@@ -93,12 +93,12 @@ plugin (`hooks/codex-hooks.json`) but stay **inert until trusted** — this is C
 gate, which Nomo cannot pre-approve. The hook command lines are byte-stable across releases, so
 trusting once holds through updates (only a changed hook line re-arms the review).
 
-The plugin bundles three **skills** — invoke them by name or in natural language:
+The plugin bundles three **skills** — invoke them by typing `$<skill>` (or in natural language):
 
-- **nomo-pair** — pair this machine with your phone (opens the QR outside the TUI, then confirms
+- `$nomo-pair` — pair this machine with your phone (opens the QR outside the TUI, then confirms
   the scan). One pairing is **shared** with Claude Code if both agents run on this machine.
-- **nomo-status** — pairing / watchdog / hook-trust / last-delivery health.
-- **nomo-unpair** — revoke the pairing and clear local state.
+- `$nomo-status` — pairing / watchdog / hook-trust / last-delivery health.
+- `$nomo-unpair` — revoke the pairing and clear local state.
 
 There is **no separate Codex pairing** — the hooks and skills read the same
 `~/.config/cc-status/config.json`, so they stay inert (exit 0) until pairing completes. On the wire
