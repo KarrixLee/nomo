@@ -55,13 +55,19 @@ export function reedSolomon(data: number[], ecLen: number): number[] {
   return res;
 }
 
-// ----- Per-version tables, EC level L only --------------------------------------------------------
-// Level L (~7% recovery) is the lowest EC level — chosen deliberately: this QR is scanned screen-to-
-// camera at close range (no print smudging / occlusion), where L scans reliably, and L needs the
-// smallest version for a given payload, so it renders the fewest terminal rows (each module row =
-// half a text line). The pairing URL is ~75 chars → version 4 at L (vs 5 at M, 8 at M when `u` is
-// present). If a payload ever needs recovery margin, bump the whole file back to M by swapping these
-// three tables and the drawFormat EC indicator (01 → 00).
+// ----- Per-version tables, EC levels L and Q ------------------------------------------------------
+// Two EC levels are supported:
+//   L (~7% recovery)  — the lowest level. Smallest version for a given payload → fewest terminal rows
+//                       (each module row = half a text line), so it backs the terminal renderer
+//                       (renderQR) and the byte-for-byte qrcode@1.5.4 fixtures. Default everywhere.
+//   Q (~25% recovery) — used for the BROWSER pairing PAGE's QR (renderQRSVG with {ecLevel:"Q"}): the
+//                       page overlays the Nomo app icon dead-centre, and Q's error budget absorbs the
+//                       few-percent of the symbol the logo covers (the WhatsApp/WeChat pattern). The
+//                       page renders crisply at any density, so the larger Q version is free there.
+// Both levels are standard ISO/IEC 18004 tables; the terminal payload is byte-identical either way
+// (the URL never changes — only the module matrix's recovery does).
+export type ECLevel = "L" | "Q";
+
 /** Total data codewords per version at level L. */
 const L_TOTAL_DATA: Record<number, number> = {
   1: 19, 2: 34, 3: 55, 4: 80, 5: 108, 6: 136, 7: 156, 8: 194, 9: 232, 10: 274,
@@ -75,6 +81,32 @@ const L_GROUPS: Record<number, [number, number][]> = {
   1: [[1, 19]], 2: [[1, 34]], 3: [[1, 55]], 4: [[1, 80]], 5: [[1, 108]],
   6: [[2, 68]], 7: [[2, 78]], 8: [[2, 97]], 9: [[2, 116]], 10: [[2, 68], [2, 69]],
 };
+/** Total data codewords per version at level Q. */
+const Q_TOTAL_DATA: Record<number, number> = {
+  1: 13, 2: 22, 3: 34, 4: 48, 5: 62, 6: 76, 7: 88, 8: 110, 9: 132, 10: 154,
+};
+/** EC codewords per block at level Q. */
+const Q_EC_PER_BLOCK: Record<number, number> = {
+  1: 13, 2: 22, 3: 18, 4: 26, 5: 18, 6: 24, 7: 18, 8: 22, 9: 20, 10: 24,
+};
+/** Block structure at level Q: list of [blockCount, dataCodewordsPerBlock] groups. */
+const Q_GROUPS: Record<number, [number, number][]> = {
+  1: [[1, 13]], 2: [[1, 22]], 3: [[2, 17]], 4: [[2, 24]], 5: [[2, 15], [2, 16]],
+  6: [[4, 19]], 7: [[2, 14], [4, 15]], 8: [[4, 18], [2, 19]], 9: [[4, 16], [4, 17]], 10: [[6, 19], [2, 20]],
+};
+
+/** Per-level lookup: capacity/EC/block tables plus the 2-bit format EC indicator (L=01, Q=11). */
+interface ECTables {
+  totalData: Record<number, number>;
+  ecPerBlock: Record<number, number>;
+  groups: Record<number, [number, number][]>;
+  formatIndicator: number;
+}
+const EC: Record<ECLevel, ECTables> = {
+  L: { totalData: L_TOTAL_DATA, ecPerBlock: L_EC_PER_BLOCK, groups: L_GROUPS, formatIndicator: 0b01 },
+  Q: { totalData: Q_TOTAL_DATA, ecPerBlock: Q_EC_PER_BLOCK, groups: Q_GROUPS, formatIndicator: 0b11 },
+};
+
 /** Alignment-pattern centre coordinates per version. */
 const ALIGN: Record<number, number[]> = {
   1: [], 2: [6, 18], 3: [6, 22], 4: [6, 26], 5: [6, 30],
@@ -87,18 +119,19 @@ function getBit(x: number, i: number): number {
   return (x >>> i) & 1;
 }
 
-/** Smallest version (1..10) whose level-L data capacity fits `byteLen`; throws if it doesn't fit. */
-function pickVersion(byteLen: number): number {
+/** Smallest version (1..10) whose data capacity at `level` fits `byteLen`; throws if it doesn't fit. */
+function pickVersion(byteLen: number, level: ECLevel): number {
+  const totalData = EC[level].totalData;
   for (let v = 1; v <= 10; v++) {
     const countBits = v < 10 ? 8 : 16;
-    if (4 + countBits + byteLen * 8 <= L_TOTAL_DATA[v] * 8) return v;
+    if (4 + countBits + byteLen * 8 <= totalData[v] * 8) return v;
   }
-  throw new Error(`payload too large for QR v1..10 at level L: ${byteLen} bytes`);
+  throw new Error(`payload too large for QR v1..10 at level ${level}: ${byteLen} bytes`);
 }
 
 /** Byte-mode bitstream → data codewords: mode(0100) ‖ count ‖ bytes ‖ terminator ‖ pad(0xEC,0x11). */
-export function buildDataCodewords(bytes: Uint8Array, version: number): number[] {
-  const totalData = L_TOTAL_DATA[version];
+export function buildDataCodewords(bytes: Uint8Array, version: number, level: ECLevel = "L"): number[] {
+  const totalData = EC[level].totalData[version];
   const capacityBits = totalData * 8;
   const bits: number[] = [];
   const push = (value: number, len: number) => {
@@ -124,11 +157,11 @@ export function buildDataCodewords(bytes: Uint8Array, version: number): number[]
 }
 
 /** Split data codewords into blocks, compute EC, and interleave into the final codeword sequence. */
-function interleave(dataCodewords: number[], version: number): number[] {
-  const ecLen = L_EC_PER_BLOCK[version];
+function interleave(dataCodewords: number[], version: number, level: ECLevel): number[] {
+  const ecLen = EC[level].ecPerBlock[version];
   const blocks: { data: number[]; ec: number[] }[] = [];
   let ptr = 0;
-  for (const [count, dataLen] of L_GROUPS[version]) {
+  for (const [count, dataLen] of EC[level].groups[version]) {
     for (let k = 0; k < count; k++) {
       const data = dataCodewords.slice(ptr, ptr + dataLen);
       ptr += dataLen;
@@ -214,10 +247,10 @@ function drawFunctionPatterns(g: Grid, version: number): void {
   setFn(g, size - 8, 8, 1);
 }
 
-/** Draw (and reserve) the 15 format-info modules for a given mask. Level L => EC indicator 01. */
-function drawFormat(g: Grid, mask: number): void {
+/** Draw (and reserve) the 15 format-info modules for a given mask + EC level (L => 01, Q => 11). */
+function drawFormat(g: Grid, mask: number, level: ECLevel): void {
   const size = g.size;
-  const data = (0b01 << 3) | mask; // level L format bits (01) ‖ mask
+  const data = (EC[level].formatIndicator << 3) | mask; // EC-level format bits ‖ mask
   let rem = data;
   for (let i = 0; i < 10; i++) rem = (rem << 1) ^ ((rem >>> 9) * 0x537);
   const bits = ((data << 10) | rem) ^ 0x5412; // 15-bit format value
@@ -378,15 +411,16 @@ function penaltyScore(g: Grid): number {
   return result;
 }
 
-/** Encode `text` into a QR module grid (level L, auto version 1..10). Dark = 1. `forceMask` is a
- *  test hook to pin a specific mask; production callers omit it and let the penalty rules choose. */
-export function qrGrid(text: string, forceMask?: number): Grid {
+/** Encode `text` into a QR module grid (auto version 1..10 at EC `level`, default L). Dark = 1.
+ *  `forceMask` is a test hook to pin a specific mask; production callers omit it and let the penalty
+ *  rules choose. */
+export function qrGrid(text: string, forceMask?: number, level: ECLevel = "L"): Grid {
   const bytes = encoder.encode(text);
-  const version = pickVersion(bytes.length);
-  const codewords = interleave(buildDataCodewords(bytes, version), version);
+  const version = pickVersion(bytes.length, level);
+  const codewords = interleave(buildDataCodewords(bytes, version, level), version, level);
   const g = newGrid(17 + 4 * version);
   drawFunctionPatterns(g, version);
-  drawFormat(g, 0); // reserve the format area; overwritten below once the mask is chosen
+  drawFormat(g, 0, level); // reserve the format area; overwritten below once the mask is chosen
   drawVersion(g, version);
   drawCodewords(g, codewords);
   // Choose the lowest-penalty mask (unless one is pinned).
@@ -396,7 +430,7 @@ export function qrGrid(text: string, forceMask?: number): Grid {
   } else {
     for (let mask = 0; mask < 8; mask++) {
       applyMask(g, mask);
-      drawFormat(g, mask);
+      drawFormat(g, mask, level);
       const penalty = penaltyScore(g);
       if (penalty < bestPenalty) {
         bestPenalty = penalty;
@@ -406,19 +440,19 @@ export function qrGrid(text: string, forceMask?: number): Grid {
     }
   }
   applyMask(g, bestMask);
-  drawFormat(g, bestMask);
+  drawFormat(g, bestMask, level);
   return g;
 }
 
-/** The QR module matrix (no quiet zone) as rows of 0/1 — dark = 1. Matches the `qrcode` npm
- *  package's `create(text,{errorCorrectionLevel:'L'}).modules` grid byte-for-byte. */
-export function qrMatrix(text: string): number[][] {
-  return qrGrid(text).modules;
+/** The QR module matrix (no quiet zone) as rows of 0/1 — dark = 1. At level L it matches the `qrcode`
+ *  npm package's `create(text,{errorCorrectionLevel:'L'}).modules` grid byte-for-byte. */
+export function qrMatrix(text: string, level: ECLevel = "L"): number[][] {
+  return qrGrid(text, undefined, level).modules;
 }
 
 /** Row-major flattened matrix (dark = 1), the shape the fixture pins for an exact compare. */
-export function qrModules(text: string): { size: number; data: number[] } {
-  const g = qrGrid(text);
+export function qrModules(text: string, level: ECLevel = "L"): { size: number; data: number[] } {
+  const g = qrGrid(text, undefined, level);
   const data: number[] = [];
   for (let r = 0; r < g.size; r++) for (let c = 0; c < g.size; c++) data.push(g.modules[r][c]);
   return { size: g.size, data };

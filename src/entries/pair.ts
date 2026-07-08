@@ -80,6 +80,13 @@ export interface PairDeps {
    *  Codex flow — self-heal finishes in the background), not the hard 10-min "window expired" exit-1.
    *  The QR's real 10-min TTL (the createdAt guard) is unchanged. Absent → historical full-window wait. */
   softTimeoutMs?: number;
+  /** Force printing the one-time code to stdout regardless of TTY (`--show-code`) — the SSH/headless
+   *  escape hatch where the browser page can't be seen. Defaults to false. */
+  showCode?: boolean;
+  /** Whether stdout is an interactive terminal. When true (the user ran `pair` directly in a real
+   *  terminal, not an agent's Bash tool / a pipe), pairStart ALSO prints the one-time code. Defaults to
+   *  `process.stdout.isTTY === true`; tests inject a boolean. */
+  isTTY?: boolean;
 }
 
 /** Default browser opener: `open` on darwin, `xdg-open` on linux, detached + unref'd so the CLI never
@@ -249,9 +256,12 @@ export async function pairStart(deps: PairDeps = {}): Promise<number> {
   // (completePendingPairing / the watchdog self-heal / unpair).
   const url = buildPairURL(workerUrl, pairingId, qrSecret);
   const page = renderPairPage({
-    svg: renderQRSVG(url),
+    svg: renderQRSVG(url, { ecLevel: "Q" }), // Q recovery leaves room for the centred Nomo logo overlay
     code: codeString ?? null,
     expiresAt: now() + MAX_WAIT_MS,
+    // Bake the live-status poll params so the page flips itself to "Paired ✓" / "expired" on its own.
+    // pcSecret already lives in config.json (same dir, same 0600); the page is deleted on completion.
+    poll: { workerURL: workerUrl, pairingId, pcSecret },
   });
   await atomicWrite(htmlPath, page, CONFIG_MODE);
   const opened = (deps.openFile ?? openInBrowser)(htmlPath);
@@ -262,6 +272,18 @@ export async function pairStart(deps: PairDeps = {}): Promise<number> {
   }
   print("The QR code and one-time pairing code are shown on that page.");
   print("This expires in 10 minutes. Keep this session open — the next step waits for your phone.");
+
+  // The one-time code is normally shown ONLY on the browser page (stdout lands in greppable agent
+  // transcripts — the transcript-secrecy rule). Two deliberate exceptions print it to stdout anyway:
+  //   • --show-code (showCode): the explicit SSH/headless escape hatch where the page can't be seen.
+  //   • a real interactive terminal (isTTY): the user ran `pair` themselves — there is no agent
+  //     transcript to leak into, so surfacing the code is a convenience, not a leak.
+  // An agent's non-TTY Bash tool (or a pipe) gets neither → the neutral-only output is unchanged.
+  const showCode = deps.showCode ?? false;
+  const isTTY = deps.isTTY ?? (process.stdout.isTTY === true);
+  if (codeString && (showCode || isTTY)) {
+    print(`One-time code: ${codeString} · expires in 10 min`);
+  }
   return 0;
 }
 
@@ -387,7 +409,7 @@ function parseTimeoutMs(argv: string[]): number | undefined {
 
 if (import.meta.main) {
   if (process.argv.includes("--check")) {
-    console.log("usage: pair [wait [--timeout <seconds>]] [--check]  — pair this machine with the Nomo app (opens a browser page with the QR + code)");
+    console.log("usage: pair [wait [--timeout <seconds>]] [--show-code] [--check]  — pair this machine with the Nomo app (opens a browser page with the QR + code; --show-code also prints the one-time code for SSH/headless)");
     process.exit(0);
   }
   if (process.argv.includes("wait")) {
@@ -395,6 +417,7 @@ if (import.meta.main) {
     process.exit(await pairWait(softTimeoutMs !== undefined ? { softTimeoutMs } : {}));
   } else {
     // `--open` is now the default (a harmless no-op if still passed by an older skill invocation).
-    process.exit(await pairStart());
+    // `--show-code` forces the one-time code onto stdout (SSH/headless where the page can't be seen).
+    process.exit(await pairStart(process.argv.includes("--show-code") ? { showCode: true } : {}));
   }
 }

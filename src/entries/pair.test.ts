@@ -168,7 +168,7 @@ describe("pairStart", () => {
     const code = await pairStart({
       fetchFn: fn, print, configPath, workerUrl: WORKER, spawnWatchdog: () => {}, now: () => 1_700_000_000_000,
       randomBytes: scriptedRandom([PAIRING_BYTES, PC_SECRET_BYTES, QR_SECRET]),
-      htmlPath, openFile: () => true, pickWords: () => words,
+      htmlPath, openFile: () => true, pickWords: () => words, isTTY: false, // non-TTY (agent Bash tool)
     });
     expect(code).toBe(0);
 
@@ -182,9 +182,60 @@ describe("pairStart", () => {
     // The full code (`<channel>-w1-w2-w3-w4`) appears on the page…
     const html = await readFile(htmlPath, "utf8");
     expect(html).toContain("7-koala-sunset-mango-river");
-    // …but NEVER on stdout.
+    // …and the page bakes the live-status poll params (worker/pairing/pcSecret) so it self-updates.
+    expect(html).toContain(`/v1/cc/pair/status?p=`);
+    expect(html).toContain(EXPECTED_PC_SECRET);
+    // …but the code is NEVER on stdout on a non-TTY (agent transcript).
     expect(lines.join("\n")).not.toContain("koala");
     expect(lines.join("\n")).not.toContain("7-koala");
+  });
+
+  // --- Feature 1: one-time code on stdout is TTY-gated (+ --show-code override) --------------------
+  test("prints the one-time code to stdout when stdout is an interactive TTY", async () => {
+    const words = ["koala", "sunset", "mango", "river"];
+    const { fn } = scriptedFetch([() => json({ channel: 7 }, 201)]);
+    await pairStart({
+      fetchFn: fn, print, configPath, workerUrl: WORKER, spawnWatchdog: () => {},
+      randomBytes: scriptedRandom([PAIRING_BYTES, PC_SECRET_BYTES, QR_SECRET]),
+      htmlPath: join(dir, PAIR_HTML_FILE), openFile: () => true, pickWords: () => words,
+      isTTY: true, // the user ran `pair` directly in a real terminal
+    });
+    expect(lines.join("\n")).toContain("One-time code: 7-koala-sunset-mango-river · expires in 10 min");
+  });
+
+  test("does NOT print the code on a non-TTY without --show-code (agent Bash tool / pipe)", async () => {
+    const words = ["koala", "sunset", "mango", "river"];
+    const { fn } = scriptedFetch([() => json({ channel: 7 }, 201)]);
+    await pairStart({
+      fetchFn: fn, print, configPath, workerUrl: WORKER, spawnWatchdog: () => {},
+      randomBytes: scriptedRandom([PAIRING_BYTES, PC_SECRET_BYTES, QR_SECRET]),
+      htmlPath: join(dir, PAIR_HTML_FILE), openFile: () => true, pickWords: () => words,
+      isTTY: false, showCode: false,
+    });
+    expect(lines.join("\n")).not.toContain("One-time code");
+    expect(lines.join("\n")).not.toContain("koala");
+  });
+
+  test("--show-code (showCode) forces the code onto stdout even on a non-TTY (SSH/headless)", async () => {
+    const words = ["koala", "sunset", "mango", "river"];
+    const { fn } = scriptedFetch([() => json({ channel: 7 }, 201)]);
+    await pairStart({
+      fetchFn: fn, print, configPath, workerUrl: WORKER, spawnWatchdog: () => {},
+      randomBytes: scriptedRandom([PAIRING_BYTES, PC_SECRET_BYTES, QR_SECRET]),
+      htmlPath: join(dir, PAIR_HTML_FILE), openFile: () => true, pickWords: () => words,
+      isTTY: false, showCode: true,
+    });
+    expect(lines.join("\n")).toContain("One-time code: 7-koala-sunset-mango-river · expires in 10 min");
+  });
+
+  test("QR-only (no channel from the worker) → no code to print even on a TTY / with --show-code", async () => {
+    const { fn } = scriptedFetch([() => json({ ok: true }, 201)]); // no channel → no code
+    await pairStart({
+      fetchFn: fn, print, configPath, workerUrl: WORKER, spawnWatchdog: () => {},
+      randomBytes: scriptedRandom([PAIRING_BYTES, PC_SECRET_BYTES, QR_SECRET]),
+      htmlPath: join(dir, PAIR_HTML_FILE), openFile: () => true, isTTY: true, showCode: true,
+    });
+    expect(lines.join("\n")).not.toContain("One-time code");
   });
 
   test("falls back to printing the page path when the browser opener declines (headless / NOMO_NO_OPEN)", async () => {

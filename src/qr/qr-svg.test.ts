@@ -51,4 +51,16 @@ describe("renderQRSVG", () => {
   test("deterministic — the same input renders byte-identically", () => {
     expect(renderQRSVG(text)).toBe(renderQRSVG(text));
   });
+
+  test("ecLevel 'Q' paints the higher-recovery matrix (the browser-page logo QR)", () => {
+    const q = (fixtures as Record<string, { text: string; size: number; data: string }>).pairUrlQ;
+    const qDark = q.data.split("").filter((b) => b === "1").length;
+    const svg = renderQRSVG(q.text, { ecLevel: "Q" });
+    // Same payload, higher EC → a larger symbol than the level-L default (57 vs 45 for this URL).
+    const full = q.size + 4 * 2;
+    expect(svg).toContain(`viewBox="0 0 ${full} ${full}"`);
+    expect((svg.match(/<rect/g) ?? []).length).toBe(qDark + 1); // Q dark modules + background
+    // Q genuinely differs from the L rendering of the same text.
+    expect(renderQRSVG(q.text, { ecLevel: "Q" })).not.toBe(renderQRSVG(q.text, { ecLevel: "L" }));
+  });
 });

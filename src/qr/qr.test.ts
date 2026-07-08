@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import fixtures from "./qr-fixtures.json";
-import { buildDataCodewords, qrModules, reedSolomon, renderQR } from "./qr";
+import { buildDataCodewords, type ECLevel, qrModules, reedSolomon, renderQR } from "./qr";
 
 // FIXTURE PROVENANCE: qr-fixtures.json was generated ONCE with the known-good `qrcode` npm package
 // (qrcode@1.5.4, the library behind `bunx qrcode`) and pinned. Exact command (run in a scratch dir
@@ -21,14 +21,19 @@ import { buildDataCodewords, qrModules, reedSolomon, renderQR } from "./qr";
 // MODULE MATRICES (data encoding, Reed-Solomon, interleave, data placement, format/version bits) —
 // asserted here against our AUTO output, so a drift in our mask selection also fails loudly.
 //
-// The two payloads cover both interesting regimes (at level L):
-//   - `short`   → version 2 (single EC block, one alignment pattern, no version info)
-//   - `pairUrl` → version 7 (multi-block interleave, timing-straddling alignment patterns, version info)
+// The payloads cover the interesting regimes across both EC levels:
+//   - `short`    → level L, version 2 (single EC block, one alignment pattern, no version info)
+//   - `pairUrl`  → level L, version 7 (multi-block interleave, timing-straddling alignment, version info)
+//   - `pairUrlQ` → level Q, version 10 (the browser-page logo-overlay QR: higher recovery, multi-block
+//                  interleave with the Q group split, version info) — exercises the Q EC/block tables and
+//                  the Q format EC indicator (11), pinned byte-for-byte against qrcode@1.5.4's `Q` output.
+// Each fixture carries its own `level` (older L fixtures default to "L").
 
 describe("qr matrix vs pinned qrcode@1.5.4 fixtures", () => {
-  for (const [name, fx] of Object.entries(fixtures) as [string, { text: string; mask: number; size: number; data: string }][]) {
-    test(`${name} (${fx.text.length} chars → ${fx.size}x${fx.size}) matches the reference matrix exactly`, () => {
-      const mine = qrModules(fx.text);
+  for (const [name, fx] of Object.entries(fixtures) as [string, { text: string; mask: number; size: number; data: string; level?: ECLevel }][]) {
+    const level = fx.level ?? "L";
+    test(`${name} (${fx.text.length} chars → ${fx.size}x${fx.size}, level ${level}) matches the reference matrix exactly`, () => {
+      const mine = qrModules(fx.text, level);
       expect(mine.size).toBe(fx.size);
       expect(mine.data.join("")).toBe(fx.data);
     });

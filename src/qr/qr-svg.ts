@@ -8,7 +8,7 @@
 //
 // PORTABILITY: bun AND node >= 18 (Task 2.3 bundles it) — no Bun.* APIs, pure string building.
 
-import { qrMatrix } from "./qr";
+import { type ECLevel, qrMatrix } from "./qr";
 
 export interface QRSVGOptions {
   /** Light-margin width in MODULES around the symbol. Default 4 = the ISO 18004 quiet zone (required
@@ -17,6 +17,10 @@ export interface QRSVGOptions {
   /** Rendered pixel size of the (square) SVG. The module grid is drawn in a viewBox and scaled to fit,
    *  so this only sets the on-screen resolution — 512 is crisp on a laptop display. */
   pixelSize?: number;
+  /** Error-correction level. Default "L" (smallest symbol); the browser pairing page passes "Q" so a
+   *  centred logo overlay has the recovery budget to spare. A payload too large for the requested level
+   *  at v1..10 falls back to "L" (bigger capacity) rather than throwing. */
+  ecLevel?: ECLevel;
 }
 
 /**
@@ -28,7 +32,16 @@ export interface QRSVGOptions {
 export function renderQRSVG(text: string, opts: QRSVGOptions = {}): string {
   const quiet = opts.quiet ?? 4;
   const pixelSize = opts.pixelSize ?? 512;
-  const matrix = qrMatrix(text);
+  const level = opts.ecLevel ?? "L";
+  // At level Q a very long self-hosted worker URL can overflow v1..10 — fall back to L (larger
+  // capacity) so a long payload always renders rather than throwing. The common production payload
+  // (~75 chars) and a typical self-hosted one (~144 chars) both fit Q comfortably.
+  let matrix: number[][];
+  try {
+    matrix = qrMatrix(text, level);
+  } catch {
+    matrix = qrMatrix(text, "L");
+  }
   const size = matrix.length;
   const full = size + quiet * 2; // side length in modules, quiet zone included
 
