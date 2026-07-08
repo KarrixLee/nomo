@@ -1,23 +1,69 @@
-# Nomo — Claude Code & Codex CLI → iPhone Live Activity
+<p align="center"><img src="assets/icon.png" width="120" alt="Nomo"></p>
 
-Mirror your **Claude Code** and **OpenAI Codex CLI** session milestones to the
-[Nomo iPhone app](https://github.com/KarrixLee/nomo) as a Live Activity (Dynamic Island). A
+# Nomo — Live Activity on your iPhone
+
+<p align="center">
+<img src="assets/claude.png" height="26" alt="Claude Code">&nbsp;&nbsp;
+<img src="assets/codex.png" height="26" alt="OpenAI Codex">&nbsp;&nbsp;
+<img src="https://img.shields.io/badge/License-MIT-blue" alt="License: MIT">
+</p>
+
+Mirror your **Claude Code** and **OpenAI Codex** session milestones to the
+**Nomo iPhone app** as a Live Activity (Dynamic Island). A
 session's status — working, needs-your-approval, done — shows up on your phone in real time,
 so you can step away from the terminal and still know when an agent needs you or has finished.
+Works with both **Codex CLI and the Codex desktop app**.
 
 Everything is **end-to-end encrypted**. Pairing is a single QR-code scan; there is no server
 key to copy. All session content (titles, machine name, status, even *which* agent produced an
 event) rides **inside** an encrypted blob, so the relay Worker that fans out the APNs push is a
 blind relay and never sees plaintext. **One pairing covers both agents** on a machine — Claude
-Code and Codex CLI share the same credentials, encryption key, watchdog, and Live Activity.
+Code and Codex share the same credentials, encryption key, watchdog, and Live Activity.
 
 The PC side ships as two manifests over one shared `plugin/` directory: a **Claude Code plugin**
-(`nomo-cc`) and a **native Codex CLI plugin** (`nomo`). Both bundle the same self-contained `.mjs`
+(`nomo-cc`) and a **native Codex plugin** (`nomo`). Both bundle the same self-contained `.mjs`
 hooks, the liveness watchdog, and the interactive commands as single-file artifacts that run under
 **either bun or node ≥ 18** (a `run.sh` shim picks whichever is installed). There are **zero npm
 dependencies** — Node built-ins only.
 
-## Install — Claude Code
+## Architecture — end-to-end encrypted
+
+Pairing hands your phone and computer **one shared key**, delivered directly through the QR code —
+it never touches any server. The plugin encrypts every session update with that key **before**
+anything leaves your machine, so the relay Worker and Apple's push service only ever carry
+ciphertext. Decryption happens on your iPhone.
+
+```mermaid
+flowchart LR
+  subgraph PC["💻 Your computer"]
+    A["Claude Code / Codex<br/>hooks fire on session events"]
+    B["nomo plugin<br/>encrypts session status<br/>with the shared key"]
+    A --> B
+  end
+
+  K(["🔑 QR pairing<br/>phone &amp; computer share one key<br/>directly — never touches a server"])
+
+  subgraph NET["🌐 Untrusted network"]
+    C["Cloudflare Worker relay<br/>sees: pairing id + ciphertext<br/>never sees: session content"]
+    D["APNs<br/>carries ciphertext"]
+    C --> D
+  end
+
+  subgraph Phone["📱 Your iPhone — Nomo app"]
+    E["Decrypts on device<br/>renders Live Activity /<br/>Dynamic Island"]
+  end
+
+  B -->|"ciphertext + pairing id"| C
+  D -->|"ciphertext"| E
+  K -.->|shared key| B
+  K -.->|shared key| E
+```
+
+**Plaintext — titles, machine name, status, even which agent produced the event — never leaves
+your computer except end-to-end encrypted.** The Worker is a blind fan-out relay: it can route by
+pairing id but cannot read a single field of what it forwards.
+
+## <img src="assets/claude.png" height="22" align="center" alt=""> Install — Claude Code
 
 From inside Claude Code:
 
@@ -47,9 +93,9 @@ The lifecycle hooks (`SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostTool
 no `settings.json` edits. The hook is deliberately silent: no pairing → no-op; network down → 2 s
 timeout, exit 0. It cannot affect a Claude Code session.
 
-## Install — OpenAI Codex CLI
+## <img src="assets/codex.png" height="22" align="center" alt=""> Install — OpenAI Codex
 
-Codex CLI (**≥ 0.142**) ships a native plugin system, so Nomo installs as a standalone Codex
+Codex (**≥ 0.142**) ships a native plugin system, so Nomo installs as a standalone Codex
 plugin (also named `nomo`, sharing the same `plugin/` directory as the Claude manifest). No Claude
 Code required. From inside a Codex session:
 
@@ -57,6 +103,9 @@ Code required. From inside a Codex session:
 codex plugin marketplace add KarrixLee/nomo
 codex plugin add nomo@nomo
 ```
+
+This also works in the **Codex desktop app** — the same marketplace-add and plugin-add flow from
+its built-in terminal.
 
 Then **trust the hooks once**: run `/hooks` and trust the **six Nomo entries**. They ship with the
 plugin (`hooks/codex-hooks.json`) but stay **inert until trusted** — this is Codex's own safety
@@ -126,3 +175,7 @@ repository — there is no publish, npm, or CI build step, so the committed bund
 runs. Re-run `bun build.ts` after any source change so `dist/` stays reproducible from source, and
 commit the regenerated `.mjs` files. The committed bundle was built with `bun 1.3.10`; use the same
 major/minor to reproduce it byte-for-byte.
+
+## License — MIT
+
+Released under the [MIT License](LICENSE). © 2026 KarrixLee.
