@@ -1,0 +1,19 @@
+{
+  "name": "nomo",
+  "description": "Nomo tools for Claude Code and OpenAI Codex CLI — mirror your sessions to the Nomo iPhone app as a Live Activity.",
+  "owner": {
+    "name": "Nomo",
+    "url": "https://github.com/KarrixLee/nomo"
+  },
+  "plugins": [
+    {
+      "name": "nomo-cc",
+      "source": "./plugin",
+      "description": "Mirror Claude Code and OpenAI Codex CLI session status to the Nomo iPhone app as a Live Activity. One QR pairing covers both agents; end-to-end encrypted.",
+      "version": "0.4.0",
+      "author": {
+        "name": "Nomo"
+      }
+    }
+  ]
+}

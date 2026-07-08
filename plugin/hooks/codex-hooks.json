@@ -1,0 +1,48 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          { "type": "command", "command": "exec \"${PLUGIN_ROOT}/scripts/run.sh\" \"${PLUGIN_ROOT}/dist/codex-status.mjs\"", "timeout": 30 }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          { "type": "command", "command": "exec \"${PLUGIN_ROOT}/scripts/run.sh\" \"${PLUGIN_ROOT}/dist/codex-status.mjs\"", "timeout": 30 }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          { "type": "command", "command": "exec \"${PLUGIN_ROOT}/scripts/run.sh\" \"${PLUGIN_ROOT}/dist/codex-status.mjs\"", "timeout": 30 }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          { "type": "command", "command": "exec \"${PLUGIN_ROOT}/scripts/run.sh\" \"${PLUGIN_ROOT}/dist/codex-status.mjs\"", "timeout": 30 }
+        ]
+      }
+    ],
+    "PermissionRequest": [
+      {
+        "hooks": [
+          { "type": "command", "command": "exec \"${PLUGIN_ROOT}/scripts/run.sh\" \"${PLUGIN_ROOT}/dist/codex-status.mjs\"", "timeout": 30 }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          { "type": "command", "command": "exec \"${PLUGIN_ROOT}/scripts/run.sh\" \"${PLUGIN_ROOT}/dist/codex-status.mjs\"", "timeout": 30 }
+        ]
+      }
+    ]
+  }
+}

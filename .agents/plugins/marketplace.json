@@ -1,0 +1,15 @@
+{
+  "name": "nomo",
+  "metadata": {
+    "description": "Nomo — mirror Claude Code and Codex CLI sessions to your iPhone"
+  },
+  "plugins": [
+    {
+      "name": "nomo",
+      "source": "./plugin",
+      "description": "Mirror Codex CLI sessions to the Nomo iPhone app as an end-to-end-encrypted Live Activity",
+      "version": "0.4.0",
+      "repository": "https://github.com/KarrixLee/nomo"
+    }
+  ]
+}

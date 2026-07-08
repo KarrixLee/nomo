@@ -1,0 +1,409 @@
+import { describe, expect, test } from "bun:test";
+import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { decryptBlob } from "../core/crypto";
+import type { SessionRecord } from "../core/shared";
+import { GONE_STRIKE_LIMIT, readGoneStrikes, recordGoneStrike, resetGoneStrikes } from "../core/shared";
+import {
+  buildDoneEnvelope, buildEndEnvelope, buildHeartbeatEnvelope, classifySession, codexLastTurnEvent,
+  goneStrikeShouldTeardown, hasInterruptMarker, lastTurnLine, PAIRING_TTL_MS, pendingPairingExpired,
+  postOutcomeForStatus, shouldHeartbeat, shouldInterruptCheck, tailShowsInterrupt,
+} from "./cc-watchdog";
+import type { PendingConfig } from "../core/shared";
+
+const KEY = new Uint8Array(32).fill(9);
+
+const rec = (over: Partial<SessionRecord> = {}): SessionRecord => ({
+  pid: 4242, machine: "mac", label: "proj", ts: 1_000_000, ...over,
+});
+
+describe("classifySession", () => {
+  const alive = () => true;
+  const dead = () => false;
+
+  test("a live pid within the window → keep", () => {
+    expect(classifySession(rec(), rec().ts, alive)).toBe("keep");
+  });
+
+  test("a dead pid within the window → end (its op:end gets POSTed)", () => {
+    expect(classifySession(rec(), rec().ts, dead)).toBe("end");
+  });
+
+  test("a malformed / unparsable record → delete", () => {
+    expect(classifySession(null, rec().ts, dead)).toBe("delete");
+    expect(classifySession({ machine: "m", label: "l", ts: 1 } as unknown as SessionRecord, 1, dead)).toBe("delete");
+    expect(classifySession({ pid: Number.NaN, machine: "m", label: "l", ts: 1 } as SessionRecord, 1, dead)).toBe("delete");
+  });
+
+  test("a stale (>24h) file → delete without POSTing (caps retries), regardless of liveness", () => {
+    const now = rec().ts + 86_400_000 + 1;
+    expect(classifySession(rec(), now, dead)).toBe("delete");
+    expect(classifySession(rec(), now, alive)).toBe("delete");
+  });
+
+  test("the decision is driven purely by the injected predicate (no real process probed)", () => {
+    const seen: number[] = [];
+    classifySession(rec({ pid: 777 }), rec().ts, (p) => { seen.push(p); return false; });
+    expect(seen).toEqual([777]);
+  });
+});
+
+describe("buildEndEnvelope (reap → v2 op:end, no blob)", () => {
+  test("is a v2 end envelope carrying no blob (the worker reuses the last stored one)", () => {
+    expect(buildEndEnvelope("sess-1", 1234)).toEqual({ v: 2, sessionId: "sess-1", op: "end", prio: 0, ts: 1234 });
+  });
+  test("satisfies parseCCEnvelope's non-blob contract (v/op/prio/ts)", () => {
+    const e = buildEndEnvelope("sess-1", 1_700_000_000_000) as Record<string, unknown>;
+    expect(e.v).toBe(2);
+    expect(typeof e.sessionId).toBe("string");
+    expect(e.op).toBe("end");
+    expect([0, 1]).toContain(e.prio);
+    expect(Number.isFinite(e.ts) && (e.ts as number) > 0).toBe(true);
+    expect(e).not.toHaveProperty("blob");
+  });
+  test("carries the record's cached start when given one; omits it for the recordless call", () => {
+    expect(buildEndEnvelope("s", 1234, rec({ sessionStartedAt: 700 }))).toMatchObject({ startedAt: 700 });
+    expect(buildEndEnvelope("s", 1234, rec())).not.toHaveProperty("startedAt");
+    expect(buildEndEnvelope("s", 1234)).not.toHaveProperty("startedAt");
+  });
+});
+
+describe("buildDoneEnvelope (interrupt corrective → v2 op:done + encrypted blob)", () => {
+  test("is a v2 done envelope whose blob decrypts to a done status carrying the record's machine/label", async () => {
+    const e = await buildDoneEnvelope("sess-9", rec({ machine: "Mac", label: "api-status" }), 1_700_000_000_000, KEY) as Record<string, unknown>;
+    expect(e).toMatchObject({ v: 2, sessionId: "sess-9", op: "done", prio: 0, ts: 1_700_000_000_000 });
+    expect(await decryptBlob(KEY, e.blob as string)).toEqual({ status: "done", title: "", machine: "Mac", label: "api-status" });
+  });
+  test("coerces a corrupt-but-parsed record's missing machine/label to empty strings", async () => {
+    const bad = { pid: 1, ts: 1 } as unknown as SessionRecord;
+    const e = await buildDoneEnvelope("s", bad, 5, KEY) as Record<string, unknown>;
+    expect(await decryptBlob(KEY, e.blob as string)).toMatchObject({ machine: "", label: "" });
+  });
+  test("codex (agent arg) restamps the blob's agent:'codex'; claude (default) omits it", async () => {
+    const codexEnv = await buildDoneEnvelope("s", rec({ machine: "Mac", label: "proj" }), 5, KEY, "codex") as Record<string, unknown>;
+    expect(await decryptBlob(KEY, codexEnv.blob as string)).toMatchObject({ status: "done", agent: "codex" });
+    const claudeEnv = await buildDoneEnvelope("s", rec(), 5, KEY) as Record<string, unknown>;
+    expect(await decryptBlob(KEY, claudeEnv.blob as string)).not.toHaveProperty("agent");
+  });
+  test("preserves the record's cached turnStartedAt in the rebuilt blob ('done in Xm' stays per-turn); omits when absent", async () => {
+    // The corrective done rebuilds its blob from scratch, so the turn anchor the prompt's hook cached
+    // must be restamped — else the island's frozen done label would regress to session-length math.
+    const withTurn = await buildDoneEnvelope("s", rec({ turnStartedAt: 1_751_900_000 }), 5, KEY) as Record<string, unknown>;
+    expect(await decryptBlob(KEY, withTurn.blob as string)).toMatchObject({ status: "done", turnStartedAt: 1_751_900_000 });
+    expect(withTurn).not.toHaveProperty("turnStartedAt"); // blob-only — never on the clear envelope
+    const withoutTurn = await buildDoneEnvelope("s", rec(), 5, KEY) as Record<string, unknown>;
+    expect(await decryptBlob(KEY, withoutTurn.blob as string)).not.toHaveProperty("turnStartedAt");
+  });
+});
+
+// --- codex interrupt detection (turn_aborted marker) ----------------------------------------
+//
+// Codex has no user/assistant transcript lines; its rollout persists a `event_msg` with payload.type
+// "turn_aborted" on Esc/abort (EventMsg::TurnAborted). The net finds the LAST turn-lifecycle boundary
+// (task_started / task_complete / turn_aborted) and corrects only when it is turn_aborted.
+describe("codexLastTurnEvent + tailShowsInterrupt (agent-parametrized marker)", () => {
+  const ev = (type: string, extra: Record<string, unknown> = {}) =>
+    JSON.stringify({ timestamp: "t", type: "event_msg", payload: { type, ...extra } });
+
+  test("returns the LAST turn boundary, skipping non-boundary event_msg noise", () => {
+    const tail = [ev("task_started"), ev("agent_message", { message: "working" }), ev("turn_aborted", { reason: "interrupted" })].join("\n");
+    expect(codexLastTurnEvent(tail)).toBe("turn_aborted");
+  });
+  test("a later task_started (a resumed/fresh turn after an abort) means NOT aborted", () => {
+    const tail = [ev("turn_aborted"), ev("user_message", { message: "again" }), ev("task_started")].join("\n");
+    expect(codexLastTurnEvent(tail)).toBe("task_started");
+  });
+  test("null when no turn boundary is present / empty / bad json", () => {
+    expect(codexLastTurnEvent(ev("agent_message", { message: "x" }))).toBeNull();
+    expect(codexLastTurnEvent("")).toBeNull();
+    expect(codexLastTurnEvent("not json at all")).toBeNull();
+  });
+  test("tailShowsInterrupt: codex keys on turn_aborted, claude keys on the interrupt marker", () => {
+    expect(tailShowsInterrupt(ev("turn_aborted"), "codex")).toBe(true);
+    expect(tailShowsInterrupt(ev("task_complete"), "codex")).toBe(false);
+    expect(tailShowsInterrupt([ev("turn_aborted"), ev("task_started")].join("\n"), "codex")).toBe(false);
+    // Claude path is unchanged: its assistant line carrying the marker still triggers.
+    const claudeTail = asstTurn("[Request interrupted by user]");
+    expect(tailShowsInterrupt(claudeTail, "claude")).toBe(true);
+    expect(tailShowsInterrupt(asstTurn("still working"), "claude")).toBe(false);
+    // Cross-agent guard: a codex tail read with the claude marker (no user/assistant line) → false.
+    expect(tailShowsInterrupt(ev("turn_aborted"), "claude")).toBe(false);
+  });
+});
+
+describe("buildHeartbeatEnvelope (re-send the stored blob to re-arm staleness)", () => {
+  test("re-sends the record's stored blob under its stored op/prio with a fresh ts", () => {
+    const r = rec({ op: "update", prio: 0, blob: "STOREDBLOB" });
+    expect(buildHeartbeatEnvelope("s", r, 1_700_000_000_000))
+      .toEqual({ v: 2, sessionId: "s", op: "update", prio: 0, ts: 1_700_000_000_000, blob: "STOREDBLOB" });
+  });
+  test("preserves a done op/prio1 faithfully (never flips the session's state)", () => {
+    const r = rec({ op: "done", prio: 1, blob: "B" });
+    expect(buildHeartbeatEnvelope("s", r, 5)).toMatchObject({ op: "done", prio: 1, blob: "B" });
+  });
+  test("null when the record has no stored blob (a pre-v2 record) — nothing to heartbeat", () => {
+    expect(buildHeartbeatEnvelope("s", rec(), 5)).toBeNull();
+    expect(buildHeartbeatEnvelope("s", rec({ blob: "" }), 5)).toBeNull();
+  });
+  test("threads the record's cached start onto the heartbeat/done envelopes (worker keeps session-birth timing)", async () => {
+    expect(buildHeartbeatEnvelope("s", rec({ op: "update", blob: "B", sessionStartedAt: 700 }), 5)).toMatchObject({ startedAt: 700 });
+    const done = await buildDoneEnvelope("s", rec({ machine: "m", label: "l", sessionStartedAt: 700 }), 5, KEY) as Record<string, unknown>;
+    expect(done).toMatchObject({ startedAt: 700 });
+    // Absent on a pre-fix record with no cached start.
+    expect(buildHeartbeatEnvelope("s", rec({ op: "update", blob: "B" }), 5)).not.toHaveProperty("startedAt");
+  });
+});
+
+// --- the transcript "interrupted by user" recovery net --------------------------------------
+
+const irec = (over: Partial<SessionRecord> = {}): SessionRecord => ({
+  pid: 4242, machine: "mac", label: "proj", ts: 1_000_000, transcript: "/tmp/t.jsonl",
+  lastEvent: "working", ...over,
+});
+
+const row = (o: unknown) => JSON.stringify(o);
+const userTurn = (text: string) => row({ type: "user", message: { role: "user", content: [{ type: "text", text }] } });
+const asstTurn = (text: string) => row({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text }] } });
+
+describe("lastTurnLine", () => {
+  test("returns the LAST user/assistant line, skipping trailing bookkeeping lines", () => {
+    const t = [
+      userTurn("first prompt"),
+      asstTurn("[Request interrupted by user]"),
+      row({ type: "system", subtype: "post_interrupt" }),
+      row({ type: "summary", summary: "did stuff" }),
+    ].join("\n");
+    expect(lastTurnLine(t)).toBe(asstTurn("[Request interrupted by user]"));
+  });
+
+  test("tolerates a truncated first line (byte-sliced tail) — it just fails JSON.parse and is skipped", () => {
+    const truncated = '_id":"abc","type":"assistant","message":{"content":"tail"}}';
+    const t = [truncated, userTurn("the real last turn")].join("\n");
+    expect(lastTurnLine(t)).toBe(userTurn("the real last turn"));
+  });
+
+  test("returns the last turn even when a trailing line is a truncated/partial write", () => {
+    const t = [userTurn("done turn"), '{"type":"assist'].join("\n");
+    expect(lastTurnLine(t)).toBe(userTurn("done turn"));
+  });
+
+  test("null when no user/assistant line is present", () => {
+    expect(lastTurnLine(row({ type: "system", x: 1 }))).toBeNull();
+    expect(lastTurnLine("")).toBeNull();
+    expect(lastTurnLine("not json at all")).toBeNull();
+  });
+});
+
+describe("hasInterruptMarker", () => {
+  test("true when the raw line carries the interrupt marker", () => {
+    expect(hasInterruptMarker(userTurn("[Request interrupted by user]"))).toBe(true);
+    expect(hasInterruptMarker(userTurn("[Request interrupted by user for tool use]"))).toBe(true);
+  });
+  test("false for an ordinary turn line", () => {
+    expect(hasInterruptMarker(userTurn("please refactor this"))).toBe(false);
+    expect(hasInterruptMarker(asstTurn("Sure, working on it."))).toBe(false);
+  });
+});
+
+describe("shouldInterruptCheck (gate matrix)", () => {
+  const now = 2_000_000;
+  test("needsAttention → check (every sweep, no ts-age gate)", () => {
+    expect(shouldInterruptCheck(irec({ lastEvent: "needsAttention", ts: now }), now)).toBe(true);
+  });
+  test("working but fresh (≤20s) → skip", () => {
+    expect(shouldInterruptCheck(irec({ lastEvent: "working", ts: now - 19_000 }), now)).toBe(false);
+    expect(shouldInterruptCheck(irec({ lastEvent: "working", ts: now - 20_000 }), now)).toBe(false);
+  });
+  test("working and stale (>20s) → check", () => {
+    expect(shouldInterruptCheck(irec({ lastEvent: "working", ts: now - 20_001 }), now)).toBe(true);
+  });
+  test("done / sessionStart → skip", () => {
+    expect(shouldInterruptCheck(irec({ lastEvent: "done", ts: now - 60_000 }), now)).toBe(false);
+    expect(shouldInterruptCheck(irec({ lastEvent: "sessionStart", ts: now - 60_000 }), now)).toBe(false);
+  });
+  test("missing / empty transcript → skip even when it would otherwise check", () => {
+    expect(shouldInterruptCheck(irec({ lastEvent: "needsAttention", transcript: "" }), now)).toBe(false);
+    expect(shouldInterruptCheck({ ...irec({ lastEvent: "needsAttention" }), transcript: undefined } as unknown as SessionRecord, now)).toBe(false);
+  });
+});
+
+// --- self-heal wall-clock deadline ----------------------------------------------------------
+
+describe("pendingPairingExpired (bounds the watchdog self-heal so an unreachable worker can't poll forever)", () => {
+  const pending = (over: Partial<PendingConfig> = {}): PendingConfig => ({
+    url: "https://w.test", pairingId: "p", pcSecret: "s", qrSecret: new Uint8Array(16), ...over,
+  });
+
+  test("createdAt + TTL is the deadline when the pending config carries a createdAt", () => {
+    const created = 1_000_000;
+    expect(pendingPairingExpired(pending({ createdAt: created }), created + PAIRING_TTL_MS - 1, Number.POSITIVE_INFINITY)).toBe(false);
+    expect(pendingPairingExpired(pending({ createdAt: created }), created + PAIRING_TTL_MS, Number.POSITIVE_INFINITY)).toBe(true);
+  });
+
+  test("a pending config without createdAt (older hook) falls back to the process-local deadline", () => {
+    expect(pendingPairingExpired(pending(), 999, 1000)).toBe(false);
+    expect(pendingPairingExpired(pending(), 1000, 1000)).toBe(true);
+  });
+
+  test("PAIRING_TTL_MS matches the worker's 10-minute pending TTL", () => {
+    expect(PAIRING_TTL_MS).toBe(600_000);
+  });
+});
+
+// --- phone-initiated revoke: definitive-vs-transient HTTP keying ----------------------------
+//
+// When the phone forgets a pairing, the server deletes the record, so requirePCAuth 404s every PC
+// event (server/src/pairing.ts). The watchdog keys ONLY on that 404 to tear down the local config;
+// a 401 (ambiguous), a 429/5xx, or a network error must stay transient so a healthy config is never
+// deleted on a blip. postOutcomeForStatus is that decision, isolated and pure.
+
+describe("postOutcomeForStatus (the definitive-revoke HTTP keying)", () => {
+  test("2xx → delivered (the event landed)", () => {
+    expect(postOutcomeForStatus(200)).toBe("delivered");
+    expect(postOutcomeForStatus(201)).toBe("delivered");
+    expect(postOutcomeForStatus(204)).toBe("delivered");
+  });
+
+  test("404 → revoked (the pairing record is gone server-side — requirePCAuth's not-found)", () => {
+    expect(postOutcomeForStatus(404)).toBe("revoked");
+  });
+
+  test("410 → revoked (the worker's dormant-GC 'gone once' signal, before it 404s)", () => {
+    expect(postOutcomeForStatus(410)).toBe("revoked");
+  });
+
+  test("401 is NOT revoked — it is ambiguous (missing header / mismatched secret), so it stays transient", () => {
+    expect(postOutcomeForStatus(401)).toBe("failed");
+  });
+
+  test("429 / 5xx are transient failures (never delete a healthy config)", () => {
+    expect(postOutcomeForStatus(429)).toBe("failed");
+    expect(postOutcomeForStatus(500)).toBe("failed");
+    expect(postOutcomeForStatus(502)).toBe("failed");
+    expect(postOutcomeForStatus(503)).toBe("failed");
+  });
+
+  test("400 (bad event) is a transient failure, not a revoke", () => {
+    expect(postOutcomeForStatus(400)).toBe("failed");
+  });
+});
+
+// --- PID-gated staleness heartbeat ----------------------------------------------------------
+
+const HEARTBEAT_AFTER_MS = 300_000; // must mirror the constant in cc-watchdog.ts
+
+describe("shouldHeartbeat (decision matrix)", () => {
+  const now = 5_000_000;
+  const quiet = () => rec({ ts: now - HEARTBEAT_AFTER_MS }); // event-quiet exactly at the threshold
+
+  test("quiet + alive + never-heartbeated + uncorrected → heartbeat", () => {
+    expect(shouldHeartbeat(quiet(), now, undefined, false)).toBe(true);
+    expect(shouldHeartbeat(rec({ ts: now - HEARTBEAT_AFTER_MS - 1 }), now, undefined, false)).toBe(true);
+  });
+
+  test("recently active (quiet < 5 min) → no heartbeat (hooks are already keeping it fresh)", () => {
+    expect(shouldHeartbeat(rec({ ts: now - (HEARTBEAT_AFTER_MS - 1) }), now, undefined, false)).toBe(false);
+    expect(shouldHeartbeat(rec({ ts: now - 15_000 }), now, undefined, false)).toBe(false);
+  });
+
+  test("throttled: a heartbeat within the last 5 min blocks another, then re-arms", () => {
+    expect(shouldHeartbeat(quiet(), now, now - 1_000, false)).toBe(false);
+    expect(shouldHeartbeat(quiet(), now, now - HEARTBEAT_AFTER_MS, false)).toBe(true);
+  });
+
+  test("failed POST leaves the throttle unset, so quietness stays true and it retries next sweep", () => {
+    expect(shouldHeartbeat(quiet(), now, undefined, false)).toBe(true);
+    expect(shouldHeartbeat(rec({ ts: now - HEARTBEAT_AFTER_MS }), now + 5_000, undefined, false)).toBe(true);
+  });
+
+  test("the interrupt net just corrected this session → no heartbeat (it is effectively done)", () => {
+    expect(shouldHeartbeat(quiet(), now, undefined, true)).toBe(false);
+  });
+
+  test("a record with a non-numeric ts is never heartbeated", () => {
+    expect(shouldHeartbeat({ ...quiet(), ts: undefined } as unknown as SessionRecord, now, undefined, false)).toBe(false);
+  });
+
+  test("dead-pid sessions never reach the heartbeat branch (they route to `end`, not `keep`)", () => {
+    expect(classifySession(quiet(), now, () => false)).toBe("end");
+    expect(classifySession(quiet(), now, () => true)).toBe("keep");
+  });
+
+  test("record.op === 'done' → never heartbeated, even quiet/never-heartbeated/uncorrected (mirrors shouldInterruptCheck's done skip)", () => {
+    expect(shouldHeartbeat(rec({ op: "done", ts: now - HEARTBEAT_AFTER_MS }), now, undefined, false)).toBe(false);
+    expect(shouldHeartbeat(rec({ op: "done", ts: now - HEARTBEAT_AFTER_MS - 1 }), now, undefined, false)).toBe(false);
+  });
+
+  test("a working/update op under the SAME conditions is still heartbeated (done is the only op gated out)", () => {
+    expect(shouldHeartbeat(rec({ op: "update", ts: now - HEARTBEAT_AFTER_MS }), now, undefined, false)).toBe(true);
+    expect(shouldHeartbeat(rec({ ts: now - HEARTBEAT_AFTER_MS }), now, undefined, false)).toBe(true); // no op field at all (pre-v2 record)
+  });
+});
+
+// --- watchdog gone-strike gate (a single transient 404 must NOT nuke a healthy pairing) ----------
+//
+// FINDING 1 fix: the watchdog used to map ONE 404/410 → immediate removeRevokedConfig(), which defeated
+// the hook's 2-strike transient-404 guard — a single transient 404 (worker redeploy / KV eventual-
+// consistency) on the watchdog's /cc/event POST would nuke a healthy pairing's credential config.
+// Now the watchdog counts against the SAME shared gone-strike counter and only tears down at
+// GONE_STRIKE_LIMIT. goneStrikeShouldTeardown is that decision, exercised here against a temp counter.
+describe("watchdog gone-strike gate (shared 2-strike teardown, not single-strike)", () => {
+  async function tmpStrikes(): Promise<{ path: string; cleanup: () => Promise<void> }> {
+    const dir = await mkdtemp(join(tmpdir(), "cc-wd-strike-"));
+    const path = join(dir, "gone-strikes");
+    return { path, cleanup: () => rm(dir, { recursive: true, force: true }) };
+  }
+  async function exists(p: string): Promise<boolean> {
+    try { await stat(p); return true; } catch { return false; }
+  }
+
+  test("a single watchdog 404 does NOT tear down, and increments the shared counter (retryable)", async () => {
+    const { path, cleanup } = await tmpStrikes();
+    try {
+      // GONE_STRIKE_LIMIT is 2, so the first strike is below the teardown threshold.
+      expect(await goneStrikeShouldTeardown(path)).toBe(false);
+      expect(await readGoneStrikes(path)).toBe(1);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("a second consecutive watchdog gone response DOES tear down (reaches GONE_STRIKE_LIMIT)", async () => {
+    const { path, cleanup } = await tmpStrikes();
+    try {
+      expect(await goneStrikeShouldTeardown(path)).toBe(false); // strike 1
+      expect(await goneStrikeShouldTeardown(path)).toBe(true);   // strike 2 → teardown
+      expect(await readGoneStrikes(path)).toBe(GONE_STRIKE_LIMIT);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("a delivered sweep between two watchdog gones resets the streak → no false teardown", async () => {
+    const { path, cleanup } = await tmpStrikes();
+    try {
+      expect(await goneStrikeShouldTeardown(path)).toBe(false); // strike 1
+      await resetGoneStrikes(path);                              // a delivered POST cleared it
+      expect(await exists(path)).toBe(false);
+      expect(await goneStrikeShouldTeardown(path)).toBe(false); // strike 1 again — NOT 2
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("hook and watchdog share ONE streak: a hook strike then a watchdog strike tears down at 2 combined", async () => {
+    const { path, cleanup } = await tmpStrikes();
+    try {
+      // The hook's POST path records a gone strike (recordGoneStrike) …
+      expect(await recordGoneStrike(path)).toBe(1);
+      // … and the watchdog's next gone response, counting the SAME file, hits the limit and tears down.
+      // This is the designed semantic: both POST to the same /cc/event for the same pairing, so a
+      // genuine revoke 404s BOTH — combining their strikes reaches teardown faster while a lone
+      // transient blip from either never does.
+      expect(await goneStrikeShouldTeardown(path)).toBe(true);
+    } finally {
+      await cleanup();
+    }
+  });
+});

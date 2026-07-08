@@ -1,0 +1,28 @@
+{
+  "hooks": {
+    "SessionStart": [
+      { "hooks": [{ "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}\"/scripts/run.sh \"${CLAUDE_PLUGIN_ROOT}\"/dist/cc-status.mjs" }] }
+    ],
+    "UserPromptSubmit": [
+      { "hooks": [{ "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}\"/scripts/run.sh \"${CLAUDE_PLUGIN_ROOT}\"/dist/cc-status.mjs" }] }
+    ],
+    "PreToolUse": [
+      { "matcher": "*", "hooks": [{ "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}\"/scripts/run.sh \"${CLAUDE_PLUGIN_ROOT}\"/dist/cc-status.mjs" }] }
+    ],
+    "PostToolUse": [
+      { "matcher": "*", "hooks": [{ "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}\"/scripts/run.sh \"${CLAUDE_PLUGIN_ROOT}\"/dist/cc-status.mjs" }] }
+    ],
+    "Notification": [
+      { "hooks": [{ "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}\"/scripts/run.sh \"${CLAUDE_PLUGIN_ROOT}\"/dist/cc-status.mjs" }] }
+    ],
+    "PermissionRequest": [
+      { "hooks": [{ "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}\"/scripts/run.sh \"${CLAUDE_PLUGIN_ROOT}\"/dist/cc-status.mjs" }] }
+    ],
+    "Stop": [
+      { "hooks": [{ "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}\"/scripts/run.sh \"${CLAUDE_PLUGIN_ROOT}\"/dist/cc-status.mjs" }] }
+    ],
+    "SessionEnd": [
+      { "hooks": [{ "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}\"/scripts/run.sh \"${CLAUDE_PLUGIN_ROOT}\"/dist/cc-status.mjs" }] }
+    ]
+  }
+}

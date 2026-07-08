@@ -1,0 +1,52 @@
+{
+  "hkdf": {
+    "qrSecretHex": "01010101010101010101010101010101",
+    "phoneNonceHex": "02020202020202020202020202020202",
+    "expectedKeyHex": "256a40ccc3cbb4c7338d5fe2bfbf7ae2f021d46a71a99c0d9a935f48e9a6fe22"
+  },
+  "gcm": [
+    {
+      "keyHex": "256a40ccc3cbb4c7338d5fe2bfbf7ae2f021d46a71a99c0d9a935f48e9a6fe22",
+      "blobB64": "AAECAwQFBgcICQoLch1QtWnCLYcaDRuU8aJWm9Di2nz9VwYZqUrEiEl6QP9Gj02Z2oOsoOheW1hckz2Ws8o7O8jLgJYMoFdEAHinjgPzv7Js5eSaPjUARhdy4/Y0kO5y95lCLqMJleClzym5pE+E96ZN/FmjAWXU8rr/PUIKUw==",
+      "plaintextJson": {
+        "status": "working",
+        "title": "add font and timer",
+        "machine": "Karrix's MacBook",
+        "label": "api-status"
+      }
+    },
+    {
+      "keyHex": "256a40ccc3cbb4c7338d5fe2bfbf7ae2f021d46a71a99c0d9a935f48e9a6fe22",
+      "blobB64": "QkJCQkJCQkJCQkJCeZaYFWvULoMnkOCGEXaSL7MjvlshNfQaWXm4qcFB+KPDYaiuHMu5qFu1BmLIODU2fn1Nj7si4GXP9cmtY9FoXwXQaD0iPHJAQVvfvuLh4csjeEqc6agMhq+bOcbIjNeKwffXgFD7TwPH523tN5+n8WBzj1BW/Tw++WDFoA4fkQJsAxv9RWc9DNsCBg==",
+      "plaintextJson": {
+        "status": "needsAttention",
+        "detail": "waiting",
+        "title": "修复登录问题 🎉",
+        "machine": "开发机",
+        "label": "api-status"
+      }
+    },
+    {
+      "keyHex": "256a40ccc3cbb4c7338d5fe2bfbf7ae2f021d46a71a99c0d9a935f48e9a6fe22",
+      "blobB64": "mZmZmZmZmZmZmZmZLvFj82FnrR+xa8Ei8SW1rHeG4jRGiRPzGaoeCQaPj7U0FDAjQ+f+JmXC0feEzkKRMFrNaG5bdt67MXbDd2Y3/7EZzjrMHjAfQhyExtyyGCz6ZsobQMJozYpnhp6BCl6+o2scn+bm+lxQj7ZOY2DHaiiFcg==",
+      "plaintextJson": {
+        "status": "done",
+        "title": "审查 PR ✅ 完成",
+        "machine": "Karrix's MacBook",
+        "label": "widget-anim"
+      }
+    },
+    {
+      "keyHex": "256a40ccc3cbb4c7338d5fe2bfbf7ae2f021d46a71a99c0d9a935f48e9a6fe22",
+      "blobB64": "DA0ODxAREhMUFRYXJMk1+orljO9fI/ExuBAduWc/IXE8PxNYekxlK1ysh2Fss7N5N1nvLRp36tm1VnooihACkC85KKyyJ2wqXUaxvekqn656rrQyOqtTdrHDmJCU+C51tQn7FqrzT0FBG7qj5ocm/6FxHuEIYxHHIKh2PwH1000r7eH4ezwt/juSNYtjzaPVLi4iKnTy85COMwZFkktHXBay1NReRw6DqDUm",
+      "plaintextJson": {
+        "status": "working",
+        "detail": "running",
+        "title": "Fix flaky test in CI ⚙️",
+        "machine": "Karrix's MacBook",
+        "label": "api-status",
+        "agent": "codex"
+      }
+    }
+  ]
+}
