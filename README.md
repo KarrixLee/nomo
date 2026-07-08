@@ -33,31 +33,12 @@ it never touches any server. The plugin encrypts every session update with that 
 anything leaves your machine, so the relay Worker and Apple's push service only ever carry
 ciphertext. Decryption happens on your iPhone.
 
-```mermaid
-flowchart LR
-  subgraph PC["💻 Your computer"]
-    A["Claude Code / Codex<br/>hooks fire on session events"]
-    B["nomo plugin<br/>encrypts session status<br/>with the shared key"]
-    A --> B
-  end
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/architecture-dark.png">
+  <img src="assets/architecture-light.png" alt="End-to-end encryption architecture: hooks on your computer feed the nomo plugin, which encrypts with a key shared only via QR pairing; the Cloudflare Worker relay and APNs carry ciphertext they cannot read; your iPhone decrypts on device and renders the Live Activity.">
+</picture>
 
-  K(["🔑 QR pairing<br/>phone &amp; computer share one key<br/>directly — never touches a server"])
-
-  subgraph NET["🌐 Untrusted network"]
-    C["Cloudflare Worker relay<br/>sees: pairing id + ciphertext<br/>never sees: session content"]
-    D["APNs<br/>carries ciphertext"]
-    C --> D
-  end
-
-  subgraph Phone["📱 Your iPhone — Nomo app"]
-    E["Decrypts on device<br/>renders Live Activity /<br/>Dynamic Island"]
-  end
-
-  B -->|"ciphertext + pairing id"| C
-  D -->|"ciphertext"| E
-  K -.->|shared key| B
-  K -.->|shared key| E
-```
+<sub>Diagram source: [`assets/architecture.excalidraw`](assets/architecture.excalidraw) — open it at [excalidraw.com](https://excalidraw.com) to edit.</sub>
 
 **Plaintext — titles, machine name, status, even which agent produced the event — never leaves
 your computer except end-to-end encrypted.** The Worker is a blind fan-out relay: it can route by
