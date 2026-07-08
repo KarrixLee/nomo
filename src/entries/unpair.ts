@@ -32,7 +32,12 @@ interface RevokeCreds {
 /** Pull revoke credentials from either a COMPLETED ({...e2eKeyB64}) or a still-PENDING
  *  ({...qrSecretB64}) config: an abandoned pending pair still owns a claimable server-side record, so
  *  it should be revoked too. Null only for a corrupt/pre-v2 config that carries no id/secret to
- *  present — nothing to revoke, but still locally removable. */
+ *  present — nothing to revoke, but still locally removable.
+ *
+ *  NOTE: pair.ts's revokeExisting keeps a deliberate LOCAL MIRROR of this extraction (revoke-before-
+ *  repair). It is not shared via core/shared because that module is inlined into every plugin entry
+ *  bundle — hoisting this helper there ripples ~9 identical lines into 5 unrelated dist artifacts. Keep
+ *  the two in sync. */
 function revokeCreds(raw: string): RevokeCreds | null {
   const completed = parseConfig(raw);
   if (completed) return { url: completed.url, pairingId: completed.pairingId, pcSecret: completed.pcSecret };

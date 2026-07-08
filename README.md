@@ -12,7 +12,7 @@ Mirror your **Claude Code** and **OpenAI Codex** session milestones to the
 **Nomo iPhone app** as a Live Activity (Dynamic Island). A
 session's status — working, needs-your-approval, done — shows up on your phone in real time,
 so you can step away from the terminal and still know when an agent needs you or has finished.
-Works with both **Codex CLI and the Codex desktop app**.
+Works with **Codex** in the terminal and the **Codex desktop app** alike.
 
 Everything is **end-to-end encrypted**. Pairing is a single QR-code scan (or a short typed code);
 there is no server key to copy. All session content (titles, machine name, status, even *which* agent produced an
@@ -28,14 +28,24 @@ dependencies** — Node built-ins only.
 
 ## Architecture — end-to-end encrypted
 
-Pairing hands your phone and computer **one shared key**, delivered directly through the QR code —
-it never touches any server. The plugin encrypts every session update with that key **before**
-anything leaves your machine, so the relay Worker and Apple's push service only ever carry
-ciphertext. Decryption happens on your iPhone.
+Pairing establishes **one shared key** that only your phone and computer ever hold — no server
+sees it. There are two ways to hand it over, and both keep the key off every server:
+
+- **Scan the QR** on the pairing page. The QR carries a random pairing secret that rides only in the
+  code image; the phone mixes it with its own nonce (HKDF-SHA256) to derive the shared key.
+- **Type the one-time code** — four words and a short channel number (e.g.
+  `7-ocean-sunset-mango-river`). The phone runs PBKDF2-SHA256 over the four words to reconstruct the
+  same secret, then the same HKDF step, arriving at the identical key. The words never leave the
+  pairing page; the channel is only a one-time routing handle the phone redeems once (it burns on
+  first use and expires in 10 minutes).
+
+Either way, the plugin encrypts every session update with the derived key **before** anything leaves
+your machine, so the relay Worker and Apple's push service only ever carry ciphertext. Decryption
+happens on your iPhone.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/architecture-dark.png">
-  <img src="assets/architecture-light.png" alt="End-to-end encryption architecture: hooks on your computer feed the nomo plugin, which encrypts with a key shared only via QR pairing; the Cloudflare Worker relay and APNs carry ciphertext they cannot read; your iPhone decrypts on device and renders the Live Activity.">
+  <img src="assets/architecture-light.png" alt="End-to-end encryption architecture: hooks on your computer feed the nomo plugin, which encrypts with a key shared only at pair time — by scanning the QR or typing the one-time code, never through a server; the Cloudflare Worker relay and APNs carry ciphertext they cannot read; your iPhone decrypts on device and renders the Live Activity.">
 </picture>
 
 <sub>Diagram source: [`assets/architecture.excalidraw`](assets/architecture.excalidraw) — open it at [excalidraw.com](https://excalidraw.com) to edit.</sub>

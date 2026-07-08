@@ -132,23 +132,42 @@ export function buildPairURL(workerUrl: string, pairingId: string, qrSecret: Uin
   return `nomo://pair?v=1${u}&p=${pairingId}&s=${b64url(qrSecret)}`;
 }
 
-/** Best-effort revoke of an EXISTING *completed* pairing before re-pairing overwrites the config —
- *  keeps the worker's KV free of orphaned pairings. A pending (mid-pairing) config has no e2eKeyB64 so
- *  parseConfig returns null and nothing is revoked — re-running mid-pairing just starts fresh, and the
- *  worker's own GC reclaims the orphaned pending record. Any failure (network, 401, gone) is ignored. */
+/** Extract the auth material a revoke needs from EITHER a COMPLETED ({...e2eKeyB64}) or a still-PENDING
+ *  ({...qrSecretB64}) config — both carry url + pairingId + pcSecret, which is all revoke presents.
+ *
+ *  This is a deliberate LOCAL MIRROR of revokeCreds in src/entries/unpair.ts. It is NOT hoisted into
+ *  core/shared because that module is inlined verbatim into every plugin entry bundle, so a helper
+ *  there ripples ~9 identical lines into 5 unrelated dist artifacts (cc-status, cc-watchdog, codex-*,
+ *  status-cmd). Keep this in sync with unpair.ts. */
+function revokeCreds(raw: string): { url: string; pairingId: string; pcSecret: string } | null {
+  const completed = parseConfig(raw);
+  if (completed) return { url: completed.url, pairingId: completed.pairingId, pcSecret: completed.pcSecret };
+  const pending = parsePendingConfig(raw);
+  if (pending) return { url: pending.url, pairingId: pending.pairingId, pcSecret: pending.pcSecret };
+  return null;
+}
+
+/** Best-effort revoke of an EXISTING pairing before re-pairing overwrites the config — keeps the
+ *  worker's KV free of orphaned pairings. Handles BOTH states via revokeCreds (mirrors unpair): a
+ *  COMPLETED config ({...e2eKeyB64}) AND a still-PENDING one ({...qrSecretB64}). Revoking the pending
+ *  state too matters because an abandoned mid-pairing record otherwise squats at the worker until its
+ *  TTL — 600s for an unclaimed pending record, 24h for a claimed-but-unacked one — so re-pairing without
+ *  revoking would leave a stale claimable record behind each time. Any failure (network, 401, gone) is
+ *  ignored — an unreachable worker must not block re-pairing. */
 async function revokeExisting(fetchFn: typeof fetch, configPath: string, print: (l: string) => void): Promise<void> {
-  let old: ReturnType<typeof parseConfig>;
+  let raw: string;
   try {
-    old = parseConfig(await readFile(configPath, "utf8"));
+    raw = await readFile(configPath, "utf8");
   } catch {
     return; // no config — fresh pair
   }
-  if (!old) return;
-  print(`Already paired (pairing ${old.pairingId.slice(0, 8)}…) — revoking the old pairing first.`);
+  const creds = revokeCreds(raw);
+  if (!creds) return; // corrupt / pre-v2 config with no id/secret to revoke — just start fresh
+  print(`Revoking the previous pairing (pairing ${creds.pairingId.slice(0, 8)}…) before starting fresh.`);
   try {
-    await fetchFn(`${old.url}/v1/cc/pair/revoke`, {
+    await fetchFn(`${creds.url}/v1/cc/pair/revoke`, {
       method: "POST",
-      headers: { "x-cc-pairing": old.pairingId, "x-cc-auth": old.pcSecret },
+      headers: { "x-cc-pairing": creds.pairingId, "x-cc-auth": creds.pcSecret },
       signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
     });
   } catch {
@@ -173,8 +192,8 @@ export async function pairStart(deps: PairDeps = {}): Promise<number> {
   // an old (now-revoked) QR secret / code can never be re-used. Tolerates ENOENT.
   await unlink(htmlPath).catch(() => {});
 
-  // Re-pairing over an existing *completed* config revokes the old one best-effort; a pending config
-  // is left alone (re-running mid-pairing just starts fresh).
+  // Re-pairing over an existing config revokes the old one best-effort — a COMPLETED pairing or an
+  // abandoned still-PENDING one (both own a claimable server-side record) — before overwriting it.
   await revokeExisting(fetchFn, configPath, print);
 
   const pairingId = bytesToHex(randomBytes(16)); // 32-hex

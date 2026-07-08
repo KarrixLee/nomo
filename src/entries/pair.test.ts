@@ -683,18 +683,46 @@ describe("pairStart (re-pairing over an existing config)", () => {
     expect(written.e2eKeyB64).toBeUndefined();
   });
 
-  test("re-running over a PENDING config just starts fresh (no revoke — pending has no credentials to revoke)", async () => {
+  test("revokes the OLD *pending* pairing too before starting fresh (an abandoned mid-pairing record still owns a claimable server-side record)", async () => {
+    // writePending's default pcSecret (EXPECTED_PC_SECRET) is the auth material revoke presents.
     await writePending({ pairingId: "c".repeat(32), qrSecretB64: b64url(new Uint8Array(16).fill(7)) });
-    const { fn, calls } = scriptedFetch([() => json({ ok: true }, 201)]);
+    const { fn, calls } = scriptedFetch([
+      (url, init) => {
+        expect(url).toBe(`${WORKER}/v1/cc/pair/revoke`);
+        expect(init?.method).toBe("POST");
+        const h = init?.headers as Record<string, string>;
+        expect(h["x-cc-pairing"]).toBe("c".repeat(32)); // the OLD pending pairingId, not the fresh one
+        expect(h["x-cc-auth"]).toBe(EXPECTED_PC_SECRET);
+        return json({ ok: true });
+      },
+      () => json({ ok: true }, 201),
+    ]);
     expect(await pairStart({
       fetchFn: fn, print, configPath, workerUrl: WORKER, spawnWatchdog: () => {},
       randomBytes: scriptedRandom([PAIRING_BYTES, PC_SECRET_BYTES, QR_SECRET]),
       htmlPath: join(dir, PAIR_HTML_FILE), openFile: () => true,
     })).toBe(0);
-    expect(calls.length).toBe(1); // ONLY start — no revoke for a pending config
-    expect(calls[0].url).toContain("/pair/start");
+    expect(calls.length).toBe(2); // revoke (of the old pending) THEN start
+    expect(calls[0].url).toContain("/pair/revoke");
+    expect(calls[1].url).toContain("/pair/start");
     const written = JSON.parse(await readFile(configPath, "utf8")) as Record<string, string>;
     expect(written.pairingId).toBe(EXPECTED_PAIRING_ID); // overwritten with the fresh pairing
+  });
+
+  test("a failing revoke of an old PENDING pairing does not block re-pairing", async () => {
+    await writePending({ pairingId: "c".repeat(32) });
+    const { fn, calls } = scriptedFetch([
+      () => { throw new Error("worker unreachable"); }, // revoke of the old pending fails
+      () => json({ ok: true }, 201), // start still proceeds
+    ]);
+    expect(await pairStart({
+      fetchFn: fn, print, configPath, workerUrl: WORKER, spawnWatchdog: () => {},
+      randomBytes: scriptedRandom([PAIRING_BYTES, PC_SECRET_BYTES, QR_SECRET]),
+      htmlPath: join(dir, PAIR_HTML_FILE), openFile: () => true,
+    })).toBe(0);
+    expect(calls.length).toBe(2);
+    const written = JSON.parse(await readFile(configPath, "utf8")) as Record<string, string>;
+    expect(written.pairingId).toBe(EXPECTED_PAIRING_ID);
   });
 
   test("a failing revoke of the old pairing does not block re-pairing", async () => {

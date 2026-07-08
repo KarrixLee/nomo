@@ -3225,20 +3225,30 @@ function buildPairURL(workerUrl, pairingId, qrSecret) {
   const u = workerUrl === DEFAULT_WORKER_URL ? "" : `&u=${b64url(textEncoder2.encode(workerUrl))}`;
   return `nomo://pair?v=1${u}&p=${pairingId}&s=${b64url(qrSecret)}`;
 }
+function revokeCreds(raw) {
+  const completed = parseConfig(raw);
+  if (completed)
+    return { url: completed.url, pairingId: completed.pairingId, pcSecret: completed.pcSecret };
+  const pending = parsePendingConfig(raw);
+  if (pending)
+    return { url: pending.url, pairingId: pending.pairingId, pcSecret: pending.pcSecret };
+  return null;
+}
 async function revokeExisting(fetchFn, configPath, print) {
-  let old;
+  let raw;
   try {
-    old = parseConfig(await readFile2(configPath, "utf8"));
+    raw = await readFile2(configPath, "utf8");
   } catch {
     return;
   }
-  if (!old)
+  const creds = revokeCreds(raw);
+  if (!creds)
     return;
-  print(`Already paired (pairing ${old.pairingId.slice(0, 8)}…) — revoking the old pairing first.`);
+  print(`Revoking the previous pairing (pairing ${creds.pairingId.slice(0, 8)}…) before starting fresh.`);
   try {
-    await fetchFn(`${old.url}/v1/cc/pair/revoke`, {
+    await fetchFn(`${creds.url}/v1/cc/pair/revoke`, {
       method: "POST",
-      headers: { "x-cc-pairing": old.pairingId, "x-cc-auth": old.pcSecret },
+      headers: { "x-cc-pairing": creds.pairingId, "x-cc-auth": creds.pcSecret },
       signal: AbortSignal.timeout(FETCH_TIMEOUT_MS)
     });
   } catch {}
