@@ -1,20 +1,50 @@
 ---
 description: Pair this computer with the Nomo iPhone app via a QR code (end-to-end encrypted)
+argument-hint: [code]
 ---
 
-Pairing is two quick steps: **open the pairing page**, then **wait for the phone to scan it**. Run
-them in order, both in the **foreground**.
+Pairing is two quick steps: **do step 1** (register + hand off the pairing), then **wait for the
+phone to claim it** (step 2). Run them in order, both in the **foreground**.
 
-## Step 1 — open the pairing page (fast)
+## Which path — read `$ARGUMENTS` first
 
-Run this exact command in the foreground and wait for it to finish (it returns in a second or two):
+The `$ARGUMENTS` string decides how step 1 hands off the pairing. Step 2 is identical either way.
+
+- **No argument** (`$ARGUMENTS` is empty) → **default browser path.** Run step 1 exactly as written
+  below: it opens a themed pairing page (QR + click-to-reveal code) in the browser and keeps the
+  one-time code out of this terminal.
+- **`$ARGUMENTS` is `code`** (trim whitespace, case-insensitive) → **no-browser code path.** The user
+  explicitly asked for the typeable code without a browser (headless / SSH). Run step 1's command with
+  `--show-code` appended (see the code-path block below): this skips the browser/QR page and prints
+  **only** the one-time pairing code straight into this terminal/transcript. Relay that printed code to
+  the user, plus the app instructions (**Sessions → Pair a Computer → “Enter code”**). This puts the
+  code in the transcript, but that trade-off is intended here — the user opted in by typing `code`.
+- **Any other value** of `$ARGUMENTS` → treat it as the **default browser path** (do not error).
+
+Whichever path you take, the guard in step 1 still holds: **only the short typeable code may ever be
+printed — the `nomo://pair…` / `s=` deep link and the QR art must NEVER be echoed or reconstructed.**
+
+## Step 1 — hand off the pairing (fast)
+
+Run the command for your path in the foreground and wait for it to finish (it returns in a second or
+two). Use **exactly one** of these two forms:
+
+**Default browser path** (no argument) — opens the QR page, code stays hidden from the terminal:
 
 ```
 "${CLAUDE_PLUGIN_ROOT}/scripts/run.sh" "${CLAUDE_PLUGIN_ROOT}/dist/pair.mjs"
 ```
 
-- This registers the pairing, writes a themed pairing **page**, and **opens it in the user's default
-  browser**, then exits. It does **not** wait for the phone — that's step 2. The page shows the QR
+**Code path** (`$ARGUMENTS` is `code`) — no browser; prints the one-time code into this terminal:
+
+```
+"${CLAUDE_PLUGIN_ROOT}/scripts/run.sh" "${CLAUDE_PLUGIN_ROOT}/dist/pair.mjs" --show-code
+```
+
+- The **default** command registers the pairing, writes a themed pairing **page**, and **opens it in
+  the user's default browser**, then exits. The **code** command skips that page entirely and prints
+  only the one-time typeable code. Neither one waits for the phone — that's step 2. On the default path
+  the page shows the QR
   **and** a one-time pairing code, hidden behind a "Tap to reveal code" control until clicked — the
   code is not printed to the terminal by default.
 - **The command's output tells you what happened — relay it in your own words:**

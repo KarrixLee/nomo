@@ -118,6 +118,8 @@ this machine's Claude Code sessions appear in the app.
 Other commands:
 
 - `/nomo-cc:pair` — pair this machine (opens a browser page with the QR code + one-time code).
+- `/nomo-cc:pair code` — no-browser variant for a headless/SSH box: skips the QR page and prints the
+  one-time typeable code straight into the terminal, so you can enter it in the app by hand.
 - `/nomo-cc:status` — pairing / watchdog / last-delivery health at a glance.
 - `/nomo-cc:unpair` — revoke the pairing on the server and delete local pairing state.
 
