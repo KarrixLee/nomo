@@ -3,7 +3,7 @@ name: nomo-pair
 description: Pair this computer with the Nomo iPhone app via a QR code (end-to-end encrypted). Use when the user asks to pair, connect their phone, set up Nomo, or link this machine so Codex sessions appear on their iPhone.
 ---
 
-Pairing is: **resolve the plugin path**, **open the QR outside the TUI**, then **confirm the scan**.
+Pairing is: **resolve the plugin path**, **open the pairing page**, then **confirm the scan**.
 Run the steps in order, in the foreground.
 
 ## Step 1 — resolve the plugin path
@@ -21,7 +21,7 @@ uses `<ROOT>` — substitute the real path you just read.
 If no `nomo@…` row exists, the plugin isn't installed — tell the user to add the Nomo marketplace and
 install the `nomo` plugin, then stop.
 
-## Step 2 — open the QR (outside the TUI)
+## Step 2 — open the pairing page (outside the TUI)
 
 Network calls need sandbox escalation in Codex. **Request escalated/approved permissions up front**
 and tell the user it's because pairing has to reach the Nomo relay over HTTPS — don't just let the
@@ -29,19 +29,21 @@ command fail. Then run this exact command in the foreground and wait for it to f
 a second or two):
 
 ```
-exec "<ROOT>/scripts/run.sh" "<ROOT>/dist/pair.mjs" --open
+exec "<ROOT>/scripts/run.sh" "<ROOT>/dist/pair.mjs"
 ```
 
-- `--open` renders the QR to a standalone image and opens it **outside** the Codex TUI (the terminal
-  QR is unreliable in Codex — output is folded). **Relay the script's printed instructions to the
-  user in your own words** (scan it in Nomo → Sessions → "Pair a Computer").
-- **Do NOT reproduce QR art in your reply** — Codex folds tool output and a mangled QR won't scan.
-  The image window is the QR the user scans.
-- **NEVER echo, reconstruct, or invent any `nomo://pair…` URL or `s=` value.** That is a plaintext
-  copy of the end-to-end secret; it must never enter the transcript. The command does not print it,
-  and neither do you.
-- If the script reports it **could not open the image**, give the user the printed **file path** so
-  they can open it themselves.
+- This writes a themed pairing **page** and **opens it in the default browser**, outside the Codex
+  TUI (a folded terminal QR is unreliable in Codex). The page shows the QR **and** a one-time pairing
+  code. **Relay the script's printed status line to the user in your own words:**
+  - `Pairing page opened in your browser.` → tell them to look at the browser window that just
+    opened, then scan the QR in Nomo → Sessions → "Pair a Computer" (or tap "Enter code" and type the
+    code shown on the page).
+  - `Open this file in a browser: <path>` → the browser couldn't launch; give them that **file path**
+    to open on the machine's display.
+- **Do NOT reproduce QR art in your reply, and NEVER echo, reconstruct, or invent any `nomo://pair…`
+  URL, `s=` value, or the code words.** None of that is printed to stdout — it lives ONLY on the page —
+  and it must never enter the transcript: it is the end-to-end secret. Relay only the neutral status
+  line above.
 - If the command prints an error line instead (network, rate-limit), relay that line and stop.
 
 ## Step 3 — confirm the scan

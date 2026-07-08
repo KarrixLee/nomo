@@ -73,19 +73,19 @@ describe("unpair (completed pairing)", () => {
   });
 });
 
-describe("unpair (tears down a transient pair --open SVG)", () => {
-  test("deletes the pairing SVG alongside config + last-send", async () => {
-    const qrSvgPath = join(dir, "pair-qr.svg");
+describe("unpair (tears down the transient pairing page)", () => {
+  test("deletes pair.html alongside config + last-send", async () => {
+    const htmlPath = join(dir, "pair.html");
     await writeFile(configPath, JSON.stringify({
       url: WORKER, pairingId: PAIRING_ID, pcSecret: PC_SECRET, e2eKeyB64: E2E_KEY_B64,
     }));
     await writeFile(lastSendPath, String(Date.now()));
-    await writeFile(qrSvgPath, "<svg>secret QR</svg>");
+    await writeFile(htmlPath, "<html>secret QR + code</html>");
 
     const { fn } = scriptedFetch([() => json({ ok: true })]);
-    expect(await unpair({ fetchFn: fn, print, configPath, lastSendPath, qrSvgPath })).toBe(0);
+    expect(await unpair({ fetchFn: fn, print, configPath, lastSendPath, htmlPath })).toBe(0);
     await expect(stat(configPath)).rejects.toBeDefined();
-    await expect(stat(qrSvgPath)).rejects.toBeDefined(); // the secret-bearing SVG is gone too
+    await expect(stat(htmlPath)).rejects.toBeDefined(); // the secret-bearing page is gone too
     expect(lines.at(-1)).toBe("Unpaired ✓");
   });
 });

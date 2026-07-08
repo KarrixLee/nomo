@@ -9,15 +9,15 @@
 // PORTABILITY: bun AND node >= 18 (after Task 2.3 bundles it) — no Bun.* APIs.
 
 import { readFile, unlink } from "node:fs/promises";
-import { CC_DIR, LAST_SEND_PATH, PAIR_QR_SVG_PATH, parseConfig, parsePendingConfig } from "../core/shared";
+import { CC_DIR, LAST_SEND_PATH, PAIR_HTML_PATH, parseConfig, parsePendingConfig } from "../core/shared";
 
 export interface UnpairDeps {
   fetchFn?: typeof fetch;
   print?: (line: string) => void;
   configPath?: string;
   lastSendPath?: string;
-  /** A transient `pair --open` SVG to tear down alongside the config; defaults to PAIR_QR_SVG_PATH. */
-  qrSvgPath?: string;
+  /** The transient pairing page (pair.html) to tear down alongside the config; defaults to PAIR_HTML_PATH. */
+  htmlPath?: string;
   /** Per-request ceiling on the server revoke so a hung socket can't stall the command. */
   revokeTimeoutMs?: number;
 }
@@ -47,7 +47,7 @@ export async function unpair(deps: UnpairDeps = {}): Promise<number> {
   const print = deps.print ?? ((line: string) => console.log(line));
   const configPath = deps.configPath ?? `${CC_DIR}/config.json`;
   const lastSendPath = deps.lastSendPath ?? LAST_SEND_PATH;
-  const qrSvgPath = deps.qrSvgPath ?? PAIR_QR_SVG_PATH;
+  const htmlPath = deps.htmlPath ?? PAIR_HTML_PATH;
   const revokeTimeoutMs = deps.revokeTimeoutMs ?? 5000;
 
   let raw: string;
@@ -87,7 +87,7 @@ export async function unpair(deps: UnpairDeps = {}): Promise<number> {
 
   await unlink(configPath).catch(() => {});
   await unlink(lastSendPath).catch(() => {});
-  await unlink(qrSvgPath).catch(() => {}); // tear down any transient `pair --open` SVG (best-effort)
+  await unlink(htmlPath).catch(() => {}); // tear down the transient pairing page (best-effort)
   print("Unpaired ✓");
   return 0;
 }

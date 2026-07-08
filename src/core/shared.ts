@@ -41,13 +41,14 @@ export const GONE_STRIKE_LIMIT = 2;
 export const PENDING_STASH_FILE = "pending-event.json";
 /** Absolute stash path for the running hook. Tests derive their own from a temp configPath's dir. */
 export const PENDING_STASH_PATH = `${CC_DIR}/${PENDING_STASH_FILE}`;
-/** Basename of the transient pairing SVG `pair --open` writes next to config.json (0600). It encodes
- *  the same `nomo://pair` secret URL as the QR, so it is short-lived: deleted the instant pairing
- *  completes (completePendingPairing, covering the watchdog self-heal), by unpair, and overwritten by
- *  any new pairStart. */
-export const PAIR_QR_SVG_FILE = "pair-qr.svg";
-/** Absolute pairing-SVG path for the running CLI. Tests derive their own from a temp configPath's dir. */
-export const PAIR_QR_SVG_PATH = `${CC_DIR}/${PAIR_QR_SVG_FILE}`;
+/** Basename of the transient pairing PAGE `pair` writes next to config.json (0600) and opens in the
+ *  browser. It embeds the same `nomo://pair` secret (inside the inline QR SVG) plus, when the worker
+ *  assigned a channel, the one-time code — so it is short-lived: deleted the instant pairing completes
+ *  (completePendingPairing, covering the watchdog self-heal), by unpair, and overwritten by any new
+ *  pairStart. */
+export const PAIR_HTML_FILE = "pair.html";
+/** Absolute pairing-page path for the running CLI. Tests derive their own from a temp configPath's dir. */
+export const PAIR_HTML_PATH = `${CC_DIR}/${PAIR_HTML_FILE}`;
 
 /** This module's own directory, resolved from import.meta.url so it works regardless of the hook's
  *  cwd (both files live in the same directory). fileURLToPath+dirname is portable across bun and
@@ -235,6 +236,11 @@ export interface PendingConfig {
   pairingId: string;
   pcSecret: string;
   qrSecret: Uint8Array;
+  /** The 32-byte PBKDF2 codeIkm for the magic-code pairing path (pairing v2), persisted alongside
+   *  qrSecret so `wait` / the watchdog self-heal can complete a CODE claim without recomputing the
+   *  600k-iteration PBKDF2. Absent when the worker assigned no channel (QR-only) or for a config
+   *  written by an older `pair` — a `path:"code"` claim then can't be completed (treated as tampered). */
+  codeIkm?: Uint8Array;
   machineName?: string;
   /** Epoch-ms the pairing was STARTED (stamped by pairStart). Bounds the self-heal window: past
    *  createdAt + the 10-min QR TTL, a still-pending config is expired. Optional so a config written by
@@ -268,11 +274,24 @@ export function parsePendingConfig(raw: string): PendingConfig | null {
     return null;
   }
   if (qrSecret.length !== 16) return null;
+  // codeIkm is optional (the magic-code path): present only when the worker assigned a channel. A
+  // malformed or wrong-length value is ignored (treated as absent) — a code claim then fails the tamper
+  // gate rather than crashing the parse; the QR path is unaffected.
+  let codeIkm: Uint8Array | undefined;
+  if (typeof c.codeIkmB64 === "string") {
+    try {
+      const decoded = fromB64url(c.codeIkmB64);
+      if (decoded.length === 32) codeIkm = decoded;
+    } catch {
+      // ignore a corrupt codeIkm — the pending config is still valid for the QR path
+    }
+  }
   return {
     url: c.url.replace(/\/$/, ""),
     pairingId: c.pairingId,
     pcSecret: c.pcSecret,
     qrSecret,
+    ...(codeIkm ? { codeIkm } : {}),
     machineName: typeof c.machineName === "string" && c.machineName.length > 0 ? c.machineName : undefined,
     createdAt: typeof c.createdAt === "number" && Number.isFinite(c.createdAt) ? c.createdAt : undefined,
   };
@@ -472,7 +491,7 @@ export async function completePendingPairing(
   if (res.status === 404) return { state: "gone" };
   if (!res.ok) return { state: "rejected", httpStatus: res.status };
 
-  const body = (await res.json()) as { state?: string; phoneNonce?: string; deviceNameEnc?: string };
+  const body = (await res.json()) as { state?: string; phoneNonce?: string; deviceNameEnc?: string; path?: string };
   // A claimed record whose phoneNonce was stripped means it was ALREADY acked by a concurrent
   // completer (the watchdog / a prior wait) — the server keeps state:"claimed" but drops the nonce +
   // name blob after ack. We can't derive the key from it, so this is NOT "pending" (which would spin
@@ -484,12 +503,18 @@ export async function completePendingPairing(
     return { state: "pending" };
   }
 
-  const e2eKey = await deriveE2EKey(pending.qrSecret, fromB64url(body.phoneNonce));
+  // The phone claimed via the QR (`path:"qr"` or absent → the historical default) or the magic code
+  // (`path:"code"`). Each has its own HKDF input: the raw qrSecret for QR, the PBKDF2 codeIkm for code.
+  // A code claim with no stored codeIkm (QR-only pairing / older config) can't be completed — treat it
+  // like a tampered claim rather than deriving a bogus key from the wrong material.
+  const ikm = body.path === "code" ? pending.codeIkm : pending.qrSecret;
+  if (!ikm) return { state: "tampered" };
+  const e2eKey = await deriveE2EKey(ikm, fromB64url(body.phoneNonce));
   let deviceName: string;
   try {
     deviceName = await decryptDeviceName(e2eKey, body.deviceNameEnc);
   } catch {
-    return { state: "tampered" }; // wrong key → the QR was tampered with; do NOT persist a bogus key
+    return { state: "tampered" }; // wrong key → the QR/code was tampered with; do NOT persist a bogus key
   }
 
   // Belt-and-suspenders: lock down any pre-existing file ahead of the atomicWrite (which already
@@ -532,11 +557,12 @@ export async function completePendingPairing(
     opts.isAlive ?? pidAlive, opts.ensureWatchdog ?? ensureWatchdog, opts.sessionsDir ?? SESSIONS_DIR,
   );
 
-  // Delete the transient pairing SVG (`pair --open` writes it next to config.json): it encodes the QR
-  // secret and is worthless the instant the pairing completes. Best-effort, tolerates ENOENT (no
-  // --open, or already gone). This one unlink covers BOTH completers — the `pair wait` CLI and the
-  // watchdog self-heal both funnel through here — so no separate cleanup is needed in cc-watchdog.ts.
-  await unlink(join(dirname(configPath), PAIR_QR_SVG_FILE)).catch(() => {});
+  // Delete the transient pairing page (`pair` writes pair.html next to config.json and opens it): it
+  // embeds the QR secret + the one-time code and is worthless the instant the pairing completes.
+  // Best-effort, tolerates ENOENT (already gone). This one unlink covers BOTH completers — the
+  // `pair wait` CLI and the watchdog self-heal both funnel through here — so no separate cleanup is
+  // needed in cc-watchdog.ts.
+  await unlink(join(dirname(configPath), PAIR_HTML_FILE)).catch(() => {});
   return { state: "completed", deviceName };
 }
 

@@ -1,18 +1,20 @@
-// pair — the PC side of QR pairing (Task 2.2 of the CC pairing + E2E plan), split into two phases so
-// the QR appears within seconds instead of after a blocking 10-minute poll (Claude Code's Bash tool
-// does not stream output — nothing shows until the process exits, so a foreground poll hides the QR).
+// pair — the PC side of pairing (pairing v2), split into two phases so the pairing page opens within
+// seconds instead of after a blocking 10-minute poll (Claude Code's Bash tool does not stream output —
+// nothing shows until the process exits, so a foreground poll would hide the page-opened line).
 //
 //   `pair.mjs`        (default) — the FAST start: mints the pairing, registers it, writes a PENDING
-//                     config (qrSecret persisted 0600), prints the QR + `nomo://pair` URL, and exits
-//                     within a couple of seconds. Also spawns the detached watchdog so the pairing
-//                     still completes if the wait step never runs.
+//                     config (qrSecret + codeIkm persisted 0600), writes a self-contained themed
+//                     `pair.html` (QR + one-time code) and opens it in the browser, then exits within a
+//                     couple of seconds. Also spawns the detached watchdog so the pairing still
+//                     completes if the wait step never runs.
 //   `pair.mjs wait`   — reads the pending config and polls until the phone claims it (up to 10 min),
-//                     then rewrites config to its completed form (qrSecret dropped, e2eKey present),
+//                     then rewrites config to its completed form (secrets dropped, e2eKey present),
 //                     acks, and prints `Paired with … ✓`.
 //
 // Output contract: pure sequential stdout lines — no ANSI cursor tricks/clears — so it renders cleanly
 // inside a slash-command transcript. Unlike the hook (silence + exit 0 always), these are interactive
-// commands: failures print ONE clear friendly line and exit non-zero.
+// commands: failures print ONE clear friendly line and exit non-zero. NOTHING secret ever reaches
+// stdout — no QR art, no `nomo://pair` URL, no code words; the browser page is the only place they show.
 //
 // PORTABILITY: bun AND node >= 18 (after Task 2.3 bundles it) — no Bun.* APIs, node: imports and
 // globalThis.crypto only.
@@ -20,11 +22,12 @@
 import { spawn } from "node:child_process";
 import { readFile, unlink } from "node:fs/promises";
 import {
-  atomicWrite, CC_DIR, completePendingPairing, ensureWatchdog, PAIR_QR_SVG_PATH, parseConfig,
+  atomicWrite, CC_DIR, completePendingPairing, ensureWatchdog, PAIR_HTML_PATH, parseConfig,
   parsePendingConfig,
 } from "../core/shared";
 import { b64url, sha256Hex } from "../core/crypto";
-import { renderQR } from "../qr/qr";
+import { deriveCodeIkm, formatCodeString, randomCodeWords } from "../core/pair-code";
+import { renderPairPage } from "../core/pair-page";
 import { renderQRSVG } from "../qr/qr-svg";
 
 // decryptDeviceName lived here historically; it now backs both this CLI and the watchdog self-heal,
@@ -63,26 +66,26 @@ export interface PairDeps {
   spawnWatchdog?: () => void;
   /** Wall clock; injectable so tests get a deterministic createdAt stamp. Defaults to Date.now. */
   now?: () => number;
-  /** `pair --open`: after printing the terminal QR, also render the same URL to an SVG file and pop it
-   *  open in the OS viewer (outside the TUI, where a crisp QR scans reliably). Default false. */
-  open?: boolean;
-  /** Where the `--open` SVG is written (0600). Defaults to PAIR_QR_SVG_PATH; tests point it at a temp
-   *  dir. A stale SVG here is removed at the START of every pairStart regardless of `--open`. */
-  qrSvgPath?: string;
-  /** Opens the rendered SVG in the OS image viewer. Returns true when it launched a viewer, false to
-   *  fall back to printing the path. Defaults to openSvgFile (spawn open/xdg-open, best-effort); tests
-   *  inject a spy so no real viewer launches. */
+  /** Where the pairing page (pair.html) is written (0600) and opened. Defaults to PAIR_HTML_PATH;
+   *  tests point it at a temp dir. A stale page here is removed at the START of every pairStart. */
+  htmlPath?: string;
+  /** Opens the rendered pairing page in the default browser. Returns true when it launched one, false
+   *  to fall back to printing the path. Defaults to openInBrowser (spawn open/xdg-open, best-effort);
+   *  tests inject a spy so no real browser launches. */
   openFile?: (path: string) => boolean;
+  /** Picks the magic-code words for the code pairing path. Defaults to randomCodeWords (crypto random
+   *  from the BIP39 wordlist); tests inject fixed words for deterministic pages. */
+  pickWords?: () => string[];
   /** `wait --timeout <seconds>` (as ms): bounds the poll loop. A timeout is then a SOFT exit-0 (the
    *  Codex flow — self-heal finishes in the background), not the hard 10-min "window expired" exit-1.
    *  The QR's real 10-min TTL (the createdAt guard) is unchanged. Absent → historical full-window wait. */
   softTimeoutMs?: number;
 }
 
-/** Default SVG opener: `open` on darwin, `xdg-open` on linux, detached + unref'd so the CLI never
- *  waits on the viewer. Best-effort — returns false (caller prints the path instead) on any other
- *  platform, a spawn failure, or when NOMO_NO_OPEN=1 (the test escape hatch). */
-function openSvgFile(path: string): boolean {
+/** Default browser opener: `open` on darwin, `xdg-open` on linux, detached + unref'd so the CLI never
+ *  waits on the browser. Best-effort — returns false (caller prints the path instead) on any other
+ *  platform, a spawn failure, or when NOMO_NO_OPEN=1 (the test / headless escape hatch). */
+function openInBrowser(path: string): boolean {
   if (process.env.NOMO_NO_OPEN === "1") return false;
   const cmd = process.platform === "darwin" ? "open" : process.platform === "linux" ? "xdg-open" : null;
   if (!cmd) return false;
@@ -90,7 +93,7 @@ function openSvgFile(path: string): boolean {
     spawn(cmd, [path], { detached: true, stdio: "ignore" }).unref();
     return true;
   } catch {
-    return false; // no viewer / spawn blocked — the caller prints the saved path
+    return false; // no browser / spawn blocked — the caller prints the saved path
   }
 }
 
@@ -121,12 +124,6 @@ export function buildPairURL(workerUrl: string, pairingId: string, qrSecret: Uin
   const u = workerUrl === DEFAULT_WORKER_URL ? "" : `&u=${b64url(textEncoder.encode(workerUrl))}`;
   return `nomo://pair?v=1${u}&p=${pairingId}&s=${b64url(qrSecret)}`;
 }
-
-/** Markers fencing the QR art in the command output. The assistant reproduces EXACTLY the block
- *  between them (the QR, nothing else) into a fenced code block so the user can scan it from chat.
- *  Everything outside the markers stays local to the terminal and must never enter the reply. */
-export const QR_BEGIN_MARKER = "──── NOMO PAIRING QR — scan this with the Nomo app ────";
-export const QR_END_MARKER = "──── end QR ────";
 
 /** Best-effort revoke of an EXISTING *completed* pairing before re-pairing overwrites the config —
  *  keeps the worker's KV free of orphaned pairings. A pending (mid-pairing) config has no e2eKeyB64 so
@@ -162,11 +159,12 @@ export async function pairStart(deps: PairDeps = {}): Promise<number> {
   const workerUrl = (deps.workerUrl ?? process.env.NOMO_WORKER_URL ?? DEFAULT_WORKER_URL).replace(/\/$/, "");
   const spawnWatchdog = deps.spawnWatchdog ?? ensureWatchdog;
   const now = deps.now ?? Date.now;
-  const qrSvgPath = deps.qrSvgPath ?? PAIR_QR_SVG_PATH;
+  const htmlPath = deps.htmlPath ?? PAIR_HTML_PATH;
+  const pickWords = deps.pickWords ?? (() => randomCodeWords(randomBytes));
 
-  // Remove any stale pairing SVG from a PRIOR attempt at the very start — regardless of `--open` — so a
-  // leftover crisp QR encoding an old (now-revoked) secret can never be re-scanned. Tolerates ENOENT.
-  await unlink(qrSvgPath).catch(() => {});
+  // Remove any stale pairing page from a PRIOR attempt at the very start — so a leftover page embedding
+  // an old (now-revoked) QR secret / code can never be re-used. Tolerates ENOENT.
+  await unlink(htmlPath).catch(() => {});
 
   // Re-pairing over an existing *completed* config revokes the old one best-effort; a pending config
   // is left alone (re-running mid-pairing just starts fresh).
@@ -201,14 +199,41 @@ export async function pairStart(deps: PairDeps = {}): Promise<number> {
     return 1;
   }
 
-  // Persist the PENDING config BEFORE printing the QR: the qrSecret must be on disk so the `wait` step
-  // (or the watchdog self-heal) can derive the key once the phone claims — even if this process is
-  // killed the instant after the QR appears. Owner-only (0600); qrSecret is key material.
+  // The pairing-v2 worker returns a numeric `channel` (>= 1) — the routing prefix for the human-typeable
+  // magic code. Absent / non-numeric (an OLD worker) → skip the code path entirely: the page shows the
+  // QR alone, and the config carries no codeIkm (a `path:"code"` claim then can't complete). A missing
+  // or non-JSON body is tolerated the same way.
+  let channel: number | undefined;
+  try {
+    const startBody = (await startRes.json()) as { channel?: unknown };
+    if (typeof startBody.channel === "number" && Number.isInteger(startBody.channel) && startBody.channel >= 1) {
+      channel = startBody.channel;
+    }
+  } catch {
+    // no body / not JSON → treat as an old worker (QR-only)
+  }
+
+  // With a channel, mint the magic code: 4 crypto-random BIP39 words → the codeIkm (PBKDF2 over the
+  // words, salted by pairingId) that replaces qrSecret as the code path's HKDF input. The code STRING
+  // (`<channel>-w1-w2-w3-w4`) is shown on the page only; codeIkm is persisted so `wait` / the watchdog
+  // can complete a code claim without recomputing the 600k-iteration PBKDF2.
+  let codeString: string | undefined;
+  let codeIkm: Uint8Array | undefined;
+  if (channel !== undefined) {
+    const words = pickWords();
+    codeIkm = await deriveCodeIkm(words, pairingId);
+    codeString = formatCodeString(channel, words);
+  }
+
+  // Persist the PENDING config BEFORE opening the page: qrSecret (and codeIkm, if any) must be on disk
+  // so the `wait` step (or the watchdog self-heal) can derive the key once the phone claims — even if
+  // this process is killed the instant after the page opens. Owner-only (0600); it is key material.
   await atomicWrite(configPath, JSON.stringify({
     url: workerUrl,
     pairingId,
     pcSecret,
     qrSecretB64: b64url(qrSecret),
+    ...(codeIkm ? { codeIkmB64: b64url(codeIkm) } : {}),
     createdAt: now(), // bounds the watchdog self-heal to the QR's 10-min TTL
   }), CONFIG_MODE);
 
@@ -216,39 +241,27 @@ export async function pairStart(deps: PairDeps = {}): Promise<number> {
   // closed terminal, dead session): it self-heals a claimed-but-pending config. Best-effort, no wait.
   spawnWatchdog();
 
+  // SECURITY (E2E / blind worker): the QR encodes qrSecret and the page shows the magic code — the HKDF
+  // inputs the worker must NEVER see (with the worker-held phoneNonce it would derive every session's
+  // AES key). Both live ONLY on the themed pairing page written 0600 and opened in the browser; NOTHING
+  // secret (no QR art, no `nomo://pair` URL, no code words) is ever printed to stdout, because stdout
+  // lands in greppable agent transcripts. The page is torn down the instant pairing completes
+  // (completePendingPairing / the watchdog self-heal / unpair).
   const url = buildPairURL(workerUrl, pairingId, qrSecret);
-  // SECURITY (E2E / blind worker): the QR encodes qrSecret — the HKDF input the worker must never see
-  // (with the worker-held phoneNonce it derives the AES key for every session blob). The assistant
-  // reproduces the QR (between the markers) into a fenced code block so the user can scan it from chat;
-  // the QR modules therefore land in the transcript as a DECODE-ONLY copy of the secret — an accepted
-  // tradeoff for a scannable QR. The plaintext `nomo://pair?...&s=` link is deliberately NOT printed:
-  // it is the trivially-greppable copy of the same secret and adds no real UX (a b64 secret isn't hand-
-  // typed). pair.md must fence reproduction to the QR block ONLY — never invent or echo a nomo:// link.
-  print(QR_BEGIN_MARKER);
-  print(renderQR(url));
-  print(QR_END_MARKER);
-  print("");
-  print("Scan the QR above with the Nomo app: Sessions tab → Pair a Computer.");
-  print("This code expires in 10 minutes. Keep this session open — the next step waits for your phone.");
-
-  // `pair --open`: render the SAME pair URL to a standalone SVG and pop it open in the OS viewer, out of
-  // the TUI where a folded/non-streaming terminal QR is unreliable. The SVG encodes the qrSecret exactly
-  // like the QR modules above, so it is written 0600 and torn down by completePendingPairing / the
-  // watchdog self-heal / unpair — the plaintext `nomo://pair` URL itself is STILL never printed. Fully
-  // best-effort: a write/open failure leaves the in-terminal QR (printed above) as the scannable path.
-  if (deps.open) {
-    try {
-      await atomicWrite(qrSvgPath, renderQRSVG(url), CONFIG_MODE);
-      const opened = (deps.openFile ?? openSvgFile)(qrSvgPath);
-      if (opened) {
-        print("QR opened in a separate window — scan it with the Nomo app (Sessions → Pair a Computer).");
-      } else {
-        print(`QR image saved: ${qrSvgPath}`);
-      }
-    } catch {
-      // best-effort — the terminal QR above is still scannable
-    }
+  const page = renderPairPage({
+    svg: renderQRSVG(url),
+    code: codeString ?? null,
+    expiresAt: now() + MAX_WAIT_MS,
+  });
+  await atomicWrite(htmlPath, page, CONFIG_MODE);
+  const opened = (deps.openFile ?? openInBrowser)(htmlPath);
+  if (opened) {
+    print("Pairing page opened in your browser.");
+  } else {
+    print(`Open this file in a browser: ${htmlPath}`);
   }
+  print("The QR code and one-time pairing code are shown on that page.");
+  print("This expires in 10 minutes. Keep this session open — the next step waits for your phone.");
   return 0;
 }
 
@@ -374,13 +387,14 @@ function parseTimeoutMs(argv: string[]): number | undefined {
 
 if (import.meta.main) {
   if (process.argv.includes("--check")) {
-    console.log("usage: pair [--open] [wait [--timeout <seconds>]] [--check]  — pair this machine with the Nomo app via QR code");
+    console.log("usage: pair [wait [--timeout <seconds>]] [--check]  — pair this machine with the Nomo app (opens a browser page with the QR + code)");
     process.exit(0);
   }
   if (process.argv.includes("wait")) {
     const softTimeoutMs = parseTimeoutMs(process.argv);
     process.exit(await pairWait(softTimeoutMs !== undefined ? { softTimeoutMs } : {}));
   } else {
-    process.exit(await pairStart({ open: process.argv.includes("--open") }));
+    // `--open` is now the default (a harmless no-op if still passed by an older skill invocation).
+    process.exit(await pairStart());
   }
 }

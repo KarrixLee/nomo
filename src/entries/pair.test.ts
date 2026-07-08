@@ -5,9 +5,9 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { b64url, decryptBlob, deriveE2EKey, fromB64url, sha256Hex } from "../core/crypto";
 import {
   buildPairURL, bytesToHex, decryptDeviceName, DEFAULT_WORKER_URL, pairStart, pairWait,
-  QR_BEGIN_MARKER, QR_END_MARKER,
 } from "./pair";
-import { completePendingPairing, PAIR_QR_SVG_FILE, parsePendingConfig, PENDING_STASH_FILE } from "../core/shared";
+import { completePendingPairing, PAIR_HTML_FILE, parsePendingConfig, PENDING_STASH_FILE } from "../core/shared";
+import { deriveCodeIkm } from "../core/pair-code";
 import { unpair } from "./unpair";
 import { humanAge, statusCmd } from "./status-cmd";
 
@@ -95,27 +95,31 @@ async function writePending(over: Record<string, unknown> = {}): Promise<void> {
   }));
 }
 
-// ---------- pairStart (phase 1: fast, prints the QR) ----------------------------------------------
+// ---------- pairStart (phase 1: fast, writes + opens the pairing page) ----------------------------
 
 describe("pairStart", () => {
-  test("registers the pairing, writes a PENDING config (0600), prints the QR fenced by markers (no link), spawns the watchdog", async () => {
+  test("registers the pairing, writes a PENDING config (0600), writes + opens pair.html (QR only, no channel), spawns the watchdog", async () => {
     const wd = watchdogSpy();
+    const htmlPath = join(dir, PAIR_HTML_FILE);
+    const opened: string[] = [];
     const { fn, calls } = scriptedFetch([
       (url, init) => {
         expect(url).toBe(`${WORKER}/v1/cc/pair/start`);
         expect(init?.method).toBe("POST");
-        return json({ ok: true }, 201);
+        return json({ ok: true }, 201); // NO channel → QR-only page
       },
     ]);
 
     const code = await pairStart({
       fetchFn: fn, print, configPath, workerUrl: WORKER, spawnWatchdog: wd.spawn, now: () => 1_700_000_000_000,
       randomBytes: scriptedRandom([PAIRING_BYTES, PC_SECRET_BYTES, QR_SECRET]),
+      htmlPath, openFile: (p: string) => { opened.push(p); return true; },
     });
 
     expect(code).toBe(0);
     expect(calls.length).toBe(1); // ONLY the start call — no polling, so it returns fast
     expect(wd.calls).toBe(1); // the self-heal watchdog was spawned
+    expect(opened).toEqual([htmlPath]); // the browser opener was invoked with the page path
 
     // start body: minted 32-hex id + sha256(pcSecret).
     const startBody = JSON.parse(String(calls[0].init?.body)) as Record<string, string>;
@@ -123,13 +127,14 @@ describe("pairStart", () => {
     expect(startBody.pairingId).toMatch(/^[0-9a-f]{32}$/);
     expect(startBody.pcAuthHash).toBe(await sha256Hex(EXPECTED_PC_SECRET));
 
-    // PENDING config: qrSecret persisted, createdAt stamped (bounds the self-heal window), NO e2eKey yet.
+    // PENDING config: qrSecret persisted, createdAt stamped, NO channel → NO codeIkm, NO e2eKey yet.
     const written = JSON.parse(await readFile(configPath, "utf8")) as Record<string, unknown>;
     expect(written).toEqual({
       url: WORKER, pairingId: EXPECTED_PAIRING_ID, pcSecret: EXPECTED_PC_SECRET,
       qrSecretB64: b64url(QR_SECRET), createdAt: 1_700_000_000_000,
     });
     expect(written.e2eKeyB64).toBeUndefined();
+    expect(written.codeIkmB64).toBeUndefined();
     // parsePendingConfig round-trips it; parseConfig (completed-only) rejects it.
     const pending = parsePendingConfig(JSON.stringify(written));
     expect(pending?.pairingId).toBe(EXPECTED_PAIRING_ID);
@@ -138,73 +143,73 @@ describe("pairStart", () => {
     // Owner-only — qrSecret is key material.
     expect((await stat(configPath)).mode & 0o777).toBe(0o600);
 
+    // The page: self-contained HTML with the inline QR SVG; written 0600 (embeds the QR secret).
+    const html = await readFile(htmlPath, "utf8");
+    expect(html).toContain("<title>Pair with Nomo</title>");
+    expect(html).toContain("<svg");
+    expect((await stat(htmlPath)).mode & 0o777).toBe(0o600);
+
     const out = lines.join("\n");
+    expect(out).toContain("Pairing page opened in your browser.");
     expect(out).toContain("expires in 10 minutes");
-    expect(out).toContain("Sessions tab → Pair a Computer");
-    expect(out).toContain("█"); // the QR itself was printed
     expect(out).not.toContain("Paired with"); // no completion in the start phase
 
-    // SECURITY: the QR is fenced by markers so the assistant reproduces EXACTLY the QR block (scannable
-    // from chat) and nothing else. The plaintext nomo:// link — the trivially-greppable copy of the
-    // secret — is NOT printed at all, so it can never reach the transcript.
-    expect(out).toContain(QR_BEGIN_MARKER);
-    expect(out).toContain(QR_END_MARKER);
-    // The QR sits between the two markers.
-    expect(out.indexOf(QR_BEGIN_MARKER)).toBeLessThan(out.indexOf("█"));
-    expect(out.indexOf("█")).toBeLessThan(out.indexOf(QR_END_MARKER));
-    // The secret nomo://pair link is never emitted.
+    // SECURITY: nothing secret is printed to stdout — no QR art, no nomo:// link (they live on the page).
+    expect(out).not.toContain("█");
     expect(out).not.toContain(buildPairURL(WORKER, EXPECTED_PAIRING_ID, QR_SECRET));
     expect(out).not.toContain("nomo://pair");
   });
-});
 
-// ---------- pairStart --open (also render + open an SVG) ------------------------------------------
+  test("with a channel: mints the magic code, persists codeIkm, shows the code on the page (never on stdout)", async () => {
+    const htmlPath = join(dir, PAIR_HTML_FILE);
+    const words = ["koala", "sunset", "mango", "river"];
+    const { fn } = scriptedFetch([() => json({ channel: 7 }, 201)]);
 
-describe("pairStart --open", () => {
-  const openDeps = (over: Record<string, unknown> = {}) => ({
-    print, configPath, workerUrl: WORKER, spawnWatchdog: () => {}, now: () => 1_700_000_000_000,
-    randomBytes: scriptedRandom([PAIRING_BYTES, PC_SECRET_BYTES, QR_SECRET]),
-    ...over,
-  });
-
-  test("writes a 0600 SVG next to config, opens it, and prints the opened line (no secret URL)", async () => {
-    const qrSvgPath = join(dir, PAIR_QR_SVG_FILE);
-    const opened: string[] = [];
-    const { fn } = scriptedFetch([() => json({ ok: true }, 201)]);
-
-    const code = await pairStart(openDeps({
-      fetchFn: fn, open: true, qrSvgPath, openFile: (p: string) => { opened.push(p); return true; },
-    }));
-
+    const code = await pairStart({
+      fetchFn: fn, print, configPath, workerUrl: WORKER, spawnWatchdog: () => {}, now: () => 1_700_000_000_000,
+      randomBytes: scriptedRandom([PAIRING_BYTES, PC_SECRET_BYTES, QR_SECRET]),
+      htmlPath, openFile: () => true, pickWords: () => words,
+    });
     expect(code).toBe(0);
-    expect(opened).toEqual([qrSvgPath]); // the opener was invoked with the SVG path
 
-    const svg = await readFile(qrSvgPath, "utf8");
-    expect(svg.startsWith("<svg")).toBe(true);
-    expect((await stat(qrSvgPath)).mode & 0o777).toBe(0o600); // owner-only — encodes the QR secret
+    // The codeIkm is persisted (b64url of the PBKDF2 output) so wait/watchdog complete a code claim.
+    const written = JSON.parse(await readFile(configPath, "utf8")) as Record<string, unknown>;
+    const expectedIkm = await deriveCodeIkm(words, EXPECTED_PAIRING_ID);
+    expect(written.codeIkmB64).toBe(b64url(expectedIkm));
+    const pending = parsePendingConfig(JSON.stringify(written));
+    expect(pending?.codeIkm).toEqual(expectedIkm);
 
-    const out = lines.join("\n");
-    expect(out).toContain("QR opened in a separate window");
-    // The SVG embeds the secret URL, but the CLI still never PRINTS it (same discipline as the QR).
-    expect(out).not.toContain("nomo://pair");
-    expect(out).not.toContain(buildPairURL(WORKER, EXPECTED_PAIRING_ID, QR_SECRET));
+    // The full code (`<channel>-w1-w2-w3-w4`) appears on the page…
+    const html = await readFile(htmlPath, "utf8");
+    expect(html).toContain("7-koala-sunset-mango-river");
+    // …but NEVER on stdout.
+    expect(lines.join("\n")).not.toContain("koala");
+    expect(lines.join("\n")).not.toContain("7-koala");
   });
 
-  test("falls back to printing the saved path when the opener declines (non-darwin/linux, failure)", async () => {
-    const qrSvgPath = join(dir, PAIR_QR_SVG_FILE);
+  test("falls back to printing the page path when the browser opener declines (headless / NOMO_NO_OPEN)", async () => {
+    const htmlPath = join(dir, PAIR_HTML_FILE);
     const { fn } = scriptedFetch([() => json({ ok: true }, 201)]);
-    expect(await pairStart(openDeps({ fetchFn: fn, open: true, qrSvgPath, openFile: () => false }))).toBe(0);
-    expect(await readFile(qrSvgPath, "utf8")).toContain("<svg"); // still written for the user to open
-    expect(lines.join("\n")).toContain(`QR image saved: ${qrSvgPath}`);
+    expect(await pairStart({
+      fetchFn: fn, print, configPath, workerUrl: WORKER, spawnWatchdog: () => {},
+      randomBytes: scriptedRandom([PAIRING_BYTES, PC_SECRET_BYTES, QR_SECRET]),
+      htmlPath, openFile: () => false,
+    })).toBe(0);
+    expect(await readFile(htmlPath, "utf8")).toContain("<svg"); // still written for the user to open
+    expect(lines.join("\n")).toContain(`Open this file in a browser: ${htmlPath}`);
   });
 
-  test("removes a stale SVG from a prior attempt at start — even WITHOUT --open", async () => {
-    const qrSvgPath = join(dir, PAIR_QR_SVG_FILE);
-    await writeFile(qrSvgPath, "<svg>stale secret from a previous pairing</svg>");
+  test("removes a stale pairing page from a prior attempt at the start", async () => {
+    const htmlPath = join(dir, PAIR_HTML_FILE);
+    await writeFile(htmlPath, "<html>stale secret from a previous pairing</html>");
     const { fn } = scriptedFetch([() => json({ ok: true }, 201)]);
-    // open omitted → no new SVG written, but the stale one must be gone.
-    expect(await pairStart(openDeps({ fetchFn: fn, qrSvgPath }))).toBe(0);
-    await expect(stat(qrSvgPath)).rejects.toBeDefined();
+    expect(await pairStart({
+      fetchFn: fn, print, configPath, workerUrl: WORKER, spawnWatchdog: () => {},
+      randomBytes: scriptedRandom([PAIRING_BYTES, PC_SECRET_BYTES, QR_SECRET]),
+      htmlPath, openFile: () => true,
+    })).toBe(0);
+    // Overwritten with the fresh page (the stale content is gone).
+    expect(await readFile(htmlPath, "utf8")).not.toContain("stale secret");
   });
 });
 
@@ -614,6 +619,7 @@ describe("pairStart (re-pairing over an existing config)", () => {
     const code = await pairStart({
       fetchFn: fn, print, configPath, workerUrl: WORKER, spawnWatchdog: () => {},
       randomBytes: scriptedRandom([PAIRING_BYTES, PC_SECRET_BYTES, QR_SECRET]),
+      htmlPath: join(dir, PAIR_HTML_FILE), openFile: () => true,
     });
     expect(code).toBe(0);
     expect(calls[0].url).toContain("/pair/revoke");
@@ -632,6 +638,7 @@ describe("pairStart (re-pairing over an existing config)", () => {
     expect(await pairStart({
       fetchFn: fn, print, configPath, workerUrl: WORKER, spawnWatchdog: () => {},
       randomBytes: scriptedRandom([PAIRING_BYTES, PC_SECRET_BYTES, QR_SECRET]),
+      htmlPath: join(dir, PAIR_HTML_FILE), openFile: () => true,
     })).toBe(0);
     expect(calls.length).toBe(1); // ONLY start — no revoke for a pending config
     expect(calls[0].url).toContain("/pair/start");
@@ -650,6 +657,7 @@ describe("pairStart (re-pairing over an existing config)", () => {
     expect(await pairStart({
       fetchFn: fn, print, configPath, workerUrl: WORKER, spawnWatchdog: () => {},
       randomBytes: scriptedRandom([PAIRING_BYTES, PC_SECRET_BYTES, QR_SECRET]),
+      htmlPath: join(dir, PAIR_HTML_FILE), openFile: () => true,
     })).toBe(0);
   });
 
@@ -667,6 +675,7 @@ describe("pairStart (re-pairing over an existing config)", () => {
     expect(await pairStart({
       fetchFn: fn, print, configPath, workerUrl: WORKER, spawnWatchdog: () => {},
       randomBytes: scriptedRandom([PAIRING_BYTES, PC_SECRET_BYTES, QR_SECRET]),
+      htmlPath: join(dir, PAIR_HTML_FILE), openFile: () => true,
     })).toBe(0);
 
     expect((await stat(configPath)).mode & 0o777).toBe(0o600);
@@ -745,9 +754,9 @@ describe("completePendingPairing", () => {
     expect((await stat(configPath)).mode & 0o777).toBe(0o600);
   });
 
-  test("deletes a transient pair --open SVG on completion (covers the watchdog self-heal path)", async () => {
-    const qrSvgPath = join(dir, PAIR_QR_SVG_FILE);
-    await writeFile(qrSvgPath, "<svg>the pairing QR secret</svg>"); // what pair --open left next to config
+  test("deletes the transient pairing page on completion (covers the watchdog self-heal path)", async () => {
+    const htmlPath = join(dir, PAIR_HTML_FILE);
+    await writeFile(htmlPath, "<html>the pairing QR secret + code</html>"); // what pair left next to config
     const phoneKey = await deriveE2EKey(QR_SECRET, PHONE_NONCE);
     const deviceNameEnc = await seal(phoneKey, new TextEncoder().encode(JSON.stringify("P")));
     const { fn } = scriptedFetch([
@@ -755,7 +764,7 @@ describe("completePendingPairing", () => {
       () => json({ ok: true }),
     ]);
     expect((await completePendingPairing(pending(), configPath, { fetchFn: fn, ackAttempts: 1 })).state).toBe("completed");
-    await expect(stat(qrSvgPath)).rejects.toBeDefined(); // the secret-bearing SVG is gone
+    await expect(stat(htmlPath)).rejects.toBeDefined(); // the secret-bearing page is gone
   });
 
   test("preserves a machineName from the pending config into the completed one", async () => {
@@ -768,6 +777,32 @@ describe("completePendingPairing", () => {
     await completePendingPairing({ ...pending(), machineName: "Studio" }, configPath, { fetchFn: fn, ackAttempts: 1 });
     const written = JSON.parse(await readFile(configPath, "utf8")) as Record<string, string>;
     expect(written.machineName).toBe("Studio");
+  });
+
+  test("a code-path claim (path:'code') derives the key from codeIkm, not qrSecret", async () => {
+    const codeIkm = new Uint8Array(32).fill(9);
+    const phoneKey = await deriveE2EKey(codeIkm, PHONE_NONCE); // the phone reconstructed codeIkm from the words
+    const deviceNameEnc = await seal(phoneKey, new TextEncoder().encode(JSON.stringify("Code Phone")));
+    const { fn } = scriptedFetch([
+      () => json({ state: "claimed", path: "code", phoneNonce: b64url(PHONE_NONCE), deviceNameEnc }),
+      () => json({ ok: true }),
+    ]);
+    const r = await completePendingPairing({ ...pending(), codeIkm }, configPath, { fetchFn: fn, ackAttempts: 1 });
+    expect(r).toEqual({ state: "completed", deviceName: "Code Phone" });
+    const written = JSON.parse(await readFile(configPath, "utf8")) as Record<string, string>;
+    expect(written.e2eKeyB64).toBe(b64url(phoneKey)); // keyed off codeIkm, matching the phone
+  });
+
+  test("a code-path claim with NO stored codeIkm (QR-only config) → tampered, no config written", async () => {
+    const codeIkm = new Uint8Array(32).fill(9);
+    const phoneKey = await deriveE2EKey(codeIkm, PHONE_NONCE);
+    const deviceNameEnc = await seal(phoneKey, new TextEncoder().encode(JSON.stringify("x")));
+    const { fn } = scriptedFetch([
+      () => json({ state: "claimed", path: "code", phoneNonce: b64url(PHONE_NONCE), deviceNameEnc }),
+    ]);
+    // pending() has no codeIkm → a code claim cannot be completed.
+    expect((await completePendingPairing(pending(), configPath, { fetchFn: fn })).state).toBe("tampered");
+    await expect(stat(configPath)).rejects.toBeDefined();
   });
 
   test("a claimed poll with the nonce stripped (already acked by a concurrent completer) → { state: 'already-completed' }, no config written", async () => {

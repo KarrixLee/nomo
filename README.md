@@ -14,8 +14,8 @@ session's status — working, needs-your-approval, done — shows up on your pho
 so you can step away from the terminal and still know when an agent needs you or has finished.
 Works with both **Codex CLI and the Codex desktop app**.
 
-Everything is **end-to-end encrypted**. Pairing is a single QR-code scan; there is no server
-key to copy. All session content (titles, machine name, status, even *which* agent produced an
+Everything is **end-to-end encrypted**. Pairing is a single QR-code scan (or a short typed code);
+there is no server key to copy. All session content (titles, machine name, status, even *which* agent produced an
 event) rides **inside** an encrypted blob, so the relay Worker that fans out the APNs push is a
 blind relay and never sees plaintext. **One pairing covers both agents** on a machine — Claude
 Code and Codex share the same credentials, encryption key, watchdog, and Live Activity.
@@ -59,13 +59,14 @@ Then pair this machine with your phone:
 /nomo-cc:pair
 ```
 
-This prints a QR code. In the Nomo app on your iPhone, open the **Sessions** tab, tap
-**"Pair a Computer"**, and scan it (the code expires in 10 minutes). Once it reports
-`Paired with … ✓`, this machine's Claude Code sessions appear in the app.
+This opens a pairing page in your browser showing a QR code and a one-time pairing code. In the Nomo
+app on your iPhone, open the **Sessions** tab, tap **"Pair a Computer"**, and either scan the QR or
+tap **"Enter code"** and type the code (it expires in 10 minutes). Once it reports `Paired with … ✓`,
+this machine's Claude Code sessions appear in the app.
 
 Other commands:
 
-- `/nomo-cc:pair` — pair this machine (prints the QR code).
+- `/nomo-cc:pair` — pair this machine (opens a browser page with the QR code + one-time code).
 - `/nomo-cc:status` — pairing / watchdog / last-delivery health at a glance.
 - `/nomo-cc:unpair` — revoke the pairing on the server and delete local pairing state.
 
@@ -95,8 +96,9 @@ trusting once holds through updates (only a changed hook line re-arms the review
 
 The plugin bundles three **skills** — invoke them by typing `$<skill>` (or in natural language):
 
-- `$nomo-pair` — pair this machine with your phone (opens the QR outside the TUI, then confirms
-  the scan). One pairing is **shared** with Claude Code if both agents run on this machine.
+- `$nomo-pair` — pair this machine with your phone (opens a browser page with the QR code + one-time
+  code, then confirms the scan). One pairing is **shared** with Claude Code if both agents run on this
+  machine.
 - `$nomo-status` — pairing / watchdog / hook-trust / last-delivery health.
 - `$nomo-unpair` — revoke the pairing and clear local state.
 
@@ -108,7 +110,8 @@ agent produced it.
 
 ## How it works
 
-- **Pairing.** `pair` derives a per-pairing E2E key from a QR-scanned secret + the phone's nonce
+- **Pairing.** `pair` opens a themed browser page with a QR code and a one-time code; it derives a
+  per-pairing E2E key from the QR-scanned secret (or the typed code, via PBKDF2) + the phone's nonce
   (HKDF-SHA256), and writes `~/.config/cc-status/config.json` (mode `0600`) with the pairing id,
   the PC secret, and the 32-byte key. Nothing is copied by hand.
 - **Hook.** On every lifecycle event the hook plans a v2 op (`start` / `update` / `done` / `end`

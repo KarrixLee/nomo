@@ -72,8 +72,8 @@ var GONE_STRIKES_PATH = `${CC_DIR}/gone-strikes`;
 var GONE_STRIKE_LIMIT = 2;
 var PENDING_STASH_FILE = "pending-event.json";
 var PENDING_STASH_PATH = `${CC_DIR}/${PENDING_STASH_FILE}`;
-var PAIR_QR_SVG_FILE = "pair-qr.svg";
-var PAIR_QR_SVG_PATH = `${CC_DIR}/${PAIR_QR_SVG_FILE}`;
+var PAIR_HTML_FILE = "pair.html";
+var PAIR_HTML_PATH = `${CC_DIR}/${PAIR_HTML_FILE}`;
 var HERE = dirname(fileURLToPath(import.meta.url));
 var WATCHDOG_PATH = existsSync(`${HERE}/cc-watchdog.mjs`) ? `${HERE}/cc-watchdog.mjs` : `${HERE}/../entries/cc-watchdog.ts`;
 function codexHome() {
@@ -143,11 +143,20 @@ function parsePendingConfig(raw) {
   }
   if (qrSecret.length !== 16)
     return null;
+  let codeIkm;
+  if (typeof c.codeIkmB64 === "string") {
+    try {
+      const decoded = fromB64url(c.codeIkmB64);
+      if (decoded.length === 32)
+        codeIkm = decoded;
+    } catch {}
+  }
   return {
     url: c.url.replace(/\/$/, ""),
     pairingId: c.pairingId,
     pcSecret: c.pcSecret,
     qrSecret,
+    ...codeIkm ? { codeIkm } : {},
     machineName: typeof c.machineName === "string" && c.machineName.length > 0 ? c.machineName : undefined,
     createdAt: typeof c.createdAt === "number" && Number.isFinite(c.createdAt) ? c.createdAt : undefined
   };
@@ -257,7 +266,10 @@ async function completePendingPairing(pending, configPath, opts = {}) {
   if (body.state !== "claimed" || typeof body.phoneNonce !== "string" || typeof body.deviceNameEnc !== "string") {
     return { state: "pending" };
   }
-  const e2eKey = await deriveE2EKey(pending.qrSecret, fromB64url(body.phoneNonce));
+  const ikm = body.path === "code" ? pending.codeIkm : pending.qrSecret;
+  if (!ikm)
+    return { state: "tampered" };
+  const e2eKey = await deriveE2EKey(ikm, fromB64url(body.phoneNonce));
   let deviceName;
   try {
     deviceName = await decryptDeviceName(e2eKey, body.deviceNameEnc);
@@ -288,7 +300,7 @@ async function completePendingPairing(pending, configPath, opts = {}) {
     }
   }
   await flushPendingStash(join(dirname(configPath), PENDING_STASH_FILE), pending.url, pending.pairingId, pending.pcSecret, e2eKey, Date.now(), fetchFn, fetchTimeoutMs, ackAttempts, ackRetryDelayMs, sleep, opts.isAlive ?? pidAlive, opts.ensureWatchdog ?? ensureWatchdog, opts.sessionsDir ?? SESSIONS_DIR);
-  await unlink(join(dirname(configPath), PAIR_QR_SVG_FILE)).catch(() => {});
+  await unlink(join(dirname(configPath), PAIR_HTML_FILE)).catch(() => {});
   return { state: "completed", deviceName };
 }
 function ensureWatchdog() {
