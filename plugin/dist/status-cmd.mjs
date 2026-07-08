@@ -19,6 +19,8 @@ import { fileURLToPath } from "node:url";
 var textEncoder = new TextEncoder;
 var textDecoder = new TextDecoder;
 var HKDF_INFO = textEncoder.encode("nomo-cc-e2e-v1");
+var RATCHET_INFO_PREFIX = "nomo-cc-ratchet-v1|";
+var ECDH_P256 = { name: "ECDH", namedCurve: "P-256" };
 function bytesToBase64(bytes) {
   let binary = "";
   for (const b of bytes)
@@ -43,6 +45,21 @@ function fromB64url(s) {
 async function deriveE2EKey(qrSecret, phoneNonce) {
   const ikm = await crypto.subtle.importKey("raw", qrSecret, "HKDF", false, ["deriveBits"]);
   const bits = await crypto.subtle.deriveBits({ name: "HKDF", hash: "SHA-256", salt: phoneNonce, info: HKDF_INFO }, ikm, 256);
+  return new Uint8Array(bits);
+}
+async function generateEphemeralKeyPair() {
+  const kp = await crypto.subtle.generateKey(ECDH_P256, true, ["deriveBits"]);
+  const privPkcs8 = new Uint8Array(await crypto.subtle.exportKey("pkcs8", kp.privateKey));
+  const pubRaw = new Uint8Array(await crypto.subtle.exportKey("raw", kp.publicKey));
+  return { privPkcs8, pubRaw };
+}
+async function deriveRatchetKey(ownPrivPkcs8, otherPubRaw, k0, pairingId) {
+  const priv = await crypto.subtle.importKey("pkcs8", ownPrivPkcs8, ECDH_P256, false, ["deriveBits"]);
+  const pub = await crypto.subtle.importKey("raw", otherPubRaw, ECDH_P256, false, []);
+  const z = new Uint8Array(await crypto.subtle.deriveBits({ name: "ECDH", public: pub }, priv, 256));
+  const zKey = await crypto.subtle.importKey("raw", z, "HKDF", false, ["deriveBits"]);
+  const info = textEncoder.encode(RATCHET_INFO_PREFIX + pairingId);
+  const bits = await crypto.subtle.deriveBits({ name: "HKDF", hash: "SHA-256", salt: k0, info }, zKey, 256);
   return new Uint8Array(bits);
 }
 async function sealCombined(key, plaintext, iv) {
@@ -151,12 +168,19 @@ function parsePendingConfig(raw) {
         codeIkm = decoded;
     } catch {}
   }
+  let pcEphPriv;
+  if (typeof c.pcEphPrivB64 === "string") {
+    try {
+      pcEphPriv = fromB64url(c.pcEphPrivB64);
+    } catch {}
+  }
   return {
     url: c.url.replace(/\/$/, ""),
     pairingId: c.pairingId,
     pcSecret: c.pcSecret,
     qrSecret,
     ...codeIkm ? { codeIkm } : {},
+    ...pcEphPriv ? { pcEphPriv } : {},
     machineName: typeof c.machineName === "string" && c.machineName.length > 0 ? c.machineName : undefined,
     createdAt: typeof c.createdAt === "number" && Number.isFinite(c.createdAt) ? c.createdAt : undefined
   };
@@ -269,9 +293,13 @@ async function completePendingPairing(pending, configPath, opts = {}) {
   const ikm = body.path === "code" ? pending.codeIkm : pending.qrSecret;
   if (!ikm)
     return { state: "tampered" };
-  const e2eKey = await deriveE2EKey(ikm, fromB64url(body.phoneNonce));
+  const k0 = await deriveE2EKey(ikm, fromB64url(body.phoneNonce));
+  if (!pending.pcEphPriv || typeof body.phoneEphPub !== "string")
+    return { state: "tampered" };
+  let e2eKey;
   let deviceName;
   try {
+    e2eKey = await deriveRatchetKey(pending.pcEphPriv, fromB64url(body.phoneEphPub), k0, pending.pairingId);
     deviceName = await decryptDeviceName(e2eKey, body.deviceNameEnc);
   } catch {
     return { state: "tampered" };

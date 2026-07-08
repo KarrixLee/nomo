@@ -33,11 +33,11 @@ sees it. There are two ways to hand it over, and both keep the key off every ser
 
 - **Scan the QR** on the pairing page. The QR carries a random pairing secret that rides only in the
   code image; the phone mixes it with its own nonce (HKDF-SHA256) to derive the shared key.
-- **Type the one-time code** — four words and a short channel number (e.g.
-  `7-ocean-sunset-mango-river`). The phone runs PBKDF2-SHA256 over the four words to reconstruct the
-  same secret, then the same HKDF step, arriving at the identical key. The words never leave the
-  pairing page; the channel is only a one-time routing handle the phone redeems once (it burns on
-  first use and expires in 10 minutes).
+- **Type the one-time code** — six words and a short channel number (e.g.
+  `7-ocean-sunset-mango-river-atlas-cabin`). The phone runs PBKDF2-SHA256 over the six words to
+  reconstruct the same secret, then the same HKDF step, arriving at the identical key. The words never
+  leave the pairing page; the channel is only a one-time routing handle the phone redeems once (it
+  burns on first use and expires in 10 minutes).
 
 Either way, the plugin encrypts every session update with the derived key **before** anything leaves
 your machine, so the relay Worker and Apple's push service only ever carry ciphertext. Decryption
@@ -53,6 +53,47 @@ happens on your iPhone.
 **Plaintext — titles, machine name, status, even which agent produced the event — never leaves
 your computer except end-to-end encrypted.** The Worker is a blind fan-out relay: it can route by
 pairing id but cannot read a single field of what it forwards.
+
+### How to show the code
+
+By default the one-time pairing code is shown **only on the pairing page**, hidden behind a "Tap to
+reveal code" control until you click it — it's never printed to the terminal, so it can't end up in
+shell history, a screen recording, or an AI assistant's transcript. Open the page, click reveal, and
+type the code into the app.
+
+If you genuinely **can't open a browser** on this machine at all — a headless box, an SSH-only
+session — pass `--show-code` to also print the code to the terminal:
+
+```
+pair.mjs --show-code
+```
+
+That skips the QR/page entirely and prints a line like
+`One-time code: 4823-ocean-sunset-mango-river-atlas-cabin · expires in 10 min` — treat it as
+sensitive for the ~10 minutes it's valid, since it's now sitting in your terminal's scrollback. When a
+browser is available at all, prefer the page: scanning the QR is the most private option of the
+three, since it never touches a keyboard, a terminal, or a chat transcript.
+
+## Encryption
+
+In plain English:
+
+- **Every session update is sealed with AES-256-GCM** before it leaves your machine. The relay Worker
+  and Apple's push service only ever carry ciphertext — they can route it by pairing id but can't read
+  a single field (title, machine name, status, or which agent produced it). The relay is **blind**:
+  the only things that transit it in the clear are *public* keys.
+- **The typeable code is six BIP39 words (~66 bits of entropy)**, stretched with **PBKDF2-SHA256 at
+  600,000 iterations**. Six words (up from four) puts an offline brute-force — the attack a
+  logging/compromised relay could try against the known-plaintext pairing blob — out of reach.
+- **A per-pairing ephemeral ECDH (P-256) "ratchet" derives the durable key.** The code (or the
+  scanned QR secret) only bootstraps a one-time handshake key; your computer and phone each generate a
+  throwaway keypair, do an ECDH, and mix the result with that bootstrap key to produce the key that
+  actually encrypts your sessions. The throwaway private keys are discarded right after pairing. This
+  gives **forward secrecy**: a code revealed *after* you've paired — leaked into a screen recording, a
+  shell history, or an AI transcript — **can't decrypt your sessions**, because the ephemeral private
+  keys it would need are already gone. Mixing the code into the handshake also stops a relay from
+  quietly swapping the public keys (a man-in-the-middle): if it tampers, pairing fails instead of
+  silently succeeding under the attacker's key.
 
 ## <img src="assets/claude.png" height="22" align="center" alt=""> Install — Claude Code
 

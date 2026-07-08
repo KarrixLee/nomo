@@ -10,27 +10,28 @@ them in order, both in the **foreground**.
 Run this exact command in the foreground and wait for it to finish (it returns in a second or two):
 
 ```
-"${CLAUDE_PLUGIN_ROOT}/scripts/run.sh" "${CLAUDE_PLUGIN_ROOT}/dist/pair.mjs" --show-code
+"${CLAUDE_PLUGIN_ROOT}/scripts/run.sh" "${CLAUDE_PLUGIN_ROOT}/dist/pair.mjs"
 ```
 
 - This registers the pairing, writes a themed pairing **page**, and **opens it in the user's default
-  browser**, then exits. It does **not** wait for the phone — that's step 2. `--show-code` also prints
-  the one-time pairing code to stdout so it works everywhere, including SSH/headless where the browser
-  page can't be seen.
+  browser**, then exits. It does **not** wait for the phone — that's step 2. The page shows the QR
+  **and** a one-time pairing code, hidden behind a "Tap to reveal code" control until clicked — the
+  code is not printed to the terminal by default.
 - **The command's output tells you what happened — relay it in your own words:**
-  - `One-time code: <code> · expires in 10 min` → relay this code to the user **prominently**, e.g.
-    "Your one-time code: `7-ocean-sunset-mango-river`", and tell them to either **scan the QR on the
-    pairing page** or **enter this code in the app** (**Sessions → Pair a Computer → “Enter code”**).
-    Note it is **one-time and expires in 10 minutes**.
   - `Pairing page opened in your browser.` → tell the user the pairing page just opened in a browser
-    window/tab, where the QR code (and the same code) are shown.
+    window/tab, where they can scan the QR, or click **"Tap to reveal code"** to see the one-time code
+    and enter it in the app (**Sessions → Pair a Computer → “Enter code”**).
   - `Open this file in a browser: <path>` (the browser couldn't be launched — headless/SSH) → give
-    the user that **file path** to open on the machine's display. The code above still lets them pair
-    without the page.
+    the user that **file path** to open on the machine's display.
+  - `The one-time code is hidden for privacy — …` → tell the user the code is deliberately kept out of
+    this terminal/transcript; they can reveal it on the pairing page. **Only if the user says they
+    can't open a browser at all** (a truly headless/SSH-only box), re-run **step 1** yourself with
+    `--show-code` appended — note this prints the code straight into this transcript, so mention that
+    trade-off to the user first.
 - **NEVER reproduce QR art, and never echo, reconstruct, or invent any `nomo://pair…` URL or `s=`
-  value** in your reply. The `nomo://` deep link is the QR's end-to-end secret; it is never printed to
-  stdout — it lives ONLY on the pairing page — and it must never enter the chat transcript. The
-  one-time pairing code is safe to relay (short-lived, single-use); the `nomo://…` URL is not.
+  value** in your reply, regardless of which variant of step 1 you ran. The `nomo://` deep link is the
+  QR's end-to-end secret; it is never printed to stdout — it lives ONLY on the pairing page — and it
+  must never enter the chat transcript.
 - If the command prints an error line instead (network, rate-limit), relay that error line to the
   user and stop; do not proceed to step 2.
 

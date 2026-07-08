@@ -18,8 +18,8 @@ import { encryptBlob } from "../core/crypto";
 import { adapterFor } from "../core/adapter";
 import {
   AgentKind, atomicWrite, CC_DIR, Config, completePendingPairing, GONE_STRIKE_LIMIT, loadConfig, loadPendingConfig,
-  PairPollResult, PendingConfig, pidAlive, readSuffix, recordGoneStrike, removeRevokedConfig, resetGoneStrikes,
-  SessionRecord, SESSIONS_DIR, WATCHDOG_PID_PATH,
+  PAIR_HTML_FILE, PairPollResult, PendingConfig, pidAlive, readSuffix, recordGoneStrike, removeRevokedConfig,
+  resetGoneStrikes, SessionRecord, SESSIONS_DIR, WATCHDOG_PID_PATH,
 } from "../core/shared";
 
 // The transcript-tail interrupt PARSERS live in the agent adapters now (the two detections are
@@ -390,6 +390,9 @@ async function removePendingConfig(): Promise<void> {
   } catch {
     // already gone / raced with a SessionEnd or a re-pair — fine
   }
+  // Tear down the sibling pairing PAGE too (it embeds the QR secret + one-time code): on a terminal
+  // expiry/gone path the page must not be orphaned next to the now-deleted config. Tolerates ENOENT.
+  await unlink(`${CC_DIR}/${PAIR_HTML_FILE}`).catch(() => {});
 }
 
 /** One self-heal attempt on a mid-pairing config: if `pair wait` never ran (Ctrl-C, closed terminal)

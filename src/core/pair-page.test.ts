@@ -5,17 +5,18 @@ import { NOMO_ICON_DATA_URI } from "./icon-data";
 
 const SVG = renderQRSVG("nomo://pair?v=1&p=00112233&s=AAAA");
 const POLL = { workerURL: "https://worker.test", pairingId: "abc123", pcSecret: "pc-secret-xyz" };
+const CODE = "4823-ocean-sunset-mango-river-atlas-cabin";
 
 describe("renderPairPage", () => {
   test("is a self-contained HTML document titled 'Pair with Nomo' with the inline SVG", () => {
-    const html = renderPairPage({ svg: SVG, code: "7-koala-sunset-mango-river", expiresAt: 1_700_000_600_000 });
+    const html = renderPairPage({ svg: SVG, code: CODE, expiresAt: 1_700_000_600_000 });
     expect(html.startsWith("<!doctype html>")).toBe(true);
     expect(html).toContain("<title>Pair with Nomo</title>");
     expect(html).toContain(SVG); // the QR SVG is embedded verbatim
   });
 
   test("no external requests: no http(s) URLs (except the poll target), no external src/href/fonts", () => {
-    const html = renderPairPage({ svg: SVG, code: "7-koala-sunset-mango-river", expiresAt: 1_700_000_600_000 });
+    const html = renderPairPage({ svg: SVG, code: CODE, expiresAt: 1_700_000_600_000 });
     // No poll block here → the only URL-ish token is the SVG namespace; nothing fetches over the network.
     expect(html).not.toMatch(/src=["']https?:/);
     expect(html).not.toMatch(/href=["']https?:/);
@@ -23,23 +24,23 @@ describe("renderPairPage", () => {
     expect(html).not.toContain("cdn");
   });
 
-  test("shows the code prominently and bakes the expiry into the countdown", () => {
-    const html = renderPairPage({ svg: SVG, code: "7-koala-sunset-mango-river", expiresAt: 1_700_000_600_000 });
-    expect(html).toContain("7-koala-sunset-mango-river");
+  test("shows the code (blurred behind the reveal control) and bakes the expiry into the countdown", () => {
+    const html = renderPairPage({ svg: SVG, code: CODE, expiresAt: 1_700_000_600_000 });
+    expect(html).toContain(CODE);
     expect(html).toContain("var expiresAt = 1700000600000;");
     expect(html).toContain("Code expired — run /nomo-cc:pair again for a fresh one.");
     expect(html).toContain("Enter code"); // the hint mentions the code entry path
   });
 
   test("embeds the Nomo logo as an inlined base64 data URI overlaid on the QR (no external image)", () => {
-    const html = renderPairPage({ svg: SVG, code: "7-koala-sunset-mango-river", expiresAt: 1_700_000_600_000 });
+    const html = renderPairPage({ svg: SVG, code: CODE, expiresAt: 1_700_000_600_000 });
     expect(html).toContain(NOMO_ICON_DATA_URI); // the exact inlined data URI
     expect(html).toContain("data:image/png;base64,"); // …and it IS a data URI (nothing fetched)
     expect(html).toContain('class="logo"'); // the centred overlay tile
   });
 
   test("renders an icon copy button next to the code that swaps to a check on success", () => {
-    const html = renderPairPage({ svg: SVG, code: "7-koala-sunset-mango-river", expiresAt: 1_700_000_600_000 });
+    const html = renderPairPage({ svg: SVG, code: CODE, expiresAt: 1_700_000_600_000 });
     expect(html).toContain('id="copy"');
     expect(html).toContain('aria-label="Copy the code"'); // accessible label (icon-only button)
     expect(html).toContain('<rect x="9" y="9"'); // the idle clipboard SVG glyph in the markup (no external asset)
@@ -47,6 +48,31 @@ describe("renderPairPage", () => {
     expect(html).toContain("navigator.clipboard"); // async clipboard API path
     expect(html).toContain('document.execCommand("copy")'); // legacy fallback for file:// pages
     expect(html).toContain("copyBtn.innerHTML = CHECK"); // clipboard → check feedback
+  });
+
+  describe("click-to-reveal code", () => {
+    const html = () => renderPairPage({ svg: SVG, code: CODE, expiresAt: 1_700_000_600_000 });
+
+    test("the code starts blurred behind a keyboard-accessible <button> reveal control", () => {
+      const h = html();
+      expect(h).toContain('class="code code-hidden"'); // blurred by default
+      expect(h).toContain('<button class="reveal" id="reveal" type="button" aria-expanded="false" aria-controls="code">Tap to reveal code</button>');
+      expect(h).not.toContain('<div class="reveal"'); // must be a real button, not a bare div
+    });
+
+    test("toggling adds/removes the blur class and flips the button label + aria-expanded", () => {
+      const h = html();
+      expect(h).toContain('classList.toggle("code-hidden")');
+      expect(h).toContain('"Tap to reveal code"');
+      expect(h).toContain('"Tap to hide code"');
+      expect(h).toContain('setAttribute("aria-expanded"');
+    });
+
+    test("QR stays visible as-is (only the code gets the reveal treatment)", () => {
+      const h = html();
+      expect(h).not.toContain('class="qr-tile code-hidden"');
+      expect(h).toContain(SVG); // the QR SVG renders unblurred/unhidden
+    });
   });
 
   test("supports light AND dark themes", () => {
@@ -72,7 +98,7 @@ describe("renderPairPage", () => {
   });
 
   describe("live-status poll (poll supplied)", () => {
-    const page = () => renderPairPage({ svg: SVG, code: "7-koala-sunset-mango-river", expiresAt: 1_700_000_600_000, poll: POLL });
+    const page = () => renderPairPage({ svg: SVG, code: CODE, expiresAt: 1_700_000_600_000, poll: POLL });
 
     test("polls the worker's status route with the x-cc-auth header every 3s", () => {
       const html = page();
@@ -108,7 +134,7 @@ describe("renderPairPage", () => {
   });
 
   test("without poll: no status fetch is emitted (static page — the countdown still runs)", () => {
-    const html = renderPairPage({ svg: SVG, code: "7-koala-sunset-mango-river", expiresAt: 1 });
+    const html = renderPairPage({ svg: SVG, code: CODE, expiresAt: 1 });
     expect(html).not.toContain("/v1/cc/pair/status");
     expect(html).not.toContain("function paired()");
     expect(html).toContain("function tick()"); // the countdown is always present

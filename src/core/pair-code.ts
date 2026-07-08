@@ -1,11 +1,14 @@
-// pair-code.ts — the "magic code" pairing path (pairing v2). When the worker assigns a numeric
-// `channel`, the pairing page shows a human-typeable code — `<channel>-w1-w2-w3-w4` — the user reads
-// into the Nomo app instead of scanning the QR. The four words index into the FROZEN BIP39 English
-// wordlist (wordlist.ts); the phone reconstructs the same shared E2E key from the words the user typed.
+// pair-code.ts — the "magic code" pairing path (pairing v3). When the worker assigns a numeric
+// `channel`, the pairing page shows a human-typeable code — `<channel>-w1-w2-w3-w4-w5-w6` — the user
+// reads into the Nomo app instead of scanning the QR. The six words index into the FROZEN BIP39
+// English wordlist (wordlist.ts); the phone reconstructs the same shared E2E key from the words typed.
+//
+// Six words (66 bits) — up from v2's four (44 bits) — so an offline brute-force by a logging/
+// compromised relay against the known-plaintext deviceNameEnc oracle is infeasible even given PBKDF2.
 //
 // Key derivation (FROZEN cross-platform contract — must match the iPhone app byte-for-byte):
-//   codeIkm = PBKDF2-SHA256(password = utf8("w1-w2-w3-w4")  [words ONLY, no channel],
-//                           salt     = utf8("nomo-pair-code-v1|" + pairingId),
+//   codeIkm = PBKDF2-SHA256(password = utf8("w1-w2-w3-w4-w5-w6")  [words ONLY, no channel],
+//                           salt     = utf8("nomo-pair-code-v2|" + pairingId),
 //                           iterations = 600000, dkLen = 32)
 //   e2eKey  = HKDF-SHA256(ikm = codeIkm, salt = phoneNonce, info = "nomo-cc-e2e-v1")   (deriveE2EKey)
 // i.e. codeIkm is a drop-in replacement for the QR path's qrSecret as the HKDF input. The channel is
@@ -19,11 +22,11 @@ import { BIP39_WORDLIST } from "./wordlist";
 
 /** The pending-pairing TTL / code lifetime salt tag — bumping this string invalidates every code, so
  *  it changes ONLY alongside a matching app change (a versioned domain separator). */
-const CODE_SALT_PREFIX = "nomo-pair-code-v1|";
+const CODE_SALT_PREFIX = "nomo-pair-code-v2|";
 const PBKDF2_ITERATIONS = 600_000;
 const CODE_KEY_LEN = 32;
-/** How many words a code carries (the `<channel>-w1-w2-w3-w4` form). */
-export const CODE_WORD_COUNT = 4;
+/** How many words a code carries (the `<channel>-w1-w2-w3-w4-w5-w6` form). Six = ~66 bits. */
+export const CODE_WORD_COUNT = 6;
 
 /** One uniformly-random index in [0, maxExclusive) drawn from crypto bytes, rejection-sampled so there
  *  is NO modulo bias: a 16-bit draw is rejected when it falls in the short non-uniform tail above the
@@ -42,7 +45,7 @@ export function uniformIndex(maxExclusive: number, randomBytes: (n: number) => U
   }
 }
 
-/** Pick CODE_WORD_COUNT uniformly-random words from the BIP39 wordlist (with replacement — the 2048^4
+/** Pick CODE_WORD_COUNT uniformly-random words from the BIP39 wordlist (with replacement — the 2048^6
  *  space is ample and the phone matches by position, so a repeated word is fine). `randomBytes` is the
  *  crypto source (injectable for tests). */
 export function randomCodeWords(
@@ -56,7 +59,7 @@ export function randomCodeWords(
   return words;
 }
 
-/** PBKDF2-SHA256(password = words.join("-"), salt = "nomo-pair-code-v1|" + pairingId, 600000, 32) →
+/** PBKDF2-SHA256(password = words.join("-"), salt = "nomo-pair-code-v2|" + pairingId, 600000, 32) →
  *  the 32-byte codeIkm that replaces qrSecret as the HKDF input for the code pairing path. Words ONLY —
  *  the channel is never part of the password. */
 export function deriveCodeIkm(words: string[], pairingId: string): Promise<Uint8Array> {
@@ -70,7 +73,7 @@ export function deriveCodeIkm(words: string[], pairingId: string): Promise<Uint8
   });
 }
 
-/** The full code string shown on the pairing page: `<channel>-w1-w2-w3-w4`, all lowercase. The channel
+/** The full code string shown on the pairing page: `<channel>-w1-w2-w3-w4-w5-w6`, all lowercase. The channel
  *  routes the pairing at the worker; the words derive the key. */
 export function formatCodeString(channel: number, words: string[]): string {
   return `${channel}-${words.join("-")}`.toLowerCase();

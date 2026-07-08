@@ -29,26 +29,27 @@ command fail. Then run this exact command in the foreground and wait for it to f
 a second or two):
 
 ```
-exec "<ROOT>/scripts/run.sh" "<ROOT>/dist/pair.mjs" --show-code
+exec "<ROOT>/scripts/run.sh" "<ROOT>/dist/pair.mjs"
 ```
 
 - This writes a themed pairing **page** and **opens it in the default browser**, outside the Codex
   TUI (a folded terminal QR is unreliable in Codex). The page shows the QR **and** a one-time pairing
-  code. `--show-code` also prints that code to stdout so it works everywhere, including SSH/headless
-  where the browser page can't be seen. **Relay the script's printed lines to the user in your own
+  code, hidden behind a "Tap to reveal code" control until clicked — the code is **not** printed to
+  stdout/the transcript by default. **Relay the script's printed lines to the user in your own
   words:**
-  - `One-time code: <code> · expires in 10 min` → relay this code **prominently**, e.g. "Your
-    one-time code: `7-ocean-sunset-mango-river`", and tell them to either **scan the QR on the pairing
-    page** or **enter this code in the app** (Nomo → Sessions → "Pair a Computer" → "Enter code").
-    Note it is **one-time and expires in 10 minutes**.
   - `Pairing page opened in your browser.` → tell them the pairing page just opened in a browser
-    window, where the QR (and the same code) are shown.
+    window, where they can scan the QR, or click **"Tap to reveal code"** to see the one-time code and
+    enter it in the app (Nomo → Sessions → "Pair a Computer" → "Enter code").
   - `Open this file in a browser: <path>` → the browser couldn't launch; give them that **file path**
-    to open on the machine's display. The code above still lets them pair without the page.
+    to open on the machine's display.
+  - `The one-time code is hidden for privacy — …` → tell the user the code is deliberately kept out of
+    this transcript; it can be revealed on the pairing page instead. **Only if the user says they
+    genuinely can't open a browser** (headless/SSH-only), re-run this step yourself with `--show-code`
+    appended — mention first that doing so prints the code straight into this transcript.
 - **Do NOT reproduce QR art in your reply, and NEVER echo, reconstruct, or invent any `nomo://pair…`
-  URL or `s=` value.** The `nomo://` deep link is the QR's end-to-end secret; it is never printed to
-  stdout — it lives ONLY on the page — and it must never enter the transcript. The one-time pairing
-  code is safe to relay (short-lived, single-use); the `nomo://…` URL is not.
+  URL or `s=` value**, regardless of which variant of this step you ran. The `nomo://` deep link is the
+  QR's end-to-end secret; it is never printed to stdout — it lives ONLY on the page — and it must
+  never enter the transcript.
 - If the command prints an error line instead (network, rate-limit), relay that line and stop.
 
 ## Step 3 — confirm the scan

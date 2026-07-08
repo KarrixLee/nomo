@@ -4,6 +4,20 @@
     "phoneNonceHex": "02020202020202020202020202020202",
     "expectedKeyHex": "256a40ccc3cbb4c7338d5fe2bfbf7ae2f021d46a71a99c0d9a935f48e9a6fe22"
   },
+  "ratchet": {
+    "_comment": "Pairing-v3 6-word code + ECDH ratchet KAT (spec 2026-07-09). FROZEN cross-platform; the Swift test must assert the same Z/K1. dPC/dPh are pkcs8 DER (base64, no padding); QPC/QPh are 65-byte SEC1 uncompressed (hex).",
+    "pairingId": "0123456789abcdef0123456789abcdef",
+    "words": ["ocean", "sunset", "mango", "river", "atlas", "cabin"],
+    "phoneNonceHex": "000102030405060708090a0b0c0d0e0f",
+    "codeIkmHex": "9643dc4cd683b866afa5bd764394ccb1c063bfba8224e64209d01055655c758c",
+    "k0Hex": "39f005d941b7bfc87b66e5a1f6a6b8c78562da363189f5ba55208812fe6b3a9e",
+    "dPC_pkcs8": "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgERERERERERERERERERERERERERERERERERERERERERGhRANCAAQCF+YX8LZEOSgnj5aZnmmiOk8sFSvfbWzfZuW4AoLU7RlKfevLl3EtLdo8qFqodlpW9F/HWFmWUvKJfGUwbleU",
+    "dPh_pkcs8": "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiKhRANCAATWWpOXfKo9GwgYUv9Xp55GXxZgV3MEuurVBd06SFic81AYXolTct9iIeo6E3VX5HP922dV8FvVB8PFM/zpyRKF",
+    "qpcHex": "040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e5794",
+    "qphHex": "04d65a93977caa3d1b081852ff57a79e465f1660577304baead505dd3a48589cf350185e895372df6221ea3a137557e473fddb6755f05bd507c3c533fce9c91285",
+    "zHex": "ccfc261f58193c98ca4ad4a53bbac6f0ee29bc4d48438090446908622ca79af6",
+    "k1Hex": "68d279545f9944d1c3a311a45af087e4eaf14a2b740e79faa5cdce84ee806f45"
+  },
   "gcm": [
     {
       "keyHex": "256a40ccc3cbb4c7338d5fe2bfbf7ae2f021d46a71a99c0d9a935f48e9a6fe22",

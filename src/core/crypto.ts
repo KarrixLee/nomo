@@ -15,6 +15,11 @@ const textDecoder = new TextDecoder();
 
 /** e.g. "nomo-cc-e2e-v1" — see the plan's Global Constraints; never changes without a version bump. */
 const HKDF_INFO = textEncoder.encode("nomo-cc-e2e-v1");
+/** Domain tag for the pairing-v3 ECDH ratchet HKDF info (concatenated with the pairingId). FROZEN
+ *  cross-platform — must match the iPhone app byte-for-byte. */
+const RATCHET_INFO_PREFIX = "nomo-cc-ratchet-v1|";
+/** P-256 ECDH parameters, reused by every keypair/derive call below. */
+const ECDH_P256 = { name: "ECDH", namedCurve: "P-256" } as const;
 
 function bytesToBase64(bytes: Uint8Array): string {
   let binary = "";
@@ -49,6 +54,43 @@ export async function deriveE2EKey(qrSecret: Uint8Array, phoneNonce: Uint8Array)
     ikm,
     256,
   );
+  return new Uint8Array(bits);
+}
+
+/** Generate an ephemeral P-256 ECDH keypair for the pairing-v3 ratchet. Returns the private key as
+ *  pkcs8 DER (to persist 0600) and the public key as SEC1 uncompressed raw bytes (65 B, first byte
+ *  0x04 — to publish in the QR `e=` param / the `/pair/start` body). `deriveBits` is the only usage
+ *  the ratchet needs; the key is exportable so `pair` can persist the private half. */
+export async function generateEphemeralKeyPair(): Promise<{ privPkcs8: Uint8Array; pubRaw: Uint8Array }> {
+  const kp = (await crypto.subtle.generateKey(ECDH_P256, true, ["deriveBits"])) as CryptoKeyPair;
+  const privPkcs8 = new Uint8Array(await crypto.subtle.exportKey("pkcs8", kp.privateKey));
+  const pubRaw = new Uint8Array(await crypto.subtle.exportKey("raw", kp.publicKey));
+  return { privPkcs8, pubRaw };
+}
+
+/** The pairing-v3 ECDH ratchet: derive the DURABLE key K1 from our ephemeral private key, the other
+ *  side's ephemeral public key, and the bootstrap key K0 (the code/QR-derived key, mixed in as the
+ *  HKDF salt so a relay that swaps the public keys can't derive K1 — it doesn't know K0).
+ *
+ *    Z  = ECDH-P256(ownPriv, otherPub)                          // 32-byte X coordinate
+ *    K1 = HKDF-SHA256(ikm = Z, salt = K0, info = "nomo-cc-ratchet-v1|" + pairingId)   // 32 B
+ *
+ *  K1 replaces K0 as the persisted pairing key (forward secrecy — a code revealed AFTER pairing can't
+ *  reconstruct Z, so it can't derive K1). FROZEN cross-platform contract (P-256 + HKDF-SHA256).
+ *  `ownPrivPkcs8` is pkcs8 DER; `otherPubRaw` is 65-byte SEC1 uncompressed. Throws on a malformed
+ *  public key (the caller treats that as a tampered claim). */
+export async function deriveRatchetKey(
+  ownPrivPkcs8: Uint8Array,
+  otherPubRaw: Uint8Array,
+  k0: Uint8Array,
+  pairingId: string,
+): Promise<Uint8Array> {
+  const priv = await crypto.subtle.importKey("pkcs8", ownPrivPkcs8, ECDH_P256, false, ["deriveBits"]);
+  const pub = await crypto.subtle.importKey("raw", otherPubRaw, ECDH_P256, false, []);
+  const z = new Uint8Array(await crypto.subtle.deriveBits({ name: "ECDH", public: pub }, priv, 256));
+  const zKey = await crypto.subtle.importKey("raw", z, "HKDF", false, ["deriveBits"]);
+  const info = textEncoder.encode(RATCHET_INFO_PREFIX + pairingId);
+  const bits = await crypto.subtle.deriveBits({ name: "HKDF", hash: "SHA-256", salt: k0, info }, zKey, 256);
   return new Uint8Array(bits);
 }
 

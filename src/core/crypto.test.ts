@@ -3,9 +3,11 @@ import {
   b64url,
   decryptBlob,
   deriveE2EKey,
+  deriveRatchetKey,
   encryptBlob,
   encryptBlobWithIVForVectors,
   fromB64url,
+  generateEphemeralKeyPair,
   sha256Hex,
 } from "./crypto";
 import vectors from "./cc-e2e-test-vectors.json";
@@ -139,6 +141,66 @@ describe("cc-e2e-test-vectors.json (cross-platform fixture consumed by the Swift
       (v) => /[一-鿿]/.test(v.plaintextJson.title) && /\p{Emoji}/u.test(v.plaintextJson.title),
     );
     expect(hasCjkEmoji).toBe(true);
+  });
+});
+
+// The FROZEN pairing-v3 ratchet vector (spec 2026-07-09). If Z or K1 ever changes, the iPhone app's
+// ratchet breaks — treat a failure here as a cross-platform contract violation, not a test to "fix".
+describe("pairing-v3 ECDH ratchet — mandatory cross-platform KAT (Z + K1 byte-equality)", () => {
+  const r = vectors.ratchet;
+
+  function fromHex(hex: string): Uint8Array {
+    const bytes = new Uint8Array(hex.length / 2);
+    for (let i = 0; i < bytes.length; i++) bytes[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+    return bytes;
+  }
+  /** The spec's pkcs8 blobs are standard base64 with NO padding — decode via atob after re-padding. */
+  function pkcs8Bytes(b64: string): Uint8Array {
+    const padded = b64 + "=".repeat((4 - (b64.length % 4)) % 4);
+    const bin = atob(padded);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    return bytes;
+  }
+
+  test("codeIkm (PBKDF2, 6 words) + K0 (HKDF) match the pinned vector", async () => {
+    // K0 = HKDF(codeIkm, phoneNonce) — codeIkm is verified against its own hex in pair-code.test.ts.
+    const k0 = await deriveE2EKey(fromHex(r.codeIkmHex), fromHex(r.phoneNonceHex));
+    expect(toHex(k0)).toBe(r.k0Hex);
+  });
+
+  test("Z = ECDH(dPh, QPC) matches the pinned X-coordinate (importing dPh via pkcs8, QPC via raw)", async () => {
+    const priv = await crypto.subtle.importKey(
+      "pkcs8", pkcs8Bytes(r.dPh_pkcs8), { name: "ECDH", namedCurve: "P-256" }, false, ["deriveBits"],
+    );
+    const pub = await crypto.subtle.importKey(
+      "raw", fromHex(r.qpcHex), { name: "ECDH", namedCurve: "P-256" }, false, [],
+    );
+    const z = new Uint8Array(await crypto.subtle.deriveBits({ name: "ECDH", public: pub }, priv, 256));
+    expect(toHex(z)).toBe(r.zHex);
+  });
+
+  test("K1 = deriveRatchetKey(dPh, QPC, K0, pairingId) matches the pinned durable key", async () => {
+    const k1 = await deriveRatchetKey(pkcs8Bytes(r.dPh_pkcs8), fromHex(r.qpcHex), fromHex(r.k0Hex), r.pairingId);
+    expect(toHex(k1)).toBe(r.k1Hex);
+  });
+
+  test("the ECDH is symmetric: deriveRatchetKey(dPC, QPh, …) yields the same K1", async () => {
+    const k1 = await deriveRatchetKey(pkcs8Bytes(r.dPC_pkcs8), fromHex(r.qphHex), fromHex(r.k0Hex), r.pairingId);
+    expect(toHex(k1)).toBe(r.k1Hex);
+  });
+
+  test("generateEphemeralKeyPair produces a 65-byte SEC1 public key (0x04) and a usable pkcs8 private key", async () => {
+    const a = await generateEphemeralKeyPair();
+    const b = await generateEphemeralKeyPair();
+    expect(a.pubRaw.length).toBe(65);
+    expect(a.pubRaw[0]).toBe(0x04); // uncompressed point
+    // Fresh keypairs derive a real shared key (round-trips through deriveRatchetKey without throwing).
+    const k0 = new Uint8Array(32).fill(5);
+    const k1 = await deriveRatchetKey(a.privPkcs8, b.pubRaw, k0, "pid");
+    const k1b = await deriveRatchetKey(b.privPkcs8, a.pubRaw, k0, "pid");
+    expect(toHex(k1)).toBe(toHex(k1b)); // ECDH symmetry on freshly generated keys
+    expect(k1.length).toBe(32);
   });
 });
 

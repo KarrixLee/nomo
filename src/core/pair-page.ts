@@ -30,8 +30,10 @@ const CHECK_ICON =
 
 export interface PairPageOptions {
   /** The QR as a complete standalone `<svg …>…</svg>` string (renderQRSVG output) — embedded inline.
-   *  The page overlays the Nomo logo dead-centre; at EC level Q the covered modules are within the
-   *  error budget, so the QR still scans (the WhatsApp/WeChat pattern). */
+   *  The page overlays the Nomo logo dead-centre; the logo is sized to stay within the QR's error
+   *  budget so it still scans (the WhatsApp/WeChat pattern). Since the pairing-v3 payload carries the
+   *  PC ephemeral key (`e=`) it exceeds level-Q capacity and renders at level L (~7% recovery), so the
+   *  logo footprint is kept to ~4% of the symbol area — comfortably under L's budget with margin. */
   svg: string;
   /** The one-time code, `<channel>-w1-w2-w3-w4`, or null when the worker assigned no channel (old
    *  worker / QR-only). Null hides the entire code section — the page then shows the QR alone. */
@@ -74,13 +76,20 @@ function jsStr(s: string): string {
 export function renderPairPage(opts: PairPageOptions): string {
   const { svg, code, expiresAt, poll } = opts;
 
+  // The code is click-to-reveal: blurred behind a "Tap to reveal code" button until the user clicks it,
+  // so a shoulder-surfed screen or a screen-share doesn't leak it for free. It's a real <button> (not a
+  // bare div) so it's keyboard-reachable and operable with Enter/Space, same as the copy button next to
+  // it. The code text is still present in the DOM (this page already carries pcSecret in its poll
+  // script — the blur is a screen-privacy measure, not a DOM-secrecy one); toggling just adds/removes a
+  // CSS blur filter and flips the button's label + `aria-expanded`.
   const codeSection = code
     ? `
       <div class="or">or enter the code</div>
       <div class="code-row">
-        <span class="code" id="code" aria-label="one-time pairing code">${esc(code)}</span>
+        <span class="code code-hidden" id="code" aria-label="one-time pairing code (hidden)">${esc(code)}</span>
         <button class="copy" id="copy" type="button" aria-label="Copy the code" title="Copy the code">${CLIPBOARD_ICON}</button>
       </div>
+      <button class="reveal" id="reveal" type="button" aria-expanded="false" aria-controls="code">Tap to reveal code</button>
       <p class="hint">In the Nomo app: <b>Sessions</b> → <b>Pair a Computer</b> → scan the QR, or tap <b>“Enter code”</b>.</p>`
     : `
       <p class="hint">In the Nomo app: <b>Sessions</b> → <b>Pair a Computer</b> → point the camera at the QR.</p>`;
@@ -128,10 +137,21 @@ export function renderPairPage(opts: PairPageOptions): string {
     pollOnce();`
     : "";
 
+  // Strict CSP (defense-in-depth): the page is a single self-contained file with ZERO external assets,
+  // so lock it down to inline-only. connect-src MUST include the worker origin — the live-status poll
+  // fetches {workerURL}/v1/cc/pair/status, and default-src 'none' would otherwise block it (and break
+  // the auto-flip to "Paired ✓"). img-src data: covers the inlined Nomo logo data URI; script/style
+  // 'unsafe-inline' cover the one inline <script>/<style>. No poll → connect-src 'none'.
+  const workerOrigin = poll ? new URL(poll.workerURL).origin : null;
+  const csp =
+    `default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; ` +
+    `img-src data:; connect-src ${workerOrigin ?? "'none'"}`;
+
   return `<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="${esc(csp)}">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Pair with Nomo</title>
 <style>
@@ -168,15 +188,16 @@ export function renderPairPage(opts: PairPageOptions): string {
     display: inline-block; line-height: 0; box-shadow: 0 2px 10px var(--shadow);
   }
   .qr-tile svg { width: 232px; height: 232px; display: block; }
-  /* Nomo logo overlaid dead-centre on a rounded white tile. Sized to cover only a few percent of the
-     QR AREA — safe at EC level Q (25% recovery), which the page QR uses. */
+  /* Nomo logo overlaid dead-centre on a rounded white tile. The pairing-v3 QR renders at EC level L
+     (~7% recovery — the e= ephemeral key pushes it past level-Q capacity), so the tile + its white
+     halo are kept to ~46px on the 232px symbol (~4% of the area), safely inside L's budget with margin. */
   .logo {
     position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
-    width: 56px; height: 56px; border-radius: 13px; background: #ffffff;
-    box-shadow: 0 0 0 3px #ffffff, 0 1px 4px rgba(0,0,0,.18);
+    width: 42px; height: 42px; border-radius: 10px; background: #ffffff;
+    box-shadow: 0 0 0 2px #ffffff, 0 1px 4px rgba(0,0,0,.18);
     display: flex; align-items: center; justify-content: center; line-height: 0;
   }
-  .logo img { width: 44px; height: 44px; border-radius: 10px; display: block; }
+  .logo img { width: 32px; height: 32px; border-radius: 8px; display: block; }
   .or {
     color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em;
     margin: 26px 0 10px; font-weight: 600;
@@ -199,6 +220,14 @@ export function renderPairPage(opts: PairPageOptions): string {
   .copy:hover { opacity: .92; }
   .copy.copied { background: var(--ok); }
   .copy .ic { display: block; }
+  /* Click-to-reveal: the code is blurred + unselectable until "Tap to reveal code" is pressed. */
+  .code.code-hidden { filter: blur(7px); user-select: none; }
+  .reveal {
+    display: block; width: 100%; margin: 10px 0 0; padding: 9px 12px;
+    font-size: 13px; font-weight: 600; color: var(--accent);
+    background: transparent; border: 1px dashed var(--border); border-radius: 10px; cursor: pointer;
+  }
+  .reveal:hover { background: var(--code-bg); }
   .hint { color: var(--muted); font-size: 13px; line-height: 1.5; margin: 20px 0 0; }
   .hint b { color: var(--fg); font-weight: 600; }
   .timer {
@@ -258,6 +287,20 @@ export function renderPairPage(opts: PairPageOptions): string {
       var m = Math.floor(total / 60);
       var s = total % 60;
       count.textContent = m + ":" + (s < 10 ? "0" : "") + s;
+    }
+
+    // Click-to-reveal: the code starts blurred; pressing the button toggles the blur + swaps its own
+    // label ("Tap to reveal code" ↔ "Tap to hide code") and aria-expanded, so a screen-shared window
+    // doesn't show the code by default. Keyboard-operable — it's a real <button>.
+    var revealBtn = document.getElementById("reveal");
+    var codeEl = document.getElementById("code");
+    if (revealBtn && codeEl) {
+      revealBtn.addEventListener("click", function () {
+        var hidden = codeEl.classList.toggle("code-hidden");
+        revealBtn.textContent = hidden ? "Tap to reveal code" : "Tap to hide code";
+        revealBtn.setAttribute("aria-expanded", hidden ? "false" : "true");
+        codeEl.setAttribute("aria-label", hidden ? "one-time pairing code (hidden)" : "one-time pairing code");
+      });
     }
 
     // Copy button: clipboard API first (best-effort), execCommand fallback (file:// pages may block the

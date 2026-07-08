@@ -4,6 +4,7 @@ var __require = /* @__PURE__ */ createRequire(import.meta.url);
 // src/entries/pair.ts
 import { spawn as spawn2 } from "node:child_process";
 import { readFile as readFile2, unlink as unlink2 } from "node:fs/promises";
+import { dirname as dirname2, join as join2 } from "node:path";
 
 // src/core/shared.ts
 import { chmod, open, readFile, rename, stat, mkdir, unlink, writeFile } from "node:fs/promises";
@@ -16,6 +17,8 @@ import { fileURLToPath } from "node:url";
 var textEncoder = new TextEncoder;
 var textDecoder = new TextDecoder;
 var HKDF_INFO = textEncoder.encode("nomo-cc-e2e-v1");
+var RATCHET_INFO_PREFIX = "nomo-cc-ratchet-v1|";
+var ECDH_P256 = { name: "ECDH", namedCurve: "P-256" };
 function bytesToBase64(bytes) {
   let binary = "";
   for (const b of bytes)
@@ -40,6 +43,21 @@ function fromB64url(s) {
 async function deriveE2EKey(qrSecret, phoneNonce) {
   const ikm = await crypto.subtle.importKey("raw", qrSecret, "HKDF", false, ["deriveBits"]);
   const bits = await crypto.subtle.deriveBits({ name: "HKDF", hash: "SHA-256", salt: phoneNonce, info: HKDF_INFO }, ikm, 256);
+  return new Uint8Array(bits);
+}
+async function generateEphemeralKeyPair() {
+  const kp = await crypto.subtle.generateKey(ECDH_P256, true, ["deriveBits"]);
+  const privPkcs8 = new Uint8Array(await crypto.subtle.exportKey("pkcs8", kp.privateKey));
+  const pubRaw = new Uint8Array(await crypto.subtle.exportKey("raw", kp.publicKey));
+  return { privPkcs8, pubRaw };
+}
+async function deriveRatchetKey(ownPrivPkcs8, otherPubRaw, k0, pairingId) {
+  const priv = await crypto.subtle.importKey("pkcs8", ownPrivPkcs8, ECDH_P256, false, ["deriveBits"]);
+  const pub = await crypto.subtle.importKey("raw", otherPubRaw, ECDH_P256, false, []);
+  const z = new Uint8Array(await crypto.subtle.deriveBits({ name: "ECDH", public: pub }, priv, 256));
+  const zKey = await crypto.subtle.importKey("raw", z, "HKDF", false, ["deriveBits"]);
+  const info = textEncoder.encode(RATCHET_INFO_PREFIX + pairingId);
+  const bits = await crypto.subtle.deriveBits({ name: "HKDF", hash: "SHA-256", salt: k0, info }, zKey, 256);
   return new Uint8Array(bits);
 }
 async function sealCombined(key, plaintext, iv) {
@@ -148,12 +166,19 @@ function parsePendingConfig(raw) {
         codeIkm = decoded;
     } catch {}
   }
+  let pcEphPriv;
+  if (typeof c.pcEphPrivB64 === "string") {
+    try {
+      pcEphPriv = fromB64url(c.pcEphPrivB64);
+    } catch {}
+  }
   return {
     url: c.url.replace(/\/$/, ""),
     pairingId: c.pairingId,
     pcSecret: c.pcSecret,
     qrSecret,
     ...codeIkm ? { codeIkm } : {},
+    ...pcEphPriv ? { pcEphPriv } : {},
     machineName: typeof c.machineName === "string" && c.machineName.length > 0 ? c.machineName : undefined,
     createdAt: typeof c.createdAt === "number" && Number.isFinite(c.createdAt) ? c.createdAt : undefined
   };
@@ -266,9 +291,13 @@ async function completePendingPairing(pending, configPath, opts = {}) {
   const ikm = body.path === "code" ? pending.codeIkm : pending.qrSecret;
   if (!ikm)
     return { state: "tampered" };
-  const e2eKey = await deriveE2EKey(ikm, fromB64url(body.phoneNonce));
+  const k0 = await deriveE2EKey(ikm, fromB64url(body.phoneNonce));
+  if (!pending.pcEphPriv || typeof body.phoneEphPub !== "string")
+    return { state: "tampered" };
+  let e2eKey;
   let deviceName;
   try {
+    e2eKey = await deriveRatchetKey(pending.pcEphPriv, fromB64url(body.phoneEphPub), k0, pending.pairingId);
     deviceName = await decryptDeviceName(e2eKey, body.deviceNameEnc);
   } catch {
     return { state: "tampered" };
@@ -2439,10 +2468,10 @@ var BIP39_WORDLIST = [
 ];
 
 // src/core/pair-code.ts
-var CODE_SALT_PREFIX = "nomo-pair-code-v1|";
+var CODE_SALT_PREFIX = "nomo-pair-code-v2|";
 var PBKDF2_ITERATIONS = 600000;
 var CODE_KEY_LEN = 32;
-var CODE_WORD_COUNT = 4;
+var CODE_WORD_COUNT = 6;
 function uniformIndex(maxExclusive, randomBytes) {
   const range = 65536;
   const limit = range - range % maxExclusive;
@@ -2493,9 +2522,10 @@ function renderPairPage(opts) {
   const codeSection = code ? `
       <div class="or">or enter the code</div>
       <div class="code-row">
-        <span class="code" id="code" aria-label="one-time pairing code">${esc(code)}</span>
+        <span class="code code-hidden" id="code" aria-label="one-time pairing code (hidden)">${esc(code)}</span>
         <button class="copy" id="copy" type="button" aria-label="Copy the code" title="Copy the code">${CLIPBOARD_ICON}</button>
       </div>
+      <button class="reveal" id="reveal" type="button" aria-expanded="false" aria-controls="code">Tap to reveal code</button>
       <p class="hint">In the Nomo app: <b>Sessions</b> → <b>Pair a Computer</b> → scan the QR, or tap <b>“Enter code”</b>.</p>` : `
       <p class="hint">In the Nomo app: <b>Sessions</b> → <b>Pair a Computer</b> → point the camera at the QR.</p>`;
   const pollScript = poll ? `
@@ -2534,10 +2564,13 @@ function renderPairPage(opts) {
     }
     pollIv = setInterval(pollOnce, 3000);
     pollOnce();` : "";
+  const workerOrigin = poll ? new URL(poll.workerURL).origin : null;
+  const csp = `default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; ` + `img-src data:; connect-src ${workerOrigin ?? "'none'"}`;
   return `<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="${esc(csp)}">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Pair with Nomo</title>
 <style>
@@ -2574,15 +2607,16 @@ function renderPairPage(opts) {
     display: inline-block; line-height: 0; box-shadow: 0 2px 10px var(--shadow);
   }
   .qr-tile svg { width: 232px; height: 232px; display: block; }
-  /* Nomo logo overlaid dead-centre on a rounded white tile. Sized to cover only a few percent of the
-     QR AREA — safe at EC level Q (25% recovery), which the page QR uses. */
+  /* Nomo logo overlaid dead-centre on a rounded white tile. The pairing-v3 QR renders at EC level L
+     (~7% recovery — the e= ephemeral key pushes it past level-Q capacity), so the tile + its white
+     halo are kept to ~46px on the 232px symbol (~4% of the area), safely inside L's budget with margin. */
   .logo {
     position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
-    width: 56px; height: 56px; border-radius: 13px; background: #ffffff;
-    box-shadow: 0 0 0 3px #ffffff, 0 1px 4px rgba(0,0,0,.18);
+    width: 42px; height: 42px; border-radius: 10px; background: #ffffff;
+    box-shadow: 0 0 0 2px #ffffff, 0 1px 4px rgba(0,0,0,.18);
     display: flex; align-items: center; justify-content: center; line-height: 0;
   }
-  .logo img { width: 44px; height: 44px; border-radius: 10px; display: block; }
+  .logo img { width: 32px; height: 32px; border-radius: 8px; display: block; }
   .or {
     color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em;
     margin: 26px 0 10px; font-weight: 600;
@@ -2605,6 +2639,14 @@ function renderPairPage(opts) {
   .copy:hover { opacity: .92; }
   .copy.copied { background: var(--ok); }
   .copy .ic { display: block; }
+  /* Click-to-reveal: the code is blurred + unselectable until "Tap to reveal code" is pressed. */
+  .code.code-hidden { filter: blur(7px); user-select: none; }
+  .reveal {
+    display: block; width: 100%; margin: 10px 0 0; padding: 9px 12px;
+    font-size: 13px; font-weight: 600; color: var(--accent);
+    background: transparent; border: 1px dashed var(--border); border-radius: 10px; cursor: pointer;
+  }
+  .reveal:hover { background: var(--code-bg); }
   .hint { color: var(--muted); font-size: 13px; line-height: 1.5; margin: 20px 0 0; }
   .hint b { color: var(--fg); font-weight: 600; }
   .timer {
@@ -2664,6 +2706,20 @@ function renderPairPage(opts) {
       var m = Math.floor(total / 60);
       var s = total % 60;
       count.textContent = m + ":" + (s < 10 ? "0" : "") + s;
+    }
+
+    // Click-to-reveal: the code starts blurred; pressing the button toggles the blur + swaps its own
+    // label ("Tap to reveal code" ↔ "Tap to hide code") and aria-expanded, so a screen-shared window
+    // doesn't show the code by default. Keyboard-operable — it's a real <button>.
+    var revealBtn = document.getElementById("reveal");
+    var codeEl = document.getElementById("code");
+    if (revealBtn && codeEl) {
+      revealBtn.addEventListener("click", function () {
+        var hidden = codeEl.classList.toggle("code-hidden");
+        revealBtn.textContent = hidden ? "Tap to reveal code" : "Tap to hide code";
+        revealBtn.setAttribute("aria-expanded", hidden ? "false" : "true");
+        codeEl.setAttribute("aria-label", hidden ? "one-time pairing code (hidden)" : "one-time pairing code");
+      });
     }
 
     // Copy button: clipboard API first (best-effort), execCommand fallback (file:// pages may block the
@@ -3217,13 +3273,14 @@ async function removePendingConfig(configPath) {
   try {
     await unlink2(configPath);
   } catch {}
+  await unlink2(join2(dirname2(configPath), PAIR_HTML_FILE)).catch(() => {});
 }
 function bytesToHex(bytes) {
   return Array.from(bytes).map((b) => b.toString(16).padStart(2, "0")).join("");
 }
-function buildPairURL(workerUrl, pairingId, qrSecret) {
+function buildPairURL(workerUrl, pairingId, qrSecret, pcEphPub) {
   const u = workerUrl === DEFAULT_WORKER_URL ? "" : `&u=${b64url(textEncoder2.encode(workerUrl))}`;
-  return `nomo://pair?v=1${u}&p=${pairingId}&s=${b64url(qrSecret)}`;
+  return `nomo://pair?v=1${u}&p=${pairingId}&s=${b64url(qrSecret)}&e=${b64url(pcEphPub)}`;
 }
 function revokeCreds(raw) {
   const completed = parseConfig(raw);
@@ -3263,17 +3320,19 @@ async function pairStart(deps = {}) {
   const now = deps.now ?? Date.now;
   const htmlPath = deps.htmlPath ?? PAIR_HTML_PATH;
   const pickWords = deps.pickWords ?? (() => randomCodeWords(randomBytes));
+  const genEphemeralKeyPair = deps.genEphemeralKeyPair ?? generateEphemeralKeyPair;
+  const showCode = deps.showCode ?? false;
   await unlink2(htmlPath).catch(() => {});
-  await revokeExisting(fetchFn, configPath, print);
   const pairingId = bytesToHex(randomBytes(16));
   const pcSecret = b64url(randomBytes(24));
   const qrSecret = randomBytes(16);
+  const eph = await genEphemeralKeyPair();
   let startRes;
   try {
     startRes = await fetchFn(`${workerUrl}/v1/cc/pair/start`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ pairingId, pcAuthHash: await sha256Hex(pcSecret) }),
+      body: JSON.stringify({ pairingId, pcAuthHash: await sha256Hex(pcSecret), pcEphPub: b64url(eph.pubRaw) }),
       signal: AbortSignal.timeout(FETCH_TIMEOUT_MS)
     });
   } catch {
@@ -3306,16 +3365,23 @@ async function pairStart(deps = {}) {
     codeIkm = await deriveCodeIkm(words, pairingId);
     codeString = formatCodeString(channel, words);
   }
+  await revokeExisting(fetchFn, configPath, print);
   await atomicWrite(configPath, JSON.stringify({
     url: workerUrl,
     pairingId,
     pcSecret,
     qrSecretB64: b64url(qrSecret),
+    pcEphPrivB64: b64url(eph.privPkcs8),
     ...codeIkm ? { codeIkmB64: b64url(codeIkm) } : {},
     createdAt: now()
   }), CONFIG_MODE2);
   spawnWatchdog();
-  const url = buildPairURL(workerUrl, pairingId, qrSecret);
+  if (showCode && codeString !== undefined) {
+    print(`One-time code: ${codeString} · expires in 10 min`);
+    print('No browser page was opened (--show-code). Enter the code in the Nomo app: Sessions → "Pair a Computer" → "Enter code".');
+    return 0;
+  }
+  const url = buildPairURL(workerUrl, pairingId, qrSecret, eph.pubRaw);
   const page = renderPairPage({
     svg: renderQRSVG(url, { ecLevel: "Q" }),
     code: codeString ?? null,
@@ -3329,12 +3395,9 @@ async function pairStart(deps = {}) {
   } else {
     print(`Open this file in a browser: ${htmlPath}`);
   }
-  print("The QR code and one-time pairing code are shown on that page.");
   print("This expires in 10 minutes. Keep this session open — the next step waits for your phone.");
-  const showCode = deps.showCode ?? false;
-  const isTTY = deps.isTTY ?? process.stdout.isTTY === true;
-  if (codeString && (showCode || isTTY)) {
-    print(`One-time code: ${codeString} · expires in 10 min`);
+  if (codeString) {
+    print(`The one-time code is hidden for privacy — click "Tap to reveal code" on the pairing page. If you can't open a browser, re-run with --show-code to read it in the terminal instead.`);
   }
   return 0;
 }
@@ -3431,7 +3494,7 @@ function parseTimeoutMs(argv) {
 }
 if (__require.main == __require.module) {
   if (process.argv.includes("--check")) {
-    console.log("usage: pair [wait [--timeout <seconds>]] [--show-code] [--check]  — pair this machine with the Nomo app (opens a browser page with the QR + code; --show-code also prints the one-time code for SSH/headless)");
+    console.log("usage: pair [wait [--timeout <seconds>]] [--show-code] [--check]  — pair this machine with the Nomo app (opens a browser page with the QR + click-to-reveal code; --show-code is for when you can't open a browser at all — it skips the QR/page and prints the one-time code to the terminal instead)");
     process.exit(0);
   }
   if (process.argv.includes("wait")) {

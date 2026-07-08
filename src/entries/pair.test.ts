@@ -1,8 +1,10 @@
 import { chmod, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { b64url, decryptBlob, deriveE2EKey, fromB64url, sha256Hex } from "../core/crypto";
+import { afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
+import {
+  b64url, decryptBlob, deriveE2EKey, deriveRatchetKey, fromB64url, generateEphemeralKeyPair, sha256Hex,
+} from "../core/crypto";
 import {
   buildPairURL, bytesToHex, decryptDeviceName, DEFAULT_WORKER_URL, pairStart, pairWait,
 } from "./pair";
@@ -62,6 +64,28 @@ const PHONE_NONCE = Uint8Array.from({ length: 16 }, (_, i) => 50 + i);
 const EXPECTED_PAIRING_ID = bytesToHex(PAIRING_BYTES);
 const EXPECTED_PC_SECRET = b64url(PC_SECRET_BYTES);
 
+// Pairing-v3 ratchet fixtures: one PC ephemeral keypair (what pairStart persists / the phone reads as
+// QPC) and one phone ephemeral keypair (what the phone sends in its claim as phoneEphPub). Generated
+// once per run; the ECDH is symmetric so either side derives the same durable K1.
+let PC_EPH: { privPkcs8: Uint8Array; pubRaw: Uint8Array };
+let PHONE_EPH: { privPkcs8: Uint8Array; pubRaw: Uint8Array };
+beforeAll(async () => {
+  PC_EPH = await generateEphemeralKeyPair();
+  PHONE_EPH = await generateEphemeralKeyPair();
+});
+
+/** The DURABLE key K1 the phone seals `deviceNameEnc` under = HKDF(ECDH(dPh, QPC), salt=K0, info),
+ *  where K0 = HKDF(ikm, phoneNonce). Mirrors completePendingPairing's PC-side derivation (which uses
+ *  the symmetric ECDH dPC·QPh), so both arrive at the same K1. */
+async function ratchetK1(
+  ikm: Uint8Array, nonce: Uint8Array = PHONE_NONCE, pairingId: string = EXPECTED_PAIRING_ID,
+): Promise<Uint8Array> {
+  const k0 = await deriveE2EKey(ikm, nonce);
+  return deriveRatchetKey(PHONE_EPH.privPkcs8, PC_EPH.pubRaw, k0, pairingId);
+}
+/** The phone's ephemeral public key (b64url SEC1) as it appears in a /pair/status claim response. */
+const phoneEphPubB64 = () => b64url(PHONE_EPH.pubRaw);
+
 let dir: string;
 let configPath: string;
 let sleeps: number[];
@@ -91,7 +115,8 @@ function watchdogSpy() {
  *  against the on-disk contract without re-running the start phase. */
 async function writePending(over: Record<string, unknown> = {}): Promise<void> {
   await writeFile(configPath, JSON.stringify({
-    url: WORKER, pairingId: EXPECTED_PAIRING_ID, pcSecret: EXPECTED_PC_SECRET, qrSecretB64: b64url(QR_SECRET), ...over,
+    url: WORKER, pairingId: EXPECTED_PAIRING_ID, pcSecret: EXPECTED_PC_SECRET, qrSecretB64: b64url(QR_SECRET),
+    pcEphPrivB64: b64url(PC_EPH.privPkcs8), ...over,
   }));
 }
 
@@ -113,6 +138,7 @@ describe("pairStart", () => {
     const code = await pairStart({
       fetchFn: fn, print, configPath, workerUrl: WORKER, spawnWatchdog: wd.spawn, now: () => 1_700_000_000_000,
       randomBytes: scriptedRandom([PAIRING_BYTES, PC_SECRET_BYTES, QR_SECRET]),
+      genEphemeralKeyPair: async () => PC_EPH,
       htmlPath, openFile: (p: string) => { opened.push(p); return true; },
     });
 
@@ -121,17 +147,19 @@ describe("pairStart", () => {
     expect(wd.calls).toBe(1); // the self-heal watchdog was spawned
     expect(opened).toEqual([htmlPath]); // the browser opener was invoked with the page path
 
-    // start body: minted 32-hex id + sha256(pcSecret).
+    // start body: minted 32-hex id + sha256(pcSecret) + the PC ephemeral PUBLIC key (QPC).
     const startBody = JSON.parse(String(calls[0].init?.body)) as Record<string, string>;
     expect(startBody.pairingId).toBe(EXPECTED_PAIRING_ID);
     expect(startBody.pairingId).toMatch(/^[0-9a-f]{32}$/);
     expect(startBody.pcAuthHash).toBe(await sha256Hex(EXPECTED_PC_SECRET));
+    expect(startBody.pcEphPub).toBe(b64url(PC_EPH.pubRaw)); // published PUBLIC key — safe for the blind worker
 
-    // PENDING config: qrSecret persisted, createdAt stamped, NO channel → NO codeIkm, NO e2eKey yet.
+    // PENDING config: qrSecret + ephemeral ratchet PRIVATE key persisted, createdAt stamped, NO channel
+    // → NO codeIkm, NO e2eKey yet.
     const written = JSON.parse(await readFile(configPath, "utf8")) as Record<string, unknown>;
     expect(written).toEqual({
       url: WORKER, pairingId: EXPECTED_PAIRING_ID, pcSecret: EXPECTED_PC_SECRET,
-      qrSecretB64: b64url(QR_SECRET), createdAt: 1_700_000_000_000,
+      qrSecretB64: b64url(QR_SECRET), pcEphPrivB64: b64url(PC_EPH.privPkcs8), createdAt: 1_700_000_000_000,
     });
     expect(written.e2eKeyB64).toBeUndefined();
     expect(written.codeIkmB64).toBeUndefined();
@@ -156,19 +184,19 @@ describe("pairStart", () => {
 
     // SECURITY: nothing secret is printed to stdout — no QR art, no nomo:// link (they live on the page).
     expect(out).not.toContain("█");
-    expect(out).not.toContain(buildPairURL(WORKER, EXPECTED_PAIRING_ID, QR_SECRET));
+    expect(out).not.toContain(buildPairURL(WORKER, EXPECTED_PAIRING_ID, QR_SECRET, PC_EPH.pubRaw));
     expect(out).not.toContain("nomo://pair");
   });
 
-  test("with a channel: mints the magic code, persists codeIkm, shows the code on the page (never on stdout)", async () => {
+  test("with a channel (default, no --show-code): mints the magic code, persists codeIkm, shows the code click-to-reveal on the page (never on stdout)", async () => {
     const htmlPath = join(dir, PAIR_HTML_FILE);
-    const words = ["koala", "sunset", "mango", "river"];
+    const words = ["koala", "sunset", "mango", "river", "atlas", "cabin"];
     const { fn } = scriptedFetch([() => json({ channel: 7 }, 201)]);
 
     const code = await pairStart({
       fetchFn: fn, print, configPath, workerUrl: WORKER, spawnWatchdog: () => {}, now: () => 1_700_000_000_000,
       randomBytes: scriptedRandom([PAIRING_BYTES, PC_SECRET_BYTES, QR_SECRET]),
-      htmlPath, openFile: () => true, pickWords: () => words, isTTY: false, // non-TTY (agent Bash tool)
+      htmlPath, openFile: () => true, pickWords: () => words,
     });
     expect(code).toBe(0);
 
@@ -179,63 +207,67 @@ describe("pairStart", () => {
     const pending = parsePendingConfig(JSON.stringify(written));
     expect(pending?.codeIkm).toEqual(expectedIkm);
 
-    // The full code (`<channel>-w1-w2-w3-w4`) appears on the page…
+    // The full code (`<channel>-w1-w2-w3-w4-w5-w6`) is on the page, but hidden behind click-to-reveal…
     const html = await readFile(htmlPath, "utf8");
-    expect(html).toContain("7-koala-sunset-mango-river");
+    expect(html).toContain("7-koala-sunset-mango-river-atlas-cabin");
+    expect(html).toContain('class="code code-hidden"');
     // …and the page bakes the live-status poll params (worker/pairing/pcSecret) so it self-updates.
     expect(html).toContain(`/v1/cc/pair/status?p=`);
     expect(html).toContain(EXPECTED_PC_SECRET);
-    // …but the code is NEVER on stdout on a non-TTY (agent transcript).
+    // …but the code is NEVER on stdout by default.
     expect(lines.join("\n")).not.toContain("koala");
     expect(lines.join("\n")).not.toContain("7-koala");
   });
 
-  // --- Feature 1: one-time code on stdout is TTY-gated (+ --show-code override) --------------------
-  test("prints the one-time code to stdout when stdout is an interactive TTY", async () => {
-    const words = ["koala", "sunset", "mango", "river"];
+  // --- one-time code on stdout is opt-in only via --show-code -------------------------------------
+  test("does NOT print the code by default (no --show-code) — tells the user it's hidden and how to reveal it", async () => {
+    const words = ["koala", "sunset", "mango", "river", "atlas", "cabin"];
     const { fn } = scriptedFetch([() => json({ channel: 7 }, 201)]);
     await pairStart({
       fetchFn: fn, print, configPath, workerUrl: WORKER, spawnWatchdog: () => {},
       randomBytes: scriptedRandom([PAIRING_BYTES, PC_SECRET_BYTES, QR_SECRET]),
       htmlPath: join(dir, PAIR_HTML_FILE), openFile: () => true, pickWords: () => words,
-      isTTY: true, // the user ran `pair` directly in a real terminal
     });
-    expect(lines.join("\n")).toContain("One-time code: 7-koala-sunset-mango-river · expires in 10 min");
+    const out = lines.join("\n");
+    expect(out).not.toContain("One-time code");
+    expect(out).not.toContain("koala");
+    expect(out).toContain("hidden for privacy");
+    expect(out).toContain("--show-code");
   });
 
-  test("does NOT print the code on a non-TTY without --show-code (agent Bash tool / pipe)", async () => {
-    const words = ["koala", "sunset", "mango", "river"];
+  test("--show-code (with a channel) skips the QR/page entirely and prints the code straight to stdout (headless/SSH escape hatch)", async () => {
+    const htmlPath = join(dir, PAIR_HTML_FILE);
+    const words = ["koala", "sunset", "mango", "river", "atlas", "cabin"];
+    const opened: string[] = [];
     const { fn } = scriptedFetch([() => json({ channel: 7 }, 201)]);
-    await pairStart({
+    const code = await pairStart({
       fetchFn: fn, print, configPath, workerUrl: WORKER, spawnWatchdog: () => {},
       randomBytes: scriptedRandom([PAIRING_BYTES, PC_SECRET_BYTES, QR_SECRET]),
-      htmlPath: join(dir, PAIR_HTML_FILE), openFile: () => true, pickWords: () => words,
-      isTTY: false, showCode: false,
+      htmlPath, openFile: (p: string) => { opened.push(p); return true; }, pickWords: () => words,
+      showCode: true,
     });
-    expect(lines.join("\n")).not.toContain("One-time code");
-    expect(lines.join("\n")).not.toContain("koala");
+    expect(code).toBe(0);
+    const out = lines.join("\n");
+    expect(out).toContain("One-time code: 7-koala-sunset-mango-river-atlas-cabin · expires in 10 min");
+    expect(out).toContain("No browser page was opened");
+    // No QR/page artifact at all — the browser opener is never invoked, and no html file is written.
+    expect(opened).toEqual([]);
+    await expect(stat(htmlPath)).rejects.toBeDefined();
   });
 
-  test("--show-code (showCode) forces the code onto stdout even on a non-TTY (SSH/headless)", async () => {
-    const words = ["koala", "sunset", "mango", "river"];
-    const { fn } = scriptedFetch([() => json({ channel: 7 }, 201)]);
-    await pairStart({
-      fetchFn: fn, print, configPath, workerUrl: WORKER, spawnWatchdog: () => {},
-      randomBytes: scriptedRandom([PAIRING_BYTES, PC_SECRET_BYTES, QR_SECRET]),
-      htmlPath: join(dir, PAIR_HTML_FILE), openFile: () => true, pickWords: () => words,
-      isTTY: false, showCode: true,
-    });
-    expect(lines.join("\n")).toContain("One-time code: 7-koala-sunset-mango-river · expires in 10 min");
-  });
-
-  test("QR-only (no channel from the worker) → no code to print even on a TTY / with --show-code", async () => {
+  test("QR-only (no channel from the worker): --show-code has nothing to print, so it falls back to the normal QR page", async () => {
+    const htmlPath = join(dir, PAIR_HTML_FILE);
+    const opened: string[] = [];
     const { fn } = scriptedFetch([() => json({ ok: true }, 201)]); // no channel → no code
     await pairStart({
       fetchFn: fn, print, configPath, workerUrl: WORKER, spawnWatchdog: () => {},
       randomBytes: scriptedRandom([PAIRING_BYTES, PC_SECRET_BYTES, QR_SECRET]),
-      htmlPath: join(dir, PAIR_HTML_FILE), openFile: () => true, isTTY: true, showCode: true,
+      htmlPath, openFile: (p: string) => { opened.push(p); return true; }, showCode: true,
     });
     expect(lines.join("\n")).not.toContain("One-time code");
+    // still falls back to opening the page — there's no code to print instead
+    expect(opened).toEqual([htmlPath]);
+    expect(await readFile(htmlPath, "utf8")).toContain("<svg");
   });
 
   test("falls back to printing the page path when the browser opener declines (headless / NOMO_NO_OPEN)", async () => {
@@ -270,7 +302,7 @@ describe("pairWait (happy path)", () => {
   test("pending → claimed → ack, exact completed config, derived key, printed name, qrSecret dropped", async () => {
     await writePending();
     // The "phone": derives the same key from the QR secret + its nonce, encrypts its name.
-    const phoneKey = await deriveE2EKey(QR_SECRET, PHONE_NONCE);
+    const phoneKey = await ratchetK1(QR_SECRET);
     const deviceNameEnc = await seal(phoneKey, new TextEncoder().encode(JSON.stringify("Karrix's iPhone")));
 
     const { fn, calls } = scriptedFetch([
@@ -279,7 +311,7 @@ describe("pairWait (happy path)", () => {
         expect((init?.headers as Record<string, string>)["x-cc-auth"]).toBe(EXPECTED_PC_SECRET);
         return json({ state: "pending" });
       },
-      () => json({ state: "claimed", phoneNonce: b64url(PHONE_NONCE), deviceNameEnc }),
+      () => json({ state: "claimed", phoneNonce: b64url(PHONE_NONCE), deviceNameEnc, phoneEphPub: phoneEphPubB64() }),
       (url, init) => {
         expect(url).toBe(`${WORKER}/v1/cc/pair/ack`);
         expect(init?.method).toBe("POST");
@@ -313,11 +345,11 @@ describe("pairWait (happy path)", () => {
 
   test("ack is retried up to 3 times on persistent failure; pairing still succeeds", async () => {
     await writePending();
-    const phoneKey = await deriveE2EKey(QR_SECRET, PHONE_NONCE);
+    const phoneKey = await ratchetK1(QR_SECRET);
     const deviceNameEnc = await seal(phoneKey, new TextEncoder().encode(JSON.stringify("P")));
     let ackAttempts = 0;
     const { fn, calls } = scriptedFetch([
-      () => json({ state: "claimed", phoneNonce: b64url(PHONE_NONCE), deviceNameEnc }),
+      () => json({ state: "claimed", phoneNonce: b64url(PHONE_NONCE), deviceNameEnc, phoneEphPub: phoneEphPubB64() }),
       () => { ackAttempts++; throw new Error("ECONNRESET"); },
       () => { ackAttempts++; throw new Error("ECONNRESET"); },
       () => { ackAttempts++; throw new Error("ECONNRESET"); },
@@ -351,7 +383,7 @@ describe("pairWait (happy path)", () => {
 
   test("a concurrent completer (watchdog) finished first: a 404 poll but a completed config → success", async () => {
     await writePending();
-    const phoneKey = await deriveE2EKey(QR_SECRET, PHONE_NONCE);
+    const phoneKey = await ratchetK1(QR_SECRET);
     const { fn } = scriptedFetch([
       async () => {
         // Simulate the watchdog completing under us just before this poll resolves 404.
@@ -367,7 +399,7 @@ describe("pairWait (happy path)", () => {
 
   test("the watchdog completes the config UNDER a mid-poll wait → the top-of-loop re-read succeeds (no false expiry)", async () => {
     await writePending();
-    const phoneKey = await deriveE2EKey(QR_SECRET, PHONE_NONCE);
+    const phoneKey = await ratchetK1(QR_SECRET);
     // Our own poll still sees "pending" (the ack hadn't landed yet), but the watchdog writes the
     // completed config to disk. The next iteration's top-of-loop re-read spots it and succeeds.
     const { fn, calls } = scriptedFetch([
@@ -386,7 +418,7 @@ describe("pairWait (happy path)", () => {
 
   test("a nonce-stripped 'claimed' poll (already acked) with a completed config on disk → success", async () => {
     await writePending();
-    const phoneKey = await deriveE2EKey(QR_SECRET, PHONE_NONCE);
+    const phoneKey = await ratchetK1(QR_SECRET);
     const { fn } = scriptedFetch([
       async () => {
         await writeFile(configPath, JSON.stringify({
@@ -429,11 +461,11 @@ describe("pairWait flushes a pending-pairing event stash on completion", () => {
   test("a fresh stash → encrypted /v1/cc/event POST after the ack, then the stash is deleted", async () => {
     await writePending();
     await writeStash();
-    const phoneKey = await deriveE2EKey(QR_SECRET, PHONE_NONCE);
+    const phoneKey = await ratchetK1(QR_SECRET);
     const deviceNameEnc = await seal(phoneKey, new TextEncoder().encode(JSON.stringify("iPhone")));
 
     const { fn, calls } = scriptedFetch([
-      () => json({ state: "claimed", phoneNonce: b64url(PHONE_NONCE), deviceNameEnc }),
+      () => json({ state: "claimed", phoneNonce: b64url(PHONE_NONCE), deviceNameEnc, phoneEphPub: phoneEphPubB64() }),
       (url) => { expect(url).toBe(`${WORKER}/v1/cc/pair/ack`); return json({ ok: true }); },
       async (url, init) => {
         expect(url).toBe(`${WORKER}/v1/cc/event`);
@@ -459,11 +491,11 @@ describe("pairWait flushes a pending-pairing event stash on completion", () => {
   test("a stale stash (older than the 10-min QR TTL) is dropped, not posted", async () => {
     await writePending();
     await writeStash({ stashedAt: Date.now() - 700_000 }); // past PENDING_STASH_STALE_MS
-    const phoneKey = await deriveE2EKey(QR_SECRET, PHONE_NONCE);
+    const phoneKey = await ratchetK1(QR_SECRET);
     const deviceNameEnc = await seal(phoneKey, new TextEncoder().encode(JSON.stringify("iPhone")));
 
     const { fn, calls } = scriptedFetch([
-      () => json({ state: "claimed", phoneNonce: b64url(PHONE_NONCE), deviceNameEnc }),
+      () => json({ state: "claimed", phoneNonce: b64url(PHONE_NONCE), deviceNameEnc, phoneEphPub: phoneEphPubB64() }),
       (url) => { expect(url).toBe(`${WORKER}/v1/cc/pair/ack`); return json({ ok: true }); },
     ]);
 
@@ -474,11 +506,11 @@ describe("pairWait flushes a pending-pairing event stash on completion", () => {
 
   test("no stash at all → pairing completes with no extra POST", async () => {
     await writePending();
-    const phoneKey = await deriveE2EKey(QR_SECRET, PHONE_NONCE);
+    const phoneKey = await ratchetK1(QR_SECRET);
     const deviceNameEnc = await seal(phoneKey, new TextEncoder().encode(JSON.stringify("iPhone")));
 
     const { fn, calls } = scriptedFetch([
-      () => json({ state: "claimed", phoneNonce: b64url(PHONE_NONCE), deviceNameEnc }),
+      () => json({ state: "claimed", phoneNonce: b64url(PHONE_NONCE), deviceNameEnc, phoneEphPub: phoneEphPubB64() }),
       (url) => { expect(url).toBe(`${WORKER}/v1/cc/pair/ack`); return json({ ok: true }); },
     ]);
 
@@ -488,17 +520,21 @@ describe("pairWait flushes a pending-pairing event stash on completion", () => {
 });
 
 describe("buildPairURL", () => {
-  test("encodes the worker URL (b64url utf8), pairing id (hex), and QR secret (b64url)", () => {
-    const url = buildPairURL(WORKER, EXPECTED_PAIRING_ID, QR_SECRET);
+  const QPC = () => PC_EPH.pubRaw;
+
+  test("encodes the worker URL (b64url utf8), pairing id (hex), QR secret (b64url), and PC eph pub (e=)", () => {
+    const url = buildPairURL(WORKER, EXPECTED_PAIRING_ID, QR_SECRET, QPC());
     const params = new URL(url.replace("nomo://", "https://nomo/")).searchParams;
     expect(params.get("v")).toBe("1");
     expect(new TextDecoder().decode(fromB64url(params.get("u")!))).toBe(WORKER);
     expect(params.get("p")).toBe(EXPECTED_PAIRING_ID);
     expect(fromB64url(params.get("s")!)).toEqual(QR_SECRET);
+    // `e=` carries the 65-byte SEC1 PUBLIC key the phone needs for the ratchet ECDH.
+    expect(fromB64url(params.get("e")!)).toEqual(PC_EPH.pubRaw);
   });
 
   test("OMITS `u` when the worker URL is the production default (the QR-shrink lever)", () => {
-    const url = buildPairURL(DEFAULT_WORKER_URL, EXPECTED_PAIRING_ID, QR_SECRET);
+    const url = buildPairURL(DEFAULT_WORKER_URL, EXPECTED_PAIRING_ID, QR_SECRET, QPC());
     expect(url).not.toContain("&u=");
     const params = new URL(url.replace("nomo://", "https://nomo/")).searchParams;
     expect(params.get("u")).toBeNull();
@@ -506,13 +542,14 @@ describe("buildPairURL", () => {
     expect(params.get("v")).toBe("1");
     expect(params.get("p")).toBe(EXPECTED_PAIRING_ID);
     expect(fromB64url(params.get("s")!)).toEqual(QR_SECRET);
+    expect(fromB64url(params.get("e")!)).toEqual(PC_EPH.pubRaw);
     // The shortened default payload is meaningfully smaller than the explicit-`u` form.
-    expect(url.length).toBeLessThan(buildPairURL(WORKER, EXPECTED_PAIRING_ID, QR_SECRET).length);
+    expect(url.length).toBeLessThan(buildPairURL(WORKER, EXPECTED_PAIRING_ID, QR_SECRET, QPC()).length);
   });
 
   test("still emits `u` for a non-default (self-hosted) worker URL", () => {
     const selfHosted = "https://cc.example.com";
-    const url = buildPairURL(selfHosted, EXPECTED_PAIRING_ID, QR_SECRET);
+    const url = buildPairURL(selfHosted, EXPECTED_PAIRING_ID, QR_SECRET, QPC());
     expect(url).toContain("&u=");
     const params = new URL(url.replace("nomo://", "https://nomo/")).searchParams;
     expect(new TextDecoder().decode(fromB64url(params.get("u")!))).toBe(selfHosted);
@@ -609,11 +646,11 @@ describe("pairWait (failure / retry paths)", () => {
 
   test("transient network blips while polling are retried, not fatal", async () => {
     await writePending();
-    const phoneKey = await deriveE2EKey(QR_SECRET, PHONE_NONCE);
+    const phoneKey = await ratchetK1(QR_SECRET);
     const deviceNameEnc = await seal(phoneKey, new TextEncoder().encode(JSON.stringify("P")));
     const { fn } = scriptedFetch([
       () => { throw new Error("ETIMEDOUT"); },
-      () => json({ state: "claimed", phoneNonce: b64url(PHONE_NONCE), deviceNameEnc }),
+      () => json({ state: "claimed", phoneNonce: b64url(PHONE_NONCE), deviceNameEnc, phoneEphPub: phoneEphPubB64() }),
       () => json({ ok: true }),
     ]);
     expect(await pairWait({ ...waitDeps(), fetchFn: fn })).toBe(0);
@@ -622,12 +659,12 @@ describe("pairWait (failure / retry paths)", () => {
 
   test("a per-request timeout (AbortError) on a status poll is a transient blip too, not fatal", async () => {
     await writePending();
-    const phoneKey = await deriveE2EKey(QR_SECRET, PHONE_NONCE);
+    const phoneKey = await ratchetK1(QR_SECRET);
     const deviceNameEnc = await seal(phoneKey, new TextEncoder().encode(JSON.stringify("P")));
     const abortError = Object.assign(new Error("This operation was aborted"), { name: "AbortError" });
     const { fn } = scriptedFetch([
       () => { throw abortError; }, // shape of a fetch rejecting because AbortSignal.timeout() fired
-      () => json({ state: "claimed", phoneNonce: b64url(PHONE_NONCE), deviceNameEnc }),
+      () => json({ state: "claimed", phoneNonce: b64url(PHONE_NONCE), deviceNameEnc, phoneEphPub: phoneEphPubB64() }),
       () => json({ ok: true }),
     ]);
     expect(await pairWait({ ...waitDeps(), fetchFn: fn })).toBe(0);
@@ -640,7 +677,7 @@ describe("pairWait (failure / retry paths)", () => {
     const wrongKey = new Uint8Array(32).fill(1);
     const deviceNameEnc = await seal(wrongKey, new TextEncoder().encode(JSON.stringify("Evil")));
     const { fn } = scriptedFetch([
-      () => json({ state: "claimed", phoneNonce: b64url(PHONE_NONCE), deviceNameEnc }),
+      () => json({ state: "claimed", phoneNonce: b64url(PHONE_NONCE), deviceNameEnc, phoneEphPub: phoneEphPubB64() }),
     ]);
     expect(await pairWait({ ...waitDeps(), fetchFn: fn })).toBe(1);
     expect(lines.join("\n")).toContain("tampered");
@@ -650,13 +687,14 @@ describe("pairWait (failure / retry paths)", () => {
 });
 
 describe("pairStart (re-pairing over an existing config)", () => {
-  test("revokes the OLD *completed* pairing before starting fresh, then writes a pending config", async () => {
+  test("starts the NEW pairing FIRST, then revokes the OLD *completed* pairing, then writes a pending config", async () => {
     const oldKey = b64url(new Uint8Array(32).fill(3));
     await writeFile(configPath, JSON.stringify({
       url: "https://old-worker.test", pairingId: "f".repeat(32), pcSecret: "old-secret", e2eKeyB64: oldKey,
     }));
 
     const { fn, calls } = scriptedFetch([
+      () => json({ ok: true }, 201), // /pair/start of the NEW pairing runs FIRST
       (url, init) => {
         expect(url).toBe("https://old-worker.test/v1/cc/pair/revoke");
         const h = init?.headers as Record<string, string>;
@@ -664,7 +702,6 @@ describe("pairStart (re-pairing over an existing config)", () => {
         expect(h["x-cc-auth"]).toBe("old-secret");
         return json({ ok: true });
       },
-      () => json({ ok: true }, 201),
     ]);
 
     const code = await pairStart({
@@ -673,8 +710,8 @@ describe("pairStart (re-pairing over an existing config)", () => {
       htmlPath: join(dir, PAIR_HTML_FILE), openFile: () => true,
     });
     expect(code).toBe(0);
-    expect(calls[0].url).toContain("/pair/revoke");
-    expect(calls[1].url).toContain("/pair/start");
+    expect(calls[0].url).toContain("/pair/start"); // start first — a failed start can't nuke the old pairing
+    expect(calls[1].url).toContain("/pair/revoke");
 
     const written = JSON.parse(await readFile(configPath, "utf8")) as Record<string, string>;
     expect(written.pairingId).toBe(EXPECTED_PAIRING_ID);
@@ -683,10 +720,11 @@ describe("pairStart (re-pairing over an existing config)", () => {
     expect(written.e2eKeyB64).toBeUndefined();
   });
 
-  test("revokes the OLD *pending* pairing too before starting fresh (an abandoned mid-pairing record still owns a claimable server-side record)", async () => {
+  test("revokes the OLD *pending* pairing too (after starting fresh) — an abandoned mid-pairing record still owns a claimable server-side record", async () => {
     // writePending's default pcSecret (EXPECTED_PC_SECRET) is the auth material revoke presents.
     await writePending({ pairingId: "c".repeat(32), qrSecretB64: b64url(new Uint8Array(16).fill(7)) });
     const { fn, calls } = scriptedFetch([
+      () => json({ ok: true }, 201), // /pair/start of the NEW pairing runs FIRST
       (url, init) => {
         expect(url).toBe(`${WORKER}/v1/cc/pair/revoke`);
         expect(init?.method).toBe("POST");
@@ -695,16 +733,15 @@ describe("pairStart (re-pairing over an existing config)", () => {
         expect(h["x-cc-auth"]).toBe(EXPECTED_PC_SECRET);
         return json({ ok: true });
       },
-      () => json({ ok: true }, 201),
     ]);
     expect(await pairStart({
       fetchFn: fn, print, configPath, workerUrl: WORKER, spawnWatchdog: () => {},
       randomBytes: scriptedRandom([PAIRING_BYTES, PC_SECRET_BYTES, QR_SECRET]),
       htmlPath: join(dir, PAIR_HTML_FILE), openFile: () => true,
     })).toBe(0);
-    expect(calls.length).toBe(2); // revoke (of the old pending) THEN start
-    expect(calls[0].url).toContain("/pair/revoke");
-    expect(calls[1].url).toContain("/pair/start");
+    expect(calls.length).toBe(2); // start THEN revoke (of the old pending)
+    expect(calls[0].url).toContain("/pair/start");
+    expect(calls[1].url).toContain("/pair/revoke");
     const written = JSON.parse(await readFile(configPath, "utf8")) as Record<string, string>;
     expect(written.pairingId).toBe(EXPECTED_PAIRING_ID); // overwritten with the fresh pairing
   });
@@ -712,8 +749,8 @@ describe("pairStart (re-pairing over an existing config)", () => {
   test("a failing revoke of an old PENDING pairing does not block re-pairing", async () => {
     await writePending({ pairingId: "c".repeat(32) });
     const { fn, calls } = scriptedFetch([
-      () => { throw new Error("worker unreachable"); }, // revoke of the old pending fails
-      () => json({ ok: true }, 201), // start still proceeds
+      () => json({ ok: true }, 201), // start proceeds first
+      () => { throw new Error("worker unreachable"); }, // revoke of the old pending then fails — ignored
     ]);
     expect(await pairStart({
       fetchFn: fn, print, configPath, workerUrl: WORKER, spawnWatchdog: () => {},
@@ -730,8 +767,8 @@ describe("pairStart (re-pairing over an existing config)", () => {
       url: "https://old-worker.test", pairingId: "e".repeat(32), pcSecret: "s", e2eKeyB64: b64url(new Uint8Array(32)),
     }));
     const { fn } = scriptedFetch([
-      () => { throw new Error("old worker gone"); },
-      () => json({ ok: true }, 201),
+      () => json({ ok: true }, 201), // start proceeds first
+      () => { throw new Error("old worker gone"); }, // revoke then fails — ignored
     ]);
     expect(await pairStart({
       fetchFn: fn, print, configPath, workerUrl: WORKER, spawnWatchdog: () => {},
@@ -748,8 +785,8 @@ describe("pairStart (re-pairing over an existing config)", () => {
     expect((await stat(configPath)).mode & 0o777).toBe(0o644);
 
     const { fn } = scriptedFetch([
-      () => json({ ok: true }), // revoke
       () => json({ ok: true }, 201), // start
+      () => json({ ok: true }), // revoke
     ]);
     expect(await pairStart({
       fetchFn: fn, print, configPath, workerUrl: WORKER, spawnWatchdog: () => {},
@@ -806,6 +843,7 @@ describe("parsePendingConfig", () => {
 describe("completePendingPairing", () => {
   const pending = () => ({
     url: WORKER, pairingId: EXPECTED_PAIRING_ID, pcSecret: EXPECTED_PC_SECRET, qrSecret: QR_SECRET,
+    pcEphPriv: PC_EPH.privPkcs8,
   });
 
   test("pending state → { state: 'pending' }, no config written", async () => {
@@ -817,10 +855,10 @@ describe("completePendingPairing", () => {
   });
 
   test("claimed → completes: writes 0600 completed config, acks, returns the device name (self-heal core)", async () => {
-    const phoneKey = await deriveE2EKey(QR_SECRET, PHONE_NONCE);
+    const phoneKey = await ratchetK1(QR_SECRET);
     const deviceNameEnc = await seal(phoneKey, new TextEncoder().encode(JSON.stringify("Watchdog Phone")));
     const { fn, calls } = scriptedFetch([
-      () => json({ state: "claimed", phoneNonce: b64url(PHONE_NONCE), deviceNameEnc }),
+      () => json({ state: "claimed", phoneNonce: b64url(PHONE_NONCE), deviceNameEnc, phoneEphPub: phoneEphPubB64() }),
       (url) => { expect(url).toBe(`${WORKER}/v1/cc/pair/ack`); return json({ ok: true }); },
     ]);
     const r = await completePendingPairing(pending(), configPath, { fetchFn: fn, ackAttempts: 1 });
@@ -836,10 +874,10 @@ describe("completePendingPairing", () => {
   test("deletes the transient pairing page on completion (covers the watchdog self-heal path)", async () => {
     const htmlPath = join(dir, PAIR_HTML_FILE);
     await writeFile(htmlPath, "<html>the pairing QR secret + code</html>"); // what pair left next to config
-    const phoneKey = await deriveE2EKey(QR_SECRET, PHONE_NONCE);
+    const phoneKey = await ratchetK1(QR_SECRET);
     const deviceNameEnc = await seal(phoneKey, new TextEncoder().encode(JSON.stringify("P")));
     const { fn } = scriptedFetch([
-      () => json({ state: "claimed", phoneNonce: b64url(PHONE_NONCE), deviceNameEnc }),
+      () => json({ state: "claimed", phoneNonce: b64url(PHONE_NONCE), deviceNameEnc, phoneEphPub: phoneEphPubB64() }),
       () => json({ ok: true }),
     ]);
     expect((await completePendingPairing(pending(), configPath, { fetchFn: fn, ackAttempts: 1 })).state).toBe("completed");
@@ -847,10 +885,10 @@ describe("completePendingPairing", () => {
   });
 
   test("preserves a machineName from the pending config into the completed one", async () => {
-    const phoneKey = await deriveE2EKey(QR_SECRET, PHONE_NONCE);
+    const phoneKey = await ratchetK1(QR_SECRET);
     const deviceNameEnc = await seal(phoneKey, new TextEncoder().encode(JSON.stringify("P")));
     const { fn } = scriptedFetch([
-      () => json({ state: "claimed", phoneNonce: b64url(PHONE_NONCE), deviceNameEnc }),
+      () => json({ state: "claimed", phoneNonce: b64url(PHONE_NONCE), deviceNameEnc, phoneEphPub: phoneEphPubB64() }),
       () => json({ ok: true }),
     ]);
     await completePendingPairing({ ...pending(), machineName: "Studio" }, configPath, { fetchFn: fn, ackAttempts: 1 });
@@ -860,10 +898,10 @@ describe("completePendingPairing", () => {
 
   test("a code-path claim (path:'code') derives the key from codeIkm, not qrSecret", async () => {
     const codeIkm = new Uint8Array(32).fill(9);
-    const phoneKey = await deriveE2EKey(codeIkm, PHONE_NONCE); // the phone reconstructed codeIkm from the words
+    const phoneKey = await ratchetK1(codeIkm); // phone reconstructs codeIkm from the words, then ratchets
     const deviceNameEnc = await seal(phoneKey, new TextEncoder().encode(JSON.stringify("Code Phone")));
     const { fn } = scriptedFetch([
-      () => json({ state: "claimed", path: "code", phoneNonce: b64url(PHONE_NONCE), deviceNameEnc }),
+      () => json({ state: "claimed", path: "code", phoneNonce: b64url(PHONE_NONCE), deviceNameEnc, phoneEphPub: phoneEphPubB64() }),
       () => json({ ok: true }),
     ]);
     const r = await completePendingPairing({ ...pending(), codeIkm }, configPath, { fetchFn: fn, ackAttempts: 1 });
@@ -874,10 +912,10 @@ describe("completePendingPairing", () => {
 
   test("a code-path claim with NO stored codeIkm (QR-only config) → tampered, no config written", async () => {
     const codeIkm = new Uint8Array(32).fill(9);
-    const phoneKey = await deriveE2EKey(codeIkm, PHONE_NONCE);
+    const phoneKey = await ratchetK1(codeIkm);
     const deviceNameEnc = await seal(phoneKey, new TextEncoder().encode(JSON.stringify("x")));
     const { fn } = scriptedFetch([
-      () => json({ state: "claimed", path: "code", phoneNonce: b64url(PHONE_NONCE), deviceNameEnc }),
+      () => json({ state: "claimed", path: "code", phoneNonce: b64url(PHONE_NONCE), deviceNameEnc, phoneEphPub: phoneEphPubB64() }),
     ]);
     // pending() has no codeIkm → a code claim cannot be completed.
     expect((await completePendingPairing(pending(), configPath, { fetchFn: fn })).state).toBe("tampered");
@@ -911,7 +949,7 @@ describe("completePendingPairing", () => {
   test("a tampered claim (wrong key) → { state: 'tampered' }, no config written", async () => {
     const deviceNameEnc = await seal(new Uint8Array(32).fill(1), new TextEncoder().encode(JSON.stringify("Evil")));
     const { fn } = scriptedFetch([
-      () => json({ state: "claimed", phoneNonce: b64url(PHONE_NONCE), deviceNameEnc }),
+      () => json({ state: "claimed", phoneNonce: b64url(PHONE_NONCE), deviceNameEnc, phoneEphPub: phoneEphPubB64() }),
     ]);
     expect((await completePendingPairing(pending(), configPath, { fetchFn: fn })).state).toBe("tampered");
     await expect(stat(configPath)).rejects.toBeDefined();
@@ -928,7 +966,7 @@ describe("completePendingPairing", () => {
 // Seams (isAlive / ensureWatchdog / sessionsDir) are injected so the test never touches a real pid or
 // spawns a real poller, and works whether the flush is driven by `pair wait` or the watchdog self-heal.
 describe("completePendingPairing stash flush — pid-liveness gate + watchdog attach", () => {
-  const pending = () => ({ url: WORKER, pairingId: EXPECTED_PAIRING_ID, pcSecret: EXPECTED_PC_SECRET, qrSecret: QR_SECRET });
+  const pending = () => ({ url: WORKER, pairingId: EXPECTED_PAIRING_ID, pcSecret: EXPECTED_PC_SECRET, qrSecret: QR_SECRET, pcEphPriv: PC_EPH.privPkcs8 });
 
   async function writeStash(over: Record<string, unknown> = {}): Promise<void> {
     await writeFile(join(dir, PENDING_STASH_FILE), JSON.stringify({
@@ -940,14 +978,14 @@ describe("completePendingPairing stash flush — pid-liveness gate + watchdog at
 
   test("a LIVE stashed session → flush posts it, writes a session record, and ensures the watchdog", async () => {
     await writeStash({ pid: 4242 });
-    const phoneKey = await deriveE2EKey(QR_SECRET, PHONE_NONCE);
+    const phoneKey = await ratchetK1(QR_SECRET);
     const deviceNameEnc = await seal(phoneKey, new TextEncoder().encode(JSON.stringify("iPhone")));
     const sessionsDir = join(dir, "sessions");
     let ensured = 0;
     const probed: number[] = [];
 
     const { fn, calls } = scriptedFetch([
-      () => json({ state: "claimed", phoneNonce: b64url(PHONE_NONCE), deviceNameEnc }),
+      () => json({ state: "claimed", phoneNonce: b64url(PHONE_NONCE), deviceNameEnc, phoneEphPub: phoneEphPubB64() }),
       (url) => { expect(url).toBe(`${WORKER}/v1/cc/pair/ack`); return json({ ok: true }); },
       async (url, init) => {
         expect(url).toBe(`${WORKER}/v1/cc/event`);
@@ -978,13 +1016,13 @@ describe("completePendingPairing stash flush — pid-liveness gate + watchdog at
 
   test("a DEAD stashed session → flush DROPS it silently: no event POST, no record, no watchdog", async () => {
     await writeStash({ pid: 5555 });
-    const phoneKey = await deriveE2EKey(QR_SECRET, PHONE_NONCE);
+    const phoneKey = await ratchetK1(QR_SECRET);
     const deviceNameEnc = await seal(phoneKey, new TextEncoder().encode(JSON.stringify("iPhone")));
     const sessionsDir = join(dir, "sessions");
     let ensured = 0;
 
     const { fn, calls } = scriptedFetch([
-      () => json({ state: "claimed", phoneNonce: b64url(PHONE_NONCE), deviceNameEnc }),
+      () => json({ state: "claimed", phoneNonce: b64url(PHONE_NONCE), deviceNameEnc, phoneEphPub: phoneEphPubB64() }),
       (url) => { expect(url).toBe(`${WORKER}/v1/cc/pair/ack`); return json({ ok: true }); },
     ]);
 
@@ -1003,13 +1041,13 @@ describe("completePendingPairing stash flush — pid-liveness gate + watchdog at
 
   test("a pid-less stash (pre-0.1.5 hook) → posts as before, but attaches no watchdog (can't verify liveness)", async () => {
     await writeStash({ pid: undefined }); // JSON.stringify drops the undefined key → no pid on disk
-    const phoneKey = await deriveE2EKey(QR_SECRET, PHONE_NONCE);
+    const phoneKey = await ratchetK1(QR_SECRET);
     const deviceNameEnc = await seal(phoneKey, new TextEncoder().encode(JSON.stringify("iPhone")));
     const sessionsDir = join(dir, "sessions");
     let ensured = 0;
 
     const { fn, calls } = scriptedFetch([
-      () => json({ state: "claimed", phoneNonce: b64url(PHONE_NONCE), deviceNameEnc }),
+      () => json({ state: "claimed", phoneNonce: b64url(PHONE_NONCE), deviceNameEnc, phoneEphPub: phoneEphPubB64() }),
       (url) => { expect(url).toBe(`${WORKER}/v1/cc/pair/ack`); return json({ ok: true }); },
       (url) => { expect(url).toBe(`${WORKER}/v1/cc/event`); return json({ ok: true }); },
     ]);

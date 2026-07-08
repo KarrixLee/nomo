@@ -3,29 +3,35 @@
 // nothing shows until the process exits, so a foreground poll would hide the page-opened line).
 //
 //   `pair.mjs`        (default) — the FAST start: mints the pairing, registers it, writes a PENDING
-//                     config (qrSecret + codeIkm persisted 0600), writes a self-contained themed
-//                     `pair.html` (QR + one-time code) and opens it in the browser, then exits within a
-//                     couple of seconds. Also spawns the detached watchdog so the pairing still
-//                     completes if the wait step never runs.
+//                     config (qrSecret + ephemeral ratchet key + codeIkm persisted 0600), writes a self-contained themed
+//                     `pair.html` (QR + click-to-reveal one-time code) and opens it in the browser, then
+//                     exits within a couple of seconds. Also spawns the detached watchdog so the pairing
+//                     still completes if the wait step never runs.
+//   `pair.mjs --show-code` — the headless/SSH escape hatch for someone who cannot open a browser at
+//                     all: skips the QR and the page entirely and prints the one-time code straight to
+//                     stdout instead. Not a generic "also print the code" convenience.
 //   `pair.mjs wait`   — reads the pending config and polls until the phone claims it (up to 10 min),
 //                     then rewrites config to its completed form (secrets dropped, e2eKey present),
 //                     acks, and prints `Paired with … ✓`.
 //
 // Output contract: pure sequential stdout lines — no ANSI cursor tricks/clears — so it renders cleanly
 // inside a slash-command transcript. Unlike the hook (silence + exit 0 always), these are interactive
-// commands: failures print ONE clear friendly line and exit non-zero. NOTHING secret ever reaches
-// stdout — no QR art, no `nomo://pair` URL, no code words; the browser page is the only place they show.
+// commands: failures print ONE clear friendly line and exit non-zero. NO QR art and no `nomo://pair`
+// URL ever reach stdout — full stop. The one-time code defaults to hidden too: the browser page
+// (click-to-reveal) is the only place it shows, UNLESS the user explicitly passes `--show-code`, which
+// intentionally prints it to stdout on request (the SSH/headless escape hatch).
 //
 // PORTABILITY: bun AND node >= 18 (after Task 2.3 bundles it) — no Bun.* APIs, node: imports and
 // globalThis.crypto only.
 
 import { spawn } from "node:child_process";
 import { readFile, unlink } from "node:fs/promises";
+import { dirname, join } from "node:path";
 import {
-  atomicWrite, CC_DIR, completePendingPairing, ensureWatchdog, PAIR_HTML_PATH, parseConfig,
-  parsePendingConfig,
+  atomicWrite, CC_DIR, completePendingPairing, ensureWatchdog, PAIR_HTML_FILE, PAIR_HTML_PATH,
+  parseConfig, parsePendingConfig,
 } from "../core/shared";
-import { b64url, sha256Hex } from "../core/crypto";
+import { b64url, generateEphemeralKeyPair, sha256Hex } from "../core/crypto";
 import { deriveCodeIkm, formatCodeString, randomCodeWords } from "../core/pair-code";
 import { renderPairPage } from "../core/pair-page";
 import { renderQRSVG } from "../qr/qr-svg";
@@ -76,17 +82,19 @@ export interface PairDeps {
   /** Picks the magic-code words for the code pairing path. Defaults to randomCodeWords (crypto random
    *  from the BIP39 wordlist); tests inject fixed words for deterministic pages. */
   pickWords?: () => string[];
+  /** Generates the PC's ephemeral P-256 ratchet keypair. Defaults to generateEphemeralKeyPair (WebCrypto
+   *  ECDH); tests inject a fixed keypair for deterministic config/QR content. */
+  genEphemeralKeyPair?: () => Promise<{ privPkcs8: Uint8Array; pubRaw: Uint8Array }>;
   /** `wait --timeout <seconds>` (as ms): bounds the poll loop. A timeout is then a SOFT exit-0 (the
    *  Codex flow — self-heal finishes in the background), not the hard 10-min "window expired" exit-1.
    *  The QR's real 10-min TTL (the createdAt guard) is unchanged. Absent → historical full-window wait. */
   softTimeoutMs?: number;
-  /** Force printing the one-time code to stdout regardless of TTY (`--show-code`) — the SSH/headless
-   *  escape hatch where the browser page can't be seen. Defaults to false. */
+  /** `--show-code`: the escape hatch for someone who cannot open a browser AT ALL (headless box,
+   *  SSH-only) — not a generic "also print the code" convenience. When true AND the worker assigned a
+   *  channel (there's a code to print), pairStart skips the QR/page entirely and prints the one-time
+   *  code straight to stdout. Defaults to false: the happy path always assumes a browser, so the code
+   *  is shown only on the pairing page, behind its click-to-reveal control. */
   showCode?: boolean;
-  /** Whether stdout is an interactive terminal. When true (the user ran `pair` directly in a real
-   *  terminal, not an agent's Bash tool / a pipe), pairStart ALSO prints the one-time code. Defaults to
-   *  `process.stdout.isTTY === true`; tests inject a boolean. */
-  isTTY?: boolean;
 }
 
 /** Default browser opener: `open` on darwin, `xdg-open` on linux, detached + unref'd so the CLI never
@@ -106,13 +114,18 @@ function openInBrowser(path: string): boolean {
 
 /** Delete a stale PENDING config on a terminal expiry/gone path so /status stops reporting
  *  "waiting for phone scan" forever. Tolerates ENOENT (already gone / raced). NEVER call this on a
- *  completed config — callers re-read and confirm the on-disk config is still pending first. */
+ *  completed config — callers re-read and confirm the on-disk config is still pending first.
+ *
+ *  Also tears down the sibling pairing PAGE (pair.html): it embeds the QR secret + the one-time code,
+ *  so on a NON-happy exit (expiry / unrecoverable) the page must not be left orphaned next to a now-
+ *  deleted config. The happy path (completePendingPairing) already deletes it; this covers the rest. */
 async function removePendingConfig(configPath: string): Promise<void> {
   try {
     await unlink(configPath);
   } catch {
     // already gone (raced with the watchdog, or never written) — fine
   }
+  await unlink(join(dirname(configPath), PAIR_HTML_FILE)).catch(() => {});
 }
 
 export function bytesToHex(bytes: Uint8Array): string {
@@ -120,16 +133,20 @@ export function bytesToHex(bytes: Uint8Array): string {
 }
 
 /** The `nomo://pair` deep link the phone scans: worker URL (b64url of UTF-8), pairing id (hex),
- *  QR secret (b64url of 16 raw bytes — the HKDF input that never touches the worker).
+ *  QR secret (b64url of 16 raw bytes — the HKDF input that never touches the worker), and the PC's
+ *  ephemeral ratchet public key `QPC` (`e=`, b64url of the 65-byte SEC1 point — a PUBLIC key, safe to
+ *  relay; the phone needs it to compute the ratchet's ECDH before it claims).
  *
  *  `u` is OMITTED when the worker URL is the production default (DEFAULT_WORKER_URL): the app fills
  *  in the same constant for a `u`-less link. This is the single biggest QR-shrink lever — the b64url
- *  worker URL is ~66 chars, over half the payload, so dropping it takes the production QR from
- *  version 8 down to version 4 (fewer terminal rows, which matters because Claude Code retypes the
- *  QR line-by-line). Self-hosters on a non-default URL still get an explicit `u`. */
-export function buildPairURL(workerUrl: string, pairingId: string, qrSecret: Uint8Array): string {
+ *  worker URL is ~66 chars, over half the payload, so dropping it keeps the production QR small even
+ *  with the added `e=` key. The 65-byte `e=` (~87 chars) can push the default payload past level-Q's
+ *  v10 capacity; renderQRSVG already falls back to level L (larger capacity) so it always renders. */
+export function buildPairURL(
+  workerUrl: string, pairingId: string, qrSecret: Uint8Array, pcEphPub: Uint8Array,
+): string {
   const u = workerUrl === DEFAULT_WORKER_URL ? "" : `&u=${b64url(textEncoder.encode(workerUrl))}`;
-  return `nomo://pair?v=1${u}&p=${pairingId}&s=${b64url(qrSecret)}`;
+  return `nomo://pair?v=1${u}&p=${pairingId}&s=${b64url(qrSecret)}&e=${b64url(pcEphPub)}`;
 }
 
 /** Extract the auth material a revoke needs from EITHER a COMPLETED ({...e2eKeyB64}) or a still-PENDING
@@ -175,8 +192,10 @@ async function revokeExisting(fetchFn: typeof fetch, configPath: string, print: 
   }
 }
 
-/** Phase 1 — the FAST start. Registers the pairing, persists a PENDING config, prints the QR, and
- *  returns within a couple of seconds. Returns a process exit code (0 = QR printed, wait next). */
+/** Phase 1 — the FAST start. Registers the pairing, persists a PENDING config, opens the pairing page
+ *  (QR + click-to-reveal code) — or, under `--show-code`, skips the page/QR and prints the code
+ *  straight to stdout instead — and returns within a couple of seconds. Returns a process exit code
+ *  (0 = success, wait next). */
 export async function pairStart(deps: PairDeps = {}): Promise<number> {
   const fetchFn = deps.fetchFn ?? fetch;
   const print = deps.print ?? ((line: string) => console.log(line));
@@ -187,25 +206,33 @@ export async function pairStart(deps: PairDeps = {}): Promise<number> {
   const now = deps.now ?? Date.now;
   const htmlPath = deps.htmlPath ?? PAIR_HTML_PATH;
   const pickWords = deps.pickWords ?? (() => randomCodeWords(randomBytes));
+  const genEphemeralKeyPair = deps.genEphemeralKeyPair ?? generateEphemeralKeyPair;
+  // `--show-code` is the PURE-CLI escape hatch for someone who cannot open a browser at all (a headless
+  // box, SSH-only) — not a generic "also print the code" convenience. The happy path always assumes a
+  // browser: the QR + a click-to-reveal code on the pairing page.
+  const showCode = deps.showCode ?? false;
 
   // Remove any stale pairing page from a PRIOR attempt at the very start — so a leftover page embedding
   // an old (now-revoked) QR secret / code can never be re-used. Tolerates ENOENT.
   await unlink(htmlPath).catch(() => {});
 
-  // Re-pairing over an existing config revokes the old one best-effort — a COMPLETED pairing or an
-  // abandoned still-PENDING one (both own a claimable server-side record) — before overwriting it.
-  await revokeExisting(fetchFn, configPath, print);
-
   const pairingId = bytesToHex(randomBytes(16)); // 32-hex
   const pcSecret = b64url(randomBytes(24));
   const qrSecret = randomBytes(16); // never sent to the worker — rides only in the QR/URL
+  // The PC's ephemeral P-256 ratchet keypair (pairing v3). The PRIVATE half is persisted 0600 (so wait/
+  // watchdog can finish the ratchet); the PUBLIC half (QPC) is published in the /pair/start body and the
+  // QR `e=` param — it's a public key, safe for the (blind) worker to relay.
+  const eph = await genEphemeralKeyPair();
 
+  // POST /pair/start BEFORE revoking any existing pairing: a failed /start must NOT nuke a healthy
+  // existing pairing (the old bug — revoke-then-start left the user unpaired on a transient /start
+  // failure). Only once /start succeeds do we revoke the old pairing and overwrite the config.
   let startRes: Response;
   try {
     startRes = await fetchFn(`${workerUrl}/v1/cc/pair/start`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ pairingId, pcAuthHash: await sha256Hex(pcSecret) }),
+      body: JSON.stringify({ pairingId, pcAuthHash: await sha256Hex(pcSecret), pcEphPub: b64url(eph.pubRaw) }),
       signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
     });
   } catch {
@@ -251,14 +278,22 @@ export async function pairStart(deps: PairDeps = {}): Promise<number> {
     codeString = formatCodeString(channel, words);
   }
 
-  // Persist the PENDING config BEFORE opening the page: qrSecret (and codeIkm, if any) must be on disk
-  // so the `wait` step (or the watchdog self-heal) can derive the key once the phone claims — even if
-  // this process is killed the instant after the page opens. Owner-only (0600); it is key material.
+  // /start succeeded — NOW revoke the old pairing (best-effort): a COMPLETED pairing or an abandoned
+  // still-PENDING one (both own a claimable server-side record). This reads the OLD config still on
+  // disk, so it must run BEFORE the atomicWrite below overwrites it. Ordering it after /start means a
+  // transient /start failure above returns early WITHOUT touching a healthy existing pairing.
+  await revokeExisting(fetchFn, configPath, print);
+
+  // Persist the PENDING config BEFORE opening the page: qrSecret, the ephemeral ratchet private key
+  // (and codeIkm, if any) must be on disk so the `wait` step (or the watchdog self-heal) can finish the
+  // ratchet + derive the key once the phone claims — even if this process is killed the instant after
+  // the page opens. Owner-only (0600); it is key material.
   await atomicWrite(configPath, JSON.stringify({
     url: workerUrl,
     pairingId,
     pcSecret,
     qrSecretB64: b64url(qrSecret),
+    pcEphPrivB64: b64url(eph.privPkcs8),
     ...(codeIkm ? { codeIkmB64: b64url(codeIkm) } : {}),
     createdAt: now(), // bounds the watchdog self-heal to the QR's 10-min TTL
   }), CONFIG_MODE);
@@ -267,13 +302,25 @@ export async function pairStart(deps: PairDeps = {}): Promise<number> {
   // closed terminal, dead session): it self-heals a claimed-but-pending config. Best-effort, no wait.
   spawnWatchdog();
 
+  // `--show-code` only skips the browser entirely when there's actually a code to read instead: an old
+  // worker with no channel has no code either, so there's nothing a terminal-only user could pair with
+  // except the QR — fall through to the normal page in that (rare) case.
+  if (showCode && codeString !== undefined) {
+    // Headless/SSH path: no browser, no display — generating a QR (and writing/opening a page nobody
+    // can see) would be dead weight and needlessly puts the more sensitive artifact on disk. The code,
+    // printed straight to stdout, is the only thing this path needs.
+    print(`One-time code: ${codeString} · expires in 10 min`);
+    print('No browser page was opened (--show-code). Enter the code in the Nomo app: Sessions → "Pair a Computer" → "Enter code".');
+    return 0;
+  }
+
   // SECURITY (E2E / blind worker): the QR encodes qrSecret and the page shows the magic code — the HKDF
   // inputs the worker must NEVER see (with the worker-held phoneNonce it would derive every session's
   // AES key). Both live ONLY on the themed pairing page written 0600 and opened in the browser; NOTHING
   // secret (no QR art, no `nomo://pair` URL, no code words) is ever printed to stdout, because stdout
   // lands in greppable agent transcripts. The page is torn down the instant pairing completes
   // (completePendingPairing / the watchdog self-heal / unpair).
-  const url = buildPairURL(workerUrl, pairingId, qrSecret);
+  const url = buildPairURL(workerUrl, pairingId, qrSecret, eph.pubRaw);
   const page = renderPairPage({
     svg: renderQRSVG(url, { ecLevel: "Q" }), // Q recovery leaves room for the centred Nomo logo overlay
     code: codeString ?? null,
@@ -289,19 +336,14 @@ export async function pairStart(deps: PairDeps = {}): Promise<number> {
   } else {
     print(`Open this file in a browser: ${htmlPath}`);
   }
-  print("The QR code and one-time pairing code are shown on that page.");
   print("This expires in 10 minutes. Keep this session open — the next step waits for your phone.");
 
-  // The one-time code is normally shown ONLY on the browser page (stdout lands in greppable agent
-  // transcripts — the transcript-secrecy rule). Two deliberate exceptions print it to stdout anyway:
-  //   • --show-code (showCode): the explicit SSH/headless escape hatch where the page can't be seen.
-  //   • a real interactive terminal (isTTY): the user ran `pair` themselves — there is no agent
-  //     transcript to leak into, so surfacing the code is a convenience, not a leak.
-  // An agent's non-TTY Bash tool (or a pipe) gets neither → the neutral-only output is unchanged.
-  const showCode = deps.showCode ?? false;
-  const isTTY = deps.isTTY ?? (process.stdout.isTTY === true);
-  if (codeString && (showCode || isTTY)) {
-    print(`One-time code: ${codeString} · expires in 10 min`);
+  // The one-time code is HIDDEN by default on the page too (blurred behind a click-to-reveal control) —
+  // stdout stays clean, and the page is already the primary place it's shown. Tell the user how to see
+  // it either way: reveal it on the page, or — only if a browser genuinely isn't available — re-run
+  // with --show-code to read it in the terminal instead.
+  if (codeString) {
+    print('The one-time code is hidden for privacy — click "Tap to reveal code" on the pairing page. If you can\'t open a browser, re-run with --show-code to read it in the terminal instead.');
   }
   return 0;
 }
@@ -428,7 +470,7 @@ function parseTimeoutMs(argv: string[]): number | undefined {
 
 if (import.meta.main) {
   if (process.argv.includes("--check")) {
-    console.log("usage: pair [wait [--timeout <seconds>]] [--show-code] [--check]  — pair this machine with the Nomo app (opens a browser page with the QR + code; --show-code also prints the one-time code for SSH/headless)");
+    console.log("usage: pair [wait [--timeout <seconds>]] [--show-code] [--check]  — pair this machine with the Nomo app (opens a browser page with the QR + click-to-reveal code; --show-code is for when you can't open a browser at all — it skips the QR/page and prints the one-time code to the terminal instead)");
     process.exit(0);
   }
   if (process.argv.includes("wait")) {
@@ -436,7 +478,7 @@ if (import.meta.main) {
     process.exit(await pairWait(softTimeoutMs !== undefined ? { softTimeoutMs } : {}));
   } else {
     // `--open` is now the default (a harmless no-op if still passed by an older skill invocation).
-    // `--show-code` forces the one-time code onto stdout (SSH/headless where the page can't be seen).
+    // `--show-code`: the no-browser escape hatch — skips the QR/page and prints the code to stdout.
     process.exit(await pairStart(process.argv.includes("--show-code") ? { showCode: true } : {}));
   }
 }
