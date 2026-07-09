@@ -121,6 +121,8 @@ Other commands:
 - `/nomo-cc:pair code` — no-browser variant for a headless/SSH box: skips the QR page and prints the
   one-time typeable code straight into the terminal, so you can enter it in the app by hand.
 - `/nomo-cc:status` — pairing / watchdog / last-delivery health at a glance.
+- `/nomo-cc:reset` — panic button for stuck/phantom sessions: stops the watchdog and clears
+  dead session rows from the phone, **without** unpairing.
 - `/nomo-cc:unpair` — revoke the pairing on the server and delete local pairing state.
 
 The lifecycle hooks (`SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`,
@@ -147,12 +149,14 @@ plugin (`hooks/codex-hooks.json`) but stay **inert until trusted** — this is C
 gate, which Nomo cannot pre-approve. The hook command lines are byte-stable across releases, so
 trusting once holds through updates (only a changed hook line re-arms the review).
 
-The plugin bundles three **skills** — invoke them by typing `$<skill>` (or in natural language):
+The plugin bundles four **skills** — invoke them by typing `$<skill>` (or in natural language):
 
 - `$nomo-pair` — pair this machine with your phone (opens a browser page with the QR code + one-time
   code, then confirms the scan). One pairing is **shared** with Claude Code if both agents run on this
   machine.
 - `$nomo-status` — pairing / watchdog / hook-trust / last-delivery health.
+- `$nomo-reset` — panic button for stuck/phantom sessions: stops the watchdog and clears dead
+  session rows from the phone, without unpairing.
 - `$nomo-unpair` — revoke the pairing and clear local state.
 
 There is **no separate Codex pairing** — the hooks and skills read the same
@@ -199,8 +203,8 @@ Runs the full suite (~318 tests across `core/`, `entries/`, and `qr/`).
 
 ### Building the plugin bundle
 
-`build.ts` bundles the seven entrypoints (`cc-status`, `codex-status`, `codex-notify`,
-`cc-watchdog`, `pair`, `unpair`, `status-cmd`) into `plugin/dist/*.mjs`, inlining every local
+`build.ts` bundles the eight entrypoints (`cc-status`, `codex-status`, `codex-notify`,
+`cc-watchdog`, `pair`, `unpair`, `reset`, `status-cmd`) into `plugin/dist/*.mjs`, inlining every local
 import so each artifact is a single node-runnable file:
 
 ```

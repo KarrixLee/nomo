@@ -1,8 +1,10 @@
 import { createRequire } from "node:module";
 var __require = /* @__PURE__ */ createRequire(import.meta.url);
 
-// src/entries/unpair.ts
-import { readFile as readFile2, unlink as unlink2 } from "node:fs/promises";
+// src/entries/reset.ts
+import { execFileSync as execFileSync2 } from "node:child_process";
+import { readdir, readFile as readFile2, unlink as unlink2 } from "node:fs/promises";
+import { basename } from "node:path";
 
 // src/core/shared.ts
 import { chmod, open, readFile, rename, stat, mkdir, unlink, writeFile } from "node:fs/promises";
@@ -430,64 +432,121 @@ function pidAncestors(pid, maxDepth = 12) {
   return chain;
 }
 
-// src/entries/unpair.ts
-function revokeCreds(raw) {
-  const completed = parseConfig(raw);
-  if (completed)
-    return { url: completed.url, pairingId: completed.pairingId, pcSecret: completed.pcSecret };
-  const pending = parsePendingConfig(raw);
-  if (pending)
-    return { url: pending.url, pairingId: pending.pairingId, pcSecret: pending.pcSecret };
-  return null;
+// src/entries/reset.ts
+function classifyResetSession(record, isAlive) {
+  if (!record || typeof record.pid !== "number" || !Number.isFinite(record.pid))
+    return "clear";
+  if (record.provisional === true)
+    return "clear";
+  return isAlive(record.pid) ? "keep" : "clear";
 }
-async function unpair(deps = {}) {
-  const fetchFn = deps.fetchFn ?? fetch;
-  const print = deps.print ?? ((line) => console.log(line));
-  const configPath = deps.configPath ?? `${CC_DIR}/config.json`;
-  const lastSendPath = deps.lastSendPath ?? LAST_SEND_PATH;
-  const htmlPath = deps.htmlPath ?? PAIR_HTML_PATH;
-  const revokeTimeoutMs = deps.revokeTimeoutMs ?? 5000;
+function isWatchdogCommand(psCommand) {
+  return psCommand.includes("cc-watchdog");
+}
+function psCommandOf(pid) {
+  try {
+    const out = execFileSync2("ps", ["-o", "command=", "-p", String(pid)], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+    const line = out.trim();
+    return line.length > 0 ? line : undefined;
+  } catch {
+    return;
+  }
+}
+async function stopWatchdog(deps) {
+  const pidPath = deps.watchdogPidPath ?? WATCHDOG_PID_PATH;
+  const commandOf = deps.commandOf ?? psCommandOf;
+  const killPid = deps.killPid ?? ((pid2) => process.kill(pid2));
   let raw;
   try {
-    raw = await readFile2(configPath, "utf8");
+    raw = await readFile2(pidPath, "utf8");
   } catch {
-    print("Not paired.");
-    return 0;
+    return "none";
   }
-  const creds = revokeCreds(raw);
-  if (creds) {
-    try {
-      const res = await fetchFn(`${creds.url}/v1/cc/pair/revoke`, {
-        method: "POST",
-        headers: { "x-cc-pairing": creds.pairingId, "x-cc-auth": creds.pcSecret },
-        signal: AbortSignal.timeout(revokeTimeoutMs)
-      });
-      if (res.ok) {
-        print("Revoked the pairing on the server.");
-      } else if (res.status === 404) {
-        print("Pairing was already revoked on the server.");
-      } else {
-        print(`Server revoke returned HTTP ${res.status} — removing the local pairing anyway.`);
-      }
-    } catch {
-      print("Could not reach the worker to revoke — removing the local pairing anyway.");
+  const pid = Number.parseInt(raw.trim(), 10);
+  let killed = false;
+  if (Number.isFinite(pid) && pid > 1) {
+    const cmd = commandOf(pid);
+    if (cmd !== undefined && isWatchdogCommand(cmd)) {
+      try {
+        killPid(pid);
+        killed = true;
+      } catch {}
     }
-  } else {
-    print("Local config is not a valid pairing — removing it.");
   }
-  await unlink2(configPath).catch(() => {});
-  await unlink2(lastSendPath).catch(() => {});
-  await unlink2(htmlPath).catch(() => {});
-  print("Unpaired ✓");
+  await unlink2(pidPath).catch(() => {});
+  return killed ? "killed" : "stale-pidfile";
+}
+async function postEnd(config, sessionId, fetchFn) {
+  try {
+    const res = await fetchFn(`${config.url}/v1/cc/event`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-cc-pairing": config.pairingId, "x-cc-auth": config.pcSecret },
+      body: JSON.stringify({ v: 2, sessionId, op: "end", prio: 0, ts: Date.now() }),
+      signal: AbortSignal.timeout(2000)
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+async function reset(deps = {}) {
+  const print = deps.print ?? ((line) => console.log(line));
+  const fetchFn = deps.fetchFn ?? fetch;
+  const sessionsDir = deps.sessionsDir ?? SESSIONS_DIR;
+  const isAlive = deps.isAlive ?? pidAlive;
+  const wd = await stopWatchdog(deps);
+  if (wd === "killed")
+    print("Stopped the watchdog (it restarts automatically on your next session).");
+  else if (wd === "stale-pidfile")
+    print("Removed a stale watchdog pidfile (no watchdog was running).");
+  else
+    print("No watchdog running.");
+  const config = await (deps.loadConfigFn ?? loadConfig)();
+  let files = [];
+  try {
+    files = (await readdir(sessionsDir)).filter((f) => f.endsWith(".json"));
+  } catch {
+    files = [];
+  }
+  let cleared = 0;
+  let ended = 0;
+  let kept = 0;
+  for (const f of files) {
+    const path = `${sessionsDir}/${f}`;
+    let record = null;
+    try {
+      record = JSON.parse(await readFile2(path, "utf8"));
+    } catch {
+      record = null;
+    }
+    if (classifyResetSession(record, isAlive) === "keep") {
+      kept++;
+      continue;
+    }
+    if (config && await postEnd(config, basename(f, ".json"), fetchFn))
+      ended++;
+    await unlink2(path).catch(() => {});
+    cleared++;
+  }
+  if (cleared > 0) {
+    print(`Cleared ${cleared} stale session record${cleared === 1 ? "" : "s"}${config ? ` (${ended} end signal${ended === 1 ? "" : "s"} delivered to your phone)` : " (not paired — cleared locally only)"}.`);
+  } else {
+    print("No stale sessions to clear.");
+  }
+  if (kept > 0)
+    print(`Left ${kept} live session${kept === 1 ? "" : "s"} untouched.`);
+  print("Pairing and keys were not touched — use the unpair command if you want that.");
   return 0;
 }
 if (__require.main == __require.module) {
   if (process.argv.includes("--check")) {
-    console.log("usage: unpair [--check]  — revoke and remove this machine's Nomo pairing");
+    console.log("usage: reset  — stop the watchdog and clear dead/phantom session rows (keeps the pairing; watchdog restarts on the next session)");
     process.exit(0);
   }
-  process.exit(await unpair());
+  process.exit(await reset());
 }
 export {
-  unpair
+  reset,
+  isWatchdogCommand,
+  classifyResetSession
 };

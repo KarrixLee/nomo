@@ -21,7 +21,7 @@ import { readdir, readFile, unlink } from "node:fs/promises";
 import { hostname } from "node:os";
 import { basename } from "node:path";
 import { encryptBlob } from "./crypto";
-import { adapterFor, claudeToolDetail, codexToolDetail, findProvisionalForPid } from "./adapter";
+import { adapterFor, claudeToolDetail, codexToolDetail, findProvisionalForPid, TrackedSessionLite } from "./adapter";
 import {
   AgentKind, atomicWrite, CCOp, CCStatus, Config, ensureWatchdog, GONE_STRIKE_LIMIT,
   LAST_SEND_PATH, lastHookPath, loadConfig, loadPendingConfig, PENDING_STASH_PATH, PendingEventStash, pidAncestors, readPrefix,
@@ -220,7 +220,7 @@ export async function stashPendingEvent(
 export async function trackSession(
   sessionId: string, op: CCOp, prio: 0 | 1, status: CCStatus, blob: string | undefined,
   machine: string, label: string, transcript: string, agent: AgentKind = "claude", sessionStartedAt?: number,
-  turnStartedAt?: number, turnId?: string,
+  turnStartedAt?: number, turnId?: string, title?: string, pairingId?: string,
 ): Promise<void> {
   try {
     const path = `${SESSIONS_DIR}/${sessionId}.json`;
@@ -252,6 +252,15 @@ export async function trackSession(
       // Bind this record to its Codex turn (the hook input's `turn_id`) so the notify backstop can tell
       // a stale turn-N notify from the live turn N+1. Claude has no turn_id → omitted (guard inert).
       ...(typeof turnId === "string" && turnId.length > 0 ? { turnId } : {}),
+      // The last NON-EMPTY display title (callers thread `title ?? previousRecord.title`). The
+      // watchdog's corrective done/needsAttention envelopes rebuild their blobs from this record, and
+      // without a cached title they'd re-push title:"" — the phone then falls back to the folder-name
+      // label. Omitted when no title has ever resolved.
+      ...(typeof title === "string" && title.length > 0 ? { title } : {}),
+      // The pairing this record's `blob` was SEALED under. A re-pair rotates the key; the watchdog's
+      // staleness heartbeat re-sends `blob` verbatim, so it must only do that while the pairing that
+      // sealed it is still the live one — otherwise the phone renders an undecryptable ghost forever.
+      ...(typeof pairingId === "string" && pairingId.length > 0 ? { pairingId } : {}),
     };
     // Owner-only (0600): the record carries hostname, cwd basename, the session pid, and the ABSOLUTE
     // transcript path — never group/world readable, matching config.json / the pending stash.
@@ -291,6 +300,22 @@ async function reconcileProvisional(config: Config, hookPid: number): Promise<vo
   } catch {
     // best-effort — never surface into a session
   }
+}
+
+/** Every tracked session's ghost-check projection (id + pid + provisional + agent), read best-effort
+ *  from SESSIONS_DIR. Feeds AgentAdapter.isChildSessionGhost — the codex app-server child-session
+ *  guard needs to know whether some OTHER real session already owns this hook's pid. */
+async function readTrackedSessions(): Promise<TrackedSessionLite[]> {
+  const files = await readdir(SESSIONS_DIR).catch(() => [] as string[]);
+  const out: TrackedSessionLite[] = [];
+  for (const f of files) {
+    if (!f.endsWith(".json")) continue;
+    try {
+      const r = JSON.parse(await readFile(`${SESSIONS_DIR}/${f}`, "utf8")) as SessionRecord;
+      out.push({ sessionId: basename(f, ".json"), pid: r.pid, provisional: r.provisional, agent: r.agent });
+    } catch { /* half-written / corrupt → skip */ }
+  }
+  return out;
 }
 
 /** Read the whole of stdin (the hook JSON) as UTF-8. process.stdin is an async iterable of Buffers
@@ -383,6 +408,23 @@ export async function runHook(agent: AgentKind): Promise<void> {
 
     const machine = config.machineName ?? hostname().replace(/\.local$/, "");
 
+    // One record read serves the child-ghost guard, the sentDone re-arm, and the cached session
+    // start. A cached start (an earlier hook parsed it) wins so we never re-parse and it survives the
+    // transcript later vanishing; otherwise parse it from the same head `readTitle` reads (memoized —
+    // no second read). Unknown → omitted from the envelope; the worker keeps its first-seen fallback.
+    const existingRecord = await readRecord(input.session_id);
+
+    // Child-session ghost guard (adapter seam; codex-only in practice): the ChatGPT.app
+    // `codex app-server` spawns child session ids with NO rollout content that share their pid with
+    // the real session — each would otherwise become a brand-new, forever-empty phone row. Only consulted
+    // for a NEVER-tracked id, so an already-live session can never be silenced by it.
+    if (!existingRecord && adapter.isChildSessionGhost) {
+      const tracked = await readTrackedSessions();
+      if (tracked.length > 0 && adapter.isChildSessionGhost({
+        sessionId: input.session_id, prefix: await getPrefix(), hookPid: process.ppid, tracked,
+      })) return;
+    }
+
     // Reconcile a provisional discovery: Codex fires no hook at session OPEN (openai/codex#15269), so
     // the watchdog may have surfaced this TUI provisionally. Now that a REAL codex hook is reporting,
     // end that provisional so the phone doesn't show both it and the real session. Codex-only (Claude
@@ -391,12 +433,6 @@ export async function runHook(agent: AgentKind): Promise<void> {
     if (agent === "codex") await reconcileProvisional(config, process.ppid);
 
     const title = await readTitle();
-
-    // One record read serves both the sentDone re-arm and the cached session start. A cached start
-    // (an earlier hook parsed it) wins so we never re-parse and it survives the transcript later
-    // vanishing; otherwise parse it from the same head `readTitle` already read (memoized — no second
-    // read). Unknown → omitted from the envelope, and the worker keeps its first-seen fallback.
-    const existingRecord = await readRecord(input.session_id);
     const sentDone = existingRecord?.sentDone === true;
     const cachedStart = typeof existingRecord?.sessionStartedAt === "number" && Number.isFinite(existingRecord.sessionStartedAt)
       ? existingRecord.sessionStartedAt : undefined;
@@ -423,7 +459,11 @@ export async function runHook(agent: AgentKind): Promise<void> {
     // running before we POST — a force-killed terminal fires no SessionEnd, so this is how the phone
     // learns of a dead session in seconds instead of after the 30-min eviction.
     const label = typeof input.cwd === "string" && input.cwd.length > 0 ? basename(input.cwd) : "session";
-    await trackSession(input.session_id, plan.op, plan.prio, plan.status, envelope.blob as string | undefined, machine, label, transcriptPath, agent, startedAt, turnStartedAt, turnId);
+    // Cache the last NON-EMPTY title (this hook's, else the previous record's) so the watchdog's
+    // corrective envelopes never regress to title:"" — and stamp the pairing the blob was sealed
+    // under so a heartbeat after a re-pair can't re-send an undecryptable stale blob.
+    await trackSession(input.session_id, plan.op, plan.prio, plan.status, envelope.blob as string | undefined, machine, label, transcriptPath, agent, startedAt, turnStartedAt, turnId,
+      title ?? existingRecord?.title, config.pairingId);
     ensureWatchdog();
 
     const res = await fetch(`${config.url}/v1/cc/event`, {

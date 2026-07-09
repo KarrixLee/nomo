@@ -5,6 +5,7 @@ var __require = /* @__PURE__ */ createRequire(import.meta.url);
 import { spawn as spawn2 } from "node:child_process";
 import { readFile as readFile2, unlink as unlink2 } from "node:fs/promises";
 import { dirname as dirname2, join as join2 } from "node:path";
+import { fileURLToPath as fileURLToPath2 } from "node:url";
 
 // src/core/shared.ts
 import { chmod, open, readFile, rename, stat, mkdir, unlink, writeFile } from "node:fs/promises";
@@ -252,7 +253,9 @@ async function flushPendingStash(stashPath, url, pairingId, pcSecret, e2eKey, no
           op: stash.op,
           prio: stash.prio,
           blob,
-          ...stash.blob.agent === "codex" ? { agent: "codex" } : {}
+          ...stash.blob.agent === "codex" ? { agent: "codex" } : {},
+          ...typeof stash.blob.title === "string" && stash.blob.title.length > 0 ? { title: stash.blob.title } : {},
+          ...pairingId.length > 0 ? { pairingId } : {}
         };
         await atomicWrite(`${sessionsDir}/${stash.sessionId}.json`, JSON.stringify(record), 384);
         ensureWD();
@@ -428,6 +431,91 @@ function pidAncestors(pid, maxDepth = 12) {
     cur = ppid;
   }
   return chain;
+}
+
+// src/core/notify-wire.ts
+function isNomoNotifyChain(arr) {
+  return arr.length > 0 && /(^|\/)notify-chain\.sh$/.test(arr[0] ?? "");
+}
+function sameCommand(a, b) {
+  return a.length === b.length && a.every((v, i) => v === b[i]);
+}
+function unwrapNotify(arr) {
+  if (arr.length === 0)
+    return null;
+  if (isNomoNotifyChain(arr)) {
+    const sep = arr.indexOf("--");
+    if (sep === -1)
+      return null;
+    return unwrapNotify(arr.slice(sep + 1));
+  }
+  const i = arr.indexOf("--previous-notify");
+  if (i !== -1 && i + 1 < arr.length && (arr[i + 1] ?? "").includes("notify-chain.sh")) {
+    const host = [...arr.slice(0, i), ...arr.slice(i + 2)];
+    let embedded = null;
+    try {
+      embedded = JSON.parse(arr[i + 1]);
+    } catch {}
+    if (Array.isArray(embedded) && embedded.every((x) => typeof x === "string")) {
+      const inner = unwrapNotify(embedded);
+      if (inner !== null && inner.length > 0 && !sameCommand(inner, host)) {
+        return [...arr.slice(0, i), "--previous-notify", JSON.stringify(inner), ...arr.slice(i + 2)];
+      }
+    }
+    return host;
+  }
+  return [...arr];
+}
+function wireNotifyArray(existing, root) {
+  const chain = `${root}/scripts/notify-chain.sh`;
+  const mjs = `${root}/dist/codex-notify.mjs`;
+  const orig = existing && existing.length > 0 ? unwrapNotify(existing) : null;
+  return orig && orig.length > 0 ? [chain, mjs, "--", ...orig] : [chain, mjs];
+}
+function parseNotifyFromToml(toml) {
+  for (const line of toml.split(`
+`)) {
+    if (/^\s*\[/.test(line))
+      break;
+    const m = line.match(/^\s*notify\s*=\s*(.*)$/);
+    if (!m)
+      continue;
+    try {
+      const parsed = JSON.parse(m[1]);
+      if (Array.isArray(parsed) && parsed.every((x) => typeof x === "string")) {
+        return { present: true, value: parsed };
+      }
+    } catch {}
+    return { present: true, value: null };
+  }
+  return { present: false, value: null };
+}
+function replaceNotifyInToml(toml, arr) {
+  const line = `notify = ${JSON.stringify(arr)}`;
+  const lines = toml.split(`
+`);
+  let firstTable = -1;
+  for (let i = 0;i < lines.length; i++) {
+    if (/^\s*\[/.test(lines[i])) {
+      firstTable = i;
+      break;
+    }
+    if (/^\s*notify\s*=/.test(lines[i])) {
+      lines[i] = line;
+      return lines.join(`
+`);
+    }
+  }
+  if (firstTable === -1) {
+    const sep = toml.length === 0 || toml.endsWith(`
+`) ? "" : `
+`;
+    return `${toml}${sep}${line}
+`;
+  }
+  lines.splice(firstTable, 0, line, "");
+  return lines.join(`
+`);
 }
 
 // src/core/pair-code.ts
@@ -3503,6 +3591,43 @@ async function pairWait(deps = {}) {
   print("Pairing window expired (10 minutes) with no phone claiming it — run /nomo-cc:pair again when ready.");
   return 1;
 }
+function pluginRootFromHere() {
+  return dirname2(dirname2(fileURLToPath2(import.meta.url)));
+}
+async function wireNotify(deps = {}) {
+  const print = deps.print ?? ((line) => console.log(line));
+  const tomlPath = deps.tomlPath ?? join2(codexHome(), "config.toml");
+  const root = deps.pluginRoot ?? pluginRootFromHere();
+  let toml = "";
+  try {
+    toml = await readFile2(tomlPath, "utf8");
+  } catch {
+    toml = "";
+  }
+  const parsed = parseNotifyFromToml(toml);
+  if (parsed.present && parsed.value === null) {
+    print(`Couldn't safely parse the existing notify line in ${tomlPath} — set it manually to:`);
+    print(`notify = ["${root}/scripts/notify-chain.sh", "${root}/dist/codex-notify.mjs", "--", <your original notify command…>]`);
+    return 1;
+  }
+  const next = wireNotifyArray(parsed.value ?? undefined, root);
+  if (parsed.value && next.length === parsed.value.length && next.every((v, i) => v === parsed.value[i])) {
+    print("Codex notify backstop already wired — no change.");
+    return 0;
+  }
+  if (toml.length > 0) {
+    const bak = `${tomlPath}.bak-nomo`;
+    try {
+      await readFile2(bak);
+    } catch {
+      await atomicWrite(bak, toml);
+    }
+  }
+  await atomicWrite(tomlPath, replaceNotifyInToml(toml, next));
+  const preserved = next.includes("--");
+  print(preserved ? "Codex notify backstop wired (your original notify command is preserved and still runs)." : "Codex notify backstop wired.");
+  return 0;
+}
 function parseTimeoutMs(argv) {
   const i = argv.indexOf("--timeout");
   if (i === -1)
@@ -3512,8 +3637,13 @@ function parseTimeoutMs(argv) {
 }
 if (__require.main == __require.module) {
   if (process.argv.includes("--check")) {
-    console.log("usage: pair [wait [--timeout <seconds>]] [--show-code] [--check]  — pair this machine with the Nomo app (opens a browser page with the QR + click-to-reveal code; --show-code is for when you can't open a browser at all — it skips the QR/page and prints the one-time code to the terminal instead)");
+    console.log("usage: pair [wait [--timeout <seconds>]] [wire-notify [<plugin-root>]] [--show-code] [--check]  — pair this machine with the Nomo app (opens a browser page with the QR + click-to-reveal code; --show-code is for when you can't open a browser at all — it skips the QR/page and prints the one-time code to the terminal instead; wire-notify idempotently wires the Codex notify backstop into config.toml)");
     process.exit(0);
+  }
+  if (process.argv.includes("wire-notify")) {
+    const i = process.argv.indexOf("wire-notify");
+    const rootArg = process.argv[i + 1];
+    process.exit(await wireNotify(rootArg && !rootArg.startsWith("--") ? { pluginRoot: rootArg } : {}));
   }
   if (process.argv.includes("wait")) {
     const softTimeoutMs = parseTimeoutMs(process.argv);
@@ -3523,6 +3653,7 @@ if (__require.main == __require.module) {
   }
 }
 export {
+  wireNotify,
   pairWait,
   pairStart,
   decryptDeviceName,

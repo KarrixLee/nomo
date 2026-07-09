@@ -147,6 +147,17 @@ export interface SessionRecord {
    *  must NOT clobber turn N+1's record with a wrong `done`, so runNotify bails when this differs from
    *  the notify payload's turn-id. Claude payloads carry no turn_id → undefined (the guard is inert). */
   turnId?: string;
+  /** The last NON-EMPTY display title POSTed for this session (the hook threads
+   *  `title ?? previousRecord.title` so it never regresses to empty). The watchdog's corrective
+   *  done/needsAttention envelopes rebuild their blobs from the record; without this they'd re-push
+   *  title:"" and the phone would fall back to the folder-name label. Absent → no title yet. */
+  title?: string;
+  /** The pairingId whose key SEALED this record's `blob`. A re-pair rotates both the pairing and the
+   *  E2E key, but session records survive it — so the watchdog's staleness heartbeat (which re-sends
+   *  `blob` verbatim) must check this against the CURRENT config.pairingId and skip on mismatch;
+   *  otherwise the phone gets frames it can never decrypt ("Encrypted session" forever). Absent on
+   *  records from older plugins → treated as unknown, never heartbeated. */
+  pairingId?: string;
   /** True for a PROVISIONAL record the watchdog wrote from process-scan discovery (an interactive TUI
    *  the hooks can't see yet — see AgentAdapter.discoverLive). Its `pid` is the discovered TUI process
    *  and its sessionId is a sentinel (`codex-pid-<pid>`). Reconciled away (op:end + delete) the moment
@@ -473,6 +484,11 @@ async function flushPendingStash(
           // marker. The stash's plaintext blob already holds `agent` (buildBlob stamped it), so we
           // derive it from there rather than adding a redundant top-level stash field.
           ...(stash.blob.agent === "codex" ? { agent: "codex" as const } : {}),
+          // Cache the stash's title (if any) and the pairing this blob was sealed under, mirroring
+          // trackSession — so a watchdog corrective keeps the title and the heartbeat's key-rotation
+          // guard can prove the blob decryptable.
+          ...(typeof stash.blob.title === "string" && stash.blob.title.length > 0 ? { title: stash.blob.title } : {}),
+          ...(pairingId.length > 0 ? { pairingId } : {}),
         };
         // Owner-only (0600): like the hook's trackSession, this record carries hostname, cwd basename,
         // the session pid, and (via the reused blob) the machine/label — never group/world readable.

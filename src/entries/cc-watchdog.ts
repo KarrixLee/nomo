@@ -111,7 +111,9 @@ export function buildEndEnvelope(sessionId: string, now: number, record?: Sessio
 
 /** The interrupt-corrective envelope: a v2 op:done carrying a freshly-encrypted blob with status
  *  "done" and the record's machine/label (coerced to "" if a corrupt record dropped them). title is
- *  "" — the watchdog has no fresh transcript title, and a done frame doesn't need one. `agent`
+ *  the record's cached last non-empty title (the hook stamps it on every emit) — the watchdog has no
+ *  fresh transcript to scan, and re-pushing title:"" made the phone regress to the folder-name label;
+ *  "" only when no title was ever resolved. `agent`
  *  (defaulted to claude so the existing call sites/tests are byte-identical) restamps the blob's
  *  optional `agent:"codex"` key so a corrective done matches what the hook would have sent. The
  *  record's cached `turnStartedAt` (epoch seconds, stamped by the turn's UserPromptSubmit) is
@@ -120,7 +122,7 @@ export function buildEndEnvelope(sessionId: string, now: number, record?: Sessio
 export async function buildDoneEnvelope(sessionId: string, record: SessionRecord, now: number, e2eKey: Uint8Array, agent: AgentKind = "claude"): Promise<object> {
   const blob = await encryptBlob(e2eKey, {
     status: "done",
-    title: "",
+    title: typeof record.title === "string" ? record.title : "",
     machine: typeof record.machine === "string" ? record.machine : "",
     label: typeof record.label === "string" ? record.label : "",
     // Per-agent blob identity comes from the adapter (no inline `agent === …` branch in the daemon).
@@ -132,15 +134,16 @@ export async function buildDoneEnvelope(sessionId: string, record: SessionRecord
 
 /** The pending-approval corrective envelope: a v2 op:update / prio 1 carrying a freshly-encrypted blob
  *  with status "needsAttention" — the SAME op/prio/status a real PermissionRequest hook would send (see
- *  hook.ts planOp: PermissionRequest → {op:update, prio:1, status:needsAttention}). title is "" (the
- *  watchdog has no fresh transcript title, and the phone shows the last-known title anyway), machine/
+ *  hook.ts planOp: PermissionRequest → {op:update, prio:1, status:needsAttention}). title is the
+ *  record's cached last non-empty title (see buildDoneEnvelope — a rebuilt title:"" regressed the
+ *  phone to the folder-name label), machine/
  *  label come from the record (coerced to "" if a corrupt record dropped them), `agent` restamps the
  *  blob's optional agent:"codex" via the adapter seam, and the record's cached `turnStartedAt` is
  *  restamped so the island timer keeps measuring the same turn — exactly as buildDoneEnvelope does. */
 export async function buildNeedsAttentionEnvelope(sessionId: string, record: SessionRecord, now: number, e2eKey: Uint8Array, agent: AgentKind = "claude"): Promise<object> {
   const blob = await encryptBlob(e2eKey, {
     status: "needsAttention",
-    title: "",
+    title: typeof record.title === "string" ? record.title : "",
     machine: typeof record.machine === "string" ? record.machine : "",
     label: typeof record.label === "string" ? record.label : "",
     // Per-agent blob identity comes from the adapter (no inline `agent === …` branch in the daemon).
@@ -153,9 +156,17 @@ export async function buildNeedsAttentionEnvelope(sessionId: string, record: Ses
 /** The staleness-heartbeat envelope: re-send the record's stored blob verbatim under its stored
  *  op/prio with a fresh ts, so the worker re-pushes the SAME content-state and re-arms its stale-date
  *  without any state change. Null when the record carries no blob (a pre-v2 record) — nothing to
- *  re-send, so the session simply isn't heartbeated. */
-export function buildHeartbeatEnvelope(sessionId: string, record: SessionRecord, now: number): object | null {
+ *  re-send, so the session simply isn't heartbeated.
+ *
+ *  KEY-ROTATION GUARD: the stored blob is sealed under the E2E key of the pairing that was live when
+ *  the hook wrote the record. A re-pair rotates pairing + key but leaves session records on disk, and
+ *  a verbatim re-send would then push frames the phone can NEVER decrypt ("Encrypted session ·
+ *  Running" forever — observed 2026-07-10 after a re-pair). When `currentPairingId` is given, the
+ *  record must carry the SAME pairingId to be heartbeated; a mismatch or a pre-fix record with no
+ *  stamp yields null (the next real hook re-seals + restamps, restoring heartbeats). */
+export function buildHeartbeatEnvelope(sessionId: string, record: SessionRecord, now: number, currentPairingId?: string): object | null {
   if (typeof record.blob !== "string" || record.blob.length === 0) return null;
+  if (currentPairingId !== undefined && record.pairingId !== currentPairingId) return null;
   return { v: 2, sessionId, op: record.op ?? "update", prio: record.prio ?? 0, ts: now, blob: record.blob, ...startedAtField(record) };
 }
 
@@ -263,6 +274,7 @@ export function buildStartEnvelope(sessionId: string, blob: string, now: number)
  *  fresh-start bookkeeping so a heartbeat/reap treats it like any other start. */
 export function buildProvisionalRecord(
   d: DiscoveredSession, machine: string, blob: string, blobAgentFields: { agent?: AgentKind }, now: number,
+  pairingId?: string,
 ): SessionRecord {
   return {
     pid: d.pid,
@@ -275,6 +287,9 @@ export function buildProvisionalRecord(
     blob,
     provisional: true,
     ...blobAgentFields,
+    // Stamp the pairing this blob was sealed under so the heartbeat's key-rotation guard can prove
+    // the blob is still decryptable (see buildHeartbeatEnvelope). Omitted only when unknown.
+    ...(typeof pairingId === "string" && pairingId.length > 0 ? { pairingId } : {}),
   };
 }
 
@@ -314,7 +329,7 @@ export async function discoverLiveSessions(config: Config, deps: DiscoverDeps = 
       const blob = await buildProvisionalBlob(d, machine, adapter.blobAgentFields, config.e2eKey);
       const outcome = await post(buildStartEnvelope(d.sessionId, blob, ts));
       if (outcome !== "delivered") continue; // failed/revoked → retry next sweep, don't persist a ghost
-      await writeRecord(d.sessionId, buildProvisionalRecord(d, machine, blob, adapter.blobAgentFields, ts));
+      await writeRecord(d.sessionId, buildProvisionalRecord(d, machine, blob, adapter.blobAgentFields, ts, config.pairingId));
     }
   }
 }
@@ -577,7 +592,7 @@ async function sweep(config: Config | null): Promise<SweepResult> {
           if (attn === "corrected") { delivered = true; flaggedAttention = true; }
         }
         if (shouldHeartbeat(record, now, heartbeatAt.get(sessionId), corrected === "corrected" || flaggedAttention)) {
-          const beat = buildHeartbeatEnvelope(sessionId, record, Date.now());
+          const beat = buildHeartbeatEnvelope(sessionId, record, Date.now(), config.pairingId);
           // delivered only: a failed heartbeat mutates NOTHING (not the record, not even the throttle),
           // so quietness stays true and it's retried next sweep. A record with no stored blob yields
           // a null envelope — nothing to send, so it simply isn't heartbeated.
@@ -741,22 +756,27 @@ async function run(): Promise<void> {
         // Unpaired OR mid-pairing. Opportunistically complete a pending pairing (self-heal), then keep
         // looping through the pairing window so a claim that arrives after `wait` died still lands.
         const pending = await loadPendingConfig();
-        if (pending) {
-          // Past the QR's TTL a still-pending config can never complete → clean it up and stop, so an
-          // unreachable worker never leaves this detached poller spinning until reboot.
-          if (pendingPairingExpired(pending, Date.now(), fallbackDeadline)) {
-            await removePendingConfig();
-            return;
-          }
-          const verdict = await selfHealPairing(pending);
-          if (verdict === "stop") return;
-          if (verdict === "cleanup") {
-            await removePendingConfig();
-            return;
-          }
-          await new Promise((r) => setTimeout(r, POLL_MS));
-          continue;
+        if (!pending) {
+          // Unpaired with NOTHING pending: there is no key to send with and nothing to self-heal, so
+          // exit NOW instead of idling. Lingering here is how a pre-rotation daemon kept beating after
+          // an unpair/re-pair race (config gone, sends continuing off stale state); the next paired
+          // hook re-spawns a fresh watchdog that reads the fresh config.
+          return;
         }
+        // Past the QR's TTL a still-pending config can never complete → clean it up and stop, so an
+        // unreachable worker never leaves this detached poller spinning until reboot.
+        if (pendingPairingExpired(pending, Date.now(), fallbackDeadline)) {
+          await removePendingConfig();
+          return;
+        }
+        const verdict = await selfHealPairing(pending);
+        if (verdict === "stop") return;
+        if (verdict === "cleanup") {
+          await removePendingConfig();
+          return;
+        }
+        await new Promise((r) => setTimeout(r, POLL_MS));
+        continue;
       }
       const nowMs = Date.now();
       if (remaining > 0) lastActiveMs = nowMs; // a live session resets the idle-grace clock

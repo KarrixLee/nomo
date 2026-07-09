@@ -30,6 +30,7 @@ const ENTRYPOINTS = [
   "cc-watchdog.ts",
   "pair.ts",
   "unpair.ts",
+  "reset.ts",
   "status-cmd.ts",
 ].map((f) => join(HERE, "src", "entries", f));
 

@@ -256,7 +256,9 @@ async function flushPendingStash(stashPath, url, pairingId, pcSecret, e2eKey, no
           op: stash.op,
           prio: stash.prio,
           blob,
-          ...stash.blob.agent === "codex" ? { agent: "codex" } : {}
+          ...stash.blob.agent === "codex" ? { agent: "codex" } : {},
+          ...typeof stash.blob.title === "string" && stash.blob.title.length > 0 ? { title: stash.blob.title } : {},
+          ...pairingId.length > 0 ? { pairingId } : {}
         };
         await atomicWrite(`${sessionsDir}/${stash.sessionId}.json`, JSON.stringify(record), 384);
         ensureWD();
@@ -584,6 +586,8 @@ function firstUserPromptFromLines(lines) {
     const r = row;
     if (r.type !== "user")
       continue;
+    if (r.isMeta === true)
+      continue;
     const msg = r.message;
     const content = msg?.content;
     let text;
@@ -597,8 +601,12 @@ function firstUserPromptFromLines(lines) {
     }
     if (typeof text !== "string")
       continue;
-    const cleaned = text.replace(/\s+/g, " ").trim();
+    const cleaned = text.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, "").replace(/\s+/g, " ").trim();
     if (!cleaned || cleaned.startsWith("<"))
+      continue;
+    if (cleaned.startsWith("Caveat:"))
+      continue;
+    if (cleaned.includes("<command-name>") || cleaned.includes("<local-command-stdout>"))
       continue;
     return cleanPromptTitle(cleaned);
   }
@@ -774,6 +782,11 @@ async function codexDiscoverLive(known, deps = {}) {
   }
   return out;
 }
+function codexChildSessionGhost(sessionId, transcriptPrefix, hookPid, tracked) {
+  if (transcriptPrefix.trim().length > 0)
+    return false;
+  return tracked.some((t) => t.sessionId !== sessionId && t.provisional !== true && t.agent === "codex" && typeof t.pid === "number" && Number.isFinite(t.pid) && t.pid === hookPid);
+}
 function findProvisionalForPid(provisionals, hookPid, ancestorsOf) {
   for (const p of provisionals)
     if (p.pid === hookPid)
@@ -821,6 +834,9 @@ var codexAdapter = {
   },
   tailShowsPendingApproval(tail) {
     return codexTailPendingApproval(tail);
+  },
+  isChildSessionGhost({ sessionId, prefix, hookPid, tracked }) {
+    return codexChildSessionGhost(sessionId, prefix, hookPid, tracked);
   },
   sessionsDir: () => `${codexHome()}/sessions`,
   sessionMatch: (name) => name.startsWith("rollout-") && name.endsWith(".jsonl"),

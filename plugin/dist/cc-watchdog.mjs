@@ -256,7 +256,9 @@ async function flushPendingStash(stashPath, url, pairingId, pcSecret, e2eKey, no
           op: stash.op,
           prio: stash.prio,
           blob,
-          ...stash.blob.agent === "codex" ? { agent: "codex" } : {}
+          ...stash.blob.agent === "codex" ? { agent: "codex" } : {},
+          ...typeof stash.blob.title === "string" && stash.blob.title.length > 0 ? { title: stash.blob.title } : {},
+          ...pairingId.length > 0 ? { pairingId } : {}
         };
         await atomicWrite(`${sessionsDir}/${stash.sessionId}.json`, JSON.stringify(record), 384);
         ensureWD();
@@ -584,6 +586,8 @@ function firstUserPromptFromLines(lines) {
     const r = row;
     if (r.type !== "user")
       continue;
+    if (r.isMeta === true)
+      continue;
     const msg = r.message;
     const content = msg?.content;
     let text;
@@ -597,8 +601,12 @@ function firstUserPromptFromLines(lines) {
     }
     if (typeof text !== "string")
       continue;
-    const cleaned = text.replace(/\s+/g, " ").trim();
+    const cleaned = text.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, "").replace(/\s+/g, " ").trim();
     if (!cleaned || cleaned.startsWith("<"))
+      continue;
+    if (cleaned.startsWith("Caveat:"))
+      continue;
+    if (cleaned.includes("<command-name>") || cleaned.includes("<local-command-stdout>"))
       continue;
     return cleanPromptTitle(cleaned);
   }
@@ -774,6 +782,11 @@ async function codexDiscoverLive(known, deps = {}) {
   }
   return out;
 }
+function codexChildSessionGhost(sessionId, transcriptPrefix, hookPid, tracked) {
+  if (transcriptPrefix.trim().length > 0)
+    return false;
+  return tracked.some((t) => t.sessionId !== sessionId && t.provisional !== true && t.agent === "codex" && typeof t.pid === "number" && Number.isFinite(t.pid) && t.pid === hookPid);
+}
 function findProvisionalForPid(provisionals, hookPid, ancestorsOf) {
   for (const p of provisionals)
     if (p.pid === hookPid)
@@ -822,6 +835,9 @@ var codexAdapter = {
   tailShowsPendingApproval(tail) {
     return codexTailPendingApproval(tail);
   },
+  isChildSessionGhost({ sessionId, prefix, hookPid, tracked }) {
+    return codexChildSessionGhost(sessionId, prefix, hookPid, tracked);
+  },
   sessionsDir: () => `${codexHome()}/sessions`,
   sessionMatch: (name) => name.startsWith("rollout-") && name.endsWith(".jsonl"),
   hookStampPath: () => lastHookPath("codex"),
@@ -857,7 +873,7 @@ function buildEndEnvelope(sessionId, now, record) {
 async function buildDoneEnvelope(sessionId, record, now, e2eKey, agent = "claude") {
   const blob = await encryptBlob(e2eKey, {
     status: "done",
-    title: "",
+    title: typeof record.title === "string" ? record.title : "",
     machine: typeof record.machine === "string" ? record.machine : "",
     label: typeof record.label === "string" ? record.label : "",
     ...adapterFor(agent).blobAgentFields,
@@ -868,7 +884,7 @@ async function buildDoneEnvelope(sessionId, record, now, e2eKey, agent = "claude
 async function buildNeedsAttentionEnvelope(sessionId, record, now, e2eKey, agent = "claude") {
   const blob = await encryptBlob(e2eKey, {
     status: "needsAttention",
-    title: "",
+    title: typeof record.title === "string" ? record.title : "",
     machine: typeof record.machine === "string" ? record.machine : "",
     label: typeof record.label === "string" ? record.label : "",
     ...adapterFor(agent).blobAgentFields,
@@ -876,8 +892,10 @@ async function buildNeedsAttentionEnvelope(sessionId, record, now, e2eKey, agent
   });
   return { v: 2, sessionId, op: "update", prio: 1, ts: now, blob, ...startedAtField(record) };
 }
-function buildHeartbeatEnvelope(sessionId, record, now) {
+function buildHeartbeatEnvelope(sessionId, record, now, currentPairingId) {
   if (typeof record.blob !== "string" || record.blob.length === 0)
+    return null;
+  if (currentPairingId !== undefined && record.pairingId !== currentPairingId)
     return null;
   return { v: 2, sessionId, op: record.op ?? "update", prio: record.prio ?? 0, ts: now, blob: record.blob, ...startedAtField(record) };
 }
@@ -933,7 +951,7 @@ async function buildProvisionalBlob(d, machine, blobAgentFields, e2eKey) {
 function buildStartEnvelope(sessionId, blob, now) {
   return { v: 2, sessionId, op: "start", prio: 0, ts: now, blob };
 }
-function buildProvisionalRecord(d, machine, blob, blobAgentFields, now) {
+function buildProvisionalRecord(d, machine, blob, blobAgentFields, now, pairingId) {
   return {
     pid: d.pid,
     machine,
@@ -944,7 +962,8 @@ function buildProvisionalRecord(d, machine, blob, blobAgentFields, now) {
     prio: 0,
     blob,
     provisional: true,
-    ...blobAgentFields
+    ...blobAgentFields,
+    ...typeof pairingId === "string" && pairingId.length > 0 ? { pairingId } : {}
   };
 }
 async function discoverLiveSessions(config, deps = {}) {
@@ -970,7 +989,7 @@ async function discoverLiveSessions(config, deps = {}) {
       const outcome = await post(buildStartEnvelope(d.sessionId, blob, ts));
       if (outcome !== "delivered")
         continue;
-      await writeRecord(d.sessionId, buildProvisionalRecord(d, machine, blob, adapter.blobAgentFields, ts));
+      await writeRecord(d.sessionId, buildProvisionalRecord(d, machine, blob, adapter.blobAgentFields, ts, config.pairingId));
     }
   }
 }
@@ -1125,7 +1144,7 @@ async function sweep(config) {
           }
         }
         if (shouldHeartbeat(record, now, heartbeatAt.get(sessionId), corrected === "corrected" || flaggedAttention)) {
-          const beat = buildHeartbeatEnvelope(sessionId, record, Date.now());
+          const beat = buildHeartbeatEnvelope(sessionId, record, Date.now(), config.pairingId);
           if (beat) {
             const outcome = await postEvent(config, beat);
             if (outcome === "revoked")
@@ -1225,21 +1244,22 @@ async function run() {
       const remaining = result.remaining;
       if (!config) {
         const pending = await loadPendingConfig();
-        if (pending) {
-          if (pendingPairingExpired(pending, Date.now(), fallbackDeadline)) {
-            await removePendingConfig();
-            return;
-          }
-          const verdict = await selfHealPairing(pending);
-          if (verdict === "stop")
-            return;
-          if (verdict === "cleanup") {
-            await removePendingConfig();
-            return;
-          }
-          await new Promise((r) => setTimeout(r, POLL_MS));
-          continue;
+        if (!pending) {
+          return;
         }
+        if (pendingPairingExpired(pending, Date.now(), fallbackDeadline)) {
+          await removePendingConfig();
+          return;
+        }
+        const verdict = await selfHealPairing(pending);
+        if (verdict === "stop")
+          return;
+        if (verdict === "cleanup") {
+          await removePendingConfig();
+          return;
+        }
+        await new Promise((r) => setTimeout(r, POLL_MS));
+        continue;
       }
       const nowMs = Date.now();
       if (remaining > 0)

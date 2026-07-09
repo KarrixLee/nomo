@@ -135,7 +135,8 @@ export async function runNotify(raw: string, deferMs = notifyDeferMs(), sleep: (
 
     const label = typeof input.cwd === "string" && input.cwd.length > 0 ? basename(input.cwd) : "session";
     await trackSession(sessionId, "done", 0, "done", envelope.blob as string | undefined, machine, label,
-      typeof record?.transcript === "string" ? record.transcript : "", "codex", startedAt, turnStartedAt, payloadTurnId);
+      typeof record?.transcript === "string" ? record.transcript : "", "codex", startedAt, turnStartedAt, payloadTurnId,
+      title ?? record?.title, config.pairingId);
     ensureWatchdog();
 
     const res = await fetch(`${config.url}/v1/cc/event`, {

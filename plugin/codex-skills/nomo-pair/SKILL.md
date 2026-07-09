@@ -73,25 +73,24 @@ channel is the backstop: on turn completion Codex runs the configured program wi
 appended. Point it at Nomo's chain wrapper, which fires `dist/codex-notify.mjs` (a de-duplicated
 "done" push) **and** forwards the payload to any pre-existing notify program so nothing breaks.
 
-Edit Codex's config file — `$CODEX_HOME/config.toml`, default `~/.codex/config.toml` — as follows.
-Read its current `notify` line first, then:
+Run this exact command and relay its final line (do NOT hand-edit `config.toml` yourself — the
+command is idempotent: it unwraps any previous Nomo wrapping, preserves the innermost original
+notify program, and rewrites the `notify` line exactly once, backing up the previous file to
+`config.toml.bak-nomo`):
 
-- **Already wired** (the `notify` array's first element ends in `scripts/notify-chain.sh`): leave it
-  as-is — do NOT double-wrap.
-- **No `notify` line yet**: add
-  ```
-  notify = ["<ROOT>/scripts/notify-chain.sh", "<ROOT>/dist/codex-notify.mjs"]
-  ```
-- **An existing `notify = [<prog>, <args…>]`** (e.g. the computer-use `SkyComputerUseClient`): WRAP it,
-  preserving every original element after a literal `"--"` separator:
-  ```
-  notify = ["<ROOT>/scripts/notify-chain.sh", "<ROOT>/dist/codex-notify.mjs", "--", <prog>, <args…>]
-  ```
+```
+exec "<ROOT>/scripts/run.sh" "<ROOT>/dist/pair.mjs" wire-notify "<ROOT>"
+```
 
-Substitute the real `<ROOT>` from Step 1. Codex appends the JSON payload as the final array element at
-runtime, so the wrapper passes it to `codex-notify.mjs` and (after `--`) re-invokes the original
-program with that payload in the exact position it expects. Tell the user this makes "done" alerts
-reliable even when a Codex hook misfires.
+- `Codex notify backstop wired…` / `already wired — no change` → done; tell the user this makes
+  "done" alerts reliable even when a Codex hook misfires (any pre-existing notify program keeps
+  running unchanged).
+- `Couldn't safely parse the existing notify line…` → the command refused to touch an unusual
+  `notify` value; relay its printed replacement line so the user can set it manually.
+
+Codex appends the JSON payload as the final array element at runtime, so the wrapper passes it to
+`codex-notify.mjs` and (after `--`) re-invokes the original program with that payload in the exact
+position it expects.
 
 ## Step 5 — trust the hooks (fresh install only)
 

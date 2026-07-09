@@ -255,7 +255,9 @@ async function flushPendingStash(stashPath, url, pairingId, pcSecret, e2eKey, no
           op: stash.op,
           prio: stash.prio,
           blob,
-          ...stash.blob.agent === "codex" ? { agent: "codex" } : {}
+          ...stash.blob.agent === "codex" ? { agent: "codex" } : {},
+          ...typeof stash.blob.title === "string" && stash.blob.title.length > 0 ? { title: stash.blob.title } : {},
+          ...pairingId.length > 0 ? { pairingId } : {}
         };
         await atomicWrite(`${sessionsDir}/${stash.sessionId}.json`, JSON.stringify(record), 384);
         ensureWD();
@@ -583,6 +585,8 @@ function firstUserPromptFromLines(lines) {
     const r = row;
     if (r.type !== "user")
       continue;
+    if (r.isMeta === true)
+      continue;
     const msg = r.message;
     const content = msg?.content;
     let text;
@@ -596,8 +600,12 @@ function firstUserPromptFromLines(lines) {
     }
     if (typeof text !== "string")
       continue;
-    const cleaned = text.replace(/\s+/g, " ").trim();
+    const cleaned = text.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, "").replace(/\s+/g, " ").trim();
     if (!cleaned || cleaned.startsWith("<"))
+      continue;
+    if (cleaned.startsWith("Caveat:"))
+      continue;
+    if (cleaned.includes("<command-name>") || cleaned.includes("<local-command-stdout>"))
       continue;
     return cleanPromptTitle(cleaned);
   }
@@ -773,6 +781,11 @@ async function codexDiscoverLive(known, deps = {}) {
   }
   return out;
 }
+function codexChildSessionGhost(sessionId, transcriptPrefix, hookPid, tracked) {
+  if (transcriptPrefix.trim().length > 0)
+    return false;
+  return tracked.some((t) => t.sessionId !== sessionId && t.provisional !== true && t.agent === "codex" && typeof t.pid === "number" && Number.isFinite(t.pid) && t.pid === hookPid);
+}
 function findProvisionalForPid(provisionals, hookPid, ancestorsOf) {
   for (const p of provisionals)
     if (p.pid === hookPid)
@@ -820,6 +833,9 @@ var codexAdapter = {
   },
   tailShowsPendingApproval(tail) {
     return codexTailPendingApproval(tail);
+  },
+  isChildSessionGhost({ sessionId, prefix, hookPid, tracked }) {
+    return codexChildSessionGhost(sessionId, prefix, hookPid, tracked);
   },
   sessionsDir: () => `${codexHome()}/sessions`,
   sessionMatch: (name) => name.startsWith("rollout-") && name.endsWith(".jsonl"),
@@ -943,7 +959,7 @@ async function stashPendingEvent(input, machine, title, now, stashPath = PENDING
     await atomicWrite(stashPath, JSON.stringify(stash), 384);
   } catch {}
 }
-async function trackSession(sessionId, op, prio, status, blob, machine, label, transcript, agent = "claude", sessionStartedAt, turnStartedAt, turnId) {
+async function trackSession(sessionId, op, prio, status, blob, machine, label, transcript, agent = "claude", sessionStartedAt, turnStartedAt, turnId, title, pairingId) {
   try {
     const path = `${SESSIONS_DIR}/${sessionId}.json`;
     if (op === "end") {
@@ -964,7 +980,9 @@ async function trackSession(sessionId, op, prio, status, blob, machine, label, t
       ...agent === "codex" ? { agent } : {},
       ...typeof sessionStartedAt === "number" && Number.isFinite(sessionStartedAt) ? { sessionStartedAt } : {},
       ...typeof turnStartedAt === "number" && Number.isFinite(turnStartedAt) ? { turnStartedAt } : {},
-      ...typeof turnId === "string" && turnId.length > 0 ? { turnId } : {}
+      ...typeof turnId === "string" && turnId.length > 0 ? { turnId } : {},
+      ...typeof title === "string" && title.length > 0 ? { title } : {},
+      ...typeof pairingId === "string" && pairingId.length > 0 ? { pairingId } : {}
     };
     await atomicWrite(path, JSON.stringify(record), 384);
   } catch {}
@@ -998,6 +1016,19 @@ async function reconcileProvisional(config, hookPid) {
     }).catch(() => {});
     await unlink2(`${SESSIONS_DIR}/${sentinel}.json`).catch(() => {});
   } catch {}
+}
+async function readTrackedSessions() {
+  const files = await readdir(SESSIONS_DIR).catch(() => []);
+  const out = [];
+  for (const f of files) {
+    if (!f.endsWith(".json"))
+      continue;
+    try {
+      const r = JSON.parse(await readFile2(`${SESSIONS_DIR}/${f}`, "utf8"));
+      out.push({ sessionId: basename2(f, ".json"), pid: r.pid, provisional: r.provisional, agent: r.agent });
+    } catch {}
+  }
+  return out;
 }
 async function readStdin() {
   const chunks = [];
@@ -1039,10 +1070,20 @@ async function runHook(agent) {
       return;
     }
     const machine = config.machineName ?? hostname().replace(/\.local$/, "");
+    const existingRecord = await readRecord(input.session_id);
+    if (!existingRecord && adapter2.isChildSessionGhost) {
+      const tracked = await readTrackedSessions();
+      if (tracked.length > 0 && adapter2.isChildSessionGhost({
+        sessionId: input.session_id,
+        prefix: await getPrefix(),
+        hookPid: process.ppid,
+        tracked
+      }))
+        return;
+    }
     if (agent === "codex")
       await reconcileProvisional(config, process.ppid);
     const title = await readTitle();
-    const existingRecord = await readRecord(input.session_id);
     const sentDone = existingRecord?.sentDone === true;
     const cachedStart = typeof existingRecord?.sessionStartedAt === "number" && Number.isFinite(existingRecord.sessionStartedAt) ? existingRecord.sessionStartedAt : undefined;
     const startedAt = cachedStart ?? transcriptStartMs(await getPrefix());
@@ -1057,7 +1098,7 @@ async function runHook(agent) {
     if (!envelope)
       return;
     const label = typeof input.cwd === "string" && input.cwd.length > 0 ? basename2(input.cwd) : "session";
-    await trackSession(input.session_id, plan.op, plan.prio, plan.status, envelope.blob, machine, label, transcriptPath, agent, startedAt, turnStartedAt, turnId);
+    await trackSession(input.session_id, plan.op, plan.prio, plan.status, envelope.blob, machine, label, transcriptPath, agent, startedAt, turnStartedAt, turnId, title ?? existingRecord?.title, config.pairingId);
     ensureWatchdog();
     const res = await fetch(`${config.url}/v1/cc/event`, {
       method: "POST",

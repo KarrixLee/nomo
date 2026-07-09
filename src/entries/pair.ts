@@ -27,10 +27,12 @@
 import { spawn } from "node:child_process";
 import { readFile, unlink } from "node:fs/promises";
 import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import {
-  atomicWrite, CC_DIR, completePendingPairing, ensureWatchdog, PAIR_HTML_FILE, PAIR_HTML_PATH,
+  atomicWrite, CC_DIR, codexHome, completePendingPairing, ensureWatchdog, PAIR_HTML_FILE, PAIR_HTML_PATH,
   parseConfig, parsePendingConfig,
 } from "../core/shared";
+import { parseNotifyFromToml, replaceNotifyInToml, wireNotifyArray } from "../core/notify-wire";
 import { b64url, generateEphemeralKeyPair, sha256Hex } from "../core/crypto";
 import { deriveCodeIkm, formatCodeString, randomCodeWords } from "../core/pair-code";
 import { renderPairPage } from "../core/pair-page";
@@ -457,6 +459,64 @@ export async function pairWait(deps: PairDeps = {}): Promise<number> {
   return 1;
 }
 
+// --- wire-notify — deterministic, idempotent Codex notify-backstop wiring -----------------------
+//
+// `pair.mjs wire-notify [<plugin-root>]` replaces the SKILL's old "hand-edit config.toml" step 4.
+// Hand-edits re-wrapped an already-wrapped notify on every re-pair (and third-party installers
+// re-embedded nomo via `--previous-notify`), compounding into a nested chain that double-fired every
+// turn. This command computes the ONE correct value — nomo's chain wrapping the innermost original
+// non-nomo notify — via the pure helpers in core/notify-wire, and only rewrites the file when the
+// value actually changes (backing the previous config.toml up to config.toml.bak-nomo once).
+
+export interface WireNotifyDeps {
+  print?: (line: string) => void;
+  /** Codex's config file; defaults to $CODEX_HOME/config.toml. Tests point at a temp file. */
+  tomlPath?: string;
+  /** The installed plugin root (the dir holding scripts/ + dist/). Defaults to this bundle's parent
+   *  (dist/pair.mjs → <root>/dist → <root>); the skill passes the resolved <ROOT> explicitly. */
+  pluginRoot?: string;
+}
+
+/** This bundle's plugin root: dist/pair.mjs lives at `<root>/dist/`, so the parent dir is the root. */
+function pluginRootFromHere(): string {
+  return dirname(dirname(fileURLToPath(import.meta.url)));
+}
+
+/** Wire (or refresh) the Codex `notify` backstop in config.toml. Idempotent — safe on every pairing.
+ *  Exit 1 only when an existing notify value is a shape we can't safely rewrite (never clobber it). */
+export async function wireNotify(deps: WireNotifyDeps = {}): Promise<number> {
+  const print = deps.print ?? ((line: string) => console.log(line));
+  const tomlPath = deps.tomlPath ?? join(codexHome(), "config.toml");
+  const root = deps.pluginRoot ?? pluginRootFromHere();
+
+  let toml = "";
+  try { toml = await readFile(tomlPath, "utf8"); } catch { toml = ""; /* no config.toml yet */ }
+  const parsed = parseNotifyFromToml(toml);
+  if (parsed.present && parsed.value === null) {
+    // A notify assignment exists but isn't a single-line string array — rewriting blind could corrupt
+    // the user's config, so refuse and hand back the exact value to set.
+    print(`Couldn't safely parse the existing notify line in ${tomlPath} — set it manually to:`);
+    print(`notify = ["${root}/scripts/notify-chain.sh", "${root}/dist/codex-notify.mjs", "--", <your original notify command…>]`);
+    return 1;
+  }
+  const next = wireNotifyArray(parsed.value ?? undefined, root);
+  if (parsed.value && next.length === parsed.value.length && next.every((v, i) => v === parsed.value![i])) {
+    print("Codex notify backstop already wired — no change.");
+    return 0;
+  }
+  // One-time backup of the pre-change file (never overwritten by later runs).
+  if (toml.length > 0) {
+    const bak = `${tomlPath}.bak-nomo`;
+    try { await readFile(bak); } catch { await atomicWrite(bak, toml); }
+  }
+  await atomicWrite(tomlPath, replaceNotifyInToml(toml, next));
+  const preserved = next.includes("--");
+  print(preserved
+    ? "Codex notify backstop wired (your original notify command is preserved and still runs)."
+    : "Codex notify backstop wired.");
+  return 0;
+}
+
 // import.meta.main is true under bun and node >= 24 when this file is the entry point; Task 2.3's
 // bundling rewrites it for older nodes.
 /** Parse `--timeout <seconds>` from argv into ms (the bounded `wait` flag). Undefined when absent or
@@ -470,8 +530,13 @@ function parseTimeoutMs(argv: string[]): number | undefined {
 
 if (import.meta.main) {
   if (process.argv.includes("--check")) {
-    console.log("usage: pair [wait [--timeout <seconds>]] [--show-code] [--check]  — pair this machine with the Nomo app (opens a browser page with the QR + click-to-reveal code; --show-code is for when you can't open a browser at all — it skips the QR/page and prints the one-time code to the terminal instead)");
+    console.log("usage: pair [wait [--timeout <seconds>]] [wire-notify [<plugin-root>]] [--show-code] [--check]  — pair this machine with the Nomo app (opens a browser page with the QR + click-to-reveal code; --show-code is for when you can't open a browser at all — it skips the QR/page and prints the one-time code to the terminal instead; wire-notify idempotently wires the Codex notify backstop into config.toml)");
     process.exit(0);
+  }
+  if (process.argv.includes("wire-notify")) {
+    const i = process.argv.indexOf("wire-notify");
+    const rootArg = process.argv[i + 1];
+    process.exit(await wireNotify(rootArg && !rootArg.startsWith("--") ? { pluginRoot: rootArg } : {}));
   }
   if (process.argv.includes("wait")) {
     const softTimeoutMs = parseTimeoutMs(process.argv);

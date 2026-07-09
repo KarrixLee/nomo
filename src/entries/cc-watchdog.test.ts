@@ -659,3 +659,58 @@ describe("codexTailPendingApproval re-export (parser reachable through ./cc-watc
     expect(codexTailPendingApproval([ev("exec_approval_request"), ev("task_complete")].join("\n"))).toBe(false);
   });
 });
+
+// --- Bug B/C regressions: heartbeat key-rotation guard + corrective-envelope title reuse -------
+
+describe("buildHeartbeatEnvelope key-rotation guard (stale blobs must never outlive a re-pair)", () => {
+  test("record sealed under the CURRENT pairing → heartbeat as before", () => {
+    const r = rec({ op: "update", prio: 0, blob: "B", pairingId: "pair-live" });
+    expect(buildHeartbeatEnvelope("s", r, 5, "pair-live")).toMatchObject({ blob: "B", op: "update" });
+  });
+
+  test("record sealed under a ROTATED-AWAY pairing → null (no undecryptable ghost frames)", () => {
+    const r = rec({ op: "update", prio: 0, blob: "B", pairingId: "pair-old" });
+    expect(buildHeartbeatEnvelope("s", r, 5, "pair-new")).toBeNull();
+  });
+
+  test("pre-fix record with NO pairingId stamp → null when the guard is armed (unknown key = unsafe)", () => {
+    const r = rec({ op: "update", prio: 0, blob: "B" });
+    expect(buildHeartbeatEnvelope("s", r, 5, "pair-live")).toBeNull();
+  });
+
+  test("guard unarmed (no currentPairingId given) keeps the historical behavior", () => {
+    const r = rec({ op: "update", prio: 0, blob: "B" });
+    expect(buildHeartbeatEnvelope("s", r, 5)).toMatchObject({ blob: "B" });
+  });
+});
+
+describe("corrective envelopes reuse the record's cached title (no more folder-name regressions)", () => {
+  test("buildDoneEnvelope threads record.title into the rebuilt blob", async () => {
+    const e = await buildDoneEnvelope("s", rec({ machine: "Mac", label: "api-status", title: "Fix the island timer" }), 5, KEY) as Record<string, unknown>;
+    expect(await decryptBlob(KEY, e.blob as string)).toMatchObject({ status: "done", title: "Fix the island timer" });
+  });
+
+  test("buildNeedsAttentionEnvelope threads record.title into the rebuilt blob", async () => {
+    const e = await buildNeedsAttentionEnvelope("s", rec({ machine: "Mac", label: "api-status", title: "Fix the island timer" }), 5, KEY) as Record<string, unknown>;
+    expect(await decryptBlob(KEY, e.blob as string)).toMatchObject({ status: "needsAttention", title: "Fix the island timer" });
+  });
+
+  test("no cached title → the historical empty title (never a crash / undefined)", async () => {
+    const e = await buildDoneEnvelope("s", rec(), 5, KEY) as Record<string, unknown>;
+    expect(await decryptBlob(KEY, e.blob as string)).toMatchObject({ title: "" });
+  });
+});
+
+describe("buildProvisionalRecord stamps the sealing pairing", () => {
+  const d: DiscoveredSession = { pid: 7, sessionId: "codex-pid-7", title: "proj", label: "proj" };
+
+  test("pairingId rides on the record so the heartbeat guard can prove the blob decryptable", () => {
+    const r = buildProvisionalRecord(d, "Mac", "BLOB", { agent: "codex" }, 99, "pair-live");
+    expect(r.pairingId).toBe("pair-live");
+    expect(buildHeartbeatEnvelope("codex-pid-7", r, 100, "pair-live")).toMatchObject({ blob: "BLOB" });
+  });
+
+  test("omitted when unknown (historical shape preserved)", () => {
+    expect(buildProvisionalRecord(d, "Mac", "BLOB", {}, 99)).not.toHaveProperty("pairingId");
+  });
+});
