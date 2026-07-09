@@ -129,11 +129,18 @@ export function transcriptStartMs(prefix: string): number | undefined {
 
 /** The plaintext content of the encrypted blob: the semantic status, the optional tool detail, the
  *  display fields (title/machine/label), and the optional per-turn anchor. This is ALL the worker
- *  never sees. Shape must match the Swift `CCBlobPlaintext` the phone/widget decode. */
-export function buildBlob(input: Record<string, unknown>, machine: string, title: string | undefined, plan: OpPlan, agent: AgentKind = "claude", turnStartedAt?: number): {
+ *  never sees. Shape must match the Swift `CCBlobPlaintext` the phone/widget decode.
+ *
+ *  `pinnedLabel` — the session's FIRST-SEEN label (from its record) — wins over the event's cwd when
+ *  given: a mid-session `cd` changes input.cwd on every later hook, and re-deriving the label per event
+ *  silently renamed the phone row / island folder chip (observed live: "api-status" → "server" after a
+ *  `cd server`). Absent/empty → first event (or a recordless caller): derive from cwd as before. */
+export function buildBlob(input: Record<string, unknown>, machine: string, title: string | undefined, plan: OpPlan, agent: AgentKind = "claude", turnStartedAt?: number, pinnedLabel?: string): {
   status: CCStatus; detail?: string; title: string; machine: string; label: string; agent?: AgentKind; turnStartedAt?: number;
 } {
-  const label = typeof input.cwd === "string" && input.cwd.length > 0 ? basename(input.cwd) : "session";
+  const label = typeof pinnedLabel === "string" && pinnedLabel.length > 0
+    ? pinnedLabel
+    : typeof input.cwd === "string" && input.cwd.length > 0 ? basename(input.cwd) : "session";
   const hookName = typeof input.hook_event_name === "string" ? input.hook_event_name : "";
   const detail = detailForHook(hookName, typeof input.tool_name === "string" ? input.tool_name : undefined);
   // The `agent` key is OMITTED for claude (byte-identical to the pre-codex blob so old Swift builds and
@@ -154,7 +161,7 @@ export function buildBlob(input: Record<string, unknown>, machine: string, title
  *  drives the re-arm (a start after a done becomes an update). */
 export async function buildEnvelope(
   input: unknown, machine: string, now: number, title: string | undefined, e2eKey: Uint8Array, sentDone: boolean,
-  agent: AgentKind = "claude", startedAt?: number, turnStartedAt?: number,
+  agent: AgentKind = "claude", startedAt?: number, turnStartedAt?: number, pinnedLabel?: string,
 ): Promise<Record<string, unknown> | null> {
   if (typeof input !== "object" || input === null) return null;
   const i = input as Record<string, unknown>;
@@ -169,7 +176,7 @@ export async function buildEnvelope(
   if (plan.op === "end") return base; // clean SessionEnd carries no content — worker reuses last blob
   // turnStartedAt rides INSIDE the encrypted blob only — the clear envelope shape above must stay
   // byte-identical (no new fields the worker could see; zero server changes).
-  const blob = await encryptBlob(e2eKey, buildBlob(i, machine, title, plan, agent, turnStartedAt));
+  const blob = await encryptBlob(e2eKey, buildBlob(i, machine, title, plan, agent, turnStartedAt, pinnedLabel));
   return { ...base, blob };
 }
 
@@ -452,13 +459,20 @@ export async function runHook(agent: AgentKind): Promise<void> {
     const turnId = typeof input.turn_id === "string" && input.turn_id.length > 0 ? input.turn_id : undefined;
     const plan = planOp(hookName, input, sentDone);
     if (!plan) return;
-    const envelope = await buildEnvelope(input, machine, Date.now(), title, config.e2eKey, sentDone, agent, startedAt, turnStartedAt);
+    // Pin the label to the session's FIRST-SEEN cwd: a mid-session `cd` changes input.cwd on every
+    // later hook, and re-deriving the label per event silently renamed the phone row / island folder
+    // chip (observed live: "api-status" → "server" after a `cd server`). A session's identity must not
+    // follow its shell around, so once the record holds a label it is reused verbatim; only the first
+    // event (no record yet) derives it from cwd.
+    const label = typeof existingRecord?.label === "string" && existingRecord.label.length > 0
+      ? existingRecord.label
+      : typeof input.cwd === "string" && input.cwd.length > 0 ? basename(input.cwd) : "session";
+    const envelope = await buildEnvelope(input, machine, Date.now(), title, config.e2eKey, sentDone, agent, startedAt, turnStartedAt, label);
     if (!envelope) return;
 
     // Record (or, on op:end, remove) this session's file and make sure the liveness watchdog is
     // running before we POST — a force-killed terminal fires no SessionEnd, so this is how the phone
     // learns of a dead session in seconds instead of after the 30-min eviction.
-    const label = typeof input.cwd === "string" && input.cwd.length > 0 ? basename(input.cwd) : "session";
     // Cache the last NON-EMPTY title (this hook's, else the previous record's) so the watchdog's
     // corrective envelopes never regress to title:"" — and stamp the pairing the blob was sealed
     // under so a heartbeat after a re-pair can't re-send an undecryptable stale blob.

@@ -2,8 +2,9 @@ import { randomUUID } from "node:crypto";
 import { describe, expect, test } from "bun:test";
 import {
   adapterFor, allAdapters, claudeAdapter, codexAdapter, codexChildSessionGhost, codexDiscoverLive,
-  codexSentinelSessionId, codexTailPendingApproval, filterCodexTuis, findProvisionalForPid,
-  firstUserPrompt, parseCodexProcs, sessionTitle, TrackedSessionLite,
+  CODEX_ROLLOUT_IDLE_SILENCE_MS, codexNewestRolloutForCwd, codexPidTurnActive, codexSentinelSessionId,
+  codexTailPendingApproval, codexTurnActiveFromTail, filterCodexTuis, findProvisionalForPid,
+  firstUserPrompt, parseCodexProcs, rolloutMetaCwd, rolloutPathFromLsof, sessionTitle, TrackedSessionLite,
 } from "./adapter";
 import type { SessionRecord } from "./shared";
 
@@ -58,6 +59,11 @@ describe("discovery seam (blobAgentFields + allAdapters + discoverLive capabilit
 
   test("codex implements discoverLive (process-scan; see the dedicated discovery suite below)", () => {
     expect(typeof codexAdapter.discoverLive).toBe("function");
+  });
+
+  test("turn-state probe capability: codex implements pidTurnActive, claude omits it", () => {
+    expect(typeof codexAdapter.pidTurnActive).toBe("function");
+    expect(claudeAdapter.pidTurnActive).toBeUndefined();
   });
 });
 
@@ -157,31 +163,211 @@ describe("filterCodexTuis", () => {
 });
 
 describe("codexDiscoverLive (full pipeline with injected ps/lsof)", () => {
-  test("surfaces each new TUI as a sentinel session titled/labelled by its cwd basename", async () => {
+  test("surfaces each new TUI as a sentinel session titled/labelled by its cwd basename, with its idle verdict", async () => {
     const cwds: Record<number, string> = { 16029: "/Users/karrix/api-status/nomo", 33198: "/Users/karrix/WidgetAnimation" };
     const discovered = await codexDiscoverLive([], {
       ps: async () => PS_FIXTURE,
       cwdOf: async (pid) => cwds[pid],
+      turnActive: async (pid) => pid === 16029, // 16029 has a turn in flight; 33198 sits idle
     });
     expect(discovered).toEqual([
-      { pid: 16029, sessionId: "codex-pid-16029", title: "nomo", label: "nomo" },
-      { pid: 33198, sessionId: "codex-pid-33198", title: "WidgetAnimation", label: "WidgetAnimation" },
+      { pid: 16029, sessionId: "codex-pid-16029", title: "nomo", label: "nomo", idle: false },
+      { pid: 33198, sessionId: "codex-pid-33198", title: "WidgetAnimation", label: "WidgetAnimation", idle: true },
     ]);
   });
 
   test("excludes pids already covered by a known record (real or provisional)", async () => {
     const known: SessionRecord[] = [{ pid: 16029, machine: "m", label: "l", ts: 1 }];
-    const discovered = await codexDiscoverLive(known, { ps: async () => PS_FIXTURE, cwdOf: async () => "/tmp/proj" });
+    const discovered = await codexDiscoverLive(known, { ps: async () => PS_FIXTURE, cwdOf: async () => "/tmp/proj", turnActive: async () => false });
     expect(discovered.map((d) => d.pid)).toEqual([33198]);
   });
 
   test("an unknown cwd falls back to the 'session' label (like buildBlob)", async () => {
-    const discovered = await codexDiscoverLive([], { ps: async () => "42 ttys001  codex", cwdOf: async () => undefined });
-    expect(discovered[0]).toEqual({ pid: 42, sessionId: "codex-pid-42", title: "session", label: "session" });
+    const discovered = await codexDiscoverLive([], { ps: async () => "42 ttys001  codex", cwdOf: async () => undefined, turnActive: async () => false });
+    expect(discovered[0]).toEqual({ pid: 42, sessionId: "codex-pid-42", title: "session", label: "session", idle: true });
+  });
+
+  test("a turn-probe THROW yields idle (the bug-safe default — never a stuck-'Running' ghost)", async () => {
+    const discovered = await codexDiscoverLive([], {
+      ps: async () => "42 ttys001  codex", cwdOf: async () => "/x/proj",
+      turnActive: async () => { throw new Error("lsof boom"); },
+    });
+    expect(discovered[0]).toMatchObject({ pid: 42, idle: true });
   });
 
   test("a `ps` failure yields no discoveries (best-effort)", async () => {
     expect(await codexDiscoverLive([], { ps: async () => { throw new Error("no ps"); }, cwdOf: async () => "/x" })).toEqual([]);
+  });
+});
+
+// --- codex idle-vs-in-flight turn classification (the v0.8.4 idle-TUI fix) --------------------
+//
+// Fixture lines mirror REAL rollout shapes (the same serde forms codexLastTurnEvent's suite uses):
+// event_msg turn boundaries + response_item/token_count noise. The classifier must call an idle REPL
+// idle (task_complete/turn_aborted last, or a fresh session_meta-only rollout) and only call a TUI
+// "working" when a turn is genuinely open (task_started last, or boundary-less-but-actively-writing).
+
+const evt = (type: string): string => JSON.stringify({ timestamp: "2026-07-10T02:00:00Z", type: "event_msg", payload: { type } });
+const item = (type: string): string => JSON.stringify({ timestamp: "2026-07-10T02:00:00Z", type: "response_item", payload: { type } });
+const meta = (): string => JSON.stringify({ timestamp: "2026-07-10T02:00:00Z", type: "session_meta", payload: { id: "s" } });
+
+describe("codexTurnActiveFromTail (idle vs in-flight decision matrix)", () => {
+  test("task_started last boundary → a turn is open (working), even with trailing noise", () => {
+    expect(codexTurnActiveFromTail(evt("task_started"), 0)).toBe(true);
+    // token_count / agent_message / response_item noise AFTER the boundary must not flip the verdict.
+    const tail = [evt("task_started"), item("reasoning"), evt("token_count"), evt("agent_message")].join("\n");
+    expect(codexTurnActiveFromTail(tail, 0)).toBe(true);
+  });
+
+  test("a long-silent rollout whose last boundary is STILL task_started stays working (long tool run)", () => {
+    // Silence alone must not override an explicit open boundary — a 10-min build inside one exec is
+    // write-quiet but genuinely in flight (the same reasoning as the interrupt net's WORKING_STALE_MS).
+    expect(codexTurnActiveFromTail(evt("task_started"), CODEX_ROLLOUT_IDLE_SILENCE_MS * 10)).toBe(true);
+  });
+
+  test("task_complete / turn_aborted last boundary → idle, regardless of recency", () => {
+    for (const boundary of ["task_complete", "turn_aborted"]) {
+      const tail = [evt("task_started"), item("function_call_output"), evt(boundary), evt("token_count")].join("\n");
+      expect(codexTurnActiveFromTail(tail, 0)).toBe(false); // freshly finished → already idle
+      expect(codexTurnActiveFromTail(tail, CODEX_ROLLOUT_IDLE_SILENCE_MS * 10)).toBe(false);
+    }
+  });
+
+  test("a fresh rollout (session_meta only — no turn ever ran) → idle even when just written", () => {
+    expect(codexTurnActiveFromTail(meta(), 0)).toBe(false);
+    expect(codexTurnActiveFromTail("", 0)).toBe(false); // empty/unflushed tail → idle
+  });
+
+  test("no boundary but RECENT turn traffic → working (mid-turn; task_started scrolled past the tail)", () => {
+    const tail = [item("reasoning"), evt("agent_message"), item("function_call")].join("\n");
+    expect(codexTurnActiveFromTail(tail, CODEX_ROLLOUT_IDLE_SILENCE_MS - 1)).toBe(true);
+  });
+
+  test("no boundary and traffic gone SILENT past the threshold → idle", () => {
+    const tail = [item("reasoning"), evt("agent_message")].join("\n");
+    expect(codexTurnActiveFromTail(tail, CODEX_ROLLOUT_IDLE_SILENCE_MS)).toBe(false);
+  });
+
+  test("tolerates a byte-sliced first line (readSuffix can cut mid-JSON), like the other tail scanners", () => {
+    const sliced = `d","payload":{"type":"task_started"}}\n${evt("task_complete")}`;
+    expect(codexTurnActiveFromTail(sliced, 0)).toBe(false); // the sliced fragment is skipped, not parsed
+  });
+});
+
+describe("rolloutPathFromLsof (pin the pid's open rollout — the codex TUI holds it open)", () => {
+  // Mirrors real `lsof -a -p <pid> -Fn` output observed live (p/fcwd/f45/n field lines).
+  const LSOF_FIXTURE = [
+    "p91986",
+    "fcwd",
+    "n/Users/karrix/api-status",
+    "f45",
+    "n/Users/karrix/.codex/sessions/2026/07/10/rollout-2026-07-10T02-00-46-019f480a.jsonl",
+  ].join("\n");
+
+  test("returns the open rollout-*.jsonl path; the cwd n-line is not mistaken for it", () => {
+    expect(rolloutPathFromLsof(LSOF_FIXTURE)).toBe("/Users/karrix/.codex/sessions/2026/07/10/rollout-2026-07-10T02-00-46-019f480a.jsonl");
+  });
+
+  test("no rollout fd listed → undefined (an ordinary process, or lsof noise only)", () => {
+    expect(rolloutPathFromLsof("p123\nfcwd\nn/Users/x/proj\nf3\nn/dev/null")).toBeUndefined();
+    expect(rolloutPathFromLsof("")).toBeUndefined();
+  });
+});
+
+describe("rolloutMetaCwd (session_meta head parser for the cwd+recency fallback)", () => {
+  const metaLine = JSON.stringify({
+    timestamp: "2026-07-10T02:00:46Z", type: "session_meta",
+    payload: { id: "019f480a", cwd: "/Users/karrix/api-status", originator: "codex_cli_rs" },
+  });
+
+  test("reads payload.cwd from the head's session_meta line", () => {
+    expect(rolloutMetaCwd(metaLine)).toBe("/Users/karrix/api-status");
+    expect(rolloutMetaCwd(`${metaLine}\n${evt("task_started")}`)).toBe("/Users/karrix/api-status");
+  });
+
+  test("no parseable session_meta (empty / corrupt / other types) → undefined", () => {
+    expect(rolloutMetaCwd("")).toBeUndefined();
+    expect(rolloutMetaCwd(evt("task_complete"))).toBeUndefined();
+    expect(rolloutMetaCwd(`{"type":"session_meta","payload":{"cwd":`)).toBeUndefined(); // byte-sliced
+  });
+});
+
+describe("codexNewestRolloutForCwd (mtime-recency fallback under sessions/YYYY/MM/DD)", () => {
+  const metaFor = (cwd: string): string =>
+    `${JSON.stringify({ timestamp: "2026-07-10T02:00:00Z", type: "session_meta", payload: { id: "x", cwd } })}\n`;
+
+  test("returns the most recently WRITTEN rollout whose session_meta cwd matches; undefined when none does", async () => {
+    const { mkdtemp, mkdir, writeFile, utimes, rm } = await import("node:fs/promises");
+    const { tmpdir } = await import("node:os");
+    const { join: j } = await import("node:path");
+    const home = await mkdtemp(j(tmpdir(), "codex-home-"));
+    try {
+      const day = j(home, "sessions", "2026", "07", "10");
+      await mkdir(day, { recursive: true });
+      // Older rollout in the RIGHT cwd, newer rollout in the WRONG cwd, newest in the right cwd again —
+      // mtime recency (not filename order) must pick the newest right-cwd one.
+      const oldRight = j(day, "rollout-2026-07-10T01-00-00-aaa.jsonl");
+      const newWrong = j(day, "rollout-2026-07-10T02-00-00-bbb.jsonl");
+      const newRight = j(day, "rollout-2026-07-10T03-00-00-ccc.jsonl");
+      await writeFile(oldRight, metaFor("/x/proj"));
+      await writeFile(newWrong, metaFor("/elsewhere"));
+      await writeFile(newRight, metaFor("/x/proj"));
+      await utimes(oldRight, new Date(1000), new Date(1000));
+      await utimes(newWrong, new Date(3000), new Date(3000));
+      await utimes(newRight, new Date(2000), new Date(2000));
+      expect(await codexNewestRolloutForCwd("/x/proj", home)).toBe(newRight);
+      expect(await codexNewestRolloutForCwd("/never/seen", home)).toBeUndefined();
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  test("a missing sessions tree → undefined (best-effort)", async () => {
+    expect(await codexNewestRolloutForCwd("/x", "/nonexistent/codex-home")).toBeUndefined();
+  });
+});
+
+describe("codexPidTurnActive (probe pipeline with injected rollout/cwd/tail/mtime)", () => {
+  test("no locatable rollout (fd closed AND no cwd match) → idle (can't prove a turn is open)", async () => {
+    expect(await codexPidTurnActive(42, {
+      rolloutOf: async () => undefined, cwdOf: async () => undefined,
+    })).toBe(false);
+    expect(await codexPidTurnActive(42, {
+      rolloutOf: async () => undefined, cwdOf: async () => "/x/proj", rolloutForCwd: async () => undefined,
+    })).toBe(false);
+  });
+
+  test("classifies from the located rollout's tail + write-silence", async () => {
+    const deps = (tail: string, mtime: number) => ({
+      rolloutOf: async () => "/r/rollout-x.jsonl",
+      readTail: async () => tail,
+      mtimeOf: async () => mtime,
+      now: () => 100_000,
+    });
+    expect(await codexPidTurnActive(42, deps(evt("task_started"), 99_000))).toBe(true);
+    expect(await codexPidTurnActive(42, deps(evt("task_complete"), 99_000))).toBe(false);
+    expect(await codexPidTurnActive(42, deps(meta(), 99_000))).toBe(false); // fresh promptless TUI → idle
+  });
+
+  test("falls back to the cwd+recency locator when the fd match yields nothing (codex closes the fd while idle)", async () => {
+    const asked: string[] = [];
+    const active = await codexPidTurnActive(42, {
+      rolloutOf: async () => undefined,
+      cwdOf: async () => "/x/proj",
+      rolloutForCwd: async (cwd) => { asked.push(cwd); return "/r/rollout-y.jsonl"; },
+      readTail: async () => evt("task_started"),
+      mtimeOf: async () => 99_000,
+      now: () => 100_000,
+    });
+    expect(asked).toEqual(["/x/proj"]);
+    expect(active).toBe(true);
+  });
+
+  test("an unreadable rollout (raced deletion / zstd compaction) → idle, never a throw", async () => {
+    expect(await codexPidTurnActive(42, {
+      rolloutOf: async () => "/r/rollout-x.jsonl",
+      readTail: async () => { throw new Error("ENOENT"); },
+    })).toBe(false);
   });
 });
 

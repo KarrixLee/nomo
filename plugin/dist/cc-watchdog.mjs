@@ -2,7 +2,7 @@ import { createRequire } from "node:module";
 var __require = /* @__PURE__ */ createRequire(import.meta.url);
 
 // src/entries/cc-watchdog.ts
-import { readdir, readFile as readFile2, unlink as unlink2 } from "node:fs/promises";
+import { readdir as readdir2, readFile as readFile2, unlink as unlink2 } from "node:fs/promises";
 import { readFileSync as readFileSync2, unlinkSync } from "node:fs";
 import { hostname } from "node:os";
 import { basename as basename2 } from "node:path";
@@ -74,6 +74,7 @@ async function sha256Hex(s) {
 
 // src/core/adapter.ts
 import { execFile } from "node:child_process";
+import { readdir, stat as stat2 } from "node:fs/promises";
 import { promisify } from "node:util";
 import { basename, join as join2 } from "node:path";
 
@@ -706,6 +707,125 @@ function codexTailPendingApproval(tail) {
   }
   return false;
 }
+var CODEX_ROLLOUT_IDLE_SILENCE_MS = 30000;
+var CODEX_TURN_OPEN_EVENT = "task_started";
+function codexTurnActiveFromTail(tail, silentForMs) {
+  const last = codexLastTurnEvent(tail);
+  if (last === CODEX_TURN_OPEN_EVENT)
+    return true;
+  if (last !== null)
+    return false;
+  if (silentForMs >= CODEX_ROLLOUT_IDLE_SILENCE_MS)
+    return false;
+  return tail.includes('"response_item"') || tail.includes('"event_msg"');
+}
+var TURN_STATE_TAIL_BYTES = 8 * 1024;
+function rolloutPathFromLsof(output) {
+  for (const line of output.split(`
+`)) {
+    if (!line.startsWith("n"))
+      continue;
+    const path = line.slice(1);
+    const name = basename(path);
+    if (name.startsWith("rollout-") && name.endsWith(".jsonl"))
+      return path;
+  }
+  return;
+}
+async function rolloutViaLsof(pid) {
+  try {
+    const { stdout } = await execFileP("lsof", ["-a", "-p", String(pid), "-Fn"]);
+    return rolloutPathFromLsof(stdout);
+  } catch {
+    return;
+  }
+}
+function rolloutMetaCwd(head) {
+  for (const line of head.split(`
+`)) {
+    if (!line.includes("session_meta"))
+      continue;
+    let row;
+    try {
+      row = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (typeof row !== "object" || row === null)
+      continue;
+    const r = row;
+    if (r.type !== "session_meta")
+      continue;
+    const cwd = r.payload?.cwd;
+    if (typeof cwd === "string" && cwd.length > 0)
+      return cwd;
+  }
+  return;
+}
+var ROLLOUT_SCAN_MAX_DAYS = 10;
+var ROLLOUT_SCAN_MAX_HEADS = 40;
+var ROLLOUT_META_HEAD_BYTES = 64 * 1024;
+async function listNumericDirsDesc(path) {
+  try {
+    return (await readdir(path)).filter((n) => /^\d+$/.test(n)).sort((a, b) => b.localeCompare(a));
+  } catch {
+    return [];
+  }
+}
+async function codexNewestRolloutForCwd(cwd, home = codexHome()) {
+  const sessions = join2(home, "sessions");
+  const candidates = [];
+  let days = 0;
+  outer:
+    for (const y of await listNumericDirsDesc(sessions)) {
+      for (const m of await listNumericDirsDesc(join2(sessions, y))) {
+        for (const d of await listNumericDirsDesc(join2(sessions, y, m))) {
+          const dir = join2(sessions, y, m, d);
+          let names;
+          try {
+            names = await readdir(dir);
+          } catch {
+            continue;
+          }
+          for (const n of names) {
+            if (!n.startsWith("rollout-") || !n.endsWith(".jsonl"))
+              continue;
+            const path = join2(dir, n);
+            try {
+              candidates.push({ path, mtime: (await stat2(path)).mtimeMs });
+            } catch {}
+          }
+          if (++days >= ROLLOUT_SCAN_MAX_DAYS)
+            break outer;
+        }
+      }
+    }
+  candidates.sort((a, b) => b.mtime - a.mtime);
+  for (const c of candidates.slice(0, ROLLOUT_SCAN_MAX_HEADS)) {
+    try {
+      if (rolloutMetaCwd(await readPrefix(c.path, ROLLOUT_META_HEAD_BYTES)) === cwd)
+        return c.path;
+    } catch {}
+  }
+  return;
+}
+async function codexPidTurnActive(pid, deps = {}) {
+  try {
+    let rollout = await (deps.rolloutOf ?? rolloutViaLsof)(pid);
+    if (!rollout) {
+      const cwd = await (deps.cwdOf ?? cwdViaLsof)(pid);
+      if (cwd)
+        rollout = await (deps.rolloutForCwd ?? codexNewestRolloutForCwd)(cwd);
+    }
+    if (!rollout)
+      return false;
+    const tail = await (deps.readTail ?? readSuffix)(rollout, TURN_STATE_TAIL_BYTES);
+    const mtime = await (deps.mtimeOf ?? (async (p) => (await stat2(p)).mtimeMs))(rollout);
+    return codexTurnActiveFromTail(tail, (deps.now ?? Date.now)() - mtime);
+  } catch {
+    return false;
+  }
+}
 function codexSentinelSessionId(pid) {
   return `codex-pid-${pid}`;
 }
@@ -767,6 +887,7 @@ async function cwdViaLsof(pid) {
 async function codexDiscoverLive(known, deps = {}) {
   const ps = deps.ps ?? runPs;
   const cwdOf = deps.cwdOf ?? cwdViaLsof;
+  const turnActive = deps.turnActive ?? codexPidTurnActive;
   let output;
   try {
     output = await ps();
@@ -778,7 +899,11 @@ async function codexDiscoverLive(known, deps = {}) {
   const out = [];
   for (const { pid } of tuis) {
     const label = labelFromCwd(await cwdOf(pid));
-    out.push({ pid, sessionId: codexSentinelSessionId(pid), title: label, label });
+    let active = false;
+    try {
+      active = await turnActive(pid);
+    } catch {}
+    out.push({ pid, sessionId: codexSentinelSessionId(pid), title: label, label, idle: !active });
   }
   return out;
 }
@@ -844,7 +969,8 @@ var codexAdapter = {
   hooksNotFiringHint: "  Run /hooks in Codex to re-trust, or reinstall the plugin — known upstream bugs #16430/#30835.",
   toolDetail: codexToolDetail,
   blobAgentFields: { agent: "codex" },
-  discoverLive: (known) => codexDiscoverLive(known)
+  discoverLive: (known) => codexDiscoverLive(known),
+  pidTurnActive: (pid) => codexPidTurnActive(pid)
 };
 function adapterFor(agent) {
   return agent === "codex" ? codexAdapter : claudeAdapter;
@@ -928,7 +1054,7 @@ function machineName(config) {
 }
 async function readAllRecordEntries() {
   try {
-    const files = await readdir(SESSIONS_DIR);
+    const files = await readdir2(SESSIONS_DIR);
     const out = [];
     for (const f of files) {
       if (!f.endsWith(".json"))
@@ -946,22 +1072,27 @@ async function readAllRecords() {
   return (await readAllRecordEntries()).map((e) => e.rec);
 }
 async function buildProvisionalBlob(d, machine, blobAgentFields, e2eKey) {
-  return encryptBlob(e2eKey, { status: "working", title: d.title ?? "", machine, label: d.label, ...blobAgentFields });
+  return encryptBlob(e2eKey, { status: d.idle === true ? "done" : "working", title: d.title ?? "", machine, label: d.label, ...blobAgentFields });
+}
+function buildProvisionalEnvelope(sessionId, blob, now, idle) {
+  return { v: 2, sessionId, op: idle ? "done" : "start", prio: 0, ts: now, blob };
 }
 function buildStartEnvelope(sessionId, blob, now) {
-  return { v: 2, sessionId, op: "start", prio: 0, ts: now, blob };
+  return buildProvisionalEnvelope(sessionId, blob, now, false);
 }
-function buildProvisionalRecord(d, machine, blob, blobAgentFields, now, pairingId) {
+function buildProvisionalRecord(d, machine, blob, blobAgentFields, now, pairingId, idle = false) {
   return {
     pid: d.pid,
     machine,
     label: d.label,
     ts: now,
-    lastEvent: "sessionStart",
-    op: "start",
+    lastEvent: idle ? "done" : "sessionStart",
+    op: idle ? "done" : "start",
+    ...idle ? { sentDone: true } : {},
     prio: 0,
     blob,
     provisional: true,
+    ...typeof d.title === "string" && d.title.length > 0 ? { title: d.title } : {},
     ...blobAgentFields,
     ...typeof pairingId === "string" && pairingId.length > 0 ? { pairingId } : {}
   };
@@ -985,11 +1116,12 @@ async function discoverLiveSessions(config, deps = {}) {
     }
     for (const d of discovered) {
       const ts = now();
+      const idle = d.idle === true;
       const blob = await buildProvisionalBlob(d, machine, adapter.blobAgentFields, config.e2eKey);
-      const outcome = await post(buildStartEnvelope(d.sessionId, blob, ts));
+      const outcome = await post(buildProvisionalEnvelope(d.sessionId, blob, ts, idle));
       if (outcome !== "delivered")
         continue;
-      await writeRecord(d.sessionId, buildProvisionalRecord(d, machine, blob, adapter.blobAgentFields, ts, config.pairingId));
+      await writeRecord(d.sessionId, buildProvisionalRecord(d, machine, blob, adapter.blobAgentFields, ts, config.pairingId, idle));
     }
   }
 }
@@ -1090,6 +1222,43 @@ async function correctPendingApproval(config, path, sessionId, record, now) {
     return "uncorrected";
   }
 }
+function shouldIdleProvisionalCheck(record, adapter) {
+  if (!adapter.pidTurnActive)
+    return false;
+  if (record.provisional !== true)
+    return false;
+  if (record.op === "done" || record.lastEvent === "done")
+    return false;
+  if (typeof record.pid !== "number" || !Number.isFinite(record.pid))
+    return false;
+  return true;
+}
+async function correctIdleProvisional(config, path, sessionId, record) {
+  try {
+    const agent = record.agent === "codex" ? "codex" : "claude";
+    const adapter = adapterFor(agent);
+    if (!shouldIdleProvisionalCheck(record, adapter))
+      return "uncorrected";
+    let active = false;
+    try {
+      active = await adapter.pidTurnActive(record.pid);
+    } catch {}
+    if (active)
+      return "uncorrected";
+    const outcome = await postEvent(config, await buildDoneEnvelope(sessionId, record, Date.now(), config.e2eKey, agent));
+    if (outcome === "revoked")
+      return "revoked";
+    if (outcome !== "delivered")
+      return "uncorrected";
+    try {
+      const next = { ...record, lastEvent: "done", sentDone: true, op: "done" };
+      await atomicWrite(path, JSON.stringify(next), 384);
+    } catch {}
+    return "corrected";
+  } catch {
+    return "uncorrected";
+  }
+}
 function shouldHeartbeat(record, now, lastHeartbeat, correctedThisSweep) {
   if (record.op === "done")
     return false;
@@ -1106,7 +1275,7 @@ function shouldHeartbeat(record, now, lastHeartbeat, correctedThisSweep) {
 async function sweep(config) {
   let files;
   try {
-    files = await readdir(SESSIONS_DIR);
+    files = await readdir2(SESSIONS_DIR);
   } catch {
     return { revoked: false, remaining: 0, delivered: false };
   }
@@ -1128,6 +1297,11 @@ async function sweep(config) {
     if (verdict === "keep") {
       remaining++;
       if (config && record) {
+        const idleFix = await correctIdleProvisional(config, path, sessionId, record);
+        if (idleFix === "revoked")
+          return { revoked: true };
+        if (idleFix === "corrected")
+          delivered = true;
         const corrected = await correctInterrupt(config, path, sessionId, record, now);
         if (corrected === "revoked")
           return { revoked: true };
@@ -1143,7 +1317,7 @@ async function sweep(config) {
             flaggedAttention = true;
           }
         }
-        if (shouldHeartbeat(record, now, heartbeatAt.get(sessionId), corrected === "corrected" || flaggedAttention)) {
+        if (shouldHeartbeat(record, now, heartbeatAt.get(sessionId), idleFix === "corrected" || corrected === "corrected" || flaggedAttention)) {
           const beat = buildHeartbeatEnvelope(sessionId, record, Date.now(), config.pairingId);
           if (beat) {
             const outcome = await postEvent(config, beat);
@@ -1284,6 +1458,7 @@ export {
   tailShowsInterrupt,
   shouldPendingApprovalCheck,
   shouldInterruptCheck,
+  shouldIdleProvisionalCheck,
   shouldHeartbeat,
   reconcileProvisionalsSweep,
   provisionalsCoveredByReal,
@@ -1298,6 +1473,7 @@ export {
   classifySession,
   buildStartEnvelope,
   buildProvisionalRecord,
+  buildProvisionalEnvelope,
   buildProvisionalBlob,
   buildNeedsAttentionEnvelope,
   buildHeartbeatEnvelope,

@@ -10,7 +10,7 @@
       "name": "nomo-cc",
       "source": "./plugin",
       "description": "Mirror Claude Code and OpenAI Codex session status to the Nomo iPhone app as a Live Activity. One QR pairing covers both agents; end-to-end encrypted.",
-      "version": "0.8.3",
+      "version": "0.8.4",
       "author": {
         "name": "Nomo"
       }

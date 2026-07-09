@@ -13,9 +13,10 @@
 // PORTABILITY: bun AND node >= 18 — no `Bun.*` APIs; file IO via node:fs/promises (shared helpers).
 
 import { execFile } from "node:child_process";
+import { readdir, stat } from "node:fs/promises";
 import { promisify } from "node:util";
 import { basename, join } from "node:path";
-import { AgentKind, codexHome, lastHookPath, readSuffix, SessionRecord } from "./shared";
+import { AgentKind, codexHome, lastHookPath, readPrefix, readSuffix, SessionRecord } from "./shared";
 
 const execFileP = promisify(execFile);
 
@@ -409,6 +410,177 @@ export function codexTailPendingApproval(tail: string): boolean {
   return false; // no approval request in the tail → nothing pending
 }
 
+// --- Codex idle-vs-in-flight turn classification (for discovery/provisional rows) -------------
+//
+// The watchdog's discovery step used to advertise EVERY live Codex TUI as status "working" — but an
+// idle REPL sitting at its prompt is NOT "Running", and with no hook ever firing for it the phone
+// showed a perpetual working row (user-confirmed live repro 2026-07-10: an idle TUI open since 2 AM
+// stuck "Running" all night). The classifier below decides, from the pid's own rollout tail, whether
+// a turn is GENUINELY open:
+//   - the last turn-lifecycle boundary (codexLastTurnEvent) is task_started → a turn is open;
+//   - it is task_complete / turn_aborted → the turn ended → idle;
+//   - NO boundary in the tail (a fresh rollout that's only session_meta, or a long turn whose
+//     task_started scrolled past the tail window): idle unless the tail shows turn traffic
+//     (response_item / event_msg lines) AND the file was written recently — a mid-flight turn keeps
+//     appending, so recent traffic with an unknown boundary is conservatively "open", while a silent
+//     or traffic-less rollout is idle.
+// Defaults are deliberately IDLE-biased: misreading an active turn as idle self-corrects in seconds
+// (its next real hook posts "working" under the real session id), whereas misreading idle as working
+// sticks forever (no hook will ever correct a promptless TUI) — the very bug this fixes.
+
+/** How long a rollout with NO turn boundary in its tail must be write-silent before the TUI is
+ *  classified idle. Short: a genuinely open turn appends response/event lines far more often than
+ *  this, and the watchdog re-checks every sweep (5 s) anyway. */
+export const CODEX_ROLLOUT_IDLE_SILENCE_MS = 30_000;
+
+/** The codex turn-OPEN boundary (payload.type of EventMsg::TurnStarted, serde-renamed). */
+const CODEX_TURN_OPEN_EVENT = "task_started";
+
+/** Whether the rollout tail shows a turn GENUINELY in flight. `silentForMs` is how long ago the
+ *  rollout was last written (now − mtime) — consulted only when the tail carries no turn boundary.
+ *  Pure so the whole decision matrix is unit-testable; see the section note for the rules. */
+export function codexTurnActiveFromTail(tail: string, silentForMs: number): boolean {
+  const last = codexLastTurnEvent(tail);
+  if (last === CODEX_TURN_OPEN_EVENT) return true; // a turn is open (trailing token_count/… is noise)
+  if (last !== null) return false; // task_complete / turn_aborted → the turn ended → idle
+  // No boundary in the tail. A fresh rollout (session_meta only — no turn ever ran) is idle no matter
+  // how recently it was created; a boundary-less tail WITH turn traffic is only "open" while the file
+  // is still being written (a mid-turn rollout appends continuously).
+  if (silentForMs >= CODEX_ROLLOUT_IDLE_SILENCE_MS) return false;
+  return tail.includes("\"response_item\"") || tail.includes("\"event_msg\"");
+}
+
+/** How much of the rollout tail the turn-state probe reads — same bound as the watchdog's interrupt/
+ *  pending-approval nets (the turn boundary rides the last few KB). */
+const TURN_STATE_TAIL_BYTES = 8 * 1024;
+
+/** Pure: the open rollout path from `lsof -p <pid> -Fn` output (an `n<path>` line whose basename is a
+ *  `rollout-*.jsonl`). When present this pins the pid's EXACT rollout — but the TUI only holds the fd
+ *  open around writes (observed live: an idle TUI showed `45w …/rollout-….jsonl` one minute and no
+ *  rollout fd the next), so absence proves nothing; the cwd+recency fallback below covers the closed
+ *  case. Undefined when no rollout fd is listed. */
+export function rolloutPathFromLsof(output: string): string | undefined {
+  for (const line of output.split("\n")) {
+    if (!line.startsWith("n")) continue;
+    const path = line.slice(1);
+    const name = basename(path);
+    if (name.startsWith("rollout-") && name.endsWith(".jsonl")) return path;
+  }
+  return undefined;
+}
+
+/** The rollout file `pid` holds open, via `lsof -p <pid> -Fn`. Undefined on any failure. */
+async function rolloutViaLsof(pid: number): Promise<string | undefined> {
+  try {
+    const { stdout } = await execFileP("lsof", ["-a", "-p", String(pid), "-Fn"]);
+    return rolloutPathFromLsof(stdout);
+  } catch {
+    return undefined;
+  }
+}
+
+/** Pure: the session_meta `payload.cwd` from a rollout HEAD (its first line — verified live:
+ *  `{"timestamp":…,"type":"session_meta","payload":{…,"cwd":"/Users/…",…}}`). Undefined when the head
+ *  carries no parseable session_meta (byte-sliced/corrupt lines are skipped, like every tail scanner). */
+export function rolloutMetaCwd(head: string): string | undefined {
+  for (const line of head.split("\n")) {
+    if (!line.includes("session_meta")) continue; // cheap pre-filter
+    let row: unknown;
+    try { row = JSON.parse(line); } catch { continue; }
+    if (typeof row !== "object" || row === null) continue;
+    const r = row as Record<string, unknown>;
+    if (r.type !== "session_meta") continue;
+    const cwd = (r.payload as Record<string, unknown> | undefined)?.cwd;
+    if (typeof cwd === "string" && cwd.length > 0) return cwd;
+  }
+  return undefined;
+}
+
+/** Bounds for the cwd+recency fallback scan: only the most recent day-directories are visited and at
+ *  most this many rollout heads are read, so a months-deep sessions tree costs a handful of small,
+ *  bounded reads per probe. A TUI idle longer than the day window classifies idle anyway (the default). */
+const ROLLOUT_SCAN_MAX_DAYS = 10;
+const ROLLOUT_SCAN_MAX_HEADS = 40;
+/** How much of a candidate rollout's head the cwd matcher reads. session_meta is the FIRST line, but
+ *  it embeds the session's whole base_instructions — measured up to ~41 KB on live 0.144 rollouts — so
+ *  a small head read truncates the line and the parse fails. 64 KB covers it with headroom while
+ *  staying a bounded, one-shot read (half of TITLE_SCAN_BYTES). */
+const ROLLOUT_META_HEAD_BYTES = 64 * 1024;
+
+/** Numeric child directories of `path`, newest-first (the sessions tree is `YYYY/MM/DD`). */
+async function listNumericDirsDesc(path: string): Promise<string[]> {
+  try {
+    return (await readdir(path)).filter((n) => /^\d+$/.test(n)).sort((a, b) => b.localeCompare(a));
+  } catch {
+    return [];
+  }
+}
+
+/** FALLBACK rollout locator: the most recently WRITTEN rollout under `$CODEX_HOME/sessions/YYYY/MM/DD`
+ *  whose session_meta cwd matches the TUI's cwd. Recency is mtime (not the filename's start stamp), so
+ *  a resumed/stolen session that's still being appended to — e.g. a ChatGPT-desktop resume of the TUI's
+ *  thread — outranks a long-dead sibling in the same cwd. Bounded (see the scan caps); best-effort:
+ *  any fs failure just yields undefined → the probe classifies idle. */
+export async function codexNewestRolloutForCwd(cwd: string, home: string = codexHome()): Promise<string | undefined> {
+  const sessions = join(home, "sessions");
+  const candidates: { path: string; mtime: number }[] = [];
+  let days = 0;
+  outer:
+  for (const y of await listNumericDirsDesc(sessions)) {
+    for (const m of await listNumericDirsDesc(join(sessions, y))) {
+      for (const d of await listNumericDirsDesc(join(sessions, y, m))) {
+        const dir = join(sessions, y, m, d);
+        let names: string[];
+        try { names = await readdir(dir); } catch { continue; }
+        for (const n of names) {
+          if (!n.startsWith("rollout-") || !n.endsWith(".jsonl")) continue;
+          const path = join(dir, n);
+          try { candidates.push({ path, mtime: (await stat(path)).mtimeMs }); } catch { /* raced away */ }
+        }
+        if (++days >= ROLLOUT_SCAN_MAX_DAYS) break outer;
+      }
+    }
+  }
+  candidates.sort((a, b) => b.mtime - a.mtime);
+  for (const c of candidates.slice(0, ROLLOUT_SCAN_MAX_HEADS)) {
+    try {
+      if (rolloutMetaCwd(await readPrefix(c.path, ROLLOUT_META_HEAD_BYTES)) === cwd) return c.path;
+    } catch { /* unreadable → skip */ }
+  }
+  return undefined;
+}
+
+/** Injectable seams for the pid turn-state probe, so it's testable without real lsof/fs. */
+export interface CodexTurnProbeDeps {
+  rolloutOf?: (pid: number) => Promise<string | undefined>;
+  cwdOf?: (pid: number) => Promise<string | undefined>;
+  rolloutForCwd?: (cwd: string) => Promise<string | undefined>;
+  readTail?: (path: string, maxBytes: number) => Promise<string>;
+  mtimeOf?: (path: string) => Promise<number>;
+  now?: () => number;
+}
+
+/** Whether the codex TUI `pid` has a turn genuinely in flight. The rollout is located by the open-fd
+ *  match first (exact, but the fd is only held around writes), else by cwd+recency (see
+ *  codexNewestRolloutForCwd), then its tail is classified. No locatable/readable rollout → false
+ *  (idle): we cannot PROVE a turn is open, and the idle-biased default is the safe one (see the
+ *  section note). Never throws across its boundary. */
+export async function codexPidTurnActive(pid: number, deps: CodexTurnProbeDeps = {}): Promise<boolean> {
+  try {
+    let rollout = await (deps.rolloutOf ?? rolloutViaLsof)(pid);
+    if (!rollout) {
+      const cwd = await (deps.cwdOf ?? cwdViaLsof)(pid);
+      if (cwd) rollout = await (deps.rolloutForCwd ?? codexNewestRolloutForCwd)(cwd);
+    }
+    if (!rollout) return false;
+    const tail = await (deps.readTail ?? readSuffix)(rollout, TURN_STATE_TAIL_BYTES);
+    const mtime = await (deps.mtimeOf ?? (async (p: string) => (await stat(p)).mtimeMs))(rollout);
+    return codexTurnActiveFromTail(tail, (deps.now ?? Date.now)() - mtime);
+  } catch {
+    return false; // unreadable rollout / raced deletion → can't prove a turn is open → idle
+  }
+}
+
 // --- Live session discovery (the seam that closes the Codex "late session" gap) --------------
 //
 // Codex fires NO hook at session OPEN — its SessionStart fires only at the FIRST prompt
@@ -430,6 +602,10 @@ export interface DiscoveredSession {
   title?: string;
   /** cwd-basename label, exactly like buildBlob's `label`. */
   label: string;
+  /** True when the TUI has NO turn in flight (an idle REPL at its prompt — see codexTurnActiveFromTail).
+   *  The watchdog then advertises the provisional as done/idle instead of "working", so an idle TUI can
+   *  never sit "Running" on the phone forever. Absent/false → a turn is open → working. */
+  idle?: boolean;
 }
 
 // --- Codex live-process discovery ------------------------------------------------------------
@@ -519,14 +695,19 @@ async function cwdViaLsof(pid: number): Promise<string | undefined> {
 export interface CodexDiscoverDeps {
   ps?: () => Promise<string>;
   cwdOf?: (pid: number) => Promise<string | undefined>;
+  /** Turn-state probe (see codexPidTurnActive) — decides each discovery's `idle` flag. */
+  turnActive?: (pid: number) => Promise<boolean>;
 }
 
 /** REMOVABLE (see above). Discover interactive Codex TUIs the hooks can't see yet (openai/codex#15269).
  *  Scans `ps`, filters to real terminal `codex` sessions not already tracked, and resolves each cwd to
- *  a sentinel provisional session. Best-effort: a `ps` failure yields no discoveries. */
+ *  a sentinel provisional session. Each discovery carries an `idle` verdict from the pid's rollout tail
+ *  (codexPidTurnActive) so the watchdog advertises an idle REPL as done, not "working". Best-effort: a
+ *  `ps` failure yields no discoveries; a turn-probe failure yields idle (the bug-safe default). */
 export async function codexDiscoverLive(known: SessionRecord[], deps: CodexDiscoverDeps = {}): Promise<DiscoveredSession[]> {
   const ps = deps.ps ?? runPs;
   const cwdOf = deps.cwdOf ?? cwdViaLsof;
+  const turnActive = deps.turnActive ?? codexPidTurnActive;
   let output: string;
   try {
     output = await ps();
@@ -538,8 +719,13 @@ export async function codexDiscoverLive(known: SessionRecord[], deps: CodexDisco
   const out: DiscoveredSession[] = [];
   for (const { pid } of tuis) {
     const label = labelFromCwd(await cwdOf(pid));
+    // Idle unless a turn is PROVABLY open — a probe failure must never resurrect the stuck-"Running"
+    // ghost this flag exists to kill (misread-active self-corrects via the next real hook; misread-idle
+    // never would).
+    let active = false;
+    try { active = await turnActive(pid); } catch { /* idle-biased default */ }
     // title == label (cwd basename): a freshly-opened TUI has no prompt yet, so the cwd names it.
-    out.push({ pid, sessionId: codexSentinelSessionId(pid), title: label, label });
+    out.push({ pid, sessionId: codexSentinelSessionId(pid), title: label, label, idle: !active });
   }
   return out;
 }
@@ -648,6 +834,11 @@ export interface AgentAdapter {
    *  sessions to surface immediately; the watchdog POSTs an op:start + writes a provisional record for
    *  each, and the hook (or a sweep backstop) reconciles them away once the real hook fires. */
   discoverLive?(known: SessionRecord[]): Promise<DiscoveredSession[]>;
+  /** OPTIONAL: whether the given live TUI pid has a turn genuinely in flight (see codexPidTurnActive).
+   *  Claude OMITS it (no discovery → no provisional rows to keep honest); Codex implements it so the
+   *  watchdog can (a) flag an idle discovery as done instead of "working" and (b) correct an existing
+   *  provisional "working" row to done once its TUI goes idle. Must never throw. */
+  pidTurnActive?(pid: number): Promise<boolean>;
 }
 
 export const claudeAdapter: AgentAdapter = {
@@ -715,6 +906,9 @@ export const codexAdapter: AgentAdapter = {
   // Codex fires no hook at session open (openai/codex#15269), so the watchdog process-scans for live
   // Codex TUIs and surfaces them provisionally. REMOVABLE once that issue ships (see codexDiscoverLive).
   discoverLive: (known: SessionRecord[]): Promise<DiscoveredSession[]> => codexDiscoverLive(known),
+  // The turn-state probe behind the idle-TUI fix: discovery flags idle REPLs, and the watchdog's
+  // idle-provisional corrective flips a stale "working" provisional to done. REMOVABLE with discovery.
+  pidTurnActive: (pid: number): Promise<boolean> => codexPidTurnActive(pid),
 };
 
 /** Select the concrete adapter for an agent kind. */

@@ -294,6 +294,35 @@ describe("buildBlob (plaintext content of the encrypted blob)", () => {
   });
 });
 
+describe("label pinning (first-seen cwd wins — a mid-session `cd` must not rename the session)", () => {
+  const plan = planOp("PreToolUse", { session_id: "s" }, false)!;
+
+  test("the label stays the FIRST-SEEN one across a cwd-changing event sequence", () => {
+    // Event 1: no record yet → the label derives from cwd, exactly as before.
+    const first = buildBlob({ session_id: "s", cwd: "/Users/x/api-status", hook_event_name: "PreToolUse", tool_name: "Edit" }, "Mac", "t", plan);
+    expect(first.label).toBe("api-status");
+    // The session's shell then `cd server`s: later hooks carry the NEW cwd, but the record's cached
+    // label (what runHook threads as pinnedLabel) must win — the observed "api-status" → "server"
+    // silent rename is exactly what this pin prevents.
+    const second = buildBlob({ session_id: "s", cwd: "/Users/x/api-status/server", hook_event_name: "PreToolUse", tool_name: "Edit" }, "Mac", "t", plan, "claude", undefined, first.label);
+    expect(second.label).toBe("api-status");
+    const third = buildBlob({ session_id: "s", cwd: "/somewhere/else", hook_event_name: "Stop" }, "Mac", "t", planOp("Stop", {}, false)!, "claude", undefined, second.label);
+    expect(third.label).toBe("api-status");
+  });
+
+  test("an empty pinnedLabel falls back to the cwd derivation (a corrupt record can't blank the label)", () => {
+    expect(buildBlob({ session_id: "s", cwd: "/x/proj", hook_event_name: "PreToolUse", tool_name: "Edit" }, "Mac", "t", plan, "claude", undefined, "").label).toBe("proj");
+  });
+
+  test("buildEnvelope threads the pinned label into the encrypted blob", async () => {
+    const env = (await buildEnvelope(
+      { session_id: "abc", hook_event_name: "PreToolUse", tool_name: "Edit", cwd: "/Users/x/api-status/server" },
+      "Mac", 5, "t", KEY, false, "claude", undefined, undefined, "api-status",
+    ))!;
+    expect(await decryptBlob(KEY, (env as { blob: string }).blob)).toMatchObject({ label: "api-status" });
+  });
+});
+
 describe("buildEnvelope (v2 envelope + encrypted blob)", () => {
   const input = { session_id: "abc", hook_event_name: "PreToolUse", tool_name: "Edit", cwd: "/Users/karrix/api-status" };
 
@@ -1369,6 +1398,58 @@ describe("runHook startedAt precedence (cached record start wins over the transc
 
   test("with no cached start, it falls back to the transcript head's first timestamp", async () => {
     expect(await runWithStart({})).toBe(transcriptHeadTs);
+  }, 20000);
+});
+
+// --- runHook label pinning (first-seen cwd wins over the event's live cwd) --------------------
+//
+// hook.ts resolves `label = existingRecord.label ?? basename(input.cwd)`: once a session record holds
+// a label, every later hook reuses it verbatim — a mid-session `cd` must not silently rename the phone
+// row / island folder chip (observed live: "api-status" → "server"). This spawns the REAL claude entry
+// and reads back the record the run rewrote, the same faithful harness as the startedAt suite above.
+describe("runHook label pinning (a mid-session cd must not rename the session)", () => {
+  const rawKey = new Uint8Array(32).fill(9);
+  const entry = join(import.meta.dir, "cc-status.ts");
+
+  async function runWithCwd(opts: { seededLabel?: string; cwd: string }): Promise<string | undefined> {
+    const home = await mkdtemp(join(tmpdir(), "cc-hook-label-"));
+    try {
+      const ccDir = join(home, ".config", "cc-status");
+      await mkdir(join(ccDir, "sessions"), { recursive: true });
+      await writeFile(join(ccDir, "config.json"), JSON.stringify({
+        url: "http://127.0.0.1:9", pairingId: "p", pcSecret: "s", e2eKeyB64: b64url(rawKey),
+      }));
+      await writeFile(join(ccDir, "watchdog.pid"), String(process.pid)); // pre-seeded live → no detached spawn
+      const sid = "label-pinning";
+      // Optionally pre-seed a record carrying the FIRST-SEEN label, as the session's first hook would have.
+      if (opts.seededLabel !== undefined) {
+        await writeFile(join(ccDir, "sessions", `${sid}.json`), JSON.stringify({
+          pid: process.ppid, machine: "m", label: opts.seededLabel, ts: Date.now(),
+        }));
+      }
+      const proc = Bun.spawn({
+        cmd: ["bun", entry],
+        env: { ...process.env, HOME: home },
+        stdin: Buffer.from(JSON.stringify({
+          session_id: sid, hook_event_name: "PreToolUse", tool_name: "Edit",
+          cwd: opts.cwd, transcript_path: "",
+        })),
+        stdout: "ignore",
+        stderr: "ignore",
+      });
+      await proc.exited;
+      return (JSON.parse(await readFile(join(ccDir, "sessions", `${sid}.json`), "utf8")) as { label?: string }).label;
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  }
+
+  test("a record's existing label WINS over a later event's changed cwd (the `cd server` repro)", async () => {
+    expect(await runWithCwd({ seededLabel: "api-status", cwd: "/Users/x/api-status/server" })).toBe("api-status");
+  }, 20000);
+
+  test("with no record yet, the first event stamps the label from its cwd (unchanged first-event behavior)", async () => {
+    expect(await runWithCwd({ cwd: "/Users/x/api-status/server" })).toBe("server");
   }, 20000);
 });
 

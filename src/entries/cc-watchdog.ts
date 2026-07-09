@@ -15,8 +15,10 @@
 //   2. DISCOVER — Codex fires NO hook at session OPEN (its SessionStart fires only at the FIRST prompt,
 //      openai/codex#15269), so a freshly-opened Codex TUI is invisible to the phone for 30 s+. Each
 //      sweep asks every adapter to discover live sessions the hooks can't see yet
-//      (adapter.discoverLive) and POSTs a PROVISIONAL op:start for each, reconciled away once the real
-//      hook fires. Claude implements no discovery (its SessionStart fires at true open).
+//      (adapter.discoverLive) and POSTs a PROVISIONAL row for each — op:start/"working" only when a
+//      turn is genuinely in flight, op:done/"done" for an idle REPL at its prompt (the v0.8.4 idle-TUI
+//      fix; a hook-less working row would otherwise show "Running" forever) — reconciled away once the
+//      real hook fires. Claude implements no discovery (its SessionStart fires at true open).
 //
 // All corrective/discovery POSTs use the SAME v2 blind envelope + per-pairing headers as the hook.
 //
@@ -220,9 +222,10 @@ async function postEvent(config: Config, body: object): Promise<PostOutcome> {
 //
 // Codex fires no hook at session OPEN (openai/codex#15269), so the daemon asks every adapter to
 // discover live TUIs the hooks can't see yet (adapter.discoverLive; Claude implements none) and POSTs
-// a PROVISIONAL op:start for each — mirroring the blob a real SessionStart would send — plus a
+// a PROVISIONAL row for each — an op:start mirroring the blob a real SessionStart would send when a
+// turn is in flight, an op:done "idle" row otherwise (see buildProvisionalBlob/Envelope) — plus a
 // provisional session record so the reap/reconcile machinery can retire it. Claude's discoverLive is
-// absent, so this whole step no-ops for Claude; Codex's is a stub until the feature commit.
+// absent, so this whole step no-ops for Claude.
 
 /** The friendly machine name for a POST (config override, else the OS hostname), matching the hook. */
 function machineName(config: Config): string {
@@ -254,38 +257,54 @@ async function readAllRecords(): Promise<SessionRecord[]> {
 }
 
 /** The provisional blob for a discovered session — byte-shaped exactly like buildBlob's output for a
- *  SessionStart (status "working", title/machine/label, the adapter's `agent` field; no detail, no
- *  turnStartedAt because a freshly-opened TUI has neither a tool nor a prompt yet). */
+ *  SessionStart (title/machine/label, the adapter's `agent` field; no detail, no turnStartedAt because
+ *  a freshly-opened TUI has neither a tool nor a prompt yet). status mirrors the TUI's REAL turn state:
+ *  "working" only when a turn is genuinely open, "done" for an idle REPL sitting at its prompt — an
+ *  idle TUI advertised as working stuck "Running" on the phone forever (the v0.8.4 idle-TUI fix; see
+ *  codexTurnActiveFromTail in adapter.ts). */
 export async function buildProvisionalBlob(
   d: DiscoveredSession, machine: string, blobAgentFields: { agent?: AgentKind }, e2eKey: Uint8Array,
 ): Promise<string> {
-  return encryptBlob(e2eKey, { status: "working", title: d.title ?? "", machine, label: d.label, ...blobAgentFields });
+  return encryptBlob(e2eKey, { status: d.idle === true ? "done" : "working", title: d.title ?? "", machine, label: d.label, ...blobAgentFields });
 }
 
-/** The provisional op:start envelope — the same v2 shape the hook POSTs for a real SessionStart. */
+/** The provisional envelope. An in-flight TUI mirrors a real SessionStart (op:start); an IDLE one is
+ *  advertised as an already-finished row (op:done — the same op/prio a real Stop posts, so the worker's
+ *  done-is-terminal semantics apply and the row never re-arms the island). Both carry the blob. */
+export function buildProvisionalEnvelope(sessionId: string, blob: string, now: number, idle: boolean): object {
+  return { v: 2, sessionId, op: idle ? "done" : "start", prio: 0, ts: now, blob };
+}
+
+/** The provisional op:start envelope — the same v2 shape the hook POSTs for a real SessionStart.
+ *  (The in-flight arm of buildProvisionalEnvelope; kept for existing callers/tests.) */
 export function buildStartEnvelope(sessionId: string, blob: string, now: number): object {
-  return { v: 2, sessionId, op: "start", prio: 0, ts: now, blob };
+  return buildProvisionalEnvelope(sessionId, blob, now, false);
 }
 
 /** The provisional session record the discovery step persists (0600) so the daemon can reap it on pid
  *  death and the hook (or the sweep backstop) can reconcile it away. `provisional:true` is what marks
  *  it; `pid` is the discovered TUI process; agent rides via the adapter's blobAgentFields (omitted for
- *  claude), keeping this free of an inline `agent === …` branch. lastEvent/op mirror trackSession's
- *  fresh-start bookkeeping so a heartbeat/reap treats it like any other start. */
+ *  claude), keeping this free of an inline `agent === …` branch. For an in-flight TUI, lastEvent/op
+ *  mirror trackSession's fresh-start bookkeeping so a heartbeat/reap treats it like any other start;
+ *  for an IDLE one they mirror a posted done (op:"done" + sentDone) so the interrupt/heartbeat/idle
+ *  nets all treat it as finished — exactly what was advertised. The discovery title (cwd basename) is
+ *  cached like trackSession's, so a later corrective done never regresses to title:"" (v0.8.3 rule). */
 export function buildProvisionalRecord(
   d: DiscoveredSession, machine: string, blob: string, blobAgentFields: { agent?: AgentKind }, now: number,
-  pairingId?: string,
+  pairingId?: string, idle = false,
 ): SessionRecord {
   return {
     pid: d.pid,
     machine,
     label: d.label,
     ts: now,
-    lastEvent: "sessionStart",
-    op: "start",
+    lastEvent: idle ? "done" : "sessionStart",
+    op: idle ? "done" : "start",
+    ...(idle ? { sentDone: true } : {}),
     prio: 0,
     blob,
     provisional: true,
+    ...(typeof d.title === "string" && d.title.length > 0 ? { title: d.title } : {}),
     ...blobAgentFields,
     // Stamp the pairing this blob was sealed under so the heartbeat's key-rotation guard can prove
     // the blob is still decryptable (see buildHeartbeatEnvelope). Omitted only when unknown.
@@ -303,10 +322,12 @@ export interface DiscoverDeps {
 }
 
 /** One discovery pass: for every adapter that implements discoverLive, surface the live TUIs the hooks
- *  can't see yet as PROVISIONAL sessions. Each new one is POSTed as an op:start; only on a delivered
- *  POST do we persist the provisional record (so a failed POST simply retries next sweep — the pid is
- *  still not "known"). Best-effort throughout: a discoverLive throw or a POST failure never derails the
- *  sweep. No-ops entirely when no adapter implements discoverLive (Claude) or none is found (Codex idle). */
+ *  can't see yet as PROVISIONAL sessions. Each new one is POSTed per its turn state — op:start
+ *  ("working") for an in-flight turn, op:done ("done") for an idle REPL (see buildProvisionalEnvelope);
+ *  only on a delivered POST do we persist the provisional record (so a failed POST simply retries next
+ *  sweep — the pid is still not "known"). Best-effort throughout: a discoverLive throw or a POST failure
+ *  never derails the sweep. No-ops entirely when no adapter implements discoverLive (Claude) or no TUI
+ *  is found. */
 export async function discoverLiveSessions(config: Config, deps: DiscoverDeps = {}): Promise<void> {
   const adapters = deps.adapters ?? allAdapters;
   const post = deps.post ?? ((body: object) => postEvent(config, body));
@@ -326,10 +347,11 @@ export async function discoverLiveSessions(config: Config, deps: DiscoverDeps = 
     }
     for (const d of discovered) {
       const ts = now();
+      const idle = d.idle === true;
       const blob = await buildProvisionalBlob(d, machine, adapter.blobAgentFields, config.e2eKey);
-      const outcome = await post(buildStartEnvelope(d.sessionId, blob, ts));
+      const outcome = await post(buildProvisionalEnvelope(d.sessionId, blob, ts, idle));
       if (outcome !== "delivered") continue; // failed/revoked → retry next sweep, don't persist a ghost
-      await writeRecord(d.sessionId, buildProvisionalRecord(d, machine, blob, adapter.blobAgentFields, ts, config.pairingId));
+      await writeRecord(d.sessionId, buildProvisionalRecord(d, machine, blob, adapter.blobAgentFields, ts, config.pairingId, idle));
     }
   }
 }
@@ -519,6 +541,63 @@ async function correctPendingApproval(config: Config, path: string, sessionId: s
   }
 }
 
+// --- Idle-provisional corrective (a discovery "working" row whose TUI went idle) --------------
+//
+// A provisional row is hook-less by definition — no Stop will EVER arrive for it — so one advertised
+// as "working" while its TUI sits idle at the prompt stays "Running" on the phone indefinitely
+// (user-confirmed live repro: an idle `codex` TUI open since 2 AM, its real session stolen by a
+// ChatGPT-desktop resume, stuck Running all night as `codex-pid-91986`). Discovery now classifies at
+// surface time (see buildProvisionalBlob), and THIS net keeps the verdict honest on later sweeps: a
+// provisional still marked working whose TUI no longer has a turn in flight gets ONE corrective
+// op:done (cached title — never title:"", the v0.8.3 rule) and its record pinned done so the net
+// can't re-fire. Deliberately ONE-WAY (working → done, never back): when the idle TUI later gets a
+// real prompt, the REAL hooks fire with the real session id and the reconcile machinery retires the
+// provisional — a done→working flip here would race those hooks and resurrect the ghost.
+
+/** Gate: should this sweep probe a still-ALIVE session's TUI for idleness? Only PROVISIONAL records
+ *  (hook-fed sessions own their lifecycle — the interrupt/notify nets cover them) of an agent whose
+ *  adapter offers the turn-state probe (codex; claude never), not already done (fire ONCE per
+ *  provisional — the corrective's rewrite closes the gate), with a probeable pid. Pure. */
+export function shouldIdleProvisionalCheck(record: SessionRecord, adapter: AgentAdapter): boolean {
+  if (!adapter.pidTurnActive) return false; // agent has no turn-state probe (claude) → never
+  if (record.provisional !== true) return false; // real sessions are the hooks'/other nets' business
+  if (record.op === "done" || record.lastEvent === "done") return false; // already advertised idle
+  if (typeof record.pid !== "number" || !Number.isFinite(record.pid)) return false;
+  return true;
+}
+
+/** The idle-provisional corrective for one still-alive session. Gated by shouldIdleProvisionalCheck,
+ *  then it probes the TUI's rollout tail (adapter.pidTurnActive): a turn genuinely in flight leaves the
+ *  working row alone; an idle TUI gets a corrective op:done rebuilt from the record's cached
+ *  title/machine/label (buildDoneEnvelope — same envelope the interrupt net posts). On a 2xx the record
+ *  is pinned done (lastEvent/op done + sentDone) so this fires once and the heartbeat/interrupt nets
+ *  treat it as finished. A transient failure leaves the file untouched for the next sweep. Returns the
+ *  same verdict triple as the other nets ("corrected" → the caller must not also heartbeat it). */
+async function correctIdleProvisional(config: Config, path: string, sessionId: string, record: SessionRecord): Promise<"corrected" | "uncorrected" | "revoked"> {
+  try {
+    const agent: AgentKind = record.agent === "codex" ? "codex" : "claude";
+    const adapter = adapterFor(agent);
+    if (!shouldIdleProvisionalCheck(record, adapter)) return "uncorrected";
+    let active = false;
+    try { active = await adapter.pidTurnActive!(record.pid); } catch { /* idle-biased, like discovery */ }
+    if (active) return "uncorrected"; // a turn is open → the working row is honest → leave it
+    const outcome = await postEvent(config, await buildDoneEnvelope(sessionId, record, Date.now(), config.e2eKey, agent));
+    if (outcome === "revoked") return "revoked"; // pairing gone → bubble up so the loop can tear down
+    if (outcome !== "delivered") return "uncorrected"; // failed POST → keep the file, retry next sweep
+    // 2xx: pin the provisional done so the gate closes and the heartbeat can never re-arm "working".
+    try {
+      const next: SessionRecord = { ...record, lastEvent: "done", sentDone: true, op: "done" };
+      // Owner-only (0600), same as every other record rewrite in this file.
+      await atomicWrite(path, JSON.stringify(next), 0o600);
+    } catch {
+      // Rewrite failed — worst case the net re-POSTs a done next sweep, which the worker drops.
+    }
+    return "corrected";
+  } catch {
+    return "uncorrected";
+  }
+}
+
 // --- Heartbeat decision ---------------------------------------------------------------------
 
 /** Should this KEPT (alive) session get a heartbeat this sweep? Pure so every guardrail is unit-
@@ -575,9 +654,15 @@ async function sweep(config: Config | null): Promise<SweepResult> {
     if (verdict === "keep") {
       remaining++;
       if (config && record) {
-        // Ordering is the guardrail: run the interrupt-recovery net FIRST. If it corrected the turn
-        // (POSTed a done), the session is effectively done, so we must NOT also heartbeat it — the
-        // returned flag carries that. Only a clean, alive, quiet, uncorrected session gets a
+        // Idle-provisional corrective FIRST: a discovery row advertised "working" whose TUI has gone
+        // idle gets its one op:done before anything else could heartbeat the stale working blob.
+        // Gated to provisional records of a probe-capable agent (codex); everything else no-ops.
+        const idleFix = await correctIdleProvisional(config, path, sessionId, record);
+        if (idleFix === "revoked") return { revoked: true };
+        if (idleFix === "corrected") delivered = true; // it POSTed a done → a 2xx landed
+        // Ordering is the guardrail: run the interrupt-recovery net next. If either net corrected the
+        // session (POSTed a done), it is effectively done, so we must NOT also heartbeat it — the
+        // returned flags carry that. Only a clean, alive, quiet, uncorrected session gets a
         // heartbeat, which re-sends its last blob to re-arm the island's stale-date.
         const corrected = await correctInterrupt(config, path, sessionId, record, now);
         if (corrected === "revoked") return { revoked: true }; // gone this POST → gated teardown in run()
@@ -591,7 +676,7 @@ async function sweep(config: Config | null): Promise<SweepResult> {
           if (attn === "revoked") return { revoked: true };
           if (attn === "corrected") { delivered = true; flaggedAttention = true; }
         }
-        if (shouldHeartbeat(record, now, heartbeatAt.get(sessionId), corrected === "corrected" || flaggedAttention)) {
+        if (shouldHeartbeat(record, now, heartbeatAt.get(sessionId), idleFix === "corrected" || corrected === "corrected" || flaggedAttention)) {
           const beat = buildHeartbeatEnvelope(sessionId, record, Date.now(), config.pairingId);
           // delivered only: a failed heartbeat mutates NOTHING (not the record, not even the throttle),
           // so quietness stays true and it's retried next sweep. A record with no stored blob yields

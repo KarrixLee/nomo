@@ -7,10 +7,11 @@ import type { SessionRecord } from "../core/shared";
 import { GONE_STRIKE_LIMIT, readGoneStrikes, recordGoneStrike, resetGoneStrikes } from "../core/shared";
 import {
   buildDoneEnvelope, buildEndEnvelope, buildHeartbeatEnvelope, buildNeedsAttentionEnvelope, buildProvisionalBlob,
-  buildProvisionalRecord, buildStartEnvelope, classifySession, codexLastTurnEvent, codexTailPendingApproval,
-  discoverLiveSessions, goneStrikeShouldTeardown, hasInterruptMarker, IDLE_GRACE_MS, lastTurnLine, PAIRING_TTL_MS,
-  pendingPairingExpired, postOutcomeForStatus, provisionalsCoveredByReal, reconcileProvisionalsSweep,
-  shouldHeartbeat, shouldInterruptCheck, shouldPendingApprovalCheck, tailShowsInterrupt,
+  buildProvisionalEnvelope, buildProvisionalRecord, buildStartEnvelope, classifySession, codexLastTurnEvent,
+  codexTailPendingApproval, discoverLiveSessions, goneStrikeShouldTeardown, hasInterruptMarker, IDLE_GRACE_MS,
+  lastTurnLine, PAIRING_TTL_MS, pendingPairingExpired, postOutcomeForStatus, provisionalsCoveredByReal,
+  reconcileProvisionalsSweep, shouldHeartbeat, shouldIdleProvisionalCheck, shouldInterruptCheck,
+  shouldPendingApprovalCheck, tailShowsInterrupt,
 } from "./cc-watchdog";
 import type { PostOutcome, RecordEntry } from "./cc-watchdog";
 import { claudeAdapter, codexAdapter } from "../core/adapter";
@@ -125,10 +126,25 @@ describe("buildStartEnvelope (provisional op:start — same v2 shape the hook PO
   });
 });
 
+describe("buildProvisionalEnvelope (op keyed on the TUI's turn state — the idle-TUI fix)", () => {
+  test("in flight (idle:false) → op:start, byte-identical to buildStartEnvelope", () => {
+    expect(buildProvisionalEnvelope("codex-pid-5150", "BLOB", 1234, false))
+      .toEqual(buildStartEnvelope("codex-pid-5150", "BLOB", 1234));
+  });
+  test("idle → op:done (the same op/prio a real Stop posts — done-is-terminal, never re-arms)", () => {
+    expect(buildProvisionalEnvelope("codex-pid-5150", "BLOB", 1234, true))
+      .toEqual({ v: 2, sessionId: "codex-pid-5150", op: "done", prio: 0, ts: 1234, blob: "BLOB" });
+  });
+});
+
 describe("buildProvisionalBlob (mirrors buildBlob's SessionStart shape)", () => {
   test("codex: decrypts to working + title/machine/label + agent:'codex', no detail/turnStartedAt", async () => {
     const blob = await buildProvisionalBlob(disc(), "Mac", { agent: "codex" }, KEY);
     expect(await decryptBlob(KEY, blob)).toEqual({ status: "working", title: "api-status", machine: "Mac", label: "api-status", agent: "codex" });
+  });
+  test("an IDLE discovery decrypts to status 'done' — an idle REPL is never advertised 'Running'", async () => {
+    const blob = await buildProvisionalBlob(disc({ idle: true }), "Mac", { agent: "codex" }, KEY);
+    expect(await decryptBlob(KEY, blob)).toEqual({ status: "done", title: "api-status", machine: "Mac", label: "api-status", agent: "codex" });
   });
   test("empty title coerces to '' (like buildBlob's title ?? '')", async () => {
     const blob = await buildProvisionalBlob(disc({ title: undefined }), "Mac", { agent: "codex" }, KEY);
@@ -146,10 +162,45 @@ describe("buildProvisionalRecord (flagged provisional, reap/reconcile-ready)", (
     expect(r).toEqual({
       pid: 5150, machine: "Mac", label: "api-status", ts: 4242,
       lastEvent: "sessionStart", op: "start", prio: 0, blob: "BLOB", provisional: true, agent: "codex",
+      title: "api-status", // cached like trackSession's — a corrective done must never regress to title:""
     });
+  });
+  test("an IDLE discovery is recorded as a posted done (op/lastEvent done + sentDone) so no net re-arms it", () => {
+    const r = buildProvisionalRecord(disc({ idle: true }), "Mac", "BLOB", { agent: "codex" }, 4242, undefined, true);
+    expect(r).toMatchObject({ lastEvent: "done", op: "done", sentDone: true, provisional: true, title: "api-status" });
+    // The done bookkeeping is exactly what the other nets key off: no heartbeat, no idle re-check.
+    expect(shouldHeartbeat(r, r.ts + 10_000_000, undefined, false)).toBe(false);
+    expect(shouldIdleProvisionalCheck(r, codexAdapter)).toBe(false);
+  });
+  test("a title-less discovery omits the cached title (never stores title:'')", () => {
+    expect(buildProvisionalRecord(disc({ title: undefined }), "Mac", "BLOB", { agent: "codex" }, 1)).not.toHaveProperty("title");
   });
   test("claude-style omits the agent field (empty blobAgentFields)", () => {
     expect(buildProvisionalRecord(disc(), "Mac", "BLOB", {}, 1)).not.toHaveProperty("agent");
+  });
+});
+
+describe("shouldIdleProvisionalCheck (gate: provisional codex rows only, once per episode)", () => {
+  const prov = (over: Partial<SessionRecord> = {}): SessionRecord =>
+    rec({ provisional: true, agent: "codex", lastEvent: "sessionStart", op: "start", ...over });
+
+  test("a provisional codex row still marked working/start IS checked", () => {
+    expect(shouldIdleProvisionalCheck(prov(), codexAdapter)).toBe(true);
+  });
+  test("claude adapter (no pidTurnActive probe) → never", () => {
+    expect(shouldIdleProvisionalCheck(prov({ agent: undefined }), claudeAdapter)).toBe(false);
+  });
+  test("a REAL (non-provisional) record → never (hooks own its lifecycle)", () => {
+    expect(shouldIdleProvisionalCheck(prov({ provisional: undefined }), codexAdapter)).toBe(false);
+    expect(shouldIdleProvisionalCheck(prov({ provisional: false }), codexAdapter)).toBe(false);
+  });
+  test("already done (op or lastEvent) → never re-checked (one corrective per episode)", () => {
+    expect(shouldIdleProvisionalCheck(prov({ op: "done" }), codexAdapter)).toBe(false);
+    expect(shouldIdleProvisionalCheck(prov({ lastEvent: "done" }), codexAdapter)).toBe(false);
+  });
+  test("an unprobeable pid → never", () => {
+    expect(shouldIdleProvisionalCheck(prov({ pid: Number.NaN }), codexAdapter)).toBe(false);
+    expect(shouldIdleProvisionalCheck(prov({ pid: undefined as unknown as number }), codexAdapter)).toBe(false);
   });
 });
 
@@ -174,6 +225,21 @@ describe("discoverLiveSessions (generic adapter-driven step)", () => {
     expect(writes).toHaveLength(1);
     expect(writes[0].id).toBe("codex-pid-5150");
     expect(writes[0].rec).toMatchObject({ pid: 5150, provisional: true, agent: "codex" });
+  });
+
+  test("an IDLE discovery is POSTed as op:done and recorded as done (never a hook-less 'working' ghost)", async () => {
+    const posts: object[] = [];
+    const writes: { id: string; rec: SessionRecord }[] = [];
+    await discoverLiveSessions(cfg(), {
+      adapters: [fakeAdapter([disc({ idle: true })])],
+      post: async (b) => { posts.push(b); return "delivered" as PostOutcome; },
+      readRecords: async () => [],
+      writeRecord: async (id, rec) => { writes.push({ id, rec }); },
+      now: () => 999,
+    });
+    expect(posts[0]).toMatchObject({ v: 2, sessionId: "codex-pid-5150", op: "done", prio: 0, ts: 999 });
+    expect(await decryptBlob(KEY, (posts[0] as { blob: string }).blob)).toMatchObject({ status: "done" });
+    expect(writes[0].rec).toMatchObject({ op: "done", lastEvent: "done", sentDone: true, provisional: true });
   });
 
   test("a NON-delivered POST persists NOTHING (retried next sweep — pid stays unknown)", async () => {

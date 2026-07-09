@@ -2,7 +2,7 @@ import { createRequire } from "node:module";
 var __require = /* @__PURE__ */ createRequire(import.meta.url);
 
 // src/core/hook.ts
-import { readdir, readFile as readFile2, unlink as unlink2 } from "node:fs/promises";
+import { readdir as readdir2, readFile as readFile2, unlink as unlink2 } from "node:fs/promises";
 import { hostname } from "node:os";
 import { basename as basename2 } from "node:path";
 
@@ -73,6 +73,7 @@ async function sha256Hex(s) {
 
 // src/core/adapter.ts
 import { execFile } from "node:child_process";
+import { readdir, stat as stat2 } from "node:fs/promises";
 import { promisify } from "node:util";
 import { basename, join as join2 } from "node:path";
 
@@ -705,6 +706,125 @@ function codexTailPendingApproval(tail) {
   }
   return false;
 }
+var CODEX_ROLLOUT_IDLE_SILENCE_MS = 30000;
+var CODEX_TURN_OPEN_EVENT = "task_started";
+function codexTurnActiveFromTail(tail, silentForMs) {
+  const last = codexLastTurnEvent(tail);
+  if (last === CODEX_TURN_OPEN_EVENT)
+    return true;
+  if (last !== null)
+    return false;
+  if (silentForMs >= CODEX_ROLLOUT_IDLE_SILENCE_MS)
+    return false;
+  return tail.includes('"response_item"') || tail.includes('"event_msg"');
+}
+var TURN_STATE_TAIL_BYTES = 8 * 1024;
+function rolloutPathFromLsof(output) {
+  for (const line of output.split(`
+`)) {
+    if (!line.startsWith("n"))
+      continue;
+    const path = line.slice(1);
+    const name = basename(path);
+    if (name.startsWith("rollout-") && name.endsWith(".jsonl"))
+      return path;
+  }
+  return;
+}
+async function rolloutViaLsof(pid) {
+  try {
+    const { stdout } = await execFileP("lsof", ["-a", "-p", String(pid), "-Fn"]);
+    return rolloutPathFromLsof(stdout);
+  } catch {
+    return;
+  }
+}
+function rolloutMetaCwd(head) {
+  for (const line of head.split(`
+`)) {
+    if (!line.includes("session_meta"))
+      continue;
+    let row;
+    try {
+      row = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (typeof row !== "object" || row === null)
+      continue;
+    const r = row;
+    if (r.type !== "session_meta")
+      continue;
+    const cwd = r.payload?.cwd;
+    if (typeof cwd === "string" && cwd.length > 0)
+      return cwd;
+  }
+  return;
+}
+var ROLLOUT_SCAN_MAX_DAYS = 10;
+var ROLLOUT_SCAN_MAX_HEADS = 40;
+var ROLLOUT_META_HEAD_BYTES = 64 * 1024;
+async function listNumericDirsDesc(path) {
+  try {
+    return (await readdir(path)).filter((n) => /^\d+$/.test(n)).sort((a, b) => b.localeCompare(a));
+  } catch {
+    return [];
+  }
+}
+async function codexNewestRolloutForCwd(cwd, home = codexHome()) {
+  const sessions = join2(home, "sessions");
+  const candidates = [];
+  let days = 0;
+  outer:
+    for (const y of await listNumericDirsDesc(sessions)) {
+      for (const m of await listNumericDirsDesc(join2(sessions, y))) {
+        for (const d of await listNumericDirsDesc(join2(sessions, y, m))) {
+          const dir = join2(sessions, y, m, d);
+          let names;
+          try {
+            names = await readdir(dir);
+          } catch {
+            continue;
+          }
+          for (const n of names) {
+            if (!n.startsWith("rollout-") || !n.endsWith(".jsonl"))
+              continue;
+            const path = join2(dir, n);
+            try {
+              candidates.push({ path, mtime: (await stat2(path)).mtimeMs });
+            } catch {}
+          }
+          if (++days >= ROLLOUT_SCAN_MAX_DAYS)
+            break outer;
+        }
+      }
+    }
+  candidates.sort((a, b) => b.mtime - a.mtime);
+  for (const c of candidates.slice(0, ROLLOUT_SCAN_MAX_HEADS)) {
+    try {
+      if (rolloutMetaCwd(await readPrefix(c.path, ROLLOUT_META_HEAD_BYTES)) === cwd)
+        return c.path;
+    } catch {}
+  }
+  return;
+}
+async function codexPidTurnActive(pid, deps = {}) {
+  try {
+    let rollout = await (deps.rolloutOf ?? rolloutViaLsof)(pid);
+    if (!rollout) {
+      const cwd = await (deps.cwdOf ?? cwdViaLsof)(pid);
+      if (cwd)
+        rollout = await (deps.rolloutForCwd ?? codexNewestRolloutForCwd)(cwd);
+    }
+    if (!rollout)
+      return false;
+    const tail = await (deps.readTail ?? readSuffix)(rollout, TURN_STATE_TAIL_BYTES);
+    const mtime = await (deps.mtimeOf ?? (async (p) => (await stat2(p)).mtimeMs))(rollout);
+    return codexTurnActiveFromTail(tail, (deps.now ?? Date.now)() - mtime);
+  } catch {
+    return false;
+  }
+}
 function codexSentinelSessionId(pid) {
   return `codex-pid-${pid}`;
 }
@@ -766,6 +886,7 @@ async function cwdViaLsof(pid) {
 async function codexDiscoverLive(known, deps = {}) {
   const ps = deps.ps ?? runPs;
   const cwdOf = deps.cwdOf ?? cwdViaLsof;
+  const turnActive = deps.turnActive ?? codexPidTurnActive;
   let output;
   try {
     output = await ps();
@@ -777,7 +898,11 @@ async function codexDiscoverLive(known, deps = {}) {
   const out = [];
   for (const { pid } of tuis) {
     const label = labelFromCwd(await cwdOf(pid));
-    out.push({ pid, sessionId: codexSentinelSessionId(pid), title: label, label });
+    let active = false;
+    try {
+      active = await turnActive(pid);
+    } catch {}
+    out.push({ pid, sessionId: codexSentinelSessionId(pid), title: label, label, idle: !active });
   }
   return out;
 }
@@ -843,7 +968,8 @@ var codexAdapter = {
   hooksNotFiringHint: "  Run /hooks in Codex to re-trust, or reinstall the plugin — known upstream bugs #16430/#30835.",
   toolDetail: codexToolDetail,
   blobAgentFields: { agent: "codex" },
-  discoverLive: (known) => codexDiscoverLive(known)
+  discoverLive: (known) => codexDiscoverLive(known),
+  pidTurnActive: (pid) => codexPidTurnActive(pid)
 };
 function adapterFor(agent) {
   return agent === "codex" ? codexAdapter : claudeAdapter;
@@ -909,8 +1035,8 @@ function transcriptStartMs(prefix) {
   }
   return;
 }
-function buildBlob(input, machine, title, plan, agent = "claude", turnStartedAt) {
-  const label = typeof input.cwd === "string" && input.cwd.length > 0 ? basename2(input.cwd) : "session";
+function buildBlob(input, machine, title, plan, agent = "claude", turnStartedAt, pinnedLabel) {
+  const label = typeof pinnedLabel === "string" && pinnedLabel.length > 0 ? pinnedLabel : typeof input.cwd === "string" && input.cwd.length > 0 ? basename2(input.cwd) : "session";
   const hookName = typeof input.hook_event_name === "string" ? input.hook_event_name : "";
   const detail = detailForHook(hookName, typeof input.tool_name === "string" ? input.tool_name : undefined);
   return {
@@ -923,7 +1049,7 @@ function buildBlob(input, machine, title, plan, agent = "claude", turnStartedAt)
     ...typeof turnStartedAt === "number" && Number.isFinite(turnStartedAt) ? { turnStartedAt } : {}
   };
 }
-async function buildEnvelope(input, machine, now, title, e2eKey, sentDone, agent = "claude", startedAt, turnStartedAt) {
+async function buildEnvelope(input, machine, now, title, e2eKey, sentDone, agent = "claude", startedAt, turnStartedAt, pinnedLabel) {
   if (typeof input !== "object" || input === null)
     return null;
   const i = input;
@@ -938,7 +1064,7 @@ async function buildEnvelope(input, machine, now, title, e2eKey, sentDone, agent
     base.startedAt = startedAt;
   if (plan.op === "end")
     return base;
-  const blob = await encryptBlob(e2eKey, buildBlob(i, machine, title, plan, agent, turnStartedAt));
+  const blob = await encryptBlob(e2eKey, buildBlob(i, machine, title, plan, agent, turnStartedAt, pinnedLabel));
   return { ...base, blob };
 }
 function buildPendingStash(input, machine, title, now, pid = process.ppid, agent = "claude") {
@@ -989,7 +1115,7 @@ async function trackSession(sessionId, op, prio, status, blob, machine, label, t
 }
 async function reconcileProvisional(config, hookPid) {
   try {
-    const files = await readdir(SESSIONS_DIR).catch(() => []);
+    const files = await readdir2(SESSIONS_DIR).catch(() => []);
     const provisionals = [];
     for (const f of files) {
       if (!f.endsWith(".json"))
@@ -1018,7 +1144,7 @@ async function reconcileProvisional(config, hookPid) {
   } catch {}
 }
 async function readTrackedSessions() {
-  const files = await readdir(SESSIONS_DIR).catch(() => []);
+  const files = await readdir2(SESSIONS_DIR).catch(() => []);
   const out = [];
   for (const f of files) {
     if (!f.endsWith(".json"))
@@ -1094,10 +1220,10 @@ async function runHook(agent) {
     const plan = planOp(hookName, input, sentDone);
     if (!plan)
       return;
-    const envelope = await buildEnvelope(input, machine, Date.now(), title, config.e2eKey, sentDone, agent, startedAt, turnStartedAt);
+    const label = typeof existingRecord?.label === "string" && existingRecord.label.length > 0 ? existingRecord.label : typeof input.cwd === "string" && input.cwd.length > 0 ? basename2(input.cwd) : "session";
+    const envelope = await buildEnvelope(input, machine, Date.now(), title, config.e2eKey, sentDone, agent, startedAt, turnStartedAt, label);
     if (!envelope)
       return;
-    const label = typeof input.cwd === "string" && input.cwd.length > 0 ? basename2(input.cwd) : "session";
     await trackSession(input.session_id, plan.op, plan.prio, plan.status, envelope.blob, machine, label, transcriptPath, agent, startedAt, turnStartedAt, turnId, title ?? existingRecord?.title, config.pairingId);
     ensureWatchdog();
     const res = await fetch(`${config.url}/v1/cc/event`, {
@@ -1137,6 +1263,8 @@ export {
   stashPendingEvent,
   sessionTitle,
   runHook,
+  rolloutPathFromLsof,
+  rolloutMetaCwd,
   planOp,
   parseCodexProcs,
   lastTurnLine,
@@ -1146,11 +1274,14 @@ export {
   findProvisionalForPid,
   filterCodexTuis,
   detailForHook,
+  codexTurnActiveFromTail,
   codexToolDetail,
   codexThreadName,
   codexTailPendingApproval,
   codexSessionTitle,
   codexSentinelSessionId,
+  codexPidTurnActive,
+  codexNewestRolloutForCwd,
   codexLastTurnEvent,
   codexIndexTitle,
   codexDiscoverLive,
@@ -1164,5 +1295,6 @@ export {
   buildBlob,
   allAdapters,
   aiTitle,
-  adapterFor
+  adapterFor,
+  CODEX_ROLLOUT_IDLE_SILENCE_MS
 };
