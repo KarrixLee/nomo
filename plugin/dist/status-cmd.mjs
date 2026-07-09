@@ -2,12 +2,12 @@ import { createRequire } from "node:module";
 var __require = /* @__PURE__ */ createRequire(import.meta.url);
 
 // src/entries/status-cmd.ts
-import { readdir as readdir2, readFile as readFile2, stat as stat3 } from "node:fs/promises";
+import { readdir as readdir2, readFile as readFile3, stat as stat3 } from "node:fs/promises";
 import { join as join3 } from "node:path";
 
 // src/core/adapter.ts
 import { execFile } from "node:child_process";
-import { readdir, stat as stat2 } from "node:fs/promises";
+import { readdir, readFile as readFile2, stat as stat2 } from "node:fs/promises";
 import { promisify } from "node:util";
 import { basename, join as join2 } from "node:path";
 
@@ -259,6 +259,7 @@ async function flushPendingStash(stashPath, url, pairingId, pcSecret, e2eKey, no
           blob,
           ...stash.blob.agent === "codex" ? { agent: "codex" } : {},
           ...typeof stash.blob.title === "string" && stash.blob.title.length > 0 ? { title: stash.blob.title } : {},
+          ...typeof stash.blob.model === "string" && stash.blob.model.length > 0 ? { model: stash.blob.model } : {},
           ...pairingId.length > 0 ? { pairingId } : {}
         };
         await atomicWrite(`${sessionsDir}/${stash.sessionId}.json`, JSON.stringify(record), 384);
@@ -617,6 +618,133 @@ function firstUserPrompt(transcript) {
   return firstUserPromptFromLines(transcript.split(`
 `));
 }
+var MODEL_TAIL_BYTES = 64 * 1024;
+function assistantModelFromLine(line) {
+  if (!line.includes('"assistant"') || !line.includes('"model"'))
+    return;
+  let row;
+  try {
+    row = JSON.parse(line);
+  } catch {
+    return;
+  }
+  if (typeof row !== "object" || row === null)
+    return;
+  const r = row;
+  if (r.type !== "assistant")
+    return;
+  if (r.isSidechain === true)
+    return;
+  const model = r.message?.model;
+  if (typeof model !== "string")
+    return;
+  const cleaned = model.trim();
+  if (!cleaned || cleaned.startsWith("<"))
+    return;
+  return cleaned;
+}
+function lastAssistantModel(text) {
+  const lines = text.split(`
+`);
+  for (let i = lines.length - 1;i >= 0; i--) {
+    const m = assistantModelFromLine(lines[i]);
+    if (m)
+      return m;
+  }
+  return;
+}
+function firstAssistantModel(text) {
+  for (const line of text.split(`
+`)) {
+    const m = assistantModelFromLine(line);
+    if (m)
+      return m;
+  }
+  return;
+}
+async function claudeSessionModel(prefix, transcriptPath) {
+  if (transcriptPath.length > 0) {
+    try {
+      const m = lastAssistantModel(await readSuffix(transcriptPath, MODEL_TAIL_BYTES));
+      if (m)
+        return m;
+    } catch {}
+  }
+  return prefix.length > 0 ? firstAssistantModel(prefix) : undefined;
+}
+function codexModelFromRollout(text) {
+  const lines = text.split(`
+`);
+  for (let i = lines.length - 1;i >= 0; i--) {
+    const line = lines[i];
+    if (!line.includes("turn_context"))
+      continue;
+    let row;
+    try {
+      row = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (typeof row !== "object" || row === null)
+      continue;
+    const r = row;
+    if (r.type !== "turn_context")
+      continue;
+    const model = r.payload?.model;
+    if (typeof model !== "string")
+      continue;
+    const cleaned = model.trim();
+    if (cleaned)
+      return cleaned;
+  }
+  return;
+}
+function codexConfigModel(toml) {
+  for (const line of toml.split(`
+`)) {
+    if (/^\s*\[/.test(line))
+      break;
+    const m = line.match(/^\s*model\s*=\s*(.*)$/);
+    if (!m)
+      continue;
+    const rest = m[1].trim();
+    const dq = rest.match(/^"((?:[^"\\]|\\.)*)"/);
+    if (dq) {
+      try {
+        const v = JSON.parse(`"${dq[1]}"`);
+        if (v.length > 0)
+          return v;
+      } catch {}
+      return;
+    }
+    const sq = rest.match(/^'([^']*)'/);
+    if (sq && sq[1].length > 0)
+      return sq[1];
+    return;
+  }
+  return;
+}
+async function codexSessionModel(input, prefix, transcriptPath, home = codexHome()) {
+  if (typeof input.model === "string" && input.model.trim().length > 0)
+    return input.model.trim();
+  if (transcriptPath.length > 0) {
+    try {
+      const m = codexModelFromRollout(await readSuffix(transcriptPath, MODEL_TAIL_BYTES));
+      if (m)
+        return m;
+    } catch {}
+  }
+  if (prefix.length > 0) {
+    const m = codexModelFromRollout(prefix);
+    if (m)
+      return m;
+  }
+  try {
+    return codexConfigModel(await readFile2(join2(home, "config.toml"), "utf8"));
+  } catch {
+    return;
+  }
+}
 var INTERRUPT_MARKER = "interrupted by user";
 var CODEX_TURN_EVENTS = new Set(["task_started", "task_complete", "turn_aborted"]);
 var CODEX_ABORT_EVENT = "turn_aborted";
@@ -927,6 +1055,9 @@ var claudeAdapter = {
   async title({ prefix }) {
     return prefix.length > 0 ? sessionTitle(prefix) : undefined;
   },
+  model({ prefix, transcriptPath }) {
+    return claudeSessionModel(prefix, transcriptPath);
+  },
   detectInterrupt(tail) {
     const line = lastTurnLine(tail);
     return line !== null && hasInterruptMarker(line);
@@ -953,6 +1084,9 @@ var codexAdapter = {
         title = cleanPromptTitle(input.prompt);
     }
     return title;
+  },
+  model({ input, prefix, transcriptPath }) {
+    return codexSessionModel(input, prefix, transcriptPath);
   },
   detectInterrupt(tail) {
     return codexLastTurnEvent(tail) === CODEX_ABORT_EVENT;
@@ -1082,7 +1216,7 @@ async function newestFileMtime(dir, match) {
 }
 async function readMsMarker(path) {
   try {
-    const ts = Number.parseInt((await readFile2(path, "utf8")).trim(), 10);
+    const ts = Number.parseInt((await readFile3(path, "utf8")).trim(), 10);
     return Number.isFinite(ts) && ts > 0 ? ts : 0;
   } catch {
     return 0;
@@ -1104,7 +1238,7 @@ async function statusCmd(deps = {}) {
   const now = deps.now ?? Date.now;
   let raw = null;
   try {
-    raw = await readFile2(configPath, "utf8");
+    raw = await readFile3(configPath, "utf8");
   } catch {}
   const config = raw !== null ? parseConfig(raw) : null;
   if (config) {
@@ -1117,14 +1251,14 @@ async function statusCmd(deps = {}) {
   }
   let watchdog = "not running";
   try {
-    const pid = Number.parseInt((await readFile2(watchdogPidPath, "utf8")).trim(), 10);
+    const pid = Number.parseInt((await readFile3(watchdogPidPath, "utf8")).trim(), 10);
     if (Number.isFinite(pid) && pid > 0 && isAlive(pid))
       watchdog = `running (pid ${pid})`;
   } catch {}
   print(`Watchdog: ${watchdog}`);
   let lastSend = "never";
   try {
-    const ts = Number.parseInt((await readFile2(lastSendPath, "utf8")).trim(), 10);
+    const ts = Number.parseInt((await readFile3(lastSendPath, "utf8")).trim(), 10);
     if (Number.isFinite(ts) && ts > 0)
       lastSend = humanAge(now() - ts);
   } catch {}
@@ -1136,11 +1270,11 @@ async function statusCmd(deps = {}) {
   print(`Tracked sessions: ${sessions}`);
   let plugin = { installed: false, enabled: true, trusted: 0, ccTrusted: 0 };
   try {
-    plugin = parseCodexPluginState(await readFile2(codexConfigPath, "utf8"));
+    plugin = parseCodexPluginState(await readFile3(codexConfigPath, "utf8"));
   } catch {}
   let legacyEvents = 0;
   try {
-    legacyEvents = countCodexHookEvents(await readFile2(codexHooksPath, "utf8"));
+    legacyEvents = countCodexHookEvents(await readFile3(codexHooksPath, "utf8"));
   } catch {}
   let pluginState;
   if (plugin.installed) {

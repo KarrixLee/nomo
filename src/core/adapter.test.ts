@@ -1,10 +1,12 @@
 import { randomUUID } from "node:crypto";
 import { describe, expect, test } from "bun:test";
 import {
-  adapterFor, allAdapters, claudeAdapter, codexAdapter, codexChildSessionGhost, codexDiscoverLive,
-  CODEX_ROLLOUT_IDLE_SILENCE_MS, codexNewestRolloutForCwd, codexPidTurnActive, codexSentinelSessionId,
+  adapterFor, allAdapters, claudeAdapter, claudeSessionModel, codexAdapter, codexChildSessionGhost,
+  codexConfigModel, codexDiscoverLive, codexModelFromRollout, CODEX_ROLLOUT_IDLE_SILENCE_MS,
+  codexNewestRolloutForCwd, codexPidTurnActive, codexSentinelSessionId, codexSessionModel,
   codexTailPendingApproval, codexTurnActiveFromTail, filterCodexTuis, findProvisionalForPid,
-  firstUserPrompt, parseCodexProcs, rolloutMetaCwd, rolloutPathFromLsof, sessionTitle, TrackedSessionLite,
+  firstAssistantModel, firstUserPrompt, lastAssistantModel, parseCodexProcs, rolloutMetaCwd,
+  rolloutPathFromLsof, sessionTitle, TrackedSessionLite,
 } from "./adapter";
 import type { SessionRecord } from "./shared";
 
@@ -102,6 +104,150 @@ describe("codex title", () => {
       input: { hook_event_name: "Stop", prompt: "ignored" },
     });
     expect(title).toBeUndefined();
+  });
+});
+
+// --- session model resolution (v0.8.5 — the blob's OPTIONAL `model` field) ---------------------
+//
+// The wire contract with the app (build 54): JSON key `model`, a raw model id string (e.g.
+// "claude-fable-5", "gpt-5-codex"), OMITTED entirely when unknown — never required, never "".
+
+describe("claude session model (assistant message.model — last wins; subagent noise excluded)", () => {
+  const asst = (model: string, extra: Record<string, unknown> = {}): string =>
+    JSON.stringify({ type: "assistant", message: { model, content: [] }, ...extra });
+
+  test("lastAssistantModel: the LAST assistant line wins (tracks a mid-session /model switch)", () => {
+    const t = [asst("claude-opus-4-5"), asst("claude-fable-5")].join("\n");
+    expect(lastAssistantModel(t)).toBe("claude-fable-5");
+  });
+
+  test("a Task subagent invocation's tool_use input `model` is NOT the session model", () => {
+    // The assistant line PROPOSING a Task carries message.model (the session model) AND a tool_use
+    // whose input has "model":"opus" — parsing message.model (not substring-matching the line) is
+    // what keeps the subagent's model out.
+    const taskLine = JSON.stringify({
+      type: "assistant",
+      message: { model: "claude-fable-5", content: [{ type: "tool_use", name: "Task", input: { model: "opus", prompt: "go" } }] },
+    });
+    expect(lastAssistantModel(taskLine)).toBe("claude-fable-5");
+    // A NON-assistant line that happens to carry a `model` field is skipped entirely.
+    expect(lastAssistantModel(`{"type":"progress","model":"opus"}`)).toBeUndefined();
+  });
+
+  test("sidechain (Task subagent) assistant turns and synthetic error rows are skipped", () => {
+    const t = [asst("claude-fable-5"), asst("claude-haiku-4-5", { isSidechain: true }), asst("<synthetic>")].join("\n");
+    expect(lastAssistantModel(t)).toBe("claude-fable-5");
+  });
+
+  test("firstAssistantModel: the FIRST assistant line (the session-opening model in the head prefix)", () => {
+    const t = [`{"type":"user","message":{"content":"hi"}}`, asst("claude-opus-4-5"), asst("claude-fable-5")].join("\n");
+    expect(firstAssistantModel(t)).toBe("claude-opus-4-5");
+  });
+
+  test("undefined when no assistant line carries a model — never an empty string", () => {
+    expect(lastAssistantModel(`{"type":"user","message":{"content":"hi"}}`)).toBeUndefined();
+    expect(lastAssistantModel(asst(""))).toBeUndefined();
+    expect(lastAssistantModel("not json\n")).toBeUndefined();
+    expect(firstAssistantModel("")).toBeUndefined();
+  });
+
+  test("claudeSessionModel: the bounded TAIL read wins (the /model-switch case); the head prefix is the fallback; else undefined", async () => {
+    const { mkdtemp, writeFile, rm } = await import("node:fs/promises");
+    const { tmpdir } = await import("node:os");
+    const { join: j } = await import("node:path");
+    const dir = await mkdtemp(j(tmpdir(), "cc-model-"));
+    try {
+      const path = j(dir, "t.jsonl");
+      await writeFile(path, [asst("claude-opus-4-5"), asst("claude-fable-5")].join("\n"));
+      // The prefix (head) still says opus, but the transcript tail's last assistant line says fable —
+      // the tail wins, so a mid-session /model switch reaches the phone.
+      expect(await claudeSessionModel(asst("claude-opus-4-5"), path)).toBe("claude-fable-5");
+      // Missing/unreadable transcript → the already-read head prefix answers (frozen at session start).
+      expect(await claudeSessionModel(asst("claude-opus-4-5"), j(dir, "missing.jsonl"))).toBe("claude-opus-4-5");
+      // Nothing anywhere → undefined (the blob then omits the key).
+      expect(await claudeSessionModel("", j(dir, "missing.jsonl"))).toBeUndefined();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("the claude adapter exposes the seam (hook stdin has no model field — the transcript answers)", async () => {
+    expect(typeof claudeAdapter.model).toBe("function");
+    expect(await claudeAdapter.model!({
+      sessionId: randomUUID(), prefix: asst("claude-fable-5"), input: {}, transcriptPath: "",
+    })).toBe("claude-fable-5");
+  });
+});
+
+describe("codex session model (input.model → rollout turn_context → config.toml default)", () => {
+  const turnCtx = (model: string): string =>
+    JSON.stringify({ timestamp: "t", type: "turn_context", payload: { cwd: "/x", model } });
+
+  test("PRIMARY: the hook payload's own top-level `model` beats every fallback; whitespace-only is ignored", async () => {
+    // Even with a rollout prefix saying gpt-5, the per-turn hook field is the exact source.
+    expect(await codexSessionModel({ model: "gpt-5-codex" }, turnCtx("gpt-5"), "", "/nonexistent-codex-home")).toBe("gpt-5-codex");
+    expect(await codexSessionModel({ model: "   " }, "", "", "/nonexistent-codex-home")).toBeUndefined();
+  });
+
+  test("codexModelFromRollout: the LAST turn_context wins; noise and byte-sliced fragments are skipped", () => {
+    const rollout = [
+      `{"type":"session_meta","payload":{"cwd":"/x"}}`,
+      turnCtx("gpt-5"),
+      `{"type":"event_msg","payload":{"type":"task_started"}}`,
+      turnCtx("gpt-5-codex"),
+      `{"type":"event_msg","payload":{"type":"token_count"}}`,
+      `ontext","payload":{"model":"sliced-turn_context"`, // byte-sliced fragment → fails JSON.parse → skipped
+    ].join("\n");
+    expect(codexModelFromRollout(rollout)).toBe("gpt-5-codex");
+    expect(codexModelFromRollout("")).toBeUndefined();
+    expect(codexModelFromRollout(turnCtx(" "))).toBeUndefined(); // whitespace model → not a model id
+  });
+
+  test("FALLBACK: the rollout answers when the hook payload carries no model (tail first, then prefix)", async () => {
+    const { mkdtemp, writeFile, rm } = await import("node:fs/promises");
+    const { tmpdir } = await import("node:os");
+    const { join: j } = await import("node:path");
+    const dir = await mkdtemp(j(tmpdir(), "codex-model-"));
+    try {
+      const path = j(dir, "rollout-t.jsonl");
+      await writeFile(path, [turnCtx("gpt-5"), turnCtx("gpt-5-codex")].join("\n"));
+      expect(await codexSessionModel({}, "", path, j(dir, "no-home"))).toBe("gpt-5-codex");
+      // Tail file missing → the already-read head prefix answers.
+      expect(await codexSessionModel({}, turnCtx("gpt-5"), j(dir, "missing.jsonl"), j(dir, "no-home"))).toBe("gpt-5");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("codexConfigModel: top-level `model` assignment only (tables skipped); both TOML string forms; never ''", () => {
+    expect(codexConfigModel('model = "gpt-5-codex"\n\n[table]\nmodel = "nope"\n')).toBe("gpt-5-codex");
+    expect(codexConfigModel("model = 'gpt-5'\n")).toBe("gpt-5"); // literal (single-quoted) string
+    expect(codexConfigModel('model = "gpt-5-codex" # the default\n')).toBe("gpt-5-codex"); // trailing comment
+    expect(codexConfigModel('[profile.x]\nmodel = "nope"\n')).toBeUndefined(); // table keys are NOT the default
+    expect(codexConfigModel('model = ""\n')).toBeUndefined();
+    expect(codexConfigModel("model = 42\n")).toBeUndefined(); // present but not a string → unusable
+    expect(codexConfigModel("")).toBeUndefined();
+  });
+
+  test("LAST RESORT: $CODEX_HOME/config.toml's default; undefined when even that is absent", async () => {
+    const { mkdtemp, writeFile, rm } = await import("node:fs/promises");
+    const { tmpdir } = await import("node:os");
+    const { join: j } = await import("node:path");
+    const home = await mkdtemp(j(tmpdir(), "codex-home-"));
+    try {
+      await writeFile(j(home, "config.toml"), 'model = "gpt-5.1-codex-max"\n');
+      expect(await codexSessionModel({}, "", "", home)).toBe("gpt-5.1-codex-max");
+      expect(await codexSessionModel({}, "", "", "/nonexistent-codex-home")).toBeUndefined();
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  test("the codex adapter exposes the seam (payload model, like the real per-turn hooks)", async () => {
+    expect(typeof codexAdapter.model).toBe("function");
+    expect(await codexAdapter.model!({
+      sessionId: randomUUID(), prefix: "", input: { model: "gpt-5-codex" }, transcriptPath: "",
+    })).toBe("gpt-5-codex");
   });
 });
 

@@ -130,6 +130,9 @@ export async function buildDoneEnvelope(sessionId: string, record: SessionRecord
     // Per-agent blob identity comes from the adapter (no inline `agent === …` branch in the daemon).
     ...adapterFor(agent).blobAgentFields,
     ...(typeof record.turnStartedAt === "number" && Number.isFinite(record.turnStartedAt) ? { turnStartedAt: record.turnStartedAt } : {}),
+    // The record's cached model id (v0.8.5, cached like title) — restamped so the rebuilt blob keeps
+    // the phone's model badge; OMITTED when the record has none (the app then hides the badge).
+    ...(typeof record.model === "string" && record.model.length > 0 ? { model: record.model } : {}),
   });
   return { v: 2, sessionId, op: "done", prio: 0, ts: now, blob, ...startedAtField(record) };
 }
@@ -151,6 +154,8 @@ export async function buildNeedsAttentionEnvelope(sessionId: string, record: Ses
     // Per-agent blob identity comes from the adapter (no inline `agent === …` branch in the daemon).
     ...adapterFor(agent).blobAgentFields,
     ...(typeof record.turnStartedAt === "number" && Number.isFinite(record.turnStartedAt) ? { turnStartedAt: record.turnStartedAt } : {}),
+    // The record's cached model id, restamped exactly as buildDoneEnvelope does (omitted when absent).
+    ...(typeof record.model === "string" && record.model.length > 0 ? { model: record.model } : {}),
   });
   return { v: 2, sessionId, op: "update", prio: 1, ts: now, blob, ...startedAtField(record) };
 }
@@ -257,8 +262,9 @@ async function readAllRecords(): Promise<SessionRecord[]> {
 }
 
 /** The provisional blob for a discovered session — byte-shaped exactly like buildBlob's output for a
- *  SessionStart (title/machine/label, the adapter's `agent` field; no detail, no turnStartedAt because
- *  a freshly-opened TUI has neither a tool nor a prompt yet). status mirrors the TUI's REAL turn state:
+ *  SessionStart (title/machine/label, the adapter's `agent` field; no detail, no turnStartedAt — and
+ *  no `model`: unknown at process-scan discovery, and the first real hook's blob self-corrects it —
+ *  because a freshly-opened TUI has neither a tool nor a prompt yet). status mirrors the TUI's REAL turn state:
  *  "working" only when a turn is genuinely open, "done" for an idle REPL sitting at its prompt — an
  *  idle TUI advertised as working stuck "Running" on the phone forever (the v0.8.4 idle-TUI fix; see
  *  codexTurnActiveFromTail in adapter.ts). */

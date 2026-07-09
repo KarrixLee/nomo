@@ -127,16 +127,19 @@ export async function runNotify(raw: string, deferMs = notifyDeferMs(), sleep: (
       ? record.sessionStartedAt : undefined;
     const turnStartedAt = typeof record?.turnStartedAt === "number" && Number.isFinite(record.turnStartedAt)
       ? record.turnStartedAt : undefined;
+    // The cached model id (an earlier hook resolved it, v0.8.5). The notify payload carries no model
+    // field, so like the anchors it's threaded from the record — omitted when there is none.
+    const model = typeof record?.model === "string" && record.model.length > 0 ? record.model : undefined;
 
     const now = Date.now();
     // sentDone is false here (we returned above when it was true), so planOp("Stop") maps to op:done.
-    const envelope = await buildEnvelope(input, machine, now, title, config.e2eKey, false, "codex", startedAt, turnStartedAt);
+    const envelope = await buildEnvelope(input, machine, now, title, config.e2eKey, false, "codex", startedAt, turnStartedAt, undefined, model);
     if (!envelope) return;
 
     const label = typeof input.cwd === "string" && input.cwd.length > 0 ? basename(input.cwd) : "session";
     await trackSession(sessionId, "done", 0, "done", envelope.blob as string | undefined, machine, label,
       typeof record?.transcript === "string" ? record.transcript : "", "codex", startedAt, turnStartedAt, payloadTurnId,
-      title ?? record?.title, config.pairingId);
+      title ?? record?.title, config.pairingId, model);
     ensureWatchdog();
 
     const res = await fetch(`${config.url}/v1/cc/event`, {

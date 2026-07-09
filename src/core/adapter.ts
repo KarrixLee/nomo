@@ -13,7 +13,7 @@
 // PORTABILITY: bun AND node >= 18 — no `Bun.*` APIs; file IO via node:fs/promises (shared helpers).
 
 import { execFile } from "node:child_process";
-import { readdir, stat } from "node:fs/promises";
+import { readdir, readFile, stat } from "node:fs/promises";
 import { promisify } from "node:util";
 import { basename, join } from "node:path";
 import { AgentKind, codexHome, lastHookPath, readPrefix, readSuffix, SessionRecord } from "./shared";
@@ -267,6 +267,156 @@ function firstUserPromptFromLines(lines: string[]): string | undefined {
 
 export function firstUserPrompt(transcript: string): string | undefined {
   return firstUserPromptFromLines(transcript.split("\n"));
+}
+
+// --- Session model resolution -----------------------------------------------------------------
+//
+// v0.8.5: each blob OPTIONALLY carries the session's raw model id (e.g. "claude-fable-5",
+// "gpt-5-codex") so the phone can badge the session. STRICTLY optional — OMITTED entirely when
+// unknown, NEVER an empty string — so an old blob stays byte-identical and the app hides the badge.
+// The two agents' sources differ, so resolution lives here behind AgentAdapter.model:
+//   - Claude's hook stdin has NO model field. The transcript's assistant lines each carry the
+//     serving model at `message.model`, so the LAST assistant line (bounded tail read) tracks a
+//     mid-session /model switch; the FIRST assistant line in the already-read head prefix is the
+//     free fallback (frozen at session start).
+//   - Codex stamps a top-level `model` on its per-turn hook payloads (primary); the rollout's
+//     freshest `turn_context` line carries `payload.model` (fallback); the configured default in
+//     $CODEX_HOME/config.toml is the last resort (weakest — a per-session override never reaches it).
+
+/** How much of the transcript tail the model resolvers read. Bigger than the 8 KB interrupt nets:
+ *  a single assistant line (large code block) or a burst of response items can exceed a few KB, and
+ *  the freshest assistant/turn_context line must land inside the window. Still one bounded read. */
+const MODEL_TAIL_BYTES = 64 * 1024;
+
+/** The `message.model` of ONE Claude transcript line, or undefined when the line isn't a real
+ *  assistant turn. CRITICAL: only a `"type":"assistant"` row's TOP-LEVEL `message.model` counts —
+ *  transcripts also contain Task subagent invocations whose tool_use input has a `model` field
+ *  ("model":"opus") that is NOT the session model; parsing (not substring-matching) `message.model`
+ *  is what keeps those out. Sidechain rows (a Task subagent's own turns, `isSidechain:true`) and
+ *  CC's synthetic error rows (`message.model:"<synthetic>"`) are likewise not the session model. */
+function assistantModelFromLine(line: string): string | undefined {
+  if (!line.includes("\"assistant\"") || !line.includes("\"model\"")) return undefined; // cheap pre-filter
+  let row: unknown;
+  try { row = JSON.parse(line); } catch { return undefined; }
+  if (typeof row !== "object" || row === null) return undefined;
+  const r = row as Record<string, unknown>;
+  if (r.type !== "assistant") return undefined;
+  if (r.isSidechain === true) return undefined; // a Task subagent's turn — its model isn't the session's
+  const model = (r.message as Record<string, unknown> | undefined)?.model;
+  if (typeof model !== "string") return undefined;
+  const cleaned = model.trim();
+  if (!cleaned || cleaned.startsWith("<")) return undefined; // "" / "<synthetic>" → not a real model id
+  return cleaned;
+}
+
+/** The LAST assistant line's `message.model` in the given text (scanned bottom-up, early-exit) — the
+ *  freshest, so it tracks a mid-session /model switch. Undefined when no assistant line carries one. */
+export function lastAssistantModel(text: string): string | undefined {
+  const lines = text.split("\n");
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const m = assistantModelFromLine(lines[i]);
+    if (m) return m;
+  }
+  return undefined;
+}
+
+/** The FIRST assistant line's `message.model` in the given text — the session's opening model. Used
+ *  on the already-read head prefix as the free fallback when the tail read fails/finds nothing. */
+export function firstAssistantModel(text: string): string | undefined {
+  for (const line of text.split("\n")) {
+    const m = assistantModelFromLine(line);
+    if (m) return m;
+  }
+  return undefined;
+}
+
+/** The Claude session's model id: the LAST assistant `message.model` from a bounded transcript tail
+ *  (tracks /model switches), else the FIRST from the already-read head prefix (frozen at session
+ *  start), else undefined (a session with no assistant turn yet — the blob then omits `model`).
+ *  Best-effort: a missing/unreadable transcript just falls through to the prefix. */
+export async function claudeSessionModel(prefix: string, transcriptPath: string): Promise<string | undefined> {
+  if (transcriptPath.length > 0) {
+    try {
+      const m = lastAssistantModel(await readSuffix(transcriptPath, MODEL_TAIL_BYTES));
+      if (m) return m;
+    } catch { /* no transcript yet / unreadable — fall through to the head prefix */ }
+  }
+  return prefix.length > 0 ? firstAssistantModel(prefix) : undefined;
+}
+
+/** The freshest `turn_context` line's `payload.model` in the given rollout text (scanned bottom-up,
+ *  early-exit — codex re-emits turn_context per turn, so the last one is the turn that's running).
+ *  Line shape: `{"timestamp":…,"type":"turn_context","payload":{…,"model":"gpt-5-codex",…}}`. A
+ *  byte-sliced first line just fails JSON.parse and is skipped, like every tail scanner here. */
+export function codexModelFromRollout(text: string): string | undefined {
+  const lines = text.split("\n");
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i];
+    if (!line.includes("turn_context")) continue; // cheap pre-filter
+    let row: unknown;
+    try { row = JSON.parse(line); } catch { continue; }
+    if (typeof row !== "object" || row === null) continue;
+    const r = row as Record<string, unknown>;
+    if (r.type !== "turn_context") continue;
+    const model = (r.payload as Record<string, unknown> | undefined)?.model;
+    if (typeof model !== "string") continue;
+    const cleaned = model.trim();
+    if (cleaned) return cleaned;
+  }
+  return undefined;
+}
+
+/** The TOP-LEVEL `model = "…"` assignment in codex's config.toml (the configured DEFAULT model —
+ *  the weakest source: a per-session `codex -m …` override never reaches it). Only the root section
+ *  (before the first `[table]` header) is scanned, mirroring parseNotifyFromToml. Basic (double-
+ *  quoted) strings parse via JSON (a compatible subset on one line, tolerating a trailing comment);
+ *  literal ('single-quoted') strings are matched directly. Anything else → undefined. */
+export function codexConfigModel(toml: string): string | undefined {
+  for (const line of toml.split("\n")) {
+    if (/^\s*\[/.test(line)) break; // first table header → past the top-level section
+    const m = line.match(/^\s*model\s*=\s*(.*)$/);
+    if (!m) continue;
+    const rest = m[1].trim();
+    const dq = rest.match(/^"((?:[^"\\]|\\.)*)"/); // basic string (stops at the closing quote → ignores a trailing # comment)
+    if (dq) {
+      try {
+        const v = JSON.parse(`"${dq[1]}"`) as string;
+        if (v.length > 0) return v;
+      } catch { /* malformed escapes → unusable */ }
+      return undefined;
+    }
+    const sq = rest.match(/^'([^']*)'/); // literal string
+    if (sq && sq[1].length > 0) return sq[1];
+    return undefined; // present but not a shape we can parse
+  }
+  return undefined;
+}
+
+/** The Codex session's model id, by decreasing authority:
+ *  1. the hook payload's own top-level `model` (codex stamps it on per-turn hook events — exact);
+ *  2. the freshest rollout `turn_context` payload.model — a bounded tail read first (latest turn),
+ *     then the already-read head prefix (the opening turn);
+ *  3. the configured default in $CODEX_HOME/config.toml (weakest).
+ *  Undefined when all three fail — the blob then omits `model`. Never throws; never returns "". */
+export async function codexSessionModel(
+  input: Record<string, unknown>, prefix: string, transcriptPath: string, home: string = codexHome(),
+): Promise<string | undefined> {
+  if (typeof input.model === "string" && input.model.trim().length > 0) return input.model.trim();
+  if (transcriptPath.length > 0) {
+    try {
+      const m = codexModelFromRollout(await readSuffix(transcriptPath, MODEL_TAIL_BYTES));
+      if (m) return m;
+    } catch { /* no rollout yet / unreadable — fall through */ }
+  }
+  if (prefix.length > 0) {
+    const m = codexModelFromRollout(prefix);
+    if (m) return m;
+  }
+  try {
+    return codexConfigModel(await readFile(join(home, "config.toml"), "utf8"));
+  } catch {
+    return undefined; // no config.toml — the model is genuinely unknown
+  }
 }
 
 // --- Transcript interrupt detection ----------------------------------------------------------
@@ -792,6 +942,14 @@ export interface AgentAdapter {
   /** Resolve the session's display title from the (already-read) transcript prefix + hook input.
    *  Async because the codex path also reads the session_index. Undefined → no title yet. */
   title(ctx: { sessionId: string; prefix: string; input: Record<string, unknown> }): Promise<string | undefined>;
+  /** OPTIONAL: resolve the session's raw model id (e.g. "claude-fable-5", "gpt-5-codex") for the
+   *  blob's OPTIONAL `model` field. Undefined → unknown → the blob OMITS the key (never an empty
+   *  string) and the phone hides its badge. Claude reads the transcript's assistant lines (its hook
+   *  stdin has no model field); Codex reads the hook payload's own `model` with rollout/config.toml
+   *  fallbacks — see claudeSessionModel / codexSessionModel. `transcriptPath` rides alongside the
+   *  memoized head `prefix` because the freshest model sits at the transcript TAIL (one bounded
+   *  readSuffix), which the title seam never needed. */
+  model?(ctx: { sessionId: string; prefix: string; input: Record<string, unknown>; transcriptPath: string }): Promise<string | undefined>;
   /** Whether the transcript tail shows the last turn was interrupted (the two detections differ). */
   detectInterrupt(tail: string): boolean;
   /** OPTIONAL: whether the transcript tail shows a PENDING approval — a tool/patch the session is
@@ -847,6 +1005,11 @@ export const claudeAdapter: AgentAdapter = {
     // Both the first user message and CC's ai-title sit near the top; the prefix carries them.
     return prefix.length > 0 ? sessionTitle(prefix) : undefined;
   },
+  // Claude's hook stdin carries no model field — the transcript's assistant lines do. Last assistant
+  // line in a bounded tail (tracks /model switches) → first in the head prefix → undefined.
+  model({ prefix, transcriptPath }): Promise<string | undefined> {
+    return claudeSessionModel(prefix, transcriptPath);
+  },
   detectInterrupt(tail: string): boolean {
     const line = lastTurnLine(tail);
     return line !== null && hasInterruptMarker(line);
@@ -882,6 +1045,11 @@ export const codexAdapter: AgentAdapter = {
       if (hookName === "UserPromptSubmit") title = cleanPromptTitle(input.prompt);
     }
     return title;
+  },
+  // Codex stamps a top-level `model` on its per-turn hook payloads (primary); rollout turn_context →
+  // config.toml default are the fallbacks. See codexSessionModel for the authority order.
+  model({ input, prefix, transcriptPath }): Promise<string | undefined> {
+    return codexSessionModel(input, prefix, transcriptPath);
   },
   detectInterrupt(tail: string): boolean {
     return codexLastTurnEvent(tail) === CODEX_ABORT_EVENT;

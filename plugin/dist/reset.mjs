@@ -254,6 +254,7 @@ async function flushPendingStash(stashPath, url, pairingId, pcSecret, e2eKey, no
           blob,
           ...stash.blob.agent === "codex" ? { agent: "codex" } : {},
           ...typeof stash.blob.title === "string" && stash.blob.title.length > 0 ? { title: stash.blob.title } : {},
+          ...typeof stash.blob.model === "string" && stash.blob.model.length > 0 ? { model: stash.blob.model } : {},
           ...pairingId.length > 0 ? { pairingId } : {}
         };
         await atomicWrite(`${sessionsDir}/${stash.sessionId}.json`, JSON.stringify(record), 384);

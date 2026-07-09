@@ -101,6 +101,15 @@ describe("buildDoneEnvelope (interrupt corrective → v2 op:done + encrypted blo
     const withoutTurn = await buildDoneEnvelope("s", rec(), 5, KEY) as Record<string, unknown>;
     expect(await decryptBlob(KEY, withoutTurn.blob as string)).not.toHaveProperty("turnStartedAt");
   });
+  test("preserves the record's cached model in the rebuilt blob (v0.8.5 badge survives a corrective done); omits when absent", async () => {
+    // The corrective done rebuilds its blob from scratch, so the model the hook cached (like title)
+    // must be restamped — else the phone's model badge would vanish on the corrective frame.
+    const withModel = await buildDoneEnvelope("s", rec({ model: "claude-fable-5" }), 5, KEY) as Record<string, unknown>;
+    expect(await decryptBlob(KEY, withModel.blob as string)).toMatchObject({ status: "done", model: "claude-fable-5" });
+    expect(withModel).not.toHaveProperty("model"); // blob-only — never on the clear envelope
+    const without = await buildDoneEnvelope("s", rec(), 5, KEY) as Record<string, unknown>;
+    expect(await decryptBlob(KEY, without.blob as string)).not.toHaveProperty("model"); // omitted, never ""
+  });
 });
 
 // --- live-session discovery seam (provisional builders + the generic discovery step) ---------
@@ -153,6 +162,10 @@ describe("buildProvisionalBlob (mirrors buildBlob's SessionStart shape)", () => 
   test("claude-style (empty agent fields) omits the agent key", async () => {
     const blob = await buildProvisionalBlob(disc(), "Mac", {}, KEY);
     expect(await decryptBlob(KEY, blob)).not.toHaveProperty("agent");
+  });
+  test("omits `model` — unknown at process-scan discovery; the first real hook self-corrects it", async () => {
+    const blob = await buildProvisionalBlob(disc(), "Mac", { agent: "codex" }, KEY);
+    expect(await decryptBlob(KEY, blob)).not.toHaveProperty("model");
   });
 });
 
@@ -687,6 +700,13 @@ describe("buildNeedsAttentionEnvelope (dropped-hook corrective → same envelope
     const bare = await buildNeedsAttentionEnvelope("s", rec(), 5, KEY) as Record<string, unknown>;
     expect(await decryptBlob(KEY, bare.blob as string)).not.toHaveProperty("turnStartedAt");
     expect(bare).not.toHaveProperty("startedAt");
+  });
+  test("preserves the record's cached model in the rebuilt blob (like buildDoneEnvelope); omits when absent", async () => {
+    const withModel = await buildNeedsAttentionEnvelope("s", rec({ model: "gpt-5-codex" }), 5, KEY, "codex") as Record<string, unknown>;
+    expect(await decryptBlob(KEY, withModel.blob as string)).toMatchObject({ status: "needsAttention", agent: "codex", model: "gpt-5-codex" });
+    expect(withModel).not.toHaveProperty("model"); // blob-only — never on the clear envelope
+    const without = await buildNeedsAttentionEnvelope("s", rec(), 5, KEY) as Record<string, unknown>;
+    expect(await decryptBlob(KEY, without.blob as string)).not.toHaveProperty("model"); // omitted, never ""
   });
 });
 

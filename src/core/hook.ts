@@ -135,8 +135,8 @@ export function transcriptStartMs(prefix: string): number | undefined {
  *  given: a mid-session `cd` changes input.cwd on every later hook, and re-deriving the label per event
  *  silently renamed the phone row / island folder chip (observed live: "api-status" → "server" after a
  *  `cd server`). Absent/empty → first event (or a recordless caller): derive from cwd as before. */
-export function buildBlob(input: Record<string, unknown>, machine: string, title: string | undefined, plan: OpPlan, agent: AgentKind = "claude", turnStartedAt?: number, pinnedLabel?: string): {
-  status: CCStatus; detail?: string; title: string; machine: string; label: string; agent?: AgentKind; turnStartedAt?: number;
+export function buildBlob(input: Record<string, unknown>, machine: string, title: string | undefined, plan: OpPlan, agent: AgentKind = "claude", turnStartedAt?: number, pinnedLabel?: string, model?: string): {
+  status: CCStatus; detail?: string; title: string; machine: string; label: string; agent?: AgentKind; turnStartedAt?: number; model?: string;
 } {
   const label = typeof pinnedLabel === "string" && pinnedLabel.length > 0
     ? pinnedLabel
@@ -146,12 +146,16 @@ export function buildBlob(input: Record<string, unknown>, machine: string, title
   // The `agent` key is OMITTED for claude (byte-identical to the pre-codex blob so old Swift builds and
   // the existing snapshots are unaffected) and the literal "codex" for a codex session. `turnStartedAt`
   // (epoch SECONDS — the current turn's start, see runHook) is likewise OMITTED when unknown, so a blob
-  // from a session with no prompt seen yet stays byte-identical to a pre-0.3.5 one.
+  // from a session with no prompt seen yet stays byte-identical to a pre-0.3.5 one. `model` (v0.8.5 —
+  // the session's raw model id, e.g. "claude-fable-5" / "gpt-5-codex", resolved by the adapter's
+  // optional model seam) follows the same rule: OMITTED entirely when unknown, never an empty string;
+  // the phone hides its badge when the key is absent.
   return {
     status: plan.status, title: title ?? "", machine, label,
     ...(detail ? { detail } : {}),
     ...(agent === "codex" ? { agent: "codex" as const } : {}),
     ...(typeof turnStartedAt === "number" && Number.isFinite(turnStartedAt) ? { turnStartedAt } : {}),
+    ...(typeof model === "string" && model.length > 0 ? { model } : {}),
   };
 }
 
@@ -161,7 +165,7 @@ export function buildBlob(input: Record<string, unknown>, machine: string, title
  *  drives the re-arm (a start after a done becomes an update). */
 export async function buildEnvelope(
   input: unknown, machine: string, now: number, title: string | undefined, e2eKey: Uint8Array, sentDone: boolean,
-  agent: AgentKind = "claude", startedAt?: number, turnStartedAt?: number, pinnedLabel?: string,
+  agent: AgentKind = "claude", startedAt?: number, turnStartedAt?: number, pinnedLabel?: string, model?: string,
 ): Promise<Record<string, unknown> | null> {
   if (typeof input !== "object" || input === null) return null;
   const i = input as Record<string, unknown>;
@@ -174,9 +178,9 @@ export async function buildEnvelope(
   const base: Record<string, unknown> = { v: 2, sessionId: i.session_id, op: plan.op, prio: plan.prio, ts: now };
   if (typeof startedAt === "number" && Number.isFinite(startedAt)) base.startedAt = startedAt;
   if (plan.op === "end") return base; // clean SessionEnd carries no content — worker reuses last blob
-  // turnStartedAt rides INSIDE the encrypted blob only — the clear envelope shape above must stay
-  // byte-identical (no new fields the worker could see; zero server changes).
-  const blob = await encryptBlob(e2eKey, buildBlob(i, machine, title, plan, agent, turnStartedAt, pinnedLabel));
+  // turnStartedAt and model ride INSIDE the encrypted blob only — the clear envelope shape above must
+  // stay byte-identical (no new fields the worker could see; zero server changes).
+  const blob = await encryptBlob(e2eKey, buildBlob(i, machine, title, plan, agent, turnStartedAt, pinnedLabel, model));
   return { ...base, blob };
 }
 
@@ -187,7 +191,7 @@ export async function buildEnvelope(
  *  op:end is skipped — it carries no blob for a session the worker has never seen. */
 export function buildPendingStash(
   input: Record<string, unknown>, machine: string, title: string | undefined, now: number, pid: number = process.ppid,
-  agent: AgentKind = "claude",
+  agent: AgentKind = "claude", model?: string,
 ): PendingEventStash | null {
   if (typeof input.session_id !== "string" || input.session_id.length === 0) return null;
   const hookName = typeof input.hook_event_name === "string" ? input.hook_event_name : "";
@@ -201,7 +205,9 @@ export function buildPendingStash(
   // mid-pairing there is no session record to read a cached anchor from, so any other hook's turn
   // start is genuinely unknown and the blob omits it (the widget falls back to `startedAt`).
   const turnStartedAt = hookName === "UserPromptSubmit" ? Math.floor(now / 1000) : undefined;
-  return { sessionId: input.session_id, op: plan.op, prio: plan.prio, blob: buildBlob(input, machine, title, plan, agent, turnStartedAt), stashedAt: now, pid };
+  // `model` rides inside the stashed plaintext blob (like `agent`), so the flush's first pairing
+  // frame carries it and the flush-written session record can cache it.
+  return { sessionId: input.session_id, op: plan.op, prio: plan.prio, blob: buildBlob(input, machine, title, plan, agent, turnStartedAt, undefined, model), stashedAt: now, pid };
 }
 
 /** Stash THIS hook's plaintext event next to config.json (owner-only, like config.json) so the pairing
@@ -209,10 +215,10 @@ export function buildPendingStash(
  *  Best-effort: a missed stash just leaves the phone waiting for the next hook, as it does today. */
 export async function stashPendingEvent(
   input: Record<string, unknown>, machine: string, title: string | undefined, now: number,
-  stashPath = PENDING_STASH_PATH, pid: number = process.ppid, agent: AgentKind = "claude",
+  stashPath = PENDING_STASH_PATH, pid: number = process.ppid, agent: AgentKind = "claude", model?: string,
 ): Promise<void> {
   try {
-    const stash = buildPendingStash(input, machine, title, now, pid, agent);
+    const stash = buildPendingStash(input, machine, title, now, pid, agent, model);
     if (!stash) return;
     await atomicWrite(stashPath, JSON.stringify(stash), 0o600);
   } catch {
@@ -227,7 +233,7 @@ export async function stashPendingEvent(
 export async function trackSession(
   sessionId: string, op: CCOp, prio: 0 | 1, status: CCStatus, blob: string | undefined,
   machine: string, label: string, transcript: string, agent: AgentKind = "claude", sessionStartedAt?: number,
-  turnStartedAt?: number, turnId?: string, title?: string, pairingId?: string,
+  turnStartedAt?: number, turnId?: string, title?: string, pairingId?: string, model?: string,
 ): Promise<void> {
   try {
     const path = `${SESSIONS_DIR}/${sessionId}.json`;
@@ -264,6 +270,10 @@ export async function trackSession(
       // without a cached title they'd re-push title:"" — the phone then falls back to the folder-name
       // label. Omitted when no title has ever resolved.
       ...(typeof title === "string" && title.length > 0 ? { title } : {}),
+      // The last NON-EMPTY model id (callers thread `model ?? previousRecord.model`, like title), so
+      // the watchdog's rebuilt done/needsAttention blobs keep the phone's model badge instead of
+      // dropping it. Omitted when no model has ever resolved.
+      ...(typeof model === "string" && model.length > 0 ? { model } : {}),
       // The pairing this record's `blob` was SEALED under. A re-pair rotates the key; the watchdog's
       // staleness heartbeat re-sends `blob` verbatim, so it must only do that while the pairing that
       // sealed it is still the live one — otherwise the phone renders an undecryptable ghost forever.
@@ -400,6 +410,13 @@ export async function runHook(agent: AgentKind): Promise<void> {
     const readTitle = async (): Promise<string | undefined> =>
       adapter.title({ sessionId: input.session_id as string, prefix: await getPrefix(), input });
 
+    // The session's model id (v0.8.5), resolved by the adapter's OPTIONAL seam next to the title —
+    // undefined when the adapter omits the seam or nothing resolves (the blob then omits `model`).
+    // The transcript path rides alongside the memoized prefix because the freshest model sits at the
+    // transcript TAIL (one bounded readSuffix inside the adapter).
+    const readModel = async (): Promise<string | undefined> =>
+      adapter.model?.({ sessionId: input.session_id as string, prefix: await getPrefix(), input, transcriptPath });
+
     // No completed config: normally inert. But if a pairing is PENDING (QR on screen, phone not yet
     // scanned), stash this hook's plaintext event — we have no e2eKey to POST with yet. The pairing
     // completer flushes it the moment it derives the key, so the phone shows the pairing session
@@ -408,7 +425,7 @@ export async function runHook(agent: AgentKind): Promise<void> {
       const pending = await loadPendingConfig();
       if (pending) {
         const machine = pending.machineName ?? hostname().replace(/\.local$/, "");
-        await stashPendingEvent(input, machine, await readTitle(), Date.now(), PENDING_STASH_PATH, process.ppid, agent);
+        await stashPendingEvent(input, machine, await readTitle(), Date.now(), PENDING_STASH_PATH, process.ppid, agent, await readModel());
       }
       return;
     }
@@ -440,6 +457,9 @@ export async function runHook(agent: AgentKind): Promise<void> {
     if (agent === "codex") await reconcileProvisional(config, process.ppid);
 
     const title = await readTitle();
+    // Keep the LAST NON-EMPTY model, like title: a hook whose tail read finds nothing (transcript
+    // raced away, no assistant turn in the window) must not drop the badge the previous hook set.
+    const model = (await readModel()) ?? existingRecord?.model;
     const sentDone = existingRecord?.sentDone === true;
     const cachedStart = typeof existingRecord?.sessionStartedAt === "number" && Number.isFinite(existingRecord.sessionStartedAt)
       ? existingRecord.sessionStartedAt : undefined;
@@ -467,7 +487,7 @@ export async function runHook(agent: AgentKind): Promise<void> {
     const label = typeof existingRecord?.label === "string" && existingRecord.label.length > 0
       ? existingRecord.label
       : typeof input.cwd === "string" && input.cwd.length > 0 ? basename(input.cwd) : "session";
-    const envelope = await buildEnvelope(input, machine, Date.now(), title, config.e2eKey, sentDone, agent, startedAt, turnStartedAt, label);
+    const envelope = await buildEnvelope(input, machine, Date.now(), title, config.e2eKey, sentDone, agent, startedAt, turnStartedAt, label, model);
     if (!envelope) return;
 
     // Record (or, on op:end, remove) this session's file and make sure the liveness watchdog is
@@ -477,7 +497,7 @@ export async function runHook(agent: AgentKind): Promise<void> {
     // corrective envelopes never regress to title:"" — and stamp the pairing the blob was sealed
     // under so a heartbeat after a re-pair can't re-send an undecryptable stale blob.
     await trackSession(input.session_id, plan.op, plan.prio, plan.status, envelope.blob as string | undefined, machine, label, transcriptPath, agent, startedAt, turnStartedAt, turnId,
-      title ?? existingRecord?.title, config.pairingId);
+      title ?? existingRecord?.title, config.pairingId, model);
     ensureWatchdog();
 
     const res = await fetch(`${config.url}/v1/cc/event`, {

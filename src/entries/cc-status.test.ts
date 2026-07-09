@@ -412,6 +412,39 @@ describe("turnStartedAt threading (blob-only; omitted when unknown)", () => {
   });
 });
 
+// --- model (the blob's OPTIONAL raw model id, v0.8.5) ------------------------------------------
+//
+// Wire contract with the app (build 54): JSON key `model`, a raw model id string (e.g.
+// "claude-fable-5", "gpt-5-codex"), OMITTED entirely when unknown — never required, never "". Rides
+// ONLY inside the encrypted blob (like turnStartedAt): the clear envelope / worker stay blind.
+describe("model threading (blob-only, optional; omitted when unknown — never an empty string)", () => {
+  const input = { session_id: "abc", hook_event_name: "PreToolUse", tool_name: "Edit", cwd: "/x/api-status" };
+  const plan = planOp("PreToolUse", input, false)!;
+
+  test("buildBlob includes a known model; OMITS the key when undefined or empty", () => {
+    expect(buildBlob(input, "Mac", "t", plan, "claude", undefined, undefined, "claude-fable-5"))
+      .toEqual({ status: "working", detail: "editing", title: "t", machine: "Mac", label: "api-status", model: "claude-fable-5" });
+    expect(buildBlob(input, "Mac", "t", plan)).not.toHaveProperty("model");
+    expect(buildBlob(input, "Mac", "t", plan, "claude", undefined, undefined, "")).not.toHaveProperty("model");
+  });
+
+  test("buildEnvelope carries it INSIDE the encrypted blob — the clear envelope shape is unchanged", async () => {
+    const env = (await buildEnvelope(input, "m", 1234, "t", KEY, false, "codex", 999, undefined, undefined, "gpt-5-codex"))!;
+    expect(env).not.toHaveProperty("model"); // never on the wire — the worker stays blind
+    expect(Object.keys(env).sort()).toEqual(["blob", "op", "prio", "sessionId", "startedAt", "ts", "v"]);
+    expect(await decryptBlob(KEY, (env as { blob: string }).blob)).toMatchObject({ agent: "codex", model: "gpt-5-codex" });
+    const without = (await buildEnvelope(input, "m", 1234, "t", KEY, false))!;
+    expect(await decryptBlob(KEY, (without as { blob: string }).blob)).not.toHaveProperty("model");
+  });
+
+  test("a mid-pairing stash carries the model inside its plaintext blob (the first pairing frame)", () => {
+    const stop = { session_id: "s1", hook_event_name: "Stop", cwd: "/x" };
+    expect(buildPendingStash(stop, "Mac", "t", 1, 7, "claude", "claude-fable-5")!.blob)
+      .toMatchObject({ model: "claude-fable-5" });
+    expect(buildPendingStash(stop, "Mac", "t", 1, 7)!.blob).not.toHaveProperty("model");
+  });
+});
+
 // --- pending-pairing stash (a hook that fires WHILE pairing is still pending) -----------------
 //
 // Mid-pairing the hook has no e2eKey, so instead of POSTing it stashes the PLAINTEXT event; the
@@ -721,6 +754,26 @@ describe("trackSession + readRecord file glue (sentDone survives a fresh disk re
       const rec = await readRecord(sessionId);
       expect(rec).not.toBeNull();
       expect(rec?.turnStartedAt).toBeUndefined();
+    } finally {
+      await unlink(`${SESSIONS_DIR}/${sessionId}.json`).catch(() => {});
+    }
+  });
+
+  test("model round-trips through the record (cached like title for the watchdog's rebuilt blobs); omitted when unknown", async () => {
+    const sessionId = `test-model-${randomUUID()}`;
+    try {
+      // A hook that resolved the model caches it so the watchdog's corrective done/needsAttention
+      // envelopes (which rebuild their blobs from the record) keep the phone's model badge.
+      await trackSession(sessionId, "update", 0, "working", "B", "mac", "proj", "/tmp/t.jsonl", "claude",
+        undefined, undefined, undefined, "add font", undefined, "claude-fable-5");
+      expect((await readRecord(sessionId))?.model).toBe("claude-fable-5");
+      // Unknown model → the field is simply absent (an old record without it must still load), and an
+      // empty string is never persisted.
+      await trackSession(sessionId, "update", 0, "working", "B", "mac", "proj", "/tmp/t.jsonl", "claude",
+        undefined, undefined, undefined, undefined, undefined, "");
+      const rec = await readRecord(sessionId);
+      expect(rec).not.toBeNull();
+      expect(rec?.model).toBeUndefined();
     } finally {
       await unlink(`${SESSIONS_DIR}/${sessionId}.json`).catch(() => {});
     }

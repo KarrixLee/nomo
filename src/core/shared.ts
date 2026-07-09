@@ -152,6 +152,12 @@ export interface SessionRecord {
    *  done/needsAttention envelopes rebuild their blobs from the record; without this they'd re-push
    *  title:"" and the phone would fall back to the folder-name label. Absent → no title yet. */
   title?: string;
+  /** The last NON-EMPTY raw model id POSTed for this session (e.g. "claude-fable-5", "gpt-5-codex";
+   *  the hook threads `model ?? previousRecord.model`, exactly like title). The watchdog's corrective
+   *  done/needsAttention envelopes rebuild their blobs from the record; caching the model here keeps
+   *  the phone's model badge on those frames instead of silently dropping it. Absent → unknown; the
+   *  rebuilt blob then OMITS the optional `model` key (never an empty string). */
+  model?: string;
   /** The pairingId whose key SEALED this record's `blob`. A re-pair rotates both the pairing and the
    *  E2E key, but session records survive it — so the watchdog's staleness heartbeat (which re-sends
    *  `blob` verbatim) must check this against the CURRENT config.pairingId and skip on mismatch;
@@ -175,7 +181,7 @@ export interface PendingEventStash {
   sessionId: string;
   op: CCOp;
   prio: 0 | 1;
-  blob: { status: CCStatus; detail?: string; title: string; machine: string; label: string; agent?: AgentKind; turnStartedAt?: number };
+  blob: { status: CCStatus; detail?: string; title: string; machine: string; label: string; agent?: AgentKind; turnStartedAt?: number; model?: string };
   /** Epoch-ms the stashing hook fired — bounds the flush to the QR's 10-min TTL (a stale stash is a
    *  ghost from a turn long since over and is dropped, not posted). */
   stashedAt: number;
@@ -488,6 +494,9 @@ async function flushPendingStash(
           // trackSession — so a watchdog corrective keeps the title and the heartbeat's key-rotation
           // guard can prove the blob decryptable.
           ...(typeof stash.blob.title === "string" && stash.blob.title.length > 0 ? { title: stash.blob.title } : {}),
+          // Cache the stash's model the same way (the stashed plaintext blob carries it, like agent/
+          // title), so a watchdog corrective on this flushed session keeps the phone's model badge.
+          ...(typeof stash.blob.model === "string" && stash.blob.model.length > 0 ? { model: stash.blob.model } : {}),
           ...(pairingId.length > 0 ? { pairingId } : {}),
         };
         // Owner-only (0600): like the hook's trackSession, this record carries hostname, cwd basename,

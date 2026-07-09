@@ -2,7 +2,7 @@ import { createRequire } from "node:module";
 var __require = /* @__PURE__ */ createRequire(import.meta.url);
 
 // src/core/hook.ts
-import { readdir as readdir2, readFile as readFile2, unlink as unlink2 } from "node:fs/promises";
+import { readdir as readdir2, readFile as readFile3, unlink as unlink2 } from "node:fs/promises";
 import { hostname } from "node:os";
 import { basename as basename2 } from "node:path";
 
@@ -73,7 +73,7 @@ async function sha256Hex(s) {
 
 // src/core/adapter.ts
 import { execFile } from "node:child_process";
-import { readdir, stat as stat2 } from "node:fs/promises";
+import { readdir, readFile as readFile2, stat as stat2 } from "node:fs/promises";
 import { promisify } from "node:util";
 import { basename, join as join2 } from "node:path";
 
@@ -258,6 +258,7 @@ async function flushPendingStash(stashPath, url, pairingId, pcSecret, e2eKey, no
           blob,
           ...stash.blob.agent === "codex" ? { agent: "codex" } : {},
           ...typeof stash.blob.title === "string" && stash.blob.title.length > 0 ? { title: stash.blob.title } : {},
+          ...typeof stash.blob.model === "string" && stash.blob.model.length > 0 ? { model: stash.blob.model } : {},
           ...pairingId.length > 0 ? { pairingId } : {}
         };
         await atomicWrite(`${sessionsDir}/${stash.sessionId}.json`, JSON.stringify(record), 384);
@@ -616,6 +617,133 @@ function firstUserPrompt(transcript) {
   return firstUserPromptFromLines(transcript.split(`
 `));
 }
+var MODEL_TAIL_BYTES = 64 * 1024;
+function assistantModelFromLine(line) {
+  if (!line.includes('"assistant"') || !line.includes('"model"'))
+    return;
+  let row;
+  try {
+    row = JSON.parse(line);
+  } catch {
+    return;
+  }
+  if (typeof row !== "object" || row === null)
+    return;
+  const r = row;
+  if (r.type !== "assistant")
+    return;
+  if (r.isSidechain === true)
+    return;
+  const model = r.message?.model;
+  if (typeof model !== "string")
+    return;
+  const cleaned = model.trim();
+  if (!cleaned || cleaned.startsWith("<"))
+    return;
+  return cleaned;
+}
+function lastAssistantModel(text) {
+  const lines = text.split(`
+`);
+  for (let i = lines.length - 1;i >= 0; i--) {
+    const m = assistantModelFromLine(lines[i]);
+    if (m)
+      return m;
+  }
+  return;
+}
+function firstAssistantModel(text) {
+  for (const line of text.split(`
+`)) {
+    const m = assistantModelFromLine(line);
+    if (m)
+      return m;
+  }
+  return;
+}
+async function claudeSessionModel(prefix, transcriptPath) {
+  if (transcriptPath.length > 0) {
+    try {
+      const m = lastAssistantModel(await readSuffix(transcriptPath, MODEL_TAIL_BYTES));
+      if (m)
+        return m;
+    } catch {}
+  }
+  return prefix.length > 0 ? firstAssistantModel(prefix) : undefined;
+}
+function codexModelFromRollout(text) {
+  const lines = text.split(`
+`);
+  for (let i = lines.length - 1;i >= 0; i--) {
+    const line = lines[i];
+    if (!line.includes("turn_context"))
+      continue;
+    let row;
+    try {
+      row = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (typeof row !== "object" || row === null)
+      continue;
+    const r = row;
+    if (r.type !== "turn_context")
+      continue;
+    const model = r.payload?.model;
+    if (typeof model !== "string")
+      continue;
+    const cleaned = model.trim();
+    if (cleaned)
+      return cleaned;
+  }
+  return;
+}
+function codexConfigModel(toml) {
+  for (const line of toml.split(`
+`)) {
+    if (/^\s*\[/.test(line))
+      break;
+    const m = line.match(/^\s*model\s*=\s*(.*)$/);
+    if (!m)
+      continue;
+    const rest = m[1].trim();
+    const dq = rest.match(/^"((?:[^"\\]|\\.)*)"/);
+    if (dq) {
+      try {
+        const v = JSON.parse(`"${dq[1]}"`);
+        if (v.length > 0)
+          return v;
+      } catch {}
+      return;
+    }
+    const sq = rest.match(/^'([^']*)'/);
+    if (sq && sq[1].length > 0)
+      return sq[1];
+    return;
+  }
+  return;
+}
+async function codexSessionModel(input, prefix, transcriptPath, home = codexHome()) {
+  if (typeof input.model === "string" && input.model.trim().length > 0)
+    return input.model.trim();
+  if (transcriptPath.length > 0) {
+    try {
+      const m = codexModelFromRollout(await readSuffix(transcriptPath, MODEL_TAIL_BYTES));
+      if (m)
+        return m;
+    } catch {}
+  }
+  if (prefix.length > 0) {
+    const m = codexModelFromRollout(prefix);
+    if (m)
+      return m;
+  }
+  try {
+    return codexConfigModel(await readFile2(join2(home, "config.toml"), "utf8"));
+  } catch {
+    return;
+  }
+}
 var INTERRUPT_MARKER = "interrupted by user";
 var CODEX_TURN_EVENTS = new Set(["task_started", "task_complete", "turn_aborted"]);
 var CODEX_ABORT_EVENT = "turn_aborted";
@@ -926,6 +1054,9 @@ var claudeAdapter = {
   async title({ prefix }) {
     return prefix.length > 0 ? sessionTitle(prefix) : undefined;
   },
+  model({ prefix, transcriptPath }) {
+    return claudeSessionModel(prefix, transcriptPath);
+  },
   detectInterrupt(tail) {
     const line = lastTurnLine(tail);
     return line !== null && hasInterruptMarker(line);
@@ -952,6 +1083,9 @@ var codexAdapter = {
         title = cleanPromptTitle(input.prompt);
     }
     return title;
+  },
+  model({ input, prefix, transcriptPath }) {
+    return codexSessionModel(input, prefix, transcriptPath);
   },
   detectInterrupt(tail) {
     return codexLastTurnEvent(tail) === CODEX_ABORT_EVENT;
@@ -1035,7 +1169,7 @@ function transcriptStartMs(prefix) {
   }
   return;
 }
-function buildBlob(input, machine, title, plan, agent = "claude", turnStartedAt, pinnedLabel) {
+function buildBlob(input, machine, title, plan, agent = "claude", turnStartedAt, pinnedLabel, model) {
   const label = typeof pinnedLabel === "string" && pinnedLabel.length > 0 ? pinnedLabel : typeof input.cwd === "string" && input.cwd.length > 0 ? basename2(input.cwd) : "session";
   const hookName = typeof input.hook_event_name === "string" ? input.hook_event_name : "";
   const detail = detailForHook(hookName, typeof input.tool_name === "string" ? input.tool_name : undefined);
@@ -1046,10 +1180,11 @@ function buildBlob(input, machine, title, plan, agent = "claude", turnStartedAt,
     label,
     ...detail ? { detail } : {},
     ...agent === "codex" ? { agent: "codex" } : {},
-    ...typeof turnStartedAt === "number" && Number.isFinite(turnStartedAt) ? { turnStartedAt } : {}
+    ...typeof turnStartedAt === "number" && Number.isFinite(turnStartedAt) ? { turnStartedAt } : {},
+    ...typeof model === "string" && model.length > 0 ? { model } : {}
   };
 }
-async function buildEnvelope(input, machine, now, title, e2eKey, sentDone, agent = "claude", startedAt, turnStartedAt, pinnedLabel) {
+async function buildEnvelope(input, machine, now, title, e2eKey, sentDone, agent = "claude", startedAt, turnStartedAt, pinnedLabel, model) {
   if (typeof input !== "object" || input === null)
     return null;
   const i = input;
@@ -1064,10 +1199,10 @@ async function buildEnvelope(input, machine, now, title, e2eKey, sentDone, agent
     base.startedAt = startedAt;
   if (plan.op === "end")
     return base;
-  const blob = await encryptBlob(e2eKey, buildBlob(i, machine, title, plan, agent, turnStartedAt, pinnedLabel));
+  const blob = await encryptBlob(e2eKey, buildBlob(i, machine, title, plan, agent, turnStartedAt, pinnedLabel, model));
   return { ...base, blob };
 }
-function buildPendingStash(input, machine, title, now, pid = process.ppid, agent = "claude") {
+function buildPendingStash(input, machine, title, now, pid = process.ppid, agent = "claude", model) {
   if (typeof input.session_id !== "string" || input.session_id.length === 0)
     return null;
   const hookName = typeof input.hook_event_name === "string" ? input.hook_event_name : "";
@@ -1075,17 +1210,17 @@ function buildPendingStash(input, machine, title, now, pid = process.ppid, agent
   if (!plan || plan.op === "end")
     return null;
   const turnStartedAt = hookName === "UserPromptSubmit" ? Math.floor(now / 1000) : undefined;
-  return { sessionId: input.session_id, op: plan.op, prio: plan.prio, blob: buildBlob(input, machine, title, plan, agent, turnStartedAt), stashedAt: now, pid };
+  return { sessionId: input.session_id, op: plan.op, prio: plan.prio, blob: buildBlob(input, machine, title, plan, agent, turnStartedAt, undefined, model), stashedAt: now, pid };
 }
-async function stashPendingEvent(input, machine, title, now, stashPath = PENDING_STASH_PATH, pid = process.ppid, agent = "claude") {
+async function stashPendingEvent(input, machine, title, now, stashPath = PENDING_STASH_PATH, pid = process.ppid, agent = "claude", model) {
   try {
-    const stash = buildPendingStash(input, machine, title, now, pid, agent);
+    const stash = buildPendingStash(input, machine, title, now, pid, agent, model);
     if (!stash)
       return;
     await atomicWrite(stashPath, JSON.stringify(stash), 384);
   } catch {}
 }
-async function trackSession(sessionId, op, prio, status, blob, machine, label, transcript, agent = "claude", sessionStartedAt, turnStartedAt, turnId, title, pairingId) {
+async function trackSession(sessionId, op, prio, status, blob, machine, label, transcript, agent = "claude", sessionStartedAt, turnStartedAt, turnId, title, pairingId, model) {
   try {
     const path = `${SESSIONS_DIR}/${sessionId}.json`;
     if (op === "end") {
@@ -1108,6 +1243,7 @@ async function trackSession(sessionId, op, prio, status, blob, machine, label, t
       ...typeof turnStartedAt === "number" && Number.isFinite(turnStartedAt) ? { turnStartedAt } : {},
       ...typeof turnId === "string" && turnId.length > 0 ? { turnId } : {},
       ...typeof title === "string" && title.length > 0 ? { title } : {},
+      ...typeof model === "string" && model.length > 0 ? { model } : {},
       ...typeof pairingId === "string" && pairingId.length > 0 ? { pairingId } : {}
     };
     await atomicWrite(path, JSON.stringify(record), 384);
@@ -1122,7 +1258,7 @@ async function reconcileProvisional(config, hookPid) {
         continue;
       let r;
       try {
-        r = JSON.parse(await readFile2(`${SESSIONS_DIR}/${f}`, "utf8"));
+        r = JSON.parse(await readFile3(`${SESSIONS_DIR}/${f}`, "utf8"));
       } catch {
         continue;
       }
@@ -1150,7 +1286,7 @@ async function readTrackedSessions() {
     if (!f.endsWith(".json"))
       continue;
     try {
-      const r = JSON.parse(await readFile2(`${SESSIONS_DIR}/${f}`, "utf8"));
+      const r = JSON.parse(await readFile3(`${SESSIONS_DIR}/${f}`, "utf8"));
       out.push({ sessionId: basename2(f, ".json"), pid: r.pid, provisional: r.provisional, agent: r.agent });
     } catch {}
   }
@@ -1187,11 +1323,12 @@ async function runHook(agent) {
       return prefixCache;
     };
     const readTitle = async () => adapter2.title({ sessionId: input.session_id, prefix: await getPrefix(), input });
+    const readModel = async () => adapter2.model?.({ sessionId: input.session_id, prefix: await getPrefix(), input, transcriptPath });
     if (!config) {
       const pending = await loadPendingConfig();
       if (pending) {
         const machine2 = pending.machineName ?? hostname().replace(/\.local$/, "");
-        await stashPendingEvent(input, machine2, await readTitle(), Date.now(), PENDING_STASH_PATH, process.ppid, agent);
+        await stashPendingEvent(input, machine2, await readTitle(), Date.now(), PENDING_STASH_PATH, process.ppid, agent, await readModel());
       }
       return;
     }
@@ -1210,6 +1347,7 @@ async function runHook(agent) {
     if (agent === "codex")
       await reconcileProvisional(config, process.ppid);
     const title = await readTitle();
+    const model = await readModel() ?? existingRecord?.model;
     const sentDone = existingRecord?.sentDone === true;
     const cachedStart = typeof existingRecord?.sessionStartedAt === "number" && Number.isFinite(existingRecord.sessionStartedAt) ? existingRecord.sessionStartedAt : undefined;
     const startedAt = cachedStart ?? transcriptStartMs(await getPrefix());
@@ -1221,10 +1359,10 @@ async function runHook(agent) {
     if (!plan)
       return;
     const label = typeof existingRecord?.label === "string" && existingRecord.label.length > 0 ? existingRecord.label : typeof input.cwd === "string" && input.cwd.length > 0 ? basename2(input.cwd) : "session";
-    const envelope = await buildEnvelope(input, machine, Date.now(), title, config.e2eKey, sentDone, agent, startedAt, turnStartedAt, label);
+    const envelope = await buildEnvelope(input, machine, Date.now(), title, config.e2eKey, sentDone, agent, startedAt, turnStartedAt, label, model);
     if (!envelope)
       return;
-    await trackSession(input.session_id, plan.op, plan.prio, plan.status, envelope.blob, machine, label, transcriptPath, agent, startedAt, turnStartedAt, turnId, title ?? existingRecord?.title, config.pairingId);
+    await trackSession(input.session_id, plan.op, plan.prio, plan.status, envelope.blob, machine, label, transcriptPath, agent, startedAt, turnStartedAt, turnId, title ?? existingRecord?.title, config.pairingId, model);
     ensureWatchdog();
     const res = await fetch(`${config.url}/v1/cc/event`, {
       method: "POST",
