@@ -13,7 +13,7 @@
 // PORTABILITY: bun AND node >= 18 — no `Bun.*` APIs; file IO via node:fs/promises (shared helpers).
 
 import { join } from "node:path";
-import { AgentKind, codexHome, lastHookPath, readSuffix } from "./shared";
+import { AgentKind, codexHome, lastHookPath, readSuffix, SessionRecord } from "./shared";
 
 /// Tool → semantic sub-status key (localized on-device by the widget). Mirrors the reference
 /// menu-bar app's tool labels, but as stable keys, not English strings. Unknown tools (e.g. MCP)
@@ -314,6 +314,29 @@ export function codexLastTurnEvent(text: string): string | null {
   return null;
 }
 
+// --- Live session discovery (the seam that closes the Codex "late session" gap) --------------
+//
+// Codex fires NO hook at session OPEN — its SessionStart fires only at the FIRST prompt
+// (openai/codex#15269) — so a freshly-opened Codex TUI is invisible to the phone for 30 s+. The
+// shared watchdog closes this by asking each adapter to discover live sessions the hooks can't see
+// yet (adapter.discoverLive) and surfacing a PROVISIONAL session for each, reconciled away once the
+// real hook finally fires. Claude needs none of this (its SessionStart fires at true open).
+
+/** A live session found by process-scan that no hook has reported yet (see AgentAdapter.discoverLive).
+ *  The watchdog turns each into a provisional op:start + a provisional session record, then reconciles
+ *  it away when the real hook arrives (or reaps it when the process dies). */
+export interface DiscoveredSession {
+  /** The discovered process — the interactive agent TUI. Stored on the provisional record so the
+   *  watchdog reaps the provisional when this pid dies and the hook reconcile can match it. */
+  pid: number;
+  /** The sentinel session id for the provisional (agent-specific; e.g. codex `codex-pid-<pid>`). */
+  sessionId: string;
+  /** Display title for the provisional blob — the cwd basename, since no real prompt exists yet. */
+  title?: string;
+  /** cwd-basename label, exactly like buildBlob's `label`. */
+  label: string;
+}
+
 // --- The adapter ------------------------------------------------------------------------------
 
 /** Everything the two agent bridges do DIFFERENTLY, behind one interface. `adapterFor(agent)`
@@ -337,6 +360,22 @@ export interface AgentAdapter {
   hooksNotFiringHint: string;
   /** This agent's half of the tool→detail map (see the merged-lookup note above). */
   toolDetail: Record<string, string>;
+  /** The extra fields this agent stamps into an encrypted blob to identify itself — spread into the
+   *  blob object so the watchdog's corrective/heartbeat/discovery POSTs carry the same `agent` key the
+   *  hook would. Claude yields `{}` (byte-identical to the pre-codex blob); Codex yields
+   *  `{ agent: "codex" }`. Replaces the watchdog's old inline `agent === "codex" ? …` ternary so no
+   *  per-agent branch remains in the agent-agnostic daemon. Typed as `{ agent?: AgentKind }` so it
+   *  spreads cleanly into both a blob object and a SessionRecord (whose `agent` follows the same
+   *  omit-for-claude convention). */
+  blobAgentFields: { agent?: AgentKind };
+  /** OPTIONAL: discover live sessions the hooks can't see yet — interactive TUIs for which NO
+   *  SessionStart has fired. Called on every watchdog sweep with the already-tracked sessions (so their
+   *  pids can be excluded). Claude OMITS it (its SessionStart fires at true session open, so there's
+   *  nothing to discover); Codex implements it because its SessionStart fires only at the FIRST prompt
+   *  (openai/codex#15269), leaving a freshly-opened TUI invisible for 30 s+. Returns the provisional
+   *  sessions to surface immediately; the watchdog POSTs an op:start + writes a provisional record for
+   *  each, and the hook (or a sweep backstop) reconciles them away once the real hook fires. */
+  discoverLive?(known: SessionRecord[]): Promise<DiscoveredSession[]>;
 }
 
 export const claudeAdapter: AgentAdapter = {
@@ -354,6 +393,10 @@ export const claudeAdapter: AgentAdapter = {
   hookStampPath: () => lastHookPath("claude"),
   hooksNotFiringHint: "  Reinstall the plugin / check /plugin.",
   toolDetail: claudeToolDetail,
+  // Claude blobs OMIT the agent key (byte-identical to the pre-codex blob), so this is empty.
+  blobAgentFields: {},
+  // No discoverLive: Claude's SessionStart fires at true session open, so the hooks already see every
+  // session — there is nothing for the watchdog to discover ahead of them.
 };
 
 export const codexAdapter: AgentAdapter = {
@@ -385,9 +428,18 @@ export const codexAdapter: AgentAdapter = {
   hookStampPath: () => lastHookPath("codex"),
   hooksNotFiringHint: "  Run /hooks in Codex to re-trust, or reinstall the plugin — known upstream bugs #16430/#30835.",
   toolDetail: codexToolDetail,
+  // Codex blobs carry `agent:"codex"` so the phone tabs/icons the session correctly.
+  blobAgentFields: { agent: "codex" as const },
+  // discoverLive is populated in the feature commit; the seam ships with a no-op stub so the generic
+  // watchdog discovery step is wired and green without yet scanning any processes.
+  discoverLive: async (): Promise<DiscoveredSession[]> => [],
 };
 
 /** Select the concrete adapter for an agent kind. */
 export function adapterFor(agent: AgentKind): AgentAdapter {
   return agent === "codex" ? codexAdapter : claudeAdapter;
 }
+
+/** Every concrete adapter, so the agent-agnostic watchdog can drive its generic per-agent steps
+ *  (e.g. discovery) across all agents without an inline `agent === …` branch. */
+export const allAdapters: AgentAdapter[] = [claudeAdapter, codexAdapter];

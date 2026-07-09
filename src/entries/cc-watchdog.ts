@@ -1,21 +1,37 @@
-// cc-watchdog — reaps Claude Code sessions whose terminal was force-killed (v2: pairing + E2E).
+// cc-watchdog — the SHARED, AGENT-AGNOSTIC liveness/discovery daemon for the coding-CLI status
+// pipeline (the "cc" prefix names that pipeline, NOT Claude specifically — it drives Claude Code AND
+// Codex sessions; file/identifier/dist names are FROZEN, so the prefix stays).
 //
-// The cc-status hook fires a SessionEnd on a clean exit, but closing a terminal kills `claude`
-// with no hook at all — so the phone's Live Activity would keep showing that session "working"
-// until the Worker's 30-min staleness eviction. This detached poller closes the gap in seconds:
-// the hook records each session's `claude` pid (process.ppid) in ~/.config/cc-status/sessions/, and
-// this process checks liveness with kill(pid,0) every few seconds, POSTing an op:end for any dead
-// one. All corrective POSTs use the SAME v2 blind envelope + per-pairing headers as the hook.
+// ALL per-agent behavior comes from the adapters (../core/adapter): which transcript-interrupt marker
+// to scan for, what `agent` field a blob carries, and which live sessions a process-scan can discover
+// ahead of the hooks. The daemon itself never branches on `agent === …`.
 //
-// Contract — identical posture to cc-status.ts: NOTHING on stdout, swallow every error, never
-// linger. Auto-exits when no sessions remain (the hook re-spawns it), single-instance via
-// ~/.config/cc-status/watchdog.pid. PORTABLE: no `Bun.*` — file IO via node:fs/promises helpers.
+// Two gaps it closes:
+//   1. REAP — the hook fires a SessionEnd on a clean exit, but force-closing a terminal kills the
+//      agent with no hook at all, so the phone's Live Activity would show that session "working" until
+//      the Worker's 30-min staleness eviction. The hook records each session's TUI pid (process.ppid)
+//      in ~/.config/cc-status/sessions/; this process checks liveness with kill(pid,0) every few
+//      seconds and POSTs an op:end for any dead one.
+//   2. DISCOVER — Codex fires NO hook at session OPEN (its SessionStart fires only at the FIRST prompt,
+//      openai/codex#15269), so a freshly-opened Codex TUI is invisible to the phone for 30 s+. Each
+//      sweep asks every adapter to discover live sessions the hooks can't see yet
+//      (adapter.discoverLive) and POSTs a PROVISIONAL op:start for each, reconciled away once the real
+//      hook fires. Claude implements no discovery (its SessionStart fires at true open).
+//
+// All corrective/discovery POSTs use the SAME v2 blind envelope + per-pairing headers as the hook.
+//
+// Contract — identical posture to cc-status.ts: NOTHING on stdout, swallow every error, never linger
+// needlessly. Single-instance via ~/.config/cc-status/watchdog.pid. It used to auto-exit the instant
+// zero sessions remained; it now lingers IDLE_GRACE_MS between sessions so discovery can surface the
+// NEXT freshly-opened Codex TUI instantly instead of waiting for a hook to re-spawn it.
+// PORTABLE: no `Bun.*` — file IO via node:fs/promises helpers.
 
 import { readdir, readFile, unlink } from "node:fs/promises";
 import { readFileSync, unlinkSync } from "node:fs";
+import { hostname } from "node:os";
 import { basename } from "node:path";
 import { encryptBlob } from "../core/crypto";
-import { adapterFor } from "../core/adapter";
+import { adapterFor, AgentAdapter, allAdapters, DiscoveredSession } from "../core/adapter";
 import {
   AgentKind, atomicWrite, CC_DIR, Config, completePendingPairing, GONE_STRIKE_LIMIT, loadConfig, loadPendingConfig,
   PAIR_HTML_FILE, PairPollResult, PendingConfig, pidAlive, readSuffix, recordGoneStrike, removeRevokedConfig,
@@ -38,6 +54,12 @@ export const PAIRING_TTL_MS = 600_000;
  *  the machine slept through the death. Delete it without POSTing, which caps retries so a
  *  permanently-failing POST can't loop forever. Matches the server's own plausibility window. */
 const SESSION_STALE_MS = 86_400_000; // 24h
+/** How long the daemon lingers with ZERO session records before exiting. It used to quit the instant
+ *  the sessions dir emptied (the hook re-spawns it on the next event). But discovery must keep running
+ *  BETWEEN sessions so a freshly-opened Codex TUI is surfaced the moment it appears — not only after a
+ *  hook happens to re-spawn us. 30 min sits well above a short gap between turns/sessions yet still lets
+ *  a truly idle machine's detached poller retire instead of polling forever. */
+export const IDLE_GRACE_MS = 1_800_000; // 30 min
 
 // --- PID-gated staleness heartbeat ----------------------------------------------------------
 //
@@ -101,7 +123,8 @@ export async function buildDoneEnvelope(sessionId: string, record: SessionRecord
     title: "",
     machine: typeof record.machine === "string" ? record.machine : "",
     label: typeof record.label === "string" ? record.label : "",
-    ...(agent === "codex" ? { agent: "codex" as const } : {}),
+    // Per-agent blob identity comes from the adapter (no inline `agent === …` branch in the daemon).
+    ...adapterFor(agent).blobAgentFields,
     ...(typeof record.turnStartedAt === "number" && Number.isFinite(record.turnStartedAt) ? { turnStartedAt: record.turnStartedAt } : {}),
   });
   return { v: 2, sessionId, op: "done", prio: 0, ts: now, blob, ...startedAtField(record) };
@@ -159,6 +182,112 @@ async function postEvent(config: Config, body: object): Promise<PostOutcome> {
     return postOutcomeForStatus(res.status);
   } catch {
     return "failed";
+  }
+}
+
+// --- Live session discovery (surfacing a session before its first hook) -----------------------
+//
+// Codex fires no hook at session OPEN (openai/codex#15269), so the daemon asks every adapter to
+// discover live TUIs the hooks can't see yet (adapter.discoverLive; Claude implements none) and POSTs
+// a PROVISIONAL op:start for each — mirroring the blob a real SessionStart would send — plus a
+// provisional session record so the reap/reconcile machinery can retire it. Claude's discoverLive is
+// absent, so this whole step no-ops for Claude; Codex's is a stub until the feature commit.
+
+/** The friendly machine name for a POST (config override, else the OS hostname), matching the hook. */
+function machineName(config: Config): string {
+  return config.machineName ?? hostname().replace(/\.local$/, "");
+}
+
+/** Every session record currently on disk (provisional and real). Feeds discovery's known-pid
+ *  exclusion and the reconcile backstop. Corrupt/half-written files are skipped. */
+async function readAllRecords(): Promise<SessionRecord[]> {
+  try {
+    const files = await readdir(SESSIONS_DIR);
+    const out: SessionRecord[] = [];
+    for (const f of files) {
+      if (!f.endsWith(".json")) continue;
+      try { out.push(JSON.parse(await readFile(`${SESSIONS_DIR}/${f}`, "utf8")) as SessionRecord); } catch { /* skip */ }
+    }
+    return out;
+  } catch {
+    return []; // no sessions dir yet
+  }
+}
+
+/** The provisional blob for a discovered session — byte-shaped exactly like buildBlob's output for a
+ *  SessionStart (status "working", title/machine/label, the adapter's `agent` field; no detail, no
+ *  turnStartedAt because a freshly-opened TUI has neither a tool nor a prompt yet). */
+export async function buildProvisionalBlob(
+  d: DiscoveredSession, machine: string, blobAgentFields: { agent?: AgentKind }, e2eKey: Uint8Array,
+): Promise<string> {
+  return encryptBlob(e2eKey, { status: "working", title: d.title ?? "", machine, label: d.label, ...blobAgentFields });
+}
+
+/** The provisional op:start envelope — the same v2 shape the hook POSTs for a real SessionStart. */
+export function buildStartEnvelope(sessionId: string, blob: string, now: number): object {
+  return { v: 2, sessionId, op: "start", prio: 0, ts: now, blob };
+}
+
+/** The provisional session record the discovery step persists (0600) so the daemon can reap it on pid
+ *  death and the hook (or the sweep backstop) can reconcile it away. `provisional:true` is what marks
+ *  it; `pid` is the discovered TUI process; agent rides via the adapter's blobAgentFields (omitted for
+ *  claude), keeping this free of an inline `agent === …` branch. lastEvent/op mirror trackSession's
+ *  fresh-start bookkeeping so a heartbeat/reap treats it like any other start. */
+export function buildProvisionalRecord(
+  d: DiscoveredSession, machine: string, blob: string, blobAgentFields: { agent?: AgentKind }, now: number,
+): SessionRecord {
+  return {
+    pid: d.pid,
+    machine,
+    label: d.label,
+    ts: now,
+    lastEvent: "sessionStart",
+    op: "start",
+    prio: 0,
+    blob,
+    provisional: true,
+    ...blobAgentFields,
+  };
+}
+
+/** Injectable side-effect seams for the discovery step, so it's testable without real fs/network. */
+export interface DiscoverDeps {
+  adapters?: AgentAdapter[];
+  post?: (body: object) => Promise<PostOutcome>;
+  readRecords?: () => Promise<SessionRecord[]>;
+  writeRecord?: (sessionId: string, rec: SessionRecord) => Promise<void>;
+  now?: () => number;
+}
+
+/** One discovery pass: for every adapter that implements discoverLive, surface the live TUIs the hooks
+ *  can't see yet as PROVISIONAL sessions. Each new one is POSTed as an op:start; only on a delivered
+ *  POST do we persist the provisional record (so a failed POST simply retries next sweep — the pid is
+ *  still not "known"). Best-effort throughout: a discoverLive throw or a POST failure never derails the
+ *  sweep. No-ops entirely when no adapter implements discoverLive (Claude) or none is found (Codex idle). */
+export async function discoverLiveSessions(config: Config, deps: DiscoverDeps = {}): Promise<void> {
+  const adapters = deps.adapters ?? allAdapters;
+  const post = deps.post ?? ((body: object) => postEvent(config, body));
+  const readRecords = deps.readRecords ?? readAllRecords;
+  const writeRecord = deps.writeRecord
+    ?? ((sessionId: string, rec: SessionRecord) => atomicWrite(`${SESSIONS_DIR}/${sessionId}.json`, JSON.stringify(rec), 0o600));
+  const now = deps.now ?? Date.now;
+  const machine = machineName(config);
+  const known = await readRecords();
+  for (const adapter of adapters) {
+    if (!adapter.discoverLive) continue;
+    let discovered: DiscoveredSession[];
+    try {
+      discovered = await adapter.discoverLive(known);
+    } catch {
+      continue; // a scan failure must never derail the sweep
+    }
+    for (const d of discovered) {
+      const ts = now();
+      const blob = await buildProvisionalBlob(d, machine, adapter.blobAgentFields, config.e2eKey);
+      const outcome = await post(buildStartEnvelope(d.sessionId, blob, ts));
+      if (outcome !== "delivered") continue; // failed/revoked → retry next sweep, don't persist a ghost
+      await writeRecord(d.sessionId, buildProvisionalRecord(d, machine, blob, adapter.blobAgentFields, ts));
+    }
   }
 }
 
@@ -426,9 +555,16 @@ async function run(): Promise<void> {
   // bound the self-heal to PAIRING_TTL_MS from THIS watchdog's spawn so an unreachable worker can't
   // keep us polling forever.
   const fallbackDeadline = Date.now() + PAIRING_TTL_MS;
+  // Idle-grace clock: the last time a sweep saw ANY session (or we just spawned). While paired we linger
+  // up to IDLE_GRACE_MS past this so discovery keeps watching for the next freshly-opened Codex TUI
+  // instead of retiring the instant the sessions dir empties (see IDLE_GRACE_MS).
+  let lastActiveMs = Date.now();
   try {
     while (true) {
       const config = await loadConfig(); // reload each cycle: a mid-pairing config may complete under us
+      // Discovery runs BEFORE the sweep (only when paired) so a just-surfaced provisional is counted in
+      // `remaining` this same cycle — keeping the daemon alive naturally while a discovered TUI lives.
+      if (config) await discoverLiveSessions(config);
       const result = await sweep(config);
       if (result.revoked) {
         // A /cc/event POST came back gone (404/410) this sweep. Do NOT tear down on the first one — a
@@ -472,7 +608,14 @@ async function run(): Promise<void> {
           continue;
         }
       }
-      if (remaining === 0) return; // no sessions and no pending pairing → quit; the hook re-spawns us
+      const nowMs = Date.now();
+      if (remaining > 0) lastActiveMs = nowMs; // a live session resets the idle-grace clock
+      if (remaining === 0) {
+        // No sessions this sweep. Unpaired (or mid-pairing with no pending) → nothing to discover, so
+        // retire immediately as before; the hook re-spawns us. Paired → linger through the idle grace so
+        // discovery can surface the next freshly-opened Codex TUI, then retire once truly idle.
+        if (!config || nowMs - lastActiveMs >= IDLE_GRACE_MS) return;
+      }
       await new Promise((r) => setTimeout(r, POLL_MS));
     }
   } finally {

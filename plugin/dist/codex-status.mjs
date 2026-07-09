@@ -653,7 +653,8 @@ var claudeAdapter = {
   sessionMatch: (name) => name.endsWith(".jsonl"),
   hookStampPath: () => lastHookPath("claude"),
   hooksNotFiringHint: "  Reinstall the plugin / check /plugin.",
-  toolDetail: claudeToolDetail
+  toolDetail: claudeToolDetail,
+  blobAgentFields: {}
 };
 var codexAdapter = {
   kind: "codex",
@@ -678,11 +679,14 @@ var codexAdapter = {
   sessionMatch: (name) => name.startsWith("rollout-") && name.endsWith(".jsonl"),
   hookStampPath: () => lastHookPath("codex"),
   hooksNotFiringHint: "  Run /hooks in Codex to re-trust, or reinstall the plugin — known upstream bugs #16430/#30835.",
-  toolDetail: codexToolDetail
+  toolDetail: codexToolDetail,
+  blobAgentFields: { agent: "codex" },
+  discoverLive: async () => []
 };
 function adapterFor(agent) {
   return agent === "codex" ? codexAdapter : claudeAdapter;
 }
+var allAdapters = [claudeAdapter, codexAdapter];
 
 // src/core/hook.ts
 var TOOL_DETAIL = { ...claudeToolDetail, ...codexToolDetail };

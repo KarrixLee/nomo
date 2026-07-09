@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { describe, expect, test } from "bun:test";
-import { adapterFor, claudeAdapter, codexAdapter } from "./adapter";
+import { adapterFor, allAdapters, claudeAdapter, codexAdapter } from "./adapter";
 
 // The adapter surface is the per-agent half of the hook pipeline. These cover the two branches that
 // actually diverge (title resolution + interrupt detection) plus the static config each adapter
@@ -34,6 +34,26 @@ describe("static config", () => {
     expect(claudeAdapter.toolDetail.Bash).toBe("running");
     expect(codexAdapter.toolDetail.apply_patch).toBe("editing");
     expect(claudeAdapter.toolDetail.apply_patch).toBeUndefined(); // halves stay separate
+  });
+});
+
+describe("discovery seam (blobAgentFields + allAdapters + discoverLive capability)", () => {
+  test("blobAgentFields: claude omits the agent key, codex yields agent:'codex'", () => {
+    expect(claudeAdapter.blobAgentFields).toEqual({});
+    expect(codexAdapter.blobAgentFields).toEqual({ agent: "codex" });
+  });
+
+  test("allAdapters is exactly the two concrete adapters (so the daemon can drive per-agent steps)", () => {
+    expect(allAdapters).toEqual([claudeAdapter, codexAdapter]);
+  });
+
+  test("claude implements NO discoverLive (its SessionStart fires at true open)", () => {
+    expect(claudeAdapter.discoverLive).toBeUndefined();
+  });
+
+  test("codex implements discoverLive; the seam commit's stub returns no discoveries", async () => {
+    expect(typeof codexAdapter.discoverLive).toBe("function");
+    expect(await codexAdapter.discoverLive!([])).toEqual([]);
   });
 });
 

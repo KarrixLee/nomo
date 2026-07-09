@@ -147,6 +147,12 @@ export interface SessionRecord {
    *  must NOT clobber turn N+1's record with a wrong `done`, so runNotify bails when this differs from
    *  the notify payload's turn-id. Claude payloads carry no turn_id → undefined (the guard is inert). */
   turnId?: string;
+  /** True for a PROVISIONAL record the watchdog wrote from process-scan discovery (an interactive TUI
+   *  the hooks can't see yet — see AgentAdapter.discoverLive). Its `pid` is the discovered TUI process
+   *  and its sessionId is a sentinel (`codex-pid-<pid>`). Reconciled away (op:end + delete) the moment
+   *  the real hook fires for that process, or reaped like any session when the pid dies. Absent on a
+   *  normal hook-written record. */
+  provisional?: boolean;
 }
 
 /** The plaintext a pending-pairing flush needs to POST the pairing session the instant the shared key

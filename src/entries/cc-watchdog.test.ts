@@ -6,11 +6,14 @@ import { decryptBlob } from "../core/crypto";
 import type { SessionRecord } from "../core/shared";
 import { GONE_STRIKE_LIMIT, readGoneStrikes, recordGoneStrike, resetGoneStrikes } from "../core/shared";
 import {
-  buildDoneEnvelope, buildEndEnvelope, buildHeartbeatEnvelope, classifySession, codexLastTurnEvent,
-  goneStrikeShouldTeardown, hasInterruptMarker, lastTurnLine, PAIRING_TTL_MS, pendingPairingExpired,
-  postOutcomeForStatus, shouldHeartbeat, shouldInterruptCheck, tailShowsInterrupt,
+  buildDoneEnvelope, buildEndEnvelope, buildHeartbeatEnvelope, buildProvisionalBlob, buildProvisionalRecord,
+  buildStartEnvelope, classifySession, codexLastTurnEvent, discoverLiveSessions, goneStrikeShouldTeardown,
+  hasInterruptMarker, IDLE_GRACE_MS, lastTurnLine, PAIRING_TTL_MS, pendingPairingExpired, postOutcomeForStatus,
+  shouldHeartbeat, shouldInterruptCheck, tailShowsInterrupt,
 } from "./cc-watchdog";
-import type { PendingConfig } from "../core/shared";
+import type { PostOutcome } from "./cc-watchdog";
+import type { AgentAdapter, DiscoveredSession } from "../core/adapter";
+import type { Config, PendingConfig } from "../core/shared";
 
 const KEY = new Uint8Array(32).fill(9);
 
@@ -94,6 +97,123 @@ describe("buildDoneEnvelope (interrupt corrective → v2 op:done + encrypted blo
     expect(withTurn).not.toHaveProperty("turnStartedAt"); // blob-only — never on the clear envelope
     const withoutTurn = await buildDoneEnvelope("s", rec(), 5, KEY) as Record<string, unknown>;
     expect(await decryptBlob(KEY, withoutTurn.blob as string)).not.toHaveProperty("turnStartedAt");
+  });
+});
+
+// --- live-session discovery seam (provisional builders + the generic discovery step) ---------
+//
+// The daemon surfaces a live TUI the hooks can't see yet as a PROVISIONAL op:start + record. These
+// cover the pure builders and the generic step's orchestration (adapter-driven, POST-gated persist).
+
+const cfg = (): Config => ({ url: "https://w.test", pairingId: "p", pcSecret: "s", e2eKey: KEY });
+const disc = (over: Partial<DiscoveredSession> = {}): DiscoveredSession =>
+  ({ pid: 5150, sessionId: "codex-pid-5150", title: "api-status", label: "api-status", ...over });
+
+describe("buildStartEnvelope (provisional op:start — same v2 shape the hook POSTs)", () => {
+  test("is a v2 op:start carrying the blob", () => {
+    expect(buildStartEnvelope("codex-pid-5150", "BLOB", 1234))
+      .toEqual({ v: 2, sessionId: "codex-pid-5150", op: "start", prio: 0, ts: 1234, blob: "BLOB" });
+  });
+  test("satisfies parseCCEnvelope's start contract (sentinel sessionId is a plain string, ≤128 chars)", () => {
+    const e = buildStartEnvelope("codex-pid-5150", "BLOB", 1_700_000_000_000) as Record<string, unknown>;
+    expect(e.v).toBe(2);
+    expect((e.sessionId as string).length).toBeLessThanOrEqual(128);
+    expect(e.op).toBe("start");
+    expect(e.blob).toBe("BLOB");
+  });
+});
+
+describe("buildProvisionalBlob (mirrors buildBlob's SessionStart shape)", () => {
+  test("codex: decrypts to working + title/machine/label + agent:'codex', no detail/turnStartedAt", async () => {
+    const blob = await buildProvisionalBlob(disc(), "Mac", { agent: "codex" }, KEY);
+    expect(await decryptBlob(KEY, blob)).toEqual({ status: "working", title: "api-status", machine: "Mac", label: "api-status", agent: "codex" });
+  });
+  test("empty title coerces to '' (like buildBlob's title ?? '')", async () => {
+    const blob = await buildProvisionalBlob(disc({ title: undefined }), "Mac", { agent: "codex" }, KEY);
+    expect(await decryptBlob(KEY, blob)).toMatchObject({ title: "" });
+  });
+  test("claude-style (empty agent fields) omits the agent key", async () => {
+    const blob = await buildProvisionalBlob(disc(), "Mac", {}, KEY);
+    expect(await decryptBlob(KEY, blob)).not.toHaveProperty("agent");
+  });
+});
+
+describe("buildProvisionalRecord (flagged provisional, reap/reconcile-ready)", () => {
+  test("carries pid + provisional:true + a fresh-start bookkeeping, and codex agent via blobAgentFields", () => {
+    const r = buildProvisionalRecord(disc(), "Mac", "BLOB", { agent: "codex" }, 4242);
+    expect(r).toEqual({
+      pid: 5150, machine: "Mac", label: "api-status", ts: 4242,
+      lastEvent: "sessionStart", op: "start", prio: 0, blob: "BLOB", provisional: true, agent: "codex",
+    });
+  });
+  test("claude-style omits the agent field (empty blobAgentFields)", () => {
+    expect(buildProvisionalRecord(disc(), "Mac", "BLOB", {}, 1)).not.toHaveProperty("agent");
+  });
+});
+
+describe("discoverLiveSessions (generic adapter-driven step)", () => {
+  // A fake adapter that returns one discovery — only kind/blobAgentFields/discoverLive are read.
+  const fakeAdapter = (discovered: DiscoveredSession[]): AgentAdapter =>
+    ({ kind: "codex", blobAgentFields: { agent: "codex" }, discoverLive: async () => discovered } as unknown as AgentAdapter);
+  const claudeLike = (): AgentAdapter => ({ kind: "claude", blobAgentFields: {} } as unknown as AgentAdapter);
+
+  test("delivered POST → persists a provisional record for the discovered session", async () => {
+    const posts: object[] = [];
+    const writes: { id: string; rec: SessionRecord }[] = [];
+    await discoverLiveSessions(cfg(), {
+      adapters: [fakeAdapter([disc()])],
+      post: async (b) => { posts.push(b); return "delivered" as PostOutcome; },
+      readRecords: async () => [],
+      writeRecord: async (id, rec) => { writes.push({ id, rec }); },
+      now: () => 999,
+    });
+    expect(posts).toHaveLength(1);
+    expect(posts[0]).toMatchObject({ v: 2, sessionId: "codex-pid-5150", op: "start", ts: 999 });
+    expect(writes).toHaveLength(1);
+    expect(writes[0].id).toBe("codex-pid-5150");
+    expect(writes[0].rec).toMatchObject({ pid: 5150, provisional: true, agent: "codex" });
+  });
+
+  test("a NON-delivered POST persists NOTHING (retried next sweep — pid stays unknown)", async () => {
+    const writes: unknown[] = [];
+    await discoverLiveSessions(cfg(), {
+      adapters: [fakeAdapter([disc()])],
+      post: async () => "failed" as PostOutcome,
+      readRecords: async () => [],
+      writeRecord: async (id, rec) => { writes.push({ id, rec }); },
+    });
+    expect(writes).toHaveLength(0);
+  });
+
+  test("an adapter WITHOUT discoverLive (claude) is skipped entirely — no POST", async () => {
+    let posted = false;
+    await discoverLiveSessions(cfg(), {
+      adapters: [claudeLike()],
+      post: async () => { posted = true; return "delivered" as PostOutcome; },
+      readRecords: async () => [],
+      writeRecord: async () => {},
+    });
+    expect(posted).toBe(false);
+  });
+
+  test("passes the known records to the adapter so it can exclude already-tracked pids", async () => {
+    const known: SessionRecord[] = [rec({ pid: 5150 })];
+    let seen: SessionRecord[] | null = null;
+    const adapter = { kind: "codex", blobAgentFields: { agent: "codex" },
+      discoverLive: async (k: SessionRecord[]) => { seen = k; return []; } } as unknown as AgentAdapter;
+    await discoverLiveSessions(cfg(), { adapters: [adapter], readRecords: async () => known, post: async () => "delivered" as PostOutcome, writeRecord: async () => {} });
+    expect(seen).toBe(known);
+  });
+
+  test("a discoverLive throw never derails the step (best-effort)", async () => {
+    const bad = { kind: "codex", blobAgentFields: { agent: "codex" }, discoverLive: async () => { throw new Error("scan boom"); } } as unknown as AgentAdapter;
+    await expect(discoverLiveSessions(cfg(), { adapters: [bad], readRecords: async () => [], post: async () => "delivered" as PostOutcome, writeRecord: async () => {} })).resolves.toBeUndefined();
+  });
+});
+
+describe("IDLE_GRACE_MS (linger between sessions so discovery keeps running)", () => {
+  test("is 30 minutes", () => {
+    expect(IDLE_GRACE_MS).toBe(1_800_000);
   });
 });
 

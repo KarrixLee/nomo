@@ -4,6 +4,7 @@ var __require = /* @__PURE__ */ createRequire(import.meta.url);
 // src/entries/cc-watchdog.ts
 import { readdir, readFile as readFile2, unlink as unlink2 } from "node:fs/promises";
 import { readFileSync as readFileSync2, unlinkSync } from "node:fs";
+import { hostname } from "node:os";
 import { basename } from "node:path";
 
 // src/core/crypto.ts
@@ -653,7 +654,8 @@ var claudeAdapter = {
   sessionMatch: (name) => name.endsWith(".jsonl"),
   hookStampPath: () => lastHookPath("claude"),
   hooksNotFiringHint: "  Reinstall the plugin / check /plugin.",
-  toolDetail: claudeToolDetail
+  toolDetail: claudeToolDetail,
+  blobAgentFields: {}
 };
 var codexAdapter = {
   kind: "codex",
@@ -678,15 +680,19 @@ var codexAdapter = {
   sessionMatch: (name) => name.startsWith("rollout-") && name.endsWith(".jsonl"),
   hookStampPath: () => lastHookPath("codex"),
   hooksNotFiringHint: "  Run /hooks in Codex to re-trust, or reinstall the plugin — known upstream bugs #16430/#30835.",
-  toolDetail: codexToolDetail
+  toolDetail: codexToolDetail,
+  blobAgentFields: { agent: "codex" },
+  discoverLive: async () => []
 };
 function adapterFor(agent) {
   return agent === "codex" ? codexAdapter : claudeAdapter;
 }
+var allAdapters = [claudeAdapter, codexAdapter];
 // src/entries/cc-watchdog.ts
 var POLL_MS = 5000;
 var PAIRING_TTL_MS = 600000;
 var SESSION_STALE_MS = 86400000;
+var IDLE_GRACE_MS = 1800000;
 var HEARTBEAT_AFTER_MS = 300000;
 var heartbeatAt = new Map;
 function classifySession(record, now, isAlive) {
@@ -708,7 +714,7 @@ async function buildDoneEnvelope(sessionId, record, now, e2eKey, agent = "claude
     title: "",
     machine: typeof record.machine === "string" ? record.machine : "",
     label: typeof record.label === "string" ? record.label : "",
-    ...agent === "codex" ? { agent: "codex" } : {},
+    ...adapterFor(agent).blobAgentFields,
     ...typeof record.turnStartedAt === "number" && Number.isFinite(record.turnStartedAt) ? { turnStartedAt: record.turnStartedAt } : {}
   });
   return { v: 2, sessionId, op: "done", prio: 0, ts: now, blob, ...startedAtField(record) };
@@ -740,6 +746,72 @@ async function postEvent(config, body) {
     return postOutcomeForStatus(res.status);
   } catch {
     return "failed";
+  }
+}
+function machineName(config) {
+  return config.machineName ?? hostname().replace(/\.local$/, "");
+}
+async function readAllRecords() {
+  try {
+    const files = await readdir(SESSIONS_DIR);
+    const out = [];
+    for (const f of files) {
+      if (!f.endsWith(".json"))
+        continue;
+      try {
+        out.push(JSON.parse(await readFile2(`${SESSIONS_DIR}/${f}`, "utf8")));
+      } catch {}
+    }
+    return out;
+  } catch {
+    return [];
+  }
+}
+async function buildProvisionalBlob(d, machine, blobAgentFields, e2eKey) {
+  return encryptBlob(e2eKey, { status: "working", title: d.title ?? "", machine, label: d.label, ...blobAgentFields });
+}
+function buildStartEnvelope(sessionId, blob, now) {
+  return { v: 2, sessionId, op: "start", prio: 0, ts: now, blob };
+}
+function buildProvisionalRecord(d, machine, blob, blobAgentFields, now) {
+  return {
+    pid: d.pid,
+    machine,
+    label: d.label,
+    ts: now,
+    lastEvent: "sessionStart",
+    op: "start",
+    prio: 0,
+    blob,
+    provisional: true,
+    ...blobAgentFields
+  };
+}
+async function discoverLiveSessions(config, deps = {}) {
+  const adapters = deps.adapters ?? allAdapters;
+  const post = deps.post ?? ((body) => postEvent(config, body));
+  const readRecords = deps.readRecords ?? readAllRecords;
+  const writeRecord = deps.writeRecord ?? ((sessionId, rec) => atomicWrite(`${SESSIONS_DIR}/${sessionId}.json`, JSON.stringify(rec), 384));
+  const now = deps.now ?? Date.now;
+  const machine = machineName(config);
+  const known = await readRecords();
+  for (const adapter of adapters) {
+    if (!adapter.discoverLive)
+      continue;
+    let discovered;
+    try {
+      discovered = await adapter.discoverLive(known);
+    } catch {
+      continue;
+    }
+    for (const d of discovered) {
+      const ts = now();
+      const blob = await buildProvisionalBlob(d, machine, adapter.blobAgentFields, config.e2eKey);
+      const outcome = await post(buildStartEnvelope(d.sessionId, blob, ts));
+      if (outcome !== "delivered")
+        continue;
+      await writeRecord(d.sessionId, buildProvisionalRecord(d, machine, blob, adapter.blobAgentFields, ts));
+    }
   }
 }
 var INTERRUPT_TAIL_BYTES = 8 * 1024;
@@ -906,9 +978,12 @@ async function run() {
   if (!await claimSingleInstance())
     return;
   const fallbackDeadline = Date.now() + PAIRING_TTL_MS;
+  let lastActiveMs = Date.now();
   try {
     while (true) {
       const config = await loadConfig();
+      if (config)
+        await discoverLiveSessions(config);
       const result = await sweep(config);
       if (result.revoked) {
         if (await goneStrikeShouldTeardown()) {
@@ -939,8 +1014,13 @@ async function run() {
           continue;
         }
       }
-      if (remaining === 0)
-        return;
+      const nowMs = Date.now();
+      if (remaining > 0)
+        lastActiveMs = nowMs;
+      if (remaining === 0) {
+        if (!config || nowMs - lastActiveMs >= IDLE_GRACE_MS)
+          return;
+      }
       await new Promise((r) => setTimeout(r, POLL_MS));
     }
   } finally {
@@ -962,10 +1042,15 @@ export {
   lastTurnLine,
   hasInterruptMarker,
   goneStrikeShouldTeardown,
+  discoverLiveSessions,
   codexLastTurnEvent,
   classifySession,
+  buildStartEnvelope,
+  buildProvisionalRecord,
+  buildProvisionalBlob,
   buildHeartbeatEnvelope,
   buildEndEnvelope,
   buildDoneEnvelope,
-  PAIRING_TTL_MS
+  PAIRING_TTL_MS,
+  IDLE_GRACE_MS
 };
