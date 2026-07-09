@@ -1176,14 +1176,41 @@ describe("runHook turn_id sniff (claude entry invoked inside a Codex session)", 
     expect(blobAgent).toBeUndefined();
   }, 20000);
 
-  // Pins the restamp guard's LOAD-BEARING assumption ("Codex payloads always carry a non-empty
-  // turn_id"): a CODEX-SHAPED payload (apply_patch tool + model/permission_mode extras) that arrives
-  // via the claude entry WITHOUT a turn_id is NOT restamped — it stays claude. If Codex ever dropped
-  // turn_id, this test would flip and flag that the sniff no longer catches the compat-layer misfire.
-  test("a codex-shaped payload with NO turn_id is NOT restamped (guard keys strictly on turn_id)", async () => {
+  // A CODEX-SHAPED payload (apply_patch tool + model/permission_mode extras) that arrives via the
+  // claude entry WITHOUT a turn_id AND WITHOUT a codex transcript path (transcript_path: "") is NOT
+  // restamped — NEITHER restamp signal fires, so it stays claude. This pins the conservative floor of
+  // the guard: absent both a non-empty turn_id (Codex's per-turn events) and a "/.codex/" transcript
+  // path (the session-scoped backstop exercised below), a run is never wrongly flipped to codex.
+  test("a codex-shaped payload with NO turn_id and NO codex transcript path stays claude", async () => {
     const { agent, blobAgent } = await runClaudeEntry({
       session_id: "sniff-no-turnid", hook_event_name: "PreToolUse", tool_name: "apply_patch",
       cwd: "/x/api-status", model: "gpt-5-codex", permission_mode: "default", transcript_path: "",
+    });
+    expect(agent).toBeUndefined();
+    expect(blobAgent).toBeUndefined();
+  }, 20000);
+
+  // The transcript-path backstop: session-scoped Codex events carry NO turn_id (observed in the wild
+  // 2026-07-09 — such events flipped Codex sessions onto the Claude tab on the phone), but their
+  // transcript_path still points under ~/.codex/sessions/. A claude-entry run whose payload has no
+  // turn_id but a "/.codex/" transcript path IS restamped to codex (record + blob).
+  test("no turn_id but a /.codex/ transcript path restamps the run agent codex", async () => {
+    const { agent, blobAgent } = await runClaudeEntry({
+      session_id: "sniff-codex-transcript", hook_event_name: "PreToolUse", tool_name: "apply_patch",
+      cwd: "/x/api-status",
+      transcript_path: "/Users/x/.codex/sessions/2026/07/09/rollout-2026-07-09T12-00-00-abcdef.jsonl",
+    });
+    expect(agent).toBe("codex");
+    expect(blobAgent).toBe("codex");
+  }, 20000);
+
+  // The complement: a NORMAL Claude payload (no turn_id, transcript under ~/.claude/projects/) is
+  // never restamped — the "/.claude/" path must not trip the "/.codex/" backstop.
+  test("a normal Claude transcript path (~/.claude/projects) is never restamped", async () => {
+    const { agent, blobAgent } = await runClaudeEntry({
+      session_id: "sniff-claude-transcript", hook_event_name: "PreToolUse", tool_name: "Edit",
+      cwd: "/x/api-status",
+      transcript_path: "/Users/x/.claude/projects/-x-api-status/1234.jsonl",
     });
     expect(agent).toBeUndefined();
     expect(blobAgent).toBeUndefined();

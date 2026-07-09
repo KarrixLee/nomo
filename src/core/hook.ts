@@ -286,11 +286,22 @@ export async function runHook(agent: AgentKind): Promise<void> {
 
     // Codex compat-layer guard: Codex ≥0.142 auto-discovers installed Claude Code plugins as hook
     // sources, so it can invoke cc-status.mjs — the CLAUDE entry (runHook("claude")) — inside a Codex
-    // session. Codex hook payloads always carry a non-empty `turn_id` string; Claude's never do. So a
-    // `turn_id` on a "claude" run means this event is really Codex's: restamp the effective agent to
-    // codex for the whole run (blob agent field, session record agent, title scanner) so it's labeled
-    // correctly instead of masquerading as a Claude session.
-    if (agent === "claude" && typeof input.turn_id === "string" && input.turn_id.length > 0) {
+    // session. Left unguarded, that Codex event masquerades as a Claude session and lands on the wrong
+    // tab on the phone. Two independent signals fingerprint a Codex-in-Claude event; EITHER restamps
+    // the effective agent to codex for the whole run (blob agent field, session record agent, title
+    // scanner):
+    //   (a) turn_id — Codex's PER-TURN hook payloads carry a non-empty `turn_id` string; Claude's
+    //       never do. This catches every event fired inside a turn.
+    //   (b) transcript_path under "/.codex/" — session-scoped Codex events (SessionStart-shaped) carry
+    //       NO turn_id (observed in the wild 2026-07-09, flipping Codex sessions onto the Claude tab),
+    //       so (a) misses them. But their transcript still points at ~/.codex/sessions/rollout-*.jsonl,
+    //       whereas Claude transcripts live under ~/.claude/projects/ — so a "/.codex/" path is a robust
+    //       agent fingerprint even when turn_id is absent. Conservative (substring, not a parse): a
+    //       "/.claude/" path can never match, so a real Claude run is never wrongly flipped.
+    if (agent === "claude" && (
+      (typeof input.turn_id === "string" && input.turn_id.length > 0) ||
+      (typeof input.transcript_path === "string" && input.transcript_path.includes("/.codex/"))
+    )) {
       agent = "codex";
     }
     // Select the per-agent adapter AFTER the restamp guard — this IS the adapter selection, so a

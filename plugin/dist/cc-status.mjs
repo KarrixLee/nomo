@@ -831,7 +831,7 @@ async function runHook(agent) {
     const input = JSON.parse(raw);
     if (typeof input.session_id !== "string" || input.session_id.length === 0)
       return;
-    if (agent === "claude" && typeof input.turn_id === "string" && input.turn_id.length > 0) {
+    if (agent === "claude" && (typeof input.turn_id === "string" && input.turn_id.length > 0 || typeof input.transcript_path === "string" && input.transcript_path.includes("/.codex/"))) {
       agent = "codex";
     }
     const adapter2 = adapterFor(agent);
