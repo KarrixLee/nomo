@@ -9,9 +9,9 @@ import {
   buildDoneEnvelope, buildEndEnvelope, buildHeartbeatEnvelope, buildProvisionalBlob, buildProvisionalRecord,
   buildStartEnvelope, classifySession, codexLastTurnEvent, discoverLiveSessions, goneStrikeShouldTeardown,
   hasInterruptMarker, IDLE_GRACE_MS, lastTurnLine, PAIRING_TTL_MS, pendingPairingExpired, postOutcomeForStatus,
-  shouldHeartbeat, shouldInterruptCheck, tailShowsInterrupt,
+  provisionalsCoveredByReal, reconcileProvisionalsSweep, shouldHeartbeat, shouldInterruptCheck, tailShowsInterrupt,
 } from "./cc-watchdog";
-import type { PostOutcome } from "./cc-watchdog";
+import type { PostOutcome, RecordEntry } from "./cc-watchdog";
 import type { AgentAdapter, DiscoveredSession } from "../core/adapter";
 import type { Config, PendingConfig } from "../core/shared";
 
@@ -214,6 +214,63 @@ describe("discoverLiveSessions (generic adapter-driven step)", () => {
 describe("IDLE_GRACE_MS (linger between sessions so discovery keeps running)", () => {
   test("is 30 minutes", () => {
     expect(IDLE_GRACE_MS).toBe(1_800_000);
+  });
+});
+
+describe("provisionalsCoveredByReal (sweep reconcile backstop matcher)", () => {
+  const entry = (sessionId: string, over: Partial<SessionRecord>): RecordEntry => ({ sessionId, rec: rec(over) });
+
+  test("a provisional whose pid a REAL codex record now holds is returned for reconcile", () => {
+    const entries = [
+      entry("codex-pid-100", { pid: 100, provisional: true, agent: "codex" }),
+      entry("real-a", { pid: 100, agent: "codex" }),
+      entry("codex-pid-200", { pid: 200, provisional: true, agent: "codex" }), // no real record yet
+    ];
+    expect(provisionalsCoveredByReal(entries)).toEqual(["codex-pid-100"]);
+  });
+
+  test("no real record covering the pid → nothing to reconcile (still discovering)", () => {
+    expect(provisionalsCoveredByReal([entry("codex-pid-200", { pid: 200, provisional: true, agent: "codex" })])).toEqual([]);
+  });
+
+  test("only a REAL (non-provisional) CODEX record counts as coverage", () => {
+    // A claude record (no agent) or another provisional at the same pid must NOT trigger a reconcile.
+    const entries = [
+      entry("codex-pid-100", { pid: 100, provisional: true, agent: "codex" }),
+      entry("real-claude", { pid: 100 }),                      // claude → not codex coverage
+      entry("codex-pid-100-dup", { pid: 100, provisional: true, agent: "codex" }), // another provisional
+    ];
+    expect(provisionalsCoveredByReal(entries)).toEqual([]);
+  });
+});
+
+describe("reconcileProvisionalsSweep (ends + deletes a covered provisional)", () => {
+  const covered = (): RecordEntry[] => [
+    { sessionId: "codex-pid-100", rec: rec({ pid: 100, provisional: true, agent: "codex" }) },
+    { sessionId: "real-a", rec: rec({ pid: 100, agent: "codex" }) },
+  ];
+
+  test("POSTs an op:end for the sentinel and deletes it on a delivered POST", async () => {
+    const posts: object[] = [];
+    const deletes: string[] = [];
+    await reconcileProvisionalsSweep(cfg(), {
+      readEntries: async () => covered(),
+      post: async (b) => { posts.push(b); return "delivered" as PostOutcome; },
+      deleteRecord: async (id) => { deletes.push(id); },
+      now: () => 42,
+    });
+    expect(posts).toEqual([{ v: 2, sessionId: "codex-pid-100", op: "end", prio: 0, ts: 42 }]);
+    expect(deletes).toEqual(["codex-pid-100"]);
+  });
+
+  test("a failed end POST keeps the provisional for the next sweep (no delete)", async () => {
+    const deletes: string[] = [];
+    await reconcileProvisionalsSweep(cfg(), {
+      readEntries: async () => covered(),
+      post: async () => "failed" as PostOutcome,
+      deleteRecord: async (id) => { deletes.push(id); },
+    });
+    expect(deletes).toEqual([]);
   });
 });
 

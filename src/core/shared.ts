@@ -12,7 +12,7 @@
 
 import { chmod, open, readFile, rename, stat, mkdir, unlink, writeFile } from "node:fs/promises";
 import { existsSync, readFileSync } from "node:fs";
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { b64url, deriveE2EKey, deriveRatchetKey, encryptBlob, fromB64url } from "./crypto";
@@ -752,4 +752,26 @@ export function pidAlive(pid: number): boolean {
   } catch (e) {
     return (e as NodeJS.ErrnoException).code === "EPERM";
   }
+}
+
+/** The ancestor pid chain of `pid` (parent, grandparent, …), walked via `ps -o ppid=` up to a bounded
+ *  depth so a garbage/cyclic table can't loop. Stops at pid ≤ 1 (launchd/init). Best-effort — a failed
+ *  lookup ends the walk. Used only as a robustness fallback by the provisional-reconcile pid matcher
+ *  (findProvisionalForPid): the common case matches on process.ppid directly and never calls this. */
+export function pidAncestors(pid: number, maxDepth = 12): number[] {
+  const chain: number[] = [];
+  let cur = pid;
+  for (let i = 0; i < maxDepth; i++) {
+    let ppid: number;
+    try {
+      const out = execFileSync("ps", ["-o", "ppid=", "-p", String(cur)], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+      ppid = Number.parseInt(out.trim(), 10);
+    } catch {
+      break; // ps failed / no such pid → end the walk
+    }
+    if (!Number.isFinite(ppid) || ppid <= 1 || chain.includes(ppid)) break;
+    chain.push(ppid);
+    cur = ppid;
+  }
+  return chain;
 }

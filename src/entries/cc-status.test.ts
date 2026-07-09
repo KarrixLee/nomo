@@ -1236,6 +1236,77 @@ describe("runHook turn_id sniff (claude entry invoked inside a Codex session)", 
   }, 20000);
 });
 
+// --- runHook provisional reconcile (a real codex hook ends the watchdog's discovered provisional) --
+//
+// Codex fires no hook at session OPEN (openai/codex#15269), so the watchdog surfaces a live Codex TUI
+// as a PROVISIONAL session keyed on the TUI pid. When the REAL codex hook finally fires, runHook must
+// end + delete that provisional (matched by pid — the hook's process.ppid IS the TUI). This spawns the
+// REAL codex entry with a temp HOME: the spawned bun's process.ppid is THIS test runner's pid, so a
+// provisional keyed on `process.pid` is the reconcile's equality match. The op:end POST goes to the
+// discard port (fails fast), but the provisional file is deleted regardless — that's what we assert.
+describe("runHook provisional reconcile (codex entry retires a matching provisional)", () => {
+  const rawKey = new Uint8Array(32).fill(9);
+  const entry = join(import.meta.dir, "codex-status.ts");
+
+  async function fileExists(p: string): Promise<boolean> {
+    return readFile(p, "utf8").then(() => true, () => false);
+  }
+
+  async function runReconcile(provPid: number): Promise<{ provGone: boolean; realAgent?: string; home: string; sessionsDir: string }> {
+    const home = await mkdtemp(join(tmpdir(), "cc-reconcile-"));
+    const ccDir = join(home, ".config", "cc-status");
+    const sessionsDir = join(ccDir, "sessions");
+    await mkdir(sessionsDir, { recursive: true });
+    await writeFile(join(ccDir, "config.json"), JSON.stringify({
+      url: "http://127.0.0.1:9", pairingId: "p", pcSecret: "s", e2eKeyB64: b64url(rawKey),
+    }));
+    await writeFile(join(ccDir, "watchdog.pid"), String(process.pid)); // no detached poller
+    const provFile = join(sessionsDir, `codex-pid-${provPid}.json`);
+    await writeFile(provFile, JSON.stringify({
+      pid: provPid, machine: "mac", label: "proj", ts: Date.now(),
+      lastEvent: "sessionStart", op: "start", prio: 0, blob: "X", provisional: true, agent: "codex",
+    }));
+    const proc = Bun.spawn({
+      cmd: ["bun", entry],
+      env: { ...process.env, HOME: home },
+      stdin: Buffer.from(JSON.stringify({
+        session_id: "real-codex-sess", hook_event_name: "PreToolUse", tool_name: "apply_patch",
+        cwd: "/x/api-status", turn_id: "t1", transcript_path: "",
+      })),
+      stdout: "ignore", stderr: "ignore",
+    });
+    await proc.exited;
+    const provGone = !(await fileExists(provFile));
+    let realAgent: string | undefined;
+    try {
+      realAgent = (JSON.parse(await readFile(join(sessionsDir, "real-codex-sess.json"), "utf8")) as { agent?: string }).agent;
+    } catch { /* no real record */ }
+    return { provGone, realAgent, home, sessionsDir };
+  }
+
+  test("a matching provisional (pid == process.ppid) is ended + deleted; the real session is tracked", async () => {
+    // The spawned entry's process.ppid is this runner's pid, so a provisional keyed on it matches.
+    const { provGone, realAgent, home } = await runReconcile(process.pid);
+    try {
+      expect(provGone).toBe(true);
+      expect(realAgent).toBe("codex");
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  }, 20000);
+
+  test("a NON-matching provisional (unrelated pid) is left untouched", async () => {
+    // 999_999 is neither the child's ppid nor any of its ancestors → no reconcile.
+    const provFileName = `codex-pid-999999.json`;
+    const { home, sessionsDir } = await runReconcile(999_999);
+    try {
+      expect(await fileExists(join(sessionsDir, provFileName))).toBe(true);
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  }, 20000);
+});
+
 // --- runHook startedAt precedence (hook.ts: `cachedStart ?? transcriptStartMs`) -------------
 //
 // The envelope's startedAt — and the sessionStartedAt written back into the record — resolves as

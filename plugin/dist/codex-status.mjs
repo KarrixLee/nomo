@@ -2,9 +2,9 @@ import { createRequire } from "node:module";
 var __require = /* @__PURE__ */ createRequire(import.meta.url);
 
 // src/core/hook.ts
-import { unlink as unlink2 } from "node:fs/promises";
+import { readdir, readFile as readFile2, unlink as unlink2 } from "node:fs/promises";
 import { hostname } from "node:os";
-import { basename } from "node:path";
+import { basename as basename2 } from "node:path";
 
 // src/core/crypto.ts
 var textEncoder = new TextEncoder;
@@ -72,12 +72,14 @@ async function sha256Hex(s) {
 }
 
 // src/core/adapter.ts
-import { join as join2 } from "node:path";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import { basename, join as join2 } from "node:path";
 
 // src/core/shared.ts
 import { chmod, open, readFile, rename, stat, mkdir, unlink, writeFile } from "node:fs/promises";
 import { existsSync, readFileSync } from "node:fs";
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 var CC_DIR = `${process.env.HOME}/.config/cc-status`;
@@ -412,8 +414,27 @@ function pidAlive(pid) {
     return e.code === "EPERM";
   }
 }
+function pidAncestors(pid, maxDepth = 12) {
+  const chain = [];
+  let cur = pid;
+  for (let i = 0;i < maxDepth; i++) {
+    let ppid;
+    try {
+      const out = execFileSync("ps", ["-o", "ppid=", "-p", String(cur)], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+      ppid = Number.parseInt(out.trim(), 10);
+    } catch {
+      break;
+    }
+    if (!Number.isFinite(ppid) || ppid <= 1 || chain.includes(ppid))
+      break;
+    chain.push(ppid);
+    cur = ppid;
+  }
+  return chain;
+}
 
 // src/core/adapter.ts
+var execFileP = promisify(execFile);
 var claudeToolDetail = {
   Bash: "running",
   Edit: "editing",
@@ -640,6 +661,92 @@ function codexLastTurnEvent(text) {
   }
   return null;
 }
+function codexSentinelSessionId(pid) {
+  return `codex-pid-${pid}`;
+}
+function parseCodexProcs(psOutput) {
+  const rows = [];
+  for (const line of psOutput.split(`
+`)) {
+    const m = line.match(/^\s*(\d+)\s+(\S+)\s+(.*)$/);
+    if (!m)
+      continue;
+    const pid = Number.parseInt(m[1], 10);
+    if (!Number.isFinite(pid))
+      continue;
+    rows.push({ pid, tty: m[2], args: m[3] });
+  }
+  return rows;
+}
+function isRealTty(tty) {
+  return tty.length > 0 && tty !== "??" && tty !== "?" && tty !== "-";
+}
+function filterCodexTuis(rows, knownPids) {
+  const out = [];
+  for (const r of rows) {
+    if (knownPids.has(r.pid))
+      continue;
+    const tokens = r.args.trim().split(/\s+/);
+    if (basename(tokens[0] ?? "") !== "codex")
+      continue;
+    if (!isRealTty(r.tty))
+      continue;
+    if (tokens.slice(1).includes("exec"))
+      continue;
+    out.push({ pid: r.pid });
+  }
+  return out;
+}
+function labelFromCwd(cwd) {
+  if (!cwd)
+    return "session";
+  const b = basename(cwd);
+  return b.length > 0 ? b : "session";
+}
+async function runPs() {
+  const { stdout } = await execFileP("ps", ["-axo", "pid=,tty=,args="]);
+  return stdout;
+}
+async function cwdViaLsof(pid) {
+  try {
+    const { stdout } = await execFileP("lsof", ["-a", "-p", String(pid), "-d", "cwd", "-Fn"]);
+    for (const line of stdout.split(`
+`))
+      if (line.startsWith("n"))
+        return line.slice(1);
+    return;
+  } catch {
+    return;
+  }
+}
+async function codexDiscoverLive(known, deps = {}) {
+  const ps = deps.ps ?? runPs;
+  const cwdOf = deps.cwdOf ?? cwdViaLsof;
+  let output;
+  try {
+    output = await ps();
+  } catch {
+    return [];
+  }
+  const knownPids = new Set(known.map((r) => r.pid).filter((p) => typeof p === "number" && Number.isFinite(p)));
+  const tuis = filterCodexTuis(parseCodexProcs(output), knownPids);
+  const out = [];
+  for (const { pid } of tuis) {
+    const label = labelFromCwd(await cwdOf(pid));
+    out.push({ pid, sessionId: codexSentinelSessionId(pid), title: label, label });
+  }
+  return out;
+}
+function findProvisionalForPid(provisionals, hookPid, ancestorsOf) {
+  for (const p of provisionals)
+    if (p.pid === hookPid)
+      return p.sessionId;
+  const chain = new Set(ancestorsOf(hookPid));
+  for (const p of provisionals)
+    if (chain.has(p.pid))
+      return p.sessionId;
+  return null;
+}
 var claudeAdapter = {
   kind: "claude",
   async title({ prefix }) {
@@ -681,7 +788,7 @@ var codexAdapter = {
   hooksNotFiringHint: "  Run /hooks in Codex to re-trust, or reinstall the plugin — known upstream bugs #16430/#30835.",
   toolDetail: codexToolDetail,
   blobAgentFields: { agent: "codex" },
-  discoverLive: async () => []
+  discoverLive: (known) => codexDiscoverLive(known)
 };
 function adapterFor(agent) {
   return agent === "codex" ? codexAdapter : claudeAdapter;
@@ -748,7 +855,7 @@ function transcriptStartMs(prefix) {
   return;
 }
 function buildBlob(input, machine, title, plan, agent = "claude", turnStartedAt) {
-  const label = typeof input.cwd === "string" && input.cwd.length > 0 ? basename(input.cwd) : "session";
+  const label = typeof input.cwd === "string" && input.cwd.length > 0 ? basename2(input.cwd) : "session";
   const hookName = typeof input.hook_event_name === "string" ? input.hook_event_name : "";
   const detail = detailForHook(hookName, typeof input.tool_name === "string" ? input.tool_name : undefined);
   return {
@@ -823,6 +930,36 @@ async function trackSession(sessionId, op, prio, status, blob, machine, label, t
     await atomicWrite(path, JSON.stringify(record), 384);
   } catch {}
 }
+async function reconcileProvisional(config, hookPid) {
+  try {
+    const files = await readdir(SESSIONS_DIR).catch(() => []);
+    const provisionals = [];
+    for (const f of files) {
+      if (!f.endsWith(".json"))
+        continue;
+      let r;
+      try {
+        r = JSON.parse(await readFile2(`${SESSIONS_DIR}/${f}`, "utf8"));
+      } catch {
+        continue;
+      }
+      if (r.provisional === true && typeof r.pid === "number")
+        provisionals.push({ sessionId: basename2(f, ".json"), pid: r.pid });
+    }
+    if (provisionals.length === 0)
+      return;
+    const sentinel = findProvisionalForPid(provisionals, hookPid, pidAncestors);
+    if (!sentinel)
+      return;
+    await fetch(`${config.url}/v1/cc/event`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-cc-pairing": config.pairingId, "x-cc-auth": config.pcSecret },
+      body: JSON.stringify({ v: 2, sessionId: sentinel, op: "end", prio: 0, ts: Date.now() }),
+      signal: AbortSignal.timeout(2000)
+    }).catch(() => {});
+    await unlink2(`${SESSIONS_DIR}/${sentinel}.json`).catch(() => {});
+  } catch {}
+}
 async function readStdin() {
   const chunks = [];
   for await (const chunk of process.stdin)
@@ -863,6 +1000,8 @@ async function runHook(agent) {
       return;
     }
     const machine = config.machineName ?? hostname().replace(/\.local$/, "");
+    if (agent === "codex")
+      await reconcileProvisional(config, process.ppid);
     const title = await readTitle();
     const existingRecord = await readRecord(input.session_id);
     const sentDone = existingRecord?.sentDone === true;
@@ -878,7 +1017,7 @@ async function runHook(agent) {
     const envelope = await buildEnvelope(input, machine, Date.now(), title, config.e2eKey, sentDone, agent, startedAt, turnStartedAt);
     if (!envelope)
       return;
-    const label = typeof input.cwd === "string" && input.cwd.length > 0 ? basename(input.cwd) : "session";
+    const label = typeof input.cwd === "string" && input.cwd.length > 0 ? basename2(input.cwd) : "session";
     await trackSession(input.session_id, plan.op, plan.prio, plan.status, envelope.blob, machine, label, transcriptPath, agent, startedAt, turnStartedAt, turnId);
     ensureWatchdog();
     const res = await fetch(`${config.url}/v1/cc/event`, {

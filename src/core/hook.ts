@@ -17,14 +17,14 @@
 // async-iterable process.stdin, file IO via node:fs/promises (shared helpers). build.ts bundles
 // this (inlined into each entry) to a .mjs.
 
-import { readFile, unlink } from "node:fs/promises";
+import { readdir, readFile, unlink } from "node:fs/promises";
 import { hostname } from "node:os";
 import { basename } from "node:path";
 import { encryptBlob } from "./crypto";
-import { adapterFor, claudeToolDetail, codexToolDetail } from "./adapter";
+import { adapterFor, claudeToolDetail, codexToolDetail, findProvisionalForPid } from "./adapter";
 import {
-  AgentKind, atomicWrite, CCOp, CCStatus, ensureWatchdog, GONE_STRIKE_LIMIT,
-  LAST_SEND_PATH, lastHookPath, loadConfig, loadPendingConfig, PENDING_STASH_PATH, PendingEventStash, readPrefix,
+  AgentKind, atomicWrite, CCOp, CCStatus, Config, ensureWatchdog, GONE_STRIKE_LIMIT,
+  LAST_SEND_PATH, lastHookPath, loadConfig, loadPendingConfig, PENDING_STASH_PATH, PendingEventStash, pidAncestors, readPrefix,
   readRecord, recordGoneStrike, removeRevokedConfig, resetGoneStrikes, SessionRecord, SESSIONS_DIR,
 } from "./shared";
 
@@ -261,6 +261,38 @@ export async function trackSession(
   }
 }
 
+/** Reconcile a provisional discovery (see cc-watchdog's discovery step): a real hook has now fired for
+ *  this codex TUI, so end + delete any PROVISIONAL session the watchdog surfaced ahead of it. Matches by
+ *  pid — the hook's process.ppid is the codex TUI process, which is the provisional's pid (with an
+ *  ancestor-walk fallback; see findProvisionalForPid). POSTs an op:end for the sentinel sessionId (the
+ *  worker reuses the last blob for the final frame) then deletes the provisional record so the sweep/
+ *  reap never re-touches it. Best-effort: a failure just leaves the provisional for the sweep backstop
+ *  or the pid-death reap. REMOVABLE with the discovery feature once openai/codex#15269 ships. */
+async function reconcileProvisional(config: Config, hookPid: number): Promise<void> {
+  try {
+    const files = await readdir(SESSIONS_DIR).catch(() => [] as string[]);
+    const provisionals: { sessionId: string; pid: number }[] = [];
+    for (const f of files) {
+      if (!f.endsWith(".json")) continue;
+      let r: SessionRecord;
+      try { r = JSON.parse(await readFile(`${SESSIONS_DIR}/${f}`, "utf8")) as SessionRecord; } catch { continue; }
+      if (r.provisional === true && typeof r.pid === "number") provisionals.push({ sessionId: basename(f, ".json"), pid: r.pid });
+    }
+    if (provisionals.length === 0) return;
+    const sentinel = findProvisionalForPid(provisionals, hookPid, pidAncestors);
+    if (!sentinel) return;
+    await fetch(`${config.url}/v1/cc/event`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-cc-pairing": config.pairingId, "x-cc-auth": config.pcSecret },
+      body: JSON.stringify({ v: 2, sessionId: sentinel, op: "end", prio: 0, ts: Date.now() }),
+      signal: AbortSignal.timeout(2000),
+    }).catch(() => {});
+    await unlink(`${SESSIONS_DIR}/${sentinel}.json`).catch(() => {});
+  } catch {
+    // best-effort — never surface into a session
+  }
+}
+
 /** Read the whole of stdin (the hook JSON) as UTF-8. process.stdin is an async iterable of Buffers
  *  under both bun and node, so this needs no Bun-specific API. */
 async function readStdin(): Promise<string> {
@@ -350,6 +382,14 @@ export async function runHook(agent: AgentKind): Promise<void> {
     }
 
     const machine = config.machineName ?? hostname().replace(/\.local$/, "");
+
+    // Reconcile a provisional discovery: Codex fires no hook at session OPEN (openai/codex#15269), so
+    // the watchdog may have surfaced this TUI provisionally. Now that a REAL codex hook is reporting,
+    // end that provisional so the phone doesn't show both it and the real session. Codex-only (Claude
+    // has no discovery). Runs before the real event so the phone ends the provisional then starts the
+    // real session, in order. REMOVABLE once openai/codex#15269 ships.
+    if (agent === "codex") await reconcileProvisional(config, process.ppid);
+
     const title = await readTitle();
 
     // One record read serves both the sentDone re-arm and the cached session start. A cached start

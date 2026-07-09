@@ -12,8 +12,12 @@
 //
 // PORTABILITY: bun AND node >= 18 — no `Bun.*` APIs; file IO via node:fs/promises (shared helpers).
 
-import { join } from "node:path";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import { basename, join } from "node:path";
 import { AgentKind, codexHome, lastHookPath, readSuffix, SessionRecord } from "./shared";
+
+const execFileP = promisify(execFile);
 
 /// Tool → semantic sub-status key (localized on-device by the widget). Mirrors the reference
 /// menu-bar app's tool labels, but as stable keys, not English strings. Unknown tools (e.g. MCP)
@@ -337,6 +341,137 @@ export interface DiscoveredSession {
   label: string;
 }
 
+// --- Codex live-process discovery ------------------------------------------------------------
+//
+// REMOVABLE once openai/codex#15269 (SessionStart at TRUE session open) ships — at that point the
+// hook itself sees a freshly-opened Codex TUI and this whole process-scan becomes dead weight.
+//
+// A live interactive Codex CLI is the `codex` executable running with a controlling tty. That tty is
+// the load-bearing filter: the `codex app-server` daemons spawned by the Codex.app desktop app and by
+// editor extensions run with NO controlling tty ("??"), so requiring a real tty excludes them while
+// keeping the real terminal sessions. `codex exec …` (non-interactive automation) is excluded by argv,
+// and any pid we already track (a real hook already fired, or a provisional already exists) is skipped.
+
+/** REMOVABLE (see above). The sentinel session id for a provisional codex session. The worker accepts
+ *  ANY 1–128-char sessionId (no UUID required — server parseCCEnvelope only length-checks), so this
+ *  readable form is valid as-is and needs no UUID-shaped encoding. */
+export function codexSentinelSessionId(pid: number): string {
+  return `codex-pid-${pid}`;
+}
+
+/** REMOVABLE (see above). Parse `ps -axo pid=,tty=,args=` output into rows. Pure. Lines that don't
+ *  start with a pid (blank / header-less noise) are skipped. */
+export function parseCodexProcs(psOutput: string): { pid: number; tty: string; args: string }[] {
+  const rows: { pid: number; tty: string; args: string }[] = [];
+  for (const line of psOutput.split("\n")) {
+    const m = line.match(/^\s*(\d+)\s+(\S+)\s+(.*)$/);
+    if (!m) continue;
+    const pid = Number.parseInt(m[1], 10);
+    if (!Number.isFinite(pid)) continue;
+    rows.push({ pid, tty: m[2], args: m[3] });
+  }
+  return rows;
+}
+
+/** A real controlling tty, i.e. an interactive terminal. macOS `ps` prints "??" for a process with no
+ *  controlling terminal (the Codex.app / extension `codex app-server` daemons); "?"/"-" cover other
+ *  no-tty spellings defensively. */
+function isRealTty(tty: string): boolean {
+  return tty.length > 0 && tty !== "??" && tty !== "?" && tty !== "-";
+}
+
+/** REMOVABLE (see above). Keep only interactive codex TUIs not already tracked: executable basename
+ *  `codex`, a REAL controlling tty (excludes the tty-less `codex app-server` daemons), and NOT a
+ *  `codex exec` automation run. Pure — the pid set and rows are injected. */
+export function filterCodexTuis(
+  rows: { pid: number; tty: string; args: string }[], knownPids: Set<number>,
+): { pid: number }[] {
+  const out: { pid: number }[] = [];
+  for (const r of rows) {
+    if (knownPids.has(r.pid)) continue;
+    const tokens = r.args.trim().split(/\s+/);
+    if (basename(tokens[0] ?? "") !== "codex") continue; // executable basename must be `codex`
+    if (!isRealTty(r.tty)) continue;                       // interactive terminal only
+    if (tokens.slice(1).includes("exec")) continue;        // exclude `codex exec …` automation
+    out.push({ pid: r.pid });
+  }
+  return out;
+}
+
+/** cwd basename → the provisional's label/title, exactly like buildBlob's cwd-basename `label`
+ *  ("session" when the cwd is unknown or the filesystem root). */
+function labelFromCwd(cwd: string | undefined): string {
+  if (!cwd) return "session";
+  const b = basename(cwd);
+  return b.length > 0 ? b : "session";
+}
+
+/** REMOVABLE (see above). `ps -axo pid=,tty=,args=` for the whole process table. */
+async function runPs(): Promise<string> {
+  const { stdout } = await execFileP("ps", ["-axo", "pid=,tty=,args="]);
+  return stdout;
+}
+
+/** REMOVABLE (see above). The cwd of a pid via `lsof -a -p <pid> -d cwd -Fn` — the output's `n` line
+ *  carries the path. Undefined on any failure (permissions, race, no lsof). */
+async function cwdViaLsof(pid: number): Promise<string | undefined> {
+  try {
+    const { stdout } = await execFileP("lsof", ["-a", "-p", String(pid), "-d", "cwd", "-Fn"]);
+    for (const line of stdout.split("\n")) if (line.startsWith("n")) return line.slice(1);
+    return undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Injectable process-scan seams so discovery is testable without spawning real `ps`/`lsof`. */
+export interface CodexDiscoverDeps {
+  ps?: () => Promise<string>;
+  cwdOf?: (pid: number) => Promise<string | undefined>;
+}
+
+/** REMOVABLE (see above). Discover interactive Codex TUIs the hooks can't see yet (openai/codex#15269).
+ *  Scans `ps`, filters to real terminal `codex` sessions not already tracked, and resolves each cwd to
+ *  a sentinel provisional session. Best-effort: a `ps` failure yields no discoveries. */
+export async function codexDiscoverLive(known: SessionRecord[], deps: CodexDiscoverDeps = {}): Promise<DiscoveredSession[]> {
+  const ps = deps.ps ?? runPs;
+  const cwdOf = deps.cwdOf ?? cwdViaLsof;
+  let output: string;
+  try {
+    output = await ps();
+  } catch {
+    return []; // no ps / scan failed → surface nothing
+  }
+  const knownPids = new Set(known.map((r) => r.pid).filter((p): p is number => typeof p === "number" && Number.isFinite(p)));
+  const tuis = filterCodexTuis(parseCodexProcs(output), knownPids);
+  const out: DiscoveredSession[] = [];
+  for (const { pid } of tuis) {
+    const label = labelFromCwd(await cwdOf(pid));
+    // title == label (cwd basename): a freshly-opened TUI has no prompt yet, so the cwd names it.
+    out.push({ pid, sessionId: codexSentinelSessionId(pid), title: label, label });
+  }
+  return out;
+}
+
+/** Match a codex hook to a provisional record by pid, returning the provisional's sentinel sessionId (or
+ *  null). PRIMARY match is EQUALITY: the codex hook's `process.ppid` IS the codex TUI process — codex
+ *  spawns the hook directly and run.sh `exec`s the runtime (same pid, parent unchanged), the very
+ *  process.ppid == TUI-pid relationship the Claude reaper already relies on in production — so it equals
+ *  the discovered/provisional pid. `ancestorsOf` is a belt-and-suspenders: were a future wrapper process
+ *  to sit between codex and the hook, the provisional's pid would be an ANCESTOR of the hook pid, so we
+ *  also match any provisional whose pid appears in the hook pid's ancestor chain (walked only if the
+ *  cheap equality pass found nothing). Pure — the ancestor walk is injected. */
+export function findProvisionalForPid(
+  provisionals: { sessionId: string; pid: number }[],
+  hookPid: number,
+  ancestorsOf: (pid: number) => number[],
+): string | null {
+  for (const p of provisionals) if (p.pid === hookPid) return p.sessionId; // common case: direct parent
+  const chain = new Set(ancestorsOf(hookPid));
+  for (const p of provisionals) if (chain.has(p.pid)) return p.sessionId;
+  return null;
+}
+
 // --- The adapter ------------------------------------------------------------------------------
 
 /** Everything the two agent bridges do DIFFERENTLY, behind one interface. `adapterFor(agent)`
@@ -430,9 +565,9 @@ export const codexAdapter: AgentAdapter = {
   toolDetail: codexToolDetail,
   // Codex blobs carry `agent:"codex"` so the phone tabs/icons the session correctly.
   blobAgentFields: { agent: "codex" as const },
-  // discoverLive is populated in the feature commit; the seam ships with a no-op stub so the generic
-  // watchdog discovery step is wired and green without yet scanning any processes.
-  discoverLive: async (): Promise<DiscoveredSession[]> => [],
+  // Codex fires no hook at session open (openai/codex#15269), so the watchdog process-scans for live
+  // Codex TUIs and surfaces them provisionally. REMOVABLE once that issue ships (see codexDiscoverLive).
+  discoverLive: (known: SessionRecord[]): Promise<DiscoveredSession[]> => codexDiscoverLive(known),
 };
 
 /** Select the concrete adapter for an agent kind. */

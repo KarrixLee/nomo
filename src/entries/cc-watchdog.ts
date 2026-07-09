@@ -198,20 +198,28 @@ function machineName(config: Config): string {
   return config.machineName ?? hostname().replace(/\.local$/, "");
 }
 
-/** Every session record currently on disk (provisional and real). Feeds discovery's known-pid
- *  exclusion and the reconcile backstop. Corrupt/half-written files are skipped. */
-async function readAllRecords(): Promise<SessionRecord[]> {
+/** A session record plus its id (the filename stem). */
+export interface RecordEntry { sessionId: string; rec: SessionRecord }
+
+/** Every session record currently on disk, id + record (provisional and real). Feeds discovery's
+ *  known-pid exclusion and the reconcile backstop. Corrupt/half-written files are skipped. */
+async function readAllRecordEntries(): Promise<RecordEntry[]> {
   try {
     const files = await readdir(SESSIONS_DIR);
-    const out: SessionRecord[] = [];
+    const out: RecordEntry[] = [];
     for (const f of files) {
       if (!f.endsWith(".json")) continue;
-      try { out.push(JSON.parse(await readFile(`${SESSIONS_DIR}/${f}`, "utf8")) as SessionRecord); } catch { /* skip */ }
+      try { out.push({ sessionId: basename(f, ".json"), rec: JSON.parse(await readFile(`${SESSIONS_DIR}/${f}`, "utf8")) as SessionRecord }); } catch { /* skip */ }
     }
     return out;
   } catch {
     return []; // no sessions dir yet
   }
+}
+
+/** Just the records, for discovery's known-pid exclusion. */
+async function readAllRecords(): Promise<SessionRecord[]> {
+  return (await readAllRecordEntries()).map((e) => e.rec);
 }
 
 /** The provisional blob for a discovered session — byte-shaped exactly like buildBlob's output for a
@@ -288,6 +296,45 @@ export async function discoverLiveSessions(config: Config, deps: DiscoverDeps = 
       if (outcome !== "delivered") continue; // failed/revoked → retry next sweep, don't persist a ghost
       await writeRecord(d.sessionId, buildProvisionalRecord(d, machine, blob, adapter.blobAgentFields, ts));
     }
+  }
+}
+
+/** The sentinel ids of PROVISIONAL records whose pid is now also held by a REAL (non-provisional) codex
+ *  record — i.e. the real hook fired but the hook's own reconcile didn't run (unpaired at hook time, or
+ *  a race). Equality on pid: a real codex record's pid and its provisional's pid are the same codex TUI
+ *  process. Pure. */
+export function provisionalsCoveredByReal(entries: RecordEntry[]): string[] {
+  const realCodexPids = new Set(
+    entries
+      .filter((e) => e.rec.provisional !== true && e.rec.agent === "codex" && typeof e.rec.pid === "number")
+      .map((e) => e.rec.pid),
+  );
+  return entries
+    .filter((e) => e.rec.provisional === true && typeof e.rec.pid === "number" && realCodexPids.has(e.rec.pid))
+    .map((e) => e.sessionId);
+}
+
+/** Injectable seams for the sweep-side provisional reconcile, so it's testable without fs/network. */
+export interface SweepReconcileDeps {
+  post?: (body: object) => Promise<PostOutcome>;
+  readEntries?: () => Promise<RecordEntry[]>;
+  deleteRecord?: (sessionId: string) => Promise<void>;
+  now?: () => number;
+}
+
+/** BACKSTOP for the hook's own reconcile: end + delete any provisional whose codex TUI now has a real
+ *  session record. Covers the case where the hook couldn't reconcile (it was unpaired when it fired, or
+ *  raced the discovery write). POSTs an op:end (worker reuses the last blob) and deletes the provisional
+ *  only on a delivered POST — a failed POST leaves it for the next sweep. Best-effort. */
+export async function reconcileProvisionalsSweep(config: Config, deps: SweepReconcileDeps = {}): Promise<void> {
+  const post = deps.post ?? ((body: object) => postEvent(config, body));
+  const readEntries = deps.readEntries ?? readAllRecordEntries;
+  const deleteRecord = deps.deleteRecord ?? ((sessionId: string) => unlink(`${SESSIONS_DIR}/${sessionId}.json`).catch(() => {}));
+  const now = deps.now ?? Date.now;
+  const entries = await readEntries();
+  for (const sessionId of provisionalsCoveredByReal(entries)) {
+    const outcome = await post(buildEndEnvelope(sessionId, now()));
+    if (outcome === "delivered") await deleteRecord(sessionId);
   }
 }
 
@@ -562,9 +609,14 @@ async function run(): Promise<void> {
   try {
     while (true) {
       const config = await loadConfig(); // reload each cycle: a mid-pairing config may complete under us
-      // Discovery runs BEFORE the sweep (only when paired) so a just-surfaced provisional is counted in
-      // `remaining` this same cycle — keeping the daemon alive naturally while a discovered TUI lives.
-      if (config) await discoverLiveSessions(config);
+      // Discovery + reconcile run BEFORE the sweep (only when paired). Backstop-reconcile first (retire
+      // any provisional whose real session already reported), then discover new TUIs — so a just-
+      // surfaced provisional is counted in `remaining` this same cycle, keeping the daemon alive
+      // naturally while a discovered TUI lives.
+      if (config) {
+        await reconcileProvisionalsSweep(config);
+        await discoverLiveSessions(config);
+      }
       const result = await sweep(config);
       if (result.revoked) {
         // A /cc/event POST came back gone (404/410) this sweep. Do NOT tear down on the first one — a

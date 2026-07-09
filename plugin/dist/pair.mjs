@@ -9,7 +9,7 @@ import { dirname as dirname2, join as join2 } from "node:path";
 // src/core/shared.ts
 import { chmod, open, readFile, rename, stat, mkdir, unlink, writeFile } from "node:fs/promises";
 import { existsSync, readFileSync } from "node:fs";
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -410,6 +410,24 @@ function pidAlive(pid) {
   } catch (e) {
     return e.code === "EPERM";
   }
+}
+function pidAncestors(pid, maxDepth = 12) {
+  const chain = [];
+  let cur = pid;
+  for (let i = 0;i < maxDepth; i++) {
+    let ppid;
+    try {
+      const out = execFileSync("ps", ["-o", "ppid=", "-p", String(cur)], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+      ppid = Number.parseInt(out.trim(), 10);
+    } catch {
+      break;
+    }
+    if (!Number.isFinite(ppid) || ppid <= 1 || chain.includes(ppid))
+      break;
+    chain.push(ppid);
+    cur = ppid;
+  }
+  return chain;
 }
 
 // src/core/pair-code.ts

@@ -6,12 +6,14 @@ import { readdir, readFile as readFile2, stat as stat2 } from "node:fs/promises"
 import { join as join3 } from "node:path";
 
 // src/core/adapter.ts
-import { join as join2 } from "node:path";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import { basename, join as join2 } from "node:path";
 
 // src/core/shared.ts
 import { chmod, open, readFile, rename, stat, mkdir, unlink, writeFile } from "node:fs/promises";
 import { existsSync, readFileSync } from "node:fs";
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -413,8 +415,27 @@ function pidAlive(pid) {
     return e.code === "EPERM";
   }
 }
+function pidAncestors(pid, maxDepth = 12) {
+  const chain = [];
+  let cur = pid;
+  for (let i = 0;i < maxDepth; i++) {
+    let ppid;
+    try {
+      const out = execFileSync("ps", ["-o", "ppid=", "-p", String(cur)], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+      ppid = Number.parseInt(out.trim(), 10);
+    } catch {
+      break;
+    }
+    if (!Number.isFinite(ppid) || ppid <= 1 || chain.includes(ppid))
+      break;
+    chain.push(ppid);
+    cur = ppid;
+  }
+  return chain;
+}
 
 // src/core/adapter.ts
+var execFileP = promisify(execFile);
 var claudeToolDetail = {
   Bash: "running",
   Edit: "editing",
@@ -641,6 +662,92 @@ function codexLastTurnEvent(text) {
   }
   return null;
 }
+function codexSentinelSessionId(pid) {
+  return `codex-pid-${pid}`;
+}
+function parseCodexProcs(psOutput) {
+  const rows = [];
+  for (const line of psOutput.split(`
+`)) {
+    const m = line.match(/^\s*(\d+)\s+(\S+)\s+(.*)$/);
+    if (!m)
+      continue;
+    const pid = Number.parseInt(m[1], 10);
+    if (!Number.isFinite(pid))
+      continue;
+    rows.push({ pid, tty: m[2], args: m[3] });
+  }
+  return rows;
+}
+function isRealTty(tty) {
+  return tty.length > 0 && tty !== "??" && tty !== "?" && tty !== "-";
+}
+function filterCodexTuis(rows, knownPids) {
+  const out = [];
+  for (const r of rows) {
+    if (knownPids.has(r.pid))
+      continue;
+    const tokens = r.args.trim().split(/\s+/);
+    if (basename(tokens[0] ?? "") !== "codex")
+      continue;
+    if (!isRealTty(r.tty))
+      continue;
+    if (tokens.slice(1).includes("exec"))
+      continue;
+    out.push({ pid: r.pid });
+  }
+  return out;
+}
+function labelFromCwd(cwd) {
+  if (!cwd)
+    return "session";
+  const b = basename(cwd);
+  return b.length > 0 ? b : "session";
+}
+async function runPs() {
+  const { stdout } = await execFileP("ps", ["-axo", "pid=,tty=,args="]);
+  return stdout;
+}
+async function cwdViaLsof(pid) {
+  try {
+    const { stdout } = await execFileP("lsof", ["-a", "-p", String(pid), "-d", "cwd", "-Fn"]);
+    for (const line of stdout.split(`
+`))
+      if (line.startsWith("n"))
+        return line.slice(1);
+    return;
+  } catch {
+    return;
+  }
+}
+async function codexDiscoverLive(known, deps = {}) {
+  const ps = deps.ps ?? runPs;
+  const cwdOf = deps.cwdOf ?? cwdViaLsof;
+  let output;
+  try {
+    output = await ps();
+  } catch {
+    return [];
+  }
+  const knownPids = new Set(known.map((r) => r.pid).filter((p) => typeof p === "number" && Number.isFinite(p)));
+  const tuis = filterCodexTuis(parseCodexProcs(output), knownPids);
+  const out = [];
+  for (const { pid } of tuis) {
+    const label = labelFromCwd(await cwdOf(pid));
+    out.push({ pid, sessionId: codexSentinelSessionId(pid), title: label, label });
+  }
+  return out;
+}
+function findProvisionalForPid(provisionals, hookPid, ancestorsOf) {
+  for (const p of provisionals)
+    if (p.pid === hookPid)
+      return p.sessionId;
+  const chain = new Set(ancestorsOf(hookPid));
+  for (const p of provisionals)
+    if (chain.has(p.pid))
+      return p.sessionId;
+  return null;
+}
 var claudeAdapter = {
   kind: "claude",
   async title({ prefix }) {
@@ -682,7 +789,7 @@ var codexAdapter = {
   hooksNotFiringHint: "  Run /hooks in Codex to re-trust, or reinstall the plugin — known upstream bugs #16430/#30835.",
   toolDetail: codexToolDetail,
   blobAgentFields: { agent: "codex" },
-  discoverLive: async () => []
+  discoverLive: (known) => codexDiscoverLive(known)
 };
 function adapterFor(agent) {
   return agent === "codex" ? codexAdapter : claudeAdapter;

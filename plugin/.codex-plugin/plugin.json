@@ -1,6 +1,6 @@
 {
   "name": "nomo",
-  "version": "0.7.2",
+  "version": "0.8.0",
   "description": "Mirror OpenAI Codex CLI sessions to the Nomo iPhone app as a Live Activity. Pair once with your phone via QR code; all session content is end-to-end encrypted (the relay worker is a blind relay and never sees plaintext).",
   "author": {
     "name": "Nomo"
