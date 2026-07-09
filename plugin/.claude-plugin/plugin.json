@@ -2,7 +2,7 @@
   "name": "nomo-cc",
   "displayName": "Nomo — Claude Code",
   "version": "0.8.3",
-  "description": "Mirror Claude Code session status to the Nomo iPhone app as a Live Activity. Pairs once with your phone via QR code; all session content is end-to-end encrypted (the relay worker never sees plaintext). OpenAI Codex CLI users install the standalone native Codex plugin (also named nomo) for the same experience.",
+  "description": "Mirror Claude Code session status to the Nomo iPhone app as a Live Activity. Pairs once with your phone via QR code; all session content is end-to-end encrypted (the relay worker never sees plaintext). OpenAI Codex users install the standalone native Codex plugin (also named nomo) for the same experience.",
   "author": {
     "name": "Nomo"
   },
