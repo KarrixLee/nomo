@@ -662,6 +662,42 @@ function codexLastTurnEvent(text) {
   }
   return null;
 }
+var CODEX_APPROVAL_REQUEST_EVENTS = new Set(["exec_approval_request", "apply_patch_approval_request"]);
+var CODEX_APPROVAL_RESOLUTION_EVENTS = new Set(["exec_command_end", "patch_apply_end", "task_complete", "turn_aborted", "task_started", "user_message"]);
+var CODEX_APPROVAL_RESOLUTION_ITEMS = new Set(["function_call_output", "custom_tool_call_output"]);
+function codexTailPendingApproval(tail) {
+  const lines = tail.split(`
+`);
+  for (let i = lines.length - 1;i >= 0; i--) {
+    const line = lines[i];
+    if (!line.trim())
+      continue;
+    if (!line.includes("event_msg") && !line.includes("response_item"))
+      continue;
+    let row;
+    try {
+      row = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (typeof row !== "object" || row === null)
+      continue;
+    const r = row;
+    const payload = r.payload;
+    const ptype = typeof payload?.type === "string" ? payload.type : undefined;
+    if (!ptype)
+      continue;
+    if (r.type === "event_msg") {
+      if (CODEX_APPROVAL_REQUEST_EVENTS.has(ptype))
+        return true;
+      if (CODEX_APPROVAL_RESOLUTION_EVENTS.has(ptype))
+        return false;
+    } else if (r.type === "response_item" && CODEX_APPROVAL_RESOLUTION_ITEMS.has(ptype)) {
+      return false;
+    }
+  }
+  return false;
+}
 function codexSentinelSessionId(pid) {
   return `codex-pid-${pid}`;
 }
@@ -783,6 +819,9 @@ var codexAdapter = {
   detectInterrupt(tail) {
     return codexLastTurnEvent(tail) === CODEX_ABORT_EVENT;
   },
+  tailShowsPendingApproval(tail) {
+    return codexTailPendingApproval(tail);
+  },
   sessionsDir: () => `${codexHome()}/sessions`,
   sessionMatch: (name) => name.startsWith("rollout-") && name.endsWith(".jsonl"),
   hookStampPath: () => lastHookPath("codex"),
@@ -825,6 +864,17 @@ async function buildDoneEnvelope(sessionId, record, now, e2eKey, agent = "claude
     ...typeof record.turnStartedAt === "number" && Number.isFinite(record.turnStartedAt) ? { turnStartedAt: record.turnStartedAt } : {}
   });
   return { v: 2, sessionId, op: "done", prio: 0, ts: now, blob, ...startedAtField(record) };
+}
+async function buildNeedsAttentionEnvelope(sessionId, record, now, e2eKey, agent = "claude") {
+  const blob = await encryptBlob(e2eKey, {
+    status: "needsAttention",
+    title: "",
+    machine: typeof record.machine === "string" ? record.machine : "",
+    label: typeof record.label === "string" ? record.label : "",
+    ...adapterFor(agent).blobAgentFields,
+    ...typeof record.turnStartedAt === "number" && Number.isFinite(record.turnStartedAt) ? { turnStartedAt: record.turnStartedAt } : {}
+  });
+  return { v: 2, sessionId, op: "update", prio: 1, ts: now, blob, ...startedAtField(record) };
 }
 function buildHeartbeatEnvelope(sessionId, record, now) {
   if (typeof record.blob !== "string" || record.blob.length === 0)
@@ -982,6 +1032,45 @@ async function correctInterrupt(config, path, sessionId, record, now) {
     return "uncorrected";
   }
 }
+function shouldPendingApprovalCheck(record, adapter) {
+  if (!adapter.tailShowsPendingApproval)
+    return false;
+  if (typeof record.transcript !== "string" || record.transcript.length === 0)
+    return false;
+  if (record.lastEvent === "needsAttention")
+    return false;
+  if (record.lastEvent === "done" || record.op === "done")
+    return false;
+  return true;
+}
+async function correctPendingApproval(config, path, sessionId, record, now) {
+  try {
+    const agent = record.agent === "codex" ? "codex" : "claude";
+    const adapter = adapterFor(agent);
+    if (!shouldPendingApprovalCheck(record, adapter))
+      return "uncorrected";
+    let tail;
+    try {
+      tail = await readSuffix(record.transcript, INTERRUPT_TAIL_BYTES);
+    } catch {
+      return "uncorrected";
+    }
+    if (!adapter.tailShowsPendingApproval(tail))
+      return "uncorrected";
+    const outcome = await postEvent(config, await buildNeedsAttentionEnvelope(sessionId, record, Date.now(), config.e2eKey, agent));
+    if (outcome === "revoked")
+      return "revoked";
+    if (outcome !== "delivered")
+      return "uncorrected";
+    try {
+      const next = { ...record, lastEvent: "needsAttention", op: "update", prio: 1, sentDone: false };
+      await atomicWrite(path, JSON.stringify(next), 384);
+    } catch {}
+    return "corrected";
+  } catch {
+    return "uncorrected";
+  }
+}
 function shouldHeartbeat(record, now, lastHeartbeat, correctedThisSweep) {
   if (record.op === "done")
     return false;
@@ -1025,7 +1114,17 @@ async function sweep(config) {
           return { revoked: true };
         if (corrected === "corrected")
           delivered = true;
-        if (shouldHeartbeat(record, now, heartbeatAt.get(sessionId), corrected === "corrected")) {
+        let flaggedAttention = false;
+        if (corrected !== "corrected") {
+          const attn = await correctPendingApproval(config, path, sessionId, record, now);
+          if (attn === "revoked")
+            return { revoked: true };
+          if (attn === "corrected") {
+            delivered = true;
+            flaggedAttention = true;
+          }
+        }
+        if (shouldHeartbeat(record, now, heartbeatAt.get(sessionId), corrected === "corrected" || flaggedAttention)) {
           const beat = buildHeartbeatEnvelope(sessionId, record, Date.now());
           if (beat) {
             const outcome = await postEvent(config, beat);
@@ -1163,6 +1262,7 @@ if (__require.main == __require.module) {
 }
 export {
   tailShowsInterrupt,
+  shouldPendingApprovalCheck,
   shouldInterruptCheck,
   shouldHeartbeat,
   reconcileProvisionalsSweep,
@@ -1173,11 +1273,13 @@ export {
   hasInterruptMarker,
   goneStrikeShouldTeardown,
   discoverLiveSessions,
+  codexTailPendingApproval,
   codexLastTurnEvent,
   classifySession,
   buildStartEnvelope,
   buildProvisionalRecord,
   buildProvisionalBlob,
+  buildNeedsAttentionEnvelope,
   buildHeartbeatEnvelope,
   buildEndEnvelope,
   buildDoneEnvelope,

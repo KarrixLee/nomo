@@ -6,12 +6,14 @@ import { decryptBlob } from "../core/crypto";
 import type { SessionRecord } from "../core/shared";
 import { GONE_STRIKE_LIMIT, readGoneStrikes, recordGoneStrike, resetGoneStrikes } from "../core/shared";
 import {
-  buildDoneEnvelope, buildEndEnvelope, buildHeartbeatEnvelope, buildProvisionalBlob, buildProvisionalRecord,
-  buildStartEnvelope, classifySession, codexLastTurnEvent, discoverLiveSessions, goneStrikeShouldTeardown,
-  hasInterruptMarker, IDLE_GRACE_MS, lastTurnLine, PAIRING_TTL_MS, pendingPairingExpired, postOutcomeForStatus,
-  provisionalsCoveredByReal, reconcileProvisionalsSweep, shouldHeartbeat, shouldInterruptCheck, tailShowsInterrupt,
+  buildDoneEnvelope, buildEndEnvelope, buildHeartbeatEnvelope, buildNeedsAttentionEnvelope, buildProvisionalBlob,
+  buildProvisionalRecord, buildStartEnvelope, classifySession, codexLastTurnEvent, codexTailPendingApproval,
+  discoverLiveSessions, goneStrikeShouldTeardown, hasInterruptMarker, IDLE_GRACE_MS, lastTurnLine, PAIRING_TTL_MS,
+  pendingPairingExpired, postOutcomeForStatus, provisionalsCoveredByReal, reconcileProvisionalsSweep,
+  shouldHeartbeat, shouldInterruptCheck, shouldPendingApprovalCheck, tailShowsInterrupt,
 } from "./cc-watchdog";
 import type { PostOutcome, RecordEntry } from "./cc-watchdog";
+import { claudeAdapter, codexAdapter } from "../core/adapter";
 import type { AgentAdapter, DiscoveredSession } from "../core/adapter";
 import type { Config, PendingConfig } from "../core/shared";
 
@@ -582,5 +584,78 @@ describe("watchdog gone-strike gate (shared 2-strike teardown, not single-strike
     } finally {
       await cleanup();
     }
+  });
+});
+
+// --- the pending-approval backstop (dropped Codex PermissionRequest #16430) ------------------
+//
+// On Codex, needsAttention hangs off ONE thread: the PermissionRequest hook. Codex has no Notification
+// event and drops hooks silently, so the watchdog scans the rollout tail for a pending approval and
+// re-raises needsAttention. buildNeedsAttentionEnvelope must match the REAL PermissionRequest wire path
+// (hook.ts planOp: PermissionRequest → op:update / prio:1 / status:needsAttention). shouldPendingApproval-
+// Check is the once-per-episode + skip-claude/done/no-transcript gate.
+
+describe("buildNeedsAttentionEnvelope (dropped-hook corrective → same envelope PermissionRequest sends)", () => {
+  test("is a v2 op:update / prio 1 whose blob decrypts to needsAttention with the record's machine/label", async () => {
+    const e = await buildNeedsAttentionEnvelope("sess-7", rec({ machine: "Mac", label: "api-status" }), 1_700_000_000_000, KEY) as Record<string, unknown>;
+    // op/prio/status EXACTLY mirror hook.ts planOp("PermissionRequest") + buildBlob.
+    expect(e).toMatchObject({ v: 2, sessionId: "sess-7", op: "update", prio: 1, ts: 1_700_000_000_000 });
+    expect(await decryptBlob(KEY, e.blob as string)).toEqual({ status: "needsAttention", title: "", machine: "Mac", label: "api-status" });
+  });
+  test("coerces a corrupt-but-parsed record's missing machine/label to empty strings", async () => {
+    const bad = { pid: 1, ts: 1 } as unknown as SessionRecord;
+    const e = await buildNeedsAttentionEnvelope("s", bad, 5, KEY) as Record<string, unknown>;
+    expect(await decryptBlob(KEY, e.blob as string)).toMatchObject({ status: "needsAttention", machine: "", label: "" });
+  });
+  test("codex (agent arg) restamps the blob's agent:'codex'; claude (default) omits it", async () => {
+    const codexEnv = await buildNeedsAttentionEnvelope("s", rec({ machine: "Mac", label: "proj" }), 5, KEY, "codex") as Record<string, unknown>;
+    expect(await decryptBlob(KEY, codexEnv.blob as string)).toMatchObject({ status: "needsAttention", agent: "codex" });
+    const claudeEnv = await buildNeedsAttentionEnvelope("s", rec(), 5, KEY) as Record<string, unknown>;
+    expect(await decryptBlob(KEY, claudeEnv.blob as string)).not.toHaveProperty("agent");
+  });
+  test("preserves the record's cached turnStartedAt + startedAt (island timer keeps the same turn)", async () => {
+    const e = await buildNeedsAttentionEnvelope("s", rec({ turnStartedAt: 1_751_900_000, sessionStartedAt: 700 }), 5, KEY) as Record<string, unknown>;
+    expect(await decryptBlob(KEY, e.blob as string)).toMatchObject({ status: "needsAttention", turnStartedAt: 1_751_900_000 });
+    expect(e).toMatchObject({ startedAt: 700 });          // clear envelope carries the session start
+    expect(e).not.toHaveProperty("turnStartedAt");        // turn anchor is blob-only
+    const bare = await buildNeedsAttentionEnvelope("s", rec(), 5, KEY) as Record<string, unknown>;
+    expect(await decryptBlob(KEY, bare.blob as string)).not.toHaveProperty("turnStartedAt");
+    expect(bare).not.toHaveProperty("startedAt");
+  });
+});
+
+describe("shouldPendingApprovalCheck (gate: once-per-episode + skip claude/done/no-transcript)", () => {
+  const arec = (over: Partial<SessionRecord> = {}): SessionRecord => ({
+    pid: 4242, machine: "mac", label: "proj", ts: 1_000_000, transcript: "/tmp/r.jsonl",
+    lastEvent: "working", agent: "codex", ...over,
+  });
+
+  test("codex + working + transcript + not-attention → check", () => {
+    expect(shouldPendingApprovalCheck(arec(), codexAdapter)).toBe(true);
+  });
+  test("a fresh sessionStart can still block on its first tool → check", () => {
+    expect(shouldPendingApprovalCheck(arec({ lastEvent: "sessionStart" }), codexAdapter)).toBe(true);
+  });
+  test("already needsAttention → skip (dedup: fire ONCE per pending episode, no double-post)", () => {
+    expect(shouldPendingApprovalCheck(arec({ lastEvent: "needsAttention" }), codexAdapter)).toBe(false);
+  });
+  test("a finished (done) session isn't awaiting approval → skip", () => {
+    expect(shouldPendingApprovalCheck(arec({ lastEvent: "done" }), codexAdapter)).toBe(false);
+    expect(shouldPendingApprovalCheck(arec({ op: "done" }), codexAdapter)).toBe(false);
+  });
+  test("claude records are skipped entirely — the adapter offers no classifier", () => {
+    expect(shouldPendingApprovalCheck(arec({ agent: undefined }), claudeAdapter)).toBe(false);
+  });
+  test("missing / empty transcript → skip", () => {
+    expect(shouldPendingApprovalCheck(arec({ transcript: "" }), codexAdapter)).toBe(false);
+    expect(shouldPendingApprovalCheck({ ...arec(), transcript: undefined } as unknown as SessionRecord, codexAdapter)).toBe(false);
+  });
+});
+
+describe("codexTailPendingApproval re-export (parser reachable through ./cc-watchdog)", () => {
+  const ev = (type: string) => JSON.stringify({ type: "event_msg", payload: { type } });
+  test("a trailing approval request → pending; a resolved one → not", () => {
+    expect(codexTailPendingApproval(ev("exec_approval_request"))).toBe(true);
+    expect(codexTailPendingApproval([ev("exec_approval_request"), ev("task_complete")].join("\n"))).toBe(false);
   });
 });

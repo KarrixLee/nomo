@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { describe, expect, test } from "bun:test";
 import {
   adapterFor, allAdapters, claudeAdapter, codexAdapter, codexDiscoverLive, codexSentinelSessionId,
-  filterCodexTuis, findProvisionalForPid, parseCodexProcs,
+  codexTailPendingApproval, filterCodexTuis, findProvisionalForPid, parseCodexProcs,
 } from "./adapter";
 import type { SessionRecord } from "./shared";
 
@@ -224,5 +224,89 @@ describe("detectInterrupt", () => {
     expect(codexAdapter.detectInterrupt(
       `{"type":"event_msg","payload":{"type":"turn_aborted"}}\n{"type":"event_msg","payload":{"type":"task_started"}}`,
     )).toBe(false);
+  });
+});
+
+// --- codex pending-approval detection (dropped PermissionRequest backstop) -------------------
+//
+// Codex surfaces a tool/patch approval via an EventMsg the plugin's PermissionRequest hook turns into
+// needsAttention; Codex has NO Notification event and silently drops hooks (openai/codex#16430), so the
+// watchdog backstops it by scanning the rollout tail. "Pending" = the tail's first decisive marker
+// (from the end) is an approval REQUEST (exec_approval_request / apply_patch_approval_request) with no
+// resolution (tool result / turn progress) after it. NOTE: these request events are transient/not
+// persisted at rust-v0.142.5, so the classifier's inputs here are documented-shape fixtures.
+describe("codexTailPendingApproval (backstop classifier) + adapter capability", () => {
+  const ev = (type: string, extra: Record<string, unknown> = {}) =>
+    JSON.stringify({ timestamp: "t", type: "event_msg", payload: { type, ...extra } });
+  const item = (type: string, extra: Record<string, unknown> = {}) =>
+    JSON.stringify({ timestamp: "t", type: "response_item", payload: { type, ...extra } });
+
+  test("only codex offers the capability; claude omits it (reliable hook channels)", () => {
+    expect(typeof codexAdapter.tailShowsPendingApproval).toBe("function");
+    expect(claudeAdapter.tailShowsPendingApproval).toBeUndefined();
+  });
+
+  test("a trailing exec/apply_patch approval request with only noise after it → pending (true)", () => {
+    expect(codexTailPendingApproval([
+      ev("task_started"),
+      item("function_call", { name: "shell" }),
+      ev("exec_approval_request", { call_id: "c1", command: ["rm", "-rf", "x"] }),
+    ].join("\n"))).toBe(true);
+    // apply_patch variant
+    expect(codexTailPendingApproval([
+      item("function_call", { name: "apply_patch" }),
+      ev("apply_patch_approval_request", { call_id: "c2" }),
+    ].join("\n"))).toBe(true);
+    // token_count / agent_message after the request is NOT a resolution — still pending
+    expect(codexTailPendingApproval([
+      ev("exec_approval_request", { call_id: "c1" }),
+      ev("token_count"),
+      ev("agent_message", { message: "thinking" }),
+    ].join("\n"))).toBe(true);
+  });
+
+  test("a request FOLLOWED by a resolution → not pending (false)", () => {
+    // tool result landed (approved & ran, or denied)
+    expect(codexTailPendingApproval([ev("exec_approval_request", { call_id: "c1" }), item("function_call_output", { call_id: "c1" })].join("\n"))).toBe(false);
+    expect(codexTailPendingApproval([ev("exec_approval_request"), item("custom_tool_call_output")].join("\n"))).toBe(false);
+    // tool finished / turn ended / new turn / user moved on
+    expect(codexTailPendingApproval([ev("exec_approval_request"), ev("exec_command_end", { call_id: "c1" })].join("\n"))).toBe(false);
+    expect(codexTailPendingApproval([ev("apply_patch_approval_request"), ev("patch_apply_end")].join("\n"))).toBe(false);
+    expect(codexTailPendingApproval([ev("exec_approval_request"), ev("task_complete")].join("\n"))).toBe(false);
+    expect(codexTailPendingApproval([ev("exec_approval_request"), ev("turn_aborted")].join("\n"))).toBe(false);
+    expect(codexTailPendingApproval([ev("exec_approval_request"), ev("task_started")].join("\n"))).toBe(false);
+    expect(codexTailPendingApproval([ev("exec_approval_request"), ev("user_message", { message: "go on" })].join("\n"))).toBe(false);
+  });
+
+  test("a SECOND request after an earlier resolved one is still pending (last decisive wins)", () => {
+    expect(codexTailPendingApproval([
+      ev("exec_approval_request", { call_id: "c1" }),
+      item("function_call_output", { call_id: "c1" }),
+      item("function_call", { name: "shell" }),
+      ev("exec_approval_request", { call_id: "c2" }),
+    ].join("\n"))).toBe(true);
+  });
+
+  test("no approval events at all (auto-approved rollout) → false", () => {
+    expect(codexTailPendingApproval([
+      ev("task_started"),
+      item("function_call", { name: "shell" }),
+      item("function_call_output", { call_id: "c1" }),
+      ev("task_complete"),
+    ].join("\n"))).toBe(false);
+  });
+
+  test("malformed / empty / byte-sliced tail → false (tolerated, never throws)", () => {
+    expect(codexTailPendingApproval("")).toBe(false);
+    expect(codexTailPendingApproval("not json at all")).toBe(false);
+    // a byte-sliced leading fragment is skipped; the intact trailing request still counts
+    expect(codexTailPendingApproval(['pe":"exec_approval_re', ev("exec_approval_request")].join("\n"))).toBe(true);
+    // a byte-sliced TRAILING fragment fails JSON.parse and is skipped, exposing the resolution beneath
+    expect(codexTailPendingApproval([ev("exec_approval_request"), item("function_call_output"), '{"type":"event_'].join("\n"))).toBe(false);
+  });
+
+  test("codexAdapter.tailShowsPendingApproval delegates to the classifier", () => {
+    expect(codexAdapter.tailShowsPendingApproval!(ev("exec_approval_request"))).toBe(true);
+    expect(codexAdapter.tailShowsPendingApproval!(ev("task_complete"))).toBe(false);
   });
 });

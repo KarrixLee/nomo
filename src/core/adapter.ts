@@ -318,6 +318,81 @@ export function codexLastTurnEvent(text: string): string | null {
   return null;
 }
 
+// --- Codex pending-approval detection (backstop for a DROPPED PermissionRequest hook) --------
+//
+// On Codex, `needsAttention` (a session blocked on the user approving a tool/patch) hangs off ONE
+// thread: the plugin's PermissionRequest hook. Codex has NO upstream Notification event (unlike
+// Claude Code), and Codex is known to SILENTLY DROP lifecycle hooks (openai/codex#16430). When that
+// hook drops, the phone never learns the session is blocked — the notify backstop only synthesizes a
+// `done` at turn end. This classifier is the watchdog's rollout-tail backstop, mirroring the existing
+// interrupt-correction: it detects an approval REQUEST at the tail with no subsequent resolution.
+//
+// The approval-request events (codex-rs `protocol/src/protocol.rs`, EventMsg is
+// `#[serde(tag="type", rename_all="snake_case")]`):
+//   - EventMsg::ExecApprovalRequest       → payload.type "exec_approval_request"
+//     (crate::approvals::ExecApprovalRequestEvent — carries call_id/command/cwd/reason)
+//   - EventMsg::ApplyPatchApprovalRequest → payload.type "apply_patch_approval_request"
+// A pending episode is RESOLVED by the tool result / turn progress that follows the user's decision:
+//   - a function_call_output / custom_tool_call_output ResponseItem (the tool ran, or was denied),
+//   - an exec_command_end / patch_apply_end event_msg (the tool finished),
+//   - a task_complete / turn_aborted / task_started event_msg (turn ended / a new turn began),
+//   - a user_message event_msg (the user moved the session on).
+// So "pending" = scanning the tail from the end, the FIRST decisive marker is a request, not a
+// resolution (symmetric with codexLastTurnEvent). Every other line (token_count, agent_message,
+// reasoning, the function_call that PROPOSED the tool, …) is noise and is scanned past.
+//
+// PERSISTENCE CAVEAT — verified against codex-rs `rollout/src/policy.rs` @ tag `rust-v0.142.5` (the
+// user's installed codex-cli): `should_persist_event_msg` classifies BOTH approval-request events as
+// "Transient, non-durable" (→ false), so on that build they are NOT written to the rollout and this
+// backstop stays DORMANT (returns false on every real rollout — confirmed empirically: 0 approval
+// events across 82 local rollouts, all auto-approved). It is kept as a forward-/other-version- and
+// history-mode-compatible net that costs one already-bounded tail read per sweep and — because it keys
+// ONLY on the explicit request event, never on a bare function_call awaiting its output — can NEVER
+// raise a false needsAttention on a merely long-running (already-approved) command.
+
+/** Codex approval-REQUEST event_msg payload.type values (EventMsg::ExecApprovalRequest /
+ *  ApplyPatchApprovalRequest). A trailing one, unresolved, is a pending approval. */
+const CODEX_APPROVAL_REQUEST_EVENTS = new Set(["exec_approval_request", "apply_patch_approval_request"]);
+/** event_msg payload.type values that RESOLVE a pending approval (the tool finished, or the turn
+ *  ended / a new turn began, or the user moved on). */
+const CODEX_APPROVAL_RESOLUTION_EVENTS = new Set(["exec_command_end", "patch_apply_end", "task_complete", "turn_aborted", "task_started", "user_message"]);
+/** response_item payload.type values that RESOLVE a pending approval — the tool RESULT landed (the
+ *  call ran after approval, or carries the denial). */
+const CODEX_APPROVAL_RESOLUTION_ITEMS = new Set(["function_call_output", "custom_tool_call_output"]);
+
+/** Whether the codex rollout tail shows an approval REQUEST that has no subsequent resolution — a
+ *  pending approval the phone must surface as needsAttention. Scans from the END and returns on the
+ *  first DECISIVE line: a request → pending (true); a resolution (tool result / turn progress) →
+ *  resolved (false). Noise lines (token_count, agent_message, reasoning, the proposing function_call)
+ *  are skipped. No request anywhere in the tail → false. Backstop for a dropped Codex PermissionRequest
+ *  hook (openai/codex#16430); see the section note for the persistence caveat. A byte-sliced first line
+ *  just fails JSON.parse and is skipped, like the other tail scanners. */
+export function codexTailPendingApproval(tail: string): boolean {
+  const lines = tail.split("\n");
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i];
+    if (!line.trim()) continue;
+    // cheap pre-filter: only event_msg (approval requests + turn/tool-end events) and response_item
+    // (tool results) lines can be decisive — everything else is noise.
+    if (!line.includes("event_msg") && !line.includes("response_item")) continue;
+    let row: unknown;
+    try { row = JSON.parse(line); } catch { continue; }
+    if (typeof row !== "object" || row === null) continue;
+    const r = row as Record<string, unknown>;
+    const payload = r.payload as Record<string, unknown> | undefined;
+    const ptype = typeof payload?.type === "string" ? (payload.type as string) : undefined;
+    if (!ptype) continue;
+    if (r.type === "event_msg") {
+      if (CODEX_APPROVAL_REQUEST_EVENTS.has(ptype)) return true;    // last decisive marker is a request → pending
+      if (CODEX_APPROVAL_RESOLUTION_EVENTS.has(ptype)) return false; // turn/tool progress → resolved
+    } else if (r.type === "response_item" && CODEX_APPROVAL_RESOLUTION_ITEMS.has(ptype)) {
+      return false; // the tool result landed → the approval was answered
+    }
+    // anything else (function_call proposing the tool, token_count, agent_message, …) → keep scanning
+  }
+  return false; // no approval request in the tail → nothing pending
+}
+
 // --- Live session discovery (the seam that closes the Codex "late session" gap) --------------
 //
 // Codex fires NO hook at session OPEN — its SessionStart fires only at the FIRST prompt
@@ -485,6 +560,14 @@ export interface AgentAdapter {
   title(ctx: { sessionId: string; prefix: string; input: Record<string, unknown> }): Promise<string | undefined>;
   /** Whether the transcript tail shows the last turn was interrupted (the two detections differ). */
   detectInterrupt(tail: string): boolean;
+  /** OPTIONAL: whether the transcript tail shows a PENDING approval — a tool/patch the session is
+   *  blocked on the user approving. Claude OMITS it (its PermissionRequest + Notification channels are
+   *  reliable); Codex implements it as the watchdog's backstop for a DROPPED PermissionRequest hook
+   *  (openai/codex#16430) — Codex has no upstream Notification event, so a dropped hook otherwise leaves
+   *  the phone unaware the session is blocked. See codexTailPendingApproval for the classifier + the
+   *  rollout-persistence caveat. Present → the watchdog runs it each sweep on a not-already-attention
+   *  session and posts a corrective needsAttention. */
+  tailShowsPendingApproval?(tail: string): boolean;
   /** Where this agent's session transcripts live (recursively scanned for liveness). */
   sessionsDir(): string;
   /** Whether a filename under sessionsDir() is one of this agent's session transcripts. */
@@ -557,6 +640,11 @@ export const codexAdapter: AgentAdapter = {
   },
   detectInterrupt(tail: string): boolean {
     return codexLastTurnEvent(tail) === CODEX_ABORT_EVENT;
+  },
+  // Backstop for a dropped Codex PermissionRequest hook (openai/codex#16430): re-raise needsAttention
+  // when the rollout tail shows a pending approval. Claude omits this (reliable hook channels).
+  tailShowsPendingApproval(tail: string): boolean {
+    return codexTailPendingApproval(tail);
   },
   sessionsDir: () => `${codexHome()}/sessions`,
   sessionMatch: (name: string) => name.startsWith("rollout-") && name.endsWith(".jsonl"),

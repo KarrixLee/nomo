@@ -41,7 +41,7 @@ import {
 // The transcript-tail interrupt PARSERS live in the agent adapters now (the two detections are
 // structurally different). Re-export them so existing importers/tests that reference "./cc-watchdog"
 // keep resolving lastTurnLine / hasInterruptMarker / codexLastTurnEvent.
-export { codexLastTurnEvent, hasInterruptMarker, lastTurnLine } from "../core/adapter";
+export { codexLastTurnEvent, codexTailPendingApproval, hasInterruptMarker, lastTurnLine } from "../core/adapter";
 
 /** Poll cadence. Short enough that a closed terminal clears in seconds; cheap enough that an
  *  idle-but-nonempty sessions dir costs almost nothing per tick. */
@@ -128,6 +128,26 @@ export async function buildDoneEnvelope(sessionId: string, record: SessionRecord
     ...(typeof record.turnStartedAt === "number" && Number.isFinite(record.turnStartedAt) ? { turnStartedAt: record.turnStartedAt } : {}),
   });
   return { v: 2, sessionId, op: "done", prio: 0, ts: now, blob, ...startedAtField(record) };
+}
+
+/** The pending-approval corrective envelope: a v2 op:update / prio 1 carrying a freshly-encrypted blob
+ *  with status "needsAttention" — the SAME op/prio/status a real PermissionRequest hook would send (see
+ *  hook.ts planOp: PermissionRequest → {op:update, prio:1, status:needsAttention}). title is "" (the
+ *  watchdog has no fresh transcript title, and the phone shows the last-known title anyway), machine/
+ *  label come from the record (coerced to "" if a corrupt record dropped them), `agent` restamps the
+ *  blob's optional agent:"codex" via the adapter seam, and the record's cached `turnStartedAt` is
+ *  restamped so the island timer keeps measuring the same turn — exactly as buildDoneEnvelope does. */
+export async function buildNeedsAttentionEnvelope(sessionId: string, record: SessionRecord, now: number, e2eKey: Uint8Array, agent: AgentKind = "claude"): Promise<object> {
+  const blob = await encryptBlob(e2eKey, {
+    status: "needsAttention",
+    title: "",
+    machine: typeof record.machine === "string" ? record.machine : "",
+    label: typeof record.label === "string" ? record.label : "",
+    // Per-agent blob identity comes from the adapter (no inline `agent === …` branch in the daemon).
+    ...adapterFor(agent).blobAgentFields,
+    ...(typeof record.turnStartedAt === "number" && Number.isFinite(record.turnStartedAt) ? { turnStartedAt: record.turnStartedAt } : {}),
+  });
+  return { v: 2, sessionId, op: "update", prio: 1, ts: now, blob, ...startedAtField(record) };
 }
 
 /** The staleness-heartbeat envelope: re-send the record's stored blob verbatim under its stored
@@ -415,6 +435,75 @@ async function correctInterrupt(config: Config, path: string, sessionId: string,
   }
 }
 
+// --- Pending-approval recovery net (dropped Codex PermissionRequest backstop) -----------------
+//
+// On Codex, needsAttention hangs off ONE thread: the plugin's PermissionRequest hook. Codex has no
+// upstream Notification event and is known to silently drop lifecycle hooks (openai/codex#16430); when
+// that hook drops, the phone never learns the session is blocked on an approval — the notify backstop
+// only synthesizes a `done` at TURN END. This net mirrors the interrupt-recovery one: it asks the
+// session's adapter (record.agent, absent → claude) whether the rollout tail shows a PENDING approval
+// (adapter.tailShowsPendingApproval; Claude implements none) and, if so, POSTs the same needsAttention
+// envelope a real PermissionRequest would have. See adapter.ts codexTailPendingApproval for the
+// classifier and its rollout-persistence caveat.
+
+/** Gate: should this sweep open the transcript to look for a pending approval on a still-ALIVE session?
+ *  Only when the session's adapter offers the classifier (codex; claude yields false), the transcript
+ *  is readable, and the session is NOT already in a state where a pending approval is meaningless or
+ *  already-surfaced: skip when lastEvent is already `needsAttention` (dedup — fire ONCE per pending
+ *  episode; the flip below closes the gate) and when the session is `done` (a finished session isn't
+ *  awaiting approval). A fresh `sessionStart` or `working` session CAN block on its first/next tool, so
+ *  those stay checkable. Pure so the whole matrix is unit-testable. */
+export function shouldPendingApprovalCheck(record: SessionRecord, adapter: AgentAdapter): boolean {
+  if (!adapter.tailShowsPendingApproval) return false; // agent has no classifier (claude) → never
+  if (typeof record.transcript !== "string" || record.transcript.length === 0) return false;
+  if (record.lastEvent === "needsAttention") return false; // already surfaced → dedup
+  if (record.lastEvent === "done" || record.op === "done") return false; // finished → not awaiting approval
+  return true;
+}
+
+/** The pending-approval recovery net for one still-alive session. Gated by shouldPendingApprovalCheck,
+ *  then it tails the rollout and, if the tail shows a pending approval, POSTs a corrective op:update /
+ *  needsAttention (the same envelope a real PermissionRequest hook produces). On a 2xx it rewrites the
+ *  session file with lastEvent:"needsAttention" so this net fires ONCE per pending episode (the gate now
+ *  skips it) and the interrupt-recovery net picks the session up (shouldInterruptCheck keys on
+ *  needsAttention, so an Esc/deny that follows still gets a corrective done). A non-2xx / network
+ *  failure leaves the file untouched for the next sweep. SCOPE: this net only OPENS the blocked state —
+ *  it deliberately does NOT synthesize a `working` update when the pending approval later resolves; the
+ *  next real hook (or the notify `done` backstop) is what clears needsAttention. Returns:
+ *   - "corrected"   → it POSTed a needsAttention this sweep → the caller must NOT also heartbeat it.
+ *   - "uncorrected" → nothing to do (gate closed, no pending approval, or a transient failed POST).
+ *   - "revoked"     → the POST 404'd: the pairing is gone server-side → the caller tears down. */
+async function correctPendingApproval(config: Config, path: string, sessionId: string, record: SessionRecord, now: number): Promise<"corrected" | "uncorrected" | "revoked"> {
+  try {
+    const agent: AgentKind = record.agent === "codex" ? "codex" : "claude";
+    const adapter = adapterFor(agent);
+    if (!shouldPendingApprovalCheck(record, adapter)) return "uncorrected";
+    let tail: string;
+    try {
+      tail = await readSuffix(record.transcript as string, INTERRUPT_TAIL_BYTES);
+    } catch {
+      return "uncorrected"; // transcript missing / cold-compressed → nothing to check
+    }
+    if (!adapter.tailShowsPendingApproval!(tail)) return "uncorrected"; // no pending approval → leave it
+    const outcome = await postEvent(config, await buildNeedsAttentionEnvelope(sessionId, record, Date.now(), config.e2eKey, agent));
+    if (outcome === "revoked") return "revoked"; // pairing gone → bubble up so the loop can tear down
+    if (outcome !== "delivered") return "uncorrected"; // failed POST → keep the file, retry next sweep
+    // 2xx: pin the session needsAttention so this net fires once per episode and the interrupt-net
+    // watches it. sentDone:false so a later re-arm behaves like a live session, not a re-armed done.
+    try {
+      const next: SessionRecord = { ...record, lastEvent: "needsAttention", op: "update", prio: 1, sentDone: false };
+      // Owner-only (0600), like the hook's trackSession / the interrupt net's rewrite — the record holds
+      // hostname, cwd basename, the session pid, and the absolute transcript path.
+      await atomicWrite(path, JSON.stringify(next), 0o600);
+    } catch {
+      // Rewrite failed — worst case the net re-POSTs a needsAttention next sweep, which the worker drops.
+    }
+    return "corrected";
+  } catch {
+    return "uncorrected";
+  }
+}
+
 // --- Heartbeat decision ---------------------------------------------------------------------
 
 /** Should this KEPT (alive) session get a heartbeat this sweep? Pure so every guardrail is unit-
@@ -478,7 +567,16 @@ async function sweep(config: Config | null): Promise<SweepResult> {
         const corrected = await correctInterrupt(config, path, sessionId, record, now);
         if (corrected === "revoked") return { revoked: true }; // gone this POST → gated teardown in run()
         if (corrected === "corrected") delivered = true; // it POSTed a done → a 2xx landed
-        if (shouldHeartbeat(record, now, heartbeatAt.get(sessionId), corrected === "corrected")) {
+        // Pending-approval backstop: only if the interrupt-net didn't just finish the turn. Re-raises
+        // needsAttention when a DROPPED Codex PermissionRequest (openai/codex#16430) left the session
+        // silently blocked. Claude's adapter offers no classifier, so this no-ops for Claude records.
+        let flaggedAttention = false;
+        if (corrected !== "corrected") {
+          const attn = await correctPendingApproval(config, path, sessionId, record, now);
+          if (attn === "revoked") return { revoked: true };
+          if (attn === "corrected") { delivered = true; flaggedAttention = true; }
+        }
+        if (shouldHeartbeat(record, now, heartbeatAt.get(sessionId), corrected === "corrected" || flaggedAttention)) {
           const beat = buildHeartbeatEnvelope(sessionId, record, Date.now());
           // delivered only: a failed heartbeat mutates NOTHING (not the record, not even the throttle),
           // so quietness stays true and it's retried next sweep. A record with no stored blob yields
