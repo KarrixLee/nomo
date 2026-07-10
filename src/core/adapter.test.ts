@@ -1,7 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { describe, expect, test } from "bun:test";
 import {
-  adapterFor, allAdapters, claudeAdapter, claudeSessionModel, claudeSessionTitle, codexAdapter, codexChildSessionGhost,
+  adapterFor, allAdapters, claudeAdapter, claudeSessionModel, claudeSessionTitle, claudeTailPendingApproval,
+  codexAdapter, codexChildSessionGhost,
   codexConfigModel, codexDiscoverLive, codexInternalSessionGhost, codexModelFromRollout,
   CODEX_ROLLOUT_IDLE_SILENCE_MS,
   codexNewestRolloutForCwd, codexPidTurnActive, codexRolloutExistsForSession, codexSentinelSessionId, codexSessionModel,
@@ -646,9 +647,9 @@ describe("codexTailPendingApproval (backstop classifier) + adapter capability", 
   const item = (type: string, extra: Record<string, unknown> = {}) =>
     JSON.stringify({ timestamp: "t", type: "response_item", payload: { type, ...extra } });
 
-  test("only codex offers the capability; claude omits it (reliable hook channels)", () => {
+  test("both agents offer the capability (codex backstops a dropped PermissionRequest; claude a dropped PreToolUse)", () => {
     expect(typeof codexAdapter.tailShowsPendingApproval).toBe("function");
-    expect(claudeAdapter.tailShowsPendingApproval).toBeUndefined();
+    expect(typeof claudeAdapter.tailShowsPendingApproval).toBe("function");
   });
 
   test("a trailing exec/apply_patch approval request with only noise after it → pending (true)", () => {
@@ -713,6 +714,67 @@ describe("codexTailPendingApproval (backstop classifier) + adapter capability", 
   test("codexAdapter.tailShowsPendingApproval delegates to the classifier", () => {
     expect(codexAdapter.tailShowsPendingApproval!(ev("exec_approval_request"))).toBe(true);
     expect(codexAdapter.tailShowsPendingApproval!(ev("task_complete"))).toBe(false);
+  });
+});
+
+// --- claude pending-approval detection (dropped PreToolUse backstop) --------------------------
+//
+// On Claude a user-blocking tool (AskUserQuestion / ExitPlanMode) surfaces needsAttention via the
+// PreToolUse hook (hook.ts planOp). If that hook is dropped, the watchdog backstops it by scanning the
+// transcript tail: "pending" = the LAST assistant turn issues a user-blocking tool_use with no later
+// tool_result answering it. A merely long-running tool (Bash) has a tool_use with no result too, so the
+// name gate is what keeps it from false-flagging.
+describe("claudeTailPendingApproval (dropped-PreToolUse backstop classifier) + adapter capability", () => {
+  const asstTool = (name: string, id: string) =>
+    JSON.stringify({ type: "assistant", message: { role: "assistant", content: [{ type: "tool_use", id, name, input: {} }] } });
+  const asstText = (text: string) =>
+    JSON.stringify({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text }] } });
+  const toolResult = (id: string) =>
+    JSON.stringify({ type: "user", message: { role: "user", content: [{ type: "tool_result", tool_use_id: id, content: "ok" }] } });
+
+  test("a blocked AskUserQuestion / ExitPlanMode with no answer → pending (true)", () => {
+    expect(claudeTailPendingApproval(asstTool("AskUserQuestion", "toolu_1"))).toBe(true);
+    expect(claudeTailPendingApproval(asstTool("ExitPlanMode", "toolu_p"))).toBe(true);
+    // text alongside the tool_use in the same assistant turn is fine
+    expect(claudeTailPendingApproval(JSON.stringify({
+      type: "assistant",
+      message: { role: "assistant", content: [{ type: "text", text: "which?" }, { type: "tool_use", id: "toolu_2", name: "AskUserQuestion", input: {} }] },
+    }))).toBe(true);
+  });
+
+  test("an ANSWERED question (tool_result follows) → not pending (false)", () => {
+    expect(claudeTailPendingApproval([asstTool("AskUserQuestion", "toolu_1"), toolResult("toolu_1")].join("\n"))).toBe(false);
+    // and once Claude has moved on to a plain-text turn after the answer → still not pending
+    expect(claudeTailPendingApproval([asstTool("AskUserQuestion", "toolu_1"), toolResult("toolu_1"), asstText("thanks")].join("\n"))).toBe(false);
+  });
+
+  test("an ordinary pending tool_use (long-running Bash, no result) → NOT pending (false)", () => {
+    expect(claudeTailPendingApproval(asstTool("Bash", "toolu_b"))).toBe(false);
+    expect(claudeTailPendingApproval(asstTool("Task", "toolu_t"))).toBe(false);
+  });
+
+  test("a NEW question after an earlier answered one → pending again (true)", () => {
+    expect(claudeTailPendingApproval([
+      asstTool("AskUserQuestion", "toolu_1"), toolResult("toolu_1"),
+      asstTool("AskUserQuestion", "toolu_2"),
+    ].join("\n"))).toBe(true);
+  });
+
+  test("sidechain (subagent) rows are ignored — not the session's own block state", () => {
+    const sideAsk = JSON.stringify({ type: "assistant", isSidechain: true, message: { role: "assistant", content: [{ type: "tool_use", id: "s1", name: "AskUserQuestion", input: {} }] } });
+    expect(claudeTailPendingApproval(sideAsk)).toBe(false);
+  });
+
+  test("malformed / empty / byte-sliced tail → false (tolerated, never throws)", () => {
+    expect(claudeTailPendingApproval("")).toBe(false);
+    expect(claudeTailPendingApproval("not json at all")).toBe(false);
+    // a byte-sliced leading fragment is skipped; the intact trailing blocked question still counts
+    expect(claudeTailPendingApproval(['{"type":"assist', asstTool("AskUserQuestion", "toolu_9")].join("\n"))).toBe(true);
+  });
+
+  test("claudeAdapter.tailShowsPendingApproval delegates to the classifier", () => {
+    expect(claudeAdapter.tailShowsPendingApproval!(asstTool("AskUserQuestion", "x"))).toBe(true);
+    expect(claudeAdapter.tailShowsPendingApproval!(asstTool("Bash", "y"))).toBe(false);
   });
 });
 

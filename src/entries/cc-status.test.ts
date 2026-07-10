@@ -46,6 +46,30 @@ describe("planOp (op mapping table)", () => {
     expect(planOp("", i(), false)).toBeNull();
   });
 
+  // --- PreToolUse for a USER-blocking tool → instant needsAttention --------------------------
+  test("PreToolUse for AskUserQuestion / ExitPlanMode → update / prio 1 / needsAttention (blocked on user)", () => {
+    expect(planOp("PreToolUse", i({ tool_name: "AskUserQuestion" }), false)).toEqual({ op: "update", prio: 1, status: "needsAttention" });
+    expect(planOp("PreToolUse", i({ tool_name: "ExitPlanMode" }), false)).toEqual({ op: "update", prio: 1, status: "needsAttention" });
+    // the same after a done still maps to the blocking needsAttention (re-arm doesn't downgrade it)
+    expect(planOp("PreToolUse", i({ tool_name: "AskUserQuestion" }), true)).toEqual({ op: "update", prio: 1, status: "needsAttention" });
+  });
+  test("PreToolUse for an ordinary tool (or no tool_name) stays a working update (prio 0)", () => {
+    expect(planOp("PreToolUse", i({ tool_name: "Bash" }), false)).toEqual({ op: "update", prio: 0, status: "working" });
+    expect(planOp("PreToolUse", i({ tool_name: "Edit" }), false)).toEqual({ op: "update", prio: 0, status: "working" });
+    expect(planOp("PreToolUse", i(), false)).toEqual({ op: "update", prio: 0, status: "working" });
+  });
+  test("Stop / SessionEnd still override a blocking-tool PreToolUse turn to done / end", () => {
+    expect(planOp("Stop", i({ tool_name: "AskUserQuestion" }), false)).toEqual({ op: "done", prio: 0, status: "done" });
+    expect(planOp("SessionEnd", i({ tool_name: "ExitPlanMode" }), false)).toMatchObject({ op: "end", prio: 0 });
+  });
+  test("the blocking needsAttention flows through buildBlob (same path as PermissionRequest, no divergent blob)", () => {
+    const plan = planOp("PreToolUse", { session_id: "s", cwd: "/x", tool_name: "AskUserQuestion" }, false)!;
+    expect(plan).toEqual({ op: "update", prio: 1, status: "needsAttention" });
+    // AskUserQuestion has no tool→detail mapping, so the blob carries needsAttention with no `detail`.
+    expect(buildBlob({ session_id: "s", cwd: "/Users/x/api-status", hook_event_name: "PreToolUse", tool_name: "AskUserQuestion" }, "Mac", "t", plan))
+      .toEqual({ status: "needsAttention", title: "t", machine: "Mac", label: "api-status" });
+  });
+
   // --- re-arm-after-done ---------------------------------------------------------------------
   test("a SessionStart AFTER a done re-arms as a fresh working update (not a start)", () => {
     expect(planOp("SessionStart", i(), true)).toEqual({ op: "update", prio: 0, status: "working" });

@@ -853,6 +853,69 @@ function codexTailPendingApproval(tail) {
   }
   return false;
 }
+var CLAUDE_USER_BLOCKING_TOOLS = new Set(["AskUserQuestion", "ExitPlanMode"]);
+function blockingToolUseId(assistantRow) {
+  const content = assistantRow.message?.content;
+  if (!Array.isArray(content))
+    return;
+  for (const part of content) {
+    if (typeof part !== "object" || part === null)
+      continue;
+    const p = part;
+    if (p.type !== "tool_use" || typeof p.name !== "string" || !CLAUDE_USER_BLOCKING_TOOLS.has(p.name))
+      continue;
+    if (typeof p.id === "string" && p.id.length > 0)
+      return p.id;
+  }
+  return;
+}
+function hasToolResultFor(row, id) {
+  const content = row.message?.content;
+  if (!Array.isArray(content))
+    return false;
+  for (const part of content) {
+    if (typeof part !== "object" || part === null)
+      continue;
+    const p = part;
+    if (p.type === "tool_result" && p.tool_use_id === id)
+      return true;
+  }
+  return false;
+}
+function claudeTailPendingApproval(tail) {
+  const rows = [];
+  for (const line of tail.split(`
+`)) {
+    if (!line.trim())
+      continue;
+    if (!line.includes("tool_use") && !line.includes("tool_result"))
+      continue;
+    let row;
+    try {
+      row = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (typeof row !== "object" || row === null)
+      continue;
+    const r = row;
+    if (r.isSidechain === true)
+      continue;
+    rows.push(r);
+  }
+  for (let i = rows.length - 1;i >= 0; i--) {
+    if (rows[i].type !== "assistant")
+      continue;
+    const id = blockingToolUseId(rows[i]);
+    if (!id)
+      return false;
+    for (let j = i + 1;j < rows.length; j++)
+      if (hasToolResultFor(rows[j], id))
+        return false;
+    return true;
+  }
+  return false;
+}
 var CODEX_ROLLOUT_IDLE_SILENCE_MS = 30000;
 var CODEX_TURN_OPEN_EVENT = "task_started";
 function codexTurnActiveFromTail(tail, silentForMs) {
@@ -1125,6 +1188,9 @@ var claudeAdapter = {
   detectInterrupt(tail) {
     const line = lastTurnLine(tail);
     return line !== null && hasInterruptMarker(line);
+  },
+  tailShowsPendingApproval(tail) {
+    return claudeTailPendingApproval(tail);
   },
   sessionsDir: () => `${process.env.HOME}/.claude/projects`,
   sessionMatch: (name) => name.endsWith(".jsonl"),

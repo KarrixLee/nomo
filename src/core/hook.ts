@@ -62,10 +62,23 @@ export function isPermissionNotification(i: Record<string, unknown>): boolean {
   return type === "permission_prompt" || msg.includes("permission") || msg.includes("approve") || msg.includes("allow");
 }
 
+/// Tools that block on the USER (not on the machine): Claude presents them and then WAITS for a human
+/// answer/approval before it can continue — AskUserQuestion parks on a multiple-choice question,
+/// ExitPlanMode parks on plan approval. A PreToolUse for either is the EARLIEST signal the session is
+/// blocked on the user, so planOp maps it to the SAME op/prio/status a PermissionRequest sends
+/// (update / prio 1 / needsAttention) instead of a generic working update — the phone alerts the instant
+/// Claude parks, not ~5 min later when Claude Code's own idle Notification finally fires. The matching
+/// PostToolUse (user answered) falls through to the normal working path. Codex has no such tool names,
+/// so a codex PreToolUse never hits this branch. Mirrored by the watchdog backstop
+/// (claudeAdapter.tailShowsPendingApproval) for the case where this very PreToolUse hook is dropped.
+const USER_BLOCKING_TOOLS = new Set(["AskUserQuestion", "ExitPlanMode"]);
+
 /// The LOCAL op planner (the worker is now blind — lifecycle semantics live here). Maps a hook to a
 /// v2 op, its delivery prio, and the semantic status carried in the blob:
 ///   SessionStart                                → start,  prio 0, working
-///   UserPromptSubmit / PreToolUse / PostToolUse → update, prio 0, working
+///   UserPromptSubmit / PostToolUse              → update, prio 0, working
+///   PreToolUse (ordinary tool)                  → update, prio 0, working
+///   PreToolUse (AskUserQuestion / ExitPlanMode) → update, prio 1, needsAttention  (blocked on the user)
 ///   Notification (permission only) / PermissionRequest → update, prio 1, needsAttention
 ///   Stop                                        → done,   prio 0, done
 ///   SessionEnd                                  → end,    prio 0  (no blob)
@@ -78,8 +91,16 @@ export function planOp(hookName: string, input: Record<string, unknown>, sentDon
       return sentDone
         ? { op: "update", prio: 0, status: "working" }
         : { op: "start", prio: 0, status: "working" };
+    case "PreToolUse": {
+      // A PreToolUse for a user-blocking tool is an INSTANT needsAttention (same op/prio/status a
+      // PermissionRequest sends); every other tool is a normal working update. The status flows through
+      // buildBlob's `plan.status` exactly like the PermissionRequest path — no divergent blob.
+      const tool = typeof input.tool_name === "string" ? input.tool_name : "";
+      return USER_BLOCKING_TOOLS.has(tool)
+        ? { op: "update", prio: 1, status: "needsAttention" }
+        : { op: "update", prio: 0, status: "working" };
+    }
     case "UserPromptSubmit":
-    case "PreToolUse":
     case "PostToolUse":
       return { op: "update", prio: 0, status: "working" };
     case "Notification":

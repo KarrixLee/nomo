@@ -729,8 +729,13 @@ describe("shouldPendingApprovalCheck (gate: once-per-episode + skip claude/done/
     expect(shouldPendingApprovalCheck(arec({ lastEvent: "done" }), codexAdapter)).toBe(false);
     expect(shouldPendingApprovalCheck(arec({ op: "done" }), codexAdapter)).toBe(false);
   });
-  test("claude records are skipped entirely — the adapter offers no classifier", () => {
-    expect(shouldPendingApprovalCheck(arec({ agent: undefined }), claudeAdapter)).toBe(false);
+  test("claude records are now checked too — the adapter backstops a dropped PreToolUse", () => {
+    // claudeAdapter gained tailShowsPendingApproval (the dropped-PreToolUse backstop), so a working
+    // claude session with a transcript is checkable, exactly like a codex one.
+    expect(shouldPendingApprovalCheck(arec({ agent: undefined }), claudeAdapter)).toBe(true);
+    // the same gates still apply to claude records: already-attention and done are skipped
+    expect(shouldPendingApprovalCheck(arec({ agent: undefined, lastEvent: "needsAttention" }), claudeAdapter)).toBe(false);
+    expect(shouldPendingApprovalCheck(arec({ agent: undefined, lastEvent: "done" }), claudeAdapter)).toBe(false);
   });
   test("missing / empty transcript → skip", () => {
     expect(shouldPendingApprovalCheck(arec({ transcript: "" }), codexAdapter)).toBe(false);

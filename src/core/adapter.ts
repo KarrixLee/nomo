@@ -594,6 +594,92 @@ export function codexTailPendingApproval(tail: string): boolean {
   return false; // no approval request in the tail → nothing pending
 }
 
+// --- Claude pending-approval detection (backstop for a DROPPED PreToolUse hook) ---------------
+//
+// On Claude, needsAttention for a USER-blocking tool (AskUserQuestion / ExitPlanMode) rides the hook
+// path: the PreToolUse-mapped instant needsAttention (see hook.ts planOp / USER_BLOCKING_TOOLS), plus
+// the reliable Notification/PermissionRequest channels. But if that PreToolUse hook is DROPPED, the
+// phone keeps showing "working" while Claude is actually parked on the user — until Claude Code's own
+// idle Notification eventually fires (~5 min). This classifier is the watchdog's transcript-tail
+// backstop, mirroring the codex one: it converts a missed hook into ≤~5-10 s of delay (the watchdog
+// polls every 5 s) instead of ~5 min.
+//
+// A Claude session is blocked-on-user iff the LAST assistant turn issues a `tool_use` for one of the
+// user-blocking tools AND no LATER line carries a `tool_result` for that tool_use id (the user hasn't
+// answered). Claude writes the assistant turn as `{"type":"assistant","message":{"content":[…,{"type":
+// "tool_use","id":"toolu_…","name":"AskUserQuestion",…}]}}` and the answer as a user turn
+// `{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_…",…}]}}`. An
+// ordinary long-running tool (Bash, Task, …) ALSO has a tool_use with no result WHILE it runs, so the
+// name gate is load-bearing: ONLY AskUserQuestion / ExitPlanMode count, never a bare pending tool_use.
+// Sidechain (subagent) rows are ignored — a Task subagent's own turns aren't the session's block state.
+
+/** The Claude tools that block on the USER (mirrors hook.ts USER_BLOCKING_TOOLS — a question / plan
+ *  approval only the human can answer). Kept here so this watchdog backstop is self-contained. */
+const CLAUDE_USER_BLOCKING_TOOLS = new Set(["AskUserQuestion", "ExitPlanMode"]);
+
+/** The id of a USER-BLOCKING `tool_use` in an assistant row's content array, or undefined when the row
+ *  issues no such tool_use. Only AskUserQuestion / ExitPlanMode qualify — an ordinary tool_use (a
+ *  long-running Bash, an Edit, …) returns undefined, so a merely in-flight tool never reads as pending. */
+function blockingToolUseId(assistantRow: Record<string, unknown>): string | undefined {
+  const content = (assistantRow.message as Record<string, unknown> | undefined)?.content;
+  if (!Array.isArray(content)) return undefined;
+  for (const part of content) {
+    if (typeof part !== "object" || part === null) continue;
+    const p = part as Record<string, unknown>;
+    if (p.type !== "tool_use" || typeof p.name !== "string" || !CLAUDE_USER_BLOCKING_TOOLS.has(p.name)) continue;
+    if (typeof p.id === "string" && p.id.length > 0) return p.id;
+  }
+  return undefined;
+}
+
+/** Whether a Claude `user` turn carries a `tool_result` for the given tool_use id — the user's answer to
+ *  the blocking question/plan (an approval, or a rejection; both write a tool_result). */
+function hasToolResultFor(row: Record<string, unknown>, id: string): boolean {
+  const content = (row.message as Record<string, unknown> | undefined)?.content;
+  if (!Array.isArray(content)) return false;
+  for (const part of content) {
+    if (typeof part !== "object" || part === null) continue;
+    const p = part as Record<string, unknown>;
+    if (p.type === "tool_result" && p.tool_use_id === id) return true;
+  }
+  return false;
+}
+
+/** Whether the Claude transcript tail shows a PENDING user-blocking tool — an AskUserQuestion /
+ *  ExitPlanMode the session is parked on with no answer yet. Finds the LAST assistant turn (sidechain
+ *  rows skipped); if it issues a user-blocking tool_use and no later line carries that tool_use's
+ *  tool_result, the session is blocked (true). Any other last assistant turn — plain text, or an
+ *  ordinary non-blocking tool_use like a running Bash — is not a pending approval (false). Because
+ *  Claude can only continue PAST a user-blocking tool once the user answers (which writes a
+ *  tool_result), a later assistant turn always implies the earlier block was resolved — so the
+ *  tool_result check is exact. Backstop for a dropped PreToolUse hook; a byte-sliced line just fails
+ *  JSON.parse and is skipped, like every other tail scanner. Never throws. */
+export function claudeTailPendingApproval(tail: string): boolean {
+  // Collect only the decisive rows — assistant `tool_use` turns and user `tool_result` turns — skipping
+  // sidechain/subagent noise. The cheap substring pre-filter skips JSON.parse on the vast majority of
+  // lines (a user tool_result row still matches via its `tool_use_id`).
+  const rows: Record<string, unknown>[] = [];
+  for (const line of tail.split("\n")) {
+    if (!line.trim()) continue;
+    if (!line.includes("tool_use") && !line.includes("tool_result")) continue;
+    let row: unknown;
+    try { row = JSON.parse(line); } catch { continue; }
+    if (typeof row !== "object" || row === null) continue;
+    const r = row as Record<string, unknown>;
+    if (r.isSidechain === true) continue; // a Task subagent's turn — not the session's own block state
+    rows.push(r);
+  }
+  // The LAST assistant turn decides: pending only if IT is a user-blocking tool_use with no later result.
+  for (let i = rows.length - 1; i >= 0; i--) {
+    if (rows[i].type !== "assistant") continue;
+    const id = blockingToolUseId(rows[i]);
+    if (!id) return false; // last assistant turn isn't a user-blocking tool → not parked on the user
+    for (let j = i + 1; j < rows.length; j++) if (hasToolResultFor(rows[j], id)) return false; // answered
+    return true; // user-blocking tool_use, no answer yet → pending
+  }
+  return false; // no assistant turn in the tail
+}
+
 // --- Codex idle-vs-in-flight turn classification (for discovery/provisional rows) -------------
 //
 // The watchdog's discovery step used to advertise EVERY live Codex TUI as status "working" — but an
@@ -1150,6 +1236,13 @@ export const claudeAdapter: AgentAdapter = {
   detectInterrupt(tail: string): boolean {
     const line = lastTurnLine(tail);
     return line !== null && hasInterruptMarker(line);
+  },
+  // Backstop for a DROPPED PreToolUse hook (the primary instant-attention path is hook.ts planOp's
+  // PreToolUse → needsAttention for AskUserQuestion / ExitPlanMode): re-raise needsAttention when the
+  // transcript tail shows Claude parked on a user-blocking tool with no answer yet. See
+  // claudeTailPendingApproval. Converts a missed hook into ≤~5-10 s of delay instead of ~5 min.
+  tailShowsPendingApproval(tail: string): boolean {
+    return claudeTailPendingApproval(tail);
   },
   sessionsDir: () => `${process.env.HOME}/.claude/projects`,
   sessionMatch: (name: string) => name.endsWith(".jsonl"),

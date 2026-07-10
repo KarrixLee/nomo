@@ -43,7 +43,7 @@ import {
 // The transcript-tail interrupt PARSERS live in the agent adapters now (the two detections are
 // structurally different). Re-export them so existing importers/tests that reference "./cc-watchdog"
 // keep resolving lastTurnLine / hasInterruptMarker / codexLastTurnEvent.
-export { codexLastTurnEvent, codexTailPendingApproval, hasInterruptMarker, lastTurnLine } from "../core/adapter";
+export { claudeTailPendingApproval, codexLastTurnEvent, codexTailPendingApproval, hasInterruptMarker, lastTurnLine } from "../core/adapter";
 
 /** Poll cadence. Short enough that a closed terminal clears in seconds; cheap enough that an
  *  idle-but-nonempty sessions dir costs almost nothing per tick. */
