@@ -98,6 +98,29 @@ export function sessionTitle(transcript: string): string | undefined {
   return aiTitleFromLines(lines) ?? firstUserPromptFromLines(lines);
 }
 
+/** How much of the transcript TAIL the Claude title resolver reads. CC re-emits `ai-title` lines as
+ *  the session evolves, so on a LONG transcript the freshest one lives near the END — far outside the
+ *  bounded head window (observed live: a 3.7 MB transcript whose FIRST ai-title sat at byte ~590K;
+ *  the head scan found nothing and the phone fell back to the folder-name label). Sized to match the
+ *  128 KB head window so a large assistant/tool line between the last ai-title and EOF still leaves
+ *  the title inside the read. */
+const TITLE_TAIL_BYTES = 128 * 1024;
+
+/** The Claude session's display title: the FRESHEST `ai-title` from a bounded transcript TAIL (long
+ *  sessions append them over time, so the newest one sits near EOF, not in the head), else the head's
+ *  ai-title / first user prompt (sessionTitle — the opening turns, before CC has generated a summary).
+ *  Mirrors claudeSessionModel's tail-then-head shape: one bounded readSuffix, best-effort — a missing/
+ *  unreadable transcript just falls through to the already-read head prefix. */
+export async function claudeSessionTitle(prefix: string, transcriptPath: string): Promise<string | undefined> {
+  if (transcriptPath.length > 0) {
+    try {
+      const t = aiTitle(await readSuffix(transcriptPath, TITLE_TAIL_BYTES));
+      if (t) return t;
+    } catch { /* no transcript yet / unreadable — fall through to the head prefix */ }
+  }
+  return prefix.length > 0 ? sessionTitle(prefix) : undefined;
+}
+
 /// The PRIMARY codex title source. Codex CLI (≥0.142) writes a clean, AI-generated thread title to
 /// `$CODEX_HOME/session_index.jsonl` — one JSON object per line
 /// `{"id":<session uuid>,"thread_name":<title>,"updated_at":<iso>}` — the very label `codex resume`
@@ -252,17 +275,28 @@ function firstUserPromptFromLines(lines: string[]): string | undefined {
       if (typeof t === "string") text = t;
     }
     if (typeof text !== "string") continue;
-    // Strip embedded <system-reminder> blocks BEFORE cleaning: a reminder-only message then reduces
-    // to "" (skipped), while a real prompt that carries an appended reminder keeps its visible text.
-    const cleaned = text.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, "").replace(/\s+/g, " ").trim();
-    if (!cleaned || cleaned.startsWith("<")) continue; // skip command/UI artifacts
-    if (cleaned.startsWith("Caveat:")) continue; // the local-command caveat wrapper is not a prompt
-    if (cleaned.includes("<command-name>") || cleaned.includes("<local-command-stdout>")) continue; // command noise mid-string
-    // Markdown-strip + word-boundary truncate so a prompt written in Markdown doesn't render raw
-    // `**asterisks**` or get hard-cut mid-word (the stashed pairing-prompt title bug).
-    return cleanPromptTitle(cleaned);
+    const title = displayTitleFromUserText(text);
+    if (title === undefined) continue; // command/UI noise — keep scanning for the real ask
+    return title;
   }
   return undefined;
+}
+
+/** Clean ONE raw user-message text into a display title, or undefined when it's command/UI noise.
+ *  The single cleaning gauntlet shared by the transcript first-prompt scanner above and the claude
+ *  adapter's UserPromptSubmit `input.prompt` fallback, so both judge "is this a real ask?" identically:
+ *  embedded <system-reminder> blocks are stripped FIRST (a reminder-only message reduces to "" and is
+ *  rejected, while a real prompt carrying an appended reminder keeps its visible text); command/UI
+ *  artifacts (leading `<`, the local-command Caveat wrapper, command-tag noise mid-string) are
+ *  rejected; what survives is Markdown-stripped + word-boundary truncated (cleanPromptTitle) so a
+ *  Markdown prompt doesn't render raw `**asterisks**` or get hard-cut mid-word. Never returns "". */
+export function displayTitleFromUserText(text: string): string | undefined {
+  const cleaned = text.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, "").replace(/\s+/g, " ").trim();
+  if (!cleaned || cleaned.startsWith("<")) return undefined; // command/UI artifacts
+  if (cleaned.startsWith("Caveat:")) return undefined; // the local-command caveat wrapper is not a prompt
+  if (cleaned.includes("<command-name>") || cleaned.includes("<local-command-stdout>")) return undefined; // command noise mid-string
+  const title = cleanPromptTitle(cleaned);
+  return title.length > 0 ? title : undefined; // all-Markdown-noise input can clean to "" — that's not a title
 }
 
 export function firstUserPrompt(transcript: string): string | undefined {
@@ -912,6 +946,84 @@ export function codexChildSessionGhost(
     typeof t.pid === "number" && Number.isFinite(t.pid) && t.pid === hookPid);
 }
 
+// --- Codex top-level internal-job ghost detection (ChatGPT.app `codex app-server`) ------------
+//
+// The child-session net above keys on the hook's pid ALREADY owning a tracked real codex session —
+// but ChatGPT.app's background `codex app-server` (tty-less, cwd=$HOME or a project dir) also runs
+// TOP-LEVEL internal jobs whose pid owns nothing (observed 2026-07-10: session
+// 019f4a6a-88ad-7ed3-8f0a-cdfcc32ff98f, ChatGPT's own "Generate 0 to 3 hyperpersonalized
+// suggestions…" prompt, model gpt-5.4, EMPTY transcript, NO rollout under ~/.codex/sessions/). Those
+// leak straight past codexChildSessionGhost and become phantom phone rows that never get a real
+// title, a turn, or an end. The prompt text is deliberately NOT matched (ChatGPT's internal prompts
+// are unversioned strings that can change any release) — the fingerprint is structural, the ROLLOUT:
+// codex writes a real session's rollout (session_meta first line) essentially at session CREATION,
+// before any hook can fire for it (SessionStart itself only fires at the first prompt,
+// openai/codex#15269), so by the time a hook arrives for a REAL session there is rollout evidence —
+// content in the transcript prefix, or at least the rollout file on disk. An internal job has
+// neither, ever.
+//
+// The guard is therefore a DEFER, not a hard verdict: skip mirroring while there is NO rollout
+// evidence (empty/absent transcript AND no rollout file for the id). A real session racing its first
+// flush (never observed, but conceivable) merely loses its first frame — hooks fire many times per
+// turn, and the next one finds the rollout and mirrors the session. A phantom row, by contrast,
+// would stick forever: no later hook ever corrects an internal job.
+
+/** Whether ANY rollout file for `sessionId` exists under `$CODEX_HOME/sessions/YYYY/MM/DD`. Codex
+ *  embeds the session uuid in the rollout filename (`rollout-<started-at>-<uuid>.jsonl` — the same
+ *  layout sessionMatch/codexNewestRolloutForCwd rely on), so this is a filename-only scan — zero
+ *  file reads — over the newest ROLLOUT_SCAN_MAX_DAYS day-directories. The only caller gates on a
+ *  NEVER-tracked id whose transcript is empty, i.e. a session at most minutes old, so the bounded
+ *  day window always covers a real one. Best-effort: unreadable directories are skipped (→ no
+ *  evidence), like the cwd locator above. */
+export async function codexRolloutExistsForSession(sessionId: string, home: string = codexHome()): Promise<boolean> {
+  if (sessionId.length === 0) return false;
+  const sessions = join(home, "sessions");
+  let days = 0;
+  for (const y of await listNumericDirsDesc(sessions)) {
+    for (const m of await listNumericDirsDesc(join(sessions, y))) {
+      for (const d of await listNumericDirsDesc(join(sessions, y, m))) {
+        let names: string[];
+        try { names = await readdir(join(sessions, y, m, d)); } catch { names = []; }
+        if (names.some((n) => n.startsWith("rollout-") && n.endsWith(".jsonl") && n.includes(sessionId))) return true;
+        if (++days >= ROLLOUT_SCAN_MAX_DAYS) return false;
+      }
+    }
+  }
+  return false;
+}
+
+/** Injectable seams for the internal-job ghost check, so the decision matrix is testable without a
+ *  real filesystem (the CodexTurnProbeDeps pattern). */
+export interface CodexInternalGhostDeps {
+  /** stat-like existence probe for the hook's own transcript_path (resolves → the file exists). */
+  statOf?: (path: string) => Promise<unknown>;
+  /** Rollout-existence locator (see codexRolloutExistsForSession). */
+  rolloutExists?: (sessionId: string) => Promise<boolean>;
+}
+
+/** Whether a NEVER-tracked codex hook event is a TOP-LEVEL app-server internal job — skip it (defer
+ *  mirroring until rollout evidence appears; see the section note). True iff the transcript prefix
+ *  is empty AND the hook's transcript_path doesn't exist on disk AND no rollout file exists for the
+ *  id. Evidence checks run cheapest-first (the already-read prefix, one stat, then the bounded
+ *  filename scan), and any POSITIVE evidence mirrors immediately; a failing probe counts as "no
+ *  evidence yet" — the defer self-heals on the session's next hook, whereas mirroring on a broken
+ *  probe would mint the very phantom row this guard exists to kill. Never throws. */
+export async function codexInternalSessionGhost(
+  sessionId: string, transcriptPrefix: string, transcriptPath: string, deps: CodexInternalGhostDeps = {},
+): Promise<boolean> {
+  if (transcriptPrefix.trim().length > 0) return false; // rollout content → a real session
+  if (transcriptPath.length > 0) {
+    // The rollout file exists even though its content hasn't flushed into the prefix yet (or the
+    // read raced) — codex created it, so the session is real.
+    try { await (deps.statOf ?? stat)(transcriptPath); return false; } catch { /* no file at the path */ }
+  }
+  try {
+    return !(await (deps.rolloutExists ?? codexRolloutExistsForSession)(sessionId));
+  } catch {
+    return true; // locator failed → still no evidence of a real session → defer (self-heals)
+  }
+}
+
 /** Match a codex hook to a provisional record by pid, returning the provisional's sentinel sessionId (or
  *  null). PRIMARY match is EQUALITY: the codex hook's `process.ppid` IS the codex TUI process — codex
  *  spawns the hook directly and run.sh `exec`s the runtime (same pid, parent unchanged), the very
@@ -940,8 +1052,12 @@ export interface AgentAdapter {
    *  the existing "claude"/"codex" values. */
   kind: AgentKind;
   /** Resolve the session's display title from the (already-read) transcript prefix + hook input.
-   *  Async because the codex path also reads the session_index. Undefined → no title yet. */
-  title(ctx: { sessionId: string; prefix: string; input: Record<string, unknown> }): Promise<string | undefined>;
+   *  Async because the codex path reads the session_index and the claude path reads a bounded
+   *  transcript TAIL — on a long session the freshest ai-title lives near the END, outside the head
+   *  window, so `transcriptPath` rides alongside the memoized head `prefix` for that one readSuffix,
+   *  exactly like the model seam below (optional: absent/"" → head-only, for callers with no
+   *  transcript on disk). Undefined → no title yet. */
+  title(ctx: { sessionId: string; prefix: string; input: Record<string, unknown>; transcriptPath?: string }): Promise<string | undefined>;
   /** OPTIONAL: resolve the session's raw model id (e.g. "claude-fable-5", "gpt-5-codex") for the
    *  blob's OPTIONAL `model` field. Undefined → unknown → the blob OMITS the key (never an empty
    *  string) and the phone hides its badge. Claude reads the transcript's assistant lines (its hook
@@ -966,6 +1082,14 @@ export interface AgentAdapter {
    *  that share their pid with the real session (see codexChildSessionGhost). Called by runHook only
    *  when NO session record exists yet for the id. */
   isChildSessionGhost?(ctx: { sessionId: string; prefix: string; hookPid: number; tracked: TrackedSessionLite[] }): boolean;
+  /** OPTIONAL: whether a hook event for a NEVER-tracked session id is a TOP-LEVEL app-server
+   *  INTERNAL JOB that must be skipped (deferred) — no transcript content, no transcript file, no
+   *  rollout for the id (see codexInternalSessionGhost). Complements isChildSessionGhost, which only
+   *  nets child ids on an already-tracked pid; ChatGPT.app's internal jobs (e.g. its
+   *  "hyperpersonalized suggestions" generator) are top-level, so the pid net can't see them. Claude
+   *  OMITS it (every Claude session id is real). Async because it probes the sessions tree. Called by
+   *  runHook only when NO session record exists yet, so a live session can never be silenced by it. */
+  isInternalSessionGhost?(ctx: { sessionId: string; prefix: string; transcriptPath: string }): Promise<boolean>;
   /** Where this agent's session transcripts live (recursively scanned for liveness). */
   sessionsDir(): string;
   /** Whether a filename under sessionsDir() is one of this agent's session transcripts. */
@@ -1001,9 +1125,22 @@ export interface AgentAdapter {
 
 export const claudeAdapter: AgentAdapter = {
   kind: "claude",
-  async title({ prefix }): Promise<string | undefined> {
-    // Both the first user message and CC's ai-title sit near the top; the prefix carries them.
-    return prefix.length > 0 ? sessionTitle(prefix) : undefined;
+  async title({ prefix, input, transcriptPath }): Promise<string | undefined> {
+    // Freshest ai-title from the transcript TAIL, else the head's ai-title / first user prompt —
+    // on a long session CC's newest ai-title sits near EOF, outside the head window entirely (see
+    // claudeSessionTitle). Preference: aiTitle(tail) ?? aiTitle(head) ?? firstUserPrompt(head).
+    const fromTranscript = await claudeSessionTitle(prefix, transcriptPath ?? "");
+    if (fromTranscript) return fromTranscript;
+    // FALLBACK (mirrors the codex adapter): a first prompt so large its transcript line alone
+    // overflows the head window (observed live: a 510 KB opening line — JSON.parse fails on the
+    // byte-sliced fragment) leaves every transcript scanner empty at turn 1. But the UserPromptSubmit
+    // hook carries the raw prompt itself — clean it through the SAME gauntlet the transcript
+    // first-prompt scanner uses, so command noise is rejected identically.
+    if (typeof input.prompt === "string" && input.prompt.length > 0) {
+      const hookName = typeof input.hook_event_name === "string" ? input.hook_event_name : "";
+      if (hookName === "UserPromptSubmit") return displayTitleFromUserText(input.prompt);
+    }
+    return undefined;
   },
   // Claude's hook stdin carries no model field — the transcript's assistant lines do. Last assistant
   // line in a bounded tail (tracks /model switches) → first in the head prefix → undefined.
@@ -1063,6 +1200,13 @@ export const codexAdapter: AgentAdapter = {
   // sharing its pid with an already-tracked real codex session, is skipped (see codexChildSessionGhost).
   isChildSessionGhost({ sessionId, prefix, hookPid, tracked }): boolean {
     return codexChildSessionGhost(sessionId, prefix, hookPid, tracked);
+  },
+  // ChatGPT.app `codex app-server` TOP-LEVEL internal jobs (its own background prompts — no rollout
+  // is ever written for them): a never-tracked id with no transcript content, no transcript file, and
+  // no rollout for the id is deferred — a real session always has rollout evidence by the time a hook
+  // fires (see codexInternalSessionGhost).
+  isInternalSessionGhost({ sessionId, prefix, transcriptPath }): Promise<boolean> {
+    return codexInternalSessionGhost(sessionId, prefix, transcriptPath);
   },
   sessionsDir: () => `${codexHome()}/sessions`,
   sessionMatch: (name: string) => name.startsWith("rollout-") && name.endsWith(".jsonl"),

@@ -291,9 +291,13 @@ export async function trackSession(
  *  this codex TUI, so end + delete any PROVISIONAL session the watchdog surfaced ahead of it. Matches by
  *  pid — the hook's process.ppid is the codex TUI process, which is the provisional's pid (with an
  *  ancestor-walk fallback; see findProvisionalForPid). POSTs an op:end for the sentinel sessionId (the
- *  worker reuses the last blob for the final frame) then deletes the provisional record so the sweep/
- *  reap never re-touches it. Best-effort: a failure just leaves the provisional for the sweep backstop
- *  or the pid-death reap. REMOVABLE with the discovery feature once openai/codex#15269 ships. */
+ *  worker reuses the last blob for the final frame) and deletes the provisional record ONLY on a 2xx —
+ *  the watchdog's "delivered gates deletion" discipline (see postOutcomeForStatus there). A failed/
+ *  timed-out POST leaves the file on disk because it is the ONLY retry handle: the worker still holds
+ *  the ghost row, and both retry paths — the next codex hook landing here and the watchdog's
+ *  reconcileProvisionalsSweep (~5s) — match provisionals BY THEIR FILE. Unlinking unconditionally
+ *  orphaned the row for hours on a single dropped POST (observed live: codex-pid-40738). Best-effort
+ *  otherwise. REMOVABLE with the discovery feature once openai/codex#15269 ships. */
 async function reconcileProvisional(config: Config, hookPid: number): Promise<void> {
   try {
     const files = await readdir(SESSIONS_DIR).catch(() => [] as string[]);
@@ -307,13 +311,17 @@ async function reconcileProvisional(config: Config, hookPid: number): Promise<vo
     if (provisionals.length === 0) return;
     const sentinel = findProvisionalForPid(provisionals, hookPid, pidAncestors);
     if (!sentinel) return;
-    await fetch(`${config.url}/v1/cc/event`, {
-      method: "POST",
-      headers: { "content-type": "application/json", "x-cc-pairing": config.pairingId, "x-cc-auth": config.pcSecret },
-      body: JSON.stringify({ v: 2, sessionId: sentinel, op: "end", prio: 0, ts: Date.now() }),
-      signal: AbortSignal.timeout(2000),
-    }).catch(() => {});
-    await unlink(`${SESSIONS_DIR}/${sentinel}.json`).catch(() => {});
+    let delivered = false;
+    try {
+      const res = await fetch(`${config.url}/v1/cc/event`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-cc-pairing": config.pairingId, "x-cc-auth": config.pcSecret },
+        body: JSON.stringify({ v: 2, sessionId: sentinel, op: "end", prio: 0, ts: Date.now() }),
+        signal: AbortSignal.timeout(2000),
+      });
+      delivered = res.ok; // 2xx only — a 401/5xx did NOT retire the worker's row
+    } catch { /* network failure / timeout → keep the file so the retry paths above can re-send */ }
+    if (delivered) await unlink(`${SESSIONS_DIR}/${sentinel}.json`).catch(() => {});
   } catch {
     // best-effort — never surface into a session
   }
@@ -404,11 +412,13 @@ export async function runHook(agent: AgentKind): Promise<void> {
 
     // The session name. Read lazily (only the paired or mid-pairing paths need it) so a never-paired
     // machine's hooks stay fully inert. The per-agent resolution chain (codex: session_index
-    // thread_name → rollout scan → UserPromptSubmit prompt; claude: ai-title → first user prompt)
-    // lives in the adapter, which reads from the same bounded, memoized prefix the start-time
-    // extractor uses.
+    // thread_name → rollout scan → UserPromptSubmit prompt; claude: freshest ai-title from a bounded
+    // transcript TAIL → head ai-title → head first-user-prompt → UserPromptSubmit prompt) lives in
+    // the adapter, which reads from the same bounded, memoized prefix the start-time extractor uses;
+    // the transcript path rides alongside for the claude tail read (the freshest ai-title on a long
+    // transcript sits near EOF, outside the head window — the model seam has the same shape).
     const readTitle = async (): Promise<string | undefined> =>
-      adapter.title({ sessionId: input.session_id as string, prefix: await getPrefix(), input });
+      adapter.title({ sessionId: input.session_id as string, prefix: await getPrefix(), input, transcriptPath });
 
     // The session's model id (v0.8.5), resolved by the adapter's OPTIONAL seam next to the title —
     // undefined when the adapter omits the seam or nothing resolves (the blob then omits `model`).
@@ -449,14 +459,24 @@ export async function runHook(agent: AgentKind): Promise<void> {
       })) return;
     }
 
-    // Reconcile a provisional discovery: Codex fires no hook at session OPEN (openai/codex#15269), so
-    // the watchdog may have surfaced this TUI provisionally. Now that a REAL codex hook is reporting,
-    // end that provisional so the phone doesn't show both it and the real session. Codex-only (Claude
-    // has no discovery). Runs before the real event so the phone ends the provisional then starts the
-    // real session, in order. REMOVABLE once openai/codex#15269 ships.
-    if (agent === "codex") await reconcileProvisional(config, process.ppid);
+    // Top-level internal-job ghost guard (adapter seam; codex-only in practice): ChatGPT.app's
+    // background `codex app-server` also runs TOP-LEVEL internal jobs (e.g. its "hyperpersonalized
+    // suggestions" generator) whose pid owns no other tracked session, so the child-session net above
+    // can't catch them. A REAL codex session has rollout evidence by the time any hook fires (content
+    // in the prefix, or at least the rollout file on disk — codex writes session_meta at session
+    // creation); an internal job never does. With no evidence the event is skipped — a DEFER, not a
+    // verdict: a real session racing its first flush just mirrors on its next hook (they fire many
+    // times per turn), while a phantom row would have stuck forever. Only consulted for a NEVER-
+    // tracked id, so an already-live session can never be silenced by it.
+    if (!existingRecord && adapter.isInternalSessionGhost && await adapter.isInternalSessionGhost({
+      sessionId: input.session_id, prefix: await getPrefix(), transcriptPath,
+    })) return;
 
-    const title = await readTitle();
+    // Keep the LAST NON-EMPTY title, like model below: a later hook whose bounded reads find nothing
+    // (the freshest ai-title outside both windows, a giant unparseable head line, a transcript raced
+    // away) must not regress the phone's title to "" — the record's cached title backstops the live
+    // blob, not just the watchdog's rebuilt ones.
+    const title = (await readTitle()) ?? existingRecord?.title;
     // Keep the LAST NON-EMPTY model, like title: a hook whose tail read finds nothing (transcript
     // raced away, no assistant turn in the window) must not drop the badge the previous hook set.
     const model = (await readModel()) ?? existingRecord?.model;
@@ -493,12 +513,24 @@ export async function runHook(agent: AgentKind): Promise<void> {
     // Record (or, on op:end, remove) this session's file and make sure the liveness watchdog is
     // running before we POST — a force-killed terminal fires no SessionEnd, so this is how the phone
     // learns of a dead session in seconds instead of after the 30-min eviction.
-    // Cache the last NON-EMPTY title (this hook's, else the previous record's) so the watchdog's
-    // corrective envelopes never regress to title:"" — and stamp the pairing the blob was sealed
-    // under so a heartbeat after a re-pair can't re-send an undecryptable stale blob.
+    // `title` already carries the last non-empty value (resolved above) so the watchdog's corrective
+    // envelopes never regress to title:"" — and the pairing the blob was sealed under is stamped so a
+    // heartbeat after a re-pair can't re-send an undecryptable stale blob.
     await trackSession(input.session_id, plan.op, plan.prio, plan.status, envelope.blob as string | undefined, machine, label, transcriptPath, agent, startedAt, turnStartedAt, turnId,
-      title ?? existingRecord?.title, config.pairingId, model);
+      title, config.pairingId, model);
     ensureWatchdog();
+
+    // Reconcile a provisional discovery: Codex fires no hook at session OPEN (openai/codex#15269), so
+    // the watchdog may have surfaced this TUI provisionally. Now that a REAL codex hook is reporting,
+    // end that provisional so the phone doesn't show both it and the real session. Codex-only (Claude
+    // has no discovery). Runs AFTER trackSession has written the real record but BEFORE the real
+    // event's POST, so the phone still sees end-provisional → start-real in order — and, with the
+    // real record already covering this pid, (a) a discovery sweep racing this hook can't re-surface
+    // the same TUI as a fresh provisional in the unlink-to-track window the old pre-track placement
+    // left open, and (b) if the end POST fails (the file survives — see reconcileProvisional) the
+    // sweep backstop finds the survivor "covered by real" and retries it within a sweep (~5s).
+    // REMOVABLE once openai/codex#15269 ships.
+    if (agent === "codex") await reconcileProvisional(config, process.ppid);
 
     const res = await fetch(`${config.url}/v1/cc/event`, {
       method: "POST",

@@ -1,9 +1,10 @@
 import { randomUUID } from "node:crypto";
 import { describe, expect, test } from "bun:test";
 import {
-  adapterFor, allAdapters, claudeAdapter, claudeSessionModel, codexAdapter, codexChildSessionGhost,
-  codexConfigModel, codexDiscoverLive, codexModelFromRollout, CODEX_ROLLOUT_IDLE_SILENCE_MS,
-  codexNewestRolloutForCwd, codexPidTurnActive, codexSentinelSessionId, codexSessionModel,
+  adapterFor, allAdapters, claudeAdapter, claudeSessionModel, claudeSessionTitle, codexAdapter, codexChildSessionGhost,
+  codexConfigModel, codexDiscoverLive, codexInternalSessionGhost, codexModelFromRollout,
+  CODEX_ROLLOUT_IDLE_SILENCE_MS,
+  codexNewestRolloutForCwd, codexPidTurnActive, codexRolloutExistsForSession, codexSentinelSessionId, codexSessionModel,
   codexTailPendingApproval, codexTurnActiveFromTail, filterCodexTuis, findProvisionalForPid,
   firstAssistantModel, firstUserPrompt, lastAssistantModel, parseCodexProcs, rolloutMetaCwd,
   rolloutPathFromLsof, sessionTitle, TrackedSessionLite,
@@ -84,6 +85,77 @@ describe("claude title", () => {
     expect(userTitle).toBe("Fix the flaky test");
 
     expect(await claudeAdapter.title({ sessionId: randomUUID(), input: {}, prefix: "" })).toBeUndefined();
+  });
+
+  test("claudeSessionTitle: the FRESHEST ai-title from the transcript TAIL wins; the head is the fallback", async () => {
+    const { mkdtemp, writeFile, rm } = await import("node:fs/promises");
+    const { tmpdir } = await import("node:os");
+    const { join: j } = await import("node:path");
+    const dir = await mkdtemp(j(tmpdir(), "cc-title-"));
+    try {
+      // Long-transcript shape (the 3.7 MB repro): the head window saw only the opening turns — NO
+      // ai-title — while the ai-title lines CC appended later sit at the tail; the LAST one wins.
+      const path = j(dir, "t.jsonl");
+      await writeFile(path, [
+        `{"type":"assistant","message":{"content":[{"type":"text","text":"${"x".repeat(200)}"}]}}`,
+        `{"type":"ai-title","aiTitle":"Old topic"}`,
+        `{"type":"ai-title","aiTitle":"Fix the reconcile orphan"}`,
+      ].join("\n"));
+      const headOnly = `{"type":"user","message":{"content":"first ask"}}`;
+      // The tail's freshest ai-title beats the head's first-user-prompt fallback.
+      expect(await claudeSessionTitle(headOnly, path)).toBe("Fix the reconcile orphan");
+      // Missing/unreadable transcript → the head prefix answers (ai-title, else first prompt).
+      expect(await claudeSessionTitle(headOnly, j(dir, "missing.jsonl"))).toBe("first ask");
+      expect(await claudeSessionTitle("", j(dir, "missing.jsonl"))).toBeUndefined();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("the adapter reads the tail through the seam: a tail-only ai-title beats the head's fallback", async () => {
+    const { mkdtemp, writeFile, rm } = await import("node:fs/promises");
+    const { tmpdir } = await import("node:os");
+    const { join: j } = await import("node:path");
+    const dir = await mkdtemp(j(tmpdir(), "cc-title-seam-"));
+    try {
+      const path = j(dir, "t.jsonl");
+      await writeFile(path, `{"type":"ai-title","aiTitle":"Tail title"}`);
+      expect(await claudeAdapter.title({
+        sessionId: randomUUID(), input: {}, transcriptPath: path,
+        prefix: `{"type":"user","message":{"content":"head fallback"}}`,
+      })).toBe("Tail title");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("UserPromptSubmit prompt fallback: a giant unparseable head line yields no transcript title, the hook input's prompt does", async () => {
+    // The other real-world failure: the FIRST user line alone exceeded the head window (a 510 KB line
+    // embedding a system-reminder), so the prefix is a byte-sliced fragment JSON.parse rejects and
+    // every transcript scanner comes up empty at turn 1 — but the hook input carries the prompt.
+    const slicedHead = `{"type":"user","message":{"content":"${"y".repeat(500)}`; // cut mid-line
+    expect(await claudeAdapter.title({
+      sessionId: randomUUID(), prefix: slicedHead, transcriptPath: "",
+      input: { hook_event_name: "UserPromptSubmit", prompt: "**Fix** the `title` bug" },
+    })).toBe("Fix the title bug"); // cleaned exactly like the transcript first-prompt fallback
+  });
+
+  test("the prompt fallback runs the SAME cleaning gauntlet as the transcript scanner (noise rejected)", async () => {
+    const ctx = (input: Record<string, unknown>) => ({ sessionId: randomUUID(), prefix: "", transcriptPath: "", input });
+    // A reminder-only prompt reduces to "" and is rejected — never a phantom title.
+    expect(await claudeAdapter.title(ctx({
+      hook_event_name: "UserPromptSubmit", prompt: "<system-reminder>injected context</system-reminder>",
+    }))).toBeUndefined();
+    // The local-command caveat wrapper is not a prompt.
+    expect(await claudeAdapter.title(ctx({
+      hook_event_name: "UserPromptSubmit", prompt: "Caveat: The messages below were generated…",
+    }))).toBeUndefined();
+    // No prompt fallback outside UserPromptSubmit (mirrors the codex adapter's gate).
+    expect(await claudeAdapter.title(ctx({ hook_event_name: "PreToolUse", prompt: "ignored" }))).toBeUndefined();
+    // A real prompt with an APPENDED reminder keeps its visible text.
+    expect(await claudeAdapter.title(ctx({
+      hook_event_name: "UserPromptSubmit", prompt: "Fix the bug<system-reminder>noise</system-reminder>",
+    }))).toBe("Fix the bug");
   });
 });
 
@@ -682,6 +754,108 @@ describe("codexChildSessionGhost (app-server child sessions must not become phon
   test("codexAdapter implements the seam; claudeAdapter omits it", () => {
     expect(codexAdapter.isChildSessionGhost!({ sessionId: "x", prefix: "", hookPid: 81879, tracked: [real] })).toBe(true);
     expect(claudeAdapter.isChildSessionGhost).toBeUndefined();
+  });
+});
+
+// --- Bug A′ regression: ChatGPT.app app-server TOP-LEVEL internal jobs -------------------------
+//
+// The child-session net above misses ChatGPT.app's top-level internal jobs. Observed 2026-07-10:
+// session 019f4a6a-88ad-7ed3-8f0a-cdfcc32ff98f, titled from ChatGPT's OWN internal prompt ("Overview
+// Generate 0 to 3 hyperpersonalized suggestions for what this user can…"), model gpt-5.4, EMPTY
+// transcript string, NO rollout under ~/.codex/sessions/ — and a pid that owned no other tracked
+// session, so codexChildSessionGhost let it straight through to a phantom phone row. That prompt
+// text is documented here as EVIDENCE only; the classifier keys on the structural signal (no
+// transcript content + no transcript file + no rollout for the id), never on prompt matching.
+
+describe("codexInternalSessionGhost (top-level app-server internal jobs must not become phone rows)", () => {
+  const ghostId = "019f4a6a-88ad-7ed3-8f0a-cdfcc32ff98f";
+
+  test("the observed ghost: empty transcript, no transcript path, no rollout → skipped", async () => {
+    expect(await codexInternalSessionGhost(ghostId, "", "", { rolloutExists: async () => false })).toBe(true);
+    // whitespace-only prefix is still "no rollout content"
+    expect(await codexInternalSessionGhost(ghostId, "  \n ", "", { rolloutExists: async () => false })).toBe(true);
+  });
+
+  test("a legit brand-new TUI session (rollout file already on disk) is mirrored", async () => {
+    expect(await codexInternalSessionGhost("real-id", "", "", { rolloutExists: async () => true })).toBe(false);
+  });
+
+  test("rollout CONTENT in the prefix mirrors immediately — neither fs probe is consulted", async () => {
+    let statted = false, scanned = false;
+    expect(await codexInternalSessionGhost("real-id", '{"timestamp":"2026-07-10T00:00:00Z","type":"session_meta"}', "/some/rollout.jsonl", {
+      statOf: async () => { statted = true; return {}; },
+      rolloutExists: async () => { scanned = true; return false; },
+    })).toBe(false);
+    expect(statted).toBe(false);
+    expect(scanned).toBe(false);
+  });
+
+  test("an existing transcript_path (file created, content not flushed yet) mirrors without the scan", async () => {
+    let scanned = false;
+    expect(await codexInternalSessionGhost("real-id", "", "/rollout/on/disk.jsonl", {
+      statOf: async () => ({}),
+      rolloutExists: async () => { scanned = true; return false; },
+    })).toBe(false);
+    expect(scanned).toBe(false);
+  });
+
+  test("a transcript_path with NO file behind it falls through to the rollout scan", async () => {
+    expect(await codexInternalSessionGhost(ghostId, "", "/gone/rollout.jsonl", {
+      statOf: async () => { throw new Error("ENOENT"); },
+      rolloutExists: async () => false,
+    })).toBe(true);
+    expect(await codexInternalSessionGhost("real-id", "", "/gone/rollout.jsonl", {
+      statOf: async () => { throw new Error("ENOENT"); },
+      rolloutExists: async () => true,
+    })).toBe(false);
+  });
+
+  test("DEFER, not verdict: the same session mirrors on its next hook once the rollout appears", async () => {
+    let rolloutOnDisk = false; // hook 1 races the first flush → no rollout yet → first frame deferred
+    const deps = { rolloutExists: async () => rolloutOnDisk };
+    expect(await codexInternalSessionGhost("racy-id", "", "", deps)).toBe(true);
+    rolloutOnDisk = true;      // hook 2 (same turn, moments later): the rollout is on disk now
+    expect(await codexInternalSessionGhost("racy-id", "", "", deps)).toBe(false);
+  });
+
+  test("a throwing locator is NO evidence → defer (self-heals; never throws out)", async () => {
+    expect(await codexInternalSessionGhost("x", "", "", {
+      rolloutExists: async () => { throw new Error("boom"); },
+    })).toBe(true);
+  });
+
+  test("codexAdapter implements the seam; claudeAdapter omits it", () => {
+    expect(typeof codexAdapter.isInternalSessionGhost).toBe("function");
+    expect(claudeAdapter.isInternalSessionGhost).toBeUndefined();
+  });
+});
+
+describe("codexRolloutExistsForSession (filename-only scan under sessions/YYYY/MM/DD)", () => {
+  test("finds a rollout whose filename carries the session id; misses unknown ids", async () => {
+    const { mkdtemp, mkdir, writeFile, rm } = await import("node:fs/promises");
+    const { tmpdir } = await import("node:os");
+    const { join: j } = await import("node:path");
+    const home = await mkdtemp(j(tmpdir(), "codex-home-"));
+    try {
+      const day = j(home, "sessions", "2026", "07", "10");
+      await mkdir(day, { recursive: true });
+      const sid = "019f4a6a-1111-7ed3-8f0a-abcabcabcabc";
+      await writeFile(j(day, `rollout-2026-07-10T01-00-00-${sid}.jsonl`), ""); // filename is the evidence — content unread
+      expect(await codexRolloutExistsForSession(sid, home)).toBe(true);
+      // the observed ghost id has no rollout anywhere → no evidence
+      expect(await codexRolloutExistsForSession("019f4a6a-88ad-7ed3-8f0a-cdfcc32ff98f", home)).toBe(false);
+      // a non-rollout file carrying the id does not count
+      await writeFile(j(day, "notes-019f4a6a-2222.txt"), "");
+      expect(await codexRolloutExistsForSession("019f4a6a-2222", home)).toBe(false);
+      // an empty id can never match (defensive — the hook gates on a non-empty session_id anyway)
+      expect(await codexRolloutExistsForSession("", home)).toBe(false);
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+
+  test("a missing sessions tree → false (no rollout evidence, best-effort)", async () => {
+    expect(await codexRolloutExistsForSession("x", "/nonexistent/codex-home")).toBe(false);
   });
 });
 

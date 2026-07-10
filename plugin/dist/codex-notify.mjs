@@ -494,6 +494,17 @@ function sessionTitle(transcript) {
 `);
   return aiTitleFromLines(lines) ?? firstUserPromptFromLines(lines);
 }
+var TITLE_TAIL_BYTES = 128 * 1024;
+async function claudeSessionTitle(prefix, transcriptPath) {
+  if (transcriptPath.length > 0) {
+    try {
+      const t = aiTitle(await readSuffix(transcriptPath, TITLE_TAIL_BYTES));
+      if (t)
+        return t;
+    } catch {}
+  }
+  return prefix.length > 0 ? sessionTitle(prefix) : undefined;
+}
 function codexThreadName(indexContent, sessionId) {
   let found;
   for (const line of indexContent.split(`
@@ -603,16 +614,23 @@ function firstUserPromptFromLines(lines) {
     }
     if (typeof text !== "string")
       continue;
-    const cleaned = text.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, "").replace(/\s+/g, " ").trim();
-    if (!cleaned || cleaned.startsWith("<"))
+    const title = displayTitleFromUserText(text);
+    if (title === undefined)
       continue;
-    if (cleaned.startsWith("Caveat:"))
-      continue;
-    if (cleaned.includes("<command-name>") || cleaned.includes("<local-command-stdout>"))
-      continue;
-    return cleanPromptTitle(cleaned);
+    return title;
   }
   return;
+}
+function displayTitleFromUserText(text) {
+  const cleaned = text.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, "").replace(/\s+/g, " ").trim();
+  if (!cleaned || cleaned.startsWith("<"))
+    return;
+  if (cleaned.startsWith("Caveat:"))
+    return;
+  if (cleaned.includes("<command-name>") || cleaned.includes("<local-command-stdout>"))
+    return;
+  const title = cleanPromptTitle(cleaned);
+  return title.length > 0 ? title : undefined;
 }
 function firstUserPrompt(transcript) {
   return firstUserPromptFromLines(transcript.split(`
@@ -1040,6 +1058,44 @@ function codexChildSessionGhost(sessionId, transcriptPrefix, hookPid, tracked) {
     return false;
   return tracked.some((t) => t.sessionId !== sessionId && t.provisional !== true && t.agent === "codex" && typeof t.pid === "number" && Number.isFinite(t.pid) && t.pid === hookPid);
 }
+async function codexRolloutExistsForSession(sessionId, home = codexHome()) {
+  if (sessionId.length === 0)
+    return false;
+  const sessions = join2(home, "sessions");
+  let days = 0;
+  for (const y of await listNumericDirsDesc(sessions)) {
+    for (const m of await listNumericDirsDesc(join2(sessions, y))) {
+      for (const d of await listNumericDirsDesc(join2(sessions, y, m))) {
+        let names;
+        try {
+          names = await readdir(join2(sessions, y, m, d));
+        } catch {
+          names = [];
+        }
+        if (names.some((n) => n.startsWith("rollout-") && n.endsWith(".jsonl") && n.includes(sessionId)))
+          return true;
+        if (++days >= ROLLOUT_SCAN_MAX_DAYS)
+          return false;
+      }
+    }
+  }
+  return false;
+}
+async function codexInternalSessionGhost(sessionId, transcriptPrefix, transcriptPath, deps = {}) {
+  if (transcriptPrefix.trim().length > 0)
+    return false;
+  if (transcriptPath.length > 0) {
+    try {
+      await (deps.statOf ?? stat2)(transcriptPath);
+      return false;
+    } catch {}
+  }
+  try {
+    return !await (deps.rolloutExists ?? codexRolloutExistsForSession)(sessionId);
+  } catch {
+    return true;
+  }
+}
 function findProvisionalForPid(provisionals, hookPid, ancestorsOf) {
   for (const p of provisionals)
     if (p.pid === hookPid)
@@ -1052,8 +1108,16 @@ function findProvisionalForPid(provisionals, hookPid, ancestorsOf) {
 }
 var claudeAdapter = {
   kind: "claude",
-  async title({ prefix }) {
-    return prefix.length > 0 ? sessionTitle(prefix) : undefined;
+  async title({ prefix, input, transcriptPath }) {
+    const fromTranscript = await claudeSessionTitle(prefix, transcriptPath ?? "");
+    if (fromTranscript)
+      return fromTranscript;
+    if (typeof input.prompt === "string" && input.prompt.length > 0) {
+      const hookName = typeof input.hook_event_name === "string" ? input.hook_event_name : "";
+      if (hookName === "UserPromptSubmit")
+        return displayTitleFromUserText(input.prompt);
+    }
+    return;
   },
   model({ prefix, transcriptPath }) {
     return claudeSessionModel(prefix, transcriptPath);
@@ -1096,6 +1160,9 @@ var codexAdapter = {
   },
   isChildSessionGhost({ sessionId, prefix, hookPid, tracked }) {
     return codexChildSessionGhost(sessionId, prefix, hookPid, tracked);
+  },
+  isInternalSessionGhost({ sessionId, prefix, transcriptPath }) {
+    return codexInternalSessionGhost(sessionId, prefix, transcriptPath);
   },
   sessionsDir: () => `${codexHome()}/sessions`,
   sessionMatch: (name) => name.startsWith("rollout-") && name.endsWith(".jsonl"),
@@ -1274,13 +1341,18 @@ async function reconcileProvisional(config, hookPid) {
     const sentinel = findProvisionalForPid(provisionals, hookPid, pidAncestors);
     if (!sentinel)
       return;
-    await fetch(`${config.url}/v1/cc/event`, {
-      method: "POST",
-      headers: { "content-type": "application/json", "x-cc-pairing": config.pairingId, "x-cc-auth": config.pcSecret },
-      body: JSON.stringify({ v: 2, sessionId: sentinel, op: "end", prio: 0, ts: Date.now() }),
-      signal: AbortSignal.timeout(2000)
-    }).catch(() => {});
-    await unlink2(`${SESSIONS_DIR}/${sentinel}.json`).catch(() => {});
+    let delivered = false;
+    try {
+      const res = await fetch(`${config.url}/v1/cc/event`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-cc-pairing": config.pairingId, "x-cc-auth": config.pcSecret },
+        body: JSON.stringify({ v: 2, sessionId: sentinel, op: "end", prio: 0, ts: Date.now() }),
+        signal: AbortSignal.timeout(2000)
+      });
+      delivered = res.ok;
+    } catch {}
+    if (delivered)
+      await unlink2(`${SESSIONS_DIR}/${sentinel}.json`).catch(() => {});
   } catch {}
 }
 async function readTrackedSessions() {
@@ -1326,7 +1398,7 @@ async function runHook(agent) {
       }
       return prefixCache;
     };
-    const readTitle = async () => adapter2.title({ sessionId: input.session_id, prefix: await getPrefix(), input });
+    const readTitle = async () => adapter2.title({ sessionId: input.session_id, prefix: await getPrefix(), input, transcriptPath });
     const readModel = async () => adapter2.model?.({ sessionId: input.session_id, prefix: await getPrefix(), input, transcriptPath });
     if (!config) {
       const pending = await loadPendingConfig();
@@ -1348,9 +1420,13 @@ async function runHook(agent) {
       }))
         return;
     }
-    if (agent === "codex")
-      await reconcileProvisional(config, process.ppid);
-    const title = await readTitle();
+    if (!existingRecord && adapter2.isInternalSessionGhost && await adapter2.isInternalSessionGhost({
+      sessionId: input.session_id,
+      prefix: await getPrefix(),
+      transcriptPath
+    }))
+      return;
+    const title = await readTitle() ?? existingRecord?.title;
     const model = await readModel() ?? existingRecord?.model;
     const sentDone = existingRecord?.sentDone === true;
     const cachedStart = typeof existingRecord?.sessionStartedAt === "number" && Number.isFinite(existingRecord.sessionStartedAt) ? existingRecord.sessionStartedAt : undefined;
@@ -1366,8 +1442,10 @@ async function runHook(agent) {
     const envelope = await buildEnvelope(input, machine, Date.now(), title, config.e2eKey, sentDone, agent, startedAt, turnStartedAt, label, model);
     if (!envelope)
       return;
-    await trackSession(input.session_id, plan.op, plan.prio, plan.status, envelope.blob, machine, label, transcriptPath, agent, startedAt, turnStartedAt, turnId, title ?? existingRecord?.title, config.pairingId, model);
+    await trackSession(input.session_id, plan.op, plan.prio, plan.status, envelope.blob, machine, label, transcriptPath, agent, startedAt, turnStartedAt, turnId, title, config.pairingId, model);
     ensureWatchdog();
+    if (agent === "codex")
+      await reconcileProvisional(config, process.ppid);
     const res = await fetch(`${config.url}/v1/cc/event`, {
       method: "POST",
       headers: {

@@ -1,15 +1,16 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, mkdtemp, readFile, rm, stat, unlink, utimes, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, stat, unlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { b64url, decryptBlob } from "../core/crypto";
-import { parseConfig, PendingEventStash, readRecord, SESSIONS_DIR } from "../core/shared";
+import { parseConfig, PendingEventStash, readRecord, SessionRecord, SESSIONS_DIR } from "../core/shared";
 import {
   aiTitle, buildBlob, buildEnvelope, buildPendingStash, cleanPromptTitle, codexIndexTitle, codexSessionTitle,
   codexThreadName, detailForHook, firstUserPrompt, isPermissionNotification, planOp, sessionTitle,
   stashPendingEvent, trackSession, transcriptStartMs,
 } from "./cc-status";
+import { provisionalsCoveredByReal, reconcileProvisionalsSweep } from "./cc-watchdog";
 import { hooksAppearStale, parseCodexPluginState, statusCmd } from "./status-cmd";
 
 // A fixed 32-byte test key; the real one is HKDF-derived, but any 32 bytes exercise the round-trip.
@@ -1222,6 +1223,13 @@ describe("runHook turn_id sniff (claude entry invoked inside a Codex session)", 
       // Pre-seed a LIVE watchdog pidfile (this very test process) so the entry's ensureWatchdog()
       // no-ops instead of spawning a detached poller that would outlive the test.
       await writeFile(join(ccDir, "watchdog.pid"), String(process.pid));
+      // Rollout EVIDENCE for the payload's session id: since the internal-job ghost guard, a codex-
+      // restamped run with a never-tracked id and no transcript content is only mirrored when its
+      // rollout exists under $CODEX_HOME/sessions — so these synthetic sessions get an (empty)
+      // rollout file whose FILENAME carries the id, under the temp HOME's ~/.codex tree.
+      const day = join(home, ".codex", "sessions", "2026", "07", "09");
+      await mkdir(day, { recursive: true });
+      await writeFile(join(day, `rollout-2026-07-09T12-00-00-${String(payload.session_id)}.jsonl`), "");
 
       const proc = Bun.spawn({
         cmd: ["bun", entry],
@@ -1306,6 +1314,11 @@ describe("runHook turn_id sniff (claude entry invoked inside a Codex session)", 
       const sid = "019e1d05-4cf4-7751-8c59-b9573047900e";
       await writeFile(join(codexHome, "session_index.jsonl"),
         JSON.stringify({ id: sid, thread_name: "Stock monitor automation", updated_at: "2026-05-12T16:29:14Z" }));
+      // CODEX_HOME overrides the helper's ~/.codex rollout fixture, so this home needs its own
+      // rollout evidence or the internal-job ghost guard would (correctly) defer the session.
+      const day = join(codexHome, "sessions", "2026", "05", "12");
+      await mkdir(day, { recursive: true });
+      await writeFile(join(day, `rollout-2026-05-12T16-29-14-${sid}.jsonl`), "");
       const { blobAgent, blobTitle } = await runClaudeEntry({
         session_id: sid, hook_event_name: "PreToolUse", tool_name: "apply_patch",
         cwd: "/x/api-status", turn_id: "t1", transcript_path: "",
@@ -1324,8 +1337,11 @@ describe("runHook turn_id sniff (claude entry invoked inside a Codex session)", 
 // as a PROVISIONAL session keyed on the TUI pid. When the REAL codex hook finally fires, runHook must
 // end + delete that provisional (matched by pid — the hook's process.ppid IS the TUI). This spawns the
 // REAL codex entry with a temp HOME: the spawned bun's process.ppid is THIS test runner's pid, so a
-// provisional keyed on `process.pid` is the reconcile's equality match. The op:end POST goes to the
-// discard port (fails fast), but the provisional file is deleted regardless — that's what we assert.
+// provisional keyed on `process.pid` is the reconcile's equality match. Deletion is GATED on a
+// delivered (2xx) op:end POST: a scripted local server exercises the success path, and the discard
+// port exercises the failure path — the file must SURVIVE a failed POST (it's the only retry handle;
+// unconditional deletion orphaned a worker ghost row for hours, the codex-pid-40738 incident) while
+// the real record, written BEFORE the reconcile, marks the survivor for the sweep backstop.
 describe("runHook provisional reconcile (codex entry retires a matching provisional)", () => {
   const rawKey = new Uint8Array(32).fill(9);
   const entry = join(import.meta.dir, "codex-status.ts");
@@ -1334,13 +1350,19 @@ describe("runHook provisional reconcile (codex entry retires a matching provisio
     return readFile(p, "utf8").then(() => true, () => false);
   }
 
-  async function runReconcile(provPid: number): Promise<{ provGone: boolean; realAgent?: string; home: string; sessionsDir: string }> {
+  /** A local server that 200s every POST, so the reconcile's op:end counts as delivered. */
+  function startOkServer(): { url: string; close: () => void } {
+    const server = Bun.serve({ port: 0, fetch: () => new Response("{}", { status: 200 }) });
+    return { url: `http://127.0.0.1:${server.port}`, close: () => server.stop(true) };
+  }
+
+  async function runReconcile(provPid: number, url: string): Promise<{ provGone: boolean; realAgent?: string; home: string; ccDir: string; sessionsDir: string }> {
     const home = await mkdtemp(join(tmpdir(), "cc-reconcile-"));
     const ccDir = join(home, ".config", "cc-status");
     const sessionsDir = join(ccDir, "sessions");
     await mkdir(sessionsDir, { recursive: true });
     await writeFile(join(ccDir, "config.json"), JSON.stringify({
-      url: "http://127.0.0.1:9", pairingId: "p", pcSecret: "s", e2eKeyB64: b64url(rawKey),
+      url, pairingId: "p", pcSecret: "s", e2eKeyB64: b64url(rawKey),
     }));
     await writeFile(join(ccDir, "watchdog.pid"), String(process.pid)); // no detached poller
     const provFile = join(sessionsDir, `codex-pid-${provPid}.json`);
@@ -1348,6 +1370,11 @@ describe("runHook provisional reconcile (codex entry retires a matching provisio
       pid: provPid, machine: "mac", label: "proj", ts: Date.now(),
       lastEvent: "sessionStart", op: "start", prio: 0, blob: "X", provisional: true, agent: "codex",
     }));
+    // Rollout evidence for the real session (see the sniff helper's note): without it the internal-
+    // job ghost guard would defer the never-tracked id before the provisional reconcile runs.
+    const day = join(home, ".codex", "sessions", "2026", "07", "09");
+    await mkdir(day, { recursive: true });
+    await writeFile(join(day, "rollout-2026-07-09T12-00-00-real-codex-sess.jsonl"), "");
     const proc = Bun.spawn({
       cmd: ["bun", entry],
       env: { ...process.env, HOME: home },
@@ -1363,15 +1390,47 @@ describe("runHook provisional reconcile (codex entry retires a matching provisio
     try {
       realAgent = (JSON.parse(await readFile(join(sessionsDir, "real-codex-sess.json"), "utf8")) as { agent?: string }).agent;
     } catch { /* no real record */ }
-    return { provGone, realAgent, home, sessionsDir };
+    return { provGone, realAgent, home, ccDir, sessionsDir };
   }
 
-  test("a matching provisional (pid == process.ppid) is ended + deleted; the real session is tracked", async () => {
+  test("a matching provisional is ended + deleted on a DELIVERED (2xx) op:end; the real session is tracked", async () => {
     // The spawned entry's process.ppid is this runner's pid, so a provisional keyed on it matches.
-    const { provGone, realAgent, home } = await runReconcile(process.pid);
+    const srv = startOkServer();
+    const { provGone, realAgent, home } = await runReconcile(process.pid, srv.url);
     try {
       expect(provGone).toBe(true);
       expect(realAgent).toBe("codex");
+    } finally {
+      srv.close();
+      await rm(home, { recursive: true, force: true });
+    }
+  }, 20000);
+
+  test("a FAILED op:end POST leaves the provisional file (the retry handle) and the sweep backstop can retire it", async () => {
+    // The discard port fails every POST fast. The provisional must SURVIVE — deleting it would strand
+    // the worker's ghost row with nothing left to retry from (the codex-pid-40738 incident) — and the
+    // real record (written BEFORE the reconcile runs) must already exist, so the surviving provisional
+    // is exactly what reconcileProvisionalsSweep's covered-by-real matcher retries within a sweep.
+    const { provGone, realAgent, home, ccDir, sessionsDir } = await runReconcile(process.pid, "http://127.0.0.1:9");
+    try {
+      expect(provGone).toBe(false); // the retry handle survives the failed POST
+      expect(realAgent).toBe("codex"); // reordering kept the normal path: the real session is tracked
+      // The survivor is "covered by real" → the watchdog sweep matches it…
+      const entries: { sessionId: string; rec: SessionRecord }[] = [];
+      for (const f of await readdir(sessionsDir)) {
+        if (f.endsWith(".json")) entries.push({ sessionId: basename(f, ".json"), rec: JSON.parse(await readFile(join(sessionsDir, f), "utf8")) as SessionRecord });
+      }
+      expect(provisionalsCoveredByReal(entries)).toEqual([`codex-pid-${process.pid}`]);
+      // …and a delivered retry retires it: end POSTed, file deleted.
+      const config = parseConfig(await readFile(join(ccDir, "config.json"), "utf8"))!;
+      const posted: string[] = [];
+      await reconcileProvisionalsSweep(config, {
+        post: async (body: object) => { posted.push((body as { sessionId: string }).sessionId); return "delivered"; },
+        readEntries: async () => entries,
+        deleteRecord: (sessionId: string) => unlink(join(sessionsDir, `${sessionId}.json`)),
+      });
+      expect(posted).toEqual([`codex-pid-${process.pid}`]);
+      expect(await fileExists(join(sessionsDir, `codex-pid-${process.pid}.json`))).toBe(false);
     } finally {
       await rm(home, { recursive: true, force: true });
     }
@@ -1379,11 +1438,13 @@ describe("runHook provisional reconcile (codex entry retires a matching provisio
 
   test("a NON-matching provisional (unrelated pid) is left untouched", async () => {
     // 999_999 is neither the child's ppid nor any of its ancestors → no reconcile.
+    const srv = startOkServer();
     const provFileName = `codex-pid-999999.json`;
-    const { home, sessionsDir } = await runReconcile(999_999);
+    const { home, sessionsDir } = await runReconcile(999_999, srv.url);
     try {
       expect(await fileExists(join(sessionsDir, provFileName))).toBe(true);
     } finally {
+      srv.close();
       await rm(home, { recursive: true, force: true });
     }
   }, 20000);
@@ -1745,5 +1806,94 @@ describe("runHook turnStartedAt (UserPromptSubmit stamps + caches; later hooks r
       session_id: "turn-restamp", hook_event_name: "UserPromptSubmit", cwd: "/x/api-status", transcript_path: "",
     }, { cachedTurn: 1_000_000 }); // an hour-old anchor from the previous turn
     expect(recordTurn!).toBeGreaterThanOrEqual(before); // fresh, not the stale 1_000_000
+  }, 20000);
+});
+
+// --- runHook title resolution (tail ai-title reaches the blob; found titles never regress) -------
+//
+// The long-transcript title fix, end to end: on a 3.7 MB transcript the freshest ai-title lives near
+// EOF — outside the 128 KB head window — so the claude adapter now also scans a bounded transcript
+// TAIL (hook.ts threads transcriptPath into adapter.title). And `title` resolves as
+// `readTitle() ?? existingRecord.title`, so a hook whose bounded reads find nothing must not regress
+// an already-found title to "" in the LIVE blob (previously only the record cache was protected).
+// Spawning the REAL claude entry and reading back the record + decrypted blob is the faithful way to
+// exercise the whole chain (same harness as the turnStartedAt suite above).
+describe("runHook title (tail ai-title reaches the blob; a found title never regresses to empty)", () => {
+  const rawKey = new Uint8Array(32).fill(9);
+  const entry = join(import.meta.dir, "cc-status.ts");
+
+  async function runTitleHook(
+    opts: { transcript?: string; cachedTitle?: string },
+  ): Promise<{ recordTitle?: string; blobTitle?: string }> {
+    const home = await mkdtemp(join(tmpdir(), "cc-hook-title-"));
+    try {
+      const ccDir = join(home, ".config", "cc-status");
+      await mkdir(join(ccDir, "sessions"), { recursive: true });
+      // A live v2 config so the hook runs; the POST fails fast against the discard port (127.0.0.1:9),
+      // but the record — carrying the resolved title + blob — is written BEFORE the fetch.
+      await writeFile(join(ccDir, "config.json"), JSON.stringify({
+        url: "http://127.0.0.1:9", pairingId: "p", pcSecret: "s", e2eKeyB64: b64url(rawKey),
+      }));
+      await writeFile(join(ccDir, "watchdog.pid"), String(process.pid)); // pre-seeded live → no detached spawn
+      const sid = "title-resolution";
+      let transcriptPath = "";
+      if (opts.transcript !== undefined) {
+        transcriptPath = join(home, "transcript.jsonl");
+        await writeFile(transcriptPath, opts.transcript);
+      }
+      // Optionally pre-seed a record carrying a cached title, as an earlier hook that found one would.
+      if (opts.cachedTitle !== undefined) {
+        await writeFile(join(ccDir, "sessions", `${sid}.json`), JSON.stringify({
+          pid: process.ppid, machine: "m", label: "l", ts: Date.now(), title: opts.cachedTitle,
+        }));
+      }
+      const proc = Bun.spawn({
+        cmd: ["bun", entry],
+        env: { ...process.env, HOME: home },
+        stdin: Buffer.from(JSON.stringify({
+          session_id: sid, hook_event_name: "PreToolUse", tool_name: "Edit",
+          cwd: "/x/api-status", transcript_path: transcriptPath,
+        })),
+        stdout: "ignore",
+        stderr: "ignore",
+      });
+      await proc.exited;
+      const rec = JSON.parse(await readFile(join(ccDir, "sessions", `${sid}.json`), "utf8")) as { title?: string; blob?: string };
+      const blob = rec.blob ? ((await decryptBlob(rawKey, rec.blob)) as { title?: string }) : undefined;
+      return { recordTitle: rec.title, blobTitle: blob?.title };
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  }
+
+  test("an ai-title BEYOND the 128 KB head window still reaches the record and the live blob (the 3.7 MB repro)", async () => {
+    // The real-world shape, shrunk: the first user line alone overflows the head window (readPrefix
+    // slices it mid-JSON → unparseable → the head yields NOTHING), and the only ai-title sits after
+    // it — head-only resolution stayed empty forever; the tail read must find it.
+    const giantFirstLine = JSON.stringify({ type: "user", message: { content: "z".repeat(140 * 1024) } });
+    const transcript = [giantFirstLine, `{"type":"ai-title","aiTitle":"Ship the tail scan"}`].join("\n");
+    const { recordTitle, blobTitle } = await runTitleHook({ transcript });
+    expect(recordTitle).toBe("Ship the tail scan");
+    expect(blobTitle).toBe("Ship the tail scan");
+  }, 20000);
+
+  test("a hook that resolves NO title keeps the record's cached title in the live blob (no regress to empty)", async () => {
+    const { recordTitle, blobTitle } = await runTitleHook({ cachedTitle: "Cached title" }); // no transcript at all
+    expect(recordTitle).toBe("Cached title");
+    expect(blobTitle).toBe("Cached title"); // previously the live blob regressed to title:""
+  }, 20000);
+
+  test("a freshly resolved title still UPGRADES a stale cached one (the backstop is a fallback, not a pin)", async () => {
+    const { recordTitle, blobTitle } = await runTitleHook({
+      transcript: `{"type":"ai-title","aiTitle":"Fresh topic"}`, cachedTitle: "Old topic",
+    });
+    expect(recordTitle).toBe("Fresh topic");
+    expect(blobTitle).toBe("Fresh topic");
+  }, 20000);
+
+  test("no transcript and no cache → title stays empty in the blob (unchanged no-title behavior)", async () => {
+    const { recordTitle, blobTitle } = await runTitleHook({});
+    expect(recordTitle).toBeUndefined(); // trackSession omits an empty title
+    expect(blobTitle).toBe(""); // buildBlob's `title ?? ""` — the phone falls back to the label
   }, 20000);
 });
