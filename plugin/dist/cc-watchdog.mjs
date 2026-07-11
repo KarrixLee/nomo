@@ -818,6 +818,7 @@ function codexLastTurnEvent(text) {
   return null;
 }
 var CODEX_APPROVAL_REQUEST_EVENTS = new Set(["exec_approval_request", "apply_patch_approval_request"]);
+var CODEX_USER_INPUT_TOOL = "request_user_input";
 var CODEX_APPROVAL_RESOLUTION_EVENTS = new Set(["exec_command_end", "patch_apply_end", "task_complete", "turn_aborted", "task_started", "user_message"]);
 var CODEX_APPROVAL_RESOLUTION_ITEMS = new Set(["function_call_output", "custom_tool_call_output"]);
 function codexTailPendingApproval(tail) {
@@ -847,8 +848,13 @@ function codexTailPendingApproval(tail) {
         return true;
       if (CODEX_APPROVAL_RESOLUTION_EVENTS.has(ptype))
         return false;
-    } else if (r.type === "response_item" && CODEX_APPROVAL_RESOLUTION_ITEMS.has(ptype)) {
-      return false;
+    } else if (r.type === "response_item") {
+      if (ptype === "function_call" && payload?.name === CODEX_USER_INPUT_TOOL) {
+        return true;
+      }
+      if (CODEX_APPROVAL_RESOLUTION_ITEMS.has(ptype)) {
+        return false;
+      }
     }
   }
   return false;

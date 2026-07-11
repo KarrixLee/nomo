@@ -63,15 +63,15 @@ export function isPermissionNotification(i: Record<string, unknown>): boolean {
 }
 
 /// Tools that block on the USER (not on the machine): Claude presents them and then WAITS for a human
-/// answer/approval before it can continue — AskUserQuestion parks on a multiple-choice question,
-/// ExitPlanMode parks on plan approval. A PreToolUse for either is the EARLIEST signal the session is
+/// answer/approval before it can continue — AskUserQuestion/request_user_input park on a
+/// multiple-choice question, while ExitPlanMode parks on plan approval. A PreToolUse for any of them
+/// is the EARLIEST signal the session is
 /// blocked on the user, so planOp maps it to the SAME op/prio/status a PermissionRequest sends
 /// (update / prio 1 / needsAttention) instead of a generic working update — the phone alerts the instant
-/// Claude parks, not ~5 min later when Claude Code's own idle Notification finally fires. The matching
-/// PostToolUse (user answered) falls through to the normal working path. Codex has no such tool names,
-/// so a codex PreToolUse never hits this branch. Mirrored by the watchdog backstop
-/// (claudeAdapter.tailShowsPendingApproval) for the case where this very PreToolUse hook is dropped.
-const USER_BLOCKING_TOOLS = new Set(["AskUserQuestion", "ExitPlanMode"]);
+/// agent parks, not ~5 min later when an idle notification or stale timeout fires. The matching
+/// PostToolUse (user answered) falls through to the normal working path. Mirrored by each adapter's
+/// watchdog backstop for the case where this very PreToolUse hook is dropped.
+const USER_BLOCKING_TOOLS = new Set(["AskUserQuestion", "ExitPlanMode", "request_user_input"]);
 
 /// The LOCAL op planner (the worker is now blind — lifecycle semantics live here). Maps a hook to a
 /// v2 op, its delivery prio, and the semantic status carried in the blob:

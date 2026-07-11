@@ -53,6 +53,14 @@ describe("planOp (op mapping table)", () => {
     // the same after a done still maps to the blocking needsAttention (re-arm doesn't downgrade it)
     expect(planOp("PreToolUse", i({ tool_name: "AskUserQuestion" }), true)).toEqual({ op: "update", prio: 1, status: "needsAttention" });
   });
+  test("Codex request_user_input → instant needsAttention; its PostToolUse answer resumes working", () => {
+    expect(planOp("PreToolUse", i({ tool_name: "request_user_input" }), false))
+      .toEqual({ op: "update", prio: 1, status: "needsAttention" });
+    expect(planOp("PreToolUse", i({ tool_name: "request_user_input" }), true))
+      .toEqual({ op: "update", prio: 1, status: "needsAttention" });
+    expect(planOp("PostToolUse", i({ tool_name: "request_user_input" }), false))
+      .toEqual({ op: "update", prio: 0, status: "working" });
+  });
   test("PreToolUse for an ordinary tool (or no tool_name) stays a working update (prio 0)", () => {
     expect(planOp("PreToolUse", i({ tool_name: "Bash" }), false)).toEqual({ op: "update", prio: 0, status: "working" });
     expect(planOp("PreToolUse", i({ tool_name: "Edit" }), false)).toEqual({ op: "update", prio: 0, status: "working" });
@@ -68,6 +76,12 @@ describe("planOp (op mapping table)", () => {
     // AskUserQuestion has no tool→detail mapping, so the blob carries needsAttention with no `detail`.
     expect(buildBlob({ session_id: "s", cwd: "/Users/x/api-status", hook_event_name: "PreToolUse", tool_name: "AskUserQuestion" }, "Mac", "t", plan))
       .toEqual({ status: "needsAttention", title: "t", machine: "Mac", label: "api-status" });
+  });
+  test("Codex request_user_input carries needsAttention through blob construction", () => {
+    const input = { session_id: "s", cwd: "/Users/x/api-status", hook_event_name: "PreToolUse", tool_name: "request_user_input" };
+    const plan = planOp("PreToolUse", input, false)!;
+    expect(buildBlob(input, "Mac", "t", plan, "codex"))
+      .toEqual({ status: "needsAttention", title: "t", machine: "Mac", label: "api-status", agent: "codex" });
   });
 
   // --- re-arm-after-done ---------------------------------------------------------------------

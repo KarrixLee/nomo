@@ -671,6 +671,21 @@ describe("codexTailPendingApproval (backstop classifier) + adapter capability", 
     ].join("\n"))).toBe(true);
   });
 
+  test("a persisted request_user_input call is pending until its function_call_output arrives", () => {
+    const request = item("function_call", { name: "request_user_input", call_id: "q1" });
+    expect(codexTailPendingApproval([ev("task_started"), request].join("\n"))).toBe(true);
+    expect(codexTailPendingApproval([
+      ev("task_started"),
+      request,
+      item("function_call_output", { call_id: "q1", output: '{"answers":{}}' }),
+    ].join("\n"))).toBe(false);
+  });
+
+  test("ordinary pending function calls are not mistaken for user input", () => {
+    expect(codexTailPendingApproval(item("function_call", { name: "shell", call_id: "c1" }))).toBe(false);
+    expect(codexTailPendingApproval(item("function_call", { name: "apply_patch", call_id: "c2" }))).toBe(false);
+  });
+
   test("a request FOLLOWED by a resolution → not pending (false)", () => {
     // tool result landed (approved & ran, or denied)
     expect(codexTailPendingApproval([ev("exec_approval_request", { call_id: "c1" }), item("function_call_output", { call_id: "c1" })].join("\n"))).toBe(false);
