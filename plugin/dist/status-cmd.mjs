@@ -84,6 +84,7 @@ async function sha256Hex(s) {
 }
 
 // src/core/shared.ts
+var PLUGIN_VERSION = "0.8.11";
 var CC_DIR = `${process.env.HOME}/.config/cc-status`;
 var SESSIONS_DIR = `${CC_DIR}/sessions`;
 var WATCHDOG_PID_PATH = `${CC_DIR}/watchdog.pid`;
@@ -235,7 +236,7 @@ async function flushPendingStash(stashPath, url, pairingId, pcSecret, e2eKey, no
       try {
         const res = await fetchFn(`${url}/v1/cc/event`, {
           method: "POST",
-          headers: { "content-type": "application/json", "x-cc-pairing": pairingId, "x-cc-auth": pcSecret },
+          headers: { "content-type": "application/json", "x-cc-pairing": pairingId, "x-cc-auth": pcSecret, "x-cc-version": PLUGIN_VERSION },
           body: JSON.stringify(envelope),
           signal: AbortSignal.timeout(fetchTimeoutMs)
         });
@@ -324,7 +325,7 @@ async function completePendingPairing(pending, configPath, opts = {}) {
     try {
       await fetchFn(`${pending.url}/v1/cc/pair/ack`, {
         method: "POST",
-        headers: { "x-cc-pairing": pending.pairingId, "x-cc-auth": pending.pcSecret },
+        headers: { "x-cc-pairing": pending.pairingId, "x-cc-auth": pending.pcSecret, "x-cc-version": PLUGIN_VERSION },
         signal: AbortSignal.timeout(fetchTimeoutMs)
       });
       break;

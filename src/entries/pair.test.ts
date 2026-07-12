@@ -8,7 +8,7 @@ import {
 import {
   buildPairURL, bytesToHex, decryptDeviceName, DEFAULT_WORKER_URL, pairStart, pairWait,
 } from "./pair";
-import { completePendingPairing, PAIR_HTML_FILE, parsePendingConfig, PENDING_STASH_FILE } from "../core/shared";
+import { completePendingPairing, PAIR_HTML_FILE, parsePendingConfig, PENDING_STASH_FILE, PLUGIN_VERSION } from "../core/shared";
 import { deriveCodeIkm } from "../core/pair-code";
 import { unpair } from "./unpair";
 import { humanAge, statusCmd } from "./status-cmd";
@@ -318,6 +318,9 @@ describe("pairWait (happy path)", () => {
         const h = init?.headers as Record<string, string>;
         expect(h["x-cc-pairing"]).toBe(EXPECTED_PAIRING_ID);
         expect(h["x-cc-auth"]).toBe(EXPECTED_PC_SECRET);
+        // The ack carries the plugin build version so the worker knows a freshly paired computer's
+        // version immediately (not only after its first /cc/event). From source it's the dev fallback.
+        expect(h["x-cc-version"]).toBe(PLUGIN_VERSION);
         return json({ ok: true });
       },
     ]);

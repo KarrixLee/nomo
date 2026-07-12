@@ -17,7 +17,7 @@
 import { execFileSync } from "node:child_process";
 import { readdir, readFile, unlink } from "node:fs/promises";
 import { basename } from "node:path";
-import { Config, loadConfig, pidAlive, SessionRecord, SESSIONS_DIR, WATCHDOG_PID_PATH } from "../core/shared";
+import { Config, loadConfig, pidAlive, PLUGIN_VERSION, SessionRecord, SESSIONS_DIR, WATCHDOG_PID_PATH } from "../core/shared";
 
 export type ResetVerdict = "clear" | "keep";
 
@@ -92,7 +92,7 @@ async function postEnd(config: Config, sessionId: string, fetchFn: typeof fetch)
   try {
     const res = await fetchFn(`${config.url}/v1/cc/event`, {
       method: "POST",
-      headers: { "content-type": "application/json", "x-cc-pairing": config.pairingId, "x-cc-auth": config.pcSecret },
+      headers: { "content-type": "application/json", "x-cc-pairing": config.pairingId, "x-cc-auth": config.pcSecret, "x-cc-version": PLUGIN_VERSION },
       body: JSON.stringify({ v: 2, sessionId, op: "end", prio: 0, ts: Date.now() }),
       signal: AbortSignal.timeout(2000),
     });

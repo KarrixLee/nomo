@@ -11,6 +11,7 @@
 // source change so dist/ stays reproducible from source.
 
 import { rm } from "node:fs/promises";
+import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -38,6 +39,11 @@ async function main(): Promise<void> {
   // Clean so a removed/renamed entrypoint can never leave a stale .mjs behind.
   await rm(OUTDIR, { recursive: true, force: true });
 
+  // The plugin's version is single-sourced from the Claude plugin manifest; inject it as a build-time
+  // define so PLUGIN_VERSION (src/core/shared.ts) resolves to it in the committed dist/*.mjs bundles.
+  const manifestPath = join(HERE, "plugin", ".claude-plugin", "plugin.json");
+  const version = (JSON.parse(readFileSync(manifestPath, "utf8")) as { version?: string }).version ?? "0.0.0-dev";
+
   const result = await Bun.build({
     entrypoints: ENTRYPOINTS,
     outdir: OUTDIR,
@@ -49,6 +55,10 @@ async function main(): Promise<void> {
     naming: "[name].mjs",
     sourcemap: "none",
     minify: false,
+    // Replaces the `__NOMO_VERSION__` textual reference in shared.ts with the manifest version string,
+    // so the bundled hook reports its real build in the x-cc-version header. Unbundled runs (tests) keep
+    // the typeof-guarded fallback.
+    define: { __NOMO_VERSION__: JSON.stringify(version) },
   });
 
   if (!result.success) {

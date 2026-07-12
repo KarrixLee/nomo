@@ -17,6 +17,15 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { b64url, deriveE2EKey, deriveRatchetKey, encryptBlob, fromB64url } from "./crypto";
 
+// The plugin's own build version, injected by build.ts as a compile-time define (`__NOMO_VERSION__`,
+// read from plugin/.claude-plugin/plugin.json). Sent as the plaintext `x-cc-version` request header on
+// every /cc/event POST so the app can flag "update available" per computer — it NEVER rides inside the
+// E2E blob or the envelope JSON. The `typeof` guard keeps the UNBUNDLED path alive: tests (and any
+// `bun src/...` run) import the raw .ts with no define, and `typeof <undeclared>` is safe in JS (it
+// yields "undefined", never a ReferenceError), so this degrades to the dev sentinel instead of throwing.
+declare const __NOMO_VERSION__: string | undefined;
+export const PLUGIN_VERSION: string = typeof __NOMO_VERSION__ === "string" ? __NOMO_VERSION__ : "0.0.0-dev";
+
 /** Root of the on-disk state: config.json, the per-session pid files, the watchdog pidfile. */
 export const CC_DIR = `${process.env.HOME}/.config/cc-status`;
 /** One `<session_id>.json` per live session — written by the hook, reaped by the watchdog. */
@@ -459,7 +468,7 @@ async function flushPendingStash(
       try {
         const res = await fetchFn(`${url}/v1/cc/event`, {
           method: "POST",
-          headers: { "content-type": "application/json", "x-cc-pairing": pairingId, "x-cc-auth": pcSecret },
+          headers: { "content-type": "application/json", "x-cc-pairing": pairingId, "x-cc-auth": pcSecret, "x-cc-version": PLUGIN_VERSION },
           body: JSON.stringify(envelope),
           signal: AbortSignal.timeout(fetchTimeoutMs),
         });
@@ -599,7 +608,7 @@ export async function completePendingPairing(
     try {
       await fetchFn(`${pending.url}/v1/cc/pair/ack`, {
         method: "POST",
-        headers: { "x-cc-pairing": pending.pairingId, "x-cc-auth": pending.pcSecret },
+        headers: { "x-cc-pairing": pending.pairingId, "x-cc-auth": pending.pcSecret, "x-cc-version": PLUGIN_VERSION },
         signal: AbortSignal.timeout(fetchTimeoutMs),
       });
       break;
