@@ -688,6 +688,42 @@ export function claudeTailPendingApproval(tail: string): boolean {
   return false; // no assistant turn in the tail
 }
 
+// --- Claude headless/daemon-invocation detection (phantom-row guard) --------------------------
+//
+// A `claude` that loads plugins but is NOT a human's interactive session — e.g. claude-mem's
+// `claude --output-format stream-json …` observation runs, or any tool that shells out to headless
+// Claude — fires SessionStart (and usually UserPromptSubmit) under a brand-new session id that NEVER
+// gets a Stop. Left unguarded that mints a phantom "working" phone row which only the 30-min idle reap
+// (the watchdog's correctIdleClaude) or the worker's own eviction ever clears. The interactive TUI runs
+// with none of these flags, so keying on the INVOKING process's argv (or a known daemon ancestor) is a
+// safe DEFER: skip mirroring a never-tracked session whose invoker looks headless. Mirrors the codex
+// app-server ghost guards' verdict-vs-defer discipline (see codexInternalSessionGhost) — the seam is
+// consulted ONLY for a never-tracked id, so a live interactive session can never be silenced by it.
+
+/** Headless `claude` argv markers matched as WHOLE tokens on the invoking process's own command line:
+ *  programmatic output (`--output-format`, e.g. the stream-json runs claude-mem spawns) and
+ *  non-interactive print mode (`-p` / `--print`). An interactive human session carries none of these. */
+const CLAUDE_HEADLESS_ARG_TOKENS = new Set(["-p", "--print", "--output-format"]);
+
+/** Command-line shapes of known daemons/harnesses that spawn headless Claude (claude-mem's
+ *  worker-service). Matched as SUBSTRINGS against the invoking process AND its ancestor chain, since a
+ *  bundled worker shows up as an absolute script path rather than a bare token. */
+const CLAUDE_DAEMON_MARKERS = ["claude-mem", "worker-service"];
+
+/** Pure: does the invoking `claude`'s own argv, or any ANCESTOR's argv, look like a non-interactive /
+ *  daemon-spawned run whose session must NOT become a phone row? `selfArgs` is process.ppid's command
+ *  line (the `claude` that ran this hook); `ancestorArgs` are its ancestors' command lines (undefined
+ *  entries — a `ps` that failed for that pid — are ignored). True iff a known daemon marker appears
+ *  anywhere in the chain, OR the self argv carries a headless flag as a whole token (`--output-format`
+ *  is followed by its value as a separate arg, so an exact-token match catches it; tokenizing means a
+ *  path that merely contains "-p" can't false-trigger). */
+export function claudeHeadlessInvocation(selfArgs: string | undefined, ancestorArgs: (string | undefined)[]): boolean {
+  const chain = [selfArgs, ...ancestorArgs].filter((s): s is string => typeof s === "string" && s.length > 0);
+  if (chain.some((args) => CLAUDE_DAEMON_MARKERS.some((m) => args.includes(m)))) return true;
+  if (typeof selfArgs !== "string" || selfArgs.length === 0) return false;
+  return selfArgs.trim().split(/\s+/).some((tok) => CLAUDE_HEADLESS_ARG_TOKENS.has(tok));
+}
+
 // --- Codex idle-vs-in-flight turn classification (for discovery/provisional rows) -------------
 //
 // The watchdog's discovery step used to advertise EVERY live Codex TUI as status "working" — but an
@@ -1184,6 +1220,15 @@ export interface AgentAdapter {
    *  OMITS it (every Claude session id is real). Async because it probes the sessions tree. Called by
    *  runHook only when NO session record exists yet, so a live session can never be silenced by it. */
   isInternalSessionGhost?(ctx: { sessionId: string; prefix: string; transcriptPath: string }): Promise<boolean>;
+  /** OPTIONAL: whether the INVOKING agent process (and its ancestor chain) is a non-interactive /
+   *  daemon-spawned "headless" run whose events must be skipped (deferred) — no phone row. Claude
+   *  implements it (headless `claude --output-format stream-json …` observation runs — e.g. claude-mem —
+   *  fire hooks under a session id that never gets a Stop, minting a phantom "working" row); Codex OMITS
+   *  it (its `codex exec` automation is already excluded from discovery by argv). The seam is handed the
+   *  invoking pid (process.ppid), the ancestor-chain walker (pidAncestors), and a per-pid command-line
+   *  reader (pidCommand) so the pure classifier stays testable. Called by runHook only when NO session
+   *  record exists yet, so an already-live interactive session can never be silenced. */
+  isHeadlessInvocation?(ctx: { pid: number; ancestorsOf: (pid: number) => number[]; commandOf: (pid: number) => string | undefined }): boolean;
   /** Where this agent's session transcripts live (recursively scanned for liveness). */
   sessionsDir(): string;
   /** Whether a filename under sessionsDir() is one of this agent's session transcripts. */
@@ -1251,6 +1296,13 @@ export const claudeAdapter: AgentAdapter = {
   // claudeTailPendingApproval. Converts a missed hook into ≤~5-10 s of delay instead of ~5 min.
   tailShowsPendingApproval(tail: string): boolean {
     return claudeTailPendingApproval(tail);
+  },
+  // Phantom-row guard: a headless `claude` (claude-mem's stream-json observation runs, or any tool
+  // shelling out to non-interactive Claude) fires hooks under a session id that never gets a Stop.
+  // Fingerprint it from the invoking process's argv + ancestor chain and DEFER (skip mirroring) so it
+  // never becomes a stuck "working" phone row. See claudeHeadlessInvocation.
+  isHeadlessInvocation({ pid, ancestorsOf, commandOf }): boolean {
+    return claudeHeadlessInvocation(commandOf(pid), ancestorsOf(pid).map((p) => commandOf(p)));
   },
   sessionsDir: () => `${process.env.HOME}/.claude/projects`,
   sessionMatch: (name: string) => name.endsWith(".jsonl"),

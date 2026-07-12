@@ -437,6 +437,15 @@ function pidAncestors(pid, maxDepth = 12) {
   }
   return chain;
 }
+function pidCommand(pid) {
+  try {
+    const out = execFileSync("ps", ["-o", "args=", "-p", String(pid)], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+    const trimmed = out.trim();
+    return trimmed.length > 0 ? trimmed : undefined;
+  } catch {
+    return;
+  }
+}
 
 // src/core/adapter.ts
 var execFileP = promisify(execFile);
@@ -922,6 +931,16 @@ function claudeTailPendingApproval(tail) {
   }
   return false;
 }
+var CLAUDE_HEADLESS_ARG_TOKENS = new Set(["-p", "--print", "--output-format"]);
+var CLAUDE_DAEMON_MARKERS = ["claude-mem", "worker-service"];
+function claudeHeadlessInvocation(selfArgs, ancestorArgs) {
+  const chain = [selfArgs, ...ancestorArgs].filter((s) => typeof s === "string" && s.length > 0);
+  if (chain.some((args) => CLAUDE_DAEMON_MARKERS.some((m) => args.includes(m))))
+    return true;
+  if (typeof selfArgs !== "string" || selfArgs.length === 0)
+    return false;
+  return selfArgs.trim().split(/\s+/).some((tok) => CLAUDE_HEADLESS_ARG_TOKENS.has(tok));
+}
 var CODEX_ROLLOUT_IDLE_SILENCE_MS = 30000;
 var CODEX_TURN_OPEN_EVENT = "task_started";
 function codexTurnActiveFromTail(tail, silentForMs) {
@@ -1198,6 +1217,9 @@ var claudeAdapter = {
   tailShowsPendingApproval(tail) {
     return claudeTailPendingApproval(tail);
   },
+  isHeadlessInvocation({ pid, ancestorsOf, commandOf }) {
+    return claudeHeadlessInvocation(commandOf(pid), ancestorsOf(pid).map((p) => commandOf(p)));
+  },
   sessionsDir: () => `${process.env.HOME}/.claude/projects`,
   sessionMatch: (name) => name.endsWith(".jsonl"),
   hookStampPath: () => lastHookPath("claude"),
@@ -1259,8 +1281,10 @@ var heartbeatAt = new Map;
 function classifySession(record, now, isAlive) {
   if (!record || typeof record.pid !== "number" || !Number.isFinite(record.pid))
     return "delete";
-  if (typeof record.ts !== "number" || now - record.ts > SESSION_STALE_MS)
+  if (typeof record.ts !== "number")
     return "delete";
+  if (now - record.ts > SESSION_STALE_MS)
+    return "stale";
   return isAlive(record.pid) ? "keep" : "end";
 }
 function startedAtField(record) {
@@ -1534,8 +1558,98 @@ async function correctIdleProvisional(config, path, sessionId, record) {
     return "uncorrected";
   }
 }
+var CLAUDE_IDLE_REAP_MS = 1800000;
+function isClaudeIdleReapEligible(record, now) {
+  if (record.agent === "codex")
+    return false;
+  if (record.provisional === true)
+    return false;
+  if (record.lastEvent !== "working" && record.lastEvent !== "sessionStart")
+    return false;
+  if (typeof record.ts !== "number")
+    return false;
+  return now - record.ts >= CLAUDE_IDLE_REAP_MS;
+}
+async function correctIdleClaude(config, path, sessionId, record, now) {
+  try {
+    if (!isClaudeIdleReapEligible(record, now))
+      return "uncorrected";
+    const outcome = await postEvent(config, await buildDoneEnvelope(sessionId, record, Date.now(), config.e2eKey, "claude"));
+    if (outcome === "revoked")
+      return "revoked";
+    if (outcome !== "delivered")
+      return "uncorrected";
+    try {
+      const next = { ...record, lastEvent: "done", sentDone: true, op: "done" };
+      await atomicWrite(path, JSON.stringify(next), 384);
+    } catch {}
+    return "corrected";
+  } catch {
+    return "uncorrected";
+  }
+}
+var TITLE_REPAIR_HEAD_BYTES = 128 * 1024;
+function statusFromRecord(record) {
+  if (record.lastEvent === "needsAttention")
+    return "needsAttention";
+  if (record.lastEvent === "done")
+    return "done";
+  return "working";
+}
+async function buildTitleRepairEnvelope(sessionId, record, title, now, e2eKey, agent = "codex") {
+  const blob = await encryptBlob(e2eKey, {
+    status: statusFromRecord(record),
+    title,
+    machine: typeof record.machine === "string" ? record.machine : "",
+    label: typeof record.label === "string" ? record.label : "",
+    ...adapterFor(agent).blobAgentFields,
+    ...typeof record.turnStartedAt === "number" && Number.isFinite(record.turnStartedAt) ? { turnStartedAt: record.turnStartedAt } : {},
+    ...typeof record.model === "string" && record.model.length > 0 ? { model: record.model } : {}
+  });
+  return { v: 2, sessionId, op: record.op ?? "update", prio: record.prio ?? 0, ts: now, blob, ...startedAtField(record) };
+}
+function shouldRepairTitle(record) {
+  if (record.agent !== "codex")
+    return false;
+  if (record.provisional === true)
+    return false;
+  return typeof record.title !== "string" || record.title.length === 0;
+}
+function titleRepairedRecord(record, title, blob, pairingId) {
+  return { ...record, title, blob, ...pairingId.length > 0 ? { pairingId } : {} };
+}
+async function repairTitle(config, path, sessionId, record) {
+  try {
+    if (!shouldRepairTitle(record))
+      return "uncorrected";
+    let prefix = "";
+    if (typeof record.transcript === "string" && record.transcript.length > 0) {
+      try {
+        prefix = await readPrefix(record.transcript, TITLE_REPAIR_HEAD_BYTES);
+      } catch {}
+    }
+    const title = await codexAdapter.title({ sessionId, prefix, input: {}, transcriptPath: record.transcript });
+    if (!title)
+      return "uncorrected";
+    const envelope = await buildTitleRepairEnvelope(sessionId, record, title, Date.now(), config.e2eKey, "codex");
+    const outcome = await postEvent(config, envelope);
+    if (outcome === "revoked")
+      return "revoked";
+    if (outcome !== "delivered")
+      return "uncorrected";
+    try {
+      const next = titleRepairedRecord(record, title, envelope.blob, config.pairingId);
+      await atomicWrite(path, JSON.stringify(next), 384);
+    } catch {}
+    return "corrected";
+  } catch {
+    return "uncorrected";
+  }
+}
 function shouldHeartbeat(record, now, lastHeartbeat, correctedThisSweep) {
   if (record.op === "done")
+    return false;
+  if (isClaudeIdleReapEligible(record, now))
     return false;
   if (correctedThisSweep)
     return false;
@@ -1592,7 +1706,27 @@ async function sweep(config) {
             flaggedAttention = true;
           }
         }
-        if (shouldHeartbeat(record, now, heartbeatAt.get(sessionId), idleFix === "corrected" || corrected === "corrected" || flaggedAttention)) {
+        let reapedIdle = false;
+        if (idleFix !== "corrected" && corrected !== "corrected" && !flaggedAttention) {
+          const idleClaude = await correctIdleClaude(config, path, sessionId, record, now);
+          if (idleClaude === "revoked")
+            return { revoked: true };
+          if (idleClaude === "corrected") {
+            delivered = true;
+            reapedIdle = true;
+          }
+        }
+        let repairedTitle = false;
+        if (idleFix !== "corrected" && corrected !== "corrected" && !flaggedAttention && !reapedIdle) {
+          const titleFix = await repairTitle(config, path, sessionId, record);
+          if (titleFix === "revoked")
+            return { revoked: true };
+          if (titleFix === "corrected") {
+            delivered = true;
+            repairedTitle = true;
+          }
+        }
+        if (shouldHeartbeat(record, now, heartbeatAt.get(sessionId), idleFix === "corrected" || corrected === "corrected" || flaggedAttention || reapedIdle || repairedTitle)) {
           const beat = buildHeartbeatEnvelope(sessionId, record, Date.now(), config.pairingId);
           if (beat) {
             const outcome = await postEvent(config, beat);
@@ -1616,6 +1750,13 @@ async function sweep(config) {
         continue;
       }
       delivered = true;
+    }
+    if (verdict === "stale" && config && record) {
+      const outcome = await postEvent(config, buildEndEnvelope(sessionId, now, record));
+      if (outcome === "revoked")
+        return { revoked: true };
+      if (outcome === "delivered")
+        delivered = true;
     }
     heartbeatAt.delete(sessionId);
     try {
@@ -1730,7 +1871,9 @@ if (__require.main == __require.module) {
   process.exit(0);
 }
 export {
+  titleRepairedRecord,
   tailShowsInterrupt,
+  shouldRepairTitle,
   shouldPendingApprovalCheck,
   shouldInterruptCheck,
   shouldIdleProvisionalCheck,
@@ -1740,6 +1883,7 @@ export {
   postOutcomeForStatus,
   pendingPairingExpired,
   lastTurnLine,
+  isClaudeIdleReapEligible,
   hasInterruptMarker,
   goneStrikeShouldTeardown,
   discoverLiveSessions,
@@ -1747,6 +1891,7 @@ export {
   codexLastTurnEvent,
   claudeTailPendingApproval,
   classifySession,
+  buildTitleRepairEnvelope,
   buildStartEnvelope,
   buildProvisionalRecord,
   buildProvisionalEnvelope,

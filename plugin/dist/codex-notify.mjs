@@ -437,6 +437,15 @@ function pidAncestors(pid, maxDepth = 12) {
   }
   return chain;
 }
+function pidCommand(pid) {
+  try {
+    const out = execFileSync("ps", ["-o", "args=", "-p", String(pid)], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+    const trimmed = out.trim();
+    return trimmed.length > 0 ? trimmed : undefined;
+  } catch {
+    return;
+  }
+}
 
 // src/core/adapter.ts
 var execFileP = promisify(execFile);
@@ -922,6 +931,16 @@ function claudeTailPendingApproval(tail) {
   }
   return false;
 }
+var CLAUDE_HEADLESS_ARG_TOKENS = new Set(["-p", "--print", "--output-format"]);
+var CLAUDE_DAEMON_MARKERS = ["claude-mem", "worker-service"];
+function claudeHeadlessInvocation(selfArgs, ancestorArgs) {
+  const chain = [selfArgs, ...ancestorArgs].filter((s) => typeof s === "string" && s.length > 0);
+  if (chain.some((args) => CLAUDE_DAEMON_MARKERS.some((m) => args.includes(m))))
+    return true;
+  if (typeof selfArgs !== "string" || selfArgs.length === 0)
+    return false;
+  return selfArgs.trim().split(/\s+/).some((tok) => CLAUDE_HEADLESS_ARG_TOKENS.has(tok));
+}
 var CODEX_ROLLOUT_IDLE_SILENCE_MS = 30000;
 var CODEX_TURN_OPEN_EVENT = "task_started";
 function codexTurnActiveFromTail(tail, silentForMs) {
@@ -1197,6 +1216,9 @@ var claudeAdapter = {
   },
   tailShowsPendingApproval(tail) {
     return claudeTailPendingApproval(tail);
+  },
+  isHeadlessInvocation({ pid, ancestorsOf, commandOf }) {
+    return claudeHeadlessInvocation(commandOf(pid), ancestorsOf(pid).map((p) => commandOf(p)));
   },
   sessionsDir: () => `${process.env.HOME}/.claude/projects`,
   sessionMatch: (name) => name.endsWith(".jsonl"),
@@ -1500,6 +1522,12 @@ async function runHook(agent) {
       sessionId: input.session_id,
       prefix: await getPrefix(),
       transcriptPath
+    }))
+      return;
+    if (!existingRecord && adapter2.isHeadlessInvocation && adapter2.isHeadlessInvocation({
+      pid: process.ppid,
+      ancestorsOf: pidAncestors,
+      commandOf: pidCommand
     }))
       return;
     const title = await readTitle() ?? existingRecord?.title;

@@ -430,6 +430,15 @@ function pidAncestors(pid, maxDepth = 12) {
   }
   return chain;
 }
+function pidCommand(pid) {
+  try {
+    const out = execFileSync("ps", ["-o", "args=", "-p", String(pid)], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+    const trimmed = out.trim();
+    return trimmed.length > 0 ? trimmed : undefined;
+  } catch {
+    return;
+  }
+}
 
 // src/entries/unpair.ts
 function revokeCreds(raw) {

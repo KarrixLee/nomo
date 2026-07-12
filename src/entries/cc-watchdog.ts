@@ -33,10 +33,10 @@ import { readFileSync, unlinkSync } from "node:fs";
 import { hostname } from "node:os";
 import { basename } from "node:path";
 import { encryptBlob } from "../core/crypto";
-import { adapterFor, AgentAdapter, allAdapters, DiscoveredSession } from "../core/adapter";
+import { adapterFor, AgentAdapter, allAdapters, codexAdapter, DiscoveredSession } from "../core/adapter";
 import {
-  AgentKind, atomicWrite, CC_DIR, Config, completePendingPairing, GONE_STRIKE_LIMIT, loadConfig, loadPendingConfig,
-  PAIR_HTML_FILE, PairPollResult, PendingConfig, pidAlive, readSuffix, recordGoneStrike, removeRevokedConfig,
+  AgentKind, atomicWrite, CC_DIR, CCOp, CCStatus, Config, completePendingPairing, GONE_STRIKE_LIMIT, loadConfig, loadPendingConfig,
+  PAIR_HTML_FILE, PairPollResult, PendingConfig, pidAlive, readPrefix, readSuffix, recordGoneStrike, removeRevokedConfig,
   resetGoneStrikes, SessionRecord, SESSIONS_DIR, WATCHDOG_PID_PATH,
 } from "../core/shared";
 
@@ -84,15 +84,18 @@ const HEARTBEAT_AFTER_MS = 300_000; // 5 min
  *  and the throttle never needs to survive a restart). */
 const heartbeatAt = new Map<string, number>();
 
-export type SessionVerdict = "keep" | "end" | "delete";
+export type SessionVerdict = "keep" | "end" | "stale" | "delete";
 
-/** Pure per-file decision. `end` → the process is gone: POST an op:end, then delete. `delete` →
- *  malformed or stale: just remove it (no POST). `keep` → still alive: leave it for next sweep.
- *  Staleness is checked before liveness so an abandoned file is always cleaned up. Liveness is an
- *  injected predicate, so this stays pure and testable without touching real processes. */
+/** Pure per-file decision. `end` → the process is gone: POST an op:end, then delete. `stale` → a VALID
+ *  record aged past the 24 h cap: POST a best-effort terminal end (so the phone row resolves instead of
+ *  silently vanishing), then delete regardless. `delete` → malformed / un-ageable (no pid, no ts): just
+ *  remove it, nothing to POST. `keep` → still alive: leave it for next sweep. Staleness is checked before
+ *  liveness so an abandoned file is always retired. Liveness is an injected predicate, so this stays pure
+ *  and testable without touching real processes. */
 export function classifySession(record: SessionRecord | null, now: number, isAlive: (pid: number) => boolean): SessionVerdict {
   if (!record || typeof record.pid !== "number" || !Number.isFinite(record.pid)) return "delete";
-  if (typeof record.ts !== "number" || now - record.ts > SESSION_STALE_MS) return "delete";
+  if (typeof record.ts !== "number") return "delete"; // no timestamp → can't age it → nothing to POST
+  if (now - record.ts > SESSION_STALE_MS) return "stale"; // abandoned (24 h): POST a terminal end, then delete
   return isAlive(record.pid) ? "keep" : "end";
 }
 
@@ -602,6 +605,170 @@ async function correctIdleProvisional(config: Config, path: string, sessionId: s
   }
 }
 
+// --- Idle-CLAUDE reap (a resumed session left alive-but-silent, no Stop ever coming) ----------
+//
+// Claude Desktop resumes an old session with `claude --resume <id> --replay-user-messages` and keeps the
+// process RESIDENT while idle: its SessionStart fires (re-arming the session to "working"), no turn
+// follows, and NO Stop ever comes. The dead-pid reaper can't help — the pid is alive — and the PID-gated
+// heartbeat below deliberately defeats the worker's 30-min eviction, so the phone would show that session
+// "working" FOREVER. This net closes the gap from the one side that knows the turn is over: event-silence.
+// When a tracked CLAUDE session has gone event-idle past a generous grace with its pid still alive, it
+// gets ONE corrective op:done (the SAME envelope the interrupt net posts) and its record is pinned done —
+// re-arming on the session's next real hook exactly like the interrupt net's done.
+
+/** How long a CLAUDE session may sit event-idle (no REAL hook since record.ts — a heartbeat never rewrites
+ *  it) while its pid is alive before the watchdog reaps it with a corrective done. 30 min sits FAR above
+ *  any legitimate mid-turn hook gap: tool hooks fire constantly during real work and even a single long
+ *  Bash maxes ~10 min, so a 30-min silence means the turn is genuinely over (a resumed-but-idle session,
+ *  or a long-finished one whose Stop was dropped). Deliberately ≫ HEARTBEAT_AFTER_MS (5 min): the 5–30 min
+ *  window is still heartbeated "working" (a legitimate long tool run / subagent / permission wait), and
+ *  only past 30 min does the reap take over. */
+const CLAUDE_IDLE_REAP_MS = 1_800_000; // 30 min
+
+/** Whether a KEPT (alive) session is an idle CLAUDE session past the reap threshold — the shared predicate
+ *  the reap net and the heartbeat guard BOTH key on, so the two always agree (a session the reaper wants to
+ *  finish is never simultaneously heartbeated back to "working"). True iff: it's a Claude session (codex has
+ *  its own discovery / idle-provisional + notify-backstop machinery, so it's left to those), not a
+ *  provisional discovery row, its last REAL event was a plain `working` update or a bare `sessionStart` (a
+ *  resumed session that fired SessionStart then nothing — never `needsAttention`, which can legitimately sit
+ *  >30 min awaiting a permission answer, nor `done`, already finished), and record.ts is older than
+ *  CLAUDE_IDLE_REAP_MS. Pure so the whole matrix is unit-testable. */
+export function isClaudeIdleReapEligible(record: SessionRecord, now: number): boolean {
+  if (record.agent === "codex") return false;
+  if (record.provisional === true) return false;
+  if (record.lastEvent !== "working" && record.lastEvent !== "sessionStart") return false;
+  if (typeof record.ts !== "number") return false;
+  return now - record.ts >= CLAUDE_IDLE_REAP_MS;
+}
+
+/** The idle-CLAUDE reap for one still-alive session. Gated by isClaudeIdleReapEligible, then it POSTs a
+ *  corrective op:done rebuilt from the record's cached title/machine/label (buildDoneEnvelope — the SAME
+ *  envelope the interrupt net posts) and pins the record done so this fires once and the heartbeat treats
+ *  it as finished. A resumed-but-idle session (SessionStart then silence) falls out through here. On the
+ *  next real hook the pinned sentDone re-arms the session to working, just like the interrupt net's done.
+ *  Returns the same verdict triple as the other nets ("corrected" → the caller must not also heartbeat it). */
+async function correctIdleClaude(config: Config, path: string, sessionId: string, record: SessionRecord, now: number): Promise<"corrected" | "uncorrected" | "revoked"> {
+  try {
+    if (!isClaudeIdleReapEligible(record, now)) return "uncorrected";
+    // Claude-only by the gate above, so the corrective done carries the claude blob shape (no agent key).
+    const outcome = await postEvent(config, await buildDoneEnvelope(sessionId, record, Date.now(), config.e2eKey, "claude"));
+    if (outcome === "revoked") return "revoked"; // pairing gone → bubble up so the loop can tear down
+    if (outcome !== "delivered") return "uncorrected"; // failed POST → keep the file, retry next sweep
+    // 2xx: pin the session done so the gate closes and the heartbeat can never re-arm "working"; the next
+    // real hook re-arms from a done exactly as the interrupt net's rewrite does.
+    try {
+      const next: SessionRecord = { ...record, lastEvent: "done", sentDone: true, op: "done" };
+      // Owner-only (0600), same as every other record rewrite in this file.
+      await atomicWrite(path, JSON.stringify(next), 0o600);
+    } catch {
+      // Rewrite failed — worst case the net re-POSTs a done next sweep, which the worker drops.
+    }
+    return "corrected";
+  } catch {
+    return "uncorrected";
+  }
+}
+
+// --- Codex title-repair (heal a permanent blank title from a dropped post-SessionStart hook) --
+//
+// Codex dispatches SessionStart BEFORE the first prompt is recorded to the rollout, and that hook's
+// payload carries no prompt — so all three of codexAdapter.title()'s sources (session_index thread_name,
+// rollout user_message scan, input.prompt) are empty at SessionStart and the blob ships title:"". Normally
+// the next UserPromptSubmit hook corrects it, but Codex silently drops lifecycle hooks (openai/codex#16430),
+// so the blank title can become PERMANENT. This net re-runs the codex title resolution on each sweep — by
+// sweep time the session_index thread_name is written (~30-40s) and the user_message line is flushed to the
+// rollout — and, once a title resolves, caches it on the record and POSTs a corrective blob carrying the
+// SAME op/status with only the title fixed. Idempotent: a record that already holds a non-empty title is
+// skipped, so this fires at most until the first title lands.
+
+/** How much of the codex rollout HEAD the title-repair fallback scans (the first user_message rides the
+ *  opening lines). Matches the hook's TITLE_SCAN_BYTES. */
+const TITLE_REPAIR_HEAD_BYTES = 128 * 1024;
+
+/** The semantic status a rebuilt blob should carry for `record` (mirrors hook.ts planOp: a fresh
+ *  `sessionStart` shows "working"; otherwise the stored status kind is the lastEvent string). */
+function statusFromRecord(record: SessionRecord): CCStatus {
+  if (record.lastEvent === "needsAttention") return "needsAttention";
+  if (record.lastEvent === "done") return "done";
+  return "working"; // "working" or a fresh "sessionStart"
+}
+
+/** The title-repair corrective envelope: re-POST the session's CURRENT state (op/prio/status unchanged)
+ *  with a freshly-resolved title, rebuilding the encrypted blob from the record's cached machine/label/
+ *  model/turn anchor. Used to heal a codex session that shipped title:"" from a SessionStart before the
+ *  session_index thread_name existed and then had every later hook dropped. Loses only the transient tool
+ *  `detail` sub-status (never cached on the record) — restored by the next real hook. */
+export async function buildTitleRepairEnvelope(
+  sessionId: string, record: SessionRecord, title: string, now: number, e2eKey: Uint8Array, agent: AgentKind = "codex",
+): Promise<{ v: 2; sessionId: string; op: CCOp; prio: 0 | 1; ts: number; blob: string; startedAt?: number }> {
+  const blob = await encryptBlob(e2eKey, {
+    status: statusFromRecord(record),
+    title,
+    machine: typeof record.machine === "string" ? record.machine : "",
+    label: typeof record.label === "string" ? record.label : "",
+    ...adapterFor(agent).blobAgentFields,
+    ...(typeof record.turnStartedAt === "number" && Number.isFinite(record.turnStartedAt) ? { turnStartedAt: record.turnStartedAt } : {}),
+    ...(typeof record.model === "string" && record.model.length > 0 ? { model: record.model } : {}),
+  });
+  return { v: 2, sessionId, op: record.op ?? "update", prio: record.prio ?? 0, ts: now, blob, ...startedAtField(record) };
+}
+
+/** Gate: should this sweep try to repair a still-tracked session's blank title? Only CODEX sessions (Claude
+ *  names its session from the transcript on the very first hook, so a claude blank is a transient read-miss
+ *  the next hook fixes, not the structural SessionStart gap), not a provisional discovery row (those carry a
+ *  cwd-basename title), whose record holds no non-empty title yet. Pure. */
+export function shouldRepairTitle(record: SessionRecord): boolean {
+  if (record.agent !== "codex") return false;
+  if (record.provisional === true) return false;
+  return typeof record.title !== "string" || record.title.length === 0;
+}
+
+/** The rewritten record after a delivered title repair: the resolved title, the freshly-sealed blob, AND
+ *  the pairing that blob was sealed under. The pairingId restamp is load-bearing: the repair seals under
+ *  the CURRENT config.e2eKey, so a legacy record whose pairingId is absent/stale would otherwise hold a
+ *  now-decryptable blob that buildHeartbeatEnvelope's key-rotation guard still refuses (pairingId
+ *  mismatch → null) — the corrected title would never be heartbeated. Pure so the restamp is testable. */
+export function titleRepairedRecord(record: SessionRecord, title: string, blob: string, pairingId: string): SessionRecord {
+  return { ...record, title, blob, ...(pairingId.length > 0 ? { pairingId } : {}) };
+}
+
+/** The title-repair net for one tracked codex session. Gated by shouldRepairTitle, then it re-runs the
+ *  codex title resolver (session_index thread_name → rollout user_message scan — both readable by sweep
+ *  time even if every post-SessionStart hook was dropped). If a title resolves it caches the title, the
+ *  freshly-sealed blob, AND the sealing pairingId on the record (the heartbeat re-sends record.blob
+ *  verbatim, so a stale blank-title blob left in place would let a later heartbeat re-push the very
+ *  title:"" we just fixed — and the rewritten record must pass the heartbeat's key-rotation guard, see
+ *  titleRepairedRecord) and POSTs the corrective at the session's CURRENT op/status. No title yet (still
+ *  pre-thread_name / empty rollout) → nothing to do, retried next sweep. Returns the same verdict triple
+ *  as the other nets. */
+async function repairTitle(config: Config, path: string, sessionId: string, record: SessionRecord): Promise<"corrected" | "uncorrected" | "revoked"> {
+  try {
+    if (!shouldRepairTitle(record)) return "uncorrected";
+    let prefix = "";
+    if (typeof record.transcript === "string" && record.transcript.length > 0) {
+      try { prefix = await readPrefix(record.transcript, TITLE_REPAIR_HEAD_BYTES); } catch { /* rollout gone / unreadable → index-only */ }
+    }
+    // input:{} — the watchdog has no hook payload, so this reduces to the PRIMARY session_index lookup plus
+    // the rollout-prefix fallback (the UserPromptSubmit input.prompt path is inert without an input).
+    const title = await codexAdapter.title({ sessionId, prefix, input: {}, transcriptPath: record.transcript });
+    if (!title) return "uncorrected"; // still no title (pre-thread_name, empty rollout) → retry next sweep
+    const envelope = await buildTitleRepairEnvelope(sessionId, record, title, Date.now(), config.e2eKey, "codex");
+    const outcome = await postEvent(config, envelope);
+    if (outcome === "revoked") return "revoked"; // pairing gone → bubble up so the loop can tear down
+    if (outcome !== "delivered") return "uncorrected"; // failed POST → keep the old record, retry next sweep
+    try {
+      const next = titleRepairedRecord(record, title, envelope.blob, config.pairingId);
+      // Owner-only (0600), same as every other record rewrite in this file.
+      await atomicWrite(path, JSON.stringify(next), 0o600);
+    } catch {
+      // Rewrite failed — worst case we re-resolve + re-POST next sweep (the worker dedupes the frame).
+    }
+    return "corrected";
+  } catch {
+    return "uncorrected";
+  }
+}
+
 // --- Heartbeat decision ---------------------------------------------------------------------
 
 /** Should this KEPT (alive) session get a heartbeat this sweep? Pure so every guardrail is unit-
@@ -613,6 +780,10 @@ async function correctIdleProvisional(config: Config, path: string, sessionId: s
  *  HEARTBEAT_AFTER_MS). */
 export function shouldHeartbeat(record: SessionRecord, now: number, lastHeartbeat: number | undefined, correctedThisSweep: boolean): boolean {
   if (record.op === "done") return false; // finished session → never re-armed by a heartbeat
+  // Idle-CLAUDE reap-eligible → never heartbeat it back to "working": the reaper and the heartbeat must
+  // agree, so even when the reap POST FAILED this sweep (record not yet pinned done) the heartbeat holds
+  // off rather than keeping a resumed-but-dead-idle session alive on the phone forever.
+  if (isClaudeIdleReapEligible(record, now)) return false;
   if (correctedThisSweep) return false;
   if (typeof record.ts !== "number") return false;
   if (now - record.ts < HEARTBEAT_AFTER_MS) return false; // still inside the hook cadence → skip
@@ -680,7 +851,27 @@ async function sweep(config: Config | null): Promise<SweepResult> {
           if (attn === "revoked") return { revoked: true };
           if (attn === "corrected") { delivered = true; flaggedAttention = true; }
         }
-        if (shouldHeartbeat(record, now, heartbeatAt.get(sessionId), idleFix === "corrected" || corrected === "corrected" || flaggedAttention)) {
+        // Idle-CLAUDE reap: a resumed-but-idle Claude session (working/sessionStart then ≥30 min of
+        // silence, pid still alive, no Stop ever coming) gets ONE corrective done instead of being
+        // heartbeated "working" forever. Only if no earlier net already finished the turn this sweep;
+        // Claude-only (isClaudeIdleReapEligible gates codex out — it has discovery + the notify backstop).
+        let reapedIdle = false;
+        if (idleFix !== "corrected" && corrected !== "corrected" && !flaggedAttention) {
+          const idleClaude = await correctIdleClaude(config, path, sessionId, record, now);
+          if (idleClaude === "revoked") return { revoked: true };
+          if (idleClaude === "corrected") { delivered = true; reapedIdle = true; }
+        }
+        // Codex title-repair: heal a session that shipped title:"" from a SessionStart and then had every
+        // later hook dropped (openai/codex#16430) — by sweep time the session_index thread_name / rollout
+        // user_message are on disk. Only when nothing else corrected this sweep (a done row with a blank
+        // title is fixed on a later sweep, since the record persists); no-ops for claude / titled records.
+        let repairedTitle = false;
+        if (idleFix !== "corrected" && corrected !== "corrected" && !flaggedAttention && !reapedIdle) {
+          const titleFix = await repairTitle(config, path, sessionId, record);
+          if (titleFix === "revoked") return { revoked: true };
+          if (titleFix === "corrected") { delivered = true; repairedTitle = true; }
+        }
+        if (shouldHeartbeat(record, now, heartbeatAt.get(sessionId), idleFix === "corrected" || corrected === "corrected" || flaggedAttention || reapedIdle || repairedTitle)) {
           const beat = buildHeartbeatEnvelope(sessionId, record, Date.now(), config.pairingId);
           // delivered only: a failed heartbeat mutates NOTHING (not the record, not even the throttle),
           // so quietness stays true and it's retried next sweep. A record with no stored blob yields
@@ -705,6 +896,16 @@ async function sweep(config: Config | null): Promise<SweepResult> {
         continue;
       }
       delivered = true; // the reap POST landed 2xx → the pairing is alive
+    }
+    if (verdict === "stale" && config && record) {
+      // 24 h-abandoned session (its POSTs have kept failing, or the machine slept through the death):
+      // POST a best-effort terminal end so the phone's row RESOLVES instead of orphaning until the
+      // worker's TTL (never silent-vanish), then fall through to delete REGARDLESS — unlike the dead-pid
+      // reap, the staleness cap exists to STOP retrying, so a failed POST here does not keep the file.
+      // A revoke still bails the whole sweep so the loop can tear the pairing down.
+      const outcome = await postEvent(config, buildEndEnvelope(sessionId, now, record));
+      if (outcome === "revoked") return { revoked: true };
+      if (outcome === "delivered") delivered = true;
     }
     heartbeatAt.delete(sessionId); // session is being removed → drop its throttle entry
     try {

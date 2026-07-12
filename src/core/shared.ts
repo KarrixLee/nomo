@@ -800,3 +800,17 @@ export function pidAncestors(pid: number, maxDepth = 12): number[] {
   }
   return chain;
 }
+
+/** The full command line (argv) of `pid` via `ps -o args= -p <pid>`, or undefined on any failure. Sync
+ *  (like pidAncestors) so the hook's pre-mirror headless-invocation guard can fingerprint the invoking
+ *  agent process — and its ancestor chain — inline without an await. Best-effort: a missing pid / failed
+ *  `ps` yields undefined, which the caller treats as "no evidence" (never a false headless verdict). */
+export function pidCommand(pid: number): string | undefined {
+  try {
+    const out = execFileSync("ps", ["-o", "args=", "-p", String(pid)], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+    const trimmed = out.trim();
+    return trimmed.length > 0 ? trimmed : undefined;
+  } catch {
+    return undefined; // no such pid / ps failed → unknown command line
+  }
+}

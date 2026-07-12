@@ -7,11 +7,11 @@ import type { SessionRecord } from "../core/shared";
 import { GONE_STRIKE_LIMIT, readGoneStrikes, recordGoneStrike, resetGoneStrikes } from "../core/shared";
 import {
   buildDoneEnvelope, buildEndEnvelope, buildHeartbeatEnvelope, buildNeedsAttentionEnvelope, buildProvisionalBlob,
-  buildProvisionalEnvelope, buildProvisionalRecord, buildStartEnvelope, classifySession, codexLastTurnEvent,
-  codexTailPendingApproval, discoverLiveSessions, goneStrikeShouldTeardown, hasInterruptMarker, IDLE_GRACE_MS,
-  lastTurnLine, PAIRING_TTL_MS, pendingPairingExpired, postOutcomeForStatus, provisionalsCoveredByReal,
-  reconcileProvisionalsSweep, shouldHeartbeat, shouldIdleProvisionalCheck, shouldInterruptCheck,
-  shouldPendingApprovalCheck, tailShowsInterrupt,
+  buildProvisionalEnvelope, buildProvisionalRecord, buildStartEnvelope, buildTitleRepairEnvelope, classifySession,
+  codexLastTurnEvent, codexTailPendingApproval, discoverLiveSessions, goneStrikeShouldTeardown, hasInterruptMarker,
+  IDLE_GRACE_MS, isClaudeIdleReapEligible, lastTurnLine, PAIRING_TTL_MS, pendingPairingExpired, postOutcomeForStatus,
+  provisionalsCoveredByReal, reconcileProvisionalsSweep, shouldHeartbeat, shouldIdleProvisionalCheck,
+  shouldInterruptCheck, shouldPendingApprovalCheck, shouldRepairTitle, tailShowsInterrupt, titleRepairedRecord,
 } from "./cc-watchdog";
 import type { PostOutcome, RecordEntry } from "./cc-watchdog";
 import { claudeAdapter, codexAdapter } from "../core/adapter";
@@ -42,16 +42,109 @@ describe("classifySession", () => {
     expect(classifySession({ pid: Number.NaN, machine: "m", label: "l", ts: 1 } as SessionRecord, 1, dead)).toBe("delete");
   });
 
-  test("a stale (>24h) file → delete without POSTing (caps retries), regardless of liveness", () => {
+  test("a stale (>24h) VALID file → stale (POST a terminal end, then delete), regardless of liveness", () => {
     const now = rec().ts + 86_400_000 + 1;
-    expect(classifySession(rec(), now, dead)).toBe("delete");
-    expect(classifySession(rec(), now, alive)).toBe("delete");
+    expect(classifySession(rec(), now, dead)).toBe("stale");
+    expect(classifySession(rec(), now, alive)).toBe("stale");
+  });
+
+  test("a record with no timestamp → delete (un-ageable, nothing to POST)", () => {
+    expect(classifySession({ pid: 4242, machine: "m", label: "l" } as unknown as SessionRecord, 1, dead)).toBe("delete");
   });
 
   test("the decision is driven purely by the injected predicate (no real process probed)", () => {
     const seen: number[] = [];
     classifySession(rec({ pid: 777 }), rec().ts, (p) => { seen.push(p); return false; });
     expect(seen).toEqual([777]);
+  });
+});
+
+describe("isClaudeIdleReapEligible (a resumed Claude session gone silent past the reap grace)", () => {
+  const REAP_MS = 1_800_000; // must mirror CLAUDE_IDLE_REAP_MS in cc-watchdog.ts
+  const now = 100_000_000;
+
+  test("a working Claude session idle ≥30 min → eligible; just under → not", () => {
+    expect(isClaudeIdleReapEligible(rec({ lastEvent: "working", ts: now - REAP_MS }), now)).toBe(true);
+    expect(isClaudeIdleReapEligible(rec({ lastEvent: "working", ts: now - REAP_MS + 1 }), now)).toBe(false);
+  });
+
+  test("a resumed session (lastEvent sessionStart) idle past the grace → eligible", () => {
+    expect(isClaudeIdleReapEligible(rec({ lastEvent: "sessionStart", ts: now - REAP_MS }), now)).toBe(true);
+  });
+
+  test("needsAttention and done are NEVER reaped (a permission wait can sit >30 min; done is finished)", () => {
+    expect(isClaudeIdleReapEligible(rec({ lastEvent: "needsAttention", ts: now - REAP_MS * 10 }), now)).toBe(false);
+    expect(isClaudeIdleReapEligible(rec({ lastEvent: "done", ts: now - REAP_MS * 10 }), now)).toBe(false);
+  });
+
+  test("codex sessions and provisional rows are left to their own machinery", () => {
+    expect(isClaudeIdleReapEligible(rec({ agent: "codex", lastEvent: "working", ts: now - REAP_MS * 5 }), now)).toBe(false);
+    expect(isClaudeIdleReapEligible(rec({ provisional: true, lastEvent: "working", ts: now - REAP_MS * 5 }), now)).toBe(false);
+  });
+
+  test("the heartbeat and the reaper AGREE — a reap-eligible session is never heartbeated back to working", () => {
+    const idle = rec({ lastEvent: "working", ts: now - REAP_MS });
+    // quiet + alive + never-heartbeated + uncorrected would normally heartbeat, but the reap guard wins.
+    expect(shouldHeartbeat(idle, now, undefined, false)).toBe(false);
+    // A shorter (5–30 min) silence is still heartbeated — that window is a legit long tool run.
+    expect(shouldHeartbeat(rec({ lastEvent: "working", ts: now - 600_000 }), now, undefined, false)).toBe(true);
+  });
+});
+
+describe("shouldRepairTitle (heal a permanent blank codex title)", () => {
+  test("a codex session with no/empty title → repair; with a title → skip (idempotent)", () => {
+    expect(shouldRepairTitle(rec({ agent: "codex" }))).toBe(true);
+    expect(shouldRepairTitle(rec({ agent: "codex", title: "" }))).toBe(true);
+    expect(shouldRepairTitle(rec({ agent: "codex", title: "Fix the bug" }))).toBe(false);
+  });
+
+  test("claude sessions and provisional rows are never title-repaired here", () => {
+    expect(shouldRepairTitle(rec({ title: "" }))).toBe(false); // claude (no agent) → not this net's job
+    expect(shouldRepairTitle(rec({ agent: "codex", provisional: true }))).toBe(false);
+  });
+});
+
+describe("buildTitleRepairEnvelope (re-POST current state with only the title fixed)", () => {
+  test("preserves the session's op/prio/status and fixes the title in the rebuilt blob", async () => {
+    const record = rec({ agent: "codex", lastEvent: "working", op: "update", prio: 0, model: "gpt-5-codex" });
+    const env = await buildTitleRepairEnvelope("sess-9", record, "Refactor the parser", 4242, KEY, "codex") as {
+      v: number; op: string; prio: number; ts: number; blob: string;
+    };
+    expect(env).toMatchObject({ v: 2, sessionId: "sess-9", op: "update", prio: 0, ts: 4242 });
+    const blob = await decryptBlob(KEY, env.blob) as Record<string, unknown>;
+    expect(blob.status).toBe("working"); // status UNCHANGED — only the title is repaired
+    expect(blob.title).toBe("Refactor the parser");
+    expect(blob.agent).toBe("codex");
+    expect(blob.model).toBe("gpt-5-codex");
+  });
+
+  test("a needsAttention record keeps its prio-1 needsAttention state on the repair frame", async () => {
+    const record = rec({ agent: "codex", lastEvent: "needsAttention", op: "update", prio: 1 });
+    const env = await buildTitleRepairEnvelope("sess-10", record, "Approve the patch?", 7, KEY, "codex") as {
+      prio: number; blob: string;
+    };
+    expect(env.prio).toBe(1);
+    const blob = await decryptBlob(KEY, env.blob) as Record<string, unknown>;
+    expect(blob.status).toBe("needsAttention");
+  });
+});
+
+describe("titleRepairedRecord (the delivered-repair record rewrite)", () => {
+  test("caches the title + blob AND restamps the sealing pairingId (a legacy/stale stamp is replaced)", () => {
+    const legacy = rec({ agent: "codex", pairingId: "old-pairing" });
+    const next = titleRepairedRecord(legacy, "Refactor the parser", "NEWBLOB", "current-pairing");
+    expect(next).toMatchObject({ title: "Refactor the parser", blob: "NEWBLOB", pairingId: "current-pairing" });
+    // A record with NO stamp at all (older plugin) gets one too — the repair sealed under the current key.
+    expect(titleRepairedRecord(rec({ agent: "codex" }), "t", "B", "current-pairing").pairingId).toBe("current-pairing");
+  });
+
+  test("the rewritten record passes the heartbeat's key-rotation guard (the very reason for the restamp)", () => {
+    // Without the restamp, a legacy record's stale pairingId made buildHeartbeatEnvelope yield null
+    // forever — the freshly-repaired title would never be re-armed by a heartbeat.
+    const stale = rec({ agent: "codex", op: "update", prio: 0, pairingId: "old-pairing" });
+    expect(buildHeartbeatEnvelope("s", stale, 99, "current-pairing")).toBeNull(); // the pre-fix dead end
+    const repaired = titleRepairedRecord(stale, "Refactor the parser", "NEWBLOB", "current-pairing");
+    expect(buildHeartbeatEnvelope("s", repaired, 99, "current-pairing")).toMatchObject({ blob: "NEWBLOB" });
   });
 });
 

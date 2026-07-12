@@ -24,7 +24,7 @@ import { encryptBlob } from "./crypto";
 import { adapterFor, claudeToolDetail, codexToolDetail, findProvisionalForPid, TrackedSessionLite } from "./adapter";
 import {
   AgentKind, atomicWrite, CCOp, CCStatus, Config, ensureWatchdog, GONE_STRIKE_LIMIT,
-  LAST_SEND_PATH, lastHookPath, loadConfig, loadPendingConfig, PENDING_STASH_PATH, PendingEventStash, pidAncestors, readPrefix,
+  LAST_SEND_PATH, lastHookPath, loadConfig, loadPendingConfig, PENDING_STASH_PATH, PendingEventStash, pidAncestors, pidCommand, readPrefix,
   readRecord, recordGoneStrike, removeRevokedConfig, resetGoneStrikes, SessionRecord, SESSIONS_DIR,
 } from "./shared";
 
@@ -491,6 +491,17 @@ export async function runHook(agent: AgentKind): Promise<void> {
     // tracked id, so an already-live session can never be silenced by it.
     if (!existingRecord && adapter.isInternalSessionGhost && await adapter.isInternalSessionGhost({
       sessionId: input.session_id, prefix: await getPrefix(), transcriptPath,
+    })) return;
+
+    // Headless/daemon-invocation guard (adapter seam; claude-only in practice): a `claude` that loads
+    // plugins but isn't a human's interactive session — claude-mem's `claude --output-format stream-json`
+    // observation runs, or any tool shelling out to headless Claude — fires SessionStart/UserPromptSubmit
+    // under a fresh session id that never gets a Stop, so left unguarded it mints a phantom "working" row
+    // that only the watchdog's 30-min idle reap (or the worker's eviction) ever clears. The invoking
+    // process's argv (process.ppid) and its ancestor chain fingerprint it. Only consulted for a NEVER-
+    // tracked id, so an already-live interactive session can never be silenced.
+    if (!existingRecord && adapter.isHeadlessInvocation && adapter.isHeadlessInvocation({
+      pid: process.ppid, ancestorsOf: pidAncestors, commandOf: pidCommand,
     })) return;
 
     // Keep the LAST NON-EMPTY title, like model below: a later hook whose bounded reads find nothing

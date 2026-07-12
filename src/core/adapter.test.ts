@@ -1,8 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { describe, expect, test } from "bun:test";
 import {
-  adapterFor, allAdapters, claudeAdapter, claudeSessionModel, claudeSessionTitle, claudeTailPendingApproval,
-  codexAdapter, codexChildSessionGhost,
+  adapterFor, allAdapters, claudeAdapter, claudeHeadlessInvocation, claudeSessionModel, claudeSessionTitle,
+  claudeTailPendingApproval, codexAdapter, codexChildSessionGhost,
   codexConfigModel, codexDiscoverLive, codexInternalSessionGhost, codexModelFromRollout,
   CODEX_ROLLOUT_IDLE_SILENCE_MS,
   codexNewestRolloutForCwd, codexPidTurnActive, codexRolloutExistsForSession, codexSentinelSessionId, codexSessionModel,
@@ -904,6 +904,52 @@ describe("codexInternalSessionGhost (top-level app-server internal jobs must not
   test("codexAdapter implements the seam; claudeAdapter omits it", () => {
     expect(typeof codexAdapter.isInternalSessionGhost).toBe("function");
     expect(claudeAdapter.isInternalSessionGhost).toBeUndefined();
+  });
+});
+
+// --- Headless/daemon `claude` invocation guard (phantom-row prevention) ------------------------
+//
+// A `claude` that loads plugins but isn't a human's interactive session (claude-mem's stream-json
+// observation runs, or any tool shelling out to headless Claude) fires hooks under a session id that
+// never gets a Stop. The classifier fingerprints it from the invoking process's argv + ancestor chain.
+
+describe("claudeHeadlessInvocation (skip a non-interactive / daemon-spawned claude)", () => {
+  test("interactive TUI (a bare `claude`, no ancestors match) → not headless", () => {
+    expect(claudeHeadlessInvocation("/usr/local/bin/claude", [])).toBe(false);
+    expect(claudeHeadlessInvocation("claude", ["/bin/zsh -l", "/sbin/launchd"])).toBe(false);
+  });
+
+  test("headless flags on the invoking claude → headless", () => {
+    expect(claudeHeadlessInvocation("claude --output-format stream-json --verbose", [])).toBe(true);
+    expect(claudeHeadlessInvocation("claude -p 'summarize this'", [])).toBe(true);
+    expect(claudeHeadlessInvocation("claude --print", [])).toBe(true);
+  });
+
+  test("a known daemon shape ANYWHERE in the chain (self or ancestor) → headless", () => {
+    expect(claudeHeadlessInvocation("claude", ["node /Users/x/.claude-mem/worker-service.js"])).toBe(true);
+    expect(claudeHeadlessInvocation("claude-mem run", [])).toBe(true);
+  });
+
+  test("tokenized flag match — a path merely CONTAINING '-p' can't false-trigger", () => {
+    expect(claudeHeadlessInvocation("/opt/my-project/bin/claude", [])).toBe(false);
+    expect(claudeHeadlessInvocation("claude --model opus-p", [])).toBe(false);
+  });
+
+  test("an unknown invoker (ps failed → undefined) is NOT treated as headless", () => {
+    expect(claudeHeadlessInvocation(undefined, [undefined])).toBe(false);
+  });
+
+  test("claudeAdapter wires the seam (codex omits it); it walks pid → command via the injected readers", () => {
+    expect(typeof claudeAdapter.isHeadlessInvocation).toBe("function");
+    expect(codexAdapter.isHeadlessInvocation).toBeUndefined();
+    const commands: Record<number, string> = { 100: "claude --output-format stream-json", 200: "node worker-service.js" };
+    expect(claudeAdapter.isHeadlessInvocation!({
+      pid: 100, ancestorsOf: () => [200], commandOf: (p) => commands[p],
+    })).toBe(true);
+    const interactive: Record<number, string> = { 100: "claude", 200: "/bin/zsh" };
+    expect(claudeAdapter.isHeadlessInvocation!({
+      pid: 100, ancestorsOf: () => [200], commandOf: (p) => interactive[p],
+    })).toBe(false);
   });
 });
 
