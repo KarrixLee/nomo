@@ -468,7 +468,7 @@ async function flushPendingStash(
       try {
         const res = await fetchFn(`${url}/v1/cc/event`, {
           method: "POST",
-          headers: { "content-type": "application/json", "x-cc-pairing": pairingId, "x-cc-auth": pcSecret },
+          headers: { "content-type": "application/json", "x-cc-pairing": pairingId, "x-cc-auth": pcSecret, "x-cc-version": PLUGIN_VERSION },
           body: JSON.stringify(envelope),
           signal: AbortSignal.timeout(fetchTimeoutMs),
         });

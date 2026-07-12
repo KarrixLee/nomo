@@ -24,7 +24,7 @@ import { encryptBlob } from "./crypto";
 import { adapterFor, claudeToolDetail, codexToolDetail, findProvisionalForPid, TrackedSessionLite } from "./adapter";
 import {
   AgentKind, atomicWrite, CCOp, CCStatus, Config, ensureWatchdog, GONE_STRIKE_LIMIT,
-  LAST_SEND_PATH, lastHookPath, loadConfig, loadPendingConfig, PENDING_STASH_PATH, PendingEventStash, pidAncestors, pidCommand, readPrefix,
+  LAST_SEND_PATH, lastHookPath, loadConfig, loadPendingConfig, PENDING_STASH_PATH, PendingEventStash, pidAncestors, pidCommand, PLUGIN_VERSION, readPrefix,
   readRecord, recordGoneStrike, removeRevokedConfig, resetGoneStrikes, SessionRecord, SESSIONS_DIR,
 } from "./shared";
 
@@ -336,7 +336,7 @@ async function reconcileProvisional(config: Config, hookPid: number): Promise<vo
     try {
       const res = await fetch(`${config.url}/v1/cc/event`, {
         method: "POST",
-        headers: { "content-type": "application/json", "x-cc-pairing": config.pairingId, "x-cc-auth": config.pcSecret },
+        headers: { "content-type": "application/json", "x-cc-pairing": config.pairingId, "x-cc-auth": config.pcSecret, "x-cc-version": PLUGIN_VERSION },
         body: JSON.stringify({ v: 2, sessionId: sentinel, op: "end", prio: 0, ts: Date.now() }),
         signal: AbortSignal.timeout(2000),
       });
@@ -570,6 +570,7 @@ export async function runHook(agent: AgentKind): Promise<void> {
         "content-type": "application/json",
         "x-cc-pairing": config.pairingId,
         "x-cc-auth": config.pcSecret,
+        "x-cc-version": PLUGIN_VERSION,
       },
       body: JSON.stringify(envelope),
       signal: AbortSignal.timeout(2000),

@@ -1935,3 +1935,44 @@ describe("runHook title (tail ai-title reaches the blob; a found title never reg
     expect(blobTitle).toBe(""); // buildBlob's `title ?? ""` — the phone falls back to the label
   }, 20000);
 });
+
+// The plugin's version rides EVERY /cc/event POST as the plaintext x-cc-version header (never in the
+// blob). Spawn the real claude entry against a header-capturing local server and assert the header is
+// present. Run from source (not the bundled dist), so __NOMO_VERSION__ is undefined and PLUGIN_VERSION
+// is the "0.0.0-dev" fallback — deterministic to assert on.
+describe("runHook sends the plugin version as the x-cc-version header", () => {
+  const rawKey = new Uint8Array(32).fill(9);
+  const entry = join(import.meta.dir, "cc-status.ts");
+
+  test("every /cc/event POST carries x-cc-version (the unbundled fallback when run from source)", async () => {
+    let seen: string | null = "NOT-CALLED";
+    const server = Bun.serve({
+      port: 0,
+      fetch(req) { seen = req.headers.get("x-cc-version"); return new Response("{}", { status: 200 }); },
+    });
+    const url = `http://127.0.0.1:${server.port}`;
+    const home = await mkdtemp(join(tmpdir(), "cc-hook-ver-"));
+    const ccDir = join(home, ".config", "cc-status");
+    await mkdir(join(ccDir, "sessions"), { recursive: true });
+    await writeFile(join(ccDir, "config.json"), JSON.stringify({
+      url, pairingId: "p", pcSecret: "s", e2eKeyB64: b64url(rawKey),
+    }));
+    await writeFile(join(ccDir, "watchdog.pid"), String(process.pid)); // no detached poller spawns
+    try {
+      const proc = Bun.spawn({
+        cmd: ["bun", entry],
+        env: { ...process.env, HOME: home },
+        stdin: Buffer.from(JSON.stringify({
+          session_id: "s1", hook_event_name: "PreToolUse", tool_name: "Edit",
+          cwd: "/x/api-status", transcript_path: "",
+        })),
+        stdout: "ignore", stderr: "ignore",
+      });
+      await proc.exited;
+      expect(seen).toBe("0.0.0-dev");
+    } finally {
+      server.stop(true);
+      await rm(home, { recursive: true, force: true });
+    }
+  }, 20000);
+});

@@ -36,7 +36,7 @@ import { encryptBlob } from "../core/crypto";
 import { adapterFor, AgentAdapter, allAdapters, codexAdapter, DiscoveredSession } from "../core/adapter";
 import {
   AgentKind, atomicWrite, CC_DIR, CCOp, CCStatus, Config, completePendingPairing, GONE_STRIKE_LIMIT, loadConfig, loadPendingConfig,
-  PAIR_HTML_FILE, PairPollResult, PendingConfig, pidAlive, readPrefix, readSuffix, recordGoneStrike, removeRevokedConfig,
+  PAIR_HTML_FILE, PairPollResult, PendingConfig, pidAlive, PLUGIN_VERSION, readPrefix, readSuffix, recordGoneStrike, removeRevokedConfig,
   resetGoneStrikes, SessionRecord, SESSIONS_DIR, WATCHDOG_PID_PATH,
 } from "../core/shared";
 
@@ -216,6 +216,7 @@ async function postEvent(config: Config, body: object): Promise<PostOutcome> {
         "content-type": "application/json",
         "x-cc-pairing": config.pairingId,
         "x-cc-auth": config.pcSecret,
+        "x-cc-version": PLUGIN_VERSION,
       },
       body: JSON.stringify(body),
       signal: AbortSignal.timeout(2000),
