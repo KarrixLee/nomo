@@ -324,7 +324,7 @@ async function completePendingPairing(pending, configPath, opts = {}) {
     try {
       await fetchFn(`${pending.url}/v1/cc/pair/ack`, {
         method: "POST",
-        headers: { "x-cc-pairing": pending.pairingId, "x-cc-auth": pending.pcSecret },
+        headers: { "x-cc-pairing": pending.pairingId, "x-cc-auth": pending.pcSecret, "x-cc-version": PLUGIN_VERSION },
         signal: AbortSignal.timeout(fetchTimeoutMs)
       });
       break;
