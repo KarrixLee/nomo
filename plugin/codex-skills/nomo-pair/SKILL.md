@@ -6,6 +6,26 @@ description: Pair this computer with the Nomo iPhone app via a QR code (end-to-e
 Pairing is: **resolve the plugin path**, **open the pairing page**, then **confirm the scan**.
 Run the steps in order, in the foreground.
 
+## Which path — read the text after `$nomo-pair` first
+
+The text the user typed after `$nomo-pair` decides how step 2 hands off the pairing. Steps 1, 3, 4,
+and 5 are identical either way.
+
+- **No argument** (nothing after `$nomo-pair`) → **default browser path.** Run step 2 exactly as
+  written: it opens a themed pairing page (QR + click-to-reveal code) in the browser and keeps the
+  one-time code out of this transcript.
+- **The argument is `code`** (trim whitespace, case-insensitive) → **no-browser code path.** The user
+  explicitly asked for the typeable code without a browser (headless / SSH). Run step 2's command with
+  `--show-code` appended (see the code-path block in step 2): this skips the browser/QR page and
+  prints **only** the one-time pairing code straight into this transcript. Relay that printed code to
+  the user, plus the app instructions (**Nomo → Sessions → "Pair a Computer" → "Enter code"**). This
+  puts the code in the transcript, but that trade-off is intended here — the user opted in by typing
+  `code`.
+- **Any other value** → treat it as the **default browser path** (do not error).
+
+Whichever path you take, the guard in step 2 still holds: **only the short typeable code may ever be
+printed — the `nomo://pair…` / `s=` deep link and the QR art must NEVER be echoed or reconstructed.**
+
 ## Step 1 — resolve the plugin path
 
 Skills get no `PLUGIN_ROOT`, so find it first. Run this exact command:
@@ -25,18 +45,27 @@ install the `nomo` plugin, then stop.
 
 Network calls need sandbox escalation in Codex. **Request escalated/approved permissions up front**
 and tell the user it's because pairing has to reach the Nomo relay over HTTPS — don't just let the
-command fail. Then run this exact command in the foreground and wait for it to finish (it returns in
-a second or two):
+command fail. Then run the command for your path (from **Which path** above) in the foreground and
+wait for it to finish (it returns in a second or two). Use **exactly one** of these two forms:
+
+**Default browser path** (no argument) — opens the QR page, code stays hidden from the transcript:
 
 ```
 exec "<ROOT>/scripts/run.sh" "<ROOT>/dist/pair.mjs"
 ```
 
-- This writes a themed pairing **page** and **opens it in the default browser**, outside the Codex
-  TUI (a folded terminal QR is unreliable in Codex). The page shows the QR **and** a one-time pairing
-  code, hidden behind a "Tap to reveal code" control until clicked — the code is **not** printed to
-  stdout/the transcript by default. **Relay the script's printed lines to the user in your own
-  words:**
+**Code path** (the argument is `code`) — no browser; prints the one-time code into this transcript:
+
+```
+exec "<ROOT>/scripts/run.sh" "<ROOT>/dist/pair.mjs" --show-code
+```
+
+- The **default** command writes a themed pairing **page** and **opens it in the default browser**,
+  outside the Codex TUI (a folded terminal QR is unreliable in Codex). The **code** command skips that
+  page entirely and prints only the one-time typeable code. On the default path the page shows the QR
+  **and** a one-time pairing code, hidden behind a "Tap to reveal code" control until clicked — the
+  code is **not** printed to stdout/the transcript by default. **Relay the script's printed lines to
+  the user in your own words:**
   - `Pairing page opened in your browser.` → tell them the pairing page just opened in a browser
     window, where they can scan the QR, or click **"Tap to reveal code"** to see the one-time code and
     enter it in the app (Nomo → Sessions → "Pair a Computer" → "Enter code").

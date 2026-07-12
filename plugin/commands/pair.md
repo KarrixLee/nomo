@@ -4,7 +4,8 @@ argument-hint: [code]
 ---
 
 Pairing is two quick steps: **do step 1** (register + hand off the pairing), then **wait for the
-phone to claim it** (step 2). Run them in order, both in the **foreground**.
+phone to claim it** (step 2). Do step 1 in the **foreground**; run the step-2 wait in the
+**background** so the terminal stays free while the phone pairs.
 
 ## Which path — read `$ARGUMENTS` first
 
@@ -65,10 +66,17 @@ two). Use **exactly one** of these two forms:
 - If the command prints an error line instead (network, rate-limit), relay that error line to the
   user and stop; do not proceed to step 2.
 
-## Step 2 — wait for the scan
+## Step 2 — wait for the scan (in the background)
 
-Now run this exact command in the foreground and wait for it to finish (blocking here is fine — the
-pairing page is already open, and this just waits for the phone):
+**First finish relaying step 1.** Before you launch the wait, your reply must already contain the
+user-visible hand-off from step 1 — the "pairing page opened" note, or (on the `code` path) the
+one-time code and app instructions. Relay it as normal text in this same message. **Never launch a
+blocking foreground wait before that text is on screen** — the old foreground wait clipped the code
+when the user interrupted mid-turn. The background wait below never blocks, so nothing can clip it,
+but the ordering still holds: relay first, then launch.
+
+Now run this exact command **in the background** — with the Bash tool's `run_in_background: true`
+option, **not** a trailing `&`:
 
 ```
 "${CLAUDE_PLUGIN_ROOT}/scripts/run.sh" "${CLAUDE_PLUGIN_ROOT}/dist/pair.mjs" wait
@@ -76,7 +84,18 @@ pairing page is already open, and this just waits for the phone):
 
 - It polls for up to 10 minutes until the phone claims the pairing, then prints `Paired with … ✓`
   (or a plain `Paired ✓` when the self-heal watchdog completed the pairing first — same success).
-- **Relay its final line to the user.** On `Paired with … ✓` / `Paired ✓`, tell the user pairing is
-  complete and this machine's Claude Code sessions will now appear in the Nomo app.
-- On failure (e.g. "Pairing window expired" or "expired or was removed"), tell the user the QR
-  timed out and suggest re-running `/nomo-cc:pair` to get a fresh code.
+- After launching it in the background, **tell the user the code / QR is ready and that you'll report
+  back automatically the moment their phone pairs (or when the 10-minute window expires), then end
+  your turn.** Do not sit and poll — the background task keeps running across turns and will
+  re-invoke you with a completion notification and an output-file path when the command exits.
+- When that completion notification arrives, **Read the command's output file and relay its final
+  line:**
+  - `Paired with … ✓` / `Paired ✓` → tell the user pairing is complete and this machine's Claude Code
+    sessions will now appear in the Nomo app.
+  - Failure (e.g. "Pairing window expired" or "expired or was removed") → tell the user the QR timed
+    out and suggest re-running `/nomo-cc:pair` to get a fresh code.
+
+**Fallback (older Claude Code without background runs).** If the Bash tool has no `run_in_background`
+capability, run the exact same command in the **foreground** and wait for it to finish (blocking is
+fine here — the pairing page is already open and this just waits for the phone), then relay its final
+line using the same success / failure mapping above.
