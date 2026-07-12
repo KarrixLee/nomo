@@ -478,16 +478,14 @@ async function correctInterrupt(config: Config, path: string, sessionId: string,
   }
 }
 
-// --- Pending-approval recovery net (dropped Codex PermissionRequest backstop) -----------------
+// --- Pending-user-action recovery net (dropped Codex blocking-hook backstop) ------------------
 //
-// On Codex, needsAttention hangs off ONE thread: the plugin's PermissionRequest hook. Codex has no
-// upstream Notification event and is known to silently drop lifecycle hooks (openai/codex#16430); when
-// that hook drops, the phone never learns the session is blocked on an approval — the notify backstop
-// only synthesizes a `done` at TURN END. This net mirrors the interrupt-recovery one: it asks the
-// session's adapter (record.agent, absent → claude) whether the rollout tail shows a PENDING approval
-// (adapter.tailShowsPendingApproval; Claude implements none) and, if so, POSTs the same needsAttention
-// envelope a real PermissionRequest would have. See adapter.ts codexTailPendingApproval for the
-// classifier and its rollout-persistence caveat.
+// On Codex, needsAttention comes from PermissionRequest for approvals and PreToolUse for the
+// request_user_input choice UI. Codex has no upstream Notification event and is known to silently drop
+// lifecycle hooks (openai/codex#16430); when either hook drops, the phone never learns the session is
+// blocked. This net asks the session's adapter whether the rollout tail shows pending user action and,
+// if so, POSTs the same needsAttention envelope as the direct hook path. See adapter.ts
+// codexTailPendingApproval for the classifier and its rollout-persistence caveat.
 
 /** Gate: should this sweep open the transcript to look for a pending approval on a still-ALIVE session?
  *  Only when the session's adapter offers the classifier (codex; claude yields false), the transcript

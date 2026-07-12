@@ -521,12 +521,11 @@ export function codexLastTurnEvent(text: string): string | null {
 
 // --- Codex pending-approval detection (backstop for a DROPPED PermissionRequest hook) --------
 //
-// On Codex, `needsAttention` (a session blocked on the user approving a tool/patch) hangs off ONE
-// thread: the plugin's PermissionRequest hook. Codex has NO upstream Notification event (unlike
-// Claude Code), and Codex is known to SILENTLY DROP lifecycle hooks (openai/codex#16430). When that
-// hook drops, the phone never learns the session is blocked — the notify backstop only synthesizes a
-// `done` at turn end. This classifier is the watchdog's rollout-tail backstop, mirroring the existing
-// interrupt-correction: it detects an approval REQUEST at the tail with no subsequent resolution.
+// On Codex, `needsAttention` can come from a PermissionRequest hook (tool/patch approval) or the
+// PreToolUse hook for request_user_input (an interactive question). Codex has NO upstream Notification
+// event (unlike Claude Code), and is known to SILENTLY DROP lifecycle hooks (openai/codex#16430).
+// This classifier is the watchdog's rollout-tail backstop: it detects either kind of user-blocking
+// request at the tail with no subsequent resolution.
 //
 // The approval-request events (codex-rs `protocol/src/protocol.rs`, EventMsg is
 // `#[serde(tag="type", rename_all="snake_case")]`):
@@ -534,13 +533,15 @@ export function codexLastTurnEvent(text: string): string | null {
 //     (crate::approvals::ExecApprovalRequestEvent — carries call_id/command/cwd/reason)
 //   - EventMsg::ApplyPatchApprovalRequest → payload.type "apply_patch_approval_request"
 // A pending episode is RESOLVED by the tool result / turn progress that follows the user's decision:
-//   - a function_call_output / custom_tool_call_output ResponseItem (the tool ran, or was denied),
+//   - a function_call_output / custom_tool_call_output ResponseItem (the tool ran, was denied, or the
+//     user answered request_user_input),
 //   - an exec_command_end / patch_apply_end event_msg (the tool finished),
 //   - a task_complete / turn_aborted / task_started event_msg (turn ended / a new turn began),
 //   - a user_message event_msg (the user moved the session on).
 // So "pending" = scanning the tail from the end, the FIRST decisive marker is a request, not a
-// resolution (symmetric with codexLastTurnEvent). Every other line (token_count, agent_message,
-// reasoning, the function_call that PROPOSED the tool, …) is noise and is scanned past.
+// resolution (symmetric with codexLastTurnEvent). A function_call named request_user_input is itself
+// a request because Codex persists that call while the choice UI is open. Every other line
+// (token_count, agent_message, reasoning, ordinary function calls, …) is noise and is scanned past.
 //
 // PERSISTENCE CAVEAT — verified against codex-rs `rollout/src/policy.rs` @ tag `rust-v0.142.5` (the
 // user's installed codex-cli): `should_persist_event_msg` classifies BOTH approval-request events as
@@ -548,12 +549,14 @@ export function codexLastTurnEvent(text: string): string | null {
 // backstop stays DORMANT (returns false on every real rollout — confirmed empirically: 0 approval
 // events across 82 local rollouts, all auto-approved). It is kept as a forward-/other-version- and
 // history-mode-compatible net that costs one already-bounded tail read per sweep and — because it keys
-// ONLY on the explicit request event, never on a bare function_call awaiting its output — can NEVER
-// raise a false needsAttention on a merely long-running (already-approved) command.
+// ONLY on the explicit approval event or a function_call whose name is exactly request_user_input —
+// never on an ordinary function_call awaiting output — so a long-running command cannot false-flag.
 
 /** Codex approval-REQUEST event_msg payload.type values (EventMsg::ExecApprovalRequest /
  *  ApplyPatchApprovalRequest). A trailing one, unresolved, is a pending approval. */
 const CODEX_APPROVAL_REQUEST_EVENTS = new Set(["exec_approval_request", "apply_patch_approval_request"]);
+/** The persisted function call that opens Codex's interactive choice UI and blocks on the user. */
+const CODEX_USER_INPUT_TOOL = "request_user_input";
 /** event_msg payload.type values that RESOLVE a pending approval (the tool finished, or the turn
  *  ended / a new turn began, or the user moved on). */
 const CODEX_APPROVAL_RESOLUTION_EVENTS = new Set(["exec_command_end", "patch_apply_end", "task_complete", "turn_aborted", "task_started", "user_message"]);
@@ -586,8 +589,13 @@ export function codexTailPendingApproval(tail: string): boolean {
     if (r.type === "event_msg") {
       if (CODEX_APPROVAL_REQUEST_EVENTS.has(ptype)) return true;    // last decisive marker is a request → pending
       if (CODEX_APPROVAL_RESOLUTION_EVENTS.has(ptype)) return false; // turn/tool progress → resolved
-    } else if (r.type === "response_item" && CODEX_APPROVAL_RESOLUTION_ITEMS.has(ptype)) {
-      return false; // the tool result landed → the approval was answered
+    } else if (r.type === "response_item") {
+      if (ptype === "function_call" && payload?.name === CODEX_USER_INPUT_TOOL) {
+        return true; // the interactive choice call is persisted before the user answers it
+      }
+      if (CODEX_APPROVAL_RESOLUTION_ITEMS.has(ptype)) {
+        return false; // the tool result landed → the approval/question was answered
+      }
     }
     // anything else (function_call proposing the tool, token_count, agent_message, …) → keep scanning
   }

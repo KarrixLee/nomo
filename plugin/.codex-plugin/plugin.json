@@ -1,13 +1,21 @@
 {
   "name": "nomo",
-  "version": "0.8.7",
+  "version": "0.8.7+codex.20260711001038",
   "description": "Mirror OpenAI Codex sessions to the Nomo iPhone app as a Live Activity. Pair once with your phone via QR code; all session content is end-to-end encrypted (the relay worker is a blind relay and never sees plaintext).",
   "author": {
     "name": "Nomo"
   },
   "homepage": "https://github.com/KarrixLee/nomo",
   "repository": "https://github.com/KarrixLee/nomo",
-  "keywords": ["codex", "openai", "live-activity", "dynamic-island", "ios", "pairing", "e2e"],
+  "keywords": [
+    "codex",
+    "openai",
+    "live-activity",
+    "dynamic-island",
+    "ios",
+    "pairing",
+    "e2e"
+  ],
   "hooks": "./hooks/codex-hooks.json",
   "skills": "./codex-skills/",
   "interface": {
