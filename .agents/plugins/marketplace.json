@@ -8,7 +8,7 @@
       "name": "nomo",
       "source": "./plugin",
       "description": "Mirror Codex sessions to the Nomo iPhone app as an end-to-end-encrypted Live Activity",
-      "version": "0.8.11",
+      "version": "1.0.0",
       "repository": "https://github.com/KarrixLee/nomo"
     }
   ]
