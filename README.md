@@ -14,6 +14,11 @@ session's status — working, needs-your-approval, done — shows up on your pho
 so you can step away from the terminal and still know when an agent needs you or has finished.
 Works with **Codex** in the terminal and the **Codex desktop app** alike.
 
+> [!NOTE]
+> **Platforms:** developed and tested on **macOS** and **Linux**. **Windows is untested** — it may
+> work (the hooks are pure Node built-ins), but nothing on Windows has been verified, so treat it as
+> unsupported for now.
+
 Everything is **end-to-end encrypted**. Pairing is a single QR-code scan (or a short typed code);
 there is no server key to copy. All session content (titles, machine name, status, even *which* agent produced an
 event) rides **inside** an encrypted blob, so the relay Worker that fans out the APNs push is a
