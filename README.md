@@ -8,6 +8,10 @@
 <img src="https://img.shields.io/badge/License-MIT-blue" alt="License: MIT">
 </p>
 
+<p align="center">
+<a href="https://apps.apple.com/app/nomo-ai-status-usage/id6779366830"><img src="assets/app-store-badge.svg" height="48" alt="Download Nomo on the App Store"></a>
+</p>
+
 Mirror your **Claude Code** and **OpenAI Codex** session milestones to the
 **Nomo iPhone app** as a Live Activity (Dynamic Island). A
 session's status — working, needs-your-approval, done — shows up on your phone in real time,
