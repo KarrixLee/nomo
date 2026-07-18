@@ -26,6 +26,7 @@ const OUTDIR = join(HERE, "plugin", "dist");
  *  on stdin. Each is bundled standalone with its local deps inlined. */
 const ENTRYPOINTS = [
   "cc-status.ts",
+  "cc-permission.ts",
   "codex-status.ts",
   "codex-notify.ts",
   "cc-watchdog.ts",
