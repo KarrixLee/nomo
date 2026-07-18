@@ -1,9 +1,13 @@
 import { createRequire } from "node:module";
 var __require = /* @__PURE__ */ createRequire(import.meta.url);
 
-// src/entries/cc-watchdog.ts
+// src/core/permission.ts
+import { access, unlink as unlink3 } from "node:fs/promises";
+import { hostname as hostname2 } from "node:os";
+import { basename as basename3 } from "node:path";
+
+// src/core/hook.ts
 import { readdir as readdir2, readFile as readFile3, unlink as unlink2 } from "node:fs/promises";
-import { readFileSync as readFileSync2, unlinkSync } from "node:fs";
 import { hostname } from "node:os";
 import { basename as basename2 } from "node:path";
 
@@ -1280,68 +1284,282 @@ function adapterFor(agent) {
   return agent === "codex" ? codexAdapter : claudeAdapter;
 }
 var allAdapters = [claudeAdapter, codexAdapter];
-// src/entries/cc-watchdog.ts
-var POLL_MS = 5000;
-var PAIRING_TTL_MS = 600000;
-var SESSION_STALE_MS = 86400000;
-var IDLE_GRACE_MS = 1800000;
-var HEARTBEAT_AFTER_MS = 300000;
-var heartbeatAt = new Map;
-function classifySession(record, now, isAlive) {
-  if (!record || typeof record.pid !== "number" || !Number.isFinite(record.pid))
-    return "delete";
-  if (typeof record.ts !== "number")
-    return "delete";
-  if (now - record.ts > SESSION_STALE_MS)
-    return "stale";
-  return isAlive(record.pid) ? "keep" : "end";
+
+// src/core/hook.ts
+var TOOL_DETAIL = { ...claudeToolDetail, ...codexToolDetail };
+function detailForHook(hookName, toolName) {
+  if (hookName === "PreToolUse")
+    return toolName ? TOOL_DETAIL[toolName] : undefined;
+  if (hookName === "PostToolUse")
+    return "thinking";
+  return;
 }
-function startedAtField(record) {
-  return typeof record.sessionStartedAt === "number" && Number.isFinite(record.sessionStartedAt) ? { startedAt: record.sessionStartedAt } : {};
+function isPermissionNotification(i) {
+  const type = typeof i.notification_type === "string" ? i.notification_type : "";
+  const msg = (typeof i.message === "string" ? i.message : "").toLowerCase();
+  return type === "permission_prompt" || msg.includes("permission") || msg.includes("approve") || msg.includes("allow");
 }
-function buildEndEnvelope(sessionId, now, record) {
-  return { v: 2, sessionId, op: "end", prio: 0, ts: now, ...record ? startedAtField(record) : {} };
+var USER_BLOCKING_TOOLS = new Set(["AskUserQuestion", "ExitPlanMode", "request_user_input"]);
+function planOp(hookName, input, sentDone) {
+  switch (hookName) {
+    case "SessionStart":
+      return sentDone ? { op: "update", prio: 0, status: "working" } : { op: "start", prio: 0, status: "working" };
+    case "PreToolUse": {
+      const tool = typeof input.tool_name === "string" ? input.tool_name : "";
+      return USER_BLOCKING_TOOLS.has(tool) ? { op: "update", prio: 1, status: "needsAttention" } : { op: "update", prio: 0, status: "working" };
+    }
+    case "UserPromptSubmit":
+    case "PostToolUse":
+      return { op: "update", prio: 0, status: "working" };
+    case "Notification":
+      if (!isPermissionNotification(input))
+        return null;
+      return { op: "update", prio: 1, status: "needsAttention" };
+    case "PermissionRequest":
+      return { op: "update", prio: 1, status: "needsAttention" };
+    case "Stop":
+      return { op: "done", prio: 0, status: "done" };
+    case "SessionEnd":
+      return { op: "end", prio: 0, status: "done" };
+    default:
+      return null;
+  }
 }
-async function buildDoneEnvelope(sessionId, record, now, e2eKey, agent = "claude") {
-  const blob = await encryptBlob(e2eKey, {
-    status: "done",
-    title: typeof record.title === "string" ? record.title : "",
-    machine: typeof record.machine === "string" ? record.machine : "",
-    label: typeof record.label === "string" ? record.label : "",
-    ...adapterFor(agent).blobAgentFields,
-    ...typeof record.turnStartedAt === "number" && Number.isFinite(record.turnStartedAt) ? { turnStartedAt: record.turnStartedAt } : {},
-    ...typeof record.model === "string" && record.model.length > 0 ? { model: record.model } : {}
-  });
-  return { v: 2, sessionId, op: "done", prio: 0, ts: now, blob, ...startedAtField(record) };
+var TITLE_SCAN_BYTES = 128 * 1024;
+function transcriptStartMs(prefix) {
+  for (const line of prefix.split(`
+`)) {
+    if (!line.includes('"timestamp"'))
+      continue;
+    let row;
+    try {
+      row = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (typeof row !== "object" || row === null)
+      continue;
+    const ts = row.timestamp;
+    if (typeof ts !== "string")
+      continue;
+    const ms = Date.parse(ts);
+    if (Number.isFinite(ms))
+      return ms;
+  }
+  return;
 }
-async function buildNeedsAttentionEnvelope(sessionId, record, now, e2eKey, agent = "claude") {
-  const blob = await encryptBlob(e2eKey, {
-    status: "needsAttention",
-    title: typeof record.title === "string" ? record.title : "",
-    machine: typeof record.machine === "string" ? record.machine : "",
-    label: typeof record.label === "string" ? record.label : "",
-    ...adapterFor(agent).blobAgentFields,
-    ...typeof record.turnStartedAt === "number" && Number.isFinite(record.turnStartedAt) ? { turnStartedAt: record.turnStartedAt } : {},
-    ...typeof record.model === "string" && record.model.length > 0 ? { model: record.model } : {}
-  });
-  return { v: 2, sessionId, op: "update", prio: 1, ts: now, blob, ...startedAtField(record) };
+function buildBlob(input, machine, title, plan, agent = "claude", turnStartedAt, pinnedLabel, model) {
+  const label = typeof pinnedLabel === "string" && pinnedLabel.length > 0 ? pinnedLabel : typeof input.cwd === "string" && input.cwd.length > 0 ? basename2(input.cwd) : "session";
+  const hookName = typeof input.hook_event_name === "string" ? input.hook_event_name : "";
+  const detail = detailForHook(hookName, typeof input.tool_name === "string" ? input.tool_name : undefined);
+  return {
+    status: plan.status,
+    title: title ?? "",
+    machine,
+    label,
+    ...detail ? { detail } : {},
+    ...agent === "codex" ? { agent: "codex" } : {},
+    ...typeof turnStartedAt === "number" && Number.isFinite(turnStartedAt) ? { turnStartedAt } : {},
+    ...typeof model === "string" && model.length > 0 ? { model } : {}
+  };
 }
-function buildHeartbeatEnvelope(sessionId, record, now, currentPairingId) {
-  if (typeof record.blob !== "string" || record.blob.length === 0)
+async function buildEnvelope(input, machine, now, title, e2eKey, sentDone, agent = "claude", startedAt, turnStartedAt, pinnedLabel, model) {
+  if (typeof input !== "object" || input === null)
     return null;
-  if (currentPairingId !== undefined && record.pairingId !== currentPairingId)
+  const i = input;
+  if (typeof i.session_id !== "string" || i.session_id.length === 0)
     return null;
-  return { v: 2, sessionId, op: record.op ?? "update", prio: record.prio ?? 0, ts: now, blob: record.blob, ...startedAtField(record) };
+  const hookName = typeof i.hook_event_name === "string" ? i.hook_event_name : "";
+  const plan = planOp(hookName, i, sentDone);
+  if (!plan)
+    return null;
+  const base = { v: 2, sessionId: i.session_id, op: plan.op, prio: plan.prio, ts: now };
+  if (typeof startedAt === "number" && Number.isFinite(startedAt))
+    base.startedAt = startedAt;
+  if (plan.op === "end")
+    return base;
+  const blob = await encryptBlob(e2eKey, buildBlob(i, machine, title, plan, agent, turnStartedAt, pinnedLabel, model));
+  return { ...base, blob };
 }
-function postOutcomeForStatus(status) {
-  if (status >= 200 && status < 300)
-    return "delivered";
-  if (status === 404 || status === 410)
-    return "revoked";
-  return "failed";
+function buildPendingStash(input, machine, title, now, pid = process.ppid, agent = "claude", model) {
+  if (typeof input.session_id !== "string" || input.session_id.length === 0)
+    return null;
+  const hookName = typeof input.hook_event_name === "string" ? input.hook_event_name : "";
+  const plan = planOp(hookName, input, false);
+  if (!plan || plan.op === "end")
+    return null;
+  const turnStartedAt = hookName === "UserPromptSubmit" ? Math.floor(now / 1000) : undefined;
+  return { sessionId: input.session_id, op: plan.op, prio: plan.prio, blob: buildBlob(input, machine, title, plan, agent, turnStartedAt, undefined, model), stashedAt: now, pid };
 }
-async function postEvent(config, body) {
+async function stashPendingEvent(input, machine, title, now, stashPath = PENDING_STASH_PATH, pid = process.ppid, agent = "claude", model) {
   try {
+    const stash = buildPendingStash(input, machine, title, now, pid, agent, model);
+    if (!stash)
+      return;
+    await atomicWrite(stashPath, JSON.stringify(stash), 384);
+  } catch {}
+}
+async function trackSession(sessionId, op, prio, status, blob, machine, label, transcript, agent = "claude", sessionStartedAt, turnStartedAt, turnId, title, pairingId, model) {
+  try {
+    const path = `${SESSIONS_DIR}/${sessionId}.json`;
+    if (op === "end") {
+      await unlink2(path).catch(() => {});
+      return;
+    }
+    const record = {
+      pid: process.ppid,
+      machine,
+      label,
+      ts: Date.now(),
+      transcript,
+      lastEvent: op === "start" ? "sessionStart" : status,
+      sentDone: op === "done",
+      op,
+      prio,
+      ...blob ? { blob } : {},
+      ...agent === "codex" ? { agent } : {},
+      ...typeof sessionStartedAt === "number" && Number.isFinite(sessionStartedAt) ? { sessionStartedAt } : {},
+      ...typeof turnStartedAt === "number" && Number.isFinite(turnStartedAt) ? { turnStartedAt } : {},
+      ...typeof turnId === "string" && turnId.length > 0 ? { turnId } : {},
+      ...typeof title === "string" && title.length > 0 ? { title } : {},
+      ...typeof model === "string" && model.length > 0 ? { model } : {},
+      ...typeof pairingId === "string" && pairingId.length > 0 ? { pairingId } : {}
+    };
+    await atomicWrite(path, JSON.stringify(record), 384);
+  } catch {}
+}
+async function reconcileProvisional(config, hookPid) {
+  try {
+    const files = await readdir2(SESSIONS_DIR).catch(() => []);
+    const provisionals = [];
+    for (const f of files) {
+      if (!f.endsWith(".json"))
+        continue;
+      let r;
+      try {
+        r = JSON.parse(await readFile3(`${SESSIONS_DIR}/${f}`, "utf8"));
+      } catch {
+        continue;
+      }
+      if (r.provisional === true && typeof r.pid === "number")
+        provisionals.push({ sessionId: basename2(f, ".json"), pid: r.pid });
+    }
+    if (provisionals.length === 0)
+      return;
+    const sentinel = findProvisionalForPid(provisionals, hookPid, pidAncestors);
+    if (!sentinel)
+      return;
+    let delivered = false;
+    try {
+      const res = await fetch(`${config.url}/v1/cc/event`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-cc-pairing": config.pairingId, "x-cc-auth": config.pcSecret, "x-cc-version": PLUGIN_VERSION },
+        body: JSON.stringify({ v: 2, sessionId: sentinel, op: "end", prio: 0, ts: Date.now() }),
+        signal: AbortSignal.timeout(2000)
+      });
+      delivered = res.ok;
+    } catch {}
+    if (delivered)
+      await unlink2(`${SESSIONS_DIR}/${sentinel}.json`).catch(() => {});
+  } catch {}
+}
+async function readTrackedSessions() {
+  const files = await readdir2(SESSIONS_DIR).catch(() => []);
+  const out = [];
+  for (const f of files) {
+    if (!f.endsWith(".json"))
+      continue;
+    try {
+      const r = JSON.parse(await readFile3(`${SESSIONS_DIR}/${f}`, "utf8"));
+      out.push({ sessionId: basename2(f, ".json"), pid: r.pid, provisional: r.provisional, agent: r.agent });
+    } catch {}
+  }
+  return out;
+}
+async function readStdin() {
+  const chunks = [];
+  for await (const chunk of process.stdin)
+    chunks.push(chunk);
+  return Buffer.concat(chunks).toString("utf8");
+}
+async function runHook(agent) {
+  try {
+    const [config, raw] = await Promise.all([loadConfig(), readStdin()]);
+    const input = JSON.parse(raw);
+    if (typeof input.session_id !== "string" || input.session_id.length === 0)
+      return;
+    if (agent === "claude" && (typeof input.turn_id === "string" && input.turn_id.length > 0 || typeof input.transcript_path === "string" && input.transcript_path.includes("/.codex/"))) {
+      agent = "codex";
+    }
+    const adapter2 = adapterFor(agent);
+    await atomicWrite(lastHookPath(agent), String(Date.now())).catch(() => {});
+    const transcriptPath = typeof input.transcript_path === "string" ? input.transcript_path : "";
+    let prefixCache;
+    const getPrefix = async () => {
+      if (prefixCache !== undefined)
+        return prefixCache;
+      prefixCache = "";
+      if (transcriptPath.length > 0) {
+        try {
+          prefixCache = await readPrefix(transcriptPath, TITLE_SCAN_BYTES);
+        } catch {}
+      }
+      return prefixCache;
+    };
+    const readTitle = async () => adapter2.title({ sessionId: input.session_id, prefix: await getPrefix(), input, transcriptPath });
+    const readModel = async () => adapter2.model?.({ sessionId: input.session_id, prefix: await getPrefix(), input, transcriptPath });
+    if (!config) {
+      const pending = await loadPendingConfig();
+      if (pending) {
+        const machine2 = pending.machineName ?? hostname().replace(/\.local$/, "");
+        await stashPendingEvent(input, machine2, await readTitle(), Date.now(), PENDING_STASH_PATH, process.ppid, agent, await readModel());
+      }
+      return;
+    }
+    const machine = config.machineName ?? hostname().replace(/\.local$/, "");
+    const existingRecord = await readRecord(input.session_id);
+    if (!existingRecord && adapter2.isChildSessionGhost) {
+      const tracked = await readTrackedSessions();
+      if (tracked.length > 0 && adapter2.isChildSessionGhost({
+        sessionId: input.session_id,
+        prefix: await getPrefix(),
+        hookPid: process.ppid,
+        tracked
+      }))
+        return;
+    }
+    if (!existingRecord && adapter2.isInternalSessionGhost && await adapter2.isInternalSessionGhost({
+      sessionId: input.session_id,
+      prefix: await getPrefix(),
+      transcriptPath
+    }))
+      return;
+    if (!existingRecord && adapter2.isHeadlessInvocation && adapter2.isHeadlessInvocation({
+      pid: process.ppid,
+      ancestorsOf: pidAncestors,
+      commandOf: pidCommand
+    }))
+      return;
+    const title = await readTitle() ?? existingRecord?.title;
+    const model = await readModel() ?? existingRecord?.model;
+    const sentDone = existingRecord?.sentDone === true;
+    const cachedStart = typeof existingRecord?.sessionStartedAt === "number" && Number.isFinite(existingRecord.sessionStartedAt) ? existingRecord.sessionStartedAt : undefined;
+    const startedAt = cachedStart ?? transcriptStartMs(await getPrefix());
+    const hookName = typeof input.hook_event_name === "string" ? input.hook_event_name : "";
+    const cachedTurn = typeof existingRecord?.turnStartedAt === "number" && Number.isFinite(existingRecord.turnStartedAt) ? existingRecord.turnStartedAt : undefined;
+    const turnStartedAt = hookName === "UserPromptSubmit" ? Math.floor(Date.now() / 1000) : cachedTurn;
+    const turnId = typeof input.turn_id === "string" && input.turn_id.length > 0 ? input.turn_id : undefined;
+    const plan = planOp(hookName, input, sentDone);
+    if (!plan)
+      return;
+    const label = typeof existingRecord?.label === "string" && existingRecord.label.length > 0 ? existingRecord.label : typeof input.cwd === "string" && input.cwd.length > 0 ? basename2(input.cwd) : "session";
+    const envelope = await buildEnvelope(input, machine, Date.now(), title, config.e2eKey, sentDone, agent, startedAt, turnStartedAt, label, model);
+    if (!envelope)
+      return;
+    await trackSession(input.session_id, plan.op, plan.prio, plan.status, envelope.blob, machine, label, transcriptPath, agent, startedAt, turnStartedAt, turnId, title, config.pairingId, model);
+    ensureWatchdog();
+    if (agent === "codex")
+      await reconcileProvisional(config, process.ppid);
     const res = await fetch(`${config.url}/v1/cc/event`, {
       method: "POST",
       headers: {
@@ -1350,566 +1568,199 @@ async function postEvent(config, body) {
         "x-cc-auth": config.pcSecret,
         "x-cc-version": PLUGIN_VERSION
       },
-      body: JSON.stringify(body),
+      body: JSON.stringify(envelope),
       signal: AbortSignal.timeout(2000)
     });
-    return postOutcomeForStatus(res.status);
-  } catch {
-    return "failed";
+    if (res.ok) {
+      await atomicWrite(LAST_SEND_PATH, String(Date.now()));
+      await resetGoneStrikes();
+    } else if (res.status === 404 || res.status === 410) {
+      const strikes = await recordGoneStrike();
+      if (strikes >= GONE_STRIKE_LIMIT) {
+        await removeRevokedConfig();
+        process.stderr.write(`[nomo-cc] pairing gone server-side (HTTP ${res.status}) — removed local pairing; re-pair with \`nomo-cc pair\` to reconnect
+`);
+      }
+    } else {
+      await resetGoneStrikes();
+    }
+  } catch {}
+}
+
+// src/core/permission.ts
+var NO_HOLD_PATH = `${CC_DIR}/no-hold`;
+var POLL_INTERVAL_MS = 3000;
+var FETCH_TIMEOUT_MS = 2000;
+var MAX_CONSECUTIVE_MISSES = 100;
+var ALLOW_LINE = JSON.stringify({ hookSpecificOutput: { hookEventName: "PermissionRequest", decision: { behavior: "allow" } } });
+var DENY_LINE = JSON.stringify({ hookSpecificOutput: { hookEventName: "PermissionRequest", decision: { behavior: "deny", message: "Denied from phone" } } });
+function buildPermissionSummary(toolName, toolInput) {
+  const str = (v) => typeof v === "string" && v.length > 0 ? v : undefined;
+  const truncate = (s, n = 80) => s.length <= n ? s : `${s.slice(0, n - 1)}…`;
+  switch (toolName) {
+    case "Bash": {
+      const cmd = str(toolInput.command);
+      return cmd ? truncate(cmd.split(`
+`)[0]) : toolName;
+    }
+    case "Edit":
+    case "Write":
+    case "Read":
+    case "NotebookEdit": {
+      const fp = str(toolInput.file_path);
+      return fp ? basename3(fp) : toolName;
+    }
+    case "WebFetch":
+    case "WebSearch": {
+      const url = str(toolInput.url);
+      if (url) {
+        try {
+          return new URL(url).host;
+        } catch {}
+      }
+      const query = str(toolInput.query);
+      return query ? truncate(query) : toolName;
+    }
+    default: {
+      if (/^mcp__/.test(toolName)) {
+        const seg = toolName.split("__").pop();
+        return seg && seg.length > 0 ? seg : toolName;
+      }
+      return toolName;
+    }
   }
 }
-function machineName(config) {
-  return config.machineName ?? hostname().replace(/\.local$/, "");
+async function readStdin2() {
+  const chunks = [];
+  for await (const chunk of process.stdin)
+    chunks.push(chunk);
+  return Buffer.concat(chunks).toString("utf8");
 }
-async function readAllRecordEntries() {
+async function flagExists(path) {
   try {
-    const files = await readdir2(SESSIONS_DIR);
-    const out = [];
-    for (const f of files) {
-      if (!f.endsWith(".json"))
-        continue;
-      try {
-        out.push({ sessionId: basename2(f, ".json"), rec: JSON.parse(await readFile3(`${SESSIONS_DIR}/${f}`, "utf8")) });
-      } catch {}
-    }
-    return out;
-  } catch {
-    return [];
-  }
-}
-async function readAllRecords() {
-  return (await readAllRecordEntries()).map((e) => e.rec);
-}
-async function buildProvisionalBlob(d, machine, blobAgentFields, e2eKey) {
-  return encryptBlob(e2eKey, { status: d.idle === true ? "done" : "working", title: d.title ?? "", machine, label: d.label, ...blobAgentFields });
-}
-function buildProvisionalEnvelope(sessionId, blob, now, idle) {
-  return { v: 2, sessionId, op: idle ? "done" : "start", prio: 0, ts: now, blob };
-}
-function buildStartEnvelope(sessionId, blob, now) {
-  return buildProvisionalEnvelope(sessionId, blob, now, false);
-}
-function buildProvisionalRecord(d, machine, blob, blobAgentFields, now, pairingId, idle = false) {
-  return {
-    pid: d.pid,
-    machine,
-    label: d.label,
-    ts: now,
-    lastEvent: idle ? "done" : "sessionStart",
-    op: idle ? "done" : "start",
-    ...idle ? { sentDone: true } : {},
-    prio: 0,
-    blob,
-    provisional: true,
-    ...typeof d.title === "string" && d.title.length > 0 ? { title: d.title } : {},
-    ...blobAgentFields,
-    ...typeof pairingId === "string" && pairingId.length > 0 ? { pairingId } : {}
-  };
-}
-async function discoverLiveSessions(config, deps = {}) {
-  const adapters = deps.adapters ?? allAdapters;
-  const post = deps.post ?? ((body) => postEvent(config, body));
-  const readRecords = deps.readRecords ?? readAllRecords;
-  const writeRecord = deps.writeRecord ?? ((sessionId, rec) => atomicWrite(`${SESSIONS_DIR}/${sessionId}.json`, JSON.stringify(rec), 384));
-  const now = deps.now ?? Date.now;
-  const machine = machineName(config);
-  const known = await readRecords();
-  for (const adapter of adapters) {
-    if (!adapter.discoverLive)
-      continue;
-    let discovered;
-    try {
-      discovered = await adapter.discoverLive(known);
-    } catch {
-      continue;
-    }
-    for (const d of discovered) {
-      const ts = now();
-      const idle = d.idle === true;
-      const blob = await buildProvisionalBlob(d, machine, adapter.blobAgentFields, config.e2eKey);
-      const outcome = await post(buildProvisionalEnvelope(d.sessionId, blob, ts, idle));
-      if (outcome !== "delivered")
-        continue;
-      await writeRecord(d.sessionId, buildProvisionalRecord(d, machine, blob, adapter.blobAgentFields, ts, config.pairingId, idle));
-    }
-  }
-}
-function provisionalsCoveredByReal(entries) {
-  const realCodexPids = new Set(entries.filter((e) => e.rec.provisional !== true && e.rec.agent === "codex" && typeof e.rec.pid === "number").map((e) => e.rec.pid));
-  return entries.filter((e) => e.rec.provisional === true && typeof e.rec.pid === "number" && realCodexPids.has(e.rec.pid)).map((e) => e.sessionId);
-}
-async function reconcileProvisionalsSweep(config, deps = {}) {
-  const post = deps.post ?? ((body) => postEvent(config, body));
-  const readEntries = deps.readEntries ?? readAllRecordEntries;
-  const deleteRecord = deps.deleteRecord ?? ((sessionId) => unlink2(`${SESSIONS_DIR}/${sessionId}.json`).catch(() => {}));
-  const now = deps.now ?? Date.now;
-  const entries = await readEntries();
-  for (const sessionId of provisionalsCoveredByReal(entries)) {
-    const outcome = await post(buildEndEnvelope(sessionId, now()));
-    if (outcome === "delivered")
-      await deleteRecord(sessionId);
-  }
-}
-var INTERRUPT_TAIL_BYTES = 8 * 1024;
-var WORKING_STALE_MS = 20000;
-function tailShowsInterrupt(tail, agent) {
-  return adapterFor(agent).detectInterrupt(tail);
-}
-function shouldInterruptCheck(record, now) {
-  if (typeof record.transcript !== "string" || record.transcript.length === 0)
-    return false;
-  if (record.lastEvent === "needsAttention")
+    await access(path);
     return true;
-  if (record.lastEvent === "working") {
-    return typeof record.ts === "number" && now - record.ts > WORKING_STALE_MS;
+  } catch {
+    return false;
   }
-  return false;
 }
-async function correctInterrupt(config, path, sessionId, record, now) {
+async function runPermissionHook(deps = {}) {
+  const noHoldPath = deps.noHoldPath ?? NO_HOLD_PATH;
   try {
-    if (!shouldInterruptCheck(record, now))
-      return "uncorrected";
-    let tail;
-    try {
-      tail = await readSuffix(record.transcript, INTERRUPT_TAIL_BYTES);
-    } catch {
-      return "uncorrected";
+    if (await flagExists(noHoldPath)) {
+      await (deps.delegate ?? (() => runHook("claude")))();
+      return;
     }
-    const agent = record.agent === "codex" ? "codex" : "claude";
-    if (!tailShowsInterrupt(tail, agent))
-      return "uncorrected";
-    const outcome = await postEvent(config, await buildDoneEnvelope(sessionId, record, Date.now(), config.e2eKey, agent));
-    if (outcome === "revoked")
-      return "revoked";
-    if (outcome !== "delivered")
-      return "uncorrected";
+    const [config, raw] = await Promise.all([
+      (deps.loadConfigFn ?? loadConfig)(),
+      (deps.readInput ?? readStdin2)()
+    ]);
+    if (!config)
+      return;
+    const input = JSON.parse(raw);
+    const sessionId = typeof input.session_id === "string" ? input.session_id : "";
+    if (sessionId.length === 0)
+      return;
+    const toolName = typeof input.tool_name === "string" ? input.tool_name : "";
+    const toolInput = typeof input.tool_input === "object" && input.tool_input !== null ? input.tool_input : {};
+    const requestId = (deps.randomUUID ?? (() => crypto.randomUUID()))();
+    const summary = buildPermissionSummary(toolName, toolInput);
+    const now = (deps.now ?? Date.now)();
+    const fetchFn = deps.fetchFn ?? fetch;
+    const record = await (deps.readRecordFn ?? readRecord)(sessionId);
+    const machine = config.machineName ?? hostname2().replace(/\.local$/, "");
+    const plan = { op: "update", prio: 1, status: "needsAttention" };
+    const base = buildBlob(input, machine, record?.title, plan, "claude", record?.turnStartedAt, record?.label, record?.model);
+    const blob = await encryptBlob(config.e2eKey, { ...base, status: "decisionPending", permissionSummary: summary, permissionRequestId: requestId });
+    const fallbackBlob = await encryptBlob(config.e2eKey, base);
+    const pcHeaders = { "x-cc-pairing": config.pairingId, "x-cc-auth": config.pcSecret, "x-cc-version": PLUGIN_VERSION };
+    let hold = false;
     try {
-      const next = { ...record, lastEvent: "done", sentDone: true, op: "done" };
-      await atomicWrite(path, JSON.stringify(next), 384);
-    } catch {}
-    return "corrected";
-  } catch {
-    return "uncorrected";
-  }
-}
-function shouldPendingApprovalCheck(record, adapter) {
-  if (!adapter.tailShowsPendingApproval)
-    return false;
-  if (typeof record.transcript !== "string" || record.transcript.length === 0)
-    return false;
-  if (record.lastEvent === "needsAttention")
-    return false;
-  if (record.lastEvent === "done" || record.op === "done")
-    return false;
-  return true;
-}
-async function correctPendingApproval(config, path, sessionId, record, now) {
-  try {
-    const agent = record.agent === "codex" ? "codex" : "claude";
-    const adapter = adapterFor(agent);
-    if (!shouldPendingApprovalCheck(record, adapter))
-      return "uncorrected";
-    let tail;
-    try {
-      tail = await readSuffix(record.transcript, INTERRUPT_TAIL_BYTES);
+      const res = await fetchFn(`${config.url}/v1/cc/decision`, {
+        method: "POST",
+        headers: { "content-type": "application/json", ...pcHeaders },
+        body: JSON.stringify({ v: 2, sessionId, requestId, op: "update", prio: 1, ts: now, blob, fallbackBlob }),
+        signal: AbortSignal.timeout(FETCH_TIMEOUT_MS)
+      });
+      if (res.ok)
+        hold = (await res.json()).hold === true;
     } catch {
-      return "uncorrected";
+      return;
     }
-    if (!adapter.tailShowsPendingApproval(tail))
-      return "uncorrected";
-    const outcome = await postEvent(config, await buildNeedsAttentionEnvelope(sessionId, record, Date.now(), config.e2eKey, agent));
-    if (outcome === "revoked")
-      return "revoked";
-    if (outcome !== "delivered")
-      return "uncorrected";
-    try {
-      const next = { ...record, lastEvent: "needsAttention", op: "update", prio: 1, sentDone: false };
-      await atomicWrite(path, JSON.stringify(next), 384);
-    } catch {}
-    return "corrected";
-  } catch {
-    return "uncorrected";
-  }
-}
-function shouldIdleProvisionalCheck(record, adapter) {
-  if (!adapter.pidTurnActive)
-    return false;
-  if (record.provisional !== true)
-    return false;
-  if (record.op === "done" || record.lastEvent === "done")
-    return false;
-  if (typeof record.pid !== "number" || !Number.isFinite(record.pid))
-    return false;
-  return true;
-}
-async function correctIdleProvisional(config, path, sessionId, record) {
-  try {
-    const agent = record.agent === "codex" ? "codex" : "claude";
-    const adapter = adapterFor(agent);
-    if (!shouldIdleProvisionalCheck(record, adapter))
-      return "uncorrected";
-    let active = false;
-    try {
-      active = await adapter.pidTurnActive(record.pid);
-    } catch {}
-    if (active)
-      return "uncorrected";
-    const outcome = await postEvent(config, await buildDoneEnvelope(sessionId, record, Date.now(), config.e2eKey, agent));
-    if (outcome === "revoked")
-      return "revoked";
-    if (outcome !== "delivered")
-      return "uncorrected";
-    try {
-      const next = { ...record, lastEvent: "done", sentDone: true, op: "done" };
-      await atomicWrite(path, JSON.stringify(next), 384);
-    } catch {}
-    return "corrected";
-  } catch {
-    return "uncorrected";
-  }
-}
-var CLAUDE_IDLE_REAP_MS = 1800000;
-function isClaudeIdleReapEligible(record, now) {
-  if (record.agent === "codex")
-    return false;
-  if (record.provisional === true)
-    return false;
-  if (record.lastEvent !== "working" && record.lastEvent !== "sessionStart")
-    return false;
-  if (typeof record.ts !== "number")
-    return false;
-  return now - record.ts >= CLAUDE_IDLE_REAP_MS;
-}
-async function correctIdleClaude(config, path, sessionId, record, now) {
-  try {
-    if (!isClaudeIdleReapEligible(record, now))
-      return "uncorrected";
-    const outcome = await postEvent(config, await buildDoneEnvelope(sessionId, record, Date.now(), config.e2eKey, "claude"));
-    if (outcome === "revoked")
-      return "revoked";
-    if (outcome !== "delivered")
-      return "uncorrected";
-    try {
-      const next = { ...record, lastEvent: "done", sentDone: true, op: "done" };
-      await atomicWrite(path, JSON.stringify(next), 384);
-    } catch {}
-    return "corrected";
-  } catch {
-    return "uncorrected";
-  }
-}
-var TITLE_REPAIR_HEAD_BYTES = 128 * 1024;
-function statusFromRecord(record) {
-  if (record.lastEvent === "needsAttention")
-    return "needsAttention";
-  if (record.lastEvent === "done")
-    return "done";
-  return "working";
-}
-async function buildTitleRepairEnvelope(sessionId, record, title, now, e2eKey, agent = "codex") {
-  const blob = await encryptBlob(e2eKey, {
-    status: statusFromRecord(record),
-    title,
-    machine: typeof record.machine === "string" ? record.machine : "",
-    label: typeof record.label === "string" ? record.label : "",
-    ...adapterFor(agent).blobAgentFields,
-    ...typeof record.turnStartedAt === "number" && Number.isFinite(record.turnStartedAt) ? { turnStartedAt: record.turnStartedAt } : {},
-    ...typeof record.model === "string" && record.model.length > 0 ? { model: record.model } : {}
-  });
-  return { v: 2, sessionId, op: record.op ?? "update", prio: record.prio ?? 0, ts: now, blob, ...startedAtField(record) };
-}
-function shouldRepairTitle(record) {
-  if (record.agent !== "codex")
-    return false;
-  if (record.provisional === true)
-    return false;
-  return typeof record.title !== "string" || record.title.length === 0;
-}
-function titleRepairedRecord(record, title, blob, pairingId) {
-  return { ...record, title, blob, ...pairingId.length > 0 ? { pairingId } : {} };
-}
-async function repairTitle(config, path, sessionId, record) {
-  try {
-    if (!shouldRepairTitle(record))
-      return "uncorrected";
-    let prefix = "";
-    if (typeof record.transcript === "string" && record.transcript.length > 0) {
+    if (!hold)
+      return;
+    const sleep = deps.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
+    const jitter = deps.jitter ?? (() => Math.floor(Math.random() * 500));
+    const interval = deps.pollIntervalMs ?? POLL_INTERVAL_MS;
+    const emit = deps.emit ?? ((line) => process.stdout.write(`${line}
+`));
+    let misses = 0;
+    for (;; ) {
+      let data;
       try {
-        prefix = await readPrefix(record.transcript, TITLE_REPAIR_HEAD_BYTES);
+        const res = await fetchFn(`${config.url}/v1/cc/decision/${requestId}`, {
+          headers: pcHeaders,
+          signal: AbortSignal.timeout(FETCH_TIMEOUT_MS)
+        });
+        if (res.ok)
+          data = await res.json();
       } catch {}
+      if (data) {
+        misses = 0;
+        if (data.status === "answered" && typeof data.answerBlob === "string") {
+          const answer = await decryptBlob(config.e2eKey, data.answerBlob);
+          if (answer.requestId === requestId) {
+            if (answer.decision === "allow")
+              emit(ALLOW_LINE);
+            else if (answer.decision === "deny")
+              emit(DENY_LINE);
+          }
+          return;
+        }
+        if (typeof data.status === "string" && data.status !== "pending")
+          return;
+      } else if (++misses >= MAX_CONSECUTIVE_MISSES) {
+        return;
+      }
+      await sleep(interval + jitter());
     }
-    const title = await codexAdapter.title({ sessionId, prefix, input: {}, transcriptPath: record.transcript });
-    if (!title)
-      return "uncorrected";
-    const envelope = await buildTitleRepairEnvelope(sessionId, record, title, Date.now(), config.e2eKey, "codex");
-    const outcome = await postEvent(config, envelope);
-    if (outcome === "revoked")
-      return "revoked";
-    if (outcome !== "delivered")
-      return "uncorrected";
-    try {
-      const next = titleRepairedRecord(record, title, envelope.blob, config.pairingId);
-      await atomicWrite(path, JSON.stringify(next), 384);
-    } catch {}
-    return "corrected";
-  } catch {
-    return "uncorrected";
-  }
+  } catch {}
 }
-function shouldHeartbeat(record, now, lastHeartbeat, correctedThisSweep) {
-  if (record.op === "done")
-    return false;
-  if (isClaudeIdleReapEligible(record, now))
-    return false;
-  if (correctedThisSweep)
-    return false;
-  if (typeof record.ts !== "number")
-    return false;
-  if (now - record.ts < HEARTBEAT_AFTER_MS)
-    return false;
-  if (lastHeartbeat !== undefined && now - lastHeartbeat < HEARTBEAT_AFTER_MS)
-    return false;
-  return true;
-}
-async function sweep(config) {
-  let files;
-  try {
-    files = await readdir2(SESSIONS_DIR);
-  } catch {
-    return { revoked: false, remaining: 0, delivered: false };
-  }
-  const now = Date.now();
-  let remaining = 0;
-  let delivered = false;
-  for (const file of files) {
-    if (!file.endsWith(".json"))
-      continue;
-    const path = `${SESSIONS_DIR}/${file}`;
-    const sessionId = basename2(file, ".json");
-    let record = null;
+async function approvalsCommand(sub, deps = {}) {
+  const path = deps.noHoldPath ?? NO_HOLD_PATH;
+  const print = deps.print ?? ((line) => console.log(line));
+  const exists = async () => {
     try {
-      record = JSON.parse(await readFile3(path, "utf8"));
+      await access(path);
+      return true;
     } catch {
-      record = null;
-    }
-    const verdict = classifySession(record, now, pidAlive);
-    if (verdict === "keep") {
-      remaining++;
-      if (config && record) {
-        const idleFix = await correctIdleProvisional(config, path, sessionId, record);
-        if (idleFix === "revoked")
-          return { revoked: true };
-        if (idleFix === "corrected")
-          delivered = true;
-        const corrected = await correctInterrupt(config, path, sessionId, record, now);
-        if (corrected === "revoked")
-          return { revoked: true };
-        if (corrected === "corrected")
-          delivered = true;
-        let flaggedAttention = false;
-        if (corrected !== "corrected") {
-          const attn = await correctPendingApproval(config, path, sessionId, record, now);
-          if (attn === "revoked")
-            return { revoked: true };
-          if (attn === "corrected") {
-            delivered = true;
-            flaggedAttention = true;
-          }
-        }
-        let reapedIdle = false;
-        if (idleFix !== "corrected" && corrected !== "corrected" && !flaggedAttention) {
-          const idleClaude = await correctIdleClaude(config, path, sessionId, record, now);
-          if (idleClaude === "revoked")
-            return { revoked: true };
-          if (idleClaude === "corrected") {
-            delivered = true;
-            reapedIdle = true;
-          }
-        }
-        let repairedTitle = false;
-        if (idleFix !== "corrected" && corrected !== "corrected" && !flaggedAttention && !reapedIdle) {
-          const titleFix = await repairTitle(config, path, sessionId, record);
-          if (titleFix === "revoked")
-            return { revoked: true };
-          if (titleFix === "corrected") {
-            delivered = true;
-            repairedTitle = true;
-          }
-        }
-        if (shouldHeartbeat(record, now, heartbeatAt.get(sessionId), idleFix === "corrected" || corrected === "corrected" || flaggedAttention || reapedIdle || repairedTitle)) {
-          const beat = buildHeartbeatEnvelope(sessionId, record, Date.now(), config.pairingId);
-          if (beat) {
-            const outcome = await postEvent(config, beat);
-            if (outcome === "revoked")
-              return { revoked: true };
-            if (outcome === "delivered") {
-              heartbeatAt.set(sessionId, now);
-              delivered = true;
-            }
-          }
-        }
-      }
-      continue;
-    }
-    if (verdict === "end" && config && record) {
-      const outcome = await postEvent(config, buildEndEnvelope(sessionId, now, record));
-      if (outcome === "revoked")
-        return { revoked: true };
-      if (outcome !== "delivered") {
-        remaining++;
-        continue;
-      }
-      delivered = true;
-    }
-    if (verdict === "stale" && config && record) {
-      const outcome = await postEvent(config, buildEndEnvelope(sessionId, now, record));
-      if (outcome === "revoked")
-        return { revoked: true };
-      if (outcome === "delivered")
-        delivered = true;
-    }
-    heartbeatAt.delete(sessionId);
-    try {
-      await unlink2(path);
-    } catch {}
-  }
-  return { revoked: false, remaining, delivered };
-}
-async function goneStrikeShouldTeardown(goneStrikesPath) {
-  return await recordGoneStrike(goneStrikesPath) >= GONE_STRIKE_LIMIT;
-}
-async function claimSingleInstance() {
-  try {
-    const holder = Number.parseInt(readFileSync2(WATCHDOG_PID_PATH, "utf8").trim(), 10);
-    if (Number.isFinite(holder) && holder !== process.pid && pidAlive(holder))
       return false;
-  } catch {}
-  await atomicWrite(WATCHDOG_PID_PATH, String(process.pid));
-  return true;
-}
-function releaseSingleInstance() {
-  try {
-    const holder = Number.parseInt(readFileSync2(WATCHDOG_PID_PATH, "utf8").trim(), 10);
-    if (holder === process.pid)
-      unlinkSync(WATCHDOG_PID_PATH);
-  } catch {}
-}
-function pendingPairingExpired(pending, now, fallbackDeadline) {
-  const deadline = typeof pending.createdAt === "number" ? pending.createdAt + PAIRING_TTL_MS : fallbackDeadline;
-  return now >= deadline;
-}
-async function removePendingConfig() {
-  try {
-    await unlink2(`${CC_DIR}/config.json`);
-  } catch {}
-  await unlink2(`${CC_DIR}/${PAIR_HTML_FILE}`).catch(() => {});
-}
-async function selfHealPairing(pending) {
-  let result;
-  try {
-    result = await completePendingPairing(pending, `${CC_DIR}/config.json`, { fetchTimeoutMs: 2000, ackAttempts: 1 });
-  } catch {
-    return "continue";
-  }
-  if (result.state === "gone" || result.state === "already-completed") {
-    return await loadConfig() ? "stop" : "cleanup";
-  }
-  if (result.state === "rejected" || result.state === "tampered")
-    return "stop";
-  return "continue";
-}
-async function run() {
-  if (!await claimSingleInstance())
-    return;
-  const fallbackDeadline = Date.now() + PAIRING_TTL_MS;
-  let lastActiveMs = Date.now();
-  try {
-    while (true) {
-      const config = await loadConfig();
-      if (config) {
-        await reconcileProvisionalsSweep(config);
-        await discoverLiveSessions(config);
-      }
-      const result = await sweep(config);
-      if (result.revoked) {
-        if (await goneStrikeShouldTeardown()) {
-          await removeRevokedConfig();
-          return;
-        }
-        await new Promise((r) => setTimeout(r, POLL_MS));
-        continue;
-      }
-      if (result.delivered)
-        await resetGoneStrikes();
-      const remaining = result.remaining;
-      if (!config) {
-        const pending = await loadPendingConfig();
-        if (!pending) {
-          return;
-        }
-        if (pendingPairingExpired(pending, Date.now(), fallbackDeadline)) {
-          await removePendingConfig();
-          return;
-        }
-        const verdict = await selfHealPairing(pending);
-        if (verdict === "stop")
-          return;
-        if (verdict === "cleanup") {
-          await removePendingConfig();
-          return;
-        }
-        await new Promise((r) => setTimeout(r, POLL_MS));
-        continue;
-      }
-      const nowMs = Date.now();
-      if (remaining > 0)
-        lastActiveMs = nowMs;
-      if (remaining === 0) {
-        if (!config || nowMs - lastActiveMs >= IDLE_GRACE_MS)
-          return;
-      }
-      await new Promise((r) => setTimeout(r, POLL_MS));
     }
-  } finally {
-    releaseSingleInstance();
+  };
+  if (sub === "off") {
+    await atomicWrite(path, "", 384);
+    print("Remote approvals are OFF for this computer — Claude Code permission prompts will appear in the terminal as usual (your phone is not asked).");
+    return 0;
   }
+  if (sub === "on") {
+    await unlink3(path).catch(() => {});
+    print("Remote approvals are ON for this computer — when a session is on your phone's Live Activity, its permission prompts are sent to the phone to Allow or Deny.");
+    return 0;
+  }
+  print(await exists() ? "Remote approvals: OFF (paused locally) — permission prompts appear in the terminal. Run `on` to resume." : "Remote approvals: ON — permission prompts for phone-attached sessions are sent to your phone. Run `off` to pause them here.");
+  return 0;
 }
+
+// src/entries/cc-permission.ts
 if (__require.main == __require.module) {
-  try {
-    await run();
-  } catch {}
+  if (process.argv.includes("--check")) {
+    console.log("usage: cc-permission [off|on|status]  — PermissionRequest hook; off/on/status toggle the local no-hold escape hatch (pause/resume remote approvals on this computer)");
+    process.exit(0);
+  }
+  const sub = process.argv[2];
+  if (sub === "off" || sub === "on" || sub === "status") {
+    process.exit(await approvalsCommand(sub));
+  }
+  await runPermissionHook();
   process.exit(0);
 }
-export {
-  titleRepairedRecord,
-  tailShowsInterrupt,
-  shouldRepairTitle,
-  shouldPendingApprovalCheck,
-  shouldInterruptCheck,
-  shouldIdleProvisionalCheck,
-  shouldHeartbeat,
-  reconcileProvisionalsSweep,
-  provisionalsCoveredByReal,
-  postOutcomeForStatus,
-  pendingPairingExpired,
-  lastTurnLine,
-  isClaudeIdleReapEligible,
-  hasInterruptMarker,
-  goneStrikeShouldTeardown,
-  discoverLiveSessions,
-  codexTailPendingApproval,
-  codexLastTurnEvent,
-  claudeTailPendingApproval,
-  classifySession,
-  buildTitleRepairEnvelope,
-  buildStartEnvelope,
-  buildProvisionalRecord,
-  buildProvisionalEnvelope,
-  buildProvisionalBlob,
-  buildNeedsAttentionEnvelope,
-  buildHeartbeatEnvelope,
-  buildEndEnvelope,
-  buildDoneEnvelope,
-  PAIRING_TTL_MS,
-  IDLE_GRACE_MS
-};

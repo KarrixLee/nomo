@@ -74,13 +74,21 @@ async function encryptBlob(key, plaintext) {
   const iv = crypto.getRandomValues(new Uint8Array(12));
   return bytesToBase64(await sealCombined(key, plaintext, iv));
 }
+async function decryptBlob(key, blob) {
+  const combined = base64ToBytes(blob);
+  const iv = combined.slice(0, 12);
+  const ciphertext = combined.slice(12);
+  const cryptoKey = await crypto.subtle.importKey("raw", key, "AES-GCM", false, ["decrypt"]);
+  const plaintext = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, cryptoKey, ciphertext);
+  return JSON.parse(textDecoder.decode(plaintext));
+}
 async function sha256Hex(s) {
   const digest = await crypto.subtle.digest("SHA-256", textEncoder.encode(s));
   return Array.from(new Uint8Array(digest)).map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
 // src/core/shared.ts
-var PLUGIN_VERSION = "1.0.0";
+var PLUGIN_VERSION = "1.1.0";
 var CC_DIR = `${process.env.HOME}/.config/cc-status`;
 var SESSIONS_DIR = `${CC_DIR}/sessions`;
 var WATCHDOG_PID_PATH = `${CC_DIR}/watchdog.pid`;
