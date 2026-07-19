@@ -52,6 +52,12 @@ const POST_RETRY_PAUSE_MS = 1_000;
  *  ONCE: a hold:false POST stores NO server record, so the re-POST is a fresh gate evaluation that now
  *  sees the shown session. Injectable via the sleep dep. */
 const HOLD_RETRY_DELAY_MS = 4_000;
+/** The auto-add race is only possible while a session is YOUNG: the app adds a session to the island
+ *  within a second or two of its first hook, so only a session whose local SessionRecord is this fresh
+ *  (or which has no record yet — brand-new, not even tracked) can still be mid-add when its first
+ *  permission prompt fires. Older, established sessions that come back {hold:false} are genuinely not on
+ *  the phone, so they must NOT pay the HOLD_RETRY_DELAY_MS tax on every prompt — they fall open at once. */
+const FRESH_SESSION_MS = 60_000;
 /** Give-up cap: this many consecutive polls without a 2xx (~5 min of sustained failure) → the worker
  *  is unreachable → exit silently (fail open, terminal dialog after Esc/retry). A successful poll —
  *  including a plain {status:"pending"} — resets the counter, so a healthy hold is unbounded. */
@@ -274,10 +280,16 @@ export async function runPermissionHook(deps: PermissionHookDeps = {}): Promise<
     trace({ event: "hold", hold });
     if (!hold) {
       // hold:false on the FIRST ask is usually genuine (session not on the phone), but a brand-new
-      // session's first prompt can lose a race with the app's island auto-add. Wait once, then re-POST
-      // the SAME requestId/blobs (single attempt, no transport retry): a hold:false POST stored no
-      // record, so this is a clean fresh gate evaluation. hold:true now → the session showed up, fall
-      // through to the poll loop; still hold:false (or a transport error) → the genuine fall-open.
+      // session's first prompt can lose a race with the app's island auto-add. Re-ask ONLY when that
+      // race is still possible — no local record yet, or the record is younger than FRESH_SESSION_MS;
+      // an established session that says hold:false is genuinely off the phone and exits AT ONCE (no 4s
+      // tax on every prompt).
+      const fresh = !record || (now - record.ts) < FRESH_SESSION_MS;
+      if (!fresh) { trace({ event: "exit", reason: "hold-false" }); return; } // established session → instant terminal dialog
+      // Wait once, then re-POST the SAME requestId/blobs (single attempt, no transport retry): a
+      // hold:false POST stored no record, so this is a clean fresh gate evaluation. hold:true now → the
+      // session showed up, fall through to the poll loop; still hold:false (or a transport error) → the
+      // genuine fall-open.
       trace({ event: "hold-retry-wait", delayMs: HOLD_RETRY_DELAY_MS });
       await sleep(HOLD_RETRY_DELAY_MS);
       const retry = await postDecision(2, 1);

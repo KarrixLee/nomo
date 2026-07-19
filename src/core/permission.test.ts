@@ -99,6 +99,31 @@ describe("runPermissionHook — hold state machine", () => {
     expect(emitted).toEqual([]);
   });
 
+  test("hold=false + ESTABLISHED session (record ts 10 min old) → exactly 1 POST, immediate silent exit", async () => {
+    const emitted: string[] = [];
+    const { fn, calls } = scriptFetch(false, []);
+    const record = { pid: 1, machine: "m", label: "l", ts: 1_000_000 - 10 * 60_000 }; // well past FRESH_SESSION_MS
+    await runPermissionHook(baseDeps({
+      fetchFn: fn, emit: (l: string) => emitted.push(l),
+      now: () => 1_000_000, readRecordFn: async () => record,
+    }) as never);
+    expect(calls.filter((c) => c.method === "POST").length).toBe(1); // NO re-ask — established session falls open at once
+    expect(calls.filter((c) => c.method === "GET").length).toBe(0);
+    expect(emitted).toEqual([]);
+  });
+
+  test("hold=false + FRESH session (record ts 5 s old) → re-asks (2 POSTs)", async () => {
+    const emitted: string[] = [];
+    const { fn, calls } = scriptFetch(false, []);
+    const record = { pid: 1, machine: "m", label: "l", ts: 1_000_000 - 5_000 }; // inside FRESH_SESSION_MS
+    await runPermissionHook(baseDeps({
+      fetchFn: fn, emit: (l: string) => emitted.push(l),
+      now: () => 1_000_000, readRecordFn: async () => record,
+    }) as never);
+    expect(calls.filter((c) => c.method === "POST").length).toBe(2); // young session still races the auto-add → re-ask
+    expect(emitted).toEqual([]);
+  });
+
   test("hold=false then hold=true on the re-ask → holds and answers normally", async () => {
     const answerBlob = await encryptBlob(KEY, { requestId: "req-fixed", decision: "allow", ts: 5 });
     const emitted: string[] = [];
