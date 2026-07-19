@@ -55,14 +55,18 @@ const INPUT = JSON.stringify({
 const ALLOW = '{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}}';
 const DENY = '{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"deny","message":"Denied from phone"}}}';
 
-/** A scripted fetch: `hold` decides the POST reply; `gets` is the sequence of GET reply bodies. */
-function scriptFetch(hold: boolean, gets: Array<Record<string, unknown> | "throw">) {
+/** A scripted fetch: `hold` decides the POST reply — a single boolean applies to every POST, or an
+ *  array supplies a per-POST-call sequence (repeating the last entry) so the hold-retry re-POST can
+ *  answer differently from the first. `gets` is the sequence of GET reply bodies. */
+function scriptFetch(hold: boolean | boolean[], gets: Array<Record<string, unknown> | "throw">) {
   const calls: Array<{ url: string; method: string; body?: string }> = [];
   let g = 0;
+  let p = 0;
+  const holdFor = () => (Array.isArray(hold) ? hold[Math.min(p++, hold.length - 1)] : hold);
   const fn = (async (url: string, init?: { method?: string; body?: string }) => {
     const method = init?.method ?? "GET";
     calls.push({ url, method, body: init?.body });
-    if (url.endsWith("/v1/cc/decision")) return new Response(JSON.stringify({ hold }), { status: 200 });
+    if (url.endsWith("/v1/cc/decision")) return new Response(JSON.stringify({ hold: holdFor() }), { status: 200 });
     // GET /v1/cc/decision/<id>
     const next = gets[Math.min(g++, gets.length - 1)];
     if (next === "throw") throw new Error("network");
@@ -86,13 +90,33 @@ const baseDeps = (over: Record<string, unknown>) => ({
 });
 
 describe("runPermissionHook — hold state machine", () => {
-  test("hold=false → POST only, no polling, no stdout", async () => {
+  test("hold=false twice (first ask + post-race re-ask) → silent, exactly 2 POSTs, no polling", async () => {
     const emitted: string[] = [];
     const { fn, calls } = scriptFetch(false, []);
     await runPermissionHook(baseDeps({ fetchFn: fn, emit: (l: string) => emitted.push(l) }) as never);
-    expect(calls.filter((c) => c.method === "POST").length).toBe(1);
+    expect(calls.filter((c) => c.method === "POST").length).toBe(2); // initial + one re-ask after the wait
     expect(calls.filter((c) => c.method === "GET").length).toBe(0);
     expect(emitted).toEqual([]);
+  });
+
+  test("hold=false then hold=true on the re-ask → holds and answers normally", async () => {
+    const answerBlob = await encryptBlob(KEY, { requestId: "req-fixed", decision: "allow", ts: 5 });
+    const emitted: string[] = [];
+    // first POST loses the island-auto-add race (hold:false), the 4s-later re-POST wins it (hold:true)
+    const { fn, calls } = scriptFetch([false, true], [{ status: "pending" }, { status: "answered", answerBlob }]);
+    await runPermissionHook(baseDeps({ fetchFn: fn, emit: (l: string) => emitted.push(l) }) as never);
+    expect(emitted).toEqual([ALLOW]);
+    expect(calls.filter((c) => c.method === "POST").length).toBe(2);
+    expect(calls.filter((c) => c.method === "GET").length).toBe(2);
+  });
+
+  test("hold=true on the first ask → NO re-ask (single POST)", async () => {
+    const answerBlob = await encryptBlob(KEY, { requestId: "req-fixed", decision: "allow", ts: 5 });
+    const emitted: string[] = [];
+    const { fn, calls } = scriptFetch(true, [{ status: "answered", answerBlob }]);
+    await runPermissionHook(baseDeps({ fetchFn: fn, emit: (l: string) => emitted.push(l) }) as never);
+    expect(emitted).toEqual([ALLOW]);
+    expect(calls.filter((c) => c.method === "POST").length).toBe(1);
   });
 
   test("POST body is the frozen wire shape: decisionPending blob + needsAttention fallbackBlob", async () => {

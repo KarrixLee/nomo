@@ -45,6 +45,13 @@ const POST_TIMEOUT_MS = 15_000;
 const POST_MAX_ATTEMPTS = 2;
 /** Pause before the single POST retry. */
 const POST_RETRY_PAUSE_MS = 1_000;
+/** A fresh session's FIRST permission prompt can fire BEFORE the phone app's ~3s poll has added the
+ *  session to the worker's island shown-list, so the very first decision POST correctly comes back
+ *  {hold:false} (session not shown yet) and the prompt falls open — even though the session lands in
+ *  the shown set a second or two later. When the first POST says hold:false, wait this long and re-ask
+ *  ONCE: a hold:false POST stores NO server record, so the re-POST is a fresh gate evaluation that now
+ *  sees the shown session. Injectable via the sleep dep. */
+const HOLD_RETRY_DELAY_MS = 4_000;
 /** Give-up cap: this many consecutive polls without a 2xx (~5 min of sustained failure) → the worker
  *  is unreachable → exit silently (fail open, terminal dialog after Esc/retry). A successful poll —
  *  including a plain {status:"pending"} — resets the counter, so a healthy hold is unbounded. */
@@ -236,29 +243,49 @@ export async function runPermissionHook(deps: PermissionHookDeps = {}): Promise<
 
     // The initial POST is the one place this hook is ALLOWED to block: give it POST_TIMEOUT_MS and one
     // retry on a timeout/network error (a non-ok HTTP status is a real answer — never retried). Any HTTP
-    // response ends the loop; only both attempts failing at the transport layer fails open.
-    let hold = false;
-    let posted = false;
-    for (let attempt = 1; attempt <= POST_MAX_ATTEMPTS; attempt += 1) {
-      try {
-        const res = await fetchFn(`${config.url}/v1/cc/decision`, {
-          method: "POST",
-          headers: { "content-type": "application/json", ...pcHeaders },
-          body: JSON.stringify({ v: 2, sessionId, requestId, op: "update", prio: 1, ts: now, blob, fallbackBlob }),
-          signal: AbortSignal.timeout(POST_TIMEOUT_MS),
-        });
-        trace({ event: "posted", requestId, attempt, status: res.status });
-        if (res.ok) hold = ((await res.json()) as { hold?: unknown }).hold === true;
-        posted = true;
-        break; // any HTTP response (ok or not) is a real answer — do not retry
-      } catch (e) {
-        trace({ event: "posted", requestId, attempt, status: 0, error: (e as { name?: string })?.name ?? "Error" });
-        if (attempt < POST_MAX_ATTEMPTS) { await sleep(POST_RETRY_PAUSE_MS); continue; } // retry the timed-out/failed POST once
+    // response ends the loop; only both attempts failing at the transport layer fails open. `round` (1 =
+    // initial, 2 = post-race re-ask) is threaded through the trace alongside `attempt` (the per-round
+    // transport retry) so both rounds are legible in the log.
+    const postDecision = async (round: number, maxAttempts: number): Promise<{ posted: boolean; hold: boolean }> => {
+      let hold = false;
+      let posted = false;
+      for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+        try {
+          const res = await fetchFn(`${config.url}/v1/cc/decision`, {
+            method: "POST",
+            headers: { "content-type": "application/json", ...pcHeaders },
+            body: JSON.stringify({ v: 2, sessionId, requestId, op: "update", prio: 1, ts: now, blob, fallbackBlob }),
+            signal: AbortSignal.timeout(POST_TIMEOUT_MS),
+          });
+          trace({ event: "posted", requestId, round, attempt, status: res.status });
+          if (res.ok) hold = ((await res.json()) as { hold?: unknown }).hold === true;
+          posted = true;
+          break; // any HTTP response (ok or not) is a real answer — do not retry
+        } catch (e) {
+          trace({ event: "posted", requestId, round, attempt, status: 0, error: (e as { name?: string })?.name ?? "Error" });
+          if (attempt < maxAttempts) { await sleep(POST_RETRY_PAUSE_MS); continue; } // retry the timed-out/failed POST once
+        }
       }
-    }
+      return { posted, hold };
+    };
+
+    let { posted, hold } = await postDecision(1, POST_MAX_ATTEMPTS);
     if (!posted) { trace({ event: "exit", reason: "post-error" }); return; } // both attempts failed at the transport → fail open
     trace({ event: "hold", hold });
-    if (!hold) { trace({ event: "exit", reason: "hold-false" }); return; } // hold:false → worker already applied the attention update → terminal dialog
+    if (!hold) {
+      // hold:false on the FIRST ask is usually genuine (session not on the phone), but a brand-new
+      // session's first prompt can lose a race with the app's island auto-add. Wait once, then re-POST
+      // the SAME requestId/blobs (single attempt, no transport retry): a hold:false POST stored no
+      // record, so this is a clean fresh gate evaluation. hold:true now → the session showed up, fall
+      // through to the poll loop; still hold:false (or a transport error) → the genuine fall-open.
+      trace({ event: "hold-retry-wait", delayMs: HOLD_RETRY_DELAY_MS });
+      await sleep(HOLD_RETRY_DELAY_MS);
+      const retry = await postDecision(2, 1);
+      if (!retry.posted) { trace({ event: "exit", reason: "hold-false" }); return; } // re-ask failed at transport → fall open
+      hold = retry.hold;
+      trace({ event: "hold", hold });
+      if (!hold) { trace({ event: "exit", reason: "hold-false" }); return; } // still not shown → worker applied the attention update → terminal dialog
+    }
 
     // HOLD: poll until the phone answers, the request leaves "pending", sustained failure trips the
     // give-up cap, or we're killed. Each fetch keeps its own 2s ceiling; transient failures are
