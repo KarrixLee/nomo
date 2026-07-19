@@ -179,6 +179,14 @@ export interface SessionRecord {
    *  the real hook fires for that process, or reaped like any session when the pid dies. Absent on a
    *  normal hook-written record. */
   provisional?: boolean;
+  /** How many consecutive times the watchdog's interrupt net has confirmed this session interrupted and
+   *  tried — and FAILED — to deliver its corrective op:done. It's the interrupt net's bounded-retry
+   *  counter: a delivered done clears it (and pins lastEvent:"done"); a failed done bumps it and, while
+   *  it's > 0, the staleness heartbeat holds off (shouldHeartbeat) so the interrupt net owns the
+   *  session's fate and never fights the heartbeat re-raising the stale needsAttention blob. Past the
+   *  retry cap the record is pinned done LOCALLY (the worker's own eviction resolves the phone since we
+   *  can't deliver). Absent → the interrupt net hasn't taken ownership; a real hook re-write clears it. */
+  doneAttempts?: number;
 }
 
 /** The plaintext a pending-pairing flush needs to POST the pairing session the instant the shared key

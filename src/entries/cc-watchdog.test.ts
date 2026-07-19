@@ -8,9 +8,9 @@ import { GONE_STRIKE_LIMIT, readGoneStrikes, recordGoneStrike, resetGoneStrikes 
 import {
   buildDoneEnvelope, buildEndEnvelope, buildHeartbeatEnvelope, buildNeedsAttentionEnvelope, buildProvisionalBlob,
   buildProvisionalEnvelope, buildProvisionalRecord, buildStartEnvelope, buildTitleRepairEnvelope, classifySession,
-  codexLastTurnEvent, codexTailPendingApproval, discoverLiveSessions, goneStrikeShouldTeardown, hasInterruptMarker,
-  IDLE_GRACE_MS, isClaudeIdleReapEligible, lastTurnLine, PAIRING_TTL_MS, pendingPairingExpired, postOutcomeForStatus,
-  provisionalsCoveredByReal, reconcileProvisionalsSweep, shouldHeartbeat, shouldIdleProvisionalCheck,
+  codexLastTurnEvent, codexTailPendingApproval, correctInterrupt, discoverLiveSessions, goneStrikeShouldTeardown,
+  hasInterruptMarker, IDLE_GRACE_MS, isClaudeIdleReapEligible, lastTurnLine, PAIRING_TTL_MS, pendingPairingExpired,
+  postOutcomeForStatus, provisionalsCoveredByReal, reconcileProvisionalsSweep, shouldHeartbeat, shouldIdleProvisionalCheck,
   shouldInterruptCheck, shouldPendingApprovalCheck, shouldRepairTitle, tailShowsInterrupt, titleRepairedRecord,
 } from "./cc-watchdog";
 import type { PostOutcome, RecordEntry } from "./cc-watchdog";
@@ -896,5 +896,112 @@ describe("buildProvisionalRecord stamps the sealing pairing", () => {
 
   test("omitted when unknown (historical shape preserved)", () => {
     expect(buildProvisionalRecord(d, "Mac", "BLOB", {}, 99)).not.toHaveProperty("pairingId");
+  });
+});
+
+// --- interrupt-net settle: the done pin sticks + bounded retry (no forever-flap) --------------
+//
+// Live bug: after Esc interrupts a needsAttention session, correctInterrupt POSTed a corrective done but
+// pinned lastEvent:"done" ONLY as a side effect of a DELIVERED post, and the heartbeat had no signal
+// agreeing with that decision. So a transiently-failing done POST left the record on needsAttention:
+// correctInterrupt re-fired its done EVERY 5-s sweep (unbounded), AND the 5-min heartbeat re-sent the
+// stale needsAttention blob — flapping the phone between done and attention indefinitely. The fix:
+//   * delivered done → pin done + CLEAR the retry counter (gate + heartbeat both close),
+//   * failed done    → verdict "pending" + a BOUNDED doneAttempts counter that (a) caps the retry and
+//                      (b) makes shouldHeartbeat hold off (the interrupt net owns the session),
+//   * past the cap   → pin done LOCALLY so the every-sweep flap ends (the worker's eviction resolves it).
+
+describe("correctInterrupt (settle an interrupted session — the done pin sticks, retry is bounded)", () => {
+  const interruptTail = asstTurn("[Request interrupted by user]");
+  const attn = (over: Partial<SessionRecord> = {}): SessionRecord =>
+    irec({ lastEvent: "needsAttention", op: "update", prio: 1, blob: "ATTN", transcript: "/tmp/t.jsonl", ...over });
+  const NOW = 9_000_000;
+
+  test("interrupt detected + delivered → posts ONE done, pins the record done, verdict 'corrected'", async () => {
+    const posts: object[] = [];
+    const writes: SessionRecord[] = [];
+    const v = await correctInterrupt(cfg(), "/tmp/s.json", "s", attn(), NOW, {
+      post: async (b) => { posts.push(b); return "delivered" as PostOutcome; },
+      readTail: async () => interruptTail,
+      writeRecord: async (_p, r) => { writes.push(r); },
+      now: () => 4242,
+    });
+    expect(v).toBe("corrected");
+    expect(posts).toHaveLength(1);
+    expect(posts[0]).toMatchObject({ op: "done", ts: 4242 });
+    expect(writes[0]).toMatchObject({ lastEvent: "done", op: "done", sentDone: true });
+    expect(writes[0].doneAttempts).toBeUndefined(); // a delivered done CLEARS any retry counter (JSON drops it)
+  });
+
+  test("the pinned done record CLOSES the gate — a subsequent sweep posts NOTHING", async () => {
+    const pinned = attn({ lastEvent: "done", op: "done", sentDone: true });
+    expect(shouldInterruptCheck(pinned, NOW)).toBe(false); // gate short-circuits before any POST
+    let posted = false;
+    const v = await correctInterrupt(cfg(), "/tmp/s.json", "s", pinned, NOW, {
+      post: async () => { posted = true; return "delivered" as PostOutcome; },
+      readTail: async () => interruptTail,
+      writeRecord: async () => {},
+    });
+    expect(v).toBe("uncorrected");
+    expect(posted).toBe(false);
+  });
+
+  test("a transiently FAILING done POST persists a bounded doneAttempts counter (verdict 'pending')", async () => {
+    const writes: SessionRecord[] = [];
+    const v = await correctInterrupt(cfg(), "/tmp/s.json", "s", attn(), NOW, {
+      post: async () => "failed" as PostOutcome,
+      readTail: async () => interruptTail,
+      writeRecord: async (_p, r) => { writes.push(r); },
+    });
+    expect(v).toBe("pending"); // interrupt handled (the caller skips the heartbeat) but NOT delivered
+    expect(writes[0]).toMatchObject({ lastEvent: "needsAttention", doneAttempts: 1 }); // bumped; gate stays open to retry
+  });
+
+  test("the retry is BOUNDED — past the cap it stops POSTing and pins the record done locally", async () => {
+    let posts = 0;
+    let last: SessionRecord = attn();
+    // Drive the net repeatedly, threading the persisted record back in (as the sweep re-reads it each pass).
+    for (let i = 0; i < 20; i++) {
+      const v = await correctInterrupt(cfg(), "/tmp/s.json", "s", last, NOW, {
+        post: async () => { posts++; return "failed" as PostOutcome; },
+        readTail: async () => interruptTail,
+        writeRecord: async (_p, r) => { last = r; },
+      });
+      expect(v).toBe("pending");
+      if (last.lastEvent === "done") break; // capped → the record was pinned done locally, ending the flap
+    }
+    expect(posts).toBeLessThanOrEqual(6);              // bounded, not one-failed-POST-per-sweep forever
+    expect(last).toMatchObject({ lastEvent: "done", op: "done" });
+  });
+
+  test("a revoke bubbles up so the loop can tear the pairing down", async () => {
+    const v = await correctInterrupt(cfg(), "/tmp/s.json", "s", attn(), NOW, {
+      post: async () => "revoked" as PostOutcome, readTail: async () => interruptTail, writeRecord: async () => {},
+    });
+    expect(v).toBe("revoked");
+  });
+
+  test("no interrupt in the tail → uncorrected, nothing posted (a genuine pending approval is untouched)", async () => {
+    let posted = false;
+    const v = await correctInterrupt(cfg(), "/tmp/s.json", "s", attn(), NOW, {
+      post: async () => { posted = true; return "delivered" as PostOutcome; },
+      readTail: async () => asstTurn("still thinking"), writeRecord: async () => {},
+    });
+    expect(v).toBe("uncorrected");
+    expect(posted).toBe(false);
+  });
+});
+
+describe("shouldHeartbeat holds off while the interrupt net owns the record (the anti-flap guard)", () => {
+  const now = 5_000_000;
+
+  test("a needsAttention record the interrupt net is retrying (doneAttempts>0) is NOT heartbeated", () => {
+    // Without this the 5-min heartbeat re-sent the stale needsAttention blob, flapping the phone between
+    // done (interrupt net) and needsAttention (heartbeat) for as long as the done POST kept failing.
+    const retrying = rec({ lastEvent: "needsAttention", op: "update", ts: now - HEARTBEAT_AFTER_MS, blob: "ATTN", doneAttempts: 1 });
+    expect(shouldHeartbeat(retrying, now, undefined, false)).toBe(false);
+    // A GENUINE pending approval (no interrupt seen, no counter) is still heartbeated to keep the island alive.
+    const genuine = rec({ lastEvent: "needsAttention", op: "update", ts: now - HEARTBEAT_AFTER_MS, blob: "ATTN" });
+    expect(shouldHeartbeat(genuine, now, undefined, false)).toBe(true);
   });
 });

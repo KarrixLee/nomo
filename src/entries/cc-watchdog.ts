@@ -420,6 +420,13 @@ const INTERRUPT_TAIL_BYTES = 8 * 1024;
 /** A `working` session refreshes its ts via hooks every ≤15 s; silence past this means either a
  *  long tool run or an interrupt — the transcript check disambiguates. */
 const WORKING_STALE_MS = 20_000;
+/** Bound on the interrupt net's corrective-done RETRIES. Once the interrupt is confirmed, a delivered
+ *  done settles the session; a failed done bumps record.doneAttempts and retries next sweep. After this
+ *  many consecutive FAILED deliveries the pairing is unreachable for this event, so the net stops the
+ *  every-5-s re-POST loop and pins the record done LOCALLY (the worker's own 30-min eviction resolves
+ *  the phone). 5 sweeps ≈ 25 s of retry covers a normal transient blip without looping forever — the
+ *  same "cap retries so a permanently-failing POST can't spin" discipline as the 24 h staleness rule. */
+const INTERRUPT_DONE_MAX_ATTEMPTS = 5;
 
 /** Whether the transcript tail shows the last turn was interrupted, for the given agent — a thin
  *  wrapper over the session adapter's detectInterrupt (the two agents' detections differ; see
@@ -441,21 +448,50 @@ export function shouldInterruptCheck(record: SessionRecord, now: number): boolea
   return false;
 }
 
-/** The interrupt recovery net for one still-alive session. Gated by shouldInterruptCheck, then it
- *  tails the transcript and, if the last real turn line reads "interrupted by user", POSTs a
- *  corrective op:done. On a 2xx it rewrites the session file with lastEvent:"done" + sentDone:true so
- *  the net can't re-fire and the next hook re-arms correctly. A non-2xx / network failure leaves the
- *  file untouched for the next sweep. Returns:
- *   - "corrected"   → it POSTed a done this sweep → the session is effectively done, so the caller
- *                     must NOT also heartbeat it.
- *   - "uncorrected" → nothing to do (gate closed, no interrupt, or a transient failed POST).
+/** Injectable side-effect seams for the interrupt net, so its settle/retry logic is testable without
+ *  real fs/network. `now` clocks the corrective done's envelope ts + the record rewrite. */
+export interface InterruptDeps {
+  post?: (body: object) => Promise<PostOutcome>;
+  readTail?: (path: string, bytes: number) => Promise<string>;
+  writeRecord?: (path: string, rec: SessionRecord) => Promise<void>;
+  now?: () => number;
+}
+
+/** The interrupt recovery net for one still-alive session. Gated by shouldInterruptCheck, then it tails
+ *  the transcript and, if the last real turn line reads "interrupted by user", the session is DECIDED
+ *  done — the only remaining question is delivery. It POSTs a corrective op:done and settles the record
+ *  so the net can neither re-fire forever nor let the heartbeat re-raise the stale needsAttention blob:
+ *   - delivered → pin lastEvent:"done" + sentDone (and CLEAR doneAttempts) so the gate skips it, the
+ *                 heartbeat gates off (op:"done"), and the next hook re-arms from a done.
+ *   - failed    → BOUNDED retry: bump record.doneAttempts and keep the record for next sweep. While
+ *                 doneAttempts > 0 the heartbeat holds off (shouldHeartbeat), so the interrupt net owns
+ *                 the session's fate instead of fighting a heartbeat that re-sends needsAttention. Past
+ *                 INTERRUPT_DONE_MAX_ATTEMPTS consecutive failures the pairing is unreachable for this
+ *                 event, so it stops POSTing and pins the record done LOCALLY (worker eviction resolves
+ *                 the phone) — ending the every-sweep flap.
+ *  Returns:
+ *   - "corrected"   → it delivered a done this sweep → a 2xx landed; the caller counts it delivered and
+ *                     must NOT also heartbeat the session.
+ *   - "pending"     → the interrupt is confirmed but the done did NOT deliver (retrying, or the retry cap
+ *                     was hit and the record was settled locally): NOT delivered, but the caller must
+ *                     still skip the heartbeat (the interrupt net owns this session).
+ *   - "uncorrected" → nothing to do (gate closed, no interrupt, or the transcript is unreadable).
  *   - "revoked"     → the POST 404'd: the pairing is gone server-side → the caller tears down. */
-async function correctInterrupt(config: Config, path: string, sessionId: string, record: SessionRecord, now: number): Promise<"corrected" | "uncorrected" | "revoked"> {
+export async function correctInterrupt(
+  config: Config, path: string, sessionId: string, record: SessionRecord, now: number, deps: InterruptDeps = {},
+): Promise<"corrected" | "pending" | "uncorrected" | "revoked"> {
+  const post = deps.post ?? ((body: object) => postEvent(config, body));
+  const readTail = deps.readTail ?? ((p: string, bytes: number) => readSuffix(p, bytes));
+  const writeRecord = deps.writeRecord
+    // Owner-only (0600), same as the hook's trackSession — the record holds hostname, cwd basename, the
+    // session pid, and the absolute transcript path; a rewrite must not widen its permissions.
+    ?? ((p: string, rec: SessionRecord) => atomicWrite(p, JSON.stringify(rec), 0o600));
+  const clock = deps.now ?? Date.now;
   try {
     if (!shouldInterruptCheck(record, now)) return "uncorrected";
     let tail: string;
     try {
-      tail = await readSuffix(record.transcript as string, INTERRUPT_TAIL_BYTES);
+      tail = await readTail(record.transcript as string, INTERRUPT_TAIL_BYTES);
     } catch {
       // Transcript missing / unreadable → nothing to check. For codex this also covers a cold rollout
       // that was compressed to `.jsonl.zst` (the plain path is deleted): readSuffix's stat() ENOENTs,
@@ -464,19 +500,30 @@ async function correctInterrupt(config: Config, path: string, sessionId: string,
     }
     const agent: AgentKind = record.agent === "codex" ? "codex" : "claude";
     if (!tailShowsInterrupt(tail, agent)) return "uncorrected"; // live turn or no interrupt → leave it
-    const outcome = await postEvent(config, await buildDoneEnvelope(sessionId, record, Date.now(), config.e2eKey, agent));
-    if (outcome === "revoked") return "revoked"; // pairing gone → bubble up so the loop can tear down
-    if (outcome !== "delivered") return "uncorrected"; // failed POST → keep the file, retry next sweep
-    // 2xx: pin the session done so the gate skips it and the next hook re-arms from a done.
-    try {
-      const next: SessionRecord = { ...record, lastEvent: "done", sentDone: true, op: "done" };
-      // Owner-only (0600), same as the hook's trackSession — the record holds hostname, cwd basename,
-      // the session pid, and the absolute transcript path; the rewrite must not widen its permissions.
-      await atomicWrite(path, JSON.stringify(next), 0o600);
-    } catch {
-      // Rewrite failed — worst case the net re-POSTs a done next sweep, which the worker drops.
+    // The interrupt is CONFIRMED from here — the session is decided done regardless of this POST's fate.
+    const attempts = typeof record.doneAttempts === "number" && Number.isFinite(record.doneAttempts) ? record.doneAttempts : 0;
+    // Retry exhausted: stop the every-sweep re-POST and pin done LOCALLY so the gate closes and the
+    // heartbeat can never re-raise needsAttention. We can't deliver, so the worker's own eviction is the
+    // backstop. "pending": interrupt handled (caller skips the heartbeat), not delivered.
+    if (attempts >= INTERRUPT_DONE_MAX_ATTEMPTS) {
+      try { await writeRecord(path, { ...record, lastEvent: "done", sentDone: true, op: "done", doneAttempts: undefined }); } catch { /* best-effort */ }
+      return "pending";
     }
-    return "corrected"; // corrected this sweep → caller must skip the heartbeat for this session
+    const outcome = await post(await buildDoneEnvelope(sessionId, record, clock(), config.e2eKey, agent));
+    if (outcome === "revoked") return "revoked"; // pairing gone → bubble up so the loop can tear down
+    if (outcome === "delivered") {
+      // 2xx: pin the session done and CLEAR the retry counter so the gate skips it and the next hook re-arms.
+      try { await writeRecord(path, { ...record, lastEvent: "done", sentDone: true, op: "done", doneAttempts: undefined }); } catch {
+        // Rewrite failed — worst case the net re-POSTs a done next sweep, which the worker drops.
+      }
+      return "corrected";
+    }
+    // Transient failure: persist the incremented attempt counter so the retry is BOUNDED and — because
+    // doneAttempts > 0 — the heartbeat holds off (shouldHeartbeat) instead of re-raising needsAttention.
+    try { await writeRecord(path, { ...record, doneAttempts: attempts + 1 }); } catch {
+      // Counter write failed — next sweep re-detects the interrupt and retries from the same attempt.
+    }
+    return "pending";
   } catch {
     return "uncorrected";
   }
@@ -781,6 +828,11 @@ async function repairTitle(config: Config, path: string, sessionId: string, reco
  *  HEARTBEAT_AFTER_MS). */
 export function shouldHeartbeat(record: SessionRecord, now: number, lastHeartbeat: number | undefined, correctedThisSweep: boolean): boolean {
   if (record.op === "done") return false; // finished session → never re-armed by a heartbeat
+  // The interrupt net has TAKEN this session (it confirmed an Esc/deny and is bounded-retrying its
+  // corrective done): while doneAttempts > 0 the heartbeat must hold off rather than re-send the stale
+  // needsAttention blob and fight the interrupt net — the same reaper-vs-heartbeat agreement the idle
+  // Claude reap enforces below. Persisted, so the hold-off survives the sweep that failed to deliver.
+  if (typeof record.doneAttempts === "number" && record.doneAttempts > 0) return false;
   // Idle-CLAUDE reap-eligible → never heartbeat it back to "working": the reaper and the heartbeat must
   // agree, so even when the reap POST FAILED this sweep (record not yet pinned done) the heartbeat holds
   // off rather than keeping a resumed-but-dead-idle session alive on the phone forever.
@@ -843,11 +895,15 @@ async function sweep(config: Config | null): Promise<SweepResult> {
         const corrected = await correctInterrupt(config, path, sessionId, record, now);
         if (corrected === "revoked") return { revoked: true }; // gone this POST → gated teardown in run()
         if (corrected === "corrected") delivered = true; // it POSTed a done → a 2xx landed
-        // Pending-approval backstop: only if the interrupt-net didn't just finish the turn. Re-raises
+        // "corrected" OR "pending" both mean the interrupt net has taken ownership of this session this
+        // sweep (delivered a done, or is bounded-retrying / just settled it locally): the other nets and
+        // the heartbeat must all stand down so they can't re-raise the stale needsAttention state.
+        const interruptHandled = corrected === "corrected" || corrected === "pending";
+        // Pending-approval backstop: only if the interrupt-net didn't just take the session. Re-raises
         // needsAttention when a DROPPED Codex PermissionRequest (openai/codex#16430) left the session
         // silently blocked. Claude's adapter offers no classifier, so this no-ops for Claude records.
         let flaggedAttention = false;
-        if (corrected !== "corrected") {
+        if (!interruptHandled) {
           const attn = await correctPendingApproval(config, path, sessionId, record, now);
           if (attn === "revoked") return { revoked: true };
           if (attn === "corrected") { delivered = true; flaggedAttention = true; }
@@ -857,7 +913,7 @@ async function sweep(config: Config | null): Promise<SweepResult> {
         // heartbeated "working" forever. Only if no earlier net already finished the turn this sweep;
         // Claude-only (isClaudeIdleReapEligible gates codex out — it has discovery + the notify backstop).
         let reapedIdle = false;
-        if (idleFix !== "corrected" && corrected !== "corrected" && !flaggedAttention) {
+        if (idleFix !== "corrected" && !interruptHandled && !flaggedAttention) {
           const idleClaude = await correctIdleClaude(config, path, sessionId, record, now);
           if (idleClaude === "revoked") return { revoked: true };
           if (idleClaude === "corrected") { delivered = true; reapedIdle = true; }
@@ -867,12 +923,12 @@ async function sweep(config: Config | null): Promise<SweepResult> {
         // user_message are on disk. Only when nothing else corrected this sweep (a done row with a blank
         // title is fixed on a later sweep, since the record persists); no-ops for claude / titled records.
         let repairedTitle = false;
-        if (idleFix !== "corrected" && corrected !== "corrected" && !flaggedAttention && !reapedIdle) {
+        if (idleFix !== "corrected" && !interruptHandled && !flaggedAttention && !reapedIdle) {
           const titleFix = await repairTitle(config, path, sessionId, record);
           if (titleFix === "revoked") return { revoked: true };
           if (titleFix === "corrected") { delivered = true; repairedTitle = true; }
         }
-        if (shouldHeartbeat(record, now, heartbeatAt.get(sessionId), idleFix === "corrected" || corrected === "corrected" || flaggedAttention || reapedIdle || repairedTitle)) {
+        if (shouldHeartbeat(record, now, heartbeatAt.get(sessionId), idleFix === "corrected" || interruptHandled || flaggedAttention || reapedIdle || repairedTitle)) {
           const beat = buildHeartbeatEnvelope(sessionId, record, Date.now(), config.pairingId);
           // delivered only: a failed heartbeat mutates NOTHING (not the record, not even the throttle),
           // so quietness stays true and it's retried next sweep. A record with no stored blob yields
