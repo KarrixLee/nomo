@@ -8,7 +8,7 @@ import { GONE_STRIKE_LIMIT, readGoneStrikes, recordGoneStrike, resetGoneStrikes 
 import {
   buildDoneEnvelope, buildEndEnvelope, buildHeartbeatEnvelope, buildNeedsAttentionEnvelope, buildProvisionalBlob,
   buildProvisionalEnvelope, buildProvisionalRecord, buildStartEnvelope, buildTitleRepairEnvelope, classifySession,
-  codexLastTurnEvent, codexTailPendingApproval, correctInterrupt, discoverLiveSessions, goneStrikeShouldTeardown,
+  claudeTailPendingApproval, codexLastTurnEvent, codexTailPendingApproval, correctIdleClaude, correctInterrupt, discoverLiveSessions, goneStrikeShouldTeardown,
   hasInterruptMarker, IDLE_GRACE_MS, isClaudeIdleReapEligible, isRetireEligible, lastTurnLine, PAIRING_TTL_MS, pendingPairingExpired,
   postOutcomeForStatus, provisionalsCoveredByReal, reconcileProvisionalsSweep, retireDoneStale, shouldHeartbeat, shouldIdleProvisionalCheck,
   shouldInterruptCheck, shouldPendingApprovalCheck, shouldRepairTitle, tailShowsInterrupt, titleRepairedRecord,
@@ -88,6 +88,122 @@ describe("isClaudeIdleReapEligible (a resumed Claude session gone silent past th
     expect(shouldHeartbeat(idle, now, undefined, false)).toBe(false);
     // A shorter (5–30 min) silence is still heartbeated — that window is a legit long tool run.
     expect(shouldHeartbeat(rec({ lastEvent: "working", ts: now - 600_000 }), now, undefined, false)).toBe(true);
+  });
+});
+
+// The idle-CLAUDE reap must make DURABLE progress even when its corrective done can't reach the worker —
+// the live failure mode (2026-07-20): seven resumed-but-never-prompted Claude sessions (lastEvent
+// "sessionStart", pid alive, transcript's last real turn DAYS old) sat unreaped because every corrective
+// done POST failed to deliver and the OLD reap returned "uncorrected" with NO write-back, leaving the record
+// frozen at "sessionStart" forever — so isRetireEligible (needs op/lastEvent "done") NEVER fired and the row
+// never retired. The fix gives the reap the interrupt net's doneAttempts discipline: bounded retry, then a
+// LOCAL done-pin that advances the record to the terminal state RETIRE keys on.
+describe("correctIdleClaude (resumed-idle reap — bounded retry + local done-pin so RETIRE can fire offline)", () => {
+  const R_MS = 1_800_000; // CLAUDE_IDLE_REAP_MS
+  const NOW = 9_000_000;
+  // A resumed-but-never-prompted Claude session: SessionStart fired at resume, then silence past the grace.
+  // Idle 2 h — well past BOTH the 30-min reap grace AND the 1-h retire horizon (the real records were ~9 h).
+  const resumed = (over: Partial<SessionRecord> = {}): SessionRecord =>
+    rec({ lastEvent: "sessionStart", op: "start", sentDone: false, blob: "B", title: "Investigate x", ts: NOW - 4 * R_MS, ...over });
+
+  test("eligible + delivered → posts ONE done, pins the record done, verdict 'corrected' (counter cleared)", async () => {
+    const posts: object[] = [];
+    const writes: SessionRecord[] = [];
+    const v = await correctIdleClaude(cfg(), "/tmp/s.json", "s", resumed(), NOW, {
+      post: async (b) => { posts.push(b); return "delivered" as PostOutcome; },
+      writeRecord: async (_p, r) => { writes.push(r); },
+      now: () => 4242,
+    });
+    expect(v).toBe("corrected");
+    expect(posts).toHaveLength(1);
+    expect(posts[0]).toMatchObject({ op: "done", ts: 4242 });
+    expect(writes[0]).toMatchObject({ lastEvent: "done", op: "done", sentDone: true });
+    expect(writes[0].doneAttempts).toBeUndefined();
+  });
+
+  test("a transiently FAILING done POST persists a bounded doneAttempts counter (verdict 'pending', record stays retryable)", async () => {
+    const writes: SessionRecord[] = [];
+    const v = await correctIdleClaude(cfg(), "/tmp/s.json", "s", resumed(), NOW, {
+      post: async () => "failed" as PostOutcome,
+      writeRecord: async (_p, r) => { writes.push(r); },
+    });
+    expect(v).toBe("pending"); // reap OWNS the session (caller skips the heartbeat) but nothing delivered
+    expect(writes[0]).toMatchObject({ lastEvent: "sessionStart", doneAttempts: 1 }); // bumped; still eligible to retry
+    expect(isClaudeIdleReapEligible(writes[0], NOW)).toBe(true);
+  });
+
+  test("the retry is BOUNDED — past the cap it stops POSTing and pins the record done locally, so RETIRE can then fire", async () => {
+    let posts = 0;
+    let last: SessionRecord = resumed();
+    for (let i = 0; i < 20; i++) {
+      const v = await correctIdleClaude(cfg(), "/tmp/s.json", "s", last, NOW, {
+        post: async () => { posts++; return "failed" as PostOutcome; },
+        writeRecord: async (_p, r) => { last = r; },
+      });
+      expect(v).toBe("pending");
+      if (last.lastEvent === "done") break; // capped → pinned done locally, ending the every-5-s re-POST spin
+    }
+    expect(posts).toBeLessThanOrEqual(6);              // bounded, NOT one-failed-POST-per-sweep forever
+    expect(last).toMatchObject({ lastEvent: "done", op: "done", sentDone: true });
+    // THE point of the fix: the locally-pinned done is the terminal state the retire net keys on, so a
+    // worker-unreachable resumed session still retires (record deleted, cap slot freed) instead of sticking.
+    expect(isRetireEligible(last, NOW)).toBe(true);
+    expect(isClaudeIdleReapEligible(last, NOW)).toBe(false); // done is no longer reap-eligible → no double-work
+  });
+
+  test("a revoke bubbles up so the loop can tear the pairing down", async () => {
+    const v = await correctIdleClaude(cfg(), "/tmp/s.json", "s", resumed(), NOW, {
+      post: async () => "revoked" as PostOutcome, writeRecord: async () => {},
+    });
+    expect(v).toBe("revoked");
+  });
+
+  test("not eligible (needsAttention, or a fresh session) → uncorrected, nothing posted", async () => {
+    let posted = false;
+    const seams = { post: async () => { posted = true; return "delivered" as PostOutcome; }, writeRecord: async () => {} };
+    expect(await correctIdleClaude(cfg(), "/tmp/s.json", "s", resumed({ lastEvent: "needsAttention" }), NOW, seams)).toBe("uncorrected");
+    expect(await correctIdleClaude(cfg(), "/tmp/s.json", "s", resumed({ ts: NOW - 60_000 }), NOW, seams)).toBe("uncorrected"); // only 1 min idle
+    expect(posted).toBe(false);
+  });
+
+  test("a healthy worker still reaps in ONE window — a resumed session delivers on the first attempt (no retry tax)", async () => {
+    let posts = 0;
+    let last: SessionRecord = resumed();
+    const v = await correctIdleClaude(cfg(), "/tmp/s.json", "s", last, NOW, {
+      post: async () => { posts++; return "delivered" as PostOutcome; },
+      writeRecord: async (_p, r) => { last = r; },
+    });
+    expect(v).toBe("corrected");
+    expect(posts).toBe(1);
+    expect(isRetireEligible(last, NOW)).toBe(true); // done + hours-idle → retires next sweep, chain complete
+  });
+});
+
+// The reap is only REACHED when the pending-approval backstop doesn't misread the resumed transcript's tail
+// as a live block. A cmux `claude --resume` writes METADATA rows (permission-mode / last-prompt / mode) after
+// the last REAL turn (which is days old) — those carry no tool_use/tool_result, so the classifier must read
+// "not pending", leaving the session free to be reaped. Fixture: structurally-equivalent synthetic rows (NO
+// private transcript content).
+describe("claudeTailPendingApproval on a cmux-resume tail (metadata rows after an old, non-blocking turn)", () => {
+  test("resumed-but-never-prompted tail (old assistant text + cmux metadata rows) → NOT pending → reap not blocked", () => {
+    const tail = [
+      JSON.stringify({ type: "assistant", isSidechain: false, message: { role: "assistant", content: [{ type: "text", text: "All done — the fix is in." }] } }),
+      JSON.stringify({ type: "attachment" }),
+      JSON.stringify({ type: "system", subtype: "resume" }),
+      JSON.stringify({ type: "ai-title", title: "Investigate x" }),
+      JSON.stringify({ type: "last-prompt" }),
+      JSON.stringify({ type: "mode" }),
+      JSON.stringify({ type: "permission-mode", mode: "auto" }),
+    ].join("\n");
+    expect(claudeTailPendingApproval(tail)).toBe(false);
+  });
+
+  test("a genuine trailing AskUserQuestion with no answer is STILL caught (the gate isn't broken by the fixture)", () => {
+    const tail = [
+      JSON.stringify({ type: "assistant", isSidechain: false, message: { role: "assistant", content: [{ type: "tool_use", id: "toolu_ask1", name: "AskUserQuestion", input: {} }] } }),
+      JSON.stringify({ type: "permission-mode", mode: "auto" }), // trailing cmux noise must not resolve the block
+    ].join("\n");
+    expect(claudeTailPendingApproval(tail)).toBe(true);
   });
 });
 

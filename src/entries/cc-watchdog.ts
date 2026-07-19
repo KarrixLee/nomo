@@ -711,6 +711,17 @@ async function correctIdleProvisional(config: Config, path: string, sessionId: s
  *  only past 30 min does the reap take over. */
 const CLAUDE_IDLE_REAP_MS = 1_800_000; // 30 min
 
+/** Bound on the idle-reap's corrective-done RETRIES — the SAME discipline the interrupt net enforces
+ *  (INTERRUPT_DONE_MAX_ATTEMPTS). Once a session is reap-DECIDED (idle past the grace) the only question is
+ *  delivery: a delivered done settles it; a FAILED done bumps record.doneAttempts and retries next sweep.
+ *  After this many consecutive FAILED deliveries the pairing is unreachable for this event, so the reap
+ *  stops the every-5-s re-POST loop and pins the record done LOCALLY — advancing it to the terminal state
+ *  the RETIRE net keys on (isRetireEligible needs op/lastEvent "done"), so a resumed-idle session whose reap
+ *  can't reach the worker still frees its cap slot + retires (record deleted, even OFFLINE) instead of
+ *  re-POSTing a doomed done forever with the record frozen at "sessionStart" and RETIRE never firing. 5
+ *  sweeps ≈ 25 s absorbs a transient blip without looping — same bound/rationale as INTERRUPT_DONE_MAX_ATTEMPTS. */
+const CLAUDE_IDLE_REAP_MAX_ATTEMPTS = 5;
+
 /** Whether a KEPT (alive) session is an idle CLAUDE session past the reap threshold — the shared predicate
  *  the reap net and the heartbeat guard BOTH key on, so the two always agree (a session the reaper wants to
  *  finish is never simultaneously heartbeated back to "working"). True iff: it's a Claude session (codex has
@@ -727,34 +738,80 @@ export function isClaudeIdleReapEligible(record: SessionRecord, now: number): bo
   return now - record.ts >= CLAUDE_IDLE_REAP_MS;
 }
 
-/** The idle-CLAUDE reap for one still-alive session. Gated by isClaudeIdleReapEligible, then it POSTs a
- *  corrective op:done rebuilt from the record's cached title/machine/label (buildDoneEnvelope — the SAME
- *  envelope the interrupt net posts) and pins the record done so this fires once and the heartbeat treats
- *  it as finished. A resumed-but-idle session (SessionStart then silence) falls out through here. On the
- *  next real hook the pinned sentDone re-arms the session to working, just like the interrupt net's done.
- *  Returns the same verdict triple as the other nets ("corrected" → the caller must not also heartbeat it). */
-async function correctIdleClaude(config: Config, path: string, sessionId: string, record: SessionRecord, now: number): Promise<"corrected" | "uncorrected" | "revoked"> {
+/** Injectable side-effect seams for the idle-CLAUDE reap, so its settle/retry logic is testable without
+ *  real fs/network — mirrors InterruptDeps. `now` clocks the corrective done's envelope ts. */
+export interface IdleReapDeps {
+  post?: (body: object) => Promise<PostOutcome>;
+  writeRecord?: (path: string, rec: SessionRecord) => Promise<void>;
+  now?: () => number;
+}
+
+/** The idle-CLAUDE reap for one still-alive session. Gated by isClaudeIdleReapEligible, then — exactly like
+ *  the interrupt net (correctInterrupt) — the session is DECIDED done and the only remaining question is
+ *  delivery. It POSTs a corrective op:done (buildDoneEnvelope, the SAME envelope the interrupt net posts,
+ *  with `at` FROZEN at record.ts so an hours-idle resumed session ages out rather than looking freshly
+ *  finished) and settles the record so the reap can neither re-fire forever nor let the heartbeat re-raise
+ *  "working":
+ *   - delivered → pin lastEvent:"done" + sentDone + op:"done" (and CLEAR doneAttempts) so the gate closes,
+ *                 the heartbeat gates off, and the next hook re-arms from a done.
+ *   - failed    → BOUNDED retry: bump record.doneAttempts and keep the record for next sweep (doneAttempts>0
+ *                 also holds the heartbeat off — shouldHeartbeat). Past CLAUDE_IDLE_REAP_MAX_ATTEMPTS the
+ *                 pairing is unreachable for THIS event, so it stops POSTing and pins the record done
+ *                 LOCALLY — advancing it to the terminal state RETIRE keys on (isRetireEligible), so the
+ *                 slot frees + the row retires even OFFLINE instead of re-POSTing a doomed done forever with
+ *                 the record stuck at "sessionStart" (the live-observed failure mode). The worker's own
+ *                 eviction resolves the phone. A resumed-but-idle session (SessionStart then silence) whose
+ *                 reap can't reach the worker now falls all the way through reap → retire on its own.
+ *  Claude-only by the gate (no agent key on the blob). On the next real hook the pinned sentDone re-arms the
+ *  session to working, just like the interrupt net's done. Returns:
+ *   - "corrected"   → it delivered a done this sweep (2xx) → the caller counts it delivered and must NOT
+ *                     also heartbeat the session.
+ *   - "pending"     → reap-decided but the done did NOT deliver (bounded-retrying, or the cap was hit and the
+ *                     record was pinned done locally): NOT delivered, but the caller must still skip the
+ *                     heartbeat (the reap owns this session this sweep).
+ *   - "uncorrected" → not eligible.
+ *   - "revoked"     → the POST 404'd: the pairing is gone server-side → the caller tears down. */
+export async function correctIdleClaude(
+  config: Config, path: string, sessionId: string, record: SessionRecord, now: number, deps: IdleReapDeps = {},
+): Promise<"corrected" | "pending" | "uncorrected" | "revoked"> {
+  const post = deps.post ?? ((body: object) => postEvent(config, body));
+  const writeRecord = deps.writeRecord
+    // Owner-only (0600), same as the hook's trackSession / the interrupt net's rewrite.
+    ?? ((p: string, rec: SessionRecord) => atomicWrite(p, JSON.stringify(rec), 0o600));
+  const clock = deps.now ?? Date.now;
   try {
     if (!isClaudeIdleReapEligible(record, now)) return "uncorrected";
+    const attempts = typeof record.doneAttempts === "number" && Number.isFinite(record.doneAttempts) ? record.doneAttempts : 0;
+    // Retry exhausted: stop the every-sweep re-POST and pin done LOCALLY so the record reaches the terminal
+    // state RETIRE keys on — the resumed-idle session then retires (record deleted, slot freed) even with the
+    // worker unreachable, instead of spinning a doomed done forever. "pending": reap handled, not delivered.
+    if (attempts >= CLAUDE_IDLE_REAP_MAX_ATTEMPTS) {
+      try { await writeRecord(path, { ...record, lastEvent: "done", sentDone: true, op: "done", doneAttempts: undefined }); } catch { /* best-effort */ }
+      return "pending";
+    }
     // Claude-only by the gate above, so the corrective done carries the claude blob shape (no agent key).
     // The done blob's `at` is FROZEN at the record's last REAL event (record.ts, epoch seconds) — NOT
     // now: this session has been idle for hours (a resumed-but-never-prompted TUI, or a long-finished
     // one whose Stop dropped), so stamping "now" would make the phone show a freshly-finished row that
     // never ages out — the very "eternally fresh" bug this reap exists to kill. record.ts is guaranteed
     // a finite number by isClaudeIdleReapEligible. (envelope `ts` stays now so the worker accepts the frame.)
-    const outcome = await postEvent(config, await buildDoneEnvelope(sessionId, record, Date.now(), config.e2eKey, "claude", Math.floor(record.ts / 1000)));
+    const doneNow = clock();
+    const outcome = await post(await buildDoneEnvelope(sessionId, record, doneNow, config.e2eKey, "claude", Math.floor(record.ts / 1000)));
     if (outcome === "revoked") return "revoked"; // pairing gone → bubble up so the loop can tear down
-    if (outcome !== "delivered") return "uncorrected"; // failed POST → keep the file, retry next sweep
-    // 2xx: pin the session done so the gate closes and the heartbeat can never re-arm "working"; the next
-    // real hook re-arms from a done exactly as the interrupt net's rewrite does.
-    try {
-      const next: SessionRecord = { ...record, lastEvent: "done", sentDone: true, op: "done" };
-      // Owner-only (0600), same as every other record rewrite in this file.
-      await atomicWrite(path, JSON.stringify(next), 0o600);
-    } catch {
-      // Rewrite failed — worst case the net re-POSTs a done next sweep, which the worker drops.
+    if (outcome === "delivered") {
+      // 2xx: pin the session done and CLEAR the retry counter so the gate closes, the heartbeat can never
+      // re-arm "working", and the next real hook re-arms from a done exactly as the interrupt net's rewrite does.
+      try { await writeRecord(path, { ...record, lastEvent: "done", sentDone: true, op: "done", doneAttempts: undefined }); } catch {
+        // Rewrite failed — worst case the net re-POSTs a done next sweep, which the worker drops.
+      }
+      return "corrected";
     }
-    return "corrected";
+    // Transient failure: persist the incremented attempt counter so the retry is BOUNDED and — because
+    // doneAttempts > 0 — the heartbeat holds off (shouldHeartbeat), exactly like the interrupt net.
+    try { await writeRecord(path, { ...record, doneAttempts: attempts + 1 }); } catch {
+      // Counter write failed — next sweep re-detects idle and retries from the same attempt.
+    }
+    return "pending";
   } catch {
     return "uncorrected";
   }
@@ -1062,7 +1119,11 @@ async function sweep(config: Config | null): Promise<SweepResult> {
         if (idleFix !== "corrected" && !interruptHandled && !flaggedAttention) {
           const idleClaude = await correctIdleClaude(config, path, sessionId, record, now);
           if (idleClaude === "revoked") return { revoked: true };
-          if (idleClaude === "corrected") { delivered = true; reapedIdle = true; }
+          // "corrected" (delivered a done) OR "pending" (bounded-retrying / just pinned done locally) both
+          // mean the reap OWNS this session this sweep — the title net + the heartbeat must stand down so
+          // they can't re-raise or re-arm it; only a delivered done counts toward `delivered`.
+          if (idleClaude === "corrected" || idleClaude === "pending") reapedIdle = true;
+          if (idleClaude === "corrected") delivered = true;
         }
         // Codex title-repair: heal a session that shipped title:"" from a SessionStart and then had every
         // later hook dropped (openai/codex#16430) — by sweep time the session_index thread_name / rollout
