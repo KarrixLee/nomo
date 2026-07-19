@@ -92,7 +92,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { execFileSync, spawn } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "1.1.5";
+var PLUGIN_VERSION = "1.1.6";
 var CC_DIR = `${process.env.HOME}/.config/cc-status`;
 var SESSIONS_DIR = `${CC_DIR}/sessions`;
 var WATCHDOG_PID_PATH = `${CC_DIR}/watchdog.pid`;
@@ -1302,7 +1302,7 @@ function startedAtField(record) {
 function buildEndEnvelope(sessionId, now, record) {
   return { v: 2, sessionId, op: "end", prio: 0, ts: now, ...record ? startedAtField(record) : {} };
 }
-async function buildDoneEnvelope(sessionId, record, now, e2eKey, agent = "claude") {
+async function buildDoneEnvelope(sessionId, record, now, e2eKey, agent = "claude", at) {
   const blob = await encryptBlob(e2eKey, {
     status: "done",
     title: typeof record.title === "string" ? record.title : "",
@@ -1310,11 +1310,12 @@ async function buildDoneEnvelope(sessionId, record, now, e2eKey, agent = "claude
     label: typeof record.label === "string" ? record.label : "",
     ...adapterFor(agent).blobAgentFields,
     ...typeof record.turnStartedAt === "number" && Number.isFinite(record.turnStartedAt) ? { turnStartedAt: record.turnStartedAt } : {},
-    ...typeof record.model === "string" && record.model.length > 0 ? { model: record.model } : {}
+    ...typeof record.model === "string" && record.model.length > 0 ? { model: record.model } : {},
+    ...typeof at === "number" && Number.isFinite(at) ? { at } : {}
   });
   return { v: 2, sessionId, op: "done", prio: 0, ts: now, blob, ...startedAtField(record) };
 }
-async function buildNeedsAttentionEnvelope(sessionId, record, now, e2eKey, agent = "claude") {
+async function buildNeedsAttentionEnvelope(sessionId, record, now, e2eKey, agent = "claude", at) {
   const blob = await encryptBlob(e2eKey, {
     status: "needsAttention",
     title: typeof record.title === "string" ? record.title : "",
@@ -1322,7 +1323,8 @@ async function buildNeedsAttentionEnvelope(sessionId, record, now, e2eKey, agent
     label: typeof record.label === "string" ? record.label : "",
     ...adapterFor(agent).blobAgentFields,
     ...typeof record.turnStartedAt === "number" && Number.isFinite(record.turnStartedAt) ? { turnStartedAt: record.turnStartedAt } : {},
-    ...typeof record.model === "string" && record.model.length > 0 ? { model: record.model } : {}
+    ...typeof record.model === "string" && record.model.length > 0 ? { model: record.model } : {},
+    ...typeof at === "number" && Number.isFinite(at) ? { at } : {}
   });
   return { v: 2, sessionId, op: "update", prio: 1, ts: now, blob, ...startedAtField(record) };
 }
@@ -1380,8 +1382,15 @@ async function readAllRecordEntries() {
 async function readAllRecords() {
   return (await readAllRecordEntries()).map((e) => e.rec);
 }
-async function buildProvisionalBlob(d, machine, blobAgentFields, e2eKey) {
-  return encryptBlob(e2eKey, { status: d.idle === true ? "done" : "working", title: d.title ?? "", machine, label: d.label, ...blobAgentFields });
+async function buildProvisionalBlob(d, machine, blobAgentFields, e2eKey, at) {
+  return encryptBlob(e2eKey, {
+    status: d.idle === true ? "done" : "working",
+    title: d.title ?? "",
+    machine,
+    label: d.label,
+    ...blobAgentFields,
+    ...typeof at === "number" && Number.isFinite(at) ? { at } : {}
+  });
 }
 function buildProvisionalEnvelope(sessionId, blob, now, idle) {
   return { v: 2, sessionId, op: idle ? "done" : "start", prio: 0, ts: now, blob };
@@ -1426,7 +1435,7 @@ async function discoverLiveSessions(config, deps = {}) {
     for (const d of discovered) {
       const ts = now();
       const idle = d.idle === true;
-      const blob = await buildProvisionalBlob(d, machine, adapter.blobAgentFields, config.e2eKey);
+      const blob = await buildProvisionalBlob(d, machine, adapter.blobAgentFields, config.e2eKey, Math.floor(ts / 1000));
       const outcome = await post(buildProvisionalEnvelope(d.sessionId, blob, ts, idle));
       if (outcome !== "delivered")
         continue;
@@ -1490,7 +1499,8 @@ async function correctInterrupt(config, path, sessionId, record, now, deps = {})
       } catch {}
       return "pending";
     }
-    const outcome = await post(await buildDoneEnvelope(sessionId, record, clock(), config.e2eKey, agent));
+    const doneNow = clock();
+    const outcome = await post(await buildDoneEnvelope(sessionId, record, doneNow, config.e2eKey, agent, Math.floor(doneNow / 1000)));
     if (outcome === "revoked")
       return "revoked";
     if (outcome === "delivered") {
@@ -1532,7 +1542,8 @@ async function correctPendingApproval(config, path, sessionId, record, now) {
     }
     if (!adapter.tailShowsPendingApproval(tail))
       return "uncorrected";
-    const outcome = await postEvent(config, await buildNeedsAttentionEnvelope(sessionId, record, Date.now(), config.e2eKey, agent));
+    const attnNow = Date.now();
+    const outcome = await postEvent(config, await buildNeedsAttentionEnvelope(sessionId, record, attnNow, config.e2eKey, agent, Math.floor(attnNow / 1000)));
     if (outcome === "revoked")
       return "revoked";
     if (outcome !== "delivered")
@@ -1569,7 +1580,8 @@ async function correctIdleProvisional(config, path, sessionId, record) {
     } catch {}
     if (active)
       return "uncorrected";
-    const outcome = await postEvent(config, await buildDoneEnvelope(sessionId, record, Date.now(), config.e2eKey, agent));
+    const idleNow = Date.now();
+    const outcome = await postEvent(config, await buildDoneEnvelope(sessionId, record, idleNow, config.e2eKey, agent, Math.floor(idleNow / 1000)));
     if (outcome === "revoked")
       return "revoked";
     if (outcome !== "delivered")
@@ -1599,7 +1611,7 @@ async function correctIdleClaude(config, path, sessionId, record, now) {
   try {
     if (!isClaudeIdleReapEligible(record, now))
       return "uncorrected";
-    const outcome = await postEvent(config, await buildDoneEnvelope(sessionId, record, Date.now(), config.e2eKey, "claude"));
+    const outcome = await postEvent(config, await buildDoneEnvelope(sessionId, record, Date.now(), config.e2eKey, "claude", Math.floor(record.ts / 1000)));
     if (outcome === "revoked")
       return "revoked";
     if (outcome !== "delivered")
@@ -1621,7 +1633,7 @@ function statusFromRecord(record) {
     return "done";
   return "working";
 }
-async function buildTitleRepairEnvelope(sessionId, record, title, now, e2eKey, agent = "codex") {
+async function buildTitleRepairEnvelope(sessionId, record, title, now, e2eKey, agent = "codex", at) {
   const blob = await encryptBlob(e2eKey, {
     status: statusFromRecord(record),
     title,
@@ -1629,7 +1641,8 @@ async function buildTitleRepairEnvelope(sessionId, record, title, now, e2eKey, a
     label: typeof record.label === "string" ? record.label : "",
     ...adapterFor(agent).blobAgentFields,
     ...typeof record.turnStartedAt === "number" && Number.isFinite(record.turnStartedAt) ? { turnStartedAt: record.turnStartedAt } : {},
-    ...typeof record.model === "string" && record.model.length > 0 ? { model: record.model } : {}
+    ...typeof record.model === "string" && record.model.length > 0 ? { model: record.model } : {},
+    ...typeof at === "number" && Number.isFinite(at) ? { at } : {}
   });
   return { v: 2, sessionId, op: record.op ?? "update", prio: record.prio ?? 0, ts: now, blob, ...startedAtField(record) };
 }
@@ -1656,7 +1669,8 @@ async function repairTitle(config, path, sessionId, record) {
     const title = await codexAdapter.title({ sessionId, prefix, input: {}, transcriptPath: record.transcript });
     if (!title)
       return "uncorrected";
-    const envelope = await buildTitleRepairEnvelope(sessionId, record, title, Date.now(), config.e2eKey, "codex");
+    const repairNow = Date.now();
+    const envelope = await buildTitleRepairEnvelope(sessionId, record, title, repairNow, config.e2eKey, "codex", Math.floor(repairNow / 1000));
     const outcome = await postEvent(config, envelope);
     if (outcome === "revoked")
       return "revoked";

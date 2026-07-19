@@ -92,7 +92,7 @@ async function sha256Hex(s) {
 }
 
 // src/core/shared.ts
-var PLUGIN_VERSION = "1.1.5";
+var PLUGIN_VERSION = "1.1.6";
 var CC_DIR = `${process.env.HOME}/.config/cc-status`;
 var SESSIONS_DIR = `${CC_DIR}/sessions`;
 var WATCHDOG_PID_PATH = `${CC_DIR}/watchdog.pid`;
@@ -1347,7 +1347,7 @@ function transcriptStartMs(prefix) {
   }
   return;
 }
-function buildBlob(input, machine, title, plan, agent = "claude", turnStartedAt, pinnedLabel, model) {
+function buildBlob(input, machine, title, plan, agent = "claude", turnStartedAt, pinnedLabel, model, at) {
   const label = typeof pinnedLabel === "string" && pinnedLabel.length > 0 ? pinnedLabel : typeof input.cwd === "string" && input.cwd.length > 0 ? basename2(input.cwd) : "session";
   const hookName = typeof input.hook_event_name === "string" ? input.hook_event_name : "";
   const detail = detailForHook(hookName, typeof input.tool_name === "string" ? input.tool_name : undefined);
@@ -1359,7 +1359,8 @@ function buildBlob(input, machine, title, plan, agent = "claude", turnStartedAt,
     ...detail ? { detail } : {},
     ...agent === "codex" ? { agent: "codex" } : {},
     ...typeof turnStartedAt === "number" && Number.isFinite(turnStartedAt) ? { turnStartedAt } : {},
-    ...typeof model === "string" && model.length > 0 ? { model } : {}
+    ...typeof model === "string" && model.length > 0 ? { model } : {},
+    ...typeof at === "number" && Number.isFinite(at) ? { at } : {}
   };
 }
 async function buildEnvelope(input, machine, now, title, e2eKey, sentDone, agent = "claude", startedAt, turnStartedAt, pinnedLabel, model) {
@@ -1377,7 +1378,8 @@ async function buildEnvelope(input, machine, now, title, e2eKey, sentDone, agent
     base.startedAt = startedAt;
   if (plan.op === "end")
     return base;
-  const blob = await encryptBlob(e2eKey, buildBlob(i, machine, title, plan, agent, turnStartedAt, pinnedLabel, model));
+  const at = Math.floor(now / 1000);
+  const blob = await encryptBlob(e2eKey, buildBlob(i, machine, title, plan, agent, turnStartedAt, pinnedLabel, model, at));
   return { ...base, blob };
 }
 function buildPendingStash(input, machine, title, now, pid = process.ppid, agent = "claude", model) {
@@ -1388,7 +1390,8 @@ function buildPendingStash(input, machine, title, now, pid = process.ppid, agent
   if (!plan || plan.op === "end")
     return null;
   const turnStartedAt = hookName === "UserPromptSubmit" ? Math.floor(now / 1000) : undefined;
-  return { sessionId: input.session_id, op: plan.op, prio: plan.prio, blob: buildBlob(input, machine, title, plan, agent, turnStartedAt, undefined, model), stashedAt: now, pid };
+  const at = Math.floor(now / 1000);
+  return { sessionId: input.session_id, op: plan.op, prio: plan.prio, blob: buildBlob(input, machine, title, plan, agent, turnStartedAt, undefined, model, at), stashedAt: now, pid };
 }
 async function stashPendingEvent(input, machine, title, now, stashPath = PENDING_STASH_PATH, pid = process.ppid, agent = "claude", model) {
   try {
