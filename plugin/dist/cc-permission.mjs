@@ -97,7 +97,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { execFileSync, spawn } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "1.1.4";
+var PLUGIN_VERSION = "1.1.5";
 var CC_DIR = `${process.env.HOME}/.config/cc-status`;
 var SESSIONS_DIR = `${CC_DIR}/sessions`;
 var WATCHDOG_PID_PATH = `${CC_DIR}/watchdog.pid`;
@@ -1596,6 +1596,7 @@ var POST_TIMEOUT_MS = 15000;
 var POST_MAX_ATTEMPTS = 2;
 var POST_RETRY_PAUSE_MS = 1000;
 var HOLD_RETRY_DELAY_MS = 4000;
+var FRESH_SESSION_MS = 60000;
 var MAX_CONSECUTIVE_MISSES = 100;
 var ALLOW_LINE = JSON.stringify({ hookSpecificOutput: { hookEventName: "PermissionRequest", decision: { behavior: "allow" } } });
 var DENY_LINE = JSON.stringify({ hookSpecificOutput: { hookEventName: "PermissionRequest", decision: { behavior: "deny", message: "Denied from phone" } } });
@@ -1762,6 +1763,11 @@ async function runPermissionHook(deps = {}) {
     }
     trace({ event: "hold", hold });
     if (!hold) {
+      const fresh = !record || now - record.ts < FRESH_SESSION_MS;
+      if (!fresh) {
+        trace({ event: "exit", reason: "hold-false" });
+        return;
+      }
       trace({ event: "hold-retry-wait", delayMs: HOLD_RETRY_DELAY_MS });
       await sleep(HOLD_RETRY_DELAY_MS);
       const retry = await postDecision(2, 1);
