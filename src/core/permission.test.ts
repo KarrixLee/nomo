@@ -317,6 +317,106 @@ describe("runPermissionHook — hold state machine", () => {
   });
 });
 
+// ---- pass-through gates (subagent / permission_mode) --------------------------------------
+//
+// The hold must never block a non-interactive/auto flow: an `agent_id` (subagent sidechain) or a
+// non-interactive permission_mode ("auto"/"dontAsk"/"bypassPermissions"/unknown) exits 0 with zero
+// output and — crucially — zero network, BEFORE any POST.
+
+/** INPUT with extra top-level fields merged in (agent_id, permission_mode, …). */
+const inputWith = (extra: Record<string, unknown>) => JSON.stringify({ ...JSON.parse(INPUT), ...extra });
+
+/** A fetch that records whether it was ever called — the gate must reach NONE of these. */
+function spyFetch() {
+  let called = false;
+  const fn = (async () => { called = true; return new Response(JSON.stringify({ hold: false }), { status: 200 }); }) as unknown as typeof fetch;
+  return { fn, called: () => called };
+}
+
+describe("runPermissionHook — pass-through gates", () => {
+  test("agent_id present (subagent) → pass-through BEFORE any fetch, silent", async () => {
+    const spy = spyFetch();
+    const emitted: string[] = [];
+    const events: Array<{ event: string; reason?: string; agent_type?: unknown }> = [];
+    await runPermissionHook(baseDeps({
+      readInput: async () => inputWith({ agent_id: "agent-abc", agent_type: "Explore" }),
+      fetchFn: spy.fn, emit: (l: string) => emitted.push(l),
+      trace: (e: { event: string; reason?: string }) => events.push(e),
+    }) as never);
+    expect(spy.called()).toBe(false); // zero network — gate fired before the POST
+    expect(emitted).toEqual([]);
+    expect(events.at(-1)).toMatchObject({ event: "exit", reason: "subagent", agent_type: "Explore" });
+  });
+
+  test("empty-string agent_id is NOT a subagent → proceeds to the POST path", async () => {
+    const spy = spyFetch();
+    await runPermissionHook(baseDeps({
+      readInput: async () => inputWith({ agent_id: "" }),
+      fetchFn: spy.fn, emit: () => {},
+    }) as never);
+    expect(spy.called()).toBe(true); // empty agent_id ⇒ main thread ⇒ hold path runs
+  });
+
+  for (const mode of ["auto", "dontAsk", "bypassPermissions"]) {
+    test(`permission_mode="${mode}" → pass-through BEFORE any fetch, silent`, async () => {
+      const spy = spyFetch();
+      const emitted: string[] = [];
+      const events: Array<{ event: string; reason?: string; mode?: unknown }> = [];
+      await runPermissionHook(baseDeps({
+        readInput: async () => inputWith({ permission_mode: mode }),
+        fetchFn: spy.fn, emit: (l: string) => emitted.push(l),
+        trace: (e: { event: string; reason?: string }) => events.push(e),
+      }) as never);
+      expect(spy.called()).toBe(false);
+      expect(emitted).toEqual([]);
+      expect(events.at(-1)).toMatchObject({ event: "exit", reason: "mode", mode });
+    });
+  }
+
+  test("unrecognized future permission_mode → pass-through (fail-open bias)", async () => {
+    const spy = spyFetch();
+    const events: Array<{ event: string; reason?: string; mode?: unknown }> = [];
+    await runPermissionHook(baseDeps({
+      readInput: async () => inputWith({ permission_mode: "someFutureMode" }),
+      fetchFn: spy.fn, emit: () => {},
+      trace: (e: { event: string; reason?: string }) => events.push(e),
+    }) as never);
+    expect(spy.called()).toBe(false);
+    expect(events.at(-1)).toMatchObject({ event: "exit", reason: "mode", mode: "someFutureMode" });
+  });
+
+  for (const mode of ["default", "acceptEdits", "plan"]) {
+    test(`permission_mode="${mode}" → PROCEEDS to the POST path (holdable dialog mode)`, async () => {
+      const spy = spyFetch();
+      await runPermissionHook(baseDeps({
+        readInput: async () => inputWith({ permission_mode: mode }),
+        fetchFn: spy.fn, emit: () => {},
+      }) as never);
+      expect(spy.called()).toBe(true);
+    });
+  }
+
+  test("MISSING permission_mode (older CC) → PROCEEDS to the POST path (prior behavior)", async () => {
+    const spy = spyFetch();
+    await runPermissionHook(baseDeps({
+      readInput: async () => INPUT, // no permission_mode, no agent_id
+      fetchFn: spy.fn, emit: () => {},
+    }) as never);
+    expect(spy.called()).toBe(true);
+  });
+
+  test("start trace carries permission_mode and the agent boolean", async () => {
+    const spy = spyFetch();
+    const events: Array<{ event: string; permission_mode?: unknown; agent?: unknown }> = [];
+    await runPermissionHook(baseDeps({
+      readInput: async () => inputWith({ permission_mode: "default" }),
+      fetchFn: spy.fn, emit: () => {},
+      trace: (e: { event: string }) => events.push(e),
+    }) as never);
+    expect(events.find((e) => e.event === "start")).toMatchObject({ permission_mode: "default", agent: false });
+  });
+});
+
 // ---- escape-hatch command -----------------------------------------------------------------
 
 describe("approvalsCommand (on/off/status)", () => {

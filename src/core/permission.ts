@@ -222,7 +222,30 @@ export async function runPermissionHook(deps: PermissionHookDeps = {}): Promise<
     if (sessionId.length === 0) { trace({ event: "exit", reason: "no-session-id" }); return; }
 
     const toolName = typeof input.tool_name === "string" ? input.tool_name : "";
-    trace({ event: "start", session_id: sessionId, tool_name: toolName });
+    const agentId = typeof input.agent_id === "string" ? input.agent_id : "";
+    const permissionMode = typeof input.permission_mode === "string" ? input.permission_mode : undefined;
+    trace({ event: "start", session_id: sessionId, tool_name: toolName, permission_mode: permissionMode, agent: agentId.length > 0 });
+
+    // PASS-THROUGH GATES — the hold must never block a non-interactive/auto flow. Both exit 0 with zero
+    // output and zero network, so the normal permission flow applies (auto-approval rules still fire; a
+    // dialog shows only if it would have anyway).
+    //
+    // 1. Subagent gate: `agent_id` is present ONLY inside a Task-tool sidechain (the documented way to
+    //    tell a subagent call from a main-thread one). Subagent asks are not human-facing here — never hold.
+    if (agentId.length > 0) {
+      const agentType = typeof input.agent_type === "string" ? input.agent_type : undefined;
+      trace({ event: "exit", reason: "subagent", agent_type: agentType });
+      return;
+    }
+    // 2. Mode gate: hold ONLY for the interactive dialog modes — "default", "acceptEdits", "plan" — and
+    //    for an absent/non-string mode (older CC versions: preserve prior behavior). In "auto" the
+    //    PermissionRequest path runs even when NO dialog would show, so the hook can't tell "would
+    //    auto-run" from "would prompt" — it must not hold. "dontAsk"/"bypassPermissions" never prompt.
+    //    Any unrecognized future value falls open too (fail-open bias).
+    if (permissionMode !== undefined && permissionMode !== "default" && permissionMode !== "acceptEdits" && permissionMode !== "plan") {
+      trace({ event: "exit", reason: "mode", mode: permissionMode });
+      return;
+    }
     const toolInput = typeof input.tool_input === "object" && input.tool_input !== null
       ? (input.tool_input as Record<string, unknown>)
       : {};
