@@ -9,8 +9,8 @@ import {
   buildDoneEnvelope, buildEndEnvelope, buildHeartbeatEnvelope, buildNeedsAttentionEnvelope, buildProvisionalBlob,
   buildProvisionalEnvelope, buildProvisionalRecord, buildStartEnvelope, buildTitleRepairEnvelope, classifySession,
   codexLastTurnEvent, codexTailPendingApproval, correctInterrupt, discoverLiveSessions, goneStrikeShouldTeardown,
-  hasInterruptMarker, IDLE_GRACE_MS, isClaudeIdleReapEligible, lastTurnLine, PAIRING_TTL_MS, pendingPairingExpired,
-  postOutcomeForStatus, provisionalsCoveredByReal, reconcileProvisionalsSweep, shouldHeartbeat, shouldIdleProvisionalCheck,
+  hasInterruptMarker, IDLE_GRACE_MS, isClaudeIdleReapEligible, isRetireEligible, lastTurnLine, PAIRING_TTL_MS, pendingPairingExpired,
+  postOutcomeForStatus, provisionalsCoveredByReal, reconcileProvisionalsSweep, retireDoneStale, shouldHeartbeat, shouldIdleProvisionalCheck,
   shouldInterruptCheck, shouldPendingApprovalCheck, shouldRepairTitle, tailShowsInterrupt, titleRepairedRecord,
 } from "./cc-watchdog";
 import type { PostOutcome, RecordEntry } from "./cc-watchdog";
@@ -466,6 +466,131 @@ describe("reconcileProvisionalsSweep (ends + deletes a covered provisional)", ()
       deleteRecord: async (id) => { deletes.push(id); },
     });
     expect(deletes).toEqual([]);
+  });
+});
+
+// --- idle-done retire (free the worker cap slot a long-idle done row still occupies) --------
+//
+// v1.1.6 froze the reap's blob `at` so an idle done row AGES OUT of the phone's display, but the worker
+// row it left behind still counts against maxSessionsPerPairing. The retire net finishes the job: a
+// Claude done session idle >1 h (pid alive) gets a blob-less op:end carrying the FROZEN real-last-event
+// `at`, and its local record is deleted — freeing the cap slot. Never touches working/needsAttention
+// (they keep heartbeating), never codex (discovery would re-surface it).
+describe("isRetireEligible (a DONE Claude session past the 1 h retire horizon)", () => {
+  const RETIRE_MS = 3_600_000; // must mirror RETIRE_AFTER_MS in cc-watchdog.ts
+  const now = 100_000_000;
+
+  test("a done Claude session idle ≥1 h → eligible; just under → not", () => {
+    expect(isRetireEligible(rec({ op: "done", lastEvent: "done", ts: now - RETIRE_MS }), now)).toBe(true);
+    expect(isRetireEligible(rec({ op: "done", lastEvent: "done", ts: now - RETIRE_MS + 1 }), now)).toBe(false);
+  });
+
+  test("done via lastEvent alone (op absent) still counts", () => {
+    expect(isRetireEligible(rec({ lastEvent: "done", ts: now - RETIRE_MS }), now)).toBe(true);
+  });
+
+  test("working and needsAttention are NEVER retired, no matter how long idle", () => {
+    expect(isRetireEligible(rec({ lastEvent: "working", op: "update", ts: now - RETIRE_MS * 10 }), now)).toBe(false);
+    expect(isRetireEligible(rec({ lastEvent: "needsAttention", op: "update", prio: 1, ts: now - RETIRE_MS * 10 }), now)).toBe(false);
+  });
+
+  test("codex and provisional rows are left to their own machinery (discovery would re-surface them)", () => {
+    expect(isRetireEligible(rec({ agent: "codex", op: "done", lastEvent: "done", ts: now - RETIRE_MS * 5 }), now)).toBe(false);
+    expect(isRetireEligible(rec({ provisional: true, op: "done", lastEvent: "done", ts: now - RETIRE_MS * 5 }), now)).toBe(false);
+  });
+
+  test("a record with no real-event timestamp is un-ageable → not retired", () => {
+    expect(isRetireEligible({ pid: 1, machine: "m", label: "l", op: "done", lastEvent: "done" } as unknown as SessionRecord, now)).toBe(false);
+  });
+
+  test("retirement fires FAR before the 24 h stale cap — the two never contend", () => {
+    // done + 1 h → retired; the same record is nowhere near the 24 h staleness window.
+    const doneOldish = rec({ op: "done", lastEvent: "done", ts: now - RETIRE_MS });
+    expect(isRetireEligible(doneOldish, now)).toBe(true);
+    expect(now - doneOldish.ts).toBeLessThan(86_400_000);
+  });
+});
+
+describe("retireDoneStale (blob-less op:end with frozen `at` + record delete)", () => {
+  const NOW = 100_000_000;
+  const RETIRE_MS = 3_600_000;
+  const done = (over: Partial<SessionRecord> = {}): SessionRecord =>
+    rec({ op: "done", lastEvent: "done", sentDone: true, blob: "DONEBLOB", ts: NOW - RETIRE_MS, ...over });
+
+  test("done + 1 h → POSTs op:end carrying the FROZEN `at`, then deletes the record", async () => {
+    const posts: Array<Record<string, unknown>> = [];
+    const deletes: string[] = [];
+    const record = done();
+    const v = await retireDoneStale(cfg(), "/tmp/s.json", "s", record, NOW, {
+      post: async (b) => { posts.push(b as Record<string, unknown>); return "delivered" as PostOutcome; },
+      deleteRecord: async (p) => { deletes.push(p); },
+    });
+    expect(v).toBe("retired");
+    expect(posts).toHaveLength(1);
+    expect(posts[0]).toMatchObject({ v: 2, sessionId: "s", op: "end", prio: 0 });
+    expect(posts[0].at).toBe(Math.floor(record.ts / 1000)); // FROZEN real-last-event, not NOW
+    expect(posts[0].at).not.toBe(Math.floor(NOW / 1000));
+    expect(deletes).toEqual(["/tmp/s.json"]);
+  });
+
+  test("done + 59 min → NOT eligible: no POST, no delete (the heartbeat keeps it)", async () => {
+    let posted = false;
+    let deleted = false;
+    const v = await retireDoneStale(cfg(), "/tmp/s.json", "s", done({ ts: NOW - RETIRE_MS + 60_000 }), NOW, {
+      post: async () => { posted = true; return "delivered" as PostOutcome; },
+      deleteRecord: async () => { deleted = true; },
+    });
+    expect(v).toBe("skip");
+    expect(posted).toBe(false);
+    expect(deleted).toBe(false);
+  });
+
+  test("a transiently-FAILED end still deletes the record (best-effort; worker eviction backstops)", async () => {
+    const deletes: string[] = [];
+    const v = await retireDoneStale(cfg(), "/tmp/s.json", "s", done(), NOW, {
+      post: async () => "failed" as PostOutcome,
+      deleteRecord: async (p) => { deletes.push(p); },
+    });
+    expect(v).toBe("retired-offline"); // deleted, but not counted as a delivered proof-of-life
+    expect(deletes).toEqual(["/tmp/s.json"]);
+  });
+
+  test("a 404 (revoked) bails WITHOUT deleting — the record is left for the loop's teardown", async () => {
+    let deleted = false;
+    const v = await retireDoneStale(cfg(), "/tmp/s.json", "s", done(), NOW, {
+      post: async () => "revoked" as PostOutcome,
+      deleteRecord: async () => { deleted = true; },
+    });
+    expect(v).toBe("revoked");
+    expect(deleted).toBe(false);
+  });
+
+  test("a working Claude session idle 2 h is NEVER retired (retire only ever touches done rows)", async () => {
+    let posted = false;
+    let deleted = false;
+    const working = rec({ lastEvent: "working", op: "update", blob: "WORK", ts: NOW - RETIRE_MS * 2 });
+    const v = await retireDoneStale(cfg(), "/tmp/s.json", "s", working, NOW, {
+      post: async () => { posted = true; return "delivered" as PostOutcome; },
+      deleteRecord: async () => { deleted = true; },
+    });
+    expect(v).toBe("skip");
+    expect(posted).toBe(false);
+    expect(deleted).toBe(false);
+    // A working session in the heartbeat window (past 5 min, under the 30 min reap) keeps heartbeating —
+    // retire never intervenes for a working row (past 30 min the v1.1.6 reap, not retire, owns its fate).
+    expect(shouldHeartbeat(rec({ lastEvent: "working", op: "update", blob: "WORK", ts: NOW - 600_000 }), NOW, undefined, false)).toBe(true);
+  });
+
+  test("a needsAttention session idle 2 h is kept (an unanswered prompt must keep heartbeating)", async () => {
+    let posted = false;
+    const attn = rec({ lastEvent: "needsAttention", op: "update", prio: 1, blob: "ATTN", ts: NOW - RETIRE_MS * 2 });
+    const v = await retireDoneStale(cfg(), "/tmp/s.json", "s", attn, NOW, {
+      post: async () => { posted = true; return "delivered" as PostOutcome; },
+      deleteRecord: async () => {},
+    });
+    expect(v).toBe("skip");
+    expect(posted).toBe(false);
+    expect(shouldHeartbeat(attn, NOW, undefined, false)).toBe(true); // still heartbeated
   });
 });
 

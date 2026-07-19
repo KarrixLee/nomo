@@ -109,9 +109,17 @@ function startedAtField(record: SessionRecord): { startedAt?: number } {
 
 /** The reap envelope for a dead-pid session: a v2 op:end with NO blob. The worker reuses the last
  *  stored blob for the final frame, so nothing here needs machine/label/title. Carries the record's
- *  cached start when known (`record` omitted at the pure-reap call sites that have no record). */
-export function buildEndEnvelope(sessionId: string, now: number, record?: SessionRecord): object {
-  return { v: 2, sessionId, op: "end", prio: 0, ts: now, ...(record ? startedAtField(record) : {}) };
+ *  cached start when known (`record` omitted at the pure-reap call sites that have no record). The
+ *  optional `at` (epoch SECONDS) rides the clear wire envelope for the idle-done RETIRE path, which
+ *  passes the FROZEN real-last-event time (record.ts/1000, consistent with 5aa1214's frozen blob `at`)
+ *  so the end frame ages by real activity rather than the retirement clock; OMITTED (byte-identical to
+ *  before) for the dead-pid / stale / reconcile callers that pass no `at`. */
+export function buildEndEnvelope(sessionId: string, now: number, record?: SessionRecord, at?: number): object {
+  return {
+    v: 2, sessionId, op: "end", prio: 0, ts: now,
+    ...(record ? startedAtField(record) : {}),
+    ...(typeof at === "number" && Number.isFinite(at) ? { at } : {}),
+  };
 }
 
 /** The interrupt-corrective envelope: a v2 op:done carrying a freshly-encrypted blob with status
@@ -752,6 +760,90 @@ async function correctIdleClaude(config: Config, path: string, sessionId: string
   }
 }
 
+// --- Idle-done retire (free the worker cap slot a long-idle done row still occupies) -----------
+//
+// v1.1.6 froze the reap's blob `at` so a resumed-but-idle Claude session AGES OUT of the phone's
+// display — but that is only a phone-side VISUAL filter. The worker session row the reap left behind
+// (an op:done) still counts against the per-pairing session cap (maxSessionsPerPairing): enough
+// idle-open TUIs and NEW sessions can no longer appear. The frozen `at` never freed that slot. This
+// net closes the last gap: a Claude session that is genuinely DONE (the idle-reaped done, or a normal
+// Stop) whose last REAL event is over an hour old — pid still alive, so the dead-pid reaper never
+// touches it — is RETIRED: a blob-less op:end (the worker DELETES the row, unlike a passively-evicting
+// op:done) carrying the FROZEN real-last-event `at`, plus its local record deleted. Cap slot freed,
+// row gone from the phone.
+//
+// Revival is intact by construction: a retired TUI has no record, but the user's next prompt fires the
+// hooks, which write the record FRESH on that event (trackSession) and re-create the worker session
+// from scratch (a fresh op:start) — retirement is never a one-way door.
+//
+// CLAUDE-ONLY, like the reap it follows: codex has discoverLive, so a retired codex row would be
+// RE-SURFACED as a provisional idle-done on the very next sweep (with a fresh `at`), silently undoing
+// the retirement — codex idle rows are left to the reconcile/notify machinery + the worker's own
+// eviction. And working / needsAttention are NEVER retired no matter how long idle (a silent 2-h build,
+// an unanswered permission prompt): isRetireEligible requires a terminal done state, so those keep
+// heartbeating exactly as before.
+
+/** How long a DONE Claude session may sit event-idle (its last REAL event = record.ts — a heartbeat
+ *  never rewrites it) with its pid alive before the watchdog retires it (blob-less op:end + record
+ *  delete). WHY 1 h: it matches the phone's own display-age filter (the frozen blob `at` ages a done row
+ *  out of view at ~the same horizon), and it sits FAR above both HEARTBEAT_AFTER_MS (5 min) and the
+ *  worker's 30-min eviction — so retirement is always a DELIBERATE, settled decision, never racing a
+ *  session the hooks are still keeping fresh nor one the worker is about to evict anyway. Deliberately
+ *  well below SESSION_STALE_MS (24 h): retirement fires FIRST for done rows, and the 24 h stale cap stays
+ *  the backstop for NON-done sessions (e.g. a needsAttention prompt abandoned for a full day). */
+const RETIRE_AFTER_MS = 3_600_000; // 1 h
+
+/** Whether a KEPT (alive) session is a DONE Claude session past the retire horizon — the predicate the
+ *  retire net keys on. True iff: it's a Claude session (codex has discoverLive; a retired codex row would
+ *  just be re-discovered next sweep), not a provisional discovery row (those are the reconcile/reap
+ *  machinery's business), it is in a terminal done state (op:"done" OR lastEvent:"done" — exactly what the
+ *  v1.1.6 idle-reap writes back and what a normal Stop leaves; NEVER working/needsAttention, so a silent
+ *  build or an unanswered permission prompt keeps heartbeating), and its last REAL event (record.ts) is
+ *  older than RETIRE_AFTER_MS. A record with no numeric ts can't be aged → not retired (classifySession
+ *  deletes it via the un-ageable path instead). Pure so the whole matrix is unit-testable. */
+export function isRetireEligible(record: SessionRecord, now: number): boolean {
+  if (record.agent === "codex") return false;
+  if (record.provisional === true) return false;
+  if (record.op !== "done" && record.lastEvent !== "done") return false;
+  if (typeof record.ts !== "number") return false;
+  return now - record.ts >= RETIRE_AFTER_MS;
+}
+
+/** Injectable seams for the retire net, so its end-POST + delete is testable without fs/network. */
+export interface RetireDeps {
+  post?: (body: object) => Promise<PostOutcome>;
+  deleteRecord?: (path: string) => Promise<void>;
+}
+
+/** The idle-done retire net for one still-alive session. Gated by isRetireEligible, then it POSTs a
+ *  best-effort blob-less op:end carrying the FROZEN real-last-event `at` (record.ts/1000 — so the worker
+ *  ages any surfaced end frame by real activity, consistent with 5aa1214) and DELETES the local record.
+ *  The delete is UNCONDITIONAL on a delivered vs a transiently-failed POST (the slot must free and the row
+ *  must go even through a brief worker blip — the worker's own 30-min eviction is the backstop for a
+ *  dropped end), exactly the delete-regardless discipline of the 24 h stale path. Returns:
+ *   - "retired"         → the op:end 2xx'd; record deleted → the caller counts it delivered (pairing alive).
+ *   - "retired-offline" → the op:end failed transiently but the record was deleted anyway → NOT delivered.
+ *   - "skip"            → not eligible (leave it for the other nets / the heartbeat).
+ *   - "revoked"         → the POST 404'd: the pairing is gone server-side → the caller tears down (the
+ *                         record is LEFT in place, mirroring the stale path's revoke bail). */
+export async function retireDoneStale(
+  config: Config, path: string, sessionId: string, record: SessionRecord, now: number, deps: RetireDeps = {},
+): Promise<"retired" | "retired-offline" | "skip" | "revoked"> {
+  const post = deps.post ?? ((body: object) => postEvent(config, body));
+  const deleteRecord = deps.deleteRecord ?? ((p: string) => unlink(p).catch(() => {}));
+  try {
+    if (!isRetireEligible(record, now)) return "skip";
+    // record.ts is guaranteed a number by isRetireEligible → floor it into epoch seconds for the frozen `at`.
+    const outcome = await post(buildEndEnvelope(sessionId, now, record, Math.floor(record.ts / 1000)));
+    if (outcome === "revoked") return "revoked"; // pairing gone → bubble up; leave the record for teardown
+    heartbeatAt.delete(sessionId); // dropping the row → drop its heartbeat-throttle entry (like the sweep's delete)
+    await deleteRecord(path);
+    return outcome === "delivered" ? "retired" : "retired-offline";
+  } catch {
+    return "skip";
+  }
+}
+
 // --- Codex title-repair (heal a permanent blank title from a dropped post-SessionStart hook) --
 //
 // Codex dispatches SessionStart BEFORE the first prompt is recorded to the rollout, and that hook's
@@ -920,6 +1012,20 @@ async function sweep(config: Config | null): Promise<SweepResult> {
     }
     const verdict = classifySession(record, now, pidAlive);
     if (verdict === "keep") {
+      // Idle-done RETIRE first: a Claude session pinned done (v1.1.6 idle-reap, or a normal Stop) whose
+      // last REAL event is >1 h old — pid still alive — gets a blob-less op:end + its record deleted, so
+      // the per-pairing cap slot its lingering done row occupied is freed. Runs BEFORE remaining++ so a
+      // retired session is neither counted alive nor heartbeated. isRetireEligible never fires for a
+      // working / needsAttention row (those keep heartbeating) nor for codex (discovery would re-surface
+      // it), so this no-ops for everything but a long-idle Claude done row.
+      if (config && record) {
+        const retire = await retireDoneStale(config, path, sessionId, record, now);
+        if (retire === "revoked") return { revoked: true };
+        if (retire !== "skip") {
+          if (retire === "retired") delivered = true; // its op:end 2xx'd → the pairing is alive
+          continue; // record deleted → not counted in remaining, not heartbeated
+        }
+      }
       remaining++;
       if (config && record) {
         // Idle-provisional corrective FIRST: a discovery row advertised "working" whose TUI has gone
