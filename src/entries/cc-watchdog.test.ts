@@ -203,6 +203,27 @@ describe("buildDoneEnvelope (interrupt corrective → v2 op:done + encrypted blo
     const without = await buildDoneEnvelope("s", rec(), 5, KEY) as Record<string, unknown>;
     expect(await decryptBlob(KEY, without.blob as string)).not.toHaveProperty("model"); // omitted, never ""
   });
+  test("stamps the passed `at` (epoch seconds) into the blob; omits it when absent (v1.1.6)", async () => {
+    // The interrupt/idle-provisional correctives pass the OBSERVED now; the idle-CLAUDE reap passes a
+    // FROZEN floor(record.ts/1000) so an hours-idle resumed session ages out (see correctIdleClaude).
+    const withAt = await buildDoneEnvelope("s", rec({ machine: "Mac", label: "proj" }), 5, KEY, "claude", 1_751_900_000) as Record<string, unknown>;
+    expect(await decryptBlob(KEY, withAt.blob as string)).toMatchObject({ status: "done", at: 1_751_900_000 });
+    expect(withAt).not.toHaveProperty("at"); // blob-only — never on the clear envelope
+    const withoutAt = await buildDoneEnvelope("s", rec(), 5, KEY) as Record<string, unknown>;
+    expect(await decryptBlob(KEY, withoutAt.blob as string)).not.toHaveProperty("at");
+  });
+  test("the idle-CLAUDE reap freezes `at` at the record's last real event (floor(record.ts/1000)), NOT now", async () => {
+    // The value the reap passes: a session resumed hours ago (record.ts) must age out, so `at` is frozen
+    // at record.ts/1000, never the watchdog's decision time. This asserts the exact contract the reap uses.
+    const record = rec({ lastEvent: "sessionStart", ts: 1_784_463_341_864, machine: "Mac", label: "api-status" });
+    const reapAt = Math.floor(record.ts / 1000); // what correctIdleClaude passes
+    const now = 1_784_490_874_000; // the watchdog's decision time, ~7.6 h LATER
+    const e = await buildDoneEnvelope("resumed", record, now, KEY, "claude", reapAt) as Record<string, unknown>;
+    expect(e).toMatchObject({ op: "done", ts: now }); // envelope ts is now so the worker accepts it
+    const blob = await decryptBlob(KEY, e.blob as string) as Record<string, unknown>;
+    expect(blob.at).toBe(1_784_463_341); // frozen at the resume, ~7.6 h before `now` — the phone ages it out
+    expect(blob.at).not.toBe(Math.floor(now / 1000));
+  });
 });
 
 // --- live-session discovery seam (provisional builders + the generic discovery step) ---------
@@ -503,6 +524,19 @@ describe("buildHeartbeatEnvelope (re-send the stored blob to re-arm staleness)",
     expect(done).toMatchObject({ startedAt: 700 });
     // Absent on a pre-fix record with no cached start.
     expect(buildHeartbeatEnvelope("s", rec({ op: "update", blob: "B" }), 5)).not.toHaveProperty("startedAt");
+  });
+  test("re-sends the stored blob VERBATIM, so a sealed `at` stays FROZEN across every heartbeat (v1.1.6)", async () => {
+    // The freeze mechanism: the hook seals `at` (the real event time) into the blob; the heartbeat re-sends
+    // that exact string, so the worker's lastEventAt churns on the fresh envelope ts but the phone reads the
+    // UNCHANGED `at` and ages the row from the real event — never from the heartbeat's clock.
+    const sealed = await import("../core/crypto").then((m) =>
+      m.encryptBlob(KEY, { status: "working", title: "t", machine: "m", label: "proj", at: 1_751_900_000 }));
+    const r = rec({ op: "update", prio: 0, blob: sealed });
+    const beatA = buildHeartbeatEnvelope("s", r, 5_000) as { blob: string };
+    const beatB = buildHeartbeatEnvelope("s", r, 9_999_999) as { blob: string };
+    expect(beatA.blob).toBe(sealed); // byte-identical — not re-encrypted
+    expect(beatB.blob).toBe(sealed); // and still identical on a much-later heartbeat
+    expect(await decryptBlob(KEY, beatB.blob)).toMatchObject({ at: 1_751_900_000 }); // `at` frozen despite ts churn
   });
 });
 

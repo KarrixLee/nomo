@@ -198,7 +198,7 @@ export interface PendingEventStash {
   sessionId: string;
   op: CCOp;
   prio: 0 | 1;
-  blob: { status: CCStatus; detail?: string; title: string; machine: string; label: string; agent?: AgentKind; turnStartedAt?: number; model?: string };
+  blob: { status: CCStatus; detail?: string; title: string; machine: string; label: string; agent?: AgentKind; turnStartedAt?: number; model?: string; at?: number };
   /** Epoch-ms the stashing hook fired — bounds the flush to the QR's 10-min TTL (a stale stash is a
    *  ghost from a turn long since over and is dropped, not posted). */
   stashedAt: number;

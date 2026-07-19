@@ -371,6 +371,7 @@ describe("buildEnvelope (v2 envelope + encrypted blob)", () => {
     expect(typeof (env as { blob: string }).blob).toBe("string");
     expect(await decryptBlob(KEY, (env as { blob: string }).blob)).toEqual({
       status: "working", detail: "editing", title: "add font and timer", machine: "Karrix's MacBook", label: "api-status",
+      at: 1, // buildEnvelope always freezes the real event time (floor(now/1000); now=1234 → 1)
     });
   });
 
@@ -484,6 +485,42 @@ describe("model threading (blob-only, optional; omitted when unknown — never a
   });
 });
 
+// --- at (the blob's frozen REAL-activity time, epoch SECONDS — v1.1.6) -------------------------
+//
+// PINNED CROSS-REPO CONTRACT: JSON key `at`, epoch SECONDS (the SAME unit as `turnStartedAt`, NOT the
+// envelope's ms `ts`). It is the phone's honest sort/age key — the worker stamps every inbound frame
+// (including the watchdog's 5-min heartbeats, which re-send the blob VERBATIM) into lastEventAt, so an
+// idle-open TUI that only ever gets heartbeated looked eternally fresh; a blob-frozen `at` lets the phone
+// age it. Appended LAST in the blob (after `model`) so the E2E vectors / older decoders are unaffected.
+describe("at threading (frozen real-event time, blob-only, epoch seconds; appended LAST)", () => {
+  const input = { session_id: "abc", hook_event_name: "PreToolUse", tool_name: "Edit", cwd: "/x/api-status" };
+  const plan = planOp("PreToolUse", input, false)!;
+
+  test("buildBlob includes a known at; OMITS the key when undefined or non-finite", () => {
+    expect(buildBlob(input, "Mac", "t", plan, "claude", undefined, undefined, undefined, 1_751_900_000))
+      .toEqual({ status: "working", detail: "editing", title: "t", machine: "Mac", label: "api-status", at: 1_751_900_000 });
+    expect(buildBlob(input, "Mac", "t", plan)).not.toHaveProperty("at");
+    expect(buildBlob(input, "Mac", "t", plan, "claude", undefined, undefined, undefined, Infinity)).not.toHaveProperty("at");
+  });
+
+  test("at is the LAST key in the blob, after model (append-last discipline for byte-stable decoders)", () => {
+    const blob = buildBlob(input, "Mac", "t", plan, "codex", 1_751_900_000, undefined, "gpt-5-codex", 1_751_900_999);
+    expect(Object.keys(blob)).toEqual(["status", "title", "machine", "label", "detail", "agent", "turnStartedAt", "model", "at"]);
+  });
+
+  test("buildEnvelope ALWAYS freezes at = floor(now/1000) INSIDE the blob; the clear envelope stays blind", async () => {
+    const env = (await buildEnvelope(input, "m", 1_751_900_123_456, "t", KEY, false))!;
+    expect(env).not.toHaveProperty("at"); // never on the wire — the worker stays blind
+    expect(Object.keys(env).sort()).toEqual(["blob", "op", "prio", "sessionId", "ts", "v"]);
+    expect(await decryptBlob(KEY, (env as { blob: string }).blob)).toMatchObject({ at: 1_751_900_123 });
+  });
+
+  test("a mid-pairing stash freezes at = floor(now/1000) inside its plaintext blob (the first pairing frame)", () => {
+    const stop = { session_id: "s1", hook_event_name: "Stop", cwd: "/x" };
+    expect(buildPendingStash(stop, "Mac", "t", 1_751_900_123_456, 7)!.blob).toMatchObject({ at: 1_751_900_123 });
+  });
+});
+
 // --- pending-pairing stash (a hook that fires WHILE pairing is still pending) -----------------
 //
 // Mid-pairing the hook has no e2eKey, so instead of POSTing it stashes the PLAINTEXT event; the
@@ -494,7 +531,7 @@ describe("buildPendingStash (plaintext event stashed while pairing is pending)",
     const input = { session_id: "s1", hook_event_name: "Stop", cwd: "/Users/x/api-status" };
     expect(buildPendingStash(input, "Mac", "add font", 1234, 4242)).toEqual({
       sessionId: "s1", op: "done", prio: 0, stashedAt: 1234, pid: 4242,
-      blob: { status: "done", title: "add font", machine: "Mac", label: "api-status" },
+      blob: { status: "done", title: "add font", machine: "Mac", label: "api-status", at: 1 }, // real event time frozen (floor(1234/1000))
     });
   });
   test("records process.ppid as the session pid by default (the `claude` process, per trackSession)", () => {

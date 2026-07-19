@@ -124,7 +124,7 @@ export function buildEndEnvelope(sessionId: string, now: number, record?: Sessio
  *  record's cached `turnStartedAt` (epoch seconds, stamped by the turn's UserPromptSubmit) is
  *  likewise restamped into the rebuilt blob — omitted when unknown — so the island's frozen
  *  "done in Xm" keeps measuring the TURN, exactly as a hook-built done blob would. */
-export async function buildDoneEnvelope(sessionId: string, record: SessionRecord, now: number, e2eKey: Uint8Array, agent: AgentKind = "claude"): Promise<object> {
+export async function buildDoneEnvelope(sessionId: string, record: SessionRecord, now: number, e2eKey: Uint8Array, agent: AgentKind = "claude", at?: number): Promise<object> {
   const blob = await encryptBlob(e2eKey, {
     status: "done",
     title: typeof record.title === "string" ? record.title : "",
@@ -136,6 +136,11 @@ export async function buildDoneEnvelope(sessionId: string, record: SessionRecord
     // The record's cached model id (v0.8.5, cached like title) — restamped so the rebuilt blob keeps
     // the phone's model badge; OMITTED when the record has none (the app then hides the badge).
     ...(typeof record.model === "string" && record.model.length > 0 ? { model: record.model } : {}),
+    // `at` (epoch SECONDS, the phone's honest sort/age key — see hook.ts buildBlob), appended LAST.
+    // Interrupt/idle-provisional correctives pass the OBSERVED now (the done happened just now); the
+    // idle-CLAUDE reap passes a FROZEN record.ts so a session idle for hours ages out immediately
+    // instead of looking freshly finished. OMITTED when the caller has no honest time.
+    ...(typeof at === "number" && Number.isFinite(at) ? { at } : {}),
   });
   return { v: 2, sessionId, op: "done", prio: 0, ts: now, blob, ...startedAtField(record) };
 }
@@ -148,7 +153,7 @@ export async function buildDoneEnvelope(sessionId: string, record: SessionRecord
  *  label come from the record (coerced to "" if a corrupt record dropped them), `agent` restamps the
  *  blob's optional agent:"codex" via the adapter seam, and the record's cached `turnStartedAt` is
  *  restamped so the island timer keeps measuring the same turn — exactly as buildDoneEnvelope does. */
-export async function buildNeedsAttentionEnvelope(sessionId: string, record: SessionRecord, now: number, e2eKey: Uint8Array, agent: AgentKind = "claude"): Promise<object> {
+export async function buildNeedsAttentionEnvelope(sessionId: string, record: SessionRecord, now: number, e2eKey: Uint8Array, agent: AgentKind = "claude", at?: number): Promise<object> {
   const blob = await encryptBlob(e2eKey, {
     status: "needsAttention",
     title: typeof record.title === "string" ? record.title : "",
@@ -159,6 +164,9 @@ export async function buildNeedsAttentionEnvelope(sessionId: string, record: Ses
     ...(typeof record.turnStartedAt === "number" && Number.isFinite(record.turnStartedAt) ? { turnStartedAt: record.turnStartedAt } : {}),
     // The record's cached model id, restamped exactly as buildDoneEnvelope does (omitted when absent).
     ...(typeof record.model === "string" && record.model.length > 0 ? { model: record.model } : {}),
+    // `at` (epoch SECONDS) appended LAST — the OBSERVED now (the block was detected just now, and the
+    // phone should surface it as a live prompt). OMITTED when the caller has no honest time.
+    ...(typeof at === "number" && Number.isFinite(at) ? { at } : {}),
   });
   return { v: 2, sessionId, op: "update", prio: 1, ts: now, blob, ...startedAtField(record) };
 }
@@ -273,9 +281,14 @@ async function readAllRecords(): Promise<SessionRecord[]> {
  *  idle TUI advertised as working stuck "Running" on the phone forever (the v0.8.4 idle-TUI fix; see
  *  codexTurnActiveFromTail in adapter.ts). */
 export async function buildProvisionalBlob(
-  d: DiscoveredSession, machine: string, blobAgentFields: { agent?: AgentKind }, e2eKey: Uint8Array,
+  d: DiscoveredSession, machine: string, blobAgentFields: { agent?: AgentKind }, e2eKey: Uint8Array, at?: number,
 ): Promise<string> {
-  return encryptBlob(e2eKey, { status: d.idle === true ? "done" : "working", title: d.title ?? "", machine, label: d.label, ...blobAgentFields });
+  // `at` (epoch SECONDS) appended LAST — the OBSERVED discovery time (a process-scan can't know the
+  // TUI's real last-activity, so "now" is the honest value). OMITTED when the caller has none.
+  return encryptBlob(e2eKey, {
+    status: d.idle === true ? "done" : "working", title: d.title ?? "", machine, label: d.label, ...blobAgentFields,
+    ...(typeof at === "number" && Number.isFinite(at) ? { at } : {}),
+  });
 }
 
 /** The provisional envelope. An in-flight TUI mirrors a real SessionStart (op:start); an IDLE one is
@@ -358,7 +371,7 @@ export async function discoverLiveSessions(config: Config, deps: DiscoverDeps = 
     for (const d of discovered) {
       const ts = now();
       const idle = d.idle === true;
-      const blob = await buildProvisionalBlob(d, machine, adapter.blobAgentFields, config.e2eKey);
+      const blob = await buildProvisionalBlob(d, machine, adapter.blobAgentFields, config.e2eKey, Math.floor(ts / 1000));
       const outcome = await post(buildProvisionalEnvelope(d.sessionId, blob, ts, idle));
       if (outcome !== "delivered") continue; // failed/revoked → retry next sweep, don't persist a ghost
       await writeRecord(d.sessionId, buildProvisionalRecord(d, machine, blob, adapter.blobAgentFields, ts, config.pairingId, idle));
@@ -509,7 +522,9 @@ export async function correctInterrupt(
       try { await writeRecord(path, { ...record, lastEvent: "done", sentDone: true, op: "done", doneAttempts: undefined }); } catch { /* best-effort */ }
       return "pending";
     }
-    const outcome = await post(await buildDoneEnvelope(sessionId, record, clock(), config.e2eKey, agent));
+    // The interrupt was just detected, so the corrective done's `at` is the OBSERVED now (epoch seconds).
+    const doneNow = clock();
+    const outcome = await post(await buildDoneEnvelope(sessionId, record, doneNow, config.e2eKey, agent, Math.floor(doneNow / 1000)));
     if (outcome === "revoked") return "revoked"; // pairing gone → bubble up so the loop can tear down
     if (outcome === "delivered") {
       // 2xx: pin the session done and CLEAR the retry counter so the gate skips it and the next hook re-arms.
@@ -577,7 +592,9 @@ async function correctPendingApproval(config: Config, path: string, sessionId: s
       return "uncorrected"; // transcript missing / cold-compressed → nothing to check
     }
     if (!adapter.tailShowsPendingApproval!(tail)) return "uncorrected"; // no pending approval → leave it
-    const outcome = await postEvent(config, await buildNeedsAttentionEnvelope(sessionId, record, Date.now(), config.e2eKey, agent));
+    // Just-detected block → `at` is the OBSERVED now (epoch seconds).
+    const attnNow = Date.now();
+    const outcome = await postEvent(config, await buildNeedsAttentionEnvelope(sessionId, record, attnNow, config.e2eKey, agent, Math.floor(attnNow / 1000)));
     if (outcome === "revoked") return "revoked"; // pairing gone → bubble up so the loop can tear down
     if (outcome !== "delivered") return "uncorrected"; // failed POST → keep the file, retry next sweep
     // 2xx: pin the session needsAttention so this net fires once per episode and the interrupt-net
@@ -636,7 +653,9 @@ async function correctIdleProvisional(config: Config, path: string, sessionId: s
     let active = false;
     try { active = await adapter.pidTurnActive!(record.pid); } catch { /* idle-biased, like discovery */ }
     if (active) return "uncorrected"; // a turn is open → the working row is honest → leave it
-    const outcome = await postEvent(config, await buildDoneEnvelope(sessionId, record, Date.now(), config.e2eKey, agent));
+    // TUI just went idle → the done's `at` is the OBSERVED now (epoch seconds).
+    const idleNow = Date.now();
+    const outcome = await postEvent(config, await buildDoneEnvelope(sessionId, record, idleNow, config.e2eKey, agent, Math.floor(idleNow / 1000)));
     if (outcome === "revoked") return "revoked"; // pairing gone → bubble up so the loop can tear down
     if (outcome !== "delivered") return "uncorrected"; // failed POST → keep the file, retry next sweep
     // 2xx: pin the provisional done so the gate closes and the heartbeat can never re-arm "working".
@@ -663,6 +682,17 @@ async function correctIdleProvisional(config: Config, path: string, sessionId: s
 // When a tracked CLAUDE session has gone event-idle past a generous grace with its pid still alive, it
 // gets ONE corrective op:done (the SAME envelope the interrupt net posts) and its record is pinned done —
 // re-arming on the session's next real hook exactly like the interrupt net's done.
+//
+// This covers the resumed-but-never-prompted case verbatim: `claude --resume` (Claude Desktop, or a
+// cmux/tmux resume) fires SessionStart — record.lastEvent:"sessionStart" — then zero turns, so record.ts is
+// pinned at the resume and nothing ever advances it (heartbeats never rewrite ts). isClaudeIdleReapEligible
+// keys on BOTH "working" and "sessionStart", so 30 min after the resume this net reaps it. CRITICALLY the
+// reap's done blob freezes `at` at record.ts (the real resume time, hours old) rather than "now", so the
+// phone ages the row out instead of showing a freshly-finished session forever (live repro 2026-07-19: a
+// cmux-resumed session sat "working/fresh" 7+ h — the worker's lastEventAt only ever saw heartbeat POSTs,
+// never a real event, so without a frozen blob `at` the row could never age). IDLE-biased, like the
+// codex-side defaults documented in adapter.ts: reaping a session that turns out still-live merely costs
+// one frame — its next real hook re-arms it to working — whereas never reaping sticks forever.
 
 /** How long a CLAUDE session may sit event-idle (no REAL hook since record.ts — a heartbeat never rewrites
  *  it) while its pid is alive before the watchdog reaps it with a corrective done. 30 min sits FAR above
@@ -699,7 +729,12 @@ async function correctIdleClaude(config: Config, path: string, sessionId: string
   try {
     if (!isClaudeIdleReapEligible(record, now)) return "uncorrected";
     // Claude-only by the gate above, so the corrective done carries the claude blob shape (no agent key).
-    const outcome = await postEvent(config, await buildDoneEnvelope(sessionId, record, Date.now(), config.e2eKey, "claude"));
+    // The done blob's `at` is FROZEN at the record's last REAL event (record.ts, epoch seconds) — NOT
+    // now: this session has been idle for hours (a resumed-but-never-prompted TUI, or a long-finished
+    // one whose Stop dropped), so stamping "now" would make the phone show a freshly-finished row that
+    // never ages out — the very "eternally fresh" bug this reap exists to kill. record.ts is guaranteed
+    // a finite number by isClaudeIdleReapEligible. (envelope `ts` stays now so the worker accepts the frame.)
+    const outcome = await postEvent(config, await buildDoneEnvelope(sessionId, record, Date.now(), config.e2eKey, "claude", Math.floor(record.ts / 1000)));
     if (outcome === "revoked") return "revoked"; // pairing gone → bubble up so the loop can tear down
     if (outcome !== "delivered") return "uncorrected"; // failed POST → keep the file, retry next sweep
     // 2xx: pin the session done so the gate closes and the heartbeat can never re-arm "working"; the next
@@ -747,7 +782,7 @@ function statusFromRecord(record: SessionRecord): CCStatus {
  *  session_index thread_name existed and then had every later hook dropped. Loses only the transient tool
  *  `detail` sub-status (never cached on the record) — restored by the next real hook. */
 export async function buildTitleRepairEnvelope(
-  sessionId: string, record: SessionRecord, title: string, now: number, e2eKey: Uint8Array, agent: AgentKind = "codex",
+  sessionId: string, record: SessionRecord, title: string, now: number, e2eKey: Uint8Array, agent: AgentKind = "codex", at?: number,
 ): Promise<{ v: 2; sessionId: string; op: CCOp; prio: 0 | 1; ts: number; blob: string; startedAt?: number }> {
   const blob = await encryptBlob(e2eKey, {
     status: statusFromRecord(record),
@@ -757,6 +792,9 @@ export async function buildTitleRepairEnvelope(
     ...adapterFor(agent).blobAgentFields,
     ...(typeof record.turnStartedAt === "number" && Number.isFinite(record.turnStartedAt) ? { turnStartedAt: record.turnStartedAt } : {}),
     ...(typeof record.model === "string" && record.model.length > 0 ? { model: record.model } : {}),
+    // `at` (epoch SECONDS) appended LAST — the OBSERVED now: this re-POSTs the session's CURRENT state
+    // (a fresh frame with the title fixed), so the phone should treat it as live. Omitted when absent.
+    ...(typeof at === "number" && Number.isFinite(at) ? { at } : {}),
   });
   return { v: 2, sessionId, op: record.op ?? "update", prio: record.prio ?? 0, ts: now, blob, ...startedAtField(record) };
 }
@@ -800,7 +838,9 @@ async function repairTitle(config: Config, path: string, sessionId: string, reco
     // the rollout-prefix fallback (the UserPromptSubmit input.prompt path is inert without an input).
     const title = await codexAdapter.title({ sessionId, prefix, input: {}, transcriptPath: record.transcript });
     if (!title) return "uncorrected"; // still no title (pre-thread_name, empty rollout) → retry next sweep
-    const envelope = await buildTitleRepairEnvelope(sessionId, record, title, Date.now(), config.e2eKey, "codex");
+    // Re-POSTing the CURRENT state with the title fixed → `at` is the OBSERVED now (epoch seconds).
+    const repairNow = Date.now();
+    const envelope = await buildTitleRepairEnvelope(sessionId, record, title, repairNow, config.e2eKey, "codex", Math.floor(repairNow / 1000));
     const outcome = await postEvent(config, envelope);
     if (outcome === "revoked") return "revoked"; // pairing gone → bubble up so the loop can tear down
     if (outcome !== "delivered") return "uncorrected"; // failed POST → keep the old record, retry next sweep

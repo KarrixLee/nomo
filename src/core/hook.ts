@@ -156,8 +156,8 @@ export function transcriptStartMs(prefix: string): number | undefined {
  *  given: a mid-session `cd` changes input.cwd on every later hook, and re-deriving the label per event
  *  silently renamed the phone row / island folder chip (observed live: "api-status" → "server" after a
  *  `cd server`). Absent/empty → first event (or a recordless caller): derive from cwd as before. */
-export function buildBlob(input: Record<string, unknown>, machine: string, title: string | undefined, plan: OpPlan, agent: AgentKind = "claude", turnStartedAt?: number, pinnedLabel?: string, model?: string): {
-  status: CCStatus; detail?: string; title: string; machine: string; label: string; agent?: AgentKind; turnStartedAt?: number; model?: string;
+export function buildBlob(input: Record<string, unknown>, machine: string, title: string | undefined, plan: OpPlan, agent: AgentKind = "claude", turnStartedAt?: number, pinnedLabel?: string, model?: string, at?: number): {
+  status: CCStatus; detail?: string; title: string; machine: string; label: string; agent?: AgentKind; turnStartedAt?: number; model?: string; at?: number;
 } {
   const label = typeof pinnedLabel === "string" && pinnedLabel.length > 0
     ? pinnedLabel
@@ -171,12 +171,23 @@ export function buildBlob(input: Record<string, unknown>, machine: string, title
   // the session's raw model id, e.g. "claude-fable-5" / "gpt-5-codex", resolved by the adapter's
   // optional model seam) follows the same rule: OMITTED entirely when unknown, never an empty string;
   // the phone hides its badge when the key is absent.
+  //
+  // `at` (v1.1.6 — epoch SECONDS, the SAME unit as `turnStartedAt`, NOT the envelope's ms `ts`) freezes
+  // the REAL activity time of the hook event this blob reports. It is the phone's honest sort/age key:
+  // the worker stamps EVERY inbound frame (including the watchdog's 5-min staleness heartbeats, which
+  // re-send this blob VERBATIM) into its `lastEventAt`, so an idle-open TUI that only ever gets
+  // heartbeated looked eternally fresh and never aged out. Because the heartbeat re-sends this blob byte
+  // for byte, `at` stays pinned at the last REAL event and the phone can age the row correctly.
+  // PINNED CROSS-REPO CONTRACT: key `at`, epoch seconds. Appended LAST (after `model`) so the E2E
+  // vectors / older decoders that depend on the existing key order are unaffected; OMITTED entirely when
+  // unknown (never 0), like every optional blob key.
   return {
     status: plan.status, title: title ?? "", machine, label,
     ...(detail ? { detail } : {}),
     ...(agent === "codex" ? { agent: "codex" as const } : {}),
     ...(typeof turnStartedAt === "number" && Number.isFinite(turnStartedAt) ? { turnStartedAt } : {}),
     ...(typeof model === "string" && model.length > 0 ? { model } : {}),
+    ...(typeof at === "number" && Number.isFinite(at) ? { at } : {}),
   };
 }
 
@@ -199,9 +210,12 @@ export async function buildEnvelope(
   const base: Record<string, unknown> = { v: 2, sessionId: i.session_id, op: plan.op, prio: plan.prio, ts: now };
   if (typeof startedAt === "number" && Number.isFinite(startedAt)) base.startedAt = startedAt;
   if (plan.op === "end") return base; // clean SessionEnd carries no content — worker reuses last blob
-  // turnStartedAt and model ride INSIDE the encrypted blob only — the clear envelope shape above must
-  // stay byte-identical (no new fields the worker could see; zero server changes).
-  const blob = await encryptBlob(e2eKey, buildBlob(i, machine, title, plan, agent, turnStartedAt, pinnedLabel, model));
+  // turnStartedAt, model, and `at` ride INSIDE the encrypted blob only — the clear envelope shape above
+  // must stay byte-identical (no new fields the worker could see; zero server changes). `at` is the real
+  // event time (`now`) in epoch SECONDS — the phone's honest sort/age key, frozen here and re-sent
+  // verbatim by every watchdog heartbeat so an idle-but-heartbeated session ages out (see buildBlob).
+  const at = Math.floor(now / 1000);
+  const blob = await encryptBlob(e2eKey, buildBlob(i, machine, title, plan, agent, turnStartedAt, pinnedLabel, model, at));
   return { ...base, blob };
 }
 
@@ -227,8 +241,11 @@ export function buildPendingStash(
   // start is genuinely unknown and the blob omits it (the widget falls back to `startedAt`).
   const turnStartedAt = hookName === "UserPromptSubmit" ? Math.floor(now / 1000) : undefined;
   // `model` rides inside the stashed plaintext blob (like `agent`), so the flush's first pairing
-  // frame carries it and the flush-written session record can cache it.
-  return { sessionId: input.session_id, op: plan.op, prio: plan.prio, blob: buildBlob(input, machine, title, plan, agent, turnStartedAt, undefined, model), stashedAt: now, pid };
+  // frame carries it and the flush-written session record can cache it. `at` (epoch seconds of the
+  // stashing hook's real event) rides the same way, so the first flushed frame carries an honest
+  // activity time for the phone to age by.
+  const at = Math.floor(now / 1000);
+  return { sessionId: input.session_id, op: plan.op, prio: plan.prio, blob: buildBlob(input, machine, title, plan, agent, turnStartedAt, undefined, model, at), stashedAt: now, pid };
 }
 
 /** Stash THIS hook's plaintext event next to config.json (owner-only, like config.json) so the pairing
