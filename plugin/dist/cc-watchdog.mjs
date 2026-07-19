@@ -92,7 +92,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { execFileSync, spawn } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "1.1.0";
+var PLUGIN_VERSION = "1.1.1";
 var CC_DIR = `${process.env.HOME}/.config/cc-status`;
 var SESSIONS_DIR = `${CC_DIR}/sessions`;
 var WATCHDOG_PID_PATH = `${CC_DIR}/watchdog.pid`;
@@ -1452,6 +1452,7 @@ async function reconcileProvisionalsSweep(config, deps = {}) {
 }
 var INTERRUPT_TAIL_BYTES = 8 * 1024;
 var WORKING_STALE_MS = 20000;
+var INTERRUPT_DONE_MAX_ATTEMPTS = 5;
 function tailShowsInterrupt(tail, agent) {
   return adapterFor(agent).detectInterrupt(tail);
 }
@@ -1465,29 +1466,43 @@ function shouldInterruptCheck(record, now) {
   }
   return false;
 }
-async function correctInterrupt(config, path, sessionId, record, now) {
+async function correctInterrupt(config, path, sessionId, record, now, deps = {}) {
+  const post = deps.post ?? ((body) => postEvent(config, body));
+  const readTail = deps.readTail ?? ((p, bytes) => readSuffix(p, bytes));
+  const writeRecord = deps.writeRecord ?? ((p, rec) => atomicWrite(p, JSON.stringify(rec), 384));
+  const clock = deps.now ?? Date.now;
   try {
     if (!shouldInterruptCheck(record, now))
       return "uncorrected";
     let tail;
     try {
-      tail = await readSuffix(record.transcript, INTERRUPT_TAIL_BYTES);
+      tail = await readTail(record.transcript, INTERRUPT_TAIL_BYTES);
     } catch {
       return "uncorrected";
     }
     const agent = record.agent === "codex" ? "codex" : "claude";
     if (!tailShowsInterrupt(tail, agent))
       return "uncorrected";
-    const outcome = await postEvent(config, await buildDoneEnvelope(sessionId, record, Date.now(), config.e2eKey, agent));
+    const attempts = typeof record.doneAttempts === "number" && Number.isFinite(record.doneAttempts) ? record.doneAttempts : 0;
+    if (attempts >= INTERRUPT_DONE_MAX_ATTEMPTS) {
+      try {
+        await writeRecord(path, { ...record, lastEvent: "done", sentDone: true, op: "done", doneAttempts: undefined });
+      } catch {}
+      return "pending";
+    }
+    const outcome = await post(await buildDoneEnvelope(sessionId, record, clock(), config.e2eKey, agent));
     if (outcome === "revoked")
       return "revoked";
-    if (outcome !== "delivered")
-      return "uncorrected";
+    if (outcome === "delivered") {
+      try {
+        await writeRecord(path, { ...record, lastEvent: "done", sentDone: true, op: "done", doneAttempts: undefined });
+      } catch {}
+      return "corrected";
+    }
     try {
-      const next = { ...record, lastEvent: "done", sentDone: true, op: "done" };
-      await atomicWrite(path, JSON.stringify(next), 384);
+      await writeRecord(path, { ...record, doneAttempts: attempts + 1 });
     } catch {}
-    return "corrected";
+    return "pending";
   } catch {
     return "uncorrected";
   }
@@ -1659,6 +1674,8 @@ async function repairTitle(config, path, sessionId, record) {
 function shouldHeartbeat(record, now, lastHeartbeat, correctedThisSweep) {
   if (record.op === "done")
     return false;
+  if (typeof record.doneAttempts === "number" && record.doneAttempts > 0)
+    return false;
   if (isClaudeIdleReapEligible(record, now))
     return false;
   if (correctedThisSweep)
@@ -1706,8 +1723,9 @@ async function sweep(config) {
           return { revoked: true };
         if (corrected === "corrected")
           delivered = true;
+        const interruptHandled = corrected === "corrected" || corrected === "pending";
         let flaggedAttention = false;
-        if (corrected !== "corrected") {
+        if (!interruptHandled) {
           const attn = await correctPendingApproval(config, path, sessionId, record, now);
           if (attn === "revoked")
             return { revoked: true };
@@ -1717,7 +1735,7 @@ async function sweep(config) {
           }
         }
         let reapedIdle = false;
-        if (idleFix !== "corrected" && corrected !== "corrected" && !flaggedAttention) {
+        if (idleFix !== "corrected" && !interruptHandled && !flaggedAttention) {
           const idleClaude = await correctIdleClaude(config, path, sessionId, record, now);
           if (idleClaude === "revoked")
             return { revoked: true };
@@ -1727,7 +1745,7 @@ async function sweep(config) {
           }
         }
         let repairedTitle = false;
-        if (idleFix !== "corrected" && corrected !== "corrected" && !flaggedAttention && !reapedIdle) {
+        if (idleFix !== "corrected" && !interruptHandled && !flaggedAttention && !reapedIdle) {
           const titleFix = await repairTitle(config, path, sessionId, record);
           if (titleFix === "revoked")
             return { revoked: true };
@@ -1736,7 +1754,7 @@ async function sweep(config) {
             repairedTitle = true;
           }
         }
-        if (shouldHeartbeat(record, now, heartbeatAt.get(sessionId), idleFix === "corrected" || corrected === "corrected" || flaggedAttention || reapedIdle || repairedTitle)) {
+        if (shouldHeartbeat(record, now, heartbeatAt.get(sessionId), idleFix === "corrected" || interruptHandled || flaggedAttention || reapedIdle || repairedTitle)) {
           const beat = buildHeartbeatEnvelope(sessionId, record, Date.now(), config.pairingId);
           if (beat) {
             const outcome = await postEvent(config, beat);
@@ -1897,6 +1915,7 @@ export {
   hasInterruptMarker,
   goneStrikeShouldTeardown,
   discoverLiveSessions,
+  correctInterrupt,
   codexTailPendingApproval,
   codexLastTurnEvent,
   claudeTailPendingApproval,
