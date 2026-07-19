@@ -92,7 +92,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { execFileSync, spawn } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "1.1.6";
+var PLUGIN_VERSION = "1.1.7";
 var CC_DIR = `${process.env.HOME}/.config/cc-status`;
 var SESSIONS_DIR = `${CC_DIR}/sessions`;
 var WATCHDOG_PID_PATH = `${CC_DIR}/watchdog.pid`;
@@ -1299,8 +1299,16 @@ function classifySession(record, now, isAlive) {
 function startedAtField(record) {
   return typeof record.sessionStartedAt === "number" && Number.isFinite(record.sessionStartedAt) ? { startedAt: record.sessionStartedAt } : {};
 }
-function buildEndEnvelope(sessionId, now, record) {
-  return { v: 2, sessionId, op: "end", prio: 0, ts: now, ...record ? startedAtField(record) : {} };
+function buildEndEnvelope(sessionId, now, record, at) {
+  return {
+    v: 2,
+    sessionId,
+    op: "end",
+    prio: 0,
+    ts: now,
+    ...record ? startedAtField(record) : {},
+    ...typeof at === "number" && Number.isFinite(at) ? { at } : {}
+  };
 }
 async function buildDoneEnvelope(sessionId, record, now, e2eKey, agent = "claude", at) {
   const blob = await encryptBlob(e2eKey, {
@@ -1625,6 +1633,34 @@ async function correctIdleClaude(config, path, sessionId, record, now) {
     return "uncorrected";
   }
 }
+var RETIRE_AFTER_MS = 3600000;
+function isRetireEligible(record, now) {
+  if (record.agent === "codex")
+    return false;
+  if (record.provisional === true)
+    return false;
+  if (record.op !== "done" && record.lastEvent !== "done")
+    return false;
+  if (typeof record.ts !== "number")
+    return false;
+  return now - record.ts >= RETIRE_AFTER_MS;
+}
+async function retireDoneStale(config, path, sessionId, record, now, deps = {}) {
+  const post = deps.post ?? ((body) => postEvent(config, body));
+  const deleteRecord = deps.deleteRecord ?? ((p) => unlink2(p).catch(() => {}));
+  try {
+    if (!isRetireEligible(record, now))
+      return "skip";
+    const outcome = await post(buildEndEnvelope(sessionId, now, record, Math.floor(record.ts / 1000)));
+    if (outcome === "revoked")
+      return "revoked";
+    heartbeatAt.delete(sessionId);
+    await deleteRecord(path);
+    return outcome === "delivered" ? "retired" : "retired-offline";
+  } catch {
+    return "skip";
+  }
+}
 var TITLE_REPAIR_HEAD_BYTES = 128 * 1024;
 function statusFromRecord(record) {
   if (record.lastEvent === "needsAttention")
@@ -1725,6 +1761,16 @@ async function sweep(config) {
     }
     const verdict = classifySession(record, now, pidAlive);
     if (verdict === "keep") {
+      if (config && record) {
+        const retire = await retireDoneStale(config, path, sessionId, record, now);
+        if (retire === "revoked")
+          return { revoked: true };
+        if (retire !== "skip") {
+          if (retire === "retired")
+            delivered = true;
+          continue;
+        }
+      }
       remaining++;
       if (config && record) {
         const idleFix = await correctIdleProvisional(config, path, sessionId, record);
@@ -1920,11 +1966,13 @@ export {
   shouldInterruptCheck,
   shouldIdleProvisionalCheck,
   shouldHeartbeat,
+  retireDoneStale,
   reconcileProvisionalsSweep,
   provisionalsCoveredByReal,
   postOutcomeForStatus,
   pendingPairingExpired,
   lastTurnLine,
+  isRetireEligible,
   isClaudeIdleReapEligible,
   hasInterruptMarker,
   goneStrikeShouldTeardown,
