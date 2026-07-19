@@ -30,8 +30,21 @@ export const NO_HOLD_PATH = `${CC_DIR}/no-hold`;
 
 /** How often to poll for the phone's answer while holding (ms). Small jitter is added per cycle. */
 const POLL_INTERVAL_MS = 3_000;
-/** Per-fetch ceiling — the "2s" half of the contract survives; only the TOTAL wait is unbounded. */
+/** Per-fetch ceiling for the poll GETs — the "2s" half of the contract survives; only the TOTAL wait
+ *  is unbounded. */
 const FETCH_TIMEOUT_MS = 2_000;
+/** The initial decision POST is DELIBERATELY allowed to block (the 2s reflex is wrong here): the
+ *  worker's decision route can legitimately take a few seconds (cold isolate, an APNs push on the
+ *  request path, network variance), and a 2s ceiling starved every real hold into a fail-open exit
+ *  before anyone could poll. Give ONLY this POST a generous deadline. */
+const POST_TIMEOUT_MS = 15_000;
+/** One retry of the initial POST on a timeout/network error (never on a non-ok HTTP status — that is a
+ *  real answer). The retry re-POSTs the SAME requestId + blobs: the worker's supersede no-ops on an
+ *  identical id and putDecision idempotently re-stores the pending record, so a re-POST after a first
+ *  attempt that actually reached the worker is safe. */
+const POST_MAX_ATTEMPTS = 2;
+/** Pause before the single POST retry. */
+const POST_RETRY_PAUSE_MS = 1_000;
 /** Give-up cap: this many consecutive polls without a 2xx (~5 min of sustained failure) → the worker
  *  is unreachable → exit silently (fail open, terminal dialog after Esc/retry). A successful poll —
  *  including a plain {status:"pending"} — resets the counter, so a healthy hold is unbounded. */
@@ -219,29 +232,37 @@ export async function runPermissionHook(deps: PermissionHookDeps = {}): Promise<
     const fallbackBlob = await encryptBlob(config.e2eKey, base);
 
     const pcHeaders = { "x-cc-pairing": config.pairingId, "x-cc-auth": config.pcSecret, "x-cc-version": PLUGIN_VERSION };
+    const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
 
+    // The initial POST is the one place this hook is ALLOWED to block: give it POST_TIMEOUT_MS and one
+    // retry on a timeout/network error (a non-ok HTTP status is a real answer — never retried). Any HTTP
+    // response ends the loop; only both attempts failing at the transport layer fails open.
     let hold = false;
-    try {
-      const res = await fetchFn(`${config.url}/v1/cc/decision`, {
-        method: "POST",
-        headers: { "content-type": "application/json", ...pcHeaders },
-        body: JSON.stringify({ v: 2, sessionId, requestId, op: "update", prio: 1, ts: now, blob, fallbackBlob }),
-        signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
-      });
-      trace({ event: "posted", requestId, status: res.status });
-      if (res.ok) hold = ((await res.json()) as { hold?: unknown }).hold === true;
-    } catch (e) {
-      trace({ event: "posted", requestId, status: 0, error: (e as { name?: string })?.name ?? "Error" });
-      trace({ event: "exit", reason: "post-error" });
-      return; // network/timeout on the POST → fail open (terminal dialog)
+    let posted = false;
+    for (let attempt = 1; attempt <= POST_MAX_ATTEMPTS; attempt += 1) {
+      try {
+        const res = await fetchFn(`${config.url}/v1/cc/decision`, {
+          method: "POST",
+          headers: { "content-type": "application/json", ...pcHeaders },
+          body: JSON.stringify({ v: 2, sessionId, requestId, op: "update", prio: 1, ts: now, blob, fallbackBlob }),
+          signal: AbortSignal.timeout(POST_TIMEOUT_MS),
+        });
+        trace({ event: "posted", requestId, attempt, status: res.status });
+        if (res.ok) hold = ((await res.json()) as { hold?: unknown }).hold === true;
+        posted = true;
+        break; // any HTTP response (ok or not) is a real answer — do not retry
+      } catch (e) {
+        trace({ event: "posted", requestId, attempt, status: 0, error: (e as { name?: string })?.name ?? "Error" });
+        if (attempt < POST_MAX_ATTEMPTS) { await sleep(POST_RETRY_PAUSE_MS); continue; } // retry the timed-out/failed POST once
+      }
     }
+    if (!posted) { trace({ event: "exit", reason: "post-error" }); return; } // both attempts failed at the transport → fail open
     trace({ event: "hold", hold });
     if (!hold) { trace({ event: "exit", reason: "hold-false" }); return; } // hold:false → worker already applied the attention update → terminal dialog
 
     // HOLD: poll until the phone answers, the request leaves "pending", sustained failure trips the
     // give-up cap, or we're killed. Each fetch keeps its own 2s ceiling; transient failures are
     // tolerated (keep polling). A decrypt failure or requestId mismatch exits silently (fail open).
-    const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
     const jitter = deps.jitter ?? (() => Math.floor(Math.random() * 500));
     const interval = deps.pollIntervalMs ?? POLL_INTERVAL_MS;
     const emit = deps.emit ?? ((line: string) => process.stdout.write(`${line}\n`));

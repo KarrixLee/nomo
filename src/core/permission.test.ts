@@ -170,6 +170,45 @@ describe("runPermissionHook — hold state machine", () => {
     expect(emitted).toEqual([]);
   });
 
+  test("POST times out once then the retry succeeds → holds and answers normally", async () => {
+    const answerBlob = await encryptBlob(KEY, { requestId: "req-fixed", decision: "allow", ts: 5 });
+    const gets: Array<Record<string, unknown>> = [{ status: "pending" }, { status: "answered", answerBlob }];
+    const emitted: string[] = [];
+    const events: Array<{ event: string; attempt?: number }> = [];
+    let postCount = 0;
+    let g = 0;
+    const fn = (async (url: string) => {
+      if (url.endsWith("/v1/cc/decision")) {
+        postCount += 1;
+        if (postCount === 1) { const e = new Error("timeout"); e.name = "TimeoutError"; throw e; }
+        return new Response(JSON.stringify({ hold: true }), { status: 200 });
+      }
+      return new Response(JSON.stringify(gets[Math.min(g++, gets.length - 1)]), { status: 200 });
+    }) as unknown as typeof fetch;
+    await runPermissionHook(baseDeps({
+      fetchFn: fn, emit: (l: string) => emitted.push(l),
+      trace: (e: { event: string; attempt?: number }) => events.push(e),
+    }) as never);
+    expect(postCount).toBe(2);              // first attempt threw, second succeeded
+    expect(emitted).toEqual([ALLOW]);       // proceeded to poll + answer normally
+    expect(events.filter((e) => e.event === "posted").map((e) => e.attempt)).toEqual([1, 2]);
+  });
+
+  test("both POST attempts fail → fail open silent, trace shows two posted attempts", async () => {
+    const emitted: string[] = [];
+    const events: Array<{ event: string; attempt?: number; reason?: string }> = [];
+    let postCount = 0;
+    const fn = (async () => { postCount += 1; const e = new Error("timeout"); e.name = "TimeoutError"; throw e; }) as unknown as typeof fetch;
+    await runPermissionHook(baseDeps({
+      fetchFn: fn, emit: (l: string) => emitted.push(l),
+      trace: (e: { event: string; attempt?: number; reason?: string }) => events.push(e),
+    }) as never);
+    expect(postCount).toBe(2);
+    expect(emitted).toEqual([]);
+    expect(events.filter((e) => e.event === "posted").map((e) => e.attempt)).toEqual([1, 2]);
+    expect(events.at(-1)).toMatchObject({ event: "exit", reason: "post-error" });
+  });
+
   test("unpaired (no config) → no output, no network at all", async () => {
     let fetched = false;
     const fn = (async () => { fetched = true; return new Response("{}"); }) as unknown as typeof fetch;
