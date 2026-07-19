@@ -92,7 +92,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { execFileSync, spawn } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "1.1.7";
+var PLUGIN_VERSION = "1.1.8";
 var CC_DIR = `${process.env.HOME}/.config/cc-status`;
 var SESSIONS_DIR = `${CC_DIR}/sessions`;
 var WATCHDOG_PID_PATH = `${CC_DIR}/watchdog.pid`;
@@ -1604,6 +1604,7 @@ async function correctIdleProvisional(config, path, sessionId, record) {
   }
 }
 var CLAUDE_IDLE_REAP_MS = 1800000;
+var CLAUDE_IDLE_REAP_MAX_ATTEMPTS = 5;
 function isClaudeIdleReapEligible(record, now) {
   if (record.agent === "codex")
     return false;
@@ -1615,20 +1616,34 @@ function isClaudeIdleReapEligible(record, now) {
     return false;
   return now - record.ts >= CLAUDE_IDLE_REAP_MS;
 }
-async function correctIdleClaude(config, path, sessionId, record, now) {
+async function correctIdleClaude(config, path, sessionId, record, now, deps = {}) {
+  const post = deps.post ?? ((body) => postEvent(config, body));
+  const writeRecord = deps.writeRecord ?? ((p, rec) => atomicWrite(p, JSON.stringify(rec), 384));
+  const clock = deps.now ?? Date.now;
   try {
     if (!isClaudeIdleReapEligible(record, now))
       return "uncorrected";
-    const outcome = await postEvent(config, await buildDoneEnvelope(sessionId, record, Date.now(), config.e2eKey, "claude", Math.floor(record.ts / 1000)));
+    const attempts = typeof record.doneAttempts === "number" && Number.isFinite(record.doneAttempts) ? record.doneAttempts : 0;
+    if (attempts >= CLAUDE_IDLE_REAP_MAX_ATTEMPTS) {
+      try {
+        await writeRecord(path, { ...record, lastEvent: "done", sentDone: true, op: "done", doneAttempts: undefined });
+      } catch {}
+      return "pending";
+    }
+    const doneNow = clock();
+    const outcome = await post(await buildDoneEnvelope(sessionId, record, doneNow, config.e2eKey, "claude", Math.floor(record.ts / 1000)));
     if (outcome === "revoked")
       return "revoked";
-    if (outcome !== "delivered")
-      return "uncorrected";
+    if (outcome === "delivered") {
+      try {
+        await writeRecord(path, { ...record, lastEvent: "done", sentDone: true, op: "done", doneAttempts: undefined });
+      } catch {}
+      return "corrected";
+    }
     try {
-      const next = { ...record, lastEvent: "done", sentDone: true, op: "done" };
-      await atomicWrite(path, JSON.stringify(next), 384);
+      await writeRecord(path, { ...record, doneAttempts: attempts + 1 });
     } catch {}
-    return "corrected";
+    return "pending";
   } catch {
     return "uncorrected";
   }
@@ -1799,10 +1814,10 @@ async function sweep(config) {
           const idleClaude = await correctIdleClaude(config, path, sessionId, record, now);
           if (idleClaude === "revoked")
             return { revoked: true };
-          if (idleClaude === "corrected") {
-            delivered = true;
+          if (idleClaude === "corrected" || idleClaude === "pending")
             reapedIdle = true;
-          }
+          if (idleClaude === "corrected")
+            delivered = true;
         }
         let repairedTitle = false;
         if (idleFix !== "corrected" && !interruptHandled && !flaggedAttention && !reapedIdle) {
@@ -1978,6 +1993,7 @@ export {
   goneStrikeShouldTeardown,
   discoverLiveSessions,
   correctInterrupt,
+  correctIdleClaude,
   codexTailPendingApproval,
   codexLastTurnEvent,
   claudeTailPendingApproval,
