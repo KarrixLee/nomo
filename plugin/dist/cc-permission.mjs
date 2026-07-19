@@ -3,6 +3,7 @@ var __require = /* @__PURE__ */ createRequire(import.meta.url);
 
 // src/core/permission.ts
 import { access, unlink as unlink3 } from "node:fs/promises";
+import { appendFileSync, statSync, truncateSync } from "node:fs";
 import { hostname as hostname2 } from "node:os";
 import { basename as basename3 } from "node:path";
 
@@ -96,7 +97,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { execFileSync, spawn } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "1.1.1";
+var PLUGIN_VERSION = "1.1.2";
 var CC_DIR = `${process.env.HOME}/.config/cc-status`;
 var SESSIONS_DIR = `${CC_DIR}/sessions`;
 var WATCHDOG_PID_PATH = `${CC_DIR}/watchdog.pid`;
@@ -1594,6 +1595,48 @@ var FETCH_TIMEOUT_MS = 2000;
 var MAX_CONSECUTIVE_MISSES = 100;
 var ALLOW_LINE = JSON.stringify({ hookSpecificOutput: { hookEventName: "PermissionRequest", decision: { behavior: "allow" } } });
 var DENY_LINE = JSON.stringify({ hookSpecificOutput: { hookEventName: "PermissionRequest", decision: { behavior: "deny", message: "Denied from phone" } } });
+var TRACE_PATH = `${CC_DIR}/permission-trace.log`;
+var TRACE_MAX_BYTES = 256 * 1024;
+function appendTrace(path, event) {
+  try {
+    appendFileSync(path, `${JSON.stringify({ ts: Date.now(), pid: process.pid, ...event })}
+`, { mode: 384 });
+  } catch {}
+}
+var traceRotated = false;
+function rotateTraceOnce(path) {
+  if (traceRotated)
+    return;
+  traceRotated = true;
+  try {
+    if (statSync(path).size > TRACE_MAX_BYTES)
+      truncateSync(path, 0);
+  } catch {}
+}
+var signalHandlersInstalled = false;
+function defaultTrace() {
+  rotateTraceOnce(TRACE_PATH);
+  const trace = (event) => appendTrace(TRACE_PATH, event);
+  if (!signalHandlersInstalled) {
+    signalHandlersInstalled = true;
+    for (const sig of ["SIGTERM", "SIGINT", "SIGHUP"]) {
+      process.on(sig, () => {
+        trace({ event: "signal", signal: sig });
+        process.exit(0);
+      });
+    }
+    process.on("uncaughtException", (e) => {
+      trace({ event: "uncaughtException", error: String(e).slice(0, 200) });
+      process.exit(0);
+    });
+    process.on("unhandledRejection", (e) => {
+      trace({ event: "unhandledRejection", error: String(e).slice(0, 200) });
+      process.exit(0);
+    });
+    process.on("exit", (code) => appendTrace(TRACE_PATH, { event: "exit-event", code }));
+  }
+  return trace;
+}
 function buildPermissionSummary(toolName, toolInput) {
   const str = (v) => typeof v === "string" && v.length > 0 ? v : undefined;
   const truncate = (s, n = 80) => s.length <= n ? s : `${s.slice(0, n - 1)}…`;
@@ -1646,6 +1689,7 @@ async function flagExists(path) {
 }
 async function runPermissionHook(deps = {}) {
   const noHoldPath = deps.noHoldPath ?? NO_HOLD_PATH;
+  const trace = deps.trace ?? defaultTrace();
   try {
     if (await flagExists(noHoldPath)) {
       await (deps.delegate ?? (() => runHook("claude")))();
@@ -1655,13 +1699,19 @@ async function runPermissionHook(deps = {}) {
       (deps.loadConfigFn ?? loadConfig)(),
       (deps.readInput ?? readStdin2)()
     ]);
-    if (!config)
+    trace({ event: "stdin-read", bytes: raw.length });
+    if (!config) {
+      trace({ event: "exit", reason: "unpaired" });
       return;
+    }
     const input = JSON.parse(raw);
     const sessionId = typeof input.session_id === "string" ? input.session_id : "";
-    if (sessionId.length === 0)
+    if (sessionId.length === 0) {
+      trace({ event: "exit", reason: "no-session-id" });
       return;
+    }
     const toolName = typeof input.tool_name === "string" ? input.tool_name : "";
+    trace({ event: "start", session_id: sessionId, tool_name: toolName });
     const toolInput = typeof input.tool_input === "object" && input.tool_input !== null ? input.tool_input : {};
     const requestId = (deps.randomUUID ?? (() => crypto.randomUUID()))();
     const summary = buildPermissionSummary(toolName, toolInput);
@@ -1682,49 +1732,77 @@ async function runPermissionHook(deps = {}) {
         body: JSON.stringify({ v: 2, sessionId, requestId, op: "update", prio: 1, ts: now, blob, fallbackBlob }),
         signal: AbortSignal.timeout(FETCH_TIMEOUT_MS)
       });
+      trace({ event: "posted", requestId, status: res.status });
       if (res.ok)
         hold = (await res.json()).hold === true;
-    } catch {
+    } catch (e) {
+      trace({ event: "posted", requestId, status: 0, error: e?.name ?? "Error" });
+      trace({ event: "exit", reason: "post-error" });
       return;
     }
-    if (!hold)
+    trace({ event: "hold", hold });
+    if (!hold) {
+      trace({ event: "exit", reason: "hold-false" });
       return;
+    }
     const sleep = deps.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
     const jitter = deps.jitter ?? (() => Math.floor(Math.random() * 500));
     const interval = deps.pollIntervalMs ?? POLL_INTERVAL_MS;
     const emit = deps.emit ?? ((line) => process.stdout.write(`${line}
 `));
     let misses = 0;
+    let seq = 0;
     for (;; ) {
+      seq += 1;
+      trace({ event: "poll-begin", seq });
       let data;
       try {
         const res = await fetchFn(`${config.url}/v1/cc/decision/${requestId}`, {
           headers: pcHeaders,
           signal: AbortSignal.timeout(FETCH_TIMEOUT_MS)
         });
-        if (res.ok)
+        if (res.ok) {
           data = await res.json();
-      } catch {}
+          trace({ event: "poll-end", seq, outcome: "ok" });
+        } else {
+          trace({ event: "poll-end", seq, outcome: "status", status: res.status });
+        }
+      } catch (e) {
+        trace({ event: "poll-end", seq, outcome: "error", error: e?.name ?? "Error" });
+      }
       if (data) {
         misses = 0;
         if (data.status === "answered" && typeof data.answerBlob === "string") {
           const answer = await decryptBlob(config.e2eKey, data.answerBlob);
-          if (answer.requestId === requestId) {
-            if (answer.decision === "allow")
+          const match = answer.requestId === requestId;
+          if (match) {
+            if (answer.decision === "allow") {
               emit(ALLOW_LINE);
-            else if (answer.decision === "deny")
+              trace({ event: "emit", decision: "allow" });
+            } else if (answer.decision === "deny") {
               emit(DENY_LINE);
+              trace({ event: "emit", decision: "deny" });
+            }
           }
+          trace({ event: "answered", match });
+          trace({ event: "exit", reason: "answered" });
           return;
         }
-        if (typeof data.status === "string" && data.status !== "pending")
+        if (typeof data.status === "string" && data.status !== "pending") {
+          trace({ event: data.status === "expired" ? "expired" : "superseded", status: data.status });
+          trace({ event: "exit", reason: data.status });
           return;
+        }
       } else if (++misses >= MAX_CONSECUTIVE_MISSES) {
+        trace({ event: "giveup", misses });
+        trace({ event: "exit", reason: "giveup" });
         return;
       }
       await sleep(interval + jitter());
     }
-  } catch {}
+  } catch (e) {
+    trace({ event: "exit", reason: "exception", error: String(e).slice(0, 200) });
+  }
 }
 async function approvalsCommand(sub, deps = {}) {
   const path = deps.noHoldPath ?? NO_HOLD_PATH;
