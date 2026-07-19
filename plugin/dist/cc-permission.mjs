@@ -97,7 +97,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { execFileSync, spawn } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "1.1.3";
+var PLUGIN_VERSION = "1.1.4";
 var CC_DIR = `${process.env.HOME}/.config/cc-status`;
 var SESSIONS_DIR = `${CC_DIR}/sessions`;
 var WATCHDOG_PID_PATH = `${CC_DIR}/watchdog.pid`;
@@ -1595,6 +1595,7 @@ var FETCH_TIMEOUT_MS = 2000;
 var POST_TIMEOUT_MS = 15000;
 var POST_MAX_ATTEMPTS = 2;
 var POST_RETRY_PAUSE_MS = 1000;
+var HOLD_RETRY_DELAY_MS = 4000;
 var MAX_CONSECUTIVE_MISSES = 100;
 var ALLOW_LINE = JSON.stringify({ hookSpecificOutput: { hookEventName: "PermissionRequest", decision: { behavior: "allow" } } });
 var DENY_LINE = JSON.stringify({ hookSpecificOutput: { hookEventName: "PermissionRequest", decision: { behavior: "deny", message: "Denied from phone" } } });
@@ -1728,37 +1729,52 @@ async function runPermissionHook(deps = {}) {
     const fallbackBlob = await encryptBlob(config.e2eKey, base);
     const pcHeaders = { "x-cc-pairing": config.pairingId, "x-cc-auth": config.pcSecret, "x-cc-version": PLUGIN_VERSION };
     const sleep = deps.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
-    let hold = false;
-    let posted = false;
-    for (let attempt = 1;attempt <= POST_MAX_ATTEMPTS; attempt += 1) {
-      try {
-        const res = await fetchFn(`${config.url}/v1/cc/decision`, {
-          method: "POST",
-          headers: { "content-type": "application/json", ...pcHeaders },
-          body: JSON.stringify({ v: 2, sessionId, requestId, op: "update", prio: 1, ts: now, blob, fallbackBlob }),
-          signal: AbortSignal.timeout(POST_TIMEOUT_MS)
-        });
-        trace({ event: "posted", requestId, attempt, status: res.status });
-        if (res.ok)
-          hold = (await res.json()).hold === true;
-        posted = true;
-        break;
-      } catch (e) {
-        trace({ event: "posted", requestId, attempt, status: 0, error: e?.name ?? "Error" });
-        if (attempt < POST_MAX_ATTEMPTS) {
-          await sleep(POST_RETRY_PAUSE_MS);
-          continue;
+    const postDecision = async (round, maxAttempts) => {
+      let hold2 = false;
+      let posted2 = false;
+      for (let attempt = 1;attempt <= maxAttempts; attempt += 1) {
+        try {
+          const res = await fetchFn(`${config.url}/v1/cc/decision`, {
+            method: "POST",
+            headers: { "content-type": "application/json", ...pcHeaders },
+            body: JSON.stringify({ v: 2, sessionId, requestId, op: "update", prio: 1, ts: now, blob, fallbackBlob }),
+            signal: AbortSignal.timeout(POST_TIMEOUT_MS)
+          });
+          trace({ event: "posted", requestId, round, attempt, status: res.status });
+          if (res.ok)
+            hold2 = (await res.json()).hold === true;
+          posted2 = true;
+          break;
+        } catch (e) {
+          trace({ event: "posted", requestId, round, attempt, status: 0, error: e?.name ?? "Error" });
+          if (attempt < maxAttempts) {
+            await sleep(POST_RETRY_PAUSE_MS);
+            continue;
+          }
         }
       }
-    }
+      return { posted: posted2, hold: hold2 };
+    };
+    let { posted, hold } = await postDecision(1, POST_MAX_ATTEMPTS);
     if (!posted) {
       trace({ event: "exit", reason: "post-error" });
       return;
     }
     trace({ event: "hold", hold });
     if (!hold) {
-      trace({ event: "exit", reason: "hold-false" });
-      return;
+      trace({ event: "hold-retry-wait", delayMs: HOLD_RETRY_DELAY_MS });
+      await sleep(HOLD_RETRY_DELAY_MS);
+      const retry = await postDecision(2, 1);
+      if (!retry.posted) {
+        trace({ event: "exit", reason: "hold-false" });
+        return;
+      }
+      hold = retry.hold;
+      trace({ event: "hold", hold });
+      if (!hold) {
+        trace({ event: "exit", reason: "hold-false" });
+        return;
+      }
     }
     const jitter = deps.jitter ?? (() => Math.floor(Math.random() * 500));
     const interval = deps.pollIntervalMs ?? POLL_INTERVAL_MS;
