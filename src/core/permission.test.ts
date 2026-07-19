@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "bun:test";
 import {
-  buildPermissionSummary, runPermissionHook, approvalsCommand, NO_HOLD_PATH,
+  buildPermissionSummary, runPermissionHook, approvalsCommand, NO_HOLD_PATH, TRACE_PATH,
 } from "./permission";
 import { encryptBlob, decryptBlob } from "./crypto";
 import type { Config } from "./shared";
@@ -81,6 +81,7 @@ const baseDeps = (over: Record<string, unknown>) => ({
   jitter: () => 0,
   noHoldPath: "/does/not/exist/no-hold",
   delegate: async () => { throw new Error("delegate must not run"); },
+  trace: () => {}, // noop by default — tests must not touch the real trace file or install signal handlers
   ...over,
 });
 
@@ -178,6 +179,39 @@ describe("runPermissionHook — hold state machine", () => {
     expect(emitted).toEqual([]);
   });
 
+  test("trace seam captures the hold lifecycle (collector injected)", async () => {
+    const answerBlob = await encryptBlob(KEY, { requestId: "req-fixed", decision: "allow", ts: 5 });
+    const events: Array<{ event: string; [k: string]: unknown }> = [];
+    const { fn } = scriptFetch(true, [{ status: "pending" }, { status: "answered", answerBlob }]);
+    await runPermissionHook(baseDeps({
+      fetchFn: fn, emit: () => {},
+      trace: (e: { event: string }) => events.push(e as { event: string }),
+    }) as never);
+    const names = events.map((e) => e.event);
+    // lifecycle in order: stdin → start → POST → hold → poll pairs → answer/emit → exit
+    expect(names).toEqual([
+      "stdin-read", "start", "posted", "hold",
+      "poll-begin", "poll-end", "poll-begin", "poll-end",
+      "emit", "answered", "exit",
+    ]);
+    expect(events.find((e) => e.event === "emit")).toMatchObject({ decision: "allow" });
+    expect(events.find((e) => e.event === "answered")).toMatchObject({ match: true });
+    expect(events.at(-1)).toMatchObject({ event: "exit", reason: "answered" });
+    // every poll-begin has a matching poll-end (a lone begin would mean death mid-fetch)
+    expect(names.filter((n) => n === "poll-begin").length).toBe(names.filter((n) => n === "poll-end").length);
+  });
+
+  test("giveup path traces a giveup + exit event", async () => {
+    const events: Array<{ event: string }> = [];
+    const { fn } = scriptFetch(true, ["throw"]);
+    await runPermissionHook(baseDeps({
+      fetchFn: fn, emit: () => {},
+      trace: (e: { event: string }) => events.push(e as { event: string }),
+    }) as never);
+    expect(events.some((e) => e.event === "giveup")).toBe(true);
+    expect(events.at(-1)).toMatchObject({ event: "exit", reason: "giveup" });
+  });
+
   test("no-hold flag present → delegates, never POSTs a decision", async () => {
     const dir = await mkdtemp(join(tmpdir(), "nomo-nohold-"));
     const flag = join(dir, "no-hold");
@@ -223,4 +257,8 @@ describe("approvalsCommand (on/off/status)", () => {
 
 test("NO_HOLD_PATH sits under the cc-status config dir", () => {
   expect(NO_HOLD_PATH.endsWith("/.config/cc-status/no-hold")).toBe(true);
+});
+
+test("TRACE_PATH sits under the cc-status config dir", () => {
+  expect(TRACE_PATH.endsWith("/.config/cc-status/permission-trace.log")).toBe(true);
 });

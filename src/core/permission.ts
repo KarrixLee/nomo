@@ -17,6 +17,7 @@
 // dist/cc-permission.mjs.
 
 import { access, unlink } from "node:fs/promises";
+import { appendFileSync, statSync, truncateSync } from "node:fs";
 import { hostname } from "node:os";
 import { basename } from "node:path";
 import { runHook, buildBlob, OpPlan } from "./hook";
@@ -39,6 +40,61 @@ const MAX_CONSECUTIVE_MISSES = 100;
 /** The exact decision lines Claude Code consumes on stdout (frozen wire contract). */
 const ALLOW_LINE = JSON.stringify({ hookSpecificOutput: { hookEventName: "PermissionRequest", decision: { behavior: "allow" } } });
 const DENY_LINE = JSON.stringify({ hookSpecificOutput: { hookEventName: "PermissionRequest", decision: { behavior: "deny", message: "Denied from phone" } } });
+
+// ---- operational trace ---------------------------------------------------------------------
+//
+// The hold hook is a long-lived, silent process: when the terminal (or Claude Code) kills it, the
+// fail-open contract means it dies with NOTHING on stdout and no log — which makes a hold that never
+// polls impossible to diagnose from the outside (the worker just sees a POST and then silence). This
+// append-only trace is the one exception: a single-line JSON event stream at TRACE_PATH recording the
+// hook's lifecycle (stdin, POST, hold decision, every poll begin/end, the answer, and — crucially —
+// the terminating signal). It never writes to stdout and every append is best-effort (a trace error is
+// swallowed), so it cannot break the fail-open posture. A killed-by-SIGKILL hold leaves a trace that
+// simply ENDS with no `exit-event` line: that silence is itself the diagnostic signature.
+
+/** Append-only JSON trace of the permission hold lifecycle (one event per line). */
+export const TRACE_PATH = `${CC_DIR}/permission-trace.log`;
+/** Truncate the trace at startup once it passes this size, so it can never grow unbounded. */
+const TRACE_MAX_BYTES = 256 * 1024;
+
+/** Sync single-line append of `{ts, pid, ...event}`. Sync so a buffered write can't be lost when the
+ *  process is killed mid-hold. Best-effort: any fs error is swallowed (tracing must never surface). */
+function appendTrace(path: string, event: object): void {
+  try {
+    appendFileSync(path, `${JSON.stringify({ ts: Date.now(), pid: process.pid, ...event })}\n`, { mode: 0o600 });
+  } catch { /* tracing is best-effort — never let it break the hook */ }
+}
+
+let traceRotated = false;
+/** Truncate-once at process startup if the log has grown past the cap (append-only otherwise). */
+function rotateTraceOnce(path: string): void {
+  if (traceRotated) return;
+  traceRotated = true;
+  try {
+    if (statSync(path).size > TRACE_MAX_BYTES) truncateSync(path, 0);
+  } catch { /* missing file or stat error — nothing to rotate */ }
+}
+
+let signalHandlersInstalled = false;
+/** The production trace sink: rotate-once, then a file appender — and, installed once per process,
+ *  the signal/exit/error handlers that capture WHAT terminated the hold. Every handler records its
+ *  cause then exits 0 with nothing on stdout, preserving the fail-open contract. SIGKILL cannot be
+ *  caught, so a SIGKILLed hold simply leaves the trace with no `exit-event` line — the signature of an
+ *  external hard kill. */
+function defaultTrace(): (event: object) => void {
+  rotateTraceOnce(TRACE_PATH);
+  const trace = (event: object): void => appendTrace(TRACE_PATH, event);
+  if (!signalHandlersInstalled) {
+    signalHandlersInstalled = true;
+    for (const sig of ["SIGTERM", "SIGINT", "SIGHUP"] as const) {
+      process.on(sig, () => { trace({ event: "signal", signal: sig }); process.exit(0); });
+    }
+    process.on("uncaughtException", (e) => { trace({ event: "uncaughtException", error: String(e).slice(0, 200) }); process.exit(0); });
+    process.on("unhandledRejection", (e) => { trace({ event: "unhandledRejection", error: String(e).slice(0, 200) }); process.exit(0); });
+    process.on("exit", (code) => appendTrace(TRACE_PATH, { event: "exit-event", code }));
+  }
+  return trace;
+}
 
 /** A concise, human-readable one-liner describing what the tool wants to do — shown on the phone's
  *  card next to Allow/Deny. Pure (unit-tested); never throws (a bad URL etc. falls back to the query
@@ -97,6 +153,10 @@ export interface PermissionHookDeps {
   /** The no-hold fire-and-forget path (defaults to the normal attention event via runHook). */
   delegate?: () => Promise<void>;
   pollIntervalMs?: number;
+  /** Operational trace sink (one JSON event per call). Defaults to the append-only file appender at
+   *  TRACE_PATH plus the signal/exit capture handlers; tests pass a collector or a noop so they touch
+   *  neither the real filesystem nor global process handlers. */
+  trace?: (event: object) => void;
 }
 
 async function readStdin(): Promise<string> {
@@ -113,6 +173,7 @@ async function flagExists(path: string): Promise<boolean> {
  *  contract and the absolute fail-open posture. Never throws across its boundary. */
 export async function runPermissionHook(deps: PermissionHookDeps = {}): Promise<void> {
   const noHoldPath = deps.noHoldPath ?? NO_HOLD_PATH;
+  const trace = deps.trace ?? defaultTrace();
   try {
     // Escape hatch FIRST (a file stat — no stdin consumed yet): if the user paused remote approvals
     // locally, behave exactly as the old fire-and-forget attention event (instant terminal dialog).
@@ -127,13 +188,15 @@ export async function runPermissionHook(deps: PermissionHookDeps = {}): Promise<
       (deps.loadConfigFn ?? loadConfig)(),
       (deps.readInput ?? readStdin)(),
     ]);
-    if (!config) return; // unpaired → exit 0, zero output, zero network
+    trace({ event: "stdin-read", bytes: raw.length });
+    if (!config) { trace({ event: "exit", reason: "unpaired" }); return; } // unpaired → exit 0, zero output, zero network
 
     const input = JSON.parse(raw) as Record<string, unknown>;
     const sessionId = typeof input.session_id === "string" ? input.session_id : "";
-    if (sessionId.length === 0) return;
+    if (sessionId.length === 0) { trace({ event: "exit", reason: "no-session-id" }); return; }
 
     const toolName = typeof input.tool_name === "string" ? input.tool_name : "";
+    trace({ event: "start", session_id: sessionId, tool_name: toolName });
     const toolInput = typeof input.tool_input === "object" && input.tool_input !== null
       ? (input.tool_input as Record<string, unknown>)
       : {};
@@ -165,11 +228,15 @@ export async function runPermissionHook(deps: PermissionHookDeps = {}): Promise<
         body: JSON.stringify({ v: 2, sessionId, requestId, op: "update", prio: 1, ts: now, blob, fallbackBlob }),
         signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
       });
+      trace({ event: "posted", requestId, status: res.status });
       if (res.ok) hold = ((await res.json()) as { hold?: unknown }).hold === true;
-    } catch {
+    } catch (e) {
+      trace({ event: "posted", requestId, status: 0, error: (e as { name?: string })?.name ?? "Error" });
+      trace({ event: "exit", reason: "post-error" });
       return; // network/timeout on the POST → fail open (terminal dialog)
     }
-    if (!hold) return; // hold:false → worker already applied the attention update → terminal dialog
+    trace({ event: "hold", hold });
+    if (!hold) { trace({ event: "exit", reason: "hold-false" }); return; } // hold:false → worker already applied the attention update → terminal dialog
 
     // HOLD: poll until the phone answers, the request leaves "pending", sustained failure trips the
     // give-up cap, or we're killed. Each fetch keeps its own 2s ceiling; transient failures are
@@ -179,35 +246,58 @@ export async function runPermissionHook(deps: PermissionHookDeps = {}): Promise<
     const interval = deps.pollIntervalMs ?? POLL_INTERVAL_MS;
     const emit = deps.emit ?? ((line: string) => process.stdout.write(`${line}\n`));
     let misses = 0;
+    let seq = 0;
     for (;;) {
+      seq += 1;
+      // poll-begin/poll-end straddle the fetch so an abort or kill MID-FETCH is visible: a begin with
+      // no matching end means the process died inside the GET (the prime suspect for a hold that
+      // never completes its first poll).
+      trace({ event: "poll-begin", seq });
       let data: { status?: string; answerBlob?: string } | undefined;
       try {
         const res = await fetchFn(`${config.url}/v1/cc/decision/${requestId}`, {
           headers: pcHeaders,
           signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
         });
-        if (res.ok) data = (await res.json()) as { status?: string; answerBlob?: string };
-      } catch { /* transient — counted below, kept polling until the cap */ }
+        if (res.ok) {
+          data = (await res.json()) as { status?: string; answerBlob?: string };
+          trace({ event: "poll-end", seq, outcome: "ok" });
+        } else {
+          trace({ event: "poll-end", seq, outcome: "status", status: res.status });
+        }
+      } catch (e) { // transient — counted below, kept polling until the cap
+        trace({ event: "poll-end", seq, outcome: "error", error: (e as { name?: string })?.name ?? "Error" });
+      }
 
       if (data) {
         misses = 0;
         if (data.status === "answered" && typeof data.answerBlob === "string") {
           // A decrypt failure here throws to the outer catch → silent exit 0 (fail open), never a retry.
           const answer = (await decryptBlob(config.e2eKey, data.answerBlob)) as { requestId?: unknown; decision?: unknown };
-          if (answer.requestId === requestId) {
-            if (answer.decision === "allow") emit(ALLOW_LINE);
-            else if (answer.decision === "deny") emit(DENY_LINE);
+          const match = answer.requestId === requestId;
+          if (match) {
+            if (answer.decision === "allow") { emit(ALLOW_LINE); trace({ event: "emit", decision: "allow" }); }
+            else if (answer.decision === "deny") { emit(DENY_LINE); trace({ event: "emit", decision: "deny" }); }
           }
+          trace({ event: "answered", match });
+          trace({ event: "exit", reason: "answered" });
           return; // answered (or mismatch) → done, exactly one or zero lines emitted
         }
-        if (typeof data.status === "string" && data.status !== "pending") return; // expired/superseded/unknown → silent
+        if (typeof data.status === "string" && data.status !== "pending") {
+          trace({ event: data.status === "expired" ? "expired" : "superseded", status: data.status });
+          trace({ event: "exit", reason: data.status });
+          return; // expired/superseded/unknown → silent
+        }
       } else if (++misses >= MAX_CONSECUTIVE_MISSES) {
+        trace({ event: "giveup", misses });
+        trace({ event: "exit", reason: "giveup" });
         return; // sustained downlink failure → fail open silently
       }
       await sleep(interval + jitter());
     }
-  } catch {
+  } catch (e) {
     // Silence + exit 0 is the contract — never surface into a Claude Code session, never block.
+    trace({ event: "exit", reason: "exception", error: String(e).slice(0, 200) });
   }
 }
 
