@@ -97,7 +97,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { execFileSync, spawn } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "1.1.8";
+var PLUGIN_VERSION = "1.1.9";
 var CC_DIR = `${process.env.HOME}/.config/cc-status`;
 var SESSIONS_DIR = `${CC_DIR}/sessions`;
 var WATCHDOG_PID_PATH = `${CC_DIR}/watchdog.pid`;
@@ -1719,7 +1719,18 @@ async function runPermissionHook(deps = {}) {
       return;
     }
     const toolName = typeof input.tool_name === "string" ? input.tool_name : "";
-    trace({ event: "start", session_id: sessionId, tool_name: toolName });
+    const agentId = typeof input.agent_id === "string" ? input.agent_id : "";
+    const permissionMode = typeof input.permission_mode === "string" ? input.permission_mode : undefined;
+    trace({ event: "start", session_id: sessionId, tool_name: toolName, permission_mode: permissionMode, agent: agentId.length > 0 });
+    if (agentId.length > 0) {
+      const agentType = typeof input.agent_type === "string" ? input.agent_type : undefined;
+      trace({ event: "exit", reason: "subagent", agent_type: agentType });
+      return;
+    }
+    if (permissionMode !== undefined && permissionMode !== "default" && permissionMode !== "acceptEdits" && permissionMode !== "plan") {
+      trace({ event: "exit", reason: "mode", mode: permissionMode });
+      return;
+    }
     const toolInput = typeof input.tool_input === "object" && input.tool_input !== null ? input.tool_input : {};
     const requestId = (deps.randomUUID ?? (() => crypto.randomUUID()))();
     const summary = buildPermissionSummary(toolName, toolInput);
