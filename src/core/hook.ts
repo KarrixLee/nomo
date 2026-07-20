@@ -542,7 +542,18 @@ export async function runHook(agent: AgentKind): Promise<void> {
     // → undefined, the blob omits it, and the widget falls back to `startedAt`.
     const cachedTurn = typeof existingRecord?.turnStartedAt === "number" && Number.isFinite(existingRecord.turnStartedAt)
       ? existingRecord.turnStartedAt : undefined;
-    const turnStartedAt = hookName === "UserPromptSubmit" ? Math.floor(Date.now() / 1000) : cachedTurn;
+    // SessionStart is ALSO a turn boundary: a resume/startup/clear opens a fresh turn, so the anchor
+    // must re-stamp to NOW. Without this a session resumed after ~40h fires SessionStart BEFORE its
+    // first UserPromptSubmit with the record reaped (no cache) → the blob omits turnStartedAt and the
+    // widget falls back to `startedAt` (the transcript-head timestamp), flashing "40h" on the island
+    // until the prompt hook lands ~5s later. The lone exception is source:"compact" — auto-compaction
+    // fires MID-turn, so re-anchoring there would jerk the in-progress timer backward; keep the cache.
+    // `source` is read defensively (Claude passes "startup"|"resume"|"clear"|"compact"): absent/unknown
+    // stamps fresh, so we fail toward a fresh anchor and never toward the 40h fallback.
+    const sessionStartSource = typeof input.source === "string" ? input.source : "";
+    const isTurnOpener = hookName === "UserPromptSubmit"
+      || (hookName === "SessionStart" && sessionStartSource !== "compact");
+    const turnStartedAt = isTurnOpener ? Math.floor(Date.now() / 1000) : cachedTurn;
     // The Codex turn id (Claude payloads carry none → undefined). Cached on the record so the notify
     // backstop's stale-turn guard can compare it against a delayed notify's payload turn-id.
     const turnId = typeof input.turn_id === "string" && input.turn_id.length > 0 ? input.turn_id : undefined;

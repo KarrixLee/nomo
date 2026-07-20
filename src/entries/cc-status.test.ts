@@ -1882,6 +1882,56 @@ describe("runHook turnStartedAt (UserPromptSubmit stamps + caches; later hooks r
     }, { cachedTurn: 1_000_000 }); // an hour-old anchor from the previous turn
     expect(recordTurn!).toBeGreaterThanOrEqual(before); // fresh, not the stale 1_000_000
   }, 20000);
+
+  // --- SessionStart is a turn boundary too (the 40h resume-flash fix) --------------------------
+  // A resumed session's SessionStart fires BEFORE the first UserPromptSubmit. With the record reaped
+  // (no cache) the blob previously omitted turnStartedAt and the widget fell back to `startedAt` — the
+  // transcript-head timestamp, which for a session opened 40h ago reads "40h" on the island until the
+  // prompt hook lands ~5s later. SessionStart must now re-anchor to NOW, EXCEPT for source:"compact"
+  // (auto-compaction fires MID-turn, so re-anchoring would jerk the live timer backward).
+  test("SessionStart (source:resume, NO cache) stamps a FRESH anchor — the 40h resume-flash fix", async () => {
+    const before = Math.floor(Date.now() / 1000);
+    const { recordTurn, blobTurn } = await runTurnHook({
+      session_id: "ss-resume", hook_event_name: "SessionStart", source: "resume", cwd: "/x/api-status", transcript_path: "",
+    });
+    const after = Math.ceil(Date.now() / 1000);
+    expect(Number.isInteger(recordTurn)).toBe(true);
+    expect(recordTurn!).toBeGreaterThanOrEqual(before);
+    expect(recordTurn!).toBeLessThanOrEqual(after);
+    expect(blobTurn).toBe(recordTurn!); // record + blob agree, exactly like UserPromptSubmit
+  }, 20000);
+
+  test("SessionStart (source:startup) stamps a fresh anchor", async () => {
+    const before = Math.floor(Date.now() / 1000);
+    const { recordTurn } = await runTurnHook({
+      session_id: "ss-startup", hook_event_name: "SessionStart", source: "startup", cwd: "/x/api-status", transcript_path: "",
+    });
+    expect(recordTurn!).toBeGreaterThanOrEqual(before);
+  }, 20000);
+
+  test("SessionStart (source:resume) RESTAMPS over a stale cached anchor (a fresh turn resets the timer)", async () => {
+    const before = Math.floor(Date.now() / 1000);
+    const { recordTurn } = await runTurnHook({
+      session_id: "ss-resume-restamp", hook_event_name: "SessionStart", source: "resume", cwd: "/x/api-status", transcript_path: "",
+    }, { cachedTurn: 1_000_000 }); // a 40h-stale anchor cached on the record
+    expect(recordTurn!).toBeGreaterThanOrEqual(before); // fresh, not the stale 1_000_000
+  }, 20000);
+
+  test("SessionStart (source:compact) PRESERVES the cached anchor — auto-compaction fires mid-turn", async () => {
+    const { recordTurn, blobTurn } = await runTurnHook({
+      session_id: "ss-compact", hook_event_name: "SessionStart", source: "compact", cwd: "/x/api-status", transcript_path: "",
+    }, { cachedTurn: 1_751_900_000 });
+    expect(recordTurn).toBe(1_751_900_000); // the in-progress turn's anchor is untouched
+    expect(blobTurn).toBe(1_751_900_000);
+  }, 20000);
+
+  test("SessionStart with an ABSENT source stamps fresh (fail toward a fresh anchor, never the 40h fallback)", async () => {
+    const before = Math.floor(Date.now() / 1000);
+    const { recordTurn } = await runTurnHook({
+      session_id: "ss-nosource", hook_event_name: "SessionStart", cwd: "/x/api-status", transcript_path: "",
+    });
+    expect(recordTurn!).toBeGreaterThanOrEqual(before);
+  }, 20000);
 });
 
 // --- runHook title resolution (tail ai-title reaches the blob; found titles never regress) -------
