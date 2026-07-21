@@ -21,7 +21,7 @@ import { appendFileSync, statSync, truncateSync } from "node:fs";
 import { hostname } from "node:os";
 import { basename } from "node:path";
 import { runHook, buildBlob, OpPlan } from "./hook";
-import { atomicWrite, CC_DIR, Config, loadConfig, PLUGIN_VERSION, readRecord, SessionRecord } from "./shared";
+import { AgentKind, atomicWrite, CC_DIR, Config, loadConfig, PLUGIN_VERSION, readRecord, SessionRecord } from "./shared";
 import { decryptBlob, encryptBlob } from "./crypto";
 
 /** Local escape-hatch flag: when this file exists, the hook skips the hold entirely and behaves as a
@@ -63,21 +63,35 @@ const FRESH_SESSION_MS = 60_000;
  *  including a plain {status:"pending"} — resets the counter, so a healthy hold is unbounded. */
 const MAX_CONSECUTIVE_MISSES = 100;
 
-/** The exact decision lines Claude Code consumes on stdout (frozen wire contract). ALLOW_LINE and the
- *  no-message DENY_LINE stay BYTE-IDENTICAL to the pre-1.1 plugin so a plain allow / deny-without-message
- *  is indistinguishable on the wire; the builders below only DIVERGE when the phone sends the new
- *  always-allow / custom-message variants. */
-const ALLOW_LINE = JSON.stringify({ hookSpecificOutput: { hookEventName: "PermissionRequest", decision: { behavior: "allow" } } });
-const DENY_LINE = JSON.stringify({ hookSpecificOutput: { hookEventName: "PermissionRequest", decision: { behavior: "deny", message: "Denied from phone" } } });
-/** Cap the phone's custom deny message so a runaway string can't bloat the stdout line CC must parse. */
+/** Serialize ONE PermissionRequest decision for the given agent's stdout contract. Both agents carry
+ *  the identical `hookSpecificOutput` object; the ONLY difference is the transport envelope: Codex
+ *  (0.144.1, verified in the Task 8 spike) requires a leading `"continue": true` wrapping the object,
+ *  Claude Code consumes the bare object. `continue` is emitted FIRST, so the codex line matches the
+ *  competitor-proven byte shape; and for claude the wrapper is absent, keeping every line BYTE-IDENTICAL
+ *  to the pre-1.1 plugin (a plain allow / deny-without-message is indistinguishable on the wire). This
+ *  single helper is the ENTIRE agent seam for the decision lines — every builder below routes through it. */
+function decisionLine(agent: AgentKind, hookSpecificOutput: object): string {
+  return JSON.stringify(agent === "codex" ? { continue: true, hookSpecificOutput } : { hookSpecificOutput });
+}
+
+/** The frozen inner objects (agent-agnostic). ALLOW_HSO / the no-message DENY_HSO stay the pre-1.1 shape;
+ *  decisionLine("claude", …) reproduces the old ALLOW_LINE / DENY_LINE byte-for-byte. */
+const ALLOW_HSO = { hookEventName: "PermissionRequest", decision: { behavior: "allow" } } as const;
+const DENY_HSO = { hookEventName: "PermissionRequest", decision: { behavior: "deny", message: "Denied from phone" } } as const;
+/** Cap the phone's custom deny message so a runaway string can't bloat the stdout line the agent parses. */
 const DENY_MESSAGE_MAX = 500;
 
+/** Plain allow. */
+function allowLine(agent: AgentKind): string {
+  return decisionLine(agent, ALLOW_HSO);
+}
+
 /** Deny with the phone's custom message; an absent/empty/whitespace-only message degrades to the frozen
- *  DENY_LINE (so a plain "Deny" tap stays byte-identical to the old wire). */
-function denyLine(message?: unknown): string {
+ *  no-message DENY line (so a plain "Deny" tap stays byte-identical to the old wire for claude). */
+function denyLine(agent: AgentKind, message?: unknown): string {
   const m = typeof message === "string" ? message.trim().slice(0, DENY_MESSAGE_MAX) : "";
-  if (m.length === 0) return DENY_LINE;
-  return JSON.stringify({ hookSpecificOutput: { hookEventName: "PermissionRequest", decision: { behavior: "deny", message: m } } });
+  if (m.length === 0) return decisionLine(agent, DENY_HSO);
+  return decisionLine(agent, { hookEventName: "PermissionRequest", decision: { behavior: "deny", message: m } });
 }
 
 /** Allow + a session-scoped always-allow rule. CC's own `permission_suggestions` (already narrowly
@@ -85,11 +99,11 @@ function denyLine(message?: unknown): string {
  *  rule. `destination: "session"` ONLY — an over-broad grant dies with the session, never persisted to
  *  disk. Requires CC ≥ 2.0.54 (the `updatedPermissions` key); older CC ignores the extra key and
  *  degrades to a plain allow (safe: the tool still runs, just no rule is remembered). */
-function allowAlwaysLine(toolName: string, suggestions: unknown): string {
+function allowAlwaysLine(agent: AgentKind, toolName: string, suggestions: unknown): string {
   const updatedPermissions = Array.isArray(suggestions) && suggestions.length > 0
     ? suggestions
     : [{ type: "addRules", rules: [{ toolName }], behavior: "allow", destination: "session" }];
-  return JSON.stringify({ hookSpecificOutput: { hookEventName: "PermissionRequest", decision: { behavior: "allow", updatedPermissions } } });
+  return decisionLine(agent, { hookEventName: "PermissionRequest", decision: { behavior: "allow", updatedPermissions } });
 }
 
 // ---- operational trace ---------------------------------------------------------------------
@@ -154,9 +168,19 @@ export function buildPermissionSummary(toolName: string, toolInput: Record<strin
   const str = (v: unknown): string | undefined => (typeof v === "string" && v.length > 0 ? v : undefined);
   const truncate = (s: string, n = 80): string => (s.length <= n ? s : `${s.slice(0, n - 1)}…`);
   switch (toolName) {
-    case "Bash": {
+    case "Bash":
+    // Codex shell tools carry the command in the SAME tool_input.command field; the switch keys purely on
+    // tool_name (Codex + Claude names never collide) so these are additive, not an agent branch.
+    case "shell":
+    case "local_shell": {
       const cmd = str(toolInput.command);
       return cmd ? truncate(cmd.split("\n")[0]) : toolName;
+    }
+    // Codex apply_patch approvals carry a human-readable summary in tool_input.description (there is no
+    // single file_path — a patch can touch many files).
+    case "apply_patch": {
+      const desc = str(toolInput.description);
+      return desc ? truncate(desc) : toolName;
     }
     case "Edit":
     case "Write":
@@ -198,7 +222,8 @@ export function buildPermissionDetail(toolName: string, toolInput: Record<string
   const str = (v: unknown): string | undefined => (typeof v === "string" && v.length > 0 ? v : undefined);
   const cap = (s: string): string => (s.length <= 400 ? s : `${s.slice(0, 399)}…`);
   switch (toolName) {
-    case "Bash": { const c = str(toolInput.command); return c ? cap(c) : ""; }
+    case "Bash": case "shell": case "local_shell": { const c = str(toolInput.command); return c ? cap(c) : ""; }
+    case "apply_patch": { const d = str(toolInput.description); return d ? cap(d) : ""; }
     case "Edit": case "Write": case "Read": case "NotebookEdit": {
       const fp = str(toolInput.file_path); return fp ? cap(fp) : "";
     }
@@ -215,6 +240,7 @@ export function buildPermissionDetail(toolName: string, toolInput: Record<string
  *  case is a decision verb we DON'T recognize (a newer phone talking to an older plugin) — we must never
  *  guess a line, so we swallow it and wait for one we know (fail-safe, symmetric with fail-open). */
 function emitDecision(
+  agent: AgentKind,
   answer: { decision?: unknown; message?: unknown },
   toolName: string,
   suggestions: unknown,
@@ -223,11 +249,11 @@ function emitDecision(
 ): boolean {
   switch (answer.decision) {
     case "allow":
-      emit(ALLOW_LINE); trace({ event: "emit", decision: "allow" }); return false;
+      emit(allowLine(agent)); trace({ event: "emit", decision: "allow" }); return false;
     case "allow_always":
-      emit(allowAlwaysLine(toolName, suggestions)); trace({ event: "emit", decision: "allow_always" }); return false;
+      emit(allowAlwaysLine(agent, toolName, suggestions)); trace({ event: "emit", decision: "allow_always" }); return false;
     case "deny":
-      emit(denyLine(answer.message));
+      emit(denyLine(agent, answer.message));
       trace({ event: "emit", decision: "deny", hasMessage: typeof answer.message === "string" && answer.message.trim().length > 0 });
       return false;
     default:
@@ -272,8 +298,14 @@ async function flagExists(path: string): Promise<boolean> {
 }
 
 /** The PermissionRequest hook body. See the module header for the (deliberately) unbounded-wait
- *  contract and the absolute fail-open posture. Never throws across its boundary. */
-export async function runPermissionHook(deps: PermissionHookDeps = {}): Promise<void> {
+ *  contract and the absolute fail-open posture. Never throws across its boundary.
+ *
+ *  `agent` (positional, defaulting to "claude" — the file's style, matching buildBlob/runHook) is the
+ *  ENTIRE per-agent seam: it tags the blob (`agent:"codex"`), picks the no-hold delegate's target, and
+ *  selects the decision-line envelope (Codex wraps in `continue:true`). Everything else — the POST/poll
+ *  state machine, the gates, fail-open — is agent-agnostic. cc-permission calls it with the default;
+ *  codex-permission calls it with "codex". */
+export async function runPermissionHook(deps: PermissionHookDeps = {}, agent: AgentKind = "claude"): Promise<void> {
   const noHoldPath = deps.noHoldPath ?? NO_HOLD_PATH;
   const trace = deps.trace ?? defaultTrace();
   try {
@@ -282,7 +314,7 @@ export async function runPermissionHook(deps: PermissionHookDeps = {}): Promise<
     // Delegating to runHook reuses the entire needs-attention pipeline (POST, tracking, watchdog) and
     // returns silently with exit 0 — it also no-ops cleanly when unpaired, so zero network in that case.
     if (await flagExists(noHoldPath)) {
-      await (deps.delegate ?? (() => runHook("claude")))();
+      await (deps.delegate ?? (() => runHook(agent)))();
       return;
     }
 
@@ -327,10 +359,12 @@ export async function runPermissionHook(deps: PermissionHookDeps = {}): Promise<
     //    Until the question-answering wave (option buttons + answer injection) ships, delegate to the
     //    exact fire-and-forget needs-attention path the no-hold flag uses: an attention buzz on the
     //    phone, answer at the Mac. Placed AFTER the mode gate so an auto-mode question never even
-    //    delegates (it fell open above). Runs BEFORE any POST/blob build.
+    //    delegates (it fell open above). Runs BEFORE any POST/blob build. CLAUDE-ONLY in practice: Codex
+    //    has no AskUserQuestion tool, so this never fires for a codex session — the delegate still
+    //    threads `agent` for correctness if it ever did.
     if (toolName === "AskUserQuestion") {
       trace({ event: "exit", reason: "question-passthrough" });
-      await (deps.delegate ?? (() => runHook("claude")))();
+      await (deps.delegate ?? (() => runHook(agent)))();
       return;
     }
     const toolInput = typeof input.tool_input === "object" && input.tool_input !== null
@@ -362,7 +396,7 @@ export async function runPermissionHook(deps: PermissionHookDeps = {}): Promise<
     const record = await (deps.readRecordFn ?? readRecord)(sessionId);
     const machine = config.machineName ?? hostname().replace(/\.local$/, "");
     const plan: OpPlan = { op: "update", prio: 1, status: "needsAttention" };
-    const base = buildBlob(input, machine, record?.title, plan, "claude", record?.turnStartedAt, record?.label, record?.model);
+    const base = buildBlob(input, machine, record?.title, plan, agent, record?.turnStartedAt, record?.label, record?.model);
     const detail = buildPermissionDetail(toolName, toolInput);
     const blob = await encryptBlob(config.e2eKey, {
       ...base, status: "decisionPending", permissionSummary: summary, permissionRequestId: requestId,
@@ -467,7 +501,7 @@ export async function runPermissionHook(deps: PermissionHookDeps = {}): Promise<
           // replay/stale answer (silent, done — unchanged). The one keep-polling case is a matched but
           // UNRECOGNIZED decision verb (newer phone, older plugin): emitDecision returns true, we skip
           // the return and fall through to the sleep so a decision we DO understand can still land.
-          const keepPolling = match && emitDecision(answer, toolName, suggestions, emit, trace);
+          const keepPolling = match && emitDecision(agent, answer, toolName, suggestions, emit, trace);
           if (!keepPolling) {
             trace({ event: "answered", match });
             trace({ event: "exit", reason: "answered" });

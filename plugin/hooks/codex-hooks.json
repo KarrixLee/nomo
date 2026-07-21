@@ -33,7 +33,7 @@
     "PermissionRequest": [
       {
         "hooks": [
-          { "type": "command", "command": "exec \"${PLUGIN_ROOT}/scripts/run.sh\" \"${PLUGIN_ROOT}/dist/codex-status.mjs\"", "timeout": 30 }
+          { "type": "command", "command": "exec \"${PLUGIN_ROOT}/scripts/run.sh\" \"${PLUGIN_ROOT}/dist/codex-permission.mjs\"", "timeout": 3600 }
         ]
       }
     ],

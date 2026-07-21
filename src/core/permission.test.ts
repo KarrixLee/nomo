@@ -47,6 +47,37 @@ describe("buildPermissionSummary", () => {
   });
 });
 
+// ---- summary builder — codex tool names (shell / local_shell / apply_patch) ----------------
+//
+// Codex fires PermissionRequest with its own snake_case tool names; the summary switch keys purely on
+// tool_name (no agent branch — Codex + Claude names don't collide), so these are additive cases.
+
+describe("buildPermissionSummary — codex tools", () => {
+  test("shell → first line of the command", () => {
+    expect(buildPermissionSummary("shell", { command: "ls -la" })).toBe("ls -la");
+    expect(buildPermissionSummary("shell", { command: "git status\necho done" })).toBe("git status");
+  });
+  test("local_shell → first line of the command", () => {
+    expect(buildPermissionSummary("local_shell", { command: "bun test\necho ok" })).toBe("bun test");
+  });
+  test("shell → truncated to <=80 chars with an ellipsis", () => {
+    const out = buildPermissionSummary("shell", { command: "echo " + "x".repeat(200) });
+    expect(out.length).toBe(80);
+    expect(out.endsWith("…")).toBe(true);
+  });
+  test("apply_patch → the description, truncated to <=80", () => {
+    expect(buildPermissionSummary("apply_patch", { description: "edit main.ts" })).toBe("edit main.ts");
+    const out = buildPermissionSummary("apply_patch", { description: "y".repeat(200) });
+    expect(out.length).toBe(80);
+    expect(out.endsWith("…")).toBe(true);
+  });
+  test("codex tools with missing fields → fall back to tool_name", () => {
+    expect(buildPermissionSummary("shell", {})).toBe("shell");
+    expect(buildPermissionSummary("local_shell", {})).toBe("local_shell");
+    expect(buildPermissionSummary("apply_patch", {})).toBe("apply_patch");
+  });
+});
+
 // ---- detail builder (pure) — fuller context for the phone card, hard 400-char cap ----------
 
 describe("buildPermissionDetail", () => {
@@ -77,6 +108,28 @@ describe("buildPermissionDetail", () => {
     expect(buildPermissionDetail("SomethingElse", { command: "x" })).toBe("");
     expect(buildPermissionDetail("Bash", {})).toBe("");
     expect(buildPermissionDetail("Edit", {})).toBe("");
+  });
+});
+
+describe("buildPermissionDetail — codex tools", () => {
+  test("shell/local_shell → the FULL multi-line command", () => {
+    expect(buildPermissionDetail("shell", { command: "cd proj\nbun test\necho done" })).toBe("cd proj\nbun test\necho done");
+    expect(buildPermissionDetail("local_shell", { command: "git add -p\ngit commit" })).toBe("git add -p\ngit commit");
+  });
+  test("shell → capped at 400 chars with an ellipsis", () => {
+    const out = buildPermissionDetail("shell", { command: "x".repeat(1000) });
+    expect(out.length).toBe(400);
+    expect(out.endsWith("…")).toBe(true);
+  });
+  test("apply_patch → the full description, capped at 400", () => {
+    expect(buildPermissionDetail("apply_patch", { description: "patch main.ts" })).toBe("patch main.ts");
+    const long = buildPermissionDetail("apply_patch", { description: "z".repeat(900) });
+    expect(long.length).toBe(400);
+    expect(long.endsWith("…")).toBe(true);
+  });
+  test("codex tools with missing fields → empty string (omitted from the blob)", () => {
+    expect(buildPermissionDetail("shell", {})).toBe("");
+    expect(buildPermissionDetail("apply_patch", {})).toBe("");
   });
 });
 
@@ -624,6 +677,99 @@ describe("runPermissionHook — AskUserQuestion pass-through", () => {
     }) as never);
     expect(delegated).toBe(false);         // mode gate returns before the question gate is reached
     expect(spy.called()).toBe(false);
+  });
+});
+
+// ---- codex agent seam (continue:true decision wrapper + agent:"codex" blob tag) ---------------
+//
+// The SAME hold engine, driven with agent "codex" (2nd positional arg). The ONLY wire differences vs
+// claude: every decision line is wrapped in a leading `continue:true` (Codex 0.144.1 consumes that
+// shape — verified in the Task 8 spike), and the sealed blob carries `agent:"codex"` so the phone tabs
+// it correctly. Claude's lines stay byte-identical (locked by the untouched claude tests above). Every
+// case below runs the REAL hold loop through the scripted-fetch harness, never a mock of the SUT.
+
+describe("runPermissionHook — codex agent", () => {
+  // Codex-wrapped variants of the frozen lines (leading "continue":true, then the identical object).
+  const CODEX_ALLOW = '{"continue":true,"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}}';
+  const CODEX_DENY = '{"continue":true,"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"deny","message":"Denied from phone"}}}';
+
+  /** Hold as codex, then answer with the given decrypted answer object; returns emitted stdout + calls. */
+  const answerCodex = async (answer: Record<string, unknown>, over: Record<string, unknown> = {}) => {
+    const answerBlob = await encryptBlob(KEY, { requestId: "req-fixed", ts: 5, ...answer });
+    const emitted: string[] = [];
+    const { fn, calls } = scriptFetch(true, [{ status: "answered", answerBlob }]);
+    await runPermissionHook(baseDeps({ fetchFn: fn, emit: (l: string) => emitted.push(l), ...over }) as never, "codex");
+    return { emitted, calls };
+  };
+
+  test("allow → the continue:true-wrapped allow line", async () => {
+    const { emitted } = await answerCodex({ decision: "allow" });
+    expect(emitted).toEqual([CODEX_ALLOW]);
+  });
+
+  test("deny (no message) → continue:true-wrapped frozen deny line", async () => {
+    const { emitted } = await answerCodex({ decision: "deny" });
+    expect(emitted).toEqual([CODEX_DENY]);
+  });
+
+  test("deny WITH a custom message → continue:true wrapper + the phone's message", async () => {
+    const { emitted } = await answerCodex({ decision: "deny", message: "use bun instead" });
+    const parsed = JSON.parse(emitted[0]);
+    expect(parsed.continue).toBe(true);
+    expect(parsed.hookSpecificOutput.decision).toEqual({ behavior: "deny", message: "use bun instead" });
+  });
+
+  test("allow_always → continue:true wrapper + a session-scoped whole-tool rule", async () => {
+    const { emitted } = await answerCodex({ decision: "allow_always" }); // INPUT tool = Bash, no suggestions
+    const parsed = JSON.parse(emitted[0]);
+    expect(parsed.continue).toBe(true);
+    expect(parsed.hookSpecificOutput.decision.behavior).toBe("allow");
+    expect(parsed.hookSpecificOutput.decision.updatedPermissions).toEqual([
+      { type: "addRules", rules: [{ toolName: "Bash" }], behavior: "allow", destination: "session" },
+    ]);
+  });
+
+  test("the posted blob + fallbackBlob both carry agent:'codex'", async () => {
+    const { calls } = await answerCodex({ decision: "allow" });
+    const body = JSON.parse(calls.find((c) => c.method === "POST")!.body!);
+    const blob = (await decryptBlob(KEY, body.blob)) as Record<string, unknown>;
+    const fb = (await decryptBlob(KEY, body.fallbackBlob)) as Record<string, unknown>;
+    expect(blob.status).toBe("decisionPending");
+    expect(blob.agent).toBe("codex");
+    expect(fb.status).toBe("needsAttention");
+    expect(fb.agent).toBe("codex");
+  });
+
+  test("codex shell PermissionRequest → summary/detail come from tool_input.command", async () => {
+    const codexInput = JSON.stringify({
+      session_id: "sess-1", hook_event_name: "PermissionRequest",
+      tool_name: "shell", tool_input: { command: "rm -rf build\necho done" },
+      cwd: "/Users/x/proj",
+    });
+    const { fn, calls } = scriptFetch(false, []);
+    await runPermissionHook(baseDeps({ fetchFn: fn, emit: () => {}, readInput: async () => codexInput }) as never, "codex");
+    const body = JSON.parse(calls.find((c) => c.method === "POST")!.body!);
+    const blob = (await decryptBlob(KEY, body.blob)) as Record<string, unknown>;
+    expect(blob.permissionToolName).toBe("shell");
+    expect(blob.permissionSummary).toBe("rm -rf build");           // first line only
+    expect(blob.permissionDetail).toBe("rm -rf build\necho done");  // full command
+    expect(blob.agent).toBe("codex");
+  });
+
+  test("no-hold flag present → delegates (codex needs-attention), never POSTs a decision", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "nomo-codex-nohold-"));
+    const flag = join(dir, "no-hold");
+    await writeFile(flag, "");
+    let delegated = false;
+    let fetched = false;
+    const fn = (async () => { fetched = true; return new Response("{}"); }) as unknown as typeof fetch;
+    await runPermissionHook(baseDeps({
+      fetchFn: fn, noHoldPath: flag, emit: () => {},
+      delegate: async () => { delegated = true; },
+    }) as never, "codex");
+    expect(delegated).toBe(true);
+    expect(fetched).toBe(false);
+    await rm(dir, { recursive: true, force: true });
   });
 });
 
