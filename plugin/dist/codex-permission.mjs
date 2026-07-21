@@ -1,6 +1,12 @@
 import { createRequire } from "node:module";
 var __require = /* @__PURE__ */ createRequire(import.meta.url);
 
+// src/core/permission.ts
+import { access, unlink as unlink3 } from "node:fs/promises";
+import { appendFileSync, statSync, truncateSync } from "node:fs";
+import { hostname as hostname2 } from "node:os";
+import { basename as basename3 } from "node:path";
+
 // src/core/hook.ts
 import { readdir as readdir2, readFile as readFile3, unlink as unlink2 } from "node:fs/promises";
 import { hostname } from "node:os";
@@ -1587,8 +1593,392 @@ async function runHook(agent) {
   } catch {}
 }
 
-// src/entries/codex-status.ts
+// src/core/permission.ts
+var NO_HOLD_PATH = `${CC_DIR}/no-hold`;
+var POLL_INTERVAL_MS = 3000;
+var FETCH_TIMEOUT_MS = 2000;
+var POST_TIMEOUT_MS = 15000;
+var POST_MAX_ATTEMPTS = 2;
+var POST_RETRY_PAUSE_MS = 1000;
+var HOLD_RETRY_DELAY_MS = 4000;
+var FRESH_SESSION_MS = 60000;
+var MAX_CONSECUTIVE_MISSES = 100;
+function decisionLine(agent, hookSpecificOutput) {
+  return JSON.stringify(agent === "codex" ? { continue: true, hookSpecificOutput } : { hookSpecificOutput });
+}
+var ALLOW_HSO = { hookEventName: "PermissionRequest", decision: { behavior: "allow" } };
+var DENY_HSO = { hookEventName: "PermissionRequest", decision: { behavior: "deny", message: "Denied from phone" } };
+var DENY_MESSAGE_MAX = 500;
+function allowLine(agent) {
+  return decisionLine(agent, ALLOW_HSO);
+}
+function denyLine(agent, message) {
+  const m = typeof message === "string" ? message.trim().slice(0, DENY_MESSAGE_MAX) : "";
+  if (m.length === 0)
+    return decisionLine(agent, DENY_HSO);
+  return decisionLine(agent, { hookEventName: "PermissionRequest", decision: { behavior: "deny", message: m } });
+}
+function allowAlwaysLine(agent, toolName, suggestions) {
+  const updatedPermissions = Array.isArray(suggestions) && suggestions.length > 0 ? suggestions : [{ type: "addRules", rules: [{ toolName }], behavior: "allow", destination: "session" }];
+  return decisionLine(agent, { hookEventName: "PermissionRequest", decision: { behavior: "allow", updatedPermissions } });
+}
+var TRACE_PATH = `${CC_DIR}/permission-trace.log`;
+var TRACE_MAX_BYTES = 256 * 1024;
+function appendTrace(path, event) {
+  try {
+    appendFileSync(path, `${JSON.stringify({ ts: Date.now(), pid: process.pid, ...event })}
+`, { mode: 384 });
+  } catch {}
+}
+var traceRotated = false;
+function rotateTraceOnce(path) {
+  if (traceRotated)
+    return;
+  traceRotated = true;
+  try {
+    if (statSync(path).size > TRACE_MAX_BYTES)
+      truncateSync(path, 0);
+  } catch {}
+}
+var signalHandlersInstalled = false;
+function defaultTrace() {
+  rotateTraceOnce(TRACE_PATH);
+  const trace = (event) => appendTrace(TRACE_PATH, event);
+  if (!signalHandlersInstalled) {
+    signalHandlersInstalled = true;
+    for (const sig of ["SIGTERM", "SIGINT", "SIGHUP"]) {
+      process.on(sig, () => {
+        trace({ event: "signal", signal: sig });
+        process.exit(0);
+      });
+    }
+    process.on("uncaughtException", (e) => {
+      trace({ event: "uncaughtException", error: String(e).slice(0, 200) });
+      process.exit(0);
+    });
+    process.on("unhandledRejection", (e) => {
+      trace({ event: "unhandledRejection", error: String(e).slice(0, 200) });
+      process.exit(0);
+    });
+    process.on("exit", (code) => appendTrace(TRACE_PATH, { event: "exit-event", code }));
+  }
+  return trace;
+}
+function buildPermissionSummary(toolName, toolInput) {
+  const str = (v) => typeof v === "string" && v.length > 0 ? v : undefined;
+  const truncate = (s, n = 80) => s.length <= n ? s : `${s.slice(0, n - 1)}…`;
+  switch (toolName) {
+    case "Bash":
+    case "shell":
+    case "local_shell": {
+      const cmd = str(toolInput.command);
+      return cmd ? truncate(cmd.split(`
+`)[0]) : toolName;
+    }
+    case "apply_patch": {
+      const desc = str(toolInput.description);
+      return desc ? truncate(desc) : toolName;
+    }
+    case "Edit":
+    case "Write":
+    case "Read":
+    case "NotebookEdit": {
+      const fp = str(toolInput.file_path);
+      return fp ? basename3(fp) : toolName;
+    }
+    case "WebFetch":
+    case "WebSearch": {
+      const url = str(toolInput.url);
+      if (url) {
+        try {
+          return new URL(url).host;
+        } catch {}
+      }
+      const query = str(toolInput.query);
+      return query ? truncate(query) : toolName;
+    }
+    case "ExitPlanMode":
+      return "Approve Claude's plan";
+    default: {
+      if (/^mcp__/.test(toolName)) {
+        const seg = toolName.split("__").pop();
+        return seg && seg.length > 0 ? seg : toolName;
+      }
+      return toolName;
+    }
+  }
+}
+function buildPermissionDetail(toolName, toolInput) {
+  const str = (v) => typeof v === "string" && v.length > 0 ? v : undefined;
+  const cap = (s) => s.length <= 400 ? s : `${s.slice(0, 399)}…`;
+  switch (toolName) {
+    case "Bash":
+    case "shell":
+    case "local_shell": {
+      const c = str(toolInput.command);
+      return c ? cap(c) : "";
+    }
+    case "apply_patch": {
+      const d = str(toolInput.description);
+      return d ? cap(d) : "";
+    }
+    case "Edit":
+    case "Write":
+    case "Read":
+    case "NotebookEdit": {
+      const fp = str(toolInput.file_path);
+      return fp ? cap(fp) : "";
+    }
+    case "WebFetch": {
+      const u = str(toolInput.url);
+      return u ? cap(u) : "";
+    }
+    case "WebSearch": {
+      const q = str(toolInput.query);
+      return q ? cap(q) : "";
+    }
+    case "ExitPlanMode": {
+      const p = str(toolInput.plan);
+      return p ? cap(p) : "";
+    }
+    default:
+      return "";
+  }
+}
+function emitDecision(agent, answer, toolName, suggestions, emit, trace) {
+  switch (answer.decision) {
+    case "allow":
+      emit(allowLine(agent));
+      trace({ event: "emit", decision: "allow" });
+      return false;
+    case "allow_always":
+      emit(allowAlwaysLine(agent, toolName, suggestions));
+      trace({ event: "emit", decision: "allow_always" });
+      return false;
+    case "deny":
+      emit(denyLine(agent, answer.message));
+      trace({ event: "emit", decision: "deny", hasMessage: typeof answer.message === "string" && answer.message.trim().length > 0 });
+      return false;
+    default:
+      trace({ event: "answer-unknown-decision" });
+      return true;
+  }
+}
+async function readStdin2() {
+  const chunks = [];
+  for await (const chunk of process.stdin)
+    chunks.push(chunk);
+  return Buffer.concat(chunks).toString("utf8");
+}
+async function flagExists(path) {
+  try {
+    await access(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+async function runPermissionHook(deps = {}, agent = "claude") {
+  const noHoldPath = deps.noHoldPath ?? NO_HOLD_PATH;
+  const trace = deps.trace ?? defaultTrace();
+  try {
+    if (await flagExists(noHoldPath)) {
+      await (deps.delegate ?? (() => runHook(agent)))();
+      return;
+    }
+    const [config, raw] = await Promise.all([
+      (deps.loadConfigFn ?? loadConfig)(),
+      (deps.readInput ?? readStdin2)()
+    ]);
+    trace({ event: "stdin-read", bytes: raw.length });
+    if (!config) {
+      trace({ event: "exit", reason: "unpaired" });
+      return;
+    }
+    const input = JSON.parse(raw);
+    const sessionId = typeof input.session_id === "string" ? input.session_id : "";
+    if (sessionId.length === 0) {
+      trace({ event: "exit", reason: "no-session-id" });
+      return;
+    }
+    const toolName = typeof input.tool_name === "string" ? input.tool_name : "";
+    const agentId = typeof input.agent_id === "string" ? input.agent_id : "";
+    const permissionMode = typeof input.permission_mode === "string" ? input.permission_mode : undefined;
+    trace({ event: "start", session_id: sessionId, tool_name: toolName, permission_mode: permissionMode, agent: agentId.length > 0 });
+    if (agentId.length > 0) {
+      const agentType = typeof input.agent_type === "string" ? input.agent_type : undefined;
+      trace({ event: "exit", reason: "subagent", agent_type: agentType });
+      return;
+    }
+    if (permissionMode !== undefined && permissionMode !== "default" && permissionMode !== "acceptEdits" && permissionMode !== "plan") {
+      trace({ event: "exit", reason: "mode", mode: permissionMode });
+      return;
+    }
+    if (toolName === "AskUserQuestion") {
+      trace({ event: "exit", reason: "question-passthrough" });
+      await (deps.delegate ?? (() => runHook(agent)))();
+      return;
+    }
+    const toolInput = typeof input.tool_input === "object" && input.tool_input !== null ? input.tool_input : {};
+    const suggestions = input.permission_suggestions;
+    const requestId = (deps.randomUUID ?? (() => crypto.randomUUID()))();
+    const summary = buildPermissionSummary(toolName, toolInput);
+    const now = (deps.now ?? Date.now)();
+    const fetchFn = deps.fetchFn ?? fetch;
+    const record = await (deps.readRecordFn ?? readRecord)(sessionId);
+    const machine = config.machineName ?? hostname2().replace(/\.local$/, "");
+    const plan = { op: "update", prio: 1, status: "needsAttention" };
+    const base = buildBlob(input, machine, record?.title, plan, agent, record?.turnStartedAt, record?.label, record?.model);
+    const detail = buildPermissionDetail(toolName, toolInput);
+    const blob = await encryptBlob(config.e2eKey, {
+      ...base,
+      status: "decisionPending",
+      permissionSummary: summary,
+      permissionRequestId: requestId,
+      permissionToolName: toolName,
+      ...detail.length > 0 ? { permissionDetail: detail } : {}
+    });
+    const fallbackBlob = await encryptBlob(config.e2eKey, base);
+    const pcHeaders = { "x-cc-pairing": config.pairingId, "x-cc-auth": config.pcSecret, "x-cc-version": PLUGIN_VERSION };
+    const sleep = deps.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
+    const postDecision = async (round, maxAttempts) => {
+      let hold2 = false;
+      let posted2 = false;
+      for (let attempt = 1;attempt <= maxAttempts; attempt += 1) {
+        try {
+          const res = await fetchFn(`${config.url}/v1/cc/decision`, {
+            method: "POST",
+            headers: { "content-type": "application/json", ...pcHeaders },
+            body: JSON.stringify({ v: 2, sessionId, requestId, op: "update", prio: 1, ts: now, blob, fallbackBlob }),
+            signal: AbortSignal.timeout(POST_TIMEOUT_MS)
+          });
+          trace({ event: "posted", requestId, round, attempt, status: res.status });
+          if (res.ok)
+            hold2 = (await res.json()).hold === true;
+          posted2 = true;
+          break;
+        } catch (e) {
+          trace({ event: "posted", requestId, round, attempt, status: 0, error: e?.name ?? "Error" });
+          if (attempt < maxAttempts) {
+            await sleep(POST_RETRY_PAUSE_MS);
+            continue;
+          }
+        }
+      }
+      return { posted: posted2, hold: hold2 };
+    };
+    let { posted, hold } = await postDecision(1, POST_MAX_ATTEMPTS);
+    if (!posted) {
+      trace({ event: "exit", reason: "post-error" });
+      return;
+    }
+    trace({ event: "hold", hold });
+    if (!hold) {
+      const fresh = !record || now - record.ts < FRESH_SESSION_MS;
+      if (!fresh) {
+        trace({ event: "exit", reason: "hold-false" });
+        return;
+      }
+      trace({ event: "hold-retry-wait", delayMs: HOLD_RETRY_DELAY_MS });
+      await sleep(HOLD_RETRY_DELAY_MS);
+      const retry = await postDecision(2, 1);
+      if (!retry.posted) {
+        trace({ event: "exit", reason: "hold-false" });
+        return;
+      }
+      hold = retry.hold;
+      trace({ event: "hold", hold });
+      if (!hold) {
+        trace({ event: "exit", reason: "hold-false" });
+        return;
+      }
+    }
+    const jitter = deps.jitter ?? (() => Math.floor(Math.random() * 500));
+    const interval = deps.pollIntervalMs ?? POLL_INTERVAL_MS;
+    const emit = deps.emit ?? ((line) => process.stdout.write(`${line}
+`));
+    let misses = 0;
+    let seq = 0;
+    for (;; ) {
+      seq += 1;
+      trace({ event: "poll-begin", seq });
+      let data;
+      try {
+        const res = await fetchFn(`${config.url}/v1/cc/decision/${requestId}`, {
+          headers: pcHeaders,
+          signal: AbortSignal.timeout(FETCH_TIMEOUT_MS)
+        });
+        if (res.ok) {
+          data = await res.json();
+          trace({ event: "poll-end", seq, outcome: "ok" });
+        } else {
+          trace({ event: "poll-end", seq, outcome: "status", status: res.status });
+        }
+      } catch (e) {
+        trace({ event: "poll-end", seq, outcome: "error", error: e?.name ?? "Error" });
+      }
+      if (data) {
+        misses = 0;
+        if (data.status === "answered" && typeof data.answerBlob === "string") {
+          const answer = await decryptBlob(config.e2eKey, data.answerBlob);
+          const match = answer.requestId === requestId;
+          const keepPolling = match && emitDecision(agent, answer, toolName, suggestions, emit, trace);
+          if (!keepPolling) {
+            trace({ event: "answered", match });
+            trace({ event: "exit", reason: "answered" });
+            return;
+          }
+        } else if (typeof data.status === "string" && data.status !== "pending") {
+          trace({ event: data.status === "expired" ? "expired" : "superseded", status: data.status });
+          trace({ event: "exit", reason: data.status });
+          return;
+        }
+      } else if (++misses >= MAX_CONSECUTIVE_MISSES) {
+        trace({ event: "giveup", misses });
+        trace({ event: "exit", reason: "giveup" });
+        return;
+      }
+      await sleep(interval + jitter());
+    }
+  } catch (e) {
+    trace({ event: "exit", reason: "exception", error: String(e).slice(0, 200) });
+  }
+}
+async function approvalsCommand(sub, deps = {}) {
+  const path = deps.noHoldPath ?? NO_HOLD_PATH;
+  const print = deps.print ?? ((line) => console.log(line));
+  const exists = async () => {
+    try {
+      await access(path);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  if (sub === "off") {
+    await atomicWrite(path, "", 384);
+    print("Remote approvals are OFF for this computer — Claude Code permission prompts will appear in the terminal as usual (your phone is not asked).");
+    return 0;
+  }
+  if (sub === "on") {
+    await unlink3(path).catch(() => {});
+    print("Remote approvals are ON for this computer — when a session is on your phone's Live Activity, its permission prompts are sent to the phone to Allow or Deny.");
+    return 0;
+  }
+  print(await exists() ? "Remote approvals: OFF (paused locally) — permission prompts appear in the terminal. Run `on` to resume." : "Remote approvals: ON — permission prompts for phone-attached sessions are sent to your phone. Run `off` to pause them here.");
+  return 0;
+}
+
+// src/entries/codex-permission.ts
 if (__require.main == __require.module) {
-  await runHook("codex");
+  if (process.argv.includes("--check")) {
+    console.log("usage: codex-permission [off|on|status]  — Codex PermissionRequest hook; off/on/status toggle the local no-hold escape hatch (pause/resume remote approvals on this computer — shared with Claude Code)");
+    process.exit(0);
+  }
+  const sub = process.argv[2];
+  if (sub === "off" || sub === "on" || sub === "status") {
+    process.exit(await approvalsCommand(sub));
+  }
+  await runPermissionHook({}, "codex");
   process.exit(0);
 }

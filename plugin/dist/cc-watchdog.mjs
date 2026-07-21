@@ -3,7 +3,7 @@ var __require = /* @__PURE__ */ createRequire(import.meta.url);
 
 // src/entries/cc-watchdog.ts
 import { readdir as readdir2, readFile as readFile3, unlink as unlink2 } from "node:fs/promises";
-import { readFileSync as readFileSync2, unlinkSync } from "node:fs";
+import { readFileSync as readFileSync2, statSync, unlinkSync } from "node:fs";
 import { hostname } from "node:os";
 import { basename as basename2 } from "node:path";
 
@@ -92,7 +92,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { execFileSync, spawn } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "1.1.10";
+var PLUGIN_VERSION = "1.2.0";
 var CC_DIR = `${process.env.HOME}/.config/cc-status`;
 var SESSIONS_DIR = `${CC_DIR}/sessions`;
 var WATCHDOG_PID_PATH = `${CC_DIR}/watchdog.pid`;
@@ -1605,7 +1605,14 @@ async function correctIdleProvisional(config, path, sessionId, record) {
 }
 var CLAUDE_IDLE_REAP_MS = 1800000;
 var CLAUDE_IDLE_REAP_MAX_ATTEMPTS = 5;
-function isClaudeIdleReapEligible(record, now) {
+function transcriptMtimeMsDefault(path) {
+  try {
+    return statSync(path).mtimeMs;
+  } catch {
+    return;
+  }
+}
+function isClaudeIdleReapEligible(record, now, transcriptMtimeMs = transcriptMtimeMsDefault) {
   if (record.agent === "codex")
     return false;
   if (record.provisional === true)
@@ -1614,7 +1621,16 @@ function isClaudeIdleReapEligible(record, now) {
     return false;
   if (typeof record.ts !== "number")
     return false;
-  return now - record.ts >= CLAUDE_IDLE_REAP_MS;
+  if (now - record.ts < CLAUDE_IDLE_REAP_MS)
+    return false;
+  if (typeof record.transcript === "string" && record.transcript.length > 0) {
+    try {
+      const m = transcriptMtimeMs(record.transcript);
+      if (typeof m === "number" && Number.isFinite(m) && now - m < CLAUDE_IDLE_REAP_MS)
+        return false;
+    } catch {}
+  }
+  return true;
 }
 async function correctIdleClaude(config, path, sessionId, record, now, deps = {}) {
   const post = deps.post ?? ((body) => postEvent(config, body));

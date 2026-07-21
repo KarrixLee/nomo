@@ -97,7 +97,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { execFileSync, spawn } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "1.1.10";
+var PLUGIN_VERSION = "1.2.0";
 var CC_DIR = `${process.env.HOME}/.config/cc-status`;
 var SESSIONS_DIR = `${CC_DIR}/sessions`;
 var WATCHDOG_PID_PATH = `${CC_DIR}/watchdog.pid`;
@@ -1603,8 +1603,25 @@ var POST_RETRY_PAUSE_MS = 1000;
 var HOLD_RETRY_DELAY_MS = 4000;
 var FRESH_SESSION_MS = 60000;
 var MAX_CONSECUTIVE_MISSES = 100;
-var ALLOW_LINE = JSON.stringify({ hookSpecificOutput: { hookEventName: "PermissionRequest", decision: { behavior: "allow" } } });
-var DENY_LINE = JSON.stringify({ hookSpecificOutput: { hookEventName: "PermissionRequest", decision: { behavior: "deny", message: "Denied from phone" } } });
+function decisionLine(agent, hookSpecificOutput) {
+  return JSON.stringify(agent === "codex" ? { continue: true, hookSpecificOutput } : { hookSpecificOutput });
+}
+var ALLOW_HSO = { hookEventName: "PermissionRequest", decision: { behavior: "allow" } };
+var DENY_HSO = { hookEventName: "PermissionRequest", decision: { behavior: "deny", message: "Denied from phone" } };
+var DENY_MESSAGE_MAX = 500;
+function allowLine(agent) {
+  return decisionLine(agent, ALLOW_HSO);
+}
+function denyLine(agent, message) {
+  const m = typeof message === "string" ? message.trim().slice(0, DENY_MESSAGE_MAX) : "";
+  if (m.length === 0)
+    return decisionLine(agent, DENY_HSO);
+  return decisionLine(agent, { hookEventName: "PermissionRequest", decision: { behavior: "deny", message: m } });
+}
+function allowAlwaysLine(agent, toolName, suggestions) {
+  const updatedPermissions = Array.isArray(suggestions) && suggestions.length > 0 ? suggestions : [{ type: "addRules", rules: [{ toolName }], behavior: "allow", destination: "session" }];
+  return decisionLine(agent, { hookEventName: "PermissionRequest", decision: { behavior: "allow", updatedPermissions } });
+}
 var TRACE_PATH = `${CC_DIR}/permission-trace.log`;
 var TRACE_MAX_BYTES = 256 * 1024;
 function appendTrace(path, event) {
@@ -1651,10 +1668,16 @@ function buildPermissionSummary(toolName, toolInput) {
   const str = (v) => typeof v === "string" && v.length > 0 ? v : undefined;
   const truncate = (s, n = 80) => s.length <= n ? s : `${s.slice(0, n - 1)}…`;
   switch (toolName) {
-    case "Bash": {
+    case "Bash":
+    case "shell":
+    case "local_shell": {
       const cmd = str(toolInput.command);
       return cmd ? truncate(cmd.split(`
 `)[0]) : toolName;
+    }
+    case "apply_patch": {
+      const desc = str(toolInput.description);
+      return desc ? truncate(desc) : toolName;
     }
     case "Edit":
     case "Write":
@@ -1674,6 +1697,8 @@ function buildPermissionSummary(toolName, toolInput) {
       const query = str(toolInput.query);
       return query ? truncate(query) : toolName;
     }
+    case "ExitPlanMode":
+      return "Approve Claude's plan";
     default: {
       if (/^mcp__/.test(toolName)) {
         const seg = toolName.split("__").pop();
@@ -1681,6 +1706,62 @@ function buildPermissionSummary(toolName, toolInput) {
       }
       return toolName;
     }
+  }
+}
+function buildPermissionDetail(toolName, toolInput) {
+  const str = (v) => typeof v === "string" && v.length > 0 ? v : undefined;
+  const cap = (s) => s.length <= 400 ? s : `${s.slice(0, 399)}…`;
+  switch (toolName) {
+    case "Bash":
+    case "shell":
+    case "local_shell": {
+      const c = str(toolInput.command);
+      return c ? cap(c) : "";
+    }
+    case "apply_patch": {
+      const d = str(toolInput.description);
+      return d ? cap(d) : "";
+    }
+    case "Edit":
+    case "Write":
+    case "Read":
+    case "NotebookEdit": {
+      const fp = str(toolInput.file_path);
+      return fp ? cap(fp) : "";
+    }
+    case "WebFetch": {
+      const u = str(toolInput.url);
+      return u ? cap(u) : "";
+    }
+    case "WebSearch": {
+      const q = str(toolInput.query);
+      return q ? cap(q) : "";
+    }
+    case "ExitPlanMode": {
+      const p = str(toolInput.plan);
+      return p ? cap(p) : "";
+    }
+    default:
+      return "";
+  }
+}
+function emitDecision(agent, answer, toolName, suggestions, emit, trace) {
+  switch (answer.decision) {
+    case "allow":
+      emit(allowLine(agent));
+      trace({ event: "emit", decision: "allow" });
+      return false;
+    case "allow_always":
+      emit(allowAlwaysLine(agent, toolName, suggestions));
+      trace({ event: "emit", decision: "allow_always" });
+      return false;
+    case "deny":
+      emit(denyLine(agent, answer.message));
+      trace({ event: "emit", decision: "deny", hasMessage: typeof answer.message === "string" && answer.message.trim().length > 0 });
+      return false;
+    default:
+      trace({ event: "answer-unknown-decision" });
+      return true;
   }
 }
 async function readStdin2() {
@@ -1697,12 +1778,12 @@ async function flagExists(path) {
     return false;
   }
 }
-async function runPermissionHook(deps = {}) {
+async function runPermissionHook(deps = {}, agent = "claude") {
   const noHoldPath = deps.noHoldPath ?? NO_HOLD_PATH;
   const trace = deps.trace ?? defaultTrace();
   try {
     if (await flagExists(noHoldPath)) {
-      await (deps.delegate ?? (() => runHook("claude")))();
+      await (deps.delegate ?? (() => runHook(agent)))();
       return;
     }
     const [config, raw] = await Promise.all([
@@ -1733,7 +1814,13 @@ async function runPermissionHook(deps = {}) {
       trace({ event: "exit", reason: "mode", mode: permissionMode });
       return;
     }
+    if (toolName === "AskUserQuestion") {
+      trace({ event: "exit", reason: "question-passthrough" });
+      await (deps.delegate ?? (() => runHook(agent)))();
+      return;
+    }
     const toolInput = typeof input.tool_input === "object" && input.tool_input !== null ? input.tool_input : {};
+    const suggestions = input.permission_suggestions;
     const requestId = (deps.randomUUID ?? (() => crypto.randomUUID()))();
     const summary = buildPermissionSummary(toolName, toolInput);
     const now = (deps.now ?? Date.now)();
@@ -1741,8 +1828,16 @@ async function runPermissionHook(deps = {}) {
     const record = await (deps.readRecordFn ?? readRecord)(sessionId);
     const machine = config.machineName ?? hostname2().replace(/\.local$/, "");
     const plan = { op: "update", prio: 1, status: "needsAttention" };
-    const base = buildBlob(input, machine, record?.title, plan, "claude", record?.turnStartedAt, record?.label, record?.model);
-    const blob = await encryptBlob(config.e2eKey, { ...base, status: "decisionPending", permissionSummary: summary, permissionRequestId: requestId });
+    const base = buildBlob(input, machine, record?.title, plan, agent, record?.turnStartedAt, record?.label, record?.model);
+    const detail = buildPermissionDetail(toolName, toolInput);
+    const blob = await encryptBlob(config.e2eKey, {
+      ...base,
+      status: "decisionPending",
+      permissionSummary: summary,
+      permissionRequestId: requestId,
+      permissionToolName: toolName,
+      ...detail.length > 0 ? { permissionDetail: detail } : {}
+    });
     const fallbackBlob = await encryptBlob(config.e2eKey, base);
     const pcHeaders = { "x-cc-pairing": config.pairingId, "x-cc-auth": config.pcSecret, "x-cc-version": PLUGIN_VERSION };
     const sleep = deps.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
@@ -1827,20 +1922,13 @@ async function runPermissionHook(deps = {}) {
         if (data.status === "answered" && typeof data.answerBlob === "string") {
           const answer = await decryptBlob(config.e2eKey, data.answerBlob);
           const match = answer.requestId === requestId;
-          if (match) {
-            if (answer.decision === "allow") {
-              emit(ALLOW_LINE);
-              trace({ event: "emit", decision: "allow" });
-            } else if (answer.decision === "deny") {
-              emit(DENY_LINE);
-              trace({ event: "emit", decision: "deny" });
-            }
+          const keepPolling = match && emitDecision(agent, answer, toolName, suggestions, emit, trace);
+          if (!keepPolling) {
+            trace({ event: "answered", match });
+            trace({ event: "exit", reason: "answered" });
+            return;
           }
-          trace({ event: "answered", match });
-          trace({ event: "exit", reason: "answered" });
-          return;
-        }
-        if (typeof data.status === "string" && data.status !== "pending") {
+        } else if (typeof data.status === "string" && data.status !== "pending") {
           trace({ event: data.status === "expired" ? "expired" : "superseded", status: data.status });
           trace({ event: "exit", reason: data.status });
           return;
