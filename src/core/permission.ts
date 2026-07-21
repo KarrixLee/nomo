@@ -63,9 +63,34 @@ const FRESH_SESSION_MS = 60_000;
  *  including a plain {status:"pending"} — resets the counter, so a healthy hold is unbounded. */
 const MAX_CONSECUTIVE_MISSES = 100;
 
-/** The exact decision lines Claude Code consumes on stdout (frozen wire contract). */
+/** The exact decision lines Claude Code consumes on stdout (frozen wire contract). ALLOW_LINE and the
+ *  no-message DENY_LINE stay BYTE-IDENTICAL to the pre-1.1 plugin so a plain allow / deny-without-message
+ *  is indistinguishable on the wire; the builders below only DIVERGE when the phone sends the new
+ *  always-allow / custom-message variants. */
 const ALLOW_LINE = JSON.stringify({ hookSpecificOutput: { hookEventName: "PermissionRequest", decision: { behavior: "allow" } } });
 const DENY_LINE = JSON.stringify({ hookSpecificOutput: { hookEventName: "PermissionRequest", decision: { behavior: "deny", message: "Denied from phone" } } });
+/** Cap the phone's custom deny message so a runaway string can't bloat the stdout line CC must parse. */
+const DENY_MESSAGE_MAX = 500;
+
+/** Deny with the phone's custom message; an absent/empty/whitespace-only message degrades to the frozen
+ *  DENY_LINE (so a plain "Deny" tap stays byte-identical to the old wire). */
+function denyLine(message?: unknown): string {
+  const m = typeof message === "string" ? message.trim().slice(0, DENY_MESSAGE_MAX) : "";
+  if (m.length === 0) return DENY_LINE;
+  return JSON.stringify({ hookSpecificOutput: { hookEventName: "PermissionRequest", decision: { behavior: "deny", message: m } } });
+}
+
+/** Allow + a session-scoped always-allow rule. CC's own `permission_suggestions` (already narrowly
+ *  scoped — e.g. `Bash(bun test:*)`) are applied VERBATIM when present; otherwise a whole-tool session
+ *  rule. `destination: "session"` ONLY — an over-broad grant dies with the session, never persisted to
+ *  disk. Requires CC ≥ 2.0.54 (the `updatedPermissions` key); older CC ignores the extra key and
+ *  degrades to a plain allow (safe: the tool still runs, just no rule is remembered). */
+function allowAlwaysLine(toolName: string, suggestions: unknown): string {
+  const updatedPermissions = Array.isArray(suggestions) && suggestions.length > 0
+    ? suggestions
+    : [{ type: "addRules", rules: [{ toolName }], behavior: "allow", destination: "session" }];
+  return JSON.stringify({ hookSpecificOutput: { hookEventName: "PermissionRequest", decision: { behavior: "allow", updatedPermissions } } });
+}
 
 // ---- operational trace ---------------------------------------------------------------------
 //
@@ -149,6 +174,10 @@ export function buildPermissionSummary(toolName: string, toolInput: Record<strin
       const query = str(toolInput.query);
       return query ? truncate(query) : toolName;
     }
+    // ExitPlanMode fires a PermissionRequest carrying the whole plan in tool_input.plan (verified on CC
+    // 2.1.216): the summary is a fixed prompt — the plan markdown itself rides in the detail field.
+    case "ExitPlanMode":
+      return "Approve Claude's plan";
     default: {
       if (/^mcp__/.test(toolName)) {
         const seg = toolName.split("__").pop();
@@ -156,6 +185,53 @@ export function buildPermissionSummary(toolName: string, toolInput: Record<strin
       }
       return toolName;
     }
+  }
+}
+
+/** Fuller context for the phone card (the append-last `permissionDetail` blob field, shown under the
+ *  one-line summary). Bash → the full command (ALL lines, unlike the first-line-only summary); the file
+ *  tools → the full path; WebFetch/WebSearch → the full url or query; ExitPlanMode → the plan markdown;
+ *  else "". Hard 400-char cap — this is the lowest-value blob field, so it truncates first if the sealed
+ *  frame ever nears the worker's MAX_BLOB_CHARS ceiling (it doesn't, in practice — see the blob-size
+ *  note at the seal site). Pure and never throws. */
+export function buildPermissionDetail(toolName: string, toolInput: Record<string, unknown>): string {
+  const str = (v: unknown): string | undefined => (typeof v === "string" && v.length > 0 ? v : undefined);
+  const cap = (s: string): string => (s.length <= 400 ? s : `${s.slice(0, 399)}…`);
+  switch (toolName) {
+    case "Bash": { const c = str(toolInput.command); return c ? cap(c) : ""; }
+    case "Edit": case "Write": case "Read": case "NotebookEdit": {
+      const fp = str(toolInput.file_path); return fp ? cap(fp) : "";
+    }
+    case "WebFetch": { const u = str(toolInput.url); return u ? cap(u) : ""; }
+    case "WebSearch": { const q = str(toolInput.query); return q ? cap(q) : ""; }
+    case "ExitPlanMode": { const p = str(toolInput.plan); return p ? cap(p) : ""; }
+    default: return "";
+  }
+}
+
+/** Apply the phone's decrypted answer for THIS request to stdout, returning true iff the hook should
+ *  KEEP POLLING. The caller has already confirmed answer.requestId === requestId. Every decision this
+ *  plugin version understands emits exactly one line and returns false (done); the ONLY keep-polling
+ *  case is a decision verb we DON'T recognize (a newer phone talking to an older plugin) — we must never
+ *  guess a line, so we swallow it and wait for one we know (fail-safe, symmetric with fail-open). */
+function emitDecision(
+  answer: { decision?: unknown; message?: unknown },
+  toolName: string,
+  suggestions: unknown,
+  emit: (line: string) => void,
+  trace: (event: object) => void,
+): boolean {
+  switch (answer.decision) {
+    case "allow":
+      emit(ALLOW_LINE); trace({ event: "emit", decision: "allow" }); return false;
+    case "allow_always":
+      emit(allowAlwaysLine(toolName, suggestions)); trace({ event: "emit", decision: "allow_always" }); return false;
+    case "deny":
+      emit(denyLine(answer.message));
+      trace({ event: "emit", decision: "deny", hasMessage: typeof answer.message === "string" && answer.message.trim().length > 0 });
+      return false;
+    default:
+      trace({ event: "answer-unknown-decision" }); return true; // future phone, old plugin — keep polling
   }
 }
 
@@ -246,9 +322,23 @@ export async function runPermissionHook(deps: PermissionHookDeps = {}): Promise<
       trace({ event: "exit", reason: "mode", mode: permissionMode });
       return;
     }
+    // 3. Question gate: CC fires a PermissionRequest for AskUserQuestion too, but a bare Allow/Deny card
+    //    is the WRONG surface for a multi-option question (Allow would just re-show the terminal picker).
+    //    Until the question-answering wave (option buttons + answer injection) ships, delegate to the
+    //    exact fire-and-forget needs-attention path the no-hold flag uses: an attention buzz on the
+    //    phone, answer at the Mac. Placed AFTER the mode gate so an auto-mode question never even
+    //    delegates (it fell open above). Runs BEFORE any POST/blob build.
+    if (toolName === "AskUserQuestion") {
+      trace({ event: "exit", reason: "question-passthrough" });
+      await (deps.delegate ?? (() => runHook("claude")))();
+      return;
+    }
     const toolInput = typeof input.tool_input === "object" && input.tool_input !== null
       ? (input.tool_input as Record<string, unknown>)
       : {};
+    // CC's own narrowly-scoped rule suggestions (present on the PermissionRequest when it has them);
+    // passed through VERBATIM by allowAlwaysLine on an always-allow answer. Absent → whole-tool rule.
+    const suggestions = input.permission_suggestions;
     const requestId = (deps.randomUUID ?? (() => crypto.randomUUID()))();
     const summary = buildPermissionSummary(toolName, toolInput);
     const now = (deps.now ?? Date.now)();
@@ -256,15 +346,29 @@ export async function runPermissionHook(deps: PermissionHookDeps = {}): Promise<
 
     // Build the SAME session frame the normal hook would (reuse buildBlob + the record the working
     // hooks already wrote), then seal TWO variants: `blob` carries status "decisionPending" plus the
-    // two permission fields appended LAST (the iOS decoder's append-only discipline; spread-override
-    // keeps `status` in its original key position), and `fallbackBlob` is the untouched plain
-    // needsAttention frame the worker stores when it declines the hold — so clients that never opted
-    // in never see the new status. The worker is blind and can read neither; it just picks one.
+    // permission fields appended LAST (the iOS decoder's append-only discipline; spread-override keeps
+    // `status` in its original key position), and `fallbackBlob` is the untouched plain needsAttention
+    // frame the worker stores when it declines the hold — so clients that never opted in never see the
+    // new status. The worker is blind and can read neither; it just picks one.
+    //
+    // Append order is FROZEN: permissionSummary, permissionRequestId, permissionToolName, then the
+    // OPTIONAL permissionDetail (omitted when empty — never an empty string, matching every other
+    // optional blob key). permissionToolName lets the phone key card layout off the tool; permissionDetail
+    // is the fuller sub-line. BLOB SIZE: the worker rejects a decision POST whose base64 `blob` exceeds
+    // MAX_BLOB_CHARS (3072) — enforced server-side, NOT here (encryptBlob never hard-fails on size). The
+    // detail's hard 400-char cap keeps even a worst-case frame (400-char detail + 80-char summary + a long
+    // title) far under that ceiling (~1.2 KB base64; overflow needs ~2.3 KB of plaintext), so no local
+    // truncation beyond the cap is needed; if that ever changed, permissionDetail is the field to shed.
     const record = await (deps.readRecordFn ?? readRecord)(sessionId);
     const machine = config.machineName ?? hostname().replace(/\.local$/, "");
     const plan: OpPlan = { op: "update", prio: 1, status: "needsAttention" };
     const base = buildBlob(input, machine, record?.title, plan, "claude", record?.turnStartedAt, record?.label, record?.model);
-    const blob = await encryptBlob(config.e2eKey, { ...base, status: "decisionPending", permissionSummary: summary, permissionRequestId: requestId });
+    const detail = buildPermissionDetail(toolName, toolInput);
+    const blob = await encryptBlob(config.e2eKey, {
+      ...base, status: "decisionPending", permissionSummary: summary, permissionRequestId: requestId,
+      permissionToolName: toolName,
+      ...(detail.length > 0 ? { permissionDetail: detail } : {}),
+    });
     const fallbackBlob = await encryptBlob(config.e2eKey, base);
 
     const pcHeaders = { "x-cc-pairing": config.pairingId, "x-cc-auth": config.pcSecret, "x-cc-version": PLUGIN_VERSION };
@@ -356,17 +460,21 @@ export async function runPermissionHook(deps: PermissionHookDeps = {}): Promise<
         misses = 0;
         if (data.status === "answered" && typeof data.answerBlob === "string") {
           // A decrypt failure here throws to the outer catch → silent exit 0 (fail open), never a retry.
-          const answer = (await decryptBlob(config.e2eKey, data.answerBlob)) as { requestId?: unknown; decision?: unknown };
+          const answer = (await decryptBlob(config.e2eKey, data.answerBlob)) as
+            { requestId?: unknown; decision?: unknown; message?: unknown };
           const match = answer.requestId === requestId;
-          if (match) {
-            if (answer.decision === "allow") { emit(ALLOW_LINE); trace({ event: "emit", decision: "allow" }); }
-            else if (answer.decision === "deny") { emit(DENY_LINE); trace({ event: "emit", decision: "deny" }); }
+          // A matched, KNOWN decision emits one line and we're done; a requestId MISMATCH is a
+          // replay/stale answer (silent, done — unchanged). The one keep-polling case is a matched but
+          // UNRECOGNIZED decision verb (newer phone, older plugin): emitDecision returns true, we skip
+          // the return and fall through to the sleep so a decision we DO understand can still land.
+          const keepPolling = match && emitDecision(answer, toolName, suggestions, emit, trace);
+          if (!keepPolling) {
+            trace({ event: "answered", match });
+            trace({ event: "exit", reason: "answered" });
+            return; // answered (known decision) or mismatch → done, exactly one or zero lines emitted
           }
-          trace({ event: "answered", match });
-          trace({ event: "exit", reason: "answered" });
-          return; // answered (or mismatch) → done, exactly one or zero lines emitted
-        }
-        if (typeof data.status === "string" && data.status !== "pending") {
+          // else: unknown decision — keep polling (do NOT return, do NOT treat "answered" as terminal)
+        } else if (typeof data.status === "string" && data.status !== "pending") {
           trace({ event: data.status === "expired" ? "expired" : "superseded", status: data.status });
           trace({ event: "exit", reason: data.status });
           return; // expired/superseded/unknown → silent

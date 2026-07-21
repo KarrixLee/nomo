@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "bun:test";
 import {
-  buildPermissionSummary, runPermissionHook, approvalsCommand, NO_HOLD_PATH, TRACE_PATH,
+  buildPermissionSummary, buildPermissionDetail, runPermissionHook, approvalsCommand, NO_HOLD_PATH, TRACE_PATH,
 } from "./permission";
 import { encryptBlob, decryptBlob } from "./crypto";
 import type { Config } from "./shared";
@@ -34,12 +34,49 @@ describe("buildPermissionSummary", () => {
   test("mcp__ tool → last __-segment", () => {
     expect(buildPermissionSummary("mcp__linear__create_issue", {})).toBe("create_issue");
   });
+  test("ExitPlanMode → fixed 'Approve Claude's plan' (the plan itself rides in the detail)", () => {
+    expect(buildPermissionSummary("ExitPlanMode", {})).toBe("Approve Claude's plan");
+    expect(buildPermissionSummary("ExitPlanMode", { plan: "# do a bunch of stuff" })).toBe("Approve Claude's plan");
+  });
   test("unknown tool → tool_name verbatim", () => {
     expect(buildPermissionSummary("SomethingElse", {})).toBe("SomethingElse");
   });
   test("missing input fields → falls back to tool_name", () => {
     expect(buildPermissionSummary("Bash", {})).toBe("Bash");
     expect(buildPermissionSummary("Edit", {})).toBe("Edit");
+  });
+});
+
+// ---- detail builder (pure) — fuller context for the phone card, hard 400-char cap ----------
+
+describe("buildPermissionDetail", () => {
+  test("Bash → the FULL command, all lines (summary is only the first line)", () => {
+    expect(buildPermissionDetail("Bash", { command: "cd proj\nbun test\necho done" })).toBe("cd proj\nbun test\necho done");
+  });
+  test("Bash → capped at 400 chars with an ellipsis", () => {
+    const out = buildPermissionDetail("Bash", { command: "x".repeat(1000) });
+    expect(out.length).toBe(400);
+    expect(out.endsWith("…")).toBe(true);
+  });
+  test("Edit/Write/Read/NotebookEdit → the FULL file_path (not just the basename)", () => {
+    for (const t of ["Edit", "Write", "Read", "NotebookEdit"]) {
+      expect(buildPermissionDetail(t, { file_path: "/Users/x/proj/src/main.ts" })).toBe("/Users/x/proj/src/main.ts");
+    }
+  });
+  test("WebFetch → full url; WebSearch → full query", () => {
+    expect(buildPermissionDetail("WebFetch", { url: "https://example.com/a/b?q=1" })).toBe("https://example.com/a/b?q=1");
+    expect(buildPermissionDetail("WebSearch", { query: "how to nomo" })).toBe("how to nomo");
+  });
+  test("ExitPlanMode → the plan markdown, capped at 400", () => {
+    expect(buildPermissionDetail("ExitPlanMode", { plan: "## Plan\n- step one\n- step two" })).toBe("## Plan\n- step one\n- step two");
+    const long = buildPermissionDetail("ExitPlanMode", { plan: "p".repeat(900) });
+    expect(long.length).toBe(400);
+    expect(long.endsWith("…")).toBe(true);
+  });
+  test("unknown tool / missing fields → empty string (omitted from the blob)", () => {
+    expect(buildPermissionDetail("SomethingElse", { command: "x" })).toBe("");
+    expect(buildPermissionDetail("Bash", {})).toBe("");
+    expect(buildPermissionDetail("Edit", {})).toBe("");
   });
 });
 
@@ -156,12 +193,18 @@ describe("runPermissionHook — hold state machine", () => {
     expect(blob.status).toBe("decisionPending");
     expect(blob.permissionSummary).toBe("rm -rf build");
     expect(blob.permissionRequestId).toBe("req-fixed");
-    // appended LAST inside the sealed JSON (append-last discipline for the iOS decoder)
-    expect(Object.keys(blob).slice(-2)).toEqual(["permissionSummary", "permissionRequestId"]);
+    expect(blob.permissionToolName).toBe("Bash");
+    expect(blob.permissionDetail).toBe("rm -rf build"); // full command (single-line here)
+    // appended LAST inside the sealed JSON (append-last discipline for the iOS decoder):
+    // permissionSummary, permissionRequestId, permissionToolName, then permissionDetail (Bash → present).
+    expect(Object.keys(blob).slice(-4)).toEqual(
+      ["permissionSummary", "permissionRequestId", "permissionToolName", "permissionDetail"]);
     const fb = (await decryptBlob(KEY, body.fallbackBlob)) as Record<string, unknown>;
     expect(fb.status).toBe("needsAttention");
     expect("permissionSummary" in fb).toBe(false);
     expect("permissionRequestId" in fb).toBe(false);
+    expect("permissionToolName" in fb).toBe(false);
+    expect("permissionDetail" in fb).toBe(false);
   });
 
   test("hold=true, answered allow → emits exactly the allow line", async () => {
@@ -414,6 +457,173 @@ describe("runPermissionHook — pass-through gates", () => {
       trace: (e: { event: string }) => events.push(e),
     }) as never);
     expect(events.find((e) => e.event === "start")).toMatchObject({ permission_mode: "default", agent: false });
+  });
+});
+
+// ---- always-allow / deny-with-message / unknown-decision / richer context / question gate ---
+//
+// These drive the REAL hold loop through the harness (scripted fetch + injected answer blob), never a
+// mock of the module under test: a hold that reaches "answered" with each decision kind, plus the
+// question pass-through that never holds at all.
+
+describe("runPermissionHook — always-allow / deny-message / unknown decision", () => {
+  /** Hold, then answer with the given decrypted answer object; returns the emitted stdout lines. */
+  const answerWith = async (answer: Record<string, unknown>, over: Record<string, unknown> = {}) => {
+    const answerBlob = await encryptBlob(KEY, { requestId: "req-fixed", ts: 5, ...answer });
+    const emitted: string[] = [];
+    const { fn, calls } = scriptFetch(true, [{ status: "answered", answerBlob }]);
+    await runPermissionHook(baseDeps({ fetchFn: fn, emit: (l: string) => emitted.push(l), ...over }) as never);
+    return { emitted, calls };
+  };
+
+  test("allow_always WITH permission_suggestions → behavior allow + updatedPermissions === the suggestions VERBATIM", async () => {
+    const SUGG = [{ type: "addRules", rules: [{ toolName: "Bash", ruleContent: "bun test:*" }], behavior: "allow", destination: "session" }];
+    const { emitted } = await answerWith(
+      { decision: "allow_always" },
+      { readInput: async () => inputWith({ permission_suggestions: SUGG }) },
+    );
+    expect(emitted.length).toBe(1);
+    const decision = JSON.parse(emitted[0]).hookSpecificOutput.decision;
+    expect(decision.behavior).toBe("allow");
+    expect(decision.updatedPermissions).toEqual(SUGG); // passed through byte-for-byte
+  });
+
+  test("allow_always with NO suggestions → a whole-tool, session-scoped addRules for the tool_name", async () => {
+    const { emitted } = await answerWith({ decision: "allow_always" }); // INPUT = Bash, no permission_suggestions
+    const decision = JSON.parse(emitted[0]).hookSpecificOutput.decision;
+    expect(decision.behavior).toBe("allow");
+    expect(decision.updatedPermissions).toEqual([
+      { type: "addRules", rules: [{ toolName: "Bash" }], behavior: "allow", destination: "session" },
+    ]);
+  });
+
+  test("allow_always with an EMPTY suggestions array → still the whole-tool session rule", async () => {
+    const { emitted } = await answerWith(
+      { decision: "allow_always" },
+      { readInput: async () => inputWith({ permission_suggestions: [] }) },
+    );
+    expect(JSON.parse(emitted[0]).hookSpecificOutput.decision.updatedPermissions).toEqual([
+      { type: "addRules", rules: [{ toolName: "Bash" }], behavior: "allow", destination: "session" },
+    ]);
+  });
+
+  test("deny WITH a custom message → behavior deny + the phone's message", async () => {
+    const { emitted } = await answerWith({ decision: "deny", message: "use bun instead" });
+    expect(JSON.parse(emitted[0]).hookSpecificOutput.decision).toEqual({ behavior: "deny", message: "use bun instead" });
+  });
+
+  test("deny with a 600-char message → truncated to 500", async () => {
+    const { emitted } = await answerWith({ decision: "deny", message: "x".repeat(600) });
+    const msg = JSON.parse(emitted[0]).hookSpecificOutput.decision.message;
+    expect(msg.length).toBe(500);
+    expect(msg).toBe("x".repeat(500));
+  });
+
+  test("deny WITHOUT a message → byte-identical to the frozen DENY line", async () => {
+    const { emitted } = await answerWith({ decision: "deny" });
+    expect(emitted).toEqual([DENY]);
+  });
+
+  test("deny with a whitespace-only message → also the frozen DENY line", async () => {
+    const { emitted } = await answerWith({ decision: "deny", message: "   " });
+    expect(emitted).toEqual([DENY]);
+  });
+
+  test("plain allow still emits the frozen ALLOW line byte-identical", async () => {
+    const { emitted } = await answerWith({ decision: "allow" });
+    expect(emitted).toEqual([ALLOW]);
+  });
+
+  test("UNKNOWN decision → nothing emitted, keeps polling; a later allow answers normally", async () => {
+    const unknownBlob = await encryptBlob(KEY, { requestId: "req-fixed", decision: "some_future_verb", ts: 5 });
+    const allowBlob = await encryptBlob(KEY, { requestId: "req-fixed", decision: "allow", ts: 6 });
+    const emitted: string[] = [];
+    const { fn, calls } = scriptFetch(true, [
+      { status: "answered", answerBlob: unknownBlob },
+      { status: "answered", answerBlob: allowBlob },
+    ]);
+    await runPermissionHook(baseDeps({ fetchFn: fn, emit: (l: string) => emitted.push(l) }) as never);
+    expect(emitted).toEqual([ALLOW]);                                    // never guessed a line for the unknown verb
+    expect(calls.filter((c) => c.method === "GET").length).toBe(2);      // kept polling PAST the unknown answer
+  });
+});
+
+// ---- richer context: the decision blob's permissionToolName / permissionDetail ----------------
+
+describe("runPermissionHook — decision blob detail fields", () => {
+  const postedBlob = async (over: Record<string, unknown>) => {
+    const { fn, calls } = scriptFetch(false, []); // hold:false is fine — the POST body is built regardless
+    await runPermissionHook(baseDeps({ fetchFn: fn, emit: () => {}, ...over }) as never);
+    const body = JSON.parse(calls.find((c) => c.method === "POST")!.body!);
+    return { body, blob: (await decryptBlob(KEY, body.blob)) as Record<string, unknown> };
+  };
+
+  test("Bash → permissionToolName 'Bash' + permissionDetail is the FULL multi-line command", async () => {
+    const cmd = "cd /Users/x/proj\nbun test\necho done";
+    const { blob } = await postedBlob({ readInput: async () => inputWith({ tool_input: { command: cmd } }) });
+    expect(blob.permissionToolName).toBe("Bash");
+    expect(blob.permissionDetail).toBe(cmd); // all lines — the summary took only the first
+  });
+
+  test("Edit → permissionDetail is the FULL file_path (summary is just the basename)", async () => {
+    const { blob } = await postedBlob({
+      readInput: async () => inputWith({ tool_name: "Edit", tool_input: { file_path: "/Users/x/proj/src/main.ts" } }),
+    });
+    expect(blob.permissionToolName).toBe("Edit");
+    expect(blob.permissionDetail).toBe("/Users/x/proj/src/main.ts");
+  });
+
+  test("empty detail (unknown tool) → permissionDetail key OMITTED, permissionToolName still present", async () => {
+    const { blob } = await postedBlob({
+      readInput: async () => inputWith({ tool_name: "SomethingElse", tool_input: {} }),
+    });
+    expect(blob.permissionToolName).toBe("SomethingElse");
+    expect("permissionDetail" in blob).toBe(false);
+  });
+
+  // Step 3: the worker rejects a decision POST whose `blob` exceeds MAX_BLOB_CHARS (3072 base64 chars —
+  // enforced server-side, NOT in this plugin; encryptBlob never hard-fails on size). A 400-char detail
+  // plus the fattest realistic fields (80-char summary, a 120-char title) stays far under that ceiling.
+  test("a 400-char detail + typical fields keeps the sealed blob under the worker's 3072-char cap", async () => {
+    const record = { pid: 1, machine: "m", label: "l", title: "y".repeat(120), ts: 1000 };
+    const { body } = await postedBlob({
+      readRecordFn: async () => record,
+      readInput: async () => inputWith({ tool_input: { command: "x".repeat(1000) } }), // detail caps to 400
+    });
+    expect(body.blob.length).toBeLessThanOrEqual(3072);
+  });
+});
+
+// ---- AskUserQuestion pass-through (a bare Allow/Deny card is the wrong surface for a question) -----
+
+describe("runPermissionHook — AskUserQuestion pass-through", () => {
+  test("tool_name AskUserQuestion → delegates (fire-and-forget attention), NO POST, nothing on stdout", async () => {
+    const spy = spyFetch();
+    const emitted: string[] = [];
+    let delegated = false;
+    const events: Array<{ event: string; reason?: string }> = [];
+    await runPermissionHook(baseDeps({
+      readInput: async () => inputWith({ tool_name: "AskUserQuestion" }),
+      fetchFn: spy.fn, emit: (l: string) => emitted.push(l),
+      delegate: async () => { delegated = true; },
+      trace: (e: { event: string; reason?: string }) => events.push(e),
+    }) as never);
+    expect(delegated).toBe(true);          // reused the exact no-hold delegate
+    expect(spy.called()).toBe(false);      // never POSTed a decision — questions are not held
+    expect(emitted).toEqual([]);           // no stdout
+    expect(events.at(-1)).toMatchObject({ event: "exit", reason: "question-passthrough" });
+  });
+
+  test("AskUserQuestion in an AUTO mode → the mode gate fires FIRST (no delegate, no POST)", async () => {
+    const spy = spyFetch();
+    let delegated = false;
+    await runPermissionHook(baseDeps({
+      readInput: async () => inputWith({ tool_name: "AskUserQuestion", permission_mode: "auto" }),
+      fetchFn: spy.fn, emit: () => {},
+      delegate: async () => { delegated = true; },
+    }) as never);
+    expect(delegated).toBe(false);         // mode gate returns before the question gate is reached
+    expect(spy.called()).toBe(false);
   });
 });
 
