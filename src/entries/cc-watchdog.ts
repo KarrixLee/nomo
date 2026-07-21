@@ -29,7 +29,7 @@
 // PORTABLE: no `Bun.*` — file IO via node:fs/promises helpers.
 
 import { readdir, readFile, unlink } from "node:fs/promises";
-import { readFileSync, unlinkSync } from "node:fs";
+import { readFileSync, statSync, unlinkSync } from "node:fs";
 import { hostname } from "node:os";
 import { basename } from "node:path";
 import { encryptBlob } from "../core/crypto";
@@ -730,12 +730,31 @@ const CLAUDE_IDLE_REAP_MAX_ATTEMPTS = 5;
  *  resumed session that fired SessionStart then nothing — never `needsAttention`, which can legitimately sit
  *  >30 min awaiting a permission answer, nor `done`, already finished), and record.ts is older than
  *  CLAUDE_IDLE_REAP_MS. Pure so the whole matrix is unit-testable. */
-export function isClaudeIdleReapEligible(record: SessionRecord, now: number): boolean {
+/** Default transcript-mtime reader for the reap guard: epoch-ms mtime, undefined on any error. */
+function transcriptMtimeMsDefault(path: string): number | undefined {
+  try { return statSync(path).mtimeMs; } catch { return undefined; }
+}
+
+export function isClaudeIdleReapEligible(
+  record: SessionRecord, now: number,
+  transcriptMtimeMs: (path: string) => number | undefined = transcriptMtimeMsDefault,
+): boolean {
   if (record.agent === "codex") return false;
   if (record.provisional === true) return false;
   if (record.lastEvent !== "working" && record.lastEvent !== "sessionStart") return false;
   if (typeof record.ts !== "number") return false;
-  return now - record.ts >= CLAUDE_IDLE_REAP_MS;
+  if (now - record.ts < CLAUDE_IDLE_REAP_MS) return false;
+  // Transcript-liveness veto: record.ts only advances on real hooks, but CC streams the turn into the
+  // session JSONL continuously — a transcript written within the reap window means the turn is alive
+  // (long tool run / subagent fan-out), so reaping it "done" would be a lie. Any stat failure falls
+  // back to the pre-guard behavior (eligible): the guard can only reduce false reaps, never add them.
+  if (typeof record.transcript === "string" && record.transcript.length > 0) {
+    try {
+      const m = transcriptMtimeMs(record.transcript);
+      if (typeof m === "number" && Number.isFinite(m) && now - m < CLAUDE_IDLE_REAP_MS) return false;
+    } catch { /* eligible — same as before the guard */ }
+  }
+  return true;
 }
 
 /** Injectable side-effect seams for the idle-CLAUDE reap, so its settle/retry logic is testable without

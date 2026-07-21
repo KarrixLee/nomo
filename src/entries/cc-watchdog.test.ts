@@ -89,6 +89,29 @@ describe("isClaudeIdleReapEligible (a resumed Claude session gone silent past th
     // A shorter (5–30 min) silence is still heartbeated — that window is a legit long tool run.
     expect(shouldHeartbeat(rec({ lastEvent: "working", ts: now - 600_000 }), now, undefined, false)).toBe(true);
   });
+
+  test("idle reap: a FRESH transcript mtime vetoes eligibility (turn still alive)", () => {
+    const now = 10_000_000_000;
+    const rec = { pid: 1, machine: "m", label: "l", ts: now - 2_000_000, lastEvent: "working",
+                  transcript: "/tmp/t.jsonl" } as SessionRecord; // 33 min event-idle
+    // transcript written 3 min ago → alive → NOT eligible
+    expect(isClaudeIdleReapEligible(rec, now, () => now - 180_000)).toBe(false);
+  });
+
+  test("idle reap: a STALE transcript mtime does not rescue (both silent past the window)", () => {
+    const now = 10_000_000_000;
+    const rec = { pid: 1, machine: "m", label: "l", ts: now - 2_000_000, lastEvent: "working",
+                  transcript: "/tmp/t.jsonl" } as SessionRecord;
+    expect(isClaudeIdleReapEligible(rec, now, () => now - 3_600_000)).toBe(true); // 60 min old
+  });
+
+  test("idle reap: missing transcript path / unreadable stat behaves exactly as before (eligible)", () => {
+    const now = 10_000_000_000;
+    const noPath = { pid: 1, machine: "m", label: "l", ts: now - 2_000_000, lastEvent: "working" } as SessionRecord;
+    expect(isClaudeIdleReapEligible(noPath, now, () => { throw new Error("must not be called"); })).toBe(true);
+    const withPath = { ...noPath, transcript: "/tmp/t.jsonl" } as SessionRecord;
+    expect(isClaudeIdleReapEligible(withPath, now, () => undefined)).toBe(true); // stat failed
+  });
 });
 
 // The idle-CLAUDE reap must make DURABLE progress even when its corrective done can't reach the worker —
