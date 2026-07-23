@@ -81,8 +81,18 @@ const DENY_HSO = { hookEventName: "PermissionRequest", decision: { behavior: "de
 /** Cap the phone's custom deny message so a runaway string can't bloat the stdout line the agent parses. */
 const DENY_MESSAGE_MAX = 500;
 
-/** Plain allow. */
-function allowLine(agent: AgentKind): string {
+/** Plain allow. EXCEPTION — ExitPlanMode (NOM-36): CC ignores a bare {behavior:"allow"} for the
+ *  plan-exit approval — deny works (the plan is rejected) but a bare allow is a NO-OP: the plan is
+ *  never approved and the session stays in plan mode. The fix echoes the tool's ORIGINAL input back
+ *  via `updatedInput` — the same thing the open-vibe-island reference does for EVERY allow
+ *  (BridgeServer's `updatedInput ?? payload.toolInput`). The echo is scoped to ExitPlanMode so every
+ *  OTHER tool's allow stays BYTE-IDENTICAL to the frozen ALLOW line (decisionLine reproduces the
+ *  pre-1.1 wire). The plugin already holds the original tool_input from stdin, so nothing new has to
+ *  travel from the phone — the phone still just answers "allow". */
+function allowLine(agent: AgentKind, toolName: string, toolInput: Record<string, unknown>): string {
+  if (toolName === "ExitPlanMode") {
+    return decisionLine(agent, { hookEventName: "PermissionRequest", decision: { behavior: "allow", updatedInput: toolInput } });
+  }
   return decisionLine(agent, ALLOW_HSO);
 }
 
@@ -99,11 +109,16 @@ function denyLine(agent: AgentKind, message?: unknown): string {
  *  rule. `destination: "session"` ONLY — an over-broad grant dies with the session, never persisted to
  *  disk. Requires CC ≥ 2.0.54 (the `updatedPermissions` key); older CC ignores the extra key and
  *  degrades to a plain allow (safe: the tool still runs, just no rule is remembered). */
-function allowAlwaysLine(agent: AgentKind, toolName: string, suggestions: unknown): string {
+function allowAlwaysLine(agent: AgentKind, toolName: string, toolInput: Record<string, unknown>, suggestions: unknown): string {
   const updatedPermissions = Array.isArray(suggestions) && suggestions.length > 0
     ? suggestions
     : [{ type: "addRules", rules: [{ toolName }], behavior: "allow", destination: "session" }];
-  return decisionLine(agent, { hookEventName: "PermissionRequest", decision: { behavior: "allow", updatedPermissions } });
+  // ExitPlanMode needs the same updatedInput echo as the plain allow (see allowLine / NOM-36) or the
+  // approval no-ops. Key order matches the reference: behavior, updatedInput, updatedPermissions.
+  const decision = toolName === "ExitPlanMode"
+    ? { behavior: "allow", updatedInput: toolInput, updatedPermissions }
+    : { behavior: "allow", updatedPermissions };
+  return decisionLine(agent, { hookEventName: "PermissionRequest", decision });
 }
 
 // ---- operational trace ---------------------------------------------------------------------
@@ -243,15 +258,16 @@ function emitDecision(
   agent: AgentKind,
   answer: { decision?: unknown; message?: unknown },
   toolName: string,
+  toolInput: Record<string, unknown>,
   suggestions: unknown,
   emit: (line: string) => void,
   trace: (event: object) => void,
 ): boolean {
   switch (answer.decision) {
     case "allow":
-      emit(allowLine(agent)); trace({ event: "emit", decision: "allow" }); return false;
+      emit(allowLine(agent, toolName, toolInput)); trace({ event: "emit", decision: "allow" }); return false;
     case "allow_always":
-      emit(allowAlwaysLine(agent, toolName, suggestions)); trace({ event: "emit", decision: "allow_always" }); return false;
+      emit(allowAlwaysLine(agent, toolName, toolInput, suggestions)); trace({ event: "emit", decision: "allow_always" }); return false;
     case "deny":
       emit(denyLine(agent, answer.message));
       trace({ event: "emit", decision: "deny", hasMessage: typeof answer.message === "string" && answer.message.trim().length > 0 });
@@ -501,7 +517,7 @@ export async function runPermissionHook(deps: PermissionHookDeps = {}, agent: Ag
           // replay/stale answer (silent, done — unchanged). The one keep-polling case is a matched but
           // UNRECOGNIZED decision verb (newer phone, older plugin): emitDecision returns true, we skip
           // the return and fall through to the sleep so a decision we DO understand can still land.
-          const keepPolling = match && emitDecision(agent, answer, toolName, suggestions, emit, trace);
+          const keepPolling = match && emitDecision(agent, answer, toolName, toolInput, suggestions, emit, trace);
           if (!keepPolling) {
             trace({ event: "answered", match });
             trace({ event: "exit", reason: "answered" });

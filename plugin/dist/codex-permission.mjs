@@ -1609,7 +1609,10 @@ function decisionLine(agent, hookSpecificOutput) {
 var ALLOW_HSO = { hookEventName: "PermissionRequest", decision: { behavior: "allow" } };
 var DENY_HSO = { hookEventName: "PermissionRequest", decision: { behavior: "deny", message: "Denied from phone" } };
 var DENY_MESSAGE_MAX = 500;
-function allowLine(agent) {
+function allowLine(agent, toolName, toolInput) {
+  if (toolName === "ExitPlanMode") {
+    return decisionLine(agent, { hookEventName: "PermissionRequest", decision: { behavior: "allow", updatedInput: toolInput } });
+  }
   return decisionLine(agent, ALLOW_HSO);
 }
 function denyLine(agent, message) {
@@ -1618,9 +1621,10 @@ function denyLine(agent, message) {
     return decisionLine(agent, DENY_HSO);
   return decisionLine(agent, { hookEventName: "PermissionRequest", decision: { behavior: "deny", message: m } });
 }
-function allowAlwaysLine(agent, toolName, suggestions) {
+function allowAlwaysLine(agent, toolName, toolInput, suggestions) {
   const updatedPermissions = Array.isArray(suggestions) && suggestions.length > 0 ? suggestions : [{ type: "addRules", rules: [{ toolName }], behavior: "allow", destination: "session" }];
-  return decisionLine(agent, { hookEventName: "PermissionRequest", decision: { behavior: "allow", updatedPermissions } });
+  const decision = toolName === "ExitPlanMode" ? { behavior: "allow", updatedInput: toolInput, updatedPermissions } : { behavior: "allow", updatedPermissions };
+  return decisionLine(agent, { hookEventName: "PermissionRequest", decision });
 }
 var TRACE_PATH = `${CC_DIR}/permission-trace.log`;
 var TRACE_MAX_BYTES = 256 * 1024;
@@ -1745,14 +1749,14 @@ function buildPermissionDetail(toolName, toolInput) {
       return "";
   }
 }
-function emitDecision(agent, answer, toolName, suggestions, emit, trace) {
+function emitDecision(agent, answer, toolName, toolInput, suggestions, emit, trace) {
   switch (answer.decision) {
     case "allow":
-      emit(allowLine(agent));
+      emit(allowLine(agent, toolName, toolInput));
       trace({ event: "emit", decision: "allow" });
       return false;
     case "allow_always":
-      emit(allowAlwaysLine(agent, toolName, suggestions));
+      emit(allowAlwaysLine(agent, toolName, toolInput, suggestions));
       trace({ event: "emit", decision: "allow_always" });
       return false;
     case "deny":
@@ -1922,7 +1926,7 @@ async function runPermissionHook(deps = {}, agent = "claude") {
         if (data.status === "answered" && typeof data.answerBlob === "string") {
           const answer = await decryptBlob(config.e2eKey, data.answerBlob);
           const match = answer.requestId === requestId;
-          const keepPolling = match && emitDecision(agent, answer, toolName, suggestions, emit, trace);
+          const keepPolling = match && emitDecision(agent, answer, toolName, toolInput, suggestions, emit, trace);
           if (!keepPolling) {
             trace({ event: "answered", match });
             trace({ event: "exit", reason: "answered" });

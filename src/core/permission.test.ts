@@ -601,6 +601,87 @@ describe("runPermissionHook — always-allow / deny-message / unknown decision",
   });
 });
 
+// ---- ExitPlanMode allow needs updatedInput (NOM-36) ---------------------------------------
+//
+// CC ignores a BARE {behavior:"allow"} for ExitPlanMode: deny works (the plan is rejected), but a
+// bare allow is a NO-OP — the plan is never approved and the session stays in plan mode. The fix
+// echoes the tool_input back via `updatedInput` (the open-vibe-island reference does this for EVERY
+// allow — BridgeServer's `updatedInput ?? payload.toolInput`). We scope the echo to ExitPlanMode so
+// every OTHER tool's allow stays byte-identical to the frozen ALLOW line.
+
+describe("runPermissionHook — ExitPlanMode allow carries updatedInput (NOM-36)", () => {
+  const PLAN = "## Plan\n- create hello.txt\n- verify";
+  const exitPlanInput = JSON.stringify({
+    session_id: "sess-1", hook_event_name: "PermissionRequest",
+    tool_name: "ExitPlanMode", tool_input: { plan: PLAN },
+    cwd: "/Users/x/proj", transcript_path: "/tmp/t.jsonl",
+  });
+  const answerExitPlan = async (answer: Record<string, unknown>, over: Record<string, unknown> = {}) => {
+    const answerBlob = await encryptBlob(KEY, { requestId: "req-fixed", ts: 5, ...answer });
+    const emitted: string[] = [];
+    const { fn } = scriptFetch(true, [{ status: "answered", answerBlob }]);
+    await runPermissionHook(baseDeps({
+      fetchFn: fn, emit: (l: string) => emitted.push(l), readInput: async () => exitPlanInput, ...over,
+    }) as never);
+    return emitted;
+  };
+
+  test("plain allow → behavior allow + updatedInput === the original tool_input (the plan)", async () => {
+    const emitted = await answerExitPlan({ decision: "allow" });
+    expect(emitted.length).toBe(1);
+    const decision = JSON.parse(emitted[0]).hookSpecificOutput.decision;
+    expect(decision).toEqual({ behavior: "allow", updatedInput: { plan: PLAN } });
+  });
+
+  test("allow_always → behavior allow + updatedInput + a session-scoped ExitPlanMode rule", async () => {
+    const emitted = await answerExitPlan({ decision: "allow_always" });
+    const decision = JSON.parse(emitted[0]).hookSpecificOutput.decision;
+    expect(decision.behavior).toBe("allow");
+    expect(decision.updatedInput).toEqual({ plan: PLAN });
+    expect(decision.updatedPermissions).toEqual([
+      { type: "addRules", rules: [{ toolName: "ExitPlanMode" }], behavior: "allow", destination: "session" },
+    ]);
+  });
+
+  test("allow_always WITH permission_suggestions → suggestions VERBATIM + updatedInput still echoed", async () => {
+    const SUGG = [{ type: "addRules", rules: [{ toolName: "ExitPlanMode" }], behavior: "allow", destination: "session" }];
+    const emitted = await answerExitPlan(
+      { decision: "allow_always" },
+      { readInput: async () => JSON.stringify({ ...JSON.parse(exitPlanInput), permission_suggestions: SUGG }) },
+    );
+    const decision = JSON.parse(emitted[0]).hookSpecificOutput.decision;
+    expect(decision.updatedInput).toEqual({ plan: PLAN });
+    expect(decision.updatedPermissions).toEqual(SUGG);
+  });
+
+  test("codex agent seam still wraps the ExitPlanMode allow in continue:true", async () => {
+    // ExitPlanMode never fires for a real Codex session, but the decision seam is agent-agnostic —
+    // the updatedInput echo must survive the continue:true envelope untouched.
+    const emitted = await answerExitPlan({ decision: "allow" }, {});
+    // (claude default above) — now the codex variant:
+    const answerBlob = await encryptBlob(KEY, { requestId: "req-fixed", ts: 5, decision: "allow" });
+    const codexEmitted: string[] = [];
+    const { fn } = scriptFetch(true, [{ status: "answered", answerBlob }]);
+    await runPermissionHook(baseDeps({
+      fetchFn: fn, emit: (l: string) => codexEmitted.push(l), readInput: async () => exitPlanInput,
+    }) as never, "codex");
+    const parsed = JSON.parse(codexEmitted[0]);
+    expect(parsed.continue).toBe(true);
+    expect(parsed.hookSpecificOutput.decision).toEqual({ behavior: "allow", updatedInput: { plan: PLAN } });
+    expect(emitted.length).toBe(1); // (claude path sanity)
+  });
+
+  test("a NON-ExitPlanMode allow stays the frozen bare allow (no updatedInput)", async () => {
+    // INPUT default = Bash → must stay byte-identical to the pre-fix wire.
+    const answerBlob = await encryptBlob(KEY, { requestId: "req-fixed", ts: 5, decision: "allow" });
+    const emitted: string[] = [];
+    const { fn } = scriptFetch(true, [{ status: "answered", answerBlob }]);
+    await runPermissionHook(baseDeps({ fetchFn: fn, emit: (l: string) => emitted.push(l) }) as never);
+    expect(emitted).toEqual([ALLOW]);
+    expect(JSON.parse(emitted[0]).hookSpecificOutput.decision).toEqual({ behavior: "allow" });
+  });
+});
+
 // ---- richer context: the decision blob's permissionToolName / permissionDetail ----------------
 
 describe("runPermissionHook — decision blob detail fields", () => {
