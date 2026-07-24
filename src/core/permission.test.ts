@@ -193,27 +193,51 @@ describe("buildPermissionQuestions", () => {
       questions: [null, { options: [{ label: "A" }] }, { question: "Real?", options: [{ label: "A" }, "junk"] }],
     })).toEqual([{ q: "Real?", o: ["A"] }]);
   });
+
+  test("a question with ZERO usable option labels is DROPPED (never rides as {q, o: []})", () => {
+    // An option-less question is unanswerable, so the phone would filter the row out of its card — and
+    // its positional `answers` array would then shift onto the wrong question. Both ends skip it here.
+    expect(buildPermissionQuestions({
+      questions: [
+        { question: "No options at all?" },
+        { question: "Empty options?", options: [] },
+        { question: "Only junk options?", options: [{ label: "" }, { nope: 1 }, "x"] },
+        { question: "Real?", options: [{ label: "A" }] },
+      ],
+    })).toEqual([{ q: "Real?", o: ["A"] }]);
+  });
 });
 
 describe("buildPermissionSummary / buildPermissionDetail — AskUserQuestion", () => {
   test("summary → the first question's text, truncated to <=80", () => {
     expect(buildPermissionSummary("AskUserQuestion", { questions: CC_QUESTIONS }))
       .toBe("Which testing approach should I use for the new parser?");
-    const out = buildPermissionSummary("AskUserQuestion", { questions: [{ question: "q".repeat(200), options: [] }] });
+    const out = buildPermissionSummary("AskUserQuestion", {
+      questions: [{ question: "q".repeat(200), options: [{ label: "A" }] }],
+    });
     expect(out.length).toBe(80);
     expect(out.endsWith("…")).toBe(true);
   });
 
-  test("detail → the first question's FULL text (the card's hero line)", () => {
-    expect(buildPermissionDetail("AskUserQuestion", { questions: CC_QUESTIONS }))
-      .toBe("Which testing approach should I use for the new parser?");
-    expect(buildPermissionDetail("AskUserQuestion", { questions: [{ question: "q".repeat(900), options: [] }] }).length)
-      .toBe(900);
+  test("detail → ALWAYS empty for a question: the text already rides twice, and a third copy competed for the blob budget", () => {
+    // Contract the phone must honor: a question card's prompt comes from `permissionQuestions`, never
+    // from `permissionDetail` (which is absent for AskUserQuestion).
+    expect(buildPermissionDetail("AskUserQuestion", { questions: CC_QUESTIONS })).toBe("");
+    expect(buildPermissionDetail("AskUserQuestion", {
+      questions: [{ question: "q".repeat(900), options: [{ label: "A" }] }],
+    })).toBe("");
   });
 
   test("no questions → summary falls back to the tool name, detail is empty", () => {
     expect(buildPermissionSummary("AskUserQuestion", {})).toBe("AskUserQuestion");
     expect(buildPermissionDetail("AskUserQuestion", {})).toBe("");
+  });
+
+  test("a question with NO usable option is not showable either → summary falls back to the tool name", () => {
+    // usableQuestions requires >= 1 answerable option; an option-less question can't be answered, so it
+    // must not become the card's headline any more than it may ride the blob.
+    expect(buildPermissionSummary("AskUserQuestion", { questions: [{ question: "Unanswerable?", options: [] }] }))
+      .toBe("AskUserQuestion");
   });
 });
 
@@ -873,6 +897,28 @@ describe("runPermissionHook — decision blob detail fields", () => {
     expect(blob.permissionDetailOmitted as number).toBeGreaterThan(0);
   });
 
+  // A SWEEP, not a fixture — and deliberately so. The fit's binary search bottoms out at a one-character
+  // "…" prefix, which is NOT free: it drags in the whole `permissionDetail` key plus
+  // `permissionDetailOmitted` (~76 base64 chars sealed, MORE than BLOB_FIT_MARGIN). So for a narrow band
+  // of base sizes the fit used to emit 3076–3084-char blobs — over the worker's hard 3072 cap, 400'd, and
+  // the hold falls open with the phone never seeing the card. Any single fixture sails straight past that
+  // band; only sweeping the base size lands inside it. Every step must stay under the cap.
+  test("SWEEP: across a range of base sizes the emitted blob is ALWAYS <= the worker's 3072-char cap", async () => {
+    let sawDroppedDetail = false;
+    let sawKeptDetail = false;
+    for (let n = 1500; n <= 1980; n += 1) {
+      const { body, blob } = await postedBlob({
+        readRecordFn: async () => ({ pid: 1, machine: "m", label: "api-status", title: "y".repeat(n), ts: 1000, model: "claude-opus-5" }),
+        readInput: async () => inputWith({ tool_input: { command: "c".repeat(8000) } }),
+      });
+      if (body.blob.length > 3072) throw new Error(`base title=${n} emitted a ${body.blob.length}-char blob (cap 3072)`);
+      if ("permissionDetail" in blob) sawKeptDetail = true; else sawDroppedDetail = true;
+    }
+    // The sweep genuinely straddles the floor: some sizes still carry a detail, the fattest shed it whole.
+    expect(sawKeptDetail).toBe(true);
+    expect(sawDroppedDetail).toBe(true);
+  }, 30_000);
+
   test("ExitPlanMode → the plan rides as permissionDetail; a short plan omits the truncation count", async () => {
     const plan = "# Plan\n\n1. Do the thing\n2. Do the other thing\n\n**Risk:** low";
     const { blob } = await postedBlob({
@@ -957,7 +1003,9 @@ describe("runPermissionHook — AskUserQuestion holds", () => {
     expect(body.blob.length).toBeLessThanOrEqual(3072);
   });
 
-  test("a truncated detail keeps the FROZEN order: …permissionDetailOmitted, THEN permissionQuestions", async () => {
+  test("a huge question text → permissionDetail is ABSENT and permissionQuestions is still LAST", async () => {
+    // The question text is NOT duplicated into permissionDetail (it already rides as permissionSummary
+    // and permissionQuestions[0].q) — a third copy competed for the same 3072-char ceiling.
     const { fn, calls } = scriptFetch(false, []);
     await runPermissionHook(baseDeps({
       fetchFn: fn, emit: () => {},
@@ -965,32 +1013,48 @@ describe("runPermissionHook — AskUserQuestion holds", () => {
     }) as never);
     const body = JSON.parse(calls.find((c) => c.method === "POST")!.body!);
     const blob = (await decryptBlob(KEY, body.blob)) as Record<string, unknown>;
-    expect(Object.keys(blob).slice(-6)).toEqual([
-      "permissionSummary", "permissionRequestId", "permissionToolName",
-      "permissionDetail", "permissionDetailOmitted", "permissionQuestions",
+    expect("permissionDetail" in blob).toBe(false);
+    expect("permissionDetailOmitted" in blob).toBe(false);
+    expect(Object.keys(blob).slice(-4)).toEqual([
+      "permissionSummary", "permissionRequestId", "permissionToolName", "permissionQuestions",
     ]);
     expect(body.blob.length).toBeLessThanOrEqual(3072);
   });
 
-  test("questions too fat for the frame → permissionQuestions OMITTED entirely, the hold still posts", async () => {
-    // CC's own worst case: 4 questions × 4 options, each at the cap. The whole field is dropped (never a
-    // partial list — a half-shown option list would be a lie) and the phone shows the read-only prompt.
-    const fat = Array.from({ length: 4 }, (_, i) => ({
-      question: `${i}`.repeat(1) + "Q".repeat(400),
-      header: "Header12chr",
-      multiSelect: true,
-      options: Array.from({ length: 4 }, (_, j) => ({ label: `${j}` + "L".repeat(200), description: "d".repeat(300) })),
-    }));
+  /** `count` questions × 4 options, every string at its cap — CC's own worst case, scaled. */
+  const fatQuestions = (count: number) => Array.from({ length: count }, (_, i) => ({
+    question: `${i}` + "Q".repeat(400),
+    header: "Header12chr",
+    multiSelect: true,
+    options: Array.from({ length: 4 }, (_, j) => ({ label: `${j}` + "L".repeat(200), description: "d".repeat(300) })),
+  }));
+
+  const postQuestions = async (questions: unknown) => {
     const { fn, calls } = scriptFetch(false, []);
     await runPermissionHook(baseDeps({
       fetchFn: fn, emit: () => {},
       readRecordFn: async () => ({ pid: 1, machine: "m", label: "api-status", title: "y".repeat(120), ts: 1000 }),
-      readInput: async () => questionInput(fat),
+      readInput: async () => questionInput(questions),
     }) as never);
     const body = JSON.parse(calls.find((c) => c.method === "POST")!.body!);
-    const blob = (await decryptBlob(KEY, body.blob)) as Record<string, unknown>;
+    return { body, blob: (await decryptBlob(KEY, body.blob)) as Record<string, unknown> };
+  };
+
+  // BRACKETED on purpose: asserting only that the fat payload's field is ABSENT would still pass with the
+  // whole feature reverted, so the one-notch-smaller payload must be asserted PRESENT in the same breath.
+  test("questions too fat for the frame → permissionQuestions OMITTED entirely, the hold still posts", async () => {
+    // The whole field is dropped (never a partial list — a half-shown option list would be a lie) and the
+    // phone shows the read-only prompt.
+    const { body, blob } = await postQuestions(fatQuestions(4));
     expect("permissionQuestions" in blob).toBe(false);
     expect(blob.permissionToolName).toBe("AskUserQuestion"); // the hold itself is unaffected
+    expect(body.blob.length).toBeLessThanOrEqual(3072);
+  });
+
+  test("…but ONE NOTCH SMALLER still rides — the drop is a real budget boundary, not a dead branch", async () => {
+    const { body, blob } = await postQuestions(fatQuestions(3));
+    expect(Array.isArray(blob.permissionQuestions)).toBe(true);
+    expect((blob.permissionQuestions as unknown[]).length).toBe(3);
     expect(body.blob.length).toBeLessThanOrEqual(3072);
   });
 
@@ -1011,6 +1075,30 @@ describe("runPermissionHook — AskUserQuestion holds", () => {
     const updatedInput = JSON.parse(emitted[0]).hookSpecificOutput.decision.updatedInput;
     expect(updatedInput.questions).toEqual(CC_QUESTIONS);                  // byte-for-byte echo
     expect(Object.keys(updatedInput).sort()).toEqual(["answers", "questions"]); // strictObject trap
+  });
+
+  test("the echo preserves OTHER allowed keys (metadata) and OVERWRITES a pre-existing answers — no illegal key ever appears", async () => {
+    // The strictObject trap has two halves: nothing CC disallows may be ADDED, and nothing CC sent may be
+    // LOST. A questions-only fixture exercises neither, so drive the spread with metadata present and a
+    // stale `answers` already in the tool_input.
+    const metadata = { source: "cli", nested: { k: 1 } };
+    const withExtras = JSON.stringify({
+      session_id: "sess-1", hook_event_name: "PermissionRequest", tool_name: "AskUserQuestion",
+      tool_input: { questions: CC_QUESTIONS, answers: { stale: "value" }, metadata },
+      cwd: "/Users/x/proj", transcript_path: "/tmp/t.jsonl",
+    });
+    const { emitted } = await answerQuestion(
+      { decision: "answer", answers: ["Integration tests"] },
+      { readInput: async () => withExtras },
+    );
+    const updatedInput = JSON.parse(emitted[0]).hookSpecificOutput.decision.updatedInput;
+    expect(updatedInput.questions).toEqual(CC_QUESTIONS);
+    expect(updatedInput.metadata).toEqual(metadata);                        // preserved, not dropped
+    expect(updatedInput.answers).toEqual({                                  // the stale map is REPLACED
+      "Which testing approach should I use for the new parser?": "Integration tests",
+    });
+    // Only keys AskUserQuestion's strictObject allows (questions/answers/annotations/metadata).
+    expect(Object.keys(updatedInput).sort()).toEqual(["answers", "metadata", "questions"]);
   });
 
   test("multi-select → the pre-joined 'A, B' string rides through verbatim", async () => {
@@ -1048,6 +1136,76 @@ describe("runPermissionHook — AskUserQuestion holds", () => {
     expect(updatedInput.answers).toEqual({ "Real?": "A" });
   });
 
+  test("a MIDDLE question with zero options is dropped on BOTH ends — the answers don't shift onto the wrong question", async () => {
+    // The shifted-pair case: the phone renders 2 rows (1st and 3rd) because the option-less middle
+    // question is unanswerable, so its answers array is ["A","C"]. If only the blob builder skipped it,
+    // "C" would land on the UNANSWERABLE question and the 3rd would go unanswered.
+    const qs = [
+      { question: "First?", options: [{ label: "A" }, { label: "B" }] },
+      { question: "Middle, unanswerable?", options: [] },
+      { question: "Third?", options: [{ label: "C" }, { label: "D" }] },
+    ];
+    const { fn, calls } = scriptFetch(false, []);
+    await runPermissionHook(baseDeps({
+      fetchFn: fn, emit: () => {}, readInput: async () => questionInput(qs),
+    }) as never);
+    const posted = JSON.parse(calls.find((c) => c.method === "POST")!.body!);
+    const blob = (await decryptBlob(KEY, posted.blob)) as Record<string, unknown>;
+    expect(blob.permissionQuestions).toEqual([                       // the phone is SHOWN exactly two rows
+      { q: "First?", o: ["A", "B"] },
+      { q: "Third?", o: ["C", "D"] },
+    ]);
+
+    const { emitted } = await answerQuestion(
+      { decision: "answer", answers: ["A", "C"] },
+      { readInput: async () => questionInput(qs) },
+    );
+    const updatedInput = JSON.parse(emitted[0]).hookSpecificOutput.decision.updatedInput;
+    expect(updatedInput.questions).toEqual(qs);                       // echoed verbatim, dropped row and all
+    expect(updatedInput.answers).toEqual({ "First?": "A", "Third?": "C" });
+  });
+
+  test("a >60-char label ROUND-TRIPS: the phone echoes the capped form, CC gets the ORIGINAL", async () => {
+    // A label is an IDENTIFIER to CC (`answers` is validated against the tool's own options), not prose.
+    // Sending back the ellipsised 60-char form could never equal a real option, so the phone's echo is
+    // re-mapped onto the full original before it goes on the wire.
+    const long = `Use the ${"very ".repeat(20)}long option`;   // 108 chars
+    expect(long.length).toBeGreaterThan(60);
+    const qs = [{ question: "Which?", options: [{ label: long }, { label: "Short one" }] }];
+    const capped = `${long.slice(0, 59)}…`;                     // exactly what buildPermissionQuestions ships
+    expect(buildPermissionQuestions({ questions: qs })[0].o[0]).toBe(capped);
+
+    const { emitted } = await answerQuestion(
+      { decision: "answer", answers: [capped] },
+      { readInput: async () => questionInput(qs) },
+    );
+    const updatedInput = JSON.parse(emitted[0]).hookSpecificOutput.decision.updatedInput;
+    expect(updatedInput.answers).toEqual({ "Which?": long });   // the ORIGINAL, untruncated label
+  });
+
+  test("a multi-select of two >60-char labels round-trips BOTH originals, re-joined 'A, B'", async () => {
+    const a = `Alpha ${"a".repeat(80)}`;
+    const b = `Bravo ${"b".repeat(80)}`;
+    const qs = [{ question: "Which?", multiSelect: true, options: [{ label: a }, { label: b }] }];
+    const [ca, cb] = buildPermissionQuestions({ questions: qs })[0].o;
+    const { emitted } = await answerQuestion(
+      { decision: "answer", answers: [`${ca}, ${cb}`] },
+      { readInput: async () => questionInput(qs) },
+    );
+    const updatedInput = JSON.parse(emitted[0]).hookSpecificOutput.decision.updatedInput;
+    expect(updatedInput.answers).toEqual({ "Which?": `${a}, ${b}` });
+  });
+
+  test("a label that CONTAINS a comma still round-trips (the whole string is tried before splitting)", async () => {
+    const qs = [{ question: "Which?", options: [{ label: "Yes, do it" }, { label: "No" }] }];
+    const { emitted } = await answerQuestion(
+      { decision: "answer", answers: ["Yes, do it"] },
+      { readInput: async () => questionInput(qs) },
+    );
+    const updatedInput = JSON.parse(emitted[0]).hookSpecificOutput.decision.updatedInput;
+    expect(updatedInput.answers).toEqual({ "Which?": "Yes, do it" });
+  });
+
   test("codex agent → the same line, wrapped in continue:true", async () => {
     const { emitted } = await answerQuestion({ decision: "answer", answers: ["Unit tests only"] }, {}, "codex");
     const parsed = JSON.parse(emitted[0]);
@@ -1061,30 +1219,40 @@ describe("runPermissionHook — AskUserQuestion holds", () => {
     });
   });
 
+  // THE RELEASE RULE (all the cases below). A verb we understand but CANNOT honor for this tool exits
+  // SILENTLY and stops polling: with no hook output CC just runs its own flow and shows the terminal
+  // picker — the "answer at your Mac" outcome — and silence can never be converted into a deny on any
+  // path, unlike a bare {behavior:"allow"} (a headless hard DENY on AskUserQuestion). Keeping the hold
+  // open instead would be worse: the phone's decision record is terminal, so the hook would re-read the
+  // same unusable answer forever while the phone showed "answered". The `emitted`+`GET === 1` pair is the
+  // whole assertion: nothing on stdout AND the hold released.
   for (const [name, answer] of [
     ["an EMPTY answers array", { decision: "answer", answers: [] }],
     ["answers that map to nothing", { decision: "answer", answers: ["", "   "] }],
     ["a missing answers key", { decision: "answer" }],
     ["a non-array answers value", { decision: "answer", answers: "Unit tests only" }],
     ["non-string answer elements", { decision: "answer", answers: [{ label: "Unit tests only" }] }],
+    ["an answer matching NO option label", { decision: "answer", answers: ["Something I was never offered"] }],
+    ["a multi-select whose SECOND piece is garbage", { decision: "answer", answers: ["Unit tests only, nonsense"] }],
+    ["a runaway 600-char answer string (capped at 500 ⇒ unmatchable)", { decision: "answer", answers: ["z".repeat(600)] }],
   ] as Array<[string, Record<string, unknown>]>) {
-    test(`FAIL-SAFE: ${name} → emits NOTHING and keeps polling (a bare allow would be a headless DENY)`, async () => {
+    test(`RELEASE: ${name} → emits NOTHING and stops polling (never a bare allow, never an infinite hold)`, async () => {
       const answerBlob = await encryptBlob(KEY, { requestId: "req-fixed", ts: 5, ...answer });
-      const allowBlob = await encryptBlob(KEY, { requestId: "req-fixed", ts: 6, decision: "deny" });
+      const laterBlob = await encryptBlob(KEY, { requestId: "req-fixed", ts: 6, decision: "deny" });
       const emitted: string[] = [];
       const { fn, calls } = scriptFetch(true, [
         { status: "answered", answerBlob },
-        { status: "answered", answerBlob: allowBlob },
+        { status: "answered", answerBlob: laterBlob }, // must never be reached — the hold is already gone
       ]);
       await runPermissionHook(baseDeps({
         fetchFn: fn, emit: (l: string) => emitted.push(l), readInput: async () => questionInput(),
       }) as never);
-      expect(emitted).toEqual([DENY]);                                // only the LATER real answer
-      expect(calls.filter((c) => c.method === "GET").length).toBe(2);  // kept polling past the unusable one
+      expect(emitted).toEqual([]);                                    // nothing on stdout
+      expect(calls.filter((c) => c.method === "GET").length).toBe(1);  // hold RELEASED — no second poll
     });
   }
 
-  test("FAIL-SAFE: `answer` on a NON-question tool → emits NOTHING and keeps polling", async () => {
+  test("RELEASE: `answer` on a NON-question tool → emits NOTHING and stops polling", async () => {
     const answerBlob = await encryptBlob(KEY, { requestId: "req-fixed", ts: 5, decision: "answer", answers: ["yes"] });
     const denyBlob = await encryptBlob(KEY, { requestId: "req-fixed", ts: 6, decision: "deny" });
     const emitted: string[] = [];
@@ -1093,13 +1261,46 @@ describe("runPermissionHook — AskUserQuestion holds", () => {
       { status: "answered", answerBlob: denyBlob },
     ]);
     await runPermissionHook(baseDeps({ fetchFn: fn, emit: (l: string) => emitted.push(l) }) as never); // INPUT = Bash
-    expect(emitted).toEqual([DENY]);
-    expect(calls.filter((c) => c.method === "GET").length).toBe(2);
+    expect(emitted).toEqual([]);
+    expect(calls.filter((c) => c.method === "GET").length).toBe(1);
   });
 
-  test("an old phone's plain `allow` on a question still emits the frozen bare allow (honest degradation)", async () => {
-    const { emitted } = await answerQuestion({ decision: "allow" });
-    expect(emitted).toEqual([ALLOW]); // CC's interactive path just re-shows the terminal picker
+  for (const verb of ["allow", "allow_always"]) {
+    test(`RELEASE: a bare \`${verb}\` on a QUESTION emits NOTHING and stops polling (a bare allow is a headless hard DENY)`, async () => {
+      const answerBlob = await encryptBlob(KEY, { requestId: "req-fixed", ts: 5, decision: verb });
+      const laterBlob = await encryptBlob(KEY, { requestId: "req-fixed", ts: 6, decision: "deny" });
+      const emitted: string[] = [];
+      const { fn, calls } = scriptFetch(true, [
+        { status: "answered", answerBlob },
+        { status: "answered", answerBlob: laterBlob },
+      ]);
+      await runPermissionHook(baseDeps({
+        fetchFn: fn, emit: (l: string) => emitted.push(l), readInput: async () => questionInput(),
+      }) as never);
+      expect(emitted).toEqual([]);
+      expect(calls.filter((c) => c.method === "GET").length).toBe(1);
+    });
+  }
+
+  test("a `deny` on a question is STILL honored — the release rule is scoped to verbs that can't be honored", async () => {
+    const { emitted } = await answerQuestion({ decision: "deny" });
+    expect(emitted).toEqual([DENY]);
+  });
+
+  test("the release path traces WHY it let go, and exits 'answered' (no giveup, no dangling poll)", async () => {
+    const answerBlob = await encryptBlob(KEY, { requestId: "req-fixed", ts: 5, decision: "allow" });
+    const events: Array<{ event: string; [k: string]: unknown }> = [];
+    const { fn } = scriptFetch(true, [{ status: "answered", answerBlob }]);
+    await runPermissionHook(baseDeps({
+      fetchFn: fn, emit: () => {}, readInput: async () => questionInput(),
+      trace: (e: { event: string }) => events.push(e as { event: string }),
+    }) as never);
+    expect(events.map((e) => e.event)).toEqual([
+      "stdin-read", "start", "posted", "hold", "poll-begin", "poll-end", "release", "answered", "exit",
+    ]);
+    expect(events.find((e) => e.event === "release")).toMatchObject({ reason: "bare-allow-on-question" });
+    expect(events.find((e) => e.event === "answered")).toMatchObject({ match: true, outcome: "released" });
+    expect(events.at(-1)).toMatchObject({ event: "exit", reason: "answered" });
   });
 
   test("AskUserQuestion in an AUTO mode → the mode gate still fires FIRST (no POST at all)", async () => {
