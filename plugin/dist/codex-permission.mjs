@@ -97,7 +97,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { execFileSync, spawn } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "1.2.0";
+var PLUGIN_VERSION = "1.2.2";
 var CC_DIR = `${process.env.HOME}/.config/cc-status`;
 var SESSIONS_DIR = `${CC_DIR}/sessions`;
 var WATCHDOG_PID_PATH = `${CC_DIR}/watchdog.pid`;
@@ -1714,40 +1714,75 @@ function buildPermissionSummary(toolName, toolInput) {
 }
 function buildPermissionDetail(toolName, toolInput) {
   const str = (v) => typeof v === "string" && v.length > 0 ? v : undefined;
-  const cap = (s) => s.length <= 400 ? s : `${s.slice(0, 399)}…`;
   switch (toolName) {
     case "Bash":
     case "shell":
     case "local_shell": {
       const c = str(toolInput.command);
-      return c ? cap(c) : "";
+      return c ?? "";
     }
     case "apply_patch": {
       const d = str(toolInput.description);
-      return d ? cap(d) : "";
+      return d ?? "";
     }
     case "Edit":
     case "Write":
     case "Read":
     case "NotebookEdit": {
       const fp = str(toolInput.file_path);
-      return fp ? cap(fp) : "";
+      return fp ?? "";
     }
     case "WebFetch": {
       const u = str(toolInput.url);
-      return u ? cap(u) : "";
+      return u ?? "";
     }
     case "WebSearch": {
       const q = str(toolInput.query);
-      return q ? cap(q) : "";
+      return q ?? "";
     }
     case "ExitPlanMode": {
       const p = str(toolInput.plan);
-      return p ? cap(p) : "";
+      return p ?? "";
     }
     default:
       return "";
   }
+}
+var MAX_BLOB_CHARS = 3072;
+var BLOB_FIT_MARGIN = 64;
+var BLOB_FIT_CHARS = MAX_BLOB_CHARS - BLOB_FIT_MARGIN;
+var MAX_DETAIL_CHARS = 20000;
+function sealedBlobChars(plaintextBytes) {
+  return Math.ceil((12 + plaintextBytes + 16) / 3) * 4;
+}
+function fitPermissionDetail(base, detail, maxChars = BLOB_FIT_CHARS) {
+  const all = Array.from(detail);
+  const hardLoss = Math.max(0, all.length - MAX_DETAIL_CHARS);
+  const chars = hardLoss > 0 ? all.slice(0, MAX_DETAIL_CHARS) : all;
+  const encoder = new TextEncoder;
+  const frameChars = (d, omitted) => sealedBlobChars(encoder.encode(JSON.stringify(permissionFrame(base, d, omitted))).length);
+  if (chars.length === 0)
+    return { detail: "", omitted: 0 };
+  if (hardLoss === 0 && frameChars(detail, 0) <= maxChars)
+    return { detail, omitted: 0 };
+  const worstCase = all.length;
+  let lo = 0;
+  let hi = chars.length - 1;
+  while (lo < hi) {
+    const mid = Math.ceil((lo + hi) / 2);
+    if (frameChars(`${chars.slice(0, mid).join("")}…`, worstCase) <= maxChars)
+      lo = mid;
+    else
+      hi = mid - 1;
+  }
+  return { detail: `${chars.slice(0, lo).join("")}…`, omitted: all.length - lo };
+}
+function permissionFrame(base, detail, omitted) {
+  return {
+    ...base,
+    ...detail.length > 0 ? { permissionDetail: detail } : {},
+    ...omitted > 0 ? { permissionDetailOmitted: omitted } : {}
+  };
 }
 function emitDecision(agent, answer, toolName, toolInput, suggestions, emit, trace) {
   switch (answer.decision) {
@@ -1833,15 +1868,15 @@ async function runPermissionHook(deps = {}, agent = "claude") {
     const machine = config.machineName ?? hostname2().replace(/\.local$/, "");
     const plan = { op: "update", prio: 1, status: "needsAttention" };
     const base = buildBlob(input, machine, record?.title, plan, agent, record?.turnStartedAt, record?.label, record?.model);
-    const detail = buildPermissionDetail(toolName, toolInput);
-    const blob = await encryptBlob(config.e2eKey, {
+    const permissionBase = {
       ...base,
       status: "decisionPending",
       permissionSummary: summary,
       permissionRequestId: requestId,
-      permissionToolName: toolName,
-      ...detail.length > 0 ? { permissionDetail: detail } : {}
-    });
+      permissionToolName: toolName
+    };
+    const fitted = fitPermissionDetail(permissionBase, buildPermissionDetail(toolName, toolInput));
+    const blob = await encryptBlob(config.e2eKey, permissionFrame(permissionBase, fitted.detail, fitted.omitted));
     const fallbackBlob = await encryptBlob(config.e2eKey, base);
     const pcHeaders = { "x-cc-pairing": config.pairingId, "x-cc-auth": config.pcSecret, "x-cc-version": PLUGIN_VERSION };
     const sleep = deps.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));

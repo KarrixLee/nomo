@@ -3,7 +3,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "bun:test";
 import {
-  buildPermissionSummary, buildPermissionDetail, runPermissionHook, approvalsCommand, NO_HOLD_PATH, TRACE_PATH,
+  buildPermissionSummary, buildPermissionDetail, fitPermissionDetail, sealedBlobChars, BLOB_FIT_CHARS,
+  runPermissionHook, approvalsCommand, NO_HOLD_PATH, TRACE_PATH,
 } from "./permission";
 import { encryptBlob, decryptBlob } from "./crypto";
 import type { Config } from "./shared";
@@ -78,16 +79,17 @@ describe("buildPermissionSummary — codex tools", () => {
   });
 });
 
-// ---- detail builder (pure) — fuller context for the phone card, hard 400-char cap ----------
+// ---- detail builder (pure) — fuller context for the phone card, UNCAPPED (the sealed-frame fit
+// below is the only ceiling; NOM-38 removed the flat 400-char cap that amputated plans) ----------
 
 describe("buildPermissionDetail", () => {
   test("Bash → the FULL command, all lines (summary is only the first line)", () => {
     expect(buildPermissionDetail("Bash", { command: "cd proj\nbun test\necho done" })).toBe("cd proj\nbun test\necho done");
   });
-  test("Bash → capped at 400 chars with an ellipsis", () => {
+  test("Bash → NOT capped here — the whole command rides to the fit (NOM-38)", () => {
     const out = buildPermissionDetail("Bash", { command: "x".repeat(1000) });
-    expect(out.length).toBe(400);
-    expect(out.endsWith("…")).toBe(true);
+    expect(out.length).toBe(1000);
+    expect(out.endsWith("…")).toBe(false);
   });
   test("Edit/Write/Read/NotebookEdit → the FULL file_path (not just the basename)", () => {
     for (const t of ["Edit", "Write", "Read", "NotebookEdit"]) {
@@ -98,11 +100,10 @@ describe("buildPermissionDetail", () => {
     expect(buildPermissionDetail("WebFetch", { url: "https://example.com/a/b?q=1" })).toBe("https://example.com/a/b?q=1");
     expect(buildPermissionDetail("WebSearch", { query: "how to nomo" })).toBe("how to nomo");
   });
-  test("ExitPlanMode → the plan markdown, capped at 400", () => {
+  test("ExitPlanMode → the WHOLE plan markdown, uncapped (NOM-38)", () => {
     expect(buildPermissionDetail("ExitPlanMode", { plan: "## Plan\n- step one\n- step two" })).toBe("## Plan\n- step one\n- step two");
     const long = buildPermissionDetail("ExitPlanMode", { plan: "p".repeat(900) });
-    expect(long.length).toBe(400);
-    expect(long.endsWith("…")).toBe(true);
+    expect(long.length).toBe(900);
   });
   test("unknown tool / missing fields → empty string (omitted from the blob)", () => {
     expect(buildPermissionDetail("SomethingElse", { command: "x" })).toBe("");
@@ -116,20 +117,77 @@ describe("buildPermissionDetail — codex tools", () => {
     expect(buildPermissionDetail("shell", { command: "cd proj\nbun test\necho done" })).toBe("cd proj\nbun test\necho done");
     expect(buildPermissionDetail("local_shell", { command: "git add -p\ngit commit" })).toBe("git add -p\ngit commit");
   });
-  test("shell → capped at 400 chars with an ellipsis", () => {
+  test("shell → NOT capped here — the whole command rides to the fit (NOM-38)", () => {
     const out = buildPermissionDetail("shell", { command: "x".repeat(1000) });
-    expect(out.length).toBe(400);
-    expect(out.endsWith("…")).toBe(true);
+    expect(out.length).toBe(1000);
   });
-  test("apply_patch → the full description, capped at 400", () => {
+  test("apply_patch → the full description, uncapped (NOM-38)", () => {
     expect(buildPermissionDetail("apply_patch", { description: "patch main.ts" })).toBe("patch main.ts");
     const long = buildPermissionDetail("apply_patch", { description: "z".repeat(900) });
-    expect(long.length).toBe(400);
-    expect(long.endsWith("…")).toBe(true);
+    expect(long.length).toBe(900);
   });
   test("codex tools with missing fields → empty string (omitted from the blob)", () => {
     expect(buildPermissionDetail("shell", {})).toBe("");
     expect(buildPermissionDetail("apply_patch", {})).toBe("");
+  });
+});
+
+// ---- sealed-frame fit (pure) — the ONLY detail ceiling, and an honest omitted count (NOM-38) ------
+
+describe("sealedBlobChars", () => {
+  test("matches the real sealed length of encryptBlob (exact, not an estimate)", async () => {
+    for (const payload of [{ a: 1 }, { plan: "x".repeat(500) }, { plan: "日".repeat(300) }]) {
+      const real = (await encryptBlob(KEY, payload)).length;
+      expect(sealedBlobChars(new TextEncoder().encode(JSON.stringify(payload)).length)).toBe(real);
+    }
+  });
+});
+
+describe("fitPermissionDetail", () => {
+  const base = {
+    status: "decisionPending", title: "y".repeat(120), machine: "studio", label: "api-status",
+    model: "claude-opus-5", permissionSummary: "Approve Claude's plan",
+    permissionRequestId: "b3f1c2d4-5e6f-7a8b-9c0d-1e2f3a4b5c6d", permissionToolName: "ExitPlanMode",
+  };
+  const frameChars = (d: string, omitted: number) =>
+    sealedBlobChars(new TextEncoder().encode(JSON.stringify({
+      ...base,
+      ...(d.length > 0 ? { permissionDetail: d } : {}),
+      ...(omitted > 0 ? { permissionDetailOmitted: omitted } : {}),
+    })).length);
+
+  test("a detail that fits rides WHOLE, with nothing omitted", () => {
+    const plan = "# Plan\n- step one\n- step two";
+    expect(fitPermissionDetail(base, plan)).toEqual({ detail: plan, omitted: 0 });
+  });
+
+  test("empty detail → empty, nothing omitted", () => {
+    expect(fitPermissionDetail(base, "")).toEqual({ detail: "", omitted: 0 });
+  });
+
+  test("a long plan keeps FAR more than the old 400-char cap and still fits the blob ceiling", () => {
+    const plan = "p".repeat(6000);
+    const { detail, omitted } = fitPermissionDetail(base, plan);
+    expect(detail.length).toBeGreaterThan(1200);       // was a flat 400 before NOM-38
+    expect(frameChars(detail, omitted)).toBeLessThanOrEqual(BLOB_FIT_CHARS);
+    // Honest: kept characters + omitted characters = the whole plan (the "…" is the extra char).
+    expect(detail.endsWith("…")).toBe(true);
+    expect(detail.length - 1 + omitted).toBe(plan.length);
+  });
+
+  test("never splits a multi-byte character in half", () => {
+    const plan = "日本語のプラン".repeat(500);
+    const { detail, omitted } = fitPermissionDetail(base, plan);
+    expect(frameChars(detail, omitted)).toBeLessThanOrEqual(BLOB_FIT_CHARS);
+    expect(detail.endsWith("…")).toBe(true);
+    expect([...detail].length - 1 + omitted).toBe([...plan].length);
+  });
+
+  test("an absurdly long detail is bounded, and the pre-slice loss is still COUNTED", () => {
+    const plan = "q".repeat(60_000);
+    const { detail, omitted } = fitPermissionDetail(base, plan);
+    expect(frameChars(detail, omitted)).toBeLessThanOrEqual(BLOB_FIT_CHARS);
+    expect(detail.length - 1 + omitted).toBe(plan.length);
   });
 });
 
@@ -716,15 +774,38 @@ describe("runPermissionHook — decision blob detail fields", () => {
   });
 
   // Step 3: the worker rejects a decision POST whose `blob` exceeds MAX_BLOB_CHARS (3072 base64 chars —
-  // enforced server-side, NOT in this plugin; encryptBlob never hard-fails on size). A 400-char detail
-  // plus the fattest realistic fields (80-char summary, a 120-char title) stays far under that ceiling.
-  test("a 400-char detail + typical fields keeps the sealed blob under the worker's 3072-char cap", async () => {
+  // enforced server-side, NOT in this plugin; encryptBlob never hard-fails on size). The detail is no
+  // longer flat-capped (NOM-38): `fitPermissionDetail` sizes the real frame, so even an enormous plan
+  // lands under the ceiling — while delivering vastly more than the old 400 chars.
+  test("a huge detail + the fattest fields still keeps the sealed blob under the worker's 3072-char cap", async () => {
     const record = { pid: 1, machine: "m", label: "l", title: "y".repeat(120), ts: 1000 };
-    const { body } = await postedBlob({
+    const { body, blob } = await postedBlob({
       readRecordFn: async () => record,
-      readInput: async () => inputWith({ tool_input: { command: "x".repeat(1000) } }), // detail caps to 400
+      readInput: async () => inputWith({ tool_input: { command: "x".repeat(20_000) } }),
     });
     expect(body.blob.length).toBeLessThanOrEqual(3072);
+    expect((blob.permissionDetail as string).length).toBeGreaterThan(1200); // was 400 pre-NOM-38
+    expect(blob.permissionDetailOmitted as number).toBeGreaterThan(0);
+  });
+
+  test("ExitPlanMode → the plan rides as permissionDetail; a short plan omits the truncation count", async () => {
+    const plan = "# Plan\n\n1. Do the thing\n2. Do the other thing\n\n**Risk:** low";
+    const { blob } = await postedBlob({
+      readInput: async () => inputWith({ tool_name: "ExitPlanMode", tool_input: { plan } }),
+    });
+    expect(blob.permissionToolName).toBe("ExitPlanMode");
+    expect(blob.permissionDetail).toBe(plan);                 // WHOLE plan, not a 400-char stub
+    expect("permissionDetailOmitted" in blob).toBe(false);    // nothing dropped ⇒ key absent
+  });
+
+  test("a truncated detail appends permissionDetailOmitted LAST (append-only wire discipline)", async () => {
+    const { blob } = await postedBlob({
+      readInput: async () => inputWith({ tool_name: "ExitPlanMode", tool_input: { plan: "p".repeat(9000) } }),
+    });
+    expect(Object.keys(blob).slice(-5)).toEqual([
+      "permissionSummary", "permissionRequestId", "permissionToolName",
+      "permissionDetail", "permissionDetailOmitted",
+    ]);
   });
 });
 

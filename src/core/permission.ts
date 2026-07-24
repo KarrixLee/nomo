@@ -229,24 +229,107 @@ export function buildPermissionSummary(toolName: string, toolInput: Record<strin
 
 /** Fuller context for the phone card (the append-last `permissionDetail` blob field, shown under the
  *  one-line summary). Bash → the full command (ALL lines, unlike the first-line-only summary); the file
- *  tools → the full path; WebFetch/WebSearch → the full url or query; ExitPlanMode → the plan markdown;
- *  else "". Hard 400-char cap — this is the lowest-value blob field, so it truncates first if the sealed
- *  frame ever nears the worker's MAX_BLOB_CHARS ceiling (it doesn't, in practice — see the blob-size
- *  note at the seal site). Pure and never throws. */
+ *  tools → the full path; WebFetch/WebSearch → the full url or query; ExitPlanMode → the WHOLE plan
+ *  markdown; else "". NOT length-capped here (it used to be a flat 400 chars, which silently amputated
+ *  every plan-mode plan — NOM-38): the only real ceiling is the sealed frame's, and `fitPermissionDetail`
+ *  applies exactly that at the seal site, keeping as much text as the wire can carry and reporting how
+ *  much it had to drop. `MAX_DETAIL_CHARS` is only a sanity bound so a pathological tool_input can't make
+ *  the fit's JSON work unbounded (its loss is counted too). Pure and never throws. */
 export function buildPermissionDetail(toolName: string, toolInput: Record<string, unknown>): string {
   const str = (v: unknown): string | undefined => (typeof v === "string" && v.length > 0 ? v : undefined);
-  const cap = (s: string): string => (s.length <= 400 ? s : `${s.slice(0, 399)}…`);
   switch (toolName) {
-    case "Bash": case "shell": case "local_shell": { const c = str(toolInput.command); return c ? cap(c) : ""; }
-    case "apply_patch": { const d = str(toolInput.description); return d ? cap(d) : ""; }
+    case "Bash": case "shell": case "local_shell": { const c = str(toolInput.command); return c ?? ""; }
+    case "apply_patch": { const d = str(toolInput.description); return d ?? ""; }
     case "Edit": case "Write": case "Read": case "NotebookEdit": {
-      const fp = str(toolInput.file_path); return fp ? cap(fp) : "";
+      const fp = str(toolInput.file_path); return fp ?? "";
     }
-    case "WebFetch": { const u = str(toolInput.url); return u ? cap(u) : ""; }
-    case "WebSearch": { const q = str(toolInput.query); return q ? cap(q) : ""; }
-    case "ExitPlanMode": { const p = str(toolInput.plan); return p ? cap(p) : ""; }
+    case "WebFetch": { const u = str(toolInput.url); return u ?? ""; }
+    case "WebSearch": { const q = str(toolInput.query); return q ?? ""; }
+    case "ExitPlanMode": { const p = str(toolInput.plan); return p ?? ""; }
     default: return "";
   }
+}
+
+/** The worker's hard ceiling on a decision POST's base64 `blob` (MAX_BLOB_CHARS, server/src/cc.ts):
+ *  an oversized frame is rejected 400 and the hold never reaches the phone. Sized so the blob plus the
+ *  rest of the ActivityKit content-state stays inside APNs' ~4 KB Live Activity budget — raising it is
+ *  a worker+APNs decision, NOT a plugin one. FROZEN cross-repo constant. */
+const MAX_BLOB_CHARS = 3072;
+/** Slack left under the ceiling. The frame-size prediction below is EXACT (AES-GCM ciphertext is the
+ *  same length as its plaintext), so this is pure belt-and-braces against a future blob key landing
+ *  between the fit and the seal. */
+const BLOB_FIT_MARGIN = 64;
+/** The base64-char budget `fitPermissionDetail` fits the whole sealed frame into. */
+export const BLOB_FIT_CHARS = MAX_BLOB_CHARS - BLOB_FIT_MARGIN;
+/** Sanity bound on the raw detail before fitting — nothing near it could ever fit, and it keeps the
+ *  binary search's JSON work bounded on a pathological input. Text dropped here is still COUNTED into
+ *  `omitted`, so the phone's "N characters omitted" note stays truthful. */
+const MAX_DETAIL_CHARS = 20_000;
+
+/** Exact base64 length of the sealed frame for `plaintextBytes` bytes: `encryptBlob` emits
+ *  base64(iv‖ct‖tag) with a 12-byte IV and a 16-byte GCM tag, and GCM ciphertext is byte-for-byte the
+ *  length of its plaintext — so the size is a pure function of the JSON's UTF-8 byte length. */
+export function sealedBlobChars(plaintextBytes: number): number {
+  return Math.ceil((12 + plaintextBytes + 16) / 3) * 4;
+}
+
+/** Fit `detail` into the sealed decisionPending frame: return the longest prefix whose SEALED blob still
+ *  fits `maxChars`, plus how many characters had to be dropped (0 = the whole thing rode).
+ *
+ *  Why a fit instead of a flat cap: an ExitPlanMode plan is the entire plan markdown, and a flat 400-char
+ *  cap cut ~90% of a typical one before it ever left the Mac (NOM-38). The real constraint is the sealed
+ *  frame's size, which depends on the OTHER blob fields (title/label/model/…), so the budget is computed
+ *  against the exact payload we are about to seal rather than guessed.
+ *
+ *  Honest-truncation contract: when text is dropped the kept prefix ends in "…" (so even an old phone
+ *  that ignores the count shows an ellipsis) and `omitted` is the real number of characters lost — the
+ *  phone renders it as "N characters omitted" instead of silently amputating the plan.
+ *
+ *  Pure (unit-tested), never throws. Binary search over code points, so a multi-byte character is never
+ *  split in half. Candidates are measured with the WORST-CASE `permissionDetailOmitted` value (the most
+ *  digits it could take), so the frame actually emitted can only be smaller than the one measured. */
+export function fitPermissionDetail(
+  base: Record<string, unknown>,
+  detail: string,
+  maxChars: number = BLOB_FIT_CHARS,
+): { detail: string; omitted: number } {
+  const all = Array.from(detail);                                  // code points, not UTF-16 units
+  const hardLoss = Math.max(0, all.length - MAX_DETAIL_CHARS);
+  const chars = hardLoss > 0 ? all.slice(0, MAX_DETAIL_CHARS) : all;
+  const encoder = new TextEncoder();
+
+  const frameChars = (d: string, omitted: number): number =>
+    sealedBlobChars(encoder.encode(JSON.stringify(permissionFrame(base, d, omitted))).length);
+
+  if (chars.length === 0) return { detail: "", omitted: 0 };
+  if (hardLoss === 0 && frameChars(detail, 0) <= maxChars) return { detail, omitted: 0 };
+
+  const worstCase = all.length; // most digits `permissionDetailOmitted` can take
+  let lo = 0;
+  let hi = chars.length - 1;
+  while (lo < hi) {
+    const mid = Math.ceil((lo + hi) / 2);
+    if (frameChars(`${chars.slice(0, mid).join("")}…`, worstCase) <= maxChars) lo = mid;
+    else hi = mid - 1;
+  }
+  return { detail: `${chars.slice(0, lo).join("")}…`, omitted: all.length - lo };
+}
+
+/** The decisionPending blob's permission tail, in its FROZEN append-last order:
+ *  … permissionToolName, permissionDetail (omitted when empty), permissionDetailOmitted (omitted when
+ *  nothing was dropped). Both optional keys follow the same "absent, never empty/zero" discipline as
+ *  every other optional blob key, so an older iOS decoder is byte-unaffected. Shared by the fit's size
+ *  prediction and the real seal so the two can never drift. */
+function permissionFrame(
+  base: Record<string, unknown>,
+  detail: string,
+  omitted: number,
+): Record<string, unknown> {
+  return {
+    ...base,
+    ...(detail.length > 0 ? { permissionDetail: detail } : {}),
+    ...(omitted > 0 ? { permissionDetailOmitted: omitted } : {}),
+  };
 }
 
 /** Apply the phone's decrypted answer for THIS request to stdout, returning true iff the hook should
@@ -403,22 +486,27 @@ export async function runPermissionHook(deps: PermissionHookDeps = {}, agent: Ag
     //
     // Append order is FROZEN: permissionSummary, permissionRequestId, permissionToolName, then the
     // OPTIONAL permissionDetail (omitted when empty — never an empty string, matching every other
-    // optional blob key). permissionToolName lets the phone key card layout off the tool; permissionDetail
-    // is the fuller sub-line. BLOB SIZE: the worker rejects a decision POST whose base64 `blob` exceeds
-    // MAX_BLOB_CHARS (3072) — enforced server-side, NOT here (encryptBlob never hard-fails on size). The
-    // detail's hard 400-char cap keeps even a worst-case frame (400-char detail + 80-char summary + a long
-    // title) far under that ceiling (~1.2 KB base64; overflow needs ~2.3 KB of plaintext), so no local
-    // truncation beyond the cap is needed; if that ever changed, permissionDetail is the field to shed.
+    // optional blob key), then the OPTIONAL permissionDetailOmitted (absent unless text was dropped).
+    // permissionToolName lets the phone key card layout off the tool; permissionDetail is the fuller
+    // sub-line (and, for ExitPlanMode, the whole plan).
+    //
+    // BLOB SIZE: the worker rejects a decision POST whose base64 `blob` exceeds MAX_BLOB_CHARS (3072) —
+    // enforced server-side, NOT by encryptBlob (which never hard-fails on size). The detail used to carry
+    // a flat 400-char cap for this, which silently amputated every plan-mode plan (NOM-38). It now rides
+    // UNCAPPED through `fitPermissionDetail`, which sizes the exact frame we are about to seal and keeps
+    // the longest prefix that still fits — ~1.7 KB of plan instead of 400 chars — reporting the dropped
+    // character count in `permissionDetailOmitted` so the phone can say so out loud instead of cutting
+    // silently. If the frame ever needs to shed more, permissionDetail is still the field to shed.
     const record = await (deps.readRecordFn ?? readRecord)(sessionId);
     const machine = config.machineName ?? hostname().replace(/\.local$/, "");
     const plan: OpPlan = { op: "update", prio: 1, status: "needsAttention" };
     const base = buildBlob(input, machine, record?.title, plan, agent, record?.turnStartedAt, record?.label, record?.model);
-    const detail = buildPermissionDetail(toolName, toolInput);
-    const blob = await encryptBlob(config.e2eKey, {
+    const permissionBase = {
       ...base, status: "decisionPending", permissionSummary: summary, permissionRequestId: requestId,
       permissionToolName: toolName,
-      ...(detail.length > 0 ? { permissionDetail: detail } : {}),
-    });
+    };
+    const fitted = fitPermissionDetail(permissionBase, buildPermissionDetail(toolName, toolInput));
+    const blob = await encryptBlob(config.e2eKey, permissionFrame(permissionBase, fitted.detail, fitted.omitted));
     const fallbackBlob = await encryptBlob(config.e2eKey, base);
 
     const pcHeaders = { "x-cc-pairing": config.pairingId, "x-cc-auth": config.pcSecret, "x-cc-version": PLUGIN_VERSION };
