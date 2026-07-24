@@ -50,6 +50,16 @@ export const GONE_STRIKE_LIMIT = 2;
  *  this module, so the reverse import would be a cycle. */
 export const NO_HOLD_PATH = `${CC_DIR}/no-hold`;
 
+/** Whether a zero-byte marker/flag file exists on disk. The ONE probe shared by every reader of the
+ *  local no-hold flag — the permission hook's escape-hatch gate, the `permission off|on|status` CLI
+ *  toggle, and localApprovalsState just below — so the gate, the toggle and the reported header can
+ *  never drift apart in what they consider "paused". Never throws: any error (absent, unreadable,
+ *  malformed path) reads as absent. Lives here for the same reason NO_HOLD_PATH does — permission.ts
+ *  already imports this module, so the reverse import would be a cycle. */
+export async function flagExists(path: string): Promise<boolean> {
+  try { await access(path); return true; } catch { return false; }
+}
+
 /** This computer's local remote-approvals state, as it goes on the wire.
  *
  *  CONTRACT — LITERAL, and the whole feature dies SILENTLY if it drifts: the worker
@@ -60,11 +70,12 @@ export const NO_HOLD_PATH = `${CC_DIR}/no-hold`;
  *  is the literal union for exactly that reason; the plugin-side proof lives in shared.test.ts and
  *  cc-status.test.ts.
  *
- *  Cost is a non-issue on the status path: one access() stat, strictly cheaper than the readFile()s
- *  (loadConfig, readRecord, and on Codex a readdir + per-file reads) that path already performs — and
- *  the permission hook already pays exactly this stat on every prompt. */
+ *  Cost is a non-issue on the status path: one access() stat per POST (the Codex reconcile path pays
+ *  a second when a provisional sentinel exists, since that is a second POST), strictly cheaper than
+ *  the readFile()s (loadConfig, readRecord, and on Codex a readdir + per-file reads) that path
+ *  already performs — and the permission hook already pays exactly this stat on every prompt. */
 export async function localApprovalsState(noHoldPath: string = NO_HOLD_PATH): Promise<"on" | "off"> {
-  try { await access(noHoldPath); return "off"; } catch { return "on"; }
+  return (await flagExists(noHoldPath)) ? "off" : "on";
 }
 
 /** Basename of the pending-pairing event stash — a hook that fires WHILE pairing is still pending has

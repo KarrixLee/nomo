@@ -16,12 +16,12 @@
 // PORTABILITY: runs unmodified under bun AND node >= 18 — no `Bun.*` APIs. build.ts bundles this into
 // dist/cc-permission.mjs.
 
-import { access, unlink } from "node:fs/promises";
+import { unlink } from "node:fs/promises";
 import { appendFileSync, statSync, truncateSync } from "node:fs";
 import { hostname } from "node:os";
 import { basename } from "node:path";
 import { runHook, buildBlob, OpPlan } from "./hook";
-import { AgentKind, atomicWrite, CC_DIR, Config, loadConfig, NO_HOLD_PATH, PLUGIN_VERSION, readRecord, SessionRecord } from "./shared";
+import { AgentKind, atomicWrite, CC_DIR, Config, flagExists, loadConfig, NO_HOLD_PATH, PLUGIN_VERSION, readRecord, SessionRecord } from "./shared";
 import { decryptBlob, encryptBlob } from "./crypto";
 
 /** Local escape-hatch flag: when this file exists, the hook skips the hold entirely and behaves as a
@@ -646,10 +646,6 @@ async function readStdin(): Promise<string> {
   return Buffer.concat(chunks).toString("utf8");
 }
 
-async function flagExists(path: string): Promise<boolean> {
-  try { await access(path); return true; } catch { return false; }
-}
-
 /** The PermissionRequest hook body. See the module header for the (deliberately) unbounded-wait
  *  contract and the absolute fail-open posture. Never throws across its boundary.
  *
@@ -895,9 +891,6 @@ export interface ApprovalsDeps {
 export async function approvalsCommand(sub: "off" | "on" | "status", deps: ApprovalsDeps = {}): Promise<number> {
   const path = deps.noHoldPath ?? NO_HOLD_PATH;
   const print = deps.print ?? ((line: string) => console.log(line));
-  const exists = async () => {
-    try { await access(path); return true; } catch { return false; }
-  };
   if (sub === "off") {
     await atomicWrite(path, "", 0o600);
     print("Remote approvals are OFF for this computer — Claude Code permission prompts will appear in the terminal as usual (your phone is not asked).");
@@ -909,7 +902,7 @@ export async function approvalsCommand(sub: "off" | "on" | "status", deps: Appro
     return 0;
   }
   // status
-  print(await exists()
+  print(await flagExists(path)
     ? "Remote approvals: OFF (paused locally) — permission prompts appear in the terminal. Run `on` to resume."
     : "Remote approvals: ON — permission prompts for phone-attached sessions are sent to your phone. Run `off` to pause them here.");
   return 0;

@@ -63,8 +63,10 @@ describe("reset (end-to-end with injected seams)", () => {
     const killed: number[] = [];
     const posts: { sessionId: string }[] = [];
     const lines: string[] = [];
-    const fetchFn = (async (_url: unknown, init?: { body?: string }) => {
+    const approvalsHeaders: (string | undefined)[] = [];
+    const fetchFn = (async (_url: unknown, init?: { body?: string; headers?: Record<string, string> }) => {
       posts.push(JSON.parse(init?.body ?? "{}") as { sessionId: string });
+      approvalsHeaders.push(init?.headers?.["x-cc-approvals"]);
       return new Response("{}", { status: 200 });
     }) as unknown as typeof fetch;
 
@@ -87,6 +89,11 @@ describe("reset (end-to-end with injected seams)", () => {
     expect((await readdir(sessions)).sort()).toEqual(["live.json"]);
     // ends POSTed for every cleared record, under the current pairing
     expect(posts.map((p) => p.sessionId).sort()).toEqual(["corrupt", "dead", "prov"]);
+    // reset is a /cc/event POSTer too, so it must report this computer's approvals pause like the
+    // rest. The flag is read from the real CC_DIR here (no seam), so assert the LITERAL union the
+    // worker matches rather than a fixed value — a missing/typo'd header fails either way.
+    expect(approvalsHeaders).toHaveLength(3);
+    for (const h of approvalsHeaders) expect(["on", "off"]).toContain(h);
     // summary mentions the kill, the clears, the kept session, and the pairing guarantee
     const all = lines.join("\n");
     expect(all).toContain("Stopped the watchdog");
