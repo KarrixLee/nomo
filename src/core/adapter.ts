@@ -57,6 +57,37 @@ export const codexToolDetail: Record<string, string> = {
   update_plan: "planning",
 };
 
+/** Maximum encrypted one-line question preview carried as the generic session `detail`. The full
+ *  request remains in Codex; this is only enough context for the phone row to say what it needs. */
+const USER_INPUT_DETAIL_MAX = 240;
+
+/** Extract the first human-facing Codex `request_user_input` question from either the hook's parsed
+ *  `tool_input` object or the rollout's JSON-string `arguments`. The tool is only available in Codex
+ *  Plan collaboration mode today, so this is the one reliable Plan-state signal the hook/rollout
+ *  contracts actually expose. It is status-only: Nomo does not pretend this path can submit an answer. */
+export function requestUserInputDetail(toolInput: unknown): string | undefined {
+  let parsed = toolInput;
+  if (typeof parsed === "string") {
+    try { parsed = JSON.parse(parsed); } catch { return undefined; }
+  }
+  if (typeof parsed !== "object" || parsed === null) return undefined;
+  const questions = (parsed as Record<string, unknown>).questions;
+  if (!Array.isArray(questions) || questions.length === 0) return undefined;
+  const first = questions[0];
+  if (typeof first !== "object" || first === null) return undefined;
+  const q = first as Record<string, unknown>;
+  const question = typeof q.question === "string" ? q.question.replace(/\s+/g, " ").trim() : "";
+  if (!question) return undefined;
+  const header = typeof q.header === "string" ? q.header.replace(/\s+/g, " ").trim() : "";
+  const text = header && !question.toLowerCase().startsWith(`${header.toLowerCase()}:`)
+    ? `${header}: ${question}`
+    : question;
+  const characters = Array.from(text);
+  return characters.length <= USER_INPUT_DETAIL_MAX
+    ? text
+    : `${characters.slice(0, USER_INPUT_DETAIL_MAX - 1).join("")}…`;
+}
+
 // --- Title resolution ------------------------------------------------------------------------
 
 /// The session's name is CC's own generated summary when available, else its first human prompt.
@@ -600,6 +631,52 @@ export function codexTailPendingApproval(tail: string): boolean {
     // anything else (function_call proposing the tool, token_count, agent_message, …) → keep scanning
   }
   return false; // no approval request in the tail → nothing pending
+}
+
+interface CodexPendingUserInput {
+  kind: "userInput";
+  detail?: string;
+}
+
+/** Classify the CURRENT pending Codex `request_user_input`, if any. This mirrors
+ *  `codexTailPendingApproval`'s reverse decisive-marker scan so an older question never leaks through a
+ *  later result/turn boundary. Unlike the optional question preview, the kind survives malformed or
+ *  future arguments: the function-call name alone is enough for the clear-envelope discriminator. */
+function codexTailPendingUserInput(tail: string): CodexPendingUserInput | undefined {
+  const lines = tail.split("\n");
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i];
+    if (!line.trim()) continue;
+    if (!line.includes("event_msg") && !line.includes("response_item")) continue;
+    let row: unknown;
+    try { row = JSON.parse(line); } catch { continue; }
+    if (typeof row !== "object" || row === null) continue;
+    const r = row as Record<string, unknown>;
+    const payload = r.payload as Record<string, unknown> | undefined;
+    const ptype = typeof payload?.type === "string" ? payload.type : undefined;
+    if (!ptype) continue;
+    if (r.type === "event_msg") {
+      if (CODEX_APPROVAL_REQUEST_EVENTS.has(ptype)) return undefined;
+      if (CODEX_APPROVAL_RESOLUTION_EVENTS.has(ptype)) return undefined;
+    } else if (r.type === "response_item") {
+      if (ptype === "function_call" && payload?.name === CODEX_USER_INPUT_TOOL) {
+        const detail = requestUserInputDetail(payload.arguments);
+        return { kind: "userInput", ...(detail ? { detail } : {}) };
+      }
+      if (CODEX_APPROVAL_RESOLUTION_ITEMS.has(ptype)) return undefined;
+    }
+  }
+  return undefined;
+}
+
+/** The first-question preview for a CURRENT pending Codex `request_user_input`, when recoverable. */
+export function codexTailPendingUserInputDetail(tail: string): string | undefined {
+  return codexTailPendingUserInput(tail)?.detail;
+}
+
+/** Clear-envelope discriminator for a CURRENT pending Codex `request_user_input`. */
+export function codexTailPendingAttentionKind(tail: string): "userInput" | undefined {
+  return codexTailPendingUserInput(tail)?.kind;
 }
 
 // --- Claude pending-approval detection (backstop for a DROPPED PreToolUse hook) ---------------
@@ -1206,6 +1283,13 @@ export interface AgentAdapter {
    *  rollout-persistence caveat. Present → the watchdog runs it each sweep on a not-already-attention
    *  session and posts a corrective needsAttention. */
   tailShowsPendingApproval?(tail: string): boolean;
+  /** OPTIONAL encrypted detail for the pending attention episode found by `tailShowsPendingApproval`.
+   *  Codex uses it to recover a dropped Plan/request_user_input hook with the actual first question;
+   *  undefined means the episode has no safely recoverable detail. */
+  tailPendingAttentionDetail?(tail: string): string | undefined;
+  /** OPTIONAL clear-envelope discriminator for the recovered attention episode. Kept deliberately
+   *  narrow: only Codex request_user_input currently has a value; ordinary approvals remain absent. */
+  tailPendingAttentionKind?(tail: string): "userInput" | undefined;
   /** OPTIONAL: whether a hook event for a NEVER-tracked session id is a CHILD-SESSION GHOST that must
    *  be skipped (no phone row). Claude OMITS it (every Claude session id is real); Codex implements it
    *  because the ChatGPT.app `codex app-server` spawns child session ids with no rollout/transcript
@@ -1348,6 +1432,12 @@ export const codexAdapter: AgentAdapter = {
   // when the rollout tail shows a pending approval. Claude omits this (reliable hook channels).
   tailShowsPendingApproval(tail: string): boolean {
     return codexTailPendingApproval(tail);
+  },
+  tailPendingAttentionDetail(tail: string): string | undefined {
+    return codexTailPendingUserInputDetail(tail);
+  },
+  tailPendingAttentionKind(tail: string): "userInput" | undefined {
+    return codexTailPendingAttentionKind(tail);
   },
   // ChatGPT.app `codex app-server` child-session ghosts: a new session id with no rollout content,
   // sharing its pid with an already-tracked real codex session, is skipped (see codexChildSessionGhost).

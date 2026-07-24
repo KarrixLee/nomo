@@ -864,6 +864,7 @@ describe("runPermissionHook — decision blob detail fields", () => {
     const { blob } = await postedBlob({ readInput: async () => inputWith({ tool_input: { command: cmd } }) });
     expect(blob.permissionToolName).toBe("Bash");
     expect(blob.permissionDetail).toBe(cmd); // all lines — the summary took only the first
+    expect(blob).not.toHaveProperty("permissionDetailOmitted");
   });
 
   test("Edit → permissionDetail is the FULL file_path (summary is just the basename)", async () => {
@@ -880,6 +881,7 @@ describe("runPermissionHook — decision blob detail fields", () => {
     });
     expect(blob.permissionToolName).toBe("SomethingElse");
     expect("permissionDetail" in blob).toBe(false);
+    expect("permissionDetailOmitted" in blob).toBe(false);
   });
 
   // Step 3: the worker rejects a decision POST whose `blob` exceeds MAX_BLOB_CHARS (3072 base64 chars —
@@ -1344,11 +1346,12 @@ describe("runPermissionHook — AskUserQuestion holds", () => {
 
 // ---- codex agent seam (continue:true decision wrapper + agent:"codex" blob tag) ---------------
 //
-// The SAME hold engine, driven with agent "codex" (2nd positional arg). The ONLY wire differences vs
-// claude: every decision line is wrapped in a leading `continue:true` (Codex 0.144.1 consumes that
-// shape — verified in the Task 8 spike), and the sealed blob carries `agent:"codex"` so the phone tabs
-// it correctly. Claude's lines stay byte-identical (locked by the untouched claude tests above). Every
-// case below runs the REAL hold loop through the scripted-fetch harness, never a mock of the SUT.
+// The SAME hold engine, driven with agent "codex" (2nd positional arg). Decision lines use Codex's
+// leading `continue:true` wrapper and the sealed blob carries `agent:"codex"` so the phone tabs it
+// correctly. Codex does NOT support PermissionRequest `updatedPermissions`, so a stale phone's
+// allow_always answer safely degrades to the same plain-allow line. Claude's lines stay byte-identical
+// (locked by the untouched claude tests above). Every case below runs the REAL hold loop through the
+// scripted-fetch harness, never a mock of the SUT.
 
 describe("runPermissionHook — codex agent", () => {
   // Codex-wrapped variants of the frozen lines (leading "continue":true, then the identical object).
@@ -1381,14 +1384,30 @@ describe("runPermissionHook — codex agent", () => {
     expect(parsed.hookSpecificOutput.decision).toEqual({ behavior: "deny", message: "use bun instead" });
   });
 
-  test("allow_always → continue:true wrapper + a session-scoped whole-tool rule", async () => {
-    const { emitted } = await answerCodex({ decision: "allow_always" }); // INPUT tool = Bash, no suggestions
-    const parsed = JSON.parse(emitted[0]);
-    expect(parsed.continue).toBe(true);
-    expect(parsed.hookSpecificOutput.decision.behavior).toBe("allow");
-    expect(parsed.hookSpecificOutput.decision.updatedPermissions).toEqual([
-      { type: "addRules", rules: [{ toolName: "Bash" }], behavior: "allow", destination: "session" },
-    ]);
+  test("allow_always safely degrades to Codex's supported plain allow (no updatedPermissions)", async () => {
+    const events: Array<Record<string, unknown>> = [];
+    const { emitted } = await answerCodex(
+      { decision: "allow_always" },
+      { trace: (event: Record<string, unknown>) => events.push(event) },
+    );
+    expect(emitted).toEqual([CODEX_ALLOW]);
+    expect(JSON.parse(emitted[0]).hookSpecificOutput.decision).not.toHaveProperty("updatedPermissions");
+    expect(events).toContainEqual({ event: "emit", decision: "allow_always_degraded_to_allow" });
+  });
+
+  test("permission_mode=plan is not treated as Codex Plan mode (fail-open, no phone hold)", async () => {
+    const spy = spyFetch();
+    const emitted: string[] = [];
+    const events: Array<Record<string, unknown>> = [];
+    await runPermissionHook(baseDeps({
+      readInput: async () => inputWith({ permission_mode: "plan" }),
+      fetchFn: spy.fn,
+      emit: (line: string) => emitted.push(line),
+      trace: (event: Record<string, unknown>) => events.push(event),
+    }) as never, "codex");
+    expect(spy.called()).toBe(false);
+    expect(emitted).toEqual([]);
+    expect(events.at(-1)).toMatchObject({ event: "exit", reason: "mode", mode: "plan" });
   });
 
   test("the posted blob + fallbackBlob both carry agent:'codex'", async () => {

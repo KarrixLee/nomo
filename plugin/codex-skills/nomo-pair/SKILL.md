@@ -123,9 +123,9 @@ position it expects.
 
 ## Step 5 — trust the hooks (fresh install only)
 
-If this is a fresh install, remind the user: the six Nomo hooks are **inert until trusted**. They must
-run `/hooks` in Codex once and **trust the six Nomo entries** — one time only; updates never re-prompt
-unless a hook line changes. **One exception:** upgrading to the version that added phone-held approvals
-re-points the `permission_request` hook, so Codex re-prompts to trust **that one entry** once after the
-upgrade — re-trust it via `/hooks`. Without trust, Codex sessions won't mirror to the phone (and
-permission prompts fall back to the terminal — fail-open).
+If this is a fresh install, remind the user: the seven Nomo hooks are **inert until trusted**. They must
+run `/hooks` in Codex once and **trust the seven Nomo entries** — one time only; updates never re-prompt
+unless a hook line changes. Upgrades that add or change a hook require trusting only the affected entry:
+the phone-held-approvals release changed `PermissionRequest`, and the clean-lifecycle release added
+`SessionEnd`. Re-trust either via `/hooks` when Codex asks. Without trust, Codex sessions won't mirror
+to the phone (and permission prompts fall back to the terminal — fail-open).

@@ -492,6 +492,33 @@ var codexToolDetail = {
   spawn_agent: "delegating",
   update_plan: "planning"
 };
+var USER_INPUT_DETAIL_MAX = 240;
+function requestUserInputDetail(toolInput) {
+  let parsed = toolInput;
+  if (typeof parsed === "string") {
+    try {
+      parsed = JSON.parse(parsed);
+    } catch {
+      return;
+    }
+  }
+  if (typeof parsed !== "object" || parsed === null)
+    return;
+  const questions = parsed.questions;
+  if (!Array.isArray(questions) || questions.length === 0)
+    return;
+  const first = questions[0];
+  if (typeof first !== "object" || first === null)
+    return;
+  const q = first;
+  const question = typeof q.question === "string" ? q.question.replace(/\s+/g, " ").trim() : "";
+  if (!question)
+    return;
+  const header = typeof q.header === "string" ? q.header.replace(/\s+/g, " ").trim() : "";
+  const text = header && !question.toLowerCase().startsWith(`${header.toLowerCase()}:`) ? `${header}: ${question}` : question;
+  const characters = Array.from(text);
+  return characters.length <= USER_INPUT_DETAIL_MAX ? text : `${characters.slice(0, USER_INPUT_DETAIL_MAX - 1).join("")}…`;
+}
 function aiTitleFromLines(lines) {
   for (let i = lines.length - 1;i >= 0; i--) {
     const line = lines[i];
@@ -888,6 +915,50 @@ function codexTailPendingApproval(tail) {
   }
   return false;
 }
+function codexTailPendingUserInput(tail) {
+  const lines = tail.split(`
+`);
+  for (let i = lines.length - 1;i >= 0; i--) {
+    const line = lines[i];
+    if (!line.trim())
+      continue;
+    if (!line.includes("event_msg") && !line.includes("response_item"))
+      continue;
+    let row;
+    try {
+      row = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (typeof row !== "object" || row === null)
+      continue;
+    const r = row;
+    const payload = r.payload;
+    const ptype = typeof payload?.type === "string" ? payload.type : undefined;
+    if (!ptype)
+      continue;
+    if (r.type === "event_msg") {
+      if (CODEX_APPROVAL_REQUEST_EVENTS.has(ptype))
+        return;
+      if (CODEX_APPROVAL_RESOLUTION_EVENTS.has(ptype))
+        return;
+    } else if (r.type === "response_item") {
+      if (ptype === "function_call" && payload?.name === CODEX_USER_INPUT_TOOL) {
+        const detail = requestUserInputDetail(payload.arguments);
+        return { kind: "userInput", ...detail ? { detail } : {} };
+      }
+      if (CODEX_APPROVAL_RESOLUTION_ITEMS.has(ptype))
+        return;
+    }
+  }
+  return;
+}
+function codexTailPendingUserInputDetail(tail) {
+  return codexTailPendingUserInput(tail)?.detail;
+}
+function codexTailPendingAttentionKind(tail) {
+  return codexTailPendingUserInput(tail)?.kind;
+}
 var CLAUDE_USER_BLOCKING_TOOLS = new Set(["AskUserQuestion", "ExitPlanMode"]);
 function blockingToolUseId(assistantRow) {
   const content = assistantRow.message?.content;
@@ -1272,6 +1343,12 @@ var codexAdapter = {
   tailShowsPendingApproval(tail) {
     return codexTailPendingApproval(tail);
   },
+  tailPendingAttentionDetail(tail) {
+    return codexTailPendingUserInputDetail(tail);
+  },
+  tailPendingAttentionKind(tail) {
+    return codexTailPendingAttentionKind(tail);
+  },
   isChildSessionGhost({ sessionId, prefix, hookPid, tracked }) {
     return codexChildSessionGhost(sessionId, prefix, hookPid, tracked);
   },
@@ -1294,7 +1371,10 @@ var allAdapters = [claudeAdapter, codexAdapter];
 
 // src/core/hook.ts
 var TOOL_DETAIL = { ...claudeToolDetail, ...codexToolDetail };
-function detailForHook(hookName, toolName) {
+function detailForHook(hookName, toolName, toolInput) {
+  if (hookName === "PreToolUse" && toolName === "request_user_input") {
+    return requestUserInputDetail(toolInput);
+  }
   if (hookName === "PreToolUse")
     return toolName ? TOOL_DETAIL[toolName] : undefined;
   if (hookName === "PostToolUse")
@@ -1358,7 +1438,7 @@ function transcriptStartMs(prefix) {
 function buildBlob(input, machine, title, plan, agent = "claude", turnStartedAt, pinnedLabel, model, at) {
   const label = typeof pinnedLabel === "string" && pinnedLabel.length > 0 ? pinnedLabel : typeof input.cwd === "string" && input.cwd.length > 0 ? basename2(input.cwd) : "session";
   const hookName = typeof input.hook_event_name === "string" ? input.hook_event_name : "";
-  const detail = detailForHook(hookName, typeof input.tool_name === "string" ? input.tool_name : undefined);
+  const detail = detailForHook(hookName, typeof input.tool_name === "string" ? input.tool_name : undefined, input.tool_input);
   return {
     status: plan.status,
     title: title ?? "",
@@ -1388,7 +1468,8 @@ async function buildEnvelope(input, machine, now, title, e2eKey, sentDone, agent
     return base;
   const at = Math.floor(now / 1000);
   const blob = await encryptBlob(e2eKey, buildBlob(i, machine, title, plan, agent, turnStartedAt, pinnedLabel, model, at));
-  return { ...base, blob };
+  const attentionKind = agent === "codex" && hookName === "PreToolUse" && i.tool_name === "request_user_input" ? "userInput" : undefined;
+  return { ...base, ...attentionKind ? { attentionKind } : {}, blob };
 }
 function buildPendingStash(input, machine, title, now, pid = process.ppid, agent = "claude", model) {
   if (typeof input.session_id !== "string" || input.session_id.length === 0)
@@ -1613,6 +1694,7 @@ export {
   runHook,
   rolloutPathFromLsof,
   rolloutMetaCwd,
+  requestUserInputDetail,
   planOp,
   parseCodexProcs,
   lastTurnLine,
@@ -1628,6 +1710,8 @@ export {
   codexTurnActiveFromTail,
   codexToolDetail,
   codexThreadName,
+  codexTailPendingUserInputDetail,
+  codexTailPendingAttentionKind,
   codexTailPendingApproval,
   codexSessionTitle,
   codexSessionModel,

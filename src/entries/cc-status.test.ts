@@ -16,6 +16,19 @@ import { hooksAppearStale, parseCodexPluginState, statusCmd } from "./status-cmd
 // A fixed 32-byte test key; the real one is HKDF-derived, but any 32 bytes exercise the round-trip.
 const KEY = new Uint8Array(32).fill(7);
 
+describe("native Codex hook manifest", () => {
+  test("registers all seven lifecycle hooks, including bounded SessionEnd cleanup", async () => {
+    const path = join(import.meta.dir, "../../plugin/hooks/codex-hooks.json");
+    const manifest = JSON.parse(await readFile(path, "utf8")) as {
+      hooks: Record<string, Array<{ hooks?: Array<{ command?: string; timeout?: number }> }>>;
+    };
+    expect(Object.keys(manifest.hooks)).toHaveLength(7);
+    const sessionEnd = manifest.hooks.SessionEnd?.[0]?.hooks?.[0];
+    expect(sessionEnd?.command).toContain("dist/codex-status.mjs");
+    expect(sessionEnd?.timeout).toBe(3);
+  });
+});
+
 describe("planOp (op mapping table)", () => {
   const i = (over: Record<string, unknown> = {}) => ({ session_id: "s", cwd: "/x", ...over });
 
@@ -131,6 +144,24 @@ describe("planOp / detail — codex payloads (extra turn_id/model/permission_mod
     expect(detailForHook("PreToolUse", "Bash")).toBe("running");
     // MCP tools serialize as mcp__server__tool on both agents → no detail.
     expect(detailForHook("PreToolUse", "mcp__memory__create_entities")).toBeUndefined();
+  });
+  test("Codex request_user_input carries the real Plan question as encrypted attention detail", () => {
+    const toolInput = {
+      questions: [{ id: "scope", header: "Scope", question: "Which API should the plan preserve?", options: [] }],
+    };
+    expect(detailForHook("PreToolUse", "request_user_input", toolInput))
+      .toBe("Scope: Which API should the plan preserve?");
+    const input = {
+      session_id: "s", cwd: "/Users/x/api-status", hook_event_name: "PreToolUse",
+      tool_name: "request_user_input", tool_input: toolInput,
+    };
+    const plan = planOp("PreToolUse", input, false)!;
+    expect(buildBlob(input, "Mac", "Plan audit", plan, "codex"))
+      .toMatchObject({
+        status: "needsAttention",
+        detail: "Scope: Which API should the plan preserve?",
+        agent: "codex",
+      });
   });
 });
 
@@ -287,7 +318,7 @@ describe("codex title resolution — index (primary) over rollout (fallback) + u
   });
 });
 
-describe("detailForHook (unchanged)", () => {
+describe("detailForHook", () => {
   test("PreToolUse maps known tools to a semantic key, unknown tools to no detail", () => {
     expect(detailForHook("PreToolUse", "Edit")).toBe("editing");
     expect(detailForHook("PreToolUse", "Bash")).toBe("running");
@@ -384,7 +415,27 @@ describe("buildEnvelope (v2 envelope + encrypted blob)", () => {
   test("a permission Notification → op update prio 1, needsAttention blob", async () => {
     const env = (await buildEnvelope({ session_id: "abc", hook_event_name: "Notification", notification_type: "permission_prompt", cwd: "/x" }, "m", 5, "t", KEY, false))!;
     expect(env).toMatchObject({ op: "update", prio: 1 });
+    expect(env).not.toHaveProperty("attentionKind");
     expect(await decryptBlob(KEY, (env as { blob: string }).blob)).toMatchObject({ status: "needsAttention" });
+  });
+
+  test("only Codex request_user_input carries clear attentionKind:'userInput'", async () => {
+    const input = {
+      session_id: "abc", hook_event_name: "PreToolUse", tool_name: "request_user_input", cwd: "/x",
+      tool_input: { questions: [{ header: "Scope", question: "Keep the API?" }] },
+    };
+    const codex = (await buildEnvelope(input, "m", 5, "t", KEY, false, "codex"))!;
+    expect(codex).toMatchObject({ op: "update", prio: 1, attentionKind: "userInput" });
+    expect(await decryptBlob(KEY, codex.blob as string)).toMatchObject({
+      status: "needsAttention", detail: "Scope: Keep the API?", agent: "codex",
+    });
+
+    const claude = (await buildEnvelope(input, "m", 5, "t", KEY, false, "claude"))!;
+    expect(claude).not.toHaveProperty("attentionKind");
+    const permission = (await buildEnvelope({
+      session_id: "abc", hook_event_name: "PermissionRequest", tool_name: "apply_patch", cwd: "/x",
+    }, "m", 5, "t", KEY, false, "codex"))!;
+    expect(permission).not.toHaveProperty("attentionKind");
   });
 
   test("SessionEnd → op end with NO blob", async () => {
@@ -981,14 +1032,14 @@ describe("statusCmd — Codex plugin detection states", () => {
     expect(pluginLine(await runStatus({}))).toBe("Codex plugin: not installed");
   });
 
-  test("installed + all 6 hooks trusted → `installed, trusted (6/6)`", async () => {
-    expect(pluginLine(await runStatus({ configToml: cfgToml({ enabled: true, trusted: 6 }) })))
-      .toBe("Codex plugin: installed, trusted (6/6)");
+  test("installed + all 7 hooks trusted → `installed, trusted (7/7)`", async () => {
+    expect(pluginLine(await runStatus({ configToml: cfgToml({ enabled: true, trusted: 7 }) })))
+      .toBe("Codex plugin: installed, trusted (7/7)");
   });
 
-  test("installed + a partial N trusted → `installed, trusted (N/6)`", async () => {
+  test("installed + a partial N trusted → `installed, trusted (N/7)`", async () => {
     expect(pluginLine(await runStatus({ configToml: cfgToml({ trusted: 3 }) })))
-      .toBe("Codex plugin: installed, trusted (3/6)");
+      .toBe("Codex plugin: installed, trusted (3/7)");
   });
 
   test("installed but no hooks trusted yet → `installed, hooks NOT trusted (run /hooks in Codex)`", async () => {
@@ -997,7 +1048,7 @@ describe("statusCmd — Codex plugin detection states", () => {
   });
 
   test("installed but explicitly disabled → `installed, disabled`", async () => {
-    expect(pluginLine(await runStatus({ configToml: cfgToml({ enabled: false, trusted: 6 }) })))
+    expect(pluginLine(await runStatus({ configToml: cfgToml({ enabled: false, trusted: 7 }) })))
       .toBe("Codex plugin: installed, disabled");
   });
 
@@ -1008,8 +1059,8 @@ describe("statusCmd — Codex plugin detection states", () => {
   });
 
   test("overlap (native enabled+trusted AND legacy) → trusted line + a double-fire WARNING naming codex-status.mjs", async () => {
-    const lines = await runStatus({ configToml: cfgToml({ enabled: true, trusted: 6 }), hooksJson: legacyHooks(6) });
-    expect(pluginLine(lines)).toBe("Codex plugin: installed, trusted (6/6)");
+    const lines = await runStatus({ configToml: cfgToml({ enabled: true, trusted: 7 }), hooksJson: legacyHooks(6) });
+    expect(pluginLine(lines)).toBe("Codex plugin: installed, trusted (7/7)");
     const warn = lines.find((l) => l.includes("double-fire"));
     expect(warn).toContain("6 legacy Nomo event");
     expect(lines.some((l) => l.includes("codex-status.mjs"))).toBe(true);
@@ -1023,7 +1074,7 @@ describe("statusCmd — Codex plugin detection states", () => {
     lines.find((l) => l.includes("WARNING") && l.includes("auto-discovered the Claude plugin"));
 
   test("both nomo AND nomo-cc trusted in Codex → auto-discovery double-fire WARNING + untrust hint", async () => {
-    const lines = await runStatus({ configToml: cfgToml({ enabled: true, trusted: 6, ccTrusted: 6 }) });
+    const lines = await runStatus({ configToml: cfgToml({ enabled: true, trusted: 7, ccTrusted: 6 }) });
     const warn = ccWarn(lines);
     expect(warn).toBeDefined();
     expect(warn).toContain("redundant double-fire");
@@ -1035,7 +1086,7 @@ describe("statusCmd — Codex plugin detection states", () => {
   });
 
   test("only the native nomo trusted (no nomo-cc) → NO auto-discovery warning", async () => {
-    const lines = await runStatus({ configToml: cfgToml({ enabled: true, trusted: 6 }) });
+    const lines = await runStatus({ configToml: cfgToml({ enabled: true, trusted: 7 }) });
     expect(ccWarn(lines)).toBeUndefined();
   });
 

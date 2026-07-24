@@ -61,6 +61,26 @@
         "label": "api-status",
         "agent": "codex"
       }
+    },
+    {
+      "keyHex": "256a40ccc3cbb4c7338d5fe2bfbf7ae2f021d46a71a99c0d9a935f48e9a6fe22",
+      "blobB64": "cHFyc3R1dnd4eXp77uIjwLi7QGEbLTzr9OZFqCUch7FuKsj+D+edPnxM4KLfBhWLvM3TMmGHL2Sajyistu9MCfAHk9DdG/HX4uL0wj4CJNnxQ/APbL78VEdXeileib9p1xoozkVJRUg5XqfkgHXcw5x7o3eaXekTO91MiPrKQ3Jme3CzIW1CSG8UGwU6+anrF/V9gsuvuAWGRq+g1U2nqIdDaLnZdDstcOwP8XPuEQmdLHE9sfD+pLuavkx0ecvszqKgFsYCA+aKW1VXzwWAVXDLVsIfFXLcqVXlXwvTBC3Ntbf0ncW7wR5EHKUWG+ny28Wf4G1r0xglFcMcRrrVKMZFBECUcbP0lvJe3qA8XkF2C+YmGH/rSP0OhKSye78fFqb3hQkqcFJBW9F1ZFsUL5yJSGTyI4Zz9yNkG/u7tLcPl1kE+aelxCkYKOzml/sAvnxj6OIBPqwTApXW4rm+DMTnaQFf6YSYFfbp77pIxK1MIqdDdOJRjBnNrFRYD6esQ21Fq6LDc0kKKgIkaVacR9MAmHlrQPYc+mZaOuuy",
+      "plaintextJson": {
+        "status": "decisionPending",
+        "detail": "waiting",
+        "title": "Review Codex command",
+        "machine": "Karrix Mac",
+        "label": "api-status",
+        "agent": "codex",
+        "turnStartedAt": 1784937600,
+        "model": "gpt-5.6-codex",
+        "permissionSummary": "bun test --coverage",
+        "permissionRequestId": "req-codex-vector",
+        "at": 1784937605,
+        "permissionToolName": "Bash",
+        "permissionDetail": "bun test --coverage",
+        "permissionDetailOmitted": 42
+      }
     }
   ]
 }

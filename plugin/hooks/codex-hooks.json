@@ -43,6 +43,13 @@
           { "type": "command", "command": "exec \"${PLUGIN_ROOT}/scripts/run.sh\" \"${PLUGIN_ROOT}/dist/codex-status.mjs\"", "timeout": 30 }
         ]
       }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          { "type": "command", "command": "exec \"${PLUGIN_ROOT}/scripts/run.sh\" \"${PLUGIN_ROOT}/dist/codex-status.mjs\"", "timeout": 3 }
+        ]
+      }
     ]
   }
 }

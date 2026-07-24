@@ -160,10 +160,18 @@ export async function buildDoneEnvelope(sessionId: string, record: SessionRecord
  *  phone to the folder-name label), machine/
  *  label come from the record (coerced to "" if a corrupt record dropped them), `agent` restamps the
  *  blob's optional agent:"codex" via the adapter seam, and the record's cached `turnStartedAt` is
- *  restamped so the island timer keeps measuring the same turn — exactly as buildDoneEnvelope does. */
-export async function buildNeedsAttentionEnvelope(sessionId: string, record: SessionRecord, now: number, e2eKey: Uint8Array, agent: AgentKind = "claude", at?: number): Promise<object> {
+ *  restamped so the island timer keeps measuring the same turn — exactly as buildDoneEnvelope does.
+ *  A recovered Codex request_user_input additionally carries clear `attentionKind:"userInput"`; plain
+ *  permission approvals omit it so the server can end an older decision episode without cross-talk. */
+export async function buildNeedsAttentionEnvelope(
+  sessionId: string, record: SessionRecord, now: number, e2eKey: Uint8Array,
+  agent: AgentKind = "claude", at?: number, detail?: string, attentionKind?: "userInput",
+): Promise<object> {
   const blob = await encryptBlob(e2eKey, {
     status: "needsAttention",
+    // A dropped Codex request_user_input hook is recoverable from its persisted function-call
+    // arguments; carry the same encrypted first-question preview the direct PreToolUse path sends.
+    ...(typeof detail === "string" && detail.length > 0 ? { detail } : {}),
     title: typeof record.title === "string" ? record.title : "",
     machine: typeof record.machine === "string" ? record.machine : "",
     label: typeof record.label === "string" ? record.label : "",
@@ -176,7 +184,14 @@ export async function buildNeedsAttentionEnvelope(sessionId: string, record: Ses
     // phone should surface it as a live prompt). OMITTED when the caller has no honest time.
     ...(typeof at === "number" && Number.isFinite(at) ? { at } : {}),
   });
-  return { v: 2, sessionId, op: "update", prio: 1, ts: now, blob, ...startedAtField(record) };
+  return {
+    v: 2, sessionId, op: "update", prio: 1, ts: now,
+    // Clear and optional: only a recovered Codex request_user_input gets this discriminator. Ordinary
+    // permission correctives (and every Claude event) retain the legacy envelope byte shape.
+    ...(agent === "codex" && attentionKind === "userInput" ? { attentionKind } : {}),
+    blob,
+    ...startedAtField(record),
+  };
 }
 
 /** The staleness-heartbeat envelope: re-send the record's stored blob verbatim under its stored
@@ -603,15 +618,28 @@ async function correctPendingApproval(config: Config, path: string, sessionId: s
       return "uncorrected"; // transcript missing / cold-compressed → nothing to check
     }
     if (!adapter.tailShowsPendingApproval!(tail)) return "uncorrected"; // no pending approval → leave it
+    const detail = adapter.tailPendingAttentionDetail?.(tail);
+    const attentionKind = adapter.tailPendingAttentionKind?.(tail);
     // Just-detected block → `at` is the OBSERVED now (epoch seconds).
     const attnNow = Date.now();
-    const outcome = await postEvent(config, await buildNeedsAttentionEnvelope(sessionId, record, attnNow, config.e2eKey, agent, Math.floor(attnNow / 1000)));
+    const envelope = await buildNeedsAttentionEnvelope(
+      sessionId, record, attnNow, config.e2eKey, agent, Math.floor(attnNow / 1000), detail, attentionKind,
+    ) as Record<string, unknown>;
+    const outcome = await postEvent(config, envelope);
     if (outcome === "revoked") return "revoked"; // pairing gone → bubble up so the loop can tear down
     if (outcome !== "delivered") return "uncorrected"; // failed POST → keep the file, retry next sweep
     // 2xx: pin the session needsAttention so this net fires once per episode and the interrupt-net
     // watches it. sentDone:false so a later re-arm behaves like a live session, not a re-armed done.
     try {
-      const next: SessionRecord = { ...record, lastEvent: "needsAttention", op: "update", prio: 1, sentDone: false };
+      const next: SessionRecord = {
+        ...record,
+        lastEvent: "needsAttention",
+        op: "update",
+        prio: 1,
+        sentDone: false,
+        // Heartbeats must repeat the corrective attention frame, not the stale pre-question working blob.
+        ...(typeof envelope.blob === "string" ? { blob: envelope.blob } : {}),
+      };
       // Owner-only (0600), like the hook's trackSession / the interrupt net's rewrite — the record holds
       // hostname, cwd basename, the session pid, and the absolute transcript path.
       await atomicWrite(path, JSON.stringify(next), 0o600);

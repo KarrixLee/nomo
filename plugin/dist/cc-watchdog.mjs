@@ -493,6 +493,33 @@ var codexToolDetail = {
   spawn_agent: "delegating",
   update_plan: "planning"
 };
+var USER_INPUT_DETAIL_MAX = 240;
+function requestUserInputDetail(toolInput) {
+  let parsed = toolInput;
+  if (typeof parsed === "string") {
+    try {
+      parsed = JSON.parse(parsed);
+    } catch {
+      return;
+    }
+  }
+  if (typeof parsed !== "object" || parsed === null)
+    return;
+  const questions = parsed.questions;
+  if (!Array.isArray(questions) || questions.length === 0)
+    return;
+  const first = questions[0];
+  if (typeof first !== "object" || first === null)
+    return;
+  const q = first;
+  const question = typeof q.question === "string" ? q.question.replace(/\s+/g, " ").trim() : "";
+  if (!question)
+    return;
+  const header = typeof q.header === "string" ? q.header.replace(/\s+/g, " ").trim() : "";
+  const text = header && !question.toLowerCase().startsWith(`${header.toLowerCase()}:`) ? `${header}: ${question}` : question;
+  const characters = Array.from(text);
+  return characters.length <= USER_INPUT_DETAIL_MAX ? text : `${characters.slice(0, USER_INPUT_DETAIL_MAX - 1).join("")}…`;
+}
 function aiTitleFromLines(lines) {
   for (let i = lines.length - 1;i >= 0; i--) {
     const line = lines[i];
@@ -889,6 +916,50 @@ function codexTailPendingApproval(tail) {
   }
   return false;
 }
+function codexTailPendingUserInput(tail) {
+  const lines = tail.split(`
+`);
+  for (let i = lines.length - 1;i >= 0; i--) {
+    const line = lines[i];
+    if (!line.trim())
+      continue;
+    if (!line.includes("event_msg") && !line.includes("response_item"))
+      continue;
+    let row;
+    try {
+      row = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (typeof row !== "object" || row === null)
+      continue;
+    const r = row;
+    const payload = r.payload;
+    const ptype = typeof payload?.type === "string" ? payload.type : undefined;
+    if (!ptype)
+      continue;
+    if (r.type === "event_msg") {
+      if (CODEX_APPROVAL_REQUEST_EVENTS.has(ptype))
+        return;
+      if (CODEX_APPROVAL_RESOLUTION_EVENTS.has(ptype))
+        return;
+    } else if (r.type === "response_item") {
+      if (ptype === "function_call" && payload?.name === CODEX_USER_INPUT_TOOL) {
+        const detail = requestUserInputDetail(payload.arguments);
+        return { kind: "userInput", ...detail ? { detail } : {} };
+      }
+      if (CODEX_APPROVAL_RESOLUTION_ITEMS.has(ptype))
+        return;
+    }
+  }
+  return;
+}
+function codexTailPendingUserInputDetail(tail) {
+  return codexTailPendingUserInput(tail)?.detail;
+}
+function codexTailPendingAttentionKind(tail) {
+  return codexTailPendingUserInput(tail)?.kind;
+}
 var CLAUDE_USER_BLOCKING_TOOLS = new Set(["AskUserQuestion", "ExitPlanMode"]);
 function blockingToolUseId(assistantRow) {
   const content = assistantRow.message?.content;
@@ -1273,6 +1344,12 @@ var codexAdapter = {
   tailShowsPendingApproval(tail) {
     return codexTailPendingApproval(tail);
   },
+  tailPendingAttentionDetail(tail) {
+    return codexTailPendingUserInputDetail(tail);
+  },
+  tailPendingAttentionKind(tail) {
+    return codexTailPendingAttentionKind(tail);
+  },
   isChildSessionGhost({ sessionId, prefix, hookPid, tracked }) {
     return codexChildSessionGhost(sessionId, prefix, hookPid, tracked);
   },
@@ -1335,9 +1412,10 @@ async function buildDoneEnvelope(sessionId, record, now, e2eKey, agent = "claude
   });
   return { v: 2, sessionId, op: "done", prio: 0, ts: now, blob, ...startedAtField(record) };
 }
-async function buildNeedsAttentionEnvelope(sessionId, record, now, e2eKey, agent = "claude", at) {
+async function buildNeedsAttentionEnvelope(sessionId, record, now, e2eKey, agent = "claude", at, detail, attentionKind) {
   const blob = await encryptBlob(e2eKey, {
     status: "needsAttention",
+    ...typeof detail === "string" && detail.length > 0 ? { detail } : {},
     title: typeof record.title === "string" ? record.title : "",
     machine: typeof record.machine === "string" ? record.machine : "",
     label: typeof record.label === "string" ? record.label : "",
@@ -1346,7 +1424,16 @@ async function buildNeedsAttentionEnvelope(sessionId, record, now, e2eKey, agent
     ...typeof record.model === "string" && record.model.length > 0 ? { model: record.model } : {},
     ...typeof at === "number" && Number.isFinite(at) ? { at } : {}
   });
-  return { v: 2, sessionId, op: "update", prio: 1, ts: now, blob, ...startedAtField(record) };
+  return {
+    v: 2,
+    sessionId,
+    op: "update",
+    prio: 1,
+    ts: now,
+    ...agent === "codex" && attentionKind === "userInput" ? { attentionKind } : {},
+    blob,
+    ...startedAtField(record)
+  };
 }
 function buildHeartbeatEnvelope(sessionId, record, now, currentPairingId) {
   if (typeof record.blob !== "string" || record.blob.length === 0)
@@ -1563,14 +1650,24 @@ async function correctPendingApproval(config, path, sessionId, record, now) {
     }
     if (!adapter.tailShowsPendingApproval(tail))
       return "uncorrected";
+    const detail = adapter.tailPendingAttentionDetail?.(tail);
+    const attentionKind = adapter.tailPendingAttentionKind?.(tail);
     const attnNow = Date.now();
-    const outcome = await postEvent(config, await buildNeedsAttentionEnvelope(sessionId, record, attnNow, config.e2eKey, agent, Math.floor(attnNow / 1000)));
+    const envelope = await buildNeedsAttentionEnvelope(sessionId, record, attnNow, config.e2eKey, agent, Math.floor(attnNow / 1000), detail, attentionKind);
+    const outcome = await postEvent(config, envelope);
     if (outcome === "revoked")
       return "revoked";
     if (outcome !== "delivered")
       return "uncorrected";
     try {
-      const next = { ...record, lastEvent: "needsAttention", op: "update", prio: 1, sentDone: false };
+      const next = {
+        ...record,
+        lastEvent: "needsAttention",
+        op: "update",
+        prio: 1,
+        sentDone: false,
+        ...typeof envelope.blob === "string" ? { blob: envelope.blob } : {}
+      };
       await atomicWrite(path, JSON.stringify(next), 384);
     } catch {}
     return "corrected";

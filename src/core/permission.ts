@@ -130,9 +130,15 @@ function denyLine(agent: AgentKind, message?: unknown): string {
 /** Allow + a session-scoped always-allow rule. CC's own `permission_suggestions` (already narrowly
  *  scoped — e.g. `Bash(bun test:*)`) are applied VERBATIM when present; otherwise a whole-tool session
  *  rule. `destination: "session"` ONLY — an over-broad grant dies with the session, never persisted to
- *  disk. Requires CC ≥ 2.0.54 (the `updatedPermissions` key); older CC ignores the extra key and
- *  degrades to a plain allow (safe: the tool still runs, just no rule is remembered). */
+ *  disk.
+ *
+ *  CODEX COMPATIBILITY: Codex currently reserves `updatedPermissions` and rejects the ENTIRE hook
+ *  decision when that field is present. A stale phone build may still offer "Always allow" for a Codex
+ *  row, so fail safely to the supported plain-allow envelope instead of emitting a decision Codex drops
+ *  and then showing a second approval dialog. The phone also keys its current-agent action policy from
+ *  the encrypted `agent:"codex"` blob field and hides the unsupported persistent option. */
 function allowAlwaysLine(agent: AgentKind, toolName: string, toolInput: Record<string, unknown>, suggestions: unknown): string {
+  if (agent === "codex") return allowLine(agent, toolName, toolInput);
   const updatedPermissions = Array.isArray(suggestions) && suggestions.length > 0
     ? suggestions
     : [{ type: "addRules", rules: [{ toolName }], behavior: "allow", destination: "session" }];
@@ -596,7 +602,9 @@ function emitDecision(
       emit(allowLine(agent, toolName, toolInput)); trace({ event: "emit", decision: "allow" }); return "emitted";
     case "allow_always":
       if (isQuestion) { trace({ event: "release", reason: "bare-allow-on-question" }); return "released"; }
-      emit(allowAlwaysLine(agent, toolName, toolInput, suggestions)); trace({ event: "emit", decision: "allow_always" }); return "emitted";
+      emit(allowAlwaysLine(agent, toolName, toolInput, suggestions));
+      trace({ event: "emit", decision: agent === "codex" ? "allow_always_degraded_to_allow" : "allow_always" });
+      return "emitted";
     case "deny":
       emit(denyLine(agent, answer.message));
       trace({ event: "emit", decision: "deny", hasMessage: typeof answer.message === "string" && answer.message.trim().length > 0 });
@@ -694,12 +702,17 @@ export async function runPermissionHook(deps: PermissionHookDeps = {}, agent: Ag
       trace({ event: "exit", reason: "subagent", agent_type: agentType });
       return;
     }
-    // 2. Mode gate: hold ONLY for the interactive dialog modes — "default", "acceptEdits", "plan" — and
-    //    for an absent/non-string mode (older CC versions: preserve prior behavior). In "auto" the
+    // 2. Mode gate: hold ONLY for the interactive dialog modes. Claude reports "default",
+    //    "acceptEdits", or "plan"; Codex's producer reports only "default" or "bypassPermissions" because
+    //    Codex Plan is a separate collaboration mode, NOT a permission_mode. An absent/non-string mode
+    //    preserves older-CC behavior. In "auto" the
     //    PermissionRequest path runs even when NO dialog would show, so the hook can't tell "would
     //    auto-run" from "would prompt" — it must not hold. "dontAsk"/"bypassPermissions" never prompt.
     //    Any unrecognized future value falls open too (fail-open bias).
-    if (permissionMode !== undefined && permissionMode !== "default" && permissionMode !== "acceptEdits" && permissionMode !== "plan") {
+    const interactiveMode = permissionMode === undefined
+      || permissionMode === "default"
+      || (agent === "claude" && (permissionMode === "acceptEdits" || permissionMode === "plan"));
+    if (!interactiveMode) {
       trace({ event: "exit", reason: "mode", mode: permissionMode });
       return;
     }

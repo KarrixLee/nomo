@@ -1099,6 +1099,25 @@ describe("buildNeedsAttentionEnvelope (dropped-hook corrective → same envelope
     const without = await buildNeedsAttentionEnvelope("s", rec(), 5, KEY) as Record<string, unknown>;
     expect(await decryptBlob(KEY, without.blob as string)).not.toHaveProperty("model"); // omitted, never ""
   });
+  test("carries a recovered request_user_input question as encrypted detail; omits it for plain approvals", async () => {
+    const withQuestion = await buildNeedsAttentionEnvelope(
+      "s", rec({ machine: "Mac", label: "proj" }), 5, KEY, "codex", 5,
+      "Scope: Which API should the plan preserve?", "userInput",
+    ) as Record<string, unknown>;
+    expect(withQuestion.attentionKind).toBe("userInput");
+    expect(await decryptBlob(KEY, withQuestion.blob as string)).toMatchObject({
+      status: "needsAttention",
+      detail: "Scope: Which API should the plan preserve?",
+      agent: "codex",
+    });
+    const approval = await buildNeedsAttentionEnvelope("s", rec(), 5, KEY, "codex", 5) as Record<string, unknown>;
+    expect(approval).not.toHaveProperty("attentionKind");
+    expect(await decryptBlob(KEY, approval.blob as string)).not.toHaveProperty("detail");
+    const claude = await buildNeedsAttentionEnvelope(
+      "s", rec(), 5, KEY, "claude", 5, "Question?", "userInput",
+    ) as Record<string, unknown>;
+    expect(claude).not.toHaveProperty("attentionKind");
+  });
 });
 
 describe("shouldPendingApprovalCheck (gate: once-per-episode + skip claude/done/no-transcript)", () => {

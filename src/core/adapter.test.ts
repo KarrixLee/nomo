@@ -6,9 +6,9 @@ import {
   codexConfigModel, codexDiscoverLive, codexInternalSessionGhost, codexModelFromRollout,
   CODEX_ROLLOUT_IDLE_SILENCE_MS,
   codexNewestRolloutForCwd, codexPidTurnActive, codexRolloutExistsForSession, codexSentinelSessionId, codexSessionModel,
-  codexTailPendingApproval, codexTurnActiveFromTail, filterCodexTuis, findProvisionalForPid,
+  codexTailPendingApproval, codexTailPendingAttentionKind, codexTailPendingUserInputDetail, codexTurnActiveFromTail, filterCodexTuis, findProvisionalForPid,
   firstAssistantModel, firstUserPrompt, lastAssistantModel, parseCodexProcs, rolloutMetaCwd,
-  rolloutPathFromLsof, sessionTitle, TrackedSessionLite,
+  requestUserInputDetail, rolloutPathFromLsof, sessionTitle, TrackedSessionLite,
 } from "./adapter";
 import type { SessionRecord } from "./shared";
 
@@ -672,18 +672,48 @@ describe("codexTailPendingApproval (backstop classifier) + adapter capability", 
   });
 
   test("a persisted request_user_input call is pending until its function_call_output arrives", () => {
-    const request = item("function_call", { name: "request_user_input", call_id: "q1" });
+    const args = JSON.stringify({ questions: [{ id: "scope", header: "Scope", question: "Which API should we keep?" }] });
+    const request = item("function_call", { name: "request_user_input", call_id: "q1", arguments: args });
     expect(codexTailPendingApproval([ev("task_started"), request].join("\n"))).toBe(true);
+    expect(codexTailPendingAttentionKind([ev("task_started"), request].join("\n"))).toBe("userInput");
+    expect(codexTailPendingUserInputDetail([ev("task_started"), request].join("\n")))
+      .toBe("Scope: Which API should we keep?");
     expect(codexTailPendingApproval([
       ev("task_started"),
       request,
       item("function_call_output", { call_id: "q1", output: '{"answers":{}}' }),
     ].join("\n"))).toBe(false);
+    expect(codexTailPendingUserInputDetail([
+      request,
+      item("function_call_output", { call_id: "q1", output: '{"answers":{}}' }),
+    ].join("\n"))).toBeUndefined();
+    expect(codexTailPendingAttentionKind([
+      request,
+      item("function_call_output", { call_id: "q1", output: '{"answers":{}}' }),
+    ].join("\n"))).toBeUndefined();
+  });
+
+  test("request_user_input preview is tolerant, whitespace-cleaned, and bounded", () => {
+    expect(requestUserInputDetail({ questions: [{ header: "  Scope ", question: " Keep   the API? " }] }))
+      .toBe("Scope: Keep the API?");
+    expect(requestUserInputDetail(JSON.stringify({ questions: [{ header: "", question: "Use SQLite?" }] })))
+      .toBe("Use SQLite?");
+    expect(requestUserInputDetail({ questions: [{ header: "Scope", question: "Scope: Keep it?" }] }))
+      .toBe("Scope: Keep it?");
+    expect(requestUserInputDetail({ questions: [{ header: "Long", question: "x".repeat(300) }] })?.length)
+      .toBe(240);
+    const emojiBoundary = requestUserInputDetail({ questions: [{ question: `${"x".repeat(238)}😀tail` }] });
+    expect(emojiBoundary).toBe(`${"x".repeat(238)}😀…`);
+    expect(emojiBoundary).not.toContain("\ud83d…");
+    expect(requestUserInputDetail("not-json")).toBeUndefined();
+    expect(requestUserInputDetail({ questions: [] })).toBeUndefined();
   });
 
   test("ordinary pending function calls are not mistaken for user input", () => {
     expect(codexTailPendingApproval(item("function_call", { name: "shell", call_id: "c1" }))).toBe(false);
     expect(codexTailPendingApproval(item("function_call", { name: "apply_patch", call_id: "c2" }))).toBe(false);
+    expect(codexTailPendingAttentionKind(item("function_call", { name: "shell", call_id: "c1" }))).toBeUndefined();
+    expect(codexTailPendingAttentionKind(ev("exec_approval_request", { call_id: "c1" }))).toBeUndefined();
   });
 
   test("a request FOLLOWED by a resolution → not pending (false)", () => {
@@ -729,6 +759,13 @@ describe("codexTailPendingApproval (backstop classifier) + adapter capability", 
   test("codexAdapter.tailShowsPendingApproval delegates to the classifier", () => {
     expect(codexAdapter.tailShowsPendingApproval!(ev("exec_approval_request"))).toBe(true);
     expect(codexAdapter.tailShowsPendingApproval!(ev("task_complete"))).toBe(false);
+    const args = JSON.stringify({ questions: [{ header: "Mode", question: "Fast or safe?" }] });
+    expect(codexAdapter.tailPendingAttentionDetail!(item("function_call", {
+      name: "request_user_input", arguments: args,
+    }))).toBe("Mode: Fast or safe?");
+    expect(codexAdapter.tailPendingAttentionKind!(item("function_call", {
+      name: "request_user_input", arguments: "not-json",
+    }))).toBe("userInput");
   });
 });
 

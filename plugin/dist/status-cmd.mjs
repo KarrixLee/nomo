@@ -493,6 +493,33 @@ var codexToolDetail = {
   spawn_agent: "delegating",
   update_plan: "planning"
 };
+var USER_INPUT_DETAIL_MAX = 240;
+function requestUserInputDetail(toolInput) {
+  let parsed = toolInput;
+  if (typeof parsed === "string") {
+    try {
+      parsed = JSON.parse(parsed);
+    } catch {
+      return;
+    }
+  }
+  if (typeof parsed !== "object" || parsed === null)
+    return;
+  const questions = parsed.questions;
+  if (!Array.isArray(questions) || questions.length === 0)
+    return;
+  const first = questions[0];
+  if (typeof first !== "object" || first === null)
+    return;
+  const q = first;
+  const question = typeof q.question === "string" ? q.question.replace(/\s+/g, " ").trim() : "";
+  if (!question)
+    return;
+  const header = typeof q.header === "string" ? q.header.replace(/\s+/g, " ").trim() : "";
+  const text = header && !question.toLowerCase().startsWith(`${header.toLowerCase()}:`) ? `${header}: ${question}` : question;
+  const characters = Array.from(text);
+  return characters.length <= USER_INPUT_DETAIL_MAX ? text : `${characters.slice(0, USER_INPUT_DETAIL_MAX - 1).join("")}…`;
+}
 function aiTitleFromLines(lines) {
   for (let i = lines.length - 1;i >= 0; i--) {
     const line = lines[i];
@@ -889,6 +916,50 @@ function codexTailPendingApproval(tail) {
   }
   return false;
 }
+function codexTailPendingUserInput(tail) {
+  const lines = tail.split(`
+`);
+  for (let i = lines.length - 1;i >= 0; i--) {
+    const line = lines[i];
+    if (!line.trim())
+      continue;
+    if (!line.includes("event_msg") && !line.includes("response_item"))
+      continue;
+    let row;
+    try {
+      row = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (typeof row !== "object" || row === null)
+      continue;
+    const r = row;
+    const payload = r.payload;
+    const ptype = typeof payload?.type === "string" ? payload.type : undefined;
+    if (!ptype)
+      continue;
+    if (r.type === "event_msg") {
+      if (CODEX_APPROVAL_REQUEST_EVENTS.has(ptype))
+        return;
+      if (CODEX_APPROVAL_RESOLUTION_EVENTS.has(ptype))
+        return;
+    } else if (r.type === "response_item") {
+      if (ptype === "function_call" && payload?.name === CODEX_USER_INPUT_TOOL) {
+        const detail = requestUserInputDetail(payload.arguments);
+        return { kind: "userInput", ...detail ? { detail } : {} };
+      }
+      if (CODEX_APPROVAL_RESOLUTION_ITEMS.has(ptype))
+        return;
+    }
+  }
+  return;
+}
+function codexTailPendingUserInputDetail(tail) {
+  return codexTailPendingUserInput(tail)?.detail;
+}
+function codexTailPendingAttentionKind(tail) {
+  return codexTailPendingUserInput(tail)?.kind;
+}
 var CLAUDE_USER_BLOCKING_TOOLS = new Set(["AskUserQuestion", "ExitPlanMode"]);
 function blockingToolUseId(assistantRow) {
   const content = assistantRow.message?.content;
@@ -1273,6 +1344,12 @@ var codexAdapter = {
   tailShowsPendingApproval(tail) {
     return codexTailPendingApproval(tail);
   },
+  tailPendingAttentionDetail(tail) {
+    return codexTailPendingUserInputDetail(tail);
+  },
+  tailPendingAttentionKind(tail) {
+    return codexTailPendingAttentionKind(tail);
+  },
   isChildSessionGhost({ sessionId, prefix, hookPid, tracked }) {
     return codexChildSessionGhost(sessionId, prefix, hookPid, tracked);
   },
@@ -1294,6 +1371,7 @@ function adapterFor(agent) {
 var allAdapters = [claudeAdapter, codexAdapter];
 
 // src/entries/status-cmd.ts
+var CODEX_PLUGIN_HOOK_COUNT = 7;
 function countCodexHookEvents(raw) {
   let parsed;
   try {
@@ -1465,7 +1543,7 @@ async function statusCmd(deps = {}) {
     else if (plugin.trusted === 0)
       pluginState = "installed, hooks NOT trusted (run /hooks in Codex)";
     else
-      pluginState = `installed, trusted (${plugin.trusted}/6)`;
+      pluginState = `installed, trusted (${plugin.trusted}/${CODEX_PLUGIN_HOOK_COUNT})`;
   } else if (legacyEvents > 0) {
     pluginState = `legacy hooks.json (${legacyEvents} events)`;
   } else {

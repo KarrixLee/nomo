@@ -13,6 +13,10 @@ import {
   SESSIONS_DIR, WATCHDOG_PID_PATH,
 } from "../core/shared";
 
+/** Native Codex plugin hook declarations in plugin/hooks/codex-hooks.json. Keep the status denominator
+ *  in lockstep with the manifest; SessionEnd is the seventh entry and performs exact row cleanup. */
+const CODEX_PLUGIN_HOOK_COUNT = 7;
+
 export interface StatusDeps {
   print?: (line: string) => void;
   configPath?: string;
@@ -237,7 +241,7 @@ export async function statusCmd(deps: StatusDeps = {}): Promise<number> {
   }
   print(`Tracked sessions: ${sessions}`);
 
-  // Native Codex plugin: the supported path — a `nomo@…` plugin in <CODEX_HOME>/config.toml whose 6
+  // Native Codex plugin: the supported path — a `nomo@…` plugin in <CODEX_HOME>/config.toml whose 7
   // bundled hooks Codex trust-reviews via `/hooks`. Legacy = the pre-plugin `/nomo-cc:codex` path that
   // wrote OUR command into <CODEX_HOME>/hooks.json; the two can coexist on an upgraded box and then
   // every event double-fires (D7.1). Both reads are naive line-scans (no TOML dep) — this is a health
@@ -259,7 +263,7 @@ export async function statusCmd(deps: StatusDeps = {}): Promise<number> {
   if (plugin.installed) {
     if (!plugin.enabled) pluginState = "installed, disabled";
     else if (plugin.trusted === 0) pluginState = "installed, hooks NOT trusted (run /hooks in Codex)";
-    else pluginState = `installed, trusted (${plugin.trusted}/6)`;
+    else pluginState = `installed, trusted (${plugin.trusted}/${CODEX_PLUGIN_HOOK_COUNT})`;
   } else if (legacyEvents > 0) {
     // No native plugin, but the legacy hooks.json path is still wired — functional, just not the
     // supported surface anymore.

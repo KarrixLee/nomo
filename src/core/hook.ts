@@ -21,7 +21,7 @@ import { readdir, readFile, unlink } from "node:fs/promises";
 import { hostname } from "node:os";
 import { basename } from "node:path";
 import { encryptBlob } from "./crypto";
-import { adapterFor, claudeToolDetail, codexToolDetail, findProvisionalForPid, TrackedSessionLite } from "./adapter";
+import { adapterFor, claudeToolDetail, codexToolDetail, findProvisionalForPid, requestUserInputDetail, TrackedSessionLite } from "./adapter";
 import {
   AgentKind, atomicWrite, CCOp, CCStatus, Config, ensureWatchdog, GONE_STRIKE_LIMIT,
   LAST_SEND_PATH, lastHookPath, loadConfig, loadPendingConfig, localApprovalsState, PENDING_STASH_PATH, PendingEventStash, pidAncestors, pidCommand, PLUGIN_VERSION, readPrefix,
@@ -46,8 +46,12 @@ export interface OpPlan {
 /// no detail rather than a wrong guess — the phone then just shows "Working".
 const TOOL_DETAIL: Record<string, string> = { ...claudeToolDetail, ...codexToolDetail };
 
-/** The working sub-status for a tool hook: the tool's label before it runs, "thinking" after. */
-export function detailForHook(hookName: string, toolName?: string): string | undefined {
+/** The working sub-status for a tool hook: the tool's label before it runs, "thinking" after. A Codex
+ *  Plan question carries its encrypted first-question preview instead of a generic tool label. */
+export function detailForHook(hookName: string, toolName?: string, toolInput?: unknown): string | undefined {
+  if (hookName === "PreToolUse" && toolName === "request_user_input") {
+    return requestUserInputDetail(toolInput);
+  }
   if (hookName === "PreToolUse") return toolName ? TOOL_DETAIL[toolName] : undefined;
   if (hookName === "PostToolUse") return "thinking";
   return undefined;
@@ -163,7 +167,11 @@ export function buildBlob(input: Record<string, unknown>, machine: string, title
     ? pinnedLabel
     : typeof input.cwd === "string" && input.cwd.length > 0 ? basename(input.cwd) : "session";
   const hookName = typeof input.hook_event_name === "string" ? input.hook_event_name : "";
-  const detail = detailForHook(hookName, typeof input.tool_name === "string" ? input.tool_name : undefined);
+  const detail = detailForHook(
+    hookName,
+    typeof input.tool_name === "string" ? input.tool_name : undefined,
+    input.tool_input,
+  );
   // The `agent` key is OMITTED for claude (byte-identical to the pre-codex blob so old Swift builds and
   // the existing snapshots are unaffected) and the literal "codex" for a codex session. `turnStartedAt`
   // (epoch SECONDS — the current turn's start, see runHook) is likewise OMITTED when unknown, so a blob
@@ -191,10 +199,13 @@ export function buildBlob(input: Record<string, unknown>, machine: string, title
   };
 }
 
-/** The wire envelope for one hook event: the blind v2 shape `{v:2, sessionId, op, prio, ts, blob?}`.
+/** The wire envelope for one hook event: the blind v2 shape
+ *  `{v:2, sessionId, op, prio, ts, attentionKind?, blob?}`.
  *  op:end carries no blob (the worker reuses the last stored one); every other op carries the E2E-
  *  encrypted blob. Null when the hook is ignored (unknown/dropped) or has no session id. `sentDone`
- *  drives the re-arm (a start after a done becomes an update). */
+ *  drives the re-arm (a start after a done becomes an update). The clear `attentionKind` is deliberately
+ *  narrow and backward-compatible: ONLY Codex's request_user_input carries `"userInput"`, allowing the
+ *  worker to distinguish a Plan question from an ordinary permission decision without reading `blob`. */
 export async function buildEnvelope(
   input: unknown, machine: string, now: number, title: string | undefined, e2eKey: Uint8Array, sentDone: boolean,
   agent: AgentKind = "claude", startedAt?: number, turnStartedAt?: number, pinnedLabel?: string, model?: string,
@@ -210,13 +221,16 @@ export async function buildEnvelope(
   const base: Record<string, unknown> = { v: 2, sessionId: i.session_id, op: plan.op, prio: plan.prio, ts: now };
   if (typeof startedAt === "number" && Number.isFinite(startedAt)) base.startedAt = startedAt;
   if (plan.op === "end") return base; // clean SessionEnd carries no content — worker reuses last blob
-  // turnStartedAt, model, and `at` ride INSIDE the encrypted blob only — the clear envelope shape above
-  // must stay byte-identical (no new fields the worker could see; zero server changes). `at` is the real
-  // event time (`now`) in epoch SECONDS — the phone's honest sort/age key, frozen here and re-sent
-  // verbatim by every watchdog heartbeat so an idle-but-heartbeated session ages out (see buildBlob).
+  // turnStartedAt, model, and `at` ride INSIDE the encrypted blob only. `attentionKind` below is the one
+  // intentional optional clear discriminator; absent events retain the byte-compatible legacy shape.
+  // `at` is the real event time (`now`) in epoch SECONDS — the phone's honest sort/age key, frozen here
+  // and re-sent verbatim by every watchdog heartbeat so an idle-but-heartbeated session ages out.
   const at = Math.floor(now / 1000);
   const blob = await encryptBlob(e2eKey, buildBlob(i, machine, title, plan, agent, turnStartedAt, pinnedLabel, model, at));
-  return { ...base, blob };
+  const attentionKind = agent === "codex" && hookName === "PreToolUse" && i.tool_name === "request_user_input"
+    ? "userInput" as const
+    : undefined;
+  return { ...base, ...(attentionKind ? { attentionKind } : {}), blob };
 }
 
 /** The pending-pairing stash for THIS hook, or null when there's nothing to stash. Built from the same
