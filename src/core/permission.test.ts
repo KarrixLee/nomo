@@ -1234,7 +1234,7 @@ describe("runPermissionHook — AskUserQuestion holds", () => {
     ["non-string answer elements", { decision: "answer", answers: [{ label: "Unit tests only" }] }],
     ["an answer matching NO option label", { decision: "answer", answers: ["Something I was never offered"] }],
     ["a multi-select whose SECOND piece is garbage", { decision: "answer", answers: ["Unit tests only, nonsense"] }],
-    ["a runaway 600-char answer string (capped at 500 ⇒ unmatchable)", { decision: "answer", answers: ["z".repeat(600)] }],
+    ["a runaway 600-char answer string (past the 500-char bound ⇒ REFUSED, not sliced)", { decision: "answer", answers: ["z".repeat(600)] }],
   ] as Array<[string, Record<string, unknown>]>) {
     test(`RELEASE: ${name} → emits NOTHING and stops polling (never a bare allow, never an infinite hold)`, async () => {
       const answerBlob = await encryptBlob(KEY, { requestId: "req-fixed", ts: 5, ...answer });
@@ -1251,6 +1251,35 @@ describe("runPermissionHook — AskUserQuestion holds", () => {
       expect(calls.filter((c) => c.method === "GET").length).toBe(1);  // hold RELEASED — no second poll
     });
   }
+
+  // The over-length answer must be REFUSED, never SLICED. Slicing at the 500-char bound can land
+  // exactly on a multi-select ", " boundary such that what SURVIVES is itself a valid — but SHORTER —
+  // real selection, so the truncation would silently change what the user picked and CC would be told
+  // they chose it. This is that exact demonstrated case: a 495-char label + ", Yes and more" slices to
+  // "<L>, Yes", which resolves cleanly onto the real labels [<L>, "Yes"]. An answer we cannot
+  // represent EXACTLY is unrepresentable, so the hold releases to the terminal picker instead.
+  test("RELEASE: an over-length multi-select must NOT be sliced into a shorter REAL selection", async () => {
+    const long = "L".repeat(495);
+    const qs = [{
+      question: "Which?", multiSelect: true,
+      options: [{ label: long }, { label: "Yes" }, { label: "Yes and more" }],
+    }];
+    const answer = `${long}, Yes and more`;
+    expect(answer.length).toBeGreaterThan(500);                     // past ANSWER_MAX
+    expect(answer.slice(0, 500)).toBe(`${long}, Yes`);              // …and the slice IS a valid selection
+    const answerBlob = await encryptBlob(KEY, { requestId: "req-fixed", ts: 5, decision: "answer", answers: [answer] });
+    const laterBlob = await encryptBlob(KEY, { requestId: "req-fixed", ts: 6, decision: "deny" });
+    const emitted: string[] = [];
+    const { fn, calls } = scriptFetch(true, [
+      { status: "answered", answerBlob },
+      { status: "answered", answerBlob: laterBlob },
+    ]);
+    await runPermissionHook(baseDeps({
+      fetchFn: fn, emit: (l: string) => emitted.push(l), readInput: async () => questionInput(qs),
+    }) as never);
+    expect(emitted).toEqual([]);                                    // NOT the wrong `<L>, Yes` answer
+    expect(calls.filter((c) => c.method === "GET").length).toBe(1);  // hold released
+  });
 
   test("RELEASE: `answer` on a NON-question tool → emits NOTHING and stops polling", async () => {
     const answerBlob = await encryptBlob(KEY, { requestId: "req-fixed", ts: 5, decision: "answer", answers: ["yes"] });

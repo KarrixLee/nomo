@@ -22,7 +22,7 @@ import { hostname } from "node:os";
 import { basename } from "node:path";
 import { cleanPromptTitle, codexAdapter } from "../core/adapter";
 import { buildEnvelope, trackSession } from "../core/hook";
-import { atomicWrite, ensureWatchdog, LAST_SEND_PATH, loadConfig, PLUGIN_VERSION, readRecord } from "../core/shared";
+import { atomicWrite, ensureWatchdog, LAST_SEND_PATH, loadConfig, localApprovalsState, PLUGIN_VERSION, readRecord } from "../core/shared";
 
 /** Map the notify JSON onto the runHook/planOp Stop-hook input shape. Null for any payload that isn't
  *  an agent-turn-complete carrying a non-empty thread-id (the only kind we back-stop) or isn't JSON. */
@@ -149,6 +149,9 @@ export async function runNotify(raw: string, deferMs = notifyDeferMs(), sleep: (
         "x-cc-pairing": config.pairingId,
         "x-cc-auth": config.pcSecret,
         "x-cc-version": PLUGIN_VERSION,
+        // This computer's local remote-approvals pause (`nomo-cc permission off`) — same plaintext
+        // report every /cc/event POSTer sends; the worker literal-matches "on"/"off".
+        "x-cc-approvals": await localApprovalsState(),
       },
       body: JSON.stringify(envelope),
       signal: AbortSignal.timeout(2000),

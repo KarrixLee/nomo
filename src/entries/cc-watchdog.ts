@@ -35,7 +35,7 @@ import { basename } from "node:path";
 import { encryptBlob } from "../core/crypto";
 import { adapterFor, AgentAdapter, allAdapters, codexAdapter, DiscoveredSession } from "../core/adapter";
 import {
-  AgentKind, atomicWrite, CC_DIR, CCOp, CCStatus, Config, completePendingPairing, GONE_STRIKE_LIMIT, loadConfig, loadPendingConfig,
+  AgentKind, atomicWrite, CC_DIR, CCOp, CCStatus, Config, completePendingPairing, GONE_STRIKE_LIMIT, loadConfig, loadPendingConfig, localApprovalsState,
   PAIR_HTML_FILE, PairPollResult, PendingConfig, pidAlive, PLUGIN_VERSION, readPrefix, readSuffix, recordGoneStrike, removeRevokedConfig,
   resetGoneStrikes, SessionRecord, SESSIONS_DIR, WATCHDOG_PID_PATH,
 } from "../core/shared";
@@ -233,6 +233,9 @@ async function postEvent(config: Config, body: object): Promise<PostOutcome> {
         "x-cc-pairing": config.pairingId,
         "x-cc-auth": config.pcSecret,
         "x-cc-version": PLUGIN_VERSION,
+        // This computer's local remote-approvals pause (`nomo-cc permission off`) — same plaintext
+        // report every /cc/event POSTer sends; the worker literal-matches "on"/"off".
+        "x-cc-approvals": await localApprovalsState(),
       },
       body: JSON.stringify(body),
       signal: AbortSignal.timeout(2000),

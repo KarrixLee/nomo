@@ -10,7 +10,7 @@
 // and node >= 18 — no `Bun.*` APIs. File IO goes through node:fs/promises; base64 decode goes
 // through the portable crypto.ts helpers. Task 2.3 bundles these .ts files to a single .mjs.
 
-import { chmod, open, readFile, rename, stat, mkdir, unlink, writeFile } from "node:fs/promises";
+import { access, chmod, open, readFile, rename, stat, mkdir, unlink, writeFile } from "node:fs/promises";
 import { existsSync, readFileSync } from "node:fs";
 import { execFileSync, spawn } from "node:child_process";
 import { dirname, join } from "node:path";
@@ -43,6 +43,30 @@ export const GONE_STRIKES_PATH = `${CC_DIR}/gone-strikes`;
  *  down. Two, not one: a single 404 can be a transient/racing delete, so we require a second to confirm
  *  the pairing is really gone before deleting the credential-bearing config. */
 export const GONE_STRIKE_LIMIT = 2;
+/** Local escape-hatch flag for remote approvals: when this zero-byte file exists, the permission hook
+ *  skips the phone hold entirely and behaves as a plain fire-and-forget attention event (instant
+ *  terminal dialog). Toggled by `nomo-cc permission off|on`. It lives HERE (not in permission.ts, which
+ *  re-exports it) because every /cc/event POSTer must report it — and permission.ts already imports
+ *  this module, so the reverse import would be a cycle. */
+export const NO_HOLD_PATH = `${CC_DIR}/no-hold`;
+
+/** This computer's local remote-approvals state, as it goes on the wire.
+ *
+ *  CONTRACT — LITERAL, and the whole feature dies SILENTLY if it drifts: the worker
+ *  (server/src/cc.ts) accepts ONLY the exact lowercase strings "on" and "off" as the `x-cc-approvals`
+ *  request header and ignores anything else without complaint (an absent header from an old plugin
+ *  stays "never reported", which the phone distinguishes from a reported "off"). So "true", "OFF",
+ *  "On", "1", or a stray space are all indistinguishable from the feature being reverted. Return type
+ *  is the literal union for exactly that reason; the plugin-side proof lives in shared.test.ts and
+ *  cc-status.test.ts.
+ *
+ *  Cost is a non-issue on the status path: one access() stat, strictly cheaper than the readFile()s
+ *  (loadConfig, readRecord, and on Codex a readdir + per-file reads) that path already performs — and
+ *  the permission hook already pays exactly this stat on every prompt. */
+export async function localApprovalsState(noHoldPath: string = NO_HOLD_PATH): Promise<"on" | "off"> {
+  try { await access(noHoldPath); return "off"; } catch { return "on"; }
+}
+
 /** Basename of the pending-pairing event stash — a hook that fires WHILE pairing is still pending has
  *  no e2eKey yet, so it stashes its plaintext event here (next to config.json) instead of POSTing;
  *  completePendingPairing encrypts + flushes it the instant it derives the key, so the phone sees the
@@ -476,7 +500,7 @@ async function flushPendingStash(
       try {
         const res = await fetchFn(`${url}/v1/cc/event`, {
           method: "POST",
-          headers: { "content-type": "application/json", "x-cc-pairing": pairingId, "x-cc-auth": pcSecret, "x-cc-version": PLUGIN_VERSION },
+          headers: { "content-type": "application/json", "x-cc-pairing": pairingId, "x-cc-auth": pcSecret, "x-cc-version": PLUGIN_VERSION, "x-cc-approvals": await localApprovalsState() },
           body: JSON.stringify(envelope),
           signal: AbortSignal.timeout(fetchTimeoutMs),
         });

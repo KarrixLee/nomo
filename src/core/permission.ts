@@ -21,12 +21,15 @@ import { appendFileSync, statSync, truncateSync } from "node:fs";
 import { hostname } from "node:os";
 import { basename } from "node:path";
 import { runHook, buildBlob, OpPlan } from "./hook";
-import { AgentKind, atomicWrite, CC_DIR, Config, loadConfig, PLUGIN_VERSION, readRecord, SessionRecord } from "./shared";
+import { AgentKind, atomicWrite, CC_DIR, Config, loadConfig, NO_HOLD_PATH, PLUGIN_VERSION, readRecord, SessionRecord } from "./shared";
 import { decryptBlob, encryptBlob } from "./crypto";
 
 /** Local escape-hatch flag: when this file exists, the hook skips the hold entirely and behaves as a
- *  plain fire-and-forget attention event (instant terminal dialog). Toggled by `cc-permission off|on`. */
-export const NO_HOLD_PATH = `${CC_DIR}/no-hold`;
+ *  plain fire-and-forget attention event (instant terminal dialog). Toggled by `cc-permission off|on`.
+ *  DEFINED IN shared.ts (every /cc/event POSTer reports it as the `x-cc-approvals` header, and a
+ *  shared.ts → permission.ts import would be a cycle); re-exported here, where it is toggled, so
+ *  existing importers are unaffected. */
+export { NO_HOLD_PATH };
 
 /** How often to poll for the phone's answer while holding (ms). Small jitter is added per cycle. */
 const POLL_INTERVAL_MS = 3_000;
@@ -175,8 +178,15 @@ function answerLine(
   for (let i = 0; i < questions.length; i += 1) {
     const a = answers[i];
     if (typeof a !== "string") continue;                        // non-string → unanswered
-    const raw = a.trim().slice(0, ANSWER_MAX);                  // MINOR 7: bound the stdout line
+    const raw = a.trim();
     if (raw.length === 0) continue;                             // unanswered → simply absent from the map
+    // Bound the stdout line — by REFUSING, never by slicing. Truncating at ANSWER_MAX can land exactly
+    // on a multi-select ", " boundary such that what SURVIVES is itself a valid but SHORTER real
+    // selection (e.g. a 495-char label + ", Yes and more" slices to "<label>, Yes"), which would tell
+    // CC the user picked something they never picked. An answer we cannot represent EXACTLY is
+    // unanswerable, so release the hold and let the terminal picker handle it — same rule as an
+    // unmatchable label below.
+    if (raw.length > ANSWER_MAX) return undefined;
     const resolved = resolveAnswer(raw, questions[i].labels);
     // An answer we cannot pin to exactly one REAL option is unanswerable: sending a guess (or the
     // phone's capped echo) would tell CC the user picked something they never picked. Release instead.

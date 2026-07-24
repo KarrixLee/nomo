@@ -2063,3 +2063,63 @@ describe("runHook sends the plugin version as the x-cc-version header", () => {
     }
   }, 20000);
 });
+
+// --- runHook reports this computer's LOCAL approvals pause as x-cc-approvals -------------------
+//
+// `nomo-cc permission off` writes a zero-byte <CC_DIR>/no-hold flag that pauses remote approvals ON
+// THIS MAC — the phone could not see it, so its "Answer permission prompts from iPhone" toggle read
+// ON while nothing would ever arrive. Every /cc/event POST now carries the state as a plaintext
+// header so the worker can record it per computer.
+//
+// THE CONTRACT IS LITERAL: the worker (server/src/cc.ts) accepts ONLY the exact lowercase strings
+// "on" and "off" and IGNORES anything else without complaint — "true"/"OFF"/"On"/"1"/a trailing
+// space all mean the feature is silently dead with no error anywhere. So these assert the EXACT
+// header bytes with toBe(), never a case-insensitive or "contains" match. Spawning the REAL claude
+// entry against a header-capturing server (the x-cc-version harness above) is the faithful proof.
+describe("runHook sends the local approvals pause as the x-cc-approvals header", () => {
+  const rawKey = new Uint8Array(32).fill(9);
+  const entry = join(import.meta.dir, "cc-status.ts");
+
+  /** Spawn the real hook with a temp HOME; `paused` pre-creates the no-hold flag. Returns the exact
+   *  header string the worker would see (null = header absent, "NOT-CALLED" = no POST happened). */
+  async function headerFor(paused: boolean): Promise<string | null> {
+    let seen: string | null = "NOT-CALLED";
+    const server = Bun.serve({
+      port: 0,
+      fetch(req) { seen = req.headers.get("x-cc-approvals"); return new Response("{}", { status: 200 }); },
+    });
+    const url = `http://127.0.0.1:${server.port}`;
+    const home = await mkdtemp(join(tmpdir(), "cc-hook-appr-"));
+    const ccDir = join(home, ".config", "cc-status");
+    await mkdir(join(ccDir, "sessions"), { recursive: true });
+    await writeFile(join(ccDir, "config.json"), JSON.stringify({
+      url, pairingId: "p", pcSecret: "s", e2eKeyB64: b64url(rawKey),
+    }));
+    await writeFile(join(ccDir, "watchdog.pid"), String(process.pid)); // no detached poller spawns
+    if (paused) await writeFile(join(ccDir, "no-hold"), ""); // exactly what `permission off` writes
+    try {
+      const proc = Bun.spawn({
+        cmd: ["bun", entry],
+        env: { ...process.env, HOME: home },
+        stdin: Buffer.from(JSON.stringify({
+          session_id: "appr-1", hook_event_name: "PreToolUse", tool_name: "Edit",
+          cwd: "/x/api-status", transcript_path: "",
+        })),
+        stdout: "ignore", stderr: "ignore",
+      });
+      await proc.exited;
+      return seen;
+    } finally {
+      server.stop(true);
+      await rm(home, { recursive: true, force: true });
+    }
+  }
+
+  test("the no-hold flag EXISTS → exactly \"off\" (byte-for-byte; the worker literal-matches)", async () => {
+    expect(await headerFor(true)).toBe("off");
+  }, 20000);
+
+  test("no flag → exactly \"on\" (byte-for-byte; bracketed against the \"off\" case above)", async () => {
+    expect(await headerFor(false)).toBe("on");
+  }, 20000);
+});
