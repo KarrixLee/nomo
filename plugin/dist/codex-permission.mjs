@@ -2,7 +2,7 @@ import { createRequire } from "node:module";
 var __require = /* @__PURE__ */ createRequire(import.meta.url);
 
 // src/core/permission.ts
-import { access, unlink as unlink3 } from "node:fs/promises";
+import { unlink as unlink3 } from "node:fs/promises";
 import { appendFileSync, statSync, truncateSync } from "node:fs";
 import { hostname as hostname2 } from "node:os";
 import { basename as basename3 } from "node:path";
@@ -92,18 +92,30 @@ import { promisify } from "node:util";
 import { basename, join as join2 } from "node:path";
 
 // src/core/shared.ts
-import { chmod, open, readFile, rename, stat, mkdir, unlink, writeFile } from "node:fs/promises";
+import { access, chmod, open, readFile, rename, stat, mkdir, unlink, writeFile } from "node:fs/promises";
 import { existsSync, readFileSync } from "node:fs";
 import { execFileSync, spawn } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "1.2.2";
+var PLUGIN_VERSION = "1.3.0";
 var CC_DIR = `${process.env.HOME}/.config/cc-status`;
 var SESSIONS_DIR = `${CC_DIR}/sessions`;
 var WATCHDOG_PID_PATH = `${CC_DIR}/watchdog.pid`;
 var LAST_SEND_PATH = `${CC_DIR}/last-send`;
 var GONE_STRIKES_PATH = `${CC_DIR}/gone-strikes`;
 var GONE_STRIKE_LIMIT = 2;
+var NO_HOLD_PATH = `${CC_DIR}/no-hold`;
+async function flagExists(path) {
+  try {
+    await access(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+async function localApprovalsState(noHoldPath = NO_HOLD_PATH) {
+  return await flagExists(noHoldPath) ? "off" : "on";
+}
 var PENDING_STASH_FILE = "pending-event.json";
 var PENDING_STASH_PATH = `${CC_DIR}/${PENDING_STASH_FILE}`;
 var PAIR_HTML_FILE = "pair.html";
@@ -249,7 +261,7 @@ async function flushPendingStash(stashPath, url, pairingId, pcSecret, e2eKey, no
       try {
         const res = await fetchFn(`${url}/v1/cc/event`, {
           method: "POST",
-          headers: { "content-type": "application/json", "x-cc-pairing": pairingId, "x-cc-auth": pcSecret, "x-cc-version": PLUGIN_VERSION },
+          headers: { "content-type": "application/json", "x-cc-pairing": pairingId, "x-cc-auth": pcSecret, "x-cc-version": PLUGIN_VERSION, "x-cc-approvals": await localApprovalsState() },
           body: JSON.stringify(envelope),
           signal: AbortSignal.timeout(fetchTimeoutMs)
         });
@@ -1457,7 +1469,7 @@ async function reconcileProvisional(config, hookPid) {
     try {
       const res = await fetch(`${config.url}/v1/cc/event`, {
         method: "POST",
-        headers: { "content-type": "application/json", "x-cc-pairing": config.pairingId, "x-cc-auth": config.pcSecret, "x-cc-version": PLUGIN_VERSION },
+        headers: { "content-type": "application/json", "x-cc-pairing": config.pairingId, "x-cc-auth": config.pcSecret, "x-cc-version": PLUGIN_VERSION, "x-cc-approvals": await localApprovalsState() },
         body: JSON.stringify({ v: 2, sessionId: sentinel, op: "end", prio: 0, ts: Date.now() }),
         signal: AbortSignal.timeout(2000)
       });
@@ -1572,7 +1584,8 @@ async function runHook(agent) {
         "content-type": "application/json",
         "x-cc-pairing": config.pairingId,
         "x-cc-auth": config.pcSecret,
-        "x-cc-version": PLUGIN_VERSION
+        "x-cc-version": PLUGIN_VERSION,
+        "x-cc-approvals": await localApprovalsState()
       },
       body: JSON.stringify(envelope),
       signal: AbortSignal.timeout(2000)
@@ -1594,7 +1607,6 @@ async function runHook(agent) {
 }
 
 // src/core/permission.ts
-var NO_HOLD_PATH = `${CC_DIR}/no-hold`;
 var POLL_INTERVAL_MS = 3000;
 var FETCH_TIMEOUT_MS = 2000;
 var POST_TIMEOUT_MS = 15000;
@@ -1609,6 +1621,7 @@ function decisionLine(agent, hookSpecificOutput) {
 var ALLOW_HSO = { hookEventName: "PermissionRequest", decision: { behavior: "allow" } };
 var DENY_HSO = { hookEventName: "PermissionRequest", decision: { behavior: "deny", message: "Denied from phone" } };
 var DENY_MESSAGE_MAX = 500;
+var ANSWER_MAX = 500;
 function allowLine(agent, toolName, toolInput) {
   if (toolName === "ExitPlanMode") {
     return decisionLine(agent, { hookEventName: "PermissionRequest", decision: { behavior: "allow", updatedInput: toolInput } });
@@ -1625,6 +1638,54 @@ function allowAlwaysLine(agent, toolName, toolInput, suggestions) {
   const updatedPermissions = Array.isArray(suggestions) && suggestions.length > 0 ? suggestions : [{ type: "addRules", rules: [{ toolName }], behavior: "allow", destination: "session" }];
   const decision = toolName === "ExitPlanMode" ? { behavior: "allow", updatedInput: toolInput, updatedPermissions } : { behavior: "allow", updatedPermissions };
   return decisionLine(agent, { hookEventName: "PermissionRequest", decision });
+}
+function answerLine(agent, toolName, toolInput, answers) {
+  if (toolName !== "AskUserQuestion" || !Array.isArray(answers))
+    return;
+  const questions = usableQuestions(toolInput);
+  if (questions.length === 0)
+    return;
+  const map = {};
+  for (let i = 0;i < questions.length; i += 1) {
+    const a = answers[i];
+    if (typeof a !== "string")
+      continue;
+    const raw = a.trim();
+    if (raw.length === 0)
+      continue;
+    if (raw.length > ANSWER_MAX)
+      return;
+    const resolved = resolveAnswer(raw, questions[i].labels);
+    if (resolved === undefined)
+      return;
+    map[questions[i].text] = resolved;
+  }
+  if (Object.keys(map).length === 0)
+    return;
+  return decisionLine(agent, {
+    hookEventName: "PermissionRequest",
+    decision: { behavior: "allow", updatedInput: { ...toolInput, answers: map } }
+  });
+}
+function resolveAnswer(answer, labels) {
+  const matchOne = (piece) => {
+    const hits = Array.from(new Set(labels.filter((l) => l === piece || cap(l, QUESTION_LABEL_MAX) === piece)));
+    return hits.length === 1 ? hits[0] : undefined;
+  };
+  const whole = matchOne(answer);
+  if (whole !== undefined)
+    return whole;
+  const pieces = answer.split(",").map((p) => p.trim()).filter((p) => p.length > 0);
+  if (pieces.length === 0)
+    return;
+  const mapped = [];
+  for (const piece of pieces) {
+    const hit = matchOne(piece);
+    if (hit === undefined)
+      return;
+    mapped.push(hit);
+  }
+  return mapped.join(", ");
 }
 var TRACE_PATH = `${CC_DIR}/permission-trace.log`;
 var TRACE_MAX_BYTES = 256 * 1024;
@@ -1703,6 +1764,10 @@ function buildPermissionSummary(toolName, toolInput) {
     }
     case "ExitPlanMode":
       return "Approve Claude's plan";
+    case "AskUserQuestion": {
+      const q = str(firstQuestionText(toolInput));
+      return q ? truncate(q) : toolName;
+    }
     default: {
       if (/^mcp__/.test(toolName)) {
         const seg = toolName.split("__").pop();
@@ -1744,9 +1809,50 @@ function buildPermissionDetail(toolName, toolInput) {
       const p = str(toolInput.plan);
       return p ?? "";
     }
+    case "AskUserQuestion":
+      return "";
     default:
       return "";
   }
+}
+var QUESTION_TEXT_MAX = 240;
+var QUESTION_LABEL_MAX = 60;
+function cap(s, n) {
+  return s.length <= n ? s : `${s.slice(0, n - 1)}…`;
+}
+function usableQuestions(toolInput) {
+  const qs = toolInput.questions;
+  if (!Array.isArray(qs))
+    return [];
+  const out = [];
+  for (const raw of qs) {
+    const text = typeof raw?.question === "string" ? raw.question : "";
+    if (text.length === 0)
+      continue;
+    const labels = [];
+    if (Array.isArray(raw?.options)) {
+      for (const opt of raw.options) {
+        const label = opt?.label;
+        if (typeof label === "string" && label.length > 0)
+          labels.push(label);
+      }
+    }
+    if (labels.length === 0)
+      continue;
+    out.push({ text, raw, labels });
+  }
+  return out;
+}
+function firstQuestionText(toolInput) {
+  return usableQuestions(toolInput)[0]?.text ?? "";
+}
+function buildPermissionQuestions(toolInput) {
+  return usableQuestions(toolInput).map(({ text, raw, labels }) => ({
+    q: cap(text, QUESTION_TEXT_MAX),
+    ...typeof raw?.header === "string" && raw.header.length > 0 ? { h: raw.header } : {},
+    ...raw?.multiSelect === true ? { m: true } : {},
+    o: labels.map((l) => cap(l, QUESTION_LABEL_MAX))
+  }));
 }
 var MAX_BLOB_CHARS = 3072;
 var BLOB_FIT_MARGIN = 64;
@@ -1755,17 +1861,20 @@ var MAX_DETAIL_CHARS = 20000;
 function sealedBlobChars(plaintextBytes) {
   return Math.ceil((12 + plaintextBytes + 16) / 3) * 4;
 }
-function fitPermissionDetail(base, detail, maxChars = BLOB_FIT_CHARS) {
+function fitPermissionDetail(base, detail, maxChars = BLOB_FIT_CHARS, questions = []) {
   const all = Array.from(detail);
   const hardLoss = Math.max(0, all.length - MAX_DETAIL_CHARS);
   const chars = hardLoss > 0 ? all.slice(0, MAX_DETAIL_CHARS) : all;
   const encoder = new TextEncoder;
-  const frameChars = (d, omitted) => sealedBlobChars(encoder.encode(JSON.stringify(permissionFrame(base, d, omitted))).length);
-  if (chars.length === 0)
-    return { detail: "", omitted: 0 };
-  if (hardLoss === 0 && frameChars(detail, 0) <= maxChars)
-    return { detail, omitted: 0 };
+  const measure = (d, omitted, qs) => sealedBlobChars(encoder.encode(JSON.stringify(permissionFrame(base, d, omitted, qs))).length);
   const worstCase = all.length;
+  const kept = questions.length > 0 && measure("", worstCase, questions) <= maxChars ? questions : [];
+  const tail = kept.length > 0 ? { questions: kept } : {};
+  const frameChars = (d, omitted) => measure(d, omitted, kept);
+  if (chars.length === 0)
+    return { detail: "", omitted: 0, ...tail };
+  if (hardLoss === 0 && frameChars(detail, 0) <= maxChars)
+    return { detail, omitted: 0, ...tail };
   let lo = 0;
   let hi = chars.length - 1;
   while (lo < hi) {
@@ -1775,32 +1884,58 @@ function fitPermissionDetail(base, detail, maxChars = BLOB_FIT_CHARS) {
     else
       hi = mid - 1;
   }
-  return { detail: `${chars.slice(0, lo).join("")}…`, omitted: all.length - lo };
+  const shortest = `${chars.slice(0, lo).join("")}…`;
+  if (lo === 0 && frameChars(shortest, worstCase) > maxChars) {
+    if (frameChars("", all.length) <= maxChars)
+      return { detail: "", omitted: all.length, ...tail };
+    return { detail: "", omitted: 0, ...tail };
+  }
+  return { detail: shortest, omitted: all.length - lo, ...tail };
 }
-function permissionFrame(base, detail, omitted) {
+function permissionFrame(base, detail, omitted, questions = []) {
   return {
     ...base,
     ...detail.length > 0 ? { permissionDetail: detail } : {},
-    ...omitted > 0 ? { permissionDetailOmitted: omitted } : {}
+    ...omitted > 0 ? { permissionDetailOmitted: omitted } : {},
+    ...questions.length > 0 ? { permissionQuestions: questions } : {}
   };
 }
 function emitDecision(agent, answer, toolName, toolInput, suggestions, emit, trace) {
+  const isQuestion = toolName === "AskUserQuestion";
   switch (answer.decision) {
     case "allow":
+      if (isQuestion) {
+        trace({ event: "release", reason: "bare-allow-on-question" });
+        return "released";
+      }
       emit(allowLine(agent, toolName, toolInput));
       trace({ event: "emit", decision: "allow" });
-      return false;
+      return "emitted";
     case "allow_always":
+      if (isQuestion) {
+        trace({ event: "release", reason: "bare-allow-on-question" });
+        return "released";
+      }
       emit(allowAlwaysLine(agent, toolName, toolInput, suggestions));
       trace({ event: "emit", decision: "allow_always" });
-      return false;
+      return "emitted";
     case "deny":
       emit(denyLine(agent, answer.message));
       trace({ event: "emit", decision: "deny", hasMessage: typeof answer.message === "string" && answer.message.trim().length > 0 });
-      return false;
+      return "emitted";
+    case "answer": {
+      const line = answerLine(agent, toolName, toolInput, answer.answers);
+      if (line === undefined) {
+        trace({ event: "release", reason: "answer-unmappable", tool_name: toolName });
+        return "released";
+      }
+      emit(line);
+      trace({ event: "emit", decision: "answer" });
+      return "emitted";
+    }
     default:
       trace({ event: "answer-unknown-decision" });
-      return true;
+      return "keep-polling";
   }
 }
 async function readStdin2() {
@@ -1808,14 +1943,6 @@ async function readStdin2() {
   for await (const chunk of process.stdin)
     chunks.push(chunk);
   return Buffer.concat(chunks).toString("utf8");
-}
-async function flagExists(path) {
-  try {
-    await access(path);
-    return true;
-  } catch {
-    return false;
-  }
 }
 async function runPermissionHook(deps = {}, agent = "claude") {
   const noHoldPath = deps.noHoldPath ?? NO_HOLD_PATH;
@@ -1853,11 +1980,6 @@ async function runPermissionHook(deps = {}, agent = "claude") {
       trace({ event: "exit", reason: "mode", mode: permissionMode });
       return;
     }
-    if (toolName === "AskUserQuestion") {
-      trace({ event: "exit", reason: "question-passthrough" });
-      await (deps.delegate ?? (() => runHook(agent)))();
-      return;
-    }
     const toolInput = typeof input.tool_input === "object" && input.tool_input !== null ? input.tool_input : {};
     const suggestions = input.permission_suggestions;
     const requestId = (deps.randomUUID ?? (() => crypto.randomUUID()))();
@@ -1875,8 +1997,8 @@ async function runPermissionHook(deps = {}, agent = "claude") {
       permissionRequestId: requestId,
       permissionToolName: toolName
     };
-    const fitted = fitPermissionDetail(permissionBase, buildPermissionDetail(toolName, toolInput));
-    const blob = await encryptBlob(config.e2eKey, permissionFrame(permissionBase, fitted.detail, fitted.omitted));
+    const fitted = fitPermissionDetail(permissionBase, buildPermissionDetail(toolName, toolInput), BLOB_FIT_CHARS, buildPermissionQuestions(toolInput));
+    const blob = await encryptBlob(config.e2eKey, permissionFrame(permissionBase, fitted.detail, fitted.omitted, fitted.questions));
     const fallbackBlob = await encryptBlob(config.e2eKey, base);
     const pcHeaders = { "x-cc-pairing": config.pairingId, "x-cc-auth": config.pcSecret, "x-cc-version": PLUGIN_VERSION };
     const sleep = deps.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
@@ -1961,9 +2083,9 @@ async function runPermissionHook(deps = {}, agent = "claude") {
         if (data.status === "answered" && typeof data.answerBlob === "string") {
           const answer = await decryptBlob(config.e2eKey, data.answerBlob);
           const match = answer.requestId === requestId;
-          const keepPolling = match && emitDecision(agent, answer, toolName, toolInput, suggestions, emit, trace);
-          if (!keepPolling) {
-            trace({ event: "answered", match });
+          const outcome = match ? emitDecision(agent, answer, toolName, toolInput, suggestions, emit, trace) : "released";
+          if (outcome !== "keep-polling") {
+            trace({ event: "answered", match, outcome });
             trace({ event: "exit", reason: "answered" });
             return;
           }
@@ -1986,14 +2108,6 @@ async function runPermissionHook(deps = {}, agent = "claude") {
 async function approvalsCommand(sub, deps = {}) {
   const path = deps.noHoldPath ?? NO_HOLD_PATH;
   const print = deps.print ?? ((line) => console.log(line));
-  const exists = async () => {
-    try {
-      await access(path);
-      return true;
-    } catch {
-      return false;
-    }
-  };
   if (sub === "off") {
     await atomicWrite(path, "", 384);
     print("Remote approvals are OFF for this computer — Claude Code permission prompts will appear in the terminal as usual (your phone is not asked).");
@@ -2004,7 +2118,7 @@ async function approvalsCommand(sub, deps = {}) {
     print("Remote approvals are ON for this computer — when a session is on your phone's Live Activity, its permission prompts are sent to the phone to Allow or Deny.");
     return 0;
   }
-  print(await exists() ? "Remote approvals: OFF (paused locally) — permission prompts appear in the terminal. Run `on` to resume." : "Remote approvals: ON — permission prompts for phone-attached sessions are sent to your phone. Run `off` to pause them here.");
+  print(await flagExists(path) ? "Remote approvals: OFF (paused locally) — permission prompts appear in the terminal. Run `on` to resume." : "Remote approvals: ON — permission prompts for phone-attached sessions are sent to your phone. Run `off` to pause them here.");
   return 0;
 }
 

@@ -12,7 +12,7 @@ import { promisify } from "node:util";
 import { basename, join as join2 } from "node:path";
 
 // src/core/shared.ts
-import { chmod, open, readFile, rename, stat, mkdir, unlink, writeFile } from "node:fs/promises";
+import { access, chmod, open, readFile, rename, stat, mkdir, unlink, writeFile } from "node:fs/promises";
 import { existsSync, readFileSync } from "node:fs";
 import { execFileSync, spawn } from "node:child_process";
 import { dirname, join } from "node:path";
@@ -92,13 +92,25 @@ async function sha256Hex(s) {
 }
 
 // src/core/shared.ts
-var PLUGIN_VERSION = "1.2.2";
+var PLUGIN_VERSION = "1.3.0";
 var CC_DIR = `${process.env.HOME}/.config/cc-status`;
 var SESSIONS_DIR = `${CC_DIR}/sessions`;
 var WATCHDOG_PID_PATH = `${CC_DIR}/watchdog.pid`;
 var LAST_SEND_PATH = `${CC_DIR}/last-send`;
 var GONE_STRIKES_PATH = `${CC_DIR}/gone-strikes`;
 var GONE_STRIKE_LIMIT = 2;
+var NO_HOLD_PATH = `${CC_DIR}/no-hold`;
+async function flagExists(path) {
+  try {
+    await access(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+async function localApprovalsState(noHoldPath = NO_HOLD_PATH) {
+  return await flagExists(noHoldPath) ? "off" : "on";
+}
 var PENDING_STASH_FILE = "pending-event.json";
 var PENDING_STASH_PATH = `${CC_DIR}/${PENDING_STASH_FILE}`;
 var PAIR_HTML_FILE = "pair.html";
@@ -244,7 +256,7 @@ async function flushPendingStash(stashPath, url, pairingId, pcSecret, e2eKey, no
       try {
         const res = await fetchFn(`${url}/v1/cc/event`, {
           method: "POST",
-          headers: { "content-type": "application/json", "x-cc-pairing": pairingId, "x-cc-auth": pcSecret, "x-cc-version": PLUGIN_VERSION },
+          headers: { "content-type": "application/json", "x-cc-pairing": pairingId, "x-cc-auth": pcSecret, "x-cc-version": PLUGIN_VERSION, "x-cc-approvals": await localApprovalsState() },
           body: JSON.stringify(envelope),
           signal: AbortSignal.timeout(fetchTimeoutMs)
         });
@@ -1455,7 +1467,7 @@ async function reconcileProvisional(config, hookPid) {
     try {
       const res = await fetch(`${config.url}/v1/cc/event`, {
         method: "POST",
-        headers: { "content-type": "application/json", "x-cc-pairing": config.pairingId, "x-cc-auth": config.pcSecret, "x-cc-version": PLUGIN_VERSION },
+        headers: { "content-type": "application/json", "x-cc-pairing": config.pairingId, "x-cc-auth": config.pcSecret, "x-cc-version": PLUGIN_VERSION, "x-cc-approvals": await localApprovalsState() },
         body: JSON.stringify({ v: 2, sessionId: sentinel, op: "end", prio: 0, ts: Date.now() }),
         signal: AbortSignal.timeout(2000)
       });
@@ -1570,7 +1582,8 @@ async function runHook(agent) {
         "content-type": "application/json",
         "x-cc-pairing": config.pairingId,
         "x-cc-auth": config.pcSecret,
-        "x-cc-version": PLUGIN_VERSION
+        "x-cc-version": PLUGIN_VERSION,
+        "x-cc-approvals": await localApprovalsState()
       },
       body: JSON.stringify(envelope),
       signal: AbortSignal.timeout(2000)
@@ -1680,7 +1693,8 @@ async function runNotify(raw, deferMs = notifyDeferMs(), sleep = (ms) => new Pro
         "content-type": "application/json",
         "x-cc-pairing": config.pairingId,
         "x-cc-auth": config.pcSecret,
-        "x-cc-version": PLUGIN_VERSION
+        "x-cc-version": PLUGIN_VERSION,
+        "x-cc-approvals": await localApprovalsState()
       },
       body: JSON.stringify(envelope),
       signal: AbortSignal.timeout(2000)
