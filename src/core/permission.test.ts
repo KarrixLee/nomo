@@ -3,8 +3,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "bun:test";
 import {
-  buildPermissionSummary, buildPermissionDetail, fitPermissionDetail, sealedBlobChars, BLOB_FIT_CHARS,
-  runPermissionHook, approvalsCommand, NO_HOLD_PATH, TRACE_PATH,
+  buildPermissionSummary, buildPermissionDetail, buildPermissionQuestions, fitPermissionDetail,
+  sealedBlobChars, BLOB_FIT_CHARS, runPermissionHook, approvalsCommand, NO_HOLD_PATH, TRACE_PATH,
 } from "./permission";
 import { encryptBlob, decryptBlob } from "./crypto";
 import type { Config } from "./shared";
@@ -129,6 +129,91 @@ describe("buildPermissionDetail — codex tools", () => {
   test("codex tools with missing fields → empty string (omitted from the blob)", () => {
     expect(buildPermissionDetail("shell", {})).toBe("");
     expect(buildPermissionDetail("apply_patch", {})).toBe("");
+  });
+});
+
+// ---- question builder (pure) — the option list that rides the blob so the phone can ANSWER -------
+//
+// AskUserQuestion is held like every other tool now (the old question-passthrough gate is gone): the
+// choices travel INSIDE the sealed blob under compact keys (q/h/m/o) to spend as little of the
+// 3072-char ceiling as possible, and option `description`s are dropped outright (the phone shows
+// labels only, and a description is the single fattest thing CC puts in that payload).
+
+const CC_QUESTIONS = [
+  {
+    question: "Which testing approach should I use for the new parser?",
+    header: "Testing",
+    multiSelect: false,
+    options: [
+      { label: "Unit tests only", description: "Fast and isolated; misses wiring bugs." },
+      { label: "Integration tests", description: "Slower but exercises the real pipeline." },
+    ],
+  },
+];
+
+describe("buildPermissionQuestions", () => {
+  test("a real CC payload → compact {q,h,m,o} entries with descriptions DROPPED", () => {
+    expect(buildPermissionQuestions({ questions: CC_QUESTIONS })).toEqual([
+      {
+        q: "Which testing approach should I use for the new parser?",
+        h: "Testing",
+        o: ["Unit tests only", "Integration tests"],
+      },
+    ]);
+  });
+
+  test("multiSelect true → m:true (absent when false, per the omit-empty discipline)", () => {
+    const [one] = buildPermissionQuestions({
+      questions: [{ question: "Pick some", multiSelect: true, options: [{ label: "A" }, { label: "B" }] }],
+    });
+    expect(one).toEqual({ q: "Pick some", m: true, o: ["A", "B"] });
+    const [two] = buildPermissionQuestions({
+      questions: [{ question: "Pick one", multiSelect: false, options: [{ label: "A" }, { label: "B" }] }],
+    });
+    expect("m" in two).toBe(false);
+  });
+
+  test("question text capped at 240 chars, each label at 60", () => {
+    const [q] = buildPermissionQuestions({
+      questions: [{ question: "z".repeat(600), options: [{ label: "L".repeat(300) }, { label: "ok" }] }],
+    });
+    expect(q.q.length).toBe(240);
+    expect(q.o[0].length).toBe(60);
+    expect(q.o[1]).toBe("ok");
+  });
+
+  test("a non-question tool (no questions array) → []", () => {
+    expect(buildPermissionQuestions({ command: "rm -rf build" })).toEqual([]);
+    expect(buildPermissionQuestions({})).toEqual([]);
+    expect(buildPermissionQuestions({ questions: "nope" })).toEqual([]);
+  });
+
+  test("malformed entries are skipped, never thrown on", () => {
+    expect(buildPermissionQuestions({
+      questions: [null, { options: [{ label: "A" }] }, { question: "Real?", options: [{ label: "A" }, "junk"] }],
+    })).toEqual([{ q: "Real?", o: ["A"] }]);
+  });
+});
+
+describe("buildPermissionSummary / buildPermissionDetail — AskUserQuestion", () => {
+  test("summary → the first question's text, truncated to <=80", () => {
+    expect(buildPermissionSummary("AskUserQuestion", { questions: CC_QUESTIONS }))
+      .toBe("Which testing approach should I use for the new parser?");
+    const out = buildPermissionSummary("AskUserQuestion", { questions: [{ question: "q".repeat(200), options: [] }] });
+    expect(out.length).toBe(80);
+    expect(out.endsWith("…")).toBe(true);
+  });
+
+  test("detail → the first question's FULL text (the card's hero line)", () => {
+    expect(buildPermissionDetail("AskUserQuestion", { questions: CC_QUESTIONS }))
+      .toBe("Which testing approach should I use for the new parser?");
+    expect(buildPermissionDetail("AskUserQuestion", { questions: [{ question: "q".repeat(900), options: [] }] }).length)
+      .toBe(900);
+  });
+
+  test("no questions → summary falls back to the tool name, detail is empty", () => {
+    expect(buildPermissionSummary("AskUserQuestion", {})).toBe("AskUserQuestion");
+    expect(buildPermissionDetail("AskUserQuestion", {})).toBe("");
   });
 });
 
@@ -809,35 +894,220 @@ describe("runPermissionHook — decision blob detail fields", () => {
   });
 });
 
-// ---- AskUserQuestion pass-through (a bare Allow/Deny card is the wrong surface for a question) -----
+// ---- AskUserQuestion HOLDS and is answered from the phone -----------------------------------
+//
+// The old question-passthrough gate (a buzz on the phone, answer at the Mac) is GONE: a question now
+// holds like every other tool, its options ride the sealed blob, and the phone's `answer` verb injects
+// the selection through `updatedInput`. The injection contract was verified against the shipped CC
+// bundle (v2.1.219): `updatedInput` is what makes CC skip its own interactive ask for the three tools
+// that declare requiresUserInteraction() — AskUserQuestion, ExitPlanMode and the Cowork role picker —
+// the input is a strictObject (only questions/answers/annotations/metadata, questions required), and
+// `answers` is keyed by QUESTION TEXT valued by an option LABEL. A multi-select answer is the labels
+// pre-joined as "A, B" (CC's schema pre-processes that form).
+//
+// SAFETY: on CC's HEADLESS path a bare {behavior:"allow"} on AskUserQuestion converts to a hard DENY.
+// So an `answer` that cannot be turned into a valid answers map must emit NOTHING and keep polling —
+// never a bare allow.
 
-describe("runPermissionHook — AskUserQuestion pass-through", () => {
-  test("tool_name AskUserQuestion → delegates (fire-and-forget attention), NO POST, nothing on stdout", async () => {
-    const spy = spyFetch();
-    const emitted: string[] = [];
-    let delegated = false;
-    const events: Array<{ event: string; reason?: string }> = [];
-    await runPermissionHook(baseDeps({
-      readInput: async () => inputWith({ tool_name: "AskUserQuestion" }),
-      fetchFn: spy.fn, emit: (l: string) => emitted.push(l),
-      delegate: async () => { delegated = true; },
-      trace: (e: { event: string; reason?: string }) => events.push(e),
-    }) as never);
-    expect(delegated).toBe(true);          // reused the exact no-hold delegate
-    expect(spy.called()).toBe(false);      // never POSTed a decision — questions are not held
-    expect(emitted).toEqual([]);           // no stdout
-    expect(events.at(-1)).toMatchObject({ event: "exit", reason: "question-passthrough" });
+describe("runPermissionHook — AskUserQuestion holds", () => {
+  const questionInput = (questions: unknown = CC_QUESTIONS) => JSON.stringify({
+    session_id: "sess-1", hook_event_name: "PermissionRequest",
+    tool_name: "AskUserQuestion", tool_input: { questions },
+    cwd: "/Users/x/proj", transcript_path: "/tmp/t.jsonl",
   });
 
-  test("AskUserQuestion in an AUTO mode → the mode gate fires FIRST (no delegate, no POST)", async () => {
-    const spy = spyFetch();
-    let delegated = false;
+  /** Hold a question, then answer it; returns the emitted stdout lines + the fetch calls. */
+  const answerQuestion = async (answer: Record<string, unknown>, over: Record<string, unknown> = {}, agent?: "codex") => {
+    const answerBlob = await encryptBlob(KEY, { requestId: "req-fixed", ts: 5, ...answer });
+    const emitted: string[] = [];
+    const { fn, calls } = scriptFetch(true, [{ status: "answered", answerBlob }]);
+    const deps = baseDeps({
+      fetchFn: fn, emit: (l: string) => emitted.push(l), readInput: async () => questionInput(), ...over,
+    }) as never;
+    await (agent ? runPermissionHook(deps, agent) : runPermissionHook(deps));
+    return { emitted, calls };
+  };
+
+  test("tool_name AskUserQuestion → HOLDS (POSTs a decision, never delegates)", async () => {
+    const { fn, calls } = scriptFetch(false, []);
+    const emitted: string[] = [];
     await runPermissionHook(baseDeps({
-      readInput: async () => inputWith({ tool_name: "AskUserQuestion", permission_mode: "auto" }),
-      fetchFn: spy.fn, emit: () => {},
-      delegate: async () => { delegated = true; },
+      fetchFn: fn, emit: (l: string) => emitted.push(l), readInput: async () => questionInput(),
+      delegate: async () => { throw new Error("delegate must not run for a question"); },
     }) as never);
-    expect(delegated).toBe(false);         // mode gate returns before the question gate is reached
+    expect(calls.filter((c) => c.method === "POST").length).toBeGreaterThan(0);
+    expect(emitted).toEqual([]);
+  });
+
+  test("the blob carries permissionQuestions LAST, options intact", async () => {
+    const { fn, calls } = scriptFetch(false, []);
+    await runPermissionHook(baseDeps({ fetchFn: fn, emit: () => {}, readInput: async () => questionInput() }) as never);
+    const body = JSON.parse(calls.find((c) => c.method === "POST")!.body!);
+    const blob = (await decryptBlob(KEY, body.blob)) as Record<string, unknown>;
+    expect(blob.permissionToolName).toBe("AskUserQuestion");
+    expect(blob.permissionSummary).toBe("Which testing approach should I use for the new parser?");
+    expect(blob.permissionQuestions).toEqual([
+      {
+        q: "Which testing approach should I use for the new parser?",
+        h: "Testing",
+        o: ["Unit tests only", "Integration tests"],
+      },
+    ]);
+    expect(Object.keys(blob).at(-1)).toBe("permissionQuestions"); // append-last wire discipline
+    expect(body.blob.length).toBeLessThanOrEqual(3072);
+  });
+
+  test("a truncated detail keeps the FROZEN order: …permissionDetailOmitted, THEN permissionQuestions", async () => {
+    const { fn, calls } = scriptFetch(false, []);
+    await runPermissionHook(baseDeps({
+      fetchFn: fn, emit: () => {},
+      readInput: async () => questionInput([{ question: "q".repeat(9000), options: [{ label: "A" }, { label: "B" }] }]),
+    }) as never);
+    const body = JSON.parse(calls.find((c) => c.method === "POST")!.body!);
+    const blob = (await decryptBlob(KEY, body.blob)) as Record<string, unknown>;
+    expect(Object.keys(blob).slice(-6)).toEqual([
+      "permissionSummary", "permissionRequestId", "permissionToolName",
+      "permissionDetail", "permissionDetailOmitted", "permissionQuestions",
+    ]);
+    expect(body.blob.length).toBeLessThanOrEqual(3072);
+  });
+
+  test("questions too fat for the frame → permissionQuestions OMITTED entirely, the hold still posts", async () => {
+    // CC's own worst case: 4 questions × 4 options, each at the cap. The whole field is dropped (never a
+    // partial list — a half-shown option list would be a lie) and the phone shows the read-only prompt.
+    const fat = Array.from({ length: 4 }, (_, i) => ({
+      question: `${i}`.repeat(1) + "Q".repeat(400),
+      header: "Header12chr",
+      multiSelect: true,
+      options: Array.from({ length: 4 }, (_, j) => ({ label: `${j}` + "L".repeat(200), description: "d".repeat(300) })),
+    }));
+    const { fn, calls } = scriptFetch(false, []);
+    await runPermissionHook(baseDeps({
+      fetchFn: fn, emit: () => {},
+      readRecordFn: async () => ({ pid: 1, machine: "m", label: "api-status", title: "y".repeat(120), ts: 1000 }),
+      readInput: async () => questionInput(fat),
+    }) as never);
+    const body = JSON.parse(calls.find((c) => c.method === "POST")!.body!);
+    const blob = (await decryptBlob(KEY, body.blob)) as Record<string, unknown>;
+    expect("permissionQuestions" in blob).toBe(false);
+    expect(blob.permissionToolName).toBe("AskUserQuestion"); // the hold itself is unaffected
+    expect(body.blob.length).toBeLessThanOrEqual(3072);
+  });
+
+  test("answer → allow + updatedInput echoing questions VERBATIM plus an answers map (the exact wire)", async () => {
+    const { emitted } = await answerQuestion({ decision: "answer", answers: ["Unit tests only"] });
+    expect(emitted).toEqual([JSON.stringify({
+      hookSpecificOutput: {
+        hookEventName: "PermissionRequest",
+        decision: {
+          behavior: "allow",
+          updatedInput: {
+            questions: CC_QUESTIONS,
+            answers: { "Which testing approach should I use for the new parser?": "Unit tests only" },
+          },
+        },
+      },
+    })]);
+    const updatedInput = JSON.parse(emitted[0]).hookSpecificOutput.decision.updatedInput;
+    expect(updatedInput.questions).toEqual(CC_QUESTIONS);                  // byte-for-byte echo
+    expect(Object.keys(updatedInput).sort()).toEqual(["answers", "questions"]); // strictObject trap
+  });
+
+  test("multi-select → the pre-joined 'A, B' string rides through verbatim", async () => {
+    const { emitted } = await answerQuestion({ decision: "answer", answers: ["Unit tests only, Integration tests"] });
+    const updatedInput = JSON.parse(emitted[0]).hookSpecificOutput.decision.updatedInput;
+    expect(updatedInput.answers).toEqual({
+      "Which testing approach should I use for the new parser?": "Unit tests only, Integration tests",
+    });
+  });
+
+  test("multi-question → answers zip BY INDEX, in the original question order; empties are skipped", async () => {
+    const qs = [
+      { question: "First?", options: [{ label: "A" }, { label: "B" }] },
+      { question: "Second?", options: [{ label: "C" }, { label: "D" }] },
+    ];
+    const { emitted } = await answerQuestion(
+      { decision: "answer", answers: ["B", ""] },
+      { readInput: async () => questionInput(qs) },
+    );
+    const updatedInput = JSON.parse(emitted[0]).hookSpecificOutput.decision.updatedInput;
+    expect(updatedInput.questions).toEqual(qs);
+    expect(updatedInput.answers).toEqual({ "First?": "B" }); // the unanswered question is simply absent
+  });
+
+  test("a SKIPPED malformed question can't shift the mapping — answers zip against what the phone was shown", async () => {
+    // buildPermissionQuestions and answerLine derive from the same usable-question filter, so the
+    // phone's answers[0] belongs to the first question it actually SAW, not to the dropped entry.
+    const qs = [{ options: [{ label: "X" }] }, { question: "Real?", options: [{ label: "A" }, { label: "B" }] }];
+    const { emitted } = await answerQuestion(
+      { decision: "answer", answers: ["A"] },
+      { readInput: async () => questionInput(qs) },
+    );
+    const updatedInput = JSON.parse(emitted[0]).hookSpecificOutput.decision.updatedInput;
+    expect(updatedInput.questions).toEqual(qs);       // still echoed verbatim, malformed entry and all
+    expect(updatedInput.answers).toEqual({ "Real?": "A" });
+  });
+
+  test("codex agent → the same line, wrapped in continue:true", async () => {
+    const { emitted } = await answerQuestion({ decision: "answer", answers: ["Unit tests only"] }, {}, "codex");
+    const parsed = JSON.parse(emitted[0]);
+    expect(parsed.continue).toBe(true);
+    expect(parsed.hookSpecificOutput.decision).toEqual({
+      behavior: "allow",
+      updatedInput: {
+        questions: CC_QUESTIONS,
+        answers: { "Which testing approach should I use for the new parser?": "Unit tests only" },
+      },
+    });
+  });
+
+  for (const [name, answer] of [
+    ["an EMPTY answers array", { decision: "answer", answers: [] }],
+    ["answers that map to nothing", { decision: "answer", answers: ["", "   "] }],
+    ["a missing answers key", { decision: "answer" }],
+    ["a non-array answers value", { decision: "answer", answers: "Unit tests only" }],
+    ["non-string answer elements", { decision: "answer", answers: [{ label: "Unit tests only" }] }],
+  ] as Array<[string, Record<string, unknown>]>) {
+    test(`FAIL-SAFE: ${name} → emits NOTHING and keeps polling (a bare allow would be a headless DENY)`, async () => {
+      const answerBlob = await encryptBlob(KEY, { requestId: "req-fixed", ts: 5, ...answer });
+      const allowBlob = await encryptBlob(KEY, { requestId: "req-fixed", ts: 6, decision: "deny" });
+      const emitted: string[] = [];
+      const { fn, calls } = scriptFetch(true, [
+        { status: "answered", answerBlob },
+        { status: "answered", answerBlob: allowBlob },
+      ]);
+      await runPermissionHook(baseDeps({
+        fetchFn: fn, emit: (l: string) => emitted.push(l), readInput: async () => questionInput(),
+      }) as never);
+      expect(emitted).toEqual([DENY]);                                // only the LATER real answer
+      expect(calls.filter((c) => c.method === "GET").length).toBe(2);  // kept polling past the unusable one
+    });
+  }
+
+  test("FAIL-SAFE: `answer` on a NON-question tool → emits NOTHING and keeps polling", async () => {
+    const answerBlob = await encryptBlob(KEY, { requestId: "req-fixed", ts: 5, decision: "answer", answers: ["yes"] });
+    const denyBlob = await encryptBlob(KEY, { requestId: "req-fixed", ts: 6, decision: "deny" });
+    const emitted: string[] = [];
+    const { fn, calls } = scriptFetch(true, [
+      { status: "answered", answerBlob },
+      { status: "answered", answerBlob: denyBlob },
+    ]);
+    await runPermissionHook(baseDeps({ fetchFn: fn, emit: (l: string) => emitted.push(l) }) as never); // INPUT = Bash
+    expect(emitted).toEqual([DENY]);
+    expect(calls.filter((c) => c.method === "GET").length).toBe(2);
+  });
+
+  test("an old phone's plain `allow` on a question still emits the frozen bare allow (honest degradation)", async () => {
+    const { emitted } = await answerQuestion({ decision: "allow" });
+    expect(emitted).toEqual([ALLOW]); // CC's interactive path just re-shows the terminal picker
+  });
+
+  test("AskUserQuestion in an AUTO mode → the mode gate still fires FIRST (no POST at all)", async () => {
+    const spy = spyFetch();
+    await runPermissionHook(baseDeps({
+      readInput: async () => JSON.stringify({ ...JSON.parse(questionInput()), permission_mode: "auto" }),
+      fetchFn: spy.fn, emit: () => {},
+    }) as never);
     expect(spy.called()).toBe(false);
   });
 });

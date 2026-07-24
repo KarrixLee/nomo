@@ -121,6 +121,48 @@ function allowAlwaysLine(agent: AgentKind, toolName: string, toolInput: Record<s
   return decisionLine(agent, { hookEventName: "PermissionRequest", decision });
 }
 
+/** Allow + the phone's ANSWER to an AskUserQuestion, injected through `updatedInput`.
+ *
+ *  Verified against the shipped Claude Code bundle (v2.1.219, same code in 2.1.214+): the decision path
+ *  drops a bare allow for any tool whose `requiresUserInteraction()` is true — AskUserQuestion,
+ *  ExitPlanMode and the Cowork role picker — and falls through to the interactive picker. Supplying
+ *  `updatedInput` is what makes CC skip its own ask and run the tool with OUR input; AskUserQuestion's
+ *  schema declares `answers` ("User answers collected by the permission component"), so the tool body is
+ *  then a pass-through. Two load-bearing details: the input is a `strictObject` (only questions/answers/
+ *  annotations/metadata, `questions` required) — so the original tool_input is echoed VERBATIM and only
+ *  `answers` is added — and the map is keyed by QUESTION TEXT, valued by an option LABEL. Multi-select
+ *  needs no special case: CC's schema pre-processes the "A, B" joined form, which is exactly what the
+ *  phone sends for a multi-select question.
+ *
+ *  FAIL-SAFE (the reason this returns `undefined` instead of degrading): on CC's HEADLESS path a bare
+ *  {behavior:"allow"} on these tools converts to a hard DENY. So anything we cannot turn into a real
+ *  answers map — a non-question tool, a missing/!array/empty `answers`, entries that zip to nothing —
+ *  must emit NOTHING and keep polling, exactly like an unknown decision verb. Never a bare allow. */
+function answerLine(
+  agent: AgentKind,
+  toolName: string,
+  toolInput: Record<string, unknown>,
+  answers: unknown,
+): string | undefined {
+  if (toolName !== "AskUserQuestion" || !Array.isArray(answers)) return undefined;
+  // Zipped against the SAME usable-question list that built `permissionQuestions`, so index i of the
+  // phone's array is index i of what the phone was SHOWN — a skipped malformed entry can never shift
+  // the mapping. The key is the ORIGINAL, untruncated question text (the blob's copy may be capped).
+  const questions = usableQuestions(toolInput);
+  if (questions.length === 0) return undefined;
+  const map: Record<string, string> = {};
+  questions.forEach(({ text }, i) => {
+    const a = answers[i];
+    if (typeof a !== "string" || a.trim().length === 0) return; // unanswered → simply absent from the map
+    map[text] = a; // the label (or the pre-joined "A, B" for multi-select) rides through verbatim
+  });
+  if (Object.keys(map).length === 0) return undefined; // nothing mappable → keep polling, never a bare allow
+  return decisionLine(agent, {
+    hookEventName: "PermissionRequest",
+    decision: { behavior: "allow", updatedInput: { ...toolInput, answers: map } },
+  });
+}
+
 // ---- operational trace ---------------------------------------------------------------------
 //
 // The hold hook is a long-lived, silent process: when the terminal (or Claude Code) kills it, the
@@ -217,6 +259,12 @@ export function buildPermissionSummary(toolName: string, toolInput: Record<strin
     // 2.1.216): the summary is a fixed prompt — the plan markdown itself rides in the detail field.
     case "ExitPlanMode":
       return "Approve Claude's plan";
+    // AskUserQuestion holds like any other tool now: the summary is the FIRST question's text (CC sends
+    // 1–4; the phone's card leads with it), the option list rides separately in `permissionQuestions`.
+    case "AskUserQuestion": {
+      const q = str(firstQuestionText(toolInput));
+      return q ? truncate(q) : toolName;
+    }
     default: {
       if (/^mcp__/.test(toolName)) {
         const seg = toolName.split("__").pop();
@@ -246,8 +294,77 @@ export function buildPermissionDetail(toolName: string, toolInput: Record<string
     case "WebFetch": { const u = str(toolInput.url); return u ?? ""; }
     case "WebSearch": { const q = str(toolInput.query); return q ?? ""; }
     case "ExitPlanMode": { const p = str(toolInput.plan); return p ?? ""; }
+    // The first question's FULL text — the card's hero line (the summary caps it at 80).
+    case "AskUserQuestion": { const q = str(firstQuestionText(toolInput)); return q ?? ""; }
     default: return "";
   }
+}
+
+/** One question as it rides the sealed blob: compact keys to spend as little of the 3072-char ceiling
+ *  as possible — q(uestion), h(eader), m(ultiSelect), o(ption labels). Mirrored 1:1 by the phone. */
+export interface PermissionQuestion {
+  q: string;
+  h?: string;
+  m?: boolean;
+  o: string[];
+}
+
+/** Longest question text kept in the blob (display only — the answers map is keyed by the ORIGINAL,
+ *  untruncated text, so a capped question can still be answered). */
+const QUESTION_TEXT_MAX = 240;
+/** Longest option label kept in the blob. */
+const QUESTION_LABEL_MAX = 60;
+
+/** One raw CC question, narrowed. */
+type RawQuestion = { question?: unknown; header?: unknown; multiSelect?: unknown; options?: unknown } | null;
+
+/** The questions CC actually sent that we can show, in order, each with its ORIGINAL (untruncated)
+ *  text. THE single filter: `buildPermissionQuestions` (what the phone renders) and `answerLine` (what
+ *  the answers zip against) both derive from this list, so a skipped malformed entry can never shift
+ *  the phone's by-index answers off their questions. (CC's schema makes `question` required, so the
+ *  skip is defence-in-depth, not an expected path.) */
+function usableQuestions(toolInput: Record<string, unknown>): Array<{ text: string; raw: RawQuestion }> {
+  const qs = toolInput.questions;
+  if (!Array.isArray(qs)) return [];
+  const out: Array<{ text: string; raw: RawQuestion }> = [];
+  for (const raw of qs as RawQuestion[]) {
+    const text = typeof raw?.question === "string" ? raw.question : "";
+    if (text.length > 0) out.push({ text, raw });
+  }
+  return out;
+}
+
+/** The first showable question's raw text, or "" — shared by the summary and the detail builders. */
+function firstQuestionText(toolInput: Record<string, unknown>): string {
+  return usableQuestions(toolInput)[0]?.text ?? "";
+}
+
+/** The AskUserQuestion choice list, compacted for the wire: one entry per question with its text, the
+ *  optional short header, the multi-select flag (present only when true), and the option LABELS.
+ *  Option `description`s are dropped outright — they are by far the fattest thing in a CC question
+ *  payload and the phone's rows show labels only. Returns [] for any tool that isn't a question (no
+ *  `questions` array), so the blob field is simply absent for every other tool.
+ *
+ *  Pure, never throws: a malformed entry (null, no text, no usable options) is skipped rather than
+ *  poisoning the hold. Truncation is display-only — `answerLine` maps answers against the ORIGINAL
+ *  tool_input, never against these capped strings. */
+export function buildPermissionQuestions(toolInput: Record<string, unknown>): PermissionQuestion[] {
+  const cap = (s: string, n: number): string => (s.length <= n ? s : `${s.slice(0, n - 1)}…`);
+  return usableQuestions(toolInput).map(({ text, raw }) => {
+    const labels: string[] = [];
+    if (Array.isArray(raw?.options)) {
+      for (const opt of raw.options) {
+        const label = (opt as { label?: unknown } | null)?.label;
+        if (typeof label === "string" && label.length > 0) labels.push(cap(label, QUESTION_LABEL_MAX));
+      }
+    }
+    return {
+      q: cap(text, QUESTION_TEXT_MAX),
+      ...(typeof raw?.header === "string" && raw.header.length > 0 ? { h: raw.header } : {}),
+      ...(raw?.multiSelect === true ? { m: true } : {}),
+      o: labels,
+    };
+  });
 }
 
 /** The worker's hard ceiling on a decision POST's base64 `blob` (MAX_BLOB_CHARS, server/src/cc.ts):
@@ -292,17 +409,28 @@ export function fitPermissionDetail(
   base: Record<string, unknown>,
   detail: string,
   maxChars: number = BLOB_FIT_CHARS,
-): { detail: string; omitted: number } {
+  questions: PermissionQuestion[] = [],
+): { detail: string; omitted: number; questions?: PermissionQuestion[] } {
   const all = Array.from(detail);                                  // code points, not UTF-16 units
   const hardLoss = Math.max(0, all.length - MAX_DETAIL_CHARS);
   const chars = hardLoss > 0 ? all.slice(0, MAX_DETAIL_CHARS) : all;
   const encoder = new TextEncoder();
 
-  const frameChars = (d: string, omitted: number): number =>
-    sealedBlobChars(encoder.encode(JSON.stringify(permissionFrame(base, d, omitted))).length);
+  const measure = (d: string, omitted: number, qs: PermissionQuestion[]): number =>
+    sealedBlobChars(encoder.encode(JSON.stringify(permissionFrame(base, d, omitted, qs))).length);
 
-  if (chars.length === 0) return { detail: "", omitted: 0 };
-  if (hardLoss === 0 && frameChars(detail, 0) <= maxChars) return { detail, omitted: 0 };
+  // The QUESTIONS are the actionable part of a question card (the detail is only context), so they get
+  // first claim on the budget: keep them iff the frame fits with them and NO detail at all. They are
+  // all-or-nothing — a partially shown option list would be a lie, and the phone degrades cleanly to
+  // the read-only prompt when the field is absent. Whatever survives is then measured by the detail's
+  // binary search below, so its cost is counted and can never eat the fit margin after the fact.
+  const kept = questions.length > 0 && measure("", 0, questions) <= maxChars ? questions : [];
+  const tail = kept.length > 0 ? { questions: kept } : {};
+
+  const frameChars = (d: string, omitted: number): number => measure(d, omitted, kept);
+
+  if (chars.length === 0) return { detail: "", omitted: 0, ...tail };
+  if (hardLoss === 0 && frameChars(detail, 0) <= maxChars) return { detail, omitted: 0, ...tail };
 
   const worstCase = all.length; // most digits `permissionDetailOmitted` can take
   let lo = 0;
@@ -312,23 +440,26 @@ export function fitPermissionDetail(
     if (frameChars(`${chars.slice(0, mid).join("")}…`, worstCase) <= maxChars) lo = mid;
     else hi = mid - 1;
   }
-  return { detail: `${chars.slice(0, lo).join("")}…`, omitted: all.length - lo };
+  return { detail: `${chars.slice(0, lo).join("")}…`, omitted: all.length - lo, ...tail };
 }
 
 /** The decisionPending blob's permission tail, in its FROZEN append-last order:
  *  … permissionToolName, permissionDetail (omitted when empty), permissionDetailOmitted (omitted when
- *  nothing was dropped). Both optional keys follow the same "absent, never empty/zero" discipline as
- *  every other optional blob key, so an older iOS decoder is byte-unaffected. Shared by the fit's size
- *  prediction and the real seal so the two can never drift. */
+ *  nothing was dropped), permissionQuestions (omitted when there are none / it didn't fit). Every
+ *  optional key follows the same "absent, never empty/zero" discipline as the rest of the blob, so an
+ *  older iOS decoder is byte-unaffected. Shared by the fit's size prediction and the real seal so the
+ *  two can never drift. */
 function permissionFrame(
   base: Record<string, unknown>,
   detail: string,
   omitted: number,
+  questions: PermissionQuestion[] = [],
 ): Record<string, unknown> {
   return {
     ...base,
     ...(detail.length > 0 ? { permissionDetail: detail } : {}),
     ...(omitted > 0 ? { permissionDetailOmitted: omitted } : {}),
+    ...(questions.length > 0 ? { permissionQuestions: questions } : {}),
   };
 }
 
@@ -339,7 +470,7 @@ function permissionFrame(
  *  guess a line, so we swallow it and wait for one we know (fail-safe, symmetric with fail-open). */
 function emitDecision(
   agent: AgentKind,
-  answer: { decision?: unknown; message?: unknown },
+  answer: { decision?: unknown; message?: unknown; answers?: unknown },
   toolName: string,
   toolInput: Record<string, unknown>,
   suggestions: unknown,
@@ -355,6 +486,14 @@ function emitDecision(
       emit(denyLine(agent, answer.message));
       trace({ event: "emit", decision: "deny", hasMessage: typeof answer.message === "string" && answer.message.trim().length > 0 });
       return false;
+    case "answer": {
+      // The phone picked option(s) for an AskUserQuestion. An answer we cannot turn into a real answers
+      // map emits NOTHING and keeps polling — a bare allow would become a hard DENY on the headless path
+      // (see answerLine), so "degrade to allow" is exactly the wrong reflex here.
+      const line = answerLine(agent, toolName, toolInput, answer.answers);
+      if (line === undefined) { trace({ event: "answer-unmappable", tool_name: toolName }); return true; }
+      emit(line); trace({ event: "emit", decision: "answer" }); return false;
+    }
     default:
       trace({ event: "answer-unknown-decision" }); return true; // future phone, old plugin — keep polling
   }
@@ -453,19 +592,9 @@ export async function runPermissionHook(deps: PermissionHookDeps = {}, agent: Ag
       trace({ event: "exit", reason: "mode", mode: permissionMode });
       return;
     }
-    // 3. Question gate: CC fires a PermissionRequest for AskUserQuestion too, but a bare Allow/Deny card
-    //    is the WRONG surface for a multi-option question (Allow would just re-show the terminal picker).
-    //    Until the question-answering wave (option buttons + answer injection) ships, delegate to the
-    //    exact fire-and-forget needs-attention path the no-hold flag uses: an attention buzz on the
-    //    phone, answer at the Mac. Placed AFTER the mode gate so an auto-mode question never even
-    //    delegates (it fell open above). Runs BEFORE any POST/blob build. CLAUDE-ONLY in practice: Codex
-    //    has no AskUserQuestion tool, so this never fires for a codex session — the delegate still
-    //    threads `agent` for correctness if it ever did.
-    if (toolName === "AskUserQuestion") {
-      trace({ event: "exit", reason: "question-passthrough" });
-      await (deps.delegate ?? (() => runHook(agent)))();
-      return;
-    }
+    // (There is no longer a question gate here: AskUserQuestion HOLDS like every other tool — its
+    // options ride the blob in `permissionQuestions` and the phone's `answer` verb injects the
+    // selection through `updatedInput`. CLAUDE-ONLY in practice: Codex has no AskUserQuestion tool.)
     const toolInput = typeof input.tool_input === "object" && input.tool_input !== null
       ? (input.tool_input as Record<string, unknown>)
       : {};
@@ -486,9 +615,11 @@ export async function runPermissionHook(deps: PermissionHookDeps = {}, agent: Ag
     //
     // Append order is FROZEN: permissionSummary, permissionRequestId, permissionToolName, then the
     // OPTIONAL permissionDetail (omitted when empty — never an empty string, matching every other
-    // optional blob key), then the OPTIONAL permissionDetailOmitted (absent unless text was dropped).
-    // permissionToolName lets the phone key card layout off the tool; permissionDetail is the fuller
-    // sub-line (and, for ExitPlanMode, the whole plan).
+    // optional blob key), then the OPTIONAL permissionDetailOmitted (absent unless text was dropped),
+    // and LAST the OPTIONAL permissionQuestions (AskUserQuestion only — absent for every other tool, and
+    // absent for a question whose option list could not fit the frame). permissionToolName lets the
+    // phone key card layout off the tool; permissionDetail is the fuller sub-line (and, for
+    // ExitPlanMode, the whole plan).
     //
     // BLOB SIZE: the worker rejects a decision POST whose base64 `blob` exceeds MAX_BLOB_CHARS (3072) —
     // enforced server-side, NOT by encryptBlob (which never hard-fails on size). The detail used to carry
@@ -505,8 +636,11 @@ export async function runPermissionHook(deps: PermissionHookDeps = {}, agent: Ag
       ...base, status: "decisionPending", permissionSummary: summary, permissionRequestId: requestId,
       permissionToolName: toolName,
     };
-    const fitted = fitPermissionDetail(permissionBase, buildPermissionDetail(toolName, toolInput));
-    const blob = await encryptBlob(config.e2eKey, permissionFrame(permissionBase, fitted.detail, fitted.omitted));
+    const fitted = fitPermissionDetail(
+      permissionBase, buildPermissionDetail(toolName, toolInput), BLOB_FIT_CHARS,
+      buildPermissionQuestions(toolInput),
+    );
+    const blob = await encryptBlob(config.e2eKey, permissionFrame(permissionBase, fitted.detail, fitted.omitted, fitted.questions));
     const fallbackBlob = await encryptBlob(config.e2eKey, base);
 
     const pcHeaders = { "x-cc-pairing": config.pairingId, "x-cc-auth": config.pcSecret, "x-cc-version": PLUGIN_VERSION };
@@ -599,7 +733,7 @@ export async function runPermissionHook(deps: PermissionHookDeps = {}, agent: Ag
         if (data.status === "answered" && typeof data.answerBlob === "string") {
           // A decrypt failure here throws to the outer catch → silent exit 0 (fail open), never a retry.
           const answer = (await decryptBlob(config.e2eKey, data.answerBlob)) as
-            { requestId?: unknown; decision?: unknown; message?: unknown };
+            { requestId?: unknown; decision?: unknown; message?: unknown; answers?: unknown };
           const match = answer.requestId === requestId;
           // A matched, KNOWN decision emits one line and we're done; a requestId MISMATCH is a
           // replay/stale answer (silent, done — unchanged). The one keep-polling case is a matched but
