@@ -10,6 +10,11 @@
 // import.meta.main block into this bundle and fire runHook("claude") first (see hook.ts header).
 //
 // Registered by the native Codex plugin's hooks/codex-hooks.json (`exec <run.sh> <this bundle>`).
+// TIMEOUT BUDGET (why SessionEnd is 8s there, not 3): one run can chain TWO 2s-budget POSTs —
+// reconcileProvisional before the main event POST (see core/hook.ts) — i.e. ~4s worst case on a stalled
+// network against ~30ms on the happy path. Codex 0.145.0 clamps SessionEnd itself, so a tighter value
+// only risks Codex killing the hook before op:end lands. The manifest is comment-free on purpose (extra
+// JSON keys could break its deserializer and disable every Codex hook); see cc-status.test.ts.
 // PORTABILITY: bun AND node >= 18 — no `Bun.*` APIs; build.ts bundles this to dist/codex-status.mjs.
 
 import { runHook } from "../core/hook";

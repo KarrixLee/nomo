@@ -713,7 +713,11 @@ export async function runPermissionHook(deps: PermissionHookDeps = {}, agent: Ag
       || permissionMode === "default"
       || (agent === "claude" && (permissionMode === "acceptEdits" || permissionMode === "plan"));
     if (!interactiveMode) {
-      trace({ event: "exit", reason: "mode", mode: permissionMode });
+      // Signal-only (no behavior change): if a future Codex starts reporting claude-style dialog modes,
+      // the `agent === "claude"` narrowing above would silently stop holding for them. Tag that exit so
+      // the trace names the cause instead of reading like an ordinary non-interactive mode.
+      const codexDialogMode = agent === "codex" && (permissionMode === "acceptEdits" || permissionMode === "plan");
+      trace({ event: "exit", reason: "mode", mode: permissionMode, ...(codexDialogMode ? { codex_dialog_mode: true } : {}) });
       return;
     }
     // (There is no longer a question gate here: AskUserQuestion HOLDS like every other tool — its

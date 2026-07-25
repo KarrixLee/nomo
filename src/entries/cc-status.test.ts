@@ -25,7 +25,14 @@ describe("native Codex hook manifest", () => {
     expect(Object.keys(manifest.hooks)).toHaveLength(7);
     const sessionEnd = manifest.hooks.SessionEnd?.[0]?.hooks?.[0];
     expect(sessionEnd?.command).toContain("dist/codex-status.mjs");
-    expect(sessionEnd?.timeout).toBe(3);
+    // WHY 8 and not a tighter number (do NOT "tidy" this back down): a SessionEnd run can chain TWO
+    // 2s-budget POSTs — reconcileProvisional (core/hook.ts) fires BEFORE the op:end event POST — so the
+    // worst case on a stalled network is ~4s, versus ~30ms on the happy path. At 3 Codex killed the hook
+    // before op:end could land (the dead-pid reaper then covered it ~5s later — fail-safe, but
+    // self-inflicted). Codex 0.145.0 clamps SessionEnd durations itself, so a small value here protects
+    // nothing. The manifest itself carries no comment: extra JSON keys risk the hook-manifest
+    // deserializer rejecting the whole file, which would silently disable EVERY Codex hook.
+    expect(sessionEnd?.timeout).toBe(8);
   });
 });
 

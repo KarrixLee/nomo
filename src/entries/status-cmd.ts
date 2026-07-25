@@ -77,7 +77,8 @@ export function countCodexHookEvents(raw: string): number {
  *    - enabled:   true unless that section carries an explicit `enabled = false` (a plugin section
  *                 with no `enabled` key is enabled by default).
  *    - trusted:   how many `[hooks.state."nomo@…"]` section headers exist — Codex writes one (with a
- *                 trusted_hash) per hook it has trust-reviewed, so this is the N-of-6 trusted count.
+ *                 trusted_hash) per hook it has trust-reviewed, so this is the N-of-CODEX_PLUGIN_HOOK_COUNT
+ *                 (7 since SessionEnd) trusted count — NOT the legacy config-layer hooks.json's 6.
  *    - ccTrusted: how many `[hooks.state."nomo-cc@…"]` section headers exist — Codex auto-discovers the
  *                 CLAUDE plugin (nomo-cc, hooks/hooks.json) and lets you trust ITS hooks too; when both
  *                 this and `trusted` are >0 every Codex event runs BOTH plugins' hooks (double-fire). */

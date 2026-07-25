@@ -62,9 +62,13 @@ export const codexToolDetail: Record<string, string> = {
 const USER_INPUT_DETAIL_MAX = 240;
 
 /** Extract the first human-facing Codex `request_user_input` question from either the hook's parsed
- *  `tool_input` object or the rollout's JSON-string `arguments`. The tool is only available in Codex
- *  Plan collaboration mode today, so this is the one reliable Plan-state signal the hook/rollout
- *  contracts actually expose. It is status-only: Nomo does not pretend this path can submit an answer. */
+ *  `tool_input` object or the rollout's JSON-string `arguments`. The tool is EXPERIMENT-GATED, not
+ *  mode-gated: the 0.145.0 binary carries `tools.experimental_request_user_input` plus a
+ *  `default_mode_request_user_input` feature flag, so it can be enabled in DEFAULT mode as well as in
+ *  Plan collaboration mode. What we rely on is narrower and does hold either way: WHEN the call appears,
+ *  the session is genuinely blocked on the user, and the hook/rollout contracts expose it — so it is a
+ *  sound blocked-state signal, not a complete one (a build with the experiment off simply never emits it,
+ *  and this path stays dormant). Status-only: Nomo does not pretend it can submit an answer. */
 export function requestUserInputDetail(toolInput: unknown): string | undefined {
   let parsed = toolInput;
   if (typeof parsed === "string") {

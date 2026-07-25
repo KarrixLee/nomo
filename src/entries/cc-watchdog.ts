@@ -169,12 +169,14 @@ export async function buildNeedsAttentionEnvelope(
 ): Promise<object> {
   const blob = await encryptBlob(e2eKey, {
     status: "needsAttention",
-    // A dropped Codex request_user_input hook is recoverable from its persisted function-call
-    // arguments; carry the same encrypted first-question preview the direct PreToolUse path sends.
-    ...(typeof detail === "string" && detail.length > 0 ? { detail } : {}),
     title: typeof record.title === "string" ? record.title : "",
     machine: typeof record.machine === "string" ? record.machine : "",
     label: typeof record.label === "string" ? record.label : "",
+    // A dropped Codex request_user_input hook is recoverable from its persisted function-call
+    // arguments; carry the same encrypted first-question preview the direct PreToolUse path sends.
+    // Placed AFTER `label` so this producer's key order matches hook.ts buildBlob's byte shape — two
+    // producers of the same needsAttention frame must not emit divergent orders.
+    ...(typeof detail === "string" && detail.length > 0 ? { detail } : {}),
     // Per-agent blob identity comes from the adapter (no inline `agent === …` branch in the daemon).
     ...adapterFor(agent).blobAgentFields,
     ...(typeof record.turnStartedAt === "number" && Number.isFinite(record.turnStartedAt) ? { turnStartedAt: record.turnStartedAt } : {}),
@@ -594,6 +596,16 @@ export function shouldPendingApprovalCheck(record: SessionRecord, adapter: Agent
   return true;
 }
 
+/** Injectable side-effect seams for the pending-approval net, so its POST/restamp discipline is testable
+ *  without real fs/network — mirrors InterruptDeps / IdleReapDeps. `now` clocks the corrective
+ *  needsAttention envelope's ts + its `at`. */
+export interface PendingApprovalDeps {
+  post?: (body: object) => Promise<PostOutcome>;
+  readTail?: (path: string, bytes: number) => Promise<string>;
+  writeRecord?: (path: string, rec: SessionRecord) => Promise<void>;
+  now?: () => number;
+}
+
 /** The pending-approval recovery net for one still-alive session. Gated by shouldPendingApprovalCheck,
  *  then it tails the rollout and, if the tail shows a pending approval, POSTs a corrective op:update /
  *  needsAttention (the same envelope a real PermissionRequest hook produces). On a 2xx it rewrites the
@@ -606,14 +618,23 @@ export function shouldPendingApprovalCheck(record: SessionRecord, adapter: Agent
  *   - "corrected"   → it POSTed a needsAttention this sweep → the caller must NOT also heartbeat it.
  *   - "uncorrected" → nothing to do (gate closed, no pending approval, or a transient failed POST).
  *   - "revoked"     → the POST 404'd: the pairing is gone server-side → the caller tears down. */
-async function correctPendingApproval(config: Config, path: string, sessionId: string, record: SessionRecord, now: number): Promise<"corrected" | "uncorrected" | "revoked"> {
+export async function correctPendingApproval(
+  config: Config, path: string, sessionId: string, record: SessionRecord, now: number, deps: PendingApprovalDeps = {},
+): Promise<"corrected" | "uncorrected" | "revoked"> {
+  const post = deps.post ?? ((body: object) => postEvent(config, body));
+  const readTail = deps.readTail ?? ((p: string, bytes: number) => readSuffix(p, bytes));
+  const writeRecord = deps.writeRecord
+    // Owner-only (0600), like the hook's trackSession / the interrupt net's rewrite — the record holds
+    // hostname, cwd basename, the session pid, and the absolute transcript path.
+    ?? ((p: string, rec: SessionRecord) => atomicWrite(p, JSON.stringify(rec), 0o600));
+  const clock = deps.now ?? Date.now;
   try {
     const agent: AgentKind = record.agent === "codex" ? "codex" : "claude";
     const adapter = adapterFor(agent);
     if (!shouldPendingApprovalCheck(record, adapter)) return "uncorrected";
     let tail: string;
     try {
-      tail = await readSuffix(record.transcript as string, INTERRUPT_TAIL_BYTES);
+      tail = await readTail(record.transcript as string, INTERRUPT_TAIL_BYTES);
     } catch {
       return "uncorrected"; // transcript missing / cold-compressed → nothing to check
     }
@@ -621,11 +642,11 @@ async function correctPendingApproval(config: Config, path: string, sessionId: s
     const detail = adapter.tailPendingAttentionDetail?.(tail);
     const attentionKind = adapter.tailPendingAttentionKind?.(tail);
     // Just-detected block → `at` is the OBSERVED now (epoch seconds).
-    const attnNow = Date.now();
+    const attnNow = clock();
     const envelope = await buildNeedsAttentionEnvelope(
       sessionId, record, attnNow, config.e2eKey, agent, Math.floor(attnNow / 1000), detail, attentionKind,
     ) as Record<string, unknown>;
-    const outcome = await postEvent(config, envelope);
+    const outcome = await post(envelope);
     if (outcome === "revoked") return "revoked"; // pairing gone → bubble up so the loop can tear down
     if (outcome !== "delivered") return "uncorrected"; // failed POST → keep the file, retry next sweep
     // 2xx: pin the session needsAttention so this net fires once per episode and the interrupt-net
@@ -640,9 +661,7 @@ async function correctPendingApproval(config: Config, path: string, sessionId: s
         // Heartbeats must repeat the corrective attention frame, not the stale pre-question working blob.
         ...(typeof envelope.blob === "string" ? { blob: envelope.blob } : {}),
       };
-      // Owner-only (0600), like the hook's trackSession / the interrupt net's rewrite — the record holds
-      // hostname, cwd basename, the session pid, and the absolute transcript path.
-      await atomicWrite(path, JSON.stringify(next), 0o600);
+      await writeRecord(path, next);
     } catch {
       // Rewrite failed — worst case the net re-POSTs a needsAttention next sweep, which the worker drops.
     }

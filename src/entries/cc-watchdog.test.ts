@@ -8,7 +8,8 @@ import { GONE_STRIKE_LIMIT, readGoneStrikes, recordGoneStrike, resetGoneStrikes 
 import {
   buildDoneEnvelope, buildEndEnvelope, buildHeartbeatEnvelope, buildNeedsAttentionEnvelope, buildProvisionalBlob,
   buildProvisionalEnvelope, buildProvisionalRecord, buildStartEnvelope, buildTitleRepairEnvelope, classifySession,
-  claudeTailPendingApproval, codexLastTurnEvent, codexTailPendingApproval, correctIdleClaude, correctInterrupt, discoverLiveSessions, goneStrikeShouldTeardown,
+  claudeTailPendingApproval, codexLastTurnEvent, codexTailPendingApproval, correctIdleClaude, correctInterrupt,
+  correctPendingApproval, discoverLiveSessions, goneStrikeShouldTeardown,
   hasInterruptMarker, IDLE_GRACE_MS, isClaudeIdleReapEligible, isRetireEligible, lastTurnLine, PAIRING_TTL_MS, pendingPairingExpired,
   postOutcomeForStatus, provisionalsCoveredByReal, reconcileProvisionalsSweep, retireDoneStale, shouldHeartbeat, shouldIdleProvisionalCheck,
   shouldInterruptCheck, shouldPendingApprovalCheck, shouldRepairTitle, tailShowsInterrupt, titleRepairedRecord,
@@ -1150,6 +1151,113 @@ describe("shouldPendingApprovalCheck (gate: once-per-episode + skip claude/done/
   test("missing / empty transcript → skip", () => {
     expect(shouldPendingApprovalCheck(arec({ transcript: "" }), codexAdapter)).toBe(false);
     expect(shouldPendingApprovalCheck({ ...arec(), transcript: undefined } as unknown as SessionRecord, codexAdapter)).toBe(false);
+  });
+});
+
+// The pending-approval net's RESTAMP is the whole point of the net surviving one sweep: without
+// `blob: envelope.blob` on the rewritten record, the very next staleness heartbeat re-broadcasts the
+// STALE pre-question "working" blob verbatim (buildHeartbeatEnvelope re-sends record.blob byte for byte)
+// and the phone row reverts off needsAttention — the exact bug this net exists to prevent. The
+// question detail + the clear `attentionKind` discriminator must likewise reach the POSTed envelope, or
+// the phone shows a bare "needs attention" with no question and the server can't scope the episode.
+describe("correctPendingApproval (corrective POST + record restamp so the heartbeat can't revert it)", () => {
+  const NOW = 7_000_000;
+  // A codex session mid-turn whose stored blob is the PRE-question "working" frame (what a heartbeat
+  // would re-send) — the state a dropped request_user_input hook leaves behind.
+  const blocked = (over: Partial<SessionRecord> = {}): SessionRecord =>
+    rec({ agent: "codex", lastEvent: "working", op: "update", prio: 0, sentDone: false,
+          blob: "STALE-WORKING-BLOB", title: "Migrate the router", transcript: "/tmp/rollout.jsonl", ts: NOW - 1000, ...over });
+  // A rollout tail whose last decisive line is a persisted request_user_input call → pending, with a
+  // recoverable first question (structurally equivalent to a real rollout; no private content).
+  const userInputTail = JSON.stringify({
+    type: "response_item",
+    payload: {
+      type: "function_call", name: "request_user_input",
+      arguments: JSON.stringify({ questions: [{ header: "Scope", question: "Which API should the plan preserve?" }] }),
+    },
+  });
+  // A plain pending approval (no request_user_input): no detail, no attentionKind.
+  const approvalTail = JSON.stringify({ type: "event_msg", payload: { type: "exec_approval_request" } });
+
+  test("delivered → the REWRITTEN record carries the POSTED envelope's blob (not the stale working one)", async () => {
+    const posts: Record<string, unknown>[] = [];
+    const writes: SessionRecord[] = [];
+    const v = await correctPendingApproval(cfg(), "/tmp/s.json", "s", blocked(), NOW, {
+      post: async (b) => { posts.push(b as Record<string, unknown>); return "delivered" as PostOutcome; },
+      readTail: async () => userInputTail,
+      writeRecord: async (_p, r) => { writes.push(r); },
+      now: () => 5_555_000,
+    });
+    expect(v).toBe("corrected");
+    expect(posts).toHaveLength(1);
+    expect(posts[0]).toMatchObject({ op: "update", prio: 1, ts: 5_555_000 });
+    expect(writes).toHaveLength(1);
+    // THE restamp: identical bytes to what was posted, and NOT the pre-question working blob.
+    expect(writes[0].blob).toBe(posts[0].blob as string);
+    expect(writes[0].blob).not.toBe("STALE-WORKING-BLOB");
+    expect(writes[0]).toMatchObject({ lastEvent: "needsAttention", op: "update", prio: 1, sentDone: false });
+    // And the restamped record heartbeats the CORRECTIVE attention frame, never the stale working one.
+    expect(buildHeartbeatEnvelope("s", writes[0], 9)).toMatchObject({ blob: posts[0].blob as string, op: "update", prio: 1 });
+  });
+
+  test("the adapter's question detail + attentionKind are threaded into the POSTED envelope", async () => {
+    const posts: Record<string, unknown>[] = [];
+    await correctPendingApproval(cfg(), "/tmp/s.json", "s", blocked(), NOW, {
+      post: async (b) => { posts.push(b as Record<string, unknown>); return "delivered" as PostOutcome; },
+      readTail: async () => userInputTail,
+      writeRecord: async () => {},
+    });
+    expect(posts[0].attentionKind).toBe("userInput"); // clear discriminator (server scopes the episode)
+    expect(await decryptBlob(KEY, posts[0].blob as string)).toMatchObject({
+      status: "needsAttention",
+      detail: "Scope: Which API should the plan preserve?", // recovered from the persisted arguments
+      title: "Migrate the router",
+      agent: "codex",
+    });
+  });
+
+  test("a plain pending approval posts NO detail and NO attentionKind (legacy envelope shape kept)", async () => {
+    const posts: Record<string, unknown>[] = [];
+    await correctPendingApproval(cfg(), "/tmp/s.json", "s", blocked(), NOW, {
+      post: async (b) => { posts.push(b as Record<string, unknown>); return "delivered" as PostOutcome; },
+      readTail: async () => approvalTail,
+      writeRecord: async () => {},
+    });
+    expect(posts[0]).not.toHaveProperty("attentionKind");
+    expect(await decryptBlob(KEY, posts[0].blob as string)).not.toHaveProperty("detail");
+  });
+
+  test("a FAILED post leaves the record untouched (retry next sweep); a revoke bubbles up", async () => {
+    let writes = 0;
+    const seams = { readTail: async () => userInputTail, writeRecord: async () => { writes++; } };
+    expect(await correctPendingApproval(cfg(), "/tmp/s.json", "s", blocked(), NOW, {
+      ...seams, post: async () => "failed" as PostOutcome,
+    })).toBe("uncorrected");
+    expect(await correctPendingApproval(cfg(), "/tmp/s.json", "s", blocked(), NOW, {
+      ...seams, post: async () => "revoked" as PostOutcome,
+    })).toBe("revoked");
+    expect(writes).toBe(0); // no restamp on a non-2xx → the stale blob stays, the net retries
+  });
+
+  test("gate closed / no pending approval / unreadable transcript → nothing posted", async () => {
+    let posted = 0;
+    const seams = {
+      post: async () => { posted++; return "delivered" as PostOutcome; },
+      writeRecord: async () => {},
+    };
+    // already surfaced (dedup gate)
+    expect(await correctPendingApproval(cfg(), "/tmp/s.json", "s", blocked({ lastEvent: "needsAttention" }), NOW, {
+      ...seams, readTail: async () => userInputTail,
+    })).toBe("uncorrected");
+    // tail shows a RESOLVED episode
+    expect(await correctPendingApproval(cfg(), "/tmp/s.json", "s", blocked(), NOW, {
+      ...seams, readTail: async () => JSON.stringify({ type: "event_msg", payload: { type: "task_complete" } }),
+    })).toBe("uncorrected");
+    // transcript missing / cold-compressed
+    expect(await correctPendingApproval(cfg(), "/tmp/s.json", "s", blocked(), NOW, {
+      ...seams, readTail: async () => { throw new Error("ENOENT"); },
+    })).toBe("uncorrected");
+    expect(posted).toBe(0);
   });
 });
 

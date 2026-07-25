@@ -153,7 +153,7 @@ codex plugin add nomo@nomo
 This also works in the **Codex desktop app** — the same marketplace-add and plugin-add flow from
 its built-in terminal.
 
-Then **trust the hooks once**: run `/hooks` and trust the **six Nomo entries**. They ship with the
+Then **trust the hooks once**: run `/hooks` and trust the **seven Nomo entries**. They ship with the
 plugin (`hooks/codex-hooks.json`) but stay **inert until trusted** — this is Codex's own safety
 gate, which Nomo cannot pre-approve. The hook command lines are byte-stable across releases, so
 trusting once holds through updates (only a changed hook line re-arms the review).
