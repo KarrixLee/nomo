@@ -92,7 +92,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { execFileSync, spawn } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "1.3.0";
+var PLUGIN_VERSION = "1.3.1";
 var CC_DIR = `${process.env.HOME}/.config/cc-status`;
 var SESSIONS_DIR = `${CC_DIR}/sessions`;
 var WATCHDOG_PID_PATH = `${CC_DIR}/watchdog.pid`;
@@ -1415,10 +1415,10 @@ async function buildDoneEnvelope(sessionId, record, now, e2eKey, agent = "claude
 async function buildNeedsAttentionEnvelope(sessionId, record, now, e2eKey, agent = "claude", at, detail, attentionKind) {
   const blob = await encryptBlob(e2eKey, {
     status: "needsAttention",
-    ...typeof detail === "string" && detail.length > 0 ? { detail } : {},
     title: typeof record.title === "string" ? record.title : "",
     machine: typeof record.machine === "string" ? record.machine : "",
     label: typeof record.label === "string" ? record.label : "",
+    ...typeof detail === "string" && detail.length > 0 ? { detail } : {},
     ...adapterFor(agent).blobAgentFields,
     ...typeof record.turnStartedAt === "number" && Number.isFinite(record.turnStartedAt) ? { turnStartedAt: record.turnStartedAt } : {},
     ...typeof record.model === "string" && record.model.length > 0 ? { model: record.model } : {},
@@ -1636,7 +1636,11 @@ function shouldPendingApprovalCheck(record, adapter) {
     return false;
   return true;
 }
-async function correctPendingApproval(config, path, sessionId, record, now) {
+async function correctPendingApproval(config, path, sessionId, record, now, deps = {}) {
+  const post = deps.post ?? ((body) => postEvent(config, body));
+  const readTail = deps.readTail ?? ((p, bytes) => readSuffix(p, bytes));
+  const writeRecord = deps.writeRecord ?? ((p, rec) => atomicWrite(p, JSON.stringify(rec), 384));
+  const clock = deps.now ?? Date.now;
   try {
     const agent = record.agent === "codex" ? "codex" : "claude";
     const adapter = adapterFor(agent);
@@ -1644,7 +1648,7 @@ async function correctPendingApproval(config, path, sessionId, record, now) {
       return "uncorrected";
     let tail;
     try {
-      tail = await readSuffix(record.transcript, INTERRUPT_TAIL_BYTES);
+      tail = await readTail(record.transcript, INTERRUPT_TAIL_BYTES);
     } catch {
       return "uncorrected";
     }
@@ -1652,9 +1656,9 @@ async function correctPendingApproval(config, path, sessionId, record, now) {
       return "uncorrected";
     const detail = adapter.tailPendingAttentionDetail?.(tail);
     const attentionKind = adapter.tailPendingAttentionKind?.(tail);
-    const attnNow = Date.now();
+    const attnNow = clock();
     const envelope = await buildNeedsAttentionEnvelope(sessionId, record, attnNow, config.e2eKey, agent, Math.floor(attnNow / 1000), detail, attentionKind);
-    const outcome = await postEvent(config, envelope);
+    const outcome = await post(envelope);
     if (outcome === "revoked")
       return "revoked";
     if (outcome !== "delivered")
@@ -1668,7 +1672,7 @@ async function correctPendingApproval(config, path, sessionId, record, now) {
         sentDone: false,
         ...typeof envelope.blob === "string" ? { blob: envelope.blob } : {}
       };
-      await atomicWrite(path, JSON.stringify(next), 384);
+      await writeRecord(path, next);
     } catch {}
     return "corrected";
   } catch {
@@ -2118,6 +2122,7 @@ export {
   hasInterruptMarker,
   goneStrikeShouldTeardown,
   discoverLiveSessions,
+  correctPendingApproval,
   correctInterrupt,
   correctIdleClaude,
   codexTailPendingApproval,
