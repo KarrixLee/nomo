@@ -14,7 +14,7 @@ import {
 } from "../core/shared";
 
 /** Native Codex plugin hook declarations in plugin/hooks/codex-hooks.json. Keep the status denominator
- *  in lockstep with the manifest; SessionEnd is the seventh entry and performs exact row cleanup. */
+ *  in lockstep with the manifest; SessionEnd is the seventh entry and records terminal history. */
 const CODEX_PLUGIN_HOOK_COUNT = 7;
 
 export interface StatusDeps {

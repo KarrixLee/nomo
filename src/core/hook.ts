@@ -85,7 +85,7 @@ const USER_BLOCKING_TOOLS = new Set(["AskUserQuestion", "ExitPlanMode", "request
 ///   PreToolUse (AskUserQuestion / ExitPlanMode) → update, prio 1, needsAttention  (blocked on the user)
 ///   Notification (permission only) / PermissionRequest → update, prio 1, needsAttention
 ///   Stop                                        → done,   prio 0, done
-///   SessionEnd                                  → end,    prio 0  (no blob)
+///   SessionEnd                                  → end,    prio 0, done
 /// Re-arm: a SessionStart AFTER an op:done was sent for this session (sentDone) restarts as a fresh
 /// `update`/working — the session already exists in the worker, so it's an update, not a new start.
 /// The update-mapped hooks are already `update`, so they naturally re-arm (and clear sentDone) too.
@@ -201,8 +201,9 @@ export function buildBlob(input: Record<string, unknown>, machine: string, title
 
 /** The wire envelope for one hook event: the blind v2 shape
  *  `{v:2, sessionId, op, prio, ts, attentionKind?, blob?}`.
- *  op:end carries no blob (the worker reuses the last stored one); every other op carries the E2E-
- *  encrypted blob. Null when the hook is ignored (unknown/dropped) or has no session id. `sentDone`
+ *  A genuine hook SessionEnd carries a fresh E2E-encrypted `done` blob so the worker can retain a
+ *  truthful terminal history row. Internal reaper/reset end envelopes remain blob-less and therefore
+ *  keep their hard-delete meaning. Null when the hook is ignored (unknown/dropped) or has no session id. `sentDone`
  *  drives the re-arm (a start after a done becomes an update). The clear `attentionKind` is deliberately
  *  narrow and backward-compatible: ONLY Codex's request_user_input carries `"userInput"`, allowing the
  *  worker to distinguish a Plan question from an ordinary permission decision without reading `blob`. */
@@ -220,7 +221,6 @@ export async function buildEnvelope(
   // worker times too. OMITTED when unknown so the wire stays byte-identical to an old plugin's post.
   const base: Record<string, unknown> = { v: 2, sessionId: i.session_id, op: plan.op, prio: plan.prio, ts: now };
   if (typeof startedAt === "number" && Number.isFinite(startedAt)) base.startedAt = startedAt;
-  if (plan.op === "end") return base; // clean SessionEnd carries no content — worker reuses last blob
   // turnStartedAt, model, and `at` ride INSIDE the encrypted blob only. `attentionKind` below is the one
   // intentional optional clear discriminator; absent events retain the byte-compatible legacy shape.
   // `at` is the real event time (`now`) in epoch SECONDS — the phone's honest sort/age key, frozen here
@@ -237,7 +237,8 @@ export async function buildEnvelope(
  *  planOp + buildBlob the paired path uses, but WITHOUT the e2eKey (still unknown mid-pairing) — the
  *  plaintext blob is stashed and encrypted later, at flush, by completePendingPairing. sentDone is
  *  fixed false: no session record is tracked while pairing, so there is no done to re-arm from. An
- *  op:end is skipped — it carries no blob for a session the worker has never seen. */
+ *  op:end is skipped even though a paired SessionEnd carries a terminal blob: a session that ended
+ *  before pairing completed must not materialize as a history-only row on first connection. */
 export function buildPendingStash(
   input: Record<string, unknown>, machine: string, title: string | undefined, now: number, pid: number = process.ppid,
   agent: AgentKind = "claude", model?: string,
@@ -343,7 +344,7 @@ export async function trackSession(
     // transcript path — never group/world readable, matching config.json / the pending stash.
     await atomicWrite(path, JSON.stringify(record), 0o600);
   } catch {
-    // Bookkeeping is best-effort; on failure the server's 30-min eviction is still the backstop.
+    // Bookkeeping is best-effort; on failure the server's one-hour eviction is still the backstop.
   }
 }
 
@@ -610,7 +611,7 @@ export async function runHook(agent: AgentKind): Promise<void> {
 
     // Record (or, on op:end, remove) this session's file and make sure the liveness watchdog is
     // running before we POST — a force-killed terminal fires no SessionEnd, so this is how the phone
-    // learns of a dead session in seconds instead of after the 30-min eviction.
+    // learns of a dead session in seconds instead of after the one-hour worker eviction.
     // `title` already carries the last non-empty value (resolved above) so the watchdog's corrective
     // envelopes never regress to title:"" — and the pairing the blob was sealed under is stamped so a
     // heartbeat after a re-pair can't re-send an undecryptable stale blob.

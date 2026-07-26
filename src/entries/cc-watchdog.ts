@@ -9,7 +9,7 @@
 // Two gaps it closes:
 //   1. REAP — the hook fires a SessionEnd on a clean exit, but force-closing a terminal kills the
 //      agent with no hook at all, so the phone's Live Activity would show that session "working" until
-//      the Worker's 30-min staleness eviction. The hook records each session's TUI pid (process.ppid)
+//      the Worker's one-hour staleness eviction. The hook records each session's TUI pid (process.ppid)
 //      in ~/.config/cc-status/sessions/; this process checks liveness with kill(pid,0) every few
 //      seconds and POSTs an op:end for any dead one.
 //   2. DISCOVER — Codex fires NO hook at session OPEN (its SessionStart fires only at the FIRST prompt,
@@ -465,7 +465,7 @@ const WORKING_STALE_MS = 20_000;
 /** Bound on the interrupt net's corrective-done RETRIES. Once the interrupt is confirmed, a delivered
  *  done settles the session; a failed done bumps record.doneAttempts and retries next sweep. After this
  *  many consecutive FAILED deliveries the pairing is unreachable for this event, so the net stops the
- *  every-5-s re-POST loop and pins the record done LOCALLY (the worker's own 30-min eviction resolves
+ *  every-5-s re-POST loop and pins the record done LOCALLY (the worker's own one-hour eviction resolves
  *  the phone). 5 sweeps ≈ 25 s of retry covers a normal transient blip without looping forever — the
  *  same "cap retries so a permanently-failing POST can't spin" discipline as the 24 h staleness rule. */
 const INTERRUPT_DONE_MAX_ATTEMPTS = 5;
@@ -736,7 +736,7 @@ async function correctIdleProvisional(config: Config, path: string, sessionId: s
 // Claude Desktop resumes an old session with `claude --resume <id> --replay-user-messages` and keeps the
 // process RESIDENT while idle: its SessionStart fires (re-arming the session to "working"), no turn
 // follows, and NO Stop ever comes. The dead-pid reaper can't help — the pid is alive — and the PID-gated
-// heartbeat below deliberately defeats the worker's 30-min eviction, so the phone would show that session
+// heartbeat below deliberately defeats the worker's one-hour eviction, so the phone would show that session
 // "working" FOREVER. This net closes the gap from the one side that knows the turn is over: event-silence.
 // When a tracked CLAUDE session has gone event-idle past a generous grace with its pid still alive, it
 // gets ONE corrective op:done (the SAME envelope the interrupt net posts) and its record is pinned done —
@@ -1016,7 +1016,7 @@ export async function correctPendingDone(
  *  never rewrites it) with its pid alive before the watchdog retires it (blob-less op:end + record
  *  delete). WHY 1 h: it matches the phone's own display-age filter (the frozen blob `at` ages a done row
  *  out of view at ~the same horizon), and it sits FAR above both HEARTBEAT_AFTER_MS (5 min) and the
- *  worker's 30-min eviction — so retirement is always a DELIBERATE, settled decision, never racing a
+ *  worker's one-hour eviction — so retirement is always a DELIBERATE, settled decision, never racing a
  *  session the hooks are still keeping fresh nor one the worker is about to evict anyway. Deliberately
  *  well below SESSION_STALE_MS (24 h): retirement fires FIRST for done rows, and the 24 h stale cap stays
  *  the backstop for NON-done sessions (e.g. a needsAttention prompt abandoned for a full day). */
@@ -1048,7 +1048,7 @@ export interface RetireDeps {
  *  best-effort blob-less op:end carrying the FROZEN real-last-event `at` (record.ts/1000 — so the worker
  *  ages any surfaced end frame by real activity, consistent with 5aa1214) and DELETES the local record.
  *  The delete is UNCONDITIONAL on a delivered vs a transiently-failed POST (the slot must free and the row
- *  must go even through a brief worker blip — the worker's own 30-min eviction is the backstop for a
+ *  must go even through a brief worker blip — the worker's own one-hour eviction is the backstop for a
  *  dropped end), exactly the delete-regardless discipline of the 24 h stale path. Returns:
  *   - "retired"         → the op:end 2xx'd; record deleted → the caller counts it delivered (pairing alive).
  *   - "retired-offline" → the op:end failed transiently but the record was deleted anyway → NOT delivered.

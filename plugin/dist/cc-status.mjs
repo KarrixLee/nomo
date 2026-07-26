@@ -91,7 +91,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { execFileSync, spawn } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "1.4.1";
+var PLUGIN_VERSION = "1.4.2";
 var CC_DIR = `${process.env.HOME}/.config/cc-status`;
 var SESSIONS_DIR = `${CC_DIR}/sessions`;
 var WATCHDOG_PID_PATH = `${CC_DIR}/watchdog.pid`;
@@ -1464,8 +1464,6 @@ async function buildEnvelope(input, machine, now, title, e2eKey, sentDone, agent
   const base = { v: 2, sessionId: i.session_id, op: plan.op, prio: plan.prio, ts: now };
   if (typeof startedAt === "number" && Number.isFinite(startedAt))
     base.startedAt = startedAt;
-  if (plan.op === "end")
-    return base;
   const at = Math.floor(now / 1000);
   const blob = await encryptBlob(e2eKey, buildBlob(i, machine, title, plan, agent, turnStartedAt, pinnedLabel, model, at));
   const attentionKind = agent === "codex" && hookName === "PreToolUse" && i.tool_name === "request_user_input" ? "userInput" : undefined;

@@ -445,10 +445,10 @@ describe("buildEnvelope (v2 envelope + encrypted blob)", () => {
     expect(permission).not.toHaveProperty("attentionKind");
   });
 
-  test("SessionEnd → op end with NO blob", async () => {
+  test("SessionEnd → op end with a terminal blob", async () => {
     const env = (await buildEnvelope({ session_id: "abc", hook_event_name: "SessionEnd", cwd: "/x" }, "m", 5, "t", KEY, false))!;
-    expect(env).toEqual({ v: 2, sessionId: "abc", op: "end", prio: 0, ts: 5 });
-    expect(env).not.toHaveProperty("blob");
+    expect(env).toMatchObject({ v: 2, sessionId: "abc", op: "end", prio: 0, ts: 5 });
+    expect(await decryptBlob(KEY, env.blob as string)).toMatchObject({ status: "done" });
   });
 
   test("re-arm: a SessionStart after done builds op update, not start", async () => {
@@ -472,7 +472,8 @@ describe("buildEnvelope (v2 envelope + encrypted blob)", () => {
 
   test("startedAt rides even on an op:end envelope (the worker times its final frame too)", async () => {
     const env = (await buildEnvelope({ session_id: "abc", hook_event_name: "SessionEnd", cwd: "/x" }, "m", 5, "t", KEY, false, "claude", 42))!;
-    expect(env).toEqual({ v: 2, sessionId: "abc", op: "end", prio: 0, ts: 5, startedAt: 42 });
+    expect(env).toMatchObject({ v: 2, sessionId: "abc", op: "end", prio: 0, ts: 5, startedAt: 42 });
+    expect(await decryptBlob(KEY, env.blob as string)).toMatchObject({ status: "done" });
   });
 
   test("a non-finite startedAt is dropped from the envelope", async () => {
@@ -607,7 +608,7 @@ describe("buildPendingStash (plaintext event stashed while pairing is pending)",
     expect(buildPendingStash({ session_id: "s", hook_event_name: "Notification", message: "waiting for your input" }, "m", "t", 1)).toBeNull();
     expect(buildPendingStash({ hook_event_name: "Stop" }, "m", "t", 1)).toBeNull();
   });
-  test("returns null for an op:end (SessionEnd) — no blob for a session the worker has never seen", () => {
+  test("returns null for an op:end (SessionEnd) — don't materialize history before pairing completes", () => {
     expect(buildPendingStash({ session_id: "s", hook_event_name: "SessionEnd", cwd: "/x" }, "m", "t", 1)).toBeNull();
   });
   test("a UserPromptSubmit stash stamps turnStartedAt (floor(now/1000)); any other hook omits it", () => {

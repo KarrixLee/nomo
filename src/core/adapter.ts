@@ -774,7 +774,7 @@ export function claudeTailPendingApproval(tail: string): boolean {
 // A `claude` that loads plugins but is NOT a human's interactive session — e.g. claude-mem's
 // `claude --output-format stream-json …` observation runs, or any tool that shells out to headless
 // Claude — fires SessionStart (and usually UserPromptSubmit) under a brand-new session id that NEVER
-// gets a Stop. Left unguarded that mints a phantom "working" phone row which only the 30-min idle reap
+// gets a Stop. Left unguarded that mints a phantom "working" phone row which only the one-hour worker eviction
 // (the watchdog's correctIdleClaude) or the worker's own eviction ever clears. The interactive TUI runs
 // with none of these flags, so keying on the INVOKING process's argv (or a known daemon ancestor) is a
 // safe DEFER: skip mirroring a never-tracked session whose invoker looks headless. Mirrors the codex
