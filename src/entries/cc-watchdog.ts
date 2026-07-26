@@ -34,6 +34,7 @@ import { hostname } from "node:os";
 import { basename } from "node:path";
 import { encryptBlob } from "../core/crypto";
 import { adapterFor, AgentAdapter, allAdapters, codexAdapter, DiscoveredSession } from "../core/adapter";
+import { CodexRemoteInputBridge } from "../core/codex-remote-input-bridge";
 import {
   AgentKind, atomicWrite, CC_DIR, CCOp, CCStatus, Config, completePendingPairing, GONE_STRIKE_LIMIT, loadConfig, loadPendingConfig, localApprovalsState,
   PAIR_HTML_FILE, PairPollResult, PendingConfig, pidAlive, PLUGIN_VERSION, readPrefix, readSuffix, recordGoneStrike, removeRevokedConfig,
@@ -1342,9 +1343,28 @@ async function run(): Promise<void> {
   // up to IDLE_GRACE_MS past this so discovery keeps watching for the next freshly-opened Codex TUI
   // instead of retiring the instant the sessions dir empties (see IDLE_GRACE_MS).
   let lastActiveMs = Date.now();
+  let remoteInputBridge: CodexRemoteInputBridge | undefined;
+  let remoteInputPairingId: string | undefined;
   try {
     while (true) {
       const config = await loadConfig(); // reload each cycle: a mid-pairing config may complete under us
+      // A real Codex request_user_input response must return on the SAME shared app-server process.
+      // Attach through `codex app-server proxy` when that control socket is available. This is
+      // fail-open: stdio-only Codex launches keep their status-only behavior and no picker is emitted.
+      if (config) {
+        if (!remoteInputBridge || remoteInputPairingId !== config.pairingId) {
+          await remoteInputBridge?.stop();
+          remoteInputBridge = new CodexRemoteInputBridge(config);
+          remoteInputPairingId = config.pairingId;
+          await remoteInputBridge.start();
+        } else {
+          await remoteInputBridge.refreshSubscriptions();
+        }
+      } else if (remoteInputBridge) {
+        await remoteInputBridge.stop();
+        remoteInputBridge = undefined;
+        remoteInputPairingId = undefined;
+      }
       // Discovery + reconcile run BEFORE the sweep (only when paired). Backstop-reconcile first (retire
       // any provisional whose real session already reported), then discover new TUIs — so a just-
       // surfaced provisional is counted in `remaining` this same cycle, keeping the daemon alive
@@ -1412,6 +1432,7 @@ async function run(): Promise<void> {
       await new Promise((r) => setTimeout(r, POLL_MS));
     }
   } finally {
+    await remoteInputBridge?.stop();
     releaseSingleInstance(); // auto-quit on empty: drop our pidfile so the next hook re-spawns
   }
 }

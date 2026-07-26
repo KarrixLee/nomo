@@ -379,12 +379,14 @@ export function buildPermissionDetail(toolName: string, toolInput: Record<string
 }
 
 /** One question as it rides the sealed blob: compact keys to spend as little of the 3072-char ceiling
- *  as possible — q(uestion), h(eader), m(ultiSelect), o(ption labels). Mirrored 1:1 by the phone. */
+ *  as possible — q(uestion), h(eader), m(ultiSelect), o(ption labels), and optional d(escriptions).
+ *  Mirrored 1:1 by the phone. */
 export interface PermissionQuestion {
   q: string;
   h?: string;
   m?: boolean;
   o: string[];
+  d?: string[];
 }
 
 /** Longest question text kept in the blob (display only — the answers map is keyed by the ORIGINAL,

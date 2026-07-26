@@ -1017,6 +1017,7 @@ describe("statusCmd — Codex plugin detection states", () => {
         watchdogPidPath: join(dir, "watchdog.pid"),
         codexConfigPath,
         codexHooksPath,
+        codexAppServerAvailable: async () => false,
         isAlive: () => false,
         now: () => 0,
       });
@@ -1026,6 +1027,24 @@ describe("statusCmd — Codex plugin detection states", () => {
     }
   }
   const pluginLine = (lines: string[]): string => lines.find((l) => l.startsWith("Codex plugin:"))!;
+
+  test("reports whether the responder-backed Codex Plan bridge is actually available", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "cc-status-bridge-"));
+    try {
+      for (const available of [false, true]) {
+        const lines: string[] = [];
+        await statusCmd({
+          print: (line) => lines.push(line),
+          configPath: join(dir, "config.json"), codexConfigPath: join(dir, "config.toml"),
+          codexHooksPath: join(dir, "hooks.json"), codexAppServerAvailable: async () => available,
+        });
+        const bridge = lines.find((line) => line.startsWith("Codex Plan answers:"));
+        expect(bridge).toContain(available ? "bridge available" : "status-only");
+      }
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
 
   test("statusCmd always returns exit code 0 (not-paired/absent is information, not an error)", async () => {
     const dir = await mkdtemp(join(tmpdir(), "cc-status-exit-"));
