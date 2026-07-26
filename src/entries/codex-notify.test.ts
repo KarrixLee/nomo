@@ -122,6 +122,9 @@ describe("runNotify E2E (argv payload, dedupe against a sent Stop)", () => {
     expect(record?.op).toBe("done");
     expect(record?.agent).toBe("codex");
     expect(blob).toMatchObject({ status: "done", agent: "codex", title: "make the widget faster" });
+    // The POST fails against the discard port, so the backstop's own done is left owed — the watchdog's
+    // correctPendingDone net re-sends it instead of the record silently claiming it landed.
+    expect(record?.donePending).toBe(true);
   }, 20000);
 
   test("dedupe: a record already showing a sent Stop is left untouched (no double-send)", async () => {
@@ -134,6 +137,21 @@ describe("runNotify E2E (argv payload, dedupe against a sent Stop)", () => {
     expect(record?.label).toBe("SENTINEL");
     expect(record?.blob).toBe("PRESEEDED");
     expect(record?.ts).toBe(111);
+  }, 20000);
+
+  // The dedupe gate keys on sentDone ONLY. The done-delivery ack marker (donePending) is a separate
+  // field for the watchdog's re-POST net, so a Stop the hooks recorded but couldn't DELIVER must still
+  // dedupe here — re-sending from notify would just create a second undelivered done, and the watchdog
+  // (which owns the retry, with a bounded counter) is the one thing allowed to re-POST it.
+  test("dedupe is unchanged by the done-delivery marker: sentDone + donePending still bails", async () => {
+    const seed = {
+      pid: process.ppid, machine: "mac", label: "SENTINEL", ts: 111, transcript: "",
+      lastEvent: "done", sentDone: true, donePending: true, op: "done", prio: 0, blob: "PRESEEDED", agent: "codex",
+    };
+    const { record } = await runNotifyEntry(payload, { seedRecord: seed });
+    expect(record?.label).toBe("SENTINEL");
+    expect(record?.blob).toBe("PRESEEDED");
+    expect(record?.donePending).toBe(true); // left for the watchdog to settle, not re-sent from here
   }, 20000);
 
   test("a record mid-work (Stop hook failed, sentDone false) → corrective done IS sent", async () => {

@@ -887,6 +887,108 @@ export async function correctIdleClaude(
   }
 }
 
+// --- Undelivered-done reconcile (the Stop landed on disk but never on the worker) --------------
+//
+// The hook writes the session record BEFORE it POSTs (a force-killed terminal must still leave a
+// reapable file), and the whole hook body is wrapped in a blanket catch — so a Stop whose POST came
+// back non-2xx, hit the 2 s AbortSignal timeout, or threw left `sentDone:true` on disk while the worker
+// still held the previous op:"update". Nothing repaired that, and it is uniquely un-self-healing:
+// EVERY other net in this file gates itself OFF on a done record (shouldPendingApprovalCheck,
+// shouldIdleProvisionalCheck, isClaudeIdleReapEligible, shouldHeartbeat), so the local "done" belief
+// silenced the very machinery that would have noticed. Live incident 2026-07-26: a session's local
+// record read sentDone/op "done" at 05:59:13 while the worker's KV row still read op:"update" from
+// 05:58:36 — the phone showed it running for ~13 h, and a hand-replayed done envelope cleared it
+// instantly. The hook now stamps `donePending` pessimistically and clears it only on a confirmed 2xx
+// (see hook.ts markDoneDelivered), leaving this net one job: settle whatever debt is still on disk.
+//
+// SCOPE — done ONLY. An op:"end" DELETES the record (trackSession), so a failed end has no local retry
+// handle at all; the dead-pid reap, the 24 h stale path, and the worker's own eviction remain its
+// backstops. Agent-agnostic: the debt is created identically by the Claude hook, the Codex hook, and
+// the codex-notify backstop, and buildDoneEnvelope restamps the record's agent either way.
+
+/** Bound on the undelivered-done re-POST — the SAME discipline as INTERRUPT_DONE_MAX_ATTEMPTS /
+ *  CLAUDE_IDLE_REAP_MAX_ATTEMPTS, sharing their `doneAttempts` counter (the three nets can never own the
+ *  same record at once: this one requires a done state, the other two exclude it). 5 sweeps ≈ 25 s
+ *  absorbs the transient blip that caused the miss in the first place; past that the pairing is
+ *  unreachable for this event, so the debt is dropped and the record pinned settled rather than
+ *  re-POSTing a doomed done every 5 s forever. */
+const PENDING_DONE_MAX_ATTEMPTS = 5;
+
+/** Gate: does this record owe the worker a done? Only the pessimistic marker matters — the record is
+ *  already in its terminal done state, so there is no status to re-derive and nothing to disambiguate
+ *  from a transcript. Provisional discovery rows are excluded: their op:done is POSTed by discovery
+ *  BEFORE the record is written (delivered gates the write), so they never carry the marker, and
+ *  re-POSTing for one would fight the reconcile machinery. Pure. */
+export function shouldPendingDoneCheck(record: SessionRecord): boolean {
+  if (record.donePending !== true) return false;
+  if (record.provisional === true) return false;
+  return true;
+}
+
+/** Injectable seams for the undelivered-done net, mirroring IdleReapDeps. `now` clocks the re-POSTed
+ *  envelope's ts (its blob `at` stays FROZEN at the record's real done time — see below). */
+export interface PendingDoneDeps {
+  post?: (body: object) => Promise<PostOutcome>;
+  writeRecord?: (path: string, rec: SessionRecord) => Promise<void>;
+  now?: () => number;
+}
+
+/** The undelivered-done reconcile for one tracked session. Gated by shouldPendingDoneCheck; the session
+ *  is already DECIDED done (a real Stop hook produced it), so the only question — as in correctInterrupt
+ *  and correctIdleClaude — is delivery:
+ *   - delivered → clear `donePending` (and `doneAttempts`) and pin the record settled done, so the gate
+ *                 closes and the next real hook re-arms from a done exactly as before.
+ *   - failed    → BOUNDED retry: bump doneAttempts, keep the marker, retry next sweep.
+ *   - capped    → stop POSTing and clear the marker anyway, pinning the record settled: an unreachable
+ *                 worker must not leave this spinning, and a cleared marker also un-blocks the retire
+ *                 net (isRetireEligible) so the row still resolves offline. The worker's own eviction is
+ *                 the phone's backstop, exactly as at the other two nets' caps.
+ *  The re-POSTed blob's `at` is FROZEN at record.ts (the real event time, epoch seconds) — the done
+ *  happened when the Stop hook fired, possibly many sweeps ago, so stamping "now" would make the phone
+ *  show a freshly-finished row that never ages out (the same rule the idle reap follows).
+ *  Returns the interrupt net's verdict quadruple: "corrected" (delivered a done this sweep) /
+ *  "pending" (owns the session, nothing delivered) / "uncorrected" (no debt) / "revoked". */
+export async function correctPendingDone(
+  config: Config, path: string, sessionId: string, record: SessionRecord, now: number, deps: PendingDoneDeps = {},
+): Promise<"corrected" | "pending" | "uncorrected" | "revoked"> {
+  const post = deps.post ?? ((body: object) => postEvent(config, body));
+  const writeRecord = deps.writeRecord
+    // Owner-only (0600), same as the hook's trackSession / every other record rewrite in this file.
+    ?? ((p: string, rec: SessionRecord) => atomicWrite(p, JSON.stringify(rec), 0o600));
+  const clock = deps.now ?? Date.now;
+  try {
+    if (!shouldPendingDoneCheck(record)) return "uncorrected";
+    const agent: AgentKind = record.agent === "codex" ? "codex" : "claude";
+    // The settled record: the debt dropped and the terminal done state pinned (the hook already wrote
+    // these, but a watchdog rewrite between then and now could have moved them — pin explicitly).
+    const settled: SessionRecord = {
+      ...record, lastEvent: "done", sentDone: true, op: "done", donePending: undefined, doneAttempts: undefined,
+    };
+    const attempts = typeof record.doneAttempts === "number" && Number.isFinite(record.doneAttempts) ? record.doneAttempts : 0;
+    if (attempts >= PENDING_DONE_MAX_ATTEMPTS) {
+      try { await writeRecord(path, settled); } catch { /* best-effort — worst case one more capped sweep */ }
+      return "pending";
+    }
+    // record.ts is the Stop's own write time; a corrupt record with no numeric ts simply omits `at`
+    // (the phone then falls back to its own receipt time, as it does for every pre-`at` frame).
+    const at = typeof record.ts === "number" && Number.isFinite(record.ts) ? Math.floor(record.ts / 1000) : undefined;
+    const outcome = await post(await buildDoneEnvelope(sessionId, record, clock(), config.e2eKey, agent, at));
+    if (outcome === "revoked") return "revoked"; // pairing gone → bubble up so the loop can tear down
+    if (outcome === "delivered") {
+      try { await writeRecord(path, settled); } catch {
+        // Rewrite failed — worst case we re-POST the same done next sweep, which the worker drops.
+      }
+      return "corrected";
+    }
+    try { await writeRecord(path, { ...record, doneAttempts: attempts + 1 }); } catch {
+      // Counter write failed — next sweep retries from the same attempt (still bounded by the cap).
+    }
+    return "pending";
+  } catch {
+    return "uncorrected";
+  }
+}
+
 // --- Idle-done retire (free the worker cap slot a long-idle done row still occupies) -----------
 //
 // v1.1.6 froze the reap's blob `at` so a resumed-but-idle Claude session AGES OUT of the phone's
@@ -1139,13 +1241,26 @@ async function sweep(config: Config | null): Promise<SweepResult> {
     }
     const verdict = classifySession(record, now, pidAlive);
     if (verdict === "keep") {
-      // Idle-done RETIRE first: a Claude session pinned done (v1.1.6 idle-reap, or a normal Stop) whose
+      // Undelivered-done reconcile BEFORE everything else: a record can carry a done the worker never
+      // received (the hook's write-before-POST ordering — see correctPendingDone), and until that debt
+      // is settled the worker's view of this session is a stale "update", so no other net's decision
+      // about it is meaningful. Handling it (delivered, retrying, or capped) makes this net the
+      // session's owner for the sweep — retire, the correctives and the heartbeat all stand down, so a
+      // just-repaired done gets to be the phone's last word before retirement can drop the row.
+      let pendingDoneHandled = false;
+      if (config && record) {
+        const pendingDone = await correctPendingDone(config, path, sessionId, record, now);
+        if (pendingDone === "revoked") return { revoked: true };
+        if (pendingDone === "corrected") delivered = true; // its done 2xx'd → the pairing is alive
+        pendingDoneHandled = pendingDone === "corrected" || pendingDone === "pending";
+      }
+      // Idle-done RETIRE next: a Claude session pinned done (v1.1.6 idle-reap, or a normal Stop) whose
       // last REAL event is >1 h old — pid still alive — gets a blob-less op:end + its record deleted, so
       // the per-pairing cap slot its lingering done row occupied is freed. Runs BEFORE remaining++ so a
       // retired session is neither counted alive nor heartbeated. isRetireEligible never fires for a
       // working / needsAttention row (those keep heartbeating) nor for codex (discovery would re-surface
       // it), so this no-ops for everything but a long-idle Claude done row.
-      if (config && record) {
+      if (config && record && !pendingDoneHandled) {
         const retire = await retireDoneStale(config, path, sessionId, record, now);
         if (retire === "revoked") return { revoked: true };
         if (retire !== "skip") {
@@ -1154,7 +1269,9 @@ async function sweep(config: Config | null): Promise<SweepResult> {
         }
       }
       remaining++;
-      if (config && record) {
+      // `!pendingDoneHandled`: the undelivered-done net took this session this sweep, so nothing below
+      // may POST for it (the in-memory `record` is also stale w.r.t. that net's rewrite).
+      if (config && record && !pendingDoneHandled) {
         // Idle-provisional corrective FIRST: a discovery row advertised "working" whose TUI has gone
         // idle gets its one op:done before anything else could heartbeat the stale working blob.
         // Gated to provisional records of a probe-capable agent (codex); everything else no-ops.

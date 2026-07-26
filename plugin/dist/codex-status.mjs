@@ -91,7 +91,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { execFileSync, spawn } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "1.4.0";
+var PLUGIN_VERSION = "1.4.1";
 var CC_DIR = `${process.env.HOME}/.config/cc-status`;
 var SESSIONS_DIR = `${CC_DIR}/sessions`;
 var WATCHDOG_PID_PATH = `${CC_DIR}/watchdog.pid`;
@@ -1505,6 +1505,7 @@ async function trackSession(sessionId, op, prio, status, blob, machine, label, t
       transcript,
       lastEvent: op === "start" ? "sessionStart" : status,
       sentDone: op === "done",
+      ...op === "done" ? { donePending: true } : {},
       op,
       prio,
       ...blob ? { blob } : {},
@@ -1517,6 +1518,14 @@ async function trackSession(sessionId, op, prio, status, blob, machine, label, t
       ...typeof pairingId === "string" && pairingId.length > 0 ? { pairingId } : {}
     };
     await atomicWrite(path, JSON.stringify(record), 384);
+  } catch {}
+}
+async function markDoneDelivered(sessionId) {
+  try {
+    const record = await readRecord(sessionId);
+    if (!record || record.donePending !== true)
+      return;
+    await atomicWrite(`${SESSIONS_DIR}/${sessionId}.json`, JSON.stringify({ ...record, donePending: undefined }), 384);
   } catch {}
 }
 async function reconcileProvisional(config, hookPid) {
@@ -1668,6 +1677,8 @@ async function runHook(agent) {
     if (res.ok) {
       await atomicWrite(LAST_SEND_PATH, String(Date.now()));
       await resetGoneStrikes();
+      if (plan.op === "done")
+        await markDoneDelivered(input.session_id);
     } else if (res.status === 404 || res.status === 410) {
       const strikes = await recordGoneStrike();
       if (strikes >= GONE_STRIKE_LIMIT) {

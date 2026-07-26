@@ -304,6 +304,14 @@ export async function trackSession(
       transcript,
       lastEvent: op === "start" ? "sessionStart" : status,
       sentDone: op === "done",
+      // The done's delivery ACK marker, stamped PESSIMISTICALLY. This record is written BEFORE the POST
+      // is attempted (see the call site), so `sentDone` alone claimed the done had landed even when the
+      // POST then non-2xx'd / timed out / threw — the worker kept the previous op:"update" and the phone
+      // showed the session running forever, with every watchdog self-heal net gated off on exactly that
+      // done state. Assuming NOT-delivered until proven otherwise is what makes a THROWN fetch (which
+      // skips all post-POST bookkeeping) still leave the debt on disk; markDoneDelivered clears it on a
+      // confirmed 2xx and the watchdog's correctPendingDone re-POSTs whatever is left over.
+      ...(op === "done" ? { donePending: true } : {}),
       op,
       prio,
       ...(blob ? { blob } : {}),
@@ -336,6 +344,22 @@ export async function trackSession(
     await atomicWrite(path, JSON.stringify(record), 0o600);
   } catch {
     // Bookkeeping is best-effort; on failure the server's 30-min eviction is still the backstop.
+  }
+}
+
+/** Clear the done-delivery debt trackSession stamped: called ONLY after an op:done POST came back 2xx,
+ *  so the watchdog's correctPendingDone net has nothing to re-send. Read-modify-write rather than a
+ *  blind rewrite: the POST took up to 2 s, and a concurrent sweep may have touched the record in that
+ *  window — we must clear only the marker, never resurrect the pre-POST snapshot. `donePending:
+ *  undefined` drops the key on stringify (the same idiom the watchdog's doneAttempts clears use).
+ *  Best-effort: a failed clear only costs one redundant re-POST that the worker dedupes. */
+export async function markDoneDelivered(sessionId: string): Promise<void> {
+  try {
+    const record = await readRecord(sessionId);
+    if (!record || record.donePending !== true) return; // already clear (or the record is gone) → nothing owed
+    await atomicWrite(`${SESSIONS_DIR}/${sessionId}.json`, JSON.stringify({ ...record, donePending: undefined }), 0o600);
+  } catch {
+    // Bookkeeping is best-effort, exactly like trackSession's own write.
   }
 }
 
@@ -626,6 +650,10 @@ export async function runHook(agent: AgentKind): Promise<void> {
       // delivered event also breaks any gone streak (the pairing is plainly alive again).
       await atomicWrite(LAST_SEND_PATH, String(Date.now()));
       await resetGoneStrikes();
+      // The ONLY place a done's delivery is confirmed. Every other exit from this POST — a non-2xx
+      // below, an AbortSignal timeout, a network throw into the outer catch — leaves trackSession's
+      // pessimistic `donePending` standing, which is precisely the debt the watchdog then settles.
+      if (plan.op === "done") await markDoneDelivered(input.session_id);
     } else if (res.status === 404 || res.status === 410) {
       // The pairing is GONE server-side (404 = deleted, 410 = dormant-GC'd once). Without this, a
       // revoked pairing keeps POSTing ~2×/tool-use forever, 404ing on every hook. A single gone

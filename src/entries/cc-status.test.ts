@@ -8,7 +8,7 @@ import { parseConfig, PendingEventStash, readRecord, SessionRecord, SESSIONS_DIR
 import {
   aiTitle, buildBlob, buildEnvelope, buildPendingStash, cleanPromptTitle, codexIndexTitle, codexSessionTitle,
   codexThreadName, detailForHook, firstUserPrompt, isPermissionNotification, planOp, sessionTitle,
-  stashPendingEvent, trackSession, transcriptStartMs,
+  markDoneDelivered, stashPendingEvent, trackSession, transcriptStartMs,
 } from "./cc-status";
 import { provisionalsCoveredByReal, reconcileProvisionalsSweep } from "./cc-watchdog";
 import { hooksAppearStale, parseCodexPluginState, statusCmd } from "./status-cmd";
@@ -844,6 +844,38 @@ describe("trackSession + readRecord file glue (sentDone survives a fresh disk re
       // next hook after a done never regresses to a dropped/unknown state.
       expect(planOp("PostToolUse", { session_id: sessionId, cwd: "/x" }, record?.sentDone === true))
         .toEqual({ op: "update", prio: 0, status: "working" });
+    } finally {
+      await unlink(`${SESSIONS_DIR}/${sessionId}.json`).catch(() => {});
+    }
+  });
+
+  // The done-delivery ACK marker. trackSession runs BEFORE the POST, so `sentDone` can only ever mean
+  // "a done was RECORDED"; `donePending` is the separate, pessimistic "…and nobody has confirmed the
+  // worker got it". The two must not be conflated: sentDone keeps driving planOp's re-arm and
+  // codex-notify's dedupe, while only the marker drives the watchdog's re-POST.
+  test("a done write stamps donePending alongside sentDone; markDoneDelivered clears ONLY the marker", async () => {
+    const sessionId = `test-ack-${randomUUID()}`;
+    try {
+      await trackSession(sessionId, "done", 0, "done", "ENCRYPTEDBLOB", "mac", "proj", "/tmp/t.jsonl");
+      expect((await readRecord(sessionId))?.donePending).toBe(true);
+
+      await markDoneDelivered(sessionId); // what the hook calls on a confirmed 2xx
+      const acked = await readRecord(sessionId);
+      expect(acked?.donePending).toBeUndefined();
+      // sentDone's meaning is untouched, so the next SessionStart still re-arms to `update`.
+      expect(acked?.sentDone).toBe(true);
+      expect(acked?.op).toBe("done");
+      expect(acked?.blob).toBe("ENCRYPTEDBLOB");
+      expect(planOp("SessionStart", { session_id: sessionId, cwd: "/x" }, acked?.sentDone === true))
+        .toEqual({ op: "update", prio: 0, status: "working" });
+
+      // Idempotent, and a NON-done event never carries the marker (only a done can owe a delivery).
+      await markDoneDelivered(sessionId);
+      expect((await readRecord(sessionId))?.donePending).toBeUndefined();
+      await trackSession(sessionId, "update", 0, "working", "B", "mac", "proj", "/tmp/t.jsonl");
+      const working = await readRecord(sessionId);
+      expect(working?.donePending).toBeUndefined();
+      expect(working?.sentDone).toBe(false);
     } finally {
       await unlink(`${SESSIONS_DIR}/${sessionId}.json`).catch(() => {});
     }
@@ -1872,6 +1904,77 @@ describe("runHook gone-strike teardown (revoked pairing stops POSTing forever)",
       srv.close();
       await rm(home, { recursive: true, force: true });
     }
+  }, 20000);
+});
+
+// --- runHook done-delivery ack (the Stop that landed on disk but never on the worker) ------------
+//
+// trackSession persists the record BEFORE the POST is attempted, and the whole hook body sits inside a
+// blanket catch — so a Stop whose POST 500s, times out on the 2 s AbortSignal, or throws used to leave
+// sentDone:true on disk while the worker still held the previous op:"update". Every watchdog self-heal
+// net gates itself off on that done state, so nothing ever repaired it (live incident 2026-07-26: the
+// phone showed a finished session running for ~13 h). The fix is an ack marker the hook only clears on a
+// confirmed 2xx. Spawning the REAL entry against a scripted server is the faithful way to exercise it —
+// a mocked fetch would not reproduce the write-before-POST ordering that causes the bug.
+describe("runHook done-delivery ack (donePending survives a failed Stop POST, clears on a 2xx)", () => {
+  const rawKey = new Uint8Array(32).fill(9);
+  const entry = join(import.meta.dir, "cc-status.ts");
+
+  // `url` undefined → point the hook at the discard port (127.0.0.1:9) so its fetch fails outright,
+  // standing in for the network-error / timeout arm that never reaches the post-POST bookkeeping.
+  async function runStop(status?: number): Promise<SessionRecord | null> {
+    const server = status === undefined ? null : Bun.serve({
+      port: 0,
+      fetch: () => new Response(status === 200 ? "{}" : "nope", { status }),
+    });
+    const url = server ? `http://127.0.0.1:${server.port}` : "http://127.0.0.1:9";
+    const home = await mkdtemp(join(tmpdir(), "cc-hook-ack-"));
+    try {
+      const ccDir = join(home, ".config", "cc-status");
+      await mkdir(join(ccDir, "sessions"), { recursive: true });
+      await writeFile(join(ccDir, "config.json"), JSON.stringify({
+        url, pairingId: "p", pcSecret: "s", e2eKeyB64: b64url(rawKey),
+      }));
+      // A live watchdog pidfile (this test process) so ensureWatchdog() no-ops instead of detaching one.
+      await writeFile(join(ccDir, "watchdog.pid"), String(process.pid));
+      const proc = Bun.spawn({
+        cmd: ["bun", entry],
+        env: { ...process.env, HOME: home },
+        stdin: Buffer.from(JSON.stringify({
+          session_id: "ack-1", hook_event_name: "Stop", cwd: "/x/api-status", transcript_path: "",
+        })),
+        stdout: "ignore", stderr: "ignore",
+      });
+      await proc.exited;
+      try { return JSON.parse(await readFile(join(ccDir, "sessions", "ack-1.json"), "utf8")) as SessionRecord; } catch { return null; }
+    } finally {
+      server?.stop(true);
+      await rm(home, { recursive: true, force: true });
+    }
+  }
+
+  test("a 2xx Stop clears the marker (nothing owed)", async () => {
+    const record = await runStop(200);
+    expect(record?.op).toBe("done");
+    expect(record?.sentDone).toBe(true);
+    expect(record?.donePending).toBeUndefined();
+  }, 20000);
+
+  test("a 500 Stop leaves the marker set — the worker never got the done", async () => {
+    const record = await runStop(500);
+    expect(record?.sentDone).toBe(true);       // unchanged meaning: a done WAS recorded
+    expect(record?.donePending).toBe(true);    // …and it is still owed to the worker
+  }, 20000);
+
+  test("a THROWN fetch (dead host) leaves the marker set — the arm that skips all post-POST bookkeeping", async () => {
+    const record = await runStop(undefined);
+    expect(record?.sentDone).toBe(true);
+    expect(record?.donePending).toBe(true);
+  }, 20000);
+
+  test("a 404 (gone) leaves the marker set too — only a 2xx is proof of delivery", async () => {
+    const record = await runStop(404);
+    expect(record?.donePending).toBe(true);
   }, 20000);
 });
 

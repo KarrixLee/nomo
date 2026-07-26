@@ -92,7 +92,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { execFileSync, spawn } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "1.4.0";
+var PLUGIN_VERSION = "1.4.1";
 var CC_DIR = `${process.env.HOME}/.config/cc-status`;
 var SESSIONS_DIR = `${CC_DIR}/sessions`;
 var WATCHDOG_PID_PATH = `${CC_DIR}/watchdog.pid`;
@@ -2278,6 +2278,7 @@ async function trackSession(sessionId, op, prio, status, blob, machine, label, t
       transcript,
       lastEvent: op === "start" ? "sessionStart" : status,
       sentDone: op === "done",
+      ...op === "done" ? { donePending: true } : {},
       op,
       prio,
       ...blob ? { blob } : {},
@@ -2290,6 +2291,14 @@ async function trackSession(sessionId, op, prio, status, blob, machine, label, t
       ...typeof pairingId === "string" && pairingId.length > 0 ? { pairingId } : {}
     };
     await atomicWrite(path, JSON.stringify(record), 384);
+  } catch {}
+}
+async function markDoneDelivered(sessionId) {
+  try {
+    const record = await readRecord(sessionId);
+    if (!record || record.donePending !== true)
+      return;
+    await atomicWrite(`${SESSIONS_DIR}/${sessionId}.json`, JSON.stringify({ ...record, donePending: undefined }), 384);
   } catch {}
 }
 async function reconcileProvisional(config, hookPid) {
@@ -2441,6 +2450,8 @@ async function runHook(agent) {
     if (res.ok) {
       await atomicWrite(LAST_SEND_PATH, String(Date.now()));
       await resetGoneStrikes();
+      if (plan.op === "done")
+        await markDoneDelivered(input.session_id);
     } else if (res.status === 404 || res.status === 410) {
       const strikes = await recordGoneStrike();
       if (strikes >= GONE_STRIKE_LIMIT) {
@@ -3766,6 +3777,55 @@ async function correctIdleClaude(config, path, sessionId, record, now, deps = {}
     return "uncorrected";
   }
 }
+var PENDING_DONE_MAX_ATTEMPTS = 5;
+function shouldPendingDoneCheck(record) {
+  if (record.donePending !== true)
+    return false;
+  if (record.provisional === true)
+    return false;
+  return true;
+}
+async function correctPendingDone(config, path, sessionId, record, now, deps = {}) {
+  const post = deps.post ?? ((body) => postEvent(config, body));
+  const writeRecord = deps.writeRecord ?? ((p, rec) => atomicWrite(p, JSON.stringify(rec), 384));
+  const clock = deps.now ?? Date.now;
+  try {
+    if (!shouldPendingDoneCheck(record))
+      return "uncorrected";
+    const agent = record.agent === "codex" ? "codex" : "claude";
+    const settled = {
+      ...record,
+      lastEvent: "done",
+      sentDone: true,
+      op: "done",
+      donePending: undefined,
+      doneAttempts: undefined
+    };
+    const attempts = typeof record.doneAttempts === "number" && Number.isFinite(record.doneAttempts) ? record.doneAttempts : 0;
+    if (attempts >= PENDING_DONE_MAX_ATTEMPTS) {
+      try {
+        await writeRecord(path, settled);
+      } catch {}
+      return "pending";
+    }
+    const at = typeof record.ts === "number" && Number.isFinite(record.ts) ? Math.floor(record.ts / 1000) : undefined;
+    const outcome = await post(await buildDoneEnvelope(sessionId, record, clock(), config.e2eKey, agent, at));
+    if (outcome === "revoked")
+      return "revoked";
+    if (outcome === "delivered") {
+      try {
+        await writeRecord(path, settled);
+      } catch {}
+      return "corrected";
+    }
+    try {
+      await writeRecord(path, { ...record, doneAttempts: attempts + 1 });
+    } catch {}
+    return "pending";
+  } catch {
+    return "uncorrected";
+  }
+}
 var RETIRE_AFTER_MS = 3600000;
 function isRetireEligible(record, now) {
   if (record.agent === "codex")
@@ -3894,7 +3954,16 @@ async function sweep(config) {
     }
     const verdict = classifySession(record, now, pidAlive);
     if (verdict === "keep") {
+      let pendingDoneHandled = false;
       if (config && record) {
+        const pendingDone = await correctPendingDone(config, path, sessionId, record, now);
+        if (pendingDone === "revoked")
+          return { revoked: true };
+        if (pendingDone === "corrected")
+          delivered = true;
+        pendingDoneHandled = pendingDone === "corrected" || pendingDone === "pending";
+      }
+      if (config && record && !pendingDoneHandled) {
         const retire = await retireDoneStale(config, path, sessionId, record, now);
         if (retire === "revoked")
           return { revoked: true };
@@ -3905,7 +3974,7 @@ async function sweep(config) {
         }
       }
       remaining++;
-      if (config && record) {
+      if (config && record && !pendingDoneHandled) {
         const idleFix = await correctIdleProvisional(config, path, sessionId, record);
         if (idleFix === "revoked")
           return { revoked: true };
@@ -4112,6 +4181,7 @@ export {
   titleRepairedRecord,
   tailShowsInterrupt,
   shouldRepairTitle,
+  shouldPendingDoneCheck,
   shouldPendingApprovalCheck,
   shouldInterruptCheck,
   shouldIdleProvisionalCheck,
@@ -4127,6 +4197,7 @@ export {
   hasInterruptMarker,
   goneStrikeShouldTeardown,
   discoverLiveSessions,
+  correctPendingDone,
   correctPendingApproval,
   correctInterrupt,
   correctIdleClaude,

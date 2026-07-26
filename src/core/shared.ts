@@ -222,6 +222,20 @@ export interface SessionRecord {
    *  retry cap the record is pinned done LOCALLY (the worker's own eviction resolves the phone since we
    *  can't deliver). Absent → the interrupt net hasn't taken ownership; a real hook re-write clears it. */
   doneAttempts?: number;
+  /** True while an op:done for this session has been RECORDED but NOT confirmed delivered — the ack
+   *  marker for the hook's write-before-POST ordering. trackSession persists the record BEFORE the POST
+   *  is attempted (so a force-killed terminal still leaves a reapable file), so a Stop whose POST then
+   *  non-2xx'd, timed out, or threw left `sentDone:true` on disk while the worker still held the
+   *  previous op:"update" — the phone showed the session running forever, and EVERY self-heal net gates
+   *  itself off on exactly that done state (live incident 2026-07-26: a session stuck "running" ~13 h).
+   *  So the done is stamped PESSIMISTICALLY (set when the record is written, cleared only by a confirmed
+   *  2xx — see markDoneDelivered), which means a thrown/timed-out fetch, or a crash mid-POST, still
+   *  leaves the marker set. The watchdog's correctPendingDone net re-POSTs it.
+   *
+   *  DELIBERATELY SEPARATE from `sentDone`, which keeps its existing meaning ("the last POSTed event for
+   *  this session was a done") because planOp's re-arm (SessionStart + sentDone → op:update) and
+   *  codex-notify's double-send dedupe both key on it. Absent → nothing owed. */
+  donePending?: boolean;
 }
 
 /** The plaintext a pending-pairing flush needs to POST the pairing session the instant the shared key

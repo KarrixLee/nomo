@@ -21,7 +21,7 @@
 import { hostname } from "node:os";
 import { basename } from "node:path";
 import { cleanPromptTitle, codexAdapter } from "../core/adapter";
-import { buildEnvelope, trackSession } from "../core/hook";
+import { buildEnvelope, markDoneDelivered, trackSession } from "../core/hook";
 import { atomicWrite, ensureWatchdog, LAST_SEND_PATH, loadConfig, localApprovalsState, PLUGIN_VERSION, readRecord } from "../core/shared";
 
 /** Map the notify JSON onto the runHook/planOp Stop-hook input shape. Null for any payload that isn't
@@ -156,7 +156,13 @@ export async function runNotify(raw: string, deferMs = notifyDeferMs(), sleep: (
       body: JSON.stringify(envelope),
       signal: AbortSignal.timeout(2000),
     });
-    if (res.ok) await atomicWrite(LAST_SEND_PATH, String(now));
+    // Same write-before-POST ordering as runHook, so the same ack discipline applies: trackSession above
+    // stamped the record donePending, and only a confirmed 2xx clears it. A failed backstop done is then
+    // re-POSTed by the watchdog's correctPendingDone instead of silently claiming it landed.
+    if (res.ok) {
+      await atomicWrite(LAST_SEND_PATH, String(now));
+      await markDoneDelivered(sessionId);
+    }
   } catch {
     // Silence is the contract — a notify backstop must never surface into a Codex session.
   }
