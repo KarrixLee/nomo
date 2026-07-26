@@ -2134,10 +2134,10 @@ class CodexProxyTransport {
 import { hostname as hostname3 } from "node:os";
 
 // src/core/permission.ts
-import { unlink as unlink3 } from "node:fs/promises";
+import { realpath, unlink as unlink3 } from "node:fs/promises";
 import { appendFileSync, statSync, truncateSync } from "node:fs";
 import { hostname as hostname2 } from "node:os";
-import { basename as basename3 } from "node:path";
+import { basename as basename3, isAbsolute, relative, resolve } from "node:path";
 
 // src/core/hook.ts
 import { readdir as readdir2, readFile as readFile3, unlink as unlink2 } from "node:fs/promises";
@@ -2474,6 +2474,96 @@ var POST_RETRY_PAUSE_MS = 1000;
 var HOLD_RETRY_DELAY_MS = 4000;
 var FRESH_SESSION_MS = 60000;
 var MAX_CONSECUTIVE_MISSES = 100;
+var CODEX_POLICY_TAIL_BYTES = 8 * 1024 * 1024;
+var CODEX_ROLLOUT_HEAD_BYTES = 1024 * 1024;
+function codexTurnPolicyFromRollout(text, turnId) {
+  if (turnId.length === 0)
+    return null;
+  const lines = text.split(`
+`);
+  for (let i = lines.length - 1;i >= 0; i -= 1) {
+    const line = lines[i];
+    if (!line.includes("turn_context") || !line.includes(turnId))
+      continue;
+    let row;
+    try {
+      row = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (typeof row !== "object" || row === null)
+      continue;
+    const record = row;
+    if (record.type !== "turn_context")
+      continue;
+    const payload = record.payload;
+    if (typeof payload !== "object" || payload === null)
+      continue;
+    const context = payload;
+    if (context.turn_id !== turnId)
+      continue;
+    const sandbox = typeof context.sandbox_policy === "object" && context.sandbox_policy !== null ? context.sandbox_policy : undefined;
+    const profile = typeof context.permission_profile === "object" && context.permission_profile !== null ? context.permission_profile : undefined;
+    return {
+      approvalPolicy: context.approval_policy,
+      approvalsReviewer: typeof context.approvals_reviewer === "string" ? context.approvals_reviewer : undefined,
+      sandboxType: typeof sandbox?.type === "string" ? sandbox.type : undefined,
+      permissionProfileType: typeof profile?.type === "string" ? profile.type : undefined
+    };
+  }
+  return null;
+}
+function codexRolloutSessionId(text) {
+  for (const line of text.split(`
+`)) {
+    if (!line.includes("session_meta"))
+      continue;
+    let row;
+    try {
+      row = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (typeof row !== "object" || row === null)
+      continue;
+    const record = row;
+    if (record.type !== "session_meta")
+      continue;
+    const id = record.payload?.id;
+    return typeof id === "string" && id.length > 0 ? id : undefined;
+  }
+  return;
+}
+async function loadCodexTurnPolicy(transcriptPath, turnId, sessionId, home = codexHome()) {
+  if (!transcriptPath || !turnId || !sessionId || !basename3(transcriptPath).match(/^rollout-.*\.jsonl$/))
+    return null;
+  try {
+    const sessionsRoot = await realpath(resolve(home, "sessions"));
+    const rollout = await realpath(transcriptPath);
+    const rel = relative(sessionsRoot, rollout);
+    if (rel === "" || rel.startsWith("..") || isAbsolute(rel))
+      return null;
+    const head = await readPrefix(rollout, CODEX_ROLLOUT_HEAD_BYTES);
+    if (codexRolloutSessionId(head) !== sessionId)
+      return null;
+    return codexTurnPolicyFromRollout(await readSuffix(rollout, CODEX_POLICY_TAIL_BYTES), turnId);
+  } catch {
+    return null;
+  }
+}
+function codexPassThroughReason(policy) {
+  if (!policy)
+    return "codex-context-unknown";
+  if (policy.approvalPolicy === "never")
+    return "codex-full-access";
+  const guardianReviewer = policy.approvalsReviewer === "auto_review" || policy.approvalsReviewer === "guardian_subagent";
+  const reviewablePolicy = policy.approvalPolicy === "on-request" || policy.approvalPolicy === "granular" || typeof policy.approvalPolicy === "object" && policy.approvalPolicy !== null;
+  if (guardianReviewer && reviewablePolicy)
+    return "codex-auto-review";
+  if (policy.approvalPolicy === "untrusted" || policy.approvalsReviewer === "user")
+    return;
+  return "codex-context-unknown";
+}
 function decisionLine(agent, hookSpecificOutput) {
   return JSON.stringify(agent === "codex" ? { continue: true, hookSpecificOutput } : { hookSpecificOutput });
 }
@@ -2843,6 +2933,19 @@ async function runPermissionHook(deps = {}, agent = "claude") {
       trace({ event: "exit", reason: "mode", mode: permissionMode, ...codexDialogMode ? { codex_dialog_mode: true } : {} });
       return;
     }
+    if (agent === "codex" && !toolName.startsWith("mcp__")) {
+      const transcriptPath = typeof input.transcript_path === "string" ? input.transcript_path : "";
+      const turnId = typeof input.turn_id === "string" ? input.turn_id : "";
+      const policy = await (deps.loadCodexTurnPolicyFn ?? loadCodexTurnPolicy)(transcriptPath, turnId, sessionId);
+      const reason = codexPassThroughReason(policy);
+      if (reason) {
+        trace({ event: "exit", reason });
+        return;
+      }
+      trace({ event: "codex-reviewer", disposition: "hold", reason: "manual" });
+    } else if (agent === "codex") {
+      trace({ event: "codex-reviewer", disposition: "hold", reason: "mcp-reviewer-unknown" });
+    }
     const toolInput = typeof input.tool_input === "object" && input.tool_input !== null ? input.tool_input : {};
     const suggestions = input.permission_suggestions;
     const requestId = (deps.randomUUID ?? (() => crypto.randomUUID()))();
@@ -3059,14 +3162,14 @@ function baseBlob(request, record, config, now) {
 function abortableSleep(ms, signal, sleep) {
   if (signal.aborted)
     return Promise.resolve();
-  return new Promise((resolve) => {
+  return new Promise((resolve2) => {
     let done = false;
     const finish = () => {
       if (done)
         return;
       done = true;
       signal.removeEventListener("abort", finish);
-      resolve();
+      resolve2();
     };
     signal.addEventListener("abort", finish, { once: true });
     sleep(ms).then(finish, finish);
@@ -3131,8 +3234,8 @@ async function runRemoteInput(request, requestId, signal, deps, onHoldCreated) {
       "x-cc-auth": deps.config.pcSecret,
       "x-cc-version": PLUGIN_VERSION
     };
-    const sleep = deps.sleep ?? ((ms) => new Promise((resolve) => {
-      const timer = setTimeout(resolve, ms);
+    const sleep = deps.sleep ?? ((ms) => new Promise((resolve2) => {
+      const timer = setTimeout(resolve2, ms);
       timer.unref?.();
     }));
     let response;
@@ -3224,8 +3327,8 @@ function startCodexRemoteInput(request, deps) {
   const controller = new AbortController;
   const fetchFn = deps.fetchFn ?? fetch;
   let settleHold;
-  const holdCreated = new Promise((resolve) => {
-    settleHold = resolve;
+  const holdCreated = new Promise((resolve2) => {
+    settleHold = resolve2;
   });
   let resolvePromise;
   const completion = runRemoteInput(request, requestId, controller.signal, deps, settleHold);

@@ -1,10 +1,11 @@
-import { mkdtemp, readFile, writeFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, symlink, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "bun:test";
 import {
   buildPermissionSummary, buildPermissionDetail, buildPermissionQuestions, fitPermissionDetail,
   sealedBlobChars, BLOB_FIT_CHARS, runPermissionHook, approvalsCommand, NO_HOLD_PATH, TRACE_PATH,
+  codexRolloutSessionId, codexTurnPolicyFromRollout, loadCodexTurnPolicy,
 } from "./permission";
 import { encryptBlob, decryptBlob } from "./crypto";
 import type { Config } from "./shared";
@@ -45,6 +46,68 @@ describe("buildPermissionSummary", () => {
   test("missing input fields → falls back to tool_name", () => {
     expect(buildPermissionSummary("Bash", {})).toBe("Bash");
     expect(buildPermissionSummary("Edit", {})).toBe("Edit");
+  });
+});
+
+describe("Codex turn approval policy", () => {
+  const row = (type: string, payload: Record<string, unknown>) => JSON.stringify({ type, payload });
+
+  test("takes the last matching turn_context and ignores a newer unrelated turn", () => {
+    const rollout = [
+      row("turn_context", { turn_id: "wanted", approval_policy: "on-request", approvals_reviewer: "user" }),
+      row("turn_context", { turn_id: "wanted", approval_policy: "on-request", approvals_reviewer: "auto_review" }),
+      row("turn_context", { turn_id: "other", approval_policy: "on-request", approvals_reviewer: "user" }),
+    ].join("\n");
+    expect(codexTurnPolicyFromRollout(rollout, "wanted")).toMatchObject({
+      approvalPolicy: "on-request", approvalsReviewer: "auto_review",
+    });
+  });
+
+  test("skips malformed rows and extracts Full Access signals", () => {
+    const rollout = [
+      "{sliced",
+      row("turn_context", {
+        turn_id: "full", approval_policy: "never", sandbox_policy: { type: "danger-full-access" },
+        permission_profile: { type: "disabled" },
+      }),
+    ].join("\n");
+    expect(codexTurnPolicyFromRollout(rollout, "full")).toEqual({
+      approvalPolicy: "never", approvalsReviewer: undefined,
+      sandboxType: "danger-full-access", permissionProfileType: "disabled",
+    });
+    expect(codexTurnPolicyFromRollout(rollout, "missing")).toBeNull();
+  });
+
+  test("session_meta parser accepts only the session row id", () => {
+    expect(codexRolloutSessionId([
+      row("event_msg", { id: "wrong" }),
+      row("session_meta", { id: "sess-right" }),
+    ].join("\n"))).toBe("sess-right");
+  });
+
+  test("loader accepts the matching rollout under CODEX_HOME and rejects session/path mismatches", async () => {
+    const home = await mkdtemp(join(tmpdir(), "nomo-codex-policy-"));
+    const day = join(home, "sessions", "2026", "07", "27");
+    await mkdir(day, { recursive: true });
+    const rollout = join(day, "rollout-test.jsonl");
+    await writeFile(rollout, [
+      row("session_meta", { id: "sess-1", base_instructions: "x".repeat(70 * 1024) }),
+      row("turn_context", { turn_id: "turn-1", approval_policy: "on-request", approvals_reviewer: "auto_review" }),
+    ].join("\n"));
+    await expect(loadCodexTurnPolicy(rollout, "turn-1", "sess-1", home)).resolves.toMatchObject({
+      approvalPolicy: "on-request", approvalsReviewer: "auto_review",
+    });
+    await expect(loadCodexTurnPolicy(rollout, "turn-1", "another-session", home)).resolves.toBeNull();
+    const outside = join(home, "rollout-outside.jsonl");
+    await writeFile(outside, [
+      row("session_meta", { id: "sess-1" }),
+      row("turn_context", { turn_id: "turn-1", approval_policy: "on-request", approvals_reviewer: "auto_review" }),
+    ].join("\n"));
+    await expect(loadCodexTurnPolicy(outside, "turn-1", "sess-1", home)).resolves.toBeNull();
+    const escapedLink = join(day, "rollout-escaped-link.jsonl");
+    await symlink(outside, escapedLink);
+    await expect(loadCodexTurnPolicy(escapedLink, "turn-1", "sess-1", home)).resolves.toBeNull();
+    await rm(home, { recursive: true, force: true });
   });
 });
 
@@ -336,6 +399,7 @@ const baseDeps = (over: Record<string, unknown>) => ({
   readInput: async () => INPUT,
   loadConfigFn: async () => CONFIG,
   readRecordFn: async () => null,
+  loadCodexTurnPolicyFn: async () => ({ approvalPolicy: "on-request", approvalsReviewer: "user" }),
   sleep: async () => {},
   now: () => 1000,
   randomUUID: () => "req-fixed",
@@ -1366,6 +1430,125 @@ describe("runPermissionHook — codex agent", () => {
     await runPermissionHook(baseDeps({ fetchFn: fn, emit: (l: string) => emitted.push(l), ...over }) as never, "codex");
     return { emitted, calls };
   };
+
+  test("Approve for me → bypasses Nomo before any phone POST and leaves remote approvals enabled", async () => {
+    const spy = spyFetch();
+    const emitted: string[] = [];
+    const events: Array<Record<string, unknown>> = [];
+    let loadedWith: string[] = [];
+    await runPermissionHook(baseDeps({
+      readInput: async () => inputWith({
+        permission_mode: "default", turn_id: "turn-auto", transcript_path: "/codex/rollout.jsonl",
+      }),
+      loadCodexTurnPolicyFn: async (path: string, turnId: string, sessionId: string) => {
+        loadedWith = [path, turnId, sessionId];
+        return { approvalPolicy: "on-request", approvalsReviewer: "auto_review", sandboxType: "workspace-write" };
+      },
+      fetchFn: spy.fn,
+      emit: (line: string) => emitted.push(line),
+      trace: (event: Record<string, unknown>) => events.push(event),
+    }) as never, "codex");
+    expect(loadedWith).toEqual(["/codex/rollout.jsonl", "turn-auto", "sess-1"]);
+    expect(spy.called()).toBe(false);
+    expect(emitted).toEqual([]);
+    expect(events.at(-1)).toMatchObject({ event: "exit", reason: "codex-auto-review" });
+  });
+
+  test("Full Access → bypasses before rollout lookup or phone POST", async () => {
+    const spy = spyFetch();
+    const events: Array<Record<string, unknown>> = [];
+    await runPermissionHook(baseDeps({
+      readInput: async () => inputWith({ permission_mode: "bypassPermissions" }),
+      loadCodexTurnPolicyFn: async () => { throw new Error("must not inspect rollout in Full Access"); },
+      fetchFn: spy.fn,
+      emit: () => {},
+      trace: (event: Record<string, unknown>) => events.push(event),
+    }) as never, "codex");
+    expect(spy.called()).toBe(false);
+    expect(events.at(-1)).toMatchObject({ event: "exit", reason: "mode", mode: "bypassPermissions" });
+  });
+
+  test("manual reviewer remains phone-holdable", async () => {
+    const { emitted, calls } = await answerCodex({ decision: "allow" }, {
+      readInput: async () => inputWith({ permission_mode: "default", turn_id: "turn-user" }),
+      loadCodexTurnPolicyFn: async () => ({ approvalPolicy: "on-request", approvalsReviewer: "user" }),
+    });
+    expect(calls.filter((call) => call.method === "POST")).toHaveLength(1);
+    expect(emitted).toEqual([CODEX_ALLOW]);
+  });
+
+  test("missing or unreadable turn context fails open to native Codex, never the phone", async () => {
+    const spy = spyFetch();
+    const events: Array<Record<string, unknown>> = [];
+    await runPermissionHook(baseDeps({
+      readInput: async () => inputWith({ permission_mode: "default", turn_id: "turn-missing" }),
+      loadCodexTurnPolicyFn: async () => null,
+      fetchFn: spy.fn,
+      emit: () => {},
+      trace: (event: Record<string, unknown>) => events.push(event),
+    }) as never, "codex");
+    expect(spy.called()).toBe(false);
+    expect(events.at(-1)).toMatchObject({ event: "exit", reason: "codex-context-unknown" });
+  });
+
+  test("auto reviewer with untrusted policy remains phone-holdable (Codex does not run guardian there)", async () => {
+    const { emitted, calls } = await answerCodex({ decision: "allow" }, {
+      readInput: async () => inputWith({ permission_mode: "default", turn_id: "turn-untrusted" }),
+      loadCodexTurnPolicyFn: async () => ({ approvalPolicy: "untrusted", approvalsReviewer: "auto_review" }),
+    });
+    expect(calls.filter((call) => call.method === "POST")).toHaveLength(1);
+    expect(emitted).toEqual([CODEX_ALLOW]);
+  });
+
+  test("danger-full-access alone does not bypass a manual approval policy", async () => {
+    const { emitted, calls } = await answerCodex({ decision: "allow" }, {
+      readInput: async () => inputWith({ permission_mode: "default", turn_id: "turn-untrusted" }),
+      loadCodexTurnPolicyFn: async () => ({
+        approvalPolicy: "untrusted", approvalsReviewer: "user", sandboxType: "danger-full-access",
+        permissionProfileType: "disabled",
+      }),
+    });
+    expect(calls.filter((call) => call.method === "POST")).toHaveLength(1);
+    expect(emitted).toEqual([CODEX_ALLOW]);
+  });
+
+  test("MCP tools do not use the thread-global reviewer because apps can override it", async () => {
+    const spy = spyFetch();
+    await runPermissionHook(baseDeps({
+      readInput: async () => inputWith({
+        permission_mode: "default", tool_name: "mcp__example__write", turn_id: "turn-mcp",
+      }),
+      loadCodexTurnPolicyFn: async () => { throw new Error("thread reviewer is not authoritative for MCP"); },
+      fetchFn: spy.fn,
+      emit: () => {},
+    }) as never, "codex");
+    expect(spy.called()).toBe(true);
+  });
+
+  test("rollout approval_policy=never bypasses even if a producer reports default", async () => {
+    const spy = spyFetch();
+    await runPermissionHook(baseDeps({
+      readInput: async () => inputWith({ permission_mode: "default", turn_id: "turn-full" }),
+      loadCodexTurnPolicyFn: async () => ({
+        approvalPolicy: "never", approvalsReviewer: "user", sandboxType: "workspace-write",
+        permissionProfileType: "managed",
+      }),
+      fetchFn: spy.fn,
+      emit: () => {},
+    }) as never, "codex");
+    expect(spy.called()).toBe(false);
+  });
+
+  test("Claude never consults the Codex reviewer gate", async () => {
+    const spy = spyFetch();
+    await runPermissionHook(baseDeps({
+      readInput: async () => inputWith({ permission_mode: "default" }),
+      loadCodexTurnPolicyFn: async () => { throw new Error("Claude must not inspect a Codex rollout"); },
+      fetchFn: spy.fn,
+      emit: () => {},
+    }) as never, "claude");
+    expect(spy.called()).toBe(true);
+  });
 
   test("allow → the continue:true-wrapped allow line", async () => {
     const { emitted } = await answerCodex({ decision: "allow" });
