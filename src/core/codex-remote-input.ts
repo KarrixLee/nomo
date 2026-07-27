@@ -12,7 +12,8 @@ import {
   Config, localApprovalsState, PLUGIN_VERSION, readRecord, SessionRecord,
 } from "./shared";
 import type {
-  CodexUserInputAnswers, CodexUserInputAnswerResult, CodexUserInputRequest,
+  CodexUserInputAnswers, CodexUserInputAnswerResult, CodexUserInputInterruptResult,
+  CodexUserInputRequest,
 } from "./codex-app-server-client";
 
 const POST_TIMEOUT_MS = 15_000;
@@ -27,6 +28,7 @@ const QUESTION_DESCRIPTION_MAX = 160;
 
 export type CodexRemoteInputResult =
   | "answered"
+  | "denied"
   | "not-held"
   | "unsupported"
   | "expired"
@@ -37,6 +39,7 @@ export type CodexRemoteInputResult =
 export interface CodexRemoteInputDeps {
   config: Config;
   answerAppServer: (answers: CodexUserInputAnswers) => Promise<CodexUserInputAnswerResult>;
+  interruptAppServer: () => Promise<CodexUserInputInterruptResult>;
   fetchFn?: typeof fetch;
   readRecordFn?: (sessionId: string) => Promise<SessionRecord | null>;
   randomUUID?: () => string;
@@ -193,8 +196,8 @@ async function runRemoteInput(
 
     const now = (deps.now ?? Date.now)();
     const fallback = baseBlob(request, record, deps.config, now);
-  // The encrypted fallback keeps a compact preview for old/status-only clients. The live question
-  // frame carries the structured picker instead; repeating the preview wastes the strict push budget.
+    // The encrypted fallback keeps a compact preview for old/status-only clients. The live question
+    // frame carries the structured picker instead; repeating the preview wastes the strict push budget.
     const { detail: _fallbackDetail, ...promptBase } = fallback;
     const permissionBase = {
       ...promptBase,
@@ -277,7 +280,12 @@ async function runRemoteInput(
             let answer: PhoneAnswer;
             try { answer = await decryptBlob(deps.config.e2eKey, data.answerBlob) as PhoneAnswer; }
             catch { return "transport-error"; }
-            if (answer.requestId !== requestId || answer.decision !== "answer") return "unsupported";
+            if (answer.requestId !== requestId) return "unsupported";
+            if (answer.decision === "deny") {
+              const result = await deps.interruptAppServer();
+              return result === "sent" || result === "already-sent" ? "denied" : "transport-error";
+            }
+            if (answer.decision !== "answer") return "unsupported";
             const mapped = codexAnswersFromPhone(request, answer.answers);
             if (!mapped) return "unsupported";
             const result = await deps.answerAppServer(mapped);

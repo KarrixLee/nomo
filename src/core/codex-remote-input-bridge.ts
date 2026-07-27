@@ -8,6 +8,7 @@ import {
   CodexThreadResumeResult,
   CodexUserInputAnswerResult,
   CodexUserInputAnswers,
+  CodexUserInputInterruptResult,
   CodexUserInputRequest,
   CodexUserInputRequestIdentity,
   CodexUserInputResolution,
@@ -30,6 +31,7 @@ interface BridgeClient {
   listLoadedThreads(params?: { cursor?: string | null; limit?: number | null }): Promise<CodexLoadedThreadListResult>;
   resumeThread(threadId: string): Promise<CodexThreadResumeResult>;
   answerUserInput(identity: CodexUserInputRequestIdentity, answers: CodexUserInputAnswers): Promise<CodexUserInputAnswerResult>;
+  interruptUserInput(identity: CodexUserInputRequestIdentity): Promise<CodexUserInputInterruptResult>;
 }
 
 export interface CodexRemoteInputBridgeCallbacks {
@@ -140,6 +142,7 @@ export class CodexRemoteInputBridge {
     const handle = this.startRemoteInputFn(request, {
       config: this.config,
       answerAppServer: (answers) => this.client.answerUserInput(request.identity, answers),
+      interruptAppServer: () => this.client.interruptUserInput(request.identity),
     });
     this.handles.set(key, handle);
     void handle.completion.finally(() => {
@@ -152,9 +155,11 @@ export class CodexRemoteInputBridge {
     const handle = this.handles.get(key);
     if (!handle) return;
     this.handles.delete(key);
-    // A response-sent resolution is the acknowledgement for our own phone answer. Every other
-    // resolution means Desktop, an interrupt, or a disconnect won; retire the phone card.
-    if (resolution !== "response-sent") void handle.resolvedElsewhere();
+    // A response/interrupt sent by this bridge is the acknowledgement for our own phone action. Every
+    // other resolution means Desktop, another interrupt, or a disconnect won; retire the phone card.
+    if (resolution !== "response-sent" && resolution !== "interrupt-sent") {
+      void handle.resolvedElsewhere();
+    }
   }
 
   private onStateChange(state: CodexAppServerState): void {

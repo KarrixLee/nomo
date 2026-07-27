@@ -68,7 +68,8 @@ const USER_INPUT_DETAIL_MAX = 240;
  *  Plan collaboration mode. What we rely on is narrower and does hold either way: WHEN the call appears,
  *  the session is genuinely blocked on the user, and the hook/rollout contracts expose it — so it is a
  *  sound blocked-state signal, not a complete one (a build with the experiment off simply never emits it,
- *  and this path stays dormant). Status-only: Nomo does not pretend it can submit an answer. */
+ *  and this path stays dormant). This helper remains display-only; the separate app-server bridge owns
+ *  validated answers and turn interruption. */
 export function requestUserInputDetail(toolInput: unknown): string | undefined {
   let parsed = toolInput;
   if (typeof parsed === "string") {

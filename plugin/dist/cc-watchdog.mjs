@@ -1542,7 +1542,7 @@ class CodexAppServerClient {
     const pending = this.pendingUserInput.get(key);
     if (!pending || !identitiesEqual(pending.request.identity, identity))
       return "stale";
-    if (pending.responseSent)
+    if (pending.responseSent || pending.interruptSent)
       return "already-sent";
     if (!validAnswers(pending.request, answers))
       return "invalid";
@@ -1559,6 +1559,29 @@ class CodexAppServerClient {
     } catch (error) {
       this.reportError(error, "Failed to answer Codex user input");
       this.disconnect(this.connectionEpoch, "connection-lost", true);
+      return "transport-error";
+    }
+  }
+  async interruptUserInput(identity) {
+    const key = rpcIdKey(identity.requestId);
+    const pending = this.pendingUserInput.get(key);
+    if (!pending || !identitiesEqual(pending.request.identity, identity))
+      return "stale";
+    if (pending.responseSent || pending.interruptSent)
+      return "already-sent";
+    if (this.stateValue !== "ready" || identity.connectionEpoch !== this.connectionEpoch || !this.transport) {
+      return "stale";
+    }
+    pending.interruptSent = true;
+    try {
+      await this.request("turn/interrupt", {
+        threadId: identity.threadId,
+        turnId: identity.turnId
+      });
+      return "sent";
+    } catch (error) {
+      pending.interruptSent = false;
+      this.reportError(error, "Failed to interrupt Codex user input");
       return "transport-error";
     }
   }
@@ -1694,7 +1717,7 @@ class CodexAppServerClient {
       autoResolutionMs: parsed.autoResolutionMs,
       receivedAtMs: this.options.now()
     };
-    this.pendingUserInput.set(key, { request, responseSent: false });
+    this.pendingUserInput.set(key, { request, responseSent: false, interruptSent: false });
     this.options.onUserInputRequest?.(request);
   }
   onServerRequestResolved(rawParams) {
@@ -1711,7 +1734,7 @@ class CodexAppServerClient {
       return;
     }
     this.pendingUserInput.delete(key);
-    this.options.onUserInputResolved?.(pending.request, pending.responseSent ? "response-sent" : "server-cleared");
+    this.options.onUserInputResolved?.(pending.request, pending.responseSent ? "response-sent" : pending.interruptSent ? "interrupt-sent" : "server-cleared");
   }
   disconnect(epoch, resolution, reconnect) {
     if (epoch !== this.connectionEpoch)
@@ -3292,7 +3315,13 @@ async function runRemoteInput(request, requestId, signal, deps, onHoldCreated) {
             } catch {
               return "transport-error";
             }
-            if (answer.requestId !== requestId || answer.decision !== "answer")
+            if (answer.requestId !== requestId)
+              return "unsupported";
+            if (answer.decision === "deny") {
+              const result2 = await deps.interruptAppServer();
+              return result2 === "sent" || result2 === "already-sent" ? "denied" : "transport-error";
+            }
+            if (answer.decision !== "answer")
               return "unsupported";
             const mapped = codexAnswersFromPhone(request, answer.answers);
             if (!mapped)
@@ -3443,7 +3472,8 @@ class CodexRemoteInputBridge {
       return;
     const handle = this.startRemoteInputFn(request, {
       config: this.config,
-      answerAppServer: (answers) => this.client.answerUserInput(request.identity, answers)
+      answerAppServer: (answers) => this.client.answerUserInput(request.identity, answers),
+      interruptAppServer: () => this.client.interruptUserInput(request.identity)
     });
     this.handles.set(key, handle);
     handle.completion.finally(() => {
@@ -3457,8 +3487,9 @@ class CodexRemoteInputBridge {
     if (!handle)
       return;
     this.handles.delete(key);
-    if (resolution !== "response-sent")
+    if (resolution !== "response-sent" && resolution !== "interrupt-sent") {
       handle.resolvedElsewhere();
+    }
   }
   onStateChange(state) {
     if (state === "ready") {

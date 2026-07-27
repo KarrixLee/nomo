@@ -47,9 +47,13 @@ export type CodexUserInputAnswerResult =
   | "invalid"
   | "transport-error";
 
+export type CodexUserInputInterruptResult = Exclude<CodexUserInputAnswerResult, "invalid">;
+
 export type CodexUserInputResolution =
   /** This client sent a response and app-server subsequently closed the request. */
   | "response-sent"
+  /** This client interrupted the owning turn and app-server subsequently closed the request. */
+  | "interrupt-sent"
   /** App-server cleared the request before this client answered (Mac answer, interrupt, or cleanup). */
   | "server-cleared"
   /** The connection disappeared. The request must not be replayed on a later connection. */
@@ -128,6 +132,7 @@ interface PendingRpc {
 interface PendingUserInput {
   request: CodexUserInputRequest;
   responseSent: boolean;
+  interruptSent: boolean;
 }
 
 const DEFAULT_RECONNECT_DELAY_MS = 1_000;
@@ -339,7 +344,7 @@ export class CodexAppServerClient {
     const key = rpcIdKey(identity.requestId);
     const pending = this.pendingUserInput.get(key);
     if (!pending || !identitiesEqual(pending.request.identity, identity)) return "stale";
-    if (pending.responseSent) return "already-sent";
+    if (pending.responseSent || pending.interruptSent) return "already-sent";
     if (!validAnswers(pending.request, answers)) return "invalid";
     if (this.stateValue !== "ready" || identity.connectionEpoch !== this.connectionEpoch || !this.transport) return "stale";
 
@@ -354,6 +359,35 @@ export class CodexAppServerClient {
     } catch (error) {
       this.reportError(error, "Failed to answer Codex user input");
       this.disconnect(this.connectionEpoch, "connection-lost", true);
+      return "transport-error";
+    }
+  }
+
+  /** Match the Codex TUI's escape action for request_user_input by interrupting its active turn. */
+  async interruptUserInput(
+    identity: CodexUserInputRequestIdentity,
+  ): Promise<CodexUserInputInterruptResult> {
+    const key = rpcIdKey(identity.requestId);
+    const pending = this.pendingUserInput.get(key);
+    if (!pending || !identitiesEqual(pending.request.identity, identity)) return "stale";
+    if (pending.responseSent || pending.interruptSent) return "already-sent";
+    if (this.stateValue !== "ready" || identity.connectionEpoch !== this.connectionEpoch || !this.transport) {
+      return "stale";
+    }
+
+    // The TUI does not synthesize a fake answer when the user rejects this prompt. It issues the
+    // documented turn/interrupt request, which clears the pending server request and finishes the turn
+    // as interrupted. Mark our action before sending so serverRequest/resolved is attributed to us.
+    pending.interruptSent = true;
+    try {
+      await this.request("turn/interrupt", {
+        threadId: identity.threadId,
+        turnId: identity.turnId,
+      });
+      return "sent";
+    } catch (error) {
+      pending.interruptSent = false;
+      this.reportError(error, "Failed to interrupt Codex user input");
       return "transport-error";
     }
   }
@@ -481,7 +515,7 @@ export class CodexAppServerClient {
       autoResolutionMs: parsed.autoResolutionMs,
       receivedAtMs: this.options.now(),
     };
-    this.pendingUserInput.set(key, { request, responseSent: false });
+    this.pendingUserInput.set(key, { request, responseSent: false, interruptSent: false });
     this.options.onUserInputRequest?.(request);
   }
 
@@ -499,7 +533,9 @@ export class CodexAppServerClient {
     this.pendingUserInput.delete(key);
     this.options.onUserInputResolved?.(
       pending.request,
-      pending.responseSent ? "response-sent" : "server-cleared",
+      pending.responseSent ? "response-sent"
+        : pending.interruptSent ? "interrupt-sent"
+          : "server-cleared",
     );
   }
 

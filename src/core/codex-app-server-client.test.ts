@@ -163,6 +163,32 @@ describe("CodexAppServerClient", () => {
     expect(await h.client.answerUserInput(h.requests[0].identity, { scope: ["Fast"] })).toBe("stale");
   });
 
+  test("interrupts the exact turn when the user denies a request_user_input prompt", async () => {
+    const h = harness();
+    await initialize(h);
+    const transport = h.transports[0];
+    transport.receive({ method: "item/tool/requestUserInput", id: "rpc-deny", params: requestParams() });
+
+    const interrupted = h.client.interruptUserInput(h.requests[0].identity);
+    await Promise.resolve();
+    expect(transport.sent[2]).toEqual({
+      method: "turn/interrupt",
+      id: 2,
+      params: { threadId: "thread-1", turnId: "turn-1" },
+    });
+    transport.receive({ id: 2, result: {} });
+    expect(await interrupted).toBe("sent");
+    expect(await h.client.interruptUserInput(h.requests[0].identity)).toBe("already-sent");
+    expect(await h.client.answerUserInput(h.requests[0].identity, { scope: ["Fast"] })).toBe("already-sent");
+
+    transport.receive({
+      method: "serverRequest/resolved",
+      params: { threadId: "thread-1", requestId: "rpc-deny" },
+    });
+    expect(h.resolutions).toEqual([[h.requests[0], "interrupt-sent"]]);
+    expect(await h.client.interruptUserInput(h.requests[0].identity)).toBe("stale");
+  });
+
   test("rejects incomplete, unknown, or forged option answers without writing to transport", async () => {
     const h = harness();
     await initialize(h);

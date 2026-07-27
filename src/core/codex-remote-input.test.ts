@@ -101,6 +101,7 @@ describe("startCodexRemoteInput", () => {
       localApprovalsStateFn: async () => "on",
       sleep: async () => {},
       answerAppServer: async (answers) => { appAnswers.push(answers); return "sent"; },
+      interruptAppServer: async () => "sent",
     });
 
     expect(await handle.completion).toBe("answered");
@@ -126,6 +127,28 @@ describe("startCodexRemoteInput", () => {
     expect(fallback).not.toHaveProperty("permissionQuestions");
   });
 
+  test("maps a phone deny to Codex turn interruption instead of forging an answer", async () => {
+    const answerBlob = await encryptBlob(key, { requestId: "relay-deny", decision: "deny" });
+    let interrupted = 0;
+    let answered = 0;
+    const handle = startCodexRemoteInput(request(), {
+      config,
+      fetchFn: (async (input) => String(input).endsWith("/v1/cc/decision")
+        ? Response.json({ hold: true })
+        : Response.json({ status: "answered", answerBlob })) as typeof fetch,
+      readRecordFn: async () => record,
+      randomUUID: () => "relay-deny",
+      localApprovalsStateFn: async () => "on",
+      sleep: async () => {},
+      answerAppServer: async () => { answered += 1; return "sent"; },
+      interruptAppServer: async () => { interrupted += 1; return "sent"; },
+    });
+
+    expect(await handle.completion).toBe("denied");
+    expect(interrupted).toBe(1);
+    expect(answered).toBe(0);
+  });
+
   test("never sends secret, option-less, or ambiguous-display questions to the relay", async () => {
     for (const questions of [
       [{ ...request().questions[0], isSecret: true }],
@@ -143,6 +166,7 @@ describe("startCodexRemoteInput", () => {
         readRecordFn: async () => record,
         randomUUID: () => "relay-2",
         answerAppServer: async () => "sent",
+        interruptAppServer: async () => "sent",
       });
       expect(await handle.completion).toBe("unsupported");
       expect(fetched).toBe(false);
@@ -167,6 +191,7 @@ describe("startCodexRemoteInput", () => {
       randomUUID: () => "relay-3",
       sleep: () => new Promise<void>((resolve) => { releaseSleep = resolve; }),
       answerAppServer: async () => "sent",
+      interruptAppServer: async () => "sent",
     });
     // Let the hold creation land, then resolve from the Desktop side.
     await posted;
@@ -187,6 +212,7 @@ describe("startCodexRemoteInput", () => {
       readRecordFn: async () => { await recordGate; return record; },
       randomUUID: () => "relay-early",
       answerAppServer: async () => "sent",
+      interruptAppServer: async () => "sent",
     });
     const resolving = handle.resolvedElsewhere();
     releaseRecord();

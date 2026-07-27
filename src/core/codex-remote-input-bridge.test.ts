@@ -5,6 +5,7 @@ import {
   CodexThreadResumeResult,
   CodexUserInputAnswerResult,
   CodexUserInputAnswers,
+  CodexUserInputInterruptResult,
   CodexUserInputRequest,
   CodexUserInputRequestIdentity,
 } from "./codex-app-server-client";
@@ -48,6 +49,7 @@ class FakeClient {
   pages: CodexLoadedThreadListResult[] = [];
   resumed: string[] = [];
   answers: { identity: CodexUserInputRequestIdentity; answers: CodexUserInputAnswers }[] = [];
+  interrupts: CodexUserInputRequestIdentity[] = [];
 
   constructor(readonly callbacks: CodexRemoteInputBridgeCallbacks) {}
   async start(): Promise<boolean> { this.state = "ready"; this.callbacks.onStateChange("ready"); return true; }
@@ -66,6 +68,12 @@ class FakeClient {
     this.answers.push({ identity, answers });
     return "sent";
   }
+  async interruptUserInput(
+    identity: CodexUserInputRequestIdentity,
+  ): Promise<CodexUserInputInterruptResult> {
+    this.interrupts.push(identity);
+    return "sent";
+  }
 }
 
 function deferred<T>() {
@@ -81,12 +89,19 @@ function harness() {
     completion: ReturnType<typeof deferred<CodexRemoteInputResult>>;
     resolved: number;
     answer: (answers: CodexUserInputAnswers) => Promise<CodexUserInputAnswerResult>;
+    interrupt: () => Promise<CodexUserInputInterruptResult>;
   }[] = [];
   const bridge = new CodexRemoteInputBridge(config, {
     createClient: (callbacks) => (client = new FakeClient(callbacks)),
     startRemoteInputFn: (incoming, deps): CodexRemoteInputHandle => {
       const completion = deferred<CodexRemoteInputResult>();
-      const item = { request: incoming, completion, resolved: 0, answer: deps.answerAppServer };
+      const item = {
+        request: incoming,
+        completion,
+        resolved: 0,
+        answer: deps.answerAppServer,
+        interrupt: deps.interruptAppServer,
+      };
       handles.push(item);
       return {
         requestId: `relay-${handles.length}`,
@@ -124,6 +139,8 @@ describe("CodexRemoteInputBridge", () => {
 
     await h.handles[0].answer({ choice: ["A"] });
     expect(h.client().answers).toEqual([{ identity: request.identity, answers: { choice: ["A"] } }]);
+    await h.handles[0].interrupt();
+    expect(h.client().interrupts).toEqual([request.identity]);
     h.client().callbacks.onUserInputResolved(request, "response-sent");
     expect(h.handles[0].resolved).toBe(0);
     h.handles[0].completion.resolve("answered");
@@ -143,6 +160,17 @@ describe("CodexRemoteInputBridge", () => {
     h.client().callbacks.onUserInputResolved(replay, "connection-lost");
     await Promise.resolve();
     expect(h.handles[1].resolved).toBe(1);
+    await h.bridge.stop();
+  });
+
+  test("does not retire the relay as resolved elsewhere after its own turn interrupt", async () => {
+    const h = harness();
+    await h.bridge.start();
+    h.client().callbacks.onUserInputRequest(request);
+    h.client().callbacks.onUserInputResolved(request, "interrupt-sent");
+    await Promise.resolve();
+    expect(h.handles[0].resolved).toBe(0);
+    h.handles[0].completion.resolve("denied");
     await h.bridge.stop();
   });
 });
