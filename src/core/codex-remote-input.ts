@@ -6,7 +6,8 @@ import { hostname } from "node:os";
 import { decryptBlob, encryptBlob } from "./crypto";
 import { requestUserInputDetail } from "./adapter";
 import {
-  BLOB_FIT_CHARS, buildPermissionQuestions, buildPermissionSummary, fitPermissionDetail,
+  BLOB_FIT_CHARS, buildPermissionQuestions, buildPermissionSummary, capPermissionWireText,
+  fitPermissionDetail, PERMISSION_QUESTION_LABEL_MAX,
 } from "./permission";
 import {
   Config, localApprovalsState, PLUGIN_VERSION, readRecord, SessionRecord,
@@ -23,7 +24,6 @@ const POLL_TIMEOUT_MS = 2_000;
 const POLL_INTERVAL_MS = 3_000;
 const MAX_CONSECUTIVE_MISSES = 100;
 const ANSWER_MAX = 500;
-const QUESTION_LABEL_MAX = 60;
 const QUESTION_DESCRIPTION_MAX = 160;
 
 export type CodexRemoteInputResult =
@@ -63,11 +63,6 @@ interface PhoneAnswer {
   answers?: unknown;
 }
 
-function cap(value: string, max: number): string {
-  const chars = Array.from(value);
-  return chars.length <= max ? value : `${chars.slice(0, max - 1).join("")}…`;
-}
-
 /** Map the phone's positional display labels back to Codex's original question ids and labels. */
 export function codexAnswersFromPhone(
   request: CodexUserInputRequest,
@@ -85,7 +80,9 @@ export function codexAnswersFromPhone(
     // exactly one original option; a collision is ambiguous and must fall back to the Mac picker.
     const hits = question.options
       .map((option) => option.label)
-      .filter((label) => label === answer || cap(label, QUESTION_LABEL_MAX) === answer);
+      .filter((label) =>
+        label === answer || capPermissionWireText(label, PERMISSION_QUESTION_LABEL_MAX) === answer
+      );
     const unique = Array.from(new Set(hits));
     if (unique.length !== 1) return undefined;
     mapped[question.id] = [unique[0]];
@@ -104,7 +101,9 @@ function renderableToolInput(request: CodexUserInputRequest): Record<string, unk
     // display collisions BEFORE the relay can let the phone terminally answer an ambiguous choice.
     if (labels.some((label) => label !== label.trim() || label.length > ANSWER_MAX)) return true;
     if (new Set(labels).size !== labels.length) return true;
-    return new Set(labels.map((label) => cap(label, QUESTION_LABEL_MAX))).size !== labels.length;
+    return new Set(labels.map((label) =>
+      capPermissionWireText(label, PERMISSION_QUESTION_LABEL_MAX)
+    )).size !== labels.length;
   })) return undefined;
   return {
     questions: request.questions.map((question) => ({
@@ -190,7 +189,9 @@ async function runRemoteInput(
       ...question,
       // Codex descriptions carry the tradeoff/impact that often makes short labels meaningful. Keep
       // them positionally aligned with `o`; older phones ignore this additive compact key.
-      d: request.questions[index].options!.map((option) => cap(option.description, QUESTION_DESCRIPTION_MAX)),
+      d: request.questions[index].options!.map((option) =>
+        capPermissionWireText(option.description, QUESTION_DESCRIPTION_MAX)
+      ),
     }));
     if (questions.length !== request.questions.length) return "unsupported";
 

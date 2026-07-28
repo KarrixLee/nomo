@@ -92,7 +92,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { execFileSync, spawn } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "1.4.2";
+var PLUGIN_VERSION = "1.4.3";
 var CC_DIR = `${process.env.HOME}/.config/cc-status`;
 var SESSIONS_DIR = `${CC_DIR}/sessions`;
 var WATCHDOG_PID_PATH = `${CC_DIR}/watchdog.pid`;
@@ -2641,7 +2641,7 @@ function answerLine(agent, toolName, toolInput, answers) {
 }
 function resolveAnswer(answer, labels) {
   const matchOne = (piece) => {
-    const hits = Array.from(new Set(labels.filter((l) => l === piece || cap(l, QUESTION_LABEL_MAX) === piece)));
+    const hits = Array.from(new Set(labels.filter((l) => l === piece || capPermissionWireText(l, PERMISSION_QUESTION_LABEL_MAX) === piece)));
     return hits.length === 1 ? hits[0] : undefined;
   };
   const whole = matchOne(answer);
@@ -2788,9 +2788,10 @@ function buildPermissionDetail(toolName, toolInput) {
   }
 }
 var QUESTION_TEXT_MAX = 240;
-var QUESTION_LABEL_MAX = 60;
-function cap(s, n) {
-  return s.length <= n ? s : `${s.slice(0, n - 1)}…`;
+var PERMISSION_QUESTION_LABEL_MAX = 60;
+function capPermissionWireText(value, max) {
+  const characters = Array.from(value);
+  return characters.length <= max ? value : `${characters.slice(0, max - 1).join("")}…`;
 }
 function usableQuestions(toolInput) {
   const qs = toolInput.questions;
@@ -2820,10 +2821,10 @@ function firstQuestionText(toolInput) {
 }
 function buildPermissionQuestions(toolInput) {
   return usableQuestions(toolInput).map(({ text, raw, labels }) => ({
-    q: cap(text, QUESTION_TEXT_MAX),
+    q: capPermissionWireText(text, QUESTION_TEXT_MAX),
     ...typeof raw?.header === "string" && raw.header.length > 0 ? { h: raw.header } : {},
     ...raw?.multiSelect === true ? { m: true } : {},
-    o: labels.map((l) => cap(l, QUESTION_LABEL_MAX))
+    o: labels.map((l) => capPermissionWireText(l, PERMISSION_QUESTION_LABEL_MAX))
   }));
 }
 var MAX_BLOB_CHARS = 3072;
@@ -3117,12 +3118,7 @@ var POLL_TIMEOUT_MS = 2000;
 var POLL_INTERVAL_MS2 = 3000;
 var MAX_CONSECUTIVE_MISSES2 = 100;
 var ANSWER_MAX2 = 500;
-var QUESTION_LABEL_MAX2 = 60;
 var QUESTION_DESCRIPTION_MAX = 160;
-function cap2(value, max) {
-  const chars = Array.from(value);
-  return chars.length <= max ? value : `${chars.slice(0, max - 1).join("")}…`;
-}
 function codexAnswersFromPhone(request, positional) {
   if (!Array.isArray(positional) || positional.length !== request.questions.length)
     return;
@@ -3135,7 +3131,7 @@ function codexAnswersFromPhone(request, positional) {
     const answer = raw.trim();
     if (answer.length === 0 || answer.length > ANSWER_MAX2 || !question.options?.length)
       return;
-    const hits = question.options.map((option) => option.label).filter((label) => label === answer || cap2(label, QUESTION_LABEL_MAX2) === answer);
+    const hits = question.options.map((option) => option.label).filter((label) => label === answer || capPermissionWireText(label, PERMISSION_QUESTION_LABEL_MAX) === answer);
     const unique = Array.from(new Set(hits));
     if (unique.length !== 1)
       return;
@@ -3154,7 +3150,7 @@ function renderableToolInput(request) {
       return true;
     if (new Set(labels).size !== labels.length)
       return true;
-    return new Set(labels.map((label) => cap2(label, QUESTION_LABEL_MAX2))).size !== labels.length;
+    return new Set(labels.map((label) => capPermissionWireText(label, PERMISSION_QUESTION_LABEL_MAX))).size !== labels.length;
   }))
     return;
   return {
@@ -3224,7 +3220,7 @@ async function runRemoteInput(request, requestId, signal, deps, onHoldCreated) {
       return "resolved-elsewhere";
     const questions = buildPermissionQuestions(toolInput).map((question, index) => ({
       ...question,
-      d: request.questions[index].options.map((option) => cap2(option.description, QUESTION_DESCRIPTION_MAX))
+      d: request.questions[index].options.map((option) => capPermissionWireText(option.description, QUESTION_DESCRIPTION_MAX))
     }));
     if (questions.length !== request.questions.length)
       return "unsupported";

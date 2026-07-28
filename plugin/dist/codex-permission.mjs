@@ -97,7 +97,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { execFileSync, spawn } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "1.4.2";
+var PLUGIN_VERSION = "1.4.3";
 var CC_DIR = `${process.env.HOME}/.config/cc-status`;
 var SESSIONS_DIR = `${CC_DIR}/sessions`;
 var WATCHDOG_PID_PATH = `${CC_DIR}/watchdog.pid`;
@@ -1851,7 +1851,7 @@ function answerLine(agent, toolName, toolInput, answers) {
 }
 function resolveAnswer(answer, labels) {
   const matchOne = (piece) => {
-    const hits = Array.from(new Set(labels.filter((l) => l === piece || cap(l, QUESTION_LABEL_MAX) === piece)));
+    const hits = Array.from(new Set(labels.filter((l) => l === piece || capPermissionWireText(l, PERMISSION_QUESTION_LABEL_MAX) === piece)));
     return hits.length === 1 ? hits[0] : undefined;
   };
   const whole = matchOne(answer);
@@ -1998,9 +1998,10 @@ function buildPermissionDetail(toolName, toolInput) {
   }
 }
 var QUESTION_TEXT_MAX = 240;
-var QUESTION_LABEL_MAX = 60;
-function cap(s, n) {
-  return s.length <= n ? s : `${s.slice(0, n - 1)}…`;
+var PERMISSION_QUESTION_LABEL_MAX = 60;
+function capPermissionWireText(value, max) {
+  const characters = Array.from(value);
+  return characters.length <= max ? value : `${characters.slice(0, max - 1).join("")}…`;
 }
 function usableQuestions(toolInput) {
   const qs = toolInput.questions;
@@ -2030,10 +2031,10 @@ function firstQuestionText(toolInput) {
 }
 function buildPermissionQuestions(toolInput) {
   return usableQuestions(toolInput).map(({ text, raw, labels }) => ({
-    q: cap(text, QUESTION_TEXT_MAX),
+    q: capPermissionWireText(text, QUESTION_TEXT_MAX),
     ...typeof raw?.header === "string" && raw.header.length > 0 ? { h: raw.header } : {},
     ...raw?.multiSelect === true ? { m: true } : {},
-    o: labels.map((l) => cap(l, QUESTION_LABEL_MAX))
+    o: labels.map((l) => capPermissionWireText(l, PERMISSION_QUESTION_LABEL_MAX))
   }));
 }
 var MAX_BLOB_CHARS = 3072;

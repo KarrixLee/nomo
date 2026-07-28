@@ -2,6 +2,9 @@ import { describe, expect, test } from "bun:test";
 import { decryptBlob, encryptBlob } from "./crypto";
 import { codexAnswersFromPhone, startCodexRemoteInput } from "./codex-remote-input";
 import type { CodexUserInputRequest } from "./codex-app-server-client";
+import {
+  buildPermissionQuestions, capPermissionWireText, PERMISSION_QUESTION_LABEL_MAX,
+} from "./permission";
 import type { Config, SessionRecord } from "./shared";
 
 const key = new Uint8Array(Array.from({ length: 32 }, (_, index) => index + 1));
@@ -69,6 +72,30 @@ describe("codexAnswersFromPhone", () => {
       ],
     }] });
     expect(codexAnswersFromPhone(ambiguous, [`${"A".repeat(59)}…`])).toBeUndefined();
+  });
+
+  test("round-trips an astral label through the exact phone-frame cap", () => {
+    const label = "😀".repeat(80);
+    const shown = buildPermissionQuestions({
+      questions: [{ question: "Emoji?", options: [{ label }] }],
+    })[0].o[0];
+    const req = request({
+      questions: [{ ...request().questions[0], options: [{ label, description: "" }] }],
+    });
+
+    expect(shown).toBe(`${"😀".repeat(59)}…`);
+    expect(codexAnswersFromPhone(req, [shown])).toEqual({ scope: [label] });
+  });
+
+  test("rejects a collision with the actual displayed astral label", () => {
+    const label = `x${"😀".repeat(80)}`;
+    const shown = capPermissionWireText(label, PERMISSION_QUESTION_LABEL_MAX);
+    const req = request({ questions: [{
+      ...request().questions[0],
+      options: [{ label, description: "" }, { label: shown, description: "" }],
+    }] });
+
+    expect(codexAnswersFromPhone(req, [shown])).toBeUndefined();
   });
 
   test("rejects partial, forged, or unrenderable answers", () => {
@@ -157,6 +184,14 @@ describe("startCodexRemoteInput", () => {
         { label: `${"A".repeat(70)}1`, description: "One" },
         { label: `${"A".repeat(70)}2`, description: "Two" },
       ] }],
+      (() => {
+        const label = `x${"😀".repeat(80)}`;
+        const shown = capPermissionWireText(label, PERMISSION_QUESTION_LABEL_MAX);
+        return [{ ...request().questions[0], options: [
+          { label, description: "Astral" },
+          { label: shown, description: "Displayed collision" },
+        ] }];
+      })(),
       [{ ...request().questions[0], options: [{ label: " Fast ", description: "Padded" }] }],
     ]) {
       let fetched = false;

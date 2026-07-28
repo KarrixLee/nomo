@@ -322,7 +322,9 @@ function answerLine(
 function resolveAnswer(answer: string, labels: string[]): string | undefined {
   const matchOne = (piece: string): string | undefined => {
     // Accept the capped wire form AND the untruncated original (a phone that echoes the real label).
-    const hits = Array.from(new Set(labels.filter((l) => l === piece || cap(l, QUESTION_LABEL_MAX) === piece)));
+    const hits = Array.from(new Set(labels.filter((l) =>
+      l === piece || capPermissionWireText(l, PERMISSION_QUESTION_LABEL_MAX) === piece
+    )));
     return hits.length === 1 ? hits[0] : undefined;
   };
   const whole = matchOne(answer);
@@ -494,12 +496,14 @@ export interface PermissionQuestion {
  *  untruncated text, so a capped question can still be answered). */
 const QUESTION_TEXT_MAX = 240;
 /** Longest option label kept in the blob. */
-const QUESTION_LABEL_MAX = 60;
+export const PERMISSION_QUESTION_LABEL_MAX = 60;
 
 /** Ellipsis-cap shared by the blob builder and the answer re-mapper, so the two can never disagree
- *  about what the phone was actually shown. A capped string is exactly `n` characters long. */
-function cap(s: string, n: number): string {
-  return s.length <= n ? s : `${s.slice(0, n - 1)}…`;
+ *  about what the phone was actually shown. Count Unicode code points rather than UTF-16 code units
+ *  so an astral character can never be split into an invalid lone surrogate. */
+export function capPermissionWireText(value: string, max: number): string {
+  const characters = Array.from(value);
+  return characters.length <= max ? value : `${characters.slice(0, max - 1).join("")}…`;
 }
 
 /** One raw CC question, narrowed. */
@@ -555,10 +559,10 @@ function firstQuestionText(toolInput: Record<string, unknown>): string {
  *  phone's echo back onto the ORIGINAL labels, so a capped label never reaches CC. */
 export function buildPermissionQuestions(toolInput: Record<string, unknown>): PermissionQuestion[] {
   return usableQuestions(toolInput).map(({ text, raw, labels }) => ({
-    q: cap(text, QUESTION_TEXT_MAX),
+    q: capPermissionWireText(text, QUESTION_TEXT_MAX),
     ...(typeof raw?.header === "string" && raw.header.length > 0 ? { h: raw.header } : {}),
     ...(raw?.multiSelect === true ? { m: true } : {}),
-    o: labels.map((l) => cap(l, QUESTION_LABEL_MAX)),
+    o: labels.map((l) => capPermissionWireText(l, PERMISSION_QUESTION_LABEL_MAX)),
   }));
 }
 
