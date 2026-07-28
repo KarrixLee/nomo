@@ -68,6 +68,22 @@ const FRESH_SESSION_MS = 60_000;
  *  is unreachable → exit silently (fail open, terminal dialog after Esc/retry). A successful poll —
  *  including a plain {status:"pending"} — resets the counter, so a healthy hold is unbounded. */
 const MAX_CONSECUTIVE_MISSES = 100;
+/** Poll statuses that are DEFINITIVE, not transient: the pairing is unauthorized/revoked/unknown, so
+ *  every remaining poll of this request is guaranteed to fail the same way. Mirrors runHook's gone-strike
+ *  set (404/410) plus the auth pair (401/403) — there, a gone response tears the pairing down; here it
+ *  only means "stop waiting". Anything else (429, 5xx, a transport throw) stays transient and rides the
+ *  MAX_CONSECUTIVE_MISSES cap. */
+const DEFINITIVE_POLL_STATUSES = new Set([401, 403, 404, 410]);
+/** …and, like the gone strike, a SINGLE definitive response can be a racing delete/deploy, so require
+ *  this many CONSECUTIVE ones before releasing. 2 ⇒ ~3 s to the terminal dialog instead of ~5.4 min. */
+const MAX_DEFINITIVE_POLL_FAILURES = 2;
+/** How many times the SAME terminal `answered` record may be re-read with a decision verb we do not
+ *  recognize before the hold is released. An answered record is TERMINAL server-side (a re-answer 409s
+ *  and the same blob is served for the record's whole 24h TTL), so a verb we can never understand would
+ *  otherwise be re-read until the hook's 86400 s timeout — a frozen terminal and ~26k doomed GETs. A
+ *  small bound keeps genuine forward-compat polling (a record still `pending`, or a DIFFERENT answer
+ *  landing) while making the stuck case fail open in seconds. */
+const MAX_UNKNOWN_ANSWER_READS = 3;
 
 /** Codex maps both a manual reviewer and "Approve for me" to hook `permission_mode:"default"`.
  *  The effective reviewer/policy lives only in the current rollout's `turn_context`, so inspect a
@@ -266,9 +282,10 @@ function allowAlwaysLine(agent: AgentKind, toolName: string, toolInput: Record<s
  *
  *  FAIL-SAFE (the reason this returns `undefined` instead of degrading): on CC's HEADLESS path a bare
  *  {behavior:"allow"} on these tools converts to a hard DENY. So anything we cannot turn into a real
- *  answers map — a non-question tool, a missing/!array/empty `answers`, entries that resolve to nothing —
- *  must emit NOTHING and RELEASE the hold (silent exit 0 → CC shows the terminal picker). Never a bare
- *  allow, and never a guessed label. */
+ *  answers map — a non-question tool, a missing/!array/empty `answers`, entries that resolve to nothing,
+ *  DUPLICATE question texts, or an answers map that does not cover EVERY question — must emit NOTHING and
+ *  RELEASE the hold (silent exit 0 → CC shows the terminal picker). Never a bare allow, never a guessed
+ *  label, and never a partial map. */
 function answerLine(
   agent: AgentKind,
   toolName: string,
@@ -281,12 +298,21 @@ function answerLine(
   // The key is the ORIGINAL, untruncated question text (the blob's copy may be capped).
   const questions = usableQuestions(toolInput);
   if (questions.length === 0) return undefined;
+  // DUPLICATE QUESTION TEXT: the map CC consumes is keyed by question text, so two questions carrying the
+  // identical string collapse onto ONE key — the later answer overwrites the earlier and one question is
+  // silently answered with the other's pick. Nothing on the wire can disambiguate them (the key IS the
+  // text), so the payload is unanswerable: release, exactly like an ambiguous option label.
+  if (new Set(questions.map((q) => q.text)).size !== questions.length) return undefined;
   const map: Record<string, string> = {};
   for (let i = 0; i < questions.length; i += 1) {
     const a = answers[i];
-    if (typeof a !== "string") continue;                        // non-string → unanswered
+    // A question left WITHOUT an answer (missing/non-string/blank entry) would make the map PARTIAL. CC's
+    // behavior on a partial `answers` map is unverified — the tool body is a pass-through, so a missing
+    // key could be read as an empty pick — and guessing wrong tells the user's session something they
+    // never said. Same policy as every other unrepresentable answer: release to the terminal picker.
+    if (typeof a !== "string") return undefined;
     const raw = a.trim();
-    if (raw.length === 0) continue;                             // unanswered → simply absent from the map
+    if (raw.length === 0) return undefined;
     // Bound the stdout line — by REFUSING, never by slicing. Truncating at ANSWER_MAX can land exactly
     // on a multi-select ", " boundary such that what SURVIVES is itself a valid but SHORTER real
     // selection (e.g. a 495-char label + ", Yes and more" slices to "<label>, Yes"), which would tell
@@ -300,7 +326,9 @@ function answerLine(
     if (resolved === undefined) return undefined;
     map[questions[i].text] = resolved;
   }
-  if (Object.keys(map).length === 0) return undefined; // nothing mappable → release, never a bare allow
+  // Every question answered, or nothing goes out (the loop above already released on the first gap; this
+  // is the invariant stated as an assertion — an empty map can never be a bare allow either).
+  if (Object.keys(map).length !== questions.length) return undefined;
   return decisionLine(agent, {
     hookEventName: "PermissionRequest",
     decision: { behavior: "allow", updatedInput: { ...toolInput, answers: map } },
@@ -356,6 +384,26 @@ export const TRACE_PATH = `${CC_DIR}/permission-trace.log`;
 /** Truncate the trace at startup once it passes this size, so it can never grow unbounded. */
 const TRACE_MAX_BYTES = 256 * 1024;
 
+/** The ONLY thing an error is ever allowed to contribute to the trace: its CLASS and, when present, its
+ *  `code` (an errno-style token like "ECONNREFUSED"). NEVER `String(e)` / `e.message` — the messages that
+ *  reach this hook quote their INPUT, and this hook's input is the raw hook payload: a `JSON.parse`
+ *  SyntaxError embeds the offending JSON (a Bash command with a token in it, a plan, a file path) into
+ *  permission-trace.log, a plaintext file on disk. A name plus a code is enough to classify a failure. */
+function errorTag(e: unknown): { error: string; code?: string } {
+  const name = typeof (e as { name?: unknown })?.name === "string" ? (e as { name: string }).name : typeof e;
+  const code = (e as { code?: unknown })?.code;
+  return { error: name, ...(typeof code === "string" ? { code } : {}) };
+}
+
+/** The reported byte offset of a JSON syntax error, or undefined — DIGITS ONLY, extracted with a regex
+ *  that cannot capture any surrounding text. Enough to locate a truncated stdin without logging it. */
+function parseErrorPosition(e: unknown): number | undefined {
+  const m = typeof (e as { message?: unknown })?.message === "string"
+    ? /position (\d+)/.exec((e as { message: string }).message)
+    : null;
+  return m ? Number(m[1]) : undefined;
+}
+
 /** Sync single-line append of `{ts, pid, ...event}`. Sync so a buffered write can't be lost when the
  *  process is killed mid-hold. Best-effort: any fs error is swallowed (tracing must never surface). */
 function appendTrace(path: string, event: object): void {
@@ -388,8 +436,10 @@ function defaultTrace(): (event: object) => void {
     for (const sig of ["SIGTERM", "SIGINT", "SIGHUP"] as const) {
       process.on(sig, () => { trace({ event: "signal", signal: sig }); process.exit(0); });
     }
-    process.on("uncaughtException", (e) => { trace({ event: "uncaughtException", error: String(e).slice(0, 200) }); process.exit(0); });
-    process.on("unhandledRejection", (e) => { trace({ event: "unhandledRejection", error: String(e).slice(0, 200) }); process.exit(0); });
+    // Class + code only (errorTag) — never the message: an error that escaped this far can still be a
+    // parse/validation error quoting the raw hook payload, and the trace is a plaintext file.
+    process.on("uncaughtException", (e) => { trace({ event: "uncaughtException", ...errorTag(e) }); process.exit(0); });
+    process.on("unhandledRejection", (e) => { trace({ event: "unhandledRejection", ...errorTag(e) }); process.exit(0); });
     process.on("exit", (code) => appendTrace(TRACE_PATH, { event: "exit-event", code }));
   }
   return trace;
@@ -794,7 +844,16 @@ export async function runPermissionHook(deps: PermissionHookDeps = {}, agent: Ag
     trace({ event: "stdin-read", bytes: raw.length });
     if (!config) { trace({ event: "exit", reason: "unpaired" }); return; } // unpaired → exit 0, zero output, zero network
 
-    const input = JSON.parse(raw) as Record<string, unknown>;
+    // Parsed HERE rather than in the outer catch so the failure can be traced WITHOUT its message: a
+    // JSON.parse SyntaxError quotes the offending input, and the input here is the raw hook payload
+    // (Bash commands, plans, paths — potentially secrets). Class + reported position only.
+    let input: Record<string, unknown>;
+    try {
+      input = JSON.parse(raw) as Record<string, unknown>;
+    } catch (e) {
+      trace({ event: "exit", reason: "bad-stdin", ...errorTag(e), pos: parseErrorPosition(e) });
+      return; // unreadable hook input → fail open, silent
+    }
     const sessionId = typeof input.session_id === "string" ? input.session_id : "";
     if (sessionId.length === 0) { trace({ event: "exit", reason: "no-session-id" }); return; }
 
@@ -891,7 +950,13 @@ export async function runPermissionHook(deps: PermissionHookDeps = {}, agent: Ag
     const record = await (deps.readRecordFn ?? readRecord)(sessionId);
     const machine = config.machineName ?? hostname().replace(/\.local$/, "");
     const plan: OpPlan = { op: "update", prio: 1, status: "needsAttention" };
-    const base = buildBlob(input, machine, record?.title, plan, agent, record?.turnStartedAt, record?.label, record?.model);
+    // `at` — the REAL event time in epoch SECONDS, computed exactly as runHook/buildEnvelope do
+    // (Math.floor(now / 1000), NOT the envelope's ms `ts`). Held frames were the ONLY frames shipping
+    // without it since v1.1.6, so a decisionPending row could not be aged/sorted honestly by the phone
+    // (and the plugin never emitted the frame the codex E2E vector describes). buildBlob appends it LAST,
+    // before the permission tail, so the append-only wire discipline is unchanged.
+    const at = Math.floor(now / 1000);
+    const base = buildBlob(input, machine, record?.title, plan, agent, record?.turnStartedAt, record?.label, record?.model, at);
     const permissionBase = {
       ...base, status: "decisionPending", permissionSummary: summary, permissionRequestId: requestId,
       permissionToolName: toolName,
@@ -934,8 +999,46 @@ export async function runPermissionHook(deps: PermissionHookDeps = {}, agent: Ag
       return { posted, hold };
     };
 
+    // ONE poll GET of this request's decision record. Shared by the post-timeout probe below and the hold
+    // loop so both read the record exactly the same way. Returns the parsed body (only on a 2xx) plus the
+    // HTTP status (0 = the fetch threw/timed out) — never throws.
+    const pollDecision = async (seq: number): Promise<{ data?: { status?: string; answerBlob?: string }; status: number }> => {
+      // poll-begin/poll-end straddle the fetch so an abort or kill MID-FETCH is visible: a begin with
+      // no matching end means the process died inside the GET (the prime suspect for a hold that
+      // never completes its first poll).
+      trace({ event: "poll-begin", seq });
+      try {
+        const res = await fetchFn(`${config.url}/v1/cc/decision/${requestId}`, {
+          headers: pcHeaders,
+          signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+        });
+        if (!res.ok) {
+          trace({ event: "poll-end", seq, outcome: "status", status: res.status });
+          return { status: res.status };
+        }
+        const data = (await res.json()) as { status?: string; answerBlob?: string };
+        trace({ event: "poll-end", seq, outcome: "ok" });
+        return { data, status: res.status };
+      } catch (e) { // transient — counted by the caller, kept polling until the cap
+        trace({ event: "poll-end", seq, outcome: "error", ...errorTag(e) });
+        return { status: 0 };
+      }
+    };
+
     let { posted, hold } = await postDecision(1, POST_MAX_ATTEMPTS);
-    if (!posted) { trace({ event: "exit", reason: "post-error" }); return; } // both attempts failed at the transport → fail open
+    if (!posted) {
+      // Both POSTs failed at the TRANSPORT layer — but a client-side timeout says nothing about whether
+      // the request LANDED. If the first one did, the worker is holding a real record and the phone is
+      // already showing the card: exiting here would fail open on the Mac while the phone still claims it
+      // can decide, and a tap would be applied to nothing. So spend ONE cheap GET (seq 0, same 2 s
+      // ceiling) asking whether the record exists. A live record ⇒ honor the hold and fall into the normal
+      // poll loop; anything else — no record, an error, a terminal status — ⇒ fail open exactly as before.
+      const probe = await pollDecision(0);
+      const live = probe.data?.status === "pending" || probe.data?.status === "answered";
+      if (!live) { trace({ event: "exit", reason: "post-error" }); return; }
+      trace({ event: "post-timeout-landed", status: probe.data?.status });
+      hold = true;
+    }
     trace({ event: "hold", hold });
     if (!hold) {
       // hold:false on the FIRST ask is usually genuine (session not on the phone), but a brand-new
@@ -965,31 +1068,19 @@ export async function runPermissionHook(deps: PermissionHookDeps = {}, agent: Ag
     const interval = deps.pollIntervalMs ?? POLL_INTERVAL_MS;
     const emit = deps.emit ?? ((line: string) => process.stdout.write(`${line}\n`));
     let misses = 0;
+    let definitiveFailures = 0;
+    /** The answerBlob of the last UNRECOGNIZED decision, and how many times in a row it has been read —
+     *  the bound that stops a terminal record we cannot understand from freezing the hold forever. */
+    let unknownBlob: string | undefined;
+    let unknownReads = 0;
     let seq = 0;
     for (;;) {
       seq += 1;
-      // poll-begin/poll-end straddle the fetch so an abort or kill MID-FETCH is visible: a begin with
-      // no matching end means the process died inside the GET (the prime suspect for a hold that
-      // never completes its first poll).
-      trace({ event: "poll-begin", seq });
-      let data: { status?: string; answerBlob?: string } | undefined;
-      try {
-        const res = await fetchFn(`${config.url}/v1/cc/decision/${requestId}`, {
-          headers: pcHeaders,
-          signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
-        });
-        if (res.ok) {
-          data = (await res.json()) as { status?: string; answerBlob?: string };
-          trace({ event: "poll-end", seq, outcome: "ok" });
-        } else {
-          trace({ event: "poll-end", seq, outcome: "status", status: res.status });
-        }
-      } catch (e) { // transient — counted below, kept polling until the cap
-        trace({ event: "poll-end", seq, outcome: "error", error: (e as { name?: string })?.name ?? "Error" });
-      }
+      const { data, status: httpStatus } = await pollDecision(seq);
 
       if (data) {
         misses = 0;
+        definitiveFailures = 0;
         if (data.status === "answered" && typeof data.answerBlob === "string") {
           // A decrypt failure here throws to the outer catch → silent exit 0 (fail open), never a retry.
           const answer = (await decryptBlob(config.e2eKey, data.answerBlob)) as
@@ -1008,22 +1099,54 @@ export async function runPermissionHook(deps: PermissionHookDeps = {}, agent: Ag
             trace({ event: "exit", reason: "answered" });
             return; // done — exactly one line emitted, or zero (release / mismatch)
           }
-          // else: unknown decision — keep polling (do NOT return, do NOT treat "answered" as terminal)
+          // UNKNOWN decision verb — keep polling, but BOUNDED. An `answered` record is TERMINAL on the
+          // worker (a re-answer 409s and the identical blob is served for the record's 24h TTL), so if the
+          // SAME blob keeps coming back the verb will never become one we understand: the forward-compat
+          // wait would freeze this terminal for the hook's full 86400 s timeout while issuing ~26k doomed
+          // GETs. Count consecutive reads of the same record and release once the bound is hit (fail open
+          // — CC shows its own dialog). A DIFFERENT answerBlob resets the count, so a genuine later answer
+          // is still honored, and `pending` polls never touch it.
+          unknownReads = data.answerBlob === unknownBlob ? unknownReads + 1 : 1;
+          unknownBlob = data.answerBlob;
+          if (unknownReads >= MAX_UNKNOWN_ANSWER_READS) {
+            trace({ event: "release", reason: "unknown-decision-terminal", reads: unknownReads });
+            trace({ event: "exit", reason: "unknown-decision" });
+            return; // a verb we will never understand on a record that will never change → fail open
+          }
         } else if (typeof data.status === "string" && data.status !== "pending") {
           trace({ event: data.status === "expired" ? "expired" : "superseded", status: data.status });
           trace({ event: "exit", reason: data.status });
           return; // expired/superseded/unknown → silent
         }
-      } else if (++misses >= MAX_CONSECUTIVE_MISSES) {
-        trace({ event: "giveup", misses });
-        trace({ event: "exit", reason: "giveup" });
-        return; // sustained downlink failure → fail open silently
+      } else {
+        // DEFINITIVE vs transient. 401/403/404/410 mean this pairing cannot read this record at all
+        // (unauthorized / revoked / GC'd), so every one of the remaining ~100 polls would fail identically
+        // — a ~5.4 min frozen terminal for an outcome already known. Mirror runHook's gone strike: two
+        // CONSECUTIVE definitive responses (a single one can be a racing delete/deploy) release at once.
+        // Everything else — 429, 5xx, a transport throw — stays transient and rides the miss cap.
+        if (DEFINITIVE_POLL_STATUSES.has(httpStatus)) {
+          definitiveFailures += 1;
+          if (definitiveFailures >= MAX_DEFINITIVE_POLL_FAILURES) {
+            trace({ event: "giveup", reason: "definitive", status: httpStatus, strikes: definitiveFailures });
+            trace({ event: "exit", reason: "definitive" });
+            return; // unpaired/revoked → fail open immediately, not in 5 minutes
+          }
+        } else {
+          definitiveFailures = 0;
+        }
+        if (++misses >= MAX_CONSECUTIVE_MISSES) {
+          trace({ event: "giveup", misses });
+          trace({ event: "exit", reason: "giveup" });
+          return; // sustained downlink failure → fail open silently
+        }
       }
       await sleep(interval + jitter());
     }
   } catch (e) {
-    // Silence + exit 0 is the contract — never surface into a Claude Code session, never block.
-    trace({ event: "exit", reason: "exception", error: String(e).slice(0, 200) });
+    // Silence + exit 0 is the contract — never surface into a Claude Code session, never block. The
+    // error is recorded by CLASS (+ code) only — see errorTag: a thrown message can quote the hook
+    // payload it choked on, and this trace is a plaintext file on disk.
+    trace({ event: "exit", reason: "exception", ...errorTag(e) });
   }
 }
 

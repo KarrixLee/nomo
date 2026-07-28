@@ -107,6 +107,10 @@ export interface CodexAppServerClientOptions {
   clientName?: string;
   clientTitle?: string;
   reconnectDelayMs?: number;
+  /** Ceiling for the exponential reconnect backoff. */
+  maxReconnectDelayMs?: number;
+  /** Consecutive failed connects before the client parks itself in "stopped" until start() runs again. */
+  maxReconnectAttempts?: number;
   requestTimeoutMs?: number;
   now?: () => number;
   setTimer?: (callback: () => void, delayMs: number) => unknown;
@@ -132,10 +136,19 @@ interface PendingRpc {
 interface PendingUserInput {
   request: CodexUserInputRequest;
   responseSent: boolean;
-  interruptSent: boolean;
+  /** A turn/interrupt was put on the wire. Sticky: the interrupt may have landed even if the reply did not. */
+  interruptAttempted: boolean;
+  /** app-server acknowledged the turn/interrupt. */
+  interruptConfirmed: boolean;
+  /** A turn/interrupt is on the wire right now. */
+  interruptInFlight: boolean;
+  /** Local mirror of app-server's autoResolutionMs deadline. */
+  expiryTimer: unknown;
 }
 
 const DEFAULT_RECONNECT_DELAY_MS = 1_000;
+const DEFAULT_MAX_RECONNECT_DELAY_MS = 300_000;
+const DEFAULT_MAX_RECONNECT_ATTEMPTS = 10;
 const DEFAULT_REQUEST_TIMEOUT_MS = 10_000;
 
 const defaultSetTimer = (callback: () => void, delayMs: number): unknown => {
@@ -255,13 +268,16 @@ function validAnswers(request: CodexUserInputRequest, answers: CodexUserInputAns
 /** A small JSON-RPC peer specialized for app-server request_user_input. */
 export class CodexAppServerClient {
   private readonly options: Required<Pick<CodexAppServerClientOptions,
-    "clientName" | "clientTitle" | "reconnectDelayMs" | "requestTimeoutMs" | "now" | "setTimer" | "clearTimer">> &
+    "clientName" | "clientTitle" | "reconnectDelayMs" | "maxReconnectDelayMs" | "maxReconnectAttempts" |
+    "requestTimeoutMs" | "now" | "setTimer" | "clearTimer">> &
     CodexAppServerClientOptions;
   private stateValue: CodexAppServerState = "stopped";
   private shouldRun = false;
   private connectionEpoch = 0;
   private transport: CodexRpcTransport | undefined;
   private reconnectTimer: unknown;
+  /** Consecutive failed connects since the last successful handshake (drives the backoff). */
+  private reconnectAttempts = 0;
   private nextRpcId = 1;
   private readonly pendingRpc = new Map<string, PendingRpc>();
   private readonly pendingUserInput = new Map<string, PendingUserInput>();
@@ -273,6 +289,8 @@ export class CodexAppServerClient {
       clientName: options.clientName ?? "nomo",
       clientTitle: options.clientTitle ?? "Nomo Remote Input",
       reconnectDelayMs: options.reconnectDelayMs ?? DEFAULT_RECONNECT_DELAY_MS,
+      maxReconnectDelayMs: options.maxReconnectDelayMs ?? DEFAULT_MAX_RECONNECT_DELAY_MS,
+      maxReconnectAttempts: options.maxReconnectAttempts ?? DEFAULT_MAX_RECONNECT_ATTEMPTS,
       requestTimeoutMs: options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS,
       now: options.now ?? Date.now,
       setTimer: options.setTimer ?? defaultSetTimer,
@@ -282,20 +300,31 @@ export class CodexAppServerClient {
 
   get state(): CodexAppServerState { return this.stateValue; }
 
-  /** Start now; a failed attempt returns false and is retried in the background until stop(). */
+  /**
+   * Start now; a failed attempt returns false and is retried in the background with exponential
+   * backoff until stop() — or until the backoff gives up, which parks the client in "stopped" and
+   * waits for the next start(). The watchdog re-arms periodically, so giving up is never terminal.
+   */
   async start(): Promise<boolean> {
     this.shouldRun = true;
+    this.reconnectAttempts = 0;
     return this.connect();
   }
 
   async stop(): Promise<void> {
     this.shouldRun = false;
+    this.reconnectAttempts = 0;
     if (this.reconnectTimer !== undefined) {
       this.options.clearTimer(this.reconnectTimer);
       this.reconnectTimer = undefined;
     }
     const transport = this.transport;
     this.disconnect(this.connectionEpoch, "connection-lost", false);
+    // Invalidate any connect still in flight: its transport is orphaned by the epoch bump and a later
+    // start() must never be handed back the dead attempt's promise (which would leave shouldRun=true
+    // with no transport and no retry timer).
+    this.connectionEpoch += 1;
+    this.connectPromise = undefined;
     try { await transport?.close(); } catch { /* already fail-open */ }
     this.setState("stopped");
   }
@@ -344,7 +373,7 @@ export class CodexAppServerClient {
     const key = rpcIdKey(identity.requestId);
     const pending = this.pendingUserInput.get(key);
     if (!pending || !identitiesEqual(pending.request.identity, identity)) return "stale";
-    if (pending.responseSent || pending.interruptSent) return "already-sent";
+    if (pending.responseSent || pending.interruptConfirmed || pending.interruptInFlight) return "already-sent";
     if (!validAnswers(pending.request, answers)) return "invalid";
     if (this.stateValue !== "ready" || identity.connectionEpoch !== this.connectionEpoch || !this.transport) return "stale";
 
@@ -370,23 +399,29 @@ export class CodexAppServerClient {
     const key = rpcIdKey(identity.requestId);
     const pending = this.pendingUserInput.get(key);
     if (!pending || !identitiesEqual(pending.request.identity, identity)) return "stale";
-    if (pending.responseSent || pending.interruptSent) return "already-sent";
+    if (pending.responseSent || pending.interruptConfirmed || pending.interruptInFlight) return "already-sent";
     if (this.stateValue !== "ready" || identity.connectionEpoch !== this.connectionEpoch || !this.transport) {
       return "stale";
     }
 
     // The TUI does not synthesize a fake answer when the user rejects this prompt. It issues the
     // documented turn/interrupt request, which clears the pending server request and finishes the turn
-    // as interrupted. Mark our action before sending so serverRequest/resolved is attributed to us.
-    pending.interruptSent = true;
+    // as interrupted. Mark the ATTEMPT before sending so serverRequest/resolved is attributed to us:
+    // a timed-out reply does not mean the interrupt failed to land, and reporting such a turn as
+    // "server-cleared" would retire a card the user actually denied.
+    pending.interruptAttempted = true;
+    pending.interruptInFlight = true;
     try {
       await this.request("turn/interrupt", {
         threadId: identity.threadId,
         turnId: identity.turnId,
       });
+      pending.interruptInFlight = false;
+      pending.interruptConfirmed = true;
       return "sent";
     } catch (error) {
-      pending.interruptSent = false;
+      // Unconfirmed only. `interruptAttempted` stays set (attribution), while a retry stays possible.
+      pending.interruptInFlight = false;
       this.reportError(error, "Failed to interrupt Codex user input");
       return "transport-error";
     }
@@ -396,8 +431,12 @@ export class CodexAppServerClient {
     if (!this.shouldRun) return Promise.resolve(false);
     if (this.stateValue === "ready") return Promise.resolve(true);
     if (this.connectPromise) return this.connectPromise;
-    this.connectPromise = this.connectOnce().finally(() => { this.connectPromise = undefined; });
-    return this.connectPromise;
+    // Only clear the slot if it still holds THIS attempt: stop() may already have dropped it.
+    const attempt: Promise<boolean> = this.connectOnce().finally(() => {
+      if (this.connectPromise === attempt) this.connectPromise = undefined;
+    });
+    this.connectPromise = attempt;
+    return attempt;
   }
 
   private async connectOnce(): Promise<boolean> {
@@ -413,7 +452,12 @@ export class CodexAppServerClient {
           this.disconnect(epoch, "connection-lost", true);
         },
       });
-      if (epoch !== this.connectionEpoch || this.transport !== transport || !this.shouldRun) return false;
+      // A stop()/reconnect that raced this open owns the lifecycle now; this transport is orphaned and
+      // must be closed here or its child process outlives us.
+      if (epoch !== this.connectionEpoch || this.transport !== transport || !this.shouldRun) {
+        await this.abandon(transport);
+        return false;
+      }
       await this.request("initialize", {
         clientInfo: {
           name: this.options.clientName,
@@ -422,8 +466,12 @@ export class CodexAppServerClient {
         },
         capabilities: { experimentalApi: true, requestAttestation: false },
       }, true);
-      if (epoch !== this.connectionEpoch || this.transport !== transport || !this.shouldRun) return false;
+      if (epoch !== this.connectionEpoch || this.transport !== transport || !this.shouldRun) {
+        await this.abandon(transport);
+        return false;
+      }
       await transport.send({ method: "initialized" });
+      this.reconnectAttempts = 0; // a completed handshake resets the backoff
       this.setState("ready");
       return true;
     } catch (error) {
@@ -492,16 +540,31 @@ export class CodexAppServerClient {
   }
 
   private onUserInputRequest(epoch: number, id: CodexRequestId, rawParams: unknown): void {
-    if (this.stateValue !== "ready") return;
+    if (this.stateValue !== "ready") {
+      // Fail open, but never silently: a request arriving between initialize and ready is dropped and
+      // the phone will never see that prompt.
+      this.reportError(new Error("Dropped item/tool/requestUserInput before the connection was ready"));
+      return;
+    }
     const parsed = parseUserInputParams(rawParams);
     if (!parsed) {
       this.reportError(new Error("Invalid item/tool/requestUserInput payload"));
       return;
     }
     const key = rpcIdKey(id);
-    if (this.pendingUserInput.has(key)) {
-      this.reportError(new Error("Duplicate app-server request id"));
-      return;
+    const existing = this.pendingUserInput.get(key);
+    if (existing) {
+      // app-server reuses numeric request ids. An entry we already answered/interrupted but whose
+      // serverRequest/resolved never arrived must not block the id forever — the new request IS the
+      // proof the old one closed. Retire it and take the id. A genuinely live duplicate is a protocol
+      // violation: report it and keep the live request (dropping it is fail-open).
+      if (existing.responseSent || existing.interruptAttempted) {
+        this.resolvePending(key, existing,
+          existing.responseSent ? "response-sent" : "interrupt-sent");
+      } else {
+        this.reportError(new Error("Duplicate app-server request id"));
+        return;
+      }
     }
     const request: CodexUserInputRequest = {
       identity: {
@@ -515,8 +578,48 @@ export class CodexAppServerClient {
       autoResolutionMs: parsed.autoResolutionMs,
       receivedAtMs: this.options.now(),
     };
-    this.pendingUserInput.set(key, { request, responseSent: false, interruptSent: false });
+    const entry: PendingUserInput = {
+      request,
+      responseSent: false,
+      interruptAttempted: false,
+      interruptConfirmed: false,
+      interruptInFlight: false,
+      expiryTimer: undefined,
+    };
+    this.pendingUserInput.set(key, entry);
+    this.armAutoResolution(key, entry);
     this.options.onUserInputRequest?.(request);
+  }
+
+  /**
+   * app-server drops the prompt on its own once autoResolutionMs elapses. Mirror that deadline locally
+   * so a phone card can never outlive the prompt it points at (the resolved notification for an
+   * auto-resolved request is not guaranteed to reach us).
+   */
+  private armAutoResolution(key: string, entry: PendingUserInput): void {
+    const timeoutMs = entry.request.autoResolutionMs;
+    if (timeoutMs === null) return;
+    entry.expiryTimer = this.options.setTimer(() => {
+      entry.expiryTimer = undefined;
+      if (this.pendingUserInput.get(key) !== entry) return;
+      this.resolvePending(key, entry, this.attributionOf(entry));
+    }, timeoutMs);
+  }
+
+  private attributionOf(pending: PendingUserInput): CodexUserInputResolution {
+    return pending.responseSent ? "response-sent"
+      : pending.interruptAttempted ? "interrupt-sent"
+        : "server-cleared";
+  }
+
+  /** Remove one pending request, clear its timer, and notify exactly once. */
+  private resolvePending(key: string, pending: PendingUserInput, resolution: CodexUserInputResolution): void {
+    this.pendingUserInput.delete(key);
+    if (pending.expiryTimer !== undefined) {
+      this.options.clearTimer(pending.expiryTimer);
+      pending.expiryTimer = undefined;
+    }
+    this.options.onUserInputResolved?.(pending.request, resolution);
   }
 
   private onServerRequestResolved(rawParams: unknown): void {
@@ -527,16 +630,19 @@ export class CodexAppServerClient {
     const pending = this.pendingUserInput.get(key);
     if (!pending) return;
     if (pending.request.identity.threadId !== params.threadId) {
+      // Deliberately keep the live request: a resolution naming another thread is not authoritative
+      // over this one, and honouring it would retire a phone card whose prompt is still waiting.
+      // The entry is still bounded — autoResolutionMs expiry, a same-id reuse, or disconnect clears it.
       this.reportError(new Error("serverRequest/resolved identity mismatch"));
       return;
     }
-    this.pendingUserInput.delete(key);
-    this.options.onUserInputResolved?.(
-      pending.request,
-      pending.responseSent ? "response-sent"
-        : pending.interruptSent ? "interrupt-sent"
-          : "server-cleared",
-    );
+    this.resolvePending(key, pending, this.attributionOf(pending));
+  }
+
+  /** Close a transport this client no longer owns (raced by stop() or another connect). */
+  private async abandon(transport: CodexRpcTransport): Promise<void> {
+    if (this.transport === transport) this.transport = undefined;
+    try { await transport.close(); } catch { /* already fail-open */ }
   }
 
   private disconnect(epoch: number, resolution: CodexUserInputResolution, reconnect: boolean): void {
@@ -547,19 +653,46 @@ export class CodexAppServerClient {
       pending.reject(new Error("Codex app-server disconnected"));
     }
     this.pendingRpc.clear();
-    for (const pending of this.pendingUserInput.values()) {
+    const pendingInput = [...this.pendingUserInput.entries()];
+    this.pendingUserInput.clear();
+    for (const [, pending] of pendingInput) {
+      if (pending.expiryTimer !== undefined) {
+        this.options.clearTimer(pending.expiryTimer);
+        pending.expiryTimer = undefined;
+      }
       this.options.onUserInputResolved?.(pending.request, resolution);
     }
-    this.pendingUserInput.clear();
     if (this.shouldRun) {
       this.setState("disconnected");
-      if (reconnect && this.reconnectTimer === undefined) {
-        this.reconnectTimer = this.options.setTimer(() => {
-          this.reconnectTimer = undefined;
-          void this.connect();
-        }, this.options.reconnectDelayMs);
-      }
+      if (reconnect) this.scheduleReconnect();
     }
+  }
+
+  /**
+   * Exponential backoff, reset by a successful handshake. Every attempt spawns a fresh `codex` child,
+   * so a permanently unavailable app-server must not be retried on a fixed short interval forever.
+   */
+  private scheduleReconnect(): void {
+    if (this.reconnectTimer !== undefined) return;
+    if (this.reconnectAttempts >= this.options.maxReconnectAttempts) {
+      // Park in a clean, restartable state: no transport, no timer, shouldRun=false. The watchdog
+      // re-arms us by calling start() again on a later sweep.
+      this.shouldRun = false;
+      this.reportError(new Error(
+        `Codex app-server reconnect gave up after ${this.reconnectAttempts} consecutive failures`,
+      ));
+      this.setState("stopped");
+      return;
+    }
+    const delayMs = Math.min(
+      this.options.reconnectDelayMs * 2 ** this.reconnectAttempts,
+      this.options.maxReconnectDelayMs,
+    );
+    this.reconnectAttempts += 1;
+    this.reconnectTimer = this.options.setTimer(() => {
+      this.reconnectTimer = undefined;
+      void this.connect().catch((error) => this.reportError(error, "Codex app-server reconnect failed"));
+    }, delayMs);
   }
 
   private setState(state: CodexAppServerState): void {

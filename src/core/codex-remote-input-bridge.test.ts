@@ -78,12 +78,14 @@ class FakeClient {
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
-  const promise = new Promise<T>((done) => { resolve = done; });
-  return { promise, resolve };
+  let reject!: (error: unknown) => void;
+  const promise = new Promise<T>((done, fail) => { resolve = done; reject = fail; });
+  return { promise, resolve, reject };
 }
 
 function harness() {
   let client!: FakeClient;
+  const errors: Error[] = [];
   const handles: {
     request: CodexUserInputRequest;
     completion: ReturnType<typeof deferred<CodexRemoteInputResult>>;
@@ -92,6 +94,7 @@ function harness() {
     interrupt: () => Promise<CodexUserInputInterruptResult>;
   }[] = [];
   const bridge = new CodexRemoteInputBridge(config, {
+    onError: (error) => errors.push(error),
     createClient: (callbacks) => (client = new FakeClient(callbacks)),
     startRemoteInputFn: (incoming, deps): CodexRemoteInputHandle => {
       const completion = deferred<CodexRemoteInputResult>();
@@ -110,7 +113,7 @@ function harness() {
       };
     },
   });
-  return { bridge, client: () => client, handles };
+  return { bridge, client: () => client, handles, errors };
 }
 
 describe("CodexRemoteInputBridge", () => {
@@ -161,6 +164,29 @@ describe("CodexRemoteInputBridge", () => {
     await Promise.resolve();
     expect(h.handles[1].resolved).toBe(1);
     await h.bridge.stop();
+  });
+
+  test("a rejected relay completion is reported and never escapes as an unhandled rejection", async () => {
+    const unhandled: unknown[] = [];
+    const capture = (reason: unknown): void => { unhandled.push(reason); };
+    process.on("unhandledRejection", capture);
+    try {
+      const h = harness();
+      await h.bridge.start();
+      h.client().callbacks.onUserInputRequest(request);
+      h.handles[0].completion.reject(new Error("relay task blew up"));
+      // Let the microtask queue drain twice; an unhandled rejection is reported on the next tick.
+      await new Promise<void>((resolve) => setTimeout(resolve, 10));
+
+      expect(h.errors.map((error) => error.message)).toEqual(["relay task blew up"]);
+      expect(unhandled).toEqual([]);
+      // The handle is still evicted, so the same request id can start a fresh relay task.
+      h.client().callbacks.onUserInputRequest(request);
+      expect(h.handles).toHaveLength(2);
+      await h.bridge.stop();
+    } finally {
+      process.off("unhandledRejection", capture);
+    }
   });
 
   test("does not retire the relay as resolved elsewhere after its own turn interrupt", async () => {

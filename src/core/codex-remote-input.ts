@@ -47,6 +47,8 @@ export interface CodexRemoteInputDeps {
   sleep?: (ms: number) => Promise<void>;
   pollIntervalMs?: number;
   localApprovalsStateFn?: () => Promise<"on" | "off">;
+  /** Diagnostic seam. Failures here are never fatal, but they must not be silent either. */
+  onError?: (error: Error) => void;
 }
 
 export interface CodexRemoteInputHandle {
@@ -150,6 +152,18 @@ function abortableSleep(ms: number, signal: AbortSignal, sleep: (ms: number) => 
     signal.addEventListener("abort", finish, { once: true });
     sleep(ms).then(finish, finish);
   });
+}
+
+function report(deps: CodexRemoteInputDeps, error: unknown, fallback: string): void {
+  try {
+    deps.onError?.(error instanceof Error ? error : new Error(`${fallback}: ${String(error)}`));
+  } catch { /* a broken reporter must not break the relay */ }
+}
+
+async function parseJson<T>(response: Response): Promise<T | undefined> {
+  // An HTTP 200 carrying non-JSON (captive portal, edge interposition, truncated body) must degrade to
+  // the normal error path, never throw out of the relay task.
+  try { return await response.json() as T; } catch { return undefined; }
 }
 
 async function resolveOnRelay(config: Config, requestId: string, fetchFn: typeof fetch): Promise<void> {
@@ -263,9 +277,29 @@ async function runRemoteInput(
       return "transport-error";
     }
     if (!response.ok) return "transport-error";
-    if (((await response.json()) as { hold?: unknown }).hold !== true) return "not-held";
+    const created = await parseJson<{ hold?: unknown }>(response);
+    if (!created) {
+      // A 200 we cannot parse may still have created the hold. Retire it rather than leave an orphan.
+      report(deps, new Error("Unparseable relay response to the decision hold POST"), "Relay POST");
+      await resolveOnRelay(deps.config, requestId, fetchFn);
+      return "transport-error";
+    }
+    if (created.hold !== true) return "not-held";
     holdCreated = true;
     onHoldCreated(true);
+
+    // The relay has already recorded the phone's decision by the time we get here, so an app-server
+    // delivery failure must not look like success on the phone: report it and retire the relay record.
+    // Residual gap: the phone may have briefly rendered "answered" before its next poll sees the card
+    // retired, and Codex still needs a Desktop answer — we deliberately never fabricate one.
+    const reportUndelivered = async (action: string, outcome: string): Promise<void> => {
+      report(
+        deps,
+        new Error(`Codex ${action} was not delivered to app-server (${outcome})`),
+        "Codex remote input delivery",
+      );
+      await resolveOnRelay(deps.config, requestId, fetchFn);
+    };
 
     let misses = 0;
     while (!signal.aborted) {
@@ -274,9 +308,16 @@ async function runRemoteInput(
           headers,
           signal: AbortSignal.timeout(POLL_TIMEOUT_MS),
         });
-        if (response.ok) {
+        // An unreadable 200 counts as a miss exactly like a non-2xx, so a relay that answers with
+        // garbage forever still trips MAX_CONSECUTIVE_MISSES instead of polling until the heat death.
+        const data = response.ok
+          ? await parseJson<{ status?: unknown; answerBlob?: unknown }>(response)
+          : undefined;
+        if (!data) {
+          misses += 1;
+          if (response.ok) report(deps, new Error("Unparseable relay poll response"), "Relay poll");
+        } else {
           misses = 0;
-          const data = (await response.json()) as { status?: unknown; answerBlob?: unknown };
           if (data.status === "answered" && typeof data.answerBlob === "string") {
             let answer: PhoneAnswer;
             try { answer = await decryptBlob(deps.config.e2eKey, data.answerBlob) as PhoneAnswer; }
@@ -284,18 +325,19 @@ async function runRemoteInput(
             if (answer.requestId !== requestId) return "unsupported";
             if (answer.decision === "deny") {
               const result = await deps.interruptAppServer();
-              return result === "sent" || result === "already-sent" ? "denied" : "transport-error";
+              if (result === "sent" || result === "already-sent") return "denied";
+              await reportUndelivered("deny", result);
+              return "transport-error";
             }
             if (answer.decision !== "answer") return "unsupported";
             const mapped = codexAnswersFromPhone(request, answer.answers);
             if (!mapped) return "unsupported";
             const result = await deps.answerAppServer(mapped);
-            return result === "sent" || result === "already-sent" ? "answered" : "transport-error";
-          }
-          if (data.status === "expired") return "expired";
-          if (data.status === "superseded") return "superseded";
-        } else {
-          misses += 1;
+            if (result === "sent" || result === "already-sent") return "answered";
+            await reportUndelivered("answer", result);
+            return "transport-error";
+          } else if (data.status === "expired") return "expired";
+          else if (data.status === "superseded") return "superseded";
         }
       } catch {
         misses += 1;
@@ -304,6 +346,13 @@ async function runRemoteInput(
       await abortableSleep(deps.pollIntervalMs ?? POLL_INTERVAL_MS, signal, sleep);
     }
     return "resolved-elsewhere";
+  } catch (error) {
+    // Nothing in this task may throw out: the caller only holds the completion promise, and an escaping
+    // rejection kills the watchdog process. readRecord, encryptBlob, JSON decoding, and a hostile relay
+    // response all land here and degrade to the normal error/release semantics.
+    report(deps, error, "Codex remote input failed");
+    if (holdCreated) await resolveOnRelay(deps.config, requestId, deps.fetchFn ?? fetch);
+    return signal.aborted ? "resolved-elsewhere" : "transport-error";
   } finally {
     if (!holdCreated) onHoldCreated(false);
   }
@@ -320,7 +369,13 @@ export function startCodexRemoteInput(
   let settleHold!: (created: boolean) => void;
   const holdCreated = new Promise<boolean>((resolve) => { settleHold = resolve; });
   let resolvePromise: Promise<void> | undefined;
-  const completion = runRemoteInput(request, requestId, controller.signal, deps, settleHold);
+  // Belt and braces: runRemoteInput already catches everything, so this only covers a throwing reporter
+  // or a future edit. The completion promise must never reject — its consumer detaches it.
+  const completion = runRemoteInput(request, requestId, controller.signal, deps, settleHold)
+    .catch((error): CodexRemoteInputResult => {
+      report(deps, error, "Codex remote input failed");
+      return "transport-error";
+    });
   return {
     requestId,
     completion,

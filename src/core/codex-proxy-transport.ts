@@ -11,6 +11,8 @@ import type { CodexRpcTransport, CodexRpcTransportHandlers } from "./codex-app-s
 const WEBSOCKET_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const DEFAULT_MAX_BUFFER_BYTES = 1 << 20; // JSON-RPC messages should be far smaller than 1 MiB.
 const DEFAULT_MAX_HANDSHAKE_BYTES = 16 << 10;
+/** Largest unmasked server frame header: 2 bytes + an 8-byte extended length. */
+const MAX_FRAME_HEADER_BYTES = 10;
 
 export interface CodexProxyReadable {
   on(event: "data", listener: (chunk: Buffer | Uint8Array | string) => void): this;
@@ -143,7 +145,9 @@ export class CodexProxyTransport implements CodexRpcTransport {
   }
 
   open(handlers: CodexRpcTransportHandlers): Promise<void> {
-    if (this.child || this.openResolve || this.upgraded) {
+    // One instance per connect: an ended instance must reject instead of spawning a second child whose
+    // open() promise could never settle (finish() already consumed the resolve/reject pair).
+    if (this.child || this.openResolve || this.upgraded || this.ended) {
       return Promise.reject(new Error("Codex proxy transport has already been opened"));
     }
     this.handlers = handlers;
@@ -216,9 +220,12 @@ export class CodexProxyTransport implements CodexRpcTransport {
   private readonly onStdoutData = (chunk: Buffer | Uint8Array | string): void => {
     if (this.ended || this.closing) return;
     const incoming = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    // Keep the inbound limit symmetric with send(), which bounds the PAYLOAD at maxBufferBytes: a legal
+    // maximum-size message also carries its frame header, and counting that against the same number
+    // would tear down the connection on a message we would happily have sent ourselves.
     const receiveLimit = this.upgraded
-      ? this.options.maxBufferBytes
-      : this.options.maxHandshakeBytes + this.options.maxBufferBytes;
+      ? this.options.maxBufferBytes + MAX_FRAME_HEADER_BYTES
+      : this.options.maxHandshakeBytes + this.options.maxBufferBytes + MAX_FRAME_HEADER_BYTES;
     if (this.buffer.byteLength + incoming.byteLength > receiveLimit) {
       this.finish(new Error("Codex proxy transport receive buffer exceeded its limit"));
       return;
@@ -317,10 +324,17 @@ export class CodexProxyTransport implements CodexRpcTransport {
       case 0x8:
         if (payload.byteLength === 1) throw new Error("Invalid websocket close payload");
         this.closing = true;
-        void this.writeFrame(0x8, payload).catch(() => undefined).finally(() => this.finish());
+        // Terminal catch: .finally() forwards a throwing finish() into a new rejected promise, which
+        // would be an unhandled rejection (fatal under Node >= 15).
+        void this.writeFrame(0x8, payload)
+          .catch(() => undefined)
+          .finally(() => this.finish())
+          .catch(() => undefined);
         return;
       case 0x9:
-        void this.writeFrame(0xa, payload).catch((error) => this.finish(error));
+        void this.writeFrame(0xa, payload)
+          .catch((error) => this.finish(error))
+          .catch(() => undefined);
         return;
       case 0xa:
         return;

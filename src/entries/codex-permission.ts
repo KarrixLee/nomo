@@ -24,6 +24,19 @@ if (import.meta.main) {
   if (sub === "off" || sub === "on" || sub === "status") {
     process.exit(await approvalsCommand(sub));
   }
-  await runPermissionHook({}, "codex");
+  // FLUSH BEFORE EXIT — same 64 KB pipe-truncation hazard as cc-permission.ts (see the measured
+  // rationale there). Codex has no ExitPlanMode plan echo, so the decision line rarely nears the
+  // buffer, but a large request_user_input answer set can — and a truncated line is a lost approval.
+  let flushed: Promise<void> = Promise.resolve();
+  await runPermissionHook({
+    emit: (line: string) => {
+      flushed = new Promise<void>((resolve) => {
+        const timer = setTimeout(resolve, 1000);
+        (timer as unknown as { unref?: () => void }).unref?.();
+        process.stdout.write(`${line}\n`, () => { clearTimeout(timer); resolve(); });
+      });
+    },
+  }, "codex");
+  await flushed;
   process.exit(0);
 }

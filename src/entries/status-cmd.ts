@@ -9,8 +9,8 @@ import { readdir, readFile, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { claudeAdapter, codexAdapter } from "../core/adapter";
 import {
-  CC_DIR, CODEX_HOOK_MARKER, codexHome, LAST_SEND_PATH, parseConfig, parsePendingConfig, pidAlive,
-  SESSIONS_DIR, WATCHDOG_PID_PATH,
+  CC_DIR, CODEX_HOOK_MARKER, codexAppServerSocketAvailable, codexHome, LAST_SEND_PATH, parseConfig,
+  parsePendingConfig, pidAlive, SESSIONS_DIR, WATCHDOG_PID_PATH,
 } from "../core/shared";
 
 /** Native Codex plugin hook declarations in plugin/hooks/codex-hooks.json. Keep the status denominator
@@ -197,10 +197,9 @@ export async function statusCmd(deps: StatusDeps = {}): Promise<number> {
   const lastHookClaudePath = deps.lastHookClaudePath ?? claudeAdapter.hookStampPath();
   const isAlive = deps.isAlive ?? pidAlive;
   const now = deps.now ?? Date.now;
-  const codexAppServerAvailable = deps.codexAppServerAvailable ?? (async () => {
-    try { return (await stat(`${codexHome()}/app-server-control/app-server-control.sock`)).isSocket(); }
-    catch { return false; }
-  });
+  // The SAME control-socket probe the watchdog gates its remote-input bridge on (core/shared) — one
+  // definition, so "Codex app-server present" can never mean two different things in two places.
+  const codexAppServerAvailable = deps.codexAppServerAvailable ?? (() => codexAppServerSocketAvailable());
 
   // Pairing.
   let raw: string | null = null;

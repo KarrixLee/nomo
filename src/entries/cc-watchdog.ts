@@ -36,9 +36,10 @@ import { encryptBlob } from "../core/crypto";
 import { adapterFor, AgentAdapter, allAdapters, codexAdapter, DiscoveredSession } from "../core/adapter";
 import { CodexRemoteInputBridge } from "../core/codex-remote-input-bridge";
 import {
-  AgentKind, atomicWrite, CC_DIR, CCOp, CCStatus, Config, completePendingPairing, GONE_STRIKE_LIMIT, loadConfig, loadPendingConfig, localApprovalsState,
-  PAIR_HTML_FILE, PairPollResult, PendingConfig, pidAlive, PLUGIN_VERSION, readPrefix, readSuffix, recordGoneStrike, removeRevokedConfig,
-  resetGoneStrikes, SessionRecord, SESSIONS_DIR, WATCHDOG_PID_PATH,
+  AgentKind, atomicWrite, CC_DIR, CCOp, CCStatus, codexAppServerSocketAvailable, Config, completePendingPairing, formatWatchdogPidfile,
+  GONE_STRIKE_LIMIT, loadConfig, loadPendingConfig, localApprovalsState,
+  PAIR_HTML_FILE, PairPollResult, parseWatchdogPidfile, PendingConfig, pidAlive, PLUGIN_VERSION, readPrefix, readSuffix, recordGoneStrike, removeRevokedConfig,
+  resetGoneStrikes, SessionRecord, SESSIONS_DIR, watchdogHolderIsLive, WATCHDOG_PID_PATH,
 } from "../core/shared";
 
 // The transcript-tail interrupt PARSERS live in the agent adapters now (the two detections are
@@ -84,6 +85,105 @@ const HEARTBEAT_AFTER_MS = 300_000; // 5 min
  *  session is by definition alive, so the process persists across the sweeps that could heartbeat it,
  *  and the throttle never needs to survive a restart). */
 const heartbeatAt = new Map<string, number>();
+
+// --- Corrective-done retry bound (memory-backed, so a failing DISK can't unbound it) -----------
+//
+// The three corrective-done nets (interrupt / idle-Claude reap / undelivered-done) bound their retries
+// with `record.doneAttempts`, which is PERSISTED inside a try/catch: if the record rewrite itself keeps
+// failing (full disk, read-only home, a clobbered sessions dir), the counter never advances and the net
+// re-POSTs a doomed done every 5 s FOREVER — the exact "cap retries so a permanently-failing POST can't
+// spin" discipline the persisted counter was meant to enforce. This in-memory mirror (same shape as
+// heartbeatAt) is consulted ALONGSIDE the persisted value — the bound is max(disk, memory) — so it holds
+// regardless of disk state. Cleared whenever a net settles/clears the counter or the record goes away.
+
+/** Per-session corrective-done attempt count for THIS watchdog process. */
+const doneAttemptsMem = new Map<string, number>();
+
+/** The attempt count a net must bound against: the higher of the persisted counter and this process's
+ *  in-memory mirror, so a record rewrite that never lands can't reset the bound to zero every sweep. */
+export function effectiveDoneAttempts(record: SessionRecord, sessionId: string): number {
+  const persisted = typeof record.doneAttempts === "number" && Number.isFinite(record.doneAttempts) ? record.doneAttempts : 0;
+  return Math.max(persisted, doneAttemptsMem.get(sessionId) ?? 0);
+}
+
+/** Remember this session's new attempt count (called with the value just persisted, so memory and disk
+ *  agree when the write lands and memory WINS when it doesn't). */
+export function noteDoneAttempt(sessionId: string, attempts: number): void {
+  doneAttemptsMem.set(sessionId, attempts);
+}
+
+/** Drop a session's in-memory attempt count — on a delivered/settled corrective (the persisted counter
+ *  is cleared in the same breath) or when the record is removed. */
+export function clearDoneAttempts(sessionId: string): void {
+  doneAttemptsMem.delete(sessionId);
+}
+
+/** Test-only reset of the module-global retry memory (mirrors what a fresh daemon starts with). */
+export function resetDoneAttemptMemory(): void {
+  doneAttemptsMem.clear();
+}
+
+// --- Stale-snapshot guard (never write back a record the world moved past) ---------------------
+//
+// Every net receives the record SNAPSHOT the sweep read at the top of its iteration, then awaits a POST
+// (up to 2 s) before rewriting the file. A real hook can land in that window — a user prompt flipping the
+// session to `working`, a Stop, a SessionEnd delete — and a blind `{...snapshot, …}` rewrite would
+// RESURRECT the pre-POST state, stamping a live session back to `done` and silencing every self-heal net
+// that gates itself off on a done record. hook.ts's markDoneDelivered already documents the rule for the
+// other side of this race: RE-READ immediately before writing and clear only the marker. These helpers
+// are that rule, made pure and testable.
+
+/** Read a session record straight from disk, or null when absent/unreadable/corrupt. */
+async function readRecordAt(path: string): Promise<SessionRecord | null> {
+  try {
+    return JSON.parse(await readFile(path, "utf8")) as SessionRecord;
+  } catch {
+    return null;
+  }
+}
+
+/** Has the on-disk record MOVED since the snapshot the sweep read? Keyed on the three fields a real
+ *  hook always rewrites: the event clock and the two state fields. Pure. */
+export function recordMovedSince(snapshot: SessionRecord, fresh: SessionRecord): boolean {
+  return fresh.ts !== snapshot.ts || fresh.lastEvent !== snapshot.lastEvent || fresh.op !== snapshot.op;
+}
+
+/** Is this record in a terminal done state? (The state every corrective-done net pins.) */
+function isDoneState(record: SessionRecord): boolean {
+  return record.op === "done" || record.lastEvent === "done";
+}
+
+/** What correctPendingDone should WRITE after a delivered (or capped) done, given the freshly re-read
+ *  record. Pure — the whole stale-snapshot matrix is unit-testable:
+ *   - re-read unavailable (null: absent/unreadable) → the `settled` snapshot rewrite, i.e. EXACTLY the
+ *     pre-guard behavior. The guard can only ever REDUCE clobber, never add a new failure mode.
+ *   - unchanged → `settled` (pin the terminal done + drop the debt, as before).
+ *   - moved and no longer done (a user prompt landed mid-POST) → null: write NOTHING. Stamping the
+ *     snapshot back would flip a live `working` session to `done` and self-silence every net.
+ *   - moved but still done → clear ONLY the debt marker on the FRESH record (never the snapshot), and
+ *     only when it still carries one. */
+export function pendingDoneSettleWrite(
+  snapshot: SessionRecord, fresh: SessionRecord | null, settled: SessionRecord,
+): SessionRecord | null {
+  if (fresh === null) return settled;
+  if (!recordMovedSince(snapshot, fresh)) return settled;
+  if (!isDoneState(fresh)) return null;
+  if (fresh.donePending !== true) return null;
+  return { ...fresh, donePending: undefined, doneAttempts: undefined };
+}
+
+/** What correctPendingDone should WRITE after a transiently-FAILED re-POST: the bumped retry counter,
+ *  applied to whichever record is current. Same stale-snapshot rules as pendingDoneSettleWrite — a
+ *  session that moved on to `working` gets nothing written (the in-memory mirror still bounds the
+ *  retry). Pure. */
+export function pendingDoneRetryWrite(
+  snapshot: SessionRecord, fresh: SessionRecord | null, attempts: number,
+): SessionRecord | null {
+  if (fresh === null) return { ...snapshot, doneAttempts: attempts };
+  if (!recordMovedSince(snapshot, fresh)) return { ...fresh, doneAttempts: attempts };
+  if (!isDoneState(fresh)) return null;
+  return { ...fresh, doneAttempts: attempts };
+}
 
 export type SessionVerdict = "keep" | "end" | "stale" | "delete";
 
@@ -408,18 +508,30 @@ export async function discoverLiveSessions(config: Config, deps: DiscoverDeps = 
   }
 }
 
-/** The sentinel ids of PROVISIONAL records whose pid is now also held by a REAL (non-provisional) codex
- *  record — i.e. the real hook fired but the hook's own reconcile didn't run (unpaired at hook time, or
- *  a race). Equality on pid: a real codex record's pid and its provisional's pid are the same codex TUI
- *  process. Pure. */
-export function provisionalsCoveredByReal(entries: RecordEntry[]): string[] {
-  const realCodexPids = new Set(
+/** The agent a record belongs to (absent → claude, the historical default). */
+function recordAgent(record: SessionRecord): AgentKind {
+  return record.agent === "codex" ? "codex" : "claude";
+}
+
+/** The sentinel ids of PROVISIONAL records whose pid is now also held by a REAL (non-provisional) record
+ *  of a DISCOVERY-CAPABLE agent — i.e. the real hook fired but the hook's own reconcile didn't run
+ *  (unpaired at hook time, or a race). Equality on pid: a real record's pid and its provisional's pid are
+ *  the same TUI process.
+ *
+ *  "Discovery-capable" is read off the adapter registry (adapter.discoverLive present) rather than
+ *  hardcoding `agent === "codex"` — provisionals only EXIST for agents that implement discoverLive, so
+ *  keying on the same seam means a future discovery-capable agent reconciles for free and the daemon keeps
+ *  its no-inline-agent-branch discipline. Today only codex implements it, so the set is identical. Pure;
+ *  the registry is injectable for tests. */
+export function provisionalsCoveredByReal(entries: RecordEntry[], adapters: AgentAdapter[] = allAdapters): string[] {
+  const discoveryCapable = new Set(adapters.filter((a) => typeof a.discoverLive === "function").map((a) => a.kind));
+  const realPids = new Set(
     entries
-      .filter((e) => e.rec.provisional !== true && e.rec.agent === "codex" && typeof e.rec.pid === "number")
+      .filter((e) => e.rec.provisional !== true && discoveryCapable.has(recordAgent(e.rec)) && typeof e.rec.pid === "number")
       .map((e) => e.rec.pid),
   );
   return entries
-    .filter((e) => e.rec.provisional === true && typeof e.rec.pid === "number" && realCodexPids.has(e.rec.pid))
+    .filter((e) => e.rec.provisional === true && typeof e.rec.pid === "number" && realPids.has(e.rec.pid))
     .map((e) => e.sessionId);
 }
 
@@ -428,6 +540,8 @@ export interface SweepReconcileDeps {
   post?: (body: object) => Promise<PostOutcome>;
   readEntries?: () => Promise<RecordEntry[]>;
   deleteRecord?: (sessionId: string) => Promise<void>;
+  /** The adapter registry that decides which agents are discovery-capable (see provisionalsCoveredByReal). */
+  adapters?: AgentAdapter[];
   now?: () => number;
 }
 
@@ -441,7 +555,7 @@ export async function reconcileProvisionalsSweep(config: Config, deps: SweepReco
   const deleteRecord = deps.deleteRecord ?? ((sessionId: string) => unlink(`${SESSIONS_DIR}/${sessionId}.json`).catch(() => {}));
   const now = deps.now ?? Date.now;
   const entries = await readEntries();
-  for (const sessionId of provisionalsCoveredByReal(entries)) {
+  for (const sessionId of provisionalsCoveredByReal(entries, deps.adapters ?? allAdapters)) {
     const outcome = await post(buildEndEnvelope(sessionId, now()));
     if (outcome === "delivered") await deleteRecord(sessionId);
   }
@@ -543,12 +657,21 @@ export async function correctInterrupt(
     const agent: AgentKind = record.agent === "codex" ? "codex" : "claude";
     if (!tailShowsInterrupt(tail, agent)) return "uncorrected"; // live turn or no interrupt → leave it
     // The interrupt is CONFIRMED from here — the session is decided done regardless of this POST's fate.
-    const attempts = typeof record.doneAttempts === "number" && Number.isFinite(record.doneAttempts) ? record.doneAttempts : 0;
+    // Bounded against disk AND this process's memory, so a record rewrite that keeps failing (full disk /
+    // read-only home) can't reset the counter to zero every sweep and re-POST a doomed done forever.
+    const attempts = effectiveDoneAttempts(record, sessionId);
     // Retry exhausted: stop the every-sweep re-POST and pin done LOCALLY so the gate closes and the
     // heartbeat can never re-raise needsAttention. We can't deliver, so the worker's own eviction is the
     // backstop. "pending": interrupt handled (caller skips the heartbeat), not delivered.
     if (attempts >= INTERRUPT_DONE_MAX_ATTEMPTS) {
-      try { await writeRecord(path, { ...record, lastEvent: "done", sentDone: true, op: "done", doneAttempts: undefined }); } catch { /* best-effort */ }
+      try {
+        await writeRecord(path, { ...record, lastEvent: "done", sentDone: true, op: "done", doneAttempts: undefined });
+        clearDoneAttempts(sessionId); // pinned done ON DISK → the gate closes; the bound has done its job
+      } catch {
+        // The pin didn't land, so the gate stays OPEN and this net will be asked again next sweep. KEEP
+        // the in-memory count: clearing it here would restart the whole retry cycle every cap, which is
+        // exactly the unbounded re-POST spin the memory mirror exists to stop.
+      }
       return "pending";
     }
     // The interrupt was just detected, so the corrective done's `at` is the OBSERVED now (epoch seconds).
@@ -560,10 +683,12 @@ export async function correctInterrupt(
       try { await writeRecord(path, { ...record, lastEvent: "done", sentDone: true, op: "done", doneAttempts: undefined }); } catch {
         // Rewrite failed — worst case the net re-POSTs a done next sweep, which the worker drops.
       }
+      clearDoneAttempts(sessionId);
       return "corrected";
     }
     // Transient failure: persist the incremented attempt counter so the retry is BOUNDED and — because
     // doneAttempts > 0 — the heartbeat holds off (shouldHeartbeat) instead of re-raising needsAttention.
+    noteDoneAttempt(sessionId, attempts + 1); // memory-backed bound: holds even if the write below fails
     try { await writeRecord(path, { ...record, doneAttempts: attempts + 1 }); } catch {
       // Counter write failed — next sweep re-detects the interrupt and retries from the same attempt.
     }
@@ -851,12 +976,20 @@ export async function correctIdleClaude(
   const clock = deps.now ?? Date.now;
   try {
     if (!isClaudeIdleReapEligible(record, now)) return "uncorrected";
-    const attempts = typeof record.doneAttempts === "number" && Number.isFinite(record.doneAttempts) ? record.doneAttempts : 0;
+    // Bounded against disk AND memory (see effectiveDoneAttempts) — a persistently-failing record write
+    // must not reset the reap's retry budget to zero on every sweep.
+    const attempts = effectiveDoneAttempts(record, sessionId);
     // Retry exhausted: stop the every-sweep re-POST and pin done LOCALLY so the record reaches the terminal
     // state RETIRE keys on — the resumed-idle session then retires (record deleted, slot freed) even with the
     // worker unreachable, instead of spinning a doomed done forever. "pending": reap handled, not delivered.
     if (attempts >= CLAUDE_IDLE_REAP_MAX_ATTEMPTS) {
-      try { await writeRecord(path, { ...record, lastEvent: "done", sentDone: true, op: "done", doneAttempts: undefined }); } catch { /* best-effort */ }
+      try {
+        await writeRecord(path, { ...record, lastEvent: "done", sentDone: true, op: "done", doneAttempts: undefined });
+        clearDoneAttempts(sessionId); // pinned done ON DISK → the gate closes; the bound has done its job
+      } catch {
+        // Pin didn't land → keep the in-memory count, or the cap would restart the retry cycle forever
+        // (see the identical note in correctInterrupt).
+      }
       return "pending";
     }
     // Claude-only by the gate above, so the corrective done carries the claude blob shape (no agent key).
@@ -874,10 +1007,12 @@ export async function correctIdleClaude(
       try { await writeRecord(path, { ...record, lastEvent: "done", sentDone: true, op: "done", doneAttempts: undefined }); } catch {
         // Rewrite failed — worst case the net re-POSTs a done next sweep, which the worker drops.
       }
+      clearDoneAttempts(sessionId);
       return "corrected";
     }
     // Transient failure: persist the incremented attempt counter so the retry is BOUNDED and — because
     // doneAttempts > 0 — the heartbeat holds off (shouldHeartbeat), exactly like the interrupt net.
+    noteDoneAttempt(sessionId, attempts + 1); // memory-backed bound: holds even if the write below fails
     try { await writeRecord(path, { ...record, doneAttempts: attempts + 1 }); } catch {
       // Counter write failed — next sweep re-detects idle and retries from the same attempt.
     }
@@ -930,6 +1065,10 @@ export function shouldPendingDoneCheck(record: SessionRecord): boolean {
 export interface PendingDoneDeps {
   post?: (body: object) => Promise<PostOutcome>;
   writeRecord?: (path: string, rec: SessionRecord) => Promise<void>;
+  /** Re-reads the record from disk immediately before a write, so a hook that landed DURING the POST is
+   *  never clobbered back to the pre-POST snapshot (see pendingDoneSettleWrite). Defaults to a real read;
+   *  null (absent/unreadable) falls back to the pre-guard snapshot write. */
+  readRecord?: (path: string) => Promise<SessionRecord | null>;
   now?: () => number;
 }
 
@@ -955,18 +1094,36 @@ export async function correctPendingDone(
   const writeRecord = deps.writeRecord
     // Owner-only (0600), same as the hook's trackSession / every other record rewrite in this file.
     ?? ((p: string, rec: SessionRecord) => atomicWrite(p, JSON.stringify(rec), 0o600));
+  const reread = deps.readRecord ?? readRecordAt;
+  // Never throws: an unreadable/absent record reads as null, which the guards treat as "no evidence"
+  // and fall back to the pre-guard snapshot write.
+  const freshRecord = async (): Promise<SessionRecord | null> => {
+    try { return await reread(path); } catch { return null; }
+  };
   const clock = deps.now ?? Date.now;
   try {
     if (!shouldPendingDoneCheck(record)) return "uncorrected";
     const agent: AgentKind = record.agent === "codex" ? "codex" : "claude";
     // The settled record: the debt dropped and the terminal done state pinned (the hook already wrote
-    // these, but a watchdog rewrite between then and now could have moved them — pin explicitly).
+    // these, but a watchdog rewrite between then and now could have moved them — pin explicitly). It is
+    // only ever written after the stale-snapshot guard proves the record hasn't moved under us.
     const settled: SessionRecord = {
       ...record, lastEvent: "done", sentDone: true, op: "done", donePending: undefined, doneAttempts: undefined,
     };
-    const attempts = typeof record.doneAttempts === "number" && Number.isFinite(record.doneAttempts) ? record.doneAttempts : 0;
+    // Bound against disk AND memory, so a record rewrite that never lands can't unbound the retry.
+    const attempts = effectiveDoneAttempts(record, sessionId);
     if (attempts >= PENDING_DONE_MAX_ATTEMPTS) {
-      try { await writeRecord(path, settled); } catch { /* best-effort — worst case one more capped sweep */ }
+      const write = pendingDoneSettleWrite(record, await freshRecord(), settled);
+      if (!write) {
+        clearDoneAttempts(sessionId); // the record moved on (a live session owns it now) → stop counting
+        return "pending";
+      }
+      try {
+        await writeRecord(path, write);
+        clearDoneAttempts(sessionId); // the debt is dropped ON DISK → the gate closes
+      } catch {
+        // Settle didn't land → keep the in-memory count so the cap holds (see correctInterrupt's note).
+      }
       return "pending";
     }
     // record.ts is the Stop's own write time; a corrupt record with no numeric ts simply omits `at`
@@ -975,13 +1132,25 @@ export async function correctPendingDone(
     const outcome = await post(await buildDoneEnvelope(sessionId, record, clock(), config.e2eKey, agent, at));
     if (outcome === "revoked") return "revoked"; // pairing gone → bubble up so the loop can tear down
     if (outcome === "delivered") {
-      try { await writeRecord(path, settled); } catch {
-        // Rewrite failed — worst case we re-POST the same done next sweep, which the worker drops.
+      // RE-READ before writing: the POST above took up to 2 s, and a user prompt landing in that window
+      // already flipped this record to `working`. Stamping the pre-POST snapshot back would resurrect
+      // `done` on a live session and silence every net that gates off a done record (see
+      // pendingDoneSettleWrite for the full matrix).
+      const write = pendingDoneSettleWrite(record, await freshRecord(), settled);
+      if (write) {
+        try { await writeRecord(path, write); } catch {
+          // Rewrite failed — worst case we re-POST the same done next sweep, which the worker drops.
+        }
       }
+      clearDoneAttempts(sessionId);
       return "corrected";
     }
-    try { await writeRecord(path, { ...record, doneAttempts: attempts + 1 }); } catch {
-      // Counter write failed — next sweep retries from the same attempt (still bounded by the cap).
+    const retry = pendingDoneRetryWrite(record, await freshRecord(), attempts + 1);
+    noteDoneAttempt(sessionId, attempts + 1); // memory-backed bound: holds even if the write below fails
+    if (retry) {
+      try { await writeRecord(path, retry); } catch {
+        // Counter write failed — next sweep retries from the same attempt (still bounded by the cap).
+      }
     }
     return "pending";
   } catch {
@@ -1042,6 +1211,10 @@ export function isRetireEligible(record: SessionRecord, now: number): boolean {
 export interface RetireDeps {
   post?: (body: object) => Promise<PostOutcome>;
   deleteRecord?: (path: string) => Promise<void>;
+  /** Re-reads the record from disk immediately before the end-POST and again before the DELETE, so a
+   *  session the user just woke up (a prompt landing mid-sweep) is never retired out from under its own
+   *  hooks. Defaults to a real read; null (absent/unreadable) keeps the pre-guard behavior. */
+  readRecord?: (path: string) => Promise<SessionRecord | null>;
 }
 
 /** The idle-done retire net for one still-alive session. Gated by isRetireEligible, then it POSTs a
@@ -1060,12 +1233,29 @@ export async function retireDoneStale(
 ): Promise<"retired" | "retired-offline" | "skip" | "revoked"> {
   const post = deps.post ?? ((body: object) => postEvent(config, body));
   const deleteRecord = deps.deleteRecord ?? ((p: string) => unlink(p).catch(() => {}));
+  const reread = deps.readRecord ?? readRecordAt;
+  const freshRecord = async (): Promise<SessionRecord | null> => {
+    try { return await reread(path); } catch { return null; }
+  };
   try {
     if (!isRetireEligible(record, now)) return "skip";
+    // STALE-SNAPSHOT GUARD (before the POST): `record` is the snapshot the sweep read at the top of this
+    // iteration, and the correctives ahead of us already awaited POSTs. If a real hook landed since — the
+    // user woke this session up — the row is no longer a settled 1-h-old done, and both the op:end and the
+    // record delete would be a lie (deleting the record also orphans the live session: no reap file, no
+    // heartbeat). A null re-read (absent/unreadable) keeps the pre-guard behavior.
+    const before = await freshRecord();
+    if (before && (recordMovedSince(record, before) || !isRetireEligible(before, now))) return "skip";
     // record.ts is guaranteed a number by isRetireEligible → floor it into epoch seconds for the frozen `at`.
     const outcome = await post(buildEndEnvelope(sessionId, now, record, Math.floor(record.ts / 1000)));
     if (outcome === "revoked") return "revoked"; // pairing gone → bubble up; leave the record for teardown
+    // …and again immediately before the DELETE: the POST above took up to 2 s, which is plenty for a
+    // prompt to land. The end frame we just sent is superseded by that hook's own frame; the RECORD must
+    // survive so the woken session keeps its reap/heartbeat handle.
+    const after = await freshRecord();
+    if (after && recordMovedSince(record, after)) return "skip";
     heartbeatAt.delete(sessionId); // dropping the row → drop its heartbeat-throttle entry (like the sweep's delete)
+    clearDoneAttempts(sessionId);
     await deleteRecord(path);
     return outcome === "delivered" ? "retired" : "retired-offline";
   } catch {
@@ -1359,6 +1549,7 @@ async function sweep(config: Config | null): Promise<SweepResult> {
       if (outcome === "delivered") delivered = true;
     }
     heartbeatAt.delete(sessionId); // session is being removed → drop its throttle entry
+    clearDoneAttempts(sessionId); // …and its corrective-done retry count (a new session must start at 0)
     try {
       await unlink(path);
     } catch {
@@ -1379,24 +1570,198 @@ export async function goneStrikeShouldTeardown(goneStrikesPath?: string): Promis
   return (await recordGoneStrike(goneStrikesPath)) >= GONE_STRIKE_LIMIT;
 }
 
-/** Claim the single-instance pidfile. Returns false if another *live* watchdog already holds it
- *  (its pid is alive and isn't us), so this instance can exit immediately. */
+// --- Codex remote-input bridge supervision (presence-gated, deadline-decoupled) ----------------
+//
+// The bridge attaches to the SHARED codex app-server through `codex app-server proxy`, and a real
+// request_user_input response must return on that same process. Two rules the sweep loop depends on:
+//
+//   PRESENCE GATE — construct/start it ONLY while a Codex app-server daemon is actually up. Unguarded,
+//   a Claude-only user (no codex installed, or codex installed but never run as a daemon) got a fresh
+//   `codex` child spawned on every cycle forever. The probe is one stat of the control socket
+//   (codexAppServerSocketAvailable), cheap enough to re-run EVERY sweep — so a user who starts the
+//   daemon later gets the bridge without restarting the watchdog, and a daemon that goes away stops it.
+//
+//   DEADLINE — never let the sweep cadence depend on Codex responsiveness. A wedged proxy child (spawned,
+//   never writes, never exits) used to freeze the whole loop at `await bridge.start()`: no reap, no
+//   heartbeat, no discovery, no gone-strike teardown — with the pidfile still claimed, so nothing could
+//   replace us either. Bridge work now runs DETACHED behind a deadline; the loop never awaits it.
+
+/** The running loop's bridge teardown, published so the SIGTERM/SIGINT handler can stop the proxy child
+ *  through the same path run()'s `finally` uses. Undefined outside a live run(). */
+let activeBridgeShutdown: (() => void) | undefined;
+
+/** How long a detached bridge operation may run before the supervisor stops waiting on it. It is NOT a
+ *  cancel (the underlying client owns its own retry/backoff) — it just bounds the supervisor's own
+ *  bookkeeping so a wedged child can never pin an in-flight operation forever. */
+const BRIDGE_OP_DEADLINE_MS = 15_000;
+
+/** Race a promise against a timer, resolving `undefined` at the deadline. The work keeps running (we
+ *  can't cancel a child's IO), but the caller stops waiting. The timer is unref'd where the runtime
+ *  supports it so it can never hold the process open. */
+export function withDeadline<T>(work: Promise<T>, ms: number): Promise<T | undefined> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<undefined>((resolve) => {
+    timer = setTimeout(() => resolve(undefined), ms);
+    (timer as unknown as { unref?: () => void }).unref?.();
+  });
+  return Promise.race([work, deadline]).finally(() => { if (timer) clearTimeout(timer); });
+}
+
+/** How often the supervisor RE-ARMS a live bridge by calling start() again. The app-server client
+ *  retries with exponential backoff and, after enough consecutive failures, deliberately PARKS itself in
+ *  a clean restartable state ("stopped": no transport, no timer) — by design it then stays off until
+ *  someone calls start() again, and that someone is us. The parked state is normally detected exactly
+ *  (the client reports its give-up through onError; see GIVE_UP_PATTERN), and this interval is the
+ *  BACKSTOP for every state we cannot observe from outside the bridge. 10 min: re-arming is nearly free
+ *  (start() on a ready client resolves immediately and just refreshes subscriptions) and it only ever
+ *  runs while a Codex daemon socket genuinely exists, so it can never become the old spawn loop. */
+const BRIDGE_REARM_MS = 600_000;
+
+/** The client's give-up report ("…reconnect gave up after N consecutive failures"). Matching it lets the
+ *  supervisor re-arm on the NEXT sweep instead of waiting out BRIDGE_REARM_MS. Deliberately loose and
+ *  non-load-bearing: if the wording ever drifts, the interval above still re-arms. */
+const GIVE_UP_PATTERN = /gave up/i;
+
+/** The slice of CodexRemoteInputBridge the supervisor drives (start/stop/refresh). Declared structurally
+ *  so tests can drive the supervisor with a fake and the real class stays untouched. */
+export interface RemoteInputBridgeLike {
+  start(): Promise<unknown>;
+  stop(): Promise<void>;
+  refreshSubscriptions(): Promise<void>;
+}
+
+/** Injectable seams for the bridge supervisor. */
+export interface BridgeSupervisorDeps {
+  /** Is a Codex app-server daemon present right now? Defaults to the control-socket stat. */
+  probe?: () => Promise<boolean>;
+  /** Builds a bridge for a pairing, wired to the supervisor's error sink. Defaults to the real
+   *  CodexRemoteInputBridge. */
+  create?: (config: Config, options: { onError: (error: Error) => void }) => RemoteInputBridgeLike;
+  /** Runs bridge work OFF the sweep path. Defaults to fire-and-forget behind BRIDGE_OP_DEADLINE_MS with
+   *  every rejection swallowed — the daemon's contract is silence, and a bridge failure must never
+   *  surface as an unhandled rejection nor stall the loop. Tests inject a collector to await the work. */
+  detach?: (work: () => Promise<unknown>) => void;
+  /** Diagnostic passthrough for bridge/client errors (the daemon itself reports nothing — silence is the
+   *  contract — but the supervisor still inspects them to spot a parked client). */
+  onError?: (error: Error) => void;
+  now?: () => number;
+}
+
+/** Drives the Codex remote-input bridge alongside the sweep loop. `sync` is called once per cycle with
+ *  the CURRENT config and returns as soon as the bookkeeping is done — never after the bridge's IO. */
+export function createBridgeSupervisor(deps: BridgeSupervisorDeps = {}) {
+  const probe = deps.probe ?? (() => codexAppServerSocketAvailable());
+  const create = deps.create
+    ?? ((config: Config, options: { onError: (error: Error) => void }) =>
+      new CodexRemoteInputBridge(config, options) as RemoteInputBridgeLike);
+  const detach = deps.detach ?? ((work: () => Promise<unknown>) => {
+    void withDeadline(Promise.resolve().then(work), BRIDGE_OP_DEADLINE_MS).catch(() => {});
+  });
+  const now = deps.now ?? Date.now;
+  let bridge: RemoteInputBridgeLike | undefined;
+  let pairingId: string | undefined;
+  let lastStartAt = 0;
+  /** The client told us it gave up reconnecting → re-arm on the very next sweep. */
+  let parked = false;
+
+  /** The bridge's error sink: watch for the client's give-up so the re-arm is prompt, then pass through. */
+  const onError = (error: Error): void => {
+    try { if (GIVE_UP_PATTERN.test(error.message)) parked = true; } catch { /* exotic error object */ }
+    try { deps.onError?.(error); } catch { /* a broken reporter must not break the supervisor */ }
+  };
+
+  /** Drop the current bridge (detached — a wedged child must not stall the caller). */
+  const teardown = (): void => {
+    const dying = bridge;
+    bridge = undefined;
+    pairingId = undefined;
+    parked = false;
+    if (dying) detach(() => dying.stop());
+  };
+
+  /** (Re-)arm the connection. start() is idempotent: on a READY client it resolves immediately and just
+   *  refreshes subscriptions, so calling it periodically is safe. */
+  const arm = (target: RemoteInputBridgeLike): void => {
+    lastStartAt = now();
+    parked = false;
+    detach(() => target.start());
+  };
+
+  return {
+    /** One cycle of supervision. Unpaired → tear down. Paired but no Codex daemon → tear down (and never
+     *  construct one, so a Claude-only machine never spawns `codex` at all). Paired + daemon present →
+     *  (re)create on a pairing change, re-arm a parked/stale connection, else refresh subscriptions. All
+     *  bridge IO is detached. */
+    async sync(config: Config | null): Promise<void> {
+      if (!config) {
+        teardown();
+        return;
+      }
+      let available = false;
+      try { available = await probe(); } catch { available = false; }
+      if (!available) {
+        teardown(); // daemon went away (or never existed) → stop the bridge, keep the sweep running
+        return;
+      }
+      if (!bridge || pairingId !== config.pairingId) {
+        teardown();
+        const next = create(config, { onError });
+        bridge = next;
+        pairingId = config.pairingId;
+        arm(next);
+        return;
+      }
+      const current = bridge;
+      // A client that gave up reconnecting stays OFF until start() is called again — so re-arm it (the
+      // socket probe above just proved a daemon is there to reach), and re-arm periodically anyway to
+      // cover the parked states we cannot observe from outside the bridge.
+      if (parked || now() - lastStartAt >= BRIDGE_REARM_MS) {
+        arm(current);
+        return;
+      }
+      detach(() => current.refreshSubscriptions());
+    },
+    /** Final teardown for the loop's `finally` / a signal handler. */
+    shutdown(): void {
+      teardown();
+    },
+    /** Whether a bridge is currently constructed (test/diagnostic seam). */
+    get active(): boolean {
+      return bridge !== undefined;
+    },
+  };
+}
+
+/** Claim the single-instance pidfile. Returns false if another *live* watchdog on the SAME build already
+ *  holds it, so this instance can exit immediately.
+ *
+ *  Two things this refuses to be fooled by (see the pidfile note in core/shared):
+ *   - a RECYCLED pid — a reboot-surviving pidfile whose pid now belongs to some unrelated process. Trusting
+ *     kill(pid,0) there blocked every future watchdog forever; watchdogHolderIsLive `ps`-verifies the
+ *     command line, so a recycled pid reads as STALE and we claim it.
+ *   - a live incumbent on a DIFFERENT build — we were spawned by ensureWatchdog precisely because it wants
+ *     the new bundle running, and it SIGTERMs the incumbent in the same breath. Backing off there would
+ *     leave the old code running (and would re-loop: the next hook SIGTERMs + spawns again), so a
+ *     version-mismatched incumbent is taken over. Its own release is ownership-checked, so it can never
+ *     stomp our claim on the way out. */
 async function claimSingleInstance(): Promise<boolean> {
   try {
-    const holder = Number.parseInt(readFileSync(WATCHDOG_PID_PATH, "utf8").trim(), 10);
-    if (Number.isFinite(holder) && holder !== process.pid && pidAlive(holder)) return false;
+    const holder = parseWatchdogPidfile(readFileSync(WATCHDOG_PID_PATH, "utf8"));
+    if (holder && holder.pid !== process.pid && watchdogHolderIsLive(holder.pid) && holder.version === PLUGIN_VERSION) {
+      return false;
+    }
   } catch {
     // No pidfile (or unreadable) → free to claim.
   }
-  await atomicWrite(WATCHDOG_PID_PATH, String(process.pid));
+  await atomicWrite(WATCHDOG_PID_PATH, formatWatchdogPidfile(process.pid));
   return true;
 }
 
 /** Release the pidfile only if we still own it, so we never stomp a successor's claim. */
 function releaseSingleInstance(): void {
   try {
-    const holder = Number.parseInt(readFileSync(WATCHDOG_PID_PATH, "utf8").trim(), 10);
-    if (holder === process.pid) unlinkSync(WATCHDOG_PID_PATH);
+    const holder = parseWatchdogPidfile(readFileSync(WATCHDOG_PID_PATH, "utf8"));
+    if (holder && holder.pid === process.pid) unlinkSync(WATCHDOG_PID_PATH);
   } catch {
     // Nothing to release.
   }
@@ -1460,28 +1825,16 @@ async function run(): Promise<void> {
   // up to IDLE_GRACE_MS past this so discovery keeps watching for the next freshly-opened Codex TUI
   // instead of retiring the instant the sessions dir empties (see IDLE_GRACE_MS).
   let lastActiveMs = Date.now();
-  let remoteInputBridge: CodexRemoteInputBridge | undefined;
-  let remoteInputPairingId: string | undefined;
+  const bridges = createBridgeSupervisor();
+  activeBridgeShutdown = () => bridges.shutdown();
   try {
     while (true) {
       const config = await loadConfig(); // reload each cycle: a mid-pairing config may complete under us
-      // A real Codex request_user_input response must return on the SAME shared app-server process.
-      // Attach through `codex app-server proxy` when that control socket is available. This is
-      // fail-open: stdio-only Codex launches keep their status-only behavior and no picker is emitted.
-      if (config) {
-        if (!remoteInputBridge || remoteInputPairingId !== config.pairingId) {
-          await remoteInputBridge?.stop();
-          remoteInputBridge = new CodexRemoteInputBridge(config);
-          remoteInputPairingId = config.pairingId;
-          await remoteInputBridge.start();
-        } else {
-          await remoteInputBridge.refreshSubscriptions();
-        }
-      } else if (remoteInputBridge) {
-        await remoteInputBridge.stop();
-        remoteInputBridge = undefined;
-        remoteInputPairingId = undefined;
-      }
+      // A real Codex request_user_input response must return on the SAME shared app-server process, so
+      // the bridge attaches through `codex app-server proxy` — but ONLY while that control socket exists
+      // (re-probed every cycle) and never on the sweep's own await path. Fail-open in both directions: no
+      // Codex daemon → no bridge and no spawn at all; a wedged proxy child → the sweep keeps its cadence.
+      await bridges.sync(config);
       // Discovery + reconcile run BEFORE the sweep (only when paired). Backstop-reconcile first (retire
       // any provisional whose real session already reported), then discover new TUIs — so a just-
       // surfaced provisional is counted in `remaining` this same cycle, keeping the daemon alive
@@ -1549,12 +1902,30 @@ async function run(): Promise<void> {
       await new Promise((r) => setTimeout(r, POLL_MS));
     }
   } finally {
-    await remoteInputBridge?.stop();
+    bridges.shutdown();
+    activeBridgeShutdown = undefined;
     releaseSingleInstance(); // auto-quit on empty: drop our pidfile so the next hook re-spawns
   }
 }
 
 if (import.meta.main) {
+  // BELT-AND-BRACES for the detached bridge work (and anything else that escapes a net's own catch): a
+  // stray rejection must never take the daemon down. Node's default is to CRASH on an unhandled
+  // rejection — which would kill every self-heal net over a transient Codex socket error — so we swallow
+  // it and keep sweeping. Silence is the contract, so there is nothing to print.
+  process.on("unhandledRejection", () => { /* keep sweeping */ });
+  // Graceful stop. ensureWatchdog SIGTERMs a version-mismatched incumbent so the new build can take over,
+  // and default SIGTERM handling would skip run()'s `finally` — leaving the pidfile CLAIMED by a dead pid
+  // (a stale lock the successor then has to `ps`-disprove). Release it here, kick the bridge's child off
+  // the same shutdown path, and give it a beat before exiting.
+  const onTerminate = (): void => {
+    try { releaseSingleInstance(); } catch { /* nothing to release */ }
+    try { activeBridgeShutdown?.(); } catch { /* best-effort */ }
+    const exitTimer = setTimeout(() => process.exit(0), 250);
+    (exitTimer as unknown as { unref?: () => void }).unref?.();
+  };
+  process.on("SIGTERM", onTerminate);
+  process.on("SIGINT", onTerminate);
   try {
     await run();
   } catch {

@@ -92,7 +92,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { execFileSync, spawn } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "1.4.3";
+var PLUGIN_VERSION = "1.4.4";
 var CC_DIR = `${process.env.HOME}/.config/cc-status`;
 var SESSIONS_DIR = `${CC_DIR}/sessions`;
 var WATCHDOG_PID_PATH = `${CC_DIR}/watchdog.pid`;
@@ -122,6 +122,16 @@ function codexHome() {
   return env && env.length > 0 ? env : `${process.env.HOME}/.codex`;
 }
 var CODEX_HOOK_MARKER = "codex-status.mjs";
+function codexAppServerSocketPath() {
+  return `${codexHome()}/app-server-control/app-server-control.sock`;
+}
+async function codexAppServerSocketAvailable(socketPath = codexAppServerSocketPath()) {
+  try {
+    return (await stat(socketPath)).isSocket();
+  } catch {
+    return false;
+  }
+}
 function lastHookPath(agent) {
   return `${CC_DIR}/last-hook-${agent}`;
 }
@@ -358,19 +368,57 @@ async function completePendingPairing(pending, configPath, opts = {}) {
   await unlink(join(dirname(configPath), PAIR_HTML_FILE)).catch(() => {});
   return { state: "completed", deviceName };
 }
-function ensureWatchdog() {
+function isWatchdogCommand(psCommand) {
+  return psCommand.includes("cc-watchdog");
+}
+function formatWatchdogPidfile(pid, version = PLUGIN_VERSION) {
+  return `${pid} ${version}`;
+}
+function parseWatchdogPidfile(raw) {
+  const [pidField, versionField] = raw.trim().split(/\s+/);
+  const pid = Number.parseInt(pidField ?? "", 10);
+  if (!Number.isFinite(pid) || pid <= 0)
+    return null;
+  return { pid, ...typeof versionField === "string" && versionField.length > 0 ? { version: versionField } : {} };
+}
+function watchdogHolderIsLive(pid, deps = {}) {
+  const isAlive = deps.isAlive ?? pidAlive;
+  const commandOf = deps.commandOf ?? pidCommand;
+  if (!Number.isFinite(pid) || pid <= 0)
+    return false;
+  if (!isAlive(pid))
+    return false;
+  const cmd = commandOf(pid);
+  if (cmd === undefined)
+    return true;
+  return isWatchdogCommand(cmd);
+}
+function ensureWatchdog(deps = {}) {
   try {
-    let running = false;
-    try {
-      const pid = Number.parseInt(readFileSync(WATCHDOG_PID_PATH, "utf8").trim(), 10);
-      running = Number.isFinite(pid) && pid > 0 && pidAlive(pid);
-    } catch {
-      running = false;
+    const pidPath = deps.pidPath ?? WATCHDOG_PID_PATH;
+    const version = deps.version ?? PLUGIN_VERSION;
+    const readPidfile = deps.readPidfile ?? (() => {
+      try {
+        return readFileSync(pidPath, "utf8");
+      } catch {
+        return;
+      }
+    });
+    const killPid = deps.killPid ?? ((pid, signal) => process.kill(pid, signal));
+    const spawnWatchdog = deps.spawnWatchdog ?? (() => {
+      const runtime = process.env.NOMO_RUNTIME && process.env.NOMO_RUNTIME.length > 0 ? process.env.NOMO_RUNTIME : process.execPath;
+      spawn(runtime, [WATCHDOG_PATH], { detached: true, stdio: "ignore" }).unref();
+    });
+    const raw = readPidfile();
+    const holder = typeof raw === "string" ? parseWatchdogPidfile(raw) : null;
+    if (holder && watchdogHolderIsLive(holder.pid, deps)) {
+      if (holder.version === version)
+        return;
+      try {
+        killPid(holder.pid, "SIGTERM");
+      } catch {}
     }
-    if (running)
-      return;
-    const runtime = process.env.NOMO_RUNTIME && process.env.NOMO_RUNTIME.length > 0 ? process.env.NOMO_RUNTIME : process.execPath;
-    spawn(runtime, [WATCHDOG_PATH], { detached: true, stdio: "ignore" }).unref();
+    spawnWatchdog();
   } catch {}
 }
 async function readRecord(sessionId) {
@@ -1372,6 +1420,8 @@ var allAdapters = [claudeAdapter, codexAdapter];
 
 // src/core/codex-app-server-client.ts
 var DEFAULT_RECONNECT_DELAY_MS = 1000;
+var DEFAULT_MAX_RECONNECT_DELAY_MS = 300000;
+var DEFAULT_MAX_RECONNECT_ATTEMPTS = 10;
 var DEFAULT_REQUEST_TIMEOUT_MS = 1e4;
 var defaultSetTimer = (callback, delayMs) => {
   const token = setTimeout(callback, delayMs);
@@ -1471,6 +1521,7 @@ class CodexAppServerClient {
   connectionEpoch = 0;
   transport;
   reconnectTimer;
+  reconnectAttempts = 0;
   nextRpcId = 1;
   pendingRpc = new Map;
   pendingUserInput = new Map;
@@ -1481,6 +1532,8 @@ class CodexAppServerClient {
       clientName: options.clientName ?? "nomo",
       clientTitle: options.clientTitle ?? "Nomo Remote Input",
       reconnectDelayMs: options.reconnectDelayMs ?? DEFAULT_RECONNECT_DELAY_MS,
+      maxReconnectDelayMs: options.maxReconnectDelayMs ?? DEFAULT_MAX_RECONNECT_DELAY_MS,
+      maxReconnectAttempts: options.maxReconnectAttempts ?? DEFAULT_MAX_RECONNECT_ATTEMPTS,
       requestTimeoutMs: options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS,
       now: options.now ?? Date.now,
       setTimer: options.setTimer ?? defaultSetTimer,
@@ -1492,16 +1545,20 @@ class CodexAppServerClient {
   }
   async start() {
     this.shouldRun = true;
+    this.reconnectAttempts = 0;
     return this.connect();
   }
   async stop() {
     this.shouldRun = false;
+    this.reconnectAttempts = 0;
     if (this.reconnectTimer !== undefined) {
       this.options.clearTimer(this.reconnectTimer);
       this.reconnectTimer = undefined;
     }
     const transport = this.transport;
     this.disconnect(this.connectionEpoch, "connection-lost", false);
+    this.connectionEpoch += 1;
+    this.connectPromise = undefined;
     try {
       await transport?.close();
     } catch {}
@@ -1542,7 +1599,7 @@ class CodexAppServerClient {
     const pending = this.pendingUserInput.get(key);
     if (!pending || !identitiesEqual(pending.request.identity, identity))
       return "stale";
-    if (pending.responseSent || pending.interruptSent)
+    if (pending.responseSent || pending.interruptConfirmed || pending.interruptInFlight)
       return "already-sent";
     if (!validAnswers(pending.request, answers))
       return "invalid";
@@ -1567,20 +1624,23 @@ class CodexAppServerClient {
     const pending = this.pendingUserInput.get(key);
     if (!pending || !identitiesEqual(pending.request.identity, identity))
       return "stale";
-    if (pending.responseSent || pending.interruptSent)
+    if (pending.responseSent || pending.interruptConfirmed || pending.interruptInFlight)
       return "already-sent";
     if (this.stateValue !== "ready" || identity.connectionEpoch !== this.connectionEpoch || !this.transport) {
       return "stale";
     }
-    pending.interruptSent = true;
+    pending.interruptAttempted = true;
+    pending.interruptInFlight = true;
     try {
       await this.request("turn/interrupt", {
         threadId: identity.threadId,
         turnId: identity.turnId
       });
+      pending.interruptInFlight = false;
+      pending.interruptConfirmed = true;
       return "sent";
     } catch (error) {
-      pending.interruptSent = false;
+      pending.interruptInFlight = false;
       this.reportError(error, "Failed to interrupt Codex user input");
       return "transport-error";
     }
@@ -1592,10 +1652,12 @@ class CodexAppServerClient {
       return Promise.resolve(true);
     if (this.connectPromise)
       return this.connectPromise;
-    this.connectPromise = this.connectOnce().finally(() => {
-      this.connectPromise = undefined;
+    const attempt = this.connectOnce().finally(() => {
+      if (this.connectPromise === attempt)
+        this.connectPromise = undefined;
     });
-    return this.connectPromise;
+    this.connectPromise = attempt;
+    return attempt;
   }
   async connectOnce() {
     this.setState("connecting");
@@ -1611,8 +1673,10 @@ class CodexAppServerClient {
           this.disconnect(epoch, "connection-lost", true);
         }
       });
-      if (epoch !== this.connectionEpoch || this.transport !== transport || !this.shouldRun)
+      if (epoch !== this.connectionEpoch || this.transport !== transport || !this.shouldRun) {
+        await this.abandon(transport);
         return false;
+      }
       await this.request("initialize", {
         clientInfo: {
           name: this.options.clientName,
@@ -1621,9 +1685,12 @@ class CodexAppServerClient {
         },
         capabilities: { experimentalApi: true, requestAttestation: false }
       }, true);
-      if (epoch !== this.connectionEpoch || this.transport !== transport || !this.shouldRun)
+      if (epoch !== this.connectionEpoch || this.transport !== transport || !this.shouldRun) {
+        await this.abandon(transport);
         return false;
+      }
       await transport.send({ method: "initialized" });
+      this.reconnectAttempts = 0;
       this.setState("ready");
       return true;
     } catch (error) {
@@ -1693,17 +1760,24 @@ class CodexAppServerClient {
     }
   }
   onUserInputRequest(epoch, id, rawParams) {
-    if (this.stateValue !== "ready")
+    if (this.stateValue !== "ready") {
+      this.reportError(new Error("Dropped item/tool/requestUserInput before the connection was ready"));
       return;
+    }
     const parsed = parseUserInputParams(rawParams);
     if (!parsed) {
       this.reportError(new Error("Invalid item/tool/requestUserInput payload"));
       return;
     }
     const key = rpcIdKey(id);
-    if (this.pendingUserInput.has(key)) {
-      this.reportError(new Error("Duplicate app-server request id"));
-      return;
+    const existing = this.pendingUserInput.get(key);
+    if (existing) {
+      if (existing.responseSent || existing.interruptAttempted) {
+        this.resolvePending(key, existing, existing.responseSent ? "response-sent" : "interrupt-sent");
+      } else {
+        this.reportError(new Error("Duplicate app-server request id"));
+        return;
+      }
     }
     const request = {
       identity: {
@@ -1717,8 +1791,39 @@ class CodexAppServerClient {
       autoResolutionMs: parsed.autoResolutionMs,
       receivedAtMs: this.options.now()
     };
-    this.pendingUserInput.set(key, { request, responseSent: false, interruptSent: false });
+    const entry = {
+      request,
+      responseSent: false,
+      interruptAttempted: false,
+      interruptConfirmed: false,
+      interruptInFlight: false,
+      expiryTimer: undefined
+    };
+    this.pendingUserInput.set(key, entry);
+    this.armAutoResolution(key, entry);
     this.options.onUserInputRequest?.(request);
+  }
+  armAutoResolution(key, entry) {
+    const timeoutMs = entry.request.autoResolutionMs;
+    if (timeoutMs === null)
+      return;
+    entry.expiryTimer = this.options.setTimer(() => {
+      entry.expiryTimer = undefined;
+      if (this.pendingUserInput.get(key) !== entry)
+        return;
+      this.resolvePending(key, entry, this.attributionOf(entry));
+    }, timeoutMs);
+  }
+  attributionOf(pending) {
+    return pending.responseSent ? "response-sent" : pending.interruptAttempted ? "interrupt-sent" : "server-cleared";
+  }
+  resolvePending(key, pending, resolution) {
+    this.pendingUserInput.delete(key);
+    if (pending.expiryTimer !== undefined) {
+      this.options.clearTimer(pending.expiryTimer);
+      pending.expiryTimer = undefined;
+    }
+    this.options.onUserInputResolved?.(pending.request, resolution);
   }
   onServerRequestResolved(rawParams) {
     const params = asRecord(rawParams);
@@ -1733,8 +1838,14 @@ class CodexAppServerClient {
       this.reportError(new Error("serverRequest/resolved identity mismatch"));
       return;
     }
-    this.pendingUserInput.delete(key);
-    this.options.onUserInputResolved?.(pending.request, pending.responseSent ? "response-sent" : pending.interruptSent ? "interrupt-sent" : "server-cleared");
+    this.resolvePending(key, pending, this.attributionOf(pending));
+  }
+  async abandon(transport) {
+    if (this.transport === transport)
+      this.transport = undefined;
+    try {
+      await transport.close();
+    } catch {}
   }
   disconnect(epoch, resolution, reconnect) {
     if (epoch !== this.connectionEpoch)
@@ -1745,19 +1856,36 @@ class CodexAppServerClient {
       pending.reject(new Error("Codex app-server disconnected"));
     }
     this.pendingRpc.clear();
-    for (const pending of this.pendingUserInput.values()) {
+    const pendingInput = [...this.pendingUserInput.entries()];
+    this.pendingUserInput.clear();
+    for (const [, pending] of pendingInput) {
+      if (pending.expiryTimer !== undefined) {
+        this.options.clearTimer(pending.expiryTimer);
+        pending.expiryTimer = undefined;
+      }
       this.options.onUserInputResolved?.(pending.request, resolution);
     }
-    this.pendingUserInput.clear();
     if (this.shouldRun) {
       this.setState("disconnected");
-      if (reconnect && this.reconnectTimer === undefined) {
-        this.reconnectTimer = this.options.setTimer(() => {
-          this.reconnectTimer = undefined;
-          this.connect();
-        }, this.options.reconnectDelayMs);
-      }
+      if (reconnect)
+        this.scheduleReconnect();
     }
+  }
+  scheduleReconnect() {
+    if (this.reconnectTimer !== undefined)
+      return;
+    if (this.reconnectAttempts >= this.options.maxReconnectAttempts) {
+      this.shouldRun = false;
+      this.reportError(new Error(`Codex app-server reconnect gave up after ${this.reconnectAttempts} consecutive failures`));
+      this.setState("stopped");
+      return;
+    }
+    const delayMs = Math.min(this.options.reconnectDelayMs * 2 ** this.reconnectAttempts, this.options.maxReconnectDelayMs);
+    this.reconnectAttempts += 1;
+    this.reconnectTimer = this.options.setTimer(() => {
+      this.reconnectTimer = undefined;
+      this.connect().catch((error) => this.reportError(error, "Codex app-server reconnect failed"));
+    }, delayMs);
   }
   setState(state) {
     if (this.stateValue === state)
@@ -1776,6 +1904,7 @@ import { createHash, randomBytes } from "node:crypto";
 var WEBSOCKET_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 var DEFAULT_MAX_BUFFER_BYTES = 1 << 20;
 var DEFAULT_MAX_HANDSHAKE_BYTES = 16 << 10;
+var MAX_FRAME_HEADER_BYTES = 10;
 function defaultSpawnProxy(command, args) {
   return spawn2(command, [...args], { stdio: ["pipe", "pipe", "pipe"] });
 }
@@ -1869,7 +1998,7 @@ class CodexProxyTransport {
     };
   }
   open(handlers) {
-    if (this.child || this.openResolve || this.upgraded) {
+    if (this.child || this.openResolve || this.upgraded || this.ended) {
       return Promise.reject(new Error("Codex proxy transport has already been opened"));
     }
     this.handlers = handlers;
@@ -1945,7 +2074,7 @@ class CodexProxyTransport {
     if (this.ended || this.closing)
       return;
     const incoming = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-    const receiveLimit = this.upgraded ? this.options.maxBufferBytes : this.options.maxHandshakeBytes + this.options.maxBufferBytes;
+    const receiveLimit = this.upgraded ? this.options.maxBufferBytes + MAX_FRAME_HEADER_BYTES : this.options.maxHandshakeBytes + this.options.maxBufferBytes + MAX_FRAME_HEADER_BYTES;
     if (this.buffer.byteLength + incoming.byteLength > receiveLimit) {
       this.finish(new Error("Codex proxy transport receive buffer exceeded its limit"));
       return;
@@ -2060,10 +2189,14 @@ class CodexProxyTransport {
         this.closing = true;
         this.writeFrame(8, payload).catch(() => {
           return;
-        }).finally(() => this.finish());
+        }).finally(() => this.finish()).catch(() => {
+          return;
+        });
         return;
       case 9:
-        this.writeFrame(10, payload).catch((error) => this.finish(error));
+        this.writeFrame(10, payload).catch((error) => this.finish(error)).catch(() => {
+          return;
+        });
         return;
       case 10:
         return;
@@ -2495,6 +2628,9 @@ var POST_RETRY_PAUSE_MS = 1000;
 var HOLD_RETRY_DELAY_MS = 4000;
 var FRESH_SESSION_MS = 60000;
 var MAX_CONSECUTIVE_MISSES = 100;
+var DEFINITIVE_POLL_STATUSES = new Set([401, 403, 404, 410]);
+var MAX_DEFINITIVE_POLL_FAILURES = 2;
+var MAX_UNKNOWN_ANSWER_READS = 3;
 var CODEX_POLICY_TAIL_BYTES = 8 * 1024 * 1024;
 var CODEX_ROLLOUT_HEAD_BYTES = 1024 * 1024;
 function codexTurnPolicyFromRollout(text, turnId) {
@@ -2617,14 +2753,16 @@ function answerLine(agent, toolName, toolInput, answers) {
   const questions = usableQuestions(toolInput);
   if (questions.length === 0)
     return;
+  if (new Set(questions.map((q) => q.text)).size !== questions.length)
+    return;
   const map = {};
   for (let i = 0;i < questions.length; i += 1) {
     const a = answers[i];
     if (typeof a !== "string")
-      continue;
+      return;
     const raw = a.trim();
     if (raw.length === 0)
-      continue;
+      return;
     if (raw.length > ANSWER_MAX)
       return;
     const resolved = resolveAnswer(raw, questions[i].labels);
@@ -2632,7 +2770,7 @@ function answerLine(agent, toolName, toolInput, answers) {
       return;
     map[questions[i].text] = resolved;
   }
-  if (Object.keys(map).length === 0)
+  if (Object.keys(map).length !== questions.length)
     return;
   return decisionLine(agent, {
     hookEventName: "PermissionRequest",
@@ -2661,6 +2799,15 @@ function resolveAnswer(answer, labels) {
 }
 var TRACE_PATH = `${CC_DIR}/permission-trace.log`;
 var TRACE_MAX_BYTES = 256 * 1024;
+function errorTag(e) {
+  const name = typeof e?.name === "string" ? e.name : typeof e;
+  const code = e?.code;
+  return { error: name, ...typeof code === "string" ? { code } : {} };
+}
+function parseErrorPosition(e) {
+  const m = typeof e?.message === "string" ? /position (\d+)/.exec(e.message) : null;
+  return m ? Number(m[1]) : undefined;
+}
 function appendTrace(path, event) {
   try {
     appendFileSync(path, `${JSON.stringify({ ts: Date.now(), pid: process.pid, ...event })}
@@ -2690,11 +2837,11 @@ function defaultTrace() {
       });
     }
     process.on("uncaughtException", (e) => {
-      trace({ event: "uncaughtException", error: String(e).slice(0, 200) });
+      trace({ event: "uncaughtException", ...errorTag(e) });
       process.exit(0);
     });
     process.on("unhandledRejection", (e) => {
-      trace({ event: "unhandledRejection", error: String(e).slice(0, 200) });
+      trace({ event: "unhandledRejection", ...errorTag(e) });
       process.exit(0);
     });
     process.on("exit", (code) => appendTrace(TRACE_PATH, { event: "exit-event", code }));
@@ -2934,7 +3081,13 @@ async function runPermissionHook(deps = {}, agent = "claude") {
       trace({ event: "exit", reason: "unpaired" });
       return;
     }
-    const input = JSON.parse(raw);
+    let input;
+    try {
+      input = JSON.parse(raw);
+    } catch (e) {
+      trace({ event: "exit", reason: "bad-stdin", ...errorTag(e), pos: parseErrorPosition(e) });
+      return;
+    }
     const sessionId = typeof input.session_id === "string" ? input.session_id : "";
     if (sessionId.length === 0) {
       trace({ event: "exit", reason: "no-session-id" });
@@ -2977,7 +3130,8 @@ async function runPermissionHook(deps = {}, agent = "claude") {
     const record = await (deps.readRecordFn ?? readRecord)(sessionId);
     const machine = config.machineName ?? hostname2().replace(/\.local$/, "");
     const plan = { op: "update", prio: 1, status: "needsAttention" };
-    const base = buildBlob(input, machine, record?.title, plan, agent, record?.turnStartedAt, record?.label, record?.model);
+    const at = Math.floor(now / 1000);
+    const base = buildBlob(input, machine, record?.title, plan, agent, record?.turnStartedAt, record?.label, record?.model, at);
     const permissionBase = {
       ...base,
       status: "decisionPending",
@@ -3016,10 +3170,35 @@ async function runPermissionHook(deps = {}, agent = "claude") {
       }
       return { posted: posted2, hold: hold2 };
     };
+    const pollDecision = async (seq2) => {
+      trace({ event: "poll-begin", seq: seq2 });
+      try {
+        const res = await fetchFn(`${config.url}/v1/cc/decision/${requestId}`, {
+          headers: pcHeaders,
+          signal: AbortSignal.timeout(FETCH_TIMEOUT_MS)
+        });
+        if (!res.ok) {
+          trace({ event: "poll-end", seq: seq2, outcome: "status", status: res.status });
+          return { status: res.status };
+        }
+        const data = await res.json();
+        trace({ event: "poll-end", seq: seq2, outcome: "ok" });
+        return { data, status: res.status };
+      } catch (e) {
+        trace({ event: "poll-end", seq: seq2, outcome: "error", ...errorTag(e) });
+        return { status: 0 };
+      }
+    };
     let { posted, hold } = await postDecision(1, POST_MAX_ATTEMPTS);
     if (!posted) {
-      trace({ event: "exit", reason: "post-error" });
-      return;
+      const probe = await pollDecision(0);
+      const live = probe.data?.status === "pending" || probe.data?.status === "answered";
+      if (!live) {
+        trace({ event: "exit", reason: "post-error" });
+        return;
+      }
+      trace({ event: "post-timeout-landed", status: probe.data?.status });
+      hold = true;
     }
     trace({ event: "hold", hold });
     if (!hold) {
@@ -3047,27 +3226,16 @@ async function runPermissionHook(deps = {}, agent = "claude") {
     const emit = deps.emit ?? ((line) => process.stdout.write(`${line}
 `));
     let misses = 0;
+    let definitiveFailures = 0;
+    let unknownBlob;
+    let unknownReads = 0;
     let seq = 0;
     for (;; ) {
       seq += 1;
-      trace({ event: "poll-begin", seq });
-      let data;
-      try {
-        const res = await fetchFn(`${config.url}/v1/cc/decision/${requestId}`, {
-          headers: pcHeaders,
-          signal: AbortSignal.timeout(FETCH_TIMEOUT_MS)
-        });
-        if (res.ok) {
-          data = await res.json();
-          trace({ event: "poll-end", seq, outcome: "ok" });
-        } else {
-          trace({ event: "poll-end", seq, outcome: "status", status: res.status });
-        }
-      } catch (e) {
-        trace({ event: "poll-end", seq, outcome: "error", error: e?.name ?? "Error" });
-      }
+      const { data, status: httpStatus } = await pollDecision(seq);
       if (data) {
         misses = 0;
+        definitiveFailures = 0;
         if (data.status === "answered" && typeof data.answerBlob === "string") {
           const answer = await decryptBlob(config.e2eKey, data.answerBlob);
           const match = answer.requestId === requestId;
@@ -3077,20 +3245,39 @@ async function runPermissionHook(deps = {}, agent = "claude") {
             trace({ event: "exit", reason: "answered" });
             return;
           }
+          unknownReads = data.answerBlob === unknownBlob ? unknownReads + 1 : 1;
+          unknownBlob = data.answerBlob;
+          if (unknownReads >= MAX_UNKNOWN_ANSWER_READS) {
+            trace({ event: "release", reason: "unknown-decision-terminal", reads: unknownReads });
+            trace({ event: "exit", reason: "unknown-decision" });
+            return;
+          }
         } else if (typeof data.status === "string" && data.status !== "pending") {
           trace({ event: data.status === "expired" ? "expired" : "superseded", status: data.status });
           trace({ event: "exit", reason: data.status });
           return;
         }
-      } else if (++misses >= MAX_CONSECUTIVE_MISSES) {
-        trace({ event: "giveup", misses });
-        trace({ event: "exit", reason: "giveup" });
-        return;
+      } else {
+        if (DEFINITIVE_POLL_STATUSES.has(httpStatus)) {
+          definitiveFailures += 1;
+          if (definitiveFailures >= MAX_DEFINITIVE_POLL_FAILURES) {
+            trace({ event: "giveup", reason: "definitive", status: httpStatus, strikes: definitiveFailures });
+            trace({ event: "exit", reason: "definitive" });
+            return;
+          }
+        } else {
+          definitiveFailures = 0;
+        }
+        if (++misses >= MAX_CONSECUTIVE_MISSES) {
+          trace({ event: "giveup", misses });
+          trace({ event: "exit", reason: "giveup" });
+          return;
+        }
       }
       await sleep(interval + jitter());
     }
   } catch (e) {
-    trace({ event: "exit", reason: "exception", error: String(e).slice(0, 200) });
+    trace({ event: "exit", reason: "exception", ...errorTag(e) });
   }
 }
 async function approvalsCommand(sub, deps = {}) {
@@ -3192,6 +3379,18 @@ function abortableSleep(ms, signal, sleep) {
     sleep(ms).then(finish, finish);
   });
 }
+function report(deps, error, fallback) {
+  try {
+    deps.onError?.(error instanceof Error ? error : new Error(`${fallback}: ${String(error)}`));
+  } catch {}
+}
+async function parseJson(response) {
+  try {
+    return await response.json();
+  } catch {
+    return;
+  }
+}
 async function resolveOnRelay(config, requestId, fetchFn) {
   try {
     await fetchFn(`${config.url}/v1/cc/decision/resolve`, {
@@ -3290,10 +3489,20 @@ async function runRemoteInput(request, requestId, signal, deps, onHoldCreated) {
     }
     if (!response.ok)
       return "transport-error";
-    if ((await response.json()).hold !== true)
+    const created = await parseJson(response);
+    if (!created) {
+      report(deps, new Error("Unparseable relay response to the decision hold POST"), "Relay POST");
+      await resolveOnRelay(deps.config, requestId, fetchFn);
+      return "transport-error";
+    }
+    if (created.hold !== true)
       return "not-held";
     holdCreated = true;
     onHoldCreated(true);
+    const reportUndelivered = async (action, outcome) => {
+      report(deps, new Error(`Codex ${action} was not delivered to app-server (${outcome})`), "Codex remote input delivery");
+      await resolveOnRelay(deps.config, requestId, fetchFn);
+    };
     let misses = 0;
     while (!signal.aborted) {
       try {
@@ -3301,9 +3510,13 @@ async function runRemoteInput(request, requestId, signal, deps, onHoldCreated) {
           headers,
           signal: AbortSignal.timeout(POLL_TIMEOUT_MS)
         });
-        if (response2.ok) {
+        const data = response2.ok ? await parseJson(response2) : undefined;
+        if (!data) {
+          misses += 1;
+          if (response2.ok)
+            report(deps, new Error("Unparseable relay poll response"), "Relay poll");
+        } else {
           misses = 0;
-          const data = await response2.json();
           if (data.status === "answered" && typeof data.answerBlob === "string") {
             let answer;
             try {
@@ -3315,7 +3528,10 @@ async function runRemoteInput(request, requestId, signal, deps, onHoldCreated) {
               return "unsupported";
             if (answer.decision === "deny") {
               const result2 = await deps.interruptAppServer();
-              return result2 === "sent" || result2 === "already-sent" ? "denied" : "transport-error";
+              if (result2 === "sent" || result2 === "already-sent")
+                return "denied";
+              await reportUndelivered("deny", result2);
+              return "transport-error";
             }
             if (answer.decision !== "answer")
               return "unsupported";
@@ -3323,14 +3539,14 @@ async function runRemoteInput(request, requestId, signal, deps, onHoldCreated) {
             if (!mapped)
               return "unsupported";
             const result = await deps.answerAppServer(mapped);
-            return result === "sent" || result === "already-sent" ? "answered" : "transport-error";
-          }
-          if (data.status === "expired")
+            if (result === "sent" || result === "already-sent")
+              return "answered";
+            await reportUndelivered("answer", result);
+            return "transport-error";
+          } else if (data.status === "expired")
             return "expired";
-          if (data.status === "superseded")
+          else if (data.status === "superseded")
             return "superseded";
-        } else {
-          misses += 1;
         }
       } catch {
         misses += 1;
@@ -3340,6 +3556,11 @@ async function runRemoteInput(request, requestId, signal, deps, onHoldCreated) {
       await abortableSleep(deps.pollIntervalMs ?? POLL_INTERVAL_MS2, signal, sleep);
     }
     return "resolved-elsewhere";
+  } catch (error) {
+    report(deps, error, "Codex remote input failed");
+    if (holdCreated)
+      await resolveOnRelay(deps.config, requestId, deps.fetchFn ?? fetch);
+    return signal.aborted ? "resolved-elsewhere" : "transport-error";
   } finally {
     if (!holdCreated)
       onHoldCreated(false);
@@ -3354,7 +3575,10 @@ function startCodexRemoteInput(request, deps) {
     settleHold = resolve2;
   });
   let resolvePromise;
-  const completion = runRemoteInput(request, requestId, controller.signal, deps, settleHold);
+  const completion = runRemoteInput(request, requestId, controller.signal, deps, settleHold).catch((error) => {
+    report(deps, error, "Codex remote input failed");
+    return "transport-error";
+  });
   return {
     requestId,
     completion,
@@ -3390,6 +3614,7 @@ class CodexRemoteInputBridge {
   config;
   client;
   startRemoteInputFn;
+  onError;
   subscribedThreads = new Set;
   handles = new Map;
   refreshPromise;
@@ -3397,6 +3622,7 @@ class CodexRemoteInputBridge {
   constructor(config, options = {}) {
     this.config = config;
     this.startRemoteInputFn = options.startRemoteInputFn ?? startCodexRemoteInput;
+    this.onError = options.onError;
     const callbacks = {
       onUserInputRequest: (request) => this.onRequest(request),
       onUserInputResolved: (request, resolution) => this.onResolved(request, resolution),
@@ -3406,8 +3632,14 @@ class CodexRemoteInputBridge {
       transportFactory: () => new CodexProxyTransport,
       clientVersion: PLUGIN_VERSION,
       reconnectDelayMs: RECONNECT_DELAY_MS,
-      ...callbacks
+      ...callbacks,
+      onError: (error) => this.reportError(error)
     });
+  }
+  reportError(error, fallback = "Codex remote input bridge error") {
+    try {
+      this.onError?.(error instanceof Error ? error : new Error(`${fallback}: ${String(error)}`));
+    } catch {}
   }
   async start() {
     this.stopping = false;
@@ -3469,12 +3701,17 @@ class CodexRemoteInputBridge {
     const handle = this.startRemoteInputFn(request, {
       config: this.config,
       answerAppServer: (answers) => this.client.answerUserInput(request.identity, answers),
-      interruptAppServer: () => this.client.interruptUserInput(request.identity)
+      interruptAppServer: () => this.client.interruptUserInput(request.identity),
+      onError: (error) => this.reportError(error)
     });
     this.handles.set(key, handle);
-    handle.completion.finally(() => {
+    handle.completion.then(() => {
+      return;
+    }, (error) => this.reportError(error, "Codex remote input failed")).then(() => {
       if (this.handles.get(key) === handle)
         this.handles.delete(key);
+    }).catch(() => {
+      return;
     });
   }
   onResolved(request, resolution) {
@@ -3484,13 +3721,13 @@ class CodexRemoteInputBridge {
       return;
     this.handles.delete(key);
     if (resolution !== "response-sent" && resolution !== "interrupt-sent") {
-      handle.resolvedElsewhere();
+      handle.resolvedElsewhere().catch((error) => this.reportError(error, "Failed to retire a Codex phone card"));
     }
   }
   onStateChange(state) {
     if (state === "ready") {
       this.subscribedThreads.clear();
-      this.refreshSubscriptions();
+      this.refreshSubscriptions().catch((error) => this.reportError(error, "Failed to refresh Codex thread subscriptions"));
     } else if (state === "disconnected" || state === "stopped") {
       this.subscribedThreads.clear();
     }
@@ -3503,6 +3740,53 @@ var SESSION_STALE_MS = 86400000;
 var IDLE_GRACE_MS = 1800000;
 var HEARTBEAT_AFTER_MS = 300000;
 var heartbeatAt = new Map;
+var doneAttemptsMem = new Map;
+function effectiveDoneAttempts(record, sessionId) {
+  const persisted = typeof record.doneAttempts === "number" && Number.isFinite(record.doneAttempts) ? record.doneAttempts : 0;
+  return Math.max(persisted, doneAttemptsMem.get(sessionId) ?? 0);
+}
+function noteDoneAttempt(sessionId, attempts) {
+  doneAttemptsMem.set(sessionId, attempts);
+}
+function clearDoneAttempts(sessionId) {
+  doneAttemptsMem.delete(sessionId);
+}
+function resetDoneAttemptMemory() {
+  doneAttemptsMem.clear();
+}
+async function readRecordAt(path) {
+  try {
+    return JSON.parse(await readFile4(path, "utf8"));
+  } catch {
+    return null;
+  }
+}
+function recordMovedSince(snapshot, fresh) {
+  return fresh.ts !== snapshot.ts || fresh.lastEvent !== snapshot.lastEvent || fresh.op !== snapshot.op;
+}
+function isDoneState(record) {
+  return record.op === "done" || record.lastEvent === "done";
+}
+function pendingDoneSettleWrite(snapshot, fresh, settled) {
+  if (fresh === null)
+    return settled;
+  if (!recordMovedSince(snapshot, fresh))
+    return settled;
+  if (!isDoneState(fresh))
+    return null;
+  if (fresh.donePending !== true)
+    return null;
+  return { ...fresh, donePending: undefined, doneAttempts: undefined };
+}
+function pendingDoneRetryWrite(snapshot, fresh, attempts) {
+  if (fresh === null)
+    return { ...snapshot, doneAttempts: attempts };
+  if (!recordMovedSince(snapshot, fresh))
+    return { ...fresh, doneAttempts: attempts };
+  if (!isDoneState(fresh))
+    return null;
+  return { ...fresh, doneAttempts: attempts };
+}
 function classifySession(record, now, isAlive) {
   if (!record || typeof record.pid !== "number" || !Number.isFinite(record.pid))
     return "delete";
@@ -3678,9 +3962,13 @@ async function discoverLiveSessions(config, deps = {}) {
     }
   }
 }
-function provisionalsCoveredByReal(entries) {
-  const realCodexPids = new Set(entries.filter((e) => e.rec.provisional !== true && e.rec.agent === "codex" && typeof e.rec.pid === "number").map((e) => e.rec.pid));
-  return entries.filter((e) => e.rec.provisional === true && typeof e.rec.pid === "number" && realCodexPids.has(e.rec.pid)).map((e) => e.sessionId);
+function recordAgent(record) {
+  return record.agent === "codex" ? "codex" : "claude";
+}
+function provisionalsCoveredByReal(entries, adapters = allAdapters) {
+  const discoveryCapable = new Set(adapters.filter((a) => typeof a.discoverLive === "function").map((a) => a.kind));
+  const realPids = new Set(entries.filter((e) => e.rec.provisional !== true && discoveryCapable.has(recordAgent(e.rec)) && typeof e.rec.pid === "number").map((e) => e.rec.pid));
+  return entries.filter((e) => e.rec.provisional === true && typeof e.rec.pid === "number" && realPids.has(e.rec.pid)).map((e) => e.sessionId);
 }
 async function reconcileProvisionalsSweep(config, deps = {}) {
   const post = deps.post ?? ((body) => postEvent(config, body));
@@ -3688,7 +3976,7 @@ async function reconcileProvisionalsSweep(config, deps = {}) {
   const deleteRecord = deps.deleteRecord ?? ((sessionId) => unlink4(`${SESSIONS_DIR}/${sessionId}.json`).catch(() => {}));
   const now = deps.now ?? Date.now;
   const entries = await readEntries();
-  for (const sessionId of provisionalsCoveredByReal(entries)) {
+  for (const sessionId of provisionalsCoveredByReal(entries, deps.adapters ?? allAdapters)) {
     const outcome = await post(buildEndEnvelope(sessionId, now()));
     if (outcome === "delivered")
       await deleteRecord(sessionId);
@@ -3727,10 +4015,11 @@ async function correctInterrupt(config, path, sessionId, record, now, deps = {})
     const agent = record.agent === "codex" ? "codex" : "claude";
     if (!tailShowsInterrupt(tail, agent))
       return "uncorrected";
-    const attempts = typeof record.doneAttempts === "number" && Number.isFinite(record.doneAttempts) ? record.doneAttempts : 0;
+    const attempts = effectiveDoneAttempts(record, sessionId);
     if (attempts >= INTERRUPT_DONE_MAX_ATTEMPTS) {
       try {
         await writeRecord(path, { ...record, lastEvent: "done", sentDone: true, op: "done", doneAttempts: undefined });
+        clearDoneAttempts(sessionId);
       } catch {}
       return "pending";
     }
@@ -3742,8 +4031,10 @@ async function correctInterrupt(config, path, sessionId, record, now, deps = {})
       try {
         await writeRecord(path, { ...record, lastEvent: "done", sentDone: true, op: "done", doneAttempts: undefined });
       } catch {}
+      clearDoneAttempts(sessionId);
       return "corrected";
     }
+    noteDoneAttempt(sessionId, attempts + 1);
     try {
       await writeRecord(path, { ...record, doneAttempts: attempts + 1 });
     } catch {}
@@ -3880,10 +4171,11 @@ async function correctIdleClaude(config, path, sessionId, record, now, deps = {}
   try {
     if (!isClaudeIdleReapEligible(record, now))
       return "uncorrected";
-    const attempts = typeof record.doneAttempts === "number" && Number.isFinite(record.doneAttempts) ? record.doneAttempts : 0;
+    const attempts = effectiveDoneAttempts(record, sessionId);
     if (attempts >= CLAUDE_IDLE_REAP_MAX_ATTEMPTS) {
       try {
         await writeRecord(path, { ...record, lastEvent: "done", sentDone: true, op: "done", doneAttempts: undefined });
+        clearDoneAttempts(sessionId);
       } catch {}
       return "pending";
     }
@@ -3895,8 +4187,10 @@ async function correctIdleClaude(config, path, sessionId, record, now, deps = {}
       try {
         await writeRecord(path, { ...record, lastEvent: "done", sentDone: true, op: "done", doneAttempts: undefined });
       } catch {}
+      clearDoneAttempts(sessionId);
       return "corrected";
     }
+    noteDoneAttempt(sessionId, attempts + 1);
     try {
       await writeRecord(path, { ...record, doneAttempts: attempts + 1 });
     } catch {}
@@ -3916,6 +4210,14 @@ function shouldPendingDoneCheck(record) {
 async function correctPendingDone(config, path, sessionId, record, now, deps = {}) {
   const post = deps.post ?? ((body) => postEvent(config, body));
   const writeRecord = deps.writeRecord ?? ((p, rec) => atomicWrite(p, JSON.stringify(rec), 384));
+  const reread = deps.readRecord ?? readRecordAt;
+  const freshRecord = async () => {
+    try {
+      return await reread(path);
+    } catch {
+      return null;
+    }
+  };
   const clock = deps.now ?? Date.now;
   try {
     if (!shouldPendingDoneCheck(record))
@@ -3929,10 +4231,16 @@ async function correctPendingDone(config, path, sessionId, record, now, deps = {
       donePending: undefined,
       doneAttempts: undefined
     };
-    const attempts = typeof record.doneAttempts === "number" && Number.isFinite(record.doneAttempts) ? record.doneAttempts : 0;
+    const attempts = effectiveDoneAttempts(record, sessionId);
     if (attempts >= PENDING_DONE_MAX_ATTEMPTS) {
+      const write = pendingDoneSettleWrite(record, await freshRecord(), settled);
+      if (!write) {
+        clearDoneAttempts(sessionId);
+        return "pending";
+      }
       try {
-        await writeRecord(path, settled);
+        await writeRecord(path, write);
+        clearDoneAttempts(sessionId);
       } catch {}
       return "pending";
     }
@@ -3941,14 +4249,22 @@ async function correctPendingDone(config, path, sessionId, record, now, deps = {
     if (outcome === "revoked")
       return "revoked";
     if (outcome === "delivered") {
-      try {
-        await writeRecord(path, settled);
-      } catch {}
+      const write = pendingDoneSettleWrite(record, await freshRecord(), settled);
+      if (write) {
+        try {
+          await writeRecord(path, write);
+        } catch {}
+      }
+      clearDoneAttempts(sessionId);
       return "corrected";
     }
-    try {
-      await writeRecord(path, { ...record, doneAttempts: attempts + 1 });
-    } catch {}
+    const retry = pendingDoneRetryWrite(record, await freshRecord(), attempts + 1);
+    noteDoneAttempt(sessionId, attempts + 1);
+    if (retry) {
+      try {
+        await writeRecord(path, retry);
+      } catch {}
+    }
     return "pending";
   } catch {
     return "uncorrected";
@@ -3969,13 +4285,28 @@ function isRetireEligible(record, now) {
 async function retireDoneStale(config, path, sessionId, record, now, deps = {}) {
   const post = deps.post ?? ((body) => postEvent(config, body));
   const deleteRecord = deps.deleteRecord ?? ((p) => unlink4(p).catch(() => {}));
+  const reread = deps.readRecord ?? readRecordAt;
+  const freshRecord = async () => {
+    try {
+      return await reread(path);
+    } catch {
+      return null;
+    }
+  };
   try {
     if (!isRetireEligible(record, now))
+      return "skip";
+    const before = await freshRecord();
+    if (before && (recordMovedSince(record, before) || !isRetireEligible(before, now)))
       return "skip";
     const outcome = await post(buildEndEnvelope(sessionId, now, record, Math.floor(record.ts / 1000)));
     if (outcome === "revoked")
       return "revoked";
+    const after = await freshRecord();
+    if (after && recordMovedSince(record, after))
+      return "skip";
     heartbeatAt.delete(sessionId);
+    clearDoneAttempts(sessionId);
     await deleteRecord(path);
     return outcome === "delivered" ? "retired" : "retired-offline";
   } catch {
@@ -4177,6 +4508,7 @@ async function sweep(config) {
         delivered = true;
     }
     heartbeatAt.delete(sessionId);
+    clearDoneAttempts(sessionId);
     try {
       await unlink4(path);
     } catch {}
@@ -4186,19 +4518,107 @@ async function sweep(config) {
 async function goneStrikeShouldTeardown(goneStrikesPath) {
   return await recordGoneStrike(goneStrikesPath) >= GONE_STRIKE_LIMIT;
 }
+var activeBridgeShutdown;
+var BRIDGE_OP_DEADLINE_MS = 15000;
+function withDeadline(work, ms) {
+  let timer;
+  const deadline = new Promise((resolve2) => {
+    timer = setTimeout(() => resolve2(undefined), ms);
+    timer.unref?.();
+  });
+  return Promise.race([work, deadline]).finally(() => {
+    if (timer)
+      clearTimeout(timer);
+  });
+}
+var BRIDGE_REARM_MS = 600000;
+var GIVE_UP_PATTERN = /gave up/i;
+function createBridgeSupervisor(deps = {}) {
+  const probe = deps.probe ?? (() => codexAppServerSocketAvailable());
+  const create = deps.create ?? ((config, options) => new CodexRemoteInputBridge(config, options));
+  const detach = deps.detach ?? ((work) => {
+    withDeadline(Promise.resolve().then(work), BRIDGE_OP_DEADLINE_MS).catch(() => {});
+  });
+  const now = deps.now ?? Date.now;
+  let bridge;
+  let pairingId;
+  let lastStartAt = 0;
+  let parked = false;
+  const onError = (error) => {
+    try {
+      if (GIVE_UP_PATTERN.test(error.message))
+        parked = true;
+    } catch {}
+    try {
+      deps.onError?.(error);
+    } catch {}
+  };
+  const teardown = () => {
+    const dying = bridge;
+    bridge = undefined;
+    pairingId = undefined;
+    parked = false;
+    if (dying)
+      detach(() => dying.stop());
+  };
+  const arm = (target) => {
+    lastStartAt = now();
+    parked = false;
+    detach(() => target.start());
+  };
+  return {
+    async sync(config) {
+      if (!config) {
+        teardown();
+        return;
+      }
+      let available = false;
+      try {
+        available = await probe();
+      } catch {
+        available = false;
+      }
+      if (!available) {
+        teardown();
+        return;
+      }
+      if (!bridge || pairingId !== config.pairingId) {
+        teardown();
+        const next = create(config, { onError });
+        bridge = next;
+        pairingId = config.pairingId;
+        arm(next);
+        return;
+      }
+      const current = bridge;
+      if (parked || now() - lastStartAt >= BRIDGE_REARM_MS) {
+        arm(current);
+        return;
+      }
+      detach(() => current.refreshSubscriptions());
+    },
+    shutdown() {
+      teardown();
+    },
+    get active() {
+      return bridge !== undefined;
+    }
+  };
+}
 async function claimSingleInstance() {
   try {
-    const holder = Number.parseInt(readFileSync2(WATCHDOG_PID_PATH, "utf8").trim(), 10);
-    if (Number.isFinite(holder) && holder !== process.pid && pidAlive(holder))
+    const holder = parseWatchdogPidfile(readFileSync2(WATCHDOG_PID_PATH, "utf8"));
+    if (holder && holder.pid !== process.pid && watchdogHolderIsLive(holder.pid) && holder.version === PLUGIN_VERSION) {
       return false;
+    }
   } catch {}
-  await atomicWrite(WATCHDOG_PID_PATH, String(process.pid));
+  await atomicWrite(WATCHDOG_PID_PATH, formatWatchdogPidfile(process.pid));
   return true;
 }
 function releaseSingleInstance() {
   try {
-    const holder = Number.parseInt(readFileSync2(WATCHDOG_PID_PATH, "utf8").trim(), 10);
-    if (holder === process.pid)
+    const holder = parseWatchdogPidfile(readFileSync2(WATCHDOG_PID_PATH, "utf8"));
+    if (holder && holder.pid === process.pid)
       unlinkSync(WATCHDOG_PID_PATH);
   } catch {}
 }
@@ -4231,25 +4651,12 @@ async function run() {
     return;
   const fallbackDeadline = Date.now() + PAIRING_TTL_MS;
   let lastActiveMs = Date.now();
-  let remoteInputBridge;
-  let remoteInputPairingId;
+  const bridges = createBridgeSupervisor();
+  activeBridgeShutdown = () => bridges.shutdown();
   try {
     while (true) {
       const config = await loadConfig();
-      if (config) {
-        if (!remoteInputBridge || remoteInputPairingId !== config.pairingId) {
-          await remoteInputBridge?.stop();
-          remoteInputBridge = new CodexRemoteInputBridge(config);
-          remoteInputPairingId = config.pairingId;
-          await remoteInputBridge.start();
-        } else {
-          await remoteInputBridge.refreshSubscriptions();
-        }
-      } else if (remoteInputBridge) {
-        await remoteInputBridge.stop();
-        remoteInputBridge = undefined;
-        remoteInputPairingId = undefined;
-      }
+      await bridges.sync(config);
       if (config) {
         await reconcileProvisionalsSweep(config);
         await discoverLiveSessions(config);
@@ -4295,17 +4702,32 @@ async function run() {
       await new Promise((r) => setTimeout(r, POLL_MS));
     }
   } finally {
-    await remoteInputBridge?.stop();
+    bridges.shutdown();
+    activeBridgeShutdown = undefined;
     releaseSingleInstance();
   }
 }
 if (__require.main == __require.module) {
+  process.on("unhandledRejection", () => {});
+  const onTerminate = () => {
+    try {
+      releaseSingleInstance();
+    } catch {}
+    try {
+      activeBridgeShutdown?.();
+    } catch {}
+    const exitTimer = setTimeout(() => process.exit(0), 250);
+    exitTimer.unref?.();
+  };
+  process.on("SIGTERM", onTerminate);
+  process.on("SIGINT", onTerminate);
   try {
     await run();
   } catch {}
   process.exit(0);
 }
 export {
+  withDeadline,
   titleRepairedRecord,
   tailShowsInterrupt,
   shouldRepairTitle,
@@ -4315,22 +4737,30 @@ export {
   shouldIdleProvisionalCheck,
   shouldHeartbeat,
   retireDoneStale,
+  resetDoneAttemptMemory,
+  recordMovedSince,
   reconcileProvisionalsSweep,
   provisionalsCoveredByReal,
   postOutcomeForStatus,
   pendingPairingExpired,
+  pendingDoneSettleWrite,
+  pendingDoneRetryWrite,
+  noteDoneAttempt,
   lastTurnLine,
   isRetireEligible,
   isClaudeIdleReapEligible,
   hasInterruptMarker,
   goneStrikeShouldTeardown,
+  effectiveDoneAttempts,
   discoverLiveSessions,
+  createBridgeSupervisor,
   correctPendingDone,
   correctPendingApproval,
   correctInterrupt,
   correctIdleClaude,
   codexTailPendingApproval,
   codexLastTurnEvent,
+  clearDoneAttempts,
   claudeTailPendingApproval,
   classifySession,
   buildTitleRepairEnvelope,

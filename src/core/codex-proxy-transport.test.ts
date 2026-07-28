@@ -203,6 +203,43 @@ describe("CodexProxyTransport", () => {
     expect(h.child.killed).toBe(true);
   });
 
+  test("accepts an inbound message whose payload is exactly the send limit", async () => {
+    const h = harness({ maxBufferBytes: 64 });
+    upgrade(h.child);
+    await h.opening;
+    const text = JSON.stringify({ m: "x".repeat(64 - 8) });
+    expect(Buffer.byteLength(text)).toBe(64);
+    // The frame header must not be charged against the payload budget: this message is exactly the
+    // size we would happily have sent ourselves.
+    await h.transport.send(JSON.parse(text));
+    h.child.stdout.push(serverFrame(0x1, text));
+    expect(h.messages).toEqual([JSON.parse(text)]);
+    expect(h.closes).toEqual([]);
+
+    // One byte over is still a hard failure.
+    h.child.stdout.push(serverFrame(0x1, JSON.stringify({ m: "x".repeat(64 - 7) })));
+    expect(h.closes).toHaveLength(1);
+    expect((h.closes[0] as Error).message).toContain("exceeds transport limit");
+  });
+
+  test("rejects reopening a finished transport instead of spawning a second child", async () => {
+    let spawns = 0;
+    const child = new FakeChild();
+    const transport = new CodexProxyTransport({
+      randomBytes: (size) => new Uint8Array(size).fill(size),
+      spawnProxy: () => { spawns += 1; return child as unknown as CodexProxyChild; },
+    });
+    const opening = transport.open({ onMessage: () => {}, onClose: () => {} });
+    upgrade(child);
+    await opening;
+    await transport.close();
+    expect(spawns).toBe(1);
+
+    await expect(transport.open({ onMessage: () => {}, onClose: () => {} }))
+      .rejects.toThrow("already been opened");
+    expect(spawns).toBe(1);
+  });
+
   test("subprocess exit includes bounded stderr context", async () => {
     const h = harness();
     h.child.stderr.push("socket not found");

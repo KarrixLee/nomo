@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   CodexAppServerClient,
+  CodexAppServerClientOptions,
   CodexRpcTransport,
   CodexRpcTransportHandlers,
   CodexUserInputRequest,
@@ -11,13 +12,21 @@ class FakeTransport implements CodexRpcTransport {
   handlers: CodexRpcTransportHandlers | undefined;
   sent: object[] = [];
   sendError: Error | undefined;
+  openError: Error | undefined;
+  /** When set, open() only settles after this promise does. */
+  openGate: Promise<void> | undefined;
+  closed = 0;
 
-  async open(handlers: CodexRpcTransportHandlers): Promise<void> { this.handlers = handlers; }
+  async open(handlers: CodexRpcTransportHandlers): Promise<void> {
+    if (this.openGate) await this.openGate;
+    if (this.openError) throw this.openError;
+    this.handlers = handlers;
+  }
   async send(message: object): Promise<void> {
     if (this.sendError) throw this.sendError;
     this.sent.push(message);
   }
-  async close(): Promise<void> {}
+  async close(): Promise<void> { this.closed += 1; }
   receive(message: unknown): void { this.handlers?.onMessage(message); }
   disconnect(error?: unknown): void { this.handlers?.onClose(error); }
 }
@@ -29,32 +38,46 @@ interface Harness {
   resolutions: Array<[CodexUserInputRequest, CodexUserInputResolution]>;
   errors: Error[];
   timers: Array<() => void>;
+  /** Parallel to `timers` (spliced together by clearTimer), so timers[i] was scheduled at delays[i]. */
+  delays: number[];
 }
 
-function harness(): Harness {
+interface HarnessOptions extends Partial<CodexAppServerClientOptions> {
+  prepare?: (transport: FakeTransport, index: number) => void;
+}
+
+function harness(options: HarnessOptions = {}): Harness {
+  const { prepare, ...overrides } = options;
   const transports: FakeTransport[] = [];
   const requests: CodexUserInputRequest[] = [];
   const resolutions: Array<[CodexUserInputRequest, CodexUserInputResolution]> = [];
   const errors: Error[] = [];
   const timers: Array<() => void> = [];
+  const delays: number[] = [];
   const client = new CodexAppServerClient({
     transportFactory: () => {
       const transport = new FakeTransport();
+      prepare?.(transport, transports.length);
       transports.push(transport);
       return transport;
     },
     clientVersion: "1.4.0-test",
     now: () => 1234,
-    setTimer: (callback) => { timers.push(callback); return callback; },
+    setTimer: (callback, delayMs) => { timers.push(callback); delays.push(delayMs); return callback; },
     clearTimer: (token) => {
       const index = timers.indexOf(token as () => void);
-      if (index >= 0) timers.splice(index, 1);
+      if (index >= 0) { timers.splice(index, 1); delays.splice(index, 1); }
     },
     onUserInputRequest: (request) => requests.push(request),
     onUserInputResolved: (request, resolution) => resolutions.push([request, resolution]),
     onError: (error) => errors.push(error),
+    ...overrides,
   });
-  return { client, transports, requests, resolutions, errors, timers };
+  return { client, transports, requests, resolutions, errors, timers, delays };
+}
+
+async function flush(times = 4): Promise<void> {
+  for (let index = 0; index < times; index += 1) await Promise.resolve();
 }
 
 async function initialize(h: Harness, index = 0): Promise<void> {
@@ -250,6 +273,187 @@ describe("CodexAppServerClient", () => {
     transport.receive({ method: "serverRequest/resolved", params: { threadId: "other", requestId: 11 } });
     expect(h.errors.at(-1)?.message).toBe("serverRequest/resolved identity mismatch");
     expect(await h.client.answerUserInput(h.requests[0].identity, { scope: ["Fast"] })).toBe("sent");
+  });
+
+  test("backs off exponentially, caps the delay, and resets after a successful handshake", async () => {
+    let failing = true;
+    const h = harness({
+      reconnectDelayMs: 100,
+      maxReconnectDelayMs: 400,
+      maxReconnectAttempts: 10,
+      prepare: (transport) => { if (failing) transport.openError = new Error("no socket"); },
+    });
+
+    expect(await h.client.start()).toBe(false);
+    // Every retry spawns a fresh `codex` child, so the delay must grow and then stay capped.
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      const fire = h.timers[h.timers.length - 1];
+      fire();
+      await flush();
+    }
+    expect(h.delays).toEqual([100, 200, 400, 400, 400]);
+    expect(h.client.state).toBe("disconnected");
+
+    // A completed handshake resets the ladder back to the base delay.
+    failing = false;
+    h.timers[h.timers.length - 1]();
+    await flush();
+    const live = h.transports[h.transports.length - 1];
+    live.receive({ id: 1, result: {} });
+    await flush();
+    expect(h.client.state).toBe("ready");
+    live.disconnect();
+    expect(h.delays.at(-1)).toBe(100);
+  });
+
+  test("gives up after consecutive failures and stays restartable", async () => {
+    let failing = true;
+    const h = harness({
+      reconnectDelayMs: 10,
+      maxReconnectAttempts: 3,
+      prepare: (transport) => { if (failing) transport.openError = new Error("no socket"); },
+    });
+
+    expect(await h.client.start()).toBe(false);
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      h.timers[h.timers.length - 1]();
+      await flush();
+    }
+    expect(h.delays).toEqual([10, 20, 40]);
+    expect(h.client.state).toBe("stopped");
+    expect(h.errors.at(-1)?.message).toContain("gave up after 3 consecutive failures");
+    // Parked, not wedged: no pending retry timer and no orphaned transport.
+    expect(h.timers.length).toBe(3); // all three fired; none still armed
+    expect(h.transports).toHaveLength(4);
+
+    failing = false;
+    const started = h.client.start();
+    await flush();
+    const live = h.transports[h.transports.length - 1];
+    live.receive({ id: 1, result: {} });
+    expect(await started).toBe(true);
+    expect(h.client.state).toBe("ready");
+  });
+
+  test("stop() during an in-flight connect leaves a restartable client", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const h = harness({ prepare: (transport, index) => { if (index === 0) transport.openGate = gate; } });
+
+    const first = h.client.start();
+    await flush();
+    await h.client.stop();
+    expect(h.client.state).toBe("stopped");
+    release();
+    expect(await first).toBe(false);
+    await flush();
+    // The abandoned attempt must not leave a live child behind.
+    expect(h.transports[0].closed).toBeGreaterThanOrEqual(1);
+
+    const second = h.client.start();
+    await flush();
+    const live = h.transports[1];
+    expect(live.sent[0]).toMatchObject({ method: "initialize" });
+    live.receive({ id: (live.sent[0] as { id: number }).id, result: {} });
+    expect(await second).toBe(true);
+    expect(h.client.state).toBe("ready");
+  });
+
+  test("a reused request id is accepted once the previous request was answered", async () => {
+    const h = harness();
+    await initialize(h);
+    const transport = h.transports[0];
+    transport.receive({ method: "item/tool/requestUserInput", id: 7, params: requestParams() });
+    expect(await h.client.answerUserInput(h.requests[0].identity, { scope: ["Fast"] })).toBe("sent");
+
+    // app-server never sent serverRequest/resolved but reused id 7 for a new prompt. The old entry must
+    // not block the id forever; it is retired with our own attribution and the new prompt goes through.
+    transport.receive({
+      method: "item/tool/requestUserInput",
+      id: 7,
+      params: { ...requestParams(), turnId: "turn-2", itemId: "item-2" },
+    });
+    expect(h.resolutions).toEqual([[h.requests[0], "response-sent"]]);
+    expect(h.requests).toHaveLength(2);
+    expect(h.requests[1].identity).toMatchObject({ requestId: 7, turnId: "turn-2" });
+    expect(await h.client.answerUserInput(h.requests[1].identity, { scope: ["Fast"] })).toBe("sent");
+    expect(h.errors).toHaveLength(0);
+  });
+
+  test("autoResolutionMs expires the request locally and never leaks its timer", async () => {
+    const h = harness();
+    await initialize(h);
+    const transport = h.transports[0];
+    transport.receive({
+      method: "item/tool/requestUserInput",
+      id: "rpc-auto",
+      params: { ...requestParams(), autoResolutionMs: 30_000 },
+    });
+    expect(h.delays).toEqual([30_000]);
+
+    h.timers[0]();
+    // The phone card cannot outlive the prompt: this looks exactly like a server-side clear.
+    expect(h.resolutions).toEqual([[h.requests[0], "server-cleared"]]);
+    expect(await h.client.answerUserInput(h.requests[0].identity, { scope: ["Fast"] })).toBe("stale");
+
+    // A resolved request clears its expiry timer instead of firing later against a dead entry.
+    transport.receive({
+      method: "item/tool/requestUserInput",
+      id: "rpc-auto-2",
+      params: { ...requestParams(), autoResolutionMs: 30_000 },
+    });
+    expect(h.timers).toHaveLength(2);
+    transport.receive({
+      method: "serverRequest/resolved",
+      params: { threadId: "thread-1", requestId: "rpc-auto-2" },
+    });
+    expect(h.timers).toHaveLength(1); // only the already-fired one remains recorded
+    expect(h.resolutions.at(-1)).toEqual([h.requests[1], "server-cleared"]);
+
+    // …and a disconnect clears any remaining expiry timer too.
+    transport.receive({
+      method: "item/tool/requestUserInput",
+      id: "rpc-auto-3",
+      params: { ...requestParams(), autoResolutionMs: 30_000 },
+    });
+    expect(h.timers).toHaveLength(2);
+    transport.disconnect();
+    // Only the already-fired first expiry plus the reconnect timer remain recorded: the live request's
+    // expiry timer was cleared by the disconnect rather than leaked.
+    expect(h.delays).toEqual([30_000, 1_000]);
+  });
+
+  test("an unconfirmed interrupt is still attributed to us when the request resolves", async () => {
+    const h = harness();
+    await initialize(h);
+    const transport = h.transports[0];
+    transport.receive({ method: "item/tool/requestUserInput", id: 12, params: requestParams() });
+
+    const interrupted = h.client.interruptUserInput(h.requests[0].identity);
+    await flush();
+    // Time out the turn/interrupt reply: the interrupt may still have landed on app-server.
+    const timeout = h.timers[0];
+    timeout();
+    expect(await interrupted).toBe("transport-error");
+
+    transport.receive({
+      method: "serverRequest/resolved",
+      params: { threadId: "thread-1", requestId: 12 },
+    });
+    // Never "server-cleared": the bridge would retire a card the user actually denied.
+    expect(h.resolutions).toEqual([[h.requests[0], "interrupt-sent"]]);
+  });
+
+  test("a request arriving before the connection is ready is reported, not silently dropped", async () => {
+    const h = harness();
+    const started = h.client.start();
+    await flush();
+    const transport = h.transports[0];
+    transport.receive({ method: "item/tool/requestUserInput", id: 5, params: requestParams() });
+    expect(h.requests).toHaveLength(0);
+    expect(h.errors.at(-1)?.message).toContain("before the connection was ready");
+    transport.receive({ id: 1, result: {} });
+    expect(await started).toBe(true);
   });
 
   test("malformed and duplicate requests are ignored", async () => {

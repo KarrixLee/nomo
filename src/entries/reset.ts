@@ -17,7 +17,7 @@
 import { execFileSync } from "node:child_process";
 import { readdir, readFile, unlink } from "node:fs/promises";
 import { basename } from "node:path";
-import { Config, loadConfig, localApprovalsState, pidAlive, PLUGIN_VERSION, SessionRecord, SESSIONS_DIR, WATCHDOG_PID_PATH } from "../core/shared";
+import { Config, isWatchdogCommand, loadConfig, localApprovalsState, pidAlive, PLUGIN_VERSION, SessionRecord, SESSIONS_DIR, WATCHDOG_PID_PATH } from "../core/shared";
 
 export type ResetVerdict = "clear" | "keep";
 
@@ -31,11 +31,11 @@ export function classifyResetSession(record: SessionRecord | null, isAlive: (pid
   return isAlive(record.pid) ? "keep" : "clear";
 }
 
-/** Whether a `ps -o command=` line is our watchdog. The daemon runs as `<runtime> …/cc-watchdog.mjs`
- *  (or the raw .ts in dev), so the script name is the stable fingerprint. */
-export function isWatchdogCommand(psCommand: string): boolean {
-  return psCommand.includes("cc-watchdog");
-}
+// The `ps` identity check lives in core/shared now — the watchdog's OWN single-instance claim and the
+// hook's ensureWatchdog spawn gate need the exact same "is this pid really our daemon?" test (a
+// recycled pid must neither be killed here nor block a spawn there). Re-exported so `reset`'s existing
+// importers/tests keep resolving it through "./reset"; behavior is byte-identical.
+export { isWatchdogCommand };
 
 /** Injectable seams so reset.test.ts can drive the sweep without real processes/fs/network. */
 export interface ResetDeps {

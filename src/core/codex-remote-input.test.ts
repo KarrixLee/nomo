@@ -237,6 +237,133 @@ describe("startCodexRemoteInput", () => {
     expect(calls.filter((url) => url.endsWith("/v1/cc/decision/resolve"))).toHaveLength(1);
   });
 
+  test("a 200 with a non-JSON body on the hold POST degrades and retires any orphan hold", async () => {
+    const calls: string[] = [];
+    const errors: Error[] = [];
+    const handle = startCodexRemoteInput(request(), {
+      config,
+      fetchFn: (async (input) => {
+        const url = String(input); calls.push(url);
+        // An edge/captive portal answers 200 with HTML. Parsing must not throw out of the task.
+        if (url.endsWith("/v1/cc/decision")) return new Response("<html>not json</html>", { status: 200 });
+        return Response.json({ ok: true });
+      }) as typeof fetch,
+      readRecordFn: async () => record,
+      randomUUID: () => "relay-html",
+      localApprovalsStateFn: async () => "on",
+      sleep: async () => {},
+      answerAppServer: async () => "sent",
+      interruptAppServer: async () => "sent",
+      onError: (error) => errors.push(error),
+    });
+
+    expect(await handle.completion).toBe("transport-error");
+    expect(calls.filter((url) => url.endsWith("/v1/cc/decision/resolve"))).toHaveLength(1);
+    expect(errors.map((error) => error.message)).toContain("Unparseable relay response to the decision hold POST");
+  });
+
+  test("a non-JSON 200 while polling counts as a miss and polling continues", async () => {
+    const errors: Error[] = [];
+    const answerBlob = await encryptBlob(key, {
+      requestId: "relay-poll", decision: "answer", answers: ["Fast"],
+    });
+    let polls = 0;
+    const handle = startCodexRemoteInput(request(), {
+      config,
+      fetchFn: (async (input) => {
+        if (String(input).endsWith("/v1/cc/decision")) return Response.json({ hold: true });
+        polls += 1;
+        if (polls === 1) return new Response("garbage", { status: 200 });
+        return Response.json({ status: "answered", answerBlob });
+      }) as typeof fetch,
+      readRecordFn: async () => record,
+      randomUUID: () => "relay-poll",
+      localApprovalsStateFn: async () => "on",
+      sleep: async () => {},
+      answerAppServer: async () => "sent",
+      interruptAppServer: async () => "sent",
+      onError: (error) => errors.push(error),
+    });
+
+    expect(await handle.completion).toBe("answered");
+    expect(polls).toBe(2);
+    expect(errors.map((error) => error.message)).toContain("Unparseable relay poll response");
+  });
+
+  test("a relay that only ever answers garbage still gives up instead of polling forever", async () => {
+    let polls = 0;
+    const handle = startCodexRemoteInput(request(), {
+      config,
+      fetchFn: (async (input) => {
+        if (String(input).endsWith("/v1/cc/decision")) return Response.json({ hold: true });
+        polls += 1;
+        return new Response("garbage", { status: 200 });
+      }) as typeof fetch,
+      readRecordFn: async () => record,
+      randomUUID: () => "relay-garbage",
+      localApprovalsStateFn: async () => "on",
+      sleep: async () => {},
+      answerAppServer: async () => "sent",
+      interruptAppServer: async () => "sent",
+    });
+
+    expect(await handle.completion).toBe("transport-error");
+    expect(polls).toBe(100); // MAX_CONSECUTIVE_MISSES
+  });
+
+  test("a throwing dependency degrades instead of rejecting the completion promise", async () => {
+    const errors: Error[] = [];
+    let fetched = false;
+    const handle = startCodexRemoteInput(request(), {
+      config,
+      fetchFn: (async () => { fetched = true; return Response.json({ hold: true }); }) as typeof fetch,
+      readRecordFn: async () => { throw new Error("session store is corrupt"); },
+      randomUUID: () => "relay-throw",
+      localApprovalsStateFn: async () => "on",
+      sleep: async () => {},
+      answerAppServer: async () => "sent",
+      interruptAppServer: async () => "sent",
+      onError: (error) => errors.push(error),
+    });
+
+    expect(await handle.completion).toBe("transport-error");
+    expect(fetched).toBe(false);
+    expect(errors.map((error) => error.message)).toContain("session store is corrupt");
+  });
+
+  test("an answer app-server refuses is reported and the relay record is retired", async () => {
+    for (const [decision, outcome, blobBody] of [
+      ["answer", "stale", { requestId: "relay-stale", decision: "answer", answers: ["Fast"] }],
+      ["deny", "transport-error", { requestId: "relay-stale", decision: "deny" }],
+    ] as const) {
+      const answerBlob = await encryptBlob(key, blobBody);
+      const calls: string[] = [];
+      const errors: Error[] = [];
+      const handle = startCodexRemoteInput(request(), {
+        config,
+        fetchFn: (async (input) => {
+          const url = String(input); calls.push(url);
+          if (url.endsWith("/v1/cc/decision")) return Response.json({ hold: true });
+          if (url.endsWith("/v1/cc/decision/resolve")) return Response.json({ ok: true });
+          return Response.json({ status: "answered", answerBlob });
+        }) as typeof fetch,
+        readRecordFn: async () => record,
+        randomUUID: () => "relay-stale",
+        localApprovalsStateFn: async () => "on",
+        sleep: async () => {},
+        answerAppServer: async () => "stale",
+        interruptAppServer: async () => "transport-error",
+        onError: (error) => errors.push(error),
+      });
+
+      // The worker already marked the request answered; the failure must be visible, not silent.
+      expect(await handle.completion).toBe("transport-error");
+      expect(calls.filter((url) => url.endsWith("/v1/cc/decision/resolve"))).toHaveLength(1);
+      expect(errors.map((error) => error.message))
+        .toContain(`Codex ${decision} was not delivered to app-server (${outcome})`);
+    }
+  });
+
   test("Desktop resolution before hold creation aborts without creating or resolving an orphan", async () => {
     const calls: string[] = [];
     let releaseRecord!: () => void;

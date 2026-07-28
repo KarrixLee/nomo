@@ -43,6 +43,8 @@ export interface CodexRemoteInputBridgeCallbacks {
 export interface CodexRemoteInputBridgeOptions {
   createClient?: (callbacks: CodexRemoteInputBridgeCallbacks) => BridgeClient;
   startRemoteInputFn?: (request: CodexUserInputRequest, deps: CodexRemoteInputDeps) => CodexRemoteInputHandle;
+  /** Diagnostic seam for the app-server client and every detached relay task. Never fatal. */
+  onError?: (error: Error) => void;
 }
 
 function requestKey(request: CodexUserInputRequest): string {
@@ -65,6 +67,7 @@ function requestKey(request: CodexUserInputRequest): string {
 export class CodexRemoteInputBridge {
   private readonly client: BridgeClient;
   private readonly startRemoteInputFn: NonNullable<CodexRemoteInputBridgeOptions["startRemoteInputFn"]>;
+  private readonly onError: CodexRemoteInputBridgeOptions["onError"];
   private readonly subscribedThreads = new Set<string>();
   private readonly handles = new Map<string, CodexRemoteInputHandle>();
   private refreshPromise: Promise<void> | undefined;
@@ -72,6 +75,7 @@ export class CodexRemoteInputBridge {
 
   constructor(private readonly config: Config, options: CodexRemoteInputBridgeOptions = {}) {
     this.startRemoteInputFn = options.startRemoteInputFn ?? startCodexRemoteInput;
+    this.onError = options.onError;
     const callbacks: CodexRemoteInputBridgeCallbacks = {
       onUserInputRequest: (request) => this.onRequest(request),
       onUserInputResolved: (request, resolution) => this.onResolved(request, resolution),
@@ -82,7 +86,14 @@ export class CodexRemoteInputBridge {
       clientVersion: PLUGIN_VERSION,
       reconnectDelayMs: RECONNECT_DELAY_MS,
       ...callbacks,
+      onError: (error) => this.reportError(error),
     });
+  }
+
+  private reportError(error: unknown, fallback = "Codex remote input bridge error"): void {
+    try {
+      this.onError?.(error instanceof Error ? error : new Error(`${fallback}: ${String(error)}`));
+    } catch { /* a broken reporter must not break the bridge */ }
   }
 
   /** Start the app-server connection. False means unavailable now; the client retries quietly. */
@@ -143,11 +154,18 @@ export class CodexRemoteInputBridge {
       config: this.config,
       answerAppServer: (answers) => this.client.answerUserInput(request.identity, answers),
       interruptAppServer: () => this.client.interruptUserInput(request.identity),
+      onError: (error) => this.reportError(error),
     });
     this.handles.set(key, handle);
-    void handle.completion.finally(() => {
+    // This chain is detached, so it must be terminally handled: `.finally()` returns a NEW promise that
+    // rejects whenever the completion rejects, and voiding that is an unhandled rejection — fatal for
+    // the watchdog process under Node >= 15.
+    handle.completion.then(
+      () => undefined,
+      (error: unknown) => this.reportError(error, "Codex remote input failed"),
+    ).then(() => {
       if (this.handles.get(key) === handle) this.handles.delete(key);
-    });
+    }).catch(() => undefined);
   }
 
   private onResolved(request: CodexUserInputRequest, resolution: CodexUserInputResolution): void {
@@ -158,14 +176,16 @@ export class CodexRemoteInputBridge {
     // A response/interrupt sent by this bridge is the acknowledgement for our own phone action. Every
     // other resolution means Desktop, another interrupt, or a disconnect won; retire the phone card.
     if (resolution !== "response-sent" && resolution !== "interrupt-sent") {
-      void handle.resolvedElsewhere();
+      handle.resolvedElsewhere().catch((error: unknown) =>
+        this.reportError(error, "Failed to retire a Codex phone card"));
     }
   }
 
   private onStateChange(state: CodexAppServerState): void {
     if (state === "ready") {
       this.subscribedThreads.clear();
-      void this.refreshSubscriptions();
+      this.refreshSubscriptions().catch((error: unknown) =>
+        this.reportError(error, "Failed to refresh Codex thread subscriptions"));
     } else if (state === "disconnected" || state === "stopped") {
       this.subscribedThreads.clear();
     }

@@ -92,7 +92,7 @@ async function sha256Hex(s) {
 }
 
 // src/core/shared.ts
-var PLUGIN_VERSION = "1.4.3";
+var PLUGIN_VERSION = "1.4.4";
 var CC_DIR = `${process.env.HOME}/.config/cc-status`;
 var SESSIONS_DIR = `${CC_DIR}/sessions`;
 var WATCHDOG_PID_PATH = `${CC_DIR}/watchdog.pid`;
@@ -122,6 +122,16 @@ function codexHome() {
   return env && env.length > 0 ? env : `${process.env.HOME}/.codex`;
 }
 var CODEX_HOOK_MARKER = "codex-status.mjs";
+function codexAppServerSocketPath() {
+  return `${codexHome()}/app-server-control/app-server-control.sock`;
+}
+async function codexAppServerSocketAvailable(socketPath = codexAppServerSocketPath()) {
+  try {
+    return (await stat(socketPath)).isSocket();
+  } catch {
+    return false;
+  }
+}
 function lastHookPath(agent) {
   return `${CC_DIR}/last-hook-${agent}`;
 }
@@ -358,19 +368,57 @@ async function completePendingPairing(pending, configPath, opts = {}) {
   await unlink(join(dirname(configPath), PAIR_HTML_FILE)).catch(() => {});
   return { state: "completed", deviceName };
 }
-function ensureWatchdog() {
+function isWatchdogCommand(psCommand) {
+  return psCommand.includes("cc-watchdog");
+}
+function formatWatchdogPidfile(pid, version = PLUGIN_VERSION) {
+  return `${pid} ${version}`;
+}
+function parseWatchdogPidfile(raw) {
+  const [pidField, versionField] = raw.trim().split(/\s+/);
+  const pid = Number.parseInt(pidField ?? "", 10);
+  if (!Number.isFinite(pid) || pid <= 0)
+    return null;
+  return { pid, ...typeof versionField === "string" && versionField.length > 0 ? { version: versionField } : {} };
+}
+function watchdogHolderIsLive(pid, deps = {}) {
+  const isAlive = deps.isAlive ?? pidAlive;
+  const commandOf = deps.commandOf ?? pidCommand;
+  if (!Number.isFinite(pid) || pid <= 0)
+    return false;
+  if (!isAlive(pid))
+    return false;
+  const cmd = commandOf(pid);
+  if (cmd === undefined)
+    return true;
+  return isWatchdogCommand(cmd);
+}
+function ensureWatchdog(deps = {}) {
   try {
-    let running = false;
-    try {
-      const pid = Number.parseInt(readFileSync(WATCHDOG_PID_PATH, "utf8").trim(), 10);
-      running = Number.isFinite(pid) && pid > 0 && pidAlive(pid);
-    } catch {
-      running = false;
+    const pidPath = deps.pidPath ?? WATCHDOG_PID_PATH;
+    const version = deps.version ?? PLUGIN_VERSION;
+    const readPidfile = deps.readPidfile ?? (() => {
+      try {
+        return readFileSync(pidPath, "utf8");
+      } catch {
+        return;
+      }
+    });
+    const killPid = deps.killPid ?? ((pid, signal) => process.kill(pid, signal));
+    const spawnWatchdog = deps.spawnWatchdog ?? (() => {
+      const runtime = process.env.NOMO_RUNTIME && process.env.NOMO_RUNTIME.length > 0 ? process.env.NOMO_RUNTIME : process.execPath;
+      spawn(runtime, [WATCHDOG_PATH], { detached: true, stdio: "ignore" }).unref();
+    });
+    const raw = readPidfile();
+    const holder = typeof raw === "string" ? parseWatchdogPidfile(raw) : null;
+    if (holder && watchdogHolderIsLive(holder.pid, deps)) {
+      if (holder.version === version)
+        return;
+      try {
+        killPid(holder.pid, "SIGTERM");
+      } catch {}
     }
-    if (running)
-      return;
-    const runtime = process.env.NOMO_RUNTIME && process.env.NOMO_RUNTIME.length > 0 ? process.env.NOMO_RUNTIME : process.execPath;
-    spawn(runtime, [WATCHDOG_PATH], { detached: true, stdio: "ignore" }).unref();
+    spawnWatchdog();
   } catch {}
 }
 async function readRecord(sessionId) {
@@ -1496,13 +1544,7 @@ async function statusCmd(deps = {}) {
   const lastHookClaudePath = deps.lastHookClaudePath ?? claudeAdapter.hookStampPath();
   const isAlive = deps.isAlive ?? pidAlive;
   const now = deps.now ?? Date.now;
-  const codexAppServerAvailable = deps.codexAppServerAvailable ?? (async () => {
-    try {
-      return (await stat3(`${codexHome()}/app-server-control/app-server-control.sock`)).isSocket();
-    } catch {
-      return false;
-    }
-  });
+  const codexAppServerAvailable = deps.codexAppServerAvailable ?? (() => codexAppServerSocketAvailable());
   let raw = null;
   try {
     raw = await readFile3(configPath, "utf8");

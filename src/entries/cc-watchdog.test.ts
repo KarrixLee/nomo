@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { beforeEach, describe, expect, test } from "bun:test";
 import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -9,10 +9,13 @@ import {
   buildDoneEnvelope, buildEndEnvelope, buildHeartbeatEnvelope, buildNeedsAttentionEnvelope, buildProvisionalBlob,
   buildProvisionalEnvelope, buildProvisionalRecord, buildStartEnvelope, buildTitleRepairEnvelope, classifySession,
   claudeTailPendingApproval, codexLastTurnEvent, codexTailPendingApproval, correctIdleClaude, correctInterrupt,
-  correctPendingApproval, correctPendingDone, discoverLiveSessions, goneStrikeShouldTeardown,
-  hasInterruptMarker, IDLE_GRACE_MS, isClaudeIdleReapEligible, isRetireEligible, lastTurnLine, PAIRING_TTL_MS, pendingPairingExpired,
-  postOutcomeForStatus, provisionalsCoveredByReal, reconcileProvisionalsSweep, retireDoneStale, shouldHeartbeat, shouldIdleProvisionalCheck,
+  correctPendingApproval, correctPendingDone, createBridgeSupervisor, discoverLiveSessions, effectiveDoneAttempts, goneStrikeShouldTeardown,
+  hasInterruptMarker, IDLE_GRACE_MS, isClaudeIdleReapEligible, isRetireEligible, lastTurnLine, PAIRING_TTL_MS, pendingDoneRetryWrite,
+  pendingDoneSettleWrite, pendingPairingExpired,
+  postOutcomeForStatus, provisionalsCoveredByReal, reconcileProvisionalsSweep, recordMovedSince, resetDoneAttemptMemory, retireDoneStale,
+  shouldHeartbeat, shouldIdleProvisionalCheck,
   shouldInterruptCheck, shouldPendingApprovalCheck, shouldPendingDoneCheck, shouldRepairTitle, tailShowsInterrupt, titleRepairedRecord,
+  withDeadline,
 } from "./cc-watchdog";
 import type { PostOutcome, RecordEntry } from "./cc-watchdog";
 import { claudeAdapter, codexAdapter } from "../core/adapter";
@@ -24,6 +27,11 @@ const KEY = new Uint8Array(32).fill(9);
 const rec = (over: Partial<SessionRecord> = {}): SessionRecord => ({
   pid: 4242, machine: "mac", label: "proj", ts: 1_000_000, ...over,
 });
+
+// The corrective-done retry bound is now ALSO held in module-global memory (so a persistently-failing
+// record write can't unbound it — see effectiveDoneAttempts). That state is per-process, exactly as it is
+// in the real daemon, so each test starts from a fresh daemon's view of the world.
+beforeEach(() => { resetDoneAttemptMemory(); });
 
 describe("classifySession", () => {
   const alive = () => true;
@@ -1544,5 +1552,460 @@ describe("shouldHeartbeat holds off while the interrupt net owns the record (the
     // A GENUINE pending approval (no interrupt seen, no counter) is still heartbeated to keep the island alive.
     const genuine = rec({ lastEvent: "needsAttention", op: "update", ts: now - HEARTBEAT_AFTER_MS, blob: "ATTN" });
     expect(shouldHeartbeat(genuine, now, undefined, false)).toBe(true);
+  });
+});
+
+// --- v1.4.4 review fixes ---------------------------------------------------------------------
+
+// The bridge used to be constructed for ANY pairing, so a Claude-only machine spawned `codex app-server
+// proxy` on every cycle forever. Construction/start is now gated on a cheap presence probe (the
+// app-server control socket) that is RE-RUN every sweep, so the daemon can appear or disappear under a
+// long-lived watchdog without a restart.
+describe("createBridgeSupervisor (presence gate: no Codex daemon → no bridge, no spawn)", () => {
+  /** A fake bridge that records the calls the supervisor makes. */
+  const fakeBridge = () => {
+    const calls: string[] = [];
+    return {
+      calls,
+      bridge: {
+        start: async () => { calls.push("start"); return true; },
+        stop: async () => { calls.push("stop"); },
+        refreshSubscriptions: async () => { calls.push("refresh"); },
+      },
+    };
+  };
+  /** Collects the detached work so a test can await it deterministically. */
+  const collector = () => {
+    const pending: Promise<unknown>[] = [];
+    return {
+      detach: (work: () => Promise<unknown>) => { pending.push(Promise.resolve().then(work).catch(() => {})); },
+      settle: () => Promise.all(pending),
+    };
+  };
+
+  test("probe false (Claude-only machine) → the bridge is NEVER constructed", async () => {
+    let created = 0;
+    const s = createBridgeSupervisor({ probe: async () => false, create: () => { created++; throw new Error("unreachable"); } });
+    await s.sync(cfg());
+    await s.sync(cfg());
+    await s.sync(cfg());
+    expect(created).toBe(0);
+    expect(s.active).toBe(false);
+  });
+
+  test("a daemon that appears LATER gets the bridge without restarting the watchdog", async () => {
+    const f = fakeBridge();
+    const c = collector();
+    let available = false;
+    const s = createBridgeSupervisor({ probe: async () => available, create: () => f.bridge, detach: c.detach });
+    await s.sync(cfg());
+    expect(f.calls).toEqual([]); // no daemon yet → nothing constructed
+    available = true;            // user starts codex
+    await s.sync(cfg());
+    await c.settle();
+    expect(f.calls).toEqual(["start"]);
+    expect(s.active).toBe(true);
+  });
+
+  test("a daemon that GOES AWAY stops the bridge (and it is re-started when it returns)", async () => {
+    const f = fakeBridge();
+    const c = collector();
+    let available = true;
+    const s = createBridgeSupervisor({ probe: async () => available, create: () => f.bridge, detach: c.detach });
+    await s.sync(cfg());
+    available = false;
+    await s.sync(cfg());
+    await c.settle();
+    expect(f.calls).toEqual(["start", "stop"]);
+    expect(s.active).toBe(false);
+    available = true;
+    await s.sync(cfg());
+    await c.settle();
+    expect(f.calls).toEqual(["start", "stop", "start"]);
+  });
+
+
+  test("a parked client (it gave up reconnecting) is RE-ARMED on the next sweep", async () => {
+    const f = fakeBridge();
+    const c = collector();
+    let sink: ((e: Error) => void) | undefined;
+    const s = createBridgeSupervisor({
+      probe: async () => true,
+      create: (_cfg, opts) => { sink = opts.onError; return f.bridge; },
+      detach: c.detach,
+      now: () => 1_000,
+    });
+    await s.sync(cfg());
+    await s.sync(cfg());
+    await c.settle();
+    expect(f.calls).toEqual(["start", "refresh"]); // healthy steady state
+    // The app-server client parks itself after N failed reconnects and stays off until start() is called.
+    sink!(new Error("Codex app-server reconnect gave up after 10 consecutive failures"));
+    await s.sync(cfg());
+    await c.settle();
+    expect(f.calls).toEqual(["start", "refresh", "start"]); // re-armed, not just refreshed
+    await s.sync(cfg());
+    await c.settle();
+    expect(f.calls).toEqual(["start", "refresh", "start", "refresh"]); // …and back to steady state
+  });
+
+  test("re-arms periodically as a backstop for parked states we can't observe", async () => {
+    const f = fakeBridge();
+    const c = collector();
+    let clock = 1_000;
+    const s = createBridgeSupervisor({ probe: async () => true, create: () => f.bridge, detach: c.detach, now: () => clock });
+    await s.sync(cfg());
+    clock += 60_000;            // 1 min later
+    await s.sync(cfg());
+    await c.settle();
+    expect(f.calls).toEqual(["start", "refresh"]);
+    clock += 600_000;           // past the re-arm interval
+    await s.sync(cfg());
+    await c.settle();
+    expect(f.calls).toEqual(["start", "refresh", "start"]);
+  });
+
+  test("errors are passed through to the caller's sink (the daemon itself stays silent)", async () => {
+    const f = fakeBridge();
+    const seen: string[] = [];
+    let sink: ((e: Error) => void) | undefined;
+    const s = createBridgeSupervisor({
+      probe: async () => true,
+      create: (_cfg, opts) => { sink = opts.onError; return f.bridge; },
+      detach: () => {},
+      onError: (e) => { seen.push(e.message); },
+    });
+    await s.sync(cfg());
+    sink!(new Error("transport closed"));
+    expect(seen).toEqual(["transport closed"]);
+  });
+
+  test("steady state refreshes subscriptions; a pairing change tears down and rebuilds", async () => {
+    const built: Array<ReturnType<typeof fakeBridge>> = [];
+    const c = collector();
+    const s = createBridgeSupervisor({
+      probe: async () => true,
+      create: () => { const f = fakeBridge(); built.push(f); return f.bridge; },
+      detach: c.detach,
+    });
+    await s.sync(cfg());
+    await s.sync(cfg());
+    await c.settle();
+    expect(built).toHaveLength(1);
+    expect(built[0].calls).toEqual(["start", "refresh"]);
+    await s.sync({ ...cfg(), pairingId: "p2" });
+    await c.settle();
+    expect(built).toHaveLength(2);
+    expect(built[0].calls).toEqual(["start", "refresh", "stop"]); // the old pairing's bridge is stopped
+    expect(built[1].calls).toEqual(["start"]);
+  });
+
+  test("unpaired (config null) tears the bridge down", async () => {
+    const f = fakeBridge();
+    const c = collector();
+    const s = createBridgeSupervisor({ probe: async () => true, create: () => f.bridge, detach: c.detach });
+    await s.sync(cfg());
+    await s.sync(null);
+    await c.settle();
+    expect(f.calls).toEqual(["start", "stop"]);
+    expect(s.active).toBe(false);
+  });
+
+  test("a probe that THROWS is treated as 'no daemon' — the sweep never sees the error", async () => {
+    let created = 0;
+    const s = createBridgeSupervisor({ probe: async () => { throw new Error("stat exploded"); }, create: () => { created++; throw new Error("x"); } });
+    await s.sync(cfg());
+    expect(created).toBe(0);
+  });
+});
+
+// The deadlock this closes: `await bridge.start()` on a wedged `codex app-server proxy` child (spawned,
+// never writes, never exits) froze EVERY self-heal net while the pidfile stayed claimed.
+describe("bridge work is DECOUPLED from the sweep cadence (a wedged Codex child can't freeze the loop)", () => {
+  test("sync() returns even when start() never settles", async () => {
+    const never = new Promise<boolean>(() => {}); // a wedged proxy child: no data, no exit, no rejection
+    const s = createBridgeSupervisor({
+      probe: async () => true,
+      create: () => ({ start: () => never, stop: async () => {}, refreshSubscriptions: () => never as unknown as Promise<void> }),
+    });
+    // If sync() awaited the bridge, this race would resolve "timeout" (and the real loop would hang).
+    const raced = await Promise.race([
+      s.sync(cfg()).then(() => "synced"),
+      new Promise((r) => setTimeout(() => r("timeout"), 250)),
+    ]);
+    expect(raced).toBe("synced");
+    // …and the NEXT cycle (refreshSubscriptions, equally wedged) is just as non-blocking.
+    const raced2 = await Promise.race([
+      s.sync(cfg()).then(() => "synced"),
+      new Promise((r) => setTimeout(() => r("timeout"), 250)),
+    ]);
+    expect(raced2).toBe("synced");
+  });
+
+  test("a REJECTING start is swallowed by the default detach (no unhandled rejection)", async () => {
+    const s = createBridgeSupervisor({
+      probe: async () => true,
+      create: () => ({ start: async () => { throw new Error("proxy died"); }, stop: async () => {}, refreshSubscriptions: async () => {} }),
+    });
+    await s.sync(cfg());
+    await new Promise((r) => setTimeout(r, 10)); // let the detached rejection land
+    expect(s.active).toBe(true); // the supervisor keeps the handle; the client owns its own retry/backoff
+  });
+
+  test("withDeadline resolves undefined instead of waiting on a promise that never settles", async () => {
+    expect(await withDeadline(new Promise<string>(() => {}), 20)).toBeUndefined();
+    expect(await withDeadline(Promise.resolve("done"), 1000)).toBe("done");
+  });
+});
+
+// A record snapshot read at the top of a sweep is STALE by the time a 2 s POST returns. Writing the
+// snapshot back stamped `done` over a session the user had just woken up — which then silenced every
+// self-heal net (they all gate off a done record).
+describe("stale-snapshot guard (a prompt landing mid-POST must never be clobbered back to done)", () => {
+  const NOW = 9_000_000;
+  const owed = (over: Partial<SessionRecord> = {}): SessionRecord =>
+    rec({ lastEvent: "done", op: "done", sentDone: true, donePending: true, blob: "B", ts: NOW - 60_000, ...over });
+
+  test("recordMovedSince keys on ts / lastEvent / op", () => {
+    const snap = owed();
+    expect(recordMovedSince(snap, { ...snap })).toBe(false);
+    expect(recordMovedSince(snap, { ...snap, ts: snap.ts + 1 })).toBe(true);
+    expect(recordMovedSince(snap, { ...snap, lastEvent: "working" })).toBe(true);
+    expect(recordMovedSince(snap, { ...snap, op: "update" })).toBe(true);
+    expect(recordMovedSince(snap, { ...snap, blob: "other" })).toBe(false); // a re-seal is not a state move
+  });
+
+  test("pendingDoneSettleWrite: unchanged → settled; moved-to-working → NOTHING; moved-but-done → marker only", () => {
+    const snap = owed();
+    const settled: SessionRecord = { ...snap, lastEvent: "done", sentDone: true, op: "done", donePending: undefined, doneAttempts: undefined };
+    expect(pendingDoneSettleWrite(snap, { ...snap }, settled)).toBe(settled);
+    expect(pendingDoneSettleWrite(snap, null, settled)).toBe(settled); // unreadable → pre-guard behavior
+    expect(pendingDoneSettleWrite(snap, { ...snap, ts: NOW, lastEvent: "working", op: "update", donePending: undefined }, settled)).toBeNull();
+    const moved = pendingDoneSettleWrite(snap, { ...snap, ts: NOW, title: "newer" }, settled);
+    expect(moved).toMatchObject({ ts: NOW, title: "newer" }); // the FRESH record survives…
+    expect(moved!.donePending).toBeUndefined();               // …minus the debt marker
+  });
+
+  test("correctPendingDone: a record that flipped to WORKING during the POST is not stamped done", async () => {
+    const writes: SessionRecord[] = [];
+    // The hook's UserPromptSubmit landed while our done was in flight.
+    const woken = rec({ lastEvent: "working", op: "update", ts: NOW, blob: "W", sentDone: false });
+    const v = await correctPendingDone(cfg(), "/tmp/s.json", "s", owed(), NOW, {
+      post: async () => "delivered" as PostOutcome,
+      readRecord: async () => woken,
+      writeRecord: async (_p, r) => { writes.push(r); },
+    });
+    expect(v).toBe("corrected");  // the done DID deliver — the pairing is alive
+    expect(writes).toEqual([]);   // …but nothing was written back: the live session keeps its working state
+    // Proof of the bug this closes: had the snapshot been written back, the session would have been
+    // silenced (every net gates off a done record) while the phone showed it running.
+    expect(shouldHeartbeat(woken, NOW + HEARTBEAT_AFTER_MS, undefined, false)).toBe(true);
+  });
+
+  test("correctPendingDone: a record that moved but is STILL done keeps the fresh state, minus the debt", async () => {
+    const writes: SessionRecord[] = [];
+    const fresher = { ...owed(), ts: NOW, title: "renamed" };
+    await correctPendingDone(cfg(), "/tmp/s.json", "s", owed(), NOW, {
+      post: async () => "delivered" as PostOutcome,
+      readRecord: async () => fresher,
+      writeRecord: async (_p, r) => { writes.push(r); },
+    });
+    expect(writes[0]).toMatchObject({ ts: NOW, title: "renamed", lastEvent: "done" });
+    expect(writes[0].donePending).toBeUndefined();
+    expect(shouldPendingDoneCheck(writes[0])).toBe(false); // the debt really is settled
+  });
+
+  test("correctPendingDone: an unchanged record still settles exactly as before (no behavior drift)", async () => {
+    const writes: SessionRecord[] = [];
+    const snap = owed();
+    const v = await correctPendingDone(cfg(), "/tmp/s.json", "s", snap, NOW, {
+      post: async () => "delivered" as PostOutcome,
+      readRecord: async () => ({ ...snap }),
+      writeRecord: async (_p, r) => { writes.push(r); },
+    });
+    expect(v).toBe("corrected");
+    expect(writes[0]).toMatchObject({ lastEvent: "done", op: "done", sentDone: true });
+    expect(writes[0].donePending).toBeUndefined();
+  });
+
+  test("pendingDoneRetryWrite: the counter bump follows the same rules", () => {
+    const snap = owed();
+    expect(pendingDoneRetryWrite(snap, null, 3)).toMatchObject({ doneAttempts: 3, donePending: true });
+    expect(pendingDoneRetryWrite(snap, { ...snap }, 3)).toMatchObject({ doneAttempts: 3 });
+    expect(pendingDoneRetryWrite(snap, { ...snap, ts: NOW, lastEvent: "working", op: "update" }, 3)).toBeNull();
+  });
+
+  test("correctPendingDone: a FAILED re-POST on a woken record writes no counter (but still bounds the retry)", async () => {
+    const writes: SessionRecord[] = [];
+    const woken = rec({ lastEvent: "working", op: "update", ts: NOW });
+    const seams = {
+      post: async () => "failed" as PostOutcome,
+      readRecord: async () => woken,
+      writeRecord: async (_p: string, r: SessionRecord) => { writes.push(r); },
+    };
+    for (let i = 0; i < 3; i++) await correctPendingDone(cfg(), "/tmp/s.json", "s", owed(), NOW, seams);
+    expect(writes).toEqual([]); // the woken record is never stamped with our stale counter
+    // …yet the retry is still bounded: the in-memory mirror counted all three attempts.
+    expect(effectiveDoneAttempts(owed(), "s")).toBe(3);
+  });
+});
+
+// Same shape at the 1 h horizon: retire POSTed a blob-less end and DELETED the record from a snapshot
+// taken before the sweep's earlier awaits — so a session woken mid-sweep lost its reap/heartbeat handle.
+describe("retireDoneStale re-reads before it deletes (a woken session is never retired out from under itself)", () => {
+  const NOW = 100_000_000;
+  const RETIRE_MS = 3_600_000;
+  const done = (over: Partial<SessionRecord> = {}): SessionRecord =>
+    rec({ op: "done", lastEvent: "done", sentDone: true, blob: "DONEBLOB", ts: NOW - RETIRE_MS, ...over });
+
+  test("a record that moved BEFORE the end-POST → skip: no POST, no delete", async () => {
+    let posted = false;
+    let deleted = false;
+    const v = await retireDoneStale(cfg(), "/tmp/s.json", "s", done(), NOW, {
+      post: async () => { posted = true; return "delivered" as PostOutcome; },
+      deleteRecord: async () => { deleted = true; },
+      readRecord: async () => rec({ lastEvent: "working", op: "update", ts: NOW }),
+    });
+    expect(v).toBe("skip");
+    expect(posted).toBe(false);
+    expect(deleted).toBe(false);
+  });
+
+  test("a record that moves DURING the end-POST → the record survives (the delete is skipped)", async () => {
+    let reads = 0;
+    let deleted = false;
+    const v = await retireDoneStale(cfg(), "/tmp/s.json", "s", done(), NOW, {
+      post: async () => "delivered" as PostOutcome,
+      deleteRecord: async () => { deleted = true; },
+      // 1st read (pre-POST): unchanged. 2nd read (pre-delete): the user's prompt landed.
+      readRecord: async () => (++reads === 1 ? done() : rec({ lastEvent: "working", op: "update", ts: NOW })),
+    });
+    expect(reads).toBe(2);
+    expect(v).toBe("skip");
+    expect(deleted).toBe(false);
+  });
+
+  test("an unchanged record still retires exactly as before (POST + delete)", async () => {
+    const deletes: string[] = [];
+    const v = await retireDoneStale(cfg(), "/tmp/s.json", "s", done(), NOW, {
+      post: async () => "delivered" as PostOutcome,
+      deleteRecord: async (p) => { deletes.push(p); },
+      readRecord: async () => done(),
+    });
+    expect(v).toBe("retired");
+    expect(deletes).toEqual(["/tmp/s.json"]);
+  });
+
+  test("an unreadable re-read keeps the pre-guard behavior (retire is best-effort, never blocked)", async () => {
+    const deletes: string[] = [];
+    const v = await retireDoneStale(cfg(), "/tmp/s.json", "s", done(), NOW, {
+      post: async () => "delivered" as PostOutcome,
+      deleteRecord: async (p) => { deletes.push(p); },
+      readRecord: async () => { throw new Error("EIO"); },
+    });
+    expect(v).toBe("retired");
+    expect(deletes).toEqual(["/tmp/s.json"]);
+  });
+});
+
+// The persisted doneAttempts counter is written inside a try/catch, so a disk that keeps failing left the
+// bound at zero forever — one doomed done POST every 5 s, indefinitely.
+describe("corrective-done retries stay bounded even when EVERY record write fails", () => {
+  const NOW = 9_000_000;
+  const interruptTail = asstTurn("[Request interrupted by user]");
+
+  test("correctInterrupt: a never-persisting counter still hits the cap (memory-backed bound)", async () => {
+    let posts = 0;
+    const snapshot = irec({ lastEvent: "needsAttention", op: "update", prio: 1, blob: "ATTN", transcript: "/tmp/t.jsonl" });
+    for (let i = 0; i < 20; i++) {
+      // The same UNCHANGED snapshot every sweep — exactly what a failing rewrite leaves on disk.
+      await correctInterrupt(cfg(), "/tmp/s.json", "wedged", snapshot, NOW, {
+        post: async () => { posts++; return "failed" as PostOutcome; },
+        readTail: async () => interruptTail,
+        writeRecord: async () => { throw new Error("ENOSPC"); },
+      });
+    }
+    expect(posts).toBeLessThanOrEqual(6); // bounded by memory, NOT one POST per sweep forever
+  });
+
+  test("correctIdleClaude: same bound (the reap can't spin on a read-only home either)", async () => {
+    let posts = 0;
+    const idle = rec({ lastEvent: "sessionStart", ts: NOW - 3_600_000, blob: "W" });
+    for (let i = 0; i < 20; i++) {
+      await correctIdleClaude(cfg(), "/tmp/s.json", "wedged-idle", idle, NOW, {
+        post: async () => { posts++; return "failed" as PostOutcome; },
+        writeRecord: async () => { throw new Error("EROFS"); },
+      });
+    }
+    expect(posts).toBeLessThanOrEqual(6);
+  });
+
+  test("correctPendingDone: same bound", async () => {
+    let posts = 0;
+    const owed = rec({ lastEvent: "done", op: "done", sentDone: true, donePending: true, blob: "B", ts: NOW - 60_000 });
+    for (let i = 0; i < 20; i++) {
+      await correctPendingDone(cfg(), "/tmp/s.json", "wedged-done", owed, NOW, {
+        post: async () => { posts++; return "failed" as PostOutcome; },
+        readRecord: async () => null,
+        writeRecord: async () => { throw new Error("EIO"); },
+      });
+    }
+    expect(posts).toBeLessThanOrEqual(6);
+  });
+
+  test("a delivered corrective clears the memory, so the NEXT episode gets a full retry budget", async () => {
+    const snapshot = irec({ lastEvent: "needsAttention", op: "update", prio: 1, blob: "ATTN", transcript: "/tmp/t.jsonl" });
+    const seams = (outcome: PostOutcome) => ({
+      post: async () => outcome,
+      readTail: async () => interruptTail,
+      writeRecord: async () => { throw new Error("ENOSPC"); },
+    });
+    for (let i = 0; i < 3; i++) await correctInterrupt(cfg(), "/tmp/s.json", "s2", snapshot, NOW, seams("failed"));
+    expect(effectiveDoneAttempts(snapshot, "s2")).toBe(3);
+    await correctInterrupt(cfg(), "/tmp/s.json", "s2", snapshot, NOW, seams("delivered"));
+    expect(effectiveDoneAttempts(snapshot, "s2")).toBe(0);
+  });
+
+  test("effectiveDoneAttempts takes the HIGHER of the persisted counter and the in-memory mirror", () => {
+    expect(effectiveDoneAttempts(rec({ doneAttempts: 4 }), "fresh")).toBe(4);
+    expect(effectiveDoneAttempts(rec(), "fresh")).toBe(0);
+  });
+});
+
+// The reconcile matcher used to hardcode `agent === "codex"` as "discovery-capable". Keying it on the
+// adapter registry's discoverLive keeps the daemon's no-inline-agent-branch discipline and lets a future
+// discovery-capable agent reconcile without touching this file.
+describe("provisionalsCoveredByReal is keyed on adapter.discoverLive, not a hardcoded agent", () => {
+  const entry = (sessionId: string, r: Partial<SessionRecord>): RecordEntry => ({ sessionId, rec: rec(r) });
+
+  test("the default registry behaves exactly as the codex-hardcoded version did", () => {
+    const entries = [
+      entry("codex-pid-77", { pid: 77, provisional: true, agent: "codex" }),
+      entry("real", { pid: 77, agent: "codex" }),
+      entry("claude-prov", { pid: 88, provisional: true }),
+      entry("claude-real", { pid: 88 }), // claude has no discoverLive → never covers a provisional
+    ];
+    expect(provisionalsCoveredByReal(entries)).toEqual(["codex-pid-77"]);
+  });
+
+  test("a hypothetical discovery-capable CLAUDE adapter would reconcile claude provisionals too", () => {
+    const discoveringClaude: AgentAdapter = { ...claudeAdapter, discoverLive: async () => [] };
+    const entries = [entry("claude-prov", { pid: 88, provisional: true }), entry("claude-real", { pid: 88 })];
+    expect(provisionalsCoveredByReal(entries, [claudeAdapter, codexAdapter])).toEqual([]);
+    expect(provisionalsCoveredByReal(entries, [discoveringClaude, codexAdapter])).toEqual(["claude-prov"]);
+  });
+
+  test("reconcileProvisionalsSweep threads the registry through", async () => {
+    const posts: object[] = [];
+    const deletes: string[] = [];
+    const entries = [entry("claude-prov", { pid: 88, provisional: true }), entry("claude-real", { pid: 88 })];
+    await reconcileProvisionalsSweep(cfg(), {
+      readEntries: async () => entries,
+      post: async (b) => { posts.push(b); return "delivered" as PostOutcome; },
+      deleteRecord: async (id) => { deletes.push(id); },
+      adapters: [{ ...claudeAdapter, discoverLive: async () => [] }],
+    });
+    expect(deletes).toEqual(["claude-prov"]);
+    expect(posts[0]).toMatchObject({ op: "end", sessionId: "claude-prov" });
   });
 });

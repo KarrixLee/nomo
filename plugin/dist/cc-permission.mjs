@@ -97,7 +97,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { execFileSync, spawn } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "1.4.3";
+var PLUGIN_VERSION = "1.4.4";
 var CC_DIR = `${process.env.HOME}/.config/cc-status`;
 var SESSIONS_DIR = `${CC_DIR}/sessions`;
 var WATCHDOG_PID_PATH = `${CC_DIR}/watchdog.pid`;
@@ -127,6 +127,16 @@ function codexHome() {
   return env && env.length > 0 ? env : `${process.env.HOME}/.codex`;
 }
 var CODEX_HOOK_MARKER = "codex-status.mjs";
+function codexAppServerSocketPath() {
+  return `${codexHome()}/app-server-control/app-server-control.sock`;
+}
+async function codexAppServerSocketAvailable(socketPath = codexAppServerSocketPath()) {
+  try {
+    return (await stat(socketPath)).isSocket();
+  } catch {
+    return false;
+  }
+}
 function lastHookPath(agent) {
   return `${CC_DIR}/last-hook-${agent}`;
 }
@@ -363,19 +373,57 @@ async function completePendingPairing(pending, configPath, opts = {}) {
   await unlink(join(dirname(configPath), PAIR_HTML_FILE)).catch(() => {});
   return { state: "completed", deviceName };
 }
-function ensureWatchdog() {
+function isWatchdogCommand(psCommand) {
+  return psCommand.includes("cc-watchdog");
+}
+function formatWatchdogPidfile(pid, version = PLUGIN_VERSION) {
+  return `${pid} ${version}`;
+}
+function parseWatchdogPidfile(raw) {
+  const [pidField, versionField] = raw.trim().split(/\s+/);
+  const pid = Number.parseInt(pidField ?? "", 10);
+  if (!Number.isFinite(pid) || pid <= 0)
+    return null;
+  return { pid, ...typeof versionField === "string" && versionField.length > 0 ? { version: versionField } : {} };
+}
+function watchdogHolderIsLive(pid, deps = {}) {
+  const isAlive = deps.isAlive ?? pidAlive;
+  const commandOf = deps.commandOf ?? pidCommand;
+  if (!Number.isFinite(pid) || pid <= 0)
+    return false;
+  if (!isAlive(pid))
+    return false;
+  const cmd = commandOf(pid);
+  if (cmd === undefined)
+    return true;
+  return isWatchdogCommand(cmd);
+}
+function ensureWatchdog(deps = {}) {
   try {
-    let running = false;
-    try {
-      const pid = Number.parseInt(readFileSync(WATCHDOG_PID_PATH, "utf8").trim(), 10);
-      running = Number.isFinite(pid) && pid > 0 && pidAlive(pid);
-    } catch {
-      running = false;
+    const pidPath = deps.pidPath ?? WATCHDOG_PID_PATH;
+    const version = deps.version ?? PLUGIN_VERSION;
+    const readPidfile = deps.readPidfile ?? (() => {
+      try {
+        return readFileSync(pidPath, "utf8");
+      } catch {
+        return;
+      }
+    });
+    const killPid = deps.killPid ?? ((pid, signal) => process.kill(pid, signal));
+    const spawnWatchdog = deps.spawnWatchdog ?? (() => {
+      const runtime = process.env.NOMO_RUNTIME && process.env.NOMO_RUNTIME.length > 0 ? process.env.NOMO_RUNTIME : process.execPath;
+      spawn(runtime, [WATCHDOG_PATH], { detached: true, stdio: "ignore" }).unref();
+    });
+    const raw = readPidfile();
+    const holder = typeof raw === "string" ? parseWatchdogPidfile(raw) : null;
+    if (holder && watchdogHolderIsLive(holder.pid, deps)) {
+      if (holder.version === version)
+        return;
+      try {
+        killPid(holder.pid, "SIGTERM");
+      } catch {}
     }
-    if (running)
-      return;
-    const runtime = process.env.NOMO_RUNTIME && process.env.NOMO_RUNTIME.length > 0 ? process.env.NOMO_RUNTIME : process.execPath;
-    spawn(runtime, [WATCHDOG_PATH], { detached: true, stdio: "ignore" }).unref();
+    spawnWatchdog();
   } catch {}
 }
 async function readRecord(sessionId) {
@@ -1705,6 +1753,9 @@ var POST_RETRY_PAUSE_MS = 1000;
 var HOLD_RETRY_DELAY_MS = 4000;
 var FRESH_SESSION_MS = 60000;
 var MAX_CONSECUTIVE_MISSES = 100;
+var DEFINITIVE_POLL_STATUSES = new Set([401, 403, 404, 410]);
+var MAX_DEFINITIVE_POLL_FAILURES = 2;
+var MAX_UNKNOWN_ANSWER_READS = 3;
 var CODEX_POLICY_TAIL_BYTES = 8 * 1024 * 1024;
 var CODEX_ROLLOUT_HEAD_BYTES = 1024 * 1024;
 function codexTurnPolicyFromRollout(text, turnId) {
@@ -1827,14 +1878,16 @@ function answerLine(agent, toolName, toolInput, answers) {
   const questions = usableQuestions(toolInput);
   if (questions.length === 0)
     return;
+  if (new Set(questions.map((q) => q.text)).size !== questions.length)
+    return;
   const map = {};
   for (let i = 0;i < questions.length; i += 1) {
     const a = answers[i];
     if (typeof a !== "string")
-      continue;
+      return;
     const raw = a.trim();
     if (raw.length === 0)
-      continue;
+      return;
     if (raw.length > ANSWER_MAX)
       return;
     const resolved = resolveAnswer(raw, questions[i].labels);
@@ -1842,7 +1895,7 @@ function answerLine(agent, toolName, toolInput, answers) {
       return;
     map[questions[i].text] = resolved;
   }
-  if (Object.keys(map).length === 0)
+  if (Object.keys(map).length !== questions.length)
     return;
   return decisionLine(agent, {
     hookEventName: "PermissionRequest",
@@ -1871,6 +1924,15 @@ function resolveAnswer(answer, labels) {
 }
 var TRACE_PATH = `${CC_DIR}/permission-trace.log`;
 var TRACE_MAX_BYTES = 256 * 1024;
+function errorTag(e) {
+  const name = typeof e?.name === "string" ? e.name : typeof e;
+  const code = e?.code;
+  return { error: name, ...typeof code === "string" ? { code } : {} };
+}
+function parseErrorPosition(e) {
+  const m = typeof e?.message === "string" ? /position (\d+)/.exec(e.message) : null;
+  return m ? Number(m[1]) : undefined;
+}
 function appendTrace(path, event) {
   try {
     appendFileSync(path, `${JSON.stringify({ ts: Date.now(), pid: process.pid, ...event })}
@@ -1900,11 +1962,11 @@ function defaultTrace() {
       });
     }
     process.on("uncaughtException", (e) => {
-      trace({ event: "uncaughtException", error: String(e).slice(0, 200) });
+      trace({ event: "uncaughtException", ...errorTag(e) });
       process.exit(0);
     });
     process.on("unhandledRejection", (e) => {
-      trace({ event: "unhandledRejection", error: String(e).slice(0, 200) });
+      trace({ event: "unhandledRejection", ...errorTag(e) });
       process.exit(0);
     });
     process.on("exit", (code) => appendTrace(TRACE_PATH, { event: "exit-event", code }));
@@ -2144,7 +2206,13 @@ async function runPermissionHook(deps = {}, agent = "claude") {
       trace({ event: "exit", reason: "unpaired" });
       return;
     }
-    const input = JSON.parse(raw);
+    let input;
+    try {
+      input = JSON.parse(raw);
+    } catch (e) {
+      trace({ event: "exit", reason: "bad-stdin", ...errorTag(e), pos: parseErrorPosition(e) });
+      return;
+    }
     const sessionId = typeof input.session_id === "string" ? input.session_id : "";
     if (sessionId.length === 0) {
       trace({ event: "exit", reason: "no-session-id" });
@@ -2187,7 +2255,8 @@ async function runPermissionHook(deps = {}, agent = "claude") {
     const record = await (deps.readRecordFn ?? readRecord)(sessionId);
     const machine = config.machineName ?? hostname2().replace(/\.local$/, "");
     const plan = { op: "update", prio: 1, status: "needsAttention" };
-    const base = buildBlob(input, machine, record?.title, plan, agent, record?.turnStartedAt, record?.label, record?.model);
+    const at = Math.floor(now / 1000);
+    const base = buildBlob(input, machine, record?.title, plan, agent, record?.turnStartedAt, record?.label, record?.model, at);
     const permissionBase = {
       ...base,
       status: "decisionPending",
@@ -2226,10 +2295,35 @@ async function runPermissionHook(deps = {}, agent = "claude") {
       }
       return { posted: posted2, hold: hold2 };
     };
+    const pollDecision = async (seq2) => {
+      trace({ event: "poll-begin", seq: seq2 });
+      try {
+        const res = await fetchFn(`${config.url}/v1/cc/decision/${requestId}`, {
+          headers: pcHeaders,
+          signal: AbortSignal.timeout(FETCH_TIMEOUT_MS)
+        });
+        if (!res.ok) {
+          trace({ event: "poll-end", seq: seq2, outcome: "status", status: res.status });
+          return { status: res.status };
+        }
+        const data = await res.json();
+        trace({ event: "poll-end", seq: seq2, outcome: "ok" });
+        return { data, status: res.status };
+      } catch (e) {
+        trace({ event: "poll-end", seq: seq2, outcome: "error", ...errorTag(e) });
+        return { status: 0 };
+      }
+    };
     let { posted, hold } = await postDecision(1, POST_MAX_ATTEMPTS);
     if (!posted) {
-      trace({ event: "exit", reason: "post-error" });
-      return;
+      const probe = await pollDecision(0);
+      const live = probe.data?.status === "pending" || probe.data?.status === "answered";
+      if (!live) {
+        trace({ event: "exit", reason: "post-error" });
+        return;
+      }
+      trace({ event: "post-timeout-landed", status: probe.data?.status });
+      hold = true;
     }
     trace({ event: "hold", hold });
     if (!hold) {
@@ -2257,27 +2351,16 @@ async function runPermissionHook(deps = {}, agent = "claude") {
     const emit = deps.emit ?? ((line) => process.stdout.write(`${line}
 `));
     let misses = 0;
+    let definitiveFailures = 0;
+    let unknownBlob;
+    let unknownReads = 0;
     let seq = 0;
     for (;; ) {
       seq += 1;
-      trace({ event: "poll-begin", seq });
-      let data;
-      try {
-        const res = await fetchFn(`${config.url}/v1/cc/decision/${requestId}`, {
-          headers: pcHeaders,
-          signal: AbortSignal.timeout(FETCH_TIMEOUT_MS)
-        });
-        if (res.ok) {
-          data = await res.json();
-          trace({ event: "poll-end", seq, outcome: "ok" });
-        } else {
-          trace({ event: "poll-end", seq, outcome: "status", status: res.status });
-        }
-      } catch (e) {
-        trace({ event: "poll-end", seq, outcome: "error", error: e?.name ?? "Error" });
-      }
+      const { data, status: httpStatus } = await pollDecision(seq);
       if (data) {
         misses = 0;
+        definitiveFailures = 0;
         if (data.status === "answered" && typeof data.answerBlob === "string") {
           const answer = await decryptBlob(config.e2eKey, data.answerBlob);
           const match = answer.requestId === requestId;
@@ -2287,20 +2370,39 @@ async function runPermissionHook(deps = {}, agent = "claude") {
             trace({ event: "exit", reason: "answered" });
             return;
           }
+          unknownReads = data.answerBlob === unknownBlob ? unknownReads + 1 : 1;
+          unknownBlob = data.answerBlob;
+          if (unknownReads >= MAX_UNKNOWN_ANSWER_READS) {
+            trace({ event: "release", reason: "unknown-decision-terminal", reads: unknownReads });
+            trace({ event: "exit", reason: "unknown-decision" });
+            return;
+          }
         } else if (typeof data.status === "string" && data.status !== "pending") {
           trace({ event: data.status === "expired" ? "expired" : "superseded", status: data.status });
           trace({ event: "exit", reason: data.status });
           return;
         }
-      } else if (++misses >= MAX_CONSECUTIVE_MISSES) {
-        trace({ event: "giveup", misses });
-        trace({ event: "exit", reason: "giveup" });
-        return;
+      } else {
+        if (DEFINITIVE_POLL_STATUSES.has(httpStatus)) {
+          definitiveFailures += 1;
+          if (definitiveFailures >= MAX_DEFINITIVE_POLL_FAILURES) {
+            trace({ event: "giveup", reason: "definitive", status: httpStatus, strikes: definitiveFailures });
+            trace({ event: "exit", reason: "definitive" });
+            return;
+          }
+        } else {
+          definitiveFailures = 0;
+        }
+        if (++misses >= MAX_CONSECUTIVE_MISSES) {
+          trace({ event: "giveup", misses });
+          trace({ event: "exit", reason: "giveup" });
+          return;
+        }
       }
       await sleep(interval + jitter());
     }
   } catch (e) {
-    trace({ event: "exit", reason: "exception", error: String(e).slice(0, 200) });
+    trace({ event: "exit", reason: "exception", ...errorTag(e) });
   }
 }
 async function approvalsCommand(sub, deps = {}) {
@@ -2330,6 +2432,20 @@ if (__require.main == __require.module) {
   if (sub === "off" || sub === "on" || sub === "status") {
     process.exit(await approvalsCommand(sub));
   }
-  await runPermissionHook();
+  let flushed = Promise.resolve();
+  await runPermissionHook({
+    emit: (line) => {
+      flushed = new Promise((resolve2) => {
+        const timer = setTimeout(resolve2, 1000);
+        timer.unref?.();
+        process.stdout.write(`${line}
+`, () => {
+          clearTimeout(timer);
+          resolve2();
+        });
+      });
+    }
+  });
+  await flushed;
   process.exit(0);
 }

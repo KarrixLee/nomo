@@ -129,6 +129,26 @@ export function codexHome(): string {
  *  hook's basename). status-cmd greps for it to flag leftover legacy (pre-native-plugin) installs. */
 export const CODEX_HOOK_MARKER = "codex-status.mjs";
 
+/** The shared Codex app-server CONTROL socket — the one `codex app-server proxy` attaches to. Its mere
+ *  existence is the cheapest honest signal that a Codex app-server daemon is up on this machine (the
+ *  socket is created by the daemon and disappears with it). */
+export function codexAppServerSocketPath(): string {
+  return `${codexHome()}/app-server-control/app-server-control.sock`;
+}
+
+/** Is a Codex app-server daemon present right now? ONE stat of the control socket — the presence probe
+ *  shared by `status` (which reports it) and the watchdog (which gates the remote-input bridge on it, so
+ *  a Claude-only user never gets a perpetual `codex app-server proxy` spawn loop). Cheap enough to
+ *  re-run every sweep, so a daemon that appears/disappears later is picked up without a restart. Never
+ *  throws: any error (absent socket, no ~/.codex, permission) reads as "not available". */
+export async function codexAppServerSocketAvailable(socketPath = codexAppServerSocketPath()): Promise<boolean> {
+  try {
+    return (await stat(socketPath)).isSocket();
+  } catch {
+    return false;
+  }
+}
+
 /** Per-agent hook-liveness stamp: the hook rewrites `<CC_DIR>/last-hook-<agent>` (epoch-ms text) on
  *  EVERY invocation, before the pairing gate — so a hook that silently never fires (Codex #16430/
  *  #30835) leaves NO stamp at all. status-cmd compares it against the newest session-transcript mtime
@@ -693,26 +713,120 @@ export async function completePendingPairing(
   return { state: "completed", deviceName };
 }
 
-/** Ensure the detached liveness/self-heal watchdog is running: if its pidfile is missing or names a
- *  dead process, spawn a fresh one and let go of it (detached + unref'd, no stdio) so the caller never
- *  waits on it. The runtime is NOMO_RUNTIME (the run.sh shim's resolved interpreter) when set, else
- *  this process's own execPath. Shared by the hook (post-pair) and `pair` (so a mid-pairing config
- *  self-heals even if `wait` is never run). Best-effort — a spawn failure just falls back to the
- *  worker's own staleness eviction / the next hook. */
-export function ensureWatchdog(): void {
+// --- Watchdog pidfile: identity + version stamp ----------------------------------------------
+//
+// The pidfile is BOTH the single-instance lock and the incumbent's build stamp. Two failure modes it
+// has to survive:
+//   1. PID RECYCLE — a pidfile that outlives a reboot (or a SIGKILLed daemon) names a pid the OS has
+//      since handed to some UNRELATED process. kill(pid,0) then says "alive" forever, so nothing ever
+//      spawns a watchdog again and every self-heal net is silently dead. The fix is the identity check
+//      `reset` already performs before it kills anything: `ps` the pid and require the command line to
+//      look like our watchdog.
+//   2. UPGRADE UNDER A LIVE DAEMON — the watchdog lingers up to 30 min between sessions, so a plugin
+//      update installed mid-session would keep running the OLD bundle indefinitely. The pidfile carries
+//      the incumbent's PLUGIN_VERSION so ensureWatchdog can SIGTERM a mismatched build and spawn fresh.
+//
+// FORMAT — `"<pid> <version>"`, deliberately parseInt-COMPATIBLE: every existing reader (status-cmd,
+// reset, this module, the watchdog's own claim/release) does `parseInt(raw.trim(), 10)`, which stops at
+// the space and still yields the pid. So an old reader reads a new pidfile correctly, and a new reader
+// treats an old (bare-pid) pidfile as "version unknown" — i.e. an older build, which is exactly right.
+
+/** Whether a `ps` command line is our watchdog. The daemon runs as `<runtime> …/cc-watchdog.mjs` (or
+ *  the raw .ts in dev), so the script name is the stable fingerprint. Shared by `reset` (which kills
+ *  the pid) and the single-instance/spawn claims (which must not trust a recycled pid). */
+export function isWatchdogCommand(psCommand: string): boolean {
+  return psCommand.includes("cc-watchdog");
+}
+
+/** The parsed watchdog pidfile: the holder's pid plus, when the incumbent stamped one, its build. */
+export interface WatchdogPidfile {
+  pid: number;
+  /** The incumbent's PLUGIN_VERSION. Absent for a pidfile written by a pre-stamp build → older code. */
+  version?: string;
+}
+
+/** Render the pidfile contents for THIS process (see the format note above). */
+export function formatWatchdogPidfile(pid: number, version: string = PLUGIN_VERSION): string {
+  return `${pid} ${version}`;
+}
+
+/** Parse a pidfile's contents. Null when there's no usable pid (empty / non-numeric / ≤ 0). Pure. */
+export function parseWatchdogPidfile(raw: string): WatchdogPidfile | null {
+  const [pidField, versionField] = raw.trim().split(/\s+/);
+  const pid = Number.parseInt(pidField ?? "", 10);
+  if (!Number.isFinite(pid) || pid <= 0) return null;
+  return { pid, ...(typeof versionField === "string" && versionField.length > 0 ? { version: versionField } : {}) };
+}
+
+/** Injectable process-identity seams (so both claim paths are testable with a fake `ps`). */
+export interface WatchdogIdentityDeps {
+  isAlive?: (pid: number) => boolean;
+  /** `ps`-style command-line lookup for a pid; undefined when the pid is gone or `ps` failed. */
+  commandOf?: (pid: number) => string | undefined;
+}
+
+/** Is this pid a REAL, live watchdog? kill(pid,0) alone is not enough (see the pid-recycle note above):
+ *  a live pid whose command line is NOT our watchdog is a recycled pid, so the pidfile is STALE and the
+ *  caller may claim it. An unavailable `ps` (undefined — no such pid, or the tool failed) falls back to
+ *  the liveness verdict: no evidence of recycling is not evidence OF recycling, and guessing "stale"
+ *  there would spawn a second daemon. */
+export function watchdogHolderIsLive(pid: number, deps: WatchdogIdentityDeps = {}): boolean {
+  const isAlive = deps.isAlive ?? pidAlive;
+  const commandOf = deps.commandOf ?? pidCommand;
+  if (!Number.isFinite(pid) || pid <= 0) return false;
+  if (!isAlive(pid)) return false;
+  const cmd = commandOf(pid);
+  if (cmd === undefined) return true; // no evidence → keep the single-instance guarantee
+  return isWatchdogCommand(cmd);
+}
+
+/** Injectable seams for ensureWatchdog, so the pid-recycle and version-takeover paths are testable
+ *  without spawning or signalling anything real. */
+export interface EnsureWatchdogDeps extends WatchdogIdentityDeps {
+  pidPath?: string;
+  /** Reads the pidfile; defaults to a sync read of `pidPath`. Undefined when absent/unreadable. */
+  readPidfile?: () => string | undefined;
+  /** SIGTERMs a stale-VERSION incumbent so it releases the pidfile; defaults to process.kill. */
+  killPid?: (pid: number, signal: NodeJS.Signals) => void;
+  /** Spawns the detached daemon; defaults to the real spawn below. */
+  spawnWatchdog?: () => void;
+  /** THIS build's version (the stamp a live incumbent is compared against). */
+  version?: string;
+}
+
+/** Ensure the detached liveness/self-heal watchdog is running the CURRENT build: if its pidfile is
+ *  missing, names a dead process, names a RECYCLED pid (alive but not a watchdog — see
+ *  watchdogHolderIsLive), or names a live watchdog running a DIFFERENT plugin version, spawn a fresh one
+ *  and let go of it (detached + unref'd, no stdio) so the caller never waits on it. A version-mismatched
+ *  incumbent is SIGTERMed first — exactly once per call, and only after the identity check proves it
+ *  really is our watchdog — so it releases the pidfile through its normal shutdown path instead of being
+ *  left to run stale code for the rest of its 30-min idle grace. The runtime is NOMO_RUNTIME (the run.sh
+ *  shim's resolved interpreter) when set, else this process's own execPath. Shared by the hook
+ *  (post-pair) and `pair` (so a mid-pairing config self-heals even if `wait` is never run). Best-effort
+ *  — a spawn failure just falls back to the worker's own staleness eviction / the next hook. */
+export function ensureWatchdog(deps: EnsureWatchdogDeps = {}): void {
   try {
-    let running = false;
-    try {
-      const pid = Number.parseInt(readFileSync(WATCHDOG_PID_PATH, "utf8").trim(), 10);
-      running = Number.isFinite(pid) && pid > 0 && pidAlive(pid);
-    } catch {
-      running = false; // no pidfile yet
+    const pidPath = deps.pidPath ?? WATCHDOG_PID_PATH;
+    const version = deps.version ?? PLUGIN_VERSION;
+    const readPidfile = deps.readPidfile ?? (() => {
+      try { return readFileSync(pidPath, "utf8"); } catch { return undefined; }
+    });
+    const killPid = deps.killPid ?? ((pid: number, signal: NodeJS.Signals) => process.kill(pid, signal));
+    const spawnWatchdog = deps.spawnWatchdog ?? (() => {
+      const runtime = process.env.NOMO_RUNTIME && process.env.NOMO_RUNTIME.length > 0
+        ? process.env.NOMO_RUNTIME
+        : process.execPath;
+      spawn(runtime, [WATCHDOG_PATH], { detached: true, stdio: "ignore" }).unref();
+    });
+    const raw = readPidfile();
+    const holder = typeof raw === "string" ? parseWatchdogPidfile(raw) : null;
+    if (holder && watchdogHolderIsLive(holder.pid, deps)) {
+      // A live watchdog on OUR build → nothing to do. A live watchdog on any other build (including an
+      // unstamped pre-upgrade one) is running stale code: retire it, then spawn the current bundle.
+      if (holder.version === version) return;
+      try { killPid(holder.pid, "SIGTERM"); } catch { /* raced its own exit — spawn anyway */ }
     }
-    if (running) return;
-    const runtime = process.env.NOMO_RUNTIME && process.env.NOMO_RUNTIME.length > 0
-      ? process.env.NOMO_RUNTIME
-      : process.execPath;
-    spawn(runtime, [WATCHDOG_PATH], { detached: true, stdio: "ignore" }).unref();
+    spawnWatchdog();
   } catch {
     // Couldn't start it → the Worker's staleness eviction / the next hook still applies.
   }

@@ -377,8 +377,10 @@ const DENY = '{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decisi
 
 /** A scripted fetch: `hold` decides the POST reply — a single boolean applies to every POST, or an
  *  array supplies a per-POST-call sequence (repeating the last entry) so the hold-retry re-POST can
- *  answer differently from the first. `gets` is the sequence of GET reply bodies. */
-function scriptFetch(hold: boolean | boolean[], gets: Array<Record<string, unknown> | "throw">) {
+ *  answer differently from the first. `gets` is the sequence of GET replies: an object is a 200 body,
+ *  "throw" is a transport failure, and a NUMBER is a non-2xx HTTP status with an empty body (used to
+ *  drive the definitive-status release). */
+function scriptFetch(hold: boolean | boolean[], gets: Array<Record<string, unknown> | "throw" | number>) {
   const calls: Array<{ url: string; method: string; body?: string }> = [];
   let g = 0;
   let p = 0;
@@ -390,6 +392,7 @@ function scriptFetch(hold: boolean | boolean[], gets: Array<Record<string, unkno
     // GET /v1/cc/decision/<id>
     const next = gets[Math.min(g++, gets.length - 1)];
     if (next === "throw") throw new Error("network");
+    if (typeof next === "number") return new Response("", { status: next });
     return new Response(JSON.stringify(next), { status: 200 });
   }) as unknown as typeof fetch;
   return { fn, calls };
@@ -491,6 +494,28 @@ describe("runPermissionHook — hold state machine", () => {
     expect("permissionDetail" in fb).toBe(false);
   });
 
+  // `at` — the sort/age key every OTHER frame has carried since v1.1.6 (epoch SECONDS, not the envelope's
+  // ms `ts`). buildBlob takes it as its 9th argument; the held frames were calling it with 8, so a
+  // decisionPending row reached the phone with no honest event time at all — and the codex E2E vector
+  // (cc-e2e-test-vectors.json: status decisionPending, "at": 1784937605) described a frame the plugin
+  // never actually emitted. Both sealed variants carry it, since both derive from the same base blob.
+  test("the held frame carries `at` (epoch SECONDS of the event) in BOTH the blob and the fallbackBlob", async () => {
+    const nowMs = 1_784_937_605_400;                                  // the vector's epoch second, plus 400 ms
+    const { fn, calls } = scriptFetch(false, []);
+    await runPermissionHook(baseDeps({ fetchFn: fn, emit: () => {}, now: () => nowMs }) as never);
+    const body = JSON.parse(calls.find((c) => c.method === "POST")!.body!);
+    const blob = (await decryptBlob(KEY, body.blob)) as Record<string, unknown>;
+    const fb = (await decryptBlob(KEY, body.fallbackBlob)) as Record<string, unknown>;
+    expect(blob.at).toBe(1_784_937_605);                              // FLOORED seconds, the vector's shape
+    expect(fb.at).toBe(1_784_937_605);
+    expect(body.ts).toBe(nowMs);                                      // the envelope stays in MILLIseconds
+    // Appended LAST in the base blob — i.e. immediately BEFORE the permission tail, so the frozen
+    // append-only order of the permission keys is untouched.
+    const keys = Object.keys(blob);
+    expect(keys[keys.indexOf("permissionSummary") - 1]).toBe("at");
+    expect(Object.keys(fb).at(-1)).toBe("at");
+  });
+
   test("hold=true, answered allow → emits exactly the allow line", async () => {
     const answerBlob = await encryptBlob(KEY, { requestId: "req-fixed", decision: "allow", ts: 5 });
     const emitted: string[] = [];
@@ -539,6 +564,60 @@ describe("runPermissionHook — hold state machine", () => {
     expect(calls.filter((c) => c.method === "GET").length).toBe(100); // MAX_CONSECUTIVE_MISSES
   });
 
+  // DEFINITIVE poll statuses. 401/403/404/410 mean this pairing can never read this record (unauthorized /
+  // revoked / GC'd), so waiting out the ~5.4 min transient cap blocks the terminal for an outcome already
+  // known. Two consecutive strikes (one can be a racing delete/deploy) release at once — the same
+  // gone-strike shape runHook uses.
+  for (const status of [401, 403, 404, 410]) {
+    test(`poll HTTP ${status} twice → releases immediately (2 GETs, not the 100-miss cap)`, async () => {
+      const emitted: string[] = [];
+      const events: Array<{ event: string; [k: string]: unknown }> = [];
+      const { fn, calls } = scriptFetch(true, [status]);
+      await runPermissionHook(baseDeps({
+        fetchFn: fn, emit: (l: string) => emitted.push(l),
+        trace: (e: { event: string }) => events.push(e as { event: string }),
+      }) as never);
+      expect(emitted).toEqual([]);
+      expect(calls.filter((c) => c.method === "GET").length).toBe(2); // MAX_DEFINITIVE_POLL_FAILURES
+      expect(events.find((e) => e.event === "giveup")).toMatchObject({ reason: "definitive", status, strikes: 2 });
+      expect(events.at(-1)).toMatchObject({ event: "exit", reason: "definitive" });
+    });
+  }
+
+  test("a SINGLE definitive status is tolerated — a racing delete/deploy must not kill a live hold", async () => {
+    const answerBlob = await encryptBlob(KEY, { requestId: "req-fixed", decision: "allow", ts: 5 });
+    const emitted: string[] = [];
+    const { fn, calls } = scriptFetch(true, [404, { status: "pending" }, 404, { status: "answered", answerBlob }]);
+    await runPermissionHook(baseDeps({ fetchFn: fn, emit: (l: string) => emitted.push(l) }) as never);
+    expect(emitted).toEqual([ALLOW]);                                  // the strike streak is broken by the 200
+    expect(calls.filter((c) => c.method === "GET").length).toBe(4);
+  });
+
+  test("429/5xx stay TRANSIENT — they ride the miss cap, never the definitive release", async () => {
+    const emitted: string[] = [];
+    const { fn, calls } = scriptFetch(true, [429, 500]);                // 500 repeats forever after the 429
+    await runPermissionHook(baseDeps({ fetchFn: fn, emit: (l: string) => emitted.push(l) }) as never);
+    expect(emitted).toEqual([]);
+    expect(calls.filter((c) => c.method === "GET").length).toBe(100);   // MAX_CONSECUTIVE_MISSES, unchanged
+  });
+
+  test("unparseable stdin → silent fail-open, and the trace records the CLASS only (never the payload)", async () => {
+    const events: Array<{ event: string; [k: string]: unknown }> = [];
+    const emitted: string[] = [];
+    const secret = "curl -H 'authorization: Bearer sk-super-secret-token' https://x";
+    const fn = (async () => { throw new Error("must not fetch"); }) as unknown as typeof fetch;
+    await runPermissionHook(baseDeps({
+      fetchFn: fn, emit: (l: string) => emitted.push(l),
+      readInput: async () => `{"tool_input":{"command":"${secret}"}`,   // truncated JSON — a real hook payload
+      trace: (e: { event: string }) => events.push(e as { event: string }),
+    }) as never);
+    expect(emitted).toEqual([]);
+    expect(events.at(-1)).toMatchObject({ event: "exit", reason: "bad-stdin", error: "SyntaxError" });
+    // The whole point: nothing the parser quoted back at us reaches the on-disk trace.
+    expect(JSON.stringify(events)).not.toContain("sk-super-secret-token");
+    expect(JSON.stringify(events)).not.toContain("curl");
+  });
+
   test("network error on the POST → fail open, silent, no throw", async () => {
     const emitted: string[] = [];
     const fn = (async () => { throw new Error("down"); }) as unknown as typeof fetch;
@@ -574,15 +653,77 @@ describe("runPermissionHook — hold state machine", () => {
     const emitted: string[] = [];
     const events: Array<{ event: string; attempt?: number; reason?: string }> = [];
     let postCount = 0;
-    const fn = (async () => { postCount += 1; const e = new Error("timeout"); e.name = "TimeoutError"; throw e; }) as unknown as typeof fetch;
+    let probeCount = 0;
+    const fn = (async (url: string) => {
+      if (url.endsWith("/v1/cc/decision")) postCount += 1; else probeCount += 1;
+      const e = new Error("timeout"); e.name = "TimeoutError"; throw e;
+    }) as unknown as typeof fetch;
     await runPermissionHook(baseDeps({
       fetchFn: fn, emit: (l: string) => emitted.push(l),
       trace: (e: { event: string; attempt?: number; reason?: string }) => events.push(e),
     }) as never);
     expect(postCount).toBe(2);
+    expect(probeCount).toBe(1);            // ONE did-it-land probe, which also failed → the old fail-open
     expect(emitted).toEqual([]);
     expect(events.filter((e) => e.event === "posted").map((e) => e.attempt)).toEqual([1, 2]);
     expect(events.at(-1)).toMatchObject({ event: "exit", reason: "post-error" });
+  });
+
+  // BOTH POSTs timing out CLIENT-side says nothing about whether the first one LANDED. If it did, the
+  // worker is holding a real record and the phone is showing the card — exiting fail-open there makes the
+  // phone lie (a tap is applied to nothing). One cheap GET distinguishes the two worlds.
+  test("both POSTs time out but the request LANDED → the probe finds it and the hold is honored", async () => {
+    const answerBlob = await encryptBlob(KEY, { requestId: "req-fixed", decision: "allow", ts: 5 });
+    const gets: Array<Record<string, unknown>> = [{ status: "pending" }, { status: "answered", answerBlob }];
+    const emitted: string[] = [];
+    const events: Array<{ event: string; [k: string]: unknown }> = [];
+    let postCount = 0;
+    let g = 0;
+    const fn = (async (url: string) => {
+      if (url.endsWith("/v1/cc/decision")) {
+        postCount += 1;                                       // the worker RECEIVED both, the client gave up
+        const e = new Error("timeout"); e.name = "TimeoutError"; throw e;
+      }
+      return new Response(JSON.stringify(gets[Math.min(g++, gets.length - 1)]), { status: 200 });
+    }) as unknown as typeof fetch;
+    await runPermissionHook(baseDeps({
+      fetchFn: fn, emit: (l: string) => emitted.push(l),
+      trace: (e: { event: string }) => events.push(e as { event: string }),
+    }) as never);
+    expect(postCount).toBe(2);
+    expect(emitted).toEqual([ALLOW]);                          // the phone's Allow was honored, not dropped
+    expect(events.find((e) => e.event === "post-timeout-landed")).toMatchObject({ status: "pending" });
+  });
+
+  test("both POSTs time out and NOTHING landed (no record) → fail open, exactly one probe", async () => {
+    const emitted: string[] = [];
+    const events: Array<{ event: string; reason?: string }> = [];
+    let getCount = 0;
+    const fn = (async (url: string) => {
+      if (url.endsWith("/v1/cc/decision")) { const e = new Error("timeout"); e.name = "TimeoutError"; throw e; }
+      getCount += 1;
+      return new Response("", { status: 404 });               // no such record — the POSTs really never landed
+    }) as unknown as typeof fetch;
+    await runPermissionHook(baseDeps({
+      fetchFn: fn, emit: (l: string) => emitted.push(l),
+      trace: (e: { event: string; reason?: string }) => events.push(e),
+    }) as never);
+    expect(emitted).toEqual([]);
+    expect(getCount).toBe(1);                                  // bounded: one request, then out
+    expect(events.at(-1)).toMatchObject({ event: "exit", reason: "post-error" });
+  });
+
+  test("both POSTs time out and the landed record is already terminal → fail open (no hold on a dead record)", async () => {
+    const emitted: string[] = [];
+    let getCount = 0;
+    const fn = (async (url: string) => {
+      if (url.endsWith("/v1/cc/decision")) { const e = new Error("timeout"); e.name = "TimeoutError"; throw e; }
+      getCount += 1;
+      return new Response(JSON.stringify({ status: "expired" }), { status: 200 });
+    }) as unknown as typeof fetch;
+    await runPermissionHook(baseDeps({ fetchFn: fn, emit: (l: string) => emitted.push(l) }) as never);
+    expect(emitted).toEqual([]);
+    expect(getCount).toBe(1);
   });
 
   test("unpaired (no config) → no output, no network at all", async () => {
@@ -818,17 +959,45 @@ describe("runPermissionHook — always-allow / deny-message / unknown decision",
     expect(emitted).toEqual([ALLOW]);
   });
 
-  test("UNKNOWN decision → nothing emitted, keeps polling; a later allow answers normally", async () => {
+  // UNKNOWN VERB — bounded, because an `answered` record is TERMINAL. The worker 409s any re-answer and
+  // serves the SAME answerBlob for the record's whole 24h TTL, so a verb this plugin cannot understand can
+  // never turn into one it can: the old unbounded "keep-polling" froze the terminal for the hook's full
+  // 86400 s timeout (~26k doomed GETs) while the phone showed "answered".
+  //
+  // (The previous version of this test scripted a DIFFERENT answerBlob on the second GET of the same
+  // requestId — a response the real worker cannot produce — so it certified a scenario that does not exist
+  // and hid exactly this bug. The reality is the SAME blob, forever.)
+  test("UNKNOWN decision on a TERMINAL record → nothing emitted and the hold RELEASES after a small bound", async () => {
+    const unknownBlob = await encryptBlob(KEY, { requestId: "req-fixed", decision: "some_future_verb", ts: 5 });
+    const emitted: string[] = [];
+    const events: Array<{ event: string; [k: string]: unknown }> = [];
+    // The worker serves this identical terminal record on EVERY poll (scriptFetch repeats the last entry).
+    const { fn, calls } = scriptFetch(true, [{ status: "answered", answerBlob: unknownBlob }]);
+    await runPermissionHook(baseDeps({
+      fetchFn: fn, emit: (l: string) => emitted.push(l),
+      trace: (e: { event: string }) => events.push(e as { event: string }),
+    }) as never);
+    expect(emitted).toEqual([]);                                         // never guessed a line for the unknown verb
+    expect(calls.filter((c) => c.method === "GET").length).toBe(3);      // MAX_UNKNOWN_ANSWER_READS — then it lets go
+    expect(events.find((e) => e.event === "release")).toMatchObject({ reason: "unknown-decision-terminal", reads: 3 });
+    expect(events.at(-1)).toMatchObject({ event: "exit", reason: "unknown-decision" });
+  });
+
+  test("forward-compat polling SURVIVES: pending polls don't spend the bound, and a KNOWN verb still lands", async () => {
     const unknownBlob = await encryptBlob(KEY, { requestId: "req-fixed", decision: "some_future_verb", ts: 5 });
     const allowBlob = await encryptBlob(KEY, { requestId: "req-fixed", decision: "allow", ts: 6 });
     const emitted: string[] = [];
+    // Two pending polls, then ONE unknown read, then the record is superseded by a NEW answer the plugin
+    // does understand (a different answerBlob → the bound resets). All still inside MAX_UNKNOWN_ANSWER_READS.
     const { fn, calls } = scriptFetch(true, [
+      { status: "pending" },
+      { status: "pending" },
       { status: "answered", answerBlob: unknownBlob },
       { status: "answered", answerBlob: allowBlob },
     ]);
     await runPermissionHook(baseDeps({ fetchFn: fn, emit: (l: string) => emitted.push(l) }) as never);
-    expect(emitted).toEqual([ALLOW]);                                    // never guessed a line for the unknown verb
-    expect(calls.filter((c) => c.method === "GET").length).toBe(2);      // kept polling PAST the unknown answer
+    expect(emitted).toEqual([ALLOW]);
+    expect(calls.filter((c) => c.method === "GET").length).toBe(4);
   });
 });
 
@@ -1175,18 +1344,75 @@ describe("runPermissionHook — AskUserQuestion holds", () => {
     });
   });
 
-  test("multi-question → answers zip BY INDEX, in the original question order; empties are skipped", async () => {
+  test("multi-question → answers zip BY INDEX, in the original question order", async () => {
     const qs = [
       { question: "First?", options: [{ label: "A" }, { label: "B" }] },
       { question: "Second?", options: [{ label: "C" }, { label: "D" }] },
     ];
     const { emitted } = await answerQuestion(
-      { decision: "answer", answers: ["B", ""] },
+      { decision: "answer", answers: ["B", "C"] },
       { readInput: async () => questionInput(qs) },
     );
     const updatedInput = JSON.parse(emitted[0]).hookSpecificOutput.decision.updatedInput;
     expect(updatedInput.questions).toEqual(qs);
-    expect(updatedInput.answers).toEqual({ "First?": "B" }); // the unanswered question is simply absent
+    expect(updatedInput.answers).toEqual({ "First?": "B", "Second?": "C" });
+  });
+
+  // POLICY CHANGE (review fix): a PARTIAL answers map is no longer emitted. This used to send
+  // {"First?":"B"} for a two-question payload and leave the second key absent — but CC's behavior on a
+  // partial map is unverified (the tool body is a pass-through, so a missing key may read as an empty
+  // pick), and telling the session something the user never said is exactly what the release rule exists
+  // to prevent. A gap in the answers ⇒ release to the terminal picker, like every other unrepresentable
+  // answer. Each RELEASE case asserts nothing on stdout AND that the hold let go (one GET only).
+  for (const [name, answers] of [
+    ["an empty-string answer for the 2nd question", ["B", ""]],
+    ["a whitespace-only answer for the 2nd question", ["B", "   "]],
+    ["a SHORT answers array (2nd question missing entirely)", ["B"]],
+    ["a non-string entry for the 2nd question", ["B", null]],
+  ] as Array<[string, unknown[]]>) {
+    test(`RELEASE: ${name} → NO partial map is ever emitted`, async () => {
+      const qs = [
+        { question: "First?", options: [{ label: "A" }, { label: "B" }] },
+        { question: "Second?", options: [{ label: "C" }, { label: "D" }] },
+      ];
+      const answerBlob = await encryptBlob(KEY, { requestId: "req-fixed", ts: 5, decision: "answer", answers });
+      const laterBlob = await encryptBlob(KEY, { requestId: "req-fixed", ts: 6, decision: "deny" });
+      const emitted: string[] = [];
+      const { fn, calls } = scriptFetch(true, [
+        { status: "answered", answerBlob },
+        { status: "answered", answerBlob: laterBlob }, // must never be reached — the hold is already gone
+      ]);
+      await runPermissionHook(baseDeps({
+        fetchFn: fn, emit: (l: string) => emitted.push(l), readInput: async () => questionInput(qs),
+      }) as never);
+      expect(emitted).toEqual([]);
+      expect(calls.filter((c) => c.method === "GET").length).toBe(1);
+    });
+  }
+
+  // DUPLICATE QUESTION TEXT: `answers` is keyed by question text, so two identical questions collapse onto
+  // ONE key — the second answer overwrites the first and one question ends up answered with the other's
+  // pick. Nothing on the wire can disambiguate them, so the payload is unanswerable: same policy as an
+  // ambiguous option label.
+  test("RELEASE: two questions with the IDENTICAL text → the collapsing map is never emitted", async () => {
+    const qs = [
+      { question: "Which one?", options: [{ label: "A" }, { label: "B" }] },
+      { question: "Which one?", options: [{ label: "C" }, { label: "D" }] },
+    ];
+    const answerBlob = await encryptBlob(KEY, {
+      requestId: "req-fixed", ts: 5, decision: "answer", answers: ["A", "D"],
+    });
+    const laterBlob = await encryptBlob(KEY, { requestId: "req-fixed", ts: 6, decision: "deny" });
+    const emitted: string[] = [];
+    const { fn, calls } = scriptFetch(true, [
+      { status: "answered", answerBlob },
+      { status: "answered", answerBlob: laterBlob },
+    ]);
+    await runPermissionHook(baseDeps({
+      fetchFn: fn, emit: (l: string) => emitted.push(l), readInput: async () => questionInput(qs),
+    }) as never);
+    expect(emitted).toEqual([]);                                     // never {"Which one?":"D"} for BOTH
+    expect(calls.filter((c) => c.method === "GET").length).toBe(1);  // hold released
   });
 
   test("a SKIPPED malformed question can't shift the mapping — answers zip against what the phone was shown", async () => {
