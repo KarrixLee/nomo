@@ -2,10 +2,10 @@ import { createRequire } from "node:module";
 var __require = /* @__PURE__ */ createRequire(import.meta.url);
 
 // src/core/permission.ts
-import { unlink as unlink3 } from "node:fs/promises";
+import { realpath, unlink as unlink3 } from "node:fs/promises";
 import { appendFileSync, statSync, truncateSync } from "node:fs";
 import { hostname as hostname2 } from "node:os";
-import { basename as basename3 } from "node:path";
+import { basename as basename3, isAbsolute, relative, resolve } from "node:path";
 
 // src/core/hook.ts
 import { readdir as readdir2, readFile as readFile3, unlink as unlink2 } from "node:fs/promises";
@@ -97,7 +97,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { execFileSync, spawn } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "1.3.1";
+var PLUGIN_VERSION = "1.4.3";
 var CC_DIR = `${process.env.HOME}/.config/cc-status`;
 var SESSIONS_DIR = `${CC_DIR}/sessions`;
 var WATCHDOG_PID_PATH = `${CC_DIR}/watchdog.pid`;
@@ -1470,8 +1470,6 @@ async function buildEnvelope(input, machine, now, title, e2eKey, sentDone, agent
   const base = { v: 2, sessionId: i.session_id, op: plan.op, prio: plan.prio, ts: now };
   if (typeof startedAt === "number" && Number.isFinite(startedAt))
     base.startedAt = startedAt;
-  if (plan.op === "end")
-    return base;
   const at = Math.floor(now / 1000);
   const blob = await encryptBlob(e2eKey, buildBlob(i, machine, title, plan, agent, turnStartedAt, pinnedLabel, model, at));
   const attentionKind = agent === "codex" && hookName === "PreToolUse" && i.tool_name === "request_user_input" ? "userInput" : undefined;
@@ -1511,6 +1509,7 @@ async function trackSession(sessionId, op, prio, status, blob, machine, label, t
       transcript,
       lastEvent: op === "start" ? "sessionStart" : status,
       sentDone: op === "done",
+      ...op === "done" ? { donePending: true } : {},
       op,
       prio,
       ...blob ? { blob } : {},
@@ -1523,6 +1522,14 @@ async function trackSession(sessionId, op, prio, status, blob, machine, label, t
       ...typeof pairingId === "string" && pairingId.length > 0 ? { pairingId } : {}
     };
     await atomicWrite(path, JSON.stringify(record), 384);
+  } catch {}
+}
+async function markDoneDelivered(sessionId) {
+  try {
+    const record = await readRecord(sessionId);
+    if (!record || record.donePending !== true)
+      return;
+    await atomicWrite(`${SESSIONS_DIR}/${sessionId}.json`, JSON.stringify({ ...record, donePending: undefined }), 384);
   } catch {}
 }
 async function reconcileProvisional(config, hookPid) {
@@ -1674,6 +1681,8 @@ async function runHook(agent) {
     if (res.ok) {
       await atomicWrite(LAST_SEND_PATH, String(Date.now()));
       await resetGoneStrikes();
+      if (plan.op === "done")
+        await markDoneDelivered(input.session_id);
     } else if (res.status === 404 || res.status === 410) {
       const strikes = await recordGoneStrike();
       if (strikes >= GONE_STRIKE_LIMIT) {
@@ -1696,6 +1705,96 @@ var POST_RETRY_PAUSE_MS = 1000;
 var HOLD_RETRY_DELAY_MS = 4000;
 var FRESH_SESSION_MS = 60000;
 var MAX_CONSECUTIVE_MISSES = 100;
+var CODEX_POLICY_TAIL_BYTES = 8 * 1024 * 1024;
+var CODEX_ROLLOUT_HEAD_BYTES = 1024 * 1024;
+function codexTurnPolicyFromRollout(text, turnId) {
+  if (turnId.length === 0)
+    return null;
+  const lines = text.split(`
+`);
+  for (let i = lines.length - 1;i >= 0; i -= 1) {
+    const line = lines[i];
+    if (!line.includes("turn_context") || !line.includes(turnId))
+      continue;
+    let row;
+    try {
+      row = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (typeof row !== "object" || row === null)
+      continue;
+    const record = row;
+    if (record.type !== "turn_context")
+      continue;
+    const payload = record.payload;
+    if (typeof payload !== "object" || payload === null)
+      continue;
+    const context = payload;
+    if (context.turn_id !== turnId)
+      continue;
+    const sandbox = typeof context.sandbox_policy === "object" && context.sandbox_policy !== null ? context.sandbox_policy : undefined;
+    const profile = typeof context.permission_profile === "object" && context.permission_profile !== null ? context.permission_profile : undefined;
+    return {
+      approvalPolicy: context.approval_policy,
+      approvalsReviewer: typeof context.approvals_reviewer === "string" ? context.approvals_reviewer : undefined,
+      sandboxType: typeof sandbox?.type === "string" ? sandbox.type : undefined,
+      permissionProfileType: typeof profile?.type === "string" ? profile.type : undefined
+    };
+  }
+  return null;
+}
+function codexRolloutSessionId(text) {
+  for (const line of text.split(`
+`)) {
+    if (!line.includes("session_meta"))
+      continue;
+    let row;
+    try {
+      row = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (typeof row !== "object" || row === null)
+      continue;
+    const record = row;
+    if (record.type !== "session_meta")
+      continue;
+    const id = record.payload?.id;
+    return typeof id === "string" && id.length > 0 ? id : undefined;
+  }
+  return;
+}
+async function loadCodexTurnPolicy(transcriptPath, turnId, sessionId, home = codexHome()) {
+  if (!transcriptPath || !turnId || !sessionId || !basename3(transcriptPath).match(/^rollout-.*\.jsonl$/))
+    return null;
+  try {
+    const sessionsRoot = await realpath(resolve(home, "sessions"));
+    const rollout = await realpath(transcriptPath);
+    const rel = relative(sessionsRoot, rollout);
+    if (rel === "" || rel.startsWith("..") || isAbsolute(rel))
+      return null;
+    const head = await readPrefix(rollout, CODEX_ROLLOUT_HEAD_BYTES);
+    if (codexRolloutSessionId(head) !== sessionId)
+      return null;
+    return codexTurnPolicyFromRollout(await readSuffix(rollout, CODEX_POLICY_TAIL_BYTES), turnId);
+  } catch {
+    return null;
+  }
+}
+function codexPassThroughReason(policy) {
+  if (!policy)
+    return "codex-context-unknown";
+  if (policy.approvalPolicy === "never")
+    return "codex-full-access";
+  const guardianReviewer = policy.approvalsReviewer === "auto_review" || policy.approvalsReviewer === "guardian_subagent";
+  const reviewablePolicy = policy.approvalPolicy === "on-request" || policy.approvalPolicy === "granular" || typeof policy.approvalPolicy === "object" && policy.approvalPolicy !== null;
+  if (guardianReviewer && reviewablePolicy)
+    return "codex-auto-review";
+  if (policy.approvalPolicy === "untrusted" || policy.approvalsReviewer === "user")
+    return;
+  return "codex-context-unknown";
+}
 function decisionLine(agent, hookSpecificOutput) {
   return JSON.stringify(agent === "codex" ? { continue: true, hookSpecificOutput } : { hookSpecificOutput });
 }
@@ -1752,7 +1851,7 @@ function answerLine(agent, toolName, toolInput, answers) {
 }
 function resolveAnswer(answer, labels) {
   const matchOne = (piece) => {
-    const hits = Array.from(new Set(labels.filter((l) => l === piece || cap(l, QUESTION_LABEL_MAX) === piece)));
+    const hits = Array.from(new Set(labels.filter((l) => l === piece || capPermissionWireText(l, PERMISSION_QUESTION_LABEL_MAX) === piece)));
     return hits.length === 1 ? hits[0] : undefined;
   };
   const whole = matchOne(answer);
@@ -1899,9 +1998,10 @@ function buildPermissionDetail(toolName, toolInput) {
   }
 }
 var QUESTION_TEXT_MAX = 240;
-var QUESTION_LABEL_MAX = 60;
-function cap(s, n) {
-  return s.length <= n ? s : `${s.slice(0, n - 1)}…`;
+var PERMISSION_QUESTION_LABEL_MAX = 60;
+function capPermissionWireText(value, max) {
+  const characters = Array.from(value);
+  return characters.length <= max ? value : `${characters.slice(0, max - 1).join("")}…`;
 }
 function usableQuestions(toolInput) {
   const qs = toolInput.questions;
@@ -1931,10 +2031,10 @@ function firstQuestionText(toolInput) {
 }
 function buildPermissionQuestions(toolInput) {
   return usableQuestions(toolInput).map(({ text, raw, labels }) => ({
-    q: cap(text, QUESTION_TEXT_MAX),
+    q: capPermissionWireText(text, QUESTION_TEXT_MAX),
     ...typeof raw?.header === "string" && raw.header.length > 0 ? { h: raw.header } : {},
     ...raw?.multiSelect === true ? { m: true } : {},
-    o: labels.map((l) => cap(l, QUESTION_LABEL_MAX))
+    o: labels.map((l) => capPermissionWireText(l, PERMISSION_QUESTION_LABEL_MAX))
   }));
 }
 var MAX_BLOB_CHARS = 3072;
@@ -2064,6 +2164,19 @@ async function runPermissionHook(deps = {}, agent = "claude") {
       const codexDialogMode = agent === "codex" && (permissionMode === "acceptEdits" || permissionMode === "plan");
       trace({ event: "exit", reason: "mode", mode: permissionMode, ...codexDialogMode ? { codex_dialog_mode: true } : {} });
       return;
+    }
+    if (agent === "codex" && !toolName.startsWith("mcp__")) {
+      const transcriptPath = typeof input.transcript_path === "string" ? input.transcript_path : "";
+      const turnId = typeof input.turn_id === "string" ? input.turn_id : "";
+      const policy = await (deps.loadCodexTurnPolicyFn ?? loadCodexTurnPolicy)(transcriptPath, turnId, sessionId);
+      const reason = codexPassThroughReason(policy);
+      if (reason) {
+        trace({ event: "exit", reason });
+        return;
+      }
+      trace({ event: "codex-reviewer", disposition: "hold", reason: "manual" });
+    } else if (agent === "codex") {
+      trace({ event: "codex-reviewer", disposition: "hold", reason: "mcp-reviewer-unknown" });
     }
     const toolInput = typeof input.tool_input === "object" && input.tool_input !== null ? input.tool_input : {};
     const suggestions = input.permission_suggestions;

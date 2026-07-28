@@ -8,7 +8,7 @@ import { parseConfig, PendingEventStash, readRecord, SessionRecord, SESSIONS_DIR
 import {
   aiTitle, buildBlob, buildEnvelope, buildPendingStash, cleanPromptTitle, codexIndexTitle, codexSessionTitle,
   codexThreadName, detailForHook, firstUserPrompt, isPermissionNotification, planOp, sessionTitle,
-  stashPendingEvent, trackSession, transcriptStartMs,
+  markDoneDelivered, stashPendingEvent, trackSession, transcriptStartMs,
 } from "./cc-status";
 import { provisionalsCoveredByReal, reconcileProvisionalsSweep } from "./cc-watchdog";
 import { hooksAppearStale, parseCodexPluginState, statusCmd } from "./status-cmd";
@@ -445,10 +445,10 @@ describe("buildEnvelope (v2 envelope + encrypted blob)", () => {
     expect(permission).not.toHaveProperty("attentionKind");
   });
 
-  test("SessionEnd → op end with NO blob", async () => {
+  test("SessionEnd → op end with a terminal blob", async () => {
     const env = (await buildEnvelope({ session_id: "abc", hook_event_name: "SessionEnd", cwd: "/x" }, "m", 5, "t", KEY, false))!;
-    expect(env).toEqual({ v: 2, sessionId: "abc", op: "end", prio: 0, ts: 5 });
-    expect(env).not.toHaveProperty("blob");
+    expect(env).toMatchObject({ v: 2, sessionId: "abc", op: "end", prio: 0, ts: 5 });
+    expect(await decryptBlob(KEY, env.blob as string)).toMatchObject({ status: "done" });
   });
 
   test("re-arm: a SessionStart after done builds op update, not start", async () => {
@@ -472,7 +472,8 @@ describe("buildEnvelope (v2 envelope + encrypted blob)", () => {
 
   test("startedAt rides even on an op:end envelope (the worker times its final frame too)", async () => {
     const env = (await buildEnvelope({ session_id: "abc", hook_event_name: "SessionEnd", cwd: "/x" }, "m", 5, "t", KEY, false, "claude", 42))!;
-    expect(env).toEqual({ v: 2, sessionId: "abc", op: "end", prio: 0, ts: 5, startedAt: 42 });
+    expect(env).toMatchObject({ v: 2, sessionId: "abc", op: "end", prio: 0, ts: 5, startedAt: 42 });
+    expect(await decryptBlob(KEY, env.blob as string)).toMatchObject({ status: "done" });
   });
 
   test("a non-finite startedAt is dropped from the envelope", async () => {
@@ -607,7 +608,7 @@ describe("buildPendingStash (plaintext event stashed while pairing is pending)",
     expect(buildPendingStash({ session_id: "s", hook_event_name: "Notification", message: "waiting for your input" }, "m", "t", 1)).toBeNull();
     expect(buildPendingStash({ hook_event_name: "Stop" }, "m", "t", 1)).toBeNull();
   });
-  test("returns null for an op:end (SessionEnd) — no blob for a session the worker has never seen", () => {
+  test("returns null for an op:end (SessionEnd) — don't materialize history before pairing completes", () => {
     expect(buildPendingStash({ session_id: "s", hook_event_name: "SessionEnd", cwd: "/x" }, "m", "t", 1)).toBeNull();
   });
   test("a UserPromptSubmit stash stamps turnStartedAt (floor(now/1000)); any other hook omits it", () => {
@@ -849,6 +850,38 @@ describe("trackSession + readRecord file glue (sentDone survives a fresh disk re
     }
   });
 
+  // The done-delivery ACK marker. trackSession runs BEFORE the POST, so `sentDone` can only ever mean
+  // "a done was RECORDED"; `donePending` is the separate, pessimistic "…and nobody has confirmed the
+  // worker got it". The two must not be conflated: sentDone keeps driving planOp's re-arm and
+  // codex-notify's dedupe, while only the marker drives the watchdog's re-POST.
+  test("a done write stamps donePending alongside sentDone; markDoneDelivered clears ONLY the marker", async () => {
+    const sessionId = `test-ack-${randomUUID()}`;
+    try {
+      await trackSession(sessionId, "done", 0, "done", "ENCRYPTEDBLOB", "mac", "proj", "/tmp/t.jsonl");
+      expect((await readRecord(sessionId))?.donePending).toBe(true);
+
+      await markDoneDelivered(sessionId); // what the hook calls on a confirmed 2xx
+      const acked = await readRecord(sessionId);
+      expect(acked?.donePending).toBeUndefined();
+      // sentDone's meaning is untouched, so the next SessionStart still re-arms to `update`.
+      expect(acked?.sentDone).toBe(true);
+      expect(acked?.op).toBe("done");
+      expect(acked?.blob).toBe("ENCRYPTEDBLOB");
+      expect(planOp("SessionStart", { session_id: sessionId, cwd: "/x" }, acked?.sentDone === true))
+        .toEqual({ op: "update", prio: 0, status: "working" });
+
+      // Idempotent, and a NON-done event never carries the marker (only a done can owe a delivery).
+      await markDoneDelivered(sessionId);
+      expect((await readRecord(sessionId))?.donePending).toBeUndefined();
+      await trackSession(sessionId, "update", 0, "working", "B", "mac", "proj", "/tmp/t.jsonl");
+      const working = await readRecord(sessionId);
+      expect(working?.donePending).toBeUndefined();
+      expect(working?.sentDone).toBe(false);
+    } finally {
+      await unlink(`${SESSIONS_DIR}/${sessionId}.json`).catch(() => {});
+    }
+  });
+
   test("op:end deletes the record instead of writing sentDone (nothing left to re-read)", async () => {
     const sessionId = `test-glue-${randomUUID()}`;
     try {
@@ -1017,6 +1050,7 @@ describe("statusCmd — Codex plugin detection states", () => {
         watchdogPidPath: join(dir, "watchdog.pid"),
         codexConfigPath,
         codexHooksPath,
+        codexAppServerAvailable: async () => false,
         isAlive: () => false,
         now: () => 0,
       });
@@ -1026,6 +1060,24 @@ describe("statusCmd — Codex plugin detection states", () => {
     }
   }
   const pluginLine = (lines: string[]): string => lines.find((l) => l.startsWith("Codex plugin:"))!;
+
+  test("reports whether the responder-backed Codex Plan bridge is actually available", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "cc-status-bridge-"));
+    try {
+      for (const available of [false, true]) {
+        const lines: string[] = [];
+        await statusCmd({
+          print: (line) => lines.push(line),
+          configPath: join(dir, "config.json"), codexConfigPath: join(dir, "config.toml"),
+          codexHooksPath: join(dir, "hooks.json"), codexAppServerAvailable: async () => available,
+        });
+        const bridge = lines.find((line) => line.startsWith("Codex Plan answers:"));
+        expect(bridge).toContain(available ? "bridge available" : "status-only");
+      }
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
 
   test("statusCmd always returns exit code 0 (not-paired/absent is information, not an error)", async () => {
     const dir = await mkdtemp(join(tmpdir(), "cc-status-exit-"));
@@ -1853,6 +1905,77 @@ describe("runHook gone-strike teardown (revoked pairing stops POSTing forever)",
       srv.close();
       await rm(home, { recursive: true, force: true });
     }
+  }, 20000);
+});
+
+// --- runHook done-delivery ack (the Stop that landed on disk but never on the worker) ------------
+//
+// trackSession persists the record BEFORE the POST is attempted, and the whole hook body sits inside a
+// blanket catch — so a Stop whose POST 500s, times out on the 2 s AbortSignal, or throws used to leave
+// sentDone:true on disk while the worker still held the previous op:"update". Every watchdog self-heal
+// net gates itself off on that done state, so nothing ever repaired it (live incident 2026-07-26: the
+// phone showed a finished session running for ~13 h). The fix is an ack marker the hook only clears on a
+// confirmed 2xx. Spawning the REAL entry against a scripted server is the faithful way to exercise it —
+// a mocked fetch would not reproduce the write-before-POST ordering that causes the bug.
+describe("runHook done-delivery ack (donePending survives a failed Stop POST, clears on a 2xx)", () => {
+  const rawKey = new Uint8Array(32).fill(9);
+  const entry = join(import.meta.dir, "cc-status.ts");
+
+  // `url` undefined → point the hook at the discard port (127.0.0.1:9) so its fetch fails outright,
+  // standing in for the network-error / timeout arm that never reaches the post-POST bookkeeping.
+  async function runStop(status?: number): Promise<SessionRecord | null> {
+    const server = status === undefined ? null : Bun.serve({
+      port: 0,
+      fetch: () => new Response(status === 200 ? "{}" : "nope", { status }),
+    });
+    const url = server ? `http://127.0.0.1:${server.port}` : "http://127.0.0.1:9";
+    const home = await mkdtemp(join(tmpdir(), "cc-hook-ack-"));
+    try {
+      const ccDir = join(home, ".config", "cc-status");
+      await mkdir(join(ccDir, "sessions"), { recursive: true });
+      await writeFile(join(ccDir, "config.json"), JSON.stringify({
+        url, pairingId: "p", pcSecret: "s", e2eKeyB64: b64url(rawKey),
+      }));
+      // A live watchdog pidfile (this test process) so ensureWatchdog() no-ops instead of detaching one.
+      await writeFile(join(ccDir, "watchdog.pid"), String(process.pid));
+      const proc = Bun.spawn({
+        cmd: ["bun", entry],
+        env: { ...process.env, HOME: home },
+        stdin: Buffer.from(JSON.stringify({
+          session_id: "ack-1", hook_event_name: "Stop", cwd: "/x/api-status", transcript_path: "",
+        })),
+        stdout: "ignore", stderr: "ignore",
+      });
+      await proc.exited;
+      try { return JSON.parse(await readFile(join(ccDir, "sessions", "ack-1.json"), "utf8")) as SessionRecord; } catch { return null; }
+    } finally {
+      server?.stop(true);
+      await rm(home, { recursive: true, force: true });
+    }
+  }
+
+  test("a 2xx Stop clears the marker (nothing owed)", async () => {
+    const record = await runStop(200);
+    expect(record?.op).toBe("done");
+    expect(record?.sentDone).toBe(true);
+    expect(record?.donePending).toBeUndefined();
+  }, 20000);
+
+  test("a 500 Stop leaves the marker set — the worker never got the done", async () => {
+    const record = await runStop(500);
+    expect(record?.sentDone).toBe(true);       // unchanged meaning: a done WAS recorded
+    expect(record?.donePending).toBe(true);    // …and it is still owed to the worker
+  }, 20000);
+
+  test("a THROWN fetch (dead host) leaves the marker set — the arm that skips all post-POST bookkeeping", async () => {
+    const record = await runStop(undefined);
+    expect(record?.sentDone).toBe(true);
+    expect(record?.donePending).toBe(true);
+  }, 20000);
+
+  test("a 404 (gone) leaves the marker set too — only a 2xx is proof of delivery", async () => {
+    const record = await runStop(404);
+    expect(record?.donePending).toBe(true);
   }, 20000);
 });
 

@@ -14,7 +14,7 @@ import {
 } from "../core/shared";
 
 /** Native Codex plugin hook declarations in plugin/hooks/codex-hooks.json. Keep the status denominator
- *  in lockstep with the manifest; SessionEnd is the seventh entry and performs exact row cleanup. */
+ *  in lockstep with the manifest; SessionEnd is the seventh entry and records terminal history. */
 const CODEX_PLUGIN_HOOK_COUNT = 7;
 
 export interface StatusDeps {
@@ -39,6 +39,9 @@ export interface StatusDeps {
    *  test can point them at temp files. */
   lastHookCodexPath?: string;
   lastHookClaudePath?: string;
+  /** Whether the shared Codex app-server control socket is reachable. Tests inject this to avoid
+   * touching the user's daemon; production defaults to checking the standard Unix socket. */
+  codexAppServerAvailable?: () => Promise<boolean>;
   isAlive?: (pid: number) => boolean;
   now?: () => number;
 }
@@ -194,6 +197,10 @@ export async function statusCmd(deps: StatusDeps = {}): Promise<number> {
   const lastHookClaudePath = deps.lastHookClaudePath ?? claudeAdapter.hookStampPath();
   const isAlive = deps.isAlive ?? pidAlive;
   const now = deps.now ?? Date.now;
+  const codexAppServerAvailable = deps.codexAppServerAvailable ?? (async () => {
+    try { return (await stat(`${codexHome()}/app-server-control/app-server-control.sock`)).isSocket(); }
+    catch { return false; }
+  });
 
   // Pairing.
   let raw: string | null = null;
@@ -273,6 +280,12 @@ export async function statusCmd(deps: StatusDeps = {}): Promise<number> {
     pluginState = "not installed";
   }
   print(`Codex plugin: ${pluginState}`);
+
+  if (await codexAppServerAvailable()) {
+    print("Codex Plan answers: bridge available (shared app-server socket found)");
+  } else {
+    print("Codex Plan answers: status-only (start `codex app-server daemon start` before launching Codex)");
+  }
 
   if (!plugin.installed && legacyEvents > 0) {
     print("  Legacy Codex hooks still work — consider migrating to the native Nomo plugin.");

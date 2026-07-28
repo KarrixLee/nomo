@@ -174,6 +174,23 @@ the only difference from Claude Code is that Codex's encrypted blob is tagged `a
 the phone can brand it. The island shows the **most-recently-active** session regardless of which
 agent produced it.
 
+### Answer Codex Plan questions from Nomo
+
+Nomo 1.4 can answer Codex `request_user_input` multiple-choice prompts from the existing encrypted
+question picker. This responder path requires the Codex task and Nomo watchdog to share the same
+app-server process. Start Codex's local daemon **before** opening a new Codex terminal session:
+
+```sh
+codex app-server daemon start
+codex
+```
+
+Then run `$nomo-status`. `Codex Plan answers: bridge available` means the control socket exists and
+Nomo can subscribe to live tasks. `status-only` means Nomo will still show “Need help” / “Answer on
+your computer,” but will not display a fake picker it cannot send back. Current Codex Desktop local
+tasks may use a separate private app-server process; those tasks intentionally stay status-only until
+Codex exposes or adopts the shared control socket.
+
 ## How it works
 
 - **Pairing.** `pair` opens a themed browser page with a QR code and a one-time code; it derives a

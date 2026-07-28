@@ -92,7 +92,7 @@ async function sha256Hex(s) {
 }
 
 // src/core/shared.ts
-var PLUGIN_VERSION = "1.3.1";
+var PLUGIN_VERSION = "1.4.3";
 var CC_DIR = `${process.env.HOME}/.config/cc-status`;
 var SESSIONS_DIR = `${CC_DIR}/sessions`;
 var WATCHDOG_PID_PATH = `${CC_DIR}/watchdog.pid`;
@@ -1496,6 +1496,13 @@ async function statusCmd(deps = {}) {
   const lastHookClaudePath = deps.lastHookClaudePath ?? claudeAdapter.hookStampPath();
   const isAlive = deps.isAlive ?? pidAlive;
   const now = deps.now ?? Date.now;
+  const codexAppServerAvailable = deps.codexAppServerAvailable ?? (async () => {
+    try {
+      return (await stat3(`${codexHome()}/app-server-control/app-server-control.sock`)).isSocket();
+    } catch {
+      return false;
+    }
+  });
   let raw = null;
   try {
     raw = await readFile3(configPath, "utf8");
@@ -1550,6 +1557,11 @@ async function statusCmd(deps = {}) {
     pluginState = "not installed";
   }
   print(`Codex plugin: ${pluginState}`);
+  if (await codexAppServerAvailable()) {
+    print("Codex Plan answers: bridge available (shared app-server socket found)");
+  } else {
+    print("Codex Plan answers: status-only (start `codex app-server daemon start` before launching Codex)");
+  }
   if (!plugin.installed && legacyEvents > 0) {
     print("  Legacy Codex hooks still work — consider migrating to the native Nomo plugin.");
   }

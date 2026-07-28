@@ -42,7 +42,11 @@ import { renderQRSVG } from "../qr/qr-svg";
 // so it moved to shared. Re-export it so its public name/import path stays stable.
 export { decryptDeviceName } from "../core/shared";
 
-export const DEFAULT_WORKER_URL = "https://api-status-push.karrixlee1231.workers.dev";
+// The custom domain on the same worker that still answers on
+// api-status-push.karrixlee1231.workers.dev. Both hostnames share one KV, so a plugin and an app
+// on opposite hosts still resolve the same pairing record — this can flip independently of the
+// app's PushServer.baseURL. Override with NOMO_WORKER_URL for wrangler dev / staging.
+export const DEFAULT_WORKER_URL = "https://api.nomo.gg";
 const POLL_INTERVAL_MS = 3_000;
 const MAX_WAIT_MS = 600_000; // == the worker's 10-minute pending-pairing TTL
 /** Every network call gets its own ceiling so a hung socket can't stall the 10-minute pairing

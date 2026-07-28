@@ -88,7 +88,7 @@ async function sha256Hex(s) {
 }
 
 // src/core/shared.ts
-var PLUGIN_VERSION = "1.3.1";
+var PLUGIN_VERSION = "1.4.3";
 var CC_DIR = `${process.env.HOME}/.config/cc-status`;
 var SESSIONS_DIR = `${CC_DIR}/sessions`;
 var WATCHDOG_PID_PATH = `${CC_DIR}/watchdog.pid`;
@@ -3385,7 +3385,7 @@ function renderQRSVG(text, opts = {}) {
   return `<svg xmlns="http://www.w3.org/2000/svg" width="${pixelSize}" height="${pixelSize}" ` + `viewBox="0 0 ${full} ${full}" shape-rendering="crispEdges">` + `<rect width="${full}" height="${full}" fill="#ffffff"/>` + `<g fill="#000000">${rects.join("")}</g>` + `</svg>`;
 }
 // src/entries/pair.ts
-var DEFAULT_WORKER_URL = "https://api-status-push.karrixlee1231.workers.dev";
+var DEFAULT_WORKER_URL = "https://api.nomo.gg";
 var POLL_INTERVAL_MS = 3000;
 var MAX_WAIT_MS = 600000;
 var FETCH_TIMEOUT_MS = 1e4;

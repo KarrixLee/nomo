@@ -68,7 +68,8 @@ const USER_INPUT_DETAIL_MAX = 240;
  *  Plan collaboration mode. What we rely on is narrower and does hold either way: WHEN the call appears,
  *  the session is genuinely blocked on the user, and the hook/rollout contracts expose it — so it is a
  *  sound blocked-state signal, not a complete one (a build with the experiment off simply never emits it,
- *  and this path stays dormant). Status-only: Nomo does not pretend it can submit an answer. */
+ *  and this path stays dormant). This helper remains display-only; the separate app-server bridge owns
+ *  validated answers and turn interruption. */
 export function requestUserInputDetail(toolInput: unknown): string | undefined {
   let parsed = toolInput;
   if (typeof parsed === "string") {
@@ -774,7 +775,7 @@ export function claudeTailPendingApproval(tail: string): boolean {
 // A `claude` that loads plugins but is NOT a human's interactive session — e.g. claude-mem's
 // `claude --output-format stream-json …` observation runs, or any tool that shells out to headless
 // Claude — fires SessionStart (and usually UserPromptSubmit) under a brand-new session id that NEVER
-// gets a Stop. Left unguarded that mints a phantom "working" phone row which only the 30-min idle reap
+// gets a Stop. Left unguarded that mints a phantom "working" phone row which only the one-hour worker eviction
 // (the watchdog's correctIdleClaude) or the worker's own eviction ever clears. The interactive TUI runs
 // with none of these flags, so keying on the INVOKING process's argv (or a known daemon ancestor) is a
 // safe DEFER: skip mirroring a never-tracked session whose invoker looks headless. Mirrors the codex

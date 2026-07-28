@@ -85,7 +85,7 @@ const USER_BLOCKING_TOOLS = new Set(["AskUserQuestion", "ExitPlanMode", "request
 ///   PreToolUse (AskUserQuestion / ExitPlanMode) → update, prio 1, needsAttention  (blocked on the user)
 ///   Notification (permission only) / PermissionRequest → update, prio 1, needsAttention
 ///   Stop                                        → done,   prio 0, done
-///   SessionEnd                                  → end,    prio 0  (no blob)
+///   SessionEnd                                  → end,    prio 0, done
 /// Re-arm: a SessionStart AFTER an op:done was sent for this session (sentDone) restarts as a fresh
 /// `update`/working — the session already exists in the worker, so it's an update, not a new start.
 /// The update-mapped hooks are already `update`, so they naturally re-arm (and clear sentDone) too.
@@ -201,8 +201,9 @@ export function buildBlob(input: Record<string, unknown>, machine: string, title
 
 /** The wire envelope for one hook event: the blind v2 shape
  *  `{v:2, sessionId, op, prio, ts, attentionKind?, blob?}`.
- *  op:end carries no blob (the worker reuses the last stored one); every other op carries the E2E-
- *  encrypted blob. Null when the hook is ignored (unknown/dropped) or has no session id. `sentDone`
+ *  A genuine hook SessionEnd carries a fresh E2E-encrypted `done` blob so the worker can retain a
+ *  truthful terminal history row. Internal reaper/reset end envelopes remain blob-less and therefore
+ *  keep their hard-delete meaning. Null when the hook is ignored (unknown/dropped) or has no session id. `sentDone`
  *  drives the re-arm (a start after a done becomes an update). The clear `attentionKind` is deliberately
  *  narrow and backward-compatible: ONLY Codex's request_user_input carries `"userInput"`, allowing the
  *  worker to distinguish a Plan question from an ordinary permission decision without reading `blob`. */
@@ -220,7 +221,6 @@ export async function buildEnvelope(
   // worker times too. OMITTED when unknown so the wire stays byte-identical to an old plugin's post.
   const base: Record<string, unknown> = { v: 2, sessionId: i.session_id, op: plan.op, prio: plan.prio, ts: now };
   if (typeof startedAt === "number" && Number.isFinite(startedAt)) base.startedAt = startedAt;
-  if (plan.op === "end") return base; // clean SessionEnd carries no content — worker reuses last blob
   // turnStartedAt, model, and `at` ride INSIDE the encrypted blob only. `attentionKind` below is the one
   // intentional optional clear discriminator; absent events retain the byte-compatible legacy shape.
   // `at` is the real event time (`now`) in epoch SECONDS — the phone's honest sort/age key, frozen here
@@ -237,7 +237,8 @@ export async function buildEnvelope(
  *  planOp + buildBlob the paired path uses, but WITHOUT the e2eKey (still unknown mid-pairing) — the
  *  plaintext blob is stashed and encrypted later, at flush, by completePendingPairing. sentDone is
  *  fixed false: no session record is tracked while pairing, so there is no done to re-arm from. An
- *  op:end is skipped — it carries no blob for a session the worker has never seen. */
+ *  op:end is skipped even though a paired SessionEnd carries a terminal blob: a session that ended
+ *  before pairing completed must not materialize as a history-only row on first connection. */
 export function buildPendingStash(
   input: Record<string, unknown>, machine: string, title: string | undefined, now: number, pid: number = process.ppid,
   agent: AgentKind = "claude", model?: string,
@@ -304,6 +305,14 @@ export async function trackSession(
       transcript,
       lastEvent: op === "start" ? "sessionStart" : status,
       sentDone: op === "done",
+      // The done's delivery ACK marker, stamped PESSIMISTICALLY. This record is written BEFORE the POST
+      // is attempted (see the call site), so `sentDone` alone claimed the done had landed even when the
+      // POST then non-2xx'd / timed out / threw — the worker kept the previous op:"update" and the phone
+      // showed the session running forever, with every watchdog self-heal net gated off on exactly that
+      // done state. Assuming NOT-delivered until proven otherwise is what makes a THROWN fetch (which
+      // skips all post-POST bookkeeping) still leave the debt on disk; markDoneDelivered clears it on a
+      // confirmed 2xx and the watchdog's correctPendingDone re-POSTs whatever is left over.
+      ...(op === "done" ? { donePending: true } : {}),
       op,
       prio,
       ...(blob ? { blob } : {}),
@@ -335,7 +344,23 @@ export async function trackSession(
     // transcript path — never group/world readable, matching config.json / the pending stash.
     await atomicWrite(path, JSON.stringify(record), 0o600);
   } catch {
-    // Bookkeeping is best-effort; on failure the server's 30-min eviction is still the backstop.
+    // Bookkeeping is best-effort; on failure the server's one-hour eviction is still the backstop.
+  }
+}
+
+/** Clear the done-delivery debt trackSession stamped: called ONLY after an op:done POST came back 2xx,
+ *  so the watchdog's correctPendingDone net has nothing to re-send. Read-modify-write rather than a
+ *  blind rewrite: the POST took up to 2 s, and a concurrent sweep may have touched the record in that
+ *  window — we must clear only the marker, never resurrect the pre-POST snapshot. `donePending:
+ *  undefined` drops the key on stringify (the same idiom the watchdog's doneAttempts clears use).
+ *  Best-effort: a failed clear only costs one redundant re-POST that the worker dedupes. */
+export async function markDoneDelivered(sessionId: string): Promise<void> {
+  try {
+    const record = await readRecord(sessionId);
+    if (!record || record.donePending !== true) return; // already clear (or the record is gone) → nothing owed
+    await atomicWrite(`${SESSIONS_DIR}/${sessionId}.json`, JSON.stringify({ ...record, donePending: undefined }), 0o600);
+  } catch {
+    // Bookkeeping is best-effort, exactly like trackSession's own write.
   }
 }
 
@@ -586,7 +611,7 @@ export async function runHook(agent: AgentKind): Promise<void> {
 
     // Record (or, on op:end, remove) this session's file and make sure the liveness watchdog is
     // running before we POST — a force-killed terminal fires no SessionEnd, so this is how the phone
-    // learns of a dead session in seconds instead of after the 30-min eviction.
+    // learns of a dead session in seconds instead of after the one-hour worker eviction.
     // `title` already carries the last non-empty value (resolved above) so the watchdog's corrective
     // envelopes never regress to title:"" — and the pairing the blob was sealed under is stamped so a
     // heartbeat after a re-pair can't re-send an undecryptable stale blob.
@@ -626,6 +651,10 @@ export async function runHook(agent: AgentKind): Promise<void> {
       // delivered event also breaks any gone streak (the pairing is plainly alive again).
       await atomicWrite(LAST_SEND_PATH, String(Date.now()));
       await resetGoneStrikes();
+      // The ONLY place a done's delivery is confirmed. Every other exit from this POST — a non-2xx
+      // below, an AbortSignal timeout, a network throw into the outer catch — leaves trackSession's
+      // pessimistic `donePending` standing, which is precisely the debt the watchdog then settles.
+      if (plan.op === "done") await markDoneDelivered(input.session_id);
     } else if (res.status === 404 || res.status === 410) {
       // The pairing is GONE server-side (404 = deleted, 410 = dormant-GC'd once). Without this, a
       // revoked pairing keeps POSTing ~2×/tool-use forever, 404ing on every hook. A single gone

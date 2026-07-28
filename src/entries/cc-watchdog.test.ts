@@ -9,10 +9,10 @@ import {
   buildDoneEnvelope, buildEndEnvelope, buildHeartbeatEnvelope, buildNeedsAttentionEnvelope, buildProvisionalBlob,
   buildProvisionalEnvelope, buildProvisionalRecord, buildStartEnvelope, buildTitleRepairEnvelope, classifySession,
   claudeTailPendingApproval, codexLastTurnEvent, codexTailPendingApproval, correctIdleClaude, correctInterrupt,
-  correctPendingApproval, discoverLiveSessions, goneStrikeShouldTeardown,
+  correctPendingApproval, correctPendingDone, discoverLiveSessions, goneStrikeShouldTeardown,
   hasInterruptMarker, IDLE_GRACE_MS, isClaudeIdleReapEligible, isRetireEligible, lastTurnLine, PAIRING_TTL_MS, pendingPairingExpired,
   postOutcomeForStatus, provisionalsCoveredByReal, reconcileProvisionalsSweep, retireDoneStale, shouldHeartbeat, shouldIdleProvisionalCheck,
-  shouldInterruptCheck, shouldPendingApprovalCheck, shouldRepairTitle, tailShowsInterrupt, titleRepairedRecord,
+  shouldInterruptCheck, shouldPendingApprovalCheck, shouldPendingDoneCheck, shouldRepairTitle, tailShowsInterrupt, titleRepairedRecord,
 } from "./cc-watchdog";
 import type { PostOutcome, RecordEntry } from "./cc-watchdog";
 import { claudeAdapter, codexAdapter } from "../core/adapter";
@@ -200,6 +200,122 @@ describe("correctIdleClaude (resumed-idle reap — bounded retry + local done-pi
     expect(v).toBe("corrected");
     expect(posts).toBe(1);
     expect(isRetireEligible(last, NOW)).toBe(true); // done + hours-idle → retires next sweep, chain complete
+  });
+});
+
+// The hook writes the session record BEFORE it POSTs, so a Stop whose POST non-2xx'd / timed out / threw
+// left sentDone:true on disk while the worker still held the previous op:"update" — and because EVERY other
+// net gates itself off on a done record, nothing ever repaired it (live incident 2026-07-26: local record
+// done at 05:59:13, worker KV still op:"update" from 05:58:36, phone stuck "running" ~13 h). The hook now
+// stamps `donePending` pessimistically; this net is what settles the debt.
+describe("correctPendingDone (re-POST a done whose delivery was never confirmed)", () => {
+  const NOW = 9_000_000;
+  // A Stop-written record whose POST never landed: terminal done state on disk, debt marker set.
+  const owed = (over: Partial<SessionRecord> = {}): SessionRecord =>
+    rec({ lastEvent: "done", op: "done", sentDone: true, donePending: true, blob: "B", title: "Ship the fix",
+          ts: NOW - 60_000, ...over });
+
+  test("delivered → posts ONE done, clears the marker, pins the record settled", async () => {
+    const posts: object[] = [];
+    const writes: SessionRecord[] = [];
+    const v = await correctPendingDone(cfg(), "/tmp/s.json", "s", owed(), NOW, {
+      post: async (b) => { posts.push(b); return "delivered" as PostOutcome; },
+      writeRecord: async (_p, r) => { writes.push(r); },
+      now: () => 4242,
+    });
+    expect(v).toBe("corrected");
+    expect(posts).toHaveLength(1);
+    expect(posts[0]).toMatchObject({ op: "done", ts: 4242 });
+    expect(writes[0]).toMatchObject({ lastEvent: "done", op: "done", sentDone: true });
+    expect(writes[0].donePending).toBeUndefined(); // debt settled → the gate closes
+    expect(writes[0].doneAttempts).toBeUndefined();
+    // The debt is gone from the on-disk shape too (JSON.stringify drops the undefined key).
+    expect(JSON.parse(JSON.stringify(writes[0]))).not.toHaveProperty("donePending");
+  });
+
+  test("the re-POSTed blob carries the record's cached title and a FROZEN `at` (the real done time)", async () => {
+    const posts: Record<string, unknown>[] = [];
+    await correctPendingDone(cfg(), "/tmp/s.json", "s", owed(), NOW, {
+      post: async (b) => { posts.push(b as Record<string, unknown>); return "delivered" as PostOutcome; },
+      writeRecord: async () => {},
+    });
+    const blob = await decryptBlob(KEY, posts[0].blob as string) as Record<string, unknown>;
+    expect(blob).toMatchObject({ status: "done", title: "Ship the fix", machine: "mac", label: "proj" });
+    // Frozen at the Stop's own write time — a done re-sent minutes later must not look freshly finished.
+    expect(blob.at).toBe(Math.floor((NOW - 60_000) / 1000));
+  });
+
+  test("no debt marker → uncorrected, nothing posted (a normally-delivered done is untouched)", async () => {
+    let posted = false;
+    const seams = { post: async () => { posted = true; return "delivered" as PostOutcome; }, writeRecord: async () => {} };
+    expect(await correctPendingDone(cfg(), "/tmp/s.json", "s", owed({ donePending: undefined }), NOW, seams)).toBe("uncorrected");
+    expect(await correctPendingDone(cfg(), "/tmp/s.json", "s", rec({ lastEvent: "working", op: "update" }), NOW, seams)).toBe("uncorrected");
+    expect(posted).toBe(false);
+  });
+
+  test("a transiently FAILING re-POST keeps the debt and bumps a bounded counter (verdict 'pending')", async () => {
+    const writes: SessionRecord[] = [];
+    const v = await correctPendingDone(cfg(), "/tmp/s.json", "s", owed(), NOW, {
+      post: async () => "failed" as PostOutcome,
+      writeRecord: async (_p, r) => { writes.push(r); },
+    });
+    expect(v).toBe("pending"); // this net OWNS the session (the rest stand down), nothing delivered
+    expect(writes[0]).toMatchObject({ donePending: true, doneAttempts: 1 }); // still owed → retried next sweep
+    expect(shouldPendingDoneCheck(writes[0])).toBe(true);
+  });
+
+  test("the retry is BOUNDED — past the cap it stops POSTing and drops the debt so RETIRE can fire", async () => {
+    let posts = 0;
+    let last: SessionRecord = owed();
+    for (let i = 0; i < 20; i++) {
+      const v = await correctPendingDone(cfg(), "/tmp/s.json", "s", last, NOW, {
+        post: async () => { posts++; return "failed" as PostOutcome; },
+        writeRecord: async (_p, r) => { last = r; },
+      });
+      expect(v).toBe("pending");
+      if (last.donePending !== true) break; // capped → debt dropped, ending the every-5-s re-POST spin
+    }
+    expect(posts).toBeLessThanOrEqual(6); // bounded, NOT one failed POST per sweep forever
+    expect(last).toMatchObject({ lastEvent: "done", op: "done", sentDone: true });
+    expect(shouldPendingDoneCheck(last)).toBe(false);
+    // The capped record is the terminal state the retire net keys on, so the row still resolves offline.
+    expect(isRetireEligible({ ...last, ts: NOW - 7_200_000 }, NOW)).toBe(true);
+  });
+
+  test("a revoke bubbles up so the loop can tear the pairing down", async () => {
+    const v = await correctPendingDone(cfg(), "/tmp/s.json", "s", owed(), NOW, {
+      post: async () => "revoked" as PostOutcome, writeRecord: async () => {},
+    });
+    expect(v).toBe("revoked");
+  });
+
+  test("a codex-written debt is re-POSTed with the codex blob identity (agent-agnostic net)", async () => {
+    const posts: Record<string, unknown>[] = [];
+    await correctPendingDone(cfg(), "/tmp/s.json", "s", owed({ agent: "codex" }), NOW, {
+      post: async (b) => { posts.push(b as Record<string, unknown>); return "delivered" as PostOutcome; },
+      writeRecord: async () => {},
+    });
+    expect(await decryptBlob(KEY, posts[0].blob as string)).toMatchObject({ agent: "codex" });
+  });
+});
+
+describe("shouldPendingDoneCheck (gate: only an unconfirmed done, never a provisional row)", () => {
+  test("the marker alone opens the gate", () => {
+    expect(shouldPendingDoneCheck(rec({ donePending: true, op: "done", lastEvent: "done" }))).toBe(true);
+    expect(shouldPendingDoneCheck(rec({ op: "done", lastEvent: "done" }))).toBe(false);
+    expect(shouldPendingDoneCheck(rec({ donePending: false, op: "done" }))).toBe(false);
+  });
+
+  test("provisional discovery rows are excluded (their done is posted BEFORE the record is written)", () => {
+    expect(shouldPendingDoneCheck(rec({ donePending: true, provisional: true }))).toBe(false);
+  });
+
+  test("the other nets keep their hands off a done record, so the three can never fight", () => {
+    const owed = rec({ lastEvent: "done", op: "done", sentDone: true, donePending: true, transcript: "/tmp/t.jsonl" });
+    expect(shouldInterruptCheck(owed, owed.ts)).toBe(false);
+    expect(shouldPendingApprovalCheck(owed, codexAdapter)).toBe(false);
+    expect(isClaudeIdleReapEligible(owed, owed.ts + 10_000_000, () => undefined)).toBe(false);
+    expect(shouldHeartbeat(owed, owed.ts + 10_000_000, undefined, false)).toBe(false);
   });
 });
 

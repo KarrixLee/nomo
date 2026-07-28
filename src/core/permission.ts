@@ -16,12 +16,15 @@
 // PORTABILITY: runs unmodified under bun AND node >= 18 — no `Bun.*` APIs. build.ts bundles this into
 // dist/cc-permission.mjs.
 
-import { unlink } from "node:fs/promises";
+import { realpath, unlink } from "node:fs/promises";
 import { appendFileSync, statSync, truncateSync } from "node:fs";
 import { hostname } from "node:os";
-import { basename } from "node:path";
+import { basename, isAbsolute, relative, resolve } from "node:path";
 import { runHook, buildBlob, OpPlan } from "./hook";
-import { AgentKind, atomicWrite, CC_DIR, Config, flagExists, loadConfig, NO_HOLD_PATH, PLUGIN_VERSION, readRecord, SessionRecord } from "./shared";
+import {
+  AgentKind, atomicWrite, CC_DIR, codexHome, Config, flagExists, loadConfig, NO_HOLD_PATH,
+  PLUGIN_VERSION, readPrefix, readRecord, readSuffix, SessionRecord,
+} from "./shared";
 import { decryptBlob, encryptBlob } from "./crypto";
 
 /** Local escape-hatch flag: when this file exists, the hook skips the hold entirely and behaves as a
@@ -65,6 +68,104 @@ const FRESH_SESSION_MS = 60_000;
  *  is unreachable → exit silently (fail open, terminal dialog after Esc/retry). A successful poll —
  *  including a plain {status:"pending"} — resets the counter, so a healthy hold is unbounded. */
 const MAX_CONSECUTIVE_MISSES = 100;
+
+/** Codex maps both a manual reviewer and "Approve for me" to hook `permission_mode:"default"`.
+ *  The effective reviewer/policy lives only in the current rollout's `turn_context`, so inspect a
+ *  bounded tail of that exact task before deciding whether Nomo should intercept the prompt. */
+const CODEX_POLICY_TAIL_BYTES = 8 * 1024 * 1024;
+const CODEX_ROLLOUT_HEAD_BYTES = 1024 * 1024;
+
+export interface CodexTurnPolicy {
+  approvalPolicy?: unknown;
+  approvalsReviewer?: string;
+  sandboxType?: string;
+  permissionProfileType?: string;
+}
+
+/** Parse the LAST turn_context for this exact turn. A newer context from another turn must not leak
+ *  across the boundary, while a duplicate for the same turn (for example after compaction) wins. */
+export function codexTurnPolicyFromRollout(text: string, turnId: string): CodexTurnPolicy | null {
+  if (turnId.length === 0) return null;
+  const lines = text.split("\n");
+  for (let i = lines.length - 1; i >= 0; i -= 1) {
+    const line = lines[i];
+    if (!line.includes("turn_context") || !line.includes(turnId)) continue;
+    let row: unknown;
+    try { row = JSON.parse(line); } catch { continue; }
+    if (typeof row !== "object" || row === null) continue;
+    const record = row as Record<string, unknown>;
+    if (record.type !== "turn_context") continue;
+    const payload = record.payload;
+    if (typeof payload !== "object" || payload === null) continue;
+    const context = payload as Record<string, unknown>;
+    if (context.turn_id !== turnId) continue;
+    const sandbox = typeof context.sandbox_policy === "object" && context.sandbox_policy !== null
+      ? context.sandbox_policy as Record<string, unknown>
+      : undefined;
+    const profile = typeof context.permission_profile === "object" && context.permission_profile !== null
+      ? context.permission_profile as Record<string, unknown>
+      : undefined;
+    return {
+      approvalPolicy: context.approval_policy,
+      approvalsReviewer: typeof context.approvals_reviewer === "string" ? context.approvals_reviewer : undefined,
+      sandboxType: typeof sandbox?.type === "string" ? sandbox.type : undefined,
+      permissionProfileType: typeof profile?.type === "string" ? profile.type : undefined,
+    };
+  }
+  return null;
+}
+
+/** Session id from the rollout's first session_meta row, used to ensure hook input cannot point this
+ *  local reader at a different task's rollout. */
+export function codexRolloutSessionId(text: string): string | undefined {
+  for (const line of text.split("\n")) {
+    if (!line.includes("session_meta")) continue;
+    let row: unknown;
+    try { row = JSON.parse(line); } catch { continue; }
+    if (typeof row !== "object" || row === null) continue;
+    const record = row as Record<string, unknown>;
+    if (record.type !== "session_meta") continue;
+    const id = (record.payload as Record<string, unknown> | undefined)?.id;
+    return typeof id === "string" && id.length > 0 ? id : undefined;
+  }
+  return undefined;
+}
+
+/** Read only a real rollout beneath this Codex home's sessions directory. Best-effort: an old Codex
+ *  build, a missing path, or an unreadable/truncated file yields null and preserves manual routing. */
+export async function loadCodexTurnPolicy(
+  transcriptPath: string, turnId: string, sessionId: string, home: string = codexHome(),
+): Promise<CodexTurnPolicy | null> {
+  if (!transcriptPath || !turnId || !sessionId || !basename(transcriptPath).match(/^rollout-.*\.jsonl$/)) return null;
+  try {
+    const sessionsRoot = await realpath(resolve(home, "sessions"));
+    const rollout = await realpath(transcriptPath);
+    const rel = relative(sessionsRoot, rollout);
+    if (rel === "" || rel.startsWith("..") || isAbsolute(rel)) return null;
+    const head = await readPrefix(rollout, CODEX_ROLLOUT_HEAD_BYTES);
+    if (codexRolloutSessionId(head) !== sessionId) return null;
+    return codexTurnPolicyFromRollout(await readSuffix(rollout, CODEX_POLICY_TAIL_BYTES), turnId);
+  } catch {
+    return null;
+  }
+}
+
+function codexPassThroughReason(
+  policy: CodexTurnPolicy | null,
+): "codex-auto-review" | "codex-full-access" | "codex-context-unknown" | undefined {
+  // Returning control to Codex is fail-open for Nomo, NOT an approval: Codex's native reviewer/dialog
+  // remains authoritative. Hold only when the exact context positively identifies a manual flow.
+  if (!policy) return "codex-context-unknown";
+  if (policy.approvalPolicy === "never") return "codex-full-access";
+  const guardianReviewer = policy.approvalsReviewer === "auto_review" || policy.approvalsReviewer === "guardian_subagent";
+  const reviewablePolicy = policy.approvalPolicy === "on-request"
+    || policy.approvalPolicy === "granular"
+    || (typeof policy.approvalPolicy === "object" && policy.approvalPolicy !== null);
+  if (guardianReviewer && reviewablePolicy) return "codex-auto-review";
+  // `untrusted` does not use Codex's automatic reviewer even if the configured reviewer says auto.
+  if (policy.approvalPolicy === "untrusted" || policy.approvalsReviewer === "user") return undefined;
+  return "codex-context-unknown";
+}
 
 /** Serialize ONE PermissionRequest decision for the given agent's stdout contract. Both agents carry
  *  the identical `hookSpecificOutput` object; the ONLY difference is the transport envelope: Codex
@@ -221,7 +322,9 @@ function answerLine(
 function resolveAnswer(answer: string, labels: string[]): string | undefined {
   const matchOne = (piece: string): string | undefined => {
     // Accept the capped wire form AND the untruncated original (a phone that echoes the real label).
-    const hits = Array.from(new Set(labels.filter((l) => l === piece || cap(l, QUESTION_LABEL_MAX) === piece)));
+    const hits = Array.from(new Set(labels.filter((l) =>
+      l === piece || capPermissionWireText(l, PERMISSION_QUESTION_LABEL_MAX) === piece
+    )));
     return hits.length === 1 ? hits[0] : undefined;
   };
   const whole = matchOne(answer);
@@ -379,24 +482,28 @@ export function buildPermissionDetail(toolName: string, toolInput: Record<string
 }
 
 /** One question as it rides the sealed blob: compact keys to spend as little of the 3072-char ceiling
- *  as possible — q(uestion), h(eader), m(ultiSelect), o(ption labels). Mirrored 1:1 by the phone. */
+ *  as possible — q(uestion), h(eader), m(ultiSelect), o(ption labels), and optional d(escriptions).
+ *  Mirrored 1:1 by the phone. */
 export interface PermissionQuestion {
   q: string;
   h?: string;
   m?: boolean;
   o: string[];
+  d?: string[];
 }
 
 /** Longest question text kept in the blob (display only — the answers map is keyed by the ORIGINAL,
  *  untruncated text, so a capped question can still be answered). */
 const QUESTION_TEXT_MAX = 240;
 /** Longest option label kept in the blob. */
-const QUESTION_LABEL_MAX = 60;
+export const PERMISSION_QUESTION_LABEL_MAX = 60;
 
 /** Ellipsis-cap shared by the blob builder and the answer re-mapper, so the two can never disagree
- *  about what the phone was actually shown. A capped string is exactly `n` characters long. */
-function cap(s: string, n: number): string {
-  return s.length <= n ? s : `${s.slice(0, n - 1)}…`;
+ *  about what the phone was actually shown. Count Unicode code points rather than UTF-16 code units
+ *  so an astral character can never be split into an invalid lone surrogate. */
+export function capPermissionWireText(value: string, max: number): string {
+  const characters = Array.from(value);
+  return characters.length <= max ? value : `${characters.slice(0, max - 1).join("")}…`;
 }
 
 /** One raw CC question, narrowed. */
@@ -452,10 +559,10 @@ function firstQuestionText(toolInput: Record<string, unknown>): string {
  *  phone's echo back onto the ORIGINAL labels, so a capped label never reaches CC. */
 export function buildPermissionQuestions(toolInput: Record<string, unknown>): PermissionQuestion[] {
   return usableQuestions(toolInput).map(({ text, raw, labels }) => ({
-    q: cap(text, QUESTION_TEXT_MAX),
+    q: capPermissionWireText(text, QUESTION_TEXT_MAX),
     ...(typeof raw?.header === "string" && raw.header.length > 0 ? { h: raw.header } : {}),
     ...(raw?.multiSelect === true ? { m: true } : {}),
-    o: labels.map((l) => cap(l, QUESTION_LABEL_MAX)),
+    o: labels.map((l) => capPermissionWireText(l, PERMISSION_QUESTION_LABEL_MAX)),
   }));
 }
 
@@ -631,6 +738,11 @@ export interface PermissionHookDeps {
   readInput?: () => Promise<string>;
   loadConfigFn?: () => Promise<Config | null>;
   readRecordFn?: (sessionId: string) => Promise<SessionRecord | null>;
+  /** Resolve Codex's effective per-turn approval policy from its rollout. Tests inject this so no
+   *  local Codex state is touched; Claude never calls it. */
+  loadCodexTurnPolicyFn?: (
+    transcriptPath: string, turnId: string, sessionId: string,
+  ) => Promise<CodexTurnPolicy | null>;
   sleep?: (ms: number) => Promise<void>;
   /** Writes the ONE decision line to stdout. Called only on a genuine phone answer. */
   emit?: (line: string) => void;
@@ -719,6 +831,26 @@ export async function runPermissionHook(deps: PermissionHookDeps = {}, agent: Ag
       const codexDialogMode = agent === "codex" && (permissionMode === "acceptEdits" || permissionMode === "plan");
       trace({ event: "exit", reason: "mode", mode: permissionMode, ...(codexDialogMode ? { codex_dialog_mode: true } : {}) });
       return;
+    }
+    // 3. Codex reviewer gate: `permission_mode:"default"` is lossy — it covers BOTH manual review and
+    //    "Approve for me". The exact turn_context records the effective reviewer after task/profile/UI
+    //    overrides. In auto-review, silently return control to Codex BEFORE any Nomo POST so Codex's
+    //    built-in reviewer can decide. Full Access normally took the mode gate above, but the rollout
+    //    checks make that promise resilient to a producer that reports `default` by mistake.
+    if (agent === "codex" && !toolName.startsWith("mcp__")) {
+      const transcriptPath = typeof input.transcript_path === "string" ? input.transcript_path : "";
+      const turnId = typeof input.turn_id === "string" ? input.turn_id : "";
+      const policy = await (deps.loadCodexTurnPolicyFn ?? loadCodexTurnPolicy)(transcriptPath, turnId, sessionId);
+      const reason = codexPassThroughReason(policy);
+      if (reason) {
+        trace({ event: "exit", reason });
+        return;
+      }
+      trace({ event: "codex-reviewer", disposition: "hold", reason: "manual" });
+    } else if (agent === "codex") {
+      // MCP apps may override the thread-global reviewer per connector. Codex does not expose that
+      // effective reviewer to hooks yet, so the rollout is not authoritative for these tool names.
+      trace({ event: "codex-reviewer", disposition: "hold", reason: "mcp-reviewer-unknown" });
     }
     // (There is no longer a question gate here: AskUserQuestion HOLDS like every other tool — its
     // options ride the blob in `permissionQuestions` and the phone's `answer` verb injects the
