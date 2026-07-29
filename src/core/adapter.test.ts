@@ -1,12 +1,12 @@
 import { randomUUID } from "node:crypto";
 import { describe, expect, test } from "bun:test";
 import {
-  adapterFor, allAdapters, claudeAdapter, claudeHeadlessInvocation, claudeSessionModel, claudeSessionTitle,
+  adapterFor, allAdapters, claudeAdapter, claudeClearPredecessor, claudeForkResumePredecessor, claudeHeadlessInvocation, claudeSessionModel, claudeSessionTitle,
   claudeTailPendingApproval, codexAdapter, codexChildSessionGhost,
   codexConfigModel, codexDiscoverLive, codexInternalSessionGhost, codexModelFromRollout,
   CODEX_ROLLOUT_IDLE_SILENCE_MS,
-  codexNewestRolloutForCwd, codexPidTurnActive, codexRolloutExistsForSession, codexSentinelSessionId, codexSessionModel,
-  codexTailPendingApproval, codexTailPendingAttentionKind, codexTailPendingUserInputDetail, codexTurnActiveFromTail, filterCodexTuis, findProvisionalForPid,
+  codexNewestRolloutForCwd, codexPidPlanPickerState, codexPidTurnActive, codexPlanPickerStateFromTail, codexRolloutExistsForSession, codexSentinelSessionId, codexSessionModel,
+  codexRolloutCreationEvidence, codexSessionCreationSuppression, codexTailPendingApproval, codexTailPendingAttentionKind, codexTailPendingUserInputDetail, codexTurnActiveFromTail, filterCodexTuis, findProvisionalForPid,
   firstAssistantModel, firstUserPrompt, lastAssistantModel, parseCodexProcs, rolloutMetaCwd,
   requestUserInputDetail, rolloutPathFromLsof, sessionTitle, TrackedSessionLite,
 } from "./adapter";
@@ -473,6 +473,57 @@ describe("codexTurnActiveFromTail (idle vs in-flight decision matrix)", () => {
   });
 });
 
+describe("codex plan-picker classifier (completed Plan turn, TUI still waiting)", () => {
+  const proposedPlan = (text = "Ship the narrow fix."): string => JSON.stringify({
+    timestamp: "2026-07-29T07:27:21Z",
+    type: "response_item",
+    payload: {
+      type: "message", role: "assistant", phase: "final_answer",
+      content: [{ type: "output_text", text: `<proposed_plan>\n${text}\n</proposed_plan>` }],
+    },
+  });
+  const normalAnswer = (): string => JSON.stringify({
+    type: "response_item",
+    payload: { type: "message", role: "assistant", phase: "final_answer", content: [{ type: "output_text", text: "Done." }] },
+  });
+
+  test("exact proposed-plan final + task_complete is pending; normal completion is unaffected", () => {
+    expect(codexPlanPickerStateFromTail([evt("task_started"), proposedPlan(), evt("task_complete")].join("\n"))).toBe("pending");
+    expect(codexPlanPickerStateFromTail([evt("task_started"), normalAnswer(), evt("task_complete")].join("\n"))).toBe("none");
+    // Merely mentioning/tag-opening a plan is insufficient: require the complete Plan-mode wrapper.
+    expect(codexPlanPickerStateFromTail([evt("task_started"), proposedPlan("x").replace("</proposed_plan>", ""), evt("task_complete")].join("\n"))).toBe("none");
+  });
+
+  test("a later task_started or user_message explicitly resolves the pending picker", () => {
+    const pending = [evt("task_started"), proposedPlan(), evt("task_complete")];
+    expect(codexPlanPickerStateFromTail([...pending, evt("task_started")].join("\n"))).toBe("resolved");
+    expect(codexPlanPickerStateFromTail([...pending, evt("user_message")].join("\n"))).toBe("resolved");
+  });
+
+  test("pid probe requires process liveness and returns exited before reading a rollout", async () => {
+    let read = false;
+    expect(await codexPidPlanPickerState(42, {
+      isAlive: () => false,
+      rolloutOf: async () => { read = true; return "/r/rollout.jsonl"; },
+      readTail: async () => [proposedPlan(), evt("task_complete")].join("\n"),
+    })).toBe("exited");
+    expect(read).toBe(false);
+  });
+
+  test("live pid + located rollout returns pending; unreadable evidence stays unknown", async () => {
+    expect(await codexPidPlanPickerState(42, {
+      isAlive: () => true,
+      rolloutOf: async () => "/r/rollout.jsonl",
+      readTail: async () => [proposedPlan(), evt("task_complete")].join("\n"),
+    })).toBe("pending");
+    expect(await codexPidPlanPickerState(42, {
+      isAlive: () => true,
+      rolloutOf: async () => "/r/rollout.jsonl",
+      readTail: async () => { throw new Error("ENOENT"); },
+    })).toBe("unknown");
+  });
+});
+
 describe("rolloutPathFromLsof (pin the pid's open rollout — the codex TUI holds it open)", () => {
   // Mirrors real `lsof -a -p <pid> -Fn` output observed live (p/fcwd/f45/n field lines).
   const LSOF_FIXTURE = [
@@ -883,6 +934,12 @@ describe("codexChildSessionGhost (app-server child sessions must not become phon
 
 describe("codexInternalSessionGhost (top-level app-server internal jobs must not become phone rows)", () => {
   const ghostId = "019f4a6a-88ad-7ed3-8f0a-cdfcc32ff98f";
+  const promptInput = { hook_event_name: "UserPromptSubmit", prompt: "real ask" };
+  const userMessage = JSON.stringify({
+    timestamp: "2026-07-10T00:00:01Z",
+    type: "event_msg",
+    payload: { type: "user_message", message: "real ask" },
+  });
 
   test("the observed ghost: empty transcript, no transcript path, no rollout → skipped", async () => {
     expect(await codexInternalSessionGhost(ghostId, "", "", { rolloutExists: async () => false })).toBe(true);
@@ -890,13 +947,13 @@ describe("codexInternalSessionGhost (top-level app-server internal jobs must not
     expect(await codexInternalSessionGhost(ghostId, "  \n ", "", { rolloutExists: async () => false })).toBe(true);
   });
 
-  test("a legit brand-new TUI session (rollout file already on disk) is mirrored", async () => {
-    expect(await codexInternalSessionGhost("real-id", "", "", { rolloutExists: async () => true })).toBe(false);
+  test("a legit first prompt with a rollout file already on disk is mirrored", async () => {
+    expect(await codexInternalSessionGhost("real-id", "", "", { rolloutExists: async () => true }, promptInput)).toBe(false);
   });
 
-  test("rollout CONTENT in the prefix mirrors immediately — neither fs probe is consulted", async () => {
+  test("rollout user_message content mirrors immediately — neither fs probe is consulted", async () => {
     let statted = false, scanned = false;
-    expect(await codexInternalSessionGhost("real-id", '{"timestamp":"2026-07-10T00:00:00Z","type":"session_meta"}', "/some/rollout.jsonl", {
+    expect(await codexInternalSessionGhost("real-id", userMessage, "/some/rollout.jsonl", {
       statOf: async () => { statted = true; return {}; },
       rolloutExists: async () => { scanned = true; return false; },
     })).toBe(false);
@@ -904,12 +961,12 @@ describe("codexInternalSessionGhost (top-level app-server internal jobs must not
     expect(scanned).toBe(false);
   });
 
-  test("an existing transcript_path (file created, content not flushed yet) mirrors without the scan", async () => {
+  test("a first prompt plus existing transcript_path mirrors without the scan", async () => {
     let scanned = false;
     expect(await codexInternalSessionGhost("real-id", "", "/rollout/on/disk.jsonl", {
       statOf: async () => ({}),
       rolloutExists: async () => { scanned = true; return false; },
-    })).toBe(false);
+    }, promptInput)).toBe(false);
     expect(scanned).toBe(false);
   });
 
@@ -921,15 +978,15 @@ describe("codexInternalSessionGhost (top-level app-server internal jobs must not
     expect(await codexInternalSessionGhost("real-id", "", "/gone/rollout.jsonl", {
       statOf: async () => { throw new Error("ENOENT"); },
       rolloutExists: async () => true,
-    })).toBe(false);
+    }, promptInput)).toBe(false);
   });
 
   test("DEFER, not verdict: the same session mirrors on its next hook once the rollout appears", async () => {
     let rolloutOnDisk = false; // hook 1 races the first flush → no rollout yet → first frame deferred
     const deps = { rolloutExists: async () => rolloutOnDisk };
-    expect(await codexInternalSessionGhost("racy-id", "", "", deps)).toBe(true);
+    expect(await codexInternalSessionGhost("racy-id", "", "", deps, promptInput)).toBe(true);
     rolloutOnDisk = true;      // hook 2 (same turn, moments later): the rollout is on disk now
-    expect(await codexInternalSessionGhost("racy-id", "", "", deps)).toBe(false);
+    expect(await codexInternalSessionGhost("racy-id", "", "", deps, promptInput)).toBe(false);
   });
 
   test("a throwing locator is NO evidence → defer (self-heals; never throws out)", async () => {
@@ -940,7 +997,53 @@ describe("codexInternalSessionGhost (top-level app-server internal jobs must not
 
   test("codexAdapter implements the seam; claudeAdapter omits it", () => {
     expect(typeof codexAdapter.isInternalSessionGhost).toBe("function");
+    expect(typeof codexAdapter.sessionCreationSuppression).toBe("function");
     expect(claudeAdapter.isInternalSessionGhost).toBeUndefined();
+    expect(claudeAdapter.sessionCreationSuppression).toBeUndefined();
+  });
+});
+
+describe("Codex rollout create suppression (subagents + promptless deferral)", () => {
+  const sessionMeta = (source: unknown): string => JSON.stringify({
+    timestamp: "2026-07-29T00:00:00Z",
+    type: "session_meta",
+    payload: { id: "s", source },
+  });
+
+  test("guardian and any other subagent source variant are permanently suppressed", async () => {
+    const guardian = sessionMeta({ subagent: { other: "guardian" } });
+    expect(codexRolloutCreationEvidence(guardian)).toEqual({ subagent: true, hasUserMessage: false });
+    expect(await codexSessionCreationSuppression(
+      "guardian", guardian, "/rollout.jsonl",
+      { hook_event_name: "SessionStart", parent_thread_id: "parent" },
+    )).toMatchObject({ guard: "codex-subagent-rollout" });
+    // Even a later prompt cannot promote an internal subagent thread to a visible phone row.
+    expect(await codexSessionCreationSuppression(
+      "guardian", guardian, "/rollout.jsonl",
+      { hook_event_name: "UserPromptSubmit", prompt: "internal review" },
+    )).toMatchObject({ guard: "codex-subagent-rollout" });
+  });
+
+  test("a promptless app-server rollout is deferred, then the first real hook prompt creates it", async () => {
+    const promptless = sessionMeta("vscode");
+    expect(await codexSessionCreationSuppression(
+      "app-thread", promptless, "/rollout.jsonl", { hook_event_name: "SessionStart" },
+    )).toMatchObject({ guard: "codex-promptless-rollout" });
+    expect(await codexSessionCreationSuppression(
+      "app-thread", promptless, "/rollout.jsonl",
+      { hook_event_name: "UserPromptSubmit", prompt: "Fix the real bug" },
+    )).toBeNull();
+  });
+
+  test("a durable rollout user_message is sufficient even when the current hook has no prompt field", async () => {
+    const prefix = [
+      sessionMeta("vscode"),
+      JSON.stringify({ type: "event_msg", payload: { type: "user_message", message: "Hello" } }),
+    ].join("\n");
+    expect(codexRolloutCreationEvidence(prefix)).toEqual({ subagent: false, hasUserMessage: true });
+    expect(await codexSessionCreationSuppression(
+      "real", prefix, "/rollout.jsonl", { hook_event_name: "PreToolUse" },
+    )).toBeNull();
   });
 });
 
@@ -965,6 +1068,14 @@ describe("claudeHeadlessInvocation (skip a non-interactive / daemon-spawned clau
   test("a known daemon shape ANYWHERE in the chain (self or ancestor) → headless", () => {
     expect(claudeHeadlessInvocation("claude", ["node /Users/x/.claude-mem/worker-service.js"])).toBe(true);
     expect(claudeHeadlessInvocation("claude-mem run", [])).toBe(true);
+    expect(claudeHeadlessInvocation("claude", ["daemon run --origin transient"])).toBe(true);
+    expect(claudeHeadlessInvocation("claude", ["bg-pty-host --socket x"])).toBe(true);
+    expect(claudeHeadlessInvocation("claude", ["bg-spare"])).toBe(true);
+  });
+
+  test("fork/reply replay is headless as a pair; an ordinary interactive fork alone is not", () => {
+    expect(claudeHeadlessInvocation("claude --fork-session --resume old.jsonl --reply-on-resume", [])).toBe(true);
+    expect(claudeHeadlessInvocation("claude --fork-session --resume old.jsonl", [])).toBe(false);
   });
 
   test("tokenized flag match — a path merely CONTAINING '-p' can't false-trigger", () => {
@@ -987,6 +1098,42 @@ describe("claudeHeadlessInvocation (skip a non-interactive / daemon-spawned clau
     expect(claudeAdapter.isHeadlessInvocation!({
       pid: 100, ancestorsOf: () => [200], commandOf: (p) => interactive[p],
     })).toBe(false);
+  });
+});
+
+describe("Claude fork/clear lineage classifiers", () => {
+  const oldId = "11111111-2222-4333-8444-555555555555";
+  const newId = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+
+  test("fork replay extracts the predecessor transcript id without blanket-matching normal resume/fork", () => {
+    expect(claudeForkResumePredecessor(
+      `claude --fork-session --resume /Users/x/.claude/projects/p/${oldId}.jsonl --reply-on-resume`,
+    )).toBe(oldId);
+    expect(claudeForkResumePredecessor(
+      `claude --fork-session --resume="/Users/x/a b/${oldId}.jsonl" --reply-on-resume`,
+    )).toBe(oldId);
+    expect(claudeForkResumePredecessor(`claude --resume ${oldId}`)).toBeUndefined();
+    expect(claudeForkResumePredecessor(`claude --fork-session --resume ${oldId}.jsonl`)).toBeUndefined();
+  });
+
+  test("a fork re-emission resolves to an already-tracked predecessor instead of a duplicate id", () => {
+    const command = `claude --fork-session --resume /tmp/${oldId}.jsonl --reply-on-resume`;
+    const predecessor = claudeAdapter.forkResumePredecessor!(command);
+    const tracked = new Set([oldId]);
+    const effective = predecessor && tracked.has(predecessor) ? predecessor : newId;
+    expect(effective).toBe(oldId);
+    expect(effective).not.toBe(newId);
+  });
+
+  test("clear retires the newest same-pid Claude predecessor only", () => {
+    const tracked: TrackedSessionLite[] = [
+      { sessionId: oldId, pid: 42, ts: 10 },
+      { sessionId: "newer-old", pid: 42, ts: 20 },
+      { sessionId: "codex", pid: 42, ts: 30, agent: "codex" },
+      { sessionId: "other-pid", pid: 99, ts: 40 },
+    ];
+    expect(claudeClearPredecessor(newId, 42, tracked)).toBe("newer-old");
+    expect(claudeAdapter.clearPredecessor!({ sessionId: newId, hookPid: 42, tracked })).toBe("newer-old");
   });
 });
 

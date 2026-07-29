@@ -61,6 +61,7 @@ describe("runNotify E2E (argv payload, dedupe against a sent Stop)", () => {
 
   async function runNotifyEntry(payloadJson: string, opts: {
     seedRecord?: Record<string, unknown>; sessionIndex?: string; codexHome?: string;
+    rolloutTail?: string;
     // Deferral window (ms) the spawned entry honors via NOMO_NOTIFY_DEFER_MS. Default "0" so the
     // common cases don't pay the real 3-second wait; the deferral-race test sets a positive window.
     deferMs?: string;
@@ -81,7 +82,13 @@ describe("runNotify E2E (argv payload, dedupe against a sent Stop)", () => {
       const sid = (JSON.parse(payloadJson) as Record<string, unknown>)["thread-id"] as string;
       const recordPath = join(ccDir, "sessions", `${sid}.json`);
       if (opts.seedRecord) {
-        await writeFile(recordPath, JSON.stringify(opts.seedRecord));
+        let seed = opts.seedRecord;
+        if (opts.rolloutTail !== undefined) {
+          const rolloutPath = join(home, "rollout-plan.jsonl");
+          await writeFile(rolloutPath, opts.rolloutTail);
+          seed = { ...seed, transcript: rolloutPath };
+        }
+        await writeFile(recordPath, JSON.stringify(seed));
       }
       const env: Record<string, string> = { ...process.env, HOME: home, NOMO_NOTIFY_DEFER_MS: opts.deferMs ?? "0" };
       if (opts.codexHome) {
@@ -165,6 +172,28 @@ describe("runNotify E2E (argv payload, dedupe against a sent Stop)", () => {
     expect(record?.op).toBe("done");
     // The cached turn anchor is threaded through so the island's "done in Xm" stays per-turn.
     expect(blob).toMatchObject({ status: "done", agent: "codex", turnStartedAt: 1_751_900_000 });
+  }, 20000);
+
+  test("plan picker pending → prio:1 needsAttention update, not done", async () => {
+    const seed = {
+      pid: process.pid, machine: "mac", label: "proj", ts: 111, transcript: "",
+      lastEvent: "working", sentDone: false, op: "update", prio: 0, blob: "OLD", agent: "codex",
+      turnStartedAt: 1_751_900_000,
+    };
+    const finalPlan = JSON.stringify({
+      type: "response_item",
+      payload: {
+        type: "message", role: "assistant", phase: "final_answer",
+        content: [{ type: "output_text", text: "<proposed_plan>\nImplement it.\n</proposed_plan>" }],
+      },
+    });
+    const complete = JSON.stringify({ type: "event_msg", payload: { type: "task_complete" } });
+    const { record, blob } = await runNotifyEntry(payload, { seedRecord: seed, rolloutTail: `${finalPlan}\n${complete}\n` });
+    expect(record).toMatchObject({
+      op: "update", prio: 1, lastEvent: "needsAttention", sentDone: false, pendingPlanPicker: true,
+    });
+    expect(record?.donePending).toBeUndefined();
+    expect(blob).toMatchObject({ status: "needsAttention", agent: "codex" });
   }, 20000);
 
   test("session_index thread_name is the PRIMARY title (beats input-messages)", async () => {

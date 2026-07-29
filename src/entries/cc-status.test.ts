@@ -8,7 +8,7 @@ import { parseConfig, PendingEventStash, readRecord, SessionRecord, SESSIONS_DIR
 import {
   aiTitle, buildBlob, buildEnvelope, buildPendingStash, cleanPromptTitle, codexIndexTitle, codexSessionTitle,
   codexThreadName, detailForHook, firstUserPrompt, isPermissionNotification, planOp, sessionTitle,
-  markDoneDelivered, stashPendingEvent, trackSession, transcriptStartMs,
+  markDoneDelivered, SESSION_TRACE_PATH, stashPendingEvent, trackSession, transcriptStartMs,
 } from "./cc-status";
 import { provisionalsCoveredByReal, reconcileProvisionalsSweep } from "./cc-watchdog";
 import { hooksAppearStale, parseCodexPluginState, statusCmd } from "./status-cmd";
@@ -419,6 +419,16 @@ describe("buildEnvelope (v2 envelope + encrypted blob)", () => {
     const env = (await buildEnvelope({ session_id: "abc", hook_event_name: "Stop", cwd: "/x" }, "m", 5, undefined, KEY, false))!;
     expect(env).toMatchObject({ op: "done", prio: 0 });
     expect(await decryptBlob(KEY, (env as { blob: string }).blob)).toMatchObject({ status: "done", title: "", label: "x" });
+  });
+
+  test("a classified Codex Plan picker overrides Stop with prio:1 user-input attention", async () => {
+    const env = (await buildEnvelope(
+      { session_id: "abc", hook_event_name: "Stop", cwd: "/x" }, "m", 5, "plan", KEY, false,
+      "codex", undefined, undefined, undefined, undefined,
+      { op: "update", prio: 1, status: "needsAttention" }, "userInput",
+    ))!;
+    expect(env).toMatchObject({ op: "update", prio: 1, attentionKind: "userInput" });
+    expect(await decryptBlob(KEY, env.blob as string)).toMatchObject({ status: "needsAttention", agent: "codex" });
   });
 
   test("a permission Notification → op update prio 1, needsAttention blob", async () => {
@@ -968,6 +978,150 @@ describe("trackSession + readRecord file glue (sentDone survives a fresh disk re
   });
 });
 
+// --- F6 phantom-session lineage + local trace ------------------------------------------------
+
+describe("runHook phantom-session lineage, origin stamp, and session-trace.log", () => {
+  const rawKey = new Uint8Array(32).fill(9);
+  const claudeEntry = join(import.meta.dir, "cc-status.ts");
+  const codexEntry = join(import.meta.dir, "codex-status.ts");
+
+  async function setupHookHome(url: string): Promise<{ home: string; ccDir: string; sessionsDir: string }> {
+    const home = await mkdtemp(join(tmpdir(), "cc-f6-"));
+    const ccDir = join(home, ".config", "cc-status");
+    const sessionsDir = join(ccDir, "sessions");
+    await mkdir(sessionsDir, { recursive: true });
+    await writeFile(join(ccDir, "config.json"), JSON.stringify({
+      url, pairingId: "p", pcSecret: "s", e2eKeyB64: b64url(rawKey),
+    }));
+    await writeFile(join(ccDir, "watchdog.pid"), String(process.pid));
+    return { home, ccDir, sessionsDir };
+  }
+
+  async function spawnHook(entry: string, home: string, payload: Record<string, unknown>): Promise<void> {
+    const proc = Bun.spawn({
+      cmd: ["bun", entry],
+      env: { ...process.env, HOME: home },
+      stdin: Buffer.from(JSON.stringify(payload)),
+      stdout: "ignore",
+      stderr: "ignore",
+    });
+    await proc.exited;
+  }
+
+  async function readLocalRecord(sessionsDir: string, sessionId: string): Promise<SessionRecord | null> {
+    try {
+      return JSON.parse(await readFile(join(sessionsDir, `${sessionId}.json`), "utf8")) as SessionRecord;
+    } catch {
+      return null;
+    }
+  }
+
+  test("SessionStart source:clear retires the same-pid predecessor and stamps full create origin", async () => {
+    const bodies: Array<Record<string, unknown>> = [];
+    const server = Bun.serve({
+      port: 0,
+      async fetch(req) {
+        bodies.push(await req.json() as Record<string, unknown>);
+        return new Response("{}", { status: 200 });
+      },
+    });
+    const { home, ccDir, sessionsDir } = await setupHookHome(`http://127.0.0.1:${server.port}`);
+    try {
+      const oldId = "11111111-2222-4333-8444-555555555555";
+      const newId = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+      await writeFile(join(sessionsDir, `${oldId}.json`), JSON.stringify({
+        pid: process.pid, machine: "m", label: "api-status", ts: Date.now(),
+        lastEvent: "done", sentDone: true, op: "done", prio: 0,
+      }));
+      const transcript = join(home, `${newId}.jsonl`);
+      await writeFile(transcript, JSON.stringify({ type: "ai-title", aiTitle: "After clear" }));
+      await spawnHook(claudeEntry, home, {
+        session_id: newId,
+        hook_event_name: "SessionStart",
+        source: "clear",
+        agent_id: "agent-7",
+        agent_type: "main",
+        cwd: "/x/api-status",
+        transcript_path: transcript,
+      });
+
+      expect(await readLocalRecord(sessionsDir, oldId)).toBeNull();
+      const created = await readLocalRecord(sessionsDir, newId);
+      expect(created).not.toBeNull();
+      expect(created?.origin).toMatchObject({
+        hook_event_name: "SessionStart",
+        source: "clear",
+        agent_id: "agent-7",
+        agent_type: "main",
+        cwd: "/x/api-status",
+        ppid: process.pid,
+      });
+      expect(typeof created?.origin?.ppid_command).toBe("string");
+      expect(bodies.some((b) => b.sessionId === oldId && b.op === "end")).toBe(true);
+      expect(bodies.some((b) => b.sessionId === newId && b.op === "start")).toBe(true);
+
+      const trace = (await readFile(join(ccDir, "session-trace.log"), "utf8"))
+        .trim().split("\n").map((line) => JSON.parse(line) as Record<string, unknown>);
+      expect(trace.some((e) => e.event === "retire" && e.sessionId === oldId)).toBe(true);
+      expect(trace.some((e) => e.event === "create" && e.sessionId === newId)).toBe(true);
+    } finally {
+      server.stop(true);
+      await rm(home, { recursive: true, force: true });
+    }
+  }, 20000);
+
+  test("promptless Codex create is traced as suppressed, then first prompt creates, and SessionEnd traces retire", async () => {
+    const { home, ccDir, sessionsDir } = await setupHookHome("http://127.0.0.1:9");
+    try {
+      const sid = "019f4a6a-88ad-7ed3-8f0a-cdfcc32ff98f";
+      const transcript = join(home, "rollout.jsonl");
+      const meta = JSON.stringify({
+        timestamp: "2026-07-29T00:00:00Z",
+        type: "session_meta",
+        payload: { id: sid, source: "vscode" },
+      });
+      await writeFile(transcript, meta);
+      await spawnHook(codexEntry, home, {
+        session_id: sid, hook_event_name: "SessionStart", cwd: "/x/api-status",
+        transcript_path: transcript,
+      });
+      expect(await readLocalRecord(sessionsDir, sid)).toBeNull();
+
+      const user = JSON.stringify({
+        timestamp: "2026-07-29T00:00:01Z",
+        type: "event_msg",
+        payload: { type: "user_message", message: "Fix the phantom row" },
+      });
+      await writeFile(transcript, `${meta}\n${user}\n`);
+      await spawnHook(codexEntry, home, {
+        session_id: sid, hook_event_name: "UserPromptSubmit", prompt: "Fix the phantom row",
+        cwd: "/x/api-status", transcript_path: transcript,
+      });
+      expect(await readLocalRecord(sessionsDir, sid)).not.toBeNull();
+
+      await spawnHook(codexEntry, home, {
+        session_id: sid, hook_event_name: "SessionEnd", cwd: "/x/api-status",
+        transcript_path: transcript,
+      });
+      expect(await readLocalRecord(sessionsDir, sid)).toBeNull();
+
+      const trace = (await readFile(join(ccDir, "session-trace.log"), "utf8"))
+        .trim().split("\n").map((line) => JSON.parse(line) as Record<string, unknown>);
+      expect(trace.some((e) =>
+        e.event === "suppress" && e.sessionId === sid && e.guard === "codex-promptless-rollout"
+      )).toBe(true);
+      expect(trace.some((e) => e.event === "create" && e.sessionId === sid)).toBe(true);
+      expect(trace.some((e) => e.event === "retire" && e.sessionId === sid)).toBe(true);
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  }, 20000);
+
+  test("SESSION_TRACE_PATH sits next to config and the permission trace", () => {
+    expect(SESSION_TRACE_PATH.endsWith("/.config/cc-status/session-trace.log")).toBe(true);
+  });
+});
+
 // --- native Codex plugin detection (D6/D7.1) --------------------------------------------------
 //
 // status-cmd learns to read the native plugin's state from <CODEX_HOME>/config.toml (naive line-scan,
@@ -1417,11 +1571,19 @@ describe("runHook turn_id sniff (claude entry invoked inside a Codex session)", 
       const day = join(home, ".codex", "sessions", "2026", "07", "09");
       await mkdir(day, { recursive: true });
       await writeFile(join(day, `rollout-2026-07-09T12-00-00-${String(payload.session_id)}.jsonl`), "");
+      const codexShaped = (typeof payload.turn_id === "string" && payload.turn_id.length > 0) ||
+        (typeof payload.transcript_path === "string" && payload.transcript_path.includes("/.codex/"));
+      // New Codex rows are intentionally deferred until a real user prompt exists. These tests target
+      // agent restamping/title resolution, so make their synthetic Codex invocation a first-prompt
+      // hook; the rollout filename above remains the independent no-internal-job evidence.
+      const effectivePayload = codexShaped
+        ? { ...payload, hook_event_name: "UserPromptSubmit", prompt: "real ask" }
+        : payload;
 
       const proc = Bun.spawn({
         cmd: ["bun", entry],
         env: { ...process.env, HOME: home, ...extraEnv },
-        stdin: Buffer.from(JSON.stringify(payload)),
+        stdin: Buffer.from(JSON.stringify(effectivePayload)),
         stdout: "ignore",
         stderr: "ignore",
       });
@@ -1566,7 +1728,7 @@ describe("runHook provisional reconcile (codex entry retires a matching provisio
       cmd: ["bun", entry],
       env: { ...process.env, HOME: home },
       stdin: Buffer.from(JSON.stringify({
-        session_id: "real-codex-sess", hook_event_name: "PreToolUse", tool_name: "apply_patch",
+        session_id: "real-codex-sess", hook_event_name: "UserPromptSubmit", prompt: "real ask",
         cwd: "/x/api-status", turn_id: "t1", transcript_path: "",
       })),
       stdout: "ignore", stderr: "ignore",

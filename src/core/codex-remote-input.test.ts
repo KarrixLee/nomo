@@ -154,6 +154,50 @@ describe("startCodexRemoteInput", () => {
     expect(fallback).not.toHaveProperty("permissionQuestions");
   });
 
+  test("description pressure sheds d and still relays a working bare-label picker", async () => {
+    const questions = Array.from({ length: 3 }, (_, index) => ({
+      ...request().questions[0],
+      id: `scope-${index}`,
+      header: `Scope ${index}`,
+      question: `How much should I change in area ${index}?`,
+      options: Array.from({ length: 8 }, (_, option) => ({
+        label: `Choice ${option}`,
+        description: "d".repeat(300),
+      })),
+    }));
+    const answerBlob = await encryptBlob(key, {
+      requestId: "relay-budget", decision: "answer", answers: ["Choice 0", "Choice 0", "Choice 0"],
+    });
+    let posted: Record<string, unknown> | undefined;
+    const appAnswers: unknown[] = [];
+    const handle = startCodexRemoteInput(request({ questions }), {
+      config,
+      fetchFn: (async (input, init) => {
+        if (String(input).endsWith("/v1/cc/decision")) {
+          posted = JSON.parse(String(init?.body));
+          return Response.json({ hold: true });
+        }
+        return Response.json({ status: "answered", answerBlob });
+      }) as typeof fetch,
+      readRecordFn: async () => record,
+      randomUUID: () => "relay-budget",
+      localApprovalsStateFn: async () => "on",
+      sleep: async () => {},
+      answerAppServer: async (answers) => { appAnswers.push(answers); return "sent"; },
+      interruptAppServer: async () => "sent",
+    });
+
+    expect(await handle.completion).toBe("answered");
+    expect(appAnswers).toEqual([{
+      "scope-0": ["Choice 0"], "scope-1": ["Choice 0"], "scope-2": ["Choice 0"],
+    }]);
+    const prompt = await decryptBlob(key, posted!.blob as string) as Record<string, unknown>;
+    const wireQuestions = prompt.permissionQuestions as Array<Record<string, unknown>>;
+    expect(wireQuestions).toHaveLength(3);
+    expect(wireQuestions.every((question) => !("d" in question))).toBe(true);
+    expect(wireQuestions[0].o).toEqual(Array.from({ length: 8 }, (_, index) => `Choice ${index}`));
+  });
+
   test("maps a phone deny to Codex turn interruption instead of forging an answer", async () => {
     const answerBlob = await encryptBlob(key, { requestId: "relay-deny", decision: "deny" });
     let interrupted = 0;

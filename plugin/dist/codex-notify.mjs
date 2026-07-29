@@ -92,7 +92,7 @@ async function sha256Hex(s) {
 }
 
 // src/core/shared.ts
-var PLUGIN_VERSION = "1.4.4";
+var PLUGIN_VERSION = "1.4.5";
 var CC_DIR = `${process.env.HOME}/.config/cc-status`;
 var SESSIONS_DIR = `${CC_DIR}/sessions`;
 var WATCHDOG_PID_PATH = `${CC_DIR}/watchdog.pid`;
@@ -964,6 +964,68 @@ function codexTailPendingApproval(tail) {
   }
   return false;
 }
+function codexFinalProposedPlan(row) {
+  const payload = row.payload;
+  if (!payload || payload.phase !== "final_answer")
+    return false;
+  let text = "";
+  if (row.type === "response_item" && payload.type === "message" && payload.role === "assistant") {
+    const content = payload.content;
+    if (!Array.isArray(content))
+      return false;
+    text = content.map((part) => {
+      if (typeof part !== "object" || part === null)
+        return "";
+      const p = part;
+      return p.type === "output_text" && typeof p.text === "string" ? p.text : "";
+    }).join("");
+  } else if (row.type === "event_msg" && payload.type === "agent_message") {
+    text = typeof payload.message === "string" ? payload.message : "";
+  } else {
+    return false;
+  }
+  const trimmed = text.trim();
+  return trimmed.startsWith("<proposed_plan>") && trimmed.endsWith("</proposed_plan>");
+}
+function codexPlanPickerStateFromTail(tail) {
+  let state = "none";
+  let finalPlanInTurn = false;
+  for (const line of tail.split(`
+`)) {
+    if (!line.trim())
+      continue;
+    if (!line.includes("event_msg") && !line.includes("response_item"))
+      continue;
+    let row;
+    try {
+      row = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (typeof row !== "object" || row === null)
+      continue;
+    const r = row;
+    if (codexFinalProposedPlan(r)) {
+      finalPlanInTurn = true;
+      continue;
+    }
+    if (r.type !== "event_msg")
+      continue;
+    const ptype = r.payload?.type;
+    if (ptype === "task_complete") {
+      if (finalPlanInTurn)
+        state = "pending";
+      finalPlanInTurn = false;
+    } else if (ptype === "task_started" || ptype === "user_message") {
+      if (state === "pending")
+        state = "resolved";
+      finalPlanInTurn = false;
+    } else if (ptype === "turn_aborted") {
+      finalPlanInTurn = false;
+    }
+  }
+  return state;
+}
 function codexTailPendingUserInput(tail) {
   const lines = tail.split(`
 `);
@@ -1072,14 +1134,36 @@ function claudeTailPendingApproval(tail) {
   return false;
 }
 var CLAUDE_HEADLESS_ARG_TOKENS = new Set(["-p", "--print", "--output-format"]);
-var CLAUDE_DAEMON_MARKERS = ["claude-mem", "worker-service"];
+var CLAUDE_DAEMON_MARKERS = [
+  "claude-mem",
+  "worker-service",
+  "daemon run --origin transient",
+  "bg-pty-host",
+  "bg-spare"
+];
+function claudeForkResumePredecessor(command) {
+  if (typeof command !== "string" || command.length === 0)
+    return;
+  const tokens = command.trim().split(/\s+/);
+  if (!tokens.includes("--fork-session") || !tokens.includes("--reply-on-resume"))
+    return;
+  const match = /(?:^|\s)--resume(?:=|\s+)(?:"([^"]+)"|'([^']+)'|(\S+))/.exec(command);
+  const resume = match?.[1] ?? match?.[2] ?? match?.[3];
+  if (!resume || !resume.endsWith(".jsonl"))
+    return;
+  const id = basename(resume, ".jsonl");
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id) ? id : undefined;
+}
 function claudeHeadlessInvocation(selfArgs, ancestorArgs) {
   const chain = [selfArgs, ...ancestorArgs].filter((s) => typeof s === "string" && s.length > 0);
   if (chain.some((args) => CLAUDE_DAEMON_MARKERS.some((m) => args.includes(m))))
     return true;
   if (typeof selfArgs !== "string" || selfArgs.length === 0)
     return false;
-  return selfArgs.trim().split(/\s+/).some((tok) => CLAUDE_HEADLESS_ARG_TOKENS.has(tok));
+  const tokens = selfArgs.trim().split(/\s+/);
+  if (tokens.some((tok) => CLAUDE_HEADLESS_ARG_TOKENS.has(tok)))
+    return true;
+  return tokens.includes("--fork-session") && tokens.includes("--reply-on-resume");
 }
 var CODEX_ROLLOUT_IDLE_SILENCE_MS = 30000;
 var CODEX_TURN_OPEN_EVENT = "task_started";
@@ -1094,6 +1178,7 @@ function codexTurnActiveFromTail(tail, silentForMs) {
   return tail.includes('"response_item"') || tail.includes('"event_msg"');
 }
 var TURN_STATE_TAIL_BYTES = 8 * 1024;
+var PLAN_PICKER_TAIL_BYTES = 64 * 1024;
 function rolloutPathFromLsof(output) {
   for (const line of output.split(`
 `)) {
@@ -1183,14 +1268,18 @@ async function codexNewestRolloutForCwd(cwd, home = codexHome()) {
   }
   return;
 }
+async function codexRolloutForPid(pid, deps) {
+  let rollout = await (deps.rolloutOf ?? rolloutViaLsof)(pid);
+  if (!rollout) {
+    const cwd = await (deps.cwdOf ?? cwdViaLsof)(pid);
+    if (cwd)
+      rollout = await (deps.rolloutForCwd ?? codexNewestRolloutForCwd)(cwd);
+  }
+  return rollout;
+}
 async function codexPidTurnActive(pid, deps = {}) {
   try {
-    let rollout = await (deps.rolloutOf ?? rolloutViaLsof)(pid);
-    if (!rollout) {
-      const cwd = await (deps.cwdOf ?? cwdViaLsof)(pid);
-      if (cwd)
-        rollout = await (deps.rolloutForCwd ?? codexNewestRolloutForCwd)(cwd);
-    }
+    const rollout = await codexRolloutForPid(pid, deps);
     if (!rollout)
       return false;
     const tail = await (deps.readTail ?? readSuffix)(rollout, TURN_STATE_TAIL_BYTES);
@@ -1198,6 +1287,19 @@ async function codexPidTurnActive(pid, deps = {}) {
     return codexTurnActiveFromTail(tail, (deps.now ?? Date.now)() - mtime);
   } catch {
     return false;
+  }
+}
+async function codexPidPlanPickerState(pid, deps = {}) {
+  try {
+    if (!(deps.isAlive ?? pidAlive)(pid))
+      return "exited";
+    const rollout = await codexRolloutForPid(pid, deps);
+    if (!rollout)
+      return "unknown";
+    const tail = await (deps.readTail ?? readSuffix)(rollout, PLAN_PICKER_TAIL_BYTES);
+    return codexPlanPickerStateFromTail(tail);
+  } catch {
+    return "unknown";
   }
 }
 function codexSentinelSessionId(pid) {
@@ -1281,6 +1383,9 @@ async function codexDiscoverLive(known, deps = {}) {
   }
   return out;
 }
+function claudeClearPredecessor(sessionId, hookPid, tracked) {
+  return tracked.filter((t) => t.sessionId !== sessionId && t.provisional !== true && t.agent !== "codex" && typeof t.pid === "number" && Number.isFinite(t.pid) && t.pid === hookPid).sort((a, b) => (b.ts ?? 0) - (a.ts ?? 0))[0]?.sessionId;
+}
 function codexChildSessionGhost(sessionId, transcriptPrefix, hookPid, tracked) {
   if (transcriptPrefix.trim().length > 0)
     return false;
@@ -1309,20 +1414,70 @@ async function codexRolloutExistsForSession(sessionId, home = codexHome()) {
   }
   return false;
 }
-async function codexInternalSessionGhost(sessionId, transcriptPrefix, transcriptPath, deps = {}) {
+function codexSubagentSource(source) {
+  return source === "subagent" || typeof source === "object" && source !== null && Object.prototype.hasOwnProperty.call(source, "subagent");
+}
+function codexRolloutCreationEvidence(prefix) {
+  let subagent = false;
+  let hasUserMessage = false;
+  for (const line of prefix.split(`
+`)) {
+    if (!line.trim())
+      continue;
+    if (!line.includes("session_meta") && !line.includes("user_message"))
+      continue;
+    let row;
+    try {
+      row = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (typeof row !== "object" || row === null)
+      continue;
+    const r = row;
+    const payload = r.payload;
+    if (r.type === "session_meta" && codexSubagentSource(payload?.source ?? r.source))
+      subagent = true;
+    if (r.type === "event_msg" && payload?.type === "user_message")
+      hasUserMessage = true;
+  }
+  return { subagent, hasUserMessage };
+}
+async function codexSessionCreationSuppression(sessionId, transcriptPrefix, transcriptPath, input = {}, deps = {}) {
+  const evidence = codexRolloutCreationEvidence(transcriptPrefix);
+  if (evidence.subagent) {
+    return {
+      guard: "codex-subagent-rollout",
+      reason: "session_meta.source is a subagent variant"
+    };
+  }
+  const hookName = typeof input.hook_event_name === "string" ? input.hook_event_name : "";
+  const hookPrompt = hookName === "UserPromptSubmit" && typeof input.prompt === "string" && input.prompt.trim().length > 0;
+  if (!evidence.hasUserMessage && !hookPrompt) {
+    return {
+      guard: "codex-promptless-rollout",
+      reason: "no rollout user_message or UserPromptSubmit prompt yet"
+    };
+  }
   if (transcriptPrefix.trim().length > 0)
-    return false;
+    return null;
   if (transcriptPath.length > 0) {
     try {
       await (deps.statOf ?? stat2)(transcriptPath);
-      return false;
+      return null;
     } catch {}
   }
   try {
-    return !await (deps.rolloutExists ?? codexRolloutExistsForSession)(sessionId);
-  } catch {
-    return true;
-  }
+    if (await (deps.rolloutExists ?? codexRolloutExistsForSession)(sessionId))
+      return null;
+  } catch {}
+  return {
+    guard: "codex-internal-no-rollout",
+    reason: "hook prompt exists but no transcript file or rollout can be found"
+  };
+}
+async function codexInternalSessionGhost(sessionId, transcriptPrefix, transcriptPath, deps = {}, input = {}) {
+  return await codexSessionCreationSuppression(sessionId, transcriptPrefix, transcriptPath, input, deps) !== null;
 }
 function findProvisionalForPid(provisionals, hookPid, ancestorsOf) {
   for (const p of provisionals)
@@ -1359,6 +1514,12 @@ var claudeAdapter = {
   },
   isHeadlessInvocation({ pid, ancestorsOf, commandOf }) {
     return claudeHeadlessInvocation(commandOf(pid), ancestorsOf(pid).map((p) => commandOf(p)));
+  },
+  forkResumePredecessor(command) {
+    return claudeForkResumePredecessor(command);
+  },
+  clearPredecessor({ sessionId, hookPid, tracked }) {
+    return claudeClearPredecessor(sessionId, hookPid, tracked);
   },
   sessionsDir: () => `${process.env.HOME}/.claude/projects`,
   sessionMatch: (name) => name.endsWith(".jsonl"),
@@ -1398,11 +1559,17 @@ var codexAdapter = {
   tailPendingAttentionKind(tail) {
     return codexTailPendingAttentionKind(tail);
   },
+  completedTurnWaitState({ pid, transcriptPath }) {
+    return codexPidPlanPickerState(pid, transcriptPath ? { rolloutOf: async () => transcriptPath } : {});
+  },
   isChildSessionGhost({ sessionId, prefix, hookPid, tracked }) {
     return codexChildSessionGhost(sessionId, prefix, hookPid, tracked);
   },
   isInternalSessionGhost({ sessionId, prefix, transcriptPath }) {
     return codexInternalSessionGhost(sessionId, prefix, transcriptPath);
+  },
+  sessionCreationSuppression({ sessionId, prefix, transcriptPath, input }) {
+    return codexSessionCreationSuppression(sessionId, prefix, transcriptPath, input);
   },
   sessionsDir: () => `${codexHome()}/sessions`,
   sessionMatch: (name) => name.startsWith("rollout-") && name.endsWith(".jsonl"),
@@ -1420,9 +1587,44 @@ var allAdapters = [claudeAdapter, codexAdapter];
 
 // src/core/hook.ts
 import { readdir as readdir2, readFile as readFile3, unlink as unlink2 } from "node:fs/promises";
+import { appendFileSync, statSync, truncateSync } from "node:fs";
 import { hostname } from "node:os";
 import { basename as basename2 } from "node:path";
 var TOOL_DETAIL = { ...claudeToolDetail, ...codexToolDetail };
+var SESSION_TRACE_PATH = `${CC_DIR}/session-trace.log`;
+var SESSION_TRACE_MAX_BYTES = 256 * 1024;
+var sessionTraceRotated = false;
+function appendSessionTrace(path, event) {
+  try {
+    appendFileSync(path, `${JSON.stringify({ ts: Date.now(), pid: process.pid, ...event })}
+`, { mode: 384 });
+  } catch {}
+}
+function rotateSessionTraceOnce(path) {
+  if (sessionTraceRotated)
+    return;
+  sessionTraceRotated = true;
+  try {
+    if (statSync(path).size > SESSION_TRACE_MAX_BYTES)
+      truncateSync(path, 0);
+  } catch {}
+}
+function traceSession(event) {
+  rotateSessionTraceOnce(SESSION_TRACE_PATH);
+  appendSessionTrace(SESSION_TRACE_PATH, event);
+}
+function sessionOrigin(input, ppid = process.ppid, command = pidCommand(ppid)) {
+  const stringField = (key) => typeof input[key] === "string" && input[key].length > 0 ? input[key] : undefined;
+  return {
+    hook_event_name: stringField("hook_event_name") ?? "",
+    ...stringField("source") ? { source: stringField("source") } : {},
+    ...stringField("agent_id") ? { agent_id: stringField("agent_id") } : {},
+    ...stringField("agent_type") ? { agent_type: stringField("agent_type") } : {},
+    ...stringField("cwd") ? { cwd: stringField("cwd") } : {},
+    ppid,
+    ...typeof command === "string" && command.length > 0 ? { ppid_command: command } : {}
+  };
+}
 function detailForHook(hookName, toolName, toolInput) {
   if (hookName === "PreToolUse" && toolName === "request_user_input") {
     return requestUserInputDetail(toolInput);
@@ -1503,14 +1705,14 @@ function buildBlob(input, machine, title, plan, agent = "claude", turnStartedAt,
     ...typeof at === "number" && Number.isFinite(at) ? { at } : {}
   };
 }
-async function buildEnvelope(input, machine, now, title, e2eKey, sentDone, agent = "claude", startedAt, turnStartedAt, pinnedLabel, model) {
+async function buildEnvelope(input, machine, now, title, e2eKey, sentDone, agent = "claude", startedAt, turnStartedAt, pinnedLabel, model, planOverride, attentionKindOverride) {
   if (typeof input !== "object" || input === null)
     return null;
   const i = input;
   if (typeof i.session_id !== "string" || i.session_id.length === 0)
     return null;
   const hookName = typeof i.hook_event_name === "string" ? i.hook_event_name : "";
-  const plan = planOp(hookName, i, sentDone);
+  const plan = planOverride ?? planOp(hookName, i, sentDone);
   if (!plan)
     return null;
   const base = { v: 2, sessionId: i.session_id, op: plan.op, prio: plan.prio, ts: now };
@@ -1518,7 +1720,7 @@ async function buildEnvelope(input, machine, now, title, e2eKey, sentDone, agent
     base.startedAt = startedAt;
   const at = Math.floor(now / 1000);
   const blob = await encryptBlob(e2eKey, buildBlob(i, machine, title, plan, agent, turnStartedAt, pinnedLabel, model, at));
-  const attentionKind = agent === "codex" && hookName === "PreToolUse" && i.tool_name === "request_user_input" ? "userInput" : undefined;
+  const attentionKind = attentionKindOverride ?? (agent === "codex" && hookName === "PreToolUse" && i.tool_name === "request_user_input" ? "userInput" : undefined);
   return { ...base, ...attentionKind ? { attentionKind } : {}, blob };
 }
 function buildPendingStash(input, machine, title, now, pid = process.ppid, agent = "claude", model) {
@@ -1540,7 +1742,7 @@ async function stashPendingEvent(input, machine, title, now, stashPath = PENDING
     await atomicWrite(stashPath, JSON.stringify(stash), 384);
   } catch {}
 }
-async function trackSession(sessionId, op, prio, status, blob, machine, label, transcript, agent = "claude", sessionStartedAt, turnStartedAt, turnId, title, pairingId, model) {
+async function trackSession(sessionId, op, prio, status, blob, machine, label, transcript, agent = "claude", sessionStartedAt, turnStartedAt, turnId, title, pairingId, model, pendingPlanPicker = false, pid = process.ppid, origin) {
   try {
     const path = `${SESSIONS_DIR}/${sessionId}.json`;
     if (op === "end") {
@@ -1548,7 +1750,7 @@ async function trackSession(sessionId, op, prio, status, blob, machine, label, t
       return;
     }
     const record = {
-      pid: process.ppid,
+      pid,
       machine,
       label,
       ts: Date.now(),
@@ -1565,7 +1767,9 @@ async function trackSession(sessionId, op, prio, status, blob, machine, label, t
       ...typeof turnId === "string" && turnId.length > 0 ? { turnId } : {},
       ...typeof title === "string" && title.length > 0 ? { title } : {},
       ...typeof model === "string" && model.length > 0 ? { model } : {},
-      ...typeof pairingId === "string" && pairingId.length > 0 ? { pairingId } : {}
+      ...typeof pairingId === "string" && pairingId.length > 0 ? { pairingId } : {},
+      ...pendingPlanPicker ? { pendingPlanPicker: true } : {},
+      ...origin ? { origin } : {}
     };
     await atomicWrite(path, JSON.stringify(record), 384);
   } catch {}
@@ -1621,10 +1825,38 @@ async function readTrackedSessions() {
       continue;
     try {
       const r = JSON.parse(await readFile3(`${SESSIONS_DIR}/${f}`, "utf8"));
-      out.push({ sessionId: basename2(f, ".json"), pid: r.pid, provisional: r.provisional, agent: r.agent });
+      out.push({ sessionId: basename2(f, ".json"), pid: r.pid, provisional: r.provisional, agent: r.agent, ts: r.ts });
     } catch {}
   }
   return out;
+}
+async function retireLineageSession(config, sessionId, agent, input, reason) {
+  let delivered = false;
+  try {
+    const res = await fetch(`${config.url}/v1/cc/event`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-cc-pairing": config.pairingId,
+        "x-cc-auth": config.pcSecret,
+        "x-cc-version": PLUGIN_VERSION,
+        "x-cc-approvals": await localApprovalsState()
+      },
+      body: JSON.stringify({ v: 2, sessionId, op: "end", prio: 0, ts: Date.now() }),
+      signal: AbortSignal.timeout(2000)
+    });
+    delivered = res.ok;
+  } catch {}
+  await unlink2(`${SESSIONS_DIR}/${sessionId}.json`).catch(() => {});
+  traceSession({
+    event: "retire",
+    sessionId,
+    agent,
+    hook_event_name: input.hook_event_name,
+    source: input.source,
+    reason,
+    delivered
+  });
 }
 async function readStdin() {
   const chunks = [];
@@ -1667,51 +1899,156 @@ async function runHook(agent) {
       return;
     }
     const machine = config.machineName ?? hostname().replace(/\.local$/, "");
-    const existingRecord = await readRecord(input.session_id);
-    if (!existingRecord && adapter2.isChildSessionGhost) {
-      const tracked = await readTrackedSessions();
-      if (tracked.length > 0 && adapter2.isChildSessionGhost({
-        sessionId: input.session_id,
-        prefix: await getPrefix(),
-        hookPid: process.ppid,
-        tracked
-      }))
-        return;
+    const reportedSessionId = input.session_id;
+    const hookName = typeof input.hook_event_name === "string" ? input.hook_event_name : "";
+    const sessionStartSource = typeof input.source === "string" ? input.source : "";
+    const hookPid = process.ppid;
+    const hookCommand = pidCommand(hookPid);
+    let sessionId = reportedSessionId;
+    let eventInput = input;
+    let reusedForkPredecessor = false;
+    let existingRecord = await readRecord(reportedSessionId);
+    let trackedCache;
+    const trackedSessions = async () => {
+      if (trackedCache === undefined)
+        trackedCache = await readTrackedSessions();
+      return trackedCache;
+    };
+    const suppress = (suppression, extra = {}) => traceSession({
+      event: "suppress",
+      sessionId: reportedSessionId,
+      agent,
+      hook_event_name: hookName,
+      ...sessionStartSource ? { source: sessionStartSource } : {},
+      ...suppression,
+      ...extra
+    });
+    const clearLineage = !existingRecord && hookName === "SessionStart" && sessionStartSource === "clear" && adapter2.clearPredecessor;
+    if (clearLineage && adapter2.clearPredecessor) {
+      const predecessor = adapter2.clearPredecessor({
+        sessionId: reportedSessionId,
+        hookPid,
+        tracked: await trackedSessions()
+      });
+      if (predecessor) {
+        await retireLineageSession(config, predecessor, agent, input, "claude SessionStart source:clear");
+        trackedCache = trackedCache?.filter((t) => t.sessionId !== predecessor);
+      }
     }
-    if (!existingRecord && adapter2.isInternalSessionGhost && await adapter2.isInternalSessionGhost({
-      sessionId: input.session_id,
-      prefix: await getPrefix(),
-      transcriptPath
-    }))
-      return;
-    if (!existingRecord && adapter2.isHeadlessInvocation && adapter2.isHeadlessInvocation({
-      pid: process.ppid,
+    if (!existingRecord && hookName === "SessionStart" && adapter2.forkResumePredecessor) {
+      const predecessor = adapter2.forkResumePredecessor(hookCommand);
+      const predecessorRecord = predecessor ? await readRecord(predecessor) : null;
+      if (predecessor && predecessorRecord) {
+        sessionId = predecessor;
+        eventInput = { ...input, session_id: predecessor };
+        existingRecord = predecessorRecord;
+        reusedForkPredecessor = true;
+        suppress({
+          guard: "claude-fork-reemission",
+          reason: "daemon fork/resume SessionStart reused the already-tracked predecessor row"
+        }, { predecessorSessionId: predecessor, effectiveSessionId: predecessor });
+      }
+    }
+    if (!existingRecord && adapter2.isChildSessionGhost) {
+      const tracked = await trackedSessions();
+      if (tracked.length > 0 && adapter2.isChildSessionGhost({
+        sessionId: reportedSessionId,
+        prefix: await getPrefix(),
+        hookPid,
+        tracked
+      })) {
+        suppress({
+          guard: "codex-child-session",
+          reason: "never-tracked empty child id shares a pid with a tracked Codex session"
+        });
+        return;
+      }
+    }
+    if (!existingRecord && adapter2.sessionCreationSuppression) {
+      const suppression = await adapter2.sessionCreationSuppression({
+        sessionId: reportedSessionId,
+        prefix: await getPrefix(),
+        transcriptPath,
+        input
+      });
+      if (suppression) {
+        suppress(suppression);
+        return;
+      }
+    }
+    const continuedForkPrompt = hookName === "UserPromptSubmit" && typeof input.prompt === "string" && input.prompt.trim().length > 0 && !!adapter2.forkResumePredecessor?.(hookCommand);
+    if (!existingRecord && !continuedForkPrompt && adapter2.isHeadlessInvocation && adapter2.isHeadlessInvocation({
+      pid: hookPid,
       ancestorsOf: pidAncestors,
       commandOf: pidCommand
-    }))
+    })) {
+      suppress({
+        guard: "claude-headless-invocation",
+        reason: "invoking process or ancestor matches a non-interactive/daemon discriminator"
+      });
       return;
+    }
     const title = await readTitle() ?? existingRecord?.title;
+    if (!existingRecord && clearLineage && !title) {
+      suppress({
+        guard: "claude-clear-untitled",
+        reason: "clear-lineage SessionStart has no prompt/title yet"
+      });
+      return;
+    }
     const model = await readModel() ?? existingRecord?.model;
     const sentDone = existingRecord?.sentDone === true;
     const cachedStart = typeof existingRecord?.sessionStartedAt === "number" && Number.isFinite(existingRecord.sessionStartedAt) ? existingRecord.sessionStartedAt : undefined;
     const startedAt = cachedStart ?? transcriptStartMs(await getPrefix());
-    const hookName = typeof input.hook_event_name === "string" ? input.hook_event_name : "";
     const cachedTurn = typeof existingRecord?.turnStartedAt === "number" && Number.isFinite(existingRecord.turnStartedAt) ? existingRecord.turnStartedAt : undefined;
-    const sessionStartSource = typeof input.source === "string" ? input.source : "";
     const isTurnOpener = hookName === "UserPromptSubmit" || hookName === "SessionStart" && sessionStartSource !== "compact";
     const turnStartedAt = isTurnOpener ? Math.floor(Date.now() / 1000) : cachedTurn;
     const turnId = typeof input.turn_id === "string" && input.turn_id.length > 0 ? input.turn_id : undefined;
-    const plan = planOp(hookName, input, sentDone);
+    let plan = planOp(hookName, input, sentDone);
     if (!plan)
       return;
+    let pendingPlanPicker = false;
+    let attentionKind;
+    if (plan.op === "done" && adapter2.completedTurnWaitState) {
+      const wait = await adapter2.completedTurnWaitState({ pid: hookPid, transcriptPath });
+      if (wait === "pending") {
+        plan = { op: "update", prio: 1, status: "needsAttention" };
+        attentionKind = "userInput";
+        pendingPlanPicker = true;
+      }
+    }
     const label = typeof existingRecord?.label === "string" && existingRecord.label.length > 0 ? existingRecord.label : typeof input.cwd === "string" && input.cwd.length > 0 ? basename2(input.cwd) : "session";
-    const envelope = await buildEnvelope(input, machine, Date.now(), title, config.e2eKey, sentDone, agent, startedAt, turnStartedAt, label, model);
+    const envelope = await buildEnvelope(eventInput, machine, Date.now(), title, config.e2eKey, sentDone, agent, startedAt, turnStartedAt, label, model, plan, attentionKind);
     if (!envelope)
       return;
-    await trackSession(input.session_id, plan.op, plan.prio, plan.status, envelope.blob, machine, label, transcriptPath, agent, startedAt, turnStartedAt, turnId, title, config.pairingId, model);
+    const createsRecord = !existingRecord && plan.op !== "end";
+    const retiresRecord = !!existingRecord && plan.op === "end";
+    const origin = existingRecord?.origin ?? sessionOrigin(input, hookPid, hookCommand);
+    const recordPid = reusedForkPredecessor ? existingRecord.pid : hookPid;
+    const recordTranscript = reusedForkPredecessor ? existingRecord.transcript ?? transcriptPath : transcriptPath;
+    await trackSession(sessionId, plan.op, plan.prio, plan.status, envelope.blob, machine, label, recordTranscript, agent, startedAt, turnStartedAt, turnId, title, config.pairingId, model, pendingPlanPicker, recordPid, origin);
+    if (createsRecord) {
+      traceSession({
+        event: "create",
+        sessionId,
+        agent,
+        hook_event_name: hookName,
+        ...sessionStartSource ? { source: sessionStartSource } : {},
+        origin
+      });
+    } else if (retiresRecord) {
+      traceSession({
+        event: "retire",
+        sessionId,
+        agent,
+        hook_event_name: hookName,
+        ...sessionStartSource ? { source: sessionStartSource } : {},
+        reason: "hook op:end"
+      });
+    }
     ensureWatchdog();
     if (agent === "codex")
-      await reconcileProvisional(config, process.ppid);
+      await reconcileProvisional(config, hookPid);
     const res = await fetch(`${config.url}/v1/cc/event`, {
       method: "POST",
       headers: {
@@ -1728,7 +2065,7 @@ async function runHook(agent) {
       await atomicWrite(LAST_SEND_PATH, String(Date.now()));
       await resetGoneStrikes();
       if (plan.op === "done")
-        await markDoneDelivered(input.session_id);
+        await markDoneDelivered(sessionId);
     } else if (res.status === 404 || res.status === 410) {
       const strikes = await recordGoneStrike();
       if (strikes >= GONE_STRIKE_LIMIT) {
@@ -1800,7 +2137,7 @@ async function runNotify(raw, deferMs = notifyDeferMs(), sleep = (ms) => new Pro
       return;
     const sessionId = input.session_id;
     const payloadTurnId = typeof input.turn_id === "string" && input.turn_id.length > 0 ? input.turn_id : undefined;
-    const record = await readRecord(sessionId);
+    let record = await readRecord(sessionId);
     if (record?.turnId && payloadTurnId && record.turnId !== payloadTurnId)
       return;
     if (record?.sentDone === true)
@@ -1812,6 +2149,8 @@ async function runNotify(raw, deferMs = notifyDeferMs(), sleep = (ms) => new Pro
         return;
       if (after?.turnId && payloadTurnId && after.turnId !== payloadTurnId)
         return;
+      if (after)
+        record = after;
     }
     const machine = config.machineName ?? hostname2().replace(/\.local$/, "");
     const title = await codexAdapter.title({ sessionId, prefix: "", input }) ?? notifyFallbackTitle(input["input-messages"]);
@@ -1819,11 +2158,17 @@ async function runNotify(raw, deferMs = notifyDeferMs(), sleep = (ms) => new Pro
     const turnStartedAt = typeof record?.turnStartedAt === "number" && Number.isFinite(record.turnStartedAt) ? record.turnStartedAt : undefined;
     const model = typeof record?.model === "string" && record.model.length > 0 ? record.model : undefined;
     const now = Date.now();
-    const envelope = await buildEnvelope(input, machine, now, title, config.e2eKey, false, "codex", startedAt, turnStartedAt, undefined, model);
+    const sessionPid = typeof record?.pid === "number" && Number.isFinite(record.pid) ? record.pid : process.ppid;
+    const transcriptPath = typeof record?.transcript === "string" ? record.transcript : "";
+    const wait = await codexAdapter.completedTurnWaitState?.({ pid: sessionPid, transcriptPath });
+    const pendingPlanPicker = wait === "pending";
+    const plan = pendingPlanPicker ? { op: "update", prio: 1, status: "needsAttention" } : { op: "done", prio: 0, status: "done" };
+    const attentionKind = pendingPlanPicker ? "userInput" : undefined;
+    const envelope = await buildEnvelope(input, machine, now, title, config.e2eKey, false, "codex", startedAt, turnStartedAt, undefined, model, plan, attentionKind);
     if (!envelope)
       return;
     const label = typeof input.cwd === "string" && input.cwd.length > 0 ? basename3(input.cwd) : "session";
-    await trackSession(sessionId, "done", 0, "done", envelope.blob, machine, label, typeof record?.transcript === "string" ? record.transcript : "", "codex", startedAt, turnStartedAt, payloadTurnId, title ?? record?.title, config.pairingId, model);
+    await trackSession(sessionId, plan.op, plan.prio, plan.status, envelope.blob, machine, label, transcriptPath, "codex", startedAt, turnStartedAt, payloadTurnId, title ?? record?.title, config.pairingId, model, pendingPlanPicker, sessionPid, record?.origin ?? sessionOrigin(input, sessionPid, pidCommand(sessionPid)));
     ensureWatchdog();
     const res = await fetch(`${config.url}/v1/cc/event`, {
       method: "POST",
@@ -1839,7 +2184,8 @@ async function runNotify(raw, deferMs = notifyDeferMs(), sleep = (ms) => new Pro
     });
     if (res.ok) {
       await atomicWrite(LAST_SEND_PATH, String(now));
-      await markDoneDelivered(sessionId);
+      if (plan.op === "done")
+        await markDoneDelivered(sessionId);
     }
   } catch {}
 }

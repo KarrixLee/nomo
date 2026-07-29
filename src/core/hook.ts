@@ -18,14 +18,18 @@
 // this (inlined into each entry) to a .mjs.
 
 import { readdir, readFile, unlink } from "node:fs/promises";
+import { appendFileSync, statSync, truncateSync } from "node:fs";
 import { hostname } from "node:os";
 import { basename } from "node:path";
 import { encryptBlob } from "./crypto";
-import { adapterFor, claudeToolDetail, codexToolDetail, findProvisionalForPid, requestUserInputDetail, TrackedSessionLite } from "./adapter";
 import {
-  AgentKind, atomicWrite, CCOp, CCStatus, Config, ensureWatchdog, GONE_STRIKE_LIMIT,
+  adapterFor, claudeToolDetail, codexToolDetail, findProvisionalForPid, requestUserInputDetail,
+  SessionCreationSuppression, TrackedSessionLite,
+} from "./adapter";
+import {
+  AgentKind, atomicWrite, CC_DIR, CCOp, CCStatus, Config, ensureWatchdog, GONE_STRIKE_LIMIT,
   LAST_SEND_PATH, lastHookPath, loadConfig, loadPendingConfig, localApprovalsState, PENDING_STASH_PATH, PendingEventStash, pidAncestors, pidCommand, PLUGIN_VERSION, readPrefix,
-  readRecord, recordGoneStrike, removeRevokedConfig, resetGoneStrikes, SessionRecord, SESSIONS_DIR,
+  readRecord, recordGoneStrike, removeRevokedConfig, resetGoneStrikes, SessionOrigin, SessionRecord, SESSIONS_DIR,
 } from "./shared";
 
 // Re-export the per-agent title/interrupt/tool-detail surface so existing importers (and cc-status's
@@ -45,6 +49,53 @@ export interface OpPlan {
 /// so this single merged lookup covers whichever agent fired the hook. Unknown tools (e.g. MCP) get
 /// no detail rather than a wrong guess — the phone then just shows "Working".
 const TOOL_DETAIL: Record<string, string> = { ...claudeToolDetail, ...codexToolDetail };
+
+// ---- session provenance + operational trace -------------------------------------------------
+
+/** Append-only, local-only session lifecycle trace next to config.json. Nothing here enters the
+ *  encrypted blob or clear envelope. */
+export const SESSION_TRACE_PATH = `${CC_DIR}/session-trace.log`;
+const SESSION_TRACE_MAX_BYTES = 256 * 1024;
+let sessionTraceRotated = false;
+
+/** Sync one-line JSON append, matching permission-trace.log's durability/0600/best-effort contract. */
+function appendSessionTrace(path: string, event: object): void {
+  try {
+    appendFileSync(path, `${JSON.stringify({ ts: Date.now(), pid: process.pid, ...event })}\n`, { mode: 0o600 });
+  } catch { /* tracing must never surface into an agent session */ }
+}
+
+/** Rotate at most once per hook process; otherwise the trace is strictly append-only. */
+function rotateSessionTraceOnce(path: string): void {
+  if (sessionTraceRotated) return;
+  sessionTraceRotated = true;
+  try {
+    if (statSync(path).size > SESSION_TRACE_MAX_BYTES) truncateSync(path, 0);
+  } catch { /* absent/unreadable → nothing to rotate */ }
+}
+
+function traceSession(event: object): void {
+  rotateSessionTraceOnce(SESSION_TRACE_PATH);
+  appendSessionTrace(SESSION_TRACE_PATH, event);
+}
+
+/** Build the local record provenance from hook stdin plus the exact process command that invoked this
+ *  hook. Exported so non-hook record creators (the Codex notify backstop) can use the same shape. */
+export function sessionOrigin(
+  input: Record<string, unknown>, ppid: number = process.ppid, command: string | undefined = pidCommand(ppid),
+): SessionOrigin {
+  const stringField = (key: string): string | undefined =>
+    typeof input[key] === "string" && (input[key] as string).length > 0 ? input[key] as string : undefined;
+  return {
+    hook_event_name: stringField("hook_event_name") ?? "",
+    ...(stringField("source") ? { source: stringField("source") } : {}),
+    ...(stringField("agent_id") ? { agent_id: stringField("agent_id") } : {}),
+    ...(stringField("agent_type") ? { agent_type: stringField("agent_type") } : {}),
+    ...(stringField("cwd") ? { cwd: stringField("cwd") } : {}),
+    ppid,
+    ...(typeof command === "string" && command.length > 0 ? { ppid_command: command } : {}),
+  };
+}
 
 /** The working sub-status for a tool hook: the tool's label before it runs, "thinking" after. A Codex
  *  Plan question carries its encrypted first-question preview instead of a generic tool label. */
@@ -210,12 +261,13 @@ export function buildBlob(input: Record<string, unknown>, machine: string, title
 export async function buildEnvelope(
   input: unknown, machine: string, now: number, title: string | undefined, e2eKey: Uint8Array, sentDone: boolean,
   agent: AgentKind = "claude", startedAt?: number, turnStartedAt?: number, pinnedLabel?: string, model?: string,
+  planOverride?: OpPlan, attentionKindOverride?: "userInput",
 ): Promise<Record<string, unknown> | null> {
   if (typeof input !== "object" || input === null) return null;
   const i = input as Record<string, unknown>;
   if (typeof i.session_id !== "string" || i.session_id.length === 0) return null;
   const hookName = typeof i.hook_event_name === "string" ? i.hook_event_name : "";
-  const plan = planOp(hookName, i, sentDone);
+  const plan = planOverride ?? planOp(hookName, i, sentDone);
   if (!plan) return null;
   // startedAt (epoch ms, matching `ts`'s unit) rides on EVERY op — including end, whose final frame the
   // worker times too. OMITTED when unknown so the wire stays byte-identical to an old plugin's post.
@@ -227,9 +279,11 @@ export async function buildEnvelope(
   // and re-sent verbatim by every watchdog heartbeat so an idle-but-heartbeated session ages out.
   const at = Math.floor(now / 1000);
   const blob = await encryptBlob(e2eKey, buildBlob(i, machine, title, plan, agent, turnStartedAt, pinnedLabel, model, at));
-  const attentionKind = agent === "codex" && hookName === "PreToolUse" && i.tool_name === "request_user_input"
-    ? "userInput" as const
-    : undefined;
+  const attentionKind = attentionKindOverride ?? (
+    agent === "codex" && hookName === "PreToolUse" && i.tool_name === "request_user_input"
+      ? "userInput" as const
+      : undefined
+  );
   return { ...base, ...(attentionKind ? { attentionKind } : {}), blob };
 }
 
@@ -287,6 +341,7 @@ export async function trackSession(
   sessionId: string, op: CCOp, prio: 0 | 1, status: CCStatus, blob: string | undefined,
   machine: string, label: string, transcript: string, agent: AgentKind = "claude", sessionStartedAt?: number,
   turnStartedAt?: number, turnId?: string, title?: string, pairingId?: string, model?: string,
+  pendingPlanPicker: boolean = false, pid: number = process.ppid, origin?: SessionOrigin,
 ): Promise<void> {
   try {
     const path = `${SESSIONS_DIR}/${sessionId}.json`;
@@ -298,7 +353,7 @@ export async function trackSession(
     // otherwise the semantic status (working / needsAttention / done). `agent` (omitted for claude)
     // tells the watchdog which interrupt marker to scan the transcript tail for.
     const record: SessionRecord = {
-      pid: process.ppid,
+      pid,
       machine,
       label,
       ts: Date.now(),
@@ -339,6 +394,8 @@ export async function trackSession(
       // staleness heartbeat re-sends `blob` verbatim, so it must only do that while the pairing that
       // sealed it is still the live one — otherwise the phone renders an undecryptable ghost forever.
       ...(typeof pairingId === "string" && pairingId.length > 0 ? { pairingId } : {}),
+      ...(pendingPlanPicker ? { pendingPlanPicker: true } : {}),
+      ...(origin ? { origin } : {}),
     };
     // Owner-only (0600): the record carries hostname, cwd basename, the session pid, and the ABSOLUTE
     // transcript path — never group/world readable, matching config.json / the pending stash.
@@ -414,10 +471,49 @@ async function readTrackedSessions(): Promise<TrackedSessionLite[]> {
     if (!f.endsWith(".json")) continue;
     try {
       const r = JSON.parse(await readFile(`${SESSIONS_DIR}/${f}`, "utf8")) as SessionRecord;
-      out.push({ sessionId: basename(f, ".json"), pid: r.pid, provisional: r.provisional, agent: r.agent });
+      out.push({ sessionId: basename(f, ".json"), pid: r.pid, provisional: r.provisional, agent: r.agent, ts: r.ts });
     } catch { /* half-written / corrupt → skip */ }
   }
   return out;
+}
+
+/** Explicit lineage retirement for Claude `/clear`: post the predecessor's blob-less op:end and
+ *  unlink its local record because Claude never emits SessionEnd for that id. The unlink is deliberate
+ *  even on a failed POST: leaving a same-live-pid record makes the watchdog believe the predecessor is
+ *  healthy forever, while the worker's bounded eviction remains the network-failure backstop. */
+async function retireLineageSession(
+  config: Config,
+  sessionId: string,
+  agent: AgentKind,
+  input: Record<string, unknown>,
+  reason: string,
+): Promise<void> {
+  let delivered = false;
+  try {
+    const res = await fetch(`${config.url}/v1/cc/event`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-cc-pairing": config.pairingId,
+        "x-cc-auth": config.pcSecret,
+        "x-cc-version": PLUGIN_VERSION,
+        "x-cc-approvals": await localApprovalsState(),
+      },
+      body: JSON.stringify({ v: 2, sessionId, op: "end", prio: 0, ts: Date.now() }),
+      signal: AbortSignal.timeout(2000),
+    });
+    delivered = res.ok;
+  } catch { /* best-effort; local unlink + worker eviction are the fallback */ }
+  await unlink(`${SESSIONS_DIR}/${sessionId}.json`).catch(() => {});
+  traceSession({
+    event: "retire",
+    sessionId,
+    agent,
+    hook_event_name: input.hook_event_name,
+    source: input.source,
+    reason,
+    delivered,
+  });
 }
 
 /** Read the whole of stdin (the hook JSON) as UTF-8. process.stdin is an async iterable of Buffers
@@ -518,36 +614,105 @@ export async function runHook(agent: AgentKind): Promise<void> {
     }
 
     const machine = config.machineName ?? hostname().replace(/\.local$/, "");
+    const reportedSessionId = input.session_id as string;
+    const hookName = typeof input.hook_event_name === "string" ? input.hook_event_name : "";
+    const sessionStartSource = typeof input.source === "string" ? input.source : "";
+    const hookPid = process.ppid;
+    const hookCommand = pidCommand(hookPid);
+    let sessionId = reportedSessionId;
+    let eventInput = input;
+    let reusedForkPredecessor = false;
 
     // One record read serves the child-ghost guard, the sentDone re-arm, and the cached session
     // start. A cached start (an earlier hook parsed it) wins so we never re-parse and it survives the
     // transcript later vanishing; otherwise parse it from the same head `readTitle` reads (memoized —
     // no second read). Unknown → omitted from the envelope; the worker keeps its first-seen fallback.
-    const existingRecord = await readRecord(input.session_id);
+    let existingRecord = await readRecord(reportedSessionId);
+    let trackedCache: TrackedSessionLite[] | undefined;
+    const trackedSessions = async (): Promise<TrackedSessionLite[]> => {
+      if (trackedCache === undefined) trackedCache = await readTrackedSessions();
+      return trackedCache;
+    };
+    const suppress = (suppression: SessionCreationSuppression, extra: object = {}): void => traceSession({
+      event: "suppress",
+      sessionId: reportedSessionId,
+      agent,
+      hook_event_name: hookName,
+      ...(sessionStartSource ? { source: sessionStartSource } : {}),
+      ...suppression,
+      ...extra,
+    });
+
+    // `/clear` lineage: Claude mints a new id on the SAME TUI process and never sends SessionEnd for
+    // the predecessor. Retire the newest old Claude row before deciding whether the new id is ready
+    // to surface. This is adapter-owned pid lineage; the shared pipeline only executes the retirement.
+    const clearLineage = !existingRecord && hookName === "SessionStart" &&
+      sessionStartSource === "clear" && adapter.clearPredecessor;
+    if (clearLineage && adapter.clearPredecessor) {
+      const predecessor = adapter.clearPredecessor({
+        sessionId: reportedSessionId,
+        hookPid,
+        tracked: await trackedSessions(),
+      });
+      if (predecessor) {
+        await retireLineageSession(config, predecessor, agent, input, "claude SessionStart source:clear");
+        // The cached projection still contains the retired id, but no later guard in this invocation
+        // should treat it as live (notably same-pid child logic if adapters evolve).
+        trackedCache = trackedCache?.filter((t) => t.sessionId !== predecessor);
+      }
+    }
+
+    // Claude daemon fork/replay: the command names the old transcript. If that predecessor is already
+    // tracked, reuse its row for the replayed SessionStart rather than minting a second id. This is not
+    // a blanket fork suppression: a later real UserPromptSubmit under the new id does not take this
+    // SessionStart-only alias path and can create the genuinely continued fork normally.
+    if (!existingRecord && hookName === "SessionStart" && adapter.forkResumePredecessor) {
+      const predecessor = adapter.forkResumePredecessor(hookCommand);
+      const predecessorRecord = predecessor ? await readRecord(predecessor) : null;
+      if (predecessor && predecessorRecord) {
+        sessionId = predecessor;
+        eventInput = { ...input, session_id: predecessor };
+        existingRecord = predecessorRecord;
+        reusedForkPredecessor = true;
+        suppress({
+          guard: "claude-fork-reemission",
+          reason: "daemon fork/resume SessionStart reused the already-tracked predecessor row",
+        }, { predecessorSessionId: predecessor, effectiveSessionId: predecessor });
+      }
+    }
 
     // Child-session ghost guard (adapter seam; codex-only in practice): the ChatGPT.app
     // `codex app-server` spawns child session ids with NO rollout content that share their pid with
     // the real session — each would otherwise become a brand-new, forever-empty phone row. Only consulted
     // for a NEVER-tracked id, so an already-live session can never be silenced by it.
     if (!existingRecord && adapter.isChildSessionGhost) {
-      const tracked = await readTrackedSessions();
+      const tracked = await trackedSessions();
       if (tracked.length > 0 && adapter.isChildSessionGhost({
-        sessionId: input.session_id, prefix: await getPrefix(), hookPid: process.ppid, tracked,
-      })) return;
+        sessionId: reportedSessionId, prefix: await getPrefix(), hookPid, tracked,
+      })) {
+        suppress({
+          guard: "codex-child-session",
+          reason: "never-tracked empty child id shares a pid with a tracked Codex session",
+        });
+        return;
+      }
     }
 
-    // Top-level internal-job ghost guard (adapter seam; codex-only in practice): ChatGPT.app's
-    // background `codex app-server` also runs TOP-LEVEL internal jobs (e.g. its "hyperpersonalized
-    // suggestions" generator) whose pid owns no other tracked session, so the child-session net above
-    // can't catch them. A REAL codex session has rollout evidence by the time any hook fires (content
-    // in the prefix, or at least the rollout file on disk — codex writes session_meta at session
-    // creation); an internal job never does. With no evidence the event is skipped — a DEFER, not a
-    // verdict: a real session racing its first flush just mirrors on its next hook (they fire many
-    // times per turn), while a phantom row would have stuck forever. Only consulted for a NEVER-
-    // tracked id, so an already-live session can never be silenced by it.
-    if (!existingRecord && adapter.isInternalSessionGhost && await adapter.isInternalSessionGhost({
-      sessionId: input.session_id, prefix: await getPrefix(), transcriptPath,
-    })) return;
+    // Detailed adapter-owned create guard. Codex uses it for subagent rollouts, promptless rollouts,
+    // and the older no-rollout app-server jobs. Every silent would-have-created return is traced with
+    // the exact guard/reason; a later real prompt simply re-enters with no record and creates normally.
+    if (!existingRecord && adapter.sessionCreationSuppression) {
+      const suppression = await adapter.sessionCreationSuppression({
+        sessionId: reportedSessionId,
+        prefix: await getPrefix(),
+        transcriptPath,
+        input,
+      });
+      if (suppression) {
+        suppress(suppression);
+        return;
+      }
+    }
 
     // Headless/daemon-invocation guard (adapter seam; claude-only in practice): a `claude` that loads
     // plugins but isn't a human's interactive session — claude-mem's `claude --output-format stream-json`
@@ -556,15 +721,33 @@ export async function runHook(agent: AgentKind): Promise<void> {
     // that only the watchdog's 30-min idle reap (or the worker's eviction) ever clears. The invoking
     // process's argv (process.ppid) and its ancestor chain fingerprint it. Only consulted for a NEVER-
     // tracked id, so an already-live interactive session can never be silenced.
-    if (!existingRecord && adapter.isHeadlessInvocation && adapter.isHeadlessInvocation({
-      pid: process.ppid, ancestorsOf: pidAncestors, commandOf: pidCommand,
-    })) return;
+    const continuedForkPrompt = hookName === "UserPromptSubmit" &&
+      typeof input.prompt === "string" && input.prompt.trim().length > 0 &&
+      !!adapter.forkResumePredecessor?.(hookCommand);
+    if (!existingRecord && !continuedForkPrompt && adapter.isHeadlessInvocation && adapter.isHeadlessInvocation({
+      pid: hookPid, ancestorsOf: pidAncestors, commandOf: pidCommand,
+    })) {
+      suppress({
+        guard: "claude-headless-invocation",
+        reason: "invoking process or ancestor matches a non-interactive/daemon discriminator",
+      });
+      return;
+    }
 
     // Keep the LAST NON-EMPTY title, like model below: a later hook whose bounded reads find nothing
     // (the freshest ai-title outside both windows, a giant unparseable head line, a transcript raced
     // away) must not regress the phone's title to "" — the record's cached title backstops the live
     // blob, not just the watchdog's rebuilt ones.
     const title = (await readTitle()) ?? existingRecord?.title;
+    // A clear transition without any title is not yet a useful visible session. The predecessor has
+    // already been retired above; defer this new id until its first prompt/title-bearing hook.
+    if (!existingRecord && clearLineage && !title) {
+      suppress({
+        guard: "claude-clear-untitled",
+        reason: "clear-lineage SessionStart has no prompt/title yet",
+      });
+      return;
+    }
     // Keep the LAST NON-EMPTY model, like title: a hook whose tail read finds nothing (transcript
     // raced away, no assistant turn in the window) must not drop the badge the previous hook set.
     const model = (await readModel()) ?? existingRecord?.model;
@@ -572,7 +755,6 @@ export async function runHook(agent: AgentKind): Promise<void> {
     const cachedStart = typeof existingRecord?.sessionStartedAt === "number" && Number.isFinite(existingRecord.sessionStartedAt)
       ? existingRecord.sessionStartedAt : undefined;
     const startedAt = cachedStart ?? transcriptStartMs(await getPrefix());
-    const hookName = typeof input.hook_event_name === "string" ? input.hook_event_name : "";
     // The CURRENT TURN's anchor (epoch SECONDS — the blob's unit, unlike the ms everywhere else). A
     // UserPromptSubmit opens a fresh turn — BOTH agents fire it under this exact hook_event_name (codex
     // sends Claude's hook names verbatim; see the codex-payload planOp tests) — so it stamps NOW and the
@@ -589,15 +771,27 @@ export async function runHook(agent: AgentKind): Promise<void> {
     // fires MID-turn, so re-anchoring there would jerk the in-progress timer backward; keep the cache.
     // `source` is read defensively (Claude passes "startup"|"resume"|"clear"|"compact"): absent/unknown
     // stamps fresh, so we fail toward a fresh anchor and never toward the 40h fallback.
-    const sessionStartSource = typeof input.source === "string" ? input.source : "";
     const isTurnOpener = hookName === "UserPromptSubmit"
       || (hookName === "SessionStart" && sessionStartSource !== "compact");
     const turnStartedAt = isTurnOpener ? Math.floor(Date.now() / 1000) : cachedTurn;
     // The Codex turn id (Claude payloads carry none → undefined). Cached on the record so the notify
     // backstop's stale-turn guard can compare it against a delayed notify's payload turn-id.
     const turnId = typeof input.turn_id === "string" && input.turn_id.length > 0 ? input.turn_id : undefined;
-    const plan = planOp(hookName, input, sentDone);
+    let plan = planOp(hookName, input, sentDone);
     if (!plan) return;
+    // Some clients can remain blocked on USER input after the model turn itself completes. The
+    // adapter owns that agent-specific proof. Today Codex uses it for the hookless TUI Plan picker:
+    // keep the session in the attention queue instead of letting a Stop lie that it is done.
+    let pendingPlanPicker = false;
+    let attentionKind: "userInput" | undefined;
+    if (plan.op === "done" && adapter.completedTurnWaitState) {
+      const wait = await adapter.completedTurnWaitState({ pid: hookPid, transcriptPath });
+      if (wait === "pending") {
+        plan = { op: "update", prio: 1, status: "needsAttention" };
+        attentionKind = "userInput";
+        pendingPlanPicker = true;
+      }
+    }
     // Pin the label to the session's FIRST-SEEN cwd: a mid-session `cd` changes input.cwd on every
     // later hook, and re-deriving the label per event silently renamed the phone row / island folder
     // chip (observed live: "api-status" → "server" after a `cd server`). A session's identity must not
@@ -606,7 +800,7 @@ export async function runHook(agent: AgentKind): Promise<void> {
     const label = typeof existingRecord?.label === "string" && existingRecord.label.length > 0
       ? existingRecord.label
       : typeof input.cwd === "string" && input.cwd.length > 0 ? basename(input.cwd) : "session";
-    const envelope = await buildEnvelope(input, machine, Date.now(), title, config.e2eKey, sentDone, agent, startedAt, turnStartedAt, label, model);
+    const envelope = await buildEnvelope(eventInput, machine, Date.now(), title, config.e2eKey, sentDone, agent, startedAt, turnStartedAt, label, model, plan, attentionKind);
     if (!envelope) return;
 
     // Record (or, on op:end, remove) this session's file and make sure the liveness watchdog is
@@ -615,8 +809,37 @@ export async function runHook(agent: AgentKind): Promise<void> {
     // `title` already carries the last non-empty value (resolved above) so the watchdog's corrective
     // envelopes never regress to title:"" — and the pairing the blob was sealed under is stamped so a
     // heartbeat after a re-pair can't re-send an undecryptable stale blob.
-    await trackSession(input.session_id, plan.op, plan.prio, plan.status, envelope.blob as string | undefined, machine, label, transcriptPath, agent, startedAt, turnStartedAt, turnId,
-      title, config.pairingId, model);
+    const createsRecord = !existingRecord && plan.op !== "end";
+    const retiresRecord = !!existingRecord && plan.op === "end";
+    const origin = existingRecord?.origin ?? sessionOrigin(input, hookPid, hookCommand);
+    // A replay alias must not steal liveness ownership from the real predecessor: keep its original
+    // session pid/transcript so the short-lived background daemon exiting cannot make the watchdog
+    // reap an otherwise-live interactive row.
+    const recordPid = reusedForkPredecessor ? existingRecord!.pid : hookPid;
+    const recordTranscript = reusedForkPredecessor
+      ? (existingRecord!.transcript ?? transcriptPath)
+      : transcriptPath;
+    await trackSession(sessionId, plan.op, plan.prio, plan.status, envelope.blob as string | undefined, machine, label, recordTranscript, agent, startedAt, turnStartedAt, turnId,
+      title, config.pairingId, model, pendingPlanPicker, recordPid, origin);
+    if (createsRecord) {
+      traceSession({
+        event: "create",
+        sessionId,
+        agent,
+        hook_event_name: hookName,
+        ...(sessionStartSource ? { source: sessionStartSource } : {}),
+        origin,
+      });
+    } else if (retiresRecord) {
+      traceSession({
+        event: "retire",
+        sessionId,
+        agent,
+        hook_event_name: hookName,
+        ...(sessionStartSource ? { source: sessionStartSource } : {}),
+        reason: "hook op:end",
+      });
+    }
     ensureWatchdog();
 
     // Reconcile a provisional discovery: Codex fires no hook at session OPEN (openai/codex#15269), so
@@ -629,7 +852,7 @@ export async function runHook(agent: AgentKind): Promise<void> {
     // left open, and (b) if the end POST fails (the file survives — see reconcileProvisional) the
     // sweep backstop finds the survivor "covered by real" and retries it within a sweep (~5s).
     // REMOVABLE once openai/codex#15269 ships.
-    if (agent === "codex") await reconcileProvisional(config, process.ppid);
+    if (agent === "codex") await reconcileProvisional(config, hookPid);
 
     const res = await fetch(`${config.url}/v1/cc/event`, {
       method: "POST",
@@ -654,7 +877,7 @@ export async function runHook(agent: AgentKind): Promise<void> {
       // The ONLY place a done's delivery is confirmed. Every other exit from this POST — a non-2xx
       // below, an AbortSignal timeout, a network throw into the outer catch — leaves trackSession's
       // pessimistic `donePending` standing, which is precisely the debt the watchdog then settles.
-      if (plan.op === "done") await markDoneDelivered(input.session_id);
+      if (plan.op === "done") await markDoneDelivered(sessionId);
     } else if (res.status === 404 || res.status === 410) {
       // The pairing is GONE server-side (404 = deleted, 410 = dormant-GC'd once). Without this, a
       // revoked pairing keeps POSTing ~2×/tool-use forever, 404ing on every hook. A single gone

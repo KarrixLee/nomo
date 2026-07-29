@@ -92,7 +92,7 @@ async function sha256Hex(s) {
 }
 
 // src/core/shared.ts
-var PLUGIN_VERSION = "1.4.4";
+var PLUGIN_VERSION = "1.4.5";
 var CC_DIR = `${process.env.HOME}/.config/cc-status`;
 var SESSIONS_DIR = `${CC_DIR}/sessions`;
 var WATCHDOG_PID_PATH = `${CC_DIR}/watchdog.pid`;
@@ -964,6 +964,68 @@ function codexTailPendingApproval(tail) {
   }
   return false;
 }
+function codexFinalProposedPlan(row) {
+  const payload = row.payload;
+  if (!payload || payload.phase !== "final_answer")
+    return false;
+  let text = "";
+  if (row.type === "response_item" && payload.type === "message" && payload.role === "assistant") {
+    const content = payload.content;
+    if (!Array.isArray(content))
+      return false;
+    text = content.map((part) => {
+      if (typeof part !== "object" || part === null)
+        return "";
+      const p = part;
+      return p.type === "output_text" && typeof p.text === "string" ? p.text : "";
+    }).join("");
+  } else if (row.type === "event_msg" && payload.type === "agent_message") {
+    text = typeof payload.message === "string" ? payload.message : "";
+  } else {
+    return false;
+  }
+  const trimmed = text.trim();
+  return trimmed.startsWith("<proposed_plan>") && trimmed.endsWith("</proposed_plan>");
+}
+function codexPlanPickerStateFromTail(tail) {
+  let state = "none";
+  let finalPlanInTurn = false;
+  for (const line of tail.split(`
+`)) {
+    if (!line.trim())
+      continue;
+    if (!line.includes("event_msg") && !line.includes("response_item"))
+      continue;
+    let row;
+    try {
+      row = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (typeof row !== "object" || row === null)
+      continue;
+    const r = row;
+    if (codexFinalProposedPlan(r)) {
+      finalPlanInTurn = true;
+      continue;
+    }
+    if (r.type !== "event_msg")
+      continue;
+    const ptype = r.payload?.type;
+    if (ptype === "task_complete") {
+      if (finalPlanInTurn)
+        state = "pending";
+      finalPlanInTurn = false;
+    } else if (ptype === "task_started" || ptype === "user_message") {
+      if (state === "pending")
+        state = "resolved";
+      finalPlanInTurn = false;
+    } else if (ptype === "turn_aborted") {
+      finalPlanInTurn = false;
+    }
+  }
+  return state;
+}
 function codexTailPendingUserInput(tail) {
   const lines = tail.split(`
 `);
@@ -1072,14 +1134,36 @@ function claudeTailPendingApproval(tail) {
   return false;
 }
 var CLAUDE_HEADLESS_ARG_TOKENS = new Set(["-p", "--print", "--output-format"]);
-var CLAUDE_DAEMON_MARKERS = ["claude-mem", "worker-service"];
+var CLAUDE_DAEMON_MARKERS = [
+  "claude-mem",
+  "worker-service",
+  "daemon run --origin transient",
+  "bg-pty-host",
+  "bg-spare"
+];
+function claudeForkResumePredecessor(command) {
+  if (typeof command !== "string" || command.length === 0)
+    return;
+  const tokens = command.trim().split(/\s+/);
+  if (!tokens.includes("--fork-session") || !tokens.includes("--reply-on-resume"))
+    return;
+  const match = /(?:^|\s)--resume(?:=|\s+)(?:"([^"]+)"|'([^']+)'|(\S+))/.exec(command);
+  const resume = match?.[1] ?? match?.[2] ?? match?.[3];
+  if (!resume || !resume.endsWith(".jsonl"))
+    return;
+  const id = basename(resume, ".jsonl");
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id) ? id : undefined;
+}
 function claudeHeadlessInvocation(selfArgs, ancestorArgs) {
   const chain = [selfArgs, ...ancestorArgs].filter((s) => typeof s === "string" && s.length > 0);
   if (chain.some((args) => CLAUDE_DAEMON_MARKERS.some((m) => args.includes(m))))
     return true;
   if (typeof selfArgs !== "string" || selfArgs.length === 0)
     return false;
-  return selfArgs.trim().split(/\s+/).some((tok) => CLAUDE_HEADLESS_ARG_TOKENS.has(tok));
+  const tokens = selfArgs.trim().split(/\s+/);
+  if (tokens.some((tok) => CLAUDE_HEADLESS_ARG_TOKENS.has(tok)))
+    return true;
+  return tokens.includes("--fork-session") && tokens.includes("--reply-on-resume");
 }
 var CODEX_ROLLOUT_IDLE_SILENCE_MS = 30000;
 var CODEX_TURN_OPEN_EVENT = "task_started";
@@ -1094,6 +1178,7 @@ function codexTurnActiveFromTail(tail, silentForMs) {
   return tail.includes('"response_item"') || tail.includes('"event_msg"');
 }
 var TURN_STATE_TAIL_BYTES = 8 * 1024;
+var PLAN_PICKER_TAIL_BYTES = 64 * 1024;
 function rolloutPathFromLsof(output) {
   for (const line of output.split(`
 `)) {
@@ -1183,14 +1268,18 @@ async function codexNewestRolloutForCwd(cwd, home = codexHome()) {
   }
   return;
 }
+async function codexRolloutForPid(pid, deps) {
+  let rollout = await (deps.rolloutOf ?? rolloutViaLsof)(pid);
+  if (!rollout) {
+    const cwd = await (deps.cwdOf ?? cwdViaLsof)(pid);
+    if (cwd)
+      rollout = await (deps.rolloutForCwd ?? codexNewestRolloutForCwd)(cwd);
+  }
+  return rollout;
+}
 async function codexPidTurnActive(pid, deps = {}) {
   try {
-    let rollout = await (deps.rolloutOf ?? rolloutViaLsof)(pid);
-    if (!rollout) {
-      const cwd = await (deps.cwdOf ?? cwdViaLsof)(pid);
-      if (cwd)
-        rollout = await (deps.rolloutForCwd ?? codexNewestRolloutForCwd)(cwd);
-    }
+    const rollout = await codexRolloutForPid(pid, deps);
     if (!rollout)
       return false;
     const tail = await (deps.readTail ?? readSuffix)(rollout, TURN_STATE_TAIL_BYTES);
@@ -1198,6 +1287,19 @@ async function codexPidTurnActive(pid, deps = {}) {
     return codexTurnActiveFromTail(tail, (deps.now ?? Date.now)() - mtime);
   } catch {
     return false;
+  }
+}
+async function codexPidPlanPickerState(pid, deps = {}) {
+  try {
+    if (!(deps.isAlive ?? pidAlive)(pid))
+      return "exited";
+    const rollout = await codexRolloutForPid(pid, deps);
+    if (!rollout)
+      return "unknown";
+    const tail = await (deps.readTail ?? readSuffix)(rollout, PLAN_PICKER_TAIL_BYTES);
+    return codexPlanPickerStateFromTail(tail);
+  } catch {
+    return "unknown";
   }
 }
 function codexSentinelSessionId(pid) {
@@ -1281,6 +1383,9 @@ async function codexDiscoverLive(known, deps = {}) {
   }
   return out;
 }
+function claudeClearPredecessor(sessionId, hookPid, tracked) {
+  return tracked.filter((t) => t.sessionId !== sessionId && t.provisional !== true && t.agent !== "codex" && typeof t.pid === "number" && Number.isFinite(t.pid) && t.pid === hookPid).sort((a, b) => (b.ts ?? 0) - (a.ts ?? 0))[0]?.sessionId;
+}
 function codexChildSessionGhost(sessionId, transcriptPrefix, hookPid, tracked) {
   if (transcriptPrefix.trim().length > 0)
     return false;
@@ -1309,20 +1414,70 @@ async function codexRolloutExistsForSession(sessionId, home = codexHome()) {
   }
   return false;
 }
-async function codexInternalSessionGhost(sessionId, transcriptPrefix, transcriptPath, deps = {}) {
+function codexSubagentSource(source) {
+  return source === "subagent" || typeof source === "object" && source !== null && Object.prototype.hasOwnProperty.call(source, "subagent");
+}
+function codexRolloutCreationEvidence(prefix) {
+  let subagent = false;
+  let hasUserMessage = false;
+  for (const line of prefix.split(`
+`)) {
+    if (!line.trim())
+      continue;
+    if (!line.includes("session_meta") && !line.includes("user_message"))
+      continue;
+    let row;
+    try {
+      row = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (typeof row !== "object" || row === null)
+      continue;
+    const r = row;
+    const payload = r.payload;
+    if (r.type === "session_meta" && codexSubagentSource(payload?.source ?? r.source))
+      subagent = true;
+    if (r.type === "event_msg" && payload?.type === "user_message")
+      hasUserMessage = true;
+  }
+  return { subagent, hasUserMessage };
+}
+async function codexSessionCreationSuppression(sessionId, transcriptPrefix, transcriptPath, input = {}, deps = {}) {
+  const evidence = codexRolloutCreationEvidence(transcriptPrefix);
+  if (evidence.subagent) {
+    return {
+      guard: "codex-subagent-rollout",
+      reason: "session_meta.source is a subagent variant"
+    };
+  }
+  const hookName = typeof input.hook_event_name === "string" ? input.hook_event_name : "";
+  const hookPrompt = hookName === "UserPromptSubmit" && typeof input.prompt === "string" && input.prompt.trim().length > 0;
+  if (!evidence.hasUserMessage && !hookPrompt) {
+    return {
+      guard: "codex-promptless-rollout",
+      reason: "no rollout user_message or UserPromptSubmit prompt yet"
+    };
+  }
   if (transcriptPrefix.trim().length > 0)
-    return false;
+    return null;
   if (transcriptPath.length > 0) {
     try {
       await (deps.statOf ?? stat2)(transcriptPath);
-      return false;
+      return null;
     } catch {}
   }
   try {
-    return !await (deps.rolloutExists ?? codexRolloutExistsForSession)(sessionId);
-  } catch {
-    return true;
-  }
+    if (await (deps.rolloutExists ?? codexRolloutExistsForSession)(sessionId))
+      return null;
+  } catch {}
+  return {
+    guard: "codex-internal-no-rollout",
+    reason: "hook prompt exists but no transcript file or rollout can be found"
+  };
+}
+async function codexInternalSessionGhost(sessionId, transcriptPrefix, transcriptPath, deps = {}, input = {}) {
+  return await codexSessionCreationSuppression(sessionId, transcriptPrefix, transcriptPath, input, deps) !== null;
 }
 function findProvisionalForPid(provisionals, hookPid, ancestorsOf) {
   for (const p of provisionals)
@@ -1359,6 +1514,12 @@ var claudeAdapter = {
   },
   isHeadlessInvocation({ pid, ancestorsOf, commandOf }) {
     return claudeHeadlessInvocation(commandOf(pid), ancestorsOf(pid).map((p) => commandOf(p)));
+  },
+  forkResumePredecessor(command) {
+    return claudeForkResumePredecessor(command);
+  },
+  clearPredecessor({ sessionId, hookPid, tracked }) {
+    return claudeClearPredecessor(sessionId, hookPid, tracked);
   },
   sessionsDir: () => `${process.env.HOME}/.claude/projects`,
   sessionMatch: (name) => name.endsWith(".jsonl"),
@@ -1398,11 +1559,17 @@ var codexAdapter = {
   tailPendingAttentionKind(tail) {
     return codexTailPendingAttentionKind(tail);
   },
+  completedTurnWaitState({ pid, transcriptPath }) {
+    return codexPidPlanPickerState(pid, transcriptPath ? { rolloutOf: async () => transcriptPath } : {});
+  },
   isChildSessionGhost({ sessionId, prefix, hookPid, tracked }) {
     return codexChildSessionGhost(sessionId, prefix, hookPid, tracked);
   },
   isInternalSessionGhost({ sessionId, prefix, transcriptPath }) {
     return codexInternalSessionGhost(sessionId, prefix, transcriptPath);
+  },
+  sessionCreationSuppression({ sessionId, prefix, transcriptPath, input }) {
+    return codexSessionCreationSuppression(sessionId, prefix, transcriptPath, input);
   },
   sessionsDir: () => `${codexHome()}/sessions`,
   sessionMatch: (name) => name.startsWith("rollout-") && name.endsWith(".jsonl"),

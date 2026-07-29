@@ -21,8 +21,8 @@
 import { hostname } from "node:os";
 import { basename } from "node:path";
 import { cleanPromptTitle, codexAdapter } from "../core/adapter";
-import { buildEnvelope, markDoneDelivered, trackSession } from "../core/hook";
-import { atomicWrite, ensureWatchdog, LAST_SEND_PATH, loadConfig, localApprovalsState, PLUGIN_VERSION, readRecord } from "../core/shared";
+import { buildEnvelope, markDoneDelivered, sessionOrigin, trackSession } from "../core/hook";
+import { atomicWrite, ensureWatchdog, LAST_SEND_PATH, loadConfig, localApprovalsState, pidCommand, PLUGIN_VERSION, readRecord } from "../core/shared";
 
 /** Map the notify JSON onto the runHook/planOp Stop-hook input shape. Null for any payload that isn't
  *  an agent-turn-complete carrying a non-empty thread-id (the only kind we back-stop) or isn't JSON. */
@@ -95,7 +95,7 @@ export async function runNotify(raw: string, deferMs = notifyDeferMs(), sleep: (
     // STALE-TURN GUARD: a delayed notify from an old turn must never clobber a newer turn. If the
     // record is already bound to a DIFFERENT turn (the next UserPromptSubmit re-stamped turnId and
     // reset sentDone), this notify belongs to a turn that's over — bail silently.
-    const record = await readRecord(sessionId);
+    let record = await readRecord(sessionId);
     if (record?.turnId && payloadTurnId && record.turnId !== payloadTurnId) return;
 
     // DEDUPE: a record showing a sent Stop means the hooks already delivered this turn's done — the
@@ -113,6 +113,9 @@ export async function runNotify(raw: string, deferMs = notifyDeferMs(), sleep: (
       const after = await readRecord(sessionId);
       if (after?.sentDone === true) return; // the Stop hook delivered this turn's done during the wait
       if (after?.turnId && payloadTurnId && after.turnId !== payloadTurnId) return; // turn advanced under us
+      // Keep the freshest same-turn anchors/pid/transcript. In particular, a concurrently-firing Stop
+      // may have created the first record as a Plan-picker attention update (sentDone stays false).
+      if (after) record = after;
     }
 
     const machine = config.machineName ?? hostname().replace(/\.local$/, "");
@@ -132,14 +135,25 @@ export async function runNotify(raw: string, deferMs = notifyDeferMs(), sleep: (
     const model = typeof record?.model === "string" && record.model.length > 0 ? record.model : undefined;
 
     const now = Date.now();
-    // sentDone is false here (we returned above when it was true), so planOp("Stop") maps to op:done.
-    const envelope = await buildEnvelope(input, machine, now, title, config.e2eKey, false, "codex", startedAt, turnStartedAt, undefined, model);
+    // The model turn is complete, but Codex's TUI may now be blocked on its hookless Plan picker.
+    // Ask the adapter before emitting done. A prior hook record supplies the stable TUI pid + exact
+    // rollout; with no record this remains best-effort through the notify process's pid locator.
+    const sessionPid = typeof record?.pid === "number" && Number.isFinite(record.pid) ? record.pid : process.ppid;
+    const transcriptPath = typeof record?.transcript === "string" ? record.transcript : "";
+    const wait = await codexAdapter.completedTurnWaitState?.({ pid: sessionPid, transcriptPath });
+    const pendingPlanPicker = wait === "pending";
+    const plan = pendingPlanPicker
+      ? { op: "update" as const, prio: 1 as const, status: "needsAttention" as const }
+      : { op: "done" as const, prio: 0 as const, status: "done" as const };
+    const attentionKind = pendingPlanPicker ? "userInput" as const : undefined;
+    const envelope = await buildEnvelope(input, machine, now, title, config.e2eKey, false, "codex", startedAt, turnStartedAt, undefined, model, plan, attentionKind);
     if (!envelope) return;
 
     const label = typeof input.cwd === "string" && input.cwd.length > 0 ? basename(input.cwd) : "session";
-    await trackSession(sessionId, "done", 0, "done", envelope.blob as string | undefined, machine, label,
-      typeof record?.transcript === "string" ? record.transcript : "", "codex", startedAt, turnStartedAt, payloadTurnId,
-      title ?? record?.title, config.pairingId, model);
+    await trackSession(sessionId, plan.op, plan.prio, plan.status, envelope.blob as string | undefined, machine, label,
+      transcriptPath, "codex", startedAt, turnStartedAt, payloadTurnId,
+      title ?? record?.title, config.pairingId, model, pendingPlanPicker, sessionPid,
+      record?.origin ?? sessionOrigin(input, sessionPid, pidCommand(sessionPid)));
     ensureWatchdog();
 
     const res = await fetch(`${config.url}/v1/cc/event`, {
@@ -157,11 +171,11 @@ export async function runNotify(raw: string, deferMs = notifyDeferMs(), sleep: (
       signal: AbortSignal.timeout(2000),
     });
     // Same write-before-POST ordering as runHook, so the same ack discipline applies: trackSession above
-    // stamped the record donePending, and only a confirmed 2xx clears it. A failed backstop done is then
-    // re-POSTed by the watchdog's correctPendingDone instead of silently claiming it landed.
+    // stamped a done record donePending, and only a confirmed 2xx clears it. A failed backstop done is
+    // then re-POSTed by the watchdog's correctPendingDone instead of silently claiming it landed.
     if (res.ok) {
       await atomicWrite(LAST_SEND_PATH, String(now));
-      await markDoneDelivered(sessionId);
+      if (plan.op === "done") await markDoneDelivered(sessionId);
     }
   } catch {
     // Silence is the contract — a notify backstop must never surface into a Codex session.

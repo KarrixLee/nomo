@@ -9,7 +9,7 @@ import {
   buildDoneEnvelope, buildEndEnvelope, buildHeartbeatEnvelope, buildNeedsAttentionEnvelope, buildProvisionalBlob,
   buildProvisionalEnvelope, buildProvisionalRecord, buildStartEnvelope, buildTitleRepairEnvelope, classifySession,
   claudeTailPendingApproval, codexLastTurnEvent, codexTailPendingApproval, correctIdleClaude, correctInterrupt,
-  correctPendingApproval, correctPendingDone, createBridgeSupervisor, discoverLiveSessions, effectiveDoneAttempts, goneStrikeShouldTeardown,
+  correctPendingApproval, correctPendingDone, correctResolvedPlanPicker, createBridgeSupervisor, discoverLiveSessions, effectiveDoneAttempts, goneStrikeShouldTeardown,
   hasInterruptMarker, IDLE_GRACE_MS, isClaudeIdleReapEligible, isRetireEligible, lastTurnLine, PAIRING_TTL_MS, pendingDoneRetryWrite,
   pendingDoneSettleWrite, pendingPairingExpired,
   postOutcomeForStatus, provisionalsCoveredByReal, reconcileProvisionalsSweep, recordMovedSince, resetDoneAttemptMemory, retireDoneStale,
@@ -1390,6 +1390,58 @@ describe("codexTailPendingApproval re-export (parser reachable through ./cc-watc
   test("a trailing approval request → pending; a resolved one → not", () => {
     expect(codexTailPendingApproval(ev("exec_approval_request"))).toBe(true);
     expect(codexTailPendingApproval([ev("exec_approval_request"), ev("task_complete")].join("\n"))).toBe(false);
+  });
+});
+
+describe("correctResolvedPlanPicker (Mac answer clears only the marked Plan wait)", () => {
+  const blockedPlan = (over: Partial<SessionRecord> = {}): SessionRecord => rec({
+    agent: "codex", transcript: "/tmp/rollout.jsonl", lastEvent: "needsAttention",
+    op: "update", prio: 1, sentDone: false, pendingPlanPicker: true,
+    blob: "PENDING-PLAN", title: "Implement the plan", pairingId: "p", ...over,
+  });
+
+  test("task_started/user_message resolution → working update and clears provenance marker", async () => {
+    const posts: Record<string, unknown>[] = [];
+    const writes: SessionRecord[] = [];
+    const result = await correctResolvedPlanPicker(cfg(), "/tmp/s.json", "s", blockedPlan(), {
+      state: async () => "resolved",
+      post: async (body) => { posts.push(body as Record<string, unknown>); return "delivered"; },
+      writeRecord: async (_path, record) => { writes.push(record); },
+      now: () => 8_000_000,
+    });
+    expect(result).toBe("corrected");
+    expect(posts[0]).toMatchObject({ op: "update", prio: 0, ts: 8_000_000 });
+    expect(posts[0]).not.toHaveProperty("attentionKind");
+    expect(await decryptBlob(KEY, posts[0].blob as string)).toMatchObject({ status: "working", agent: "codex" });
+    expect(writes[0]).toMatchObject({ lastEvent: "working", op: "update", prio: 0, sentDone: false });
+    expect(writes[0].pendingPlanPicker).toBeUndefined();
+  });
+
+  test("still pending / unknown stays attention; an unmarked genuine attention episode is untouched", async () => {
+    let posted = 0;
+    const seams = {
+      post: async () => { posted++; return "delivered" as PostOutcome; },
+      writeRecord: async () => {},
+    };
+    expect(await correctResolvedPlanPicker(cfg(), "/tmp/s.json", "s", blockedPlan(), {
+      ...seams, state: async () => "pending",
+    })).toBe("uncorrected");
+    expect(await correctResolvedPlanPicker(cfg(), "/tmp/s.json", "s", blockedPlan(), {
+      ...seams, state: async () => "unknown",
+    })).toBe("uncorrected");
+    expect(await correctResolvedPlanPicker(cfg(), "/tmp/s.json", "s", blockedPlan({ pendingPlanPicker: undefined }), {
+      ...seams, state: async () => "resolved",
+    })).toBe("uncorrected");
+    expect(posted).toBe(0);
+  });
+
+  test("process exit follows the existing terminal reap path", async () => {
+    const record = blockedPlan();
+    expect(classifySession(record, record.ts + 1, () => false)).toBe("end");
+    expect(await correctResolvedPlanPicker(cfg(), "/tmp/s.json", "s", record, {
+      state: async () => "exited",
+      post: async () => { throw new Error("must not post working"); },
+    })).toBe("uncorrected");
   });
 });
 

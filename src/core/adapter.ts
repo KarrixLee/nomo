@@ -16,7 +16,7 @@ import { execFile } from "node:child_process";
 import { readdir, readFile, stat } from "node:fs/promises";
 import { promisify } from "node:util";
 import { basename, join } from "node:path";
-import { AgentKind, codexHome, lastHookPath, readPrefix, readSuffix, SessionRecord } from "./shared";
+import { AgentKind, codexHome, lastHookPath, pidAlive, readPrefix, readSuffix, SessionRecord } from "./shared";
 
 const execFileP = promisify(execFile);
 
@@ -638,6 +638,79 @@ export function codexTailPendingApproval(tail: string): boolean {
   return false; // no approval request in the tail → nothing pending
 }
 
+// --- Codex TUI plan-picker detection ----------------------------------------------------------
+//
+// Codex's client-side "Implement this plan?" picker emits no hook and no durable approval event.
+// The rollout DOES retain a precise turn-end fingerprint: the final assistant message is wrapped in
+// `<proposed_plan>...</proposed_plan>`, then task_complete closes the turn. While the picker is open,
+// no later task_started/user_message exists. Requiring the complete wrapper (rather than guessing from
+// ordinary prose that mentions a plan) keeps this intentionally precision-biased: a normal completed
+// turn must never be held in needsAttention merely because its TUI remains open at the prompt.
+
+export type CodexPlanPickerState = "pending" | "resolved" | "none" | "exited" | "unknown";
+
+/** Whether an assistant payload is the durable FINAL plan emitted by Codex Plan mode. Supports both
+ *  rollout forms seen across Codex versions: response_item message content and event_msg agent_message.
+ *  The exact full wrapper is load-bearing for precision. */
+function codexFinalProposedPlan(row: Record<string, unknown>): boolean {
+  const payload = row.payload as Record<string, unknown> | undefined;
+  if (!payload || payload.phase !== "final_answer") return false;
+  let text = "";
+  if (row.type === "response_item" && payload.type === "message" && payload.role === "assistant") {
+    const content = payload.content;
+    if (!Array.isArray(content)) return false;
+    text = content.map((part) => {
+      if (typeof part !== "object" || part === null) return "";
+      const p = part as Record<string, unknown>;
+      return p.type === "output_text" && typeof p.text === "string" ? p.text : "";
+    }).join("");
+  } else if (row.type === "event_msg" && payload.type === "agent_message") {
+    text = typeof payload.message === "string" ? payload.message : "";
+  } else {
+    return false;
+  }
+  const trimmed = text.trim();
+  return trimmed.startsWith("<proposed_plan>") && trimmed.endsWith("</proposed_plan>");
+}
+
+/** Classify the plan-picker episode visible in a bounded rollout tail.
+ *
+ *  pending  — an exact final proposed-plan message was followed by task_complete, with no later
+ *             task_started/user_message (the client-side picker is still the next action)
+ *  resolved — such an episode exists and explicit later turn/user progress proves the Mac answered it
+ *  none      — no exact completed-plan episode is present (the overwhelmingly common normal-done case)
+ *
+ * A later completed plan supersedes an older resolved one, so repeated Plan turns classify correctly.
+ * Malformed/byte-sliced lines are skipped, matching the other rollout-tail classifiers. */
+export function codexPlanPickerStateFromTail(tail: string): Extract<CodexPlanPickerState, "pending" | "resolved" | "none"> {
+  let state: "pending" | "resolved" | "none" = "none";
+  let finalPlanInTurn = false;
+  for (const line of tail.split("\n")) {
+    if (!line.trim()) continue;
+    if (!line.includes("event_msg") && !line.includes("response_item")) continue;
+    let row: unknown;
+    try { row = JSON.parse(line); } catch { continue; }
+    if (typeof row !== "object" || row === null) continue;
+    const r = row as Record<string, unknown>;
+    if (codexFinalProposedPlan(r)) {
+      finalPlanInTurn = true;
+      continue;
+    }
+    if (r.type !== "event_msg") continue;
+    const ptype = (r.payload as Record<string, unknown> | undefined)?.type;
+    if (ptype === "task_complete") {
+      if (finalPlanInTurn) state = "pending";
+      finalPlanInTurn = false;
+    } else if (ptype === "task_started" || ptype === "user_message") {
+      if (state === "pending") state = "resolved";
+      finalPlanInTurn = false;
+    } else if (ptype === "turn_aborted") {
+      finalPlanInTurn = false;
+    }
+  }
+  return state;
+}
+
 interface CodexPendingUserInput {
   kind: "userInput";
   detail?: string;
@@ -790,7 +863,31 @@ const CLAUDE_HEADLESS_ARG_TOKENS = new Set(["-p", "--print", "--output-format"])
 /** Command-line shapes of known daemons/harnesses that spawn headless Claude (claude-mem's
  *  worker-service). Matched as SUBSTRINGS against the invoking process AND its ancestor chain, since a
  *  bundled worker shows up as an absolute script path rather than a bare token. */
-const CLAUDE_DAEMON_MARKERS = ["claude-mem", "worker-service"];
+const CLAUDE_DAEMON_MARKERS = [
+  "claude-mem",
+  "worker-service",
+  "daemon run --origin transient",
+  "bg-pty-host",
+  "bg-spare",
+];
+
+/** Extract the predecessor session id from the precise Claude daemon fork/replay argv shape:
+ *  `--fork-session --resume <old-transcript>.jsonl --reply-on-resume`. Requiring BOTH replay flags,
+ *  an actual `.jsonl` path, and a UUID-shaped filename keeps this precision-biased — an ordinary
+ *  interactive `claude --resume <id>` or user-created fork is not classified by a loose substring.
+ *  Quoted paths (including spaces) and `--resume=<path>` are supported. */
+export function claudeForkResumePredecessor(command: string | undefined): string | undefined {
+  if (typeof command !== "string" || command.length === 0) return undefined;
+  const tokens = command.trim().split(/\s+/);
+  if (!tokens.includes("--fork-session") || !tokens.includes("--reply-on-resume")) return undefined;
+  const match = /(?:^|\s)--resume(?:=|\s+)(?:"([^"]+)"|'([^']+)'|(\S+))/.exec(command);
+  const resume = match?.[1] ?? match?.[2] ?? match?.[3];
+  if (!resume || !resume.endsWith(".jsonl")) return undefined;
+  const id = basename(resume, ".jsonl");
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)
+    ? id
+    : undefined;
+}
 
 /** Pure: does the invoking `claude`'s own argv, or any ANCESTOR's argv, look like a non-interactive /
  *  daemon-spawned run whose session must NOT become a phone row? `selfArgs` is process.ppid's command
@@ -803,7 +900,11 @@ export function claudeHeadlessInvocation(selfArgs: string | undefined, ancestorA
   const chain = [selfArgs, ...ancestorArgs].filter((s): s is string => typeof s === "string" && s.length > 0);
   if (chain.some((args) => CLAUDE_DAEMON_MARKERS.some((m) => args.includes(m)))) return true;
   if (typeof selfArgs !== "string" || selfArgs.length === 0) return false;
-  return selfArgs.trim().split(/\s+/).some((tok) => CLAUDE_HEADLESS_ARG_TOKENS.has(tok));
+  const tokens = selfArgs.trim().split(/\s+/);
+  if (tokens.some((tok) => CLAUDE_HEADLESS_ARG_TOKENS.has(tok))) return true;
+  // The replay daemon carries neither -p nor --print. The pair is load-bearing: --fork-session alone
+  // is a legitimate interactive feature, while --reply-on-resume is the daemon's auto-reply mode.
+  return tokens.includes("--fork-session") && tokens.includes("--reply-on-resume");
 }
 
 // --- Codex idle-vs-in-flight turn classification (for discovery/provisional rows) -------------
@@ -849,6 +950,10 @@ export function codexTurnActiveFromTail(tail: string, silentForMs: number): bool
 /** How much of the rollout tail the turn-state probe reads — same bound as the watchdog's interrupt/
  *  pending-approval nets (the turn boundary rides the last few KB). */
 const TURN_STATE_TAIL_BYTES = 8 * 1024;
+/** A final proposed plan is a single JSONL response_item whose text can be substantially larger than
+ *  an ordinary turn boundary. Read enough to retain that WHOLE line; a sliced plan line deliberately
+ *  fails closed (normal done) rather than guessing. */
+const PLAN_PICKER_TAIL_BYTES = 64 * 1024;
 
 /** Pure: the open rollout path from `lsof -p <pid> -Fn` output (an `n<path>` line whose basename is a
  *  `rollout-*.jsonl`). When present this pins the pid's EXACT rollout — but the TUI only holds the fd
@@ -956,6 +1061,17 @@ export interface CodexTurnProbeDeps {
   now?: () => number;
 }
 
+/** Locate the rollout owned by a Codex TUI. Shared by the ordinary turn-active probe and the
+ *  plan-picker probe so both use the exact-open-fd first / cwd+recency fallback contract. */
+async function codexRolloutForPid(pid: number, deps: CodexTurnProbeDeps): Promise<string | undefined> {
+  let rollout = await (deps.rolloutOf ?? rolloutViaLsof)(pid);
+  if (!rollout) {
+    const cwd = await (deps.cwdOf ?? cwdViaLsof)(pid);
+    if (cwd) rollout = await (deps.rolloutForCwd ?? codexNewestRolloutForCwd)(cwd);
+  }
+  return rollout;
+}
+
 /** Whether the codex TUI `pid` has a turn genuinely in flight. The rollout is located by the open-fd
  *  match first (exact, but the fd is only held around writes), else by cwd+recency (see
  *  codexNewestRolloutForCwd), then its tail is classified. No locatable/readable rollout → false
@@ -963,17 +1079,35 @@ export interface CodexTurnProbeDeps {
  *  section note). Never throws across its boundary. */
 export async function codexPidTurnActive(pid: number, deps: CodexTurnProbeDeps = {}): Promise<boolean> {
   try {
-    let rollout = await (deps.rolloutOf ?? rolloutViaLsof)(pid);
-    if (!rollout) {
-      const cwd = await (deps.cwdOf ?? cwdViaLsof)(pid);
-      if (cwd) rollout = await (deps.rolloutForCwd ?? codexNewestRolloutForCwd)(cwd);
-    }
+    const rollout = await codexRolloutForPid(pid, deps);
     if (!rollout) return false;
     const tail = await (deps.readTail ?? readSuffix)(rollout, TURN_STATE_TAIL_BYTES);
     const mtime = await (deps.mtimeOf ?? (async (p: string) => (await stat(p)).mtimeMs))(rollout);
     return codexTurnActiveFromTail(tail, (deps.now ?? Date.now)() - mtime);
   } catch {
     return false; // unreadable rollout / raced deletion → can't prove a turn is open → idle
+  }
+}
+
+/** Extra seam for the plan-picker probe: liveness is part of the proof, not merely a caller
+ *  assumption. A dead process can never be waiting on a client-side TUI picker. */
+export interface CodexPlanPickerProbeDeps extends CodexTurnProbeDeps {
+  isAlive?: (pid: number) => boolean;
+}
+
+/** The current client-side plan-picker state for a Codex TUI pid. Reuses the turn-active probe's
+ *  rollout locator, but requires continued process liveness before a rollout can classify pending.
+ *  `resolved` is returned only for explicit post-plan task_started/user_message evidence; failures are
+ *  `unknown`, so the watchdog never clears a pending row on an incidental read/lsof race. */
+export async function codexPidPlanPickerState(pid: number, deps: CodexPlanPickerProbeDeps = {}): Promise<CodexPlanPickerState> {
+  try {
+    if (!(deps.isAlive ?? pidAlive)(pid)) return "exited";
+    const rollout = await codexRolloutForPid(pid, deps);
+    if (!rollout) return "unknown";
+    const tail = await (deps.readTail ?? readSuffix)(rollout, PLAN_PICKER_TAIL_BYTES);
+    return codexPlanPickerStateFromTail(tail);
+  } catch {
+    return "unknown";
   }
 }
 
@@ -1144,6 +1278,29 @@ export interface TrackedSessionLite {
   pid?: number;
   provisional?: boolean;
   agent?: AgentKind;
+  ts?: number;
+}
+
+/** Adapter-owned explanation for deferring a never-tracked session row. The hook writes this verbatim
+ *  (guard + reason) to session-trace.log, so a silent return is inspectable without moving any of this
+ *  agent-specific classification into the shared hook pipeline. */
+export interface SessionCreationSuppression {
+  guard: string;
+  reason: string;
+}
+
+/** The most recent Claude record on the SAME process is the predecessor of a `SessionStart` whose
+ *  source is `clear`. Claude keeps the TUI process alive across `/clear`, changes only the session id,
+ *  and emits no SessionEnd for the old id. Codex records and provisional discovery rows are excluded;
+ *  newest `ts` wins if an earlier bug already left more than one stale record on the pid. */
+export function claudeClearPredecessor(
+  sessionId: string, hookPid: number, tracked: TrackedSessionLite[],
+): string | undefined {
+  return tracked
+    .filter((t) =>
+      t.sessionId !== sessionId && t.provisional !== true && t.agent !== "codex" &&
+      typeof t.pid === "number" && Number.isFinite(t.pid) && t.pid === hookPid)
+    .sort((a, b) => (b.ts ?? 0) - (a.ts ?? 0))[0]?.sessionId;
 }
 
 /** Pure classifier: is this hook event a codex CHILD-session ghost (skip it — no phone row)?
@@ -1213,6 +1370,80 @@ export interface CodexInternalGhostDeps {
   rolloutExists?: (sessionId: string) => Promise<boolean>;
 }
 
+/** Does a parsed Codex session_meta source identify a subagent variant? Codex serializes enum variants
+ *  as an object keyed by the variant name (`{"subagent":{...}}` in the guardian repro). Accept the
+ *  string form too for forward/backward compatibility, but do not recursively match arbitrary nested
+ *  keys: only the source variant itself is authoritative. */
+function codexSubagentSource(source: unknown): boolean {
+  return source === "subagent" || (
+    typeof source === "object" && source !== null &&
+    Object.prototype.hasOwnProperty.call(source, "subagent")
+  );
+}
+
+/** Structural evidence from a bounded Codex rollout prefix. Subagent source is sticky and wins even if
+ *  the internal thread later writes a user_message; `hasUserMessage` means an actual rollout event_msg
+ *  with payload.type=user_message (not an incidental string in instructions/tool output). */
+export function codexRolloutCreationEvidence(prefix: string): { subagent: boolean; hasUserMessage: boolean } {
+  let subagent = false;
+  let hasUserMessage = false;
+  for (const line of prefix.split("\n")) {
+    if (!line.trim()) continue;
+    if (!line.includes("session_meta") && !line.includes("user_message")) continue;
+    let row: unknown;
+    try { row = JSON.parse(line); } catch { continue; }
+    if (typeof row !== "object" || row === null) continue;
+    const r = row as Record<string, unknown>;
+    const payload = r.payload as Record<string, unknown> | undefined;
+    if (r.type === "session_meta" && codexSubagentSource(payload?.source ?? r.source)) subagent = true;
+    if (r.type === "event_msg" && payload?.type === "user_message") hasUserMessage = true;
+  }
+  return { subagent, hasUserMessage };
+}
+
+/** Detailed Codex create guard used by runHook. A subagent rollout is permanently suppressed. Any
+ *  other rollout is deferred until a REAL user_message exists, with the current UserPromptSubmit's
+ *  non-empty `prompt` accepted as race-proof evidence before the JSONL flush. If a hook prompt exists
+ *  but the rollout itself is still wholly absent, retain the older top-level internal-job evidence
+ *  check so app-server background prompts cannot mint rows merely by carrying prompt text. */
+export async function codexSessionCreationSuppression(
+  sessionId: string,
+  transcriptPrefix: string,
+  transcriptPath: string,
+  input: Record<string, unknown> = {},
+  deps: CodexInternalGhostDeps = {},
+): Promise<SessionCreationSuppression | null> {
+  const evidence = codexRolloutCreationEvidence(transcriptPrefix);
+  if (evidence.subagent) {
+    return {
+      guard: "codex-subagent-rollout",
+      reason: "session_meta.source is a subagent variant",
+    };
+  }
+  const hookName = typeof input.hook_event_name === "string" ? input.hook_event_name : "";
+  const hookPrompt = hookName === "UserPromptSubmit" &&
+    typeof input.prompt === "string" && input.prompt.trim().length > 0;
+  if (!evidence.hasUserMessage && !hookPrompt) {
+    return {
+      guard: "codex-promptless-rollout",
+      reason: "no rollout user_message or UserPromptSubmit prompt yet",
+    };
+  }
+  if (transcriptPrefix.trim().length > 0) return null;
+  if (transcriptPath.length > 0) {
+    try { await (deps.statOf ?? stat)(transcriptPath); return null; } catch { /* no file at the path */ }
+  }
+  try {
+    if (await (deps.rolloutExists ?? codexRolloutExistsForSession)(sessionId)) return null;
+  } catch {
+    // A failed locator is still no rollout evidence. Defer; a later hook self-heals.
+  }
+  return {
+    guard: "codex-internal-no-rollout",
+    reason: "hook prompt exists but no transcript file or rollout can be found",
+  };
+}
+
 /** Whether a NEVER-tracked codex hook event is a TOP-LEVEL app-server internal job — skip it (defer
  *  mirroring until rollout evidence appears; see the section note). True iff the transcript prefix
  *  is empty AND the hook's transcript_path doesn't exist on disk AND no rollout file exists for the
@@ -1222,18 +1453,11 @@ export interface CodexInternalGhostDeps {
  *  probe would mint the very phantom row this guard exists to kill. Never throws. */
 export async function codexInternalSessionGhost(
   sessionId: string, transcriptPrefix: string, transcriptPath: string, deps: CodexInternalGhostDeps = {},
+  input: Record<string, unknown> = {},
 ): Promise<boolean> {
-  if (transcriptPrefix.trim().length > 0) return false; // rollout content → a real session
-  if (transcriptPath.length > 0) {
-    // The rollout file exists even though its content hasn't flushed into the prefix yet (or the
-    // read raced) — codex created it, so the session is real.
-    try { await (deps.statOf ?? stat)(transcriptPath); return false; } catch { /* no file at the path */ }
-  }
-  try {
-    return !(await (deps.rolloutExists ?? codexRolloutExistsForSession)(sessionId));
-  } catch {
-    return true; // locator failed → still no evidence of a real session → defer (self-heals)
-  }
+  return (await codexSessionCreationSuppression(
+    sessionId, transcriptPrefix, transcriptPath, input, deps,
+  )) !== null;
 }
 
 /** Match a codex hook to a provisional record by pid, returning the provisional's sentinel sessionId (or
@@ -1295,6 +1519,12 @@ export interface AgentAdapter {
   /** OPTIONAL clear-envelope discriminator for the recovered attention episode. Kept deliberately
    *  narrow: only Codex request_user_input currently has a value; ordinary approvals remain absent. */
   tailPendingAttentionKind?(tail: string): "userInput" | undefined;
+  /** OPTIONAL: classify the client-side wait that can remain AFTER an agent turn completes. Codex
+   *  implements this for its TUI Plan picker; Claude omits it. The hook/notify done paths consult it
+   *  before emitting done, and the watchdog consults it only for records explicitly marked as this
+   *  kind of wait. `transcriptPath` pins the exact rollout when known; otherwise the pid locator's
+   *  open-fd / cwd+recency fallback is used. */
+  completedTurnWaitState?(ctx: { pid: number; transcriptPath?: string }): Promise<CodexPlanPickerState>;
   /** OPTIONAL: whether a hook event for a NEVER-tracked session id is a CHILD-SESSION GHOST that must
    *  be skipped (no phone row). Claude OMITS it (every Claude session id is real); Codex implements it
    *  because the ChatGPT.app `codex app-server` spawns child session ids with no rollout/transcript
@@ -1309,6 +1539,25 @@ export interface AgentAdapter {
    *  OMITS it (every Claude session id is real). Async because it probes the sessions tree. Called by
    *  runHook only when NO session record exists yet, so a live session can never be silenced by it. */
   isInternalSessionGhost?(ctx: { sessionId: string; prefix: string; transcriptPath: string }): Promise<boolean>;
+  /** OPTIONAL detailed never-tracked create guard. Codex owns rollout semantics here (subagent source,
+   *  promptless deferral, and absent-rollout internal jobs); the shared hook only records and obeys the
+   *  adapter's guard/reason. */
+  sessionCreationSuppression?(ctx: {
+    sessionId: string;
+    prefix: string;
+    transcriptPath: string;
+    input: Record<string, unknown>;
+  }): Promise<SessionCreationSuppression | null>;
+  /** OPTIONAL Claude lineage seam: extract the predecessor id named by the precise daemon
+   *  `--fork-session --resume <transcript> --reply-on-resume` command. The hook confirms that record
+   *  exists before reusing it, so argv alone can never invent an alias. */
+  forkResumePredecessor?(command: string | undefined): string | undefined;
+  /** OPTIONAL Claude `/clear` lineage seam: identify the old row on the same TUI process. */
+  clearPredecessor?(ctx: {
+    sessionId: string;
+    hookPid: number;
+    tracked: TrackedSessionLite[];
+  }): string | undefined;
   /** OPTIONAL: whether the INVOKING agent process (and its ancestor chain) is a non-interactive /
    *  daemon-spawned "headless" run whose events must be skipped (deferred) — no phone row. Claude
    *  implements it (headless `claude --output-format stream-json …` observation runs — e.g. claude-mem —
@@ -1393,6 +1642,12 @@ export const claudeAdapter: AgentAdapter = {
   isHeadlessInvocation({ pid, ancestorsOf, commandOf }): boolean {
     return claudeHeadlessInvocation(commandOf(pid), ancestorsOf(pid).map((p) => commandOf(p)));
   },
+  forkResumePredecessor(command: string | undefined): string | undefined {
+    return claudeForkResumePredecessor(command);
+  },
+  clearPredecessor({ sessionId, hookPid, tracked }): string | undefined {
+    return claudeClearPredecessor(sessionId, hookPid, tracked);
+  },
   sessionsDir: () => `${process.env.HOME}/.claude/projects`,
   sessionMatch: (name: string) => name.endsWith(".jsonl"),
   hookStampPath: () => lastHookPath("claude"),
@@ -1444,6 +1699,11 @@ export const codexAdapter: AgentAdapter = {
   tailPendingAttentionKind(tail: string): "userInput" | undefined {
     return codexTailPendingAttentionKind(tail);
   },
+  completedTurnWaitState({ pid, transcriptPath }): Promise<CodexPlanPickerState> {
+    return codexPidPlanPickerState(pid, transcriptPath
+      ? { rolloutOf: async () => transcriptPath }
+      : {});
+  },
   // ChatGPT.app `codex app-server` child-session ghosts: a new session id with no rollout content,
   // sharing its pid with an already-tracked real codex session, is skipped (see codexChildSessionGhost).
   isChildSessionGhost({ sessionId, prefix, hookPid, tracked }): boolean {
@@ -1455,6 +1715,9 @@ export const codexAdapter: AgentAdapter = {
   // fires (see codexInternalSessionGhost).
   isInternalSessionGhost({ sessionId, prefix, transcriptPath }): Promise<boolean> {
     return codexInternalSessionGhost(sessionId, prefix, transcriptPath);
+  },
+  sessionCreationSuppression({ sessionId, prefix, transcriptPath, input }): Promise<SessionCreationSuppression | null> {
+    return codexSessionCreationSuppression(sessionId, prefix, transcriptPath, input);
   },
   sessionsDir: () => `${codexHome()}/sessions`,
   sessionMatch: (name: string) => name.startsWith("rollout-") && name.endsWith(".jsonl"),

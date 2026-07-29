@@ -297,6 +297,77 @@ export async function buildNeedsAttentionEnvelope(
   };
 }
 
+/** A plan-picker answer is real user progress, so its watchdog corrective is a fresh working update
+ *  (not a verbatim heartbeat). It intentionally carries no attentionKind: op:update/prio:0 closes the
+ *  attention episode and returns the session to its ordinary in-flight state. */
+export async function buildWorkingEnvelope(
+  sessionId: string, record: SessionRecord, now: number, e2eKey: Uint8Array, agent: AgentKind = "claude",
+): Promise<Record<string, unknown>> {
+  const blob = await encryptBlob(e2eKey, {
+    status: "working",
+    title: typeof record.title === "string" ? record.title : "",
+    machine: typeof record.machine === "string" ? record.machine : "",
+    label: typeof record.label === "string" ? record.label : "",
+    ...adapterFor(agent).blobAgentFields,
+    ...(typeof record.turnStartedAt === "number" && Number.isFinite(record.turnStartedAt) ? { turnStartedAt: record.turnStartedAt } : {}),
+    ...(typeof record.model === "string" && record.model.length > 0 ? { model: record.model } : {}),
+    at: Math.floor(now / 1000),
+  });
+  return { v: 2, sessionId, op: "update", prio: 0, ts: now, blob, ...startedAtField(record) };
+}
+
+/** Side-effect seams for resolving a hookless completed-turn wait. */
+export interface PlanPickerResolutionDeps {
+  state?: () => Promise<"pending" | "resolved" | "none" | "exited" | "unknown">;
+  post?: (body: object) => Promise<PostOutcome>;
+  writeRecord?: (path: string, rec: SessionRecord) => Promise<void>;
+  now?: () => number;
+}
+
+/** Clear ONLY a needsAttention episode that the Stop/notify path explicitly marked as a Plan picker,
+ * and ONLY after the adapter sees later task_started/user_message evidence in the rollout. Unknown /
+ * unreadable state leaves the row pending; process death is handled by the sweep's normal op:end reap. */
+export async function correctResolvedPlanPicker(
+  config: Config, path: string, sessionId: string, record: SessionRecord, deps: PlanPickerResolutionDeps = {},
+): Promise<"corrected" | "uncorrected" | "revoked"> {
+  try {
+    if (record.pendingPlanPicker !== true) return "uncorrected";
+    const agent: AgentKind = record.agent === "codex" ? "codex" : "claude";
+    const adapter = adapterFor(agent);
+    if (!adapter.completedTurnWaitState) return "uncorrected";
+    const state = await (deps.state ?? (() => adapter.completedTurnWaitState!({
+      pid: record.pid,
+      transcriptPath: typeof record.transcript === "string" ? record.transcript : undefined,
+    })))();
+    if (state !== "resolved") return "uncorrected";
+    const now = (deps.now ?? Date.now)();
+    const envelope = await buildWorkingEnvelope(sessionId, record, now, config.e2eKey, agent);
+    const outcome = await (deps.post ?? ((body: object) => postEvent(config, body)))(envelope);
+    if (outcome === "revoked") return "revoked";
+    if (outcome !== "delivered") return "uncorrected";
+    const next: SessionRecord = {
+      ...record,
+      ts: now,
+      lastEvent: "working",
+      sentDone: false,
+      op: "update",
+      prio: 0,
+      blob: envelope.blob as string,
+      pairingId: config.pairingId,
+      pendingPlanPicker: undefined,
+    };
+    try {
+      await (deps.writeRecord ?? ((p: string, rec: SessionRecord) => atomicWrite(p, JSON.stringify(rec), 0o600)))(path, next);
+    } catch {
+      // The working update already landed. Treat it as corrected for this sweep so the stale
+      // needsAttention blob is not heartbeated immediately; the next sweep can resolve/restamp again.
+    }
+    return "corrected";
+  } catch {
+    return "uncorrected";
+  }
+}
+
 /** The staleness-heartbeat envelope: re-send the record's stored blob verbatim under its stored
  *  op/prio with a fresh ts, so the worker re-pushes the SAME content-state and re-arms its stale-date
  *  without any state change. Null when the record carries no blob (a pre-v2 record) — nothing to
@@ -1468,11 +1539,18 @@ async function sweep(config: Config | null): Promise<SweepResult> {
         const idleFix = await correctIdleProvisional(config, path, sessionId, record);
         if (idleFix === "revoked") return { revoked: true };
         if (idleFix === "corrected") delivered = true; // it POSTed a done → a 2xx landed
+        // A Stop/notify-classified Codex Plan picker stays needsAttention until the rollout proves the
+        // Mac answered it. Clear that explicit episode before the generic correctives/heartbeat; a
+        // failed/unknown probe leaves it untouched and the heartbeat sustains the pending state.
+        const planResolution = await correctResolvedPlanPicker(config, path, sessionId, record);
+        if (planResolution === "revoked") return { revoked: true };
+        const resolvedPlan = planResolution === "corrected";
+        if (resolvedPlan) delivered = true;
         // Ordering is the guardrail: run the interrupt-recovery net next. If either net corrected the
         // session (POSTed a done), it is effectively done, so we must NOT also heartbeat it — the
         // returned flags carry that. Only a clean, alive, quiet, uncorrected session gets a
         // heartbeat, which re-sends its last blob to re-arm the island's stale-date.
-        const corrected = await correctInterrupt(config, path, sessionId, record, now);
+        const corrected = resolvedPlan ? "uncorrected" : await correctInterrupt(config, path, sessionId, record, now);
         if (corrected === "revoked") return { revoked: true }; // gone this POST → gated teardown in run()
         if (corrected === "corrected") delivered = true; // it POSTed a done → a 2xx landed
         // "corrected" OR "pending" both mean the interrupt net has taken ownership of this session this
@@ -1483,7 +1561,7 @@ async function sweep(config: Config | null): Promise<SweepResult> {
         // needsAttention when a DROPPED Codex PermissionRequest (openai/codex#16430) left the session
         // silently blocked. Claude's adapter offers no classifier, so this no-ops for Claude records.
         let flaggedAttention = false;
-        if (!interruptHandled) {
+        if (!resolvedPlan && !interruptHandled) {
           const attn = await correctPendingApproval(config, path, sessionId, record, now);
           if (attn === "revoked") return { revoked: true };
           if (attn === "corrected") { delivered = true; flaggedAttention = true; }
@@ -1493,7 +1571,7 @@ async function sweep(config: Config | null): Promise<SweepResult> {
         // heartbeated "working" forever. Only if no earlier net already finished the turn this sweep;
         // Claude-only (isClaudeIdleReapEligible gates codex out — it has discovery + the notify backstop).
         let reapedIdle = false;
-        if (idleFix !== "corrected" && !interruptHandled && !flaggedAttention) {
+        if (idleFix !== "corrected" && !resolvedPlan && !interruptHandled && !flaggedAttention) {
           const idleClaude = await correctIdleClaude(config, path, sessionId, record, now);
           if (idleClaude === "revoked") return { revoked: true };
           // "corrected" (delivered a done) OR "pending" (bounded-retrying / just pinned done locally) both
@@ -1507,12 +1585,12 @@ async function sweep(config: Config | null): Promise<SweepResult> {
         // user_message are on disk. Only when nothing else corrected this sweep (a done row with a blank
         // title is fixed on a later sweep, since the record persists); no-ops for claude / titled records.
         let repairedTitle = false;
-        if (idleFix !== "corrected" && !interruptHandled && !flaggedAttention && !reapedIdle) {
+        if (idleFix !== "corrected" && !resolvedPlan && !interruptHandled && !flaggedAttention && !reapedIdle) {
           const titleFix = await repairTitle(config, path, sessionId, record);
           if (titleFix === "revoked") return { revoked: true };
           if (titleFix === "corrected") { delivered = true; repairedTitle = true; }
         }
-        if (shouldHeartbeat(record, now, heartbeatAt.get(sessionId), idleFix === "corrected" || interruptHandled || flaggedAttention || reapedIdle || repairedTitle)) {
+        if (shouldHeartbeat(record, now, heartbeatAt.get(sessionId), idleFix === "corrected" || resolvedPlan || interruptHandled || flaggedAttention || reapedIdle || repairedTitle)) {
           const beat = buildHeartbeatEnvelope(sessionId, record, Date.now(), config.pairingId);
           // delivered only: a failed heartbeat mutates NOTHING (not the record, not even the throttle),
           // so quietness stays true and it's retried next sweep. A record with no stored blob yields

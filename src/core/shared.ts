@@ -157,6 +157,20 @@ export function lastHookPath(agent: AgentKind): string {
   return `${CC_DIR}/last-hook-${agent}`;
 }
 
+/** Local-only provenance for the hook invocation that FIRST created a session record. This is
+ *  deliberately absent from the encrypted blob and clear wire envelope: it exists solely to make a
+ *  phantom row diagnosable from the Mac. Field names mirror the hook payload / process vocabulary so
+ *  a copied record can be compared directly with hook stdin and `ps`. */
+export interface SessionOrigin {
+  hook_event_name: string;
+  source?: string;
+  agent_id?: string;
+  agent_type?: string;
+  cwd?: string;
+  ppid: number;
+  ppid_command?: string;
+}
+
 /** What the hook records per session so the watchdog can check liveness and, on death, POST a
  *  corrective v2 envelope (op:end to reap, op:done on a detected interrupt) or re-send the last blob
  *  as a staleness heartbeat. */
@@ -256,6 +270,14 @@ export interface SessionRecord {
    *  this session was a done") because planOp's re-arm (SessionStart + sentDone → op:update) and
    *  codex-notify's double-send dedupe both key on it. Absent → nothing owed. */
   donePending?: boolean;
+  /** True only when a Codex turn completion was reclassified as the client-side Plan picker. The
+   *  watchdog uses this explicit provenance marker to clear needsAttention on later rollout progress
+   *  without touching an ordinary permission/question attention episode. */
+  pendingPlanPicker?: boolean;
+  /** The hook/process provenance that FIRST created this local record. Preserved across later hook and
+   *  watchdog rewrites. Local-only diagnostic metadata — never copied into the blob or wire envelope.
+   *  Optional for backward compatibility with records written before the phantom-session trace fix. */
+  origin?: SessionOrigin;
 }
 
 /** The plaintext a pending-pairing flush needs to POST the pairing session the instant the shared key

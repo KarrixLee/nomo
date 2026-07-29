@@ -547,6 +547,8 @@ export interface PermissionQuestion {
 const QUESTION_TEXT_MAX = 240;
 /** Longest option label kept in the blob. */
 export const PERMISSION_QUESTION_LABEL_MAX = 60;
+/** Longest option description kept in the blob. */
+const QUESTION_DESCRIPTION_MAX = 160;
 
 /** Ellipsis-cap shared by the blob builder and the answer re-mapper, so the two can never disagree
  *  about what the phone was actually shown. Count Unicode code points rather than UTF-16 code units
@@ -559,9 +561,9 @@ export function capPermissionWireText(value: string, max: number): string {
 /** One raw CC question, narrowed. */
 type RawQuestion = { question?: unknown; header?: unknown; multiSelect?: unknown; options?: unknown } | null;
 
-/** A question CC sent that is both SHOWABLE and ANSWERABLE, with its ORIGINAL (untruncated) text and
- *  option labels. */
-interface UsableQuestion { text: string; raw: RawQuestion; labels: string[] }
+/** A question CC sent that is both SHOWABLE and ANSWERABLE, with its ORIGINAL (untruncated) text,
+ *  option labels, and positionally aligned descriptions. */
+interface UsableQuestion { text: string; raw: RawQuestion; labels: string[]; descriptions: string[] }
 
 /** THE single question filter. `buildPermissionQuestions` (what the phone renders) and `answerLine`
  *  (what the phone's positional answers zip against) both derive from this list, so an entry skipped
@@ -581,14 +583,19 @@ function usableQuestions(toolInput: Record<string, unknown>): UsableQuestion[] {
     const text = typeof raw?.question === "string" ? raw.question : "";
     if (text.length === 0) continue;
     const labels: string[] = [];
+    const descriptions: string[] = [];
     if (Array.isArray(raw?.options)) {
       for (const opt of raw.options) {
         const label = (opt as { label?: unknown } | null)?.label;
-        if (typeof label === "string" && label.length > 0) labels.push(label);
+        if (typeof label === "string" && label.length > 0) {
+          labels.push(label);
+          const description = (opt as { description?: unknown } | null)?.description;
+          descriptions.push(typeof description === "string" ? description : "");
+        }
       }
     }
     if (labels.length === 0) continue;
-    out.push({ text, raw, labels });
+    out.push({ text, raw, labels, descriptions });
   }
   return out;
 }
@@ -599,21 +606,27 @@ function firstQuestionText(toolInput: Record<string, unknown>): string {
 }
 
 /** The AskUserQuestion choice list, compacted for the wire: one entry per question with its text, the
- *  optional short header, the multi-select flag (present only when true), and the option LABELS.
- *  Option `description`s are dropped outright — they are by far the fattest thing in a CC question
- *  payload and the phone's rows show labels only. Returns [] for any tool that isn't a question (no
- *  `questions` array), so the blob field is simply absent for every other tool.
+ *  optional short header, the multi-select flag (present only when true), option labels, and aligned
+ *  option descriptions when at least one is non-empty. Descriptions are capped and remain the first
+ *  field shed by `fitPermissionDetail` under wire-budget pressure. Returns [] for any tool that isn't
+ *  a question (no `questions` array), so the blob field is simply absent for every other tool.
  *
  *  Pure, never throws: an entry with no text or NO usable option (unanswerable — see usableQuestions)
  *  is skipped rather than poisoning the hold. Truncation is display-only — `answerLine` re-maps the
  *  phone's echo back onto the ORIGINAL labels, so a capped label never reaches CC. */
 export function buildPermissionQuestions(toolInput: Record<string, unknown>): PermissionQuestion[] {
-  return usableQuestions(toolInput).map(({ text, raw, labels }) => ({
-    q: capPermissionWireText(text, QUESTION_TEXT_MAX),
-    ...(typeof raw?.header === "string" && raw.header.length > 0 ? { h: raw.header } : {}),
-    ...(raw?.multiSelect === true ? { m: true } : {}),
-    o: labels.map((l) => capPermissionWireText(l, PERMISSION_QUESTION_LABEL_MAX)),
-  }));
+  return usableQuestions(toolInput).map(({ text, raw, labels, descriptions }) => {
+    const wireDescriptions = descriptions.map((description) =>
+      capPermissionWireText(description, QUESTION_DESCRIPTION_MAX)
+    );
+    return {
+      q: capPermissionWireText(text, QUESTION_TEXT_MAX),
+      ...(typeof raw?.header === "string" && raw.header.length > 0 ? { h: raw.header } : {}),
+      ...(raw?.multiSelect === true ? { m: true } : {}),
+      o: labels.map((l) => capPermissionWireText(l, PERMISSION_QUESTION_LABEL_MAX)),
+      ...(wireDescriptions.some((description) => description.length > 0) ? { d: wireDescriptions } : {}),
+    };
+  });
 }
 
 /** The worker's hard ceiling on a decision POST's base64 `blob` (MAX_BLOB_CHARS, server/src/cc.ts):
@@ -673,12 +686,18 @@ export function fitPermissionDetail(
   const worstCase = all.length; // most digits `permissionDetailOmitted` can ever take
 
   // The QUESTIONS are the actionable part of a question card (the detail is only context), so they get
-  // first claim on the budget: keep them iff the frame fits with them and NO detail at all. They are
-  // all-or-nothing — a partially shown option list would be a lie, and the phone degrades cleanly to
-  // the read-only prompt when the field is absent. The candidate frame is measured WITH the worst-case
-  // `permissionDetailOmitted`, so keeping the questions stays valid even on the drop-the-detail-entirely
-  // branch below (where that key is present and the detail is not).
-  const kept = questions.length > 0 && measure("", worstCase, questions) <= maxChars ? questions : [];
+  // first claim on the budget. Descriptions are useful but non-actionable and therefore shed FIRST:
+  // keep the full questions when they fit with NO detail, otherwise retry the entire label-only picker,
+  // otherwise omit the entire picker. A partial question or option list would be a lie, and the phone
+  // degrades cleanly to the read-only prompt when the field is absent. Candidates are measured WITH the
+  // worst-case `permissionDetailOmitted`, so the chosen variant stays valid even on the
+  // drop-the-detail-entirely branch below (where that key is present and the detail is not).
+  const bareQuestions = questions.map(({ d: _descriptions, ...question }) => question);
+  const kept = questions.length > 0 && measure("", worstCase, questions) <= maxChars
+    ? questions
+    : bareQuestions.length > 0 && measure("", worstCase, bareQuestions) <= maxChars
+    ? bareQuestions
+    : [];
   const tail = kept.length > 0 ? { questions: kept } : {};
 
   const frameChars = (d: string, omitted: number): number => measure(d, omitted, kept);

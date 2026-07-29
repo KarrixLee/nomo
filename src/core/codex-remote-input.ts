@@ -24,7 +24,6 @@ const POLL_TIMEOUT_MS = 2_000;
 const POLL_INTERVAL_MS = 3_000;
 const MAX_CONSECUTIVE_MISSES = 100;
 const ANSWER_MAX = 500;
-const QUESTION_DESCRIPTION_MAX = 160;
 
 export type CodexRemoteInputResult =
   | "answered"
@@ -199,14 +198,7 @@ async function runRemoteInput(
     if (!record || (record.agent ?? "claude") !== "codex") return "unsupported";
     if (signal.aborted) return "resolved-elsewhere";
 
-    const questions = buildPermissionQuestions(toolInput).map((question, index) => ({
-      ...question,
-      // Codex descriptions carry the tradeoff/impact that often makes short labels meaningful. Keep
-      // them positionally aligned with `o`; older phones ignore this additive compact key.
-      d: request.questions[index].options!.map((option) =>
-        capPermissionWireText(option.description, QUESTION_DESCRIPTION_MAX)
-      ),
-    }));
+    const questions = buildPermissionQuestions(toolInput);
     if (questions.length !== request.questions.length) return "unsupported";
 
     const now = (deps.now ?? Date.now)();
@@ -222,6 +214,7 @@ async function runRemoteInput(
       permissionToolName: "request_user_input",
     };
     const fitted = fitPermissionDetail(permissionBase, "", BLOB_FIT_CHARS, questions);
+    // A label-only picker is still fully actionable; only fall back to Desktop when even that cannot fit.
     if (!fitted.questions || fitted.questions.length !== request.questions.length) return "unsupported";
     const promptFrame = { ...permissionBase, permissionQuestions: fitted.questions };
     const [blob, fallbackBlob, approvals] = await Promise.all([

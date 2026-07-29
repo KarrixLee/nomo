@@ -81,6 +81,53 @@
         "permissionDetail": "bun test --coverage",
         "permissionDetailOmitted": 42
       }
+    },
+    {
+      "_comment": "Question wire vector with positionally aligned option descriptions in compact key d.",
+      "keyHex": "256a40ccc3cbb4c7338d5fe2bfbf7ae2f021d46a71a99c0d9a935f48e9a6fe22",
+      "blobB64": "gYGBgYGBgYGBgYGBtaGYsLSXXm7V5x+OiWr1G/9UHTxKBTgolgRC0Rl2P5v3msrnVIZeOr4KRATllKB8Ix4Nx1kQlp5s3QpPIz5WGWbqCVB+p1Qgg+NkQZpyeyMVdy5HretSse3ZKgfNenJyIvYxszq3s+VD5KKmZeD05cBtiDt8v+TAF5pIobdLiloFKIM/iQoMLD5jv3T0utTK09EMoiOl+42aWg/6GBIvKoSM+Q6XxQJXev4CudjGJtu2/Tj3efK9uglGhHaEN4ghzcXk+FJdV2lBa1eRrOIlA65rnKubZOjNXlOVIeIgOvAOJQxDtv9AVbKaoFYRN+YbYMQxRfqdrG6AziPzJMtxkClJp+TuH8VqsP6giqiMw+fKBnXXjlmxDHMoZxFRnxBt5N4eCTdYPh8wVNnEOqyuQLQLKM4obJngInqlCn1ZFh1Ze0t87GyAPOEPJ9lT+W1A/Es46MBkmznTL3HseW8gNWf/TfCCBizBu0HJ0hl7JLStdlqSgmmJEVtX+GYIvYlQqVlUxtl8vfIa8MTuIy2FvQzhW5EUE+5/mZkc6CkjzQ==",
+      "plaintextJson": {
+        "status": "decisionPending",
+        "title": "Choose scope",
+        "machine": "Karrix Mac",
+        "label": "api-status",
+        "agent": "codex",
+        "permissionSummary": "How much should I change?",
+        "permissionRequestId": "req-question-d",
+        "at": 1784937610,
+        "permissionToolName": "request_user_input",
+        "permissionQuestions": [
+          {
+            "q": "How much should I change?",
+            "h": "Scope",
+            "o": ["Fast", "Thorough"],
+            "d": ["Smallest safe change", "Include hardening"]
+          }
+        ]
+      }
+    },
+    {
+      "_comment": "Question wire vector after budget fitting shed d; the complete bare-label picker remains actionable.",
+      "keyHex": "256a40ccc3cbb4c7338d5fe2bfbf7ae2f021d46a71a99c0d9a935f48e9a6fe22",
+      "blobB64": "goKCgoKCgoKCgoKC5zIcVjr++8iS2UHVpdqJMu09qhfY0HSLCCtQXa7i/ZY33nkIsD8230VnPzbxze9jY05gPJEM/RrjJN0bBXqZcyqztnncG+AjhzQYDu/zJ7RWjWHbYzUt9zRbthA4c9IeRd5Br6u0GhTNJzLAF1xRsInNamsBtQzvSEmuECo/szyum1mt8rQJAuMr35pdvsSxpQxnif3vkX0+t3MX4NiaUH673tWr79yREbMPR4JGeee0OPiOKiIDW8escGQUB1bsVUYGpUT9YQa5ByIqMSK4X7qwJk89vaF0kfxHJHdbVP58gHIsQWNAz3gm51l9L6YstYbE4wbEhh3wURXa0Di6KB6XzeDcDPvPOAWmiKkF2leu4XGf51pY3eFIu4JmKoi87vFFqcy6N6oPTSssLUxR0ERoccXWX6eH8IIodf0dUbLbsmWlF0xUqJ1ldAO2X2GLENXI5T4ldehmIW3+5luPbjYRkXB3qef6aOSraOoy6+hktAG9yjVddA==",
+      "plaintextJson": {
+        "status": "decisionPending",
+        "title": "Choose deployment",
+        "machine": "Karrix Mac",
+        "label": "api-status",
+        "agent": "codex",
+        "permissionSummary": "Where should I deploy?",
+        "permissionRequestId": "req-question-d-shed",
+        "at": 1784937615,
+        "permissionToolName": "request_user_input",
+        "permissionQuestions": [
+          {
+            "q": "Where should I deploy?",
+            "h": "Target",
+            "o": ["Staging", "Production"]
+          }
+        ]
+      }
     }
   ]
 }

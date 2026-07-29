@@ -198,9 +198,9 @@ describe("buildPermissionDetail — codex tools", () => {
 // ---- question builder (pure) — the option list that rides the blob so the phone can ANSWER -------
 //
 // AskUserQuestion is held like every other tool now (the old question-passthrough gate is gone): the
-// choices travel INSIDE the sealed blob under compact keys (q/h/m/o) to spend as little of the
-// 3072-char ceiling as possible, and option `description`s are dropped outright (the phone shows
-// labels only, and a description is the single fattest thing CC puts in that payload).
+// choices travel INSIDE the sealed blob under compact keys (q/h/m/o/d) to spend as little of the
+// 3072-char ceiling as possible. Descriptions ride positionally with labels when useful and are shed
+// before the actionable picker if the frame is under budget pressure.
 
 const CC_QUESTIONS = [
   {
@@ -215,14 +215,38 @@ const CC_QUESTIONS = [
 ];
 
 describe("buildPermissionQuestions", () => {
-  test("a real CC payload → compact {q,h,m,o} entries with descriptions DROPPED", () => {
+  test("a real CC payload → compact {q,h,m,o,d} entries with descriptions aligned", () => {
     expect(buildPermissionQuestions({ questions: CC_QUESTIONS })).toEqual([
       {
         q: "Which testing approach should I use for the new parser?",
         h: "Testing",
         o: ["Unit tests only", "Integration tests"],
+        d: ["Fast and isolated; misses wiring bugs.", "Slower but exercises the real pipeline."],
       },
     ]);
+  });
+
+  test("descriptions stay label-aligned, cap at 160 code points, and are omitted when all empty", () => {
+    const [described] = buildPermissionQuestions({
+      questions: [{
+        question: "Pick one",
+        options: [
+          { label: "A" },
+          { label: "discard me", description: "wrong row" },
+          { label: "", description: "must not shift" },
+          { label: "B", description: "😀".repeat(200) },
+        ],
+      }],
+    });
+    expect(described.o).toEqual(["A", "discard me", "B"]);
+    expect(described.d?.[0]).toBe("");
+    expect(described.d?.[1]).toBe("wrong row");
+    expect(described.d?.[2]).toBe(`${"😀".repeat(159)}…`);
+    expect([...(described.d?.[2] ?? "")]).toHaveLength(160);
+
+    expect(buildPermissionQuestions({
+      questions: [{ question: "No descriptions", options: [{ label: "A" }, { label: "B", description: "" }] }],
+    })).toEqual([{ q: "No descriptions", o: ["A", "B"] }]);
   });
 
   test("multiSelect true → m:true (absent when false, per the omit-empty discipline)", () => {
@@ -335,6 +359,28 @@ describe("fitPermissionDetail", () => {
 
   test("empty detail → empty, nothing omitted", () => {
     expect(fitPermissionDetail(base, "")).toEqual({ detail: "", omitted: 0 });
+  });
+
+  test("question budget ladder keeps d, then sheds d, then drops the whole picker", () => {
+    const questions = buildPermissionQuestions({
+      questions: [{
+        question: "Choose",
+        options: [
+          { label: "Fast", description: "Smallest safe change" },
+          { label: "Thorough", description: "Include hardening" },
+        ],
+      }],
+    });
+    const bare = questions.map(({ d: _descriptions, ...question }) => question);
+    const questionFrameChars = (qs: typeof questions) => sealedBlobChars(new TextEncoder().encode(JSON.stringify({
+      ...base, permissionQuestions: qs,
+    })).length);
+    const fullBudget = questionFrameChars(questions);
+    const bareBudget = questionFrameChars(bare);
+
+    expect(fitPermissionDetail(base, "", fullBudget, questions).questions).toEqual(questions);
+    expect(fitPermissionDetail(base, "", bareBudget, questions).questions).toEqual(bare);
+    expect(fitPermissionDetail(base, "", bareBudget - 4, questions)).toEqual({ detail: "", omitted: 0 });
   });
 
   test("a long plan keeps FAR more than the old 400-char cap and still fits the blob ceiling", () => {
@@ -1232,6 +1278,7 @@ describe("runPermissionHook — AskUserQuestion holds", () => {
         q: "Which testing approach should I use for the new parser?",
         h: "Testing",
         o: ["Unit tests only", "Integration tests"],
+        d: ["Fast and isolated; misses wiring bugs.", "Slower but exercises the real pipeline."],
       },
     ]);
     expect(Object.keys(blob).at(-1)).toBe("permissionQuestions"); // append-last wire discipline
@@ -1290,6 +1337,7 @@ describe("runPermissionHook — AskUserQuestion holds", () => {
     const { body, blob } = await postQuestions(fatQuestions(3));
     expect(Array.isArray(blob.permissionQuestions)).toBe(true);
     expect((blob.permissionQuestions as unknown[]).length).toBe(3);
+    expect((blob.permissionQuestions as Array<Record<string, unknown>>).every((question) => !("d" in question))).toBe(true);
     expect(body.blob.length).toBeLessThanOrEqual(3072);
   });
 
