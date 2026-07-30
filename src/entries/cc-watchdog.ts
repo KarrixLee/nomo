@@ -2118,6 +2118,35 @@ async function claimSingleInstance(): Promise<boolean> {
   return true;
 }
 
+export interface WatchdogOwnershipDeps {
+  pidPath?: string;
+  pid?: number;
+  version?: string;
+  readPidfile?: () => string;
+}
+
+/** Whether this process still owns the exact pidfile claim it started with. Claim-time exclusion is
+ *  not enough: a newer build, reset, unpair, or a racing spawn can replace/remove the pidfile while an
+ *  old daemon is asleep or stuck in bridge work. Re-check before EVERY sweep so that displaced daemon
+ *  notices on its next turn and retires its children instead of continuing as an ownerless zombie. */
+export function isRightfulWatchdogOwner(deps: WatchdogOwnershipDeps = {}): boolean {
+  try {
+    const pidPath = deps.pidPath ?? WATCHDOG_PID_PATH;
+    const holder = parseWatchdogPidfile((deps.readPidfile ?? (() => readFileSync(pidPath, "utf8")))());
+    return holder?.pid === (deps.pid ?? process.pid) && holder.version === (deps.version ?? PLUGIN_VERSION);
+  } catch {
+    return false; // missing/unreadable pidfile means nobody may keep sweeping
+  }
+}
+
+/** Sweep-boundary ownership gate. `shutdown` is the bridge supervisor's teardown path, which stops
+ *  its `codex app-server proxy` child (and remains safe to call again from run()'s finally block). */
+export function enforceWatchdogOwnership(shutdown: () => void, deps: WatchdogOwnershipDeps = {}): boolean {
+  if (isRightfulWatchdogOwner(deps)) return true;
+  try { shutdown(); } catch { /* best-effort child cleanup; finally gets another chance */ }
+  return false;
+}
+
 /** Release the pidfile only if we still own it, so we never stomp a successor's claim. */
 function releaseSingleInstance(): void {
   try {
@@ -2190,6 +2219,9 @@ async function run(): Promise<void> {
   activeBridgeShutdown = () => bridges.shutdown();
   try {
     while (true) {
+      // A claim can be stolen or removed after startup (upgrade takeover, reset, racing spawn). An
+      // ownerless daemon must not touch sessions or retain its proxy/bridge children for another tick.
+      if (!enforceWatchdogOwnership(() => bridges.shutdown())) return;
       const config = await loadConfig(); // reload each cycle: a mid-pairing config may complete under us
       // A real Codex request_user_input response must return on the SAME shared app-server process, so
       // the bridge attaches through `codex app-server proxy` — but ONLY while that control socket exists

@@ -10,7 +10,7 @@ import {
   buildProvisionalEnvelope, buildProvisionalRecord, buildStartEnvelope, buildTitleRepairEnvelope, classifySession,
   claudeTailPendingApproval, codexLastTurnEvent, codexTailPendingApproval, correctIdleClaude, correctInterrupt,
   correctPendingApproval, correctPendingDone, correctPlanPickerVerification, correctResolvedPlanPicker, createBridgeSupervisor, discoverLiveSessions, effectiveDoneAttempts, goneStrikeShouldTeardown,
-  hasInterruptMarker, IDLE_GRACE_MS, isClaudeIdleReapEligible, isRetireEligible, lastTurnLine, PAIRING_TTL_MS, pendingDoneRetryWrite,
+  enforceWatchdogOwnership, hasInterruptMarker, IDLE_GRACE_MS, isClaudeIdleReapEligible, isRetireEligible, isRightfulWatchdogOwner, lastTurnLine, PAIRING_TTL_MS, pendingDoneRetryWrite,
   pendingDoneSettleWrite, pendingPairingExpired, planPickerPendingExpired, PLAN_PICKER_PENDING_MAX_MS,
   PLAN_PICKER_RECENT_DONE_MS, PLAN_PICKER_VERIFY_MAX_MS,
   postOutcomeForStatus, provisionalsCoveredByReal, reconcileProvisionalsSweep, recordMovedSince, resetDoneAttemptMemory, retireDoneStale,
@@ -33,6 +33,34 @@ const rec = (over: Partial<SessionRecord> = {}): SessionRecord => ({
 // record write can't unbound it — see effectiveDoneAttempts). That state is per-process, exactly as it is
 // in the real daemon, so each test starts from a fresh daemon's view of the world.
 beforeEach(() => { resetDoneAttemptMemory(); });
+
+describe("per-sweep watchdog pidfile ownership", () => {
+  test("a non-owner self-exits at the sweep gate and cleans up its bridge/proxy children", () => {
+    let childCleanups = 0;
+    expect(enforceWatchdogOwnership(
+      () => { childCleanups++; },
+      { pid: 111, version: "1.4.4", readPidfile: () => "222 1.4.4" },
+    )).toBe(false);
+    expect(childCleanups).toBe(1);
+  });
+
+  test("an own-pid version mismatch self-exits (a newer build has superseded this daemon)", () => {
+    let childCleanups = 0;
+    expect(enforceWatchdogOwnership(
+      () => { childCleanups++; },
+      { pid: 111, version: "1.4.4", readPidfile: () => "111 1.4.5" },
+    )).toBe(false);
+    expect(childCleanups).toBe(1);
+  });
+
+  test("the rightful pid + version owner keeps running and leaves children intact", () => {
+    let childCleanups = 0;
+    const deps = { pid: 111, version: "1.4.4", readPidfile: () => "111 1.4.4" };
+    expect(isRightfulWatchdogOwner(deps)).toBe(true);
+    expect(enforceWatchdogOwnership(() => { childCleanups++; }, deps)).toBe(true);
+    expect(childCleanups).toBe(0);
+  });
+});
 
 describe("classifySession", () => {
   const alive = () => true;

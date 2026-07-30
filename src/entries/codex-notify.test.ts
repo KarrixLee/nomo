@@ -3,7 +3,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { b64url, decryptBlob } from "../core/crypto";
+import { createProcessHygiene, isolatedTestEnv } from "../test/process-hygiene";
 import { notifyFallbackTitle, synthStopInput } from "./codex-notify";
+
+const { spawnTestProcess } = createProcessHygiene();
 
 // Codex runs the `notify` program with ONE trailing JSON arg on turn completion. The verified payload
 // (codex-cli 0.142.5 binary strings, legacy_notify path) is:
@@ -76,9 +79,6 @@ describe("runNotify E2E (argv payload, dedupe against a sent Stop)", () => {
       await writeFile(join(ccDir, "config.json"), JSON.stringify({
         url: "http://127.0.0.1:9", pairingId: "p", pcSecret: "s", e2eKeyB64: b64url(rawKey),
       }));
-      // Pre-seed a LIVE watchdog pidfile (this test process) so ensureWatchdog() no-ops.
-      await writeFile(join(ccDir, "watchdog.pid"), String(process.pid));
-
       const sid = (JSON.parse(payloadJson) as Record<string, unknown>)["thread-id"] as string;
       const recordPath = join(ccDir, "sessions", `${sid}.json`);
       if (opts.seedRecord) {
@@ -90,14 +90,14 @@ describe("runNotify E2E (argv payload, dedupe against a sent Stop)", () => {
         }
         await writeFile(recordPath, JSON.stringify(seed));
       }
-      const env: Record<string, string> = { ...process.env, HOME: home, NOMO_NOTIFY_DEFER_MS: opts.deferMs ?? "0" };
+      const env = isolatedTestEnv(home, { NOMO_NOTIFY_DEFER_MS: opts.deferMs ?? "0" });
       if (opts.codexHome) {
         await mkdir(opts.codexHome, { recursive: true });
         if (opts.sessionIndex) await writeFile(join(opts.codexHome, "session_index.jsonl"), opts.sessionIndex);
         env.CODEX_HOME = opts.codexHome;
       }
 
-      const proc = Bun.spawn({
+      const proc = spawnTestProcess({
         cmd: ["bun", entry, payloadJson], // payload as the LAST argv — codex's notify contract
         env, stdout: "ignore", stderr: "ignore",
       });

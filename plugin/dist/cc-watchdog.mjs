@@ -92,7 +92,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { execFileSync, spawn } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "1.4.8";
+var PLUGIN_VERSION = "1.4.9";
 var CC_DIR = `${process.env.HOME}/.config/cc-status`;
 var SESSIONS_DIR = `${CC_DIR}/sessions`;
 var WATCHDOG_PID_PATH = `${CC_DIR}/watchdog.pid`;
@@ -425,6 +425,8 @@ function watchdogHolderIsLive(pid, deps = {}) {
 }
 function ensureWatchdog(deps = {}) {
   try {
+    if (process.env.NOMO_SKIP_WATCHDOG === "1")
+      return;
     const pidPath = deps.pidPath ?? WATCHDOG_PID_PATH;
     const version = deps.version ?? PLUGIN_VERSION;
     const readPidfile = deps.readPidfile ?? (() => {
@@ -451,9 +453,9 @@ function ensureWatchdog(deps = {}) {
     spawnWatchdog();
   } catch {}
 }
-async function readRecord(sessionId) {
+async function readRecord(sessionId, sessionsDir = SESSIONS_DIR) {
   try {
-    return JSON.parse(await readFile(`${SESSIONS_DIR}/${sessionId}.json`, "utf8"));
+    return JSON.parse(await readFile(`${sessionsDir}/${sessionId}.json`, "utf8"));
   } catch {
     return null;
   }
@@ -2748,9 +2750,9 @@ async function stashPendingEvent(input, machine, title, now, stashPath = PENDING
     await atomicWrite(stashPath, JSON.stringify(stash), 384);
   } catch {}
 }
-async function trackSession(sessionId, op, prio, status, blob, machine, label, transcript, agent = "claude", sessionStartedAt, turnStartedAt, turnId, title, pairingId, model, pendingPlanPicker = false, pid = process.ppid, origin, planPickerVerificationPending = false) {
+async function trackSessionAt(sessionsDir, sessionId, op, prio, status, blob, machine, label, transcript, agent = "claude", sessionStartedAt, turnStartedAt, turnId, title, pairingId, model, pendingPlanPicker = false, pid = process.ppid, origin, planPickerVerificationPending = false) {
   try {
-    const path = `${SESSIONS_DIR}/${sessionId}.json`;
+    const path = `${sessionsDir}/${sessionId}.json`;
     if (op === "end") {
       await unlink2(path).catch(() => {});
       return;
@@ -2783,13 +2785,19 @@ async function trackSession(sessionId, op, prio, status, blob, machine, label, t
     await atomicWrite(path, JSON.stringify(record), 384);
   } catch {}
 }
-async function markDoneDelivered(sessionId) {
+async function trackSession(sessionId, op, prio, status, blob, machine, label, transcript, agent = "claude", sessionStartedAt, turnStartedAt, turnId, title, pairingId, model, pendingPlanPicker = false, pid = process.ppid, origin, planPickerVerificationPending = false) {
+  return trackSessionAt(SESSIONS_DIR, sessionId, op, prio, status, blob, machine, label, transcript, agent, sessionStartedAt, turnStartedAt, turnId, title, pairingId, model, pendingPlanPicker, pid, origin, planPickerVerificationPending);
+}
+async function markDoneDeliveredAt(sessionsDir, sessionId) {
   try {
-    const record = await readRecord(sessionId);
+    const record = await readRecord(sessionId, sessionsDir);
     if (!record || record.donePending !== true)
       return;
-    await atomicWrite(`${SESSIONS_DIR}/${sessionId}.json`, JSON.stringify({ ...record, donePending: undefined }), 384);
+    await atomicWrite(`${sessionsDir}/${sessionId}.json`, JSON.stringify({ ...record, donePending: undefined }), 384);
   } catch {}
+}
+async function markDoneDelivered(sessionId) {
+  return markDoneDeliveredAt(SESSIONS_DIR, sessionId);
 }
 async function reconcileProvisional(config, hookPid) {
   try {
@@ -5390,6 +5398,23 @@ async function claimSingleInstance() {
   await atomicWrite(WATCHDOG_PID_PATH, formatWatchdogPidfile(process.pid));
   return true;
 }
+function isRightfulWatchdogOwner(deps = {}) {
+  try {
+    const pidPath = deps.pidPath ?? WATCHDOG_PID_PATH;
+    const holder = parseWatchdogPidfile((deps.readPidfile ?? (() => readFileSync2(pidPath, "utf8")))());
+    return holder?.pid === (deps.pid ?? process.pid) && holder.version === (deps.version ?? PLUGIN_VERSION);
+  } catch {
+    return false;
+  }
+}
+function enforceWatchdogOwnership(shutdown, deps = {}) {
+  if (isRightfulWatchdogOwner(deps))
+    return true;
+  try {
+    shutdown();
+  } catch {}
+  return false;
+}
 function releaseSingleInstance() {
   try {
     const holder = parseWatchdogPidfile(readFileSync2(WATCHDOG_PID_PATH, "utf8"));
@@ -5430,6 +5455,8 @@ async function run() {
   activeBridgeShutdown = () => bridges.shutdown();
   try {
     while (true) {
+      if (!enforceWatchdogOwnership(() => bridges.shutdown()))
+        return;
       const config = await loadConfig();
       await bridges.sync(config);
       if (config) {
@@ -5526,10 +5553,12 @@ export {
   pendingDoneRetryWrite,
   noteDoneAttempt,
   lastTurnLine,
+  isRightfulWatchdogOwner,
   isRetireEligible,
   isClaudeIdleReapEligible,
   hasInterruptMarker,
   goneStrikeShouldTeardown,
+  enforceWatchdogOwnership,
   effectiveDoneAttempts,
   discoverLiveSessions,
   createBridgeSupervisor,

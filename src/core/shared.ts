@@ -878,6 +878,11 @@ export interface EnsureWatchdogDeps extends WatchdogIdentityDeps {
  *  — a spawn failure just falls back to the worker's own staleness eviction / the next hook. */
 export function ensureWatchdog(deps: EnsureWatchdogDeps = {}): void {
   try {
+    // Real-entry E2E tests exercise the hook in a child process. They do not need a second, detached
+    // daemon to validate hook behavior, and a detached child cannot be joined by Bun's test runner.
+    // Keep the opt-out explicit (never inferred from NODE_ENV) so production behavior is unchanged
+    // unless a caller deliberately requests it.
+    if (process.env.NOMO_SKIP_WATCHDOG === "1") return;
     const pidPath = deps.pidPath ?? WATCHDOG_PID_PATH;
     const version = deps.version ?? PLUGIN_VERSION;
     const readPidfile = deps.readPidfile ?? (() => {
@@ -905,9 +910,9 @@ export function ensureWatchdog(deps: EnsureWatchdogDeps = {}): void {
 }
 
 /** Read a session record file, or null if it's absent/unreadable/corrupt. */
-export async function readRecord(sessionId: string): Promise<SessionRecord | null> {
+export async function readRecord(sessionId: string, sessionsDir: string = SESSIONS_DIR): Promise<SessionRecord | null> {
   try {
-    return JSON.parse(await readFile(`${SESSIONS_DIR}/${sessionId}.json`, "utf8")) as SessionRecord;
+    return JSON.parse(await readFile(`${sessionsDir}/${sessionId}.json`, "utf8")) as SessionRecord;
   } catch {
     return null;
   }

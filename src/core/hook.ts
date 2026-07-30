@@ -339,7 +339,8 @@ export async function stashPendingEvent(
  *  detached watchdog can notice a force-killed terminal that fires no SessionEnd hook; on op:end,
  *  delete the record instead (nothing to reap). Persists the op/prio/blob so the watchdog can re-send
  *  a staleness heartbeat verbatim, and `sentDone` so the next hook re-arms correctly. Best-effort. */
-export async function trackSession(
+export async function trackSessionAt(
+  sessionsDir: string,
   sessionId: string, op: CCOp, prio: 0 | 1, status: CCStatus, blob: string | undefined,
   machine: string, label: string, transcript: string, agent: AgentKind = "claude", sessionStartedAt?: number,
   turnStartedAt?: number, turnId?: string, title?: string, pairingId?: string, model?: string,
@@ -347,7 +348,7 @@ export async function trackSession(
   planPickerVerificationPending: boolean = false,
 ): Promise<void> {
   try {
-    const path = `${SESSIONS_DIR}/${sessionId}.json`;
+    const path = `${sessionsDir}/${sessionId}.json`;
     if (op === "end") {
       await unlink(path).catch(() => {}); // clean exit → no watchdog reaping needed
       return;
@@ -411,20 +412,41 @@ export async function trackSession(
   }
 }
 
+/** Production wrapper for the fixed on-disk sessions root. Tests that exercise write/read glue use
+ *  trackSessionAt with a temp directory so a live production watchdog can never observe their rows. */
+export async function trackSession(
+  sessionId: string, op: CCOp, prio: 0 | 1, status: CCStatus, blob: string | undefined,
+  machine: string, label: string, transcript: string, agent: AgentKind = "claude", sessionStartedAt?: number,
+  turnStartedAt?: number, turnId?: string, title?: string, pairingId?: string, model?: string,
+  pendingPlanPicker: boolean = false, pid: number = process.ppid, origin?: SessionOrigin,
+  planPickerVerificationPending: boolean = false,
+): Promise<void> {
+  return trackSessionAt(
+    SESSIONS_DIR,
+    sessionId, op, prio, status, blob, machine, label, transcript, agent, sessionStartedAt,
+    turnStartedAt, turnId, title, pairingId, model, pendingPlanPicker, pid, origin,
+    planPickerVerificationPending,
+  );
+}
+
 /** Clear the done-delivery debt trackSession stamped: called ONLY after an op:done POST came back 2xx,
  *  so the watchdog's correctPendingDone net has nothing to re-send. Read-modify-write rather than a
  *  blind rewrite: the POST took up to 2 s, and a concurrent sweep may have touched the record in that
  *  window — we must clear only the marker, never resurrect the pre-POST snapshot. `donePending:
  *  undefined` drops the key on stringify (the same idiom the watchdog's doneAttempts clears use).
  *  Best-effort: a failed clear only costs one redundant re-POST that the worker dedupes. */
-export async function markDoneDelivered(sessionId: string): Promise<void> {
+export async function markDoneDeliveredAt(sessionsDir: string, sessionId: string): Promise<void> {
   try {
-    const record = await readRecord(sessionId);
+    const record = await readRecord(sessionId, sessionsDir);
     if (!record || record.donePending !== true) return; // already clear (or the record is gone) → nothing owed
-    await atomicWrite(`${SESSIONS_DIR}/${sessionId}.json`, JSON.stringify({ ...record, donePending: undefined }), 0o600);
+    await atomicWrite(`${sessionsDir}/${sessionId}.json`, JSON.stringify({ ...record, donePending: undefined }), 0o600);
   } catch {
     // Bookkeeping is best-effort, exactly like trackSession's own write.
   }
+}
+
+export async function markDoneDelivered(sessionId: string): Promise<void> {
+  return markDoneDeliveredAt(SESSIONS_DIR, sessionId);
 }
 
 /** Reconcile a provisional discovery (see cc-watchdog's discovery step): a real hook has now fired for

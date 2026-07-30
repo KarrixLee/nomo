@@ -6,18 +6,20 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { b64url, decryptBlob } from "../core/crypto";
 import {
   BLOB_FIT_CHARS, parseConfig, PendingEventStash, PLAN_BLOB_TEXT_MAX_CHARS, PLAN_BLOB_TRUNCATION_MARKER,
-  readRecord, sealedBlobChars, SessionRecord, SESSIONS_DIR,
+  readRecord, sealedBlobChars, SessionRecord,
 } from "../core/shared";
 import {
   aiTitle, buildBlob, buildEnvelope, buildPendingStash, cleanPromptTitle, codexIndexTitle, codexSessionTitle,
   codexThreadName, detailForHook, firstUserPrompt, isPermissionNotification, planOp, sessionTitle,
-  markDoneDelivered, SESSION_TRACE_PATH, stashPendingEvent, trackSession, transcriptStartMs,
+  markDoneDeliveredAt, SESSION_TRACE_PATH, stashPendingEvent, trackSessionAt, transcriptStartMs,
 } from "./cc-status";
 import { provisionalsCoveredByReal, reconcileProvisionalsSweep } from "./cc-watchdog";
 import { hooksAppearStale, parseCodexPluginState, statusCmd } from "./status-cmd";
+import { createProcessHygiene, isolatedTestEnv } from "../test/process-hygiene";
 
 // A fixed 32-byte test key; the real one is HKDF-derived, but any 32 bytes exercise the round-trip.
 const KEY = new Uint8Array(32).fill(7);
+const { spawnTestProcess } = createProcessHygiene();
 
 describe("native Codex hook manifest", () => {
   test("registers all seven lifecycle hooks, including bounded SessionEnd cleanup", async () => {
@@ -889,17 +891,30 @@ describe("parseConfig (config v2 validation)", () => {
 // real re-arm crosses a process boundary: the Stop hook's trackSession() writes sentDone:true to
 // disk and exits, then the NEXT hook invocation (a fresh process) calls readRecord() to read it back
 // before calling planOp(). This exercises that real write→exit→fresh-read→plan path end to end,
-// using a uniquely-named session file under the real SESSIONS_DIR (cleaned up after) since
-// shared's paths are fixed at module load from process.env.HOME.
+// using a uniquely-named session file under an injected temp sessions directory. It must never use
+// the real SESSIONS_DIR: the production watchdog could reap/POST the synthetic row between write/read.
 describe("trackSession + readRecord file glue (sentDone survives a fresh disk read)", () => {
+  let glueHome: string;
+  let glueSessions: string;
+
+  beforeEach(async () => {
+    glueHome = await mkdtemp(join(tmpdir(), "cc-file-glue-"));
+    glueSessions = join(glueHome, "sessions");
+    await mkdir(glueSessions, { recursive: true });
+  });
+
+  afterEach(async () => {
+    await rm(glueHome, { recursive: true, force: true });
+  });
+
   test("a Stop (done) write's sentDone is readable by a separate readRecord call, and re-arms the NEXT SessionStart to `update`", async () => {
     const sessionId = `test-glue-${randomUUID()}`;
     try {
       // The Stop hook's write path: exactly what main() does on a Stop event.
-      await trackSession(sessionId, "done", 0, "done", "ENCRYPTEDBLOB", "mac", "proj", "/tmp/t.jsonl");
+      await trackSessionAt(glueSessions, sessionId, "done", 0, "done", "ENCRYPTEDBLOB", "mac", "proj", "/tmp/t.jsonl");
 
       // A NEW read, as a separate later process/hook invocation would do — not the in-memory value.
-      const record = await readRecord(sessionId);
+      const record = await readRecord(sessionId, glueSessions);
       expect(record?.sentDone).toBe(true);
       expect(record?.op).toBe("done");
       expect(record?.blob).toBe("ENCRYPTEDBLOB");
@@ -915,7 +930,7 @@ describe("trackSession + readRecord file glue (sentDone survives a fresh disk re
       expect(planOp("PostToolUse", { session_id: sessionId, cwd: "/x" }, record?.sentDone === true))
         .toEqual({ op: "update", prio: 0, status: "working" });
     } finally {
-      await unlink(`${SESSIONS_DIR}/${sessionId}.json`).catch(() => {});
+      await unlink(`${glueSessions}/${sessionId}.json`).catch(() => {});
     }
   });
 
@@ -926,11 +941,11 @@ describe("trackSession + readRecord file glue (sentDone survives a fresh disk re
   test("a done write stamps donePending alongside sentDone; markDoneDelivered clears ONLY the marker", async () => {
     const sessionId = `test-ack-${randomUUID()}`;
     try {
-      await trackSession(sessionId, "done", 0, "done", "ENCRYPTEDBLOB", "mac", "proj", "/tmp/t.jsonl");
-      expect((await readRecord(sessionId))?.donePending).toBe(true);
+      await trackSessionAt(glueSessions, sessionId, "done", 0, "done", "ENCRYPTEDBLOB", "mac", "proj", "/tmp/t.jsonl");
+      expect((await readRecord(sessionId, glueSessions))?.donePending).toBe(true);
 
-      await markDoneDelivered(sessionId); // what the hook calls on a confirmed 2xx
-      const acked = await readRecord(sessionId);
+      await markDoneDeliveredAt(glueSessions, sessionId); // what the hook calls on a confirmed 2xx
+      const acked = await readRecord(sessionId, glueSessions);
       expect(acked?.donePending).toBeUndefined();
       // sentDone's meaning is untouched, so the next SessionStart still re-arms to `update`.
       expect(acked?.sentDone).toBe(true);
@@ -940,26 +955,26 @@ describe("trackSession + readRecord file glue (sentDone survives a fresh disk re
         .toEqual({ op: "update", prio: 0, status: "working" });
 
       // Idempotent, and a NON-done event never carries the marker (only a done can owe a delivery).
-      await markDoneDelivered(sessionId);
-      expect((await readRecord(sessionId))?.donePending).toBeUndefined();
-      await trackSession(sessionId, "update", 0, "working", "B", "mac", "proj", "/tmp/t.jsonl");
-      const working = await readRecord(sessionId);
+      await markDoneDeliveredAt(glueSessions, sessionId);
+      expect((await readRecord(sessionId, glueSessions))?.donePending).toBeUndefined();
+      await trackSessionAt(glueSessions, sessionId, "update", 0, "working", "B", "mac", "proj", "/tmp/t.jsonl");
+      const working = await readRecord(sessionId, glueSessions);
       expect(working?.donePending).toBeUndefined();
       expect(working?.sentDone).toBe(false);
     } finally {
-      await unlink(`${SESSIONS_DIR}/${sessionId}.json`).catch(() => {});
+      await unlink(`${glueSessions}/${sessionId}.json`).catch(() => {});
     }
   });
 
   test("op:end deletes the record instead of writing sentDone (nothing left to re-read)", async () => {
     const sessionId = `test-glue-${randomUUID()}`;
     try {
-      await trackSession(sessionId, "start", 0, "working", "B", "mac", "proj", "/tmp/t.jsonl");
-      expect(await readRecord(sessionId)).not.toBeNull();
-      await trackSession(sessionId, "end", 0, "done", undefined, "mac", "proj", "/tmp/t.jsonl");
-      expect(await readRecord(sessionId)).toBeNull();
+      await trackSessionAt(glueSessions, sessionId, "start", 0, "working", "B", "mac", "proj", "/tmp/t.jsonl");
+      expect(await readRecord(sessionId, glueSessions)).not.toBeNull();
+      await trackSessionAt(glueSessions, sessionId, "end", 0, "done", undefined, "mac", "proj", "/tmp/t.jsonl");
+      expect(await readRecord(sessionId, glueSessions)).toBeNull();
     } finally {
-      await unlink(`${SESSIONS_DIR}/${sessionId}.json`).catch(() => {});
+      await unlink(`${glueSessions}/${sessionId}.json`).catch(() => {});
     }
   });
 
@@ -967,15 +982,15 @@ describe("trackSession + readRecord file glue (sentDone survives a fresh disk re
     const sessionId = `test-start-${randomUUID()}`;
     try {
       // A known start is cached in the record so the next hook / the watchdog re-send it without re-parsing.
-      await trackSession(sessionId, "update", 0, "working", "B", "mac", "proj", "/tmp/t.jsonl", "claude", 1_699_999_999_000);
-      expect((await readRecord(sessionId))?.sessionStartedAt).toBe(1_699_999_999_000);
+      await trackSessionAt(glueSessions, sessionId, "update", 0, "working", "B", "mac", "proj", "/tmp/t.jsonl", "claude", 1_699_999_999_000);
+      expect((await readRecord(sessionId, glueSessions))?.sessionStartedAt).toBe(1_699_999_999_000);
       // Unknown start → the field is simply absent (an old record without it must still load).
-      await trackSession(sessionId, "update", 0, "working", "B", "mac", "proj", "/tmp/t.jsonl");
-      const rec = await readRecord(sessionId);
+      await trackSessionAt(glueSessions, sessionId, "update", 0, "working", "B", "mac", "proj", "/tmp/t.jsonl");
+      const rec = await readRecord(sessionId, glueSessions);
       expect(rec).not.toBeNull();
       expect(rec?.sessionStartedAt).toBeUndefined();
     } finally {
-      await unlink(`${SESSIONS_DIR}/${sessionId}.json`).catch(() => {});
+      await unlink(`${glueSessions}/${sessionId}.json`).catch(() => {});
     }
   });
 
@@ -983,15 +998,15 @@ describe("trackSession + readRecord file glue (sentDone survives a fresh disk re
     const sessionId = `test-turn-${randomUUID()}`;
     try {
       // A UserPromptSubmit's stamp is cached (epoch seconds) so the turn's later hooks re-send it.
-      await trackSession(sessionId, "update", 0, "working", "B", "mac", "proj", "/tmp/t.jsonl", "claude", 1_699_999_999_000, 1_751_900_000);
-      expect((await readRecord(sessionId))?.turnStartedAt).toBe(1_751_900_000);
+      await trackSessionAt(glueSessions, sessionId, "update", 0, "working", "B", "mac", "proj", "/tmp/t.jsonl", "claude", 1_699_999_999_000, 1_751_900_000);
+      expect((await readRecord(sessionId, glueSessions))?.turnStartedAt).toBe(1_751_900_000);
       // No anchor known → the field is simply absent (an old record without it must still load).
-      await trackSession(sessionId, "update", 0, "working", "B", "mac", "proj", "/tmp/t.jsonl");
-      const rec = await readRecord(sessionId);
+      await trackSessionAt(glueSessions, sessionId, "update", 0, "working", "B", "mac", "proj", "/tmp/t.jsonl");
+      const rec = await readRecord(sessionId, glueSessions);
       expect(rec).not.toBeNull();
       expect(rec?.turnStartedAt).toBeUndefined();
     } finally {
-      await unlink(`${SESSIONS_DIR}/${sessionId}.json`).catch(() => {});
+      await unlink(`${glueSessions}/${sessionId}.json`).catch(() => {});
     }
   });
 
@@ -1000,18 +1015,18 @@ describe("trackSession + readRecord file glue (sentDone survives a fresh disk re
     try {
       // A hook that resolved the model caches it so the watchdog's corrective done/needsAttention
       // envelopes (which rebuild their blobs from the record) keep the phone's model badge.
-      await trackSession(sessionId, "update", 0, "working", "B", "mac", "proj", "/tmp/t.jsonl", "claude",
+      await trackSessionAt(glueSessions, sessionId, "update", 0, "working", "B", "mac", "proj", "/tmp/t.jsonl", "claude",
         undefined, undefined, undefined, "add font", undefined, "claude-fable-5");
-      expect((await readRecord(sessionId))?.model).toBe("claude-fable-5");
+      expect((await readRecord(sessionId, glueSessions))?.model).toBe("claude-fable-5");
       // Unknown model → the field is simply absent (an old record without it must still load), and an
       // empty string is never persisted.
-      await trackSession(sessionId, "update", 0, "working", "B", "mac", "proj", "/tmp/t.jsonl", "claude",
+      await trackSessionAt(glueSessions, sessionId, "update", 0, "working", "B", "mac", "proj", "/tmp/t.jsonl", "claude",
         undefined, undefined, undefined, undefined, undefined, "");
-      const rec = await readRecord(sessionId);
+      const rec = await readRecord(sessionId, glueSessions);
       expect(rec).not.toBeNull();
       expect(rec?.model).toBeUndefined();
     } finally {
-      await unlink(`${SESSIONS_DIR}/${sessionId}.json`).catch(() => {});
+      await unlink(`${glueSessions}/${sessionId}.json`).catch(() => {});
     }
   });
 
@@ -1019,18 +1034,18 @@ describe("trackSession + readRecord file glue (sentDone survives a fresh disk re
     const sessionId = `test-turnid-${randomUUID()}`;
     try {
       // A Codex hook binds the record to its turn_id so the notify backstop's stale-turn guard works.
-      await trackSession(sessionId, "update", 0, "working", "B", "mac", "proj", "/tmp/t.jsonl", "codex", 1_699_999_999_000, 1_751_900_000, "tu-42");
-      const rec = await readRecord(sessionId);
+      await trackSessionAt(glueSessions, sessionId, "update", 0, "working", "B", "mac", "proj", "/tmp/t.jsonl", "codex", 1_699_999_999_000, 1_751_900_000, "tu-42");
+      const rec = await readRecord(sessionId, glueSessions);
       expect(rec?.turnId).toBe("tu-42");
       // The watchdog's corrective-done re-write is `{ ...record, lastEvent, sentDone, op }` — the spread
       // carries turnId through verbatim, exactly like turnStartedAt.
       const rewritten = { ...rec!, lastEvent: "done", sentDone: true, op: "done" as const };
       expect(rewritten.turnId).toBe("tu-42");
       // A claude hook (no turn_id / empty) omits the field — an old record without it must still load.
-      await trackSession(sessionId, "update", 0, "working", "B", "mac", "proj", "/tmp/t.jsonl");
-      expect((await readRecord(sessionId))?.turnId).toBeUndefined();
+      await trackSessionAt(glueSessions, sessionId, "update", 0, "working", "B", "mac", "proj", "/tmp/t.jsonl");
+      expect((await readRecord(sessionId, glueSessions))?.turnId).toBeUndefined();
     } finally {
-      await unlink(`${SESSIONS_DIR}/${sessionId}.json`).catch(() => {});
+      await unlink(`${glueSessions}/${sessionId}.json`).catch(() => {});
     }
   });
 });
@@ -1050,14 +1065,13 @@ describe("runHook phantom-session lineage, origin stamp, and session-trace.log",
     await writeFile(join(ccDir, "config.json"), JSON.stringify({
       url, pairingId: "p", pcSecret: "s", e2eKeyB64: b64url(rawKey),
     }));
-    await writeFile(join(ccDir, "watchdog.pid"), String(process.pid));
     return { home, ccDir, sessionsDir };
   }
 
   async function spawnHook(entry: string, home: string, payload: Record<string, unknown>): Promise<void> {
-    const proc = Bun.spawn({
+    const proc = spawnTestProcess({
       cmd: ["bun", entry],
-      env: { ...process.env, HOME: home },
+      env: isolatedTestEnv(home),
       stdin: Buffer.from(JSON.stringify(payload)),
       stdout: "ignore",
       stderr: "ignore",
@@ -1089,9 +1103,9 @@ const child = Bun.spawn({
 });
 await child.exited;
 `);
-    const proc = Bun.spawn({
+    const proc = spawnTestProcess({
       cmd: ["bun", broker, appServer, entry, home, Buffer.from(JSON.stringify(payload)).toString("base64")],
-      env: { ...process.env, HOME: home },
+      env: isolatedTestEnv(home),
       stdout: "ignore",
       stderr: "ignore",
     });
@@ -1657,10 +1671,9 @@ describe("runHook per-agent hook-liveness stamp", () => {
       await writeFile(join(ccDir, "config.json"), JSON.stringify({
         url: "http://127.0.0.1:9", pairingId: "p", pcSecret: "s", e2eKeyB64: b64url(rawKey),
       }));
-      await writeFile(join(ccDir, "watchdog.pid"), String(process.pid));
-      const proc = Bun.spawn({
+      const proc = spawnTestProcess({
         cmd: ["bun", entry],
-        env: { ...process.env, HOME: home },
+        env: isolatedTestEnv(home),
         stdin: Buffer.from(JSON.stringify(payload)),
         stdout: "ignore", stderr: "ignore",
       });
@@ -1717,9 +1730,6 @@ describe("runHook turn_id sniff (claude entry invoked inside a Codex session)", 
       await writeFile(join(ccDir, "config.json"), JSON.stringify({
         url: "http://127.0.0.1:9", pairingId: "p", pcSecret: "s", e2eKeyB64: b64url(rawKey),
       }));
-      // Pre-seed a LIVE watchdog pidfile (this very test process) so the entry's ensureWatchdog()
-      // no-ops instead of spawning a detached poller that would outlive the test.
-      await writeFile(join(ccDir, "watchdog.pid"), String(process.pid));
       // Rollout EVIDENCE for the payload's session id: since the internal-job ghost guard, a codex-
       // restamped run with a never-tracked id and no transcript content is only mirrored when its
       // rollout exists under $CODEX_HOME/sessions — so these synthetic sessions get an (empty)
@@ -1736,9 +1746,9 @@ describe("runHook turn_id sniff (claude entry invoked inside a Codex session)", 
         ? { ...payload, hook_event_name: "UserPromptSubmit", prompt: "real ask" }
         : payload;
 
-      const proc = Bun.spawn({
+      const proc = spawnTestProcess({
         cmd: ["bun", entry],
-        env: { ...process.env, HOME: home, ...extraEnv },
+        env: isolatedTestEnv(home, extraEnv),
         stdin: Buffer.from(JSON.stringify(effectivePayload)),
         stdout: "ignore",
         stderr: "ignore",
@@ -1869,7 +1879,6 @@ describe("runHook provisional reconcile (codex entry retires a matching provisio
     await writeFile(join(ccDir, "config.json"), JSON.stringify({
       url, pairingId: "p", pcSecret: "s", e2eKeyB64: b64url(rawKey),
     }));
-    await writeFile(join(ccDir, "watchdog.pid"), String(process.pid)); // no detached poller
     const provFile = join(sessionsDir, `codex-pid-${provPid}.json`);
     await writeFile(provFile, JSON.stringify({
       pid: provPid, machine: "mac", label: "proj", ts: Date.now(),
@@ -1880,9 +1889,9 @@ describe("runHook provisional reconcile (codex entry retires a matching provisio
     const day = join(home, ".codex", "sessions", "2026", "07", "09");
     await mkdir(day, { recursive: true });
     await writeFile(join(day, "rollout-2026-07-09T12-00-00-real-codex-sess.jsonl"), "");
-    const proc = Bun.spawn({
+    const proc = spawnTestProcess({
       cmd: ["bun", entry],
-      env: { ...process.env, HOME: home },
+      env: isolatedTestEnv(home),
       stdin: Buffer.from(JSON.stringify({
         session_id: "real-codex-sess", hook_event_name: "UserPromptSubmit", prompt: "real ask",
         cwd: "/x/api-status", turn_id: "t1", transcript_path: "",
@@ -1978,8 +1987,6 @@ describe("runHook startedAt precedence (cached record start wins over the transc
       await writeFile(join(ccDir, "config.json"), JSON.stringify({
         url: "http://127.0.0.1:9", pairingId: "p", pcSecret: "s", e2eKeyB64: b64url(rawKey),
       }));
-      await writeFile(join(ccDir, "watchdog.pid"), String(process.pid)); // pre-seeded live → no detached spawn
-
       const sid = "start-precedence";
       // A transcript whose head timestamp DIFFERS from any cached start, so the winner is unambiguous.
       const transcriptPath = join(home, "transcript.jsonl");
@@ -1991,9 +1998,9 @@ describe("runHook startedAt precedence (cached record start wins over the transc
         }));
       }
 
-      const proc = Bun.spawn({
+      const proc = spawnTestProcess({
         cmd: ["bun", entry],
-        env: { ...process.env, HOME: home },
+        env: isolatedTestEnv(home),
         stdin: Buffer.from(JSON.stringify({
           session_id: sid, hook_event_name: "PreToolUse", tool_name: "Edit",
           cwd: "/x/api-status", transcript_path: transcriptPath,
@@ -2038,7 +2045,6 @@ describe("runHook label pinning (a mid-session cd must not rename the session)",
       await writeFile(join(ccDir, "config.json"), JSON.stringify({
         url: "http://127.0.0.1:9", pairingId: "p", pcSecret: "s", e2eKeyB64: b64url(rawKey),
       }));
-      await writeFile(join(ccDir, "watchdog.pid"), String(process.pid)); // pre-seeded live → no detached spawn
       const sid = "label-pinning";
       // Optionally pre-seed a record carrying the FIRST-SEEN label, as the session's first hook would have.
       if (opts.seededLabel !== undefined) {
@@ -2046,9 +2052,9 @@ describe("runHook label pinning (a mid-session cd must not rename the session)",
           pid: process.ppid, machine: "m", label: opts.seededLabel, ts: Date.now(),
         }));
       }
-      const proc = Bun.spawn({
+      const proc = spawnTestProcess({
         cmd: ["bun", entry],
-        env: { ...process.env, HOME: home },
+        env: isolatedTestEnv(home),
         stdin: Buffer.from(JSON.stringify({
           session_id: sid, hook_event_name: "PreToolUse", tool_name: "Edit",
           cwd: opts.cwd, transcript_path: "",
@@ -2109,14 +2115,13 @@ describe("runHook gone-strike teardown (revoked pairing stops POSTing forever)",
     await writeFile(join(ccDir, "config.json"), JSON.stringify({
       url, pairingId: "p", pcSecret: "s", e2eKeyB64: b64url(rawKey),
     }));
-    await writeFile(join(ccDir, "watchdog.pid"), String(process.pid));
     return { home, ccDir };
   }
 
   async function runOnce(home: string, sid: string): Promise<void> {
-    const proc = Bun.spawn({
+    const proc = spawnTestProcess({
       cmd: ["bun", entry],
-      env: { ...process.env, HOME: home },
+      env: isolatedTestEnv(home),
       stdin: Buffer.from(JSON.stringify({
         session_id: sid, hook_event_name: "PreToolUse", tool_name: "Edit",
         cwd: "/x/api-status", transcript_path: "",
@@ -2256,11 +2261,9 @@ describe("runHook done-delivery ack (donePending survives a failed Stop POST, cl
       await writeFile(join(ccDir, "config.json"), JSON.stringify({
         url, pairingId: "p", pcSecret: "s", e2eKeyB64: b64url(rawKey),
       }));
-      // A live watchdog pidfile (this test process) so ensureWatchdog() no-ops instead of detaching one.
-      await writeFile(join(ccDir, "watchdog.pid"), String(process.pid));
-      const proc = Bun.spawn({
+      const proc = spawnTestProcess({
         cmd: ["bun", entry],
-        env: { ...process.env, HOME: home },
+        env: isolatedTestEnv(home),
         stdin: Buffer.from(JSON.stringify({
           session_id: "ack-1", hook_event_name: "Stop", cwd: "/x/api-status", transcript_path: "",
         })),
@@ -2322,7 +2325,6 @@ describe("runHook turnStartedAt (UserPromptSubmit stamps + caches; later hooks r
       await writeFile(join(ccDir, "config.json"), JSON.stringify({
         url: "http://127.0.0.1:9", pairingId: "p", pcSecret: "s", e2eKeyB64: b64url(rawKey),
       }));
-      await writeFile(join(ccDir, "watchdog.pid"), String(process.pid)); // pre-seeded live → no detached spawn
       // Optionally pre-seed a record carrying a cached turnStartedAt (as the turn's prompt hook would have).
       if (opts.cachedTurn !== undefined) {
         await writeFile(join(ccDir, "sessions", `${payload.session_id}.json`), JSON.stringify({
@@ -2330,9 +2332,9 @@ describe("runHook turnStartedAt (UserPromptSubmit stamps + caches; later hooks r
         }));
       }
 
-      const proc = Bun.spawn({
+      const proc = spawnTestProcess({
         cmd: ["bun", entry],
-        env: { ...process.env, HOME: home },
+        env: isolatedTestEnv(home),
         stdin: Buffer.from(JSON.stringify(payload)),
         stdout: "ignore",
         stderr: "ignore",
@@ -2460,7 +2462,6 @@ describe("runHook title (tail ai-title reaches the blob; a found title never reg
       await writeFile(join(ccDir, "config.json"), JSON.stringify({
         url: "http://127.0.0.1:9", pairingId: "p", pcSecret: "s", e2eKeyB64: b64url(rawKey),
       }));
-      await writeFile(join(ccDir, "watchdog.pid"), String(process.pid)); // pre-seeded live → no detached spawn
       const sid = "title-resolution";
       let transcriptPath = "";
       if (opts.transcript !== undefined) {
@@ -2473,9 +2474,9 @@ describe("runHook title (tail ai-title reaches the blob; a found title never reg
           pid: process.ppid, machine: "m", label: "l", ts: Date.now(), title: opts.cachedTitle,
         }));
       }
-      const proc = Bun.spawn({
+      const proc = spawnTestProcess({
         cmd: ["bun", entry],
-        env: { ...process.env, HOME: home },
+        env: isolatedTestEnv(home),
         stdin: Buffer.from(JSON.stringify({
           session_id: sid, hook_event_name: "PreToolUse", tool_name: "Edit",
           cwd: "/x/api-status", transcript_path: transcriptPath,
@@ -2545,11 +2546,10 @@ describe("runHook sends the plugin version as the x-cc-version header", () => {
     await writeFile(join(ccDir, "config.json"), JSON.stringify({
       url, pairingId: "p", pcSecret: "s", e2eKeyB64: b64url(rawKey),
     }));
-    await writeFile(join(ccDir, "watchdog.pid"), String(process.pid)); // no detached poller spawns
     try {
-      const proc = Bun.spawn({
+      const proc = spawnTestProcess({
         cmd: ["bun", entry],
-        env: { ...process.env, HOME: home },
+        env: isolatedTestEnv(home),
         stdin: Buffer.from(JSON.stringify({
           session_id: "s1", hook_event_name: "PreToolUse", tool_name: "Edit",
           cwd: "/x/api-status", transcript_path: "",
@@ -2596,12 +2596,11 @@ describe("runHook sends the local approvals pause as the x-cc-approvals header",
     await writeFile(join(ccDir, "config.json"), JSON.stringify({
       url, pairingId: "p", pcSecret: "s", e2eKeyB64: b64url(rawKey),
     }));
-    await writeFile(join(ccDir, "watchdog.pid"), String(process.pid)); // no detached poller spawns
     if (paused) await writeFile(join(ccDir, "no-hold"), ""); // exactly what `permission off` writes
     try {
-      const proc = Bun.spawn({
+      const proc = spawnTestProcess({
         cmd: ["bun", entry],
-        env: { ...process.env, HOME: home },
+        env: isolatedTestEnv(home),
         stdin: Buffer.from(JSON.stringify({
           session_id: "appr-1", hook_event_name: "PreToolUse", tool_name: "Edit",
           cwd: "/x/api-status", transcript_path: "",
