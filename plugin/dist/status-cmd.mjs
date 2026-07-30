@@ -570,6 +570,9 @@ function pidAlive(pid) {
     return e.code === "EPERM";
   }
 }
+function isRealTty(tty) {
+  return tty.length > 0 && tty !== "??" && tty !== "?" && tty !== "-";
+}
 function pidAncestors(pid, maxDepth = 12) {
   const chain = [];
   let cur = pid;
@@ -1468,10 +1471,7 @@ function parseCodexProcs(psOutput) {
   }
   return rows;
 }
-function isRealTty(tty) {
-  return tty.length > 0 && tty !== "??" && tty !== "?" && tty !== "-";
-}
-function filterCodexTuis(rows, knownPids) {
+function codexTuiCandidates(rows, knownPids) {
   const out = [];
   for (const r of rows) {
     if (knownPids.has(r.pid))
@@ -1483,9 +1483,12 @@ function filterCodexTuis(rows, knownPids) {
       continue;
     if (tokens.slice(1).includes("exec"))
       continue;
-    out.push({ pid: r.pid });
+    out.push({ pid: r.pid, tty: r.tty });
   }
   return out;
+}
+function filterCodexTuis(rows, knownPids) {
+  return codexTuiCandidates(rows, knownPids).map(({ pid }) => ({ pid }));
 }
 function labelFromCwd(cwd) {
   if (!cwd)
@@ -1531,6 +1534,149 @@ async function codexDiscoverLive(known, deps = {}) {
     out.push({ pid, sessionId: codexSentinelSessionId(pid), title: label, label, idle: !active });
   }
   return out;
+}
+async function ttyViaPs(pid) {
+  try {
+    const { stdout } = await execFileP("ps", ["-o", "tty=", "-p", String(pid)]);
+    const trimmed = stdout.trim();
+    return trimmed.length > 0 ? trimmed : undefined;
+  } catch {
+    return;
+  }
+}
+async function startTimeViaPs(pid) {
+  try {
+    const { stdout } = await execFileP("ps", ["-o", "lstart=", "-p", String(pid)]);
+    const parsed = Date.parse(stdout.trim());
+    return Number.isFinite(parsed) ? parsed : undefined;
+  } catch {
+    return;
+  }
+}
+function noteLocate(deps, reason) {
+  try {
+    deps.note?.(reason);
+  } catch {}
+}
+function sentinelPid(sessionId) {
+  const m = /^codex-pid-(\d+)$/.exec(sessionId);
+  if (!m)
+    return;
+  const pid = Number.parseInt(m[1], 10);
+  return Number.isFinite(pid) ? pid : undefined;
+}
+async function codexLocateTuiPid(ctx, deps = {}) {
+  try {
+    let output;
+    try {
+      output = await (deps.ps ?? runPs)();
+    } catch {
+      noteLocate(deps, "error");
+      return;
+    }
+    const candidates = codexTuiCandidates(parseCodexProcs(output), new Set);
+    if (candidates.length === 0) {
+      noteLocate(deps, "no-candidate");
+      return;
+    }
+    const pids = new Set(candidates.map((c) => c.pid));
+    if (typeof ctx.record.pid === "number" && Number.isFinite(ctx.record.pid) && pids.has(ctx.record.pid)) {
+      noteLocate(deps, "record-pid");
+      return ctx.record.pid;
+    }
+    const sentinel = sentinelPid(ctx.sessionId);
+    if (sentinel !== undefined && pids.has(sentinel)) {
+      noteLocate(deps, "sentinel-pid");
+      return sentinel;
+    }
+    let subset = candidates;
+    const cwd = ctx.record.origin?.cwd;
+    if (typeof cwd === "string" && cwd.length > 0) {
+      const cwdOf = deps.cwdOf ?? cwdViaLsof;
+      const matched = [];
+      for (const c of candidates) {
+        let candidateCwd;
+        try {
+          candidateCwd = await cwdOf(c.pid);
+        } catch {
+          candidateCwd = undefined;
+        }
+        if (candidateCwd === cwd)
+          matched.push(c);
+      }
+      if (matched.length === 1) {
+        noteLocate(deps, "cwd-unique");
+        return matched[0].pid;
+      }
+      subset = matched;
+    }
+    const startedAt = ctx.record.sessionStartedAt;
+    if (subset.length > 1 && typeof startedAt === "number" && Number.isFinite(startedAt)) {
+      const startTimeOf = deps.startTimeOf ?? startTimeViaPs;
+      let best;
+      let tied = false;
+      for (const c of subset) {
+        let started;
+        try {
+          started = await startTimeOf(c.pid);
+        } catch {
+          started = undefined;
+        }
+        if (typeof started !== "number" || !Number.isFinite(started))
+          continue;
+        const delta = Math.abs(started - startedAt);
+        if (best === undefined || delta < best.delta) {
+          best = { pid: c.pid, delta };
+          tied = false;
+        } else if (delta === best.delta) {
+          tied = true;
+        }
+      }
+      if (best !== undefined && !tied) {
+        noteLocate(deps, "start-time");
+        return best.pid;
+      }
+      noteLocate(deps, "ambiguous");
+      return;
+    }
+    if (subset.length > 1) {
+      noteLocate(deps, "ambiguous");
+      return;
+    }
+    if (candidates.length === 1) {
+      noteLocate(deps, "only-candidate");
+      return candidates[0].pid;
+    }
+    noteLocate(deps, "ambiguous");
+    return;
+  } catch {
+    noteLocate(deps, "error");
+    return;
+  }
+}
+async function claudeLocateTuiPid(ctx, deps = {}) {
+  try {
+    const pid = ctx.record.pid;
+    if (typeof pid !== "number" || !Number.isFinite(pid) || pid <= 0) {
+      noteLocate(deps, "no-candidate");
+      return;
+    }
+    let tty;
+    try {
+      tty = await (deps.ttyOf ?? ttyViaPs)(pid);
+    } catch {
+      tty = undefined;
+    }
+    if (typeof tty !== "string" || !isRealTty(tty.trim())) {
+      noteLocate(deps, "no-candidate");
+      return;
+    }
+    noteLocate(deps, "record-pid");
+    return pid;
+  } catch {
+    noteLocate(deps, "error");
+    return;
+  }
 }
 function claudeClearPredecessor(sessionId, hookPid, tracked) {
   return tracked.filter((t) => t.sessionId !== sessionId && t.provisional !== true && t.agent !== "codex" && typeof t.pid === "number" && Number.isFinite(t.pid) && t.pid === hookPid).sort((a, b) => (b.ts ?? 0) - (a.ts ?? 0))[0]?.sessionId;
@@ -1675,7 +1821,8 @@ var claudeAdapter = {
   hookStampPath: () => lastHookPath("claude"),
   hooksNotFiringHint: "  Reinstall the plugin / check /plugin.",
   toolDetail: claudeToolDetail,
-  blobAgentFields: {}
+  blobAgentFields: {},
+  locateTuiPid: (ctx, deps) => claudeLocateTuiPid(ctx, deps)
 };
 var codexAdapter = {
   kind: "codex",
@@ -1730,7 +1877,8 @@ var codexAdapter = {
   toolDetail: codexToolDetail,
   blobAgentFields: { agent: "codex" },
   discoverLive: (known) => codexDiscoverLive(known),
-  pidTurnActive: (pid) => codexPidTurnActive(pid)
+  pidTurnActive: (pid) => codexPidTurnActive(pid),
+  locateTuiPid: (ctx, deps) => codexLocateTuiPid(ctx, deps)
 };
 function adapterFor(agent) {
   return agent === "codex" ? codexAdapter : claudeAdapter;

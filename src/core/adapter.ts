@@ -16,7 +16,7 @@ import { execFile } from "node:child_process";
 import { readdir, readFile, stat } from "node:fs/promises";
 import { promisify } from "node:util";
 import { basename, join } from "node:path";
-import { AgentKind, codexHome, lastHookPath, pidAlive, readPrefix, readSuffix, SessionRecord } from "./shared";
+import { AgentKind, codexHome, isRealTty, lastHookPath, pidAlive, readPrefix, readSuffix, SessionRecord } from "./shared";
 
 const execFileP = promisify(execFile);
 
@@ -1230,11 +1230,24 @@ export function parseCodexProcs(psOutput: string): { pid: number; tty: string; a
   return rows;
 }
 
-/** A real controlling tty, i.e. an interactive terminal. macOS `ps` prints "??" for a process with no
- *  controlling terminal (the Codex.app / extension `codex app-server` daemons); "?"/"-" cover other
- *  no-tty spellings defensively. */
-function isRealTty(tty: string): boolean {
-  return tty.length > 0 && tty !== "??" && tty !== "?" && tty !== "-";
+/** REMOVABLE (see above). The same filter as filterCodexTuis, but each survivor keeps its `tty`.
+ *  Discovery only ever needed the pid; the macOS terminal-focus locator needs the tty too (it is the
+ *  correlation key between a codex process and the terminal window showing it), so the tty-preserving
+ *  form is the primitive and filterCodexTuis is the pid-only projection of it — the existing
+ *  `{pid}`-shaped contract (and its tests) is unchanged. Pure — the pid set and rows are injected. */
+export function codexTuiCandidates(
+  rows: { pid: number; tty: string; args: string }[], knownPids: Set<number>,
+): { pid: number; tty: string }[] {
+  const out: { pid: number; tty: string }[] = [];
+  for (const r of rows) {
+    if (knownPids.has(r.pid)) continue;
+    const tokens = r.args.trim().split(/\s+/);
+    if (basename(tokens[0] ?? "") !== "codex") continue; // executable basename must be `codex`
+    if (!isRealTty(r.tty)) continue;                       // interactive terminal only
+    if (tokens.slice(1).includes("exec")) continue;        // exclude `codex exec …` automation
+    out.push({ pid: r.pid, tty: r.tty });
+  }
+  return out;
 }
 
 /** REMOVABLE (see above). Keep only interactive codex TUIs not already tracked: executable basename
@@ -1243,16 +1256,7 @@ function isRealTty(tty: string): boolean {
 export function filterCodexTuis(
   rows: { pid: number; tty: string; args: string }[], knownPids: Set<number>,
 ): { pid: number }[] {
-  const out: { pid: number }[] = [];
-  for (const r of rows) {
-    if (knownPids.has(r.pid)) continue;
-    const tokens = r.args.trim().split(/\s+/);
-    if (basename(tokens[0] ?? "") !== "codex") continue; // executable basename must be `codex`
-    if (!isRealTty(r.tty)) continue;                       // interactive terminal only
-    if (tokens.slice(1).includes("exec")) continue;        // exclude `codex exec …` automation
-    out.push({ pid: r.pid });
-  }
-  return out;
+  return codexTuiCandidates(rows, knownPids).map(({ pid }) => ({ pid }));
 }
 
 /** cwd basename → the provisional's label/title, exactly like buildBlob's cwd-basename `label`
@@ -1318,6 +1322,215 @@ export async function codexDiscoverLive(known: SessionRecord[], deps: CodexDisco
     out.push({ pid, sessionId: codexSentinelSessionId(pid), title: label, label, idle: !active });
   }
   return out;
+}
+
+// --- TUI LOCATE (the per-agent half of "bring this session's terminal window to the front") ----
+//
+// The phone can ask this computer to focus the terminal a session is running in (the watchdog's
+// `focus-terminal` command). That splits cleanly in two: WHICH process is the session's interactive
+// TUI (agent-specific — this seam), and HOW to raise the macOS window showing it (agent-agnostic —
+// core/terminal-focus.ts). Only the first half belongs here.
+//
+// Claude is trivial: the hook records process.ppid, which IS the `claude` TUI. Codex is not — the
+// record's pid can be an `app-server` host, a resumed thread, or a provisional discovery sentinel —
+// so its locator is an explicit, ordered correlation heuristic that STOPS at the first unambiguous
+// hit and otherwise gives up. Precision over magic: focusing the WRONG window is worse than doing
+// nothing, so every tie, every unresolvable set, and every failed probe returns undefined.
+
+/** Why a locate resolved (or didn't) — reported through LocateTuiDeps.note so the watchdog can trace
+ *  an "ambiguous" give-up distinctly from "no candidate at all". Never affects the return value. */
+export type LocateTuiReason =
+  | "record-pid"      // 1. the record's own pid is a live TUI
+  | "sentinel-pid"    // 2. the codex-pid-<n> provisional sentinel names a live TUI
+  | "cwd-unique"      // 3. exactly one live TUI runs in the record's origin cwd
+  | "start-time"      // 4. the strictly closest process start to the session's start
+  | "only-candidate"  // 5. nothing correlated, but the machine has exactly ONE TUI
+  | "ambiguous"       // two or more equally-plausible TUIs — deliberately no guess
+  | "no-candidate"    // no live TUI at all (or the record has no usable pid)
+  | "error";          // the process scan itself failed
+
+/** Injectable seams for the locate step (mirrors CodexDiscoverDeps), so the whole heuristic is
+ *  unit-testable without spawning `ps`/`lsof`. */
+export interface LocateTuiDeps {
+  /** Whole-process-table scan, `ps -axo pid=,tty=,args=` (same output parseCodexProcs reads). */
+  ps?: () => Promise<string>;
+  /** A pid's current working directory (lsof). */
+  cwdOf?: (pid: number) => Promise<string | undefined>;
+  /** A pid's process start time as epoch ms, or undefined when it can't be resolved. */
+  startTimeOf?: (pid: number) => Promise<number | undefined>;
+  /** A pid's controlling tty as `ps` prints it ("ttys004" / "??"), or undefined on failure. */
+  ttyOf?: (pid: number) => Promise<string | undefined>;
+  /** Optional outcome sink (see LocateTuiReason). Best-effort; never throws into the caller. */
+  note?: (reason: LocateTuiReason) => void;
+}
+
+/** The controlling tty of a pid via `ps -o tty= -p <pid>`. Undefined on any failure. */
+async function ttyViaPs(pid: number): Promise<string | undefined> {
+  try {
+    const { stdout } = await execFileP("ps", ["-o", "tty=", "-p", String(pid)]);
+    const trimmed = stdout.trim();
+    return trimmed.length > 0 ? trimmed : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** A pid's process start time (epoch ms) via `ps -o lstart= -p <pid>` — the full-date form, which
+ *  Date.parse handles ("Wed Jul 30 02:14:07 2026"). Undefined on any failure/unparseable output. */
+async function startTimeViaPs(pid: number): Promise<number | undefined> {
+  try {
+    const { stdout } = await execFileP("ps", ["-o", "lstart=", "-p", String(pid)]);
+    const parsed = Date.parse(stdout.trim());
+    return Number.isFinite(parsed) ? parsed : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Best-effort note (a throwing sink must never break a locate). */
+function noteLocate(deps: LocateTuiDeps, reason: LocateTuiReason): void {
+  try { deps.note?.(reason); } catch { /* diagnostics only */ }
+}
+
+/** The provisional discovery sentinel's embedded pid (`codex-pid-<n>`), or undefined. */
+function sentinelPid(sessionId: string): number | undefined {
+  const m = /^codex-pid-(\d+)$/.exec(sessionId);
+  if (!m) return undefined;
+  const pid = Number.parseInt(m[1], 10);
+  return Number.isFinite(pid) ? pid : undefined;
+}
+
+/** Locate the interactive Codex TUI process for a session record. ORDERED heuristic; the first
+ *  unambiguous hit wins and nothing later can override it:
+ *    1. `record.pid` is itself one of the live codex TUI candidates → that process.
+ *    2. the session id is the `codex-pid-<n>` discovery sentinel and <n> is a candidate → that one.
+ *    3. cwd: resolve each candidate's cwd and keep those equal to `record.origin?.cwd`. Exactly one
+ *       → that one; several → continue with ONLY that subset. (Skipped entirely when the record has
+ *       no origin cwd — older/provisional records — and NEVER approximated by `record.label`, the cwd
+ *       BASENAME, which collides across worktrees/checkouts of the same project.)
+ *    4. start-time proximity, only when `record.sessionStartedAt` is known: the candidate whose
+ *       process start is STRICTLY closest to it. A tie, or no resolvable start times, → give up.
+ *    5. if the surviving subset is EMPTY, fall back to "the codex TUI" only when the whole machine
+ *       has exactly one; otherwise undefined.
+ *  Never throws: a `ps` failure, an lsof race, or a garbage record all yield undefined. */
+export async function codexLocateTuiPid(
+  ctx: { sessionId: string; record: SessionRecord }, deps: LocateTuiDeps = {},
+): Promise<number | undefined> {
+  try {
+    let output: string;
+    try {
+      output = await (deps.ps ?? runPs)();
+    } catch {
+      noteLocate(deps, "error");
+      return undefined; // no process table → no evidence at all
+    }
+    // knownPids is EMPTY here on purpose: discovery excludes already-tracked pids, but a locate is
+    // asking about a tracked session, so its own process must remain a candidate.
+    const candidates = codexTuiCandidates(parseCodexProcs(output), new Set());
+    if (candidates.length === 0) {
+      noteLocate(deps, "no-candidate");
+      return undefined;
+    }
+    const pids = new Set(candidates.map((c) => c.pid));
+
+    // 1. the record's own pid is a live TUI (the common, exact case).
+    if (typeof ctx.record.pid === "number" && Number.isFinite(ctx.record.pid) && pids.has(ctx.record.pid)) {
+      noteLocate(deps, "record-pid");
+      return ctx.record.pid;
+    }
+
+    // 2. the discovery sentinel names the pid directly.
+    const sentinel = sentinelPid(ctx.sessionId);
+    if (sentinel !== undefined && pids.has(sentinel)) {
+      noteLocate(deps, "sentinel-pid");
+      return sentinel;
+    }
+
+    // 3. cwd equality (exact path, never the basename).
+    let subset = candidates;
+    const cwd = ctx.record.origin?.cwd;
+    if (typeof cwd === "string" && cwd.length > 0) {
+      const cwdOf = deps.cwdOf ?? cwdViaLsof;
+      const matched: { pid: number; tty: string }[] = [];
+      for (const c of candidates) {
+        let candidateCwd: string | undefined;
+        try { candidateCwd = await cwdOf(c.pid); } catch { candidateCwd = undefined; }
+        if (candidateCwd === cwd) matched.push(c);
+      }
+      if (matched.length === 1) {
+        noteLocate(deps, "cwd-unique");
+        return matched[0].pid;
+      }
+      subset = matched; // several → tiebreak within them; none → the empty-subset fallback below
+    }
+
+    // 4. start-time proximity, strictly closest, only with a known session start.
+    const startedAt = ctx.record.sessionStartedAt;
+    if (subset.length > 1 && typeof startedAt === "number" && Number.isFinite(startedAt)) {
+      const startTimeOf = deps.startTimeOf ?? startTimeViaPs;
+      let best: { pid: number; delta: number } | undefined;
+      let tied = false;
+      for (const c of subset) {
+        let started: number | undefined;
+        try { started = await startTimeOf(c.pid); } catch { started = undefined; }
+        if (typeof started !== "number" || !Number.isFinite(started)) continue;
+        const delta = Math.abs(started - startedAt);
+        if (best === undefined || delta < best.delta) {
+          best = { pid: c.pid, delta };
+          tied = false;
+        } else if (delta === best.delta) {
+          tied = true;
+        }
+      }
+      if (best !== undefined && !tied) {
+        noteLocate(deps, "start-time");
+        return best.pid;
+      }
+      noteLocate(deps, "ambiguous"); // equally close, or nothing resolved → refuse to guess
+      return undefined;
+    }
+    if (subset.length > 1) {
+      noteLocate(deps, "ambiguous"); // several plausible TUIs and no tiebreak key
+      return undefined;
+    }
+    // 5. nothing correlated (a lone cwd match already returned at step 3). Only a machine with exactly ONE codex TUI is unambiguous.
+    if (candidates.length === 1) {
+      noteLocate(deps, "only-candidate");
+      return candidates[0].pid;
+    }
+    noteLocate(deps, "ambiguous");
+    return undefined;
+  } catch {
+    noteLocate(deps, "error");
+    return undefined;
+  }
+}
+
+/** Locate the interactive Claude TUI process: the record's own pid IS it (the hook stores
+ *  process.ppid, the `claude` process). The only check is that the pid still holds a REAL controlling
+ *  tty — a dead pid, or one whose tty is "??" (a headless/daemon `claude`), owns no terminal window,
+ *  so there is nothing to focus. Never throws. */
+export async function claudeLocateTuiPid(
+  ctx: { sessionId: string; record: SessionRecord }, deps: LocateTuiDeps = {},
+): Promise<number | undefined> {
+  try {
+    const pid = ctx.record.pid;
+    if (typeof pid !== "number" || !Number.isFinite(pid) || pid <= 0) {
+      noteLocate(deps, "no-candidate");
+      return undefined;
+    }
+    let tty: string | undefined;
+    try { tty = await (deps.ttyOf ?? ttyViaPs)(pid); } catch { tty = undefined; }
+    if (typeof tty !== "string" || !isRealTty(tty.trim())) {
+      noteLocate(deps, "no-candidate");
+      return undefined;
+    }
+    noteLocate(deps, "record-pid");
+    return pid;
+  } catch {
+    noteLocate(deps, "error");
+    return undefined;
+  }
 }
 
 // --- Codex child-session ghost detection (ChatGPT.app `codex app-server`) ---------------------
@@ -1661,6 +1874,14 @@ export interface AgentAdapter {
    *  watchdog can (a) flag an idle discovery as done instead of "working" and (b) correct an existing
    *  provisional "working" row to done once its TUI goes idle. Must never throw. */
   pidTurnActive?(pid: number): Promise<boolean>;
+  /** OPTIONAL: which live process is this session's INTERACTIVE TUI — the one whose terminal window
+   *  the phone's `focus-terminal` command wants raised. Undefined means "don't know / not sure": the
+   *  watchdog then does NOTHING (focusing the wrong window is worse than a no-op). Claude returns its
+   *  recorded pid when that pid still holds a real controlling tty; Codex runs the ordered correlation
+   *  heuristic in codexLocateTuiPid. `sessionId` rides alongside the record because a record does not
+   *  carry its own id (the filename stem is the id) and the codex discovery sentinel encodes the pid
+   *  in it. Must never throw. */
+  locateTuiPid?(ctx: { sessionId: string; record: SessionRecord }, deps?: LocateTuiDeps): Promise<number | undefined>;
 }
 
 export const claudeAdapter: AgentAdapter = {
@@ -1720,6 +1941,8 @@ export const claudeAdapter: AgentAdapter = {
   blobAgentFields: {},
   // No discoverLive: Claude's SessionStart fires at true session open, so the hooks already see every
   // session — there is nothing for the watchdog to discover ahead of them.
+  // The recorded pid IS the TUI (process.ppid at hook time); it only has to still own a real tty.
+  locateTuiPid: (ctx, deps) => claudeLocateTuiPid(ctx, deps),
 };
 
 export const codexAdapter: AgentAdapter = {
@@ -1800,6 +2023,9 @@ export const codexAdapter: AgentAdapter = {
   // The turn-state probe behind the idle-TUI fix: discovery flags idle REPLs, and the watchdog's
   // idle-provisional corrective flips a stale "working" provisional to done. REMOVABLE with discovery.
   pidTurnActive: (pid: number): Promise<boolean> => codexPidTurnActive(pid),
+  // A codex record's pid may be an app-server host or a discovery sentinel, so locating the TUI is an
+  // ordered correlation heuristic that refuses to guess (see codexLocateTuiPid).
+  locateTuiPid: (ctx, deps) => codexLocateTuiPid(ctx, deps),
 };
 
 /** Select the concrete adapter for an agent kind. */

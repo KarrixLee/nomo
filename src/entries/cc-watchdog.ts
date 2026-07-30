@@ -34,6 +34,9 @@ import { hostname } from "node:os";
 import { basename } from "node:path";
 import { encryptBlob } from "../core/crypto";
 import { adapterFor, AgentAdapter, allAdapters, codexAdapter, CodexPlanPickerEvidence, DiscoveredSession } from "../core/adapter";
+import type { LocateTuiReason } from "../core/adapter";
+import { focusTerminalForPid } from "../core/terminal-focus";
+import type { FocusResult } from "../core/terminal-focus";
 import { CodexRemoteInputBridge } from "../core/codex-remote-input-bridge";
 import type { CodexThreadWaitState } from "../core/codex-remote-input-bridge";
 import type { PlanPickerTraceDecision } from "../core/shared";
@@ -41,7 +44,7 @@ import {
   AgentKind, appendFittedPlanAndDebug, atomicWrite, CC_DIR, CCOp, CCStatus, codexAppServerSocketAvailable, Config, completePendingPairing, formatPlanPickerDebug, formatWatchdogPidfile,
   GONE_STRIKE_LIMIT, loadConfig, loadPendingConfig, localApprovalsState,
   PAIR_HTML_FILE, PairPollResult, parseWatchdogPidfile, PendingConfig, pidAlive, PLUGIN_VERSION, readPrefix, readSuffix, recordGoneStrike, removeRevokedConfig,
-  resetGoneStrikes, SessionRecord, SESSIONS_DIR, tracePlanPickerDecision, watchdogHolderIsLive, WATCHDOG_PID_PATH,
+  resetGoneStrikes, SessionRecord, SESSIONS_DIR, traceSession, tracePlanPickerDecision, watchdogHolderIsLive, WATCHDOG_PID_PATH,
 } from "../core/shared";
 
 // The transcript-tail interrupt PARSERS live in the agent adapters now (the two detections are
@@ -772,6 +775,30 @@ export function postOutcomeForStatus(status: number): PostOutcome {
   return "failed";
 }
 
+/** The header set for a WATCHDOG /cc/event POST. Pure (the approvals value is passed in), so the
+ *  one header that differs from every other POSTer's is unit-testable without touching fetch.
+ *
+ *  `x-cc-role: "watchdog"` is what gates piggybacked command delivery (see the command-intake
+ *  section): the worker attaches `commands` ONLY to requests carrying it, and consumes each command
+ *  as it answers. It must therefore be sent by the one caller that READS the response body — this
+ *  one. hook.ts, codex-notify.ts, reset.ts and shared.ts's pending-pairing flush all POST the same
+ *  route and all discard the body, so if they claimed this role they would consume-and-drop the
+ *  user's queued command. DO NOT add this header anywhere else. Literal-matched by the worker, same
+ *  posture as x-cc-approvals's "on"/"off". */
+export function watchdogEventHeaders(config: Config, approvals: string): Record<string, string> {
+  return {
+    "content-type": "application/json",
+    "x-cc-pairing": config.pairingId,
+    "x-cc-auth": config.pcSecret,
+    "x-cc-version": PLUGIN_VERSION,
+    // This computer's local remote-approvals pause (`nomo-cc permission off`) — same plaintext
+    // report every /cc/event POSTer sends; the worker literal-matches "on"/"off".
+    "x-cc-approvals": approvals,
+    // Only this POSTer drains the command queue (see the doc comment above).
+    "x-cc-role": "watchdog",
+  };
+}
+
 /** POST a v2 envelope to the Worker with the per-pairing auth headers. `delivered` ONLY on a 2xx:
  *  a 401/500 is a FAILURE, not success — otherwise a bad secret or a Worker error would count as
  *  delivered and the caller would delete/rewrite the session file, losing the session. A 404 is
@@ -781,21 +808,219 @@ async function postEvent(config: Config, body: object): Promise<PostOutcome> {
   try {
     const res = await fetch(`${config.url}/v1/cc/event`, {
       method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "x-cc-pairing": config.pairingId,
-        "x-cc-auth": config.pcSecret,
-        "x-cc-version": PLUGIN_VERSION,
-        // This computer's local remote-approvals pause (`nomo-cc permission off`) — same plaintext
-        // report every /cc/event POSTer sends; the worker literal-matches "on"/"off".
-        "x-cc-approvals": await localApprovalsState(),
-      },
+      headers: watchdogEventHeaders(config, await localApprovalsState()),
       body: JSON.stringify(body),
       signal: AbortSignal.timeout(2000),
     });
-    return postOutcomeForStatus(res.status);
+    const outcome = postOutcomeForStatus(res.status);
+    // A 2xx MAY piggyback queued phone→Mac commands (see the command-intake section below). The
+    // worker consumes them as it answers, so this response is the ONLY time we will ever see them —
+    // buffer them here and let the sweep loop execute them off the POST path. Best-effort: a
+    // non-JSON body (captive portal, edge interposition, truncated read) must degrade to a plain
+    // delivered, never throw out of a POST that already succeeded.
+    if (outcome === "delivered") {
+      try { bufferCommands(extractCommands(await res.json())); } catch { /* not JSON → no commands */ }
+    }
+    return outcome;
   } catch {
     return "failed";
+  }
+}
+
+// --- Command intake (phone → Mac, piggybacked on the /cc/event response) -----------------------
+//
+// The phone can ask this computer to DO something — today only "focus the terminal this session is
+// running in". There is no inbound channel to a laptop behind NAT, and adding a poll would cost a
+// request every few seconds forever, so commands ride back on the response to the POSTs the watchdog
+// already makes:
+//
+//   {"ok":true, …, "commands":[{"id":"…","kind":"focus-terminal","sessionId":"…","ts":1753900000000}]}
+//
+// The key is OMITTED when nothing is queued, and the worker CONSUMES each command as it delivers it,
+// so every command is seen exactly once and there is nothing to re-request. postEvent buffers what it
+// parses (its PostOutcome signature is depended on by a dozen injected `post:` deps and stays exactly
+// as it was); the sweep loop drains the buffer once per tick, so a slow osascript can never sit on
+// the POST path.
+
+/** A queued phone→Mac command. Only one kind exists today; unknown kinds are dropped at parse time. */
+export interface FocusCommand {
+  id: string;
+  kind: "focus-terminal";
+  sessionId: string;
+  /** Epoch-ms the worker queued it (diagnostics only — nothing gates on it). */
+  ts?: number;
+}
+
+/** Cap on commands accepted from ONE response. A compromised/buggy worker must not be able to hand
+ *  this daemon an unbounded work list; 8 is far above the real ceiling (a user taps one row). */
+const COMMANDS_PER_RESPONSE_MAX = 8;
+/** Cap on the pending buffer, in case several POSTs in one tick each carry commands. */
+const COMMAND_BUFFER_MAX = 32;
+/** How many executed command ids to remember, so a worker replay/duplicate delivery can't re-focus a
+ *  window under the user's hands. Bounded: this is a long-lived process. */
+const EXECUTED_COMMAND_IDS_MAX = 64;
+
+/** Commands buffered out of POST responses, awaiting the next drain. */
+const commandBuffer: FocusCommand[] = [];
+/** Ids already executed by THIS daemon (insertion-ordered, evicted oldest-first). */
+const executedCommandIds = new Set<string>();
+
+/** Parse the OPTIONAL `commands` key of a /cc/event response body. Accepts only well-formed
+ *  focus-terminal entries (string id, non-empty string sessionId), ignores unknown kinds, tolerates a
+ *  missing / non-array key, caps the result, and NEVER throws — a malformed body must degrade to
+ *  "no commands", exactly like an unparseable one. Pure. */
+export function extractCommands(body: unknown): FocusCommand[] {
+  try {
+    if (typeof body !== "object" || body === null) return [];
+    const raw = (body as Record<string, unknown>).commands;
+    if (!Array.isArray(raw)) return []; // absent (the normal case) or the wrong shape
+    const out: FocusCommand[] = [];
+    for (const entry of raw) {
+      if (out.length >= COMMANDS_PER_RESPONSE_MAX) break;
+      if (typeof entry !== "object" || entry === null) continue;
+      const e = entry as Record<string, unknown>;
+      if (e.kind !== "focus-terminal") continue; // forward-compat: a future kind is simply ignored
+      if (typeof e.id !== "string" || e.id.length === 0) continue;
+      if (typeof e.sessionId !== "string" || e.sessionId.length === 0) continue;
+      out.push({
+        id: e.id, kind: "focus-terminal", sessionId: e.sessionId,
+        ...(typeof e.ts === "number" && Number.isFinite(e.ts) ? { ts: e.ts } : {}),
+      });
+    }
+    return out;
+  } catch {
+    return [];
+  }
+}
+
+/** Queue parsed commands for the next drain (bounded). Best-effort, never throws. */
+function bufferCommands(commands: FocusCommand[]): void {
+  for (const c of commands) {
+    if (commandBuffer.length >= COMMAND_BUFFER_MAX) return;
+    commandBuffer.push(c);
+  }
+}
+
+/** Remember an executed id, evicting the oldest once the bound is reached. */
+function rememberCommandId(id: string): void {
+  executedCommandIds.add(id);
+  while (executedCommandIds.size > EXECUTED_COMMAND_IDS_MAX) {
+    const oldest = executedCommandIds.values().next();
+    if (oldest.done) break;
+    executedCommandIds.delete(oldest.value);
+  }
+}
+
+/** Test-only reset of the module-global command state (what a fresh daemon starts with). */
+export function resetCommandState(): void {
+  commandBuffer.length = 0;
+  executedCommandIds.clear();
+}
+
+/** What a focus attempt ended up doing — the ONLY debugging channel a user has for this feature, so
+ *  every command produces exactly one line whatever happens. */
+export type FocusTraceResult =
+  | "focused"           // a window (or at least the owning app) came forward
+  | "no-record"         // the sessionId names no session on this machine
+  | "no-candidate"      // no live TUI process could be identified for it
+  | "ambiguous"         // several equally-plausible TUIs — deliberately no guess
+  | "osascript-failed"  // AppleScript refused (TCC denial / timeout / app error)
+  | "unsupported"       // not macOS, unknown terminal app, or an agent with no locate seam
+  | "duplicate";        // this command id already ran on this daemon
+
+/** Best-effort trace with the same argv guard tracePicker uses: pure unit calls run inside `bun test`
+ *  with the production HOME visible and must never pollute the user's live trace. */
+function traceFocus(deps: { trace?: (event: object) => void }, event: object): void {
+  if (deps.trace) {
+    try { deps.trace(event); } catch { /* diagnostics only */ }
+    return;
+  }
+  if (process.argv.some((arg) => arg === "test" || arg.endsWith(".test.ts"))) return;
+  traceSession(event);
+}
+
+/** Injectable seams for the drain, so the whole path is testable with no filesystem and no osascript. */
+export interface DrainCommandsDeps {
+  /** Take (and clear) the pending commands. Defaults to draining the module buffer. */
+  take?: () => FocusCommand[];
+  /** Every session record on disk, id + record. Defaults to the sweep's own reader. */
+  readRecords?: () => Promise<RecordEntry[]>;
+  /** Raise the window for a located pid. Defaults to the real macOS AppleScript path. */
+  focus?: (pid: number) => Promise<FocusResult>;
+  /** The adapter registry the per-session locate dispatches through (same seam
+   *  discoverLiveSessions / reconcileProvisionalsSweep expose), so a test can supply a locator
+   *  without spawning a real `ps`. Defaults to the real registry. */
+  adapters?: AgentAdapter[];
+  trace?: (event: object) => void;
+}
+
+/** Execute every buffered command, returning how many actually focused something.
+ *
+ *  For a focus-terminal command: find the session's record (unknown id → no-record), pick its
+ *  adapter via the same recordAgent/adapterFor dispatch every other net uses, and ask the adapter's
+ *  optional locate seam WHICH live process is that session's interactive TUI. Undefined — no
+ *  candidate, or several equally plausible ones — is a deliberate NO-OP: focusing the wrong window is
+ *  worse than doing nothing. An agent with no locate seam is likewise a no-op.
+ *
+ *  Ids are deduped against a bounded recently-executed set, so a worker replay can't double-focus.
+ *  Every outcome is traced. The whole drain is wrapped: a command must never derail the sweep. */
+export async function drainCommands(config: Config, deps: DrainCommandsDeps = {}): Promise<number> {
+  try {
+    const pending = (deps.take ?? (() => commandBuffer.splice(0, commandBuffer.length)))();
+    if (pending.length === 0) return 0;
+    const readRecords = deps.readRecords ?? readAllRecordEntries;
+    const focus = deps.focus ?? ((pid: number) => focusTerminalForPid(pid));
+    let entries: RecordEntry[] | null = null;
+    let focused = 0;
+    for (const cmd of pending) {
+      const base = { event: "focus-terminal", sessionId: cmd.sessionId, id: cmd.id };
+      try {
+        if (executedCommandIds.has(cmd.id)) {
+          traceFocus(deps, { ...base, result: "duplicate" as FocusTraceResult });
+          continue;
+        }
+        rememberCommandId(cmd.id); // BEFORE the work: a throw mid-focus must not re-run on the next tick
+        if (entries === null) entries = await readRecords(); // one dir read per drain, not per command
+        const entry = entries.find((e) => e.sessionId === cmd.sessionId);
+        if (!entry) {
+          traceFocus(deps, { ...base, result: "no-record" as FocusTraceResult });
+          continue;
+        }
+        const agent = recordAgent(entry.rec);
+        const adapter = deps.adapters
+          ? deps.adapters.find((a) => a.kind === agent) ?? adapterFor(agent)
+          : adapterFor(agent);
+        if (!adapter.locateTuiPid) {
+          traceFocus(deps, { ...base, agent, result: "unsupported" as FocusTraceResult });
+          continue;
+        }
+        let reason: LocateTuiReason | undefined;
+        const pid = await adapter.locateTuiPid(
+          { sessionId: cmd.sessionId, record: entry.rec },
+          { note: (r) => { reason = r; } },
+        );
+        if (typeof pid !== "number" || !Number.isFinite(pid)) {
+          const result: FocusTraceResult = reason === "ambiguous" ? "ambiguous" : "no-candidate";
+          traceFocus(deps, { ...base, agent, result, reason: reason ?? "no-candidate" });
+          continue;
+        }
+        const outcome = await focus(pid);
+        if (outcome.ok) {
+          focused += 1;
+          traceFocus(deps, { ...base, agent, pid, result: "focused" as FocusTraceResult, via: outcome.via, reason });
+          continue;
+        }
+        const result: FocusTraceResult = outcome.reason === "osascript-failed"
+          ? "osascript-failed"
+          : outcome.reason === "unsupported" ? "unsupported" : "no-candidate";
+        traceFocus(deps, { ...base, agent, pid, result, why: outcome.reason, reason });
+      } catch {
+        traceFocus(deps, { ...base, result: "no-candidate" as FocusTraceResult, why: "error" });
+      }
+    }
+    return focused;
+  } catch {
+    return 0; // a command must never derail the sweep
   }
 }
 
@@ -1841,6 +2066,87 @@ export function shouldHeartbeat(record: SessionRecord, now: number, lastHeartbea
   return true;
 }
 
+// --- Waiting-session fast beat (the command-pickup latency floor) ------------------------------
+//
+// Commands ride back on the RESPONSE to a watchdog /cc/event POST (see the command-intake section),
+// so the worst-case delay between a phone tap and the Mac acting on it is exactly "how long until
+// this daemon next POSTs". For the target scenario — a session PARKED on a plan picker / permission
+// hold / question, i.e. precisely when a user reaches for "Open on Mac" — that was up to FIVE
+// MINUTES, and here is why, from the gates themselves:
+//   - shouldPendingApprovalCheck returns false once `lastEvent === "needsAttention"` (fire-once
+//     dedup), so the pending-approval net stops POSTing the moment the wait is surfaced;
+//   - correctResolvedPlanPicker / correctPlanPickerVerification return "uncorrected" WITHOUT a POST
+//     while the picker is genuinely still open (state "pending");
+//   - correctInterrupt / correctIdleClaude / repairTitle / retireDoneStale all no-op on a titled,
+//     alive, uninterrupted attention row;
+//   - discoverLiveSessions skips any pid that is already tracked, and reconcileProvisionalsSweep
+//     only ever fires for a provisional that a real record now covers — neither POSTs for this row;
+//   - the blocking permission hold itself talks to /v1/cc/decision*, never /cc/event.
+// Which leaves the staleness heartbeat, gated on `now - record.ts >= HEARTBEAT_AFTER_MS` (5 min).
+//
+// The fix is deliberately the smallest one that adds no polling loop: while a session is WAITING, the
+// pairing gets one extra verbatim heartbeat every WAITING_HEARTBEAT_AFTER_MS. It reuses the existing
+// heartbeat envelope (the record's last blob, unchanged op/prio) so it can never alter state, it
+// piggybacks on the sweep that already runs every POLL_MS, and it is throttled on a PAIRING-level
+// clock rather than a per-session one — so ten waiting sessions cost exactly what one costs.
+
+/** How long the pairing waits between fast beats while any session is parked on the user. Sized
+ *  against the sweep cadence (POLL_MS = 5 s) so the worst-case pickup is ~15 s, and against the
+ *  worker's 300-per-60-s-per-pairing /cc/event limit: because the throttle clock is per-PAIRING,
+ *  this adds at most 6 POSTs per minute in total (2 % of the budget) no matter how many sessions
+ *  wait. Non-waiting sessions are untouched — they keep the 5-minute cadence exactly. */
+export const WAITING_HEARTBEAT_AFTER_MS = 10_000;
+
+/** Is this session parked on the USER — a permission hold, a question, or the Codex plan picker?
+ *  Pure, and the only thing the fast beat keys on:
+ *    - `lastEvent === "needsAttention"` is what every attention producer writes (hook.ts stamps the
+ *      posted status; PermissionRequest maps to needsAttention, and the blocking decisionPending
+ *      frame is sealed over that same record state);
+ *    - `pendingPlanPicker` is the Codex TUI picker's explicit durable marker;
+ *    - `prio === 1` is the wire-level attention marker, which only survives while the episode does
+ *      (any later working/done hook rewrites op+prio together).
+ *  A terminal row is never "waiting", whatever else it carries. */
+export function isWaitingSession(record: SessionRecord): boolean {
+  if (record.op === "done" || record.lastEvent === "done") return false;
+  return record.lastEvent === "needsAttention" || record.pendingPlanPicker === true || record.prio === 1;
+}
+
+/** Should this session provide the pairing's fast beat this sweep? Every guardrail shouldHeartbeat
+ *  enforces applies identically (a done row, a net that owns the session this sweep, or an in-flight
+ *  corrective-done retry all stand down), plus: the session must be waiting, must have been
+ *  event-quiet for at least one interval (so this never doubles up on the hook POST that just opened
+ *  the episode), and the PAIRING must not have fast-beaten within the interval. `lastWaitingBeat` is
+ *  that pairing-wide clock — passed in, so this stays pure. */
+export function shouldWaitingHeartbeat(
+  record: SessionRecord, now: number, lastWaitingBeat: number | undefined, correctedThisSweep: boolean,
+): boolean {
+  if (!isWaitingSession(record)) return false;
+  if (typeof record.doneAttempts === "number" && record.doneAttempts > 0) return false;
+  if (isClaudeIdleReapEligible(record, now)) return false;
+  if (correctedThisSweep) return false;
+  if (typeof record.ts !== "number") return false;
+  if (now - record.ts < WAITING_HEARTBEAT_AFTER_MS) return false; // the opening hook POST just happened
+  if (lastWaitingBeat !== undefined && now - lastWaitingBeat < WAITING_HEARTBEAT_AFTER_MS) return false;
+  return true;
+}
+
+/** Which heartbeat (if any) this session gets this sweep. The stale beat wins when both apply, so a
+ *  waiting session that has ALSO been quiet for five minutes still only sends one POST. Pure — the
+ *  whole cadence matrix is unit-testable without fs/network. */
+export type HeartbeatKind = "none" | "stale" | "waiting";
+export function heartbeatKind(
+  record: SessionRecord, now: number, lastHeartbeat: number | undefined,
+  lastWaitingBeat: number | undefined, correctedThisSweep: boolean,
+): HeartbeatKind {
+  if (shouldHeartbeat(record, now, lastHeartbeat, correctedThisSweep)) return "stale";
+  if (shouldWaitingHeartbeat(record, now, lastWaitingBeat, correctedThisSweep)) return "waiting";
+  return "none";
+}
+
+/** The pairing-wide clock behind the waiting fast beat (in-memory, exactly like heartbeatAt: a
+ *  waiting session is by definition alive, so the daemon outlives the wait it is throttling). */
+let waitingBeatAt: number | undefined;
+
 /** The result of one sweep. `revoked` means a /cc/event POST came back gone (404/410) THIS sweep — NOT
  *  a definitive teardown signal on its own: the loop feeds it through the shared 2-strike gate (a
  *  single transient gone never tears down). Otherwise `remaining` is how many session files are left
@@ -1987,7 +2293,11 @@ async function sweep(config: Config | null, deps: SweepDeps = {}): Promise<Sweep
           if (titleFix === "revoked") return { revoked: true };
           if (titleFix === "corrected") { delivered = true; repairedTitle = true; }
         }
-        if (shouldHeartbeat(record, now, heartbeatAt.get(sessionId), idleFix === "corrected" || planResolutionHandled || interruptHandled || flaggedAttention || reapedIdle || repairedTitle)) {
+        const beatKind = heartbeatKind(
+          record, now, heartbeatAt.get(sessionId), waitingBeatAt,
+          idleFix === "corrected" || planResolutionHandled || interruptHandled || flaggedAttention || reapedIdle || repairedTitle,
+        );
+        if (beatKind !== "none") {
           const beat = buildHeartbeatEnvelope(sessionId, record, Date.now(), config.pairingId);
           // delivered only: a failed heartbeat mutates NOTHING (not the record, not even the throttle),
           // so quietness stays true and it's retried next sweep. A record with no stored blob yields
@@ -1995,7 +2305,11 @@ async function sweep(config: Config | null, deps: SweepDeps = {}): Promise<Sweep
           if (beat) {
             const outcome = await postEvent(config, beat);
             if (outcome === "revoked") return { revoked: true };
-            if (outcome === "delivered") { heartbeatAt.set(sessionId, now); delivered = true; }
+            if (outcome === "delivered") {
+              heartbeatAt.set(sessionId, now); // a fast beat IS a heartbeat — it advances both clocks
+              if (beatKind === "waiting") waitingBeatAt = now;
+              delivered = true;
+            }
           }
         }
       }
@@ -2372,6 +2686,10 @@ async function run(): Promise<void> {
       const result = await sweep(config, {
         threadWaitState: (threadId) => bridges.threadWaitState(threadId),
       });
+      // Commands the worker piggybacked on THIS cycle's POST responses (discovery/reconcile/sweep).
+      // Drained once per tick, off the POST path, so a slow osascript can never delay a status event.
+      // Best-effort by construction — drainCommands swallows everything and returns a count.
+      if (config) await drainCommands(config);
       if (result.revoked) {
         // A /cc/event POST came back gone (404/410) this sweep. Do NOT tear down on the first one — a
         // single gone can be a transient/racing delete (worker redeploy, KV eventual-consistency), and

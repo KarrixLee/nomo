@@ -1135,6 +1135,14 @@ export function pidAlive(pid: number): boolean {
   }
 }
 
+/** A REAL controlling tty, i.e. an interactive terminal. macOS `ps` prints "??" for a process with no
+ *  controlling terminal (the Codex.app / extension `codex app-server` daemons); "?"/"-" cover other
+ *  no-tty spellings defensively. Shared by codex discovery (the daemon filter) and the macOS
+ *  terminal-focus locator (a pid with no tty owns no terminal window). Pure. */
+export function isRealTty(tty: string): boolean {
+  return tty.length > 0 && tty !== "??" && tty !== "?" && tty !== "-";
+}
+
 /** The ancestor pid chain of `pid` (parent, grandparent, …), walked via `ps -o ppid=` up to a bounded
  *  depth so a garbage/cyclic table can't loop. Stops at pid ≤ 1 (launchd/init). Best-effort — a failed
  *  lookup ends the walk. Used only as a robustness fallback by the provisional-reconcile pid matcher

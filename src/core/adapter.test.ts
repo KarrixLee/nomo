@@ -3,8 +3,8 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, test } from "bun:test";
 import {
-  adapterFor, allAdapters, claudeAdapter, claudeClearPredecessor, claudeForkResumePredecessor, claudeHeadlessInvocation, claudeSessionModel, claudeSessionTitle,
-  claudeTailPendingApproval, codexAdapter, codexChildSessionGhost,
+  adapterFor, allAdapters, claudeAdapter, claudeClearPredecessor, claudeForkResumePredecessor, claudeHeadlessInvocation, claudeLocateTuiPid, claudeSessionModel, claudeSessionTitle,
+  claudeTailPendingApproval, codexAdapter, codexChildSessionGhost, codexLocateTuiPid, codexTuiCandidates,
   codexConfigModel, codexDiscoverLive, codexInternalSessionGhost, codexModelFromRollout,
   CODEX_ROLLOUT_IDLE_SILENCE_MS,
   codexNewestRolloutForCwd, codexPidPlanPickerEvidence, codexPidPlanPickerState, codexPidTurnActive, codexPlanPickerStateFromTail, codexProposedPlanMarkdown, codexRolloutExistsForSession, codexSentinelSessionId, codexSessionModel,
@@ -12,6 +12,7 @@ import {
   firstAssistantModel, firstUserPrompt, lastAssistantModel, parseCodexProcs, rolloutMetaCwd,
   requestUserInputDetail, rolloutPathFromLsof, sessionTitle, TrackedSessionLite,
 } from "./adapter";
+import type { LocateTuiReason } from "./adapter";
 import type { SessionRecord } from "./shared";
 
 // The adapter surface is the per-agent half of the hook pipeline. These cover the two branches that
@@ -1275,5 +1276,229 @@ describe("firstUserPrompt (skips command noise / caveat / system-reminder rows)"
       user("fix the island timer"),
     ].join("\n");
     expect(sessionTitle(transcript)).toBe("Island timer fix");
+  });
+});
+
+// --- TUI locate (the per-agent half of the phone's "focus this session's terminal") -----------
+//
+// Precision is the whole point: every ambiguity must return undefined rather than raise SOME window.
+// The fixture is the same real `ps` output the discovery tests use — two interactive codex TUIs plus
+// the tty-less app-server daemons — and every seam (ps / lsof / ps -o lstart / ps -o tty) is injected.
+
+const locRec = (over: Partial<SessionRecord> = {}): SessionRecord => ({
+  pid: 999_999, machine: "mac", label: "proj", ts: 1_000_000, agent: "codex", ...over,
+});
+
+/** One-codex-TUI process table (for the single-candidate fallback). */
+const PS_ONE_TUI = [
+  " 8750 ??       /Applications/Codex.app/Contents/Resources/codex app-server --analytics-default-enabled",
+  "16029 ttys017  codex",
+].join("\n");
+
+describe("codexTuiCandidates (the tty-preserving primitive under filterCodexTuis)", () => {
+  test("keeps each survivor's tty, and filterCodexTuis stays the pid-only projection of it", () => {
+    expect(codexTuiCandidates(parseCodexProcs(PS_FIXTURE), new Set())).toEqual([
+      { pid: 16029, tty: "ttys017" },
+      { pid: 33198, tty: "ttys018" },
+    ]);
+    expect(filterCodexTuis(parseCodexProcs(PS_FIXTURE), new Set())).toEqual([{ pid: 16029 }, { pid: 33198 }]);
+  });
+});
+
+describe("codexLocateTuiPid (ordered correlation heuristic)", () => {
+  const notes: string[] = [];
+  const note = (r: LocateTuiReason): void => { notes.push(r); };
+  const ps = async (): Promise<string> => PS_FIXTURE;
+
+  test("1. the record's own pid IS a live TUI → that process, nothing else consulted", async () => {
+    notes.length = 0;
+    let lsofCalls = 0;
+    const pid = await codexLocateTuiPid(
+      { sessionId: "some-uuid", record: locRec({ pid: 33198 }) },
+      { ps, cwdOf: async () => { lsofCalls++; return "/x"; }, note },
+    );
+    expect(pid).toBe(33198);
+    expect(notes).toEqual(["record-pid"]);
+    expect(lsofCalls).toBe(0);
+  });
+
+  test("2. the codex-pid-<n> discovery sentinel names a live TUI", async () => {
+    notes.length = 0;
+    const pid = await codexLocateTuiPid(
+      { sessionId: "codex-pid-16029", record: locRec({ pid: 42 }) },
+      { ps, note },
+    );
+    expect(pid).toBe(16029);
+    expect(notes).toEqual(["sentinel-pid"]);
+  });
+
+  test("2b. a sentinel naming a DEAD pid falls through (it is not a candidate)", async () => {
+    notes.length = 0;
+    const pid = await codexLocateTuiPid(
+      { sessionId: "codex-pid-70000", record: locRec({ pid: 42 }) },
+      { ps, note },
+    );
+    expect(pid).toBeUndefined();
+    expect(notes).toEqual(["ambiguous"]); // two live TUIs, nothing to correlate on
+  });
+
+  test("3. exactly one candidate runs in the record's origin cwd", async () => {
+    notes.length = 0;
+    const cwds: Record<number, string> = { 16029: "/Users/karrix/api-status/nomo", 33198: "/Users/karrix/WidgetAnimation" };
+    const pid = await codexLocateTuiPid(
+      { sessionId: "some-uuid", record: locRec({ pid: 42, origin: { hook_event_name: "SessionStart", ppid: 42, cwd: "/Users/karrix/WidgetAnimation" } }) },
+      { ps, cwdOf: async (p) => cwds[p], note },
+    );
+    expect(pid).toBe(33198);
+    expect(notes).toEqual(["cwd-unique"]);
+  });
+
+  test("3b. TWO candidates in the same cwd and no session start → ambiguous, no guess", async () => {
+    notes.length = 0;
+    const pid = await codexLocateTuiPid(
+      { sessionId: "some-uuid", record: locRec({ pid: 42, origin: { hook_event_name: "SessionStart", ppid: 42, cwd: "/repo" } }) },
+      { ps, cwdOf: async () => "/repo", note },
+    );
+    expect(pid).toBeUndefined();
+    expect(notes).toEqual(["ambiguous"]);
+  });
+
+  test("3c. a cwd that matches NOTHING leaves the subset empty → the whole-machine fallback rules", async () => {
+    notes.length = 0;
+    const pid = await codexLocateTuiPid(
+      { sessionId: "some-uuid", record: locRec({ pid: 42, origin: { hook_event_name: "SessionStart", ppid: 42, cwd: "/gone" } }) },
+      { ps, cwdOf: async () => "/elsewhere", note },
+    );
+    expect(pid).toBeUndefined(); // two TUIs on the machine → still ambiguous
+    expect(notes).toEqual(["ambiguous"]);
+  });
+
+  test("4. start-time proximity breaks a cwd tie — STRICTLY closest wins", async () => {
+    notes.length = 0;
+    const starts: Record<number, number> = { 16029: 1_000_000, 33198: 1_009_000 };
+    const pid = await codexLocateTuiPid(
+      {
+        sessionId: "some-uuid",
+        record: locRec({ pid: 42, sessionStartedAt: 1_008_000, origin: { hook_event_name: "SessionStart", ppid: 42, cwd: "/repo" } }),
+      },
+      { ps, cwdOf: async () => "/repo", startTimeOf: async (p) => starts[p], note },
+    );
+    expect(pid).toBe(33198);
+    expect(notes).toEqual(["start-time"]);
+  });
+
+  test("4b. two candidates EQUALLY close → undefined (a coin flip is worse than a no-op)", async () => {
+    notes.length = 0;
+    const starts: Record<number, number> = { 16029: 900, 33198: 1100 };
+    const pid = await codexLocateTuiPid(
+      { sessionId: "some-uuid", record: locRec({ pid: 42, sessionStartedAt: 1000 }) },
+      { ps, startTimeOf: async (p) => starts[p], note },
+    );
+    expect(pid).toBeUndefined();
+    expect(notes).toEqual(["ambiguous"]);
+  });
+
+  test("4c. no resolvable start times → undefined, never a fallback guess between two TUIs", async () => {
+    notes.length = 0;
+    const pid = await codexLocateTuiPid(
+      { sessionId: "some-uuid", record: locRec({ pid: 42, sessionStartedAt: 1000 }) },
+      { ps, startTimeOf: async () => undefined, note },
+    );
+    expect(pid).toBeUndefined();
+    expect(notes).toEqual(["ambiguous"]);
+  });
+
+  test("5. nothing correlates, but the machine has exactly ONE codex TUI → that one", async () => {
+    notes.length = 0;
+    const pid = await codexLocateTuiPid(
+      { sessionId: "some-uuid", record: locRec({ pid: 42 }) },
+      { ps: async () => PS_ONE_TUI, note },
+    );
+    expect(pid).toBe(16029);
+    expect(notes).toEqual(["only-candidate"]);
+  });
+
+  test("no live codex TUI at all → undefined", async () => {
+    notes.length = 0;
+    const pid = await codexLocateTuiPid(
+      { sessionId: "some-uuid", record: locRec({ pid: 42 }) },
+      { ps: async () => " 8750 ??       /Applications/Codex.app/Contents/Resources/codex app-server", note },
+    );
+    expect(pid).toBeUndefined();
+    expect(notes).toEqual(["no-candidate"]);
+  });
+
+  test("a failing `ps` is evidence-free, never a guess", async () => {
+    notes.length = 0;
+    const pid = await codexLocateTuiPid(
+      { sessionId: "some-uuid", record: locRec({ pid: 42 }) },
+      { ps: async () => { throw new Error("no ps"); }, note },
+    );
+    expect(pid).toBeUndefined();
+    expect(notes).toEqual(["error"]);
+  });
+
+  test("a throwing lsof degrades that candidate to 'no cwd', it does not abort the locate", async () => {
+    notes.length = 0;
+    const pid = await codexLocateTuiPid(
+      { sessionId: "some-uuid", record: locRec({ pid: 42, origin: { hook_event_name: "SessionStart", ppid: 42, cwd: "/repo" } }) },
+      {
+        ps,
+        cwdOf: async (p) => { if (p === 16029) throw new Error("lsof denied"); return "/repo"; },
+        note,
+      },
+    );
+    expect(pid).toBe(33198);
+    expect(notes).toEqual(["cwd-unique"]);
+  });
+
+  test("a throwing note sink can never break a locate", async () => {
+    const pid = await codexLocateTuiPid(
+      { sessionId: "some-uuid", record: locRec({ pid: 16029 }) },
+      { ps, note: () => { throw new Error("bad sink"); } },
+    );
+    expect(pid).toBe(16029);
+  });
+});
+
+describe("claudeLocateTuiPid (the recorded pid IS the TUI)", () => {
+  test("returns the recorded pid when it still holds a real controlling tty", async () => {
+    const notes: LocateTuiReason[] = [];
+    const pid = await claudeLocateTuiPid(
+      { sessionId: "s", record: locRec({ pid: 4242, agent: undefined }) },
+      { ttyOf: async () => "ttys004", note: (r) => notes.push(r) },
+    );
+    expect(pid).toBe(4242);
+    expect(notes).toEqual(["record-pid"]);
+  });
+
+  test("a tty-less (headless/daemon) or dead pid owns no window → undefined", async () => {
+    const notes: LocateTuiReason[] = [];
+    const note = (r: LocateTuiReason): void => { notes.push(r); };
+    expect(await claudeLocateTuiPid({ sessionId: "s", record: locRec({ pid: 4242 }) }, { ttyOf: async () => "??", note })).toBeUndefined();
+    expect(await claudeLocateTuiPid({ sessionId: "s", record: locRec({ pid: 4242 }) }, { ttyOf: async () => undefined, note })).toBeUndefined();
+    expect(await claudeLocateTuiPid({ sessionId: "s", record: locRec({ pid: 4242 }) }, { ttyOf: async () => { throw new Error("ps"); }, note })).toBeUndefined();
+    expect(notes).toEqual(["no-candidate", "no-candidate", "no-candidate"]);
+  });
+
+  test("a record with no usable pid is a no-op", async () => {
+    expect(await claudeLocateTuiPid(
+      { sessionId: "s", record: locRec({ pid: Number.NaN }) }, { ttyOf: async () => "ttys004" },
+    )).toBeUndefined();
+  });
+});
+
+describe("both adapters expose the locate seam", () => {
+  test("claude and codex each wire their locator; the shared daemon dispatches through it", async () => {
+    expect(typeof claudeAdapter.locateTuiPid).toBe("function");
+    expect(typeof codexAdapter.locateTuiPid).toBe("function");
+    expect(await codexAdapter.locateTuiPid!(
+      { sessionId: "codex-pid-16029", record: locRec({ pid: 1 }) },
+      { ps: async () => PS_ONE_TUI },
+    )).toBe(16029);
+    expect(await claudeAdapter.locateTuiPid!(
+      { sessionId: "s", record: locRec({ pid: 77, agent: undefined }) },
+      { ttyOf: async () => "ttys009" },
+    )).toBe(77);
   });
 });

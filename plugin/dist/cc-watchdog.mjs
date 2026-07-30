@@ -570,6 +570,9 @@ function pidAlive(pid) {
     return e.code === "EPERM";
   }
 }
+function isRealTty(tty) {
+  return tty.length > 0 && tty !== "??" && tty !== "?" && tty !== "-";
+}
 function pidAncestors(pid, maxDepth = 12) {
   const chain = [];
   let cur = pid;
@@ -1468,10 +1471,7 @@ function parseCodexProcs(psOutput) {
   }
   return rows;
 }
-function isRealTty(tty) {
-  return tty.length > 0 && tty !== "??" && tty !== "?" && tty !== "-";
-}
-function filterCodexTuis(rows, knownPids) {
+function codexTuiCandidates(rows, knownPids) {
   const out = [];
   for (const r of rows) {
     if (knownPids.has(r.pid))
@@ -1483,9 +1483,12 @@ function filterCodexTuis(rows, knownPids) {
       continue;
     if (tokens.slice(1).includes("exec"))
       continue;
-    out.push({ pid: r.pid });
+    out.push({ pid: r.pid, tty: r.tty });
   }
   return out;
+}
+function filterCodexTuis(rows, knownPids) {
+  return codexTuiCandidates(rows, knownPids).map(({ pid }) => ({ pid }));
 }
 function labelFromCwd(cwd) {
   if (!cwd)
@@ -1531,6 +1534,149 @@ async function codexDiscoverLive(known, deps = {}) {
     out.push({ pid, sessionId: codexSentinelSessionId(pid), title: label, label, idle: !active });
   }
   return out;
+}
+async function ttyViaPs(pid) {
+  try {
+    const { stdout } = await execFileP("ps", ["-o", "tty=", "-p", String(pid)]);
+    const trimmed = stdout.trim();
+    return trimmed.length > 0 ? trimmed : undefined;
+  } catch {
+    return;
+  }
+}
+async function startTimeViaPs(pid) {
+  try {
+    const { stdout } = await execFileP("ps", ["-o", "lstart=", "-p", String(pid)]);
+    const parsed = Date.parse(stdout.trim());
+    return Number.isFinite(parsed) ? parsed : undefined;
+  } catch {
+    return;
+  }
+}
+function noteLocate(deps, reason) {
+  try {
+    deps.note?.(reason);
+  } catch {}
+}
+function sentinelPid(sessionId) {
+  const m = /^codex-pid-(\d+)$/.exec(sessionId);
+  if (!m)
+    return;
+  const pid = Number.parseInt(m[1], 10);
+  return Number.isFinite(pid) ? pid : undefined;
+}
+async function codexLocateTuiPid(ctx, deps = {}) {
+  try {
+    let output;
+    try {
+      output = await (deps.ps ?? runPs)();
+    } catch {
+      noteLocate(deps, "error");
+      return;
+    }
+    const candidates = codexTuiCandidates(parseCodexProcs(output), new Set);
+    if (candidates.length === 0) {
+      noteLocate(deps, "no-candidate");
+      return;
+    }
+    const pids = new Set(candidates.map((c) => c.pid));
+    if (typeof ctx.record.pid === "number" && Number.isFinite(ctx.record.pid) && pids.has(ctx.record.pid)) {
+      noteLocate(deps, "record-pid");
+      return ctx.record.pid;
+    }
+    const sentinel = sentinelPid(ctx.sessionId);
+    if (sentinel !== undefined && pids.has(sentinel)) {
+      noteLocate(deps, "sentinel-pid");
+      return sentinel;
+    }
+    let subset = candidates;
+    const cwd = ctx.record.origin?.cwd;
+    if (typeof cwd === "string" && cwd.length > 0) {
+      const cwdOf = deps.cwdOf ?? cwdViaLsof;
+      const matched = [];
+      for (const c of candidates) {
+        let candidateCwd;
+        try {
+          candidateCwd = await cwdOf(c.pid);
+        } catch {
+          candidateCwd = undefined;
+        }
+        if (candidateCwd === cwd)
+          matched.push(c);
+      }
+      if (matched.length === 1) {
+        noteLocate(deps, "cwd-unique");
+        return matched[0].pid;
+      }
+      subset = matched;
+    }
+    const startedAt = ctx.record.sessionStartedAt;
+    if (subset.length > 1 && typeof startedAt === "number" && Number.isFinite(startedAt)) {
+      const startTimeOf = deps.startTimeOf ?? startTimeViaPs;
+      let best;
+      let tied = false;
+      for (const c of subset) {
+        let started;
+        try {
+          started = await startTimeOf(c.pid);
+        } catch {
+          started = undefined;
+        }
+        if (typeof started !== "number" || !Number.isFinite(started))
+          continue;
+        const delta = Math.abs(started - startedAt);
+        if (best === undefined || delta < best.delta) {
+          best = { pid: c.pid, delta };
+          tied = false;
+        } else if (delta === best.delta) {
+          tied = true;
+        }
+      }
+      if (best !== undefined && !tied) {
+        noteLocate(deps, "start-time");
+        return best.pid;
+      }
+      noteLocate(deps, "ambiguous");
+      return;
+    }
+    if (subset.length > 1) {
+      noteLocate(deps, "ambiguous");
+      return;
+    }
+    if (candidates.length === 1) {
+      noteLocate(deps, "only-candidate");
+      return candidates[0].pid;
+    }
+    noteLocate(deps, "ambiguous");
+    return;
+  } catch {
+    noteLocate(deps, "error");
+    return;
+  }
+}
+async function claudeLocateTuiPid(ctx, deps = {}) {
+  try {
+    const pid = ctx.record.pid;
+    if (typeof pid !== "number" || !Number.isFinite(pid) || pid <= 0) {
+      noteLocate(deps, "no-candidate");
+      return;
+    }
+    let tty;
+    try {
+      tty = await (deps.ttyOf ?? ttyViaPs)(pid);
+    } catch {
+      tty = undefined;
+    }
+    if (typeof tty !== "string" || !isRealTty(tty.trim())) {
+      noteLocate(deps, "no-candidate");
+      return;
+    }
+    noteLocate(deps, "record-pid");
+    return pid;
+  } catch {
+    noteLocate(deps, "error");
+    return;
+  }
 }
 function claudeClearPredecessor(sessionId, hookPid, tracked) {
   return tracked.filter((t) => t.sessionId !== sessionId && t.provisional !== true && t.agent !== "codex" && typeof t.pid === "number" && Number.isFinite(t.pid) && t.pid === hookPid).sort((a, b) => (b.ts ?? 0) - (a.ts ?? 0))[0]?.sessionId;
@@ -1675,7 +1821,8 @@ var claudeAdapter = {
   hookStampPath: () => lastHookPath("claude"),
   hooksNotFiringHint: "  Reinstall the plugin / check /plugin.",
   toolDetail: claudeToolDetail,
-  blobAgentFields: {}
+  blobAgentFields: {},
+  locateTuiPid: (ctx, deps) => claudeLocateTuiPid(ctx, deps)
 };
 var codexAdapter = {
   kind: "codex",
@@ -1730,12 +1877,176 @@ var codexAdapter = {
   toolDetail: codexToolDetail,
   blobAgentFields: { agent: "codex" },
   discoverLive: (known) => codexDiscoverLive(known),
-  pidTurnActive: (pid) => codexPidTurnActive(pid)
+  pidTurnActive: (pid) => codexPidTurnActive(pid),
+  locateTuiPid: (ctx, deps) => codexLocateTuiPid(ctx, deps)
 };
 function adapterFor(agent) {
   return agent === "codex" ? codexAdapter : claudeAdapter;
 }
 var allAdapters = [claudeAdapter, codexAdapter];
+
+// src/core/terminal-focus.ts
+import { execFile as execFile2 } from "node:child_process";
+import { promisify as promisify2 } from "node:util";
+var execFileP2 = promisify2(execFile2);
+var OSASCRIPT_TIMEOUT_MS = 4000;
+var TERMINAL_APPS = [
+  { id: "terminal-app", bundleId: "com.apple.Terminal", match: /\/Terminal\.app\// },
+  { id: "iterm2", bundleId: "com.googlecode.iterm2", match: /\/iTerm\.app\/|\/iTerm2\.app\// },
+  { id: "ghostty", bundleId: "com.mitchellh.ghostty", match: /\/Ghostty\.app\/|(?:^|\/)ghostty(?:\s|$)/ },
+  { id: "wezterm", bundleId: "com.github.wez.wezterm", match: /\/WezTerm\.app\/|(?:^|\/)wezterm(?:-gui)?(?:\s|$)/ },
+  { id: "alacritty", bundleId: "org.alacritty", match: /\/Alacritty\.app\/|(?:^|\/)alacritty(?:\s|$)/ },
+  { id: "kitty", bundleId: "net.kovidgoyal.kitty", match: /\/kitty\.app\/|(?:^|\/)kitty(?:\s|$)/ },
+  { id: "hyper", bundleId: "co.zeit.hyper", match: /\/Hyper\.app\// },
+  { id: "warp", bundleId: "dev.warp.Warp-Stable", match: /\/Warp\.app\// },
+  { id: "vscode", bundleId: "com.microsoft.VSCode", match: /\/Visual Studio Code\.app\/|\/Code\.app\/|Code Helper/ }
+];
+function owningTerminalApp(pid, ancestorsOf = pidAncestors, commandOf = pidCommand) {
+  let chain = [];
+  try {
+    chain = ancestorsOf(pid);
+  } catch {
+    chain = [];
+  }
+  for (const candidate of [pid, ...chain]) {
+    let command;
+    try {
+      command = commandOf(candidate);
+    } catch {
+      continue;
+    }
+    if (typeof command !== "string" || command.length === 0)
+      continue;
+    const app = TERMINAL_APPS.find((a) => a.match.test(command));
+    if (app)
+      return app;
+  }
+  return;
+}
+function ttyDevicePath(raw) {
+  if (typeof raw !== "string")
+    return;
+  const trimmed = raw.trim();
+  if (!isRealTty(trimmed))
+    return;
+  const bare = trimmed.startsWith("/dev/") ? trimmed.slice(5) : trimmed;
+  const name = /^s[0-9]+$/.test(bare) ? `tty${bare}` : bare;
+  const path = `/dev/${name}`;
+  return isTtyDevicePath(path) ? path : undefined;
+}
+function isTtyDevicePath(path) {
+  return /^\/dev\/tty[a-z0-9]+$/.test(path);
+}
+function terminalAppScript(devPath) {
+  if (!isTtyDevicePath(devPath))
+    throw new Error("unsafe tty path");
+  return [
+    `tell application "Terminal"`,
+    `	repeat with w in windows`,
+    `		repeat with t in tabs of w`,
+    `			if tty of t is "${devPath}" then`,
+    `				set selected of t to true`,
+    `				set index of w to 1`,
+    `				activate`,
+    `				return "ok"`,
+    `			end if`,
+    `		end repeat`,
+    `	end repeat`,
+    `end tell`,
+    `return "none"`
+  ].join(`
+`);
+}
+function iterm2Script(devPath) {
+  if (!isTtyDevicePath(devPath))
+    throw new Error("unsafe tty path");
+  return [
+    `tell application "iTerm"`,
+    `	repeat with w in windows`,
+    `		repeat with t in tabs of w`,
+    `			repeat with s in sessions of t`,
+    `				if tty of s is "${devPath}" then`,
+    `					select s`,
+    `					select t`,
+    `					select w`,
+    `					activate`,
+    `					return "ok"`,
+    `				end if`,
+    `			end repeat`,
+    `		end repeat`,
+    `	end repeat`,
+    `end tell`,
+    `return "none"`
+  ].join(`
+`);
+}
+function activateScript(bundleId) {
+  if (!/^[A-Za-z0-9.\-]+$/.test(bundleId))
+    throw new Error("unsafe bundle id");
+  return `tell application id "${bundleId}" to activate`;
+}
+async function runOsascript(script) {
+  const { stdout } = await execFileP2("osascript", ["-e", script], { timeout: OSASCRIPT_TIMEOUT_MS });
+  return String(stdout).trim();
+}
+async function ttyViaPs2(pid) {
+  try {
+    const { stdout } = await execFileP2("ps", ["-o", "tty=", "-p", String(pid)]);
+    const trimmed = stdout.trim();
+    return trimmed.length > 0 ? trimmed : undefined;
+  } catch {
+    return;
+  }
+}
+function note(deps, event) {
+  try {
+    deps.trace?.(event);
+  } catch {}
+}
+async function focusTerminalForPid(pid, deps = {}) {
+  try {
+    if ((deps.platform ?? process.platform) !== "darwin") {
+      note(deps, { event: "terminal-focus", pid, result: "unsupported", why: "not-darwin" });
+      return { ok: false, reason: "unsupported" };
+    }
+    let rawTty;
+    try {
+      rawTty = await (deps.ttyOf ?? ttyViaPs2)(pid);
+    } catch {
+      rawTty = undefined;
+    }
+    const devPath = ttyDevicePath(rawTty);
+    if (devPath === undefined) {
+      note(deps, { event: "terminal-focus", pid, result: "no-tty", tty: rawTty ?? "" });
+      return { ok: false, reason: "no-tty" };
+    }
+    const app = owningTerminalApp(pid, deps.ancestorsOf ?? pidAncestors, deps.commandOf ?? pidCommand);
+    if (!app) {
+      note(deps, { event: "terminal-focus", pid, result: "unsupported", why: "no-owning-app" });
+      return { ok: false, reason: "unsupported" };
+    }
+    const osascript = deps.osascript ?? runOsascript;
+    try {
+      if (app.id === "terminal-app" || app.id === "iterm2") {
+        const script = app.id === "terminal-app" ? terminalAppScript(devPath) : iterm2Script(devPath);
+        const out = await osascript(script);
+        if (String(out).trim() === "ok") {
+          const via = app.id === "terminal-app" ? "terminal-app" : "iterm2";
+          note(deps, { event: "terminal-focus", pid, result: "focused", via, app: app.id });
+          return { ok: true, via };
+        }
+      }
+      await osascript(activateScript(app.bundleId));
+      note(deps, { event: "terminal-focus", pid, result: "focused", via: "app-activate", app: app.id });
+      return { ok: true, via: "app-activate" };
+    } catch {
+      note(deps, { event: "terminal-focus", pid, result: "osascript-failed", app: app.id });
+      return { ok: false, reason: "osascript-failed" };
+    }
+  } catch {
+    return { ok: false, reason: "osascript-failed" };
+  }
+}
 
 // src/core/codex-app-server-client.ts
 var DEFAULT_RECONNECT_DELAY_MS = 1000;
@@ -4806,23 +5117,157 @@ function postOutcomeForStatus(status) {
     return "revoked";
   return "failed";
 }
+function watchdogEventHeaders(config, approvals) {
+  return {
+    "content-type": "application/json",
+    "x-cc-pairing": config.pairingId,
+    "x-cc-auth": config.pcSecret,
+    "x-cc-version": PLUGIN_VERSION,
+    "x-cc-approvals": approvals,
+    "x-cc-role": "watchdog"
+  };
+}
 async function postEvent(config, body) {
   try {
     const res = await fetch(`${config.url}/v1/cc/event`, {
       method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "x-cc-pairing": config.pairingId,
-        "x-cc-auth": config.pcSecret,
-        "x-cc-version": PLUGIN_VERSION,
-        "x-cc-approvals": await localApprovalsState()
-      },
+      headers: watchdogEventHeaders(config, await localApprovalsState()),
       body: JSON.stringify(body),
       signal: AbortSignal.timeout(2000)
     });
-    return postOutcomeForStatus(res.status);
+    const outcome = postOutcomeForStatus(res.status);
+    if (outcome === "delivered") {
+      try {
+        bufferCommands(extractCommands(await res.json()));
+      } catch {}
+    }
+    return outcome;
   } catch {
     return "failed";
+  }
+}
+var COMMANDS_PER_RESPONSE_MAX = 8;
+var COMMAND_BUFFER_MAX = 32;
+var EXECUTED_COMMAND_IDS_MAX = 64;
+var commandBuffer = [];
+var executedCommandIds = new Set;
+function extractCommands(body) {
+  try {
+    if (typeof body !== "object" || body === null)
+      return [];
+    const raw = body.commands;
+    if (!Array.isArray(raw))
+      return [];
+    const out = [];
+    for (const entry of raw) {
+      if (out.length >= COMMANDS_PER_RESPONSE_MAX)
+        break;
+      if (typeof entry !== "object" || entry === null)
+        continue;
+      const e = entry;
+      if (e.kind !== "focus-terminal")
+        continue;
+      if (typeof e.id !== "string" || e.id.length === 0)
+        continue;
+      if (typeof e.sessionId !== "string" || e.sessionId.length === 0)
+        continue;
+      out.push({
+        id: e.id,
+        kind: "focus-terminal",
+        sessionId: e.sessionId,
+        ...typeof e.ts === "number" && Number.isFinite(e.ts) ? { ts: e.ts } : {}
+      });
+    }
+    return out;
+  } catch {
+    return [];
+  }
+}
+function bufferCommands(commands) {
+  for (const c of commands) {
+    if (commandBuffer.length >= COMMAND_BUFFER_MAX)
+      return;
+    commandBuffer.push(c);
+  }
+}
+function rememberCommandId(id) {
+  executedCommandIds.add(id);
+  while (executedCommandIds.size > EXECUTED_COMMAND_IDS_MAX) {
+    const oldest = executedCommandIds.values().next();
+    if (oldest.done)
+      break;
+    executedCommandIds.delete(oldest.value);
+  }
+}
+function resetCommandState() {
+  commandBuffer.length = 0;
+  executedCommandIds.clear();
+}
+function traceFocus(deps, event) {
+  if (deps.trace) {
+    try {
+      deps.trace(event);
+    } catch {}
+    return;
+  }
+  if (process.argv.some((arg) => arg === "test" || arg.endsWith(".test.ts")))
+    return;
+  traceSession(event);
+}
+async function drainCommands(config, deps = {}) {
+  try {
+    const pending = (deps.take ?? (() => commandBuffer.splice(0, commandBuffer.length)))();
+    if (pending.length === 0)
+      return 0;
+    const readRecords = deps.readRecords ?? readAllRecordEntries;
+    const focus = deps.focus ?? ((pid) => focusTerminalForPid(pid));
+    let entries = null;
+    let focused = 0;
+    for (const cmd of pending) {
+      const base = { event: "focus-terminal", sessionId: cmd.sessionId, id: cmd.id };
+      try {
+        if (executedCommandIds.has(cmd.id)) {
+          traceFocus(deps, { ...base, result: "duplicate" });
+          continue;
+        }
+        rememberCommandId(cmd.id);
+        if (entries === null)
+          entries = await readRecords();
+        const entry = entries.find((e) => e.sessionId === cmd.sessionId);
+        if (!entry) {
+          traceFocus(deps, { ...base, result: "no-record" });
+          continue;
+        }
+        const agent = recordAgent(entry.rec);
+        const adapter2 = deps.adapters ? deps.adapters.find((a) => a.kind === agent) ?? adapterFor(agent) : adapterFor(agent);
+        if (!adapter2.locateTuiPid) {
+          traceFocus(deps, { ...base, agent, result: "unsupported" });
+          continue;
+        }
+        let reason;
+        const pid = await adapter2.locateTuiPid({ sessionId: cmd.sessionId, record: entry.rec }, { note: (r) => {
+          reason = r;
+        } });
+        if (typeof pid !== "number" || !Number.isFinite(pid)) {
+          const result2 = reason === "ambiguous" ? "ambiguous" : "no-candidate";
+          traceFocus(deps, { ...base, agent, result: result2, reason: reason ?? "no-candidate" });
+          continue;
+        }
+        const outcome = await focus(pid);
+        if (outcome.ok) {
+          focused += 1;
+          traceFocus(deps, { ...base, agent, pid, result: "focused", via: outcome.via, reason });
+          continue;
+        }
+        const result = outcome.reason === "osascript-failed" ? "osascript-failed" : outcome.reason === "unsupported" ? "unsupported" : "no-candidate";
+        traceFocus(deps, { ...base, agent, pid, result, why: outcome.reason, reason });
+      } catch {
+        traceFocus(deps, { ...base, result: "no-candidate", why: "error" });
+      }
+    }
+    return focused;
+  } catch {
+    return 0;
   }
 }
 function machineName(config) {
@@ -5356,6 +5801,37 @@ function shouldHeartbeat(record, now, lastHeartbeat, correctedThisSweep) {
     return false;
   return true;
 }
+var WAITING_HEARTBEAT_AFTER_MS = 1e4;
+function isWaitingSession(record) {
+  if (record.op === "done" || record.lastEvent === "done")
+    return false;
+  return record.lastEvent === "needsAttention" || record.pendingPlanPicker === true || record.prio === 1;
+}
+function shouldWaitingHeartbeat(record, now, lastWaitingBeat, correctedThisSweep) {
+  if (!isWaitingSession(record))
+    return false;
+  if (typeof record.doneAttempts === "number" && record.doneAttempts > 0)
+    return false;
+  if (isClaudeIdleReapEligible(record, now))
+    return false;
+  if (correctedThisSweep)
+    return false;
+  if (typeof record.ts !== "number")
+    return false;
+  if (now - record.ts < WAITING_HEARTBEAT_AFTER_MS)
+    return false;
+  if (lastWaitingBeat !== undefined && now - lastWaitingBeat < WAITING_HEARTBEAT_AFTER_MS)
+    return false;
+  return true;
+}
+function heartbeatKind(record, now, lastHeartbeat, lastWaitingBeat, correctedThisSweep) {
+  if (shouldHeartbeat(record, now, lastHeartbeat, correctedThisSweep))
+    return "stale";
+  if (shouldWaitingHeartbeat(record, now, lastWaitingBeat, correctedThisSweep))
+    return "waiting";
+  return "none";
+}
+var waitingBeatAt;
 async function sweep(config, deps = {}) {
   let files;
   try {
@@ -5465,7 +5941,8 @@ async function sweep(config, deps = {}) {
             repairedTitle = true;
           }
         }
-        if (shouldHeartbeat(record, now, heartbeatAt.get(sessionId), idleFix === "corrected" || planResolutionHandled || interruptHandled || flaggedAttention || reapedIdle || repairedTitle)) {
+        const beatKind = heartbeatKind(record, now, heartbeatAt.get(sessionId), waitingBeatAt, idleFix === "corrected" || planResolutionHandled || interruptHandled || flaggedAttention || reapedIdle || repairedTitle);
+        if (beatKind !== "none") {
           const beat = buildHeartbeatEnvelope(sessionId, record, Date.now(), config.pairingId);
           if (beat) {
             const outcome = await postEvent(config, beat);
@@ -5473,6 +5950,8 @@ async function sweep(config, deps = {}) {
               return { revoked: true };
             if (outcome === "delivered") {
               heartbeatAt.set(sessionId, now);
+              if (beatKind === "waiting")
+                waitingBeatAt = now;
               delivered = true;
             }
           }
@@ -5691,6 +6170,8 @@ async function run() {
       const result = await sweep(config, {
         threadWaitState: (threadId) => bridges.threadWaitState(threadId)
       });
+      if (config)
+        await drainCommands(config);
       if (result.revoked) {
         if (await goneStrikeShouldTeardown()) {
           await removeRevokedConfig();
@@ -5757,8 +6238,10 @@ if (__require.main == __require.module) {
 }
 export {
   withDeadline,
+  watchdogEventHeaders,
   titleRepairedRecord,
   tailShowsInterrupt,
+  shouldWaitingHeartbeat,
   shouldRepairTitle,
   shouldPlanPickerVerificationCheck,
   shouldPendingDoneCheck,
@@ -5768,6 +6251,7 @@ export {
   shouldHeartbeat,
   retireDoneStale,
   resetDoneAttemptMemory,
+  resetCommandState,
   recordMovedSince,
   reconcileProvisionalsSweep,
   provisionalsCoveredByReal,
@@ -5778,13 +6262,17 @@ export {
   pendingDoneRetryWrite,
   noteDoneAttempt,
   lastTurnLine,
+  isWaitingSession,
   isRightfulWatchdogOwner,
   isRetireEligible,
   isClaudeIdleReapEligible,
+  heartbeatKind,
   hasInterruptMarker,
   goneStrikeShouldTeardown,
+  extractCommands,
   enforceWatchdogOwnership,
   effectiveDoneAttempts,
+  drainCommands,
   discoverLiveSessions,
   createBridgeSupervisor,
   correctResolvedPlanPicker,
@@ -5808,6 +6296,7 @@ export {
   buildHeartbeatEnvelope,
   buildEndEnvelope,
   buildDoneEnvelope,
+  WAITING_HEARTBEAT_AFTER_MS,
   PLAN_PICKER_VERIFY_MAX_MS,
   PLAN_PICKER_RECENT_DONE_MS,
   PLAN_PICKER_PENDING_MAX_MS,

@@ -563,6 +563,9 @@ function pidAlive(pid) {
     return e.code === "EPERM";
   }
 }
+function isRealTty(tty) {
+  return tty.length > 0 && tty !== "??" && tty !== "?" && tty !== "-";
+}
 function pidAncestors(pid, maxDepth = 12) {
   const chain = [];
   let cur = pid;

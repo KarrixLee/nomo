@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
 import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -9,14 +10,15 @@ import {
   buildDoneEnvelope, buildEndEnvelope, buildHeartbeatEnvelope, buildNeedsAttentionEnvelope, buildProvisionalBlob,
   buildProvisionalEnvelope, buildProvisionalRecord, buildStartEnvelope, buildTitleRepairEnvelope, classifySession,
   claudeTailPendingApproval, codexLastTurnEvent, codexTailPendingApproval, correctIdleClaude, correctInterrupt,
-  correctPendingApproval, correctPendingDone, correctPlanPickerVerification, correctResolvedPlanPicker, createBridgeSupervisor, discoverLiveSessions, effectiveDoneAttempts, goneStrikeShouldTeardown,
+  correctPendingApproval, correctPendingDone, correctPlanPickerVerification, correctResolvedPlanPicker, createBridgeSupervisor, discoverLiveSessions, drainCommands, effectiveDoneAttempts, extractCommands, goneStrikeShouldTeardown,
   enforceWatchdogOwnership, hasInterruptMarker, IDLE_GRACE_MS, isClaudeIdleReapEligible, isRetireEligible, isRightfulWatchdogOwner, lastTurnLine, PAIRING_TTL_MS, pendingDoneRetryWrite,
   pendingDoneSettleWrite, pendingPairingExpired, planPickerPendingExpired, PLAN_PICKER_PENDING_MAX_MS,
   PLAN_PICKER_RECENT_DONE_MS, PLAN_PICKER_VERIFY_MAX_MS,
-  postOutcomeForStatus, provisionalsCoveredByReal, reconcileProvisionalsSweep, recordMovedSince, resetDoneAttemptMemory, retireDoneStale,
+  postOutcomeForStatus, provisionalsCoveredByReal, reconcileProvisionalsSweep, recordMovedSince, resetCommandState, resetDoneAttemptMemory, retireDoneStale,
   shouldHeartbeat, shouldIdleProvisionalCheck,
+  heartbeatKind, isWaitingSession,
   shouldInterruptCheck, shouldPendingApprovalCheck, shouldPendingDoneCheck, shouldPlanPickerVerificationCheck, shouldRepairTitle, tailShowsInterrupt, titleRepairedRecord,
-  withDeadline,
+  watchdogEventHeaders, WAITING_HEARTBEAT_AFTER_MS, withDeadline,
 } from "./cc-watchdog";
 import type { PostOutcome, RecordEntry } from "./cc-watchdog";
 import { claudeAdapter, codexAdapter } from "../core/adapter";
@@ -2424,5 +2426,300 @@ describe("provisionalsCoveredByReal is keyed on adapter.discoverLive, not a hard
     });
     expect(deletes).toEqual(["claude-prov"]);
     expect(posts[0]).toMatchObject({ op: "end", sessionId: "claude-prov" });
+  });
+});
+
+// --- phone → Mac commands (piggybacked on the /cc/event response) ------------------------------
+//
+// The worker consumes each command as it delivers it, so the plugin sees every command exactly once
+// and must never re-request one. extractCommands is the parse boundary (hostile input: it must never
+// throw and must ignore anything it doesn't fully understand); drainCommands is the execution
+// boundary (every seam injected — no filesystem, no `ps`, no osascript).
+
+describe("extractCommands (the /cc/event response's OPTIONAL commands key)", () => {
+  test("accepts a well-formed focus-terminal payload", () => {
+    expect(extractCommands({
+      ok: true,
+      commands: [{ id: "c1", kind: "focus-terminal", sessionId: "sess-a", ts: 1_753_900_000_000 }],
+    })).toEqual([{ id: "c1", kind: "focus-terminal", sessionId: "sess-a", ts: 1_753_900_000_000 }]);
+  });
+
+  test("the key is OMITTED when nothing is queued — the overwhelmingly common response", () => {
+    expect(extractCommands({ ok: true })).toEqual([]);
+    expect(extractCommands({ ok: true, commands: null })).toEqual([]);
+    expect(extractCommands({ ok: true, commands: "focus" })).toEqual([]);
+    expect(extractCommands(undefined)).toEqual([]);
+    expect(extractCommands("not json at all")).toEqual([]);
+    expect(extractCommands(null)).toEqual([]);
+  });
+
+  test("unknown kinds are ignored (forward compatibility, not a crash)", () => {
+    expect(extractCommands({
+      commands: [
+        { id: "c1", kind: "reboot-the-mac", sessionId: "sess-a" },
+        { id: "c2", kind: "focus-terminal", sessionId: "sess-a" },
+      ],
+    })).toEqual([{ id: "c2", kind: "focus-terminal", sessionId: "sess-a" }]);
+  });
+
+  test("malformed entries are dropped individually, never fatally", () => {
+    expect(extractCommands({
+      commands: [
+        null,
+        "focus-terminal",
+        { kind: "focus-terminal", sessionId: "sess-a" },                 // no id
+        { id: "", kind: "focus-terminal", sessionId: "sess-a" },          // empty id
+        { id: 7, kind: "focus-terminal", sessionId: "sess-a" },           // non-string id
+        { id: "c1", kind: "focus-terminal" },                             // no sessionId
+        { id: "c2", kind: "focus-terminal", sessionId: "" },              // empty sessionId
+        { id: "c3", kind: "focus-terminal", sessionId: 5 },               // non-string sessionId
+        { id: "c4", kind: "focus-terminal", sessionId: "sess-b", ts: "x" }, // junk ts is dropped, entry kept
+      ],
+    })).toEqual([{ id: "c4", kind: "focus-terminal", sessionId: "sess-b" }]);
+  });
+
+  test("caps at 8 per response (a buggy/compromised worker can't hand us an unbounded work list)", () => {
+    const commands = Array.from({ length: 25 }, (_, i) => ({ id: `c${i}`, kind: "focus-terminal", sessionId: "s" }));
+    expect(extractCommands({ commands })).toHaveLength(8);
+    expect(extractCommands({ commands })[7].id).toBe("c7");
+  });
+});
+
+describe("drainCommands (execute what the worker queued, once)", () => {
+  beforeEach(() => { resetCommandState(); });
+
+  const entry = (sessionId: string, r: Partial<SessionRecord> = {}): RecordEntry => ({ sessionId, rec: rec(r) });
+  /** An adapter registry whose locator is scripted, so no real `ps` is ever spawned. */
+  const registry = (locate: (ctx: { sessionId: string; record: SessionRecord }, deps?: { note?: (r: string) => void }) => Promise<number | undefined>): AgentAdapter[] => [
+    { ...claudeAdapter, locateTuiPid: locate as AgentAdapter["locateTuiPid"] },
+    { ...codexAdapter, locateTuiPid: locate as AgentAdapter["locateTuiPid"] },
+  ];
+
+  test("focuses the located TUI for each command and reports how many landed", async () => {
+    const focused: number[] = [];
+    const traces: Record<string, unknown>[] = [];
+    const count = await drainCommands(cfg(), {
+      take: () => [
+        { id: "c1", kind: "focus-terminal", sessionId: "sess-a" },
+        { id: "c2", kind: "focus-terminal", sessionId: "sess-b" },
+      ],
+      readRecords: async () => [entry("sess-a", { pid: 11 }), entry("sess-b", { pid: 22, agent: "codex" })],
+      adapters: registry(async ({ record }) => record.pid),
+      focus: async (pid) => { focused.push(pid); return { ok: true, via: "terminal-app" }; },
+      trace: (e) => traces.push(e as Record<string, unknown>),
+    });
+    expect(count).toBe(2);
+    expect(focused).toEqual([11, 22]);
+    expect(traces.map((t) => t.result)).toEqual(["focused", "focused"]);
+    expect(traces[1]).toMatchObject({ event: "focus-terminal", sessionId: "sess-b", id: "c2", agent: "codex", pid: 22, via: "terminal-app" });
+  });
+
+  test("an unknown sessionId is a traced no-op", async () => {
+    const traces: Record<string, unknown>[] = [];
+    let focusCalls = 0;
+    const count = await drainCommands(cfg(), {
+      take: () => [{ id: "c1", kind: "focus-terminal", sessionId: "ghost" }],
+      readRecords: async () => [entry("sess-a")],
+      focus: async () => { focusCalls++; return { ok: true, via: "app-activate" }; },
+      trace: (e) => traces.push(e as Record<string, unknown>),
+    });
+    expect(count).toBe(0);
+    expect(focusCalls).toBe(0);
+    expect(traces).toEqual([{ event: "focus-terminal", sessionId: "ghost", id: "c1", result: "no-record" }]);
+  });
+
+  test("a locate that can't decide (ambiguous / no candidate) focuses NOTHING and says which", async () => {
+    const traces: Record<string, unknown>[] = [];
+    const count = await drainCommands(cfg(), {
+      take: () => [
+        { id: "c1", kind: "focus-terminal", sessionId: "sess-a" },
+        { id: "c2", kind: "focus-terminal", sessionId: "sess-b" },
+      ],
+      readRecords: async () => [entry("sess-a"), entry("sess-b")],
+      adapters: registry(async ({ sessionId }, d) => {
+        d?.note?.(sessionId === "sess-a" ? "ambiguous" : "no-candidate");
+        return undefined;
+      }),
+      focus: async () => { throw new Error("must never be called"); },
+      trace: (e) => traces.push(e as Record<string, unknown>),
+    });
+    expect(count).toBe(0);
+    expect(traces.map((t) => t.result)).toEqual(["ambiguous", "no-candidate"]);
+  });
+
+  test("an agent with no locate seam is unsupported, not an error", async () => {
+    const traces: Record<string, unknown>[] = [];
+    const noLocate: AgentAdapter = { ...claudeAdapter };
+    delete noLocate.locateTuiPid;
+    const count = await drainCommands(cfg(), {
+      take: () => [{ id: "c1", kind: "focus-terminal", sessionId: "sess-a" }],
+      readRecords: async () => [entry("sess-a")],
+      adapters: [noLocate, codexAdapter],
+      trace: (e) => traces.push(e as Record<string, unknown>),
+    });
+    expect(count).toBe(0);
+    expect(traces[0]).toMatchObject({ result: "unsupported", agent: "claude" });
+  });
+
+  test("a repeated command id never re-focuses (a worker replay can't yank the window twice)", async () => {
+    const focused: number[] = [];
+    const traces: Record<string, unknown>[] = [];
+    const deps = {
+      readRecords: async () => [entry("sess-a", { pid: 11 })],
+      adapters: registry(async ({ record }) => record.pid),
+      focus: async (pid: number) => { focused.push(pid); return { ok: true as const, via: "iterm2" as const }; },
+      trace: (e: object) => traces.push(e as Record<string, unknown>),
+    };
+    const cmd = { id: "same-id", kind: "focus-terminal" as const, sessionId: "sess-a" };
+    expect(await drainCommands(cfg(), { ...deps, take: () => [cmd] })).toBe(1);
+    expect(await drainCommands(cfg(), { ...deps, take: () => [cmd] })).toBe(0);
+    expect(focused).toEqual([11]);
+    expect(traces.map((t) => t.result)).toEqual(["focused", "duplicate"]);
+  });
+
+  test("a rejected focus (TCC denial, dead window server) never throws out of the drain", async () => {
+    const traces: Record<string, unknown>[] = [];
+    const count = await drainCommands(cfg(), {
+      take: () => [
+        { id: "c1", kind: "focus-terminal", sessionId: "sess-a" },
+        { id: "c2", kind: "focus-terminal", sessionId: "sess-a" },
+      ],
+      readRecords: async () => [entry("sess-a", { pid: 11 })],
+      adapters: registry(async ({ record }) => record.pid),
+      focus: async (pid) => {
+        if (pid === 11 && traces.length === 0) throw new Error("osascript exploded");
+        return { ok: false, reason: "osascript-failed" };
+      },
+      trace: (e) => traces.push(e as Record<string, unknown>),
+    });
+    expect(count).toBe(0);
+    expect(traces.map((t) => t.result)).toEqual(["no-candidate", "osascript-failed"]);
+  });
+
+  test("an empty buffer costs nothing — no record read at all", async () => {
+    let reads = 0;
+    expect(await drainCommands(cfg(), {
+      take: () => [],
+      readRecords: async () => { reads++; return []; },
+    })).toBe(0);
+    expect(reads).toBe(0);
+  });
+
+  test("a throwing take() cannot derail the sweep", async () => {
+    expect(await drainCommands(cfg(), { take: () => { throw new Error("boom"); } })).toBe(0);
+  });
+});
+
+// --- the watchdog's own header set (x-cc-role gates command delivery) --------------------------
+//
+// Commands are CONSUMED server-side on delivery, so exactly one POSTer may claim the role: the one
+// that reads the response body. hook.ts / codex-notify.ts / reset.ts / shared.ts's pending-pairing
+// flush all POST /cc/event and all discard the body — if any of them sent this header they would
+// consume-and-drop the user's queued command.
+describe("watchdogEventHeaders", () => {
+  test("carries the per-pairing auth set plus the watchdog role marker", () => {
+    const headers = watchdogEventHeaders(cfg(), "on");
+    expect(headers["x-cc-pairing"]).toBe("p");
+    expect(headers["x-cc-auth"]).toBe("s");
+    expect(headers["content-type"]).toBe("application/json");
+    expect(headers["x-cc-approvals"]).toBe("on");
+    expect(headers["x-cc-role"]).toBe("watchdog");
+    expect(typeof headers["x-cc-version"]).toBe("string");
+  });
+
+  test("the approvals value is reported verbatim (the worker literal-matches on/off)", () => {
+    expect(watchdogEventHeaders(cfg(), "off")["x-cc-approvals"]).toBe("off");
+  });
+
+  test("no OTHER /cc/event POSTer in the tree claims the watchdog role", async () => {
+    // A grep-as-test: the role must never spread to a caller that discards the response body.
+    const roots = ["src/core/hook.ts", "src/core/shared.ts", "src/core/permission.ts", "src/core/codex-remote-input.ts", "src/entries/reset.ts", "src/entries/codex-notify.ts"];
+    for (const file of roots) {
+      expect(readFileSync(join(import.meta.dir, "..", "..", file), "utf8")).not.toContain("x-cc-role");
+    }
+  });
+});
+
+// --- waiting-session fast beat (command-pickup latency) ---------------------------------------
+//
+// Pins BOTH cadences: a parked-on-the-user session makes the pairing POST every
+// WAITING_HEARTBEAT_AFTER_MS (so a phone tap is picked up in seconds, not minutes), while every
+// other session keeps the untouched 5-minute staleness heartbeat.
+describe("isWaitingSession", () => {
+  test("every attention marker counts as waiting", () => {
+    expect(isWaitingSession(rec({ lastEvent: "needsAttention" }))).toBe(true);
+    expect(isWaitingSession(rec({ pendingPlanPicker: true }))).toBe(true);
+    expect(isWaitingSession(rec({ prio: 1 }))).toBe(true);
+  });
+
+  test("an ordinary working / freshly-started session is NOT waiting (zero extra POSTs for it)", () => {
+    expect(isWaitingSession(rec({ lastEvent: "working", prio: 0 }))).toBe(false);
+    expect(isWaitingSession(rec({ lastEvent: "sessionStart" }))).toBe(false);
+    expect(isWaitingSession(rec({}))).toBe(false);
+  });
+
+  test("a terminal row is never waiting, whatever else it still carries", () => {
+    expect(isWaitingSession(rec({ op: "done", prio: 1 }))).toBe(false);
+    expect(isWaitingSession(rec({ lastEvent: "done", pendingPlanPicker: true }))).toBe(false);
+  });
+});
+
+describe("heartbeatKind (both cadences at once)", () => {
+  const waiting = (over: Partial<SessionRecord> = {}): SessionRecord =>
+    rec({ ts: 1_000_000, lastEvent: "needsAttention", op: "update", prio: 1, blob: "B", ...over });
+
+  test("a session parked on the user beats every WAITING_HEARTBEAT_AFTER_MS, not every 5 min", () => {
+    const now = 1_000_000 + WAITING_HEARTBEAT_AFTER_MS;
+    expect(heartbeatKind(waiting(), now, undefined, undefined, false)).toBe("waiting");
+    // …and is then throttled on the PAIRING clock until the next interval elapses.
+    expect(heartbeatKind(waiting(), now, undefined, now, false)).toBe("none");
+    expect(heartbeatKind(waiting(), now + WAITING_HEARTBEAT_AFTER_MS, undefined, now, false)).toBe("waiting");
+  });
+
+  test("the fast beat never doubles up on the hook POST that just opened the episode", () => {
+    expect(heartbeatKind(waiting(), 1_000_000 + WAITING_HEARTBEAT_AFTER_MS - 1, undefined, undefined, false)).toBe("none");
+  });
+
+  test("ONE pairing-wide clock: a second waiting session does not add POSTs in the same interval", () => {
+    const now = 1_000_000 + WAITING_HEARTBEAT_AFTER_MS;
+    expect(heartbeatKind(waiting(), now, undefined, undefined, false)).toBe("waiting");
+    // the sweep records that beat, so every other waiting session sees it and stands down
+    expect(heartbeatKind(waiting({ ts: 900_000 }), now, undefined, now, false)).toBe("none");
+  });
+
+  test("a NON-waiting session is completely unaffected — still exactly the 5-minute cadence", () => {
+    const working = rec({ ts: 1_000_000, lastEvent: "working", op: "update", prio: 0, blob: "B" });
+    expect(heartbeatKind(working, 1_000_000 + WAITING_HEARTBEAT_AFTER_MS, undefined, undefined, false)).toBe("none");
+    expect(heartbeatKind(working, 1_000_000 + 299_999, undefined, undefined, false)).toBe("none");
+    expect(heartbeatKind(working, 1_000_000 + 300_000, undefined, undefined, false)).toBe("stale");
+  });
+
+  test("the stale beat wins when both apply, so a long wait still sends only one POST", () => {
+    expect(heartbeatKind(waiting(), 1_000_000 + 300_000, undefined, undefined, false)).toBe("stale");
+  });
+
+  test("every shouldHeartbeat guardrail holds for the fast beat too", () => {
+    const now = 1_000_000 + WAITING_HEARTBEAT_AFTER_MS;
+    expect(heartbeatKind(waiting({ op: "done" }), now, undefined, undefined, false)).toBe("none"); // terminal
+    expect(heartbeatKind(waiting({ doneAttempts: 1 }), now, undefined, undefined, false)).toBe("none"); // corrective in flight
+    expect(heartbeatKind(waiting(), now, undefined, undefined, true)).toBe("none"); // a net owns it this sweep
+    expect(heartbeatKind(waiting({ ts: undefined as unknown as number }), now, undefined, undefined, false)).toBe("none");
+  });
+
+  test("aggregate POST budget: the fast beat costs ≤6 /min for the WHOLE pairing (limit is 300/min)", () => {
+    // Drive a minute of 5-second sweeps with three waiting sessions and count the beats.
+    const sessions = [waiting({ ts: 0 }), waiting({ ts: 0 }), waiting({ ts: 0 })];
+    let lastWaitingBeat: number | undefined;
+    let beats = 0;
+    for (let now = 0; now < 60_000; now += 5_000) {
+      for (const s of sessions) {
+        if (heartbeatKind(s, now, undefined, lastWaitingBeat, false) === "waiting") {
+          beats++;
+          lastWaitingBeat = now; // what the sweep does on a delivered fast beat
+        }
+      }
+    }
+    expect(beats).toBeLessThanOrEqual(6);
+    expect(beats).toBeGreaterThan(0);
   });
 });
