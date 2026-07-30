@@ -5,7 +5,7 @@ import { basename, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { b64url, decryptBlob } from "../core/crypto";
 import {
-  BLOB_FIT_CHARS, parseConfig, PendingEventStash, PLAN_BLOB_TEXT_MAX_CHARS, PLAN_BLOB_TRUNCATION_MARKER,
+  BLOB_FIT_CHARS, DBG_BLOB_TEXT_MAX_CHARS, formatPlanPickerDebug, parseConfig, PendingEventStash, PLAN_BLOB_TEXT_MAX_CHARS, PLAN_BLOB_TRUNCATION_MARKER,
   readRecord, sealedBlobChars, SessionRecord,
 } from "../core/shared";
 import {
@@ -108,7 +108,7 @@ describe("planOp (op mapping table)", () => {
     const input = { session_id: "s", cwd: "/Users/x/api-status", hook_event_name: "PreToolUse", tool_name: "request_user_input" };
     const plan = planOp("PreToolUse", input, false)!;
     expect(buildBlob(input, "Mac", "t", plan, "codex"))
-      .toEqual({ status: "needsAttention", title: "t", machine: "Mac", label: "api-status", agent: "codex" });
+      .toMatchObject({ status: "needsAttention", title: "t", machine: "Mac", label: "api-status", agent: "codex", dbg: expect.any(String) });
   });
 
   // --- re-arm-after-done ---------------------------------------------------------------------
@@ -183,7 +183,7 @@ describe("agent key threading (codex present as the literal string; claude OMITS
   test("buildBlob stamps agent:'codex' for a codex hook, and has NO agent key for claude", () => {
     const plan = planOp("PreToolUse", { session_id: "s", cwd: "/x" }, false)!;
     expect(buildBlob({ session_id: "s", cwd: "/Users/x/api-status", hook_event_name: "PreToolUse", tool_name: "apply_patch" }, "Mac", "t", plan, "codex"))
-      .toEqual({ status: "working", detail: "editing", title: "t", machine: "Mac", label: "api-status", agent: "codex" });
+      .toMatchObject({ status: "working", detail: "editing", title: "t", machine: "Mac", label: "api-status", agent: "codex", dbg: expect.any(String) });
     expect(buildBlob({ session_id: "s", cwd: "/x", hook_event_name: "PreToolUse", tool_name: "Edit" }, "Mac", "t", plan))
       .not.toHaveProperty("agent");
   });
@@ -381,7 +381,7 @@ describe("buildBlob (plaintext content of the encrypted blob)", () => {
     const input = { session_id: "s", cwd: "/x/proj", hook_event_name: "Stop" };
     const attention = { op: "update" as const, prio: 1 as const, status: "needsAttention" as const };
     const pending = buildBlob(input, "Mac", "t", attention, "codex", undefined, undefined, "gpt-5", 123, "p".repeat(5000));
-    expect(Object.keys(pending).at(-1)).toBe("plan");
+    expect(Object.keys(pending).slice(-2)).toEqual(["plan", "dbg"]);
     expect(pending.plan?.endsWith(PLAN_BLOB_TRUNCATION_MARKER)).toBe(true);
     expect([...(pending.plan ?? "")]).toHaveLength(PLAN_BLOB_TEXT_MAX_CHARS);
     expect(sealedBlobChars(new TextEncoder().encode(JSON.stringify(pending)).length)).toBeLessThanOrEqual(BLOB_FIT_CHARS);
@@ -392,7 +392,7 @@ describe("buildBlob (plaintext content of the encrypted blob)", () => {
       .not.toHaveProperty("plan");
   });
 
-  test("budget overflow drops plan first and preserves every existing blob key", () => {
+  test("budget overflow drops dbg first, then fits plan, while preserving every base key", () => {
     const input = { session_id: "s", cwd: "/x/proj", hook_event_name: "Stop" };
     const attention = { op: "update" as const, prio: 1 as const, status: "needsAttention" as const };
     let title = "";
@@ -411,8 +411,25 @@ describe("buildBlob (plaintext content of the encrypted blob)", () => {
     expect(title.length).toBeGreaterThan(0);
     const base = buildBlob(input, "Mac", title, attention, "codex", 7, "proj", "gpt-5", 9);
     const attempted = buildBlob(input, "Mac", title, attention, "codex", 7, "proj", "gpt-5", 9, "p".repeat(5000));
-    expect(attempted).toEqual(base);
-    expect(attempted).not.toHaveProperty("plan");
+    expect(base).toHaveProperty("dbg");
+    expect(attempted).not.toHaveProperty("dbg");
+    expect(attempted).toHaveProperty("plan");
+    expect(Object.fromEntries(Object.entries(attempted).filter(([key]) => key !== "plan")))
+      .toEqual(Object.fromEntries(Object.entries(base).filter(([key]) => key !== "dbg")));
+    expect(sealedBlobChars(new TextEncoder().encode(JSON.stringify(attempted)).length)).toBeLessThanOrEqual(BLOB_FIT_CHARS);
+  });
+
+  test("dbg is emitted for Codex, appended last after plan, and capped at 200 characters", () => {
+    const input = { session_id: "s", cwd: "/x/proj", hook_event_name: "Stop" };
+    const attention = { op: "update" as const, prio: 1 as const, status: "needsAttention" as const };
+    const dbg = formatPlanPickerDebug({
+      version: "v".repeat(500), event: "stop", classifier: "pending", marker: "p",
+      daemon: "idle", daemonDisposition: "ign", ttl: "37m", by: "wd",
+    });
+    const blob = buildBlob(input, "Mac", "t", attention, "codex", undefined, undefined, undefined, 9, "Plan", dbg);
+    expect(blob.dbg).toBe(dbg);
+    expect(Array.from(blob.dbg ?? "")).toHaveLength(DBG_BLOB_TEXT_MAX_CHARS);
+    expect(Object.keys(blob).slice(-2)).toEqual(["plan", "dbg"]);
   });
 });
 
@@ -635,7 +652,7 @@ describe("at threading (frozen real-event time, blob-only, epoch seconds; append
 
   test("at is the LAST key in the blob, after model (append-last discipline for byte-stable decoders)", () => {
     const blob = buildBlob(input, "Mac", "t", plan, "codex", 1_751_900_000, undefined, "gpt-5-codex", 1_751_900_999);
-    expect(Object.keys(blob)).toEqual(["status", "title", "machine", "label", "detail", "agent", "turnStartedAt", "model", "at"]);
+    expect(Object.keys(blob)).toEqual(["status", "title", "machine", "label", "detail", "agent", "turnStartedAt", "model", "at", "dbg"]);
   });
 
   test("buildEnvelope ALWAYS freezes at = floor(now/1000) INSIDE the blob; the clear envelope stays blind", async () => {

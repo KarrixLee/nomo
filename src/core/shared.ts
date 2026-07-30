@@ -11,7 +11,7 @@
 // through the portable crypto.ts helpers. Task 2.3 bundles these .ts files to a single .mjs.
 
 import { access, chmod, open, readFile, rename, stat, mkdir, unlink, writeFile } from "node:fs/promises";
-import { existsSync, readFileSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync, statSync, truncateSync } from "node:fs";
 import { execFileSync, spawn } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -26,8 +26,85 @@ import { b64url, deriveE2EKey, deriveRatchetKey, encryptBlob, fromB64url } from 
 declare const __NOMO_VERSION__: string | undefined;
 export const PLUGIN_VERSION: string = typeof __NOMO_VERSION__ === "string" ? __NOMO_VERSION__ : "0.0.0-dev";
 
+/** Plan-picker/session state carried in the optional encrypted `dbg` blob field.
+ *  Stable grammar (tokens and order are part of the phone contract):
+ *    `<version> ev:<event> cls:<verdict> mk:<0|v|p|s> dq:<na|wait|idle>(<na|keep|ign>) ttl:<-|Nm|fire> by:<h|n|wd>`
+ *  `mk` is none/verification/pending/settled; `dq` is daemon query + disposition; `ttl` is marker
+ *  age (whole minutes) or `fire`; and `by` is hook/notify/watchdog. Values are token-sanitized and the
+ *  complete string is code-point capped, so `dbg` is always plain text <= 200 characters. */
+export const DBG_BLOB_TEXT_MAX_CHARS = 200;
+export type PlanPickerDebugActor = "h" | "n" | "wd";
+export type PlanPickerDebugMarker = "0" | "v" | "p" | "s";
+
+function debugToken(value: string): string {
+  if (value === "-") return "-";
+  return value.toLowerCase().replace(/[^a-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "") || "na";
+}
+
+export function formatPlanPickerDebug(input: {
+  event: string;
+  classifier: string;
+  marker?: PlanPickerDebugMarker;
+  daemon?: "na" | "wait" | "idle";
+  daemonDisposition?: "na" | "keep" | "ign";
+  ttl?: string;
+  by: PlanPickerDebugActor;
+  version?: string;
+}): string {
+  const value = `${debugToken(input.version ?? PLUGIN_VERSION)} ev:${debugToken(input.event)} cls:${debugToken(input.classifier)} mk:${input.marker ?? "0"} dq:${input.daemon ?? "na"}(${input.daemonDisposition ?? "na"}) ttl:${debugToken(input.ttl ?? "-")} by:${input.by}`;
+  return Array.from(value).slice(0, DBG_BLOB_TEXT_MAX_CHARS).join("");
+}
+
 /** Root of the on-disk state: config.json, the per-session pid files, the watchdog pidfile. */
 export const CC_DIR = `${process.env.HOME}/.config/cc-status`;
+/** Append-only, local-only session lifecycle/state-machine trace next to config.json. */
+export const SESSION_TRACE_PATH = `${CC_DIR}/session-trace.log`;
+const SESSION_TRACE_MAX_BYTES = 256 * 1024;
+let sessionTraceRotated = false;
+
+/** One-line JSON trace with the same best-effort, owner-only, rotate-once discipline for every
+ * producer (hook, notify, watchdog). Nothing here enters the clear envelope. */
+export function traceSession(event: object, path: string = SESSION_TRACE_PATH): void {
+  try {
+    if (!sessionTraceRotated) {
+      sessionTraceRotated = true;
+      try { if (statSync(path).size > SESSION_TRACE_MAX_BYTES) truncateSync(path, 0); } catch { /* absent */ }
+    }
+    appendFileSync(path, `${JSON.stringify({ ts: Date.now(), pid: process.pid, ...event })}\n`, { mode: 0o600 });
+  } catch { /* tracing must never surface into an agent session */ }
+}
+
+export interface PlanPickerTraceDecision {
+  source: "hook" | "notify" | "watchdog";
+  classifier: string;
+  marker: "set-verification" | "set-pending" | "cleared" | "kept" | "none" | "settled";
+  daemonQuery?: "not-queried" | "waitingOnUserInput" | "notWaitingOnUserInput" | "unavailable";
+  daemonIgnored?: boolean;
+  ttlFired?: boolean;
+  settle?: "none" | "blocked" | "done";
+  correctionPosted?: boolean;
+  doneBy?: "hook" | "notify" | "watchdog";
+}
+
+/** Fixed-shape Plan-picker decision line. Explicit false/none values keep grep/jq queries stable and
+ * make every line answer classifier, marker, daemon, TTL, settlement, correction, and done-owner. */
+export function tracePlanPickerDecision(
+  sessionId: string, decision: PlanPickerTraceDecision, path?: string,
+): void {
+  traceSession({
+    event: "plan-picker",
+    sessionId,
+    source: decision.source,
+    classifier: decision.classifier,
+    marker: decision.marker,
+    daemonQuery: decision.daemonQuery ?? "not-queried",
+    daemonIgnored: decision.daemonIgnored ?? false,
+    ttlFired: decision.ttlFired ?? false,
+    settle: decision.settle ?? "none",
+    correctionPosted: decision.correctionPosted ?? false,
+    doneBy: decision.doneBy ?? null,
+  }, path);
+}
 /** One `<session_id>.json` per live session — written by the hook, reaped by the watchdog. */
 export const SESSIONS_DIR = `${CC_DIR}/sessions`;
 /** Single-instance handle/lock for the watchdog process. */
@@ -88,6 +165,23 @@ export function appendFittedPlan<T extends Record<string, unknown>>(base: T, pla
     else hi = mid - 1;
   }
   return { ...base, plan: chars.slice(0, lo).join("") + marker };
+}
+
+/** Append optional `plan`, then optional `dbg` LAST. Budget precedence is intentional: build the
+ *  best-fitting plan first, try the capped debug string on that complete shape, and drop `dbg` whole
+ *  if it would overflow. Thus `dbg` is always the FIRST sacrifice; only then may plan be truncated or
+ *  omitted by appendFittedPlan. Base fields are never removed. */
+export function appendFittedPlanAndDebug<T extends Record<string, unknown>>(
+  base: T, plan: string | undefined, dbg: string | undefined,
+): T & { plan?: string; dbg?: string } {
+  const withPlan = appendFittedPlan(base, plan);
+  if (typeof dbg !== "string" || dbg.length === 0) return withPlan;
+  const capped = Array.from(dbg).slice(0, DBG_BLOB_TEXT_MAX_CHARS).join("");
+  const encoder = new TextEncoder();
+  const withDebug = { ...withPlan, dbg: capped };
+  return sealedBlobChars(encoder.encode(JSON.stringify(withDebug)).length) <= BLOB_FIT_CHARS
+    ? withDebug
+    : withPlan;
 }
 
 /** Whether a zero-byte marker/flag file exists on disk. The ONE probe shared by every reader of the
@@ -321,9 +415,14 @@ export interface SessionRecord {
    *  The short-lived hook deliberately leaves the phone working and delegates the terminal decision
    *  to the watchdog. Any ordinary later hook rewrite omits this marker and therefore cancels it. */
   planPickerVerificationPending?: boolean;
-  /** Terminal provenance for a picker resolved by daemon status or its hard TTL. Prevents the
-   *  recent-done migration backstop from re-raising the same structurally-valid rollout signature. */
+  /** Terminal provenance for a picker resolved by the verification/hard-TTL bounds. Prevents the
+   *  ordinary recent-done migration backstop from re-raising the same structurally-valid rollout
+   *  signature. A bounded repair may still reconsider this flag when full proof + live pid survives,
+   *  because v1.4.8 incorrectly stamped it while the client-side picker was still open. */
   planPickerSettled?: boolean;
+  /** Latest compact state-machine decision mirrored into rebuilt encrypted frames. Local cache only;
+   *  the clear worker envelope never sees it. Plain text, optional, <= 200 chars. */
+  dbg?: string;
   /** The hook/process provenance that FIRST created this local record. Preserved across later hook and
    *  watchdog rewrites. Local-only diagnostic metadata — never copied into the blob or wire envelope.
    *  Optional for backward compatibility with records written before the phantom-session trace fix. */
@@ -339,7 +438,7 @@ export interface PendingEventStash {
   sessionId: string;
   op: CCOp;
   prio: 0 | 1;
-  blob: { status: CCStatus; detail?: string; title: string; machine: string; label: string; agent?: AgentKind; turnStartedAt?: number; model?: string; at?: number; plan?: string };
+  blob: { status: CCStatus; detail?: string; title: string; machine: string; label: string; agent?: AgentKind; turnStartedAt?: number; model?: string; at?: number; plan?: string; dbg?: string };
   /** Epoch-ms the stashing hook fired — bounds the flush to the QR's 10-min TTL (a stale stash is a
    *  ghost from a turn long since over and is dropped, not posted). */
   stashedAt: number;

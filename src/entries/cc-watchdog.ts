@@ -36,11 +36,12 @@ import { encryptBlob } from "../core/crypto";
 import { adapterFor, AgentAdapter, allAdapters, codexAdapter, CodexPlanPickerEvidence, DiscoveredSession } from "../core/adapter";
 import { CodexRemoteInputBridge } from "../core/codex-remote-input-bridge";
 import type { CodexThreadWaitState } from "../core/codex-remote-input-bridge";
+import type { PlanPickerTraceDecision } from "../core/shared";
 import {
-  AgentKind, appendFittedPlan, atomicWrite, CC_DIR, CCOp, CCStatus, codexAppServerSocketAvailable, Config, completePendingPairing, formatWatchdogPidfile,
+  AgentKind, appendFittedPlanAndDebug, atomicWrite, CC_DIR, CCOp, CCStatus, codexAppServerSocketAvailable, Config, completePendingPairing, formatPlanPickerDebug, formatWatchdogPidfile,
   GONE_STRIKE_LIMIT, loadConfig, loadPendingConfig, localApprovalsState,
   PAIR_HTML_FILE, PairPollResult, parseWatchdogPidfile, PendingConfig, pidAlive, PLUGIN_VERSION, readPrefix, readSuffix, recordGoneStrike, removeRevokedConfig,
-  resetGoneStrikes, SessionRecord, SESSIONS_DIR, watchdogHolderIsLive, WATCHDOG_PID_PATH,
+  resetGoneStrikes, SessionRecord, SESSIONS_DIR, tracePlanPickerDecision, watchdogHolderIsLive, WATCHDOG_PID_PATH,
 } from "../core/shared";
 
 // The transcript-tail interrupt PARSERS live in the agent adapters now (the two detections are
@@ -234,8 +235,8 @@ export function buildEndEnvelope(sessionId: string, now: number, record?: Sessio
  *  record's cached `turnStartedAt` (epoch seconds, stamped by the turn's UserPromptSubmit) is
  *  likewise restamped into the rebuilt blob — omitted when unknown — so the island's frozen
  *  "done in Xm" keeps measuring the TURN, exactly as a hook-built done blob would. */
-export async function buildDoneEnvelope(sessionId: string, record: SessionRecord, now: number, e2eKey: Uint8Array, agent: AgentKind = "claude", at?: number): Promise<object> {
-  const blob = await encryptBlob(e2eKey, {
+export async function buildDoneEnvelope(sessionId: string, record: SessionRecord, now: number, e2eKey: Uint8Array, agent: AgentKind = "claude", at?: number, dbg?: string): Promise<object> {
+  const base = {
     status: "done",
     title: typeof record.title === "string" ? record.title : "",
     machine: typeof record.machine === "string" ? record.machine : "",
@@ -251,7 +252,9 @@ export async function buildDoneEnvelope(sessionId: string, record: SessionRecord
     // idle-CLAUDE reap passes a FROZEN record.ts so a session idle for hours ages out immediately
     // instead of looking freshly finished. OMITTED when the caller has no honest time.
     ...(typeof at === "number" && Number.isFinite(at) ? { at } : {}),
-  });
+  };
+  const debug = agent === "codex" ? dbg ?? formatPlanPickerDebug({ event: "done", classifier: "done", marker: "0", by: "wd" }) : undefined;
+  const blob = await encryptBlob(e2eKey, appendFittedPlanAndDebug(base, undefined, debug));
   return { v: 2, sessionId, op: "done", prio: 0, ts: now, blob, ...startedAtField(record) };
 }
 
@@ -268,6 +271,7 @@ export async function buildDoneEnvelope(sessionId: string, record: SessionRecord
 export async function buildNeedsAttentionEnvelope(
   sessionId: string, record: SessionRecord, now: number, e2eKey: Uint8Array,
   agent: AgentKind = "claude", at?: number, detail?: string, attentionKind?: "userInput", proposedPlan?: string,
+  dbg?: string,
 ): Promise<object> {
   const base = {
     status: "needsAttention",
@@ -288,7 +292,8 @@ export async function buildNeedsAttentionEnvelope(
     // preserving the existing order and omitted for ordinary permissions/questions.
     ...(typeof at === "number" && Number.isFinite(at) ? { at } : {}),
   };
-  const blob = await encryptBlob(e2eKey, appendFittedPlan(base, proposedPlan));
+  const debug = agent === "codex" ? dbg ?? formatPlanPickerDebug({ event: "attention", classifier: "pending", marker: "0", by: "wd" }) : undefined;
+  const blob = await encryptBlob(e2eKey, appendFittedPlanAndDebug(base, proposedPlan, debug));
   return {
     v: 2, sessionId, op: "update", prio: 1, ts: now,
     // Clear and optional: only a recovered Codex request_user_input gets this discriminator. Ordinary
@@ -303,9 +308,9 @@ export async function buildNeedsAttentionEnvelope(
  *  (not a verbatim heartbeat). It intentionally carries no attentionKind: op:update/prio:0 closes the
  *  attention episode and returns the session to its ordinary in-flight state. */
 export async function buildWorkingEnvelope(
-  sessionId: string, record: SessionRecord, now: number, e2eKey: Uint8Array, agent: AgentKind = "claude",
+  sessionId: string, record: SessionRecord, now: number, e2eKey: Uint8Array, agent: AgentKind = "claude", dbg?: string,
 ): Promise<Record<string, unknown>> {
-  const blob = await encryptBlob(e2eKey, {
+  const base = {
     status: "working",
     title: typeof record.title === "string" ? record.title : "",
     machine: typeof record.machine === "string" ? record.machine : "",
@@ -314,7 +319,9 @@ export async function buildWorkingEnvelope(
     ...(typeof record.turnStartedAt === "number" && Number.isFinite(record.turnStartedAt) ? { turnStartedAt: record.turnStartedAt } : {}),
     ...(typeof record.model === "string" && record.model.length > 0 ? { model: record.model } : {}),
     at: Math.floor(now / 1000),
-  });
+  };
+  const debug = agent === "codex" ? dbg ?? formatPlanPickerDebug({ event: "working", classifier: "resolved", marker: "0", by: "wd" }) : undefined;
+  const blob = await encryptBlob(e2eKey, appendFittedPlanAndDebug(base, undefined, debug));
   return { v: 2, sessionId, op: "update", prio: 0, ts: now, blob, ...startedAtField(record) };
 }
 
@@ -326,16 +333,39 @@ export interface PlanPickerResolutionDeps {
   writeRecord?: (path: string, rec: SessionRecord) => Promise<void>;
   readRecord?: (path: string) => Promise<SessionRecord | null>;
   now?: () => number;
+  trace?: (decision: PlanPickerTraceDecision) => void;
 }
 
 type PlanPickerCorrection = "corrected" | "pending" | "uncorrected" | "revoked";
+
+function markerAge(record: SessionRecord, now: number): string {
+  const since = typeof record.planPickerPendingSince === "number" && Number.isFinite(record.planPickerPendingSince)
+    ? record.planPickerPendingSince : record.ts;
+  return typeof since === "number" && Number.isFinite(since)
+    ? `${Math.max(0, Math.floor((now - since) / 60_000))}m` : "-";
+}
+
+function tracePicker(
+  sessionId: string,
+  deps: { trace?: (decision: PlanPickerTraceDecision) => void },
+  decision: PlanPickerTraceDecision,
+): void {
+  if (deps.trace) {
+    deps.trace(decision);
+    return;
+  }
+  // Pure unit calls run inside `bun test` with production HOME still visible; never pollute the user's
+  // live trace. Spawned hook/watchdog entry tests have their own argv + isolated HOME and still trace.
+  if (process.argv.some((arg) => arg === "test" || arg.endsWith(".test.ts"))) return;
+  tracePlanPickerDecision(sessionId, decision);
+}
 
 /** Persist the terminal state before posting it. This makes a watchdog replacement between disk and
  *  wire harmless: `donePending` retries a missed POST, while a delivered POST can never leave the
  *  local record frozen at the older working/attention state. */
 async function settlePendingPlanPickerDone(
   config: Config, path: string, sessionId: string, snapshot: SessionRecord, now: number,
-  deps: Pick<PlanPickerResolutionDeps, "post" | "writeRecord" | "readRecord">,
+  deps: Pick<PlanPickerResolutionDeps, "post" | "writeRecord" | "readRecord" | "trace">,
 ): Promise<PlanPickerCorrection> {
   const readCurrent = deps.readRecord ?? readRecordAt;
   const writeRecord = deps.writeRecord
@@ -344,11 +374,19 @@ async function settlePendingPlanPickerDone(
   if (!fresh || recordMovedSince(snapshot, fresh) || fresh.turnId !== snapshot.turnId ||
       fresh.pendingPlanPicker !== snapshot.pendingPlanPicker ||
       fresh.planPickerVerificationPending !== snapshot.planPickerVerificationPending) {
+    tracePicker(sessionId, deps, {
+      source: "watchdog", classifier: "settle-stale", marker: "kept", settle: "blocked",
+    });
     return "uncorrected";
   }
   const at = typeof snapshot.ts === "number" && Number.isFinite(snapshot.ts)
     ? Math.floor(snapshot.ts / 1000) : undefined;
-  const envelope = await buildDoneEnvelope(sessionId, snapshot, now, config.e2eKey, "codex", at) as Record<string, unknown>;
+  const ttlFired = planPickerPendingExpired(snapshot, now);
+  const dbg = formatPlanPickerDebug({
+    event: ttlFired ? "ttl" : "settle", classifier: "done", marker: "s",
+    ttl: ttlFired ? "fire" : markerAge(snapshot, now), by: "wd",
+  });
+  const envelope = await buildDoneEnvelope(sessionId, snapshot, now, config.e2eKey, "codex", at, dbg) as Record<string, unknown>;
   const next: SessionRecord = {
     ...fresh,
     lastEvent: "done",
@@ -363,14 +401,23 @@ async function settlePendingPlanPickerDone(
     planPickerPendingSince: undefined,
     planPickerSettled: true,
     doneAttempts: undefined,
+    dbg,
   };
   await writeRecord(path, next);
   let outcome: PostOutcome;
   try {
     outcome = await (deps.post ?? ((body: object) => postEvent(config, body)))(envelope);
   } catch {
+    tracePicker(sessionId, deps, {
+      source: "watchdog", classifier: "done", marker: "settled", ttlFired,
+      settle: "done", correctionPosted: false, doneBy: "watchdog",
+    });
     return "pending"; // disk already owns this terminal transition; donePending retries it
   }
+  tracePicker(sessionId, deps, {
+    source: "watchdog", classifier: "done", marker: "settled", ttlFired,
+    settle: "done", correctionPosted: outcome === "delivered", doneBy: "watchdog",
+  });
   if (outcome === "revoked") return "revoked";
   if (outcome !== "delivered") return "pending";
   // Clear only our own delivery debt. A prompt that raced the POST owns its newer record.
@@ -404,17 +451,29 @@ export async function correctResolvedPlanPicker(
       pid: record.pid,
       transcriptPath: typeof record.transcript === "string" ? record.transcript : undefined,
     })))();
-    if (state === "pending" && deps.threadWaitState) {
-      const threadState = await deps.threadWaitState();
-      if (threadState === "notWaitingOnUserInput") {
-        return await settlePendingPlanPickerDone(config, path, sessionId, record, now, deps);
-      }
-      // Waiting proves the picker is still up. Unavailable/ambiguous deliberately preserve the
-      // existing behavior; the hard TTL above remains the final bound.
+    if (state === "pending") {
+      const threadState = deps.threadWaitState ? await deps.threadWaitState() : "unavailable";
+      // The picker is pure client-side TUI state: thread/read reports daemon idle both while it is
+      // visibly open and after ESC. Therefore only waiting=true is useful confirmation; idle and
+      // unavailable are ignored. ESC may remain stuck until the one-hour hard TTL, an accepted cost
+      // of restoring the durable rollout-signature semantics without false dismissal.
+      const daemonIdle = threadState === "notWaitingOnUserInput";
+      tracePicker(sessionId, deps, {
+        source: "watchdog", classifier: state, marker: "kept",
+        daemonQuery: threadState,
+        daemonIgnored: threadState !== "waitingOnUserInput",
+        settle: daemonIdle ? "blocked" : "none",
+      });
       return "uncorrected";
     }
-    if (state !== "resolved") return "uncorrected";
-    const envelope = await buildWorkingEnvelope(sessionId, record, now, config.e2eKey, agent);
+    if (state !== "resolved") {
+      tracePicker(sessionId, deps, { source: "watchdog", classifier: state, marker: "kept" });
+      return "uncorrected";
+    }
+    const dbg = formatPlanPickerDebug({
+      event: "resolve", classifier: state, marker: "0", ttl: markerAge(record, now), by: "wd",
+    });
+    const envelope = await buildWorkingEnvelope(sessionId, record, now, config.e2eKey, agent, dbg);
     const next: SessionRecord = {
       ...record,
       ts: now,
@@ -427,6 +486,7 @@ export async function correctResolvedPlanPicker(
       pendingPlanPicker: undefined,
       planPickerPendingSince: undefined,
       planPickerSettled: undefined,
+      dbg,
     };
     // Persist first so a process replacement cannot reproduce the phone/local divergence from F12.
     await (deps.writeRecord ?? ((p: string, rec: SessionRecord) => atomicWrite(p, JSON.stringify(rec), 0o600)))(path, next);
@@ -434,8 +494,14 @@ export async function correctResolvedPlanPicker(
     try {
       outcome = await (deps.post ?? ((body: object) => postEvent(config, body)))(envelope);
     } catch {
+      tracePicker(sessionId, deps, {
+        source: "watchdog", classifier: state, marker: "cleared", correctionPosted: false,
+      });
       return "pending"; // the durable working correction owns this sweep
     }
+    tracePicker(sessionId, deps, {
+      source: "watchdog", classifier: state, marker: "cleared", correctionPosted: outcome === "delivered",
+    });
     if (outcome === "revoked") return "revoked";
     if (outcome !== "delivered") return "pending";
     return "corrected";
@@ -458,9 +524,9 @@ export const PLAN_PICKER_VERIFY_MAX_MS = 30_000;
  *  can otherwise remain valid forever after ESC because dismissal is intentionally absent from JSONL.
  *  One hour preserves long deliberation while guaranteeing that no pending marker is immortal. */
 export const PLAN_PICKER_PENDING_MAX_MS = 60 * 60_000;
-/** Migration/self-heal window for a plain done written by the old timing-based implementation. Exact
- *  full picker proof + live pid + no later progress is still required. Bounded so old done rows are
- *  never reconsidered indefinitely. */
+/** Migration/self-heal window for a plain done or the v1.4.8 buggy daemon-settled done. Exact full
+ *  picker proof + live pid + no later progress is still required. Bounded so old done rows are never
+ *  reconsidered indefinitely. */
 export const PLAN_PICKER_RECENT_DONE_MS = 30 * 60_000;
 
 /** Pure gate for marked completions and the narrowly bounded old-build done backstop. */
@@ -468,7 +534,6 @@ export function shouldPlanPickerVerificationCheck(record: SessionRecord, now: nu
   if (record.agent !== "codex" || record.provisional === true) return false;
   if (typeof record.transcript !== "string" || record.transcript.length === 0) return false;
   if (record.planPickerVerificationPending === true) return true;
-  if (record.planPickerSettled === true) return false;
   if (record.op !== "done" || record.lastEvent !== "done" || record.sentDone !== true) return false;
   if (typeof record.ts !== "number" || !Number.isFinite(record.ts)) return false;
   const age = now - record.ts;
@@ -493,7 +558,9 @@ export interface PlanPickerVerificationDeps {
   writeRecord?: (path: string, rec: SessionRecord) => Promise<void>;
   readRecord?: (path: string) => Promise<SessionRecord | null>;
   threadWaitState?: () => Promise<CodexThreadWaitState>;
+  pidAlive?: (pid: number) => boolean;
   now?: () => number;
+  trace?: (decision: PlanPickerTraceDecision) => void;
 }
 
 /** Watchdog-owned settlement for a possibly completed Plan turn.
@@ -501,7 +568,8 @@ export interface PlanPickerVerificationDeps {
  *   resolved  → later task_started/user_message: clear only a provisional verification marker.
  *   incomplete/none/unknown → keep a fresh marker; after the cap, confirm done.
  *   exited     → leave it to the normal dead-pid op:end path.
- * A recent unmarked done is correction-only: anything except exact pending is left untouched. */
+ * A recent done (including a v1.4.8 settled record) is correction-only: anything except exact pending
+ * with a live pid is left untouched. */
 export async function correctPlanPickerVerification(
   config: Config, path: string, sessionId: string, record: SessionRecord,
   deps: PlanPickerVerificationDeps = {},
@@ -509,6 +577,13 @@ export async function correctPlanPickerVerification(
   try {
     const now = (deps.now ?? Date.now)();
     if (!shouldPlanPickerVerificationCheck(record, now)) return "uncorrected";
+    const recentDoneBackstop = record.planPickerVerificationPending !== true;
+    if (recentDoneBackstop && !(deps.pidAlive ?? pidAlive)(record.pid)) {
+      tracePicker(sessionId, deps, {
+        source: "watchdog", classifier: "dead-pid", marker: record.planPickerSettled === true ? "settled" : "none",
+      });
+      return "uncorrected";
+    }
     const readCurrent = deps.readRecord ?? readRecordAt;
     const writeRecord = deps.writeRecord
       ?? ((p: string, rec: SessionRecord) => atomicWrite(p, JSON.stringify(rec), 0o600));
@@ -518,6 +593,7 @@ export async function correctPlanPickerVerification(
       if (!fresh || recordMovedSince(record, fresh)) return null;
       if (fresh.turnId !== record.turnId) return null;
       if (fresh.planPickerVerificationPending !== record.planPickerVerificationPending) return null;
+      if (fresh.planPickerSettled !== record.planPickerSettled) return null;
       return fresh;
     };
 
@@ -537,36 +613,63 @@ export async function correctPlanPickerVerification(
         });
     const state = evidence.state;
 
-    if (state === "exited") return "uncorrected";
+    if (state === "exited") {
+      tracePicker(sessionId, deps, {
+        source: "watchdog", classifier: state, marker: record.planPickerSettled === true ? "settled" : "kept",
+      });
+      return "uncorrected";
+    }
     if (state === "resolved") {
-      if (record.planPickerVerificationPending !== true) return "uncorrected";
+      if (record.planPickerVerificationPending !== true) {
+        tracePicker(sessionId, deps, {
+          source: "watchdog", classifier: state, marker: record.planPickerSettled === true ? "settled" : "none",
+        });
+        return "uncorrected";
+      }
       const fresh = await freshUnchanged();
-      if (!fresh) return "uncorrected";
+      if (!fresh) {
+        tracePicker(sessionId, deps, {
+          source: "watchdog", classifier: "resolved-stale", marker: "kept", settle: "blocked",
+        });
+        return "uncorrected";
+      }
       await writeRecord(path, {
         ...fresh,
         planPickerVerificationPending: undefined,
         planPickerPendingSince: undefined,
       });
+      tracePicker(sessionId, deps, {
+        source: "watchdog", classifier: state, marker: "cleared",
+      });
       return "pending"; // locally settled; own this sweep so its stale snapshot is not heartbeated
     }
 
     if (state === "pending") {
-      if (deps.threadWaitState) {
-        const threadState = await deps.threadWaitState();
-        if (threadState === "notWaitingOnUserInput") {
-          return record.planPickerVerificationPending === true
-            ? await settlePendingPlanPickerDone(config, path, sessionId, record, now, deps)
-            : "uncorrected"; // the migration-backstop record is already honestly done
-        }
-        // Explicit waiting keeps the picker behavior. Unavailable is intentionally fail-open to the
-        // rollout proof, with PLAN_PICKER_PENDING_MAX_MS as the absolute safety bound.
-      }
+      const threadState = deps.threadWaitState ? await deps.threadWaitState() : "unavailable";
+      // Only explicit waiting confirms the picker; daemon idle is structurally ambiguous for the TUI
+      // and is ignored exactly like unavailable. The durable rollout proof + hard TTL own the state.
+      const daemonIgnored = threadState !== "waitingOnUserInput";
       // Re-read BEFORE posting: a user prompt/Stop could have replaced the sweep snapshot while the
       // rollout probe ran. Never send stale attention for a record that has already moved on.
       const fresh = await freshUnchanged();
-      if (!fresh) return "uncorrected";
+      if (!fresh) {
+        tracePicker(sessionId, deps, {
+          source: "watchdog", classifier: "pending-stale", marker: "kept",
+          daemonQuery: threadState, daemonIgnored, settle: "blocked",
+        });
+        return "uncorrected";
+      }
+      const dbg = formatPlanPickerDebug({
+        event: recentDoneBackstop ? "recorrect" : "verify",
+        classifier: state,
+        marker: "p",
+        daemon: threadState === "waitingOnUserInput" ? "wait" : threadState === "notWaitingOnUserInput" ? "idle" : "na",
+        daemonDisposition: daemonIgnored ? "ign" : "keep",
+        ttl: markerAge(record, now),
+        by: "wd",
+      });
       const envelope = await buildNeedsAttentionEnvelope(
-        sessionId, record, now, config.e2eKey, "codex", Math.floor(now / 1000), undefined, "userInput", evidence.plan,
+        sessionId, record, now, config.e2eKey, "codex", Math.floor(now / 1000), undefined, "userInput", evidence.plan, dbg,
       ) as Record<string, unknown>;
       // Durable first: if the watchdog is replaced after the POST, the successor sees the same prio-1
       // picker state instead of the old prio-0 verification marker.
@@ -585,22 +688,41 @@ export async function correctPlanPickerVerification(
         planPickerSettled: undefined,
         donePending: undefined,
         doneAttempts: undefined,
+        dbg,
       });
       let outcome: PostOutcome;
       try {
         outcome = await post(envelope);
       } catch {
+        tracePicker(sessionId, deps, {
+          source: "watchdog", classifier: state, marker: "set-pending",
+          daemonQuery: threadState, daemonIgnored, settle: threadState === "notWaitingOnUserInput" ? "blocked" : "none",
+          correctionPosted: false,
+        });
         return "pending"; // the durable prio-1 state owns this sweep and is retryable
       }
+      tracePicker(sessionId, deps, {
+        source: "watchdog", classifier: state, marker: "set-pending",
+        daemonQuery: threadState, daemonIgnored, settle: threadState === "notWaitingOnUserInput" ? "blocked" : "none",
+        correctionPosted: outcome === "delivered",
+      });
       if (outcome === "revoked") return "revoked";
       if (outcome !== "delivered") return "pending";
       return "corrected";
     }
 
     // An old-build plain done is correction-only. No complete proof means no resurrection.
-    if (record.planPickerVerificationPending !== true) return "uncorrected";
+    if (record.planPickerVerificationPending !== true) {
+      tracePicker(sessionId, deps, {
+        source: "watchdog", classifier: state, marker: record.planPickerSettled === true ? "settled" : "none",
+      });
+      return "uncorrected";
+    }
     const age = typeof record.ts === "number" && Number.isFinite(record.ts) ? now - record.ts : Infinity;
-    if (age < PLAN_PICKER_VERIFY_MAX_MS) return "pending";
+    if (age < PLAN_PICKER_VERIFY_MAX_MS) {
+      tracePicker(sessionId, deps, { source: "watchdog", classifier: state, marker: "kept" });
+      return "pending";
+    }
 
     // The marked candidate never became a full picker signature within the cap. Fail closed to done,
     // preserving the original event time in the blob so this delayed confirmation does not look fresh.
@@ -727,10 +849,14 @@ export async function buildProvisionalBlob(
 ): Promise<string> {
   // `at` (epoch SECONDS) appended LAST — the OBSERVED discovery time (a process-scan can't know the
   // TUI's real last-activity, so "now" is the honest value). OMITTED when the caller has none.
-  return encryptBlob(e2eKey, {
+  const base = {
     status: d.idle === true ? "done" : "working", title: d.title ?? "", machine, label: d.label, ...blobAgentFields,
     ...(typeof at === "number" && Number.isFinite(at) ? { at } : {}),
-  });
+  };
+  const dbg = blobAgentFields.agent === "codex" ? formatPlanPickerDebug({
+    event: "discover", classifier: d.idle === true ? "done" : "work", marker: "0", by: "wd",
+  }) : undefined;
+  return encryptBlob(e2eKey, appendFittedPlanAndDebug(base, undefined, dbg));
 }
 
 /** The provisional envelope. An in-flight TUI mirrors a real SessionStart (op:start); an IDLE one is
@@ -771,6 +897,9 @@ export function buildProvisionalRecord(
     provisional: true,
     ...(typeof d.title === "string" && d.title.length > 0 ? { title: d.title } : {}),
     ...blobAgentFields,
+    ...(blobAgentFields.agent === "codex" ? { dbg: formatPlanPickerDebug({
+      event: "discover", classifier: idle ? "done" : "work", marker: "0", by: "wd",
+    }) } : {}),
     // Stamp the pairing this blob was sealed under so the heartbeat's key-rotation guard can prove
     // the blob is still decryptable (see buildHeartbeatEnvelope). Omitted only when unknown.
     ...(typeof pairingId === "string" && pairingId.length > 0 ? { pairingId } : {}),
@@ -1608,7 +1737,7 @@ function statusFromRecord(record: SessionRecord): CCStatus {
 export async function buildTitleRepairEnvelope(
   sessionId: string, record: SessionRecord, title: string, now: number, e2eKey: Uint8Array, agent: AgentKind = "codex", at?: number,
 ): Promise<{ v: 2; sessionId: string; op: CCOp; prio: 0 | 1; ts: number; blob: string; startedAt?: number }> {
-  const blob = await encryptBlob(e2eKey, {
+  const base = {
     status: statusFromRecord(record),
     title,
     machine: typeof record.machine === "string" ? record.machine : "",
@@ -1619,7 +1748,11 @@ export async function buildTitleRepairEnvelope(
     // `at` (epoch SECONDS) appended LAST — the OBSERVED now: this re-POSTs the session's CURRENT state
     // (a fresh frame with the title fixed), so the phone should treat it as live. Omitted when absent.
     ...(typeof at === "number" && Number.isFinite(at) ? { at } : {}),
-  });
+  };
+  const dbg = agent === "codex" ? record.dbg ?? formatPlanPickerDebug({
+    event: "title", classifier: statusFromRecord(record), marker: record.pendingPlanPicker ? "p" : record.planPickerVerificationPending ? "v" : record.planPickerSettled ? "s" : "0", by: "wd",
+  }) : undefined;
+  const blob = await encryptBlob(e2eKey, appendFittedPlanAndDebug(base, undefined, dbg));
   return { v: 2, sessionId, op: record.op ?? "update", prio: record.prio ?? 0, ts: now, blob, ...startedAtField(record) };
 }
 

@@ -23,7 +23,7 @@ import { hostname } from "node:os";
 import { basename } from "node:path";
 import { cleanPromptTitle, codexAdapter } from "../core/adapter";
 import { buildEnvelope, markDoneDelivered, sessionOrigin, trackSession } from "../core/hook";
-import { atomicWrite, ensureWatchdog, LAST_SEND_PATH, loadConfig, localApprovalsState, pidCommand, PLUGIN_VERSION, readRecord } from "../core/shared";
+import { atomicWrite, ensureWatchdog, formatPlanPickerDebug, LAST_SEND_PATH, loadConfig, localApprovalsState, pidCommand, PLUGIN_VERSION, readRecord, tracePlanPickerDecision } from "../core/shared";
 
 /** Map the notify JSON onto the runHook/planOp Stop-hook input shape. Null for any payload that isn't
  *  an agent-turn-complete carrying a non-empty thread-id (the only kind we back-stop) or isn't JSON. */
@@ -153,8 +153,15 @@ export async function runNotify(raw: string, deferMs = notifyDeferMs(), sleep: (
         ? { op: "update" as const, prio: 0 as const, status: "working" as const }
       : { op: "done" as const, prio: 0 as const, status: "done" as const };
     const attentionKind = pendingPlanPicker ? "userInput" as const : undefined;
+    const dbg = formatPlanPickerDebug({
+      event: "notify",
+      classifier: wait ?? "unknown",
+      marker: pendingPlanPicker ? "p" : planPickerVerificationPending ? "v" : "0",
+      ttl: pendingPlanPicker || planPickerVerificationPending ? "0m" : "-",
+      by: "n",
+    });
     const envelope = await buildEnvelope(input, machine, now, title, config.e2eKey, false, "codex", startedAt, turnStartedAt, undefined, model, plan, attentionKind,
-      pendingPlanPicker ? evidence.plan : undefined);
+      pendingPlanPicker ? evidence.plan : undefined, dbg);
     if (!envelope) return;
 
     const label = typeof input.cwd === "string" && input.cwd.length > 0 ? basename(input.cwd) : "session";
@@ -162,7 +169,15 @@ export async function runNotify(raw: string, deferMs = notifyDeferMs(), sleep: (
       transcriptPath, "codex", startedAt, turnStartedAt, payloadTurnId,
       title ?? record?.title, config.pairingId, model, pendingPlanPicker, sessionPid,
       record?.origin ?? sessionOrigin(input, sessionPid, pidCommand(sessionPid)),
-      planPickerVerificationPending);
+      planPickerVerificationPending, dbg);
+    const clearedPickerMarker = !pendingPlanPicker && !planPickerVerificationPending
+      && (record?.pendingPlanPicker === true || record?.planPickerSettled === true);
+    tracePlanPickerDecision(sessionId, {
+      source: "notify",
+      classifier: wait ?? "unknown",
+      marker: pendingPlanPicker ? "set-pending" : planPickerVerificationPending ? "set-verification" : clearedPickerMarker ? "cleared" : "none",
+      ...(plan.op === "done" ? { doneBy: "notify" as const } : {}),
+    });
     ensureWatchdog();
 
     const res = await fetch(`${config.url}/v1/cc/event`, {

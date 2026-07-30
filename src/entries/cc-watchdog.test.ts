@@ -3,8 +3,8 @@ import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { decryptBlob } from "../core/crypto";
-import type { SessionRecord } from "../core/shared";
-import { GONE_STRIKE_LIMIT, readGoneStrikes, recordGoneStrike, resetGoneStrikes } from "../core/shared";
+import type { PlanPickerTraceDecision, SessionRecord } from "../core/shared";
+import { GONE_STRIKE_LIMIT, readGoneStrikes, recordGoneStrike, resetGoneStrikes, tracePlanPickerDecision } from "../core/shared";
 import {
   buildDoneEnvelope, buildEndEnvelope, buildHeartbeatEnvelope, buildNeedsAttentionEnvelope, buildProvisionalBlob,
   buildProvisionalEnvelope, buildProvisionalRecord, buildStartEnvelope, buildTitleRepairEnvelope, classifySession,
@@ -556,11 +556,11 @@ describe("buildProvisionalEnvelope (op keyed on the TUI's turn state — the idl
 describe("buildProvisionalBlob (mirrors buildBlob's SessionStart shape)", () => {
   test("codex: decrypts to working + title/machine/label + agent:'codex', no detail/turnStartedAt", async () => {
     const blob = await buildProvisionalBlob(disc(), "Mac", { agent: "codex" }, KEY);
-    expect(await decryptBlob(KEY, blob)).toEqual({ status: "working", title: "api-status", machine: "Mac", label: "api-status", agent: "codex" });
+    expect(await decryptBlob(KEY, blob)).toMatchObject({ status: "working", title: "api-status", machine: "Mac", label: "api-status", agent: "codex", dbg: expect.any(String) });
   });
   test("an IDLE discovery decrypts to status 'done' — an idle REPL is never advertised 'Running'", async () => {
     const blob = await buildProvisionalBlob(disc({ idle: true }), "Mac", { agent: "codex" }, KEY);
-    expect(await decryptBlob(KEY, blob)).toEqual({ status: "done", title: "api-status", machine: "Mac", label: "api-status", agent: "codex" });
+    expect(await decryptBlob(KEY, blob)).toMatchObject({ status: "done", title: "api-status", machine: "Mac", label: "api-status", agent: "codex", dbg: expect.any(String) });
   });
   test("empty title coerces to '' (like buildBlob's title ?? '')", async () => {
     const blob = await buildProvisionalBlob(disc({ title: undefined }), "Mac", { agent: "codex" }, KEY);
@@ -583,6 +583,7 @@ describe("buildProvisionalRecord (flagged provisional, reap/reconcile-ready)", (
       pid: 5150, machine: "Mac", label: "api-status", ts: 4242,
       lastEvent: "sessionStart", op: "start", prio: 0, blob: "BLOB", provisional: true, agent: "codex",
       title: "api-status", // cached like trackSession's — a corrective done must never regress to title:""
+      dbg: expect.any(String),
     });
   });
   test("an IDLE discovery is recorded as a posted done (op/lastEvent done + sentDone) so no net re-arms it", () => {
@@ -1472,6 +1473,9 @@ describe("correctResolvedPlanPicker (Mac answer clears only the marked Plan wait
       ...seams, state: async () => "pending", threadWaitState: async () => "waitingOnUserInput",
     })).toBe("uncorrected");
     expect(await correctResolvedPlanPicker(cfg(), "/tmp/s.json", "s", blockedPlan(), {
+      ...seams, state: async () => "pending", threadWaitState: async () => "notWaitingOnUserInput",
+    })).toBe("uncorrected");
+    expect(await correctResolvedPlanPicker(cfg(), "/tmp/s.json", "s", blockedPlan(), {
       ...seams, state: async () => "unknown",
     })).toBe("uncorrected");
     expect(await correctResolvedPlanPicker(cfg(), "/tmp/s.json", "s", blockedPlan({ pendingPlanPicker: undefined }), {
@@ -1522,7 +1526,7 @@ describe("correctPlanPickerVerification (watchdog owns flush settlement)", () =>
     expect(writes[0].planPickerPendingSince).toBe(NOW);
   });
 
-  test("ESC-shaped daemon idle resolves an exact pending rollout to durable done", async () => {
+  test("daemon idle is ignored and an exact pending rollout stays durable needsAttention", async () => {
     const record = verifying({ planPickerPendingSince: NOW - 5_000 });
     const posts: Record<string, unknown>[] = [];
     const writes: SessionRecord[] = [];
@@ -1536,14 +1540,15 @@ describe("correctPlanPickerVerification (watchdog owns flush settlement)", () =>
       now: () => NOW,
     })).toBe("corrected");
     expect(posts).toHaveLength(1);
-    expect(posts[0]).toMatchObject({ op: "done", prio: 0 });
+    expect(posts[0]).toMatchObject({ op: "update", prio: 1, attentionKind: "userInput" });
     expect(writes[0]).toMatchObject({
-      lastEvent: "done", op: "done", prio: 0, sentDone: true, donePending: true,
-      planPickerSettled: true,
+      lastEvent: "needsAttention", op: "update", prio: 1, sentDone: false,
+      pendingPlanPicker: true,
     });
     expect(writes[0].planPickerVerificationPending).toBeUndefined();
-    expect(writes[0].pendingPlanPicker).toBeUndefined();
-    expect(writes[0].planPickerPendingSince).toBeUndefined();
+    expect(writes[0].planPickerSettled).toBeUndefined();
+    expect(writes[0].planPickerPendingSince).toBe(NOW);
+    expect((await decryptBlob(KEY, posts[0].blob as string)).dbg).toContain("dq:idle(ign)");
   });
 
   test("daemon unavailable sustains the picker initially, but the hard TTL still resolves it", async () => {
@@ -1646,6 +1651,7 @@ describe("correctPlanPickerVerification (watchdog owns flush settlement)", () =>
     for (const state of ["resolved", "none", "exited"] as const) {
       expect(await correctPlanPickerVerification(cfg(), "/tmp/s.json", "s", recentDone, {
         state: async () => state,
+        pidAlive: () => true,
         post: async () => { posted++; return "delivered"; },
         readRecord: async () => recentDone,
         now: () => NOW,
@@ -1659,6 +1665,105 @@ describe("correctPlanPickerVerification (watchdog owns flush settlement)", () =>
       now: () => NOW,
     })).toBe("uncorrected");
     expect({ posted, classified }).toEqual({ posted: 0, classified: 0 });
+  });
+
+  test("a buggy-build settled done is re-corrected only with full proof + live pid + recent window", async () => {
+    const settled = verifying({
+      planPickerVerificationPending: undefined,
+      planPickerSettled: true,
+      lastEvent: "done", op: "done", prio: 0, sentDone: true, ts: NOW - 1_000,
+    });
+    let current = settled;
+    const posts: Record<string, unknown>[] = [];
+    expect(shouldPlanPickerVerificationCheck(settled, NOW)).toBe(true);
+    expect(await correctPlanPickerVerification(cfg(), "/tmp/s.json", "s", settled, {
+      evidence: async () => ({ state: "pending", plan: "# Still open" }),
+      threadWaitState: async () => "notWaitingOnUserInput",
+      pidAlive: () => true,
+      readRecord: async () => current,
+      writeRecord: async (_path, next) => { current = next; },
+      post: async (body) => { posts.push(body as Record<string, unknown>); return "delivered"; },
+      now: () => NOW,
+    })).toBe("corrected");
+    expect(posts[0]).toMatchObject({ op: "update", prio: 1, attentionKind: "userInput" });
+    expect(current).toMatchObject({ lastEvent: "needsAttention", pendingPlanPicker: true, prio: 1 });
+    expect(current.planPickerSettled).toBeUndefined();
+  });
+
+  test("settled done is not re-corrected outside the window, with a dead pid, or after later progress", async () => {
+    const settled = verifying({
+      planPickerVerificationPending: undefined,
+      planPickerSettled: true,
+      lastEvent: "done", op: "done", prio: 0, sentDone: true, ts: NOW - 1_000,
+    });
+    let posts = 0;
+    let classified = 0;
+    const outside = { ...settled, ts: NOW - PLAN_PICKER_RECENT_DONE_MS - 1 };
+    expect(await correctPlanPickerVerification(cfg(), "/tmp/s.json", "s", outside, {
+      evidence: async () => { classified++; return { state: "pending", plan: "# stale" }; },
+      pidAlive: () => true,
+      post: async () => { posts++; return "delivered"; },
+      now: () => NOW,
+    })).toBe("uncorrected");
+    expect(await correctPlanPickerVerification(cfg(), "/tmp/s.json", "s", settled, {
+      evidence: async () => { classified++; return { state: "pending", plan: "# dead" }; },
+      pidAlive: () => false,
+      post: async () => { posts++; return "delivered"; },
+      now: () => NOW,
+    })).toBe("uncorrected");
+    expect(await correctPlanPickerVerification(cfg(), "/tmp/s.json", "s", settled, {
+      evidence: async () => { classified++; return { state: "resolved" }; },
+      pidAlive: () => true,
+      post: async () => { posts++; return "delivered"; },
+      now: () => NOW,
+    })).toBe("uncorrected");
+    expect({ posts, classified }).toEqual({ posts: 0, classified: 1 });
+  });
+
+  test("decision trace covers open, daemon-idle ignored, blocked settlement, and eventual TTL done", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "picker-trace-"));
+    const tracePath = join(dir, "session-trace.log");
+    const trace = (decision: PlanPickerTraceDecision) => tracePlanPickerDecision("s", decision, tracePath);
+    let current = verifying();
+    await correctPlanPickerVerification(cfg(), "/tmp/s.json", "s", current, {
+      evidence: async () => ({ state: "pending", plan: "# Trace me" }),
+      threadWaitState: async () => "notWaitingOnUserInput",
+      readRecord: async () => current,
+      writeRecord: async (_path, next) => { current = next; },
+      post: async () => "delivered",
+      now: () => NOW,
+      trace,
+    });
+    expect(current.pendingPlanPicker).toBe(true);
+    await correctResolvedPlanPicker(cfg(), "/tmp/s.json", "s", current, {
+      state: async () => "pending",
+      threadWaitState: async () => "notWaitingOnUserInput",
+      trace,
+      now: () => NOW + 5_000,
+    });
+    current = { ...current, planPickerPendingSince: NOW - PLAN_PICKER_PENDING_MAX_MS };
+    await correctResolvedPlanPicker(cfg(), "/tmp/s.json", "s", current, {
+      state: async () => { throw new Error("TTL must precede classifier"); },
+      readRecord: async () => current,
+      writeRecord: async (_path, next) => { current = next; },
+      post: async () => "delivered",
+      trace,
+      now: () => NOW,
+    });
+    const traces = (await readFile(tracePath, "utf8")).trim().split("\n")
+      .map((line) => JSON.parse(line) as Record<string, unknown>);
+    expect(traces).toContainEqual(expect.objectContaining({
+      classifier: "pending", marker: "set-pending", daemonQuery: "notWaitingOnUserInput",
+      daemonIgnored: true, settle: "blocked", correctionPosted: true,
+    }));
+    expect(traces).toContainEqual(expect.objectContaining({
+      classifier: "pending", marker: "kept", daemonIgnored: true, settle: "blocked",
+    }));
+    expect(traces).toContainEqual(expect.objectContaining({
+      classifier: "done", marker: "settled", ttlFired: true, settle: "done",
+      correctionPosted: true, doneBy: "watchdog",
+    }));
+    await rm(dir, { recursive: true, force: true });
   });
 
   test("marked ambiguity past the verification cap fails closed to a delivered done", async () => {

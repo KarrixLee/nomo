@@ -18,7 +18,6 @@
 // this (inlined into each entry) to a .mjs.
 
 import { readdir, readFile, unlink } from "node:fs/promises";
-import { appendFileSync, statSync, truncateSync } from "node:fs";
 import { hostname } from "node:os";
 import { basename } from "node:path";
 import { encryptBlob } from "./crypto";
@@ -27,10 +26,12 @@ import {
   SessionCreationSuppression, TrackedSessionLite,
 } from "./adapter";
 import {
-  AgentKind, appendFittedPlan, atomicWrite, CC_DIR, CCOp, CCStatus, codexCompanionBrokerEvidence, Config, ensureWatchdog, GONE_STRIKE_LIMIT,
+  AgentKind, appendFittedPlanAndDebug, atomicWrite, CCOp, CCStatus, codexCompanionBrokerEvidence, Config, ensureWatchdog, formatPlanPickerDebug, GONE_STRIKE_LIMIT,
   LAST_SEND_PATH, lastHookPath, loadConfig, loadPendingConfig, localApprovalsState, PENDING_STASH_PATH, PendingEventStash, pidAncestors, pidCommand, PLUGIN_VERSION, readPrefix,
-  readRecord, recordGoneStrike, removeRevokedConfig, resetGoneStrikes, SessionOrigin, SessionRecord, SESSIONS_DIR,
+  readRecord, recordGoneStrike, removeRevokedConfig, resetGoneStrikes, SessionOrigin, SessionRecord, SESSIONS_DIR, tracePlanPickerDecision, traceSession,
 } from "./shared";
+
+export { SESSION_TRACE_PATH } from "./shared";
 
 // Re-export the per-agent title/interrupt/tool-detail surface so existing importers (and cc-status's
 // `export *`, which many tests import through) keep seeing sessionTitle / codexIndexTitle / etc.
@@ -51,33 +52,6 @@ export interface OpPlan {
 const TOOL_DETAIL: Record<string, string> = { ...claudeToolDetail, ...codexToolDetail };
 
 // ---- session provenance + operational trace -------------------------------------------------
-
-/** Append-only, local-only session lifecycle trace next to config.json. Nothing here enters the
- *  encrypted blob or clear envelope. */
-export const SESSION_TRACE_PATH = `${CC_DIR}/session-trace.log`;
-const SESSION_TRACE_MAX_BYTES = 256 * 1024;
-let sessionTraceRotated = false;
-
-/** Sync one-line JSON append, matching permission-trace.log's durability/0600/best-effort contract. */
-function appendSessionTrace(path: string, event: object): void {
-  try {
-    appendFileSync(path, `${JSON.stringify({ ts: Date.now(), pid: process.pid, ...event })}\n`, { mode: 0o600 });
-  } catch { /* tracing must never surface into an agent session */ }
-}
-
-/** Rotate at most once per hook process; otherwise the trace is strictly append-only. */
-function rotateSessionTraceOnce(path: string): void {
-  if (sessionTraceRotated) return;
-  sessionTraceRotated = true;
-  try {
-    if (statSync(path).size > SESSION_TRACE_MAX_BYTES) truncateSync(path, 0);
-  } catch { /* absent/unreadable → nothing to rotate */ }
-}
-
-function traceSession(event: object): void {
-  rotateSessionTraceOnce(SESSION_TRACE_PATH);
-  appendSessionTrace(SESSION_TRACE_PATH, event);
-}
 
 /** Build the local record provenance from hook stdin plus the exact process command that invoked this
  *  hook. Exported so non-hook record creators (the Codex notify backstop) can use the same shape. */
@@ -211,8 +185,8 @@ export function transcriptStartMs(prefix: string): number | undefined {
  *  given: a mid-session `cd` changes input.cwd on every later hook, and re-deriving the label per event
  *  silently renamed the phone row / island folder chip (observed live: "api-status" → "server" after a
  *  `cd server`). Absent/empty → first event (or a recordless caller): derive from cwd as before. */
-export function buildBlob(input: Record<string, unknown>, machine: string, title: string | undefined, plan: OpPlan, agent: AgentKind = "claude", turnStartedAt?: number, pinnedLabel?: string, model?: string, at?: number, proposedPlan?: string): {
-  status: CCStatus; detail?: string; title: string; machine: string; label: string; agent?: AgentKind; turnStartedAt?: number; model?: string; at?: number; plan?: string;
+export function buildBlob(input: Record<string, unknown>, machine: string, title: string | undefined, plan: OpPlan, agent: AgentKind = "claude", turnStartedAt?: number, pinnedLabel?: string, model?: string, at?: number, proposedPlan?: string, dbgOverride?: string): {
+  status: CCStatus; detail?: string; title: string; machine: string; label: string; agent?: AgentKind; turnStartedAt?: number; model?: string; at?: number; plan?: string; dbg?: string;
 } {
   const label = typeof pinnedLabel === "string" && pinnedLabel.length > 0
     ? pinnedLabel
@@ -239,8 +213,7 @@ export function buildBlob(input: Record<string, unknown>, machine: string, title
   // for byte, `at` stays pinned at the last REAL event and the phone can age the row correctly.
   // PINNED CROSS-REPO CONTRACT: key `at`, epoch seconds. It remains after `model`; the OPTIONAL Plan
   // picker `plan` key is appended after EVERY existing key and omitted everywhere except a proven
-  // pending picker. This append-last/omit-when-unknown discipline keeps old decoders and byte vectors
-  // untouched. appendFittedPlan measures the ENTIRE sealed frame and drops `plan` before any base key.
+  // pending picker. The optional `dbg` follows `plan` LAST and is the first budget sacrifice.
   const base = {
     status: plan.status, title: title ?? "", machine, label,
     ...(detail ? { detail } : {}),
@@ -249,7 +222,14 @@ export function buildBlob(input: Record<string, unknown>, machine: string, title
     ...(typeof model === "string" && model.length > 0 ? { model } : {}),
     ...(typeof at === "number" && Number.isFinite(at) ? { at } : {}),
   };
-  return appendFittedPlan(base, proposedPlan);
+  const dbg = agent === "codex"
+    ? dbgOverride ?? formatPlanPickerDebug({
+      event: hookName || "event",
+      classifier: plan.status === "needsAttention" ? "attn" : plan.status === "working" ? "work" : "done",
+      by: "h",
+    })
+    : undefined;
+  return appendFittedPlanAndDebug(base, proposedPlan, dbg);
 }
 
 /** The wire envelope for one hook event: the blind v2 shape
@@ -263,7 +243,7 @@ export function buildBlob(input: Record<string, unknown>, machine: string, title
 export async function buildEnvelope(
   input: unknown, machine: string, now: number, title: string | undefined, e2eKey: Uint8Array, sentDone: boolean,
   agent: AgentKind = "claude", startedAt?: number, turnStartedAt?: number, pinnedLabel?: string, model?: string,
-  planOverride?: OpPlan, attentionKindOverride?: "userInput", proposedPlan?: string,
+  planOverride?: OpPlan, attentionKindOverride?: "userInput", proposedPlan?: string, dbg?: string,
 ): Promise<Record<string, unknown> | null> {
   if (typeof input !== "object" || input === null) return null;
   const i = input as Record<string, unknown>;
@@ -280,7 +260,7 @@ export async function buildEnvelope(
   // `at` is the real event time (`now`) in epoch SECONDS — the phone's honest sort/age key, frozen here
   // and re-sent verbatim by every watchdog heartbeat so an idle-but-heartbeated session ages out.
   const at = Math.floor(now / 1000);
-  const blob = await encryptBlob(e2eKey, buildBlob(i, machine, title, plan, agent, turnStartedAt, pinnedLabel, model, at, proposedPlan));
+  const blob = await encryptBlob(e2eKey, buildBlob(i, machine, title, plan, agent, turnStartedAt, pinnedLabel, model, at, proposedPlan, dbg));
   const attentionKind = attentionKindOverride ?? (
     agent === "codex" && hookName === "PreToolUse" && i.tool_name === "request_user_input"
       ? "userInput" as const
@@ -345,7 +325,7 @@ export async function trackSessionAt(
   machine: string, label: string, transcript: string, agent: AgentKind = "claude", sessionStartedAt?: number,
   turnStartedAt?: number, turnId?: string, title?: string, pairingId?: string, model?: string,
   pendingPlanPicker: boolean = false, pid: number = process.ppid, origin?: SessionOrigin,
-  planPickerVerificationPending: boolean = false,
+  planPickerVerificationPending: boolean = false, dbg?: string,
 ): Promise<void> {
   try {
     const path = `${sessionsDir}/${sessionId}.json`;
@@ -402,6 +382,7 @@ export async function trackSessionAt(
       ...(pendingPlanPicker ? { pendingPlanPicker: true } : {}),
       ...(planPickerVerificationPending ? { planPickerVerificationPending: true } : {}),
       ...(pendingPlanPicker || planPickerVerificationPending ? { planPickerPendingSince: recordedAt } : {}),
+      ...(typeof dbg === "string" && dbg.length > 0 ? { dbg } : {}),
       ...(origin ? { origin } : {}),
     };
     // Owner-only (0600): the record carries hostname, cwd basename, the session pid, and the ABSOLUTE
@@ -419,13 +400,13 @@ export async function trackSession(
   machine: string, label: string, transcript: string, agent: AgentKind = "claude", sessionStartedAt?: number,
   turnStartedAt?: number, turnId?: string, title?: string, pairingId?: string, model?: string,
   pendingPlanPicker: boolean = false, pid: number = process.ppid, origin?: SessionOrigin,
-  planPickerVerificationPending: boolean = false,
+  planPickerVerificationPending: boolean = false, dbg?: string,
 ): Promise<void> {
   return trackSessionAt(
     SESSIONS_DIR,
     sessionId, op, prio, status, blob, machine, label, transcript, agent, sessionStartedAt,
     turnStartedAt, turnId, title, pairingId, model, pendingPlanPicker, pid, origin,
-    planPickerVerificationPending,
+    planPickerVerificationPending, dbg,
   );
 }
 
@@ -839,11 +820,13 @@ export async function runHook(agent: AgentKind): Promise<void> {
     let planPickerVerificationPending = false;
     let attentionKind: "userInput" | undefined;
     let proposedPlan: string | undefined;
+    let pickerClassifier = plan.op === "done" ? "none" : plan.status;
     if (plan.op === "done" && adapter.completedTurnWaitState) {
       const evidence = adapter.completedTurnWaitEvidence
         ? await adapter.completedTurnWaitEvidence({ pid: hookPid, transcriptPath })
         : { state: await adapter.completedTurnWaitState({ pid: hookPid, transcriptPath }) };
       const wait = evidence.state;
+      pickerClassifier = wait;
       if (wait === "pending") {
         plan = { op: "update", prio: 1, status: "needsAttention" };
         attentionKind = "userInput";
@@ -864,7 +847,14 @@ export async function runHook(agent: AgentKind): Promise<void> {
     const label = typeof existingRecord?.label === "string" && existingRecord.label.length > 0
       ? existingRecord.label
       : typeof input.cwd === "string" && input.cwd.length > 0 ? basename(input.cwd) : "session";
-    const envelope = await buildEnvelope(eventInput, machine, Date.now(), title, config.e2eKey, sentDone, agent, startedAt, turnStartedAt, label, model, plan, attentionKind, proposedPlan);
+    const dbg = agent === "codex" ? formatPlanPickerDebug({
+      event: hookName || "event",
+      classifier: pickerClassifier,
+      marker: pendingPlanPicker ? "p" : planPickerVerificationPending ? "v" : "0",
+      ttl: pendingPlanPicker || planPickerVerificationPending ? "0m" : "-",
+      by: "h",
+    }) : undefined;
+    const envelope = await buildEnvelope(eventInput, machine, Date.now(), title, config.e2eKey, sentDone, agent, startedAt, turnStartedAt, label, model, plan, attentionKind, proposedPlan, dbg);
     if (!envelope) return;
 
     // Record (or, on op:end, remove) this session's file and make sure the liveness watchdog is
@@ -884,7 +874,18 @@ export async function runHook(agent: AgentKind): Promise<void> {
       ? (existingRecord!.transcript ?? transcriptPath)
       : transcriptPath;
     await trackSession(sessionId, plan.op, plan.prio, plan.status, envelope.blob as string | undefined, machine, label, recordTranscript, agent, startedAt, turnStartedAt, turnId,
-      title, config.pairingId, model, pendingPlanPicker, recordPid, origin, planPickerVerificationPending);
+      title, config.pairingId, model, pendingPlanPicker, recordPid, origin, planPickerVerificationPending, dbg);
+    const clearedPickerMarker = pendingPlanPicker === false && planPickerVerificationPending === false
+      && (existingRecord?.pendingPlanPicker === true || existingRecord?.planPickerVerificationPending === true || existingRecord?.planPickerSettled === true);
+    if (agent === "codex" && (hookName === "Stop" || pendingPlanPicker || planPickerVerificationPending || clearedPickerMarker)) {
+      tracePlanPickerDecision(sessionId, {
+        source: "hook",
+        classifier: pickerClassifier,
+        marker: pendingPlanPicker ? "set-pending" : planPickerVerificationPending ? "set-verification" : clearedPickerMarker ? "cleared" : "none",
+        correctionPosted: false,
+        ...(plan.op === "done" ? { doneBy: "hook" as const } : {}),
+      });
+    }
     if (createsRecord) {
       traceSession({
         event: "create",

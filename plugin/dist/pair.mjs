@@ -9,7 +9,7 @@ import { fileURLToPath as fileURLToPath2 } from "node:url";
 
 // src/core/shared.ts
 import { access, chmod, open, readFile, rename, stat, mkdir, unlink, writeFile } from "node:fs/promises";
-import { existsSync, readFileSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync, statSync, truncateSync } from "node:fs";
 import { execFileSync, spawn } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -88,8 +88,49 @@ async function sha256Hex(s) {
 }
 
 // src/core/shared.ts
-var PLUGIN_VERSION = "1.4.9";
+var PLUGIN_VERSION = "1.4.10";
+var DBG_BLOB_TEXT_MAX_CHARS = 200;
+function debugToken(value) {
+  if (value === "-")
+    return "-";
+  return value.toLowerCase().replace(/[^a-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "") || "na";
+}
+function formatPlanPickerDebug(input) {
+  const value = `${debugToken(input.version ?? PLUGIN_VERSION)} ev:${debugToken(input.event)} cls:${debugToken(input.classifier)} mk:${input.marker ?? "0"} dq:${input.daemon ?? "na"}(${input.daemonDisposition ?? "na"}) ttl:${debugToken(input.ttl ?? "-")} by:${input.by}`;
+  return Array.from(value).slice(0, DBG_BLOB_TEXT_MAX_CHARS).join("");
+}
 var CC_DIR = `${process.env.HOME}/.config/cc-status`;
+var SESSION_TRACE_PATH = `${CC_DIR}/session-trace.log`;
+var SESSION_TRACE_MAX_BYTES = 256 * 1024;
+var sessionTraceRotated = false;
+function traceSession(event, path = SESSION_TRACE_PATH) {
+  try {
+    if (!sessionTraceRotated) {
+      sessionTraceRotated = true;
+      try {
+        if (statSync(path).size > SESSION_TRACE_MAX_BYTES)
+          truncateSync(path, 0);
+      } catch {}
+    }
+    appendFileSync(path, `${JSON.stringify({ ts: Date.now(), pid: process.pid, ...event })}
+`, { mode: 384 });
+  } catch {}
+}
+function tracePlanPickerDecision(sessionId, decision, path) {
+  traceSession({
+    event: "plan-picker",
+    sessionId,
+    source: decision.source,
+    classifier: decision.classifier,
+    marker: decision.marker,
+    daemonQuery: decision.daemonQuery ?? "not-queried",
+    daemonIgnored: decision.daemonIgnored ?? false,
+    ttlFired: decision.ttlFired ?? false,
+    settle: decision.settle ?? "none",
+    correctionPosted: decision.correctionPosted ?? false,
+    doneBy: decision.doneBy ?? null
+  }, path);
+}
 var SESSIONS_DIR = `${CC_DIR}/sessions`;
 var WATCHDOG_PID_PATH = `${CC_DIR}/watchdog.pid`;
 var LAST_SEND_PATH = `${CC_DIR}/last-send`;
@@ -125,6 +166,15 @@ function appendFittedPlan(base, plan) {
       hi = mid - 1;
   }
   return { ...base, plan: chars.slice(0, lo).join("") + marker };
+}
+function appendFittedPlanAndDebug(base, plan, dbg) {
+  const withPlan = appendFittedPlan(base, plan);
+  if (typeof dbg !== "string" || dbg.length === 0)
+    return withPlan;
+  const capped = Array.from(dbg).slice(0, DBG_BLOB_TEXT_MAX_CHARS).join("");
+  const encoder = new TextEncoder;
+  const withDebug = { ...withPlan, dbg: capped };
+  return sealedBlobChars(encoder.encode(JSON.stringify(withDebug)).length) <= BLOB_FIT_CHARS ? withDebug : withPlan;
 }
 async function flagExists(path) {
   try {

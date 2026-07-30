@@ -9,7 +9,6 @@ import { basename as basename3, isAbsolute, relative, resolve } from "node:path"
 
 // src/core/hook.ts
 import { readdir as readdir2, readFile as readFile3, unlink as unlink2 } from "node:fs/promises";
-import { appendFileSync, statSync, truncateSync } from "node:fs";
 import { hostname } from "node:os";
 import { basename as basename2 } from "node:path";
 
@@ -94,12 +93,53 @@ import { basename, join as join2 } from "node:path";
 
 // src/core/shared.ts
 import { access, chmod, open, readFile, rename, stat, mkdir, unlink, writeFile } from "node:fs/promises";
-import { existsSync, readFileSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync, statSync, truncateSync } from "node:fs";
 import { execFileSync, spawn } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "1.4.9";
+var PLUGIN_VERSION = "1.4.10";
+var DBG_BLOB_TEXT_MAX_CHARS = 200;
+function debugToken(value) {
+  if (value === "-")
+    return "-";
+  return value.toLowerCase().replace(/[^a-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "") || "na";
+}
+function formatPlanPickerDebug(input) {
+  const value = `${debugToken(input.version ?? PLUGIN_VERSION)} ev:${debugToken(input.event)} cls:${debugToken(input.classifier)} mk:${input.marker ?? "0"} dq:${input.daemon ?? "na"}(${input.daemonDisposition ?? "na"}) ttl:${debugToken(input.ttl ?? "-")} by:${input.by}`;
+  return Array.from(value).slice(0, DBG_BLOB_TEXT_MAX_CHARS).join("");
+}
 var CC_DIR = `${process.env.HOME}/.config/cc-status`;
+var SESSION_TRACE_PATH = `${CC_DIR}/session-trace.log`;
+var SESSION_TRACE_MAX_BYTES = 256 * 1024;
+var sessionTraceRotated = false;
+function traceSession(event, path = SESSION_TRACE_PATH) {
+  try {
+    if (!sessionTraceRotated) {
+      sessionTraceRotated = true;
+      try {
+        if (statSync(path).size > SESSION_TRACE_MAX_BYTES)
+          truncateSync(path, 0);
+      } catch {}
+    }
+    appendFileSync(path, `${JSON.stringify({ ts: Date.now(), pid: process.pid, ...event })}
+`, { mode: 384 });
+  } catch {}
+}
+function tracePlanPickerDecision(sessionId, decision, path) {
+  traceSession({
+    event: "plan-picker",
+    sessionId,
+    source: decision.source,
+    classifier: decision.classifier,
+    marker: decision.marker,
+    daemonQuery: decision.daemonQuery ?? "not-queried",
+    daemonIgnored: decision.daemonIgnored ?? false,
+    ttlFired: decision.ttlFired ?? false,
+    settle: decision.settle ?? "none",
+    correctionPosted: decision.correctionPosted ?? false,
+    doneBy: decision.doneBy ?? null
+  }, path);
+}
 var SESSIONS_DIR = `${CC_DIR}/sessions`;
 var WATCHDOG_PID_PATH = `${CC_DIR}/watchdog.pid`;
 var LAST_SEND_PATH = `${CC_DIR}/last-send`;
@@ -135,6 +175,15 @@ function appendFittedPlan(base, plan) {
       hi = mid - 1;
   }
   return { ...base, plan: chars.slice(0, lo).join("") + marker };
+}
+function appendFittedPlanAndDebug(base, plan, dbg) {
+  const withPlan = appendFittedPlan(base, plan);
+  if (typeof dbg !== "string" || dbg.length === 0)
+    return withPlan;
+  const capped = Array.from(dbg).slice(0, DBG_BLOB_TEXT_MAX_CHARS).join("");
+  const encoder = new TextEncoder;
+  const withDebug = { ...withPlan, dbg: capped };
+  return sealedBlobChars(encoder.encode(JSON.stringify(withDebug)).length) <= BLOB_FIT_CHARS ? withDebug : withPlan;
 }
 async function flagExists(path) {
   try {
@@ -1695,28 +1744,6 @@ var allAdapters = [claudeAdapter, codexAdapter];
 
 // src/core/hook.ts
 var TOOL_DETAIL = { ...claudeToolDetail, ...codexToolDetail };
-var SESSION_TRACE_PATH = `${CC_DIR}/session-trace.log`;
-var SESSION_TRACE_MAX_BYTES = 256 * 1024;
-var sessionTraceRotated = false;
-function appendSessionTrace(path, event) {
-  try {
-    appendFileSync(path, `${JSON.stringify({ ts: Date.now(), pid: process.pid, ...event })}
-`, { mode: 384 });
-  } catch {}
-}
-function rotateSessionTraceOnce(path) {
-  if (sessionTraceRotated)
-    return;
-  sessionTraceRotated = true;
-  try {
-    if (statSync(path).size > SESSION_TRACE_MAX_BYTES)
-      truncateSync(path, 0);
-  } catch {}
-}
-function traceSession(event) {
-  rotateSessionTraceOnce(SESSION_TRACE_PATH);
-  appendSessionTrace(SESSION_TRACE_PATH, event);
-}
 function sessionOrigin(input, ppid = process.ppid, command = pidCommand(ppid)) {
   const stringField = (key) => typeof input[key] === "string" && input[key].length > 0 ? input[key] : undefined;
   return {
@@ -1793,7 +1820,7 @@ function transcriptStartMs(prefix) {
   }
   return;
 }
-function buildBlob(input, machine, title, plan, agent = "claude", turnStartedAt, pinnedLabel, model, at, proposedPlan) {
+function buildBlob(input, machine, title, plan, agent = "claude", turnStartedAt, pinnedLabel, model, at, proposedPlan, dbgOverride) {
   const label = typeof pinnedLabel === "string" && pinnedLabel.length > 0 ? pinnedLabel : typeof input.cwd === "string" && input.cwd.length > 0 ? basename2(input.cwd) : "session";
   const hookName = typeof input.hook_event_name === "string" ? input.hook_event_name : "";
   const detail = detailForHook(hookName, typeof input.tool_name === "string" ? input.tool_name : undefined, input.tool_input);
@@ -1808,9 +1835,14 @@ function buildBlob(input, machine, title, plan, agent = "claude", turnStartedAt,
     ...typeof model === "string" && model.length > 0 ? { model } : {},
     ...typeof at === "number" && Number.isFinite(at) ? { at } : {}
   };
-  return appendFittedPlan(base, proposedPlan);
+  const dbg = agent === "codex" ? dbgOverride ?? formatPlanPickerDebug({
+    event: hookName || "event",
+    classifier: plan.status === "needsAttention" ? "attn" : plan.status === "working" ? "work" : "done",
+    by: "h"
+  }) : undefined;
+  return appendFittedPlanAndDebug(base, proposedPlan, dbg);
 }
-async function buildEnvelope(input, machine, now, title, e2eKey, sentDone, agent = "claude", startedAt, turnStartedAt, pinnedLabel, model, planOverride, attentionKindOverride, proposedPlan) {
+async function buildEnvelope(input, machine, now, title, e2eKey, sentDone, agent = "claude", startedAt, turnStartedAt, pinnedLabel, model, planOverride, attentionKindOverride, proposedPlan, dbg) {
   if (typeof input !== "object" || input === null)
     return null;
   const i = input;
@@ -1824,7 +1856,7 @@ async function buildEnvelope(input, machine, now, title, e2eKey, sentDone, agent
   if (typeof startedAt === "number" && Number.isFinite(startedAt))
     base.startedAt = startedAt;
   const at = Math.floor(now / 1000);
-  const blob = await encryptBlob(e2eKey, buildBlob(i, machine, title, plan, agent, turnStartedAt, pinnedLabel, model, at, proposedPlan));
+  const blob = await encryptBlob(e2eKey, buildBlob(i, machine, title, plan, agent, turnStartedAt, pinnedLabel, model, at, proposedPlan, dbg));
   const attentionKind = attentionKindOverride ?? (agent === "codex" && hookName === "PreToolUse" && i.tool_name === "request_user_input" ? "userInput" : undefined);
   return { ...base, ...attentionKind ? { attentionKind } : {}, blob };
 }
@@ -1847,7 +1879,7 @@ async function stashPendingEvent(input, machine, title, now, stashPath = PENDING
     await atomicWrite(stashPath, JSON.stringify(stash), 384);
   } catch {}
 }
-async function trackSessionAt(sessionsDir, sessionId, op, prio, status, blob, machine, label, transcript, agent = "claude", sessionStartedAt, turnStartedAt, turnId, title, pairingId, model, pendingPlanPicker = false, pid = process.ppid, origin, planPickerVerificationPending = false) {
+async function trackSessionAt(sessionsDir, sessionId, op, prio, status, blob, machine, label, transcript, agent = "claude", sessionStartedAt, turnStartedAt, turnId, title, pairingId, model, pendingPlanPicker = false, pid = process.ppid, origin, planPickerVerificationPending = false, dbg) {
   try {
     const path = `${sessionsDir}/${sessionId}.json`;
     if (op === "end") {
@@ -1877,13 +1909,14 @@ async function trackSessionAt(sessionsDir, sessionId, op, prio, status, blob, ma
       ...pendingPlanPicker ? { pendingPlanPicker: true } : {},
       ...planPickerVerificationPending ? { planPickerVerificationPending: true } : {},
       ...pendingPlanPicker || planPickerVerificationPending ? { planPickerPendingSince: recordedAt } : {},
+      ...typeof dbg === "string" && dbg.length > 0 ? { dbg } : {},
       ...origin ? { origin } : {}
     };
     await atomicWrite(path, JSON.stringify(record), 384);
   } catch {}
 }
-async function trackSession(sessionId, op, prio, status, blob, machine, label, transcript, agent = "claude", sessionStartedAt, turnStartedAt, turnId, title, pairingId, model, pendingPlanPicker = false, pid = process.ppid, origin, planPickerVerificationPending = false) {
-  return trackSessionAt(SESSIONS_DIR, sessionId, op, prio, status, blob, machine, label, transcript, agent, sessionStartedAt, turnStartedAt, turnId, title, pairingId, model, pendingPlanPicker, pid, origin, planPickerVerificationPending);
+async function trackSession(sessionId, op, prio, status, blob, machine, label, transcript, agent = "claude", sessionStartedAt, turnStartedAt, turnId, title, pairingId, model, pendingPlanPicker = false, pid = process.ppid, origin, planPickerVerificationPending = false, dbg) {
+  return trackSessionAt(SESSIONS_DIR, sessionId, op, prio, status, blob, machine, label, transcript, agent, sessionStartedAt, turnStartedAt, turnId, title, pairingId, model, pendingPlanPicker, pid, origin, planPickerVerificationPending, dbg);
 }
 async function markDoneDeliveredAt(sessionsDir, sessionId) {
   try {
@@ -2140,9 +2173,11 @@ async function runHook(agent) {
     let planPickerVerificationPending = false;
     let attentionKind;
     let proposedPlan;
+    let pickerClassifier = plan.op === "done" ? "none" : plan.status;
     if (plan.op === "done" && adapter2.completedTurnWaitState) {
       const evidence = adapter2.completedTurnWaitEvidence ? await adapter2.completedTurnWaitEvidence({ pid: hookPid, transcriptPath }) : { state: await adapter2.completedTurnWaitState({ pid: hookPid, transcriptPath }) };
       const wait = evidence.state;
+      pickerClassifier = wait;
       if (wait === "pending") {
         plan = { op: "update", prio: 1, status: "needsAttention" };
         attentionKind = "userInput";
@@ -2154,7 +2189,14 @@ async function runHook(agent) {
       }
     }
     const label = typeof existingRecord?.label === "string" && existingRecord.label.length > 0 ? existingRecord.label : typeof input.cwd === "string" && input.cwd.length > 0 ? basename2(input.cwd) : "session";
-    const envelope = await buildEnvelope(eventInput, machine, Date.now(), title, config.e2eKey, sentDone, agent, startedAt, turnStartedAt, label, model, plan, attentionKind, proposedPlan);
+    const dbg = agent === "codex" ? formatPlanPickerDebug({
+      event: hookName || "event",
+      classifier: pickerClassifier,
+      marker: pendingPlanPicker ? "p" : planPickerVerificationPending ? "v" : "0",
+      ttl: pendingPlanPicker || planPickerVerificationPending ? "0m" : "-",
+      by: "h"
+    }) : undefined;
+    const envelope = await buildEnvelope(eventInput, machine, Date.now(), title, config.e2eKey, sentDone, agent, startedAt, turnStartedAt, label, model, plan, attentionKind, proposedPlan, dbg);
     if (!envelope)
       return;
     const createsRecord = !existingRecord && plan.op !== "end";
@@ -2162,7 +2204,17 @@ async function runHook(agent) {
     const origin = existingRecord?.origin ?? sessionOrigin(input, hookPid, hookCommand);
     const recordPid = reusedForkPredecessor ? existingRecord.pid : hookPid;
     const recordTranscript = reusedForkPredecessor ? existingRecord.transcript ?? transcriptPath : transcriptPath;
-    await trackSession(sessionId, plan.op, plan.prio, plan.status, envelope.blob, machine, label, recordTranscript, agent, startedAt, turnStartedAt, turnId, title, config.pairingId, model, pendingPlanPicker, recordPid, origin, planPickerVerificationPending);
+    await trackSession(sessionId, plan.op, plan.prio, plan.status, envelope.blob, machine, label, recordTranscript, agent, startedAt, turnStartedAt, turnId, title, config.pairingId, model, pendingPlanPicker, recordPid, origin, planPickerVerificationPending, dbg);
+    const clearedPickerMarker = pendingPlanPicker === false && planPickerVerificationPending === false && (existingRecord?.pendingPlanPicker === true || existingRecord?.planPickerVerificationPending === true || existingRecord?.planPickerSettled === true);
+    if (agent === "codex" && (hookName === "Stop" || pendingPlanPicker || planPickerVerificationPending || clearedPickerMarker)) {
+      tracePlanPickerDecision(sessionId, {
+        source: "hook",
+        classifier: pickerClassifier,
+        marker: pendingPlanPicker ? "set-pending" : planPickerVerificationPending ? "set-verification" : clearedPickerMarker ? "cleared" : "none",
+        correctionPosted: false,
+        ...plan.op === "done" ? { doneBy: "hook" } : {}
+      });
+    }
     if (createsRecord) {
       traceSession({
         event: "create",
