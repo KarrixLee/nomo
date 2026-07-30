@@ -342,6 +342,7 @@ export async function trackSession(
   machine: string, label: string, transcript: string, agent: AgentKind = "claude", sessionStartedAt?: number,
   turnStartedAt?: number, turnId?: string, title?: string, pairingId?: string, model?: string,
   pendingPlanPicker: boolean = false, pid: number = process.ppid, origin?: SessionOrigin,
+  planPickerVerificationPending: boolean = false,
 ): Promise<void> {
   try {
     const path = `${SESSIONS_DIR}/${sessionId}.json`;
@@ -395,6 +396,7 @@ export async function trackSession(
       // sealed it is still the live one — otherwise the phone renders an undecryptable ghost forever.
       ...(typeof pairingId === "string" && pairingId.length > 0 ? { pairingId } : {}),
       ...(pendingPlanPicker ? { pendingPlanPicker: true } : {}),
+      ...(planPickerVerificationPending ? { planPickerVerificationPending: true } : {}),
       ...(origin ? { origin } : {}),
     };
     // Owner-only (0600): the record carries hostname, cwd basename, the session pid, and the ABSOLUTE
@@ -783,15 +785,19 @@ export async function runHook(agent: AgentKind): Promise<void> {
     // adapter owns that agent-specific proof. Today Codex uses it for the hookless TUI Plan picker:
     // keep the session in the attention queue instead of letting a Stop lie that it is done.
     let pendingPlanPicker = false;
+    let planPickerVerificationPending = false;
     let attentionKind: "userInput" | undefined;
     if (plan.op === "done" && adapter.completedTurnWaitState) {
-      const finalAssistantMessage = typeof input.last_assistant_message === "string"
-        ? input.last_assistant_message : undefined;
-      const wait = await adapter.completedTurnWaitState({ pid: hookPid, transcriptPath, finalAssistantMessage });
+      const wait = await adapter.completedTurnWaitState({ pid: hookPid, transcriptPath });
       if (wait === "pending") {
         plan = { op: "update", prio: 1, status: "needsAttention" };
         attentionKind = "userInput";
         pendingPlanPicker = true;
+      } else if (wait === "incomplete") {
+        // Do not guess done and do not sleep inside a short-lived hook. Preserve the current working
+        // wire state and leave a durable marker for the long-lived watchdog to settle after flush.
+        plan = { op: "update", prio: 0, status: "working" };
+        planPickerVerificationPending = true;
       }
     }
     // Pin the label to the session's FIRST-SEEN cwd: a mid-session `cd` changes input.cwd on every
@@ -822,7 +828,7 @@ export async function runHook(agent: AgentKind): Promise<void> {
       ? (existingRecord!.transcript ?? transcriptPath)
       : transcriptPath;
     await trackSession(sessionId, plan.op, plan.prio, plan.status, envelope.blob as string | undefined, machine, label, recordTranscript, agent, startedAt, turnStartedAt, turnId,
-      title, config.pairingId, model, pendingPlanPicker, recordPid, origin);
+      title, config.pairingId, model, pendingPlanPicker, recordPid, origin, planPickerVerificationPending);
     if (createsRecord) {
       traceSession({
         event: "create",

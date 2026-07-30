@@ -11,9 +11,10 @@
 // through the SAME shared pipeline the hooks use (buildEnvelope → trackSession → POST). It reuses the
 // exported pieces of hook.ts + the codex adapter rather than runHook (which reads stdin).
 //
-// DEDUPE: if the session record already shows a sent Stop (sentDone), the hooks ARE working for this
-// turn — exit silently, never double-send. With NO record (hooks never fired at all), send a best-
-// effort done anyway. Contract, like the hooks: NOTHING on stdout, exit 0 always, 2-second net ceiling.
+// DEDUPE: if the session record already shows a sent Stop (sentDone), or Stop delegated an incomplete
+// Plan completion to the watchdog, the hooks ARE working for this turn — exit silently, never race
+// their decision. With NO record (hooks never fired at all), send a best-effort completion anyway.
+// Contract, like the hooks: NOTHING on stdout, exit 0 always, 2-second net ceiling.
 //
 // PORTABILITY: bun AND node >= 18 — no `Bun.*` APIs; build.ts bundles this to dist/codex-notify.mjs,
 // invoked via plugin/scripts/notify-chain.sh (which also chains any pre-existing notify program).
@@ -101,7 +102,7 @@ export async function runNotify(raw: string, deferMs = notifyDeferMs(), sleep: (
     // DEDUPE: a record showing a sent Stop means the hooks already delivered this turn's done — the
     // backstop must not double-send. (sentDone is set only by an op:done and cleared by the next
     // start/update, so it's true iff the last POSTed event for this session was a done.)
-    if (record?.sentDone === true) return;
+    if (record?.sentDone === true || record?.planPickerVerificationPending === true) return;
 
     // DEFERRAL BACKSTOP: on a healthy machine the Stop hook fires concurrently and writes sentDone LATE
     // (after transcript reads + encryption), so notify would otherwise win the race and double-send.
@@ -111,7 +112,7 @@ export async function runNotify(raw: string, deferMs = notifyDeferMs(), sleep: (
     if (deferMs > 0) {
       await sleep(deferMs);
       const after = await readRecord(sessionId);
-      if (after?.sentDone === true) return; // the Stop hook delivered this turn's done during the wait
+      if (after?.sentDone === true || after?.planPickerVerificationPending === true) return;
       if (after?.turnId && payloadTurnId && after.turnId !== payloadTurnId) return; // turn advanced under us
       // Keep the freshest same-turn anchors/pid/transcript. In particular, a concurrently-firing Stop
       // may have created the first record as a Plan-picker attention update (sentDone stays false).
@@ -140,12 +141,13 @@ export async function runNotify(raw: string, deferMs = notifyDeferMs(), sleep: (
     // rollout; with no record this remains best-effort through the notify process's pid locator.
     const sessionPid = typeof record?.pid === "number" && Number.isFinite(record.pid) ? record.pid : process.ppid;
     const transcriptPath = typeof record?.transcript === "string" ? record.transcript : "";
-    const finalAssistantMessage = typeof input.last_assistant_message === "string"
-      ? input.last_assistant_message : undefined;
-    const wait = await codexAdapter.completedTurnWaitState?.({ pid: sessionPid, transcriptPath, finalAssistantMessage });
+    const wait = await codexAdapter.completedTurnWaitState?.({ pid: sessionPid, transcriptPath });
     const pendingPlanPicker = wait === "pending";
+    const planPickerVerificationPending = wait === "incomplete";
     const plan = pendingPlanPicker
       ? { op: "update" as const, prio: 1 as const, status: "needsAttention" as const }
+      : planPickerVerificationPending
+        ? { op: "update" as const, prio: 0 as const, status: "working" as const }
       : { op: "done" as const, prio: 0 as const, status: "done" as const };
     const attentionKind = pendingPlanPicker ? "userInput" as const : undefined;
     const envelope = await buildEnvelope(input, machine, now, title, config.e2eKey, false, "codex", startedAt, turnStartedAt, undefined, model, plan, attentionKind);
@@ -155,7 +157,8 @@ export async function runNotify(raw: string, deferMs = notifyDeferMs(), sleep: (
     await trackSession(sessionId, plan.op, plan.prio, plan.status, envelope.blob as string | undefined, machine, label,
       transcriptPath, "codex", startedAt, turnStartedAt, payloadTurnId,
       title ?? record?.title, config.pairingId, model, pendingPlanPicker, sessionPid,
-      record?.origin ?? sessionOrigin(input, sessionPid, pidCommand(sessionPid)));
+      record?.origin ?? sessionOrigin(input, sessionPid, pidCommand(sessionPid)),
+      planPickerVerificationPending);
     ensureWatchdog();
 
     const res = await fetch(`${config.url}/v1/cc/event`, {

@@ -92,7 +92,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { execFileSync, spawn } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "1.4.6";
+var PLUGIN_VERSION = "1.4.7";
 var CC_DIR = `${process.env.HOME}/.config/cc-status`;
 var SESSIONS_DIR = `${CC_DIR}/sessions`;
 var WATCHDOG_PID_PATH = `${CC_DIR}/watchdog.pid`;
@@ -1297,7 +1297,6 @@ async function codexPidTurnActive(pid, deps = {}) {
     return false;
   }
 }
-var CODEX_PLAN_PICKER_FLUSH_GRACE_MS = 3000;
 async function codexPidPlanPickerAnalysis(pid, deps) {
   try {
     if (!(deps.isAlive ?? pidAlive)(pid))
@@ -1306,24 +1305,16 @@ async function codexPidPlanPickerAnalysis(pid, deps) {
     if (!rollout)
       return { state: "unknown", incompleteFinalPlan: false };
     const tail = await (deps.readTail ?? readSuffix)(rollout, PLAN_PICKER_TAIL_BYTES);
-    return codexPlanPickerTailAnalysis(tail);
+    const analysis = codexPlanPickerTailAnalysis(tail);
+    return {
+      state: analysis.incompleteFinalPlan ? "incomplete" : analysis.state,
+      incompleteFinalPlan: analysis.incompleteFinalPlan
+    };
   } catch {
     return { state: "unknown", incompleteFinalPlan: false };
   }
 }
 async function codexPidPlanPickerState(pid, deps = {}) {
-  return (await codexPidPlanPickerAnalysis(pid, deps)).state;
-}
-async function codexSettledPlanPickerState(pid, finalAssistantMessage, deps = {}) {
-  const first = await codexPidPlanPickerAnalysis(pid, deps);
-  if (first.state === "pending" || first.state === "resolved" || first.state === "exited")
-    return first.state;
-  if (!first.incompleteFinalPlan && !codexProposedPlanText(finalAssistantMessage))
-    return first.state;
-  const delay = deps.flushGraceMs ?? CODEX_PLAN_PICKER_FLUSH_GRACE_MS;
-  if (delay > 0) {
-    await (deps.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms))))(delay);
-  }
   return (await codexPidPlanPickerAnalysis(pid, deps)).state;
 }
 function codexSentinelSessionId(pid) {
@@ -1583,8 +1574,8 @@ var codexAdapter = {
   tailPendingAttentionKind(tail) {
     return codexTailPendingAttentionKind(tail);
   },
-  completedTurnWaitState({ pid, transcriptPath, finalAssistantMessage }) {
-    return codexSettledPlanPickerState(pid, finalAssistantMessage, transcriptPath ? { rolloutOf: async () => transcriptPath } : {});
+  completedTurnWaitState({ pid, transcriptPath }) {
+    return codexPidPlanPickerState(pid, transcriptPath ? { rolloutOf: async () => transcriptPath } : {});
   },
   isChildSessionGhost({ sessionId, prefix, hookPid, tracked }) {
     return codexChildSessionGhost(sessionId, prefix, hookPid, tracked);
@@ -2643,7 +2634,7 @@ async function stashPendingEvent(input, machine, title, now, stashPath = PENDING
     await atomicWrite(stashPath, JSON.stringify(stash), 384);
   } catch {}
 }
-async function trackSession(sessionId, op, prio, status, blob, machine, label, transcript, agent = "claude", sessionStartedAt, turnStartedAt, turnId, title, pairingId, model, pendingPlanPicker = false, pid = process.ppid, origin) {
+async function trackSession(sessionId, op, prio, status, blob, machine, label, transcript, agent = "claude", sessionStartedAt, turnStartedAt, turnId, title, pairingId, model, pendingPlanPicker = false, pid = process.ppid, origin, planPickerVerificationPending = false) {
   try {
     const path = `${SESSIONS_DIR}/${sessionId}.json`;
     if (op === "end") {
@@ -2670,6 +2661,7 @@ async function trackSession(sessionId, op, prio, status, blob, machine, label, t
       ...typeof model === "string" && model.length > 0 ? { model } : {},
       ...typeof pairingId === "string" && pairingId.length > 0 ? { pairingId } : {},
       ...pendingPlanPicker ? { pendingPlanPicker: true } : {},
+      ...planPickerVerificationPending ? { planPickerVerificationPending: true } : {},
       ...origin ? { origin } : {}
     };
     await atomicWrite(path, JSON.stringify(record), 384);
@@ -2909,14 +2901,17 @@ async function runHook(agent) {
     if (!plan)
       return;
     let pendingPlanPicker = false;
+    let planPickerVerificationPending = false;
     let attentionKind;
     if (plan.op === "done" && adapter2.completedTurnWaitState) {
-      const finalAssistantMessage = typeof input.last_assistant_message === "string" ? input.last_assistant_message : undefined;
-      const wait = await adapter2.completedTurnWaitState({ pid: hookPid, transcriptPath, finalAssistantMessage });
+      const wait = await adapter2.completedTurnWaitState({ pid: hookPid, transcriptPath });
       if (wait === "pending") {
         plan = { op: "update", prio: 1, status: "needsAttention" };
         attentionKind = "userInput";
         pendingPlanPicker = true;
+      } else if (wait === "incomplete") {
+        plan = { op: "update", prio: 0, status: "working" };
+        planPickerVerificationPending = true;
       }
     }
     const label = typeof existingRecord?.label === "string" && existingRecord.label.length > 0 ? existingRecord.label : typeof input.cwd === "string" && input.cwd.length > 0 ? basename2(input.cwd) : "session";
@@ -2928,7 +2923,7 @@ async function runHook(agent) {
     const origin = existingRecord?.origin ?? sessionOrigin(input, hookPid, hookCommand);
     const recordPid = reusedForkPredecessor ? existingRecord.pid : hookPid;
     const recordTranscript = reusedForkPredecessor ? existingRecord.transcript ?? transcriptPath : transcriptPath;
-    await trackSession(sessionId, plan.op, plan.prio, plan.status, envelope.blob, machine, label, recordTranscript, agent, startedAt, turnStartedAt, turnId, title, config.pairingId, model, pendingPlanPicker, recordPid, origin);
+    await trackSession(sessionId, plan.op, plan.prio, plan.status, envelope.blob, machine, label, recordTranscript, agent, startedAt, turnStartedAt, turnId, title, config.pairingId, model, pendingPlanPicker, recordPid, origin, planPickerVerificationPending);
     if (createsRecord) {
       traceSession({
         event: "create",
@@ -4267,6 +4262,118 @@ async function correctResolvedPlanPicker(config, path, sessionId, record, deps =
     return "uncorrected";
   }
 }
+var PLAN_PICKER_VERIFY_MAX_MS = 30000;
+var PLAN_PICKER_RECENT_DONE_MS = 30 * 60000;
+function shouldPlanPickerVerificationCheck(record, now) {
+  if (record.agent !== "codex" || record.provisional === true)
+    return false;
+  if (typeof record.transcript !== "string" || record.transcript.length === 0)
+    return false;
+  if (record.planPickerVerificationPending === true)
+    return true;
+  if (record.op !== "done" || record.lastEvent !== "done" || record.sentDone !== true)
+    return false;
+  if (typeof record.ts !== "number" || !Number.isFinite(record.ts))
+    return false;
+  const age = now - record.ts;
+  return age >= 0 && age <= PLAN_PICKER_RECENT_DONE_MS;
+}
+async function correctPlanPickerVerification(config, path, sessionId, record, deps = {}) {
+  try {
+    const now = (deps.now ?? Date.now)();
+    if (!shouldPlanPickerVerificationCheck(record, now))
+      return "uncorrected";
+    const state = await (deps.state ?? (() => codexAdapter.completedTurnWaitState({
+      pid: record.pid,
+      transcriptPath: record.transcript
+    })))();
+    const readCurrent = deps.readRecord ?? readRecordAt;
+    const writeRecord = deps.writeRecord ?? ((p, rec) => atomicWrite(p, JSON.stringify(rec), 384));
+    const post = deps.post ?? ((body) => postEvent(config, body));
+    const freshUnchanged = async () => {
+      const fresh2 = await readCurrent(path);
+      if (!fresh2 || recordMovedSince(record, fresh2))
+        return null;
+      if (fresh2.turnId !== record.turnId)
+        return null;
+      if (fresh2.planPickerVerificationPending !== record.planPickerVerificationPending)
+        return null;
+      return fresh2;
+    };
+    if (state === "exited")
+      return "uncorrected";
+    if (state === "resolved") {
+      if (record.planPickerVerificationPending !== true)
+        return "uncorrected";
+      const fresh2 = await freshUnchanged();
+      if (!fresh2)
+        return "uncorrected";
+      await writeRecord(path, { ...fresh2, planPickerVerificationPending: undefined });
+      return "pending";
+    }
+    if (state === "pending") {
+      if (!await freshUnchanged())
+        return "uncorrected";
+      const envelope2 = await buildNeedsAttentionEnvelope(sessionId, record, now, config.e2eKey, "codex", Math.floor(now / 1000), undefined, "userInput");
+      const outcome2 = await post(envelope2);
+      if (outcome2 === "revoked")
+        return "revoked";
+      if (outcome2 !== "delivered")
+        return "pending";
+      const fresh2 = await freshUnchanged();
+      if (fresh2) {
+        await writeRecord(path, {
+          ...fresh2,
+          ts: now,
+          lastEvent: "needsAttention",
+          sentDone: false,
+          op: "update",
+          prio: 1,
+          blob: envelope2.blob,
+          pairingId: config.pairingId,
+          pendingPlanPicker: true,
+          planPickerVerificationPending: undefined,
+          donePending: undefined,
+          doneAttempts: undefined
+        });
+      }
+      return "corrected";
+    }
+    if (record.planPickerVerificationPending !== true)
+      return "uncorrected";
+    const age = typeof record.ts === "number" && Number.isFinite(record.ts) ? now - record.ts : Infinity;
+    if (age < PLAN_PICKER_VERIFY_MAX_MS)
+      return "pending";
+    if (!await freshUnchanged())
+      return "uncorrected";
+    const at = typeof record.ts === "number" && Number.isFinite(record.ts) ? Math.floor(record.ts / 1000) : undefined;
+    const envelope = await buildDoneEnvelope(sessionId, record, now, config.e2eKey, "codex", at);
+    const outcome = await post(envelope);
+    if (outcome === "revoked")
+      return "revoked";
+    if (outcome !== "delivered")
+      return "pending";
+    const fresh = await freshUnchanged();
+    if (fresh) {
+      await writeRecord(path, {
+        ...fresh,
+        lastEvent: "done",
+        sentDone: true,
+        op: "done",
+        prio: 0,
+        blob: envelope.blob,
+        pairingId: config.pairingId,
+        planPickerVerificationPending: undefined,
+        pendingPlanPicker: undefined,
+        donePending: undefined,
+        doneAttempts: undefined
+      });
+    }
+    return "corrected";
+  } catch {
+    return "uncorrected";
+  }
+}
 function buildHeartbeatEnvelope(sessionId, record, now, currentPairingId) {
   if (typeof record.blob !== "string" || record.blob.length === 0)
     return null;
@@ -4834,6 +4941,19 @@ async function sweep(config) {
     }
     const verdict = classifySession(record, now, pidAlive);
     if (verdict === "keep") {
+      let planVerificationHandled = false;
+      if (config && record) {
+        const verification = await correctPlanPickerVerification(config, path, sessionId, record);
+        if (verification === "revoked")
+          return { revoked: true };
+        if (verification === "corrected")
+          delivered = true;
+        planVerificationHandled = verification === "corrected" || verification === "pending";
+      }
+      if (planVerificationHandled) {
+        remaining++;
+        continue;
+      }
       let pendingDoneHandled = false;
       if (config && record) {
         const pendingDone = await correctPendingDone(config, path, sessionId, record, now);
@@ -5158,6 +5278,7 @@ export {
   titleRepairedRecord,
   tailShowsInterrupt,
   shouldRepairTitle,
+  shouldPlanPickerVerificationCheck,
   shouldPendingDoneCheck,
   shouldPendingApprovalCheck,
   shouldInterruptCheck,
@@ -5182,6 +5303,7 @@ export {
   discoverLiveSessions,
   createBridgeSupervisor,
   correctResolvedPlanPicker,
+  correctPlanPickerVerification,
   correctPendingDone,
   correctPendingApproval,
   correctInterrupt,
@@ -5201,6 +5323,8 @@ export {
   buildHeartbeatEnvelope,
   buildEndEnvelope,
   buildDoneEnvelope,
+  PLAN_PICKER_VERIFY_MAX_MS,
+  PLAN_PICKER_RECENT_DONE_MS,
   PAIRING_TTL_MS,
   IDLE_GRACE_MS
 };

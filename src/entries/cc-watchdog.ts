@@ -318,7 +318,7 @@ export async function buildWorkingEnvelope(
 
 /** Side-effect seams for resolving a hookless completed-turn wait. */
 export interface PlanPickerResolutionDeps {
-  state?: () => Promise<"pending" | "resolved" | "none" | "exited" | "unknown">;
+  state?: () => Promise<"pending" | "incomplete" | "resolved" | "none" | "exited" | "unknown">;
   post?: (body: object) => Promise<PostOutcome>;
   writeRecord?: (path: string, rec: SessionRecord) => Promise<void>;
   now?: () => number;
@@ -361,6 +361,144 @@ export async function correctResolvedPlanPicker(
     } catch {
       // The working update already landed. Treat it as corrected for this sweep so the stale
       // needsAttention blob is not heartbeated immediately; the next sweep can resolve/restamp again.
+    }
+    return "corrected";
+  } catch {
+    return "uncorrected";
+  }
+}
+
+// --- Plan-picker completion verification ------------------------------------------------------
+//
+// Codex persists the exact final <proposed_plan> wrapper before task_complete, with an observed flush
+// gap that is not bounded tightly enough for a short-lived Stop hook. Stop/notify therefore leave a
+// local verification marker and keep the wire state working. This long-lived daemon owns the eventual
+// decision. A short recent-done backstop also repairs records written by older builds / killed hooks.
+
+/** A marker must not defer a genuinely ambiguous completion forever. Five sweeps gives rollout I/O
+ *  ample time to settle; past this, anything short of the complete picker proof fails closed to done. */
+export const PLAN_PICKER_VERIFY_MAX_MS = 30_000;
+/** Migration/self-heal window for a plain done written by the old timing-based implementation. Exact
+ *  full picker proof + live pid + no later progress is still required. Bounded so old done rows are
+ *  never reconsidered indefinitely. */
+export const PLAN_PICKER_RECENT_DONE_MS = 30 * 60_000;
+
+/** Pure gate for marked completions and the narrowly bounded old-build done backstop. */
+export function shouldPlanPickerVerificationCheck(record: SessionRecord, now: number): boolean {
+  if (record.agent !== "codex" || record.provisional === true) return false;
+  if (typeof record.transcript !== "string" || record.transcript.length === 0) return false;
+  if (record.planPickerVerificationPending === true) return true;
+  if (record.op !== "done" || record.lastEvent !== "done" || record.sentDone !== true) return false;
+  if (typeof record.ts !== "number" || !Number.isFinite(record.ts)) return false;
+  const age = now - record.ts;
+  return age >= 0 && age <= PLAN_PICKER_RECENT_DONE_MS;
+}
+
+export interface PlanPickerVerificationDeps {
+  state?: () => Promise<"pending" | "incomplete" | "resolved" | "none" | "exited" | "unknown">;
+  post?: (body: object) => Promise<PostOutcome>;
+  writeRecord?: (path: string, rec: SessionRecord) => Promise<void>;
+  readRecord?: (path: string) => Promise<SessionRecord | null>;
+  now?: () => number;
+}
+
+/** Watchdog-owned settlement for a possibly completed Plan turn.
+ *   pending    → exact wrapper + task_complete + live pid: post needsAttention and pin picker marker.
+ *   resolved  → later task_started/user_message: clear only a provisional verification marker.
+ *   incomplete/none/unknown → keep a fresh marker; after the cap, confirm done.
+ *   exited     → leave it to the normal dead-pid op:end path.
+ * A recent unmarked done is correction-only: anything except exact pending is left untouched. */
+export async function correctPlanPickerVerification(
+  config: Config, path: string, sessionId: string, record: SessionRecord,
+  deps: PlanPickerVerificationDeps = {},
+): Promise<"corrected" | "pending" | "uncorrected" | "revoked"> {
+  try {
+    const now = (deps.now ?? Date.now)();
+    if (!shouldPlanPickerVerificationCheck(record, now)) return "uncorrected";
+    const state = await (deps.state ?? (() => codexAdapter.completedTurnWaitState!({
+      pid: record.pid,
+      transcriptPath: record.transcript,
+    })))();
+    const readCurrent = deps.readRecord ?? readRecordAt;
+    const writeRecord = deps.writeRecord
+      ?? ((p: string, rec: SessionRecord) => atomicWrite(p, JSON.stringify(rec), 0o600));
+    const post = deps.post ?? ((body: object) => postEvent(config, body));
+    const freshUnchanged = async (): Promise<SessionRecord | null> => {
+      const fresh = await readCurrent(path);
+      if (!fresh || recordMovedSince(record, fresh)) return null;
+      if (fresh.turnId !== record.turnId) return null;
+      if (fresh.planPickerVerificationPending !== record.planPickerVerificationPending) return null;
+      return fresh;
+    };
+
+    if (state === "exited") return "uncorrected";
+    if (state === "resolved") {
+      if (record.planPickerVerificationPending !== true) return "uncorrected";
+      const fresh = await freshUnchanged();
+      if (!fresh) return "uncorrected";
+      await writeRecord(path, { ...fresh, planPickerVerificationPending: undefined });
+      return "pending"; // locally settled; own this sweep so its stale snapshot is not heartbeated
+    }
+
+    if (state === "pending") {
+      // Re-read BEFORE posting: a user prompt/Stop could have replaced the sweep snapshot while the
+      // rollout probe ran. Never send stale attention for a record that has already moved on.
+      if (!await freshUnchanged()) return "uncorrected";
+      const envelope = await buildNeedsAttentionEnvelope(
+        sessionId, record, now, config.e2eKey, "codex", Math.floor(now / 1000), undefined, "userInput",
+      ) as Record<string, unknown>;
+      const outcome = await post(envelope);
+      if (outcome === "revoked") return "revoked";
+      if (outcome !== "delivered") return "pending";
+      const fresh = await freshUnchanged();
+      if (fresh) {
+        await writeRecord(path, {
+          ...fresh,
+          ts: now,
+          lastEvent: "needsAttention",
+          sentDone: false,
+          op: "update",
+          prio: 1,
+          blob: envelope.blob as string,
+          pairingId: config.pairingId,
+          pendingPlanPicker: true,
+          planPickerVerificationPending: undefined,
+          donePending: undefined,
+          doneAttempts: undefined,
+        });
+      }
+      return "corrected";
+    }
+
+    // An old-build plain done is correction-only. No complete proof means no resurrection.
+    if (record.planPickerVerificationPending !== true) return "uncorrected";
+    const age = typeof record.ts === "number" && Number.isFinite(record.ts) ? now - record.ts : Infinity;
+    if (age < PLAN_PICKER_VERIFY_MAX_MS) return "pending";
+
+    // The marked candidate never became a full picker signature within the cap. Fail closed to done,
+    // preserving the original event time in the blob so this delayed confirmation does not look fresh.
+    if (!await freshUnchanged()) return "uncorrected";
+    const at = typeof record.ts === "number" && Number.isFinite(record.ts)
+      ? Math.floor(record.ts / 1000) : undefined;
+    const envelope = await buildDoneEnvelope(sessionId, record, now, config.e2eKey, "codex", at) as Record<string, unknown>;
+    const outcome = await post(envelope);
+    if (outcome === "revoked") return "revoked";
+    if (outcome !== "delivered") return "pending";
+    const fresh = await freshUnchanged();
+    if (fresh) {
+      await writeRecord(path, {
+        ...fresh,
+        lastEvent: "done",
+        sentDone: true,
+        op: "done",
+        prio: 0,
+        blob: envelope.blob as string,
+        pairingId: config.pairingId,
+        planPickerVerificationPending: undefined,
+        pendingPlanPicker: undefined,
+        donePending: undefined,
+        doneAttempts: undefined,
+      });
     }
     return "corrected";
   } catch {
@@ -1502,6 +1640,19 @@ async function sweep(config: Config | null): Promise<SweepResult> {
     }
     const verdict = classifySession(record, now, pidAlive);
     if (verdict === "keep") {
+      // Long-lived Plan verification runs before the done-debt net: a killed/old Stop may have left a
+      // donePending record whose terminal state is precisely what still needs classification.
+      let planVerificationHandled = false;
+      if (config && record) {
+        const verification = await correctPlanPickerVerification(config, path, sessionId, record);
+        if (verification === "revoked") return { revoked: true };
+        if (verification === "corrected") delivered = true;
+        planVerificationHandled = verification === "corrected" || verification === "pending";
+      }
+      if (planVerificationHandled) {
+        remaining++;
+        continue; // the sweep snapshot is stale after any correction; no competing net may use it
+      }
       // Undelivered-done reconcile BEFORE everything else: a record can carry a done the worker never
       // received (the hook's write-before-POST ordering — see correctPendingDone), and until that debt
       // is settled the worker's view of this session is a stale "update", so no other net's decision

@@ -92,7 +92,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { execFileSync, spawn } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "1.4.6";
+var PLUGIN_VERSION = "1.4.7";
 var CC_DIR = `${process.env.HOME}/.config/cc-status`;
 var SESSIONS_DIR = `${CC_DIR}/sessions`;
 var WATCHDOG_PID_PATH = `${CC_DIR}/watchdog.pid`;
@@ -1297,7 +1297,6 @@ async function codexPidTurnActive(pid, deps = {}) {
     return false;
   }
 }
-var CODEX_PLAN_PICKER_FLUSH_GRACE_MS = 3000;
 async function codexPidPlanPickerAnalysis(pid, deps) {
   try {
     if (!(deps.isAlive ?? pidAlive)(pid))
@@ -1306,24 +1305,16 @@ async function codexPidPlanPickerAnalysis(pid, deps) {
     if (!rollout)
       return { state: "unknown", incompleteFinalPlan: false };
     const tail = await (deps.readTail ?? readSuffix)(rollout, PLAN_PICKER_TAIL_BYTES);
-    return codexPlanPickerTailAnalysis(tail);
+    const analysis = codexPlanPickerTailAnalysis(tail);
+    return {
+      state: analysis.incompleteFinalPlan ? "incomplete" : analysis.state,
+      incompleteFinalPlan: analysis.incompleteFinalPlan
+    };
   } catch {
     return { state: "unknown", incompleteFinalPlan: false };
   }
 }
 async function codexPidPlanPickerState(pid, deps = {}) {
-  return (await codexPidPlanPickerAnalysis(pid, deps)).state;
-}
-async function codexSettledPlanPickerState(pid, finalAssistantMessage, deps = {}) {
-  const first = await codexPidPlanPickerAnalysis(pid, deps);
-  if (first.state === "pending" || first.state === "resolved" || first.state === "exited")
-    return first.state;
-  if (!first.incompleteFinalPlan && !codexProposedPlanText(finalAssistantMessage))
-    return first.state;
-  const delay = deps.flushGraceMs ?? CODEX_PLAN_PICKER_FLUSH_GRACE_MS;
-  if (delay > 0) {
-    await (deps.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms))))(delay);
-  }
   return (await codexPidPlanPickerAnalysis(pid, deps)).state;
 }
 function codexSentinelSessionId(pid) {
@@ -1583,8 +1574,8 @@ var codexAdapter = {
   tailPendingAttentionKind(tail) {
     return codexTailPendingAttentionKind(tail);
   },
-  completedTurnWaitState({ pid, transcriptPath, finalAssistantMessage }) {
-    return codexSettledPlanPickerState(pid, finalAssistantMessage, transcriptPath ? { rolloutOf: async () => transcriptPath } : {});
+  completedTurnWaitState({ pid, transcriptPath }) {
+    return codexPidPlanPickerState(pid, transcriptPath ? { rolloutOf: async () => transcriptPath } : {});
   },
   isChildSessionGhost({ sessionId, prefix, hookPid, tracked }) {
     return codexChildSessionGhost(sessionId, prefix, hookPid, tracked);
@@ -1762,7 +1753,7 @@ async function stashPendingEvent(input, machine, title, now, stashPath = PENDING
     await atomicWrite(stashPath, JSON.stringify(stash), 384);
   } catch {}
 }
-async function trackSession(sessionId, op, prio, status, blob, machine, label, transcript, agent = "claude", sessionStartedAt, turnStartedAt, turnId, title, pairingId, model, pendingPlanPicker = false, pid = process.ppid, origin) {
+async function trackSession(sessionId, op, prio, status, blob, machine, label, transcript, agent = "claude", sessionStartedAt, turnStartedAt, turnId, title, pairingId, model, pendingPlanPicker = false, pid = process.ppid, origin, planPickerVerificationPending = false) {
   try {
     const path = `${SESSIONS_DIR}/${sessionId}.json`;
     if (op === "end") {
@@ -1789,6 +1780,7 @@ async function trackSession(sessionId, op, prio, status, blob, machine, label, t
       ...typeof model === "string" && model.length > 0 ? { model } : {},
       ...typeof pairingId === "string" && pairingId.length > 0 ? { pairingId } : {},
       ...pendingPlanPicker ? { pendingPlanPicker: true } : {},
+      ...planPickerVerificationPending ? { planPickerVerificationPending: true } : {},
       ...origin ? { origin } : {}
     };
     await atomicWrite(path, JSON.stringify(record), 384);
@@ -2028,14 +2020,17 @@ async function runHook(agent) {
     if (!plan)
       return;
     let pendingPlanPicker = false;
+    let planPickerVerificationPending = false;
     let attentionKind;
     if (plan.op === "done" && adapter2.completedTurnWaitState) {
-      const finalAssistantMessage = typeof input.last_assistant_message === "string" ? input.last_assistant_message : undefined;
-      const wait = await adapter2.completedTurnWaitState({ pid: hookPid, transcriptPath, finalAssistantMessage });
+      const wait = await adapter2.completedTurnWaitState({ pid: hookPid, transcriptPath });
       if (wait === "pending") {
         plan = { op: "update", prio: 1, status: "needsAttention" };
         attentionKind = "userInput";
         pendingPlanPicker = true;
+      } else if (wait === "incomplete") {
+        plan = { op: "update", prio: 0, status: "working" };
+        planPickerVerificationPending = true;
       }
     }
     const label = typeof existingRecord?.label === "string" && existingRecord.label.length > 0 ? existingRecord.label : typeof input.cwd === "string" && input.cwd.length > 0 ? basename2(input.cwd) : "session";
@@ -2047,7 +2042,7 @@ async function runHook(agent) {
     const origin = existingRecord?.origin ?? sessionOrigin(input, hookPid, hookCommand);
     const recordPid = reusedForkPredecessor ? existingRecord.pid : hookPid;
     const recordTranscript = reusedForkPredecessor ? existingRecord.transcript ?? transcriptPath : transcriptPath;
-    await trackSession(sessionId, plan.op, plan.prio, plan.status, envelope.blob, machine, label, recordTranscript, agent, startedAt, turnStartedAt, turnId, title, config.pairingId, model, pendingPlanPicker, recordPid, origin);
+    await trackSession(sessionId, plan.op, plan.prio, plan.status, envelope.blob, machine, label, recordTranscript, agent, startedAt, turnStartedAt, turnId, title, config.pairingId, model, pendingPlanPicker, recordPid, origin, planPickerVerificationPending);
     if (createsRecord) {
       traceSession({
         event: "create",
@@ -2134,7 +2129,6 @@ export {
   codexTailPendingUserInputDetail,
   codexTailPendingAttentionKind,
   codexTailPendingApproval,
-  codexSettledPlanPickerState,
   codexSessionTitle,
   codexSessionModel,
   codexSessionCreationSuppression,

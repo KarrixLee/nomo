@@ -9,12 +9,12 @@ import {
   buildDoneEnvelope, buildEndEnvelope, buildHeartbeatEnvelope, buildNeedsAttentionEnvelope, buildProvisionalBlob,
   buildProvisionalEnvelope, buildProvisionalRecord, buildStartEnvelope, buildTitleRepairEnvelope, classifySession,
   claudeTailPendingApproval, codexLastTurnEvent, codexTailPendingApproval, correctIdleClaude, correctInterrupt,
-  correctPendingApproval, correctPendingDone, correctResolvedPlanPicker, createBridgeSupervisor, discoverLiveSessions, effectiveDoneAttempts, goneStrikeShouldTeardown,
+  correctPendingApproval, correctPendingDone, correctPlanPickerVerification, correctResolvedPlanPicker, createBridgeSupervisor, discoverLiveSessions, effectiveDoneAttempts, goneStrikeShouldTeardown,
   hasInterruptMarker, IDLE_GRACE_MS, isClaudeIdleReapEligible, isRetireEligible, lastTurnLine, PAIRING_TTL_MS, pendingDoneRetryWrite,
-  pendingDoneSettleWrite, pendingPairingExpired,
+  pendingDoneSettleWrite, pendingPairingExpired, PLAN_PICKER_RECENT_DONE_MS, PLAN_PICKER_VERIFY_MAX_MS,
   postOutcomeForStatus, provisionalsCoveredByReal, reconcileProvisionalsSweep, recordMovedSince, resetDoneAttemptMemory, retireDoneStale,
   shouldHeartbeat, shouldIdleProvisionalCheck,
-  shouldInterruptCheck, shouldPendingApprovalCheck, shouldPendingDoneCheck, shouldRepairTitle, tailShowsInterrupt, titleRepairedRecord,
+  shouldInterruptCheck, shouldPendingApprovalCheck, shouldPendingDoneCheck, shouldPlanPickerVerificationCheck, shouldRepairTitle, tailShowsInterrupt, titleRepairedRecord,
   withDeadline,
 } from "./cc-watchdog";
 import type { PostOutcome, RecordEntry } from "./cc-watchdog";
@@ -1442,6 +1442,97 @@ describe("correctResolvedPlanPicker (Mac answer clears only the marked Plan wait
       state: async () => "exited",
       post: async () => { throw new Error("must not post working"); },
     })).toBe("uncorrected");
+  });
+});
+
+describe("correctPlanPickerVerification (watchdog owns flush settlement)", () => {
+  const NOW = 9_000_000;
+  const verifying = (over: Partial<SessionRecord> = {}): SessionRecord => rec({
+    agent: "codex", transcript: "/tmp/019fb1fc.jsonl", lastEvent: "working",
+    op: "update", prio: 0, sentDone: false, planPickerVerificationPending: true,
+    blob: "WORKING", title: "Validate the live picker", pairingId: "p", ts: NOW - 5_000,
+    ...over,
+  });
+
+  test("hook killed after its marker write → watchdog posts prio-1 attention and pins picker provenance", async () => {
+    const record = verifying(); // no hook POST/re-read is needed after this durable snapshot
+    const posts: Record<string, unknown>[] = [];
+    const writes: SessionRecord[] = [];
+    expect(await correctPlanPickerVerification(cfg(), "/tmp/s.json", "s", record, {
+      state: async () => "pending",
+      readRecord: async () => record,
+      post: async (body) => { posts.push(body as Record<string, unknown>); return "delivered"; },
+      writeRecord: async (_path, next) => { writes.push(next); },
+      now: () => NOW,
+    })).toBe("corrected");
+    expect(posts[0]).toMatchObject({ op: "update", prio: 1, attentionKind: "userInput" });
+    expect(await decryptBlob(KEY, posts[0].blob as string)).toMatchObject({ status: "needsAttention", agent: "codex" });
+    expect(writes[0]).toMatchObject({
+      lastEvent: "needsAttention", op: "update", prio: 1, sentDone: false, pendingPlanPicker: true,
+    });
+    expect(writes[0].planPickerVerificationPending).toBeUndefined();
+  });
+
+  test("notify-chain absent: the Stop marker alone survives an incomplete sweep and corrects later", async () => {
+    const record = verifying();
+    let posted = 0;
+    expect(shouldPlanPickerVerificationCheck(record, NOW)).toBe(true);
+    expect(await correctPlanPickerVerification(cfg(), "/tmp/s.json", "s", record, {
+      state: async () => "incomplete",
+      post: async () => { posted++; return "delivered"; },
+      readRecord: async () => record,
+      now: () => NOW,
+    })).toBe("pending");
+    expect(posted).toBe(0);
+    expect(await correctPlanPickerVerification(cfg(), "/tmp/s.json", "s", record, {
+      state: async () => "pending",
+      post: async () => { posted++; return "delivered"; },
+      readRecord: async () => record,
+      writeRecord: async () => {},
+      now: () => NOW + 5_000,
+    })).toBe("corrected");
+    expect(posted).toBe(1);
+  });
+
+  test("genuine done is never resurrected: resolved/none/exited and old done rows are untouched", async () => {
+    const recentDone = verifying({
+      planPickerVerificationPending: undefined,
+      lastEvent: "done", op: "done", prio: 0, sentDone: true, ts: NOW - 1_000,
+    });
+    let posted = 0;
+    for (const state of ["resolved", "none", "exited"] as const) {
+      expect(await correctPlanPickerVerification(cfg(), "/tmp/s.json", "s", recentDone, {
+        state: async () => state,
+        post: async () => { posted++; return "delivered"; },
+        readRecord: async () => recentDone,
+        now: () => NOW,
+      })).toBe("uncorrected");
+    }
+    const oldDone = { ...recentDone, ts: NOW - PLAN_PICKER_RECENT_DONE_MS - 1 };
+    let classified = 0;
+    expect(await correctPlanPickerVerification(cfg(), "/tmp/s.json", "s", oldDone, {
+      state: async () => { classified++; return "pending"; },
+      post: async () => { posted++; return "delivered"; },
+      now: () => NOW,
+    })).toBe("uncorrected");
+    expect({ posted, classified }).toEqual({ posted: 0, classified: 0 });
+  });
+
+  test("marked ambiguity past the verification cap fails closed to a delivered done", async () => {
+    const record = verifying({ ts: NOW - PLAN_PICKER_VERIFY_MAX_MS });
+    const posts: Record<string, unknown>[] = [];
+    const writes: SessionRecord[] = [];
+    expect(await correctPlanPickerVerification(cfg(), "/tmp/s.json", "s", record, {
+      state: async () => "unknown",
+      readRecord: async () => record,
+      post: async (body) => { posts.push(body as Record<string, unknown>); return "delivered"; },
+      writeRecord: async (_path, next) => { writes.push(next); },
+      now: () => NOW,
+    })).toBe("corrected");
+    expect(posts[0]).toMatchObject({ op: "done", prio: 0 });
+    expect(await decryptBlob(KEY, posts[0].blob as string)).toMatchObject({ status: "done", agent: "codex" });
+    expect(writes[0]).toMatchObject({ lastEvent: "done", op: "done", prio: 0, sentDone: true });
+    expect(writes[0].planPickerVerificationPending).toBeUndefined();
   });
 });
 

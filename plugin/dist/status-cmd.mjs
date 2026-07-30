@@ -92,7 +92,7 @@ async function sha256Hex(s) {
 }
 
 // src/core/shared.ts
-var PLUGIN_VERSION = "1.4.6";
+var PLUGIN_VERSION = "1.4.7";
 var CC_DIR = `${process.env.HOME}/.config/cc-status`;
 var SESSIONS_DIR = `${CC_DIR}/sessions`;
 var WATCHDOG_PID_PATH = `${CC_DIR}/watchdog.pid`;
@@ -1297,7 +1297,6 @@ async function codexPidTurnActive(pid, deps = {}) {
     return false;
   }
 }
-var CODEX_PLAN_PICKER_FLUSH_GRACE_MS = 3000;
 async function codexPidPlanPickerAnalysis(pid, deps) {
   try {
     if (!(deps.isAlive ?? pidAlive)(pid))
@@ -1306,24 +1305,16 @@ async function codexPidPlanPickerAnalysis(pid, deps) {
     if (!rollout)
       return { state: "unknown", incompleteFinalPlan: false };
     const tail = await (deps.readTail ?? readSuffix)(rollout, PLAN_PICKER_TAIL_BYTES);
-    return codexPlanPickerTailAnalysis(tail);
+    const analysis = codexPlanPickerTailAnalysis(tail);
+    return {
+      state: analysis.incompleteFinalPlan ? "incomplete" : analysis.state,
+      incompleteFinalPlan: analysis.incompleteFinalPlan
+    };
   } catch {
     return { state: "unknown", incompleteFinalPlan: false };
   }
 }
 async function codexPidPlanPickerState(pid, deps = {}) {
-  return (await codexPidPlanPickerAnalysis(pid, deps)).state;
-}
-async function codexSettledPlanPickerState(pid, finalAssistantMessage, deps = {}) {
-  const first = await codexPidPlanPickerAnalysis(pid, deps);
-  if (first.state === "pending" || first.state === "resolved" || first.state === "exited")
-    return first.state;
-  if (!first.incompleteFinalPlan && !codexProposedPlanText(finalAssistantMessage))
-    return first.state;
-  const delay = deps.flushGraceMs ?? CODEX_PLAN_PICKER_FLUSH_GRACE_MS;
-  if (delay > 0) {
-    await (deps.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms))))(delay);
-  }
   return (await codexPidPlanPickerAnalysis(pid, deps)).state;
 }
 function codexSentinelSessionId(pid) {
@@ -1583,8 +1574,8 @@ var codexAdapter = {
   tailPendingAttentionKind(tail) {
     return codexTailPendingAttentionKind(tail);
   },
-  completedTurnWaitState({ pid, transcriptPath, finalAssistantMessage }) {
-    return codexSettledPlanPickerState(pid, finalAssistantMessage, transcriptPath ? { rolloutOf: async () => transcriptPath } : {});
+  completedTurnWaitState({ pid, transcriptPath }) {
+    return codexPidPlanPickerState(pid, transcriptPath ? { rolloutOf: async () => transcriptPath } : {});
   },
   isChildSessionGhost({ sessionId, prefix, hookPid, tracked }) {
     return codexChildSessionGhost(sessionId, prefix, hookPid, tracked);

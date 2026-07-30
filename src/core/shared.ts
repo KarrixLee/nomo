@@ -274,6 +274,10 @@ export interface SessionRecord {
    *  watchdog uses this explicit provenance marker to clear needsAttention on later rollout progress
    *  without touching an ordinary permission/question attention episode. */
   pendingPlanPicker?: boolean;
+  /** Exact Plan final wrapper was durable when Stop/notify ran, but task_complete had not flushed yet.
+   *  The short-lived hook deliberately leaves the phone working and delegates the terminal decision
+   *  to the watchdog. Any ordinary later hook rewrite omits this marker and therefore cancels it. */
+  planPickerVerificationPending?: boolean;
   /** The hook/process provenance that FIRST created this local record. Preserved across later hook and
    *  watchdog rewrites. Local-only diagnostic metadata — never copied into the blob or wire envelope.
    *  Optional for backward compatibility with records written before the phantom-session trace fix. */

@@ -146,7 +146,17 @@ describe("runNotify E2E (argv payload, dedupe against a sent Stop)", () => {
     expect(record?.ts).toBe(111);
   }, 20000);
 
-  // The dedupe gate keys on sentDone ONLY. The done-delivery ack marker (donePending) is a separate
+  test("dedupe: Stop's plan-verification marker makes notify stand down even without sentDone", async () => {
+    const seed = {
+      pid: process.ppid, machine: "mac", label: "SENTINEL", ts: 111, transcript: "/tmp/plan.jsonl",
+      lastEvent: "working", sentDone: false, op: "update", prio: 0, blob: "PRESEEDED", agent: "codex",
+      planPickerVerificationPending: true,
+    };
+    const { record } = await runNotifyEntry(payload, { seedRecord: seed });
+    expect(record).toMatchObject(seed);
+  }, 20000);
+
+  // The ordinary done dedupe gate keys on sentDone. The done-delivery ack marker (donePending) is separate
   // field for the watchdog's re-POST net, so a Stop the hooks recorded but couldn't DELIVER must still
   // dedupe here — re-sending from notify would just create a second undelivered done, and the watchdog
   // (which owns the retry, with a bounded counter) is the one thing allowed to re-POST it.
@@ -194,6 +204,28 @@ describe("runNotify E2E (argv payload, dedupe against a sent Stop)", () => {
     });
     expect(record?.donePending).toBeUndefined();
     expect(blob).toMatchObject({ status: "needsAttention", agent: "codex" });
+  }, 20000);
+
+  test("wrapper durable but task_complete absent → working verification marker, never plain done", async () => {
+    const seed = {
+      pid: process.pid, machine: "mac", label: "proj", ts: 111, transcript: "",
+      lastEvent: "working", sentDone: false, op: "update", prio: 0, blob: "OLD", agent: "codex",
+    };
+    const incomplete = JSON.stringify({
+      timestamp: "2026-07-30T07:47:08.784Z",
+      type: "response_item",
+      payload: {
+        type: "message", role: "assistant", phase: "final_answer",
+        content: [{ type: "output_text", text: "<proposed_plan>\nSanitized live plan.\n</proposed_plan>" }],
+      },
+    });
+    const { record, blob } = await runNotifyEntry(payload, { seedRecord: seed, rolloutTail: `${incomplete}\n` });
+    expect(record).toMatchObject({
+      op: "update", prio: 0, lastEvent: "working", sentDone: false,
+      planPickerVerificationPending: true,
+    });
+    expect(record?.donePending).toBeUndefined();
+    expect(blob).toMatchObject({ status: "working", agent: "codex" });
   }, 20000);
 
   test("session_index thread_name is the PRIMARY title (beats input-messages)", async () => {
