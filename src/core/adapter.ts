@@ -1186,6 +1186,12 @@ export interface DiscoveredSession {
   /** The discovered process — the interactive agent TUI. Stored on the provisional record so the
    *  watchdog reaps the provisional when this pid dies and the hook reconcile can match it. */
   pid: number;
+  /** Exact TUI cwd, retained locally so a daemon-fronted real session can be correlated only when
+   *  cwd + process-start evidence identify one unique real-terminal client. Never enters a blob. */
+  cwd?: string;
+  /** Epoch-ms process start reported by ps. Together with cwd this is the conservative correlation
+   *  key for standalone-daemon hooks whose process.ppid is the immortal app-server, not the TUI. */
+  startedAt?: number;
   /** The sentinel session id for the provisional (agent-specific; e.g. codex `codex-pid-<pid>`). */
   sessionId: string;
   /** Display title for the provisional blob — the cwd basename, since no real prompt exists yet. */
@@ -1285,8 +1291,21 @@ async function cwdViaLsof(pid: number): Promise<string | undefined> {
 export interface CodexDiscoverDeps {
   ps?: () => Promise<string>;
   cwdOf?: (pid: number) => Promise<string | undefined>;
+  startedAtOf?: (pid: number) => Promise<number | undefined>;
   /** Turn-state probe (see codexPidTurnActive) — decides each discovery's `idle` flag. */
   turnActive?: (pid: number) => Promise<boolean>;
+}
+
+/** REMOVABLE with discovery. Process birth from macOS/BSD `ps lstart`; undefined on locale/probe
+ * failure. A missing start time deliberately prevents later TUI/session correlation. */
+async function processStartedAtViaPs(pid: number): Promise<number | undefined> {
+  try {
+    const { stdout } = await execFileP("ps", ["-p", String(pid), "-o", "lstart="]);
+    const value = Date.parse(stdout.trim());
+    return Number.isFinite(value) ? value : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /** REMOVABLE (see above). Discover interactive Codex TUIs the hooks can't see yet (openai/codex#15269).
@@ -1297,6 +1316,7 @@ export interface CodexDiscoverDeps {
 export async function codexDiscoverLive(known: SessionRecord[], deps: CodexDiscoverDeps = {}): Promise<DiscoveredSession[]> {
   const ps = deps.ps ?? runPs;
   const cwdOf = deps.cwdOf ?? cwdViaLsof;
+  const startedAtOf = deps.startedAtOf ?? processStartedAtViaPs;
   const turnActive = deps.turnActive ?? codexPidTurnActive;
   let output: string;
   try {
@@ -1308,14 +1328,20 @@ export async function codexDiscoverLive(known: SessionRecord[], deps: CodexDisco
   const tuis = filterCodexTuis(parseCodexProcs(output), knownPids);
   const out: DiscoveredSession[] = [];
   for (const { pid } of tuis) {
-    const label = labelFromCwd(await cwdOf(pid));
+    const cwd = await cwdOf(pid);
+    const startedAt = await startedAtOf(pid);
+    const label = labelFromCwd(cwd);
     // Idle unless a turn is PROVABLY open — a probe failure must never resurrect the stuck-"Running"
     // ghost this flag exists to kill (misread-active self-corrects via the next real hook; misread-idle
     // never would).
     let active = false;
     try { active = await turnActive(pid); } catch { /* idle-biased default */ }
     // title == label (cwd basename): a freshly-opened TUI has no prompt yet, so the cwd names it.
-    out.push({ pid, sessionId: codexSentinelSessionId(pid), title: label, label, idle: !active });
+    out.push({
+      pid, sessionId: codexSentinelSessionId(pid), title: label, label, idle: !active,
+      ...(cwd ? { cwd } : {}),
+      ...(typeof startedAt === "number" && Number.isFinite(startedAt) ? { startedAt } : {}),
+    });
   }
   return out;
 }

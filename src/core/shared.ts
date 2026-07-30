@@ -382,6 +382,14 @@ export interface SessionRecord {
    *  the real hook fires for that process, or reaped like any session when the pid dies. Absent on a
    *  normal hook-written record. */
   provisional?: boolean;
+  /** Real-terminal Codex client confidently correlated to this daemon-fronted session. Unlike `pid`
+   *  (the immortal standalone app-server), death of this optional PID is a precise TUI-exit signal.
+   *  Written only from unique exact-cwd + tight process/session-start evidence; ambiguity omits it. */
+  tuiPid?: number;
+  /** Provisional-only exact cwd of the discovered real-TTY client. Local correlation evidence only. */
+  tuiCwd?: string;
+  /** Provisional-only real-TTY process birth time (epoch ms). Local correlation evidence only. */
+  tuiStartedAt?: number;
   /** How many consecutive times the watchdog's interrupt net has confirmed this session interrupted and
    *  tried — and FAILED — to deliver its corrective op:done. It's the interrupt net's bounded-retry
    *  counter: a delivered done clears it (and pins lastEvent:"done"); a failed done bumps it and, while

@@ -389,35 +389,37 @@ describe("codexDiscoverLive (full pipeline with injected ps/lsof)", () => {
     const discovered = await codexDiscoverLive([], {
       ps: async () => PS_FIXTURE,
       cwdOf: async (pid) => cwds[pid],
+      startedAtOf: async (pid) => pid === 16029 ? 1_000 : 2_000,
       turnActive: async (pid) => pid === 16029, // 16029 has a turn in flight; 33198 sits idle
     });
     expect(discovered).toEqual([
-      { pid: 16029, sessionId: "codex-pid-16029", title: "nomo", label: "nomo", idle: false },
-      { pid: 33198, sessionId: "codex-pid-33198", title: "WidgetAnimation", label: "WidgetAnimation", idle: true },
+      { pid: 16029, sessionId: "codex-pid-16029", title: "nomo", label: "nomo", idle: false, cwd: cwds[16029], startedAt: 1_000 },
+      { pid: 33198, sessionId: "codex-pid-33198", title: "WidgetAnimation", label: "WidgetAnimation", idle: true, cwd: cwds[33198], startedAt: 2_000 },
     ]);
   });
 
   test("excludes pids already covered by a known record (real or provisional)", async () => {
     const known: SessionRecord[] = [{ pid: 16029, machine: "m", label: "l", ts: 1 }];
-    const discovered = await codexDiscoverLive(known, { ps: async () => PS_FIXTURE, cwdOf: async () => "/tmp/proj", turnActive: async () => false });
+    const discovered = await codexDiscoverLive(known, { ps: async () => PS_FIXTURE, cwdOf: async () => "/tmp/proj", startedAtOf: async () => undefined, turnActive: async () => false });
     expect(discovered.map((d) => d.pid)).toEqual([33198]);
   });
 
   test("an unknown cwd falls back to the 'session' label (like buildBlob)", async () => {
-    const discovered = await codexDiscoverLive([], { ps: async () => "42 ttys001  codex", cwdOf: async () => undefined, turnActive: async () => false });
+    const discovered = await codexDiscoverLive([], { ps: async () => "42 ttys001  codex", cwdOf: async () => undefined, startedAtOf: async () => undefined, turnActive: async () => false });
     expect(discovered[0]).toEqual({ pid: 42, sessionId: "codex-pid-42", title: "session", label: "session", idle: true });
   });
 
   test("a turn-probe THROW yields idle (the bug-safe default — never a stuck-'Running' ghost)", async () => {
     const discovered = await codexDiscoverLive([], {
       ps: async () => "42 ttys001  codex", cwdOf: async () => "/x/proj",
+      startedAtOf: async () => undefined,
       turnActive: async () => { throw new Error("lsof boom"); },
     });
     expect(discovered[0]).toMatchObject({ pid: 42, idle: true });
   });
 
   test("a `ps` failure yields no discoveries (best-effort)", async () => {
-    expect(await codexDiscoverLive([], { ps: async () => { throw new Error("no ps"); }, cwdOf: async () => "/x" })).toEqual([]);
+    expect(await codexDiscoverLive([], { ps: async () => { throw new Error("no ps"); }, cwdOf: async () => "/x", startedAtOf: async () => undefined })).toEqual([]);
   });
 });
 
