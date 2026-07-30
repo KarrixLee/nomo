@@ -649,6 +649,14 @@ export function codexTailPendingApproval(tail: string): boolean {
 
 export type CodexPlanPickerState = "pending" | "resolved" | "none" | "exited" | "unknown";
 
+/** Exact Plan-mode final-answer wrapper. Also used by the completed-turn flush retry: the notify /
+ *  Stop payload can carry this message before the rollout has appended its trailing task_complete. */
+export function codexProposedPlanText(text: unknown): boolean {
+  if (typeof text !== "string") return false;
+  const trimmed = text.trim();
+  return trimmed.startsWith("<proposed_plan>") && trimmed.endsWith("</proposed_plan>");
+}
+
 /** Whether an assistant payload is the durable FINAL plan emitted by Codex Plan mode. Supports both
  *  rollout forms seen across Codex versions: response_item message content and event_msg agent_message.
  *  The exact full wrapper is load-bearing for precision. */
@@ -669,8 +677,7 @@ function codexFinalProposedPlan(row: Record<string, unknown>): boolean {
   } else {
     return false;
   }
-  const trimmed = text.trim();
-  return trimmed.startsWith("<proposed_plan>") && trimmed.endsWith("</proposed_plan>");
+  return codexProposedPlanText(text);
 }
 
 /** Classify the plan-picker episode visible in a bounded rollout tail.
@@ -682,7 +689,13 @@ function codexFinalProposedPlan(row: Record<string, unknown>): boolean {
  *
  * A later completed plan supersedes an older resolved one, so repeated Plan turns classify correctly.
  * Malformed/byte-sliced lines are skipped, matching the other rollout-tail classifiers. */
-export function codexPlanPickerStateFromTail(tail: string): Extract<CodexPlanPickerState, "pending" | "resolved" | "none"> {
+interface CodexPlanPickerTailAnalysis {
+  state: Extract<CodexPlanPickerState, "pending" | "resolved" | "none">;
+  /** Exact final wrapper is durable, but task_complete has not been appended yet. Retry-only signal. */
+  incompleteFinalPlan: boolean;
+}
+
+function codexPlanPickerTailAnalysis(tail: string): CodexPlanPickerTailAnalysis {
   let state: "pending" | "resolved" | "none" = "none";
   let finalPlanInTurn = false;
   for (const line of tail.split("\n")) {
@@ -708,7 +721,11 @@ export function codexPlanPickerStateFromTail(tail: string): Extract<CodexPlanPic
       finalPlanInTurn = false;
     }
   }
-  return state;
+  return { state, incompleteFinalPlan: finalPlanInTurn };
+}
+
+export function codexPlanPickerStateFromTail(tail: string): Extract<CodexPlanPickerState, "pending" | "resolved" | "none"> {
+  return codexPlanPickerTailAnalysis(tail).state;
 }
 
 interface CodexPendingUserInput {
@@ -1095,20 +1112,56 @@ export interface CodexPlanPickerProbeDeps extends CodexTurnProbeDeps {
   isAlive?: (pid: number) => boolean;
 }
 
+/** Notify can arrive after the exact final Plan wrapper is durable but before codex-cli flushes
+ *  task_complete. Give only that precision-proof case one bounded second read; ordinary completions
+ *  are never delayed, and the second read must still prove wrapper + task_complete + live process or
+ *  the caller fails closed to done. The payload wrapper is an additional trigger when the rollout's
+ *  final response_item itself has not flushed yet. */
+const CODEX_PLAN_PICKER_FLUSH_GRACE_MS = 3000;
+export interface CodexPlanPickerSettleDeps extends CodexPlanPickerProbeDeps {
+  sleep?: (ms: number) => Promise<void>;
+  flushGraceMs?: number;
+}
+
 /** The current client-side plan-picker state for a Codex TUI pid. Reuses the turn-active probe's
  *  rollout locator, but requires continued process liveness before a rollout can classify pending.
  *  `resolved` is returned only for explicit post-plan task_started/user_message evidence; failures are
  *  `unknown`, so the watchdog never clears a pending row on an incidental read/lsof race. */
-export async function codexPidPlanPickerState(pid: number, deps: CodexPlanPickerProbeDeps = {}): Promise<CodexPlanPickerState> {
+async function codexPidPlanPickerAnalysis(
+  pid: number,
+  deps: CodexPlanPickerProbeDeps,
+): Promise<{ state: CodexPlanPickerState; incompleteFinalPlan: boolean }> {
   try {
-    if (!(deps.isAlive ?? pidAlive)(pid)) return "exited";
+    if (!(deps.isAlive ?? pidAlive)(pid)) return { state: "exited", incompleteFinalPlan: false };
     const rollout = await codexRolloutForPid(pid, deps);
-    if (!rollout) return "unknown";
+    if (!rollout) return { state: "unknown", incompleteFinalPlan: false };
     const tail = await (deps.readTail ?? readSuffix)(rollout, PLAN_PICKER_TAIL_BYTES);
-    return codexPlanPickerStateFromTail(tail);
+    return codexPlanPickerTailAnalysis(tail);
   } catch {
-    return "unknown";
+    return { state: "unknown", incompleteFinalPlan: false };
   }
+}
+
+export async function codexPidPlanPickerState(pid: number, deps: CodexPlanPickerProbeDeps = {}): Promise<CodexPlanPickerState> {
+  return (await codexPidPlanPickerAnalysis(pid, deps)).state;
+}
+
+/** Classify a completed turn, retrying once for the observed codex-cli rollout flush lag. The retry
+ *  is armed only by an exact final-answer wrapper already durable in the rollout or present in the
+ *  Stop/notify payload. */
+export async function codexSettledPlanPickerState(
+  pid: number,
+  finalAssistantMessage: unknown,
+  deps: CodexPlanPickerSettleDeps = {},
+): Promise<CodexPlanPickerState> {
+  const first = await codexPidPlanPickerAnalysis(pid, deps);
+  if (first.state === "pending" || first.state === "resolved" || first.state === "exited") return first.state;
+  if (!first.incompleteFinalPlan && !codexProposedPlanText(finalAssistantMessage)) return first.state;
+  const delay = deps.flushGraceMs ?? CODEX_PLAN_PICKER_FLUSH_GRACE_MS;
+  if (delay > 0) {
+    await (deps.sleep ?? ((ms) => new Promise<void>((resolve) => setTimeout(resolve, ms))))(delay);
+  }
+  return (await codexPidPlanPickerAnalysis(pid, deps)).state;
 }
 
 // --- Live session discovery (the seam that closes the Codex "late session" gap) --------------
@@ -1524,7 +1577,7 @@ export interface AgentAdapter {
    *  before emitting done, and the watchdog consults it only for records explicitly marked as this
    *  kind of wait. `transcriptPath` pins the exact rollout when known; otherwise the pid locator's
    *  open-fd / cwd+recency fallback is used. */
-  completedTurnWaitState?(ctx: { pid: number; transcriptPath?: string }): Promise<CodexPlanPickerState>;
+  completedTurnWaitState?(ctx: { pid: number; transcriptPath?: string; finalAssistantMessage?: string }): Promise<CodexPlanPickerState>;
   /** OPTIONAL: whether a hook event for a NEVER-tracked session id is a CHILD-SESSION GHOST that must
    *  be skipped (no phone row). Claude OMITS it (every Claude session id is real); Codex implements it
    *  because the ChatGPT.app `codex app-server` spawns child session ids with no rollout/transcript
@@ -1699,8 +1752,8 @@ export const codexAdapter: AgentAdapter = {
   tailPendingAttentionKind(tail: string): "userInput" | undefined {
     return codexTailPendingAttentionKind(tail);
   },
-  completedTurnWaitState({ pid, transcriptPath }): Promise<CodexPlanPickerState> {
-    return codexPidPlanPickerState(pid, transcriptPath
+  completedTurnWaitState({ pid, transcriptPath, finalAssistantMessage }): Promise<CodexPlanPickerState> {
+    return codexSettledPlanPickerState(pid, finalAssistantMessage, transcriptPath
       ? { rolloutOf: async () => transcriptPath }
       : {});
   },

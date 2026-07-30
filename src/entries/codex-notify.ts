@@ -140,7 +140,9 @@ export async function runNotify(raw: string, deferMs = notifyDeferMs(), sleep: (
     // rollout; with no record this remains best-effort through the notify process's pid locator.
     const sessionPid = typeof record?.pid === "number" && Number.isFinite(record.pid) ? record.pid : process.ppid;
     const transcriptPath = typeof record?.transcript === "string" ? record.transcript : "";
-    const wait = await codexAdapter.completedTurnWaitState?.({ pid: sessionPid, transcriptPath });
+    const finalAssistantMessage = typeof input.last_assistant_message === "string"
+      ? input.last_assistant_message : undefined;
+    const wait = await codexAdapter.completedTurnWaitState?.({ pid: sessionPid, transcriptPath, finalAssistantMessage });
     const pendingPlanPicker = wait === "pending";
     const plan = pendingPlanPicker
       ? { op: "update" as const, prio: 1 as const, status: "needsAttention" as const }

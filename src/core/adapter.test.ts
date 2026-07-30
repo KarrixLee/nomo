@@ -1,11 +1,13 @@
 import { randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { describe, expect, test } from "bun:test";
 import {
   adapterFor, allAdapters, claudeAdapter, claudeClearPredecessor, claudeForkResumePredecessor, claudeHeadlessInvocation, claudeSessionModel, claudeSessionTitle,
   claudeTailPendingApproval, codexAdapter, codexChildSessionGhost,
   codexConfigModel, codexDiscoverLive, codexInternalSessionGhost, codexModelFromRollout,
   CODEX_ROLLOUT_IDLE_SILENCE_MS,
-  codexNewestRolloutForCwd, codexPidPlanPickerState, codexPidTurnActive, codexPlanPickerStateFromTail, codexRolloutExistsForSession, codexSentinelSessionId, codexSessionModel,
+  codexNewestRolloutForCwd, codexPidPlanPickerState, codexPidTurnActive, codexPlanPickerStateFromTail, codexRolloutExistsForSession, codexSentinelSessionId, codexSessionModel, codexSettledPlanPickerState,
   codexRolloutCreationEvidence, codexSessionCreationSuppression, codexTailPendingApproval, codexTailPendingAttentionKind, codexTailPendingUserInputDetail, codexTurnActiveFromTail, filterCodexTuis, findProvisionalForPid,
   firstAssistantModel, firstUserPrompt, lastAssistantModel, parseCodexProcs, rolloutMetaCwd,
   requestUserInputDetail, rolloutPathFromLsof, sessionTitle, TrackedSessionLite,
@@ -474,6 +476,7 @@ describe("codexTurnActiveFromTail (idle vs in-flight decision matrix)", () => {
 });
 
 describe("codex plan-picker classifier (completed Plan turn, TUI still waiting)", () => {
+  const real0146Tail = readFileSync(join(import.meta.dir, "fixtures", "codex-0.146-plan-picker-tail.jsonl"), "utf8").trim();
   const proposedPlan = (text = "Ship the narrow fix."): string => JSON.stringify({
     timestamp: "2026-07-29T07:27:21Z",
     type: "response_item",
@@ -492,6 +495,39 @@ describe("codex plan-picker classifier (completed Plan turn, TUI still waiting)"
     expect(codexPlanPickerStateFromTail([evt("task_started"), normalAnswer(), evt("task_complete")].join("\n"))).toBe("none");
     // Merely mentioning/tag-opening a plan is insufficient: require the complete Plan-mode wrapper.
     expect(codexPlanPickerStateFromTail([evt("task_started"), proposedPlan("x").replace("</proposed_plan>", ""), evt("task_complete")].join("\n"))).toBe("none");
+  });
+
+  test("0.146.0 real tail: retry bridges notify-before-task_complete flush lag", async () => {
+    const rows = real0146Tail.split("\n");
+    const beforeTaskComplete = rows.slice(0, -1).join("\n");
+    let reads = 0;
+    let sleeps = 0;
+    expect(codexPlanPickerStateFromTail(beforeTaskComplete)).toBe("none");
+    expect(codexPlanPickerStateFromTail(real0146Tail)).toBe("pending");
+    // Real 0.146.0 task_complete carried last_agent_message:null, so the durable response_item — not
+    // the notify payload — must be sufficient to arm the bounded re-read.
+    expect(await codexSettledPlanPickerState(937, null, {
+      isAlive: () => true,
+      rolloutOf: async () => "/r/019faef9.jsonl",
+      readTail: async () => ++reads === 1 ? beforeTaskComplete : real0146Tail,
+      flushGraceMs: 3000,
+      sleep: async (ms) => { expect(ms).toBe(3000); sleeps++; },
+    })).toBe("pending");
+    expect({ reads, sleeps }).toEqual({ reads: 2, sleeps: 1 });
+  });
+
+  test("flush retry stays precision-biased: ordinary finals do not wait; unresolved ambiguity closes", async () => {
+    let sleeps = 0;
+    const deps = {
+      isAlive: () => true,
+      rolloutOf: async () => "/r/rollout.jsonl",
+      readTail: async () => normalAnswer(),
+      sleep: async () => { sleeps++; },
+    };
+    expect(await codexSettledPlanPickerState(42, "Done.", deps)).toBe("none");
+    expect(sleeps).toBe(0);
+    expect(await codexSettledPlanPickerState(42, "<proposed_plan>\nPlan\n</proposed_plan>", deps)).toBe("none");
+    expect(sleeps).toBe(1);
   });
 
   test("a later task_started or user_message explicitly resolves the pending picker", () => {

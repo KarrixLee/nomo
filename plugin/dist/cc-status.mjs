@@ -92,7 +92,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { execFileSync, spawn } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "1.4.5";
+var PLUGIN_VERSION = "1.4.6";
 var CC_DIR = `${process.env.HOME}/.config/cc-status`;
 var SESSIONS_DIR = `${CC_DIR}/sessions`;
 var WATCHDOG_PID_PATH = `${CC_DIR}/watchdog.pid`;
@@ -964,6 +964,12 @@ function codexTailPendingApproval(tail) {
   }
   return false;
 }
+function codexProposedPlanText(text) {
+  if (typeof text !== "string")
+    return false;
+  const trimmed = text.trim();
+  return trimmed.startsWith("<proposed_plan>") && trimmed.endsWith("</proposed_plan>");
+}
 function codexFinalProposedPlan(row) {
   const payload = row.payload;
   if (!payload || payload.phase !== "final_answer")
@@ -984,10 +990,9 @@ function codexFinalProposedPlan(row) {
   } else {
     return false;
   }
-  const trimmed = text.trim();
-  return trimmed.startsWith("<proposed_plan>") && trimmed.endsWith("</proposed_plan>");
+  return codexProposedPlanText(text);
 }
-function codexPlanPickerStateFromTail(tail) {
+function codexPlanPickerTailAnalysis(tail) {
   let state = "none";
   let finalPlanInTurn = false;
   for (const line of tail.split(`
@@ -1024,7 +1029,10 @@ function codexPlanPickerStateFromTail(tail) {
       finalPlanInTurn = false;
     }
   }
-  return state;
+  return { state, incompleteFinalPlan: finalPlanInTurn };
+}
+function codexPlanPickerStateFromTail(tail) {
+  return codexPlanPickerTailAnalysis(tail).state;
 }
 function codexTailPendingUserInput(tail) {
   const lines = tail.split(`
@@ -1289,18 +1297,34 @@ async function codexPidTurnActive(pid, deps = {}) {
     return false;
   }
 }
-async function codexPidPlanPickerState(pid, deps = {}) {
+var CODEX_PLAN_PICKER_FLUSH_GRACE_MS = 3000;
+async function codexPidPlanPickerAnalysis(pid, deps) {
   try {
     if (!(deps.isAlive ?? pidAlive)(pid))
-      return "exited";
+      return { state: "exited", incompleteFinalPlan: false };
     const rollout = await codexRolloutForPid(pid, deps);
     if (!rollout)
-      return "unknown";
+      return { state: "unknown", incompleteFinalPlan: false };
     const tail = await (deps.readTail ?? readSuffix)(rollout, PLAN_PICKER_TAIL_BYTES);
-    return codexPlanPickerStateFromTail(tail);
+    return codexPlanPickerTailAnalysis(tail);
   } catch {
-    return "unknown";
+    return { state: "unknown", incompleteFinalPlan: false };
   }
+}
+async function codexPidPlanPickerState(pid, deps = {}) {
+  return (await codexPidPlanPickerAnalysis(pid, deps)).state;
+}
+async function codexSettledPlanPickerState(pid, finalAssistantMessage, deps = {}) {
+  const first = await codexPidPlanPickerAnalysis(pid, deps);
+  if (first.state === "pending" || first.state === "resolved" || first.state === "exited")
+    return first.state;
+  if (!first.incompleteFinalPlan && !codexProposedPlanText(finalAssistantMessage))
+    return first.state;
+  const delay = deps.flushGraceMs ?? CODEX_PLAN_PICKER_FLUSH_GRACE_MS;
+  if (delay > 0) {
+    await (deps.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms))))(delay);
+  }
+  return (await codexPidPlanPickerAnalysis(pid, deps)).state;
 }
 function codexSentinelSessionId(pid) {
   return `codex-pid-${pid}`;
@@ -1559,8 +1583,8 @@ var codexAdapter = {
   tailPendingAttentionKind(tail) {
     return codexTailPendingAttentionKind(tail);
   },
-  completedTurnWaitState({ pid, transcriptPath }) {
-    return codexPidPlanPickerState(pid, transcriptPath ? { rolloutOf: async () => transcriptPath } : {});
+  completedTurnWaitState({ pid, transcriptPath, finalAssistantMessage }) {
+    return codexSettledPlanPickerState(pid, finalAssistantMessage, transcriptPath ? { rolloutOf: async () => transcriptPath } : {});
   },
   isChildSessionGhost({ sessionId, prefix, hookPid, tracked }) {
     return codexChildSessionGhost(sessionId, prefix, hookPid, tracked);
@@ -2006,7 +2030,8 @@ async function runHook(agent) {
     let pendingPlanPicker = false;
     let attentionKind;
     if (plan.op === "done" && adapter2.completedTurnWaitState) {
-      const wait = await adapter2.completedTurnWaitState({ pid: hookPid, transcriptPath });
+      const finalAssistantMessage = typeof input.last_assistant_message === "string" ? input.last_assistant_message : undefined;
+      const wait = await adapter2.completedTurnWaitState({ pid: hookPid, transcriptPath, finalAssistantMessage });
       if (wait === "pending") {
         plan = { op: "update", prio: 1, status: "needsAttention" };
         attentionKind = "userInput";
@@ -2109,12 +2134,14 @@ export {
   codexTailPendingUserInputDetail,
   codexTailPendingAttentionKind,
   codexTailPendingApproval,
+  codexSettledPlanPickerState,
   codexSessionTitle,
   codexSessionModel,
   codexSessionCreationSuppression,
   codexSentinelSessionId,
   codexRolloutExistsForSession,
   codexRolloutCreationEvidence,
+  codexProposedPlanText,
   codexPlanPickerStateFromTail,
   codexPidTurnActive,
   codexPidPlanPickerState,

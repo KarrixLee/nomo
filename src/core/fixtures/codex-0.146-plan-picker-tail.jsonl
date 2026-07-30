@@ -1,0 +1,4 @@
+{"timestamp":"2026-07-29T20:16:23.123Z","type":"event_msg","payload":{"type":"item_completed","thread_id":"019faef9-SANITIZED","turn_id":"019faf83-SANITIZED","completed_at_ms":1785356183123,"item":{"type":"Plan"}}}
+{"timestamp":"2026-07-29T20:16:23.130Z","type":"response_item","payload":{"type":"message","role":"assistant","phase":"final_answer","content":[{"type":"output_text","text":"<proposed_plan>\n# Sanitized validation plan\n\nValidate the requested behavior.\n</proposed_plan>"}]}}
+{"timestamp":"2026-07-29T20:16:23.142Z","type":"event_msg","payload":{"type":"token_count"}}
+{"timestamp":"2026-07-29T20:16:25.289Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"019faf83-SANITIZED","started_at":1785356028,"completed_at":1785356185,"duration_ms":156872,"time_to_first_token_ms":8115,"last_agent_message":null}}

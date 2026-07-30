@@ -785,7 +785,9 @@ export async function runHook(agent: AgentKind): Promise<void> {
     let pendingPlanPicker = false;
     let attentionKind: "userInput" | undefined;
     if (plan.op === "done" && adapter.completedTurnWaitState) {
-      const wait = await adapter.completedTurnWaitState({ pid: hookPid, transcriptPath });
+      const finalAssistantMessage = typeof input.last_assistant_message === "string"
+        ? input.last_assistant_message : undefined;
+      const wait = await adapter.completedTurnWaitState({ pid: hookPid, transcriptPath, finalAssistantMessage });
       if (wait === "pending") {
         plan = { op: "update", prio: 1, status: "needsAttention" };
         attentionKind = "userInput";
