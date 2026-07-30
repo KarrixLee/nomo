@@ -92,7 +92,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { execFileSync, spawn } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "1.4.7";
+var PLUGIN_VERSION = "1.4.8";
 var CC_DIR = `${process.env.HOME}/.config/cc-status`;
 var SESSIONS_DIR = `${CC_DIR}/sessions`;
 var WATCHDOG_PID_PATH = `${CC_DIR}/watchdog.pid`;
@@ -100,6 +100,36 @@ var LAST_SEND_PATH = `${CC_DIR}/last-send`;
 var GONE_STRIKES_PATH = `${CC_DIR}/gone-strikes`;
 var GONE_STRIKE_LIMIT = 2;
 var NO_HOLD_PATH = `${CC_DIR}/no-hold`;
+var BLOB_FIT_CHARS = 3008;
+function sealedBlobChars(plaintextBytes) {
+  return Math.ceil((12 + plaintextBytes + 16) / 3) * 4;
+}
+var PLAN_BLOB_TEXT_MAX_CHARS = 1800;
+var PLAN_BLOB_TRUNCATION_MARKER = `
+…`;
+function appendFittedPlan(base, plan) {
+  if (typeof plan !== "string" || plan.length === 0)
+    return base;
+  const chars = Array.from(plan);
+  const marker = PLAN_BLOB_TRUNCATION_MARKER;
+  const markerChars = Array.from(marker).length;
+  const encoder = new TextEncoder;
+  const fits = (value) => sealedBlobChars(encoder.encode(JSON.stringify({ ...base, plan: value })).length) <= BLOB_FIT_CHARS;
+  if (chars.length <= PLAN_BLOB_TEXT_MAX_CHARS && fits(plan))
+    return { ...base, plan };
+  if (!fits(marker))
+    return base;
+  let lo = 0;
+  let hi = Math.min(chars.length, PLAN_BLOB_TEXT_MAX_CHARS - markerChars);
+  while (lo < hi) {
+    const mid = Math.ceil((lo + hi) / 2);
+    if (fits(chars.slice(0, mid).join("") + marker))
+      lo = mid;
+    else
+      hi = mid - 1;
+  }
+  return { ...base, plan: chars.slice(0, lo).join("") + marker };
+}
 async function flagExists(path) {
   try {
     await access(path);
@@ -514,6 +544,40 @@ function pidCommand(pid) {
   } catch {
     return;
   }
+}
+function codexCompanionBrokerEvidence(pid, ancestorsOf = pidAncestors, commandOf = pidCommand) {
+  const appServer = /(?:^|[\/\s"'])codex(?:\.exe)?(?:["']?)\s+app-server(?:$|\s)/;
+  const brokerScript = /(?:^|[\/\s"'=])app-server-broker\.mjs(?:$|[\s"'])/;
+  const brokerSocket = /unix:\/\/[^\s"'<>]*\/cxc-[^/\s"'<>]+\/broker\.sock(?:$|[\s"'])/;
+  let ownerCommand;
+  try {
+    ownerCommand = commandOf(pid);
+  } catch {
+    return null;
+  }
+  if (typeof ownerCommand !== "string" || !appServer.test(ownerCommand))
+    return null;
+  let ancestors = [];
+  try {
+    ancestors = ancestorsOf(pid);
+  } catch {}
+  for (const candidate of [pid, ...ancestors]) {
+    let command;
+    try {
+      command = candidate === pid ? ownerCommand : commandOf(candidate);
+    } catch {
+      continue;
+    }
+    if (typeof command !== "string" || command.length === 0)
+      continue;
+    if (brokerScript.test(command)) {
+      return { pid: candidate, command, matchedBy: "app-server-broker.mjs" };
+    }
+    if (brokerSocket.test(command)) {
+      return { pid: candidate, command, matchedBy: "cxc-broker-socket" };
+    }
+  }
+  return null;
 }
 
 // src/core/adapter.ts
@@ -965,20 +1029,27 @@ function codexTailPendingApproval(tail) {
   return false;
 }
 function codexProposedPlanText(text) {
+  return codexProposedPlanMarkdown(text) !== undefined;
+}
+function codexProposedPlanMarkdown(text) {
   if (typeof text !== "string")
-    return false;
+    return;
   const trimmed = text.trim();
-  return trimmed.startsWith("<proposed_plan>") && trimmed.endsWith("</proposed_plan>");
+  const open2 = "<proposed_plan>";
+  const close = "</proposed_plan>";
+  if (!trimmed.startsWith(open2) || !trimmed.endsWith(close))
+    return;
+  return trimmed.slice(open2.length, -close.length).trim();
 }
 function codexFinalProposedPlan(row) {
   const payload = row.payload;
   if (!payload || payload.phase !== "final_answer")
-    return false;
+    return;
   let text = "";
   if (row.type === "response_item" && payload.type === "message" && payload.role === "assistant") {
     const content = payload.content;
     if (!Array.isArray(content))
-      return false;
+      return;
     text = content.map((part) => {
       if (typeof part !== "object" || part === null)
         return "";
@@ -988,13 +1059,14 @@ function codexFinalProposedPlan(row) {
   } else if (row.type === "event_msg" && payload.type === "agent_message") {
     text = typeof payload.message === "string" ? payload.message : "";
   } else {
-    return false;
+    return;
   }
-  return codexProposedPlanText(text);
+  return codexProposedPlanMarkdown(text);
 }
 function codexPlanPickerTailAnalysis(tail) {
   let state = "none";
-  let finalPlanInTurn = false;
+  let plan;
+  let finalPlanInTurn;
   for (const line of tail.split(`
 `)) {
     if (!line.trim())
@@ -1010,26 +1082,31 @@ function codexPlanPickerTailAnalysis(tail) {
     if (typeof row !== "object" || row === null)
       continue;
     const r = row;
-    if (codexFinalProposedPlan(r)) {
-      finalPlanInTurn = true;
+    const finalPlan = codexFinalProposedPlan(r);
+    if (finalPlan !== undefined) {
+      finalPlanInTurn = finalPlan;
       continue;
     }
     if (r.type !== "event_msg")
       continue;
     const ptype = r.payload?.type;
     if (ptype === "task_complete") {
-      if (finalPlanInTurn)
+      if (finalPlanInTurn !== undefined) {
         state = "pending";
-      finalPlanInTurn = false;
+        plan = finalPlanInTurn;
+      }
+      finalPlanInTurn = undefined;
     } else if (ptype === "task_started" || ptype === "user_message") {
-      if (state === "pending")
+      if (state === "pending") {
         state = "resolved";
-      finalPlanInTurn = false;
+        plan = undefined;
+      }
+      finalPlanInTurn = undefined;
     } else if (ptype === "turn_aborted") {
-      finalPlanInTurn = false;
+      finalPlanInTurn = undefined;
     }
   }
-  return { state, incompleteFinalPlan: finalPlanInTurn };
+  return { state, ...state === "pending" && plan !== undefined ? { plan } : {}, incompleteFinalPlan: finalPlanInTurn !== undefined };
 }
 function codexPlanPickerStateFromTail(tail) {
   return codexPlanPickerTailAnalysis(tail).state;
@@ -1308,6 +1385,7 @@ async function codexPidPlanPickerAnalysis(pid, deps) {
     const analysis = codexPlanPickerTailAnalysis(tail);
     return {
       state: analysis.incompleteFinalPlan ? "incomplete" : analysis.state,
+      ...!analysis.incompleteFinalPlan && analysis.plan !== undefined ? { plan: analysis.plan } : {},
       incompleteFinalPlan: analysis.incompleteFinalPlan
     };
   } catch {
@@ -1316,6 +1394,10 @@ async function codexPidPlanPickerAnalysis(pid, deps) {
 }
 async function codexPidPlanPickerState(pid, deps = {}) {
   return (await codexPidPlanPickerAnalysis(pid, deps)).state;
+}
+async function codexPidPlanPickerEvidence(pid, deps = {}) {
+  const { state, plan } = await codexPidPlanPickerAnalysis(pid, deps);
+  return { state, ...state === "pending" && plan !== undefined ? { plan } : {} };
 }
 function codexSentinelSessionId(pid) {
   return `codex-pid-${pid}`;
@@ -1577,6 +1659,9 @@ var codexAdapter = {
   completedTurnWaitState({ pid, transcriptPath }) {
     return codexPidPlanPickerState(pid, transcriptPath ? { rolloutOf: async () => transcriptPath } : {});
   },
+  completedTurnWaitEvidence({ pid, transcriptPath }) {
+    return codexPidPlanPickerEvidence(pid, transcriptPath ? { rolloutOf: async () => transcriptPath } : {});
+  },
   isChildSessionGhost({ sessionId, prefix, hookPid, tracked }) {
     return codexChildSessionGhost(sessionId, prefix, hookPid, tracked);
   },
@@ -1621,6 +1706,23 @@ function asRecord(value) {
 }
 function parseRequestId(value) {
   return typeof value === "string" || typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+function parseThreadStatus(value) {
+  const status = asRecord(value);
+  if (!status || typeof status.type !== "string")
+    return;
+  if (status.type === "notLoaded" || status.type === "idle" || status.type === "systemError") {
+    return { type: status.type };
+  }
+  if (status.type !== "active" || !Array.isArray(status.activeFlags))
+    return;
+  const activeFlags = [];
+  for (const flag of status.activeFlags) {
+    if (flag !== "waitingOnApproval" && flag !== "waitingOnUserInput")
+      return;
+    activeFlags.push(flag);
+  }
+  return { type: "active", activeFlags };
 }
 function parseQuestion(value) {
   const q = asRecord(value);
@@ -1775,6 +1877,17 @@ class CodexAppServerClient {
     if (!result || !thread || thread.id !== threadId)
       throw new Error("Invalid thread/resume response");
     return { ...result, thread };
+  }
+  async readThreadStatus(threadId) {
+    if (threadId.length === 0)
+      throw new Error("threadId is required");
+    const result = asRecord(await this.request("thread/read", { threadId, includeTurns: false }));
+    const thread = asRecord(result?.thread);
+    const status = parseThreadStatus(thread?.status);
+    if (!result || !thread || thread.id !== threadId || !status) {
+      throw new Error("Invalid thread/read response");
+    }
+    return status;
   }
   async answerUserInput(identity, answers) {
     const key = rpcIdKey(identity.requestId);
@@ -2581,11 +2694,11 @@ function transcriptStartMs(prefix) {
   }
   return;
 }
-function buildBlob(input, machine, title, plan, agent = "claude", turnStartedAt, pinnedLabel, model, at) {
+function buildBlob(input, machine, title, plan, agent = "claude", turnStartedAt, pinnedLabel, model, at, proposedPlan) {
   const label = typeof pinnedLabel === "string" && pinnedLabel.length > 0 ? pinnedLabel : typeof input.cwd === "string" && input.cwd.length > 0 ? basename2(input.cwd) : "session";
   const hookName = typeof input.hook_event_name === "string" ? input.hook_event_name : "";
   const detail = detailForHook(hookName, typeof input.tool_name === "string" ? input.tool_name : undefined, input.tool_input);
-  return {
+  const base = {
     status: plan.status,
     title: title ?? "",
     machine,
@@ -2596,8 +2709,9 @@ function buildBlob(input, machine, title, plan, agent = "claude", turnStartedAt,
     ...typeof model === "string" && model.length > 0 ? { model } : {},
     ...typeof at === "number" && Number.isFinite(at) ? { at } : {}
   };
+  return appendFittedPlan(base, proposedPlan);
 }
-async function buildEnvelope(input, machine, now, title, e2eKey, sentDone, agent = "claude", startedAt, turnStartedAt, pinnedLabel, model, planOverride, attentionKindOverride) {
+async function buildEnvelope(input, machine, now, title, e2eKey, sentDone, agent = "claude", startedAt, turnStartedAt, pinnedLabel, model, planOverride, attentionKindOverride, proposedPlan) {
   if (typeof input !== "object" || input === null)
     return null;
   const i = input;
@@ -2611,7 +2725,7 @@ async function buildEnvelope(input, machine, now, title, e2eKey, sentDone, agent
   if (typeof startedAt === "number" && Number.isFinite(startedAt))
     base.startedAt = startedAt;
   const at = Math.floor(now / 1000);
-  const blob = await encryptBlob(e2eKey, buildBlob(i, machine, title, plan, agent, turnStartedAt, pinnedLabel, model, at));
+  const blob = await encryptBlob(e2eKey, buildBlob(i, machine, title, plan, agent, turnStartedAt, pinnedLabel, model, at, proposedPlan));
   const attentionKind = attentionKindOverride ?? (agent === "codex" && hookName === "PreToolUse" && i.tool_name === "request_user_input" ? "userInput" : undefined);
   return { ...base, ...attentionKind ? { attentionKind } : {}, blob };
 }
@@ -2641,11 +2755,12 @@ async function trackSession(sessionId, op, prio, status, blob, machine, label, t
       await unlink2(path).catch(() => {});
       return;
     }
+    const recordedAt = Date.now();
     const record = {
       pid,
       machine,
       label,
-      ts: Date.now(),
+      ts: recordedAt,
       transcript,
       lastEvent: op === "start" ? "sessionStart" : status,
       sentDone: op === "done",
@@ -2662,6 +2777,7 @@ async function trackSession(sessionId, op, prio, status, blob, machine, label, t
       ...typeof pairingId === "string" && pairingId.length > 0 ? { pairingId } : {},
       ...pendingPlanPicker ? { pendingPlanPicker: true } : {},
       ...planPickerVerificationPending ? { planPickerVerificationPending: true } : {},
+      ...pendingPlanPicker || planPickerVerificationPending ? { planPickerPendingSince: recordedAt } : {},
       ...origin ? { origin } : {}
     };
     await atomicWrite(path, JSON.stringify(record), 384);
@@ -2816,6 +2932,21 @@ async function runHook(agent) {
       ...suppression,
       ...extra
     });
+    const companionBroker = agent === "codex" ? codexCompanionBrokerEvidence(hookPid, pidAncestors, pidCommand) : null;
+    if (companionBroker) {
+      const reason = `broker ancestry proven by ${companionBroker.matchedBy}`;
+      if (existingRecord) {
+        await retireLineageSession(config, reportedSessionId, agent, input, `codex companion ${reason}`);
+      }
+      suppress({
+        guard: "codex-companion-broker",
+        reason
+      }, {
+        brokerPid: companionBroker.pid,
+        brokerMatch: companionBroker.matchedBy
+      });
+      return;
+    }
     const clearLineage = !existingRecord && hookName === "SessionStart" && sessionStartSource === "clear" && adapter2.clearPredecessor;
     if (clearLineage && adapter2.clearPredecessor) {
       const predecessor = adapter2.clearPredecessor({
@@ -2903,19 +3034,22 @@ async function runHook(agent) {
     let pendingPlanPicker = false;
     let planPickerVerificationPending = false;
     let attentionKind;
+    let proposedPlan;
     if (plan.op === "done" && adapter2.completedTurnWaitState) {
-      const wait = await adapter2.completedTurnWaitState({ pid: hookPid, transcriptPath });
+      const evidence = adapter2.completedTurnWaitEvidence ? await adapter2.completedTurnWaitEvidence({ pid: hookPid, transcriptPath }) : { state: await adapter2.completedTurnWaitState({ pid: hookPid, transcriptPath }) };
+      const wait = evidence.state;
       if (wait === "pending") {
         plan = { op: "update", prio: 1, status: "needsAttention" };
         attentionKind = "userInput";
         pendingPlanPicker = true;
+        proposedPlan = evidence.plan;
       } else if (wait === "incomplete") {
         plan = { op: "update", prio: 0, status: "working" };
         planPickerVerificationPending = true;
       }
     }
     const label = typeof existingRecord?.label === "string" && existingRecord.label.length > 0 ? existingRecord.label : typeof input.cwd === "string" && input.cwd.length > 0 ? basename2(input.cwd) : "session";
-    const envelope = await buildEnvelope(eventInput, machine, Date.now(), title, config.e2eKey, sentDone, agent, startedAt, turnStartedAt, label, model, plan, attentionKind);
+    const envelope = await buildEnvelope(eventInput, machine, Date.now(), title, config.e2eKey, sentDone, agent, startedAt, turnStartedAt, label, model, plan, attentionKind, proposedPlan);
     if (!envelope)
       return;
     const createsRecord = !existingRecord && plan.op !== "end";
@@ -3340,13 +3474,7 @@ function buildPermissionQuestions(toolInput) {
     };
   });
 }
-var MAX_BLOB_CHARS = 3072;
-var BLOB_FIT_MARGIN = 64;
-var BLOB_FIT_CHARS = MAX_BLOB_CHARS - BLOB_FIT_MARGIN;
 var MAX_DETAIL_CHARS = 20000;
-function sealedBlobChars(plaintextBytes) {
-  return Math.ceil((12 + plaintextBytes + 16) / 3) * 4;
-}
 function fitPermissionDetail(base, detail, maxChars = BLOB_FIT_CHARS, questions = []) {
   const all = Array.from(detail);
   const hardLoss = Math.max(0, all.length - MAX_DETAIL_CHARS);
@@ -4021,6 +4149,21 @@ class CodexRemoteInputBridge {
     });
     return this.refreshPromise;
   }
+  async readThreadWaitState(threadId) {
+    if (this.client.state !== "ready" || this.stopping)
+      return "unavailable";
+    try {
+      const status = await this.client.readThreadStatus(threadId);
+      if (status.type === "idle")
+        return "notWaitingOnUserInput";
+      if (status.type === "active") {
+        return status.activeFlags.includes("waitingOnUserInput") ? "waitingOnUserInput" : "notWaitingOnUserInput";
+      }
+      return "unavailable";
+    } catch {
+      return "unavailable";
+    }
+  }
   async stop() {
     if (this.stopping)
       return;
@@ -4186,8 +4329,8 @@ async function buildDoneEnvelope(sessionId, record, now, e2eKey, agent = "claude
   });
   return { v: 2, sessionId, op: "done", prio: 0, ts: now, blob, ...startedAtField(record) };
 }
-async function buildNeedsAttentionEnvelope(sessionId, record, now, e2eKey, agent = "claude", at, detail, attentionKind) {
-  const blob = await encryptBlob(e2eKey, {
+async function buildNeedsAttentionEnvelope(sessionId, record, now, e2eKey, agent = "claude", at, detail, attentionKind, proposedPlan) {
+  const base = {
     status: "needsAttention",
     title: typeof record.title === "string" ? record.title : "",
     machine: typeof record.machine === "string" ? record.machine : "",
@@ -4197,7 +4340,8 @@ async function buildNeedsAttentionEnvelope(sessionId, record, now, e2eKey, agent
     ...typeof record.turnStartedAt === "number" && Number.isFinite(record.turnStartedAt) ? { turnStartedAt: record.turnStartedAt } : {},
     ...typeof record.model === "string" && record.model.length > 0 ? { model: record.model } : {},
     ...typeof at === "number" && Number.isFinite(at) ? { at } : {}
-  });
+  };
+  const blob = await encryptBlob(e2eKey, appendFittedPlan(base, proposedPlan));
   return {
     v: 2,
     sessionId,
@@ -4222,10 +4366,57 @@ async function buildWorkingEnvelope(sessionId, record, now, e2eKey, agent = "cla
   });
   return { v: 2, sessionId, op: "update", prio: 0, ts: now, blob, ...startedAtField(record) };
 }
+async function settlePendingPlanPickerDone(config, path, sessionId, snapshot, now, deps) {
+  const readCurrent = deps.readRecord ?? readRecordAt;
+  const writeRecord = deps.writeRecord ?? ((p, rec) => atomicWrite(p, JSON.stringify(rec), 384));
+  const fresh = await readCurrent(path);
+  if (!fresh || recordMovedSince(snapshot, fresh) || fresh.turnId !== snapshot.turnId || fresh.pendingPlanPicker !== snapshot.pendingPlanPicker || fresh.planPickerVerificationPending !== snapshot.planPickerVerificationPending) {
+    return "uncorrected";
+  }
+  const at = typeof snapshot.ts === "number" && Number.isFinite(snapshot.ts) ? Math.floor(snapshot.ts / 1000) : undefined;
+  const envelope = await buildDoneEnvelope(sessionId, snapshot, now, config.e2eKey, "codex", at);
+  const next = {
+    ...fresh,
+    lastEvent: "done",
+    sentDone: true,
+    donePending: true,
+    op: "done",
+    prio: 0,
+    blob: envelope.blob,
+    pairingId: config.pairingId,
+    pendingPlanPicker: undefined,
+    planPickerVerificationPending: undefined,
+    planPickerPendingSince: undefined,
+    planPickerSettled: true,
+    doneAttempts: undefined
+  };
+  await writeRecord(path, next);
+  let outcome;
+  try {
+    outcome = await (deps.post ?? ((body) => postEvent(config, body)))(envelope);
+  } catch {
+    return "pending";
+  }
+  if (outcome === "revoked")
+    return "revoked";
+  if (outcome !== "delivered")
+    return "pending";
+  try {
+    const after = await readCurrent(path);
+    if (after?.donePending === true && after.blob === next.blob && after.op === "done") {
+      await writeRecord(path, { ...after, donePending: undefined });
+    }
+  } catch {}
+  return "corrected";
+}
 async function correctResolvedPlanPicker(config, path, sessionId, record, deps = {}) {
   try {
     if (record.pendingPlanPicker !== true)
       return "uncorrected";
+    const now = (deps.now ?? Date.now)();
+    if (planPickerPendingExpired(record, now)) {
+      return await settlePendingPlanPickerDone(config, path, sessionId, record, now, deps);
+    }
     const agent = record.agent === "codex" ? "codex" : "claude";
     const adapter2 = adapterFor(agent);
     if (!adapter2.completedTurnWaitState)
@@ -4234,15 +4425,16 @@ async function correctResolvedPlanPicker(config, path, sessionId, record, deps =
       pid: record.pid,
       transcriptPath: typeof record.transcript === "string" ? record.transcript : undefined
     })))();
+    if (state === "pending" && deps.threadWaitState) {
+      const threadState = await deps.threadWaitState();
+      if (threadState === "notWaitingOnUserInput") {
+        return await settlePendingPlanPickerDone(config, path, sessionId, record, now, deps);
+      }
+      return "uncorrected";
+    }
     if (state !== "resolved")
       return "uncorrected";
-    const now = (deps.now ?? Date.now)();
     const envelope = await buildWorkingEnvelope(sessionId, record, now, config.e2eKey, agent);
-    const outcome = await (deps.post ?? ((body) => postEvent(config, body)))(envelope);
-    if (outcome === "revoked")
-      return "revoked";
-    if (outcome !== "delivered")
-      return "uncorrected";
     const next = {
       ...record,
       ts: now,
@@ -4252,17 +4444,28 @@ async function correctResolvedPlanPicker(config, path, sessionId, record, deps =
       prio: 0,
       blob: envelope.blob,
       pairingId: config.pairingId,
-      pendingPlanPicker: undefined
+      pendingPlanPicker: undefined,
+      planPickerPendingSince: undefined,
+      planPickerSettled: undefined
     };
+    await (deps.writeRecord ?? ((p, rec) => atomicWrite(p, JSON.stringify(rec), 384)))(path, next);
+    let outcome;
     try {
-      await (deps.writeRecord ?? ((p, rec) => atomicWrite(p, JSON.stringify(rec), 384)))(path, next);
-    } catch {}
+      outcome = await (deps.post ?? ((body) => postEvent(config, body)))(envelope);
+    } catch {
+      return "pending";
+    }
+    if (outcome === "revoked")
+      return "revoked";
+    if (outcome !== "delivered")
+      return "pending";
     return "corrected";
   } catch {
     return "uncorrected";
   }
 }
 var PLAN_PICKER_VERIFY_MAX_MS = 30000;
+var PLAN_PICKER_PENDING_MAX_MS = 60 * 60000;
 var PLAN_PICKER_RECENT_DONE_MS = 30 * 60000;
 function shouldPlanPickerVerificationCheck(record, now) {
   if (record.agent !== "codex" || record.provisional === true)
@@ -4271,6 +4474,8 @@ function shouldPlanPickerVerificationCheck(record, now) {
     return false;
   if (record.planPickerVerificationPending === true)
     return true;
+  if (record.planPickerSettled === true)
+    return false;
   if (record.op !== "done" || record.lastEvent !== "done" || record.sentDone !== true)
     return false;
   if (typeof record.ts !== "number" || !Number.isFinite(record.ts))
@@ -4278,65 +4483,90 @@ function shouldPlanPickerVerificationCheck(record, now) {
   const age = now - record.ts;
   return age >= 0 && age <= PLAN_PICKER_RECENT_DONE_MS;
 }
+function planPickerPendingExpired(record, now) {
+  if (record.planPickerVerificationPending !== true && record.pendingPlanPicker !== true)
+    return false;
+  const since = typeof record.planPickerPendingSince === "number" && Number.isFinite(record.planPickerPendingSince) ? record.planPickerPendingSince : typeof record.ts === "number" && Number.isFinite(record.ts) ? record.ts : -Infinity;
+  return now - since >= PLAN_PICKER_PENDING_MAX_MS;
+}
 async function correctPlanPickerVerification(config, path, sessionId, record, deps = {}) {
   try {
     const now = (deps.now ?? Date.now)();
     if (!shouldPlanPickerVerificationCheck(record, now))
       return "uncorrected";
-    const state = await (deps.state ?? (() => codexAdapter.completedTurnWaitState({
-      pid: record.pid,
-      transcriptPath: record.transcript
-    })))();
     const readCurrent = deps.readRecord ?? readRecordAt;
     const writeRecord = deps.writeRecord ?? ((p, rec) => atomicWrite(p, JSON.stringify(rec), 384));
     const post = deps.post ?? ((body) => postEvent(config, body));
     const freshUnchanged = async () => {
-      const fresh2 = await readCurrent(path);
-      if (!fresh2 || recordMovedSince(record, fresh2))
+      const fresh = await readCurrent(path);
+      if (!fresh || recordMovedSince(record, fresh))
         return null;
-      if (fresh2.turnId !== record.turnId)
+      if (fresh.turnId !== record.turnId)
         return null;
-      if (fresh2.planPickerVerificationPending !== record.planPickerVerificationPending)
+      if (fresh.planPickerVerificationPending !== record.planPickerVerificationPending)
         return null;
-      return fresh2;
+      return fresh;
     };
+    if (record.planPickerVerificationPending === true && planPickerPendingExpired(record, now)) {
+      return await settlePendingPlanPickerDone(config, path, sessionId, record, now, deps);
+    }
+    const evidence = deps.evidence ? await deps.evidence() : deps.state ? { state: await deps.state() } : await codexAdapter.completedTurnWaitEvidence({
+      pid: record.pid,
+      transcriptPath: record.transcript
+    });
+    const state = evidence.state;
     if (state === "exited")
       return "uncorrected";
     if (state === "resolved") {
       if (record.planPickerVerificationPending !== true)
         return "uncorrected";
-      const fresh2 = await freshUnchanged();
-      if (!fresh2)
+      const fresh = await freshUnchanged();
+      if (!fresh)
         return "uncorrected";
-      await writeRecord(path, { ...fresh2, planPickerVerificationPending: undefined });
+      await writeRecord(path, {
+        ...fresh,
+        planPickerVerificationPending: undefined,
+        planPickerPendingSince: undefined
+      });
       return "pending";
     }
     if (state === "pending") {
-      if (!await freshUnchanged())
-        return "uncorrected";
-      const envelope2 = await buildNeedsAttentionEnvelope(sessionId, record, now, config.e2eKey, "codex", Math.floor(now / 1000), undefined, "userInput");
-      const outcome2 = await post(envelope2);
-      if (outcome2 === "revoked")
-        return "revoked";
-      if (outcome2 !== "delivered")
-        return "pending";
-      const fresh2 = await freshUnchanged();
-      if (fresh2) {
-        await writeRecord(path, {
-          ...fresh2,
-          ts: now,
-          lastEvent: "needsAttention",
-          sentDone: false,
-          op: "update",
-          prio: 1,
-          blob: envelope2.blob,
-          pairingId: config.pairingId,
-          pendingPlanPicker: true,
-          planPickerVerificationPending: undefined,
-          donePending: undefined,
-          doneAttempts: undefined
-        });
+      if (deps.threadWaitState) {
+        const threadState = await deps.threadWaitState();
+        if (threadState === "notWaitingOnUserInput") {
+          return record.planPickerVerificationPending === true ? await settlePendingPlanPickerDone(config, path, sessionId, record, now, deps) : "uncorrected";
+        }
       }
+      const fresh = await freshUnchanged();
+      if (!fresh)
+        return "uncorrected";
+      const envelope = await buildNeedsAttentionEnvelope(sessionId, record, now, config.e2eKey, "codex", Math.floor(now / 1000), undefined, "userInput", evidence.plan);
+      await writeRecord(path, {
+        ...fresh,
+        ts: now,
+        lastEvent: "needsAttention",
+        sentDone: false,
+        op: "update",
+        prio: 1,
+        blob: envelope.blob,
+        pairingId: config.pairingId,
+        pendingPlanPicker: true,
+        planPickerVerificationPending: undefined,
+        planPickerPendingSince: now,
+        planPickerSettled: undefined,
+        donePending: undefined,
+        doneAttempts: undefined
+      });
+      let outcome;
+      try {
+        outcome = await post(envelope);
+      } catch {
+        return "pending";
+      }
+      if (outcome === "revoked")
+        return "revoked";
+      if (outcome !== "delivered")
+        return "pending";
       return "corrected";
     }
     if (record.planPickerVerificationPending !== true)
@@ -4344,32 +4574,7 @@ async function correctPlanPickerVerification(config, path, sessionId, record, de
     const age = typeof record.ts === "number" && Number.isFinite(record.ts) ? now - record.ts : Infinity;
     if (age < PLAN_PICKER_VERIFY_MAX_MS)
       return "pending";
-    if (!await freshUnchanged())
-      return "uncorrected";
-    const at = typeof record.ts === "number" && Number.isFinite(record.ts) ? Math.floor(record.ts / 1000) : undefined;
-    const envelope = await buildDoneEnvelope(sessionId, record, now, config.e2eKey, "codex", at);
-    const outcome = await post(envelope);
-    if (outcome === "revoked")
-      return "revoked";
-    if (outcome !== "delivered")
-      return "pending";
-    const fresh = await freshUnchanged();
-    if (fresh) {
-      await writeRecord(path, {
-        ...fresh,
-        lastEvent: "done",
-        sentDone: true,
-        op: "done",
-        prio: 0,
-        blob: envelope.blob,
-        pairingId: config.pairingId,
-        planPickerVerificationPending: undefined,
-        pendingPlanPicker: undefined,
-        donePending: undefined,
-        doneAttempts: undefined
-      });
-    }
-    return "corrected";
+    return await settlePendingPlanPickerDone(config, path, sessionId, record, now, deps);
   } catch {
     return "uncorrected";
   }
@@ -4918,7 +5123,7 @@ function shouldHeartbeat(record, now, lastHeartbeat, correctedThisSweep) {
     return false;
   return true;
 }
-async function sweep(config) {
+async function sweep(config, deps = {}) {
   let files;
   try {
     files = await readdir3(SESSIONS_DIR);
@@ -4943,7 +5148,9 @@ async function sweep(config) {
     if (verdict === "keep") {
       let planVerificationHandled = false;
       if (config && record) {
-        const verification = await correctPlanPickerVerification(config, path, sessionId, record);
+        const verification = await correctPlanPickerVerification(config, path, sessionId, record, {
+          ...deps.threadWaitState ? { threadWaitState: () => deps.threadWaitState(sessionId) } : {}
+        });
         if (verification === "revoked")
           return { revoked: true };
         if (verification === "corrected")
@@ -4980,20 +5187,23 @@ async function sweep(config) {
           return { revoked: true };
         if (idleFix === "corrected")
           delivered = true;
-        const planResolution = await correctResolvedPlanPicker(config, path, sessionId, record);
+        const planResolution = await correctResolvedPlanPicker(config, path, sessionId, record, {
+          ...deps.threadWaitState ? { threadWaitState: () => deps.threadWaitState(sessionId) } : {}
+        });
         if (planResolution === "revoked")
           return { revoked: true };
         const resolvedPlan = planResolution === "corrected";
+        const planResolutionHandled = resolvedPlan || planResolution === "pending";
         if (resolvedPlan)
           delivered = true;
-        const corrected = resolvedPlan ? "uncorrected" : await correctInterrupt(config, path, sessionId, record, now);
+        const corrected = planResolutionHandled ? "uncorrected" : await correctInterrupt(config, path, sessionId, record, now);
         if (corrected === "revoked")
           return { revoked: true };
         if (corrected === "corrected")
           delivered = true;
         const interruptHandled = corrected === "corrected" || corrected === "pending";
         let flaggedAttention = false;
-        if (!resolvedPlan && !interruptHandled) {
+        if (!planResolutionHandled && !interruptHandled) {
           const attn = await correctPendingApproval(config, path, sessionId, record, now);
           if (attn === "revoked")
             return { revoked: true };
@@ -5003,7 +5213,7 @@ async function sweep(config) {
           }
         }
         let reapedIdle = false;
-        if (idleFix !== "corrected" && !resolvedPlan && !interruptHandled && !flaggedAttention) {
+        if (idleFix !== "corrected" && !planResolutionHandled && !interruptHandled && !flaggedAttention) {
           const idleClaude = await correctIdleClaude(config, path, sessionId, record, now);
           if (idleClaude === "revoked")
             return { revoked: true };
@@ -5013,7 +5223,7 @@ async function sweep(config) {
             delivered = true;
         }
         let repairedTitle = false;
-        if (idleFix !== "corrected" && !resolvedPlan && !interruptHandled && !flaggedAttention && !reapedIdle) {
+        if (idleFix !== "corrected" && !planResolutionHandled && !interruptHandled && !flaggedAttention && !reapedIdle) {
           const titleFix = await repairTitle(config, path, sessionId, record);
           if (titleFix === "revoked")
             return { revoked: true };
@@ -5022,7 +5232,7 @@ async function sweep(config) {
             repairedTitle = true;
           }
         }
-        if (shouldHeartbeat(record, now, heartbeatAt.get(sessionId), idleFix === "corrected" || resolvedPlan || interruptHandled || flaggedAttention || reapedIdle || repairedTitle)) {
+        if (shouldHeartbeat(record, now, heartbeatAt.get(sessionId), idleFix === "corrected" || planResolutionHandled || interruptHandled || flaggedAttention || reapedIdle || repairedTitle)) {
           const beat = buildHeartbeatEnvelope(sessionId, record, Date.now(), config.pairingId);
           if (beat) {
             const outcome = await postEvent(config, beat);
@@ -5067,6 +5277,7 @@ async function goneStrikeShouldTeardown(goneStrikesPath) {
 }
 var activeBridgeShutdown;
 var BRIDGE_OP_DEADLINE_MS = 15000;
+var PLAN_PICKER_STATUS_QUERY_DEADLINE_MS = 2000;
 function withDeadline(work, ms) {
   let timer;
   const deadline = new Promise((resolve2) => {
@@ -5147,6 +5358,23 @@ function createBridgeSupervisor(deps = {}) {
     shutdown() {
       teardown();
     },
+    async threadWaitState(threadId) {
+      if (!bridge?.readThreadWaitState)
+        return "unavailable";
+      let available = false;
+      try {
+        available = await probe();
+      } catch {
+        return "unavailable";
+      }
+      if (!available)
+        return "unavailable";
+      try {
+        return await withDeadline(bridge.readThreadWaitState(threadId), PLAN_PICKER_STATUS_QUERY_DEADLINE_MS) ?? "unavailable";
+      } catch {
+        return "unavailable";
+      }
+    },
     get active() {
       return bridge !== undefined;
     }
@@ -5208,7 +5436,9 @@ async function run() {
         await reconcileProvisionalsSweep(config);
         await discoverLiveSessions(config);
       }
-      const result = await sweep(config);
+      const result = await sweep(config, {
+        threadWaitState: (threadId) => bridges.threadWaitState(threadId)
+      });
       if (result.revoked) {
         if (await goneStrikeShouldTeardown()) {
           await removeRevokedConfig();
@@ -5290,6 +5520,7 @@ export {
   reconcileProvisionalsSweep,
   provisionalsCoveredByReal,
   postOutcomeForStatus,
+  planPickerPendingExpired,
   pendingPairingExpired,
   pendingDoneSettleWrite,
   pendingDoneRetryWrite,
@@ -5325,6 +5556,7 @@ export {
   buildDoneEnvelope,
   PLAN_PICKER_VERIFY_MAX_MS,
   PLAN_PICKER_RECENT_DONE_MS,
+  PLAN_PICKER_PENDING_MAX_MS,
   PAIRING_TTL_MS,
   IDLE_GRACE_MS
 };

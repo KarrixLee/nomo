@@ -92,7 +92,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { execFileSync, spawn } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "1.4.7";
+var PLUGIN_VERSION = "1.4.8";
 var CC_DIR = `${process.env.HOME}/.config/cc-status`;
 var SESSIONS_DIR = `${CC_DIR}/sessions`;
 var WATCHDOG_PID_PATH = `${CC_DIR}/watchdog.pid`;
@@ -100,6 +100,36 @@ var LAST_SEND_PATH = `${CC_DIR}/last-send`;
 var GONE_STRIKES_PATH = `${CC_DIR}/gone-strikes`;
 var GONE_STRIKE_LIMIT = 2;
 var NO_HOLD_PATH = `${CC_DIR}/no-hold`;
+var BLOB_FIT_CHARS = 3008;
+function sealedBlobChars(plaintextBytes) {
+  return Math.ceil((12 + plaintextBytes + 16) / 3) * 4;
+}
+var PLAN_BLOB_TEXT_MAX_CHARS = 1800;
+var PLAN_BLOB_TRUNCATION_MARKER = `
+…`;
+function appendFittedPlan(base, plan) {
+  if (typeof plan !== "string" || plan.length === 0)
+    return base;
+  const chars = Array.from(plan);
+  const marker = PLAN_BLOB_TRUNCATION_MARKER;
+  const markerChars = Array.from(marker).length;
+  const encoder = new TextEncoder;
+  const fits = (value) => sealedBlobChars(encoder.encode(JSON.stringify({ ...base, plan: value })).length) <= BLOB_FIT_CHARS;
+  if (chars.length <= PLAN_BLOB_TEXT_MAX_CHARS && fits(plan))
+    return { ...base, plan };
+  if (!fits(marker))
+    return base;
+  let lo = 0;
+  let hi = Math.min(chars.length, PLAN_BLOB_TEXT_MAX_CHARS - markerChars);
+  while (lo < hi) {
+    const mid = Math.ceil((lo + hi) / 2);
+    if (fits(chars.slice(0, mid).join("") + marker))
+      lo = mid;
+    else
+      hi = mid - 1;
+  }
+  return { ...base, plan: chars.slice(0, lo).join("") + marker };
+}
 async function flagExists(path) {
   try {
     await access(path);
@@ -514,6 +544,40 @@ function pidCommand(pid) {
   } catch {
     return;
   }
+}
+function codexCompanionBrokerEvidence(pid, ancestorsOf = pidAncestors, commandOf = pidCommand) {
+  const appServer = /(?:^|[\/\s"'])codex(?:\.exe)?(?:["']?)\s+app-server(?:$|\s)/;
+  const brokerScript = /(?:^|[\/\s"'=])app-server-broker\.mjs(?:$|[\s"'])/;
+  const brokerSocket = /unix:\/\/[^\s"'<>]*\/cxc-[^/\s"'<>]+\/broker\.sock(?:$|[\s"'])/;
+  let ownerCommand;
+  try {
+    ownerCommand = commandOf(pid);
+  } catch {
+    return null;
+  }
+  if (typeof ownerCommand !== "string" || !appServer.test(ownerCommand))
+    return null;
+  let ancestors = [];
+  try {
+    ancestors = ancestorsOf(pid);
+  } catch {}
+  for (const candidate of [pid, ...ancestors]) {
+    let command;
+    try {
+      command = candidate === pid ? ownerCommand : commandOf(candidate);
+    } catch {
+      continue;
+    }
+    if (typeof command !== "string" || command.length === 0)
+      continue;
+    if (brokerScript.test(command)) {
+      return { pid: candidate, command, matchedBy: "app-server-broker.mjs" };
+    }
+    if (brokerSocket.test(command)) {
+      return { pid: candidate, command, matchedBy: "cxc-broker-socket" };
+    }
+  }
+  return null;
 }
 
 // src/core/adapter.ts
@@ -965,20 +1029,27 @@ function codexTailPendingApproval(tail) {
   return false;
 }
 function codexProposedPlanText(text) {
+  return codexProposedPlanMarkdown(text) !== undefined;
+}
+function codexProposedPlanMarkdown(text) {
   if (typeof text !== "string")
-    return false;
+    return;
   const trimmed = text.trim();
-  return trimmed.startsWith("<proposed_plan>") && trimmed.endsWith("</proposed_plan>");
+  const open2 = "<proposed_plan>";
+  const close = "</proposed_plan>";
+  if (!trimmed.startsWith(open2) || !trimmed.endsWith(close))
+    return;
+  return trimmed.slice(open2.length, -close.length).trim();
 }
 function codexFinalProposedPlan(row) {
   const payload = row.payload;
   if (!payload || payload.phase !== "final_answer")
-    return false;
+    return;
   let text = "";
   if (row.type === "response_item" && payload.type === "message" && payload.role === "assistant") {
     const content = payload.content;
     if (!Array.isArray(content))
-      return false;
+      return;
     text = content.map((part) => {
       if (typeof part !== "object" || part === null)
         return "";
@@ -988,13 +1059,14 @@ function codexFinalProposedPlan(row) {
   } else if (row.type === "event_msg" && payload.type === "agent_message") {
     text = typeof payload.message === "string" ? payload.message : "";
   } else {
-    return false;
+    return;
   }
-  return codexProposedPlanText(text);
+  return codexProposedPlanMarkdown(text);
 }
 function codexPlanPickerTailAnalysis(tail) {
   let state = "none";
-  let finalPlanInTurn = false;
+  let plan;
+  let finalPlanInTurn;
   for (const line of tail.split(`
 `)) {
     if (!line.trim())
@@ -1010,26 +1082,31 @@ function codexPlanPickerTailAnalysis(tail) {
     if (typeof row !== "object" || row === null)
       continue;
     const r = row;
-    if (codexFinalProposedPlan(r)) {
-      finalPlanInTurn = true;
+    const finalPlan = codexFinalProposedPlan(r);
+    if (finalPlan !== undefined) {
+      finalPlanInTurn = finalPlan;
       continue;
     }
     if (r.type !== "event_msg")
       continue;
     const ptype = r.payload?.type;
     if (ptype === "task_complete") {
-      if (finalPlanInTurn)
+      if (finalPlanInTurn !== undefined) {
         state = "pending";
-      finalPlanInTurn = false;
+        plan = finalPlanInTurn;
+      }
+      finalPlanInTurn = undefined;
     } else if (ptype === "task_started" || ptype === "user_message") {
-      if (state === "pending")
+      if (state === "pending") {
         state = "resolved";
-      finalPlanInTurn = false;
+        plan = undefined;
+      }
+      finalPlanInTurn = undefined;
     } else if (ptype === "turn_aborted") {
-      finalPlanInTurn = false;
+      finalPlanInTurn = undefined;
     }
   }
-  return { state, incompleteFinalPlan: finalPlanInTurn };
+  return { state, ...state === "pending" && plan !== undefined ? { plan } : {}, incompleteFinalPlan: finalPlanInTurn !== undefined };
 }
 function codexPlanPickerStateFromTail(tail) {
   return codexPlanPickerTailAnalysis(tail).state;
@@ -1308,6 +1385,7 @@ async function codexPidPlanPickerAnalysis(pid, deps) {
     const analysis = codexPlanPickerTailAnalysis(tail);
     return {
       state: analysis.incompleteFinalPlan ? "incomplete" : analysis.state,
+      ...!analysis.incompleteFinalPlan && analysis.plan !== undefined ? { plan: analysis.plan } : {},
       incompleteFinalPlan: analysis.incompleteFinalPlan
     };
   } catch {
@@ -1316,6 +1394,10 @@ async function codexPidPlanPickerAnalysis(pid, deps) {
 }
 async function codexPidPlanPickerState(pid, deps = {}) {
   return (await codexPidPlanPickerAnalysis(pid, deps)).state;
+}
+async function codexPidPlanPickerEvidence(pid, deps = {}) {
+  const { state, plan } = await codexPidPlanPickerAnalysis(pid, deps);
+  return { state, ...state === "pending" && plan !== undefined ? { plan } : {} };
 }
 function codexSentinelSessionId(pid) {
   return `codex-pid-${pid}`;
@@ -1577,6 +1659,9 @@ var codexAdapter = {
   completedTurnWaitState({ pid, transcriptPath }) {
     return codexPidPlanPickerState(pid, transcriptPath ? { rolloutOf: async () => transcriptPath } : {});
   },
+  completedTurnWaitEvidence({ pid, transcriptPath }) {
+    return codexPidPlanPickerEvidence(pid, transcriptPath ? { rolloutOf: async () => transcriptPath } : {});
+  },
   isChildSessionGhost({ sessionId, prefix, hookPid, tracked }) {
     return codexChildSessionGhost(sessionId, prefix, hookPid, tracked);
   },
@@ -1700,11 +1785,11 @@ function transcriptStartMs(prefix) {
   }
   return;
 }
-function buildBlob(input, machine, title, plan, agent = "claude", turnStartedAt, pinnedLabel, model, at) {
+function buildBlob(input, machine, title, plan, agent = "claude", turnStartedAt, pinnedLabel, model, at, proposedPlan) {
   const label = typeof pinnedLabel === "string" && pinnedLabel.length > 0 ? pinnedLabel : typeof input.cwd === "string" && input.cwd.length > 0 ? basename2(input.cwd) : "session";
   const hookName = typeof input.hook_event_name === "string" ? input.hook_event_name : "";
   const detail = detailForHook(hookName, typeof input.tool_name === "string" ? input.tool_name : undefined, input.tool_input);
-  return {
+  const base = {
     status: plan.status,
     title: title ?? "",
     machine,
@@ -1715,8 +1800,9 @@ function buildBlob(input, machine, title, plan, agent = "claude", turnStartedAt,
     ...typeof model === "string" && model.length > 0 ? { model } : {},
     ...typeof at === "number" && Number.isFinite(at) ? { at } : {}
   };
+  return appendFittedPlan(base, proposedPlan);
 }
-async function buildEnvelope(input, machine, now, title, e2eKey, sentDone, agent = "claude", startedAt, turnStartedAt, pinnedLabel, model, planOverride, attentionKindOverride) {
+async function buildEnvelope(input, machine, now, title, e2eKey, sentDone, agent = "claude", startedAt, turnStartedAt, pinnedLabel, model, planOverride, attentionKindOverride, proposedPlan) {
   if (typeof input !== "object" || input === null)
     return null;
   const i = input;
@@ -1730,7 +1816,7 @@ async function buildEnvelope(input, machine, now, title, e2eKey, sentDone, agent
   if (typeof startedAt === "number" && Number.isFinite(startedAt))
     base.startedAt = startedAt;
   const at = Math.floor(now / 1000);
-  const blob = await encryptBlob(e2eKey, buildBlob(i, machine, title, plan, agent, turnStartedAt, pinnedLabel, model, at));
+  const blob = await encryptBlob(e2eKey, buildBlob(i, machine, title, plan, agent, turnStartedAt, pinnedLabel, model, at, proposedPlan));
   const attentionKind = attentionKindOverride ?? (agent === "codex" && hookName === "PreToolUse" && i.tool_name === "request_user_input" ? "userInput" : undefined);
   return { ...base, ...attentionKind ? { attentionKind } : {}, blob };
 }
@@ -1760,11 +1846,12 @@ async function trackSession(sessionId, op, prio, status, blob, machine, label, t
       await unlink2(path).catch(() => {});
       return;
     }
+    const recordedAt = Date.now();
     const record = {
       pid,
       machine,
       label,
-      ts: Date.now(),
+      ts: recordedAt,
       transcript,
       lastEvent: op === "start" ? "sessionStart" : status,
       sentDone: op === "done",
@@ -1781,6 +1868,7 @@ async function trackSession(sessionId, op, prio, status, blob, machine, label, t
       ...typeof pairingId === "string" && pairingId.length > 0 ? { pairingId } : {},
       ...pendingPlanPicker ? { pendingPlanPicker: true } : {},
       ...planPickerVerificationPending ? { planPickerVerificationPending: true } : {},
+      ...pendingPlanPicker || planPickerVerificationPending ? { planPickerPendingSince: recordedAt } : {},
       ...origin ? { origin } : {}
     };
     await atomicWrite(path, JSON.stringify(record), 384);
@@ -1935,6 +2023,21 @@ async function runHook(agent) {
       ...suppression,
       ...extra
     });
+    const companionBroker = agent === "codex" ? codexCompanionBrokerEvidence(hookPid, pidAncestors, pidCommand) : null;
+    if (companionBroker) {
+      const reason = `broker ancestry proven by ${companionBroker.matchedBy}`;
+      if (existingRecord) {
+        await retireLineageSession(config, reportedSessionId, agent, input, `codex companion ${reason}`);
+      }
+      suppress({
+        guard: "codex-companion-broker",
+        reason
+      }, {
+        brokerPid: companionBroker.pid,
+        brokerMatch: companionBroker.matchedBy
+      });
+      return;
+    }
     const clearLineage = !existingRecord && hookName === "SessionStart" && sessionStartSource === "clear" && adapter2.clearPredecessor;
     if (clearLineage && adapter2.clearPredecessor) {
       const predecessor = adapter2.clearPredecessor({
@@ -2022,19 +2125,22 @@ async function runHook(agent) {
     let pendingPlanPicker = false;
     let planPickerVerificationPending = false;
     let attentionKind;
+    let proposedPlan;
     if (plan.op === "done" && adapter2.completedTurnWaitState) {
-      const wait = await adapter2.completedTurnWaitState({ pid: hookPid, transcriptPath });
+      const evidence = adapter2.completedTurnWaitEvidence ? await adapter2.completedTurnWaitEvidence({ pid: hookPid, transcriptPath }) : { state: await adapter2.completedTurnWaitState({ pid: hookPid, transcriptPath }) };
+      const wait = evidence.state;
       if (wait === "pending") {
         plan = { op: "update", prio: 1, status: "needsAttention" };
         attentionKind = "userInput";
         pendingPlanPicker = true;
+        proposedPlan = evidence.plan;
       } else if (wait === "incomplete") {
         plan = { op: "update", prio: 0, status: "working" };
         planPickerVerificationPending = true;
       }
     }
     const label = typeof existingRecord?.label === "string" && existingRecord.label.length > 0 ? existingRecord.label : typeof input.cwd === "string" && input.cwd.length > 0 ? basename2(input.cwd) : "session";
-    const envelope = await buildEnvelope(eventInput, machine, Date.now(), title, config.e2eKey, sentDone, agent, startedAt, turnStartedAt, label, model, plan, attentionKind);
+    const envelope = await buildEnvelope(eventInput, machine, Date.now(), title, config.e2eKey, sentDone, agent, startedAt, turnStartedAt, label, model, plan, attentionKind, proposedPlan);
     if (!envelope)
       return;
     const createsRecord = !existingRecord && plan.op !== "end";
@@ -2136,9 +2242,11 @@ export {
   codexRolloutExistsForSession,
   codexRolloutCreationEvidence,
   codexProposedPlanText,
+  codexProposedPlanMarkdown,
   codexPlanPickerStateFromTail,
   codexPidTurnActive,
   codexPidPlanPickerState,
+  codexPidPlanPickerEvidence,
   codexNewestRolloutForCwd,
   codexModelFromRollout,
   codexLastTurnEvent,

@@ -50,6 +50,46 @@ export const GONE_STRIKE_LIMIT = 2;
  *  this module, so the reverse import would be a cycle. */
 export const NO_HOLD_PATH = `${CC_DIR}/no-hold`;
 
+/** Shared sealed-blob fit ceiling. The worker's hard limit is 3072 base64 characters; keep the
+ *  existing 64-character safety margin used by permission frames. Blob producers must measure the
+ *  complete plaintext shape before appending optional large text. */
+export const BLOB_FIT_CHARS = 3008;
+
+/** Exact base64 length of AES-GCM(iv || ciphertext || tag) for a JSON plaintext byte count. */
+export function sealedBlobChars(plaintextBytes: number): number {
+  return Math.ceil((12 + plaintextBytes + 16) / 3) * 4;
+}
+
+/** The phone-plan preview's preferred cap, including the trailing truncation marker. */
+export const PLAN_BLOB_TEXT_MAX_CHARS = 1800;
+export const PLAN_BLOB_TRUNCATION_MARKER = "\n…";
+
+/** Append the optional Plan-picker markdown LAST while fitting the ENTIRE sealed blob. `plan` is the
+ *  first and only sacrifice: every existing base key is retained. A long plan keeps the longest
+ *  code-point prefix that fits both the 1800-character preview cap and BLOB_FIT_CHARS, followed by
+ *  "\n…". If even that marker-only minimal value cannot fit, the key is omitted entirely. */
+export function appendFittedPlan<T extends Record<string, unknown>>(base: T, plan: string | undefined): T & { plan?: string } {
+  if (typeof plan !== "string" || plan.length === 0) return base;
+  const chars = Array.from(plan);
+  const marker = PLAN_BLOB_TRUNCATION_MARKER;
+  const markerChars = Array.from(marker).length;
+  const encoder = new TextEncoder();
+  const fits = (value: string): boolean =>
+    sealedBlobChars(encoder.encode(JSON.stringify({ ...base, plan: value })).length) <= BLOB_FIT_CHARS;
+
+  if (chars.length <= PLAN_BLOB_TEXT_MAX_CHARS && fits(plan)) return { ...base, plan };
+  if (!fits(marker)) return base;
+
+  let lo = 0;
+  let hi = Math.min(chars.length, PLAN_BLOB_TEXT_MAX_CHARS - markerChars);
+  while (lo < hi) {
+    const mid = Math.ceil((lo + hi) / 2);
+    if (fits(chars.slice(0, mid).join("") + marker)) lo = mid;
+    else hi = mid - 1;
+  }
+  return { ...base, plan: chars.slice(0, lo).join("") + marker };
+}
+
 /** Whether a zero-byte marker/flag file exists on disk. The ONE probe shared by every reader of the
  *  local no-hold flag — the permission hook's escape-hatch gate, the `permission off|on|status` CLI
  *  toggle, and localApprovalsState just below — so the gate, the toggle and the reported header can
@@ -274,10 +314,16 @@ export interface SessionRecord {
    *  watchdog uses this explicit provenance marker to clear needsAttention on later rollout progress
    *  without touching an ordinary permission/question attention episode. */
   pendingPlanPicker?: boolean;
+  /** Epoch-ms at which either Plan-picker marker was first persisted. Unlike `ts`, this is explicitly
+   *  the hard-sanity-TTL anchor and is never refreshed by a heartbeat or repeated status query. */
+  planPickerPendingSince?: number;
   /** Exact Plan final wrapper was durable when Stop/notify ran, but task_complete had not flushed yet.
    *  The short-lived hook deliberately leaves the phone working and delegates the terminal decision
    *  to the watchdog. Any ordinary later hook rewrite omits this marker and therefore cancels it. */
   planPickerVerificationPending?: boolean;
+  /** Terminal provenance for a picker resolved by daemon status or its hard TTL. Prevents the
+   *  recent-done migration backstop from re-raising the same structurally-valid rollout signature. */
+  planPickerSettled?: boolean;
   /** The hook/process provenance that FIRST created this local record. Preserved across later hook and
    *  watchdog rewrites. Local-only diagnostic metadata — never copied into the blob or wire envelope.
    *  Optional for backward compatibility with records written before the phantom-session trace fix. */
@@ -293,7 +339,7 @@ export interface PendingEventStash {
   sessionId: string;
   op: CCOp;
   prio: 0 | 1;
-  blob: { status: CCStatus; detail?: string; title: string; machine: string; label: string; agent?: AgentKind; turnStartedAt?: number; model?: string; at?: number };
+  blob: { status: CCStatus; detail?: string; title: string; machine: string; label: string; agent?: AgentKind; turnStartedAt?: number; model?: string; at?: number; plan?: string };
   /** Epoch-ms the stashing hook fired — bounds the flush to the QR's 10-min TTL (a stale stash is a
    *  ghost from a turn long since over and is dropped, not posted). */
   stashedAt: number;
@@ -1019,4 +1065,45 @@ export function pidCommand(pid: number): string | undefined {
   } catch {
     return undefined; // no such pid / ps failed → unknown command line
   }
+}
+
+export interface CodexCompanionBrokerEvidence {
+  pid: number;
+  command: string;
+  matchedBy: "app-server-broker.mjs" | "cxc-broker-socket";
+}
+
+/** Prove that a Codex app-server invocation belongs to the openai-codex companion broker. The
+ *  invoking pid must itself have a `codex app-server` argv; this prevents an unrelated descendant of
+ *  a broker-owned Codex host (tests, shells, user-launched tools) from inheriting the verdict. That
+ *  process and its real ancestor chain are then inspected; titles and hook payload text are irrelevant.
+ *  Either structural broker fingerprint is sufficient:
+ *    - an argv token/path whose basename is exactly app-server-broker.mjs
+ *    - the broker endpoint unix://…/<cxc-prefixed-directory>/broker.sock
+ *  Missing commands or a failed ancestor walk provide no evidence and therefore fail OPEN. */
+export function codexCompanionBrokerEvidence(
+  pid: number,
+  ancestorsOf: (pid: number) => number[] = pidAncestors,
+  commandOf: (pid: number) => string | undefined = pidCommand,
+): CodexCompanionBrokerEvidence | null {
+  const appServer = /(?:^|[\/\s"'])codex(?:\.exe)?(?:["']?)\s+app-server(?:$|\s)/;
+  const brokerScript = /(?:^|[\/\s"'=])app-server-broker\.mjs(?:$|[\s"'])/;
+  const brokerSocket = /unix:\/\/[^\s"'<>]*\/cxc-[^/\s"'<>]+\/broker\.sock(?:$|[\s"'])/;
+  let ownerCommand: string | undefined;
+  try { ownerCommand = commandOf(pid); } catch { return null; }
+  if (typeof ownerCommand !== "string" || !appServer.test(ownerCommand)) return null;
+  let ancestors: number[] = [];
+  try { ancestors = ancestorsOf(pid); } catch { /* unreadable ancestry → inspect only pid, then fail open */ }
+  for (const candidate of [pid, ...ancestors]) {
+    let command: string | undefined;
+    try { command = candidate === pid ? ownerCommand : commandOf(candidate); } catch { continue; }
+    if (typeof command !== "string" || command.length === 0) continue;
+    if (brokerScript.test(command)) {
+      return { pid: candidate, command, matchedBy: "app-server-broker.mjs" };
+    }
+    if (brokerSocket.test(command)) {
+      return { pid: candidate, command, matchedBy: "cxc-broker-socket" };
+    }
+  }
+  return null;
 }

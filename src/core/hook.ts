@@ -27,7 +27,7 @@ import {
   SessionCreationSuppression, TrackedSessionLite,
 } from "./adapter";
 import {
-  AgentKind, atomicWrite, CC_DIR, CCOp, CCStatus, Config, ensureWatchdog, GONE_STRIKE_LIMIT,
+  AgentKind, appendFittedPlan, atomicWrite, CC_DIR, CCOp, CCStatus, codexCompanionBrokerEvidence, Config, ensureWatchdog, GONE_STRIKE_LIMIT,
   LAST_SEND_PATH, lastHookPath, loadConfig, loadPendingConfig, localApprovalsState, PENDING_STASH_PATH, PendingEventStash, pidAncestors, pidCommand, PLUGIN_VERSION, readPrefix,
   readRecord, recordGoneStrike, removeRevokedConfig, resetGoneStrikes, SessionOrigin, SessionRecord, SESSIONS_DIR,
 } from "./shared";
@@ -211,8 +211,8 @@ export function transcriptStartMs(prefix: string): number | undefined {
  *  given: a mid-session `cd` changes input.cwd on every later hook, and re-deriving the label per event
  *  silently renamed the phone row / island folder chip (observed live: "api-status" → "server" after a
  *  `cd server`). Absent/empty → first event (or a recordless caller): derive from cwd as before. */
-export function buildBlob(input: Record<string, unknown>, machine: string, title: string | undefined, plan: OpPlan, agent: AgentKind = "claude", turnStartedAt?: number, pinnedLabel?: string, model?: string, at?: number): {
-  status: CCStatus; detail?: string; title: string; machine: string; label: string; agent?: AgentKind; turnStartedAt?: number; model?: string; at?: number;
+export function buildBlob(input: Record<string, unknown>, machine: string, title: string | undefined, plan: OpPlan, agent: AgentKind = "claude", turnStartedAt?: number, pinnedLabel?: string, model?: string, at?: number, proposedPlan?: string): {
+  status: CCStatus; detail?: string; title: string; machine: string; label: string; agent?: AgentKind; turnStartedAt?: number; model?: string; at?: number; plan?: string;
 } {
   const label = typeof pinnedLabel === "string" && pinnedLabel.length > 0
     ? pinnedLabel
@@ -237,10 +237,11 @@ export function buildBlob(input: Record<string, unknown>, machine: string, title
   // re-send this blob VERBATIM) into its `lastEventAt`, so an idle-open TUI that only ever gets
   // heartbeated looked eternally fresh and never aged out. Because the heartbeat re-sends this blob byte
   // for byte, `at` stays pinned at the last REAL event and the phone can age the row correctly.
-  // PINNED CROSS-REPO CONTRACT: key `at`, epoch seconds. Appended LAST (after `model`) so the E2E
-  // vectors / older decoders that depend on the existing key order are unaffected; OMITTED entirely when
-  // unknown (never 0), like every optional blob key.
-  return {
+  // PINNED CROSS-REPO CONTRACT: key `at`, epoch seconds. It remains after `model`; the OPTIONAL Plan
+  // picker `plan` key is appended after EVERY existing key and omitted everywhere except a proven
+  // pending picker. This append-last/omit-when-unknown discipline keeps old decoders and byte vectors
+  // untouched. appendFittedPlan measures the ENTIRE sealed frame and drops `plan` before any base key.
+  const base = {
     status: plan.status, title: title ?? "", machine, label,
     ...(detail ? { detail } : {}),
     ...(agent === "codex" ? { agent: "codex" as const } : {}),
@@ -248,6 +249,7 @@ export function buildBlob(input: Record<string, unknown>, machine: string, title
     ...(typeof model === "string" && model.length > 0 ? { model } : {}),
     ...(typeof at === "number" && Number.isFinite(at) ? { at } : {}),
   };
+  return appendFittedPlan(base, proposedPlan);
 }
 
 /** The wire envelope for one hook event: the blind v2 shape
@@ -261,7 +263,7 @@ export function buildBlob(input: Record<string, unknown>, machine: string, title
 export async function buildEnvelope(
   input: unknown, machine: string, now: number, title: string | undefined, e2eKey: Uint8Array, sentDone: boolean,
   agent: AgentKind = "claude", startedAt?: number, turnStartedAt?: number, pinnedLabel?: string, model?: string,
-  planOverride?: OpPlan, attentionKindOverride?: "userInput",
+  planOverride?: OpPlan, attentionKindOverride?: "userInput", proposedPlan?: string,
 ): Promise<Record<string, unknown> | null> {
   if (typeof input !== "object" || input === null) return null;
   const i = input as Record<string, unknown>;
@@ -278,7 +280,7 @@ export async function buildEnvelope(
   // `at` is the real event time (`now`) in epoch SECONDS — the phone's honest sort/age key, frozen here
   // and re-sent verbatim by every watchdog heartbeat so an idle-but-heartbeated session ages out.
   const at = Math.floor(now / 1000);
-  const blob = await encryptBlob(e2eKey, buildBlob(i, machine, title, plan, agent, turnStartedAt, pinnedLabel, model, at));
+  const blob = await encryptBlob(e2eKey, buildBlob(i, machine, title, plan, agent, turnStartedAt, pinnedLabel, model, at, proposedPlan));
   const attentionKind = attentionKindOverride ?? (
     agent === "codex" && hookName === "PreToolUse" && i.tool_name === "request_user_input"
       ? "userInput" as const
@@ -353,11 +355,12 @@ export async function trackSession(
     // lastEvent is the watchdog interrupt-net's gate key: a fresh `start` is a quiet "sessionStart",
     // otherwise the semantic status (working / needsAttention / done). `agent` (omitted for claude)
     // tells the watchdog which interrupt marker to scan the transcript tail for.
+    const recordedAt = Date.now();
     const record: SessionRecord = {
       pid,
       machine,
       label,
-      ts: Date.now(),
+      ts: recordedAt,
       transcript,
       lastEvent: op === "start" ? "sessionStart" : status,
       sentDone: op === "done",
@@ -397,6 +400,7 @@ export async function trackSession(
       ...(typeof pairingId === "string" && pairingId.length > 0 ? { pairingId } : {}),
       ...(pendingPlanPicker ? { pendingPlanPicker: true } : {}),
       ...(planPickerVerificationPending ? { planPickerVerificationPending: true } : {}),
+      ...(pendingPlanPicker || planPickerVerificationPending ? { planPickerPendingSince: recordedAt } : {}),
       ...(origin ? { origin } : {}),
     };
     // Owner-only (0600): the record carries hostname, cwd basename, the session pid, and the ABSOLUTE
@@ -645,6 +649,31 @@ export async function runHook(agent: AgentKind): Promise<void> {
       ...extra,
     });
 
+    // Claude's openai-codex companion tasks run a headless Codex app-server under a dedicated broker.
+    // They are delegated rescue work, not user-owned Codex sessions, so they must never create phone
+    // rows. Unlike title-based filtering, a `codex app-server` owner plus the broker's actual process
+    // ancestry is structural proof:
+    // its argv contains app-server-broker.mjs and/or a unix://…/<cxc-prefix>/broker.sock. Missing ps
+    // data yields no evidence and fails open. This guard intentionally applies to an EXISTING record
+    // too: a row minted by an older plugin is retired (op:end + local unlink) on its next event.
+    const companionBroker = agent === "codex"
+      ? codexCompanionBrokerEvidence(hookPid, pidAncestors, pidCommand)
+      : null;
+    if (companionBroker) {
+      const reason = `broker ancestry proven by ${companionBroker.matchedBy}`;
+      if (existingRecord) {
+        await retireLineageSession(config, reportedSessionId, agent, input, `codex companion ${reason}`);
+      }
+      suppress({
+        guard: "codex-companion-broker",
+        reason,
+      }, {
+        brokerPid: companionBroker.pid,
+        brokerMatch: companionBroker.matchedBy,
+      });
+      return;
+    }
+
     // `/clear` lineage: Claude mints a new id on the SAME TUI process and never sends SessionEnd for
     // the predecessor. Retire the newest old Claude row before deciding whether the new id is ready
     // to surface. This is adapter-owned pid lineage; the shared pipeline only executes the retirement.
@@ -787,12 +816,17 @@ export async function runHook(agent: AgentKind): Promise<void> {
     let pendingPlanPicker = false;
     let planPickerVerificationPending = false;
     let attentionKind: "userInput" | undefined;
+    let proposedPlan: string | undefined;
     if (plan.op === "done" && adapter.completedTurnWaitState) {
-      const wait = await adapter.completedTurnWaitState({ pid: hookPid, transcriptPath });
+      const evidence = adapter.completedTurnWaitEvidence
+        ? await adapter.completedTurnWaitEvidence({ pid: hookPid, transcriptPath })
+        : { state: await adapter.completedTurnWaitState({ pid: hookPid, transcriptPath }) };
+      const wait = evidence.state;
       if (wait === "pending") {
         plan = { op: "update", prio: 1, status: "needsAttention" };
         attentionKind = "userInput";
         pendingPlanPicker = true;
+        proposedPlan = evidence.plan;
       } else if (wait === "incomplete") {
         // Do not guess done and do not sleep inside a short-lived hook. Preserve the current working
         // wire state and leave a durable marker for the long-lived watchdog to settle after flush.
@@ -808,7 +842,7 @@ export async function runHook(agent: AgentKind): Promise<void> {
     const label = typeof existingRecord?.label === "string" && existingRecord.label.length > 0
       ? existingRecord.label
       : typeof input.cwd === "string" && input.cwd.length > 0 ? basename(input.cwd) : "session";
-    const envelope = await buildEnvelope(eventInput, machine, Date.now(), title, config.e2eKey, sentDone, agent, startedAt, turnStartedAt, label, model, plan, attentionKind);
+    const envelope = await buildEnvelope(eventInput, machine, Date.now(), title, config.e2eKey, sentDone, agent, startedAt, turnStartedAt, label, model, plan, attentionKind, proposedPlan);
     if (!envelope) return;
 
     // Record (or, on op:end, remove) this session's file and make sure the liveness watchdog is

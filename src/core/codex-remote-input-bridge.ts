@@ -6,6 +6,7 @@ import {
   CodexAppServerState,
   CodexLoadedThreadListResult,
   CodexThreadResumeResult,
+  CodexThreadStatus,
   CodexUserInputAnswerResult,
   CodexUserInputAnswers,
   CodexUserInputInterruptResult,
@@ -30,9 +31,13 @@ interface BridgeClient {
   stop(): Promise<void>;
   listLoadedThreads(params?: { cursor?: string | null; limit?: number | null }): Promise<CodexLoadedThreadListResult>;
   resumeThread(threadId: string): Promise<CodexThreadResumeResult>;
+  readThreadStatus(threadId: string): Promise<CodexThreadStatus>;
   answerUserInput(identity: CodexUserInputRequestIdentity, answers: CodexUserInputAnswers): Promise<CodexUserInputAnswerResult>;
   interruptUserInput(identity: CodexUserInputRequestIdentity): Promise<CodexUserInputInterruptResult>;
 }
+
+/** The only distinction the watchdog needs. Unknown means there is no authoritative dismissal proof. */
+export type CodexThreadWaitState = "waitingOnUserInput" | "notWaitingOnUserInput" | "unavailable";
 
 export interface CodexRemoteInputBridgeCallbacks {
   onUserInputRequest(request: CodexUserInputRequest): void;
@@ -110,6 +115,24 @@ export class CodexRemoteInputBridge {
     if (this.refreshPromise) return this.refreshPromise;
     this.refreshPromise = this.refreshLoadedThreads().finally(() => { this.refreshPromise = undefined; });
     return this.refreshPromise;
+  }
+
+  /** Query only an already-pending Plan-picker thread. `idle` or an active thread without the flag is
+   * authoritative dismissal; unloaded/error/malformed/transport states fail open to unavailable. */
+  async readThreadWaitState(threadId: string): Promise<CodexThreadWaitState> {
+    if (this.client.state !== "ready" || this.stopping) return "unavailable";
+    try {
+      const status = await this.client.readThreadStatus(threadId);
+      if (status.type === "idle") return "notWaitingOnUserInput";
+      if (status.type === "active") {
+        return status.activeFlags.includes("waitingOnUserInput")
+          ? "waitingOnUserInput"
+          : "notWaitingOnUserInput";
+      }
+      return "unavailable";
+    } catch {
+      return "unavailable";
+    }
   }
 
   async stop(): Promise<void> {

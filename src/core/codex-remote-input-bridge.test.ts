@@ -3,6 +3,7 @@ import {
   CodexAppServerState,
   CodexLoadedThreadListResult,
   CodexThreadResumeResult,
+  CodexThreadStatus,
   CodexUserInputAnswerResult,
   CodexUserInputAnswers,
   CodexUserInputInterruptResult,
@@ -50,6 +51,8 @@ class FakeClient {
   resumed: string[] = [];
   answers: { identity: CodexUserInputRequestIdentity; answers: CodexUserInputAnswers }[] = [];
   interrupts: CodexUserInputRequestIdentity[] = [];
+  threadStatus: CodexThreadStatus = { type: "idle" };
+  threadStatusError: Error | undefined;
 
   constructor(readonly callbacks: CodexRemoteInputBridgeCallbacks) {}
   async start(): Promise<boolean> { this.state = "ready"; this.callbacks.onStateChange("ready"); return true; }
@@ -60,6 +63,10 @@ class FakeClient {
   async resumeThread(threadId: string): Promise<CodexThreadResumeResult> {
     this.resumed.push(threadId);
     return { thread: { id: threadId } };
+  }
+  async readThreadStatus(): Promise<CodexThreadStatus> {
+    if (this.threadStatusError) throw this.threadStatusError;
+    return this.threadStatus;
   }
   async answerUserInput(
     identity: CodexUserInputRequestIdentity,
@@ -117,6 +124,20 @@ function harness() {
 }
 
 describe("CodexRemoteInputBridge", () => {
+  test("maps 0.146.0 waiting, idle/composer, and query failure without guessing", async () => {
+    const h = harness();
+    await h.bridge.start();
+    h.client().threadStatus = { type: "active", activeFlags: ["waitingOnUserInput"] };
+    expect(await h.bridge.readThreadWaitState("thread-1")).toBe("waitingOnUserInput");
+    h.client().threadStatus = { type: "idle" };
+    expect(await h.bridge.readThreadWaitState("thread-1")).toBe("notWaitingOnUserInput");
+    h.client().threadStatus = { type: "active", activeFlags: ["waitingOnApproval"] };
+    expect(await h.bridge.readThreadWaitState("thread-1")).toBe("notWaitingOnUserInput");
+    h.client().threadStatusError = new Error("thread/read unavailable");
+    expect(await h.bridge.readThreadWaitState("thread-1")).toBe("unavailable");
+    await h.bridge.stop();
+  });
+
   test("subscribes every loaded page once and picks up newly loaded threads", async () => {
     const h = harness();
     h.client().pages.push(

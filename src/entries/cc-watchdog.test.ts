@@ -11,7 +11,8 @@ import {
   claudeTailPendingApproval, codexLastTurnEvent, codexTailPendingApproval, correctIdleClaude, correctInterrupt,
   correctPendingApproval, correctPendingDone, correctPlanPickerVerification, correctResolvedPlanPicker, createBridgeSupervisor, discoverLiveSessions, effectiveDoneAttempts, goneStrikeShouldTeardown,
   hasInterruptMarker, IDLE_GRACE_MS, isClaudeIdleReapEligible, isRetireEligible, lastTurnLine, PAIRING_TTL_MS, pendingDoneRetryWrite,
-  pendingDoneSettleWrite, pendingPairingExpired, PLAN_PICKER_RECENT_DONE_MS, PLAN_PICKER_VERIFY_MAX_MS,
+  pendingDoneSettleWrite, pendingPairingExpired, planPickerPendingExpired, PLAN_PICKER_PENDING_MAX_MS,
+  PLAN_PICKER_RECENT_DONE_MS, PLAN_PICKER_VERIFY_MAX_MS,
   postOutcomeForStatus, provisionalsCoveredByReal, reconcileProvisionalsSweep, recordMovedSince, resetDoneAttemptMemory, retireDoneStale,
   shouldHeartbeat, shouldIdleProvisionalCheck,
   shouldInterruptCheck, shouldPendingApprovalCheck, shouldPendingDoneCheck, shouldPlanPickerVerificationCheck, shouldRepairTitle, tailShowsInterrupt, titleRepairedRecord,
@@ -1243,6 +1244,20 @@ describe("buildNeedsAttentionEnvelope (dropped-hook corrective → same envelope
     ) as Record<string, unknown>;
     expect(claude).not.toHaveProperty("attentionKind");
   });
+
+  test("a proven Plan-picker frame carries capped plan markdown; ordinary attention omits it", async () => {
+    const pending = await buildNeedsAttentionEnvelope(
+      "s", rec({ machine: "Mac", label: "proj" }), 5, KEY, "codex", 5, undefined, "userInput",
+      "# Plan\n\n" + "x".repeat(5000),
+    ) as Record<string, unknown>;
+    const pendingBlob = await decryptBlob(KEY, pending.blob as string);
+    expect(pendingBlob.plan).toBeString();
+    expect((pendingBlob.plan as string).endsWith("\n…")).toBe(true);
+    const ordinary = await buildNeedsAttentionEnvelope(
+      "s", rec({ machine: "Mac", label: "proj" }), 5, KEY, "codex", 5, undefined, "userInput",
+    ) as Record<string, unknown>;
+    expect(await decryptBlob(KEY, ordinary.blob as string)).not.toHaveProperty("plan");
+  });
 });
 
 describe("shouldPendingApprovalCheck (gate: once-per-episode + skip claude/done/no-transcript)", () => {
@@ -1397,7 +1412,7 @@ describe("correctResolvedPlanPicker (Mac answer clears only the marked Plan wait
   const blockedPlan = (over: Partial<SessionRecord> = {}): SessionRecord => rec({
     agent: "codex", transcript: "/tmp/rollout.jsonl", lastEvent: "needsAttention",
     op: "update", prio: 1, sentDone: false, pendingPlanPicker: true,
-    blob: "PENDING-PLAN", title: "Implement the plan", pairingId: "p", ...over,
+    blob: "PENDING-PLAN", title: "Implement the plan", pairingId: "p", ts: 7_999_000, ...over,
   });
 
   test("task_started/user_message resolution → working update and clears provenance marker", async () => {
@@ -1412,7 +1427,9 @@ describe("correctResolvedPlanPicker (Mac answer clears only the marked Plan wait
     expect(result).toBe("corrected");
     expect(posts[0]).toMatchObject({ op: "update", prio: 0, ts: 8_000_000 });
     expect(posts[0]).not.toHaveProperty("attentionKind");
-    expect(await decryptBlob(KEY, posts[0].blob as string)).toMatchObject({ status: "working", agent: "codex" });
+    const resolvedBlob = await decryptBlob(KEY, posts[0].blob as string);
+    expect(resolvedBlob).toMatchObject({ status: "working", agent: "codex" });
+    expect(resolvedBlob).not.toHaveProperty("plan");
     expect(writes[0]).toMatchObject({ lastEvent: "working", op: "update", prio: 0, sentDone: false });
     expect(writes[0].pendingPlanPicker).toBeUndefined();
   });
@@ -1424,7 +1441,7 @@ describe("correctResolvedPlanPicker (Mac answer clears only the marked Plan wait
       writeRecord: async () => {},
     };
     expect(await correctResolvedPlanPicker(cfg(), "/tmp/s.json", "s", blockedPlan(), {
-      ...seams, state: async () => "pending",
+      ...seams, state: async () => "pending", threadWaitState: async () => "waitingOnUserInput",
     })).toBe("uncorrected");
     expect(await correctResolvedPlanPicker(cfg(), "/tmp/s.json", "s", blockedPlan(), {
       ...seams, state: async () => "unknown",
@@ -1459,18 +1476,102 @@ describe("correctPlanPickerVerification (watchdog owns flush settlement)", () =>
     const posts: Record<string, unknown>[] = [];
     const writes: SessionRecord[] = [];
     expect(await correctPlanPickerVerification(cfg(), "/tmp/s.json", "s", record, {
-      state: async () => "pending",
+      evidence: async () => ({ state: "pending", plan: "# Durable plan\n\nShip it." }),
+      threadWaitState: async () => "waitingOnUserInput",
       readRecord: async () => record,
       post: async (body) => { posts.push(body as Record<string, unknown>); return "delivered"; },
       writeRecord: async (_path, next) => { writes.push(next); },
       now: () => NOW,
     })).toBe("corrected");
     expect(posts[0]).toMatchObject({ op: "update", prio: 1, attentionKind: "userInput" });
-    expect(await decryptBlob(KEY, posts[0].blob as string)).toMatchObject({ status: "needsAttention", agent: "codex" });
+    expect(await decryptBlob(KEY, posts[0].blob as string)).toMatchObject({
+      status: "needsAttention", agent: "codex", plan: "# Durable plan\n\nShip it.",
+    });
     expect(writes[0]).toMatchObject({
       lastEvent: "needsAttention", op: "update", prio: 1, sentDone: false, pendingPlanPicker: true,
     });
     expect(writes[0].planPickerVerificationPending).toBeUndefined();
+    expect(writes[0].planPickerPendingSince).toBe(NOW);
+  });
+
+  test("ESC-shaped daemon idle resolves an exact pending rollout to durable done", async () => {
+    const record = verifying({ planPickerPendingSince: NOW - 5_000 });
+    const posts: Record<string, unknown>[] = [];
+    const writes: SessionRecord[] = [];
+    let current = record;
+    expect(await correctPlanPickerVerification(cfg(), "/tmp/s.json", "s", record, {
+      evidence: async () => ({ state: "pending", plan: "# Plan" }),
+      threadWaitState: async () => "notWaitingOnUserInput",
+      readRecord: async () => current,
+      writeRecord: async (_path, next) => { current = next; writes.push(next); },
+      post: async (body) => { posts.push(body as Record<string, unknown>); return "delivered"; },
+      now: () => NOW,
+    })).toBe("corrected");
+    expect(posts).toHaveLength(1);
+    expect(posts[0]).toMatchObject({ op: "done", prio: 0 });
+    expect(writes[0]).toMatchObject({
+      lastEvent: "done", op: "done", prio: 0, sentDone: true, donePending: true,
+      planPickerSettled: true,
+    });
+    expect(writes[0].planPickerVerificationPending).toBeUndefined();
+    expect(writes[0].pendingPlanPicker).toBeUndefined();
+    expect(writes[0].planPickerPendingSince).toBeUndefined();
+  });
+
+  test("daemon unavailable sustains the picker initially, but the hard TTL still resolves it", async () => {
+    const fresh = verifying({ planPickerPendingSince: NOW - PLAN_PICKER_PENDING_MAX_MS + 1 });
+    const firstPosts: Record<string, unknown>[] = [];
+    expect(await correctPlanPickerVerification(cfg(), "/tmp/s.json", "s", fresh, {
+      state: async () => "pending",
+      threadWaitState: async () => "unavailable",
+      readRecord: async () => fresh,
+      writeRecord: async () => {},
+      post: async (body) => { firstPosts.push(body as Record<string, unknown>); return "delivered"; },
+      now: () => NOW,
+    })).toBe("corrected");
+    expect(firstPosts[0]).toMatchObject({ op: "update", prio: 1, attentionKind: "userInput" });
+
+    const expired = verifying({ planPickerPendingSince: NOW - PLAN_PICKER_PENDING_MAX_MS });
+    let queried = 0;
+    const terminalPosts: Record<string, unknown>[] = [];
+    expect(await correctPlanPickerVerification(cfg(), "/tmp/s.json", "s", expired, {
+      state: async () => "pending",
+      threadWaitState: async () => { queried++; throw new Error("proxy unavailable"); },
+      readRecord: async () => expired,
+      writeRecord: async () => {},
+      post: async (body) => { terminalPosts.push(body as Record<string, unknown>); return "delivered"; },
+      now: () => NOW,
+    })).toBe("corrected");
+    expect(queried).toBe(0); // TTL precedes every query/failure path
+    expect(terminalPosts[0]).toMatchObject({ op: "done", prio: 0 });
+  });
+
+  test("both picker markers expire at the hard TTL, including exact-pending/waiting paths", async () => {
+    const verify = verifying({ planPickerPendingSince: NOW - PLAN_PICKER_PENDING_MAX_MS });
+    const attention = verifying({
+      planPickerVerificationPending: undefined,
+      pendingPlanPicker: true,
+      lastEvent: "needsAttention",
+      prio: 1,
+      planPickerPendingSince: NOW - PLAN_PICKER_PENDING_MAX_MS,
+    });
+    expect(planPickerPendingExpired(verify, NOW)).toBe(true);
+    expect(planPickerPendingExpired(attention, NOW)).toBe(true);
+    expect(planPickerPendingExpired({
+      ...verify,
+      planPickerPendingSince: NOW - PLAN_PICKER_PENDING_MAX_MS + 1,
+    }, NOW)).toBe(false);
+
+    const terminal: Record<string, unknown>[] = [];
+    expect(await correctResolvedPlanPicker(cfg(), "/tmp/s.json", "s", attention, {
+      state: async () => "pending",
+      threadWaitState: async () => "waitingOnUserInput",
+      readRecord: async () => attention,
+      writeRecord: async () => {},
+      post: async (body) => { terminal.push(body as Record<string, unknown>); return "delivered"; },
+      now: () => NOW,
+    })).toBe("corrected");
+    expect(terminal[0]).toMatchObject({ op: "done", prio: 0 });
   });
 
   test("notify-chain absent: the Stop marker alone survives an incomplete sweep and corrects later", async () => {
@@ -1492,6 +1593,20 @@ describe("correctPlanPickerVerification (watchdog owns flush settlement)", () =>
       now: () => NOW + 5_000,
     })).toBe("corrected");
     expect(posted).toBe(1);
+  });
+
+  test("the prio-1 transition is durable before POST and a thrown POST stays owned for retry", async () => {
+    const record = verifying();
+    const order: string[] = [];
+    expect(await correctPlanPickerVerification(cfg(), "/tmp/s.json", "s", record, {
+      state: async () => "pending",
+      threadWaitState: async () => "waitingOnUserInput",
+      readRecord: async () => record,
+      writeRecord: async () => { order.push("write"); },
+      post: async () => { order.push("post"); throw new Error("offline"); },
+      now: () => NOW,
+    })).toBe("pending");
+    expect(order).toEqual(["write", "post"]);
   });
 
   test("genuine done is never resurrected: resolved/none/exited and old done rows are untouched", async () => {
@@ -1765,6 +1880,32 @@ describe("createBridgeSupervisor (presence gate: no Codex daemon → no bridge, 
     await s.sync(cfg());
     await c.settle();
     expect(f.calls).toEqual(["start", "stop", "start"]);
+  });
+
+  test("pending-picker status queries use the active bridge only while the daemon socket is available", async () => {
+    const f = fakeBridge();
+    const c = collector();
+    let available = true;
+    let reads = 0;
+    const bridge = {
+      ...f.bridge,
+      readThreadWaitState: async (threadId: string) => {
+        reads++;
+        expect(threadId).toBe("thread-plan");
+        return "waitingOnUserInput" as const;
+      },
+    };
+    const s = createBridgeSupervisor({
+      probe: async () => available,
+      create: () => bridge,
+      detach: c.detach,
+    });
+    await s.sync(cfg());
+    await c.settle();
+    expect(await s.threadWaitState("thread-plan")).toBe("waitingOnUserInput");
+    available = false;
+    expect(await s.threadWaitState("thread-plan")).toBe("unavailable");
+    expect(reads).toBe(1);
   });
 
 

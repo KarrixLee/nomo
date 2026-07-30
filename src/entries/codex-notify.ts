@@ -141,7 +141,10 @@ export async function runNotify(raw: string, deferMs = notifyDeferMs(), sleep: (
     // rollout; with no record this remains best-effort through the notify process's pid locator.
     const sessionPid = typeof record?.pid === "number" && Number.isFinite(record.pid) ? record.pid : process.ppid;
     const transcriptPath = typeof record?.transcript === "string" ? record.transcript : "";
-    const wait = await codexAdapter.completedTurnWaitState?.({ pid: sessionPid, transcriptPath });
+    const evidence = codexAdapter.completedTurnWaitEvidence
+      ? await codexAdapter.completedTurnWaitEvidence({ pid: sessionPid, transcriptPath })
+      : { state: await codexAdapter.completedTurnWaitState?.({ pid: sessionPid, transcriptPath }) };
+    const wait = evidence.state;
     const pendingPlanPicker = wait === "pending";
     const planPickerVerificationPending = wait === "incomplete";
     const plan = pendingPlanPicker
@@ -150,7 +153,8 @@ export async function runNotify(raw: string, deferMs = notifyDeferMs(), sleep: (
         ? { op: "update" as const, prio: 0 as const, status: "working" as const }
       : { op: "done" as const, prio: 0 as const, status: "done" as const };
     const attentionKind = pendingPlanPicker ? "userInput" as const : undefined;
-    const envelope = await buildEnvelope(input, machine, now, title, config.e2eKey, false, "codex", startedAt, turnStartedAt, undefined, model, plan, attentionKind);
+    const envelope = await buildEnvelope(input, machine, now, title, config.e2eKey, false, "codex", startedAt, turnStartedAt, undefined, model, plan, attentionKind,
+      pendingPlanPicker ? evidence.plan : undefined);
     if (!envelope) return;
 
     const label = typeof input.cwd === "string" && input.cwd.length > 0 ? basename(input.cwd) : "session";

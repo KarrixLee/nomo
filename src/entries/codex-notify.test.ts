@@ -203,7 +203,7 @@ describe("runNotify E2E (argv payload, dedupe against a sent Stop)", () => {
       op: "update", prio: 1, lastEvent: "needsAttention", sentDone: false, pendingPlanPicker: true,
     });
     expect(record?.donePending).toBeUndefined();
-    expect(blob).toMatchObject({ status: "needsAttention", agent: "codex" });
+    expect(blob).toMatchObject({ status: "needsAttention", agent: "codex", plan: "Implement it." });
   }, 20000);
 
   test("wrapper durable but task_complete absent → working verification marker, never plain done", async () => {
@@ -226,6 +226,7 @@ describe("runNotify E2E (argv payload, dedupe against a sent Stop)", () => {
     });
     expect(record?.donePending).toBeUndefined();
     expect(blob).toMatchObject({ status: "working", agent: "codex" });
+    expect(blob).not.toHaveProperty("plan");
   }, 20000);
 
   test("session_index thread_name is the PRIMARY title (beats input-messages)", async () => {

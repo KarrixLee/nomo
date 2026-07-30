@@ -3,9 +3,41 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "bun:test";
 import {
-  codexAppServerSocketAvailable, codexAppServerSocketPath, ensureWatchdog, formatWatchdogPidfile, isWatchdogCommand,
+  codexAppServerSocketAvailable, codexAppServerSocketPath, codexCompanionBrokerEvidence, ensureWatchdog, formatWatchdogPidfile, isWatchdogCommand,
   localApprovalsState, parseWatchdogPidfile, PLUGIN_VERSION, watchdogHolderIsLive,
 } from "./shared";
+
+describe("codexCompanionBrokerEvidence (structural companion-session proof)", () => {
+  test("matches an exact app-server-broker.mjs argv path in the ancestor chain", () => {
+    const commands: Record<number, string> = {
+      10: "/opt/codex codex app-server",
+      20: "node /Users/x/.claude/plugins/cache/openai-codex/codex/1.2.3/scripts/app-server-broker.mjs",
+    };
+    expect(codexCompanionBrokerEvidence(10, () => [20], (pid) => commands[pid])).toMatchObject({
+      pid: 20, matchedBy: "app-server-broker.mjs",
+    });
+  });
+
+  test("matches the cxc broker socket endpoint even when the script path is absent", () => {
+    const command = "codex app-server --listen unix:///private/tmp/cxc-a81f/broker.sock";
+    expect(codexCompanionBrokerEvidence(10, () => [], () => command)).toMatchObject({
+      pid: 10, matchedBy: "cxc-broker-socket",
+    });
+  });
+
+  test("unreadable or throwing ancestry fails open", () => {
+    expect(codexCompanionBrokerEvidence(10, () => { throw new Error("EPERM"); }, () => undefined)).toBeNull();
+    expect(codexCompanionBrokerEvidence(10, () => [20], () => undefined)).toBeNull();
+  });
+
+  test("a standalone codex app-server without broker ancestry is unaffected", () => {
+    const commands: Record<number, string> = {
+      10: "/Applications/Codex.app/codex app-server --listen unix:///tmp/codex.sock",
+      20: "/sbin/launchd",
+    };
+    expect(codexCompanionBrokerEvidence(10, () => [20], (pid) => commands[pid])).toBeNull();
+  });
+});
 
 // PLUGIN_VERSION is injected by build.ts as a compile-time `__NOMO_VERSION__` define ONLY in the
 // bundled dist/*.mjs. Tests import the raw .ts with no define, so the typeof guard must degrade to

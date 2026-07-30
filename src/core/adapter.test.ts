@@ -7,7 +7,7 @@ import {
   claudeTailPendingApproval, codexAdapter, codexChildSessionGhost,
   codexConfigModel, codexDiscoverLive, codexInternalSessionGhost, codexModelFromRollout,
   CODEX_ROLLOUT_IDLE_SILENCE_MS,
-  codexNewestRolloutForCwd, codexPidPlanPickerState, codexPidTurnActive, codexPlanPickerStateFromTail, codexRolloutExistsForSession, codexSentinelSessionId, codexSessionModel,
+  codexNewestRolloutForCwd, codexPidPlanPickerEvidence, codexPidPlanPickerState, codexPidTurnActive, codexPlanPickerStateFromTail, codexProposedPlanMarkdown, codexRolloutExistsForSession, codexSentinelSessionId, codexSessionModel,
   codexRolloutCreationEvidence, codexSessionCreationSuppression, codexTailPendingApproval, codexTailPendingAttentionKind, codexTailPendingUserInputDetail, codexTurnActiveFromTail, filterCodexTuis, findProvisionalForPid,
   firstAssistantModel, firstUserPrompt, lastAssistantModel, parseCodexProcs, rolloutMetaCwd,
   requestUserInputDetail, rolloutPathFromLsof, sessionTitle, TrackedSessionLite,
@@ -497,6 +497,17 @@ describe("codex plan-picker classifier (completed Plan turn, TUI still waiting)"
     expect(codexPlanPickerStateFromTail([evt("task_started"), proposedPlan("x").replace("</proposed_plan>", ""), evt("task_complete")].join("\n"))).toBe("none");
   });
 
+  test("extracts only inner markdown and returns it with the same pending evidence read", async () => {
+    expect(codexProposedPlanMarkdown("<proposed_plan>\n# Ship\n\nDo it.\n</proposed_plan>"))
+      .toBe("# Ship\n\nDo it.");
+    const tail = [evt("task_started"), proposedPlan("# Ship\n\nDo it."), evt("task_complete")].join("\n");
+    expect(await codexPidPlanPickerEvidence(42, {
+      isAlive: () => true,
+      rolloutOf: async () => "/r/rollout.jsonl",
+      readTail: async () => tail,
+    })).toEqual({ state: "pending", plan: "# Ship\n\nDo it." });
+  });
+
   test("0.146.0 live 5.1s gap: hook classifies durable wrapper as incomplete without sleeping", async () => {
     const rows = real0146Tail.split("\n");
     const beforeTaskComplete = rows.slice(0, -1).join("\n");
@@ -531,6 +542,15 @@ describe("codex plan-picker classifier (completed Plan turn, TUI still waiting)"
     const pending = [evt("task_started"), proposedPlan(), evt("task_complete")];
     expect(codexPlanPickerStateFromTail([...pending, evt("task_started")].join("\n"))).toBe("resolved");
     expect(codexPlanPickerStateFromTail([...pending, evt("user_message")].join("\n"))).toBe("resolved");
+  });
+
+  test("resolved evidence drops the plan with the picker state", async () => {
+    const tail = [evt("task_started"), proposedPlan("Private plan"), evt("task_complete"), evt("user_message")].join("\n");
+    expect(await codexPidPlanPickerEvidence(42, {
+      isAlive: () => true,
+      rolloutOf: async () => "/r/rollout.jsonl",
+      readTail: async () => tail,
+    })).toEqual({ state: "resolved" });
   });
 
   test("pid probe requires process liveness and returns exited before reading a rollout", async () => {

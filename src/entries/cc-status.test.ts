@@ -4,7 +4,10 @@ import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { b64url, decryptBlob } from "../core/crypto";
-import { parseConfig, PendingEventStash, readRecord, SessionRecord, SESSIONS_DIR } from "../core/shared";
+import {
+  BLOB_FIT_CHARS, parseConfig, PendingEventStash, PLAN_BLOB_TEXT_MAX_CHARS, PLAN_BLOB_TRUNCATION_MARKER,
+  readRecord, sealedBlobChars, SessionRecord, SESSIONS_DIR,
+} from "../core/shared";
 import {
   aiTitle, buildBlob, buildEnvelope, buildPendingStash, cleanPromptTitle, codexIndexTitle, codexSessionTitle,
   codexThreadName, detailForHook, firstUserPrompt, isPermissionNotification, planOp, sessionTitle,
@@ -371,6 +374,44 @@ describe("buildBlob (plaintext content of the encrypted blob)", () => {
     expect(buildBlob({ session_id: "s", cwd: "/x", hook_event_name: "PermissionRequest" }, "Mac", "t", plan))
       .toMatchObject({ status: "needsAttention" });
   });
+
+  test("optional plan is appended last only on a caller-proven pending frame and prefix-capped", () => {
+    const input = { session_id: "s", cwd: "/x/proj", hook_event_name: "Stop" };
+    const attention = { op: "update" as const, prio: 1 as const, status: "needsAttention" as const };
+    const pending = buildBlob(input, "Mac", "t", attention, "codex", undefined, undefined, "gpt-5", 123, "p".repeat(5000));
+    expect(Object.keys(pending).at(-1)).toBe("plan");
+    expect(pending.plan?.endsWith(PLAN_BLOB_TRUNCATION_MARKER)).toBe(true);
+    expect([...(pending.plan ?? "")]).toHaveLength(PLAN_BLOB_TEXT_MAX_CHARS);
+    expect(sealedBlobChars(new TextEncoder().encode(JSON.stringify(pending)).length)).toBeLessThanOrEqual(BLOB_FIT_CHARS);
+
+    expect(buildBlob(input, "Mac", "t", { op: "update", prio: 0, status: "working" }, "codex"))
+      .not.toHaveProperty("plan");
+    expect(buildBlob(input, "Mac", "t", { op: "done", prio: 0, status: "done" }, "codex"))
+      .not.toHaveProperty("plan");
+  });
+
+  test("budget overflow drops plan first and preserves every existing blob key", () => {
+    const input = { session_id: "s", cwd: "/x/proj", hook_event_name: "Stop" };
+    const attention = { op: "update" as const, prio: 1 as const, status: "needsAttention" as const };
+    let title = "";
+    for (let n = 1; n < 4000; n++) {
+      const candidate = "t".repeat(n);
+      const base = buildBlob(input, "Mac", candidate, attention, "codex", 7, "proj", "gpt-5", 9);
+      const withMarker = { ...base, plan: PLAN_BLOB_TRUNCATION_MARKER };
+      if (
+        sealedBlobChars(new TextEncoder().encode(JSON.stringify(base)).length) <= BLOB_FIT_CHARS
+        && sealedBlobChars(new TextEncoder().encode(JSON.stringify(withMarker)).length) > BLOB_FIT_CHARS
+      ) {
+        title = candidate;
+        break;
+      }
+    }
+    expect(title.length).toBeGreaterThan(0);
+    const base = buildBlob(input, "Mac", title, attention, "codex", 7, "proj", "gpt-5", 9);
+    const attempted = buildBlob(input, "Mac", title, attention, "codex", 7, "proj", "gpt-5", 9, "p".repeat(5000));
+    expect(attempted).toEqual(base);
+    expect(attempted).not.toHaveProperty("plan");
+  });
 });
 
 describe("label pinning (first-seen cwd wins — a mid-session `cd` must not rename the session)", () => {
@@ -425,10 +466,26 @@ describe("buildEnvelope (v2 envelope + encrypted blob)", () => {
     const env = (await buildEnvelope(
       { session_id: "abc", hook_event_name: "Stop", cwd: "/x" }, "m", 5, "plan", KEY, false,
       "codex", undefined, undefined, undefined, undefined,
-      { op: "update", prio: 1, status: "needsAttention" }, "userInput",
+      { op: "update", prio: 1, status: "needsAttention" }, "userInput", "# Proposed\n\nShip it.",
     ))!;
     expect(env).toMatchObject({ op: "update", prio: 1, attentionKind: "userInput" });
-    expect(await decryptBlob(KEY, env.blob as string)).toMatchObject({ status: "needsAttention", agent: "codex" });
+    expect(await decryptBlob(KEY, env.blob as string)).toMatchObject({
+      status: "needsAttention", agent: "codex", plan: "# Proposed\n\nShip it.",
+    });
+  });
+
+  test("blob decode round-trips with and without the optional plan key", async () => {
+    const plan = { op: "update" as const, prio: 1 as const, status: "needsAttention" as const };
+    const withPlan = (await buildEnvelope(
+      { session_id: "abc", hook_event_name: "Stop", cwd: "/x" }, "m", 5, "t", KEY, false,
+      "codex", undefined, undefined, undefined, undefined, plan, "userInput", "Read me",
+    ))!;
+    const withoutPlan = (await buildEnvelope(
+      { session_id: "abc", hook_event_name: "Stop", cwd: "/x" }, "m", 5, "t", KEY, false,
+      "codex", undefined, undefined, undefined, undefined, plan, "userInput",
+    ))!;
+    expect(await decryptBlob(KEY, withPlan.blob as string)).toHaveProperty("plan", "Read me");
+    expect(await decryptBlob(KEY, withoutPlan.blob as string)).not.toHaveProperty("plan");
   });
 
   test("a permission Notification → op update prio 1, needsAttention blob", async () => {
@@ -1008,6 +1065,39 @@ describe("runHook phantom-session lineage, origin stamp, and session-trace.log",
     await proc.exited;
   }
 
+  async function spawnHookThroughBroker(entry: string, home: string, payload: Record<string, unknown>): Promise<void> {
+    const broker = join(home, "app-server-broker.mjs");
+    const appServer = join(home, "codex-app-server.mjs");
+    await writeFile(appServer, `
+const [entry, hookHome, encoded] = process.argv.slice(2);
+const child = Bun.spawn({
+  cmd: ["bun", entry],
+  env: { ...process.env, HOME: hookHome },
+  stdin: Buffer.from(encoded, "base64"),
+  stdout: "ignore",
+  stderr: "ignore",
+});
+await child.exited;
+`);
+    await writeFile(broker, `
+const [appServer, entry, hookHome, encoded] = process.argv.slice(2);
+const child = Bun.spawn({
+  cmd: ["bun", appServer, entry, hookHome, encoded, "codex", "app-server"],
+  env: { ...process.env, HOME: hookHome },
+  stdout: "ignore",
+  stderr: "ignore",
+});
+await child.exited;
+`);
+    const proc = Bun.spawn({
+      cmd: ["bun", broker, appServer, entry, home, Buffer.from(JSON.stringify(payload)).toString("base64")],
+      env: { ...process.env, HOME: home },
+      stdout: "ignore",
+      stderr: "ignore",
+    });
+    await proc.exited;
+  }
+
   async function readLocalRecord(sessionsDir: string, sessionId: string): Promise<SessionRecord | null> {
     try {
       return JSON.parse(await readFile(join(sessionsDir, `${sessionId}.json`), "utf8")) as SessionRecord;
@@ -1113,6 +1203,72 @@ describe("runHook phantom-session lineage, origin stamp, and session-trace.log",
       expect(trace.some((e) => e.event === "create" && e.sessionId === sid)).toBe(true);
       expect(trace.some((e) => e.event === "retire" && e.sessionId === sid)).toBe(true);
     } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  }, 20000);
+
+  test("companion broker ancestry suppresses a new Codex row and traces guard + reason", async () => {
+    const { home, ccDir, sessionsDir } = await setupHookHome("http://127.0.0.1:9");
+    try {
+      const sid = "019f4a6a-88ad-7ed3-8f0a-cdfcc32ff991";
+      const transcript = join(home, "companion-rollout.jsonl");
+      await writeFile(transcript, [
+        JSON.stringify({ timestamp: "2026-07-30T00:00:00Z", type: "session_meta", payload: { id: sid, source: "cli" } }),
+        JSON.stringify({ timestamp: "2026-07-30T00:00:01Z", type: "event_msg", payload: { type: "user_message", message: "Delegated rescue" } }),
+      ].join("\n"));
+      await spawnHookThroughBroker(codexEntry, home, {
+        session_id: sid, hook_event_name: "UserPromptSubmit", prompt: "Delegated rescue",
+        cwd: "/x/api-status", transcript_path: transcript,
+      });
+
+      expect(await readLocalRecord(sessionsDir, sid)).toBeNull();
+      const trace = (await readFile(join(ccDir, "session-trace.log"), "utf8"))
+        .trim().split("\n").map((line) => JSON.parse(line) as Record<string, unknown>);
+      expect(trace).toContainEqual(expect.objectContaining({
+        event: "suppress",
+        sessionId: sid,
+        guard: "codex-companion-broker",
+        reason: "broker ancestry proven by app-server-broker.mjs",
+        brokerMatch: "app-server-broker.mjs",
+      }));
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  }, 20000);
+
+  test("an older companion record is retired idempotently on its next broker-owned event", async () => {
+    const bodies: Array<Record<string, unknown>> = [];
+    const server = Bun.serve({
+      port: 0,
+      async fetch(req) {
+        bodies.push(await req.json() as Record<string, unknown>);
+        return new Response("{}", { status: 200 });
+      },
+    });
+    const { home, ccDir, sessionsDir } = await setupHookHome(`http://127.0.0.1:${server.port}`);
+    try {
+      const sid = "019f4a6a-88ad-7ed3-8f0a-cdfcc32ff992";
+      await writeFile(join(sessionsDir, `${sid}.json`), JSON.stringify({
+        pid: 123, machine: "m", label: "api-status", ts: Date.now(),
+        lastEvent: "working", sentDone: false, op: "update", prio: 0, agent: "codex",
+      }));
+      await spawnHookThroughBroker(codexEntry, home, {
+        session_id: sid, hook_event_name: "PostToolUse", cwd: "/x/api-status",
+      });
+
+      expect(await readLocalRecord(sessionsDir, sid)).toBeNull();
+      expect(bodies).toContainEqual(expect.objectContaining({ sessionId: sid, op: "end", prio: 0 }));
+      const trace = (await readFile(join(ccDir, "session-trace.log"), "utf8"))
+        .trim().split("\n").map((line) => JSON.parse(line) as Record<string, unknown>);
+      expect(trace.some((event) =>
+        event.event === "retire" && event.sessionId === sid
+        && typeof event.reason === "string" && event.reason.includes("codex companion broker ancestry proven")
+      )).toBe(true);
+      expect(trace.some((event) =>
+        event.event === "suppress" && event.sessionId === sid && event.guard === "codex-companion-broker"
+      )).toBe(true);
+    } finally {
+      server.stop(true);
       await rm(home, { recursive: true, force: true });
     }
   }, 20000);

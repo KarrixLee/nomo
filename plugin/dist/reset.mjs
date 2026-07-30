@@ -87,7 +87,7 @@ async function sha256Hex(s) {
 }
 
 // src/core/shared.ts
-var PLUGIN_VERSION = "1.4.7";
+var PLUGIN_VERSION = "1.4.8";
 var CC_DIR = `${process.env.HOME}/.config/cc-status`;
 var SESSIONS_DIR = `${CC_DIR}/sessions`;
 var WATCHDOG_PID_PATH = `${CC_DIR}/watchdog.pid`;
@@ -95,6 +95,36 @@ var LAST_SEND_PATH = `${CC_DIR}/last-send`;
 var GONE_STRIKES_PATH = `${CC_DIR}/gone-strikes`;
 var GONE_STRIKE_LIMIT = 2;
 var NO_HOLD_PATH = `${CC_DIR}/no-hold`;
+var BLOB_FIT_CHARS = 3008;
+function sealedBlobChars(plaintextBytes) {
+  return Math.ceil((12 + plaintextBytes + 16) / 3) * 4;
+}
+var PLAN_BLOB_TEXT_MAX_CHARS = 1800;
+var PLAN_BLOB_TRUNCATION_MARKER = `
+…`;
+function appendFittedPlan(base, plan) {
+  if (typeof plan !== "string" || plan.length === 0)
+    return base;
+  const chars = Array.from(plan);
+  const marker = PLAN_BLOB_TRUNCATION_MARKER;
+  const markerChars = Array.from(marker).length;
+  const encoder = new TextEncoder;
+  const fits = (value) => sealedBlobChars(encoder.encode(JSON.stringify({ ...base, plan: value })).length) <= BLOB_FIT_CHARS;
+  if (chars.length <= PLAN_BLOB_TEXT_MAX_CHARS && fits(plan))
+    return { ...base, plan };
+  if (!fits(marker))
+    return base;
+  let lo = 0;
+  let hi = Math.min(chars.length, PLAN_BLOB_TEXT_MAX_CHARS - markerChars);
+  while (lo < hi) {
+    const mid = Math.ceil((lo + hi) / 2);
+    if (fits(chars.slice(0, mid).join("") + marker))
+      lo = mid;
+    else
+      hi = mid - 1;
+  }
+  return { ...base, plan: chars.slice(0, lo).join("") + marker };
+}
 async function flagExists(path) {
   try {
     await access(path);
@@ -509,6 +539,40 @@ function pidCommand(pid) {
   } catch {
     return;
   }
+}
+function codexCompanionBrokerEvidence(pid, ancestorsOf = pidAncestors, commandOf = pidCommand) {
+  const appServer = /(?:^|[\/\s"'])codex(?:\.exe)?(?:["']?)\s+app-server(?:$|\s)/;
+  const brokerScript = /(?:^|[\/\s"'=])app-server-broker\.mjs(?:$|[\s"'])/;
+  const brokerSocket = /unix:\/\/[^\s"'<>]*\/cxc-[^/\s"'<>]+\/broker\.sock(?:$|[\s"'])/;
+  let ownerCommand;
+  try {
+    ownerCommand = commandOf(pid);
+  } catch {
+    return null;
+  }
+  if (typeof ownerCommand !== "string" || !appServer.test(ownerCommand))
+    return null;
+  let ancestors = [];
+  try {
+    ancestors = ancestorsOf(pid);
+  } catch {}
+  for (const candidate of [pid, ...ancestors]) {
+    let command;
+    try {
+      command = candidate === pid ? ownerCommand : commandOf(candidate);
+    } catch {
+      continue;
+    }
+    if (typeof command !== "string" || command.length === 0)
+      continue;
+    if (brokerScript.test(command)) {
+      return { pid: candidate, command, matchedBy: "app-server-broker.mjs" };
+    }
+    if (brokerSocket.test(command)) {
+      return { pid: candidate, command, matchedBy: "cxc-broker-socket" };
+    }
+  }
+  return null;
 }
 
 // src/entries/reset.ts

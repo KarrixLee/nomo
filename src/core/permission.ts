@@ -22,8 +22,8 @@ import { hostname } from "node:os";
 import { basename, isAbsolute, relative, resolve } from "node:path";
 import { runHook, buildBlob, OpPlan } from "./hook";
 import {
-  AgentKind, atomicWrite, CC_DIR, codexHome, Config, flagExists, loadConfig, NO_HOLD_PATH,
-  PLUGIN_VERSION, readPrefix, readRecord, readSuffix, SessionRecord,
+  AgentKind, atomicWrite, BLOB_FIT_CHARS, CC_DIR, codexHome, Config, flagExists, loadConfig, NO_HOLD_PATH,
+  PLUGIN_VERSION, readPrefix, readRecord, readSuffix, sealedBlobChars, SessionRecord,
 } from "./shared";
 import { decryptBlob, encryptBlob } from "./crypto";
 
@@ -32,7 +32,7 @@ import { decryptBlob, encryptBlob } from "./crypto";
  *  DEFINED IN shared.ts (every /cc/event POSTer reports it as the `x-cc-approvals` header, and a
  *  shared.ts → permission.ts import would be a cycle); re-exported here, where it is toggled, so
  *  existing importers are unaffected. */
-export { NO_HOLD_PATH };
+export { BLOB_FIT_CHARS, NO_HOLD_PATH, sealedBlobChars };
 
 /** How often to poll for the phone's answer while holding (ms). Small jitter is added per cycle. */
 const POLL_INTERVAL_MS = 3_000;
@@ -629,30 +629,10 @@ export function buildPermissionQuestions(toolInput: Record<string, unknown>): Pe
   });
 }
 
-/** The worker's hard ceiling on a decision POST's base64 `blob` (MAX_BLOB_CHARS, server/src/cc.ts):
- *  an oversized frame is rejected 400 and the hold never reaches the phone. Sized so the blob plus the
- *  rest of the ActivityKit content-state stays inside APNs' ~4 KB Live Activity budget — raising it is
- *  a worker+APNs decision, NOT a plugin one. FROZEN cross-repo constant. */
-const MAX_BLOB_CHARS = 3072;
-/** Slack left under the ceiling. The frame-size prediction below is EXACT (AES-GCM ciphertext is the
- *  same length as its plaintext), so this is belt-and-braces against a future blob key landing between
- *  the fit and the seal — it is NOT a licence to overshoot. Every field the fit adds must be MEASURED:
- *  the "…" floor alone costs ~76 sealed chars (permissionDetail + permissionDetailOmitted), more than
- *  this whole margin, which is exactly how over-cap frames used to escape (see the FLOOR GUARD below). */
-const BLOB_FIT_MARGIN = 64;
-/** The base64-char budget `fitPermissionDetail` fits the whole sealed frame into. */
-export const BLOB_FIT_CHARS = MAX_BLOB_CHARS - BLOB_FIT_MARGIN;
 /** Sanity bound on the raw detail before fitting — nothing near it could ever fit, and it keeps the
  *  binary search's JSON work bounded on a pathological input. Text dropped here is still COUNTED into
  *  `omitted`, so the phone's "N characters omitted" note stays truthful. */
 const MAX_DETAIL_CHARS = 20_000;
-
-/** Exact base64 length of the sealed frame for `plaintextBytes` bytes: `encryptBlob` emits
- *  base64(iv‖ct‖tag) with a 12-byte IV and a 16-byte GCM tag, and GCM ciphertext is byte-for-byte the
- *  length of its plaintext — so the size is a pure function of the JSON's UTF-8 byte length. */
-export function sealedBlobChars(plaintextBytes: number): number {
-  return Math.ceil((12 + plaintextBytes + 16) / 3) * 4;
-}
 
 /** Fit `detail` into the sealed decisionPending frame: return the longest prefix whose SEALED blob still
  *  fits `maxChars`, plus how many characters had to be dropped (0 = the whole thing rode).

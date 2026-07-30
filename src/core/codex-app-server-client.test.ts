@@ -151,6 +151,28 @@ describe("CodexAppServerClient", () => {
     expect(await loaded).toEqual({ data: ["thread-live-1", "thread-live-2"], nextCursor: null });
   });
 
+  test("reads the exact 0.146.0 thread runtime status without loading turns", async () => {
+    const h = harness();
+    await initialize(h);
+    const transport = h.transports[0];
+
+    const waiting = h.client.readThreadStatus("thread-1");
+    await Promise.resolve();
+    expect(transport.sent[2]).toEqual({
+      method: "thread/read", id: 2, params: { threadId: "thread-1", includeTurns: false },
+    });
+    transport.receive({
+      id: 2,
+      result: {
+        thread: {
+          id: "thread-1",
+          status: { type: "active", activeFlags: ["waitingOnUserInput"] },
+        },
+      },
+    });
+    expect(await waiting).toEqual({ type: "active", activeFlags: ["waitingOnUserInput"] });
+  });
+
   test("emits a typed request and answers the same server request id", async () => {
     const h = harness();
     await initialize(h);

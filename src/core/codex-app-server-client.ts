@@ -101,6 +101,13 @@ export interface CodexThreadResumeResult {
   [key: string]: unknown;
 }
 
+/** Exact 0.146.0 v2 thread runtime status shape. Kept narrow so a future protocol drift fails open. */
+export type CodexThreadStatus =
+  | { type: "notLoaded" }
+  | { type: "idle" }
+  | { type: "systemError" }
+  | { type: "active"; activeFlags: Array<"waitingOnApproval" | "waitingOnUserInput"> };
+
 export interface CodexAppServerClientOptions {
   transportFactory: CodexRpcTransportFactory;
   clientVersion: string;
@@ -176,6 +183,21 @@ function parseRequestId(value: unknown): CodexRequestId | undefined {
   return typeof value === "string" || (typeof value === "number" && Number.isFinite(value))
     ? value
     : undefined;
+}
+
+function parseThreadStatus(value: unknown): CodexThreadStatus | undefined {
+  const status = asRecord(value);
+  if (!status || typeof status.type !== "string") return undefined;
+  if (status.type === "notLoaded" || status.type === "idle" || status.type === "systemError") {
+    return { type: status.type };
+  }
+  if (status.type !== "active" || !Array.isArray(status.activeFlags)) return undefined;
+  const activeFlags: Array<"waitingOnApproval" | "waitingOnUserInput"> = [];
+  for (const flag of status.activeFlags) {
+    if (flag !== "waitingOnApproval" && flag !== "waitingOnUserInput") return undefined;
+    activeFlags.push(flag);
+  }
+  return { type: "active", activeFlags };
 }
 
 function parseQuestion(value: unknown): CodexUserInputQuestion | undefined {
@@ -364,6 +386,19 @@ export class CodexAppServerClient {
     const thread = asRecord(result?.thread);
     if (!result || !thread || thread.id !== threadId) throw new Error("Invalid thread/resume response");
     return { ...result, thread: thread as CodexThreadSummary } as CodexThreadResumeResult;
+  }
+
+  /** Read the current runtime status without loading turn history. This is the 0.146.0 `thread/read`
+   * request; callers treat notLoaded/systemError, protocol drift, and transport errors as unavailable. */
+  async readThreadStatus(threadId: string): Promise<CodexThreadStatus> {
+    if (threadId.length === 0) throw new Error("threadId is required");
+    const result = asRecord(await this.request("thread/read", { threadId, includeTurns: false }));
+    const thread = asRecord(result?.thread);
+    const status = parseThreadStatus(thread?.status);
+    if (!result || !thread || thread.id !== threadId || !status) {
+      throw new Error("Invalid thread/read response");
+    }
+    return status;
   }
 
   async answerUserInput(

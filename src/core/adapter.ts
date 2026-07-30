@@ -648,25 +648,39 @@ export function codexTailPendingApproval(tail: string): boolean {
 // turn must never be held in needsAttention merely because its TUI remains open at the prompt.
 
 export type CodexPlanPickerState = "pending" | "incomplete" | "resolved" | "none" | "exited" | "unknown";
+export interface CodexPlanPickerEvidence {
+  state: CodexPlanPickerState;
+  /** Inner markdown from the exact final <proposed_plan> wrapper. Present only while pending. */
+  plan?: string;
+}
 
 /** Exact Plan-mode final-answer wrapper. The watchdog verification marker is armed when this durable
  *  message exists before the rollout has appended its trailing task_complete. */
 export function codexProposedPlanText(text: unknown): boolean {
-  if (typeof text !== "string") return false;
+  return codexProposedPlanMarkdown(text) !== undefined;
+}
+
+/** Extract the wrapper's inner markdown. Trimming is limited to the wrapper boundary so the phone
+ *  receives markdown content, never the protocol tags themselves. */
+export function codexProposedPlanMarkdown(text: unknown): string | undefined {
+  if (typeof text !== "string") return undefined;
   const trimmed = text.trim();
-  return trimmed.startsWith("<proposed_plan>") && trimmed.endsWith("</proposed_plan>");
+  const open = "<proposed_plan>";
+  const close = "</proposed_plan>";
+  if (!trimmed.startsWith(open) || !trimmed.endsWith(close)) return undefined;
+  return trimmed.slice(open.length, -close.length).trim();
 }
 
 /** Whether an assistant payload is the durable FINAL plan emitted by Codex Plan mode. Supports both
  *  rollout forms seen across Codex versions: response_item message content and event_msg agent_message.
  *  The exact full wrapper is load-bearing for precision. */
-function codexFinalProposedPlan(row: Record<string, unknown>): boolean {
+function codexFinalProposedPlan(row: Record<string, unknown>): string | undefined {
   const payload = row.payload as Record<string, unknown> | undefined;
-  if (!payload || payload.phase !== "final_answer") return false;
+  if (!payload || payload.phase !== "final_answer") return undefined;
   let text = "";
   if (row.type === "response_item" && payload.type === "message" && payload.role === "assistant") {
     const content = payload.content;
-    if (!Array.isArray(content)) return false;
+    if (!Array.isArray(content)) return undefined;
     text = content.map((part) => {
       if (typeof part !== "object" || part === null) return "";
       const p = part as Record<string, unknown>;
@@ -675,9 +689,9 @@ function codexFinalProposedPlan(row: Record<string, unknown>): boolean {
   } else if (row.type === "event_msg" && payload.type === "agent_message") {
     text = typeof payload.message === "string" ? payload.message : "";
   } else {
-    return false;
+    return undefined;
   }
-  return codexProposedPlanText(text);
+  return codexProposedPlanMarkdown(text);
 }
 
 /** Classify the plan-picker episode visible in a bounded rollout tail.
@@ -691,13 +705,16 @@ function codexFinalProposedPlan(row: Record<string, unknown>): boolean {
  * Malformed/byte-sliced lines are skipped, matching the other rollout-tail classifiers. */
 interface CodexPlanPickerTailAnalysis {
   state: Extract<CodexPlanPickerState, "pending" | "resolved" | "none">;
+  /** Inner markdown for the currently pending completed Plan episode. */
+  plan?: string;
   /** Exact final wrapper is durable, but task_complete has not been appended yet. Retry-only signal. */
   incompleteFinalPlan: boolean;
 }
 
 function codexPlanPickerTailAnalysis(tail: string): CodexPlanPickerTailAnalysis {
   let state: "pending" | "resolved" | "none" = "none";
-  let finalPlanInTurn = false;
+  let plan: string | undefined;
+  let finalPlanInTurn: string | undefined;
   for (const line of tail.split("\n")) {
     if (!line.trim()) continue;
     if (!line.includes("event_msg") && !line.includes("response_item")) continue;
@@ -705,23 +722,30 @@ function codexPlanPickerTailAnalysis(tail: string): CodexPlanPickerTailAnalysis 
     try { row = JSON.parse(line); } catch { continue; }
     if (typeof row !== "object" || row === null) continue;
     const r = row as Record<string, unknown>;
-    if (codexFinalProposedPlan(r)) {
-      finalPlanInTurn = true;
+    const finalPlan = codexFinalProposedPlan(r);
+    if (finalPlan !== undefined) {
+      finalPlanInTurn = finalPlan;
       continue;
     }
     if (r.type !== "event_msg") continue;
     const ptype = (r.payload as Record<string, unknown> | undefined)?.type;
     if (ptype === "task_complete") {
-      if (finalPlanInTurn) state = "pending";
-      finalPlanInTurn = false;
+      if (finalPlanInTurn !== undefined) {
+        state = "pending";
+        plan = finalPlanInTurn;
+      }
+      finalPlanInTurn = undefined;
     } else if (ptype === "task_started" || ptype === "user_message") {
-      if (state === "pending") state = "resolved";
-      finalPlanInTurn = false;
+      if (state === "pending") {
+        state = "resolved";
+        plan = undefined;
+      }
+      finalPlanInTurn = undefined;
     } else if (ptype === "turn_aborted") {
-      finalPlanInTurn = false;
+      finalPlanInTurn = undefined;
     }
   }
-  return { state, incompleteFinalPlan: finalPlanInTurn };
+  return { state, ...(state === "pending" && plan !== undefined ? { plan } : {}), incompleteFinalPlan: finalPlanInTurn !== undefined };
 }
 
 export function codexPlanPickerStateFromTail(tail: string): Extract<CodexPlanPickerState, "pending" | "resolved" | "none"> {
@@ -1119,7 +1143,7 @@ export interface CodexPlanPickerProbeDeps extends CodexTurnProbeDeps {
 async function codexPidPlanPickerAnalysis(
   pid: number,
   deps: CodexPlanPickerProbeDeps,
-): Promise<{ state: CodexPlanPickerState; incompleteFinalPlan: boolean }> {
+): Promise<CodexPlanPickerEvidence & { incompleteFinalPlan: boolean }> {
   try {
     if (!(deps.isAlive ?? pidAlive)(pid)) return { state: "exited", incompleteFinalPlan: false };
     const rollout = await codexRolloutForPid(pid, deps);
@@ -1128,6 +1152,7 @@ async function codexPidPlanPickerAnalysis(
     const analysis = codexPlanPickerTailAnalysis(tail);
     return {
       state: analysis.incompleteFinalPlan ? "incomplete" : analysis.state,
+      ...(!analysis.incompleteFinalPlan && analysis.plan !== undefined ? { plan: analysis.plan } : {}),
       incompleteFinalPlan: analysis.incompleteFinalPlan,
     };
   } catch {
@@ -1137,6 +1162,13 @@ async function codexPidPlanPickerAnalysis(
 
 export async function codexPidPlanPickerState(pid: number, deps: CodexPlanPickerProbeDeps = {}): Promise<CodexPlanPickerState> {
   return (await codexPidPlanPickerAnalysis(pid, deps)).state;
+}
+
+/** State + plan markdown from ONE durable rollout-tail read, so a pending verdict and its displayed
+ *  plan can never come from different filesystem snapshots. */
+export async function codexPidPlanPickerEvidence(pid: number, deps: CodexPlanPickerProbeDeps = {}): Promise<CodexPlanPickerEvidence> {
+  const { state, plan } = await codexPidPlanPickerAnalysis(pid, deps);
+  return { state, ...(state === "pending" && plan !== undefined ? { plan } : {}) };
 }
 
 // --- Live session discovery (the seam that closes the Codex "late session" gap) --------------
@@ -1553,6 +1585,9 @@ export interface AgentAdapter {
    *  kind of wait. `transcriptPath` pins the exact rollout when known; otherwise the pid locator's
    *  open-fd / cwd+recency fallback is used. */
   completedTurnWaitState?(ctx: { pid: number; transcriptPath?: string }): Promise<CodexPlanPickerState>;
+  /** OPTIONAL state + plan markdown from the same durable probe. F11 consumers prefer this over the
+   *  state-only compatibility seam to avoid a second rollout read. */
+  completedTurnWaitEvidence?(ctx: { pid: number; transcriptPath?: string }): Promise<CodexPlanPickerEvidence>;
   /** OPTIONAL: whether a hook event for a NEVER-tracked session id is a CHILD-SESSION GHOST that must
    *  be skipped (no phone row). Claude OMITS it (every Claude session id is real); Codex implements it
    *  because the ChatGPT.app `codex app-server` spawns child session ids with no rollout/transcript
@@ -1729,6 +1764,11 @@ export const codexAdapter: AgentAdapter = {
   },
   completedTurnWaitState({ pid, transcriptPath }): Promise<CodexPlanPickerState> {
     return codexPidPlanPickerState(pid, transcriptPath
+      ? { rolloutOf: async () => transcriptPath }
+      : {});
+  },
+  completedTurnWaitEvidence({ pid, transcriptPath }): Promise<CodexPlanPickerEvidence> {
+    return codexPidPlanPickerEvidence(pid, transcriptPath
       ? { rolloutOf: async () => transcriptPath }
       : {});
   },
