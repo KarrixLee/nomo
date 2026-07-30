@@ -337,6 +337,10 @@ export interface PlanPickerResolutionDeps {
   readRecord?: (path: string) => Promise<SessionRecord | null>;
   now?: () => number;
   trace?: (decision: PlanPickerTraceDecision) => void;
+  /** Sweep-only snapshot of real-TTY provisional rows. Unit callers omit it, keeping pure tests away
+   *  from the user's live sessions dir. Missing/ambiguous evidence means no stamp and TTL fallback. */
+  tuiCandidates?: () => Promise<SessionRecord[]>;
+  pidAlive?: (pid: number) => boolean;
 }
 
 type PlanPickerCorrection = "corrected" | "pending" | "uncorrected" | "revoked";
@@ -369,6 +373,7 @@ function tracePicker(
 async function settlePendingPlanPickerDone(
   config: Config, path: string, sessionId: string, snapshot: SessionRecord, now: number,
   deps: Pick<PlanPickerResolutionDeps, "post" | "writeRecord" | "readRecord" | "trace">,
+  cause: "settle" | "exit" = "settle",
 ): Promise<PlanPickerCorrection> {
   const readCurrent = deps.readRecord ?? readRecordAt;
   const writeRecord = deps.writeRecord
@@ -386,7 +391,7 @@ async function settlePendingPlanPickerDone(
     ? Math.floor(snapshot.ts / 1000) : undefined;
   const ttlFired = planPickerPendingExpired(snapshot, now);
   const dbg = formatPlanPickerDebug({
-    event: ttlFired ? "ttl" : "settle", classifier: "done", marker: "s",
+    event: cause === "exit" ? "exit" : ttlFired ? "ttl" : "settle", classifier: "done", marker: "s",
     ttl: ttlFired ? "fire" : markerAge(snapshot, now), by: "wd",
   });
   const envelope = await buildDoneEnvelope(sessionId, snapshot, now, config.e2eKey, "codex", at, dbg) as Record<string, unknown>;
@@ -412,13 +417,13 @@ async function settlePendingPlanPickerDone(
     outcome = await (deps.post ?? ((body: object) => postEvent(config, body)))(envelope);
   } catch {
     tracePicker(sessionId, deps, {
-      source: "watchdog", classifier: "done", marker: "settled", ttlFired,
+      source: "watchdog", classifier: cause === "exit" ? "tui-exit" : "done", marker: "settled", ttlFired,
       settle: "done", correctionPosted: false, doneBy: "watchdog",
     });
     return "pending"; // disk already owns this terminal transition; donePending retries it
   }
   tracePicker(sessionId, deps, {
-    source: "watchdog", classifier: "done", marker: "settled", ttlFired,
+    source: "watchdog", classifier: cause === "exit" ? "tui-exit" : "done", marker: "settled", ttlFired,
     settle: "done", correctionPosted: outcome === "delivered", doneBy: "watchdog",
   });
   if (outcome === "revoked") return "revoked";
@@ -433,9 +438,40 @@ async function settlePendingPlanPickerDone(
   return "corrected";
 }
 
+/** Maximum permitted distance between the real-TTY process birth and rollout/session birth. The
+ * pair normally lands within seconds. A resume, an old idle TUI, missing ps data, or two nearby TUIs
+ * deliberately fails correlation and leaves the hard TTL as the only terminal backstop. */
+export const CODEX_TUI_SESSION_START_SKEW_MS = 30_000;
+const CODEX_TUI_SESSION_START_FUTURE_SLOP_MS = 2_000;
+
+/** Precision-biased daemon-session → real-TTY correlation. All evidence is mandatory: this must be a
+ * standalone-daemon hook record, both sides need an exact cwd and finite birth time, the birth times
+ * must be close, the candidate must still be alive, and exactly ONE candidate may qualify. */
+export function correlateCodexTuiPid(
+  record: SessionRecord, candidates: SessionRecord[], alive: (pid: number) => boolean = pidAlive,
+): number | undefined {
+  if (record.agent !== "codex" || record.provisional === true) return undefined;
+  const cwd = record.origin?.cwd;
+  const owner = record.origin?.ppid_command;
+  const startedAt = record.sessionStartedAt;
+  if (typeof cwd !== "string" || cwd.length === 0 ||
+      typeof owner !== "string" || !owner.includes("/standalone/") || !/(?:^|\/)codex app-server(?:\s|$)/.test(owner) ||
+      typeof startedAt !== "number" || !Number.isFinite(startedAt)) return undefined;
+  const matches = candidates.filter((candidate) =>
+    candidate.provisional === true && candidate.agent === "codex" &&
+    candidate.tuiCwd === cwd &&
+    typeof candidate.pid === "number" && Number.isFinite(candidate.pid) &&
+    typeof candidate.tuiStartedAt === "number" && Number.isFinite(candidate.tuiStartedAt) &&
+    startedAt - candidate.tuiStartedAt >= -CODEX_TUI_SESSION_START_FUTURE_SLOP_MS &&
+    startedAt - candidate.tuiStartedAt <= CODEX_TUI_SESSION_START_SKEW_MS &&
+    alive(candidate.pid));
+  return matches.length === 1 ? matches[0].pid : undefined;
+}
+
 /** Clear ONLY a needsAttention episode that the Stop/notify path explicitly marked as a Plan picker,
  * and ONLY after the adapter sees later task_started/user_message evidence in the rollout. Unknown /
- * unreadable state leaves the row pending; process death is handled by the sweep's normal op:end reap. */
+ * unreadable state leaves the row pending; a confidently stamped TUI death settles it immediately,
+ * while an unstamped daemon-fronted row retains the hard-TTL backstop. */
 export async function correctResolvedPlanPicker(
   config: Config, path: string, sessionId: string, record: SessionRecord, deps: PlanPickerResolutionDeps = {},
 ): Promise<PlanPickerCorrection> {
@@ -447,12 +483,34 @@ export async function correctResolvedPlanPicker(
     if (planPickerPendingExpired(record, now)) {
       return await settlePendingPlanPickerDone(config, path, sessionId, record, now, deps);
     }
-    const agent: AgentKind = record.agent === "codex" ? "codex" : "claude";
+    let snapshot = record;
+    let tuiPid = typeof snapshot.tuiPid === "number" && Number.isFinite(snapshot.tuiPid)
+      ? snapshot.tuiPid : undefined;
+    if (tuiPid === undefined && deps.tuiCandidates) {
+      const correlated = correlateCodexTuiPid(snapshot, await deps.tuiCandidates(), deps.pidAlive ?? pidAlive);
+      if (correlated !== undefined) {
+        const readCurrent = deps.readRecord ?? readRecordAt;
+        const fresh = await readCurrent(path);
+        if (fresh && !recordMovedSince(snapshot, fresh) && fresh.turnId === snapshot.turnId &&
+            fresh.pendingPlanPicker === true) {
+          snapshot = { ...fresh, tuiPid: correlated };
+          await (deps.writeRecord
+            ?? ((p: string, rec: SessionRecord) => atomicWrite(p, JSON.stringify(rec), 0o600)))(path, snapshot);
+          tuiPid = correlated;
+        }
+      }
+    }
+    // This PID is trusted only because the correlation above was unique and evidence-complete. Its
+    // continued life always wins (never dismiss a live picker); its death resolves in this sweep.
+    if (tuiPid !== undefined && !(deps.pidAlive ?? pidAlive)(tuiPid)) {
+      return await settlePendingPlanPickerDone(config, path, sessionId, snapshot, now, deps, "exit");
+    }
+    const agent: AgentKind = snapshot.agent === "codex" ? "codex" : "claude";
     const adapter = adapterFor(agent);
     if (!adapter.completedTurnWaitState) return "uncorrected";
     const state = await (deps.state ?? (() => adapter.completedTurnWaitState!({
-      pid: record.pid,
-      transcriptPath: typeof record.transcript === "string" ? record.transcript : undefined,
+      pid: snapshot.pid,
+      transcriptPath: typeof snapshot.transcript === "string" ? snapshot.transcript : undefined,
     })))();
     if (state === "pending") {
       const threadState = deps.threadWaitState ? await deps.threadWaitState() : "unavailable";
@@ -476,9 +534,9 @@ export async function correctResolvedPlanPicker(
     const dbg = formatPlanPickerDebug({
       event: "resolve", classifier: state, marker: "0", ttl: markerAge(record, now), by: "wd",
     });
-    const envelope = await buildWorkingEnvelope(sessionId, record, now, config.e2eKey, agent, dbg);
+    const envelope = await buildWorkingEnvelope(sessionId, snapshot, now, config.e2eKey, agent, dbg);
     const next: SessionRecord = {
-      ...record,
+      ...snapshot,
       ts: now,
       lastEvent: "working",
       sentDone: false,
@@ -1269,6 +1327,8 @@ export function buildProvisionalRecord(
     prio: 0,
     blob,
     provisional: true,
+    ...(typeof d.cwd === "string" && d.cwd.length > 0 ? { tuiCwd: d.cwd } : {}),
+    ...(typeof d.startedAt === "number" && Number.isFinite(d.startedAt) ? { tuiStartedAt: d.startedAt } : {}),
     ...(typeof d.title === "string" && d.title.length > 0 ? { title: d.title } : {}),
     ...blobAgentFields,
     ...(blobAgentFields.agent === "codex" ? { dbg: formatPlanPickerDebug({
@@ -2393,6 +2453,7 @@ async function sweep(config: Config | null, deps: SweepDeps = {}): Promise<Sweep
         // failed/unknown probe leaves it untouched and the heartbeat sustains the pending state.
         const planResolution = await correctResolvedPlanPicker(config, path, sessionId, record, {
           ...(deps.threadWaitState ? { threadWaitState: () => deps.threadWaitState!(sessionId) } : {}),
+          tuiCandidates: readAllRecords,
         });
         if (planResolution === "revoked") return { revoked: true };
         const resolvedPlan = planResolution === "corrected";

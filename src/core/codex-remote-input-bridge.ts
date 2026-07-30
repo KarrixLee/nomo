@@ -117,8 +117,9 @@ export class CodexRemoteInputBridge {
     return this.refreshPromise;
   }
 
-  /** Query only an already-pending Plan-picker thread. `idle` or an active thread without the flag is
-   * authoritative dismissal; unloaded/error/malformed/transport states fail open to unavailable. */
+  /** Query only an already-pending Plan-picker thread. The watchdog may use explicit waiting as
+   * confirmation, but client-side TUI pickers report daemon idle both before and after dismissal, so
+   * `notWaitingOnUserInput` is never itself an exit signal. Errors fail open to unavailable. */
   async readThreadWaitState(threadId: string): Promise<CodexThreadWaitState> {
     if (this.client.state !== "ready" || this.stopping) return "unavailable";
     try {

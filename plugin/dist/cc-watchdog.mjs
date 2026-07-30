@@ -92,7 +92,7 @@ import { appendFileSync, existsSync, readFileSync, statSync, truncateSync } from
 import { execFileSync, spawn } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "1.4.10";
+var PLUGIN_VERSION = "1.4.11";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -1512,9 +1512,19 @@ async function cwdViaLsof(pid) {
     return;
   }
 }
+async function processStartedAtViaPs(pid) {
+  try {
+    const { stdout } = await execFileP("ps", ["-p", String(pid), "-o", "lstart="]);
+    const value = Date.parse(stdout.trim());
+    return Number.isFinite(value) ? value : undefined;
+  } catch {
+    return;
+  }
+}
 async function codexDiscoverLive(known, deps = {}) {
   const ps = deps.ps ?? runPs;
   const cwdOf = deps.cwdOf ?? cwdViaLsof;
+  const startedAtOf = deps.startedAtOf ?? processStartedAtViaPs;
   const turnActive = deps.turnActive ?? codexPidTurnActive;
   let output;
   try {
@@ -1526,12 +1536,22 @@ async function codexDiscoverLive(known, deps = {}) {
   const tuis = filterCodexTuis(parseCodexProcs(output), knownPids);
   const out = [];
   for (const { pid } of tuis) {
-    const label = labelFromCwd(await cwdOf(pid));
+    const cwd = await cwdOf(pid);
+    const startedAt = await startedAtOf(pid);
+    const label = labelFromCwd(cwd);
     let active = false;
     try {
       active = await turnActive(pid);
     } catch {}
-    out.push({ pid, sessionId: codexSentinelSessionId(pid), title: label, label, idle: !active });
+    out.push({
+      pid,
+      sessionId: codexSentinelSessionId(pid),
+      title: label,
+      label,
+      idle: !active,
+      ...cwd ? { cwd } : {},
+      ...typeof startedAt === "number" && Number.isFinite(startedAt) ? { startedAt } : {}
+    });
   }
   return out;
 }
@@ -4755,7 +4775,7 @@ function tracePicker(sessionId, deps, decision) {
     return;
   tracePlanPickerDecision(sessionId, decision);
 }
-async function settlePendingPlanPickerDone(config, path, sessionId, snapshot, now, deps) {
+async function settlePendingPlanPickerDone(config, path, sessionId, snapshot, now, deps, cause = "settle") {
   const readCurrent = deps.readRecord ?? readRecordAt;
   const writeRecord = deps.writeRecord ?? ((p, rec) => atomicWrite(p, JSON.stringify(rec), 384));
   const fresh = await readCurrent(path);
@@ -4771,7 +4791,7 @@ async function settlePendingPlanPickerDone(config, path, sessionId, snapshot, no
   const at = typeof snapshot.ts === "number" && Number.isFinite(snapshot.ts) ? Math.floor(snapshot.ts / 1000) : undefined;
   const ttlFired = planPickerPendingExpired(snapshot, now);
   const dbg = formatPlanPickerDebug({
-    event: ttlFired ? "ttl" : "settle",
+    event: cause === "exit" ? "exit" : ttlFired ? "ttl" : "settle",
     classifier: "done",
     marker: "s",
     ttl: ttlFired ? "fire" : markerAge(snapshot, now),
@@ -4801,7 +4821,7 @@ async function settlePendingPlanPickerDone(config, path, sessionId, snapshot, no
   } catch {
     tracePicker(sessionId, deps, {
       source: "watchdog",
-      classifier: "done",
+      classifier: cause === "exit" ? "tui-exit" : "done",
       marker: "settled",
       ttlFired,
       settle: "done",
@@ -4812,7 +4832,7 @@ async function settlePendingPlanPickerDone(config, path, sessionId, snapshot, no
   }
   tracePicker(sessionId, deps, {
     source: "watchdog",
-    classifier: "done",
+    classifier: cause === "exit" ? "tui-exit" : "done",
     marker: "settled",
     ttlFired,
     settle: "done",
@@ -4831,6 +4851,19 @@ async function settlePendingPlanPickerDone(config, path, sessionId, snapshot, no
   } catch {}
   return "corrected";
 }
+var CODEX_TUI_SESSION_START_SKEW_MS = 30000;
+var CODEX_TUI_SESSION_START_FUTURE_SLOP_MS = 2000;
+function correlateCodexTuiPid(record, candidates, alive = pidAlive) {
+  if (record.agent !== "codex" || record.provisional === true)
+    return;
+  const cwd = record.origin?.cwd;
+  const owner = record.origin?.ppid_command;
+  const startedAt = record.sessionStartedAt;
+  if (typeof cwd !== "string" || cwd.length === 0 || typeof owner !== "string" || !owner.includes("/standalone/") || !/(?:^|\/)codex app-server(?:\s|$)/.test(owner) || typeof startedAt !== "number" || !Number.isFinite(startedAt))
+    return;
+  const matches = candidates.filter((candidate) => candidate.provisional === true && candidate.agent === "codex" && candidate.tuiCwd === cwd && typeof candidate.pid === "number" && Number.isFinite(candidate.pid) && typeof candidate.tuiStartedAt === "number" && Number.isFinite(candidate.tuiStartedAt) && startedAt - candidate.tuiStartedAt >= -CODEX_TUI_SESSION_START_FUTURE_SLOP_MS && startedAt - candidate.tuiStartedAt <= CODEX_TUI_SESSION_START_SKEW_MS && alive(candidate.pid));
+  return matches.length === 1 ? matches[0].pid : undefined;
+}
 async function correctResolvedPlanPicker(config, path, sessionId, record, deps = {}) {
   try {
     if (record.pendingPlanPicker !== true)
@@ -4839,13 +4872,30 @@ async function correctResolvedPlanPicker(config, path, sessionId, record, deps =
     if (planPickerPendingExpired(record, now)) {
       return await settlePendingPlanPickerDone(config, path, sessionId, record, now, deps);
     }
-    const agent = record.agent === "codex" ? "codex" : "claude";
+    let snapshot = record;
+    let tuiPid = typeof snapshot.tuiPid === "number" && Number.isFinite(snapshot.tuiPid) ? snapshot.tuiPid : undefined;
+    if (tuiPid === undefined && deps.tuiCandidates) {
+      const correlated = correlateCodexTuiPid(snapshot, await deps.tuiCandidates(), deps.pidAlive ?? pidAlive);
+      if (correlated !== undefined) {
+        const readCurrent = deps.readRecord ?? readRecordAt;
+        const fresh = await readCurrent(path);
+        if (fresh && !recordMovedSince(snapshot, fresh) && fresh.turnId === snapshot.turnId && fresh.pendingPlanPicker === true) {
+          snapshot = { ...fresh, tuiPid: correlated };
+          await (deps.writeRecord ?? ((p, rec) => atomicWrite(p, JSON.stringify(rec), 384)))(path, snapshot);
+          tuiPid = correlated;
+        }
+      }
+    }
+    if (tuiPid !== undefined && !(deps.pidAlive ?? pidAlive)(tuiPid)) {
+      return await settlePendingPlanPickerDone(config, path, sessionId, snapshot, now, deps, "exit");
+    }
+    const agent = snapshot.agent === "codex" ? "codex" : "claude";
     const adapter2 = adapterFor(agent);
     if (!adapter2.completedTurnWaitState)
       return "uncorrected";
     const state = await (deps.state ?? (() => adapter2.completedTurnWaitState({
-      pid: record.pid,
-      transcriptPath: typeof record.transcript === "string" ? record.transcript : undefined
+      pid: snapshot.pid,
+      transcriptPath: typeof snapshot.transcript === "string" ? snapshot.transcript : undefined
     })))();
     if (state === "pending") {
       const threadState = deps.threadWaitState ? await deps.threadWaitState() : "unavailable";
@@ -4871,9 +4921,9 @@ async function correctResolvedPlanPicker(config, path, sessionId, record, deps =
       ttl: markerAge(record, now),
       by: "wd"
     });
-    const envelope = await buildWorkingEnvelope(sessionId, record, now, config.e2eKey, agent, dbg);
+    const envelope = await buildWorkingEnvelope(sessionId, snapshot, now, config.e2eKey, agent, dbg);
     const next = {
-      ...record,
+      ...snapshot,
       ts: now,
       lastEvent: "working",
       sentDone: false,
@@ -5380,6 +5430,8 @@ function buildProvisionalRecord(d, machine, blob, blobAgentFields, now, pairingI
     prio: 0,
     blob,
     provisional: true,
+    ...typeof d.cwd === "string" && d.cwd.length > 0 ? { tuiCwd: d.cwd } : {},
+    ...typeof d.startedAt === "number" && Number.isFinite(d.startedAt) ? { tuiStartedAt: d.startedAt } : {},
     ...typeof d.title === "string" && d.title.length > 0 ? { title: d.title } : {},
     ...blobAgentFields,
     ...blobAgentFields.agent === "codex" ? { dbg: formatPlanPickerDebug({
@@ -5950,7 +6002,8 @@ async function sweep(config, deps = {}) {
         if (idleFix === "corrected")
           delivered = true;
         const planResolution = await correctResolvedPlanPicker(config, path, sessionId, record, {
-          ...deps.threadWaitState ? { threadWaitState: () => deps.threadWaitState(sessionId) } : {}
+          ...deps.threadWaitState ? { threadWaitState: () => deps.threadWaitState(sessionId) } : {},
+          tuiCandidates: readAllRecords
         });
         if (planResolution === "revoked")
           return { revoked: true };
@@ -6329,6 +6382,7 @@ export {
   drainCommands,
   discoverLiveSessions,
   createBridgeSupervisor,
+  correlateCodexTuiPid,
   correctResolvedPlanPicker,
   correctPlanPickerVerification,
   correctPendingDone,
@@ -6358,5 +6412,6 @@ export {
   PAIRING_TTL_MS,
   IDLE_GRACE_MS,
   COMMAND_TTL_MS,
-  COMMAND_FUTURE_SKEW_MS
+  COMMAND_FUTURE_SKEW_MS,
+  CODEX_TUI_SESSION_START_SKEW_MS
 };

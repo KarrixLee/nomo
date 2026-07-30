@@ -97,7 +97,7 @@ import { appendFileSync, existsSync, readFileSync, statSync, truncateSync } from
 import { execFileSync, spawn } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "1.4.10";
+var PLUGIN_VERSION = "1.4.11";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -1517,9 +1517,19 @@ async function cwdViaLsof(pid) {
     return;
   }
 }
+async function processStartedAtViaPs(pid) {
+  try {
+    const { stdout } = await execFileP("ps", ["-p", String(pid), "-o", "lstart="]);
+    const value = Date.parse(stdout.trim());
+    return Number.isFinite(value) ? value : undefined;
+  } catch {
+    return;
+  }
+}
 async function codexDiscoverLive(known, deps = {}) {
   const ps = deps.ps ?? runPs;
   const cwdOf = deps.cwdOf ?? cwdViaLsof;
+  const startedAtOf = deps.startedAtOf ?? processStartedAtViaPs;
   const turnActive = deps.turnActive ?? codexPidTurnActive;
   let output;
   try {
@@ -1531,12 +1541,22 @@ async function codexDiscoverLive(known, deps = {}) {
   const tuis = filterCodexTuis(parseCodexProcs(output), knownPids);
   const out = [];
   for (const { pid } of tuis) {
-    const label = labelFromCwd(await cwdOf(pid));
+    const cwd = await cwdOf(pid);
+    const startedAt = await startedAtOf(pid);
+    const label = labelFromCwd(cwd);
     let active = false;
     try {
       active = await turnActive(pid);
     } catch {}
-    out.push({ pid, sessionId: codexSentinelSessionId(pid), title: label, label, idle: !active });
+    out.push({
+      pid,
+      sessionId: codexSentinelSessionId(pid),
+      title: label,
+      label,
+      idle: !active,
+      ...cwd ? { cwd } : {},
+      ...typeof startedAt === "number" && Number.isFinite(startedAt) ? { startedAt } : {}
+    });
   }
   return out;
 }

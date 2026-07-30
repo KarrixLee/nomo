@@ -10,6 +10,7 @@ import {
   buildDoneEnvelope, buildEndEnvelope, buildHeartbeatEnvelope, buildNeedsAttentionEnvelope, buildProvisionalBlob,
   buildProvisionalEnvelope, buildProvisionalRecord, buildStartEnvelope, buildTitleRepairEnvelope, classifySession,
   claudeTailPendingApproval, codexLastTurnEvent, codexTailPendingApproval, correctIdleClaude, correctInterrupt,
+  CODEX_TUI_SESSION_START_SKEW_MS, correlateCodexTuiPid,
   COMMAND_FUTURE_SKEW_MS, COMMAND_TTL_MS, commandIsFresh,
   correctPendingApproval, correctPendingDone, correctPlanPickerVerification, correctResolvedPlanPicker, createBridgeSupervisor, discoverLiveSessions, drainCommands, effectiveDoneAttempts, extractCommands, goneStrikeShouldTeardown,
   enforceWatchdogOwnership, hasInterruptMarker, IDLE_GRACE_MS, isClaudeIdleReapEligible, isRetireEligible, isRightfulWatchdogOwner, lastTurnLine, PAIRING_TTL_MS, pendingDoneRetryWrite,
@@ -598,6 +599,11 @@ describe("buildProvisionalRecord (flagged provisional, reap/reconcile-ready)", (
   });
   test("a title-less discovery omits the cached title (never stores title:'')", () => {
     expect(buildProvisionalRecord(disc({ title: undefined }), "Mac", "BLOB", { agent: "codex" }, 1)).not.toHaveProperty("title");
+  });
+  test("retains exact cwd + process birth only as local TUI-correlation evidence", () => {
+    expect(buildProvisionalRecord(
+      disc({ cwd: "/Users/me/project", startedAt: 1234 }), "Mac", "BLOB", { agent: "codex" }, 4242,
+    )).toMatchObject({ tuiCwd: "/Users/me/project", tuiStartedAt: 1234 });
   });
   test("claude-style omits the agent field (empty blobAgentFields)", () => {
     expect(buildProvisionalRecord(disc(), "Mac", "BLOB", {}, 1)).not.toHaveProperty("agent");
@@ -1447,6 +1453,30 @@ describe("correctResolvedPlanPicker (Mac answer clears only the marked Plan wait
     blob: "PENDING-PLAN", title: "Implement the plan", pairingId: "p", ts: 7_999_000, ...over,
   });
 
+  const daemonSession = (over: Partial<SessionRecord> = {}): SessionRecord => blockedPlan({
+    sessionStartedAt: 10_000,
+    origin: {
+      hook_event_name: "UserPromptSubmit", cwd: "/Users/me/project", ppid: 937,
+      ppid_command: "/Users/me/.codex/packages/standalone/current/codex app-server --listen unix://",
+    },
+    ...over,
+  });
+  const tui = (pid: number, over: Partial<SessionRecord> = {}): SessionRecord => rec({
+    pid, agent: "codex", provisional: true, tuiCwd: "/Users/me/project", tuiStartedAt: 10_005,
+    ...over,
+  });
+
+  test("correlation requires one live real-TTY provisional with exact cwd and close process/session births", () => {
+    const record = daemonSession();
+    expect(correlateCodexTuiPid(record, [tui(5150)], () => true)).toBe(5150);
+    expect(correlateCodexTuiPid(record, [tui(5150), tui(5151)], () => true)).toBeUndefined();
+    expect(correlateCodexTuiPid(record, [tui(5150, { tuiCwd: "/Users/me/other" })], () => true)).toBeUndefined();
+    expect(correlateCodexTuiPid(record, [tui(5150, { tuiStartedAt: 10_000 - CODEX_TUI_SESSION_START_SKEW_MS - 1 })], () => true)).toBeUndefined();
+    expect(correlateCodexTuiPid(record, [tui(5150, { tuiStartedAt: 12_001 })], () => true)).toBeUndefined();
+    expect(correlateCodexTuiPid(record, [tui(5150)], () => false)).toBeUndefined();
+    expect(correlateCodexTuiPid(daemonSession({ origin: { ...record.origin!, ppid_command: "/Applications/ChatGPT.app/codex app-server" } }), [tui(5150)], () => true)).toBeUndefined();
+  });
+
   test("task_started/user_message resolution → working update and clears provenance marker", async () => {
     const posts: Record<string, unknown>[] = [];
     const writes: SessionRecord[] = [];
@@ -1485,6 +1515,81 @@ describe("correctResolvedPlanPicker (Mac answer clears only the marked Plan wait
       ...seams, state: async () => "resolved",
     })).toBe("uncorrected");
     expect(posted).toBe(0);
+  });
+
+  test("unique correlation stamps the TUI pid, while a live TUI never resolves its pending picker", async () => {
+    const record = daemonSession();
+    let current = record;
+    const posts: object[] = [];
+    expect(await correctResolvedPlanPicker(cfg(), "/tmp/s.json", "s", record, {
+      tuiCandidates: async () => [tui(5150)],
+      pidAlive: () => true,
+      readRecord: async () => current,
+      writeRecord: async (_path, next) => { current = next; },
+      state: async () => "pending",
+      threadWaitState: async () => "notWaitingOnUserInput",
+      post: async (body) => { posts.push(body); return "delivered"; },
+      now: () => 8_000_000,
+    })).toBe("uncorrected");
+    expect(current.tuiPid).toBe(5150);
+    expect(current).toMatchObject({ pendingPlanPicker: true, lastEvent: "needsAttention", prio: 1 });
+    expect(posts).toHaveLength(0);
+  });
+
+  test("a stamped TUI exit resolves within one sweep and emits ev:exit plus a tui-exit trace", async () => {
+    let current = daemonSession({ tuiPid: 5150 });
+    const posts: Record<string, unknown>[] = [];
+    const traces: PlanPickerTraceDecision[] = [];
+    expect(await correctResolvedPlanPicker(cfg(), "/tmp/s.json", "s", current, {
+      pidAlive: () => false,
+      readRecord: async () => current,
+      writeRecord: async (_path, next) => { current = next; },
+      state: async () => { throw new Error("exit must precede rollout classification"); },
+      post: async (body) => { posts.push(body as Record<string, unknown>); return "delivered"; },
+      trace: (decision) => { traces.push(decision); },
+      now: () => 8_000_000,
+    })).toBe("corrected");
+    expect(posts).toHaveLength(1);
+    expect(posts[0]).toMatchObject({ op: "done", prio: 0 });
+    expect(await decryptBlob(KEY, posts[0].blob as string)).toMatchObject({
+      status: "done", agent: "codex", dbg: expect.stringContaining("ev:exit"),
+    });
+    expect(current).toMatchObject({ lastEvent: "done", op: "done", prio: 0, planPickerSettled: true });
+    expect(current.pendingPlanPicker).toBeUndefined();
+    expect(traces).toContainEqual(expect.objectContaining({
+      source: "watchdog", classifier: "tui-exit", marker: "settled", ttlFired: false,
+      settle: "done", correctionPosted: true, doneBy: "watchdog",
+    }));
+  });
+
+  test("ambiguous TUI correlation keeps attention and still falls back to the hard TTL", async () => {
+    let current = daemonSession({ planPickerPendingSince: 7_000_000 });
+    const candidates = [tui(5150), tui(5151)];
+    const posts: Record<string, unknown>[] = [];
+    expect(await correctResolvedPlanPicker(cfg(), "/tmp/s.json", "s", current, {
+      tuiCandidates: async () => candidates,
+      pidAlive: () => true,
+      readRecord: async () => current,
+      writeRecord: async (_path, next) => { current = next; },
+      state: async () => "pending",
+      threadWaitState: async () => "notWaitingOnUserInput",
+      post: async (body) => { posts.push(body as Record<string, unknown>); return "delivered"; },
+      now: () => 7_000_001,
+    })).toBe("uncorrected");
+    expect(current.tuiPid).toBeUndefined();
+    expect(posts).toHaveLength(0);
+
+    expect(await correctResolvedPlanPicker(cfg(), "/tmp/s.json", "s", current, {
+      tuiCandidates: async () => candidates,
+      pidAlive: () => true,
+      readRecord: async () => current,
+      writeRecord: async (_path, next) => { current = next; },
+      state: async () => { throw new Error("TTL must precede correlation/classification"); },
+      post: async (body) => { posts.push(body as Record<string, unknown>); return "delivered"; },
+      now: () => 7_000_000 + PLAN_PICKER_PENDING_MAX_MS,
+    })).toBe("corrected");
+    expect(posts).toHaveLength(1);
+    expect(posts[0]).toMatchObject({ op: "done", prio: 0 });
   });
 
   test("process exit follows the existing terminal reap path", async () => {
