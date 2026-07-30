@@ -5146,11 +5146,16 @@ async function postEvent(config, body) {
     return "failed";
   }
 }
+var COMMAND_KINDS_ALLOWED = new Set(["focus-terminal"]);
 var COMMANDS_PER_RESPONSE_MAX = 8;
 var COMMAND_BUFFER_MAX = 32;
 var EXECUTED_COMMAND_IDS_MAX = 64;
+var SEEN_NONCES_MAX = 512;
+var COMMAND_TTL_MS = 120000;
+var COMMAND_FUTURE_SKEW_MS = 30000;
 var commandBuffer = [];
 var executedCommandIds = new Set;
+var seenCommandNonces = new Set;
 function extractCommands(body) {
   try {
     if (typeof body !== "object" || body === null)
@@ -5165,23 +5170,35 @@ function extractCommands(body) {
       if (typeof entry !== "object" || entry === null)
         continue;
       const e = entry;
-      if (e.kind !== "focus-terminal")
-        continue;
       if (typeof e.id !== "string" || e.id.length === 0)
         continue;
-      if (typeof e.sessionId !== "string" || e.sessionId.length === 0)
+      if (typeof e.blob !== "string" || e.blob.length === 0)
         continue;
-      out.push({
-        id: e.id,
-        kind: "focus-terminal",
-        sessionId: e.sessionId,
-        ...typeof e.ts === "number" && Number.isFinite(e.ts) ? { ts: e.ts } : {}
-      });
+      out.push({ id: e.id, blob: e.blob });
     }
     return out;
   } catch {
     return [];
   }
+}
+function parseCommandPayload(plain) {
+  if (typeof plain !== "object" || plain === null)
+    return;
+  const p = plain;
+  if (typeof p.kind !== "string" || p.kind.length === 0)
+    return;
+  if (typeof p.sessionId !== "string" || p.sessionId.length === 0)
+    return;
+  if (typeof p.ts !== "number" || !Number.isFinite(p.ts))
+    return;
+  if (typeof p.nonce !== "string" || p.nonce.length === 0)
+    return;
+  return { kind: p.kind, sessionId: p.sessionId, ts: p.ts, nonce: p.nonce };
+}
+function commandIsFresh(ts, now) {
+  if (ts > now + COMMAND_FUTURE_SKEW_MS)
+    return false;
+  return now - ts <= COMMAND_TTL_MS;
 }
 function bufferCommands(commands) {
   for (const c of commands) {
@@ -5190,18 +5207,19 @@ function bufferCommands(commands) {
     commandBuffer.push(c);
   }
 }
-function rememberCommandId(id) {
-  executedCommandIds.add(id);
-  while (executedCommandIds.size > EXECUTED_COMMAND_IDS_MAX) {
-    const oldest = executedCommandIds.values().next();
+function rememberBounded(set, value, max) {
+  set.add(value);
+  while (set.size > max) {
+    const oldest = set.values().next();
     if (oldest.done)
       break;
-    executedCommandIds.delete(oldest.value);
+    set.delete(oldest.value);
   }
 }
 function resetCommandState() {
   commandBuffer.length = 0;
   executedCommandIds.clear();
+  seenCommandNonces.clear();
 }
 function traceFocus(deps, event) {
   if (deps.trace) {
@@ -5221,23 +5239,58 @@ async function drainCommands(config, deps = {}) {
       return 0;
     const readRecords = deps.readRecords ?? readAllRecordEntries;
     const focus = deps.focus ?? ((pid) => focusTerminalForPid(pid));
+    const now = (deps.now ?? Date.now)();
     let entries = null;
     let focused = 0;
+    const batchTargets = new Set;
     for (const cmd of pending) {
-      const base = { event: "focus-terminal", sessionId: cmd.sessionId, id: cmd.id };
+      const base = { event: "focus-terminal", id: cmd.id };
       try {
         if (executedCommandIds.has(cmd.id)) {
-          traceFocus(deps, { ...base, result: "duplicate" });
+          traceFocus(deps, { ...base, result: "duplicate", why: "id" });
           continue;
         }
-        rememberCommandId(cmd.id);
+        rememberBounded(executedCommandIds, cmd.id, EXECUTED_COMMAND_IDS_MAX);
+        let plain;
+        try {
+          plain = await decryptBlob(config.e2eKey, cmd.blob);
+        } catch {
+          traceFocus(deps, { ...base, result: "decrypt-failed" });
+          continue;
+        }
+        const payload = parseCommandPayload(plain);
+        if (!payload) {
+          traceFocus(deps, { ...base, result: "malformed" });
+          continue;
+        }
+        base.sessionId = payload.sessionId;
+        base.kind = payload.kind;
+        if (!COMMAND_KINDS_ALLOWED.has(payload.kind)) {
+          traceFocus(deps, { ...base, result: "bad-kind" });
+          continue;
+        }
+        if (!commandIsFresh(payload.ts, now)) {
+          traceFocus(deps, { ...base, result: "stale", age: now - payload.ts });
+          continue;
+        }
+        if (seenCommandNonces.has(payload.nonce)) {
+          traceFocus(deps, { ...base, result: "replay" });
+          continue;
+        }
+        rememberBounded(seenCommandNonces, payload.nonce, SEEN_NONCES_MAX);
         if (entries === null)
           entries = await readRecords();
-        const entry = entries.find((e) => e.sessionId === cmd.sessionId);
+        const entry = entries.find((e) => e.sessionId === payload.sessionId);
         if (!entry) {
-          traceFocus(deps, { ...base, result: "no-record" });
+          traceFocus(deps, { ...base, result: "unknown-session" });
           continue;
         }
+        const target = `${payload.kind}|${payload.sessionId}`;
+        if (batchTargets.has(target)) {
+          traceFocus(deps, { ...base, result: "duplicate", why: "batch" });
+          continue;
+        }
+        batchTargets.add(target);
         const agent = recordAgent(entry.rec);
         const adapter2 = deps.adapters ? deps.adapters.find((a) => a.kind === agent) ?? adapterFor(agent) : adapterFor(agent);
         if (!adapter2.locateTuiPid) {
@@ -5245,7 +5298,7 @@ async function drainCommands(config, deps = {}) {
           continue;
         }
         let reason;
-        const pid = await adapter2.locateTuiPid({ sessionId: cmd.sessionId, record: entry.rec }, { note: (r) => {
+        const pid = await adapter2.locateTuiPid({ sessionId: payload.sessionId, record: entry.rec }, { note: (r) => {
           reason = r;
         } });
         if (typeof pid !== "number" || !Number.isFinite(pid)) {
@@ -6260,6 +6313,7 @@ export {
   pendingPairingExpired,
   pendingDoneSettleWrite,
   pendingDoneRetryWrite,
+  parseCommandPayload,
   noteDoneAttempt,
   lastTurnLine,
   isWaitingSession,
@@ -6281,6 +6335,7 @@ export {
   correctPendingApproval,
   correctInterrupt,
   correctIdleClaude,
+  commandIsFresh,
   codexTailPendingApproval,
   codexLastTurnEvent,
   clearDoneAttempts,
@@ -6301,5 +6356,7 @@ export {
   PLAN_PICKER_RECENT_DONE_MS,
   PLAN_PICKER_PENDING_MAX_MS,
   PAIRING_TTL_MS,
-  IDLE_GRACE_MS
+  IDLE_GRACE_MS,
+  COMMAND_TTL_MS,
+  COMMAND_FUTURE_SKEW_MS
 };

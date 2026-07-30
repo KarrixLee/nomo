@@ -3,13 +3,14 @@ import { readFileSync } from "node:fs";
 import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { decryptBlob } from "../core/crypto";
+import { decryptBlob, encryptBlob } from "../core/crypto";
 import type { PlanPickerTraceDecision, SessionRecord } from "../core/shared";
 import { GONE_STRIKE_LIMIT, readGoneStrikes, recordGoneStrike, resetGoneStrikes, tracePlanPickerDecision } from "../core/shared";
 import {
   buildDoneEnvelope, buildEndEnvelope, buildHeartbeatEnvelope, buildNeedsAttentionEnvelope, buildProvisionalBlob,
   buildProvisionalEnvelope, buildProvisionalRecord, buildStartEnvelope, buildTitleRepairEnvelope, classifySession,
   claudeTailPendingApproval, codexLastTurnEvent, codexTailPendingApproval, correctIdleClaude, correctInterrupt,
+  COMMAND_FUTURE_SKEW_MS, COMMAND_TTL_MS, commandIsFresh,
   correctPendingApproval, correctPendingDone, correctPlanPickerVerification, correctResolvedPlanPicker, createBridgeSupervisor, discoverLiveSessions, drainCommands, effectiveDoneAttempts, extractCommands, goneStrikeShouldTeardown,
   enforceWatchdogOwnership, hasInterruptMarker, IDLE_GRACE_MS, isClaudeIdleReapEligible, isRetireEligible, isRightfulWatchdogOwner, lastTurnLine, PAIRING_TTL_MS, pendingDoneRetryWrite,
   pendingDoneSettleWrite, pendingPairingExpired, planPickerPendingExpired, PLAN_PICKER_PENDING_MAX_MS,
@@ -20,7 +21,7 @@ import {
   shouldInterruptCheck, shouldPendingApprovalCheck, shouldPendingDoneCheck, shouldPlanPickerVerificationCheck, shouldRepairTitle, tailShowsInterrupt, titleRepairedRecord,
   watchdogEventHeaders, WAITING_HEARTBEAT_AFTER_MS, withDeadline,
 } from "./cc-watchdog";
-import type { PostOutcome, RecordEntry } from "./cc-watchdog";
+import type { CommandPayload, DrainCommandsDeps, PostOutcome, RecordEntry } from "./cc-watchdog";
 import { claudeAdapter, codexAdapter } from "../core/adapter";
 import type { AgentAdapter, DiscoveredSession } from "../core/adapter";
 import type { Config, PendingConfig } from "../core/shared";
@@ -2429,19 +2430,24 @@ describe("provisionalsCoveredByReal is keyed on adapter.discoverLive, not a hard
   });
 });
 
-// --- phone → Mac commands (piggybacked on the /cc/event response) ------------------------------
+// --- phone → Mac commands (E2E-sealed, piggybacked on the /cc/event response) ------------------
 //
-// The worker consumes each command as it delivers it, so the plugin sees every command exactly once
-// and must never re-request one. extractCommands is the parse boundary (hostile input: it must never
-// throw and must ignore anything it doesn't fully understand); drainCommands is the execution
-// boundary (every seam injected — no filesystem, no `ps`, no osascript).
+// The worker relays an OPAQUE {id, blob} and can neither read nor forge the payload, so extractCommands
+// is a pure shape check and ALL the semantics — allow-list, freshness, replay, de-duplication — are
+// enforced in drainCommands after the GCM tag authenticates the blob. These tests seal with the repo's
+// own crypto helpers (never a mock) so they prove interop with the phone's envelope.
 
 describe("extractCommands (the /cc/event response's OPTIONAL commands key)", () => {
-  test("accepts a well-formed focus-terminal payload", () => {
-    expect(extractCommands({
-      ok: true,
-      commands: [{ id: "c1", kind: "focus-terminal", sessionId: "sess-a", ts: 1_753_900_000_000 }],
-    })).toEqual([{ id: "c1", kind: "focus-terminal", sessionId: "sess-a", ts: 1_753_900_000_000 }]);
+  test("accepts a well-formed sealed entry", () => {
+    expect(extractCommands({ ok: true, commands: [{ id: "c1", blob: "SEALED" }] }))
+      .toEqual([{ id: "c1", blob: "SEALED" }]);
+  });
+
+  test("the wire is OPAQUE — nothing semantic is read here, and clear fields are never trusted", () => {
+    // A worker that helpfully (or maliciously) adds clear fields gets them ignored entirely: only
+    // id + blob survive, so nothing downstream can key on unauthenticated data.
+    expect(extractCommands({ commands: [{ id: "c1", blob: "SEALED", kind: "focus-terminal", sessionId: "spoofed" }] }))
+      .toEqual([{ id: "c1", blob: "SEALED" }]);
   });
 
   test("the key is OMITTED when nothing is queued — the overwhelmingly common response", () => {
@@ -2453,40 +2459,45 @@ describe("extractCommands (the /cc/event response's OPTIONAL commands key)", () 
     expect(extractCommands(null)).toEqual([]);
   });
 
-  test("unknown kinds are ignored (forward compatibility, not a crash)", () => {
-    expect(extractCommands({
-      commands: [
-        { id: "c1", kind: "reboot-the-mac", sessionId: "sess-a" },
-        { id: "c2", kind: "focus-terminal", sessionId: "sess-a" },
-      ],
-    })).toEqual([{ id: "c2", kind: "focus-terminal", sessionId: "sess-a" }]);
-  });
-
   test("malformed entries are dropped individually, never fatally", () => {
     expect(extractCommands({
       commands: [
         null,
-        "focus-terminal",
-        { kind: "focus-terminal", sessionId: "sess-a" },                 // no id
-        { id: "", kind: "focus-terminal", sessionId: "sess-a" },          // empty id
-        { id: 7, kind: "focus-terminal", sessionId: "sess-a" },           // non-string id
-        { id: "c1", kind: "focus-terminal" },                             // no sessionId
-        { id: "c2", kind: "focus-terminal", sessionId: "" },              // empty sessionId
-        { id: "c3", kind: "focus-terminal", sessionId: 5 },               // non-string sessionId
-        { id: "c4", kind: "focus-terminal", sessionId: "sess-b", ts: "x" }, // junk ts is dropped, entry kept
+        "c1",
+        { blob: "SEALED" },              // no id
+        { id: "", blob: "SEALED" },      // empty id
+        { id: 7, blob: "SEALED" },       // non-string id
+        { id: "c1" },                    // no blob
+        { id: "c2", blob: "" },          // empty blob
+        { id: "c3", blob: 9 },           // non-string blob
+        { id: "c4", blob: "SEALED" },    // the only good one
       ],
-    })).toEqual([{ id: "c4", kind: "focus-terminal", sessionId: "sess-b" }]);
+    })).toEqual([{ id: "c4", blob: "SEALED" }]);
   });
 
   test("caps at 8 per response (a buggy/compromised worker can't hand us an unbounded work list)", () => {
-    const commands = Array.from({ length: 25 }, (_, i) => ({ id: `c${i}`, kind: "focus-terminal", sessionId: "s" }));
+    const commands = Array.from({ length: 25 }, (_, i) => ({ id: `c${i}`, blob: "SEALED" }));
     expect(extractCommands({ commands })).toHaveLength(8);
     expect(extractCommands({ commands })[7].id).toBe("c7");
   });
 });
 
-describe("drainCommands (execute what the worker queued, once)", () => {
+describe("drainCommands (authenticate, validate, then execute)", () => {
   beforeEach(() => { resetCommandState(); });
+
+  const NOW = 1_800_000_000_000;
+  const OTHER_KEY = new Uint8Array(32).fill(7); // a key this pairing does NOT hold
+  let nonceSeq = 0;
+
+  /** A sealed command exactly as the phone would produce it. */
+  const sealed = async (
+    over: Partial<CommandPayload> = {}, opts: { id?: string; key?: Uint8Array } = {},
+  ): Promise<{ id: string; blob: string }> => ({
+    id: opts.id ?? `cmd-${++nonceSeq}`,
+    blob: await encryptBlob(opts.key ?? KEY, {
+      kind: "focus-terminal", sessionId: "sess-a", ts: NOW, nonce: `n-${++nonceSeq}`, ...over,
+    }),
+  });
 
   const entry = (sessionId: string, r: Partial<SessionRecord> = {}): RecordEntry => ({ sessionId, rec: rec(r) });
   /** An adapter registry whose locator is scripted, so no real `ps` is ever spawned. */
@@ -2495,108 +2506,225 @@ describe("drainCommands (execute what the worker queued, once)", () => {
     { ...codexAdapter, locateTuiPid: locate as AgentAdapter["locateTuiPid"] },
   ];
 
-  test("focuses the located TUI for each command and reports how many landed", async () => {
+  /** The standard harness: one tracked claude session + one tracked codex session, a scripted locate
+   *  that returns the record's pid, and a focus that records what it raised. */
+  const harness = (over: Partial<DrainCommandsDeps> = {}) => {
     const focused: number[] = [];
     const traces: Record<string, unknown>[] = [];
-    const count = await drainCommands(cfg(), {
-      take: () => [
-        { id: "c1", kind: "focus-terminal", sessionId: "sess-a" },
-        { id: "c2", kind: "focus-terminal", sessionId: "sess-b" },
-      ],
+    const deps: DrainCommandsDeps = {
       readRecords: async () => [entry("sess-a", { pid: 11 }), entry("sess-b", { pid: 22, agent: "codex" })],
       adapters: registry(async ({ record }) => record.pid),
       focus: async (pid) => { focused.push(pid); return { ok: true, via: "terminal-app" }; },
+      now: () => NOW,
       trace: (e) => traces.push(e as Record<string, unknown>),
+      ...over,
+    };
+    return { focused, traces, deps };
+  };
+
+  test("HAPPY PATH: a blob sealed under the pairing key decrypts, validates and focuses", async () => {
+    const { focused, traces, deps } = harness();
+    const cmd = await sealed({ sessionId: "sess-b" });
+    expect(await drainCommands(cfg(), { ...deps, take: () => [cmd] })).toBe(1);
+    expect(focused).toEqual([22]);
+    expect(traces[0]).toMatchObject({
+      event: "focus-terminal", id: cmd.id, sessionId: "sess-b", kind: "focus-terminal",
+      agent: "codex", pid: 22, result: "focused", via: "terminal-app",
     });
-    expect(count).toBe(2);
-    expect(focused).toEqual([11, 22]);
-    expect(traces.map((t) => t.result)).toEqual(["focused", "focused"]);
-    expect(traces[1]).toMatchObject({ event: "focus-terminal", sessionId: "sess-b", id: "c2", agent: "codex", pid: 22, via: "terminal-app" });
   });
 
-  test("an unknown sessionId is a traced no-op", async () => {
-    const traces: Record<string, unknown>[] = [];
-    let focusCalls = 0;
-    const count = await drainCommands(cfg(), {
-      take: () => [{ id: "c1", kind: "focus-terminal", sessionId: "ghost" }],
-      readRecords: async () => [entry("sess-a")],
-      focus: async () => { focusCalls++; return { ok: true, via: "app-activate" }; },
-      trace: (e) => traces.push(e as Record<string, unknown>),
+  test("a blob sealed under the WRONG key is refused — this is the whole point of sealing", async () => {
+    const { focused, traces, deps } = harness();
+    const cmd = await sealed({}, { key: OTHER_KEY });
+    expect(await drainCommands(cfg(), { ...deps, take: () => [cmd] })).toBe(0);
+    expect(focused).toEqual([]);
+    expect(traces.map((t) => t.result)).toEqual(["decrypt-failed"]);
+    expect(traces[0].sessionId).toBeUndefined(); // nothing is even READ out of an unauthenticated blob
+  });
+
+  test("a TAMPERED ciphertext is refused (GCM's tag catches the edit)", async () => {
+    const { focused, traces, deps } = harness();
+    const good = await sealed();
+    const flipped = good.blob.slice(0, 20) + (good.blob[20] === "A" ? "B" : "A") + good.blob.slice(21);
+    expect(await drainCommands(cfg(), { ...deps, take: () => [{ id: good.id, blob: flipped }] })).toBe(0);
+    expect(focused).toEqual([]);
+    expect(traces.map((t) => t.result)).toEqual(["decrypt-failed"]);
+  });
+
+  test("an authentic blob that isn't a command shape is malformed, not executed", async () => {
+    const { focused, traces, deps } = harness();
+    const noNonce = { id: "c-nn", blob: await encryptBlob(KEY, { kind: "focus-terminal", sessionId: "sess-a", ts: NOW }) };
+    const noSession = { id: "c-ns", blob: await encryptBlob(KEY, { kind: "focus-terminal", ts: NOW, nonce: "n" }) };
+    expect(await drainCommands(cfg(), { ...deps, take: () => [noNonce, noSession] })).toBe(0);
+    expect(focused).toEqual([]);
+    expect(traces.map((t) => t.result)).toEqual(["malformed", "malformed"]);
+  });
+
+  test("a kind outside the plugin's allow-list is refused (the blind relay can't filter it for us)", async () => {
+    const { focused, traces, deps } = harness();
+    const cmd = await sealed({ kind: "run-shell-command" });
+    expect(await drainCommands(cfg(), { ...deps, take: () => [cmd] })).toBe(0);
+    expect(focused).toEqual([]);
+    expect(traces[0]).toMatchObject({ result: "bad-kind", kind: "run-shell-command" });
+  });
+
+  test("a sessionId this machine doesn't track is refused", async () => {
+    const { focused, traces, deps } = harness();
+    const cmd = await sealed({ sessionId: "ghost" });
+    expect(await drainCommands(cfg(), { ...deps, take: () => [cmd] })).toBe(0);
+    expect(focused).toEqual([]);
+    expect(traces[0]).toMatchObject({ result: "unknown-session", sessionId: "ghost" });
+  });
+
+  test("FRESHNESS: a tap older than the queue TTL is stale intent and is refused", async () => {
+    const { focused, traces, deps } = harness();
+    const stale = await sealed({ ts: NOW - COMMAND_TTL_MS - 1 });
+    const edge = await sealed({ ts: NOW - COMMAND_TTL_MS }); // exactly at the TTL still counts
+    expect(await drainCommands(cfg(), { ...deps, take: () => [stale, edge] })).toBe(1);
+    expect(focused).toEqual([11]);
+    expect(traces.map((t) => t.result)).toEqual(["stale", "focused"]);
+  });
+
+  test("FRESHNESS: clock skew is tolerated up to the margin, and refused beyond it", async () => {
+    const { focused, traces, deps } = harness();
+    const skewed = await sealed({ ts: NOW + COMMAND_FUTURE_SKEW_MS });      // within the margin
+    const absurd = await sealed({ ts: NOW + COMMAND_FUTURE_SKEW_MS + 1 });  // beyond it
+    expect(await drainCommands(cfg(), { ...deps, take: () => [skewed, absurd] })).toBe(1);
+    expect(focused).toEqual([11]);
+    expect(traces.map((t) => t.result)).toEqual(["focused", "stale"]);
+  });
+
+  // CROSS-SURFACE UNIT GUARD. The two freshness tests above derive their boundaries from
+  // COMMAND_TTL_MS / COMMAND_FUTURE_SKEW_MS, so they would still pass if the SCALE were wrong on both
+  // sides. The scale is a real cross-surface risk: iOS seals `ts` in epoch MILLISECONDS (the
+  // CCCommand seal site), while the sibling CCDecisionAnswer.ts carries its timestamp in SECONDS — so
+  // an editor "fixing" that inconsistency in either direction would silently make this daemon reject
+  // every command (or, in the other direction, accept arbitrarily old ones). These literals fail loudly
+  // the moment either half of the contract changes units.
+  test("UNITS: `ts` is epoch MILLISECONDS — the same instant in seconds reads as ~56 years stale", async () => {
+    const MS = 1_800_000_000_000;      // 2027-01-15T08:00:00Z, in milliseconds
+    const SECONDS = MS / 1000;          // 1_800_000_000 — the SAME instant, in seconds
+    const nowMs = MS + 3_000;           // three seconds after the tap
+
+    const { focused, traces, deps } = harness({ now: () => nowMs });
+    const inMs = await sealed({ ts: MS });
+    const inSeconds = await sealed({ ts: SECONDS });
+    expect(await drainCommands(cfg(), { ...deps, take: () => [inMs, inSeconds] })).toBe(1);
+    expect(focused).toEqual([11]);
+    expect(traces.map((t) => t.result)).toEqual(["focused", "stale"]);
+
+    // …and the pure gate, with no constant in sight on either side of the comparison.
+    expect(commandIsFresh(MS, nowMs)).toBe(true);
+    expect(commandIsFresh(SECONDS, nowMs)).toBe(false);
+    expect(nowMs - SECONDS).toBeGreaterThan(50 * 365 * 24 * 60 * 60 * 1000); // >50 years, unmistakable
+  });
+
+  test("REPLAY: the same sealed blob re-delivered under a FRESH id is refused by the nonce", async () => {
+    const { focused, traces, deps } = harness();
+    const cmd = await sealed();
+    expect(await drainCommands(cfg(), { ...deps, take: () => [cmd] })).toBe(1);
+    // A compromised worker re-queues the identical blob under a brand-new id: the id set can't help,
+    // the nonce set does.
+    expect(await drainCommands(cfg(), { ...deps, take: () => [{ id: "fresh-id", blob: cmd.blob }] })).toBe(0);
+    expect(focused).toEqual([11]);
+    expect(traces.map((t) => t.result)).toEqual(["focused", "replay"]);
+  });
+
+  test("a repeated command id never re-focuses (a duplicate delivery of the same envelope)", async () => {
+    const { focused, traces, deps } = harness();
+    const cmd = await sealed();
+    expect(await drainCommands(cfg(), { ...deps, take: () => [cmd] })).toBe(1);
+    expect(await drainCommands(cfg(), { ...deps, take: () => [cmd] })).toBe(0);
+    expect(focused).toEqual([11]);
+    expect(traces.map((t) => t.result)).toEqual(["focused", "duplicate"]);
+    expect(traces[1]).toMatchObject({ why: "id" });
+  });
+
+  test("BATCH COLLAPSE: two taps for the same target in one drain raise the window ONCE", async () => {
+    const { focused, traces, deps } = harness();
+    const first = await sealed({ sessionId: "sess-a" });
+    const second = await sealed({ sessionId: "sess-a" }); // distinct id AND nonce — only the target matches
+    const other = await sealed({ sessionId: "sess-b" });
+    expect(await drainCommands(cfg(), { ...deps, take: () => [first, second, other] })).toBe(2);
+    expect(focused).toEqual([11, 22]);
+    expect(traces.map((t) => t.result)).toEqual(["focused", "duplicate", "focused"]);
+    expect(traces[1]).toMatchObject({ why: "batch", sessionId: "sess-a" });
+  });
+
+  // The phone seals CCSessionBrief.sessionId verbatim, which for a discovered Codex row is the
+  // "codex-pid-<n>" sentinel. Both halves of that contract are pinned here (see the comment on the
+  // unknown-session check): (a) the provisional record really is stored under the sentinel, so such a
+  // command resolves; (b) a provisional can never reach the state the phone offers the button for.
+  test("SESSION-ID FORM: a codex-pid-<n> sentinel resolves, and a provisional is never attention-state", async () => {
+    // (a) discovery persists the provisional under the sentinel id itself.
+    const written: string[] = [];
+    await discoverLiveSessions(cfg(), {
+      adapters: [{ ...codexAdapter, discoverLive: async () => [disc({ pid: 16029, sessionId: "codex-pid-16029" })] }],
+      post: async () => "delivered" as PostOutcome,
+      readRecords: async () => [],
+      writeRecord: async (sessionId) => { written.push(sessionId); },
     });
-    expect(count).toBe(0);
-    expect(focusCalls).toBe(0);
-    expect(traces).toEqual([{ event: "focus-terminal", sessionId: "ghost", id: "c1", result: "no-record" }]);
+    expect(written).toEqual(["codex-pid-16029"]); // the very id the phone would seal
+
+    const provisional = buildProvisionalRecord(disc({ pid: 16029 }), "mac", "B", { agent: "codex" }, 1_000);
+    const { focused, traces, deps } = harness({
+      readRecords: async () => [{ sessionId: "codex-pid-16029", rec: provisional }],
+    });
+    const cmd = await sealed({ sessionId: "codex-pid-16029" });
+    expect(await drainCommands(cfg(), { ...deps, take: () => [cmd] })).toBe(1);
+    expect(focused).toEqual([16029]);
+    expect(traces[0]).toMatchObject({ result: "focused", sessionId: "codex-pid-16029" });
+
+    // (b) …and it could never have been offered: a provisional is start/done, never needsAttention,
+    // and the one net that could raise attention refuses it for lack of a transcript.
+    for (const idle of [false, true]) {
+      const row = buildProvisionalRecord(disc(), "mac", "B", { agent: "codex" }, 1_000, "p", idle);
+      expect(row.lastEvent).toBe(idle ? "done" : "sessionStart");
+      expect(isWaitingSession(row)).toBe(false);
+      expect(shouldPendingApprovalCheck(row, codexAdapter)).toBe(false);
+      expect(shouldPlanPickerVerificationCheck(row, 1_000)).toBe(false);
+    }
   });
 
   test("a locate that can't decide (ambiguous / no candidate) focuses NOTHING and says which", async () => {
-    const traces: Record<string, unknown>[] = [];
-    const count = await drainCommands(cfg(), {
-      take: () => [
-        { id: "c1", kind: "focus-terminal", sessionId: "sess-a" },
-        { id: "c2", kind: "focus-terminal", sessionId: "sess-b" },
-      ],
-      readRecords: async () => [entry("sess-a"), entry("sess-b")],
+    const { traces, deps } = harness({
       adapters: registry(async ({ sessionId }, d) => {
         d?.note?.(sessionId === "sess-a" ? "ambiguous" : "no-candidate");
         return undefined;
       }),
       focus: async () => { throw new Error("must never be called"); },
-      trace: (e) => traces.push(e as Record<string, unknown>),
     });
-    expect(count).toBe(0);
+    const a = await sealed({ sessionId: "sess-a" });
+    const b = await sealed({ sessionId: "sess-b" });
+    expect(await drainCommands(cfg(), { ...deps, take: () => [a, b] })).toBe(0);
     expect(traces.map((t) => t.result)).toEqual(["ambiguous", "no-candidate"]);
   });
 
   test("an agent with no locate seam is unsupported, not an error", async () => {
-    const traces: Record<string, unknown>[] = [];
     const noLocate: AgentAdapter = { ...claudeAdapter };
     delete noLocate.locateTuiPid;
-    const count = await drainCommands(cfg(), {
-      take: () => [{ id: "c1", kind: "focus-terminal", sessionId: "sess-a" }],
-      readRecords: async () => [entry("sess-a")],
-      adapters: [noLocate, codexAdapter],
-      trace: (e) => traces.push(e as Record<string, unknown>),
-    });
-    expect(count).toBe(0);
+    const { traces, deps } = harness({ adapters: [noLocate, codexAdapter] });
+    const cmd = await sealed({ sessionId: "sess-a" });
+    expect(await drainCommands(cfg(), { ...deps, take: () => [cmd] })).toBe(0);
     expect(traces[0]).toMatchObject({ result: "unsupported", agent: "claude" });
   });
 
-  test("a repeated command id never re-focuses (a worker replay can't yank the window twice)", async () => {
-    const focused: number[] = [];
+  test("a rejected or THROWING focus never throws out of the drain", async () => {
     const traces: Record<string, unknown>[] = [];
-    const deps = {
-      readRecords: async () => [entry("sess-a", { pid: 11 })],
-      adapters: registry(async ({ record }) => record.pid),
-      focus: async (pid: number) => { focused.push(pid); return { ok: true as const, via: "iterm2" as const }; },
-      trace: (e: object) => traces.push(e as Record<string, unknown>),
-    };
-    const cmd = { id: "same-id", kind: "focus-terminal" as const, sessionId: "sess-a" };
-    expect(await drainCommands(cfg(), { ...deps, take: () => [cmd] })).toBe(1);
-    expect(await drainCommands(cfg(), { ...deps, take: () => [cmd] })).toBe(0);
-    expect(focused).toEqual([11]);
-    expect(traces.map((t) => t.result)).toEqual(["focused", "duplicate"]);
-  });
-
-  test("a rejected focus (TCC denial, dead window server) never throws out of the drain", async () => {
-    const traces: Record<string, unknown>[] = [];
-    const count = await drainCommands(cfg(), {
-      take: () => [
-        { id: "c1", kind: "focus-terminal", sessionId: "sess-a" },
-        { id: "c2", kind: "focus-terminal", sessionId: "sess-a" },
-      ],
-      readRecords: async () => [entry("sess-a", { pid: 11 })],
-      adapters: registry(async ({ record }) => record.pid),
-      focus: async (pid) => {
-        if (pid === 11 && traces.length === 0) throw new Error("osascript exploded");
+    const { deps } = harness({
+      trace: (e) => traces.push(e as Record<string, unknown>),
+      focus: async () => {
+        if (traces.length === 0) throw new Error("osascript exploded");
         return { ok: false, reason: "osascript-failed" };
       },
-      trace: (e) => traces.push(e as Record<string, unknown>),
     });
-    expect(count).toBe(0);
+    const a = await sealed({ sessionId: "sess-a" });
+    const b = await sealed({ sessionId: "sess-b" });
+    expect(await drainCommands(cfg(), { ...deps, take: () => [a, b] })).toBe(0);
     expect(traces.map((t) => t.result)).toEqual(["no-candidate", "osascript-failed"]);
   });
 
-  test("an empty buffer costs nothing — no record read at all", async () => {
+  test("an empty buffer costs nothing — no record read, no decryption", async () => {
     let reads = 0;
     expect(await drainCommands(cfg(), {
       take: () => [],

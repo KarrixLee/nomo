@@ -32,7 +32,7 @@ import { readdir, readFile, unlink } from "node:fs/promises";
 import { readFileSync, statSync, unlinkSync } from "node:fs";
 import { hostname } from "node:os";
 import { basename } from "node:path";
-import { encryptBlob } from "../core/crypto";
+import { decryptBlob, encryptBlob } from "../core/crypto";
 import { adapterFor, AgentAdapter, allAdapters, codexAdapter, CodexPlanPickerEvidence, DiscoveredSession } from "../core/adapter";
 import type { LocateTuiReason } from "../core/adapter";
 import { focusTerminalForPid } from "../core/terminal-focus";
@@ -832,60 +832,101 @@ async function postEvent(config: Config, body: object): Promise<PostOutcome> {
 // The phone can ask this computer to DO something — today only "focus the terminal this session is
 // running in". There is no inbound channel to a laptop behind NAT, and adding a poll would cost a
 // request every few seconds forever, so commands ride back on the response to the POSTs the watchdog
-// already makes:
+// already makes — and ONLY to those, gated on the x-cc-role header (see watchdogEventHeaders):
 //
-//   {"ok":true, …, "commands":[{"id":"…","kind":"focus-terminal","sessionId":"…","ts":1753900000000}]}
+//   {"ok":true, …, "commands":[{"id":"<opaque>","blob":"<sealed>"}]}
 //
 // The key is OMITTED when nothing is queued, and the worker CONSUMES each command as it delivers it,
-// so every command is seen exactly once and there is nothing to re-request. postEvent buffers what it
-// parses (its PostOutcome signature is depended on by a dozen injected `post:` deps and stays exactly
-// as it was); the sweep loop drains the buffer once per tick, so a slow osascript can never sit on
-// the POST path.
+// so every command is seen exactly once and there is nothing to re-request.
+//
+// E2E-SEALED, same invariant as every other phone→Mac payload (decision answers are an opaque
+// answerBlob the hold decrypts with config.e2eKey; see permission.ts). The worker relays an OPAQUE id
+// and blob: no kind, no sessionId, no timestamp in the clear. `blob` is the SAME envelope as every
+// other blob in this codebase — standard padded base64 of AES-256-GCM iv(12) + ct + tag(16), sealed
+// by the phone under the pairing e2eKey — so decryptBlob is exactly the right reader and GCM's tag
+// check is what makes a forged or tampered command unexecutable. Sealed plaintext:
+//
+//   {"kind":"focus-terminal","sessionId":"<id>","ts":<epoch ms>,"nonce":"<random>"}
+//
+// Because the relay is BLIND, three responsibilities that would normally sit server-side moved here:
+// the kind allow-list, freshness, and de-duplication (both replay across batches and collapsing two
+// rapid taps within one batch). postEvent buffers what it parses (its PostOutcome signature is
+// depended on by a dozen injected `post:` deps and stays exactly as it was); the sweep loop drains
+// the buffer once per tick, so neither decryption nor a slow osascript ever sits on the POST path.
 
-/** A queued phone→Mac command. Only one kind exists today; unknown kinds are dropped at parse time. */
-export interface FocusCommand {
+/** One command exactly as it arrives on the wire: an opaque id plus the sealed payload. Nothing here
+ *  is trustworthy until the blob decrypts. */
+export interface SealedCommand {
   id: string;
-  kind: "focus-terminal";
-  sessionId: string;
-  /** Epoch-ms the worker queued it (diagnostics only — nothing gates on it). */
-  ts?: number;
+  blob: string;
 }
+
+/** The authenticated command, after decryption. Every field is phone-authored and tag-protected. */
+export interface CommandPayload {
+  kind: string;
+  sessionId: string;
+  /** Epoch-ms the PHONE sealed it — authenticated, unlike any server-supplied time. */
+  ts: number;
+  /** Per-command random string; the replay bound (a compromised worker can re-deliver an old blob
+   *  under a fresh id, so the id set alone cannot stop replay). */
+  nonce: string;
+}
+
+/** The kinds this plugin will act on. The allow-list lives HERE, not on the worker, because the
+ *  plugin is now the ONLY party that can read the blob — a blind relay cannot filter what it can't
+ *  see. Anything else decrypts fine and is then rejected as bad-kind. */
+const COMMAND_KINDS_ALLOWED = new Set(["focus-terminal"]);
 
 /** Cap on commands accepted from ONE response. A compromised/buggy worker must not be able to hand
  *  this daemon an unbounded work list; 8 is far above the real ceiling (a user taps one row). */
 const COMMANDS_PER_RESPONSE_MAX = 8;
 /** Cap on the pending buffer, in case several POSTs in one tick each carry commands. */
 const COMMAND_BUFFER_MAX = 32;
-/** How many executed command ids to remember, so a worker replay/duplicate delivery can't re-focus a
- *  window under the user's hands. Bounded: this is a long-lived process. */
+/** How many executed command ids to remember, so a duplicate DELIVERY can't re-focus a window under
+ *  the user's hands. Bounded: this is a long-lived process. */
 const EXECUTED_COMMAND_IDS_MAX = 64;
+/** How many seen nonces to remember. The nonce is the real replay bound (ids are worker-chosen and
+ *  therefore forgeable), and it only works if a nonce cannot be EVICTED while its blob is still fresh
+ *  enough to re-execute — otherwise a flood of junk commands would push the real one out and reopen
+ *  the replay window. So this is sized against the maximum intake inside one TTL: at most
+ *  COMMANDS_PER_RESPONSE_MAX (8) per POST and at most a POST every POLL_MS (5 s) plus the sweep's own
+ *  correctives, i.e. well under 250 commands per 120 s. 512 leaves a 2x margin over that ceiling. */
+const SEEN_NONCES_MAX = 512;
+/** How old a SEALED ts may be before the command is refused — the worker's queue TTL. A command the
+ *  user tapped two minutes ago is stale intent: they have moved on, and executing it would yank a
+ *  window unexpectedly. This is also what bounds replay together with the nonce set. */
+export const COMMAND_TTL_MS = 120_000;
+/** How far into the future a SEALED ts may sit before it is refused. Phone, worker and Mac clocks
+ *  drift independently (NTP skew, a laptop waking from sleep with a stale clock), and 30 s is
+ *  comfortably above real-world skew while staying well inside the 120 s TTL — so the accept window
+ *  is never wider than the TTL it is meant to enforce. */
+export const COMMAND_FUTURE_SKEW_MS = 30_000;
 
-/** Commands buffered out of POST responses, awaiting the next drain. */
-const commandBuffer: FocusCommand[] = [];
-/** Ids already executed by THIS daemon (insertion-ordered, evicted oldest-first). */
+/** Commands buffered out of POST responses, awaiting the next drain (still sealed). */
+const commandBuffer: SealedCommand[] = [];
+/** Command ids already handled by THIS daemon (insertion-ordered, evicted oldest-first). */
 const executedCommandIds = new Set<string>();
+/** Sealed nonces already seen by THIS daemon — the cross-batch replay bound. */
+const seenCommandNonces = new Set<string>();
 
-/** Parse the OPTIONAL `commands` key of a /cc/event response body. Accepts only well-formed
- *  focus-terminal entries (string id, non-empty string sessionId), ignores unknown kinds, tolerates a
- *  missing / non-array key, caps the result, and NEVER throws — a malformed body must degrade to
- *  "no commands", exactly like an unparseable one. Pure. */
-export function extractCommands(body: unknown): FocusCommand[] {
+/** Parse the OPTIONAL `commands` key of a /cc/event response body. The wire entries are now OPAQUE,
+ *  so this is a pure shape check: a non-empty string `id` and a non-empty string `blob`. Everything
+ *  semantic (kind, session, freshness) is unknowable until the blob is decrypted and is validated in
+ *  drainCommands. Tolerates a missing / non-array key, caps the result, and NEVER throws — a
+ *  malformed body must degrade to "no commands", exactly like an unparseable one. Pure. */
+export function extractCommands(body: unknown): SealedCommand[] {
   try {
     if (typeof body !== "object" || body === null) return [];
     const raw = (body as Record<string, unknown>).commands;
     if (!Array.isArray(raw)) return []; // absent (the normal case) or the wrong shape
-    const out: FocusCommand[] = [];
+    const out: SealedCommand[] = [];
     for (const entry of raw) {
       if (out.length >= COMMANDS_PER_RESPONSE_MAX) break;
       if (typeof entry !== "object" || entry === null) continue;
       const e = entry as Record<string, unknown>;
-      if (e.kind !== "focus-terminal") continue; // forward-compat: a future kind is simply ignored
       if (typeof e.id !== "string" || e.id.length === 0) continue;
-      if (typeof e.sessionId !== "string" || e.sessionId.length === 0) continue;
-      out.push({
-        id: e.id, kind: "focus-terminal", sessionId: e.sessionId,
-        ...(typeof e.ts === "number" && Number.isFinite(e.ts) ? { ts: e.ts } : {}),
-      });
+      if (typeof e.blob !== "string" || e.blob.length === 0) continue;
+      out.push({ id: e.id, blob: e.blob });
     }
     return out;
   } catch {
@@ -893,21 +934,41 @@ export function extractCommands(body: unknown): FocusCommand[] {
   }
 }
 
+/** Shape-check a DECRYPTED command payload. Only a phone bug can produce a malformed one (the worker
+ *  cannot forge a valid tag), so this is a distinct outcome from a decrypt failure. Pure. */
+export function parseCommandPayload(plain: unknown): CommandPayload | undefined {
+  if (typeof plain !== "object" || plain === null) return undefined;
+  const p = plain as Record<string, unknown>;
+  if (typeof p.kind !== "string" || p.kind.length === 0) return undefined;
+  if (typeof p.sessionId !== "string" || p.sessionId.length === 0) return undefined;
+  if (typeof p.ts !== "number" || !Number.isFinite(p.ts)) return undefined;
+  if (typeof p.nonce !== "string" || p.nonce.length === 0) return undefined;
+  return { kind: p.kind, sessionId: p.sessionId, ts: p.ts, nonce: p.nonce };
+}
+
+/** Is this authenticated command still live? False when the tap is older than the queue TTL (stale
+ *  intent — the user has moved on) or sits implausibly far in the future (clock skew beyond the
+ *  margin). Keyed on the SEALED ts only; a server-supplied time is not authenticated. Pure. */
+export function commandIsFresh(ts: number, now: number): boolean {
+  if (ts > now + COMMAND_FUTURE_SKEW_MS) return false;
+  return now - ts <= COMMAND_TTL_MS;
+}
+
 /** Queue parsed commands for the next drain (bounded). Best-effort, never throws. */
-function bufferCommands(commands: FocusCommand[]): void {
+function bufferCommands(commands: SealedCommand[]): void {
   for (const c of commands) {
     if (commandBuffer.length >= COMMAND_BUFFER_MAX) return;
     commandBuffer.push(c);
   }
 }
 
-/** Remember an executed id, evicting the oldest once the bound is reached. */
-function rememberCommandId(id: string): void {
-  executedCommandIds.add(id);
-  while (executedCommandIds.size > EXECUTED_COMMAND_IDS_MAX) {
-    const oldest = executedCommandIds.values().next();
+/** Add to a bounded insertion-ordered set, evicting the oldest once full. */
+function rememberBounded(set: Set<string>, value: string, max: number): void {
+  set.add(value);
+  while (set.size > max) {
+    const oldest = set.values().next();
     if (oldest.done) break;
-    executedCommandIds.delete(oldest.value);
+    set.delete(oldest.value);
   }
 }
 
@@ -915,18 +976,26 @@ function rememberCommandId(id: string): void {
 export function resetCommandState(): void {
   commandBuffer.length = 0;
   executedCommandIds.clear();
+  seenCommandNonces.clear();
 }
 
-/** What a focus attempt ended up doing — the ONLY debugging channel a user has for this feature, so
- *  every command produces exactly one line whatever happens. */
+/** What a command ended up doing — the ONLY debugging channel a user has for this feature, so every
+ *  command produces exactly one line whatever happens. The first six are REJECTIONS that happen
+ *  before anything is executed (see drainCommands' validation order); the rest describe the focus
+ *  attempt itself. */
 export type FocusTraceResult =
+  | "decrypt-failed"    // the blob did not decrypt/authenticate under this pairing's key
+  | "malformed"         // it decrypted, but the sealed JSON isn't a command (a phone bug)
+  | "bad-kind"          // authentic, but not a kind this plugin acts on
+  | "stale"             // the sealed tap is older than the queue TTL, or implausibly future-dated
+  | "replay"            // this sealed nonce has already been seen by this daemon
+  | "duplicate"         // repeated command id, or a second tap for the same target in one batch
+  | "unknown-session"   // the sealed sessionId names no session on this machine
   | "focused"           // a window (or at least the owning app) came forward
-  | "no-record"         // the sessionId names no session on this machine
   | "no-candidate"      // no live TUI process could be identified for it
   | "ambiguous"         // several equally-plausible TUIs — deliberately no guess
   | "osascript-failed"  // AppleScript refused (TCC denial / timeout / app error)
-  | "unsupported"       // not macOS, unknown terminal app, or an agent with no locate seam
-  | "duplicate";        // this command id already ran on this daemon
+  | "unsupported";      // not macOS, unknown terminal app, or an agent with no locate seam
 
 /** Best-effort trace with the same argv guard tracePicker uses: pure unit calls run inside `bun test`
  *  with the production HOME visible and must never pollute the user's live trace. */
@@ -939,10 +1008,12 @@ function traceFocus(deps: { trace?: (event: object) => void }, event: object): v
   traceSession(event);
 }
 
-/** Injectable seams for the drain, so the whole path is testable with no filesystem and no osascript. */
+/** Injectable seams for the drain, so the whole path is testable with no filesystem and no osascript.
+ *  Decryption is deliberately NOT a seam: tests seal real blobs with the repo's own crypto helpers,
+ *  so they prove interop with the phone's envelope rather than a mock's. */
 export interface DrainCommandsDeps {
-  /** Take (and clear) the pending commands. Defaults to draining the module buffer. */
-  take?: () => FocusCommand[];
+  /** Take (and clear) the pending sealed commands. Defaults to draining the module buffer. */
+  take?: () => SealedCommand[];
   /** Every session record on disk, id + record. Defaults to the sweep's own reader. */
   readRecords?: () => Promise<RecordEntry[]>;
   /** Raise the window for a located pid. Defaults to the real macOS AppleScript path. */
@@ -951,18 +1022,34 @@ export interface DrainCommandsDeps {
    *  discoverLiveSessions / reconcileProvisionalsSweep expose), so a test can supply a locator
    *  without spawning a real `ps`. Defaults to the real registry. */
   adapters?: AgentAdapter[];
+  now?: () => number;
   trace?: (event: object) => void;
 }
 
-/** Execute every buffered command, returning how many actually focused something.
+/** Decrypt, VALIDATE, then execute every buffered command; returns how many actually focused
+ *  something. Nothing is acted on until the blob authenticates, because the relay is blind and a
+ *  compromised worker must not be able to author a control message this daemon obeys.
  *
- *  For a focus-terminal command: find the session's record (unknown id → no-record), pick its
- *  adapter via the same recordAgent/adapterFor dispatch every other net uses, and ask the adapter's
- *  optional locate seam WHICH live process is that session's interactive TUI. Undefined — no
- *  candidate, or several equally plausible ones — is a deliberate NO-OP: focusing the wrong window is
- *  worse than doing nothing. An agent with no locate seam is likewise a no-op.
+ *  Validation order (cheapest / most-decisive first, and NOTHING runs before the tag check):
+ *    1. repeated command id            -> duplicate       (free; a re-delivery of the same envelope)
+ *    2. decryptBlob(config.e2eKey)     -> decrypt-failed  (GCM's tag catches forgery AND tampering)
+ *    3. sealed JSON shape              -> malformed       (only a phone bug can reach this)
+ *    4. kind in the plugin allow-list  -> bad-kind
+ *    5. freshness of the SEALED ts     -> stale           (authenticated time; never the server's)
+ *    6. nonce not seen before          -> replay          (then recorded, so the next copy is caught)
+ *    7. sessionId is tracked locally   -> unknown-session
+ *    8. first (kind, sessionId) in this batch -> duplicate (two rapid taps raise the window once)
+ *  and only then the agent's locate seam + the focus itself.
  *
- *  Ids are deduped against a bounded recently-executed set, so a worker replay can't double-focus.
+ *  The id set alone cannot stop replay — ids are worker-chosen, so an old blob can be re-delivered
+ *  under a fresh one; the sealed nonce plus the 120 s freshness window are what bound it together.
+ *  Batch collapsing lives here for the same reason the allow-list does: a blind relay cannot dedupe
+ *  what it cannot read.
+ *
+ *  For an executable focus-terminal command: find the session record, pick its adapter via the same
+ *  recordAgent/adapterFor dispatch every other net uses, and ask the adapter's optional locate seam
+ *  WHICH live process is that session's interactive TUI. Undefined — no candidate, or several equally
+ *  plausible ones — is a deliberate NO-OP: focusing the wrong window is worse than doing nothing.
  *  Every outcome is traced. The whole drain is wrapped: a command must never derail the sweep. */
 export async function drainCommands(config: Config, deps: DrainCommandsDeps = {}): Promise<number> {
   try {
@@ -970,22 +1057,84 @@ export async function drainCommands(config: Config, deps: DrainCommandsDeps = {}
     if (pending.length === 0) return 0;
     const readRecords = deps.readRecords ?? readAllRecordEntries;
     const focus = deps.focus ?? ((pid: number) => focusTerminalForPid(pid));
+    const now = (deps.now ?? Date.now)();
     let entries: RecordEntry[] | null = null;
     let focused = 0;
+    /** (kind, sessionId) pairs already acted on IN THIS BATCH — the worker can no longer collapse
+     *  two rapid taps for us, because it cannot see what they target. */
+    const batchTargets = new Set<string>();
     for (const cmd of pending) {
-      const base = { event: "focus-terminal", sessionId: cmd.sessionId, id: cmd.id };
+      const base: Record<string, unknown> = { event: "focus-terminal", id: cmd.id };
       try {
+        // 1. Same envelope delivered twice.
         if (executedCommandIds.has(cmd.id)) {
-          traceFocus(deps, { ...base, result: "duplicate" as FocusTraceResult });
+          traceFocus(deps, { ...base, result: "duplicate" as FocusTraceResult, why: "id" });
           continue;
         }
-        rememberCommandId(cmd.id); // BEFORE the work: a throw mid-focus must not re-run on the next tick
+        // BEFORE the work: a throw mid-focus must not re-run this command on the next tick.
+        rememberBounded(executedCommandIds, cmd.id, EXECUTED_COMMAND_IDS_MAX);
+
+        // 2. The tag check. A worker that forges or edits a blob cannot produce a valid one.
+        let plain: unknown;
+        try {
+          plain = await decryptBlob(config.e2eKey, cmd.blob);
+        } catch {
+          traceFocus(deps, { ...base, result: "decrypt-failed" as FocusTraceResult });
+          continue;
+        }
+        // 3. Authentic, but is it a command?
+        const payload = parseCommandPayload(plain);
+        if (!payload) {
+          traceFocus(deps, { ...base, result: "malformed" as FocusTraceResult });
+          continue;
+        }
+        base.sessionId = payload.sessionId;
+        base.kind = payload.kind;
+        // 4. The plugin-side allow-list (the blind relay cannot filter what it cannot read).
+        if (!COMMAND_KINDS_ALLOWED.has(payload.kind)) {
+          traceFocus(deps, { ...base, result: "bad-kind" as FocusTraceResult });
+          continue;
+        }
+        // 5. Stale intent, on the AUTHENTICATED clock.
+        if (!commandIsFresh(payload.ts, now)) {
+          traceFocus(deps, { ...base, result: "stale" as FocusTraceResult, age: now - payload.ts });
+          continue;
+        }
+        // 6. Replay of an older sealed command under a fresh id.
+        if (seenCommandNonces.has(payload.nonce)) {
+          traceFocus(deps, { ...base, result: "replay" as FocusTraceResult });
+          continue;
+        }
+        rememberBounded(seenCommandNonces, payload.nonce, SEEN_NONCES_MAX);
+        // 7. A command may only ever name a session THIS machine tracks. The phone seals
+        // CCSessionBrief.sessionId verbatim, and BOTH halves of the id-form question check out
+        // (verified 2026-07-31, belt and braces):
+        //   (a) a PROVISIONAL Codex discovery row is persisted under the very sentinel id the phone
+        //       received — discoverLiveSessions writes buildProvisionalRecord to
+        //       <SESSIONS_DIR>/<d.sessionId>.json, where d.sessionId is codexSentinelSessionId(pid),
+        //       i.e. "codex-pid-<n>" — so a command naming the sentinel resolves here, it does not
+        //       fall through to unknown-session;
+        //   (b) a provisional row can never be in the state the phone's button is offered for anyway:
+        //       buildProvisionalRecord only ever writes lastEvent sessionStart/done (op start/done,
+        //       prio 0), and no net can flip one to needsAttention — correctPendingApproval requires a
+        //       non-empty `transcript` (a provisional has none), shouldPlanPickerVerificationCheck
+        //       excludes `provisional === true` outright, and correctResolvedPlanPicker needs a
+        //       pendingPlanPicker marker a provisional never carries.
+        // So the sentinel is accepted if it ever arrives, and it realistically never will.
         if (entries === null) entries = await readRecords(); // one dir read per drain, not per command
-        const entry = entries.find((e) => e.sessionId === cmd.sessionId);
+        const entry = entries.find((e) => e.sessionId === payload.sessionId);
         if (!entry) {
-          traceFocus(deps, { ...base, result: "no-record" as FocusTraceResult });
+          traceFocus(deps, { ...base, result: "unknown-session" as FocusTraceResult });
           continue;
         }
+        // 8. Two taps for the same target in one batch raise the window once.
+        const target = `${payload.kind}|${payload.sessionId}`;
+        if (batchTargets.has(target)) {
+          traceFocus(deps, { ...base, result: "duplicate" as FocusTraceResult, why: "batch" });
+          continue;
+        }
+        batchTargets.add(target);
+
         const agent = recordAgent(entry.rec);
         const adapter = deps.adapters
           ? deps.adapters.find((a) => a.kind === agent) ?? adapterFor(agent)
@@ -996,7 +1145,7 @@ export async function drainCommands(config: Config, deps: DrainCommandsDeps = {}
         }
         let reason: LocateTuiReason | undefined;
         const pid = await adapter.locateTuiPid(
-          { sessionId: cmd.sessionId, record: entry.rec },
+          { sessionId: payload.sessionId, record: entry.rec },
           { note: (r) => { reason = r; } },
         );
         if (typeof pid !== "number" || !Number.isFinite(pid)) {
