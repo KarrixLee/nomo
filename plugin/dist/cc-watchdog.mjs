@@ -92,7 +92,7 @@ import { appendFileSync, existsSync, readFileSync, statSync, truncateSync } from
 import { execFileSync, spawn } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "1.4.12";
+var PLUGIN_VERSION = "1.4.13";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -1910,6 +1910,82 @@ import { execFile as execFile2 } from "node:child_process";
 import { promisify as promisify2 } from "node:util";
 var execFileP2 = promisify2(execFile2);
 var OSASCRIPT_TIMEOUT_MS = 4000;
+var HERDR_TIMEOUT_MS = 4000;
+var HERDR_TAB_ID = /^[A-Za-z0-9:]+$/;
+function commandTokens(command) {
+  return command.trim().split(/\s+/).filter(Boolean);
+}
+function isHerdrCommand(command) {
+  if (typeof command !== "string")
+    return false;
+  const executable = commandTokens(command)[0]?.replace(/^['"]|['"]$/g, "");
+  return typeof executable === "string" && /(?:^|\/)herdr$/.test(executable);
+}
+function isHerdrServer(command) {
+  return typeof command === "string" && isHerdrCommand(command) && commandTokens(command).slice(1).includes("server");
+}
+function ancestryContainsHerdr(pid, ancestorsOf, commandOf) {
+  let ancestors;
+  try {
+    ancestors = ancestorsOf(pid);
+  } catch {
+    ancestors = [];
+  }
+  for (const candidate of [pid, ...ancestors]) {
+    try {
+      if (isHerdrCommand(commandOf(candidate)))
+        return true;
+    } catch {}
+  }
+  return false;
+}
+function recordTitleMatchesPane(recordTitle, paneTitle) {
+  if (typeof recordTitle !== "string" || typeof paneTitle !== "string")
+    return false;
+  if (recordTitle === paneTitle)
+    return true;
+  const match = /^(.*?)(?:\u2026|\.{3})$/.exec(recordTitle);
+  return !!match && match[1].length > 0 && paneTitle.startsWith(match[1]);
+}
+function correlateHerdrPane(context, panes) {
+  let candidates = context.agent === "claude" ? panes.filter((pane) => pane.agent === "claude" && recordTitleMatchesPane(context.record.title, pane.terminal_title_stripped)) : panes.filter((pane) => pane.agent === "codex" && typeof context.record.origin?.cwd === "string" && context.record.origin.cwd.length > 0 && pane.cwd === context.record.origin.cwd);
+  if (candidates.length > 1) {
+    const working = candidates.filter((pane) => pane.agent_status === "working");
+    if (working.length > 0)
+      candidates = working;
+  }
+  return candidates.length === 1 ? candidates[0] : undefined;
+}
+function parseHerdrPanes(stdout) {
+  const parsed = JSON.parse(stdout);
+  const panes = parsed?.result?.panes;
+  if (!Array.isArray(panes))
+    throw new Error("invalid herdr pane list");
+  return panes.filter((value) => {
+    if (!value || typeof value !== "object")
+      return false;
+    const pane = value;
+    return typeof pane.agent === "string" && typeof pane.tab_id === "string";
+  });
+}
+function parsePsProcesses(stdout) {
+  const out = [];
+  for (const line of stdout.split(/\r?\n/)) {
+    const match = /^\s*(\d+)\s+(\S+)\s+(.+)$/.exec(line);
+    if (!match)
+      continue;
+    const pid = Number.parseInt(match[1], 10);
+    if (Number.isFinite(pid))
+      out.push({ pid, tty: match[2], command: match[3] });
+  }
+  return out;
+}
+async function runExecFile(file, args, options, deps) {
+  if (deps.execFile)
+    return deps.execFile(file, args, options);
+  const { stdout, stderr } = await execFileP2(file, args, options);
+  return { stdout: String(stdout), stderr: String(stderr) };
+}
 var TERMINAL_APPS = [
   { id: "terminal-app", bundleId: "com.apple.Terminal", match: /\/Terminal\.app\// },
   { id: "iterm2", bundleId: "com.googlecode.iterm2", match: /\/iTerm\.app\/|\/iTerm2\.app\// },
@@ -2023,6 +2099,67 @@ function note(deps, event) {
     deps.trace?.(event);
   } catch {}
 }
+async function focusHerdr(pid, deps, ancestorsOf, commandOf) {
+  const context = deps.context;
+  if (!context) {
+    note(deps, { event: "terminal-focus", pid, result: "ambiguous", reason: "herdr-ambiguous" });
+    return { ok: false, reason: "herdr-ambiguous" };
+  }
+  let pane;
+  try {
+    const listed = await runExecFile("herdr", ["pane", "list"], { timeout: HERDR_TIMEOUT_MS }, deps);
+    if ((listed.exitCode ?? 0) !== 0)
+      throw new Error("herdr pane list failed");
+    pane = correlateHerdrPane(context, parseHerdrPanes(String(listed.stdout)));
+  } catch {
+    note(deps, { event: "terminal-focus", pid, result: "unsupported", reason: "herdr-cli-failed" });
+    return { ok: false, reason: "herdr-cli-failed" };
+  }
+  if (!pane) {
+    note(deps, { event: "terminal-focus", pid, result: "ambiguous", reason: "herdr-ambiguous" });
+    return { ok: false, reason: "herdr-ambiguous" };
+  }
+  if (!HERDR_TAB_ID.test(pane.tab_id)) {
+    note(deps, { event: "terminal-focus", pid, result: "unsupported", reason: "herdr-cli-failed" });
+    return { ok: false, reason: "herdr-cli-failed" };
+  }
+  try {
+    const focused = await runExecFile("herdr", ["tab", "focus", pane.tab_id], { timeout: HERDR_TIMEOUT_MS }, deps);
+    if ((focused.exitCode ?? 0) !== 0)
+      throw new Error("herdr tab focus failed");
+  } catch {
+    note(deps, { event: "terminal-focus", pid, result: "unsupported", reason: "herdr-cli-failed" });
+    return { ok: false, reason: "herdr-cli-failed" };
+  }
+  let app;
+  try {
+    const scanned = await runExecFile("ps", ["-axo", "pid=,tty=,args="], { timeout: HERDR_TIMEOUT_MS }, deps);
+    if ((scanned.exitCode ?? 0) === 0) {
+      const apps = new Map;
+      for (const process2 of parsePsProcesses(String(scanned.stdout))) {
+        if (!isRealTty(process2.tty) || !isHerdrCommand(process2.command) || isHerdrServer(process2.command))
+          continue;
+        const owner = owningTerminalApp(process2.pid, ancestorsOf, commandOf);
+        if (owner)
+          apps.set(owner.bundleId, owner);
+      }
+      if (apps.size === 1)
+        app = apps.values().next().value;
+    }
+  } catch {}
+  if (!app) {
+    note(deps, { event: "terminal-focus", pid, result: "focused", via: "herdr", reason: "focused-detached" });
+    return { ok: true, via: "herdr", reason: "focused-detached" };
+  }
+  try {
+    await (deps.osascript ?? runOsascript)(activateScript(app.bundleId));
+    note(deps, { event: "terminal-focus", pid, result: "focused", via: "herdr", app: app.id, reason: "herdr-focused" });
+    return { ok: true, via: "herdr", reason: "herdr-focused" };
+  } catch {
+    note(deps, { event: "terminal-focus", pid, result: "osascript-failed", app: app.id });
+    return { ok: false, reason: "osascript-failed" };
+  }
+}
 async function focusTerminalForPid(pid, deps = {}) {
   try {
     if ((deps.platform ?? process.platform) !== "darwin") {
@@ -2040,7 +2177,12 @@ async function focusTerminalForPid(pid, deps = {}) {
       note(deps, { event: "terminal-focus", pid, result: "no-tty", tty: rawTty ?? "" });
       return { ok: false, reason: "no-tty" };
     }
-    const app = owningTerminalApp(pid, deps.ancestorsOf ?? pidAncestors, deps.commandOf ?? pidCommand);
+    const ancestorsOf = deps.ancestorsOf ?? pidAncestors;
+    const commandOf = deps.commandOf ?? pidCommand;
+    if (ancestryContainsHerdr(pid, ancestorsOf, commandOf)) {
+      return await focusHerdr(pid, deps, ancestorsOf, commandOf);
+    }
+    const app = owningTerminalApp(pid, ancestorsOf, commandOf);
     if (!app) {
       note(deps, { event: "terminal-focus", pid, result: "unsupported", why: "no-owning-app" });
       return { ok: false, reason: "unsupported" };
@@ -5288,7 +5430,7 @@ async function drainCommands(config, deps = {}) {
     if (pending.length === 0)
       return 0;
     const readRecords = deps.readRecords ?? readAllRecordEntries;
-    const focus = deps.focus ?? ((pid) => focusTerminalForPid(pid));
+    const focus = deps.focus ?? ((pid, context) => focusTerminalForPid(pid, { context }));
     const now = (deps.now ?? Date.now)();
     let entries = null;
     let focused = 0;
@@ -5356,14 +5498,22 @@ async function drainCommands(config, deps = {}) {
           traceFocus(deps, { ...base, agent, result: result2, reason: reason ?? "no-candidate" });
           continue;
         }
-        const outcome = await focus(pid);
+        const outcome = await focus(pid, { agent, record: entry.rec });
         if (outcome.ok) {
           focused += 1;
-          traceFocus(deps, { ...base, agent, pid, result: "focused", via: outcome.via, reason });
+          traceFocus(deps, {
+            ...base,
+            agent,
+            pid,
+            result: "focused",
+            via: outcome.via,
+            reason: outcome.reason ?? reason
+          });
           continue;
         }
-        const result = outcome.reason === "osascript-failed" ? "osascript-failed" : outcome.reason === "unsupported" ? "unsupported" : "no-candidate";
-        traceFocus(deps, { ...base, agent, pid, result, why: outcome.reason, reason });
+        const result = outcome.reason === "herdr-ambiguous" ? "ambiguous" : outcome.reason === "osascript-failed" ? "osascript-failed" : outcome.reason === "unsupported" ? "unsupported" : "no-candidate";
+        const focusReason = outcome.reason === "herdr-cli-failed" || outcome.reason === "herdr-ambiguous" ? outcome.reason : reason;
+        traceFocus(deps, { ...base, agent, pid, result, why: outcome.reason, reason: focusReason });
       } catch {
         traceFocus(deps, { ...base, result: "no-candidate", why: "error" });
       }

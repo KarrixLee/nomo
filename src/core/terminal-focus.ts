@@ -24,6 +24,7 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { isRealTty, pidAncestors, pidCommand } from "./shared";
+import type { AgentKind, SessionRecord } from "./shared";
 
 const execFileP = promisify(execFile);
 
@@ -31,18 +32,43 @@ const execFileP = promisify(execFile);
  *  AppleScript can block indefinitely — on a modal dialog, a hung terminal app, or the TCC consent
  *  prompt itself — and this runs inside the watchdog's sweep loop, which must keep its cadence. */
 const OSASCRIPT_TIMEOUT_MS = 4000;
+const HERDR_TIMEOUT_MS = 4000;
 
 /** How the window was raised. `terminal-app`/`iterm2` mean the EXACT tab/session for that tty was
  *  selected; `app-activate` means only the owning application was brought forward. */
-export type FocusVia = "terminal-app" | "iterm2" | "app-activate";
+export type FocusVia = "terminal-app" | "iterm2" | "app-activate" | "herdr";
 
 /** Why nothing was focused. `no-tty` — the pid holds no real controlling terminal (dead, or a
  *  headless/daemon process). `unsupported` — not macOS, or no known terminal application owns the
  *  pid. `osascript-failed` — the AppleScript bridge errored (most likely a denied/unprompted TCC
  *  Automation permission, -1743), timed out, or the app refused the event. */
-export type FocusFailure = "no-tty" | "unsupported" | "osascript-failed";
+export type FocusFailure =
+  | "no-tty"
+  | "unsupported"
+  | "osascript-failed"
+  | "herdr-ambiguous"
+  | "herdr-cli-failed";
 
-export type FocusResult = { ok: true; via: FocusVia } | { ok: false; reason: FocusFailure };
+export type HerdrFocusReason = "herdr-focused" | "focused-detached";
+
+export type FocusResult =
+  | { ok: true; via: FocusVia; reason?: HerdrFocusReason }
+  | { ok: false; reason: FocusFailure };
+
+/** Session evidence herdr needs because its daemon owns the TUI pty: the pane, rather than the pid's
+ *  terminal ancestry, is correlated to the record. */
+export interface FocusContext {
+  agent: AgentKind;
+  record: SessionRecord;
+}
+
+export interface ExecFileResult {
+  stdout: string;
+  stderr?: string;
+  /** The real promisified execFile rejects on non-zero. This optional field lets unit seams model an
+   *  exited child directly too; absent means zero. */
+  exitCode?: number;
+}
 
 /** Injectable seams so every branch is unit-testable without a real desktop. NOTHING here spawns a
  *  process when all four are supplied. */
@@ -57,8 +83,109 @@ export interface FocusDeps {
   commandOf?: (pid: number) => string | undefined;
   /** Run one AppleScript and return its trimmed stdout. Rejects on any osascript failure. */
   osascript?: (script: string) => Promise<string>;
+  /** Session record used only when the TUI ancestry reveals a herdr daemon. */
+  context?: FocusContext;
+  /** execFile seam for herdr and its client-process scan. No shell is ever involved. */
+  execFile?: (file: string, args: string[], options: { timeout: number }) => Promise<ExecFileResult>;
   /** Best-effort diagnostics sink (the watchdog passes traceSession). */
   trace?: (event: object) => void;
+}
+
+interface HerdrPane {
+  agent: string;
+  agent_status?: string;
+  cwd?: string;
+  tab_id: string;
+  terminal_title_stripped?: string;
+}
+
+const HERDR_TAB_ID = /^[A-Za-z0-9:]+$/;
+
+function commandTokens(command: string): string[] {
+  return command.trim().split(/\s+/).filter(Boolean);
+}
+
+function isHerdrCommand(command: string | undefined): boolean {
+  if (typeof command !== "string") return false;
+  const executable = commandTokens(command)[0]?.replace(/^['"]|['"]$/g, "");
+  return typeof executable === "string" && /(?:^|\/)herdr$/.test(executable);
+}
+
+function isHerdrServer(command: string | undefined): boolean {
+  return typeof command === "string"
+    && isHerdrCommand(command)
+    && commandTokens(command).slice(1).includes("server");
+}
+
+function ancestryContainsHerdr(
+  pid: number,
+  ancestorsOf: (pid: number) => number[],
+  commandOf: (pid: number) => string | undefined,
+): boolean {
+  let ancestors: number[];
+  try { ancestors = ancestorsOf(pid); } catch { ancestors = []; }
+  for (const candidate of [pid, ...ancestors]) {
+    try {
+      if (isHerdrCommand(commandOf(candidate))) return true;
+    } catch { /* a raced process contributes no evidence */ }
+  }
+  return false;
+}
+
+function recordTitleMatchesPane(recordTitle: unknown, paneTitle: unknown): boolean {
+  if (typeof recordTitle !== "string" || typeof paneTitle !== "string") return false;
+  if (recordTitle === paneTitle) return true;
+  // Records are occasionally fitted for display with a trailing ellipsis. Only that explicit
+  // truncation marker enables prefix matching; arbitrary prefixes would collide too easily.
+  const match = /^(.*?)(?:\u2026|\.{3})$/.exec(recordTitle);
+  return !!match && match[1].length > 0 && paneTitle.startsWith(match[1]);
+}
+
+function correlateHerdrPane(context: FocusContext, panes: HerdrPane[]): HerdrPane | undefined {
+  let candidates = context.agent === "claude"
+    ? panes.filter((pane) => pane.agent === "claude"
+      && recordTitleMatchesPane(context.record.title, pane.terminal_title_stripped))
+    : panes.filter((pane) => pane.agent === "codex"
+      && typeof context.record.origin?.cwd === "string"
+      && context.record.origin.cwd.length > 0
+      && pane.cwd === context.record.origin.cwd);
+
+  // Status may break a primary-signal tie, but can never introduce a pane that title/cwd rejected.
+  if (candidates.length > 1) {
+    const working = candidates.filter((pane) => pane.agent_status === "working");
+    if (working.length > 0) candidates = working;
+  }
+  return candidates.length === 1 ? candidates[0] : undefined;
+}
+
+function parseHerdrPanes(stdout: string): HerdrPane[] {
+  const parsed: unknown = JSON.parse(stdout);
+  const panes = (parsed as { result?: { panes?: unknown } })?.result?.panes;
+  if (!Array.isArray(panes)) throw new Error("invalid herdr pane list");
+  return panes.filter((value): value is HerdrPane => {
+    if (!value || typeof value !== "object") return false;
+    const pane = value as Partial<HerdrPane>;
+    return typeof pane.agent === "string" && typeof pane.tab_id === "string";
+  });
+}
+
+function parsePsProcesses(stdout: string): Array<{ pid: number; tty: string; command: string }> {
+  const out: Array<{ pid: number; tty: string; command: string }> = [];
+  for (const line of stdout.split(/\r?\n/)) {
+    const match = /^\s*(\d+)\s+(\S+)\s+(.+)$/.exec(line);
+    if (!match) continue;
+    const pid = Number.parseInt(match[1], 10);
+    if (Number.isFinite(pid)) out.push({ pid, tty: match[2], command: match[3] });
+  }
+  return out;
+}
+
+async function runExecFile(
+  file: string, args: string[], options: { timeout: number }, deps: FocusDeps,
+): Promise<ExecFileResult> {
+  if (deps.execFile) return deps.execFile(file, args, options);
+  const { stdout, stderr } = await execFileP(file, args, options);
+  return { stdout: String(stdout), stderr: String(stderr) };
 }
 
 /** A terminal emulator we can recognise from argv and activate by bundle id. `script` is the
@@ -207,6 +334,82 @@ function note(deps: FocusDeps, event: object): void {
   try { deps.trace?.(event); } catch { /* diagnostics only */ }
 }
 
+async function focusHerdr(
+  pid: number,
+  deps: FocusDeps,
+  ancestorsOf: (pid: number) => number[],
+  commandOf: (pid: number) => string | undefined,
+): Promise<FocusResult> {
+  const context = deps.context;
+  if (!context) {
+    note(deps, { event: "terminal-focus", pid, result: "ambiguous", reason: "herdr-ambiguous" });
+    return { ok: false, reason: "herdr-ambiguous" };
+  }
+
+  let pane: HerdrPane | undefined;
+  try {
+    const listed = await runExecFile("herdr", ["pane", "list"], { timeout: HERDR_TIMEOUT_MS }, deps);
+    if ((listed.exitCode ?? 0) !== 0) throw new Error("herdr pane list failed");
+    pane = correlateHerdrPane(context, parseHerdrPanes(String(listed.stdout)));
+  } catch {
+    note(deps, { event: "terminal-focus", pid, result: "unsupported", reason: "herdr-cli-failed" });
+    return { ok: false, reason: "herdr-cli-failed" };
+  }
+
+  if (!pane) {
+    note(deps, { event: "terminal-focus", pid, result: "ambiguous", reason: "herdr-ambiguous" });
+    return { ok: false, reason: "herdr-ambiguous" };
+  }
+  if (!HERDR_TAB_ID.test(pane.tab_id)) {
+    note(deps, { event: "terminal-focus", pid, result: "unsupported", reason: "herdr-cli-failed" });
+    return { ok: false, reason: "herdr-cli-failed" };
+  }
+
+  try {
+    // Output may be a JSON result or plain text in released herdr versions. Exit zero is the
+    // command's contract, so stdout is intentionally not parsed.
+    const focused = await runExecFile(
+      "herdr", ["tab", "focus", pane.tab_id], { timeout: HERDR_TIMEOUT_MS }, deps,
+    );
+    if ((focused.exitCode ?? 0) !== 0) throw new Error("herdr tab focus failed");
+  } catch {
+    note(deps, { event: "terminal-focus", pid, result: "unsupported", reason: "herdr-cli-failed" });
+    return { ok: false, reason: "herdr-cli-failed" };
+  }
+
+  let app: TerminalApp | undefined;
+  try {
+    const scanned = await runExecFile(
+      "ps", ["-axo", "pid=,tty=,args="], { timeout: HERDR_TIMEOUT_MS }, deps,
+    );
+    if ((scanned.exitCode ?? 0) === 0) {
+      const apps = new Map<string, TerminalApp>();
+      for (const process of parsePsProcesses(String(scanned.stdout))) {
+        if (!isRealTty(process.tty) || !isHerdrCommand(process.command) || isHerdrServer(process.command)) continue;
+        const owner = owningTerminalApp(process.pid, ancestorsOf, commandOf);
+        if (owner) apps.set(owner.bundleId, owner);
+      }
+      // Several client processes inside the same GUI application are safe; distinct host apps are
+      // not, because activating one would be a guess.
+      if (apps.size === 1) app = apps.values().next().value;
+    }
+  } catch { /* the tab is already focused; a client scan failure degrades to detached */ }
+
+  if (!app) {
+    note(deps, { event: "terminal-focus", pid, result: "focused", via: "herdr", reason: "focused-detached" });
+    return { ok: true, via: "herdr", reason: "focused-detached" };
+  }
+
+  try {
+    await (deps.osascript ?? runOsascript)(activateScript(app.bundleId));
+    note(deps, { event: "terminal-focus", pid, result: "focused", via: "herdr", app: app.id, reason: "herdr-focused" });
+    return { ok: true, via: "herdr", reason: "herdr-focused" };
+  } catch {
+    note(deps, { event: "terminal-focus", pid, result: "osascript-failed", app: app.id });
+    return { ok: false, reason: "osascript-failed" };
+  }
+}
+
 /** Bring the macOS terminal window running `pid` to the front. See the module header for the full
  *  strategy. Never throws; every refusal is a typed {ok:false} result. */
 export async function focusTerminalForPid(pid: number, deps: FocusDeps = {}): Promise<FocusResult> {
@@ -222,7 +425,12 @@ export async function focusTerminalForPid(pid: number, deps: FocusDeps = {}): Pr
       note(deps, { event: "terminal-focus", pid, result: "no-tty", tty: rawTty ?? "" });
       return { ok: false, reason: "no-tty" };
     }
-    const app = owningTerminalApp(pid, deps.ancestorsOf ?? pidAncestors, deps.commandOf ?? pidCommand);
+    const ancestorsOf = deps.ancestorsOf ?? pidAncestors;
+    const commandOf = deps.commandOf ?? pidCommand;
+    if (ancestryContainsHerdr(pid, ancestorsOf, commandOf)) {
+      return await focusHerdr(pid, deps, ancestorsOf, commandOf);
+    }
+    const app = owningTerminalApp(pid, ancestorsOf, commandOf);
     if (!app) {
       note(deps, { event: "terminal-focus", pid, result: "unsupported", why: "no-owning-app" });
       return { ok: false, reason: "unsupported" };

@@ -2638,6 +2638,24 @@ describe("drainCommands (authenticate, validate, then execute)", () => {
     });
   });
 
+  test("threads the session record into terminal focus and traces herdr's terminal reason", async () => {
+    const seen: Array<{ pid: number; agent: string; title?: string; cwd?: string }> = [];
+    const { traces, deps } = harness({
+      readRecords: async () => [entry("sess-b", {
+        pid: 22, agent: "codex", title: "Review herdr support",
+        origin: { hook_event_name: "SessionStart", ppid: 22, cwd: "/repo" },
+      })],
+      focus: async (pid, context) => {
+        seen.push({ pid, agent: context.agent, title: context.record.title, cwd: context.record.origin?.cwd });
+        return { ok: true, via: "herdr", reason: "herdr-focused" };
+      },
+    });
+    const cmd = await sealed({ sessionId: "sess-b" });
+    expect(await drainCommands(cfg(), { ...deps, take: () => [cmd] })).toBe(1);
+    expect(seen).toEqual([{ pid: 22, agent: "codex", title: "Review herdr support", cwd: "/repo" }]);
+    expect(traces[0]).toMatchObject({ result: "focused", via: "herdr", reason: "herdr-focused" });
+  });
+
   test("a blob sealed under the WRONG key is refused — this is the whole point of sealing", async () => {
     const { focused, traces, deps } = harness();
     const cmd = await sealed({}, { key: OTHER_KEY });

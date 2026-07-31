@@ -4,6 +4,7 @@ import {
   terminalAppScript, ttyDevicePath,
 } from "./terminal-focus";
 import type { FocusDeps } from "./terminal-focus";
+import type { SessionRecord } from "./shared";
 
 // Every test here runs entirely on injected seams: NO osascript is ever spawned, no real process is
 // inspected, and the platform is injected. The AppleScript itself is asserted as text (the builders
@@ -12,6 +13,25 @@ import type { FocusDeps } from "./terminal-focus";
 const TERMINAL_ARGV = "/System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal";
 const ITERM_ARGV = "/Applications/iTerm.app/Contents/MacOS/iTerm2";
 const GHOSTTY_ARGV = "/Applications/Ghostty.app/Contents/MacOS/ghostty";
+const HERDR_SERVER_ARGV = "/opt/homebrew/bin/herdr server";
+
+const REAL_HERDR_PANE_LIST = JSON.stringify({
+  result: {
+    panes: [
+      {
+        agent: "codex", agent_status: "idle", cwd: "/Users/karrix/api-status", focused: false,
+        pane_id: "w2:pB", tab_id: "w2:tB", terminal_id: "term_657d", terminal_title: "api-status",
+        terminal_title_stripped: "api-status", workspace_id: "w2",
+      },
+      {
+        agent: "claude", agent_status: "working", cwd: "/Users/karrix/api-status", focused: true,
+        pane_id: "w2:p8", tab_id: "w2:t8", terminal_title: "⠂ Review and clean up test cases for NOM-42",
+        terminal_title_stripped: "Review and clean up test cases for NOM-42", workspace_id: "w2",
+      },
+    ],
+    type: "pane_list",
+  },
+});
 
 /** A fully-injected deps object: darwin, one tty, an ancestor chain, and a scripted osascript. */
 function deps(over: Partial<FocusDeps> & { argvOf?: Record<number, string> } = {}): FocusDeps {
@@ -23,6 +43,51 @@ function deps(over: Partial<FocusDeps> & { argvOf?: Record<number, string> } = {
     commandOf: (pid) => argv[pid],
     osascript: async () => "ok",
     ...over,
+  };
+}
+
+function herdrRecord(over: Partial<SessionRecord> = {}): SessionRecord {
+  return {
+    pid: 100, machine: "Mac", label: "api-status", ts: 1,
+    title: "Review and clean up test cases for NOM-42",
+    origin: { hook_event_name: "SessionStart", ppid: 100, cwd: "/Users/karrix/api-status" },
+    ...over,
+  };
+}
+
+function herdrDeps(over: {
+  agent?: "claude" | "codex";
+  record?: SessionRecord;
+  paneList?: string;
+  focusResult?: { stdout: string; exitCode?: number };
+  ps?: string;
+  trace?: (event: object) => void;
+} = {}): { deps: FocusDeps; calls: Array<{ file: string; args: string[] }>; scripts: string[] } {
+  const calls: Array<{ file: string; args: string[] }> = [];
+  const scripts: string[] = [];
+  const commands: Record<number, string> = {
+    100: "codex", 101: "-zsh", 102: HERDR_SERVER_ARGV, 500: "/opt/homebrew/bin/herdr",
+    501: "-zsh", 502: "/usr/bin/login -fp karrix", 503: GHOSTTY_ARGV,
+  };
+  return {
+    calls,
+    scripts,
+    deps: {
+      platform: "darwin",
+      ttyOf: async () => "ttys001",
+      ancestorsOf: (pid) => pid === 500 ? [501, 502, 503] : [101, 102, 1],
+      commandOf: (pid) => commands[pid],
+      context: { agent: over.agent ?? "claude", record: over.record ?? herdrRecord() },
+      execFile: async (file, args) => {
+        calls.push({ file, args });
+        if (file === "herdr" && args[0] === "pane") return { stdout: over.paneList ?? REAL_HERDR_PANE_LIST };
+        if (file === "herdr" && args[0] === "tab") return over.focusResult ?? { stdout: "focused\n" };
+        if (file === "ps") return { stdout: over.ps ?? "500 ttys009 /opt/homebrew/bin/herdr\n" };
+        throw new Error("unexpected execFile call");
+      },
+      osascript: async (script) => { scripts.push(script); return ""; },
+      trace: over.trace,
+    },
   };
 }
 
@@ -203,5 +268,90 @@ describe("focusTerminalForPid", () => {
     const events: object[] = [];
     await focusTerminalForPid(100, deps({ trace: (e) => events.push(e) }));
     expect(events).toEqual([{ event: "terminal-focus", pid: 100, result: "focused", via: "terminal-app", app: "terminal-app" }]);
+  });
+});
+
+describe("focusTerminalForPid through herdr", () => {
+  test("matches a Claude pane by exact terminal_title_stripped and activates its client host", async () => {
+    const events: object[] = [];
+    const h = herdrDeps({
+      focusResult: { stdout: JSON.stringify({ id: "cli:tab:focus", result: { tab_id: "w2:t8" } }) },
+      trace: (event) => events.push(event),
+    });
+    expect(await focusTerminalForPid(100, h.deps)).toEqual({ ok: true, via: "herdr", reason: "herdr-focused" });
+    expect(h.calls.map((call) => [call.file, ...call.args])).toEqual([
+      ["herdr", "pane", "list"], ["herdr", "tab", "focus", "w2:t8"],
+      ["ps", "-axo", "pid=,tty=,args="],
+    ]);
+    expect(h.scripts).toEqual([`tell application id "com.mitchellh.ghostty" to activate`]);
+    expect(events.at(-1)).toMatchObject({ result: "focused", reason: "herdr-focused", app: "ghostty" });
+  });
+
+  test("matches when an explicitly ellipsis-truncated record title prefixes the full pane title", async () => {
+    const h = herdrDeps({ record: herdrRecord({ title: "Review and clean up test cases…" }) });
+    expect(await focusTerminalForPid(100, h.deps)).toEqual({ ok: true, via: "herdr", reason: "herdr-focused" });
+    expect(h.calls[1]).toEqual({ file: "herdr", args: ["tab", "focus", "w2:t8"] });
+  });
+
+  test("matches a Codex pane only by a unique exact origin cwd", async () => {
+    const h = herdrDeps({ agent: "codex", record: herdrRecord({ agent: "codex", title: "unrelated" }) });
+    expect(await focusTerminalForPid(100, h.deps)).toEqual({ ok: true, via: "herdr", reason: "herdr-focused" });
+    expect(h.calls[1]).toEqual({ file: "herdr", args: ["tab", "focus", "w2:tB"] });
+  });
+
+  test("uses agent_status only to break a tie between primary-signal matches", async () => {
+    const payload = JSON.stringify({ result: { panes: [
+      { agent: "codex", agent_status: "idle", cwd: "/Users/karrix/api-status", tab_id: "w2:tIdle" },
+      { agent: "codex", agent_status: "working", cwd: "/Users/karrix/api-status", tab_id: "w2:tWorking" },
+    ] } });
+    const h = herdrDeps({
+      agent: "codex", record: herdrRecord({ agent: "codex", lastEvent: "working" }), paneList: payload,
+    });
+    expect(await focusTerminalForPid(100, h.deps)).toEqual({ ok: true, via: "herdr", reason: "herdr-focused" });
+    expect(h.calls[1]).toEqual({ file: "herdr", args: ["tab", "focus", "w2:tWorking"] });
+  });
+
+  test("gives up on multiple candidates after tiebreak and never runs tab focus", async () => {
+    const payload = JSON.stringify({ result: { panes: [
+      { agent: "codex", agent_status: "idle", cwd: "/Users/karrix/api-status", tab_id: "w2:tB" },
+      { agent: "codex", agent_status: "idle", cwd: "/Users/karrix/api-status", tab_id: "w2:tC" },
+    ] } });
+    const events: object[] = [];
+    const h = herdrDeps({ agent: "codex", paneList: payload, trace: (event) => events.push(event) });
+    expect(await focusTerminalForPid(100, h.deps)).toEqual({ ok: false, reason: "herdr-ambiguous" });
+    expect(h.calls).toEqual([{ file: "herdr", args: ["pane", "list"] }]);
+    expect(events.at(-1)).toMatchObject({ result: "ambiguous", reason: "herdr-ambiguous" });
+  });
+
+  test("treats malformed pane-list JSON as herdr-cli-failed and never throws", async () => {
+    const h = herdrDeps({ paneList: "{ definitely not json" });
+    expect(await focusTerminalForPid(100, h.deps)).toEqual({ ok: false, reason: "herdr-cli-failed" });
+    expect(h.calls).toEqual([{ file: "herdr", args: ["pane", "list"] }]);
+  });
+
+  test("rejects an unsafe tab_id before it can reach execFile", async () => {
+    const payload = JSON.stringify({ result: { panes: [{
+      agent: "codex", agent_status: "idle", cwd: "/Users/karrix/api-status",
+      tab_id: "w2:tB;touch /tmp/herdr-injected",
+    }] } });
+    const h = herdrDeps({ agent: "codex", paneList: payload });
+    expect(await focusTerminalForPid(100, h.deps)).toEqual({ ok: false, reason: "herdr-cli-failed" });
+    expect(h.calls).toEqual([{ file: "herdr", args: ["pane", "list"] }]);
+  });
+
+  test("keeps a successful tab focus when no real-tty herdr client is attached", async () => {
+    const events: object[] = [];
+    const h = herdrDeps({ ps: "500 ?? /opt/homebrew/bin/herdr\n", trace: (event) => events.push(event) });
+    expect(await focusTerminalForPid(100, h.deps)).toEqual({ ok: true, via: "herdr", reason: "focused-detached" });
+    expect(h.calls[1]).toEqual({ file: "herdr", args: ["tab", "focus", "w2:t8"] });
+    expect(h.scripts).toEqual([]);
+    expect(events.at(-1)).toMatchObject({ result: "focused", reason: "focused-detached" });
+  });
+
+  test("maps a non-zero herdr tab-focus exit to herdr-cli-failed", async () => {
+    const h = herdrDeps({ focusResult: { stdout: "failed", exitCode: 1 } });
+    expect(await focusTerminalForPid(100, h.deps)).toEqual({ ok: false, reason: "herdr-cli-failed" });
+    expect(h.calls).toHaveLength(2);
+    expect(h.calls[1]).toEqual({ file: "herdr", args: ["tab", "focus", "w2:t8"] });
   });
 });

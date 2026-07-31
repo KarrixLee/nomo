@@ -36,7 +36,7 @@ import { decryptBlob, encryptBlob } from "../core/crypto";
 import { adapterFor, AgentAdapter, allAdapters, codexAdapter, CodexPlanPickerEvidence, DiscoveredSession } from "../core/adapter";
 import type { LocateTuiReason } from "../core/adapter";
 import { focusTerminalForPid } from "../core/terminal-focus";
-import type { FocusResult } from "../core/terminal-focus";
+import type { FocusContext, FocusResult } from "../core/terminal-focus";
 import { CodexRemoteInputBridge } from "../core/codex-remote-input-bridge";
 import type { CodexThreadWaitState } from "../core/codex-remote-input-bridge";
 import type { PlanPickerTraceDecision } from "../core/shared";
@@ -1074,8 +1074,9 @@ export interface DrainCommandsDeps {
   take?: () => SealedCommand[];
   /** Every session record on disk, id + record. Defaults to the sweep's own reader. */
   readRecords?: () => Promise<RecordEntry[]>;
-  /** Raise the window for a located pid. Defaults to the real macOS AppleScript path. */
-  focus?: (pid: number) => Promise<FocusResult>;
+  /** Raise the window for a located pid. The record context lets terminal-focus correlate a herdr
+   *  daemon-owned pty to its pane. Defaults to the real macOS focus path. */
+  focus?: (pid: number, context: FocusContext) => Promise<FocusResult>;
   /** The adapter registry the per-session locate dispatches through (same seam
    *  discoverLiveSessions / reconcileProvisionalsSweep expose), so a test can supply a locator
    *  without spawning a real `ps`. Defaults to the real registry. */
@@ -1114,7 +1115,7 @@ export async function drainCommands(config: Config, deps: DrainCommandsDeps = {}
     const pending = (deps.take ?? (() => commandBuffer.splice(0, commandBuffer.length)))();
     if (pending.length === 0) return 0;
     const readRecords = deps.readRecords ?? readAllRecordEntries;
-    const focus = deps.focus ?? ((pid: number) => focusTerminalForPid(pid));
+    const focus = deps.focus ?? ((pid: number, context: FocusContext) => focusTerminalForPid(pid, { context }));
     const now = (deps.now ?? Date.now)();
     let entries: RecordEntry[] | null = null;
     let focused = 0;
@@ -1211,16 +1212,24 @@ export async function drainCommands(config: Config, deps: DrainCommandsDeps = {}
           traceFocus(deps, { ...base, agent, result, reason: reason ?? "no-candidate" });
           continue;
         }
-        const outcome = await focus(pid);
+        const outcome = await focus(pid, { agent, record: entry.rec });
         if (outcome.ok) {
           focused += 1;
-          traceFocus(deps, { ...base, agent, pid, result: "focused" as FocusTraceResult, via: outcome.via, reason });
+          traceFocus(deps, {
+            ...base, agent, pid, result: "focused" as FocusTraceResult, via: outcome.via,
+            reason: outcome.reason ?? reason,
+          });
           continue;
         }
-        const result: FocusTraceResult = outcome.reason === "osascript-failed"
+        const result: FocusTraceResult = outcome.reason === "herdr-ambiguous"
+          ? "ambiguous"
+          : outcome.reason === "osascript-failed"
           ? "osascript-failed"
           : outcome.reason === "unsupported" ? "unsupported" : "no-candidate";
-        traceFocus(deps, { ...base, agent, pid, result, why: outcome.reason, reason });
+        const focusReason = outcome.reason === "herdr-cli-failed" || outcome.reason === "herdr-ambiguous"
+          ? outcome.reason
+          : reason;
+        traceFocus(deps, { ...base, agent, pid, result, why: outcome.reason, reason: focusReason });
       } catch {
         traceFocus(deps, { ...base, result: "no-candidate" as FocusTraceResult, why: "error" });
       }
