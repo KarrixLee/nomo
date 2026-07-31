@@ -92,7 +92,7 @@ import { appendFileSync, existsSync, readFileSync, statSync, truncateSync } from
 import { execFileSync, spawn } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "1.4.13";
+var PLUGIN_VERSION = "1.4.14";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -6056,7 +6056,7 @@ function shouldHeartbeat(record, now, lastHeartbeat, correctedThisSweep) {
     return false;
   return true;
 }
-var WAITING_HEARTBEAT_AFTER_MS = 1e4;
+var WAITING_HEARTBEAT_AFTER_MS = 5000;
 function isWaitingSession(record) {
   if (record.op === "done" || record.lastEvent === "done")
     return false;

@@ -2927,8 +2927,12 @@ describe("heartbeatKind (both cadences at once)", () => {
     expect(heartbeatKind(waiting(), now + WAITING_HEARTBEAT_AFTER_MS, undefined, now, false)).toBe("waiting");
   });
 
-  test("the fast beat never doubles up on the hook POST that just opened the episode", () => {
-    expect(heartbeatKind(waiting(), 1_000_000 + WAITING_HEARTBEAT_AFTER_MS - 1, undefined, undefined, false)).toBe("none");
+  test("the pairing fast-beat clock is closed at 5,000 ms", () => {
+    expect(WAITING_HEARTBEAT_AFTER_MS).toBe(5_000);
+    const lastBeat = 1_000_000;
+    const parked = waiting({ ts: lastBeat - 10_000 });
+    expect(heartbeatKind(parked, lastBeat + 4_999, undefined, lastBeat, false)).toBe("none");
+    expect(heartbeatKind(parked, lastBeat + 5_000, undefined, lastBeat, false)).toBe("waiting");
   });
 
   test("ONE pairing-wide clock: a second waiting session does not add POSTs in the same interval", () => {
@@ -2957,8 +2961,9 @@ describe("heartbeatKind (both cadences at once)", () => {
     expect(heartbeatKind(waiting({ ts: undefined as unknown as number }), now, undefined, undefined, false)).toBe("none");
   });
 
-  test("aggregate POST budget: the fast beat costs ≤6 /min for the WHOLE pairing (limit is 300/min)", () => {
-    // Drive a minute of 5-second sweeps with three waiting sessions and count the beats.
+  test("aggregate POST budget: the fast beat costs ≤12 /min for the WHOLE pairing (limit is 300/min)", () => {
+    // Drive a minute of 5-second sweeps with three waiting sessions and count the beats: at most
+    // 12 / 300 = 4% of the pairing's POST budget, and only while at least one session is waiting.
     const sessions = [waiting({ ts: 0 }), waiting({ ts: 0 }), waiting({ ts: 0 })];
     let lastWaitingBeat: number | undefined;
     let beats = 0;
@@ -2970,7 +2975,7 @@ describe("heartbeatKind (both cadences at once)", () => {
         }
       }
     }
-    expect(beats).toBeLessThanOrEqual(6);
+    expect(beats).toBeLessThanOrEqual(12);
     expect(beats).toBeGreaterThan(0);
   });
 });

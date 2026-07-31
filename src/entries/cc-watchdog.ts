@@ -2309,11 +2309,11 @@ export function shouldHeartbeat(record: SessionRecord, now: number, lastHeartbea
 // clock rather than a per-session one — so ten waiting sessions cost exactly what one costs.
 
 /** How long the pairing waits between fast beats while any session is parked on the user. Sized
- *  against the sweep cadence (POLL_MS = 5 s) so the worst-case pickup is ~15 s, and against the
+ *  against the sweep cadence (POLL_MS = 5 s) so the next sweep is eligible, and against the
  *  worker's 300-per-60-s-per-pairing /cc/event limit: because the throttle clock is per-PAIRING,
- *  this adds at most 6 POSTs per minute in total (2 % of the budget) no matter how many sessions
+ *  this adds at most 12 POSTs per minute in total (4 % of the budget) no matter how many sessions
  *  wait. Non-waiting sessions are untouched — they keep the 5-minute cadence exactly. */
-export const WAITING_HEARTBEAT_AFTER_MS = 10_000;
+export const WAITING_HEARTBEAT_AFTER_MS = 5_000;
 
 /** Is this session parked on the USER — a permission hold, a question, or the Codex plan picker?
  *  Pure, and the only thing the fast beat keys on:
