@@ -33,6 +33,14 @@ fi
 
 for v in "${before[@]:-}"; do
   [ -z "$v" ] && continue
+  [ "$v" = "$latest" ] && continue
+  # A prior backfill symlink survives the add but now DANGLES (its target dir
+  # was deleted) — `-e` follows links, so a dangling link reads as missing yet
+  # `ln` collides on it. Remove any symlink first, then (re)point at the new
+  # snapshot. Never touch real directories.
+  if [ -L "$CACHE/$v" ]; then
+    rm "$CACHE/$v"
+  fi
   if [ ! -e "$CACHE/$v" ]; then
     ln -s "$latest" "$CACHE/$v"
     echo "codex-install: backfilled $v -> $latest (open sessions keep working)"
