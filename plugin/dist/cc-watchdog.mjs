@@ -92,9 +92,9 @@ async function sha256Hex(s) {
 }
 
 // src/core/adapter.ts
-import { execFile } from "node:child_process";
+import { execFile as execFile2 } from "node:child_process";
 import { readdir, readFile as readFile2, stat as stat2 } from "node:fs/promises";
-import { promisify } from "node:util";
+import { promisify as promisify2 } from "node:util";
 import { basename, join as join2 } from "node:path";
 
 // src/core/shared.ts
@@ -103,7 +103,7 @@ import { appendFileSync, existsSync, readFileSync, statSync, truncateSync } from
 import { execFileSync, spawn } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "1.5.0";
+var PLUGIN_VERSION = "1.5.1";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -551,6 +551,40 @@ async function stampPermissionDetailFullAt(sessionsDir, sessionId, permissionDet
 async function stampPermissionDetailFull(sessionId, permissionDetailFull) {
   return stampPermissionDetailFullAt(SESSIONS_DIR, sessionId, permissionDetailFull);
 }
+var DECISION_HOLD_SUFFIX = ".hold";
+function decisionHoldFileName(sessionId) {
+  return `${sessionId}${DECISION_HOLD_SUFFIX}`;
+}
+async function writeDecisionHoldAt(sessionsDir, sessionId, hold) {
+  try {
+    await atomicWrite(`${sessionsDir}/${decisionHoldFileName(sessionId)}`, JSON.stringify(hold), 384);
+  } catch {}
+}
+async function clearDecisionHoldAt(sessionsDir, sessionId, pid) {
+  const path = `${sessionsDir}/${decisionHoldFileName(sessionId)}`;
+  try {
+    const raw = await readFile(path, "utf8").catch(() => {
+      return;
+    });
+    if (raw !== undefined) {
+      let owner;
+      try {
+        owner = JSON.parse(raw).pid;
+      } catch {
+        owner = undefined;
+      }
+      if (typeof owner === "number" && owner !== pid)
+        return;
+    }
+    await unlink(path).catch(() => {});
+  } catch {}
+}
+async function writeDecisionHold(sessionId, hold) {
+  return writeDecisionHoldAt(SESSIONS_DIR, sessionId, hold);
+}
+async function clearDecisionHold(sessionId, pid) {
+  return clearDecisionHoldAt(SESSIONS_DIR, sessionId, pid);
+}
 async function readPrefix(path, maxBytes) {
   const fh = await open(path, "r");
   try {
@@ -676,8 +710,313 @@ function codexCompanionBrokerEvidence(pid, ancestorsOf = pidAncestors, commandOf
   return null;
 }
 
-// src/core/adapter.ts
+// src/core/terminal-focus.ts
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 var execFileP = promisify(execFile);
+var OSASCRIPT_TIMEOUT_MS = 4000;
+var HERDR_TIMEOUT_MS = 4000;
+var HERDR_TAB_ID = /^[A-Za-z0-9:]+$/;
+function commandTokens(command) {
+  return command.trim().split(/\s+/).filter(Boolean);
+}
+function isHerdrCommand(command) {
+  if (typeof command !== "string")
+    return false;
+  const executable = commandTokens(command)[0]?.replace(/^['"]|['"]$/g, "");
+  return typeof executable === "string" && /(?:^|\/)herdr$/.test(executable);
+}
+function isHerdrServer(command) {
+  return typeof command === "string" && isHerdrCommand(command) && commandTokens(command).slice(1).includes("server");
+}
+function ancestryContainsHerdr(pid, ancestorsOf = pidAncestors, commandOf = pidCommand) {
+  let ancestors;
+  try {
+    ancestors = ancestorsOf(pid);
+  } catch {
+    ancestors = [];
+  }
+  for (const candidate of [pid, ...ancestors]) {
+    try {
+      if (isHerdrCommand(commandOf(candidate)))
+        return true;
+    } catch {}
+  }
+  return false;
+}
+function recordTitleMatchesPane(recordTitle, paneTitle) {
+  if (typeof recordTitle !== "string" || typeof paneTitle !== "string")
+    return false;
+  if (recordTitle === paneTitle)
+    return true;
+  const match = /^(.*?)(?:\u2026|\.{3})$/.exec(recordTitle);
+  return !!match && match[1].length > 0 && paneTitle.startsWith(match[1]);
+}
+function correlateHerdrPane(context, panes) {
+  let candidates = context.agent === "claude" ? panes.filter((pane) => pane.agent === "claude" && recordTitleMatchesPane(context.record.title, pane.terminal_title_stripped)) : panes.filter((pane) => pane.agent === "codex" && typeof context.record.origin?.cwd === "string" && context.record.origin.cwd.length > 0 && pane.cwd === context.record.origin.cwd);
+  if (candidates.length > 1) {
+    const working = candidates.filter((pane) => pane.agent_status === "working");
+    if (working.length > 0)
+      candidates = working;
+  }
+  return candidates.length === 1 ? candidates[0] : undefined;
+}
+function parseHerdrPanes(stdout) {
+  const parsed = JSON.parse(stdout);
+  const panes = parsed?.result?.panes;
+  if (!Array.isArray(panes))
+    throw new Error("invalid herdr pane list");
+  return panes.filter((value) => {
+    if (!value || typeof value !== "object")
+      return false;
+    const pane = value;
+    return typeof pane.agent === "string" && typeof pane.tab_id === "string";
+  });
+}
+function parsePsProcesses(stdout) {
+  const out = [];
+  for (const line of stdout.split(/\r?\n/)) {
+    const match = /^\s*(\d+)\s+(\S+)\s+(.+)$/.exec(line);
+    if (!match)
+      continue;
+    const pid = Number.parseInt(match[1], 10);
+    if (Number.isFinite(pid))
+      out.push({ pid, tty: match[2], command: match[3] });
+  }
+  return out;
+}
+async function runExecFile(file, args, options, deps) {
+  if (deps.execFile)
+    return deps.execFile(file, args, options);
+  const { stdout, stderr } = await execFileP(file, args, options);
+  return { stdout: String(stdout), stderr: String(stderr) };
+}
+var TERMINAL_APPS = [
+  { id: "terminal-app", bundleId: "com.apple.Terminal", match: /\/Terminal\.app\// },
+  { id: "iterm2", bundleId: "com.googlecode.iterm2", match: /\/iTerm\.app\/|\/iTerm2\.app\// },
+  { id: "ghostty", bundleId: "com.mitchellh.ghostty", match: /\/Ghostty\.app\/|(?:^|\/)ghostty(?:\s|$)/ },
+  { id: "wezterm", bundleId: "com.github.wez.wezterm", match: /\/WezTerm\.app\/|(?:^|\/)wezterm(?:-gui)?(?:\s|$)/ },
+  { id: "alacritty", bundleId: "org.alacritty", match: /\/Alacritty\.app\/|(?:^|\/)alacritty(?:\s|$)/ },
+  { id: "kitty", bundleId: "net.kovidgoyal.kitty", match: /\/kitty\.app\/|(?:^|\/)kitty(?:\s|$)/ },
+  { id: "hyper", bundleId: "co.zeit.hyper", match: /\/Hyper\.app\// },
+  { id: "warp", bundleId: "dev.warp.Warp-Stable", match: /\/Warp\.app\// },
+  { id: "vscode", bundleId: "com.microsoft.VSCode", match: /\/Visual Studio Code\.app\/|\/Code\.app\/|Code Helper/ }
+];
+function owningTerminalApp(pid, ancestorsOf = pidAncestors, commandOf = pidCommand) {
+  let chain = [];
+  try {
+    chain = ancestorsOf(pid);
+  } catch {
+    chain = [];
+  }
+  for (const candidate of [pid, ...chain]) {
+    let command;
+    try {
+      command = commandOf(candidate);
+    } catch {
+      continue;
+    }
+    if (typeof command !== "string" || command.length === 0)
+      continue;
+    const app = TERMINAL_APPS.find((a) => a.match.test(command));
+    if (app)
+      return app;
+  }
+  return;
+}
+function ttyDevicePath(raw) {
+  if (typeof raw !== "string")
+    return;
+  const trimmed = raw.trim();
+  if (!isRealTty(trimmed))
+    return;
+  const bare = trimmed.startsWith("/dev/") ? trimmed.slice(5) : trimmed;
+  const name = /^s[0-9]+$/.test(bare) ? `tty${bare}` : bare;
+  const path = `/dev/${name}`;
+  return isTtyDevicePath(path) ? path : undefined;
+}
+function isTtyDevicePath(path) {
+  return /^\/dev\/tty[a-z0-9]+$/.test(path);
+}
+function terminalAppScript(devPath) {
+  if (!isTtyDevicePath(devPath))
+    throw new Error("unsafe tty path");
+  return [
+    `tell application "Terminal"`,
+    `	repeat with w in windows`,
+    `		repeat with t in tabs of w`,
+    `			if tty of t is "${devPath}" then`,
+    `				set selected of t to true`,
+    `				set index of w to 1`,
+    `				activate`,
+    `				return "ok"`,
+    `			end if`,
+    `		end repeat`,
+    `	end repeat`,
+    `end tell`,
+    `return "none"`
+  ].join(`
+`);
+}
+function iterm2Script(devPath) {
+  if (!isTtyDevicePath(devPath))
+    throw new Error("unsafe tty path");
+  return [
+    `tell application "iTerm"`,
+    `	repeat with w in windows`,
+    `		repeat with t in tabs of w`,
+    `			repeat with s in sessions of t`,
+    `				if tty of s is "${devPath}" then`,
+    `					select s`,
+    `					select t`,
+    `					select w`,
+    `					activate`,
+    `					return "ok"`,
+    `				end if`,
+    `			end repeat`,
+    `		end repeat`,
+    `	end repeat`,
+    `end tell`,
+    `return "none"`
+  ].join(`
+`);
+}
+function activateScript(bundleId) {
+  if (!/^[A-Za-z0-9.\-]+$/.test(bundleId))
+    throw new Error("unsafe bundle id");
+  return `tell application id "${bundleId}" to activate`;
+}
+async function runOsascript(script) {
+  const { stdout } = await execFileP("osascript", ["-e", script], { timeout: OSASCRIPT_TIMEOUT_MS });
+  return String(stdout).trim();
+}
+async function ttyViaPs(pid) {
+  try {
+    const { stdout } = await execFileP("ps", ["-o", "tty=", "-p", String(pid)]);
+    const trimmed = stdout.trim();
+    return trimmed.length > 0 ? trimmed : undefined;
+  } catch {
+    return;
+  }
+}
+function note(deps, event) {
+  try {
+    deps.trace?.(event);
+  } catch {}
+}
+async function focusHerdr(pid, deps, ancestorsOf, commandOf) {
+  const context = deps.context;
+  if (!context) {
+    note(deps, { event: "terminal-focus", pid, result: "ambiguous", reason: "herdr-ambiguous" });
+    return { ok: false, reason: "herdr-ambiguous" };
+  }
+  let pane;
+  try {
+    const listed = await runExecFile("herdr", ["pane", "list"], { timeout: HERDR_TIMEOUT_MS }, deps);
+    if ((listed.exitCode ?? 0) !== 0)
+      throw new Error("herdr pane list failed");
+    pane = correlateHerdrPane(context, parseHerdrPanes(String(listed.stdout)));
+  } catch {
+    note(deps, { event: "terminal-focus", pid, result: "unsupported", reason: "herdr-cli-failed" });
+    return { ok: false, reason: "herdr-cli-failed" };
+  }
+  if (!pane) {
+    note(deps, { event: "terminal-focus", pid, result: "ambiguous", reason: "herdr-ambiguous" });
+    return { ok: false, reason: "herdr-ambiguous" };
+  }
+  if (!HERDR_TAB_ID.test(pane.tab_id)) {
+    note(deps, { event: "terminal-focus", pid, result: "unsupported", reason: "herdr-cli-failed" });
+    return { ok: false, reason: "herdr-cli-failed" };
+  }
+  try {
+    const focused = await runExecFile("herdr", ["tab", "focus", pane.tab_id], { timeout: HERDR_TIMEOUT_MS }, deps);
+    if ((focused.exitCode ?? 0) !== 0)
+      throw new Error("herdr tab focus failed");
+  } catch {
+    note(deps, { event: "terminal-focus", pid, result: "unsupported", reason: "herdr-cli-failed" });
+    return { ok: false, reason: "herdr-cli-failed" };
+  }
+  let app;
+  try {
+    const scanned = await runExecFile("ps", ["-axo", "pid=,tty=,args="], { timeout: HERDR_TIMEOUT_MS }, deps);
+    if ((scanned.exitCode ?? 0) === 0) {
+      const apps = new Map;
+      for (const process2 of parsePsProcesses(String(scanned.stdout))) {
+        if (!isRealTty(process2.tty) || !isHerdrCommand(process2.command) || isHerdrServer(process2.command))
+          continue;
+        const owner = owningTerminalApp(process2.pid, ancestorsOf, commandOf);
+        if (owner)
+          apps.set(owner.bundleId, owner);
+      }
+      if (apps.size === 1)
+        app = apps.values().next().value;
+    }
+  } catch {}
+  if (!app) {
+    note(deps, { event: "terminal-focus", pid, result: "focused", via: "herdr", reason: "focused-detached" });
+    return { ok: true, via: "herdr", reason: "focused-detached" };
+  }
+  try {
+    await (deps.osascript ?? runOsascript)(activateScript(app.bundleId));
+    note(deps, { event: "terminal-focus", pid, result: "focused", via: "herdr", app: app.id, reason: "herdr-focused" });
+    return { ok: true, via: "herdr", reason: "herdr-focused" };
+  } catch {
+    note(deps, { event: "terminal-focus", pid, result: "osascript-failed", app: app.id });
+    return { ok: false, reason: "osascript-failed" };
+  }
+}
+async function focusTerminalForPid(pid, deps = {}) {
+  try {
+    if ((deps.platform ?? process.platform) !== "darwin") {
+      note(deps, { event: "terminal-focus", pid, result: "unsupported", why: "not-darwin" });
+      return { ok: false, reason: "unsupported" };
+    }
+    const ancestorsOf = deps.ancestorsOf ?? pidAncestors;
+    const commandOf = deps.commandOf ?? pidCommand;
+    if (ancestryContainsHerdr(pid, ancestorsOf, commandOf)) {
+      return await focusHerdr(pid, deps, ancestorsOf, commandOf);
+    }
+    let rawTty;
+    try {
+      rawTty = await (deps.ttyOf ?? ttyViaPs)(pid);
+    } catch {
+      rawTty = undefined;
+    }
+    const devPath = ttyDevicePath(rawTty);
+    if (devPath === undefined) {
+      note(deps, { event: "terminal-focus", pid, result: "no-tty", tty: rawTty ?? "" });
+      return { ok: false, reason: "no-tty" };
+    }
+    const app = owningTerminalApp(pid, ancestorsOf, commandOf);
+    if (!app) {
+      note(deps, { event: "terminal-focus", pid, result: "unsupported", why: "no-owning-app" });
+      return { ok: false, reason: "unsupported" };
+    }
+    const osascript = deps.osascript ?? runOsascript;
+    try {
+      if (app.id === "terminal-app" || app.id === "iterm2") {
+        const script = app.id === "terminal-app" ? terminalAppScript(devPath) : iterm2Script(devPath);
+        const out = await osascript(script);
+        if (String(out).trim() === "ok") {
+          const via = app.id === "terminal-app" ? "terminal-app" : "iterm2";
+          note(deps, { event: "terminal-focus", pid, result: "focused", via, app: app.id });
+          return { ok: true, via };
+        }
+      }
+      await osascript(activateScript(app.bundleId));
+      note(deps, { event: "terminal-focus", pid, result: "focused", via: "app-activate", app: app.id });
+      return { ok: true, via: "app-activate" };
+    } catch {
+      note(deps, { event: "terminal-focus", pid, result: "osascript-failed", app: app.id });
+      return { ok: false, reason: "osascript-failed" };
+    }
+  } catch {
+    return { ok: false, reason: "osascript-failed" };
+  }
+}
+
+// src/core/adapter.ts
+var execFileP2 = promisify2(execFile2);
 var claudeToolDetail = {
   Bash: "running",
   Edit: "editing",
@@ -1374,7 +1713,7 @@ function rolloutPathFromLsof(output) {
 }
 async function rolloutViaLsof(pid) {
   try {
-    const { stdout } = await execFileP("lsof", ["-a", "-p", String(pid), "-Fn"]);
+    const { stdout } = await execFileP2("lsof", ["-a", "-p", String(pid), "-Fn"]);
     return rolloutPathFromLsof(stdout);
   } catch {
     return;
@@ -1538,12 +1877,12 @@ function labelFromCwd(cwd) {
   return b.length > 0 ? b : "session";
 }
 async function runPs() {
-  const { stdout } = await execFileP("ps", ["-axo", "pid=,tty=,args="]);
+  const { stdout } = await execFileP2("ps", ["-axo", "pid=,tty=,args="]);
   return stdout;
 }
 async function cwdViaLsof(pid) {
   try {
-    const { stdout } = await execFileP("lsof", ["-a", "-p", String(pid), "-d", "cwd", "-Fn"]);
+    const { stdout } = await execFileP2("lsof", ["-a", "-p", String(pid), "-d", "cwd", "-Fn"]);
     for (const line of stdout.split(`
 `))
       if (line.startsWith("n"))
@@ -1555,7 +1894,7 @@ async function cwdViaLsof(pid) {
 }
 async function processStartedAtViaPs(pid) {
   try {
-    const { stdout } = await execFileP("ps", ["-p", String(pid), "-o", "lstart="]);
+    const { stdout } = await execFileP2("ps", ["-p", String(pid), "-o", "lstart="]);
     const value = Date.parse(stdout.trim());
     return Number.isFinite(value) ? value : undefined;
   } catch {
@@ -1596,9 +1935,9 @@ async function codexDiscoverLive(known, deps = {}) {
   }
   return out;
 }
-async function ttyViaPs(pid) {
+async function ttyViaPs2(pid) {
   try {
-    const { stdout } = await execFileP("ps", ["-o", "tty=", "-p", String(pid)]);
+    const { stdout } = await execFileP2("ps", ["-o", "tty=", "-p", String(pid)]);
     const trimmed = stdout.trim();
     return trimmed.length > 0 ? trimmed : undefined;
   } catch {
@@ -1607,7 +1946,7 @@ async function ttyViaPs(pid) {
 }
 async function startTimeViaPs(pid) {
   try {
-    const { stdout } = await execFileP("ps", ["-o", "lstart=", "-p", String(pid)]);
+    const { stdout } = await execFileP2("ps", ["-o", "lstart=", "-p", String(pid)]);
     const parsed = Date.parse(stdout.trim());
     return Number.isFinite(parsed) ? parsed : undefined;
   } catch {
@@ -1722,9 +2061,13 @@ async function claudeLocateTuiPid(ctx, deps = {}) {
       noteLocate(deps, "no-candidate");
       return;
     }
+    if (ancestryContainsHerdr(pid, deps.ancestorsOf ?? pidAncestors, deps.commandOf ?? pidCommand)) {
+      noteLocate(deps, "record-pid");
+      return pid;
+    }
     let tty;
     try {
-      tty = await (deps.ttyOf ?? ttyViaPs)(pid);
+      tty = await (deps.ttyOf ?? ttyViaPs2)(pid);
     } catch {
       tty = undefined;
     }
@@ -1945,311 +2288,6 @@ function adapterFor(agent) {
   return agent === "codex" ? codexAdapter : claudeAdapter;
 }
 var allAdapters = [claudeAdapter, codexAdapter];
-
-// src/core/terminal-focus.ts
-import { execFile as execFile2 } from "node:child_process";
-import { promisify as promisify2 } from "node:util";
-var execFileP2 = promisify2(execFile2);
-var OSASCRIPT_TIMEOUT_MS = 4000;
-var HERDR_TIMEOUT_MS = 4000;
-var HERDR_TAB_ID = /^[A-Za-z0-9:]+$/;
-function commandTokens(command) {
-  return command.trim().split(/\s+/).filter(Boolean);
-}
-function isHerdrCommand(command) {
-  if (typeof command !== "string")
-    return false;
-  const executable = commandTokens(command)[0]?.replace(/^['"]|['"]$/g, "");
-  return typeof executable === "string" && /(?:^|\/)herdr$/.test(executable);
-}
-function isHerdrServer(command) {
-  return typeof command === "string" && isHerdrCommand(command) && commandTokens(command).slice(1).includes("server");
-}
-function ancestryContainsHerdr(pid, ancestorsOf, commandOf) {
-  let ancestors;
-  try {
-    ancestors = ancestorsOf(pid);
-  } catch {
-    ancestors = [];
-  }
-  for (const candidate of [pid, ...ancestors]) {
-    try {
-      if (isHerdrCommand(commandOf(candidate)))
-        return true;
-    } catch {}
-  }
-  return false;
-}
-function recordTitleMatchesPane(recordTitle, paneTitle) {
-  if (typeof recordTitle !== "string" || typeof paneTitle !== "string")
-    return false;
-  if (recordTitle === paneTitle)
-    return true;
-  const match = /^(.*?)(?:\u2026|\.{3})$/.exec(recordTitle);
-  return !!match && match[1].length > 0 && paneTitle.startsWith(match[1]);
-}
-function correlateHerdrPane(context, panes) {
-  let candidates = context.agent === "claude" ? panes.filter((pane) => pane.agent === "claude" && recordTitleMatchesPane(context.record.title, pane.terminal_title_stripped)) : panes.filter((pane) => pane.agent === "codex" && typeof context.record.origin?.cwd === "string" && context.record.origin.cwd.length > 0 && pane.cwd === context.record.origin.cwd);
-  if (candidates.length > 1) {
-    const working = candidates.filter((pane) => pane.agent_status === "working");
-    if (working.length > 0)
-      candidates = working;
-  }
-  return candidates.length === 1 ? candidates[0] : undefined;
-}
-function parseHerdrPanes(stdout) {
-  const parsed = JSON.parse(stdout);
-  const panes = parsed?.result?.panes;
-  if (!Array.isArray(panes))
-    throw new Error("invalid herdr pane list");
-  return panes.filter((value) => {
-    if (!value || typeof value !== "object")
-      return false;
-    const pane = value;
-    return typeof pane.agent === "string" && typeof pane.tab_id === "string";
-  });
-}
-function parsePsProcesses(stdout) {
-  const out = [];
-  for (const line of stdout.split(/\r?\n/)) {
-    const match = /^\s*(\d+)\s+(\S+)\s+(.+)$/.exec(line);
-    if (!match)
-      continue;
-    const pid = Number.parseInt(match[1], 10);
-    if (Number.isFinite(pid))
-      out.push({ pid, tty: match[2], command: match[3] });
-  }
-  return out;
-}
-async function runExecFile(file, args, options, deps) {
-  if (deps.execFile)
-    return deps.execFile(file, args, options);
-  const { stdout, stderr } = await execFileP2(file, args, options);
-  return { stdout: String(stdout), stderr: String(stderr) };
-}
-var TERMINAL_APPS = [
-  { id: "terminal-app", bundleId: "com.apple.Terminal", match: /\/Terminal\.app\// },
-  { id: "iterm2", bundleId: "com.googlecode.iterm2", match: /\/iTerm\.app\/|\/iTerm2\.app\// },
-  { id: "ghostty", bundleId: "com.mitchellh.ghostty", match: /\/Ghostty\.app\/|(?:^|\/)ghostty(?:\s|$)/ },
-  { id: "wezterm", bundleId: "com.github.wez.wezterm", match: /\/WezTerm\.app\/|(?:^|\/)wezterm(?:-gui)?(?:\s|$)/ },
-  { id: "alacritty", bundleId: "org.alacritty", match: /\/Alacritty\.app\/|(?:^|\/)alacritty(?:\s|$)/ },
-  { id: "kitty", bundleId: "net.kovidgoyal.kitty", match: /\/kitty\.app\/|(?:^|\/)kitty(?:\s|$)/ },
-  { id: "hyper", bundleId: "co.zeit.hyper", match: /\/Hyper\.app\// },
-  { id: "warp", bundleId: "dev.warp.Warp-Stable", match: /\/Warp\.app\// },
-  { id: "vscode", bundleId: "com.microsoft.VSCode", match: /\/Visual Studio Code\.app\/|\/Code\.app\/|Code Helper/ }
-];
-function owningTerminalApp(pid, ancestorsOf = pidAncestors, commandOf = pidCommand) {
-  let chain = [];
-  try {
-    chain = ancestorsOf(pid);
-  } catch {
-    chain = [];
-  }
-  for (const candidate of [pid, ...chain]) {
-    let command;
-    try {
-      command = commandOf(candidate);
-    } catch {
-      continue;
-    }
-    if (typeof command !== "string" || command.length === 0)
-      continue;
-    const app = TERMINAL_APPS.find((a) => a.match.test(command));
-    if (app)
-      return app;
-  }
-  return;
-}
-function ttyDevicePath(raw) {
-  if (typeof raw !== "string")
-    return;
-  const trimmed = raw.trim();
-  if (!isRealTty(trimmed))
-    return;
-  const bare = trimmed.startsWith("/dev/") ? trimmed.slice(5) : trimmed;
-  const name = /^s[0-9]+$/.test(bare) ? `tty${bare}` : bare;
-  const path = `/dev/${name}`;
-  return isTtyDevicePath(path) ? path : undefined;
-}
-function isTtyDevicePath(path) {
-  return /^\/dev\/tty[a-z0-9]+$/.test(path);
-}
-function terminalAppScript(devPath) {
-  if (!isTtyDevicePath(devPath))
-    throw new Error("unsafe tty path");
-  return [
-    `tell application "Terminal"`,
-    `	repeat with w in windows`,
-    `		repeat with t in tabs of w`,
-    `			if tty of t is "${devPath}" then`,
-    `				set selected of t to true`,
-    `				set index of w to 1`,
-    `				activate`,
-    `				return "ok"`,
-    `			end if`,
-    `		end repeat`,
-    `	end repeat`,
-    `end tell`,
-    `return "none"`
-  ].join(`
-`);
-}
-function iterm2Script(devPath) {
-  if (!isTtyDevicePath(devPath))
-    throw new Error("unsafe tty path");
-  return [
-    `tell application "iTerm"`,
-    `	repeat with w in windows`,
-    `		repeat with t in tabs of w`,
-    `			repeat with s in sessions of t`,
-    `				if tty of s is "${devPath}" then`,
-    `					select s`,
-    `					select t`,
-    `					select w`,
-    `					activate`,
-    `					return "ok"`,
-    `				end if`,
-    `			end repeat`,
-    `		end repeat`,
-    `	end repeat`,
-    `end tell`,
-    `return "none"`
-  ].join(`
-`);
-}
-function activateScript(bundleId) {
-  if (!/^[A-Za-z0-9.\-]+$/.test(bundleId))
-    throw new Error("unsafe bundle id");
-  return `tell application id "${bundleId}" to activate`;
-}
-async function runOsascript(script) {
-  const { stdout } = await execFileP2("osascript", ["-e", script], { timeout: OSASCRIPT_TIMEOUT_MS });
-  return String(stdout).trim();
-}
-async function ttyViaPs2(pid) {
-  try {
-    const { stdout } = await execFileP2("ps", ["-o", "tty=", "-p", String(pid)]);
-    const trimmed = stdout.trim();
-    return trimmed.length > 0 ? trimmed : undefined;
-  } catch {
-    return;
-  }
-}
-function note(deps, event) {
-  try {
-    deps.trace?.(event);
-  } catch {}
-}
-async function focusHerdr(pid, deps, ancestorsOf, commandOf) {
-  const context = deps.context;
-  if (!context) {
-    note(deps, { event: "terminal-focus", pid, result: "ambiguous", reason: "herdr-ambiguous" });
-    return { ok: false, reason: "herdr-ambiguous" };
-  }
-  let pane;
-  try {
-    const listed = await runExecFile("herdr", ["pane", "list"], { timeout: HERDR_TIMEOUT_MS }, deps);
-    if ((listed.exitCode ?? 0) !== 0)
-      throw new Error("herdr pane list failed");
-    pane = correlateHerdrPane(context, parseHerdrPanes(String(listed.stdout)));
-  } catch {
-    note(deps, { event: "terminal-focus", pid, result: "unsupported", reason: "herdr-cli-failed" });
-    return { ok: false, reason: "herdr-cli-failed" };
-  }
-  if (!pane) {
-    note(deps, { event: "terminal-focus", pid, result: "ambiguous", reason: "herdr-ambiguous" });
-    return { ok: false, reason: "herdr-ambiguous" };
-  }
-  if (!HERDR_TAB_ID.test(pane.tab_id)) {
-    note(deps, { event: "terminal-focus", pid, result: "unsupported", reason: "herdr-cli-failed" });
-    return { ok: false, reason: "herdr-cli-failed" };
-  }
-  try {
-    const focused = await runExecFile("herdr", ["tab", "focus", pane.tab_id], { timeout: HERDR_TIMEOUT_MS }, deps);
-    if ((focused.exitCode ?? 0) !== 0)
-      throw new Error("herdr tab focus failed");
-  } catch {
-    note(deps, { event: "terminal-focus", pid, result: "unsupported", reason: "herdr-cli-failed" });
-    return { ok: false, reason: "herdr-cli-failed" };
-  }
-  let app;
-  try {
-    const scanned = await runExecFile("ps", ["-axo", "pid=,tty=,args="], { timeout: HERDR_TIMEOUT_MS }, deps);
-    if ((scanned.exitCode ?? 0) === 0) {
-      const apps = new Map;
-      for (const process2 of parsePsProcesses(String(scanned.stdout))) {
-        if (!isRealTty(process2.tty) || !isHerdrCommand(process2.command) || isHerdrServer(process2.command))
-          continue;
-        const owner = owningTerminalApp(process2.pid, ancestorsOf, commandOf);
-        if (owner)
-          apps.set(owner.bundleId, owner);
-      }
-      if (apps.size === 1)
-        app = apps.values().next().value;
-    }
-  } catch {}
-  if (!app) {
-    note(deps, { event: "terminal-focus", pid, result: "focused", via: "herdr", reason: "focused-detached" });
-    return { ok: true, via: "herdr", reason: "focused-detached" };
-  }
-  try {
-    await (deps.osascript ?? runOsascript)(activateScript(app.bundleId));
-    note(deps, { event: "terminal-focus", pid, result: "focused", via: "herdr", app: app.id, reason: "herdr-focused" });
-    return { ok: true, via: "herdr", reason: "herdr-focused" };
-  } catch {
-    note(deps, { event: "terminal-focus", pid, result: "osascript-failed", app: app.id });
-    return { ok: false, reason: "osascript-failed" };
-  }
-}
-async function focusTerminalForPid(pid, deps = {}) {
-  try {
-    if ((deps.platform ?? process.platform) !== "darwin") {
-      note(deps, { event: "terminal-focus", pid, result: "unsupported", why: "not-darwin" });
-      return { ok: false, reason: "unsupported" };
-    }
-    let rawTty;
-    try {
-      rawTty = await (deps.ttyOf ?? ttyViaPs2)(pid);
-    } catch {
-      rawTty = undefined;
-    }
-    const devPath = ttyDevicePath(rawTty);
-    if (devPath === undefined) {
-      note(deps, { event: "terminal-focus", pid, result: "no-tty", tty: rawTty ?? "" });
-      return { ok: false, reason: "no-tty" };
-    }
-    const ancestorsOf = deps.ancestorsOf ?? pidAncestors;
-    const commandOf = deps.commandOf ?? pidCommand;
-    if (ancestryContainsHerdr(pid, ancestorsOf, commandOf)) {
-      return await focusHerdr(pid, deps, ancestorsOf, commandOf);
-    }
-    const app = owningTerminalApp(pid, ancestorsOf, commandOf);
-    if (!app) {
-      note(deps, { event: "terminal-focus", pid, result: "unsupported", why: "no-owning-app" });
-      return { ok: false, reason: "unsupported" };
-    }
-    const osascript = deps.osascript ?? runOsascript;
-    try {
-      if (app.id === "terminal-app" || app.id === "iterm2") {
-        const script = app.id === "terminal-app" ? terminalAppScript(devPath) : iterm2Script(devPath);
-        const out = await osascript(script);
-        if (String(out).trim() === "ok") {
-          const via = app.id === "terminal-app" ? "terminal-app" : "iterm2";
-          note(deps, { event: "terminal-focus", pid, result: "focused", via, app: app.id });
-          return { ok: true, via };
-        }
-      }
-      await osascript(activateScript(app.bundleId));
-      note(deps, { event: "terminal-focus", pid, result: "focused", via: "app-activate", app: app.id });
-      return { ok: true, via: "app-activate" };
-    } catch {
-      note(deps, { event: "terminal-focus", pid, result: "osascript-failed", app: app.id });
-      return { ok: false, reason: "osascript-failed" };
-    }
-  } catch {
-    return { ok: false, reason: "osascript-failed" };
-  }
-}
 
 // src/core/codex-app-server-client.ts
 var DEFAULT_RECONNECT_DELAY_MS = 1000;
@@ -3246,6 +3284,7 @@ var LAN_FRAME_RETIRE_GRACE_MS = 60000;
 var LAN_FRAMES_WATCH_DEBOUNCE_MS = 100;
 var LAN_FRAMES_WAITERS_MAX = 4;
 var LAN_FRAME_SESSION_STALE_MS = 86400000;
+var LAN_HOLD_MAX_AGE_MS = 600000;
 function lanFrameSessionLive(record, now, isAlive) {
   if (typeof record.pid !== "number" || !Number.isFinite(record.pid))
     return false;
@@ -3255,13 +3294,23 @@ function lanFrameSessionLive(record, now, isAlive) {
     return false;
   return isAlive(record.pid);
 }
-function lanFrameContent(record, pairingId) {
+function lanFrameContent(record, pairingId, hold = null, now = Date.now(), isAlive = pidAlive) {
   if (typeof record.blob !== "string" || record.blob.length === 0)
     return null;
   if (pairingId === undefined || record.pairingId !== pairingId)
     return null;
   if (typeof record.ts !== "number" || !Number.isFinite(record.ts))
     return null;
+  if (lanHoldLive(hold, record, now, isAlive)) {
+    return {
+      op: "update",
+      prio: 1,
+      ts: Math.max(record.ts, hold.at),
+      blob: hold.blob,
+      ...record.agent === "codex" ? { agent: "codex" } : {},
+      ...record.attentionKind === "userInput" ? { attentionKind: "userInput" } : {}
+    };
+  }
   const prio = record.prio === 1 ? 1 : 0;
   return {
     op: record.op ?? "update",
@@ -3271,6 +3320,18 @@ function lanFrameContent(record, pairingId) {
     ...record.agent === "codex" ? { agent: "codex" } : {},
     ...prio === 1 && record.attentionKind === "userInput" ? { attentionKind: "userInput" } : {}
   };
+}
+function lanHoldLive(hold, record, now, isAlive) {
+  if (!hold || typeof hold.blob !== "string" || hold.blob.length === 0)
+    return false;
+  if (typeof hold.at !== "number" || !Number.isFinite(hold.at))
+    return false;
+  if (now - hold.at > LAN_HOLD_MAX_AGE_MS)
+    return false;
+  if (typeof hold.pid !== "number" || !Number.isFinite(hold.pid) || !isAlive(hold.pid))
+    return false;
+  const suppressible = (record.op ?? "update") === "update" && record.prio === 1;
+  return record.ts <= hold.at || suppressible;
 }
 function defaultWatchDir(dir, onChange) {
   try {
@@ -3348,6 +3409,11 @@ function createLanFrameStore(deps = {}) {
     }
     let changed = false;
     const seen = new Set;
+    const held = new Set;
+    for (const file of files) {
+      if (file.endsWith(DECISION_HOLD_SUFFIX))
+        held.add(file.slice(0, -DECISION_HOLD_SUFFIX.length));
+    }
     for (const file of files) {
       if (!file.endsWith(".json"))
         continue;
@@ -3361,7 +3427,15 @@ function createLanFrameStore(deps = {}) {
       } catch {
         continue;
       }
-      const content = lanFrameContent(record, pairingId);
+      let hold = null;
+      if (held.has(sessionId)) {
+        try {
+          hold = JSON.parse(await readFile3(`${sessionsDir}/${decisionHoldFileName(sessionId)}`, "utf8"));
+        } catch {
+          hold = null;
+        }
+      }
+      const content = lanFrameContent(record, pairingId, hold, at, isAlive);
       if (!content)
         continue;
       changed = lanFrameSessionLive(record, at, isAlive) ? stamp(sessionId, content) || changed : stamp(sessionId, terminalContent({ seq: 0, sessionId, ...content }, at), at) || changed;
@@ -4181,6 +4255,7 @@ async function trackSessionAt(sessionsDir, sessionId, op, prio, status, blob, ma
     const path = `${sessionsDir}/${sessionId}.json`;
     if (op === "end") {
       await unlink2(path).catch(() => {});
+      await unlink2(`${sessionsDir}/${decisionHoldFileName(sessionId)}`).catch(() => {});
       return;
     }
     const recordedAt = Date.now();
@@ -5151,6 +5226,12 @@ function defaultLanStatePath() {
 function defaultStampDetailFull() {
   return lanRunningUnderTest() ? async () => {} : stampPermissionDetailFull;
 }
+function defaultWriteHold() {
+  return lanRunningUnderTest() ? async () => {} : writeDecisionHold;
+}
+function defaultClearHold() {
+  return lanRunningUnderTest() ? async () => {} : clearDecisionHold;
+}
 async function readStdin2() {
   const chunks = [];
   for await (const chunk of process.stdin)
@@ -5161,6 +5242,7 @@ async function runPermissionHook(deps = {}, agent = "claude") {
   const noHoldPath = deps.noHoldPath ?? NO_HOLD_PATH;
   const trace = deps.trace ?? defaultTrace();
   let loopback;
+  let heldSessionId;
   try {
     if (await flagExists(noHoldPath)) {
       await (deps.delegate ?? (() => runHook(agent)))();
@@ -5342,6 +5424,8 @@ async function runPermissionHook(deps = {}, agent = "claude") {
         return;
       }
     }
+    await (deps.writeHoldFn ?? defaultWriteHold())(sessionId, { blob, at: (deps.now ?? Date.now)(), pid: deps.holdPid ?? process.pid });
+    heldSessionId = sessionId;
     const jitter = deps.jitter ?? (() => Math.floor(Math.random() * 500));
     const interval = deps.pollIntervalMs ?? POLL_INTERVAL_MS;
     const emit = deps.emit ?? ((line) => process.stdout.write(`${line}
@@ -5422,6 +5506,11 @@ async function runPermissionHook(deps = {}, agent = "claude") {
     try {
       loopback?.stop();
     } catch {}
+    if (heldSessionId !== undefined) {
+      try {
+        await (deps.clearHoldFn ?? defaultClearHold())(heldSessionId, deps.holdPid ?? process.pid);
+      } catch {}
+    }
   }
 }
 async function approvalsCommand(sub, deps = {}) {
