@@ -9,6 +9,7 @@ import {
   lanFrameSessionLive,
   LAN_FRAMES_WAITERS_MAX,
   LAN_FRAME_RETIRE_GRACE_MS,
+  LAN_FRAME_SESSION_STALE_MS,
 } from "./lan-frames";
 import type { LanFrame, LanFramesSlice, LanFrameStore } from "./lan-frames";
 import {
@@ -31,9 +32,13 @@ import {
   LAN_TTL_MS,
   parseLanEnvelope,
   parseLanFramesRequest,
+  parseLanReadRequest,
   parseLanState,
 } from "./lan-listener";
 import type { LanAnswerDelivery, LanAnswerStore, LanCommand, LanListener } from "./lan-listener";
+import {
+  BLOB_FIT_CHARS, fullTextForRecord, RECORD_FULL_TEXT_MAX_CHARS, RECORD_FULL_TEXT_TRUNCATION_MARKER,
+} from "./shared";
 import type { Config, SessionRecord } from "./shared";
 
 // Every listener binds LOOPBACK in tests: a `bun test` run must never open a port to the network the
@@ -236,8 +241,8 @@ describe("POST /v1/lan — the happy paths", () => {
     const dir = await stateDir();
     const { port } = await startListener({ statePath: join(dir, "lan.json"), cfg });
     const n = nonce();
-    // Deliberately an op no build implements (phase 3 took "frames"; phase 4 will take "read").
-    const res = await post(port, await sealRequest(cfg, { op: "read", ts: Date.now(), nonce: n, payload: {} }));
+    // Deliberately an op no build implements (phase 3 took "frames", phase 4 took "read").
+    const res = await post(port, await sealRequest(cfg, { op: "transcript", ts: Date.now(), nonce: n, payload: {} }));
     expect(res.status).toBe(200);
     const opened = await openResponse(cfg, res.json);
     expect(opened.reqNonce).toBe(n);
@@ -1258,5 +1263,184 @@ describe("POST /v1/lan — op:frames", () => {
     listener.stop(); // teardown seam: the frame store's waiters are resolved before the sockets die
     await held;      // resolves (answered or socket-closed) — what must NOT happen is a 20 s hang
     expect(Date.now() - started).toBeLessThan(2_000);
+  });
+});
+
+describe("read — the unabridged pull (phase 4)", () => {
+  const NOW = 1_800_000_000_000;
+  const stores: LanFrameStore[] = [];
+
+  afterEach(() => {
+    while (stores.length > 0) {
+      try { stores.pop()?.stop(); } catch { /* already stopped */ }
+    }
+  });
+
+  async function fed(over: Record<string, unknown> = {}): Promise<{ dir: string; store: LanFrameStore }> {
+    const dir = await mkdtemp(join(tmpdir(), "nomo-read-"));
+    tmpDirs.push(dir);
+    const store = createLanFrameStore({ sessionsDir: dir, isAlive: () => true, now: () => NOW, ...over });
+    stores.push(store);
+    store.setPairing("pairing-abc");
+    return { dir, store };
+  }
+
+  const write = (dir: string, sessionId: string, over: Partial<SessionRecord> = {}): Promise<void> =>
+    writeFile(join(dir, `${sessionId}.json`), JSON.stringify({
+      pid: 4242, machine: "mac-mini", label: "api-status", ts: NOW,
+      op: "update", prio: 1, blob: "sealed-blob", pairingId: "pairing-abc", ...over,
+    }));
+
+  // --- the store's own read path ---------------------------------------------------------------
+
+  test("serves the whole plan / permission detail, complete:true, straight off the record", async () => {
+    const { dir, store } = await fed();
+    const plan = `# Plan\n${"step\n".repeat(2000)}`;
+    await write(dir, "s1", { planFull: plan, permissionDetailFull: "ls -la\n".repeat(500) });
+    expect(await store.readFull("s1", "plan")).toEqual({ content: plan, complete: true });
+    expect(await store.readFull("s1", "permission-detail")).toEqual({ content: "ls -la\n".repeat(500), complete: true });
+  });
+
+  test("a record clipped by the 256 K cap reports complete:false instead of pretending it ended there", async () => {
+    const { dir, store } = await fed();
+    const clipped = fullTextForRecord("x".repeat(RECORD_FULL_TEXT_MAX_CHARS + 1_000), "…")!;
+    await write(dir, "s1", { planFull: clipped });
+    const hit = await store.readFull("s1", "plan");
+    expect(hit?.complete).toBe(false);
+    expect(Array.from(hit!.content).length).toBe(RECORD_FULL_TEXT_MAX_CHARS);
+    expect(hit!.content.endsWith(RECORD_FULL_TEXT_TRUNCATION_MARKER)).toBe(true);
+  });
+
+  test("null for every miss: unknown session, ANOTHER pairing, an expired record, or an absent field", async () => {
+    const { dir, store } = await fed();
+    await write(dir, "s1", { planFull: "kept" });                                   // has a plan, no detail
+    await write(dir, "s2", { planFull: "other", pairingId: "pairing-was-rotated" }); // not ours to serve
+    await write(dir, "s3", { planFull: "old", ts: NOW - LAN_FRAME_SESSION_STALE_MS - 1 });
+    expect(await store.readFull("nope", "plan")).toBeNull();               // unknown session
+    expect(await store.readFull("s1", "permission-detail")).toBeNull();    // field never truncated
+    expect(await store.readFull("s2", "plan")).toBeNull();                 // wrong pairing
+    expect(await store.readFull("s3", "plan")).toBeNull();                 // past the 24 h cap
+  });
+
+  test("a session id outside the charset gate can never become a path — no traversal, just null", async () => {
+    const { dir, store } = await fed();
+    await writeFile(join(dir, "secret.json"), JSON.stringify({
+      pid: 1, machine: "m", label: "l", ts: NOW, blob: "b", pairingId: "pairing-abc", planFull: "TOP SECRET",
+    }));
+    for (const id of ["../secret", "s1/../secret", "s1.json", "", "a".repeat(129)]) {
+      expect(await store.readFull(id, "plan")).toBeNull();
+    }
+  });
+
+  test("a record from an OLD plugin (neither field) reads back null rather than throwing", async () => {
+    const { dir, store } = await fed();
+    await writeFile(join(dir, "s1.json"), JSON.stringify({
+      pid: 4242, machine: "mac", label: "proj", ts: NOW, op: "update", prio: 1, blob: "B", pairingId: "pairing-abc",
+    }));
+    expect(await store.readFull("s1", "plan")).toBeNull();
+    expect(await store.readFull("s1", "permission-detail")).toBeNull();
+    // …and a corrupt file is a miss too, never a throw.
+    await writeFile(join(dir, "s2.json"), "{ not json");
+    expect(await store.readFull("s2", "plan")).toBeNull();
+  });
+
+  test("a store with no session dir (the `bun test` default) serves nothing", async () => {
+    const store = createLanFrameStore({ now: () => NOW });
+    stores.push(store);
+    store.setPairing("pairing-abc");
+    expect(await store.readFull("s1", "plan")).toBeNull();
+  });
+
+  test("a session that went terminal is still readable — the plan does not vanish with the process", async () => {
+    const { dir, store } = await fed({ isAlive: () => false });
+    await write(dir, "s1", { planFull: "the plan the user is reading" });
+    expect(await store.readFull("s1", "plan")).toEqual({ content: "the plan the user is reading", complete: true });
+  });
+
+  // --- the wire op -----------------------------------------------------------------------------
+
+  test("op:read answers a SEALED {ok,content,complete} — full content, no worker ceiling in sight", async () => {
+    const cfg = config();
+    const { dir, store } = await fed();
+    const plan = `# Plan\n${"a long line of plan markdown\n".repeat(400)}`;
+    await write(dir, "s1", { planFull: plan });
+    const sdir = await stateDir();
+    const { port } = await startListener({ statePath: join(sdir, "lan.json"), frames: store, cfg });
+
+    const n = nonce();
+    const res = await post(port, await sealRequest(cfg, {
+      op: "read", ts: Date.now(), nonce: n, payload: { what: "plan", sessionId: "s1" },
+    }));
+    expect(res.status).toBe(200);
+    const opened = await openResponse(cfg, res.json);
+    expect(opened.reqNonce).toBe(n);
+    expect(opened.payload).toEqual({ ok: true, content: plan, complete: true });
+    // Well past what the worker's 3072-char sealed ceiling could ever have carried.
+    expect(plan.length).toBeGreaterThan(BLOB_FIT_CHARS * 3);
+  });
+
+  test("op:read serves the permission detail the decision frame had to cut", async () => {
+    const cfg = config();
+    const { dir, store } = await fed();
+    const detail = "for f in *; do echo \"$f\"; done\n".repeat(300);
+    await write(dir, "s1", { permissionDetailFull: detail });
+    const sdir = await stateDir();
+    const { port } = await startListener({ statePath: join(sdir, "lan.json"), frames: store, cfg });
+    const res = await post(port, await sealRequest(cfg, {
+      op: "read", ts: Date.now(), nonce: nonce(), payload: { what: "permission-detail", sessionId: "s1" },
+    }));
+    expect((await openResponse(cfg, res.json)).payload).toEqual({ ok: true, content: detail, complete: true });
+  });
+
+  test("every miss is the SAME sealed not-found — unknown session, wrong pairing, absent field", async () => {
+    const cfg = config();
+    const { dir, store } = await fed();
+    await write(dir, "mine", { planFull: "kept" });
+    await write(dir, "theirs", { planFull: "not-ours", pairingId: "pairing-rotated" });
+    const sdir = await stateDir();
+    const { port } = await startListener({ statePath: join(sdir, "lan.json"), frames: store, cfg });
+    const asks = [
+      { what: "plan", sessionId: "unknown" },
+      { what: "plan", sessionId: "theirs" },
+      { what: "permission-detail", sessionId: "mine" },
+    ];
+    for (const payload of asks) {
+      const res = await post(port, await sealRequest(cfg, { op: "read", ts: Date.now(), nonce: nonce(), payload }));
+      expect(res.status).toBe(200); // authenticated ⇒ a SEALED answer, never an opaque 400
+      expect((await openResponse(cfg, res.json)).payload).toEqual({ ok: false, err: "not-found" });
+    }
+  });
+
+  test("a malformed read payload is the same opaque 400 every other bad payload gets", async () => {
+    const cfg = config();
+    const { store } = await fed();
+    const sdir = await stateDir();
+    const { port } = await startListener({ statePath: join(sdir, "lan.json"), frames: store, cfg });
+    const bad = [
+      {},
+      { what: "plan" },
+      { sessionId: "s1" },
+      { what: "transcript", sessionId: "s1" },   // unknown `what` is refused, never defaulted
+      { what: "plan", sessionId: "../secret" },  // path traversal dies at the parser
+      { what: "plan", sessionId: "" },
+      { what: "plan", sessionId: "a".repeat(129) },
+      { what: 1, sessionId: "s1" },
+      { what: "plan", sessionId: 5 },
+    ];
+    for (const payload of bad) {
+      const res = await post(port, await sealRequest(cfg, { op: "read", ts: Date.now(), nonce: nonce(), payload }));
+      expect(res.status).toBe(400);
+      expect(res.json).toEqual({});
+    }
+  });
+
+  test("parseLanReadRequest is the pure gate behind all of that", () => {
+    expect(parseLanReadRequest({ what: "plan", sessionId: "s-1_A" })).toEqual({ what: "plan", sessionId: "s-1_A" });
+    expect(parseLanReadRequest({ what: "permission-detail", sessionId: "codex-pid-40738" }))
+      .toEqual({ what: "permission-detail", sessionId: "codex-pid-40738" });
+    expect(parseLanReadRequest({ what: "detail", sessionId: "s1" })).toBeNull();
+    expect(parseLanReadRequest({ what: "plan", sessionId: "a/b" })).toBeNull();
+    expect(parseLanReadRequest({ what: "plan", sessionId: "a.b" })).toBeNull();
+    expect(parseLanReadRequest({})).toBeNull();
   });
 });

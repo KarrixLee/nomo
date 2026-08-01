@@ -184,6 +184,56 @@ export function appendFittedPlanAndDebug<T extends Record<string, unknown>>(
     : withPlan;
 }
 
+// --- unabridged copies for the LAN read op (NOM-44 phase 4) -------------------------------------
+//
+// Everything above fits text into the WORKER's 3072-char sealed-blob ceiling: a long plan keeps a
+// prefix, a long permission detail keeps a prefix plus an omitted-count. That ceiling is real and stays
+// exactly as it is — every byte that crosses the worker still obeys it. But a phone on the SAME network
+// can pull from this machine directly (lan-listener's `read` op), and there is no ceiling on that path,
+// so the UNABRIDGED string is teed onto the session record and served on demand.
+//
+// POSTURE: session records are 0600 local files that never leave this Mac — the watchdog's heartbeat
+// posts `record.blob` (already sealed under the pairing key) and nothing else, and the LAN frames feed
+// copies only the sealed blob plus the clear envelope fields. Plaintext on the record is therefore
+// exactly the posture the record already has (it holds the hostname, the cwd label, and the absolute
+// transcript path in the clear today).
+
+/** Ceiling on a full copy kept for the LAN read op. "No worker ceiling" is not "unbounded": 256 K
+ *  characters is far past any real plan or shell command, and it bounds what a runaway tool_input can
+ *  make this plugin write per session (and re-write on every watchdog record rewrite). */
+export const RECORD_FULL_TEXT_MAX_CHARS = 262_144;
+/** Appended when the cap above actually clipped the text. It is what lets a reader report
+ *  `complete:false` out loud instead of silently amputating — the same honest-truncation contract
+ *  `fitPermissionDetail`'s omitted-count and `appendFittedPlan`'s "\n…" marker carry on the wire. */
+export const RECORD_FULL_TEXT_TRUNCATION_MARKER = "\n…[truncated]";
+
+/** The value to persist on the session record for a blob field that was fitted, or undefined when
+ *  there is nothing worth keeping.
+ *
+ *  Undefined — meaning "the phone falls back to the copy already in the blob" — in exactly two cases:
+ *  there was no text at all, or the fit changed NOTHING (`full === fitted`), in which case a second copy
+ *  on disk would only be a bigger record saying the same thing. Otherwise the whole string, clipped at
+ *  RECORD_FULL_TEXT_MAX_CHARS code points (never mid-code-point) with the marker appended.
+ *
+ *  `fitted` is undefined when the fit dropped the field ENTIRELY (a plan that could not fit at all) —
+ *  that is a change, so the full text is stored. Pure; never throws. */
+export function fullTextForRecord(full: string | undefined, fitted: string | undefined): string | undefined {
+  if (typeof full !== "string" || full.length === 0) return undefined;
+  if (full === fitted) return undefined;
+  const chars = Array.from(full);
+  if (chars.length <= RECORD_FULL_TEXT_MAX_CHARS) return full;
+  const markerChars = Array.from(RECORD_FULL_TEXT_TRUNCATION_MARKER).length;
+  return chars.slice(0, RECORD_FULL_TEXT_MAX_CHARS - markerChars).join("") + RECORD_FULL_TEXT_TRUNCATION_MARKER;
+}
+
+/** Did a stored full copy survive the cap whole? The marker is the signal (a suffix test, not a length
+ *  test: the stored string is the only thing the reader has). A genuine text that happens to END with
+ *  the exact marker would be reported one notch more conservatively than it deserves — cosmetic, and
+ *  the alternative (a second record field) would spend an append-last slot on it. Pure. */
+export function recordFullTextIsComplete(value: string): boolean {
+  return !value.endsWith(RECORD_FULL_TEXT_TRUNCATION_MARKER);
+}
+
 /** Whether a zero-byte marker/flag file exists on disk. The ONE probe shared by every reader of the
  *  local no-hold flag — the permission hook's escape-hatch gate, the `permission off|on|status` CLI
  *  toggle, and localApprovalsState just below — so the gate, the toggle and the reported header can
@@ -449,6 +499,20 @@ export interface SessionRecord {
    *  simply has no `attentionKind` key and reads back `undefined` (never a crash, never a default).
    *  Absent → no discriminator (a plain approval, or an agent that has none). */
   attentionKind?: "userInput";
+  /** APPENDED LAST (NOM-44 phase 4), same discipline as `attentionKind` above. The UNABRIDGED plan
+   *  markdown whose FITTED copy rides the sealed blob's `plan` key — present ONLY when appendFittedPlan
+   *  actually had to cut (or drop) it, so `full === fitted` stores nothing and the phone simply reads the
+   *  blob's copy. Served by the LAN listener's `read` op; capped at RECORD_FULL_TEXT_MAX_CHARS with
+   *  RECORD_FULL_TEXT_TRUNCATION_MARKER. Written by trackSessionAt, which rebuilds the record whole, so
+   *  a later event of the same session drops it automatically. */
+  planFull?: string;
+  /** APPENDED LAST (NOM-44 phase 4). The UNABRIDGED `permissionDetail` — the whole ExitPlanMode plan,
+   *  the whole multi-line Bash command — whose fitted prefix rides the decisionPending blob. Present ONLY
+   *  when `fitPermissionDetail` had to cut it. Unlike every other field here it is PATCHED onto an
+   *  existing record (see stampPermissionDetailFullAt): the permission hook is a separate short-lived
+   *  process that reads the record but never rebuilds it. The next ordinary hook rewrite drops it, which
+   *  is exactly the right lifetime — the card is gone by then. */
+  permissionDetailFull?: string;
 }
 
 /** The plaintext a pending-pairing flush needs to POST the pairing session the instant the shared key
@@ -1037,6 +1101,38 @@ export async function readRecord(sessionId: string, sessionsDir: string = SESSIO
   } catch {
     return null;
   }
+}
+
+/** Tee the UNABRIDGED permission detail onto an EXISTING session record (NOM-44 phase 4), so a phone on
+ *  the same network can pull the whole plan/command over LAN instead of the wire-budget prefix.
+ *
+ *  READ-MODIFY-WRITE, exactly like markDoneDeliveredAt and for the same reason: the permission hook is a
+ *  separate short-lived process, so it must patch the one key it owns rather than rewrite a snapshot the
+ *  session's own hooks (or the watchdog) may have moved on from. `undefined` is a legitimate value — it
+ *  DROPS the key on stringify (the same idiom markDoneDeliveredAt uses for donePending), which is how a
+ *  prompt whose detail rode whole clears the copy an earlier prompt in the same session left behind.
+ *
+ *  No record (the session was reaped, or its first hook has not landed) → nothing to patch, and nothing
+ *  to serve either: the LAN read answers not-found, which is the honest answer. Best-effort throughout —
+ *  a failed tee costs the phone the truncated copy it would have had anyway. */
+export async function stampPermissionDetailFullAt(
+  sessionsDir: string, sessionId: string, permissionDetailFull: string | undefined,
+): Promise<void> {
+  try {
+    const record = await readRecord(sessionId, sessionsDir);
+    if (!record) return;
+    if (record.permissionDetailFull === permissionDetailFull) return; // nothing would change
+    await atomicWrite(`${sessionsDir}/${sessionId}.json`, JSON.stringify({ ...record, permissionDetailFull }), 0o600);
+  } catch {
+    // Bookkeeping is best-effort, exactly like trackSession's own write.
+  }
+}
+
+/** Production wrapper for the fixed on-disk sessions root (tests inject a temp dir). */
+export async function stampPermissionDetailFull(
+  sessionId: string, permissionDetailFull: string | undefined,
+): Promise<void> {
+  return stampPermissionDetailFullAt(SESSIONS_DIR, sessionId, permissionDetailFull);
 }
 
 /** Read up to `maxBytes` from the START of a file (the transcript's ai-title / first prompt sit near

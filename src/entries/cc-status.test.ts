@@ -5,7 +5,7 @@ import { basename, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { b64url, decryptBlob } from "../core/crypto";
 import {
-  BLOB_FIT_CHARS, DBG_BLOB_TEXT_MAX_CHARS, formatPlanPickerDebug, parseConfig, PendingEventStash, PLAN_BLOB_TEXT_MAX_CHARS, PLAN_BLOB_TRUNCATION_MARKER,
+  BLOB_FIT_CHARS, DBG_BLOB_TEXT_MAX_CHARS, formatPlanPickerDebug, fullTextForRecord, parseConfig, PendingEventStash, PLAN_BLOB_TEXT_MAX_CHARS, PLAN_BLOB_TRUNCATION_MARKER,
   readRecord, sealedBlobChars, SessionRecord,
 } from "../core/shared";
 import {
@@ -1094,6 +1094,69 @@ describe("trackSession + readRecord file glue (sentDone survives a fresh disk re
     } finally {
       await unlink(path).catch(() => {});
     }
+  });
+
+  test("planFull round-trips (append-last), is dropped by the next event, and an OLD record still parses", async () => {
+    const sessionId = `test-planfull-${randomUUID()}`;
+    const path = `${glueSessions}/${sessionId}.json`;
+    const full = "# Plan\n".repeat(500);
+    try {
+      // A picker frame whose blob could only carry a PREFIX of the plan tees the whole thing here, so a
+      // phone on the same network can pull it over LAN (the worker's 3072-char ceiling is untouched).
+      await trackSessionAt(glueSessions, sessionId, "update", 1, "needsAttention", "B", "mac", "proj", "/tmp/t.jsonl", "codex",
+        undefined, undefined, undefined, undefined, undefined, undefined, false, 4242, undefined, false, undefined, "userInput", full);
+      expect((await readRecord(sessionId, glueSessions))?.planFull).toBe(full);
+      // APPEND-LAST: the newest key is the LAST one serialized, so no existing key moved.
+      expect(Object.keys(JSON.parse(await readFile(path, "utf8")) as object).at(-1)).toBe("planFull");
+      // The record is rebuilt whole on every event, so the next hook drops the copy with the episode.
+      await trackSessionAt(glueSessions, sessionId, "update", 0, "working", "B", "mac", "proj", "/tmp/t.jsonl");
+      expect((await readRecord(sessionId, glueSessions))?.planFull).toBeUndefined();
+      // A record written before the field existed loads fine and reads back undefined.
+      await writeFile(path, JSON.stringify({
+        pid: 4242, machine: "mac", label: "proj", ts: Date.now(), op: "update", prio: 1,
+        lastEvent: "needsAttention", blob: "B", pairingId: "p",
+      }));
+      const legacy = await readRecord(sessionId, glueSessions);
+      expect(legacy).not.toBeNull();
+      expect(legacy?.planFull).toBeUndefined();
+      expect(legacy?.blob).toBe("B");
+    } finally {
+      await unlink(path).catch(() => {});
+    }
+  });
+});
+
+describe("buildEnvelope's blob-plaintext tee (the unabridged-plan source)", () => {
+  const input = {
+    session_id: "s-tee", hook_event_name: "Stop", cwd: "/Users/x/api-status", transcript_path: "/tmp/t.jsonl",
+  };
+  const plan = { op: "update" as const, prio: 1 as const, status: "needsAttention" as const };
+
+  test("a plan too big for the sealed ceiling is FITTED in the blob and kept whole for the record", async () => {
+    const full = `${"a".repeat(6000)}END`;
+    let teed: { plan?: string } | undefined;
+    await buildEnvelope(input, "mac", 1_800_000_000_000, "T", KEY, false, "codex", undefined, undefined, "proj",
+      undefined, plan, "userInput", full, undefined, (plaintext) => { teed = plaintext; });
+    // What rode the wire is a prefix with the truncation marker — the worker ceiling is untouched.
+    expect(teed?.plan).not.toBe(full);
+    expect(teed?.plan?.endsWith(PLAN_BLOB_TRUNCATION_MARKER)).toBe(true);
+    // What the record keeps is the whole thing, so the LAN read serves the real plan.
+    expect(fullTextForRecord(full, teed?.plan)).toBe(full);
+  });
+
+  test("a plan that rides WHOLE stores nothing — the phone just reads the blob's own copy", async () => {
+    const full = "# Short plan\n- do the thing";
+    let teed: { plan?: string } | undefined;
+    await buildEnvelope(input, "mac", 1_800_000_000_000, "T", KEY, false, "codex", undefined, undefined, "proj",
+      undefined, plan, "userInput", full, undefined, (plaintext) => { teed = plaintext; });
+    expect(teed?.plan).toBe(full);
+    expect(fullTextForRecord(full, teed?.plan)).toBeUndefined();
+  });
+
+  test("a throwing tee never breaks the envelope it observes", async () => {
+    const envelope = await buildEnvelope(input, "mac", 1_800_000_000_000, "T", KEY, false, "claude", undefined, undefined,
+      "proj", undefined, plan, undefined, undefined, undefined, () => { throw new Error("tee exploded"); });
+    expect(typeof envelope?.blob).toBe("string");
   });
 });
 

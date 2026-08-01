@@ -24,8 +24,8 @@ import { hostname } from "node:os";
 import { basename, isAbsolute, relative, resolve } from "node:path";
 import { runHook, buildBlob, OpPlan } from "./hook";
 import {
-  AgentKind, atomicWrite, BLOB_FIT_CHARS, CC_DIR, codexHome, Config, flagExists, loadConfig, NO_HOLD_PATH,
-  PLUGIN_VERSION, readPrefix, readRecord, readSuffix, sealedBlobChars, SessionRecord,
+  AgentKind, atomicWrite, BLOB_FIT_CHARS, CC_DIR, codexHome, Config, flagExists, fullTextForRecord, loadConfig, NO_HOLD_PATH,
+  PLUGIN_VERSION, readPrefix, readRecord, readSuffix, sealedBlobChars, SessionRecord, stampPermissionDetailFull,
 } from "./shared";
 import { b64url, decryptBlob, deriveLanKey, encryptBlob } from "./crypto";
 // The PURE wire contract only — deliberately NOT "./lan-listener": this hook is a short-lived process
@@ -997,6 +997,14 @@ function defaultLanStatePath(): string | undefined {
   return lanRunningUnderTest() ? undefined : LAN_STATE_PATH;
 }
 
+/** The session-record tee for the unabridged permission detail (NOM-44 phase 4). The real writer in
+ *  production; a NO-OP under `bun test`, where a unit test sees the developer's REAL home directory and
+ *  must never patch their live session records — the same guard, and the same reason, as
+ *  defaultLanStatePath above. Tests that exercise the tee inject `stampDetailFullFn`. */
+function defaultStampDetailFull(): (sessionId: string, detailFull: string | undefined) => Promise<void> {
+  return lanRunningUnderTest() ? async () => { /* never touch real records from a test */ } : stampPermissionDetailFull;
+}
+
 /** Injectable seams so permission.test.ts drives the state machine with a scripted fetch, an instant
  *  sleep, a deterministic requestId, and a temp flag path — no real stdin/network/timers. Production
  *  uses every default. */
@@ -1006,6 +1014,10 @@ export interface PermissionHookDeps {
   readInput?: () => Promise<string>;
   loadConfigFn?: () => Promise<Config | null>;
   readRecordFn?: (sessionId: string) => Promise<SessionRecord | null>;
+  /** Persists the UNABRIDGED permission detail on the session record for the LAN `read` op (NOM-44
+   *  phase 4). Defaults to the real record patcher in production and to a NO-OP under `bun test` — see
+   *  defaultStampDetailFull. Called at most once per prompt, and only when the value would change. */
+  stampDetailFullFn?: (sessionId: string, detailFull: string | undefined) => Promise<void>;
   /** Resolve Codex's effective per-turn approval policy from its rollout. Tests inject this so no
    *  local Codex state is touched; Claude never calls it. */
   loadCodexTurnPolicyFn?: (
@@ -1191,10 +1203,24 @@ export async function runPermissionHook(deps: PermissionHookDeps = {}, agent: Ag
       ...base, status: "decisionPending", permissionSummary: summary, permissionRequestId: requestId,
       permissionToolName: toolName,
     };
+    const rawDetail = buildPermissionDetail(toolName, toolInput);
     const fitted = fitPermissionDetail(
-      permissionBase, buildPermissionDetail(toolName, toolInput), BLOB_FIT_CHARS,
+      permissionBase, rawDetail, BLOB_FIT_CHARS,
       buildPermissionQuestions(toolInput),
     );
+    // NOM-44 phase 4: the fit above is the WORKER's ceiling and stays exactly as it is, but a phone on
+    // this network can pull from the Mac directly, where there is none — so tee the UNABRIDGED detail
+    // (the whole ExitPlanMode plan, the whole multi-line Bash command) onto the 0600 session record for
+    // the LAN listener's `read` op. `fullTextForRecord` returns undefined when nothing was cut, and
+    // writing undefined DROPS the key — which is how a prompt that rode whole clears the copy an earlier
+    // prompt in this session left behind. Skipped entirely when the record already holds the right value
+    // (the overwhelmingly common case: no truncation, no stale copy), so an ordinary prompt pays no IO.
+    // Awaited, not fired-and-forgotten: it is one small local write, and the phone must never be able to
+    // see the card (POSTed just below) before the content it may ask for is on disk.
+    const detailFull = fullTextForRecord(rawDetail, fitted.detail);
+    if (record && record.permissionDetailFull !== detailFull) {
+      await (deps.stampDetailFullFn ?? defaultStampDetailFull())(sessionId, detailFull);
+    }
     const blob = await encryptBlob(config.e2eKey, permissionFrame(permissionBase, fitted.detail, fitted.omitted, fitted.questions));
     const fallbackBlob = await encryptBlob(config.e2eKey, base);
 

@@ -2206,3 +2206,60 @@ test("NO_HOLD_PATH sits under the cc-status config dir", () => {
 test("TRACE_PATH sits under the cc-status config dir", () => {
   expect(TRACE_PATH.endsWith("/.config/cc-status/permission-trace.log")).toBe(true);
 });
+
+// ---- NOM-44 phase 4: the unabridged permission detail teed onto the session record --------------
+//
+// The blob the worker carries is still fitted to 3072 chars; this tee is what lets a phone on the same
+// network pull the WHOLE plan/command over LAN instead of living with the prefix.
+
+describe("runPermissionHook — the unabridged-detail record tee", () => {
+  const teed = async (over: Record<string, unknown>): Promise<Array<string | undefined>> => {
+    const seen: Array<string | undefined> = [];
+    const { fn } = scriptFetch(false, []);
+    await runPermissionHook(baseDeps({
+      fetchFn: fn, emit: () => {},
+      stampDetailFullFn: async (_sessionId: string, detailFull: string | undefined) => { seen.push(detailFull); },
+      ...over,
+    }) as never);
+    return seen;
+  };
+
+  const record = (over: Record<string, unknown> = {}) => ({ pid: 1, machine: "m", label: "l", ts: 1000, ...over });
+
+  test("a TRUNCATED detail is stored whole, so the LAN read can serve the real command", async () => {
+    const command = `${"x".repeat(20_000)}END`;
+    expect(await teed({
+      readRecordFn: async () => record(),
+      readInput: async () => inputWith({ tool_input: { command } }),
+    })).toEqual([command]);
+  });
+
+  test("a detail that rides WHOLE stores nothing — and clears a previous prompt's stale copy", async () => {
+    const short = "ls -la";
+    // Nothing stale on the record ⇒ nothing would change ⇒ the record is never touched at all.
+    expect(await teed({
+      readRecordFn: async () => record(),
+      readInput: async () => inputWith({ tool_input: { command: short } }),
+    })).toEqual([]);
+    // A copy left by an earlier prompt in this session IS cleared (undefined drops the key).
+    expect(await teed({
+      readRecordFn: async () => record({ permissionDetailFull: "the previous prompt's plan" }),
+      readInput: async () => inputWith({ tool_input: { command: short } }),
+    })).toEqual([undefined]);
+  });
+
+  test("no session record (reaped / first hook not landed yet) → no write is even attempted", async () => {
+    expect(await teed({
+      readRecordFn: async () => null,
+      readInput: async () => inputWith({ tool_input: { command: "y".repeat(20_000) } }),
+    })).toEqual([]);
+  });
+
+  test("an ExitPlanMode plan too long for the frame is kept whole for the pull", async () => {
+    const plan = `# Plan\n${"- a step that is quite wordy indeed\n".repeat(400)}`;
+    expect(await teed({
+      readRecordFn: async () => record(),
+      readInput: async () => inputWith({ tool_name: "ExitPlanMode", tool_input: { plan } }),
+    })).toEqual([plan]);
+  });
+});

@@ -186,6 +186,23 @@ function appendFittedPlanAndDebug(base, plan, dbg) {
   const withDebug = { ...withPlan, dbg: capped };
   return sealedBlobChars(encoder.encode(JSON.stringify(withDebug)).length) <= BLOB_FIT_CHARS ? withDebug : withPlan;
 }
+var RECORD_FULL_TEXT_MAX_CHARS = 262144;
+var RECORD_FULL_TEXT_TRUNCATION_MARKER = `
+…[truncated]`;
+function fullTextForRecord(full, fitted) {
+  if (typeof full !== "string" || full.length === 0)
+    return;
+  if (full === fitted)
+    return;
+  const chars = Array.from(full);
+  if (chars.length <= RECORD_FULL_TEXT_MAX_CHARS)
+    return full;
+  const markerChars = Array.from(RECORD_FULL_TEXT_TRUNCATION_MARKER).length;
+  return chars.slice(0, RECORD_FULL_TEXT_MAX_CHARS - markerChars).join("") + RECORD_FULL_TEXT_TRUNCATION_MARKER;
+}
+function recordFullTextIsComplete(value) {
+  return !value.endsWith(RECORD_FULL_TEXT_TRUNCATION_MARKER);
+}
 async function flagExists(path) {
   try {
     await access(path);
@@ -515,6 +532,19 @@ async function readRecord(sessionId, sessionsDir = SESSIONS_DIR) {
   } catch {
     return null;
   }
+}
+async function stampPermissionDetailFullAt(sessionsDir, sessionId, permissionDetailFull) {
+  try {
+    const record = await readRecord(sessionId, sessionsDir);
+    if (!record)
+      return;
+    if (record.permissionDetailFull === permissionDetailFull)
+      return;
+    await atomicWrite(`${sessionsDir}/${sessionId}.json`, JSON.stringify({ ...record, permissionDetailFull }), 384);
+  } catch {}
+}
+async function stampPermissionDetailFull(sessionId, permissionDetailFull) {
+  return stampPermissionDetailFullAt(SESSIONS_DIR, sessionId, permissionDetailFull);
 }
 async function readPrefix(path, maxBytes) {
   const fh = await open(path, "r");

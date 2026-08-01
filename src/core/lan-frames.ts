@@ -24,12 +24,18 @@
 //
 // PRIVACY: `blob` is copied VERBATIM out of the record. It is sealed under the pairing e2eKey and is
 // never opened here — this module is exactly as blind as the worker. Only the phone can read it.
+//
+// PHASE 4 (`readFull`) is the ONE deliberate exception, and it never crosses the worker: the unabridged
+// plan / permission detail the hook teed onto the record is plaintext, and it is served plaintext into
+// the listener's K_lan OUTER seal. That is still E2E between this Mac and the paired phone — the content
+// simply rides one seal instead of two, because there is no blind relay in the middle to be blind.
 
 import { watch } from "node:fs";
 import { readdir, readFile } from "node:fs/promises";
 import { basename } from "node:path";
-import { lanRunningUnderTest } from "./lan-wire";
-import { pidAlive, SESSIONS_DIR } from "./shared";
+import { LAN_SESSION_ID_RE, lanRunningUnderTest } from "./lan-wire";
+import type { LanReadWhat } from "./lan-wire";
+import { pidAlive, recordFullTextIsComplete, SESSIONS_DIR } from "./shared";
 import type { AgentKind, CCOp, SessionRecord } from "./shared";
 
 /** How long a session that has RETIRED (record deleted, pid dead, aged out) keeps serving its final
@@ -69,6 +75,15 @@ export interface LanFrame {
 export interface LanFramesSlice {
   seq: number;
   frames: LanFrame[];
+}
+
+/** One unabridged field, as the `read` op serves it (phase 4). `complete` is false only when the
+ *  256 KB record-side cap clipped the stored copy — the phone says so out loud rather than pretending
+ *  the text ended there. NOT sealed under the pairing key: unlike `blob`, this content rides inside the
+ *  K_lan OUTER seal and nothing else, which is E2E between this Mac and the phone already. */
+export interface LanFullRead {
+  content: string;
+  complete: boolean;
 }
 
 /** A frame's content — everything except the counter stamp. Built with a FIXED key order so
@@ -151,6 +166,24 @@ export interface LanFrameStore {
   /** Point the feed at the CURRENT pairing. A rotation voids every cached frame (they are sealed under
    *  the old key), so the map is cleared and rebuilt. */
   setPairing(pairingId: string | undefined): void;
+  /** The UNABRIDGED plan / permission detail for ONE session (the `read` op, phase 4), or null when
+   *  there is nothing honest to serve.
+   *
+   *  A FRESH DISK READ, deliberately — not another in-memory map. A read is a rare, explicit user
+   *  action (tapping a plan on the phone) where one open+read is invisible, while the payload is up to
+   *  256 KB per session: caching it would grow this daemon's heap by the size of every plan every
+   *  session ever proposed, for content most sessions never ask for. The frame map stays what it is —
+   *  small, hot, blob-only. It lives HERE rather than in the listener because the guards it needs are
+   *  this module's: the sessions directory (which the listener does not know) and the pairing (which
+   *  lanFrameContent already enforces).
+   *
+   *  Null — the listener's `not-found` — for: no store directory, a session id outside the charset gate,
+   *  an absent/corrupt record, a record from ANOTHER pairing (the same rule lanFrameContent applies, so
+   *  a read can never serve what a frame would refuse), a record past the 24 h abandonment cap, or a
+   *  record with no such field (the common case: nothing was truncated, so the phone keeps the blob's
+   *  own copy). Liveness is deliberately NOT required: a session that just went terminal can still have
+   *  the plan the user is looking at pulled. Never throws. */
+  readFull(sessionId: string, what: LanReadWhat): Promise<LanFullRead | null>;
   /** Re-read the whole session store and fold every change into the map. Called on the watch feed
    *  (debounced) and once per watchdog sweep as the lossy-watch fallback. Never throws. */
   reconcile(): Promise<void>;
@@ -364,6 +397,28 @@ export function createLanFrameStore(deps: LanFrameStoreDeps = {}): LanFrameStore
       // deliberately keeps climbing, so the rebuild reaches the phone as ordinary new frames.
       entries.clear();
       void store.reconcile();
+    },
+    async readFull(sessionId: string, what: LanReadWhat): Promise<LanFullRead | null> {
+      try {
+        if (!sessionsDir) return null;
+        if (!LAN_SESSION_ID_RE.test(sessionId)) return null; // charset gate == path-traversal gate
+        let record: SessionRecord;
+        try {
+          record = JSON.parse(await readFile(`${sessionsDir}/${sessionId}.json`, "utf8")) as SessionRecord;
+        } catch {
+          return null; // absent / unreadable / corrupt — all "not found" from the phone's side
+        }
+        // The SAME pairing guard lanFrameContent applies: a record left behind by a previous pairing
+        // belongs to a phone that no longer exists here, and its content is not this caller's to read.
+        if (pairingId === undefined || record.pairingId !== pairingId) return null;
+        if (typeof record.ts !== "number" || !Number.isFinite(record.ts)) return null;
+        if (now() - record.ts > LAN_FRAME_SESSION_STALE_MS) return null; // expired, like every other read of this store
+        const content = what === "plan" ? record.planFull : record.permissionDetailFull;
+        if (typeof content !== "string" || content.length === 0) return null;
+        return { content, complete: recordFullTextIsComplete(content) };
+      } catch {
+        return null; // a read is best-effort; the phone falls back to the truncated blob copy
+      }
     },
     reconcile(): Promise<void> {
       if (stopped) return Promise.resolve();

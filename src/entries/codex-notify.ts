@@ -23,7 +23,7 @@ import { hostname } from "node:os";
 import { basename } from "node:path";
 import { cleanPromptTitle, codexAdapter } from "../core/adapter";
 import { buildEnvelope, markDoneDelivered, sessionOrigin, trackSession } from "../core/hook";
-import { atomicWrite, ensureWatchdog, formatPlanPickerDebug, LAST_SEND_PATH, loadConfig, localApprovalsState, pidCommand, PLUGIN_VERSION, readRecord, tracePlanPickerDecision } from "../core/shared";
+import { atomicWrite, ensureWatchdog, formatPlanPickerDebug, fullTextForRecord, LAST_SEND_PATH, loadConfig, localApprovalsState, pidCommand, PLUGIN_VERSION, readRecord, tracePlanPickerDecision } from "../core/shared";
 
 /** Map the notify JSON onto the runHook/planOp Stop-hook input shape. Null for any payload that isn't
  *  an agent-turn-complete carrying a non-empty thread-id (the only kind we back-stop) or isn't JSON. */
@@ -160,8 +160,13 @@ export async function runNotify(raw: string, deferMs = notifyDeferMs(), sleep: (
       ttl: pendingPlanPicker || planPickerVerificationPending ? "0m" : "-",
       by: "n",
     });
+    // The UNABRIDGED plan for the LAN `read` op (NOM-44 phase 4) — kept only when the blob's fitted
+    // `plan` key differs from the whole thing. Same tee the hook path uses, so both producers of a
+    // picker frame leave the phone the same pull-the-full-plan affordance.
+    const proposedPlan = pendingPlanPicker ? evidence.plan : undefined;
+    let planFull: string | undefined;
     const envelope = await buildEnvelope(input, machine, now, title, config.e2eKey, false, "codex", startedAt, turnStartedAt, undefined, model, plan, attentionKind,
-      pendingPlanPicker ? evidence.plan : undefined, dbg);
+      proposedPlan, dbg, (plaintext) => { planFull = fullTextForRecord(proposedPlan, plaintext.plan); });
     if (!envelope) return;
 
     const label = typeof input.cwd === "string" && input.cwd.length > 0 ? basename(input.cwd) : "session";
@@ -171,7 +176,9 @@ export async function runNotify(raw: string, deferMs = notifyDeferMs(), sleep: (
       record?.origin ?? sessionOrigin(input, sessionPid, pidCommand(sessionPid)),
       planPickerVerificationPending, dbg,
       // Same discriminator the envelope above carries, cached on the record for the LAN frames feed.
-      attentionKind);
+      attentionKind,
+      // The unabridged plan for the LAN `read` op — undefined unless the blob's copy was truncated.
+      planFull);
     const clearedPickerMarker = !pendingPlanPicker && !planPickerVerificationPending
       && (record?.pendingPlanPicker === true || record?.planPickerSettled === true);
     tracePlanPickerDecision(sessionId, {

@@ -191,6 +191,23 @@ function appendFittedPlanAndDebug(base, plan, dbg) {
   const withDebug = { ...withPlan, dbg: capped };
   return sealedBlobChars(encoder.encode(JSON.stringify(withDebug)).length) <= BLOB_FIT_CHARS ? withDebug : withPlan;
 }
+var RECORD_FULL_TEXT_MAX_CHARS = 262144;
+var RECORD_FULL_TEXT_TRUNCATION_MARKER = `
+…[truncated]`;
+function fullTextForRecord(full, fitted) {
+  if (typeof full !== "string" || full.length === 0)
+    return;
+  if (full === fitted)
+    return;
+  const chars = Array.from(full);
+  if (chars.length <= RECORD_FULL_TEXT_MAX_CHARS)
+    return full;
+  const markerChars = Array.from(RECORD_FULL_TEXT_TRUNCATION_MARKER).length;
+  return chars.slice(0, RECORD_FULL_TEXT_MAX_CHARS - markerChars).join("") + RECORD_FULL_TEXT_TRUNCATION_MARKER;
+}
+function recordFullTextIsComplete(value) {
+  return !value.endsWith(RECORD_FULL_TEXT_TRUNCATION_MARKER);
+}
 async function flagExists(path) {
   try {
     await access(path);
@@ -520,6 +537,19 @@ async function readRecord(sessionId, sessionsDir = SESSIONS_DIR) {
   } catch {
     return null;
   }
+}
+async function stampPermissionDetailFullAt(sessionsDir, sessionId, permissionDetailFull) {
+  try {
+    const record = await readRecord(sessionId, sessionsDir);
+    if (!record)
+      return;
+    if (record.permissionDetailFull === permissionDetailFull)
+      return;
+    await atomicWrite(`${sessionsDir}/${sessionId}.json`, JSON.stringify({ ...record, permissionDetailFull }), 384);
+  } catch {}
+}
+async function stampPermissionDetailFull(sessionId, permissionDetailFull) {
+  return stampPermissionDetailFullAt(SESSIONS_DIR, sessionId, permissionDetailFull);
 }
 async function readPrefix(path, maxBytes) {
   const fh = await open(path, "r");
@@ -2019,7 +2049,7 @@ function buildBlob(input, machine, title, plan, agent = "claude", turnStartedAt,
   }) : undefined;
   return appendFittedPlanAndDebug(base, proposedPlan, dbg);
 }
-async function buildEnvelope(input, machine, now, title, e2eKey, sentDone, agent = "claude", startedAt, turnStartedAt, pinnedLabel, model, planOverride, attentionKindOverride, proposedPlan, dbg) {
+async function buildEnvelope(input, machine, now, title, e2eKey, sentDone, agent = "claude", startedAt, turnStartedAt, pinnedLabel, model, planOverride, attentionKindOverride, proposedPlan, dbg, onBlobPlaintext) {
   if (typeof input !== "object" || input === null)
     return null;
   const i = input;
@@ -2033,7 +2063,11 @@ async function buildEnvelope(input, machine, now, title, e2eKey, sentDone, agent
   if (typeof startedAt === "number" && Number.isFinite(startedAt))
     base.startedAt = startedAt;
   const at = Math.floor(now / 1000);
-  const blob = await encryptBlob(e2eKey, buildBlob(i, machine, title, plan, agent, turnStartedAt, pinnedLabel, model, at, proposedPlan, dbg));
+  const plaintext = buildBlob(i, machine, title, plan, agent, turnStartedAt, pinnedLabel, model, at, proposedPlan, dbg);
+  try {
+    onBlobPlaintext?.(plaintext);
+  } catch {}
+  const blob = await encryptBlob(e2eKey, plaintext);
   const attentionKind = attentionKindOverride ?? (agent === "codex" && hookName === "PreToolUse" && i.tool_name === "request_user_input" ? "userInput" : undefined);
   return { ...base, ...attentionKind ? { attentionKind } : {}, blob };
 }
@@ -2056,7 +2090,7 @@ async function stashPendingEvent(input, machine, title, now, stashPath = PENDING
     await atomicWrite(stashPath, JSON.stringify(stash), 384);
   } catch {}
 }
-async function trackSessionAt(sessionsDir, sessionId, op, prio, status, blob, machine, label, transcript, agent = "claude", sessionStartedAt, turnStartedAt, turnId, title, pairingId, model, pendingPlanPicker = false, pid = process.ppid, origin, planPickerVerificationPending = false, dbg, attentionKind) {
+async function trackSessionAt(sessionsDir, sessionId, op, prio, status, blob, machine, label, transcript, agent = "claude", sessionStartedAt, turnStartedAt, turnId, title, pairingId, model, pendingPlanPicker = false, pid = process.ppid, origin, planPickerVerificationPending = false, dbg, attentionKind, planFull) {
   try {
     const path = `${sessionsDir}/${sessionId}.json`;
     if (op === "end") {
@@ -2088,13 +2122,14 @@ async function trackSessionAt(sessionsDir, sessionId, op, prio, status, blob, ma
       ...pendingPlanPicker || planPickerVerificationPending ? { planPickerPendingSince: recordedAt } : {},
       ...typeof dbg === "string" && dbg.length > 0 ? { dbg } : {},
       ...origin ? { origin } : {},
-      ...attentionKind ? { attentionKind } : {}
+      ...attentionKind ? { attentionKind } : {},
+      ...typeof planFull === "string" && planFull.length > 0 ? { planFull } : {}
     };
     await atomicWrite(path, JSON.stringify(record), 384);
   } catch {}
 }
-async function trackSession(sessionId, op, prio, status, blob, machine, label, transcript, agent = "claude", sessionStartedAt, turnStartedAt, turnId, title, pairingId, model, pendingPlanPicker = false, pid = process.ppid, origin, planPickerVerificationPending = false, dbg, attentionKind) {
-  return trackSessionAt(SESSIONS_DIR, sessionId, op, prio, status, blob, machine, label, transcript, agent, sessionStartedAt, turnStartedAt, turnId, title, pairingId, model, pendingPlanPicker, pid, origin, planPickerVerificationPending, dbg, attentionKind);
+async function trackSession(sessionId, op, prio, status, blob, machine, label, transcript, agent = "claude", sessionStartedAt, turnStartedAt, turnId, title, pairingId, model, pendingPlanPicker = false, pid = process.ppid, origin, planPickerVerificationPending = false, dbg, attentionKind, planFull) {
+  return trackSessionAt(SESSIONS_DIR, sessionId, op, prio, status, blob, machine, label, transcript, agent, sessionStartedAt, turnStartedAt, turnId, title, pairingId, model, pendingPlanPicker, pid, origin, planPickerVerificationPending, dbg, attentionKind, planFull);
 }
 async function markDoneDeliveredAt(sessionsDir, sessionId) {
   try {
@@ -2374,7 +2409,10 @@ async function runHook(agent) {
       ttl: pendingPlanPicker || planPickerVerificationPending ? "0m" : "-",
       by: "h"
     }) : undefined;
-    const envelope = await buildEnvelope(eventInput, machine, Date.now(), title, config.e2eKey, sentDone, agent, startedAt, turnStartedAt, label, model, plan, attentionKind, proposedPlan, dbg);
+    let planFull;
+    const envelope = await buildEnvelope(eventInput, machine, Date.now(), title, config.e2eKey, sentDone, agent, startedAt, turnStartedAt, label, model, plan, attentionKind, proposedPlan, dbg, (plaintext) => {
+      planFull = fullTextForRecord(proposedPlan, plaintext.plan);
+    });
     if (!envelope)
       return;
     const createsRecord = !existingRecord && plan.op !== "end";
@@ -2382,7 +2420,7 @@ async function runHook(agent) {
     const origin = existingRecord?.origin ?? sessionOrigin(input, hookPid, hookCommand);
     const recordPid = reusedForkPredecessor ? existingRecord.pid : hookPid;
     const recordTranscript = reusedForkPredecessor ? existingRecord.transcript ?? transcriptPath : transcriptPath;
-    await trackSession(sessionId, plan.op, plan.prio, plan.status, envelope.blob, machine, label, recordTranscript, agent, startedAt, turnStartedAt, turnId, title, config.pairingId, model, pendingPlanPicker, recordPid, origin, planPickerVerificationPending, dbg, attentionKind);
+    await trackSession(sessionId, plan.op, plan.prio, plan.status, envelope.blob, machine, label, recordTranscript, agent, startedAt, turnStartedAt, turnId, title, config.pairingId, model, pendingPlanPicker, recordPid, origin, planPickerVerificationPending, dbg, attentionKind, planFull);
     const clearedPickerMarker = pendingPlanPicker === false && planPickerVerificationPending === false && (existingRecord?.pendingPlanPicker === true || existingRecord?.planPickerVerificationPending === true || existingRecord?.planPickerSettled === true);
     if (agent === "codex" && (hookName === "Stop" || pendingPlanPicker || planPickerVerificationPending || clearedPickerMarker)) {
       tracePlanPickerDecision(sessionId, {
@@ -2539,11 +2577,15 @@ async function runNotify(raw, deferMs = notifyDeferMs(), sleep = (ms) => new Pro
       ttl: pendingPlanPicker || planPickerVerificationPending ? "0m" : "-",
       by: "n"
     });
-    const envelope = await buildEnvelope(input, machine, now, title, config.e2eKey, false, "codex", startedAt, turnStartedAt, undefined, model, plan, attentionKind, pendingPlanPicker ? evidence.plan : undefined, dbg);
+    const proposedPlan = pendingPlanPicker ? evidence.plan : undefined;
+    let planFull;
+    const envelope = await buildEnvelope(input, machine, now, title, config.e2eKey, false, "codex", startedAt, turnStartedAt, undefined, model, plan, attentionKind, proposedPlan, dbg, (plaintext) => {
+      planFull = fullTextForRecord(proposedPlan, plaintext.plan);
+    });
     if (!envelope)
       return;
     const label = typeof input.cwd === "string" && input.cwd.length > 0 ? basename3(input.cwd) : "session";
-    await trackSession(sessionId, plan.op, plan.prio, plan.status, envelope.blob, machine, label, transcriptPath, "codex", startedAt, turnStartedAt, payloadTurnId, title ?? record?.title, config.pairingId, model, pendingPlanPicker, sessionPid, record?.origin ?? sessionOrigin(input, sessionPid, pidCommand(sessionPid)), planPickerVerificationPending, dbg, attentionKind);
+    await trackSession(sessionId, plan.op, plan.prio, plan.status, envelope.blob, machine, label, transcriptPath, "codex", startedAt, turnStartedAt, payloadTurnId, title ?? record?.title, config.pairingId, model, pendingPlanPicker, sessionPid, record?.origin ?? sessionOrigin(input, sessionPid, pidCommand(sessionPid)), planPickerVerificationPending, dbg, attentionKind, planFull);
     const clearedPickerMarker = !pendingPlanPicker && !planPickerVerificationPending && (record?.pendingPlanPicker === true || record?.planPickerSettled === true);
     tracePlanPickerDecision(sessionId, {
       source: "notify",

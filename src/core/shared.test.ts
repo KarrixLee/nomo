@@ -1,10 +1,11 @@
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "bun:test";
 import {
-  codexAppServerSocketAvailable, codexAppServerSocketPath, codexCompanionBrokerEvidence, ensureWatchdog, formatWatchdogPidfile, isWatchdogCommand,
-  localApprovalsState, parseWatchdogPidfile, PLUGIN_VERSION, watchdogHolderIsLive,
+  codexAppServerSocketAvailable, codexAppServerSocketPath, codexCompanionBrokerEvidence, ensureWatchdog, formatWatchdogPidfile, fullTextForRecord, isWatchdogCommand,
+  localApprovalsState, parseWatchdogPidfile, PLUGIN_VERSION, RECORD_FULL_TEXT_MAX_CHARS,
+  RECORD_FULL_TEXT_TRUNCATION_MARKER, recordFullTextIsComplete, stampPermissionDetailFullAt, watchdogHolderIsLive,
 } from "./shared";
 
 describe("codexCompanionBrokerEvidence (structural companion-session proof)", () => {
@@ -212,5 +213,89 @@ describe("codexAppServerSocketAvailable (the shared control-socket probe)", () =
 
   test("the default path lives under CODEX_HOME", () => {
     expect(codexAppServerSocketPath().endsWith("/app-server-control/app-server-control.sock")).toBe(true);
+  });
+});
+
+// --- unabridged copies for the LAN read op (NOM-44 phase 4) -------------------------------------
+
+describe("fullTextForRecord (what gets teed onto the session record)", () => {
+  test("stores NOTHING when the fit changed nothing — the phone reads the blob's own copy", () => {
+    expect(fullTextForRecord("# Plan", "# Plan")).toBeUndefined();
+    expect(fullTextForRecord("", "")).toBeUndefined();
+    expect(fullTextForRecord(undefined, undefined)).toBeUndefined();
+    expect(fullTextForRecord(undefined, "anything")).toBeUndefined();
+  });
+
+  test("stores the WHOLE string whenever the fit cut it — including when the field was dropped outright", () => {
+    const full = `${"a".repeat(5000)}END`;
+    expect(fullTextForRecord(full, `${"a".repeat(1200)}\n…`)).toBe(full); // truncated prefix
+    expect(fullTextForRecord(full, undefined)).toBe(full);                // dropped entirely
+    expect(fullTextForRecord(full, "")).toBe(full);                       // shed to empty
+  });
+
+  test("clips at the 256 K cap with the marker, and never mid-code-point", () => {
+    const over = "🙂".repeat(RECORD_FULL_TEXT_MAX_CHARS + 1_000); // astral: 2 UTF-16 units per code point
+    const stored = fullTextForRecord(over, "…")!;
+    const chars = Array.from(stored);
+    expect(chars.length).toBe(RECORD_FULL_TEXT_MAX_CHARS);
+    expect(stored.endsWith(RECORD_FULL_TEXT_TRUNCATION_MARKER)).toBe(true);
+    // No lone surrogate survived the slice: re-encoding is lossless.
+    expect(chars.slice(0, chars.length - Array.from(RECORD_FULL_TEXT_TRUNCATION_MARKER).length).join("")).not.toContain("�");
+    // Exactly AT the cap is not clipped.
+    const exact = "x".repeat(RECORD_FULL_TEXT_MAX_CHARS);
+    expect(fullTextForRecord(exact, "…")).toBe(exact);
+  });
+
+  test("recordFullTextIsComplete keys off the marker the cap appends", () => {
+    expect(recordFullTextIsComplete("the whole plan")).toBe(true);
+    expect(recordFullTextIsComplete(`clipped${RECORD_FULL_TEXT_TRUNCATION_MARKER}`)).toBe(false);
+  });
+});
+
+describe("stampPermissionDetailFullAt (the permission hook's record patch)", () => {
+  const record = (over: Record<string, unknown> = {}): string => JSON.stringify({
+    pid: 4242, machine: "mac", label: "proj", ts: 1_800_000_000_000, op: "update", prio: 1,
+    blob: "SEALED", pairingId: "pairing-abc", ...over,
+  });
+
+  async function dir(): Promise<string> {
+    return await mkdtemp(join(tmpdir(), "nomo-stamp-"));
+  }
+
+  test("patches ONE key onto an existing record, append-last, leaving every other key in place", async () => {
+    const d = await dir();
+    try {
+      await writeFile(join(d, "s1.json"), record());
+      await stampPermissionDetailFullAt(d, "s1", "the whole /bin/sh command");
+      const parsed = JSON.parse(await readFile(join(d, "s1.json"), "utf8")) as Record<string, unknown>;
+      expect(parsed.permissionDetailFull).toBe("the whole /bin/sh command");
+      expect(Object.keys(parsed).at(-1)).toBe("permissionDetailFull");
+      expect(parsed.blob).toBe("SEALED");
+      expect(parsed.pairingId).toBe("pairing-abc");
+    } finally {
+      await rm(d, { recursive: true, force: true });
+    }
+  });
+
+  test("undefined DROPS the key — a prompt that rode whole clears the previous prompt's copy", async () => {
+    const d = await dir();
+    try {
+      await writeFile(join(d, "s1.json"), record({ permissionDetailFull: "stale" }));
+      await stampPermissionDetailFullAt(d, "s1", undefined);
+      const parsed = JSON.parse(await readFile(join(d, "s1.json"), "utf8")) as Record<string, unknown>;
+      expect("permissionDetailFull" in parsed).toBe(false);
+    } finally {
+      await rm(d, { recursive: true, force: true });
+    }
+  });
+
+  test("no record (reaped session) is a silent no-op, never a created file or a throw", async () => {
+    const d = await dir();
+    try {
+      await stampPermissionDetailFullAt(d, "ghost", "content");
+      expect(await readFile(join(d, "ghost.json"), "utf8").catch(() => null)).toBeNull();
+    } finally {
+      await rm(d, { recursive: true, force: true });
+    }
   });
 });

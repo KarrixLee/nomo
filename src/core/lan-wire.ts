@@ -64,6 +64,37 @@ export function parseLanFramesRequest(payload: Record<string, unknown>): LanFram
   return { sinceSeq, waitMs };
 }
 
+/** What a `read` op may ask for (phase 4). FROZEN strings, mirrored verbatim by the iOS CCLanClient —
+ *  they name the two blob fields the worker's 3072-char ceiling truncates: the Plan-picker markdown
+ *  (`plan`) and the permission card's fuller context (`permissionDetail`). */
+export type LanReadWhat = "plan" | "permission-detail";
+
+/** A `read` request payload, after the outer seal opens. Both fields REQUIRED, like every other op's:
+ *  the contract is frozen and shared with the phone, so a missing field is a client bug, not a default. */
+export interface LanReadRequest {
+  what: LanReadWhat;
+  sessionId: string;
+}
+
+/** Session-id charset gate for the `read` op. Same shape as LAN_REQUEST_ID_RE, but a SEPARATE constant
+ *  because it does a second job: the id is turned into a FILE PATH (`<sessionsDir>/<id>.json`), so the
+ *  charset is also the path-traversal defence — no dot, no slash, no separator of any kind can survive
+ *  it. Real ids are UUIDs or the `codex-pid-<pid>` sentinel, both comfortably inside it; anything
+ *  exotic simply reads as not-found, which is a safe answer rather than a wrong one. */
+export const LAN_SESSION_ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
+
+/** Shape-check a `read` payload. Strict: an unknown `what` is refused rather than defaulted (a phone
+ *  asking for something this build cannot serve must not silently get the other field), and the session
+ *  id must pass the charset gate above. Pure; anything else → null → the same opaque 400 every other
+ *  malformed payload gets. */
+export function parseLanReadRequest(payload: Record<string, unknown>): LanReadRequest | null {
+  const what = payload.what;
+  const sessionId = payload.sessionId;
+  if (what !== "plan" && what !== "permission-detail") return null;
+  if (typeof sessionId !== "string" || !LAN_SESSION_ID_RE.test(sessionId)) return null;
+  return { what, sessionId };
+}
+
 /** Where the bound port + listener-instance id are persisted, next to config.json (0600, atomicWrite —
  *  same directory discipline as every other piece of daemon state). Re-binding the SAME port across
  *  watchdog restarts is what lets the phone keep a cached endpoint working instead of re-probing; it is

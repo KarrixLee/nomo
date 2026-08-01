@@ -26,7 +26,7 @@ import {
   SessionCreationSuppression, TrackedSessionLite,
 } from "./adapter";
 import {
-  AgentKind, appendFittedPlanAndDebug, atomicWrite, CCOp, CCStatus, codexCompanionBrokerEvidence, Config, ensureWatchdog, formatPlanPickerDebug, GONE_STRIKE_LIMIT,
+  AgentKind, appendFittedPlanAndDebug, atomicWrite, CCOp, CCStatus, codexCompanionBrokerEvidence, Config, ensureWatchdog, formatPlanPickerDebug, fullTextForRecord, GONE_STRIKE_LIMIT,
   LAST_SEND_PATH, lastHookPath, loadConfig, loadPendingConfig, localApprovalsState, PENDING_STASH_PATH, PendingEventStash, pidAncestors, pidCommand, PLUGIN_VERSION, readPrefix,
   readRecord, recordGoneStrike, removeRevokedConfig, resetGoneStrikes, SessionOrigin, SessionRecord, SESSIONS_DIR, tracePlanPickerDecision, traceSession,
 } from "./shared";
@@ -244,6 +244,11 @@ export async function buildEnvelope(
   input: unknown, machine: string, now: number, title: string | undefined, e2eKey: Uint8Array, sentDone: boolean,
   agent: AgentKind = "claude", startedAt?: number, turnStartedAt?: number, pinnedLabel?: string, model?: string,
   planOverride?: OpPlan, attentionKindOverride?: "userInput", proposedPlan?: string, dbg?: string,
+  /** APPEND-LAST tee (NOM-44 phase 4). Called with the blob PLAINTEXT this envelope is about to seal,
+   *  so the caller can compare the FITTED `plan` against the full one it passed in and persist the
+   *  unabridged copy on the session record for the LAN `read` op. Purely observational — it runs before
+   *  the seal, never mutates, and a throw is swallowed: a diagnostic tee must not break an envelope. */
+  onBlobPlaintext?: (plain: ReturnType<typeof buildBlob>) => void,
 ): Promise<Record<string, unknown> | null> {
   if (typeof input !== "object" || input === null) return null;
   const i = input as Record<string, unknown>;
@@ -260,7 +265,9 @@ export async function buildEnvelope(
   // `at` is the real event time (`now`) in epoch SECONDS — the phone's honest sort/age key, frozen here
   // and re-sent verbatim by every watchdog heartbeat so an idle-but-heartbeated session ages out.
   const at = Math.floor(now / 1000);
-  const blob = await encryptBlob(e2eKey, buildBlob(i, machine, title, plan, agent, turnStartedAt, pinnedLabel, model, at, proposedPlan, dbg));
+  const plaintext = buildBlob(i, machine, title, plan, agent, turnStartedAt, pinnedLabel, model, at, proposedPlan, dbg);
+  try { onBlobPlaintext?.(plaintext); } catch { /* a tee must never break an envelope */ }
+  const blob = await encryptBlob(e2eKey, plaintext);
   const attentionKind = attentionKindOverride ?? (
     agent === "codex" && hookName === "PreToolUse" && i.tool_name === "request_user_input"
       ? "userInput" as const
@@ -326,6 +333,7 @@ export async function trackSessionAt(
   turnStartedAt?: number, turnId?: string, title?: string, pairingId?: string, model?: string,
   pendingPlanPicker: boolean = false, pid: number = process.ppid, origin?: SessionOrigin,
   planPickerVerificationPending: boolean = false, dbg?: string, attentionKind?: "userInput",
+  planFull?: string,
 ): Promise<void> {
   try {
     const path = `${sessionsDir}/${sessionId}.json`;
@@ -392,6 +400,12 @@ export async function trackSessionAt(
       // here, never patched) and OMITTED when the event has none, keeping every existing record's bytes
       // byte-identical.
       ...(attentionKind ? { attentionKind } : {}),
+      // APPENDED LAST (NOM-44 phase 4). The UNABRIDGED plan markdown, present ONLY when the blob's
+      // `plan` key had to be cut (or dropped) to fit the worker's 3072-char sealed ceiling — the caller
+      // passes fullTextForRecord(proposedPlan, <the fitted plan buildBlob produced>), which is undefined
+      // whenever the whole thing already rode. Written through like every field here (the record is
+      // rebuilt whole, never patched), so the next event of this session drops it automatically.
+      ...(typeof planFull === "string" && planFull.length > 0 ? { planFull } : {}),
     };
     // Owner-only (0600): the record carries hostname, cwd basename, the session pid, and the ABSOLUTE
     // transcript path — never group/world readable, matching config.json / the pending stash.
@@ -409,12 +423,13 @@ export async function trackSession(
   turnStartedAt?: number, turnId?: string, title?: string, pairingId?: string, model?: string,
   pendingPlanPicker: boolean = false, pid: number = process.ppid, origin?: SessionOrigin,
   planPickerVerificationPending: boolean = false, dbg?: string, attentionKind?: "userInput",
+  planFull?: string,
 ): Promise<void> {
   return trackSessionAt(
     SESSIONS_DIR,
     sessionId, op, prio, status, blob, machine, label, transcript, agent, sessionStartedAt,
     turnStartedAt, turnId, title, pairingId, model, pendingPlanPicker, pid, origin,
-    planPickerVerificationPending, dbg, attentionKind,
+    planPickerVerificationPending, dbg, attentionKind, planFull,
   );
 }
 
@@ -862,7 +877,12 @@ export async function runHook(agent: AgentKind): Promise<void> {
       ttl: pendingPlanPicker || planPickerVerificationPending ? "0m" : "-",
       by: "h",
     }) : undefined;
-    const envelope = await buildEnvelope(eventInput, machine, Date.now(), title, config.e2eKey, sentDone, agent, startedAt, turnStartedAt, label, model, plan, attentionKind, proposedPlan, dbg);
+    // The UNABRIDGED plan, kept ONLY when the blob's `plan` key had to be cut to fit the worker's sealed
+    // ceiling (NOM-44 phase 4). The tee hands back the exact plaintext buildBlob produced, so the
+    // comparison is against the real fitted value rather than a re-derivation that could drift.
+    let planFull: string | undefined;
+    const envelope = await buildEnvelope(eventInput, machine, Date.now(), title, config.e2eKey, sentDone, agent, startedAt, turnStartedAt, label, model, plan, attentionKind, proposedPlan, dbg,
+      (plaintext) => { planFull = fullTextForRecord(proposedPlan, plaintext.plan); });
     if (!envelope) return;
 
     // Record (or, on op:end, remove) this session's file and make sure the liveness watchdog is
@@ -886,7 +906,9 @@ export async function runHook(agent: AgentKind): Promise<void> {
       // The SAME discriminator this event's envelope carries (buildEnvelope stamps it on the clear wire
       // envelope): cached so the LAN frames feed, which rebuilds frames from the record rather than from
       // the POST, keeps a Codex question labelled as a question.
-      attentionKind);
+      attentionKind,
+      // The unabridged plan for the LAN `read` op — undefined unless the blob's copy was truncated.
+      planFull);
     const clearedPickerMarker = pendingPlanPicker === false && planPickerVerificationPending === false
       && (existingRecord?.pendingPlanPicker === true || existingRecord?.planPickerVerificationPending === true || existingRecord?.planPickerSettled === true);
     if (agent === "codex" && (hookName === "Stop" || pendingPlanPicker || planPickerVerificationPending || clearedPickerMarker)) {

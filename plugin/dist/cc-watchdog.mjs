@@ -191,6 +191,23 @@ function appendFittedPlanAndDebug(base, plan, dbg) {
   const withDebug = { ...withPlan, dbg: capped };
   return sealedBlobChars(encoder.encode(JSON.stringify(withDebug)).length) <= BLOB_FIT_CHARS ? withDebug : withPlan;
 }
+var RECORD_FULL_TEXT_MAX_CHARS = 262144;
+var RECORD_FULL_TEXT_TRUNCATION_MARKER = `
+…[truncated]`;
+function fullTextForRecord(full, fitted) {
+  if (typeof full !== "string" || full.length === 0)
+    return;
+  if (full === fitted)
+    return;
+  const chars = Array.from(full);
+  if (chars.length <= RECORD_FULL_TEXT_MAX_CHARS)
+    return full;
+  const markerChars = Array.from(RECORD_FULL_TEXT_TRUNCATION_MARKER).length;
+  return chars.slice(0, RECORD_FULL_TEXT_MAX_CHARS - markerChars).join("") + RECORD_FULL_TEXT_TRUNCATION_MARKER;
+}
+function recordFullTextIsComplete(value) {
+  return !value.endsWith(RECORD_FULL_TEXT_TRUNCATION_MARKER);
+}
 async function flagExists(path) {
   try {
     await access(path);
@@ -520,6 +537,19 @@ async function readRecord(sessionId, sessionsDir = SESSIONS_DIR) {
   } catch {
     return null;
   }
+}
+async function stampPermissionDetailFullAt(sessionsDir, sessionId, permissionDetailFull) {
+  try {
+    const record = await readRecord(sessionId, sessionsDir);
+    if (!record)
+      return;
+    if (record.permissionDetailFull === permissionDetailFull)
+      return;
+    await atomicWrite(`${sessionsDir}/${sessionId}.json`, JSON.stringify({ ...record, permissionDetailFull }), 384);
+  } catch {}
+}
+async function stampPermissionDetailFull(sessionId, permissionDetailFull) {
+  return stampPermissionDetailFullAt(SESSIONS_DIR, sessionId, permissionDetailFull);
 }
 async function readPrefix(path, maxBytes) {
   const fh = await open(path, "r");
@@ -3152,6 +3182,16 @@ function parseLanFramesRequest(payload) {
     return null;
   return { sinceSeq, waitMs };
 }
+var LAN_SESSION_ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
+function parseLanReadRequest(payload) {
+  const what = payload.what;
+  const sessionId = payload.sessionId;
+  if (what !== "plan" && what !== "permission-detail")
+    return null;
+  if (typeof sessionId !== "string" || !LAN_SESSION_ID_RE.test(sessionId))
+    return null;
+  return { what, sessionId };
+}
 var LAN_STATE_PATH = `${CC_DIR}/lan.json`;
 function parseLanState(raw) {
   try {
@@ -3378,6 +3418,32 @@ function createLanFrameStore(deps = {}) {
       pairingId = next;
       entries.clear();
       store.reconcile();
+    },
+    async readFull(sessionId, what) {
+      try {
+        if (!sessionsDir)
+          return null;
+        if (!LAN_SESSION_ID_RE.test(sessionId))
+          return null;
+        let record;
+        try {
+          record = JSON.parse(await readFile3(`${sessionsDir}/${sessionId}.json`, "utf8"));
+        } catch {
+          return null;
+        }
+        if (pairingId === undefined || record.pairingId !== pairingId)
+          return null;
+        if (typeof record.ts !== "number" || !Number.isFinite(record.ts))
+          return null;
+        if (now() - record.ts > LAN_FRAME_SESSION_STALE_MS)
+          return null;
+        const content = what === "plan" ? record.planFull : record.permissionDetailFull;
+        if (typeof content !== "string" || content.length === 0)
+          return null;
+        return { content, complete: recordFullTextIsComplete(content) };
+      } catch {
+        return null;
+      }
     },
     reconcile() {
       if (stopped)
@@ -3669,6 +3735,12 @@ function createLanListener(deps = {}) {
         const lid = address?.lid ?? "";
         const slice = await frames.wait(request.sinceSeq, request.waitMs);
         payload = { ok: true, seq: slice.seq, lid, frames: slice.frames };
+      } else if (envelope.op === "read") {
+        const request = parseLanReadRequest(envelope.payload);
+        if (!request)
+          return reject(res, "read-payload");
+        const hit = await frames.readFull(request.sessionId, request.what);
+        payload = hit ? { ok: true, content: hit.content, complete: hit.complete } : { ok: false, err: "not-found" };
       } else if (envelope.op === "answer-poll" && isLoopbackAddress(peerAddress(req))) {
         const requestId = envelope.payload.requestId;
         if (typeof requestId !== "string" || !LAN_REQUEST_ID_RE.test(requestId))
@@ -4048,7 +4120,7 @@ function buildBlob(input, machine, title, plan, agent = "claude", turnStartedAt,
   }) : undefined;
   return appendFittedPlanAndDebug(base, proposedPlan, dbg);
 }
-async function buildEnvelope(input, machine, now, title, e2eKey, sentDone, agent = "claude", startedAt, turnStartedAt, pinnedLabel, model, planOverride, attentionKindOverride, proposedPlan, dbg) {
+async function buildEnvelope(input, machine, now, title, e2eKey, sentDone, agent = "claude", startedAt, turnStartedAt, pinnedLabel, model, planOverride, attentionKindOverride, proposedPlan, dbg, onBlobPlaintext) {
   if (typeof input !== "object" || input === null)
     return null;
   const i = input;
@@ -4062,7 +4134,11 @@ async function buildEnvelope(input, machine, now, title, e2eKey, sentDone, agent
   if (typeof startedAt === "number" && Number.isFinite(startedAt))
     base.startedAt = startedAt;
   const at = Math.floor(now / 1000);
-  const blob = await encryptBlob(e2eKey, buildBlob(i, machine, title, plan, agent, turnStartedAt, pinnedLabel, model, at, proposedPlan, dbg));
+  const plaintext = buildBlob(i, machine, title, plan, agent, turnStartedAt, pinnedLabel, model, at, proposedPlan, dbg);
+  try {
+    onBlobPlaintext?.(plaintext);
+  } catch {}
+  const blob = await encryptBlob(e2eKey, plaintext);
   const attentionKind = attentionKindOverride ?? (agent === "codex" && hookName === "PreToolUse" && i.tool_name === "request_user_input" ? "userInput" : undefined);
   return { ...base, ...attentionKind ? { attentionKind } : {}, blob };
 }
@@ -4085,7 +4161,7 @@ async function stashPendingEvent(input, machine, title, now, stashPath = PENDING
     await atomicWrite(stashPath, JSON.stringify(stash), 384);
   } catch {}
 }
-async function trackSessionAt(sessionsDir, sessionId, op, prio, status, blob, machine, label, transcript, agent = "claude", sessionStartedAt, turnStartedAt, turnId, title, pairingId, model, pendingPlanPicker = false, pid = process.ppid, origin, planPickerVerificationPending = false, dbg, attentionKind) {
+async function trackSessionAt(sessionsDir, sessionId, op, prio, status, blob, machine, label, transcript, agent = "claude", sessionStartedAt, turnStartedAt, turnId, title, pairingId, model, pendingPlanPicker = false, pid = process.ppid, origin, planPickerVerificationPending = false, dbg, attentionKind, planFull) {
   try {
     const path = `${sessionsDir}/${sessionId}.json`;
     if (op === "end") {
@@ -4117,13 +4193,14 @@ async function trackSessionAt(sessionsDir, sessionId, op, prio, status, blob, ma
       ...pendingPlanPicker || planPickerVerificationPending ? { planPickerPendingSince: recordedAt } : {},
       ...typeof dbg === "string" && dbg.length > 0 ? { dbg } : {},
       ...origin ? { origin } : {},
-      ...attentionKind ? { attentionKind } : {}
+      ...attentionKind ? { attentionKind } : {},
+      ...typeof planFull === "string" && planFull.length > 0 ? { planFull } : {}
     };
     await atomicWrite(path, JSON.stringify(record), 384);
   } catch {}
 }
-async function trackSession(sessionId, op, prio, status, blob, machine, label, transcript, agent = "claude", sessionStartedAt, turnStartedAt, turnId, title, pairingId, model, pendingPlanPicker = false, pid = process.ppid, origin, planPickerVerificationPending = false, dbg, attentionKind) {
-  return trackSessionAt(SESSIONS_DIR, sessionId, op, prio, status, blob, machine, label, transcript, agent, sessionStartedAt, turnStartedAt, turnId, title, pairingId, model, pendingPlanPicker, pid, origin, planPickerVerificationPending, dbg, attentionKind);
+async function trackSession(sessionId, op, prio, status, blob, machine, label, transcript, agent = "claude", sessionStartedAt, turnStartedAt, turnId, title, pairingId, model, pendingPlanPicker = false, pid = process.ppid, origin, planPickerVerificationPending = false, dbg, attentionKind, planFull) {
+  return trackSessionAt(SESSIONS_DIR, sessionId, op, prio, status, blob, machine, label, transcript, agent, sessionStartedAt, turnStartedAt, turnId, title, pairingId, model, pendingPlanPicker, pid, origin, planPickerVerificationPending, dbg, attentionKind, planFull);
 }
 async function markDoneDeliveredAt(sessionsDir, sessionId) {
   try {
@@ -4403,7 +4480,10 @@ async function runHook(agent) {
       ttl: pendingPlanPicker || planPickerVerificationPending ? "0m" : "-",
       by: "h"
     }) : undefined;
-    const envelope = await buildEnvelope(eventInput, machine, Date.now(), title, config.e2eKey, sentDone, agent, startedAt, turnStartedAt, label, model, plan, attentionKind, proposedPlan, dbg);
+    let planFull;
+    const envelope = await buildEnvelope(eventInput, machine, Date.now(), title, config.e2eKey, sentDone, agent, startedAt, turnStartedAt, label, model, plan, attentionKind, proposedPlan, dbg, (plaintext) => {
+      planFull = fullTextForRecord(proposedPlan, plaintext.plan);
+    });
     if (!envelope)
       return;
     const createsRecord = !existingRecord && plan.op !== "end";
@@ -4411,7 +4491,7 @@ async function runHook(agent) {
     const origin = existingRecord?.origin ?? sessionOrigin(input, hookPid, hookCommand);
     const recordPid = reusedForkPredecessor ? existingRecord.pid : hookPid;
     const recordTranscript = reusedForkPredecessor ? existingRecord.transcript ?? transcriptPath : transcriptPath;
-    await trackSession(sessionId, plan.op, plan.prio, plan.status, envelope.blob, machine, label, recordTranscript, agent, startedAt, turnStartedAt, turnId, title, config.pairingId, model, pendingPlanPicker, recordPid, origin, planPickerVerificationPending, dbg, attentionKind);
+    await trackSession(sessionId, plan.op, plan.prio, plan.status, envelope.blob, machine, label, recordTranscript, agent, startedAt, turnStartedAt, turnId, title, config.pairingId, model, pendingPlanPicker, recordPid, origin, planPickerVerificationPending, dbg, attentionKind, planFull);
     const clearedPickerMarker = pendingPlanPicker === false && planPickerVerificationPending === false && (existingRecord?.pendingPlanPicker === true || existingRecord?.planPickerVerificationPending === true || existingRecord?.planPickerSettled === true);
     if (agent === "codex" && (hookName === "Stop" || pendingPlanPicker || planPickerVerificationPending || clearedPickerMarker)) {
       tracePlanPickerDecision(sessionId, {
@@ -5060,6 +5140,9 @@ function createLoopbackAnswerPoller(config, requestId, deps) {
 function defaultLanStatePath() {
   return lanRunningUnderTest() ? undefined : LAN_STATE_PATH;
 }
+function defaultStampDetailFull() {
+  return lanRunningUnderTest() ? async () => {} : stampPermissionDetailFull;
+}
 async function readStdin2() {
   const chunks = [];
   for await (const chunk of process.stdin)
@@ -5142,7 +5225,12 @@ async function runPermissionHook(deps = {}, agent = "claude") {
       permissionRequestId: requestId,
       permissionToolName: toolName
     };
-    const fitted = fitPermissionDetail(permissionBase, buildPermissionDetail(toolName, toolInput), BLOB_FIT_CHARS, buildPermissionQuestions(toolInput));
+    const rawDetail = buildPermissionDetail(toolName, toolInput);
+    const fitted = fitPermissionDetail(permissionBase, rawDetail, BLOB_FIT_CHARS, buildPermissionQuestions(toolInput));
+    const detailFull = fullTextForRecord(rawDetail, fitted.detail);
+    if (record && record.permissionDetailFull !== detailFull) {
+      await (deps.stampDetailFullFn ?? defaultStampDetailFull())(sessionId, detailFull);
+    }
     const blob = await encryptBlob(config.e2eKey, permissionFrame(permissionBase, fitted.detail, fitted.omitted, fitted.questions));
     const fallbackBlob = await encryptBlob(config.e2eKey, base);
     const pcHeaders = { "x-cc-pairing": config.pairingId, "x-cc-auth": config.pcSecret, "x-cc-version": PLUGIN_VERSION };

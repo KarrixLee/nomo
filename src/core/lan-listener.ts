@@ -58,6 +58,21 @@
 //          the record's e2eKey-sealed ciphertext VERBATIM — the listener never opens it, so this feed is
 //          as blind as the worker. Frames are seq-ascending, one per session (latest state only), and a
 //          request with nothing new is HELD up to waitMs, answered the moment anything changes.
+//
+// PHASE 4 adds the on-demand pull for content the WORKER path has to truncate:
+//
+//   {"op":"read", payload:{"what":"plan"|"permission-detail","sessionId":"<id>"}}
+//        → sealed {"ok":true,"content":"<the whole thing>","complete":true|false}
+//          |       {"ok":false,"err":"not-found"}
+//        The worker caps a sealed blob at 3072 base64 chars, so a long plan reaches the phone as a
+//        prefix (and a long permission detail as a prefix plus an omitted-count). The hook tees the
+//        UNABRIDGED string onto the 0600 session record whenever that fit actually cut something;
+//        this op serves it. There is no ceiling on this path — `complete:false` means only that the
+//        record-side 256 KB cap clipped it. Unlike `frames`, the content here is PLAINTEXT inside the
+//        K_lan seal rather than a second, e2eKey-sealed blob: this is a direct Mac↔phone channel with
+//        no blind relay in the middle, so the outer seal already IS the end-to-end seal. `not-found`
+//        covers every miss identically (unknown session, other pairing, expired record, nothing was
+//        truncated) — the phone's fallback is the blob's own copy in all of them.
 
 import { createServer } from "node:http";
 import { readFile } from "node:fs/promises";
@@ -69,7 +84,7 @@ import { atomicWrite, Config, traceSession } from "./shared";
 import {
   isLoopbackAddress, LAN_ANSWER_BLOB_MAX_CHARS, LAN_ENVELOPE_VERSION, LAN_PATH, LAN_REQUEST_ID_RE,
   LAN_STATE_PATH, lanEnvelopeIsFresh, lanRunningUnderTest, parseLanEnvelope, parseLanFramesRequest,
-  parseLanState,
+  parseLanReadRequest, parseLanState,
 } from "./lan-wire";
 import type { LanState } from "./lan-wire";
 
@@ -78,10 +93,11 @@ import type { LanState } from "./lan-wire";
 // "./lan-listener" — tests included — keeps resolving exactly the same names.
 export {
   isLoopbackAddress, LAN_ANSWER_BLOB_MAX_CHARS, LAN_ENVELOPE_VERSION, LAN_FRAMES_WAIT_MAX_MS,
-  LAN_FUTURE_SKEW_MS, LAN_NONCE_MAX_CHARS, LAN_PATH, LAN_REQUEST_ID_RE, LAN_STATE_PATH, LAN_TTL_MS,
-  lanEnvelopeIsFresh, lanRunningUnderTest, parseLanEnvelope, parseLanFramesRequest, parseLanState,
+  LAN_FUTURE_SKEW_MS, LAN_NONCE_MAX_CHARS, LAN_PATH, LAN_REQUEST_ID_RE, LAN_SESSION_ID_RE,
+  LAN_STATE_PATH, LAN_TTL_MS, lanEnvelopeIsFresh, lanRunningUnderTest, parseLanEnvelope,
+  parseLanFramesRequest, parseLanReadRequest, parseLanState,
 } from "./lan-wire";
-export type { LanEnvelope, LanFramesRequest, LanState } from "./lan-wire";
+export type { LanEnvelope, LanFramesRequest, LanReadRequest, LanReadWhat, LanState } from "./lan-wire";
 
 /** Request-body ceiling. A command envelope is a few hundred bytes; 64 KB is enormous headroom and
  *  still bounds what a hostile LAN peer can make this daemon buffer. Enforced on Content-Length AND on
@@ -242,7 +258,8 @@ export interface LanListenerDeps {
   /** The answer store this listener writes/serves. Defaults to the process-wide singleton, which is what
    *  makes the in-process Codex relay see the same answers. */
   answers?: LanAnswerStore;
-  /** The phase-3 status feed the `frames` op serves. Defaults to a store over the real session dir
+  /** The phase-3 status feed the `frames` op serves (and the phase-4 `read` op's record access).
+   *  Defaults to a store over the real session dir
    *  (inert under `bun test` — see createLanFrameStore). Its lifecycle is OWNED here: started with the
    *  listener and stopped by stop(), which is what wires it into all three watchdog teardown seams
    *  (ownership loss, run()'s finally, SIGTERM/SIGINT) without the daemon knowing it exists. */
@@ -496,6 +513,17 @@ export function createLanListener(deps: LanListenerDeps = {}): LanListener {
         // and a data-bearing reply without it reads as "listener too old for this op" — which would
         // permanently stop the frames channel for this lid.
         payload = { ok: true, seq: slice.seq, lid, frames: slice.frames };
+      } else if (envelope.op === "read") {
+        const request = parseLanReadRequest(envelope.payload);
+        if (!request) return reject(res, "read-payload");
+        // On-demand disk read through the frame store (which owns the sessions dir and the pairing
+        // guard); nothing is cached here. `not-found` is the ONE answer for every miss — absent session,
+        // other pairing, expired record, or a field that was never truncated in the first place — so the
+        // phone's fallback is the same in all of them: render the copy already in the blob.
+        const hit = await frames.readFull(request.sessionId, request.what);
+        payload = hit
+          ? { ok: true, content: hit.content, complete: hit.complete }
+          : { ok: false, err: "not-found" };
       } else if (envelope.op === "answer-poll" && isLoopbackAddress(peerAddress(req))) {
         // LOOPBACK ONLY. This op exists for the blocked Claude hook — a separate short-lived process on
         // THIS machine with no IPC to the daemon. The phone never needs it, so an off-LAN-address caller
