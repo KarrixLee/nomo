@@ -39,6 +39,8 @@ import { focusTerminalForPid } from "../core/terminal-focus";
 import type { FocusContext, FocusResult } from "../core/terminal-focus";
 import { CodexRemoteInputBridge } from "../core/codex-remote-input-bridge";
 import type { CodexThreadWaitState } from "../core/codex-remote-input-bridge";
+import { createLanHintPublisher, createLanListener } from "../core/lan-listener";
+import type { LanCommand, LanListener } from "../core/lan-listener";
 import type { PlanPickerTraceDecision } from "../core/shared";
 import {
   AgentKind, appendFittedPlanAndDebug, atomicWrite, CC_DIR, CCOp, CCStatus, codexAppServerSocketAvailable, Config, completePendingPairing, formatPlanPickerDebug, formatWatchdogPidfile,
@@ -857,6 +859,20 @@ export function watchdogEventHeaders(config: Config, approvals: string): Record<
   };
 }
 
+// --- LAN listener handle (NOM-44 phase 1) ------------------------------------------------------
+//
+// The listener is a same-network fast path for phone→Mac commands; the worker channel below stays
+// canonical and completely unchanged. Two module-level handles because two very different call sites
+// need it: postEvent (to piggyback the sealed host hint) and the signal handlers (to stop the socket).
+
+/** The running loop's listener, published so postEvent can read its address and the SIGTERM/SIGINT
+ *  handler can close the socket. Undefined outside a live run(). */
+let activeLanListener: LanListener | undefined;
+
+/** Publishes the sealed LAN host hint on the POSTs the daemon already makes (see lan-listener). It is
+ *  a module singleton for the same reason the buffers above are: postEvent has no place to hang state. */
+const lanHintPublisher = createLanHintPublisher({ address: () => activeLanListener?.address() ?? null });
+
 /** POST a v2 envelope to the Worker with the per-pairing auth headers. `delivered` ONLY on a 2xx:
  *  a 401/500 is a FAILURE, not success — otherwise a bad secret or a Worker error would count as
  *  delivered and the caller would delete/rewrite the session file, losing the session. A 404 is
@@ -864,10 +880,15 @@ export function watchdogEventHeaders(config: Config, approvals: string): Record<
  *  Any network error / timeout is a transient `failed`. Best-effort: never throws across its boundary. */
 async function postEvent(config: Config, body: object): Promise<PostOutcome> {
   try {
+    // The LAN listener's sealed host hint rides along on the POSTs this daemon already makes — no new
+    // request is ever issued for discovery, and `take` returns undefined unless the hint actually
+    // changed or its 5-minute refresh came due (so the overwhelming majority of POSTs are untouched).
+    const lanHint = await lanHintPublisher.take(config);
+    const payload = lanHint ? { ...body, lanHint } : body;
     const res = await fetch(`${config.url}/v1/cc/event`, {
       method: "POST",
       headers: watchdogEventHeaders(config, await localApprovalsState()),
-      body: JSON.stringify(body),
+      body: JSON.stringify(payload),
       signal: AbortSignal.timeout(2000),
     });
     const outcome = postOutcomeForStatus(res.status);
@@ -1237,6 +1258,57 @@ export async function drainCommands(config: Config, deps: DrainCommandsDeps = {}
     return focused;
   } catch {
     return 0; // a command must never derail the sweep
+  }
+}
+
+// --- LAN command intake (phone → Mac, direct, same network) ------------------------------------
+//
+// The SECOND delivery channel for the exact same sealed commands. The phone dispatches both legs in
+// parallel with the SAME ciphertext, so whichever arrives first wins and the loser is dropped by the
+// inner-nonce replay check in drainCommands (step 6) — which is why nothing here re-validates the blob:
+// a second dedupe on command content would only be a second thing to get wrong.
+//
+// CONCURRENCY (verified against drainCommands above, 2026-08-01): the drain is already interleave-safe.
+// It takes its work with a synchronous `commandBuffer.splice(...)`, so two drains can never be handed
+// the same entry; and BOTH of its check-then-remember pairs (`executedCommandIds.has` → rememberBounded,
+// `seenCommandNonces.has` → rememberBounded) are synchronous with no await between the test and the
+// insert, so even two copies of one command racing through separate drains resolve to exactly one
+// executor and one "replay". The latch below therefore is not a correctness patch — it is a simplicity
+// guarantee: with the immediate LAN drain added there are now TWO callers, and serializing them keeps
+// the (already fine) reasoning about focus side effects trivially true rather than subtle.
+
+/** Serializes every drainCommands call — the sweep's once-per-tick one and the LAN listener's
+ *  immediate one — onto a single chain. Always resolves (drainCommands swallows everything). */
+let drainChain: Promise<unknown> = Promise.resolve();
+
+/** Queue a drain behind any in-flight one. Returns the number of commands that focused something. */
+export function enqueueDrainCommands(config: Config, deps: DrainCommandsDeps = {}): Promise<number> {
+  const run = (): Promise<number> => drainCommands(config, deps);
+  const next = drainChain.then(run, run);
+  drainChain = next.catch(() => {});
+  return next;
+}
+
+/** Prefix stamped on the command id of a LAN-delivered command, so the trace line says which channel
+ *  delivered it. The id is only ever used for the delivered-twice check (`executedCommandIds`); the
+ *  REPLAY bound is the sealed inner nonce, which is identical on both legs — that is precisely what
+ *  makes racing the two channels a no-op instead of a double focus. */
+export const LAN_COMMAND_ID_PREFIX = "lan:";
+
+/** The listener's command sink. Buffers the still-sealed blob exactly like extractCommands does for the
+ *  worker leg, then kicks an IMMEDIATE drain — that one call is the whole latency win (a command no
+ *  longer waits for the next 5 s sweep, let alone the next worker round trip).
+ *
+ *  The returned promise is for TESTS ONLY. The listener wires this in as `onCommand` (a void-returning
+ *  sink) and deliberately does NOT await it: the HTTP response must go back the instant the blob is
+ *  queued, never after an osascript window raise. It resolves rather than rejects in every case. */
+export function acceptLanCommand(command: LanCommand, deps: DrainCommandsDeps = {}): Promise<number> {
+  try {
+    if (commandBuffer.length >= COMMAND_BUFFER_MAX) return Promise.resolve(0); // the worker leg's bound
+    commandBuffer.push({ id: `${LAN_COMMAND_ID_PREFIX}${command.nonce}`, blob: command.blob });
+    return enqueueDrainCommands(command.config, deps).catch(() => 0);
+  } catch {
+    return Promise.resolve(0); // a malformed sink call must never surface anywhere
   }
 }
 
@@ -2598,6 +2670,11 @@ export async function goneStrikeShouldTeardown(goneStrikesPath?: string): Promis
  *  through the same path run()'s `finally` uses. Undefined outside a live run(). */
 let activeBridgeShutdown: (() => void) | undefined;
 
+/** The running loop's LAN listener teardown, published for the SIGTERM/SIGINT handler for the same
+ *  reason activeBridgeShutdown is: default signal handling skips run()'s `finally`, and a leaked
+ *  listening socket would keep the successor watchdog from re-binding the persisted port. */
+let activeLanShutdown: (() => void) | undefined;
+
 /** How long a detached bridge operation may run before the supervisor stops waiting on it. It is NOT a
  *  cancel (the underlying client owns its own retry/backoff) — it just bounds the supervisor's own
  *  bookkeeping so a wedged child can never pin an in-flight operation forever. */
@@ -2883,17 +2960,33 @@ async function run(): Promise<void> {
   let lastActiveMs = Date.now();
   const bridges = createBridgeSupervisor();
   activeBridgeShutdown = () => bridges.shutdown();
+  // The LAN listener starts only AFTER the single-instance claim: exactly one watchdog per machine may
+  // own the socket (and the persisted port in lan.json), and a losing instance returned above without
+  // ever reaching here. createLanListener returns immediately — the bind runs off this stack, so a
+  // refused/occupied port can never delay the first sweep.
+  const lan = createLanListener({ onCommand: acceptLanCommand });
+  activeLanListener = lan;
+  const shutdown = (): void => {
+    bridges.shutdown();
+    try { lan.stop(); } catch { /* best-effort socket teardown */ }
+  };
+  activeLanShutdown = () => { try { lan.stop(); } catch { /* best-effort */ } };
   try {
     while (true) {
       // A claim can be stolen or removed after startup (upgrade takeover, reset, racing spawn). An
-      // ownerless daemon must not touch sessions or retain its proxy/bridge children for another tick.
-      if (!enforceWatchdogOwnership(() => bridges.shutdown())) return;
+      // ownerless daemon must not touch sessions or retain its proxy/bridge children — or its LAN
+      // socket, which a successor needs to re-bind — for another tick.
+      if (!enforceWatchdogOwnership(shutdown)) return;
       const config = await loadConfig(); // reload each cycle: a mid-pairing config may complete under us
       // A real Codex request_user_input response must return on the SAME shared app-server process, so
       // the bridge attaches through `codex app-server proxy` — but ONLY while that control socket exists
       // (re-probed every cycle) and never on the sweep's own await path. Fail-open in both directions: no
       // Codex daemon → no bridge and no spawn at all; a wedged proxy child → the sweep keeps its cadence.
       await bridges.sync(config);
+      // Re-key the LAN listener from the CURRENT config (a re-pair rotates e2eKey, and K_lan derives
+      // from it). Deliberately NOT awaited-on-IO: sync() only swaps a promise and returns, so the LAN
+      // channel can never sit on the sweep path — the design's non-negotiable.
+      lan.sync(config);
       // Discovery + reconcile run BEFORE the sweep (only when paired). Backstop-reconcile first (retire
       // any provisional whose real session already reported), then discover new TUIs — so a just-
       // surfaced provisional is counted in `remaining` this same cycle, keeping the daemon alive
@@ -2908,7 +3001,7 @@ async function run(): Promise<void> {
       // Commands the worker piggybacked on THIS cycle's POST responses (discovery/reconcile/sweep).
       // Drained once per tick, off the POST path, so a slow osascript can never delay a status event.
       // Best-effort by construction — drainCommands swallows everything and returns a count.
-      if (config) await drainCommands(config);
+      if (config) await enqueueDrainCommands(config);
       if (result.revoked) {
         // A /cc/event POST came back gone (404/410) this sweep. Do NOT tear down on the first one — a
         // single gone can be a transient/racing delete (worker redeploy, KV eventual-consistency), and
@@ -2967,8 +3060,10 @@ async function run(): Promise<void> {
       await new Promise((r) => setTimeout(r, POLL_MS));
     }
   } finally {
-    bridges.shutdown();
+    shutdown(); // bridge child AND the LAN socket — a retired daemon must leave no listener behind
     activeBridgeShutdown = undefined;
+    activeLanShutdown = undefined;
+    activeLanListener = undefined;
     releaseSingleInstance(); // auto-quit on empty: drop our pidfile so the next hook re-spawns
   }
 }
@@ -2986,6 +3081,7 @@ if (import.meta.main) {
   const onTerminate = (): void => {
     try { releaseSingleInstance(); } catch { /* nothing to release */ }
     try { activeBridgeShutdown?.(); } catch { /* best-effort */ }
+    try { activeLanShutdown?.(); } catch { /* best-effort */ }
     const exitTimer = setTimeout(() => process.exit(0), 250);
     (exitTimer as unknown as { unref?: () => void }).unref?.();
   };

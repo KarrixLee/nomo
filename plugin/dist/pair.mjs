@@ -19,6 +19,7 @@ var textEncoder = new TextEncoder;
 var textDecoder = new TextDecoder;
 var HKDF_INFO = textEncoder.encode("nomo-cc-e2e-v1");
 var RATCHET_INFO_PREFIX = "nomo-cc-ratchet-v1|";
+var LAN_INFO_PREFIX = "nomo-lan-v1|";
 var ECDH_P256 = { name: "ECDH", namedCurve: "P-256" };
 function bytesToBase64(bytes) {
   let binary = "";
@@ -44,6 +45,16 @@ function fromB64url(s) {
 async function deriveE2EKey(qrSecret, phoneNonce) {
   const ikm = await crypto.subtle.importKey("raw", qrSecret, "HKDF", false, ["deriveBits"]);
   const bits = await crypto.subtle.deriveBits({ name: "HKDF", hash: "SHA-256", salt: phoneNonce, info: HKDF_INFO }, ikm, 256);
+  return new Uint8Array(bits);
+}
+async function deriveLanKey(e2eKey, pairingId) {
+  const ikm = await crypto.subtle.importKey("raw", e2eKey, "HKDF", false, ["deriveBits"]);
+  const bits = await crypto.subtle.deriveBits({
+    name: "HKDF",
+    hash: "SHA-256",
+    salt: new Uint8Array(0),
+    info: textEncoder.encode(LAN_INFO_PREFIX + pairingId)
+  }, ikm, 256);
   return new Uint8Array(bits);
 }
 async function generateEphemeralKeyPair() {

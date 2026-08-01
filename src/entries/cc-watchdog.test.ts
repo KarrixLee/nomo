@@ -7,6 +7,7 @@ import { decryptBlob, encryptBlob } from "../core/crypto";
 import type { PlanPickerTraceDecision, SessionRecord } from "../core/shared";
 import { GONE_STRIKE_LIMIT, readGoneStrikes, recordGoneStrike, resetGoneStrikes, tracePlanPickerDecision } from "../core/shared";
 import {
+  acceptLanCommand, enqueueDrainCommands, LAN_COMMAND_ID_PREFIX,
   buildDoneEnvelope, buildEndEnvelope, buildHeartbeatEnvelope, buildNeedsAttentionEnvelope, buildProvisionalBlob,
   buildProvisionalEnvelope, buildProvisionalRecord, buildStartEnvelope, buildTitleRepairEnvelope, classifySession,
   claudeTailPendingApproval, codexLastTurnEvent, codexTailPendingApproval, correctIdleClaude, correctInterrupt,
@@ -2858,6 +2859,99 @@ describe("drainCommands (authenticate, validate, then execute)", () => {
 
   test("a throwing take() cannot derail the sweep", async () => {
     expect(await drainCommands(cfg(), { take: () => { throw new Error("boom"); } })).toBe(0);
+  });
+});
+
+// --- the LAN channel's glue into the SAME command chain (NOM-44 phase 1) -----------------------
+//
+// acceptLanCommand is the listener's sink. It must buffer the blob exactly the way extractCommands does
+// for the worker leg and then kick an immediate drain — never re-validate, so the two channels dedupe on
+// the one thing that is identical across them: the inner sealed nonce.
+describe("acceptLanCommand + enqueueDrainCommands (the LAN leg of command intake)", () => {
+  beforeEach(() => { resetCommandState(); });
+
+  const NOW = 1_800_000_000_000;
+
+  const lanBlob = (over: Record<string, unknown> = {}): Promise<string> => encryptBlob(KEY, {
+    kind: "focus-terminal", sessionId: "sess-a", ts: NOW, nonce: "lan-nonce-1", ...over,
+  });
+
+  const harness = () => {
+    const focused: number[] = [];
+    const traces: Record<string, unknown>[] = [];
+    const deps: DrainCommandsDeps = {
+      readRecords: async () => [{ sessionId: "sess-a", rec: rec({ pid: 11 }) }],
+      adapters: [{ ...claudeAdapter, locateTuiPid: (async ({ record }) => record.pid) as AgentAdapter["locateTuiPid"] }],
+      focus: async (pid) => { focused.push(pid); return { ok: true, via: "terminal-app" }; },
+      now: () => NOW,
+      trace: (e) => traces.push(e as Record<string, unknown>),
+    };
+    return { focused, traces, deps };
+  };
+
+  test("a LAN command lands in the shared buffer under a lan:-prefixed id and drains through the normal chain", async () => {
+    const { focused, traces, deps } = harness();
+    // acceptLanCommand pushes into the SAME module buffer the worker leg fills (the drain's default
+    // take()), and kicks the drain itself — the whole latency win in one call.
+    expect(await acceptLanCommand({ nonce: "outer-1", blob: await lanBlob(), config: cfg() }, deps)).toBe(1);
+    expect(focused).toEqual([11]);
+    expect(traces[0]).toMatchObject({ id: `${LAN_COMMAND_ID_PREFIX}outer-1`, sessionId: "sess-a", result: "focused" });
+  });
+
+  test("the same ciphertext delivered on BOTH channels focuses once — the inner nonce is the bound", async () => {
+    const { focused, deps } = harness();
+    const blob = await lanBlob();
+    // The worker leg delivers the identical ciphertext under a server-minted id and wins the race...
+    expect(await drainCommands(cfg(), { ...deps, take: () => extractCommands({ commands: [{ id: "wrk-1", blob }] }) })).toBe(1);
+    // ...so the LAN copy, arriving with a different OUTER nonce and a different id, is dropped as a
+    // replay of the inner sealed nonce. No second window raise.
+    expect(await acceptLanCommand({ nonce: "outer-1", blob, config: cfg() }, deps)).toBe(0);
+    expect(focused).toEqual([11]);
+  });
+
+  test("the shared COMMAND_BUFFER_MAX bound holds, so a LAN peer cannot grow the queue without limit", async () => {
+    const blob = await lanBlob();
+    const traces: Record<string, unknown>[] = [];
+    // Queue far more than the bound WITHOUT draining (a take that yields nothing leaves the buffer be).
+    for (let i = 0; i < 100; i++) {
+      await acceptLanCommand({ nonce: `outer-${i}`, blob, config: cfg() }, { take: () => [], now: () => NOW });
+    }
+    // Now drain for real: every buffered entry produces exactly one trace line, so the count IS the
+    // buffer's depth. 32 = COMMAND_BUFFER_MAX.
+    await drainCommands(cfg(), { readRecords: async () => [], now: () => NOW, trace: (e) => traces.push(e as Record<string, unknown>) });
+    expect(traces.length).toBe(32);
+  });
+
+  test("enqueueDrainCommands serializes: three concurrent drains never overlap", async () => {
+    // Distinct inner nonces so each drain gets past the replay check and into the (async) record read,
+    // which is where an overlap would show up.
+    const blobs = await Promise.all([1, 2, 3].map((i) => lanBlob({ nonce: `lan-nonce-${i}` })));
+    let queued = 0;
+    let active = 0;
+    let overlapped = false;
+    const deps: DrainCommandsDeps = {
+      take: () => [{ id: `c-${queued}`, blob: blobs[queued++] }],
+      readRecords: async () => {
+        active += 1;
+        if (active > 1) overlapped = true;
+        await new Promise((r) => setTimeout(r, 5));
+        active -= 1;
+        return [];
+      },
+      now: () => NOW,
+      trace: () => { /* silent */ },
+    };
+    await Promise.all([
+      enqueueDrainCommands(cfg(), deps),
+      enqueueDrainCommands(cfg(), deps),
+      enqueueDrainCommands(cfg(), deps),
+    ]);
+    expect(overlapped).toBe(false);
+    expect(queued).toBe(3);
+  });
+
+  test("a throwing sink call is swallowed — the HTTP response must never depend on the drain", () => {
+    expect(() => acceptLanCommand({ nonce: "outer-x", blob: "not-a-blob", config: cfg() })).not.toThrow();
   });
 });
 

@@ -129,5 +129,27 @@
         ]
       }
     }
-  ]
+  ],
+  "lan": {
+    "_comment": "LAN transport outer seal (NOM-44 phase 1). K_lan = HKDF-SHA256(ikm = e2eKey, salt = <empty>, info = \"nomo-lan-v1|\" + pairingId). FROZEN cross-platform; the Swift CCLanClient must derive the same key and open the same envelopes. e2eKeyHex is the hkdf vector's expectedKeyHex, so the two entries chain.",
+    "e2eKeyHex": "256a40ccc3cbb4c7338d5fe2bfbf7ae2f021d46a71a99c0d9a935f48e9a6fe22",
+    "pairingId": "0123456789abcdef0123456789abcdef",
+    "info": "nomo-lan-v1|0123456789abcdef0123456789abcdef",
+    "lanKeyHex": "7a682e7a0a1164f46d87f4a5c9e0b57fee0b0a7357e123e7274971a631b5e0ea",
+    "requestEnvelopeB64": "AAECAwQFBgcICQoLKR1cPnK+I+o9tKzsxeY5T2AzB7HZjRHtqWpw+KYRC3/9ZOunaoOCebXb/QU0dQK/1Hfn2M7948xs5DTJLh4lVNE7w6EfJ/G8ywzJJDag3DPnfCvJ7ow+BdzmvMsUJpwfs9ysbjD72MYK9Quki+BXUdrKs78SjqOh",
+    "requestPlaintextJson": {
+      "v": 1,
+      "op": "command",
+      "ts": 1785000000000,
+      "nonce": "AAECAwQFBgcICQoLDA0ODw",
+      "payload": { "blob": "3q2+7w==" }
+    },
+    "responseEnvelopeB64": "ERERERERERERERER9ahjZPkqsdJMuAaph0iGcJNkKdk70r7BQ02vTafgkdpXj5dm6mD842k/yG0UxFlZkPr8SJBWp5piexLEQq+cOEHftjVStrtP2zUA9UAJa/4hE37LozSomCcv1H+HCQRwKBHoAg==",
+    "responsePlaintextJson": {
+      "v": 1,
+      "reqNonce": "AAECAwQFBgcICQoLDA0ODw",
+      "ts": 1785000000123,
+      "payload": { "ok": true }
+    }
+  }
 }

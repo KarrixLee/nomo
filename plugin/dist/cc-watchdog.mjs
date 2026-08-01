@@ -2,7 +2,7 @@ import { createRequire } from "node:module";
 var __require = /* @__PURE__ */ createRequire(import.meta.url);
 
 // src/entries/cc-watchdog.ts
-import { readdir as readdir3, readFile as readFile4, unlink as unlink4 } from "node:fs/promises";
+import { readdir as readdir3, readFile as readFile5, unlink as unlink4 } from "node:fs/promises";
 import { readFileSync as readFileSync2, statSync as statSync3, unlinkSync } from "node:fs";
 import { hostname as hostname4 } from "node:os";
 import { basename as basename4 } from "node:path";
@@ -12,6 +12,7 @@ var textEncoder = new TextEncoder;
 var textDecoder = new TextDecoder;
 var HKDF_INFO = textEncoder.encode("nomo-cc-e2e-v1");
 var RATCHET_INFO_PREFIX = "nomo-cc-ratchet-v1|";
+var LAN_INFO_PREFIX = "nomo-lan-v1|";
 var ECDH_P256 = { name: "ECDH", namedCurve: "P-256" };
 function bytesToBase64(bytes) {
   let binary = "";
@@ -37,6 +38,16 @@ function fromB64url(s) {
 async function deriveE2EKey(qrSecret, phoneNonce) {
   const ikm = await crypto.subtle.importKey("raw", qrSecret, "HKDF", false, ["deriveBits"]);
   const bits = await crypto.subtle.deriveBits({ name: "HKDF", hash: "SHA-256", salt: phoneNonce, info: HKDF_INFO }, ikm, 256);
+  return new Uint8Array(bits);
+}
+async function deriveLanKey(e2eKey, pairingId) {
+  const ikm = await crypto.subtle.importKey("raw", e2eKey, "HKDF", false, ["deriveBits"]);
+  const bits = await crypto.subtle.deriveBits({
+    name: "HKDF",
+    hash: "SHA-256",
+    salt: new Uint8Array(0),
+    info: textEncoder.encode(LAN_INFO_PREFIX + pairingId)
+  }, ikm, 256);
   return new Uint8Array(bits);
 }
 async function generateEphemeralKeyPair() {
@@ -4833,6 +4844,461 @@ class CodexRemoteInputBridge {
     }
   }
 }
+
+// src/core/lan-listener.ts
+import { createServer } from "node:http";
+import { readFile as readFile4 } from "node:fs/promises";
+import { networkInterfaces } from "node:os";
+var LAN_PATH = "/v1/lan";
+var LAN_ENVELOPE_VERSION = 1;
+var LAN_BODY_MAX_BYTES = 65536;
+var LAN_TTL_MS = 120000;
+var LAN_FUTURE_SKEW_MS = 30000;
+var LAN_SEEN_NONCES_MAX = 512;
+var LAN_NONCE_MAX_CHARS = 64;
+var LAN_COMMAND_BLOB_MAX_CHARS = 8192;
+var LAN_KEEPALIVE_MS = 5000;
+var LAN_REQUEST_TIMEOUT_MS = 1e4;
+var LAN_STATE_PATH = `${CC_DIR}/lan.json`;
+var textDecoder2 = new TextDecoder;
+function traceLan(deps, event) {
+  if (deps.trace) {
+    try {
+      deps.trace(event);
+    } catch {}
+    return;
+  }
+  if (process.argv.some((arg) => arg === "test" || arg.endsWith(".test.ts")))
+    return;
+  traceSession({ event: "lan", ...event });
+}
+function defaultListenerId() {
+  const c = globalThis.crypto;
+  try {
+    if (typeof c?.randomUUID === "function")
+      return c.randomUUID();
+  } catch {}
+  return b64url(crypto.getRandomValues(new Uint8Array(16)));
+}
+function parseLanState(raw) {
+  try {
+    const parsed = JSON.parse(raw);
+    if (typeof parsed !== "object" || parsed === null)
+      return null;
+    const s = parsed;
+    if (typeof s.port !== "number" || !Number.isInteger(s.port) || s.port < 1 || s.port > 65535)
+      return null;
+    if (typeof s.lid !== "string" || s.lid.length === 0 || s.lid.length > 128)
+      return null;
+    const createdAt = typeof s.createdAt === "number" && Number.isFinite(s.createdAt) ? s.createdAt : 0;
+    return { port: s.port, lid: s.lid, createdAt };
+  } catch {
+    return null;
+  }
+}
+function parseLanEnvelope(plain) {
+  if (typeof plain !== "object" || plain === null)
+    return null;
+  const e = plain;
+  if (e.v !== LAN_ENVELOPE_VERSION)
+    return null;
+  if (typeof e.op !== "string" || e.op.length === 0 || e.op.length > 32)
+    return null;
+  if (typeof e.ts !== "number" || !Number.isFinite(e.ts))
+    return null;
+  if (typeof e.nonce !== "string" || e.nonce.length === 0 || e.nonce.length > LAN_NONCE_MAX_CHARS)
+    return null;
+  if (typeof e.payload !== "object" || e.payload === null || Array.isArray(e.payload))
+    return null;
+  return { v: e.v, op: e.op, ts: e.ts, nonce: e.nonce, payload: e.payload };
+}
+function lanEnvelopeIsFresh(ts, now) {
+  if (ts > now + LAN_FUTURE_SKEW_MS)
+    return false;
+  return now - ts <= LAN_TTL_MS;
+}
+function rememberBounded(set, value, max) {
+  set.add(value);
+  while (set.size > max) {
+    const oldest = set.values().next();
+    if (oldest.done)
+      break;
+    set.delete(oldest.value);
+  }
+}
+function readBody(req, max) {
+  return new Promise((resolve2) => {
+    const declared = Number(req.headers["content-length"]);
+    if (Number.isFinite(declared) && declared > max) {
+      try {
+        req.pause();
+      } catch {}
+      resolve2(null);
+      return;
+    }
+    const chunks = [];
+    let total = 0;
+    let settled = false;
+    const done = (value) => {
+      if (settled)
+        return;
+      settled = true;
+      resolve2(value);
+    };
+    req.on("data", (chunk) => {
+      const bytes = chunk;
+      total += bytes.length;
+      if (total > max) {
+        try {
+          req.pause();
+        } catch {}
+        done(null);
+        return;
+      }
+      chunks.push(bytes);
+    });
+    req.on("end", () => {
+      const merged = new Uint8Array(total);
+      let offset = 0;
+      for (const c of chunks) {
+        merged.set(c, offset);
+        offset += c.length;
+      }
+      done(textDecoder2.decode(merged));
+    });
+    req.on("error", () => done(null));
+    req.on("aborted", () => done(null));
+  });
+}
+function createLanListener(deps = {}) {
+  const host = deps.host ?? "0.0.0.0";
+  const statePath = deps.statePath ?? LAN_STATE_PATH;
+  const now = deps.now ?? Date.now;
+  const newListenerId = deps.newListenerId ?? defaultListenerId;
+  let server;
+  let address = null;
+  let stopped = false;
+  const sockets = new Set;
+  const seenNonces = new Set;
+  let config = null;
+  let keyPromise = Promise.resolve(null);
+  let keyMemo;
+  const send = (res, status, body) => {
+    try {
+      res.writeHead(status, { "content-type": "application/json", "cache-control": "no-store" });
+      res.end(JSON.stringify(body));
+    } catch {}
+  };
+  const reject = (res, why) => {
+    traceLan(deps, { result: "reject", why });
+    send(res, 400, {});
+  };
+  const handle = async (req, res) => {
+    try {
+      if ((req.method ?? "").toUpperCase() !== "POST")
+        return reject(res, "method");
+      if ((req.url ?? "").split("?")[0] !== LAN_PATH)
+        return reject(res, "path");
+      const raw = await readBody(req, LAN_BODY_MAX_BYTES);
+      if (raw === null)
+        return reject(res, "body-size");
+      let outer;
+      try {
+        outer = JSON.parse(raw);
+      } catch {
+        return reject(res, "json");
+      }
+      if (typeof outer !== "object" || outer === null)
+        return reject(res, "shape");
+      const p = outer.p;
+      if (typeof p !== "string" || p.length === 0)
+        return reject(res, "shape");
+      const key = await keyPromise;
+      const pairing = config;
+      if (!key || !pairing)
+        return reject(res, "unpaired");
+      let plain;
+      try {
+        plain = await decryptBlob(key, p);
+      } catch {
+        return reject(res, "decrypt");
+      }
+      const envelope = parseLanEnvelope(plain);
+      if (!envelope)
+        return reject(res, "envelope");
+      if (!lanEnvelopeIsFresh(envelope.ts, now()))
+        return reject(res, "stale");
+      if (seenNonces.has(envelope.nonce))
+        return reject(res, "replay");
+      rememberBounded(seenNonces, envelope.nonce, LAN_SEEN_NONCES_MAX);
+      let payload;
+      if (envelope.op === "ping") {
+        payload = { ok: true };
+      } else if (envelope.op === "command") {
+        const blob = envelope.payload.blob;
+        if (typeof blob !== "string" || blob.length === 0 || blob.length > LAN_COMMAND_BLOB_MAX_CHARS) {
+          return reject(res, "command-payload");
+        }
+        try {
+          deps.onCommand?.({ nonce: envelope.nonce, blob, config: pairing });
+        } catch {}
+        payload = { ok: true };
+      } else {
+        payload = { ok: false, err: "bad-op" };
+      }
+      const sealed = await encryptBlob(key, {
+        v: LAN_ENVELOPE_VERSION,
+        reqNonce: envelope.nonce,
+        ts: now(),
+        payload
+      });
+      traceLan(deps, { result: "ok", op: envelope.op });
+      send(res, 200, { p: sealed });
+    } catch {
+      try {
+        send(res, 400, {});
+      } catch {}
+    }
+  };
+  const tryListen = (port) => new Promise((resolve2) => {
+    let settled = false;
+    let candidate;
+    try {
+      candidate = createServer((req, res) => {
+        handle(req, res);
+      });
+    } catch {
+      resolve2(null);
+      return;
+    }
+    const finish = (value) => {
+      if (settled)
+        return;
+      settled = true;
+      resolve2(value);
+    };
+    try {
+      candidate.keepAliveTimeout = LAN_KEEPALIVE_MS;
+      candidate.requestTimeout = LAN_REQUEST_TIMEOUT_MS;
+      candidate.on("error", () => {
+        try {
+          candidate.close();
+        } catch {}
+        finish(null);
+      });
+      candidate.on("connection", (socket) => {
+        const s = socket;
+        sockets.add(s);
+        try {
+          s.on("close", () => {
+            sockets.delete(s);
+          });
+        } catch {}
+      });
+      candidate.once("listening", () => finish(candidate));
+      candidate.listen(port, host);
+    } catch {
+      finish(null);
+    }
+  });
+  const bind = async () => {
+    let persisted = null;
+    try {
+      persisted = parseLanState(await readFile4(statePath, "utf8"));
+    } catch {
+      persisted = null;
+    }
+    if (persisted) {
+      const bound = await tryListen(persisted.port);
+      if (stopped) {
+        try {
+          bound?.close();
+        } catch {}
+        return null;
+      }
+      if (bound) {
+        server = bound;
+        try {
+          bound.unref?.();
+        } catch {}
+        address = { port: persisted.port, lid: persisted.lid };
+        traceLan(deps, { result: "bound", port: address.port, lid: address.lid, reused: true });
+        return address;
+      }
+    }
+    const fresh = await tryListen(0);
+    if (stopped) {
+      try {
+        fresh?.close();
+      } catch {}
+      return null;
+    }
+    if (!fresh) {
+      traceLan(deps, { result: "bind-failed" });
+      return null;
+    }
+    server = fresh;
+    try {
+      fresh.unref?.();
+    } catch {}
+    const info = fresh.address();
+    const port = typeof info?.port === "number" ? info.port : 0;
+    if (port === 0) {
+      traceLan(deps, { result: "bind-failed", why: "no-port" });
+      return null;
+    }
+    address = { port, lid: newListenerId() };
+    const state = { port, lid: address.lid, createdAt: now() };
+    try {
+      await atomicWrite(statePath, JSON.stringify(state), 384);
+    } catch {
+      traceLan(deps, { result: "state-write-failed" });
+    }
+    traceLan(deps, { result: "bound", port, lid: address.lid, reused: false });
+    return address;
+  };
+  const ready = bind().catch(() => null);
+  return {
+    ready,
+    sync(next) {
+      try {
+        config = next;
+        const memo = next ? `${next.pairingId}|${b64url(next.e2eKey)}` : "";
+        if (memo === keyMemo)
+          return;
+        keyMemo = memo;
+        keyPromise = next ? deriveLanKey(next.e2eKey, next.pairingId).catch(() => null) : Promise.resolve(null);
+        seenNonces.clear();
+      } catch {}
+    },
+    address() {
+      return address;
+    },
+    stop() {
+      stopped = true;
+      address = null;
+      const dying = server;
+      server = undefined;
+      for (const s of sockets) {
+        try {
+          s.destroy();
+        } catch {}
+      }
+      sockets.clear();
+      if (!dying)
+        return;
+      try {
+        dying.removeAllListeners("error");
+      } catch {}
+      try {
+        dying.on("error", () => {});
+      } catch {}
+      try {
+        dying.close();
+      } catch {}
+    }
+  };
+}
+var LAN_HINT_REFRESH_MS = 300000;
+var LAN_HINT_MAX_CHARS = 2048;
+var LAN_HOSTS_CACHE_MS = 5000;
+function lanHostAddresses(interfaces = networkInterfaces()) {
+  const v4 = [];
+  const v6 = [];
+  try {
+    for (const entries of Object.values(interfaces)) {
+      if (!entries)
+        continue;
+      for (const entry of entries) {
+        const address = entry?.address;
+        if (typeof address !== "string" || address.length === 0)
+          continue;
+        if (entry.internal)
+          continue;
+        const isV6 = entry.family === "IPv6" || entry.family === 6;
+        if (isV6) {
+          const lower = address.toLowerCase();
+          if (lower.startsWith("fe80:") || lower.startsWith("::"))
+            continue;
+          if (!v6.includes(address))
+            v6.push(address);
+          continue;
+        }
+        if (address.startsWith("169.254."))
+          continue;
+        if (!v4.includes(address))
+          v4.push(address);
+      }
+    }
+  } catch {
+    return [];
+  }
+  return [...v4, ...v6];
+}
+async function sealHint(key, hosts, port, lid, ts) {
+  let list = hosts;
+  for (;; ) {
+    const sealed = await encryptBlob(key, { v: LAN_ENVELOPE_VERSION, hosts: list, port, lid, ts });
+    if (sealed.length <= LAN_HINT_MAX_CHARS)
+      return sealed;
+    if (list.length <= 1)
+      return;
+    list = list.slice(0, list.length - 1);
+  }
+}
+function createLanHintPublisher(deps) {
+  const hostsOf = deps.hosts ?? (() => lanHostAddresses());
+  const now = deps.now ?? Date.now;
+  let lastState;
+  let lastSentAt = 0;
+  let lastSealed;
+  let cachedHosts = [];
+  let cachedAt = 0;
+  const hosts = (t) => {
+    if (t - cachedAt < LAN_HOSTS_CACHE_MS && cachedAt !== 0)
+      return cachedHosts;
+    cachedAt = t;
+    try {
+      cachedHosts = hostsOf();
+    } catch {
+      cachedHosts = [];
+    }
+    return cachedHosts;
+  };
+  return {
+    async take(config) {
+      try {
+        if (!config)
+          return;
+        const addr = deps.address();
+        if (!addr)
+          return;
+        const t = now();
+        const list = hosts(t);
+        if (list.length === 0)
+          return;
+        const state = `${config.pairingId}|${addr.port}|${addr.lid}|${list.join(",")}`;
+        if (state === lastState) {
+          if (t - lastSentAt < LAN_HINT_REFRESH_MS)
+            return;
+          if (lastSealed) {
+            lastSentAt = t;
+            return lastSealed;
+          }
+        }
+        const sealed = await sealHint(config.e2eKey, list, addr.port, addr.lid, t);
+        if (!sealed)
+          return;
+        lastState = state;
+        lastSealed = sealed;
+        lastSentAt = t;
+        return sealed;
+      } catch {
+        return;
+      }
+    }
+  };
+}
 // src/entries/cc-watchdog.ts
 var POLL_MS = 5000;
 var PAIRING_TTL_MS = 600000;
@@ -4856,7 +5322,7 @@ function resetDoneAttemptMemory() {
 }
 async function readRecordAt(path) {
   try {
-    return JSON.parse(await readFile4(path, "utf8"));
+    return JSON.parse(await readFile5(path, "utf8"));
   } catch {
     return null;
   }
@@ -5380,12 +5846,16 @@ function watchdogEventHeaders(config, approvals) {
     "x-cc-role": "watchdog"
   };
 }
+var activeLanListener;
+var lanHintPublisher = createLanHintPublisher({ address: () => activeLanListener?.address() ?? null });
 async function postEvent(config, body) {
   try {
+    const lanHint = await lanHintPublisher.take(config);
+    const payload = lanHint ? { ...body, lanHint } : body;
     const res = await fetch(`${config.url}/v1/cc/event`, {
       method: "POST",
       headers: watchdogEventHeaders(config, await localApprovalsState()),
-      body: JSON.stringify(body),
+      body: JSON.stringify(payload),
       signal: AbortSignal.timeout(2000)
     });
     const outcome = postOutcomeForStatus(res.status);
@@ -5460,7 +5930,7 @@ function bufferCommands(commands) {
     commandBuffer.push(c);
   }
 }
-function rememberBounded(set, value, max) {
+function rememberBounded2(set, value, max) {
   set.add(value);
   while (set.size > max) {
     const oldest = set.values().next();
@@ -5503,7 +5973,7 @@ async function drainCommands(config, deps = {}) {
           traceFocus(deps, { ...base, result: "duplicate", why: "id" });
           continue;
         }
-        rememberBounded(executedCommandIds, cmd.id, EXECUTED_COMMAND_IDS_MAX);
+        rememberBounded2(executedCommandIds, cmd.id, EXECUTED_COMMAND_IDS_MAX);
         let plain;
         try {
           plain = await decryptBlob(config.e2eKey, cmd.blob);
@@ -5530,7 +6000,7 @@ async function drainCommands(config, deps = {}) {
           traceFocus(deps, { ...base, result: "replay" });
           continue;
         }
-        rememberBounded(seenCommandNonces, payload.nonce, SEEN_NONCES_MAX);
+        rememberBounded2(seenCommandNonces, payload.nonce, SEEN_NONCES_MAX);
         if (entries === null)
           entries = await readRecords();
         const entry = entries.find((e) => e.sessionId === payload.sessionId);
@@ -5584,6 +6054,24 @@ async function drainCommands(config, deps = {}) {
     return 0;
   }
 }
+var drainChain = Promise.resolve();
+function enqueueDrainCommands(config, deps = {}) {
+  const run = () => drainCommands(config, deps);
+  const next = drainChain.then(run, run);
+  drainChain = next.catch(() => {});
+  return next;
+}
+var LAN_COMMAND_ID_PREFIX = "lan:";
+function acceptLanCommand(command, deps = {}) {
+  try {
+    if (commandBuffer.length >= COMMAND_BUFFER_MAX)
+      return Promise.resolve(0);
+    commandBuffer.push({ id: `${LAN_COMMAND_ID_PREFIX}${command.nonce}`, blob: command.blob });
+    return enqueueDrainCommands(command.config, deps).catch(() => 0);
+  } catch {
+    return Promise.resolve(0);
+  }
+}
 function machineName(config) {
   return config.machineName ?? hostname4().replace(/\.local$/, "");
 }
@@ -5595,7 +6083,7 @@ async function readAllRecordEntries() {
       if (!f.endsWith(".json"))
         continue;
       try {
-        out.push({ sessionId: basename4(f, ".json"), rec: JSON.parse(await readFile4(`${SESSIONS_DIR}/${f}`, "utf8")) });
+        out.push({ sessionId: basename4(f, ".json"), rec: JSON.parse(await readFile5(`${SESSIONS_DIR}/${f}`, "utf8")) });
       } catch {}
     }
     return out;
@@ -6165,7 +6653,7 @@ async function sweep(config, deps = {}) {
     const sessionId = basename4(file, ".json");
     let record = null;
     try {
-      record = JSON.parse(await readFile4(path, "utf8"));
+      record = JSON.parse(await readFile5(path, "utf8"));
     } catch {
       record = null;
     }
@@ -6305,6 +6793,7 @@ async function goneStrikeShouldTeardown(goneStrikesPath) {
   return await recordGoneStrike(goneStrikesPath) >= GONE_STRIKE_LIMIT;
 }
 var activeBridgeShutdown;
+var activeLanShutdown;
 var BRIDGE_OP_DEADLINE_MS = 15000;
 var PLAN_PICKER_STATUS_QUERY_DEADLINE_MS = 2000;
 function withDeadline(work, ms) {
@@ -6474,12 +6963,26 @@ async function run() {
   let lastActiveMs = Date.now();
   const bridges = createBridgeSupervisor();
   activeBridgeShutdown = () => bridges.shutdown();
+  const lan = createLanListener({ onCommand: acceptLanCommand });
+  activeLanListener = lan;
+  const shutdown = () => {
+    bridges.shutdown();
+    try {
+      lan.stop();
+    } catch {}
+  };
+  activeLanShutdown = () => {
+    try {
+      lan.stop();
+    } catch {}
+  };
   try {
     while (true) {
-      if (!enforceWatchdogOwnership(() => bridges.shutdown()))
+      if (!enforceWatchdogOwnership(shutdown))
         return;
       const config = await loadConfig();
       await bridges.sync(config);
+      lan.sync(config);
       if (config) {
         await reconcileProvisionalsSweep(config);
         await discoverLiveSessions(config);
@@ -6488,7 +6991,7 @@ async function run() {
         threadWaitState: (threadId) => bridges.threadWaitState(threadId)
       });
       if (config)
-        await drainCommands(config);
+        await enqueueDrainCommands(config);
       if (result.revoked) {
         if (await goneStrikeShouldTeardown()) {
           await removeRevokedConfig();
@@ -6529,8 +7032,10 @@ async function run() {
       await new Promise((r) => setTimeout(r, POLL_MS));
     }
   } finally {
-    bridges.shutdown();
+    shutdown();
     activeBridgeShutdown = undefined;
+    activeLanShutdown = undefined;
+    activeLanListener = undefined;
     releaseSingleInstance();
   }
 }
@@ -6542,6 +7047,9 @@ if (__require.main == __require.module) {
     } catch {}
     try {
       activeBridgeShutdown?.();
+    } catch {}
+    try {
+      activeLanShutdown?.();
     } catch {}
     const exitTimer = setTimeout(() => process.exit(0), 250);
     exitTimer.unref?.();
@@ -6588,6 +7096,7 @@ export {
   hasInterruptMarker,
   goneStrikeShouldTeardown,
   extractCommands,
+  enqueueDrainCommands,
   enforceWatchdogOwnership,
   effectiveDoneAttempts,
   drainCommands,
@@ -6616,11 +7125,13 @@ export {
   buildHeartbeatEnvelope,
   buildEndEnvelope,
   buildDoneEnvelope,
+  acceptLanCommand,
   WAITING_HEARTBEAT_AFTER_MS,
   PLAN_PICKER_VERIFY_MAX_MS,
   PLAN_PICKER_RECENT_DONE_MS,
   PLAN_PICKER_PENDING_MAX_MS,
   PAIRING_TTL_MS,
+  LAN_COMMAND_ID_PREFIX,
   IDLE_GRACE_MS,
   COMMAND_TTL_MS,
   COMMAND_FUTURE_SKEW_MS,
