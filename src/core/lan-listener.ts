@@ -49,15 +49,27 @@
 //          op the blocked Claude hook (a separate short-lived process with no IPC to this daemon) uses
 //          to read the store. Off-loopback callers get the same {"ok":false,"err":"bad-op"} any unknown
 //          op gets, so the phone cannot tell this op exists at all.
+//
+// PHASE 3 adds the Mac→phone status feed on the same envelope (the map itself lives in lan-frames.ts):
+//
+//   {"op":"frames", payload:{"sinceSeq":<integer >= 0>,"waitMs":<0..25000>}}
+//        → sealed {"ok":true,"seq":<latest counter>,"lid":"<this listener instance>","frames":[…]} where each
+//          frame is {"seq","sessionId","op","prio","ts","blob"(+"agent","attentionKind")} and `blob` is
+//          the record's e2eKey-sealed ciphertext VERBATIM — the listener never opens it, so this feed is
+//          as blind as the worker. Frames are seq-ascending, one per session (latest state only), and a
+//          request with nothing new is HELD up to waitMs, answered the moment anything changes.
 
 import { createServer } from "node:http";
 import { readFile } from "node:fs/promises";
 import { networkInterfaces } from "node:os";
 import { b64url, decryptBlob, deriveLanKey, encryptBlob } from "./crypto";
+import { createLanFrameStore } from "./lan-frames";
+import type { LanFrameStore } from "./lan-frames";
 import { atomicWrite, Config, traceSession } from "./shared";
 import {
   isLoopbackAddress, LAN_ANSWER_BLOB_MAX_CHARS, LAN_ENVELOPE_VERSION, LAN_PATH, LAN_REQUEST_ID_RE,
-  LAN_STATE_PATH, lanEnvelopeIsFresh, lanRunningUnderTest, parseLanEnvelope, parseLanState,
+  LAN_STATE_PATH, lanEnvelopeIsFresh, lanRunningUnderTest, parseLanEnvelope, parseLanFramesRequest,
+  parseLanState,
 } from "./lan-wire";
 import type { LanState } from "./lan-wire";
 
@@ -65,11 +77,11 @@ import type { LanState } from "./lan-wire";
 // HTTP server (see that file's header). Re-exported here, unchanged, so every existing importer of
 // "./lan-listener" — tests included — keeps resolving exactly the same names.
 export {
-  isLoopbackAddress, LAN_ANSWER_BLOB_MAX_CHARS, LAN_ENVELOPE_VERSION, LAN_FUTURE_SKEW_MS, LAN_NONCE_MAX_CHARS,
-  LAN_PATH, LAN_REQUEST_ID_RE, LAN_STATE_PATH, LAN_TTL_MS, lanEnvelopeIsFresh, lanRunningUnderTest,
-  parseLanEnvelope, parseLanState,
+  isLoopbackAddress, LAN_ANSWER_BLOB_MAX_CHARS, LAN_ENVELOPE_VERSION, LAN_FRAMES_WAIT_MAX_MS,
+  LAN_FUTURE_SKEW_MS, LAN_NONCE_MAX_CHARS, LAN_PATH, LAN_REQUEST_ID_RE, LAN_STATE_PATH, LAN_TTL_MS,
+  lanEnvelopeIsFresh, lanRunningUnderTest, parseLanEnvelope, parseLanFramesRequest, parseLanState,
 } from "./lan-wire";
-export type { LanEnvelope, LanState } from "./lan-wire";
+export type { LanEnvelope, LanFramesRequest, LanState } from "./lan-wire";
 
 /** Request-body ceiling. A command envelope is a few hundred bytes; 64 KB is enormous headroom and
  *  still bounds what a hostile LAN peer can make this daemon buffer. Enforced on Content-Length AND on
@@ -230,6 +242,11 @@ export interface LanListenerDeps {
   /** The answer store this listener writes/serves. Defaults to the process-wide singleton, which is what
    *  makes the in-process Codex relay see the same answers. */
   answers?: LanAnswerStore;
+  /** The phase-3 status feed the `frames` op serves. Defaults to a store over the real session dir
+   *  (inert under `bun test` — see createLanFrameStore). Its lifecycle is OWNED here: started with the
+   *  listener and stopped by stop(), which is what wires it into all three watchdog teardown seams
+   *  (ownership loss, run()'s finally, SIGTERM/SIGINT) without the daemon knowing it exists. */
+  frames?: LanFrameStore;
   /** How the peer's address is read, for the `answer-poll` loopback gate. Production reads node's
    *  `req.socket.remoteAddress`; tests inject a LAN address to exercise the OFF-loopback branch, which is
    *  otherwise unreachable from a test that (correctly) only ever binds loopback. */
@@ -318,6 +335,8 @@ interface LanServer {
   unref?(): unknown;
   keepAliveTimeout?: number;
   requestTimeout?: number;
+  /** Per-socket inactivity timeout. 0 = off (node's default since v13); see tryListen's timeout note. */
+  timeout?: number;
 }
 
 /** Read the body with a hard byte ceiling. Returns null on overflow, transport error, or a
@@ -379,6 +398,7 @@ export function createLanListener(deps: LanListenerDeps = {}): LanListener {
   const sockets = new Set<{ destroy(): unknown }>();
   const seenNonces = new Set<string>();
   const answers = deps.answers ?? lanAnswerStore;
+  const frames = deps.frames ?? createLanFrameStore();
   const peerAddress = deps.remoteAddress ?? ((req: unknown) => (req as LanReq)?.socket?.remoteAddress);
 
   /** The CURRENT pairing, refreshed by sync(). Null while unpaired — every request then fails to
@@ -461,6 +481,21 @@ export function createLanListener(deps: LanListenerDeps = {}): LanListener {
           try { deps.onAnswer?.({ requestId, answerBlob, config: pairing }); } catch { /* never fail the response on the sink */ }
         }
         payload = { ok: true }; // a duplicate is still an ok: the phone deliberately raced two channels
+      } else if (envelope.op === "frames") {
+        const request = parseLanFramesRequest(envelope.payload);
+        if (!request) return reject(res, "frames-payload");
+        // The ONE long-held response in this server. It parks on the frame store's waiter list — never
+        // on a timer of its own, never on the sweep, and never holding any watchdog work: the store is
+        // fed by an fs.watch on the session dir plus the sweep's own reconcile, both of which only ever
+        // WAKE waiters. `lid` is captured before the wait so a teardown mid-hold still answers with the
+        // instance the phone was talking to, and the key was captured before it too, so a re-pair
+        // landing mid-hold cannot seal the answer under a key this caller doesn't have.
+        const lid = address?.lid ?? "";
+        const slice = await frames.wait(request.sinceSeq, request.waitMs);
+        // `ok:true` is load-bearing beside the data: the phone classifies EVERY reply on `payload.ok`,
+        // and a data-bearing reply without it reads as "listener too old for this op" — which would
+        // permanently stop the frames channel for this lid.
+        payload = { ok: true, seq: slice.seq, lid, frames: slice.frames };
       } else if (envelope.op === "answer-poll" && isLoopbackAddress(peerAddress(req))) {
         // LOOPBACK ONLY. This op exists for the blocked Claude hook — a separate short-lived process on
         // THIS machine with no IPC to the daemon. The phone never needs it, so an off-LAN-address caller
@@ -510,8 +545,18 @@ export function createLanListener(deps: LanListenerDeps = {}): LanListener {
       resolve(value);
     };
     try {
+      // Timeout discipline, set EXPLICITLY because the `frames` op holds a response open for up to 25 s
+      // and a server-side timeout would kill it (measured on bun 1.3.14 AND node: a 26 s held response
+      // survives all three settings below — `requestTimeout` bounds RECEIVING the request, not answering
+      // it, and `keepAliveTimeout` only applies to an idle socket BETWEEN responses):
+      //   keepAliveTimeout — idle keep-alive reuse window; not running while a response is pending.
+      //   requestTimeout   — whole-request RECEIVE ceiling (slowloris); unrelated to the hold.
+      //   headersTimeout   — left at node's 60 s default, comfortably above the 25 s hold.
+      //   timeout          — per-socket inactivity. Pinned to 0 (node's default; bun reports undefined)
+      //                      so no runtime can decide a socket parked on a long-poll is "inactive".
       candidate.keepAliveTimeout = LAN_KEEPALIVE_MS;
       candidate.requestTimeout = LAN_REQUEST_TIMEOUT_MS;
+      candidate.timeout = 0;
       candidate.on("error", () => {
         try { candidate.close(); } catch { /* never listened */ }
         finish(null);
@@ -575,12 +620,22 @@ export function createLanListener(deps: LanListenerDeps = {}): LanListener {
   };
 
   const ready = bind().catch(() => null);
+  // The status feed's watcher is armed with the listener, not on first use: the phone's very first
+  // `frames` request must be answerable from a map that is already warm. Never awaited (arming is a
+  // single syscall and a failure just degrades the feed to the per-sweep reconcile).
+  frames.start();
 
   return {
     ready,
     sync(next: Config | null): void {
       try {
         config = next;
+        // The status feed is re-pointed and re-read on EVERY sweep — this is the lossy-watch fallback
+        // for the fs.watch feed (macOS coalesces/drops events), and it is why nothing here is awaited:
+        // reconcile() returns a promise the sweep must never sit on. setPairing is a no-op unless the
+        // pairing actually rotated, in which case it also voids every frame sealed under the old key.
+        frames.setPairing(next?.pairingId);
+        void frames.reconcile();
         const memo = next ? `${next.pairingId}|${b64url(next.e2eKey)}` : "";
         if (memo === keyMemo) return;
         keyMemo = memo;
@@ -600,6 +655,9 @@ export function createLanListener(deps: LanListenerDeps = {}): LanListener {
     stop(): void {
       stopped = true;
       address = null;
+      // FIRST: release the status feed. Its stop() closes the directory watcher AND resolves every held
+      // long-poll, so no `frames` response is still parked on a socket we are about to destroy.
+      try { frames.stop(); } catch { /* best-effort teardown */ }
       const dying = server;
       server = undefined;
       // Destroy live sockets first: a keep-alive connection would otherwise hold close() open.

@@ -169,7 +169,9 @@ export async function runNotify(raw: string, deferMs = notifyDeferMs(), sleep: (
       transcriptPath, "codex", startedAt, turnStartedAt, payloadTurnId,
       title ?? record?.title, config.pairingId, model, pendingPlanPicker, sessionPid,
       record?.origin ?? sessionOrigin(input, sessionPid, pidCommand(sessionPid)),
-      planPickerVerificationPending, dbg);
+      planPickerVerificationPending, dbg,
+      // Same discriminator the envelope above carries, cached on the record for the LAN frames feed.
+      attentionKind);
     const clearedPickerMarker = !pendingPlanPicker && !planPickerVerificationPending
       && (record?.pendingPlanPicker === true || record?.planPickerSettled === true);
     tracePlanPickerDecision(sessionId, {

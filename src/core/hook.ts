@@ -325,7 +325,7 @@ export async function trackSessionAt(
   machine: string, label: string, transcript: string, agent: AgentKind = "claude", sessionStartedAt?: number,
   turnStartedAt?: number, turnId?: string, title?: string, pairingId?: string, model?: string,
   pendingPlanPicker: boolean = false, pid: number = process.ppid, origin?: SessionOrigin,
-  planPickerVerificationPending: boolean = false, dbg?: string,
+  planPickerVerificationPending: boolean = false, dbg?: string, attentionKind?: "userInput",
 ): Promise<void> {
   try {
     const path = `${sessionsDir}/${sessionId}.json`;
@@ -384,6 +384,14 @@ export async function trackSessionAt(
       ...(pendingPlanPicker || planPickerVerificationPending ? { planPickerPendingSince: recordedAt } : {}),
       ...(typeof dbg === "string" && dbg.length > 0 ? { dbg } : {}),
       ...(origin ? { origin } : {}),
+      // APPENDED LAST (NOM-44 phase 3, mirroring how model/pairingId were added): the clear
+      // `attentionKind` discriminator this event POSTed. It rides the worker envelope already; the LAN
+      // frames feed rebuilds its frames from THIS record, so without the cache a Codex
+      // `request_user_input` would reach the phone over LAN looking like a plain approval. Written
+      // through on every event (so a later working/done event drops it — the record is rebuilt whole
+      // here, never patched) and OMITTED when the event has none, keeping every existing record's bytes
+      // byte-identical.
+      ...(attentionKind ? { attentionKind } : {}),
     };
     // Owner-only (0600): the record carries hostname, cwd basename, the session pid, and the ABSOLUTE
     // transcript path — never group/world readable, matching config.json / the pending stash.
@@ -400,13 +408,13 @@ export async function trackSession(
   machine: string, label: string, transcript: string, agent: AgentKind = "claude", sessionStartedAt?: number,
   turnStartedAt?: number, turnId?: string, title?: string, pairingId?: string, model?: string,
   pendingPlanPicker: boolean = false, pid: number = process.ppid, origin?: SessionOrigin,
-  planPickerVerificationPending: boolean = false, dbg?: string,
+  planPickerVerificationPending: boolean = false, dbg?: string, attentionKind?: "userInput",
 ): Promise<void> {
   return trackSessionAt(
     SESSIONS_DIR,
     sessionId, op, prio, status, blob, machine, label, transcript, agent, sessionStartedAt,
     turnStartedAt, turnId, title, pairingId, model, pendingPlanPicker, pid, origin,
-    planPickerVerificationPending, dbg,
+    planPickerVerificationPending, dbg, attentionKind,
   );
 }
 
@@ -874,7 +882,11 @@ export async function runHook(agent: AgentKind): Promise<void> {
       ? (existingRecord!.transcript ?? transcriptPath)
       : transcriptPath;
     await trackSession(sessionId, plan.op, plan.prio, plan.status, envelope.blob as string | undefined, machine, label, recordTranscript, agent, startedAt, turnStartedAt, turnId,
-      title, config.pairingId, model, pendingPlanPicker, recordPid, origin, planPickerVerificationPending, dbg);
+      title, config.pairingId, model, pendingPlanPicker, recordPid, origin, planPickerVerificationPending, dbg,
+      // The SAME discriminator this event's envelope carries (buildEnvelope stamps it on the clear wire
+      // envelope): cached so the LAN frames feed, which rebuilds frames from the record rather than from
+      // the POST, keeps a Codex question labelled as a question.
+      attentionKind);
     const clearedPickerMarker = pendingPlanPicker === false && planPickerVerificationPending === false
       && (existingRecord?.pendingPlanPicker === true || existingRecord?.planPickerVerificationPending === true || existingRecord?.planPickerSettled === true);
     if (agent === "codex" && (hookName === "Stop" || pendingPlanPicker || planPickerVerificationPending || clearedPickerMarker)) {

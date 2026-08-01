@@ -1,8 +1,16 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { b64url, decryptBlob, deriveLanKey, encryptBlob } from "./crypto";
+import {
+  createLanFrameStore,
+  lanFrameContent,
+  lanFrameSessionLive,
+  LAN_FRAMES_WAITERS_MAX,
+  LAN_FRAME_RETIRE_GRACE_MS,
+} from "./lan-frames";
+import type { LanFrame, LanFramesSlice, LanFrameStore } from "./lan-frames";
 import {
   createLanAnswerStore,
   createLanHintPublisher,
@@ -15,16 +23,18 @@ import {
   LAN_ANSWER_TTL_MS,
   LAN_BODY_MAX_BYTES,
   LAN_ENVELOPE_VERSION,
+  LAN_FRAMES_WAIT_MAX_MS,
   LAN_FUTURE_SKEW_MS,
   LAN_HINT_MAX_CHARS,
   LAN_HINT_REFRESH_MS,
   LAN_PATH,
   LAN_TTL_MS,
   parseLanEnvelope,
+  parseLanFramesRequest,
   parseLanState,
 } from "./lan-listener";
 import type { LanAnswerDelivery, LanAnswerStore, LanCommand, LanListener } from "./lan-listener";
-import type { Config } from "./shared";
+import type { Config, SessionRecord } from "./shared";
 
 // Every listener binds LOOPBACK in tests: a `bun test` run must never open a port to the network the
 // developer's machine is on. Production defaults to 0.0.0.0 — that is the one difference.
@@ -63,6 +73,7 @@ async function startListener(options: {
   onCommand?: (c: LanCommand) => void;
   onAnswer?: (a: LanAnswerDelivery) => void;
   answers?: LanAnswerStore;
+  frames?: LanFrameStore;
   remoteAddress?: (req: unknown) => string | undefined;
   now?: () => number;
   cfg?: Config | null;
@@ -74,6 +85,7 @@ async function startListener(options: {
     onCommand: options.onCommand,
     onAnswer: options.onAnswer,
     answers: options.answers,
+    frames: options.frames,
     remoteAddress: options.remoteAddress,
     now: options.now,
     newListenerId: options.newListenerId,
@@ -224,7 +236,8 @@ describe("POST /v1/lan — the happy paths", () => {
     const dir = await stateDir();
     const { port } = await startListener({ statePath: join(dir, "lan.json"), cfg });
     const n = nonce();
-    const res = await post(port, await sealRequest(cfg, { op: "frames", ts: Date.now(), nonce: n, payload: {} }));
+    // Deliberately an op no build implements (phase 3 took "frames"; phase 4 will take "read").
+    const res = await post(port, await sealRequest(cfg, { op: "read", ts: Date.now(), nonce: n, payload: {} }));
     expect(res.status).toBe(200);
     const opened = await openResponse(cfg, res.json);
     expect(opened.reqNonce).toBe(n);
@@ -750,5 +763,500 @@ describe("sealed host-hint publisher", () => {
     expect(opened.hosts.length).toBeGreaterThan(0);
     expect(opened.hosts.length).toBeLessThan(many.length);
     expect(opened.hosts[0]).toBe(many[0]); // trimmed from the END: the best candidate survives
+  });
+});
+
+// --- phase 3: status frames -----------------------------------------------------------------------
+
+describe("frames — pure helpers", () => {
+  const NOW = 1_800_000_000_000;
+  const rec = (over: Partial<SessionRecord> = {}): SessionRecord => ({
+    pid: 4242, machine: "mac-mini", label: "api-status", ts: NOW,
+    op: "update", prio: 0, blob: "sealed-blob", pairingId: "pairing-abc", ...over,
+  });
+
+  test("parseLanFramesRequest accepts the frozen shape and refuses everything else", () => {
+    expect(parseLanFramesRequest({ sinceSeq: 0, waitMs: 0 })).toEqual({ sinceSeq: 0, waitMs: 0 });
+    expect(parseLanFramesRequest({ sinceSeq: 7, waitMs: LAN_FRAMES_WAIT_MAX_MS }))
+      .toEqual({ sinceSeq: 7, waitMs: LAN_FRAMES_WAIT_MAX_MS });
+    expect(parseLanFramesRequest({ waitMs: 0 })).toBeNull();                       // both fields required
+    expect(parseLanFramesRequest({ sinceSeq: 0 })).toBeNull();
+    expect(parseLanFramesRequest({ sinceSeq: -1, waitMs: 0 })).toBeNull();         // no negative cursor
+    expect(parseLanFramesRequest({ sinceSeq: 1.5, waitMs: 0 })).toBeNull();        // integers only
+    expect(parseLanFramesRequest({ sinceSeq: "3", waitMs: 0 })).toBeNull();
+    expect(parseLanFramesRequest({ sinceSeq: 0, waitMs: LAN_FRAMES_WAIT_MAX_MS + 1 })).toBeNull(); // hold ceiling
+    expect(parseLanFramesRequest({ sinceSeq: 0, waitMs: -1 })).toBeNull();
+    expect(parseLanFramesRequest({ sinceSeq: Number.NaN, waitMs: 0 })).toBeNull();
+  });
+
+  test("lanFrameContent mirrors the heartbeat envelope's op/prio defaults and carries the blob verbatim", () => {
+    expect(lanFrameContent(rec(), "pairing-abc")).toEqual({ op: "update", prio: 0, ts: NOW, blob: "sealed-blob" });
+    // op/prio absent (a pre-v2 record) → the same defaults buildHeartbeatEnvelope applies.
+    expect(lanFrameContent(rec({ op: undefined, prio: undefined }), "pairing-abc"))
+      .toEqual({ op: "update", prio: 0, ts: NOW, blob: "sealed-blob" });
+    expect(lanFrameContent(rec({ op: "done", agent: "codex" }), "pairing-abc"))
+      .toEqual({ op: "done", prio: 0, ts: NOW, blob: "sealed-blob", agent: "codex" });
+  });
+
+  test("nothing renderable is ever invented: no blob, another pairing, or no ts all read as null", () => {
+    expect(lanFrameContent(rec({ blob: undefined }), "pairing-abc")).toBeNull();
+    expect(lanFrameContent(rec({ blob: "" }), "pairing-abc")).toBeNull();
+    // Sealed under a pairing that is no longer live → the phone could never decrypt it ("Encrypted
+    // session forever"), which is exactly what the heartbeat's own pairing guard prevents.
+    expect(lanFrameContent(rec({ pairingId: "pairing-old" }), "pairing-abc")).toBeNull();
+    expect(lanFrameContent(rec({ pairingId: undefined }), "pairing-abc")).toBeNull();
+    expect(lanFrameContent(rec(), undefined)).toBeNull();                 // unpaired listener
+    expect(lanFrameContent(rec({ ts: undefined as unknown as number }), "pairing-abc")).toBeNull();
+  });
+
+  test("attentionKind rides ONLY on a live prio-1 frame (a stale marker can't relabel a done row)", () => {
+    const question = rec({ prio: 1, attentionKind: "userInput" });
+    expect(lanFrameContent(question, "pairing-abc")).toEqual({
+      op: "update", prio: 1, ts: NOW, blob: "sealed-blob", attentionKind: "userInput",
+    });
+    // Same marker left behind on a record a watchdog net rewrote into a done (those nets spread
+    // ...record): prio 0 ⇒ the discriminator is dropped rather than mislabelling the frame.
+    expect(lanFrameContent(rec({ op: "done", prio: 0, attentionKind: "userInput" }), "pairing-abc"))
+      .toEqual({ op: "done", prio: 0, ts: NOW, blob: "sealed-blob" });
+  });
+
+  test("a record written by an OLDER plugin (no attentionKind key at all) parses and simply has none", () => {
+    // Byte-for-byte an old-format record: the append-last field is absent from the JSON entirely.
+    const legacy = JSON.parse(
+      '{"pid":4242,"machine":"mac-mini","label":"api-status","ts":1800000000000,"op":"update","prio":1,'
+      + '"blob":"sealed-blob","pairingId":"pairing-abc"}',
+    ) as SessionRecord;
+    expect(legacy.attentionKind).toBeUndefined();
+    const content = lanFrameContent(legacy, "pairing-abc");
+    expect(content).toEqual({ op: "update", prio: 1, ts: 1_800_000_000_000, blob: "sealed-blob" });
+    expect(content).not.toHaveProperty("attentionKind");
+  });
+
+  test("lanFrameSessionLive mirrors classifySession's keep/end/stale decision", () => {
+    expect(lanFrameSessionLive(rec(), NOW, () => true)).toBe(true);
+    expect(lanFrameSessionLive(rec(), NOW, () => false)).toBe(false);                    // dead pid
+    expect(lanFrameSessionLive(rec({ ts: NOW - 86_400_001 }), NOW, () => true)).toBe(false); // 24 h cap
+    expect(lanFrameSessionLive(rec({ pid: undefined as unknown as number }), NOW, () => true)).toBe(false);
+    expect(lanFrameSessionLive(rec({ ts: undefined as unknown as number }), NOW, () => true)).toBe(false);
+  });
+});
+
+describe("frames — the state-sync store", () => {
+  const NOW = 1_800_000_000_000;
+  const stores: LanFrameStore[] = [];
+
+  afterEach(() => {
+    while (stores.length > 0) {
+      try { stores.pop()?.stop(); } catch { /* already stopped */ }
+    }
+  });
+
+  async function framesDir(): Promise<string> {
+    const dir = await mkdtemp(join(tmpdir(), "nomo-frames-"));
+    tmpDirs.push(dir);
+    return dir;
+  }
+
+  const recordFile = (over: Partial<SessionRecord> = {}): string => JSON.stringify({
+    pid: 4242, machine: "mac-mini", label: "api-status", ts: NOW,
+    op: "update", prio: 0, blob: "sealed-blob", pairingId: "pairing-abc", ...over,
+  });
+
+  async function put(dir: string, sessionId: string, over: Partial<SessionRecord> = {}): Promise<void> {
+    await writeFile(join(dir, `${sessionId}.json`), recordFile(over));
+  }
+
+  function makeStore(dir: string, over: Record<string, unknown> = {}): LanFrameStore {
+    const store = createLanFrameStore({
+      sessionsDir: dir, isAlive: () => true, now: () => NOW, ...over,
+    });
+    stores.push(store);
+    store.setPairing("pairing-abc");
+    return store;
+  }
+
+  test("one counter, monotonic; three rapid updates COALESCE into one frame carrying the latest blob", async () => {
+    const dir = await framesDir();
+    const store = makeStore(dir);
+    await put(dir, "s1", { blob: "blob-1" });
+    await store.reconcile();
+    expect(store.seq()).toBe(1);
+
+    // Three more writes, each observed (this is what a burst of watch events looks like).
+    for (const blob of ["blob-2", "blob-3", "blob-4"]) {
+      await put(dir, "s1", { blob });
+      await store.reconcile();
+    }
+    expect(store.seq()).toBe(4);          // the counter counts CHANGES…
+    expect(store.size()).toBe(1);         // …but the map holds one entry per session
+    const slice = store.since(0);
+    expect(slice.seq).toBe(4);
+    expect(slice.frames).toHaveLength(1); // …so the phone gets the latest state, never the history
+    expect(slice.frames[0]).toEqual({ seq: 4, sessionId: "s1", op: "update", prio: 0, ts: NOW, blob: "blob-4" });
+
+    // An unchanged record must NOT bump the counter — otherwise every 5 s reconcile would wake every
+    // long-poll for nothing.
+    await store.reconcile();
+    expect(store.seq()).toBe(4);
+  });
+
+  test("sinceSeq filters to what the phone has not seen, seq ascending", async () => {
+    const dir = await framesDir();
+    const store = makeStore(dir);
+    await put(dir, "s1", { blob: "a1" });
+    await store.reconcile();
+    await put(dir, "s2", { blob: "b1" });
+    await store.reconcile();
+
+    expect(store.since(0).frames.map((f: LanFrame) => f.sessionId)).toEqual(["s1", "s2"]);
+    expect(store.since(1).frames.map((f: LanFrame) => f.sessionId)).toEqual(["s2"]);
+    expect(store.since(2).frames).toEqual([]);
+
+    await put(dir, "s1", { blob: "a2" });
+    await store.reconcile();
+    const tail = store.since(2);
+    expect(tail.seq).toBe(3);
+    expect(tail.frames).toHaveLength(1);
+    expect(tail.frames[0]).toMatchObject({ seq: 3, sessionId: "s1", blob: "a2" });
+    // Frames always arrive seq-ascending, whatever the map's own iteration order is.
+    const all = store.since(0).frames;
+    expect(all.map((f: LanFrame) => f.seq)).toEqual([...all.map((f: LanFrame) => f.seq)].sort((a, b) => a - b));
+  });
+
+  test("a STALE-HIGH sinceSeq (a cursor from a previous listener instance) yields the FULL map", async () => {
+    const dir = await framesDir();
+    const store = makeStore(dir);
+    await put(dir, "s1");
+    await put(dir, "s2");
+    await store.reconcile();
+    expect(store.seq()).toBe(2);
+
+    // The phone still holds a cursor from before the watchdog restarted (the counter is in-memory and
+    // restarts at 0). Filtering by it would silently starve it forever.
+    const slice = store.since(9_999);
+    expect(slice.seq).toBe(2);
+    expect(slice.frames).toHaveLength(2);
+  });
+
+  test("a long-poll resolves on the very next change (well under 200 ms) and answers empty on timeout", async () => {
+    const dir = await framesDir();
+    const store = makeStore(dir);
+    await put(dir, "s1", { blob: "a1" });
+    await store.reconcile();
+
+    const started = Date.now();
+    const held = store.wait(store.seq(), 5_000);
+    setTimeout(() => {
+      void put(dir, "s1", { blob: "a2" }).then(() => store.reconcile());
+    }, 20);
+    const woken = await held;
+    const elapsed = Date.now() - started;
+    expect(elapsed).toBeLessThan(200);
+    expect(woken.frames).toHaveLength(1);
+    expect(woken.frames[0]).toMatchObject({ sessionId: "s1", blob: "a2" });
+
+    // Nothing happens → the hold expires and answers an EMPTY frame list (never an error, never a
+    // dangling socket).
+    const timedOut = await store.wait(store.seq(), 60);
+    expect(timedOut.frames).toEqual([]);
+    expect(timedOut.seq).toBe(store.seq());
+  });
+
+  test("waitMs 0 never holds, and a request whose cursor is already behind answers immediately", async () => {
+    const dir = await framesDir();
+    const store = makeStore(dir);
+    await put(dir, "s1");
+    await store.reconcile();
+    const started = Date.now();
+    expect((await store.wait(store.seq(), 0)).frames).toEqual([]);
+    expect((await store.wait(0, 5_000)).frames).toHaveLength(1);
+    expect(Date.now() - started).toBeLessThan(200);
+  });
+
+  test("the waiter list is capped: the OLDEST hold is dropped with an immediate empty response", async () => {
+    const dir = await framesDir();
+    const store = makeStore(dir);
+    const settled: number[] = [];
+    const holds = Array.from({ length: LAN_FRAMES_WAITERS_MAX + 1 }, (_, i) =>
+      store.wait(0, 5_000).then((slice) => { settled.push(i); return slice; }));
+    await new Promise((r) => setTimeout(r, 30));
+    expect(settled).toEqual([0]); // exactly the oldest, and it answered rather than erroring
+    expect((await holds[0]).frames).toEqual([]);
+
+    // Teardown must resolve every remaining hold — a listener that stops may not leave sockets hanging.
+    store.stop();
+    const rest = await Promise.all(holds.slice(1));
+    expect(rest).toHaveLength(LAN_FRAMES_WAITERS_MAX);
+    for (const slice of rest) expect(slice.frames).toEqual([]);
+    // …and after stop() nothing holds at all.
+    const after = Date.now();
+    await store.wait(0, 5_000);
+    expect(Date.now() - after).toBeLessThan(200);
+  });
+
+  test("a retired session gets ONE final terminal frame, then drops out of the map after the grace", async () => {
+    const dir = await framesDir();
+    let clock = NOW;
+    const store = makeStore(dir, { now: () => clock });
+    await put(dir, "s1", { blob: "a1" });
+    await store.reconcile();
+    expect(store.since(0).frames[0]).toMatchObject({ op: "update", prio: 0 });
+
+    // The record is deleted (a clean op:end, a reap, or the idle-done retire).
+    await unlink(join(dir, "s1.json"));
+    clock = NOW + 1_000;
+    await store.reconcile();
+    const final = store.since(1);
+    expect(final.frames).toHaveLength(1);
+    expect(final.frames[0]).toMatchObject({ sessionId: "s1", op: "end", prio: 0, ts: NOW + 1_000, blob: "a1" });
+
+    // Re-observing the same absence must NOT restamp it — one last word, not a heartbeat of ends.
+    const seqAfterEnd = store.seq();
+    await store.reconcile();
+    expect(store.seq()).toBe(seqAfterEnd);
+
+    // Past the grace the entry leaves the map entirely (silently, by contract: the phone was already
+    // told, and absence in a LAN response is never evidence on its side).
+    clock = NOW + 1_000 + LAN_FRAME_RETIRE_GRACE_MS + 1;
+    await store.reconcile();
+    expect(store.size()).toBe(0);
+    expect(store.since(0).frames).toEqual([]);
+  });
+
+  test("a session whose pid died gets the same terminal frame, mirroring the sweep's verdict", async () => {
+    const dir = await framesDir();
+    let alive = true;
+    const store = makeStore(dir, { isAlive: () => alive });
+    await put(dir, "s1", { blob: "a1" });
+    await store.reconcile();
+    expect(store.since(0).frames[0]).toMatchObject({ op: "update" });
+    alive = false;
+    await store.reconcile();
+    expect(store.since(1).frames[0]).toMatchObject({ sessionId: "s1", op: "end", prio: 0, blob: "a1" });
+  });
+
+  test("records the feed cannot render are skipped without inventing a frame", async () => {
+    const dir = await framesDir();
+    const store = makeStore(dir);
+    await put(dir, "no-blob", { blob: undefined });
+    await put(dir, "other-pairing", { pairingId: "pairing-old" });
+    await writeFile(join(dir, "corrupt.json"), "{{{ not json");
+    await writeFile(join(dir, "notes.txt"), "ignored");
+    await put(dir, "good");
+    await store.reconcile();
+    expect(store.since(0).frames.map((f: LanFrame) => f.sessionId)).toEqual(["good"]);
+  });
+
+  test("a pairing rotation voids every cached frame (they are sealed under a key the phone no longer has)", async () => {
+    const dir = await framesDir();
+    const store = makeStore(dir);
+    await put(dir, "s1");
+    await store.reconcile();
+    expect(store.size()).toBe(1);
+    store.setPairing("pairing-new");
+    await store.reconcile();
+    expect(store.size()).toBe(0);                 // the old record's blob can't be opened by the new pairing
+    await put(dir, "s2", { pairingId: "pairing-new" });
+    await store.reconcile();
+    expect(store.since(0).frames.map((f: LanFrame) => f.sessionId)).toEqual(["s2"]);
+  });
+
+  test("the fs.watch feed picks up a record written by a HOOK PROCESS with no reconcile call at all", async () => {
+    const dir = await framesDir();
+    const store = makeStore(dir, { debounceMs: 20 });
+    store.start();
+    store.start(); // idempotent
+
+    const held = store.wait(0, 8_000);
+    // Nothing here ever calls reconcile(): this is the real node fs.watch feed, which is how a separate,
+    // short-lived hook process's write reaches the phone in ~100 ms instead of on the 5 s sweep.
+    //
+    // The write is REPEATED on a slow tick on purpose. A cold macOS watcher can miss its first event
+    // (reproduced at ~1-in-15 fresh processes) — that is exactly the documented lossiness this design
+    // answers with the sweep fallback, so pinning a single event would be testing a guarantee the
+    // platform does not make. Any one delivery proves the feed; identical content means the extra
+    // writes cost nothing (an unchanged record never bumps the counter).
+    let slice: LanFramesSlice | null = null;
+    for (let attempt = 0; attempt < 10 && slice === null; attempt += 1) {
+      await put(dir, "s1", { blob: "from-the-hook" });
+      slice = await Promise.race([held, new Promise<null>((r) => setTimeout(() => r(null), 400))]);
+    }
+    expect(slice).not.toBeNull();
+    expect(slice!.frames).toHaveLength(1);
+    expect(slice!.frames[0]).toMatchObject({ sessionId: "s1", blob: "from-the-hook" });
+  });
+
+  test("the watch feed is debounced: a burst of events costs exactly ONE directory pass", async () => {
+    const dir = await framesDir();
+    await put(dir, "s1");
+    let fire: (() => void) | undefined;
+    let closed = 0;
+    let passes = 0;
+    const store = makeStore(dir, {
+      debounceMs: 30,
+      isAlive: () => { passes += 1; return true; }, // called once per readable record per pass
+      watchDir: (_dir: string, onChange: () => void) => {
+        fire = onChange;
+        return { close: () => { closed += 1; } };
+      },
+    });
+    store.start();
+    expect(typeof fire).toBe("function");
+    await store.reconcile(); // settle the pairing-driven first pass, then measure only the watch feed
+    passes = 0;
+    for (let i = 0; i < 5; i += 1) fire!();          // a write burst
+    await new Promise((r) => setTimeout(r, 120));
+    expect(passes).toBe(1);                          // …collapsed into one reload
+    fire!();
+    await new Promise((r) => setTimeout(r, 120));
+    expect(passes).toBe(2);                          // a later event still gets its own pass
+    store.stop();
+    expect(closed).toBe(1);
+    fire!();                                          // an event after teardown must do nothing
+    await new Promise((r) => setTimeout(r, 120));
+    expect(passes).toBe(2);
+  });
+
+  test("a store with no session dir (the `bun test` default) is inert rather than reading real records", async () => {
+    const store = createLanFrameStore({ now: () => NOW });
+    stores.push(store);
+    store.setPairing("pairing-abc");
+    store.start();
+    await store.reconcile();
+    expect(store.size()).toBe(0);
+    expect(store.since(0)).toEqual({ seq: 0, frames: [] });
+  });
+});
+
+describe("POST /v1/lan — op:frames", () => {
+  const NOW = 1_800_000_000_000;
+  const stores: LanFrameStore[] = [];
+
+  afterEach(() => {
+    while (stores.length > 0) {
+      try { stores.pop()?.stop(); } catch { /* already stopped */ }
+    }
+  });
+
+  async function fed(): Promise<{ dir: string; store: LanFrameStore }> {
+    const dir = await mkdtemp(join(tmpdir(), "nomo-frames-"));
+    tmpDirs.push(dir);
+    const store = createLanFrameStore({ sessionsDir: dir, isAlive: () => true, now: () => NOW });
+    stores.push(store);
+    store.setPairing("pairing-abc");
+    return { dir, store };
+  }
+
+  const write = (dir: string, sessionId: string, over: Partial<SessionRecord> = {}): Promise<void> =>
+    writeFile(join(dir, `${sessionId}.json`), JSON.stringify({
+      pid: 4242, machine: "mac-mini", label: "api-status", ts: NOW,
+      op: "update", prio: 0, blob: "sealed-blob", pairingId: "pairing-abc", ...over,
+    }));
+
+  test("answers a SEALED {seq,lid,frames} — the blob is passed through untouched, never opened here", async () => {
+    const cfg = config();
+    const { dir, store } = await fed();
+    await write(dir, "s1", { blob: "sealed-by-the-hook", prio: 1, attentionKind: "userInput", agent: "codex" });
+    await store.reconcile();
+    const sdir = await stateDir();
+    const { port, lid } = await startListener({ statePath: join(sdir, "lan.json"), frames: store, cfg });
+
+    const n = nonce();
+    const res = await post(port, await sealRequest(cfg, {
+      op: "frames", ts: Date.now(), nonce: n, payload: { sinceSeq: 0, waitMs: 0 },
+    }));
+    expect(res.status).toBe(200);
+    const opened = await openResponse(cfg, res.json);
+    expect(opened.reqNonce).toBe(n);
+    expect(opened.payload).toEqual({
+      ok: true,
+      seq: 1,
+      lid,
+      frames: [{
+        seq: 1, sessionId: "s1", op: "update", prio: 1, ts: NOW,
+        blob: "sealed-by-the-hook", agent: "codex", attentionKind: "userInput",
+      }],
+    });
+  });
+
+  test("the lid is stable for the life of the instance (it is the phone's cursor-reset signal)", async () => {
+    const cfg = config();
+    const { store } = await fed();
+    const sdir = await stateDir();
+    const { port, lid } = await startListener({ statePath: join(sdir, "lan.json"), frames: store, cfg });
+    const seen: unknown[] = [];
+    for (let i = 0; i < 3; i += 1) {
+      const res = await post(port, await sealRequest(cfg, {
+        op: "frames", ts: Date.now(), nonce: nonce(), payload: { sinceSeq: 0, waitMs: 0 },
+      }));
+      seen.push(((await openResponse(cfg, res.json)).payload as Record<string, unknown>).lid);
+    }
+    expect(seen).toEqual([lid, lid, lid]);
+  });
+
+  test("a held request is answered the moment a record lands (the sub-second win), sealed as always", async () => {
+    const cfg = config();
+    const { dir, store } = await fed();
+    const sdir = await stateDir();
+    const { port } = await startListener({ statePath: join(sdir, "lan.json"), frames: store, cfg });
+
+    const started = Date.now();
+    const held = post(port, await sealRequest(cfg, {
+      op: "frames", ts: Date.now(), nonce: nonce(), payload: { sinceSeq: 0, waitMs: 5_000 },
+    }));
+    setTimeout(() => { void write(dir, "s9", { blob: "late-blob" }).then(() => store.reconcile()); }, 25);
+    const res = await held;
+    expect(Date.now() - started).toBeLessThan(1_000);
+    const payload = (await openResponse(cfg, res.json)).payload as { frames: LanFrame[] };
+    expect(payload.frames).toHaveLength(1);
+    expect(payload.frames[0]).toMatchObject({ sessionId: "s9", blob: "late-blob" });
+  });
+
+  test("a hold that expires answers an empty frame list rather than an error", async () => {
+    const cfg = config();
+    const { store } = await fed();
+    const sdir = await stateDir();
+    const { port } = await startListener({ statePath: join(sdir, "lan.json"), frames: store, cfg });
+    const res = await post(port, await sealRequest(cfg, {
+      op: "frames", ts: Date.now(), nonce: nonce(), payload: { sinceSeq: 0, waitMs: 80 },
+    }));
+    expect(res.status).toBe(200);
+    expect((await openResponse(cfg, res.json)).payload).toEqual({ ok: true, seq: 0, lid: expect.any(String), frames: [] });
+  });
+
+  test("a malformed frames payload is the same opaque 400 every other bad payload gets", async () => {
+    const cfg = config();
+    const { store } = await fed();
+    const sdir = await stateDir();
+    const { port } = await startListener({ statePath: join(sdir, "lan.json"), frames: store, cfg });
+    const bad = [
+      {},
+      { sinceSeq: 0 },
+      { waitMs: 0 },
+      { sinceSeq: -1, waitMs: 0 },
+      { sinceSeq: 0, waitMs: LAN_FRAMES_WAIT_MAX_MS + 1 },
+      { sinceSeq: "0", waitMs: 0 },
+      { sinceSeq: 1.5, waitMs: 0 },
+    ];
+    for (const payload of bad) {
+      const res = await post(port, await sealRequest(cfg, { op: "frames", ts: Date.now(), nonce: nonce(), payload }));
+      expect(res.status).toBe(400);
+      expect(res.json).toEqual({});
+    }
+  });
+
+  test("stopping the listener releases a held frames request instead of hanging its socket", async () => {
+    const cfg = config();
+    const { store } = await fed();
+    const sdir = await stateDir();
+    const { listener, port } = await startListener({ statePath: join(sdir, "lan.json"), frames: store, cfg });
+    const held = post(port, await sealRequest(cfg, {
+      op: "frames", ts: Date.now(), nonce: nonce(), payload: { sinceSeq: 0, waitMs: 20_000 },
+    })).catch((error: Error) => ({ status: -1, json: error.name }));
+    await new Promise((r) => setTimeout(r, 50));
+    const started = Date.now();
+    listener.stop(); // teardown seam: the frame store's waiters are resolved before the sockets die
+    await held;      // resolves (answered or socket-closed) — what must NOT happen is a 20 s hang
+    expect(Date.now() - started).toBeLessThan(2_000);
   });
 });

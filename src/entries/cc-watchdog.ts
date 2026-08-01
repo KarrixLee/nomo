@@ -1789,6 +1789,11 @@ export async function correctPendingApproval(
         sentDone: false,
         // Heartbeats must repeat the corrective attention frame, not the stale pre-question working blob.
         ...(typeof envelope.blob === "string" ? { blob: envelope.blob } : {}),
+        // Write the clear discriminator THROUGH to the record (append-last field, NOM-44 phase 3) so the
+        // LAN frames feed labels this recovered episode exactly as the POSTed envelope does. Written
+        // unconditionally — `undefined` DROPS the key on stringify (the doneAttempts-clear idiom), which
+        // is what keeps a plain approval from inheriting a previous question's marker through the spread.
+        attentionKind,
       };
       await writeRecord(path, next);
     } catch {

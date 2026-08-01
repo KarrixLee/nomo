@@ -2058,7 +2058,7 @@ async function stashPendingEvent(input, machine, title, now, stashPath = PENDING
     await atomicWrite(stashPath, JSON.stringify(stash), 384);
   } catch {}
 }
-async function trackSessionAt(sessionsDir, sessionId, op, prio, status, blob, machine, label, transcript, agent = "claude", sessionStartedAt, turnStartedAt, turnId, title, pairingId, model, pendingPlanPicker = false, pid = process.ppid, origin, planPickerVerificationPending = false, dbg) {
+async function trackSessionAt(sessionsDir, sessionId, op, prio, status, blob, machine, label, transcript, agent = "claude", sessionStartedAt, turnStartedAt, turnId, title, pairingId, model, pendingPlanPicker = false, pid = process.ppid, origin, planPickerVerificationPending = false, dbg, attentionKind) {
   try {
     const path = `${sessionsDir}/${sessionId}.json`;
     if (op === "end") {
@@ -2089,13 +2089,14 @@ async function trackSessionAt(sessionsDir, sessionId, op, prio, status, blob, ma
       ...planPickerVerificationPending ? { planPickerVerificationPending: true } : {},
       ...pendingPlanPicker || planPickerVerificationPending ? { planPickerPendingSince: recordedAt } : {},
       ...typeof dbg === "string" && dbg.length > 0 ? { dbg } : {},
-      ...origin ? { origin } : {}
+      ...origin ? { origin } : {},
+      ...attentionKind ? { attentionKind } : {}
     };
     await atomicWrite(path, JSON.stringify(record), 384);
   } catch {}
 }
-async function trackSession(sessionId, op, prio, status, blob, machine, label, transcript, agent = "claude", sessionStartedAt, turnStartedAt, turnId, title, pairingId, model, pendingPlanPicker = false, pid = process.ppid, origin, planPickerVerificationPending = false, dbg) {
-  return trackSessionAt(SESSIONS_DIR, sessionId, op, prio, status, blob, machine, label, transcript, agent, sessionStartedAt, turnStartedAt, turnId, title, pairingId, model, pendingPlanPicker, pid, origin, planPickerVerificationPending, dbg);
+async function trackSession(sessionId, op, prio, status, blob, machine, label, transcript, agent = "claude", sessionStartedAt, turnStartedAt, turnId, title, pairingId, model, pendingPlanPicker = false, pid = process.ppid, origin, planPickerVerificationPending = false, dbg, attentionKind) {
+  return trackSessionAt(SESSIONS_DIR, sessionId, op, prio, status, blob, machine, label, transcript, agent, sessionStartedAt, turnStartedAt, turnId, title, pairingId, model, pendingPlanPicker, pid, origin, planPickerVerificationPending, dbg, attentionKind);
 }
 async function markDoneDeliveredAt(sessionsDir, sessionId) {
   try {
@@ -2383,7 +2384,7 @@ async function runHook(agent) {
     const origin = existingRecord?.origin ?? sessionOrigin(input, hookPid, hookCommand);
     const recordPid = reusedForkPredecessor ? existingRecord.pid : hookPid;
     const recordTranscript = reusedForkPredecessor ? existingRecord.transcript ?? transcriptPath : transcriptPath;
-    await trackSession(sessionId, plan.op, plan.prio, plan.status, envelope.blob, machine, label, recordTranscript, agent, startedAt, turnStartedAt, turnId, title, config.pairingId, model, pendingPlanPicker, recordPid, origin, planPickerVerificationPending, dbg);
+    await trackSession(sessionId, plan.op, plan.prio, plan.status, envelope.blob, machine, label, recordTranscript, agent, startedAt, turnStartedAt, turnId, title, config.pairingId, model, pendingPlanPicker, recordPid, origin, planPickerVerificationPending, dbg, attentionKind);
     const clearedPickerMarker = pendingPlanPicker === false && planPickerVerificationPending === false && (existingRecord?.pendingPlanPicker === true || existingRecord?.planPickerVerificationPending === true || existingRecord?.planPickerSettled === true);
     if (agent === "codex" && (hookName === "Stop" || pendingPlanPicker || planPickerVerificationPending || clearedPickerMarker)) {
       tracePlanPickerDecision(sessionId, {
@@ -2454,6 +2455,20 @@ var LAN_FUTURE_SKEW_MS = 30000;
 var LAN_NONCE_MAX_CHARS = 64;
 var LAN_REQUEST_ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
 var LAN_ANSWER_BLOB_MAX_CHARS = 3072;
+var LAN_FRAMES_WAIT_MAX_MS = 25000;
+function parseLanFramesRequest(payload) {
+  const sinceSeq = payload.sinceSeq;
+  const waitMs = payload.waitMs;
+  if (typeof sinceSeq !== "number" || !Number.isInteger(sinceSeq))
+    return null;
+  if (sinceSeq < 0 || sinceSeq > Number.MAX_SAFE_INTEGER)
+    return null;
+  if (typeof waitMs !== "number" || !Number.isInteger(waitMs))
+    return null;
+  if (waitMs < 0 || waitMs > LAN_FRAMES_WAIT_MAX_MS)
+    return null;
+  return { sinceSeq, waitMs };
+}
 var LAN_STATE_PATH = `${CC_DIR}/lan.json`;
 function parseLanState(raw) {
   try {

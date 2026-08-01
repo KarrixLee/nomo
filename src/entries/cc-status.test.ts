@@ -1065,6 +1065,36 @@ describe("trackSession + readRecord file glue (sentDone survives a fresh disk re
       await unlink(`${glueSessions}/${sessionId}.json`).catch(() => {});
     }
   });
+
+  test("attentionKind round-trips through the record (append-last), and an OLD record without it still parses", async () => {
+    const sessionId = `test-attn-${randomUUID()}`;
+    const path = `${glueSessions}/${sessionId}.json`;
+    try {
+      // A Codex request_user_input event caches its clear discriminator so the LAN frames feed — which
+      // rebuilds frames from the RECORD, not from the POST — keeps labelling it a question.
+      await trackSessionAt(glueSessions, sessionId, "update", 1, "needsAttention", "B", "mac", "proj", "/tmp/t.jsonl", "codex",
+        undefined, undefined, undefined, undefined, undefined, undefined, false, 4242, undefined, false, undefined, "userInput");
+      expect((await readRecord(sessionId, glueSessions))?.attentionKind).toBe("userInput");
+      // APPEND-LAST: the new key is the LAST one in the serialized record, so no existing key moved.
+      expect(Object.keys(JSON.parse(await readFile(path, "utf8")) as object).at(-1)).toBe("attentionKind");
+      // A plain approval / a later working event writes no discriminator at all — the record is rebuilt
+      // whole on every event, so the marker cannot linger past its episode.
+      await trackSessionAt(glueSessions, sessionId, "update", 0, "working", "B", "mac", "proj", "/tmp/t.jsonl");
+      expect((await readRecord(sessionId, glueSessions))?.attentionKind).toBeUndefined();
+      // An OLD plugin's record (written before the field existed) has no such key: it must load fine and
+      // simply read back undefined — never a crash, never a default.
+      await writeFile(path, JSON.stringify({
+        pid: 4242, machine: "mac", label: "proj", ts: Date.now(), op: "update", prio: 1,
+        lastEvent: "needsAttention", blob: "B", pairingId: "p",
+      }));
+      const legacy = await readRecord(sessionId, glueSessions);
+      expect(legacy).not.toBeNull();
+      expect(legacy?.attentionKind).toBeUndefined();
+      expect(legacy?.blob).toBe("B");
+    } finally {
+      await unlink(path).catch(() => {});
+    }
+  });
 });
 
 // --- F6 phantom-session lineage + local trace ------------------------------------------------

@@ -435,6 +435,20 @@ export interface SessionRecord {
    *  watchdog rewrites. Local-only diagnostic metadata — never copied into the blob or wire envelope.
    *  Optional for backward compatibility with records written before the phantom-session trace fix. */
   origin?: SessionOrigin;
+  /** APPENDED LAST (NOM-44 phase 3). The clear `attentionKind` discriminator just POSTed for this
+   *  session — today only Codex's `request_user_input` ("the model is asking YOU something", as opposed
+   *  to a plain permission approval). It already rides the WORKER envelope (see hook.ts buildEnvelope /
+   *  cc-watchdog's needsAttention corrective), but it was never persisted, so the LAN frames feed — which
+   *  is rebuilt from these records, not from the POSTs — would have dropped the marker and shown a Codex
+   *  question as an ordinary approval on the phone.
+   *
+   *  APPEND-LAST DISCIPLINE (mirrors how `model`/`pairingId` were added): a new optional field goes at
+   *  the END of this interface AND at the END of trackSessionAt's record literal, never interleaved, so
+   *  existing keys keep their order and the diff shows exactly one added line on each side. Parsing is
+   *  tolerant by construction — readRecord is a plain JSON.parse, so a record written by an older plugin
+   *  simply has no `attentionKind` key and reads back `undefined` (never a crash, never a default).
+   *  Absent → no discriminator (a plain approval, or an agent that has none). */
+  attentionKind?: "userInput";
 }
 
 /** The plaintext a pending-pairing flush needs to POST the pairing session the instant the shared key

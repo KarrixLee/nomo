@@ -36,6 +36,34 @@ export const LAN_REQUEST_ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
  *  be a silent split brain between the two channels. */
 export const LAN_ANSWER_BLOB_MAX_CHARS = 3072;
 
+/** Longest a `frames` long-poll may be held open (phase 3). The phone asks for at most this; anything
+ *  larger is a client bug and is refused rather than clamped, so both ends always agree on the deadline.
+ *  25 s sits comfortably under every timeout in the path — see the node:http timeout note in
+ *  lan-listener's tryListen — and gives the phone a cheap re-arm loop while it is foregrounded. */
+export const LAN_FRAMES_WAIT_MAX_MS = 25_000;
+
+/** A `frames` request payload, after the outer seal opens: "everything newer than sinceSeq, and if there
+ *  is nothing, hold the response up to waitMs". Both fields are REQUIRED — the contract is frozen and
+ *  shared verbatim with the iOS CCLanClient, so a missing field is a client bug, not a default. */
+export interface LanFramesRequest {
+  sinceSeq: number;
+  waitMs: number;
+}
+
+/** Shape-check a `frames` payload. Integers only: `sinceSeq` is a counter the phone echoes back from a
+ *  previous response (0 on a fresh connection), `waitMs` is bounded by LAN_FRAMES_WAIT_MAX_MS so a
+ *  caller cannot pin a socket for longer than the listener intends. Pure; anything else → null → the
+ *  same opaque 400 every other malformed payload gets. */
+export function parseLanFramesRequest(payload: Record<string, unknown>): LanFramesRequest | null {
+  const sinceSeq = payload.sinceSeq;
+  const waitMs = payload.waitMs;
+  if (typeof sinceSeq !== "number" || !Number.isInteger(sinceSeq)) return null;
+  if (sinceSeq < 0 || sinceSeq > Number.MAX_SAFE_INTEGER) return null;
+  if (typeof waitMs !== "number" || !Number.isInteger(waitMs)) return null;
+  if (waitMs < 0 || waitMs > LAN_FRAMES_WAIT_MAX_MS) return null;
+  return { sinceSeq, waitMs };
+}
+
 /** Where the bound port + listener-instance id are persisted, next to config.json (0600, atomicWrite —
  *  same directory discipline as every other piece of daemon state). Re-binding the SAME port across
  *  watchdog restarts is what lets the phone keep a cached endpoint working instead of re-probing; it is
