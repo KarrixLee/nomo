@@ -16,7 +16,8 @@ import { execFile } from "node:child_process";
 import { readdir, readFile, stat } from "node:fs/promises";
 import { promisify } from "node:util";
 import { basename, join } from "node:path";
-import { AgentKind, codexHome, isRealTty, lastHookPath, pidAlive, readPrefix, readSuffix, SessionRecord } from "./shared";
+import { AgentKind, codexHome, isRealTty, lastHookPath, pidAlive, pidAncestors, pidCommand, readPrefix, readSuffix, SessionRecord } from "./shared";
+import { ancestryContainsHerdr } from "./terminal-focus";
 
 const execFileP = promisify(execFile);
 
@@ -1386,6 +1387,10 @@ export interface LocateTuiDeps {
   startTimeOf?: (pid: number) => Promise<number | undefined>;
   /** A pid's controlling tty as `ps` prints it ("ttys004" / "??"), or undefined on failure. */
   ttyOf?: (pid: number) => Promise<string | undefined>;
+  /** Ancestor pid chain (shared.pidAncestors) — the herdr-ownership probe. */
+  ancestorsOf?: (pid: number) => number[];
+  /** A pid's full argv (shared.pidCommand) — the herdr-ownership probe. */
+  commandOf?: (pid: number) => string | undefined;
   /** Optional outcome sink (see LocateTuiReason). Best-effort; never throws into the caller. */
   note?: (reason: LocateTuiReason) => void;
 }
@@ -1533,9 +1538,16 @@ export async function codexLocateTuiPid(
 }
 
 /** Locate the interactive Claude TUI process: the record's own pid IS it (the hook stores
- *  process.ppid, the `claude` process). The only check is that the pid still holds a REAL controlling
- *  tty — a dead pid, or one whose tty is "??" (a headless/daemon `claude`), owns no terminal window,
- *  so there is nothing to focus. Never throws. */
+ *  process.ppid, the `claude` process). The check is that the pid still owns a window:
+ *    • if herdr's daemon owns its pty (the pid or an ancestor IS a herdr process) the pid's own tty
+ *      is MEANINGLESS — terminal-focus correlates the herdr PANE instead — so it is accepted as-is;
+ *    • otherwise it must hold a REAL controlling tty, because a dead pid, or one whose tty is "??"
+ *      (a headless `claude`), owns no terminal window and there is nothing to focus.
+ *  The herdr clause exists because a Claude BACKGROUND/forked session (`claude daemon run` →
+ *  `--bg-pty-host`) records a daemon-hosted ppid that always reads "??" while its herdr tab is open
+ *  and uniquely correlatable — the tty-only rule silently no-opped "Open on Mac" for every one of
+ *  them (field report 2026-08-02). A dead pid has no readable ancestry, so it can never take that
+ *  clause. Never throws. */
 export async function claudeLocateTuiPid(
   ctx: { sessionId: string; record: SessionRecord }, deps: LocateTuiDeps = {},
 ): Promise<number | undefined> {
@@ -1544,6 +1556,10 @@ export async function claudeLocateTuiPid(
     if (typeof pid !== "number" || !Number.isFinite(pid) || pid <= 0) {
       noteLocate(deps, "no-candidate");
       return undefined;
+    }
+    if (ancestryContainsHerdr(pid, deps.ancestorsOf ?? pidAncestors, deps.commandOf ?? pidCommand)) {
+      noteLocate(deps, "record-pid");
+      return pid;
     }
     let tty: string | undefined;
     try { tty = await (deps.ttyOf ?? ttyViaPs)(pid); } catch { tty = undefined; }

@@ -1,9 +1,11 @@
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "bun:test";
 import {
-  codexAppServerSocketAvailable, codexAppServerSocketPath, codexCompanionBrokerEvidence, ensureWatchdog, formatWatchdogPidfile, fullTextForRecord, isWatchdogCommand,
+  clearDecisionHoldAt, codexAppServerSocketAvailable, codexAppServerSocketPath, codexCompanionBrokerEvidence,
+  decisionHoldFileName, ensureWatchdog, formatWatchdogPidfile, fullTextForRecord, isWatchdogCommand,
+  readDecisionHoldAt, writeDecisionHoldAt,
   localApprovalsState, parseWatchdogPidfile, PLUGIN_VERSION, RECORD_FULL_TEXT_MAX_CHARS,
   RECORD_FULL_TEXT_TRUNCATION_MARKER, recordFullTextIsComplete, stampPermissionDetailFullAt, watchdogHolderIsLive,
 } from "./shared";
@@ -294,6 +296,58 @@ describe("stampPermissionDetailFullAt (the permission hook's record patch)", () 
     try {
       await stampPermissionDetailFullAt(d, "ghost", "content");
       expect(await readFile(join(d, "ghost.json"), "utf8").catch(() => null)).toBeNull();
+    } finally {
+      await rm(d, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("the remote-approval hold marker (the LAN channel's decision-pending guard)", () => {
+  async function dir(): Promise<string> {
+    return await mkdtemp(join(tmpdir(), "nomo-hold-"));
+  }
+
+  test("round-trips, and lives beside the record WITHOUT ever looking like one", async () => {
+    const d = await dir();
+    try {
+      const hold = { blob: "sealed-decision-pending", at: 1_800_000_000_000, pid: 4242 };
+      await writeDecisionHoldAt(d, "s1", hold);
+      expect(await readDecisionHoldAt(d, "s1")).toEqual(hold);
+      // The whole reason this is not a SessionRecord field: `trackSessionAt` rebuilds the record whole
+      // on every hook event and would erase it. The whole reason it is not a `.json` file: every other
+      // readdir consumer of this directory filters on that extension, and a marker that read as a
+      // session would surface on the phone as a row of its own.
+      expect(decisionHoldFileName("s1")).toBe("s1.hold");
+      expect(decisionHoldFileName("s1").endsWith(".json")).toBe(false);
+      expect(await readdir(d)).toEqual(["s1.hold"]);
+    } finally {
+      await rm(d, { recursive: true, force: true });
+    }
+  });
+
+  test("clearing is COMPARE-AND-CLEAR: a parallel tool's later hold survives our exit", async () => {
+    const d = await dir();
+    try {
+      // Claude runs tools in PARALLEL. Tool A's hook holds, tool B's hook holds over it, then A exits.
+      await writeDecisionHoldAt(d, "s1", { blob: "card-b", at: 2, pid: 777 });
+      await clearDecisionHoldAt(d, "s1", 4242);                 // A's exit — not the owner
+      expect(await readDecisionHoldAt(d, "s1")).toMatchObject({ pid: 777 });
+      await clearDecisionHoldAt(d, "s1", 777);                  // B's exit — the owner
+      expect(await readDecisionHoldAt(d, "s1")).toBeNull();
+    } finally {
+      await rm(d, { recursive: true, force: true });
+    }
+  });
+
+  test("an absent or corrupt marker is never a throw: no owner, so it is simply removed", async () => {
+    const d = await dir();
+    try {
+      await clearDecisionHoldAt(d, "ghost", 1);                 // nothing there → silent
+      expect(await readDecisionHoldAt(d, "ghost")).toBeNull();
+      await writeFile(join(d, "s1.hold"), "{not json");
+      expect(await readDecisionHoldAt(d, "s1")).toBeNull();
+      await clearDecisionHoldAt(d, "s1", 1);                    // nobody can own it → gone
+      expect(await readFile(join(d, "s1.hold"), "utf8").catch(() => null)).toBeNull();
     } finally {
       await rm(d, { recursive: true, force: true });
     }

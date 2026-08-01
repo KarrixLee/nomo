@@ -24,8 +24,10 @@ import { hostname } from "node:os";
 import { basename, isAbsolute, relative, resolve } from "node:path";
 import { runHook, buildBlob, OpPlan } from "./hook";
 import {
-  AgentKind, atomicWrite, BLOB_FIT_CHARS, CC_DIR, codexHome, Config, flagExists, fullTextForRecord, loadConfig, NO_HOLD_PATH,
+  AgentKind, atomicWrite, BLOB_FIT_CHARS, CC_DIR, clearDecisionHold, codexHome, Config, DecisionHold, flagExists,
+  fullTextForRecord, loadConfig, NO_HOLD_PATH,
   PLUGIN_VERSION, readPrefix, readRecord, readSuffix, sealedBlobChars, SessionRecord, stampPermissionDetailFull,
+  writeDecisionHold,
 } from "./shared";
 import { b64url, decryptBlob, deriveLanKey, encryptBlob } from "./crypto";
 // The relay's timing/give-up rules, shared verbatim with the Codex relay (codex-remote-input.ts) that
@@ -979,6 +981,17 @@ function defaultStampDetailFull(): (sessionId: string, detailFull: string | unde
   return lanRunningUnderTest() ? async () => { /* never touch real records from a test */ } : stampPermissionDetailFull;
 }
 
+/** The hold-marker writer/clearer, under the SAME test guard and for the same reason as
+ *  defaultStampDetailFull: a unit test must never stamp (or, worse, clear) a marker in the developer's
+ *  live session store. Tests that exercise the hold inject `writeHoldFn` / `clearHoldFn`. */
+function defaultWriteHold(): (sessionId: string, hold: DecisionHold) => Promise<void> {
+  return lanRunningUnderTest() ? async () => { /* never touch real records from a test */ } : writeDecisionHold;
+}
+
+function defaultClearHold(): (sessionId: string, pid: number) => Promise<void> {
+  return lanRunningUnderTest() ? async () => { /* never touch real records from a test */ } : clearDecisionHold;
+}
+
 /** Injectable seams so permission.test.ts drives the state machine with a scripted fetch, an instant
  *  sleep, a deterministic requestId, and a temp flag path — no real stdin/network/timers. Production
  *  uses every default. */
@@ -992,6 +1005,14 @@ export interface PermissionHookDeps {
    *  phase 4). Defaults to the real record patcher in production and to a NO-OP under `bun test` — see
    *  defaultStampDetailFull. Called at most once per prompt, and only when the value would change. */
   stampDetailFullFn?: (sessionId: string, detailFull: string | undefined) => Promise<void>;
+  /** Stamps / retires the on-disk hold marker the LAN frames feed serves the Allow/Deny card from (see
+   *  shared.ts's DecisionHold header). Defaults to the real writers in production and to NO-OPs under
+   *  `bun test` — see defaultWriteHold. Called exactly once each per granted hold. */
+  writeHoldFn?: (sessionId: string, hold: DecisionHold) => Promise<void>;
+  clearHoldFn?: (sessionId: string, pid: number) => Promise<void>;
+  /** The pid stamped as the hold's OWNER (defaults to this process). Injected so a test can drive the
+   *  compare-and-clear rule without spawning processes. */
+  holdPid?: number;
   /** Resolve Codex's effective per-turn approval policy from its rollout. Tests inject this so no
    *  local Codex state is touched; Claude never calls it. */
   loadCodexTurnPolicyFn?: (
@@ -1043,6 +1064,9 @@ export async function runPermissionHook(deps: PermissionHookDeps = {}, agent: Ag
   /** The hold's LAN loopback poller, once a hold is granted. Function-scoped ONLY so the `finally` below
    *  can stop its detached ticker no matter which of the loop's many exits fired. */
   let loopback: LoopbackAnswerPoller | undefined;
+  /** The session whose on-disk hold marker THIS process owns, once one is stamped — function-scoped for
+   *  the same reason as `loopback`: the `finally` clears it from every exit of the poll loop. */
+  let heldSessionId: string | undefined;
   try {
     // Escape hatch FIRST (a file stat — no stdin consumed yet): if the user paused remote approvals
     // locally, behave exactly as the old fire-and-forget attention event (instant terminal dialog).
@@ -1324,6 +1348,21 @@ export async function runPermissionHook(deps: PermissionHookDeps = {}, agent: Ag
       if (!hold) { trace({ event: "exit", reason: "hold-false" }); return; } // still not shown → worker applied the attention update → terminal dialog
     }
 
+    // THE HOLD IS REAL — tell the LAN channel. The worker now stores the decisionPending frame and
+    // defends it (it drops the plain prio:1 needsAttention CC's `Notification` hook fires seconds from
+    // now); the LAN frames feed rebuilds its frames from the SESSION RECORD, which has never carried
+    // either half. So stamp the same sealed frame beside the record, where the feed can find it, and
+    // let its guards decide when it stops being the truth (see shared.ts's DecisionHold header and
+    // lanHoldLive). Without this the phone's LAN row settles on a yellow "needs help" with no
+    // Allow/Deny — field report, session bed2e681, 2026-08-02.
+    //
+    // AWAITED, and BEFORE the poll loop, for the same reason the detail tee is: the phone must never be
+    // able to see the card before the local state that describes it is on disk. Best-effort inside.
+    await (deps.writeHoldFn ?? defaultWriteHold())(
+      sessionId, { blob, at: (deps.now ?? Date.now)(), pid: deps.holdPid ?? process.pid },
+    );
+    heldSessionId = sessionId;
+
     // HOLD: poll until the phone answers, the request leaves "pending", sustained failure trips the
     // give-up cap, or we're killed. Each fetch keeps its own 2s ceiling; transient failures are
     // tolerated (keep polling). A decrypt failure or requestId mismatch exits silently (fail open).
@@ -1450,6 +1489,15 @@ export async function runPermissionHook(deps: PermissionHookDeps = {}, agent: Ag
     // Stop the detached loopback ticker on EVERY exit (emitted, released, give-up, exception). The
     // process is normally about to exit anyway; this is what keeps it from outliving the hold in-process.
     try { loopback?.stop(); } catch { /* best-effort */ }
+    // Retire this process's hold marker the same way — answered, released, expired, gave up, threw. It
+    // is a compare-and-clear (a parallel tool's LATER hold must survive our exit), and it is NOT the
+    // only release: a SIGKILL, or the SIGTERM a closed terminal sends, never reaches a `finally`, so the
+    // feed's own holder-liveness and TTL guards are what make a marker impossible to wedge.
+    if (heldSessionId !== undefined) {
+      try {
+        await (deps.clearHoldFn ?? defaultClearHold())(heldSessionId, deps.holdPid ?? process.pid);
+      } catch { /* best-effort */ }
+    }
   }
 }
 

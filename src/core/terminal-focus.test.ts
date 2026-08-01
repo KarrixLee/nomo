@@ -272,6 +272,33 @@ describe("focusTerminalForPid", () => {
 });
 
 describe("focusTerminalForPid through herdr", () => {
+  // FIELD REGRESSION (2026-08-02): "Open on Mac" no-opped for a daemon-hosted Claude session. The
+  // hook records `process.ppid`, which for a `claude daemon run` / `--bg-pty-host` session is a
+  // process with NO controlling tty ("??") — so the tty gate refused it as no-tty even though its
+  // herdr TAB was open and correlated uniquely by title. The herdr daemon owns the pty; the pid's
+  // own tty is simply not the signal there, so the herdr branch has to be reached FIRST.
+  test("a daemon-hosted pid with NO controlling tty still reaches herdr — the daemon owns the pty", async () => {
+    const events: object[] = [];
+    const h = herdrDeps({ trace: (event) => events.push(event) });
+    expect(await focusTerminalForPid(100, { ...h.deps, ttyOf: async () => "??" }))
+      .toEqual({ ok: true, via: "herdr", reason: "herdr-focused" });
+    expect(h.calls[1]).toEqual({ file: "herdr", args: ["tab", "focus", "w2:t8"] });
+    expect(events.at(-1)).toMatchObject({ result: "focused", reason: "herdr-focused" });
+  });
+
+  test("a pid whose tty cannot be read at all still reaches herdr", async () => {
+    const h = herdrDeps({});
+    expect(await focusTerminalForPid(100, { ...h.deps, ttyOf: async () => undefined }))
+      .toEqual({ ok: true, via: "herdr", reason: "herdr-focused" });
+  });
+
+  test("WITHOUT herdr in the ancestry a tty-less pid is still refused as no-tty", async () => {
+    // The guard for the change above: only a herdr-owned pty may skip the tty gate. A headless
+    // `claude` on a plain machine owns no window and must still be refused.
+    expect(await focusTerminalForPid(100, deps({ ttyOf: async () => "??" })))
+      .toEqual({ ok: false, reason: "no-tty" });
+  });
+
   test("matches a Claude pane by exact terminal_title_stripped and activates its client host", async () => {
     const events: object[] = [];
     const h = herdrDeps({

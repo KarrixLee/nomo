@@ -1135,6 +1135,112 @@ export async function stampPermissionDetailFull(
   return stampPermissionDetailFullAt(SESSIONS_DIR, sessionId, permissionDetailFull);
 }
 
+// ---- the remote-approval HOLD marker (the LAN channel's decision-pending guard) ------------------
+//
+// WHY IT EXISTS. `decisionPending` — the violet Allow/Deny card — is a state the permission hook builds
+// ONLY as the body of its POST /v1/cc/decision, never as anything on disk. The worker stores that frame
+// and defends it: while a request is pending it DROPS the concurrent plain prio:1 needsAttention that
+// CC's `Notification` (permission_prompt) hook fires ~1-6 s later (`dropped:"decision-pending"`,
+// server/src/cc.ts). The LAN frames feed, which rebuilds its frames from the SESSION RECORD, had
+// neither half: no card to serve, and no guard — so it shipped that plain needsAttention at a stamp
+// NEWER than the worker's, and the phone's CCWorkerSnapshotMerge (app build 10) correctly held the
+// worker's older decisionPending brief back. The prompt settled on a yellow "needs help" row with no
+// Allow/Deny and the user could not answer from the app at all (field report, session bed2e681,
+// 2026-08-02). This marker is the record channel's copy of both halves.
+//
+// A SIBLING FILE, NOT A SessionRecord FIELD, deliberately. `trackSessionAt` rebuilds the record WHOLE on
+// every hook event (that is what makes attentionKind/planFull expire on their own), so a field would be
+// erased by the very Notification write it exists to outrank — the hook that owns the hold is a separate
+// short-lived process and cannot re-stamp it. A `<sessionId>.hold` file sits in the same directory (so
+// the feed's fs.watch sees it appear and disappear within milliseconds) while being invisible to every
+// other consumer: readdir callers in cc-watchdog, reset, status-cmd, hook.ts and the feed itself all
+// filter `.endsWith(".json")`.
+//
+// CRASH SAFETY IS THE FEED'S, NOT THIS FILE'S. `clearDecisionHold` runs from the hook's `finally`, which
+// a SIGKILL — or the SIGTERM a closed terminal sends, seen on bed2e681 — never reaches. So the marker
+// carries its own holder pid and start time and the feed treats it as inert the moment that process is
+// gone or the TTL lapses (see lanHoldLive). A stale marker can never wedge a row.
+
+/** One live remote-approval hold, as the hook writes it and the LAN frames feed reads it. */
+export interface DecisionHold {
+  /** The SEALED decisionPending frame — byte-identical to the `blob` the hook POSTed to
+   *  /v1/cc/decision, sealed under the pairing e2eKey. The feed is exactly as blind to it as the
+   *  worker is; only the phone can open it. */
+  blob: string;
+  /** Epoch-ms the hold began: the TTL anchor, and the frame's ordering stamp when the record itself
+   *  has not been rewritten since. */
+  at: number;
+  /** The HOLDING HOOK's own pid (not the session's). The feed probes it for liveness, which is what
+   *  makes a killed hook release the card in one reconcile pass instead of at the TTL. */
+  pid: number;
+}
+
+/** Deliberately NOT `.json`: every other readdir consumer of SESSIONS_DIR filters on that extension
+ *  (cc-watchdog's two sweeps, reset, status-cmd, hook.ts's two scans, and the frames feed itself), so
+ *  a marker can never be mistaken for a session row. */
+export const DECISION_HOLD_SUFFIX = ".hold";
+
+/** The marker's file name for a session. */
+export function decisionHoldFileName(sessionId: string): string {
+  return `${sessionId}${DECISION_HOLD_SUFFIX}`;
+}
+
+/** Stamp a live hold beside its session record. Best-effort, like every other write in this file: a
+ *  failed stamp costs the phone the LAN card, and the ≤3 s worker poll still carries it. */
+export async function writeDecisionHoldAt(
+  sessionsDir: string, sessionId: string, hold: DecisionHold,
+): Promise<void> {
+  try {
+    await atomicWrite(`${sessionsDir}/${decisionHoldFileName(sessionId)}`, JSON.stringify(hold), 0o600);
+  } catch {
+    // Bookkeeping is best-effort, exactly like trackSession's own write.
+  }
+}
+
+/** Remove a hold marker — COMPARE-AND-CLEAR on the holder pid. Claude runs tools in PARALLEL, so a
+ *  SECOND permission hook may have stamped ITS hold over ours while we were polling; an exiting hook
+ *  must never silently un-hold a prompt the user is still looking at. A marker we cannot read is
+ *  removed anyway (nobody can own it). */
+export async function clearDecisionHoldAt(
+  sessionsDir: string, sessionId: string, pid: number,
+): Promise<void> {
+  const path = `${sessionsDir}/${decisionHoldFileName(sessionId)}`;
+  try {
+    const raw = await readFile(path, "utf8").catch(() => undefined);
+    if (raw !== undefined) {
+      let owner: number | undefined;
+      try { owner = (JSON.parse(raw) as DecisionHold).pid; } catch { owner = undefined; }
+      if (typeof owner === "number" && owner !== pid) return; // a newer hold owns this session now
+    }
+    await unlink(path).catch(() => {}); // already gone → nothing to do
+  } catch {
+    // Best-effort: a marker left behind is released by the feed's liveness/TTL guards anyway.
+  }
+}
+
+/** The marker for one session, or null when there is none (the overwhelmingly common case) / it is
+ *  unreadable. Never throws. */
+export async function readDecisionHoldAt(
+  sessionsDir: string, sessionId: string,
+): Promise<DecisionHold | null> {
+  try {
+    return JSON.parse(
+      await readFile(`${sessionsDir}/${decisionHoldFileName(sessionId)}`, "utf8"),
+    ) as DecisionHold;
+  } catch {
+    return null;
+  }
+}
+
+/** Production wrappers for the fixed on-disk sessions root (tests inject a temp dir). */
+export async function writeDecisionHold(sessionId: string, hold: DecisionHold): Promise<void> {
+  return writeDecisionHoldAt(SESSIONS_DIR, sessionId, hold);
+}
+
+export async function clearDecisionHold(sessionId: string, pid: number): Promise<void> {
+  return clearDecisionHoldAt(SESSIONS_DIR, sessionId, pid);
+}
+
 /** Read up to `maxBytes` from the START of a file (the transcript's ai-title / first prompt sit near
  *  the top). Bounded `read` so a multi-MB, ever-growing transcript costs one small read. */
 export async function readPrefix(path: string, maxBytes: number): Promise<string> {

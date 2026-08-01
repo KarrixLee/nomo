@@ -6,7 +6,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { b64url, decryptBlob } from "../core/crypto";
 import {
   BLOB_FIT_CHARS, DBG_BLOB_TEXT_MAX_CHARS, formatPlanPickerDebug, fullTextForRecord, parseConfig, PendingEventStash, PLAN_BLOB_TEXT_MAX_CHARS, PLAN_BLOB_TRUNCATION_MARKER,
-  readRecord, sealedBlobChars, SessionRecord,
+  readDecisionHoldAt, readRecord, sealedBlobChars, SessionRecord, writeDecisionHoldAt,
 } from "../core/shared";
 import {
   aiTitle, buildBlob, buildEnvelope, buildPendingStash, cleanPromptTitle, codexIndexTitle, codexSessionTitle,
@@ -992,6 +992,23 @@ describe("trackSession + readRecord file glue (sentDone survives a fresh disk re
       expect(await readRecord(sessionId, glueSessions)).toBeNull();
     } finally {
       await unlink(`${glueSessions}/${sessionId}.json`).catch(() => {});
+    }
+  });
+
+  test("op:end also retires a hold marker a killed permission hook left behind", async () => {
+    const sessionId = `test-glue-${randomUUID()}`;
+    try {
+      await trackSessionAt(glueSessions, sessionId, "start", 0, "working", "B", "mac", "proj", "/tmp/t.jsonl");
+      // A SIGKILL/SIGTERM skips the holding hook's `finally`, so the marker outlives its hold. The
+      // frames feed already treats it as inert (dead holder / TTL), but nothing removed the FILE — and
+      // "the session is over" is known exactly here.
+      await writeDecisionHoldAt(glueSessions, sessionId, { blob: "card", at: Date.now(), pid: 1 });
+      expect(await readDecisionHoldAt(glueSessions, sessionId)).not.toBeNull();
+      await trackSessionAt(glueSessions, sessionId, "end", 0, "done", undefined, "mac", "proj", "/tmp/t.jsonl");
+      expect(await readDecisionHoldAt(glueSessions, sessionId)).toBeNull();
+    } finally {
+      await unlink(`${glueSessions}/${sessionId}.json`).catch(() => {});
+      await unlink(`${glueSessions}/${sessionId}.hold`).catch(() => {});
     }
   });
 

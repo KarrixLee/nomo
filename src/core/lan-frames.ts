@@ -35,8 +35,8 @@ import { readdir, readFile } from "node:fs/promises";
 import { basename } from "node:path";
 import { LAN_SESSION_ID_RE, lanRunningUnderTest } from "./lan-wire";
 import type { LanReadWhat } from "./lan-wire";
-import { pidAlive, recordFullTextIsComplete, SESSIONS_DIR } from "./shared";
-import type { AgentKind, CCOp, SessionRecord } from "./shared";
+import { DECISION_HOLD_SUFFIX, decisionHoldFileName, pidAlive, recordFullTextIsComplete, SESSIONS_DIR } from "./shared";
+import type { AgentKind, CCOp, DecisionHold, SessionRecord } from "./shared";
 
 /** How long a session that has RETIRED (record deleted, pid dead, aged out) keeps serving its final
  *  terminal frame before it drops out of the map entirely. The frame itself is delivered once, the
@@ -56,6 +56,12 @@ export const LAN_FRAMES_WAITERS_MAX = 4;
  *  module — core must not import from entries/). Past it the watchdog retires the record; the feed calls
  *  the session terminal at the same moment so the phone never sees a live row the sweep has given up on. */
 export const LAN_FRAME_SESSION_STALE_MS = 86_400_000;
+/** The hard ceiling on a hold marker (see shared.ts's DecisionHold header). It is the SECOND of two
+ *  independent releases — the holder-pid liveness probe is the fast one — and exists only for the case
+ *  where a killed hook's pid was recycled by an unrelated process. 10 min mirrors the worker's own
+ *  decision-poll key TTL (DECPOLL_TTL_SECONDS, server/src/decision.ts), which is the same "no hook can
+ *  still be polling for this" bound expressed server-side. */
+export const LAN_HOLD_MAX_AGE_MS = 600_000;
 
 /** One session's latest state, as the phone receives it. `blob` is the record's e2eKey-sealed
  *  CCBlobPlaintext, verbatim; everything else is the clear envelope the worker path would have carried
@@ -114,10 +120,27 @@ export function lanFrameSessionLive(record: SessionRecord, now: number, isAlive:
  *  LAN frame and the worker frame for the same record describe the same event. `attentionKind` rides
  *  ONLY on a prio-1 frame: it marks a LIVE question, and a record rewritten into a done/working state by
  *  a watchdog net that spreads `...record` could otherwise carry a previous episode's marker forward. */
-export function lanFrameContent(record: SessionRecord, pairingId: string | undefined): LanFrameContent | null {
+export function lanFrameContent(
+  record: SessionRecord, pairingId: string | undefined,
+  hold: DecisionHold | null = null, now: number = Date.now(), isAlive: (pid: number) => boolean = pidAlive,
+): LanFrameContent | null {
   if (typeof record.blob !== "string" || record.blob.length === 0) return null;
   if (pairingId === undefined || record.pairingId !== pairingId) return null;
   if (typeof record.ts !== "number" || !Number.isFinite(record.ts)) return null;
+  // THE HOLD OVERLAY. While a remote-approval hold is live the CARD is this session's true state, and
+  // the record's own prio:1 needsAttention is the concurrent restatement the worker drops. Stamped at
+  // max(record.ts, hold.at) so it is strictly newer than whatever the phone last accepted on either
+  // channel — a card the phone's per-session ordering guard rejected would be no card at all.
+  if (lanHoldLive(hold, record, now, isAlive)) {
+    return {
+      op: "update",
+      prio: 1,
+      ts: Math.max(record.ts, hold!.at),
+      blob: hold!.blob,
+      ...(record.agent === "codex" ? { agent: "codex" as AgentKind } : {}),
+      ...(record.attentionKind === "userInput" ? { attentionKind: "userInput" as const } : {}),
+    };
+  }
   const prio: 0 | 1 = record.prio === 1 ? 1 : 0;
   return {
     op: (record.op ?? "update") as CCOp,
@@ -127,6 +150,29 @@ export function lanFrameContent(record: SessionRecord, pairingId: string | undef
     ...(record.agent === "codex" ? { agent: "codex" as AgentKind } : {}),
     ...(prio === 1 && record.attentionKind === "userInput" ? { attentionKind: "userInput" as const } : {}),
   };
+}
+
+/** Should this session's frame be the HOLD's card rather than the record's own state?
+ *
+ *  The release rules are the exact mirror of the worker's decision-pending guard (server/src/cc.ts):
+ *  only a plain prio:1 `update` is outranked. A prio:0 frame written AFTER the hold began is genuine
+ *  forward progress — Claude runs tools in PARALLEL, so tool B's PostToolUse lands while tool A is
+ *  still blocking — and a done/end ends the row; both must speak, exactly as they do server-side.
+ *
+ *  Plus the two releases the worker does not need, because ITS record has a TTL and a poll-liveness
+ *  sweep while this one is a file a killed hook leaves behind: the holder process must still be alive,
+ *  and the marker must be younger than LAN_HOLD_MAX_AGE_MS. Between them a stale marker costs at most
+ *  one reconcile pass, never a wedged row. */
+export function lanHoldLive(
+  hold: DecisionHold | null | undefined, record: SessionRecord, now: number,
+  isAlive: (pid: number) => boolean,
+): boolean {
+  if (!hold || typeof hold.blob !== "string" || hold.blob.length === 0) return false;
+  if (typeof hold.at !== "number" || !Number.isFinite(hold.at)) return false;
+  if (now - hold.at > LAN_HOLD_MAX_AGE_MS) return false;
+  if (typeof hold.pid !== "number" || !Number.isFinite(hold.pid) || !isAlive(hold.pid)) return false;
+  const suppressible = (record.op ?? "update") === "update" && record.prio === 1;
+  return record.ts <= hold.at || suppressible;
 }
 
 export interface LanFrameStoreDeps {
@@ -320,6 +366,12 @@ export function createLanFrameStore(deps: LanFrameStoreDeps = {}): LanFrameStore
     }
     let changed = false;
     const seen = new Set<string>();
+    // Which sessions have a hold marker beside them, from the listing we already have — so the common
+    // case (no hold anywhere) costs ZERO extra reads, and a held session costs exactly one.
+    const held = new Set<string>();
+    for (const file of files) {
+      if (file.endsWith(DECISION_HOLD_SUFFIX)) held.add(file.slice(0, -DECISION_HOLD_SUFFIX.length));
+    }
     for (const file of files) {
       if (!file.endsWith(".json")) continue;
       const sessionId = basename(file, ".json");
@@ -333,7 +385,15 @@ export function createLanFrameStore(deps: LanFrameStoreDeps = {}): LanFrameStore
       } catch {
         continue; // unreadable/corrupt → leave whatever we already serve; the next pass re-reads it
       }
-      const content = lanFrameContent(record, pairingId);
+      let hold: DecisionHold | null = null;
+      if (held.has(sessionId)) {
+        try {
+          hold = JSON.parse(await readFile(`${sessionsDir}/${decisionHoldFileName(sessionId)}`, "utf8")) as DecisionHold;
+        } catch {
+          hold = null; // removed mid-pass / half-written → this pass simply has no hold
+        }
+      }
+      const content = lanFrameContent(record, pairingId, hold, at, isAlive);
       if (!content) continue; // nothing renderable (no blob / other pairing / un-orderable)
       changed = lanFrameSessionLive(record, at, isAlive)
         ? stamp(sessionId, content) || changed

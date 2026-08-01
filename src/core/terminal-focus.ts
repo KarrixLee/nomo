@@ -5,6 +5,8 @@
 // everything here works purely off a pid and knows nothing about Claude, Codex, or sessions.
 //
 // How a pid becomes a window:
+//   0. if herdr owns the pty (the pid or an ancestor IS a herdr process), the pane list — not the
+//      tty — is the correlation key, so that branch is taken FIRST and the tty is never consulted,
 //   1. the pid's controlling tty (`ps -o tty=` → "ttys004" → the device path "/dev/ttys004"),
 //   2. the OWNING terminal application, from the pid's ancestor chain's argv (Terminal.app, iTerm2,
 //      Ghostty, WezTerm, Alacritty, kitty, Hyper, Warp, VS Code),
@@ -117,10 +119,16 @@ function isHerdrServer(command: string | undefined): boolean {
     && commandTokens(command).slice(1).includes("server");
 }
 
-function ancestryContainsHerdr(
+/** Whether `pid` or any ancestor IS a herdr process — i.e. whether herdr's daemon owns this pty.
+ *  EXPORTED because the locate step (adapter.claudeLocateTuiPid) has to ask the same question before
+ *  it applies its own tty gate: under herdr the pid's controlling tty is not the signal, so a locate
+ *  that rejected a tty-less pid would never let this module see it at all. A dead pid has no readable
+ *  ancestry and no command, so it can never answer true here — which is what keeps the escape hatch
+ *  from resurrecting a stale record onto a live pane. */
+export function ancestryContainsHerdr(
   pid: number,
-  ancestorsOf: (pid: number) => number[],
-  commandOf: (pid: number) => string | undefined,
+  ancestorsOf: (pid: number) => number[] = pidAncestors,
+  commandOf: (pid: number) => string | undefined = pidCommand,
 ): boolean {
   let ancestors: number[];
   try { ancestors = ancestorsOf(pid); } catch { ancestors = []; }
@@ -418,17 +426,23 @@ export async function focusTerminalForPid(pid: number, deps: FocusDeps = {}): Pr
       note(deps, { event: "terminal-focus", pid, result: "unsupported", why: "not-darwin" });
       return { ok: false, reason: "unsupported" };
     }
+    const ancestorsOf = deps.ancestorsOf ?? pidAncestors;
+    const commandOf = deps.commandOf ?? pidCommand;
+    // herdr FIRST, before the tty gate. Its daemon owns the TUI pty, so a session's process can
+    // legitimately have no controlling tty of its own — a Claude background/forked task hosted by
+    // `claude daemon run` reads back "??" — while its herdr TAB is open and uniquely correlatable.
+    // Gating on the tty first refused exactly that case as no-tty and made "Open on Mac" a silent
+    // no-op for it (field report 2026-08-02). Correlation is by pane, never by tty, so nothing below
+    // this line is needed to raise the right window.
+    if (ancestryContainsHerdr(pid, ancestorsOf, commandOf)) {
+      return await focusHerdr(pid, deps, ancestorsOf, commandOf);
+    }
     let rawTty: string | undefined;
     try { rawTty = await (deps.ttyOf ?? ttyViaPs)(pid); } catch { rawTty = undefined; }
     const devPath = ttyDevicePath(rawTty);
     if (devPath === undefined) {
       note(deps, { event: "terminal-focus", pid, result: "no-tty", tty: rawTty ?? "" });
       return { ok: false, reason: "no-tty" };
-    }
-    const ancestorsOf = deps.ancestorsOf ?? pidAncestors;
-    const commandOf = deps.commandOf ?? pidCommand;
-    if (ancestryContainsHerdr(pid, ancestorsOf, commandOf)) {
-      return await focusHerdr(pid, deps, ancestorsOf, commandOf);
     }
     const app = owningTerminalApp(pid, ancestorsOf, commandOf);
     if (!app) {

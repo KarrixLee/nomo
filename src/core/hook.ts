@@ -26,7 +26,7 @@ import {
   SessionCreationSuppression, TrackedSessionLite,
 } from "./adapter";
 import {
-  AgentKind, appendFittedPlanAndDebug, atomicWrite, CCOp, CCStatus, codexCompanionBrokerEvidence, Config, ensureWatchdog, formatPlanPickerDebug, fullTextForRecord, GONE_STRIKE_LIMIT,
+  AgentKind, appendFittedPlanAndDebug, atomicWrite, CCOp, CCStatus, codexCompanionBrokerEvidence, Config, decisionHoldFileName, ensureWatchdog, formatPlanPickerDebug, fullTextForRecord, GONE_STRIKE_LIMIT,
   LAST_SEND_PATH, lastHookPath, loadConfig, loadPendingConfig, localApprovalsState, PENDING_STASH_PATH, PendingEventStash, pidAncestors, pidCommand, PLUGIN_VERSION, readPrefix,
   readRecord, recordGoneStrike, removeRevokedConfig, resetGoneStrikes, SessionOrigin, SessionRecord, SESSIONS_DIR, tracePlanPickerDecision, traceSession,
 } from "./shared";
@@ -339,6 +339,11 @@ export async function trackSessionAt(
     const path = `${sessionsDir}/${sessionId}.json`;
     if (op === "end") {
       await unlink(path).catch(() => {}); // clean exit → no watchdog reaping needed
+      // A hold marker cannot outlive its session. Normally the holding hook's own `finally` retires it,
+      // but that never runs on a SIGKILL (or the SIGTERM a closed terminal sends), and the feed's
+      // liveness/TTL guards only make such a marker INERT — they do not remove the file. This is the
+      // chokepoint where "the session is over" is known, so nothing of it is left behind.
+      await unlink(`${sessionsDir}/${decisionHoldFileName(sessionId)}`).catch(() => {});
       return;
     }
     // lastEvent is the watchdog interrupt-net's gate key: a fresh `start` is a quiet "sessionStart",

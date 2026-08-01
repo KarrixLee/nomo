@@ -8,6 +8,7 @@ import {
   lanFrameContent,
   lanFrameSessionLive,
   LAN_FRAMES_WAITERS_MAX,
+  LAN_HOLD_MAX_AGE_MS,
   LAN_FRAME_RETIRE_GRACE_MS,
   LAN_FRAME_SESSION_STALE_MS,
 } from "./lan-frames";
@@ -43,7 +44,8 @@ import * as wire from "./lan-wire";
 import {
   BLOB_FIT_CHARS, fullTextForRecord, RECORD_FULL_TEXT_MAX_CHARS, RECORD_FULL_TEXT_TRUNCATION_MARKER,
 } from "./shared";
-import type { Config, SessionRecord } from "./shared";
+import { decisionHoldFileName } from "./shared";
+import type { Config, DecisionHold, SessionRecord } from "./shared";
 
 // Every listener binds LOOPBACK in tests: a `bun test` run must never open a port to the network the
 // developer's machine is on. Production defaults to 0.0.0.0 — that is the one difference.
@@ -855,6 +857,57 @@ describe("frames — pure helpers", () => {
     expect(content).not.toHaveProperty("attentionKind");
   });
 
+  // --- the remote-approval hold overlay (the LAN half of the worker's decision-pending guard) -------
+  //
+  // FIELD CASE, session bed2e681 (2026-08-02, build 10). The permission hook POSTs its decisionPending
+  // frame to /v1/cc/decision at T and holds; ~6 s later CC's `Notification` (permission_prompt) hook
+  // fires and rewrites the SESSION RECORD as a plain prio:1 needsAttention. On the worker that envelope
+  // is dropped (`dropped:"decision-pending"`, server/src/cc.ts) so the stored blob stays the card — but
+  // the record channel had no such guard, so the LAN feed shipped the plain needsAttention at a stamp
+  // 6 s NEWER than the worker's. Build 10's CCWorkerSnapshotMerge then held the worker's (older)
+  // decisionPending brief back for good, and the prompt settled permanently on the yellow "needs help"
+  // row with no Allow/Deny. The overlay is the missing guard.
+  const HOLD_AT = NOW - 6_000;
+  const hold = (over: Partial<DecisionHold> = {}): DecisionHold =>
+    ({ blob: "sealed-decision-pending", at: HOLD_AT, pid: 4242, ...over });
+
+  test("a LIVE hold overrides the plain needsAttention a concurrent Notification hook wrote (bed2e681)", () => {
+    expect(lanFrameContent(rec({ prio: 1 }), "pairing-abc", hold(), NOW, () => true)).toEqual({
+      op: "update", prio: 1, ts: NOW, blob: "sealed-decision-pending",
+    });
+    // A record that has NOT been rewritten since the hold began still gets the card — stamped at the
+    // hold, which is strictly newer than the pre-hold working frame the phone already holds.
+    expect(lanFrameContent(rec({ ts: HOLD_AT - 1_000, prio: 0 }), "pairing-abc", hold(), NOW, () => true))
+      .toEqual({ op: "update", prio: 1, ts: HOLD_AT, blob: "sealed-decision-pending" });
+    // The codex discriminator still rides (a held `request_user_input` is still a question).
+    expect(lanFrameContent(rec({ prio: 1, agent: "codex", attentionKind: "userInput" }),
+                           "pairing-abc", hold(), NOW, () => true))
+      .toEqual({ op: "update", prio: 1, ts: NOW, blob: "sealed-decision-pending",
+                 agent: "codex", attentionKind: "userInput" });
+  });
+
+  test("the hold overlay releases exactly where the worker's guard does — and cannot wedge a row", () => {
+    const alive = () => true;
+    // FORWARD PROGRESS SPEAKS. Claude runs tools in parallel: tool B's PostToolUse (prio:0) lands while
+    // tool A is still held, and a done/end ends the row. Same carve-outs cc.ts's guard makes.
+    expect(lanFrameContent(rec({ prio: 0 }), "pairing-abc", hold(), NOW, alive))
+      .toEqual({ op: "update", prio: 0, ts: NOW, blob: "sealed-blob" });
+    expect(lanFrameContent(rec({ op: "done", prio: 0 }), "pairing-abc", hold(), NOW, alive))
+      .toEqual({ op: "done", prio: 0, ts: NOW, blob: "sealed-blob" });
+    // CRASH SAFETY. The holding hook is a separate short-lived process; a SIGTERM/SIGKILL skips its
+    // `finally` and leaves the marker behind (observed live on bed2e681). A dead holder is inert at
+    // once, and the TTL covers the case where its pid was recycled by something else.
+    expect(lanFrameContent(rec({ prio: 1 }), "pairing-abc", hold(), NOW, () => false))
+      .toEqual({ op: "update", prio: 1, ts: NOW, blob: "sealed-blob" });
+    expect(lanFrameContent(rec({ prio: 1 }), "pairing-abc", hold(), HOLD_AT + LAN_HOLD_MAX_AGE_MS + 1, alive))
+      .toEqual({ op: "update", prio: 1, ts: NOW, blob: "sealed-blob" });
+    // A malformed / empty marker is simply not a hold.
+    expect(lanFrameContent(rec({ prio: 1 }), "pairing-abc", hold({ blob: "" }), NOW, alive))
+      .toEqual({ op: "update", prio: 1, ts: NOW, blob: "sealed-blob" });
+    expect(lanFrameContent(rec({ prio: 1 }), "pairing-abc", null, NOW, alive))
+      .toEqual({ op: "update", prio: 1, ts: NOW, blob: "sealed-blob" });
+  });
+
   test("lanFrameSessionLive mirrors classifySession's keep/end/stale decision", () => {
     expect(lanFrameSessionLive(rec(), NOW, () => true)).toBe(true);
     expect(lanFrameSessionLive(rec(), NOW, () => false)).toBe(false);                    // dead pid
@@ -897,6 +950,35 @@ describe("frames — the state-sync store", () => {
     store.setPairing("pairing-abc");
     return store;
   }
+
+  test("a hold marker beside the record makes the feed serve the CARD, and clearing it hands the row back", async () => {
+    const dir = await framesDir();
+    const store = makeStore(dir);
+    // Pre-hold working frame — what the phone is looking at when the prompt arrives.
+    await put(dir, "s1", { ts: NOW - 10_000 });
+    await store.reconcile();
+    expect(store.since(0).frames[0]).toMatchObject({ prio: 0, ts: NOW - 10_000, blob: "sealed-blob" });
+
+    // The permission hook holds, then CC's Notification hook rewrites the record as a plain
+    // needsAttention 6 s later — the exact bed2e681 sequence.
+    await writeFile(join(dir, decisionHoldFileName("s1")),
+                    JSON.stringify({ blob: "sealed-decision-pending", at: NOW - 6_000, pid: 4242 }));
+    await put(dir, "s1", { prio: 1 });
+    await store.reconcile();
+    expect(store.since(0).frames).toEqual([
+      { seq: 2, sessionId: "s1", op: "update", prio: 1, ts: NOW, blob: "sealed-decision-pending" },
+    ]);
+    // The marker is NOT a session: it must never surface as a row of its own.
+    expect(store.size()).toBe(1);
+
+    // Answered → the hook's `finally` removes the marker → the record speaks for itself again.
+    await unlink(join(dir, decisionHoldFileName("s1")));
+    await put(dir, "s1", { ts: NOW + 1_000 });
+    await store.reconcile();
+    expect(store.since(2).frames).toEqual([
+      { seq: 3, sessionId: "s1", op: "update", prio: 0, ts: NOW + 1_000, blob: "sealed-blob" },
+    ]);
+  });
 
   test("one counter, monotonic; three rapid updates COALESCE into one frame carrying the latest blob", async () => {
     const dir = await framesDir();

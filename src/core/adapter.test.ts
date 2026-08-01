@@ -1477,10 +1477,54 @@ describe("claudeLocateTuiPid (the recorded pid IS the TUI)", () => {
   test("a tty-less (headless/daemon) or dead pid owns no window → undefined", async () => {
     const notes: LocateTuiReason[] = [];
     const note = (r: LocateTuiReason): void => { notes.push(r); };
-    expect(await claudeLocateTuiPid({ sessionId: "s", record: locRec({ pid: 4242 }) }, { ttyOf: async () => "??", note })).toBeUndefined();
-    expect(await claudeLocateTuiPid({ sessionId: "s", record: locRec({ pid: 4242 }) }, { ttyOf: async () => undefined, note })).toBeUndefined();
-    expect(await claudeLocateTuiPid({ sessionId: "s", record: locRec({ pid: 4242 }) }, { ttyOf: async () => { throw new Error("ps"); }, note })).toBeUndefined();
+    // No herdr anywhere in the ancestry: the pid's own tty IS the only signal, as before. The two
+    // seams keep this hermetic — without them the real process table would be walked.
+    const plain = { ancestorsOf: (): number[] => [], commandOf: (): undefined => undefined, note };
+    expect(await claudeLocateTuiPid({ sessionId: "s", record: locRec({ pid: 4242 }) }, { ...plain, ttyOf: async () => "??" })).toBeUndefined();
+    expect(await claudeLocateTuiPid({ sessionId: "s", record: locRec({ pid: 4242 }) }, { ...plain, ttyOf: async () => undefined })).toBeUndefined();
+    expect(await claudeLocateTuiPid({ sessionId: "s", record: locRec({ pid: 4242 }) }, { ...plain, ttyOf: async () => { throw new Error("ps"); } })).toBeUndefined();
     expect(notes).toEqual(["no-candidate", "no-candidate", "no-candidate"]);
+  });
+
+  // FIELD REGRESSION (2026-08-02), the locate half of the same bug: a session started as a Claude
+  // background/forked task records the daemon-hosted `process.ppid`, whose tty is "??". Refusing it
+  // here meant terminal-focus never even got the chance to correlate its (open, unique) herdr pane.
+  test("a tty-less pid whose pty is owned by the herdr daemon is still the TUI", async () => {
+    const notes: LocateTuiReason[] = [];
+    const commands: Record<number, string> = {
+      9337: "/Users/karrix/.local/share/claude/versions/2.1.220 --session-id 878bc284 --fork-session",
+      9108: "/Users/karrix/.local/share/claude/ClaudeCode.app/Contents/MacOS/claude --bg-pty-host",
+      9074: "/Users/karrix/.local/bin/claude daemon run --origin transient",
+      76594: "/opt/homebrew/bin/herdr server",
+    };
+    const pid = await claudeLocateTuiPid(
+      { sessionId: "s", record: locRec({ pid: 9337, agent: undefined }) },
+      {
+        ttyOf: async () => "??",
+        ancestorsOf: () => [9108, 9074, 76594],
+        commandOf: (p) => commands[p],
+        note: (r) => notes.push(r),
+      },
+    );
+    expect(pid).toBe(9337);
+    expect(notes).toEqual(["record-pid"]);
+  });
+
+  test("a pid that is GONE is never resurrected by a herdr ancestry", async () => {
+    // A dead pid reads back no tty at all. `ps` cannot report an ancestry for it either, so the
+    // herdr escape hatch must not fire — otherwise a stale record could focus a live pane.
+    const notes: LocateTuiReason[] = [];
+    const pid = await claudeLocateTuiPid(
+      { sessionId: "s", record: locRec({ pid: 9337, agent: undefined }) },
+      {
+        ttyOf: async () => undefined,
+        ancestorsOf: () => [],
+        commandOf: () => undefined,
+        note: (r) => notes.push(r),
+      },
+    );
+    expect(pid).toBeUndefined();
+    expect(notes).toEqual(["no-candidate"]);
   });
 
   test("a record with no usable pid is a no-op", async () => {

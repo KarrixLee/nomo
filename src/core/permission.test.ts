@@ -565,6 +565,47 @@ describe("runPermissionHook — hold state machine", () => {
     expect(calls.filter((c) => c.method === "POST").length).toBe(1);
   });
 
+  // THE LAN CHANNEL'S HALF OF THE WORKER'S DECISION-PENDING GUARD (field report, session bed2e681,
+  // 2026-08-02). The worker STORES this POST's decisionPending blob and defends it — it drops the plain
+  // prio:1 needsAttention CC's `Notification` (permission_prompt) hook fires seconds later. The LAN
+  // frames feed rebuilds its frames from the SESSION RECORD, which carried neither, so it shipped that
+  // needsAttention at a NEWER stamp and the phone's build-10 snapshot merge then held the worker's older
+  // decisionPending brief back for good: a yellow "needs help" row with no Allow/Deny, unanswerable from
+  // the app. The hook must therefore leave the same sealed card on disk for as long as it holds.
+  test("a granted hold stamps the sealed card on disk, and every exit retires it", async () => {
+    const answerBlob = await encryptBlob(KEY, { requestId: "req-fixed", decision: "allow", ts: 5 });
+    const { fn, calls } = scriptFetch(true, [{ status: "answered", answerBlob }]);
+    const writes: { sessionId: string; hold: { blob: string; at: number; pid: number } }[] = [];
+    const clears: { sessionId: string; pid: number }[] = [];
+    await runPermissionHook(baseDeps({
+      fetchFn: fn, emit: () => {}, holdPid: 9_001,
+      writeHoldFn: async (sessionId: string, hold: { blob: string; at: number; pid: number }) => { writes.push({ sessionId, hold }); },
+      clearHoldFn: async (sessionId: string, pid: number) => { clears.push({ sessionId, pid }); },
+    }) as never);
+    expect(writes).toHaveLength(1);
+    expect(writes[0].sessionId).toBe("sess-1");
+    // The marker carries the EXACT frame that was POSTed — one sealed card, two channels.
+    expect(writes[0].hold.blob).toBe(JSON.parse(calls.find((c) => c.method === "POST")!.body!).blob);
+    expect(writes[0].hold.at).toBe(1000);
+    expect(writes[0].hold.pid).toBe(9_001);   // the HOLDING process, so the feed can probe its liveness
+    // Answered → retired, keyed by the same owner pid (compare-and-clear: a parallel tool's LATER hold
+    // for this session must survive our exit).
+    expect(clears).toEqual([{ sessionId: "sess-1", pid: 9_001 }]);
+  });
+
+  test("a hold that was never granted stamps NOTHING (nothing to defend, nothing to leave behind)", async () => {
+    const { fn } = scriptFetch(false, []);
+    const writes: unknown[] = [];
+    const clears: unknown[] = [];
+    await runPermissionHook(baseDeps({
+      fetchFn: fn, emit: () => {},
+      writeHoldFn: async () => { writes.push(1); },
+      clearHoldFn: async () => { clears.push(1); },
+    }) as never);
+    expect(writes).toEqual([]);
+    expect(clears).toEqual([]);
+  });
+
   test("POST body is the frozen wire shape: decisionPending blob + needsAttention fallbackBlob", async () => {
     const { fn, calls } = scriptFetch(false, []);
     await runPermissionHook(baseDeps({ fetchFn: fn, emit: () => {} }) as never);
