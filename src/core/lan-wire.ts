@@ -2,11 +2,11 @@
 //
 // WHY IT IS ITS OWN MODULE: two very different processes speak this protocol on this machine. The
 // watchdog HOSTS it (lan-listener.ts — a node:http server, an answer store, interface enumeration), and
-// the blocked permission hook CONSUMES it (permission.ts — a 250 ms loopback poll and nothing else).
-// The hook is a short-lived process spawned on every permission prompt, so it must not bundle an HTTP
-// server it will never start: everything both sides need — the endpoint, the envelope shape, the
-// freshness bounds, the id/blob ceilings, lan.json — lives here, and lan-listener re-exports every name
-// so its own importers are unaffected.
+// the blocked permission hook CONSUMES it (permission.ts — a ~300 ms loopback `answer-poll` and nothing
+// else). The hook is a short-lived process spawned on every permission prompt, so it must not bundle an
+// HTTP server it will never start: the PURE contract — the endpoint, the envelope shape, the freshness
+// bounds, the id/blob ceilings, lan.json — lives here, and lan-listener re-exports every name in this
+// file (all of it, nothing more) so its own importers are unaffected.
 //
 // Everything in this file is PURE (no sockets, no timers, no filesystem) apart from the `CC_DIR` path
 // constant. The wire itself is documented in lan-listener's header, which remains the reference.
@@ -35,6 +35,11 @@ export const LAN_REQUEST_ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
  *  sends the identical ciphertext down both legs: a blob this side accepted and the worker refused would
  *  be a silent split brain between the two channels. */
 export const LAN_ANSWER_BLOB_MAX_CHARS = 3072;
+/** Upper bound on a `command` op's inner sealed blob — the sibling of the answer ceiling above, and here
+ *  for the same reason: it is a payload-field ceiling the iOS CCLanClient mirrors, not host machinery.
+ *  The worker path caps blobs at 3072 base64 chars (BLOB_FIT_CHARS + margin); the LAN path has no worker
+ *  in it, so it is allowed more headroom — but a bound is still a bound. */
+export const LAN_COMMAND_BLOB_MAX_CHARS = 8192;
 
 /** Longest a `frames` long-poll may be held open (phase 3). The phone asks for at most this; anything
  *  larger is a client bug and is refused rather than clamped, so both ends always agree on the deadline.

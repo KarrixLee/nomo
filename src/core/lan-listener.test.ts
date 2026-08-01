@@ -36,6 +36,10 @@ import {
   parseLanState,
 } from "./lan-listener";
 import type { LanAnswerDelivery, LanAnswerStore, LanCommand, LanListener } from "./lan-listener";
+// Namespace imports for the re-export shim test below — the ONE place that asserts on the module
+// surfaces themselves rather than on any single name.
+import * as listener from "./lan-listener";
+import * as wire from "./lan-wire";
 import {
   BLOB_FIT_CHARS, fullTextForRecord, RECORD_FULL_TEXT_MAX_CHARS, RECORD_FULL_TEXT_TRUNCATION_MARKER,
 } from "./shared";
@@ -197,6 +201,20 @@ describe("pure envelope helpers", () => {
     expect(parseLanState('{"port":70000,"lid":"abc"}')).toBeNull();
     expect(parseLanState('{"port":51234,"lid":""}')).toBeNull();
     expect(parseLanState("not json")).toBeNull();
+  });
+
+  // THE SHIM RULE (see lan-listener's re-export block). lan-wire exists so the short-lived permission
+  // hook can speak the protocol without bundling an HTTP server, and lan-listener re-exports ALL of it so
+  // its own importers — this file included — never had to move. That "all of it" is the part that rots
+  // silently: a wire constant added to lan-wire and forgotten in the shim is invisible until some future
+  // importer reaches for it through the module the header says is the reference. Runtime values only,
+  // which is exactly the set that can break at runtime; types are erased and cannot.
+  test("lan-listener re-exports every runtime name lan-wire exports, identically", () => {
+    const missing = Object.keys(wire).filter((name) => !(name in listener));
+    expect(missing).toEqual([]);
+    for (const name of Object.keys(wire)) {
+      expect((listener as Record<string, unknown>)[name]).toBe((wire as Record<string, unknown>)[name]);
+    }
   });
 });
 

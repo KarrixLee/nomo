@@ -28,6 +28,13 @@ import {
   PLUGIN_VERSION, readPrefix, readRecord, readSuffix, sealedBlobChars, SessionRecord, stampPermissionDetailFull,
 } from "./shared";
 import { b64url, decryptBlob, deriveLanKey, encryptBlob } from "./crypto";
+// The relay's timing/give-up rules, shared verbatim with the Codex relay (codex-remote-input.ts) that
+// polls the SAME route with the same credentials. See decision-poll.ts for what is deliberately NOT
+// shared — the first-contact POST ceiling, which each caller bounds by what IT blocks.
+import {
+  DEFINITIVE_POLL_STATUSES, MAX_CONSECUTIVE_MISSES, MAX_DEFINITIVE_POLL_FAILURES, POLL_INTERVAL_MS,
+  POLL_TIMEOUT_MS, POST_MAX_ATTEMPTS, POST_RETRY_PAUSE_MS,
+} from "./decision-poll";
 // The PURE wire contract only — deliberately NOT "./lan-listener": this hook is a short-lived process
 // spawned on every permission prompt and must not bundle (or load node:http for) an HTTP server it can
 // never start. See lan-wire.ts's header.
@@ -42,11 +49,6 @@ import {
  *  existing importers are unaffected. */
 export { BLOB_FIT_CHARS, NO_HOLD_PATH, sealedBlobChars };
 
-/** How often to poll for the phone's answer while holding (ms). Small jitter is added per cycle. */
-const POLL_INTERVAL_MS = 3_000;
-/** Per-fetch ceiling for the poll GETs — the "2s" half of the contract survives; only the TOTAL wait
- *  is unbounded. */
-const FETCH_TIMEOUT_MS = 2_000;
 /** FIRST-CONTACT ceiling for the decision POST — the ONE fetch the terminal dialog waits behind before
  *  it is either held (phone card up) or released (normal dialog). It is deliberately LONGER than the
  *  poll's 2s (the worker's decision route can take a moment: cold isolate, KV reads, the gate checks)
@@ -59,7 +61,7 @@ const FETCH_TIMEOUT_MS = 2_000;
  *  under a second; a stall past a few seconds means the network is gone, and the only useful thing to do
  *  with that answer is fail open NOW.
  *
- *  WORST-CASE PRE-DIALOG BLOCK, stalled network: POST_FIRST_CONTACT_TIMEOUT_MS (4s) + FETCH_TIMEOUT_MS
+ *  WORST-CASE PRE-DIALOG BLOCK, stalled network: POST_FIRST_CONTACT_TIMEOUT_MS (4s) + POLL_TIMEOUT_MS
  *  (2s did-it-land probe) ≈ 6s, because a TIMEOUT is never retried (see POST_MAX_ATTEMPTS). A network
  *  that fails FAST (connection refused, DNS NXDOMAIN) costs ~0 + POST_RETRY_PAUSE_MS + ~0 + 2s ≈ 3s.
  *  Both stay under the ~10s bar. The fresh-session re-ask (HOLD_RETRY_DELAY_MS + one more short POST)
@@ -67,16 +69,6 @@ const FETCH_TIMEOUT_MS = 2_000;
  *  so it is never the dead-network case. Once a hold IS granted the wait becomes unbounded ON PURPOSE
  *  (the phone owns the dialog) and every fetch from there on is a 2s poll GET. */
 const POST_FIRST_CONTACT_TIMEOUT_MS = 4_000;
-/** One retry of the initial POST — but ONLY when the first attempt failed FAST (connection refused,
- *  DNS, reset). A TIMEOUT is NOT retried: the network is stalled, a second stall buys no new information
- *  and doubles the freeze, and the did-it-land probe below already covers the "it actually landed" case.
- *  A non-ok HTTP status is never retried either — that is a real answer. The retry re-POSTs the SAME
- *  requestId + blobs (with a FRESH `ts`, see postDecision): the worker's supersede no-ops on an identical
- *  id and putDecision idempotently re-stores the pending record, so a re-POST after a first attempt that
- *  actually reached the worker is safe. */
-const POST_MAX_ATTEMPTS = 2;
-/** Pause before the single POST retry. */
-const POST_RETRY_PAUSE_MS = 1_000;
 /** A fresh session's FIRST permission prompt can fire BEFORE the phone app's ~3s poll has added the
  *  session to the worker's island shown-list, so the very first decision POST correctly comes back
  *  {hold:false} (session not shown yet) and the prompt falls open — even though the session lands in
@@ -90,24 +82,6 @@ const HOLD_RETRY_DELAY_MS = 4_000;
  *  permission prompt fires. Older, established sessions that come back {hold:false} are genuinely not on
  *  the phone, so they must NOT pay the HOLD_RETRY_DELAY_MS tax on every prompt — they fall open at once. */
 const FRESH_SESSION_MS = 60_000;
-/** Give-up cap: this many consecutive polls without a 2xx (~5 min of sustained failure) → the worker
- *  is unreachable → exit silently (fail open, terminal dialog after Esc/retry). A successful poll —
- *  including a plain {status:"pending"} — resets the counter, so a healthy hold is unbounded. */
-const MAX_CONSECUTIVE_MISSES = 100;
-/** Poll statuses that are DEFINITIVE, not transient: the pairing is unauthorized/revoked/unknown, so
- *  every remaining poll of this request is guaranteed to fail the same way. Mirrors runHook's gone-strike
- *  set (404/410) plus the auth pair (401/403) — there, a gone response tears the pairing down; here it
- *  only means "stop waiting". Anything else (429, 5xx, a transport throw) stays transient and rides the
- *  MAX_CONSECUTIVE_MISSES cap.
- *
- *  EXPORTED as the transport-layer rule for polling `/v1/cc/decision/:id`, not as a permission-hook
- *  detail: codex-remote-input.ts polls the SAME relay route with the same pairing credentials and must
- *  give up on the same evidence (it already imports this module's wire helpers). Per-agent behavior lives
- *  in core/adapter.ts; this is transport. */
-export const DEFINITIVE_POLL_STATUSES = new Set([401, 403, 404, 410]);
-/** …and, like the gone strike, a SINGLE definitive response can be a racing delete/deploy, so require
- *  this many CONSECUTIVE ones before releasing. 2 ⇒ ~3 s to the terminal dialog instead of ~5.4 min. */
-export const MAX_DEFINITIVE_POLL_FAILURES = 2;
 /** How many times the SAME terminal `answered` record may be re-read with a decision verb we do not
  *  recognize before the hold is released. An answered record is TERMINAL server-side (a re-answer 409s
  *  and the same blob is served for the record's whole 24h TTL), so a verb we can never understand would
@@ -1296,7 +1270,7 @@ export async function runPermissionHook(deps: PermissionHookDeps = {}, agent: Ag
       try {
         const res = await fetchFn(`${config.url}/v1/cc/decision/${requestId}`, {
           headers: pcHeaders,
-          signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+          signal: AbortSignal.timeout(POLL_TIMEOUT_MS),
         });
         if (!res.ok) {
           trace({ event: "poll-end", seq, outcome: "status", status: res.status });

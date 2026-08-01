@@ -769,7 +769,7 @@ describe("runPermissionHook — hold state machine", () => {
 
   // STALLED NETWORK (captive portal / hung proxy / half-open TCP). The dialog must not wait behind a
   // SECOND long ceiling for an answer the first stall already gave: one first-contact POST, one cheap
-  // probe, out. The whole pre-dialog block is POST_FIRST_CONTACT_TIMEOUT_MS + FETCH_TIMEOUT_MS ≈ 6s,
+  // probe, out. The whole pre-dialog block is POST_FIRST_CONTACT_TIMEOUT_MS + POLL_TIMEOUT_MS ≈ 6s,
   // not the ~33s two 15s POSTs used to cost.
   test("POST TIMES OUT → exactly one POST attempt (no long-ceiling retry) + one probe, then fail open", async () => {
     const emitted: string[] = [];

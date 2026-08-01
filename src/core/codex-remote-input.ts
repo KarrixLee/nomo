@@ -7,10 +7,15 @@ import { decryptBlob, encryptBlob } from "./crypto";
 import { requestUserInputDetail } from "./adapter";
 import { lanAnswerStore } from "./lan-listener";
 import type { LanAnswerStore } from "./lan-listener";
+// The relay's timing/give-up rules, shared verbatim with the Claude permission hook (permission.ts),
+// which polls the SAME route with the same credentials — see decision-poll.ts.
+import {
+  DEFINITIVE_POLL_STATUSES, MAX_CONSECUTIVE_MISSES, MAX_DEFINITIVE_POLL_FAILURES, POLL_INTERVAL_MS,
+  POLL_TIMEOUT_MS, POST_MAX_ATTEMPTS, POST_RETRY_PAUSE_MS,
+} from "./decision-poll";
 import {
   BLOB_FIT_CHARS, buildPermissionQuestions, buildPermissionSummary, capPermissionWireText,
-  DEFINITIVE_POLL_STATUSES, fitPermissionDetail, MAX_DEFINITIVE_POLL_FAILURES,
-  PERMISSION_QUESTION_LABEL_MAX,
+  fitPermissionDetail, PERMISSION_QUESTION_LABEL_MAX,
 } from "./permission";
 import {
   Config, localApprovalsState, PLUGIN_VERSION, readRecord, SessionRecord,
@@ -20,12 +25,12 @@ import type {
   CodexUserInputRequest,
 } from "./codex-app-server-client";
 
+/** FIRST-CONTACT ceiling for the decision POST. Deliberately NOT the permission hook's 4 s twin
+ *  (POST_FIRST_CONTACT_TIMEOUT_MS): this relay runs detached inside the watchdog and blocks nobody's
+ *  terminal, so it can afford to wait out a slow round trip rather than fall back to Desktop. Same
+ *  ceiling on the best-effort `resolve` echo below. Every OTHER timing/give-up rule on this route is
+ *  shared — see decision-poll.ts. */
 const POST_TIMEOUT_MS = 15_000;
-const POST_MAX_ATTEMPTS = 2;
-const POST_RETRY_PAUSE_MS = 1_000;
-const POLL_TIMEOUT_MS = 2_000;
-const POLL_INTERVAL_MS = 3_000;
-const MAX_CONSECUTIVE_MISSES = 100;
 const ANSWER_MAX = 500;
 
 export type CodexRemoteInputResult =

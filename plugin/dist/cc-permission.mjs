@@ -2485,6 +2485,15 @@ async function runHook(agent) {
   } catch {}
 }
 
+// src/core/decision-poll.ts
+var POLL_INTERVAL_MS = 3000;
+var POLL_TIMEOUT_MS = 2000;
+var POST_MAX_ATTEMPTS = 2;
+var POST_RETRY_PAUSE_MS = 1000;
+var MAX_CONSECUTIVE_MISSES = 100;
+var DEFINITIVE_POLL_STATUSES = new Set([401, 403, 404, 410]);
+var MAX_DEFINITIVE_POLL_FAILURES = 2;
+
 // src/core/lan-wire.ts
 var LAN_PATH = "/v1/lan";
 var LAN_ENVELOPE_VERSION = 1;
@@ -2493,6 +2502,7 @@ var LAN_FUTURE_SKEW_MS = 30000;
 var LAN_NONCE_MAX_CHARS = 64;
 var LAN_REQUEST_ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
 var LAN_ANSWER_BLOB_MAX_CHARS = 3072;
+var LAN_COMMAND_BLOB_MAX_CHARS = 8192;
 var LAN_FRAMES_WAIT_MAX_MS = 25000;
 function parseLanFramesRequest(payload) {
   const sinceSeq = payload.sinceSeq;
@@ -2566,16 +2576,9 @@ function lanRunningUnderTest() {
 }
 
 // src/core/permission.ts
-var POLL_INTERVAL_MS = 3000;
-var FETCH_TIMEOUT_MS = 2000;
 var POST_FIRST_CONTACT_TIMEOUT_MS = 4000;
-var POST_MAX_ATTEMPTS = 2;
-var POST_RETRY_PAUSE_MS = 1000;
 var HOLD_RETRY_DELAY_MS = 4000;
 var FRESH_SESSION_MS = 60000;
-var MAX_CONSECUTIVE_MISSES = 100;
-var DEFINITIVE_POLL_STATUSES = new Set([401, 403, 404, 410]);
-var MAX_DEFINITIVE_POLL_FAILURES = 2;
 var MAX_UNKNOWN_ANSWER_READS = 3;
 var CODEX_POLICY_TAIL_BYTES = 8 * 1024 * 1024;
 var CODEX_ROLLOUT_HEAD_BYTES = 1024 * 1024;
@@ -3297,7 +3300,7 @@ async function runPermissionHook(deps = {}, agent = "claude") {
       try {
         const res = await fetchFn(`${config.url}/v1/cc/decision/${requestId}`, {
           headers: pcHeaders,
-          signal: AbortSignal.timeout(FETCH_TIMEOUT_MS)
+          signal: AbortSignal.timeout(POLL_TIMEOUT_MS)
         });
         if (!res.ok) {
           trace({ event: "poll-end", seq: seq2, outcome: "status", status: res.status });

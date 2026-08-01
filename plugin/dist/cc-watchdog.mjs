@@ -3168,6 +3168,7 @@ var LAN_FUTURE_SKEW_MS = 30000;
 var LAN_NONCE_MAX_CHARS = 64;
 var LAN_REQUEST_ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
 var LAN_ANSWER_BLOB_MAX_CHARS = 3072;
+var LAN_COMMAND_BLOB_MAX_CHARS = 8192;
 var LAN_FRAMES_WAIT_MAX_MS = 25000;
 function parseLanFramesRequest(payload) {
   const sinceSeq = payload.sinceSeq;
@@ -3494,10 +3495,20 @@ function createLanFrameStore(deps = {}) {
   return store;
 }
 
+// src/core/bounded-set.ts
+function rememberBounded(set, value, max) {
+  set.add(value);
+  while (set.size > max) {
+    const oldest = set.values().next();
+    if (oldest.done)
+      break;
+    set.delete(oldest.value);
+  }
+}
+
 // src/core/lan-listener.ts
 var LAN_BODY_MAX_BYTES = 65536;
 var LAN_SEEN_NONCES_MAX = 512;
-var LAN_COMMAND_BLOB_MAX_CHARS = 8192;
 var LAN_KEEPALIVE_MS = 5000;
 var LAN_REQUEST_TIMEOUT_MS = 1e4;
 var LAN_ANSWER_TTL_MS = 120000;
@@ -3584,14 +3595,9 @@ function defaultListenerId() {
   } catch {}
   return b64url(crypto.getRandomValues(new Uint8Array(16)));
 }
-function rememberBounded(set, value, max) {
-  set.add(value);
-  while (set.size > max) {
-    const oldest = set.values().next();
-    if (oldest.done)
-      break;
-    set.delete(oldest.value);
-  }
+function requestIdOf(payload) {
+  const requestId = payload.requestId;
+  return typeof requestId === "string" && LAN_REQUEST_ID_RE.test(requestId) ? requestId : null;
 }
 function readBody(req, max) {
   return new Promise((resolve) => {
@@ -3714,9 +3720,9 @@ function createLanListener(deps = {}) {
         } catch {}
         payload = { ok: true };
       } else if (envelope.op === "answer") {
-        const requestId = envelope.payload.requestId;
+        const requestId = requestIdOf(envelope.payload);
         const answerBlob = envelope.payload.answerBlob;
-        if (typeof requestId !== "string" || !LAN_REQUEST_ID_RE.test(requestId))
+        if (requestId === null)
           return reject(res, "answer-request-id");
         if (typeof answerBlob !== "string" || answerBlob.length === 0 || answerBlob.length > LAN_ANSWER_BLOB_MAX_CHARS) {
           return reject(res, "answer-blob");
@@ -3742,8 +3748,8 @@ function createLanListener(deps = {}) {
         const hit = await frames.readFull(request.sessionId, request.what);
         payload = hit ? { ok: true, content: hit.content, complete: hit.complete } : { ok: false, err: "not-found" };
       } else if (envelope.op === "answer-poll" && isLoopbackAddress(peerAddress(req))) {
-        const requestId = envelope.payload.requestId;
-        if (typeof requestId !== "string" || !LAN_REQUEST_ID_RE.test(requestId))
+        const requestId = requestIdOf(envelope.payload);
+        if (requestId === null)
           return reject(res, "answer-poll-request-id");
         const hit = answers.peek(requestId, now());
         payload = hit ? { status: "answered", answerBlob: hit.answerBlob } : { status: "pending" };
@@ -4010,6 +4016,15 @@ function createLanHintPublisher(deps) {
     }
   };
 }
+
+// src/core/decision-poll.ts
+var POLL_INTERVAL_MS = 3000;
+var POLL_TIMEOUT_MS = 2000;
+var POST_MAX_ATTEMPTS = 2;
+var POST_RETRY_PAUSE_MS = 1000;
+var MAX_CONSECUTIVE_MISSES = 100;
+var DEFINITIVE_POLL_STATUSES = new Set([401, 403, 404, 410]);
+var MAX_DEFINITIVE_POLL_FAILURES = 2;
 
 // src/core/permission.ts
 import { readFile as readFile6, realpath, unlink as unlink3 } from "node:fs/promises";
@@ -4555,16 +4570,9 @@ async function runHook(agent) {
 }
 
 // src/core/permission.ts
-var POLL_INTERVAL_MS = 3000;
-var FETCH_TIMEOUT_MS = 2000;
 var POST_FIRST_CONTACT_TIMEOUT_MS = 4000;
-var POST_MAX_ATTEMPTS = 2;
-var POST_RETRY_PAUSE_MS = 1000;
 var HOLD_RETRY_DELAY_MS = 4000;
 var FRESH_SESSION_MS = 60000;
-var MAX_CONSECUTIVE_MISSES = 100;
-var DEFINITIVE_POLL_STATUSES = new Set([401, 403, 404, 410]);
-var MAX_DEFINITIVE_POLL_FAILURES = 2;
 var MAX_UNKNOWN_ANSWER_READS = 3;
 var CODEX_POLICY_TAIL_BYTES = 8 * 1024 * 1024;
 var CODEX_ROLLOUT_HEAD_BYTES = 1024 * 1024;
@@ -5286,7 +5294,7 @@ async function runPermissionHook(deps = {}, agent = "claude") {
       try {
         const res = await fetchFn(`${config.url}/v1/cc/decision/${requestId}`, {
           headers: pcHeaders,
-          signal: AbortSignal.timeout(FETCH_TIMEOUT_MS)
+          signal: AbortSignal.timeout(POLL_TIMEOUT_MS)
         });
         if (!res.ok) {
           trace({ event: "poll-end", seq: seq2, outcome: "status", status: res.status });
@@ -5435,11 +5443,6 @@ async function approvalsCommand(sub, deps = {}) {
 
 // src/core/codex-remote-input.ts
 var POST_TIMEOUT_MS = 15000;
-var POST_MAX_ATTEMPTS2 = 2;
-var POST_RETRY_PAUSE_MS2 = 1000;
-var POLL_TIMEOUT_MS = 2000;
-var POLL_INTERVAL_MS2 = 3000;
-var MAX_CONSECUTIVE_MISSES2 = 100;
 var ANSWER_MAX2 = 500;
 function codexAnswersFromPhone(request, positional) {
   if (!Array.isArray(positional) || positional.length !== request.questions.length)
@@ -5602,7 +5605,7 @@ async function runRemoteInput(request, requestId, signal, deps, onHoldCreated) {
       timer.unref?.();
     }));
     let response;
-    for (let attempt = 1;attempt <= POST_MAX_ATTEMPTS2 && !signal.aborted; attempt += 1) {
+    for (let attempt = 1;attempt <= POST_MAX_ATTEMPTS && !signal.aborted; attempt += 1) {
       try {
         response = await fetchFn(`${deps.config.url}/v1/cc/decision`, {
           method: "POST",
@@ -5623,8 +5626,8 @@ async function runRemoteInput(request, requestId, signal, deps, onHoldCreated) {
         });
         break;
       } catch {
-        if (attempt < POST_MAX_ATTEMPTS2 && !signal.aborted) {
-          await abortableSleep(POST_RETRY_PAUSE_MS2, signal, sleep);
+        if (attempt < POST_MAX_ATTEMPTS && !signal.aborted) {
+          await abortableSleep(POST_RETRY_PAUSE_MS, signal, sleep);
         }
       }
     }
@@ -5716,11 +5719,11 @@ async function runRemoteInput(request, requestId, signal, deps, onHoldCreated) {
         misses += 1;
         definitiveFailures = 0;
       }
-      if (misses >= MAX_CONSECUTIVE_MISSES2)
+      if (misses >= MAX_CONSECUTIVE_MISSES)
         return "transport-error";
       const waiter = answers.waiter(requestId, clock());
       try {
-        await Promise.race([abortableSleep(deps.pollIntervalMs ?? POLL_INTERVAL_MS2, signal, sleep), waiter.promise]);
+        await Promise.race([abortableSleep(deps.pollIntervalMs ?? POLL_INTERVAL_MS, signal, sleep), waiter.promise]);
       } finally {
         waiter.cancel();
       }
@@ -6563,15 +6566,6 @@ function bufferCommands(commands) {
     commandBuffer.push(c);
   }
 }
-function rememberBounded2(set, value, max) {
-  set.add(value);
-  while (set.size > max) {
-    const oldest = set.values().next();
-    if (oldest.done)
-      break;
-    set.delete(oldest.value);
-  }
-}
 function resetCommandState() {
   commandBuffer.length = 0;
   executedCommandIds.clear();
@@ -6606,7 +6600,7 @@ async function drainCommands(config, deps = {}) {
           traceFocus(deps, { ...base, result: "duplicate", why: "id" });
           continue;
         }
-        rememberBounded2(executedCommandIds, cmd.id, EXECUTED_COMMAND_IDS_MAX);
+        rememberBounded(executedCommandIds, cmd.id, EXECUTED_COMMAND_IDS_MAX);
         let plain;
         try {
           plain = await decryptBlob(config.e2eKey, cmd.blob);
@@ -6633,7 +6627,7 @@ async function drainCommands(config, deps = {}) {
           traceFocus(deps, { ...base, result: "replay" });
           continue;
         }
-        rememberBounded2(seenCommandNonces, payload.nonce, SEEN_NONCES_MAX);
+        rememberBounded(seenCommandNonces, payload.nonce, SEEN_NONCES_MAX);
         if (entries === null)
           entries = await readRecords();
         const entry = entries.find((e) => e.sessionId === payload.sessionId);
@@ -7614,17 +7608,16 @@ async function run() {
     }
   });
   activeLanListener = lan;
+  const stopLan = () => {
+    try {
+      lan.stop();
+    } catch {}
+  };
   const shutdown = () => {
     bridges.shutdown();
-    try {
-      lan.stop();
-    } catch {}
+    stopLan();
   };
-  activeLanShutdown = () => {
-    try {
-      lan.stop();
-    } catch {}
-  };
+  activeLanShutdown = stopLan;
   try {
     while (true) {
       if (!enforceWatchdogOwnership(shutdown))

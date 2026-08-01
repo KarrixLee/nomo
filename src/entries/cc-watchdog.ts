@@ -49,6 +49,7 @@ import {
   PAIR_HTML_FILE, PairPollResult, parseWatchdogPidfile, PendingConfig, pidAlive, PLUGIN_VERSION, readPrefix, readSuffix, recordGoneStrike, removeRevokedConfig,
   resetGoneStrikes, SessionRecord, SESSIONS_DIR, traceSession, tracePlanPickerDecision, watchdogHolderIsLive, WATCHDOG_PID_PATH,
 } from "../core/shared";
+import { rememberBounded } from "../core/bounded-set";
 
 // The transcript-tail interrupt PARSERS live in the agent adapters now (the two detections are
 // structurally different). Re-export them so existing importers/tests that reference "./cc-watchdog"
@@ -1039,16 +1040,6 @@ function bufferCommands(commands: SealedCommand[]): void {
   for (const c of commands) {
     if (commandBuffer.length >= COMMAND_BUFFER_MAX) return;
     commandBuffer.push(c);
-  }
-}
-
-/** Add to a bounded insertion-ordered set, evicting the oldest once full. */
-function rememberBounded(set: Set<string>, value: string, max: number): void {
-  set.add(value);
-  while (set.size > max) {
-    const oldest = set.values().next();
-    if (oldest.done) break;
-    set.delete(oldest.value);
   }
 }
 
@@ -3022,11 +3013,18 @@ async function run(): Promise<void> {
     onAnswer: (answer) => { void acceptLanAnswer(answer); },
   });
   activeLanListener = lan;
-  const shutdown = (): void => {
-    bridges.shutdown();
+  // ONE stop, reached from all three teardown seams: run()'s `finally`, an ownership loss mid-sweep
+  // (both via `shutdown`), and the SIGTERM/SIGINT handler (via activeLanShutdown, which default signal
+  // handling reaches without running the `finally`). lan.stop() is idempotent, so overlapping seams are
+  // free; the try/catch is here rather than at each seam so no caller can forget it.
+  const stopLan = (): void => {
     try { lan.stop(); } catch { /* best-effort socket teardown */ }
   };
-  activeLanShutdown = () => { try { lan.stop(); } catch { /* best-effort */ } };
+  const shutdown = (): void => {
+    bridges.shutdown();
+    stopLan();
+  };
+  activeLanShutdown = stopLan;
   try {
     while (true) {
       // A claim can be stolen or removed after startup (upgrade takeover, reset, racing spawn). An

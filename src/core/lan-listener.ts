@@ -38,6 +38,21 @@
 // implement: that gets a SEALED 200 {"ok":false,"err":"bad-op"} so a newer phone can distinguish "this
 // Mac is alive but older" from "unreachable". Only a holder of K_lan can ever see that answer.
 //
+// THE OPS, in the order the phases added them. Every one of them rides the envelope above, and every one
+// answers SEALED — the 400 is reserved for envelopes that never authenticated at all.
+//
+// PHASE 1 ships the reachability probe every LAN link opens with, and the command op it exists for:
+//
+//   {"op":"ping", payload:{}}
+//        → sealed {"ok":true}. No side effects: it proves the endpoint is this pairing's Mac, that the
+//          key still opens, and that the clock/nonce guards agree — which is exactly what the phone
+//          needs before it commits a real command to the LAN leg.
+//
+//   {"op":"command", payload:{"blob":"<b64 sealed under the PAIRING key>"}}
+//        → sealed {"ok":true}. The blob is handed to the watchdog untouched; all command validation
+//          (kind allow-list, freshness, replay dedupe) stays in drainCommands, so a LAN command and its
+//          worker twin collapse on the SAME inner nonce.
+//
 // PHASE 2 adds two ops on the same envelope (see the answer store below):
 //
 //   {"op":"answer",      payload:{"requestId":"<id>","answerBlob":"<b64 sealed under the PAIRING key>"}}
@@ -80,22 +95,27 @@ import { networkInterfaces } from "node:os";
 import { b64url, decryptBlob, deriveLanKey, encryptBlob } from "./crypto";
 import { createLanFrameStore } from "./lan-frames";
 import type { LanFrameStore } from "./lan-frames";
+import { rememberBounded } from "./bounded-set";
 import { atomicWrite, Config, traceSession } from "./shared";
 import {
-  isLoopbackAddress, LAN_ANSWER_BLOB_MAX_CHARS, LAN_ENVELOPE_VERSION, LAN_PATH, LAN_REQUEST_ID_RE,
-  LAN_STATE_PATH, lanEnvelopeIsFresh, lanRunningUnderTest, parseLanEnvelope, parseLanFramesRequest,
-  parseLanReadRequest, parseLanState,
+  isLoopbackAddress, LAN_ANSWER_BLOB_MAX_CHARS, LAN_COMMAND_BLOB_MAX_CHARS, LAN_ENVELOPE_VERSION,
+  LAN_PATH, LAN_REQUEST_ID_RE, LAN_STATE_PATH, lanEnvelopeIsFresh, lanRunningUnderTest,
+  parseLanEnvelope, parseLanFramesRequest, parseLanReadRequest, parseLanState,
 } from "./lan-wire";
 import type { LanState } from "./lan-wire";
 
 // The PURE wire contract lives in lan-wire.ts so the permission hook can speak it without bundling this
 // HTTP server (see that file's header). Re-exported here, unchanged, so every existing importer of
 // "./lan-listener" — tests included — keeps resolving exactly the same names.
+//
+// THE RULE, so this shim cannot rot: it re-exports ALL of lan-wire and nothing else. "This name is part
+// of the wire" is then the same question as "is it reachable through lan-listener?", and a new wire
+// constant is added in exactly one place with no importer to chase.
 export {
-  isLoopbackAddress, LAN_ANSWER_BLOB_MAX_CHARS, LAN_ENVELOPE_VERSION, LAN_FRAMES_WAIT_MAX_MS,
-  LAN_FUTURE_SKEW_MS, LAN_NONCE_MAX_CHARS, LAN_PATH, LAN_REQUEST_ID_RE, LAN_SESSION_ID_RE,
-  LAN_STATE_PATH, LAN_TTL_MS, lanEnvelopeIsFresh, lanRunningUnderTest, parseLanEnvelope,
-  parseLanFramesRequest, parseLanReadRequest, parseLanState,
+  isLoopbackAddress, LAN_ANSWER_BLOB_MAX_CHARS, LAN_COMMAND_BLOB_MAX_CHARS, LAN_ENVELOPE_VERSION,
+  LAN_FRAMES_WAIT_MAX_MS, LAN_FUTURE_SKEW_MS, LAN_NONCE_MAX_CHARS, LAN_PATH, LAN_REQUEST_ID_RE,
+  LAN_SESSION_ID_RE, LAN_STATE_PATH, LAN_TTL_MS, lanEnvelopeIsFresh, lanRunningUnderTest,
+  parseLanEnvelope, parseLanFramesRequest, parseLanReadRequest, parseLanState,
 } from "./lan-wire";
 export type { LanEnvelope, LanFramesRequest, LanReadRequest, LanReadWhat, LanState } from "./lan-wire";
 
@@ -108,10 +128,7 @@ export const LAN_BODY_MAX_BYTES = 65_536;
  *  is exactly why it must not be consumed by outer-envelope traffic — a flood of junk LAN envelopes must
  *  not be able to evict a real command's inner nonce and reopen the cross-channel replay window.
  *  512 with FIFO eviction, same sizing argument as the inner set. */
-export const LAN_SEEN_NONCES_MAX = 512;
-/** Upper bound on a command's inner sealed blob. The worker path caps blobs at 3072 base64 chars
- *  (BLOB_FIT_CHARS + margin); the LAN path has no worker in it, but a bound is still a bound. */
-export const LAN_COMMAND_BLOB_MAX_CHARS = 8192;
+const LAN_SEEN_NONCES_MAX = 512;
 /** Idle keep-alive / whole-request ceilings, so a half-open LAN peer cannot pin a socket forever. */
 const LAN_KEEPALIVE_MS = 5_000;
 const LAN_REQUEST_TIMEOUT_MS = 10_000;
@@ -315,14 +332,15 @@ function defaultListenerId(): string {
   return b64url(crypto.getRandomValues(new Uint8Array(16)));
 }
 
-/** Add to a bounded insertion-ordered set, evicting oldest-first (mirrors the watchdog's helper). */
-function rememberBounded(set: Set<string>, value: string, max: number): void {
-  set.add(value);
-  while (set.size > max) {
-    const oldest = set.values().next();
-    if (oldest.done) break;
-    set.delete(oldest.value);
-  }
+/** The `requestId` field of a payload, or null when it is absent or outside the charset gate. ONE
+ *  helper because TWO ops read it — `answer` (phone → store) and `answer-poll` (hook ← store) — and they
+ *  must apply the identical gate: the worker's REQID_RE is what decides whether the SAME id is accepted
+ *  on the worker leg, and an id one op here took while the other refused would be a split brain between
+ *  the two halves of a single answer's journey. Each caller keeps its OWN reject reason, so the trace
+ *  still says which op failed. */
+function requestIdOf(payload: Record<string, unknown>): string | null {
+  const requestId = payload.requestId;
+  return typeof requestId === "string" && LAN_REQUEST_ID_RE.test(requestId) ? requestId : null;
 }
 
 // --- the listener ------------------------------------------------------------------------------
@@ -481,9 +499,9 @@ export function createLanListener(deps: LanListenerDeps = {}): LanListener {
         try { deps.onCommand?.({ nonce: envelope.nonce, blob, config: pairing }); } catch { /* never fail the response on the sink */ }
         payload = { ok: true };
       } else if (envelope.op === "answer") {
-        const requestId = envelope.payload.requestId;
+        const requestId = requestIdOf(envelope.payload);
         const answerBlob = envelope.payload.answerBlob;
-        if (typeof requestId !== "string" || !LAN_REQUEST_ID_RE.test(requestId)) return reject(res, "answer-request-id");
+        if (requestId === null) return reject(res, "answer-request-id");
         if (typeof answerBlob !== "string" || answerBlob.length === 0 || answerBlob.length > LAN_ANSWER_BLOB_MAX_CHARS) {
           return reject(res, "answer-blob");
         }
@@ -528,8 +546,8 @@ export function createLanListener(deps: LanListenerDeps = {}): LanListener {
         // LOOPBACK ONLY. This op exists for the blocked Claude hook — a separate short-lived process on
         // THIS machine with no IPC to the daemon. The phone never needs it, so an off-LAN-address caller
         // falls through to the bad-op branch below and cannot even learn the op exists.
-        const requestId = envelope.payload.requestId;
-        if (typeof requestId !== "string" || !LAN_REQUEST_ID_RE.test(requestId)) return reject(res, "answer-poll-request-id");
+        const requestId = requestIdOf(envelope.payload);
+        if (requestId === null) return reject(res, "answer-poll-request-id");
         const hit = answers.peek(requestId, now());
         // The SAME shape the worker's GET /v1/cc/decision/:id returns, so the hook's answer branch is
         // reused verbatim across both channels.

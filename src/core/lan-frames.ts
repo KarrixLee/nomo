@@ -47,7 +47,7 @@ export const LAN_FRAME_RETIRE_GRACE_MS = 60_000;
 /** Debounce on the fs.watch feed. Long enough that a hook's write burst (record rewrite + the watchdog's
  *  own rewrite of the same file) collapses into ONE reload, short enough to stay far under the sub-second
  *  target. */
-export const LAN_FRAMES_WATCH_DEBOUNCE_MS = 100;
+const LAN_FRAMES_WATCH_DEBOUNCE_MS = 100;
 /** Concurrent long-poll waiters. One foregrounded phone holds exactly one; the cap bounds what a K_lan
  *  holder (or a phone that reconnects without draining its old sockets) can pin, and the OLDEST waiter is
  *  dropped with an immediate empty response rather than refused — a dropped waiter simply re-arms. */
