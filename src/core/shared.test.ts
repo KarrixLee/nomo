@@ -7,7 +7,8 @@ import {
   decisionHoldFileName, ensureWatchdog, formatWatchdogPidfile, fullTextForRecord, isWatchdogCommand,
   readDecisionHoldAt, writeDecisionHoldAt,
   localApprovalsState, parseWatchdogPidfile, PLUGIN_VERSION, RECORD_FULL_TEXT_MAX_CHARS,
-  RECORD_FULL_TEXT_TRUNCATION_MARKER, recordFullTextIsComplete, stampPermissionDetailFullAt, watchdogHolderIsLive,
+  RECORD_FULL_TEXT_TRUNCATION_MARKER, recordFullTextIsComplete, stampPermissionDetailFullAt, watchdogBuildStamp,
+  watchdogHolderIsLive,
 } from "./shared";
 
 describe("codexCompanionBrokerEvidence (structural companion-session proof)", () => {
@@ -192,6 +193,60 @@ describe("ensureWatchdog (spawn gate: recycled pids and stale builds must not bl
 
   test("a garbage pidfile → spawn", () => {
     expect(run("nonsense")).toEqual({ kills: [], spawned: 1 });
+  });
+
+  // THE FIELD BUG (2026-08-02): the version string is not the build. A bundle rebuilt in place under
+  // the SAME version — every iteration of a fix before its release bump — left the incumbent running
+  // the OLD code forever, because the stamp it was compared against had not changed. The daemon is
+  // long-lived (a 30-min idle grace), so "the fix is on disk" and "the fix is running" diverged
+  // silently: the .hold markers the new permission hook wrote were read by nobody.
+  test("a live watchdog on the same VERSION but a DIFFERENT bundle → takeover", () => {
+    expect(run("777 1.4.4 aaa", { build: "bbb" })).toEqual({ kills: [[777, "SIGTERM"]], spawned: 1 });
+  });
+
+  test("same version AND same bundle → still no spawn, no signal", () => {
+    expect(run("777 1.4.4 aaa", { build: "aaa" })).toEqual({ kills: [], spawned: 0 });
+  });
+
+  test("an UNKNOWN build stamp on either side compares on the version alone (never a restart loop)", () => {
+    // A pre-stamp incumbent, or a bundle we cannot stat: absence of evidence is not evidence of a
+    // different build, and guessing "different" would SIGTERM the daemon on every hook.
+    expect(run("777 1.4.4", { build: "bbb" })).toEqual({ kills: [], spawned: 0 });
+    expect(run("777 1.4.4 aaa", { build: undefined })).toEqual({ kills: [], spawned: 0 });
+    // …but a genuine version change still takes over, stamps or no stamps.
+    expect(run("777 1.4.3", { build: undefined })).toEqual({ kills: [[777, "SIGTERM"]], spawned: 1 });
+  });
+
+  test("the pidfile carries the build as a THIRD field, and stays parseInt-compatible", () => {
+    expect(formatWatchdogPidfile(777, "1.4.4", "abc")).toBe("777 1.4.4 abc");
+    expect(Number.parseInt(formatWatchdogPidfile(777, "1.4.4", "abc"), 10)).toBe(777);
+    expect(parseWatchdogPidfile("777 1.4.4 abc")).toEqual({ pid: 777, version: "1.4.4", build: "abc" });
+    expect(parseWatchdogPidfile("777 1.4.4")).toEqual({ pid: 777, version: "1.4.4" });
+    // No stamp available → the two-field form the previous build wrote, byte for byte.
+    expect(formatWatchdogPidfile(777, "1.4.4", undefined)).toBe("777 1.4.4");
+  });
+});
+
+describe("watchdogBuildStamp (the bundle's identity, not its version)", () => {
+  test("equal for two copies of the SAME bytes, different the moment the bytes change", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "nomo-build-"));
+    try {
+      const a = join(dir, "a.mjs");
+      const b = join(dir, "b.mjs");
+      await writeFile(a, "console.log(1)\n");
+      await writeFile(b, "console.log(1)\n");
+      // CONTENT, not mtime: the same bundle installed twice (a plugin cache copy and a dev checkout)
+      // must not look like two different builds, or every hook would fight over the daemon.
+      expect(watchdogBuildStamp(a)).toBe(watchdogBuildStamp(b));
+      await writeFile(b, "console.log(2)\n");
+      expect(watchdogBuildStamp(a)).not.toBe(watchdogBuildStamp(b));
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("an unreadable path is UNKNOWN (undefined), never a throw and never a fake stamp", () => {
+    expect(watchdogBuildStamp("/does/not/exist/cc-watchdog.mjs")).toBeUndefined();
   });
 });
 

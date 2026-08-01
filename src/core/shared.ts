@@ -55,6 +55,28 @@ export function formatPlanPickerDebug(input: {
   return Array.from(value).slice(0, DBG_BLOB_TEXT_MAX_CHARS).join("");
 }
 
+/** The `dbg` breadcrumb for a LAN decision HOLD — the same space-separated `key:value` line
+ *  formatPlanPickerDebug produces, for the other state machine that can wedge a row.
+ *
+ *  It answers the one question a stuck approval always raises: is the card the phone is showing the
+ *  Mac's HOLD OVERLAY, or the record's own frame? The overlay's blob is this one and carries this line;
+ *  the record's blob never does. So `hold@…` on the row means the LAN feed is serving the card, and its
+ *  absence under a decisionPending row means the phone is looking at the worker's copy instead.
+ *
+ *  `at` is the marker's own stamp, verbatim — the same number lanHoldLive compares against the record's
+ *  and the same one the overlay's frame is stamped max()-with, so the phone's applied frame stamp and
+ *  this line can be read side by side. Fitted into BLOB_FIT_CHARS by appendFittedPlanAndDebug like
+ *  every other dbg, i.e. dropped entirely rather than crowding out the card's real content. */
+export function formatDecisionHoldDebug(input: {
+  at: number;
+  requestId: string;
+  pid: number;
+  version?: string;
+}): string {
+  const value = `${debugToken(input.version ?? PLUGIN_VERSION)} ev:hold hold@${Math.floor(input.at)} req:${debugToken(input.requestId.slice(0, 8))} pid:${input.pid}`;
+  return Array.from(value).slice(0, DBG_BLOB_TEXT_MAX_CHARS).join("");
+}
+
 /** Root of the on-disk state: config.json, the per-session pid files, the watchdog pidfile. */
 export const CC_DIR = `${process.env.HOME}/.config/cc-status`;
 /** Append-only, local-only session lifecycle/state-machine trace next to config.json. */
@@ -995,24 +1017,75 @@ export function isWatchdogCommand(psCommand: string): boolean {
   return psCommand.includes("cc-watchdog");
 }
 
-/** The parsed watchdog pidfile: the holder's pid plus, when the incumbent stamped one, its build. */
+/** The parsed watchdog pidfile: the holder's pid plus, when the incumbent stamped them, its version
+ *  and the identity of the BUNDLE it is actually executing. */
 export interface WatchdogPidfile {
   pid: number;
   /** The incumbent's PLUGIN_VERSION. Absent for a pidfile written by a pre-stamp build → older code. */
   version?: string;
+  /** The incumbent's `watchdogBuildStamp` — see below. Absent for a pre-build-stamp build, or when it
+   *  could not read its own bundle. */
+  build?: string;
 }
 
-/** Render the pidfile contents for THIS process (see the format note above). */
-export function formatWatchdogPidfile(pid: number, version: string = PLUGIN_VERSION): string {
-  return `${pid} ${version}`;
+/** The identity of the watchdog BUNDLE — what the version string is not.
+ *
+ *  A version is bumped at RELEASE; a bundle is rebuilt on every iteration of a fix. The daemon lingers
+ *  up to 30 min between sessions, so a rebuild under an unchanged version left the incumbent running
+ *  the OLD code with nothing able to notice: `ensureWatchdog` compared version to version, found them
+ *  equal, and returned. That is how a shipped, on-disk fix ran nowhere for hours (the LAN decisionPending
+ *  hold, 2026-08-02 — the hook wrote its `.hold` markers and the running feed had no code to read them).
+ *
+ *  CONTENT-DERIVED, deliberately, not mtime or size: the same bundle exists in more than one place on a
+ *  real machine (a plugin-cache copy and a dev checkout), and a path-shaped stamp would make two hooks
+ *  running from different copies of the SAME build fight over the daemon on every event. FNV-1a over the
+ *  bundle is ~0.5 ms for the real ~280 KB file, which is nothing beside the network call this hook is
+ *  about to make, and it is not a security boundary — the file is the code we are already executing.
+ *
+ *  UNDEFINED means UNKNOWN (unreadable, absent, a dev entry that isn't there): never a fabricated stamp,
+ *  because a wrong one would either mask a stale daemon or restart a healthy one. */
+export function watchdogBuildStamp(path: string = WATCHDOG_PATH): string | undefined {
+  try {
+    const bytes = readFileSync(path);
+    let hash = 0x811c9dc5;
+    for (let i = 0; i < bytes.length; i++) {
+      hash ^= bytes[i]!;
+      hash = Math.imul(hash, 0x01000193);
+    }
+    return (hash >>> 0).toString(36);
+  } catch {
+    return undefined;
+  }
+}
+
+/** Do two build stamps describe DIFFERENT bundles? Only when both are known and disagree: an unknown
+ *  stamp on either side (a pre-stamp incumbent, an unreadable bundle) falls back to the version
+ *  comparison alone, because guessing "different" there would SIGTERM the daemon on every hook. Pure. */
+export function watchdogBuildDiffers(incumbent: string | undefined, current: string | undefined): boolean {
+  if (incumbent === undefined || current === undefined) return false;
+  return incumbent !== current;
+}
+
+/** Render the pidfile contents for THIS process (see the format note above). The build stamp is
+ *  omitted entirely when unknown, which is byte-for-byte the two-field form earlier builds wrote —
+ *  and it is passed IN rather than defaulted, so this stays pure and nothing stats a bundle just to
+ *  format a string. The daemon's own claim path supplies `watchdogBuildStamp()`. */
+export function formatWatchdogPidfile(
+  pid: number, version: string = PLUGIN_VERSION, build?: string,
+): string {
+  return `${pid} ${version}${typeof build === "string" && build.length > 0 ? ` ${build}` : ""}`;
 }
 
 /** Parse a pidfile's contents. Null when there's no usable pid (empty / non-numeric / ≤ 0). Pure. */
 export function parseWatchdogPidfile(raw: string): WatchdogPidfile | null {
-  const [pidField, versionField] = raw.trim().split(/\s+/);
+  const [pidField, versionField, buildField] = raw.trim().split(/\s+/);
   const pid = Number.parseInt(pidField ?? "", 10);
   if (!Number.isFinite(pid) || pid <= 0) return null;
-  return { pid, ...(typeof versionField === "string" && versionField.length > 0 ? { version: versionField } : {}) };
+  return {
+    pid,
+    ...(typeof versionField === "string" && versionField.length > 0 ? { version: versionField } : {}),
+    ...(typeof buildField === "string" && buildField.length > 0 ? { build: buildField } : {}),
+  };
 }
 
 /** Injectable process-identity seams (so both claim paths are testable with a fake `ps`). */
@@ -1049,6 +1122,8 @@ export interface EnsureWatchdogDeps extends WatchdogIdentityDeps {
   spawnWatchdog?: () => void;
   /** THIS build's version (the stamp a live incumbent is compared against). */
   version?: string;
+  /** THIS bundle's `watchdogBuildStamp` — the second half of that comparison. */
+  build?: string;
 }
 
 /** Ensure the detached liveness/self-heal watchdog is running the CURRENT build: if its pidfile is
@@ -1070,6 +1145,7 @@ export function ensureWatchdog(deps: EnsureWatchdogDeps = {}): void {
     if (process.env.NOMO_SKIP_WATCHDOG === "1") return;
     const pidPath = deps.pidPath ?? WATCHDOG_PID_PATH;
     const version = deps.version ?? PLUGIN_VERSION;
+    const build = "build" in deps ? deps.build : watchdogBuildStamp();
     const readPidfile = deps.readPidfile ?? (() => {
       try { return readFileSync(pidPath, "utf8"); } catch { return undefined; }
     });
@@ -1084,8 +1160,9 @@ export function ensureWatchdog(deps: EnsureWatchdogDeps = {}): void {
     const holder = typeof raw === "string" ? parseWatchdogPidfile(raw) : null;
     if (holder && watchdogHolderIsLive(holder.pid, deps)) {
       // A live watchdog on OUR build → nothing to do. A live watchdog on any other build (including an
-      // unstamped pre-upgrade one) is running stale code: retire it, then spawn the current bundle.
-      if (holder.version === version) return;
+      // unstamped pre-upgrade one, or the SAME version rebuilt in place — see watchdogBuildStamp) is
+      // running stale code: retire it, then spawn the current bundle.
+      if (holder.version === version && !watchdogBuildDiffers(holder.build, build)) return;
       try { killPid(holder.pid, "SIGTERM"); } catch { /* raced its own exit — spawn anyway */ }
     }
     spawnWatchdog();

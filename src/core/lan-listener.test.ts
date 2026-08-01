@@ -980,6 +980,62 @@ describe("frames — the state-sync store", () => {
     ]);
   });
 
+  // --- per-session monotonic stamps (the phone's ordering guard is STRICTLY-newer) ---------------
+  //
+  // The phone drops a non-terminal frame whose `ts` is not ABOVE the row it would replace
+  // (CCLanFramesMerge.accepts). Every state change this feed reports must therefore carry a stamp
+  // strictly above the one it last reported FOR THAT SESSION — and the hold overlay is the one place
+  // where two DIFFERENT states legitimately share a record stamp, because the card is stamped
+  // max(record.ts, hold.at). Both edges of a hold collide, and a dropped frame is a wedged row.
+
+  test("a hold that began BEFORE the record's last write still out-orders the frame the phone has", async () => {
+    const dir = await framesDir();
+    const store = makeStore(dir);
+    // The needsAttention record lands first and reaches the phone at ts NOW.
+    await put(dir, "s1", { prio: 1 });
+    await store.reconcile();
+    expect(store.since(0).frames[0]).toMatchObject({ prio: 1, ts: NOW, blob: "sealed-blob" });
+
+    // THEN the marker becomes visible, stamped EARLIER than that record (the hook began holding
+    // before CC's Notification hook rewrote the row). max(record.ts, hold.at) is exactly the stamp
+    // the phone already holds, so an un-bumped card is a card the phone throws away.
+    await writeFile(join(dir, decisionHoldFileName("s1")),
+                    JSON.stringify({ blob: "sealed-decision-pending", at: NOW - 6_000, pid: 4242 }));
+    await store.reconcile();
+    const card = store.since(1).frames[0];
+    expect(card).toMatchObject({ blob: "sealed-decision-pending" });
+    expect(card!.ts).toBeGreaterThan(NOW);
+  });
+
+  test("releasing a hold that never advanced the record still out-orders the card", async () => {
+    const dir = await framesDir();
+    const store = makeStore(dir);
+    await writeFile(join(dir, decisionHoldFileName("s1")),
+                    JSON.stringify({ blob: "sealed-decision-pending", at: NOW - 6_000, pid: 4242 }));
+    await put(dir, "s1", { prio: 1 });
+    await store.reconcile();
+    expect(store.since(0).frames[0]).toMatchObject({ ts: NOW, blob: "sealed-decision-pending" });
+
+    // The hold EXPIRED (or was answered at the Mac): the marker goes and NO further hook event
+    // rewrites the record, so the released frame carries the record's original stamp.
+    await unlink(join(dir, decisionHoldFileName("s1")));
+    await store.reconcile();
+    const released = store.since(1).frames[0];
+    expect(released).toMatchObject({ blob: "sealed-blob" });
+    expect(released!.ts).toBeGreaterThan(NOW);
+  });
+
+  test("identical content re-observed neither bumps the counter nor inflates the stamp", async () => {
+    const dir = await framesDir();
+    const store = makeStore(dir);
+    await put(dir, "s1", { prio: 1 });
+    await store.reconcile();
+    await store.reconcile();
+    await store.reconcile();
+    expect(store.seq()).toBe(1);
+    expect(store.since(0).frames[0]).toMatchObject({ ts: NOW });
+  });
+
   test("one counter, monotonic; three rapid updates COALESCE into one frame carrying the latest blob", async () => {
     const dir = await framesDir();
     const store = makeStore(dir);
@@ -997,7 +1053,10 @@ describe("frames — the state-sync store", () => {
     const slice = store.since(0);
     expect(slice.seq).toBe(4);
     expect(slice.frames).toHaveLength(1); // …so the phone gets the latest state, never the history
-    expect(slice.frames[0]).toEqual({ seq: 4, sessionId: "s1", op: "update", prio: 0, ts: NOW, blob: "blob-4" });
+    // ts = NOW + 3, not NOW: the fixture rewrites the record three times WITHOUT advancing its stamp
+    // (a real hook stamps Date.now() per write), and each of those is a genuine content change the
+    // phone's strictly-newer guard would otherwise drop. See `stamp`'s monotonic rule.
+    expect(slice.frames[0]).toEqual({ seq: 4, sessionId: "s1", op: "update", prio: 0, ts: NOW + 3, blob: "blob-4" });
 
     // An unchanged record must NOT bump the counter — otherwise every 5 s reconcile would wake every
     // long-poll for nothing.

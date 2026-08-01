@@ -47,7 +47,8 @@ import {
   AgentKind, appendFittedPlanAndDebug, atomicWrite, CC_DIR, CCOp, CCStatus, codexAppServerSocketAvailable, Config, completePendingPairing, formatPlanPickerDebug, formatWatchdogPidfile,
   GONE_STRIKE_LIMIT, loadConfig, loadPendingConfig, localApprovalsState,
   PAIR_HTML_FILE, PairPollResult, parseWatchdogPidfile, PendingConfig, pidAlive, PLUGIN_VERSION, readPrefix, readSuffix, recordGoneStrike, removeRevokedConfig,
-  resetGoneStrikes, SessionRecord, SESSIONS_DIR, traceSession, tracePlanPickerDecision, watchdogHolderIsLive, WATCHDOG_PID_PATH,
+  resetGoneStrikes, SessionRecord, SESSIONS_DIR, traceSession, tracePlanPickerDecision, watchdogBuildDiffers,
+  watchdogBuildStamp, watchdogHolderIsLive, WATCHDOG_PID_PATH,
 } from "../core/shared";
 import { rememberBounded } from "../core/bounded-set";
 
@@ -589,9 +590,9 @@ export const PLAN_PICKER_VERIFY_MAX_MS = 30_000;
  *  can otherwise remain valid forever after ESC because dismissal is intentionally absent from JSONL.
  *  One hour preserves long deliberation while guaranteeing that no pending marker is immortal. */
 export const PLAN_PICKER_PENDING_MAX_MS = 60 * 60_000;
-/** Migration/self-heal window for a plain done or the v1.4.8 buggy daemon-settled done. Exact full
- *  picker proof + live pid + no later progress is still required. Bounded so old done rows are never
- *  reconsidered indefinitely. */
+/** Migration/self-heal window for a plain done a killed hook left behind. Exact full picker proof +
+ *  live pid + no later progress is still required. Bounded so old done rows are never reconsidered
+ *  indefinitely. */
 export const PLAN_PICKER_RECENT_DONE_MS = 30 * 60_000;
 
 /** Pure gate for marked completions and the narrowly bounded old-build done backstop. */
@@ -599,6 +600,17 @@ export function shouldPlanPickerVerificationCheck(record: SessionRecord, now: nu
   if (record.agent !== "codex" || record.provisional === true) return false;
   if (typeof record.transcript !== "string" || record.transcript.length === 0) return false;
   if (record.planPickerVerificationPending === true) return true;
+  // CONVERGENCE LATCH. `planPickerSettled` is written by exactly one place — settlePendingPlanPickerDone
+  // — and therefore means "this watchdog has already adjudicated this picker episode as terminal",
+  // with the whole picture (TTL fired, or a correlated TUI proven dead). The backstop below re-opens a
+  // done from *rollout evidence alone*, and the rollout signature is durable forever: Codex never
+  // writes picker dismissal to JSONL. So without this gate the two correctives are exact inverses and
+  // neither ever wins — measured 2026-08-02 as 738 posted corrections over 48min (~7.3s per flip),
+  // every one of them a prio-1 ⇄ done Live Activity push against the ~40/6min ActivityKit budget.
+  // The latch is released only by genuine NEW evidence: correctResolvedPlanPicker clears it when the
+  // rollout shows real progress, and every hook write rebuilds the record without it, so a later turn
+  // opening a real picker is unaffected.
+  if (record.planPickerSettled === true) return false;
   if (record.op !== "done" || record.lastEvent !== "done" || record.sentDone !== true) return false;
   if (typeof record.ts !== "number" || !Number.isFinite(record.ts)) return false;
   const age = now - record.ts;
@@ -643,7 +655,14 @@ export async function correctPlanPickerVerification(
     const now = (deps.now ?? Date.now)();
     if (!shouldPlanPickerVerificationCheck(record, now)) return "uncorrected";
     const recentDoneBackstop = record.planPickerVerificationPending !== true;
-    if (recentDoneBackstop && !(deps.pidAlive ?? pidAlive)(record.pid)) {
+    // Re-opening a done demands proof the session can still be showing a picker. For a daemon-fronted
+    // Codex row `record.pid` is the app-server — alive for every session on the machine, so it proves
+    // nothing. When the precision-biased correlation has stamped a real TTY, that is the process that
+    // owns the picker; correctResolvedPlanPicker already treats its death as decisive enough to settle,
+    // so it must also be decisive enough to refuse a resurrection.
+    const ownerPid = typeof record.tuiPid === "number" && Number.isFinite(record.tuiPid)
+      ? record.tuiPid : record.pid;
+    if (recentDoneBackstop && !(deps.pidAlive ?? pidAlive)(ownerPid)) {
       tracePicker(sessionId, deps, {
         source: "watchdog", classifier: "dead-pid", marker: record.planPickerSettled === true ? "settled" : "none",
       });
@@ -2891,15 +2910,22 @@ export function createBridgeSupervisor(deps: BridgeSupervisorDeps = {}) {
  *     version-mismatched incumbent is taken over. Its own release is ownership-checked, so it can never
  *     stomp our claim on the way out. */
 async function claimSingleInstance(): Promise<boolean> {
+  // OUR bundle's identity, read once. It is stamped into the pidfile so a later hook can tell that a
+  // rebuild happened under an unchanged version (see watchdogBuildStamp) — and it is the same test
+  // applied here, so a same-version incumbent running DIFFERENT code is taken over rather than deferred
+  // to. Without that, ensureWatchdog would SIGTERM the stale daemon and its replacement would politely
+  // back off, leaving the machine with no watchdog at all.
+  const build = watchdogBuildStamp();
   try {
     const holder = parseWatchdogPidfile(readFileSync(WATCHDOG_PID_PATH, "utf8"));
-    if (holder && holder.pid !== process.pid && watchdogHolderIsLive(holder.pid) && holder.version === PLUGIN_VERSION) {
+    if (holder && holder.pid !== process.pid && watchdogHolderIsLive(holder.pid)
+        && holder.version === PLUGIN_VERSION && !watchdogBuildDiffers(holder.build, build)) {
       return false;
     }
   } catch {
     // No pidfile (or unreadable) → free to claim.
   }
-  await atomicWrite(WATCHDOG_PID_PATH, formatWatchdogPidfile(process.pid));
+  await atomicWrite(WATCHDOG_PID_PATH, formatWatchdogPidfile(process.pid, PLUGIN_VERSION, build));
   return true;
 }
 

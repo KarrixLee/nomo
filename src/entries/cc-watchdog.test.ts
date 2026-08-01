@@ -1777,16 +1777,18 @@ describe("correctPlanPickerVerification (watchdog owns flush settlement)", () =>
     expect({ posted, classified }).toEqual({ posted: 0, classified: 0 });
   });
 
-  test("a buggy-build settled done is re-corrected only with full proof + live pid + recent window", async () => {
-    const settled = verifying({
+  test("an unadjudicated done is re-corrected only with full proof + live pid + recent window", async () => {
+    // A hook killed between its done write and its picker marker leaves a PLAIN done: no adjudicator
+    // ever ruled on it, so rollout proof may still re-open it. A done carrying `planPickerSettled`
+    // is the opposite case and is latched shut below.
+    const plainDone = verifying({
       planPickerVerificationPending: undefined,
-      planPickerSettled: true,
       lastEvent: "done", op: "done", prio: 0, sentDone: true, ts: NOW - 1_000,
     });
-    let current = settled;
+    let current = plainDone;
     const posts: Record<string, unknown>[] = [];
-    expect(shouldPlanPickerVerificationCheck(settled, NOW)).toBe(true);
-    expect(await correctPlanPickerVerification(cfg(), "/tmp/s.json", "s", settled, {
+    expect(shouldPlanPickerVerificationCheck(plainDone, NOW)).toBe(true);
+    expect(await correctPlanPickerVerification(cfg(), "/tmp/s.json", "s", plainDone, {
       evidence: async () => ({ state: "pending", plan: "# Still open" }),
       threadWaitState: async () => "notWaitingOnUserInput",
       pidAlive: () => true,
@@ -1798,36 +1800,88 @@ describe("correctPlanPickerVerification (watchdog owns flush settlement)", () =>
     expect(posts[0]).toMatchObject({ op: "update", prio: 1, attentionKind: "userInput" });
     expect(current).toMatchObject({ lastEvent: "needsAttention", pendingPlanPicker: true, prio: 1 });
     expect(current.planPickerSettled).toBeUndefined();
+
+    // Same full proof, same live pid, same window — but the watchdog already settled this episode.
+    const settled = { ...plainDone, planPickerSettled: true };
+    let classified = 0;
+    expect(shouldPlanPickerVerificationCheck(settled, NOW)).toBe(false);
+    expect(await correctPlanPickerVerification(cfg(), "/tmp/s.json", "s", settled, {
+      evidence: async () => { classified++; return { state: "pending", plan: "# Still open" }; },
+      pidAlive: () => true,
+      post: async () => { throw new Error("a settled picker must never be re-opened"); },
+      now: () => NOW,
+    })).toBe("uncorrected");
+    expect(classified).toBe(0);
   });
 
-  test("settled done is not re-corrected outside the window, with a dead pid, or after later progress", async () => {
-    const settled = verifying({
+  test("an unadjudicated done is not re-corrected outside the window, with a dead pid, or after later progress", async () => {
+    const plainDone = verifying({
       planPickerVerificationPending: undefined,
-      planPickerSettled: true,
       lastEvent: "done", op: "done", prio: 0, sentDone: true, ts: NOW - 1_000,
     });
     let posts = 0;
     let classified = 0;
-    const outside = { ...settled, ts: NOW - PLAN_PICKER_RECENT_DONE_MS - 1 };
+    const outside = { ...plainDone, ts: NOW - PLAN_PICKER_RECENT_DONE_MS - 1 };
     expect(await correctPlanPickerVerification(cfg(), "/tmp/s.json", "s", outside, {
       evidence: async () => { classified++; return { state: "pending", plan: "# stale" }; },
       pidAlive: () => true,
       post: async () => { posts++; return "delivered"; },
       now: () => NOW,
     })).toBe("uncorrected");
-    expect(await correctPlanPickerVerification(cfg(), "/tmp/s.json", "s", settled, {
+    expect(await correctPlanPickerVerification(cfg(), "/tmp/s.json", "s", plainDone, {
       evidence: async () => { classified++; return { state: "pending", plan: "# dead" }; },
       pidAlive: () => false,
       post: async () => { posts++; return "delivered"; },
       now: () => NOW,
     })).toBe("uncorrected");
-    expect(await correctPlanPickerVerification(cfg(), "/tmp/s.json", "s", settled, {
+    // A daemon-fronted row: the app-server pid lives forever, so only the correlated TTY is evidence.
+    expect(await correctPlanPickerVerification(cfg(), "/tmp/s.json", "s", { ...plainDone, pid: 937, tuiPid: 64_799 }, {
+      evidence: async () => { classified++; return { state: "pending", plan: "# dead tui" }; },
+      pidAlive: (pid) => pid === 937,
+      post: async () => { posts++; return "delivered"; },
+      now: () => NOW,
+    })).toBe("uncorrected");
+    expect(await correctPlanPickerVerification(cfg(), "/tmp/s.json", "s", plainDone, {
       evidence: async () => { classified++; return { state: "resolved" }; },
       pidAlive: () => true,
       post: async () => { posts++; return "delivered"; },
       now: () => NOW,
     })).toBe("uncorrected");
     expect({ posts, classified }).toEqual({ posts: 0, classified: 1 });
+  });
+
+  test("a settled picker never re-opens: the two correctives converge instead of flapping", async () => {
+    // The production loop measured 2026-08-02: two daemon-fronted Codex sessions alternating
+    // set-pending ⇄ tui-exit every ~7.3s for 48 minutes (738 posted corrections). Each flip is a real
+    // prio-1 ⇄ done transition, i.e. one priority-10 Live Activity push, which alone burned the
+    // ActivityKit budget. The rollout's picker signature is durable (dismissal is never written to
+    // JSONL) so it classifies "pending" forever, and `record.pid` is the app-server DAEMON — always
+    // alive — so the recent-done backstop's liveness gate re-opened every settlement.
+    let current: SessionRecord = rec({
+      agent: "codex", transcript: "/tmp/019fb9a2.jsonl", lastEvent: "needsAttention",
+      op: "update", prio: 1, sentDone: false, pendingPlanPicker: true, planPickerPendingSince: NOW,
+      blob: "ATTENTION", title: "Plan?", pairingId: "p", ts: NOW, pid: 937, tuiPid: 64799,
+    });
+    const posts: Record<string, unknown>[] = [];
+    const deps = (now: number) => ({
+      state: async () => "pending" as const,
+      evidence: async () => ({ state: "pending" as const, plan: "# Still open" }),
+      threadWaitState: async () => "notWaitingOnUserInput" as const,
+      pidAlive: (pid: number) => pid === 937, // the daemon lives on; the TUI (64799) has exited
+      readRecord: async () => current,
+      writeRecord: async (_p: string, next: SessionRecord) => { current = next; },
+      post: async (body: object) => { posts.push(body as Record<string, unknown>); return "delivered" as const; },
+      now: () => now,
+    });
+    for (let sweep = 0; sweep < 6; sweep++) {
+      const at = NOW + sweep * 7_300;
+      await correctResolvedPlanPicker(cfg(), "/tmp/s.json", "s", current, deps(at));
+      await correctPlanPickerVerification(cfg(), "/tmp/s.json", "s", current, deps(at + 1_000));
+    }
+    // One terminal transition total. The dead TUI is decisive, and the settlement it wrote is a latch.
+    expect(posts.map((p) => p.op)).toEqual(["done"]);
+    expect(current).toMatchObject({ op: "done", lastEvent: "done", planPickerSettled: true });
+    expect(current.pendingPlanPicker).toBeUndefined();
   });
 
   test("decision trace covers open, daemon-idle ignored, blocked settlement, and eventual TTL done", async () => {

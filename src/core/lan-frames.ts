@@ -330,14 +330,35 @@ export function createLanFrameStore(deps: LanFrameStoreDeps = {}): LanFrameStore
   };
 
   /** Stamp a session's new state, unless it is byte-identical to what the map already holds. Returns
-   *  whether anything changed (the caller wakes the waiters ONCE per reconcile pass, not per session). */
+   *  whether anything changed (the caller wakes the waiters ONCE per reconcile pass, not per session).
+   *
+   *  PER-SESSION MONOTONIC `ts` — the one adjustment this store makes to what it was handed, and the
+   *  reason it exists: the phone's ordering guard drops a non-terminal frame whose stamp is not STRICTLY
+   *  above the row it would replace (CCLanFramesMerge.accepts), so a state change reported at a stamp we
+   *  have ALREADY reported for this session is a state change the phone throws away — and the row wedges
+   *  until some later hook happens to rewrite the record.
+   *
+   *  That collision is not hypothetical, it is structural, and the hold overlay sits on both edges of
+   *  it: the card is stamped max(record.ts, hold.at), so whenever hold.at ≤ record.ts the card AND the
+   *  record's own frame carry the identical number. Entering, the card cannot displace the yellow
+   *  needsAttention frame the phone already has; leaving, the released record cannot displace the card,
+   *  which strands dead Allow/Deny buttons on the row (the worker's copy cannot break the tie either —
+   *  it is FLOORED to whole seconds, so it never out-orders a LAN stamp for the same event).
+   *
+   *  So: content that genuinely CHANGED but did not advance is served one millisecond past the last
+   *  stamp we sent. It is an honest claim — this IS a later state than the one we already described —
+   *  and it is the whole rule, at the single choke point every frame in this store passes through.
+   *  UNCHANGED content still returns false above, so nothing here inflates on a quiet reconcile. */
   const stamp = (sessionId: string, content: LanFrameContent, retiredAt?: number): boolean => {
+    // Signed on the content AS GIVEN, never on the adjusted stamp: the signature's job is "is this the
+    // same state?", and comparing an already-inflated number would make every pass look different.
     const sig = `${retiredAt === undefined ? "live" : "term"}|${JSON.stringify(content)}`;
     const prev = entries.get(sessionId);
     if (prev && prev.sig === sig && (prev.retiredAt === undefined) === (retiredAt === undefined)) return false;
     counter += 1;
+    const ts = prev && content.ts <= prev.frame.ts ? prev.frame.ts + 1 : content.ts;
     entries.set(sessionId, {
-      frame: { seq: counter, sessionId, ...content },
+      frame: { seq: counter, sessionId, ...content, ts },
       sig,
       ...(retiredAt === undefined ? {} : { retiredAt }),
     });

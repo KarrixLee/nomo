@@ -11,6 +11,7 @@ import { encryptBlob, decryptBlob } from "./crypto";
 import { createLanAnswerStore, createLanListener } from "./lan-listener";
 import type { LanAnswerStore, LanListener } from "./lan-listener";
 import type { Config } from "./shared";
+import { PLUGIN_VERSION } from "./shared";
 
 // ---- summary builder (pure) ---------------------------------------------------------------
 
@@ -584,8 +585,15 @@ describe("runPermissionHook — hold state machine", () => {
     }) as never);
     expect(writes).toHaveLength(1);
     expect(writes[0].sessionId).toBe("sess-1");
-    // The marker carries the EXACT frame that was POSTed — one sealed card, two channels.
-    expect(writes[0].hold.blob).toBe(JSON.parse(calls.find((c) => c.method === "POST")!.body!).blob);
+    // The marker carries the SAME card that was POSTed — one frame, two channels — plus the `dbg`
+    // breadcrumb that names the channel. Everything the phone RENDERS must be identical; the tail is
+    // the only difference, and it is the whole point (see formatDecisionHoldDebug).
+    const posted = (await decryptBlob(KEY, JSON.parse(calls.find((c) => c.method === "POST")!.body!).blob)) as Record<string, unknown>;
+    const held = (await decryptBlob(KEY, writes[0].hold.blob)) as Record<string, unknown>;
+    expect({ ...held, dbg: undefined }).toEqual({ ...posted, dbg: undefined });
+    expect("dbg" in posted).toBe(false);
+    expect(held.dbg).toBe(`${PLUGIN_VERSION} ev:hold hold@1000 req:req-fixe pid:9001`);
+    expect(Object.keys(held).at(-1)).toBe("dbg");   // append-LAST, like every other blob tail
     expect(writes[0].hold.at).toBe(1000);
     expect(writes[0].hold.pid).toBe(9_001);   // the HOLDING process, so the feed can probe its liveness
     // Answered → retired, keyed by the same owner pid (compare-and-clear: a parallel tool's LATER hold

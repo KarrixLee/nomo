@@ -24,7 +24,8 @@ import { hostname } from "node:os";
 import { basename, isAbsolute, relative, resolve } from "node:path";
 import { runHook, buildBlob, OpPlan } from "./hook";
 import {
-  AgentKind, atomicWrite, BLOB_FIT_CHARS, CC_DIR, clearDecisionHold, codexHome, Config, DecisionHold, flagExists,
+  AgentKind, appendFittedPlanAndDebug, atomicWrite, BLOB_FIT_CHARS, CC_DIR, clearDecisionHold, codexHome, Config,
+  DecisionHold, flagExists, formatDecisionHoldDebug,
   fullTextForRecord, loadConfig, NO_HOLD_PATH,
   PLUGIN_VERSION, readPrefix, readRecord, readSuffix, sealedBlobChars, SessionRecord, stampPermissionDetailFull,
   writeDecisionHold,
@@ -1358,8 +1359,23 @@ export async function runPermissionHook(deps: PermissionHookDeps = {}, agent: Ag
     //
     // AWAITED, and BEFORE the poll loop, for the same reason the detail tee is: the phone must never be
     // able to see the card before the local state that describes it is on disk. Best-effort inside.
+    //
+    // The MARKER's card is re-sealed with a `dbg` tail (see formatDecisionHoldDebug) — the SAME card,
+    // plus the one line that tells a diagnosing user which channel painted the row on their phone. The
+    // WORKER's copy (`blob`, already POSTed above) is deliberately left untouched: the two blobs differ
+    // in exactly that line, which is what makes the difference legible. Best-effort by construction — a
+    // seal that throws must not cost the user their approval, so the plain card is the fallback.
+    const holdAt = (deps.now ?? Date.now)();
+    const holdPid = deps.holdPid ?? process.pid;
+    let holdBlob = blob;
+    try {
+      holdBlob = await encryptBlob(config.e2eKey, appendFittedPlanAndDebug(
+        permissionFrame(permissionBase, fitted.detail, fitted.omitted, fitted.questions), undefined,
+        formatDecisionHoldDebug({ at: holdAt, requestId, pid: holdPid }),
+      ));
+    } catch { /* the card without its breadcrumb is still the card */ }
     await (deps.writeHoldFn ?? defaultWriteHold())(
-      sessionId, { blob, at: (deps.now ?? Date.now)(), pid: deps.holdPid ?? process.pid },
+      sessionId, { blob: holdBlob, at: holdAt, pid: holdPid },
     );
     heldSessionId = sessionId;
 
