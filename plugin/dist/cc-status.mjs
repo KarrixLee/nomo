@@ -102,7 +102,7 @@ import { appendFileSync, existsSync, readFileSync, statSync, truncateSync } from
 import { execFileSync, spawn } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "1.5.1";
+var PLUGIN_VERSION = "1.5.2";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -111,6 +111,10 @@ function debugToken(value) {
 }
 function formatPlanPickerDebug(input) {
   const value = `${debugToken(input.version ?? PLUGIN_VERSION)} ev:${debugToken(input.event)} cls:${debugToken(input.classifier)} mk:${input.marker ?? "0"} dq:${input.daemon ?? "na"}(${input.daemonDisposition ?? "na"}) ttl:${debugToken(input.ttl ?? "-")} by:${input.by}`;
+  return Array.from(value).slice(0, DBG_BLOB_TEXT_MAX_CHARS).join("");
+}
+function formatDecisionHoldDebug(input) {
+  const value = `${debugToken(input.version ?? PLUGIN_VERSION)} ev:hold hold@${Math.floor(input.at)} req:${debugToken(input.requestId.slice(0, 8))} pid:${input.pid}`;
   return Array.from(value).slice(0, DBG_BLOB_TEXT_MAX_CHARS).join("");
 }
 var CC_DIR = `${process.env.HOME}/.config/cc-status`;
@@ -478,15 +482,37 @@ async function completePendingPairing(pending, configPath, opts = {}) {
 function isWatchdogCommand(psCommand) {
   return psCommand.includes("cc-watchdog");
 }
-function formatWatchdogPidfile(pid, version = PLUGIN_VERSION) {
-  return `${pid} ${version}`;
+function watchdogBuildStamp(path = WATCHDOG_PATH) {
+  try {
+    const bytes = readFileSync(path);
+    let hash = 2166136261;
+    for (let i = 0;i < bytes.length; i++) {
+      hash ^= bytes[i];
+      hash = Math.imul(hash, 16777619);
+    }
+    return (hash >>> 0).toString(36);
+  } catch {
+    return;
+  }
+}
+function watchdogBuildDiffers(incumbent, current) {
+  if (incumbent === undefined || current === undefined)
+    return false;
+  return incumbent !== current;
+}
+function formatWatchdogPidfile(pid, version = PLUGIN_VERSION, build) {
+  return `${pid} ${version}${typeof build === "string" && build.length > 0 ? ` ${build}` : ""}`;
 }
 function parseWatchdogPidfile(raw) {
-  const [pidField, versionField] = raw.trim().split(/\s+/);
+  const [pidField, versionField, buildField] = raw.trim().split(/\s+/);
   const pid = Number.parseInt(pidField ?? "", 10);
   if (!Number.isFinite(pid) || pid <= 0)
     return null;
-  return { pid, ...typeof versionField === "string" && versionField.length > 0 ? { version: versionField } : {} };
+  return {
+    pid,
+    ...typeof versionField === "string" && versionField.length > 0 ? { version: versionField } : {},
+    ...typeof buildField === "string" && buildField.length > 0 ? { build: buildField } : {}
+  };
 }
 function watchdogHolderIsLive(pid, deps = {}) {
   const isAlive = deps.isAlive ?? pidAlive;
@@ -506,6 +532,7 @@ function ensureWatchdog(deps = {}) {
       return;
     const pidPath = deps.pidPath ?? WATCHDOG_PID_PATH;
     const version = deps.version ?? PLUGIN_VERSION;
+    const build = "build" in deps ? deps.build : watchdogBuildStamp();
     const readPidfile = deps.readPidfile ?? (() => {
       try {
         return readFileSync(pidPath, "utf8");
@@ -521,7 +548,7 @@ function ensureWatchdog(deps = {}) {
     const raw = readPidfile();
     const holder = typeof raw === "string" ? parseWatchdogPidfile(raw) : null;
     if (holder && watchdogHolderIsLive(holder.pid, deps)) {
-      if (holder.version === version)
+      if (holder.version === version && !watchdogBuildDiffers(holder.build, build))
         return;
       try {
         killPid(holder.pid, "SIGTERM");
