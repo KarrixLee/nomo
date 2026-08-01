@@ -408,6 +408,121 @@ describe("startCodexRemoteInput", () => {
     }
   });
 
+  // ABORT DURING THE POST. The worker creates the hold (pending decision + shown-set enrollment + violet
+  // island push) the moment the POST lands; if the Mac answers while that POST is in flight, the abort
+  // must NOT skip retirement — the phone would keep a live Answer/Deny card for a dead prompt until the
+  // worker's ~30s sweep. The fetch must also be signed with the caller's signal, or `controller.abort()`
+  // cannot cancel it at all and the race window is the whole POST duration.
+  test("an abort that lands while the hold POST resolves still retires the created hold", async () => {
+    const calls: string[] = [];
+    let postSignal: AbortSignal | undefined;
+    let releasePost!: () => void;
+    const postGate = new Promise<void>((resolve) => { releasePost = resolve; });
+    let markPosted!: () => void;
+    const posted = new Promise<void>((resolve) => { markPosted = resolve; });
+    const handle = startCodexRemoteInput(request(), {
+      config,
+      fetchFn: (async (input, init) => {
+        const url = String(input); calls.push(url);
+        if (url.endsWith("/v1/cc/decision")) {
+          postSignal = init?.signal ?? undefined;
+          markPosted();
+          await postGate;                       // the worker commits the hold while Desktop answers
+          return Response.json({ hold: true });
+        }
+        return Response.json({ ok: true });
+      }) as typeof fetch,
+      readRecordFn: async () => record,
+      randomUUID: () => "relay-race",
+      localApprovalsStateFn: async () => "on",
+      sleep: async () => {},
+      answerAppServer: async () => "sent",
+      interruptAppServer: async () => "sent",
+    });
+
+    await posted;
+    const resolving = handle.resolvedElsewhere();  // Desktop wins the race, POST still in flight
+    expect(postSignal?.aborted).toBe(true);        // the caller's abort really reaches the fetch
+    releasePost();
+    await resolving;
+
+    expect(await handle.completion).toBe("resolved-elsewhere");
+    expect(calls.filter((url) => url.endsWith("/v1/cc/decision/resolve"))).toHaveLength(1);
+  });
+
+  // DEFINITIVE poll statuses — same rule as the permission hook's poll loop. A revoked pairing or a
+  // cleared record can never heal, so riding MAX_CONSECUTIVE_MISSES (100 × 3s ≈ 5 min) burns the shared
+  // per-pairing poll budget and starves genuinely live holds into 429s.
+  for (const status of [401, 403, 404, 410]) {
+    test(`a poll answering ${status} twice gives up at once (2 GETs, not the 100-miss cap)`, async () => {
+      let polls = 0;
+      const handle = startCodexRemoteInput(request(), {
+        config,
+        fetchFn: (async (input) => {
+          if (String(input).endsWith("/v1/cc/decision")) return Response.json({ hold: true });
+          polls += 1;
+          return new Response("", { status });
+        }) as typeof fetch,
+        readRecordFn: async () => record,
+        randomUUID: () => "relay-definitive",
+        localApprovalsStateFn: async () => "on",
+        sleep: async () => {},
+        answerAppServer: async () => "sent",
+        interruptAppServer: async () => "sent",
+      });
+
+      expect(await handle.completion).toBe("transport-error");
+      expect(polls).toBe(2); // MAX_DEFINITIVE_POLL_FAILURES
+    });
+  }
+
+  test("a SINGLE definitive status is tolerated — a racing delete/deploy must not kill a live hold", async () => {
+    const answerBlob = await encryptBlob(key, {
+      requestId: "relay-single", decision: "answer", answers: ["Fast"],
+    });
+    let polls = 0;
+    const handle = startCodexRemoteInput(request(), {
+      config,
+      fetchFn: (async (input) => {
+        if (String(input).endsWith("/v1/cc/decision")) return Response.json({ hold: true });
+        polls += 1;
+        if (polls === 1 || polls === 3) return new Response("", { status: 404 });
+        if (polls === 2) return Response.json({ status: "pending" });   // breaks the strike streak
+        return Response.json({ status: "answered", answerBlob });
+      }) as typeof fetch,
+      readRecordFn: async () => record,
+      randomUUID: () => "relay-single",
+      localApprovalsStateFn: async () => "on",
+      sleep: async () => {},
+      answerAppServer: async () => "sent",
+      interruptAppServer: async () => "sent",
+    });
+
+    expect(await handle.completion).toBe("answered");
+    expect(polls).toBe(4);
+  });
+
+  test("429/5xx stay TRANSIENT — they ride the miss cap, never the definitive give-up", async () => {
+    let polls = 0;
+    const handle = startCodexRemoteInput(request(), {
+      config,
+      fetchFn: (async (input) => {
+        if (String(input).endsWith("/v1/cc/decision")) return Response.json({ hold: true });
+        polls += 1;
+        return new Response("", { status: polls === 1 ? 429 : 500 });
+      }) as typeof fetch,
+      readRecordFn: async () => record,
+      randomUUID: () => "relay-transient",
+      localApprovalsStateFn: async () => "on",
+      sleep: async () => {},
+      answerAppServer: async () => "sent",
+      interruptAppServer: async () => "sent",
+    });
+
+    expect(await handle.completion).toBe("transport-error");
+    expect(polls).toBe(100); // MAX_CONSECUTIVE_MISSES, unchanged
+  });
+
   test("Desktop resolution before hold creation aborts without creating or resolving an orphan", async () => {
     const calls: string[] = [];
     let releaseRecord!: () => void;

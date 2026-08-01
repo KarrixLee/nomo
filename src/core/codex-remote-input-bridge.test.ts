@@ -47,6 +47,8 @@ const request: CodexUserInputRequest = {
 
 class FakeClient {
   state: CodexAppServerState = "stopped";
+  /** Requests the real client hands back through onUserInputResolved while DISCONNECTING (stop()). */
+  resolveOnStop: CodexUserInputRequest[] = [];
   pages: CodexLoadedThreadListResult[] = [];
   resumed: string[] = [];
   answers: { identity: CodexUserInputRequestIdentity; answers: CodexUserInputAnswers }[] = [];
@@ -56,7 +58,11 @@ class FakeClient {
 
   constructor(readonly callbacks: CodexRemoteInputBridgeCallbacks) {}
   async start(): Promise<boolean> { this.state = "ready"; this.callbacks.onStateChange("ready"); return true; }
-  async stop(): Promise<void> { this.state = "stopped"; this.callbacks.onStateChange("stopped"); }
+  async stop(): Promise<void> {
+    for (const request of this.resolveOnStop) this.callbacks.onUserInputResolved(request, "connection-lost");
+    this.state = "stopped";
+    this.callbacks.onStateChange("stopped");
+  }
   async listLoadedThreads(): Promise<CodexLoadedThreadListResult> {
     return this.pages.shift() ?? { data: [], nextCursor: null };
   }
@@ -90,13 +96,16 @@ function deferred<T>() {
   return { promise, resolve, reject };
 }
 
-function harness() {
+/** `retirement` models the in-flight POST /cc/decision/resolve: until it settles, the phone still shows
+ *  a live card. `resolved` counts retirement STARTS, `retired` counts COMPLETIONS. */
+function harness(options: { retirement?: () => Promise<void> } = {}) {
   let client!: FakeClient;
   const errors: Error[] = [];
   const handles: {
     request: CodexUserInputRequest;
     completion: ReturnType<typeof deferred<CodexRemoteInputResult>>;
     resolved: number;
+    retired: number;
     answer: (answers: CodexUserInputAnswers) => Promise<CodexUserInputAnswerResult>;
     interrupt: () => Promise<CodexUserInputInterruptResult>;
   }[] = [];
@@ -109,14 +118,26 @@ function harness() {
         request: incoming,
         completion,
         resolved: 0,
+        retired: 0,
         answer: deps.answerAppServer,
         interrupt: deps.interruptAppServer,
       };
       handles.push(item);
+      // Memoized exactly like the real handle, so a double retirement is one POST.
+      let retirement: Promise<void> | undefined;
       return {
         requestId: `relay-${handles.length}`,
         completion: completion.promise,
-        async resolvedElsewhere() { item.resolved += 1; completion.resolve("resolved-elsewhere"); },
+        resolvedElsewhere() {
+          if (retirement) return retirement;
+          item.resolved += 1;
+          retirement = (async () => {
+            await options.retirement?.();
+            item.retired += 1;
+            completion.resolve("resolved-elsewhere");
+          })();
+          return retirement;
+        },
       };
     },
   });
@@ -208,6 +229,44 @@ describe("CodexRemoteInputBridge", () => {
     } finally {
       process.off("unhandledRejection", capture);
     }
+  });
+
+  // stop() used to snapshot the handle map AFTER client.stop(), but the disconnect routes every pending
+  // request through onUserInputResolved, which deletes the handle and fires its retirement
+  // fire-and-forget — so the snapshot was empty, `Promise.allSettled([])` resolved instantly, and the
+  // in-flight POST /cc/decision/resolve calls died with the process. The phone then kept live
+  // Answer/Deny cards for dead prompts. Both orderings (retired BY the disconnect, and still-open at
+  // stop time) must be awaited.
+  test("stop() waits for every retirement POST — including the ones the disconnect started", async () => {
+    // One INDEPENDENT gate per retirement, so the test can prove which POSTs stop() actually awaits.
+    const gates: Array<() => void> = [];
+    const h = harness({ retirement: () => new Promise<void>((resolve) => { gates.push(resolve); }) });
+    const settle = (): Promise<void> => new Promise<void>((resolve) => { setTimeout(resolve, 5); });
+    await h.bridge.start();
+    const second = { ...request, identity: { ...request.identity, itemId: "item-2" } };
+    h.client().callbacks.onUserInputRequest(request);
+    h.client().callbacks.onUserInputRequest(second);
+    expect(h.handles).toHaveLength(2);
+    h.client().resolveOnStop.push(second); // the disconnect resolves this one from inside client.stop()
+
+    let stopped = false;
+    const stopping = h.bridge.stop().then(() => { stopped = true; });
+    await settle();
+    expect(stopped).toBe(false);                                   // still waiting on the resolve POSTs
+    expect(h.handles.map((item) => item.resolved)).toEqual([1, 1]); // both retirements STARTED, once each
+    expect(gates).toHaveLength(2);                                 // gates[0] = the disconnect's, gates[1] = the still-open handle's
+
+    // Releasing ONLY the handle stop() itself retired is not enough: the disconnect's retirement — the
+    // one the old snapshot-after-stop() ordering abandoned — must be awaited too.
+    gates[1]();
+    await settle();
+    expect(stopped).toBe(false);
+    expect(h.handles.map((item) => item.retired)).toEqual([1, 0]);
+
+    gates[0]();
+    await stopping;
+    expect(stopped).toBe(true);
+    expect(h.handles.map((item) => item.retired)).toEqual([1, 1]); // both COMPLETED before stop() resolved
   });
 
   test("does not retire the relay as resolved elsewhere after its own turn interrupt", async () => {

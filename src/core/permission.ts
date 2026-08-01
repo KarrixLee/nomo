@@ -5,8 +5,10 @@
 // while the phone decides; otherwise it falls straight through to the normal terminal dialog.
 //
 // CONTRACT — this module DELIBERATELY breaks the plugin's "2s, never block" rule that every other
-// entry keeps (see hook.ts:12-14 and cc-watchdog.ts's header). Each individual fetch still has a 2s
-// ceiling, but the TOTAL wait is unbounded: the hook polls until the phone answers, the request is
+// entry keeps (see hook.ts:12-14 and cc-watchdog.ts's header). Every poll fetch still has a 2s ceiling
+// and the one blocking POST has a 4s one (so a dead network costs ~6s BEFORE the dialog, never the ~33s
+// the old 15s×2 ceiling cost — see POST_FIRST_CONTACT_TIMEOUT_MS), but the TOTAL wait ONCE A HOLD IS
+// GRANTED is unbounded: the hook polls until the phone answers, the request is
 // expired/superseded server-side, sustained downlink failure trips the give-up cap, or the process is
 // killed (Esc at the terminal). Fail-open is absolute — any network error, timeout, non-200, decrypt
 // failure, or unpaired/misconfigured state exits 0 with NOTHING on stdout, so the terminal dialog
@@ -39,15 +41,33 @@ const POLL_INTERVAL_MS = 3_000;
 /** Per-fetch ceiling for the poll GETs — the "2s" half of the contract survives; only the TOTAL wait
  *  is unbounded. */
 const FETCH_TIMEOUT_MS = 2_000;
-/** The initial decision POST is DELIBERATELY allowed to block (the 2s reflex is wrong here): the
- *  worker's decision route can legitimately take a few seconds (cold isolate, an APNs push on the
- *  request path, network variance), and a 2s ceiling starved every real hold into a fail-open exit
- *  before anyone could poll. Give ONLY this POST a generous deadline. */
-const POST_TIMEOUT_MS = 15_000;
-/** One retry of the initial POST on a timeout/network error (never on a non-ok HTTP status — that is a
- *  real answer). The retry re-POSTs the SAME requestId + blobs: the worker's supersede no-ops on an
- *  identical id and putDecision idempotently re-stores the pending record, so a re-POST after a first
- *  attempt that actually reached the worker is safe. */
+/** FIRST-CONTACT ceiling for the decision POST — the ONE fetch the terminal dialog waits behind before
+ *  it is either held (phone card up) or released (normal dialog). It is deliberately LONGER than the
+ *  poll's 2s (the worker's decision route can take a moment: cold isolate, KV reads, the gate checks)
+ *  and deliberately MUCH SHORTER than the 15s it used to be.
+ *
+ *  WHY IT SHRANK: at 15s × POST_MAX_ATTEMPTS + POST_RETRY_PAUSE_MS + the 2s did-it-land probe, a
+ *  captive portal / hung proxy / half-open TCP froze the terminal for ~33s on EVERY permission prompt
+ *  (~50s on the fresh-session re-ask path) — a hostile failure mode for a hook whose whole contract is
+ *  "never block on our infrastructure". A worker that is reachable at all answers this route in well
+ *  under a second; a stall past a few seconds means the network is gone, and the only useful thing to do
+ *  with that answer is fail open NOW.
+ *
+ *  WORST-CASE PRE-DIALOG BLOCK, stalled network: POST_FIRST_CONTACT_TIMEOUT_MS (4s) + FETCH_TIMEOUT_MS
+ *  (2s did-it-land probe) ≈ 6s, because a TIMEOUT is never retried (see POST_MAX_ATTEMPTS). A network
+ *  that fails FAST (connection refused, DNS NXDOMAIN) costs ~0 + POST_RETRY_PAUSE_MS + ~0 + 2s ≈ 3s.
+ *  Both stay under the ~10s bar. The fresh-session re-ask (HOLD_RETRY_DELAY_MS + one more short POST)
+ *  rides on top of that, but ONLY on the path where the worker already ANSWERED — i.e. it is reachable,
+ *  so it is never the dead-network case. Once a hold IS granted the wait becomes unbounded ON PURPOSE
+ *  (the phone owns the dialog) and every fetch from there on is a 2s poll GET. */
+const POST_FIRST_CONTACT_TIMEOUT_MS = 4_000;
+/** One retry of the initial POST — but ONLY when the first attempt failed FAST (connection refused,
+ *  DNS, reset). A TIMEOUT is NOT retried: the network is stalled, a second stall buys no new information
+ *  and doubles the freeze, and the did-it-land probe below already covers the "it actually landed" case.
+ *  A non-ok HTTP status is never retried either — that is a real answer. The retry re-POSTs the SAME
+ *  requestId + blobs (with a FRESH `ts`, see postDecision): the worker's supersede no-ops on an identical
+ *  id and putDecision idempotently re-stores the pending record, so a re-POST after a first attempt that
+ *  actually reached the worker is safe. */
 const POST_MAX_ATTEMPTS = 2;
 /** Pause before the single POST retry. */
 const POST_RETRY_PAUSE_MS = 1_000;
@@ -72,11 +92,16 @@ const MAX_CONSECUTIVE_MISSES = 100;
  *  every remaining poll of this request is guaranteed to fail the same way. Mirrors runHook's gone-strike
  *  set (404/410) plus the auth pair (401/403) — there, a gone response tears the pairing down; here it
  *  only means "stop waiting". Anything else (429, 5xx, a transport throw) stays transient and rides the
- *  MAX_CONSECUTIVE_MISSES cap. */
-const DEFINITIVE_POLL_STATUSES = new Set([401, 403, 404, 410]);
+ *  MAX_CONSECUTIVE_MISSES cap.
+ *
+ *  EXPORTED as the transport-layer rule for polling `/v1/cc/decision/:id`, not as a permission-hook
+ *  detail: codex-remote-input.ts polls the SAME relay route with the same pairing credentials and must
+ *  give up on the same evidence (it already imports this module's wire helpers). Per-agent behavior lives
+ *  in core/adapter.ts; this is transport. */
+export const DEFINITIVE_POLL_STATUSES = new Set([401, 403, 404, 410]);
 /** …and, like the gone strike, a SINGLE definitive response can be a racing delete/deploy, so require
  *  this many CONSECUTIVE ones before releasing. 2 ⇒ ~3 s to the terminal dialog instead of ~5.4 min. */
-const MAX_DEFINITIVE_POLL_FAILURES = 2;
+export const MAX_DEFINITIVE_POLL_FAILURES = 2;
 /** How many times the SAME terminal `answered` record may be re-read with a decision verb we do not
  *  recognize before the hold is released. An answered record is TERMINAL server-side (a re-answer 409s
  *  and the same blob is served for the record's whole 24h TTL), so a verb we can never understand would
@@ -970,32 +995,62 @@ export async function runPermissionHook(deps: PermissionHookDeps = {}, agent: Ag
     const pcHeaders = { "x-cc-pairing": config.pairingId, "x-cc-auth": config.pcSecret, "x-cc-version": PLUGIN_VERSION };
     const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
 
-    // The initial POST is the one place this hook is ALLOWED to block: give it POST_TIMEOUT_MS and one
-    // retry on a timeout/network error (a non-ok HTTP status is a real answer — never retried). Any HTTP
-    // response ends the loop; only both attempts failing at the transport layer fails open. `round` (1 =
-    // initial, 2 = post-race re-ask) is threaded through the trace alongside `attempt` (the per-round
-    // transport retry) so both rounds are legible in the log.
-    const postDecision = async (round: number, maxAttempts: number): Promise<{ posted: boolean; hold: boolean }> => {
+    // The initial POST is the one place this hook is ALLOWED to block, and it is bounded tightly (see
+    // POST_FIRST_CONTACT_TIMEOUT_MS for the worst-case pre-dialog arithmetic). One retry, and ONLY after a
+    // FAST transport failure — a timeout ends the round at once. A non-ok HTTP status is a real answer and
+    // is never retried. `round` (1 = initial, 2 = post-race re-ask) is threaded through the trace alongside
+    // `attempt` (the per-round transport retry) so both rounds are legible in the log.
+    //
+    // FRESH `ts` PER ATTEMPT. Every POST must carry a STRICTLY NEWER timestamp than the last one this hook
+    // sent. The hold:false path is not a no-op server-side: the worker stores/pushes the fallback frame,
+    // which stamps the session row's `lastTs` with the ts we just sent. Re-POSTing the SAME ts then trips
+    // the worker's ordering guard (`env.ts <= existing.lastTs` → drop "stale" → hold:false
+    // "stale-session"), so the HOLD_RETRY_DELAY_MS re-ask — the ONE mechanism that recovers a fresh
+    // session's first prompt from the island auto-add race — could never succeed. `lastPostTs + 1` also
+    // covers a coarse/frozen clock, where two reads inside the retry window can return the same ms.
+    let lastPostTs = 0;
+    const postDecision = async (
+      round: number, maxAttempts: number,
+    ): Promise<{ posted: boolean; hold: boolean; reason?: string }> => {
       let hold = false;
       let posted = false;
+      let reason: string | undefined;
       for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+        const ts = Math.max((deps.now ?? Date.now)(), lastPostTs + 1);
+        lastPostTs = ts;
         try {
           const res = await fetchFn(`${config.url}/v1/cc/decision`, {
             method: "POST",
             headers: { "content-type": "application/json", ...pcHeaders },
-            body: JSON.stringify({ v: 2, sessionId, requestId, op: "update", prio: 1, ts: now, blob, fallbackBlob }),
-            signal: AbortSignal.timeout(POST_TIMEOUT_MS),
+            body: JSON.stringify({ v: 2, sessionId, requestId, op: "update", prio: 1, ts, blob, fallbackBlob }),
+            signal: AbortSignal.timeout(POST_FIRST_CONTACT_TIMEOUT_MS),
           });
-          trace({ event: "posted", requestId, round, attempt, status: res.status });
-          if (res.ok) hold = ((await res.json()) as { hold?: unknown }).hold === true;
+          if (res.ok) {
+            // A 200 whose body we cannot read (captive portal, edge interposition) is NOT a transport
+            // failure to retry behind another ceiling — it just isn't a hold.
+            const body = (await res.json().catch(() => ({}))) as { hold?: unknown; reason?: unknown };
+            hold = body.hold === true;
+            if (typeof body.reason === "string") reason = body.reason;
+          }
+          // The worker names the FIRST failing gate in `reason` (stale-session / toggle-off /
+          // no-activity). Without it a field trace of a prompt that fell open is unfalsifiable — a
+          // re-ask killed by the staleness guard looks exactly like the user having approvals off.
+          trace({
+            event: "posted", requestId, round, attempt, status: res.status, ts,
+            ...(res.ok ? { hold } : {}), ...(reason !== undefined ? { reason } : {}),
+          });
           posted = true;
           break; // any HTTP response (ok or not) is a real answer — do not retry
         } catch (e) {
-          trace({ event: "posted", requestId, round, attempt, status: 0, error: (e as { name?: string })?.name ?? "Error" });
-          if (attempt < maxAttempts) { await sleep(POST_RETRY_PAUSE_MS); continue; } // retry the timed-out/failed POST once
+          const name = (e as { name?: string })?.name ?? "Error";
+          trace({ event: "posted", requestId, round, attempt, status: 0, ts, error: name });
+          // A TIMEOUT means the network is stalled: retrying only doubles the terminal freeze for the
+          // same answer. Anything else failed FAST, so one cheap retry is worth it.
+          if (name === "TimeoutError") break;
+          if (attempt < maxAttempts) { await sleep(POST_RETRY_PAUSE_MS); continue; }
         }
       }
-      return { posted, hold };
+      return { posted, hold, reason };
     };
 
     // ONE poll GET of this request's decision record. Shared by the post-timeout probe below and the hold
@@ -1024,7 +1079,7 @@ export async function runPermissionHook(deps: PermissionHookDeps = {}, agent: Ag
       }
     };
 
-    let { posted, hold } = await postDecision(1, POST_MAX_ATTEMPTS);
+    let { posted, hold, reason: holdReason } = await postDecision(1, POST_MAX_ATTEMPTS);
     if (!posted) {
       // Both POSTs failed at the TRANSPORT layer — but a client-side timeout says nothing about whether
       // the request LANDED. If the first one did, the worker is holding a real record and the phone is
@@ -1037,8 +1092,9 @@ export async function runPermissionHook(deps: PermissionHookDeps = {}, agent: Ag
       if (!live) { trace({ event: "exit", reason: "post-error" }); return; }
       trace({ event: "post-timeout-landed", status: probe.data?.status });
       hold = true;
+      holdReason = undefined;
     }
-    trace({ event: "hold", hold });
+    trace({ event: "hold", hold, ...(holdReason !== undefined ? { reason: holdReason } : {}) });
     if (!hold) {
       // hold:false on the FIRST ask is usually genuine (session not on the phone), but a brand-new
       // session's first prompt can lose a race with the app's island auto-add. Re-ask ONLY when that
@@ -1047,16 +1103,18 @@ export async function runPermissionHook(deps: PermissionHookDeps = {}, agent: Ag
       // tax on every prompt).
       const fresh = !record || (now - record.ts) < FRESH_SESSION_MS;
       if (!fresh) { trace({ event: "exit", reason: "hold-false" }); return; } // established session → instant terminal dialog
-      // Wait once, then re-POST the SAME requestId/blobs (single attempt, no transport retry): a
-      // hold:false POST stored no record, so this is a clean fresh gate evaluation. hold:true now → the
-      // session showed up, fall through to the poll loop; still hold:false (or a transport error) → the
-      // genuine fall-open.
+      // Wait once, then re-POST the SAME requestId/blobs with a FRESH, strictly-newer `ts` (single
+      // attempt, no transport retry): the first POST created no DECISION record, so this is a clean fresh
+      // gate evaluation — but it DID stamp the session row, which is exactly why the new ts is load-bearing
+      // (see postDecision). hold:true now → the session showed up, fall through to the poll loop; still
+      // hold:false (or a transport error) → the genuine fall-open.
       trace({ event: "hold-retry-wait", delayMs: HOLD_RETRY_DELAY_MS });
       await sleep(HOLD_RETRY_DELAY_MS);
       const retry = await postDecision(2, 1);
       if (!retry.posted) { trace({ event: "exit", reason: "hold-false" }); return; } // re-ask failed at transport → fall open
       hold = retry.hold;
-      trace({ event: "hold", hold });
+      holdReason = retry.reason;
+      trace({ event: "hold", hold, ...(holdReason !== undefined ? { reason: holdReason } : {}) });
       if (!hold) { trace({ event: "exit", reason: "hold-false" }); return; } // still not shown → worker applied the attention update → terminal dialog
     }
 

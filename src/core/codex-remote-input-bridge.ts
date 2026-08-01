@@ -75,6 +75,11 @@ export class CodexRemoteInputBridge {
   private readonly onError: CodexRemoteInputBridgeOptions["onError"];
   private readonly subscribedThreads = new Set<string>();
   private readonly handles = new Map<string, CodexRemoteInputHandle>();
+  /** In-flight `resolvedElsewhere()` retirements (each POST /cc/decision/resolve). Tracked so stop() can
+   *  await them: the disconnect inside client.stop() routes every pending request through onResolved,
+   *  which starts a retirement fire-and-forget — abandoning those POSTs on process exit leaves the phone
+   *  showing live Answer/Deny cards for dead prompts. */
+  private readonly pendingRetirements = new Set<Promise<void>>();
   private refreshPromise: Promise<void> | undefined;
   private stopping = false;
 
@@ -136,13 +141,29 @@ export class CodexRemoteInputBridge {
     }
   }
 
+  /** Start one handle's retirement and REMEMBER the promise, so stop() can wait for the POST that tells
+   *  the worker the card is dead. `resolvedElsewhere()` is idempotent (it memoizes its own promise), so
+   *  retiring a handle onResolved already retired is a free no-op. */
+  private retire(handle: CodexRemoteInputHandle, fallback: string): void {
+    const retirement = handle.resolvedElsewhere().catch((error: unknown) => this.reportError(error, fallback));
+    this.pendingRetirements.add(retirement);
+    retirement.then(() => { this.pendingRetirements.delete(retirement); }).catch(() => undefined);
+  }
+
   async stop(): Promise<void> {
     if (this.stopping) return;
     this.stopping = true;
-    await this.client.stop();
+    // SNAPSHOT FIRST. client.stop() disconnects, and the disconnect routes every pending request through
+    // onResolved, which DELETES the handle and starts its retirement — so a snapshot taken afterwards is
+    // empty and `Promise.allSettled([])` resolved instantly, abandoning the in-flight resolve POSTs the
+    // moment the process exited. Retiring from the pre-stop snapshot AND awaiting `pendingRetirements`
+    // (which onResolved feeds through the same helper) covers both orderings.
     const handles = [...this.handles.values()];
+    await this.client.stop();
+    for (const handle of this.handles.values()) handles.push(handle); // anything started during stop()
     this.handles.clear();
-    await Promise.allSettled(handles.map((handle) => handle.resolvedElsewhere()));
+    for (const handle of new Set(handles)) this.retire(handle, "Failed to retire a Codex phone card");
+    await Promise.allSettled([...this.pendingRetirements]);
     this.subscribedThreads.clear();
   }
 
@@ -200,8 +221,7 @@ export class CodexRemoteInputBridge {
     // A response/interrupt sent by this bridge is the acknowledgement for our own phone action. Every
     // other resolution means Desktop, another interrupt, or a disconnect won; retire the phone card.
     if (resolution !== "response-sent" && resolution !== "interrupt-sent") {
-      handle.resolvedElsewhere().catch((error: unknown) =>
-        this.reportError(error, "Failed to retire a Codex phone card"));
+      this.retire(handle, "Failed to retire a Codex phone card");
     }
   }
 

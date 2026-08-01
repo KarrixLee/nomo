@@ -7,7 +7,8 @@ import { decryptBlob, encryptBlob } from "./crypto";
 import { requestUserInputDetail } from "./adapter";
 import {
   BLOB_FIT_CHARS, buildPermissionQuestions, buildPermissionSummary, capPermissionWireText,
-  fitPermissionDetail, PERMISSION_QUESTION_LABEL_MAX,
+  DEFINITIVE_POLL_STATUSES, fitPermissionDetail, MAX_DEFINITIVE_POLL_FAILURES,
+  PERMISSION_QUESTION_LABEL_MAX,
 } from "./permission";
 import {
   Config, localApprovalsState, PLUGIN_VERSION, readRecord, SessionRecord,
@@ -138,6 +139,27 @@ function baseBlob(
   };
 }
 
+/** The signal for ONE relay fetch: its own deadline OR the caller's abort, whichever fires first.
+ *
+ *  Signing a fetch with `AbortSignal.timeout(...)` alone left `controller.abort()` unable to cancel an
+ *  in-flight request, so a prompt resolved on the Mac kept its POST/GET running for the whole timeout —
+ *  the exact window in which the worker can create a hold nobody is left to retire. `AbortSignal.any`
+ *  exists on Node >= 20.3 / Bun; the manual fallback keeps this module runnable on Node 18, where
+ *  `AbortSignal.timeout` exists but `.any` does not. */
+function requestSignal(ms: number, signal: AbortSignal): AbortSignal {
+  const deadline = AbortSignal.timeout(ms);
+  const any = (AbortSignal as unknown as { any?: (signals: AbortSignal[]) => AbortSignal }).any;
+  if (typeof any === "function") return any.call(AbortSignal, [signal, deadline]);
+  const controller = new AbortController();
+  const abort = (): void => controller.abort();
+  if (signal.aborted || deadline.aborted) controller.abort();
+  else {
+    signal.addEventListener("abort", abort, { once: true });
+    deadline.addEventListener("abort", abort, { once: true });
+  }
+  return controller.signal;
+}
+
 function abortableSleep(ms: number, signal: AbortSignal, sleep: (ms: number) => Promise<void>): Promise<void> {
   if (signal.aborted) return Promise.resolve();
   return new Promise<void>((resolve) => {
@@ -253,7 +275,7 @@ async function runRemoteInput(
             ...(typeof record.sessionStartedAt === "number" && Number.isFinite(record.sessionStartedAt)
               ? { startedAt: record.sessionStartedAt } : {}),
           }),
-          signal: AbortSignal.timeout(POST_TIMEOUT_MS),
+          signal: requestSignal(POST_TIMEOUT_MS, signal),
         });
         break; // every HTTP status is authoritative; only transport failures retry
       } catch {
@@ -262,24 +284,32 @@ async function runRemoteInput(
         }
       }
     }
-    if (signal.aborted) return "resolved-elsewhere";
+    // ABORT ORDERING. The `signal.aborted` check DELIBERATELY comes AFTER the response is classified.
+    // Checking it here — before `holdCreated` is set — is how a prompt resolved on the Mac while the POST
+    // was in flight left a live card on the phone: the worker HAD created the hold (pending decision,
+    // shown-set enrollment, violet island push), but `resolvedElsewhere()` only retires when `holdCreated`
+    // resolved true, so nothing retired it until the worker's ~30s sweep. Every branch below therefore
+    // either retires the hold itself or records that one exists, and only then honors the abort.
     if (!response) {
-      // Both responses were ambiguous. Retire a same-id hold if either POST committed before its reply
-      // was lost; a true no-create returns 404 and costs nothing.
+      // Both responses were ambiguous (including an abort that cancelled the fetch). Retire a same-id hold
+      // if either POST committed before its reply was lost; a true no-create returns 404 and costs nothing.
       await resolveOnRelay(deps.config, requestId, fetchFn);
-      return "transport-error";
+      return signal.aborted ? "resolved-elsewhere" : "transport-error";
     }
-    if (!response.ok) return "transport-error";
+    if (!response.ok) return signal.aborted ? "resolved-elsewhere" : "transport-error";
     const created = await parseJson<{ hold?: unknown }>(response);
     if (!created) {
       // A 200 we cannot parse may still have created the hold. Retire it rather than leave an orphan.
       report(deps, new Error("Unparseable relay response to the decision hold POST"), "Relay POST");
       await resolveOnRelay(deps.config, requestId, fetchFn);
-      return "transport-error";
+      return signal.aborted ? "resolved-elsewhere" : "transport-error";
     }
-    if (created.hold !== true) return "not-held";
+    if (created.hold !== true) return signal.aborted ? "resolved-elsewhere" : "not-held";
+    // The hold EXISTS on the worker. Publish that fact BEFORE honoring the abort, so an abort that lost
+    // the race still retires the card through resolvedElsewhere()'s `await holdCreated` branch.
     holdCreated = true;
     onHoldCreated(true);
+    if (signal.aborted) return "resolved-elsewhere";
 
     // The relay has already recorded the phone's decision by the time we get here, so an app-server
     // delivery failure must not look like success on the phone: report it and retire the relay record.
@@ -295,11 +325,12 @@ async function runRemoteInput(
     };
 
     let misses = 0;
+    let definitiveFailures = 0;
     while (!signal.aborted) {
       try {
         const response = await fetchFn(`${deps.config.url}/v1/cc/decision/${requestId}`, {
           headers,
-          signal: AbortSignal.timeout(POLL_TIMEOUT_MS),
+          signal: requestSignal(POLL_TIMEOUT_MS, signal),
         });
         // An unreadable 200 counts as a miss exactly like a non-2xx, so a relay that answers with
         // garbage forever still trips MAX_CONSECUTIVE_MISSES instead of polling until the heat death.
@@ -309,8 +340,22 @@ async function runRemoteInput(
         if (!data) {
           misses += 1;
           if (response.ok) report(deps, new Error("Unparseable relay poll response"), "Relay poll");
+          // DEFINITIVE vs transient — the same rule the permission hook's poll loop uses, and for the
+          // same reason: 401/403/404/410 mean this pairing cannot read this record AT ALL (unauthorized /
+          // revoked / GC'd), so the remaining ~100 polls would fail identically. Riding the miss cap
+          // there burns ~5 min of the shared per-pairing poll budget on a doomed request and starves
+          // genuinely live holds into 429s. Two CONSECUTIVE strikes (one can be a racing delete/deploy)
+          // give up at once. Everything else — 429, 5xx, an unreadable 200, a transport throw — stays
+          // transient.
+          if (!response.ok && DEFINITIVE_POLL_STATUSES.has(response.status)) {
+            definitiveFailures += 1;
+            if (definitiveFailures >= MAX_DEFINITIVE_POLL_FAILURES) return "transport-error";
+          } else {
+            definitiveFailures = 0;
+          }
         } else {
           misses = 0;
+          definitiveFailures = 0;
           if (data.status === "answered" && typeof data.answerBlob === "string") {
             let answer: PhoneAnswer;
             try { answer = await decryptBlob(deps.config.e2eKey, data.answerBlob) as PhoneAnswer; }
@@ -334,6 +379,7 @@ async function runRemoteInput(
         }
       } catch {
         misses += 1;
+        definitiveFailures = 0; // a transport throw says nothing about the record — never a strike
       }
       if (misses >= MAX_CONSECUTIVE_MISSES) return "transport-error";
       await abortableSleep(deps.pollIntervalMs ?? POLL_INTERVAL_MS, signal, sleep);

@@ -97,7 +97,7 @@ import { appendFileSync, existsSync, readFileSync, statSync, truncateSync } from
 import { execFileSync, spawn } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "1.4.14";
+var PLUGIN_VERSION = "1.4.15";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -2438,7 +2438,7 @@ async function runHook(agent) {
 // src/core/permission.ts
 var POLL_INTERVAL_MS = 3000;
 var FETCH_TIMEOUT_MS = 2000;
-var POST_TIMEOUT_MS = 15000;
+var POST_FIRST_CONTACT_TIMEOUT_MS = 4000;
 var POST_MAX_ATTEMPTS = 2;
 var POST_RETRY_PAUSE_MS = 1000;
 var HOLD_RETRY_DELAY_MS = 4000;
@@ -2964,31 +2964,51 @@ async function runPermissionHook(deps = {}, agent = "claude") {
     const fallbackBlob = await encryptBlob(config.e2eKey, base);
     const pcHeaders = { "x-cc-pairing": config.pairingId, "x-cc-auth": config.pcSecret, "x-cc-version": PLUGIN_VERSION };
     const sleep = deps.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
+    let lastPostTs = 0;
     const postDecision = async (round, maxAttempts) => {
       let hold2 = false;
       let posted2 = false;
+      let reason;
       for (let attempt = 1;attempt <= maxAttempts; attempt += 1) {
+        const ts = Math.max((deps.now ?? Date.now)(), lastPostTs + 1);
+        lastPostTs = ts;
         try {
           const res = await fetchFn(`${config.url}/v1/cc/decision`, {
             method: "POST",
             headers: { "content-type": "application/json", ...pcHeaders },
-            body: JSON.stringify({ v: 2, sessionId, requestId, op: "update", prio: 1, ts: now, blob, fallbackBlob }),
-            signal: AbortSignal.timeout(POST_TIMEOUT_MS)
+            body: JSON.stringify({ v: 2, sessionId, requestId, op: "update", prio: 1, ts, blob, fallbackBlob }),
+            signal: AbortSignal.timeout(POST_FIRST_CONTACT_TIMEOUT_MS)
           });
-          trace({ event: "posted", requestId, round, attempt, status: res.status });
-          if (res.ok)
-            hold2 = (await res.json()).hold === true;
+          if (res.ok) {
+            const body = await res.json().catch(() => ({}));
+            hold2 = body.hold === true;
+            if (typeof body.reason === "string")
+              reason = body.reason;
+          }
+          trace({
+            event: "posted",
+            requestId,
+            round,
+            attempt,
+            status: res.status,
+            ts,
+            ...res.ok ? { hold: hold2 } : {},
+            ...reason !== undefined ? { reason } : {}
+          });
           posted2 = true;
           break;
         } catch (e) {
-          trace({ event: "posted", requestId, round, attempt, status: 0, error: e?.name ?? "Error" });
+          const name = e?.name ?? "Error";
+          trace({ event: "posted", requestId, round, attempt, status: 0, ts, error: name });
+          if (name === "TimeoutError")
+            break;
           if (attempt < maxAttempts) {
             await sleep(POST_RETRY_PAUSE_MS);
             continue;
           }
         }
       }
-      return { posted: posted2, hold: hold2 };
+      return { posted: posted2, hold: hold2, reason };
     };
     const pollDecision = async (seq2) => {
       trace({ event: "poll-begin", seq: seq2 });
@@ -3009,7 +3029,7 @@ async function runPermissionHook(deps = {}, agent = "claude") {
         return { status: 0 };
       }
     };
-    let { posted, hold } = await postDecision(1, POST_MAX_ATTEMPTS);
+    let { posted, hold, reason: holdReason } = await postDecision(1, POST_MAX_ATTEMPTS);
     if (!posted) {
       const probe = await pollDecision(0);
       const live = probe.data?.status === "pending" || probe.data?.status === "answered";
@@ -3019,8 +3039,9 @@ async function runPermissionHook(deps = {}, agent = "claude") {
       }
       trace({ event: "post-timeout-landed", status: probe.data?.status });
       hold = true;
+      holdReason = undefined;
     }
-    trace({ event: "hold", hold });
+    trace({ event: "hold", hold, ...holdReason !== undefined ? { reason: holdReason } : {} });
     if (!hold) {
       const fresh = !record || now - record.ts < FRESH_SESSION_MS;
       if (!fresh) {
@@ -3035,7 +3056,8 @@ async function runPermissionHook(deps = {}, agent = "claude") {
         return;
       }
       hold = retry.hold;
-      trace({ event: "hold", hold });
+      holdReason = retry.reason;
+      trace({ event: "hold", hold, ...holdReason !== undefined ? { reason: holdReason } : {} });
       if (!hold) {
         trace({ event: "exit", reason: "hold-false" });
         return;

@@ -505,6 +505,55 @@ describe("runPermissionHook — hold state machine", () => {
     expect(calls.filter((c) => c.method === "GET").length).toBe(2);
   });
 
+  // FRESH `ts` PER POST. The first (hold:false) POST is not a server-side no-op: the worker stores/pushes
+  // the fallback frame, stamping the session row's lastTs with the ts we sent. Re-POSTing that SAME ts hits
+  // the worker's ordering guard (env.ts <= lastTs → drop "stale" → hold:false "stale-session"), so the
+  // re-ask could NEVER win the island auto-add race it exists for. Every POST must be strictly newer.
+  test("the hold re-ask POSTs a STRICTLY NEWER ts (fake clock advanced by the injected sleep)", async () => {
+    const answerBlob = await encryptBlob(KEY, { requestId: "req-fixed", decision: "allow", ts: 5 });
+    let clock = 1_000_000;
+    const { fn, calls } = scriptFetch([false, true], [{ status: "answered", answerBlob }]);
+    const emitted: string[] = [];
+    await runPermissionHook(baseDeps({
+      fetchFn: fn, emit: (l: string) => emitted.push(l),
+      now: () => clock,
+      sleep: async (ms: number) => { clock += ms; },            // the 4s hold-retry wait really elapses
+    }) as never);
+    const posts = calls.filter((c) => c.method === "POST").map((c) => JSON.parse(c.body!).ts as number);
+    expect(posts).toHaveLength(2);
+    expect(posts[1]).toBeGreaterThan(posts[0]);
+    expect(posts[1] - posts[0]).toBe(4_000);                    // HOLD_RETRY_DELAY_MS of real elapsed time
+    expect(emitted).toEqual([ALLOW]);                           // …and the re-ask's hold:true is honored
+  });
+
+  test("even a FROZEN clock yields a strictly newer ts on the re-ask (coarse-clock guard)", async () => {
+    const { fn, calls } = scriptFetch(false, []);
+    await runPermissionHook(baseDeps({ fetchFn: fn, emit: () => {} }) as never); // now: () => 1000, sleep: noop
+    const posts = calls.filter((c) => c.method === "POST").map((c) => JSON.parse(c.body!).ts as number);
+    expect(posts).toEqual([1000, 1001]);
+  });
+
+  // The worker names the FIRST failing gate in `reason` (stale-session / toggle-off / no-activity). Without
+  // it in the trace, a prompt that fell open is unfalsifiable in the field: a re-ask killed by the staleness
+  // guard looks exactly like the user having remote approvals switched off.
+  test("the worker's hold:false `reason` is recorded in the trace (posted + hold lines)", async () => {
+    const events: Array<{ event: string; [k: string]: unknown }> = [];
+    let post = 0;
+    const fn = (async (url: string) => {
+      post += 1;
+      if (!url.endsWith("/v1/cc/decision")) throw new Error("no polling expected");
+      return new Response(
+        JSON.stringify({ hold: false, reason: post === 1 ? "no-activity" : "stale-session" }),
+        { status: 200 },
+      );
+    }) as unknown as typeof fetch;
+    await runPermissionHook(baseDeps({
+      fetchFn: fn, emit: () => {}, trace: (e: { event: string }) => events.push(e as { event: string }),
+    }) as never);
+    expect(events.filter((e) => e.event === "posted").map((e) => e.reason)).toEqual(["no-activity", "stale-session"]);
+    expect(events.filter((e) => e.event === "hold").map((e) => e.reason)).toEqual(["no-activity", "stale-session"]);
+  });
+
   test("hold=true on the first ask → NO re-ask (single POST)", async () => {
     const answerBlob = await encryptBlob(KEY, { requestId: "req-fixed", decision: "allow", ts: 5 });
     const emitted: string[] = [];
@@ -671,7 +720,7 @@ describe("runPermissionHook — hold state machine", () => {
     expect(emitted).toEqual([]);
   });
 
-  test("POST times out once then the retry succeeds → holds and answers normally", async () => {
+  test("POST fails FAST once then the retry succeeds → holds and answers normally", async () => {
     const answerBlob = await encryptBlob(KEY, { requestId: "req-fixed", decision: "allow", ts: 5 });
     const gets: Array<Record<string, unknown>> = [{ status: "pending" }, { status: "answered", answerBlob }];
     const emitted: string[] = [];
@@ -681,7 +730,8 @@ describe("runPermissionHook — hold state machine", () => {
     const fn = (async (url: string) => {
       if (url.endsWith("/v1/cc/decision")) {
         postCount += 1;
-        if (postCount === 1) { const e = new Error("timeout"); e.name = "TimeoutError"; throw e; }
+        // A FAST failure (connection refused): retrying costs ~nothing, so the retry survives.
+        if (postCount === 1) { const e = new Error("refused") as Error & { code?: string }; e.code = "ECONNREFUSED"; throw e; }
         return new Response(JSON.stringify({ hold: true }), { status: 200 });
       }
       return new Response(JSON.stringify(gets[Math.min(g++, gets.length - 1)]), { status: 200 });
@@ -690,19 +740,19 @@ describe("runPermissionHook — hold state machine", () => {
       fetchFn: fn, emit: (l: string) => emitted.push(l),
       trace: (e: { event: string; attempt?: number }) => events.push(e),
     }) as never);
-    expect(postCount).toBe(2);              // first attempt threw, second succeeded
+    expect(postCount).toBe(2);              // first attempt threw fast, second succeeded
     expect(emitted).toEqual([ALLOW]);       // proceeded to poll + answer normally
     expect(events.filter((e) => e.event === "posted").map((e) => e.attempt)).toEqual([1, 2]);
   });
 
-  test("both POST attempts fail → fail open silent, trace shows two posted attempts", async () => {
+  test("both FAST-failing POST attempts fail → fail open silent, trace shows two posted attempts", async () => {
     const emitted: string[] = [];
     const events: Array<{ event: string; attempt?: number; reason?: string }> = [];
     let postCount = 0;
     let probeCount = 0;
     const fn = (async (url: string) => {
       if (url.endsWith("/v1/cc/decision")) postCount += 1; else probeCount += 1;
-      const e = new Error("timeout"); e.name = "TimeoutError"; throw e;
+      const e = new Error("refused") as Error & { code?: string }; e.code = "ECONNREFUSED"; throw e;
     }) as unknown as typeof fetch;
     await runPermissionHook(baseDeps({
       fetchFn: fn, emit: (l: string) => emitted.push(l),
@@ -715,10 +765,37 @@ describe("runPermissionHook — hold state machine", () => {
     expect(events.at(-1)).toMatchObject({ event: "exit", reason: "post-error" });
   });
 
-  // BOTH POSTs timing out CLIENT-side says nothing about whether the first one LANDED. If it did, the
-  // worker is holding a real record and the phone is showing the card — exiting fail-open there makes the
-  // phone lie (a tap is applied to nothing). One cheap GET distinguishes the two worlds.
-  test("both POSTs time out but the request LANDED → the probe finds it and the hold is honored", async () => {
+  // STALLED NETWORK (captive portal / hung proxy / half-open TCP). The dialog must not wait behind a
+  // SECOND long ceiling for an answer the first stall already gave: one first-contact POST, one cheap
+  // probe, out. The whole pre-dialog block is POST_FIRST_CONTACT_TIMEOUT_MS + FETCH_TIMEOUT_MS ≈ 6s,
+  // not the ~33s two 15s POSTs used to cost.
+  test("POST TIMES OUT → exactly one POST attempt (no long-ceiling retry) + one probe, then fail open", async () => {
+    const emitted: string[] = [];
+    const events: Array<{ event: string; attempt?: number; reason?: string }> = [];
+    const waits: number[] = [];
+    let postCount = 0;
+    let probeCount = 0;
+    const fn = (async (url: string) => {
+      if (url.endsWith("/v1/cc/decision")) postCount += 1; else probeCount += 1;
+      const e = new Error("timeout"); e.name = "TimeoutError"; throw e;
+    }) as unknown as typeof fetch;
+    await runPermissionHook(baseDeps({
+      fetchFn: fn, emit: (l: string) => emitted.push(l),
+      sleep: async (ms: number) => { waits.push(ms); },
+      trace: (e: { event: string; attempt?: number; reason?: string }) => events.push(e),
+    }) as never);
+    expect(postCount).toBe(1);             // the stall IS the answer — no second 4s ceiling
+    expect(probeCount).toBe(1);            // the did-it-land probe still runs (2s)
+    expect(waits).toEqual([]);             // not even the 1s retry pause is paid
+    expect(emitted).toEqual([]);
+    expect(events.filter((e) => e.event === "posted").map((e) => e.attempt)).toEqual([1]);
+    expect(events.at(-1)).toMatchObject({ event: "exit", reason: "post-error" });
+  });
+
+  // A POST timing out CLIENT-side says nothing about whether it LANDED. If it did, the worker is holding
+  // a real record and the phone is showing the card — exiting fail-open there makes the phone lie (a tap
+  // is applied to nothing). One cheap GET distinguishes the two worlds.
+  test("the POST times out but the request LANDED → the probe finds it and the hold is honored", async () => {
     const answerBlob = await encryptBlob(KEY, { requestId: "req-fixed", decision: "allow", ts: 5 });
     const gets: Array<Record<string, unknown>> = [{ status: "pending" }, { status: "answered", answerBlob }];
     const emitted: string[] = [];
@@ -727,7 +804,7 @@ describe("runPermissionHook — hold state machine", () => {
     let g = 0;
     const fn = (async (url: string) => {
       if (url.endsWith("/v1/cc/decision")) {
-        postCount += 1;                                       // the worker RECEIVED both, the client gave up
+        postCount += 1;                                       // the worker RECEIVED it, the client gave up
         const e = new Error("timeout"); e.name = "TimeoutError"; throw e;
       }
       return new Response(JSON.stringify(gets[Math.min(g++, gets.length - 1)]), { status: 200 });
@@ -736,12 +813,12 @@ describe("runPermissionHook — hold state machine", () => {
       fetchFn: fn, emit: (l: string) => emitted.push(l),
       trace: (e: { event: string }) => events.push(e as { event: string }),
     }) as never);
-    expect(postCount).toBe(2);
+    expect(postCount).toBe(1);
     expect(emitted).toEqual([ALLOW]);                          // the phone's Allow was honored, not dropped
     expect(events.find((e) => e.event === "post-timeout-landed")).toMatchObject({ status: "pending" });
   });
 
-  test("both POSTs time out and NOTHING landed (no record) → fail open, exactly one probe", async () => {
+  test("the POST times out and NOTHING landed (no record) → fail open, exactly one probe", async () => {
     const emitted: string[] = [];
     const events: Array<{ event: string; reason?: string }> = [];
     let getCount = 0;
