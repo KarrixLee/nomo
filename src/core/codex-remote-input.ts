@@ -5,6 +5,8 @@
 import { hostname } from "node:os";
 import { decryptBlob, encryptBlob } from "./crypto";
 import { requestUserInputDetail } from "./adapter";
+import { lanAnswerStore } from "./lan-listener";
+import type { LanAnswerStore } from "./lan-listener";
 import {
   BLOB_FIT_CHARS, buildPermissionQuestions, buildPermissionSummary, capPermissionWireText,
   DEFINITIVE_POLL_STATUSES, fitPermissionDetail, MAX_DEFINITIVE_POLL_FAILURES,
@@ -47,6 +49,11 @@ export interface CodexRemoteInputDeps {
   sleep?: (ms: number) => Promise<void>;
   pollIntervalMs?: number;
   localApprovalsStateFn?: () => Promise<"on" | "off">;
+  /** The LAN listener's in-process answer store (NOM-44 phase 2). This relay runs INSIDE the watchdog,
+   *  so a phone answer delivered over the LAN is already in this process's memory: it is applied on the
+   *  spot instead of waiting for the next 3 s worker tick. Defaults to the process-wide singleton the
+   *  listener writes; tests inject their own. */
+  answerStore?: LanAnswerStore;
   /** Diagnostic seam. Failures here are never fatal, but they must not be silent either. */
   onError?: (error: Error) => void;
 }
@@ -187,7 +194,12 @@ async function parseJson<T>(response: Response): Promise<T | undefined> {
   try { return await response.json() as T; } catch { return undefined; }
 }
 
-async function resolveOnRelay(config: Config, requestId: string, fetchFn: typeof fetch): Promise<void> {
+/** POST /v1/cc/decision/resolve — the blob-free, PC-authenticated "this request is settled on the Mac"
+ *  transition. EXPORTED because the LAN channel needs the identical request: after the watchdog's
+ *  listener stores a LAN-delivered answer it echoes exactly this call, so the worker record retires and
+ *  the island's Allow/Deny buttons drop even when the phone's own worker leg never landed. Best-effort
+ *  by contract — every failure is swallowed (and, on the LAN path, it is NEVER a gone strike). */
+export async function resolveOnRelay(config: Config, requestId: string, fetchFn: typeof fetch = fetch): Promise<void> {
   try {
     await fetchFn(`${config.url}/v1/cc/decision/resolve`, {
       method: "POST",
@@ -324,9 +336,42 @@ async function runRemoteInput(
       await resolveOnRelay(deps.config, requestId, fetchFn);
     };
 
+    /** Apply ONE sealed phone answer, from EITHER delivery channel — the 3 s worker poll or the LAN
+     *  listener's in-process answer store. THE single answered-branch body so the two cannot drift: the
+     *  requestId-mismatch guard, the deny→interrupt mapping, and the answer→app-server delivery all
+     *  behave identically no matter how the blob arrived. */
+    const applyAnswerBlob = async (answerBlob: string): Promise<CodexRemoteInputResult> => {
+      let answer: PhoneAnswer;
+      try { answer = await decryptBlob(deps.config.e2eKey, answerBlob) as PhoneAnswer; }
+      catch { return "transport-error"; }
+      if (answer.requestId !== requestId) return "unsupported";
+      if (answer.decision === "deny") {
+        const result = await deps.interruptAppServer();
+        if (result === "sent" || result === "already-sent") return "denied";
+        await reportUndelivered("deny", result);
+        return "transport-error";
+      }
+      if (answer.decision !== "answer") return "unsupported";
+      const mapped = codexAnswersFromPhone(request, answer.answers);
+      if (!mapped) return "unsupported";
+      const result = await deps.answerAppServer(mapped);
+      if (result === "sent" || result === "already-sent") return "answered";
+      await reportUndelivered("answer", result);
+      return "transport-error";
+    };
+
+    // The LAN store lives in THIS process (the listener is hosted by the same watchdog), so a LAN-
+    // delivered answer needs no poll at all: it is checked at the top of every iteration AND raced
+    // against the sleep at the bottom, which is what removes the up-to-3 s tick from the answer path.
+    // The worker poll below keeps its own cadence untouched — it is the relay's liveness proof.
+    const answers = deps.answerStore ?? lanAnswerStore;
+    const clock = deps.now ?? Date.now;
+
     let misses = 0;
     let definitiveFailures = 0;
     while (!signal.aborted) {
+      const local = answers.peek(requestId, clock());
+      if (local) return await applyAnswerBlob(local.answerBlob);
       try {
         const response = await fetchFn(`${deps.config.url}/v1/cc/decision/${requestId}`, {
           headers,
@@ -357,23 +402,7 @@ async function runRemoteInput(
           misses = 0;
           definitiveFailures = 0;
           if (data.status === "answered" && typeof data.answerBlob === "string") {
-            let answer: PhoneAnswer;
-            try { answer = await decryptBlob(deps.config.e2eKey, data.answerBlob) as PhoneAnswer; }
-            catch { return "transport-error"; }
-            if (answer.requestId !== requestId) return "unsupported";
-            if (answer.decision === "deny") {
-              const result = await deps.interruptAppServer();
-              if (result === "sent" || result === "already-sent") return "denied";
-              await reportUndelivered("deny", result);
-              return "transport-error";
-            }
-            if (answer.decision !== "answer") return "unsupported";
-            const mapped = codexAnswersFromPhone(request, answer.answers);
-            if (!mapped) return "unsupported";
-            const result = await deps.answerAppServer(mapped);
-            if (result === "sent" || result === "already-sent") return "answered";
-            await reportUndelivered("answer", result);
-            return "transport-error";
+            return await applyAnswerBlob(data.answerBlob); // the shared branch — see applyAnswerBlob
           } else if (data.status === "expired") return "expired";
           else if (data.status === "superseded") return "superseded";
         }
@@ -382,7 +411,15 @@ async function runRemoteInput(
         definitiveFailures = 0; // a transport throw says nothing about the record — never a strike
       }
       if (misses >= MAX_CONSECUTIVE_MISSES) return "transport-error";
-      await abortableSleep(deps.pollIntervalMs ?? POLL_INTERVAL_MS, signal, sleep);
+      // The poll cadence is unchanged: the race can only END this wait EARLY (a LAN answer landed), never
+      // extend it. `cancel()` in the finally is mandatory — without it every abandoned tick would leave a
+      // listener behind in the store.
+      const waiter = answers.waiter(requestId, clock());
+      try {
+        await Promise.race([abortableSleep(deps.pollIntervalMs ?? POLL_INTERVAL_MS, signal, sleep), waiter.promise]);
+      } finally {
+        waiter.cancel();
+      }
     }
     return "resolved-elsewhere";
   } catch (error) {

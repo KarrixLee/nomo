@@ -4,10 +4,15 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { b64url, decryptBlob, deriveLanKey, encryptBlob } from "./crypto";
 import {
+  createLanAnswerStore,
   createLanHintPublisher,
   createLanListener,
+  isLoopbackAddress,
   lanEnvelopeIsFresh,
   lanHostAddresses,
+  LAN_ANSWER_BLOB_MAX_CHARS,
+  LAN_ANSWER_STORE_MAX,
+  LAN_ANSWER_TTL_MS,
   LAN_BODY_MAX_BYTES,
   LAN_ENVELOPE_VERSION,
   LAN_FUTURE_SKEW_MS,
@@ -18,7 +23,7 @@ import {
   parseLanEnvelope,
   parseLanState,
 } from "./lan-listener";
-import type { LanCommand, LanListener } from "./lan-listener";
+import type { LanAnswerDelivery, LanAnswerStore, LanCommand, LanListener } from "./lan-listener";
 import type { Config } from "./shared";
 
 // Every listener binds LOOPBACK in tests: a `bun test` run must never open a port to the network the
@@ -56,6 +61,9 @@ async function stateDir(): Promise<string> {
 async function startListener(options: {
   statePath: string;
   onCommand?: (c: LanCommand) => void;
+  onAnswer?: (a: LanAnswerDelivery) => void;
+  answers?: LanAnswerStore;
+  remoteAddress?: (req: unknown) => string | undefined;
   now?: () => number;
   cfg?: Config | null;
   newListenerId?: () => string;
@@ -64,6 +72,9 @@ async function startListener(options: {
     host: HOST,
     statePath: options.statePath,
     onCommand: options.onCommand,
+    onAnswer: options.onAnswer,
+    answers: options.answers,
+    remoteAddress: options.remoteAddress,
     now: options.now,
     newListenerId: options.newListenerId,
     trace: () => { /* tests never touch the user's session trace */ },
@@ -400,6 +411,233 @@ describe("port persistence + listener-instance id", () => {
     expect(listener.address()).toBeNull();
     listener.stop(); // idempotent
     await expect(fetch(`http://${HOST}:${port}${LAN_PATH}`, { method: "POST", body: "{}" })).rejects.toThrow();
+  });
+});
+
+// --- phase 2: approval answers ------------------------------------------------------------------
+
+describe("LAN answer store", () => {
+  const NOW = 1_800_000_000_000;
+
+  test("first writer wins: a second answer for the same requestId never overwrites", () => {
+    const store = createLanAnswerStore();
+    expect(store.put("req-1", "blob-a", NOW)).toBe("stored");
+    expect(store.put("req-1", "blob-b", NOW + 10)).toBe("duplicate");
+    expect(store.peek("req-1", NOW + 20)?.answerBlob).toBe("blob-a");
+  });
+
+  test("an entry expires at the TTL and is dropped on read", () => {
+    const store = createLanAnswerStore();
+    store.put("req-1", "blob-a", NOW);
+    expect(store.peek("req-1", NOW + LAN_ANSWER_TTL_MS)?.answerBlob).toBe("blob-a");
+    expect(store.peek("req-1", NOW + LAN_ANSWER_TTL_MS + 1)).toBeUndefined();
+    expect(store.size()).toBe(0);
+    // …and once expired the id is writable again (a re-asked prompt reuses nothing, but the store must
+    // not become a permanent tombstone either).
+    expect(store.put("req-1", "blob-b", NOW + LAN_ANSWER_TTL_MS + 2)).toBe("stored");
+  });
+
+  test("the store is FIFO-bounded, so a K_lan holder cannot grow it without limit", () => {
+    const store = createLanAnswerStore();
+    for (let i = 0; i < LAN_ANSWER_STORE_MAX + 10; i += 1) store.put(`req-${i}`, `blob-${i}`, NOW);
+    expect(store.size()).toBe(LAN_ANSWER_STORE_MAX);
+    expect(store.peek("req-0", NOW)).toBeUndefined();                       // oldest evicted first
+    expect(store.peek(`req-${LAN_ANSWER_STORE_MAX + 9}`, NOW)?.answerBlob)
+      .toBe(`blob-${LAN_ANSWER_STORE_MAX + 9}`);                            // newest survives
+  });
+
+  test("waiter() resolves when the answer lands, is pre-resolved when it is already there, and cancels clean", async () => {
+    const store = createLanAnswerStore();
+    let woke = false;
+    const waiter = store.waiter("req-1", NOW);
+    void waiter.promise.then(() => { woke = true; });
+    await Promise.resolve();
+    expect(woke).toBe(false);
+    store.put("req-1", "blob-a", NOW);
+    await waiter.promise;
+    expect(woke).toBe(true);
+    waiter.cancel(); // idempotent
+
+    expect(await Promise.race([
+      store.waiter("req-1", NOW).promise.then(() => "already-there"),
+      Promise.resolve().then(() => "pending"),
+    ])).toBe("already-there");
+
+    // A cancelled waiter must resolve (never leave a racing awaiter hanging) and must be unregistered.
+    const abandoned = store.waiter("req-2", NOW);
+    abandoned.cancel();
+    await abandoned.promise;
+  });
+});
+
+describe("POST /v1/lan — op:answer", () => {
+  const NOW = 1_800_000_000_000;
+
+  test("stores the still-sealed answer, answers a sealed ok, and echoes to the worker exactly once", async () => {
+    const cfg = config();
+    const store = createLanAnswerStore();
+    const echoed: LanAnswerDelivery[] = [];
+    const dir = await stateDir();
+    const { port } = await startListener({
+      statePath: join(dir, "lan.json"), answers: store, onAnswer: (a) => { echoed.push(a); }, now: () => NOW, cfg,
+    });
+
+    // The answerBlob is sealed under the PAIRING key by the phone; the listener never opens it (the hold
+    // that consumes it does the decrypt + requestId match, exactly as on the worker path).
+    const answerBlob = await encryptBlob(cfg.e2eKey, { requestId: "req-1", decision: "allow" });
+    const n = nonce();
+    const res = await post(port, await sealRequest(cfg, {
+      op: "answer", ts: NOW, nonce: n, payload: { requestId: "req-1", answerBlob },
+    }));
+
+    expect(res.status).toBe(200);
+    const opened = await openResponse(cfg, res.json);
+    expect(opened.reqNonce).toBe(n);
+    expect(opened.payload).toEqual({ ok: true });
+    expect(store.peek("req-1", NOW)).toEqual({ answerBlob, at: NOW });
+    expect(echoed).toHaveLength(1);
+    expect(echoed[0].requestId).toBe("req-1");
+    expect(echoed[0].answerBlob).toBe(answerBlob);
+    expect(echoed[0].config.pairingId).toBe(cfg.pairingId);
+  });
+
+  test("a duplicate requestId keeps the FIRST blob, still answers ok, and does NOT re-echo", async () => {
+    const cfg = config();
+    const store = createLanAnswerStore();
+    const echoed: LanAnswerDelivery[] = [];
+    const dir = await stateDir();
+    const { port } = await startListener({
+      statePath: join(dir, "lan.json"), answers: store, onAnswer: (a) => { echoed.push(a); }, now: () => NOW, cfg,
+    });
+    const first = await encryptBlob(cfg.e2eKey, { requestId: "req-1", decision: "allow" });
+    const second = await encryptBlob(cfg.e2eKey, { requestId: "req-1", decision: "deny" });
+    for (const answerBlob of [first, second]) {
+      const res = await post(port, await sealRequest(cfg, {
+        op: "answer", ts: NOW, nonce: nonce(), payload: { requestId: "req-1", answerBlob },
+      }));
+      expect(res.status).toBe(200);
+      expect((await openResponse(cfg, res.json)).payload).toEqual({ ok: true });
+    }
+    expect(store.peek("req-1", NOW)?.answerBlob).toBe(first); // first-writer-wins, like the worker route
+    expect(echoed).toHaveLength(1);                           // the echo fires per STORED answer, not per POST
+  });
+
+  test("a bad requestId or an oversized/empty blob is an opaque 400 that never reaches the store", async () => {
+    const cfg = config();
+    const store = createLanAnswerStore();
+    const echoed: LanAnswerDelivery[] = [];
+    const dir = await stateDir();
+    const { port } = await startListener({
+      statePath: join(dir, "lan.json"), answers: store, onAnswer: (a) => { echoed.push(a); }, now: () => NOW, cfg,
+    });
+    const answerBlob = await encryptBlob(cfg.e2eKey, { requestId: "req-1", decision: "allow" });
+    const bad = [
+      { requestId: "not a request id", answerBlob },        // space — outside the worker's REQID_RE
+      { requestId: "", answerBlob },
+      { requestId: "x".repeat(129), answerBlob },            // past the 128-char ceiling
+      { requestId: 7, answerBlob },
+      { requestId: "req-1" },                                // no blob at all
+      { requestId: "req-1", answerBlob: "" },
+      { requestId: "req-1", answerBlob: "A".repeat(LAN_ANSWER_BLOB_MAX_CHARS + 1) },
+    ];
+    for (const payload of bad) {
+      const res = await post(port, await sealRequest(cfg, { op: "answer", ts: NOW, nonce: nonce(), payload }));
+      expect(res.status).toBe(400);
+      expect(res.json).toEqual({});
+    }
+    expect(store.size()).toBe(0);
+    expect(echoed).toHaveLength(0);
+  });
+
+  test("a sink that throws cannot break the phone's response (the echo is never on the request path)", async () => {
+    const cfg = config();
+    const store = createLanAnswerStore();
+    const dir = await stateDir();
+    const { port } = await startListener({
+      statePath: join(dir, "lan.json"), answers: store,
+      onAnswer: () => { throw new Error("worker echo exploded"); }, now: () => NOW, cfg,
+    });
+    const answerBlob = await encryptBlob(cfg.e2eKey, { requestId: "req-1", decision: "allow" });
+    const res = await post(port, await sealRequest(cfg, {
+      op: "answer", ts: NOW, nonce: nonce(), payload: { requestId: "req-1", answerBlob },
+    }));
+    expect(res.status).toBe(200);
+    expect((await openResponse(cfg, res.json)).payload).toEqual({ ok: true });
+    expect(store.peek("req-1", NOW)?.answerBlob).toBe(answerBlob); // stored BEFORE the sink ran
+  });
+});
+
+describe("POST /v1/lan — op:answer-poll (loopback only)", () => {
+  const NOW = 1_800_000_000_000;
+
+  test("isLoopbackAddress accepts only this machine's own loopback forms", () => {
+    for (const ok of ["127.0.0.1", "127.0.0.53", "::1", "::ffff:127.0.0.1"]) {
+      expect(isLoopbackAddress(ok)).toBe(true);
+    }
+    for (const no of ["192.168.1.42", "10.0.0.7", "::ffff:192.168.1.42", "fd00::1", "", undefined, 127]) {
+      expect(isLoopbackAddress(no)).toBe(false);
+    }
+  });
+
+  test("answers pending, then the stored answerBlob — the SAME shape the worker's decision GET returns", async () => {
+    const cfg = config();
+    const store = createLanAnswerStore();
+    const dir = await stateDir();
+    const { port } = await startListener({ statePath: join(dir, "lan.json"), answers: store, now: () => NOW, cfg });
+
+    const pending = await post(port, await sealRequest(cfg, {
+      op: "answer-poll", ts: NOW, nonce: nonce(), payload: { requestId: "req-1" },
+    }));
+    expect((await openResponse(cfg, pending.json)).payload).toEqual({ status: "pending" });
+
+    const answerBlob = await encryptBlob(cfg.e2eKey, { requestId: "req-1", decision: "allow" });
+    store.put("req-1", answerBlob, NOW);
+    const answered = await post(port, await sealRequest(cfg, {
+      op: "answer-poll", ts: NOW, nonce: nonce(), payload: { requestId: "req-1" },
+    }));
+    expect((await openResponse(cfg, answered.json)).payload).toEqual({ status: "answered", answerBlob });
+  });
+
+  test("an expired answer reads as pending again (the TTL is enforced on the read path too)", async () => {
+    const cfg = config();
+    const store = createLanAnswerStore();
+    let now = NOW;
+    const dir = await stateDir();
+    const { port } = await startListener({ statePath: join(dir, "lan.json"), answers: store, now: () => now, cfg });
+    store.put("req-1", await encryptBlob(cfg.e2eKey, { requestId: "req-1", decision: "allow" }), NOW);
+    now = NOW + LAN_ANSWER_TTL_MS + 1;
+    const res = await post(port, await sealRequest(cfg, {
+      op: "answer-poll", ts: now, nonce: nonce(), payload: { requestId: "req-1" },
+    }));
+    expect((await openResponse(cfg, res.json)).payload).toEqual({ status: "pending" });
+  });
+
+  test("a NON-loopback caller gets the plain bad-op answer — the op is invisible from the network", async () => {
+    const cfg = config();
+    const store = createLanAnswerStore();
+    const dir = await stateDir();
+    // The listener only ever binds loopback in tests, so the peer address is the injected seam.
+    const { port } = await startListener({
+      statePath: join(dir, "lan.json"), answers: store, remoteAddress: () => "192.168.1.42", now: () => NOW, cfg,
+    });
+    store.put("req-1", "secret-blob", NOW);
+    const res = await post(port, await sealRequest(cfg, {
+      op: "answer-poll", ts: NOW, nonce: nonce(), payload: { requestId: "req-1" },
+    }));
+    expect(res.status).toBe(200);
+    // Byte-identical to ANY unknown op, so an old and a new phone see the same thing and nothing leaks.
+    expect((await openResponse(cfg, res.json)).payload).toEqual({ ok: false, err: "bad-op" });
+  });
+
+  test("a malformed requestId on the loopback op is the same opaque 400", async () => {
+    const cfg = config();
+    const dir = await stateDir();
+    const { port } = await startListener({ statePath: join(dir, "lan.json"), now: () => NOW, cfg });
+    for (const payload of [{}, { requestId: "" }, { requestId: "bad id" }, { requestId: "x".repeat(129) }]) {
+      const res = await post(port, await sealRequest(cfg, { op: "answer-poll", ts: NOW, nonce: nonce(), payload }));
+      expect(res.status).toBe(400);
+      expect(res.json).toEqual({});
+    }
   });
 });
 

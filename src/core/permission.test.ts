@@ -1,13 +1,15 @@
 import { mkdir, mkdtemp, readFile, symlink, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
 import {
   buildPermissionSummary, buildPermissionDetail, buildPermissionQuestions, fitPermissionDetail,
   sealedBlobChars, BLOB_FIT_CHARS, runPermissionHook, approvalsCommand, NO_HOLD_PATH, TRACE_PATH,
   codexRolloutSessionId, codexTurnPolicyFromRollout, loadCodexTurnPolicy,
 } from "./permission";
 import { encryptBlob, decryptBlob } from "./crypto";
+import { createLanAnswerStore, createLanListener } from "./lan-listener";
+import type { LanAnswerStore, LanListener } from "./lan-listener";
 import type { Config } from "./shared";
 
 // ---- summary builder (pure) ---------------------------------------------------------------
@@ -2011,6 +2013,189 @@ describe("approvalsCommand (on/off/status)", () => {
     expect(await approvalsCommand("status", deps)).toBe(0);
     expect(lines.join("\n").toLowerCase()).toContain("on");
     await rm(dir, { recursive: true, force: true });
+  });
+});
+
+// ---- LAN loopback answer poll (NOM-44 phase 2) ---------------------------------------------
+//
+// The hook is a SEPARATE process from the watchdog that owns the LAN answer store, so it reads that
+// store over loopback HTTP. These tests drive a REAL listener on 127.0.0.1 (the wire, not a mock) while
+// the worker leg stays scripted — because the whole point is that the two channels are independent and
+// the worker's 3 s cadence is untouched by anything the LAN leg does.
+describe("runPermissionHook — LAN loopback answer poll", () => {
+  const live: LanListener[] = [];
+  const dirs: string[] = [];
+
+  afterEach(async () => {
+    while (live.length > 0) {
+      try { live.pop()?.stop(); } catch { /* already stopped */ }
+    }
+    while (dirs.length > 0) {
+      const dir = dirs.pop();
+      if (dir) await rm(dir, { recursive: true, force: true }).catch(() => {});
+    }
+  });
+
+  /** A real listener bound to loopback, plus the lan.json path the hook will discover it through. */
+  async function listenerFor(store: LanAnswerStore): Promise<string> {
+    const dir = await mkdtemp(join(tmpdir(), "nomo-perm-lan-"));
+    dirs.push(dir);
+    const statePath = join(dir, "lan.json");
+    const listener = createLanListener({
+      host: "127.0.0.1", statePath, answers: store, trace: () => { /* never the user's session trace */ },
+    });
+    live.push(listener);
+    await listener.ready;
+    listener.sync(CONFIG);
+    return statePath;
+  }
+
+  /** A worker sleep that really elapses (so the LAN leg can win the race) and records its arguments —
+   *  the cadence proof: every wait the hold loop asks for must still be `interval + jitter`. */
+  const pacedSleep = (ms: number, sleeps: number[]) => (requested: number): Promise<void> => {
+    sleeps.push(requested);
+    return new Promise<void>((resolve) => { setTimeout(resolve, ms); });
+  };
+
+  test("a LAN-delivered answer emits the SAME line as a worker-delivered one, without a second worker poll", async () => {
+    const answerBlob = await encryptBlob(KEY, { requestId: "req-fixed", decision: "allow", ts: 5 });
+
+    // 1. The worker delivers it (the pre-phase-2 path, unchanged).
+    const viaWorker: string[] = [];
+    const worker = scriptFetch(true, [{ status: "answered", answerBlob }]);
+    await runPermissionHook(baseDeps({ fetchFn: worker.fn, emit: (l: string) => viaWorker.push(l) }) as never);
+
+    // 2. The LAN listener delivers the IDENTICAL ciphertext while the worker only ever says "pending".
+    const store = createLanAnswerStore();
+    const statePath = await listenerFor(store);
+    store.put("req-fixed", answerBlob, Date.now());
+    const viaLan: string[] = [];
+    const events: Array<Record<string, unknown>> = [];
+    const sleeps: number[] = [];
+    const lan = scriptFetch(true, [{ status: "pending" }]);
+    let lanCalls = 0;
+    await runPermissionHook(baseDeps({
+      fetchFn: lan.fn,
+      emit: (l: string) => viaLan.push(l),
+      sleep: pacedSleep(60, sleeps),
+      trace: (e: object) => events.push(e as Record<string, unknown>),
+      now: () => Date.now(),          // the sealed loopback envelope carries a REAL ts (the listener
+      lanStatePath: statePath,        // enforces the same 120 s freshness window the phone's leg does)
+      lanFetchFn: ((url: string, init: RequestInit) => { lanCalls += 1; return fetch(url, init); }) as unknown as typeof fetch,
+      lanSleep: (ms: number) => new Promise<void>((r) => { setTimeout(r, Math.min(ms, 2)); }),
+      lanIntervalMs: 2,
+    }) as never);
+
+    expect(viaLan).toEqual(viaWorker);            // one shared answered-branch → one identical line
+    expect(viaLan).toEqual([ALLOW]);
+    expect(lan.calls.filter((c) => c.method === "GET").length).toBe(1); // the 3 s tick never came round
+    expect(lanCalls).toBe(1);                     // …and the poller retires after ONE delivery
+    expect(events.some((e) => e.event === "answered" && e.src === "lan")).toBe(true);
+    expect(sleeps.every((ms) => ms === 3_000)).toBe(true); // the worker cadence itself is untouched
+  });
+
+  test("a LAN answer whose inner requestId does not match releases silently, exactly like the worker path", async () => {
+    const store = createLanAnswerStore();
+    const statePath = await listenerFor(store);
+    // A stale/replayed answer: stored under the id we poll for, but sealed for a DIFFERENT request.
+    store.put("req-fixed", await encryptBlob(KEY, { requestId: "req-other", decision: "allow" }), Date.now());
+    const emitted: string[] = [];
+    const events: Array<Record<string, unknown>> = [];
+    const { fn } = scriptFetch(true, [{ status: "pending" }]);
+    await runPermissionHook(baseDeps({
+      fetchFn: fn,
+      emit: (l: string) => emitted.push(l),
+      sleep: pacedSleep(60, []),
+      trace: (e: object) => events.push(e as Record<string, unknown>),
+      now: () => Date.now(),          // the sealed loopback envelope carries a REAL ts (the listener
+      lanStatePath: statePath,        // enforces the same 120 s freshness window the phone's leg does)
+      lanFetchFn: fetch,
+      lanSleep: (ms: number) => new Promise<void>((r) => { setTimeout(r, Math.min(ms, 2)); }),
+      lanIntervalMs: 2,
+    }) as never);
+    expect(emitted).toEqual([]);                  // nothing on stdout — fail open to the terminal dialog
+    expect(events.some((e) => e.event === "answered" && e.match === false && e.src === "lan")).toBe(true);
+  });
+
+  test("an UNRECOGNIZED verb over LAN retires the LAN leg (no hot loop) and the worker still answers", async () => {
+    const store = createLanAnswerStore();
+    const statePath = await listenerFor(store);
+    store.put("req-fixed", await encryptBlob(KEY, { requestId: "req-fixed", decision: "teleport" }), Date.now());
+    const answerBlob = await encryptBlob(KEY, { requestId: "req-fixed", decision: "allow" });
+    const emitted: string[] = [];
+    let lanCalls = 0;
+    const { fn, calls } = scriptFetch(true, [{ status: "pending" }, { status: "answered", answerBlob }]);
+    await runPermissionHook(baseDeps({
+      fetchFn: fn,
+      emit: (l: string) => emitted.push(l),
+      sleep: pacedSleep(20, []),
+      now: () => Date.now(),
+      lanStatePath: statePath,
+      lanFetchFn: ((url: string, init: RequestInit) => { lanCalls += 1; return fetch(url, init); }) as unknown as typeof fetch,
+      lanSleep: (ms: number) => new Promise<void>((r) => { setTimeout(r, Math.min(ms, 2)); }),
+      lanIntervalMs: 2,
+    }) as never);
+    expect(emitted).toEqual([ALLOW]);             // the worker's own answer finished the hold
+    expect(lanCalls).toBe(1);                     // the LAN leg delivered once and stopped — never a spin
+    expect(calls.filter((c) => c.method === "GET").length).toBeGreaterThanOrEqual(2);
+  });
+
+  test("loopback failures are silent, bounded at 5 consecutive strikes, and never touch the worker path", async () => {
+    const answerBlob = await encryptBlob(KEY, { requestId: "req-fixed", decision: "allow" });
+    const emitted: string[] = [];
+    const events: Array<Record<string, unknown>> = [];
+    const sleeps: number[] = [];
+    let lanCalls = 0;
+    // Three "pending" worker polls (~180 ms of wall clock at 60 ms a tick) give the 2 ms LAN ticker far
+    // more than five chances — so a count of exactly 5 IS the give-up bound, not a race.
+    const { fn, calls } = scriptFetch(true, [
+      { status: "pending" }, { status: "pending" }, { status: "pending" }, { status: "answered", answerBlob },
+    ]);
+    await runPermissionHook(baseDeps({
+      fetchFn: fn,
+      emit: (l: string) => emitted.push(l),
+      sleep: pacedSleep(60, sleeps),
+      trace: (e: object) => events.push(e as Record<string, unknown>),
+      lanStatePath: "/does/not/exist/lan.json", // discovery fails → but the fetch below is what we count
+      lanFetchFn: (async () => { lanCalls += 1; throw new Error("ECONNREFUSED"); }) as unknown as typeof fetch,
+      lanSleep: (ms: number) => new Promise<void>((r) => { setTimeout(r, Math.min(ms, 2)); }),
+      lanIntervalMs: 2,
+    }) as never);
+
+    expect(emitted).toEqual([ALLOW]);                       // the worker leg carried the hold, untouched
+    expect(calls.filter((c) => c.method === "GET").length).toBe(4);
+    expect(sleeps).toEqual([3_000, 3_000, 3_000]);          // cadence: one full interval per pending poll
+    expect(lanCalls).toBe(0);                               // no lan.json → not a single loopback request
+    // Nothing about a dead LAN leg may reach the trace more than once per hold.
+    expect(events.filter((e) => e.event === "lan-poll").length).toBeLessThanOrEqual(1);
+  });
+
+  test("with a live lan.json but a refused socket, the poller gives up after 5 strikes and traces once", async () => {
+    const store = createLanAnswerStore();
+    const statePath = await listenerFor(store);
+    live.pop()?.stop();                                     // the port in lan.json is now dead
+    const answerBlob = await encryptBlob(KEY, { requestId: "req-fixed", decision: "allow" });
+    const emitted: string[] = [];
+    const events: Array<Record<string, unknown>> = [];
+    let lanCalls = 0;
+    const { fn } = scriptFetch(true, [
+      { status: "pending" }, { status: "pending" }, { status: "pending" }, { status: "answered", answerBlob },
+    ]);
+    await runPermissionHook(baseDeps({
+      fetchFn: fn,
+      emit: (l: string) => emitted.push(l),
+      sleep: pacedSleep(60, []),
+      trace: (e: object) => events.push(e as Record<string, unknown>),
+      now: () => Date.now(),          // the sealed loopback envelope carries a REAL ts (the listener
+      lanStatePath: statePath,        // enforces the same 120 s freshness window the phone's leg does)
+      lanFetchFn: (async (url: string, init: RequestInit) => { lanCalls += 1; return await fetch(url, init); }) as unknown as typeof fetch,
+      lanSleep: (ms: number) => new Promise<void>((r) => { setTimeout(r, Math.min(ms, 2)); }),
+      lanIntervalMs: 2,
+    }) as never);
+
+    expect(emitted).toEqual([ALLOW]);
+    expect(lanCalls).toBe(5);                               // LOOPBACK_MAX_CONSECUTIVE_ERRORS, then silence
+    expect(events.filter((e) => e.event === "lan-poll")).toEqual([{ event: "lan-poll", result: "give-up" }]);
   });
 });
 

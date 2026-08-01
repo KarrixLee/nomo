@@ -7,7 +7,7 @@ import { decryptBlob, encryptBlob } from "../core/crypto";
 import type { PlanPickerTraceDecision, SessionRecord } from "../core/shared";
 import { GONE_STRIKE_LIMIT, readGoneStrikes, recordGoneStrike, resetGoneStrikes, tracePlanPickerDecision } from "../core/shared";
 import {
-  acceptLanCommand, enqueueDrainCommands, LAN_COMMAND_ID_PREFIX,
+  acceptLanAnswer, acceptLanCommand, enqueueDrainCommands, LAN_COMMAND_ID_PREFIX,
   buildDoneEnvelope, buildEndEnvelope, buildHeartbeatEnvelope, buildNeedsAttentionEnvelope, buildProvisionalBlob,
   buildProvisionalEnvelope, buildProvisionalRecord, buildStartEnvelope, buildTitleRepairEnvelope, classifySession,
   claudeTailPendingApproval, codexLastTurnEvent, codexTailPendingApproval, correctIdleClaude, correctInterrupt,
@@ -24,6 +24,7 @@ import {
   watchdogEventHeaders, WAITING_HEARTBEAT_AFTER_MS, withDeadline,
 } from "./cc-watchdog";
 import type { CommandPayload, DrainCommandsDeps, PostOutcome, RecordEntry } from "./cc-watchdog";
+import { resolveOnRelay } from "../core/codex-remote-input";
 import { claudeAdapter, codexAdapter } from "../core/adapter";
 import type { AgentAdapter, DiscoveredSession } from "../core/adapter";
 import type { Config, PendingConfig } from "../core/shared";
@@ -2952,6 +2953,62 @@ describe("acceptLanCommand + enqueueDrainCommands (the LAN leg of command intake
 
   test("a throwing sink call is swallowed — the HTTP response must never depend on the drain", () => {
     expect(() => acceptLanCommand({ nonce: "outer-x", blob: "not-a-blob", config: cfg() })).not.toThrow();
+  });
+});
+
+// --- the LAN answer sink: the split-brain backstop (NOM-44 phase 2) ---------------------------
+//
+// By the time this sink runs the listener has ALREADY stored the sealed answer (that store is what the
+// Claude hook's loopback poll and the in-process Codex relay read). Its only job is to tell the WORKER
+// the request is settled, so the island's Allow/Deny buttons retire even when the phone's own parallel
+// worker leg failed. It must never throw, never block the phone's response, and never count as a gone
+// strike — the gone ladder is a /cc/event authority signal, and this path never goes near that route.
+describe("acceptLanAnswer (the worker echo after a LAN-delivered answer)", () => {
+  const delivery = () => ({ requestId: "req-lan-1", answerBlob: "sealed-answer", config: cfg() });
+
+  test("echoes exactly one blob-free POST /v1/cc/decision/resolve with the pairing's PC auth", async () => {
+    const calls: Array<{ url: string; method?: string; headers?: Record<string, string>; body?: string }> = [];
+    const fetchFn = (async (url: string, init: { method?: string; headers?: Record<string, string>; body?: string }) => {
+      calls.push({ url, ...init });
+      return new Response(JSON.stringify({ ok: true, status: "superseded" }), { status: 200 });
+    }) as unknown as typeof fetch;
+    // resolveFn is the seam; the default is the SAME resolveOnRelay the Codex relay uses, so the shape
+    // asserted here is the shape that ships.
+    await acceptLanAnswer(delivery(), { resolveFn: (config, requestId) => resolveOnRelay(config, requestId, fetchFn) });
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0].url).toBe("https://w.test/v1/cc/decision/resolve");
+    expect(calls[0].method).toBe("POST");
+    expect(JSON.parse(calls[0].body!)).toEqual({ requestId: "req-lan-1" }); // blob-free: the worker stays blind
+    expect(calls[0].headers).toMatchObject({ "x-cc-pairing": "p", "x-cc-auth": "s" });
+    // The one route that feeds the gone-strike ladder is /v1/cc/event; this path never touches it.
+    expect(calls.every((c) => !c.url.endsWith("/v1/cc/event"))).toBe(true);
+  });
+
+  test("a 404/410 (the phone's own worker leg already retired it) is a normal outcome, never a gone strike", async () => {
+    // The gone-strike ladder is fed EXCLUSIVELY by the /v1/cc/event POSTers (postEvent + runHook), which
+    // is why this is a structural property rather than a counter assertion: the LAN echo issues exactly
+    // one request, to the resolve route, and calls nothing else — there is no path from here to
+    // recordGoneStrike at all. A definitive status is simply "already retired", the NORMAL race outcome.
+    for (const status of [404, 410]) {
+      const urls: string[] = [];
+      const fetchFn = (async (url: string) => { urls.push(url); return new Response("", { status }); }) as unknown as typeof fetch;
+      await acceptLanAnswer(delivery(), { resolveFn: (config, requestId) => resolveOnRelay(config, requestId, fetchFn) });
+      expect(urls).toEqual(["https://w.test/v1/cc/decision/resolve"]);
+    }
+  });
+
+  test("a failing echo resolves silently (traced, never thrown) — the worker's 30 s sweep is the backstop", async () => {
+    const traces: Array<Record<string, unknown>> = [];
+    await acceptLanAnswer(delivery(), {
+      resolveFn: async () => { throw new Error("network gone"); },
+      trace: (e) => traces.push(e as Record<string, unknown>),
+    });
+    expect(traces).toEqual([{ event: "lan", result: "echo-failed", requestId: "req-lan-1" }]);
+  });
+
+  test("a synchronously throwing resolver cannot surface into the listener's request handler", () => {
+    expect(() => acceptLanAnswer(delivery(), { resolveFn: () => { throw new Error("boom"); } })).not.toThrow();
   });
 });
 

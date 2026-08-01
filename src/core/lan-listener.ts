@@ -37,36 +37,50 @@
 // The ONE semantic exception is a well-formed, authenticated envelope naming an op this build does not
 // implement: that gets a SEALED 200 {"ok":false,"err":"bad-op"} so a newer phone can distinguish "this
 // Mac is alive but older" from "unreachable". Only a holder of K_lan can ever see that answer.
+//
+// PHASE 2 adds two ops on the same envelope (see the answer store below):
+//
+//   {"op":"answer",      payload:{"requestId":"<id>","answerBlob":"<b64 sealed under the PAIRING key>"}}
+//        → sealed {"ok":true}. The answerBlob is NEVER opened here: it is sealed under e2eKey, and the
+//          hold that consumes it (Claude hook / Codex relay) does the decrypt + requestId match exactly
+//          as it does for a worker-delivered answer. This listener is as blind as the worker.
+//   {"op":"answer-poll", payload:{"requestId":"<id>"}}
+//        → sealed {"status":"pending"} | {"status":"answered","answerBlob":"<b64>"} — the LOOPBACK-ONLY
+//          op the blocked Claude hook (a separate short-lived process with no IPC to this daemon) uses
+//          to read the store. Off-loopback callers get the same {"ok":false,"err":"bad-op"} any unknown
+//          op gets, so the phone cannot tell this op exists at all.
 
 import { createServer } from "node:http";
 import { readFile } from "node:fs/promises";
 import { networkInterfaces } from "node:os";
 import { b64url, decryptBlob, deriveLanKey, encryptBlob } from "./crypto";
-import { atomicWrite, CC_DIR, Config, traceSession } from "./shared";
+import { atomicWrite, Config, traceSession } from "./shared";
+import {
+  isLoopbackAddress, LAN_ANSWER_BLOB_MAX_CHARS, LAN_ENVELOPE_VERSION, LAN_PATH, LAN_REQUEST_ID_RE,
+  LAN_STATE_PATH, lanEnvelopeIsFresh, lanRunningUnderTest, parseLanEnvelope, parseLanState,
+} from "./lan-wire";
+import type { LanState } from "./lan-wire";
 
-/** The single endpoint. Anything else is a 400 — there is no index, no health page, no discovery URL. */
-export const LAN_PATH = "/v1/lan";
-/** Envelope version, inner request AND response. Bumped only on a breaking plaintext-shape change. */
-export const LAN_ENVELOPE_VERSION = 1;
+// The PURE wire contract lives in lan-wire.ts so the permission hook can speak it without bundling this
+// HTTP server (see that file's header). Re-exported here, unchanged, so every existing importer of
+// "./lan-listener" — tests included — keeps resolving exactly the same names.
+export {
+  isLoopbackAddress, LAN_ANSWER_BLOB_MAX_CHARS, LAN_ENVELOPE_VERSION, LAN_FUTURE_SKEW_MS, LAN_NONCE_MAX_CHARS,
+  LAN_PATH, LAN_REQUEST_ID_RE, LAN_STATE_PATH, LAN_TTL_MS, lanEnvelopeIsFresh, lanRunningUnderTest,
+  parseLanEnvelope, parseLanState,
+} from "./lan-wire";
+export type { LanEnvelope, LanState } from "./lan-wire";
+
 /** Request-body ceiling. A command envelope is a few hundred bytes; 64 KB is enormous headroom and
  *  still bounds what a hostile LAN peer can make this daemon buffer. Enforced on Content-Length AND on
  *  the streamed bytes (a chunked body has no honest Content-Length). */
 export const LAN_BODY_MAX_BYTES = 65_536;
-/** How old a sealed `ts` may be. Mirrors the worker path's COMMAND_TTL_MS so the two channels expire
- *  the same intent at the same moment — a phone that raced both legs must not have one of them still
- *  accepted after the other went stale. */
-export const LAN_TTL_MS = 120_000;
-/** How far a sealed `ts` may sit in the future. Mirrors COMMAND_FUTURE_SKEW_MS. */
-export const LAN_FUTURE_SKEW_MS = 30_000;
 /** Bound on the OUTER-nonce replay set. Deliberately SEPARATE from the watchdog's seenCommandNonces:
  *  that set guards the INNER (e2eKey-sealed) command nonce and is shared with the worker channel, which
  *  is exactly why it must not be consumed by outer-envelope traffic — a flood of junk LAN envelopes must
  *  not be able to evict a real command's inner nonce and reopen the cross-channel replay window.
  *  512 with FIFO eviction, same sizing argument as the inner set. */
 export const LAN_SEEN_NONCES_MAX = 512;
-/** Upper bound on the nonce string we will remember, so the seen-set cannot be grown by long values.
- *  The phone sends base64url of 16 CSPRNG bytes = 22 characters. */
-export const LAN_NONCE_MAX_CHARS = 64;
 /** Upper bound on a command's inner sealed blob. The worker path caps blobs at 3072 base64 chars
  *  (BLOB_FIT_CHARS + margin); the LAN path has no worker in it, but a bound is still a bound. */
 export const LAN_COMMAND_BLOB_MAX_CHARS = 8192;
@@ -74,18 +88,109 @@ export const LAN_COMMAND_BLOB_MAX_CHARS = 8192;
 const LAN_KEEPALIVE_MS = 5_000;
 const LAN_REQUEST_TIMEOUT_MS = 10_000;
 
-/** Where the bound port + listener-instance id are persisted, next to config.json (0600, atomicWrite —
- *  same directory discipline as every other piece of daemon state). Re-binding the SAME port across
- *  watchdog restarts is what lets the phone keep a cached endpoint working instead of re-probing. */
-export const LAN_STATE_PATH = `${CC_DIR}/lan.json`;
+/** How long a LAN-delivered answer stays consumable. Sized like LAN_TTL_MS: past two minutes the hold it
+ *  belongs to is gone (worker-expired, released, or the terminal was killed) and the entry is garbage. */
+export const LAN_ANSWER_TTL_MS = 120_000;
+/** Bound on the answer store, FIFO-evicted. One entry per LIVE permission prompt on this machine;
+ *  64 concurrent holds is already implausible, and the bound is what stops a K_lan holder from growing
+ *  this daemon's heap with answers no hold will ever read. */
+export const LAN_ANSWER_STORE_MAX = 64;
 
-/** What `lan.json` holds. `lid` identifies this LISTENER INSTANCE (not the machine): the phone caches
- *  per-lid, so a changed lid tells it "everything you cached about this endpoint is void". */
-export interface LanState {
-  port: number;
-  lid: string;
-  createdAt: number;
+/** One stored answer: the still-sealed phone ciphertext plus when it landed (TTL clock). */
+export interface LanAnswer {
+  answerBlob: string;
+  at: number;
 }
+
+/** A cancellable "tell me when an answer for this requestId lands" handle. `cancel()` MUST be called by
+ *  every waiter (a `finally`), or the store keeps a listener per abandoned poll tick. */
+export interface LanAnswerWaiter {
+  promise: Promise<void>;
+  cancel(): void;
+}
+
+/** The in-memory answer store: written by the listener's `answer` op, read by the `answer-poll` op (the
+ *  Claude hook's loopback client) and DIRECTLY by the in-process Codex relay (codex-remote-input), which
+ *  also uses `waiter` to skip its 3 s poll tick.
+ *
+ *  FIRST-WRITER-WINS, mirroring the worker's answer route: a second `answer` for a live requestId is
+ *  acknowledged (the phone must never see an error for a duplicate it deliberately raced) but does NOT
+ *  overwrite. Two different blobs for one requestId can only mean a retry or a racing tap, and the hold
+ *  has already been told about the first. */
+export interface LanAnswerStore {
+  /** Store unless this requestId already holds a live answer. Returns which happened — the caller uses
+   *  it to fire the worker echo exactly ONCE per genuinely stored answer. */
+  put(requestId: string, answerBlob: string, at: number): "stored" | "duplicate";
+  /** The live (non-expired) answer for this requestId, or undefined. Non-destructive: a hold may read
+   *  the same answer twice (worker poll and loopback poll can both be in flight) and TTL is the only
+   *  thing that removes an entry. */
+  peek(requestId: string, now: number): LanAnswer | undefined;
+  waiter(requestId: string, now: number): LanAnswerWaiter;
+  /** Live entry count (test/diagnostic seam). */
+  size(): number;
+}
+
+export function createLanAnswerStore(options: { ttlMs?: number; max?: number } = {}): LanAnswerStore {
+  const ttl = options.ttlMs ?? LAN_ANSWER_TTL_MS;
+  const max = options.max ?? LAN_ANSWER_STORE_MAX;
+  /** Insertion-ordered by construction (Map), which is what makes the eviction below FIFO. */
+  const entries = new Map<string, LanAnswer>();
+  const waiters = new Map<string, Set<() => void>>();
+
+  const live = (entry: LanAnswer | undefined, now: number): LanAnswer | undefined =>
+    entry && now - entry.at <= ttl && entry.at - now <= ttl ? entry : undefined;
+
+  return {
+    put(requestId: string, answerBlob: string, at: number): "stored" | "duplicate" {
+      const existing = entries.get(requestId);
+      if (live(existing, at)) return "duplicate"; // first writer wins (the worker's rule)
+      entries.delete(requestId); // re-insert so an expired entry's slot moves to the END of the FIFO
+      entries.set(requestId, { answerBlob, at });
+      while (entries.size > max) {
+        const oldest = entries.keys().next();
+        if (oldest.done) break;
+        entries.delete(oldest.value);
+      }
+      for (const notify of waiters.get(requestId) ?? []) {
+        try { notify(); } catch { /* a broken waiter must not break the store */ }
+      }
+      return "stored";
+    },
+    peek(requestId: string, now: number): LanAnswer | undefined {
+      const entry = entries.get(requestId);
+      const fresh = live(entry, now);
+      if (entry && !fresh) entries.delete(requestId); // expired → drop on read
+      return fresh;
+    },
+    waiter(requestId: string, now: number): LanAnswerWaiter {
+      if (this.peek(requestId, now)) return { promise: Promise.resolve(), cancel: () => { /* nothing registered */ } };
+      let settle!: () => void;
+      const promise = new Promise<void>((resolve) => { settle = resolve; });
+      const set = waiters.get(requestId) ?? new Set<() => void>();
+      set.add(settle);
+      waiters.set(requestId, set);
+      return {
+        promise,
+        cancel(): void {
+          const current = waiters.get(requestId);
+          if (current) {
+            current.delete(settle);
+            if (current.size === 0) waiters.delete(requestId);
+          }
+          settle(); // never leave a racing awaiter pending
+        },
+      };
+    },
+    size(): number {
+      return entries.size;
+    },
+  };
+}
+
+/** THE process-wide store. The listener writes it, the loopback `answer-poll` op reads it, and the Codex
+ *  relay (same process) reads it directly — one instance is what makes those three the same store. Tests
+ *  inject their own via `LanListenerDeps.answers` / `CodexRemoteInputDeps.answerStore`. */
+export const lanAnswerStore: LanAnswerStore = createLanAnswerStore();
 
 /** The listener's current address, once bound. */
 export interface LanAddress {
@@ -104,10 +209,31 @@ export interface LanCommand {
   config: Config;
 }
 
+/** A LAN-delivered approval answer, handed to the watchdog AFTER it has been stored (so the store is
+ *  already serving it when this fires). `answerBlob` is the untouched e2eKey-sealed ciphertext — the
+ *  listener never opens it; the hold that consumes it does, exactly as for a worker-delivered answer. */
+export interface LanAnswerDelivery {
+  requestId: string;
+  answerBlob: string;
+  /** The config the envelope authenticated against, so the sink can echo to the worker without a reload. */
+  config: Config;
+}
+
 export interface LanListenerDeps {
   /** Called when an authenticated `op:"command"` arrives. MUST return promptly: it runs on the HTTP
    *  request path, so the real implementation only buffers + schedules. */
   onCommand?: (command: LanCommand) => void;
+  /** Called ONCE per genuinely stored `op:"answer"` (never for a duplicate). Same contract as onCommand:
+   *  it runs on the request path, so the real implementation starts its work and returns — the phone's
+   *  sealed {"ok":true} must not wait for a worker round trip. */
+  onAnswer?: (answer: LanAnswerDelivery) => void;
+  /** The answer store this listener writes/serves. Defaults to the process-wide singleton, which is what
+   *  makes the in-process Codex relay see the same answers. */
+  answers?: LanAnswerStore;
+  /** How the peer's address is read, for the `answer-poll` loopback gate. Production reads node's
+   *  `req.socket.remoteAddress`; tests inject a LAN address to exercise the OFF-loopback branch, which is
+   *  otherwise unreachable from a test that (correctly) only ever binds loopback. */
+  remoteAddress?: (req: unknown) => string | undefined;
   /** Interface to bind. Defaults to every interface (that is the entire point); tests bind loopback. */
   host?: string;
   /** Where the port/lid are persisted. Injectable so tests never touch the user's real state dir. */
@@ -141,7 +267,7 @@ function traceLan(deps: LanListenerDeps, event: object): void {
     try { deps.trace(event); } catch { /* diagnostics only */ }
     return;
   }
-  if (process.argv.some((arg) => arg === "test" || arg.endsWith(".test.ts"))) return;
+  if (lanRunningUnderTest()) return;
   traceSession({ event: "lan", ...event });
 }
 
@@ -153,51 +279,6 @@ function defaultListenerId(): string {
     if (typeof c?.randomUUID === "function") return c.randomUUID();
   } catch { /* fall through to the random id */ }
   return b64url(crypto.getRandomValues(new Uint8Array(16)));
-}
-
-/** Parse `lan.json`. Anything malformed reads as "no persisted state" (bind fresh) — a corrupt file
- *  must never keep the listener from coming up. Pure. */
-export function parseLanState(raw: string): LanState | null {
-  try {
-    const parsed: unknown = JSON.parse(raw);
-    if (typeof parsed !== "object" || parsed === null) return null;
-    const s = parsed as Record<string, unknown>;
-    if (typeof s.port !== "number" || !Number.isInteger(s.port) || s.port < 1 || s.port > 65_535) return null;
-    if (typeof s.lid !== "string" || s.lid.length === 0 || s.lid.length > 128) return null;
-    const createdAt = typeof s.createdAt === "number" && Number.isFinite(s.createdAt) ? s.createdAt : 0;
-    return { port: s.port, lid: s.lid, createdAt };
-  } catch {
-    return null;
-  }
-}
-
-/** The inner request envelope, after the outer seal opens. Every field is phone-authored and
- *  tag-protected — nothing here is trustworthy before decryptBlob succeeded. */
-export interface LanEnvelope {
-  v: number;
-  op: string;
-  ts: number;
-  nonce: string;
-  payload: Record<string, unknown>;
-}
-
-/** Shape-check a DECRYPTED envelope. A failure here can only be a client bug (a forger cannot produce a
- *  valid GCM tag), and is still answered with the same opaque 400. Pure. */
-export function parseLanEnvelope(plain: unknown): LanEnvelope | null {
-  if (typeof plain !== "object" || plain === null) return null;
-  const e = plain as Record<string, unknown>;
-  if (e.v !== LAN_ENVELOPE_VERSION) return null;
-  if (typeof e.op !== "string" || e.op.length === 0 || e.op.length > 32) return null;
-  if (typeof e.ts !== "number" || !Number.isFinite(e.ts)) return null;
-  if (typeof e.nonce !== "string" || e.nonce.length === 0 || e.nonce.length > LAN_NONCE_MAX_CHARS) return null;
-  if (typeof e.payload !== "object" || e.payload === null || Array.isArray(e.payload)) return null;
-  return { v: e.v, op: e.op, ts: e.ts, nonce: e.nonce, payload: e.payload as Record<string, unknown> };
-}
-
-/** Freshness on the AUTHENTICATED clock, with the worker channel's exact bounds. Pure. */
-export function lanEnvelopeIsFresh(ts: number, now: number): boolean {
-  if (ts > now + LAN_FUTURE_SKEW_MS) return false;
-  return now - ts <= LAN_TTL_MS;
 }
 
 /** Add to a bounded insertion-ordered set, evicting oldest-first (mirrors the watchdog's helper). */
@@ -218,6 +299,8 @@ interface LanReq {
   method?: string;
   url?: string;
   headers: Record<string, string | string[] | undefined>;
+  /** node's connection socket. Only `remoteAddress` is read — the loopback gate on `answer-poll`. */
+  socket?: { remoteAddress?: string };
   on(event: string, listener: (arg?: unknown) => void): unknown;
   pause(): unknown;
 }
@@ -295,6 +378,8 @@ export function createLanListener(deps: LanListenerDeps = {}): LanListener {
   let stopped = false;
   const sockets = new Set<{ destroy(): unknown }>();
   const seenNonces = new Set<string>();
+  const answers = deps.answers ?? lanAnswerStore;
+  const peerAddress = deps.remoteAddress ?? ((req: unknown) => (req as LanReq)?.socket?.remoteAddress);
 
   /** The CURRENT pairing, refreshed by sync(). Null while unpaired — every request then fails to
    *  decrypt (there is no key) and gets the same opaque 400 as a wrong-key probe. */
@@ -358,6 +443,34 @@ export function createLanListener(deps: LanListenerDeps = {}): LanListener {
         // and its worker twin collapse on the SAME inner nonce.
         try { deps.onCommand?.({ nonce: envelope.nonce, blob, config: pairing }); } catch { /* never fail the response on the sink */ }
         payload = { ok: true };
+      } else if (envelope.op === "answer") {
+        const requestId = envelope.payload.requestId;
+        const answerBlob = envelope.payload.answerBlob;
+        if (typeof requestId !== "string" || !LAN_REQUEST_ID_RE.test(requestId)) return reject(res, "answer-request-id");
+        if (typeof answerBlob !== "string" || answerBlob.length === 0 || answerBlob.length > LAN_ANSWER_BLOB_MAX_CHARS) {
+          return reject(res, "answer-blob");
+        }
+        // Store FIRST (synchronously), so the loopback `answer-poll` and the in-process Codex relay are
+        // already able to see this answer before the phone even gets its ok back.
+        const stored = answers.put(requestId, answerBlob, now());
+        if (stored === "stored") {
+          // The split-brain backstop: tell the worker this request is resolved so the island's Allow/Deny
+          // buttons retire even when the phone's own parallel worker leg failed. Fire-and-forget by
+          // contract — the sink starts the POST and returns; the response below never waits on it, and a
+          // failure is traced, never thrown (and NEVER a gone strike: that is worker-authority only).
+          try { deps.onAnswer?.({ requestId, answerBlob, config: pairing }); } catch { /* never fail the response on the sink */ }
+        }
+        payload = { ok: true }; // a duplicate is still an ok: the phone deliberately raced two channels
+      } else if (envelope.op === "answer-poll" && isLoopbackAddress(peerAddress(req))) {
+        // LOOPBACK ONLY. This op exists for the blocked Claude hook — a separate short-lived process on
+        // THIS machine with no IPC to the daemon. The phone never needs it, so an off-LAN-address caller
+        // falls through to the bad-op branch below and cannot even learn the op exists.
+        const requestId = envelope.payload.requestId;
+        if (typeof requestId !== "string" || !LAN_REQUEST_ID_RE.test(requestId)) return reject(res, "answer-poll-request-id");
+        const hit = answers.peek(requestId, now());
+        // The SAME shape the worker's GET /v1/cc/decision/:id returns, so the hook's answer branch is
+        // reused verbatim across both channels.
+        payload = hit ? { status: "answered", answerBlob: hit.answerBlob } : { status: "pending" };
       } else {
         payload = { ok: false, err: "bad-op" };
       }

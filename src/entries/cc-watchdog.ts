@@ -40,7 +40,8 @@ import type { FocusContext, FocusResult } from "../core/terminal-focus";
 import { CodexRemoteInputBridge } from "../core/codex-remote-input-bridge";
 import type { CodexThreadWaitState } from "../core/codex-remote-input-bridge";
 import { createLanHintPublisher, createLanListener } from "../core/lan-listener";
-import type { LanCommand, LanListener } from "../core/lan-listener";
+import type { LanAnswerDelivery, LanCommand, LanListener } from "../core/lan-listener";
+import { resolveOnRelay } from "../core/codex-remote-input";
 import type { PlanPickerTraceDecision } from "../core/shared";
 import {
   AgentKind, appendFittedPlanAndDebug, atomicWrite, CC_DIR, CCOp, CCStatus, codexAppServerSocketAvailable, Config, completePendingPairing, formatPlanPickerDebug, formatWatchdogPidfile,
@@ -1309,6 +1310,51 @@ export function acceptLanCommand(command: LanCommand, deps: DrainCommandsDeps = 
     return enqueueDrainCommands(command.config, deps).catch(() => 0);
   } catch {
     return Promise.resolve(0); // a malformed sink call must never surface anywhere
+  }
+}
+
+// --- LAN answer intake (phone → Mac, direct, same network) -------------------------------------
+//
+// The listener has ALREADY stored the sealed answer by the time this runs (the store is what the Claude
+// hook's loopback poll and the in-process Codex relay read), so this sink has exactly one job: the
+// SPLIT-BRAIN BACKSTOP. The phone dispatches its answer down both legs in parallel; if its worker leg
+// failed while its LAN leg succeeded, the worker still holds a `pending` decision record and the island
+// keeps showing live Allow/Deny buttons for a prompt that is already answered. Echoing the existing
+// blob-free /v1/cc/decision/resolve retires it.
+//
+// THREE properties this must keep, all of them non-negotiable:
+//  - OFF THE REQUEST PATH: the listener calls this and returns immediately; the phone's sealed {"ok":true}
+//    never waits for a worker round trip (resolveOnRelay's own ceiling is 15 s).
+//  - NEVER THROWS: it runs from an HTTP handler's stack. resolveOnRelay swallows everything; the extra
+//    try/catch here covers a synchronous throw before the promise even exists.
+//  - NEVER A GONE STRIKE: a 404/410 here means "that record is already gone", which is the NORMAL case
+//    when the phone's own worker leg won the race. The gone-strike ladder is a /cc/event (worker
+//    AUTHORITY) signal only — structurally so, since this path never calls recordGoneStrike.
+//
+// The echo can only ever retire a record that is STILL PENDING (the worker gives a phone answer
+// precedence over this transition and returns its terminal state untouched), so it cannot destroy an
+// answer a hold is mid-poll for. The one degraded case the design accepts: the phone's worker leg AND
+// the hold's loopback poll both fail while this echo succeeds — the prompt then falls open to the
+// terminal dialog, which is the fail-open outcome, never a misapplied decision.
+
+/** The listener's answer sink. Fire-and-forget: the returned promise is for TESTS ONLY (the listener
+ *  wires this in as a void-returning `onAnswer`) and always resolves. */
+export function acceptLanAnswer(
+  answer: LanAnswerDelivery,
+  deps: {
+    resolveFn?: (config: Config, requestId: string) => Promise<void>;
+    trace?: (event: object) => void;
+  } = {},
+): Promise<void> {
+  try {
+    const resolve = deps.resolveFn ?? ((config: Config, requestId: string) => resolveOnRelay(config, requestId, fetch));
+    return resolve(answer.config, answer.requestId).catch(() => {
+      // Best-effort by design: if this echo ALSO fails, the worker's own ~30 s poll-liveness sweep
+      // expires the record. Traced, never surfaced — the daemon's contract is silence.
+      traceFocus(deps, { event: "lan", result: "echo-failed", requestId: answer.requestId });
+    });
+  } catch {
+    return Promise.resolve(); // a malformed sink call must never surface anywhere
   }
 }
 
@@ -2964,7 +3010,12 @@ async function run(): Promise<void> {
   // own the socket (and the persisted port in lan.json), and a losing instance returned above without
   // ever reaching here. createLanListener returns immediately — the bind runs off this stack, so a
   // refused/occupied port can never delay the first sweep.
-  const lan = createLanListener({ onCommand: acceptLanCommand });
+  const lan = createLanListener({
+    onCommand: acceptLanCommand,
+    // Phase 2: the listener stores the sealed answer itself (the hook's loopback poll and the Codex
+    // relay read that store); this sink only fires the worker echo, off the response path.
+    onAnswer: (answer) => { void acceptLanAnswer(answer); },
+  });
   activeLanListener = lan;
   const shutdown = (): void => {
     bridges.shutdown();

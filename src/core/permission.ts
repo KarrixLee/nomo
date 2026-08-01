@@ -18,7 +18,7 @@
 // PORTABILITY: runs unmodified under bun AND node >= 18 — no `Bun.*` APIs. build.ts bundles this into
 // dist/cc-permission.mjs.
 
-import { realpath, unlink } from "node:fs/promises";
+import { readFile, realpath, unlink } from "node:fs/promises";
 import { appendFileSync, statSync, truncateSync } from "node:fs";
 import { hostname } from "node:os";
 import { basename, isAbsolute, relative, resolve } from "node:path";
@@ -27,7 +27,13 @@ import {
   AgentKind, atomicWrite, BLOB_FIT_CHARS, CC_DIR, codexHome, Config, flagExists, loadConfig, NO_HOLD_PATH,
   PLUGIN_VERSION, readPrefix, readRecord, readSuffix, sealedBlobChars, SessionRecord,
 } from "./shared";
-import { decryptBlob, encryptBlob } from "./crypto";
+import { b64url, decryptBlob, deriveLanKey, encryptBlob } from "./crypto";
+// The PURE wire contract only — deliberately NOT "./lan-listener": this hook is a short-lived process
+// spawned on every permission prompt and must not bundle (or load node:http for) an HTTP server it can
+// never start. See lan-wire.ts's header.
+import {
+  LAN_ENVELOPE_VERSION, LAN_PATH, LAN_STATE_PATH, lanRunningUnderTest, parseLanState,
+} from "./lan-wire";
 
 /** Local escape-hatch flag: when this file exists, the hook skips the hold entirely and behaves as a
  *  plain fire-and-forget attention event (instant terminal dialog). Toggled by `cc-permission off|on`.
@@ -803,6 +809,194 @@ function emitDecision(
   }
 }
 
+// ---- LAN loopback answer poll (NOM-44 phase 2) ----------------------------------------------
+//
+// The watchdog's LAN listener can be handed the phone's answer DIRECTLY over the local network
+// (op:"answer"), which is ~100 ms instead of the ~5-12 s a worker round trip costs. But this hook is a
+// SEPARATE, short-lived process with no IPC to that daemon, so it reads the store the only way it can:
+// a loopback HTTP poll of the listener's `answer-poll` op, every ~300 ms.
+//
+// THE NON-NEGOTIABLE: the 3 s worker poll is the Mac's LIVENESS PROOF (30 s of silence and the worker
+// expires the hold), so it is not slowed, skipped, or reordered by any of this. The loopback poller runs
+// as its OWN detached ticker and the hold loop merely RACES its unchanged `sleep(interval + jitter())`
+// against "an answer arrived" — the sleep still resolves at exactly the same moment it always did.
+// Everything else follows from "LAN is additive": a loopback failure is silent (one trace line per hold,
+// never per attempt), never counts toward MAX_CONSECUTIVE_MISSES or DEFINITIVE_POLL_STATUSES or a gone
+// strike (those are worker-authority signals), and with no lan.json there is no ticker at all.
+
+/** Loopback poll cadence. ~10 ticks inside one worker poll interval. */
+const LOOPBACK_POLL_INTERVAL_MS = 300;
+/** Per-attempt ceiling. The peer is a socket on this same machine: anything slower than this is a dead
+ *  or wedged listener, and waiting longer only delays the next tick. */
+const LOOPBACK_FETCH_TIMEOUT_MS = 250;
+/** Consecutive loopback failures before this hold stops trying. The watchdog can die mid-hold (that is
+ *  the whole robustness case) and the worker poll is still running, so there is nothing to recover. */
+const LOOPBACK_MAX_CONSECUTIVE_ERRORS = 5;
+
+export interface LoopbackAnswerPollerDeps {
+  fetchFn: typeof fetch;
+  now: () => number;
+  trace: (event: object) => void;
+  /** lan.json (the listener's port). `undefined` disables the poller outright — zero timers, zero HTTP,
+   *  byte-identical behavior to the pre-phase-2 hook. */
+  statePath?: string;
+  /** The ticker's OWN pacing clock — a real unref'd timer by default and deliberately NOT the hook's
+   *  injected `sleep`: the hold tests inject an INSTANT sleep for the worker cadence, and sharing it here
+   *  would turn this ticker into a hot loop. */
+  sleep?: (ms: number) => Promise<void>;
+  intervalMs?: number;
+  /** How often the ABSENCE of lan.json is re-checked. Defaults to the worker poll interval, so a watchdog
+   *  that comes up mid-hold is picked up within one worker cycle — and never re-stat'ed per 300 ms tick. */
+  discoverIntervalMs?: number;
+}
+
+export interface LoopbackAnswerPoller {
+  /** Race the caller's OWN, untouched poll sleep against a LAN-delivered answer. Resolves with the
+   *  sealed answerBlob when one arrived first, or undefined when the sleep simply finished. */
+  wait(sleeping: Promise<void>): Promise<string | undefined>;
+  /** Stop the ticker (always call from a `finally` — a hold can return from a dozen places). */
+  stop(): void;
+}
+
+/** The loopback poller for ONE hold. Derives K_lan itself (the hook has config.e2eKey + pairingId) and
+ *  seals every request with a fresh nonce and the current ts, exactly like the phone does. */
+export function createLoopbackAnswerPoller(
+  config: Config,
+  requestId: string,
+  deps: LoopbackAnswerPollerDeps,
+): LoopbackAnswerPoller {
+  const interval = deps.intervalMs ?? LOOPBACK_POLL_INTERVAL_MS;
+  const discoverInterval = deps.discoverIntervalMs ?? POLL_INTERVAL_MS;
+  const tick = deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => {
+    const timer = setTimeout(resolve, ms);
+    (timer as unknown as { unref?: () => void }).unref?.();
+  }));
+
+  let live = deps.statePath !== undefined;
+  let started = false;
+  let port: number | undefined;
+  let lastDiscoverAt = 0;
+  let errors = 0;
+  let traced = false;
+  let pending: string | undefined;
+  /** The one-shot wake. It is never re-armed, because the ticker delivers at most ONE answer per hold
+   *  (see the ticker): after that the poller is retired and only the worker poll remains. */
+  let wakeResolve: () => void = () => { /* replaced immediately below */ };
+  let wake: Promise<void> = new Promise<void>((resolve) => { wakeResolve = resolve; });
+  let keyPromise: Promise<Uint8Array> | undefined;
+
+  /** ONE trace line per hold, never per attempt — a dead listener must not spam permission-trace.log. */
+  const note = (result: string): void => {
+    if (traced) return;
+    traced = true;
+    try { deps.trace({ event: "lan-poll", result }); } catch { /* diagnostics only */ }
+  };
+
+  const key = (): Promise<Uint8Array> => (keyPromise ??= deriveLanKey(config.e2eKey, config.pairingId));
+
+  const readPort = async (): Promise<number | undefined> => {
+    if (deps.statePath === undefined) return undefined;
+    try {
+      return parseLanState(await readFile(deps.statePath, "utf8"))?.port;
+    } catch {
+      return undefined; // no watchdog / no listener → nothing to poll, silently
+    }
+  };
+
+  /** ONE loopback poll. Never throws; every failure just increments the strike counter. */
+  const attempt = async (): Promise<string | undefined> => {
+    try {
+      const k = await key();
+      const nonce = b64url(crypto.getRandomValues(new Uint8Array(16)));
+      const body = JSON.stringify({
+        p: await encryptBlob(k, {
+          v: LAN_ENVELOPE_VERSION, op: "answer-poll", ts: deps.now(), nonce, payload: { requestId },
+        }),
+      });
+      const res = await deps.fetchFn(`http://127.0.0.1:${port}${LAN_PATH}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body,
+        signal: AbortSignal.timeout(LOOPBACK_FETCH_TIMEOUT_MS),
+      });
+      if (!res.ok) { errors += 1; return undefined; }
+      const outer = (await res.json()) as { p?: unknown };
+      if (typeof outer?.p !== "string") { errors += 1; return undefined; }
+      const opened = (await decryptBlob(k, outer.p)) as {
+        reqNonce?: unknown; payload?: { status?: unknown; answerBlob?: unknown };
+      };
+      // The sealed response echoes OUR nonce; anything else is a replayed response and is not an answer.
+      if (opened.reqNonce !== nonce) { errors += 1; return undefined; }
+      errors = 0; // a well-formed sealed answer-poll reply, pending or not, is a healthy listener
+      const payload = opened.payload;
+      if (payload?.status === "answered" && typeof payload.answerBlob === "string" && payload.answerBlob.length > 0) {
+        return payload.answerBlob;
+      }
+      return undefined;
+    } catch {
+      errors += 1;
+      return undefined; // timeout, refused socket, undecryptable reply — all silent, all the same
+    }
+  };
+
+  /** The detached ticker. It is the ONLY thing that touches the network here, and nothing in the hold
+   *  loop ever awaits it — that is what keeps the worker cadence provably untouched. */
+  const ticker = async (): Promise<void> => {
+    while (live) {
+      await tick(interval);
+      if (!live) return;
+      if (port === undefined) {
+        const t = deps.now();
+        if (lastDiscoverAt !== 0 && t - lastDiscoverAt < discoverInterval) continue;
+        lastDiscoverAt = t;
+        port = await readPort();
+        if (port === undefined) continue; // no listener yet: no HTTP at all, re-check next worker cycle
+      }
+      const blob = await attempt();
+      if (!live) return;
+      if (blob !== undefined) {
+        // ONE delivery per hold. The consumer either ends the hold with it or (an unrecognized verb) keeps
+        // waiting on the WORKER — re-serving the same stored blob every 300 ms would spin the hold loop.
+        pending = blob;
+        wakeResolve();
+        return;
+      }
+      if (errors >= LOOPBACK_MAX_CONSECUTIVE_ERRORS) {
+        note("give-up"); // the worker poll is still running; this hold simply stops trying locally
+        live = false;
+        return;
+      }
+    }
+  };
+
+  return {
+    async wait(sleeping: Promise<void>): Promise<string | undefined> {
+      if (!live) { await sleeping; return undefined; }
+      if (!started) {
+        started = true;
+        void ticker().catch(() => { live = false; note("error"); });
+      }
+      await Promise.race([sleeping, wake]);
+      if (pending === undefined) return undefined; // the worker sleep finished first — cadence unchanged
+      const blob = pending;
+      pending = undefined;
+      live = false;
+      return blob;
+    },
+    stop(): void {
+      live = false;
+      wakeResolve();
+    },
+  };
+}
+
+/** lan.json in production; nothing under `bun test`, where the developer's REAL listener would otherwise
+ *  be polled by unit tests (same guard, same reason, as lan-listener's traceLan). Tests that exercise the
+ *  loopback path inject `lanStatePath` explicitly. */
+function defaultLanStatePath(): string | undefined {
+  return lanRunningUnderTest() ? undefined : LAN_STATE_PATH;
+}
+
 /** Injectable seams so permission.test.ts drives the state machine with a scripted fetch, an instant
  *  sleep, a deterministic requestId, and a temp flag path — no real stdin/network/timers. Production
  *  uses every default. */
@@ -832,6 +1026,15 @@ export interface PermissionHookDeps {
    *  TRACE_PATH plus the signal/exit capture handlers; tests pass a collector or a noop so they touch
    *  neither the real filesystem nor global process handlers. */
   trace?: (event: object) => void;
+  /** lan.json for the LAN loopback answer poll (NOM-44 phase 2). Defaults to the real path in
+   *  production and to NOTHING under `bun test` — see defaultLanStatePath. */
+  lanStatePath?: string;
+  /** Transport for the loopback poll only. Defaults to `fetchFn`, so a test that scripts the worker also
+   *  sees the loopback attempts; a test driving a REAL listener passes the real fetch here. */
+  lanFetchFn?: typeof fetch;
+  /** The loopback ticker's own pacing clock + cadence (never the hook's `sleep` — see the poller). */
+  lanSleep?: (ms: number) => Promise<void>;
+  lanIntervalMs?: number;
 }
 
 async function readStdin(): Promise<string> {
@@ -851,6 +1054,9 @@ async function readStdin(): Promise<string> {
 export async function runPermissionHook(deps: PermissionHookDeps = {}, agent: AgentKind = "claude"): Promise<void> {
   const noHoldPath = deps.noHoldPath ?? NO_HOLD_PATH;
   const trace = deps.trace ?? defaultTrace();
+  /** The hold's LAN loopback poller, once a hold is granted. Function-scoped ONLY so the `finally` below
+   *  can stop its detached ticker no matter which of the loop's many exits fired. */
+  let loopback: LoopbackAnswerPoller | undefined;
   try {
     // Escape hatch FIRST (a file stat — no stdin consumed yet): if the user paused remote approvals
     // locally, behave exactly as the old fire-and-forget attention event (instant terminal dialog).
@@ -1124,6 +1330,44 @@ export async function runPermissionHook(deps: PermissionHookDeps = {}, agent: Ag
     const jitter = deps.jitter ?? (() => Math.floor(Math.random() * 500));
     const interval = deps.pollIntervalMs ?? POLL_INTERVAL_MS;
     const emit = deps.emit ?? ((line: string) => process.stdout.write(`${line}\n`));
+
+    /** Apply ONE sealed answer blob to this hold, from EITHER delivery channel — the 3 s worker poll or
+     *  the ~300 ms LAN loopback poll. THE single answered-branch body, so the two sources cannot drift:
+     *  decrypt → requestId match → emitDecision → THE RELEASE RULE (see emitDecision). "done" means the
+     *  hold is over (exactly one line emitted, or deliberately zero); "keep-polling" is only ever an
+     *  UNRECOGNIZED decision verb. A decrypt failure throws to the outer catch → silent exit 0 (fail
+     *  open), unchanged and identical on both channels. */
+    const applyAnswerBlob = async (answerBlob: string, src: "worker" | "lan"): Promise<"done" | "keep-polling"> => {
+      const answer = (await decryptBlob(config.e2eKey, answerBlob)) as
+        { requestId?: unknown; decision?: unknown; message?: unknown; answers?: unknown };
+      const match = answer.requestId === requestId;
+      // A matched, KNOWN decision either emits one line ("emitted") or deliberately emits nothing and
+      // lets the hold go ("released" — THE RELEASE RULE); both are DONE. A requestId MISMATCH is a
+      // replay/stale answer (silent, done). The ONE keep-polling case is a matched but UNRECOGNIZED
+      // decision verb (newer phone, older plugin): a decision we DO understand can still land.
+      const outcome: DecisionOutcome = match
+        ? emitDecision(agent, answer, toolName, toolInput, suggestions, emit, trace)
+        : "released";
+      if (outcome !== "keep-polling") {
+        trace({ event: "answered", match, outcome, src });
+        trace({ event: "exit", reason: "answered" });
+        return "done";
+      }
+      return "keep-polling";
+    };
+
+    // The LAN fast path, alongside (never instead of) the worker poll below. Inert when there is no
+    // lan.json — i.e. no watchdog listener — which is byte-for-byte the pre-phase-2 hook. Held in the
+    // function-scope handle so the outer `finally` can stop the ticker from EVERY exit of this loop.
+    loopback = createLoopbackAnswerPoller(config, requestId, {
+      fetchFn: deps.lanFetchFn ?? fetchFn,
+      now: deps.now ?? Date.now,
+      trace,
+      statePath: deps.lanStatePath ?? defaultLanStatePath(),
+      sleep: deps.lanSleep,
+      intervalMs: deps.lanIntervalMs,
+      discoverIntervalMs: interval,
+    });
     let misses = 0;
     let definitiveFailures = 0;
     /** The answerBlob of the last UNRECOGNIZED decision, and how many times in a row it has been read —
@@ -1139,21 +1383,10 @@ export async function runPermissionHook(deps: PermissionHookDeps = {}, agent: Ag
         misses = 0;
         definitiveFailures = 0;
         if (data.status === "answered" && typeof data.answerBlob === "string") {
-          // A decrypt failure here throws to the outer catch → silent exit 0 (fail open), never a retry.
-          const answer = (await decryptBlob(config.e2eKey, data.answerBlob)) as
-            { requestId?: unknown; decision?: unknown; message?: unknown; answers?: unknown };
-          const match = answer.requestId === requestId;
-          // A matched, KNOWN decision either emits one line ("emitted") or deliberately emits nothing
-          // and lets the hold go ("released" — see THE RELEASE RULE in emitDecision); both are DONE. A
-          // requestId MISMATCH is a replay/stale answer (silent, done — unchanged). The ONE keep-polling
-          // case is a matched but UNRECOGNIZED decision verb (newer phone, older plugin): we skip the
-          // return and fall through to the sleep so a decision we DO understand can still land.
-          const outcome: DecisionOutcome = match
-            ? emitDecision(agent, answer, toolName, toolInput, suggestions, emit, trace)
-            : "released";
-          if (outcome !== "keep-polling") {
-            trace({ event: "answered", match, outcome });
-            trace({ event: "exit", reason: "answered" });
+          // The SHARED answered branch (applyAnswerBlob above) — byte-identical handling whether this
+          // blob came from the worker poll or the LAN loopback poll. A decrypt failure inside it throws
+          // to the outer catch → silent exit 0 (fail open), never a retry.
+          if (await applyAnswerBlob(data.answerBlob, "worker") === "done") {
             return; // done — exactly one line emitted, or zero (release / mismatch)
           }
           // UNKNOWN decision verb — keep polling, but BOUNDED. An `answered` record is TERMINAL on the
@@ -1197,13 +1430,26 @@ export async function runPermissionHook(deps: PermissionHookDeps = {}, agent: Ag
           return; // sustained downlink failure → fail open silently
         }
       }
-      await sleep(interval + jitter());
+      // THE WORKER CADENCE IS THIS LINE, UNCHANGED: `sleep(interval + jitter())` is still what paces the
+      // loop. The race only lets a LAN-delivered answer cut the wait SHORT — it can never extend it, and
+      // the loopback ticker runs on its own stack, so a wedged listener cannot delay the next poll.
+      const lanBlob = await loopback.wait(sleep(interval + jitter()));
+      if (lanBlob !== undefined) {
+        // Same code path as a worker-delivered answer, by construction. An unrecognized verb here does
+        // NOT keep the LAN channel open (the poller retires itself after one delivery): the worker poll
+        // owns the bounded unknown-answer wait, exactly as before.
+        if (await applyAnswerBlob(lanBlob, "lan") === "done") return;
+      }
     }
   } catch (e) {
     // Silence + exit 0 is the contract — never surface into a Claude Code session, never block. The
     // error is recorded by CLASS (+ code) only — see errorTag: a thrown message can quote the hook
     // payload it choked on, and this trace is a plaintext file on disk.
     trace({ event: "exit", reason: "exception", ...errorTag(e) });
+  } finally {
+    // Stop the detached loopback ticker on EVERY exit (emitted, released, give-up, exception). The
+    // process is normally about to exit anyway; this is what keeps it from outliving the hold in-process.
+    try { loopback?.stop(); } catch { /* best-effort */ }
   }
 }
 

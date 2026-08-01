@@ -2,7 +2,7 @@ import { createRequire } from "node:module";
 var __require = /* @__PURE__ */ createRequire(import.meta.url);
 
 // src/entries/cc-watchdog.ts
-import { readdir as readdir3, readFile as readFile5, unlink as unlink4 } from "node:fs/promises";
+import { readdir as readdir3, readFile as readFile6, unlink as unlink4 } from "node:fs/promises";
 import { readFileSync as readFileSync2, statSync as statSync3, unlinkSync } from "node:fs";
 import { hostname as hostname4 } from "node:os";
 import { basename as basename4 } from "node:path";
@@ -3120,14 +3120,571 @@ class CodexProxyTransport {
 // src/core/codex-remote-input.ts
 import { hostname as hostname3 } from "node:os";
 
+// src/core/lan-listener.ts
+import { createServer } from "node:http";
+import { readFile as readFile3 } from "node:fs/promises";
+import { networkInterfaces } from "node:os";
+
+// src/core/lan-wire.ts
+var LAN_PATH = "/v1/lan";
+var LAN_ENVELOPE_VERSION = 1;
+var LAN_TTL_MS = 120000;
+var LAN_FUTURE_SKEW_MS = 30000;
+var LAN_NONCE_MAX_CHARS = 64;
+var LAN_REQUEST_ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
+var LAN_ANSWER_BLOB_MAX_CHARS = 3072;
+var LAN_STATE_PATH = `${CC_DIR}/lan.json`;
+function parseLanState(raw) {
+  try {
+    const parsed = JSON.parse(raw);
+    if (typeof parsed !== "object" || parsed === null)
+      return null;
+    const s = parsed;
+    if (typeof s.port !== "number" || !Number.isInteger(s.port) || s.port < 1 || s.port > 65535)
+      return null;
+    if (typeof s.lid !== "string" || s.lid.length === 0 || s.lid.length > 128)
+      return null;
+    const createdAt = typeof s.createdAt === "number" && Number.isFinite(s.createdAt) ? s.createdAt : 0;
+    return { port: s.port, lid: s.lid, createdAt };
+  } catch {
+    return null;
+  }
+}
+function parseLanEnvelope(plain) {
+  if (typeof plain !== "object" || plain === null)
+    return null;
+  const e = plain;
+  if (e.v !== LAN_ENVELOPE_VERSION)
+    return null;
+  if (typeof e.op !== "string" || e.op.length === 0 || e.op.length > 32)
+    return null;
+  if (typeof e.ts !== "number" || !Number.isFinite(e.ts))
+    return null;
+  if (typeof e.nonce !== "string" || e.nonce.length === 0 || e.nonce.length > LAN_NONCE_MAX_CHARS)
+    return null;
+  if (typeof e.payload !== "object" || e.payload === null || Array.isArray(e.payload))
+    return null;
+  return { v: e.v, op: e.op, ts: e.ts, nonce: e.nonce, payload: e.payload };
+}
+function lanEnvelopeIsFresh(ts, now) {
+  if (ts > now + LAN_FUTURE_SKEW_MS)
+    return false;
+  return now - ts <= LAN_TTL_MS;
+}
+function isLoopbackAddress(address) {
+  if (typeof address !== "string" || address.length === 0)
+    return false;
+  const bare = address.startsWith("::ffff:") ? address.slice(7) : address;
+  return bare === "::1" || bare === "127.0.0.1" || bare.startsWith("127.");
+}
+function lanRunningUnderTest() {
+  return process.argv.some((arg) => arg === "test" || arg.endsWith(".test.ts"));
+}
+
+// src/core/lan-listener.ts
+var LAN_BODY_MAX_BYTES = 65536;
+var LAN_SEEN_NONCES_MAX = 512;
+var LAN_COMMAND_BLOB_MAX_CHARS = 8192;
+var LAN_KEEPALIVE_MS = 5000;
+var LAN_REQUEST_TIMEOUT_MS = 1e4;
+var LAN_ANSWER_TTL_MS = 120000;
+var LAN_ANSWER_STORE_MAX = 64;
+function createLanAnswerStore(options = {}) {
+  const ttl = options.ttlMs ?? LAN_ANSWER_TTL_MS;
+  const max = options.max ?? LAN_ANSWER_STORE_MAX;
+  const entries = new Map;
+  const waiters = new Map;
+  const live = (entry, now) => entry && now - entry.at <= ttl && entry.at - now <= ttl ? entry : undefined;
+  return {
+    put(requestId, answerBlob, at) {
+      const existing = entries.get(requestId);
+      if (live(existing, at))
+        return "duplicate";
+      entries.delete(requestId);
+      entries.set(requestId, { answerBlob, at });
+      while (entries.size > max) {
+        const oldest = entries.keys().next();
+        if (oldest.done)
+          break;
+        entries.delete(oldest.value);
+      }
+      for (const notify of waiters.get(requestId) ?? []) {
+        try {
+          notify();
+        } catch {}
+      }
+      return "stored";
+    },
+    peek(requestId, now) {
+      const entry = entries.get(requestId);
+      const fresh = live(entry, now);
+      if (entry && !fresh)
+        entries.delete(requestId);
+      return fresh;
+    },
+    waiter(requestId, now) {
+      if (this.peek(requestId, now))
+        return { promise: Promise.resolve(), cancel: () => {} };
+      let settle;
+      const promise = new Promise((resolve) => {
+        settle = resolve;
+      });
+      const set = waiters.get(requestId) ?? new Set;
+      set.add(settle);
+      waiters.set(requestId, set);
+      return {
+        promise,
+        cancel() {
+          const current = waiters.get(requestId);
+          if (current) {
+            current.delete(settle);
+            if (current.size === 0)
+              waiters.delete(requestId);
+          }
+          settle();
+        }
+      };
+    },
+    size() {
+      return entries.size;
+    }
+  };
+}
+var lanAnswerStore = createLanAnswerStore();
+var textDecoder2 = new TextDecoder;
+function traceLan(deps, event) {
+  if (deps.trace) {
+    try {
+      deps.trace(event);
+    } catch {}
+    return;
+  }
+  if (lanRunningUnderTest())
+    return;
+  traceSession({ event: "lan", ...event });
+}
+function defaultListenerId() {
+  const c = globalThis.crypto;
+  try {
+    if (typeof c?.randomUUID === "function")
+      return c.randomUUID();
+  } catch {}
+  return b64url(crypto.getRandomValues(new Uint8Array(16)));
+}
+function rememberBounded(set, value, max) {
+  set.add(value);
+  while (set.size > max) {
+    const oldest = set.values().next();
+    if (oldest.done)
+      break;
+    set.delete(oldest.value);
+  }
+}
+function readBody(req, max) {
+  return new Promise((resolve) => {
+    const declared = Number(req.headers["content-length"]);
+    if (Number.isFinite(declared) && declared > max) {
+      try {
+        req.pause();
+      } catch {}
+      resolve(null);
+      return;
+    }
+    const chunks = [];
+    let total = 0;
+    let settled = false;
+    const done = (value) => {
+      if (settled)
+        return;
+      settled = true;
+      resolve(value);
+    };
+    req.on("data", (chunk) => {
+      const bytes = chunk;
+      total += bytes.length;
+      if (total > max) {
+        try {
+          req.pause();
+        } catch {}
+        done(null);
+        return;
+      }
+      chunks.push(bytes);
+    });
+    req.on("end", () => {
+      const merged = new Uint8Array(total);
+      let offset = 0;
+      for (const c of chunks) {
+        merged.set(c, offset);
+        offset += c.length;
+      }
+      done(textDecoder2.decode(merged));
+    });
+    req.on("error", () => done(null));
+    req.on("aborted", () => done(null));
+  });
+}
+function createLanListener(deps = {}) {
+  const host = deps.host ?? "0.0.0.0";
+  const statePath = deps.statePath ?? LAN_STATE_PATH;
+  const now = deps.now ?? Date.now;
+  const newListenerId = deps.newListenerId ?? defaultListenerId;
+  let server;
+  let address = null;
+  let stopped = false;
+  const sockets = new Set;
+  const seenNonces = new Set;
+  const answers = deps.answers ?? lanAnswerStore;
+  const peerAddress = deps.remoteAddress ?? ((req) => req?.socket?.remoteAddress);
+  let config = null;
+  let keyPromise = Promise.resolve(null);
+  let keyMemo;
+  const send = (res, status, body) => {
+    try {
+      res.writeHead(status, { "content-type": "application/json", "cache-control": "no-store" });
+      res.end(JSON.stringify(body));
+    } catch {}
+  };
+  const reject = (res, why) => {
+    traceLan(deps, { result: "reject", why });
+    send(res, 400, {});
+  };
+  const handle = async (req, res) => {
+    try {
+      if ((req.method ?? "").toUpperCase() !== "POST")
+        return reject(res, "method");
+      if ((req.url ?? "").split("?")[0] !== LAN_PATH)
+        return reject(res, "path");
+      const raw = await readBody(req, LAN_BODY_MAX_BYTES);
+      if (raw === null)
+        return reject(res, "body-size");
+      let outer;
+      try {
+        outer = JSON.parse(raw);
+      } catch {
+        return reject(res, "json");
+      }
+      if (typeof outer !== "object" || outer === null)
+        return reject(res, "shape");
+      const p = outer.p;
+      if (typeof p !== "string" || p.length === 0)
+        return reject(res, "shape");
+      const key = await keyPromise;
+      const pairing = config;
+      if (!key || !pairing)
+        return reject(res, "unpaired");
+      let plain;
+      try {
+        plain = await decryptBlob(key, p);
+      } catch {
+        return reject(res, "decrypt");
+      }
+      const envelope = parseLanEnvelope(plain);
+      if (!envelope)
+        return reject(res, "envelope");
+      if (!lanEnvelopeIsFresh(envelope.ts, now()))
+        return reject(res, "stale");
+      if (seenNonces.has(envelope.nonce))
+        return reject(res, "replay");
+      rememberBounded(seenNonces, envelope.nonce, LAN_SEEN_NONCES_MAX);
+      let payload;
+      if (envelope.op === "ping") {
+        payload = { ok: true };
+      } else if (envelope.op === "command") {
+        const blob = envelope.payload.blob;
+        if (typeof blob !== "string" || blob.length === 0 || blob.length > LAN_COMMAND_BLOB_MAX_CHARS) {
+          return reject(res, "command-payload");
+        }
+        try {
+          deps.onCommand?.({ nonce: envelope.nonce, blob, config: pairing });
+        } catch {}
+        payload = { ok: true };
+      } else if (envelope.op === "answer") {
+        const requestId = envelope.payload.requestId;
+        const answerBlob = envelope.payload.answerBlob;
+        if (typeof requestId !== "string" || !LAN_REQUEST_ID_RE.test(requestId))
+          return reject(res, "answer-request-id");
+        if (typeof answerBlob !== "string" || answerBlob.length === 0 || answerBlob.length > LAN_ANSWER_BLOB_MAX_CHARS) {
+          return reject(res, "answer-blob");
+        }
+        const stored = answers.put(requestId, answerBlob, now());
+        if (stored === "stored") {
+          try {
+            deps.onAnswer?.({ requestId, answerBlob, config: pairing });
+          } catch {}
+        }
+        payload = { ok: true };
+      } else if (envelope.op === "answer-poll" && isLoopbackAddress(peerAddress(req))) {
+        const requestId = envelope.payload.requestId;
+        if (typeof requestId !== "string" || !LAN_REQUEST_ID_RE.test(requestId))
+          return reject(res, "answer-poll-request-id");
+        const hit = answers.peek(requestId, now());
+        payload = hit ? { status: "answered", answerBlob: hit.answerBlob } : { status: "pending" };
+      } else {
+        payload = { ok: false, err: "bad-op" };
+      }
+      const sealed = await encryptBlob(key, {
+        v: LAN_ENVELOPE_VERSION,
+        reqNonce: envelope.nonce,
+        ts: now(),
+        payload
+      });
+      traceLan(deps, { result: "ok", op: envelope.op });
+      send(res, 200, { p: sealed });
+    } catch {
+      try {
+        send(res, 400, {});
+      } catch {}
+    }
+  };
+  const tryListen = (port) => new Promise((resolve) => {
+    let settled = false;
+    let candidate;
+    try {
+      candidate = createServer((req, res) => {
+        handle(req, res);
+      });
+    } catch {
+      resolve(null);
+      return;
+    }
+    const finish = (value) => {
+      if (settled)
+        return;
+      settled = true;
+      resolve(value);
+    };
+    try {
+      candidate.keepAliveTimeout = LAN_KEEPALIVE_MS;
+      candidate.requestTimeout = LAN_REQUEST_TIMEOUT_MS;
+      candidate.on("error", () => {
+        try {
+          candidate.close();
+        } catch {}
+        finish(null);
+      });
+      candidate.on("connection", (socket) => {
+        const s = socket;
+        sockets.add(s);
+        try {
+          s.on("close", () => {
+            sockets.delete(s);
+          });
+        } catch {}
+      });
+      candidate.once("listening", () => finish(candidate));
+      candidate.listen(port, host);
+    } catch {
+      finish(null);
+    }
+  });
+  const bind = async () => {
+    let persisted = null;
+    try {
+      persisted = parseLanState(await readFile3(statePath, "utf8"));
+    } catch {
+      persisted = null;
+    }
+    if (persisted) {
+      const bound = await tryListen(persisted.port);
+      if (stopped) {
+        try {
+          bound?.close();
+        } catch {}
+        return null;
+      }
+      if (bound) {
+        server = bound;
+        try {
+          bound.unref?.();
+        } catch {}
+        address = { port: persisted.port, lid: persisted.lid };
+        traceLan(deps, { result: "bound", port: address.port, lid: address.lid, reused: true });
+        return address;
+      }
+    }
+    const fresh = await tryListen(0);
+    if (stopped) {
+      try {
+        fresh?.close();
+      } catch {}
+      return null;
+    }
+    if (!fresh) {
+      traceLan(deps, { result: "bind-failed" });
+      return null;
+    }
+    server = fresh;
+    try {
+      fresh.unref?.();
+    } catch {}
+    const info = fresh.address();
+    const port = typeof info?.port === "number" ? info.port : 0;
+    if (port === 0) {
+      traceLan(deps, { result: "bind-failed", why: "no-port" });
+      return null;
+    }
+    address = { port, lid: newListenerId() };
+    const state = { port, lid: address.lid, createdAt: now() };
+    try {
+      await atomicWrite(statePath, JSON.stringify(state), 384);
+    } catch {
+      traceLan(deps, { result: "state-write-failed" });
+    }
+    traceLan(deps, { result: "bound", port, lid: address.lid, reused: false });
+    return address;
+  };
+  const ready = bind().catch(() => null);
+  return {
+    ready,
+    sync(next) {
+      try {
+        config = next;
+        const memo = next ? `${next.pairingId}|${b64url(next.e2eKey)}` : "";
+        if (memo === keyMemo)
+          return;
+        keyMemo = memo;
+        keyPromise = next ? deriveLanKey(next.e2eKey, next.pairingId).catch(() => null) : Promise.resolve(null);
+        seenNonces.clear();
+      } catch {}
+    },
+    address() {
+      return address;
+    },
+    stop() {
+      stopped = true;
+      address = null;
+      const dying = server;
+      server = undefined;
+      for (const s of sockets) {
+        try {
+          s.destroy();
+        } catch {}
+      }
+      sockets.clear();
+      if (!dying)
+        return;
+      try {
+        dying.removeAllListeners("error");
+      } catch {}
+      try {
+        dying.on("error", () => {});
+      } catch {}
+      try {
+        dying.close();
+      } catch {}
+    }
+  };
+}
+var LAN_HINT_REFRESH_MS = 300000;
+var LAN_HINT_MAX_CHARS = 2048;
+var LAN_HOSTS_CACHE_MS = 5000;
+function lanHostAddresses(interfaces = networkInterfaces()) {
+  const v4 = [];
+  const v6 = [];
+  try {
+    for (const entries of Object.values(interfaces)) {
+      if (!entries)
+        continue;
+      for (const entry of entries) {
+        const address = entry?.address;
+        if (typeof address !== "string" || address.length === 0)
+          continue;
+        if (entry.internal)
+          continue;
+        const isV6 = entry.family === "IPv6" || entry.family === 6;
+        if (isV6) {
+          const lower = address.toLowerCase();
+          if (lower.startsWith("fe80:") || lower.startsWith("::"))
+            continue;
+          if (!v6.includes(address))
+            v6.push(address);
+          continue;
+        }
+        if (address.startsWith("169.254."))
+          continue;
+        if (!v4.includes(address))
+          v4.push(address);
+      }
+    }
+  } catch {
+    return [];
+  }
+  return [...v4, ...v6];
+}
+async function sealHint(key, hosts, port, lid, ts) {
+  let list = hosts;
+  for (;; ) {
+    const sealed = await encryptBlob(key, { v: LAN_ENVELOPE_VERSION, hosts: list, port, lid, ts });
+    if (sealed.length <= LAN_HINT_MAX_CHARS)
+      return sealed;
+    if (list.length <= 1)
+      return;
+    list = list.slice(0, list.length - 1);
+  }
+}
+function createLanHintPublisher(deps) {
+  const hostsOf = deps.hosts ?? (() => lanHostAddresses());
+  const now = deps.now ?? Date.now;
+  let lastState;
+  let lastSentAt = 0;
+  let lastSealed;
+  let cachedHosts = [];
+  let cachedAt = 0;
+  const hosts = (t) => {
+    if (t - cachedAt < LAN_HOSTS_CACHE_MS && cachedAt !== 0)
+      return cachedHosts;
+    cachedAt = t;
+    try {
+      cachedHosts = hostsOf();
+    } catch {
+      cachedHosts = [];
+    }
+    return cachedHosts;
+  };
+  return {
+    async take(config) {
+      try {
+        if (!config)
+          return;
+        const addr = deps.address();
+        if (!addr)
+          return;
+        const t = now();
+        const list = hosts(t);
+        if (list.length === 0)
+          return;
+        const state = `${config.pairingId}|${addr.port}|${addr.lid}|${list.join(",")}`;
+        if (state === lastState) {
+          if (t - lastSentAt < LAN_HINT_REFRESH_MS)
+            return;
+          if (lastSealed) {
+            lastSentAt = t;
+            return lastSealed;
+          }
+        }
+        const sealed = await sealHint(config.e2eKey, list, addr.port, addr.lid, t);
+        if (!sealed)
+          return;
+        lastState = state;
+        lastSealed = sealed;
+        lastSentAt = t;
+        return sealed;
+      } catch {
+        return;
+      }
+    }
+  };
+}
+
 // src/core/permission.ts
-import { realpath, unlink as unlink3 } from "node:fs/promises";
+import { readFile as readFile5, realpath, unlink as unlink3 } from "node:fs/promises";
 import { appendFileSync as appendFileSync2, statSync as statSync2, truncateSync as truncateSync2 } from "node:fs";
 import { hostname as hostname2 } from "node:os";
 import { basename as basename3, isAbsolute, relative, resolve } from "node:path";
 
 // src/core/hook.ts
-import { readdir as readdir2, readFile as readFile3, unlink as unlink2 } from "node:fs/promises";
+import { readdir as readdir2, readFile as readFile4, unlink as unlink2 } from "node:fs/promises";
 import { hostname } from "node:os";
 import { basename as basename2 } from "node:path";
 var TOOL_DETAIL = { ...claudeToolDetail, ...codexToolDetail };
@@ -3325,7 +3882,7 @@ async function reconcileProvisional(config, hookPid) {
         continue;
       let r;
       try {
-        r = JSON.parse(await readFile3(`${SESSIONS_DIR}/${f}`, "utf8"));
+        r = JSON.parse(await readFile4(`${SESSIONS_DIR}/${f}`, "utf8"));
       } catch {
         continue;
       }
@@ -3358,7 +3915,7 @@ async function readTrackedSessions() {
     if (!f.endsWith(".json"))
       continue;
     try {
-      const r = JSON.parse(await readFile3(`${SESSIONS_DIR}/${f}`, "utf8"));
+      const r = JSON.parse(await readFile4(`${SESSIONS_DIR}/${f}`, "utf8"));
       out.push({ sessionId: basename2(f, ".json"), pid: r.pid, provisional: r.provisional, agent: r.agent, ts: r.ts });
     } catch {}
   }
@@ -4097,6 +4654,149 @@ function emitDecision(agent, answer, toolName, toolInput, suggestions, emit, tra
       return "keep-polling";
   }
 }
+var LOOPBACK_POLL_INTERVAL_MS = 300;
+var LOOPBACK_FETCH_TIMEOUT_MS = 250;
+var LOOPBACK_MAX_CONSECUTIVE_ERRORS = 5;
+function createLoopbackAnswerPoller(config, requestId, deps) {
+  const interval = deps.intervalMs ?? LOOPBACK_POLL_INTERVAL_MS;
+  const discoverInterval = deps.discoverIntervalMs ?? POLL_INTERVAL_MS;
+  const tick = deps.sleep ?? ((ms) => new Promise((resolve2) => {
+    const timer = setTimeout(resolve2, ms);
+    timer.unref?.();
+  }));
+  let live = deps.statePath !== undefined;
+  let started = false;
+  let port;
+  let lastDiscoverAt = 0;
+  let errors = 0;
+  let traced = false;
+  let pending;
+  let wakeResolve = () => {};
+  let wake = new Promise((resolve2) => {
+    wakeResolve = resolve2;
+  });
+  let keyPromise;
+  const note2 = (result) => {
+    if (traced)
+      return;
+    traced = true;
+    try {
+      deps.trace({ event: "lan-poll", result });
+    } catch {}
+  };
+  const key = () => keyPromise ??= deriveLanKey(config.e2eKey, config.pairingId);
+  const readPort = async () => {
+    if (deps.statePath === undefined)
+      return;
+    try {
+      return parseLanState(await readFile5(deps.statePath, "utf8"))?.port;
+    } catch {
+      return;
+    }
+  };
+  const attempt = async () => {
+    try {
+      const k = await key();
+      const nonce = b64url(crypto.getRandomValues(new Uint8Array(16)));
+      const body = JSON.stringify({
+        p: await encryptBlob(k, {
+          v: LAN_ENVELOPE_VERSION,
+          op: "answer-poll",
+          ts: deps.now(),
+          nonce,
+          payload: { requestId }
+        })
+      });
+      const res = await deps.fetchFn(`http://127.0.0.1:${port}${LAN_PATH}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body,
+        signal: AbortSignal.timeout(LOOPBACK_FETCH_TIMEOUT_MS)
+      });
+      if (!res.ok) {
+        errors += 1;
+        return;
+      }
+      const outer = await res.json();
+      if (typeof outer?.p !== "string") {
+        errors += 1;
+        return;
+      }
+      const opened = await decryptBlob(k, outer.p);
+      if (opened.reqNonce !== nonce) {
+        errors += 1;
+        return;
+      }
+      errors = 0;
+      const payload = opened.payload;
+      if (payload?.status === "answered" && typeof payload.answerBlob === "string" && payload.answerBlob.length > 0) {
+        return payload.answerBlob;
+      }
+      return;
+    } catch {
+      errors += 1;
+      return;
+    }
+  };
+  const ticker = async () => {
+    while (live) {
+      await tick(interval);
+      if (!live)
+        return;
+      if (port === undefined) {
+        const t = deps.now();
+        if (lastDiscoverAt !== 0 && t - lastDiscoverAt < discoverInterval)
+          continue;
+        lastDiscoverAt = t;
+        port = await readPort();
+        if (port === undefined)
+          continue;
+      }
+      const blob = await attempt();
+      if (!live)
+        return;
+      if (blob !== undefined) {
+        pending = blob;
+        wakeResolve();
+        return;
+      }
+      if (errors >= LOOPBACK_MAX_CONSECUTIVE_ERRORS) {
+        note2("give-up");
+        live = false;
+        return;
+      }
+    }
+  };
+  return {
+    async wait(sleeping) {
+      if (!live) {
+        await sleeping;
+        return;
+      }
+      if (!started) {
+        started = true;
+        ticker().catch(() => {
+          live = false;
+          note2("error");
+        });
+      }
+      await Promise.race([sleeping, wake]);
+      if (pending === undefined)
+        return;
+      const blob = pending;
+      pending = undefined;
+      live = false;
+      return blob;
+    },
+    stop() {
+      live = false;
+      wakeResolve();
+    }
+  };
+}
+function defaultLanStatePath() {
+  return lanRunningUnderTest() ? undefined : LAN_STATE_PATH;
+}
 async function readStdin2() {
   const chunks = [];
   for await (const chunk of process.stdin)
@@ -4106,6 +4806,7 @@ async function readStdin2() {
 async function runPermissionHook(deps = {}, agent = "claude") {
   const noHoldPath = deps.noHoldPath ?? NO_HOLD_PATH;
   const trace = deps.trace ?? defaultTrace();
+  let loopback;
   try {
     if (await flagExists(noHoldPath)) {
       await (deps.delegate ?? (() => runHook(agent)))();
@@ -4286,6 +4987,26 @@ async function runPermissionHook(deps = {}, agent = "claude") {
     const interval = deps.pollIntervalMs ?? POLL_INTERVAL_MS;
     const emit = deps.emit ?? ((line) => process.stdout.write(`${line}
 `));
+    const applyAnswerBlob = async (answerBlob, src) => {
+      const answer = await decryptBlob(config.e2eKey, answerBlob);
+      const match = answer.requestId === requestId;
+      const outcome = match ? emitDecision(agent, answer, toolName, toolInput, suggestions, emit, trace) : "released";
+      if (outcome !== "keep-polling") {
+        trace({ event: "answered", match, outcome, src });
+        trace({ event: "exit", reason: "answered" });
+        return "done";
+      }
+      return "keep-polling";
+    };
+    loopback = createLoopbackAnswerPoller(config, requestId, {
+      fetchFn: deps.lanFetchFn ?? fetchFn,
+      now: deps.now ?? Date.now,
+      trace,
+      statePath: deps.lanStatePath ?? defaultLanStatePath(),
+      sleep: deps.lanSleep,
+      intervalMs: deps.lanIntervalMs,
+      discoverIntervalMs: interval
+    });
     let misses = 0;
     let definitiveFailures = 0;
     let unknownBlob;
@@ -4298,12 +5019,7 @@ async function runPermissionHook(deps = {}, agent = "claude") {
         misses = 0;
         definitiveFailures = 0;
         if (data.status === "answered" && typeof data.answerBlob === "string") {
-          const answer = await decryptBlob(config.e2eKey, data.answerBlob);
-          const match = answer.requestId === requestId;
-          const outcome = match ? emitDecision(agent, answer, toolName, toolInput, suggestions, emit, trace) : "released";
-          if (outcome !== "keep-polling") {
-            trace({ event: "answered", match, outcome });
-            trace({ event: "exit", reason: "answered" });
+          if (await applyAnswerBlob(data.answerBlob, "worker") === "done") {
             return;
           }
           unknownReads = data.answerBlob === unknownBlob ? unknownReads + 1 : 1;
@@ -4335,10 +5051,18 @@ async function runPermissionHook(deps = {}, agent = "claude") {
           return;
         }
       }
-      await sleep(interval + jitter());
+      const lanBlob = await loopback.wait(sleep(interval + jitter()));
+      if (lanBlob !== undefined) {
+        if (await applyAnswerBlob(lanBlob, "lan") === "done")
+          return;
+      }
     }
   } catch (e) {
     trace({ event: "exit", reason: "exception", ...errorTag(e) });
+  } finally {
+    try {
+      loopback?.stop();
+    } catch {}
   }
 }
 async function approvalsCommand(sub, deps = {}) {
@@ -4466,7 +5190,7 @@ async function parseJson(response) {
     return;
   }
 }
-async function resolveOnRelay(config, requestId, fetchFn) {
+async function resolveOnRelay(config, requestId, fetchFn = fetch) {
   try {
     await fetchFn(`${config.url}/v1/cc/decision/resolve`, {
       method: "POST",
@@ -4575,9 +5299,41 @@ async function runRemoteInput(request, requestId, signal, deps, onHoldCreated) {
       report(deps, new Error(`Codex ${action} was not delivered to app-server (${outcome})`), "Codex remote input delivery");
       await resolveOnRelay(deps.config, requestId, fetchFn);
     };
+    const applyAnswerBlob = async (answerBlob) => {
+      let answer;
+      try {
+        answer = await decryptBlob(deps.config.e2eKey, answerBlob);
+      } catch {
+        return "transport-error";
+      }
+      if (answer.requestId !== requestId)
+        return "unsupported";
+      if (answer.decision === "deny") {
+        const result2 = await deps.interruptAppServer();
+        if (result2 === "sent" || result2 === "already-sent")
+          return "denied";
+        await reportUndelivered("deny", result2);
+        return "transport-error";
+      }
+      if (answer.decision !== "answer")
+        return "unsupported";
+      const mapped = codexAnswersFromPhone(request, answer.answers);
+      if (!mapped)
+        return "unsupported";
+      const result = await deps.answerAppServer(mapped);
+      if (result === "sent" || result === "already-sent")
+        return "answered";
+      await reportUndelivered("answer", result);
+      return "transport-error";
+    };
+    const answers = deps.answerStore ?? lanAnswerStore;
+    const clock = deps.now ?? Date.now;
     let misses = 0;
     let definitiveFailures = 0;
     while (!signal.aborted) {
+      const local = answers.peek(requestId, clock());
+      if (local)
+        return await applyAnswerBlob(local.answerBlob);
       try {
         const response2 = await fetchFn(`${deps.config.url}/v1/cc/decision/${requestId}`, {
           headers,
@@ -4599,31 +5355,7 @@ async function runRemoteInput(request, requestId, signal, deps, onHoldCreated) {
           misses = 0;
           definitiveFailures = 0;
           if (data.status === "answered" && typeof data.answerBlob === "string") {
-            let answer;
-            try {
-              answer = await decryptBlob(deps.config.e2eKey, data.answerBlob);
-            } catch {
-              return "transport-error";
-            }
-            if (answer.requestId !== requestId)
-              return "unsupported";
-            if (answer.decision === "deny") {
-              const result2 = await deps.interruptAppServer();
-              if (result2 === "sent" || result2 === "already-sent")
-                return "denied";
-              await reportUndelivered("deny", result2);
-              return "transport-error";
-            }
-            if (answer.decision !== "answer")
-              return "unsupported";
-            const mapped = codexAnswersFromPhone(request, answer.answers);
-            if (!mapped)
-              return "unsupported";
-            const result = await deps.answerAppServer(mapped);
-            if (result === "sent" || result === "already-sent")
-              return "answered";
-            await reportUndelivered("answer", result);
-            return "transport-error";
+            return await applyAnswerBlob(data.answerBlob);
           } else if (data.status === "expired")
             return "expired";
           else if (data.status === "superseded")
@@ -4635,7 +5367,12 @@ async function runRemoteInput(request, requestId, signal, deps, onHoldCreated) {
       }
       if (misses >= MAX_CONSECUTIVE_MISSES2)
         return "transport-error";
-      await abortableSleep(deps.pollIntervalMs ?? POLL_INTERVAL_MS2, signal, sleep);
+      const waiter = answers.waiter(requestId, clock());
+      try {
+        await Promise.race([abortableSleep(deps.pollIntervalMs ?? POLL_INTERVAL_MS2, signal, sleep), waiter.promise]);
+      } finally {
+        waiter.cancel();
+      }
     }
     return "resolved-elsewhere";
   } catch (error) {
@@ -4844,461 +5581,6 @@ class CodexRemoteInputBridge {
     }
   }
 }
-
-// src/core/lan-listener.ts
-import { createServer } from "node:http";
-import { readFile as readFile4 } from "node:fs/promises";
-import { networkInterfaces } from "node:os";
-var LAN_PATH = "/v1/lan";
-var LAN_ENVELOPE_VERSION = 1;
-var LAN_BODY_MAX_BYTES = 65536;
-var LAN_TTL_MS = 120000;
-var LAN_FUTURE_SKEW_MS = 30000;
-var LAN_SEEN_NONCES_MAX = 512;
-var LAN_NONCE_MAX_CHARS = 64;
-var LAN_COMMAND_BLOB_MAX_CHARS = 8192;
-var LAN_KEEPALIVE_MS = 5000;
-var LAN_REQUEST_TIMEOUT_MS = 1e4;
-var LAN_STATE_PATH = `${CC_DIR}/lan.json`;
-var textDecoder2 = new TextDecoder;
-function traceLan(deps, event) {
-  if (deps.trace) {
-    try {
-      deps.trace(event);
-    } catch {}
-    return;
-  }
-  if (process.argv.some((arg) => arg === "test" || arg.endsWith(".test.ts")))
-    return;
-  traceSession({ event: "lan", ...event });
-}
-function defaultListenerId() {
-  const c = globalThis.crypto;
-  try {
-    if (typeof c?.randomUUID === "function")
-      return c.randomUUID();
-  } catch {}
-  return b64url(crypto.getRandomValues(new Uint8Array(16)));
-}
-function parseLanState(raw) {
-  try {
-    const parsed = JSON.parse(raw);
-    if (typeof parsed !== "object" || parsed === null)
-      return null;
-    const s = parsed;
-    if (typeof s.port !== "number" || !Number.isInteger(s.port) || s.port < 1 || s.port > 65535)
-      return null;
-    if (typeof s.lid !== "string" || s.lid.length === 0 || s.lid.length > 128)
-      return null;
-    const createdAt = typeof s.createdAt === "number" && Number.isFinite(s.createdAt) ? s.createdAt : 0;
-    return { port: s.port, lid: s.lid, createdAt };
-  } catch {
-    return null;
-  }
-}
-function parseLanEnvelope(plain) {
-  if (typeof plain !== "object" || plain === null)
-    return null;
-  const e = plain;
-  if (e.v !== LAN_ENVELOPE_VERSION)
-    return null;
-  if (typeof e.op !== "string" || e.op.length === 0 || e.op.length > 32)
-    return null;
-  if (typeof e.ts !== "number" || !Number.isFinite(e.ts))
-    return null;
-  if (typeof e.nonce !== "string" || e.nonce.length === 0 || e.nonce.length > LAN_NONCE_MAX_CHARS)
-    return null;
-  if (typeof e.payload !== "object" || e.payload === null || Array.isArray(e.payload))
-    return null;
-  return { v: e.v, op: e.op, ts: e.ts, nonce: e.nonce, payload: e.payload };
-}
-function lanEnvelopeIsFresh(ts, now) {
-  if (ts > now + LAN_FUTURE_SKEW_MS)
-    return false;
-  return now - ts <= LAN_TTL_MS;
-}
-function rememberBounded(set, value, max) {
-  set.add(value);
-  while (set.size > max) {
-    const oldest = set.values().next();
-    if (oldest.done)
-      break;
-    set.delete(oldest.value);
-  }
-}
-function readBody(req, max) {
-  return new Promise((resolve2) => {
-    const declared = Number(req.headers["content-length"]);
-    if (Number.isFinite(declared) && declared > max) {
-      try {
-        req.pause();
-      } catch {}
-      resolve2(null);
-      return;
-    }
-    const chunks = [];
-    let total = 0;
-    let settled = false;
-    const done = (value) => {
-      if (settled)
-        return;
-      settled = true;
-      resolve2(value);
-    };
-    req.on("data", (chunk) => {
-      const bytes = chunk;
-      total += bytes.length;
-      if (total > max) {
-        try {
-          req.pause();
-        } catch {}
-        done(null);
-        return;
-      }
-      chunks.push(bytes);
-    });
-    req.on("end", () => {
-      const merged = new Uint8Array(total);
-      let offset = 0;
-      for (const c of chunks) {
-        merged.set(c, offset);
-        offset += c.length;
-      }
-      done(textDecoder2.decode(merged));
-    });
-    req.on("error", () => done(null));
-    req.on("aborted", () => done(null));
-  });
-}
-function createLanListener(deps = {}) {
-  const host = deps.host ?? "0.0.0.0";
-  const statePath = deps.statePath ?? LAN_STATE_PATH;
-  const now = deps.now ?? Date.now;
-  const newListenerId = deps.newListenerId ?? defaultListenerId;
-  let server;
-  let address = null;
-  let stopped = false;
-  const sockets = new Set;
-  const seenNonces = new Set;
-  let config = null;
-  let keyPromise = Promise.resolve(null);
-  let keyMemo;
-  const send = (res, status, body) => {
-    try {
-      res.writeHead(status, { "content-type": "application/json", "cache-control": "no-store" });
-      res.end(JSON.stringify(body));
-    } catch {}
-  };
-  const reject = (res, why) => {
-    traceLan(deps, { result: "reject", why });
-    send(res, 400, {});
-  };
-  const handle = async (req, res) => {
-    try {
-      if ((req.method ?? "").toUpperCase() !== "POST")
-        return reject(res, "method");
-      if ((req.url ?? "").split("?")[0] !== LAN_PATH)
-        return reject(res, "path");
-      const raw = await readBody(req, LAN_BODY_MAX_BYTES);
-      if (raw === null)
-        return reject(res, "body-size");
-      let outer;
-      try {
-        outer = JSON.parse(raw);
-      } catch {
-        return reject(res, "json");
-      }
-      if (typeof outer !== "object" || outer === null)
-        return reject(res, "shape");
-      const p = outer.p;
-      if (typeof p !== "string" || p.length === 0)
-        return reject(res, "shape");
-      const key = await keyPromise;
-      const pairing = config;
-      if (!key || !pairing)
-        return reject(res, "unpaired");
-      let plain;
-      try {
-        plain = await decryptBlob(key, p);
-      } catch {
-        return reject(res, "decrypt");
-      }
-      const envelope = parseLanEnvelope(plain);
-      if (!envelope)
-        return reject(res, "envelope");
-      if (!lanEnvelopeIsFresh(envelope.ts, now()))
-        return reject(res, "stale");
-      if (seenNonces.has(envelope.nonce))
-        return reject(res, "replay");
-      rememberBounded(seenNonces, envelope.nonce, LAN_SEEN_NONCES_MAX);
-      let payload;
-      if (envelope.op === "ping") {
-        payload = { ok: true };
-      } else if (envelope.op === "command") {
-        const blob = envelope.payload.blob;
-        if (typeof blob !== "string" || blob.length === 0 || blob.length > LAN_COMMAND_BLOB_MAX_CHARS) {
-          return reject(res, "command-payload");
-        }
-        try {
-          deps.onCommand?.({ nonce: envelope.nonce, blob, config: pairing });
-        } catch {}
-        payload = { ok: true };
-      } else {
-        payload = { ok: false, err: "bad-op" };
-      }
-      const sealed = await encryptBlob(key, {
-        v: LAN_ENVELOPE_VERSION,
-        reqNonce: envelope.nonce,
-        ts: now(),
-        payload
-      });
-      traceLan(deps, { result: "ok", op: envelope.op });
-      send(res, 200, { p: sealed });
-    } catch {
-      try {
-        send(res, 400, {});
-      } catch {}
-    }
-  };
-  const tryListen = (port) => new Promise((resolve2) => {
-    let settled = false;
-    let candidate;
-    try {
-      candidate = createServer((req, res) => {
-        handle(req, res);
-      });
-    } catch {
-      resolve2(null);
-      return;
-    }
-    const finish = (value) => {
-      if (settled)
-        return;
-      settled = true;
-      resolve2(value);
-    };
-    try {
-      candidate.keepAliveTimeout = LAN_KEEPALIVE_MS;
-      candidate.requestTimeout = LAN_REQUEST_TIMEOUT_MS;
-      candidate.on("error", () => {
-        try {
-          candidate.close();
-        } catch {}
-        finish(null);
-      });
-      candidate.on("connection", (socket) => {
-        const s = socket;
-        sockets.add(s);
-        try {
-          s.on("close", () => {
-            sockets.delete(s);
-          });
-        } catch {}
-      });
-      candidate.once("listening", () => finish(candidate));
-      candidate.listen(port, host);
-    } catch {
-      finish(null);
-    }
-  });
-  const bind = async () => {
-    let persisted = null;
-    try {
-      persisted = parseLanState(await readFile4(statePath, "utf8"));
-    } catch {
-      persisted = null;
-    }
-    if (persisted) {
-      const bound = await tryListen(persisted.port);
-      if (stopped) {
-        try {
-          bound?.close();
-        } catch {}
-        return null;
-      }
-      if (bound) {
-        server = bound;
-        try {
-          bound.unref?.();
-        } catch {}
-        address = { port: persisted.port, lid: persisted.lid };
-        traceLan(deps, { result: "bound", port: address.port, lid: address.lid, reused: true });
-        return address;
-      }
-    }
-    const fresh = await tryListen(0);
-    if (stopped) {
-      try {
-        fresh?.close();
-      } catch {}
-      return null;
-    }
-    if (!fresh) {
-      traceLan(deps, { result: "bind-failed" });
-      return null;
-    }
-    server = fresh;
-    try {
-      fresh.unref?.();
-    } catch {}
-    const info = fresh.address();
-    const port = typeof info?.port === "number" ? info.port : 0;
-    if (port === 0) {
-      traceLan(deps, { result: "bind-failed", why: "no-port" });
-      return null;
-    }
-    address = { port, lid: newListenerId() };
-    const state = { port, lid: address.lid, createdAt: now() };
-    try {
-      await atomicWrite(statePath, JSON.stringify(state), 384);
-    } catch {
-      traceLan(deps, { result: "state-write-failed" });
-    }
-    traceLan(deps, { result: "bound", port, lid: address.lid, reused: false });
-    return address;
-  };
-  const ready = bind().catch(() => null);
-  return {
-    ready,
-    sync(next) {
-      try {
-        config = next;
-        const memo = next ? `${next.pairingId}|${b64url(next.e2eKey)}` : "";
-        if (memo === keyMemo)
-          return;
-        keyMemo = memo;
-        keyPromise = next ? deriveLanKey(next.e2eKey, next.pairingId).catch(() => null) : Promise.resolve(null);
-        seenNonces.clear();
-      } catch {}
-    },
-    address() {
-      return address;
-    },
-    stop() {
-      stopped = true;
-      address = null;
-      const dying = server;
-      server = undefined;
-      for (const s of sockets) {
-        try {
-          s.destroy();
-        } catch {}
-      }
-      sockets.clear();
-      if (!dying)
-        return;
-      try {
-        dying.removeAllListeners("error");
-      } catch {}
-      try {
-        dying.on("error", () => {});
-      } catch {}
-      try {
-        dying.close();
-      } catch {}
-    }
-  };
-}
-var LAN_HINT_REFRESH_MS = 300000;
-var LAN_HINT_MAX_CHARS = 2048;
-var LAN_HOSTS_CACHE_MS = 5000;
-function lanHostAddresses(interfaces = networkInterfaces()) {
-  const v4 = [];
-  const v6 = [];
-  try {
-    for (const entries of Object.values(interfaces)) {
-      if (!entries)
-        continue;
-      for (const entry of entries) {
-        const address = entry?.address;
-        if (typeof address !== "string" || address.length === 0)
-          continue;
-        if (entry.internal)
-          continue;
-        const isV6 = entry.family === "IPv6" || entry.family === 6;
-        if (isV6) {
-          const lower = address.toLowerCase();
-          if (lower.startsWith("fe80:") || lower.startsWith("::"))
-            continue;
-          if (!v6.includes(address))
-            v6.push(address);
-          continue;
-        }
-        if (address.startsWith("169.254."))
-          continue;
-        if (!v4.includes(address))
-          v4.push(address);
-      }
-    }
-  } catch {
-    return [];
-  }
-  return [...v4, ...v6];
-}
-async function sealHint(key, hosts, port, lid, ts) {
-  let list = hosts;
-  for (;; ) {
-    const sealed = await encryptBlob(key, { v: LAN_ENVELOPE_VERSION, hosts: list, port, lid, ts });
-    if (sealed.length <= LAN_HINT_MAX_CHARS)
-      return sealed;
-    if (list.length <= 1)
-      return;
-    list = list.slice(0, list.length - 1);
-  }
-}
-function createLanHintPublisher(deps) {
-  const hostsOf = deps.hosts ?? (() => lanHostAddresses());
-  const now = deps.now ?? Date.now;
-  let lastState;
-  let lastSentAt = 0;
-  let lastSealed;
-  let cachedHosts = [];
-  let cachedAt = 0;
-  const hosts = (t) => {
-    if (t - cachedAt < LAN_HOSTS_CACHE_MS && cachedAt !== 0)
-      return cachedHosts;
-    cachedAt = t;
-    try {
-      cachedHosts = hostsOf();
-    } catch {
-      cachedHosts = [];
-    }
-    return cachedHosts;
-  };
-  return {
-    async take(config) {
-      try {
-        if (!config)
-          return;
-        const addr = deps.address();
-        if (!addr)
-          return;
-        const t = now();
-        const list = hosts(t);
-        if (list.length === 0)
-          return;
-        const state = `${config.pairingId}|${addr.port}|${addr.lid}|${list.join(",")}`;
-        if (state === lastState) {
-          if (t - lastSentAt < LAN_HINT_REFRESH_MS)
-            return;
-          if (lastSealed) {
-            lastSentAt = t;
-            return lastSealed;
-          }
-        }
-        const sealed = await sealHint(config.e2eKey, list, addr.port, addr.lid, t);
-        if (!sealed)
-          return;
-        lastState = state;
-        lastSealed = sealed;
-        lastSentAt = t;
-        return sealed;
-      } catch {
-        return;
-      }
-    }
-  };
-}
 // src/entries/cc-watchdog.ts
 var POLL_MS = 5000;
 var PAIRING_TTL_MS = 600000;
@@ -5322,7 +5604,7 @@ function resetDoneAttemptMemory() {
 }
 async function readRecordAt(path) {
   try {
-    return JSON.parse(await readFile5(path, "utf8"));
+    return JSON.parse(await readFile6(path, "utf8"));
   } catch {
     return null;
   }
@@ -6072,6 +6354,16 @@ function acceptLanCommand(command, deps = {}) {
     return Promise.resolve(0);
   }
 }
+function acceptLanAnswer(answer, deps = {}) {
+  try {
+    const resolve2 = deps.resolveFn ?? ((config, requestId) => resolveOnRelay(config, requestId, fetch));
+    return resolve2(answer.config, answer.requestId).catch(() => {
+      traceFocus(deps, { event: "lan", result: "echo-failed", requestId: answer.requestId });
+    });
+  } catch {
+    return Promise.resolve();
+  }
+}
 function machineName(config) {
   return config.machineName ?? hostname4().replace(/\.local$/, "");
 }
@@ -6083,7 +6375,7 @@ async function readAllRecordEntries() {
       if (!f.endsWith(".json"))
         continue;
       try {
-        out.push({ sessionId: basename4(f, ".json"), rec: JSON.parse(await readFile5(`${SESSIONS_DIR}/${f}`, "utf8")) });
+        out.push({ sessionId: basename4(f, ".json"), rec: JSON.parse(await readFile6(`${SESSIONS_DIR}/${f}`, "utf8")) });
       } catch {}
     }
     return out;
@@ -6653,7 +6945,7 @@ async function sweep(config, deps = {}) {
     const sessionId = basename4(file, ".json");
     let record = null;
     try {
-      record = JSON.parse(await readFile5(path, "utf8"));
+      record = JSON.parse(await readFile6(path, "utf8"));
     } catch {
       record = null;
     }
@@ -6963,7 +7255,12 @@ async function run() {
   let lastActiveMs = Date.now();
   const bridges = createBridgeSupervisor();
   activeBridgeShutdown = () => bridges.shutdown();
-  const lan = createLanListener({ onCommand: acceptLanCommand });
+  const lan = createLanListener({
+    onCommand: acceptLanCommand,
+    onAnswer: (answer) => {
+      acceptLanAnswer(answer);
+    }
+  });
   activeLanListener = lan;
   const shutdown = () => {
     bridges.shutdown();
@@ -7126,6 +7423,7 @@ export {
   buildEndEnvelope,
   buildDoneEnvelope,
   acceptLanCommand,
+  acceptLanAnswer,
   WAITING_HEARTBEAT_AFTER_MS,
   PLAN_PICKER_VERIFY_MAX_MS,
   PLAN_PICKER_RECENT_DONE_MS,

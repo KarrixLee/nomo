@@ -2,7 +2,7 @@ import { createRequire } from "node:module";
 var __require = /* @__PURE__ */ createRequire(import.meta.url);
 
 // src/core/permission.ts
-import { realpath, unlink as unlink3 } from "node:fs/promises";
+import { readFile as readFile4, realpath, unlink as unlink3 } from "node:fs/promises";
 import { appendFileSync as appendFileSync2, statSync as statSync2, truncateSync as truncateSync2 } from "node:fs";
 import { hostname as hostname2 } from "node:os";
 import { basename as basename3, isAbsolute, relative, resolve } from "node:path";
@@ -2446,6 +2446,62 @@ async function runHook(agent) {
   } catch {}
 }
 
+// src/core/lan-wire.ts
+var LAN_PATH = "/v1/lan";
+var LAN_ENVELOPE_VERSION = 1;
+var LAN_TTL_MS = 120000;
+var LAN_FUTURE_SKEW_MS = 30000;
+var LAN_NONCE_MAX_CHARS = 64;
+var LAN_REQUEST_ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
+var LAN_ANSWER_BLOB_MAX_CHARS = 3072;
+var LAN_STATE_PATH = `${CC_DIR}/lan.json`;
+function parseLanState(raw) {
+  try {
+    const parsed = JSON.parse(raw);
+    if (typeof parsed !== "object" || parsed === null)
+      return null;
+    const s = parsed;
+    if (typeof s.port !== "number" || !Number.isInteger(s.port) || s.port < 1 || s.port > 65535)
+      return null;
+    if (typeof s.lid !== "string" || s.lid.length === 0 || s.lid.length > 128)
+      return null;
+    const createdAt = typeof s.createdAt === "number" && Number.isFinite(s.createdAt) ? s.createdAt : 0;
+    return { port: s.port, lid: s.lid, createdAt };
+  } catch {
+    return null;
+  }
+}
+function parseLanEnvelope(plain) {
+  if (typeof plain !== "object" || plain === null)
+    return null;
+  const e = plain;
+  if (e.v !== LAN_ENVELOPE_VERSION)
+    return null;
+  if (typeof e.op !== "string" || e.op.length === 0 || e.op.length > 32)
+    return null;
+  if (typeof e.ts !== "number" || !Number.isFinite(e.ts))
+    return null;
+  if (typeof e.nonce !== "string" || e.nonce.length === 0 || e.nonce.length > LAN_NONCE_MAX_CHARS)
+    return null;
+  if (typeof e.payload !== "object" || e.payload === null || Array.isArray(e.payload))
+    return null;
+  return { v: e.v, op: e.op, ts: e.ts, nonce: e.nonce, payload: e.payload };
+}
+function lanEnvelopeIsFresh(ts, now) {
+  if (ts > now + LAN_FUTURE_SKEW_MS)
+    return false;
+  return now - ts <= LAN_TTL_MS;
+}
+function isLoopbackAddress(address) {
+  if (typeof address !== "string" || address.length === 0)
+    return false;
+  const bare = address.startsWith("::ffff:") ? address.slice(7) : address;
+  return bare === "::1" || bare === "127.0.0.1" || bare.startsWith("127.");
+}
+function lanRunningUnderTest() {
+  return process.argv.some((arg) => arg === "test" || arg.endsWith(".test.ts"));
+}
+
 // src/core/permission.ts
 var POLL_INTERVAL_MS = 3000;
 var FETCH_TIMEOUT_MS = 2000;
@@ -2889,6 +2945,149 @@ function emitDecision(agent, answer, toolName, toolInput, suggestions, emit, tra
       return "keep-polling";
   }
 }
+var LOOPBACK_POLL_INTERVAL_MS = 300;
+var LOOPBACK_FETCH_TIMEOUT_MS = 250;
+var LOOPBACK_MAX_CONSECUTIVE_ERRORS = 5;
+function createLoopbackAnswerPoller(config, requestId, deps) {
+  const interval = deps.intervalMs ?? LOOPBACK_POLL_INTERVAL_MS;
+  const discoverInterval = deps.discoverIntervalMs ?? POLL_INTERVAL_MS;
+  const tick = deps.sleep ?? ((ms) => new Promise((resolve2) => {
+    const timer = setTimeout(resolve2, ms);
+    timer.unref?.();
+  }));
+  let live = deps.statePath !== undefined;
+  let started = false;
+  let port;
+  let lastDiscoverAt = 0;
+  let errors = 0;
+  let traced = false;
+  let pending;
+  let wakeResolve = () => {};
+  let wake = new Promise((resolve2) => {
+    wakeResolve = resolve2;
+  });
+  let keyPromise;
+  const note = (result) => {
+    if (traced)
+      return;
+    traced = true;
+    try {
+      deps.trace({ event: "lan-poll", result });
+    } catch {}
+  };
+  const key = () => keyPromise ??= deriveLanKey(config.e2eKey, config.pairingId);
+  const readPort = async () => {
+    if (deps.statePath === undefined)
+      return;
+    try {
+      return parseLanState(await readFile4(deps.statePath, "utf8"))?.port;
+    } catch {
+      return;
+    }
+  };
+  const attempt = async () => {
+    try {
+      const k = await key();
+      const nonce = b64url(crypto.getRandomValues(new Uint8Array(16)));
+      const body = JSON.stringify({
+        p: await encryptBlob(k, {
+          v: LAN_ENVELOPE_VERSION,
+          op: "answer-poll",
+          ts: deps.now(),
+          nonce,
+          payload: { requestId }
+        })
+      });
+      const res = await deps.fetchFn(`http://127.0.0.1:${port}${LAN_PATH}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body,
+        signal: AbortSignal.timeout(LOOPBACK_FETCH_TIMEOUT_MS)
+      });
+      if (!res.ok) {
+        errors += 1;
+        return;
+      }
+      const outer = await res.json();
+      if (typeof outer?.p !== "string") {
+        errors += 1;
+        return;
+      }
+      const opened = await decryptBlob(k, outer.p);
+      if (opened.reqNonce !== nonce) {
+        errors += 1;
+        return;
+      }
+      errors = 0;
+      const payload = opened.payload;
+      if (payload?.status === "answered" && typeof payload.answerBlob === "string" && payload.answerBlob.length > 0) {
+        return payload.answerBlob;
+      }
+      return;
+    } catch {
+      errors += 1;
+      return;
+    }
+  };
+  const ticker = async () => {
+    while (live) {
+      await tick(interval);
+      if (!live)
+        return;
+      if (port === undefined) {
+        const t = deps.now();
+        if (lastDiscoverAt !== 0 && t - lastDiscoverAt < discoverInterval)
+          continue;
+        lastDiscoverAt = t;
+        port = await readPort();
+        if (port === undefined)
+          continue;
+      }
+      const blob = await attempt();
+      if (!live)
+        return;
+      if (blob !== undefined) {
+        pending = blob;
+        wakeResolve();
+        return;
+      }
+      if (errors >= LOOPBACK_MAX_CONSECUTIVE_ERRORS) {
+        note("give-up");
+        live = false;
+        return;
+      }
+    }
+  };
+  return {
+    async wait(sleeping) {
+      if (!live) {
+        await sleeping;
+        return;
+      }
+      if (!started) {
+        started = true;
+        ticker().catch(() => {
+          live = false;
+          note("error");
+        });
+      }
+      await Promise.race([sleeping, wake]);
+      if (pending === undefined)
+        return;
+      const blob = pending;
+      pending = undefined;
+      live = false;
+      return blob;
+    },
+    stop() {
+      live = false;
+      wakeResolve();
+    }
+  };
+}
+function defaultLanStatePath() {
+  return lanRunningUnderTest() ? undefined : LAN_STATE_PATH;
+}
 async function readStdin2() {
   const chunks = [];
   for await (const chunk of process.stdin)
@@ -2898,6 +3097,7 @@ async function readStdin2() {
 async function runPermissionHook(deps = {}, agent = "claude") {
   const noHoldPath = deps.noHoldPath ?? NO_HOLD_PATH;
   const trace = deps.trace ?? defaultTrace();
+  let loopback;
   try {
     if (await flagExists(noHoldPath)) {
       await (deps.delegate ?? (() => runHook(agent)))();
@@ -3078,6 +3278,26 @@ async function runPermissionHook(deps = {}, agent = "claude") {
     const interval = deps.pollIntervalMs ?? POLL_INTERVAL_MS;
     const emit = deps.emit ?? ((line) => process.stdout.write(`${line}
 `));
+    const applyAnswerBlob = async (answerBlob, src) => {
+      const answer = await decryptBlob(config.e2eKey, answerBlob);
+      const match = answer.requestId === requestId;
+      const outcome = match ? emitDecision(agent, answer, toolName, toolInput, suggestions, emit, trace) : "released";
+      if (outcome !== "keep-polling") {
+        trace({ event: "answered", match, outcome, src });
+        trace({ event: "exit", reason: "answered" });
+        return "done";
+      }
+      return "keep-polling";
+    };
+    loopback = createLoopbackAnswerPoller(config, requestId, {
+      fetchFn: deps.lanFetchFn ?? fetchFn,
+      now: deps.now ?? Date.now,
+      trace,
+      statePath: deps.lanStatePath ?? defaultLanStatePath(),
+      sleep: deps.lanSleep,
+      intervalMs: deps.lanIntervalMs,
+      discoverIntervalMs: interval
+    });
     let misses = 0;
     let definitiveFailures = 0;
     let unknownBlob;
@@ -3090,12 +3310,7 @@ async function runPermissionHook(deps = {}, agent = "claude") {
         misses = 0;
         definitiveFailures = 0;
         if (data.status === "answered" && typeof data.answerBlob === "string") {
-          const answer = await decryptBlob(config.e2eKey, data.answerBlob);
-          const match = answer.requestId === requestId;
-          const outcome = match ? emitDecision(agent, answer, toolName, toolInput, suggestions, emit, trace) : "released";
-          if (outcome !== "keep-polling") {
-            trace({ event: "answered", match, outcome });
-            trace({ event: "exit", reason: "answered" });
+          if (await applyAnswerBlob(data.answerBlob, "worker") === "done") {
             return;
           }
           unknownReads = data.answerBlob === unknownBlob ? unknownReads + 1 : 1;
@@ -3127,10 +3342,18 @@ async function runPermissionHook(deps = {}, agent = "claude") {
           return;
         }
       }
-      await sleep(interval + jitter());
+      const lanBlob = await loopback.wait(sleep(interval + jitter()));
+      if (lanBlob !== undefined) {
+        if (await applyAnswerBlob(lanBlob, "lan") === "done")
+          return;
+      }
     }
   } catch (e) {
     trace({ event: "exit", reason: "exception", ...errorTag(e) });
+  } finally {
+    try {
+      loopback?.stop();
+    } catch {}
   }
 }
 async function approvalsCommand(sub, deps = {}) {

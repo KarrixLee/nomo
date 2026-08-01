@@ -1,6 +1,9 @@
 import { describe, expect, test } from "bun:test";
 import { decryptBlob, encryptBlob } from "./crypto";
 import { codexAnswersFromPhone, startCodexRemoteInput } from "./codex-remote-input";
+import type { CodexRemoteInputDeps } from "./codex-remote-input";
+import { createLanAnswerStore, LAN_ANSWER_TTL_MS } from "./lan-listener";
+import type { LanAnswerStore } from "./lan-listener";
 import type { CodexUserInputRequest } from "./codex-app-server-client";
 import {
   buildPermissionQuestions, capPermissionWireText, PERMISSION_QUESTION_LABEL_MAX,
@@ -540,5 +543,112 @@ describe("startCodexRemoteInput", () => {
     await resolving;
     expect(await handle.completion).toBe("resolved-elsewhere");
     expect(calls).toEqual([]);
+  });
+});
+
+// --- the LAN channel (NOM-44 phase 2) ----------------------------------------------------------
+//
+// This relay runs INSIDE the watchdog, which is also the process hosting the LAN listener — so a phone
+// answer delivered over the local network is already in this process's memory. It is applied straight
+// from the store instead of waiting up to 3 s for the next worker poll tick. The worker poll itself is
+// untouched: it keeps its cadence (it is the relay's liveness proof) and every guard it applies to an
+// answer — decrypt, requestId match, deny→interrupt, label re-mapping — is the SAME shared code.
+describe("startCodexRemoteInput — LAN-delivered answers", () => {
+  const NOW = 1_800_000_000_000;
+
+  /** A relay whose worker leg only ever creates the hold and then says "pending" forever, counting the
+   *  polls; the LAN store is the only channel that can finish it. */
+  function relay(store: LanAnswerStore, over: Partial<CodexRemoteInputDeps> = {}) {
+    const polls: number[] = [];
+    let sawPoll!: () => void;
+    const polled = new Promise<void>((resolve) => { sawPoll = resolve; });
+    const appAnswers: unknown[] = [];
+    let interrupted = 0;
+    const handle = startCodexRemoteInput(request(), {
+      config,
+      fetchFn: (async (input: string | URL | Request) => {
+        const url = String(input);
+        if (url.endsWith("/v1/cc/decision")) return Response.json({ hold: true });
+        polls.push(1);
+        sawPoll();
+        return Response.json({ status: "pending" });
+      }) as typeof fetch,
+      readRecordFn: async () => record,
+      randomUUID: () => "relay-lan",
+      localApprovalsStateFn: async () => "on",
+      now: () => NOW,
+      answerStore: store,
+      sleep: () => new Promise<void>(() => { /* the 3 s tick NEVER fires in these tests */ }),
+      answerAppServer: async (answers) => { appAnswers.push(answers); return "sent"; },
+      interruptAppServer: async () => { interrupted += 1; return "sent"; },
+      ...over,
+    });
+    return { handle, polls, polled, appAnswers, interrupted: () => interrupted };
+  }
+
+  test("an answer already in the store is applied without a single worker poll", async () => {
+    const store = createLanAnswerStore();
+    store.put("relay-lan", await encryptBlob(key, {
+      requestId: "relay-lan", decision: "answer", answers: ["Thorough"],
+    }), NOW);
+    const { handle, polls, appAnswers } = relay(store);
+    expect(await handle.completion).toBe("answered");
+    expect(appAnswers).toEqual([{ scope: ["Thorough"] }]);
+    expect(polls).toHaveLength(0); // the store is checked FIRST, before the loop ever hits the network
+  });
+
+  test("an answer that lands mid-hold wakes the relay instead of waiting for the next tick", async () => {
+    const store = createLanAnswerStore();
+    // The sleep in this relay never resolves, so ONLY the store's waiter can move the loop on.
+    const { handle, polls, polled, appAnswers } = relay(store);
+    await polled;
+    store.put("relay-lan", await encryptBlob(key, {
+      requestId: "relay-lan", decision: "answer", answers: ["Fast"],
+    }), NOW);
+    expect(await handle.completion).toBe("answered");
+    expect(appAnswers).toEqual([{ scope: ["Fast"] }]);
+    expect(polls).toHaveLength(1); // one poll happened; the answer did NOT wait for a second
+  });
+
+  test("a LAN deny maps to the same Codex interrupt the worker path uses", async () => {
+    const store = createLanAnswerStore();
+    store.put("relay-lan", await encryptBlob(key, { requestId: "relay-lan", decision: "deny" }), NOW);
+    const { handle, interrupted, appAnswers } = relay(store);
+    expect(await handle.completion).toBe("denied");
+    expect(interrupted()).toBe(1);
+    expect(appAnswers).toEqual([]);
+  });
+
+  test("the requestId-mismatch guard is preserved on the LAN path (never answers off a stale blob)", async () => {
+    const store = createLanAnswerStore();
+    store.put("relay-lan", await encryptBlob(key, {
+      requestId: "some-other-request", decision: "answer", answers: ["Thorough"],
+    }), NOW);
+    const { handle, appAnswers, interrupted } = relay(store);
+    expect(await handle.completion).toBe("unsupported");
+    expect(appAnswers).toEqual([]);
+    expect(interrupted()).toBe(0);
+  });
+
+  test("an unmappable LAN answer falls back to the Mac picker, exactly as a worker-delivered one does", async () => {
+    const store = createLanAnswerStore();
+    store.put("relay-lan", await encryptBlob(key, {
+      requestId: "relay-lan", decision: "answer", answers: ["Not An Option"],
+    }), NOW);
+    const { handle, appAnswers } = relay(store);
+    expect(await handle.completion).toBe("unsupported");
+    expect(appAnswers).toEqual([]);
+  });
+
+  test("an EXPIRED store entry is ignored — the relay keeps polling the worker as if nothing arrived", async () => {
+    const store = createLanAnswerStore();
+    store.put("relay-lan", await encryptBlob(key, {
+      requestId: "relay-lan", decision: "answer", answers: ["Thorough"],
+    }), NOW - LAN_ANSWER_TTL_MS - 1);
+    const { handle, polled, appAnswers } = relay(store);
+    await polled;                      // it polled the worker rather than applying the stale answer
+    await handle.resolvedElsewhere();  // and unwinds normally
+    expect(await handle.completion).toBe("resolved-elsewhere");
+    expect(appAnswers).toEqual([]);
   });
 });
