@@ -98,7 +98,7 @@ async function sha256Hex(s) {
 }
 
 // src/core/shared.ts
-var PLUGIN_VERSION = "1.5.2";
+var PLUGIN_VERSION = "1.5.3";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -582,7 +582,7 @@ async function writeDecisionHoldAt(sessionsDir, sessionId, hold) {
     await atomicWrite(`${sessionsDir}/${decisionHoldFileName(sessionId)}`, JSON.stringify(hold), 384);
   } catch {}
 }
-async function clearDecisionHoldAt(sessionsDir, sessionId, pid) {
+async function clearDecisionHoldAt(sessionsDir, sessionId, pid, beforeUnlink) {
   const path = `${sessionsDir}/${decisionHoldFileName(sessionId)}`;
   try {
     const raw = await readFile(path, "utf8").catch(() => {
@@ -596,16 +596,37 @@ async function clearDecisionHoldAt(sessionsDir, sessionId, pid) {
         owner = undefined;
       }
       if (typeof owner === "number" && owner !== pid)
-        return;
+        return false;
+    }
+    if (beforeUnlink !== undefined) {
+      try {
+        await beforeUnlink();
+      } catch {}
     }
     await unlink(path).catch(() => {});
+    return true;
+  } catch {
+    return false;
+  }
+}
+async function settleDecisionHoldRecordAt(sessionsDir, sessionId, patch) {
+  try {
+    const record = await readRecord(sessionId, sessionsDir);
+    if (!record)
+      return;
+    if (record.op !== "update" || record.prio !== 1)
+      return;
+    await atomicWrite(`${sessionsDir}/${sessionId}.json`, JSON.stringify({ ...record, ...patch }), 384);
   } catch {}
 }
 async function writeDecisionHold(sessionId, hold) {
   return writeDecisionHoldAt(SESSIONS_DIR, sessionId, hold);
 }
-async function clearDecisionHold(sessionId, pid) {
-  return clearDecisionHoldAt(SESSIONS_DIR, sessionId, pid);
+async function clearDecisionHold(sessionId, pid, beforeUnlink) {
+  return clearDecisionHoldAt(SESSIONS_DIR, sessionId, pid, beforeUnlink);
+}
+async function settleDecisionHoldRecord(sessionId, patch) {
+  return settleDecisionHoldRecordAt(SESSIONS_DIR, sessionId, patch);
 }
 async function readPrefix(path, maxBytes) {
   const fh = await open(path, "r");

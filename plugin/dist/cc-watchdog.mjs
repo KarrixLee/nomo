@@ -103,7 +103,7 @@ import { appendFileSync, existsSync, readFileSync, statSync, truncateSync } from
 import { execFileSync, spawn } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "1.5.2";
+var PLUGIN_VERSION = "1.5.3";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -587,7 +587,7 @@ async function writeDecisionHoldAt(sessionsDir, sessionId, hold) {
     await atomicWrite(`${sessionsDir}/${decisionHoldFileName(sessionId)}`, JSON.stringify(hold), 384);
   } catch {}
 }
-async function clearDecisionHoldAt(sessionsDir, sessionId, pid) {
+async function clearDecisionHoldAt(sessionsDir, sessionId, pid, beforeUnlink) {
   const path = `${sessionsDir}/${decisionHoldFileName(sessionId)}`;
   try {
     const raw = await readFile(path, "utf8").catch(() => {
@@ -601,16 +601,37 @@ async function clearDecisionHoldAt(sessionsDir, sessionId, pid) {
         owner = undefined;
       }
       if (typeof owner === "number" && owner !== pid)
-        return;
+        return false;
+    }
+    if (beforeUnlink !== undefined) {
+      try {
+        await beforeUnlink();
+      } catch {}
     }
     await unlink(path).catch(() => {});
+    return true;
+  } catch {
+    return false;
+  }
+}
+async function settleDecisionHoldRecordAt(sessionsDir, sessionId, patch) {
+  try {
+    const record = await readRecord(sessionId, sessionsDir);
+    if (!record)
+      return;
+    if (record.op !== "update" || record.prio !== 1)
+      return;
+    await atomicWrite(`${sessionsDir}/${sessionId}.json`, JSON.stringify({ ...record, ...patch }), 384);
   } catch {}
 }
 async function writeDecisionHold(sessionId, hold) {
   return writeDecisionHoldAt(SESSIONS_DIR, sessionId, hold);
 }
-async function clearDecisionHold(sessionId, pid) {
-  return clearDecisionHoldAt(SESSIONS_DIR, sessionId, pid);
+async function clearDecisionHold(sessionId, pid, beforeUnlink) {
+  return clearDecisionHoldAt(SESSIONS_DIR, sessionId, pid, beforeUnlink);
+}
+async function settleDecisionHoldRecord(sessionId, patch) {
+  return settleDecisionHoldRecordAt(SESSIONS_DIR, sessionId, patch);
 }
 async function readPrefix(path, maxBytes) {
   const fh = await open(path, "r");
@@ -5242,6 +5263,22 @@ function createLoopbackAnswerPoller(config, requestId, deps) {
       live = false;
       return blob;
     },
+    async settle() {
+      if (pending !== undefined) {
+        const blob = pending;
+        pending = undefined;
+        live = false;
+        return blob;
+      }
+      if (!live)
+        return;
+      live = false;
+      if (port === undefined)
+        port = await readPort();
+      if (port === undefined)
+        return;
+      return await attempt();
+    },
     stop() {
       live = false;
       wakeResolve();
@@ -5258,7 +5295,13 @@ function defaultWriteHold() {
   return lanRunningUnderTest() ? async () => {} : writeDecisionHold;
 }
 function defaultClearHold() {
-  return lanRunningUnderTest() ? async () => {} : clearDecisionHold;
+  return lanRunningUnderTest() ? async (_sessionId, _pid, beforeUnlink) => {
+    await beforeUnlink?.();
+    return true;
+  } : clearDecisionHold;
+}
+function defaultSettleHoldRecord() {
+  return lanRunningUnderTest() ? async () => {} : settleDecisionHoldRecord;
 }
 async function readStdin2() {
   const chunks = [];
@@ -5271,6 +5314,8 @@ async function runPermissionHook(deps = {}, agent = "claude") {
   const trace = deps.trace ?? defaultTrace();
   let loopback;
   let heldSessionId;
+  let emittedDecision = false;
+  let settleHeldRecord;
   try {
     if (await flagExists(noHoldPath)) {
       await (deps.delegate ?? (() => runHook(agent)))();
@@ -5460,6 +5505,19 @@ async function runPermissionHook(deps = {}, agent = "claude") {
     } catch {}
     await (deps.writeHoldFn ?? defaultWriteHold())(sessionId, { blob: holdBlob, at: holdAt, pid: holdPid });
     heldSessionId = sessionId;
+    settleHeldRecord = async () => {
+      const settledAt = (deps.now ?? Date.now)();
+      const patch = emittedDecision ? {
+        ts: settledAt,
+        lastEvent: "working",
+        op: "update",
+        prio: 0,
+        sentDone: false,
+        attentionKind: undefined,
+        blob: await encryptBlob(config.e2eKey, { ...base, status: "working", at: Math.floor(settledAt / 1000) })
+      } : { ts: settledAt, blob: fallbackBlob };
+      await (deps.settleHoldRecordFn ?? defaultSettleHoldRecord())(sessionId, patch);
+    };
     const jitter = deps.jitter ?? (() => Math.floor(Math.random() * 500));
     const interval = deps.pollIntervalMs ?? POLL_INTERVAL_MS;
     const emit = deps.emit ?? ((line) => process.stdout.write(`${line}
@@ -5468,6 +5526,8 @@ async function runPermissionHook(deps = {}, agent = "claude") {
       const answer = await decryptBlob(config.e2eKey, answerBlob);
       const match = answer.requestId === requestId;
       const outcome = match ? emitDecision(agent, answer, toolName, toolInput, suggestions, emit, trace) : "released";
+      if (outcome === "emitted")
+        emittedDecision = true;
       if (outcome !== "keep-polling") {
         trace({ event: "answered", match, outcome, src });
         trace({ event: "exit", reason: "answered" });
@@ -5507,6 +5567,9 @@ async function runPermissionHook(deps = {}, agent = "claude") {
             return;
           }
         } else if (typeof data.status === "string" && data.status !== "pending") {
+          const settled = loopback === undefined ? undefined : await loopback.settle();
+          if (settled !== undefined && await applyAnswerBlob(settled, "lan") === "done")
+            return;
           trace({ event: data.status === "expired" ? "expired" : "superseded", status: data.status });
           trace({ event: "exit", reason: data.status });
           return;
@@ -5542,7 +5605,7 @@ async function runPermissionHook(deps = {}, agent = "claude") {
     } catch {}
     if (heldSessionId !== undefined) {
       try {
-        await (deps.clearHoldFn ?? defaultClearHold())(heldSessionId, deps.holdPid ?? process.pid);
+        await (deps.clearHoldFn ?? defaultClearHold())(heldSessionId, deps.holdPid ?? process.pid, settleHeldRecord);
       } catch {}
     }
   }
