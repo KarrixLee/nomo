@@ -658,9 +658,24 @@ export function createLanListener(deps: LanListenerDeps = {}): LanListener {
   });
 
   /** Bind, preferring the persisted port so a phone's cached endpoint survives a watchdog restart.
-   *  A failed re-bind (someone else took the port) falls back to an ephemeral one AND rotates the lid,
-   *  because from the phone's point of view this is a different endpoint and everything it cached for
-   *  the old lid is void. */
+   *  A failed re-bind (someone else took the port) falls back to an ephemeral one.
+   *
+   *  THE PORT IS REUSED; THE LID NEVER IS. They are different facts and this function used to conflate
+   *  them. The port is the ENDPOINT — keeping it is exactly what spares a phone a re-probe across a
+   *  restart. The `lid` is the LISTENER INSTANCE, and lan-wire's contract for it is "a changed lid tells
+   *  the phone everything you cached about this endpoint is void". After a restart everything it cached
+   *  IS void: `counter`, `stateCounter`, `entries` and `stateEntries` are all in-memory and all begin
+   *  again at zero. Re-serving the old lid asserts otherwise, and the phone believes it —
+   *    • its v2 `state` cursor keeps the DEAD instance's counter, and the new listener answers that
+   *      cursor INCREMENTALLY as soon as its own counter has climbed past the number (`states()` coerces
+   *      to 0, and so answers `complete`, only while `sinceSeq > counter`). A complete map is the only
+   *      thing allowed to seed the phone's LAN ownership, so it never gets one, and a session that is
+   *      QUIET — a parked Allow/Deny hold above all — silently stays worker-driven for the whole link;
+   *    • `stateUnsupportedLids` / `unsupportedLids` / the restart cooldown are all keyed by lid on the
+   *      phone, so the documented "upgrading the plugin mints a new listener instance and re-negotiates
+   *      v2 with no app relaunch" only ever fired when the port happened to move as well.
+   *  A new process is a new lid, and the rotation is persisted so the next restart cannot re-publish one
+   *  the phone has already retired. The cost is one hint reseal and one full map per restart. */
   const bind = async (): Promise<LanAddress | null> => {
     let persisted: LanState | null = null;
     try { persisted = parseLanState(await readFile(statePath, "utf8")); } catch { persisted = null; }
@@ -671,7 +686,15 @@ export function createLanListener(deps: LanListenerDeps = {}): LanListener {
       if (bound) {
         server = bound;
         try { bound.unref?.(); } catch { /* runtime without unref */ }
-        address = { port: persisted.port, lid: persisted.lid };
+        address = { port: persisted.port, lid: newListenerId() };
+        const rotated: LanState = { port: address.port, lid: address.lid, createdAt: now() };
+        try {
+          await atomicWrite(statePath, JSON.stringify(rotated), 0o600);
+        } catch {
+          // The rotated lid still holds for THIS run (it is what we serve and seal into the hint); only
+          // its persistence is lost, and the next restart simply rotates again from the older file.
+          traceLan(deps, { result: "state-write-failed" });
+        }
         traceLan(deps, { result: "bound", port: address.port, lid: address.lid, reused: true });
         return address;
       }

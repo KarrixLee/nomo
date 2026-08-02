@@ -408,7 +408,21 @@ describe("POST /v1/lan — every rejection is an opaque 400 with an empty body",
 });
 
 describe("port persistence + listener-instance id", () => {
-  test("persists port/lid on a fresh bind, re-binds the SAME port after a restart, and rotates the lid when the port is taken", async () => {
+  // THE PORT AND THE LID ARE DIFFERENT FACTS, and conflating them was the 2026-08-03 field bug's enabler.
+  // The port is the ENDPOINT — reusing it is what lets a phone's cached address survive a watchdog
+  // restart without a re-probe. The lid is the INSTANCE, and lan-wire's own contract for it is "a changed
+  // lid tells the phone everything you cached about this endpoint is void". After a restart EVERYTHING it
+  // cached IS void: `counter`, `stateCounter`, the frames map and the state map are all in-memory and all
+  // start again at zero. Re-serving the old lid is therefore a false statement, and the phone believes it:
+  //   • its v2 cursor keeps a DEAD instance's counter, and the new listener answers it incrementally the
+  //     moment its own counter has climbed past that number — so the phone never gets the complete map
+  //     that is the ONLY thing allowed to seed LAN ownership, and quiet rows (a parked Allow/Deny hold
+  //     above all) silently stay worker-driven for the life of the link;
+  //   • `stateUnsupportedLids` / `unsupportedLids` / the restart cooldown are all keyed by lid, so the
+  //     documented "upgrading the plugin mints a new listener instance and re-negotiates v2 with no app
+  //     relaunch" only ever worked when the port happened to change too.
+  // So: the port is reused, the lid never is.
+  test("persists port/lid on a fresh bind, re-binds the SAME port after a restart, and mints a NEW lid every time it binds", async () => {
     const dir = await stateDir();
     const statePath = join(dir, "lan.json");
 
@@ -424,13 +438,23 @@ describe("port persistence + listener-instance id", () => {
     expect(second.lid).not.toBe(first.lid);
     expect(parseLanState(await readFile(statePath, "utf8"))).toMatchObject({ port: second.port, lid: second.lid });
 
-    // 3. With both stopped, a restart re-binds the persisted port and KEEPS the lid — that stability
-    //    is what lets the phone's cached endpoint keep working across a watchdog restart.
+    // 3. With both stopped, a restart re-binds the persisted PORT — that stability is what lets the
+    //    phone's cached endpoint keep working across a watchdog restart — but mints a NEW LID, because
+    //    this is a new process and every counter and map the old lid vouched for is gone. The rotation
+    //    is persisted too, or the next restart would re-publish a lid the phone has already retired.
     first.listener.stop();
     second.listener.stop();
     const third = await startListener({ statePath });
     expect(third.port).toBe(second.port);
-    expect(third.lid).toBe(second.lid);
+    expect(third.lid).not.toBe(second.lid);
+    expect(parseLanState(await readFile(statePath, "utf8")))
+      .toMatchObject({ port: third.port, lid: third.lid });
+
+    // …and again, so "a new process is a new lid" is a rule rather than a one-off.
+    third.listener.stop();
+    const fourth = await startListener({ statePath });
+    expect(fourth.port).toBe(third.port);
+    expect(fourth.lid).not.toBe(third.lid);
   });
 
   test("a corrupt lan.json is ignored: the listener still binds, with a fresh lid", async () => {
@@ -2088,14 +2112,29 @@ describe("state — the snapshot store", () => {
     const v1 = store.since(0).frames;
     const v2 = store.states(0).sessions;
     expect(v1.map((f) => f.sessionId).sort()).toEqual(v2.map((s) => s.sessionId).sort());
-    // The BLOB is the same ciphertext on both legs — a handoff between them cannot reflow the phone's
-    // text, which is the entire point of keeping BLOB_FIT_CHARS on the Mac's own blob.
     for (const frame of v1) {
       const twin = v2.find((s) => s.sessionId === frame.sessionId)!;
-      expect(twin.blob).toBe(frame.blob);
       expect(twin.agent).toBe(frame.agent);
       expect(twin.terminal).toBe(false);            // neither leg calls a live `done` row terminal
     }
+    // THE BLOB IS THE SAME CIPHERTEXT wherever both legs derive the row FROM the blob — a handoff
+    // between them cannot reflow the phone's text, which is the entire point of keeping BLOB_FIT_CHARS
+    // on the Mac's own blob.
+    const s1v1 = v1.find((f) => f.sessionId === "s1")!;
+    const s1v2 = v2.find((s) => s.sessionId === "s1")!;
+    expect(s1v2.blob).toBe(s1v1.blob);
+    // …AND THE `done` RUNG IS THE ONE PLACE IT CANNOT BE, because the two legs carry different AUTHORITY
+    // for the status. v1 ships the lifecycle `op`, and the phone reads a terminal op as "done whatever
+    // the blob says" (CCLanFrame.isTerminal). v2 has no `op`, so the blob IS the status — and the record's
+    // blob is written by whichever hook ran last, which for a watchdog corrective done is the PREVIOUS
+    // state (`{ ...record, op: "done" }` keeps the old `prio`/`blob`). Byte-identity here would mean
+    // shipping "needsAttention" for a finished session, which is exactly the 2026-08-03 field bug. So v2
+    // authors, and what the two legs agree on is THE ROW, not the ciphertext.
+    const s2v1 = v1.find((f) => f.sessionId === "s2")!;
+    const s2v2 = v2.find((s) => s.sessionId === "s2")!;
+    expect(s2v1.op).toBe("done");                                  // v1's authority: the lifecycle op
+    expect(s2v2.blob).not.toBe(s2v1.blob);
+    expect(await decryptBlob(KEY, s2v2.blob)).toMatchObject({ status: "done" });   // v2's: the blob
     expect(v2.find((s) => s.sessionId === "s1")!.why).toBe("attn");
     expect(v2.find((s) => s.sessionId === "s2")!.why).toBe("done/cx");
     // The two cursors are INDEPENDENT — a v2-only change must never renumber the frozen v1 wire.

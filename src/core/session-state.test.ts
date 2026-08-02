@@ -258,6 +258,45 @@ describe("computeSessionState — the ranking table", () => {
     expect(state({ correctives: { done: true } })).toMatchObject({ state: "done", why: "done" });
   });
 
+  // THE 2026-08-03 FIELD BUG — "the Dynamic Island shows the session that FINISHED instead of the one
+  // that is running", plus its sibling "the row went yellow when the session was over".
+  //
+  // Six watchdog corrective-done writers spread `{ ...record, op: "done", lastEvent: "done" }`: they
+  // POST a freshly built done envelope, but on DISK they leave `prio` and `blob` exactly as the previous
+  // hook wrote them. The live record that produced the report reads, verbatim:
+  //     { op: "done", lastEvent: "done", sentDone: true, prio: 1, blob: <a needsAttention blob> }
+  // v1's `frames` projection survived that because the LIFECYCLE OP was the phone's authority
+  // (CCLanFrame.isTerminal ⇒ "the row reads done whatever the blob says"). v2 has NO such field —
+  // `terminal` means "retire this entry from the map", and a done with a live pid is deliberately not
+  // that — so the phone fell through to the blob's own `status` and painted the finished session
+  // needsAttention. `needsAttention` is tier 2 in CCPrimaryPick and `working` is tier 1, so the finished
+  // session then TOOK THE ISLAND from the one that was actually running.
+  //
+  // The fix is the rule the two neighbouring rungs already follow — rank 3's CC-driven twin and rank 5's
+  // recordDone case both AUTHOR their plaintext — for the same one-line reason: THE RECORD'S BLOB CANNOT
+  // CARRY A STATE THE RECORD ITSELF DID NOT WRITE, and the state machine cannot read its own sealed blob
+  // to find out. Authoring also restores invariant 22 (textual identity with the worker's own corrective,
+  // buildDoneEnvelope), which the sealed passthrough was quietly breaking on every corrective done.
+  test("RANK 3 · done AUTHORS its blob — a corrective done never re-serves the record's stale blob", () => {
+    // The field record, verbatim: op:done + the prio:1 needsAttention blob the Notification hook left.
+    const corrected = rec({ op: "done", lastEvent: "done", prio: 1, blob: "sealed-needs-attention" });
+    expect(state({ record: corrected })).toEqual({
+      state: "done", terminal: false, ts: NOW, why: "done", agent: "claude",
+      blob: { kind: "plain", value: buildStatePlaintext(corrected, "done", NOW) },
+    });
+    // …and the authored plaintext SAYS done, which is the whole point: it is what the phone renders.
+    expect(buildStatePlaintext(corrected, "done", NOW).status).toBe("done");
+    // Stamped at the RECORD's ts, never `now`: commitState signs the pre-seal description, so a stamp
+    // that moved every sweep would re-seal (and re-wake every long poll) on a session that is over.
+    const aged = rec({ op: "done", ts: RECORD_AT });
+    expect(state({ record: aged })).toMatchObject({
+      ts: RECORD_AT, blob: { kind: "plain", value: buildStatePlaintext(aged, "done", RECORD_AT) },
+    });
+    // The CC-corroborated variant of the same rung keeps its own `why` and authors identically.
+    expect(withCc({ status: "idle", statusUpdatedAt: CC_AT }, { record: older({ op: "done" }) }))
+      .toMatchObject({ state: "done", why: "done+cc", blob: { kind: "plain" } });
+  });
+
   test("RANK 4 · needsAttention · why:attn — prio 1 with no live hold", () => {
     expect(state({ record: rec({ prio: 1 }) }))
       .toMatchObject({ state: "needsAttention", why: "attn", blob: { kind: "sealed", value: "sealed-blob" } });
@@ -415,10 +454,20 @@ describe("computeSessionState — what CC's file may and may not do (invariant 1
       .toMatchObject({ state: "working", why: "work" });
   });
 
-  test("it CORROBORATES a record's own done (why gains +cc) without changing the blob", () => {
-    const s = withCc({ status: "idle", statusUpdatedAt: CC_AT }, { record: older({ op: "done" }) })!;
+  // CC's contribution here is to the `why` ONLY — it corroborates a done the record already claimed and
+  // never invents one. What it does NOT do any more is decide the blob: rank 3 authors its plaintext
+  // unconditionally now (see "RANK 3 · done AUTHORS its blob"), because the record's own blob is written
+  // by whichever hook ran LAST and a corrective done leaves the previous one in place. That was the
+  // 2026-08-03 field bug, and this assertion used to pin the passthrough that caused it.
+  test("it CORROBORATES a record's own done (why gains +cc), and the blob is authored either way", () => {
+    const record = older({ op: "done" });
+    const s = withCc({ status: "idle", statusUpdatedAt: CC_AT }, { record })!;
     expect(s).toMatchObject({ state: "done", why: "done+cc" });
-    expect(s.blob).toEqual({ kind: "sealed", value: "sealed-blob" });
+    expect(s.blob).toEqual({ kind: "plain", value: buildStatePlaintext(record, "done", RECORD_AT, "api-status-53") });
+    // Identical blob with and without CC's corroboration — only `why` moves, which is the invariant.
+    const bare = state({ record })!;
+    expect(bare.why).toBe("done");
+    expect((bare.blob as { value: Record<string, unknown> }).value.status).toBe("done");
   });
 
   test("it NEVER creates a row", () => {

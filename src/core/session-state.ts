@@ -452,7 +452,25 @@ export function computeSessionState(input: SessionStateInput): SessionState | nu
     // and would render the wrong word.
     const heldBack = opinion?.status === "busy" && opinion.statusUpdatedAt > ts;
     if (!heldBack) {
-      return of("done", opinion?.status === "idle" ? "done+cc" : suffix("done"), sealed, ts, false);
+      // THE BLOB IS AUTHORED, never the record's own — the same rule the CC-driven twin below and rank
+      // 5's recordDone case already follow, and for the same one-line reason: THE RECORD'S BLOB CANNOT
+      // CARRY A STATE THE RECORD ITSELF DID NOT WRITE. A corrective done is written by the watchdog as
+      // `{ ...record, op: "done", lastEvent: "done" }` — the POSTed envelope is rebuilt, but on disk the
+      // previous hook's `prio` and `blob` survive, so a done record routinely carries a needsAttention
+      // (or working) blob. v1's `frames` never noticed: the LIFECYCLE OP was the phone's authority there
+      // (`CCLanFrame.isTerminal` ⇒ the row reads done whatever the blob says). v2 has no such field —
+      // `terminal` means "retire this entry", and a done with a live pid is deliberately not that — so a
+      // passed-through blob became the rendered status, and the 2026-08-03 field report was a FINISHED
+      // session painted needsAttention, outranking a running one for the island (CCPrimaryPick tiers
+      // attention above working). Authoring is also what invariant 22 asks for: this is byte-for-byte
+      // what the watchdog's own buildDoneEnvelope POSTs for the same corrective.
+      //
+      // Stamped at `ts` (the record's own), NOT `now`: commitState signs the pre-seal description, so a
+      // stamp that moved every sweep would re-seal and wake every long poll on a session that is over.
+      return of(
+        "done", opinion?.status === "idle" ? "done+cc" : suffix("done"),
+        { kind: "plain", value: buildStatePlaintext(record, "done", ts, opinion?.name) }, ts, false,
+      );
     }
   }
 
