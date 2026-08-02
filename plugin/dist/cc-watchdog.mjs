@@ -103,7 +103,7 @@ import { appendFileSync, existsSync, readFileSync, statSync, truncateSync } from
 import { execFileSync, spawn } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "1.6.0";
+var PLUGIN_VERSION = "1.6.1";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -115,7 +115,7 @@ function formatPlanPickerDebug(input) {
   return Array.from(value).slice(0, DBG_BLOB_TEXT_MAX_CHARS).join("");
 }
 function formatDecisionHoldDebug(input) {
-  const value = `${debugToken(input.version ?? PLUGIN_VERSION)} ev:hold hold@${Math.floor(input.at)} req:${debugToken(input.requestId.slice(0, 8))} pid:${input.pid}`;
+  const value = `${debugToken(input.version ?? PLUGIN_VERSION)} ev:hold req:${debugToken(input.requestId.slice(0, 8))} pid:${input.pid}`;
   return Array.from(value).slice(0, DBG_BLOB_TEXT_MAX_CHARS).join("");
 }
 var CC_DIR = `${process.env.HOME}/.config/cc-status`;
@@ -5911,7 +5911,7 @@ async function runPermissionHook(deps = {}, agent = "claude") {
     const holdPid = deps.holdPid ?? process.pid;
     let holdBlob = blob;
     try {
-      holdBlob = await encryptBlob(config.e2eKey, appendFittedPlanAndDebug(permissionFrame(permissionBase, fitted.detail, fitted.omitted, fitted.questions), undefined, formatDecisionHoldDebug({ at: holdAt, requestId, pid: holdPid })));
+      holdBlob = await encryptBlob(config.e2eKey, appendFittedPlanAndDebug(permissionFrame(permissionBase, fitted.detail, fitted.omitted, fitted.questions), undefined, formatDecisionHoldDebug({ requestId, pid: holdPid })));
     } catch {}
     await (deps.writeHoldFn ?? defaultWriteHold())(sessionId, { blob: holdBlob, at: holdAt, pid: holdPid });
     heldSessionId = sessionId;

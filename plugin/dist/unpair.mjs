@@ -96,7 +96,7 @@ async function sha256Hex(s) {
 }
 
 // src/core/shared.ts
-var PLUGIN_VERSION = "1.6.0";
+var PLUGIN_VERSION = "1.6.1";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -108,7 +108,7 @@ function formatPlanPickerDebug(input) {
   return Array.from(value).slice(0, DBG_BLOB_TEXT_MAX_CHARS).join("");
 }
 function formatDecisionHoldDebug(input) {
-  const value = `${debugToken(input.version ?? PLUGIN_VERSION)} ev:hold hold@${Math.floor(input.at)} req:${debugToken(input.requestId.slice(0, 8))} pid:${input.pid}`;
+  const value = `${debugToken(input.version ?? PLUGIN_VERSION)} ev:hold req:${debugToken(input.requestId.slice(0, 8))} pid:${input.pid}`;
   return Array.from(value).slice(0, DBG_BLOB_TEXT_MAX_CHARS).join("");
 }
 var CC_DIR = `${process.env.HOME}/.config/cc-status`;
