@@ -1009,6 +1009,49 @@ describe("frames — the state-sync store", () => {
     expect(card!.ts).toBeGreaterThan(NOW);
   });
 
+  // THE MIXED-VERSION CONTRACT that LAN status v2 phase 3 spent, and the reason this projection's
+  // monotonic bump is DEPRECATION-WINDOW machinery rather than something phase 3 could delete.
+  //
+  // The phone used to carry its own half of the R1 fix: `CCLanFramesMerge.accepts`'s `decisionEdge`
+  // allowance, which let an ENTERING hold card land on an equal stamp. Phase 3 deleted it, on the
+  // strength of THIS side — a `frames` response can never repeat a per-session `ts`, so the tie the
+  // allowance existed for cannot reach the phone at all. If this test ever goes red, a NEW app build on
+  // an OLD Mac wedges yellow with no Allow/Deny for the whole hold, and there is no longer a phone-side
+  // net under it. Do not delete this before the `frames` op itself.
+  test("the frames projection NEVER repeats a per-session ts — the guard the phone stopped duplicating", async () => {
+    const dir = await framesDir();
+    const store = makeStore(dir);
+    const seenTs: number[] = [];
+    let cursor = 0;
+    const drain = (): void => {
+      const slice = store.since(cursor);
+      cursor = slice.seq;
+      for (const frame of slice.frames) seenTs.push(frame.ts);
+    };
+
+    // Every edge that legitimately shares a record stamp, walked in one session: a plain attention
+    // frame, the ENTERING hold card (stamped max(record.ts, hold.at) — the R1 collision), a parallel
+    // tool's prio:0 write landing mid-hold, and the release back to the record.
+    await put(dir, "s1", { prio: 1 });
+    await store.reconcile();
+    drain();
+    await writeFile(join(dir, decisionHoldFileName("s1")),
+                    JSON.stringify({ blob: "sealed-decision-pending", at: NOW - 6_000, pid: 4242 }));
+    await store.reconcile();
+    drain();
+    await put(dir, "s1", { prio: 0, blob: "sealed-parallel-tool" });   // same frozen record ts
+    await store.reconcile();
+    drain();
+    await unlink(join(dir, decisionHoldFileName("s1")));
+    await store.reconcile();
+    drain();
+
+    expect(seenTs.length).toBeGreaterThanOrEqual(3);
+    for (let i = 1; i < seenTs.length; i += 1) {
+      expect(seenTs[i]).toBeGreaterThan(seenTs[i - 1]);
+    }
+  });
+
   // A KILLED holder is the ONE release the hook's own `finally` cannot cover — a SIGKILL (or the
   // SIGTERM a closed terminal sends) never reaches it, so nothing settles the record and nothing
   // unlinks the marker. The record it left behind genuinely IS this session's truth, and the pid probe

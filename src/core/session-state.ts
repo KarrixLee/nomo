@@ -457,8 +457,8 @@ export function computeSessionState(input: SessionStateInput): SessionState | nu
   }
 
   // --- rank 2: a live hold ------------------------------------------------------------------------
-  // The card's blob is the hold's blob VERBATIM — sealed by the hook with its own `hold@` dbg tail, and
-  // never re-derived here.
+  // The card's blob is the hold's blob VERBATIM — sealed by the hook with its own `ev:hold` dbg tail,
+  // and never re-derived here.
   if (stateHoldLive(hold, holdPidAlive, now)) {
     return {
       state: "decisionPending", terminal: false, ts, why: "hold",

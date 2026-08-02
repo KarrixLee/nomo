@@ -592,7 +592,11 @@ describe("runPermissionHook — hold state machine", () => {
     const held = (await decryptBlob(KEY, writes[0].hold.blob)) as Record<string, unknown>;
     expect({ ...held, dbg: undefined }).toEqual({ ...posted, dbg: undefined });
     expect("dbg" in posted).toBe(false);
-    expect(held.dbg).toBe(`${PLUGIN_VERSION} ev:hold hold@1000 req:req-fixe pid:9001`);
+    // PORTED IN v2 PHASE 3: the `hold@<at>` tail is gone (spec, "The diagnostics line under v2"). It
+    // reported an ordering fact from the era when `ts` was an ordering contract; the state feed now names
+    // the deciding input on the wire (`why:"hold"`). `ev:hold` still answers the only question the line
+    // ever existed for — WHICH channel painted this card — so the assertion survives, one token shorter.
+    expect(held.dbg).toBe(`${PLUGIN_VERSION} ev:hold req:req-fixe pid:9001`);
     expect(Object.keys(held).at(-1)).toBe("dbg");   // append-LAST, like every other blob tail
     expect(writes[0].hold.at).toBe(1000);
     expect(writes[0].hold.pid).toBe(9_001);   // the HOLDING process, so the feed can probe its liveness

@@ -59,21 +59,25 @@ export function formatPlanPickerDebug(input: {
  *  formatPlanPickerDebug produces, for the other state machine that can wedge a row.
  *
  *  It answers the one question a stuck approval always raises: is the card the phone is showing the
- *  Mac's HOLD OVERLAY, or the record's own frame? The overlay's blob is this one and carries this line;
- *  the record's blob never does. So `hold@…` on the row means the LAN feed is serving the card, and its
- *  absence under a decisionPending row means the phone is looking at the worker's copy instead.
+ *  Mac's hold, or the record's own frame? The hold's blob is this one and carries this line; the
+ *  record's blob never does. `ev:hold` on the row is that statement, and its absence under a
+ *  decisionPending row means the phone is looking at the worker's copy instead.
  *
- *  `at` is the marker's own stamp, verbatim — the same number lanHoldLive compares against the record's
- *  and the same one the overlay's frame is stamped max()-with, so the phone's applied frame stamp and
- *  this line can be read side by side. Fitted into BLOB_FIT_CHARS by appendFittedPlanAndDebug like
- *  every other dbg, i.e. dropped entirely rather than crowding out the card's real content. */
+ *  THE `hold@<at>` TAIL IS RETIRED (LAN status v2 phase 3). It carried the marker's own stamp so a
+ *  reader could line it up against the frame stamp the overlay was max()-ed to — an ordering fact, from
+ *  the era when `ts` was an ordering contract. Under v2 the state feed serves whole snapshots and names
+ *  the deciding input on the wire (`why:"hold"`), so there is no stamp to reconcile and the tail was
+ *  reporting a mechanism nobody reads any more. `ev:hold` alone keeps the only question it ever
+ *  answered answered, on BOTH protocols — nothing on either side has ever parsed the tail, so an old
+ *  phone loses no behaviour, only a number it could not use. Fitted into BLOB_FIT_CHARS by
+ *  appendFittedPlanAndDebug like every other dbg, i.e. dropped entirely rather than crowding out the
+ *  card's real content. */
 export function formatDecisionHoldDebug(input: {
-  at: number;
   requestId: string;
   pid: number;
   version?: string;
 }): string {
-  const value = `${debugToken(input.version ?? PLUGIN_VERSION)} ev:hold hold@${Math.floor(input.at)} req:${debugToken(input.requestId.slice(0, 8))} pid:${input.pid}`;
+  const value = `${debugToken(input.version ?? PLUGIN_VERSION)} ev:hold req:${debugToken(input.requestId.slice(0, 8))} pid:${input.pid}`;
   return Array.from(value).slice(0, DBG_BLOB_TEXT_MAX_CHARS).join("");
 }
 

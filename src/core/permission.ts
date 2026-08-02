@@ -1433,7 +1433,7 @@ export async function runPermissionHook(deps: PermissionHookDeps = {}, agent: Ag
     try {
       holdBlob = await encryptBlob(config.e2eKey, appendFittedPlanAndDebug(
         permissionFrame(permissionBase, fitted.detail, fitted.omitted, fitted.questions), undefined,
-        formatDecisionHoldDebug({ at: holdAt, requestId, pid: holdPid }),
+        formatDecisionHoldDebug({ requestId, pid: holdPid }),
       ));
     } catch { /* the card without its breadcrumb is still the card */ }
     await (deps.writeHoldFn ?? defaultWriteHold())(
