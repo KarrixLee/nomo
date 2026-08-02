@@ -103,7 +103,7 @@ import { appendFileSync, existsSync, readFileSync, statSync, truncateSync } from
 import { execFileSync, spawn } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "1.5.3";
+var PLUGIN_VERSION = "1.6.0";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -3242,9 +3242,11 @@ import { readFile as readFile4 } from "node:fs/promises";
 import { networkInterfaces } from "node:os";
 
 // src/core/lan-frames.ts
+import { execFile as execFile3 } from "node:child_process";
 import { watch } from "node:fs";
 import { readdir as readdir2, readFile as readFile3 } from "node:fs/promises";
 import { basename as basename2 } from "node:path";
+import { promisify as promisify3 } from "node:util";
 
 // src/core/lan-wire.ts
 var LAN_PATH = "/v1/lan";
@@ -3327,12 +3329,188 @@ function lanRunningUnderTest() {
   return process.argv.some((arg) => arg === "test" || arg.endsWith(".test.ts"));
 }
 
+// src/core/session-state.ts
+var SESSION_STATE_STALE_MS = 86400000;
+var STATE_HOLD_MAX_AGE_MS = 600000;
+var CC_STATUS_MAX_AGE_MS = 600000;
+var CC_STATUS_FUTURE_SKEW_MS = 5000;
+var CC_PROC_START_TOLERANCE_MS = 5000;
+var CC_IDLE_DONE_GRACE_MS = 3000;
+var MONTHS = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
+function parseCcProcStart(value) {
+  if (typeof value !== "string")
+    return;
+  const m = /^\s*[A-Za-z]{3}\s+([A-Za-z]{3})\s+(\d{1,2})\s+(\d{2}):(\d{2}):(\d{2})\s+(\d{4})\s*$/.exec(value);
+  if (!m)
+    return;
+  const month = MONTHS.indexOf(m[1].toLowerCase());
+  if (month < 0)
+    return;
+  const day = Number(m[2]);
+  const utc = Date.UTC(Number(m[6]), month, day, Number(m[3]), Number(m[4]), Number(m[5]));
+  if (!Number.isFinite(utc))
+    return;
+  return new Date(utc).getUTCDate() === day ? utc : undefined;
+}
+function parseCcSessionFile(raw) {
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed))
+    return null;
+  const f = parsed;
+  if (typeof f.pid !== "number" || !Number.isFinite(f.pid))
+    return null;
+  if (typeof f.sessionId !== "string" || f.sessionId.length === 0)
+    return null;
+  const str = (key) => typeof f[key] === "string" && f[key].length > 0 ? f[key] : undefined;
+  const num = (key) => typeof f[key] === "number" && Number.isFinite(f[key]) ? f[key] : undefined;
+  return {
+    pid: f.pid,
+    sessionId: f.sessionId,
+    ...str("cwd") ? { cwd: str("cwd") } : {},
+    ...num("startedAt") !== undefined ? { startedAt: num("startedAt") } : {},
+    ...str("procStart") ? { procStart: str("procStart") } : {},
+    ...str("version") ? { version: str("version") } : {},
+    ...str("kind") ? { kind: str("kind") } : {},
+    ...str("entrypoint") ? { entrypoint: str("entrypoint") } : {},
+    ...str("name") ? { name: str("name") } : {},
+    ...str("nameSource") ? { nameSource: str("nameSource") } : {},
+    ...str("status") ? { status: str("status") } : {},
+    ...num("updatedAt") !== undefined ? { updatedAt: num("updatedAt") } : {},
+    ...num("statusUpdatedAt") !== undefined ? { statusUpdatedAt: num("statusUpdatedAt") } : {}
+  };
+}
+function ccOpinion(file, join3, now) {
+  if (!file)
+    return null;
+  if (typeof join3.pid !== "number" || !Number.isFinite(join3.pid) || file.pid !== join3.pid)
+    return null;
+  if (file.sessionId !== join3.sessionId)
+    return null;
+  const probed = join3.procStartedAt;
+  if (typeof probed !== "number" || !Number.isFinite(probed))
+    return null;
+  const claimed = typeof file.startedAt === "number" && Number.isFinite(file.startedAt) ? file.startedAt : parseCcProcStart(file.procStart);
+  if (typeof claimed !== "number")
+    return null;
+  if (Math.abs(claimed - probed) > CC_PROC_START_TOLERANCE_MS)
+    return null;
+  if (file.status !== "busy" && file.status !== "idle")
+    return null;
+  const at = file.statusUpdatedAt;
+  if (typeof at !== "number" || !Number.isFinite(at))
+    return null;
+  if (now - at >= CC_STATUS_MAX_AGE_MS)
+    return null;
+  if (at - now > CC_STATUS_FUTURE_SKEW_MS)
+    return null;
+  return {
+    status: file.status,
+    statusUpdatedAt: at,
+    ...file.name && file.nameSource === "derived" ? { name: file.name } : {}
+  };
+}
+var finite = (value) => typeof value === "number" && Number.isFinite(value);
+var filled = (value) => typeof value === "string" && value.length > 0;
+function buildStatePlaintext(record, status, at, titleFallback) {
+  const agent = record.agent === "codex" ? "codex" : "claude";
+  const base = {
+    status,
+    title: filled(record.title) ? record.title : filled(titleFallback) ? titleFallback : "",
+    machine: typeof record.machine === "string" ? record.machine : "",
+    label: typeof record.label === "string" ? record.label : "",
+    ...adapterFor(agent).blobAgentFields,
+    ...finite(record.turnStartedAt) ? { turnStartedAt: record.turnStartedAt } : {},
+    ...filled(record.model) ? { model: record.model } : {},
+    at: Math.floor(at / 1000)
+  };
+  const dbg = agent === "codex" ? formatPlanPickerDebug({
+    event: status === "done" ? "done" : "working",
+    classifier: status === "done" ? "done" : "resolved",
+    marker: "0",
+    by: "wd"
+  }) : undefined;
+  return appendFittedPlanAndDebug(base, undefined, dbg);
+}
+function stateHoldLive(hold, holdPidAlive, now) {
+  if (!hold || !filled(hold.blob))
+    return false;
+  if (!finite(hold.at))
+    return false;
+  if (now - hold.at > STATE_HOLD_MAX_AGE_MS)
+    return false;
+  if (!finite(hold.pid) || holdPidAlive !== true)
+    return false;
+  return true;
+}
+function computeSessionState(input) {
+  const { sessionId, record, pairingId, hold, pidAlive: pidAlive2, holdPidAlive, cc, ccProcStartedAt, correctives, now } = input;
+  if (record === null) {
+    return { state: "ended", terminal: true, ts: now, why: "reap", blob: { kind: "last" }, agent: "claude" };
+  }
+  if (!filled(record.blob))
+    return null;
+  if (pairingId === undefined || record.pairingId !== pairingId)
+    return null;
+  const agent = record.agent === "codex" ? "codex" : "claude";
+  const ts = finite(record.ts) ? record.ts : now;
+  const startedAt = finite(record.sessionStartedAt) ? { startedAt: record.sessionStartedAt } : {};
+  const sealed = { kind: "sealed", value: record.blob };
+  const asking = record.attentionKind === "userInput" ? { attentionKind: "userInput" } : {};
+  const of = (state, why, blob, at, terminal = false) => ({ state, terminal, ts: at, why, blob, agent, ...startedAt });
+  if (correctives?.ended === true)
+    return of("ended", "end", sealed, ts, true);
+  if (record.op === "end")
+    return of("ended", "end", sealed, ts, true);
+  if (finite(record.ts) && now - record.ts > SESSION_STATE_STALE_MS)
+    return of("ended", "stale", sealed, ts, true);
+  if (!pidAlive2)
+    return of("ended", "reap", sealed, ts, true);
+  const ccUsable = agent === "claude" && record.provisional !== true;
+  const opinion = ccUsable ? ccOpinion(cc, { pid: record.pid, sessionId, procStartedAt: ccProcStartedAt }, now) : null;
+  const suffix = (base) => agent === "codex" ? `${base}/cx` : base;
+  const recordDone = correctives?.done === true || record.op === "done" || record.lastEvent === "done";
+  if (recordDone) {
+    const heldBack = opinion?.status === "busy" && opinion.statusUpdatedAt > ts;
+    if (!heldBack) {
+      return of("done", opinion?.status === "idle" ? "done+cc" : suffix("done"), sealed, ts, false);
+    }
+  }
+  if (stateHoldLive(hold, holdPidAlive, now)) {
+    return {
+      state: "decisionPending",
+      terminal: false,
+      ts,
+      why: "hold",
+      blob: { kind: "sealed", value: hold.blob },
+      agent,
+      ...startedAt,
+      ...asking
+    };
+  }
+  if (!recordDone && opinion?.status === "idle" && record.prio !== 1 && record.lastEvent !== "needsAttention" && opinion.statusUpdatedAt > ts + CC_IDLE_DONE_GRACE_MS) {
+    return of("done", "done+cc", { kind: "plain", value: buildStatePlaintext(record, "done", opinion.statusUpdatedAt, opinion.name) }, ts, false);
+  }
+  if (record.prio === 1)
+    return { ...of("needsAttention", "attn", sealed, ts, false), ...asking };
+  const busy = opinion?.status === "busy" && opinion.statusUpdatedAt > ts;
+  return of("working", busy ? "work+cc" : suffix("work"), recordDone ? { kind: "plain", value: buildStatePlaintext(record, "working", now, opinion?.name) } : sealed, ts, false);
+}
+
 // src/core/lan-frames.ts
+var execFileP3 = promisify3(execFile3);
 var LAN_FRAME_RETIRE_GRACE_MS = 60000;
 var LAN_FRAMES_WATCH_DEBOUNCE_MS = 100;
 var LAN_FRAMES_WAITERS_MAX = 4;
 var LAN_FRAME_SESSION_STALE_MS = 86400000;
 var LAN_HOLD_MAX_AGE_MS = 600000;
+var LAN_STATE_SESSIONS_MAX = 20;
+var CC_SESSIONS_DIR = `${process.env.HOME}/.claude/sessions`;
+var CC_CAPABILITY_LATCH_SWEEPS = 5;
 function lanFrameSessionLive(record, now, isAlive) {
   if (typeof record.pid !== "number" || !Number.isFinite(record.pid))
     return false;
@@ -3381,6 +3559,26 @@ function lanHoldLive(hold, record, now, isAlive) {
   const suppressible = (record.op ?? "update") === "update" && record.prio === 1;
   return record.ts <= hold.at || suppressible;
 }
+function sameKey(a, b) {
+  if (a === b)
+    return true;
+  if (!a || !b || a.length !== b.length)
+    return false;
+  for (let i = 0;i < a.length; i += 1) {
+    if (a[i] !== b[i])
+      return false;
+  }
+  return true;
+}
+async function defaultProcStartedAt(pid) {
+  try {
+    const { stdout } = await execFileP3("ps", ["-o", "lstart=", "-p", String(pid)]);
+    const parsed = Date.parse(String(stdout).trim());
+    return Number.isFinite(parsed) ? parsed : undefined;
+  } catch {
+    return;
+  }
+}
 function defaultWatchDir(dir, onChange) {
   try {
     const watcher = watch(dir, { persistent: false }, () => onChange());
@@ -3403,13 +3601,25 @@ function createLanFrameStore(deps = {}) {
   const debounceMs = deps.debounceMs ?? LAN_FRAMES_WATCH_DEBOUNCE_MS;
   const maxWaiters = deps.maxWaiters ?? LAN_FRAMES_WAITERS_MAX;
   const watchDir = deps.watchDir ?? defaultWatchDir;
+  const ccSessionsDir = deps.ccSessionsDir ?? (lanRunningUnderTest() ? undefined : CC_SESSIONS_DIR);
+  const procStartedAt = deps.procStartedAt ?? defaultProcStartedAt;
   const entries = new Map;
+  const stateEntries = new Map;
   const waiters = new Set;
+  const stateWaiters = new Set;
   let counter = 0;
+  let stateCounter = 0;
+  let completeFromSeq = 0;
   let pairingId;
+  let e2eKey;
   let stopped = false;
   let watcher = null;
+  let ccWatcher = null;
   let debounce;
+  const procStartCache = new Map;
+  const ccSeenPids = new Set;
+  let ccMissStreak = 0;
+  let ccLatchedOff = false;
   let chain = Promise.resolve();
   const drop = (waiter) => {
     if (waiter.timer !== undefined) {
@@ -3417,13 +3627,32 @@ function createLanFrameStore(deps = {}) {
       waiter.timer = undefined;
     }
     waiters.delete(waiter);
+    stateWaiters.delete(waiter);
     try {
       waiter.resolve();
     } catch {}
   };
-  const wake = () => {
-    for (const waiter of [...waiters])
+  const wake = (set) => {
+    for (const waiter of [...set])
       drop(waiter);
+  };
+  const park = async (set, waitMs) => {
+    let settle;
+    const promise = new Promise((resolve) => {
+      settle = resolve;
+    });
+    const waiter = { resolve: settle };
+    set.add(waiter);
+    while (set.size > maxWaiters) {
+      const oldest = set.values().next();
+      if (oldest.done || oldest.value === waiter)
+        break;
+      drop(oldest.value);
+    }
+    const timer = setTimeout(() => drop(waiter), waitMs);
+    timer.unref?.();
+    waiter.timer = timer;
+    await promise;
   };
   const stamp = (sessionId, content, retiredAt) => {
     const sig = `${retiredAt === undefined ? "live" : "term"}|${JSON.stringify(content)}`;
@@ -3446,6 +3675,75 @@ function createLanFrameStore(deps = {}) {
     blob: frame.blob,
     ...frame.agent ? { agent: frame.agent } : {}
   });
+  const startOf = async (pid) => {
+    if (typeof pid !== "number" || !Number.isFinite(pid))
+      return;
+    if (procStartCache.has(pid))
+      return procStartCache.get(pid);
+    let value;
+    try {
+      value = await procStartedAt(pid);
+    } catch {
+      value = undefined;
+    }
+    procStartCache.set(pid, value);
+    return value;
+  };
+  const ccFileOf = async (pid) => {
+    if (!ccSessionsDir || ccLatchedOff)
+      return null;
+    if (typeof pid !== "number" || !Number.isFinite(pid))
+      return null;
+    try {
+      return parseCcSessionFile(await readFile3(`${ccSessionsDir}/${pid}.json`, "utf8"));
+    } catch {
+      return null;
+    }
+  };
+  const commitState = async (sessionId, computed, at) => {
+    const prev = stateEntries.get(sessionId);
+    const blob = computed.blob;
+    if (blob.kind === "last" && !prev)
+      return false;
+    const blobSig = blob.kind === "sealed" ? `s:${blob.value}` : blob.kind === "plain" ? `p:${JSON.stringify(blob.value)}` : `l:${prev.state.blob}`;
+    const agent = blob.kind === "last" ? prev.state.agent : computed.agent === "codex" ? "codex" : undefined;
+    const startedAt = blob.kind === "last" ? prev.state.startedAt : computed.startedAt;
+    const asking = blob.kind === "last" ? undefined : computed.attentionKind;
+    const sig = `${computed.terminal ? "term" : "live"}|${computed.ts}|${computed.why}|${agent ?? ""}` + `|${startedAt ?? ""}|${asking ?? ""}|${blobSig}`;
+    if (prev && prev.sig === sig)
+      return false;
+    let sealed;
+    if (blob.kind === "sealed") {
+      sealed = blob.value;
+    } else if (blob.kind === "last") {
+      sealed = prev.state.blob;
+    } else {
+      if (!e2eKey)
+        return false;
+      try {
+        sealed = await encryptBlob(e2eKey, blob.value);
+      } catch {
+        return false;
+      }
+    }
+    stateCounter += 1;
+    stateEntries.set(sessionId, {
+      seq: stateCounter,
+      state: {
+        sessionId,
+        ts: computed.ts,
+        terminal: computed.terminal,
+        blob: sealed,
+        ...agent ? { agent } : {},
+        ...startedAt !== undefined ? { startedAt } : {},
+        ...asking ? { attentionKind: asking } : {},
+        why: computed.why.slice(0, 16)
+      },
+      sig,
+      ...computed.terminal ? { retiredAt: at } : {}
+    });
+    return true;
+  };
   const reconcileOnce = async () => {
     if (!sessionsDir)
       return;
@@ -3457,18 +3755,34 @@ function createLanFrameStore(deps = {}) {
       files = [];
     }
     let changed = false;
+    let stateChanged = false;
     const seen = new Set;
+    const aliveCache = new Map;
+    const alive = (pid) => {
+      const memo = aliveCache.get(pid);
+      if (memo !== undefined)
+        return memo;
+      const value = isAlive(pid);
+      aliveCache.set(pid, value);
+      return value;
+    };
     const held = new Set;
     for (const file of files) {
       if (file.endsWith(DECISION_HOLD_SUFFIX))
         held.add(file.slice(0, -DECISION_HOLD_SUFFIX.length));
     }
+    let ccConsulted = false;
+    let ccAnswered = false;
+    let freshPid = false;
+    const livePids = new Set;
     for (const file of files) {
       if (!file.endsWith(".json"))
         continue;
       const sessionId = basename2(file, ".json");
       seen.add(sessionId);
-      if (entries.get(sessionId)?.retiredAt !== undefined)
+      const v1Retired = entries.get(sessionId)?.retiredAt !== undefined;
+      const v2Retired = stateEntries.get(sessionId)?.retiredAt !== undefined;
+      if (v1Retired && v2Retired)
         continue;
       let record = null;
       try {
@@ -3484,10 +3798,45 @@ function createLanFrameStore(deps = {}) {
           hold = null;
         }
       }
-      const content = lanFrameContent(record, pairingId, hold, at, isAlive);
-      if (!content)
-        continue;
-      changed = lanFrameSessionLive(record, at, isAlive) ? stamp(sessionId, content) || changed : stamp(sessionId, terminalContent({ seq: 0, sessionId, ...content }, at), at) || changed;
+      if (typeof record.pid === "number" && Number.isFinite(record.pid))
+        livePids.add(record.pid);
+      if (!v1Retired) {
+        const content = lanFrameContent(record, pairingId, hold, at, alive);
+        if (content) {
+          changed = lanFrameSessionLive(record, at, alive) ? stamp(sessionId, content) || changed : stamp(sessionId, terminalContent({ seq: 0, sessionId, ...content }, at), at) || changed;
+        }
+      }
+      if (!v2Retired) {
+        const askCc = record.agent !== "codex" && record.provisional !== true;
+        let cc = null;
+        let ccProcStartedAt;
+        if (askCc && ccSessionsDir) {
+          if (typeof record.pid === "number" && Number.isFinite(record.pid) && !ccSeenPids.has(record.pid)) {
+            freshPid = true;
+            ccSeenPids.add(record.pid);
+          }
+          if (!ccLatchedOff) {
+            ccConsulted = true;
+            cc = await ccFileOf(record.pid);
+            if (cc?.status === "busy" || cc?.status === "idle")
+              ccAnswered = true;
+            ccProcStartedAt = await startOf(record.pid);
+          }
+        }
+        const computed = computeSessionState({
+          sessionId,
+          record,
+          pairingId,
+          hold,
+          pidAlive: typeof record.pid === "number" && Number.isFinite(record.pid) ? alive(record.pid) : false,
+          holdPidAlive: hold && typeof hold.pid === "number" && Number.isFinite(hold.pid) ? alive(hold.pid) : false,
+          cc,
+          ccProcStartedAt,
+          now: at
+        });
+        if (computed)
+          stateChanged = await commitState(sessionId, computed, at) || stateChanged;
+      }
     }
     for (const [sessionId, entry] of [...entries]) {
       if (entry.retiredAt === undefined && !seen.has(sessionId)) {
@@ -3497,8 +3846,36 @@ function createLanFrameStore(deps = {}) {
       if (entry.retiredAt !== undefined && at - entry.retiredAt > retireGraceMs)
         entries.delete(sessionId);
     }
+    for (const [sessionId, entry] of [...stateEntries]) {
+      if (entry.retiredAt === undefined && !seen.has(sessionId)) {
+        const gone = computeSessionState({ sessionId, record: null, pairingId, pidAlive: false, now: at });
+        if (gone)
+          stateChanged = await commitState(sessionId, gone, at) || stateChanged;
+        continue;
+      }
+      if (entry.retiredAt !== undefined && at - entry.retiredAt > retireGraceMs)
+        stateEntries.delete(sessionId);
+    }
+    if (freshPid) {
+      ccMissStreak = 0;
+      ccLatchedOff = false;
+    } else if (ccConsulted) {
+      ccMissStreak = ccAnswered ? 0 : ccMissStreak + 1;
+      if (ccMissStreak >= CC_CAPABILITY_LATCH_SWEEPS)
+        ccLatchedOff = true;
+    }
+    for (const pid of [...procStartCache.keys()]) {
+      if (!livePids.has(pid))
+        procStartCache.delete(pid);
+    }
+    for (const pid of [...ccSeenPids]) {
+      if (!livePids.has(pid))
+        ccSeenPids.delete(pid);
+    }
     if (changed)
-      wake();
+      wake(waiters);
+    if (stateChanged)
+      wake(stateWaiters);
   };
   const store = {
     seq() {
@@ -3518,29 +3895,38 @@ function createLanFrameStore(deps = {}) {
       const immediate = store.since(sinceSeq);
       if (stopped || waitMs <= 0 || immediate.frames.length > 0)
         return immediate;
-      let settle;
-      const promise = new Promise((resolve) => {
-        settle = resolve;
-      });
-      const waiter = { resolve: settle };
-      waiters.add(waiter);
-      while (waiters.size > maxWaiters) {
-        const oldest = waiters.values().next();
-        if (oldest.done || oldest.value === waiter)
-          break;
-        drop(oldest.value);
-      }
-      const timer = setTimeout(() => drop(waiter), waitMs);
-      timer.unref?.();
-      waiter.timer = timer;
-      await promise;
+      await park(waiters, waitMs);
       return store.since(sinceSeq);
     },
-    setPairing(next) {
-      if (next === pairingId)
-        return;
+    states(sinceSeq) {
+      const from = !Number.isFinite(sinceSeq) || sinceSeq < 0 || sinceSeq > stateCounter ? 0 : sinceSeq;
+      const complete = from === 0 || from <= completeFromSeq;
+      const picked = [];
+      for (const entry of stateEntries.values()) {
+        if (complete || entry.seq > from)
+          picked.push(entry);
+      }
+      picked.sort((a, b) => a.seq - b.seq);
+      const capped = picked.length <= LAN_STATE_SESSIONS_MAX ? picked : [...picked].sort((a, b) => b.state.ts - a.state.ts).slice(0, LAN_STATE_SESSIONS_MAX).sort((a, b) => a.seq - b.seq);
+      return { seq: stateCounter, at: now(), complete, sessions: capped.map((entry) => entry.state) };
+    },
+    async waitStates(sinceSeq, waitMs) {
+      const immediate = store.states(sinceSeq);
+      if (stopped || waitMs <= 0 || immediate.sessions.length > 0 || immediate.complete && stateCounter > 0) {
+        return immediate;
+      }
+      await park(stateWaiters, waitMs);
+      return store.states(sinceSeq);
+    },
+    setPairing(next, key) {
+      const rotated = next !== pairingId || e2eKey !== undefined && key !== undefined && !sameKey(e2eKey, key);
       pairingId = next;
+      e2eKey = key;
+      if (!rotated)
+        return;
       entries.clear();
+      stateEntries.clear();
+      completeFromSeq = stateCounter;
       store.reconcile();
     },
     async readFull(sessionId, what) {
@@ -3584,9 +3970,9 @@ function createLanFrameStore(deps = {}) {
       return chain;
     },
     start() {
-      if (stopped || watcher || !sessionsDir)
+      if (stopped)
         return;
-      watcher = watchDir(sessionsDir, () => {
+      const bump = () => {
         if (stopped)
           return;
         if (debounce !== undefined)
@@ -3596,7 +3982,11 @@ function createLanFrameStore(deps = {}) {
           store.reconcile();
         }, debounceMs);
         debounce.unref?.();
-      });
+      };
+      if (!watcher && sessionsDir)
+        watcher = watchDir(sessionsDir, bump);
+      if (!ccWatcher && ccSessionsDir)
+        ccWatcher = watchDir(ccSessionsDir, bump);
     },
     stop() {
       stopped = true;
@@ -3609,7 +3999,13 @@ function createLanFrameStore(deps = {}) {
       try {
         dying?.close();
       } catch {}
-      wake();
+      const dyingCc = ccWatcher;
+      ccWatcher = null;
+      try {
+        dyingCc?.close();
+      } catch {}
+      wake(waiters);
+      wake(stateWaiters);
     },
     size() {
       return entries.size;
@@ -3864,6 +4260,20 @@ function createLanListener(deps = {}) {
         const lid = address?.lid ?? "";
         const slice = await frames.wait(request.sinceSeq, request.waitMs);
         payload = { ok: true, seq: slice.seq, lid, frames: slice.frames };
+      } else if (envelope.op === "state") {
+        const request = parseLanFramesRequest(envelope.payload);
+        if (!request)
+          return reject(res, "state-payload");
+        const lid = address?.lid ?? "";
+        const slice = await frames.waitStates(request.sinceSeq, request.waitMs);
+        payload = {
+          ok: true,
+          seq: slice.seq,
+          lid,
+          at: slice.at,
+          complete: slice.complete,
+          sessions: slice.sessions
+        };
       } else if (envelope.op === "read") {
         const request = parseLanReadRequest(envelope.payload);
         if (!request)
@@ -3998,7 +4408,7 @@ function createLanListener(deps = {}) {
     sync(next) {
       try {
         config = next;
-        frames.setPairing(next?.pairingId);
+        frames.setPairing(next?.pairingId, next?.e2eKey);
         frames.reconcile();
         const memo = next ? `${next.pairingId}|${b64url(next.e2eKey)}` : "";
         if (memo === keyMemo)
