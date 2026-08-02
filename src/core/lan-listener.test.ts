@@ -11,6 +11,8 @@ import {
   LAN_HOLD_MAX_AGE_MS,
   LAN_FRAME_RETIRE_GRACE_MS,
   LAN_FRAME_SESSION_STALE_MS,
+  LAN_STATE_SESSIONS_MAX,
+  CC_CAPABILITY_LATCH_SWEEPS,
 } from "./lan-frames";
 import type { LanFrame, LanFramesSlice, LanFrameStore } from "./lan-frames";
 import {
@@ -1650,5 +1652,598 @@ describe("read — the unabridged pull (phase 4)", () => {
     expect(parseLanReadRequest({ what: "plan", sessionId: "a/b" })).toBeNull();
     expect(parseLanReadRequest({ what: "plan", sessionId: "a.b" })).toBeNull();
     expect(parseLanReadRequest({})).toBeNull();
+  });
+});
+
+// -------------------------------------------------------------------------------------------------
+// LAN STATUS v2 — the `state` op (NOM-47 phase A).
+//
+// The store stops copying records and starts serving COMPUTED DISPLAY STATE. `frames` keeps working from
+// the SAME store for the whole deprecation window (the phone is the laggard: a user can point an old app
+// at a fresh plugin indefinitely), which is why the dual-serve parity test below is not optional.
+// -------------------------------------------------------------------------------------------------
+
+describe("state — the snapshot store", () => {
+  const NOW = 1_800_000_000_000;
+  const KEY = new Uint8Array(32).fill(7);
+  const stores: LanFrameStore[] = [];
+
+  afterEach(() => {
+    while (stores.length > 0) {
+      try { stores.pop()?.stop(); } catch { /* already stopped */ }
+    }
+  });
+
+  async function snapDir(): Promise<string> {
+    const dir = await mkdtemp(join(tmpdir(), "nomo-state-"));
+    tmpDirs.push(dir);
+    return dir;
+  }
+
+  const write = (dir: string, sessionId: string, over: Partial<SessionRecord> = {}): Promise<void> =>
+    writeFile(join(dir, `${sessionId}.json`), JSON.stringify({
+      pid: 4242, machine: "mac-mini", label: "api-status", ts: NOW,
+      op: "update", prio: 0, blob: "sealed-blob", pairingId: "pairing-abc", ...over,
+    }));
+
+  function snapStore(dir: string, over: Record<string, unknown> = {}): LanFrameStore {
+    const store = createLanFrameStore({ sessionsDir: dir, isAlive: () => true, now: () => NOW, ...over });
+    stores.push(store);
+    store.setPairing("pairing-abc", KEY);
+    return store;
+  }
+
+  test("serves one whole computed state per session — no op, no prio, a `terminal` flag and a `why`", async () => {
+    const dir = await snapDir();
+    const store = snapStore(dir);
+    await write(dir, "s1", { blob: "sealed-by-the-hook", agent: "codex", sessionStartedAt: 1_700_000_000_000 });
+    await store.reconcile();
+    const slice = store.states(0);
+    expect(slice).toMatchObject({ seq: 1, at: NOW, complete: true });
+    expect(slice.sessions).toEqual([{
+      sessionId: "s1", ts: NOW, terminal: false, blob: "sealed-by-the-hook",
+      agent: "codex", startedAt: 1_700_000_000_000, why: "work/cx",
+    }]);
+    // The v1 wire's discriminators are GONE from this shape, by design.
+    expect(slice.sessions[0]).not.toHaveProperty("op");
+    expect(slice.sessions[0]).not.toHaveProperty("prio");
+    expect(slice.sessions[0]).not.toHaveProperty("seq");
+  });
+
+  test("`seq` is a CHANGE COUNTER: an unchanged pass does not bump it, a real change does", async () => {
+    const dir = await snapDir();
+    const store = snapStore(dir);
+    await write(dir, "s1");
+    await store.reconcile();
+    expect(store.states(0).seq).toBe(1);
+    await store.reconcile();
+    await store.reconcile();
+    expect(store.states(0).seq).toBe(1);            // three passes, one state
+    await write(dir, "s1", { prio: 1 });
+    await store.reconcile();
+    expect(store.states(0).seq).toBe(2);
+    expect(store.states(0).sessions[0]).toMatchObject({ why: "attn" });
+  });
+
+  test("`seq` is a CURSOR, never a comparison: a state whose ts did not advance still lands", async () => {
+    // v1 had to inflate `ts` past the previous stamp or the phone's ordering guard dropped the frame.
+    // There is no ordering guard any more, so `ts` is reported as observed and nothing is inflated.
+    const dir = await snapDir();
+    const store = snapStore(dir);
+    await write(dir, "s1", { ts: NOW, prio: 0 });
+    await store.reconcile();
+    await write(dir, "s1", { ts: NOW, prio: 1 });    // SAME millisecond, genuinely different state
+    await store.reconcile();
+    const after = store.states(1);
+    expect(after.sessions).toHaveLength(1);
+    expect(after.sessions[0]).toMatchObject({ ts: NOW, why: "attn" });
+  });
+
+  test("`complete` is true for cursor 0, for a stale-high cursor, and after a pairing rotation", async () => {
+    const dir = await snapDir();
+    const store = snapStore(dir);
+    await write(dir, "s1");
+    await write(dir, "s2");
+    await store.reconcile();
+    expect(store.states(0)).toMatchObject({ complete: true });
+    expect(store.states(0).sessions).toHaveLength(2);
+    // A cursor in the middle is an INCREMENTAL answer — and absence in it is never evidence.
+    expect(store.states(1)).toMatchObject({ complete: false });
+    expect(store.states(1).sessions).toHaveLength(1);
+    expect(store.states(2)).toMatchObject({ complete: false, sessions: [] });
+    // A cursor from a previous listener instance (the counter is in-memory and restarts at 0).
+    expect(store.states(9_999)).toMatchObject({ complete: true });
+    expect(store.states(9_999).sessions).toHaveLength(2);
+    // A rotation voids everything the phone remembers, so every older cursor is answered whole.
+    store.setPairing("pairing-new", new Uint8Array(32).fill(9));
+    await store.reconcile();
+    expect(store.states(2)).toMatchObject({ complete: true });
+  });
+
+  test("a long poll resolves on the very next change, and answers empty on timeout", async () => {
+    const dir = await snapDir();
+    const store = snapStore(dir);
+    await write(dir, "s1");
+    await store.reconcile();
+    const cursor = store.states(0).seq;
+
+    const started = Date.now();
+    const held = store.waitStates(cursor, 5_000);
+    await write(dir, "s1", { prio: 1 });
+    await store.reconcile();
+    const slice = await held;
+    expect(Date.now() - started).toBeLessThan(1_000);
+    expect(slice.sessions).toHaveLength(1);
+    expect(slice.sessions[0]).toMatchObject({ why: "attn" });
+
+    const empty = await store.waitStates(slice.seq, 40);
+    expect(empty).toMatchObject({ complete: false, sessions: [] });
+  });
+
+  test("a COMPLETE answer is never held: the phone's whole link-up handoff waits on it", async () => {
+    // Nothing is LAN-owned on the phone until a complete:true response lands, so holding one for 25 s
+    // would leave every row worker-driven for the length of the poll.
+    const dir = await snapDir();
+    const store = snapStore(dir);
+    await write(dir, "s1");
+    await store.reconcile();
+    const started = Date.now();
+    const slice = await store.waitStates(0, 25_000);
+    expect(Date.now() - started).toBeLessThan(200);
+    expect(slice).toMatchObject({ complete: true });
+    // …but a Mac with nothing to say holds like any other request, or the phone would spin.
+    const bare = snapStore(await snapDir());
+    await bare.reconcile();
+    const spun = Date.now();
+    await bare.waitStates(0, 60);
+    expect(Date.now() - spun).toBeGreaterThanOrEqual(40);
+  });
+
+  test("a terminal state is served once and then held for the retire grace, never silently dropped", async () => {
+    const dir = await snapDir();
+    let clock = NOW;
+    const store = snapStore(dir, { now: () => clock });
+    await write(dir, "s1");
+    await store.reconcile();
+    await unlink(join(dir, "s1.json"));             // a clean end, a reap, a retire — all look like this
+    await store.reconcile();
+    const gone = store.states(0);
+    expect(gone.sessions).toEqual([{ sessionId: "s1", ts: NOW, terminal: true, blob: "sealed-blob", why: "reap" }]);
+    // Re-observed, it does not re-stamp: one terminal statement, not one per pass.
+    const seq = gone.seq;
+    await store.reconcile();
+    expect(store.states(0).seq).toBe(seq);
+    clock = NOW + LAN_FRAME_RETIRE_GRACE_MS + 1;
+    await store.reconcile();
+    expect(store.states(0).sessions).toEqual([]);
+  });
+
+  test("a dead pid is terminal with why:reap; a 24 h-abandoned record with why:stale", async () => {
+    const dir = await snapDir();
+    const dead = snapStore(dir, { isAlive: () => false });
+    await write(dir, "s1");
+    await dead.reconcile();
+    expect(dead.states(0).sessions[0]).toMatchObject({ terminal: true, why: "reap" });
+
+    const aged = await snapDir();
+    const store = snapStore(aged);
+    await write(aged, "s2", { ts: NOW - LAN_FRAME_SESSION_STALE_MS - 1 });
+    await store.reconcile();
+    expect(store.states(0).sessions[0]).toMatchObject({ terminal: true, why: "stale" });
+  });
+
+  test("the CC capability latch stops reading a directory that stopped answering, and re-arms on a new pid", async () => {
+    const dir = await snapDir();
+    const ccDir = await snapDir();
+    let reads = 0;
+    const store = snapStore(dir, {
+      ccSessionsDir: ccDir,
+      procStartedAt: async (pid: number) => { reads += 1; return pid === 4242 ? NOW - 3_600_000 : NOW; },
+    });
+    // An sdk-cli row: present, joinable, and carrying NO `status` at all — the verified shape that means
+    // "no opinion", forever, at one readFile per sweep.
+    await writeFile(join(ccDir, "4242.json"), JSON.stringify({
+      pid: 4242, sessionId: "s1", startedAt: NOW - 3_600_000, entrypoint: "sdk-cli",
+    }));
+    await write(dir, "s1", { op: "done", ts: NOW - 30_000 });
+    for (let i = 0; i < CC_CAPABILITY_LATCH_SWEEPS + 2; i += 1) await store.reconcile();
+    expect(store.states(0).sessions[0]).toMatchObject({ why: "done" });   // today's behaviour throughout
+    const settled = reads;
+    // Latched: a CC file that suddenly DOES answer is no longer even opened…
+    await writeFile(join(ccDir, "4242.json"), JSON.stringify({
+      pid: 4242, sessionId: "s1", startedAt: NOW - 3_600_000, status: "busy", statusUpdatedAt: NOW - 1_000,
+    }));
+    await store.reconcile();
+    expect(store.states(0).sessions[0]).toMatchObject({ why: "done" });
+    expect(reads).toBe(settled);
+    // …until a pid we have never probed shows up, which re-arms it.
+    await write(dir, "s2", { pid: 7777, ts: NOW - 30_000, op: "done" });
+    await store.reconcile();
+    await store.reconcile();
+    expect(store.states(0).sessions.find((x) => x.sessionId === "s1")).toMatchObject({ why: "work+cc" });
+  });
+
+  test("a live hold serves the CARD and outranks a prio:0 write that lands during it", async () => {
+    const dir = await snapDir();
+    const store = snapStore(dir);
+    await write(dir, "s1", { ts: NOW - 10_000 });
+    await store.reconcile();
+    await writeFile(join(dir, decisionHoldFileName("s1")),
+                    JSON.stringify({ blob: "sealed-card", at: NOW - 6_000, pid: 4242 } satisfies DecisionHold));
+    await store.reconcile();
+    expect(store.states(0).sessions[0]).toMatchObject({ blob: "sealed-card", why: "hold", terminal: false });
+    // A parallel tool's PostToolUse lands mid-hold. On the WORKER this takes the row back (a green row
+    // under an open Allow/Deny card); on the Mac the holding hook is still alive, so the card stands.
+    await write(dir, "s1", { ts: NOW, prio: 0 });
+    await store.reconcile();
+    expect(store.states(0).sessions[0]).toMatchObject({ blob: "sealed-card", why: "hold" });
+    // The marker going away hands the row straight back.
+    await unlink(join(dir, decisionHoldFileName("s1")));
+    await store.reconcile();
+    expect(store.states(0).sessions[0]).toMatchObject({ blob: "sealed-blob", why: "work" });
+  });
+
+  test("CC's file drives the state through the store, and the Mac's authored blob is SEALED under e2eKey", async () => {
+    const dir = await snapDir();
+    const ccDir = await snapDir();
+    const store = snapStore(dir, { ccSessionsDir: ccDir, procStartedAt: async () => NOW - 3_600_000 });
+    // The record says done (a Stop fired mid fan-out); CC — watching the actual process — is still busy,
+    // and said so AFTER the record's own write. Both clocks are in the past: a status write dated in the
+    // future is refused outright, since CC and this daemon share one wall clock.
+    // The CC file goes down FIRST: the store's pairing-driven bootstrap pass is in flight, and a pass
+    // that saw the record without its CC file would commit a state this test is not about.
+    await writeFile(join(ccDir, "4242.json"), JSON.stringify({
+      pid: 4242, sessionId: "s1", startedAt: NOW - 3_600_000, procStart: "Sat Aug  1 20:11:34 2026",
+      entrypoint: "cli", name: "api-status-53", nameSource: "derived",
+      status: "busy", statusUpdatedAt: NOW - 1_000,
+    }));
+    await write(dir, "s1", { op: "done", ts: NOW - 30_000, blob: "sealed-done-by-the-hook" });
+    await store.reconcile();
+    const held = store.states(0).sessions[0];
+    expect(held.why).toBe("work+cc");
+    expect(held.blob).not.toBe("sealed-done-by-the-hook");   // a fresh, Mac-authored ciphertext
+    expect(await decryptBlob(KEY, held.blob)).toMatchObject({ status: "working", label: "api-status" });
+
+    // CC goes idle past the grace ⇒ the missed-done corrective, authored and sealed the same way.
+    await writeFile(join(ccDir, "4242.json"), JSON.stringify({
+      pid: 4242, sessionId: "s1", startedAt: NOW - 3_600_000, status: "idle", statusUpdatedAt: NOW - 1_000,
+    }));
+    await write(dir, "s1", { op: "update", ts: NOW - 30_000, blob: "sealed-working" });
+    await store.reconcile();
+    const done = store.states(0).sessions[0];
+    expect(done.why).toBe("done+cc");
+    expect(await decryptBlob(KEY, done.blob)).toMatchObject({ status: "done" });
+  });
+
+  test("the sealed ciphertext is CACHED: an unchanged authored state is not re-sealed every pass", async () => {
+    const dir = await snapDir();
+    const ccDir = await snapDir();
+    const store = snapStore(dir, { ccSessionsDir: ccDir, procStartedAt: async () => NOW - 3_600_000 });
+    await writeFile(join(ccDir, "4242.json"), JSON.stringify({
+      pid: 4242, sessionId: "s1", startedAt: NOW - 3_600_000, status: "busy", statusUpdatedAt: NOW - 1_000,
+    }));
+    await write(dir, "s1", { op: "done", ts: NOW - 30_000 });
+    await store.reconcile();
+    expect(store.states(0).sessions[0].why).toBe("work+cc");   // the AUTHORED path, not a passthrough
+    const first = store.states(0).sessions[0].blob;
+    await store.reconcile();
+    await store.reconcile();
+    // encryptBlob draws a fresh IV every call, so an identical string is proof no reseal happened.
+    expect(store.states(0).sessions[0].blob).toBe(first);
+    expect(store.states(0).seq).toBe(1);
+  });
+
+  test("with no e2eKey a Mac-authored state is simply ABSENT — never a lie, and absence is never evidence", async () => {
+    const dir = await snapDir();
+    const ccDir = await snapDir();
+    const store = createLanFrameStore({
+      sessionsDir: dir, ccSessionsDir: ccDir, isAlive: () => true, now: () => NOW,
+      procStartedAt: async () => NOW - 3_600_000,
+    });
+    stores.push(store);
+    store.setPairing("pairing-abc");                 // pairing known, key not
+    await writeFile(join(ccDir, "4242.json"), JSON.stringify({
+      pid: 4242, sessionId: "s1", startedAt: NOW - 3_600_000, status: "busy", statusUpdatedAt: NOW - 1_000,
+    }));
+    await write(dir, "s1", { op: "done", ts: NOW - 30_000 });
+    await store.reconcile();
+    expect(store.states(0).sessions).toEqual([]);
+    // The v1 projection is untouched by any of that.
+    expect(store.since(0).frames[0]).toMatchObject({ op: "done", blob: "sealed-blob" });
+  });
+
+  test("the CC file is ignored unless BOTH join keys and the process-start probe agree", async () => {
+    const dir = await snapDir();
+    const ccDir = await snapDir();
+    const store = snapStore(dir, { ccSessionsDir: ccDir, procStartedAt: async () => NOW - 3_600_000 });
+    await write(dir, "s1", { op: "done", ts: NOW - 30_000 });
+    await store.reconcile();
+    for (const bent of [
+      { pid: 4242, sessionId: "someone-else", startedAt: NOW - 3_600_000, status: "busy", statusUpdatedAt: NOW - 1_000 },
+      { pid: 9999, sessionId: "s1", startedAt: NOW - 3_600_000, status: "busy", statusUpdatedAt: NOW - 1_000 },
+      { pid: 4242, sessionId: "s1", startedAt: NOW - 7_200_000, status: "busy", statusUpdatedAt: NOW - 1_000 },
+      { pid: 4242, sessionId: "s1", startedAt: NOW - 3_600_000, statusUpdatedAt: NOW - 1_000 },
+      { pid: 4242, sessionId: "s1", startedAt: NOW - 3_600_000, status: "busy", statusUpdatedAt: NOW - 3 * 86_400_000 },
+      { pid: 4242, sessionId: "s1", startedAt: NOW - 3_600_000, status: "busy", statusUpdatedAt: NOW + 60_000 },
+    ]) {
+      await writeFile(join(ccDir, `${bent.pid}.json`), JSON.stringify(bent));
+      await store.reconcile();
+      expect(store.states(0).sessions[0]).toMatchObject({ why: "done" }); // today's behaviour, exactly
+    }
+  });
+
+  test("the per-response ceiling matches the worker's own per-pairing session cap", async () => {
+    const dir = await snapDir();
+    const store = snapStore(dir);
+    for (let i = 0; i < LAN_STATE_SESSIONS_MAX + 5; i += 1) {
+      await write(dir, `s${i}`, { ts: NOW - i * 1_000 });
+    }
+    await store.reconcile();
+    const slice = store.states(0);
+    expect(slice.sessions).toHaveLength(LAN_STATE_SESSIONS_MAX);
+    // The MOST RECENTLY ACTIVE survive; the overflow simply stays worker-driven on the phone.
+    expect(slice.sessions.map((s) => s.sessionId)).toContain("s0");
+    expect(slice.sessions.map((s) => s.sessionId)).not.toContain(`s${LAN_STATE_SESSIONS_MAX + 4}`);
+  });
+
+  test("attentionKind rides the state wire too, present/absent, and v1's copy is untouched", async () => {
+    const dir = await snapDir();
+    const store = snapStore(dir);
+    await write(dir, "sq", { prio: 1, agent: "codex", attentionKind: "userInput", blob: "sealed-question" });
+    await write(dir, "sa", { prio: 1, blob: "sealed-approval" });               // a plain approval
+    await store.reconcile();
+    const byId = (id: string) => store.states(0).sessions.find((x) => x.sessionId === id)!;
+    expect(byId("sq")).toMatchObject({ why: "attn", attentionKind: "userInput" });
+    expect(byId("sa")).not.toHaveProperty("attentionKind");
+    // The v1 envelope's own copy is byte-identical to what it always was.
+    const v1 = store.since(0).frames.find((f) => f.sessionId === "sq")!;
+    expect(v1).toMatchObject({ op: "update", prio: 1, attentionKind: "userInput" });
+    expect(store.since(0).frames.find((f) => f.sessionId === "sa")).not.toHaveProperty("attentionKind");
+
+    // The episode ends: the marker the watchdog's nets carry forward must not relabel the done row, on
+    // EITHER wire. And the state change is genuinely observed (the signature covers the field).
+    const before = store.states(0).seq;
+    await write(dir, "sq", { op: "done", prio: 0, agent: "codex", attentionKind: "userInput", blob: "sealed-done" });
+    await store.reconcile();
+    expect(store.states(0).seq).toBeGreaterThan(before);
+    expect(byId("sq")).not.toHaveProperty("attentionKind");
+    expect(store.since(0).frames.find((f) => f.sessionId === "sq")).not.toHaveProperty("attentionKind");
+  });
+
+  test("a v2-ONLY change does not wake a v1 long-poll (an old phone must not be re-polled for nothing)", async () => {
+    const dir = await snapDir();
+    const ccDir = await snapDir();
+    const store = snapStore(dir, { ccSessionsDir: ccDir, procStartedAt: async () => NOW - 3_600_000 });
+    await write(dir, "s1", { op: "done", ts: NOW - 30_000 });
+    await store.reconcile();
+    const v1Cursor = store.since(0).seq;
+    const v2Cursor = store.states(0).seq;
+
+    let v1Woke = false;
+    const heldV1 = store.wait(v1Cursor, 1_500).then((slice) => { v1Woke = true; return slice; });
+    const heldV2 = store.waitStates(v2Cursor, 1_500);
+    // CC flips to busy. The RECORD does not move, so the v1 projection is unchanged and its waiter has
+    // nothing to be told; the computed state changes, and its waiter is answered at once.
+    await writeFile(join(ccDir, "4242.json"), JSON.stringify({
+      pid: 4242, sessionId: "s1", startedAt: NOW - 3_600_000, status: "busy", statusUpdatedAt: NOW - 1_000,
+    }));
+    await store.reconcile();
+    const v2 = await heldV2;
+    expect(v2.sessions[0]).toMatchObject({ why: "work+cc" });
+    expect(v1Woke).toBe(false);
+    store.stop();                                    // teardown still releases BOTH feeds' waiters
+    expect((await heldV1).frames).toEqual([]);
+  });
+
+  test("DUAL SERVE: both ops answer from the same store, off the same records, consistently", async () => {
+    const dir = await snapDir();
+    const store = snapStore(dir);
+    await write(dir, "s1", { prio: 1, blob: "sealed-attn" });
+    await write(dir, "s2", { op: "done", blob: "sealed-done", agent: "codex" });
+    await store.reconcile();
+
+    const v1 = store.since(0).frames;
+    const v2 = store.states(0).sessions;
+    expect(v1.map((f) => f.sessionId).sort()).toEqual(v2.map((s) => s.sessionId).sort());
+    // The BLOB is the same ciphertext on both legs — a handoff between them cannot reflow the phone's
+    // text, which is the entire point of keeping BLOB_FIT_CHARS on the Mac's own blob.
+    for (const frame of v1) {
+      const twin = v2.find((s) => s.sessionId === frame.sessionId)!;
+      expect(twin.blob).toBe(frame.blob);
+      expect(twin.agent).toBe(frame.agent);
+      expect(twin.terminal).toBe(false);            // neither leg calls a live `done` row terminal
+    }
+    expect(v2.find((s) => s.sessionId === "s1")!.why).toBe("attn");
+    expect(v2.find((s) => s.sessionId === "s2")!.why).toBe("done/cx");
+    // The two cursors are INDEPENDENT — a v2-only change must never renumber the frozen v1 wire.
+    expect(store.since(0).seq).toBe(2);
+    expect(store.states(0).seq).toBe(2);
+  });
+
+  test("the v1 projection is byte-identical to what `frames` has always served", async () => {
+    // The golden test: for a corpus of records × holds × liveness, the store's v1 output equals
+    // lanFrameContent's, which is the function the shipped phone build was written against.
+    const cases: Array<{ over: Partial<SessionRecord>; hold?: DecisionHold; alive: boolean }> = [
+      { over: {}, alive: true },
+      { over: { prio: 1 }, alive: true },
+      { over: { prio: 1, attentionKind: "userInput" }, alive: true },
+      { over: { op: "done" }, alive: true },
+      { over: { op: "update", prio: undefined, agent: "codex" }, alive: true },
+      { over: { prio: 1 }, hold: { blob: "sealed-card", at: NOW - 1_000, pid: 4242 }, alive: true },
+      { over: { prio: 0 }, hold: { blob: "sealed-card", at: NOW - 1_000, pid: 4242 }, alive: true },
+    ];
+    for (const [i, c] of cases.entries()) {
+      // The whole fixture is on disk BEFORE the store exists. A store's pairing-driven bootstrap pass is
+      // in flight from the moment setPairing runs, and a pass that saw the record without its hold marker
+      // would (correctly, per v1) serve the corrected frame one millisecond on — v1's monotonic stamp
+      // bump. That is the behaviour under test elsewhere; here it would just make the comparison racy.
+      const dir = await snapDir();
+      await write(dir, "s1", c.over);
+      if (c.hold) await writeFile(join(dir, decisionHoldFileName("s1")), JSON.stringify(c.hold));
+      const store = snapStore(dir, { isAlive: () => c.alive });
+      await store.reconcile();
+      const record = JSON.parse(await readFile(join(dir, "s1.json"), "utf8")) as SessionRecord;
+      const expected = lanFrameContent(record, "pairing-abc", c.hold ?? null, NOW, () => c.alive);
+      const served = store.since(0).frames[0];
+      expect({ case: i, ...served, seq: undefined, sessionId: undefined })
+        .toEqual({ case: i, ...expected, seq: undefined, sessionId: undefined });
+    }
+  });
+});
+
+describe("POST /v1/lan — op:state", () => {
+  const NOW = 1_800_000_000_000;
+  const stores: LanFrameStore[] = [];
+
+  afterEach(() => {
+    while (stores.length > 0) {
+      try { stores.pop()?.stop(); } catch { /* already stopped */ }
+    }
+  });
+
+  async function fed(cfg: Config): Promise<{ dir: string; store: LanFrameStore }> {
+    const dir = await mkdtemp(join(tmpdir(), "nomo-state-"));
+    tmpDirs.push(dir);
+    const store = createLanFrameStore({ sessionsDir: dir, isAlive: () => true, now: () => NOW });
+    stores.push(store);
+    store.setPairing(cfg.pairingId, cfg.e2eKey);
+    return { dir, store };
+  }
+
+  const write = (dir: string, sessionId: string, over: Partial<SessionRecord> = {}): Promise<void> =>
+    writeFile(join(dir, `${sessionId}.json`), JSON.stringify({
+      pid: 4242, machine: "mac-mini", label: "api-status", ts: NOW,
+      op: "update", prio: 0, blob: "sealed-blob", pairingId: "pairing-abc", ...over,
+    }));
+
+  test("answers a SEALED {ok,seq,lid,at,complete,sessions} — the blob passed through untouched", async () => {
+    const cfg = config();
+    const { dir, store } = await fed(cfg);
+    await write(dir, "s1", { blob: "sealed-by-the-hook", prio: 1, agent: "codex" });
+    await store.reconcile();
+    const sdir = await stateDir();
+    const { port, lid } = await startListener({ statePath: join(sdir, "lan.json"), frames: store, cfg });
+
+    const n = nonce();
+    const res = await post(port, await sealRequest(cfg, {
+      op: "state", ts: Date.now(), nonce: n, payload: { sinceSeq: 0, waitMs: 0 },
+    }));
+    expect(res.status).toBe(200);
+    const opened = await openResponse(cfg, res.json);
+    expect(opened.reqNonce).toBe(n);
+    expect(opened.payload).toEqual({
+      ok: true,
+      seq: 1,
+      lid,
+      at: NOW,
+      complete: true,
+      sessions: [{
+        sessionId: "s1", ts: NOW, terminal: false, blob: "sealed-by-the-hook", agent: "codex", why: "attn",
+      }],
+    });
+  });
+
+  test("attentionKind round-trips over the sealed state wire, and is absent when there is none", async () => {
+    const cfg = config();
+    const { dir, store } = await fed(cfg);
+    await write(dir, "sq", { prio: 1, agent: "codex", attentionKind: "userInput", blob: "sealed-question" });
+    await write(dir, "sa", { prio: 1, blob: "sealed-approval" });
+    await store.reconcile();
+    const sdir = await stateDir();
+    const { port } = await startListener({ statePath: join(sdir, "lan.json"), frames: store, cfg });
+
+    const res = await post(port, await sealRequest(cfg, {
+      op: "state", ts: Date.now(), nonce: nonce(), payload: { sinceSeq: 0, waitMs: 0 },
+    }));
+    const payload = (await openResponse(cfg, res.json)).payload as {
+      sessions: Array<Record<string, unknown>>;
+    };
+    const question = payload.sessions.find((x) => x.sessionId === "sq")!;
+    const approval = payload.sessions.find((x) => x.sessionId === "sa")!;
+    expect(question).toEqual({
+      sessionId: "sq", ts: NOW, terminal: false, blob: "sealed-question",
+      agent: "codex", attentionKind: "userInput", why: "attn",
+    });
+    expect(approval).not.toHaveProperty("attentionKind");
+  });
+
+  test("a held request is answered the moment a record lands, sealed as always", async () => {
+    const cfg = config();
+    const { dir, store } = await fed(cfg);
+    await write(dir, "s1");
+    await store.reconcile();
+    const cursor = store.states(0).seq;
+    const sdir = await stateDir();
+    const { port } = await startListener({ statePath: join(sdir, "lan.json"), frames: store, cfg });
+
+    const started = Date.now();
+    const pending = post(port, await sealRequest(cfg, {
+      op: "state", ts: Date.now(), nonce: nonce(), payload: { sinceSeq: cursor, waitMs: 5_000 },
+    }));
+    await new Promise((r) => setTimeout(r, 30));
+    await write(dir, "s1", { prio: 1, blob: "sealed-attn" });
+    await store.reconcile();
+    const res = await pending;
+    expect(Date.now() - started).toBeLessThan(2_000);
+    const payload = (await openResponse(cfg, res.json)).payload as {
+      complete: boolean; sessions: Array<{ blob: string; why: string }>;
+    };
+    expect(payload.complete).toBe(false);            // an incremental answer never seeds ownership
+    expect(payload.sessions).toHaveLength(1);
+    expect(payload.sessions[0]).toMatchObject({ blob: "sealed-attn", why: "attn" });
+  });
+
+  test("BOTH ops are served, from the same store, in the same listener", async () => {
+    const cfg = config();
+    const { dir, store } = await fed(cfg);
+    await write(dir, "s1", { blob: "sealed-one" });
+    await store.reconcile();
+    const sdir = await stateDir();
+    const { port } = await startListener({ statePath: join(sdir, "lan.json"), frames: store, cfg });
+
+    const v1 = (await openResponse(cfg, (await post(port, await sealRequest(cfg, {
+      op: "frames", ts: Date.now(), nonce: nonce(), payload: { sinceSeq: 0, waitMs: 0 },
+    }))).json)).payload as { frames: Array<{ blob: string; op: string; prio: number }> };
+    const v2 = (await openResponse(cfg, (await post(port, await sealRequest(cfg, {
+      op: "state", ts: Date.now(), nonce: nonce(), payload: { sinceSeq: 0, waitMs: 0 },
+    }))).json)).payload as { sessions: Array<{ blob: string; why: string }> };
+
+    expect(v1.frames).toHaveLength(1);
+    expect(v2.sessions).toHaveLength(1);
+    expect(v1.frames[0]).toMatchObject({ op: "update", prio: 0, blob: "sealed-one" });
+    expect(v2.sessions[0]).toMatchObject({ blob: "sealed-one", why: "work" });
+  });
+
+  test("a malformed state payload is the same opaque 400 every other bad payload gets", async () => {
+    const cfg = config();
+    const { store } = await fed(cfg);
+    const sdir = await stateDir();
+    const { port } = await startListener({ statePath: join(sdir, "lan.json"), frames: store, cfg });
+    const bad: Array<Record<string, unknown>> = [
+      {},
+      { sinceSeq: 0 },
+      { waitMs: 0 },
+      { sinceSeq: -1, waitMs: 0 },
+      { sinceSeq: 0, waitMs: LAN_FRAMES_WAIT_MAX_MS + 1 },
+      { sinceSeq: "0", waitMs: 0 },
+    ];
+    for (const payload of bad) {
+      const res = await post(port, await sealRequest(cfg, { op: "state", ts: Date.now(), nonce: nonce(), payload }));
+      expect(res.status).toBe(400);
+      expect(res.json).toEqual({});
+    }
+  });
+
+  test("stopping the listener releases a held state request instead of hanging its socket", async () => {
+    const cfg = config();
+    const { store } = await fed(cfg);
+    const sdir = await stateDir();
+    const { listener, port } = await startListener({ statePath: join(sdir, "lan.json"), frames: store, cfg });
+    const pending = post(port, await sealRequest(cfg, {
+      op: "state", ts: Date.now(), nonce: nonce(), payload: { sinceSeq: 0, waitMs: 20_000 },
+    })).catch(() => ({ status: 0, json: null }));
+    await new Promise((r) => setTimeout(r, 40));
+    listener.stop();
+    await pending;                                   // resolves rather than sitting out the 20 s hold
   });
 });

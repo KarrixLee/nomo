@@ -74,6 +74,26 @@
 //          as blind as the worker. Frames are seq-ascending, one per session (latest state only), and a
 //          request with nothing new is HELD up to waitMs, answered the moment anything changes.
 //
+// LAN STATUS v2 (NOM-47 phase A) adds the op that supersedes `frames` — a SNAPSHOT feed rather than an
+// event replay. The Mac computes the final display state (core/session-state.ts) and serves complete
+// current-state snapshots of it, so there is nothing left on the phone to order or arbitrate:
+//
+//   {"op":"state", payload:{"sinceSeq":<integer >= 0>,"waitMs":<0..25000>}}    (byte-identical to `frames`)
+//        → sealed {"ok":true,"seq":<change counter>,"lid":"<instance>","at":<epoch ms>,
+//                  "complete":true|false,
+//                  "sessions":[{"sessionId","ts","terminal","blob"
+//                               (+"agent","startedAt","attentionKind","why")}, …]}
+//        `attentionKind` is the SAME clear discriminator the v1 `frames` envelope and the worker wire
+//        carry ("userInput" = a Codex request_user_input, i.e. a question rather than an approval); the
+//        phone's answer flows key on it and it is not derivable from the sealed blob. It rides only while
+//        the state is one the user can answer.
+//        `complete:true` means this response IS the whole current map for this pairing — the ONLY thing
+//        the phone may seed per-row LAN ownership from. On `complete:false`, absence is still never
+//        evidence. `seq` is a CURSOR, never a comparison; `ts` is an observation stamp, never an ordering
+//        guard; `why` names the input that decided the row (`hold`, `work+cc`, `done/cx`, …).
+//        `frames` KEEPS WORKING from the same store for the whole deprecation window — the phone is the
+//        laggard here, since a user can point an old app at a fresh plugin indefinitely.
+//
 // PHASE 4 adds the on-demand pull for content the WORKER path has to truncate:
 //
 //   {"op":"read", payload:{"what":"plan"|"permission-detail","sessionId":"<id>"}}
@@ -531,6 +551,24 @@ export function createLanListener(deps: LanListenerDeps = {}): LanListener {
         // and a data-bearing reply without it reads as "listener too old for this op" — which would
         // permanently stop the frames channel for this lid.
         payload = { ok: true, seq: slice.seq, lid, frames: slice.frames };
+      } else if (envelope.op === "state") {
+        // THE v2 FEED. Same parser, same ceiling, same driver loop as `frames` — the request shape is
+        // byte-identical on purpose. A NEW OP rather than `frames v2` because that is the only shape
+        // change with safe negotiation: CCLanClient turns an unknown op into `.notHandled` and latches it
+        // per lid, so an old Mac answering `bad-op` is a fallback the phone already knows how to take,
+        // whereas a `frames` response an old phone cannot decode would arrive with `ok:true` telling it
+        // everything is fine. Both ops are served from the SAME store for the whole deprecation window,
+        // so there is exactly one source of truth here and the old op cannot drift.
+        const request = parseLanFramesRequest(envelope.payload);
+        if (!request) return reject(res, "state-payload");
+        const lid = address?.lid ?? "";
+        const slice = await frames.waitStates(request.sinceSeq, request.waitMs);
+        // `at` is the Mac's snapshot instant — the freshness anchor for the whole response, taken AFTER
+        // the hold resolves. `complete` says this is the whole current map, and it is the only thing the
+        // phone may seed per-row LAN ownership from.
+        payload = {
+          ok: true, seq: slice.seq, lid, at: slice.at, complete: slice.complete, sessions: slice.sessions,
+        };
       } else if (envelope.op === "read") {
         const request = parseLanReadRequest(envelope.payload);
         if (!request) return reject(res, "read-payload");
@@ -680,7 +718,9 @@ export function createLanListener(deps: LanListenerDeps = {}): LanListener {
         // for the fs.watch feed (macOS coalesces/drops events), and it is why nothing here is awaited:
         // reconcile() returns a promise the sweep must never sit on. setPairing is a no-op unless the
         // pairing actually rotated, in which case it also voids every frame sealed under the old key.
-        frames.setPairing(next?.pairingId);
+        // The e2eKey rides along from v2 on: the store seals the plaintexts the MAC AUTHORS (a state no
+        // hook-written blob describes) and passes every hook-authored ciphertext through untouched.
+        frames.setPairing(next?.pairingId, next?.e2eKey);
         void frames.reconcile();
         const memo = next ? `${next.pairingId}|${b64url(next.e2eKey)}` : "";
         if (memo === keyMemo) return;
