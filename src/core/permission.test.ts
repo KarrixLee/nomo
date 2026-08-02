@@ -614,6 +614,113 @@ describe("runPermissionHook — hold state machine", () => {
     expect(clears).toEqual([]);
   });
 
+  // THE RECORD'S OWN EXIT FROM THE HOLD (field reports R2/R3, session a51208e8, 2026-08-02). The hook
+  // never wrote the SessionRecord, so retiring the marker handed the row back to the state CC's
+  // `Notification` hook left there: op:update / prio:1 / needsAttention at a FROZEN ts. The LAN feed's
+  // monotonic stamp then ships that stale yellow at prevTs+1, where the phone ACCEPTS it — a brief flash
+  // when a later hook advances the record (answered), and a PERMANENT wedge when none ever will
+  // (superseded/expired/giveup/exception: nothing is emitted, no tool runs, no hook follows, and the
+  // watchdog's idle reap deliberately skips needsAttention). The process that owns the hold must own the
+  // record's exit from it.
+
+  /** The hold-settle deps, wired the way production is: the injected clear runs `beforeUnlink` (the
+   *  settle) and only THEN retires the marker, so `order` proves the record is written first. */
+  function settleProbe(over: { cleared?: boolean } = {}) {
+    const order: string[] = [];
+    const patches: Array<Record<string, unknown>> = [];
+    return {
+      order,
+      patches,
+      deps: {
+        settleHoldRecordFn: async (_sessionId: string, patch: Record<string, unknown>) => {
+          order.push("settle");
+          patches.push(patch);
+        },
+        clearHoldFn: async (_sessionId: string, _pid: number, beforeUnlink?: () => Promise<void>) => {
+          if (over.cleared === false) return false;             // a newer hold owns it → never settle
+          await beforeUnlink?.();
+          order.push("clear");
+          return true;
+        },
+        writeHoldFn: async () => {},
+      },
+    };
+  }
+
+  /** The record CC's `Notification` hook left behind: the frozen prio:1 yellow the hold overlays. */
+  const HELD_RECORD = {
+    pid: 1, machine: "m", label: "l", ts: 900, op: "update", prio: 1,
+    lastEvent: "needsAttention", attentionKind: "userInput", sentDone: true, blob: "stale-attention-blob",
+  };
+
+  test("an ANSWERED hold settles the record to prio:0 working before the marker is retired", async () => {
+    const answerBlob = await encryptBlob(KEY, { requestId: "req-fixed", decision: "allow", ts: 5 });
+    const { fn } = scriptFetch(true, [{ status: "answered", answerBlob }]);
+    const probe = settleProbe();
+    const emitted: string[] = [];
+    await runPermissionHook(baseDeps({
+      fetchFn: fn, emit: (l: string) => emitted.push(l), holdPid: 9_001,
+      readRecordFn: async () => HELD_RECORD,
+      ...probe.deps,
+    }) as never);
+    expect(emitted).toEqual([ALLOW]);
+    expect(probe.patches).toHaveLength(1);
+    // What the real writer commits: the patch folded onto the record it read (see settleDecisionHoldRecordAt).
+    const settled = { ...HELD_RECORD, ...probe.patches[0] } as Record<string, unknown>;
+    expect(settled).toMatchObject({ op: "update", prio: 0, lastEvent: "working", sentDone: false });
+    expect(settled.attentionKind).toBeUndefined();              // the question/approval episode is over
+    expect(settled.ts as number).toBeGreaterThan(HELD_RECORD.ts); // …and it is no longer frozen
+    expect(await decryptBlob(KEY, settled.blob as string)).toMatchObject({ status: "working" });
+    // ORDERING IS LOAD-BEARING: a reconcile pass must never see "marker gone + record stale".
+    expect(probe.order).toEqual(["settle", "clear"]);
+  });
+
+  test("a SUPERSEDED hold re-stamps needsAttention with the fallback blob instead of freezing the record", async () => {
+    const { fn } = scriptFetch(true, [{ status: "superseded" }]);
+    const probe = settleProbe();
+    const emitted: string[] = [];
+    await runPermissionHook(baseDeps({
+      fetchFn: fn, emit: (l: string) => emitted.push(l), holdPid: 9_001,
+      readRecordFn: async () => HELD_RECORD,
+      ...probe.deps,
+    }) as never);
+    // The user is still blocked — just at the Mac. Same yellow, honestly re-stamped; never "working".
+    expect(emitted).toEqual([]);
+    expect(probe.patches).toHaveLength(1);
+    const settled = { ...HELD_RECORD, ...probe.patches[0] } as Record<string, unknown>;
+    expect(settled).toMatchObject({ op: "update", prio: 1, lastEvent: "needsAttention" });
+    expect(settled.ts as number).toBeGreaterThan(HELD_RECORD.ts);
+    expect(await decryptBlob(KEY, settled.blob as string)).toMatchObject({ status: "needsAttention" });
+    expect(probe.order).toEqual(["settle", "clear"]);
+  });
+
+  test("the record settle is skipped when the compare-and-clear declines (a newer hold owns the session)", async () => {
+    const answerBlob = await encryptBlob(KEY, { requestId: "req-fixed", decision: "allow", ts: 5 });
+    const { fn } = scriptFetch(true, [{ status: "answered", answerBlob }]);
+    const probe = settleProbe({ cleared: false });
+    const emitted: string[] = [];
+    await runPermissionHook(baseDeps({
+      fetchFn: fn, emit: (l: string) => emitted.push(l), holdPid: 9_001,
+      readRecordFn: async () => HELD_RECORD,
+      ...probe.deps,
+    }) as never);
+    expect(emitted).toEqual([ALLOW]);                           // the answer still lands, always
+    expect(probe.patches).toEqual([]);                          // …but tool B's live card is untouched
+    expect(probe.order).toEqual([]);
+  });
+
+  test("a hold that was never granted settles NOTHING (the record was never ours to move)", async () => {
+    const { fn } = scriptFetch(false, []);
+    const probe = settleProbe();
+    await runPermissionHook(baseDeps({
+      fetchFn: fn, emit: () => {},
+      readRecordFn: async () => HELD_RECORD,
+      ...probe.deps,
+    }) as never);
+    expect(probe.patches).toEqual([]);
+    expect(probe.order).toEqual([]);
+  });
+
   test("POST body is the frozen wire shape: decisionPending blob + needsAttention fallbackBlob", async () => {
     const { fn, calls } = scriptFetch(false, []);
     await runPermissionHook(baseDeps({ fetchFn: fn, emit: () => {} }) as never);
@@ -2141,6 +2248,42 @@ describe("runPermissionHook — LAN loopback answer poll", () => {
     expect(lanCalls).toBe(1);                     // …and the poller retires after ONE delivery
     expect(events.some((e) => e.event === "answered" && e.src === "lan")).toBe(true);
     expect(sleeps.every((ms) => ms === 3_000)).toBe(true); // the worker cadence itself is untouched
+  });
+
+  // NOM-47 / field report R3 (session a51208e8, 2026-08-02). The split-brain backstop makes a worker
+  // `superseded` the NORMAL consequence of a LAN answer landing: the listener stores the phone's blob
+  // synchronously, then the watchdog's answer sink echoes /v1/cc/decision/resolve, which retires the
+  // worker's pending record as "superseded". So the very event that DELIVERS the answer also poisons
+  // the status the worker poll is about to return — and the terminal branch used to `return` before the
+  // loop ever reached `loopback.wait`, discarding an answer that was already in hand.
+  //
+  // Field timeline: answer op landed on LAN at 18:16:58.061, the loopback tick read it at 18:16:58.274,
+  // and the worker poll (in flight since 18:16:57.930) returned `superseded` at 18:16:58.534 — the hook
+  // exited silently and the user's Deny was thrown away ("answer submitted" never appeared).
+  test("a terminal worker status does NOT discard a LAN answer that already landed (NOM-47 R3)", async () => {
+    const store = createLanAnswerStore();
+    const statePath = await listenerFor(store);
+    // The phone's Deny is already in the LAN store — exactly as it is the instant the resolve echo fires.
+    store.put("req-fixed", await encryptBlob(KEY, { requestId: "req-fixed", decision: "deny" }), Date.now());
+    const emitted: string[] = [];
+    const events: Array<Record<string, unknown>> = [];
+    // The worker's very next poll reports the record the echo just retired.
+    const { fn } = scriptFetch(true, [{ status: "superseded" }]);
+    await runPermissionHook(baseDeps({
+      fetchFn: fn,
+      emit: (l: string) => emitted.push(l),
+      trace: (e: object) => events.push(e as Record<string, unknown>),
+      now: () => Date.now(),
+      lanStatePath: statePath,
+      lanFetchFn: fetch,
+      lanSleep: (ms: number) => new Promise<void>((r) => { setTimeout(r, Math.min(ms, 2)); }),
+      lanIntervalMs: 2,
+    }) as never);
+
+    // The answer the user actually gave must win over the status their own answer caused.
+    expect(emitted).toEqual([DENY]);
+    expect(events.some((e) => e.event === "answered" && e.src === "lan")).toBe(true);
+    expect(events.some((e) => e.event === "exit" && e.reason === "superseded")).toBe(false);
   });
 
   test("a LAN answer whose inner requestId does not match releases silently, exactly like the worker path", async () => {

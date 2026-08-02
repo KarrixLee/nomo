@@ -1007,22 +1007,71 @@ describe("frames — the state-sync store", () => {
     expect(card!.ts).toBeGreaterThan(NOW);
   });
 
-  test("releasing a hold that never advanced the record still out-orders the card", async () => {
+  // A KILLED holder is the ONE release the hook's own `finally` cannot cover — a SIGKILL (or the
+  // SIGTERM a closed terminal sends) never reaches it, so nothing settles the record and nothing
+  // unlinks the marker. The record it left behind genuinely IS this session's truth, and the pid probe
+  // is what hands the row back. Every CLEAN exit now settles the record first (see permission.ts's
+  // finally and the a51208e8 test below), so this is no longer the ordinary release path.
+  test("a KILLED holder's marker releases to the record it left behind, which still out-orders the card", async () => {
     const dir = await framesDir();
-    const store = makeStore(dir);
+    let holderAlive = true;                       // the HOLDING hook's pid, probed independently of the session's
+    const store = makeStore(dir, { isAlive: (pid: number) => (pid === 9_001 ? holderAlive : true) });
     await writeFile(join(dir, decisionHoldFileName("s1")),
-                    JSON.stringify({ blob: "sealed-decision-pending", at: NOW - 6_000, pid: 4242 }));
+                    JSON.stringify({ blob: "sealed-decision-pending", at: NOW - 6_000, pid: 9_001 }));
     await put(dir, "s1", { prio: 1 });
     await store.reconcile();
     expect(store.since(0).frames[0]).toMatchObject({ ts: NOW, blob: "sealed-decision-pending" });
 
-    // The hold EXPIRED (or was answered at the Mac): the marker goes and NO further hook event
-    // rewrites the record, so the released frame carries the record's original stamp.
-    await unlink(join(dir, decisionHoldFileName("s1")));
+    // The holding hook was KILLED: the marker is still on disk (no `finally` ran to retire it, and no
+    // hook event rewrote the record either), so lanHoldLive's liveness probe is the only release — and
+    // the released frame carries the record's ORIGINAL stamp, which the card already used.
+    holderAlive = false;
     await store.reconcile();
     const released = store.since(1).frames[0];
     expect(released).toMatchObject({ blob: "sealed-blob" });
     expect(released!.ts).toBeGreaterThan(NOW);
+  });
+
+  // THE WEDGE (field reports R2/R3, session a51208e8). Retiring the marker used to hand the row back to
+  // the record exactly as CC's `Notification` hook wrote it — prio:1 needsAttention at a FROZEN ts —
+  // which `stamp` then ships at prevTs+1, where the phone ACCEPTS it. Nothing followed a
+  // superseded/expired/give-up exit, so the row stayed yellow forever. The fix is ordering the hook now
+  // guarantees: settle the record FIRST, retire the marker second, so no reconcile pass can ever
+  // observe "marker gone + record stale".
+  test("an ANSWERED hold never emits a yellow frame: the record settles before the marker goes (a51208e8)", async () => {
+    const dir = await framesDir();
+    const store = makeStore(dir);
+    const seen: LanFrame[] = [];
+    let cursor = 0;
+    const drain = (): void => {
+      const slice = store.since(cursor);
+      cursor = slice.seq;
+      seen.push(...slice.frames);
+    };
+
+    await writeFile(join(dir, decisionHoldFileName("s1")),
+                    JSON.stringify({ blob: "sealed-decision-pending", at: NOW - 6_000, pid: 4242 }));
+    await put(dir, "s1", { prio: 1, op: "update", lastEvent: "needsAttention", blob: "sealed-attention" });
+    await store.reconcile();
+    drain();
+    expect(seen.at(-1)).toMatchObject({ prio: 1, blob: "sealed-decision-pending" });
+
+    // THE FIXED RELEASE ORDER — record first…
+    await put(dir, "s1", {
+      prio: 0, op: "update", lastEvent: "working", sentDone: false, ts: NOW + 1_000, blob: "sealed-working",
+    });
+    await store.reconcile();                      // a reconcile landing INSIDE the window is now harmless
+    drain();
+    // …marker second.
+    await unlink(join(dir, decisionHoldFileName("s1")));
+    await store.reconcile();
+    drain();
+
+    // The stale yellow the record used to be frozen at was never shipped, on any pass.
+    expect(seen.some((f) => f.blob === "sealed-attention")).toBe(false);
+    expect(seen.some((f) => f.prio === 1 && f.blob !== "sealed-decision-pending")).toBe(false);
+    expect(seen.at(-1)).toMatchObject({ op: "update", prio: 0, blob: "sealed-working" });
+    expect(seen.at(-1)!.ts).toBeGreaterThan(NOW);
   });
 
   test("identical content re-observed neither bumps the counter nor inflates the stamp", async () => {

@@ -27,7 +27,8 @@ import {
   AgentKind, appendFittedPlanAndDebug, atomicWrite, BLOB_FIT_CHARS, CC_DIR, clearDecisionHold, codexHome, Config,
   DecisionHold, flagExists, formatDecisionHoldDebug,
   fullTextForRecord, loadConfig, NO_HOLD_PATH,
-  PLUGIN_VERSION, readPrefix, readRecord, readSuffix, sealedBlobChars, SessionRecord, stampPermissionDetailFull,
+  PLUGIN_VERSION, readPrefix, readRecord, readSuffix, sealedBlobChars, SessionRecord,
+  settleDecisionHoldRecord, stampPermissionDetailFull,
   writeDecisionHold,
 } from "./shared";
 import { b64url, decryptBlob, deriveLanKey, encryptBlob } from "./crypto";
@@ -831,6 +832,9 @@ export interface LoopbackAnswerPoller {
   /** Race the caller's OWN, untouched poll sleep against a LAN-delivered answer. Resolves with the
    *  sealed answerBlob when one arrived first, or undefined when the sleep simply finished. */
   wait(sleeping: Promise<void>): Promise<string | undefined>;
+  /** ONE last look at the local answer store before the hold fails open on a TERMINAL worker status.
+   *  Resolves with a sealed answerBlob if the phone's answer is already here, else undefined. */
+  settle(): Promise<string | undefined>;
   /** Stop the ticker (always call from a `finally` — a hold can return from a dozen places). */
   stop(): void;
 }
@@ -960,6 +964,30 @@ export function createLoopbackAnswerPoller(
       live = false;
       return blob;
     },
+    async settle(): Promise<string | undefined> {
+      // THE LAST WORD BEFORE A TERMINAL WORKER STATUS (NOM-47 / field report R3). A worker
+      // `superseded` is not independent evidence that the user did not answer — it is the ROUTINE
+      // consequence of them answering over LAN: the listener stores the blob synchronously and the
+      // watchdog's answer sink then echoes /v1/cc/decision/resolve, which retires the worker's pending
+      // record. So before the hold fails open on that status, ask the local store once more.
+      //
+      // Two cases, both covered: the ticker had ALREADY read the answer into `pending` (it is simply
+      // handed over — the field case, where the tick beat the worker response by 260 ms), or the answer
+      // landed after the last tick, which the single extra `attempt()` below picks up. Best-effort by
+      // construction: no listener, no port, or a failed read all return undefined and the caller fails
+      // open exactly as before. This runs at most ONCE per hold, off the poll cadence entirely.
+      if (pending !== undefined) {
+        const blob = pending;
+        pending = undefined;
+        live = false;
+        return blob;
+      }
+      if (!live) return undefined;
+      live = false; // one shot, whatever it returns — the hold is ending either way
+      if (port === undefined) port = await readPort();
+      if (port === undefined) return undefined;
+      return await attempt();
+    },
     stop(): void {
       live = false;
       wakeResolve();
@@ -989,8 +1017,25 @@ function defaultWriteHold(): (sessionId: string, hold: DecisionHold) => Promise<
   return lanRunningUnderTest() ? async () => { /* never touch real records from a test */ } : writeDecisionHold;
 }
 
-function defaultClearHold(): (sessionId: string, pid: number) => Promise<void> {
-  return lanRunningUnderTest() ? async () => { /* never touch real records from a test */ } : clearDecisionHold;
+function defaultClearHold(): (
+  sessionId: string, pid: number, beforeUnlink?: () => Promise<void>,
+) => Promise<boolean> {
+  return lanRunningUnderTest()
+    // The test stand-in still RUNS the settle callback (which is itself a no-op under `bun test`, see
+    // defaultSettleHoldRecord) so the production ordering is exercised rather than silently skipped.
+    ? async (_sessionId: string, _pid: number, beforeUnlink?: () => Promise<void>) => {
+      await beforeUnlink?.();
+      return true;
+    }
+    : clearDecisionHold;
+}
+
+/** The record settle this process owes the LAN feed on its way out of a hold (see
+ *  settleDecisionHoldRecordAt). Same test guard, same reason, as defaultWriteHold above: a unit test sees
+ *  the developer's REAL home directory and must never rewrite their live session records. Tests that
+ *  exercise the settle inject `settleHoldRecordFn`. */
+function defaultSettleHoldRecord(): (sessionId: string, patch: Partial<SessionRecord>) => Promise<void> {
+  return lanRunningUnderTest() ? async () => { /* never touch real records from a test */ } : settleDecisionHoldRecord;
 }
 
 /** Injectable seams so permission.test.ts drives the state machine with a scripted fetch, an instant
@@ -1010,7 +1055,16 @@ export interface PermissionHookDeps {
    *  shared.ts's DecisionHold header). Defaults to the real writers in production and to NO-OPs under
    *  `bun test` — see defaultWriteHold. Called exactly once each per granted hold. */
   writeHoldFn?: (sessionId: string, hold: DecisionHold) => Promise<void>;
-  clearHoldFn?: (sessionId: string, pid: number) => Promise<void>;
+  /** Retires the marker, and answers whether this process actually OWNED it. `beforeUnlink` — the record
+   *  settle below — runs only when it did, and always BEFORE the unlink (see clearDecisionHoldAt). */
+  clearHoldFn?: (
+    sessionId: string, pid: number, beforeUnlink?: () => Promise<void>,
+  ) => Promise<boolean>;
+  /** Moves the SESSION RECORD out of the state the hold overlaid, on the way out (field reports R2/R3 —
+   *  see settleDecisionHoldRecordAt). Defaults to the real record patcher in production and to a NO-OP
+   *  under `bun test` — see defaultSettleHoldRecord. Called at most once per granted hold, and only when
+   *  the compare-and-clear accepts. */
+  settleHoldRecordFn?: (sessionId: string, patch: Partial<SessionRecord>) => Promise<void>;
   /** The pid stamped as the hold's OWNER (defaults to this process). Injected so a test can drive the
    *  compare-and-clear rule without spawning processes. */
   holdPid?: number;
@@ -1068,6 +1122,14 @@ export async function runPermissionHook(deps: PermissionHookDeps = {}, agent: Ag
   /** The session whose on-disk hold marker THIS process owns, once one is stamped — function-scoped for
    *  the same reason as `loopback`: the `finally` clears it from every exit of the poll loop. */
   let heldSessionId: string | undefined;
+  /** Did this hold actually put a decision line on stdout? The ONE bit that separates the two honest
+   *  settles below: the user answered (the session is working again) from the user is still blocked, just
+   *  at the Mac (still needsAttention). Set in applyAnswerBlob, read by `settleHeldRecord` at exit time. */
+  let emittedDecision = false;
+  /** The record settle this process owes the LAN feed, built the moment a hold is granted so it closes
+   *  over the config/blobs the `try` scope owns. Read `emittedDecision` at CALL time — it describes the
+   *  exit that actually happened, not the one we expected when we built it. */
+  let settleHeldRecord: (() => Promise<void>) | undefined;
   try {
     // Escape hatch FIRST (a file stat — no stdin consumed yet): if the user paused remote approvals
     // locally, behave exactly as the old fire-and-forget attention event (instant terminal dialog).
@@ -1379,6 +1441,33 @@ export async function runPermissionHook(deps: PermissionHookDeps = {}, agent: Ag
     );
     heldSessionId = sessionId;
 
+    // …AND THE PROCESS THAT OWNS THE HOLD OWNS THE RECORD'S EXIT FROM IT (field reports R2/R3, session
+    // a51208e8). Retiring the marker alone hands the row back to the state CC's `Notification` hook left
+    // there — op:update / prio:1 / needsAttention at a FROZEN ts — which the feed's monotonic `stamp`
+    // ships at prevTs+1, where the phone ACCEPTS it. Answered, the next real hook advances the record a
+    // second later (a yellow FLASH); superseded/expired/gave-up/threw, nothing EVER follows and the row
+    // wedges yellow for good (it also pins the worker's `decact` overlay, which only clears on a
+    // prio:0/done/end frame). So this hook writes the record itself, on its way out.
+    //
+    // TWO honest settles, and only two. A decision was EMITTED → the session is working again, so
+    // prio:0/working with a freshly sealed `working` frame (the write that also releases the worker's
+    // overlay). Anything else → the user is still blocked, just at the Mac: the SAME yellow, re-sealed
+    // from the plain attention frame and freshly stamped. Never "working" there — a released/expired hold
+    // has approved nothing, and claiming progress would be a lie the phone renders as green.
+    settleHeldRecord = async (): Promise<void> => {
+      const settledAt = (deps.now ?? Date.now)();
+      const patch: Partial<SessionRecord> = emittedDecision
+        ? {
+          ts: settledAt, lastEvent: "working", op: "update", prio: 0, sentDone: false,
+          // The approval episode is over; a stale marker would otherwise ride forward on every
+          // record the watchdog rebuilds by spreading `...record`.
+          attentionKind: undefined,
+          blob: await encryptBlob(config.e2eKey, { ...base, status: "working", at: Math.floor(settledAt / 1000) }),
+        }
+        : { ts: settledAt, blob: fallbackBlob };
+      await (deps.settleHoldRecordFn ?? defaultSettleHoldRecord())(sessionId, patch);
+    };
+
     // HOLD: poll until the phone answers, the request leaves "pending", sustained failure trips the
     // give-up cap, or we're killed. Each fetch keeps its own 2s ceiling; transient failures are
     // tolerated (keep polling). A decrypt failure or requestId mismatch exits silently (fail open).
@@ -1403,6 +1492,9 @@ export async function runPermissionHook(deps: PermissionHookDeps = {}, agent: Ag
       const outcome: DecisionOutcome = match
         ? emitDecision(agent, answer, toolName, toolInput, suggestions, emit, trace)
         : "released";
+      // The ONE bit `settleHeldRecord` needs: a line on stdout means the session is WORKING again. A
+      // "released" outcome emitted nothing, so the user is still blocked at the Mac (see the settle).
+      if (outcome === "emitted") emittedDecision = true;
       if (outcome !== "keep-polling") {
         trace({ event: "answered", match, outcome, src });
         trace({ event: "exit", reason: "answered" });
@@ -1459,6 +1551,13 @@ export async function runPermissionHook(deps: PermissionHookDeps = {}, agent: Ag
             return; // a verb we will never understand on a record that will never change → fail open
           }
         } else if (typeof data.status === "string" && data.status !== "pending") {
+          // A TERMINAL status is not independent evidence that the user did not answer. When the phone
+          // answers over LAN, the watchdog's split-brain backstop echoes /v1/cc/decision/resolve, which
+          // retires this very record as "superseded" — so the answer's OWN delivery is what produces the
+          // status about to fail us open, and the loop returns here long before it reaches the
+          // `loopback.wait` that would have handed the blob over. Ask the local store once, first.
+          const settled = loopback === undefined ? undefined : await loopback.settle();
+          if (settled !== undefined && await applyAnswerBlob(settled, "lan") === "done") return;
           trace({ event: data.status === "expired" ? "expired" : "superseded", status: data.status });
           trace({ event: "exit", reason: data.status });
           return; // expired/superseded/unknown → silent
@@ -1509,9 +1608,17 @@ export async function runPermissionHook(deps: PermissionHookDeps = {}, agent: Ag
     // is a compare-and-clear (a parallel tool's LATER hold must survive our exit), and it is NOT the
     // only release: a SIGKILL, or the SIGTERM a closed terminal sends, never reaches a `finally`, so the
     // feed's own holder-liveness and TTL guards are what make a marker impossible to wedge.
+    //
+    // The record settle rides INSIDE that compare-and-clear, which is the only place that knows both
+    // things it depends on: that we still own the marker (a newer hold's card must not be walked back by
+    // our exit), and that the record is written BEFORE the unlink (a reconcile pass must never observe
+    // "marker gone + record stale" — see clearDecisionHoldAt). Best-effort, like everything here: a
+    // failed settle must never cost the user their approval or surface into the session.
     if (heldSessionId !== undefined) {
       try {
-        await (deps.clearHoldFn ?? defaultClearHold())(heldSessionId, deps.holdPid ?? process.pid);
+        await (deps.clearHoldFn ?? defaultClearHold())(
+          heldSessionId, deps.holdPid ?? process.pid, settleHeldRecord,
+        );
       } catch { /* best-effort */ }
     }
   }

@@ -7,7 +7,8 @@ import {
   decisionHoldFileName, ensureWatchdog, formatWatchdogPidfile, fullTextForRecord, isWatchdogCommand,
   readDecisionHoldAt, writeDecisionHoldAt,
   localApprovalsState, parseWatchdogPidfile, PLUGIN_VERSION, RECORD_FULL_TEXT_MAX_CHARS,
-  RECORD_FULL_TEXT_TRUNCATION_MARKER, recordFullTextIsComplete, stampPermissionDetailFullAt, watchdogBuildStamp,
+  RECORD_FULL_TEXT_TRUNCATION_MARKER, recordFullTextIsComplete, settleDecisionHoldRecordAt,
+  stampPermissionDetailFullAt, watchdogBuildStamp,
   watchdogHolderIsLive,
 } from "./shared";
 
@@ -385,9 +386,9 @@ describe("the remote-approval hold marker (the LAN channel's decision-pending gu
     try {
       // Claude runs tools in PARALLEL. Tool A's hook holds, tool B's hook holds over it, then A exits.
       await writeDecisionHoldAt(d, "s1", { blob: "card-b", at: 2, pid: 777 });
-      await clearDecisionHoldAt(d, "s1", 4242);                 // A's exit — not the owner
+      expect(await clearDecisionHoldAt(d, "s1", 4242)).toBe(false); // A's exit — not the owner
       expect(await readDecisionHoldAt(d, "s1")).toMatchObject({ pid: 777 });
-      await clearDecisionHoldAt(d, "s1", 777);                  // B's exit — the owner
+      expect(await clearDecisionHoldAt(d, "s1", 777)).toBe(true);   // B's exit — the owner
       expect(await readDecisionHoldAt(d, "s1")).toBeNull();
     } finally {
       await rm(d, { recursive: true, force: true });
@@ -397,12 +398,100 @@ describe("the remote-approval hold marker (the LAN channel's decision-pending gu
   test("an absent or corrupt marker is never a throw: no owner, so it is simply removed", async () => {
     const d = await dir();
     try {
-      await clearDecisionHoldAt(d, "ghost", 1);                 // nothing there → silent
+      expect(await clearDecisionHoldAt(d, "ghost", 1)).toBe(true); // nothing there → silent
       expect(await readDecisionHoldAt(d, "ghost")).toBeNull();
       await writeFile(join(d, "s1.hold"), "{not json");
       expect(await readDecisionHoldAt(d, "s1")).toBeNull();
-      await clearDecisionHoldAt(d, "s1", 1);                    // nobody can own it → gone
+      expect(await clearDecisionHoldAt(d, "s1", 1)).toBe(true);  // nobody can own it → gone
       expect(await readFile(join(d, "s1.hold"), "utf8").catch(() => null)).toBeNull();
+    } finally {
+      await rm(d, { recursive: true, force: true });
+    }
+  });
+
+  // The hook's record settle rides in here (field reports R2/R3): it must run only for the OWNER, and
+  // strictly BEFORE the unlink — the LAN feed reads the record and the marker independently per pass, so
+  // "marker gone + record stale" is exactly the frozen-yellow frame the settle exists to prevent.
+  test("beforeUnlink runs for the owner, while the marker is still on disk — and never for anyone else", async () => {
+    const d = await dir();
+    try {
+      await writeDecisionHoldAt(d, "s1", { blob: "card-a", at: 2, pid: 777 });
+      let markerAtCallback: unknown;
+      let calls = 0;
+      // Not the owner → the callback never runs and the marker survives.
+      expect(await clearDecisionHoldAt(d, "s1", 4242, async () => { calls += 1; })).toBe(false);
+      expect(calls).toBe(0);
+      expect(await readDecisionHoldAt(d, "s1")).toMatchObject({ pid: 777 });
+      // The owner → the callback runs FIRST (the marker is still there when it does), then the unlink.
+      expect(await clearDecisionHoldAt(d, "s1", 777, async () => {
+        calls += 1;
+        markerAtCallback = await readDecisionHoldAt(d, "s1");
+      })).toBe(true);
+      expect(calls).toBe(1);
+      expect(markerAtCallback).toMatchObject({ pid: 777 });
+      expect(await readDecisionHoldAt(d, "s1")).toBeNull();
+    } finally {
+      await rm(d, { recursive: true, force: true });
+    }
+  });
+
+  test("a throwing settle still retires the marker (a wedged card is worse than a stale record)", async () => {
+    const d = await dir();
+    try {
+      await writeDecisionHoldAt(d, "s1", { blob: "card-a", at: 2, pid: 777 });
+      expect(await clearDecisionHoldAt(d, "s1", 777, async () => { throw new Error("disk full"); })).toBe(true);
+      expect(await readDecisionHoldAt(d, "s1")).toBeNull();
+    } finally {
+      await rm(d, { recursive: true, force: true });
+    }
+  });
+});
+
+// ---- the hold's RECORD settle (the exit the hook used to never write) --------------------------
+
+describe("settleDecisionHoldRecordAt", () => {
+  async function dir(): Promise<string> {
+    return await mkdtemp(join(tmpdir(), "nomo-settle-"));
+  }
+
+  const held = {
+    pid: 1, machine: "m", label: "l", ts: 1_000, op: "update", prio: 1,
+    lastEvent: "needsAttention", attentionKind: "userInput", blob: "stale-attention",
+  };
+
+  test("patches the record the hold overlaid, keys and all", async () => {
+    const d = await dir();
+    try {
+      await writeFile(join(d, "s1.json"), JSON.stringify(held));
+      await settleDecisionHoldRecordAt(d, "s1", {
+        ts: 2_000, lastEvent: "working", op: "update", prio: 0, sentDone: false,
+        attentionKind: undefined, blob: "sealed-working",
+      });
+      const after = JSON.parse(await readFile(join(d, "s1.json"), "utf8")) as Record<string, unknown>;
+      expect(after).toMatchObject({
+        pid: 1, machine: "m", ts: 2_000, op: "update", prio: 0, lastEvent: "working",
+        sentDone: false, blob: "sealed-working",
+      });
+      expect("attentionKind" in after).toBe(false);            // undefined DROPS the key, like donePending
+    } finally {
+      await rm(d, { recursive: true, force: true });
+    }
+  });
+
+  test("NO-OP unless the record is still the prio:1 update we overlaid", async () => {
+    const d = await dir();
+    try {
+      // A later hook already advanced it (a parallel tool's PostToolUse / a done / an end): that state is
+      // newer than anything this exiting hook knows, and must never be walked back.
+      for (const over of [{ prio: 0 }, { op: "done", prio: 0 }, { op: "end", prio: 0 }, { op: undefined }]) {
+        const moved = { ...held, ...over };
+        await writeFile(join(d, "s1.json"), JSON.stringify(moved));
+        await settleDecisionHoldRecordAt(d, "s1", { ts: 2_000, blob: "sealed-working" });
+        expect(JSON.parse(await readFile(join(d, "s1.json"), "utf8"))).toEqual(JSON.parse(JSON.stringify(moved)));
+      }
+      // …and a record that is gone entirely is simply nothing to patch.
+      await settleDecisionHoldRecordAt(d, "ghost", { ts: 2_000 });
+      expect(await readFile(join(d, "ghost.json"), "utf8").catch(() => null)).toBeNull();
     } finally {
       await rm(d, { recursive: true, force: true });
     }

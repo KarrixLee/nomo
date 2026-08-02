@@ -1277,21 +1277,66 @@ export async function writeDecisionHoldAt(
 /** Remove a hold marker — COMPARE-AND-CLEAR on the holder pid. Claude runs tools in PARALLEL, so a
  *  SECOND permission hook may have stamped ITS hold over ours while we were polling; an exiting hook
  *  must never silently un-hold a prompt the user is still looking at. A marker we cannot read is
- *  removed anyway (nobody can own it). */
+ *  removed anyway (nobody can own it).
+ *
+ *  Returns whether this pid actually OWNED the marker — which is the gate the caller's record settle
+ *  needs (see settleDecisionHoldRecordAt): if a parallel tool's newer hold owns this session, our exit
+ *  must move neither the marker nor the record, or we would drop a card the user is still looking at.
+ *
+ *  `beforeUnlink` runs ONLY when the compare-and-clear accepts, and ALWAYS BEFORE the unlink — this
+ *  function is the one place that knows both facts. The order is load-bearing: the LAN frames feed reads
+ *  the record and the marker independently per reconcile pass, so a pass that observed "marker gone +
+ *  record stale" would ship exactly the frozen yellow the settle exists to prevent. Best-effort: a
+ *  throwing callback still retires the marker (a wedged card is worse than a stale record). */
 export async function clearDecisionHoldAt(
   sessionsDir: string, sessionId: string, pid: number,
-): Promise<void> {
+  beforeUnlink?: () => Promise<void>,
+): Promise<boolean> {
   const path = `${sessionsDir}/${decisionHoldFileName(sessionId)}`;
   try {
     const raw = await readFile(path, "utf8").catch(() => undefined);
     if (raw !== undefined) {
       let owner: number | undefined;
       try { owner = (JSON.parse(raw) as DecisionHold).pid; } catch { owner = undefined; }
-      if (typeof owner === "number" && owner !== pid) return; // a newer hold owns this session now
+      if (typeof owner === "number" && owner !== pid) return false; // a newer hold owns this session now
+    }
+    if (beforeUnlink !== undefined) {
+      try { await beforeUnlink(); } catch { /* the marker still goes — see the header */ }
     }
     await unlink(path).catch(() => {}); // already gone → nothing to do
+    return true;
   } catch {
     // Best-effort: a marker left behind is released by the feed's liveness/TTL guards anyway.
+    return false;
+  }
+}
+
+/** Settle an EXISTING session record out of the hold this process owned (field reports R2/R3, session
+ *  a51208e8). The permission hook never wrote the record, so retiring the marker handed the row back to
+ *  the state CC's `Notification` hook left there — op:update / prio:1 / needsAttention at a FROZEN ts —
+ *  and the LAN feed's monotonic stamp ships that at prevTs+1, where the phone accepts it. Answered, a
+ *  later hook advances the record ~1 s on (a yellow FLASH); superseded/expired/gave-up/threw, NOTHING
+ *  ever follows — no line is emitted, no tool runs, no hook fires, and the watchdog's idle reap
+ *  deliberately skips needsAttention — so the row wedges yellow for good. It also pins the WORKER's
+ *  `decact` overlay, which only clears on a prio:0/done/end frame.
+ *
+ *  READ-MODIFY-WRITE, exactly like markDoneDeliveredAt and stampPermissionDetailFullAt and for the same
+ *  reason: the permission hook is a separate short-lived process, so it patches the keys it owns rather
+ *  than rewriting a snapshot the session's own hooks (or the watchdog) may have moved on from.
+ *
+ *  NO-OP UNLESS THE RECORD IS STILL OURS. Only a plain `update`/prio:1 record is the one we overlaid; if
+ *  a later hook already advanced it (a parallel tool's PostToolUse, a done, an end) that state is newer
+ *  than anything this exiting hook knows and must never be walked back. Best-effort throughout. */
+export async function settleDecisionHoldRecordAt(
+  sessionsDir: string, sessionId: string, patch: Partial<SessionRecord>,
+): Promise<void> {
+  try {
+    const record = await readRecord(sessionId, sessionsDir);
+    if (!record) return;                                        // reaped / never tracked → nothing to settle
+    if (record.op !== "update" || record.prio !== 1) return;     // a later hook already moved it on
+    await atomicWrite(`${sessionsDir}/${sessionId}.json`, JSON.stringify({ ...record, ...patch }), 0o600);
+  } catch {
+    // Bookkeeping is best-effort, exactly like trackSession's own write.
   }
 }
 
@@ -1314,8 +1359,16 @@ export async function writeDecisionHold(sessionId: string, hold: DecisionHold): 
   return writeDecisionHoldAt(SESSIONS_DIR, sessionId, hold);
 }
 
-export async function clearDecisionHold(sessionId: string, pid: number): Promise<void> {
-  return clearDecisionHoldAt(SESSIONS_DIR, sessionId, pid);
+export async function clearDecisionHold(
+  sessionId: string, pid: number, beforeUnlink?: () => Promise<void>,
+): Promise<boolean> {
+  return clearDecisionHoldAt(SESSIONS_DIR, sessionId, pid, beforeUnlink);
+}
+
+export async function settleDecisionHoldRecord(
+  sessionId: string, patch: Partial<SessionRecord>,
+): Promise<void> {
+  return settleDecisionHoldRecordAt(SESSIONS_DIR, sessionId, patch);
 }
 
 /** Read up to `maxBytes` from the START of a file (the transcript's ai-title / first prompt sit near
