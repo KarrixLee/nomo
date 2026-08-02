@@ -103,7 +103,7 @@ import { appendFileSync, existsSync, readFileSync, statSync, truncateSync } from
 import { execFileSync, spawn } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "1.6.1";
+var PLUGIN_VERSION = "1.6.2";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -3477,7 +3477,7 @@ function computeSessionState(input) {
   if (recordDone) {
     const heldBack = opinion?.status === "busy" && opinion.statusUpdatedAt > ts;
     if (!heldBack) {
-      return of("done", opinion?.status === "idle" ? "done+cc" : suffix("done"), sealed, ts, false);
+      return of("done", opinion?.status === "idle" ? "done+cc" : suffix("done"), { kind: "plain", value: buildStatePlaintext(record, "done", ts, opinion?.name) }, ts, false);
     }
   }
   if (stateHoldLive(hold, holdPidAlive, now)) {
@@ -4365,7 +4365,13 @@ function createLanListener(deps = {}) {
         try {
           bound.unref?.();
         } catch {}
-        address = { port: persisted.port, lid: persisted.lid };
+        address = { port: persisted.port, lid: newListenerId() };
+        const rotated = { port: address.port, lid: address.lid, createdAt: now() };
+        try {
+          await atomicWrite(statePath, JSON.stringify(rotated), 384);
+        } catch {
+          traceLan(deps, { result: "state-write-failed" });
+        }
         traceLan(deps, { result: "bound", port: address.port, lid: address.lid, reused: true });
         return address;
       }
