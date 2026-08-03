@@ -109,6 +109,55 @@ describe("codexAnswersFromPhone", () => {
 });
 
 describe("startCodexRemoteInput", () => {
+  test("mirrors a granted Codex question into the local hold marker and settles it on exit", async () => {
+    const answerBlob = await encryptBlob(key, {
+      requestId: "relay-hold",
+      decision: "answer",
+      answers: ["Fast"],
+    });
+    const lifecycle: string[] = [];
+    let marker: unknown;
+    let settled: Partial<SessionRecord> | undefined;
+    const handle = startCodexRemoteInput(request(), {
+      config,
+      fetchFn: (async (input) => {
+        const url = String(input);
+        if (url.endsWith("/v1/cc/decision")) return Response.json({ hold: true });
+        expect(lifecycle).toEqual(["write"]); // marker precedes the first poll that can deliver an answer
+        return Response.json({ status: "answered", answerBlob });
+      }) as typeof fetch,
+      readRecordFn: async () => record,
+      randomUUID: () => "relay-hold",
+      now: () => 1_234_567,
+      localApprovalsStateFn: async () => "on",
+      sleep: async () => {},
+      answerAppServer: async () => "sent",
+      interruptAppServer: async () => "sent",
+      holdPid: 7708,
+      writeHoldFn: async (_sessionId, hold) => {
+        lifecycle.push("write");
+        marker = hold;
+      },
+      clearHoldFn: async (sessionId, pid, beforeUnlink) => {
+        lifecycle.push(`clear:${sessionId}:${pid}`);
+        await beforeUnlink?.();
+        return true;
+      },
+      settleHoldRecordFn: async (_sessionId, patch) => {
+        lifecycle.push("settle");
+        settled = patch;
+      },
+    });
+
+    expect(await handle.completion).toBe("answered");
+    expect(marker).toMatchObject({ at: 1_234_567, pid: 7708 });
+    expect((await decryptBlob(key, (marker as { blob: string }).blob) as Record<string, unknown>).status)
+      .toBe("decisionPending");
+    expect(lifecycle).toEqual(["write", "clear:thread-1:7708", "settle"]);
+    expect(settled).toMatchObject({ op: "update", prio: 0, lastEvent: "working", attentionKind: undefined });
+    expect((await decryptBlob(key, settled!.blob as string) as Record<string, unknown>).status).toBe("working");
+  });
+
   test("posts an E2E question frame, polls the phone, and answers app-server", async () => {
     const answerBlob = await encryptBlob(key, {
       requestId: "relay-1",

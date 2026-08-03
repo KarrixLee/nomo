@@ -18,8 +18,10 @@ import {
   fitPermissionDetail, PERMISSION_QUESTION_LABEL_MAX,
 } from "./permission";
 import {
-  Config, localApprovalsState, PLUGIN_VERSION, readRecord, SessionRecord,
+  clearDecisionHold, Config, DecisionHold, localApprovalsState, PLUGIN_VERSION, readRecord, SessionRecord,
+  settleDecisionHoldRecord, writeDecisionHold,
 } from "./shared";
+import { lanRunningUnderTest } from "./lan-wire";
 import type {
   CodexUserInputAnswers, CodexUserInputAnswerResult, CodexUserInputInterruptResult,
   CodexUserInputRequest,
@@ -59,6 +61,14 @@ export interface CodexRemoteInputDeps {
    *  spot instead of waiting for the next 3 s worker tick. Defaults to the process-wide singleton the
    *  listener writes; tests inject their own. */
   answerStore?: LanAnswerStore;
+  /** Local `.hold` marker lifecycle for the LAN state feed. This relay lives in the watchdog, so its
+   *  owner pid is the watchdog's own pid (unlike permission.ts's short-lived hook process). */
+  writeHoldFn?: (sessionId: string, hold: DecisionHold) => Promise<void>;
+  clearHoldFn?: (
+    sessionId: string, pid: number, beforeUnlink?: () => Promise<void>,
+  ) => Promise<boolean>;
+  settleHoldRecordFn?: (sessionId: string, patch: Partial<SessionRecord>) => Promise<void>;
+  holdPid?: number;
   /** Diagnostic seam. Failures here are never fatal, but they must not be silent either. */
   onError?: (error: Error) => void;
 }
@@ -75,6 +85,27 @@ interface PhoneAnswer {
   requestId?: unknown;
   decision?: unknown;
   answers?: unknown;
+}
+
+/** Unit tests run in the developer's real HOME, so production marker defaults must be inert there.
+ *  Injected seams still exercise the full lifecycle. Mirrors permission.ts's guard exactly. */
+function defaultWriteHold(): (sessionId: string, hold: DecisionHold) => Promise<void> {
+  return lanRunningUnderTest() ? async () => { /* never touch live records from a test */ } : writeDecisionHold;
+}
+
+function defaultClearHold(): (
+  sessionId: string, pid: number, beforeUnlink?: () => Promise<void>,
+) => Promise<boolean> {
+  return lanRunningUnderTest()
+    ? async (_sessionId: string, _pid: number, beforeUnlink?: () => Promise<void>) => {
+      await beforeUnlink?.();
+      return true;
+    }
+    : clearDecisionHold;
+}
+
+function defaultSettleHoldRecord(): (sessionId: string, patch: Partial<SessionRecord>) => Promise<void> {
+  return lanRunningUnderTest() ? async () => { /* never touch live records from a test */ } : settleDecisionHoldRecord;
 }
 
 /** Map the phone's positional display labels back to Codex's original question ids and labels. */
@@ -230,6 +261,9 @@ async function runRemoteInput(
   onHoldCreated: (created: boolean) => void,
 ): Promise<CodexRemoteInputResult> {
   let holdCreated = false;
+  let heldSessionId: string | undefined;
+  let resumed = false;
+  let settleHeldRecord: (() => Promise<void>) | undefined;
   try {
     const toolInput = renderableToolInput(request);
     if (!toolInput) return "unsupported";
@@ -325,6 +359,29 @@ async function runRemoteInput(
     // The hold EXISTS on the worker. Publish that fact BEFORE honoring the abort, so an abort that lost
     // the race still retires the card through resolvedElsewhere()'s `await holdCreated` branch.
     holdCreated = true;
+    // Worker hold and local LAN marker are one lifecycle. The marker carries the watchdog pid because
+    // this relay is in-process; a watchdog crash makes it dead on the next liveness pass, and the normal
+    // 10-minute marker TTL remains the pid-reuse backstop. Await the write before exposing the created
+    // hold to resolvedElsewhere(), so every exit from that point has a marker it can compare-and-clear.
+    const holdPid = deps.holdPid ?? process.pid;
+    await (deps.writeHoldFn ?? defaultWriteHold())(
+      request.identity.threadId, { blob, at: now, pid: holdPid },
+    );
+    heldSessionId = request.identity.threadId;
+    settleHeldRecord = async (): Promise<void> => {
+      const settledAt = (deps.now ?? Date.now)();
+      const unblocked = resumed || signal.aborted;
+      const patch: Partial<SessionRecord> = unblocked
+        ? {
+          ts: settledAt, lastEvent: "working", op: "update", prio: 0, sentDone: false,
+          attentionKind: undefined,
+          blob: await encryptBlob(deps.config.e2eKey, {
+            ...promptBase, status: "working", at: Math.floor(settledAt / 1000),
+          }),
+        }
+        : { ts: settledAt, blob: fallbackBlob };
+      await (deps.settleHoldRecordFn ?? defaultSettleHoldRecord())(request.identity.threadId, patch);
+    };
     onHoldCreated(true);
     if (signal.aborted) return "resolved-elsewhere";
 
@@ -352,7 +409,10 @@ async function runRemoteInput(
       if (answer.requestId !== requestId) return "unsupported";
       if (answer.decision === "deny") {
         const result = await deps.interruptAppServer();
-        if (result === "sent" || result === "already-sent") return "denied";
+        if (result === "sent" || result === "already-sent") {
+          resumed = true;
+          return "denied";
+        }
         await reportUndelivered("deny", result);
         return "transport-error";
       }
@@ -360,7 +420,10 @@ async function runRemoteInput(
       const mapped = codexAnswersFromPhone(request, answer.answers);
       if (!mapped) return "unsupported";
       const result = await deps.answerAppServer(mapped);
-      if (result === "sent" || result === "already-sent") return "answered";
+      if (result === "sent" || result === "already-sent") {
+        resumed = true;
+        return "answered";
+      }
       await reportUndelivered("answer", result);
       return "transport-error";
     };
@@ -435,6 +498,15 @@ async function runRemoteInput(
     if (holdCreated) await resolveOnRelay(deps.config, requestId, deps.fetchFn ?? fetch);
     return signal.aborted ? "resolved-elsewhere" : "transport-error";
   } finally {
+    // Same settle-before-unlink compare-and-clear discipline as permission.ts. A later hold owns the
+    // marker/record if its pid differs; a moved record makes settleDecisionHoldRecord a no-op.
+    if (heldSessionId !== undefined) {
+      try {
+        await (deps.clearHoldFn ?? defaultClearHold())(
+          heldSessionId, deps.holdPid ?? process.pid, settleHeldRecord,
+        );
+      } catch { /* marker liveness + TTL are the crash-safe release */ }
+    }
     if (!holdCreated) onHoldCreated(false);
   }
 }

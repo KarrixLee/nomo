@@ -683,7 +683,6 @@ export function createLanFrameStore(deps: LanFrameStoreDeps = {}): LanFrameStore
       seen.add(sessionId);
       const v1Retired = entries.get(sessionId)?.retiredAt !== undefined; // already had its last word
       const v2Retired = stateEntries.get(sessionId)?.retiredAt !== undefined;
-      if (v1Retired && v2Retired) continue;
       let record: SessionRecord | null = null;
       try {
         record = JSON.parse(await readFile(`${sessionsDir}/${file}`, "utf8")) as SessionRecord;
@@ -701,17 +700,22 @@ export function createLanFrameStore(deps: LanFrameStoreDeps = {}): LanFrameStore
       if (typeof record.pid === "number" && Number.isFinite(record.pid)) livePids.add(record.pid);
 
       // --- v1: the `frames` projection, byte-identical to what it has always served ------------------
-      if (!v1Retired) {
+      // A terminal entry is normally frozen for the retire grace. It is NOT a tombstone, though: a
+      // newer hook can rewrite the still-present record after an earlier liveness observation raced it.
+      // Re-open only on positive current liveness; otherwise recomputing terminal content would move
+      // retiredAt on every sweep and make the 60-second grace immortal.
+      const v1LiveNow = lanFrameSessionLive(record, at, alive);
+      if (!v1Retired || v1LiveNow) {
         const content = lanFrameContent(record, pairingId, hold, at, alive);
         if (content) {
-          changed = lanFrameSessionLive(record, at, alive)
+          changed = v1LiveNow
             ? stamp(sessionId, content) || changed
             : stamp(sessionId, terminalContent({ seq: 0, sessionId, ...content }, at), at) || changed;
         }
       }
 
       // --- v2: the computed display state -----------------------------------------------------------
-      if (!v2Retired) {
+      {
         // CC is consulted for CLAUDE, non-provisional sessions only: there is no CC-equivalent for Codex,
         // and a provisional row's `pid` is an immortal app-server rather than a session process. Both stay
         // on the record-only path, and say so on the wire through the `/cx` suffix.
@@ -732,18 +736,31 @@ export function createLanFrameStore(deps: LanFrameStoreDeps = {}): LanFrameStore
             ccProcStartedAt = await startOf(record.pid);
           }
         }
+        // Codex's record pid is sometimes an immortal standalone app-server. Once the watchdog has
+        // precision-correlated the real TUI, that `tuiPid` is the only process whose death says this
+        // session ended. Without it, preserve the existing explicit-end/24 h backstops rather than
+        // guessing at one of several TUIs.
+        const statePid = record.agent === "codex" && typeof record.tuiPid === "number"
+          && Number.isFinite(record.tuiPid)
+          ? record.tuiPid
+          : record.pid;
         const computed = computeSessionState({
           sessionId,
           record,
           pairingId,
           hold,
-          pidAlive: typeof record.pid === "number" && Number.isFinite(record.pid) ? alive(record.pid) : false,
+          pidAlive: typeof statePid === "number" && Number.isFinite(statePid) ? alive(statePid) : false,
           holdPidAlive: hold && typeof hold.pid === "number" && Number.isFinite(hold.pid) ? alive(hold.pid) : false,
           cc,
           ccProcStartedAt,
           now: at,
         });
-        if (computed) stateChanged = await commitState(sessionId, computed, at) || stateChanged;
+        // Like v1, retirement is a grace-period statement, not a permanent tombstone. Recompute every
+        // existing record so a newer non-terminal hook state revives immediately; leave an unchanged
+        // terminal frozen so its retire clock can actually expire.
+        if (computed && (!v2Retired || !computed.terminal)) {
+          stateChanged = await commitState(sessionId, computed, at) || stateChanged;
+        }
       }
     }
     for (const [sessionId, entry] of [...entries]) {
@@ -752,9 +769,13 @@ export function createLanFrameStore(deps: LanFrameStoreDeps = {}): LanFrameStore
         changed = stamp(sessionId, terminalContent(entry.frame, at), at) || changed;
         continue;
       }
-      // Past the grace a terminal session leaves the map. This is NOT a frame: the phone was already
-      // told the session ended, and "absence in a LAN response" is never evidence on the phone side.
-      if (entry.retiredAt !== undefined && at - entry.retiredAt > retireGraceMs) entries.delete(sessionId);
+      // Past the grace a terminal session leaves the SERVED map. When its dead record still exists,
+      // retain this entry as a hidden tombstone: deleting all memory of it makes the next sweep ingest
+      // that same dead file as a brand-new terminal row (disappear → reappear every 60 seconds). A
+      // missing record can be forgotten completely; a newer live record revives through `stamp` above.
+      if (entry.retiredAt !== undefined && at - entry.retiredAt > retireGraceMs && !seen.has(sessionId)) {
+        entries.delete(sessionId);
+      }
     }
     for (const [sessionId, entry] of [...stateEntries]) {
       if (entry.retiredAt === undefined && !seen.has(sessionId)) {
@@ -765,7 +786,9 @@ export function createLanFrameStore(deps: LanFrameStoreDeps = {}): LanFrameStore
         if (gone) stateChanged = await commitState(sessionId, gone, at) || stateChanged;
         continue;
       }
-      if (entry.retiredAt !== undefined && at - entry.retiredAt > retireGraceMs) stateEntries.delete(sessionId);
+      if (entry.retiredAt !== undefined && at - entry.retiredAt > retireGraceMs && !seen.has(sessionId)) {
+        stateEntries.delete(sessionId);
+      }
     }
     // The capability latch, and its re-arm. A pass that consulted CC and got no usable status anywhere
     // counts against the streak; a pass that got one — or that saw a pid we have never probed — clears it.
@@ -799,7 +822,9 @@ export function createLanFrameStore(deps: LanFrameStoreDeps = {}): LanFrameStore
       // stamped with numbers it already believes it has seen.
       const from = !Number.isFinite(sinceSeq) || sinceSeq < 0 || sinceSeq > counter ? 0 : sinceSeq;
       const frames: LanFrame[] = [];
+      const at = now();
       for (const entry of entries.values()) {
+        if (entry.retiredAt !== undefined && at - entry.retiredAt > retireGraceMs) continue;
         if (entry.frame.seq > from) frames.push(entry.frame);
       }
       frames.sort((a, b) => a.seq - b.seq);
@@ -817,7 +842,9 @@ export function createLanFrameStore(deps: LanFrameStoreDeps = {}): LanFrameStore
       const from = !Number.isFinite(sinceSeq) || sinceSeq < 0 || sinceSeq > stateCounter ? 0 : sinceSeq;
       const complete = from === 0 || from <= completeFromSeq;
       const picked: StateEntry[] = [];
+      const instant = now();
       for (const entry of stateEntries.values()) {
+        if (entry.retiredAt !== undefined && instant - entry.retiredAt > retireGraceMs) continue;
         if (complete || entry.seq > from) picked.push(entry);
       }
       picked.sort((a, b) => a.seq - b.seq);
@@ -932,7 +959,12 @@ export function createLanFrameStore(deps: LanFrameStoreDeps = {}): LanFrameStore
       wake(stateWaiters);
     },
     size(): number {
-      return entries.size;
+      const at = now();
+      let visible = 0;
+      for (const entry of entries.values()) {
+        if (entry.retiredAt === undefined || at - entry.retiredAt <= retireGraceMs) visible += 1;
+      }
+      return visible;
     },
   };
   return store;

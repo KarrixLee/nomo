@@ -302,7 +302,10 @@ export interface SessionStateInput {
   pairingId: string | undefined;
   /** The `.hold` marker beside the record, if any. */
   hold?: DecisionHold | null;
-  /** Is the SESSION's own process alive? Probed by the caller (the feed's injected liveness predicate). */
+  /** Is the SESSION's authoritative owner process alive? Probed by the caller. For a daemon-fronted
+   *  Codex record this means its precision-correlated `tuiPid`, when present, rather than the immortal
+   *  app-server in `record.pid`; without that correlation the caller deliberately keeps the daemon row
+   *  on the explicit-end/24 h path. */
   pidAlive: boolean;
   /** Is the HOLDING HOOK's process alive? Probed by the caller; irrelevant when there is no hold. */
   holdPidAlive?: boolean;
@@ -432,9 +435,9 @@ export function computeSessionState(input: SessionStateInput): SessionState | nu
   if (!pidAlive) return of("ended", "reap", sealed, ts, true);
 
   // --- CC's opinion, gated ------------------------------------------------------------------------
-  // NEVER consulted for Codex (no equivalent file exists) nor for a PROVISIONAL row, whose `pid` is an
-  // immortal app-server rather than a session process — those stay on the record-only path by
-  // construction, and say so on the wire through the `/cx` suffix.
+  // NEVER consulted for Codex (no equivalent file exists) nor for a PROVISIONAL row (which has no
+  // trustworthy CC-file join). Those stay on the record-only path by construction, and Codex says so
+  // on the wire through the `/cx` suffix.
   const ccUsable = agent === "claude" && record.provisional !== true;
   const opinion = ccUsable
     ? ccOpinion(cc, { pid: record.pid, sessionId, procStartedAt: ccProcStartedAt }, now)

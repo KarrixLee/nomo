@@ -1899,6 +1899,56 @@ describe("state — the snapshot store", () => {
     expect(store.states(0).sessions[0]).toMatchObject({ terminal: true, why: "stale" });
   });
 
+  test("a daemon-fronted Codex row reaps from its correlated TUI, not its immortal app-server", async () => {
+    const dir = await snapDir();
+    const store = snapStore(dir, { isAlive: (pid: number) => pid === 937 });
+    await write(dir, "s1", { agent: "codex", pid: 937, tuiPid: 64_799 });
+    await write(dir, "s2", { agent: "codex", pid: 937 });
+    await store.reconcile();
+
+    expect(store.states(0).sessions.find((s) => s.sessionId === "s1"))
+      .toMatchObject({ terminal: true, why: "reap", agent: "codex" });
+    // Without a precision-correlated TUI, the daemon row retains the existing explicit-end/24 h
+    // backstops; app-server liveness must not be mistaken for proof about some guessed TUI.
+    expect(store.states(0).sessions.find((s) => s.sessionId === "s2"))
+      .toMatchObject({ terminal: false, why: "work/cx", agent: "codex" });
+  });
+
+  test("a newer hook emission revives a retired entry immediately instead of after disappear/reappear", async () => {
+    const dir = await snapDir();
+    let clock = NOW;
+    let alive = false;
+    const store = snapStore(dir, { now: () => clock, isAlive: () => alive });
+    await write(dir, "s1", { agent: "codex" });
+    await store.reconcile();
+    const terminal = store.states(0);
+    expect(terminal.sessions[0]).toMatchObject({ terminal: true, why: "reap" });
+
+    alive = true;
+    clock += 1;
+    await write(dir, "s1", { agent: "codex", ts: clock, prio: 1, lastEvent: "needsAttention" });
+    await store.reconcile();
+    expect(store.states(terminal.seq).sessions[0])
+      .toMatchObject({ sessionId: "s1", terminal: false, why: "attn", ts: clock });
+    expect(store.since(0).frames[0]).toMatchObject({ sessionId: "s1", op: "update", prio: 1 });
+  });
+
+  test("a persistent dead record stays retired after the grace instead of reappearing next sweep", async () => {
+    const dir = await snapDir();
+    let clock = NOW;
+    const store = snapStore(dir, { now: () => clock, isAlive: () => false });
+    await write(dir, "s1", { agent: "codex" });
+    await store.reconcile();
+    expect(store.states(0).sessions[0]).toMatchObject({ terminal: true, why: "reap" });
+
+    clock += LAN_FRAME_RETIRE_GRACE_MS + 1;
+    await store.reconcile();
+    expect(store.states(0).sessions).toEqual([]);
+    const retiredSeq = store.states(0).seq;
+    await store.reconcile();
+    expect(store.states(0)).toMatchObject({ seq: retiredSeq, sessions: [] });
+  });
+
   test("the CC capability latch stops reading a directory that stopped answering, and re-arms on a new pid", async () => {
     const dir = await snapDir();
     const ccDir = await snapDir();
