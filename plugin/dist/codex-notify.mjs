@@ -103,7 +103,7 @@ async function sha256Hex(s) {
 }
 
 // src/core/shared.ts
-var PLUGIN_VERSION = "1.6.3";
+var PLUGIN_VERSION = "1.6.4";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -1960,12 +1960,16 @@ async function codexDiscoverLive(known, deps = {}) {
   } catch {
     return [];
   }
-  const knownPids = new Set(known.map((r) => r.pid).filter((p) => typeof p === "number" && Number.isFinite(p)));
+  const retiredOwners = known.filter((r) => r.agent === "codex" && typeof r.retiredAt === "number" && Number.isFinite(r.retiredAt));
+  const knownPids = new Set(known.filter((r) => !retiredOwners.includes(r)).flatMap((r) => [r.pid, r.tuiPid]).filter((p) => typeof p === "number" && Number.isFinite(p)));
   const tuis = filterCodexTuis(parseCodexProcs(output), knownPids);
   const out = [];
   for (const { pid } of tuis) {
     const cwd = await cwdOf(pid);
     const startedAt = await startedAtOf(pid);
+    const retiredOwner = retiredOwners.find((r) => r.tuiPid === pid || r.pid === pid);
+    if (retiredOwner && typeof startedAt === "number" && Number.isFinite(startedAt) && startedAt <= retiredOwner.retiredAt)
+      continue;
     const label = labelFromCwd(cwd);
     let active = false;
     try {
@@ -2167,6 +2171,7 @@ function codexSubagentSource(source) {
 function codexRolloutCreationEvidence(prefix) {
   let subagent = false;
   let hasUserMessage = false;
+  let headlessExec = false;
   for (const line of prefix.split(`
 `)) {
     if (!line.trim())
@@ -2183,12 +2188,16 @@ function codexRolloutCreationEvidence(prefix) {
       continue;
     const r = row;
     const payload = r.payload;
-    if (r.type === "session_meta" && codexSubagentSource(payload?.source ?? r.source))
-      subagent = true;
+    if (r.type === "session_meta") {
+      if (codexSubagentSource(payload?.source ?? r.source))
+        subagent = true;
+      if (payload?.originator === "codex_exec" || payload?.source === "exec")
+        headlessExec = true;
+    }
     if (r.type === "event_msg" && payload?.type === "user_message")
       hasUserMessage = true;
   }
-  return { subagent, hasUserMessage };
+  return { subagent, hasUserMessage, headlessExec };
 }
 async function codexSessionCreationSuppression(sessionId, transcriptPrefix, transcriptPath, input = {}, deps = {}) {
   const evidence = codexRolloutCreationEvidence(transcriptPrefix);
@@ -2196,6 +2205,12 @@ async function codexSessionCreationSuppression(sessionId, transcriptPrefix, tran
     return {
       guard: "codex-subagent-rollout",
       reason: "session_meta.source is a subagent variant"
+    };
+  }
+  if (evidence.headlessExec) {
+    return {
+      guard: "codex-headless-exec",
+      reason: "session_meta identifies a non-interactive codex exec run"
     };
   }
   const hookName = typeof input.hook_event_name === "string" ? input.hook_event_name : "";
@@ -2660,6 +2675,8 @@ async function runHook(agent) {
     let eventInput = input;
     let reusedForkPredecessor = false;
     let existingRecord = await readRecord(reportedSessionId);
+    if (existingRecord?.agent === "codex" && typeof existingRecord.retiredAt === "number" && Number.isFinite(existingRecord.retiredAt))
+      existingRecord = null;
     let trackedCache;
     const trackedSessions = async () => {
       if (trackedCache === undefined)

@@ -103,7 +103,7 @@ import { appendFileSync, existsSync, readFileSync, statSync, truncateSync } from
 import { execFileSync, spawn } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "1.6.3";
+var PLUGIN_VERSION = "1.6.4";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -1960,12 +1960,16 @@ async function codexDiscoverLive(known, deps = {}) {
   } catch {
     return [];
   }
-  const knownPids = new Set(known.map((r) => r.pid).filter((p) => typeof p === "number" && Number.isFinite(p)));
+  const retiredOwners = known.filter((r) => r.agent === "codex" && typeof r.retiredAt === "number" && Number.isFinite(r.retiredAt));
+  const knownPids = new Set(known.filter((r) => !retiredOwners.includes(r)).flatMap((r) => [r.pid, r.tuiPid]).filter((p) => typeof p === "number" && Number.isFinite(p)));
   const tuis = filterCodexTuis(parseCodexProcs(output), knownPids);
   const out = [];
   for (const { pid } of tuis) {
     const cwd = await cwdOf(pid);
     const startedAt = await startedAtOf(pid);
+    const retiredOwner = retiredOwners.find((r) => r.tuiPid === pid || r.pid === pid);
+    if (retiredOwner && typeof startedAt === "number" && Number.isFinite(startedAt) && startedAt <= retiredOwner.retiredAt)
+      continue;
     const label = labelFromCwd(cwd);
     let active = false;
     try {
@@ -2167,6 +2171,7 @@ function codexSubagentSource(source) {
 function codexRolloutCreationEvidence(prefix) {
   let subagent = false;
   let hasUserMessage = false;
+  let headlessExec = false;
   for (const line of prefix.split(`
 `)) {
     if (!line.trim())
@@ -2183,12 +2188,16 @@ function codexRolloutCreationEvidence(prefix) {
       continue;
     const r = row;
     const payload = r.payload;
-    if (r.type === "session_meta" && codexSubagentSource(payload?.source ?? r.source))
-      subagent = true;
+    if (r.type === "session_meta") {
+      if (codexSubagentSource(payload?.source ?? r.source))
+        subagent = true;
+      if (payload?.originator === "codex_exec" || payload?.source === "exec")
+        headlessExec = true;
+    }
     if (r.type === "event_msg" && payload?.type === "user_message")
       hasUserMessage = true;
   }
-  return { subagent, hasUserMessage };
+  return { subagent, hasUserMessage, headlessExec };
 }
 async function codexSessionCreationSuppression(sessionId, transcriptPrefix, transcriptPath, input = {}, deps = {}) {
   const evidence = codexRolloutCreationEvidence(transcriptPrefix);
@@ -2196,6 +2205,12 @@ async function codexSessionCreationSuppression(sessionId, transcriptPrefix, tran
     return {
       guard: "codex-subagent-rollout",
       reason: "session_meta.source is a subagent variant"
+    };
+  }
+  if (evidence.headlessExec) {
+    return {
+      guard: "codex-headless-exec",
+      reason: "session_meta identifies a non-interactive codex exec run"
     };
   }
   const hookName = typeof input.hook_event_name === "string" ? input.hook_event_name : "";
@@ -3512,6 +3527,8 @@ var LAN_STATE_SESSIONS_MAX = 20;
 var CC_SESSIONS_DIR = `${process.env.HOME}/.claude/sessions`;
 var CC_CAPABILITY_LATCH_SWEEPS = 5;
 function lanFrameSessionLive(record, now, isAlive) {
+  if (typeof record.retiredAt === "number" && Number.isFinite(record.retiredAt))
+    return false;
   if (typeof record.pid !== "number" || !Number.isFinite(record.pid))
     return false;
   if (typeof record.ts !== "number" || !Number.isFinite(record.ts))
@@ -3521,6 +3538,8 @@ function lanFrameSessionLive(record, now, isAlive) {
   return isAlive(record.pid);
 }
 function lanFrameContent(record, pairingId, hold = null, now = Date.now(), isAlive = pidAlive) {
+  if (typeof record.retiredAt === "number" && Number.isFinite(record.retiredAt))
+    return null;
   if (typeof record.blob !== "string" || record.blob.length === 0)
     return null;
   if (pairingId === undefined || record.pairingId !== pairingId)
@@ -3786,6 +3805,10 @@ function createLanFrameStore(deps = {}) {
       try {
         record = JSON.parse(await readFile3(`${sessionsDir}/${file}`, "utf8"));
       } catch {
+        continue;
+      }
+      if (record.agent === "codex" && typeof record.retiredAt === "number" && Number.isFinite(record.retiredAt)) {
+        seen.delete(sessionId);
         continue;
       }
       let hold = null;
@@ -4909,6 +4932,8 @@ async function runHook(agent) {
     let eventInput = input;
     let reusedForkPredecessor = false;
     let existingRecord = await readRecord(reportedSessionId);
+    if (existingRecord?.agent === "codex" && typeof existingRecord.retiredAt === "number" && Number.isFinite(existingRecord.retiredAt))
+      existingRecord = null;
     let trackedCache;
     const trackedSessions = async () => {
       if (trackedCache === undefined)
@@ -6656,9 +6681,28 @@ function classifySession(record, now, isAlive) {
     return "delete";
   if (typeof record.ts !== "number")
     return "delete";
+  if (record.agent === "codex" && typeof record.retiredAt === "number" && Number.isFinite(record.retiredAt)) {
+    if (typeof record.tuiPid !== "number" || !Number.isFinite(record.tuiPid))
+      return "delete";
+    return isAlive(record.tuiPid) ? "keep" : "delete";
+  }
   if (now - record.ts > SESSION_STALE_MS)
     return "stale";
-  return isAlive(record.pid) ? "keep" : "end";
+  const ownerPid = record.agent === "codex" && typeof record.tuiPid === "number" && Number.isFinite(record.tuiPid) ? record.tuiPid : record.pid;
+  return isAlive(ownerPid) ? "keep" : "end";
+}
+async function locateCodexOwnedTui(sessionId, record) {
+  const resolved = resolveCodexTuiOwner(record, await readAllRecords(), pidAlive);
+  if (resolved !== undefined)
+    return resolved;
+  const locate = adapterFor("codex").locateTuiPid;
+  if (!locate)
+    return;
+  let reason;
+  const pid = await locate({ sessionId, record }, { note: (value) => {
+    reason = value;
+  } });
+  return reason === "record-pid" || reason === "sentinel-pid" ? pid : undefined;
 }
 function startedAtField(record) {
   return typeof record.sessionStartedAt === "number" && Number.isFinite(record.sessionStartedAt) ? { startedAt: record.sessionStartedAt } : {};
@@ -6830,6 +6874,24 @@ function correlateCodexTuiPid(record, candidates, alive = pidAlive) {
     return;
   const matches = candidates.filter((candidate) => candidate.provisional === true && candidate.agent === "codex" && candidate.tuiCwd === cwd && typeof candidate.pid === "number" && Number.isFinite(candidate.pid) && typeof candidate.tuiStartedAt === "number" && Number.isFinite(candidate.tuiStartedAt) && startedAt - candidate.tuiStartedAt >= -CODEX_TUI_SESSION_START_FUTURE_SLOP_MS && startedAt - candidate.tuiStartedAt <= CODEX_TUI_SESSION_START_SKEW_MS && alive(candidate.pid));
   return matches.length === 1 ? matches[0].pid : undefined;
+}
+function resolveCodexTuiOwner(record, candidates, alive = pidAlive) {
+  if (record.agent !== "codex")
+    return;
+  if (typeof record.tuiPid === "number" && Number.isFinite(record.tuiPid) && alive(record.tuiPid)) {
+    return record.tuiPid;
+  }
+  if (record.provisional === true && typeof record.pid === "number" && Number.isFinite(record.pid) && alive(record.pid)) {
+    return record.pid;
+  }
+  const command = record.origin?.ppid_command;
+  if (typeof command === "string") {
+    const tokens = command.trim().split(/\s+/);
+    if (basename5(tokens[0] ?? "") === "codex" && tokens[1] !== "app-server" && !tokens.slice(1).includes("exec") && typeof record.pid === "number" && alive(record.pid)) {
+      return record.pid;
+    }
+  }
+  return correlateCodexTuiPid(record, candidates, alive);
 }
 async function correctResolvedPlanPicker(config, path, sessionId, record, deps = {}) {
   try {
@@ -7660,6 +7722,9 @@ function isClaudeIdleReapEligible(record, now, transcriptMtimeMs = transcriptMti
     return false;
   if (record.provisional === true)
     return false;
+  return idleReapAgeEligible(record, now, transcriptMtimeMs);
+}
+function idleReapAgeEligible(record, now, transcriptMtimeMs = transcriptMtimeMsDefault) {
   if (record.lastEvent !== "working" && record.lastEvent !== "sessionStart")
     return false;
   if (typeof record.ts !== "number")
@@ -7680,8 +7745,37 @@ async function correctIdleClaude(config, path, sessionId, record, now, deps = {}
   const writeRecord = deps.writeRecord ?? ((p, rec) => atomicWrite(p, JSON.stringify(rec), 384));
   const clock = deps.now ?? Date.now;
   try {
-    if (!isClaudeIdleReapEligible(record, now))
+    const agent = record.agent === "codex" ? "codex" : "claude";
+    if (agent === "codex") {
+      if (record.provisional === true || !idleReapAgeEligible(record, now) || typeof record.transcript !== "string" || record.transcript.length === 0)
+        return "uncorrected";
+      let tuiPid = typeof record.tuiPid === "number" && Number.isFinite(record.tuiPid) ? record.tuiPid : undefined;
+      if (tuiPid === undefined) {
+        const locate = deps.locateTuiPid ?? locateCodexOwnedTui;
+        try {
+          tuiPid = await locate(sessionId, record);
+        } catch {
+          return "uncorrected";
+        }
+      }
+      if (typeof tuiPid !== "number" || !Number.isFinite(tuiPid) || !(deps.pidAlive ?? pidAlive)(tuiPid)) {
+        return "uncorrected";
+      }
+      const transcript = record.transcript;
+      const active = deps.codexTurnActive ?? (async (_pid, path2) => {
+        const tail = await readSuffix(path2, 8 * 1024);
+        return codexTurnActiveFromTail(tail, Date.now() - statSync3(path2).mtimeMs);
+      });
+      try {
+        if (await active(tuiPid, transcript))
+          return "uncorrected";
+      } catch {
+        return "uncorrected";
+      }
+      record = { ...record, tuiPid };
+    } else if (!isClaudeIdleReapEligible(record, now)) {
       return "uncorrected";
+    }
     const attempts = effectiveDoneAttempts(record, sessionId);
     if (attempts >= CLAUDE_IDLE_REAP_MAX_ATTEMPTS) {
       try {
@@ -7691,7 +7785,7 @@ async function correctIdleClaude(config, path, sessionId, record, now, deps = {}
       return "pending";
     }
     const doneNow = clock();
-    const outcome = await post(await buildDoneEnvelope(sessionId, record, doneNow, config.e2eKey, "claude", Math.floor(record.ts / 1000)));
+    const outcome = await post(await buildDoneEnvelope(sessionId, record, doneNow, config.e2eKey, agent, Math.floor(record.ts / 1000)));
     if (outcome === "revoked")
       return "revoked";
     if (outcome === "delivered") {
@@ -7783,9 +7877,9 @@ async function correctPendingDone(config, path, sessionId, record, now, deps = {
 }
 var RETIRE_AFTER_MS = 3600000;
 function isRetireEligible(record, now) {
-  if (record.agent === "codex")
+  if (typeof record.retiredAt === "number" && Number.isFinite(record.retiredAt))
     return false;
-  if (record.provisional === true)
+  if (record.provisional === true && record.agent !== "codex")
     return false;
   if (record.op !== "done" && record.lastEvent !== "done")
     return false;
@@ -7796,6 +7890,9 @@ function isRetireEligible(record, now) {
 async function retireDoneStale(config, path, sessionId, record, now, deps = {}) {
   const post = deps.post ?? ((body) => postEvent(config, body));
   const deleteRecord = deps.deleteRecord ?? ((p) => unlink4(p).catch(() => {}));
+  const writeRecord = deps.writeRecord ?? ((p, rec) => atomicWrite(p, JSON.stringify(rec), 384));
+  const alive = deps.pidAlive ?? pidAlive;
+  const locateTuiPid = deps.locateTuiPid ?? locateCodexOwnedTui;
   const reread = deps.readRecord ?? readRecordAt;
   const freshRecord = async () => {
     try {
@@ -7807,6 +7904,19 @@ async function retireDoneStale(config, path, sessionId, record, now, deps = {}) 
   try {
     if (!isRetireEligible(record, now))
       return "skip";
+    let tuiPid;
+    if (record.agent === "codex") {
+      const cached = typeof record.tuiPid === "number" && Number.isFinite(record.tuiPid) ? record.tuiPid : undefined;
+      if (cached !== undefined && alive(cached))
+        tuiPid = cached;
+      if (tuiPid === undefined) {
+        try {
+          const located = await locateTuiPid(sessionId, record);
+          if (typeof located === "number" && Number.isFinite(located) && alive(located))
+            tuiPid = located;
+        } catch {}
+      }
+    }
     const before = await freshRecord();
     if (before && (recordMovedSince(record, before) || !isRetireEligible(before, now)))
       return "skip";
@@ -7818,7 +7928,19 @@ async function retireDoneStale(config, path, sessionId, record, now, deps = {}) 
       return "skip";
     heartbeatAt.delete(sessionId);
     clearDoneAttempts(sessionId);
-    await deleteRecord(path);
+    if (record.agent === "codex" && tuiPid !== undefined) {
+      await writeRecord(path, {
+        pid: tuiPid,
+        machine: record.machine,
+        label: record.label,
+        ts: record.ts,
+        agent: "codex",
+        tuiPid,
+        retiredAt: now
+      });
+    } else {
+      await deleteRecord(path);
+    }
     return outcome === "delivered" ? "retired" : "retired-offline";
   } catch {
     return "skip";
@@ -7961,6 +8083,10 @@ async function sweep(config, deps = {}) {
       record = null;
     }
     const verdict = classifySession(record, now, pidAlive);
+    if (verdict === "keep" && record?.agent === "codex" && typeof record.retiredAt === "number" && Number.isFinite(record.retiredAt)) {
+      remaining++;
+      continue;
+    }
     if (verdict === "keep") {
       let planVerificationHandled = false;
       if (config && record) {
@@ -8383,6 +8509,7 @@ export {
   shouldIdleProvisionalCheck,
   shouldHeartbeat,
   retireDoneStale,
+  resolveCodexTuiOwner,
   resetDoneAttemptMemory,
   resetCommandState,
   recordMovedSince,
