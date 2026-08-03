@@ -103,7 +103,7 @@ import { appendFileSync, existsSync, readFileSync, statSync, truncateSync } from
 import { execFileSync, spawn } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "1.6.2";
+var PLUGIN_VERSION = "1.6.3";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -3782,8 +3782,6 @@ function createLanFrameStore(deps = {}) {
       seen.add(sessionId);
       const v1Retired = entries.get(sessionId)?.retiredAt !== undefined;
       const v2Retired = stateEntries.get(sessionId)?.retiredAt !== undefined;
-      if (v1Retired && v2Retired)
-        continue;
       let record = null;
       try {
         record = JSON.parse(await readFile3(`${sessionsDir}/${file}`, "utf8"));
@@ -3800,13 +3798,14 @@ function createLanFrameStore(deps = {}) {
       }
       if (typeof record.pid === "number" && Number.isFinite(record.pid))
         livePids.add(record.pid);
-      if (!v1Retired) {
+      const v1LiveNow = lanFrameSessionLive(record, at, alive);
+      if (!v1Retired || v1LiveNow) {
         const content = lanFrameContent(record, pairingId, hold, at, alive);
         if (content) {
-          changed = lanFrameSessionLive(record, at, alive) ? stamp(sessionId, content) || changed : stamp(sessionId, terminalContent({ seq: 0, sessionId, ...content }, at), at) || changed;
+          changed = v1LiveNow ? stamp(sessionId, content) || changed : stamp(sessionId, terminalContent({ seq: 0, sessionId, ...content }, at), at) || changed;
         }
       }
-      if (!v2Retired) {
+      {
         const askCc = record.agent !== "codex" && record.provisional !== true;
         let cc = null;
         let ccProcStartedAt;
@@ -3823,19 +3822,21 @@ function createLanFrameStore(deps = {}) {
             ccProcStartedAt = await startOf(record.pid);
           }
         }
+        const statePid = record.agent === "codex" && typeof record.tuiPid === "number" && Number.isFinite(record.tuiPid) ? record.tuiPid : record.pid;
         const computed = computeSessionState({
           sessionId,
           record,
           pairingId,
           hold,
-          pidAlive: typeof record.pid === "number" && Number.isFinite(record.pid) ? alive(record.pid) : false,
+          pidAlive: typeof statePid === "number" && Number.isFinite(statePid) ? alive(statePid) : false,
           holdPidAlive: hold && typeof hold.pid === "number" && Number.isFinite(hold.pid) ? alive(hold.pid) : false,
           cc,
           ccProcStartedAt,
           now: at
         });
-        if (computed)
+        if (computed && (!v2Retired || !computed.terminal)) {
           stateChanged = await commitState(sessionId, computed, at) || stateChanged;
+        }
       }
     }
     for (const [sessionId, entry] of [...entries]) {
@@ -3843,8 +3844,9 @@ function createLanFrameStore(deps = {}) {
         changed = stamp(sessionId, terminalContent(entry.frame, at), at) || changed;
         continue;
       }
-      if (entry.retiredAt !== undefined && at - entry.retiredAt > retireGraceMs)
+      if (entry.retiredAt !== undefined && at - entry.retiredAt > retireGraceMs && !seen.has(sessionId)) {
         entries.delete(sessionId);
+      }
     }
     for (const [sessionId, entry] of [...stateEntries]) {
       if (entry.retiredAt === undefined && !seen.has(sessionId)) {
@@ -3853,8 +3855,9 @@ function createLanFrameStore(deps = {}) {
           stateChanged = await commitState(sessionId, gone, at) || stateChanged;
         continue;
       }
-      if (entry.retiredAt !== undefined && at - entry.retiredAt > retireGraceMs)
+      if (entry.retiredAt !== undefined && at - entry.retiredAt > retireGraceMs && !seen.has(sessionId)) {
         stateEntries.delete(sessionId);
+      }
     }
     if (freshPid) {
       ccMissStreak = 0;
@@ -3884,7 +3887,10 @@ function createLanFrameStore(deps = {}) {
     since(sinceSeq) {
       const from = !Number.isFinite(sinceSeq) || sinceSeq < 0 || sinceSeq > counter ? 0 : sinceSeq;
       const frames = [];
+      const at = now();
       for (const entry of entries.values()) {
+        if (entry.retiredAt !== undefined && at - entry.retiredAt > retireGraceMs)
+          continue;
         if (entry.frame.seq > from)
           frames.push(entry.frame);
       }
@@ -3902,7 +3908,10 @@ function createLanFrameStore(deps = {}) {
       const from = !Number.isFinite(sinceSeq) || sinceSeq < 0 || sinceSeq > stateCounter ? 0 : sinceSeq;
       const complete = from === 0 || from <= completeFromSeq;
       const picked = [];
+      const instant = now();
       for (const entry of stateEntries.values()) {
+        if (entry.retiredAt !== undefined && instant - entry.retiredAt > retireGraceMs)
+          continue;
         if (complete || entry.seq > from)
           picked.push(entry);
       }
@@ -4008,7 +4017,13 @@ function createLanFrameStore(deps = {}) {
       wake(stateWaiters);
     },
     size() {
-      return entries.size;
+      const at = now();
+      let visible = 0;
+      for (const entry of entries.values()) {
+        if (entry.retiredAt === undefined || at - entry.retiredAt <= retireGraceMs)
+          visible += 1;
+      }
+      return visible;
     }
   };
   return store;
@@ -6046,6 +6061,18 @@ async function approvalsCommand(sub, deps = {}) {
 // src/core/codex-remote-input.ts
 var POST_TIMEOUT_MS = 15000;
 var ANSWER_MAX2 = 500;
+function defaultWriteHold2() {
+  return lanRunningUnderTest() ? async () => {} : writeDecisionHold;
+}
+function defaultClearHold2() {
+  return lanRunningUnderTest() ? async (_sessionId, _pid, beforeUnlink) => {
+    await beforeUnlink?.();
+    return true;
+  } : clearDecisionHold;
+}
+function defaultSettleHoldRecord2() {
+  return lanRunningUnderTest() ? async () => {} : settleDecisionHoldRecord;
+}
 function codexAnswersFromPhone(request, positional) {
   if (!Array.isArray(positional) || positional.length !== request.questions.length)
     return;
@@ -6163,6 +6190,9 @@ async function resolveOnRelay(config, requestId, fetchFn = fetch) {
 }
 async function runRemoteInput(request, requestId, signal, deps, onHoldCreated) {
   let holdCreated = false;
+  let heldSessionId;
+  let resumed = false;
+  let settleHeldRecord;
   try {
     const toolInput = renderableToolInput(request);
     if (!toolInput)
@@ -6248,6 +6278,27 @@ async function runRemoteInput(request, requestId, signal, deps, onHoldCreated) {
     if (created.hold !== true)
       return signal.aborted ? "resolved-elsewhere" : "not-held";
     holdCreated = true;
+    const holdPid = deps.holdPid ?? process.pid;
+    await (deps.writeHoldFn ?? defaultWriteHold2())(request.identity.threadId, { blob, at: now, pid: holdPid });
+    heldSessionId = request.identity.threadId;
+    settleHeldRecord = async () => {
+      const settledAt = (deps.now ?? Date.now)();
+      const unblocked = resumed || signal.aborted;
+      const patch = unblocked ? {
+        ts: settledAt,
+        lastEvent: "working",
+        op: "update",
+        prio: 0,
+        sentDone: false,
+        attentionKind: undefined,
+        blob: await encryptBlob(deps.config.e2eKey, {
+          ...promptBase,
+          status: "working",
+          at: Math.floor(settledAt / 1000)
+        })
+      } : { ts: settledAt, blob: fallbackBlob };
+      await (deps.settleHoldRecordFn ?? defaultSettleHoldRecord2())(request.identity.threadId, patch);
+    };
     onHoldCreated(true);
     if (signal.aborted)
       return "resolved-elsewhere";
@@ -6266,8 +6317,10 @@ async function runRemoteInput(request, requestId, signal, deps, onHoldCreated) {
         return "unsupported";
       if (answer.decision === "deny") {
         const result2 = await deps.interruptAppServer();
-        if (result2 === "sent" || result2 === "already-sent")
+        if (result2 === "sent" || result2 === "already-sent") {
+          resumed = true;
           return "denied";
+        }
         await reportUndelivered("deny", result2);
         return "transport-error";
       }
@@ -6277,8 +6330,10 @@ async function runRemoteInput(request, requestId, signal, deps, onHoldCreated) {
       if (!mapped)
         return "unsupported";
       const result = await deps.answerAppServer(mapped);
-      if (result === "sent" || result === "already-sent")
+      if (result === "sent" || result === "already-sent") {
+        resumed = true;
         return "answered";
+      }
       await reportUndelivered("answer", result);
       return "transport-error";
     };
@@ -6337,6 +6392,11 @@ async function runRemoteInput(request, requestId, signal, deps, onHoldCreated) {
       await resolveOnRelay(deps.config, requestId, deps.fetchFn ?? fetch);
     return signal.aborted ? "resolved-elsewhere" : "transport-error";
   } finally {
+    if (heldSessionId !== undefined) {
+      try {
+        await (deps.clearHoldFn ?? defaultClearHold2())(heldSessionId, deps.holdPid ?? process.pid, settleHeldRecord);
+      } catch {}
+    }
     if (!holdCreated)
       onHoldCreated(false);
   }
