@@ -33,7 +33,7 @@ import { readFileSync, statSync, unlinkSync } from "node:fs";
 import { hostname } from "node:os";
 import { basename } from "node:path";
 import { decryptBlob, encryptBlob } from "../core/crypto";
-import { adapterFor, AgentAdapter, allAdapters, codexAdapter, CodexPlanPickerEvidence, DiscoveredSession } from "../core/adapter";
+import { adapterFor, AgentAdapter, allAdapters, codexAdapter, codexTurnActiveFromTail, CodexPlanPickerEvidence, DiscoveredSession } from "../core/adapter";
 import type { LocateTuiReason } from "../core/adapter";
 import { focusTerminalForPid } from "../core/terminal-focus";
 import type { FocusContext, FocusResult } from "../core/terminal-focus";
@@ -206,8 +206,34 @@ export type SessionVerdict = "keep" | "end" | "stale" | "delete";
 export function classifySession(record: SessionRecord | null, now: number, isAlive: (pid: number) => boolean): SessionVerdict {
   if (!record || typeof record.pid !== "number" || !Number.isFinite(record.pid)) return "delete";
   if (typeof record.ts !== "number") return "delete"; // no timestamp → can't age it → nothing to POST
+  // A retired Codex marker is not a session and must never age into another op:end. It exists solely
+  // to reserve the exact interactive owner from discovery; keep it while that TUI lives, then quietly
+  // delete it. A real hook rebuilds the record whole and drops retiredAt, reviving normally.
+  if (record.agent === "codex" && typeof record.retiredAt === "number" && Number.isFinite(record.retiredAt)) {
+    if (typeof record.tuiPid !== "number" || !Number.isFinite(record.tuiPid)) return "delete";
+    return isAlive(record.tuiPid) ? "keep" : "delete";
+  }
   if (now - record.ts > SESSION_STALE_MS) return "stale"; // abandoned (24 h): POST a terminal end, then delete
-  return isAlive(record.pid) ? "keep" : "end";
+  // A precision-correlated Codex TUI owns the session. Its app-server pid can live for the lifetime of
+  // the app and is no evidence that this particular terminal still exists.
+  const ownerPid = record.agent === "codex" && typeof record.tuiPid === "number" && Number.isFinite(record.tuiPid)
+    ? record.tuiPid : record.pid;
+  return isAlive(ownerPid) ? "keep" : "end";
+}
+
+/** Retirement-grade Codex ownership. The general focus locator may use a lone machine-wide TUI or cwd
+ * match as a convenience; neither alone is enough to suppress discovery or declare a working row idle.
+ * Accept direct pid/sentinel ownership, or the strict cwd + process/session-birth correlation below. */
+async function locateCodexOwnedTui(sessionId: string, record: SessionRecord): Promise<number | undefined> {
+  // First spend the same exact evidence the LAN parity path persists: direct hook/discovery ownership,
+  // a cached correlation, or the strict daemon↔provisional cwd/start join.
+  const resolved = resolveCodexTuiOwner(record, await readAllRecords(), pidAlive);
+  if (resolved !== undefined) return resolved;
+  const locate = adapterFor("codex").locateTuiPid;
+  if (!locate) return undefined;
+  let reason: LocateTuiReason | undefined;
+  const pid = await locate({ sessionId, record }, { note: (value) => { reason = value; } });
+  return reason === "record-pid" || reason === "sentinel-pid" ? pid : undefined;
 }
 
 /** The session's cached true start (epoch ms) as an envelope fragment, or nothing when unknown — so
@@ -471,6 +497,30 @@ export function correlateCodexTuiPid(
     startedAt - candidate.tuiStartedAt <= CODEX_TUI_SESSION_START_SKEW_MS &&
     alive(candidate.pid));
   return matches.length === 1 ? matches[0].pid : undefined;
+}
+
+/** Resolve only retirement-grade Codex ownership. Cached precision correlation wins; provisional rows
+ * and direct CLI hook parents own themselves. Daemon-fronted records must pass the strict cwd + process/
+ * session-birth join above, so a headless app-server job cannot borrow an unrelated lone TUI. */
+export function resolveCodexTuiOwner(
+  record: SessionRecord, candidates: SessionRecord[], alive: (pid: number) => boolean = pidAlive,
+): number | undefined {
+  if (record.agent !== "codex") return undefined;
+  if (typeof record.tuiPid === "number" && Number.isFinite(record.tuiPid) && alive(record.tuiPid)) {
+    return record.tuiPid;
+  }
+  if (record.provisional === true && typeof record.pid === "number" && Number.isFinite(record.pid) && alive(record.pid)) {
+    return record.pid;
+  }
+  const command = record.origin?.ppid_command;
+  if (typeof command === "string") {
+    const tokens = command.trim().split(/\s+/);
+    if (basename(tokens[0] ?? "") === "codex" && tokens[1] !== "app-server" &&
+        !tokens.slice(1).includes("exec") && typeof record.pid === "number" && alive(record.pid)) {
+      return record.pid;
+    }
+  }
+  return correlateCodexTuiPid(record, candidates, alive);
 }
 
 /** Clear ONLY a needsAttention episode that the Stop/notify path explicitly marked as a Plan picker,
@@ -1874,7 +1924,7 @@ async function correctIdleProvisional(config: Config, path: string, sessionId: s
   }
 }
 
-// --- Idle-CLAUDE reap (a resumed session left alive-but-silent, no Stop ever coming) ----------
+// --- Idle-session reap (a resumed session left alive-but-silent, no Stop ever coming) ----------
 //
 // Claude Desktop resumes an old session with `claude --resume <id> --replay-user-messages` and keeps the
 // process RESIDENT while idle: its SessionStart fires (re-arming the session to "working"), no turn
@@ -1935,6 +1985,15 @@ export function isClaudeIdleReapEligible(
 ): boolean {
   if (record.agent === "codex") return false;
   if (record.provisional === true) return false;
+  return idleReapAgeEligible(record, now, transcriptMtimeMs);
+}
+
+/** Shared clock/transcript half of idle reaping. Agent ownership stays outside: Claude's process is
+ * authoritative directly; Codex must first correlate a real TUI and prove the exact rollout idle. */
+function idleReapAgeEligible(
+  record: SessionRecord, now: number,
+  transcriptMtimeMs: (path: string) => number | undefined = transcriptMtimeMsDefault,
+): boolean {
   if (record.lastEvent !== "working" && record.lastEvent !== "sessionStart") return false;
   if (typeof record.ts !== "number") return false;
   if (now - record.ts < CLAUDE_IDLE_REAP_MS) return false;
@@ -1951,16 +2010,21 @@ export function isClaudeIdleReapEligible(
   return true;
 }
 
-/** Injectable side-effect seams for the idle-CLAUDE reap, so its settle/retry logic is testable without
- *  real fs/network — mirrors InterruptDeps. `now` clocks the corrective done's envelope ts. */
+/** Injectable side-effect seams for the idle-session reap, so its settle/retry logic is testable without
+ *  real fs/network — mirrors InterruptDeps. Codex's extra seams enforce its TUI + exact-rollout proof. */
 export interface IdleReapDeps {
   post?: (body: object) => Promise<PostOutcome>;
   writeRecord?: (path: string, rec: SessionRecord) => Promise<void>;
+  locateTuiPid?: (sessionId: string, record: SessionRecord) => Promise<number | undefined>;
+  pidAlive?: (pid: number) => boolean;
+  codexTurnActive?: (pid: number, transcriptPath: string) => Promise<boolean>;
   now?: () => number;
 }
 
-/** The idle-CLAUDE reap for one still-alive session. Gated by isClaudeIdleReapEligible, then — exactly like
- *  the interrupt net (correctInterrupt) — the session is DECIDED done and the only remaining question is
+/** The idle reap for one still-alive session. Claude retains isClaudeIdleReapEligible's historical
+ *  event/transcript clock. Codex additionally requires a correlated live TUI and a readable exact rollout
+ *  proving the turn is idle. Once gated — exactly like the interrupt net (correctInterrupt) — the session
+ *  is DECIDED done and the only remaining question is
  *  delivery. It POSTs a corrective op:done (buildDoneEnvelope, the SAME envelope the interrupt net posts,
  *  with `at` FROZEN at record.ts so an hours-idle resumed session ages out rather than looking freshly
  *  finished) and settles the record so the reap can neither re-fire forever nor let the heartbeat re-raise
@@ -1975,8 +2039,8 @@ export interface IdleReapDeps {
  *                 the record stuck at "sessionStart" (the live-observed failure mode). The worker's own
  *                 eviction resolves the phone. A resumed-but-idle session (SessionStart then silence) whose
  *                 reap can't reach the worker now falls all the way through reap → retire on its own.
- *  Claude-only by the gate (no agent key on the blob). On the next real hook the pinned sentDone re-arms the
- *  session to working, just like the interrupt net's done. Returns:
+ *  On the next real hook the pinned sentDone re-arms the session to working, just like the interrupt
+ *  net's done. Returns:
  *   - "corrected"   → it delivered a done this sweep (2xx) → the caller counts it delivered and must NOT
  *                     also heartbeat the session.
  *   - "pending"     → reap-decided but the done did NOT deliver (bounded-retrying, or the cap was hit and the
@@ -1993,7 +2057,41 @@ export async function correctIdleClaude(
     ?? ((p: string, rec: SessionRecord) => atomicWrite(p, JSON.stringify(rec), 0o600));
   const clock = deps.now ?? Date.now;
   try {
-    if (!isClaudeIdleReapEligible(record, now)) return "uncorrected";
+    const agent: AgentKind = record.agent === "codex" ? "codex" : "claude";
+    if (agent === "codex") {
+      // Sound Codex equivalent: clock silence alone is insufficient because record.pid may be the
+      // immortal app-server and a legitimate long turn can be hook-quiet. Require all three pieces:
+      // age + stale rollout mtime, an exact rollout path, and a conservatively correlated LIVE TUI
+      // whose exact rollout says no turn is active. Any missing/throwing evidence fails open to tracking.
+      if (record.provisional === true || !idleReapAgeEligible(record, now) ||
+          typeof record.transcript !== "string" || record.transcript.length === 0) return "uncorrected";
+      let tuiPid = typeof record.tuiPid === "number" && Number.isFinite(record.tuiPid)
+        ? record.tuiPid : undefined;
+      if (tuiPid === undefined) {
+        const locate = deps.locateTuiPid ?? locateCodexOwnedTui;
+        try { tuiPid = await locate(sessionId, record); } catch { return "uncorrected"; }
+      }
+      if (typeof tuiPid !== "number" || !Number.isFinite(tuiPid) || !(deps.pidAlive ?? pidAlive)(tuiPid)) {
+        return "uncorrected";
+      }
+      const transcript = record.transcript;
+      const active = deps.codexTurnActive
+        ?? (async (_pid: number, path: string) => {
+          // Stricter than discovery's deliberately idle-biased probe: retirement may not translate an
+          // unreadable rollout into "idle". Read the exact hook-owned path here and let either IO/stat
+          // failure throw into the fail-open catch below.
+          const tail = await readSuffix(path, 8 * 1024);
+          return codexTurnActiveFromTail(tail, Date.now() - statSync(path).mtimeMs);
+        });
+      try {
+        if (await active(tuiPid, transcript)) return "uncorrected";
+      } catch {
+        return "uncorrected";
+      }
+      record = { ...record, tuiPid };
+    } else if (!isClaudeIdleReapEligible(record, now)) {
+      return "uncorrected";
+    }
     // Bounded against disk AND memory (see effectiveDoneAttempts) — a persistently-failing record write
     // must not reset the reap's retry budget to zero on every sweep.
     const attempts = effectiveDoneAttempts(record, sessionId);
@@ -2010,14 +2108,15 @@ export async function correctIdleClaude(
       }
       return "pending";
     }
-    // Claude-only by the gate above, so the corrective done carries the claude blob shape (no agent key).
+    // The corrective carries the record's agent shape. Codex reaches here only after the stricter
+    // TUI+rollout proof above; Claude keeps its historical clock/transcript behavior.
     // The done blob's `at` is FROZEN at the record's last REAL event (record.ts, epoch seconds) — NOT
     // now: this session has been idle for hours (a resumed-but-never-prompted TUI, or a long-finished
     // one whose Stop dropped), so stamping "now" would make the phone show a freshly-finished row that
     // never ages out — the very "eternally fresh" bug this reap exists to kill. record.ts is guaranteed
     // a finite number by isClaudeIdleReapEligible. (envelope `ts` stays now so the worker accepts the frame.)
     const doneNow = clock();
-    const outcome = await post(await buildDoneEnvelope(sessionId, record, doneNow, config.e2eKey, "claude", Math.floor(record.ts / 1000)));
+    const outcome = await post(await buildDoneEnvelope(sessionId, record, doneNow, config.e2eKey, agent, Math.floor(record.ts / 1000)));
     if (outcome === "revoked") return "revoked"; // pairing gone → bubble up so the loop can tear down
     if (outcome === "delivered") {
       // 2xx: pin the session done and CLEAR the retry counter so the gate closes, the heartbeat can never
@@ -2178,30 +2277,26 @@ export async function correctPendingDone(
 
 // --- Idle-done retire (free the worker cap slot a long-idle done row still occupies) -----------
 //
-// v1.1.6 froze the reap's blob `at` so a resumed-but-idle Claude session AGES OUT of the phone's
+// v1.1.6 froze the reap's blob `at` so a resumed-but-idle session AGES OUT of the phone's
 // display — but that is only a phone-side VISUAL filter. The worker session row the reap left behind
 // (an op:done) still counts against the per-pairing session cap (maxSessionsPerPairing): enough
 // idle-open TUIs and NEW sessions can no longer appear. The frozen `at` never freed that slot. This
-// net closes the last gap: a Claude session that is genuinely DONE (the idle-reaped done, or a normal
+// net closes the last gap: a session that is genuinely DONE (the idle-reaped done, or a normal
 // Stop) whose last REAL event is over an hour old — pid still alive, so the dead-pid reaper never
 // touches it — is RETIRED: a blob-less op:end (the worker DELETES the row, unlike a passively-evicting
-// op:done) carrying the FROZEN real-last-event `at`, plus its local record deleted. Cap slot freed,
-// row gone from the phone.
+// op:done) carrying the FROZEN real-last-event `at`. Claude and headless Codex records are deleted;
+// an interactive Codex TUI leaves a blob-less local owner marker so discovery cannot recreate it.
+// Either way the cap slot is freed and the row is gone from the phone.
 //
-// Revival is intact by construction: a retired TUI has no record, but the user's next prompt fires the
-// hooks, which write the record FRESH on that event (trackSession) and re-create the worker session
-// from scratch (a fresh op:start) — retirement is never a one-way door.
-//
-// CLAUDE-ONLY, like the reap it follows: codex has discoverLive, so a retired codex row would be
-// RE-SURFACED as a provisional idle-done on the very next sweep (with a fresh `at`), silently undoing
-// the retirement — codex idle rows are left to the reconcile/notify machinery + the worker's own
-// eviction. And working / needsAttention are NEVER retired no matter how long idle (a silent 2-h build,
+// Revival is intact by construction: trackSession rebuilds a record whole on the next genuine hook,
+// dropping any owner marker and recreating the worker row. Retirement is never a one-way door. Working /
+// needsAttention are NEVER retired merely for age (a silent 2-h build,
 // an unanswered permission prompt): isRetireEligible requires a terminal done state, so those keep
 // heartbeating exactly as before.
 
-/** How long a DONE Claude session may sit event-idle (its last REAL event = record.ts — a heartbeat
- *  never rewrites it) with its pid alive before the watchdog retires it (blob-less op:end + record
- *  delete). WHY 1 h: it matches the phone's own display-age filter (the frozen blob `at` ages a done row
+/** How long a DONE session may sit event-idle (its last REAL event = record.ts — a heartbeat never
+ *  rewrites it) before the watchdog retires it with a blob-less op:end. WHY 1 h: it matches the phone's
+ *  own display-age filter (the frozen blob `at` ages a done row
  *  out of view at ~the same horizon), and it sits FAR above both HEARTBEAT_AFTER_MS (5 min) and the
  *  worker's one-hour eviction — so retirement is always a DELIBERATE, settled decision, never racing a
  *  session the hooks are still keeping fresh nor one the worker is about to evict anyway. Deliberately
@@ -2209,40 +2304,46 @@ export async function correctPendingDone(
  *  the backstop for NON-done sessions (e.g. a needsAttention prompt abandoned for a full day). */
 const RETIRE_AFTER_MS = 3_600_000; // 1 h
 
-/** Whether a KEPT (alive) session is a DONE Claude session past the retire horizon — the predicate the
- *  retire net keys on. True iff: it's a Claude session (codex has discoverLive; a retired codex row would
- *  just be re-discovered next sweep), not a provisional discovery row (those are the reconcile/reap
- *  machinery's business), it is in a terminal done state (op:"done" OR lastEvent:"done" — exactly what the
+/** Whether a KEPT session is DONE past the retire horizon — the predicate the retire net keys on. True
+ *  iff it is a real session or Codex provisional (never a non-Codex provisional / existing owner marker),
+ *  is in a terminal done state (op:"done" OR lastEvent:"done" — exactly what the
  *  v1.1.6 idle-reap writes back and what a normal Stop leaves; NEVER working/needsAttention, so a silent
  *  build or an unanswered permission prompt keeps heartbeating), and its last REAL event (record.ts) is
  *  older than RETIRE_AFTER_MS. A record with no numeric ts can't be aged → not retired (classifySession
  *  deletes it via the un-ageable path instead). Pure so the whole matrix is unit-testable. */
 export function isRetireEligible(record: SessionRecord, now: number): boolean {
-  if (record.agent === "codex") return false;
-  if (record.provisional === true) return false;
+  if (typeof record.retiredAt === "number" && Number.isFinite(record.retiredAt)) return false;
+  // Codex provisionals are real visible done rows too. Retirement converts them into an owner marker,
+  // which is precisely what prevents discoverLive from recreating them while the idle TUI stays open.
+  if (record.provisional === true && record.agent !== "codex") return false;
   if (record.op !== "done" && record.lastEvent !== "done") return false;
   if (typeof record.ts !== "number") return false;
   return now - record.ts >= RETIRE_AFTER_MS;
 }
 
-/** Injectable seams for the retire net, so its end-POST + delete is testable without fs/network. */
+/** Injectable seams for the retire net, so its end-POST + delete/marker write is testable. */
 export interface RetireDeps {
   post?: (body: object) => Promise<PostOutcome>;
   deleteRecord?: (path: string) => Promise<void>;
+  writeRecord?: (path: string, rec: SessionRecord) => Promise<void>;
+  /** Conservative real-TUI locator. Undefined means no discoverable interactive owner, so deletion
+   *  cannot start a discovery loop (the common headless/app-server one-shot case). */
+  locateTuiPid?: (sessionId: string, record: SessionRecord) => Promise<number | undefined>;
+  pidAlive?: (pid: number) => boolean;
   /** Re-reads the record from disk immediately before the end-POST and again before the DELETE, so a
    *  session the user just woke up (a prompt landing mid-sweep) is never retired out from under its own
    *  hooks. Defaults to a real read; null (absent/unreadable) keeps the pre-guard behavior. */
   readRecord?: (path: string) => Promise<SessionRecord | null>;
 }
 
-/** The idle-done retire net for one still-alive session. Gated by isRetireEligible, then it POSTs a
+/** The idle-done retire net for one kept session. Gated by isRetireEligible, then it POSTs a
  *  best-effort blob-less op:end carrying the FROZEN real-last-event `at` (record.ts/1000 — so the worker
- *  ages any surfaced end frame by real activity, consistent with 5aa1214) and DELETES the local record.
- *  The delete is UNCONDITIONAL on a delivered vs a transiently-failed POST (the slot must free and the row
- *  must go even through a brief worker blip — the worker's own one-hour eviction is the backstop for a
- *  dropped end), exactly the delete-regardless discipline of the 24 h stale path. Returns:
- *   - "retired"         → the op:end 2xx'd; record deleted → the caller counts it delivered (pairing alive).
- *   - "retired-offline" → the op:end failed transiently but the record was deleted anyway → NOT delivered.
+ *  ages any surfaced end frame by real activity, consistent with 5aa1214). It deletes the local record
+ *  unless a live Codex TUI would be rediscovered, in which case it writes an invisible owner marker.
+ *  Local retirement is unconditional on delivered vs transient failure; worker eviction backstops a
+ *  dropped end. Returns:
+ *   - "retired"         → the op:end 2xx'd; record deleted/marked → pairing alive.
+ *   - "retired-offline" → the op:end failed; record deleted/marked anyway → NOT delivered.
  *   - "skip"            → not eligible (leave it for the other nets / the heartbeat).
  *   - "revoked"         → the POST 404'd: the pairing is gone server-side → the caller tears down (the
  *                         record is LEFT in place, mirroring the stale path's revoke bail). */
@@ -2251,12 +2352,28 @@ export async function retireDoneStale(
 ): Promise<"retired" | "retired-offline" | "skip" | "revoked"> {
   const post = deps.post ?? ((body: object) => postEvent(config, body));
   const deleteRecord = deps.deleteRecord ?? ((p: string) => unlink(p).catch(() => {}));
+  const writeRecord = deps.writeRecord
+    ?? ((p: string, rec: SessionRecord) => atomicWrite(p, JSON.stringify(rec), 0o600));
+  const alive = deps.pidAlive ?? pidAlive;
+  const locateTuiPid = deps.locateTuiPid ?? locateCodexOwnedTui;
   const reread = deps.readRecord ?? readRecordAt;
   const freshRecord = async (): Promise<SessionRecord | null> => {
     try { return await reread(path); } catch { return null; }
   };
   try {
     if (!isRetireEligible(record, now)) return "skip";
+    let tuiPid: number | undefined;
+    if (record.agent === "codex") {
+      const cached = typeof record.tuiPid === "number" && Number.isFinite(record.tuiPid)
+        ? record.tuiPid : undefined;
+      if (cached !== undefined && alive(cached)) tuiPid = cached;
+      if (tuiPid === undefined) {
+        try {
+          const located = await locateTuiPid(sessionId, record);
+          if (typeof located === "number" && Number.isFinite(located) && alive(located)) tuiPid = located;
+        } catch { /* no trustworthy interactive owner → ordinary delete */ }
+      }
+    }
     // STALE-SNAPSHOT GUARD (before the POST): `record` is the snapshot the sweep read at the top of this
     // iteration, and the correctives ahead of us already awaited POSTs. If a real hook landed since — the
     // user woke this session up — the row is no longer a settled 1-h-old done, and both the op:end and the
@@ -2274,7 +2391,22 @@ export async function retireDoneStale(
     if (after && recordMovedSince(record, after)) return "skip";
     heartbeatAt.delete(sessionId); // dropping the row → drop its heartbeat-throttle entry (like the sweep's delete)
     clearDoneAttempts(sessionId);
-    await deleteRecord(path);
+    if (record.agent === "codex" && tuiPid !== undefined) {
+      // Durable recreation-loop break: the minimal marker stays in the same known-record set discovery
+      // already consults, but has no blob/op/full text so neither worker nor LAN can serve it. A genuine
+      // hook rewrites this file whole and revives the session; TUI death makes classifySession delete it.
+      await writeRecord(path, {
+        pid: tuiPid,
+        machine: record.machine,
+        label: record.label,
+        ts: record.ts,
+        agent: "codex",
+        tuiPid,
+        retiredAt: now,
+      });
+    } else {
+      await deleteRecord(path);
+    }
     return outcome === "delivered" ? "retired" : "retired-offline";
   } catch {
     return "skip";
@@ -2537,6 +2669,14 @@ async function sweep(config: Config | null, deps: SweepDeps = {}): Promise<Sweep
       record = null; // unreadable / half-written / corrupt → classified as delete
     }
     const verdict = classifySession(record, now, pidAlive);
+    // A live retired-owner marker is bookkeeping, not a session: keep the daemon resident so discovery
+    // remains suppressed, but run none of the delivery/corrective/title/heartbeat nets against it. When
+    // its TUI dies classifySession returns delete and the ordinary unlink path below removes it silently.
+    if (verdict === "keep" && record?.agent === "codex" &&
+        typeof record.retiredAt === "number" && Number.isFinite(record.retiredAt)) {
+      remaining++;
+      continue;
+    }
     if (verdict === "keep") {
       // Long-lived Plan verification runs before the done-debt net: a killed/old Stop may have left a
       // donePending record whose terminal state is precisely what still needs classification.
@@ -2566,18 +2706,15 @@ async function sweep(config: Config | null, deps: SweepDeps = {}): Promise<Sweep
         if (pendingDone === "corrected") delivered = true; // its done 2xx'd → the pairing is alive
         pendingDoneHandled = pendingDone === "corrected" || pendingDone === "pending";
       }
-      // Idle-done RETIRE next: a Claude session pinned done (v1.1.6 idle-reap, or a normal Stop) whose
-      // last REAL event is >1 h old — pid still alive — gets a blob-less op:end + its record deleted, so
-      // the per-pairing cap slot its lingering done row occupied is freed. Runs BEFORE remaining++ so a
-      // retired session is neither counted alive nor heartbeated. isRetireEligible never fires for a
-      // working / needsAttention row (those keep heartbeating) nor for codex (discovery would re-surface
-      // it), so this no-ops for everything but a long-idle Claude done row.
+      // Idle-done RETIRE next: any terminal row whose last REAL event is >1 h old gets a blob-less
+      // op:end. Codex retains only an invisible real-TUI owner marker, preventing discoverLive from
+      // undoing the retirement; other rows delete normally. Working / needsAttention never qualify.
       if (config && record && !pendingDoneHandled) {
         const retire = await retireDoneStale(config, path, sessionId, record, now);
         if (retire === "revoked") return { revoked: true };
         if (retire !== "skip") {
           if (retire === "retired") delivered = true; // its op:end 2xx'd → the pairing is alive
-          continue; // record deleted → not counted in remaining, not heartbeated
+          continue; // record deleted or replaced by an invisible owner marker; never heartbeated
         }
       }
       remaining++;
@@ -2621,10 +2758,9 @@ async function sweep(config: Config | null, deps: SweepDeps = {}): Promise<Sweep
           if (attn === "revoked") return { revoked: true };
           if (attn === "corrected") { delivered = true; flaggedAttention = true; }
         }
-        // Idle-CLAUDE reap: a resumed-but-idle Claude session (working/sessionStart then ≥30 min of
-        // silence, pid still alive, no Stop ever coming) gets ONE corrective done instead of being
-        // heartbeated "working" forever. Only if no earlier net already finished the turn this sweep;
-        // Claude-only (isClaudeIdleReapEligible gates codex out — it has discovery + the notify backstop).
+        // Idle-session reap: Claude keeps its historical event/transcript silence rule. Codex additionally
+        // needs a correlated live TUI + readable exact rollout proving no turn is open. Only if no earlier
+        // net already finished the turn this sweep.
         let reapedIdle = false;
         if (idleFix !== "corrected" && !planResolutionHandled && !interruptHandled && !flaggedAttention) {
           const idleClaude = await correctIdleClaude(config, path, sessionId, record, now);

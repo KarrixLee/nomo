@@ -1329,12 +1329,21 @@ export async function codexDiscoverLive(known: SessionRecord[], deps: CodexDisco
   } catch {
     return []; // no ps / scan failed → surface nothing
   }
-  const knownPids = new Set(known.map((r) => r.pid).filter((p): p is number => typeof p === "number" && Number.isFinite(p)));
+  // Ordinary records reserve both their hook pid and any correlated TUI. A retired-owner marker is
+  // different: a numeric pid alone is not durable identity and may be reused after the old TUI exits.
+  // Validate markers against the candidate's process birth below; unknown/newer birth fails open.
+  const retiredOwners = known.filter((r) =>
+    r.agent === "codex" && typeof r.retiredAt === "number" && Number.isFinite(r.retiredAt));
+  const knownPids = new Set(known.filter((r) => !retiredOwners.includes(r)).flatMap((r) => [r.pid, r.tuiPid])
+    .filter((p): p is number => typeof p === "number" && Number.isFinite(p)));
   const tuis = filterCodexTuis(parseCodexProcs(output), knownPids);
   const out: DiscoveredSession[] = [];
   for (const { pid } of tuis) {
     const cwd = await cwdOf(pid);
     const startedAt = await startedAtOf(pid);
+    const retiredOwner = retiredOwners.find((r) => r.tuiPid === pid || r.pid === pid);
+    if (retiredOwner && typeof startedAt === "number" && Number.isFinite(startedAt) &&
+        startedAt <= (retiredOwner.retiredAt as number)) continue;
     const label = labelFromCwd(cwd);
     // Idle unless a turn is PROVABLY open — a probe failure must never resurrect the stuck-"Running"
     // ghost this flag exists to kill (misread-active self-corrects via the next real hook; misread-idle
@@ -1699,9 +1708,12 @@ function codexSubagentSource(source: unknown): boolean {
 /** Structural evidence from a bounded Codex rollout prefix. Subagent source is sticky and wins even if
  *  the internal thread later writes a user_message; `hasUserMessage` means an actual rollout event_msg
  *  with payload.type=user_message (not an incidental string in instructions/tool output). */
-export function codexRolloutCreationEvidence(prefix: string): { subagent: boolean; hasUserMessage: boolean } {
+export function codexRolloutCreationEvidence(prefix: string): {
+  subagent: boolean; hasUserMessage: boolean; headlessExec: boolean;
+} {
   let subagent = false;
   let hasUserMessage = false;
+  let headlessExec = false;
   for (const line of prefix.split("\n")) {
     if (!line.trim()) continue;
     if (!line.includes("session_meta") && !line.includes("user_message")) continue;
@@ -1710,10 +1722,18 @@ export function codexRolloutCreationEvidence(prefix: string): { subagent: boolea
     if (typeof row !== "object" || row === null) continue;
     const r = row as Record<string, unknown>;
     const payload = r.payload as Record<string, unknown> | undefined;
-    if (r.type === "session_meta" && codexSubagentSource(payload?.source ?? r.source)) subagent = true;
+    if (r.type === "session_meta") {
+      if (codexSubagentSource(payload?.source ?? r.source)) subagent = true;
+      // Codex's durable session_meta is the only authoritative creation-time discriminator for an
+      // ordinary one-shot. Hook stdin carries no interactive/exec bit, and app-server-fronted runs can
+      // share a tty-less parent with real desktop sessions. Historical `codex exec` rollouts stamp both
+      // originator:"codex_exec" and source:"exec"; either exact enum/string is sufficient. Missing or
+      // malformed metadata leaves this false, deliberately failing open to tracking.
+      if (payload?.originator === "codex_exec" || payload?.source === "exec") headlessExec = true;
+    }
     if (r.type === "event_msg" && payload?.type === "user_message") hasUserMessage = true;
   }
-  return { subagent, hasUserMessage };
+  return { subagent, hasUserMessage, headlessExec };
 }
 
 /** Detailed Codex create guard used by runHook. A subagent rollout is permanently suppressed. Any
@@ -1733,6 +1753,12 @@ export async function codexSessionCreationSuppression(
     return {
       guard: "codex-subagent-rollout",
       reason: "session_meta.source is a subagent variant",
+    };
+  }
+  if (evidence.headlessExec) {
+    return {
+      guard: "codex-headless-exec",
+      reason: "session_meta identifies a non-interactive codex exec run",
     };
   }
   const hookName = typeof input.hook_event_name === "string" ? input.hook_event_name : "";

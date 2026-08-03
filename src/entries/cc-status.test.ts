@@ -1348,6 +1348,70 @@ await child.exited;
     }
   }, 20000);
 
+  test("a rollout-proven codex exec one-shot is suppressed even though it has a real user message", async () => {
+    const { home, ccDir, sessionsDir } = await setupHookHome("http://127.0.0.1:9");
+    try {
+      const sid = "019f4a6a-88ad-7ed3-8f0a-cdfcc32ff990";
+      // A local discovery-suppression marker is not an existing visible session. Creation guards must
+      // still run, or `codex exec resume <retired-id>` could turn the marker back into a phone row.
+      await writeFile(join(sessionsDir, `${sid}.json`), JSON.stringify({
+        pid: process.pid, tuiPid: process.pid, retiredAt: Date.now(),
+        machine: "m", label: "api-status", ts: Date.now() - 3_600_000, agent: "codex",
+      }));
+      const transcript = join(home, "exec-rollout.jsonl");
+      await writeFile(transcript, [
+        JSON.stringify({ type: "session_meta", payload: {
+          id: sid, source: "exec", originator: "codex_exec", thread_source: "user",
+        } }),
+        JSON.stringify({ type: "event_msg", payload: { type: "user_message", message: "Review this tree" } }),
+      ].join("\n"));
+      await spawnHook(codexEntry, home, {
+        session_id: sid, hook_event_name: "UserPromptSubmit", prompt: "Review this tree",
+        cwd: "/x/api-status", transcript_path: transcript,
+      });
+
+      const marker = await readLocalRecord(sessionsDir, sid);
+      expect(marker).toMatchObject({ agent: "codex", retiredAt: expect.any(Number) });
+      expect(marker?.blob).toBeUndefined();
+      const trace = (await readFile(join(ccDir, "session-trace.log"), "utf8"))
+        .trim().split("\n").map((line) => JSON.parse(line) as Record<string, unknown>);
+      expect(trace).toContainEqual(expect.objectContaining({
+        event: "suppress", sessionId: sid, guard: "codex-headless-exec",
+      }));
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  }, 20000);
+
+  test("a genuine interactive hook revives a retired-owner marker by rebuilding the row", async () => {
+    const { home, sessionsDir } = await setupHookHome("http://127.0.0.1:9");
+    try {
+      const sid = "019f4a6a-88ad-7ed3-8f0a-cdfcc32ff989";
+      await writeFile(join(sessionsDir, `${sid}.json`), JSON.stringify({
+        pid: process.pid, tuiPid: process.pid, retiredAt: Date.now(),
+        machine: "m", label: "api-status", ts: Date.now() - 3_600_000, agent: "codex",
+      }));
+      const transcript = join(home, "interactive-rollout.jsonl");
+      await writeFile(transcript, [
+        JSON.stringify({ type: "session_meta", payload: {
+          id: sid, source: "vscode", originator: "Claude Code", thread_source: "user",
+        } }),
+        JSON.stringify({ type: "event_msg", payload: { type: "user_message", message: "Real prompt" } }),
+      ].join("\n"));
+      await spawnHook(codexEntry, home, {
+        session_id: sid, hook_event_name: "UserPromptSubmit", prompt: "Real prompt",
+        cwd: "/x/api-status", transcript_path: transcript,
+      });
+
+      const revived = await readLocalRecord(sessionsDir, sid);
+      expect(revived?.retiredAt).toBeUndefined();
+      expect(revived).toMatchObject({ agent: "codex", lastEvent: "working", op: "update" });
+      expect(typeof revived?.blob).toBe("string");
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  }, 20000);
+
   test("companion broker ancestry suppresses a new Codex row and traces guard + reason", async () => {
     const { home, ccDir, sessionsDir } = await setupHookHome("http://127.0.0.1:9");
     try {

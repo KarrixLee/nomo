@@ -665,6 +665,11 @@ export async function runHook(agent: AgentKind): Promise<void> {
     // transcript later vanishing; otherwise parse it from the same head `readTitle` reads (memoized —
     // no second read). Unknown → omitted from the envelope; the worker keeps its first-seen fallback.
     let existingRecord = await readRecord(reportedSessionId);
+    // A retired-owner marker is deliberately not a tracked/visible session. Treat it as absent for all
+    // creation guards: a genuine interactive hook will rebuild the file whole below, while a headless
+    // `codex exec resume <id>` must still be suppressed instead of reviving the marker into a phone row.
+    if (existingRecord?.agent === "codex" && typeof existingRecord.retiredAt === "number" &&
+        Number.isFinite(existingRecord.retiredAt)) existingRecord = null;
     let trackedCache: TrackedSessionLite[] | undefined;
     const trackedSessions = async (): Promise<TrackedSessionLite[]> => {
       if (trackedCache === undefined) trackedCache = await readTrackedSessions();

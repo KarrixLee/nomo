@@ -940,6 +940,8 @@ describe("frames — pure helpers", () => {
     expect(lanFrameSessionLive(rec({ ts: NOW - 86_400_001 }), NOW, () => true)).toBe(false); // 24 h cap
     expect(lanFrameSessionLive(rec({ pid: undefined as unknown as number }), NOW, () => true)).toBe(false);
     expect(lanFrameSessionLive(rec({ ts: undefined as unknown as number }), NOW, () => true)).toBe(false);
+    expect(lanFrameSessionLive(rec({ agent: "codex", retiredAt: NOW }), NOW, () => true)).toBe(false);
+    expect(lanFrameContent(rec({ agent: "codex", retiredAt: NOW }), "pairing-abc")).toBeNull();
   });
 });
 
@@ -1881,6 +1883,27 @@ describe("state — the snapshot store", () => {
     await store.reconcile();
     expect(store.states(0).seq).toBe(seq);
     clock = NOW + LAN_FRAME_RETIRE_GRACE_MS + 1;
+    await store.reconcile();
+    expect(store.states(0).sessions).toEqual([]);
+  });
+
+  test("a Codex retired-owner marker is invisible and retires the previously served row despite staying on disk", async () => {
+    const dir = await snapDir();
+    let clock = NOW;
+    const store = snapStore(dir, { now: () => clock });
+    await write(dir, "s1", { agent: "codex", pid: 64799, tuiPid: 64799 });
+    await store.reconcile();
+    expect(store.states(0).sessions).toHaveLength(1);
+
+    await write(dir, "s1", {
+      agent: "codex", pid: 64799, tuiPid: 64799, retiredAt: clock,
+      blob: undefined, op: undefined, pairingId: undefined,
+    });
+    await store.reconcile();
+    expect(store.states(0).sessions).toEqual([
+      expect.objectContaining({ sessionId: "s1", terminal: true }),
+    ]);
+    clock += LAN_FRAME_RETIRE_GRACE_MS + 1;
     await store.reconcile();
     expect(store.states(0).sessions).toEqual([]);
   });

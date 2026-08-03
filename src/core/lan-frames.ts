@@ -173,6 +173,7 @@ type LanFrameContent = Omit<LanFrame, "seq" | "sessionId">;
  *  decision exactly (un-ageable → not live, 24 h-abandoned → not live, dead pid → not live), so the feed
  *  and the sweep can never disagree about who is running. Pure apart from the injected liveness probe. */
 export function lanFrameSessionLive(record: SessionRecord, now: number, isAlive: (pid: number) => boolean): boolean {
+  if (typeof record.retiredAt === "number" && Number.isFinite(record.retiredAt)) return false;
   if (typeof record.pid !== "number" || !Number.isFinite(record.pid)) return false;
   if (typeof record.ts !== "number" || !Number.isFinite(record.ts)) return false;
   if (now - record.ts > LAN_FRAME_SESSION_STALE_MS) return false;
@@ -197,6 +198,7 @@ export function lanFrameContent(
   record: SessionRecord, pairingId: string | undefined,
   hold: DecisionHold | null = null, now: number = Date.now(), isAlive: (pid: number) => boolean = pidAlive,
 ): LanFrameContent | null {
+  if (typeof record.retiredAt === "number" && Number.isFinite(record.retiredAt)) return null;
   if (typeof record.blob !== "string" || record.blob.length === 0) return null;
   if (pairingId === undefined || record.pairingId !== pairingId) return null;
   if (typeof record.ts !== "number" || !Number.isFinite(record.ts)) return null;
@@ -688,6 +690,14 @@ export function createLanFrameStore(deps: LanFrameStoreDeps = {}): LanFrameStore
         record = JSON.parse(await readFile(`${sessionsDir}/${file}`, "utf8")) as SessionRecord;
       } catch {
         continue; // unreadable/corrupt → leave whatever we already serve; the next pass re-reads it
+      }
+      // A Codex retirement marker is intentionally present on disk but absent from BOTH feeds. Treat it
+      // exactly like a deleted record here: an already-served row gets one terminal frame + retire grace,
+      // while a fresh listener never learns the marker exists. Discovery still reads the same file and
+      // reserves its tuiPid, which is the whole reason the marker survives locally.
+      if (record.agent === "codex" && typeof record.retiredAt === "number" && Number.isFinite(record.retiredAt)) {
+        seen.delete(sessionId);
+        continue;
       }
       let hold: DecisionHold | null = null;
       if (held.has(sessionId)) {

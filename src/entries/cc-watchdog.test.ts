@@ -11,7 +11,7 @@ import {
   buildDoneEnvelope, buildEndEnvelope, buildHeartbeatEnvelope, buildNeedsAttentionEnvelope, buildProvisionalBlob,
   buildProvisionalEnvelope, buildProvisionalRecord, buildStartEnvelope, buildTitleRepairEnvelope, classifySession,
   claudeTailPendingApproval, codexLastTurnEvent, codexTailPendingApproval, correctIdleClaude, correctInterrupt,
-  CODEX_TUI_SESSION_START_SKEW_MS, correlateCodexTuiPid,
+  CODEX_TUI_SESSION_START_SKEW_MS, correlateCodexTuiPid, resolveCodexTuiOwner,
   COMMAND_FUTURE_SKEW_MS, COMMAND_TTL_MS, commandIsFresh,
   correctPendingApproval, correctPendingDone, correctPlanPickerVerification, correctResolvedPlanPicker, createBridgeSupervisor, discoverLiveSessions, drainCommands, effectiveDoneAttempts, extractCommands, goneStrikeShouldTeardown,
   enforceWatchdogOwnership, hasInterruptMarker, IDLE_GRACE_MS, isClaudeIdleReapEligible, isRetireEligible, isRightfulWatchdogOwner, lastTurnLine, PAIRING_TTL_MS, pendingDoneRetryWrite,
@@ -101,6 +101,18 @@ describe("classifySession", () => {
     classifySession(rec({ pid: 777 }), rec().ts, (p) => { seen.push(p); return false; });
     expect(seen).toEqual([777]);
   });
+
+  test("a correlated Codex row is owned by tuiPid, not its immortal app-server pid", () => {
+    const row = rec({ agent: "codex", pid: 937, tuiPid: 64799 });
+    expect(classifySession(row, row.ts, (pid) => pid === 937)).toBe("end");
+    expect(classifySession(row, row.ts, (pid) => pid === 64799)).toBe("keep");
+  });
+
+  test("a retired-owner marker stays only while its TUI lives, then deletes without another end", () => {
+    const marker = rec({ agent: "codex", pid: 64799, tuiPid: 64799, retiredAt: 2_000_000 });
+    expect(classifySession(marker, marker.ts + 90_000_000, (pid) => pid === 64799)).toBe("keep");
+    expect(classifySession(marker, marker.ts + 90_000_000, () => false)).toBe("delete");
+  });
 });
 
 describe("isClaudeIdleReapEligible (a resumed Claude session gone silent past the reap grace)", () => {
@@ -186,6 +198,43 @@ describe("correctIdleClaude (resumed-idle reap — bounded retry + local done-pi
     expect(posts[0]).toMatchObject({ op: "done", ts: 4242 });
     expect(writes[0]).toMatchObject({ lastEvent: "done", op: "done", sentDone: true });
     expect(writes[0].doneAttempts).toBeUndefined();
+  });
+
+  test("Codex idle reap requires a correlated live TUI and exact-rollout proof that no turn is active", async () => {
+    const posts: object[] = [];
+    const writes: SessionRecord[] = [];
+    const record = resumed({ agent: "codex", pid: 937, transcript: "/tmp/rollout.jsonl" });
+    const v = await correctIdleClaude(cfg(), "/tmp/s.json", "s", record, NOW, {
+      locateTuiPid: async () => 64799,
+      pidAlive: (pid) => pid === 64799,
+      codexTurnActive: async (pid, transcript) => {
+        expect(pid).toBe(64799);
+        expect(transcript).toBe("/tmp/rollout.jsonl");
+        return false;
+      },
+      post: async (body) => { posts.push(body); return "delivered" as PostOutcome; },
+      writeRecord: async (_path, next) => { writes.push(next); },
+      now: () => 4242,
+    });
+    expect(v).toBe("corrected");
+    expect(posts).toHaveLength(1);
+    expect(writes.at(-1)).toMatchObject({ agent: "codex", tuiPid: 64799, lastEvent: "done", op: "done" });
+  });
+
+  test("Codex idle reap fails open when the rollout says active or no TUI can be correlated", async () => {
+    const record = resumed({ agent: "codex", pid: 937, transcript: "/tmp/rollout.jsonl" });
+    let posts = 0;
+    expect(await correctIdleClaude(cfg(), "/tmp/s.json", "s", record, NOW, {
+      locateTuiPid: async () => 64799,
+      pidAlive: () => true,
+      codexTurnActive: async () => true,
+      post: async () => { posts++; return "delivered" as PostOutcome; },
+    })).toBe("uncorrected");
+    expect(await correctIdleClaude(cfg(), "/tmp/s.json", "s", record, NOW, {
+      locateTuiPid: async () => undefined,
+      post: async () => { posts++; return "delivered" as PostOutcome; },
+    })).toBe("uncorrected");
+    expect(posts).toBe(0);
   });
 
   test("a transiently FAILING done POST persists a bounded doneAttempts counter (verdict 'pending', record stays retryable)", async () => {
@@ -781,7 +830,7 @@ describe("reconcileProvisionalsSweep (ends + deletes a covered provisional)", ()
 // Claude done session idle >1 h (pid alive) gets a blob-less op:end carrying the FROZEN real-last-event
 // `at`, and its local record is deleted — freeing the cap slot. Never touches working/needsAttention
 // (they keep heartbeating), never codex (discovery would re-surface it).
-describe("isRetireEligible (a DONE Claude session past the 1 h retire horizon)", () => {
+describe("isRetireEligible (a DONE session past the 1 h real-event horizon)", () => {
   const RETIRE_MS = 3_600_000; // must mirror RETIRE_AFTER_MS in cc-watchdog.ts
   const now = 100_000_000;
 
@@ -799,8 +848,13 @@ describe("isRetireEligible (a DONE Claude session past the 1 h retire horizon)",
     expect(isRetireEligible(rec({ lastEvent: "needsAttention", op: "update", prio: 1, ts: now - RETIRE_MS * 10 }), now)).toBe(false);
   });
 
-  test("codex and provisional rows are left to their own machinery (discovery would re-surface them)", () => {
-    expect(isRetireEligible(rec({ agent: "codex", op: "done", lastEvent: "done", ts: now - RETIRE_MS * 5 }), now)).toBe(false);
+  test("Codex real and provisional done rows retire; a local retired-owner marker cannot retire twice", () => {
+    expect(isRetireEligible(rec({ agent: "codex", op: "done", lastEvent: "done", ts: now - RETIRE_MS * 5 }), now)).toBe(true);
+    expect(isRetireEligible(rec({ agent: "codex", provisional: true, op: "done", lastEvent: "done", ts: now - RETIRE_MS * 5 }), now)).toBe(true);
+    expect(isRetireEligible(rec({ agent: "codex", op: "done", lastEvent: "done", ts: now - RETIRE_MS * 5, retiredAt: now }), now)).toBe(false);
+  });
+
+  test("non-Codex provisional rows remain outside the retire net", () => {
     expect(isRetireEligible(rec({ provisional: true, op: "done", lastEvent: "done", ts: now - RETIRE_MS * 5 }), now)).toBe(false);
   });
 
@@ -857,6 +911,39 @@ describe("retireDoneStale (blob-less op:end with frozen `at` + record delete)", 
       deleteRecord: async (p) => { deletes.push(p); },
     });
     expect(v).toBe("retired-offline"); // deleted, but not counted as a delivered proof-of-life
+    expect(deletes).toEqual(["/tmp/s.json"]);
+  });
+
+  test("a Codex done row becomes a local owner marker so discovery cannot recreate its live TUI", async () => {
+    const posts: object[] = [];
+    const writes: SessionRecord[] = [];
+    const deletes: string[] = [];
+    const record = done({ agent: "codex", pid: 937, tuiPid: undefined });
+    const v = await retireDoneStale(cfg(), "/tmp/s.json", "s", record, NOW, {
+      post: async (body) => { posts.push(body); return "delivered" as PostOutcome; },
+      locateTuiPid: async () => 64799,
+      pidAlive: (pid) => pid === 64799,
+      writeRecord: async (_path, next) => { writes.push(next); },
+      deleteRecord: async (path) => { deletes.push(path); },
+    });
+    expect(v).toBe("retired");
+    expect(posts).toHaveLength(1);
+    expect(deletes).toEqual([]);
+    expect(writes).toEqual([expect.objectContaining({
+      agent: "codex", pid: 64799, tuiPid: 64799, retiredAt: NOW,
+    })]);
+    expect(writes[0].blob).toBeUndefined();
+    expect(writes[0].op).toBeUndefined();
+  });
+
+  test("a headless/unowned Codex done row deletes normally because discovery has no TUI to recreate", async () => {
+    const deletes: string[] = [];
+    const v = await retireDoneStale(cfg(), "/tmp/s.json", "s", done({ agent: "codex", pid: 937 }), NOW, {
+      post: async () => "delivered" as PostOutcome,
+      locateTuiPid: async () => undefined,
+      deleteRecord: async (path) => { deletes.push(path); },
+    });
+    expect(v).toBe("retired");
     expect(deletes).toEqual(["/tmp/s.json"]);
   });
 
@@ -1477,6 +1564,15 @@ describe("correctResolvedPlanPicker (Mac answer clears only the marked Plan wait
     expect(correlateCodexTuiPid(record, [tui(5150, { tuiStartedAt: 12_001 })], () => true)).toBeUndefined();
     expect(correlateCodexTuiPid(record, [tui(5150)], () => false)).toBeUndefined();
     expect(correlateCodexTuiPid(daemonSession({ origin: { ...record.origin!, ppid_command: "/Applications/ChatGPT.app/codex app-server" } }), [tui(5150)], () => true)).toBeUndefined();
+  });
+
+  test("retirement ownership accepts exact/cached owners but never borrows an unrelated lone TUI", () => {
+    expect(resolveCodexTuiOwner(blockedPlan({ pid: 5150, origin: {
+      hook_event_name: "Stop", ppid: 5150, ppid_command: "codex", cwd: "/Users/me/project",
+    } }), [], () => true)).toBe(5150);
+    expect(resolveCodexTuiOwner(daemonSession({ tuiPid: 5151 }), [], (pid) => pid === 5151)).toBe(5151);
+    expect(resolveCodexTuiOwner(daemonSession(), [tui(5150, { tuiCwd: "/Users/me/other" })], () => true)).toBeUndefined();
+    expect(resolveCodexTuiOwner(daemonSession(), [tui(5150)], () => true)).toBe(5150);
   });
 
   test("task_started/user_message resolution → working update and clears provenance marker", async () => {

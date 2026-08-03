@@ -405,6 +405,36 @@ describe("codexDiscoverLive (full pipeline with injected ps/lsof)", () => {
     expect(discovered.map((d) => d.pid)).toEqual([33198]);
   });
 
+  test("a retired-owner marker keeps discovery from recreating its still-open TUI", async () => {
+    const known = [{
+      pid: 16029, tuiPid: 16029, retiredAt: 123,
+      machine: "m", label: "proj", ts: 100, agent: "codex",
+    } as SessionRecord];
+    const discovered = await codexDiscoverLive(known, {
+      ps: async () => PS_FIXTURE,
+      cwdOf: async () => "/tmp/proj",
+      startedAtOf: async () => 100,
+      turnActive: async () => false,
+    });
+    expect(discovered.map((d) => d.pid)).not.toContain(16029);
+  });
+
+  test("a retired-owner marker fails open for an unverifiable or PID-reused TUI", async () => {
+    const known = [{
+      pid: 16029, tuiPid: 16029, retiredAt: 123,
+      machine: "m", label: "proj", ts: 100, agent: "codex",
+    } as SessionRecord];
+    for (const startedAt of [undefined, 124]) {
+      const discovered = await codexDiscoverLive(known, {
+        ps: async () => "16029 ttys017  codex",
+        cwdOf: async () => "/tmp/proj",
+        startedAtOf: async () => startedAt,
+        turnActive: async () => false,
+      });
+      expect(discovered.map((d) => d.pid)).toEqual([16029]);
+    }
+  });
+
   test("an unknown cwd falls back to the 'session' label (like buildBlob)", async () => {
     const discovered = await codexDiscoverLive([], { ps: async () => "42 ttys001  codex", cwdOf: async () => undefined, startedAtOf: async () => undefined, turnActive: async () => false });
     expect(discovered[0]).toEqual({ pid: 42, sessionId: "codex-pid-42", title: "session", label: "session", idle: true });
@@ -1068,7 +1098,7 @@ describe("Codex rollout create suppression (subagents + promptless deferral)", (
 
   test("guardian and any other subagent source variant are permanently suppressed", async () => {
     const guardian = sessionMeta({ subagent: { other: "guardian" } });
-    expect(codexRolloutCreationEvidence(guardian)).toEqual({ subagent: true, hasUserMessage: false });
+    expect(codexRolloutCreationEvidence(guardian)).toEqual({ subagent: true, hasUserMessage: false, headlessExec: false });
     expect(await codexSessionCreationSuppression(
       "guardian", guardian, "/rollout.jsonl",
       { hook_event_name: "SessionStart", parent_thread_id: "parent" },
@@ -1096,9 +1126,40 @@ describe("Codex rollout create suppression (subagents + promptless deferral)", (
       sessionMeta("vscode"),
       JSON.stringify({ type: "event_msg", payload: { type: "user_message", message: "Hello" } }),
     ].join("\n");
-    expect(codexRolloutCreationEvidence(prefix)).toEqual({ subagent: false, hasUserMessage: true });
+    expect(codexRolloutCreationEvidence(prefix)).toEqual({ subagent: false, hasUserMessage: true, headlessExec: false });
     expect(await codexSessionCreationSuppression(
       "real", prefix, "/rollout.jsonl", { hook_event_name: "PreToolUse" },
+    )).toBeNull();
+  });
+
+  test("codex exec session_meta is authoritative headless evidence even with a real user_message", async () => {
+    const prefix = [
+      JSON.stringify({ type: "session_meta", payload: {
+        id: "exec-1", originator: "codex_exec", source: "exec", thread_source: "user",
+      } }),
+      JSON.stringify({ type: "event_msg", payload: { type: "user_message", message: "review this" } }),
+    ].join("\n");
+    expect(codexRolloutCreationEvidence(prefix)).toEqual({
+      subagent: false, hasUserMessage: true, headlessExec: true,
+    });
+    expect(await codexSessionCreationSuppression(
+      "exec-1", prefix, "/tmp/rollout.jsonl", { hook_event_name: "UserPromptSubmit", prompt: "review this" },
+    )).toEqual({
+      guard: "codex-headless-exec",
+      reason: "session_meta identifies a non-interactive codex exec run",
+    });
+  });
+
+  test("ordinary interactive metadata remains admitted (missing exec proof fails open)", async () => {
+    const prefix = [
+      JSON.stringify({ type: "session_meta", payload: { id: "interactive-1", source: "vscode", originator: "Claude Code" } }),
+      JSON.stringify({ type: "event_msg", payload: { type: "user_message", message: "real prompt" } }),
+    ].join("\n");
+    expect(codexRolloutCreationEvidence(prefix)).toEqual({
+      subagent: false, hasUserMessage: true, headlessExec: false,
+    });
+    expect(await codexSessionCreationSuppression(
+      "interactive-1", prefix, "/tmp/rollout.jsonl", { hook_event_name: "UserPromptSubmit", prompt: "real prompt" },
     )).toBeNull();
   });
 });

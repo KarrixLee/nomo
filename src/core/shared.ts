@@ -539,6 +539,13 @@ export interface SessionRecord {
    *  process that reads the record but never rebuilds it. The next ordinary hook rewrite drops it, which
    *  is exactly the right lifetime — the card is gone by then. */
   permissionDetailFull?: string;
+  /** APPENDED LAST. Local-only Codex discovery-suppression marker. After a done row's one-hour
+   *  real-event horizon, the watchdog sends op:end but must remember the still-open interactive TUI:
+   *  otherwise process discovery would recreate the retired row on its next five-second pass. The
+   *  marker is a deliberately minimal SessionRecord (no blob/op/full text), with pid === tuiPid, and
+   *  remains only until that TUI exits or a genuine hook rebuilds this file and thereby drops the key.
+   *  It never rides a worker or LAN envelope. */
+  retiredAt?: number;
 }
 
 /** The plaintext a pending-pairing flush needs to POST the pairing session the instant the shared key
