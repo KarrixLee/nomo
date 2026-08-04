@@ -417,10 +417,19 @@ async function runRemoteInput(
      *  requestId-mismatch guard, the deny→interrupt mapping, and the answer→app-server delivery all
      *  behave identically no matter how the blob arrived. */
     const applyAnswerBlob = async (answerBlob: string): Promise<CodexRemoteInputResult> => {
+      // EVERY REJECTION BELOW IS REPORTED. A refused answer releases the hold, which the phone reads as
+      // the card simply flipping back to an unanswerable attention row — indistinguishable from a flap
+      // and, until 2026-08-05, impossible to diagnose because each of these returns was silent. The
+      // messages are deliberately CONTENT-FREE (no question text, no option label, no answer): this
+      // lands in a plaintext local trace, and permission.ts's errorTag discipline applies here too.
+      const reject = (why: string, result: CodexRemoteInputResult): CodexRemoteInputResult => {
+        report(deps, new Error(`Codex phone answer rejected (${why})`), "Codex remote input answer");
+        return result;
+      };
       let answer: PhoneAnswer;
       try { answer = await decryptBlob(deps.config.e2eKey, answerBlob) as PhoneAnswer; }
-      catch { return "transport-error"; }
-      if (answer.requestId !== requestId) return "unsupported";
+      catch { return reject("undecryptable", "transport-error"); }
+      if (answer.requestId !== requestId) return reject("request-id mismatch", "unsupported");
       if (answer.decision === "deny") {
         const result = await deps.interruptAppServer();
         if (result === "sent" || result === "already-sent") {
@@ -430,9 +439,9 @@ async function runRemoteInput(
         await reportUndelivered("deny", result);
         return "transport-error";
       }
-      if (answer.decision !== "answer") return "unsupported";
+      if (answer.decision !== "answer") return reject("unknown decision", "unsupported");
       const mapped = codexAnswersFromPhone(request, answer.answers);
-      if (!mapped) return "unsupported";
+      if (!mapped) return reject("unmappable to the app-server questions", "unsupported");
       const result = await deps.answerAppServer(mapped);
       if (result === "sent" || result === "already-sent") {
         resumed = true;
@@ -448,6 +457,16 @@ async function runRemoteInput(
     // The worker poll below keeps its own cadence untouched — it is the relay's liveness proof.
     const answers = deps.answerStore ?? lanAnswerStore;
     const clock = deps.now ?? Date.now;
+    /** THE STORE IS THIS MACHINE'S AUTHORITY on a request it is holding, and it OUTRANKS whatever the
+     *  worker says about that request. Not a nicety — the two are causally linked: the listener that
+     *  stores a LAN answer also echoes POST /cc/decision/resolve (cc-watchdog's acceptLanAnswer, the
+     *  split-brain backstop that retires the island's buttons when the phone's own worker leg fails),
+     *  and that route flips the record to `superseded`. The phone's answer therefore routinely lands
+     *  while a poll is in flight, and that poll returns TERMINAL for a prompt this process can answer.
+     *  Honouring it dropped the pick on the floor (field 2026-08-05): the hold released, the row fell
+     *  back to the yellow attention frame, and Codex waited forever. `put` is synchronous and strictly
+     *  precedes the echo, so a terminal status caused by our own echo can never outrun this peek. */
+    const localAnswer = (): string | undefined => answers.peek(requestId, clock())?.answerBlob;
 
     let misses = 0;
     let definitiveFailures = 0;
@@ -458,8 +477,8 @@ async function runRemoteInput(
     // healthy network, up to 8s on a tunnel that cannot meet it. See createPollBudget.
     const pollBudget = deps.pollBudget ?? createPollBudget();
     while (!signal.aborted) {
-      const local = answers.peek(requestId, clock());
-      if (local) return await applyAnswerBlob(local.answerBlob);
+      const local = localAnswer();
+      if (local) return await applyAnswerBlob(local);
       polls += 1;
       const budgetMs = pollBudget.next(polls);
       const startedAt = clock();
@@ -498,8 +517,12 @@ async function runRemoteInput(
           definitiveFailures = 0;
           if (data.status === "answered" && typeof data.answerBlob === "string") {
             return await applyAnswerBlob(data.answerBlob); // the shared branch — see applyAnswerBlob
-          } else if (data.status === "expired") return "expired";
-          else if (data.status === "superseded") return "superseded";
+          } else if (data.status === "expired" || data.status === "superseded") {
+            // A TERMINAL worker status is honoured only when the store holds nothing — see localAnswer.
+            const raced = localAnswer();
+            if (raced) return await applyAnswerBlob(raced);
+            return data.status === "expired" ? "expired" : "superseded";
+          }
         }
       } catch {
         misses += 1;

@@ -1465,6 +1465,22 @@ export function acceptLanCommand(command: LanCommand, deps: DrainCommandsDeps = 
 // answer a hold is mid-poll for. The one degraded case the design accepts: the phone's worker leg AND
 // the hold's loopback poll both fail while this echo succeeds — the prompt then falls open to the
 // terminal dialog, which is the fail-open outcome, never a misapplied decision.
+//
+//  - AND IT MUST LOSE THE RACE IT WAS NEVER MEANT TO ENTER (fixed 2026-08-05). The echo above was
+//    written as if the phone's worker leg might win; on a real LAN it never does — this machine is one
+//    hop away and Cloudflare is a round trip — so the echo landed FIRST on essentially every answer and
+//    /v1/cc/decision/resolve stamped the record `superseded` before the phone's own answer could make it
+//    `answered`. Two user-visible lies followed, both reported from the field: the phone's worker leg
+//    came back 409, and the row's worker-authored `decisionState` (which outranks this phone's local
+//    answered-set) rendered "Replaced by a newer request" for the user's OWN successful tap. Waiting
+//    LAN_ANSWER_ECHO_DELAY_MS first costs nothing — the worker's answer route is authoritative and a
+//    resolve on an already-`answered` record is a documented no-op — and makes this what its name always
+//    claimed: a backstop for the failure case, not the first writer in the normal one.
+
+/** How long the echo waits for the phone's own worker leg to settle the record honestly before it steps
+ *  in. Comfortably past a normal answer POST plus its first bounded retry, and far inside the worker's
+ *  ~30 s poll-liveness sweep (the backstop's own backstop, for a watchdog that dies mid-wait). */
+export const LAN_ANSWER_ECHO_DELAY_MS = 5_000;
 
 /** The listener's answer sink. Fire-and-forget: the returned promise is for TESTS ONLY (the listener
  *  wires this in as a void-returning `onAnswer`) and always resolves. */
@@ -1473,15 +1489,25 @@ export function acceptLanAnswer(
   deps: {
     resolveFn?: (config: Config, requestId: string) => Promise<void>;
     trace?: (event: object) => void;
+    /** The backstop's head start for the phone's own worker leg. Tests pass 0. */
+    delayMs?: number;
+    sleep?: (ms: number) => Promise<void>;
   } = {},
 ): Promise<void> {
   try {
     const resolve = deps.resolveFn ?? ((config: Config, requestId: string) => resolveOnRelay(config, requestId, fetch));
-    return resolve(answer.config, answer.requestId).catch(() => {
-      // Best-effort by design: if this echo ALSO fails, the worker's own ~30 s poll-liveness sweep
-      // expires the record. Traced, never surfaced — the daemon's contract is silence.
-      traceFocus(deps, { event: "lan", result: "echo-failed", requestId: answer.requestId });
-    });
+    const delayMs = deps.delayMs ?? LAN_ANSWER_ECHO_DELAY_MS;
+    const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((done) => {
+      const timer = setTimeout(done, ms);
+      timer.unref?.(); // a pending backstop must never hold the watchdog process open
+    }));
+    return (delayMs > 0 ? sleep(delayMs) : Promise.resolve())
+      .then(() => resolve(answer.config, answer.requestId))
+      .catch(() => {
+        // Best-effort by design: if this echo ALSO fails, the worker's own ~30 s poll-liveness sweep
+        // expires the record. Traced, never surfaced — the daemon's contract is silence.
+        traceFocus(deps, { event: "lan", result: "echo-failed", requestId: answer.requestId });
+      });
   } catch {
     return Promise.resolve(); // a malformed sink call must never surface anywhere
   }
@@ -3317,7 +3343,16 @@ async function run(): Promise<void> {
   // up to IDLE_GRACE_MS past this so discovery keeps watching for the next freshly-opened Codex TUI
   // instead of retiring the instant the sessions dir empties (see IDLE_GRACE_MS).
   let lastActiveMs = Date.now();
-  const bridges = createBridgeSupervisor();
+  // THE BRIDGE'S ERRORS GET A HOME. The Codex relay reports every refused phone answer and every
+  // undelivered injection through this sink, and until 2026-08-05 run() passed no `onError` at all — so
+  // a rejected answer released the hold in total silence and looked, from the phone, like the card
+  // flapping on its own. Local-only, best-effort, and content-free by construction (the reporters carry
+  // no question, option or answer text), exactly like every other line in this trace.
+  const bridges = createBridgeSupervisor({
+    onError: (error) => traceSession({
+      event: "bridge", error: error.name, msg: String(error.message ?? "").slice(0, 200),
+    }),
+  });
   activeBridgeShutdown = () => bridges.shutdown();
   // The LAN listener starts only AFTER the single-instance claim: exactly one watchdog per machine may
   // own the socket (and the persisted port in lan.json), and a losing instance returned above without

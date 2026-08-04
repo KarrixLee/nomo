@@ -839,6 +839,49 @@ describe("startCodexRemoteInput — LAN-delivered answers", () => {
     expect(appAnswers).toEqual([]);
   });
 
+  /** A refused answer RELEASES the hold, which the phone can only read as the card flipping back to an
+   *  unanswerable row. That must never be silent — and it must never quote the question, the option or
+   *  the answer into a plaintext local trace. */
+  test("a refused answer is REPORTED, and the report carries no answer content", async () => {
+    const store = createLanAnswerStore();
+    store.put("relay-lan", await encryptBlob(key, {
+      requestId: "relay-lan", decision: "answer", answers: ["Not An Option"],
+    }), NOW);
+    const errors: string[] = [];
+    const { handle } = relay(store, { onError: (error) => { errors.push(error.message); } });
+    expect(await handle.completion).toBe("unsupported");
+    expect(errors).toEqual(["Codex phone answer rejected (unmappable to the app-server questions)"]);
+    expect(errors.join(" ")).not.toContain("Not An Option");
+  });
+
+  /** THE FIELD BUG (2026-08-05). The listener that stores a LAN answer ALSO echoes
+   *  POST /v1/cc/decision/resolve (cc-watchdog's acceptLanAnswer, the split-brain backstop), and that
+   *  route flips the worker record to `superseded`. So the phone's own answer routinely arrives while
+   *  this relay has a GET in flight, and that GET comes back TERMINAL for a request the store can
+   *  answer perfectly well. Honouring the worker there dropped the pick on the floor: the hold released,
+   *  the row fell back to the yellow attention frame, and Codex kept waiting forever. The store is the
+   *  authority on this machine — a terminal worker status may only be honoured when it holds nothing. */
+  for (const status of ["superseded", "expired"] as const) {
+    test(`a store answer that lands mid-poll beats the worker's "${status}"`, async () => {
+      const store = createLanAnswerStore();
+      const blob = await encryptBlob(key, {
+        requestId: "relay-lan", decision: "answer", answers: ["Fast"],
+      });
+      const { handle, appAnswers } = relay(store, {
+        fetchFn: (async (input: string | URL | Request) => {
+          const url = String(input);
+          if (url.endsWith("/v1/cc/decision")) return Response.json({ hold: true });
+          // The listener stores the answer FIRST and only then echoes `resolve` — so by the time the
+          // worker can report a terminal status, this process already holds the phone's answer.
+          store.put("relay-lan", blob, NOW);
+          return Response.json({ status });
+        }) as typeof fetch,
+      });
+      expect(await handle.completion).toBe("answered");
+      expect(appAnswers).toEqual([{ scope: ["Fast"] }]);
+    });
+  }
+
   test("an EXPIRED store entry is ignored — the relay keeps polling the worker as if nothing arrived", async () => {
     const store = createLanAnswerStore();
     store.put("relay-lan", await encryptBlob(key, {

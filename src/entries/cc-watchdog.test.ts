@@ -8,7 +8,7 @@ import { createLanAnswerStore } from "../core/lan-listener";
 import type { DecisionHold, PlanPickerTraceDecision, SessionRecord } from "../core/shared";
 import { GONE_STRIKE_LIMIT, readGoneStrikes, recordGoneStrike, resetGoneStrikes, tracePlanPickerDecision } from "../core/shared";
 import {
-  acceptLanAnswer, acceptLanCommand, enqueueDrainCommands, LAN_COMMAND_ID_PREFIX,
+  acceptLanAnswer, acceptLanCommand, enqueueDrainCommands, LAN_ANSWER_ECHO_DELAY_MS, LAN_COMMAND_ID_PREFIX,
   buildDoneEnvelope, buildEndEnvelope, buildHeartbeatEnvelope, buildNeedsAttentionEnvelope, buildProvisionalBlob,
   buildProvisionalEnvelope, buildProvisionalRecord, buildStartEnvelope, buildTitleRepairEnvelope, classifySession,
   claudeTailPendingApproval, codexLastTurnEvent, codexTailPendingApproval, correctIdleClaude, correctInterrupt,
@@ -3365,7 +3365,7 @@ describe("acceptLanAnswer (the worker echo after a LAN-delivered answer)", () =>
     }) as unknown as typeof fetch;
     // resolveFn is the seam; the default is the SAME resolveOnRelay the Codex relay uses, so the shape
     // asserted here is the shape that ships.
-    await acceptLanAnswer(delivery(), { resolveFn: (config, requestId) => resolveOnRelay(config, requestId, fetchFn) });
+    await acceptLanAnswer(delivery(), { delayMs: 0, resolveFn: (config, requestId) => resolveOnRelay(config, requestId, fetchFn) });
 
     expect(calls).toHaveLength(1);
     expect(calls[0].url).toBe("https://w.test/v1/cc/decision/resolve");
@@ -3384,7 +3384,7 @@ describe("acceptLanAnswer (the worker echo after a LAN-delivered answer)", () =>
     for (const status of [404, 410]) {
       const urls: string[] = [];
       const fetchFn = (async (url: string) => { urls.push(url); return new Response("", { status }); }) as unknown as typeof fetch;
-      await acceptLanAnswer(delivery(), { resolveFn: (config, requestId) => resolveOnRelay(config, requestId, fetchFn) });
+      await acceptLanAnswer(delivery(), { delayMs: 0, resolveFn: (config, requestId) => resolveOnRelay(config, requestId, fetchFn) });
       expect(urls).toEqual(["https://w.test/v1/cc/decision/resolve"]);
     }
   });
@@ -3392,6 +3392,7 @@ describe("acceptLanAnswer (the worker echo after a LAN-delivered answer)", () =>
   test("a failing echo resolves silently (traced, never thrown) — the worker's 30 s sweep is the backstop", async () => {
     const traces: Array<Record<string, unknown>> = [];
     await acceptLanAnswer(delivery(), {
+      delayMs: 0,
       resolveFn: async () => { throw new Error("network gone"); },
       trace: (e) => traces.push(e as Record<string, unknown>),
     });
@@ -3399,7 +3400,30 @@ describe("acceptLanAnswer (the worker echo after a LAN-delivered answer)", () =>
   });
 
   test("a synchronously throwing resolver cannot surface into the listener's request handler", () => {
-    expect(() => acceptLanAnswer(delivery(), { resolveFn: () => { throw new Error("boom"); } })).not.toThrow();
+    expect(() => acceptLanAnswer(delivery(), { delayMs: 0, resolveFn: () => { throw new Error("boom"); } })).not.toThrow();
+  });
+
+  /** THE ECHO IS A BACKSTOP, NOT THE FIRST WRITER (field 2026-08-05). It used to fire the instant the
+   *  answer landed, which on a real LAN is always before the phone's own worker leg can land — so
+   *  /v1/cc/decision/resolve stamped `superseded` on the user's OWN answer, the phone's worker leg came
+   *  back 409, and the row read "Replaced by a newer request" for a tap that had just succeeded. */
+  test("the echo gives the phone's own worker leg a head start before it fires", async () => {
+    const order: string[] = [];
+    let released!: () => void;
+    const waited = new Promise<void>((resolve) => { released = resolve; });
+    const echo = acceptLanAnswer(delivery(), {
+      sleep: (ms) => { order.push(`slept:${ms}`); return waited; },
+      resolveFn: async () => { order.push("resolve"); },
+    });
+    expect(order).toEqual([`slept:${LAN_ANSWER_ECHO_DELAY_MS}`]); // nothing has been echoed yet
+    released();
+    await echo;
+    expect(order).toEqual([`slept:${LAN_ANSWER_ECHO_DELAY_MS}`, "resolve"]);
+  });
+
+  test("the default head start is a real, bounded wait (not zero, not forever)", () => {
+    expect(LAN_ANSWER_ECHO_DELAY_MS).toBeGreaterThan(0);
+    expect(LAN_ANSWER_ECHO_DELAY_MS).toBeLessThan(30_000); // inside the worker's poll-liveness sweep
   });
 });
 
