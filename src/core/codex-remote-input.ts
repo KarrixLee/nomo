@@ -10,10 +10,10 @@ import type { LanAnswerStore } from "./lan-listener";
 // The relay's timing/give-up rules, shared verbatim with the Claude permission hook (permission.ts),
 // which polls the SAME route with the same credentials — see decision-poll.ts.
 import {
-  DEFINITIVE_POLL_STATUSES, MAX_CONSECUTIVE_MISSES, MAX_DEFINITIVE_POLL_FAILURES,
-  POLL_FIRST_CONTACT_TIMEOUT_MS, POLL_INTERVAL_MS,
-  POLL_TIMEOUT_MS, POST_MAX_ATTEMPTS, POST_RETRY_PAUSE_MS,
+  createPollBudget, DEFINITIVE_POLL_STATUSES, MAX_CONSECUTIVE_MISSES, MAX_DEFINITIVE_POLL_FAILURES,
+  POLL_INTERVAL_MS, POST_MAX_ATTEMPTS, POST_RETRY_PAUSE_MS,
 } from "./decision-poll";
+import type { PollBudget } from "./decision-poll";
 import {
   BLOB_FIT_CHARS, buildPermissionQuestions, buildPermissionSummary, capPermissionWireText,
   fitPermissionDetail, PERMISSION_QUESTION_LABEL_MAX,
@@ -63,6 +63,11 @@ export interface CodexRemoteInputDeps {
    *  spot instead of waiting for the next 3 s worker tick. Defaults to the process-wide singleton the
    *  listener writes; tests inject their own. */
   answerStore?: LanAnswerStore;
+  /** This relay's own latency estimate for /v1/cc/decision, which sizes every steady-state poll's
+   *  ceiling (see createPollBudget). Defaults to a fresh per-request estimator; injected by tests, which
+   *  is also the only way to OBSERVE the budget here — unlike the permission hook, the relay has no
+   *  trace file to write it to. */
+  pollBudget?: PollBudget;
   /** Local `.hold` marker lifecycle for the LAN state feed. This relay lives in the watchdog, so its
    *  owner pid is the watchdog's own pid (unlike permission.ts's short-lived hook process). */
   writeHoldFn?: (sessionId: string, hold: DecisionHold) => Promise<void>;
@@ -447,23 +452,31 @@ async function runRemoteInput(
     let misses = 0;
     let definitiveFailures = 0;
     let polls = 0;
+    // The SAME adaptive per-fetch ceiling the permission hook polls on, and for the same reason: first
+    // contact pays a proxy/tunnel's DNS + connect + TLS setup on the v1.6.6 floor, and every poll after
+    // it is bounded by what THIS relay's own completed round trips actually cost — the tight 2s on a
+    // healthy network, up to 8s on a tunnel that cannot meet it. See createPollBudget.
+    const pollBudget = deps.pollBudget ?? createPollBudget();
     while (!signal.aborted) {
       const local = answers.peek(requestId, clock());
       if (local) return await applyAnswerBlob(local.answerBlob);
+      polls += 1;
+      const budgetMs = pollBudget.next(polls);
+      const startedAt = clock();
       try {
-        // FIRST CONTACT gets the bigger ceiling (NOM-45), exactly as in the permission hook: the first
-        // GET pays a proxy/tunnel's DNS + connect + TLS setup that the steady-state 2s was never sized
-        // for. Every poll after it keeps the tight cadence and ceiling.
-        polls += 1;
         const response = await fetchFn(`${deps.config.url}/v1/cc/decision/${requestId}`, {
           headers,
-          signal: requestSignal(polls === 1 ? POLL_FIRST_CONTACT_TIMEOUT_MS : POLL_TIMEOUT_MS, signal),
+          signal: requestSignal(budgetMs, signal),
         });
         // An unreadable 200 counts as a miss exactly like a non-2xx, so a relay that answers with
         // garbage forever still trips MAX_CONSECUTIVE_MISSES instead of polling until the heat death.
         const data = response.ok
           ? await parseJson<{ status?: unknown; answerBlob?: unknown }>(response)
           : undefined;
+        // A response ARRIVED, body and all — ok or not, the transport cost is a real measurement, and the
+        // budget it must fit under covers the body read too (the abort signal does). A THROW is never fed
+        // (see PollBudget.observe): it measures nothing and must not inflate the give-up clock.
+        pollBudget.observe(clock() - startedAt);
         if (!data) {
           misses += 1;
           if (response.ok) report(deps, new Error("Unparseable relay poll response"), "Relay poll");

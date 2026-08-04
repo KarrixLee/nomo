@@ -5,8 +5,10 @@
 // while the phone decides; otherwise it falls straight through to the normal terminal dialog.
 //
 // CONTRACT — this module DELIBERATELY breaks the plugin's "2s, never block" rule that every other
-// entry keeps (see hook.ts:12-14 and cc-watchdog.ts's header). Every STEADY-STATE poll fetch still has a
-// 2s ceiling, first contact gets a bigger one for the proxy/tunnel handshake (POST 6s, first GET 4s —
+// entry keeps (see hook.ts:12-14 and cc-watchdog.ts's header). Every STEADY-STATE poll fetch is still
+// BOUNDED — at 2s on a healthy network, and at whatever this process's own measured round trips say it
+// must be (≤8s) on a slow one; see createPollBudget. First contact gets a bigger one for the
+// proxy/tunnel handshake (POST 6s, first GET 4s —
 // so a dead network costs ~10s BEFORE the dialog, never the ~33s
 // the old 15s×2 ceiling cost — see POST_FIRST_CONTACT_TIMEOUT_MS), but the TOTAL wait ONCE A HOLD IS
 // GRANTED is unbounded: the hook polls until the phone answers, the request is
@@ -37,9 +39,8 @@ import { b64url, decryptBlob, deriveLanKey, encryptBlob } from "./crypto";
 // polls the SAME route with the same credentials. See decision-poll.ts for what is deliberately NOT
 // shared — the first-contact POST ceiling, which each caller bounds by what IT blocks.
 import {
-  DEFINITIVE_POLL_STATUSES, MAX_CONSECUTIVE_MISSES, MAX_DEFINITIVE_POLL_FAILURES,
-  POLL_FIRST_CONTACT_TIMEOUT_MS, POLL_INTERVAL_MS,
-  POLL_TIMEOUT_MS, POST_MAX_ATTEMPTS, POST_RETRY_PAUSE_MS,
+  createPollBudget, DEFINITIVE_POLL_STATUSES, MAX_CONSECUTIVE_MISSES, MAX_DEFINITIVE_POLL_FAILURES,
+  POLL_INTERVAL_MS, POLL_JITTER_MAX_MS, POST_MAX_ATTEMPTS, POST_RETRY_PAUSE_MS,
 } from "./decision-poll";
 // The PURE wire contract only — deliberately NOT "./lan-listener": this hook is a short-lived process
 // spawned on every permission prompt and must not bundle (or load node:http for) an HTTP server it can
@@ -77,7 +78,8 @@ export { BLOB_FIT_CHARS, NO_HOLD_PATH, sealedBlobChars };
  *  proxy's own DNS + connect + TLS setup, and when it stalls it stalls for SECONDS. At 4s the whole
  *  first-contact leg — POST *and* the 2s did-it-land probe — timed out on a hold the phone was already
  *  showing, so the Mac fell open while the phone kept a yellow hand nobody could answer. 6s buys the
- *  handshake; the steady-state poll cadence and its 2s ceiling are untouched (see POLL_TIMEOUT_MS).
+ *  handshake; the steady-state poll cadence is untouched, and its ceiling now sizes itself from the same
+ *  handshake this budget paid for (see POLL_TIMEOUT_MS / createPollBudget).
  *
  *  WORST-CASE PRE-DIALOG BLOCK, stalled network: POST_FIRST_CONTACT_TIMEOUT_MS (6s) +
  *  POLL_FIRST_CONTACT_TIMEOUT_MS (4s did-it-land probe) = 10s, because a TIMEOUT is never retried (see
@@ -1477,31 +1479,49 @@ export async function runPermissionHook(
       return { posted, hold, reason };
     };
 
+    // The wall clock this hold measures its own round trips with. Wall, not monotonic, because `deps.now`
+    // is the ONE clock seam this hook has and tests drive it; a backwards NTP step is discarded by
+    // PollBudget.observe and a forward one is a single outlier its median window shrugs off.
+    const clock = deps.now ?? Date.now;
+    /** This process's own latency estimate for /v1/cc/decision — ONE per hold, shared by the did-it-land
+     *  probe and every poll of the hold loop, because they are the same route over the same connection. */
+    const pollBudget = createPollBudget();
+
     // ONE poll GET of this request's decision record. Shared by the post-timeout probe below and the hold
     // loop so both read the record exactly the same way. Returns the parsed body (only on a 2xx) plus the
     // HTTP status (0 = the fetch threw/timed out) — never throws.
     const pollDecision = async (seq: number): Promise<{ data?: { status?: string; answerBlob?: string }; status: number }> => {
-      // FIRST CONTACT gets the bigger budget (NOM-45): seq 0 is the did-it-land probe after a POST that
-      // already stalled, and seq 1 is the freshly granted hold's first GET — both are the FIRST fetch
-      // this short-lived process completes on this route, so both pay the proxy/tunnel handshake the
-      // steady-state 2s ceiling was never sized for. Every poll from seq 2 on keeps the tight 2s.
-      const budgetMs = seq <= 1 ? POLL_FIRST_CONTACT_TIMEOUT_MS : POLL_TIMEOUT_MS;
+      // THE BUDGET IS MEASURED, NOT ASSUMED. seq 0/1 are the FIRST fetch this short-lived process makes
+      // on this route (the did-it-land probe after a stalled POST, and a freshly granted hold's first
+      // GET), so they pay the proxy/tunnel handshake on the v1.6.6 first-contact floor with nothing yet
+      // measured. From seq 2 on the ceiling is sized from what THIS process's own completed round trips
+      // cost — a healthy Mac stays at the tight 2 s, a tunnel that answers in 3 s gets a budget it can
+      // actually meet. See createPollBudget.
+      const budgetMs = pollBudget.next(seq);
       // poll-begin/poll-end straddle the fetch so an abort or kill MID-FETCH is visible: a begin with
       // no matching end means the process died inside the GET (the prime suspect for a hold that
       // never completes its first poll). `budgetMs` rides along so a trace of consecutive TimeoutErrors
-      // says which ceiling each one hit.
+      // says which ceiling each one hit — and now also which ceiling the measurements bought.
       trace({ event: "poll-begin", seq, budgetMs });
+      const startedAt = clock();
+      // ONE completed round trip = one measurement, ok or not: a 429 or a 5xx still paid the whole
+      // transport cost. A THROW measures nothing (see PollBudget.observe) and is deliberately not fed.
+      const measure = (): number => {
+        const ms = clock() - startedAt;
+        pollBudget.observe(ms);
+        return ms;
+      };
       try {
         const res = await fetchFn(`${config.url}/v1/cc/decision/${requestId}`, {
           headers: pcHeaders,
           signal: AbortSignal.timeout(budgetMs),
         });
         if (!res.ok) {
-          trace({ event: "poll-end", seq, outcome: "status", status: res.status });
+          trace({ event: "poll-end", seq, outcome: "status", status: res.status, ms: measure() });
           return { status: res.status };
         }
         const data = (await res.json()) as { status?: string; answerBlob?: string };
-        trace({ event: "poll-end", seq, outcome: "ok" });
+        trace({ event: "poll-end", seq, outcome: "ok", ms: measure() });
         return { data, status: res.status };
       } catch (e) { // transient — counted by the caller, kept polling until the cap
         trace({ event: "poll-end", seq, outcome: "error", ...errorTag(e) });
@@ -1672,9 +1692,9 @@ export async function runPermissionHook(
     };
 
     // HOLD: poll until the phone answers, the request leaves "pending", sustained failure trips the
-    // give-up cap, or we're killed. Each fetch keeps its own 2s ceiling; transient failures are
+    // give-up cap, or we're killed. Each fetch keeps its own measured ceiling; transient failures are
     // tolerated (keep polling). A decrypt failure or requestId mismatch exits silently (fail open).
-    const jitter = deps.jitter ?? (() => Math.floor(Math.random() * 500));
+    const jitter = deps.jitter ?? (() => Math.floor(Math.random() * POLL_JITTER_MAX_MS));
     const interval = deps.pollIntervalMs ?? POLL_INTERVAL_MS;
     const emit = deps.emit ?? ((line: string) => process.stdout.write(`${line}\n`));
 

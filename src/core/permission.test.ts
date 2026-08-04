@@ -9,7 +9,8 @@ import {
   POST_FIRST_CONTACT_TIMEOUT_MS,
 } from "./permission";
 import {
-  MAX_CONSECUTIVE_MISSES, POLL_FIRST_CONTACT_TIMEOUT_MS, POLL_TIMEOUT_MS,
+  createPollBudget, MAX_CONSECUTIVE_MISSES, POLL_FIRST_CONTACT_TIMEOUT_MS,
+  POLL_TIMEOUT_CEILING_MS, POLL_TIMEOUT_MS,
 } from "./decision-poll";
 import { encryptBlob, decryptBlob } from "./crypto";
 import { createLanAnswerStore, createLanListener } from "./lan-listener";
@@ -767,6 +768,12 @@ describe("runPermissionHook — hold state machine", () => {
     expect(calls.filter((c) => c.method === "GET").length).toBe(MAX_CONSECUTIVE_MISSES);
     expect(events.find((e) => e.event === "giveup")).toMatchObject({ stalled: true });
     expect(events.at(-1)).toMatchObject({ event: "exit", reason: "giveup" });
+    // …AND THE GIVE-UP CLOCK IS UNCHANGED BY THE ADAPTIVE BUDGET. A poll that THROWS measures nothing, so
+    // it never feeds the estimator: a network that produces no completed round trip cannot inflate its
+    // own ceiling, and the fail-open stays ~100 × (2 s + 3 s) rather than stretching to ~100 × (8 s + 3 s).
+    expect(events.filter((e) => e.event === "poll-begin").map((e) => e.budgetMs))
+      .toEqual([POLL_FIRST_CONTACT_TIMEOUT_MS,
+        ...Array<number>(MAX_CONSECUTIVE_MISSES - 1).fill(POLL_TIMEOUT_MS)]);
     // …and the row the phone keeps is now legible as auto-retrying rather than answerable.
     expect(probe.patches).toHaveLength(1);
     expect(await stallOf(probe.patches[0]))
@@ -1021,9 +1028,52 @@ describe("runPermissionHook — hold state machine", () => {
     const budgets = events.filter((e) => e.event === "poll-begin").map((e) => [e.seq, e.budgetMs]);
     expect(budgets).toEqual([
       [1, POLL_FIRST_CONTACT_TIMEOUT_MS],                         // the freshly granted hold's first GET
-      [2, POLL_TIMEOUT_MS],
+      [2, POLL_TIMEOUT_MS],                                       // instant round trips → the snappy floor
       [3, POLL_TIMEOUT_MS],
     ]);
+  });
+
+  // The v1.6.6 premise — "in steady state the connection is already established, so 2 s is generous" —
+  // is false through the user's tunnel. Field trace 2026-08-04: seq 1 SUCCEEDED in 3306 ms on the new 4 s
+  // first-contact budget, then seq 2/3/4/5 all timed out on the 2 s steady-state one. The hold died
+  // before the user could answer. The first contact that succeeded IS the measurement that should have
+  // sized the ones after it.
+  test("a SLOW measured round trip sizes every LATER poll — the field trace's 3306 ms is the probe", async () => {
+    const answerBlob = await encryptBlob(KEY, { requestId: "req-fixed", decision: "allow", ts: 5 });
+    const events: Array<{ event: string; seq?: number; budgetMs?: number; ms?: number }> = [];
+    const emitted: string[] = [];
+    let clock = 1_000;
+    let gets = 0;
+    const fn = (async (url: string) => {
+      if (url.endsWith("/v1/cc/decision")) return new Response(JSON.stringify({ hold: true }), { status: 200 });
+      gets += 1;
+      clock += 3_306;                                             // the tunnel's real cost, per GET
+      return new Response(JSON.stringify(
+        gets >= 3 ? { status: "answered", answerBlob } : { status: "pending" }), { status: 200 });
+    }) as unknown as typeof fetch;
+    await runPermissionHook(baseDeps({
+      fetchFn: fn, emit: (l: string) => emitted.push(l), now: () => clock,
+      trace: (e: { event: string; seq?: number; budgetMs?: number; ms?: number }) => events.push(e),
+    }) as never);
+
+    expect(emitted).toEqual([ALLOW]);                             // the answer LANDS instead of timing out
+    expect(events.filter((e) => e.event === "poll-begin").map((e) => [e.seq, e.budgetMs])).toEqual([
+      [1, POLL_FIRST_CONTACT_TIMEOUT_MS],                         // nothing measured yet
+      [2, POLL_TIMEOUT_CEILING_MS],                               // 3 × 3306 ms, clamped at the ceiling
+      [3, POLL_TIMEOUT_CEILING_MS],
+    ]);
+    // …and the measurement itself is on the record, so a field trace shows what bought the budget.
+    expect(events.filter((e) => e.event === "poll-end").map((e) => e.ms)).toEqual([3_306, 3_306, 3_306]);
+  });
+
+  test("a single slow poll does not pin the ceiling — a recovered network drops back to 2 s", async () => {
+    // Drive the estimator through the same seam the hook does, with the hook's own seq numbering.
+    const budget = createPollBudget();
+    expect(budget.next(1)).toBe(POLL_FIRST_CONTACT_TIMEOUT_MS);
+    for (let i = 0; i < 5; i += 1) budget.observe(90);            // a healthy warm round trip
+    expect(budget.next(2)).toBe(POLL_TIMEOUT_MS);
+    budget.observe(9_000);                                        // ONE hiccup
+    expect(budget.next(2)).toBe(POLL_TIMEOUT_MS);
   });
 
   test("the did-it-land probe (seq 0) is first contact too — it IS this process's first GET", async () => {

@@ -2,6 +2,9 @@ import { describe, expect, test } from "bun:test";
 import { decryptBlob, encryptBlob } from "./crypto";
 import { codexAnswersFromPhone, startCodexRemoteInput } from "./codex-remote-input";
 import type { CodexRemoteInputDeps } from "./codex-remote-input";
+import {
+  createPollBudget, POLL_FIRST_CONTACT_TIMEOUT_MS, POLL_TIMEOUT_CEILING_MS, POLL_TIMEOUT_MS,
+} from "./decision-poll";
 import { createLanAnswerStore, LAN_ANSWER_TTL_MS } from "./lan-listener";
 import type { LanAnswerStore } from "./lan-listener";
 import type { CodexUserInputRequest } from "./codex-app-server-client";
@@ -204,6 +207,85 @@ describe("startCodexRemoteInput", () => {
     const fallback = await decryptBlob(key, posted.fallbackBlob as string) as Record<string, unknown>;
     expect(fallback.status).toBe("needsAttention");
     expect(fallback).not.toHaveProperty("permissionQuestions");
+  });
+
+  // Same route, same credentials, same tunnel — so the same adaptive ceiling as the permission hook.
+  // Without it the Codex channel reproduces the 2026-08-04 field failure on its own: a first contact
+  // that succeeds in 3306 ms followed by steady-state GETs bounded at 2 s, every one of them doomed.
+  test("the relay's poll ceiling is sized by its OWN round trips, first-contact floor first", async () => {
+    const answerBlob = await encryptBlob(key, {
+      requestId: "relay-slow", decision: "answer", answers: ["Fast"],
+    });
+    const budgets: number[] = [];
+    const estimator = createPollBudget();
+    const pollBudget = {
+      next: (seq: number) => { const ms = estimator.next(seq); budgets.push(ms); return ms; },
+      observe: (ms: number) => estimator.observe(ms),
+    };
+    let clock = 1_000;
+    let gets = 0;
+    const fetchFn = async (input: string | URL | Request): Promise<Response> => {
+      const url = String(input);
+      if (url.endsWith("/v1/cc/decision")) return Response.json({ hold: true });
+      gets += 1;
+      clock += 3_306;                                   // the field trace's real tunnel round trip
+      return Response.json(gets >= 3 ? { status: "answered", answerBlob } : { status: "pending" });
+    };
+    const handle = startCodexRemoteInput(request(), {
+      config,
+      fetchFn: fetchFn as typeof fetch,
+      readRecordFn: async () => record,
+      randomUUID: () => "relay-slow",
+      now: () => clock,
+      localApprovalsStateFn: async () => "on",
+      sleep: async () => {},
+      pollBudget,
+      answerAppServer: async () => "sent",
+      interruptAppServer: async () => "sent",
+    });
+
+    expect(await handle.completion).toBe("answered");
+    expect(budgets).toEqual([
+      POLL_FIRST_CONTACT_TIMEOUT_MS,                    // poll 1 — nothing measured yet
+      POLL_TIMEOUT_CEILING_MS,                          // 3 × 3306 ms, clamped
+      POLL_TIMEOUT_CEILING_MS,
+    ]);
+  });
+
+  test("a healthy relay keeps the snappy 2 s steady-state ceiling", async () => {
+    const answerBlob = await encryptBlob(key, {
+      requestId: "relay-fast", decision: "answer", answers: ["Fast"],
+    });
+    const budgets: number[] = [];
+    const estimator = createPollBudget();
+    const pollBudget = {
+      next: (seq: number) => { const ms = estimator.next(seq); budgets.push(ms); return ms; },
+      observe: (ms: number) => estimator.observe(ms),
+    };
+    let clock = 1_000;
+    let gets = 0;
+    const fetchFn = async (input: string | URL | Request): Promise<Response> => {
+      const url = String(input);
+      if (url.endsWith("/v1/cc/decision")) return Response.json({ hold: true });
+      gets += 1;
+      clock += 87;                                      // measured warm round trip to api.nomo.gg
+      return Response.json(gets >= 3 ? { status: "answered", answerBlob } : { status: "pending" });
+    };
+    const handle = startCodexRemoteInput(request(), {
+      config,
+      fetchFn: fetchFn as typeof fetch,
+      readRecordFn: async () => record,
+      randomUUID: () => "relay-fast",
+      now: () => clock,
+      localApprovalsStateFn: async () => "on",
+      sleep: async () => {},
+      pollBudget,
+      answerAppServer: async () => "sent",
+      interruptAppServer: async () => "sent",
+    });
+
+    expect(await handle.completion).toBe("answered");
+    expect(budgets).toEqual([POLL_FIRST_CONTACT_TIMEOUT_MS, POLL_TIMEOUT_MS, POLL_TIMEOUT_MS]);
   });
 
   test("description pressure sheds d and still relays a working bare-label picker", async () => {
