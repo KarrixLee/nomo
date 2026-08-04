@@ -96,9 +96,19 @@ function deferred<T>() {
   return { promise, resolve, reject };
 }
 
+async function drainRequests(): Promise<void> {
+  await Promise.resolve();
+  await Promise.resolve();
+}
+
 /** `retirement` models the in-flight POST /cc/decision/resolve: until it settles, the phone still shows
  *  a live card. `resolved` counts retirement STARTS, `retired` counts COMPLETIONS. */
-function harness(options: { retirement?: () => Promise<void> } = {}) {
+function harness(options: {
+  retirement?: () => Promise<void>;
+  fallbackOwnsRequest?: (request: CodexUserInputRequest) => Promise<boolean>;
+  markThreadReady?: (threadId: string) => Promise<void>;
+  clearThreadReady?: (threadId: string) => Promise<void>;
+} = {}) {
   let client!: FakeClient;
   const errors: Error[] = [];
   const handles: {
@@ -111,6 +121,9 @@ function harness(options: { retirement?: () => Promise<void> } = {}) {
   }[] = [];
   const bridge = new CodexRemoteInputBridge(config, {
     onError: (error) => errors.push(error),
+    fallbackOwnsRequestFn: options.fallbackOwnsRequest,
+    markThreadReadyFn: options.markThreadReady,
+    clearThreadReadyFn: options.clearThreadReady,
     createClient: (callbacks) => (client = new FakeClient(callbacks)),
     startRemoteInputFn: (incoming, deps): CodexRemoteInputHandle => {
       const completion = deferred<CodexRemoteInputResult>();
@@ -145,6 +158,18 @@ function harness(options: { retirement?: () => Promise<void> } = {}) {
 }
 
 describe("CodexRemoteInputBridge", () => {
+  test("a matching fallback claim suppresses the bridge, including duplicate app-server delivery", async () => {
+    let claims = 0;
+    const h = harness({ fallbackOwnsRequest: async () => { claims += 1; return true; } });
+    await h.bridge.start();
+    h.client().callbacks.onUserInputRequest(request);
+    h.client().callbacks.onUserInputRequest(request);
+    await drainRequests();
+    expect(claims).toBe(1);
+    expect(h.handles).toHaveLength(0);
+    await h.bridge.stop();
+  });
+
   test("maps 0.146.0 waiting, idle/composer, and query failure without guessing", async () => {
     const h = harness();
     await h.bridge.start();
@@ -174,11 +199,28 @@ describe("CodexRemoteInputBridge", () => {
     await h.bridge.stop();
   });
 
+  test("publishes, renews, and clears per-thread bridge readiness leases", async () => {
+    const marked: string[] = [];
+    const cleared: string[] = [];
+    const h = harness({
+      markThreadReady: async (threadId) => { marked.push(threadId); },
+      clearThreadReady: async (threadId) => { cleared.push(threadId); },
+    });
+    h.client().pages.push({ data: ["thread-1"], nextCursor: null });
+    await h.bridge.start();
+    h.client().pages.push({ data: ["thread-1"], nextCursor: null });
+    await h.bridge.refreshSubscriptions();
+    expect(marked).toEqual(["thread-1", "thread-1"]);
+    await h.bridge.stop();
+    expect(cleared).toContain("thread-1");
+  });
+
   test("starts one relay request and answers the exact app-server identity", async () => {
     const h = harness();
     await h.bridge.start();
     h.client().callbacks.onUserInputRequest(request);
     h.client().callbacks.onUserInputRequest(request);
+    await drainRequests();
     expect(h.handles).toHaveLength(1);
     expect(h.handles[0].request).toEqual(request);
 
@@ -196,12 +238,14 @@ describe("CodexRemoteInputBridge", () => {
     const h = harness();
     await h.bridge.start();
     h.client().callbacks.onUserInputRequest(request);
+    await drainRequests();
     h.client().callbacks.onUserInputResolved(request, "server-cleared");
     await Promise.resolve();
     expect(h.handles[0].resolved).toBe(1);
 
     const replay = { ...request, identity: { ...request.identity, connectionEpoch: 3 } };
     h.client().callbacks.onUserInputRequest(replay);
+    await drainRequests();
     h.client().callbacks.onUserInputResolved(replay, "connection-lost");
     await Promise.resolve();
     expect(h.handles[1].resolved).toBe(1);
@@ -216,6 +260,7 @@ describe("CodexRemoteInputBridge", () => {
       const h = harness();
       await h.bridge.start();
       h.client().callbacks.onUserInputRequest(request);
+      await drainRequests();
       h.handles[0].completion.reject(new Error("relay task blew up"));
       // Let the microtask queue drain twice; an unhandled rejection is reported on the next tick.
       await new Promise<void>((resolve) => setTimeout(resolve, 10));
@@ -224,6 +269,7 @@ describe("CodexRemoteInputBridge", () => {
       expect(unhandled).toEqual([]);
       // The handle is still evicted, so the same request id can start a fresh relay task.
       h.client().callbacks.onUserInputRequest(request);
+      await drainRequests();
       expect(h.handles).toHaveLength(2);
       await h.bridge.stop();
     } finally {
@@ -246,6 +292,7 @@ describe("CodexRemoteInputBridge", () => {
     const second = { ...request, identity: { ...request.identity, itemId: "item-2" } };
     h.client().callbacks.onUserInputRequest(request);
     h.client().callbacks.onUserInputRequest(second);
+    await drainRequests();
     expect(h.handles).toHaveLength(2);
     h.client().resolveOnStop.push(second); // the disconnect resolves this one from inside client.stop()
 
@@ -273,6 +320,7 @@ describe("CodexRemoteInputBridge", () => {
     const h = harness();
     await h.bridge.start();
     h.client().callbacks.onUserInputRequest(request);
+    await drainRequests();
     h.client().callbacks.onUserInputResolved(request, "interrupt-sent");
     await Promise.resolve();
     expect(h.handles[0].resolved).toBe(0);

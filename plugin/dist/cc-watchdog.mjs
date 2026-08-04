@@ -2,7 +2,7 @@ import { createRequire } from "node:module";
 var __require = /* @__PURE__ */ createRequire(import.meta.url);
 
 // src/entries/cc-watchdog.ts
-import { readdir as readdir4, readFile as readFile7, unlink as unlink4 } from "node:fs/promises";
+import { readdir as readdir4, readFile as readFile8, unlink as unlink5 } from "node:fs/promises";
 import { readFileSync as readFileSync2, statSync as statSync3, unlinkSync } from "node:fs";
 import { hostname as hostname4 } from "node:os";
 import { basename as basename5 } from "node:path";
@@ -4614,7 +4614,7 @@ var DEFINITIVE_POLL_STATUSES = new Set([401, 403, 404, 410]);
 var MAX_DEFINITIVE_POLL_FAILURES = 2;
 
 // src/core/permission.ts
-import { readFile as readFile6, realpath, unlink as unlink3 } from "node:fs/promises";
+import { readFile as readFile7, realpath, unlink as unlink4 } from "node:fs/promises";
 import { appendFileSync as appendFileSync2, statSync as statSync2, truncateSync as truncateSync2 } from "node:fs";
 import { hostname as hostname2 } from "node:os";
 import { basename as basename4, isAbsolute, relative, resolve } from "node:path";
@@ -5159,6 +5159,169 @@ async function runHook(agent) {
   } catch {}
 }
 
+// src/core/codex-user-input-arbitration.ts
+import { createHash as createHash2 } from "node:crypto";
+import { readFile as readFile6, unlink as unlink3 } from "node:fs/promises";
+
+// src/core/codex-user-input-shape.ts
+var ANSWER_MAX = 500;
+var OPTION_LABEL_WIRE_MAX = 60;
+function capLabel(value) {
+  const characters = Array.from(value);
+  return characters.length <= OPTION_LABEL_WIRE_MAX ? value : `${characters.slice(0, OPTION_LABEL_WIRE_MAX - 1).join("")}…`;
+}
+function renderableCodexUserInput(toolInput) {
+  const rawQuestions = toolInput.questions;
+  if (!Array.isArray(rawQuestions) || rawQuestions.length < 1 || rawQuestions.length > 3)
+    return;
+  const questions = [];
+  for (const raw of rawQuestions) {
+    if (!raw || raw.isSecret === true || typeof raw.question !== "string" || raw.question.length === 0) {
+      return;
+    }
+    if (!Array.isArray(raw.options) || raw.options.length === 0)
+      return;
+    const options = [];
+    const labels = [];
+    for (const candidate of raw.options) {
+      const option = candidate;
+      if (!option || typeof option.label !== "string" || option.label.length === 0)
+        return;
+      const label = option.label;
+      if (label !== label.trim() || label.length > ANSWER_MAX)
+        return;
+      labels.push(label);
+      options.push({
+        label,
+        description: typeof option.description === "string" ? option.description : ""
+      });
+    }
+    if (new Set(labels).size !== labels.length)
+      return;
+    if (new Set(labels.map(capLabel)).size !== labels.length)
+      return;
+    questions.push({
+      question: raw.question,
+      ...typeof raw.header === "string" ? { header: raw.header } : {},
+      multiSelect: false,
+      options
+    });
+  }
+  return { questions };
+}
+
+// src/core/codex-user-input-arbitration.ts
+var CODEX_INPUT_BRIDGE_SUFFIX = ".input-bridge";
+var CODEX_INPUT_FALLBACK_SUFFIX = ".input-fallback";
+var CODEX_INPUT_BRIDGE_LEASE_MS = 15000;
+var CODEX_INPUT_FALLBACK_TTL_MS = 600000;
+var CODEX_INPUT_BRIDGE_WAIT_MS = 750;
+var BRIDGE_WAIT_STEP_MS = 50;
+function bridgePath(sessionsDir, sessionId) {
+  return `${sessionsDir}/${sessionId}${CODEX_INPUT_BRIDGE_SUFFIX}`;
+}
+function fallbackPath(sessionsDir, sessionId) {
+  return `${sessionsDir}/${sessionId}${CODEX_INPUT_FALLBACK_SUFFIX}`;
+}
+function canonicalQuestions(toolInput) {
+  if (!Array.isArray(toolInput.questions))
+    return [];
+  return toolInput.questions.map((candidate) => {
+    const question = candidate;
+    return {
+      id: typeof question?.id === "string" ? question.id : "",
+      header: typeof question?.header === "string" ? question.header : "",
+      question: typeof question?.question === "string" ? question.question : "",
+      isSecret: question?.isSecret === true,
+      options: Array.isArray(question?.options) ? question.options.map((option) => {
+        const value = option;
+        return typeof value?.label === "string" ? value.label : "";
+      }) : null
+    };
+  });
+}
+function codexInputFingerprint(turnId, toolInput) {
+  return createHash2("sha256").update(JSON.stringify([turnId, canonicalQuestions(toolInput)])).digest("hex");
+}
+async function readMarker(path) {
+  try {
+    return JSON.parse(await readFile6(path, "utf8"));
+  } catch {
+    return;
+  }
+}
+function finite2(value) {
+  return typeof value === "number" && Number.isFinite(value);
+}
+async function markCodexInputBridgeReady(sessionId, deps = {}) {
+  const sessionsDir = deps.sessionsDir ?? SESSIONS_DIR;
+  await atomicWrite(bridgePath(sessionsDir, sessionId), JSON.stringify({
+    at: (deps.now ?? Date.now)(),
+    pid: deps.pid ?? process.pid
+  }), 384);
+}
+async function clearCodexInputBridgeReady(sessionId, deps = {}) {
+  const sessionsDir = deps.sessionsDir ?? SESSIONS_DIR;
+  const path = bridgePath(sessionsDir, sessionId);
+  const lease = await readMarker(path);
+  if (finite2(lease?.pid) && lease.pid !== (deps.pid ?? process.pid))
+    return;
+  await unlink3(path).catch(() => {});
+}
+async function codexInputBridgeCanServe(sessionId, _turnId, toolInput, deps = {}) {
+  if (!renderableCodexUserInput(toolInput))
+    return false;
+  const sessionsDir = deps.sessionsDir ?? SESSIONS_DIR;
+  const clock = deps.now ?? Date.now;
+  const alive = deps.isPidAlive ?? pidAlive;
+  const sleep = deps.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
+  const attempts = Math.ceil(CODEX_INPUT_BRIDGE_WAIT_MS / BRIDGE_WAIT_STEP_MS) + 1;
+  for (let attempt = 0;attempt < attempts; attempt += 1) {
+    const lease = await readMarker(bridgePath(sessionsDir, sessionId));
+    const now = clock();
+    if (finite2(lease?.at) && finite2(lease?.pid) && now >= lease.at && now - lease.at <= CODEX_INPUT_BRIDGE_LEASE_MS && alive(lease.pid)) {
+      return true;
+    }
+    if (attempt + 1 < attempts)
+      await sleep(BRIDGE_WAIT_STEP_MS);
+  }
+  return false;
+}
+async function markCodexInputFallback(sessionId, turnId, toolInput, held = false, deps = {}) {
+  const sessionsDir = deps.sessionsDir ?? SESSIONS_DIR;
+  await atomicWrite(fallbackPath(sessionsDir, sessionId), JSON.stringify({
+    at: (deps.now ?? Date.now)(),
+    fingerprint: codexInputFingerprint(turnId, toolInput),
+    held,
+    pid: deps.pid ?? process.pid
+  }), 384);
+}
+async function clearCodexInputFallback(sessionId, turnId, toolInput, deps = {}) {
+  const sessionsDir = deps.sessionsDir ?? SESSIONS_DIR;
+  const path = fallbackPath(sessionsDir, sessionId);
+  const claim = await readMarker(path);
+  if (!claim || claim.fingerprint !== codexInputFingerprint(turnId, toolInput))
+    return;
+  await unlink3(path).catch(() => {});
+}
+async function codexInputFallbackOwnsRequest(request, deps = {}) {
+  const sessionsDir = deps.sessionsDir ?? SESSIONS_DIR;
+  const path = fallbackPath(sessionsDir, request.identity.threadId);
+  const claim = await readMarker(path);
+  if (!claim || claim.held !== true || !finite2(claim.at) || typeof claim.fingerprint !== "string")
+    return false;
+  const now = (deps.now ?? Date.now)();
+  if (now < claim.at || now - claim.at > CODEX_INPUT_FALLBACK_TTL_MS) {
+    await unlink3(path).catch(() => {});
+    return false;
+  }
+  const fingerprint = codexInputFingerprint(request.identity.turnId, { questions: request.questions });
+  if (claim.fingerprint !== fingerprint)
+    return false;
+  await unlink3(path).catch(() => {});
+  return true;
+}
+
 // src/core/permission.ts
 var POST_FIRST_CONTACT_TIMEOUT_MS = 6000;
 var HOLD_RETRY_DELAY_MS = 4000;
@@ -5260,7 +5423,7 @@ function decisionLine(agent, hookSpecificOutput) {
 var ALLOW_HSO = { hookEventName: "PermissionRequest", decision: { behavior: "allow" } };
 var DENY_HSO = { hookEventName: "PermissionRequest", decision: { behavior: "deny", message: "Denied from phone" } };
 var DENY_MESSAGE_MAX = 500;
-var ANSWER_MAX = 500;
+var ANSWER_MAX2 = 500;
 function allowLine(agent, toolName, toolInput) {
   if (toolName === "ExitPlanMode") {
     return decisionLine(agent, { hookEventName: "PermissionRequest", decision: { behavior: "allow", updatedInput: toolInput } });
@@ -5311,7 +5474,7 @@ function answerLine(agent, toolName, toolInput, answers) {
     const raw = a.trim();
     if (raw.length === 0)
       return;
-    if (raw.length > ANSWER_MAX)
+    if (raw.length > ANSWER_MAX2)
       return;
     const resolved = resolveAnswer(raw, questions[i].labels);
     if (resolved === undefined)
@@ -5667,7 +5830,7 @@ function createLoopbackAnswerPoller(config, requestId, deps) {
     if (deps.statePath === undefined)
       return;
     try {
-      return parseLanState(await readFile6(deps.statePath, "utf8"))?.port;
+      return parseLanState(await readFile7(deps.statePath, "utf8"))?.port;
     } catch {
       return;
     }
@@ -5806,6 +5969,15 @@ function defaultClearHold() {
 function defaultSettleHoldRecord() {
   return lanRunningUnderTest() ? async () => {} : settleDecisionHoldRecord;
 }
+function defaultBridgeCanServe() {
+  return lanRunningUnderTest() ? async () => false : codexInputBridgeCanServe;
+}
+function defaultMarkInputFallback() {
+  return lanRunningUnderTest() ? async () => {} : markCodexInputFallback;
+}
+function defaultClearInputFallback() {
+  return lanRunningUnderTest() ? async () => {} : clearCodexInputFallback;
+}
 async function readStdin2() {
   const chunks = [];
   for await (const chunk of process.stdin)
@@ -5820,6 +5992,10 @@ async function runPermissionHook(deps = {}, agent = "claude", surface = "permiss
   let heldSessionId;
   let settleAsWorking = false;
   let settleHeldRecord;
+  let markInputFallback;
+  let clearInputFallbackClaim;
+  let fallbackHoldGranted = false;
+  let fallbackBlocksTool = false;
   try {
     if (await flagExists(noHoldPath)) {
       if (!tuiUserInput)
@@ -5880,6 +6056,23 @@ async function runPermissionHook(deps = {}, agent = "claude", surface = "permiss
       trace({ event: "codex-reviewer", disposition: "hold", reason: "mcp-reviewer-unknown" });
     }
     const toolInput = typeof input.tool_input === "object" && input.tool_input !== null ? input.tool_input : {};
+    if (tuiUserInput) {
+      const turnId = typeof input.turn_id === "string" ? input.turn_id : "";
+      const bridgeOwns = await (deps.bridgeCanServeFn ?? defaultBridgeCanServe())(sessionId, turnId, toolInput);
+      if (bridgeOwns) {
+        trace({ event: "exit", reason: "app-server-bridge" });
+        return;
+      }
+      const markFallback = deps.markInputFallbackFn ?? defaultMarkInputFallback();
+      const clearFallback = deps.clearInputFallbackFn ?? defaultClearInputFallback();
+      markInputFallback = (held) => markFallback(sessionId, turnId, toolInput, held);
+      clearInputFallbackClaim = () => clearFallback(sessionId, turnId, toolInput);
+      try {
+        await markInputFallback(false);
+      } catch {
+        trace({ event: "input-arbitration-marker-error", phase: "pending" });
+      }
+    }
     const suggestions = input.permission_suggestions;
     const requestId = (deps.randomUUID ?? (() => crypto.randomUUID()))();
     const summary = buildPermissionSummary(toolName, toolInput);
@@ -6034,6 +6227,14 @@ async function runPermissionHook(deps = {}, agent = "claude", surface = "permiss
         return;
       }
     }
+    if (tuiUserInput && markInputFallback !== undefined) {
+      fallbackHoldGranted = true;
+      try {
+        await markInputFallback(true);
+      } catch {
+        trace({ event: "input-arbitration-marker-error", phase: "held" });
+      }
+    }
     const holdAt = (deps.now ?? Date.now)();
     const holdPid = deps.holdPid ?? process.pid;
     let holdBlob = blob;
@@ -6064,6 +6265,8 @@ async function runPermissionHook(deps = {}, agent = "claude", surface = "permiss
       const answer = await decryptBlob(config.e2eKey, answerBlob);
       const match = answer.requestId === requestId;
       const outcome = match ? emitDecision(agent, answer, toolName, toolInput, suggestions, emit, trace, surface) : "released";
+      if (tuiUserInput && match && answer.decision === "deny")
+        fallbackBlocksTool = true;
       if (outcome === "emitted")
         settleAsWorking = true;
       if (outcome !== "keep-polling") {
@@ -6139,6 +6342,14 @@ async function runPermissionHook(deps = {}, agent = "claude", surface = "permiss
   } catch (e) {
     trace({ event: "exit", reason: "exception", ...errorTag(e) });
   } finally {
+    if (markInputFallback !== undefined && clearInputFallbackClaim !== undefined) {
+      try {
+        if (fallbackHoldGranted && !fallbackBlocksTool)
+          await markInputFallback(true);
+        else
+          await clearInputFallbackClaim();
+      } catch {}
+    }
     try {
       loopback?.stop();
     } catch {}
@@ -6158,7 +6369,7 @@ async function approvalsCommand(sub, deps = {}) {
     return 0;
   }
   if (sub === "on") {
-    await unlink3(path).catch(() => {});
+    await unlink4(path).catch(() => {});
     print("Remote approvals are ON for this computer — when a session is on your phone's Live Activity, its permission prompts are sent to the phone to Allow or Deny.");
     return 0;
   }
@@ -6168,7 +6379,7 @@ async function approvalsCommand(sub, deps = {}) {
 
 // src/core/codex-remote-input.ts
 var POST_TIMEOUT_MS = 15000;
-var ANSWER_MAX2 = 500;
+var ANSWER_MAX3 = 500;
 function defaultWriteHold2() {
   return lanRunningUnderTest() ? async () => {} : writeDecisionHold;
 }
@@ -6191,7 +6402,7 @@ function codexAnswersFromPhone(request, positional) {
     if (typeof raw !== "string")
       return;
     const answer = raw.trim();
-    if (answer.length === 0 || answer.length > ANSWER_MAX2 || !question.options?.length)
+    if (answer.length === 0 || answer.length > ANSWER_MAX3 || !question.options?.length)
       return;
     const hits = question.options.map((option) => option.label).filter((label) => label === answer || capPermissionWireText(label, PERMISSION_QUESTION_LABEL_MAX) === answer);
     const unique = Array.from(new Set(hits));
@@ -6200,29 +6411,6 @@ function codexAnswersFromPhone(request, positional) {
     mapped[question.id] = [unique[0]];
   }
   return mapped;
-}
-function renderableToolInput(request) {
-  if (request.questions.length < 1 || request.questions.length > 3)
-    return;
-  if (request.questions.some((question) => {
-    if (question.isSecret || !question.options?.length)
-      return true;
-    const labels = question.options.map((option) => option.label);
-    if (labels.some((label) => label !== label.trim() || label.length > ANSWER_MAX2))
-      return true;
-    if (new Set(labels).size !== labels.length)
-      return true;
-    return new Set(labels.map((label) => capPermissionWireText(label, PERMISSION_QUESTION_LABEL_MAX))).size !== labels.length;
-  }))
-    return;
-  return {
-    questions: request.questions.map((question) => ({
-      question: question.question,
-      header: question.header,
-      multiSelect: false,
-      options: question.options.map((option) => ({ ...option }))
-    }))
-  };
 }
 function baseBlob(request, record, config, now) {
   const preview = requestUserInputDetail({ questions: request.questions });
@@ -6302,7 +6490,7 @@ async function runRemoteInput(request, requestId, signal, deps, onHoldCreated) {
   let resumed = false;
   let settleHeldRecord;
   try {
-    const toolInput = renderableToolInput(request);
+    const toolInput = renderableCodexUserInput({ questions: request.questions });
     if (!toolInput)
       return "unsupported";
     const record = await (deps.readRecordFn ?? readRecord)(request.identity.threadId);
@@ -6579,7 +6767,12 @@ class CodexRemoteInputBridge {
   client;
   startRemoteInputFn;
   onError;
+  markThreadReadyFn;
+  clearThreadReadyFn;
+  fallbackOwnsRequestFn;
   subscribedThreads = new Set;
+  pendingRequests = new Set;
+  resolvedWhilePending = new Set;
   handles = new Map;
   pendingRetirements = new Set;
   refreshPromise;
@@ -6588,6 +6781,10 @@ class CodexRemoteInputBridge {
     this.config = config;
     this.startRemoteInputFn = options.startRemoteInputFn ?? startCodexRemoteInput;
     this.onError = options.onError;
+    const underTest = lanRunningUnderTest();
+    this.markThreadReadyFn = options.markThreadReadyFn ?? (underTest ? async () => {} : markCodexInputBridgeReady);
+    this.clearThreadReadyFn = options.clearThreadReadyFn ?? (underTest ? async () => {} : clearCodexInputBridgeReady);
+    this.fallbackOwnsRequestFn = options.fallbackOwnsRequestFn ?? (underTest ? async () => false : codexInputFallbackOwnsRequest);
     const callbacks = {
       onUserInputRequest: (request) => this.onRequest(request),
       onUserInputResolved: (request, resolution) => this.onResolved(request, resolution),
@@ -6652,6 +6849,7 @@ class CodexRemoteInputBridge {
       return;
     this.stopping = true;
     const handles = [...this.handles.values()];
+    await Promise.allSettled([...this.subscribedThreads].map((threadId) => this.clearThreadReadyFn(threadId)));
     await this.client.stop();
     for (const handle of this.handles.values())
       handles.push(handle);
@@ -6675,11 +6873,16 @@ class CodexRemoteInputBridge {
       for (const threadId of page.data) {
         if (this.client.state !== "ready" || this.stopping)
           return;
-        if (this.subscribedThreads.has(threadId))
+        if (this.subscribedThreads.has(threadId)) {
+          try {
+            await this.markThreadReadyFn(threadId);
+          } catch {}
           continue;
+        }
         try {
           await this.client.resumeThread(threadId);
           this.subscribedThreads.add(threadId);
+          await this.markThreadReadyFn(threadId);
         } catch {}
       }
       cursor = page.nextCursor;
@@ -6689,29 +6892,47 @@ class CodexRemoteInputBridge {
     if (this.stopping)
       return;
     const key = requestKey(request);
-    if (this.handles.has(key))
+    if (this.handles.has(key) || this.pendingRequests.has(key))
       return;
-    const handle = this.startRemoteInputFn(request, {
-      config: this.config,
-      answerAppServer: (answers) => this.client.answerUserInput(request.identity, answers),
-      interruptAppServer: () => this.client.interruptUserInput(request.identity),
-      onError: (error) => this.reportError(error)
-    });
-    this.handles.set(key, handle);
-    handle.completion.then(() => {
-      return;
-    }, (error) => this.reportError(error, "Codex remote input failed")).then(() => {
-      if (this.handles.get(key) === handle)
-        this.handles.delete(key);
-    }).catch(() => {
-      return;
-    });
+    this.pendingRequests.add(key);
+    this.routeRequest(request, key);
+  }
+  async routeRequest(request, key) {
+    try {
+      if (await this.fallbackOwnsRequestFn(request))
+        return;
+      if (this.stopping || this.handles.has(key) || this.resolvedWhilePending.delete(key))
+        return;
+      const handle = this.startRemoteInputFn(request, {
+        config: this.config,
+        answerAppServer: (answers) => this.client.answerUserInput(request.identity, answers),
+        interruptAppServer: () => this.client.interruptUserInput(request.identity),
+        onError: (error) => this.reportError(error)
+      });
+      this.handles.set(key, handle);
+      handle.completion.then(() => {
+        return;
+      }, (error) => this.reportError(error, "Codex remote input failed")).then(() => {
+        if (this.handles.get(key) === handle)
+          this.handles.delete(key);
+      }).catch(() => {
+        return;
+      });
+    } catch (error) {
+      this.reportError(error, "Failed to arbitrate Codex remote input");
+    } finally {
+      this.pendingRequests.delete(key);
+      this.resolvedWhilePending.delete(key);
+    }
   }
   onResolved(request, resolution) {
     const key = requestKey(request);
     const handle = this.handles.get(key);
-    if (!handle)
+    if (!handle) {
+      if (this.pendingRequests.has(key))
+        this.resolvedWhilePending.add(key);
       return;
+    }
     this.handles.delete(key);
     if (resolution !== "response-sent" && resolution !== "interrupt-sent") {
       this.retire(handle, "Failed to retire a Codex phone card");
@@ -6722,7 +6943,9 @@ class CodexRemoteInputBridge {
       this.subscribedThreads.clear();
       this.refreshSubscriptions().catch((error) => this.reportError(error, "Failed to refresh Codex thread subscriptions"));
     } else if (state === "disconnected" || state === "stopped") {
+      const threads = [...this.subscribedThreads];
       this.subscribedThreads.clear();
+      Promise.allSettled(threads.map((threadId) => this.clearThreadReadyFn(threadId)));
     }
   }
 }
@@ -6749,7 +6972,7 @@ function resetDoneAttemptMemory() {
 }
 async function readRecordAt(path) {
   try {
-    return JSON.parse(await readFile7(path, "utf8"));
+    return JSON.parse(await readFile8(path, "utf8"));
   } catch {
     return null;
   }
@@ -7584,7 +7807,7 @@ async function readAllRecordEntries() {
       if (!f.endsWith(".json"))
         continue;
       try {
-        out.push({ sessionId: basename5(f, ".json"), rec: JSON.parse(await readFile7(`${SESSIONS_DIR}/${f}`, "utf8")) });
+        out.push({ sessionId: basename5(f, ".json"), rec: JSON.parse(await readFile8(`${SESSIONS_DIR}/${f}`, "utf8")) });
       } catch {}
     }
     return out;
@@ -7682,7 +7905,7 @@ function provisionalsCoveredByReal(entries, adapters = allAdapters) {
 async function reconcileProvisionalsSweep(config, deps = {}) {
   const post = deps.post ?? ((body) => postEvent(config, body));
   const readEntries = deps.readEntries ?? readAllRecordEntries;
-  const deleteRecord = deps.deleteRecord ?? ((sessionId) => unlink4(`${SESSIONS_DIR}/${sessionId}.json`).catch(() => {}));
+  const deleteRecord = deps.deleteRecord ?? ((sessionId) => unlink5(`${SESSIONS_DIR}/${sessionId}.json`).catch(() => {}));
   const now = deps.now ?? Date.now;
   const entries = await readEntries();
   for (const sessionId of provisionalsCoveredByReal(entries, deps.adapters ?? allAdapters)) {
@@ -8026,7 +8249,7 @@ function isRetireEligible(record, now) {
 }
 async function retireDoneStale(config, path, sessionId, record, now, deps = {}) {
   const post = deps.post ?? ((body) => postEvent(config, body));
-  const deleteRecord = deps.deleteRecord ?? ((p) => unlink4(p).catch(() => {}));
+  const deleteRecord = deps.deleteRecord ?? ((p) => unlink5(p).catch(() => {}));
   const writeRecord = deps.writeRecord ?? ((p, rec) => atomicWrite(p, JSON.stringify(rec), 384));
   const alive = deps.pidAlive ?? pidAlive;
   const locateTuiPid = deps.locateTuiPid ?? locateCodexOwnedTui;
@@ -8215,7 +8438,7 @@ async function sweep(config, deps = {}) {
     const sessionId = basename5(file, ".json");
     let record = null;
     try {
-      record = JSON.parse(await readFile7(path, "utf8"));
+      record = JSON.parse(await readFile8(path, "utf8"));
     } catch {
       record = null;
     }
@@ -8350,7 +8573,7 @@ async function sweep(config, deps = {}) {
     heartbeatAt.delete(sessionId);
     clearDoneAttempts(sessionId);
     try {
-      await unlink4(path);
+      await unlink5(path);
     } catch {}
   }
   return { revoked: false, remaining, delivered };
@@ -8505,9 +8728,9 @@ function pendingPairingExpired(pending, now, fallbackDeadline) {
 }
 async function removePendingConfig() {
   try {
-    await unlink4(`${CC_DIR}/config.json`);
+    await unlink5(`${CC_DIR}/config.json`);
   } catch {}
-  await unlink4(`${CC_DIR}/${PAIR_HTML_FILE}`).catch(() => {});
+  await unlink5(`${CC_DIR}/${PAIR_HTML_FILE}`).catch(() => {});
 }
 async function selfHealPairing(pending) {
   let result;

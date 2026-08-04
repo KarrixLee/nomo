@@ -47,6 +47,9 @@ import {
 import {
   LAN_ENVELOPE_VERSION, LAN_PATH, LAN_STATE_PATH, lanRunningUnderTest, parseLanState,
 } from "./lan-wire";
+import {
+  clearCodexInputFallback, codexInputBridgeCanServe, markCodexInputFallback,
+} from "./codex-user-input-arbitration";
 
 /** Local escape-hatch flag: when this file exists, the hook skips the hold entirely and behaves as a
  *  plain fire-and-forget attention event (instant terminal dialog). Toggled by `cc-permission off|on`.
@@ -1098,6 +1101,18 @@ function defaultSettleHoldRecord(): (sessionId: string, patch: Partial<SessionRe
   return lanRunningUnderTest() ? async () => { /* never touch real records from a test */ } : settleDecisionHoldRecord;
 }
 
+function defaultBridgeCanServe(): NonNullable<PermissionHookDeps["bridgeCanServeFn"]> {
+  return lanRunningUnderTest() ? async () => false : codexInputBridgeCanServe;
+}
+
+function defaultMarkInputFallback(): NonNullable<PermissionHookDeps["markInputFallbackFn"]> {
+  return lanRunningUnderTest() ? async () => {} : markCodexInputFallback;
+}
+
+function defaultClearInputFallback(): NonNullable<PermissionHookDeps["clearInputFallbackFn"]> {
+  return lanRunningUnderTest() ? async () => {} : clearCodexInputFallback;
+}
+
 /** Injectable seams so permission.test.ts drives the state machine with a scripted fetch, an instant
  *  sleep, a deterministic requestId, and a temp flag path — no real stdin/network/timers. Production
  *  uses every default. */
@@ -1157,6 +1172,17 @@ export interface PermissionHookDeps {
   /** The loopback ticker's own pacing clock + cadence (never the hook's `sleep` — see the poller). */
   lanSleep?: (ms: number) => Promise<void>;
   lanIntervalMs?: number;
+  /** Cross-process request_user_input ownership seams. The exact-match hook yields only to a live,
+   * subscribed bridge that shares its shape filter; otherwise it marks the honest fallback first. */
+  bridgeCanServeFn?: (
+    sessionId: string, turnId: string, toolInput: Record<string, unknown>,
+  ) => Promise<boolean>;
+  markInputFallbackFn?: (
+    sessionId: string, turnId: string, toolInput: Record<string, unknown>, held?: boolean,
+  ) => Promise<void>;
+  clearInputFallbackFn?: (
+    sessionId: string, turnId: string, toolInput: Record<string, unknown>,
+  ) => Promise<void>;
 }
 
 async function readStdin(): Promise<string> {
@@ -1198,6 +1224,13 @@ export async function runPermissionHook(
    *  over the config/blobs the `try` scope owns. Read `settleAsWorking` at CALL time — it describes the
    *  exit that actually happened, not the one we expected when we built it. */
   let settleHeldRecord: (() => Promise<void>) | undefined;
+  /** Refresh fallback ownership immediately before this hook releases. A user may leave the card open
+   * near the ten-minute hold TTL; anchoring the suppression marker at release still lets the bridge
+   * recognize the native request that follows. */
+  let markInputFallback: ((held: boolean) => Promise<void>) | undefined;
+  let clearInputFallbackClaim: (() => Promise<void>) | undefined;
+  let fallbackHoldGranted = false;
+  let fallbackBlocksTool = false;
   try {
     // Escape hatch FIRST (a file stat — no stdin consumed yet): if the user paused remote approvals
     // locally, behave exactly as the old fire-and-forget attention event (instant terminal dialog).
@@ -1297,6 +1330,24 @@ export async function runPermissionHook(
     const toolInput = typeof input.tool_input === "object" && input.tool_input !== null
       ? (input.tool_input as Record<string, unknown>)
       : {};
+    if (tuiUserInput) {
+      const turnId = typeof input.turn_id === "string" ? input.turn_id : "";
+      const bridgeOwns = await (deps.bridgeCanServeFn ?? defaultBridgeCanServe())(
+        sessionId, turnId, toolInput,
+      );
+      if (bridgeOwns) {
+        trace({ event: "exit", reason: "app-server-bridge" });
+        return;
+      }
+      // This stamp precedes the fallback decision POST. If the fallback later releases into Codex's
+      // native picker, the bridge consumes it and suppresses its otherwise-duplicate actionable hold.
+      const markFallback = deps.markInputFallbackFn ?? defaultMarkInputFallback();
+      const clearFallback = deps.clearInputFallbackFn ?? defaultClearInputFallback();
+      markInputFallback = (held) => markFallback(sessionId, turnId, toolInput, held);
+      clearInputFallbackClaim = () => clearFallback(sessionId, turnId, toolInput);
+      try { await markInputFallback(false); }
+      catch { trace({ event: "input-arbitration-marker-error", phase: "pending" }); }
+    }
     // CC's own narrowly-scoped rule suggestions (present on the PermissionRequest when it has them);
     // passed through VERBATIM by allowAlwaysLine on an always-allow answer. Absent → whole-tool rule.
     const suggestions = input.permission_suggestions;
@@ -1549,6 +1600,12 @@ export async function runPermissionHook(
       if (!hold) { trace({ event: "exit", reason: "hold-false" }); return; } // still not shown → worker applied the attention update → terminal dialog
     }
 
+    if (tuiUserInput && markInputFallback !== undefined) {
+      fallbackHoldGranted = true;
+      try { await markInputFallback(true); }
+      catch { trace({ event: "input-arbitration-marker-error", phase: "held" }); }
+    }
+
     // THE HOLD IS REAL — tell the LAN channel. The worker now stores the decisionPending frame and
     // defends it (it drops the plain prio:1 needsAttention CC's `Notification` hook fires seconds from
     // now); the LAN frames feed rebuilds its frames from the SESSION RECORD, which has never carried
@@ -1638,6 +1695,7 @@ export async function runPermissionHook(
       const outcome: DecisionOutcome = match
         ? emitDecision(agent, answer, toolName, toolInput, suggestions, emit, trace, surface)
         : "released";
+      if (tuiUserInput && match && answer.decision === "deny") fallbackBlocksTool = true;
       // Only an ordinary emitted decision means WORKING. `emitted-attention` released PreToolUse but
       // opened the native TUI picker; `released` emitted nothing. Both remain honestly attentive.
       if (outcome === "emitted") settleAsWorking = true;
@@ -1753,6 +1811,12 @@ export async function runPermissionHook(
     // payload it choked on, and this trace is a plaintext file on disk.
     trace({ event: "exit", reason: "exception", ...errorTag(e) });
   } finally {
+    if (markInputFallback !== undefined && clearInputFallbackClaim !== undefined) {
+      try {
+        if (fallbackHoldGranted && !fallbackBlocksTool) await markInputFallback(true);
+        else await clearInputFallbackClaim();
+      } catch { /* the original claim still has its bounded TTL */ }
+    }
     // Stop the detached loopback ticker on EVERY exit (emitted, released, give-up, exception). The
     // process is normally about to exit anyway; this is what keeps it from outliving the hold in-process.
     try { loopback?.stop(); } catch { /* best-effort */ }

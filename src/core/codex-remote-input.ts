@@ -27,6 +27,7 @@ import type {
   CodexUserInputAnswers, CodexUserInputAnswerResult, CodexUserInputInterruptResult,
   CodexUserInputRequest,
 } from "./codex-app-server-client";
+import { renderableCodexUserInput } from "./codex-user-input-shape";
 
 /** FIRST-CONTACT ceiling for the decision POST. Deliberately NOT the permission hook's 4 s twin
  *  (POST_FIRST_CONTACT_TIMEOUT_MS): this relay runs detached inside the watchdog and blocks nobody's
@@ -136,31 +137,6 @@ export function codexAnswersFromPhone(
   return mapped;
 }
 
-function renderableToolInput(request: CodexUserInputRequest): Record<string, unknown> | undefined {
-  if (request.questions.length < 1 || request.questions.length > 3) return undefined;
-  // Secret/free-form-only questions never leave the Mac. `isOther` may coexist with ordinary choices;
-  // Nomo exposes only those explicit labels and leaves free-form "Other" to Codex Desktop.
-  if (request.questions.some((question) => {
-    if (question.isSecret || !question.options?.length) return true;
-    const labels = question.options.map((option) => option.label);
-    // The picker must round-trip exactly. Reject whitespace-normalizing labels, duplicates, and capped
-    // display collisions BEFORE the relay can let the phone terminally answer an ambiguous choice.
-    if (labels.some((label) => label !== label.trim() || label.length > ANSWER_MAX)) return true;
-    if (new Set(labels).size !== labels.length) return true;
-    return new Set(labels.map((label) =>
-      capPermissionWireText(label, PERMISSION_QUESTION_LABEL_MAX)
-    )).size !== labels.length;
-  })) return undefined;
-  return {
-    questions: request.questions.map((question) => ({
-      question: question.question,
-      header: question.header,
-      multiSelect: false,
-      options: question.options!.map((option) => ({ ...option })),
-    })),
-  };
-}
-
 function baseBlob(
   request: CodexUserInputRequest,
   record: SessionRecord,
@@ -266,7 +242,7 @@ async function runRemoteInput(
   let resumed = false;
   let settleHeldRecord: (() => Promise<void>) | undefined;
   try {
-    const toolInput = renderableToolInput(request);
+    const toolInput = renderableCodexUserInput({ questions: request.questions });
     if (!toolInput) return "unsupported";
     const record = await (deps.readRecordFn ?? readRecord)(request.identity.threadId);
     if (!record || (record.agent ?? "claude") !== "codex") return "unsupported";

@@ -16,6 +16,8 @@ import { createLanAnswerStore, createLanListener } from "./lan-listener";
 import type { LanAnswerStore, LanListener } from "./lan-listener";
 import type { Config } from "./shared";
 import { PLUGIN_VERSION } from "./shared";
+import { startCodexRemoteInput } from "./codex-remote-input";
+import { renderableCodexUserInput } from "./codex-user-input-shape";
 
 // ---- summary builder (pure) ---------------------------------------------------------------
 
@@ -2439,6 +2441,97 @@ describe("runPermissionHook — Codex TUI request_user_input", () => {
       status: "decisionPending", permissionToolName: "request_user_input", dbg: expect.any(String),
     });
     expect(emitted).toHaveLength(1);
+  });
+
+  test("live bridge: exactly one option-bearing hold answers through app-server injection", async () => {
+    const holds: Array<{ blob: string }> = [];
+    const { emitted, calls: hookCalls } = await answerTui({ decision: "deny" }, {
+      bridgeCanServeFn: async () => true,
+      writeHoldFn: async (_sessionId: string, hold: { blob: string }) => { holds.push(hold); },
+    });
+    expect(hookCalls).toHaveLength(0);
+    expect(holds).toHaveLength(0);
+    expect(emitted).toHaveLength(0);
+
+    const answerBlob = await encryptBlob(KEY, {
+      requestId: "bridge-request", decision: "answer", answers: ["Green"],
+    });
+    const appAnswers: unknown[] = [];
+    let posted: Record<string, unknown> | undefined;
+    const handle = startCodexRemoteInput({
+      identity: {
+        connectionEpoch: 1, requestId: 4, threadId: "sess-1", turnId: "turn-auto", itemId: "item-1",
+      },
+      questions: [{
+        id: "deploy", header: "Deploy", question: "Which deployment should I use?",
+        isOther: false, isSecret: false, options: TOOL_INPUT.questions[0].options,
+      }],
+      autoResolutionMs: null, receivedAtMs: 1_000,
+    }, {
+      config: CONFIG,
+      fetchFn: (async (url, init) => {
+        if (String(url).endsWith("/v1/cc/decision")) {
+          posted = JSON.parse(String(init?.body));
+          return Response.json({ hold: true });
+        }
+        return Response.json({ status: "answered", answerBlob });
+      }) as typeof fetch,
+      readRecordFn: async () => ({
+        pid: 1, machine: "m", label: "l", ts: 900, agent: "codex", op: "update", prio: 1,
+      }),
+      randomUUID: () => "bridge-request", now: () => 1_000,
+      localApprovalsStateFn: async () => "on", sleep: async () => {},
+      answerAppServer: async (answers) => { appAnswers.push(answers); return "sent"; },
+      interruptAppServer: async () => "sent",
+      writeHoldFn: async (_sessionId, hold) => { holds.push(hold); },
+      clearHoldFn: async (_sessionId, _pid, beforeUnlink) => { await beforeUnlink?.(); return true; },
+      settleHoldRecordFn: async () => {},
+    });
+
+    expect(await handle.completion).toBe("answered");
+    expect(holds).toHaveLength(1);
+    expect(appAnswers).toEqual([{ deploy: ["Green"] }]);
+    const frame = await decryptBlob(KEY, posted!.blob as string) as Record<string, unknown>;
+    expect(frame.permissionQuestions).toEqual([{
+      q: "Which deployment should I use?", h: "Deploy", o: ["Blue", "Green"],
+      d: ["Use blue", "Use green"],
+    }]);
+  });
+
+  test("live bridge rejects a secret shape: exactly one honest option-less fallback hold", async () => {
+    const secretInput = JSON.stringify({
+      ...JSON.parse(TUI_INPUT),
+      tool_input: {
+        questions: [{
+          id: "token", header: "Secret", question: "Enter token", isSecret: true, options: [],
+        }],
+      },
+    });
+    const answerBlob = await encryptBlob(KEY, { requestId: "req-fixed", decision: "deny" });
+    const { fn, calls } = scriptFetch(true, [{ status: "answered", answerBlob }]);
+    const holds: Array<{ blob: string }> = [];
+    const claimStates: boolean[] = [];
+    let claimsCleared = 0;
+    await runPermissionHook(baseDeps({
+      fetchFn: fn, readInput: async () => secretInput,
+      bridgeCanServeFn: async (_sessionId: string, _turnId: string, input: Record<string, unknown>) => {
+        return renderableCodexUserInput(input) !== undefined;
+      },
+      markInputFallbackFn: async (
+        _sessionId: string, _turnId: string, _input: Record<string, unknown>, held = false,
+      ) => { claimStates.push(held); },
+      clearInputFallbackFn: async () => { claimsCleared += 1; },
+      writeHoldFn: async (_sessionId: string, hold: { blob: string }) => { holds.push(hold); },
+      emit: () => {},
+    }) as never, "codex", "tui-request-user-input");
+
+    expect(holds).toHaveLength(1);
+    const post = JSON.parse(calls.find((call) => call.method === "POST")!.body!);
+    const frame = await decryptBlob(KEY, post.blob) as Record<string, unknown>;
+    expect(frame.permissionToolName).toBe("request_user_input");
+    expect(frame).not.toHaveProperty("permissionQuestions");
+    expect(claimStates).toEqual([false, true]);
+    expect(claimsCleared).toBe(1); // Deny prevents app-server delivery, so no stale suppression remains.
   });
 
   test("Deny blocks the tool through Codex's PreToolUse schema", async () => {

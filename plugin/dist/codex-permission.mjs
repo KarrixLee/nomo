@@ -2,7 +2,7 @@ import { createRequire } from "node:module";
 var __require = /* @__PURE__ */ createRequire(import.meta.url);
 
 // src/core/permission.ts
-import { readFile as readFile4, realpath, unlink as unlink3 } from "node:fs/promises";
+import { readFile as readFile5, realpath, unlink as unlink4 } from "node:fs/promises";
 import { appendFileSync as appendFileSync2, statSync as statSync2, truncateSync as truncateSync2 } from "node:fs";
 import { hostname as hostname2 } from "node:os";
 import { basename as basename3, isAbsolute, relative, resolve } from "node:path";
@@ -2992,6 +2992,169 @@ function lanRunningUnderTest() {
   return process.argv.some((arg) => arg === "test" || arg.endsWith(".test.ts"));
 }
 
+// src/core/codex-user-input-arbitration.ts
+import { createHash } from "node:crypto";
+import { readFile as readFile4, unlink as unlink3 } from "node:fs/promises";
+
+// src/core/codex-user-input-shape.ts
+var ANSWER_MAX = 500;
+var OPTION_LABEL_WIRE_MAX = 60;
+function capLabel(value) {
+  const characters = Array.from(value);
+  return characters.length <= OPTION_LABEL_WIRE_MAX ? value : `${characters.slice(0, OPTION_LABEL_WIRE_MAX - 1).join("")}…`;
+}
+function renderableCodexUserInput(toolInput) {
+  const rawQuestions = toolInput.questions;
+  if (!Array.isArray(rawQuestions) || rawQuestions.length < 1 || rawQuestions.length > 3)
+    return;
+  const questions = [];
+  for (const raw of rawQuestions) {
+    if (!raw || raw.isSecret === true || typeof raw.question !== "string" || raw.question.length === 0) {
+      return;
+    }
+    if (!Array.isArray(raw.options) || raw.options.length === 0)
+      return;
+    const options = [];
+    const labels = [];
+    for (const candidate of raw.options) {
+      const option = candidate;
+      if (!option || typeof option.label !== "string" || option.label.length === 0)
+        return;
+      const label = option.label;
+      if (label !== label.trim() || label.length > ANSWER_MAX)
+        return;
+      labels.push(label);
+      options.push({
+        label,
+        description: typeof option.description === "string" ? option.description : ""
+      });
+    }
+    if (new Set(labels).size !== labels.length)
+      return;
+    if (new Set(labels.map(capLabel)).size !== labels.length)
+      return;
+    questions.push({
+      question: raw.question,
+      ...typeof raw.header === "string" ? { header: raw.header } : {},
+      multiSelect: false,
+      options
+    });
+  }
+  return { questions };
+}
+
+// src/core/codex-user-input-arbitration.ts
+var CODEX_INPUT_BRIDGE_SUFFIX = ".input-bridge";
+var CODEX_INPUT_FALLBACK_SUFFIX = ".input-fallback";
+var CODEX_INPUT_BRIDGE_LEASE_MS = 15000;
+var CODEX_INPUT_FALLBACK_TTL_MS = 600000;
+var CODEX_INPUT_BRIDGE_WAIT_MS = 750;
+var BRIDGE_WAIT_STEP_MS = 50;
+function bridgePath(sessionsDir, sessionId) {
+  return `${sessionsDir}/${sessionId}${CODEX_INPUT_BRIDGE_SUFFIX}`;
+}
+function fallbackPath(sessionsDir, sessionId) {
+  return `${sessionsDir}/${sessionId}${CODEX_INPUT_FALLBACK_SUFFIX}`;
+}
+function canonicalQuestions(toolInput) {
+  if (!Array.isArray(toolInput.questions))
+    return [];
+  return toolInput.questions.map((candidate) => {
+    const question = candidate;
+    return {
+      id: typeof question?.id === "string" ? question.id : "",
+      header: typeof question?.header === "string" ? question.header : "",
+      question: typeof question?.question === "string" ? question.question : "",
+      isSecret: question?.isSecret === true,
+      options: Array.isArray(question?.options) ? question.options.map((option) => {
+        const value = option;
+        return typeof value?.label === "string" ? value.label : "";
+      }) : null
+    };
+  });
+}
+function codexInputFingerprint(turnId, toolInput) {
+  return createHash("sha256").update(JSON.stringify([turnId, canonicalQuestions(toolInput)])).digest("hex");
+}
+async function readMarker(path) {
+  try {
+    return JSON.parse(await readFile4(path, "utf8"));
+  } catch {
+    return;
+  }
+}
+function finite(value) {
+  return typeof value === "number" && Number.isFinite(value);
+}
+async function markCodexInputBridgeReady(sessionId, deps = {}) {
+  const sessionsDir = deps.sessionsDir ?? SESSIONS_DIR;
+  await atomicWrite(bridgePath(sessionsDir, sessionId), JSON.stringify({
+    at: (deps.now ?? Date.now)(),
+    pid: deps.pid ?? process.pid
+  }), 384);
+}
+async function clearCodexInputBridgeReady(sessionId, deps = {}) {
+  const sessionsDir = deps.sessionsDir ?? SESSIONS_DIR;
+  const path = bridgePath(sessionsDir, sessionId);
+  const lease = await readMarker(path);
+  if (finite(lease?.pid) && lease.pid !== (deps.pid ?? process.pid))
+    return;
+  await unlink3(path).catch(() => {});
+}
+async function codexInputBridgeCanServe(sessionId, _turnId, toolInput, deps = {}) {
+  if (!renderableCodexUserInput(toolInput))
+    return false;
+  const sessionsDir = deps.sessionsDir ?? SESSIONS_DIR;
+  const clock = deps.now ?? Date.now;
+  const alive = deps.isPidAlive ?? pidAlive;
+  const sleep = deps.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
+  const attempts = Math.ceil(CODEX_INPUT_BRIDGE_WAIT_MS / BRIDGE_WAIT_STEP_MS) + 1;
+  for (let attempt = 0;attempt < attempts; attempt += 1) {
+    const lease = await readMarker(bridgePath(sessionsDir, sessionId));
+    const now = clock();
+    if (finite(lease?.at) && finite(lease?.pid) && now >= lease.at && now - lease.at <= CODEX_INPUT_BRIDGE_LEASE_MS && alive(lease.pid)) {
+      return true;
+    }
+    if (attempt + 1 < attempts)
+      await sleep(BRIDGE_WAIT_STEP_MS);
+  }
+  return false;
+}
+async function markCodexInputFallback(sessionId, turnId, toolInput, held = false, deps = {}) {
+  const sessionsDir = deps.sessionsDir ?? SESSIONS_DIR;
+  await atomicWrite(fallbackPath(sessionsDir, sessionId), JSON.stringify({
+    at: (deps.now ?? Date.now)(),
+    fingerprint: codexInputFingerprint(turnId, toolInput),
+    held,
+    pid: deps.pid ?? process.pid
+  }), 384);
+}
+async function clearCodexInputFallback(sessionId, turnId, toolInput, deps = {}) {
+  const sessionsDir = deps.sessionsDir ?? SESSIONS_DIR;
+  const path = fallbackPath(sessionsDir, sessionId);
+  const claim = await readMarker(path);
+  if (!claim || claim.fingerprint !== codexInputFingerprint(turnId, toolInput))
+    return;
+  await unlink3(path).catch(() => {});
+}
+async function codexInputFallbackOwnsRequest(request, deps = {}) {
+  const sessionsDir = deps.sessionsDir ?? SESSIONS_DIR;
+  const path = fallbackPath(sessionsDir, request.identity.threadId);
+  const claim = await readMarker(path);
+  if (!claim || claim.held !== true || !finite(claim.at) || typeof claim.fingerprint !== "string")
+    return false;
+  const now = (deps.now ?? Date.now)();
+  if (now < claim.at || now - claim.at > CODEX_INPUT_FALLBACK_TTL_MS) {
+    await unlink3(path).catch(() => {});
+    return false;
+  }
+  const fingerprint = codexInputFingerprint(request.identity.turnId, { questions: request.questions });
+  if (claim.fingerprint !== fingerprint)
+    return false;
+  await unlink3(path).catch(() => {});
+  return true;
+}
+
 // src/core/permission.ts
 var POST_FIRST_CONTACT_TIMEOUT_MS = 6000;
 var HOLD_RETRY_DELAY_MS = 4000;
@@ -3093,7 +3256,7 @@ function decisionLine(agent, hookSpecificOutput) {
 var ALLOW_HSO = { hookEventName: "PermissionRequest", decision: { behavior: "allow" } };
 var DENY_HSO = { hookEventName: "PermissionRequest", decision: { behavior: "deny", message: "Denied from phone" } };
 var DENY_MESSAGE_MAX = 500;
-var ANSWER_MAX = 500;
+var ANSWER_MAX2 = 500;
 function allowLine(agent, toolName, toolInput) {
   if (toolName === "ExitPlanMode") {
     return decisionLine(agent, { hookEventName: "PermissionRequest", decision: { behavior: "allow", updatedInput: toolInput } });
@@ -3144,7 +3307,7 @@ function answerLine(agent, toolName, toolInput, answers) {
     const raw = a.trim();
     if (raw.length === 0)
       return;
-    if (raw.length > ANSWER_MAX)
+    if (raw.length > ANSWER_MAX2)
       return;
     const resolved = resolveAnswer(raw, questions[i].labels);
     if (resolved === undefined)
@@ -3500,7 +3663,7 @@ function createLoopbackAnswerPoller(config, requestId, deps) {
     if (deps.statePath === undefined)
       return;
     try {
-      return parseLanState(await readFile4(deps.statePath, "utf8"))?.port;
+      return parseLanState(await readFile5(deps.statePath, "utf8"))?.port;
     } catch {
       return;
     }
@@ -3639,6 +3802,15 @@ function defaultClearHold() {
 function defaultSettleHoldRecord() {
   return lanRunningUnderTest() ? async () => {} : settleDecisionHoldRecord;
 }
+function defaultBridgeCanServe() {
+  return lanRunningUnderTest() ? async () => false : codexInputBridgeCanServe;
+}
+function defaultMarkInputFallback() {
+  return lanRunningUnderTest() ? async () => {} : markCodexInputFallback;
+}
+function defaultClearInputFallback() {
+  return lanRunningUnderTest() ? async () => {} : clearCodexInputFallback;
+}
 async function readStdin2() {
   const chunks = [];
   for await (const chunk of process.stdin)
@@ -3653,6 +3825,10 @@ async function runPermissionHook(deps = {}, agent = "claude", surface = "permiss
   let heldSessionId;
   let settleAsWorking = false;
   let settleHeldRecord;
+  let markInputFallback;
+  let clearInputFallbackClaim;
+  let fallbackHoldGranted = false;
+  let fallbackBlocksTool = false;
   try {
     if (await flagExists(noHoldPath)) {
       if (!tuiUserInput)
@@ -3713,6 +3889,23 @@ async function runPermissionHook(deps = {}, agent = "claude", surface = "permiss
       trace({ event: "codex-reviewer", disposition: "hold", reason: "mcp-reviewer-unknown" });
     }
     const toolInput = typeof input.tool_input === "object" && input.tool_input !== null ? input.tool_input : {};
+    if (tuiUserInput) {
+      const turnId = typeof input.turn_id === "string" ? input.turn_id : "";
+      const bridgeOwns = await (deps.bridgeCanServeFn ?? defaultBridgeCanServe())(sessionId, turnId, toolInput);
+      if (bridgeOwns) {
+        trace({ event: "exit", reason: "app-server-bridge" });
+        return;
+      }
+      const markFallback = deps.markInputFallbackFn ?? defaultMarkInputFallback();
+      const clearFallback = deps.clearInputFallbackFn ?? defaultClearInputFallback();
+      markInputFallback = (held) => markFallback(sessionId, turnId, toolInput, held);
+      clearInputFallbackClaim = () => clearFallback(sessionId, turnId, toolInput);
+      try {
+        await markInputFallback(false);
+      } catch {
+        trace({ event: "input-arbitration-marker-error", phase: "pending" });
+      }
+    }
     const suggestions = input.permission_suggestions;
     const requestId = (deps.randomUUID ?? (() => crypto.randomUUID()))();
     const summary = buildPermissionSummary(toolName, toolInput);
@@ -3867,6 +4060,14 @@ async function runPermissionHook(deps = {}, agent = "claude", surface = "permiss
         return;
       }
     }
+    if (tuiUserInput && markInputFallback !== undefined) {
+      fallbackHoldGranted = true;
+      try {
+        await markInputFallback(true);
+      } catch {
+        trace({ event: "input-arbitration-marker-error", phase: "held" });
+      }
+    }
     const holdAt = (deps.now ?? Date.now)();
     const holdPid = deps.holdPid ?? process.pid;
     let holdBlob = blob;
@@ -3897,6 +4098,8 @@ async function runPermissionHook(deps = {}, agent = "claude", surface = "permiss
       const answer = await decryptBlob(config.e2eKey, answerBlob);
       const match = answer.requestId === requestId;
       const outcome = match ? emitDecision(agent, answer, toolName, toolInput, suggestions, emit, trace, surface) : "released";
+      if (tuiUserInput && match && answer.decision === "deny")
+        fallbackBlocksTool = true;
       if (outcome === "emitted")
         settleAsWorking = true;
       if (outcome !== "keep-polling") {
@@ -3972,6 +4175,14 @@ async function runPermissionHook(deps = {}, agent = "claude", surface = "permiss
   } catch (e) {
     trace({ event: "exit", reason: "exception", ...errorTag(e) });
   } finally {
+    if (markInputFallback !== undefined && clearInputFallbackClaim !== undefined) {
+      try {
+        if (fallbackHoldGranted && !fallbackBlocksTool)
+          await markInputFallback(true);
+        else
+          await clearInputFallbackClaim();
+      } catch {}
+    }
     try {
       loopback?.stop();
     } catch {}
@@ -3991,7 +4202,7 @@ async function approvalsCommand(sub, deps = {}) {
     return 0;
   }
   if (sub === "on") {
-    await unlink3(path).catch(() => {});
+    await unlink4(path).catch(() => {});
     print("Remote approvals are ON for this computer — when a session is on your phone's Live Activity, its permission prompts are sent to the phone to Allow or Deny.");
     return 0;
   }
