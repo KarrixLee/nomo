@@ -108,7 +108,7 @@ import { appendFileSync, existsSync, readFileSync, statSync, truncateSync } from
 import { execFileSync, spawn } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "1.6.7";
+var PLUGIN_VERSION = "1.6.8";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -2903,8 +2903,32 @@ async function runHook(agent) {
 
 // src/core/decision-poll.ts
 var POLL_INTERVAL_MS = 3000;
+var POLL_JITTER_MAX_MS = 500;
 var POLL_TIMEOUT_MS = 2000;
+var POLL_TIMEOUT_CEILING_MS = 8000;
+var POLL_BUDGET_LATENCY_FACTOR = 3;
+var POLL_LATENCY_SAMPLES = 5;
 var POLL_FIRST_CONTACT_TIMEOUT_MS = 4000;
+function createPollBudget() {
+  const window = [];
+  return {
+    next(seq) {
+      const floorMs = seq <= 1 ? POLL_FIRST_CONTACT_TIMEOUT_MS : POLL_TIMEOUT_MS;
+      if (window.length === 0)
+        return floorMs;
+      const sorted = [...window].sort((a, b) => a - b);
+      const typical = sorted[Math.floor(sorted.length / 2)];
+      return Math.min(POLL_TIMEOUT_CEILING_MS, Math.max(floorMs, Math.ceil(typical * POLL_BUDGET_LATENCY_FACTOR)));
+    },
+    observe(roundTripMs) {
+      if (!Number.isFinite(roundTripMs) || roundTripMs < 0)
+        return;
+      window.push(roundTripMs);
+      if (window.length > POLL_LATENCY_SAMPLES)
+        window.shift();
+    }
+  };
+}
 var POST_MAX_ATTEMPTS = 2;
 var POST_RETRY_PAUSE_MS = 1000;
 var MAX_CONSECUTIVE_MISSES = 100;
@@ -3989,20 +4013,28 @@ async function runPermissionHook(deps = {}, agent = "claude", surface = "permiss
       }
       return { posted: posted2, hold: hold2, reason };
     };
+    const clock = deps.now ?? Date.now;
+    const pollBudget = createPollBudget();
     const pollDecision = async (seq2) => {
-      const budgetMs = seq2 <= 1 ? POLL_FIRST_CONTACT_TIMEOUT_MS : POLL_TIMEOUT_MS;
+      const budgetMs = pollBudget.next(seq2);
       trace({ event: "poll-begin", seq: seq2, budgetMs });
+      const startedAt = clock();
+      const measure = () => {
+        const ms = clock() - startedAt;
+        pollBudget.observe(ms);
+        return ms;
+      };
       try {
         const res = await fetchFn(`${config.url}/v1/cc/decision/${requestId}`, {
           headers: pcHeaders,
           signal: AbortSignal.timeout(budgetMs)
         });
         if (!res.ok) {
-          trace({ event: "poll-end", seq: seq2, outcome: "status", status: res.status });
+          trace({ event: "poll-end", seq: seq2, outcome: "status", status: res.status, ms: measure() });
           return { status: res.status };
         }
         const data = await res.json();
-        trace({ event: "poll-end", seq: seq2, outcome: "ok" });
+        trace({ event: "poll-end", seq: seq2, outcome: "ok", ms: measure() });
         return { data, status: res.status };
       } catch (e) {
         trace({ event: "poll-end", seq: seq2, outcome: "error", ...errorTag(e) });
@@ -4090,7 +4122,7 @@ async function runPermissionHook(deps = {}, agent = "claude", surface = "permiss
       } : attentionStalled ? await stalledPatch(settledAt) : { ts: settledAt, blob: fallbackBlob, attentionStalledAt: undefined };
       await (deps.settleHoldRecordFn ?? defaultSettleHoldRecord())(sessionId, patch);
     };
-    const jitter = deps.jitter ?? (() => Math.floor(Math.random() * 500));
+    const jitter = deps.jitter ?? (() => Math.floor(Math.random() * POLL_JITTER_MAX_MS));
     const interval = deps.pollIntervalMs ?? POLL_INTERVAL_MS;
     const emit = deps.emit ?? ((line) => process.stdout.write(`${line}
 `));
