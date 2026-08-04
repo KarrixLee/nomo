@@ -42,15 +42,17 @@ describe("native Codex hook manifest", () => {
     expect(sessionEnd?.timeout).toBe(3);
   });
 
-  test("registers a blocking exact-match PreToolUse handler for TUI request_user_input", async () => {
+  // ROLLED BACK 2026-08-05 (field): the blocking request_user_input handler HUNG — its trace showed
+  // `start` with no `posted`/`exit`, and with a 3600s manifest timeout it blocked Codex's own tool call,
+  // so the user saw NO picker in the CLI and nothing answerable on the phone. The app-server bridge
+  // (codex-remote-input) remains the answerable path, exactly as on dev. Re-adding this handler requires
+  // proving, with instrumentation, that every pre-decision path is bounded and fail-open.
+  test("registers NO blocking request_user_input handler (it hung the CLI in the field)", async () => {
     const path = join(import.meta.dir, "../../plugin/hooks/codex-hooks.json");
     const manifest = JSON.parse(await readFile(path, "utf8")) as {
-      hooks: Record<string, Array<{ matcher?: string; hooks?: Array<{ command?: string; timeout?: number }> }>>;
+      hooks: Record<string, Array<{ matcher?: string }>>;
     };
-    const handler = manifest.hooks.PreToolUse.find((entry) => entry.matcher === "request_user_input")?.hooks?.[0];
-    expect(handler?.command).toContain("dist/codex-permission.mjs");
-    expect(handler?.command).toContain("--tui-request-user-input");
-    expect(handler?.timeout).toBe(3600);
+    expect(manifest.hooks.PreToolUse.some((entry) => entry.matcher === "request_user_input")).toBe(false);
   });
 });
 
