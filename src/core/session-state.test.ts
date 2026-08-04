@@ -324,9 +324,48 @@ describe("computeSessionState — the ranking table", () => {
     const s = state({ record: rec({ agent: "codex", sessionStartedAt: 1_700_000_000_000 }) })!;
     expect(s.agent).toBe("codex");
     expect(s.startedAt).toBe(1_700_000_000_000);
-    for (const why of ["reap", "stale", "end", "hold", "attn", "done", "done+cc", "done/cx", "work", "work+cc", "work/cx"]) {
+    for (const why of ["reap", "stale", "end", "hold", "attn", "attn/net", "done", "done+cc", "done/cx", "work", "work+cc", "work/cx"]) {
       expect(why.length).toBeLessThanOrEqual(16);
     }
+  });
+});
+
+describe("computeSessionState — attn/net, the WORKER-UNREACHABLE discriminator (NOM-45)", () => {
+  // The hook is fail-open, so a hold that dies because the worker went away never blocks the user at the
+  // Mac — but it used to leave the PHONE on a yellow hand nobody could answer. `attentionStalledAt` is
+  // what makes the row honest; here is the half of it that rides the wire as a `why` code.
+  test("prio:1 + attentionStalledAt ⇒ still needsAttention, but why:attn/net", () => {
+    expect(state({ record: rec({ prio: 1, attentionStalledAt: NOW - 5_000 }) })).toMatchObject({
+      state: "needsAttention", why: "attn/net", blob: { kind: "sealed", value: "sealed-blob" },
+    });
+  });
+
+  test("without the marker the SAME record is a plain attn — the code is additive, never a default", () => {
+    expect(state({ record: rec({ prio: 1 }) })).toMatchObject({ why: "attn" });
+    // A record written by a plugin that predates the field simply has no key.
+    expect(state({ record: rec({ prio: 1, attentionStalledAt: undefined }) })).toMatchObject({ why: "attn" });
+  });
+
+  test("it never relabels a rung the user cannot read it on — a stale marker must not outlive its episode", () => {
+    // Every one of these carries the marker AND outranks (or falls below) rank 4. None may wear it: the
+    // watchdog's nets rebuild records by spreading `...record`, so the key can survive its own episode.
+    const stalled = (over: Partial<SessionRecord>) => rec({ attentionStalledAt: NOW - 5_000, ...over });
+    expect(state({ record: stalled({ prio: 1 }), hold: hold(), holdPidAlive: true })).toMatchObject({ why: "hold" });
+    expect(state({ record: stalled({ op: "done", prio: 1 }) })).toMatchObject({ why: "done" });
+    expect(state({ record: stalled({ op: "end", prio: 1 }) })).toMatchObject({ why: "end" });
+    expect(state({ record: stalled({ prio: 1 }), pidAlive: false })).toMatchObject({ why: "reap" });
+    expect(state({ record: stalled({ prio: 0 }) })).toMatchObject({ why: "work" });
+  });
+
+  test("a NaN/garbage marker degrades to plain attn rather than a fabricated code", () => {
+    expect(state({ record: rec({ prio: 1, attentionStalledAt: Number.NaN }) })).toMatchObject({ why: "attn" });
+    expect(state({ record: rec({ prio: 1, attentionStalledAt: "soon" as unknown as number }) }))
+      .toMatchObject({ why: "attn" });
+  });
+
+  test("the question discriminator survives alongside it — a stalled QUESTION is still a question", () => {
+    expect(state({ record: rec({ prio: 1, attentionKind: "userInput", attentionStalledAt: NOW - 5_000 }) }))
+      .toMatchObject({ state: "needsAttention", why: "attn/net", attentionKind: "userInput" });
   });
 });
 

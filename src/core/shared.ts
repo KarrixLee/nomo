@@ -546,6 +546,25 @@ export interface SessionRecord {
    *  remains only until that TUI exits or a genuine hook rebuilds this file and thereby drops the key.
    *  It never rides a worker or LAN envelope. */
   retiredAt?: number;
+  /** APPENDED LAST (NOM-45), same discipline as `attentionKind` above. Epoch ms at which an attention
+   *  episode ended because THE WORKER WAS UNREACHABLE — a first-contact POST that failed at the
+   *  transport layer with nothing found by the did-it-land probe, or a granted hold that rode
+   *  MAX_CONSECUTIVE_MISSES worth of consecutive unusable polls. NOT set for a genuine answer, an
+   *  expiry/supersede, a definitive 401/403/404/410, or a thrown exception: those are all states where
+   *  the phone's row is telling the truth.
+   *
+   *  WHY IT EXISTS (field report, 2026-08-03): the hook is fail-open, so the user is never blocked at
+   *  the Mac — but the PHONE was left showing a yellow needsAttention hand for a hold that no longer
+   *  exists, indistinguishable from a genuine dead end the user could answer. This flag is what lets
+   *  computeSessionState say `attn/net` and the settle re-seal the row's blob with `reconnecting`, so
+   *  the phone renders the honest auto-retrying treatment instead: the Mac lost contact, and it will
+   *  ask again.
+   *
+   *  LIFETIME is the same as `attentionKind`'s and for the same reason: an ordinary hook rewrite
+   *  (trackSessionAt rebuilds the record whole) drops the key, the hold-settle clears it explicitly on
+   *  the working branch so the watchdog's `...record` spreads cannot carry it forward, and
+   *  computeSessionState only reads it on the rung that can honestly show it (`record.prio === 1`). */
+  attentionStalledAt?: number;
 }
 
 /** The plaintext a pending-pairing flush needs to POST the pairing session the instant the shared key

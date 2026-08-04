@@ -14,17 +14,33 @@
 //
 // WHAT IS DELIBERATELY *NOT* HERE: the FIRST-CONTACT POST ceiling. The two callers block different
 // things and so bound it differently on purpose — permission.ts freezes the user's terminal dialog
-// behind it (POST_FIRST_CONTACT_TIMEOUT_MS, 4 s) while codex-remote-input runs detached inside the
+// behind it (POST_FIRST_CONTACT_TIMEOUT_MS, 6 s) while codex-remote-input runs detached inside the
 // watchdog and can afford the full round trip (POST_TIMEOUT_MS, 15 s). Those two are NOT duplicates;
-// each stays documented where its blocking cost is paid.
+// each stays documented where its blocking cost is paid. The first-contact ceiling for the poll GETs
+// IS here (POLL_FIRST_CONTACT_TIMEOUT_MS) — both callers pay it on the same fetch, the first one.
 
 /** How often a granted hold re-reads its decision record (ms). Callers add their own jitter. Also the
  *  cadence the LAN loopback poller re-checks the ABSENCE of lan.json at, so a watchdog that comes up
  *  mid-hold is discovered within one worker cycle. */
 export const POLL_INTERVAL_MS = 3_000;
-/** Per-fetch ceiling for the poll GETs. The permission hook's "every fetch is bounded at 2 s" contract
- *  survives on both channels; only the TOTAL wait is unbounded. */
+/** Per-fetch ceiling for the STEADY-STATE poll GETs. The permission hook's "every fetch is bounded at
+ *  2 s" contract survives on both channels; only the TOTAL wait is unbounded. Deliberately unchanged by
+ *  NOM-45: by the time a hold is polling in steady state the connection to the worker has already been
+ *  established once, so 2 s is generous and keeping it is what keeps the shared per-pairing poll budget
+ *  and the give-up arithmetic (MAX_CONSECUTIVE_MISSES × POLL_INTERVAL_MS ≈ 5 min) exactly as specified. */
 export const POLL_TIMEOUT_MS = 2_000;
+/** FIRST-CONTACT ceiling for a poll GET — the FIRST GET a process makes on this route, i.e. the
+ *  permission hook's did-it-land probe (seq 0) and the first poll of a freshly granted hold (seq 1), and
+ *  the Codex relay's first poll.
+ *
+ *  WHY IT IS BIGGER THAN POLL_TIMEOUT_MS (field report, 2026-08-03): the user's Mac resolves
+ *  api.nomo.gg through a tunnel/proxy that hands back a fake IP (28.0.0.19). A HEALTHY request through
+ *  it completes in ~590 ms, but the FIRST connection of a process pays the proxy's own DNS + connect +
+ *  TLS setup, and when that stalls it stalls for seconds. Six consecutive 2 s GETs all timed out, and
+ *  the retry hook's POST + 2 s did-it-land probe timed out too — so the Mac gave up on a hold the phone
+ *  was still showing. A steady-state cadence tuned for an established connection is the wrong budget for
+ *  the handshake that establishes it; every subsequent GET keeps the tight 2 s. */
+export const POLL_FIRST_CONTACT_TIMEOUT_MS = 4_000;
 /** One retry of the initial decision POST — and ONLY after a FAST transport failure (connection
  *  refused, DNS, reset). A TIMEOUT is never retried (a second stall buys no new information and doubles
  *  the freeze) and a non-ok HTTP status is never retried either (that is a real answer). The retry
@@ -34,9 +50,19 @@ export const POLL_TIMEOUT_MS = 2_000;
 export const POST_MAX_ATTEMPTS = 2;
 /** Pause before that single POST retry. */
 export const POST_RETRY_PAUSE_MS = 1_000;
-/** Give-up cap: this many CONSECUTIVE polls without a usable 2xx (~5 min at the interval above) means
- *  the worker is unreachable → stop waiting and fail open. Any successful poll — including a plain
- *  {status:"pending"} — resets the counter, so a healthy hold is unbounded. */
+/** Give-up CEILING: this many CONSECUTIVE polls without a usable 2xx (~5 min at the interval above)
+ *  means the worker is unreachable → stop waiting and fail open. Any successful poll — including a plain
+ *  {status:"pending"} — resets the counter, so a healthy hold is unbounded.
+ *
+ *  THIS IS A TOLERANCE, NOT A TRIPWIRE, and NOM-45 keeps it that way deliberately. A transport throw is
+ *  worth ONE miss and nothing more: it is never a definitive strike (see DEFINITIVE_POLL_STATUSES /
+ *  MAX_DEFINITIVE_POLL_FAILURES below, which release in 2), so a tunnel that stalls for 20 s — six, ten,
+ *  thirty consecutive timeouts — costs the hold nothing but those misses and RESUMES polling the instant
+ *  one GET completes. 100 is the ceiling that keeps fail-open honest: a Mac whose network never comes
+ *  back must still hand the user their terminal dialog rather than block forever, and ~5 min is the point
+ *  past which "it will be back in a moment" stops being true. The phone learns which of the two happened
+ *  from the record's `attentionStalledAt` (see SessionRecord) — a give-up here is a RECONNECTING row,
+ *  never a dead yellow hand. */
 export const MAX_CONSECUTIVE_MISSES = 100;
 
 /** Poll statuses that are DEFINITIVE, not transient: the pairing is unauthorized/revoked/unknown, so

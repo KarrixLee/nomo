@@ -407,6 +407,74 @@ describe("startCodexRemoteInput", () => {
     expect(polls).toBe(100); // MAX_CONSECUTIVE_MISSES
   });
 
+  // ---- NOM-45 · the honest transient state, the permission hook's twin -------------------------
+  test("a POST that never reaches the worker stamps the record RECONNECTING (no hold was ever created)", async () => {
+    let settled: Partial<SessionRecord> | undefined;
+    const handle = startCodexRemoteInput(request(), {
+      config,
+      fetchFn: (async (input) => {
+        // The resolve echo is best-effort and swallows its own failures; the decision POST is what stalls.
+        if (String(input).endsWith("/v1/cc/decision")) { const e = new Error("t"); e.name = "TimeoutError"; throw e; }
+        return Response.json({ ok: true });
+      }) as typeof fetch,
+      readRecordFn: async () => record,
+      randomUUID: () => "relay-stall",
+      now: () => 9_000,
+      localApprovalsStateFn: async () => "on",
+      sleep: async () => {},
+      answerAppServer: async () => "sent",
+      interruptAppServer: async () => "sent",
+      settleHoldRecordFn: async (_sessionId, patch) => { settled = patch; },
+    });
+
+    expect(await handle.completion).toBe("transport-error");     // Codex is unblocked at the Mac, as before
+    expect(settled).toMatchObject({ attentionStalledAt: 9_000 });
+    const blob = await decryptBlob(key, settled!.blob as string) as Record<string, unknown>;
+    expect(blob).toMatchObject({ status: "needsAttention", reconnecting: 9 });
+  });
+
+  test("a give-up after the miss ceiling settles RECONNECTING too — and an ANSWER never does", async () => {
+    const answerBlob = await encryptBlob(key, { requestId: "relay-x", decision: "answer", answers: ["Fast"] });
+    const run = async (id: string, garbageForever: boolean) => {
+      let settled: Partial<SessionRecord> | undefined;
+      const handle = startCodexRemoteInput(request(), {
+        config,
+        fetchFn: (async (input) => {
+          if (String(input).endsWith("/v1/cc/decision")) return Response.json({ hold: true });
+          return garbageForever
+            ? new Response("garbage", { status: 200 })
+            : Response.json({ status: "answered", answerBlob: await encryptBlob(key, {
+              requestId: id, decision: "answer", answers: ["Fast"],
+            }) });
+        }) as typeof fetch,
+        readRecordFn: async () => record,
+        randomUUID: () => id,
+        now: () => 9_000,
+        localApprovalsStateFn: async () => "on",
+        sleep: async () => {},
+        answerAppServer: async () => "sent",
+        interruptAppServer: async () => "sent",
+        writeHoldFn: async () => {},
+        clearHoldFn: async (_s, _p, beforeUnlink) => { await beforeUnlink?.(); return true; },
+        settleHoldRecordFn: async (_sessionId, patch) => { settled = patch; },
+      });
+      return { result: await handle.completion, settled };
+    };
+
+    const gaveUp = await run("relay-giveup", true);
+    expect(gaveUp.result).toBe("transport-error");
+    expect(gaveUp.settled).toMatchObject({ attentionStalledAt: 9_000 });
+    expect(await decryptBlob(key, gaveUp.settled!.blob as string)).toMatchObject({ reconnecting: 9 });
+
+    const answered = await run("relay-answered", false);
+    expect(answered.result).toBe("answered");
+    // CLEARED, not merely omitted: the watchdog rebuilds records by spreading `...record`.
+    expect("attentionStalledAt" in (answered.settled as object)).toBe(true);
+    expect(answered.settled!.attentionStalledAt).toBeUndefined();
+    expect(await decryptBlob(key, answered.settled!.blob as string)).not.toHaveProperty("reconnecting");
+    expect(answerBlob.length).toBeGreaterThan(0);
+  });
+
   test("a throwing dependency degrades instead of rejecting the completion promise", async () => {
     const errors: Error[] = [];
     let fetched = false;

@@ -6,7 +6,11 @@ import {
   buildPermissionSummary, buildPermissionDetail, buildPermissionQuestions, fitPermissionDetail,
   sealedBlobChars, BLOB_FIT_CHARS, runPermissionHook, approvalsCommand, NO_HOLD_PATH, TRACE_PATH,
   codexRolloutSessionId, codexTurnPolicyFromRollout, loadCodexTurnPolicy,
+  POST_FIRST_CONTACT_TIMEOUT_MS,
 } from "./permission";
+import {
+  MAX_CONSECUTIVE_MISSES, POLL_FIRST_CONTACT_TIMEOUT_MS, POLL_TIMEOUT_MS,
+} from "./decision-poll";
 import { encryptBlob, decryptBlob } from "./crypto";
 import { createLanAnswerStore, createLanListener } from "./lan-listener";
 import type { LanAnswerStore, LanListener } from "./lan-listener";
@@ -730,6 +734,141 @@ describe("runPermissionHook — hold state machine", () => {
     expect(probe.order).toEqual([]);
   });
 
+  // ---- NOM-45 · THE HONEST TRANSIENT STATE ------------------------------------------------------
+  // Field report 2026-08-03 (pids 49753/49836): a Codex TUI question held fine, then every poll timed
+  // out through a stalled tunnel and the retry hook's POST timed out too. The user was never blocked at
+  // the Mac (fail-open works), but the PHONE kept a yellow needsAttention hand for a hold that no longer
+  // existed — indistinguishable from a genuine dead end. These pin the difference on the wire.
+
+  /** `undefined` for a patch that never stamped the stall — a `null`/0 here would be a fabricated one. */
+  const stallOf = async (patch: Record<string, unknown> | undefined) => {
+    if (!patch) return undefined;
+    const blob = patch.blob === undefined
+      ? undefined
+      : await decryptBlob(KEY, patch.blob as string) as Record<string, unknown>;
+    return { at: patch.attentionStalledAt, reconnecting: blob?.reconnecting, status: blob?.status };
+  };
+
+  test("a hold that GAVE UP because the worker was unreachable settles RECONNECTING, not a dead yellow hand", async () => {
+    const emitted: string[] = [];
+    const events: Array<{ event: string; [k: string]: unknown }> = [];
+    const { fn, calls } = scriptFetch(true, ["throw"]);           // every poll fails at the transport
+    const probe = settleProbe();
+    await runPermissionHook(baseDeps({
+      fetchFn: fn, emit: (l: string) => emitted.push(l), holdPid: 9_001, now: () => 5_000,
+      readRecordFn: async () => HELD_RECORD,
+      trace: (e: { event: string }) => events.push(e as { event: string }),
+      ...probe.deps,
+    }) as never);
+    // FAIL-OPEN IS UNCHANGED — the ceiling still hands the user their terminal dialog.
+    expect(emitted).toEqual([]);
+    expect(calls.filter((c) => c.method === "GET").length).toBe(MAX_CONSECUTIVE_MISSES);
+    expect(events.find((e) => e.event === "giveup")).toMatchObject({ stalled: true });
+    expect(events.at(-1)).toMatchObject({ event: "exit", reason: "giveup" });
+    // …and the row the phone keeps is now legible as auto-retrying rather than answerable.
+    expect(probe.patches).toHaveLength(1);
+    expect(await stallOf(probe.patches[0]))
+      .toEqual({ at: 5_000, reconnecting: 5, status: "needsAttention" });
+    // Still the same rung — the user really is blocked, just at the Mac. Never "working", never done.
+    const settled = { ...HELD_RECORD, ...probe.patches[0] } as Record<string, unknown>;
+    expect(settled).toMatchObject({ op: "update", prio: 1, lastEvent: "needsAttention" });
+    // ORDERING, unchanged: the record is written before the marker is retired.
+    expect(probe.order).toEqual(["settle", "clear"]);
+  });
+
+  test("ONLY the unreachable exits stamp it — answered / superseded / expired / definitive do NOT", async () => {
+    const answerBlob = await encryptBlob(KEY, { requestId: "req-fixed", decision: "allow", ts: 5 });
+    const cases: Array<[string, Array<Record<string, unknown> | "throw" | number>]> = [
+      ["answered", [{ status: "answered", answerBlob }]],
+      ["superseded", [{ status: "superseded" }]],
+      ["expired", [{ status: "expired" }]],
+      ["definitive", [403]],                                     // 2 strikes → release, worker SPOKE
+    ];
+    for (const [name, gets] of cases) {
+      const { fn } = scriptFetch(true, gets);
+      const probe = settleProbe();
+      await runPermissionHook(baseDeps({
+        fetchFn: fn, emit: () => {}, holdPid: 9_001, now: () => 5_000,
+        readRecordFn: async () => HELD_RECORD,
+        ...probe.deps,
+      }) as never);
+      expect(probe.patches).toHaveLength(1);
+      const settled = { ...HELD_RECORD, ...probe.patches[0] } as Record<string, unknown>;
+      // The patch must CLEAR any marker, not merely omit it: the watchdog rebuilds records by spreading
+      // `...record`, so an omitted key would let a previous stall ride forward onto a recovered row.
+      expect("attentionStalledAt" in (probe.patches[0] as object)).toBe(true);
+      expect(settled.attentionStalledAt, name).toBeUndefined();
+      const blob = await decryptBlob(KEY, settled.blob as string) as Record<string, unknown>;
+      expect("reconnecting" in blob, name).toBe(false);
+    }
+  });
+
+  test("post-error whose PROBE never reached the worker stamps the stall (the field case, pid 49836)", async () => {
+    const events: Array<{ event: string; [k: string]: unknown }> = [];
+    const probe = settleProbe();
+    const fn = (async () => { const e = new Error("timeout"); e.name = "TimeoutError"; throw e; }) as unknown as typeof fetch;
+    await runPermissionHook(baseDeps({
+      fetchFn: fn, emit: () => {}, now: () => 5_000,
+      readRecordFn: async () => HELD_RECORD,
+      trace: (e: { event: string }) => events.push(e as { event: string }),
+      ...probe.deps,
+    }) as never);
+    expect(events.at(-1)).toMatchObject({ event: "exit", reason: "post-error", stalled: true });
+    // No hold was ever granted, so the settle is written DIRECTLY (the clear never runs).
+    expect(probe.patches).toHaveLength(1);
+    expect(await stallOf(probe.patches[0]))
+      .toEqual({ at: 5_000, reconnecting: 5, status: "needsAttention" });
+    expect(probe.order).toEqual(["settle"]);
+  });
+
+  test("post-error where the WORKER SPOKE (404 probe) stamps nothing — that row is not lying", async () => {
+    const events: Array<{ event: string; [k: string]: unknown }> = [];
+    const probe = settleProbe();
+    const fn = (async (url: string) => {
+      if (url.endsWith("/v1/cc/decision")) { const e = new Error("timeout"); e.name = "TimeoutError"; throw e; }
+      return new Response("", { status: 404 });                  // nothing was ever held
+    }) as unknown as typeof fetch;
+    await runPermissionHook(baseDeps({
+      fetchFn: fn, emit: () => {},
+      readRecordFn: async () => HELD_RECORD,
+      trace: (e: { event: string }) => events.push(e as { event: string }),
+      ...probe.deps,
+    }) as never);
+    expect(events.at(-1)).toMatchObject({ event: "exit", reason: "post-error" });
+    expect(events.at(-1)!.stalled).toBeUndefined();
+    expect(probe.patches).toEqual([]);
+  });
+
+  test("a fresh-session RE-ASK that dies at the transport stamps the stall (round 1 already painted the row)", async () => {
+    const probe = settleProbe();
+    const events: Array<{ event: string; [k: string]: unknown }> = [];
+    let posts = 0;
+    const fn = (async (url: string) => {
+      if (!url.endsWith("/v1/cc/decision")) throw new Error("no GET expected");
+      posts += 1;
+      if (posts === 1) return new Response(JSON.stringify({ hold: false }), { status: 200 });
+      const e = new Error("timeout"); e.name = "TimeoutError"; throw e; // the network died under the re-ask
+    }) as unknown as typeof fetch;
+    await runPermissionHook(baseDeps({
+      fetchFn: fn, emit: () => {}, now: () => 5_000,
+      readRecordFn: async () => null,                            // brand-new session → the re-ask runs
+      trace: (e: { event: string }) => events.push(e as { event: string }),
+      ...probe.deps,
+    }) as never);
+    expect(posts).toBe(2);
+    expect(events.at(-1)).toMatchObject({ event: "exit", reason: "hold-false", stalled: true });
+    expect(await stallOf(probe.patches[0])).toMatchObject({ at: 5_000, reconnecting: 5 });
+  });
+
+  test("a plain hold:false (the worker SAID no) stamps nothing", async () => {
+    const probe = settleProbe();
+    const { fn } = scriptFetch(false, []);
+    await runPermissionHook(baseDeps({
+      fetchFn: fn, emit: () => {}, readRecordFn: async () => null, ...probe.deps,
+    }) as never);
+    expect(probe.patches).toEqual([]);
+  });
+
   test("POST body is the frozen wire shape: decisionPending blob + needsAttention fallbackBlob", async () => {
     const { fn, calls } = scriptFetch(false, []);
     await runPermissionHook(baseDeps({ fetchFn: fn, emit: () => {} }) as never);
@@ -853,6 +992,99 @@ describe("runPermissionHook — hold state machine", () => {
     await runPermissionHook(baseDeps({ fetchFn: fn, emit: (l: string) => emitted.push(l) }) as never);
     expect(emitted).toEqual([ALLOW]);                                  // the strike streak is broken by the 200
     expect(calls.filter((c) => c.method === "GET").length).toBe(4);
+  });
+
+  // ---- NOM-45 · TUNNEL TOLERANCE ---------------------------------------------------------------
+  // The user's Mac resolves api.nomo.gg through a proxy that hands back a fake IP: a HEALTHY request is
+  // ~590 ms, but the FIRST connection of a short-lived hook pays that proxy's DNS + connect + TLS setup,
+  // and at 2 s/4 s the whole first-contact leg timed out on a hold the phone was already showing.
+  test("FIRST CONTACT gets a bigger budget than the steady-state poll — and steady state is untouched", () => {
+    expect(POLL_TIMEOUT_MS).toBe(2_000);                          // the "every poll is bounded" contract
+    expect(POLL_FIRST_CONTACT_TIMEOUT_MS).toBe(4_000);
+    expect(POST_FIRST_CONTACT_TIMEOUT_MS).toBe(6_000);
+    expect(POLL_FIRST_CONTACT_TIMEOUT_MS).toBeGreaterThan(POLL_TIMEOUT_MS);
+    // WORST-CASE PRE-DIALOG BLOCK on a fully stalled network, and the bar it must stay under: one POST
+    // (never retried after a timeout) + one did-it-land probe.
+    expect(POST_FIRST_CONTACT_TIMEOUT_MS + POLL_FIRST_CONTACT_TIMEOUT_MS).toBeLessThanOrEqual(10_000);
+  });
+
+  test("the budget is spent on the first GETs only — seq 0/1 first-contact, seq 2+ steady state", async () => {
+    const answerBlob = await encryptBlob(KEY, { requestId: "req-fixed", decision: "allow", ts: 5 });
+    const events: Array<{ event: string; seq?: number; budgetMs?: number }> = [];
+    const { fn } = scriptFetch(true, [{ status: "pending" }, { status: "pending" }, { status: "answered", answerBlob }]);
+    await runPermissionHook(baseDeps({
+      fetchFn: fn, emit: () => {},
+      trace: (e: { event: string; seq?: number; budgetMs?: number }) => events.push(e),
+    }) as never);
+    const budgets = events.filter((e) => e.event === "poll-begin").map((e) => [e.seq, e.budgetMs]);
+    expect(budgets).toEqual([
+      [1, POLL_FIRST_CONTACT_TIMEOUT_MS],                         // the freshly granted hold's first GET
+      [2, POLL_TIMEOUT_MS],
+      [3, POLL_TIMEOUT_MS],
+    ]);
+  });
+
+  test("the did-it-land probe (seq 0) is first contact too — it IS this process's first GET", async () => {
+    const answerBlob = await encryptBlob(KEY, { requestId: "req-fixed", decision: "allow", ts: 5 });
+    const events: Array<{ event: string; seq?: number; budgetMs?: number }> = [];
+    let gets = 0;
+    const fn = (async (url: string) => {
+      if (url.endsWith("/v1/cc/decision")) { const e = new Error("timeout"); e.name = "TimeoutError"; throw e; }
+      gets += 1;                                                  // seq 0 finds it pending, seq 1 answers
+      return new Response(JSON.stringify(
+        gets === 1 ? { status: "pending" } : { status: "answered", answerBlob }), { status: 200 });
+    }) as unknown as typeof fetch;
+    await runPermissionHook(baseDeps({
+      fetchFn: fn, emit: () => {},
+      trace: (e: { event: string; seq?: number; budgetMs?: number }) => events.push(e),
+    }) as never);
+    expect(events.find((e) => e.event === "poll-begin" && e.seq === 0)?.budgetMs)
+      .toBe(POLL_FIRST_CONTACT_TIMEOUT_MS);
+  });
+
+  test("a SHORT tunnel stall is survived, not released — the hold resumes polling and still answers", async () => {
+    const answerBlob = await encryptBlob(KEY, { requestId: "req-fixed", decision: "allow", ts: 5 });
+    const emitted: string[] = [];
+    const probe = settleProbe();
+    // Thirty consecutive TimeoutErrors — five times the field report's six — then the tunnel recovers.
+    const gets: Array<Record<string, unknown> | "throw"> = [
+      ...Array<"throw">(30).fill("throw"), { status: "answered", answerBlob },
+    ];
+    const { fn, calls } = scriptFetch(true, gets);
+    await runPermissionHook(baseDeps({
+      fetchFn: fn, emit: (l: string) => emitted.push(l), holdPid: 9_001,
+      readRecordFn: async () => HELD_RECORD,
+      ...probe.deps,
+    }) as never);
+    expect(emitted).toEqual([ALLOW]);                             // the phone's answer still lands
+    expect(calls.filter((c) => c.method === "GET").length).toBe(31);
+    // …and nothing was ever painted as reconnecting: the hold never gave up.
+    const settled = { ...HELD_RECORD, ...probe.patches[0] } as Record<string, unknown>;
+    expect(settled).toMatchObject({ prio: 0, lastEvent: "working" });
+    expect(settled.attentionStalledAt).toBeUndefined();
+  });
+
+  test("…but PAST the ceiling it still fails open — a bounded tolerance, never an indefinite block", async () => {
+    const emitted: string[] = [];
+    const events: Array<{ event: string; [k: string]: unknown }> = [];
+    const { fn, calls } = scriptFetch(true, ["throw"]);
+    await runPermissionHook(baseDeps({
+      fetchFn: fn, emit: (l: string) => emitted.push(l),
+      trace: (e: { event: string }) => events.push(e as { event: string }),
+    }) as never);
+    expect(emitted).toEqual([]);                                  // fail-open: CC shows its own dialog
+    expect(calls.filter((c) => c.method === "GET").length).toBe(MAX_CONSECUTIVE_MISSES);
+    expect(events.at(-1)).toMatchObject({ event: "exit", reason: "giveup" });
+  });
+
+  test("a transport throw is never a DEFINITIVE strike — timeouts must not release like a 403", async () => {
+    const answerBlob = await encryptBlob(KEY, { requestId: "req-fixed", decision: "allow", ts: 5 });
+    const emitted: string[] = [];
+    // Two consecutive 403s WOULD release in 2; two consecutive throws must not.
+    const { fn, calls } = scriptFetch(true, ["throw", "throw", { status: "answered", answerBlob }]);
+    await runPermissionHook(baseDeps({ fetchFn: fn, emit: (l: string) => emitted.push(l) }) as never);
+    expect(emitted).toEqual([ALLOW]);
+    expect(calls.filter((c) => c.method === "GET").length).toBe(3);
   });
 
   test("429/5xx stay TRANSIENT — they ride the miss cap, never the definitive release", async () => {

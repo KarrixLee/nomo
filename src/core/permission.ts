@@ -5,8 +5,9 @@
 // while the phone decides; otherwise it falls straight through to the normal terminal dialog.
 //
 // CONTRACT — this module DELIBERATELY breaks the plugin's "2s, never block" rule that every other
-// entry keeps (see hook.ts:12-14 and cc-watchdog.ts's header). Every poll fetch still has a 2s ceiling
-// and the one blocking POST has a 4s one (so a dead network costs ~6s BEFORE the dialog, never the ~33s
+// entry keeps (see hook.ts:12-14 and cc-watchdog.ts's header). Every STEADY-STATE poll fetch still has a
+// 2s ceiling, first contact gets a bigger one for the proxy/tunnel handshake (POST 6s, first GET 4s —
+// so a dead network costs ~10s BEFORE the dialog, never the ~33s
 // the old 15s×2 ceiling cost — see POST_FIRST_CONTACT_TIMEOUT_MS), but the TOTAL wait ONCE A HOLD IS
 // GRANTED is unbounded: the hook polls until the phone answers, the request is
 // expired/superseded server-side, sustained downlink failure trips the give-up cap, or the process is
@@ -36,7 +37,8 @@ import { b64url, decryptBlob, deriveLanKey, encryptBlob } from "./crypto";
 // polls the SAME route with the same credentials. See decision-poll.ts for what is deliberately NOT
 // shared — the first-contact POST ceiling, which each caller bounds by what IT blocks.
 import {
-  DEFINITIVE_POLL_STATUSES, MAX_CONSECUTIVE_MISSES, MAX_DEFINITIVE_POLL_FAILURES, POLL_INTERVAL_MS,
+  DEFINITIVE_POLL_STATUSES, MAX_CONSECUTIVE_MISSES, MAX_DEFINITIVE_POLL_FAILURES,
+  POLL_FIRST_CONTACT_TIMEOUT_MS, POLL_INTERVAL_MS,
   POLL_TIMEOUT_MS, POST_MAX_ATTEMPTS, POST_RETRY_PAUSE_MS,
 } from "./decision-poll";
 // The PURE wire contract only — deliberately NOT "./lan-listener": this hook is a short-lived process
@@ -65,14 +67,24 @@ export { BLOB_FIT_CHARS, NO_HOLD_PATH, sealedBlobChars };
  *  under a second; a stall past a few seconds means the network is gone, and the only useful thing to do
  *  with that answer is fail open NOW.
  *
- *  WORST-CASE PRE-DIALOG BLOCK, stalled network: POST_FIRST_CONTACT_TIMEOUT_MS (4s) + POLL_TIMEOUT_MS
- *  (2s did-it-land probe) ≈ 6s, because a TIMEOUT is never retried (see POST_MAX_ATTEMPTS). A network
- *  that fails FAST (connection refused, DNS NXDOMAIN) costs ~0 + POST_RETRY_PAUSE_MS + ~0 + 2s ≈ 3s.
- *  Both stay under the ~10s bar. The fresh-session re-ask (HOLD_RETRY_DELAY_MS + one more short POST)
- *  rides on top of that, but ONLY on the path where the worker already ANSWERED — i.e. it is reachable,
- *  so it is never the dead-network case. Once a hold IS granted the wait becomes unbounded ON PURPOSE
- *  (the phone owns the dialog) and every fetch from there on is a 2s poll GET. */
-const POST_FIRST_CONTACT_TIMEOUT_MS = 4_000;
+ *  …AND WHY IT GREW BACK FROM 4s TO 6s (NOM-45, field report 2026-08-03). "A worker that is reachable
+ *  at all answers in well under a second" is true of a DIRECT connection. The user's Mac resolves
+ *  api.nomo.gg through a tunnel/proxy that hands back a fake IP (28.0.0.19): a healthy request through
+ *  it still completes in ~590 ms, but the FIRST connection of a short-lived hook process pays that
+ *  proxy's own DNS + connect + TLS setup, and when it stalls it stalls for SECONDS. At 4s the whole
+ *  first-contact leg — POST *and* the 2s did-it-land probe — timed out on a hold the phone was already
+ *  showing, so the Mac fell open while the phone kept a yellow hand nobody could answer. 6s buys the
+ *  handshake; the steady-state poll cadence and its 2s ceiling are untouched (see POLL_TIMEOUT_MS).
+ *
+ *  WORST-CASE PRE-DIALOG BLOCK, stalled network: POST_FIRST_CONTACT_TIMEOUT_MS (6s) +
+ *  POLL_FIRST_CONTACT_TIMEOUT_MS (4s did-it-land probe) = 10s, because a TIMEOUT is never retried (see
+ *  POST_MAX_ATTEMPTS). A network that fails FAST (connection refused, DNS NXDOMAIN) costs ~0 +
+ *  POST_RETRY_PAUSE_MS + ~0 + ~0 ≈ 1s. Both stay at or under the ~10s bar, and both remain a fraction of
+ *  the ~33s the old 15s×2 ceiling cost. The fresh-session re-ask (HOLD_RETRY_DELAY_MS + one more short
+ *  POST) rides on top of that, but ONLY on the path where the worker already ANSWERED — i.e. it is
+ *  reachable, so it is never the dead-network case. Once a hold IS granted the wait becomes unbounded ON
+ *  PURPOSE (the phone owns the dialog) and every fetch from there on is a 2s poll GET. */
+export const POST_FIRST_CONTACT_TIMEOUT_MS = 6_000;
 /** A fresh session's FIRST permission prompt can fire BEFORE the phone app's ~3s poll has added the
  *  session to the worker's island shown-list, so the very first decision POST correctly comes back
  *  {hold:false} (session not shown yet) and the prompt falls open — even though the session lands in
@@ -1418,14 +1430,20 @@ export async function runPermissionHook(
     // loop so both read the record exactly the same way. Returns the parsed body (only on a 2xx) plus the
     // HTTP status (0 = the fetch threw/timed out) — never throws.
     const pollDecision = async (seq: number): Promise<{ data?: { status?: string; answerBlob?: string }; status: number }> => {
+      // FIRST CONTACT gets the bigger budget (NOM-45): seq 0 is the did-it-land probe after a POST that
+      // already stalled, and seq 1 is the freshly granted hold's first GET — both are the FIRST fetch
+      // this short-lived process completes on this route, so both pay the proxy/tunnel handshake the
+      // steady-state 2s ceiling was never sized for. Every poll from seq 2 on keeps the tight 2s.
+      const budgetMs = seq <= 1 ? POLL_FIRST_CONTACT_TIMEOUT_MS : POLL_TIMEOUT_MS;
       // poll-begin/poll-end straddle the fetch so an abort or kill MID-FETCH is visible: a begin with
       // no matching end means the process died inside the GET (the prime suspect for a hold that
-      // never completes its first poll).
-      trace({ event: "poll-begin", seq });
+      // never completes its first poll). `budgetMs` rides along so a trace of consecutive TimeoutErrors
+      // says which ceiling each one hit.
+      trace({ event: "poll-begin", seq, budgetMs });
       try {
         const res = await fetchFn(`${config.url}/v1/cc/decision/${requestId}`, {
           headers: pcHeaders,
-          signal: AbortSignal.timeout(POLL_TIMEOUT_MS),
+          signal: AbortSignal.timeout(budgetMs),
         });
         if (!res.ok) {
           trace({ event: "poll-end", seq, outcome: "status", status: res.status });
@@ -1440,17 +1458,62 @@ export async function runPermissionHook(
       }
     };
 
+    // ---- THE HONEST TRANSIENT STATE (NOM-45) ------------------------------------------------------
+    // When this hook stops because THE WORKER WAS UNREACHABLE, the user is fine — fail-open hands them
+    // the terminal dialog — but the PHONE is not: it keeps whatever attention row the last successful
+    // POST painted, a yellow hand for a hold that no longer exists and that no tap can resolve. Field
+    // report 2026-08-03 (pids 49753/49836): a Codex TUI question held fine, six consecutive polls timed
+    // out through a stalled proxy, the retry hook's POST timed out too, and the phone was left on an
+    // unanswerable `att/ans` row indistinguishable from a genuine dead end.
+    //
+    // So say so, on the record, where BOTH channels read it: `attentionStalledAt` gives
+    // computeSessionState its `attn/net` code, and the blob is re-sealed from the SAME plain attention
+    // frame plus a `reconnecting` key so the phone's row (worker envelope or LAN snapshot — one blob,
+    // both legs) renders the auto-retrying treatment instead. The write goes through
+    // settleDecisionHoldRecord, so it is a no-op unless the record is still the plain update/prio:1 row
+    // this episode owned — a later hook that already moved the session on is never walked back.
+    //
+    // Set ONLY on the transport-failure exits. A definitive 401/403/404/410, a genuine answer, an
+    // expiry/supersede and a thrown exception all leave the row telling the truth already.
+    let attentionStalled = false;
+    /** The stall patch: the plain attention frame the phone already has, plus the one key that turns a
+     *  dead hand into "Reconnecting…". Best-effort seal — a frame that will not encrypt still settles
+     *  with the plain fallback, because a missing breadcrumb is better than a frozen `ts`. */
+    const stalledPatch = async (at: number): Promise<Partial<SessionRecord>> => {
+      let stalledBlob = fallbackBlob;
+      try {
+        stalledBlob = await encryptBlob(config.e2eKey, { ...base, reconnecting: Math.floor(at / 1000) });
+      } catch { /* the plain attention frame is still honest, just less specific */ }
+      return { ts: at, blob: stalledBlob, attentionStalledAt: at };
+    };
+    /** Stamp the stall on a session this hook never got to hold (the POST itself never landed). The
+     *  holds' own exits ride settleHeldRecord below instead, so the marker is written exactly once. */
+    const markAttentionStalled = async (): Promise<void> => {
+      const at = (deps.now ?? Date.now)();
+      try {
+        await (deps.settleHoldRecordFn ?? defaultSettleHoldRecord())(sessionId, await stalledPatch(at));
+      } catch { /* best-effort, exactly like every other settle */ }
+    };
+
     let { posted, hold, reason: holdReason } = await postDecision(1, POST_MAX_ATTEMPTS);
     if (!posted) {
       // Both POSTs failed at the TRANSPORT layer — but a client-side timeout says nothing about whether
       // the request LANDED. If the first one did, the worker is holding a real record and the phone is
       // already showing the card: exiting here would fail open on the Mac while the phone still claims it
-      // can decide, and a tap would be applied to nothing. So spend ONE cheap GET (seq 0, same 2 s
+      // can decide, and a tap would be applied to nothing. So spend ONE cheap GET (seq 0, first-contact
       // ceiling) asking whether the record exists. A live record ⇒ honor the hold and fall into the normal
       // poll loop; anything else — no record, an error, a terminal status — ⇒ fail open exactly as before.
       const probe = await pollDecision(0);
       const live = probe.data?.status === "pending" || probe.data?.status === "answered";
-      if (!live) { trace({ event: "exit", reason: "post-error" }); return; }
+      if (!live) {
+        // TRANSPORT vs ANSWER. `status: 0` means the probe itself never reached the worker, so we do not
+        // know what the phone is showing and must assume the worst (the field case). A real HTTP status
+        // — 404 "no such record", 200 {expired} — is the worker SPEAKING: nothing was ever held, or it is
+        // already retired, and the row is not lying. Only the first case is a stall.
+        if (probe.status === 0) await markAttentionStalled();
+        trace({ event: "exit", reason: "post-error", ...(probe.status === 0 ? { stalled: true } : {}) });
+        return;
+      }
       trace({ event: "post-timeout-landed", status: probe.data?.status });
       hold = true;
       holdReason = undefined;
@@ -1472,7 +1535,14 @@ export async function runPermissionHook(
       trace({ event: "hold-retry-wait", delayMs: HOLD_RETRY_DELAY_MS });
       await sleep(HOLD_RETRY_DELAY_MS);
       const retry = await postDecision(2, 1);
-      if (!retry.posted) { trace({ event: "exit", reason: "hold-false" }); return; } // re-ask failed at transport → fall open
+      if (!retry.posted) {
+        // The re-ask failed at TRANSPORT → fall open. Round 1 already succeeded, which means the worker
+        // stored and pushed the fallback attention frame — the phone IS showing a yellow row — and the
+        // network then died under us. Same honest transient state as every other unreachable exit.
+        await markAttentionStalled();
+        trace({ event: "exit", reason: "hold-false", stalled: true });
+        return;
+      }
       hold = retry.hold;
       holdReason = retry.reason;
       trace({ event: "hold", hold, ...(holdReason !== undefined ? { reason: holdReason } : {}) });
@@ -1530,9 +1600,17 @@ export async function runPermissionHook(
           // The approval episode is over; a stale marker would otherwise ride forward on every
           // record the watchdog rebuilds by spreading `...record`.
           attentionKind: undefined,
+          // …and neither may a stall marker: the phone answered, so contact plainly exists.
+          attentionStalledAt: undefined,
           blob: await encryptBlob(config.e2eKey, { ...base, status: "working", at: Math.floor(settledAt / 1000) }),
         }
-        : { ts: settledAt, blob: fallbackBlob };
+        // THREE honest settles now. `attentionStalled` is the third: the hold ended because the worker
+        // went unreachable, so the same yellow gets the `reconnecting` breadcrumb and the phone reads it
+        // as auto-retrying. Every other release re-stamps the plain attention frame and CLEARS any
+        // marker a previous stalled episode left, so a row that has recovered cannot keep claiming it.
+        : attentionStalled
+          ? await stalledPatch(settledAt)
+          : { ts: settledAt, blob: fallbackBlob, attentionStalledAt: undefined };
       await (deps.settleHoldRecordFn ?? defaultSettleHoldRecord())(sessionId, patch);
     };
 
@@ -1647,7 +1725,13 @@ export async function runPermissionHook(
           definitiveFailures = 0;
         }
         if (++misses >= MAX_CONSECUTIVE_MISSES) {
-          trace({ event: "giveup", misses });
+          // SUSTAINED unreachability — ~5 min of consecutive unusable polls, transport throws and 429/5xx
+          // alike (a definitive status released two strikes ago, above). Fail open at the Mac, and tell
+          // the phone the truth on the way out: this row is not a question waiting for a tap, it is a
+          // computer that lost contact and will ask again. The settle rides the `finally`'s
+          // compare-and-clear, so it lands before the marker is retired.
+          attentionStalled = true;
+          trace({ event: "giveup", misses, stalled: true });
           trace({ event: "exit", reason: "giveup" });
           return; // sustained downlink failure → fail open silently
         }

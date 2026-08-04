@@ -10,7 +10,8 @@ import type { LanAnswerStore } from "./lan-listener";
 // The relay's timing/give-up rules, shared verbatim with the Claude permission hook (permission.ts),
 // which polls the SAME route with the same credentials — see decision-poll.ts.
 import {
-  DEFINITIVE_POLL_STATUSES, MAX_CONSECUTIVE_MISSES, MAX_DEFINITIVE_POLL_FAILURES, POLL_INTERVAL_MS,
+  DEFINITIVE_POLL_STATUSES, MAX_CONSECUTIVE_MISSES, MAX_DEFINITIVE_POLL_FAILURES,
+  POLL_FIRST_CONTACT_TIMEOUT_MS, POLL_INTERVAL_MS,
   POLL_TIMEOUT_MS, POST_MAX_ATTEMPTS, POST_RETRY_PAUSE_MS,
 } from "./decision-poll";
 import {
@@ -307,6 +308,32 @@ async function runRemoteInput(
       const timer = setTimeout(resolve, ms);
       timer.unref?.();
     }));
+    // THE HONEST TRANSIENT STATE (NOM-45) — the permission hook's twin, and for the identical reason:
+    // when this relay stops because THE WORKER WAS UNREACHABLE, Codex is unblocked at the Mac but the
+    // phone keeps the yellow attention row the last successful POST painted, unanswerable and
+    // indistinguishable from a real dead end. `attentionStalledAt` + the blob's `reconnecting` key make
+    // it read as auto-retrying on both channels. Set ONLY on the two transport-failure exits; a
+    // definitive status, an expiry/supersede, an unreadable-but-real reply and a genuine answer all
+    // leave the row telling the truth.
+    let attentionStalled = false;
+    const stalledPatch = async (at: number): Promise<Partial<SessionRecord>> => {
+      let stalledBlob = fallbackBlob;
+      try {
+        stalledBlob = await encryptBlob(deps.config.e2eKey, { ...fallback, reconnecting: Math.floor(at / 1000) });
+      } catch { /* the plain attention frame is still honest, just less specific */ }
+      return { ts: at, blob: stalledBlob, attentionStalledAt: at };
+    };
+    /** Stamp the stall on a session this relay never got to hold (the POST itself never landed). A hold
+     *  that DID exist rides settleHeldRecord instead, so the marker is written exactly once. */
+    const markAttentionStalled = async (): Promise<void> => {
+      const at = (deps.now ?? Date.now)();
+      try {
+        await (deps.settleHoldRecordFn ?? defaultSettleHoldRecord())(
+          request.identity.threadId, await stalledPatch(at),
+        );
+      } catch { /* best-effort, exactly like every other settle */ }
+    };
+
     let response: Response | undefined;
     for (let attempt = 1; attempt <= POST_MAX_ATTEMPTS && !signal.aborted; attempt += 1) {
       try {
@@ -345,6 +372,8 @@ async function runRemoteInput(
       // Both responses were ambiguous (including an abort that cancelled the fetch). Retire a same-id hold
       // if either POST committed before its reply was lost; a true no-create returns 404 and costs nothing.
       await resolveOnRelay(deps.config, requestId, fetchFn);
+      // An ABORT is a resolution on the Mac, not a lost worker — only a genuine transport failure stalls.
+      if (!signal.aborted) await markAttentionStalled();
       return signal.aborted ? "resolved-elsewhere" : "transport-error";
     }
     if (!response.ok) return signal.aborted ? "resolved-elsewhere" : "transport-error";
@@ -375,11 +404,15 @@ async function runRemoteInput(
         ? {
           ts: settledAt, lastEvent: "working", op: "update", prio: 0, sentDone: false,
           attentionKind: undefined,
+          // The phone answered (or the Mac did) — contact plainly exists, so no stall may ride forward.
+          attentionStalledAt: undefined,
           blob: await encryptBlob(deps.config.e2eKey, {
             ...promptBase, status: "working", at: Math.floor(settledAt / 1000),
           }),
         }
-        : { ts: settledAt, blob: fallbackBlob };
+        : attentionStalled
+          ? await stalledPatch(settledAt)
+          : { ts: settledAt, blob: fallbackBlob, attentionStalledAt: undefined };
       await (deps.settleHoldRecordFn ?? defaultSettleHoldRecord())(request.identity.threadId, patch);
     };
     onHoldCreated(true);
@@ -437,13 +470,18 @@ async function runRemoteInput(
 
     let misses = 0;
     let definitiveFailures = 0;
+    let polls = 0;
     while (!signal.aborted) {
       const local = answers.peek(requestId, clock());
       if (local) return await applyAnswerBlob(local.answerBlob);
       try {
+        // FIRST CONTACT gets the bigger ceiling (NOM-45), exactly as in the permission hook: the first
+        // GET pays a proxy/tunnel's DNS + connect + TLS setup that the steady-state 2s was never sized
+        // for. Every poll after it keeps the tight cadence and ceiling.
+        polls += 1;
         const response = await fetchFn(`${deps.config.url}/v1/cc/decision/${requestId}`, {
           headers,
-          signal: requestSignal(POLL_TIMEOUT_MS, signal),
+          signal: requestSignal(polls === 1 ? POLL_FIRST_CONTACT_TIMEOUT_MS : POLL_TIMEOUT_MS, signal),
         });
         // An unreadable 200 counts as a miss exactly like a non-2xx, so a relay that answers with
         // garbage forever still trips MAX_CONSECUTIVE_MISSES instead of polling until the heat death.
@@ -478,7 +516,12 @@ async function runRemoteInput(
         misses += 1;
         definitiveFailures = 0; // a transport throw says nothing about the record — never a strike
       }
-      if (misses >= MAX_CONSECUTIVE_MISSES) return "transport-error";
+      if (misses >= MAX_CONSECUTIVE_MISSES) {
+        // ~5 min of consecutive unusable polls: the worker is gone, not slow. Fail open here, and let the
+        // settle below tell the phone it is a RECONNECTING row rather than a question it can answer.
+        attentionStalled = true;
+        return "transport-error";
+      }
       // The poll cadence is unchanged: the race can only END this wait EARLY (a LAN answer landed), never
       // extend it. `cancel()` in the finally is mandatory — without it every abandoned tick would leave a
       // listener behind in the store.

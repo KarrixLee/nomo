@@ -233,6 +233,11 @@ export type SessionDisplayState = "ended" | "decisionPending" | "done" | "needsA
  *  - `end`     a delivered `op:end`, or the watchdog's own pre-delivery end corrective
  *  - `hold`    a LIVE `.hold` marker — holder pid alive, inside the TTL
  *  - `attn`    the record's own `prio:1`
+ *  - `attn/net` …the same rung, but the attention episode ended because THE WORKER WAS UNREACHABLE
+ *              (`record.attentionStalledAt`, NOM-45). The row is still the user's to answer at the Mac,
+ *              which is why it is not a separate state — but the phone renders it as auto-retrying
+ *              ("Reconnecting…") rather than a dead yellow hand it cannot act on, driven by the
+ *              `reconnecting` key the hook re-sealed into the same blob.
  *  - `done`    the record's own terminal state
  *  - `work`    everything else with a live pid
  *  - `+cc`     CC's session file contributed: it held a `done` back, or advanced a stale `working`
@@ -241,7 +246,7 @@ export type SessionDisplayState = "ended" | "decisionPending" | "done" | "needsA
  *              fidelity and Codex rows keep v1 fidelity, and the user can read which is which rather
  *              than being told a uniform story the Codex half cannot back up. */
 export type SessionStateWhy =
-  | "reap" | "stale" | "end" | "hold" | "attn"
+  | "reap" | "stale" | "end" | "hold" | "attn" | "attn/net"
   | "done" | "done+cc" | "done/cx"
   | "work" | "work+cc" | "work/cx";
 
@@ -384,7 +389,7 @@ export function stateHoldLive(
  *  |  3'  | done             | record terminal, pid alive, and CC does not say busy              | done, done+cc |
  *  |  2   | decisionPending  | a LIVE hold (marker + holder pid alive + inside the TTL)          | hold          |
  *  |  3   | done             | CC says idle past the record's ts + grace on a working row        | done+cc       |
- *  |  4   | needsAttention   | record.prio === 1 and no live hold                                | attn          |
+ *  |  4   | needsAttention   | record.prio === 1 and no live hold                                | attn, attn/net|
  *  |  5   | working          | anything else with a live pid                                     | work, work+cc |
  *
  *  RANK 3 IS EVALUATED BEFORE RANK 2 and that is not a typo. The spec's ranking table puts
@@ -500,7 +505,15 @@ export function computeSessionState(input: SessionStateInput): SessionState | nu
   }
 
   // --- rank 4: needsAttention ---------------------------------------------------------------------
-  if (record.prio === 1) return { ...of("needsAttention", "attn", sealed, ts, false), ...asking };
+  // `attn/net` is the SAME rung with a different cause named (NOM-45): the episode ended because the
+  // worker was unreachable, not because the user still has something to answer on the phone. Read ONLY
+  // here — a done/working/ended row must never wear a previous episode's stall marker, exactly the rule
+  // `asking` follows one line up. The render signal itself rides the blob (`reconnecting`); this is the
+  // diagnostic half, and it is what makes a stalled row legible in the phone's debug line.
+  if (record.prio === 1) {
+    const why: SessionStateWhy = finite(record.attentionStalledAt) ? "attn/net" : "attn";
+    return { ...of("needsAttention", why, sealed, ts, false), ...asking };
+  }
 
   // --- rank 5: working ----------------------------------------------------------------------------
   const busy = opinion?.status === "busy" && opinion.statusUpdatedAt > ts;
