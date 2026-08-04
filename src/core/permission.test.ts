@@ -46,6 +46,11 @@ describe("buildPermissionSummary", () => {
   test("unknown tool → tool_name verbatim", () => {
     expect(buildPermissionSummary("SomethingElse", {})).toBe("SomethingElse");
   });
+  test("Codex request_user_input → first question text", () => {
+    expect(buildPermissionSummary("request_user_input", {
+      questions: [{ id: "choice", header: "Pick", question: "Which deployment should I use?", options: [{ label: "Blue" }] }],
+    })).toBe("Which deployment should I use?");
+  });
   test("missing input fields → falls back to tool_name", () => {
     expect(buildPermissionSummary("Bash", {})).toBe("Bash");
     expect(buildPermissionSummary("Edit", {})).toBe("Edit");
@@ -2147,6 +2152,120 @@ describe("runPermissionHook — codex agent", () => {
     expect(delegated).toBe(true);
     expect(fetched).toBe(false);
     await rm(dir, { recursive: true, force: true });
+  });
+});
+
+// ---- Codex TUI request_user_input through blocking PreToolUse -------------------------------
+
+describe("runPermissionHook — Codex TUI request_user_input", () => {
+  const TOOL_INPUT = {
+    questions: [{
+      id: "deploy", header: "Deploy", question: "Which deployment should I use?",
+      options: [{ label: "Blue", description: "Use blue" }, { label: "Green", description: "Use green" }],
+    }],
+  };
+  const TUI_INPUT = JSON.stringify({
+    session_id: "sess-1", hook_event_name: "PreToolUse", tool_name: "request_user_input",
+    tool_input: TOOL_INPUT, permission_mode: "default", cwd: "/Users/x/proj",
+    transcript_path: "/codex/rollout.jsonl", turn_id: "turn-auto",
+  });
+
+  const answerTui = async (answer: Record<string, unknown>, over: Record<string, unknown> = {}) => {
+    const answerBlob = await encryptBlob(KEY, { requestId: "req-fixed", ts: 5, ...answer });
+    const emitted: string[] = [];
+    const { fn, calls } = scriptFetch(true, [{ status: "answered", answerBlob }]);
+    await runPermissionHook(baseDeps({
+      fetchFn: fn, emit: (line: string) => emitted.push(line), readInput: async () => TUI_INPUT,
+      ...over,
+    }) as never, "codex", "tui-request-user-input");
+    return { emitted, calls };
+  };
+
+  test("holds even under auto_review and posts an honest release-only question card", async () => {
+    const holds: Array<{ sessionId: string; blob: string; at: number; pid: number }> = [];
+    const { emitted, calls } = await answerTui({ decision: "deny" }, {
+      loadCodexTurnPolicyFn: async () => ({ approvalPolicy: "on-request", approvalsReviewer: "auto_review" }),
+      holdPid: 9001,
+      writeHoldFn: async (sessionId: string, hold: { blob: string; at: number; pid: number }) => {
+        holds.push({ sessionId, ...hold });
+      },
+    });
+    const post = calls.find((call) => call.method === "POST")!;
+    const body = JSON.parse(post.body!);
+    const blob = (await decryptBlob(KEY, body.blob)) as Record<string, unknown>;
+    expect(body.attentionKind).toBe("userInput");
+    expect(blob).toMatchObject({
+      status: "decisionPending", agent: "codex", permissionToolName: "request_user_input",
+      permissionSummary: "Which deployment should I use?",
+    });
+    // A standalone TUI has no app-server answer transport. Omitting the choice list makes the phone
+    // offer only its honest actions: Deny, plus the row's independent Open on Mac command.
+    expect(blob).not.toHaveProperty("permissionQuestions");
+    expect(holds).toHaveLength(1);
+    expect(holds[0]).toMatchObject({ sessionId: "sess-1", at: 1000, pid: 9001 });
+    expect(await decryptBlob(KEY, holds[0].blob)).toMatchObject({
+      status: "decisionPending", permissionToolName: "request_user_input", dbg: expect.any(String),
+    });
+    expect(emitted).toHaveLength(1);
+  });
+
+  test("Deny blocks the tool through Codex's PreToolUse schema", async () => {
+    const { emitted } = await answerTui({ decision: "deny", message: "Not this turn" });
+    expect(JSON.parse(emitted[0])).toEqual({
+      continue: true,
+      hookSpecificOutput: {
+        hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: "Not this turn",
+      },
+    });
+  });
+
+  test("Open-on-Mac release emits allow with the ORIGINAL input, then leaves the row attentive", async () => {
+    const patches: Array<Record<string, unknown>> = [];
+    const order: string[] = [];
+    const { emitted } = await answerTui({ decision: "allow" }, {
+      readRecordFn: async () => ({
+        pid: 1, machine: "m", label: "l", ts: 900, op: "update", prio: 1,
+        lastEvent: "needsAttention", attentionKind: "userInput", blob: "old",
+      }),
+      writeHoldFn: async () => {}, holdPid: 9001,
+      settleHoldRecordFn: async (_sessionId: string, patch: Record<string, unknown>) => { order.push("settle"); patches.push(patch); },
+      clearHoldFn: async (_sessionId: string, _pid: number, beforeUnlink?: () => Promise<void>) => {
+        await beforeUnlink?.(); order.push("clear"); return true;
+      },
+    });
+    expect(JSON.parse(emitted[0])).toEqual({
+      continue: true,
+      hookSpecificOutput: {
+        hookEventName: "PreToolUse", permissionDecision: "allow", updatedInput: TOOL_INPUT,
+      },
+    });
+    expect(patches).toHaveLength(1);
+    expect({ prio: 1, ...patches[0] }).toMatchObject({ prio: 1 });
+    expect(patches[0]).not.toHaveProperty("prio", 0);
+    expect(await decryptBlob(KEY, patches[0].blob as string)).toMatchObject({ status: "needsAttention" });
+    expect(order).toEqual(["settle", "clear"]);
+  });
+
+  test("the local approvals pause returns immediately without duplicating the status hook", async () => {
+    let delegated = false;
+    await runPermissionHook(baseDeps({
+      noHoldPath: "/dev/null", readInput: async () => { throw new Error("must not consume stdin"); },
+      delegate: async () => { delegated = true; },
+    }) as never, "codex", "tui-request-user-input");
+    expect(delegated).toBe(false);
+  });
+
+  test("the specialized entry fails open unless Codex delivered the exact PreToolUse tool", async () => {
+    for (const input of [
+      { hook_event_name: "PermissionRequest", tool_name: "request_user_input" },
+      { hook_event_name: "PreToolUse", tool_name: "shell" },
+    ]) {
+      const spy = spyFetch();
+      await runPermissionHook(baseDeps({
+        readInput: async () => JSON.stringify({ ...JSON.parse(TUI_INPUT), ...input }), fetchFn: spy.fn,
+      }) as never, "codex", "tui-request-user-input");
+      expect(spy.called()).toBe(false);
+    }
   });
 });
 

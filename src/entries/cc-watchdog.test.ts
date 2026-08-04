@@ -4,7 +4,8 @@ import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { decryptBlob, encryptBlob } from "../core/crypto";
-import type { PlanPickerTraceDecision, SessionRecord } from "../core/shared";
+import { createLanAnswerStore } from "../core/lan-listener";
+import type { DecisionHold, PlanPickerTraceDecision, SessionRecord } from "../core/shared";
 import { GONE_STRIKE_LIMIT, readGoneStrikes, recordGoneStrike, resetGoneStrikes, tracePlanPickerDecision } from "../core/shared";
 import {
   acceptLanAnswer, acceptLanCommand, enqueueDrainCommands, LAN_COMMAND_ID_PREFIX,
@@ -2788,6 +2789,101 @@ describe("drainCommands (authenticate, validate, then execute)", () => {
       event: "focus-terminal", id: cmd.id, sessionId: "sess-b", kind: "focus-terminal",
       agent: "codex", pid: 22, result: "focused", via: "terminal-app",
     });
+  });
+
+  test("Open on Mac releases only a LIVE TUI request_user_input hold after focus succeeds", async () => {
+    const answers = createLanAnswerStore();
+    const resolved: string[] = [];
+    const hold: DecisionHold = {
+      blob: await encryptBlob(KEY, {
+        status: "decisionPending", agent: "codex", permissionRequestId: "req-tui",
+        permissionToolName: "request_user_input", permissionSummary: "Which deployment?",
+      }),
+      at: NOW - 1_000,
+      pid: 777,
+    };
+    const { deps } = harness({
+      readDecisionHoldFn: async () => hold,
+      holdPidAliveFn: () => true,
+      answerStore: answers,
+      resolveDecisionFn: async (_config: Config, requestId: string) => { resolved.push(requestId); },
+    });
+    const cmd = await sealed({ sessionId: "sess-b" });
+    expect(await drainCommands(cfg(), { ...deps, take: () => [cmd] })).toBe(1);
+    const stored = answers.peek("req-tui", NOW);
+    expect(stored).toBeDefined();
+    expect(await decryptBlob(KEY, stored!.answerBlob)).toEqual({
+      requestId: "req-tui", decision: "allow", ts: Math.floor(NOW / 1000),
+    });
+    expect(resolved).toEqual(["req-tui"]);
+  });
+
+  test("focus never releases an ordinary/app-server question card or a dead hold", async () => {
+    for (const testCase of [
+      {
+        name: "app-server",
+        alive: true,
+        frame: {
+          status: "decisionPending", agent: "codex", permissionRequestId: "req-app",
+          permissionToolName: "request_user_input", permissionQuestions: [{ q: "Which?", o: ["A", "B"] }],
+        },
+      },
+      {
+        name: "dead",
+        alive: false,
+        frame: {
+          status: "decisionPending", agent: "codex", permissionRequestId: "req-dead",
+          permissionToolName: "request_user_input",
+        },
+      },
+      {
+        name: "stale",
+        alive: true,
+        at: NOW - 600_001,
+        frame: {
+          status: "decisionPending", agent: "codex", permissionRequestId: "req-stale",
+          permissionToolName: "request_user_input",
+        },
+      },
+    ]) {
+      resetCommandState();
+      const answers = createLanAnswerStore();
+      const resolved: string[] = [];
+      const hold: DecisionHold = {
+        blob: await encryptBlob(KEY, testCase.frame), at: testCase.at ?? NOW - 1_000, pid: 777,
+      };
+      const { deps } = harness({
+        readDecisionHoldFn: async () => hold,
+        holdPidAliveFn: () => testCase.alive,
+        answerStore: answers,
+        resolveDecisionFn: async (_config: Config, requestId: string) => { resolved.push(requestId); },
+      });
+      const cmd = await sealed({ sessionId: "sess-b" }, { id: `cmd-${testCase.name}` });
+      expect(await drainCommands(cfg(), { ...deps, take: () => [cmd] })).toBe(1);
+      expect(answers.size()).toBe(0);
+      expect(resolved).toEqual([]);
+    }
+  });
+
+  test("a failed focus does not release the blocking hook", async () => {
+    const answers = createLanAnswerStore();
+    const hold: DecisionHold = {
+      blob: await encryptBlob(KEY, {
+        status: "decisionPending", agent: "codex", permissionRequestId: "req-tui",
+        permissionToolName: "request_user_input",
+      }),
+      at: NOW,
+      pid: 777,
+    };
+    const { deps } = harness({
+      focus: async () => ({ ok: false, reason: "osascript-failed" }),
+      readDecisionHoldFn: async () => hold,
+      holdPidAliveFn: () => true,
+      answerStore: answers,
+    });
+    const cmd = await sealed({ sessionId: "sess-b" });
+    expect(await drainCommands(cfg(), { ...deps, take: () => [cmd] })).toBe(0);
+    expect(answers.size()).toBe(0);
   });
 
   test("threads the session record into terminal focus and traces herdr's terminal reason", async () => {

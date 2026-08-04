@@ -41,6 +41,17 @@ describe("native Codex hook manifest", () => {
     // silently disable EVERY Codex hook.
     expect(sessionEnd?.timeout).toBe(3);
   });
+
+  test("registers a blocking exact-match PreToolUse handler for TUI request_user_input", async () => {
+    const path = join(import.meta.dir, "../../plugin/hooks/codex-hooks.json");
+    const manifest = JSON.parse(await readFile(path, "utf8")) as {
+      hooks: Record<string, Array<{ matcher?: string; hooks?: Array<{ command?: string; timeout?: number }> }>>;
+    };
+    const handler = manifest.hooks.PreToolUse.find((entry) => entry.matcher === "request_user_input")?.hooks?.[0];
+    expect(handler?.command).toContain("dist/codex-permission.mjs");
+    expect(handler?.command).toContain("--tui-request-user-input");
+    expect(handler?.timeout).toBe(3600);
+  });
 });
 
 describe("planOp (op mapping table)", () => {

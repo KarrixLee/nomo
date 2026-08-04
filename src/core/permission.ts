@@ -222,6 +222,9 @@ const ANSWER_MAX = 500;
 type DecisionOutcome =
   /** One decision line went to stdout — the hold is over. */
   | "emitted"
+  /** One line released a blocking PreToolUse so Codex can open its native picker. The user is still
+   *  waiting at the Mac, so the session record must remain attentive. */
+  | "emitted-attention"
   /** NOTHING was emitted and the hold is over: the hook exits 0 silently, so CC proceeds with its own
    *  flow and shows the terminal picker ("answer at your Mac"). Used whenever a KNOWN verb cannot be
    *  honored for this tool — it can never be converted into a deny on any path. */
@@ -251,6 +254,23 @@ function denyLine(agent: AgentKind, message?: unknown): string {
   const m = typeof message === "string" ? message.trim().slice(0, DENY_MESSAGE_MAX) : "";
   if (m.length === 0) return decisionLine(agent, DENY_HSO);
   return decisionLine(agent, { hookEventName: "PermissionRequest", decision: { behavior: "deny", message: m } });
+}
+
+/** Codex 0.146's blocking PreToolUse contract. request_user_input's handler has not started while this
+ *  hook is running, so allow echoes the ORIGINAL tool input before the native TUI opens its picker. */
+function preToolUserInputLine(
+  decision: "allow" | "deny", toolInput: Record<string, unknown>, message?: unknown,
+): string {
+  if (decision === "allow") {
+    return decisionLine("codex", {
+      hookEventName: "PreToolUse", permissionDecision: "allow", updatedInput: toolInput,
+    });
+  }
+  const custom = typeof message === "string" ? message.trim().slice(0, DENY_MESSAGE_MAX) : "";
+  return decisionLine("codex", {
+    hookEventName: "PreToolUse", permissionDecision: "deny",
+    permissionDecisionReason: custom.length > 0 ? custom : "Denied from phone",
+  });
 }
 
 /** Allow + a session-scoped always-allow rule. CC's own `permission_suggestions` (already narrowly
@@ -500,6 +520,17 @@ export function buildPermissionSummary(toolName: string, toolInput: Record<strin
     case "AskUserQuestion": {
       const q = str(firstQuestionText(toolInput));
       return q ? truncate(q) : toolName;
+    }
+    // A standalone Codex TUI question deliberately does NOT send its options to the phone: without an
+    // attached app-server there is no transport on which to inject a selected option. The prompt itself
+    // is still useful and honest as the card summary beside Deny / Open on Mac.
+    case "request_user_input": {
+      const questions = Array.isArray(toolInput.questions) ? toolInput.questions : [];
+      const q = questions.find((raw) => {
+        const question = (raw as { question?: unknown } | null)?.question;
+        return typeof question === "string" && question.length > 0;
+      }) as { question?: unknown } | undefined;
+      return typeof q?.question === "string" ? truncate(q.question) : toolName;
     }
     default: {
       if (/^mcp__/.test(toolName)) {
@@ -759,7 +790,24 @@ function emitDecision(
   suggestions: unknown,
   emit: (line: string) => void,
   trace: (event: object) => void,
+  surface: PermissionHookSurface,
 ): DecisionOutcome {
+  if (surface === "tui-request-user-input") {
+    if (answer.decision === "deny") {
+      emit(preToolUserInputLine("deny", toolInput, answer.message));
+      trace({ event: "emit", decision: "deny", hook_event_name: "PreToolUse" });
+      return "emitted";
+    }
+    if (answer.decision === "allow" || answer.decision === "allow_always" || answer.decision === "answer") {
+      // An unattached TUI has no external UserInputAnswer transport. Every positive verb therefore means
+      // the only action this hook can actually deliver: release to Codex's own terminal picker.
+      emit(preToolUserInputLine("allow", toolInput));
+      trace({ event: "emit", decision: "release-to-tui", requested: answer.decision });
+      return "emitted-attention";
+    }
+    trace({ event: "answer-unknown-decision" });
+    return "keep-polling";
+  }
   const isQuestion = toolName === "AskUserQuestion";
   switch (answer.decision) {
     case "allow":
@@ -1105,6 +1153,10 @@ async function readStdin(): Promise<string> {
   return Buffer.concat(chunks).toString("utf8");
 }
 
+/** Which native hook contract owns this hold. The specialized surface is intentionally not inferred
+ *  from tool_name: only the exact manifest handler may emit PreToolUse control output. */
+export type PermissionHookSurface = "permission-request" | "tui-request-user-input";
+
 /** The PermissionRequest hook body. See the module header for the (deliberately) unbounded-wait
  *  contract and the absolute fail-open posture. Never throws across its boundary.
  *
@@ -1113,7 +1165,11 @@ async function readStdin(): Promise<string> {
  *  selects the decision-line envelope (Codex wraps in `continue:true`). Everything else — the POST/poll
  *  state machine, the gates, fail-open — is agent-agnostic. cc-permission calls it with the default;
  *  codex-permission calls it with "codex". */
-export async function runPermissionHook(deps: PermissionHookDeps = {}, agent: AgentKind = "claude"): Promise<void> {
+export async function runPermissionHook(
+  deps: PermissionHookDeps = {}, agent: AgentKind = "claude",
+  surface: PermissionHookSurface = "permission-request",
+): Promise<void> {
+  const tuiUserInput = surface === "tui-request-user-input";
   const noHoldPath = deps.noHoldPath ?? NO_HOLD_PATH;
   const trace = deps.trace ?? defaultTrace();
   /** The hold's LAN loopback poller, once a hold is granted. Function-scoped ONLY so the `finally` below
@@ -1122,12 +1178,12 @@ export async function runPermissionHook(deps: PermissionHookDeps = {}, agent: Ag
   /** The session whose on-disk hold marker THIS process owns, once one is stamped — function-scoped for
    *  the same reason as `loopback`: the `finally` clears it from every exit of the poll loop. */
   let heldSessionId: string | undefined;
-  /** Did this hold actually put a decision line on stdout? The ONE bit that separates the two honest
-   *  settles below: the user answered (the session is working again) from the user is still blocked, just
-   *  at the Mac (still needsAttention). Set in applyAnswerBlob, read by `settleHeldRecord` at exit time. */
-  let emittedDecision = false;
+  /** Is the session actually working after the emitted decision? Ordinary allow/deny is done; a special
+   *  PreToolUse allow merely opens Codex's TUI picker and must remain needsAttention. Set in
+   *  applyAnswerBlob, read by `settleHeldRecord` at exit time. */
+  let settleAsWorking = false;
   /** The record settle this process owes the LAN feed, built the moment a hold is granted so it closes
-   *  over the config/blobs the `try` scope owns. Read `emittedDecision` at CALL time — it describes the
+   *  over the config/blobs the `try` scope owns. Read `settleAsWorking` at CALL time — it describes the
    *  exit that actually happened, not the one we expected when we built it. */
   let settleHeldRecord: (() => Promise<void>) | undefined;
   try {
@@ -1136,7 +1192,9 @@ export async function runPermissionHook(deps: PermissionHookDeps = {}, agent: Ag
     // Delegating to runHook reuses the entire needs-attention pipeline (POST, tracking, watchdog) and
     // returns silently with exit 0 — it also no-ops cleanly when unpaired, so zero network in that case.
     if (await flagExists(noHoldPath)) {
-      await (deps.delegate ?? (() => runHook(agent)))();
+      // The wildcard codex-status PreToolUse handler already owns the yellow status event. Calling it
+      // again from this exact-match handler would recreate the old double-fire; release silently.
+      if (!tuiUserInput) await (deps.delegate ?? (() => runHook(agent)))();
       return;
     }
 
@@ -1165,6 +1223,13 @@ export async function runPermissionHook(deps: PermissionHookDeps = {}, agent: Ag
     const permissionMode = typeof input.permission_mode === "string" ? input.permission_mode : undefined;
     trace({ event: "start", session_id: sessionId, tool_name: toolName, permission_mode: permissionMode, agent: agentId.length > 0 });
 
+    if (tuiUserInput && (
+      agent !== "codex" || input.hook_event_name !== "PreToolUse" || toolName !== "request_user_input"
+    )) {
+      trace({ event: "exit", reason: "wrong-hook-surface" });
+      return;
+    }
+
     // PASS-THROUGH GATES — the hold must never block a non-interactive/auto flow. Both exit 0 with zero
     // output and zero network, so the normal permission flow applies (auto-approval rules still fire; a
     // dialog shows only if it would have anyway).
@@ -1186,7 +1251,7 @@ export async function runPermissionHook(deps: PermissionHookDeps = {}, agent: Ag
     const interactiveMode = permissionMode === undefined
       || permissionMode === "default"
       || (agent === "claude" && (permissionMode === "acceptEdits" || permissionMode === "plan"));
-    if (!interactiveMode) {
+    if (!tuiUserInput && !interactiveMode) {
       // Signal-only (no behavior change): if a future Codex starts reporting claude-style dialog modes,
       // the `agent === "claude"` narrowing above would silently stop holding for them. Tag that exit so
       // the trace names the cause instead of reading like an ordinary non-interactive mode.
@@ -1199,7 +1264,7 @@ export async function runPermissionHook(deps: PermissionHookDeps = {}, agent: Ag
     //    overrides. In auto-review, silently return control to Codex BEFORE any Nomo POST so Codex's
     //    built-in reviewer can decide. Full Access normally took the mode gate above, but the rollout
     //    checks make that promise resilient to a producer that reports `default` by mistake.
-    if (agent === "codex" && !toolName.startsWith("mcp__")) {
+    if (!tuiUserInput && agent === "codex" && !toolName.startsWith("mcp__")) {
       const transcriptPath = typeof input.transcript_path === "string" ? input.transcript_path : "";
       const turnId = typeof input.turn_id === "string" ? input.turn_id : "";
       const policy = await (deps.loadCodexTurnPolicyFn ?? loadCodexTurnPolicy)(transcriptPath, turnId, sessionId);
@@ -1209,7 +1274,7 @@ export async function runPermissionHook(deps: PermissionHookDeps = {}, agent: Ag
         return;
       }
       trace({ event: "codex-reviewer", disposition: "hold", reason: "manual" });
-    } else if (agent === "codex") {
+    } else if (!tuiUserInput && agent === "codex") {
       // MCP apps may override the thread-global reviewer per connector. Codex does not expose that
       // effective reviewer to hooks yet, so the rollout is not authoritative for these tool names.
       trace({ event: "codex-reviewer", disposition: "hold", reason: "mcp-reviewer-unknown" });
@@ -1267,7 +1332,7 @@ export async function runPermissionHook(deps: PermissionHookDeps = {}, agent: Ag
     const rawDetail = buildPermissionDetail(toolName, toolInput);
     const fitted = fitPermissionDetail(
       permissionBase, rawDetail, BLOB_FIT_CHARS,
-      buildPermissionQuestions(toolInput),
+      tuiUserInput ? [] : buildPermissionQuestions(toolInput),
     );
     // NOM-44 phase 4: the fit above is the WORKER's ceiling and stays exactly as it is, but a phone on
     // this network can pull from the Mac directly, where there is none — so tee the UNABRIDGED detail
@@ -1315,7 +1380,10 @@ export async function runPermissionHook(deps: PermissionHookDeps = {}, agent: Ag
           const res = await fetchFn(`${config.url}/v1/cc/decision`, {
             method: "POST",
             headers: { "content-type": "application/json", ...pcHeaders },
-            body: JSON.stringify({ v: 2, sessionId, requestId, op: "update", prio: 1, ts, blob, fallbackBlob }),
+            body: JSON.stringify({
+              v: 2, sessionId, requestId, op: "update", prio: 1, ts, blob, fallbackBlob,
+              ...(tuiUserInput ? { attentionKind: "userInput" } : {}),
+            }),
             signal: AbortSignal.timeout(POST_FIRST_CONTACT_TIMEOUT_MS),
           });
           if (res.ok) {
@@ -1449,14 +1517,14 @@ export async function runPermissionHook(deps: PermissionHookDeps = {}, agent: Ag
     // wedges yellow for good (it also pins the worker's `decact` overlay, which only clears on a
     // prio:0/done/end frame). So this hook writes the record itself, on its way out.
     //
-    // TWO honest settles, and only two. A decision was EMITTED → the session is working again, so
-    // prio:0/working with a freshly sealed `working` frame (the write that also releases the worker's
-    // overlay). Anything else → the user is still blocked, just at the Mac: the SAME yellow, re-sealed
-    // from the plain attention frame and freshly stamped. Never "working" there — a released/expired hold
-    // has approved nothing, and claiming progress would be a lie the phone renders as green.
+    // TWO honest settles, and only two. A terminal approval/deny made the session active again →
+    // prio:0/working with a freshly sealed `working` frame (also releases the worker's overlay).
+    // Anything else — including a PreToolUse allow whose only job was to open Codex's native picker —
+    // leaves the user blocked at the Mac: the SAME yellow, re-sealed from the plain attention frame and
+    // freshly stamped. Claiming progress there would be a lie the phone renders as green.
     settleHeldRecord = async (): Promise<void> => {
       const settledAt = (deps.now ?? Date.now)();
-      const patch: Partial<SessionRecord> = emittedDecision
+      const patch: Partial<SessionRecord> = settleAsWorking
         ? {
           ts: settledAt, lastEvent: "working", op: "update", prio: 0, sentDone: false,
           // The approval episode is over; a stale marker would otherwise ride forward on every
@@ -1490,11 +1558,11 @@ export async function runPermissionHook(deps: PermissionHookDeps = {}, agent: Ag
       // replay/stale answer (silent, done). The ONE keep-polling case is a matched but UNRECOGNIZED
       // decision verb (newer phone, older plugin): a decision we DO understand can still land.
       const outcome: DecisionOutcome = match
-        ? emitDecision(agent, answer, toolName, toolInput, suggestions, emit, trace)
+        ? emitDecision(agent, answer, toolName, toolInput, suggestions, emit, trace, surface)
         : "released";
-      // The ONE bit `settleHeldRecord` needs: a line on stdout means the session is WORKING again. A
-      // "released" outcome emitted nothing, so the user is still blocked at the Mac (see the settle).
-      if (outcome === "emitted") emittedDecision = true;
+      // Only an ordinary emitted decision means WORKING. `emitted-attention` released PreToolUse but
+      // opened the native TUI picker; `released` emitted nothing. Both remain honestly attentive.
+      if (outcome === "emitted") settleAsWorking = true;
       if (outcome !== "keep-polling") {
         trace({ event: "answered", match, outcome, src });
         trace({ event: "exit", reason: "answered" });

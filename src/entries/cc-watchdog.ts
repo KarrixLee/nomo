@@ -39,14 +39,16 @@ import { focusTerminalForPid } from "../core/terminal-focus";
 import type { FocusContext, FocusResult } from "../core/terminal-focus";
 import { CodexRemoteInputBridge } from "../core/codex-remote-input-bridge";
 import type { CodexThreadWaitState } from "../core/codex-remote-input-bridge";
-import { createLanHintPublisher, createLanListener } from "../core/lan-listener";
-import type { LanAnswerDelivery, LanCommand, LanListener } from "../core/lan-listener";
+import { createLanHintPublisher, createLanListener, lanAnswerStore } from "../core/lan-listener";
+import type { LanAnswerDelivery, LanAnswerStore, LanCommand, LanListener } from "../core/lan-listener";
+import { lanRunningUnderTest } from "../core/lan-wire";
+import { stateHoldLive } from "../core/session-state";
 import { resolveOnRelay } from "../core/codex-remote-input";
-import type { PlanPickerTraceDecision } from "../core/shared";
+import type { DecisionHold, PlanPickerTraceDecision } from "../core/shared";
 import {
   AgentKind, appendFittedPlanAndDebug, atomicWrite, CC_DIR, CCOp, CCStatus, codexAppServerSocketAvailable, Config, completePendingPairing, formatPlanPickerDebug, formatWatchdogPidfile,
   GONE_STRIKE_LIMIT, loadConfig, loadPendingConfig, localApprovalsState,
-  PAIR_HTML_FILE, PairPollResult, parseWatchdogPidfile, PendingConfig, pidAlive, PLUGIN_VERSION, readPrefix, readSuffix, recordGoneStrike, removeRevokedConfig,
+  PAIR_HTML_FILE, PairPollResult, parseWatchdogPidfile, PendingConfig, pidAlive, PLUGIN_VERSION, readDecisionHoldAt, readPrefix, readSuffix, recordGoneStrike, removeRevokedConfig,
   resetGoneStrikes, SessionRecord, SESSIONS_DIR, traceSession, tracePlanPickerDecision, watchdogBuildDiffers,
   watchdogBuildStamp, watchdogHolderIsLive, WATCHDOG_PID_PATH,
 } from "../core/shared";
@@ -1163,8 +1165,62 @@ export interface DrainCommandsDeps {
    *  discoverLiveSessions / reconcileProvisionalsSweep expose), so a test can supply a locator
    *  without spawning a real `ps`. Defaults to the real registry. */
   adapters?: AgentAdapter[];
+  /** Exact live-hold seam behind Open on Mac's TUI-picker release. Test defaults never read the
+   *  developer's real session directory. */
+  readDecisionHoldFn?: (sessionId: string) => Promise<DecisionHold | null>;
+  holdPidAliveFn?: (pid: number) => boolean;
+  answerStore?: LanAnswerStore;
+  resolveDecisionFn?: typeof resolveOnRelay;
   now?: () => number;
   trace?: (event: object) => void;
+}
+
+/** After a successful focus, release ONLY the specialized TUI request_user_input PreToolUse hold.
+ *
+ * A local Codex TUI has no app-server connection on which the watchdog can submit Op::UserInputAnswer,
+ * so the phone must never be shown answer choices it cannot deliver. The special hold is identified by
+ * its encrypted release-only card (Codex + request_user_input + NO permissionQuestions), and it must
+ * still satisfy the same owner-pid and 10-minute TTL gate as the LAN state feed. The synthetic allow is
+ * handed to the existing answer store; the hook emits updatedInput and Codex then opens its native picker.
+ * The relay resolve is merely the split-brain cleanup/fail-open backstop and never gates local delivery. */
+async function releaseFocusedTuiUserInputHold(
+  config: Config, sessionId: string, now: number, deps: DrainCommandsDeps,
+): Promise<boolean> {
+  const readHold = deps.readDecisionHoldFn ?? (
+    lanRunningUnderTest() ? async () => null : (id: string) => readDecisionHoldAt(SESSIONS_DIR, id)
+  );
+  const hold = await readHold(sessionId);
+  const alive = hold && typeof hold.pid === "number"
+    ? (deps.holdPidAliveFn ?? pidAlive)(hold.pid)
+    : false;
+  if (!stateHoldLive(hold, alive, now)) return false;
+
+  let card: Record<string, unknown>;
+  try {
+    const plain = await decryptBlob(config.e2eKey, hold!.blob);
+    if (typeof plain !== "object" || plain === null) return false;
+    card = plain as Record<string, unknown>;
+  } catch {
+    return false;
+  }
+  const requestId = card.permissionRequestId;
+  if (
+    card.status !== "decisionPending"
+    || card.agent !== "codex"
+    || card.permissionToolName !== "request_user_input"
+    || typeof requestId !== "string" || requestId.length === 0
+    || Object.prototype.hasOwnProperty.call(card, "permissionQuestions")
+  ) return false;
+
+  const answerBlob = await encryptBlob(config.e2eKey, {
+    requestId, decision: "allow", ts: Math.floor(now / 1000),
+  });
+  const stored = (deps.answerStore ?? lanAnswerStore).put(requestId, answerBlob, now);
+  if (stored !== "stored") return false;
+  try {
+    void Promise.resolve((deps.resolveDecisionFn ?? resolveOnRelay)(config, requestId)).catch(() => {});
+  } catch { /* local delivery already succeeded; relay cleanup is best-effort */ }
+  return true;
 }
 
 /** Decrypt, VALIDATE, then execute every buffered command; returns how many actually focused
@@ -1297,9 +1353,12 @@ export async function drainCommands(config: Config, deps: DrainCommandsDeps = {}
         const outcome = await focus(pid, { agent, record: entry.rec });
         if (outcome.ok) {
           focused += 1;
+          const releasedTuiInput = await releaseFocusedTuiUserInputHold(
+            config, payload.sessionId, now, deps,
+          ).catch(() => false);
           traceFocus(deps, {
             ...base, agent, pid, result: "focused" as FocusTraceResult, via: outcome.via,
-            reason: outcome.reason ?? reason,
+            reason: outcome.reason ?? reason, ...(releasedTuiInput ? { releasedTuiInput: true } : {}),
           });
           continue;
         }
