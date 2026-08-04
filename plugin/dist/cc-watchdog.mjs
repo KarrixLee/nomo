@@ -103,7 +103,7 @@ import { appendFileSync, existsSync, readFileSync, statSync, truncateSync } from
 import { execFileSync, spawn } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "1.6.5";
+var PLUGIN_VERSION = "1.6.6";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -3517,8 +3517,10 @@ function computeSessionState(input) {
   if (!recordDone && opinion?.status === "idle" && record.prio !== 1 && record.lastEvent !== "needsAttention" && opinion.statusUpdatedAt > ts + CC_IDLE_DONE_GRACE_MS) {
     return of("done", "done+cc", { kind: "plain", value: buildStatePlaintext(record, "done", opinion.statusUpdatedAt, opinion.name) }, ts, false);
   }
-  if (record.prio === 1)
-    return { ...of("needsAttention", "attn", sealed, ts, false), ...asking };
+  if (record.prio === 1) {
+    const why = finite(record.attentionStalledAt) ? "attn/net" : "attn";
+    return { ...of("needsAttention", why, sealed, ts, false), ...asking };
+  }
   const busy = opinion?.status === "busy" && opinion.statusUpdatedAt > ts;
   return of("working", busy ? "work+cc" : suffix("work"), recordDone ? { kind: "plain", value: buildStatePlaintext(record, "working", now, opinion?.name) } : sealed, ts, false);
 }
@@ -4604,6 +4606,7 @@ function createLanHintPublisher(deps) {
 // src/core/decision-poll.ts
 var POLL_INTERVAL_MS = 3000;
 var POLL_TIMEOUT_MS = 2000;
+var POLL_FIRST_CONTACT_TIMEOUT_MS = 4000;
 var POST_MAX_ATTEMPTS = 2;
 var POST_RETRY_PAUSE_MS = 1000;
 var MAX_CONSECUTIVE_MISSES = 100;
@@ -5157,7 +5160,7 @@ async function runHook(agent) {
 }
 
 // src/core/permission.ts
-var POST_FIRST_CONTACT_TIMEOUT_MS = 4000;
+var POST_FIRST_CONTACT_TIMEOUT_MS = 6000;
 var HOLD_RETRY_DELAY_MS = 4000;
 var FRESH_SESSION_MS = 60000;
 var MAX_UNKNOWN_ANSWER_READS = 3;
@@ -5961,11 +5964,12 @@ async function runPermissionHook(deps = {}, agent = "claude", surface = "permiss
       return { posted: posted2, hold: hold2, reason };
     };
     const pollDecision = async (seq2) => {
-      trace({ event: "poll-begin", seq: seq2 });
+      const budgetMs = seq2 <= 1 ? POLL_FIRST_CONTACT_TIMEOUT_MS : POLL_TIMEOUT_MS;
+      trace({ event: "poll-begin", seq: seq2, budgetMs });
       try {
         const res = await fetchFn(`${config.url}/v1/cc/decision/${requestId}`, {
           headers: pcHeaders,
-          signal: AbortSignal.timeout(POLL_TIMEOUT_MS)
+          signal: AbortSignal.timeout(budgetMs)
         });
         if (!res.ok) {
           trace({ event: "poll-end", seq: seq2, outcome: "status", status: res.status });
@@ -5979,12 +5983,28 @@ async function runPermissionHook(deps = {}, agent = "claude", surface = "permiss
         return { status: 0 };
       }
     };
+    let attentionStalled = false;
+    const stalledPatch = async (at2) => {
+      let stalledBlob = fallbackBlob;
+      try {
+        stalledBlob = await encryptBlob(config.e2eKey, { ...base, reconnecting: Math.floor(at2 / 1000) });
+      } catch {}
+      return { ts: at2, blob: stalledBlob, attentionStalledAt: at2 };
+    };
+    const markAttentionStalled = async () => {
+      const at2 = (deps.now ?? Date.now)();
+      try {
+        await (deps.settleHoldRecordFn ?? defaultSettleHoldRecord())(sessionId, await stalledPatch(at2));
+      } catch {}
+    };
     let { posted, hold, reason: holdReason } = await postDecision(1, POST_MAX_ATTEMPTS);
     if (!posted) {
       const probe = await pollDecision(0);
       const live = probe.data?.status === "pending" || probe.data?.status === "answered";
       if (!live) {
-        trace({ event: "exit", reason: "post-error" });
+        if (probe.status === 0)
+          await markAttentionStalled();
+        trace({ event: "exit", reason: "post-error", ...probe.status === 0 ? { stalled: true } : {} });
         return;
       }
       trace({ event: "post-timeout-landed", status: probe.data?.status });
@@ -6002,7 +6022,8 @@ async function runPermissionHook(deps = {}, agent = "claude", surface = "permiss
       await sleep(HOLD_RETRY_DELAY_MS);
       const retry = await postDecision(2, 1);
       if (!retry.posted) {
-        trace({ event: "exit", reason: "hold-false" });
+        await markAttentionStalled();
+        trace({ event: "exit", reason: "hold-false", stalled: true });
         return;
       }
       hold = retry.hold;
@@ -6030,8 +6051,9 @@ async function runPermissionHook(deps = {}, agent = "claude", surface = "permiss
         prio: 0,
         sentDone: false,
         attentionKind: undefined,
+        attentionStalledAt: undefined,
         blob: await encryptBlob(config.e2eKey, { ...base, status: "working", at: Math.floor(settledAt / 1000) })
-      } : { ts: settledAt, blob: fallbackBlob };
+      } : attentionStalled ? await stalledPatch(settledAt) : { ts: settledAt, blob: fallbackBlob, attentionStalledAt: undefined };
       await (deps.settleHoldRecordFn ?? defaultSettleHoldRecord())(sessionId, patch);
     };
     const jitter = deps.jitter ?? (() => Math.floor(Math.random() * 500));
@@ -6102,7 +6124,8 @@ async function runPermissionHook(deps = {}, agent = "claude", surface = "permiss
           definitiveFailures = 0;
         }
         if (++misses >= MAX_CONSECUTIVE_MISSES) {
-          trace({ event: "giveup", misses });
+          attentionStalled = true;
+          trace({ event: "giveup", misses, stalled: true });
           trace({ event: "exit", reason: "giveup" });
           return;
         }
@@ -6321,6 +6344,20 @@ async function runRemoteInput(request, requestId, signal, deps, onHoldCreated) {
       const timer = setTimeout(resolve2, ms);
       timer.unref?.();
     }));
+    let attentionStalled = false;
+    const stalledPatch = async (at) => {
+      let stalledBlob = fallbackBlob;
+      try {
+        stalledBlob = await encryptBlob(deps.config.e2eKey, { ...fallback, reconnecting: Math.floor(at / 1000) });
+      } catch {}
+      return { ts: at, blob: stalledBlob, attentionStalledAt: at };
+    };
+    const markAttentionStalled = async () => {
+      const at = (deps.now ?? Date.now)();
+      try {
+        await (deps.settleHoldRecordFn ?? defaultSettleHoldRecord2())(request.identity.threadId, await stalledPatch(at));
+      } catch {}
+    };
     let response;
     for (let attempt = 1;attempt <= POST_MAX_ATTEMPTS && !signal.aborted; attempt += 1) {
       try {
@@ -6350,6 +6387,8 @@ async function runRemoteInput(request, requestId, signal, deps, onHoldCreated) {
     }
     if (!response) {
       await resolveOnRelay(deps.config, requestId, fetchFn);
+      if (!signal.aborted)
+        await markAttentionStalled();
       return signal.aborted ? "resolved-elsewhere" : "transport-error";
     }
     if (!response.ok)
@@ -6376,12 +6415,13 @@ async function runRemoteInput(request, requestId, signal, deps, onHoldCreated) {
         prio: 0,
         sentDone: false,
         attentionKind: undefined,
+        attentionStalledAt: undefined,
         blob: await encryptBlob(deps.config.e2eKey, {
           ...promptBase,
           status: "working",
           at: Math.floor(settledAt / 1000)
         })
-      } : { ts: settledAt, blob: fallbackBlob };
+      } : attentionStalled ? await stalledPatch(settledAt) : { ts: settledAt, blob: fallbackBlob, attentionStalledAt: undefined };
       await (deps.settleHoldRecordFn ?? defaultSettleHoldRecord2())(request.identity.threadId, patch);
     };
     onHoldCreated(true);
@@ -6426,14 +6466,16 @@ async function runRemoteInput(request, requestId, signal, deps, onHoldCreated) {
     const clock = deps.now ?? Date.now;
     let misses = 0;
     let definitiveFailures = 0;
+    let polls = 0;
     while (!signal.aborted) {
       const local = answers.peek(requestId, clock());
       if (local)
         return await applyAnswerBlob(local.answerBlob);
       try {
+        polls += 1;
         const response2 = await fetchFn(`${deps.config.url}/v1/cc/decision/${requestId}`, {
           headers,
-          signal: requestSignal(POLL_TIMEOUT_MS, signal)
+          signal: requestSignal(polls === 1 ? POLL_FIRST_CONTACT_TIMEOUT_MS : POLL_TIMEOUT_MS, signal)
         });
         const data = response2.ok ? await parseJson(response2) : undefined;
         if (!data) {
@@ -6461,8 +6503,10 @@ async function runRemoteInput(request, requestId, signal, deps, onHoldCreated) {
         misses += 1;
         definitiveFailures = 0;
       }
-      if (misses >= MAX_CONSECUTIVE_MISSES)
+      if (misses >= MAX_CONSECUTIVE_MISSES) {
+        attentionStalled = true;
         return "transport-error";
+      }
       const waiter = answers.waiter(requestId, clock());
       try {
         await Promise.race([abortableSleep(deps.pollIntervalMs ?? POLL_INTERVAL_MS, signal, sleep), waiter.promise]);

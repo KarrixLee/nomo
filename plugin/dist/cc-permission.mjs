@@ -108,7 +108,7 @@ import { appendFileSync, existsSync, readFileSync, statSync, truncateSync } from
 import { execFileSync, spawn } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "1.6.5";
+var PLUGIN_VERSION = "1.6.6";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -2904,6 +2904,7 @@ async function runHook(agent) {
 // src/core/decision-poll.ts
 var POLL_INTERVAL_MS = 3000;
 var POLL_TIMEOUT_MS = 2000;
+var POLL_FIRST_CONTACT_TIMEOUT_MS = 4000;
 var POST_MAX_ATTEMPTS = 2;
 var POST_RETRY_PAUSE_MS = 1000;
 var MAX_CONSECUTIVE_MISSES = 100;
@@ -2992,7 +2993,7 @@ function lanRunningUnderTest() {
 }
 
 // src/core/permission.ts
-var POST_FIRST_CONTACT_TIMEOUT_MS = 4000;
+var POST_FIRST_CONTACT_TIMEOUT_MS = 6000;
 var HOLD_RETRY_DELAY_MS = 4000;
 var FRESH_SESSION_MS = 60000;
 var MAX_UNKNOWN_ANSWER_READS = 3;
@@ -3796,11 +3797,12 @@ async function runPermissionHook(deps = {}, agent = "claude", surface = "permiss
       return { posted: posted2, hold: hold2, reason };
     };
     const pollDecision = async (seq2) => {
-      trace({ event: "poll-begin", seq: seq2 });
+      const budgetMs = seq2 <= 1 ? POLL_FIRST_CONTACT_TIMEOUT_MS : POLL_TIMEOUT_MS;
+      trace({ event: "poll-begin", seq: seq2, budgetMs });
       try {
         const res = await fetchFn(`${config.url}/v1/cc/decision/${requestId}`, {
           headers: pcHeaders,
-          signal: AbortSignal.timeout(POLL_TIMEOUT_MS)
+          signal: AbortSignal.timeout(budgetMs)
         });
         if (!res.ok) {
           trace({ event: "poll-end", seq: seq2, outcome: "status", status: res.status });
@@ -3814,12 +3816,28 @@ async function runPermissionHook(deps = {}, agent = "claude", surface = "permiss
         return { status: 0 };
       }
     };
+    let attentionStalled = false;
+    const stalledPatch = async (at2) => {
+      let stalledBlob = fallbackBlob;
+      try {
+        stalledBlob = await encryptBlob(config.e2eKey, { ...base, reconnecting: Math.floor(at2 / 1000) });
+      } catch {}
+      return { ts: at2, blob: stalledBlob, attentionStalledAt: at2 };
+    };
+    const markAttentionStalled = async () => {
+      const at2 = (deps.now ?? Date.now)();
+      try {
+        await (deps.settleHoldRecordFn ?? defaultSettleHoldRecord())(sessionId, await stalledPatch(at2));
+      } catch {}
+    };
     let { posted, hold, reason: holdReason } = await postDecision(1, POST_MAX_ATTEMPTS);
     if (!posted) {
       const probe = await pollDecision(0);
       const live = probe.data?.status === "pending" || probe.data?.status === "answered";
       if (!live) {
-        trace({ event: "exit", reason: "post-error" });
+        if (probe.status === 0)
+          await markAttentionStalled();
+        trace({ event: "exit", reason: "post-error", ...probe.status === 0 ? { stalled: true } : {} });
         return;
       }
       trace({ event: "post-timeout-landed", status: probe.data?.status });
@@ -3837,7 +3855,8 @@ async function runPermissionHook(deps = {}, agent = "claude", surface = "permiss
       await sleep(HOLD_RETRY_DELAY_MS);
       const retry = await postDecision(2, 1);
       if (!retry.posted) {
-        trace({ event: "exit", reason: "hold-false" });
+        await markAttentionStalled();
+        trace({ event: "exit", reason: "hold-false", stalled: true });
         return;
       }
       hold = retry.hold;
@@ -3865,8 +3884,9 @@ async function runPermissionHook(deps = {}, agent = "claude", surface = "permiss
         prio: 0,
         sentDone: false,
         attentionKind: undefined,
+        attentionStalledAt: undefined,
         blob: await encryptBlob(config.e2eKey, { ...base, status: "working", at: Math.floor(settledAt / 1000) })
-      } : { ts: settledAt, blob: fallbackBlob };
+      } : attentionStalled ? await stalledPatch(settledAt) : { ts: settledAt, blob: fallbackBlob, attentionStalledAt: undefined };
       await (deps.settleHoldRecordFn ?? defaultSettleHoldRecord())(sessionId, patch);
     };
     const jitter = deps.jitter ?? (() => Math.floor(Math.random() * 500));
@@ -3937,7 +3957,8 @@ async function runPermissionHook(deps = {}, agent = "claude", surface = "permiss
           definitiveFailures = 0;
         }
         if (++misses >= MAX_CONSECUTIVE_MISSES) {
-          trace({ event: "giveup", misses });
+          attentionStalled = true;
+          trace({ event: "giveup", misses, stalled: true });
           trace({ event: "exit", reason: "giveup" });
           return;
         }
