@@ -108,7 +108,7 @@ import { appendFileSync, existsSync, readFileSync, statSync, truncateSync } from
 import { execFileSync, spawn } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "1.6.4";
+var PLUGIN_VERSION = "1.6.5";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -628,6 +628,13 @@ async function settleDecisionHoldRecordAt(sessionsDir, sessionId, patch) {
       return;
     await atomicWrite(`${sessionsDir}/${sessionId}.json`, JSON.stringify({ ...record, ...patch }), 384);
   } catch {}
+}
+async function readDecisionHoldAt(sessionsDir, sessionId) {
+  try {
+    return JSON.parse(await readFile(`${sessionsDir}/${decisionHoldFileName(sessionId)}`, "utf8"));
+  } catch {
+    return null;
+  }
 }
 async function writeDecisionHold(sessionId, hold) {
   return writeDecisionHoldAt(SESSIONS_DIR, sessionId, hold);
@@ -3098,6 +3105,21 @@ function denyLine(agent, message) {
     return decisionLine(agent, DENY_HSO);
   return decisionLine(agent, { hookEventName: "PermissionRequest", decision: { behavior: "deny", message: m } });
 }
+function preToolUserInputLine(decision, toolInput, message) {
+  if (decision === "allow") {
+    return decisionLine("codex", {
+      hookEventName: "PreToolUse",
+      permissionDecision: "allow",
+      updatedInput: toolInput
+    });
+  }
+  const custom = typeof message === "string" ? message.trim().slice(0, DENY_MESSAGE_MAX) : "";
+  return decisionLine("codex", {
+    hookEventName: "PreToolUse",
+    permissionDecision: "deny",
+    permissionDecisionReason: custom.length > 0 ? custom : "Denied from phone"
+  });
+}
 function allowAlwaysLine(agent, toolName, toolInput, suggestions) {
   if (agent === "codex")
     return allowLine(agent, toolName, toolInput);
@@ -3245,6 +3267,14 @@ function buildPermissionSummary(toolName, toolInput) {
       const q = str(firstQuestionText(toolInput));
       return q ? truncate(q) : toolName;
     }
+    case "request_user_input": {
+      const questions = Array.isArray(toolInput.questions) ? toolInput.questions : [];
+      const q = questions.find((raw) => {
+        const question = raw?.question;
+        return typeof question === "string" && question.length > 0;
+      });
+      return typeof q?.question === "string" ? truncate(q.question) : toolName;
+    }
     default: {
       if (/^mcp__/.test(toolName)) {
         const seg = toolName.split("__").pop();
@@ -3382,7 +3412,21 @@ function permissionFrame(base, detail, omitted, questions = []) {
     ...questions.length > 0 ? { permissionQuestions: questions } : {}
   };
 }
-function emitDecision(agent, answer, toolName, toolInput, suggestions, emit, trace) {
+function emitDecision(agent, answer, toolName, toolInput, suggestions, emit, trace, surface) {
+  if (surface === "tui-request-user-input") {
+    if (answer.decision === "deny") {
+      emit(preToolUserInputLine("deny", toolInput, answer.message));
+      trace({ event: "emit", decision: "deny", hook_event_name: "PreToolUse" });
+      return "emitted";
+    }
+    if (answer.decision === "allow" || answer.decision === "allow_always" || answer.decision === "answer") {
+      emit(preToolUserInputLine("allow", toolInput));
+      trace({ event: "emit", decision: "release-to-tui", requested: answer.decision });
+      return "emitted-attention";
+    }
+    trace({ event: "answer-unknown-decision" });
+    return "keep-polling";
+  }
   const isQuestion = toolName === "AskUserQuestion";
   switch (answer.decision) {
     case "allow":
@@ -3600,16 +3644,18 @@ async function readStdin2() {
     chunks.push(chunk);
   return Buffer.concat(chunks).toString("utf8");
 }
-async function runPermissionHook(deps = {}, agent = "claude") {
+async function runPermissionHook(deps = {}, agent = "claude", surface = "permission-request") {
+  const tuiUserInput = surface === "tui-request-user-input";
   const noHoldPath = deps.noHoldPath ?? NO_HOLD_PATH;
   const trace = deps.trace ?? defaultTrace();
   let loopback;
   let heldSessionId;
-  let emittedDecision = false;
+  let settleAsWorking = false;
   let settleHeldRecord;
   try {
     if (await flagExists(noHoldPath)) {
-      await (deps.delegate ?? (() => runHook(agent)))();
+      if (!tuiUserInput)
+        await (deps.delegate ?? (() => runHook(agent)))();
       return;
     }
     const [config, raw] = await Promise.all([
@@ -3637,18 +3683,22 @@ async function runPermissionHook(deps = {}, agent = "claude") {
     const agentId = typeof input.agent_id === "string" ? input.agent_id : "";
     const permissionMode = typeof input.permission_mode === "string" ? input.permission_mode : undefined;
     trace({ event: "start", session_id: sessionId, tool_name: toolName, permission_mode: permissionMode, agent: agentId.length > 0 });
+    if (tuiUserInput && (agent !== "codex" || input.hook_event_name !== "PreToolUse" || toolName !== "request_user_input")) {
+      trace({ event: "exit", reason: "wrong-hook-surface" });
+      return;
+    }
     if (agentId.length > 0) {
       const agentType = typeof input.agent_type === "string" ? input.agent_type : undefined;
       trace({ event: "exit", reason: "subagent", agent_type: agentType });
       return;
     }
     const interactiveMode = permissionMode === undefined || permissionMode === "default" || agent === "claude" && (permissionMode === "acceptEdits" || permissionMode === "plan");
-    if (!interactiveMode) {
+    if (!tuiUserInput && !interactiveMode) {
       const codexDialogMode = agent === "codex" && (permissionMode === "acceptEdits" || permissionMode === "plan");
       trace({ event: "exit", reason: "mode", mode: permissionMode, ...codexDialogMode ? { codex_dialog_mode: true } : {} });
       return;
     }
-    if (agent === "codex" && !toolName.startsWith("mcp__")) {
+    if (!tuiUserInput && agent === "codex" && !toolName.startsWith("mcp__")) {
       const transcriptPath = typeof input.transcript_path === "string" ? input.transcript_path : "";
       const turnId = typeof input.turn_id === "string" ? input.turn_id : "";
       const policy = await (deps.loadCodexTurnPolicyFn ?? loadCodexTurnPolicy)(transcriptPath, turnId, sessionId);
@@ -3658,7 +3708,7 @@ async function runPermissionHook(deps = {}, agent = "claude") {
         return;
       }
       trace({ event: "codex-reviewer", disposition: "hold", reason: "manual" });
-    } else if (agent === "codex") {
+    } else if (!tuiUserInput && agent === "codex") {
       trace({ event: "codex-reviewer", disposition: "hold", reason: "mcp-reviewer-unknown" });
     }
     const toolInput = typeof input.tool_input === "object" && input.tool_input !== null ? input.tool_input : {};
@@ -3680,7 +3730,7 @@ async function runPermissionHook(deps = {}, agent = "claude") {
       permissionToolName: toolName
     };
     const rawDetail = buildPermissionDetail(toolName, toolInput);
-    const fitted = fitPermissionDetail(permissionBase, rawDetail, BLOB_FIT_CHARS, buildPermissionQuestions(toolInput));
+    const fitted = fitPermissionDetail(permissionBase, rawDetail, BLOB_FIT_CHARS, tuiUserInput ? [] : buildPermissionQuestions(toolInput));
     const detailFull = fullTextForRecord(rawDetail, fitted.detail);
     if (record && record.permissionDetailFull !== detailFull) {
       await (deps.stampDetailFullFn ?? defaultStampDetailFull())(sessionId, detailFull);
@@ -3701,7 +3751,17 @@ async function runPermissionHook(deps = {}, agent = "claude") {
           const res = await fetchFn(`${config.url}/v1/cc/decision`, {
             method: "POST",
             headers: { "content-type": "application/json", ...pcHeaders },
-            body: JSON.stringify({ v: 2, sessionId, requestId, op: "update", prio: 1, ts, blob, fallbackBlob }),
+            body: JSON.stringify({
+              v: 2,
+              sessionId,
+              requestId,
+              op: "update",
+              prio: 1,
+              ts,
+              blob,
+              fallbackBlob,
+              ...tuiUserInput ? { attentionKind: "userInput" } : {}
+            }),
             signal: AbortSignal.timeout(POST_FIRST_CONTACT_TIMEOUT_MS)
           });
           if (res.ok) {
@@ -3798,7 +3858,7 @@ async function runPermissionHook(deps = {}, agent = "claude") {
     heldSessionId = sessionId;
     settleHeldRecord = async () => {
       const settledAt = (deps.now ?? Date.now)();
-      const patch = emittedDecision ? {
+      const patch = settleAsWorking ? {
         ts: settledAt,
         lastEvent: "working",
         op: "update",
@@ -3816,9 +3876,9 @@ async function runPermissionHook(deps = {}, agent = "claude") {
     const applyAnswerBlob = async (answerBlob, src) => {
       const answer = await decryptBlob(config.e2eKey, answerBlob);
       const match = answer.requestId === requestId;
-      const outcome = match ? emitDecision(agent, answer, toolName, toolInput, suggestions, emit, trace) : "released";
+      const outcome = match ? emitDecision(agent, answer, toolName, toolInput, suggestions, emit, trace, surface) : "released";
       if (outcome === "emitted")
-        emittedDecision = true;
+        settleAsWorking = true;
       if (outcome !== "keep-polling") {
         trace({ event: "answered", match, outcome, src });
         trace({ event: "exit", reason: "answered" });
@@ -3929,6 +3989,7 @@ if (__require.main == __require.module) {
     process.exit(await approvalsCommand(sub));
   }
   let flushed = Promise.resolve();
+  const surface = process.argv.includes("--tui-request-user-input") ? "tui-request-user-input" : "permission-request";
   await runPermissionHook({
     emit: (line) => {
       flushed = new Promise((resolve2) => {
@@ -3941,7 +4002,7 @@ if (__require.main == __require.module) {
         });
       });
     }
-  }, "codex");
+  }, "codex", surface);
   await flushed;
   process.exit(0);
 }
