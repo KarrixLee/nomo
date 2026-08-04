@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -14,12 +14,12 @@ import {
   claudeTailPendingApproval, codexLastTurnEvent, codexTailPendingApproval, correctIdleClaude, correctInterrupt,
   CODEX_TUI_SESSION_START_SKEW_MS, correlateCodexTuiPid, resolveCodexTuiOwner,
   COMMAND_FUTURE_SKEW_MS, COMMAND_TTL_MS, commandIsFresh,
-  correctPendingApproval, correctPendingDone, correctPlanPickerVerification, correctResolvedPlanPicker, createBridgeSupervisor, discoverLiveSessions, drainCommands, effectiveDoneAttempts, extractCommands, goneStrikeShouldTeardown,
+  codexBridgeIsDown, correctPendingApproval, correctPendingDone, correctPlanPickerVerification, correctResolvedPlanPicker, createBridgeSupervisor, discoverLiveSessions, drainCommands, effectiveDoneAttempts, extractCommands, goneStrikeShouldTeardown,
   enforceWatchdogOwnership, hasInterruptMarker, IDLE_GRACE_MS, isClaudeIdleReapEligible, isRetireEligible, isRightfulWatchdogOwner, lastTurnLine, PAIRING_TTL_MS, pendingDoneRetryWrite,
   pendingDoneSettleWrite, pendingPairingExpired, planPickerPendingExpired, PLAN_PICKER_PENDING_MAX_MS,
   PLAN_PICKER_RECENT_DONE_MS, PLAN_PICKER_VERIFY_MAX_MS,
-  postOutcomeForStatus, provisionalsCoveredByReal, reconcileProvisionalsSweep, recordMovedSince, resetCommandState, resetDoneAttemptMemory, retireDoneStale,
-  shouldHeartbeat, shouldIdleProvisionalCheck,
+  buildWorkingEnvelope, postOutcomeForStatus, provisionalsCoveredByReal, reconcileProvisionalsSweep, recordMovedSince, resetCommandState, resetDoneAttemptMemory, retireDoneStale,
+  setCodexBridgeDown, shouldHeartbeat, shouldIdleProvisionalCheck,
   heartbeatKind, isWaitingSession,
   shouldInterruptCheck, shouldPendingApprovalCheck, shouldPendingDoneCheck, shouldPlanPickerVerificationCheck, shouldRepairTitle, tailShowsInterrupt, titleRepairedRecord,
   watchdogEventHeaders, WAITING_HEARTBEAT_AFTER_MS, withDeadline,
@@ -2394,6 +2394,151 @@ describe("createBridgeSupervisor (presence gate: no Codex daemon → no bridge, 
     const s = createBridgeSupervisor({ probe: async () => { throw new Error("stat exploded"); }, create: () => { created++; throw new Error("x"); } });
     await s.sync(cfg());
     expect(created).toBe(0);
+  });
+
+  // The regression this closes: the user's Codex app-server daemon died at 22:14 and NOTHING said so.
+  // The presence gate correctly refused to build a bridge — and since the bridge is the ONLY path by
+  // which a phone can answer a Codex TUI question, every question for the next day degraded into an
+  // attention row that could be looked at but never answered.
+  test("socket PRESENT → no start attempt at all (the bridge just builds, as before)", async () => {
+    const f = fakeBridge();
+    const c = collector();
+    let starts = 0;
+    const s = createBridgeSupervisor({
+      probe: async () => true, create: () => f.bridge, detach: c.detach,
+      startDaemon: async () => { starts += 1; return true; },
+    });
+    await s.sync(cfg());
+    await s.sync(cfg());
+    await c.settle();
+    expect(starts).toBe(0);
+    expect(s.daemonDown).toBe(false);
+    expect(f.calls).toEqual(["start", "refresh"]);
+  });
+
+  test("socket ABSENT → EXACTLY ONE bounded start attempt per cooldown, not one per sweep", async () => {
+    const c = collector();
+    let clock = 1_000_000;
+    let starts = 0;
+    const s = createBridgeSupervisor({
+      probe: async () => false, create: () => { throw new Error("unreachable"); }, detach: c.detach,
+      now: () => clock, startDaemon: async () => { starts += 1; return false; },
+    });
+    await s.sync(cfg());          // t0 → the one attempt
+    clock += 5_000; await s.sync(cfg()); // next sweep
+    clock += 5_000; await s.sync(cfg()); // …and the next
+    clock += 280_000; await s.sync(cfg()); // still inside the 5-minute cooldown
+    await c.settle();
+    expect(starts).toBe(1);
+    clock += 20_000;              // cooldown expired (290 s + 20 s > 300 s)
+    await s.sync(cfg());
+    await c.settle();
+    expect(starts).toBe(2);
+  });
+
+  test("the start attempt is DETACHED and never-throwing — a hung/exploding `codex` costs the sweep nothing", async () => {
+    const traced: object[] = [];
+    const s = createBridgeSupervisor({
+      probe: async () => false,
+      create: () => { throw new Error("unreachable"); },
+      // No `detach` injected: the production fire-and-forget path must swallow this rejection itself.
+      startDaemon: () => Promise.reject(new Error("codex: command not found")),
+      trace: (event) => traced.push(event),
+    });
+    const raced = await Promise.race([
+      s.sync(cfg()).then(() => "synced"),
+      new Promise((r) => setTimeout(() => r("timeout"), 250)),
+    ]);
+    expect(raced).toBe("synced");
+    await new Promise((r) => setTimeout(r, 10)); // let the detached rejection land
+    expect(traced).toEqual([{ event: "codex-daemon-start", outcome: "attempt" }]);
+    expect(s.daemonDown).toBe(true);
+  });
+
+  test("a start that SUCCEEDS builds the bridge on the NEXT sync (the probe stays the only authority)", async () => {
+    const f = fakeBridge();
+    const c = collector();
+    let socket = false;
+    const s = createBridgeSupervisor({
+      probe: async () => socket, create: () => f.bridge, detach: c.detach,
+      startDaemon: async () => { socket = true; return true; },
+    });
+    await s.sync(cfg());
+    await c.settle();
+    expect(f.calls).toEqual([]);      // the sync that noticed does NOT retro-build a bridge
+    expect(s.daemonDown).toBe(true);
+    await s.sync(cfg());
+    await c.settle();
+    expect(f.calls).toEqual(["start"]);
+    expect(s.daemonDown).toBe(false); // …and the breadcrumb clears itself
+  });
+
+  test("unpaired never attempts a start (no config, no Codex row to be honest to)", async () => {
+    let starts = 0;
+    const s = createBridgeSupervisor({
+      probe: async () => false, create: () => { throw new Error("unreachable"); },
+      startDaemon: async () => { starts += 1; return true; },
+    });
+    await s.sync(null);
+    expect(starts).toBe(0);
+    expect(s.daemonDown).toBe(false);
+  });
+});
+
+// The breadcrumb half of the same regression: while the socket is gone, every Codex frame the sweep
+// seals says so in its `dbg` tail, so the phone's diagnostics toggle names the cause instead of showing
+// a question that silently cannot be answered.
+describe("cxbridge:down breadcrumb (Codex frames only, and only while the socket is missing)", () => {
+  const rec = (): SessionRecord => ({ pid: 1, machine: "m", label: "l", ts: 1, blob: "" });
+  const key = new Uint8Array(32).fill(7);
+  const dbgOf = async (blob: string): Promise<string | undefined> =>
+    ((await decryptBlob(key, blob)) as { dbg?: string }).dbg;
+
+  afterEach(() => setCodexBridgeDown(false));
+
+  test("a Codex attention frame carries the marker LAST while down, and loses it once the socket returns", async () => {
+    setCodexBridgeDown(true);
+    const down = await buildNeedsAttentionEnvelope("s1", rec(), 1_000, key, "codex") as { blob: string };
+    const marked = await dbgOf(down.blob);
+    expect(marked).toContain("ev:attention");
+    expect(marked?.endsWith(" cxbridge:down")).toBe(true);
+
+    setCodexBridgeDown(false);
+    const up = await buildNeedsAttentionEnvelope("s1", rec(), 1_000, key, "codex") as { blob: string };
+    expect(await dbgOf(up.blob)).not.toContain("cxbridge:down");
+  });
+
+  test("done / working / provisional Codex frames carry it too — a row is diagnosable in any state", async () => {
+    setCodexBridgeDown(true);
+    const done = await buildDoneEnvelope("s1", rec(), 1_000, key, "codex") as { blob: string };
+    const working = await buildWorkingEnvelope("s1", rec(), 1_000, key, "codex");
+    const provisional = await buildProvisionalBlob(
+      { sessionId: "s1", pid: 2, label: "l", title: "t" } as never, "m", { agent: "codex" }, key,
+    );
+    expect(await dbgOf(done.blob)).toContain("cxbridge:down");
+    expect(await dbgOf(working.blob as string)).toContain("cxbridge:down");
+    expect(await dbgOf(provisional)).toContain("cxbridge:down");
+  });
+
+  test("NOTHING is added to a Claude session (its dbg stays absent entirely)", async () => {
+    setCodexBridgeDown(true);
+    expect(codexBridgeIsDown()).toBe(true);
+    const done = await buildDoneEnvelope("s1", rec(), 1_000, key, "claude") as { blob: string };
+    const attention = await buildNeedsAttentionEnvelope("s1", rec(), 1_000, key, "claude") as { blob: string };
+    expect(await dbgOf(done.blob)).toBeUndefined();
+    expect(await dbgOf(attention.blob)).toBeUndefined();
+  });
+
+  test("the marker is added at most once, and a CACHED dbg loses it once the socket is back", async () => {
+    setCodexBridgeDown(true);
+    const marked = "1.0.0 ev:x cls:y cxbridge:down";
+    const once = await buildDoneEnvelope("s1", rec(), 1_000, key, "codex", 1, marked) as { blob: string };
+    expect((await dbgOf(once.blob) ?? "").match(/cxbridge:down/g)).toHaveLength(1);
+    // The title repair rebuilds from `record.dbg`, so a marker stamped during an outage must not ride
+    // forward once the daemon is back.
+    setCodexBridgeDown(false);
+    const repaired = await buildTitleRepairEnvelope("s1", { ...rec(), dbg: marked }, "t", 1_000, key, "codex");
+    expect(await dbgOf(repaired.blob)).toBe("1.0.0 ev:x cls:y");
   });
 });
 

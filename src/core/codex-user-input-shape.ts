@@ -1,6 +1,8 @@
-// Shared, pure classification for Codex request_user_input. Both the blocking hook and the app-server
-// bridge must make the same serve/fallback decision or their cross-process arbitration can create zero
-// holds (hook yields, bridge rejects) or two (hook falls back, bridge accepts).
+// Pure classification for Codex request_user_input: which question shapes the phone can DISPLAY and
+// LOSSLESSLY ANSWER. The app-server bridge (core/codex-remote-input) is its only caller and the only
+// producer of a Codex question card — it was once shared with a blocking PreToolUse hook so the two
+// would agree on ownership, but that hook can never answer a question (it can rewrite a tool's input,
+// never substitute its result) and was deleted; see the note at the top of core/permission.
 
 const ANSWER_MAX = 500;
 const OPTION_LABEL_WIRE_MAX = 60;

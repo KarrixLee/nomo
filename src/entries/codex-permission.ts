@@ -28,9 +28,6 @@ if (import.meta.main) {
   // rationale there). Codex has no ExitPlanMode plan echo, so the decision line rarely nears the
   // buffer, but a large request_user_input answer set can — and a truncated line is a lost approval.
   let flushed: Promise<void> = Promise.resolve();
-  const surface = process.argv.includes("--tui-request-user-input")
-    ? "tui-request-user-input" as const
-    : "permission-request" as const;
   await runPermissionHook({
     emit: (line: string) => {
       flushed = new Promise<void>((resolve) => {
@@ -39,7 +36,7 @@ if (import.meta.main) {
         process.stdout.write(`${line}\n`, () => { clearTimeout(timer); resolve(); });
       });
     },
-  }, "codex", surface);
+  }, "codex");
   await flushed;
   process.exit(0);
 }

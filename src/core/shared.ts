@@ -81,6 +81,39 @@ export function formatDecisionHoldDebug(input: {
   return Array.from(value).slice(0, DBG_BLOB_TEXT_MAX_CHARS).join("");
 }
 
+/** The `dbg` tail that says "this Codex session has NO app-server bridge, because the control socket is
+ *  missing right now". It exists because the failure it names is otherwise completely silent: phone
+ *  answering of a Codex TUI `request_user_input` works ONLY through the app-server bridge, and with no
+ *  daemon socket the watchdog's presence gate never builds one — every question then degrades to an
+ *  attention row the phone can look at but not answer. The phone already shows `dbg` verbatim under its
+ *  diagnostics toggle, so one token there turns an invisible degradation into a readable one without any
+ *  new UI.
+ *
+ *  ORDERING TRUTH, encoded here so nobody widens the claim: the marker describes the socket's state at
+ *  the moment the frame was built. It never promises that starting the daemon will rescue THIS session —
+ *  a Codex TUI that launched with no daemon hosts its conversation in-process and can never retro-attach.
+ *  The recovery attempt this marker accompanies is only ever about the NEXT session. */
+export const CODEX_BRIDGE_DOWN_MARKER = "cxbridge:down";
+
+/** Bring a Codex `dbg` line into line with the CURRENT socket observation, honoring append-last
+ *  discipline: the marker goes at the very END (never reordering the frozen grammar
+ *  formatPlanPickerDebug produces), it is added at most once, and it is DROPPED WHOLE rather than
+ *  pushing the line past DBG_BLOB_TEXT_MAX_CHARS — the outer appendFittedPlanAndDebug would otherwise
+ *  slice it into a half-token. `undefined` in (a non-Codex frame) is `undefined` out: nothing is ever
+ *  added to a Claude session.
+ *
+ *  It also REMOVES the marker when the socket is back, which is not symmetry for its own sake: several
+ *  producers rebuild a frame from a `dbg` CACHED ON THE SESSION RECORD (the title repair, the
+ *  provisional row), so without the strip a marker stamped during an outage would ride forward forever
+ *  and keep accusing a daemon that has since recovered. */
+export function appendCodexBridgeMarker(dbg: string | undefined, down: boolean): string | undefined {
+  if (typeof dbg !== "string" || dbg.length === 0) return dbg;
+  const bare = dbg.split(` ${CODEX_BRIDGE_DOWN_MARKER}`).join("");
+  if (!down) return bare;
+  const next = `${bare} ${CODEX_BRIDGE_DOWN_MARKER}`;
+  return Array.from(next).length <= DBG_BLOB_TEXT_MAX_CHARS ? next : bare;
+}
+
 /** Root of the on-disk state: config.json, the per-session pid files, the watchdog pidfile. */
 export const CC_DIR = `${process.env.HOME}/.config/cc-status`;
 /** Append-only, local-only session lifecycle/state-machine trace next to config.json. */
@@ -357,6 +390,112 @@ export async function codexAppServerSocketAvailable(socketPath = codexAppServerS
   } catch {
     return false;
   }
+}
+
+/** The EXACT subcommand that brings the shared Codex app-server daemon up, verified against the local
+ *  binary's help (codex-cli 0.146.0): `codex app-server daemon start` — "Start the local app server
+ *  daemon if it is not already running", i.e. it is idempotent by contract. NOTE it is `daemon start`
+ *  and NOT `codex app-server proxy`: proxy only ATTACHES to an existing control socket and fails with a
+ *  connect error when none is there, which is precisely how the daemon's death stayed invisible. */
+export const CODEX_DAEMON_START_ARGS = ["app-server", "daemon", "start"] as const;
+/** Ceiling on the start CHILD itself. `daemon start` forks the server and returns; anything slower than
+ *  this is a wedged binary and waiting longer only delays the trace. */
+const CODEX_DAEMON_START_TIMEOUT_MS = 8_000;
+/** After a clean exit, how long we keep re-statting for the socket before calling the attempt a failure.
+ *  The daemon binds its control socket a beat after the parent returns. */
+const CODEX_DAEMON_SOCKET_WAIT_MS = 4_000;
+const CODEX_DAEMON_SOCKET_POLL_MS = 250;
+
+export interface CodexDaemonStartDeps {
+  /** Spawns the start child. Defaults to the real `codex` binary with stdin CLOSED (see below). */
+  spawnFn?: (command: string, args: readonly string[]) => {
+    on(event: "error", listener: (error: unknown) => void): unknown;
+    on(event: "exit", listener: (code: number | null, signal: string | null) => void): unknown;
+    kill(signal?: string): boolean;
+  };
+  probe?: () => Promise<boolean>;
+  sleep?: (ms: number) => Promise<void>;
+  trace?: (event: object) => void;
+  codexPath?: string;
+  timeoutMs?: number;
+  socketWaitMs?: number;
+}
+
+/** Best-effort recovery for a MISSING Codex app-server daemon: run `codex app-server daemon start` once
+ *  and wait, bounded, for the control socket to appear. Resolves true only when the socket is really
+ *  there afterwards.
+ *
+ *  RULES, all of them load-bearing:
+ *   - NON-INTERACTIVE. stdio is `ignore` — stdin is /dev/null, so the child can never prompt, and it
+ *     inherits none of our streams (the watchdog owes its stdout absolute silence).
+ *   - NEVER THROWS. A missing binary (ENOENT), a non-zero exit, a hang, or a socket that never appears
+ *     all resolve false and are TRACED. The caller degrades; it never fails.
+ *   - IT DOES NOT RESCUE THE SESSION THAT NOTICED. A Codex TUI started while no daemon existed hosts its
+ *     conversation in-process and never retro-attaches, so no amount of starting the daemon makes THAT
+ *     TUI answerable from the phone. This buys the NEXT session, and any wording built on top of it must
+ *     not promise more (see CODEX_BRIDGE_DOWN_MARKER). */
+export async function startCodexAppServerDaemon(deps: CodexDaemonStartDeps = {}): Promise<boolean> {
+  const trace = deps.trace ?? ((event: object) => traceSession(event));
+  const probe = deps.probe ?? (() => codexAppServerSocketAvailable());
+  const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+  const command = deps.codexPath ?? "codex";
+  const timeoutMs = deps.timeoutMs ?? CODEX_DAEMON_START_TIMEOUT_MS;
+  const socketWaitMs = deps.socketWaitMs ?? CODEX_DAEMON_SOCKET_WAIT_MS;
+  const spawnFn = deps.spawnFn
+    ?? ((cmd: string, args: readonly string[]) => spawn(cmd, [...args], { stdio: "ignore" }));
+
+  let exit: { code: number | null; signal: string | null } | "error" | "timeout";
+  try {
+    exit = await new Promise<typeof exit>((resolve) => {
+      let settled = false;
+      const done = (value: typeof exit): void => {
+        if (settled) return;
+        settled = true;
+        resolve(value);
+      };
+      let child: ReturnType<NonNullable<CodexDaemonStartDeps["spawnFn"]>>;
+      try {
+        child = spawnFn(command, CODEX_DAEMON_START_ARGS);
+      } catch {
+        done("error"); // codex not installed / not executable
+        return;
+      }
+      const timer = setTimeout(() => {
+        try { child.kill("SIGTERM"); } catch { /* already gone */ }
+        done("timeout");
+      }, timeoutMs);
+      (timer as unknown as { unref?: () => void }).unref?.();
+      child.on("error", () => { clearTimeout(timer); done("error"); });
+      child.on("exit", (code, signal) => { clearTimeout(timer); done({ code, signal }); });
+    });
+  } catch {
+    exit = "error";
+  }
+
+  if (exit === "error" || exit === "timeout" || exit.code !== 0) {
+    trace({
+      event: "codex-daemon-start", outcome: exit === "error" ? "spawn-failed" : exit === "timeout" ? "timeout" : "nonzero-exit",
+      ...(typeof exit === "object" ? { code: exit.code, signal: exit.signal } : {}),
+    });
+    return false;
+  }
+
+  // Exit 0 is not proof: `daemon start` returns before the socket is necessarily bound (and would also
+  // exit 0 if it decided the daemon was already up while the socket is being replaced). The SOCKET is
+  // the contract, so re-stat until it shows up or the bounded wait expires.
+  const deadline = socketWaitMs;
+  for (let waited = 0; ; waited += CODEX_DAEMON_SOCKET_POLL_MS) {
+    let up = false;
+    try { up = await probe(); } catch { up = false; }
+    if (up) {
+      trace({ event: "codex-daemon-start", outcome: "started", waitedMs: waited });
+      return true;
+    }
+    if (waited >= deadline) break;
+    await sleep(CODEX_DAEMON_SOCKET_POLL_MS);
+  }
+  trace({ event: "codex-daemon-start", outcome: "no-socket", waitedMs: deadline });
+  return false;
 }
 
 /** Per-agent hook-liveness stamp: the hook rewrites `<CC_DIR>/last-hook-<agent>` (epoch-ms text) on

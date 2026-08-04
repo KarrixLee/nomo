@@ -48,9 +48,24 @@ import {
 import {
   LAN_ENVELOPE_VERSION, LAN_PATH, LAN_STATE_PATH, lanRunningUnderTest, parseLanState,
 } from "./lan-wire";
-import {
-  clearCodexInputFallback, codexInputBridgeCanServe, markCodexInputFallback,
-} from "./codex-user-input-arbitration";
+// WHY THERE IS NO request_user_input HOOK SURFACE HERE (removed 2026-08-04 — do not rebuild it).
+//
+// A Codex TUI question can be answered from the phone through EXACTLY ONE mechanism: the app-server
+// bridge (core/codex-remote-input → client.answerUserInput, which speaks the app-server-only
+// RequestUserInputAnswer response type). This file once carried a second, hook-shaped attempt — a
+// blocking PreToolUse handler on `request_user_input` plus a cross-process arbitration protocol
+// (core/codex-user-input-arbitration) to keep the two from creating zero or two holds. It cannot work,
+// for a reason no amount of engineering moves:
+//
+//   A PreToolUse hook can only rewrite a tool's INPUT (`updatedInput`) or allow/deny it. There is no
+//   `answers` field and no other channel by which it can substitute a tool RESULT. So the best a hook
+//   could ever do with the phone's answer is rewrite the QUESTIONS and then let Codex ask them at the
+//   Mac — which is not answering from the phone, it is re-asking locally. (It also hung the Codex CLI in
+//   the field, which is why the manifest entry was reverted in v1.6.9.)
+//
+// If a future Codex ships a hook that can return a tool result, that is a NEW contract and deserves a
+// new design — not a revival of this one. Until then, the honest failure mode is the daemon-presence
+// breadcrumb (`cxbridge:down`, see core/shared) plus the watchdog's bounded daemon-start recovery.
 
 /** Local escape-hatch flag: when this file exists, the hook skips the hold entirely and behaves as a
  *  plain fire-and-forget attention event (instant terminal dialog). Toggled by `cc-permission off|on`.
@@ -239,9 +254,6 @@ const ANSWER_MAX = 500;
 type DecisionOutcome =
   /** One decision line went to stdout — the hold is over. */
   | "emitted"
-  /** One line released a blocking PreToolUse so Codex can open its native picker. The user is still
-   *  waiting at the Mac, so the session record must remain attentive. */
-  | "emitted-attention"
   /** NOTHING was emitted and the hold is over: the hook exits 0 silently, so CC proceeds with its own
    *  flow and shows the terminal picker ("answer at your Mac"). Used whenever a KNOWN verb cannot be
    *  honored for this tool — it can never be converted into a deny on any path. */
@@ -271,23 +283,6 @@ function denyLine(agent: AgentKind, message?: unknown): string {
   const m = typeof message === "string" ? message.trim().slice(0, DENY_MESSAGE_MAX) : "";
   if (m.length === 0) return decisionLine(agent, DENY_HSO);
   return decisionLine(agent, { hookEventName: "PermissionRequest", decision: { behavior: "deny", message: m } });
-}
-
-/** Codex 0.146's blocking PreToolUse contract. request_user_input's handler has not started while this
- *  hook is running, so allow echoes the ORIGINAL tool input before the native TUI opens its picker. */
-function preToolUserInputLine(
-  decision: "allow" | "deny", toolInput: Record<string, unknown>, message?: unknown,
-): string {
-  if (decision === "allow") {
-    return decisionLine("codex", {
-      hookEventName: "PreToolUse", permissionDecision: "allow", updatedInput: toolInput,
-    });
-  }
-  const custom = typeof message === "string" ? message.trim().slice(0, DENY_MESSAGE_MAX) : "";
-  return decisionLine("codex", {
-    hookEventName: "PreToolUse", permissionDecision: "deny",
-    permissionDecisionReason: custom.length > 0 ? custom : "Denied from phone",
-  });
 }
 
 /** Allow + a session-scoped always-allow rule. CC's own `permission_suggestions` (already narrowly
@@ -807,24 +802,7 @@ function emitDecision(
   suggestions: unknown,
   emit: (line: string) => void,
   trace: (event: object) => void,
-  surface: PermissionHookSurface,
 ): DecisionOutcome {
-  if (surface === "tui-request-user-input") {
-    if (answer.decision === "deny") {
-      emit(preToolUserInputLine("deny", toolInput, answer.message));
-      trace({ event: "emit", decision: "deny", hook_event_name: "PreToolUse" });
-      return "emitted";
-    }
-    if (answer.decision === "allow" || answer.decision === "allow_always" || answer.decision === "answer") {
-      // An unattached TUI has no external UserInputAnswer transport. Every positive verb therefore means
-      // the only action this hook can actually deliver: release to Codex's own terminal picker.
-      emit(preToolUserInputLine("allow", toolInput));
-      trace({ event: "emit", decision: "release-to-tui", requested: answer.decision });
-      return "emitted-attention";
-    }
-    trace({ event: "answer-unknown-decision" });
-    return "keep-polling";
-  }
   const isQuestion = toolName === "AskUserQuestion";
   switch (answer.decision) {
     case "allow":
@@ -1103,18 +1081,6 @@ function defaultSettleHoldRecord(): (sessionId: string, patch: Partial<SessionRe
   return lanRunningUnderTest() ? async () => { /* never touch real records from a test */ } : settleDecisionHoldRecord;
 }
 
-function defaultBridgeCanServe(): NonNullable<PermissionHookDeps["bridgeCanServeFn"]> {
-  return lanRunningUnderTest() ? async () => false : codexInputBridgeCanServe;
-}
-
-function defaultMarkInputFallback(): NonNullable<PermissionHookDeps["markInputFallbackFn"]> {
-  return lanRunningUnderTest() ? async () => {} : markCodexInputFallback;
-}
-
-function defaultClearInputFallback(): NonNullable<PermissionHookDeps["clearInputFallbackFn"]> {
-  return lanRunningUnderTest() ? async () => {} : clearCodexInputFallback;
-}
-
 /** Injectable seams so permission.test.ts drives the state machine with a scripted fetch, an instant
  *  sleep, a deterministic requestId, and a temp flag path — no real stdin/network/timers. Production
  *  uses every default. */
@@ -1174,17 +1140,6 @@ export interface PermissionHookDeps {
   /** The loopback ticker's own pacing clock + cadence (never the hook's `sleep` — see the poller). */
   lanSleep?: (ms: number) => Promise<void>;
   lanIntervalMs?: number;
-  /** Cross-process request_user_input ownership seams. The exact-match hook yields only to a live,
-   * subscribed bridge that shares its shape filter; otherwise it marks the honest fallback first. */
-  bridgeCanServeFn?: (
-    sessionId: string, turnId: string, toolInput: Record<string, unknown>,
-  ) => Promise<boolean>;
-  markInputFallbackFn?: (
-    sessionId: string, turnId: string, toolInput: Record<string, unknown>, held?: boolean,
-  ) => Promise<void>;
-  clearInputFallbackFn?: (
-    sessionId: string, turnId: string, toolInput: Record<string, unknown>,
-  ) => Promise<void>;
 }
 
 async function readStdin(): Promise<string> {
@@ -1192,10 +1147,6 @@ async function readStdin(): Promise<string> {
   for await (const chunk of process.stdin) chunks.push(chunk as Buffer);
   return Buffer.concat(chunks).toString("utf8");
 }
-
-/** Which native hook contract owns this hold. The specialized surface is intentionally not inferred
- *  from tool_name: only the exact manifest handler may emit PreToolUse control output. */
-export type PermissionHookSurface = "permission-request" | "tui-request-user-input";
 
 /** The PermissionRequest hook body. See the module header for the (deliberately) unbounded-wait
  *  contract and the absolute fail-open posture. Never throws across its boundary.
@@ -1207,9 +1158,7 @@ export type PermissionHookSurface = "permission-request" | "tui-request-user-inp
  *  codex-permission calls it with "codex". */
 export async function runPermissionHook(
   deps: PermissionHookDeps = {}, agent: AgentKind = "claude",
-  surface: PermissionHookSurface = "permission-request",
 ): Promise<void> {
-  const tuiUserInput = surface === "tui-request-user-input";
   const noHoldPath = deps.noHoldPath ?? NO_HOLD_PATH;
   const trace = deps.trace ?? defaultTrace();
   /** The hold's LAN loopback poller, once a hold is granted. Function-scoped ONLY so the `finally` below
@@ -1218,30 +1167,21 @@ export async function runPermissionHook(
   /** The session whose on-disk hold marker THIS process owns, once one is stamped — function-scoped for
    *  the same reason as `loopback`: the `finally` clears it from every exit of the poll loop. */
   let heldSessionId: string | undefined;
-  /** Is the session actually working after the emitted decision? Ordinary allow/deny is done; a special
-   *  PreToolUse allow merely opens Codex's TUI picker and must remain needsAttention. Set in
+  /** Is the session actually working after the emitted decision? An ordinary emitted allow/deny is done;
+   *  a `released` exit left the user waiting at the Mac and must remain needsAttention. Set in
    *  applyAnswerBlob, read by `settleHeldRecord` at exit time. */
   let settleAsWorking = false;
   /** The record settle this process owes the LAN feed, built the moment a hold is granted so it closes
    *  over the config/blobs the `try` scope owns. Read `settleAsWorking` at CALL time — it describes the
    *  exit that actually happened, not the one we expected when we built it. */
   let settleHeldRecord: (() => Promise<void>) | undefined;
-  /** Refresh fallback ownership immediately before this hook releases. A user may leave the card open
-   * near the ten-minute hold TTL; anchoring the suppression marker at release still lets the bridge
-   * recognize the native request that follows. */
-  let markInputFallback: ((held: boolean) => Promise<void>) | undefined;
-  let clearInputFallbackClaim: (() => Promise<void>) | undefined;
-  let fallbackHoldGranted = false;
-  let fallbackBlocksTool = false;
   try {
     // Escape hatch FIRST (a file stat — no stdin consumed yet): if the user paused remote approvals
     // locally, behave exactly as the old fire-and-forget attention event (instant terminal dialog).
     // Delegating to runHook reuses the entire needs-attention pipeline (POST, tracking, watchdog) and
     // returns silently with exit 0 — it also no-ops cleanly when unpaired, so zero network in that case.
     if (await flagExists(noHoldPath)) {
-      // The wildcard codex-status PreToolUse handler already owns the yellow status event. Calling it
-      // again from this exact-match handler would recreate the old double-fire; release silently.
-      if (!tuiUserInput) await (deps.delegate ?? (() => runHook(agent)))();
+      await (deps.delegate ?? (() => runHook(agent)))();
       return;
     }
 
@@ -1270,13 +1210,6 @@ export async function runPermissionHook(
     const permissionMode = typeof input.permission_mode === "string" ? input.permission_mode : undefined;
     trace({ event: "start", session_id: sessionId, tool_name: toolName, permission_mode: permissionMode, agent: agentId.length > 0 });
 
-    if (tuiUserInput && (
-      agent !== "codex" || input.hook_event_name !== "PreToolUse" || toolName !== "request_user_input"
-    )) {
-      trace({ event: "exit", reason: "wrong-hook-surface" });
-      return;
-    }
-
     // PASS-THROUGH GATES — the hold must never block a non-interactive/auto flow. Both exit 0 with zero
     // output and zero network, so the normal permission flow applies (auto-approval rules still fire; a
     // dialog shows only if it would have anyway).
@@ -1298,7 +1231,7 @@ export async function runPermissionHook(
     const interactiveMode = permissionMode === undefined
       || permissionMode === "default"
       || (agent === "claude" && (permissionMode === "acceptEdits" || permissionMode === "plan"));
-    if (!tuiUserInput && !interactiveMode) {
+    if (!interactiveMode) {
       // Signal-only (no behavior change): if a future Codex starts reporting claude-style dialog modes,
       // the `agent === "claude"` narrowing above would silently stop holding for them. Tag that exit so
       // the trace names the cause instead of reading like an ordinary non-interactive mode.
@@ -1311,7 +1244,7 @@ export async function runPermissionHook(
     //    overrides. In auto-review, silently return control to Codex BEFORE any Nomo POST so Codex's
     //    built-in reviewer can decide. Full Access normally took the mode gate above, but the rollout
     //    checks make that promise resilient to a producer that reports `default` by mistake.
-    if (!tuiUserInput && agent === "codex" && !toolName.startsWith("mcp__")) {
+    if (agent === "codex" && !toolName.startsWith("mcp__")) {
       const transcriptPath = typeof input.transcript_path === "string" ? input.transcript_path : "";
       const turnId = typeof input.turn_id === "string" ? input.turn_id : "";
       const policy = await (deps.loadCodexTurnPolicyFn ?? loadCodexTurnPolicy)(transcriptPath, turnId, sessionId);
@@ -1321,7 +1254,7 @@ export async function runPermissionHook(
         return;
       }
       trace({ event: "codex-reviewer", disposition: "hold", reason: "manual" });
-    } else if (!tuiUserInput && agent === "codex") {
+    } else if (agent === "codex") {
       // MCP apps may override the thread-global reviewer per connector. Codex does not expose that
       // effective reviewer to hooks yet, so the rollout is not authoritative for these tool names.
       trace({ event: "codex-reviewer", disposition: "hold", reason: "mcp-reviewer-unknown" });
@@ -1332,24 +1265,6 @@ export async function runPermissionHook(
     const toolInput = typeof input.tool_input === "object" && input.tool_input !== null
       ? (input.tool_input as Record<string, unknown>)
       : {};
-    if (tuiUserInput) {
-      const turnId = typeof input.turn_id === "string" ? input.turn_id : "";
-      const bridgeOwns = await (deps.bridgeCanServeFn ?? defaultBridgeCanServe())(
-        sessionId, turnId, toolInput,
-      );
-      if (bridgeOwns) {
-        trace({ event: "exit", reason: "app-server-bridge" });
-        return;
-      }
-      // This stamp precedes the fallback decision POST. If the fallback later releases into Codex's
-      // native picker, the bridge consumes it and suppresses its otherwise-duplicate actionable hold.
-      const markFallback = deps.markInputFallbackFn ?? defaultMarkInputFallback();
-      const clearFallback = deps.clearInputFallbackFn ?? defaultClearInputFallback();
-      markInputFallback = (held) => markFallback(sessionId, turnId, toolInput, held);
-      clearInputFallbackClaim = () => clearFallback(sessionId, turnId, toolInput);
-      try { await markInputFallback(false); }
-      catch { trace({ event: "input-arbitration-marker-error", phase: "pending" }); }
-    }
     // CC's own narrowly-scoped rule suggestions (present on the PermissionRequest when it has them);
     // passed through VERBATIM by allowAlwaysLine on an always-allow answer. Absent → whole-tool rule.
     const suggestions = input.permission_suggestions;
@@ -1396,8 +1311,7 @@ export async function runPermissionHook(
     };
     const rawDetail = buildPermissionDetail(toolName, toolInput);
     const fitted = fitPermissionDetail(
-      permissionBase, rawDetail, BLOB_FIT_CHARS,
-      tuiUserInput ? [] : buildPermissionQuestions(toolInput),
+      permissionBase, rawDetail, BLOB_FIT_CHARS, buildPermissionQuestions(toolInput),
     );
     // NOM-44 phase 4: the fit above is the WORKER's ceiling and stays exactly as it is, but a phone on
     // this network can pull from the Mac directly, where there is none — so tee the UNABRIDGED detail
@@ -1447,7 +1361,6 @@ export async function runPermissionHook(
             headers: { "content-type": "application/json", ...pcHeaders },
             body: JSON.stringify({
               v: 2, sessionId, requestId, op: "update", prio: 1, ts, blob, fallbackBlob,
-              ...(tuiUserInput ? { attentionKind: "userInput" } : {}),
             }),
             signal: AbortSignal.timeout(POST_FIRST_CONTACT_TIMEOUT_MS),
           });
@@ -1620,12 +1533,6 @@ export async function runPermissionHook(
       if (!hold) { trace({ event: "exit", reason: "hold-false" }); return; } // still not shown → worker applied the attention update → terminal dialog
     }
 
-    if (tuiUserInput && markInputFallback !== undefined) {
-      fallbackHoldGranted = true;
-      try { await markInputFallback(true); }
-      catch { trace({ event: "input-arbitration-marker-error", phase: "held" }); }
-    }
-
     // THE HOLD IS REAL — tell the LAN channel. The worker now stores the decisionPending frame and
     // defends it (it drops the plain prio:1 needsAttention CC's `Notification` hook fires seconds from
     // now); the LAN frames feed rebuilds its frames from the SESSION RECORD, which has never carried
@@ -1713,11 +1620,10 @@ export async function runPermissionHook(
       // replay/stale answer (silent, done). The ONE keep-polling case is a matched but UNRECOGNIZED
       // decision verb (newer phone, older plugin): a decision we DO understand can still land.
       const outcome: DecisionOutcome = match
-        ? emitDecision(agent, answer, toolName, toolInput, suggestions, emit, trace, surface)
+        ? emitDecision(agent, answer, toolName, toolInput, suggestions, emit, trace)
         : "released";
-      if (tuiUserInput && match && answer.decision === "deny") fallbackBlocksTool = true;
-      // Only an ordinary emitted decision means WORKING. `emitted-attention` released PreToolUse but
-      // opened the native TUI picker; `released` emitted nothing. Both remain honestly attentive.
+      // Only an emitted decision means WORKING. A `released` exit emitted nothing and left the user at
+      // the Mac, so that row stays honestly attentive.
       if (outcome === "emitted") settleAsWorking = true;
       if (outcome !== "keep-polling") {
         trace({ event: "answered", match, outcome, src });
@@ -1831,12 +1737,6 @@ export async function runPermissionHook(
     // payload it choked on, and this trace is a plaintext file on disk.
     trace({ event: "exit", reason: "exception", ...errorTag(e) });
   } finally {
-    if (markInputFallback !== undefined && clearInputFallbackClaim !== undefined) {
-      try {
-        if (fallbackHoldGranted && !fallbackBlocksTool) await markInputFallback(true);
-        else await clearInputFallbackClaim();
-      } catch { /* the original claim still has its bounded TTL */ }
-    }
     // Stop the detached loopback ticker on EVERY exit (emitted, released, give-up, exception). The
     // process is normally about to exit anyway; this is what keeps it from outliving the hold in-process.
     try { loopback?.stop(); } catch { /* best-effort */ }

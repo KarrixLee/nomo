@@ -21,10 +21,14 @@ import {
   startCodexRemoteInput,
 } from "./codex-remote-input";
 import { Config, PLUGIN_VERSION } from "./shared";
-import {
-  clearCodexInputBridgeReady, codexInputFallbackOwnsRequest, markCodexInputBridgeReady,
-} from "./codex-user-input-arbitration";
-import { lanRunningUnderTest } from "./lan-wire";
+
+// NO CROSS-PROCESS ARBITRATION LIVES HERE ANY MORE (removed 2026-08-04). This bridge used to publish a
+// per-thread readiness lease and consult a hook-written fallback fingerprint, so that a blocking
+// PreToolUse handler on `request_user_input` and this bridge could not both (or neither) create a hold.
+// That hook is gone for good — a PreToolUse hook can substitute a tool INPUT (`updatedInput`), never a
+// tool RESULT, and `RequestUserInputAnswer` is an app-server-only response type — so this bridge is now
+// the SOLE producer of a Codex question card and has nobody to arbitrate with. See the long note at the
+// top of core/permission before reintroducing either side.
 
 const LOADED_PAGE_SIZE = 100;
 const RECONNECT_DELAY_MS = 5_000;
@@ -54,9 +58,6 @@ export interface CodexRemoteInputBridgeOptions {
   startRemoteInputFn?: (request: CodexUserInputRequest, deps: CodexRemoteInputDeps) => CodexRemoteInputHandle;
   /** Diagnostic seam for the app-server client and every detached relay task. Never fatal. */
   onError?: (error: Error) => void;
-  markThreadReadyFn?: (threadId: string) => Promise<void>;
-  clearThreadReadyFn?: (threadId: string) => Promise<void>;
-  fallbackOwnsRequestFn?: (request: CodexUserInputRequest) => Promise<boolean>;
 }
 
 function requestKey(request: CodexUserInputRequest): string {
@@ -80,9 +81,6 @@ export class CodexRemoteInputBridge {
   private readonly client: BridgeClient;
   private readonly startRemoteInputFn: NonNullable<CodexRemoteInputBridgeOptions["startRemoteInputFn"]>;
   private readonly onError: CodexRemoteInputBridgeOptions["onError"];
-  private readonly markThreadReadyFn: NonNullable<CodexRemoteInputBridgeOptions["markThreadReadyFn"]>;
-  private readonly clearThreadReadyFn: NonNullable<CodexRemoteInputBridgeOptions["clearThreadReadyFn"]>;
-  private readonly fallbackOwnsRequestFn: NonNullable<CodexRemoteInputBridgeOptions["fallbackOwnsRequestFn"]>;
   private readonly subscribedThreads = new Set<string>();
   private readonly pendingRequests = new Set<string>();
   private readonly resolvedWhilePending = new Set<string>();
@@ -98,13 +96,6 @@ export class CodexRemoteInputBridge {
   constructor(private readonly config: Config, options: CodexRemoteInputBridgeOptions = {}) {
     this.startRemoteInputFn = options.startRemoteInputFn ?? startCodexRemoteInput;
     this.onError = options.onError;
-    const underTest = lanRunningUnderTest();
-    this.markThreadReadyFn = options.markThreadReadyFn
-      ?? (underTest ? async () => {} : markCodexInputBridgeReady);
-    this.clearThreadReadyFn = options.clearThreadReadyFn
-      ?? (underTest ? async () => {} : clearCodexInputBridgeReady);
-    this.fallbackOwnsRequestFn = options.fallbackOwnsRequestFn
-      ?? (underTest ? async () => false : codexInputFallbackOwnsRequest);
     const callbacks: CodexRemoteInputBridgeCallbacks = {
       onUserInputRequest: (request) => this.onRequest(request),
       onUserInputResolved: (request, resolution) => this.onResolved(request, resolution),
@@ -178,7 +169,6 @@ export class CodexRemoteInputBridge {
     // moment the process exited. Retiring from the pre-stop snapshot AND awaiting `pendingRetirements`
     // (which onResolved feeds through the same helper) covers both orderings.
     const handles = [...this.handles.values()];
-    await Promise.allSettled([...this.subscribedThreads].map((threadId) => this.clearThreadReadyFn(threadId)));
     await this.client.stop();
     for (const handle of this.handles.values()) handles.push(handle); // anything started during stop()
     this.handles.clear();
@@ -199,14 +189,10 @@ export class CodexRemoteInputBridge {
       }
       for (const threadId of page.data) {
         if (this.client.state !== "ready" || this.stopping) return;
-        if (this.subscribedThreads.has(threadId)) {
-          try { await this.markThreadReadyFn(threadId); } catch { /* the next sweep renews it */ }
-          continue;
-        }
+        if (this.subscribedThreads.has(threadId)) continue;
         try {
           await this.client.resumeThread(threadId);
           this.subscribedThreads.add(threadId);
-          await this.markThreadReadyFn(threadId);
         } catch {
           // A thread can unload between list and resume. The next watchdog sweep can try again.
         }
@@ -225,9 +211,6 @@ export class CodexRemoteInputBridge {
 
   private async routeRequest(request: CodexUserInputRequest, key: string): Promise<void> {
     try {
-      // A fallback PreToolUse hook runs before app-server receives this request. If it released to the
-      // native picker, its fingerprint is the proof that one honest hold already existed.
-      if (await this.fallbackOwnsRequestFn(request)) return;
       if (this.stopping || this.handles.has(key) || this.resolvedWhilePending.delete(key)) return;
       const handle = this.startRemoteInputFn(request, {
         config: this.config,
@@ -274,9 +257,7 @@ export class CodexRemoteInputBridge {
       this.refreshSubscriptions().catch((error: unknown) =>
         this.reportError(error, "Failed to refresh Codex thread subscriptions"));
     } else if (state === "disconnected" || state === "stopped") {
-      const threads = [...this.subscribedThreads];
       this.subscribedThreads.clear();
-      void Promise.allSettled(threads.map((threadId) => this.clearThreadReadyFn(threadId)));
     }
   }
 }

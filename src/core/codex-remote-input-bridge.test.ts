@@ -105,9 +105,6 @@ async function drainRequests(): Promise<void> {
  *  a live card. `resolved` counts retirement STARTS, `retired` counts COMPLETIONS. */
 function harness(options: {
   retirement?: () => Promise<void>;
-  fallbackOwnsRequest?: (request: CodexUserInputRequest) => Promise<boolean>;
-  markThreadReady?: (threadId: string) => Promise<void>;
-  clearThreadReady?: (threadId: string) => Promise<void>;
 } = {}) {
   let client!: FakeClient;
   const errors: Error[] = [];
@@ -121,9 +118,6 @@ function harness(options: {
   }[] = [];
   const bridge = new CodexRemoteInputBridge(config, {
     onError: (error) => errors.push(error),
-    fallbackOwnsRequestFn: options.fallbackOwnsRequest,
-    markThreadReadyFn: options.markThreadReady,
-    clearThreadReadyFn: options.clearThreadReady,
     createClient: (callbacks) => (client = new FakeClient(callbacks)),
     startRemoteInputFn: (incoming, deps): CodexRemoteInputHandle => {
       const completion = deferred<CodexRemoteInputResult>();
@@ -158,18 +152,6 @@ function harness(options: {
 }
 
 describe("CodexRemoteInputBridge", () => {
-  test("a matching fallback claim suppresses the bridge, including duplicate app-server delivery", async () => {
-    let claims = 0;
-    const h = harness({ fallbackOwnsRequest: async () => { claims += 1; return true; } });
-    await h.bridge.start();
-    h.client().callbacks.onUserInputRequest(request);
-    h.client().callbacks.onUserInputRequest(request);
-    await drainRequests();
-    expect(claims).toBe(1);
-    expect(h.handles).toHaveLength(0);
-    await h.bridge.stop();
-  });
-
   test("maps 0.146.0 waiting, idle/composer, and query failure without guessing", async () => {
     const h = harness();
     await h.bridge.start();
@@ -197,22 +179,6 @@ describe("CodexRemoteInputBridge", () => {
     await h.bridge.refreshSubscriptions();
     expect(h.client().resumed).toEqual(["thread-1", "thread-2", "thread-3", "thread-4"]);
     await h.bridge.stop();
-  });
-
-  test("publishes, renews, and clears per-thread bridge readiness leases", async () => {
-    const marked: string[] = [];
-    const cleared: string[] = [];
-    const h = harness({
-      markThreadReady: async (threadId) => { marked.push(threadId); },
-      clearThreadReady: async (threadId) => { cleared.push(threadId); },
-    });
-    h.client().pages.push({ data: ["thread-1"], nextCursor: null });
-    await h.bridge.start();
-    h.client().pages.push({ data: ["thread-1"], nextCursor: null });
-    await h.bridge.refreshSubscriptions();
-    expect(marked).toEqual(["thread-1", "thread-1"]);
-    await h.bridge.stop();
-    expect(cleared).toContain("thread-1");
   });
 
   test("starts one relay request and answers the exact app-server identity", async () => {

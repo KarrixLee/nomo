@@ -46,7 +46,8 @@ import { stateHoldLive } from "../core/session-state";
 import { resolveOnRelay } from "../core/codex-remote-input";
 import type { DecisionHold, PlanPickerTraceDecision } from "../core/shared";
 import {
-  AgentKind, appendFittedPlanAndDebug, atomicWrite, CC_DIR, CCOp, CCStatus, codexAppServerSocketAvailable, Config, completePendingPairing, formatPlanPickerDebug, formatWatchdogPidfile,
+  AgentKind, appendCodexBridgeMarker, appendFittedPlanAndDebug, atomicWrite, CC_DIR, CCOp, CCStatus, codexAppServerSocketAvailable, Config, completePendingPairing, formatPlanPickerDebug, formatWatchdogPidfile,
+  startCodexAppServerDaemon,
   GONE_STRIKE_LIMIT, loadConfig, loadPendingConfig, localApprovalsState,
   PAIR_HTML_FILE, PairPollResult, parseWatchdogPidfile, PendingConfig, pidAlive, PLUGIN_VERSION, readDecisionHoldAt, readPrefix, readSuffix, recordGoneStrike, removeRevokedConfig,
   resetGoneStrikes, SessionRecord, SESSIONS_DIR, traceSession, tracePlanPickerDecision, watchdogBuildDiffers,
@@ -289,7 +290,10 @@ export async function buildDoneEnvelope(sessionId: string, record: SessionRecord
     // instead of looking freshly finished. OMITTED when the caller has no honest time.
     ...(typeof at === "number" && Number.isFinite(at) ? { at } : {}),
   };
-  const debug = agent === "codex" ? dbg ?? formatPlanPickerDebug({ event: "done", classifier: "done", marker: "0", by: "wd" }) : undefined;
+  const debug = appendCodexBridgeMarker(
+    agent === "codex" ? dbg ?? formatPlanPickerDebug({ event: "done", classifier: "done", marker: "0", by: "wd" }) : undefined,
+    codexBridgeIsDown(),
+  );
   const blob = await encryptBlob(e2eKey, appendFittedPlanAndDebug(base, undefined, debug));
   return { v: 2, sessionId, op: "done", prio: 0, ts: now, blob, ...startedAtField(record) };
 }
@@ -328,7 +332,10 @@ export async function buildNeedsAttentionEnvelope(
     // preserving the existing order and omitted for ordinary permissions/questions.
     ...(typeof at === "number" && Number.isFinite(at) ? { at } : {}),
   };
-  const debug = agent === "codex" ? dbg ?? formatPlanPickerDebug({ event: "attention", classifier: "pending", marker: "0", by: "wd" }) : undefined;
+  const debug = appendCodexBridgeMarker(
+    agent === "codex" ? dbg ?? formatPlanPickerDebug({ event: "attention", classifier: "pending", marker: "0", by: "wd" }) : undefined,
+    codexBridgeIsDown(),
+  );
   const blob = await encryptBlob(e2eKey, appendFittedPlanAndDebug(base, proposedPlan, debug));
   return {
     v: 2, sessionId, op: "update", prio: 1, ts: now,
@@ -356,7 +363,10 @@ export async function buildWorkingEnvelope(
     ...(typeof record.model === "string" && record.model.length > 0 ? { model: record.model } : {}),
     at: Math.floor(now / 1000),
   };
-  const debug = agent === "codex" ? dbg ?? formatPlanPickerDebug({ event: "working", classifier: "resolved", marker: "0", by: "wd" }) : undefined;
+  const debug = appendCodexBridgeMarker(
+    agent === "codex" ? dbg ?? formatPlanPickerDebug({ event: "working", classifier: "resolved", marker: "0", by: "wd" }) : undefined,
+    codexBridgeIsDown(),
+  );
   const blob = await encryptBlob(e2eKey, appendFittedPlanAndDebug(base, undefined, debug));
   return { v: 2, sessionId, op: "update", prio: 0, ts: now, blob, ...startedAtField(record) };
 }
@@ -1531,9 +1541,9 @@ export async function buildProvisionalBlob(
     status: d.idle === true ? "done" : "working", title: d.title ?? "", machine, label: d.label, ...blobAgentFields,
     ...(typeof at === "number" && Number.isFinite(at) ? { at } : {}),
   };
-  const dbg = blobAgentFields.agent === "codex" ? formatPlanPickerDebug({
+  const dbg = appendCodexBridgeMarker(blobAgentFields.agent === "codex" ? formatPlanPickerDebug({
     event: "discover", classifier: d.idle === true ? "done" : "work", marker: "0", by: "wd",
-  }) : undefined;
+  }) : undefined, codexBridgeIsDown());
   return encryptBlob(e2eKey, appendFittedPlanAndDebug(base, undefined, dbg));
 }
 
@@ -1577,9 +1587,9 @@ export function buildProvisionalRecord(
     ...(typeof d.startedAt === "number" && Number.isFinite(d.startedAt) ? { tuiStartedAt: d.startedAt } : {}),
     ...(typeof d.title === "string" && d.title.length > 0 ? { title: d.title } : {}),
     ...blobAgentFields,
-    ...(blobAgentFields.agent === "codex" ? { dbg: formatPlanPickerDebug({
+    ...(blobAgentFields.agent === "codex" ? { dbg: appendCodexBridgeMarker(formatPlanPickerDebug({
       event: "discover", classifier: idle ? "done" : "work", marker: "0", by: "wd",
-    }) } : {}),
+    }), codexBridgeIsDown()) } : {}),
     // Stamp the pairing this blob was sealed under so the heartbeat's key-rotation guard can prove
     // the blob is still decryptable (see buildHeartbeatEnvelope). Omitted only when unknown.
     ...(typeof pairingId === "string" && pairingId.length > 0 ? { pairingId } : {}),
@@ -2516,9 +2526,9 @@ export async function buildTitleRepairEnvelope(
     // (a fresh frame with the title fixed), so the phone should treat it as live. Omitted when absent.
     ...(typeof at === "number" && Number.isFinite(at) ? { at } : {}),
   };
-  const dbg = agent === "codex" ? record.dbg ?? formatPlanPickerDebug({
+  const dbg = appendCodexBridgeMarker(agent === "codex" ? record.dbg ?? formatPlanPickerDebug({
     event: "title", classifier: statusFromRecord(record), marker: record.pendingPlanPicker ? "p" : record.planPickerVerificationPending ? "v" : record.planPickerSettled ? "s" : "0", by: "wd",
-  }) : undefined;
+  }) : undefined, codexBridgeIsDown());
   const blob = await encryptBlob(e2eKey, appendFittedPlanAndDebug(base, undefined, dbg));
   return { v: 2, sessionId, op: record.op ?? "update", prio: record.prio ?? 0, ts: now, blob, ...startedAtField(record) };
 }
@@ -2921,6 +2931,19 @@ export async function goneStrikeShouldTeardown(goneStrikesPath?: string): Promis
 //   never writes, never exits) used to freeze the whole loop at `await bridge.start()`: no reap, no
 //   heartbeat, no discovery, no gone-strike teardown — with the pidfile still claimed, so nothing could
 //   replace us either. Bridge work now runs DETACHED behind a deadline; the loop never awaits it.
+//
+//   RECOVERY + HONESTY (2026-08-04) — the presence gate is correct but it used to fail SILENTLY, and the
+//   thing it silently disables is the ONLY path by which a phone can answer a Codex TUI
+//   `request_user_input` (codex-remote-input builds the questions and injects the answer through
+//   answerAppServer → client.answerUserInput; there is no hook-shaped substitute — see the deletion note
+//   in core/permission). A daemon that died at 22:14 therefore turned every Codex question into an
+//   attention row nobody could answer, with nothing anywhere saying why. So absence now does two things:
+//     1. TRIES ONCE PER COOLDOWN to bring the daemon back (`codex app-server daemon start`), detached,
+//        bounded, non-interactive, every failure traced and none thrown; and
+//     2. RAISES A BREADCRUMB (`cxbridge:down` in the Codex `dbg` tail) for as long as the socket is gone.
+//   ORDERING TRUTH: starting the daemon does NOT rescue an already-running TUI — a Codex TUI launched
+//   with no daemon hosts its conversation in-process and can never retro-attach. The attempt buys the
+//   NEXT session, and the breadcrumb's wording promises nothing more.
 
 /** The running loop's bridge teardown, published so the SIGTERM/SIGINT handler can stop the proxy child
  *  through the same path run()'s `finally` uses. Undefined outside a live run(). */
@@ -2965,6 +2988,31 @@ const BRIDGE_REARM_MS = 600_000;
  *  non-load-bearing: if the wording ever drifts, the interval above still re-arms. */
 const GIVE_UP_PATTERN = /gave up/i;
 
+/** At most ONE `codex app-server daemon start` attempt per this window, counted from the moment the
+ *  attempt is launched (not from its outcome), so a slow or wedged start cannot let a second one in.
+ *  Five minutes: long enough that a machine with no codex installed spends effectively nothing on this
+ *  forever, short enough that a user who fixes their install sees the bridge come back within one coffee
+ *  refill. It is NOT a retry budget — there is no cap on total attempts, because the honest recovery for
+ *  a daemon that died hours ago is exactly "try again periodically". */
+const BRIDGE_DAEMON_START_COOLDOWN_MS = 300_000;
+
+/** Is the Codex app-server control socket missing as of the most recent sweep? Module-level because the
+ *  blob builders below are pure functions called from a dozen places and threading a flag through all of
+ *  them would be pure noise; run() republishes it from the supervisor once per cycle. Defaults to FALSE
+ *  so nothing that never runs a sweep (every unit test of a builder, the LAN read path) can accidentally
+ *  stamp the marker. */
+let codexBridgeDown = false;
+
+/** Publish the sweep's observation. Exported for tests and for run()'s once-per-cycle republish. */
+export function setCodexBridgeDown(down: boolean): void {
+  codexBridgeDown = down;
+}
+
+/** The current observation, read by the Codex blob builders when they stamp `dbg`. */
+export function codexBridgeIsDown(): boolean {
+  return codexBridgeDown;
+}
+
 /** The slice of CodexRemoteInputBridge the supervisor drives (start/stop/refresh). Declared structurally
  *  so tests can drive the supervisor with a fake and the real class stays untouched. */
 export interface RemoteInputBridgeLike {
@@ -2988,6 +3036,12 @@ export interface BridgeSupervisorDeps {
   /** Diagnostic passthrough for bridge/client errors (the daemon itself reports nothing — silence is the
    *  contract — but the supervisor still inspects them to spot a parked client). */
   onError?: (error: Error) => void;
+  /** Best-effort recovery for an ABSENT daemon: `codex app-server daemon start`. Defaults to the real
+   *  bounded, non-interactive, never-throwing spawn. Resolves true only when the control socket is
+   *  genuinely there afterwards. */
+  startDaemon?: () => Promise<boolean>;
+  /** Local-only trace sink for the start attempts (never stdout, never the wire). */
+  trace?: (event: object) => void;
   now?: () => number;
 }
 
@@ -3002,11 +3056,23 @@ export function createBridgeSupervisor(deps: BridgeSupervisorDeps = {}) {
     void withDeadline(Promise.resolve().then(work), BRIDGE_OP_DEADLINE_MS).catch(() => {});
   });
   const now = deps.now ?? Date.now;
+  // Under `bun test` the default is a NO-OP: a unit test that drives an absent socket must never spawn a
+  // real `codex` on the developer's machine (same guard, same reason, as the hold-marker writers in
+  // core/permission). Tests that exercise the recovery inject `startDaemon`.
+  const startDaemon = deps.startDaemon
+    ?? (lanRunningUnderTest() ? async () => false : () => startCodexAppServerDaemon());
+  const trace = deps.trace ?? ((event: object) => traceSession(event));
   let bridge: RemoteInputBridgeLike | undefined;
   let pairingId: string | undefined;
   let lastStartAt = 0;
   /** The client told us it gave up reconnecting → re-arm on the very next sweep. */
   let parked = false;
+  /** Was the control socket missing on the most recent PAIRED sync? Read by run() to publish the
+   *  `cxbridge:down` breadcrumb, and reset the moment the socket comes back. */
+  let daemonDown = false;
+  /** When the last daemon start attempt was LAUNCHED (0 = never). Stamped before the work is detached so
+   *  the cooldown holds even while an attempt is still in flight. */
+  let lastDaemonStartAt = 0;
 
   /** The bridge's error sink: watch for the client's give-up so the re-arm is prompt, then pass through. */
   const onError = (error: Error): void => {
@@ -3031,6 +3097,24 @@ export function createBridgeSupervisor(deps: BridgeSupervisorDeps = {}) {
     detach(() => target.start());
   };
 
+  /** Absent socket → try to bring the daemon back, at most once per BRIDGE_DAEMON_START_COOLDOWN_MS.
+   *  DETACHED like every other bridge operation: the sweep must never wait on `codex` starting, and a
+   *  binary that hangs must cost this loop nothing. The cooldown stamp is taken BEFORE detaching, so the
+   *  five-second sweep cadence cannot fire a second attempt while the first is still running. Every
+   *  failure mode is inside startDaemon (which never throws); we only record the decision. */
+  const tryStartDaemon = (): void => {
+    const at = now();
+    if (lastDaemonStartAt !== 0 && at - lastDaemonStartAt < BRIDGE_DAEMON_START_COOLDOWN_MS) return;
+    lastDaemonStartAt = at;
+    try { trace({ event: "codex-daemon-start", outcome: "attempt" }); } catch { /* tracing is never fatal */ }
+    detach(async () => {
+      // The result is deliberately NOT acted on here: the next sweep's own socket probe is the single
+      // source of truth for "is there a daemon", and a successful start therefore builds the bridge on
+      // the very next cycle rather than through a second, racier code path.
+      await startDaemon().catch(() => false);
+    });
+  };
+
   return {
     /** One cycle of supervision. Unpaired → tear down. Paired but no Codex daemon → tear down (and never
      *  construct one, so a Claude-only machine never spawns `codex` at all). Paired + daemon present →
@@ -3039,14 +3123,21 @@ export function createBridgeSupervisor(deps: BridgeSupervisorDeps = {}) {
     async sync(config: Config | null): Promise<void> {
       if (!config) {
         teardown();
+        daemonDown = false; // unpaired: there is no Codex row to be honest to
         return;
       }
       let available = false;
       try { available = await probe(); } catch { available = false; }
       if (!available) {
         teardown(); // daemon went away (or never existed) → stop the bridge, keep the sweep running
+        // …but do NOT stop there: silence here is what made a dead daemon look like a working one for a
+        // whole day. Try to bring it back (bounded, cooldown-gated, detached) and raise the breadcrumb
+        // meanwhile — the attempt is for the NEXT Codex session, never for a TUI already running.
+        daemonDown = true;
+        tryStartDaemon();
         return;
       }
+      daemonDown = false;
       if (!bridge || pairingId !== config.pairingId) {
         teardown();
         const next = create(config, { onError });
@@ -3088,6 +3179,11 @@ export function createBridgeSupervisor(deps: BridgeSupervisorDeps = {}) {
     /** Whether a bridge is currently constructed (test/diagnostic seam). */
     get active(): boolean {
       return bridge !== undefined;
+    },
+    /** Was the Codex control socket missing on the last PAIRED sync? run() republishes this to the blob
+     *  builders as the `cxbridge:down` breadcrumb. */
+    get daemonDown(): boolean {
+      return daemonDown;
     },
   };
 }
@@ -3258,6 +3354,11 @@ async function run(): Promise<void> {
       // (re-probed every cycle) and never on the sweep's own await path. Fail-open in both directions: no
       // Codex daemon → no bridge and no spawn at all; a wedged proxy child → the sweep keeps its cadence.
       await bridges.sync(config);
+      // Publish the socket observation to this cycle's blob builders. While it is down, every Codex frame
+      // this sweep seals carries `cxbridge:down` in its `dbg` tail — the phone's diagnostics toggle is
+      // then the difference between "my question just sits there" and a nameable cause. It clears itself
+      // the moment a daemon is back.
+      setCodexBridgeDown(bridges.daemonDown);
       // Re-key the LAN listener from the CURRENT config (a re-pair rotates e2eKey, and K_lan derives
       // from it). Deliberately NOT awaited-on-IO: sync() only swaps a promise and returns, so the LAN
       // channel can never sit on the sweep path — the design's non-negotiable.

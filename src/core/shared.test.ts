@@ -3,7 +3,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "bun:test";
 import {
-  clearDecisionHoldAt, codexAppServerSocketAvailable, codexAppServerSocketPath, codexCompanionBrokerEvidence,
+  appendCodexBridgeMarker, clearDecisionHoldAt, CODEX_BRIDGE_DOWN_MARKER, CODEX_DAEMON_START_ARGS,
+  codexAppServerSocketAvailable, codexAppServerSocketPath, codexCompanionBrokerEvidence,
+  DBG_BLOB_TEXT_MAX_CHARS, startCodexAppServerDaemon,
   decisionHoldFileName, ensureWatchdog, formatWatchdogPidfile, fullTextForRecord, isWatchdogCommand,
   readDecisionHoldAt, writeDecisionHoldAt,
   localApprovalsState, parseWatchdogPidfile, PLUGIN_VERSION, RECORD_FULL_TEXT_MAX_CHARS,
@@ -271,6 +273,110 @@ describe("codexAppServerSocketAvailable (the shared control-socket probe)", () =
 
   test("the default path lives under CODEX_HOME", () => {
     expect(codexAppServerSocketPath().endsWith("/app-server-control/app-server-control.sock")).toBe(true);
+  });
+});
+
+// Recovery for the OTHER half of the presence gate: when the socket is missing, try (once per watchdog
+// cooldown) to bring the daemon back. `codex app-server daemon start` is verified against codex-cli
+// 0.146.0's own help — "Start the local app server daemon if it is not already running" — and is NOT
+// `app-server proxy`, which only attaches to an existing socket and errors when there is none.
+describe("startCodexAppServerDaemon (bounded, non-interactive, never-throwing)", () => {
+  /** A scriptable stand-in for the spawned child. */
+  const child = (script: (emit: (event: "error" | "exit", ...args: unknown[]) => void) => void) => {
+    const listeners = new Map<string, (...args: unknown[]) => void>();
+    const kills: string[] = [];
+    const handle = {
+      on(event: string, listener: (...args: unknown[]) => void) { listeners.set(event, listener); return handle; },
+      kill(signal?: string) { kills.push(signal ?? "SIGTERM"); return true; },
+    };
+    queueMicrotask(() => script((event, ...args) => listeners.get(event)?.(...args)));
+    return { handle, kills };
+  };
+
+  test("runs the exact verified subcommand and reports success only when the SOCKET appears", async () => {
+    const spawned: Array<{ command: string; args: readonly string[] }> = [];
+    const traced: object[] = [];
+    let socket = false;
+    const ok = await startCodexAppServerDaemon({
+      spawnFn: (command, args) => {
+        spawned.push({ command, args });
+        return child((emit) => { socket = true; emit("exit", 0, null); }).handle;
+      },
+      probe: async () => socket,
+      sleep: async () => {},
+      trace: (event) => traced.push(event),
+    });
+    expect(ok).toBe(true);
+    expect(spawned).toEqual([{ command: "codex", args: CODEX_DAEMON_START_ARGS }]);
+    expect(CODEX_DAEMON_START_ARGS).toEqual(["app-server", "daemon", "start"]);
+    expect(traced[0]).toMatchObject({ event: "codex-daemon-start", outcome: "started" });
+  });
+
+  test("exit 0 with NO socket is a failure, traced, bounded — never an infinite wait", async () => {
+    const traced: object[] = [];
+    const ok = await startCodexAppServerDaemon({
+      spawnFn: () => child((emit) => emit("exit", 0, null)).handle,
+      probe: async () => false,
+      sleep: async () => {},
+      trace: (event) => traced.push(event),
+      socketWaitMs: 1_000,
+    });
+    expect(ok).toBe(false);
+    expect(traced).toEqual([{ event: "codex-daemon-start", outcome: "no-socket", waitedMs: 1_000 }]);
+  });
+
+  test("a missing binary (spawn throws / emits error) and a non-zero exit both resolve false, traced", async () => {
+    const traced: object[] = [];
+    expect(await startCodexAppServerDaemon({
+      spawnFn: () => { throw new Error("ENOENT"); },
+      probe: async () => true, trace: (event) => traced.push(event),
+    })).toBe(false);
+    expect(await startCodexAppServerDaemon({
+      spawnFn: () => child((emit) => emit("error", new Error("ENOENT"))).handle,
+      probe: async () => true, trace: (event) => traced.push(event),
+    })).toBe(false);
+    expect(await startCodexAppServerDaemon({
+      spawnFn: () => child((emit) => emit("exit", 1, null)).handle,
+      probe: async () => true, trace: (event) => traced.push(event),
+    })).toBe(false);
+    expect(traced.map((event) => (event as { outcome: string }).outcome))
+      .toEqual(["spawn-failed", "spawn-failed", "nonzero-exit"]);
+  });
+
+  test("a child that never exits is KILLED at the timeout instead of pinning the caller", async () => {
+    const traced: object[] = [];
+    const c = child(() => { /* never exits */ });
+    const ok = await startCodexAppServerDaemon({
+      spawnFn: () => c.handle, probe: async () => true, trace: (event) => traced.push(event), timeoutMs: 20,
+    });
+    expect(ok).toBe(false);
+    expect(c.kills).toEqual(["SIGTERM"]);
+    expect(traced).toEqual([{ event: "codex-daemon-start", outcome: "timeout" }]);
+  });
+});
+
+// The breadcrumb the phone shows under its diagnostics toggle while the socket is gone.
+describe("appendCodexBridgeMarker (append-last, at most once, dropped rather than truncated)", () => {
+  test("appends LAST while down, never doubles, and is STRIPPED once the socket is back", () => {
+    expect(appendCodexBridgeMarker("1.0 ev:attention", true)).toBe(`1.0 ev:attention ${CODEX_BRIDGE_DOWN_MARKER}`);
+    expect(appendCodexBridgeMarker("1.0 ev:attention", false)).toBe("1.0 ev:attention");
+    const once = appendCodexBridgeMarker("1.0 ev:attention", true);
+    expect(appendCodexBridgeMarker(once, true)).toBe(once);
+    // A `dbg` CACHED on the session record (title repair, provisional row) must not keep accusing a
+    // daemon that has since recovered.
+    expect(appendCodexBridgeMarker(once, false)).toBe("1.0 ev:attention");
+  });
+
+  test("a non-Codex frame (undefined dbg) stays undefined — nothing is ever added to Claude", () => {
+    expect(appendCodexBridgeMarker(undefined, true)).toBeUndefined();
+    expect(appendCodexBridgeMarker("", true)).toBe("");
+  });
+
+  test("a dbg that has no room for the marker keeps its own grammar intact (whole-marker drop)", () => {
+    const full = "x".repeat(DBG_BLOB_TEXT_MAX_CHARS);
+    expect(appendCodexBridgeMarker(full, true)).toBe(full);
+    const roomy = "x".repeat(DBG_BLOB_TEXT_MAX_CHARS - CODEX_BRIDGE_DOWN_MARKER.length - 1);
+    expect(appendCodexBridgeMarker(roomy, true)).toBe(`${roomy} ${CODEX_BRIDGE_DOWN_MARKER}`);
   });
 });
 
