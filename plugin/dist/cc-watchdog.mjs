@@ -103,7 +103,7 @@ import { appendFileSync, existsSync, readFileSync, statSync, truncateSync } from
 import { execFileSync, spawn } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "1.7.0";
+var PLUGIN_VERSION = "1.7.1";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -6537,14 +6537,18 @@ async function runRemoteInput(request, requestId, signal, deps, onHoldCreated) {
       await resolveOnRelay(deps.config, requestId, fetchFn);
     };
     const applyAnswerBlob = async (answerBlob) => {
+      const reject = (why, result2) => {
+        report(deps, new Error(`Codex phone answer rejected (${why})`), "Codex remote input answer");
+        return result2;
+      };
       let answer;
       try {
         answer = await decryptBlob(deps.config.e2eKey, answerBlob);
       } catch {
-        return "transport-error";
+        return reject("undecryptable", "transport-error");
       }
       if (answer.requestId !== requestId)
-        return "unsupported";
+        return reject("request-id mismatch", "unsupported");
       if (answer.decision === "deny") {
         const result2 = await deps.interruptAppServer();
         if (result2 === "sent" || result2 === "already-sent") {
@@ -6555,10 +6559,10 @@ async function runRemoteInput(request, requestId, signal, deps, onHoldCreated) {
         return "transport-error";
       }
       if (answer.decision !== "answer")
-        return "unsupported";
+        return reject("unknown decision", "unsupported");
       const mapped = codexAnswersFromPhone(request, answer.answers);
       if (!mapped)
-        return "unsupported";
+        return reject("unmappable to the app-server questions", "unsupported");
       const result = await deps.answerAppServer(mapped);
       if (result === "sent" || result === "already-sent") {
         resumed = true;
@@ -6569,14 +6573,15 @@ async function runRemoteInput(request, requestId, signal, deps, onHoldCreated) {
     };
     const answers = deps.answerStore ?? lanAnswerStore;
     const clock = deps.now ?? Date.now;
+    const localAnswer = () => answers.peek(requestId, clock())?.answerBlob;
     let misses = 0;
     let definitiveFailures = 0;
     let polls = 0;
     const pollBudget = deps.pollBudget ?? createPollBudget();
     while (!signal.aborted) {
-      const local = answers.peek(requestId, clock());
+      const local = localAnswer();
       if (local)
-        return await applyAnswerBlob(local.answerBlob);
+        return await applyAnswerBlob(local);
       polls += 1;
       const budgetMs = pollBudget.next(polls);
       const startedAt = clock();
@@ -6603,10 +6608,12 @@ async function runRemoteInput(request, requestId, signal, deps, onHoldCreated) {
           definitiveFailures = 0;
           if (data.status === "answered" && typeof data.answerBlob === "string") {
             return await applyAnswerBlob(data.answerBlob);
-          } else if (data.status === "expired")
-            return "expired";
-          else if (data.status === "superseded")
-            return "superseded";
+          } else if (data.status === "expired" || data.status === "superseded") {
+            const raced = localAnswer();
+            if (raced)
+              return await applyAnswerBlob(raced);
+            return data.status === "expired" ? "expired" : "superseded";
+          }
         }
       } catch {
         misses += 1;
@@ -7690,10 +7697,16 @@ function acceptLanCommand(command, deps = {}) {
     return Promise.resolve(0);
   }
 }
+var LAN_ANSWER_ECHO_DELAY_MS = 5000;
 function acceptLanAnswer(answer, deps = {}) {
   try {
     const resolve2 = deps.resolveFn ?? ((config, requestId) => resolveOnRelay(config, requestId, fetch));
-    return resolve2(answer.config, answer.requestId).catch(() => {
+    const delayMs = deps.delayMs ?? LAN_ANSWER_ECHO_DELAY_MS;
+    const sleep = deps.sleep ?? ((ms) => new Promise((done) => {
+      const timer = setTimeout(done, ms);
+      timer.unref?.();
+    }));
+    return (delayMs > 0 ? sleep(delayMs) : Promise.resolve()).then(() => resolve2(answer.config, answer.requestId)).catch(() => {
       traceFocus(deps, { event: "lan", result: "echo-failed", requestId: answer.requestId });
     });
   } catch {
@@ -8686,7 +8699,13 @@ async function run() {
     return;
   const fallbackDeadline = Date.now() + PAIRING_TTL_MS;
   let lastActiveMs = Date.now();
-  const bridges = createBridgeSupervisor();
+  const bridges = createBridgeSupervisor({
+    onError: (error) => traceSession({
+      event: "bridge",
+      error: error.name,
+      msg: String(error.message ?? "").slice(0, 200)
+    })
+  });
   activeBridgeShutdown = () => bridges.shutdown();
   const lan = createLanListener({
     onCommand: acceptLanCommand,
@@ -8866,6 +8885,7 @@ export {
   PLAN_PICKER_PENDING_MAX_MS,
   PAIRING_TTL_MS,
   LAN_COMMAND_ID_PREFIX,
+  LAN_ANSWER_ECHO_DELAY_MS,
   IDLE_GRACE_MS,
   COMMAND_TTL_MS,
   COMMAND_FUTURE_SKEW_MS,
