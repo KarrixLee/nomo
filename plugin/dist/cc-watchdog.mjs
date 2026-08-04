@@ -2,7 +2,7 @@ import { createRequire } from "node:module";
 var __require = /* @__PURE__ */ createRequire(import.meta.url);
 
 // src/entries/cc-watchdog.ts
-import { readdir as readdir4, readFile as readFile8, unlink as unlink5 } from "node:fs/promises";
+import { readdir as readdir4, readFile as readFile7, unlink as unlink4 } from "node:fs/promises";
 import { readFileSync as readFileSync2, statSync as statSync3, unlinkSync } from "node:fs";
 import { hostname as hostname4 } from "node:os";
 import { basename as basename5 } from "node:path";
@@ -103,7 +103,7 @@ import { appendFileSync, existsSync, readFileSync, statSync, truncateSync } from
 import { execFileSync, spawn } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "1.6.9";
+var PLUGIN_VERSION = "1.7.0";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -117,6 +117,16 @@ function formatPlanPickerDebug(input) {
 function formatDecisionHoldDebug(input) {
   const value = `${debugToken(input.version ?? PLUGIN_VERSION)} ev:hold req:${debugToken(input.requestId.slice(0, 8))} pid:${input.pid}`;
   return Array.from(value).slice(0, DBG_BLOB_TEXT_MAX_CHARS).join("");
+}
+var CODEX_BRIDGE_DOWN_MARKER = "cxbridge:down";
+function appendCodexBridgeMarker(dbg, down) {
+  if (typeof dbg !== "string" || dbg.length === 0)
+    return dbg;
+  const bare = dbg.split(` ${CODEX_BRIDGE_DOWN_MARKER}`).join("");
+  if (!down)
+    return bare;
+  const next = `${bare} ${CODEX_BRIDGE_DOWN_MARKER}`;
+  return Array.from(next).length <= DBG_BLOB_TEXT_MAX_CHARS ? next : bare;
 }
 var CC_DIR = `${process.env.HOME}/.config/cc-status`;
 var SESSION_TRACE_PATH = `${CC_DIR}/session-trace.log`;
@@ -243,6 +253,81 @@ async function codexAppServerSocketAvailable(socketPath = codexAppServerSocketPa
   } catch {
     return false;
   }
+}
+var CODEX_DAEMON_START_ARGS = ["app-server", "daemon", "start"];
+var CODEX_DAEMON_START_TIMEOUT_MS = 8000;
+var CODEX_DAEMON_SOCKET_WAIT_MS = 4000;
+var CODEX_DAEMON_SOCKET_POLL_MS = 250;
+async function startCodexAppServerDaemon(deps = {}) {
+  const trace = deps.trace ?? ((event) => traceSession(event));
+  const probe = deps.probe ?? (() => codexAppServerSocketAvailable());
+  const sleep = deps.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
+  const command = deps.codexPath ?? "codex";
+  const timeoutMs = deps.timeoutMs ?? CODEX_DAEMON_START_TIMEOUT_MS;
+  const socketWaitMs = deps.socketWaitMs ?? CODEX_DAEMON_SOCKET_WAIT_MS;
+  const spawnFn = deps.spawnFn ?? ((cmd, args) => spawn(cmd, [...args], { stdio: "ignore" }));
+  let exit;
+  try {
+    exit = await new Promise((resolve) => {
+      let settled = false;
+      const done = (value) => {
+        if (settled)
+          return;
+        settled = true;
+        resolve(value);
+      };
+      let child;
+      try {
+        child = spawnFn(command, CODEX_DAEMON_START_ARGS);
+      } catch {
+        done("error");
+        return;
+      }
+      const timer = setTimeout(() => {
+        try {
+          child.kill("SIGTERM");
+        } catch {}
+        done("timeout");
+      }, timeoutMs);
+      timer.unref?.();
+      child.on("error", () => {
+        clearTimeout(timer);
+        done("error");
+      });
+      child.on("exit", (code, signal) => {
+        clearTimeout(timer);
+        done({ code, signal });
+      });
+    });
+  } catch {
+    exit = "error";
+  }
+  if (exit === "error" || exit === "timeout" || exit.code !== 0) {
+    trace({
+      event: "codex-daemon-start",
+      outcome: exit === "error" ? "spawn-failed" : exit === "timeout" ? "timeout" : "nonzero-exit",
+      ...typeof exit === "object" ? { code: exit.code, signal: exit.signal } : {}
+    });
+    return false;
+  }
+  const deadline = socketWaitMs;
+  for (let waited = 0;; waited += CODEX_DAEMON_SOCKET_POLL_MS) {
+    let up = false;
+    try {
+      up = await probe();
+    } catch {
+      up = false;
+    }
+    if (up) {
+      trace({ event: "codex-daemon-start", outcome: "started", waitedMs: waited });
+      return true;
+    }
+    if (waited >= deadline)
+      break;
+    await sleep(CODEX_DAEMON_SOCKET_POLL_MS);
+  }
+  trace({ event: "codex-daemon-start", outcome: "no-socket", waitedMs: deadline });
+  return false;
 }
 function lastHookPath(agent) {
   return `${CC_DIR}/last-hook-${agent}`;
@@ -4638,7 +4723,7 @@ var DEFINITIVE_POLL_STATUSES = new Set([401, 403, 404, 410]);
 var MAX_DEFINITIVE_POLL_FAILURES = 2;
 
 // src/core/permission.ts
-import { readFile as readFile7, realpath, unlink as unlink4 } from "node:fs/promises";
+import { readFile as readFile6, realpath, unlink as unlink3 } from "node:fs/promises";
 import { appendFileSync as appendFileSync2, statSync as statSync2, truncateSync as truncateSync2 } from "node:fs";
 import { hostname as hostname2 } from "node:os";
 import { basename as basename4, isAbsolute, relative, resolve } from "node:path";
@@ -5183,169 +5268,6 @@ async function runHook(agent) {
   } catch {}
 }
 
-// src/core/codex-user-input-arbitration.ts
-import { createHash as createHash2 } from "node:crypto";
-import { readFile as readFile6, unlink as unlink3 } from "node:fs/promises";
-
-// src/core/codex-user-input-shape.ts
-var ANSWER_MAX = 500;
-var OPTION_LABEL_WIRE_MAX = 60;
-function capLabel(value) {
-  const characters = Array.from(value);
-  return characters.length <= OPTION_LABEL_WIRE_MAX ? value : `${characters.slice(0, OPTION_LABEL_WIRE_MAX - 1).join("")}…`;
-}
-function renderableCodexUserInput(toolInput) {
-  const rawQuestions = toolInput.questions;
-  if (!Array.isArray(rawQuestions) || rawQuestions.length < 1 || rawQuestions.length > 3)
-    return;
-  const questions = [];
-  for (const raw of rawQuestions) {
-    if (!raw || raw.isSecret === true || typeof raw.question !== "string" || raw.question.length === 0) {
-      return;
-    }
-    if (!Array.isArray(raw.options) || raw.options.length === 0)
-      return;
-    const options = [];
-    const labels = [];
-    for (const candidate of raw.options) {
-      const option = candidate;
-      if (!option || typeof option.label !== "string" || option.label.length === 0)
-        return;
-      const label = option.label;
-      if (label !== label.trim() || label.length > ANSWER_MAX)
-        return;
-      labels.push(label);
-      options.push({
-        label,
-        description: typeof option.description === "string" ? option.description : ""
-      });
-    }
-    if (new Set(labels).size !== labels.length)
-      return;
-    if (new Set(labels.map(capLabel)).size !== labels.length)
-      return;
-    questions.push({
-      question: raw.question,
-      ...typeof raw.header === "string" ? { header: raw.header } : {},
-      multiSelect: false,
-      options
-    });
-  }
-  return { questions };
-}
-
-// src/core/codex-user-input-arbitration.ts
-var CODEX_INPUT_BRIDGE_SUFFIX = ".input-bridge";
-var CODEX_INPUT_FALLBACK_SUFFIX = ".input-fallback";
-var CODEX_INPUT_BRIDGE_LEASE_MS = 15000;
-var CODEX_INPUT_FALLBACK_TTL_MS = 600000;
-var CODEX_INPUT_BRIDGE_WAIT_MS = 750;
-var BRIDGE_WAIT_STEP_MS = 50;
-function bridgePath(sessionsDir, sessionId) {
-  return `${sessionsDir}/${sessionId}${CODEX_INPUT_BRIDGE_SUFFIX}`;
-}
-function fallbackPath(sessionsDir, sessionId) {
-  return `${sessionsDir}/${sessionId}${CODEX_INPUT_FALLBACK_SUFFIX}`;
-}
-function canonicalQuestions(toolInput) {
-  if (!Array.isArray(toolInput.questions))
-    return [];
-  return toolInput.questions.map((candidate) => {
-    const question = candidate;
-    return {
-      id: typeof question?.id === "string" ? question.id : "",
-      header: typeof question?.header === "string" ? question.header : "",
-      question: typeof question?.question === "string" ? question.question : "",
-      isSecret: question?.isSecret === true,
-      options: Array.isArray(question?.options) ? question.options.map((option) => {
-        const value = option;
-        return typeof value?.label === "string" ? value.label : "";
-      }) : null
-    };
-  });
-}
-function codexInputFingerprint(turnId, toolInput) {
-  return createHash2("sha256").update(JSON.stringify([turnId, canonicalQuestions(toolInput)])).digest("hex");
-}
-async function readMarker(path) {
-  try {
-    return JSON.parse(await readFile6(path, "utf8"));
-  } catch {
-    return;
-  }
-}
-function finite2(value) {
-  return typeof value === "number" && Number.isFinite(value);
-}
-async function markCodexInputBridgeReady(sessionId, deps = {}) {
-  const sessionsDir = deps.sessionsDir ?? SESSIONS_DIR;
-  await atomicWrite(bridgePath(sessionsDir, sessionId), JSON.stringify({
-    at: (deps.now ?? Date.now)(),
-    pid: deps.pid ?? process.pid
-  }), 384);
-}
-async function clearCodexInputBridgeReady(sessionId, deps = {}) {
-  const sessionsDir = deps.sessionsDir ?? SESSIONS_DIR;
-  const path = bridgePath(sessionsDir, sessionId);
-  const lease = await readMarker(path);
-  if (finite2(lease?.pid) && lease.pid !== (deps.pid ?? process.pid))
-    return;
-  await unlink3(path).catch(() => {});
-}
-async function codexInputBridgeCanServe(sessionId, _turnId, toolInput, deps = {}) {
-  if (!renderableCodexUserInput(toolInput))
-    return false;
-  const sessionsDir = deps.sessionsDir ?? SESSIONS_DIR;
-  const clock = deps.now ?? Date.now;
-  const alive = deps.isPidAlive ?? pidAlive;
-  const sleep = deps.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
-  const attempts = Math.ceil(CODEX_INPUT_BRIDGE_WAIT_MS / BRIDGE_WAIT_STEP_MS) + 1;
-  for (let attempt = 0;attempt < attempts; attempt += 1) {
-    const lease = await readMarker(bridgePath(sessionsDir, sessionId));
-    const now = clock();
-    if (finite2(lease?.at) && finite2(lease?.pid) && now >= lease.at && now - lease.at <= CODEX_INPUT_BRIDGE_LEASE_MS && alive(lease.pid)) {
-      return true;
-    }
-    if (attempt + 1 < attempts)
-      await sleep(BRIDGE_WAIT_STEP_MS);
-  }
-  return false;
-}
-async function markCodexInputFallback(sessionId, turnId, toolInput, held = false, deps = {}) {
-  const sessionsDir = deps.sessionsDir ?? SESSIONS_DIR;
-  await atomicWrite(fallbackPath(sessionsDir, sessionId), JSON.stringify({
-    at: (deps.now ?? Date.now)(),
-    fingerprint: codexInputFingerprint(turnId, toolInput),
-    held,
-    pid: deps.pid ?? process.pid
-  }), 384);
-}
-async function clearCodexInputFallback(sessionId, turnId, toolInput, deps = {}) {
-  const sessionsDir = deps.sessionsDir ?? SESSIONS_DIR;
-  const path = fallbackPath(sessionsDir, sessionId);
-  const claim = await readMarker(path);
-  if (!claim || claim.fingerprint !== codexInputFingerprint(turnId, toolInput))
-    return;
-  await unlink3(path).catch(() => {});
-}
-async function codexInputFallbackOwnsRequest(request, deps = {}) {
-  const sessionsDir = deps.sessionsDir ?? SESSIONS_DIR;
-  const path = fallbackPath(sessionsDir, request.identity.threadId);
-  const claim = await readMarker(path);
-  if (!claim || claim.held !== true || !finite2(claim.at) || typeof claim.fingerprint !== "string")
-    return false;
-  const now = (deps.now ?? Date.now)();
-  if (now < claim.at || now - claim.at > CODEX_INPUT_FALLBACK_TTL_MS) {
-    await unlink3(path).catch(() => {});
-    return false;
-  }
-  const fingerprint = codexInputFingerprint(request.identity.turnId, { questions: request.questions });
-  if (claim.fingerprint !== fingerprint)
-    return false;
-  await unlink3(path).catch(() => {});
-  return true;
-}
-
 // src/core/permission.ts
 var POST_FIRST_CONTACT_TIMEOUT_MS = 6000;
 var HOLD_RETRY_DELAY_MS = 4000;
@@ -5447,7 +5369,7 @@ function decisionLine(agent, hookSpecificOutput) {
 var ALLOW_HSO = { hookEventName: "PermissionRequest", decision: { behavior: "allow" } };
 var DENY_HSO = { hookEventName: "PermissionRequest", decision: { behavior: "deny", message: "Denied from phone" } };
 var DENY_MESSAGE_MAX = 500;
-var ANSWER_MAX2 = 500;
+var ANSWER_MAX = 500;
 function allowLine(agent, toolName, toolInput) {
   if (toolName === "ExitPlanMode") {
     return decisionLine(agent, { hookEventName: "PermissionRequest", decision: { behavior: "allow", updatedInput: toolInput } });
@@ -5459,21 +5381,6 @@ function denyLine(agent, message) {
   if (m.length === 0)
     return decisionLine(agent, DENY_HSO);
   return decisionLine(agent, { hookEventName: "PermissionRequest", decision: { behavior: "deny", message: m } });
-}
-function preToolUserInputLine(decision, toolInput, message) {
-  if (decision === "allow") {
-    return decisionLine("codex", {
-      hookEventName: "PreToolUse",
-      permissionDecision: "allow",
-      updatedInput: toolInput
-    });
-  }
-  const custom = typeof message === "string" ? message.trim().slice(0, DENY_MESSAGE_MAX) : "";
-  return decisionLine("codex", {
-    hookEventName: "PreToolUse",
-    permissionDecision: "deny",
-    permissionDecisionReason: custom.length > 0 ? custom : "Denied from phone"
-  });
 }
 function allowAlwaysLine(agent, toolName, toolInput, suggestions) {
   if (agent === "codex")
@@ -5498,7 +5405,7 @@ function answerLine(agent, toolName, toolInput, answers) {
     const raw = a.trim();
     if (raw.length === 0)
       return;
-    if (raw.length > ANSWER_MAX2)
+    if (raw.length > ANSWER_MAX)
       return;
     const resolved = resolveAnswer(raw, questions[i].labels);
     if (resolved === undefined)
@@ -5767,21 +5674,7 @@ function permissionFrame(base, detail, omitted, questions = []) {
     ...questions.length > 0 ? { permissionQuestions: questions } : {}
   };
 }
-function emitDecision(agent, answer, toolName, toolInput, suggestions, emit, trace, surface) {
-  if (surface === "tui-request-user-input") {
-    if (answer.decision === "deny") {
-      emit(preToolUserInputLine("deny", toolInput, answer.message));
-      trace({ event: "emit", decision: "deny", hook_event_name: "PreToolUse" });
-      return "emitted";
-    }
-    if (answer.decision === "allow" || answer.decision === "allow_always" || answer.decision === "answer") {
-      emit(preToolUserInputLine("allow", toolInput));
-      trace({ event: "emit", decision: "release-to-tui", requested: answer.decision });
-      return "emitted-attention";
-    }
-    trace({ event: "answer-unknown-decision" });
-    return "keep-polling";
-  }
+function emitDecision(agent, answer, toolName, toolInput, suggestions, emit, trace) {
   const isQuestion = toolName === "AskUserQuestion";
   switch (answer.decision) {
     case "allow":
@@ -5854,7 +5747,7 @@ function createLoopbackAnswerPoller(config, requestId, deps) {
     if (deps.statePath === undefined)
       return;
     try {
-      return parseLanState(await readFile7(deps.statePath, "utf8"))?.port;
+      return parseLanState(await readFile6(deps.statePath, "utf8"))?.port;
     } catch {
       return;
     }
@@ -5993,37 +5886,22 @@ function defaultClearHold() {
 function defaultSettleHoldRecord() {
   return lanRunningUnderTest() ? async () => {} : settleDecisionHoldRecord;
 }
-function defaultBridgeCanServe() {
-  return lanRunningUnderTest() ? async () => false : codexInputBridgeCanServe;
-}
-function defaultMarkInputFallback() {
-  return lanRunningUnderTest() ? async () => {} : markCodexInputFallback;
-}
-function defaultClearInputFallback() {
-  return lanRunningUnderTest() ? async () => {} : clearCodexInputFallback;
-}
 async function readStdin2() {
   const chunks = [];
   for await (const chunk of process.stdin)
     chunks.push(chunk);
   return Buffer.concat(chunks).toString("utf8");
 }
-async function runPermissionHook(deps = {}, agent = "claude", surface = "permission-request") {
-  const tuiUserInput = surface === "tui-request-user-input";
+async function runPermissionHook(deps = {}, agent = "claude") {
   const noHoldPath = deps.noHoldPath ?? NO_HOLD_PATH;
   const trace = deps.trace ?? defaultTrace();
   let loopback;
   let heldSessionId;
   let settleAsWorking = false;
   let settleHeldRecord;
-  let markInputFallback;
-  let clearInputFallbackClaim;
-  let fallbackHoldGranted = false;
-  let fallbackBlocksTool = false;
   try {
     if (await flagExists(noHoldPath)) {
-      if (!tuiUserInput)
-        await (deps.delegate ?? (() => runHook(agent)))();
+      await (deps.delegate ?? (() => runHook(agent)))();
       return;
     }
     const [config, raw] = await Promise.all([
@@ -6051,22 +5929,18 @@ async function runPermissionHook(deps = {}, agent = "claude", surface = "permiss
     const agentId = typeof input.agent_id === "string" ? input.agent_id : "";
     const permissionMode = typeof input.permission_mode === "string" ? input.permission_mode : undefined;
     trace({ event: "start", session_id: sessionId, tool_name: toolName, permission_mode: permissionMode, agent: agentId.length > 0 });
-    if (tuiUserInput && (agent !== "codex" || input.hook_event_name !== "PreToolUse" || toolName !== "request_user_input")) {
-      trace({ event: "exit", reason: "wrong-hook-surface" });
-      return;
-    }
     if (agentId.length > 0) {
       const agentType = typeof input.agent_type === "string" ? input.agent_type : undefined;
       trace({ event: "exit", reason: "subagent", agent_type: agentType });
       return;
     }
     const interactiveMode = permissionMode === undefined || permissionMode === "default" || agent === "claude" && (permissionMode === "acceptEdits" || permissionMode === "plan");
-    if (!tuiUserInput && !interactiveMode) {
+    if (!interactiveMode) {
       const codexDialogMode = agent === "codex" && (permissionMode === "acceptEdits" || permissionMode === "plan");
       trace({ event: "exit", reason: "mode", mode: permissionMode, ...codexDialogMode ? { codex_dialog_mode: true } : {} });
       return;
     }
-    if (!tuiUserInput && agent === "codex" && !toolName.startsWith("mcp__")) {
+    if (agent === "codex" && !toolName.startsWith("mcp__")) {
       const transcriptPath = typeof input.transcript_path === "string" ? input.transcript_path : "";
       const turnId = typeof input.turn_id === "string" ? input.turn_id : "";
       const policy = await (deps.loadCodexTurnPolicyFn ?? loadCodexTurnPolicy)(transcriptPath, turnId, sessionId);
@@ -6076,27 +5950,10 @@ async function runPermissionHook(deps = {}, agent = "claude", surface = "permiss
         return;
       }
       trace({ event: "codex-reviewer", disposition: "hold", reason: "manual" });
-    } else if (!tuiUserInput && agent === "codex") {
+    } else if (agent === "codex") {
       trace({ event: "codex-reviewer", disposition: "hold", reason: "mcp-reviewer-unknown" });
     }
     const toolInput = typeof input.tool_input === "object" && input.tool_input !== null ? input.tool_input : {};
-    if (tuiUserInput) {
-      const turnId = typeof input.turn_id === "string" ? input.turn_id : "";
-      const bridgeOwns = await (deps.bridgeCanServeFn ?? defaultBridgeCanServe())(sessionId, turnId, toolInput);
-      if (bridgeOwns) {
-        trace({ event: "exit", reason: "app-server-bridge" });
-        return;
-      }
-      const markFallback = deps.markInputFallbackFn ?? defaultMarkInputFallback();
-      const clearFallback = deps.clearInputFallbackFn ?? defaultClearInputFallback();
-      markInputFallback = (held) => markFallback(sessionId, turnId, toolInput, held);
-      clearInputFallbackClaim = () => clearFallback(sessionId, turnId, toolInput);
-      try {
-        await markInputFallback(false);
-      } catch {
-        trace({ event: "input-arbitration-marker-error", phase: "pending" });
-      }
-    }
     const suggestions = input.permission_suggestions;
     const requestId = (deps.randomUUID ?? (() => crypto.randomUUID()))();
     const summary = buildPermissionSummary(toolName, toolInput);
@@ -6115,7 +5972,7 @@ async function runPermissionHook(deps = {}, agent = "claude", surface = "permiss
       permissionToolName: toolName
     };
     const rawDetail = buildPermissionDetail(toolName, toolInput);
-    const fitted = fitPermissionDetail(permissionBase, rawDetail, BLOB_FIT_CHARS, tuiUserInput ? [] : buildPermissionQuestions(toolInput));
+    const fitted = fitPermissionDetail(permissionBase, rawDetail, BLOB_FIT_CHARS, buildPermissionQuestions(toolInput));
     const detailFull = fullTextForRecord(rawDetail, fitted.detail);
     if (record && record.permissionDetailFull !== detailFull) {
       await (deps.stampDetailFullFn ?? defaultStampDetailFull())(sessionId, detailFull);
@@ -6144,8 +6001,7 @@ async function runPermissionHook(deps = {}, agent = "claude", surface = "permiss
               prio: 1,
               ts,
               blob,
-              fallbackBlob,
-              ...tuiUserInput ? { attentionKind: "userInput" } : {}
+              fallbackBlob
             }),
             signal: AbortSignal.timeout(POST_FIRST_CONTACT_TIMEOUT_MS)
           });
@@ -6259,14 +6115,6 @@ async function runPermissionHook(deps = {}, agent = "claude", surface = "permiss
         return;
       }
     }
-    if (tuiUserInput && markInputFallback !== undefined) {
-      fallbackHoldGranted = true;
-      try {
-        await markInputFallback(true);
-      } catch {
-        trace({ event: "input-arbitration-marker-error", phase: "held" });
-      }
-    }
     const holdAt = (deps.now ?? Date.now)();
     const holdPid = deps.holdPid ?? process.pid;
     let holdBlob = blob;
@@ -6296,9 +6144,7 @@ async function runPermissionHook(deps = {}, agent = "claude", surface = "permiss
     const applyAnswerBlob = async (answerBlob, src) => {
       const answer = await decryptBlob(config.e2eKey, answerBlob);
       const match = answer.requestId === requestId;
-      const outcome = match ? emitDecision(agent, answer, toolName, toolInput, suggestions, emit, trace, surface) : "released";
-      if (tuiUserInput && match && answer.decision === "deny")
-        fallbackBlocksTool = true;
+      const outcome = match ? emitDecision(agent, answer, toolName, toolInput, suggestions, emit, trace) : "released";
       if (outcome === "emitted")
         settleAsWorking = true;
       if (outcome !== "keep-polling") {
@@ -6374,14 +6220,6 @@ async function runPermissionHook(deps = {}, agent = "claude", surface = "permiss
   } catch (e) {
     trace({ event: "exit", reason: "exception", ...errorTag(e) });
   } finally {
-    if (markInputFallback !== undefined && clearInputFallbackClaim !== undefined) {
-      try {
-        if (fallbackHoldGranted && !fallbackBlocksTool)
-          await markInputFallback(true);
-        else
-          await clearInputFallbackClaim();
-      } catch {}
-    }
     try {
       loopback?.stop();
     } catch {}
@@ -6401,12 +6239,59 @@ async function approvalsCommand(sub, deps = {}) {
     return 0;
   }
   if (sub === "on") {
-    await unlink4(path).catch(() => {});
+    await unlink3(path).catch(() => {});
     print("Remote approvals are ON for this computer — when a session is on your phone's Live Activity, its permission prompts are sent to the phone to Allow or Deny.");
     return 0;
   }
   print(await flagExists(path) ? "Remote approvals: OFF (paused locally) — permission prompts appear in the terminal. Run `on` to resume." : "Remote approvals: ON — permission prompts for phone-attached sessions are sent to your phone. Run `off` to pause them here.");
   return 0;
+}
+
+// src/core/codex-user-input-shape.ts
+var ANSWER_MAX2 = 500;
+var OPTION_LABEL_WIRE_MAX = 60;
+function capLabel(value) {
+  const characters = Array.from(value);
+  return characters.length <= OPTION_LABEL_WIRE_MAX ? value : `${characters.slice(0, OPTION_LABEL_WIRE_MAX - 1).join("")}…`;
+}
+function renderableCodexUserInput(toolInput) {
+  const rawQuestions = toolInput.questions;
+  if (!Array.isArray(rawQuestions) || rawQuestions.length < 1 || rawQuestions.length > 3)
+    return;
+  const questions = [];
+  for (const raw of rawQuestions) {
+    if (!raw || raw.isSecret === true || typeof raw.question !== "string" || raw.question.length === 0) {
+      return;
+    }
+    if (!Array.isArray(raw.options) || raw.options.length === 0)
+      return;
+    const options = [];
+    const labels = [];
+    for (const candidate of raw.options) {
+      const option = candidate;
+      if (!option || typeof option.label !== "string" || option.label.length === 0)
+        return;
+      const label = option.label;
+      if (label !== label.trim() || label.length > ANSWER_MAX2)
+        return;
+      labels.push(label);
+      options.push({
+        label,
+        description: typeof option.description === "string" ? option.description : ""
+      });
+    }
+    if (new Set(labels).size !== labels.length)
+      return;
+    if (new Set(labels.map(capLabel)).size !== labels.length)
+      return;
+    questions.push({
+      question: raw.question,
+      ...typeof raw.header === "string" ? { header: raw.header } : {},
+      multiSelect: false,
+      options
+    });
+  }
+  return { questions };
 }
 
 // src/core/codex-remote-input.ts
@@ -6803,9 +6688,6 @@ class CodexRemoteInputBridge {
   client;
   startRemoteInputFn;
   onError;
-  markThreadReadyFn;
-  clearThreadReadyFn;
-  fallbackOwnsRequestFn;
   subscribedThreads = new Set;
   pendingRequests = new Set;
   resolvedWhilePending = new Set;
@@ -6817,10 +6699,6 @@ class CodexRemoteInputBridge {
     this.config = config;
     this.startRemoteInputFn = options.startRemoteInputFn ?? startCodexRemoteInput;
     this.onError = options.onError;
-    const underTest = lanRunningUnderTest();
-    this.markThreadReadyFn = options.markThreadReadyFn ?? (underTest ? async () => {} : markCodexInputBridgeReady);
-    this.clearThreadReadyFn = options.clearThreadReadyFn ?? (underTest ? async () => {} : clearCodexInputBridgeReady);
-    this.fallbackOwnsRequestFn = options.fallbackOwnsRequestFn ?? (underTest ? async () => false : codexInputFallbackOwnsRequest);
     const callbacks = {
       onUserInputRequest: (request) => this.onRequest(request),
       onUserInputResolved: (request, resolution) => this.onResolved(request, resolution),
@@ -6885,7 +6763,6 @@ class CodexRemoteInputBridge {
       return;
     this.stopping = true;
     const handles = [...this.handles.values()];
-    await Promise.allSettled([...this.subscribedThreads].map((threadId) => this.clearThreadReadyFn(threadId)));
     await this.client.stop();
     for (const handle of this.handles.values())
       handles.push(handle);
@@ -6909,16 +6786,11 @@ class CodexRemoteInputBridge {
       for (const threadId of page.data) {
         if (this.client.state !== "ready" || this.stopping)
           return;
-        if (this.subscribedThreads.has(threadId)) {
-          try {
-            await this.markThreadReadyFn(threadId);
-          } catch {}
+        if (this.subscribedThreads.has(threadId))
           continue;
-        }
         try {
           await this.client.resumeThread(threadId);
           this.subscribedThreads.add(threadId);
-          await this.markThreadReadyFn(threadId);
         } catch {}
       }
       cursor = page.nextCursor;
@@ -6935,8 +6807,6 @@ class CodexRemoteInputBridge {
   }
   async routeRequest(request, key) {
     try {
-      if (await this.fallbackOwnsRequestFn(request))
-        return;
       if (this.stopping || this.handles.has(key) || this.resolvedWhilePending.delete(key))
         return;
       const handle = this.startRemoteInputFn(request, {
@@ -6979,9 +6849,7 @@ class CodexRemoteInputBridge {
       this.subscribedThreads.clear();
       this.refreshSubscriptions().catch((error) => this.reportError(error, "Failed to refresh Codex thread subscriptions"));
     } else if (state === "disconnected" || state === "stopped") {
-      const threads = [...this.subscribedThreads];
       this.subscribedThreads.clear();
-      Promise.allSettled(threads.map((threadId) => this.clearThreadReadyFn(threadId)));
     }
   }
 }
@@ -7008,7 +6876,7 @@ function resetDoneAttemptMemory() {
 }
 async function readRecordAt(path) {
   try {
-    return JSON.parse(await readFile8(path, "utf8"));
+    return JSON.parse(await readFile7(path, "utf8"));
   } catch {
     return null;
   }
@@ -7092,7 +6960,7 @@ async function buildDoneEnvelope(sessionId, record, now, e2eKey, agent = "claude
     ...typeof record.model === "string" && record.model.length > 0 ? { model: record.model } : {},
     ...typeof at === "number" && Number.isFinite(at) ? { at } : {}
   };
-  const debug = agent === "codex" ? dbg ?? formatPlanPickerDebug({ event: "done", classifier: "done", marker: "0", by: "wd" }) : undefined;
+  const debug = appendCodexBridgeMarker(agent === "codex" ? dbg ?? formatPlanPickerDebug({ event: "done", classifier: "done", marker: "0", by: "wd" }) : undefined, codexBridgeIsDown());
   const blob = await encryptBlob(e2eKey, appendFittedPlanAndDebug(base, undefined, debug));
   return { v: 2, sessionId, op: "done", prio: 0, ts: now, blob, ...startedAtField(record) };
 }
@@ -7108,7 +6976,7 @@ async function buildNeedsAttentionEnvelope(sessionId, record, now, e2eKey, agent
     ...typeof record.model === "string" && record.model.length > 0 ? { model: record.model } : {},
     ...typeof at === "number" && Number.isFinite(at) ? { at } : {}
   };
-  const debug = agent === "codex" ? dbg ?? formatPlanPickerDebug({ event: "attention", classifier: "pending", marker: "0", by: "wd" }) : undefined;
+  const debug = appendCodexBridgeMarker(agent === "codex" ? dbg ?? formatPlanPickerDebug({ event: "attention", classifier: "pending", marker: "0", by: "wd" }) : undefined, codexBridgeIsDown());
   const blob = await encryptBlob(e2eKey, appendFittedPlanAndDebug(base, proposedPlan, debug));
   return {
     v: 2,
@@ -7132,7 +7000,7 @@ async function buildWorkingEnvelope(sessionId, record, now, e2eKey, agent = "cla
     ...typeof record.model === "string" && record.model.length > 0 ? { model: record.model } : {},
     at: Math.floor(now / 1000)
   };
-  const debug = agent === "codex" ? dbg ?? formatPlanPickerDebug({ event: "working", classifier: "resolved", marker: "0", by: "wd" }) : undefined;
+  const debug = appendCodexBridgeMarker(agent === "codex" ? dbg ?? formatPlanPickerDebug({ event: "working", classifier: "resolved", marker: "0", by: "wd" }) : undefined, codexBridgeIsDown());
   const blob = await encryptBlob(e2eKey, appendFittedPlanAndDebug(base, undefined, debug));
   return { v: 2, sessionId, op: "update", prio: 0, ts: now, blob, ...startedAtField(record) };
 }
@@ -7843,7 +7711,7 @@ async function readAllRecordEntries() {
       if (!f.endsWith(".json"))
         continue;
       try {
-        out.push({ sessionId: basename5(f, ".json"), rec: JSON.parse(await readFile8(`${SESSIONS_DIR}/${f}`, "utf8")) });
+        out.push({ sessionId: basename5(f, ".json"), rec: JSON.parse(await readFile7(`${SESSIONS_DIR}/${f}`, "utf8")) });
       } catch {}
     }
     return out;
@@ -7863,12 +7731,12 @@ async function buildProvisionalBlob(d, machine, blobAgentFields, e2eKey, at) {
     ...blobAgentFields,
     ...typeof at === "number" && Number.isFinite(at) ? { at } : {}
   };
-  const dbg = blobAgentFields.agent === "codex" ? formatPlanPickerDebug({
+  const dbg = appendCodexBridgeMarker(blobAgentFields.agent === "codex" ? formatPlanPickerDebug({
     event: "discover",
     classifier: d.idle === true ? "done" : "work",
     marker: "0",
     by: "wd"
-  }) : undefined;
+  }) : undefined, codexBridgeIsDown());
   return encryptBlob(e2eKey, appendFittedPlanAndDebug(base, undefined, dbg));
 }
 function buildProvisionalEnvelope(sessionId, blob, now, idle) {
@@ -7893,12 +7761,12 @@ function buildProvisionalRecord(d, machine, blob, blobAgentFields, now, pairingI
     ...typeof d.startedAt === "number" && Number.isFinite(d.startedAt) ? { tuiStartedAt: d.startedAt } : {},
     ...typeof d.title === "string" && d.title.length > 0 ? { title: d.title } : {},
     ...blobAgentFields,
-    ...blobAgentFields.agent === "codex" ? { dbg: formatPlanPickerDebug({
+    ...blobAgentFields.agent === "codex" ? { dbg: appendCodexBridgeMarker(formatPlanPickerDebug({
       event: "discover",
       classifier: idle ? "done" : "work",
       marker: "0",
       by: "wd"
-    }) } : {},
+    }), codexBridgeIsDown()) } : {},
     ...typeof pairingId === "string" && pairingId.length > 0 ? { pairingId } : {}
   };
 }
@@ -7941,7 +7809,7 @@ function provisionalsCoveredByReal(entries, adapters = allAdapters) {
 async function reconcileProvisionalsSweep(config, deps = {}) {
   const post = deps.post ?? ((body) => postEvent(config, body));
   const readEntries = deps.readEntries ?? readAllRecordEntries;
-  const deleteRecord = deps.deleteRecord ?? ((sessionId) => unlink5(`${SESSIONS_DIR}/${sessionId}.json`).catch(() => {}));
+  const deleteRecord = deps.deleteRecord ?? ((sessionId) => unlink4(`${SESSIONS_DIR}/${sessionId}.json`).catch(() => {}));
   const now = deps.now ?? Date.now;
   const entries = await readEntries();
   for (const sessionId of provisionalsCoveredByReal(entries, deps.adapters ?? allAdapters)) {
@@ -8285,7 +8153,7 @@ function isRetireEligible(record, now) {
 }
 async function retireDoneStale(config, path, sessionId, record, now, deps = {}) {
   const post = deps.post ?? ((body) => postEvent(config, body));
-  const deleteRecord = deps.deleteRecord ?? ((p) => unlink5(p).catch(() => {}));
+  const deleteRecord = deps.deleteRecord ?? ((p) => unlink4(p).catch(() => {}));
   const writeRecord = deps.writeRecord ?? ((p, rec) => atomicWrite(p, JSON.stringify(rec), 384));
   const alive = deps.pidAlive ?? pidAlive;
   const locateTuiPid = deps.locateTuiPid ?? locateCodexOwnedTui;
@@ -8361,12 +8229,12 @@ async function buildTitleRepairEnvelope(sessionId, record, title, now, e2eKey, a
     ...typeof record.model === "string" && record.model.length > 0 ? { model: record.model } : {},
     ...typeof at === "number" && Number.isFinite(at) ? { at } : {}
   };
-  const dbg = agent === "codex" ? record.dbg ?? formatPlanPickerDebug({
+  const dbg = appendCodexBridgeMarker(agent === "codex" ? record.dbg ?? formatPlanPickerDebug({
     event: "title",
     classifier: statusFromRecord(record),
     marker: record.pendingPlanPicker ? "p" : record.planPickerVerificationPending ? "v" : record.planPickerSettled ? "s" : "0",
     by: "wd"
-  }) : undefined;
+  }) : undefined, codexBridgeIsDown());
   const blob = await encryptBlob(e2eKey, appendFittedPlanAndDebug(base, undefined, dbg));
   return { v: 2, sessionId, op: record.op ?? "update", prio: record.prio ?? 0, ts: now, blob, ...startedAtField(record) };
 }
@@ -8474,7 +8342,7 @@ async function sweep(config, deps = {}) {
     const sessionId = basename5(file, ".json");
     let record = null;
     try {
-      record = JSON.parse(await readFile8(path, "utf8"));
+      record = JSON.parse(await readFile7(path, "utf8"));
     } catch {
       record = null;
     }
@@ -8609,7 +8477,7 @@ async function sweep(config, deps = {}) {
     heartbeatAt.delete(sessionId);
     clearDoneAttempts(sessionId);
     try {
-      await unlink5(path);
+      await unlink4(path);
     } catch {}
   }
   return { revoked: false, remaining, delivered };
@@ -8634,6 +8502,14 @@ function withDeadline(work, ms) {
 }
 var BRIDGE_REARM_MS = 600000;
 var GIVE_UP_PATTERN = /gave up/i;
+var BRIDGE_DAEMON_START_COOLDOWN_MS = 300000;
+var codexBridgeDown = false;
+function setCodexBridgeDown(down) {
+  codexBridgeDown = down;
+}
+function codexBridgeIsDown() {
+  return codexBridgeDown;
+}
 function createBridgeSupervisor(deps = {}) {
   const probe = deps.probe ?? (() => codexAppServerSocketAvailable());
   const create = deps.create ?? ((config, options) => new CodexRemoteInputBridge(config, options));
@@ -8641,10 +8517,14 @@ function createBridgeSupervisor(deps = {}) {
     withDeadline(Promise.resolve().then(work), BRIDGE_OP_DEADLINE_MS).catch(() => {});
   });
   const now = deps.now ?? Date.now;
+  const startDaemon = deps.startDaemon ?? (lanRunningUnderTest() ? async () => false : () => startCodexAppServerDaemon());
+  const trace = deps.trace ?? ((event) => traceSession(event));
   let bridge;
   let pairingId;
   let lastStartAt = 0;
   let parked = false;
+  let daemonDown = false;
+  let lastDaemonStartAt = 0;
   const onError = (error) => {
     try {
       if (GIVE_UP_PATTERN.test(error.message))
@@ -8667,10 +8547,23 @@ function createBridgeSupervisor(deps = {}) {
     parked = false;
     detach(() => target.start());
   };
+  const tryStartDaemon = () => {
+    const at = now();
+    if (lastDaemonStartAt !== 0 && at - lastDaemonStartAt < BRIDGE_DAEMON_START_COOLDOWN_MS)
+      return;
+    lastDaemonStartAt = at;
+    try {
+      trace({ event: "codex-daemon-start", outcome: "attempt" });
+    } catch {}
+    detach(async () => {
+      await startDaemon().catch(() => false);
+    });
+  };
   return {
     async sync(config) {
       if (!config) {
         teardown();
+        daemonDown = false;
         return;
       }
       let available = false;
@@ -8681,8 +8574,11 @@ function createBridgeSupervisor(deps = {}) {
       }
       if (!available) {
         teardown();
+        daemonDown = true;
+        tryStartDaemon();
         return;
       }
+      daemonDown = false;
       if (!bridge || pairingId !== config.pairingId) {
         teardown();
         const next = create(config, { onError });
@@ -8720,6 +8616,9 @@ function createBridgeSupervisor(deps = {}) {
     },
     get active() {
       return bridge !== undefined;
+    },
+    get daemonDown() {
+      return daemonDown;
     }
   };
 }
@@ -8764,9 +8663,9 @@ function pendingPairingExpired(pending, now, fallbackDeadline) {
 }
 async function removePendingConfig() {
   try {
-    await unlink5(`${CC_DIR}/config.json`);
+    await unlink4(`${CC_DIR}/config.json`);
   } catch {}
-  await unlink5(`${CC_DIR}/${PAIR_HTML_FILE}`).catch(() => {});
+  await unlink4(`${CC_DIR}/${PAIR_HTML_FILE}`).catch(() => {});
 }
 async function selfHealPairing(pending) {
   let result;
@@ -8812,6 +8711,7 @@ async function run() {
         return;
       const config = await loadConfig();
       await bridges.sync(config);
+      setCodexBridgeDown(bridges.daemonDown);
       lan.sync(config);
       if (config) {
         await reconcileProvisionalsSweep(config);
@@ -8904,6 +8804,7 @@ export {
   shouldInterruptCheck,
   shouldIdleProvisionalCheck,
   shouldHeartbeat,
+  setCodexBridgeDown,
   retireDoneStale,
   resolveCodexTuiOwner,
   resetDoneAttemptMemory,
@@ -8943,6 +8844,7 @@ export {
   commandIsFresh,
   codexTailPendingApproval,
   codexLastTurnEvent,
+  codexBridgeIsDown,
   clearDoneAttempts,
   claudeTailPendingApproval,
   classifySession,
