@@ -2437,6 +2437,94 @@ describe("runHook gone-strike teardown (revoked pairing stops POSTing forever)",
   }, 20000);
 });
 
+// --- runHook attentionKind reaches the RECORD, not just the wire (the LAN/worker render split) ----
+//
+// buildEnvelope derives `attentionKind:"userInput"` itself for a Codex PreToolUse request_user_input,
+// but runHook used to hand trackSession its own LOCAL `attentionKind` variable — which only the Codex
+// Plan-picker branch ever sets. So the commonest question there is went out labelled a question on the
+// worker envelope and UNLABELLED on the session record, and lan-frames.ts (which rebuilds its frames
+// from the record, never from the POST) rendered the very same prompt as a plain approval over LAN.
+// This spawns the REAL codex entry against a capturing server so the wire envelope and the on-disk
+// record are compared as the field sees them — a direct trackSessionAt call, which is how the record's
+// own append-last test shipped green, cannot catch a caller passing the wrong argument.
+describe("runHook attentionKind (the record caches what the envelope POSTed)", () => {
+  const rawKey = new Uint8Array(32).fill(9);
+  const codexEntry = join(import.meta.dir, "codex-status.ts");
+
+  /** A 200 server that records every POSTed envelope. */
+  function startCapturingServer(): { url: string; posts: Array<Record<string, unknown>>; close: () => void } {
+    const posts: Array<Record<string, unknown>> = [];
+    const server = Bun.serve({
+      port: 0,
+      async fetch(request) {
+        try { posts.push(await request.json() as Record<string, unknown>); } catch { /* non-JSON probe */ }
+        return new Response("{}", { status: 200 });
+      },
+    });
+    return { url: `http://127.0.0.1:${server.port}`, posts, close: () => server.stop(true) };
+  }
+
+  async function runCodexHook(input: Record<string, unknown>): Promise<{
+    record: SessionRecord | undefined;
+    envelope: Record<string, unknown> | undefined;
+  }> {
+    const srv = startCapturingServer();
+    const home = await mkdtemp(join(tmpdir(), "cc-hook-attn-"));
+    try {
+      const ccDir = join(home, ".config", "cc-status");
+      await mkdir(join(ccDir, "sessions"), { recursive: true });
+      await writeFile(join(ccDir, "config.json"), JSON.stringify({
+        url: srv.url, pairingId: "p", pcSecret: "s", e2eKeyB64: b64url(rawKey),
+      }));
+      // A real rollout with a user_message: without it the codex-promptless-rollout create guard
+      // suppresses the session entirely and no event of any kind is produced.
+      const rollout = join(home, "rollout.jsonl");
+      await writeFile(rollout, [
+        JSON.stringify({ type: "session_meta", payload: { id: input.session_id, source: "vscode" } }),
+        JSON.stringify({ type: "event_msg", payload: { type: "user_message", message: "Ship it" } }),
+      ].join("\n"));
+      const proc = spawnTestProcess({
+        cmd: ["bun", codexEntry],
+        env: isolatedTestEnv(home),
+        stdin: Buffer.from(JSON.stringify({ transcript_path: rollout, ...input })),
+        stdout: "ignore",
+        stderr: "ignore",
+      });
+      await proc.exited;
+      const path = join(ccDir, "sessions", `${input.session_id as string}.json`);
+      let record: SessionRecord | undefined;
+      try { record = JSON.parse(await readFile(path, "utf8")) as SessionRecord; } catch { record = undefined; }
+      // The event POST is the one carrying this session's op — a provisional reconcile can precede it.
+      const envelope = srv.posts.find((post) => post.sessionId === input.session_id);
+      return { record, envelope };
+    } finally {
+      srv.close();
+      await rm(home, { recursive: true, force: true });
+    }
+  }
+
+  test("a Codex request_user_input stamps attentionKind on BOTH the envelope and the record", async () => {
+    const { record, envelope } = await runCodexHook({
+      session_id: "attn-userinput", hook_event_name: "PreToolUse", tool_name: "request_user_input",
+      cwd: "/x/api-status",
+      tool_input: { questions: [{ id: "scope", header: "Scope", question: "Keep the API?" }] },
+    });
+    expect(envelope).toMatchObject({ op: "update", prio: 1, attentionKind: "userInput" });
+    expect(record?.attentionKind).toBe("userInput");
+    // The whole point: the two channels describe the same event with the same discriminator.
+    expect(record?.attentionKind).toBe(envelope?.attentionKind as string);
+  }, 20000);
+
+  test("an ordinary Codex tool event leaves both the envelope and the record without one", async () => {
+    const { record, envelope } = await runCodexHook({
+      session_id: "attn-plain", hook_event_name: "PreToolUse", tool_name: "shell",
+      cwd: "/x/api-status",
+    });
+    expect(envelope).not.toHaveProperty("attentionKind");
+    expect(record?.attentionKind).toBeUndefined();
+  }, 20000);
+});
+
 // --- runHook done-delivery ack (the Stop that landed on disk but never on the worker) ------------
 //
 // trackSession persists the record BEFORE the POST is attempted, and the whole hook body sits inside a

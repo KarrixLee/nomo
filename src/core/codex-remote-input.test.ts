@@ -12,6 +12,7 @@ import {
   buildPermissionQuestions, capPermissionWireText, PERMISSION_QUESTION_LABEL_MAX,
 } from "./permission";
 import type { Config, SessionRecord } from "./shared";
+import { renderableCodexUserInput } from "./codex-user-input-shape";
 
 const key = new Uint8Array(Array.from({ length: 32 }, (_, index) => index + 1));
 const config: Config = {
@@ -108,6 +109,74 @@ describe("codexAnswersFromPhone", () => {
     expect(codexAnswersFromPhone(request(), [])).toBeUndefined();
     expect(codexAnswersFromPhone(request(), ["Other"])).toBeUndefined();
     expect(codexAnswersFromPhone(request(), [""])).toBeUndefined();
+  });
+
+  // THE ANSWER-EATING SHAPE. The id is the map key, so two questions sharing one id used to collapse
+  // into a single entry: app-server got only the SECOND question's pick, and the user's first answer
+  // (the "No" to "Deploy to prod?" below) was discarded with no trace. Falling back to the Mac picker
+  // is the only honest outcome.
+  test("rejects two questions sharing an id instead of dropping the first answer", () => {
+    const duplicate = request({
+      questions: [
+        {
+          id: "dupe", header: "Deploy", question: "Deploy to prod?", isOther: false, isSecret: false,
+          options: [{ label: "Yes", description: "" }, { label: "No", description: "" }],
+        },
+        {
+          id: "dupe", header: "Notify", question: "Tell the channel?", isOther: false, isSecret: false,
+          options: [{ label: "Yes", description: "" }, { label: "No", description: "" }],
+        },
+      ],
+    });
+    expect(codexAnswersFromPhone(duplicate, ["No", "Yes"])).toBeUndefined();
+  });
+
+  test("rejects a question whose id is empty or missing (it would key the map \"undefined\")", () => {
+    const empty = request({ questions: [{ ...request().questions[0], id: "" }] });
+    expect(codexAnswersFromPhone(empty, ["Thorough"])).toBeUndefined();
+
+    const { id: _dropped, ...idless } = request().questions[0];
+    const missing = request({
+      questions: [idless as CodexUserInputRequest["questions"][number]],
+    });
+    expect(codexAnswersFromPhone(missing, ["Thorough"])).toBeUndefined();
+  });
+
+  test("distinct ids on a multi-question request still map every answer (happy path unchanged)", () => {
+    const two = request({
+      questions: [
+        {
+          id: "deploy", header: "Deploy", question: "Deploy to prod?", isOther: false, isSecret: false,
+          options: [{ label: "Yes", description: "" }, { label: "No", description: "" }],
+        },
+        {
+          id: "notify", header: "Notify", question: "Tell the channel?", isOther: false, isSecret: false,
+          options: [{ label: "Yes", description: "" }, { label: "No", description: "" }],
+        },
+      ],
+    });
+    expect(codexAnswersFromPhone(two, ["No", "Yes"])).toEqual({ deploy: ["No"], notify: ["Yes"] });
+  });
+});
+
+// The gate that keeps a duplicate/empty-id request off the phone in the FIRST place: the relay only
+// builds a card when renderableCodexUserInput accepts the shape, so refusing here means the user is
+// never shown a question whose answer could not be attributed back.
+describe("renderableCodexUserInput id shape", () => {
+  const q = (over: Record<string, unknown> = {}) => ({
+    id: "scope", question: "How much?", isSecret: false,
+    options: [{ label: "Fast", description: "" }, { label: "Thorough", description: "" }],
+    ...over,
+  });
+
+  test("accepts distinct non-empty ids", () => {
+    expect(renderableCodexUserInput({ questions: [q(), q({ id: "other" })] })).toBeDefined();
+  });
+
+  test("refuses a duplicate id, an empty id, and a missing id", () => {
+    expect(renderableCodexUserInput({ questions: [q(), q()] })).toBeUndefined();
+    expect(renderableCodexUserInput({ questions: [q({ id: "" })] })).toBeUndefined();
+    expect(renderableCodexUserInput({ questions: [q({ id: undefined })] })).toBeUndefined();
   });
 });
 

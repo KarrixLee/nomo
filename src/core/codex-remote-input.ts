@@ -115,7 +115,16 @@ function defaultSettleHoldRecord(): (sessionId: string, patch: Partial<SessionRe
   return lanRunningUnderTest() ? async () => { /* never touch live records from a test */ } : settleDecisionHoldRecord;
 }
 
-/** Map the phone's positional display labels back to Codex's original question ids and labels. */
+/** Map the phone's positional display labels back to Codex's original question ids and labels.
+ *
+ *  THE ID IS THE MAP KEY, so it must be a non-empty string AND unique across the request — otherwise
+ *  the answers silently collapse. A malformed row with no id keys the object "undefined"; two rows
+ *  sharing an id overwrite each other, and app-server receives ONLY the last question's pick under the
+ *  shared id while the user's first answer is DISCARDED (field-reproducible: a "No" to "Deploy to
+ *  prod?" vanishing behind a second question). Both are rejected here, which falls the whole request
+ *  back to the Mac picker — the same honest outcome as any other unmappable answer. The primary gate is
+ *  upstream in renderableCodexUserInput (a request like this never reaches the phone at all); this is
+ *  the last line of defence on the only path that can mis-attribute a real human decision. */
 export function codexAnswersFromPhone(
   request: CodexUserInputRequest,
   positional: unknown,
@@ -124,6 +133,7 @@ export function codexAnswersFromPhone(
   const mapped: Record<string, string[]> = {};
   for (let index = 0; index < request.questions.length; index += 1) {
     const question = request.questions[index];
+    if (typeof question?.id !== "string" || question.id.length === 0) return undefined;
     const raw = positional[index];
     if (typeof raw !== "string") return undefined;
     const answer = raw.trim();
@@ -139,6 +149,8 @@ export function codexAnswersFromPhone(
     if (unique.length !== 1) return undefined;
     mapped[question.id] = [unique[0]];
   }
+  // One key per question, or two questions shared an id and one pick was overwritten on the way in.
+  if (Object.keys(mapped).length !== request.questions.length) return undefined;
   return mapped;
 }
 

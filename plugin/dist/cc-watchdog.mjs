@@ -103,7 +103,7 @@ import { appendFileSync, existsSync, readFileSync, statSync, truncateSync } from
 import { execFileSync, spawn } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "1.7.5";
+var PLUGIN_VERSION = "1.7.6";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -5205,7 +5205,7 @@ async function runHook(agent) {
     const origin = existingRecord?.origin ?? sessionOrigin(input, hookPid, hookCommand);
     const recordPid = reusedForkPredecessor ? existingRecord.pid : hookPid;
     const recordTranscript = reusedForkPredecessor ? existingRecord.transcript ?? transcriptPath : transcriptPath;
-    await trackSession(sessionId, plan.op, plan.prio, plan.status, envelope.blob, machine, label, recordTranscript, agent, startedAt, turnStartedAt, turnId, title, config.pairingId, model, pendingPlanPicker, recordPid, origin, planPickerVerificationPending, dbg, attentionKind, planFull);
+    await trackSession(sessionId, plan.op, plan.prio, plan.status, envelope.blob, machine, label, recordTranscript, agent, startedAt, turnStartedAt, turnId, title, config.pairingId, model, pendingPlanPicker, recordPid, origin, planPickerVerificationPending, dbg, envelope.attentionKind, planFull);
     const clearedPickerMarker = pendingPlanPicker === false && planPickerVerificationPending === false && (existingRecord?.pendingPlanPicker === true || existingRecord?.planPickerVerificationPending === true || existingRecord?.planPickerSettled === true);
     if (agent === "codex" && (hookName === "Stop" || pendingPlanPicker || planPickerVerificationPending || clearedPickerMarker)) {
       tracePlanPickerDecision(sessionId, {
@@ -6265,10 +6265,14 @@ function renderableCodexUserInput(toolInput) {
   if (!Array.isArray(rawQuestions) || rawQuestions.length < 1 || rawQuestions.length > 3)
     return;
   const questions = [];
+  const ids = [];
   for (const raw of rawQuestions) {
     if (!raw || raw.isSecret === true || typeof raw.question !== "string" || raw.question.length === 0) {
       return;
     }
+    if (typeof raw.id !== "string" || raw.id.length === 0)
+      return;
+    ids.push(raw.id);
     if (!Array.isArray(raw.options) || raw.options.length === 0)
       return;
     const options = [];
@@ -6297,6 +6301,8 @@ function renderableCodexUserInput(toolInput) {
       options
     });
   }
+  if (new Set(ids).size !== ids.length)
+    return;
   return { questions };
 }
 
@@ -6321,6 +6327,8 @@ function codexAnswersFromPhone(request, positional) {
   const mapped = {};
   for (let index = 0;index < request.questions.length; index += 1) {
     const question = request.questions[index];
+    if (typeof question?.id !== "string" || question.id.length === 0)
+      return;
     const raw = positional[index];
     if (typeof raw !== "string")
       return;
@@ -6333,6 +6341,8 @@ function codexAnswersFromPhone(request, positional) {
       return;
     mapped[question.id] = [unique[0]];
   }
+  if (Object.keys(mapped).length !== request.questions.length)
+    return;
   return mapped;
 }
 function baseBlob(request, record, config, now) {

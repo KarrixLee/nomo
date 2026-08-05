@@ -913,10 +913,13 @@ export async function runHook(agent: AgentKind): Promise<void> {
       : transcriptPath;
     await trackSession(sessionId, plan.op, plan.prio, plan.status, envelope.blob as string | undefined, machine, label, recordTranscript, agent, startedAt, turnStartedAt, turnId,
       title, config.pairingId, model, pendingPlanPicker, recordPid, origin, planPickerVerificationPending, dbg,
-      // The SAME discriminator this event's envelope carries (buildEnvelope stamps it on the clear wire
-      // envelope): cached so the LAN frames feed, which rebuilds frames from the record rather than from
-      // the POST, keeps a Codex question labelled as a question.
-      attentionKind,
+      // The SAME discriminator this event's envelope carries — READ BACK OFF THE ENVELOPE, not from the
+      // local `attentionKind` above. buildEnvelope derives it itself for a Codex PreToolUse
+      // `request_user_input` (the local variable is only ever set by the Plan-picker branch), so passing
+      // the local one cached NOTHING for the commonest question there is: the worker channel said
+      // "question", the LAN feed — which rebuilds its frames from THIS record, not from the POST — said
+      // "plain approval", and the same prompt rendered two different cards depending on the transport.
+      envelope.attentionKind as "userInput" | undefined,
       // The unabridged plan for the LAN `read` op — undefined unless the blob's copy was truncated.
       planFull);
     const clearedPickerMarker = pendingPlanPicker === false && planPickerVerificationPending === false

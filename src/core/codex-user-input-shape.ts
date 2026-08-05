@@ -31,10 +31,18 @@ export function renderableCodexUserInput(
   if (!Array.isArray(rawQuestions) || rawQuestions.length < 1 || rawQuestions.length > 3) return undefined;
 
   const questions: Array<Record<string, unknown>> = [];
+  // The question ids never reach the phone (the card is positional), but the ANSWER path maps the
+  // phone's positional picks back onto them — see codexAnswersFromPhone. An id that is missing/empty,
+  // or shared by two questions, makes that map lossy: the answers collapse onto one key and a real
+  // human decision is silently dropped. This is the chokepoint BOTH paths pass through, so the request
+  // is refused here, before an unanswerable card is ever shown, and the Mac picker keeps ownership.
+  const ids: string[] = [];
   for (const raw of rawQuestions as RawQuestion[]) {
     if (!raw || raw.isSecret === true || typeof raw.question !== "string" || raw.question.length === 0) {
       return undefined;
     }
+    if (typeof raw.id !== "string" || raw.id.length === 0) return undefined;
+    ids.push(raw.id);
     if (!Array.isArray(raw.options) || raw.options.length === 0) return undefined;
     const options: Array<Record<string, unknown>> = [];
     const labels: string[] = [];
@@ -58,6 +66,7 @@ export function renderableCodexUserInput(
       options,
     });
   }
+  if (new Set(ids).size !== ids.length) return undefined;
   return { questions };
 }
 
