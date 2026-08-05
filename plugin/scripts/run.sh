@@ -30,15 +30,29 @@ do
   if [ -x "$rt" ]; then exec "$rt" "$@"; fi
 done
 
+# CACHED RESULT of the login-shell probe below. Checked before the probe, never before PATH or the
+# fixed candidates — so installing bun later still takes effect immediately, and the cache can only
+# ever short-circuit the SLOW path. A cached path that no longer exists (node upgraded, version
+# switched) simply fails the -x test and falls through to a fresh probe that rewrites it.
+cache="${XDG_CONFIG_HOME:-$HOME/.config}/cc-status/runtime"
+if [ -r "$cache" ]; then
+  rt=$(cat "$cache" 2>/dev/null)
+  if [ -n "$rt" ] && [ -x "$rt" ]; then exec "$rt" "$@"; fi
+fi
+
 # LAST RESORT: a login shell. Version managers (nvm, fnm, volta, asdf) install node under a
 # per-version directory no fixed list can enumerate, and they publish it by editing the user's shell
-# rc — so the only portable way to find that node is to ask the shell that has it. This costs a shell
-# spawn (~100ms), which is why it runs only after PATH and the fixed candidates have both failed: the
-# normal case never pays for it. `-i` matters — nvm/fnm are commonly set up in .zshrc, which a
-# non-interactive login shell does not read.
+# rc — so the only portable way to find that node is to ask the shell that has it. It costs a shell
+# spawn (~100ms), and a hook fires on every tool use, so the result is CACHED above: a version-manager
+# user pays this once per machine, not once per hook. `-i` matters — nvm/fnm are commonly set up in
+# .zshrc, which a non-interactive login shell does not read.
 if [ -n "$SHELL" ] && [ -x "$SHELL" ]; then
   rt=$("$SHELL" -ilc 'command -v bun || command -v node' 2>/dev/null | head -n 1)
-  if [ -n "$rt" ] && [ -x "$rt" ]; then exec "$rt" "$@"; fi
+  if [ -n "$rt" ] && [ -x "$rt" ]; then
+    # Best-effort cache write; a read-only or missing dir must never break the hook.
+    (mkdir -p "$(dirname "$cache")" 2>/dev/null && printf '%s\n' "$rt" >"$cache" 2>/dev/null) || true
+    exec "$rt" "$@"
+  fi
 fi
 
 exit 0
