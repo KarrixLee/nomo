@@ -486,6 +486,29 @@ function defaultTrace(): (event: object) => void {
   return trace;
 }
 
+/** THE question predicate: is this tool ASKING THE HUMAN SOMETHING, rather than asking for permission?
+ *
+ *  The distinction is the whole reason the permission-mode gate below has an exemption. A permission
+ *  MODE ("auto", "bypassPermissions", "dontAsk", "acceptEdits") auto-approves permission PROMPTS — which
+ *  is exactly why holding those on the phone would be pointless. It can never auto-ANSWER a question:
+ *  the agent is asking WHICH option the human wants, and no mode can answer that on the human's behalf.
+ *
+ *  Verified in the shipped CC bundle (2.1.222): the permission evaluator returns
+ *  `{behavior:"ask", decisionReason:{reason:"requiresUserInteraction"}}` for a tool that declares
+ *  `requiresUserInteraction()` BEFORE the bypassPermissions/dontAsk early-allow and before any
+ *  allow-rule match — so AskUserQuestion reaches the PermissionRequest hook in EVERY mode, and the
+ *  hook's `decision.updatedInput` is consumed by the one shared `runHooks()` implementation regardless
+ *  of mode. That is why the answer path needs no mode-specific handling.
+ *
+ *  DELIBERATELY NARROWER than hook.ts's USER_BLOCKING_TOOLS (which also carries ExitPlanMode): a plan
+ *  approval IS a permission-shaped approval, and an auto mode approving it is the mode working as
+ *  designed. Only genuine questions are exempted. `request_user_input` is Codex's analogue; it is not
+ *  reachable through today's Codex PermissionRequest manifest, but the predicate names the CONCEPT, not
+ *  the reachable surface — the Codex reviewer/dialog gates below still apply to it. */
+export function isQuestionTool(toolName: string): boolean {
+  return toolName === "AskUserQuestion" || toolName === "request_user_input";
+}
+
 /** A concise, human-readable one-liner describing what the tool wants to do — shown on the phone's
  *  card next to Allow/Deny. Pure (unit-tested); never throws (a bad URL etc. falls back to the query
  *  or the tool name). */
@@ -1231,14 +1254,26 @@ export async function runPermissionHook(
     const interactiveMode = permissionMode === undefined
       || permissionMode === "default"
       || (agent === "claude" && (permissionMode === "acceptEdits" || permissionMode === "plan"));
-    if (!interactiveMode) {
-      // Signal-only (no behavior change): if a future Codex starts reporting claude-style dialog modes,
-      // the `agent === "claude"` narrowing above would silently stop holding for them. Tag that exit so
-      // the trace names the cause instead of reading like an ordinary non-interactive mode.
-      const codexDialogMode = agent === "codex" && (permissionMode === "acceptEdits" || permissionMode === "plan");
+    // Signal-only (no behavior change): if a future Codex starts reporting claude-style dialog modes,
+    // the `agent === "claude"` narrowing above would silently stop holding for them. Tag that exit so
+    // the trace names the cause instead of reading like an ordinary non-interactive mode. It ALSO
+    // suppresses the question exemption below — a mode this hook cannot reason about must keep skipping.
+    const codexDialogMode = agent === "codex" && (permissionMode === "acceptEdits" || permissionMode === "plan");
+    //    …EXCEPT FOR A GENUINE QUESTION (field bug, traced live 2026-08-04: an AskUserQuestion in "auto"
+    //    exited here, so a real question degraded to a plain yellow needsAttention row nobody could
+    //    answer). Everything the paragraph above says is about PERMISSION prompts, which these modes
+    //    auto-approve. A question is the one thing they cannot auto-answer: CC's evaluator forces
+    //    `behavior:"ask"` for a `requiresUserInteraction()` tool ahead of every mode short-circuit, so
+    //    the TUI blocks on a human in auto/bypassPermissions/dontAsk exactly as it does in default —
+    //    which makes a question exactly the case that SHOULD hold in every mode. See isQuestionTool.
+    const questionExempt = !interactiveMode && !codexDialogMode && isQuestionTool(toolName);
+    if (!interactiveMode && !questionExempt) {
       trace({ event: "exit", reason: "mode", mode: permissionMode, ...(codexDialogMode ? { codex_dialog_mode: true } : {}) });
       return;
     }
+    // Its own event, never an "exit": one grep separates "skipped because of the mode" (exit/mode) from
+    // "the mode gate was bypassed because this is a question" (mode-gate-bypass) in the next field trace.
+    if (questionExempt) trace({ event: "mode-gate-bypass", reason: "question", mode: permissionMode, tool_name: toolName });
     // 3. Codex reviewer gate: `permission_mode:"default"` is lossy — it covers BOTH manual review and
     //    "Approve for me". The exact turn_context records the effective reviewer after task/profile/UI
     //    overrides. In auto-review, silently return control to Codex BEFORE any Nomo POST so Codex's

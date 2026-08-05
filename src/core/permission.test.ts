@@ -1458,6 +1458,175 @@ describe("runPermissionHook — pass-through gates", () => {
   });
 });
 
+// ---- the mode gate EXEMPTS genuine questions -------------------------------------------------
+//
+// FIELD BUG (traced live 2026-08-04): {"event":"start","tool_name":"AskUserQuestion",
+// "permission_mode":"auto"} was immediately followed by {"event":"exit","reason":"mode","mode":"auto"},
+// so a real QUESTION never held and degraded to a plain yellow needsAttention row on the phone. A
+// permission MODE auto-approves permission PROMPTS; it can never auto-ANSWER a question. Verified in the
+// shipped CC bundle (2.1.222): the permission evaluator returns {behavior:"ask", reason:
+// "requiresUserInteraction"} for AskUserQuestion BEFORE the bypassPermissions/dontAsk early-allow and
+// before any allow-rule — i.e. the hook fires and its decision is consumed identically in every mode.
+//
+// The gate stays exactly as it was for every other tool, and the SUBAGENT gate, the no-hold flag, and
+// the Codex reviewer/dialog gates still win over the exemption.
+
+describe("runPermissionHook — the mode gate exempts genuine questions", () => {
+  /** A PermissionRequest for a question tool, with extra top-level fields merged in. */
+  const questionAsk = (extra: Record<string, unknown> = {}, toolName = "AskUserQuestion") => JSON.stringify({
+    session_id: "sess-1", hook_event_name: "PermissionRequest",
+    tool_name: toolName, tool_input: { questions: CC_QUESTIONS },
+    cwd: "/Users/x/proj", transcript_path: "/tmp/t.jsonl", ...extra,
+  });
+
+  // Every mode the gate used to swallow: the two auto-approving ones, the never-prompt one, and an
+  // unknown future value (the fail-open branch must exempt questions too).
+  for (const mode of ["auto", "dontAsk", "bypassPermissions", "someFutureMode"]) {
+    test(`a QUESTION in permission_mode="${mode}" HOLDS (POSTs) and traces the bypass`, async () => {
+      const spy = spyFetch();
+      const events: Array<{ event: string; reason?: string; mode?: unknown; tool_name?: unknown }> = [];
+      await runPermissionHook(baseDeps({
+        readInput: async () => questionAsk({ permission_mode: mode }),
+        fetchFn: spy.fn, emit: () => {},
+        trace: (e: { event: string }) => events.push(e),
+      }) as never);
+      expect(spy.called()).toBe(true);
+      expect(events).toContainEqual({
+        event: "mode-gate-bypass", reason: "question", mode, tool_name: "AskUserQuestion",
+      });
+      expect(events.some((e) => e.event === "exit" && e.reason === "mode")).toBe(false);
+    });
+
+    test(`a NON-question in permission_mode="${mode}" still exits with reason "mode"`, async () => {
+      const spy = spyFetch();
+      const events: Array<{ event: string; reason?: string; mode?: unknown }> = [];
+      await runPermissionHook(baseDeps({
+        readInput: async () => inputWith({ permission_mode: mode }), // Bash
+        fetchFn: spy.fn, emit: () => {},
+        trace: (e: { event: string }) => events.push(e),
+      }) as never);
+      expect(spy.called()).toBe(false);
+      expect(events.at(-1)).toMatchObject({ event: "exit", reason: "mode", mode });
+      expect(events.some((e) => e.event === "mode-gate-bypass")).toBe(false);
+    });
+  }
+
+  test("a question in an auto mode is ANSWERABLE — the same updatedInput line default mode emits", async () => {
+    // The answer path is mode-independent: CC consumes `decision.updatedInput` in the one shared
+    // runHooks() implementation, whichever permission mode the session is in.
+    const answerBlob = await encryptBlob(KEY, {
+      requestId: "req-fixed", ts: 5, decision: "answer", answers: ["Unit tests only"],
+    });
+    const emitted: string[] = [];
+    const { fn } = scriptFetch(true, [{ status: "answered", answerBlob }]);
+    await runPermissionHook(baseDeps({
+      fetchFn: fn, emit: (l: string) => emitted.push(l),
+      readInput: async () => questionAsk({ permission_mode: "auto" }),
+    }) as never);
+    expect(emitted).toEqual([JSON.stringify({
+      hookSpecificOutput: {
+        hookEventName: "PermissionRequest",
+        decision: {
+          behavior: "allow",
+          updatedInput: {
+            questions: CC_QUESTIONS,
+            answers: { "Which testing approach should I use for the new parser?": "Unit tests only" },
+          },
+        },
+      },
+    })]);
+  });
+
+  // Claude's already-interactive modes: a question held there BEFORE this change and still does, by the
+  // ordinary interactive-mode branch — so no bypass is traced (the exemption is not silently widening).
+  for (const mode of ["default", "acceptEdits", "plan"]) {
+    test(`permission_mode="${mode}" is UNCHANGED for a question — holds, no bypass trace`, async () => {
+      const spy = spyFetch();
+      const events: Array<{ event: string }> = [];
+      await runPermissionHook(baseDeps({
+        readInput: async () => questionAsk({ permission_mode: mode }),
+        fetchFn: spy.fn, emit: () => {},
+        trace: (e: { event: string }) => events.push(e),
+      }) as never);
+      expect(spy.called()).toBe(true);
+      expect(events.some((e) => e.event === "mode-gate-bypass")).toBe(false);
+    });
+  }
+
+  // ---- the gates that must still win over the exemption ----
+
+  test("SUBAGENT + question + auto mode → still exits 'subagent', zero network", async () => {
+    const spy = spyFetch();
+    const events: Array<{ event: string; reason?: string }> = [];
+    await runPermissionHook(baseDeps({
+      readInput: async () => questionAsk({ permission_mode: "auto", agent_id: "agent-abc", agent_type: "Explore" }),
+      fetchFn: spy.fn, emit: () => {},
+      trace: (e: { event: string }) => events.push(e),
+    }) as never);
+    expect(spy.called()).toBe(false);
+    expect(events.at(-1)).toMatchObject({ event: "exit", reason: "subagent" });
+  });
+
+  test("no-hold flag + question + auto mode → still delegates, never POSTs", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "nomo-nohold-q-"));
+    const flag = join(dir, "no-hold");
+    await writeFile(flag, "");
+    let delegated = false;
+    let fetched = false;
+    const fn = (async () => { fetched = true; return new Response("{}"); }) as unknown as typeof fetch;
+    await runPermissionHook(baseDeps({
+      fetchFn: fn, noHoldPath: flag, emit: () => {},
+      readInput: async () => questionAsk({ permission_mode: "auto" }),
+      delegate: async () => { delegated = true; },
+    }) as never);
+    expect(delegated).toBe(true);
+    expect(fetched).toBe(false);
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  test("CODEX dialog mode (acceptEdits) + question → still skipped, tagged codex_dialog_mode", async () => {
+    // The `agent === "claude"` narrowing on acceptEdits/plan is deliberate; the exemption must not open a
+    // hold for a Codex producer that reports a claude-style dialog mode.
+    const spy = spyFetch();
+    const events: Array<{ event: string; reason?: string; codex_dialog_mode?: unknown }> = [];
+    await runPermissionHook(baseDeps({
+      readInput: async () => questionAsk({ permission_mode: "acceptEdits" }, "request_user_input"),
+      loadCodexTurnPolicyFn: async () => { throw new Error("must not inspect a rollout for a skipped dialog mode"); },
+      fetchFn: spy.fn, emit: () => {},
+      trace: (e: { event: string }) => events.push(e),
+    }) as never, "codex");
+    expect(spy.called()).toBe(false);
+    expect(events.at(-1)).toMatchObject({
+      event: "exit", reason: "mode", mode: "acceptEdits", codex_dialog_mode: true,
+    });
+  });
+
+  test("CODEX auto-review reviewer + question → still exits 'codex-auto-review' (gate 3 still runs)", async () => {
+    const spy = spyFetch();
+    const events: Array<{ event: string; reason?: string }> = [];
+    await runPermissionHook(baseDeps({
+      readInput: async () => questionAsk({ permission_mode: "bypassPermissions", turn_id: "t1" }, "request_user_input"),
+      loadCodexTurnPolicyFn: async () => ({
+        approvalPolicy: "on-request", approvalsReviewer: "auto_review", sandboxType: "workspace-write",
+      }),
+      fetchFn: spy.fn, emit: () => {},
+      trace: (e: { event: string }) => events.push(e),
+    }) as never, "codex");
+    expect(spy.called()).toBe(false);
+    expect(events.at(-1)).toMatchObject({ event: "exit", reason: "codex-auto-review" });
+  });
+
+  test("CODEX manual reviewer + question in Full Access → holds (Full Access cannot answer a question)", async () => {
+    const spy = spyFetch();
+    await runPermissionHook(baseDeps({
+      readInput: async () => questionAsk({ permission_mode: "bypassPermissions", turn_id: "t1" }, "request_user_input"),
+      loadCodexTurnPolicyFn: async () => ({ approvalPolicy: "on-request", approvalsReviewer: "user" }),
+      fetchFn: spy.fn, emit: () => {},
+    }) as never, "codex");
+    expect(spy.called()).toBe(true);
+  });
+});
+
 // ---- always-allow / deny-with-message / unknown-decision / richer context / question gate ---
 //
 // These drive the REAL hold loop through the harness (scripted fetch + injected answer blob), never a
@@ -2199,13 +2368,18 @@ describe("runPermissionHook — AskUserQuestion holds", () => {
     expect(events.at(-1)).toMatchObject({ event: "exit", reason: "answered" });
   });
 
-  test("AskUserQuestion in an AUTO mode → the mode gate still fires FIRST (no POST at all)", async () => {
-    const spy = spyFetch();
-    await runPermissionHook(baseDeps({
-      readInput: async () => JSON.stringify({ ...JSON.parse(questionInput()), permission_mode: "auto" }),
-      fetchFn: spy.fn, emit: () => {},
-    }) as never);
-    expect(spy.called()).toBe(false);
+  // WAS "the mode gate still fires FIRST" until 2026-08-04, which is the field bug: a question is the ONE
+  // thing a permission mode can never auto-answer, so it must hold in auto mode too. Full coverage lives
+  // in "the mode gate exempts genuine questions" above; this asserts the ANSWER still lands from here.
+  test("AskUserQuestion in an AUTO mode → HOLDS and is answered like any other question", async () => {
+    const { emitted } = await answerQuestion(
+      { decision: "answer", answers: ["Integration tests"] },
+      { readInput: async () => JSON.stringify({ ...JSON.parse(questionInput()), permission_mode: "auto" }) },
+    );
+    const updatedInput = JSON.parse(emitted[0]).hookSpecificOutput.decision.updatedInput;
+    expect(updatedInput.answers).toEqual({
+      "Which testing approach should I use for the new parser?": "Integration tests",
+    });
   });
 });
 
