@@ -30,4 +30,15 @@ do
   if [ -x "$rt" ]; then exec "$rt" "$@"; fi
 done
 
+# LAST RESORT: a login shell. Version managers (nvm, fnm, volta, asdf) install node under a
+# per-version directory no fixed list can enumerate, and they publish it by editing the user's shell
+# rc — so the only portable way to find that node is to ask the shell that has it. This costs a shell
+# spawn (~100ms), which is why it runs only after PATH and the fixed candidates have both failed: the
+# normal case never pays for it. `-i` matters — nvm/fnm are commonly set up in .zshrc, which a
+# non-interactive login shell does not read.
+if [ -n "$SHELL" ] && [ -x "$SHELL" ]; then
+  rt=$("$SHELL" -ilc 'command -v bun || command -v node' 2>/dev/null | head -n 1)
+  if [ -n "$rt" ] && [ -x "$rt" ]; then exec "$rt" "$@"; fi
+fi
+
 exit 0
