@@ -1,5 +1,6 @@
 #!/bin/sh
-# Resolve a JS runtime: prefer bun, else node; hooks must stay silent on failure.
+# Resolve a JS runtime: prefer bun, else node; hooks must stay silent on failure. Also keeps the
+# version-stable hook shim installed (see the HOOK-SHIM UPKEEP block below).
 #
 # WHY THE ABSOLUTE-PATH FALLBACKS (2026-08-05, field): a hook runs with whatever PATH the agent hands
 # it, which is often thinner than an interactive shell's — a bun installed at ~/.bun/bin is routinely
@@ -24,6 +25,132 @@
 # EXIT 0 ON NOTHING FOUND is deliberate and must not become an error: an unpaired or runtime-less
 # machine has to leave the user's agent completely undisturbed. A hook that exits non-zero is surfaced
 # to the user as a failure, which is exactly the noise this whole file exists to prevent.
+
+# ATOMIC + OWNER-ONLY, matching every other file this plugin writes (config.json, the session records,
+# the trace log are all 0600). A plain `> "$dest"` landed 0644 under the default umask and was readable
+# half-written by a concurrent hook; temp-then-rename makes the swap all-or-nothing, and the chmod
+# happens while the file is still under its private name. Entirely best-effort: a read-only or missing
+# directory must never break the hook, so both helpers always return 0.
+#
+# Two variants because the callers differ in what they can afford. nomo_atomic_write takes a string and
+# is fork-free (`printf` is a builtin) — it runs on the runtime-cache path. nomo_atomic_copy shells out
+# to cp and is only ever reached on the rare shim-install path.
+nomo_atomic_write() {
+  _tmp="$1.$$"
+  (
+    mkdir -p "${1%/*}" 2>/dev/null &&
+    printf '%s\n' "$3" >"$_tmp" 2>/dev/null &&
+    chmod "$2" "$_tmp" 2>/dev/null &&
+    mv -f "$_tmp" "$1" 2>/dev/null
+  ) || rm -f "$_tmp" 2>/dev/null
+  return 0
+}
+
+nomo_atomic_copy() {
+  _tmp="$1.$$"
+  (
+    mkdir -p "${1%/*}" 2>/dev/null &&
+    cp "$3" "$_tmp" 2>/dev/null &&
+    chmod "$2" "$_tmp" 2>/dev/null &&
+    mv -f "$_tmp" "$1" 2>/dev/null
+  ) || rm -f "$_tmp" 2>/dev/null
+  return 0
+}
+
+# ── HOOK-SHIM UPKEEP ─────────────────────────────────────────────────────────────────────────────
+#
+# WHY (2026-08-06, field): both hosts install a plugin into a VERSION-PINNED cache directory, and Codex
+# deletes the previous one on update. The Codex `app-server` daemon that spawns every Codex hook
+# resolves $PLUGIN_ROOT once and keeps it for its whole (multi-day) life, so after ANY version bump the
+# path baked into its hook command lines is gone and every hook — including new sessions' — dies with
+# 127, silently, until the user restarts a daemon they don't know exists. The manifests therefore fall
+# back to a shim at a path that never changes; this block is what puts it there and keeps it current.
+#
+# SELF-BOOTSTRAPPING: on a fresh install $PLUGIN_ROOT is still valid, the hook runs run.sh directly,
+# and run.sh installs the shim that the NEXT bump will need. Nothing asks the user to do anything.
+#
+# NOT ON EVERY HOOK. The check is a stamp read (one open, one builtin read) plus two stats and three
+# string compares — no forks, nothing written. The runtime probe already taught this file that a
+# per-invocation write is an SSD tax and a concurrent-hook race; the install runs only when something
+# genuinely changed.
+#
+# BUMP NOMO_SHIM_REV whenever scripts/hook-shim.sh changes, or installed copies will never refresh.
+NOMO_SHIM_REV=1
+
+# Numeric semver compare: true when $1 sorts strictly AFTER $2. A DELIBERATE TWIN of the function in
+# hook-shim.sh — run.sh has to stay a standalone file that works when nothing else on disk does, so it
+# cannot source a shared helper. Lexical comparison is not an option: it orders 1.7.10 below 1.7.9,
+# which is precisely the bump most likely to exercise this code.
+nomo_newer() {
+  _a=${1%%[-+]*}; _b=${2%%[-+]*}
+  for _i in 1 2 3; do
+    _x=${_a%%.*}; _y=${_b%%.*}
+    case "$_x" in ''|*[!0-9]*) _x=0 ;; esac
+    case "$_y" in ''|*[!0-9]*) _y=0 ;; esac
+    [ "$_x" -gt "$_y" ] && return 0
+    [ "$_x" -lt "$_y" ] && return 1
+    case "$_a" in *.*) _a=${_a#*.} ;; *) _a=0 ;; esac
+    case "$_b" in *.*) _b=${_b#*.} ;; *) _b=0 ;; esac
+  done
+  case "$1" in *-*) return 1 ;; esac
+  case "$2" in *-*) return 0 ;; esac
+  return 1
+}
+
+# $0 is the only trustworthy statement of which plugin copy is actually executing: $PLUGIN_ROOT may be
+# a lie (that is the whole bug) and the shim may have exec'd us from somewhere else entirely. An
+# invocation that does not look like "<root>/scripts/run.sh", or whose root is relative, is left alone
+# — recording a relative path would produce a stamp that resolves to nothing from a hook's cwd.
+nomo_root=${0%/scripts/run.sh}
+case "$nomo_root" in
+  "$0") nomo_root= ;;  # $0 did not end in /scripts/run.sh at all
+  /*) ;;               # absolute root — usable
+  *) nomo_root= ;;     # relative invocation
+esac
+
+if [ -n "$HOME" ] && [ -n "$nomo_root" ]; then
+  nomo_shim="$HOME/.config/cc-status/hook-shim.sh"
+  nomo_stamp="$HOME/.config/cc-status/hook-shim.stamp"
+  nomo_rev=
+  nomo_recorded=
+  # Fields: "<shim-rev> <plugin-root>"; the root is last so a path with spaces survives IFS splitting.
+  [ -r "$nomo_stamp" ] && read -r nomo_rev nomo_recorded <"$nomo_stamp" 2>/dev/null
+
+  nomo_want_install=0
+  if [ ! -x "$nomo_shim" ]; then
+    # Missing or never installed. Install ours even if the stamp claims a newer rev once lived here —
+    # a working older shim beats no shim, and that newer version's run.sh will re-upgrade it.
+    nomo_want_install=1
+  elif [ "$nomo_rev" != "$NOMO_SHIM_REV" ]; then
+    # Only ever move the rev FORWARD. Two versions of this plugin can be installed at once (Claude's
+    # cache keeps every version it has ever seen), and letting the older one rewrite the newer one's
+    # shim would make the two fight over the file on every single hook.
+    case "$nomo_rev" in
+      ''|*[!0-9]*) nomo_want_install=1 ;;
+      *) [ "$NOMO_SHIM_REV" -gt "$nomo_rev" ] && nomo_want_install=1 ;;
+    esac
+  elif [ "$nomo_recorded" != "$nomo_root" ]; then
+    # Someone else's root is recorded. Take it over only if theirs is gone, or ours is genuinely newer
+    # (STRICTLY newer — on a tie the incumbent keeps it, which is what stops a Claude hook and a Codex
+    # hook of the same version from rewriting the stamp back and forth forever).
+    if [ ! -x "$nomo_recorded/scripts/run.sh" ]; then
+      nomo_want_install=1
+    elif nomo_newer "${nomo_root##*/}" "${nomo_recorded##*/}"; then
+      nomo_want_install=1
+    fi
+  fi
+
+  if [ "$nomo_want_install" = 1 ] && [ -f "$nomo_root/scripts/hook-shim.sh" ]; then
+    # 0700 on the directory too: it holds config.json, i.e. the pairing key this plugin's whole
+    # end-to-end encryption story rests on, and it has no business being world-readable.
+    mkdir -p "${nomo_shim%/*}" 2>/dev/null && chmod 700 "${nomo_shim%/*}" 2>/dev/null
+    # Shim first, stamp second. A crash in between leaves a stale stamp, which merely re-runs this
+    # block on the next hook; the reverse order would advertise a shim that is not there yet.
+    nomo_atomic_copy "$nomo_shim" 700 "$nomo_root/scripts/hook-shim.sh"
+    nomo_atomic_write "$nomo_stamp" 600 "$NOMO_SHIM_REV $nomo_root"
+  fi
+fi
+
 if command -v bun >/dev/null 2>&1; then exec bun "$@"; fi
 if command -v node >/dev/null 2>&1; then exec node "$@"; fi
 
@@ -48,21 +175,9 @@ done
 cache="$HOME/.config/cc-status/runtime"
 NEGATIVE_CACHE_TTL=3600
 
-# Atomic + owner-only, matching every other file this plugin writes (config.json, the session records,
-# the trace log are all 0600). A plain `> "$cache"` landed 0644 under the default umask and was
-# readable half-written by a concurrent hook; temp-then-rename makes the swap all-or-nothing, and the
-# chmod happens while the file is still under its private name. Entirely best-effort: a read-only or
-# missing directory must never break the hook.
-write_cache() {
-  tmp="$cache.$$"
-  (
-    mkdir -p "${cache%/*}" 2>/dev/null &&
-    printf '%s\n' "$1" >"$tmp" 2>/dev/null &&
-    chmod 600 "$tmp" 2>/dev/null &&
-    mv -f "$tmp" "$cache" 2>/dev/null
-  ) || rm -f "$tmp" 2>/dev/null
-  return 0
-}
+# Owner-only and atomic, via the shared helper defined at the top of this file (see the comment there
+# for why a plain redirect was not good enough).
+write_cache() { nomo_atomic_write "$cache" 600 "$1"; }
 
 if [ -r "$cache" ]; then
   rt=$(cat "$cache" 2>/dev/null)
