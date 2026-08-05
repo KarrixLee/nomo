@@ -103,7 +103,7 @@ import { appendFileSync, existsSync, readFileSync, statSync, truncateSync } from
 import { execFileSync, spawn } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "1.7.1";
+var PLUGIN_VERSION = "1.7.2";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -5490,6 +5490,9 @@ function defaultTrace() {
   }
   return trace;
 }
+function isQuestionTool(toolName) {
+  return toolName === "AskUserQuestion" || toolName === "request_user_input";
+}
 function buildPermissionSummary(toolName, toolInput) {
   const str = (v) => typeof v === "string" && v.length > 0 ? v : undefined;
   const truncate = (s, n = 80) => s.length <= n ? s : `${s.slice(0, n - 1)}…`;
@@ -5935,11 +5938,14 @@ async function runPermissionHook(deps = {}, agent = "claude") {
       return;
     }
     const interactiveMode = permissionMode === undefined || permissionMode === "default" || agent === "claude" && (permissionMode === "acceptEdits" || permissionMode === "plan");
-    if (!interactiveMode) {
-      const codexDialogMode = agent === "codex" && (permissionMode === "acceptEdits" || permissionMode === "plan");
+    const codexDialogMode = agent === "codex" && (permissionMode === "acceptEdits" || permissionMode === "plan");
+    const questionExempt = !interactiveMode && !codexDialogMode && isQuestionTool(toolName);
+    if (!interactiveMode && !questionExempt) {
       trace({ event: "exit", reason: "mode", mode: permissionMode, ...codexDialogMode ? { codex_dialog_mode: true } : {} });
       return;
     }
+    if (questionExempt)
+      trace({ event: "mode-gate-bypass", reason: "question", mode: permissionMode, tool_name: toolName });
     if (agent === "codex" && !toolName.startsWith("mcp__")) {
       const transcriptPath = typeof input.transcript_path === "string" ? input.transcript_path : "";
       const turnId = typeof input.turn_id === "string" ? input.turn_id : "";
