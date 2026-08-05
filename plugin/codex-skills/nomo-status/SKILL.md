@@ -19,7 +19,7 @@ column starts with `nomo@` and take that row's **PATH** column value as `<ROOT>`
 Run this exact command and present its output block **as-is**:
 
 ```
-exec "<ROOT>/scripts/run.sh" "<ROOT>/dist/status-cmd.mjs"
+NOMOR="<ROOT>"; NOMOS="$HOME/.config/cc-status/hook-shim.sh"; [ -n "$NOMOR" ] && [ -x "$NOMOR/scripts/run.sh" ] && exec "$NOMOR/scripts/run.sh" "$NOMOR/dist/status-cmd.mjs"; [ -x "$NOMOS" ] && exec "$NOMOS" status-cmd; echo "Nomo could not find its installed files - reinstall the nomo plugin."; exit 1
 ```
 
 It prints a short health readout: whether this machine is paired (and to which worker), whether the

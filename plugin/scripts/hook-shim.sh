@@ -26,6 +26,12 @@
 # hook that exits non-zero or writes to stderr is surfaced to the user as a failure in their agent
 # turn, and a plugin whose job is a phone notification must never do that.
 #
+# THREE CALLERS, one address. (1) hook manifests, as the fallback when the host's own root is gone.
+# (2) The slash commands and Codex skills, same shape. (3) Codex's `notify` setting in config.toml,
+# which has NO fallback at all — config.toml is written once at pairing and never revisited, so a
+# version-pinned path there breaks permanently rather than until a restart. That third caller is why
+# the shim also carries the notify FAN-OUT (see nomo_notify below).
+#
 # Installed and kept current by run.sh (see the NOMO_SHIM_REV block there). Editing this file requires
 # bumping NOMO_SHIM_REV in run.sh, or already-installed copies will never be refreshed.
 
@@ -39,17 +45,48 @@ case "$1" in
     NOMO_ENTRY=$1 ;;
   *) exit 0 ;;
 esac
+# Everything after the entry name is FORWARDED to the bundle verbatim ("$@" from here on): the slash
+# commands pass sub-commands (`wait`, `--show-code`, `on|off|status`) and Codex appends the notify
+# payload. Nothing here inspects those — they are our own bundles' argv, at the same trust level as
+# the entry name itself.
+shift
 
 # Everything below is addressed relative to HOME. Without it there is nothing to resolve.
 [ -n "$HOME" ] || exit 0
+
+# THE NOTIFY FAN-OUT, transplanted from the old scripts/notify-chain.sh (which lived inside the
+# version-pinned root and so had the exact bug this file exists to fix). Codex runs the `notify`
+# program with ONE JSON payload appended as the FINAL argument, fire-and-forget. argv contract:
+#   hook-shim.sh codex-notify <JSON>                            — nomo only
+#   hook-shim.sh codex-notify -- <orig-prog> <orig-args…> <JSON> — nomo + the pre-existing notify
+# After the "--" the payload already sits in the exact position the original program expects, so it is
+# exec'd verbatim. This is reached ONLY for the codex-notify entry, so no hook pays for it.
+nomo_notify() {
+  _run=$1; _mjs=$2; shift 2
+  # The payload is whatever ended up last; the loop is a builtin, so this stays fork-free.
+  _payload=""
+  for _payload in "$@"; do :; done
+  # (a) The nomo backstop, backgrounded so a chained notify program is never delayed behind it.
+  ( "$_run" "$_mjs" "$_payload" >/dev/null 2>&1 || true ) &
+  # (b) The pre-existing notify program, if we are wrapping one. `command -v` first: exec'ing an
+  # uninstalled program would die 127 and Codex may surface that stderr.
+  if [ "$1" = "--" ]; then
+    shift
+    if [ "$#" -gt 0 ] && command -v "$1" >/dev/null 2>&1; then exec "$@"; fi
+  fi
+  exit 0
+}
 
 # Hand off to a candidate root, or return non-zero so the caller keeps looking. Both tests matter: a
 # root can survive with its scripts/ intact but WITHOUT the entry we were asked for (an older version
 # predating that entry), and exec'ing run.sh on a missing bundle would surface the runtime's own error.
 nomo_launch() {
-  [ -x "$1/scripts/run.sh" ] || return 1
-  [ -f "$1/dist/$NOMO_ENTRY.mjs" ] || return 1
-  exec "$1/scripts/run.sh" "$1/dist/$NOMO_ENTRY.mjs"
+  _root=$1; shift
+  [ -x "$_root/scripts/run.sh" ] || return 1
+  [ -f "$_root/dist/$NOMO_ENTRY.mjs" ] || return 1
+  # nomo_notify never returns (it execs the chained program or exits 0).
+  [ "$NOMO_ENTRY" = codex-notify ] && nomo_notify "$_root/scripts/run.sh" "$_root/dist/$NOMO_ENTRY.mjs" "$@"
+  exec "$_root/scripts/run.sh" "$_root/dist/$NOMO_ENTRY.mjs" "$@"
 }
 
 # (a) FAST PATH — the root run.sh last recorded. One open, one builtin read, two tests. This is the
@@ -58,7 +95,7 @@ NOMO_STAMP="$HOME/.config/cc-status/hook-shim.stamp"
 if [ -r "$NOMO_STAMP" ]; then
   # Fields: "<shim-rev> <plugin-root>". The root is last so a path containing spaces survives IFS.
   read -r nomo_rev nomo_root <"$NOMO_STAMP" 2>/dev/null
-  if [ -n "$nomo_root" ]; then nomo_launch "$nomo_root"; fi
+  if [ -n "$nomo_root" ]; then nomo_launch "$nomo_root" "$@"; fi
 fi
 
 # Numeric semver compare: true when $1 sorts strictly AFTER $2. Written out longhand because the
@@ -116,13 +153,13 @@ do
     nomo_bestv=$nomo_v
   fi
 done
-if [ -n "$nomo_best" ]; then nomo_launch "$nomo_best"; fi
+if [ -n "$nomo_best" ]; then nomo_launch "$nomo_best" "$@"; fi
 
 # (c) LAST RESORT — a marketplace installed straight from git keeps an unversioned working copy here.
 # It has no version to rank, so it is only consulted when the versioned caches produced nothing.
 for nomo_d in "$HOME"/.claude/plugins/marketplaces/*/plugin/ "$HOME"/.codex/plugins/marketplaces/*/plugin/; do
   case "$nomo_d" in *'*'*) continue ;; esac
-  nomo_launch "${nomo_d%/}"
+  nomo_launch "${nomo_d%/}" "$@"
 done
 
 # Nothing anywhere. Silence is the contract.

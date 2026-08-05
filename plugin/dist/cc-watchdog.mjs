@@ -2,7 +2,7 @@ import { createRequire } from "node:module";
 var __require = /* @__PURE__ */ createRequire(import.meta.url);
 
 // src/entries/cc-watchdog.ts
-import { readdir as readdir4, readFile as readFile7, unlink as unlink4 } from "node:fs/promises";
+import { readdir as readdir4, readFile as readFile8, unlink as unlink4 } from "node:fs/promises";
 import { readFileSync as readFileSync2, statSync as statSync3, unlinkSync } from "node:fs";
 import { hostname as hostname4 } from "node:os";
 import { basename as basename5 } from "node:path";
@@ -103,7 +103,7 @@ import { appendFileSync, existsSync, readFileSync, statSync, truncateSync } from
 import { execFileSync, spawn } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "1.7.8";
+var PLUGIN_VERSION = "1.7.9";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -4723,15 +4723,159 @@ var DEFINITIVE_POLL_STATUSES = new Set([401, 403, 404, 410]);
 var MAX_DEFINITIVE_POLL_FAILURES = 2;
 
 // src/core/permission.ts
-import { readFile as readFile6, realpath, unlink as unlink3 } from "node:fs/promises";
+import { readFile as readFile7, realpath, unlink as unlink3 } from "node:fs/promises";
 import { appendFileSync as appendFileSync2, statSync as statSync2, truncateSync as truncateSync2 } from "node:fs";
 import { hostname as hostname2 } from "node:os";
 import { basename as basename4, isAbsolute, relative, resolve } from "node:path";
 
 // src/core/hook.ts
-import { readdir as readdir3, readFile as readFile5, unlink as unlink2 } from "node:fs/promises";
+import { readdir as readdir3, readFile as readFile6, unlink as unlink2 } from "node:fs/promises";
 import { hostname } from "node:os";
 import { basename as basename3 } from "node:path";
+
+// src/core/notify-wire.ts
+import { readFile as readFile5 } from "node:fs/promises";
+var NOMO_NOTIFY_ENTRY = "codex-notify";
+function nomoNotifyProgram(home) {
+  return `${home}/.config/cc-status/hook-shim.sh`;
+}
+function isNomoNotifyChain(arr) {
+  const prog = arr[0] ?? "";
+  if (/(^|\/)notify-chain\.sh$/.test(prog))
+    return true;
+  return /(^|\/)hook-shim\.sh$/.test(prog) && arr[1] === NOMO_NOTIFY_ENTRY;
+}
+function referencesNomoNotify(text) {
+  if (text.includes("notify-chain.sh"))
+    return true;
+  return text.includes("hook-shim.sh") && text.includes(NOMO_NOTIFY_ENTRY);
+}
+function arrayReferencesNomoNotify(arr) {
+  return isNomoNotifyChain(arr) || arr.some((s) => referencesNomoNotify(s));
+}
+function sameCommand(a, b) {
+  return a.length === b.length && a.every((v, i) => v === b[i]);
+}
+function unwrapNotify(arr) {
+  if (arr.length === 0)
+    return null;
+  if (isNomoNotifyChain(arr)) {
+    const sep = arr.indexOf("--");
+    if (sep === -1)
+      return null;
+    return unwrapNotify(arr.slice(sep + 1));
+  }
+  const i = arr.indexOf("--previous-notify");
+  if (i !== -1 && i + 1 < arr.length && referencesNomoNotify(arr[i + 1] ?? "")) {
+    const host = [...arr.slice(0, i), ...arr.slice(i + 2)];
+    let embedded = null;
+    try {
+      embedded = JSON.parse(arr[i + 1]);
+    } catch {}
+    if (Array.isArray(embedded) && embedded.every((x) => typeof x === "string")) {
+      const inner = unwrapNotify(embedded);
+      if (inner !== null && inner.length > 0 && !sameCommand(inner, host)) {
+        return [...arr.slice(0, i), "--previous-notify", JSON.stringify(inner), ...arr.slice(i + 2)];
+      }
+    }
+    return host;
+  }
+  return [...arr];
+}
+function wireNotifyArray(existing, program) {
+  const orig = existing && existing.length > 0 ? unwrapNotify(existing) : null;
+  return orig && orig.length > 0 ? [program, NOMO_NOTIFY_ENTRY, "--", ...orig] : [program, NOMO_NOTIFY_ENTRY];
+}
+function parseNotifyFromToml(toml) {
+  for (const line of toml.split(`
+`)) {
+    if (/^\s*\[/.test(line))
+      break;
+    const m = line.match(/^\s*notify\s*=\s*(.*)$/);
+    if (!m)
+      continue;
+    try {
+      const parsed = JSON.parse(m[1]);
+      if (Array.isArray(parsed) && parsed.every((x) => typeof x === "string")) {
+        return { present: true, value: parsed };
+      }
+    } catch {}
+    return { present: true, value: null };
+  }
+  return { present: false, value: null };
+}
+function replaceNotifyInToml(toml, arr) {
+  const line = `notify = ${JSON.stringify(arr)}`;
+  const lines = toml.split(`
+`);
+  let firstTable = -1;
+  for (let i = 0;i < lines.length; i++) {
+    if (/^\s*\[/.test(lines[i])) {
+      firstTable = i;
+      break;
+    }
+    if (/^\s*notify\s*=/.test(lines[i])) {
+      lines[i] = line;
+      return lines.join(`
+`);
+    }
+  }
+  if (firstTable === -1) {
+    const sep = toml.length === 0 || toml.endsWith(`
+`) ? "" : `
+`;
+    return `${toml}${sep}${line}
+`;
+  }
+  lines.splice(firstTable, 0, line, "");
+  return lines.join(`
+`);
+}
+function tomlMayNeedNotifyRepair(toml, program) {
+  const flat = toml.includes("\\") ? toml.split("\\").join("") : toml;
+  if (flat.includes("notify-chain.sh"))
+    return true;
+  if (!flat.includes("hook-shim.sh"))
+    return false;
+  return !flat.includes(program);
+}
+async function repairNotifyWiring(deps = {}) {
+  try {
+    const home = deps.home ?? process.env.HOME ?? "";
+    if (home.length === 0)
+      return "unchanged";
+    const program = nomoNotifyProgram(home);
+    const tomlPath = deps.tomlPath ?? `${codexHome()}/config.toml`;
+    let toml;
+    try {
+      toml = await readFile5(tomlPath, "utf8");
+    } catch {
+      return "unchanged";
+    }
+    if (!tomlMayNeedNotifyRepair(toml, program))
+      return "unchanged";
+    const parsed = parseNotifyFromToml(toml);
+    if (!parsed.present || parsed.value === null)
+      return "refused";
+    if (!arrayReferencesNomoNotify(parsed.value))
+      return "refused";
+    const next = wireNotifyArray(parsed.value, program);
+    if (sameCommand(next, parsed.value))
+      return "unchanged";
+    const bak = `${tomlPath}.bak-nomo`;
+    try {
+      await readFile5(bak);
+    } catch {
+      await atomicWrite(bak, toml);
+    }
+    await atomicWrite(tomlPath, replaceNotifyInToml(toml, next));
+    return "repaired";
+  } catch {
+    return "refused";
+  }
+}
+
+// src/core/hook.ts
 var TOOL_DETAIL = { ...claudeToolDetail, ...codexToolDetail };
 function sessionOrigin(input, ppid = process.ppid, command = pidCommand(ppid)) {
   const stringField = (key) => typeof input[key] === "string" && input[key].length > 0 ? input[key] : undefined;
@@ -4934,7 +5078,7 @@ async function reconcileProvisional(config, hookPid) {
         continue;
       let r;
       try {
-        r = JSON.parse(await readFile5(`${SESSIONS_DIR}/${f}`, "utf8"));
+        r = JSON.parse(await readFile6(`${SESSIONS_DIR}/${f}`, "utf8"));
       } catch {
         continue;
       }
@@ -4967,7 +5111,7 @@ async function readTrackedSessions() {
     if (!f.endsWith(".json"))
       continue;
     try {
-      const r = JSON.parse(await readFile5(`${SESSIONS_DIR}/${f}`, "utf8"));
+      const r = JSON.parse(await readFile6(`${SESSIONS_DIR}/${f}`, "utf8"));
       out.push({ sessionId: basename3(f, ".json"), pid: r.pid, provisional: r.provisional, agent: r.agent, ts: r.ts });
     } catch {}
   }
@@ -5018,6 +5162,9 @@ async function runHook(agent) {
     }
     const adapter2 = adapterFor(agent);
     await atomicWrite(lastHookPath(agent), String(Date.now())).catch(() => {});
+    if (agent === "codex" && input.hook_event_name === "SessionStart") {
+      await repairNotifyWiring().catch(() => {});
+    }
     const transcriptPath = typeof input.transcript_path === "string" ? input.transcript_path : "";
     let prefixCache;
     const getPrefix = async () => {
@@ -5750,7 +5897,7 @@ function createLoopbackAnswerPoller(config, requestId, deps) {
     if (deps.statePath === undefined)
       return;
     try {
-      return parseLanState(await readFile6(deps.statePath, "utf8"))?.port;
+      return parseLanState(await readFile7(deps.statePath, "utf8"))?.port;
     } catch {
       return;
     }
@@ -6899,7 +7046,7 @@ function resetDoneAttemptMemory() {
 }
 async function readRecordAt(path) {
   try {
-    return JSON.parse(await readFile7(path, "utf8"));
+    return JSON.parse(await readFile8(path, "utf8"));
   } catch {
     return null;
   }
@@ -7741,7 +7888,7 @@ async function readAllRecordEntries() {
       if (!f.endsWith(".json"))
         continue;
       try {
-        out.push({ sessionId: basename5(f, ".json"), rec: JSON.parse(await readFile7(`${SESSIONS_DIR}/${f}`, "utf8")) });
+        out.push({ sessionId: basename5(f, ".json"), rec: JSON.parse(await readFile8(`${SESSIONS_DIR}/${f}`, "utf8")) });
       } catch {}
     }
     return out;
@@ -8398,7 +8545,7 @@ async function sweep(config, deps = {}) {
     const sessionId = basename5(file, ".json");
     let record = null;
     try {
-      record = JSON.parse(await readFile7(path, "utf8"));
+      record = JSON.parse(await readFile8(path, "utf8"));
     } catch {
       record = null;
     }

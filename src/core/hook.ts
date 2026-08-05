@@ -30,6 +30,7 @@ import {
   LAST_SEND_PATH, lastHookPath, loadConfig, loadPendingConfig, localApprovalsState, PENDING_STASH_PATH, PendingEventStash, pidAncestors, pidCommand, PLUGIN_VERSION, readPrefix,
   readRecord, recordGoneStrike, removeRevokedConfig, resetGoneStrikes, SessionOrigin, SessionRecord, SESSIONS_DIR, tracePlanPickerDecision, traceSession,
 } from "./shared";
+import { repairNotifyWiring } from "./notify-wire";
 
 export { SESSION_TRACE_PATH } from "./shared";
 
@@ -605,6 +606,21 @@ export async function runHook(agent: AgentKind): Promise<void> {
     // #30835 — activity in the rollout but no stamp). Cheap (one small write; hooks run 8x/turn already)
     // and best-effort — a stamp failure must never derail the rest of the hook.
     await atomicWrite(lastHookPath(agent), String(Date.now())).catch(() => {});
+
+    // NOTIFY SELF-REPAIR (v1.7.9). Codex's `notify` setting is written into config.toml ONCE, at
+    // pairing, and nothing ever rewrites it — so the version-pinned paths written by ≤1.7.8 broke the
+    // turn-completion backstop permanently at the user's first plugin update, for a user who may never
+    // re-pair. This is the only regularly-firing place that can fix that. Fenced hard:
+    //   - CODEX ONLY (notify is a Codex setting) and SESSION-START ONLY — once per session, not per
+    //     tool use, so a long session pays this exactly once;
+    //   - the check itself is one small read plus three substring scans, and it writes nothing at all
+    //     unless a stale nomo-authored value is genuinely present (see tomlMayNeedNotifyRepair);
+    //   - it swallows everything (fail-open) — a repair that cannot run must never wedge a turn.
+    // Deliberately placed BEFORE the pairing gate below: an unpaired machine can still be carrying a
+    // broken notify line, and leaving it broken until the user re-pairs is the bug, not the fix.
+    if (agent === "codex" && input.hook_event_name === "SessionStart") {
+      await repairNotifyWiring().catch(() => {});
+    }
 
     const transcriptPath = typeof input.transcript_path === "string" ? input.transcript_path : "";
     // The transcript head, read AT MOST ONCE per hook and shared by BOTH the title scanner and the

@@ -3,7 +3,8 @@ var __require = /* @__PURE__ */ createRequire(import.meta.url);
 
 // src/entries/pair.ts
 import { spawn as spawn2 } from "node:child_process";
-import { readFile as readFile2, unlink as unlink2 } from "node:fs/promises";
+import { constants as fsConstants } from "node:fs";
+import { access as access2, mkdir as mkdir2, readFile as readFile3, unlink as unlink2 } from "node:fs/promises";
 import { dirname as dirname2, join as join2 } from "node:path";
 import { fileURLToPath as fileURLToPath2 } from "node:url";
 
@@ -99,7 +100,7 @@ async function sha256Hex(s) {
 }
 
 // src/core/shared.ts
-var PLUGIN_VERSION = "1.7.8";
+var PLUGIN_VERSION = "1.7.9";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -847,8 +848,24 @@ function codexCompanionBrokerEvidence(pid, ancestorsOf = pidAncestors, commandOf
 }
 
 // src/core/notify-wire.ts
+import { readFile as readFile2 } from "node:fs/promises";
+var NOMO_NOTIFY_ENTRY = "codex-notify";
+function nomoNotifyProgram(home) {
+  return `${home}/.config/cc-status/hook-shim.sh`;
+}
 function isNomoNotifyChain(arr) {
-  return arr.length > 0 && /(^|\/)notify-chain\.sh$/.test(arr[0] ?? "");
+  const prog = arr[0] ?? "";
+  if (/(^|\/)notify-chain\.sh$/.test(prog))
+    return true;
+  return /(^|\/)hook-shim\.sh$/.test(prog) && arr[1] === NOMO_NOTIFY_ENTRY;
+}
+function referencesNomoNotify(text) {
+  if (text.includes("notify-chain.sh"))
+    return true;
+  return text.includes("hook-shim.sh") && text.includes(NOMO_NOTIFY_ENTRY);
+}
+function arrayReferencesNomoNotify(arr) {
+  return isNomoNotifyChain(arr) || arr.some((s) => referencesNomoNotify(s));
 }
 function sameCommand(a, b) {
   return a.length === b.length && a.every((v, i) => v === b[i]);
@@ -863,7 +880,7 @@ function unwrapNotify(arr) {
     return unwrapNotify(arr.slice(sep + 1));
   }
   const i = arr.indexOf("--previous-notify");
-  if (i !== -1 && i + 1 < arr.length && (arr[i + 1] ?? "").includes("notify-chain.sh")) {
+  if (i !== -1 && i + 1 < arr.length && referencesNomoNotify(arr[i + 1] ?? "")) {
     const host = [...arr.slice(0, i), ...arr.slice(i + 2)];
     let embedded = null;
     try {
@@ -879,11 +896,9 @@ function unwrapNotify(arr) {
   }
   return [...arr];
 }
-function wireNotifyArray(existing, root) {
-  const chain = `${root}/scripts/notify-chain.sh`;
-  const mjs = `${root}/dist/codex-notify.mjs`;
+function wireNotifyArray(existing, program) {
   const orig = existing && existing.length > 0 ? unwrapNotify(existing) : null;
-  return orig && orig.length > 0 ? [chain, mjs, "--", ...orig] : [chain, mjs];
+  return orig && orig.length > 0 ? [program, NOMO_NOTIFY_ENTRY, "--", ...orig] : [program, NOMO_NOTIFY_ENTRY];
 }
 function parseNotifyFromToml(toml) {
   for (const line of toml.split(`
@@ -929,6 +944,49 @@ function replaceNotifyInToml(toml, arr) {
   lines.splice(firstTable, 0, line, "");
   return lines.join(`
 `);
+}
+function tomlMayNeedNotifyRepair(toml, program) {
+  const flat = toml.includes("\\") ? toml.split("\\").join("") : toml;
+  if (flat.includes("notify-chain.sh"))
+    return true;
+  if (!flat.includes("hook-shim.sh"))
+    return false;
+  return !flat.includes(program);
+}
+async function repairNotifyWiring(deps = {}) {
+  try {
+    const home = deps.home ?? process.env.HOME ?? "";
+    if (home.length === 0)
+      return "unchanged";
+    const program = nomoNotifyProgram(home);
+    const tomlPath = deps.tomlPath ?? `${codexHome()}/config.toml`;
+    let toml;
+    try {
+      toml = await readFile2(tomlPath, "utf8");
+    } catch {
+      return "unchanged";
+    }
+    if (!tomlMayNeedNotifyRepair(toml, program))
+      return "unchanged";
+    const parsed = parseNotifyFromToml(toml);
+    if (!parsed.present || parsed.value === null)
+      return "refused";
+    if (!arrayReferencesNomoNotify(parsed.value))
+      return "refused";
+    const next = wireNotifyArray(parsed.value, program);
+    if (sameCommand(next, parsed.value))
+      return "unchanged";
+    const bak = `${tomlPath}.bak-nomo`;
+    try {
+      await readFile2(bak);
+    } catch {
+      await atomicWrite(bak, toml);
+    }
+    await atomicWrite(tomlPath, replaceNotifyInToml(toml, next));
+    return "repaired";
+  } catch {
+    return "refused";
+  }
 }
 
 // src/core/pair-code.ts
@@ -3813,7 +3871,7 @@ function revokeCreds(raw) {
 async function revokeExisting(fetchFn, configPath, print) {
   let raw;
   try {
-    raw = await readFile2(configPath, "utf8");
+    raw = await readFile3(configPath, "utf8");
   } catch {
     return;
   }
@@ -3930,7 +3988,7 @@ async function pairWait(deps = {}) {
   const now = deps.now ?? Date.now;
   const readCompleted = async () => {
     try {
-      return parseConfig(await readFile2(configPath, "utf8"));
+      return parseConfig(await readFile3(configPath, "utf8"));
     } catch {
       return null;
     }
@@ -3938,7 +3996,7 @@ async function pairWait(deps = {}) {
   const printPaired = (c) => print(c.machineName ? `Paired with ${c.machineName} ✓` : "Paired ✓");
   let raw;
   try {
-    raw = await readFile2(configPath, "utf8");
+    raw = await readFile3(configPath, "utf8");
   } catch {
     print("No pairing in progress — run /nomo-cc:pair first.");
     return 1;
@@ -4007,23 +4065,38 @@ async function pairWait(deps = {}) {
 function pluginRootFromHere() {
   return dirname2(dirname2(fileURLToPath2(import.meta.url)));
 }
+async function ensureNotifyProgram(root, program) {
+  try {
+    await access2(program, fsConstants.X_OK);
+    return true;
+  } catch {}
+  try {
+    await mkdir2(dirname2(program), { recursive: true, mode: 448 });
+    await atomicWrite(program, await readFile3(join2(root, "scripts", "hook-shim.sh"), "utf8"), 448);
+    return true;
+  } catch {
+    return false;
+  }
+}
 async function wireNotify(deps = {}) {
   const print = deps.print ?? ((line) => console.log(line));
   const tomlPath = deps.tomlPath ?? join2(codexHome(), "config.toml");
   const root = deps.pluginRoot ?? pluginRootFromHere();
+  const program = nomoNotifyProgram(deps.home ?? process.env.HOME ?? "");
+  const installed = await ensureNotifyProgram(root, program);
   let toml = "";
   try {
-    toml = await readFile2(tomlPath, "utf8");
+    toml = await readFile3(tomlPath, "utf8");
   } catch {
     toml = "";
   }
   const parsed = parseNotifyFromToml(toml);
   if (parsed.present && parsed.value === null) {
     print(`Couldn't safely parse the existing notify line in ${tomlPath} — set it manually to:`);
-    print(`notify = ["${root}/scripts/notify-chain.sh", "${root}/dist/codex-notify.mjs", "--", <your original notify command…>]`);
+    print(`notify = ["${program}", "codex-notify", "--", <your original notify command…>]`);
     return 1;
   }
-  const next = wireNotifyArray(parsed.value ?? undefined, root);
+  const next = wireNotifyArray(parsed.value ?? undefined, program);
   if (parsed.value && next.length === parsed.value.length && next.every((v, i) => v === parsed.value[i])) {
     print("Codex notify backstop already wired — no change.");
     return 0;
@@ -4031,7 +4104,7 @@ async function wireNotify(deps = {}) {
   if (toml.length > 0) {
     const bak = `${tomlPath}.bak-nomo`;
     try {
-      await readFile2(bak);
+      await readFile3(bak);
     } catch {
       await atomicWrite(bak, toml);
     }
@@ -4039,6 +4112,8 @@ async function wireNotify(deps = {}) {
   await atomicWrite(tomlPath, replaceNotifyInToml(toml, next));
   const preserved = next.includes("--");
   print(preserved ? "Codex notify backstop wired (your original notify command is preserved and still runs)." : "Codex notify backstop wired.");
+  if (!installed)
+    print(`Note: ${program} isn't installed yet — it appears on the next Codex hook.`);
   return 0;
 }
 function parseTimeoutMs(argv) {

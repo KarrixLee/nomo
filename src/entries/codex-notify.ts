@@ -17,7 +17,9 @@
 // Contract, like the hooks: NOTHING on stdout, exit 0 always, 2-second net ceiling.
 //
 // PORTABILITY: bun AND node >= 18 — no `Bun.*` APIs; build.ts bundles this to dist/codex-notify.mjs,
-// invoked via plugin/scripts/notify-chain.sh (which also chains any pre-existing notify program).
+// invoked via `plugin/scripts/hook-shim.sh codex-notify` (which also chains any pre-existing notify
+// program). The shim — not a path inside the version-pinned plugin root — is what config.toml's
+// `notify` names, because that file is written once at pairing and never rewritten; see core/notify-wire.
 
 import { hostname } from "node:os";
 import { basename } from "node:path";

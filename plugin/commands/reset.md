@@ -5,7 +5,7 @@ description: Reset stuck Nomo session state — stop the watchdog and clear dead
 Run this exact command and show its output verbatim to the user:
 
 ```
-"${CLAUDE_PLUGIN_ROOT}/scripts/run.sh" "${CLAUDE_PLUGIN_ROOT}/dist/reset.mjs"
+NOMOR="${CLAUDE_PLUGIN_ROOT}"; NOMOS="$HOME/.config/cc-status/hook-shim.sh"; [ -n "$NOMOR" ] && [ -x "$NOMOR/scripts/run.sh" ] && exec "$NOMOR/scripts/run.sh" "$NOMOR/dist/reset.mjs"; [ -x "$NOMOS" ] && exec "$NOMOS" reset; echo "Nomo could not find its installed files - reinstall the nomo plugin."; exit 1
 ```
 
 What it does (relay the printed summary):

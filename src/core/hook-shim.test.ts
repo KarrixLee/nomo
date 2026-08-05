@@ -12,9 +12,9 @@
 // Everything runs against a throwaway HOME with a synthetic plugin cache; the shell scripts are the
 // repo's real ones, and the "dist bundles" are one-line scripts that announce which root ran them.
 
-import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { afterEach, describe, expect, test } from "bun:test";
 import { createProcessHygiene, isolatedTestEnv } from "../test/process-hygiene";
 
@@ -31,6 +31,10 @@ const ENTRIES = [
   "cc-status", "cc-permission", "cc-watchdog", "codex-status", "codex-permission",
   "codex-notify", "pair", "unpair", "reset", "status-cmd",
 ];
+
+/** The shim revision run.sh currently installs. Read from the script rather than hard-coded, so a
+ *  future shim edit (which MUST bump this) doesn't fail these tests for the wrong reason. */
+const SHIM_REV = (/^NOMO_SHIM_REV=(\d+)$/m.exec(await readFile(RUN_SH, "utf8")) ?? [, "?"])[1]!;
 
 const homes: string[] = [];
 afterEach(async () => {
@@ -53,9 +57,37 @@ async function installRoot(root: string): Promise<string> {
     await chmod(join(root, "scripts", name), 0o755);
   }
   for (const entry of ENTRIES) {
-    await writeFile(join(root, "dist", `${entry}.mjs`), `console.log("ran ${entry} @ ${root}");\n`);
+    // Also record argv to a file: the notify path BACKGROUNDS the bundle with its output sent to
+    // /dev/null, so stdout cannot prove what ran or what it was handed.
+    await writeFile(join(root, "dist", `${entry}.mjs`), [
+      'import { appendFileSync } from "node:fs";',
+      `console.log("ran ${entry} @ ${root}");`,
+      `appendFileSync(process.env.HOME + "/ran.log", ${JSON.stringify(`${entry} @ ${root} `)} + JSON.stringify(process.argv.slice(2)) + "\\n");`,
+      "",
+    ].join("\n"));
   }
   return root;
+}
+
+/** A stand-in for a pre-existing `notify` program the user already had (the SkyComputerUseClient
+ *  slot). Records its own argv so the chain's hand-off can be verified verbatim. */
+async function installPrevNotify(home: string, name = "prev-notify"): Promise<string> {
+  const path = join(home, name);
+  await writeFile(path, `#!/bin/sh\nprintf '%s\\n' "prev $*" >>"$HOME/ran.log"\n`);
+  await chmod(path, 0o755);
+  return path;
+}
+
+/** The chain backgrounds the nomo bundle, so its line lands after the shim has already exited. */
+async function waitForLog(home: string, needle: string, timeoutMs = 5000): Promise<string> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    let log = "";
+    try { log = await readFile(join(home, "ran.log"), "utf8"); } catch { /* not written yet */ }
+    if (log.includes(needle)) return log;
+    if (Date.now() > deadline) return log;
+    await new Promise((r) => setTimeout(r, 25));
+  }
 }
 
 const cachedRoot = (home: string, host: ".codex" | ".claude", market: string, plugin: string, version: string): string =>
@@ -87,9 +119,9 @@ async function runShell(argv: string[], home: string, env: Record<string, string
   return { code, stdout, stderr };
 }
 
-/** Invoke the installed shim exactly the way a hook command does. */
-const runShim = (home: string, entry: string): Promise<ShellResult> =>
-  runShell([join(home, ".config/cc-status/hook-shim.sh"), entry], home);
+/** Invoke the installed shim exactly the way a hook command does (plus any forwarded argv). */
+const runShim = (home: string, entry: string, ...args: string[]): Promise<ShellResult> =>
+  runShell([join(home, ".config/cc-status/hook-shim.sh"), entry, ...args], home);
 
 /** Run one hook COMMAND STRING straight out of a manifest, through /bin/sh, with the host's root env
  *  var set to whatever the (possibly stale) daemon would have handed it. */
@@ -261,7 +293,7 @@ describe("hook-shim resolution", () => {
     const home = await newHome();
     await placeShim(home);
     // A stamp pointing at a root that no longer exists, and no cache to fall back on.
-    await writeFile(join(home, ".config/cc-status/hook-shim.stamp"), `1 ${join(home, "gone")}\n`);
+    await writeFile(join(home, ".config/cc-status/hook-shim.stamp"), `${SHIM_REV} ${join(home, "gone")}\n`);
 
     const res = await runShim(home, "codex-status");
     expect(res.code).toBe(0);
@@ -298,6 +330,84 @@ describe("hook-shim resolution", () => {
   });
 });
 
+describe("the shim forwards argv, and carries the Codex notify fan-out", () => {
+  // WHY THE FAN-OUT MOVED HERE (v1.7.9). Codex's `notify` setting is an argv array in config.toml,
+  // exec'd directly — no shell, no env expansion, no fallback — and config.toml is written once at
+  // pairing and never revisited. So the old value (scripts/notify-chain.sh + dist/codex-notify.mjs,
+  // both inside the version-pinned plugin root) broke PERMANENTLY at the user's first update, not
+  // merely until a daemon restart. Naming the shim instead moves the resolution to run time; carrying
+  // the fan-out here is what lets one stable file serve that value.
+
+  test("extra argv reaches the bundle (this is what the slash commands need)", async () => {
+    const home = await newHome();
+    const root = await installRoot(cachedRoot(home, ".codex", "acme", "nomo", "1.7.9"));
+    await placeShim(home);
+
+    const res = await runShim(home, "pair", "wait", "--timeout", "60");
+    expect(res.code).toBe(0);
+    expect(await readFile(join(home, "ran.log"), "utf8"))
+      .toContain(`pair @ ${root} ["wait","--timeout","60"]`);
+  });
+
+  test("NOMO ONLY: the payload reaches codex-notify with no chained program", async () => {
+    const home = await newHome();
+    const root = await installRoot(cachedRoot(home, ".codex", "acme", "nomo", "1.7.9"));
+    await placeShim(home);
+    const payload = JSON.stringify({ type: "agent-turn-complete", "turn-id": "t1" });
+
+    const res = await runShim(home, "codex-notify", payload);
+    expect(res.code).toBe(0);
+    expect(res.stderr).toBe("");
+    const log = await waitForLog(home, "codex-notify @");
+    expect(log).toContain(`codex-notify @ ${root} ${JSON.stringify([payload])}`);
+  });
+
+  test("CHAINED: the wrapped previous notify still runs, with the payload in its final position", async () => {
+    const home = await newHome();
+    const root = await installRoot(cachedRoot(home, ".codex", "acme", "nomo", "1.7.9"));
+    await placeShim(home);
+    const prev = await installPrevNotify(home);
+    const payload = JSON.stringify({ type: "agent-turn-complete" });
+
+    const res = await runShim(home, "codex-notify", "--", prev, "turn-ended", payload);
+    expect(res.code).toBe(0);
+    expect(res.stderr).toBe("");
+    // BOTH halves fire: nomo's backstop AND the program nomo is wrapping.
+    const log = await waitForLog(home, "codex-notify @");
+    expect(log).toContain(`prev turn-ended ${payload}`);
+    expect(log).toContain(`codex-notify @ ${root} ${JSON.stringify([payload])}`);
+  });
+
+  test("a chained program that no longer exists is skipped silently (never a 127 in the session)", async () => {
+    const home = await newHome();
+    await installRoot(cachedRoot(home, ".codex", "acme", "nomo", "1.7.9"));
+    await placeShim(home);
+
+    const res = await runShim(home, "codex-notify", "--", join(home, "uninstalled-notify"), "{}");
+    expect(res.code).toBe(0);
+    expect(res.stdout).toBe("");
+    expect(res.stderr).toBe("");
+    expect(await waitForLog(home, "codex-notify @")).toContain("codex-notify @");
+  });
+
+  test("STALE-PROOF: notify still fires after the version dir it was wired under is deleted", async () => {
+    // The whole point. A config.toml written under 1.7.7 names only the shim, so an update that
+    // deletes 1.7.7 and installs 1.7.9 leaves the notify value correct and working.
+    const home = await newHome();
+    const old = await installRoot(cachedRoot(home, ".codex", "acme", "nomo", "1.7.7"));
+    await runShell([join(old, "scripts/run.sh"), join(old, "dist/codex-status.mjs")], home);  // bootstrap
+    const next = await installRoot(cachedRoot(home, ".codex", "acme", "nomo", "1.7.9"));
+    await rm(old, { recursive: true, force: true });
+    const prev = await installPrevNotify(home);
+
+    const res = await runShim(home, "codex-notify", "--", prev, "{}");
+    expect(res.code).toBe(0);
+    const log = await waitForLog(home, "codex-notify @");
+    expect(log).toContain(`codex-notify @ ${next}`);
+    expect(log).toContain("prev {}");
+  });
+});
+
 describe("run.sh shim upkeep", () => {
   test("a fresh install writes the shim 0700 and the stamp 0600, and the bundle still runs", async () => {
     const home = await newHome();
@@ -305,7 +415,7 @@ describe("run.sh shim upkeep", () => {
     const res = await runShell([join(root, "scripts/run.sh"), join(root, "dist/codex-status.mjs")], home);
 
     expect(res.stdout).toContain(`@ ${root}`);
-    expect(await readStamp(home)).toBe(`1 ${root}`);
+    expect(await readStamp(home)).toBe(`${SHIM_REV} ${root}`);
     expect((await stat(join(home, ".config/cc-status/hook-shim.sh"))).mode & 0o777).toBe(0o700);
     expect((await stat(join(home, ".config/cc-status/hook-shim.stamp"))).mode & 0o777).toBe(0o600);
     expect((await stat(join(home, ".config/cc-status"))).mode & 0o777).toBe(0o700);
@@ -341,7 +451,7 @@ describe("run.sh shim upkeep", () => {
     const codex = await installRoot(cachedRoot(home, ".codex", "acme", "nomo", "1.7.8"));
     await runShell([join(claude, "scripts/run.sh"), join(claude, "dist/cc-status.mjs")], home);
     const first = await readStamp(home);
-    expect(first).toBe(`1 ${claude}`);
+    expect(first).toBe(`${SHIM_REV} ${claude}`);
 
     const stampPath = join(home, ".config/cc-status/hook-shim.stamp");
     const before = (await stat(stampPath)).mtimeMs;
@@ -359,26 +469,26 @@ describe("run.sh shim upkeep", () => {
     const older = await installRoot(cachedRoot(home, ".claude", "acme", "nomo-cc", "1.7.8"));
     const newer = await installRoot(cachedRoot(home, ".claude", "acme", "nomo-cc", "1.10.0"));
     await runShell([join(older, "scripts/run.sh"), join(older, "dist/cc-status.mjs")], home);
-    expect(await readStamp(home)).toBe(`1 ${older}`);
+    expect(await readStamp(home)).toBe(`${SHIM_REV} ${older}`);
 
     await runShell([join(newer, "scripts/run.sh"), join(newer, "dist/cc-status.mjs")], home);
-    expect(await readStamp(home)).toBe(`1 ${newer}`);
+    expect(await readStamp(home)).toBe(`${SHIM_REV} ${newer}`);
 
     await runShell([join(older, "scripts/run.sh"), join(older, "dist/cc-status.mjs")], home);
-    expect(await readStamp(home)).toBe(`1 ${newer}`);
+    expect(await readStamp(home)).toBe(`${SHIM_REV} ${newer}`);
   });
 
   test("a recorded root that has been deleted is replaced by whoever is running now", async () => {
     const home = await newHome();
     const gone = await installRoot(cachedRoot(home, ".codex", "acme", "nomo", "9.9.9"));
     await runShell([join(gone, "scripts/run.sh"), join(gone, "dist/codex-status.mjs")], home);
-    expect(await readStamp(home)).toBe(`1 ${gone}`);
+    expect(await readStamp(home)).toBe(`${SHIM_REV} ${gone}`);
     await rm(gone, { recursive: true, force: true });
 
     // An OLDER install: normally it would defer, but there is nothing left to defer to.
     const survivor = await installRoot(cachedRoot(home, ".codex", "acme", "nomo", "1.0.0"));
     await runShell([join(survivor, "scripts/run.sh"), join(survivor, "dist/codex-status.mjs")], home);
-    expect(await readStamp(home)).toBe(`1 ${survivor}`);
+    expect(await readStamp(home)).toBe(`${SHIM_REV} ${survivor}`);
   });
 
   test("an invocation that is not <root>/scripts/run.sh records nothing", async () => {
@@ -393,4 +503,78 @@ describe("run.sh shim upkeep", () => {
     expect(res.stdout).toContain(`@ ${root}`);          // still resolves a runtime and runs
     await expect(readStamp(home)).rejects.toThrow();     // but records nothing
   });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
+
+describe("slash commands and Codex skills carry the shim fallback", () => {
+  // ISSUE B, same bug class as the hooks: these address the plugin through ${CLAUDE_PLUGIN_ROOT} (the
+  // Claude commands) or a <ROOT> the agent substitutes (the Codex skills), and both go stale the same
+  // way after a version bump. They fail LOUDLY rather than silently, so they were never the outage the
+  // hooks were — but "the plugin is gone" is not an acceptable answer to /nomo-cc:status either.
+  // A LINT, not a behavior test: a command added next year must not be able to skip the fallback.
+  const COMMANDS = join(PLUGIN_DIR, "commands");
+  const SKILLS = join(PLUGIN_DIR, "codex-skills");
+
+  /** Every fenced block in a doc that actually LAUNCHES a bundle. Prose, `codex plugin list` and the
+   *  user-facing `/nomo-cc:…` / `$nomo-…` invocations are deliberately not matched: they are things
+   *  the reader runs, not paths we exec, and rewriting them would be nonsense. */
+  async function launchBlocks(file: string): Promise<string[]> {
+    const text = await readFile(file, "utf8");
+    return [...text.matchAll(/```[a-z]*\n([\s\S]*?)```/g)]
+      .map((m) => m[1].trim())
+      .filter((block) => block.includes("/dist/") || block.includes("hook-shim.sh"));
+  }
+
+  async function docs(dir: string): Promise<string[]> {
+    const out: string[] = [];
+    for (const name of await readdir(dir, { withFileTypes: true })) {
+      if (name.isDirectory()) out.push(join(dir, name.name, "SKILL.md"));
+      else if (name.name.endsWith(".md")) out.push(join(dir, name.name));
+    }
+    return out;
+  }
+
+  for (const [label, dir, rootExpr] of [
+    ["commands", COMMANDS, '${CLAUDE_PLUGIN_ROOT}'],
+    ["codex-skills", SKILLS, "<ROOT>"],
+  ] as const) {
+    test(`${label}: every launch block prefers the live root, then falls back to the shim`, async () => {
+      const files = await docs(dir);
+      expect(files.length).toBeGreaterThan(0);
+      let blocks = 0;
+      for (const file of files) {
+        for (const block of await launchBlocks(file)) {
+          blocks += 1;
+          const where = `${basename(dirname(file))}/${basename(file)}: ${block.slice(0, 60)}`;
+          expect(where + block).toContain(rootExpr);
+          expect(where + block).toContain('[ -n "$NOMOR" ]');
+          expect(where + block).toContain('[ -x "$NOMOR/scripts/run.sh" ]');
+          expect(where + block).toContain("$HOME/.config/cc-status/hook-shim.sh");
+          expect(where + block).toContain('[ -x "$NOMOS" ]');
+          // Interactive, unlike a hook: silence would leave the user staring at a command that did
+          // nothing, so the unresolvable case says so and exits non-zero.
+          expect(where + block).toContain("exit 1");
+        }
+      }
+      expect(blocks).toBeGreaterThanOrEqual(files.length);
+    });
+
+    test(`${label}: the fallback entry name matches the bundle, is whitelisted, and keeps its argv`, async () => {
+      for (const file of await docs(dir)) {
+        for (const block of await launchBlocks(file)) {
+          const live = /dist\/([a-z-]+)\.mjs"([^;]*);/.exec(block);
+          const fallback = /exec "\$NOMOS" ([a-z-]+)([^;]*);/.exec(block);
+          const where = `${basename(file)}: `;
+          expect(where + block).toContain('exec "$NOMOS"');
+          expect(`${where}${live?.[1]}`).toBe(`${where}${fallback?.[1]}`);
+          expect(ENTRIES).toContain(live![1]);
+          // Sub-commands (`wait --timeout 60`, `--show-code`, `<on|off|status>`) must survive the
+          // fallback too — the shim forwards them, so dropping them here would silently change what
+          // the user's command does the day the live root goes stale.
+          expect(`${where}args ${live?.[2]?.trim()}`).toBe(`${where}args ${fallback?.[2]?.trim()}`);
+        }
+      }
+    });
+  }
 });

@@ -75,7 +75,12 @@ nomo_atomic_copy() {
 # genuinely changed.
 #
 # BUMP NOMO_SHIM_REV whenever scripts/hook-shim.sh changes, or installed copies will never refresh.
-NOMO_SHIM_REV=1
+# rev 2 (v1.7.9): the shim forwards extra argv to the bundle and carries the Codex `notify` fan-out,
+# so config.toml's notify can name it instead of a version-pinned notify-chain.sh. A rev-1 shim still
+# launches every hook correctly; it just drops the notify payload, and this block replaces it on the
+# first hook after the upgrade — which is BEFORE the SessionStart self-repair rewrites config.toml,
+# because that repair runs inside a bundle this file exec's.
+NOMO_SHIM_REV=2
 
 # Numeric semver compare: true when $1 sorts strictly AFTER $2. A DELIBERATE TWIN of the function in
 # hook-shim.sh — run.sh has to stay a standalone file that works when nothing else on disk does, so it

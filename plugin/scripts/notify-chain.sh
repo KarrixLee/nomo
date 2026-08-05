@@ -1,6 +1,15 @@
 #!/bin/sh
 # notify-chain.sh — Codex `notify`-channel fan-out for the Nomo plugin.
 #
+# LEGACY AS OF v1.7.9 — KEPT ONLY FOR CONFIGS ALREADY POINTING AT IT. New wirings name
+# scripts/hook-shim.sh instead (`hook-shim.sh codex-notify [-- <orig…>]`, same argv contract minus the
+# leading .mjs path), because THIS file lives inside the version-pinned plugin directory: the host
+# deletes that directory on update, and Codex's `notify` setting is written into config.toml once at
+# pairing and never rewritten — so a value naming this path broke permanently at the user's first
+# plugin update. The fan-out below now lives in nomo_notify() in hook-shim.sh; the two must not drift
+# while any un-repaired config.toml can still reach this file. Self-repair (core/notify-wire's
+# repairNotifyWiring, run on Codex SessionStart) re-points those configs automatically.
+#
 # Codex runs the configured `notify` program with ONE JSON payload appended as the FINAL argument on
 # turn completion (fire-and-forget). This wrapper (a) fires the Nomo backstop, codex-notify.mjs, with
 # that payload — a "done" push for when the lifecycle hooks fail to fire (openai/codex#16430, #30835)

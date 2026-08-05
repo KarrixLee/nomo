@@ -1,4 +1,4 @@
-import { chmod, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
@@ -6,8 +6,9 @@ import {
   b64url, decryptBlob, deriveE2EKey, deriveRatchetKey, fromB64url, generateEphemeralKeyPair, sha256Hex,
 } from "../core/crypto";
 import {
-  buildPairURL, bytesToHex, decryptDeviceName, DEFAULT_WORKER_URL, pairStart, pairWait,
+  buildPairURL, bytesToHex, decryptDeviceName, DEFAULT_WORKER_URL, pairStart, pairWait, wireNotify,
 } from "./pair";
+import { parseNotifyFromToml } from "../core/notify-wire";
 import { completePendingPairing, PAIR_HTML_FILE, parsePendingConfig, PENDING_STASH_FILE, PLUGIN_VERSION } from "../core/shared";
 import { deriveCodeIkm } from "../core/pair-code";
 import { unpair } from "./unpair";
@@ -1193,5 +1194,97 @@ describe("statusCmd", () => {
       isAlive: () => false,
     })).toBe(0);
     expect(lines.join("\n")).toContain("Watchdog: not running");
+  });
+});
+
+// ---------- wire-notify ---------------------------------------------------------------------------
+//
+// THE BUG (fixed v1.7.9): wireNotify used to bake `<pluginRoot>/scripts/notify-chain.sh` and
+// `<pluginRoot>/dist/codex-notify.mjs` into config.toml. For a marketplace install that root is a
+// version-pinned cache directory the host deletes on update, and NOTHING ever rewrites config.toml —
+// so the Codex turn-completion backstop died permanently at the user's first plugin update. The value
+// now names the version-stable hook shim.
+
+describe("wireNotify writes a version-stable value", () => {
+  const dirs: string[] = [];
+  afterEach(async () => {
+    await Promise.all(dirs.splice(0).map((d) => rm(d, { recursive: true, force: true })));
+  });
+
+  const SKY = "/Applications/Some.app/Contents/MacOS/SkyComputerUseClient";
+
+  /** A throwaway home plus a fake INSTALLED plugin root, in the version-pinned shape a marketplace
+   *  install really has — so a leaked root is unmistakable in an assertion. */
+  async function scratch(): Promise<{ home: string; root: string; tomlPath: string; program: string; lines: string[]; print: (l: string) => void }> {
+    const home = await mkdtemp(join(tmpdir(), "nomo-wire-"));
+    dirs.push(home);
+    const root = join(home, ".codex/plugins/cache/nomo/nomo/1.7.9/plugin");
+    await mkdir(join(root, "scripts"), { recursive: true });
+    await writeFile(join(root, "scripts/hook-shim.sh"), await readFile(join(import.meta.dir, "../../plugin/scripts/hook-shim.sh"), "utf8"));
+    const lines: string[] = [];
+    return { home, root, tomlPath: join(home, "config.toml"), program: `${home}/.config/cc-status/hook-shim.sh`, lines, print: (l) => lines.push(l) };
+  }
+
+  const notifyOf = async (p: string): Promise<string[] | null> =>
+    parseNotifyFromToml(await readFile(p, "utf8")).value;
+
+  test("a fresh wiring contains no version-pinned segment anywhere", async () => {
+    const { home, root, tomlPath, program, lines, print } = await scratch();
+    await writeFile(tomlPath, 'model = "gpt"\n');
+
+    expect(await wireNotify({ tomlPath, pluginRoot: root, home, print })).toBe(0);
+    const value = await notifyOf(tomlPath);
+    expect(value).toEqual([program, "codex-notify"]);
+    expect(value!.join(" ")).not.toContain(root);
+    expect(value!.join(" ")).not.toContain("plugins/cache");
+    expect(value!.join(" ")).not.toContain("1.7.9");
+    expect(lines.join("\n")).toContain("Codex notify backstop wired");
+  });
+
+  test("an existing non-nomo notify is preserved after the separator", async () => {
+    const { home, root, tomlPath, program, print } = await scratch();
+    await writeFile(tomlPath, `notify = ${JSON.stringify([SKY, "turn-ended"])}\n`);
+
+    expect(await wireNotify({ tomlPath, pluginRoot: root, home, print })).toBe(0);
+    expect(await notifyOf(tomlPath)).toEqual([program, "codex-notify", "--", SKY, "turn-ended"]);
+  });
+
+  test("it INSTALLS the stable program it is about to name, if run.sh hasn't yet", async () => {
+    const { home, root, tomlPath, program, print } = await scratch();
+    await writeFile(tomlPath, "");
+    await expect(stat(program)).rejects.toThrow();
+
+    expect(await wireNotify({ tomlPath, pluginRoot: root, home, print })).toBe(0);
+    // Pointing config.toml — the file nothing ever revisits — at something absent would be the same
+    // class of bug all over again.
+    expect((await stat(program)).mode & 0o777).toBe(0o700);
+    expect(await readFile(program, "utf8"))
+      .toBe(await readFile(join(root, "scripts/hook-shim.sh"), "utf8"));
+  });
+
+  test("idempotent: a second run reports no change and rewrites nothing", async () => {
+    const { home, root, tomlPath, print } = await scratch();
+    await writeFile(tomlPath, `notify = ${JSON.stringify([SKY, "turn-ended"])}\n`);
+    expect(await wireNotify({ tomlPath, pluginRoot: root, home, print })).toBe(0);
+    const after = await readFile(tomlPath, "utf8");
+    const mtime = (await stat(tomlPath)).mtimeMs;
+    await new Promise((r) => setTimeout(r, 20));
+
+    const lines: string[] = [];
+    expect(await wireNotify({ tomlPath, pluginRoot: root, home, print: (l) => lines.push(l) })).toBe(0);
+    expect(lines.join("\n")).toContain("already wired");
+    expect(await readFile(tomlPath, "utf8")).toBe(after);
+    expect((await stat(tomlPath)).mtimeMs).toBe(mtime);
+  });
+
+  test("the manual-fix line it prints on refusal is also version-stable", async () => {
+    const { home, root, tomlPath, program } = await scratch();
+    await writeFile(tomlPath, 'notify = [\n  "multi",\n  "line",\n]\n');
+    const lines: string[] = [];
+
+    expect(await wireNotify({ tomlPath, pluginRoot: root, home, print: (l) => lines.push(l) })).toBe(1);
+    expect(lines.join("\n")).toContain(program);
+    expect(lines.join("\n")).not.toContain("notify-chain.sh");
+    expect(lines.join("\n")).not.toContain(root);
   });
 });
