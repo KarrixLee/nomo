@@ -103,7 +103,7 @@ import { appendFileSync, existsSync, readFileSync, statSync, truncateSync } from
 import { execFileSync, spawn } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "1.7.6";
+var PLUGIN_VERSION = "1.7.7";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -7065,6 +7065,7 @@ async function settlePendingPlanPickerDone(config, path, sessionId, snapshot, no
   const envelope = await buildDoneEnvelope(sessionId, snapshot, now, config.e2eKey, "codex", at, dbg);
   const next = {
     ...fresh,
+    ts: now,
     lastEvent: "done",
     sentDone: true,
     donePending: true,
@@ -8140,10 +8141,19 @@ async function correctPendingDone(config, path, sessionId, record, now, deps = {
         await writeRecord(path, write);
         clearDoneAttempts(sessionId);
       } catch {}
+      traceFocus(deps, { event: "pending-done", sessionId, outcome: "capped", attempts, delivered: false });
       return "pending";
     }
     const at = typeof record.ts === "number" && Number.isFinite(record.ts) ? Math.floor(record.ts / 1000) : undefined;
     const outcome = await post(await buildDoneEnvelope(sessionId, record, clock(), config.e2eKey, agent, at));
+    traceFocus(deps, {
+      event: "pending-done",
+      sessionId,
+      outcome,
+      attempts,
+      delivered: outcome === "delivered",
+      at
+    });
     if (outcome === "revoked")
       return "revoked";
     if (outcome === "delivered") {
@@ -8168,7 +8178,7 @@ async function correctPendingDone(config, path, sessionId, record, now, deps = {
     return "uncorrected";
   }
 }
-var RETIRE_AFTER_MS = 3600000;
+var RETIRE_AFTER_MS = PLAN_PICKER_PENDING_MAX_MS + 15 * 60000;
 function isRetireEligible(record, now) {
   if (typeof record.retiredAt === "number" && Number.isFinite(record.retiredAt))
     return false;
@@ -8194,6 +8204,15 @@ async function retireDoneStale(config, path, sessionId, record, now, deps = {}) 
       return null;
     }
   };
+  const breadcrumb = (outcome, tuiPid) => traceFocus(deps, {
+    event: "retire",
+    reason: "idle-done",
+    sessionId,
+    recordTs: record.ts,
+    ageMs: typeof record.ts === "number" ? now - record.ts : undefined,
+    tuiPid,
+    outcome
+  });
   try {
     if (!isRetireEligible(record, now))
       return "skip";
@@ -8211,14 +8230,20 @@ async function retireDoneStale(config, path, sessionId, record, now, deps = {}) 
       }
     }
     const before = await freshRecord();
-    if (before && (recordMovedSince(record, before) || !isRetireEligible(before, now)))
+    if (before && (recordMovedSince(record, before) || !isRetireEligible(before, now))) {
+      breadcrumb("skip-woken", tuiPid);
       return "skip";
+    }
     const outcome = await post(buildEndEnvelope(sessionId, now, record, Math.floor(record.ts / 1000)));
-    if (outcome === "revoked")
+    if (outcome === "revoked") {
+      breadcrumb("revoked", tuiPid);
       return "revoked";
+    }
     const after = await freshRecord();
-    if (after && recordMovedSince(record, after))
+    if (after && recordMovedSince(record, after)) {
+      breadcrumb("skip-woken-post", tuiPid);
       return "skip";
+    }
     heartbeatAt.delete(sessionId);
     clearDoneAttempts(sessionId);
     if (record.agent === "codex" && tuiPid !== undefined) {
@@ -8234,7 +8259,9 @@ async function retireDoneStale(config, path, sessionId, record, now, deps = {}) 
     } else {
       await deleteRecord(path);
     }
-    return outcome === "delivered" ? "retired" : "retired-offline";
+    const verdict = outcome === "delivered" ? "retired" : "retired-offline";
+    breadcrumb(verdict, tuiPid);
+    return verdict;
   } catch {
     return "skip";
   }
@@ -8896,6 +8923,7 @@ export {
   acceptLanCommand,
   acceptLanAnswer,
   WAITING_HEARTBEAT_AFTER_MS,
+  RETIRE_AFTER_MS,
   PLAN_PICKER_VERIFY_MAX_MS,
   PLAN_PICKER_RECENT_DONE_MS,
   PLAN_PICKER_PENDING_MAX_MS,

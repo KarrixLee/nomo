@@ -17,7 +17,7 @@ import {
   codexBridgeIsDown, correctPendingApproval, correctPendingDone, correctPlanPickerVerification, correctResolvedPlanPicker, createBridgeSupervisor, discoverLiveSessions, drainCommands, effectiveDoneAttempts, extractCommands, goneStrikeShouldTeardown,
   enforceWatchdogOwnership, hasInterruptMarker, IDLE_GRACE_MS, isClaudeIdleReapEligible, isRetireEligible, isRightfulWatchdogOwner, lastTurnLine, PAIRING_TTL_MS, pendingDoneRetryWrite,
   pendingDoneSettleWrite, pendingPairingExpired, planPickerPendingExpired, PLAN_PICKER_PENDING_MAX_MS,
-  PLAN_PICKER_RECENT_DONE_MS, PLAN_PICKER_VERIFY_MAX_MS,
+  PLAN_PICKER_RECENT_DONE_MS, PLAN_PICKER_VERIFY_MAX_MS, RETIRE_AFTER_MS,
   buildWorkingEnvelope, postOutcomeForStatus, provisionalsCoveredByReal, reconcileProvisionalsSweep, recordMovedSince, resetCommandState, resetDoneAttemptMemory, retireDoneStale,
   setCodexBridgeDown, shouldHeartbeat, shouldIdleProvisionalCheck,
   heartbeatKind, isWaitingSession,
@@ -373,6 +373,33 @@ describe("correctPendingDone (re-POST a done whose delivery was never confirmed)
     expect(shouldPendingDoneCheck(last)).toBe(false);
     // The capped record is the terminal state the retire net keys on, so the row still resolves offline.
     expect(isRetireEligible({ ...last, ts: NOW - 7_200_000 }, NOW)).toBe(true);
+  });
+
+  // "Did this done ever reach the worker?" must be answerable from the log alone — a settled record on
+  // disk says nothing about delivery, and the retire net later deletes the row entirely.
+  test("every attempt leaves a delivery breadcrumb, including the silent cap", async () => {
+    const traces: Record<string, unknown>[] = [];
+    const trace = (e: object) => { traces.push(e as Record<string, unknown>); };
+    let last: SessionRecord = owed();
+    for (let i = 0; i < 20; i++) {
+      await correctPendingDone(cfg(), "/tmp/s.json", "s", last, NOW, {
+        post: async () => "failed" as PostOutcome, writeRecord: async (_p, r) => { last = r; }, trace,
+      });
+      if (last.donePending !== true) break;
+    }
+    expect(traces[0]).toMatchObject({
+      event: "pending-done", sessionId: "s", outcome: "failed", delivered: false, attempts: 0,
+    });
+    // The cap is the ONLY path that stops POSTing without ever delivering — it must not be silent.
+    expect(traces.at(-1)).toMatchObject({ event: "pending-done", outcome: "capped", delivered: false });
+
+    traces.length = 0;
+    await correctPendingDone(cfg(), "/tmp/s.json", "s2", owed(), NOW, {
+      post: async () => "delivered" as PostOutcome, writeRecord: async () => {}, trace,
+    });
+    expect(traces).toEqual([expect.objectContaining({
+      event: "pending-done", sessionId: "s2", outcome: "delivered", delivered: true,
+    })]);
   });
 
   test("a revoke bubbles up so the loop can tear the pairing down", async () => {
@@ -832,8 +859,18 @@ describe("reconcileProvisionalsSweep (ends + deletes a covered provisional)", ()
 // `at`, and its local record is deleted — freeing the cap slot. Never touches working/needsAttention
 // (they keep heartbeating), never codex (discovery would re-surface it).
 describe("isRetireEligible (a DONE session past the 1 h real-event horizon)", () => {
-  const RETIRE_MS = 3_600_000; // must mirror RETIRE_AFTER_MS in cc-watchdog.ts
+  const RETIRE_MS = RETIRE_AFTER_MS; // derived, not mirrored — see the born-expired guard test below
   const now = 100_000_000;
+
+  // REGRESSION GUARD (born-expired trap). RETIRE_AFTER_MS and PLAN_PICKER_PENDING_MAX_MS were both
+  // independently written as exactly 1 h. settlePendingPlanPickerDone settles a pending picker AT its
+  // TTL, so the resulting done was already past the retire horizon the instant it was written: the next
+  // sweep (~47 s later in the field incident) posted a blob-less op:end and the worker hard-deleted the
+  // row. The retire horizon must stay STRICTLY ABOVE the picker TTL so no settle can be born expired.
+  test("the retire horizon sits strictly above the plan-picker hard TTL (no born-expired settle)", () => {
+    expect(RETIRE_AFTER_MS).toBeGreaterThan(PLAN_PICKER_PENDING_MAX_MS);
+    expect(RETIRE_AFTER_MS - PLAN_PICKER_PENDING_MAX_MS).toBeGreaterThanOrEqual(15 * 60_000);
+  });
 
   test("a done Claude session idle ≥1 h → eligible; just under → not", () => {
     expect(isRetireEligible(rec({ op: "done", lastEvent: "done", ts: now - RETIRE_MS }), now)).toBe(true);
@@ -873,7 +910,7 @@ describe("isRetireEligible (a DONE session past the 1 h real-event horizon)", ()
 
 describe("retireDoneStale (blob-less op:end with frozen `at` + record delete)", () => {
   const NOW = 100_000_000;
-  const RETIRE_MS = 3_600_000;
+  const RETIRE_MS = RETIRE_AFTER_MS;
   const done = (over: Partial<SessionRecord> = {}): SessionRecord =>
     rec({ op: "done", lastEvent: "done", sentDone: true, blob: "DONEBLOB", ts: NOW - RETIRE_MS, ...over });
 
@@ -891,6 +928,45 @@ describe("retireDoneStale (blob-less op:end with frozen `at` + record delete)", 
     expect(posts[0].at).toBe(Math.floor(record.ts / 1000)); // FROZEN real-last-event, not NOW
     expect(posts[0].at).not.toBe(Math.floor(NOW / 1000));
     expect(deletes).toEqual(["/tmp/s.json"]);
+  });
+
+  // Retirement deletes the row on BOTH sides, so without a breadcrumb a vanished session is
+  // indistinguishable from one that was never sent — which is what made the born-expired plan-picker
+  // incident invisible in the trace.
+  test("every post-eligibility exit leaves one retire breadcrumb (age + owner + outcome)", async () => {
+    const traces: Record<string, unknown>[] = [];
+    const trace = (e: object) => { traces.push(e as Record<string, unknown>); };
+    const record = done();
+    expect(await retireDoneStale(cfg(), "/tmp/s.json", "s", record, NOW, {
+      post: async () => "delivered" as PostOutcome, deleteRecord: async () => {}, trace,
+    })).toBe("retired");
+    expect(traces[0]).toMatchObject({
+      event: "retire", reason: "idle-done", sessionId: "s", recordTs: record.ts,
+      ageMs: RETIRE_MS, outcome: "retired",
+    });
+
+    // an undelivered end still retires locally…
+    expect(await retireDoneStale(cfg(), "/tmp/s.json", "s", done(), NOW, {
+      post: async () => "failed" as PostOutcome, deleteRecord: async () => {}, trace,
+    })).toBe("retired-offline");
+    expect(traces[1]).toMatchObject({ event: "retire", outcome: "retired-offline" });
+
+    // …a Codex row that keeps its live TUI records the owner pid it left behind…
+    expect(await retireDoneStale(cfg(), "/tmp/s.json", "s", done({ agent: "codex", tuiPid: 5150 }), NOW, {
+      post: async () => "delivered" as PostOutcome, writeRecord: async () => {}, pidAlive: () => true, trace,
+    })).toBe("retired");
+    expect(traces[2]).toMatchObject({ event: "retire", outcome: "retired", tuiPid: 5150 });
+
+    // …and a session the user woke mid-sweep says so instead of vanishing silently.
+    expect(await retireDoneStale(cfg(), "/tmp/s.json", "s", done(), NOW, {
+      post: async () => { throw new Error("must not post a woken session"); },
+      readRecord: async () => rec({ lastEvent: "working", op: "update", ts: NOW }), trace,
+    })).toBe("skip");
+    expect(traces[3]).toMatchObject({ event: "retire", outcome: "skip-woken" });
+
+    // The not-eligible early return stays SILENT (it is every kept session on every sweep).
+    expect(await retireDoneStale(cfg(), "/tmp/s.json", "s", done({ ts: NOW }), NOW, { trace })).toBe("skip");
+    expect(traces).toHaveLength(4);
   });
 
   test("done + 59 min → NOT eligible: no POST, no delete (the heartbeat keeps it)", async () => {
@@ -1698,6 +1774,70 @@ describe("correctResolvedPlanPicker (Mac answer clears only the marked Plan wait
       state: async () => "exited",
       post: async () => { throw new Error("must not post working"); },
     })).toBe("uncorrected");
+  });
+});
+
+// --- the born-expired settle (a TTL-settled picker was retired seconds after it settled) ----------
+//
+// FIELD INCIDENT: a Codex turn ended into the plan-picker verification pending state and sat there until
+// the hard TTL (PLAN_PICKER_PENDING_MAX_MS, 1 h) settled it to done. The settle spread the fresh record
+// and flipped op/lastEvent, but never re-stamped `ts` — and RETIRE_AFTER_MS was the SAME 1 h — so the
+// settled done was ALREADY past the retire horizon the instant it was written. The next sweep (~47 s
+// later) posted a blob-less op:end and the worker hard-deleted the row: the done lived seconds, not an
+// hour. The fix splits the two clocks — the retention clock (record.ts) restarts at the settle, the
+// DISPLAY clock (the blob's `at`) stays frozen at the original event time.
+describe("a TTL-settled plan picker starts a FRESH retention clock (born-expired regression)", () => {
+  const PENDED_AT = 50_000_000;                                    // the real event time (turn end)
+  const SETTLED_AT = PENDED_AT + PLAN_PICKER_PENDING_MAX_MS;       // the hard TTL fires exactly here
+  const SWEEP_AFTER_MS = 50_000;                                   // the incident's next sweep, ~47 s later
+
+  const pending = (over: Partial<SessionRecord> = {}): SessionRecord => rec({
+    agent: "codex", transcript: "/tmp/rollout.jsonl", lastEvent: "needsAttention",
+    op: "update", prio: 1, sentDone: false, pendingPlanPicker: true,
+    blob: "PENDING-PLAN", title: "Implement the plan", pairingId: "p",
+    ts: PENDED_AT, planPickerPendingSince: PENDED_AT, ...over,
+  });
+
+  /** Drive the real TTL settle through the public net and hand back the settled record + the posts. */
+  const settleAtTtl = async () => {
+    let current = pending();
+    const posts: Record<string, unknown>[] = [];
+    expect(await correctResolvedPlanPicker(cfg(), "/tmp/s.json", "s", current, {
+      state: async () => { throw new Error("TTL must precede rollout classification"); },
+      readRecord: async () => current,
+      writeRecord: async (_path, next) => { current = next; },
+      post: async (body) => { posts.push(body as Record<string, unknown>); return "delivered"; },
+      now: () => SETTLED_AT,
+    })).toBe("corrected");
+    expect(posts[0]).toMatchObject({ op: "done", prio: 0 });
+    return { settled: current, posts };
+  };
+
+  test("the settled done re-stamps ts and SURVIVES the next sweep (the exact incident)", async () => {
+    const { settled } = await settleAtTtl();
+    expect(settled).toMatchObject({ op: "done", lastEvent: "done", planPickerSettled: true });
+    expect(settled.ts).toBe(SETTLED_AT);
+    expect(isRetireEligible(settled, SETTLED_AT)).toBe(false);
+    expect(isRetireEligible(settled, SETTLED_AT + SWEEP_AFTER_MS)).toBe(false);
+    // The pre-fix row's age on that same sweep had ALREADY met the old 1 h horizon (both constants were
+    // 1 h and ts was never re-stamped) — which is exactly why it was retired 47 s after settling…
+    expect((SETTLED_AT + SWEEP_AFTER_MS) - PENDED_AT).toBeGreaterThan(PLAN_PICKER_PENDING_MAX_MS);
+    // …and the two fixes are now independent: even an un-re-stamped record is saved by the F2 margin.
+    expect(isRetireEligible({ ...settled, ts: PENDED_AT }, SETTLED_AT + SWEEP_AFTER_MS)).toBe(false);
+  });
+
+  test("it becomes retire-eligible only a full RETIRE_AFTER_MS past the SETTLE", async () => {
+    const { settled } = await settleAtTtl();
+    expect(isRetireEligible(settled, SETTLED_AT + RETIRE_AFTER_MS - 1)).toBe(false);
+    expect(isRetireEligible(settled, SETTLED_AT + RETIRE_AFTER_MS)).toBe(true);
+  });
+
+  test("the blob's `at` stays FROZEN at the original event time (honest display age)", async () => {
+    const { posts } = await settleAtTtl();
+    const blob = await decryptBlob(KEY, posts[0].blob as string) as Record<string, unknown>;
+    expect(blob.status).toBe("done");
+    expect(blob.at).toBe(Math.floor(PENDED_AT / 1000));       // the turn really ended an hour ago…
+    expect(blob.at).not.toBe(Math.floor(SETTLED_AT / 1000));  // …the retention re-stamp never reaches it
   });
 });
 
@@ -2677,7 +2817,7 @@ describe("stale-snapshot guard (a prompt landing mid-POST must never be clobbere
 // taken before the sweep's earlier awaits — so a session woken mid-sweep lost its reap/heartbeat handle.
 describe("retireDoneStale re-reads before it deletes (a woken session is never retired out from under itself)", () => {
   const NOW = 100_000_000;
-  const RETIRE_MS = 3_600_000;
+  const RETIRE_MS = RETIRE_AFTER_MS;
   const done = (over: Partial<SessionRecord> = {}): SessionRecord =>
     rec({ op: "done", lastEvent: "done", sentDone: true, blob: "DONEBLOB", ts: NOW - RETIRE_MS, ...over });
 

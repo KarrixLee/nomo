@@ -440,6 +440,16 @@ async function settlePendingPlanPickerDone(
   const envelope = await buildDoneEnvelope(sessionId, snapshot, now, config.e2eKey, "codex", at, dbg) as Record<string, unknown>;
   const next: SessionRecord = {
     ...fresh,
+    // TWO CLOCKS, DELIBERATELY SPLIT.
+    //  - DISPLAY clock: the blob's `at` above is FROZEN at snapshot.ts (the original event time) and is
+    //    computed BEFORE this write, so the phone keeps showing the honest activity age of the turn that
+    //    actually ended — the re-stamp below can never reach it.
+    //  - RETENTION clock: record.ts is what isRetireEligible ages, so it must restart HERE. Before this,
+    //    a picker settled by the hard TTL (PLAN_PICKER_PENDING_MAX_MS, 1 h) inherited a ts that was already
+    //    1 h old, and RETIRE_AFTER_MS was the SAME 1 h — so the settled done was BORN retire-eligible and
+    //    the very next sweep (~47 s later in the field incident) posted a blob-less op:end that hard-deleted
+    //    the row worker-side. The done lived seconds instead of its intended hour.
+    ts: now,
     lastEvent: "done",
     sentDone: true,
     donePending: true,
@@ -1149,8 +1159,9 @@ export type FocusTraceResult =
   | "osascript-failed"  // AppleScript refused (TCC denial / timeout / app error)
   | "unsupported";      // not macOS, unknown terminal app, or an agent with no locate seam
 
-/** Best-effort trace with the same argv guard tracePicker uses: pure unit calls run inside `bun test`
- *  with the production HOME visible and must never pollute the user's live trace. */
+/** The module's generic best-effort trace, with the same argv guard tracePicker uses: pure unit calls run
+ *  inside `bun test` with the production HOME visible and must never pollute the user's live trace. Named
+ *  for its first caller; also carries the "lan", "retire" and "pending-done" breadcrumbs. */
 function traceFocus(deps: { trace?: (event: object) => void }, event: object): void {
   if (deps.trace) {
     try { deps.trace(event); } catch { /* diagnostics only */ }
@@ -2282,6 +2293,9 @@ export interface PendingDoneDeps {
    *  null (absent/unreadable) falls back to the pre-guard snapshot write. */
   readRecord?: (path: string) => Promise<SessionRecord | null>;
   now?: () => number;
+  /** Diagnostics seam. Defaults to the session trace (argv-guarded), so "did this done ever reach the
+   *  worker?" is answerable from the log instead of inferred from the row's disappearance. */
+  trace?: (event: object) => void;
 }
 
 /** The undelivered-done reconcile for one tracked session. Gated by shouldPendingDoneCheck; the session
@@ -2336,12 +2350,19 @@ export async function correctPendingDone(
       } catch {
         // Settle didn't land → keep the in-memory count so the cap holds (see correctInterrupt's note).
       }
+      // The done NEVER reached the worker and never will: only the local record now says "done".
+      traceFocus(deps, { event: "pending-done", sessionId, outcome: "capped", attempts, delivered: false });
       return "pending";
     }
     // record.ts is the Stop's own write time; a corrupt record with no numeric ts simply omits `at`
     // (the phone then falls back to its own receipt time, as it does for every pre-`at` frame).
     const at = typeof record.ts === "number" && Number.isFinite(record.ts) ? Math.floor(record.ts / 1000) : undefined;
     const outcome = await post(await buildDoneEnvelope(sessionId, record, clock(), config.e2eKey, agent, at));
+    // One line per attempt, whatever happens: the retry ladder is otherwise invisible, and "did this done
+    // ever reach the worker" is exactly the question a vanished row raises.
+    traceFocus(deps, {
+      event: "pending-done", sessionId, outcome, attempts, delivered: outcome === "delivered", at,
+    });
     if (outcome === "revoked") return "revoked"; // pairing gone → bubble up so the loop can tear down
     if (outcome === "delivered") {
       // RE-READ before writing: the POST above took up to 2 s, and a user prompt landing in that window
@@ -2390,14 +2411,20 @@ export async function correctPendingDone(
 // heartbeating exactly as before.
 
 /** How long a DONE session may sit event-idle (its last REAL event = record.ts — a heartbeat never
- *  rewrites it) before the watchdog retires it with a blob-less op:end. WHY 1 h: it matches the phone's
+ *  rewrites it) before the watchdog retires it with a blob-less op:end. WHY ~1 h: it tracks the phone's
  *  own display-age filter (the frozen blob `at` ages a done row
  *  out of view at ~the same horizon), and it sits FAR above both HEARTBEAT_AFTER_MS (5 min) and the
  *  worker's one-hour eviction — so retirement is always a DELIBERATE, settled decision, never racing a
  *  session the hooks are still keeping fresh nor one the worker is about to evict anyway. Deliberately
  *  well below SESSION_STALE_MS (24 h): retirement fires FIRST for done rows, and the 24 h stale cap stays
- *  the backstop for NON-done sessions (e.g. a needsAttention prompt abandoned for a full day). */
-const RETIRE_AFTER_MS = 3_600_000; // 1 h
+ *  the backstop for NON-done sessions (e.g. a needsAttention prompt abandoned for a full day).
+ *  DERIVED, NEVER LITERAL: it must stay STRICTLY GREATER than PLAN_PICKER_PENDING_MAX_MS (the plan-picker
+ *  hard TTL, declared far above this line). Both were independently written as 1 h, and that collision was
+ *  a real defect: settlePendingPlanPickerDone settles a picker exactly at its TTL, so the resulting done
+ *  was BORN past this horizon and the next sweep retired it (blob-less op:end → the worker deletes the
+ *  row) seconds later. The settle now re-stamps ts, and this margin makes the trap unreachable even if a
+ *  future pended-then-settled path forgets to. */
+export const RETIRE_AFTER_MS = PLAN_PICKER_PENDING_MAX_MS + 15 * 60_000; // 1 h 15 min
 
 /** Whether a KEPT session is DONE past the retire horizon — the predicate the retire net keys on. True
  *  iff it is a real session or Codex provisional (never a non-Codex provisional / existing owner marker),
@@ -2429,6 +2456,9 @@ export interface RetireDeps {
    *  session the user just woke up (a prompt landing mid-sweep) is never retired out from under its own
    *  hooks. Defaults to a real read; null (absent/unreadable) keeps the pre-guard behavior. */
   readRecord?: (path: string) => Promise<SessionRecord | null>;
+  /** Diagnostics seam. Defaults to the session trace (argv-guarded). Retirement DELETES the row on both
+   *  sides, so without a breadcrumb a vanished session is indistinguishable from one that was never sent. */
+  trace?: (event: object) => void;
 }
 
 /** The idle-done retire net for one kept session. Gated by isRetireEligible, then it POSTs a
@@ -2455,6 +2485,18 @@ export async function retireDoneStale(
   const freshRecord = async (): Promise<SessionRecord | null> => {
     try { return await reread(path); } catch { return null; }
   };
+  // Every line that leaves this net AFTER eligibility is traced (the not-eligible early return is not —
+  // that is every kept session on every sweep). One breadcrumb answers "who deleted this row, how old was
+  // it, and did the end frame land": the born-expired plan-picker incident was invisible in the log.
+  const breadcrumb = (outcome: string, tuiPid?: number) => traceFocus(deps, {
+    event: "retire",
+    reason: "idle-done",
+    sessionId,
+    recordTs: record.ts,
+    ageMs: typeof record.ts === "number" ? now - record.ts : undefined,
+    tuiPid,
+    outcome,
+  });
   try {
     if (!isRetireEligible(record, now)) return "skip";
     let tuiPid: number | undefined;
@@ -2475,15 +2517,24 @@ export async function retireDoneStale(
     // record delete would be a lie (deleting the record also orphans the live session: no reap file, no
     // heartbeat). A null re-read (absent/unreadable) keeps the pre-guard behavior.
     const before = await freshRecord();
-    if (before && (recordMovedSince(record, before) || !isRetireEligible(before, now))) return "skip";
+    if (before && (recordMovedSince(record, before) || !isRetireEligible(before, now))) {
+      breadcrumb("skip-woken", tuiPid);
+      return "skip";
+    }
     // record.ts is guaranteed a number by isRetireEligible → floor it into epoch seconds for the frozen `at`.
     const outcome = await post(buildEndEnvelope(sessionId, now, record, Math.floor(record.ts / 1000)));
-    if (outcome === "revoked") return "revoked"; // pairing gone → bubble up; leave the record for teardown
+    if (outcome === "revoked") {
+      breadcrumb("revoked", tuiPid);
+      return "revoked"; // pairing gone → bubble up; leave the record for teardown
+    }
     // …and again immediately before the DELETE: the POST above took up to 2 s, which is plenty for a
     // prompt to land. The end frame we just sent is superseded by that hook's own frame; the RECORD must
     // survive so the woken session keeps its reap/heartbeat handle.
     const after = await freshRecord();
-    if (after && recordMovedSince(record, after)) return "skip";
+    if (after && recordMovedSince(record, after)) {
+      breadcrumb("skip-woken-post", tuiPid);
+      return "skip";
+    }
     heartbeatAt.delete(sessionId); // dropping the row → drop its heartbeat-throttle entry (like the sweep's delete)
     clearDoneAttempts(sessionId);
     if (record.agent === "codex" && tuiPid !== undefined) {
@@ -2502,7 +2553,9 @@ export async function retireDoneStale(
     } else {
       await deleteRecord(path);
     }
-    return outcome === "delivered" ? "retired" : "retired-offline";
+    const verdict = outcome === "delivered" ? "retired" : "retired-offline";
+    breadcrumb(verdict, tuiPid);
+    return verdict;
   } catch {
     return "skip";
   }
