@@ -25,14 +25,15 @@
 // globalThis.crypto only.
 
 import { spawn } from "node:child_process";
-import { readFile, unlink } from "node:fs/promises";
+import { constants as fsConstants } from "node:fs";
+import { access, mkdir, readFile, unlink } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   atomicWrite, CC_DIR, codexHome, completePendingPairing, ensureWatchdog, PAIR_HTML_FILE, PAIR_HTML_PATH,
   parseConfig, parsePendingConfig,
 } from "../core/shared";
-import { parseNotifyFromToml, replaceNotifyInToml, wireNotifyArray } from "../core/notify-wire";
+import { nomoNotifyProgram, parseNotifyFromToml, replaceNotifyInToml, wireNotifyArray } from "../core/notify-wire";
 import { b64url, generateEphemeralKeyPair, sha256Hex } from "../core/crypto";
 import { deriveCodeIkm, formatCodeString, randomCodeWords } from "../core/pair-code";
 import { renderPairPage } from "../core/pair-page";
@@ -477,13 +478,34 @@ export interface WireNotifyDeps {
   /** Codex's config file; defaults to $CODEX_HOME/config.toml. Tests point at a temp file. */
   tomlPath?: string;
   /** The installed plugin root (the dir holding scripts/ + dist/). Defaults to this bundle's parent
-   *  (dist/pair.mjs → <root>/dist → <root>); the skill passes the resolved <ROOT> explicitly. */
+   *  (dist/pair.mjs → <root>/dist → <root>); the skill passes the resolved <ROOT> explicitly. NO LONGER
+   *  part of the value written to config.toml (see the stable-path note in core/notify-wire) — it is
+   *  now only the SOURCE the version-stable shim is copied from when it isn't installed yet. */
   pluginRoot?: string;
+  /** The home whose stable shim path gets written; defaults to $HOME. Tests point at a temp home. */
+  home?: string;
 }
 
 /** This bundle's plugin root: dist/pair.mjs lives at `<root>/dist/`, so the parent dir is the root. */
 function pluginRootFromHere(): string {
   return dirname(dirname(fileURLToPath(import.meta.url)));
+}
+
+/** Make sure the stable notify program actually exists before config.toml is pointed at it.
+ *  Normally redundant — run.sh installs the shim on every invocation, and this command is launched
+ *  through run.sh — but config.toml is the one file that never gets a second chance, so a copy that
+ *  costs one stat on the happy path is worth it. Never overwrites an existing shim (a newer one may
+ *  already be there); run.sh owns the rev/stamp discipline. Best-effort throughout. */
+async function ensureNotifyProgram(root: string, program: string): Promise<boolean> {
+  try {
+    await access(program, fsConstants.X_OK);
+    return true;
+  } catch { /* not installed yet — fall through and copy it */ }
+  try {
+    await mkdir(dirname(program), { recursive: true, mode: 0o700 });
+    await atomicWrite(program, await readFile(join(root, "scripts", "hook-shim.sh"), "utf8"), 0o700);
+    return true;
+  } catch { return false; }
 }
 
 /** Wire (or refresh) the Codex `notify` backstop in config.toml. Idempotent — safe on every pairing.
@@ -492,6 +514,8 @@ export async function wireNotify(deps: WireNotifyDeps = {}): Promise<number> {
   const print = deps.print ?? ((line: string) => console.log(line));
   const tomlPath = deps.tomlPath ?? join(codexHome(), "config.toml");
   const root = deps.pluginRoot ?? pluginRootFromHere();
+  const program = nomoNotifyProgram(deps.home ?? process.env.HOME ?? "");
+  const installed = await ensureNotifyProgram(root, program);
 
   let toml = "";
   try { toml = await readFile(tomlPath, "utf8"); } catch { toml = ""; /* no config.toml yet */ }
@@ -500,10 +524,10 @@ export async function wireNotify(deps: WireNotifyDeps = {}): Promise<number> {
     // A notify assignment exists but isn't a single-line string array — rewriting blind could corrupt
     // the user's config, so refuse and hand back the exact value to set.
     print(`Couldn't safely parse the existing notify line in ${tomlPath} — set it manually to:`);
-    print(`notify = ["${root}/scripts/notify-chain.sh", "${root}/dist/codex-notify.mjs", "--", <your original notify command…>]`);
+    print(`notify = ["${program}", "codex-notify", "--", <your original notify command…>]`);
     return 1;
   }
-  const next = wireNotifyArray(parsed.value ?? undefined, root);
+  const next = wireNotifyArray(parsed.value ?? undefined, program);
   if (parsed.value && next.length === parsed.value.length && next.every((v, i) => v === parsed.value![i])) {
     print("Codex notify backstop already wired — no change.");
     return 0;
@@ -518,6 +542,10 @@ export async function wireNotify(deps: WireNotifyDeps = {}): Promise<number> {
   print(preserved
     ? "Codex notify backstop wired (your original notify command is preserved and still runs)."
     : "Codex notify backstop wired.");
+  // Only ever a warning: the shim is installed by run.sh on the next hook that fires, so a machine
+  // that couldn't be written to right now still self-heals. Saying nothing would be worse than an
+  // extra line if the state dir is genuinely unwritable.
+  if (!installed) print(`Note: ${program} isn't installed yet — it appears on the next Codex hook.`);
   return 0;
 }
 

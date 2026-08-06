@@ -18,6 +18,9 @@ const HKDF_INFO = textEncoder.encode("nomo-cc-e2e-v1");
 /** Domain tag for the pairing-v3 ECDH ratchet HKDF info (concatenated with the pairingId). FROZEN
  *  cross-platform — must match the iPhone app byte-for-byte. */
 const RATCHET_INFO_PREFIX = "nomo-cc-ratchet-v1|";
+/** Domain tag for the LAN transport's OUTER seal key (concatenated with the pairingId). FROZEN
+ *  cross-platform — the iPhone's CCLanClient derives the identical key. See deriveLanKey. */
+const LAN_INFO_PREFIX = "nomo-lan-v1|";
 /** P-256 ECDH parameters, reused by every keypair/derive call below. */
 const ECDH_P256 = { name: "ECDH", namedCurve: "P-256" } as const;
 
@@ -51,6 +54,36 @@ export async function deriveE2EKey(qrSecret: Uint8Array, phoneNonce: Uint8Array)
   const ikm = await crypto.subtle.importKey("raw", qrSecret, "HKDF", false, ["deriveBits"]);
   const bits = await crypto.subtle.deriveBits(
     { name: "HKDF", hash: "SHA-256", salt: phoneNonce, info: HKDF_INFO },
+    ikm,
+    256,
+  );
+  return new Uint8Array(bits);
+}
+
+/** The LAN transport's OUTER seal key:
+ *
+ *    K_lan = HKDF-SHA256(ikm = e2eKey, salt = <empty>, info = "nomo-lan-v1|" + pairingId)   // 32 B
+ *
+ *  Derived on BOTH sides from material that already exists (the pairing's durable `e2eKey`), so the
+ *  LAN channel exchanges and persists nothing new, and a re-pair rotates it automatically. The salt is
+ *  deliberately EMPTY (a zero-length Uint8Array — HKDF then extracts with a hashLen zero block, which
+ *  is what CryptoKit's `HKDF.deriveKey(salt: Data())` does), so the only domain separation is `info`.
+ *
+ *  WHY a separate key at all: every LAN request body is sealed under K_lan while every worker-path
+ *  ciphertext is sealed under e2eKey, so a ciphertext lifted off one channel is undecryptable on the
+ *  other — cross-channel replay is structurally dead rather than merely detected. It also hides the
+ *  inner envelope's metadata (op, requestIds, pairingId) from a Wi-Fi observer.
+ *
+ *  FROZEN cross-platform contract — the vector lives in cc-e2e-test-vectors.json (`lan`). */
+export async function deriveLanKey(e2eKey: Uint8Array, pairingId: string): Promise<Uint8Array> {
+  const ikm = await crypto.subtle.importKey("raw", e2eKey, "HKDF", false, ["deriveBits"]);
+  const bits = await crypto.subtle.deriveBits(
+    {
+      name: "HKDF",
+      hash: "SHA-256",
+      salt: new Uint8Array(0),
+      info: textEncoder.encode(LAN_INFO_PREFIX + pairingId),
+    },
     ikm,
     256,
   );

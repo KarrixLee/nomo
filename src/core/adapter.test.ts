@@ -405,6 +405,36 @@ describe("codexDiscoverLive (full pipeline with injected ps/lsof)", () => {
     expect(discovered.map((d) => d.pid)).toEqual([33198]);
   });
 
+  test("a retired-owner marker keeps discovery from recreating its still-open TUI", async () => {
+    const known = [{
+      pid: 16029, tuiPid: 16029, retiredAt: 123,
+      machine: "m", label: "proj", ts: 100, agent: "codex",
+    } as SessionRecord];
+    const discovered = await codexDiscoverLive(known, {
+      ps: async () => PS_FIXTURE,
+      cwdOf: async () => "/tmp/proj",
+      startedAtOf: async () => 100,
+      turnActive: async () => false,
+    });
+    expect(discovered.map((d) => d.pid)).not.toContain(16029);
+  });
+
+  test("a retired-owner marker fails open for an unverifiable or PID-reused TUI", async () => {
+    const known = [{
+      pid: 16029, tuiPid: 16029, retiredAt: 123,
+      machine: "m", label: "proj", ts: 100, agent: "codex",
+    } as SessionRecord];
+    for (const startedAt of [undefined, 124]) {
+      const discovered = await codexDiscoverLive(known, {
+        ps: async () => "16029 ttys017  codex",
+        cwdOf: async () => "/tmp/proj",
+        startedAtOf: async () => startedAt,
+        turnActive: async () => false,
+      });
+      expect(discovered.map((d) => d.pid)).toEqual([16029]);
+    }
+  });
+
   test("an unknown cwd falls back to the 'session' label (like buildBlob)", async () => {
     const discovered = await codexDiscoverLive([], { ps: async () => "42 ttys001  codex", cwdOf: async () => undefined, startedAtOf: async () => undefined, turnActive: async () => false });
     expect(discovered[0]).toEqual({ pid: 42, sessionId: "codex-pid-42", title: "session", label: "session", idle: true });
@@ -1068,7 +1098,7 @@ describe("Codex rollout create suppression (subagents + promptless deferral)", (
 
   test("guardian and any other subagent source variant are permanently suppressed", async () => {
     const guardian = sessionMeta({ subagent: { other: "guardian" } });
-    expect(codexRolloutCreationEvidence(guardian)).toEqual({ subagent: true, hasUserMessage: false });
+    expect(codexRolloutCreationEvidence(guardian)).toEqual({ subagent: true, hasUserMessage: false, headlessExec: false });
     expect(await codexSessionCreationSuppression(
       "guardian", guardian, "/rollout.jsonl",
       { hook_event_name: "SessionStart", parent_thread_id: "parent" },
@@ -1096,9 +1126,40 @@ describe("Codex rollout create suppression (subagents + promptless deferral)", (
       sessionMeta("vscode"),
       JSON.stringify({ type: "event_msg", payload: { type: "user_message", message: "Hello" } }),
     ].join("\n");
-    expect(codexRolloutCreationEvidence(prefix)).toEqual({ subagent: false, hasUserMessage: true });
+    expect(codexRolloutCreationEvidence(prefix)).toEqual({ subagent: false, hasUserMessage: true, headlessExec: false });
     expect(await codexSessionCreationSuppression(
       "real", prefix, "/rollout.jsonl", { hook_event_name: "PreToolUse" },
+    )).toBeNull();
+  });
+
+  test("codex exec session_meta is authoritative headless evidence even with a real user_message", async () => {
+    const prefix = [
+      JSON.stringify({ type: "session_meta", payload: {
+        id: "exec-1", originator: "codex_exec", source: "exec", thread_source: "user",
+      } }),
+      JSON.stringify({ type: "event_msg", payload: { type: "user_message", message: "review this" } }),
+    ].join("\n");
+    expect(codexRolloutCreationEvidence(prefix)).toEqual({
+      subagent: false, hasUserMessage: true, headlessExec: true,
+    });
+    expect(await codexSessionCreationSuppression(
+      "exec-1", prefix, "/tmp/rollout.jsonl", { hook_event_name: "UserPromptSubmit", prompt: "review this" },
+    )).toEqual({
+      guard: "codex-headless-exec",
+      reason: "session_meta identifies a non-interactive codex exec run",
+    });
+  });
+
+  test("ordinary interactive metadata remains admitted (missing exec proof fails open)", async () => {
+    const prefix = [
+      JSON.stringify({ type: "session_meta", payload: { id: "interactive-1", source: "vscode", originator: "Claude Code" } }),
+      JSON.stringify({ type: "event_msg", payload: { type: "user_message", message: "real prompt" } }),
+    ].join("\n");
+    expect(codexRolloutCreationEvidence(prefix)).toEqual({
+      subagent: false, hasUserMessage: true, headlessExec: false,
+    });
+    expect(await codexSessionCreationSuppression(
+      "interactive-1", prefix, "/tmp/rollout.jsonl", { hook_event_name: "UserPromptSubmit", prompt: "real prompt" },
     )).toBeNull();
   });
 });
@@ -1477,10 +1538,54 @@ describe("claudeLocateTuiPid (the recorded pid IS the TUI)", () => {
   test("a tty-less (headless/daemon) or dead pid owns no window → undefined", async () => {
     const notes: LocateTuiReason[] = [];
     const note = (r: LocateTuiReason): void => { notes.push(r); };
-    expect(await claudeLocateTuiPid({ sessionId: "s", record: locRec({ pid: 4242 }) }, { ttyOf: async () => "??", note })).toBeUndefined();
-    expect(await claudeLocateTuiPid({ sessionId: "s", record: locRec({ pid: 4242 }) }, { ttyOf: async () => undefined, note })).toBeUndefined();
-    expect(await claudeLocateTuiPid({ sessionId: "s", record: locRec({ pid: 4242 }) }, { ttyOf: async () => { throw new Error("ps"); }, note })).toBeUndefined();
+    // No herdr anywhere in the ancestry: the pid's own tty IS the only signal, as before. The two
+    // seams keep this hermetic — without them the real process table would be walked.
+    const plain = { ancestorsOf: (): number[] => [], commandOf: (): undefined => undefined, note };
+    expect(await claudeLocateTuiPid({ sessionId: "s", record: locRec({ pid: 4242 }) }, { ...plain, ttyOf: async () => "??" })).toBeUndefined();
+    expect(await claudeLocateTuiPid({ sessionId: "s", record: locRec({ pid: 4242 }) }, { ...plain, ttyOf: async () => undefined })).toBeUndefined();
+    expect(await claudeLocateTuiPid({ sessionId: "s", record: locRec({ pid: 4242 }) }, { ...plain, ttyOf: async () => { throw new Error("ps"); } })).toBeUndefined();
     expect(notes).toEqual(["no-candidate", "no-candidate", "no-candidate"]);
+  });
+
+  // FIELD REGRESSION (2026-08-02), the locate half of the same bug: a session started as a Claude
+  // background/forked task records the daemon-hosted `process.ppid`, whose tty is "??". Refusing it
+  // here meant terminal-focus never even got the chance to correlate its (open, unique) herdr pane.
+  test("a tty-less pid whose pty is owned by the herdr daemon is still the TUI", async () => {
+    const notes: LocateTuiReason[] = [];
+    const commands: Record<number, string> = {
+      9337: "/Users/karrix/.local/share/claude/versions/2.1.220 --session-id 878bc284 --fork-session",
+      9108: "/Users/karrix/.local/share/claude/ClaudeCode.app/Contents/MacOS/claude --bg-pty-host",
+      9074: "/Users/karrix/.local/bin/claude daemon run --origin transient",
+      76594: "/opt/homebrew/bin/herdr server",
+    };
+    const pid = await claudeLocateTuiPid(
+      { sessionId: "s", record: locRec({ pid: 9337, agent: undefined }) },
+      {
+        ttyOf: async () => "??",
+        ancestorsOf: () => [9108, 9074, 76594],
+        commandOf: (p) => commands[p],
+        note: (r) => notes.push(r),
+      },
+    );
+    expect(pid).toBe(9337);
+    expect(notes).toEqual(["record-pid"]);
+  });
+
+  test("a pid that is GONE is never resurrected by a herdr ancestry", async () => {
+    // A dead pid reads back no tty at all. `ps` cannot report an ancestry for it either, so the
+    // herdr escape hatch must not fire — otherwise a stale record could focus a live pane.
+    const notes: LocateTuiReason[] = [];
+    const pid = await claudeLocateTuiPid(
+      { sessionId: "s", record: locRec({ pid: 9337, agent: undefined }) },
+      {
+        ttyOf: async () => undefined,
+        ancestorsOf: () => [],
+        commandOf: () => undefined,
+        note: (r) => notes.push(r),
+      },
+    );
+    expect(pid).toBeUndefined();
+    expect(notes).toEqual(["no-candidate"]);
   });
 
   test("a record with no usable pid is a no-op", async () => {

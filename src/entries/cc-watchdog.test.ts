@@ -1,28 +1,31 @@
-import { beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { decryptBlob, encryptBlob } from "../core/crypto";
-import type { PlanPickerTraceDecision, SessionRecord } from "../core/shared";
+import { createLanAnswerStore } from "../core/lan-listener";
+import type { DecisionHold, PlanPickerTraceDecision, SessionRecord } from "../core/shared";
 import { GONE_STRIKE_LIMIT, readGoneStrikes, recordGoneStrike, resetGoneStrikes, tracePlanPickerDecision } from "../core/shared";
 import {
+  acceptLanAnswer, acceptLanCommand, enqueueDrainCommands, LAN_ANSWER_ECHO_DELAY_MS, LAN_COMMAND_ID_PREFIX,
   buildDoneEnvelope, buildEndEnvelope, buildHeartbeatEnvelope, buildNeedsAttentionEnvelope, buildProvisionalBlob,
   buildProvisionalEnvelope, buildProvisionalRecord, buildStartEnvelope, buildTitleRepairEnvelope, classifySession,
   claudeTailPendingApproval, codexLastTurnEvent, codexTailPendingApproval, correctIdleClaude, correctInterrupt,
-  CODEX_TUI_SESSION_START_SKEW_MS, correlateCodexTuiPid,
+  CODEX_TUI_SESSION_START_SKEW_MS, correlateCodexTuiPid, resolveCodexTuiOwner,
   COMMAND_FUTURE_SKEW_MS, COMMAND_TTL_MS, commandIsFresh,
-  correctPendingApproval, correctPendingDone, correctPlanPickerVerification, correctResolvedPlanPicker, createBridgeSupervisor, discoverLiveSessions, drainCommands, effectiveDoneAttempts, extractCommands, goneStrikeShouldTeardown,
+  codexBridgeIsDown, correctPendingApproval, correctPendingDone, correctPlanPickerVerification, correctResolvedPlanPicker, createBridgeSupervisor, discoverLiveSessions, drainCommands, effectiveDoneAttempts, extractCommands, goneStrikeShouldTeardown,
   enforceWatchdogOwnership, hasInterruptMarker, IDLE_GRACE_MS, isClaudeIdleReapEligible, isRetireEligible, isRightfulWatchdogOwner, lastTurnLine, PAIRING_TTL_MS, pendingDoneRetryWrite,
   pendingDoneSettleWrite, pendingPairingExpired, planPickerPendingExpired, PLAN_PICKER_PENDING_MAX_MS,
-  PLAN_PICKER_RECENT_DONE_MS, PLAN_PICKER_VERIFY_MAX_MS,
-  postOutcomeForStatus, provisionalsCoveredByReal, reconcileProvisionalsSweep, recordMovedSince, resetCommandState, resetDoneAttemptMemory, retireDoneStale,
-  shouldHeartbeat, shouldIdleProvisionalCheck,
+  PLAN_PICKER_RECENT_DONE_MS, PLAN_PICKER_VERIFY_MAX_MS, RETIRE_AFTER_MS,
+  buildWorkingEnvelope, postOutcomeForStatus, provisionalsCoveredByReal, reconcileProvisionalsSweep, recordMovedSince, resetCommandState, resetDoneAttemptMemory, retireDoneStale,
+  setCodexBridgeDown, shouldHeartbeat, shouldIdleProvisionalCheck,
   heartbeatKind, isWaitingSession,
   shouldInterruptCheck, shouldPendingApprovalCheck, shouldPendingDoneCheck, shouldPlanPickerVerificationCheck, shouldRepairTitle, tailShowsInterrupt, titleRepairedRecord,
   watchdogEventHeaders, WAITING_HEARTBEAT_AFTER_MS, withDeadline,
 } from "./cc-watchdog";
 import type { CommandPayload, DrainCommandsDeps, PostOutcome, RecordEntry } from "./cc-watchdog";
+import { resolveOnRelay } from "../core/codex-remote-input";
 import { claudeAdapter, codexAdapter } from "../core/adapter";
 import type { AgentAdapter, DiscoveredSession } from "../core/adapter";
 import type { Config, PendingConfig } from "../core/shared";
@@ -98,6 +101,18 @@ describe("classifySession", () => {
     const seen: number[] = [];
     classifySession(rec({ pid: 777 }), rec().ts, (p) => { seen.push(p); return false; });
     expect(seen).toEqual([777]);
+  });
+
+  test("a correlated Codex row is owned by tuiPid, not its immortal app-server pid", () => {
+    const row = rec({ agent: "codex", pid: 937, tuiPid: 64799 });
+    expect(classifySession(row, row.ts, (pid) => pid === 937)).toBe("end");
+    expect(classifySession(row, row.ts, (pid) => pid === 64799)).toBe("keep");
+  });
+
+  test("a retired-owner marker stays only while its TUI lives, then deletes without another end", () => {
+    const marker = rec({ agent: "codex", pid: 64799, tuiPid: 64799, retiredAt: 2_000_000 });
+    expect(classifySession(marker, marker.ts + 90_000_000, (pid) => pid === 64799)).toBe("keep");
+    expect(classifySession(marker, marker.ts + 90_000_000, () => false)).toBe("delete");
   });
 });
 
@@ -184,6 +199,43 @@ describe("correctIdleClaude (resumed-idle reap — bounded retry + local done-pi
     expect(posts[0]).toMatchObject({ op: "done", ts: 4242 });
     expect(writes[0]).toMatchObject({ lastEvent: "done", op: "done", sentDone: true });
     expect(writes[0].doneAttempts).toBeUndefined();
+  });
+
+  test("Codex idle reap requires a correlated live TUI and exact-rollout proof that no turn is active", async () => {
+    const posts: object[] = [];
+    const writes: SessionRecord[] = [];
+    const record = resumed({ agent: "codex", pid: 937, transcript: "/tmp/rollout.jsonl" });
+    const v = await correctIdleClaude(cfg(), "/tmp/s.json", "s", record, NOW, {
+      locateTuiPid: async () => 64799,
+      pidAlive: (pid) => pid === 64799,
+      codexTurnActive: async (pid, transcript) => {
+        expect(pid).toBe(64799);
+        expect(transcript).toBe("/tmp/rollout.jsonl");
+        return false;
+      },
+      post: async (body) => { posts.push(body); return "delivered" as PostOutcome; },
+      writeRecord: async (_path, next) => { writes.push(next); },
+      now: () => 4242,
+    });
+    expect(v).toBe("corrected");
+    expect(posts).toHaveLength(1);
+    expect(writes.at(-1)).toMatchObject({ agent: "codex", tuiPid: 64799, lastEvent: "done", op: "done" });
+  });
+
+  test("Codex idle reap fails open when the rollout says active or no TUI can be correlated", async () => {
+    const record = resumed({ agent: "codex", pid: 937, transcript: "/tmp/rollout.jsonl" });
+    let posts = 0;
+    expect(await correctIdleClaude(cfg(), "/tmp/s.json", "s", record, NOW, {
+      locateTuiPid: async () => 64799,
+      pidAlive: () => true,
+      codexTurnActive: async () => true,
+      post: async () => { posts++; return "delivered" as PostOutcome; },
+    })).toBe("uncorrected");
+    expect(await correctIdleClaude(cfg(), "/tmp/s.json", "s", record, NOW, {
+      locateTuiPid: async () => undefined,
+      post: async () => { posts++; return "delivered" as PostOutcome; },
+    })).toBe("uncorrected");
+    expect(posts).toBe(0);
   });
 
   test("a transiently FAILING done POST persists a bounded doneAttempts counter (verdict 'pending', record stays retryable)", async () => {
@@ -321,6 +373,33 @@ describe("correctPendingDone (re-POST a done whose delivery was never confirmed)
     expect(shouldPendingDoneCheck(last)).toBe(false);
     // The capped record is the terminal state the retire net keys on, so the row still resolves offline.
     expect(isRetireEligible({ ...last, ts: NOW - 7_200_000 }, NOW)).toBe(true);
+  });
+
+  // "Did this done ever reach the worker?" must be answerable from the log alone — a settled record on
+  // disk says nothing about delivery, and the retire net later deletes the row entirely.
+  test("every attempt leaves a delivery breadcrumb, including the silent cap", async () => {
+    const traces: Record<string, unknown>[] = [];
+    const trace = (e: object) => { traces.push(e as Record<string, unknown>); };
+    let last: SessionRecord = owed();
+    for (let i = 0; i < 20; i++) {
+      await correctPendingDone(cfg(), "/tmp/s.json", "s", last, NOW, {
+        post: async () => "failed" as PostOutcome, writeRecord: async (_p, r) => { last = r; }, trace,
+      });
+      if (last.donePending !== true) break;
+    }
+    expect(traces[0]).toMatchObject({
+      event: "pending-done", sessionId: "s", outcome: "failed", delivered: false, attempts: 0,
+    });
+    // The cap is the ONLY path that stops POSTing without ever delivering — it must not be silent.
+    expect(traces.at(-1)).toMatchObject({ event: "pending-done", outcome: "capped", delivered: false });
+
+    traces.length = 0;
+    await correctPendingDone(cfg(), "/tmp/s.json", "s2", owed(), NOW, {
+      post: async () => "delivered" as PostOutcome, writeRecord: async () => {}, trace,
+    });
+    expect(traces).toEqual([expect.objectContaining({
+      event: "pending-done", sessionId: "s2", outcome: "delivered", delivered: true,
+    })]);
   });
 
   test("a revoke bubbles up so the loop can tear the pairing down", async () => {
@@ -779,9 +858,19 @@ describe("reconcileProvisionalsSweep (ends + deletes a covered provisional)", ()
 // Claude done session idle >1 h (pid alive) gets a blob-less op:end carrying the FROZEN real-last-event
 // `at`, and its local record is deleted — freeing the cap slot. Never touches working/needsAttention
 // (they keep heartbeating), never codex (discovery would re-surface it).
-describe("isRetireEligible (a DONE Claude session past the 1 h retire horizon)", () => {
-  const RETIRE_MS = 3_600_000; // must mirror RETIRE_AFTER_MS in cc-watchdog.ts
+describe("isRetireEligible (a DONE session past the 1 h real-event horizon)", () => {
+  const RETIRE_MS = RETIRE_AFTER_MS; // derived, not mirrored — see the born-expired guard test below
   const now = 100_000_000;
+
+  // REGRESSION GUARD (born-expired trap). RETIRE_AFTER_MS and PLAN_PICKER_PENDING_MAX_MS were both
+  // independently written as exactly 1 h. settlePendingPlanPickerDone settles a pending picker AT its
+  // TTL, so the resulting done was already past the retire horizon the instant it was written: the next
+  // sweep (~47 s later in the field incident) posted a blob-less op:end and the worker hard-deleted the
+  // row. The retire horizon must stay STRICTLY ABOVE the picker TTL so no settle can be born expired.
+  test("the retire horizon sits strictly above the plan-picker hard TTL (no born-expired settle)", () => {
+    expect(RETIRE_AFTER_MS).toBeGreaterThan(PLAN_PICKER_PENDING_MAX_MS);
+    expect(RETIRE_AFTER_MS - PLAN_PICKER_PENDING_MAX_MS).toBeGreaterThanOrEqual(15 * 60_000);
+  });
 
   test("a done Claude session idle ≥1 h → eligible; just under → not", () => {
     expect(isRetireEligible(rec({ op: "done", lastEvent: "done", ts: now - RETIRE_MS }), now)).toBe(true);
@@ -797,8 +886,13 @@ describe("isRetireEligible (a DONE Claude session past the 1 h retire horizon)",
     expect(isRetireEligible(rec({ lastEvent: "needsAttention", op: "update", prio: 1, ts: now - RETIRE_MS * 10 }), now)).toBe(false);
   });
 
-  test("codex and provisional rows are left to their own machinery (discovery would re-surface them)", () => {
-    expect(isRetireEligible(rec({ agent: "codex", op: "done", lastEvent: "done", ts: now - RETIRE_MS * 5 }), now)).toBe(false);
+  test("Codex real and provisional done rows retire; a local retired-owner marker cannot retire twice", () => {
+    expect(isRetireEligible(rec({ agent: "codex", op: "done", lastEvent: "done", ts: now - RETIRE_MS * 5 }), now)).toBe(true);
+    expect(isRetireEligible(rec({ agent: "codex", provisional: true, op: "done", lastEvent: "done", ts: now - RETIRE_MS * 5 }), now)).toBe(true);
+    expect(isRetireEligible(rec({ agent: "codex", op: "done", lastEvent: "done", ts: now - RETIRE_MS * 5, retiredAt: now }), now)).toBe(false);
+  });
+
+  test("non-Codex provisional rows remain outside the retire net", () => {
     expect(isRetireEligible(rec({ provisional: true, op: "done", lastEvent: "done", ts: now - RETIRE_MS * 5 }), now)).toBe(false);
   });
 
@@ -816,7 +910,7 @@ describe("isRetireEligible (a DONE Claude session past the 1 h retire horizon)",
 
 describe("retireDoneStale (blob-less op:end with frozen `at` + record delete)", () => {
   const NOW = 100_000_000;
-  const RETIRE_MS = 3_600_000;
+  const RETIRE_MS = RETIRE_AFTER_MS;
   const done = (over: Partial<SessionRecord> = {}): SessionRecord =>
     rec({ op: "done", lastEvent: "done", sentDone: true, blob: "DONEBLOB", ts: NOW - RETIRE_MS, ...over });
 
@@ -834,6 +928,45 @@ describe("retireDoneStale (blob-less op:end with frozen `at` + record delete)", 
     expect(posts[0].at).toBe(Math.floor(record.ts / 1000)); // FROZEN real-last-event, not NOW
     expect(posts[0].at).not.toBe(Math.floor(NOW / 1000));
     expect(deletes).toEqual(["/tmp/s.json"]);
+  });
+
+  // Retirement deletes the row on BOTH sides, so without a breadcrumb a vanished session is
+  // indistinguishable from one that was never sent — which is what made the born-expired plan-picker
+  // incident invisible in the trace.
+  test("every post-eligibility exit leaves one retire breadcrumb (age + owner + outcome)", async () => {
+    const traces: Record<string, unknown>[] = [];
+    const trace = (e: object) => { traces.push(e as Record<string, unknown>); };
+    const record = done();
+    expect(await retireDoneStale(cfg(), "/tmp/s.json", "s", record, NOW, {
+      post: async () => "delivered" as PostOutcome, deleteRecord: async () => {}, trace,
+    })).toBe("retired");
+    expect(traces[0]).toMatchObject({
+      event: "retire", reason: "idle-done", sessionId: "s", recordTs: record.ts,
+      ageMs: RETIRE_MS, outcome: "retired",
+    });
+
+    // an undelivered end still retires locally…
+    expect(await retireDoneStale(cfg(), "/tmp/s.json", "s", done(), NOW, {
+      post: async () => "failed" as PostOutcome, deleteRecord: async () => {}, trace,
+    })).toBe("retired-offline");
+    expect(traces[1]).toMatchObject({ event: "retire", outcome: "retired-offline" });
+
+    // …a Codex row that keeps its live TUI records the owner pid it left behind…
+    expect(await retireDoneStale(cfg(), "/tmp/s.json", "s", done({ agent: "codex", tuiPid: 5150 }), NOW, {
+      post: async () => "delivered" as PostOutcome, writeRecord: async () => {}, pidAlive: () => true, trace,
+    })).toBe("retired");
+    expect(traces[2]).toMatchObject({ event: "retire", outcome: "retired", tuiPid: 5150 });
+
+    // …and a session the user woke mid-sweep says so instead of vanishing silently.
+    expect(await retireDoneStale(cfg(), "/tmp/s.json", "s", done(), NOW, {
+      post: async () => { throw new Error("must not post a woken session"); },
+      readRecord: async () => rec({ lastEvent: "working", op: "update", ts: NOW }), trace,
+    })).toBe("skip");
+    expect(traces[3]).toMatchObject({ event: "retire", outcome: "skip-woken" });
+
+    // The not-eligible early return stays SILENT (it is every kept session on every sweep).
+    expect(await retireDoneStale(cfg(), "/tmp/s.json", "s", done({ ts: NOW }), NOW, { trace })).toBe("skip");
+    expect(traces).toHaveLength(4);
   });
 
   test("done + 59 min → NOT eligible: no POST, no delete (the heartbeat keeps it)", async () => {
@@ -855,6 +988,39 @@ describe("retireDoneStale (blob-less op:end with frozen `at` + record delete)", 
       deleteRecord: async (p) => { deletes.push(p); },
     });
     expect(v).toBe("retired-offline"); // deleted, but not counted as a delivered proof-of-life
+    expect(deletes).toEqual(["/tmp/s.json"]);
+  });
+
+  test("a Codex done row becomes a local owner marker so discovery cannot recreate its live TUI", async () => {
+    const posts: object[] = [];
+    const writes: SessionRecord[] = [];
+    const deletes: string[] = [];
+    const record = done({ agent: "codex", pid: 937, tuiPid: undefined });
+    const v = await retireDoneStale(cfg(), "/tmp/s.json", "s", record, NOW, {
+      post: async (body) => { posts.push(body); return "delivered" as PostOutcome; },
+      locateTuiPid: async () => 64799,
+      pidAlive: (pid) => pid === 64799,
+      writeRecord: async (_path, next) => { writes.push(next); },
+      deleteRecord: async (path) => { deletes.push(path); },
+    });
+    expect(v).toBe("retired");
+    expect(posts).toHaveLength(1);
+    expect(deletes).toEqual([]);
+    expect(writes).toEqual([expect.objectContaining({
+      agent: "codex", pid: 64799, tuiPid: 64799, retiredAt: NOW,
+    })]);
+    expect(writes[0].blob).toBeUndefined();
+    expect(writes[0].op).toBeUndefined();
+  });
+
+  test("a headless/unowned Codex done row deletes normally because discovery has no TUI to recreate", async () => {
+    const deletes: string[] = [];
+    const v = await retireDoneStale(cfg(), "/tmp/s.json", "s", done({ agent: "codex", pid: 937 }), NOW, {
+      post: async () => "delivered" as PostOutcome,
+      locateTuiPid: async () => undefined,
+      deleteRecord: async (path) => { deletes.push(path); },
+    });
+    expect(v).toBe("retired");
     expect(deletes).toEqual(["/tmp/s.json"]);
   });
 
@@ -1477,6 +1643,15 @@ describe("correctResolvedPlanPicker (Mac answer clears only the marked Plan wait
     expect(correlateCodexTuiPid(daemonSession({ origin: { ...record.origin!, ppid_command: "/Applications/ChatGPT.app/codex app-server" } }), [tui(5150)], () => true)).toBeUndefined();
   });
 
+  test("retirement ownership accepts exact/cached owners but never borrows an unrelated lone TUI", () => {
+    expect(resolveCodexTuiOwner(blockedPlan({ pid: 5150, origin: {
+      hook_event_name: "Stop", ppid: 5150, ppid_command: "codex", cwd: "/Users/me/project",
+    } }), [], () => true)).toBe(5150);
+    expect(resolveCodexTuiOwner(daemonSession({ tuiPid: 5151 }), [], (pid) => pid === 5151)).toBe(5151);
+    expect(resolveCodexTuiOwner(daemonSession(), [tui(5150, { tuiCwd: "/Users/me/other" })], () => true)).toBeUndefined();
+    expect(resolveCodexTuiOwner(daemonSession(), [tui(5150)], () => true)).toBe(5150);
+  });
+
   test("task_started/user_message resolution → working update and clears provenance marker", async () => {
     const posts: Record<string, unknown>[] = [];
     const writes: SessionRecord[] = [];
@@ -1599,6 +1774,70 @@ describe("correctResolvedPlanPicker (Mac answer clears only the marked Plan wait
       state: async () => "exited",
       post: async () => { throw new Error("must not post working"); },
     })).toBe("uncorrected");
+  });
+});
+
+// --- the born-expired settle (a TTL-settled picker was retired seconds after it settled) ----------
+//
+// FIELD INCIDENT: a Codex turn ended into the plan-picker verification pending state and sat there until
+// the hard TTL (PLAN_PICKER_PENDING_MAX_MS, 1 h) settled it to done. The settle spread the fresh record
+// and flipped op/lastEvent, but never re-stamped `ts` — and RETIRE_AFTER_MS was the SAME 1 h — so the
+// settled done was ALREADY past the retire horizon the instant it was written. The next sweep (~47 s
+// later) posted a blob-less op:end and the worker hard-deleted the row: the done lived seconds, not an
+// hour. The fix splits the two clocks — the retention clock (record.ts) restarts at the settle, the
+// DISPLAY clock (the blob's `at`) stays frozen at the original event time.
+describe("a TTL-settled plan picker starts a FRESH retention clock (born-expired regression)", () => {
+  const PENDED_AT = 50_000_000;                                    // the real event time (turn end)
+  const SETTLED_AT = PENDED_AT + PLAN_PICKER_PENDING_MAX_MS;       // the hard TTL fires exactly here
+  const SWEEP_AFTER_MS = 50_000;                                   // the incident's next sweep, ~47 s later
+
+  const pending = (over: Partial<SessionRecord> = {}): SessionRecord => rec({
+    agent: "codex", transcript: "/tmp/rollout.jsonl", lastEvent: "needsAttention",
+    op: "update", prio: 1, sentDone: false, pendingPlanPicker: true,
+    blob: "PENDING-PLAN", title: "Implement the plan", pairingId: "p",
+    ts: PENDED_AT, planPickerPendingSince: PENDED_AT, ...over,
+  });
+
+  /** Drive the real TTL settle through the public net and hand back the settled record + the posts. */
+  const settleAtTtl = async () => {
+    let current = pending();
+    const posts: Record<string, unknown>[] = [];
+    expect(await correctResolvedPlanPicker(cfg(), "/tmp/s.json", "s", current, {
+      state: async () => { throw new Error("TTL must precede rollout classification"); },
+      readRecord: async () => current,
+      writeRecord: async (_path, next) => { current = next; },
+      post: async (body) => { posts.push(body as Record<string, unknown>); return "delivered"; },
+      now: () => SETTLED_AT,
+    })).toBe("corrected");
+    expect(posts[0]).toMatchObject({ op: "done", prio: 0 });
+    return { settled: current, posts };
+  };
+
+  test("the settled done re-stamps ts and SURVIVES the next sweep (the exact incident)", async () => {
+    const { settled } = await settleAtTtl();
+    expect(settled).toMatchObject({ op: "done", lastEvent: "done", planPickerSettled: true });
+    expect(settled.ts).toBe(SETTLED_AT);
+    expect(isRetireEligible(settled, SETTLED_AT)).toBe(false);
+    expect(isRetireEligible(settled, SETTLED_AT + SWEEP_AFTER_MS)).toBe(false);
+    // The pre-fix row's age on that same sweep had ALREADY met the old 1 h horizon (both constants were
+    // 1 h and ts was never re-stamped) — which is exactly why it was retired 47 s after settling…
+    expect((SETTLED_AT + SWEEP_AFTER_MS) - PENDED_AT).toBeGreaterThan(PLAN_PICKER_PENDING_MAX_MS);
+    // …and the two fixes are now independent: even an un-re-stamped record is saved by the F2 margin.
+    expect(isRetireEligible({ ...settled, ts: PENDED_AT }, SETTLED_AT + SWEEP_AFTER_MS)).toBe(false);
+  });
+
+  test("it becomes retire-eligible only a full RETIRE_AFTER_MS past the SETTLE", async () => {
+    const { settled } = await settleAtTtl();
+    expect(isRetireEligible(settled, SETTLED_AT + RETIRE_AFTER_MS - 1)).toBe(false);
+    expect(isRetireEligible(settled, SETTLED_AT + RETIRE_AFTER_MS)).toBe(true);
+  });
+
+  test("the blob's `at` stays FROZEN at the original event time (honest display age)", async () => {
+    const { posts } = await settleAtTtl();
+    const blob = await decryptBlob(KEY, posts[0].blob as string) as Record<string, unknown>;
+    expect(blob.status).toBe("done");
+    expect(blob.at).toBe(Math.floor(PENDED_AT / 1000));       // the turn really ended an hour ago…
+    expect(blob.at).not.toBe(Math.floor(SETTLED_AT / 1000));  // …the retention re-stamp never reaches it
   });
 });
 
@@ -1775,16 +2014,18 @@ describe("correctPlanPickerVerification (watchdog owns flush settlement)", () =>
     expect({ posted, classified }).toEqual({ posted: 0, classified: 0 });
   });
 
-  test("a buggy-build settled done is re-corrected only with full proof + live pid + recent window", async () => {
-    const settled = verifying({
+  test("an unadjudicated done is re-corrected only with full proof + live pid + recent window", async () => {
+    // A hook killed between its done write and its picker marker leaves a PLAIN done: no adjudicator
+    // ever ruled on it, so rollout proof may still re-open it. A done carrying `planPickerSettled`
+    // is the opposite case and is latched shut below.
+    const plainDone = verifying({
       planPickerVerificationPending: undefined,
-      planPickerSettled: true,
       lastEvent: "done", op: "done", prio: 0, sentDone: true, ts: NOW - 1_000,
     });
-    let current = settled;
+    let current = plainDone;
     const posts: Record<string, unknown>[] = [];
-    expect(shouldPlanPickerVerificationCheck(settled, NOW)).toBe(true);
-    expect(await correctPlanPickerVerification(cfg(), "/tmp/s.json", "s", settled, {
+    expect(shouldPlanPickerVerificationCheck(plainDone, NOW)).toBe(true);
+    expect(await correctPlanPickerVerification(cfg(), "/tmp/s.json", "s", plainDone, {
       evidence: async () => ({ state: "pending", plan: "# Still open" }),
       threadWaitState: async () => "notWaitingOnUserInput",
       pidAlive: () => true,
@@ -1796,36 +2037,88 @@ describe("correctPlanPickerVerification (watchdog owns flush settlement)", () =>
     expect(posts[0]).toMatchObject({ op: "update", prio: 1, attentionKind: "userInput" });
     expect(current).toMatchObject({ lastEvent: "needsAttention", pendingPlanPicker: true, prio: 1 });
     expect(current.planPickerSettled).toBeUndefined();
+
+    // Same full proof, same live pid, same window — but the watchdog already settled this episode.
+    const settled = { ...plainDone, planPickerSettled: true };
+    let classified = 0;
+    expect(shouldPlanPickerVerificationCheck(settled, NOW)).toBe(false);
+    expect(await correctPlanPickerVerification(cfg(), "/tmp/s.json", "s", settled, {
+      evidence: async () => { classified++; return { state: "pending", plan: "# Still open" }; },
+      pidAlive: () => true,
+      post: async () => { throw new Error("a settled picker must never be re-opened"); },
+      now: () => NOW,
+    })).toBe("uncorrected");
+    expect(classified).toBe(0);
   });
 
-  test("settled done is not re-corrected outside the window, with a dead pid, or after later progress", async () => {
-    const settled = verifying({
+  test("an unadjudicated done is not re-corrected outside the window, with a dead pid, or after later progress", async () => {
+    const plainDone = verifying({
       planPickerVerificationPending: undefined,
-      planPickerSettled: true,
       lastEvent: "done", op: "done", prio: 0, sentDone: true, ts: NOW - 1_000,
     });
     let posts = 0;
     let classified = 0;
-    const outside = { ...settled, ts: NOW - PLAN_PICKER_RECENT_DONE_MS - 1 };
+    const outside = { ...plainDone, ts: NOW - PLAN_PICKER_RECENT_DONE_MS - 1 };
     expect(await correctPlanPickerVerification(cfg(), "/tmp/s.json", "s", outside, {
       evidence: async () => { classified++; return { state: "pending", plan: "# stale" }; },
       pidAlive: () => true,
       post: async () => { posts++; return "delivered"; },
       now: () => NOW,
     })).toBe("uncorrected");
-    expect(await correctPlanPickerVerification(cfg(), "/tmp/s.json", "s", settled, {
+    expect(await correctPlanPickerVerification(cfg(), "/tmp/s.json", "s", plainDone, {
       evidence: async () => { classified++; return { state: "pending", plan: "# dead" }; },
       pidAlive: () => false,
       post: async () => { posts++; return "delivered"; },
       now: () => NOW,
     })).toBe("uncorrected");
-    expect(await correctPlanPickerVerification(cfg(), "/tmp/s.json", "s", settled, {
+    // A daemon-fronted row: the app-server pid lives forever, so only the correlated TTY is evidence.
+    expect(await correctPlanPickerVerification(cfg(), "/tmp/s.json", "s", { ...plainDone, pid: 937, tuiPid: 64_799 }, {
+      evidence: async () => { classified++; return { state: "pending", plan: "# dead tui" }; },
+      pidAlive: (pid) => pid === 937,
+      post: async () => { posts++; return "delivered"; },
+      now: () => NOW,
+    })).toBe("uncorrected");
+    expect(await correctPlanPickerVerification(cfg(), "/tmp/s.json", "s", plainDone, {
       evidence: async () => { classified++; return { state: "resolved" }; },
       pidAlive: () => true,
       post: async () => { posts++; return "delivered"; },
       now: () => NOW,
     })).toBe("uncorrected");
     expect({ posts, classified }).toEqual({ posts: 0, classified: 1 });
+  });
+
+  test("a settled picker never re-opens: the two correctives converge instead of flapping", async () => {
+    // The production loop measured 2026-08-02: two daemon-fronted Codex sessions alternating
+    // set-pending ⇄ tui-exit every ~7.3s for 48 minutes (738 posted corrections). Each flip is a real
+    // prio-1 ⇄ done transition, i.e. one priority-10 Live Activity push, which alone burned the
+    // ActivityKit budget. The rollout's picker signature is durable (dismissal is never written to
+    // JSONL) so it classifies "pending" forever, and `record.pid` is the app-server DAEMON — always
+    // alive — so the recent-done backstop's liveness gate re-opened every settlement.
+    let current: SessionRecord = rec({
+      agent: "codex", transcript: "/tmp/019fb9a2.jsonl", lastEvent: "needsAttention",
+      op: "update", prio: 1, sentDone: false, pendingPlanPicker: true, planPickerPendingSince: NOW,
+      blob: "ATTENTION", title: "Plan?", pairingId: "p", ts: NOW, pid: 937, tuiPid: 64799,
+    });
+    const posts: Record<string, unknown>[] = [];
+    const deps = (now: number) => ({
+      state: async () => "pending" as const,
+      evidence: async () => ({ state: "pending" as const, plan: "# Still open" }),
+      threadWaitState: async () => "notWaitingOnUserInput" as const,
+      pidAlive: (pid: number) => pid === 937, // the daemon lives on; the TUI (64799) has exited
+      readRecord: async () => current,
+      writeRecord: async (_p: string, next: SessionRecord) => { current = next; },
+      post: async (body: object) => { posts.push(body as Record<string, unknown>); return "delivered" as const; },
+      now: () => now,
+    });
+    for (let sweep = 0; sweep < 6; sweep++) {
+      const at = NOW + sweep * 7_300;
+      await correctResolvedPlanPicker(cfg(), "/tmp/s.json", "s", current, deps(at));
+      await correctPlanPickerVerification(cfg(), "/tmp/s.json", "s", current, deps(at + 1_000));
+    }
+    // One terminal transition total. The dead TUI is decisive, and the settlement it wrote is a latch.
+    expect(posts.map((p) => p.op)).toEqual(["done"]);
+    expect(current).toMatchObject({ op: "done", lastEvent: "done", planPickerSettled: true });
+    expect(current.pendingPlanPicker).toBeUndefined();
   });
 
   test("decision trace covers open, daemon-idle ignored, blocked settlement, and eventual TTL done", async () => {
@@ -2242,6 +2535,151 @@ describe("createBridgeSupervisor (presence gate: no Codex daemon → no bridge, 
     await s.sync(cfg());
     expect(created).toBe(0);
   });
+
+  // The regression this closes: the user's Codex app-server daemon died at 22:14 and NOTHING said so.
+  // The presence gate correctly refused to build a bridge — and since the bridge is the ONLY path by
+  // which a phone can answer a Codex TUI question, every question for the next day degraded into an
+  // attention row that could be looked at but never answered.
+  test("socket PRESENT → no start attempt at all (the bridge just builds, as before)", async () => {
+    const f = fakeBridge();
+    const c = collector();
+    let starts = 0;
+    const s = createBridgeSupervisor({
+      probe: async () => true, create: () => f.bridge, detach: c.detach,
+      startDaemon: async () => { starts += 1; return true; },
+    });
+    await s.sync(cfg());
+    await s.sync(cfg());
+    await c.settle();
+    expect(starts).toBe(0);
+    expect(s.daemonDown).toBe(false);
+    expect(f.calls).toEqual(["start", "refresh"]);
+  });
+
+  test("socket ABSENT → EXACTLY ONE bounded start attempt per cooldown, not one per sweep", async () => {
+    const c = collector();
+    let clock = 1_000_000;
+    let starts = 0;
+    const s = createBridgeSupervisor({
+      probe: async () => false, create: () => { throw new Error("unreachable"); }, detach: c.detach,
+      now: () => clock, startDaemon: async () => { starts += 1; return false; },
+    });
+    await s.sync(cfg());          // t0 → the one attempt
+    clock += 5_000; await s.sync(cfg()); // next sweep
+    clock += 5_000; await s.sync(cfg()); // …and the next
+    clock += 280_000; await s.sync(cfg()); // still inside the 5-minute cooldown
+    await c.settle();
+    expect(starts).toBe(1);
+    clock += 20_000;              // cooldown expired (290 s + 20 s > 300 s)
+    await s.sync(cfg());
+    await c.settle();
+    expect(starts).toBe(2);
+  });
+
+  test("the start attempt is DETACHED and never-throwing — a hung/exploding `codex` costs the sweep nothing", async () => {
+    const traced: object[] = [];
+    const s = createBridgeSupervisor({
+      probe: async () => false,
+      create: () => { throw new Error("unreachable"); },
+      // No `detach` injected: the production fire-and-forget path must swallow this rejection itself.
+      startDaemon: () => Promise.reject(new Error("codex: command not found")),
+      trace: (event) => traced.push(event),
+    });
+    const raced = await Promise.race([
+      s.sync(cfg()).then(() => "synced"),
+      new Promise((r) => setTimeout(() => r("timeout"), 250)),
+    ]);
+    expect(raced).toBe("synced");
+    await new Promise((r) => setTimeout(r, 10)); // let the detached rejection land
+    expect(traced).toEqual([{ event: "codex-daemon-start", outcome: "attempt" }]);
+    expect(s.daemonDown).toBe(true);
+  });
+
+  test("a start that SUCCEEDS builds the bridge on the NEXT sync (the probe stays the only authority)", async () => {
+    const f = fakeBridge();
+    const c = collector();
+    let socket = false;
+    const s = createBridgeSupervisor({
+      probe: async () => socket, create: () => f.bridge, detach: c.detach,
+      startDaemon: async () => { socket = true; return true; },
+    });
+    await s.sync(cfg());
+    await c.settle();
+    expect(f.calls).toEqual([]);      // the sync that noticed does NOT retro-build a bridge
+    expect(s.daemonDown).toBe(true);
+    await s.sync(cfg());
+    await c.settle();
+    expect(f.calls).toEqual(["start"]);
+    expect(s.daemonDown).toBe(false); // …and the breadcrumb clears itself
+  });
+
+  test("unpaired never attempts a start (no config, no Codex row to be honest to)", async () => {
+    let starts = 0;
+    const s = createBridgeSupervisor({
+      probe: async () => false, create: () => { throw new Error("unreachable"); },
+      startDaemon: async () => { starts += 1; return true; },
+    });
+    await s.sync(null);
+    expect(starts).toBe(0);
+    expect(s.daemonDown).toBe(false);
+  });
+});
+
+// The breadcrumb half of the same regression: while the socket is gone, every Codex frame the sweep
+// seals says so in its `dbg` tail, so the phone's diagnostics toggle names the cause instead of showing
+// a question that silently cannot be answered.
+describe("cxbridge:down breadcrumb (Codex frames only, and only while the socket is missing)", () => {
+  const rec = (): SessionRecord => ({ pid: 1, machine: "m", label: "l", ts: 1, blob: "" });
+  const key = new Uint8Array(32).fill(7);
+  const dbgOf = async (blob: string): Promise<string | undefined> =>
+    ((await decryptBlob(key, blob)) as { dbg?: string }).dbg;
+
+  afterEach(() => setCodexBridgeDown(false));
+
+  test("a Codex attention frame carries the marker LAST while down, and loses it once the socket returns", async () => {
+    setCodexBridgeDown(true);
+    const down = await buildNeedsAttentionEnvelope("s1", rec(), 1_000, key, "codex") as { blob: string };
+    const marked = await dbgOf(down.blob);
+    expect(marked).toContain("ev:attention");
+    expect(marked?.endsWith(" cxbridge:down")).toBe(true);
+
+    setCodexBridgeDown(false);
+    const up = await buildNeedsAttentionEnvelope("s1", rec(), 1_000, key, "codex") as { blob: string };
+    expect(await dbgOf(up.blob)).not.toContain("cxbridge:down");
+  });
+
+  test("done / working / provisional Codex frames carry it too — a row is diagnosable in any state", async () => {
+    setCodexBridgeDown(true);
+    const done = await buildDoneEnvelope("s1", rec(), 1_000, key, "codex") as { blob: string };
+    const working = await buildWorkingEnvelope("s1", rec(), 1_000, key, "codex");
+    const provisional = await buildProvisionalBlob(
+      { sessionId: "s1", pid: 2, label: "l", title: "t" } as never, "m", { agent: "codex" }, key,
+    );
+    expect(await dbgOf(done.blob)).toContain("cxbridge:down");
+    expect(await dbgOf(working.blob as string)).toContain("cxbridge:down");
+    expect(await dbgOf(provisional)).toContain("cxbridge:down");
+  });
+
+  test("NOTHING is added to a Claude session (its dbg stays absent entirely)", async () => {
+    setCodexBridgeDown(true);
+    expect(codexBridgeIsDown()).toBe(true);
+    const done = await buildDoneEnvelope("s1", rec(), 1_000, key, "claude") as { blob: string };
+    const attention = await buildNeedsAttentionEnvelope("s1", rec(), 1_000, key, "claude") as { blob: string };
+    expect(await dbgOf(done.blob)).toBeUndefined();
+    expect(await dbgOf(attention.blob)).toBeUndefined();
+  });
+
+  test("the marker is added at most once, and a CACHED dbg loses it once the socket is back", async () => {
+    setCodexBridgeDown(true);
+    const marked = "1.0.0 ev:x cls:y cxbridge:down";
+    const once = await buildDoneEnvelope("s1", rec(), 1_000, key, "codex", 1, marked) as { blob: string };
+    expect((await dbgOf(once.blob) ?? "").match(/cxbridge:down/g)).toHaveLength(1);
+    // The title repair rebuilds from `record.dbg`, so a marker stamped during an outage must not ride
+    // forward once the daemon is back.
+    setCodexBridgeDown(false);
+    const repaired = await buildTitleRepairEnvelope("s1", { ...rec(), dbg: marked }, "t", 1_000, key, "codex");
+    expect(await dbgOf(repaired.blob)).toBe("1.0.0 ev:x cls:y");
+  });
 });
 
 // The deadlock this closes: `await bridge.start()` on a wedged `codex app-server proxy` child (spawned,
@@ -2379,7 +2817,7 @@ describe("stale-snapshot guard (a prompt landing mid-POST must never be clobbere
 // taken before the sweep's earlier awaits — so a session woken mid-sweep lost its reap/heartbeat handle.
 describe("retireDoneStale re-reads before it deletes (a woken session is never retired out from under itself)", () => {
   const NOW = 100_000_000;
-  const RETIRE_MS = 3_600_000;
+  const RETIRE_MS = RETIRE_AFTER_MS;
   const done = (over: Partial<SessionRecord> = {}): SessionRecord =>
     rec({ op: "done", lastEvent: "done", sentDone: true, blob: "DONEBLOB", ts: NOW - RETIRE_MS, ...over });
 
@@ -2638,6 +3076,101 @@ describe("drainCommands (authenticate, validate, then execute)", () => {
     });
   });
 
+  test("Open on Mac releases only a LIVE TUI request_user_input hold after focus succeeds", async () => {
+    const answers = createLanAnswerStore();
+    const resolved: string[] = [];
+    const hold: DecisionHold = {
+      blob: await encryptBlob(KEY, {
+        status: "decisionPending", agent: "codex", permissionRequestId: "req-tui",
+        permissionToolName: "request_user_input", permissionSummary: "Which deployment?",
+      }),
+      at: NOW - 1_000,
+      pid: 777,
+    };
+    const { deps } = harness({
+      readDecisionHoldFn: async () => hold,
+      holdPidAliveFn: () => true,
+      answerStore: answers,
+      resolveDecisionFn: async (_config: Config, requestId: string) => { resolved.push(requestId); },
+    });
+    const cmd = await sealed({ sessionId: "sess-b" });
+    expect(await drainCommands(cfg(), { ...deps, take: () => [cmd] })).toBe(1);
+    const stored = answers.peek("req-tui", NOW);
+    expect(stored).toBeDefined();
+    expect(await decryptBlob(KEY, stored!.answerBlob)).toEqual({
+      requestId: "req-tui", decision: "allow", ts: Math.floor(NOW / 1000),
+    });
+    expect(resolved).toEqual(["req-tui"]);
+  });
+
+  test("focus never releases an ordinary/app-server question card or a dead hold", async () => {
+    for (const testCase of [
+      {
+        name: "app-server",
+        alive: true,
+        frame: {
+          status: "decisionPending", agent: "codex", permissionRequestId: "req-app",
+          permissionToolName: "request_user_input", permissionQuestions: [{ q: "Which?", o: ["A", "B"] }],
+        },
+      },
+      {
+        name: "dead",
+        alive: false,
+        frame: {
+          status: "decisionPending", agent: "codex", permissionRequestId: "req-dead",
+          permissionToolName: "request_user_input",
+        },
+      },
+      {
+        name: "stale",
+        alive: true,
+        at: NOW - 600_001,
+        frame: {
+          status: "decisionPending", agent: "codex", permissionRequestId: "req-stale",
+          permissionToolName: "request_user_input",
+        },
+      },
+    ]) {
+      resetCommandState();
+      const answers = createLanAnswerStore();
+      const resolved: string[] = [];
+      const hold: DecisionHold = {
+        blob: await encryptBlob(KEY, testCase.frame), at: testCase.at ?? NOW - 1_000, pid: 777,
+      };
+      const { deps } = harness({
+        readDecisionHoldFn: async () => hold,
+        holdPidAliveFn: () => testCase.alive,
+        answerStore: answers,
+        resolveDecisionFn: async (_config: Config, requestId: string) => { resolved.push(requestId); },
+      });
+      const cmd = await sealed({ sessionId: "sess-b" }, { id: `cmd-${testCase.name}` });
+      expect(await drainCommands(cfg(), { ...deps, take: () => [cmd] })).toBe(1);
+      expect(answers.size()).toBe(0);
+      expect(resolved).toEqual([]);
+    }
+  });
+
+  test("a failed focus does not release the blocking hook", async () => {
+    const answers = createLanAnswerStore();
+    const hold: DecisionHold = {
+      blob: await encryptBlob(KEY, {
+        status: "decisionPending", agent: "codex", permissionRequestId: "req-tui",
+        permissionToolName: "request_user_input",
+      }),
+      at: NOW,
+      pid: 777,
+    };
+    const { deps } = harness({
+      focus: async () => ({ ok: false, reason: "osascript-failed" }),
+      readDecisionHoldFn: async () => hold,
+      holdPidAliveFn: () => true,
+      answerStore: answers,
+    });
+    const cmd = await sealed({ sessionId: "sess-b" });
+    expect(await drainCommands(cfg(), { ...deps, take: () => [cmd] })).toBe(0);
+    expect(answers.size()).toBe(0);
+  });
+
   test("threads the session record into terminal focus and traces herdr's terminal reason", async () => {
     const seen: Array<{ pid: number; agent: string; title?: string; cwd?: string }> = [];
     const { traces, deps } = harness({
@@ -2858,6 +3391,179 @@ describe("drainCommands (authenticate, validate, then execute)", () => {
 
   test("a throwing take() cannot derail the sweep", async () => {
     expect(await drainCommands(cfg(), { take: () => { throw new Error("boom"); } })).toBe(0);
+  });
+});
+
+// --- the LAN channel's glue into the SAME command chain (NOM-44 phase 1) -----------------------
+//
+// acceptLanCommand is the listener's sink. It must buffer the blob exactly the way extractCommands does
+// for the worker leg and then kick an immediate drain — never re-validate, so the two channels dedupe on
+// the one thing that is identical across them: the inner sealed nonce.
+describe("acceptLanCommand + enqueueDrainCommands (the LAN leg of command intake)", () => {
+  beforeEach(() => { resetCommandState(); });
+
+  const NOW = 1_800_000_000_000;
+
+  const lanBlob = (over: Record<string, unknown> = {}): Promise<string> => encryptBlob(KEY, {
+    kind: "focus-terminal", sessionId: "sess-a", ts: NOW, nonce: "lan-nonce-1", ...over,
+  });
+
+  const harness = () => {
+    const focused: number[] = [];
+    const traces: Record<string, unknown>[] = [];
+    const deps: DrainCommandsDeps = {
+      readRecords: async () => [{ sessionId: "sess-a", rec: rec({ pid: 11 }) }],
+      adapters: [{ ...claudeAdapter, locateTuiPid: (async ({ record }) => record.pid) as AgentAdapter["locateTuiPid"] }],
+      focus: async (pid) => { focused.push(pid); return { ok: true, via: "terminal-app" }; },
+      now: () => NOW,
+      trace: (e) => traces.push(e as Record<string, unknown>),
+    };
+    return { focused, traces, deps };
+  };
+
+  test("a LAN command lands in the shared buffer under a lan:-prefixed id and drains through the normal chain", async () => {
+    const { focused, traces, deps } = harness();
+    // acceptLanCommand pushes into the SAME module buffer the worker leg fills (the drain's default
+    // take()), and kicks the drain itself — the whole latency win in one call.
+    expect(await acceptLanCommand({ nonce: "outer-1", blob: await lanBlob(), config: cfg() }, deps)).toBe(1);
+    expect(focused).toEqual([11]);
+    expect(traces[0]).toMatchObject({ id: `${LAN_COMMAND_ID_PREFIX}outer-1`, sessionId: "sess-a", result: "focused" });
+  });
+
+  test("the same ciphertext delivered on BOTH channels focuses once — the inner nonce is the bound", async () => {
+    const { focused, deps } = harness();
+    const blob = await lanBlob();
+    // The worker leg delivers the identical ciphertext under a server-minted id and wins the race...
+    expect(await drainCommands(cfg(), { ...deps, take: () => extractCommands({ commands: [{ id: "wrk-1", blob }] }) })).toBe(1);
+    // ...so the LAN copy, arriving with a different OUTER nonce and a different id, is dropped as a
+    // replay of the inner sealed nonce. No second window raise.
+    expect(await acceptLanCommand({ nonce: "outer-1", blob, config: cfg() }, deps)).toBe(0);
+    expect(focused).toEqual([11]);
+  });
+
+  test("the shared COMMAND_BUFFER_MAX bound holds, so a LAN peer cannot grow the queue without limit", async () => {
+    const blob = await lanBlob();
+    const traces: Record<string, unknown>[] = [];
+    // Queue far more than the bound WITHOUT draining (a take that yields nothing leaves the buffer be).
+    for (let i = 0; i < 100; i++) {
+      await acceptLanCommand({ nonce: `outer-${i}`, blob, config: cfg() }, { take: () => [], now: () => NOW });
+    }
+    // Now drain for real: every buffered entry produces exactly one trace line, so the count IS the
+    // buffer's depth. 32 = COMMAND_BUFFER_MAX.
+    await drainCommands(cfg(), { readRecords: async () => [], now: () => NOW, trace: (e) => traces.push(e as Record<string, unknown>) });
+    expect(traces.length).toBe(32);
+  });
+
+  test("enqueueDrainCommands serializes: three concurrent drains never overlap", async () => {
+    // Distinct inner nonces so each drain gets past the replay check and into the (async) record read,
+    // which is where an overlap would show up.
+    const blobs = await Promise.all([1, 2, 3].map((i) => lanBlob({ nonce: `lan-nonce-${i}` })));
+    let queued = 0;
+    let active = 0;
+    let overlapped = false;
+    const deps: DrainCommandsDeps = {
+      take: () => [{ id: `c-${queued}`, blob: blobs[queued++] }],
+      readRecords: async () => {
+        active += 1;
+        if (active > 1) overlapped = true;
+        await new Promise((r) => setTimeout(r, 5));
+        active -= 1;
+        return [];
+      },
+      now: () => NOW,
+      trace: () => { /* silent */ },
+    };
+    await Promise.all([
+      enqueueDrainCommands(cfg(), deps),
+      enqueueDrainCommands(cfg(), deps),
+      enqueueDrainCommands(cfg(), deps),
+    ]);
+    expect(overlapped).toBe(false);
+    expect(queued).toBe(3);
+  });
+
+  test("a throwing sink call is swallowed — the HTTP response must never depend on the drain", () => {
+    expect(() => acceptLanCommand({ nonce: "outer-x", blob: "not-a-blob", config: cfg() })).not.toThrow();
+  });
+});
+
+// --- the LAN answer sink: the split-brain backstop (NOM-44 phase 2) ---------------------------
+//
+// By the time this sink runs the listener has ALREADY stored the sealed answer (that store is what the
+// Claude hook's loopback poll and the in-process Codex relay read). Its only job is to tell the WORKER
+// the request is settled, so the island's Allow/Deny buttons retire even when the phone's own parallel
+// worker leg failed. It must never throw, never block the phone's response, and never count as a gone
+// strike — the gone ladder is a /cc/event authority signal, and this path never goes near that route.
+describe("acceptLanAnswer (the worker echo after a LAN-delivered answer)", () => {
+  const delivery = () => ({ requestId: "req-lan-1", answerBlob: "sealed-answer", config: cfg() });
+
+  test("echoes exactly one blob-free POST /v1/cc/decision/resolve with the pairing's PC auth", async () => {
+    const calls: Array<{ url: string; method?: string; headers?: Record<string, string>; body?: string }> = [];
+    const fetchFn = (async (url: string, init: { method?: string; headers?: Record<string, string>; body?: string }) => {
+      calls.push({ url, ...init });
+      return new Response(JSON.stringify({ ok: true, status: "superseded" }), { status: 200 });
+    }) as unknown as typeof fetch;
+    // resolveFn is the seam; the default is the SAME resolveOnRelay the Codex relay uses, so the shape
+    // asserted here is the shape that ships.
+    await acceptLanAnswer(delivery(), { delayMs: 0, resolveFn: (config, requestId) => resolveOnRelay(config, requestId, fetchFn) });
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0].url).toBe("https://w.test/v1/cc/decision/resolve");
+    expect(calls[0].method).toBe("POST");
+    expect(JSON.parse(calls[0].body!)).toEqual({ requestId: "req-lan-1" }); // blob-free: the worker stays blind
+    expect(calls[0].headers).toMatchObject({ "x-cc-pairing": "p", "x-cc-auth": "s" });
+    // The one route that feeds the gone-strike ladder is /v1/cc/event; this path never touches it.
+    expect(calls.every((c) => !c.url.endsWith("/v1/cc/event"))).toBe(true);
+  });
+
+  test("a 404/410 (the phone's own worker leg already retired it) is a normal outcome, never a gone strike", async () => {
+    // The gone-strike ladder is fed EXCLUSIVELY by the /v1/cc/event POSTers (postEvent + runHook), which
+    // is why this is a structural property rather than a counter assertion: the LAN echo issues exactly
+    // one request, to the resolve route, and calls nothing else — there is no path from here to
+    // recordGoneStrike at all. A definitive status is simply "already retired", the NORMAL race outcome.
+    for (const status of [404, 410]) {
+      const urls: string[] = [];
+      const fetchFn = (async (url: string) => { urls.push(url); return new Response("", { status }); }) as unknown as typeof fetch;
+      await acceptLanAnswer(delivery(), { delayMs: 0, resolveFn: (config, requestId) => resolveOnRelay(config, requestId, fetchFn) });
+      expect(urls).toEqual(["https://w.test/v1/cc/decision/resolve"]);
+    }
+  });
+
+  test("a failing echo resolves silently (traced, never thrown) — the worker's 30 s sweep is the backstop", async () => {
+    const traces: Array<Record<string, unknown>> = [];
+    await acceptLanAnswer(delivery(), {
+      delayMs: 0,
+      resolveFn: async () => { throw new Error("network gone"); },
+      trace: (e) => traces.push(e as Record<string, unknown>),
+    });
+    expect(traces).toEqual([{ event: "lan", result: "echo-failed", requestId: "req-lan-1" }]);
+  });
+
+  test("a synchronously throwing resolver cannot surface into the listener's request handler", () => {
+    expect(() => acceptLanAnswer(delivery(), { delayMs: 0, resolveFn: () => { throw new Error("boom"); } })).not.toThrow();
+  });
+
+  /** THE ECHO IS A BACKSTOP, NOT THE FIRST WRITER (field 2026-08-05). It used to fire the instant the
+   *  answer landed, which on a real LAN is always before the phone's own worker leg can land — so
+   *  /v1/cc/decision/resolve stamped `superseded` on the user's OWN answer, the phone's worker leg came
+   *  back 409, and the row read "Replaced by a newer request" for a tap that had just succeeded. */
+  test("the echo gives the phone's own worker leg a head start before it fires", async () => {
+    const order: string[] = [];
+    let released!: () => void;
+    const waited = new Promise<void>((resolve) => { released = resolve; });
+    const echo = acceptLanAnswer(delivery(), {
+      sleep: (ms) => { order.push(`slept:${ms}`); return waited; },
+      resolveFn: async () => { order.push("resolve"); },
+    });
+    expect(order).toEqual([`slept:${LAN_ANSWER_ECHO_DELAY_MS}`]); // nothing has been echoed yet
+    released();
+    await echo;
+    expect(order).toEqual([`slept:${LAN_ANSWER_ECHO_DELAY_MS}`, "resolve"]);
+  });
+
+  test("the default head start is a real, bounded wait (not zero, not forever)", () => {
+    expect(LAN_ANSWER_ECHO_DELAY_MS).toBeGreaterThan(0);
+    expect(LAN_ANSWER_ECHO_DELAY_MS).toBeLessThan(30_000); // inside the worker's poll-liveness sweep
   });
 });
 

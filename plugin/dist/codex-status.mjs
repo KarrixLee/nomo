@@ -2,7 +2,7 @@ import { createRequire } from "node:module";
 var __require = /* @__PURE__ */ createRequire(import.meta.url);
 
 // src/core/hook.ts
-import { readdir as readdir2, readFile as readFile3, unlink as unlink2 } from "node:fs/promises";
+import { readdir as readdir2, readFile as readFile4, unlink as unlink2 } from "node:fs/promises";
 import { hostname } from "node:os";
 import { basename as basename2 } from "node:path";
 
@@ -11,6 +11,7 @@ var textEncoder = new TextEncoder;
 var textDecoder = new TextDecoder;
 var HKDF_INFO = textEncoder.encode("nomo-cc-e2e-v1");
 var RATCHET_INFO_PREFIX = "nomo-cc-ratchet-v1|";
+var LAN_INFO_PREFIX = "nomo-lan-v1|";
 var ECDH_P256 = { name: "ECDH", namedCurve: "P-256" };
 function bytesToBase64(bytes) {
   let binary = "";
@@ -36,6 +37,16 @@ function fromB64url(s) {
 async function deriveE2EKey(qrSecret, phoneNonce) {
   const ikm = await crypto.subtle.importKey("raw", qrSecret, "HKDF", false, ["deriveBits"]);
   const bits = await crypto.subtle.deriveBits({ name: "HKDF", hash: "SHA-256", salt: phoneNonce, info: HKDF_INFO }, ikm, 256);
+  return new Uint8Array(bits);
+}
+async function deriveLanKey(e2eKey, pairingId) {
+  const ikm = await crypto.subtle.importKey("raw", e2eKey, "HKDF", false, ["deriveBits"]);
+  const bits = await crypto.subtle.deriveBits({
+    name: "HKDF",
+    hash: "SHA-256",
+    salt: new Uint8Array(0),
+    info: textEncoder.encode(LAN_INFO_PREFIX + pairingId)
+  }, ikm, 256);
   return new Uint8Array(bits);
 }
 async function generateEphemeralKeyPair() {
@@ -80,9 +91,9 @@ async function sha256Hex(s) {
 }
 
 // src/core/adapter.ts
-import { execFile } from "node:child_process";
+import { execFile as execFile2 } from "node:child_process";
 import { readdir, readFile as readFile2, stat as stat2 } from "node:fs/promises";
-import { promisify } from "node:util";
+import { promisify as promisify2 } from "node:util";
 import { basename, join as join2 } from "node:path";
 
 // src/core/shared.ts
@@ -91,7 +102,7 @@ import { appendFileSync, existsSync, readFileSync, statSync, truncateSync } from
 import { execFileSync, spawn } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "1.4.15";
+var PLUGIN_VERSION = "1.7.9";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -101,6 +112,20 @@ function debugToken(value) {
 function formatPlanPickerDebug(input) {
   const value = `${debugToken(input.version ?? PLUGIN_VERSION)} ev:${debugToken(input.event)} cls:${debugToken(input.classifier)} mk:${input.marker ?? "0"} dq:${input.daemon ?? "na"}(${input.daemonDisposition ?? "na"}) ttl:${debugToken(input.ttl ?? "-")} by:${input.by}`;
   return Array.from(value).slice(0, DBG_BLOB_TEXT_MAX_CHARS).join("");
+}
+function formatDecisionHoldDebug(input) {
+  const value = `${debugToken(input.version ?? PLUGIN_VERSION)} ev:hold req:${debugToken(input.requestId.slice(0, 8))} pid:${input.pid}`;
+  return Array.from(value).slice(0, DBG_BLOB_TEXT_MAX_CHARS).join("");
+}
+var CODEX_BRIDGE_DOWN_MARKER = "cxbridge:down";
+function appendCodexBridgeMarker(dbg, down) {
+  if (typeof dbg !== "string" || dbg.length === 0)
+    return dbg;
+  const bare = dbg.split(` ${CODEX_BRIDGE_DOWN_MARKER}`).join("");
+  if (!down)
+    return bare;
+  const next = `${bare} ${CODEX_BRIDGE_DOWN_MARKER}`;
+  return Array.from(next).length <= DBG_BLOB_TEXT_MAX_CHARS ? next : bare;
 }
 var CC_DIR = `${process.env.HOME}/.config/cc-status`;
 var SESSION_TRACE_PATH = `${CC_DIR}/session-trace.log`;
@@ -179,6 +204,23 @@ function appendFittedPlanAndDebug(base, plan, dbg) {
   const withDebug = { ...withPlan, dbg: capped };
   return sealedBlobChars(encoder.encode(JSON.stringify(withDebug)).length) <= BLOB_FIT_CHARS ? withDebug : withPlan;
 }
+var RECORD_FULL_TEXT_MAX_CHARS = 262144;
+var RECORD_FULL_TEXT_TRUNCATION_MARKER = `
+…[truncated]`;
+function fullTextForRecord(full, fitted) {
+  if (typeof full !== "string" || full.length === 0)
+    return;
+  if (full === fitted)
+    return;
+  const chars = Array.from(full);
+  if (chars.length <= RECORD_FULL_TEXT_MAX_CHARS)
+    return full;
+  const markerChars = Array.from(RECORD_FULL_TEXT_TRUNCATION_MARKER).length;
+  return chars.slice(0, RECORD_FULL_TEXT_MAX_CHARS - markerChars).join("") + RECORD_FULL_TEXT_TRUNCATION_MARKER;
+}
+function recordFullTextIsComplete(value) {
+  return !value.endsWith(RECORD_FULL_TEXT_TRUNCATION_MARKER);
+}
 async function flagExists(path) {
   try {
     await access(path);
@@ -210,6 +252,81 @@ async function codexAppServerSocketAvailable(socketPath = codexAppServerSocketPa
   } catch {
     return false;
   }
+}
+var CODEX_DAEMON_START_ARGS = ["app-server", "daemon", "start"];
+var CODEX_DAEMON_START_TIMEOUT_MS = 8000;
+var CODEX_DAEMON_SOCKET_WAIT_MS = 4000;
+var CODEX_DAEMON_SOCKET_POLL_MS = 250;
+async function startCodexAppServerDaemon(deps = {}) {
+  const trace = deps.trace ?? ((event) => traceSession(event));
+  const probe = deps.probe ?? (() => codexAppServerSocketAvailable());
+  const sleep = deps.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
+  const command = deps.codexPath ?? "codex";
+  const timeoutMs = deps.timeoutMs ?? CODEX_DAEMON_START_TIMEOUT_MS;
+  const socketWaitMs = deps.socketWaitMs ?? CODEX_DAEMON_SOCKET_WAIT_MS;
+  const spawnFn = deps.spawnFn ?? ((cmd, args) => spawn(cmd, [...args], { stdio: "ignore" }));
+  let exit;
+  try {
+    exit = await new Promise((resolve) => {
+      let settled = false;
+      const done = (value) => {
+        if (settled)
+          return;
+        settled = true;
+        resolve(value);
+      };
+      let child;
+      try {
+        child = spawnFn(command, CODEX_DAEMON_START_ARGS);
+      } catch {
+        done("error");
+        return;
+      }
+      const timer = setTimeout(() => {
+        try {
+          child.kill("SIGTERM");
+        } catch {}
+        done("timeout");
+      }, timeoutMs);
+      timer.unref?.();
+      child.on("error", () => {
+        clearTimeout(timer);
+        done("error");
+      });
+      child.on("exit", (code, signal) => {
+        clearTimeout(timer);
+        done({ code, signal });
+      });
+    });
+  } catch {
+    exit = "error";
+  }
+  if (exit === "error" || exit === "timeout" || exit.code !== 0) {
+    trace({
+      event: "codex-daemon-start",
+      outcome: exit === "error" ? "spawn-failed" : exit === "timeout" ? "timeout" : "nonzero-exit",
+      ...typeof exit === "object" ? { code: exit.code, signal: exit.signal } : {}
+    });
+    return false;
+  }
+  const deadline = socketWaitMs;
+  for (let waited = 0;; waited += CODEX_DAEMON_SOCKET_POLL_MS) {
+    let up = false;
+    try {
+      up = await probe();
+    } catch {
+      up = false;
+    }
+    if (up) {
+      trace({ event: "codex-daemon-start", outcome: "started", waitedMs: waited });
+      return true;
+    }
+    if (waited >= deadline)
+      break;
+    await sleep(CODEX_DAEMON_SOCKET_POLL_MS);
+  }
+  trace({ event: "codex-daemon-start", outcome: "no-socket", waitedMs: deadline });
+  return false;
 }
 function lastHookPath(agent) {
   return `${CC_DIR}/last-hook-${agent}`;
@@ -450,15 +567,37 @@ async function completePendingPairing(pending, configPath, opts = {}) {
 function isWatchdogCommand(psCommand) {
   return psCommand.includes("cc-watchdog");
 }
-function formatWatchdogPidfile(pid, version = PLUGIN_VERSION) {
-  return `${pid} ${version}`;
+function watchdogBuildStamp(path = WATCHDOG_PATH) {
+  try {
+    const bytes = readFileSync(path);
+    let hash = 2166136261;
+    for (let i = 0;i < bytes.length; i++) {
+      hash ^= bytes[i];
+      hash = Math.imul(hash, 16777619);
+    }
+    return (hash >>> 0).toString(36);
+  } catch {
+    return;
+  }
+}
+function watchdogBuildDiffers(incumbent, current) {
+  if (incumbent === undefined || current === undefined)
+    return false;
+  return incumbent !== current;
+}
+function formatWatchdogPidfile(pid, version = PLUGIN_VERSION, build) {
+  return `${pid} ${version}${typeof build === "string" && build.length > 0 ? ` ${build}` : ""}`;
 }
 function parseWatchdogPidfile(raw) {
-  const [pidField, versionField] = raw.trim().split(/\s+/);
+  const [pidField, versionField, buildField] = raw.trim().split(/\s+/);
   const pid = Number.parseInt(pidField ?? "", 10);
   if (!Number.isFinite(pid) || pid <= 0)
     return null;
-  return { pid, ...typeof versionField === "string" && versionField.length > 0 ? { version: versionField } : {} };
+  return {
+    pid,
+    ...typeof versionField === "string" && versionField.length > 0 ? { version: versionField } : {},
+    ...typeof buildField === "string" && buildField.length > 0 ? { build: buildField } : {}
+  };
 }
 function watchdogHolderIsLive(pid, deps = {}) {
   const isAlive = deps.isAlive ?? pidAlive;
@@ -478,6 +617,7 @@ function ensureWatchdog(deps = {}) {
       return;
     const pidPath = deps.pidPath ?? WATCHDOG_PID_PATH;
     const version = deps.version ?? PLUGIN_VERSION;
+    const build = "build" in deps ? deps.build : watchdogBuildStamp();
     const readPidfile = deps.readPidfile ?? (() => {
       try {
         return readFileSync(pidPath, "utf8");
@@ -493,7 +633,7 @@ function ensureWatchdog(deps = {}) {
     const raw = readPidfile();
     const holder = typeof raw === "string" ? parseWatchdogPidfile(raw) : null;
     if (holder && watchdogHolderIsLive(holder.pid, deps)) {
-      if (holder.version === version)
+      if (holder.version === version && !watchdogBuildDiffers(holder.build, build))
         return;
       try {
         killPid(holder.pid, "SIGTERM");
@@ -508,6 +648,81 @@ async function readRecord(sessionId, sessionsDir = SESSIONS_DIR) {
   } catch {
     return null;
   }
+}
+async function stampPermissionDetailFullAt(sessionsDir, sessionId, permissionDetailFull) {
+  try {
+    const record = await readRecord(sessionId, sessionsDir);
+    if (!record)
+      return;
+    if (record.permissionDetailFull === permissionDetailFull)
+      return;
+    await atomicWrite(`${sessionsDir}/${sessionId}.json`, JSON.stringify({ ...record, permissionDetailFull }), 384);
+  } catch {}
+}
+async function stampPermissionDetailFull(sessionId, permissionDetailFull) {
+  return stampPermissionDetailFullAt(SESSIONS_DIR, sessionId, permissionDetailFull);
+}
+var DECISION_HOLD_SUFFIX = ".hold";
+function decisionHoldFileName(sessionId) {
+  return `${sessionId}${DECISION_HOLD_SUFFIX}`;
+}
+async function writeDecisionHoldAt(sessionsDir, sessionId, hold) {
+  try {
+    await atomicWrite(`${sessionsDir}/${decisionHoldFileName(sessionId)}`, JSON.stringify(hold), 384);
+  } catch {}
+}
+async function clearDecisionHoldAt(sessionsDir, sessionId, pid, beforeUnlink) {
+  const path = `${sessionsDir}/${decisionHoldFileName(sessionId)}`;
+  try {
+    const raw = await readFile(path, "utf8").catch(() => {
+      return;
+    });
+    if (raw !== undefined) {
+      let owner;
+      try {
+        owner = JSON.parse(raw).pid;
+      } catch {
+        owner = undefined;
+      }
+      if (typeof owner === "number" && owner !== pid)
+        return false;
+    }
+    if (beforeUnlink !== undefined) {
+      try {
+        await beforeUnlink();
+      } catch {}
+    }
+    await unlink(path).catch(() => {});
+    return true;
+  } catch {
+    return false;
+  }
+}
+async function settleDecisionHoldRecordAt(sessionsDir, sessionId, patch) {
+  try {
+    const record = await readRecord(sessionId, sessionsDir);
+    if (!record)
+      return;
+    if (record.op !== "update" || record.prio !== 1)
+      return;
+    await atomicWrite(`${sessionsDir}/${sessionId}.json`, JSON.stringify({ ...record, ...patch }), 384);
+  } catch {}
+}
+async function readDecisionHoldAt(sessionsDir, sessionId) {
+  try {
+    return JSON.parse(await readFile(`${sessionsDir}/${decisionHoldFileName(sessionId)}`, "utf8"));
+  } catch {
+    return null;
+  }
+}
+async function writeDecisionHold(sessionId, hold) {
+  return writeDecisionHoldAt(SESSIONS_DIR, sessionId, hold);
+}
+async function clearDecisionHold(sessionId, pid, beforeUnlink) {
+  return clearDecisionHoldAt(SESSIONS_DIR, sessionId, pid, beforeUnlink);
+}
+async function settleDecisionHoldRecord(sessionId, patch) {
+  return settleDecisionHoldRecordAt(SESSIONS_DIR, sessionId, patch);
 }
 async function readPrefix(path, maxBytes) {
   const fh = await open(path, "r");
@@ -634,8 +849,313 @@ function codexCompanionBrokerEvidence(pid, ancestorsOf = pidAncestors, commandOf
   return null;
 }
 
-// src/core/adapter.ts
+// src/core/terminal-focus.ts
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 var execFileP = promisify(execFile);
+var OSASCRIPT_TIMEOUT_MS = 4000;
+var HERDR_TIMEOUT_MS = 4000;
+var HERDR_TAB_ID = /^[A-Za-z0-9:]+$/;
+function commandTokens(command) {
+  return command.trim().split(/\s+/).filter(Boolean);
+}
+function isHerdrCommand(command) {
+  if (typeof command !== "string")
+    return false;
+  const executable = commandTokens(command)[0]?.replace(/^['"]|['"]$/g, "");
+  return typeof executable === "string" && /(?:^|\/)herdr$/.test(executable);
+}
+function isHerdrServer(command) {
+  return typeof command === "string" && isHerdrCommand(command) && commandTokens(command).slice(1).includes("server");
+}
+function ancestryContainsHerdr(pid, ancestorsOf = pidAncestors, commandOf = pidCommand) {
+  let ancestors;
+  try {
+    ancestors = ancestorsOf(pid);
+  } catch {
+    ancestors = [];
+  }
+  for (const candidate of [pid, ...ancestors]) {
+    try {
+      if (isHerdrCommand(commandOf(candidate)))
+        return true;
+    } catch {}
+  }
+  return false;
+}
+function recordTitleMatchesPane(recordTitle, paneTitle) {
+  if (typeof recordTitle !== "string" || typeof paneTitle !== "string")
+    return false;
+  if (recordTitle === paneTitle)
+    return true;
+  const match = /^(.*?)(?:\u2026|\.{3})$/.exec(recordTitle);
+  return !!match && match[1].length > 0 && paneTitle.startsWith(match[1]);
+}
+function correlateHerdrPane(context, panes) {
+  let candidates = context.agent === "claude" ? panes.filter((pane) => pane.agent === "claude" && recordTitleMatchesPane(context.record.title, pane.terminal_title_stripped)) : panes.filter((pane) => pane.agent === "codex" && typeof context.record.origin?.cwd === "string" && context.record.origin.cwd.length > 0 && pane.cwd === context.record.origin.cwd);
+  if (candidates.length > 1) {
+    const working = candidates.filter((pane) => pane.agent_status === "working");
+    if (working.length > 0)
+      candidates = working;
+  }
+  return candidates.length === 1 ? candidates[0] : undefined;
+}
+function parseHerdrPanes(stdout) {
+  const parsed = JSON.parse(stdout);
+  const panes = parsed?.result?.panes;
+  if (!Array.isArray(panes))
+    throw new Error("invalid herdr pane list");
+  return panes.filter((value) => {
+    if (!value || typeof value !== "object")
+      return false;
+    const pane = value;
+    return typeof pane.agent === "string" && typeof pane.tab_id === "string";
+  });
+}
+function parsePsProcesses(stdout) {
+  const out = [];
+  for (const line of stdout.split(/\r?\n/)) {
+    const match = /^\s*(\d+)\s+(\S+)\s+(.+)$/.exec(line);
+    if (!match)
+      continue;
+    const pid = Number.parseInt(match[1], 10);
+    if (Number.isFinite(pid))
+      out.push({ pid, tty: match[2], command: match[3] });
+  }
+  return out;
+}
+async function runExecFile(file, args, options, deps) {
+  if (deps.execFile)
+    return deps.execFile(file, args, options);
+  const { stdout, stderr } = await execFileP(file, args, options);
+  return { stdout: String(stdout), stderr: String(stderr) };
+}
+var TERMINAL_APPS = [
+  { id: "terminal-app", bundleId: "com.apple.Terminal", match: /\/Terminal\.app\// },
+  { id: "iterm2", bundleId: "com.googlecode.iterm2", match: /\/iTerm\.app\/|\/iTerm2\.app\// },
+  { id: "ghostty", bundleId: "com.mitchellh.ghostty", match: /\/Ghostty\.app\/|(?:^|\/)ghostty(?:\s|$)/ },
+  { id: "wezterm", bundleId: "com.github.wez.wezterm", match: /\/WezTerm\.app\/|(?:^|\/)wezterm(?:-gui)?(?:\s|$)/ },
+  { id: "alacritty", bundleId: "org.alacritty", match: /\/Alacritty\.app\/|(?:^|\/)alacritty(?:\s|$)/ },
+  { id: "kitty", bundleId: "net.kovidgoyal.kitty", match: /\/kitty\.app\/|(?:^|\/)kitty(?:\s|$)/ },
+  { id: "hyper", bundleId: "co.zeit.hyper", match: /\/Hyper\.app\// },
+  { id: "warp", bundleId: "dev.warp.Warp-Stable", match: /\/Warp\.app\// },
+  { id: "vscode", bundleId: "com.microsoft.VSCode", match: /\/Visual Studio Code\.app\/|\/Code\.app\/|Code Helper/ }
+];
+function owningTerminalApp(pid, ancestorsOf = pidAncestors, commandOf = pidCommand) {
+  let chain = [];
+  try {
+    chain = ancestorsOf(pid);
+  } catch {
+    chain = [];
+  }
+  for (const candidate of [pid, ...chain]) {
+    let command;
+    try {
+      command = commandOf(candidate);
+    } catch {
+      continue;
+    }
+    if (typeof command !== "string" || command.length === 0)
+      continue;
+    const app = TERMINAL_APPS.find((a) => a.match.test(command));
+    if (app)
+      return app;
+  }
+  return;
+}
+function ttyDevicePath(raw) {
+  if (typeof raw !== "string")
+    return;
+  const trimmed = raw.trim();
+  if (!isRealTty(trimmed))
+    return;
+  const bare = trimmed.startsWith("/dev/") ? trimmed.slice(5) : trimmed;
+  const name = /^s[0-9]+$/.test(bare) ? `tty${bare}` : bare;
+  const path = `/dev/${name}`;
+  return isTtyDevicePath(path) ? path : undefined;
+}
+function isTtyDevicePath(path) {
+  return /^\/dev\/tty[a-z0-9]+$/.test(path);
+}
+function terminalAppScript(devPath) {
+  if (!isTtyDevicePath(devPath))
+    throw new Error("unsafe tty path");
+  return [
+    `tell application "Terminal"`,
+    `	repeat with w in windows`,
+    `		repeat with t in tabs of w`,
+    `			if tty of t is "${devPath}" then`,
+    `				set selected of t to true`,
+    `				set index of w to 1`,
+    `				activate`,
+    `				return "ok"`,
+    `			end if`,
+    `		end repeat`,
+    `	end repeat`,
+    `end tell`,
+    `return "none"`
+  ].join(`
+`);
+}
+function iterm2Script(devPath) {
+  if (!isTtyDevicePath(devPath))
+    throw new Error("unsafe tty path");
+  return [
+    `tell application "iTerm"`,
+    `	repeat with w in windows`,
+    `		repeat with t in tabs of w`,
+    `			repeat with s in sessions of t`,
+    `				if tty of s is "${devPath}" then`,
+    `					select s`,
+    `					select t`,
+    `					select w`,
+    `					activate`,
+    `					return "ok"`,
+    `				end if`,
+    `			end repeat`,
+    `		end repeat`,
+    `	end repeat`,
+    `end tell`,
+    `return "none"`
+  ].join(`
+`);
+}
+function activateScript(bundleId) {
+  if (!/^[A-Za-z0-9.\-]+$/.test(bundleId))
+    throw new Error("unsafe bundle id");
+  return `tell application id "${bundleId}" to activate`;
+}
+async function runOsascript(script) {
+  const { stdout } = await execFileP("osascript", ["-e", script], { timeout: OSASCRIPT_TIMEOUT_MS });
+  return String(stdout).trim();
+}
+async function ttyViaPs(pid) {
+  try {
+    const { stdout } = await execFileP("ps", ["-o", "tty=", "-p", String(pid)]);
+    const trimmed = stdout.trim();
+    return trimmed.length > 0 ? trimmed : undefined;
+  } catch {
+    return;
+  }
+}
+function note(deps, event) {
+  try {
+    deps.trace?.(event);
+  } catch {}
+}
+async function focusHerdr(pid, deps, ancestorsOf, commandOf) {
+  const context = deps.context;
+  if (!context) {
+    note(deps, { event: "terminal-focus", pid, result: "ambiguous", reason: "herdr-ambiguous" });
+    return { ok: false, reason: "herdr-ambiguous" };
+  }
+  let pane;
+  try {
+    const listed = await runExecFile("herdr", ["pane", "list"], { timeout: HERDR_TIMEOUT_MS }, deps);
+    if ((listed.exitCode ?? 0) !== 0)
+      throw new Error("herdr pane list failed");
+    pane = correlateHerdrPane(context, parseHerdrPanes(String(listed.stdout)));
+  } catch {
+    note(deps, { event: "terminal-focus", pid, result: "unsupported", reason: "herdr-cli-failed" });
+    return { ok: false, reason: "herdr-cli-failed" };
+  }
+  if (!pane) {
+    note(deps, { event: "terminal-focus", pid, result: "ambiguous", reason: "herdr-ambiguous" });
+    return { ok: false, reason: "herdr-ambiguous" };
+  }
+  if (!HERDR_TAB_ID.test(pane.tab_id)) {
+    note(deps, { event: "terminal-focus", pid, result: "unsupported", reason: "herdr-cli-failed" });
+    return { ok: false, reason: "herdr-cli-failed" };
+  }
+  try {
+    const focused = await runExecFile("herdr", ["tab", "focus", pane.tab_id], { timeout: HERDR_TIMEOUT_MS }, deps);
+    if ((focused.exitCode ?? 0) !== 0)
+      throw new Error("herdr tab focus failed");
+  } catch {
+    note(deps, { event: "terminal-focus", pid, result: "unsupported", reason: "herdr-cli-failed" });
+    return { ok: false, reason: "herdr-cli-failed" };
+  }
+  let app;
+  try {
+    const scanned = await runExecFile("ps", ["-axo", "pid=,tty=,args="], { timeout: HERDR_TIMEOUT_MS }, deps);
+    if ((scanned.exitCode ?? 0) === 0) {
+      const apps = new Map;
+      for (const process2 of parsePsProcesses(String(scanned.stdout))) {
+        if (!isRealTty(process2.tty) || !isHerdrCommand(process2.command) || isHerdrServer(process2.command))
+          continue;
+        const owner = owningTerminalApp(process2.pid, ancestorsOf, commandOf);
+        if (owner)
+          apps.set(owner.bundleId, owner);
+      }
+      if (apps.size === 1)
+        app = apps.values().next().value;
+    }
+  } catch {}
+  if (!app) {
+    note(deps, { event: "terminal-focus", pid, result: "focused", via: "herdr", reason: "focused-detached" });
+    return { ok: true, via: "herdr", reason: "focused-detached" };
+  }
+  try {
+    await (deps.osascript ?? runOsascript)(activateScript(app.bundleId));
+    note(deps, { event: "terminal-focus", pid, result: "focused", via: "herdr", app: app.id, reason: "herdr-focused" });
+    return { ok: true, via: "herdr", reason: "herdr-focused" };
+  } catch {
+    note(deps, { event: "terminal-focus", pid, result: "osascript-failed", app: app.id });
+    return { ok: false, reason: "osascript-failed" };
+  }
+}
+async function focusTerminalForPid(pid, deps = {}) {
+  try {
+    if ((deps.platform ?? process.platform) !== "darwin") {
+      note(deps, { event: "terminal-focus", pid, result: "unsupported", why: "not-darwin" });
+      return { ok: false, reason: "unsupported" };
+    }
+    const ancestorsOf = deps.ancestorsOf ?? pidAncestors;
+    const commandOf = deps.commandOf ?? pidCommand;
+    if (ancestryContainsHerdr(pid, ancestorsOf, commandOf)) {
+      return await focusHerdr(pid, deps, ancestorsOf, commandOf);
+    }
+    let rawTty;
+    try {
+      rawTty = await (deps.ttyOf ?? ttyViaPs)(pid);
+    } catch {
+      rawTty = undefined;
+    }
+    const devPath = ttyDevicePath(rawTty);
+    if (devPath === undefined) {
+      note(deps, { event: "terminal-focus", pid, result: "no-tty", tty: rawTty ?? "" });
+      return { ok: false, reason: "no-tty" };
+    }
+    const app = owningTerminalApp(pid, ancestorsOf, commandOf);
+    if (!app) {
+      note(deps, { event: "terminal-focus", pid, result: "unsupported", why: "no-owning-app" });
+      return { ok: false, reason: "unsupported" };
+    }
+    const osascript = deps.osascript ?? runOsascript;
+    try {
+      if (app.id === "terminal-app" || app.id === "iterm2") {
+        const script = app.id === "terminal-app" ? terminalAppScript(devPath) : iterm2Script(devPath);
+        const out = await osascript(script);
+        if (String(out).trim() === "ok") {
+          const via = app.id === "terminal-app" ? "terminal-app" : "iterm2";
+          note(deps, { event: "terminal-focus", pid, result: "focused", via, app: app.id });
+          return { ok: true, via };
+        }
+      }
+      await osascript(activateScript(app.bundleId));
+      note(deps, { event: "terminal-focus", pid, result: "focused", via: "app-activate", app: app.id });
+      return { ok: true, via: "app-activate" };
+    } catch {
+      note(deps, { event: "terminal-focus", pid, result: "osascript-failed", app: app.id });
+      return { ok: false, reason: "osascript-failed" };
+    }
+  } catch {
+    return { ok: false, reason: "osascript-failed" };
+  }
+}
+
+// src/core/adapter.ts
+var execFileP2 = promisify2(execFile2);
 var claudeToolDetail = {
   Bash: "running",
   Edit: "editing",
@@ -1332,7 +1852,7 @@ function rolloutPathFromLsof(output) {
 }
 async function rolloutViaLsof(pid) {
   try {
-    const { stdout } = await execFileP("lsof", ["-a", "-p", String(pid), "-Fn"]);
+    const { stdout } = await execFileP2("lsof", ["-a", "-p", String(pid), "-Fn"]);
     return rolloutPathFromLsof(stdout);
   } catch {
     return;
@@ -1496,12 +2016,12 @@ function labelFromCwd(cwd) {
   return b.length > 0 ? b : "session";
 }
 async function runPs() {
-  const { stdout } = await execFileP("ps", ["-axo", "pid=,tty=,args="]);
+  const { stdout } = await execFileP2("ps", ["-axo", "pid=,tty=,args="]);
   return stdout;
 }
 async function cwdViaLsof(pid) {
   try {
-    const { stdout } = await execFileP("lsof", ["-a", "-p", String(pid), "-d", "cwd", "-Fn"]);
+    const { stdout } = await execFileP2("lsof", ["-a", "-p", String(pid), "-d", "cwd", "-Fn"]);
     for (const line of stdout.split(`
 `))
       if (line.startsWith("n"))
@@ -1513,7 +2033,7 @@ async function cwdViaLsof(pid) {
 }
 async function processStartedAtViaPs(pid) {
   try {
-    const { stdout } = await execFileP("ps", ["-p", String(pid), "-o", "lstart="]);
+    const { stdout } = await execFileP2("ps", ["-p", String(pid), "-o", "lstart="]);
     const value = Date.parse(stdout.trim());
     return Number.isFinite(value) ? value : undefined;
   } catch {
@@ -1531,12 +2051,16 @@ async function codexDiscoverLive(known, deps = {}) {
   } catch {
     return [];
   }
-  const knownPids = new Set(known.map((r) => r.pid).filter((p) => typeof p === "number" && Number.isFinite(p)));
+  const retiredOwners = known.filter((r) => r.agent === "codex" && typeof r.retiredAt === "number" && Number.isFinite(r.retiredAt));
+  const knownPids = new Set(known.filter((r) => !retiredOwners.includes(r)).flatMap((r) => [r.pid, r.tuiPid]).filter((p) => typeof p === "number" && Number.isFinite(p)));
   const tuis = filterCodexTuis(parseCodexProcs(output), knownPids);
   const out = [];
   for (const { pid } of tuis) {
     const cwd = await cwdOf(pid);
     const startedAt = await startedAtOf(pid);
+    const retiredOwner = retiredOwners.find((r) => r.tuiPid === pid || r.pid === pid);
+    if (retiredOwner && typeof startedAt === "number" && Number.isFinite(startedAt) && startedAt <= retiredOwner.retiredAt)
+      continue;
     const label = labelFromCwd(cwd);
     let active = false;
     try {
@@ -1554,9 +2078,9 @@ async function codexDiscoverLive(known, deps = {}) {
   }
   return out;
 }
-async function ttyViaPs(pid) {
+async function ttyViaPs2(pid) {
   try {
-    const { stdout } = await execFileP("ps", ["-o", "tty=", "-p", String(pid)]);
+    const { stdout } = await execFileP2("ps", ["-o", "tty=", "-p", String(pid)]);
     const trimmed = stdout.trim();
     return trimmed.length > 0 ? trimmed : undefined;
   } catch {
@@ -1565,7 +2089,7 @@ async function ttyViaPs(pid) {
 }
 async function startTimeViaPs(pid) {
   try {
-    const { stdout } = await execFileP("ps", ["-o", "lstart=", "-p", String(pid)]);
+    const { stdout } = await execFileP2("ps", ["-o", "lstart=", "-p", String(pid)]);
     const parsed = Date.parse(stdout.trim());
     return Number.isFinite(parsed) ? parsed : undefined;
   } catch {
@@ -1680,9 +2204,13 @@ async function claudeLocateTuiPid(ctx, deps = {}) {
       noteLocate(deps, "no-candidate");
       return;
     }
+    if (ancestryContainsHerdr(pid, deps.ancestorsOf ?? pidAncestors, deps.commandOf ?? pidCommand)) {
+      noteLocate(deps, "record-pid");
+      return pid;
+    }
     let tty;
     try {
-      tty = await (deps.ttyOf ?? ttyViaPs)(pid);
+      tty = await (deps.ttyOf ?? ttyViaPs2)(pid);
     } catch {
       tty = undefined;
     }
@@ -1734,6 +2262,7 @@ function codexSubagentSource(source) {
 function codexRolloutCreationEvidence(prefix) {
   let subagent = false;
   let hasUserMessage = false;
+  let headlessExec = false;
   for (const line of prefix.split(`
 `)) {
     if (!line.trim())
@@ -1750,12 +2279,16 @@ function codexRolloutCreationEvidence(prefix) {
       continue;
     const r = row;
     const payload = r.payload;
-    if (r.type === "session_meta" && codexSubagentSource(payload?.source ?? r.source))
-      subagent = true;
+    if (r.type === "session_meta") {
+      if (codexSubagentSource(payload?.source ?? r.source))
+        subagent = true;
+      if (payload?.originator === "codex_exec" || payload?.source === "exec")
+        headlessExec = true;
+    }
     if (r.type === "event_msg" && payload?.type === "user_message")
       hasUserMessage = true;
   }
-  return { subagent, hasUserMessage };
+  return { subagent, hasUserMessage, headlessExec };
 }
 async function codexSessionCreationSuppression(sessionId, transcriptPrefix, transcriptPath, input = {}, deps = {}) {
   const evidence = codexRolloutCreationEvidence(transcriptPrefix);
@@ -1763,6 +2296,12 @@ async function codexSessionCreationSuppression(sessionId, transcriptPrefix, tran
     return {
       guard: "codex-subagent-rollout",
       reason: "session_meta.source is a subagent variant"
+    };
+  }
+  if (evidence.headlessExec) {
+    return {
+      guard: "codex-headless-exec",
+      reason: "session_meta identifies a non-interactive codex exec run"
     };
   }
   const hookName = typeof input.hook_event_name === "string" ? input.hook_event_name : "";
@@ -1904,6 +2443,148 @@ function adapterFor(agent) {
 }
 var allAdapters = [claudeAdapter, codexAdapter];
 
+// src/core/notify-wire.ts
+import { readFile as readFile3 } from "node:fs/promises";
+var NOMO_NOTIFY_ENTRY = "codex-notify";
+function nomoNotifyProgram(home) {
+  return `${home}/.config/cc-status/hook-shim.sh`;
+}
+function isNomoNotifyChain(arr) {
+  const prog = arr[0] ?? "";
+  if (/(^|\/)notify-chain\.sh$/.test(prog))
+    return true;
+  return /(^|\/)hook-shim\.sh$/.test(prog) && arr[1] === NOMO_NOTIFY_ENTRY;
+}
+function referencesNomoNotify(text) {
+  if (text.includes("notify-chain.sh"))
+    return true;
+  return text.includes("hook-shim.sh") && text.includes(NOMO_NOTIFY_ENTRY);
+}
+function arrayReferencesNomoNotify(arr) {
+  return isNomoNotifyChain(arr) || arr.some((s) => referencesNomoNotify(s));
+}
+function sameCommand(a, b) {
+  return a.length === b.length && a.every((v, i) => v === b[i]);
+}
+function unwrapNotify(arr) {
+  if (arr.length === 0)
+    return null;
+  if (isNomoNotifyChain(arr)) {
+    const sep = arr.indexOf("--");
+    if (sep === -1)
+      return null;
+    return unwrapNotify(arr.slice(sep + 1));
+  }
+  const i = arr.indexOf("--previous-notify");
+  if (i !== -1 && i + 1 < arr.length && referencesNomoNotify(arr[i + 1] ?? "")) {
+    const host = [...arr.slice(0, i), ...arr.slice(i + 2)];
+    let embedded = null;
+    try {
+      embedded = JSON.parse(arr[i + 1]);
+    } catch {}
+    if (Array.isArray(embedded) && embedded.every((x) => typeof x === "string")) {
+      const inner = unwrapNotify(embedded);
+      if (inner !== null && inner.length > 0 && !sameCommand(inner, host)) {
+        return [...arr.slice(0, i), "--previous-notify", JSON.stringify(inner), ...arr.slice(i + 2)];
+      }
+    }
+    return host;
+  }
+  return [...arr];
+}
+function wireNotifyArray(existing, program) {
+  const orig = existing && existing.length > 0 ? unwrapNotify(existing) : null;
+  return orig && orig.length > 0 ? [program, NOMO_NOTIFY_ENTRY, "--", ...orig] : [program, NOMO_NOTIFY_ENTRY];
+}
+function parseNotifyFromToml(toml) {
+  for (const line of toml.split(`
+`)) {
+    if (/^\s*\[/.test(line))
+      break;
+    const m = line.match(/^\s*notify\s*=\s*(.*)$/);
+    if (!m)
+      continue;
+    try {
+      const parsed = JSON.parse(m[1]);
+      if (Array.isArray(parsed) && parsed.every((x) => typeof x === "string")) {
+        return { present: true, value: parsed };
+      }
+    } catch {}
+    return { present: true, value: null };
+  }
+  return { present: false, value: null };
+}
+function replaceNotifyInToml(toml, arr) {
+  const line = `notify = ${JSON.stringify(arr)}`;
+  const lines = toml.split(`
+`);
+  let firstTable = -1;
+  for (let i = 0;i < lines.length; i++) {
+    if (/^\s*\[/.test(lines[i])) {
+      firstTable = i;
+      break;
+    }
+    if (/^\s*notify\s*=/.test(lines[i])) {
+      lines[i] = line;
+      return lines.join(`
+`);
+    }
+  }
+  if (firstTable === -1) {
+    const sep = toml.length === 0 || toml.endsWith(`
+`) ? "" : `
+`;
+    return `${toml}${sep}${line}
+`;
+  }
+  lines.splice(firstTable, 0, line, "");
+  return lines.join(`
+`);
+}
+function tomlMayNeedNotifyRepair(toml, program) {
+  const flat = toml.includes("\\") ? toml.split("\\").join("") : toml;
+  if (flat.includes("notify-chain.sh"))
+    return true;
+  if (!flat.includes("hook-shim.sh"))
+    return false;
+  return !flat.includes(program);
+}
+async function repairNotifyWiring(deps = {}) {
+  try {
+    const home = deps.home ?? process.env.HOME ?? "";
+    if (home.length === 0)
+      return "unchanged";
+    const program = nomoNotifyProgram(home);
+    const tomlPath = deps.tomlPath ?? `${codexHome()}/config.toml`;
+    let toml;
+    try {
+      toml = await readFile3(tomlPath, "utf8");
+    } catch {
+      return "unchanged";
+    }
+    if (!tomlMayNeedNotifyRepair(toml, program))
+      return "unchanged";
+    const parsed = parseNotifyFromToml(toml);
+    if (!parsed.present || parsed.value === null)
+      return "refused";
+    if (!arrayReferencesNomoNotify(parsed.value))
+      return "refused";
+    const next = wireNotifyArray(parsed.value, program);
+    if (sameCommand(next, parsed.value))
+      return "unchanged";
+    const bak = `${tomlPath}.bak-nomo`;
+    try {
+      await readFile3(bak);
+    } catch {
+      await atomicWrite(bak, toml);
+    }
+    await atomicWrite(tomlPath, replaceNotifyInToml(toml, next));
+    return "repaired";
+  } catch {
+    return "refused";
+  }
+}
+
 // src/core/hook.ts
 var TOOL_DETAIL = { ...claudeToolDetail, ...codexToolDetail };
 function sessionOrigin(input, ppid = process.ppid, command = pidCommand(ppid)) {
@@ -2004,7 +2685,7 @@ function buildBlob(input, machine, title, plan, agent = "claude", turnStartedAt,
   }) : undefined;
   return appendFittedPlanAndDebug(base, proposedPlan, dbg);
 }
-async function buildEnvelope(input, machine, now, title, e2eKey, sentDone, agent = "claude", startedAt, turnStartedAt, pinnedLabel, model, planOverride, attentionKindOverride, proposedPlan, dbg) {
+async function buildEnvelope(input, machine, now, title, e2eKey, sentDone, agent = "claude", startedAt, turnStartedAt, pinnedLabel, model, planOverride, attentionKindOverride, proposedPlan, dbg, onBlobPlaintext) {
   if (typeof input !== "object" || input === null)
     return null;
   const i = input;
@@ -2018,7 +2699,11 @@ async function buildEnvelope(input, machine, now, title, e2eKey, sentDone, agent
   if (typeof startedAt === "number" && Number.isFinite(startedAt))
     base.startedAt = startedAt;
   const at = Math.floor(now / 1000);
-  const blob = await encryptBlob(e2eKey, buildBlob(i, machine, title, plan, agent, turnStartedAt, pinnedLabel, model, at, proposedPlan, dbg));
+  const plaintext = buildBlob(i, machine, title, plan, agent, turnStartedAt, pinnedLabel, model, at, proposedPlan, dbg);
+  try {
+    onBlobPlaintext?.(plaintext);
+  } catch {}
+  const blob = await encryptBlob(e2eKey, plaintext);
   const attentionKind = attentionKindOverride ?? (agent === "codex" && hookName === "PreToolUse" && i.tool_name === "request_user_input" ? "userInput" : undefined);
   return { ...base, ...attentionKind ? { attentionKind } : {}, blob };
 }
@@ -2041,11 +2726,12 @@ async function stashPendingEvent(input, machine, title, now, stashPath = PENDING
     await atomicWrite(stashPath, JSON.stringify(stash), 384);
   } catch {}
 }
-async function trackSessionAt(sessionsDir, sessionId, op, prio, status, blob, machine, label, transcript, agent = "claude", sessionStartedAt, turnStartedAt, turnId, title, pairingId, model, pendingPlanPicker = false, pid = process.ppid, origin, planPickerVerificationPending = false, dbg) {
+async function trackSessionAt(sessionsDir, sessionId, op, prio, status, blob, machine, label, transcript, agent = "claude", sessionStartedAt, turnStartedAt, turnId, title, pairingId, model, pendingPlanPicker = false, pid = process.ppid, origin, planPickerVerificationPending = false, dbg, attentionKind, planFull) {
   try {
     const path = `${sessionsDir}/${sessionId}.json`;
     if (op === "end") {
       await unlink2(path).catch(() => {});
+      await unlink2(`${sessionsDir}/${decisionHoldFileName(sessionId)}`).catch(() => {});
       return;
     }
     const recordedAt = Date.now();
@@ -2072,13 +2758,15 @@ async function trackSessionAt(sessionsDir, sessionId, op, prio, status, blob, ma
       ...planPickerVerificationPending ? { planPickerVerificationPending: true } : {},
       ...pendingPlanPicker || planPickerVerificationPending ? { planPickerPendingSince: recordedAt } : {},
       ...typeof dbg === "string" && dbg.length > 0 ? { dbg } : {},
-      ...origin ? { origin } : {}
+      ...origin ? { origin } : {},
+      ...attentionKind ? { attentionKind } : {},
+      ...typeof planFull === "string" && planFull.length > 0 ? { planFull } : {}
     };
     await atomicWrite(path, JSON.stringify(record), 384);
   } catch {}
 }
-async function trackSession(sessionId, op, prio, status, blob, machine, label, transcript, agent = "claude", sessionStartedAt, turnStartedAt, turnId, title, pairingId, model, pendingPlanPicker = false, pid = process.ppid, origin, planPickerVerificationPending = false, dbg) {
-  return trackSessionAt(SESSIONS_DIR, sessionId, op, prio, status, blob, machine, label, transcript, agent, sessionStartedAt, turnStartedAt, turnId, title, pairingId, model, pendingPlanPicker, pid, origin, planPickerVerificationPending, dbg);
+async function trackSession(sessionId, op, prio, status, blob, machine, label, transcript, agent = "claude", sessionStartedAt, turnStartedAt, turnId, title, pairingId, model, pendingPlanPicker = false, pid = process.ppid, origin, planPickerVerificationPending = false, dbg, attentionKind, planFull) {
+  return trackSessionAt(SESSIONS_DIR, sessionId, op, prio, status, blob, machine, label, transcript, agent, sessionStartedAt, turnStartedAt, turnId, title, pairingId, model, pendingPlanPicker, pid, origin, planPickerVerificationPending, dbg, attentionKind, planFull);
 }
 async function markDoneDeliveredAt(sessionsDir, sessionId) {
   try {
@@ -2100,7 +2788,7 @@ async function reconcileProvisional(config, hookPid) {
         continue;
       let r;
       try {
-        r = JSON.parse(await readFile3(`${SESSIONS_DIR}/${f}`, "utf8"));
+        r = JSON.parse(await readFile4(`${SESSIONS_DIR}/${f}`, "utf8"));
       } catch {
         continue;
       }
@@ -2133,7 +2821,7 @@ async function readTrackedSessions() {
     if (!f.endsWith(".json"))
       continue;
     try {
-      const r = JSON.parse(await readFile3(`${SESSIONS_DIR}/${f}`, "utf8"));
+      const r = JSON.parse(await readFile4(`${SESSIONS_DIR}/${f}`, "utf8"));
       out.push({ sessionId: basename2(f, ".json"), pid: r.pid, provisional: r.provisional, agent: r.agent, ts: r.ts });
     } catch {}
   }
@@ -2184,6 +2872,9 @@ async function runHook(agent) {
     }
     const adapter2 = adapterFor(agent);
     await atomicWrite(lastHookPath(agent), String(Date.now())).catch(() => {});
+    if (agent === "codex" && input.hook_event_name === "SessionStart") {
+      await repairNotifyWiring().catch(() => {});
+    }
     const transcriptPath = typeof input.transcript_path === "string" ? input.transcript_path : "";
     let prefixCache;
     const getPrefix = async () => {
@@ -2217,6 +2908,8 @@ async function runHook(agent) {
     let eventInput = input;
     let reusedForkPredecessor = false;
     let existingRecord = await readRecord(reportedSessionId);
+    if (existingRecord?.agent === "codex" && typeof existingRecord.retiredAt === "number" && Number.isFinite(existingRecord.retiredAt))
+      existingRecord = null;
     let trackedCache;
     const trackedSessions = async () => {
       if (trackedCache === undefined)
@@ -2358,7 +3051,10 @@ async function runHook(agent) {
       ttl: pendingPlanPicker || planPickerVerificationPending ? "0m" : "-",
       by: "h"
     }) : undefined;
-    const envelope = await buildEnvelope(eventInput, machine, Date.now(), title, config.e2eKey, sentDone, agent, startedAt, turnStartedAt, label, model, plan, attentionKind, proposedPlan, dbg);
+    let planFull;
+    const envelope = await buildEnvelope(eventInput, machine, Date.now(), title, config.e2eKey, sentDone, agent, startedAt, turnStartedAt, label, model, plan, attentionKind, proposedPlan, dbg, (plaintext) => {
+      planFull = fullTextForRecord(proposedPlan, plaintext.plan);
+    });
     if (!envelope)
       return;
     const createsRecord = !existingRecord && plan.op !== "end";
@@ -2366,7 +3062,7 @@ async function runHook(agent) {
     const origin = existingRecord?.origin ?? sessionOrigin(input, hookPid, hookCommand);
     const recordPid = reusedForkPredecessor ? existingRecord.pid : hookPid;
     const recordTranscript = reusedForkPredecessor ? existingRecord.transcript ?? transcriptPath : transcriptPath;
-    await trackSession(sessionId, plan.op, plan.prio, plan.status, envelope.blob, machine, label, recordTranscript, agent, startedAt, turnStartedAt, turnId, title, config.pairingId, model, pendingPlanPicker, recordPid, origin, planPickerVerificationPending, dbg);
+    await trackSession(sessionId, plan.op, plan.prio, plan.status, envelope.blob, machine, label, recordTranscript, agent, startedAt, turnStartedAt, turnId, title, config.pairingId, model, pendingPlanPicker, recordPid, origin, planPickerVerificationPending, dbg, envelope.attentionKind, planFull);
     const clearedPickerMarker = pendingPlanPicker === false && planPickerVerificationPending === false && (existingRecord?.pendingPlanPicker === true || existingRecord?.planPickerVerificationPending === true || existingRecord?.planPickerSettled === true);
     if (agent === "codex" && (hookName === "Stop" || pendingPlanPicker || planPickerVerificationPending || clearedPickerMarker)) {
       tracePlanPickerDecision(sessionId, {

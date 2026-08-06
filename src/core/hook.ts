@@ -26,10 +26,11 @@ import {
   SessionCreationSuppression, TrackedSessionLite,
 } from "./adapter";
 import {
-  AgentKind, appendFittedPlanAndDebug, atomicWrite, CCOp, CCStatus, codexCompanionBrokerEvidence, Config, ensureWatchdog, formatPlanPickerDebug, GONE_STRIKE_LIMIT,
+  AgentKind, appendFittedPlanAndDebug, atomicWrite, CCOp, CCStatus, codexCompanionBrokerEvidence, Config, decisionHoldFileName, ensureWatchdog, formatPlanPickerDebug, fullTextForRecord, GONE_STRIKE_LIMIT,
   LAST_SEND_PATH, lastHookPath, loadConfig, loadPendingConfig, localApprovalsState, PENDING_STASH_PATH, PendingEventStash, pidAncestors, pidCommand, PLUGIN_VERSION, readPrefix,
   readRecord, recordGoneStrike, removeRevokedConfig, resetGoneStrikes, SessionOrigin, SessionRecord, SESSIONS_DIR, tracePlanPickerDecision, traceSession,
 } from "./shared";
+import { repairNotifyWiring } from "./notify-wire";
 
 export { SESSION_TRACE_PATH } from "./shared";
 
@@ -244,6 +245,11 @@ export async function buildEnvelope(
   input: unknown, machine: string, now: number, title: string | undefined, e2eKey: Uint8Array, sentDone: boolean,
   agent: AgentKind = "claude", startedAt?: number, turnStartedAt?: number, pinnedLabel?: string, model?: string,
   planOverride?: OpPlan, attentionKindOverride?: "userInput", proposedPlan?: string, dbg?: string,
+  /** APPEND-LAST tee (NOM-44 phase 4). Called with the blob PLAINTEXT this envelope is about to seal,
+   *  so the caller can compare the FITTED `plan` against the full one it passed in and persist the
+   *  unabridged copy on the session record for the LAN `read` op. Purely observational — it runs before
+   *  the seal, never mutates, and a throw is swallowed: a diagnostic tee must not break an envelope. */
+  onBlobPlaintext?: (plain: ReturnType<typeof buildBlob>) => void,
 ): Promise<Record<string, unknown> | null> {
   if (typeof input !== "object" || input === null) return null;
   const i = input as Record<string, unknown>;
@@ -260,7 +266,9 @@ export async function buildEnvelope(
   // `at` is the real event time (`now`) in epoch SECONDS — the phone's honest sort/age key, frozen here
   // and re-sent verbatim by every watchdog heartbeat so an idle-but-heartbeated session ages out.
   const at = Math.floor(now / 1000);
-  const blob = await encryptBlob(e2eKey, buildBlob(i, machine, title, plan, agent, turnStartedAt, pinnedLabel, model, at, proposedPlan, dbg));
+  const plaintext = buildBlob(i, machine, title, plan, agent, turnStartedAt, pinnedLabel, model, at, proposedPlan, dbg);
+  try { onBlobPlaintext?.(plaintext); } catch { /* a tee must never break an envelope */ }
+  const blob = await encryptBlob(e2eKey, plaintext);
   const attentionKind = attentionKindOverride ?? (
     agent === "codex" && hookName === "PreToolUse" && i.tool_name === "request_user_input"
       ? "userInput" as const
@@ -325,12 +333,18 @@ export async function trackSessionAt(
   machine: string, label: string, transcript: string, agent: AgentKind = "claude", sessionStartedAt?: number,
   turnStartedAt?: number, turnId?: string, title?: string, pairingId?: string, model?: string,
   pendingPlanPicker: boolean = false, pid: number = process.ppid, origin?: SessionOrigin,
-  planPickerVerificationPending: boolean = false, dbg?: string,
+  planPickerVerificationPending: boolean = false, dbg?: string, attentionKind?: "userInput",
+  planFull?: string,
 ): Promise<void> {
   try {
     const path = `${sessionsDir}/${sessionId}.json`;
     if (op === "end") {
       await unlink(path).catch(() => {}); // clean exit → no watchdog reaping needed
+      // A hold marker cannot outlive its session. Normally the holding hook's own `finally` retires it,
+      // but that never runs on a SIGKILL (or the SIGTERM a closed terminal sends), and the feed's
+      // liveness/TTL guards only make such a marker INERT — they do not remove the file. This is the
+      // chokepoint where "the session is over" is known, so nothing of it is left behind.
+      await unlink(`${sessionsDir}/${decisionHoldFileName(sessionId)}`).catch(() => {});
       return;
     }
     // lastEvent is the watchdog interrupt-net's gate key: a fresh `start` is a quiet "sessionStart",
@@ -384,6 +398,20 @@ export async function trackSessionAt(
       ...(pendingPlanPicker || planPickerVerificationPending ? { planPickerPendingSince: recordedAt } : {}),
       ...(typeof dbg === "string" && dbg.length > 0 ? { dbg } : {}),
       ...(origin ? { origin } : {}),
+      // APPENDED LAST (NOM-44 phase 3, mirroring how model/pairingId were added): the clear
+      // `attentionKind` discriminator this event POSTed. It rides the worker envelope already; the LAN
+      // frames feed rebuilds its frames from THIS record, so without the cache a Codex
+      // `request_user_input` would reach the phone over LAN looking like a plain approval. Written
+      // through on every event (so a later working/done event drops it — the record is rebuilt whole
+      // here, never patched) and OMITTED when the event has none, keeping every existing record's bytes
+      // byte-identical.
+      ...(attentionKind ? { attentionKind } : {}),
+      // APPENDED LAST (NOM-44 phase 4). The UNABRIDGED plan markdown, present ONLY when the blob's
+      // `plan` key had to be cut (or dropped) to fit the worker's 3072-char sealed ceiling — the caller
+      // passes fullTextForRecord(proposedPlan, <the fitted plan buildBlob produced>), which is undefined
+      // whenever the whole thing already rode. Written through like every field here (the record is
+      // rebuilt whole, never patched), so the next event of this session drops it automatically.
+      ...(typeof planFull === "string" && planFull.length > 0 ? { planFull } : {}),
     };
     // Owner-only (0600): the record carries hostname, cwd basename, the session pid, and the ABSOLUTE
     // transcript path — never group/world readable, matching config.json / the pending stash.
@@ -400,13 +428,14 @@ export async function trackSession(
   machine: string, label: string, transcript: string, agent: AgentKind = "claude", sessionStartedAt?: number,
   turnStartedAt?: number, turnId?: string, title?: string, pairingId?: string, model?: string,
   pendingPlanPicker: boolean = false, pid: number = process.ppid, origin?: SessionOrigin,
-  planPickerVerificationPending: boolean = false, dbg?: string,
+  planPickerVerificationPending: boolean = false, dbg?: string, attentionKind?: "userInput",
+  planFull?: string,
 ): Promise<void> {
   return trackSessionAt(
     SESSIONS_DIR,
     sessionId, op, prio, status, blob, machine, label, transcript, agent, sessionStartedAt,
     turnStartedAt, turnId, title, pairingId, model, pendingPlanPicker, pid, origin,
-    planPickerVerificationPending, dbg,
+    planPickerVerificationPending, dbg, attentionKind, planFull,
   );
 }
 
@@ -578,6 +607,21 @@ export async function runHook(agent: AgentKind): Promise<void> {
     // and best-effort — a stamp failure must never derail the rest of the hook.
     await atomicWrite(lastHookPath(agent), String(Date.now())).catch(() => {});
 
+    // NOTIFY SELF-REPAIR (v1.7.9). Codex's `notify` setting is written into config.toml ONCE, at
+    // pairing, and nothing ever rewrites it — so the version-pinned paths written by ≤1.7.8 broke the
+    // turn-completion backstop permanently at the user's first plugin update, for a user who may never
+    // re-pair. This is the only regularly-firing place that can fix that. Fenced hard:
+    //   - CODEX ONLY (notify is a Codex setting) and SESSION-START ONLY — once per session, not per
+    //     tool use, so a long session pays this exactly once;
+    //   - the check itself is one small read plus three substring scans, and it writes nothing at all
+    //     unless a stale nomo-authored value is genuinely present (see tomlMayNeedNotifyRepair);
+    //   - it swallows everything (fail-open) — a repair that cannot run must never wedge a turn.
+    // Deliberately placed BEFORE the pairing gate below: an unpaired machine can still be carrying a
+    // broken notify line, and leaving it broken until the user re-pairs is the bug, not the fix.
+    if (agent === "codex" && input.hook_event_name === "SessionStart") {
+      await repairNotifyWiring().catch(() => {});
+    }
+
     const transcriptPath = typeof input.transcript_path === "string" ? input.transcript_path : "";
     // The transcript head, read AT MOST ONCE per hook and shared by BOTH the title scanner and the
     // start-time extractor (so the start-time fix adds no second file read). "" when there's no
@@ -637,6 +681,11 @@ export async function runHook(agent: AgentKind): Promise<void> {
     // transcript later vanishing; otherwise parse it from the same head `readTitle` reads (memoized —
     // no second read). Unknown → omitted from the envelope; the worker keeps its first-seen fallback.
     let existingRecord = await readRecord(reportedSessionId);
+    // A retired-owner marker is deliberately not a tracked/visible session. Treat it as absent for all
+    // creation guards: a genuine interactive hook will rebuild the file whole below, while a headless
+    // `codex exec resume <id>` must still be suppressed instead of reviving the marker into a phone row.
+    if (existingRecord?.agent === "codex" && typeof existingRecord.retiredAt === "number" &&
+        Number.isFinite(existingRecord.retiredAt)) existingRecord = null;
     let trackedCache: TrackedSessionLite[] | undefined;
     const trackedSessions = async (): Promise<TrackedSessionLite[]> => {
       if (trackedCache === undefined) trackedCache = await readTrackedSessions();
@@ -854,7 +903,12 @@ export async function runHook(agent: AgentKind): Promise<void> {
       ttl: pendingPlanPicker || planPickerVerificationPending ? "0m" : "-",
       by: "h",
     }) : undefined;
-    const envelope = await buildEnvelope(eventInput, machine, Date.now(), title, config.e2eKey, sentDone, agent, startedAt, turnStartedAt, label, model, plan, attentionKind, proposedPlan, dbg);
+    // The UNABRIDGED plan, kept ONLY when the blob's `plan` key had to be cut to fit the worker's sealed
+    // ceiling (NOM-44 phase 4). The tee hands back the exact plaintext buildBlob produced, so the
+    // comparison is against the real fitted value rather than a re-derivation that could drift.
+    let planFull: string | undefined;
+    const envelope = await buildEnvelope(eventInput, machine, Date.now(), title, config.e2eKey, sentDone, agent, startedAt, turnStartedAt, label, model, plan, attentionKind, proposedPlan, dbg,
+      (plaintext) => { planFull = fullTextForRecord(proposedPlan, plaintext.plan); });
     if (!envelope) return;
 
     // Record (or, on op:end, remove) this session's file and make sure the liveness watchdog is
@@ -874,7 +928,16 @@ export async function runHook(agent: AgentKind): Promise<void> {
       ? (existingRecord!.transcript ?? transcriptPath)
       : transcriptPath;
     await trackSession(sessionId, plan.op, plan.prio, plan.status, envelope.blob as string | undefined, machine, label, recordTranscript, agent, startedAt, turnStartedAt, turnId,
-      title, config.pairingId, model, pendingPlanPicker, recordPid, origin, planPickerVerificationPending, dbg);
+      title, config.pairingId, model, pendingPlanPicker, recordPid, origin, planPickerVerificationPending, dbg,
+      // The SAME discriminator this event's envelope carries — READ BACK OFF THE ENVELOPE, not from the
+      // local `attentionKind` above. buildEnvelope derives it itself for a Codex PreToolUse
+      // `request_user_input` (the local variable is only ever set by the Plan-picker branch), so passing
+      // the local one cached NOTHING for the commonest question there is: the worker channel said
+      // "question", the LAN feed — which rebuilds its frames from THIS record, not from the POST — said
+      // "plain approval", and the same prompt rendered two different cards depending on the transport.
+      envelope.attentionKind as "userInput" | undefined,
+      // The unabridged plan for the LAN `read` op — undefined unless the blob's copy was truncated.
+      planFull);
     const clearedPickerMarker = pendingPlanPicker === false && planPickerVerificationPending === false
       && (existingRecord?.pendingPlanPicker === true || existingRecord?.planPickerVerificationPending === true || existingRecord?.planPickerSettled === true);
     if (agent === "codex" && (hookName === "Stop" || pendingPlanPicker || planPickerVerificationPending || clearedPickerMarker)) {

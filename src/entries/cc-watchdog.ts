@@ -33,19 +33,27 @@ import { readFileSync, statSync, unlinkSync } from "node:fs";
 import { hostname } from "node:os";
 import { basename } from "node:path";
 import { decryptBlob, encryptBlob } from "../core/crypto";
-import { adapterFor, AgentAdapter, allAdapters, codexAdapter, CodexPlanPickerEvidence, DiscoveredSession } from "../core/adapter";
+import { adapterFor, AgentAdapter, allAdapters, codexAdapter, codexTurnActiveFromTail, CodexPlanPickerEvidence, DiscoveredSession } from "../core/adapter";
 import type { LocateTuiReason } from "../core/adapter";
 import { focusTerminalForPid } from "../core/terminal-focus";
 import type { FocusContext, FocusResult } from "../core/terminal-focus";
 import { CodexRemoteInputBridge } from "../core/codex-remote-input-bridge";
 import type { CodexThreadWaitState } from "../core/codex-remote-input-bridge";
-import type { PlanPickerTraceDecision } from "../core/shared";
+import { createLanHintPublisher, createLanListener, lanAnswerStore } from "../core/lan-listener";
+import type { LanAnswerDelivery, LanAnswerStore, LanCommand, LanListener } from "../core/lan-listener";
+import { lanRunningUnderTest } from "../core/lan-wire";
+import { stateHoldLive } from "../core/session-state";
+import { resolveOnRelay } from "../core/codex-remote-input";
+import type { DecisionHold, PlanPickerTraceDecision } from "../core/shared";
 import {
-  AgentKind, appendFittedPlanAndDebug, atomicWrite, CC_DIR, CCOp, CCStatus, codexAppServerSocketAvailable, Config, completePendingPairing, formatPlanPickerDebug, formatWatchdogPidfile,
+  AgentKind, appendCodexBridgeMarker, appendFittedPlanAndDebug, atomicWrite, CC_DIR, CCOp, CCStatus, codexAppServerSocketAvailable, Config, completePendingPairing, formatPlanPickerDebug, formatWatchdogPidfile,
+  startCodexAppServerDaemon,
   GONE_STRIKE_LIMIT, loadConfig, loadPendingConfig, localApprovalsState,
-  PAIR_HTML_FILE, PairPollResult, parseWatchdogPidfile, PendingConfig, pidAlive, PLUGIN_VERSION, readPrefix, readSuffix, recordGoneStrike, removeRevokedConfig,
-  resetGoneStrikes, SessionRecord, SESSIONS_DIR, traceSession, tracePlanPickerDecision, watchdogHolderIsLive, WATCHDOG_PID_PATH,
+  PAIR_HTML_FILE, PairPollResult, parseWatchdogPidfile, PendingConfig, pidAlive, PLUGIN_VERSION, readDecisionHoldAt, readPrefix, readSuffix, recordGoneStrike, removeRevokedConfig,
+  resetGoneStrikes, SessionRecord, SESSIONS_DIR, traceSession, tracePlanPickerDecision, watchdogBuildDiffers,
+  watchdogBuildStamp, watchdogHolderIsLive, WATCHDOG_PID_PATH,
 } from "../core/shared";
+import { rememberBounded } from "../core/bounded-set";
 
 // The transcript-tail interrupt PARSERS live in the agent adapters now (the two detections are
 // structurally different). Re-export them so existing importers/tests that reference "./cc-watchdog"
@@ -201,8 +209,34 @@ export type SessionVerdict = "keep" | "end" | "stale" | "delete";
 export function classifySession(record: SessionRecord | null, now: number, isAlive: (pid: number) => boolean): SessionVerdict {
   if (!record || typeof record.pid !== "number" || !Number.isFinite(record.pid)) return "delete";
   if (typeof record.ts !== "number") return "delete"; // no timestamp → can't age it → nothing to POST
+  // A retired Codex marker is not a session and must never age into another op:end. It exists solely
+  // to reserve the exact interactive owner from discovery; keep it while that TUI lives, then quietly
+  // delete it. A real hook rebuilds the record whole and drops retiredAt, reviving normally.
+  if (record.agent === "codex" && typeof record.retiredAt === "number" && Number.isFinite(record.retiredAt)) {
+    if (typeof record.tuiPid !== "number" || !Number.isFinite(record.tuiPid)) return "delete";
+    return isAlive(record.tuiPid) ? "keep" : "delete";
+  }
   if (now - record.ts > SESSION_STALE_MS) return "stale"; // abandoned (24 h): POST a terminal end, then delete
-  return isAlive(record.pid) ? "keep" : "end";
+  // A precision-correlated Codex TUI owns the session. Its app-server pid can live for the lifetime of
+  // the app and is no evidence that this particular terminal still exists.
+  const ownerPid = record.agent === "codex" && typeof record.tuiPid === "number" && Number.isFinite(record.tuiPid)
+    ? record.tuiPid : record.pid;
+  return isAlive(ownerPid) ? "keep" : "end";
+}
+
+/** Retirement-grade Codex ownership. The general focus locator may use a lone machine-wide TUI or cwd
+ * match as a convenience; neither alone is enough to suppress discovery or declare a working row idle.
+ * Accept direct pid/sentinel ownership, or the strict cwd + process/session-birth correlation below. */
+async function locateCodexOwnedTui(sessionId: string, record: SessionRecord): Promise<number | undefined> {
+  // First spend the same exact evidence the LAN parity path persists: direct hook/discovery ownership,
+  // a cached correlation, or the strict daemon↔provisional cwd/start join.
+  const resolved = resolveCodexTuiOwner(record, await readAllRecords(), pidAlive);
+  if (resolved !== undefined) return resolved;
+  const locate = adapterFor("codex").locateTuiPid;
+  if (!locate) return undefined;
+  let reason: LocateTuiReason | undefined;
+  const pid = await locate({ sessionId, record }, { note: (value) => { reason = value; } });
+  return reason === "record-pid" || reason === "sentinel-pid" ? pid : undefined;
 }
 
 /** The session's cached true start (epoch ms) as an envelope fragment, or nothing when unknown — so
@@ -256,7 +290,10 @@ export async function buildDoneEnvelope(sessionId: string, record: SessionRecord
     // instead of looking freshly finished. OMITTED when the caller has no honest time.
     ...(typeof at === "number" && Number.isFinite(at) ? { at } : {}),
   };
-  const debug = agent === "codex" ? dbg ?? formatPlanPickerDebug({ event: "done", classifier: "done", marker: "0", by: "wd" }) : undefined;
+  const debug = appendCodexBridgeMarker(
+    agent === "codex" ? dbg ?? formatPlanPickerDebug({ event: "done", classifier: "done", marker: "0", by: "wd" }) : undefined,
+    codexBridgeIsDown(),
+  );
   const blob = await encryptBlob(e2eKey, appendFittedPlanAndDebug(base, undefined, debug));
   return { v: 2, sessionId, op: "done", prio: 0, ts: now, blob, ...startedAtField(record) };
 }
@@ -295,7 +332,10 @@ export async function buildNeedsAttentionEnvelope(
     // preserving the existing order and omitted for ordinary permissions/questions.
     ...(typeof at === "number" && Number.isFinite(at) ? { at } : {}),
   };
-  const debug = agent === "codex" ? dbg ?? formatPlanPickerDebug({ event: "attention", classifier: "pending", marker: "0", by: "wd" }) : undefined;
+  const debug = appendCodexBridgeMarker(
+    agent === "codex" ? dbg ?? formatPlanPickerDebug({ event: "attention", classifier: "pending", marker: "0", by: "wd" }) : undefined,
+    codexBridgeIsDown(),
+  );
   const blob = await encryptBlob(e2eKey, appendFittedPlanAndDebug(base, proposedPlan, debug));
   return {
     v: 2, sessionId, op: "update", prio: 1, ts: now,
@@ -323,7 +363,10 @@ export async function buildWorkingEnvelope(
     ...(typeof record.model === "string" && record.model.length > 0 ? { model: record.model } : {}),
     at: Math.floor(now / 1000),
   };
-  const debug = agent === "codex" ? dbg ?? formatPlanPickerDebug({ event: "working", classifier: "resolved", marker: "0", by: "wd" }) : undefined;
+  const debug = appendCodexBridgeMarker(
+    agent === "codex" ? dbg ?? formatPlanPickerDebug({ event: "working", classifier: "resolved", marker: "0", by: "wd" }) : undefined,
+    codexBridgeIsDown(),
+  );
   const blob = await encryptBlob(e2eKey, appendFittedPlanAndDebug(base, undefined, debug));
   return { v: 2, sessionId, op: "update", prio: 0, ts: now, blob, ...startedAtField(record) };
 }
@@ -397,6 +440,16 @@ async function settlePendingPlanPickerDone(
   const envelope = await buildDoneEnvelope(sessionId, snapshot, now, config.e2eKey, "codex", at, dbg) as Record<string, unknown>;
   const next: SessionRecord = {
     ...fresh,
+    // TWO CLOCKS, DELIBERATELY SPLIT.
+    //  - DISPLAY clock: the blob's `at` above is FROZEN at snapshot.ts (the original event time) and is
+    //    computed BEFORE this write, so the phone keeps showing the honest activity age of the turn that
+    //    actually ended — the re-stamp below can never reach it.
+    //  - RETENTION clock: record.ts is what isRetireEligible ages, so it must restart HERE. Before this,
+    //    a picker settled by the hard TTL (PLAN_PICKER_PENDING_MAX_MS, 1 h) inherited a ts that was already
+    //    1 h old, and RETIRE_AFTER_MS was the SAME 1 h — so the settled done was BORN retire-eligible and
+    //    the very next sweep (~47 s later in the field incident) posted a blob-less op:end that hard-deleted
+    //    the row worker-side. The done lived seconds instead of its intended hour.
+    ts: now,
     lastEvent: "done",
     sentDone: true,
     donePending: true,
@@ -466,6 +519,30 @@ export function correlateCodexTuiPid(
     startedAt - candidate.tuiStartedAt <= CODEX_TUI_SESSION_START_SKEW_MS &&
     alive(candidate.pid));
   return matches.length === 1 ? matches[0].pid : undefined;
+}
+
+/** Resolve only retirement-grade Codex ownership. Cached precision correlation wins; provisional rows
+ * and direct CLI hook parents own themselves. Daemon-fronted records must pass the strict cwd + process/
+ * session-birth join above, so a headless app-server job cannot borrow an unrelated lone TUI. */
+export function resolveCodexTuiOwner(
+  record: SessionRecord, candidates: SessionRecord[], alive: (pid: number) => boolean = pidAlive,
+): number | undefined {
+  if (record.agent !== "codex") return undefined;
+  if (typeof record.tuiPid === "number" && Number.isFinite(record.tuiPid) && alive(record.tuiPid)) {
+    return record.tuiPid;
+  }
+  if (record.provisional === true && typeof record.pid === "number" && Number.isFinite(record.pid) && alive(record.pid)) {
+    return record.pid;
+  }
+  const command = record.origin?.ppid_command;
+  if (typeof command === "string") {
+    const tokens = command.trim().split(/\s+/);
+    if (basename(tokens[0] ?? "") === "codex" && tokens[1] !== "app-server" &&
+        !tokens.slice(1).includes("exec") && typeof record.pid === "number" && alive(record.pid)) {
+      return record.pid;
+    }
+  }
+  return correlateCodexTuiPid(record, candidates, alive);
 }
 
 /** Clear ONLY a needsAttention episode that the Stop/notify path explicitly marked as a Plan picker,
@@ -585,9 +662,9 @@ export const PLAN_PICKER_VERIFY_MAX_MS = 30_000;
  *  can otherwise remain valid forever after ESC because dismissal is intentionally absent from JSONL.
  *  One hour preserves long deliberation while guaranteeing that no pending marker is immortal. */
 export const PLAN_PICKER_PENDING_MAX_MS = 60 * 60_000;
-/** Migration/self-heal window for a plain done or the v1.4.8 buggy daemon-settled done. Exact full
- *  picker proof + live pid + no later progress is still required. Bounded so old done rows are never
- *  reconsidered indefinitely. */
+/** Migration/self-heal window for a plain done a killed hook left behind. Exact full picker proof +
+ *  live pid + no later progress is still required. Bounded so old done rows are never reconsidered
+ *  indefinitely. */
 export const PLAN_PICKER_RECENT_DONE_MS = 30 * 60_000;
 
 /** Pure gate for marked completions and the narrowly bounded old-build done backstop. */
@@ -595,6 +672,17 @@ export function shouldPlanPickerVerificationCheck(record: SessionRecord, now: nu
   if (record.agent !== "codex" || record.provisional === true) return false;
   if (typeof record.transcript !== "string" || record.transcript.length === 0) return false;
   if (record.planPickerVerificationPending === true) return true;
+  // CONVERGENCE LATCH. `planPickerSettled` is written by exactly one place — settlePendingPlanPickerDone
+  // — and therefore means "this watchdog has already adjudicated this picker episode as terminal",
+  // with the whole picture (TTL fired, or a correlated TUI proven dead). The backstop below re-opens a
+  // done from *rollout evidence alone*, and the rollout signature is durable forever: Codex never
+  // writes picker dismissal to JSONL. So without this gate the two correctives are exact inverses and
+  // neither ever wins — measured 2026-08-02 as 738 posted corrections over 48min (~7.3s per flip),
+  // every one of them a prio-1 ⇄ done Live Activity push against the ~40/6min ActivityKit budget.
+  // The latch is released only by genuine NEW evidence: correctResolvedPlanPicker clears it when the
+  // rollout shows real progress, and every hook write rebuilds the record without it, so a later turn
+  // opening a real picker is unaffected.
+  if (record.planPickerSettled === true) return false;
   if (record.op !== "done" || record.lastEvent !== "done" || record.sentDone !== true) return false;
   if (typeof record.ts !== "number" || !Number.isFinite(record.ts)) return false;
   const age = now - record.ts;
@@ -639,7 +727,14 @@ export async function correctPlanPickerVerification(
     const now = (deps.now ?? Date.now)();
     if (!shouldPlanPickerVerificationCheck(record, now)) return "uncorrected";
     const recentDoneBackstop = record.planPickerVerificationPending !== true;
-    if (recentDoneBackstop && !(deps.pidAlive ?? pidAlive)(record.pid)) {
+    // Re-opening a done demands proof the session can still be showing a picker. For a daemon-fronted
+    // Codex row `record.pid` is the app-server — alive for every session on the machine, so it proves
+    // nothing. When the precision-biased correlation has stamped a real TTY, that is the process that
+    // owns the picker; correctResolvedPlanPicker already treats its death as decisive enough to settle,
+    // so it must also be decisive enough to refuse a resurrection.
+    const ownerPid = typeof record.tuiPid === "number" && Number.isFinite(record.tuiPid)
+      ? record.tuiPid : record.pid;
+    if (recentDoneBackstop && !(deps.pidAlive ?? pidAlive)(ownerPid)) {
       tracePicker(sessionId, deps, {
         source: "watchdog", classifier: "dead-pid", marker: record.planPickerSettled === true ? "settled" : "none",
       });
@@ -857,6 +952,20 @@ export function watchdogEventHeaders(config: Config, approvals: string): Record<
   };
 }
 
+// --- LAN listener handle (NOM-44 phase 1) ------------------------------------------------------
+//
+// The listener is a same-network fast path for phone→Mac commands; the worker channel below stays
+// canonical and completely unchanged. Two module-level handles because two very different call sites
+// need it: postEvent (to piggyback the sealed host hint) and the signal handlers (to stop the socket).
+
+/** The running loop's listener, published so postEvent can read its address and the SIGTERM/SIGINT
+ *  handler can close the socket. Undefined outside a live run(). */
+let activeLanListener: LanListener | undefined;
+
+/** Publishes the sealed LAN host hint on the POSTs the daemon already makes (see lan-listener). It is
+ *  a module singleton for the same reason the buffers above are: postEvent has no place to hang state. */
+const lanHintPublisher = createLanHintPublisher({ address: () => activeLanListener?.address() ?? null });
+
 /** POST a v2 envelope to the Worker with the per-pairing auth headers. `delivered` ONLY on a 2xx:
  *  a 401/500 is a FAILURE, not success — otherwise a bad secret or a Worker error would count as
  *  delivered and the caller would delete/rewrite the session file, losing the session. A 404 is
@@ -864,10 +973,15 @@ export function watchdogEventHeaders(config: Config, approvals: string): Record<
  *  Any network error / timeout is a transient `failed`. Best-effort: never throws across its boundary. */
 async function postEvent(config: Config, body: object): Promise<PostOutcome> {
   try {
+    // The LAN listener's sealed host hint rides along on the POSTs this daemon already makes — no new
+    // request is ever issued for discovery, and `take` returns undefined unless the hint actually
+    // changed or its 5-minute refresh came due (so the overwhelming majority of POSTs are untouched).
+    const lanHint = await lanHintPublisher.take(config);
+    const payload = lanHint ? { ...body, lanHint } : body;
     const res = await fetch(`${config.url}/v1/cc/event`, {
       method: "POST",
       headers: watchdogEventHeaders(config, await localApprovalsState()),
-      body: JSON.stringify(body),
+      body: JSON.stringify(payload),
       signal: AbortSignal.timeout(2000),
     });
     const outcome = postOutcomeForStatus(res.status);
@@ -1020,16 +1134,6 @@ function bufferCommands(commands: SealedCommand[]): void {
   }
 }
 
-/** Add to a bounded insertion-ordered set, evicting the oldest once full. */
-function rememberBounded(set: Set<string>, value: string, max: number): void {
-  set.add(value);
-  while (set.size > max) {
-    const oldest = set.values().next();
-    if (oldest.done) break;
-    set.delete(oldest.value);
-  }
-}
-
 /** Test-only reset of the module-global command state (what a fresh daemon starts with). */
 export function resetCommandState(): void {
   commandBuffer.length = 0;
@@ -1055,8 +1159,9 @@ export type FocusTraceResult =
   | "osascript-failed"  // AppleScript refused (TCC denial / timeout / app error)
   | "unsupported";      // not macOS, unknown terminal app, or an agent with no locate seam
 
-/** Best-effort trace with the same argv guard tracePicker uses: pure unit calls run inside `bun test`
- *  with the production HOME visible and must never pollute the user's live trace. */
+/** The module's generic best-effort trace, with the same argv guard tracePicker uses: pure unit calls run
+ *  inside `bun test` with the production HOME visible and must never pollute the user's live trace. Named
+ *  for its first caller; also carries the "lan", "retire" and "pending-done" breadcrumbs. */
 function traceFocus(deps: { trace?: (event: object) => void }, event: object): void {
   if (deps.trace) {
     try { deps.trace(event); } catch { /* diagnostics only */ }
@@ -1081,8 +1186,62 @@ export interface DrainCommandsDeps {
    *  discoverLiveSessions / reconcileProvisionalsSweep expose), so a test can supply a locator
    *  without spawning a real `ps`. Defaults to the real registry. */
   adapters?: AgentAdapter[];
+  /** Exact live-hold seam behind Open on Mac's TUI-picker release. Test defaults never read the
+   *  developer's real session directory. */
+  readDecisionHoldFn?: (sessionId: string) => Promise<DecisionHold | null>;
+  holdPidAliveFn?: (pid: number) => boolean;
+  answerStore?: LanAnswerStore;
+  resolveDecisionFn?: typeof resolveOnRelay;
   now?: () => number;
   trace?: (event: object) => void;
+}
+
+/** After a successful focus, release ONLY the specialized TUI request_user_input PreToolUse hold.
+ *
+ * A local Codex TUI has no app-server connection on which the watchdog can submit Op::UserInputAnswer,
+ * so the phone must never be shown answer choices it cannot deliver. The special hold is identified by
+ * its encrypted release-only card (Codex + request_user_input + NO permissionQuestions), and it must
+ * still satisfy the same owner-pid and 10-minute TTL gate as the LAN state feed. The synthetic allow is
+ * handed to the existing answer store; the hook emits updatedInput and Codex then opens its native picker.
+ * The relay resolve is merely the split-brain cleanup/fail-open backstop and never gates local delivery. */
+async function releaseFocusedTuiUserInputHold(
+  config: Config, sessionId: string, now: number, deps: DrainCommandsDeps,
+): Promise<boolean> {
+  const readHold = deps.readDecisionHoldFn ?? (
+    lanRunningUnderTest() ? async () => null : (id: string) => readDecisionHoldAt(SESSIONS_DIR, id)
+  );
+  const hold = await readHold(sessionId);
+  const alive = hold && typeof hold.pid === "number"
+    ? (deps.holdPidAliveFn ?? pidAlive)(hold.pid)
+    : false;
+  if (!stateHoldLive(hold, alive, now)) return false;
+
+  let card: Record<string, unknown>;
+  try {
+    const plain = await decryptBlob(config.e2eKey, hold!.blob);
+    if (typeof plain !== "object" || plain === null) return false;
+    card = plain as Record<string, unknown>;
+  } catch {
+    return false;
+  }
+  const requestId = card.permissionRequestId;
+  if (
+    card.status !== "decisionPending"
+    || card.agent !== "codex"
+    || card.permissionToolName !== "request_user_input"
+    || typeof requestId !== "string" || requestId.length === 0
+    || Object.prototype.hasOwnProperty.call(card, "permissionQuestions")
+  ) return false;
+
+  const answerBlob = await encryptBlob(config.e2eKey, {
+    requestId, decision: "allow", ts: Math.floor(now / 1000),
+  });
+  const stored = (deps.answerStore ?? lanAnswerStore).put(requestId, answerBlob, now);
+  if (stored !== "stored") return false;
+  try {
+    void Promise.resolve((deps.resolveDecisionFn ?? resolveOnRelay)(config, requestId)).catch(() => {});
+  } catch { /* local delivery already succeeded; relay cleanup is best-effort */ }
+  return true;
 }
 
 /** Decrypt, VALIDATE, then execute every buffered command; returns how many actually focused
@@ -1215,9 +1374,12 @@ export async function drainCommands(config: Config, deps: DrainCommandsDeps = {}
         const outcome = await focus(pid, { agent, record: entry.rec });
         if (outcome.ok) {
           focused += 1;
+          const releasedTuiInput = await releaseFocusedTuiUserInputHold(
+            config, payload.sessionId, now, deps,
+          ).catch(() => false);
           traceFocus(deps, {
             ...base, agent, pid, result: "focused" as FocusTraceResult, via: outcome.via,
-            reason: outcome.reason ?? reason,
+            reason: outcome.reason ?? reason, ...(releasedTuiInput ? { releasedTuiInput: true } : {}),
           });
           continue;
         }
@@ -1237,6 +1399,128 @@ export async function drainCommands(config: Config, deps: DrainCommandsDeps = {}
     return focused;
   } catch {
     return 0; // a command must never derail the sweep
+  }
+}
+
+// --- LAN command intake (phone → Mac, direct, same network) ------------------------------------
+//
+// The SECOND delivery channel for the exact same sealed commands. The phone dispatches both legs in
+// parallel with the SAME ciphertext, so whichever arrives first wins and the loser is dropped by the
+// inner-nonce replay check in drainCommands (step 6) — which is why nothing here re-validates the blob:
+// a second dedupe on command content would only be a second thing to get wrong.
+//
+// CONCURRENCY (verified against drainCommands above, 2026-08-01): the drain is already interleave-safe.
+// It takes its work with a synchronous `commandBuffer.splice(...)`, so two drains can never be handed
+// the same entry; and BOTH of its check-then-remember pairs (`executedCommandIds.has` → rememberBounded,
+// `seenCommandNonces.has` → rememberBounded) are synchronous with no await between the test and the
+// insert, so even two copies of one command racing through separate drains resolve to exactly one
+// executor and one "replay". The latch below therefore is not a correctness patch — it is a simplicity
+// guarantee: with the immediate LAN drain added there are now TWO callers, and serializing them keeps
+// the (already fine) reasoning about focus side effects trivially true rather than subtle.
+
+/** Serializes every drainCommands call — the sweep's once-per-tick one and the LAN listener's
+ *  immediate one — onto a single chain. Always resolves (drainCommands swallows everything). */
+let drainChain: Promise<unknown> = Promise.resolve();
+
+/** Queue a drain behind any in-flight one. Returns the number of commands that focused something. */
+export function enqueueDrainCommands(config: Config, deps: DrainCommandsDeps = {}): Promise<number> {
+  const run = (): Promise<number> => drainCommands(config, deps);
+  const next = drainChain.then(run, run);
+  drainChain = next.catch(() => {});
+  return next;
+}
+
+/** Prefix stamped on the command id of a LAN-delivered command, so the trace line says which channel
+ *  delivered it. The id is only ever used for the delivered-twice check (`executedCommandIds`); the
+ *  REPLAY bound is the sealed inner nonce, which is identical on both legs — that is precisely what
+ *  makes racing the two channels a no-op instead of a double focus. */
+export const LAN_COMMAND_ID_PREFIX = "lan:";
+
+/** The listener's command sink. Buffers the still-sealed blob exactly like extractCommands does for the
+ *  worker leg, then kicks an IMMEDIATE drain — that one call is the whole latency win (a command no
+ *  longer waits for the next 5 s sweep, let alone the next worker round trip).
+ *
+ *  The returned promise is for TESTS ONLY. The listener wires this in as `onCommand` (a void-returning
+ *  sink) and deliberately does NOT await it: the HTTP response must go back the instant the blob is
+ *  queued, never after an osascript window raise. It resolves rather than rejects in every case. */
+export function acceptLanCommand(command: LanCommand, deps: DrainCommandsDeps = {}): Promise<number> {
+  try {
+    if (commandBuffer.length >= COMMAND_BUFFER_MAX) return Promise.resolve(0); // the worker leg's bound
+    commandBuffer.push({ id: `${LAN_COMMAND_ID_PREFIX}${command.nonce}`, blob: command.blob });
+    return enqueueDrainCommands(command.config, deps).catch(() => 0);
+  } catch {
+    return Promise.resolve(0); // a malformed sink call must never surface anywhere
+  }
+}
+
+// --- LAN answer intake (phone → Mac, direct, same network) -------------------------------------
+//
+// The listener has ALREADY stored the sealed answer by the time this runs (the store is what the Claude
+// hook's loopback poll and the in-process Codex relay read), so this sink has exactly one job: the
+// SPLIT-BRAIN BACKSTOP. The phone dispatches its answer down both legs in parallel; if its worker leg
+// failed while its LAN leg succeeded, the worker still holds a `pending` decision record and the island
+// keeps showing live Allow/Deny buttons for a prompt that is already answered. Echoing the existing
+// blob-free /v1/cc/decision/resolve retires it.
+//
+// THREE properties this must keep, all of them non-negotiable:
+//  - OFF THE REQUEST PATH: the listener calls this and returns immediately; the phone's sealed {"ok":true}
+//    never waits for a worker round trip (resolveOnRelay's own ceiling is 15 s).
+//  - NEVER THROWS: it runs from an HTTP handler's stack. resolveOnRelay swallows everything; the extra
+//    try/catch here covers a synchronous throw before the promise even exists.
+//  - NEVER A GONE STRIKE: a 404/410 here means "that record is already gone", which is the NORMAL case
+//    when the phone's own worker leg won the race. The gone-strike ladder is a /cc/event (worker
+//    AUTHORITY) signal only — structurally so, since this path never calls recordGoneStrike.
+//
+// The echo can only ever retire a record that is STILL PENDING (the worker gives a phone answer
+// precedence over this transition and returns its terminal state untouched), so it cannot destroy an
+// answer a hold is mid-poll for. The one degraded case the design accepts: the phone's worker leg AND
+// the hold's loopback poll both fail while this echo succeeds — the prompt then falls open to the
+// terminal dialog, which is the fail-open outcome, never a misapplied decision.
+//
+//  - AND IT MUST LOSE THE RACE IT WAS NEVER MEANT TO ENTER (fixed 2026-08-05). The echo above was
+//    written as if the phone's worker leg might win; on a real LAN it never does — this machine is one
+//    hop away and Cloudflare is a round trip — so the echo landed FIRST on essentially every answer and
+//    /v1/cc/decision/resolve stamped the record `superseded` before the phone's own answer could make it
+//    `answered`. Two user-visible lies followed, both reported from the field: the phone's worker leg
+//    came back 409, and the row's worker-authored `decisionState` (which outranks this phone's local
+//    answered-set) rendered "Replaced by a newer request" for the user's OWN successful tap. Waiting
+//    LAN_ANSWER_ECHO_DELAY_MS first costs nothing — the worker's answer route is authoritative and a
+//    resolve on an already-`answered` record is a documented no-op — and makes this what its name always
+//    claimed: a backstop for the failure case, not the first writer in the normal one.
+
+/** How long the echo waits for the phone's own worker leg to settle the record honestly before it steps
+ *  in. Comfortably past a normal answer POST plus its first bounded retry, and far inside the worker's
+ *  ~30 s poll-liveness sweep (the backstop's own backstop, for a watchdog that dies mid-wait). */
+export const LAN_ANSWER_ECHO_DELAY_MS = 5_000;
+
+/** The listener's answer sink. Fire-and-forget: the returned promise is for TESTS ONLY (the listener
+ *  wires this in as a void-returning `onAnswer`) and always resolves. */
+export function acceptLanAnswer(
+  answer: LanAnswerDelivery,
+  deps: {
+    resolveFn?: (config: Config, requestId: string) => Promise<void>;
+    trace?: (event: object) => void;
+    /** The backstop's head start for the phone's own worker leg. Tests pass 0. */
+    delayMs?: number;
+    sleep?: (ms: number) => Promise<void>;
+  } = {},
+): Promise<void> {
+  try {
+    const resolve = deps.resolveFn ?? ((config: Config, requestId: string) => resolveOnRelay(config, requestId, fetch));
+    const delayMs = deps.delayMs ?? LAN_ANSWER_ECHO_DELAY_MS;
+    const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((done) => {
+      const timer = setTimeout(done, ms);
+      timer.unref?.(); // a pending backstop must never hold the watchdog process open
+    }));
+    return (delayMs > 0 ? sleep(delayMs) : Promise.resolve())
+      .then(() => resolve(answer.config, answer.requestId))
+      .catch(() => {
+        // Best-effort by design: if this echo ALSO fails, the worker's own ~30 s poll-liveness sweep
+        // expires the record. Traced, never surfaced — the daemon's contract is silence.
+        traceFocus(deps, { event: "lan", result: "echo-failed", requestId: answer.requestId });
+      });
+  } catch {
+    return Promise.resolve(); // a malformed sink call must never surface anywhere
   }
 }
 
@@ -1294,9 +1578,9 @@ export async function buildProvisionalBlob(
     status: d.idle === true ? "done" : "working", title: d.title ?? "", machine, label: d.label, ...blobAgentFields,
     ...(typeof at === "number" && Number.isFinite(at) ? { at } : {}),
   };
-  const dbg = blobAgentFields.agent === "codex" ? formatPlanPickerDebug({
+  const dbg = appendCodexBridgeMarker(blobAgentFields.agent === "codex" ? formatPlanPickerDebug({
     event: "discover", classifier: d.idle === true ? "done" : "work", marker: "0", by: "wd",
-  }) : undefined;
+  }) : undefined, codexBridgeIsDown());
   return encryptBlob(e2eKey, appendFittedPlanAndDebug(base, undefined, dbg));
 }
 
@@ -1340,9 +1624,9 @@ export function buildProvisionalRecord(
     ...(typeof d.startedAt === "number" && Number.isFinite(d.startedAt) ? { tuiStartedAt: d.startedAt } : {}),
     ...(typeof d.title === "string" && d.title.length > 0 ? { title: d.title } : {}),
     ...blobAgentFields,
-    ...(blobAgentFields.agent === "codex" ? { dbg: formatPlanPickerDebug({
+    ...(blobAgentFields.agent === "codex" ? { dbg: appendCodexBridgeMarker(formatPlanPickerDebug({
       event: "discover", classifier: idle ? "done" : "work", marker: "0", by: "wd",
-    }) } : {}),
+    }), codexBridgeIsDown()) } : {}),
     // Stamp the pairing this blob was sealed under so the heartbeat's key-rotation guard can prove
     // the blob is still decryptable (see buildHeartbeatEnvelope). Omitted only when unknown.
     ...(typeof pairingId === "string" && pairingId.length > 0 ? { pairingId } : {}),
@@ -1671,6 +1955,11 @@ export async function correctPendingApproval(
         sentDone: false,
         // Heartbeats must repeat the corrective attention frame, not the stale pre-question working blob.
         ...(typeof envelope.blob === "string" ? { blob: envelope.blob } : {}),
+        // Write the clear discriminator THROUGH to the record (append-last field, NOM-44 phase 3) so the
+        // LAN frames feed labels this recovered episode exactly as the POSTed envelope does. Written
+        // unconditionally — `undefined` DROPS the key on stringify (the doneAttempts-clear idiom), which
+        // is what keeps a plain approval from inheriting a previous question's marker through the spread.
+        attentionKind,
       };
       await writeRecord(path, next);
     } catch {
@@ -1741,7 +2030,7 @@ async function correctIdleProvisional(config: Config, path: string, sessionId: s
   }
 }
 
-// --- Idle-CLAUDE reap (a resumed session left alive-but-silent, no Stop ever coming) ----------
+// --- Idle-session reap (a resumed session left alive-but-silent, no Stop ever coming) ----------
 //
 // Claude Desktop resumes an old session with `claude --resume <id> --replay-user-messages` and keeps the
 // process RESIDENT while idle: its SessionStart fires (re-arming the session to "working"), no turn
@@ -1802,6 +2091,15 @@ export function isClaudeIdleReapEligible(
 ): boolean {
   if (record.agent === "codex") return false;
   if (record.provisional === true) return false;
+  return idleReapAgeEligible(record, now, transcriptMtimeMs);
+}
+
+/** Shared clock/transcript half of idle reaping. Agent ownership stays outside: Claude's process is
+ * authoritative directly; Codex must first correlate a real TUI and prove the exact rollout idle. */
+function idleReapAgeEligible(
+  record: SessionRecord, now: number,
+  transcriptMtimeMs: (path: string) => number | undefined = transcriptMtimeMsDefault,
+): boolean {
   if (record.lastEvent !== "working" && record.lastEvent !== "sessionStart") return false;
   if (typeof record.ts !== "number") return false;
   if (now - record.ts < CLAUDE_IDLE_REAP_MS) return false;
@@ -1818,16 +2116,21 @@ export function isClaudeIdleReapEligible(
   return true;
 }
 
-/** Injectable side-effect seams for the idle-CLAUDE reap, so its settle/retry logic is testable without
- *  real fs/network — mirrors InterruptDeps. `now` clocks the corrective done's envelope ts. */
+/** Injectable side-effect seams for the idle-session reap, so its settle/retry logic is testable without
+ *  real fs/network — mirrors InterruptDeps. Codex's extra seams enforce its TUI + exact-rollout proof. */
 export interface IdleReapDeps {
   post?: (body: object) => Promise<PostOutcome>;
   writeRecord?: (path: string, rec: SessionRecord) => Promise<void>;
+  locateTuiPid?: (sessionId: string, record: SessionRecord) => Promise<number | undefined>;
+  pidAlive?: (pid: number) => boolean;
+  codexTurnActive?: (pid: number, transcriptPath: string) => Promise<boolean>;
   now?: () => number;
 }
 
-/** The idle-CLAUDE reap for one still-alive session. Gated by isClaudeIdleReapEligible, then — exactly like
- *  the interrupt net (correctInterrupt) — the session is DECIDED done and the only remaining question is
+/** The idle reap for one still-alive session. Claude retains isClaudeIdleReapEligible's historical
+ *  event/transcript clock. Codex additionally requires a correlated live TUI and a readable exact rollout
+ *  proving the turn is idle. Once gated — exactly like the interrupt net (correctInterrupt) — the session
+ *  is DECIDED done and the only remaining question is
  *  delivery. It POSTs a corrective op:done (buildDoneEnvelope, the SAME envelope the interrupt net posts,
  *  with `at` FROZEN at record.ts so an hours-idle resumed session ages out rather than looking freshly
  *  finished) and settles the record so the reap can neither re-fire forever nor let the heartbeat re-raise
@@ -1842,8 +2145,8 @@ export interface IdleReapDeps {
  *                 the record stuck at "sessionStart" (the live-observed failure mode). The worker's own
  *                 eviction resolves the phone. A resumed-but-idle session (SessionStart then silence) whose
  *                 reap can't reach the worker now falls all the way through reap → retire on its own.
- *  Claude-only by the gate (no agent key on the blob). On the next real hook the pinned sentDone re-arms the
- *  session to working, just like the interrupt net's done. Returns:
+ *  On the next real hook the pinned sentDone re-arms the session to working, just like the interrupt
+ *  net's done. Returns:
  *   - "corrected"   → it delivered a done this sweep (2xx) → the caller counts it delivered and must NOT
  *                     also heartbeat the session.
  *   - "pending"     → reap-decided but the done did NOT deliver (bounded-retrying, or the cap was hit and the
@@ -1860,7 +2163,41 @@ export async function correctIdleClaude(
     ?? ((p: string, rec: SessionRecord) => atomicWrite(p, JSON.stringify(rec), 0o600));
   const clock = deps.now ?? Date.now;
   try {
-    if (!isClaudeIdleReapEligible(record, now)) return "uncorrected";
+    const agent: AgentKind = record.agent === "codex" ? "codex" : "claude";
+    if (agent === "codex") {
+      // Sound Codex equivalent: clock silence alone is insufficient because record.pid may be the
+      // immortal app-server and a legitimate long turn can be hook-quiet. Require all three pieces:
+      // age + stale rollout mtime, an exact rollout path, and a conservatively correlated LIVE TUI
+      // whose exact rollout says no turn is active. Any missing/throwing evidence fails open to tracking.
+      if (record.provisional === true || !idleReapAgeEligible(record, now) ||
+          typeof record.transcript !== "string" || record.transcript.length === 0) return "uncorrected";
+      let tuiPid = typeof record.tuiPid === "number" && Number.isFinite(record.tuiPid)
+        ? record.tuiPid : undefined;
+      if (tuiPid === undefined) {
+        const locate = deps.locateTuiPid ?? locateCodexOwnedTui;
+        try { tuiPid = await locate(sessionId, record); } catch { return "uncorrected"; }
+      }
+      if (typeof tuiPid !== "number" || !Number.isFinite(tuiPid) || !(deps.pidAlive ?? pidAlive)(tuiPid)) {
+        return "uncorrected";
+      }
+      const transcript = record.transcript;
+      const active = deps.codexTurnActive
+        ?? (async (_pid: number, path: string) => {
+          // Stricter than discovery's deliberately idle-biased probe: retirement may not translate an
+          // unreadable rollout into "idle". Read the exact hook-owned path here and let either IO/stat
+          // failure throw into the fail-open catch below.
+          const tail = await readSuffix(path, 8 * 1024);
+          return codexTurnActiveFromTail(tail, Date.now() - statSync(path).mtimeMs);
+        });
+      try {
+        if (await active(tuiPid, transcript)) return "uncorrected";
+      } catch {
+        return "uncorrected";
+      }
+      record = { ...record, tuiPid };
+    } else if (!isClaudeIdleReapEligible(record, now)) {
+      return "uncorrected";
+    }
     // Bounded against disk AND memory (see effectiveDoneAttempts) — a persistently-failing record write
     // must not reset the reap's retry budget to zero on every sweep.
     const attempts = effectiveDoneAttempts(record, sessionId);
@@ -1877,14 +2214,15 @@ export async function correctIdleClaude(
       }
       return "pending";
     }
-    // Claude-only by the gate above, so the corrective done carries the claude blob shape (no agent key).
+    // The corrective carries the record's agent shape. Codex reaches here only after the stricter
+    // TUI+rollout proof above; Claude keeps its historical clock/transcript behavior.
     // The done blob's `at` is FROZEN at the record's last REAL event (record.ts, epoch seconds) — NOT
     // now: this session has been idle for hours (a resumed-but-never-prompted TUI, or a long-finished
     // one whose Stop dropped), so stamping "now" would make the phone show a freshly-finished row that
     // never ages out — the very "eternally fresh" bug this reap exists to kill. record.ts is guaranteed
     // a finite number by isClaudeIdleReapEligible. (envelope `ts` stays now so the worker accepts the frame.)
     const doneNow = clock();
-    const outcome = await post(await buildDoneEnvelope(sessionId, record, doneNow, config.e2eKey, "claude", Math.floor(record.ts / 1000)));
+    const outcome = await post(await buildDoneEnvelope(sessionId, record, doneNow, config.e2eKey, agent, Math.floor(record.ts / 1000)));
     if (outcome === "revoked") return "revoked"; // pairing gone → bubble up so the loop can tear down
     if (outcome === "delivered") {
       // 2xx: pin the session done and CLEAR the retry counter so the gate closes, the heartbeat can never
@@ -1955,6 +2293,9 @@ export interface PendingDoneDeps {
    *  null (absent/unreadable) falls back to the pre-guard snapshot write. */
   readRecord?: (path: string) => Promise<SessionRecord | null>;
   now?: () => number;
+  /** Diagnostics seam. Defaults to the session trace (argv-guarded), so "did this done ever reach the
+   *  worker?" is answerable from the log instead of inferred from the row's disappearance. */
+  trace?: (event: object) => void;
 }
 
 /** The undelivered-done reconcile for one tracked session. Gated by shouldPendingDoneCheck; the session
@@ -2009,12 +2350,19 @@ export async function correctPendingDone(
       } catch {
         // Settle didn't land → keep the in-memory count so the cap holds (see correctInterrupt's note).
       }
+      // The done NEVER reached the worker and never will: only the local record now says "done".
+      traceFocus(deps, { event: "pending-done", sessionId, outcome: "capped", attempts, delivered: false });
       return "pending";
     }
     // record.ts is the Stop's own write time; a corrupt record with no numeric ts simply omits `at`
     // (the phone then falls back to its own receipt time, as it does for every pre-`at` frame).
     const at = typeof record.ts === "number" && Number.isFinite(record.ts) ? Math.floor(record.ts / 1000) : undefined;
     const outcome = await post(await buildDoneEnvelope(sessionId, record, clock(), config.e2eKey, agent, at));
+    // One line per attempt, whatever happens: the retry ladder is otherwise invisible, and "did this done
+    // ever reach the worker" is exactly the question a vanished row raises.
+    traceFocus(deps, {
+      event: "pending-done", sessionId, outcome, attempts, delivered: outcome === "delivered", at,
+    });
     if (outcome === "revoked") return "revoked"; // pairing gone → bubble up so the loop can tear down
     if (outcome === "delivered") {
       // RE-READ before writing: the POST above took up to 2 s, and a user prompt landing in that window
@@ -2045,71 +2393,82 @@ export async function correctPendingDone(
 
 // --- Idle-done retire (free the worker cap slot a long-idle done row still occupies) -----------
 //
-// v1.1.6 froze the reap's blob `at` so a resumed-but-idle Claude session AGES OUT of the phone's
+// v1.1.6 froze the reap's blob `at` so a resumed-but-idle session AGES OUT of the phone's
 // display — but that is only a phone-side VISUAL filter. The worker session row the reap left behind
 // (an op:done) still counts against the per-pairing session cap (maxSessionsPerPairing): enough
 // idle-open TUIs and NEW sessions can no longer appear. The frozen `at` never freed that slot. This
-// net closes the last gap: a Claude session that is genuinely DONE (the idle-reaped done, or a normal
+// net closes the last gap: a session that is genuinely DONE (the idle-reaped done, or a normal
 // Stop) whose last REAL event is over an hour old — pid still alive, so the dead-pid reaper never
 // touches it — is RETIRED: a blob-less op:end (the worker DELETES the row, unlike a passively-evicting
-// op:done) carrying the FROZEN real-last-event `at`, plus its local record deleted. Cap slot freed,
-// row gone from the phone.
+// op:done) carrying the FROZEN real-last-event `at`. Claude and headless Codex records are deleted;
+// an interactive Codex TUI leaves a blob-less local owner marker so discovery cannot recreate it.
+// Either way the cap slot is freed and the row is gone from the phone.
 //
-// Revival is intact by construction: a retired TUI has no record, but the user's next prompt fires the
-// hooks, which write the record FRESH on that event (trackSession) and re-create the worker session
-// from scratch (a fresh op:start) — retirement is never a one-way door.
-//
-// CLAUDE-ONLY, like the reap it follows: codex has discoverLive, so a retired codex row would be
-// RE-SURFACED as a provisional idle-done on the very next sweep (with a fresh `at`), silently undoing
-// the retirement — codex idle rows are left to the reconcile/notify machinery + the worker's own
-// eviction. And working / needsAttention are NEVER retired no matter how long idle (a silent 2-h build,
+// Revival is intact by construction: trackSession rebuilds a record whole on the next genuine hook,
+// dropping any owner marker and recreating the worker row. Retirement is never a one-way door. Working /
+// needsAttention are NEVER retired merely for age (a silent 2-h build,
 // an unanswered permission prompt): isRetireEligible requires a terminal done state, so those keep
 // heartbeating exactly as before.
 
-/** How long a DONE Claude session may sit event-idle (its last REAL event = record.ts — a heartbeat
- *  never rewrites it) with its pid alive before the watchdog retires it (blob-less op:end + record
- *  delete). WHY 1 h: it matches the phone's own display-age filter (the frozen blob `at` ages a done row
+/** How long a DONE session may sit event-idle (its last REAL event = record.ts — a heartbeat never
+ *  rewrites it) before the watchdog retires it with a blob-less op:end. WHY ~1 h: it tracks the phone's
+ *  own display-age filter (the frozen blob `at` ages a done row
  *  out of view at ~the same horizon), and it sits FAR above both HEARTBEAT_AFTER_MS (5 min) and the
  *  worker's one-hour eviction — so retirement is always a DELIBERATE, settled decision, never racing a
  *  session the hooks are still keeping fresh nor one the worker is about to evict anyway. Deliberately
  *  well below SESSION_STALE_MS (24 h): retirement fires FIRST for done rows, and the 24 h stale cap stays
- *  the backstop for NON-done sessions (e.g. a needsAttention prompt abandoned for a full day). */
-const RETIRE_AFTER_MS = 3_600_000; // 1 h
+ *  the backstop for NON-done sessions (e.g. a needsAttention prompt abandoned for a full day).
+ *  DERIVED, NEVER LITERAL: it must stay STRICTLY GREATER than PLAN_PICKER_PENDING_MAX_MS (the plan-picker
+ *  hard TTL, declared far above this line). Both were independently written as 1 h, and that collision was
+ *  a real defect: settlePendingPlanPickerDone settles a picker exactly at its TTL, so the resulting done
+ *  was BORN past this horizon and the next sweep retired it (blob-less op:end → the worker deletes the
+ *  row) seconds later. The settle now re-stamps ts, and this margin makes the trap unreachable even if a
+ *  future pended-then-settled path forgets to. */
+export const RETIRE_AFTER_MS = PLAN_PICKER_PENDING_MAX_MS + 15 * 60_000; // 1 h 15 min
 
-/** Whether a KEPT (alive) session is a DONE Claude session past the retire horizon — the predicate the
- *  retire net keys on. True iff: it's a Claude session (codex has discoverLive; a retired codex row would
- *  just be re-discovered next sweep), not a provisional discovery row (those are the reconcile/reap
- *  machinery's business), it is in a terminal done state (op:"done" OR lastEvent:"done" — exactly what the
+/** Whether a KEPT session is DONE past the retire horizon — the predicate the retire net keys on. True
+ *  iff it is a real session or Codex provisional (never a non-Codex provisional / existing owner marker),
+ *  is in a terminal done state (op:"done" OR lastEvent:"done" — exactly what the
  *  v1.1.6 idle-reap writes back and what a normal Stop leaves; NEVER working/needsAttention, so a silent
  *  build or an unanswered permission prompt keeps heartbeating), and its last REAL event (record.ts) is
  *  older than RETIRE_AFTER_MS. A record with no numeric ts can't be aged → not retired (classifySession
  *  deletes it via the un-ageable path instead). Pure so the whole matrix is unit-testable. */
 export function isRetireEligible(record: SessionRecord, now: number): boolean {
-  if (record.agent === "codex") return false;
-  if (record.provisional === true) return false;
+  if (typeof record.retiredAt === "number" && Number.isFinite(record.retiredAt)) return false;
+  // Codex provisionals are real visible done rows too. Retirement converts them into an owner marker,
+  // which is precisely what prevents discoverLive from recreating them while the idle TUI stays open.
+  if (record.provisional === true && record.agent !== "codex") return false;
   if (record.op !== "done" && record.lastEvent !== "done") return false;
   if (typeof record.ts !== "number") return false;
   return now - record.ts >= RETIRE_AFTER_MS;
 }
 
-/** Injectable seams for the retire net, so its end-POST + delete is testable without fs/network. */
+/** Injectable seams for the retire net, so its end-POST + delete/marker write is testable. */
 export interface RetireDeps {
   post?: (body: object) => Promise<PostOutcome>;
   deleteRecord?: (path: string) => Promise<void>;
+  writeRecord?: (path: string, rec: SessionRecord) => Promise<void>;
+  /** Conservative real-TUI locator. Undefined means no discoverable interactive owner, so deletion
+   *  cannot start a discovery loop (the common headless/app-server one-shot case). */
+  locateTuiPid?: (sessionId: string, record: SessionRecord) => Promise<number | undefined>;
+  pidAlive?: (pid: number) => boolean;
   /** Re-reads the record from disk immediately before the end-POST and again before the DELETE, so a
    *  session the user just woke up (a prompt landing mid-sweep) is never retired out from under its own
    *  hooks. Defaults to a real read; null (absent/unreadable) keeps the pre-guard behavior. */
   readRecord?: (path: string) => Promise<SessionRecord | null>;
+  /** Diagnostics seam. Defaults to the session trace (argv-guarded). Retirement DELETES the row on both
+   *  sides, so without a breadcrumb a vanished session is indistinguishable from one that was never sent. */
+  trace?: (event: object) => void;
 }
 
-/** The idle-done retire net for one still-alive session. Gated by isRetireEligible, then it POSTs a
+/** The idle-done retire net for one kept session. Gated by isRetireEligible, then it POSTs a
  *  best-effort blob-less op:end carrying the FROZEN real-last-event `at` (record.ts/1000 — so the worker
- *  ages any surfaced end frame by real activity, consistent with 5aa1214) and DELETES the local record.
- *  The delete is UNCONDITIONAL on a delivered vs a transiently-failed POST (the slot must free and the row
- *  must go even through a brief worker blip — the worker's own one-hour eviction is the backstop for a
- *  dropped end), exactly the delete-regardless discipline of the 24 h stale path. Returns:
- *   - "retired"         → the op:end 2xx'd; record deleted → the caller counts it delivered (pairing alive).
- *   - "retired-offline" → the op:end failed transiently but the record was deleted anyway → NOT delivered.
+ *  ages any surfaced end frame by real activity, consistent with 5aa1214). It deletes the local record
+ *  unless a live Codex TUI would be rediscovered, in which case it writes an invisible owner marker.
+ *  Local retirement is unconditional on delivered vs transient failure; worker eviction backstops a
+ *  dropped end. Returns:
+ *   - "retired"         → the op:end 2xx'd; record deleted/marked → pairing alive.
+ *   - "retired-offline" → the op:end failed; record deleted/marked anyway → NOT delivered.
  *   - "skip"            → not eligible (leave it for the other nets / the heartbeat).
  *   - "revoked"         → the POST 404'd: the pairing is gone server-side → the caller tears down (the
  *                         record is LEFT in place, mirroring the stale path's revoke bail). */
@@ -2118,31 +2477,85 @@ export async function retireDoneStale(
 ): Promise<"retired" | "retired-offline" | "skip" | "revoked"> {
   const post = deps.post ?? ((body: object) => postEvent(config, body));
   const deleteRecord = deps.deleteRecord ?? ((p: string) => unlink(p).catch(() => {}));
+  const writeRecord = deps.writeRecord
+    ?? ((p: string, rec: SessionRecord) => atomicWrite(p, JSON.stringify(rec), 0o600));
+  const alive = deps.pidAlive ?? pidAlive;
+  const locateTuiPid = deps.locateTuiPid ?? locateCodexOwnedTui;
   const reread = deps.readRecord ?? readRecordAt;
   const freshRecord = async (): Promise<SessionRecord | null> => {
     try { return await reread(path); } catch { return null; }
   };
+  // Every line that leaves this net AFTER eligibility is traced (the not-eligible early return is not —
+  // that is every kept session on every sweep). One breadcrumb answers "who deleted this row, how old was
+  // it, and did the end frame land": the born-expired plan-picker incident was invisible in the log.
+  const breadcrumb = (outcome: string, tuiPid?: number) => traceFocus(deps, {
+    event: "retire",
+    reason: "idle-done",
+    sessionId,
+    recordTs: record.ts,
+    ageMs: typeof record.ts === "number" ? now - record.ts : undefined,
+    tuiPid,
+    outcome,
+  });
   try {
     if (!isRetireEligible(record, now)) return "skip";
+    let tuiPid: number | undefined;
+    if (record.agent === "codex") {
+      const cached = typeof record.tuiPid === "number" && Number.isFinite(record.tuiPid)
+        ? record.tuiPid : undefined;
+      if (cached !== undefined && alive(cached)) tuiPid = cached;
+      if (tuiPid === undefined) {
+        try {
+          const located = await locateTuiPid(sessionId, record);
+          if (typeof located === "number" && Number.isFinite(located) && alive(located)) tuiPid = located;
+        } catch { /* no trustworthy interactive owner → ordinary delete */ }
+      }
+    }
     // STALE-SNAPSHOT GUARD (before the POST): `record` is the snapshot the sweep read at the top of this
     // iteration, and the correctives ahead of us already awaited POSTs. If a real hook landed since — the
     // user woke this session up — the row is no longer a settled 1-h-old done, and both the op:end and the
     // record delete would be a lie (deleting the record also orphans the live session: no reap file, no
     // heartbeat). A null re-read (absent/unreadable) keeps the pre-guard behavior.
     const before = await freshRecord();
-    if (before && (recordMovedSince(record, before) || !isRetireEligible(before, now))) return "skip";
+    if (before && (recordMovedSince(record, before) || !isRetireEligible(before, now))) {
+      breadcrumb("skip-woken", tuiPid);
+      return "skip";
+    }
     // record.ts is guaranteed a number by isRetireEligible → floor it into epoch seconds for the frozen `at`.
     const outcome = await post(buildEndEnvelope(sessionId, now, record, Math.floor(record.ts / 1000)));
-    if (outcome === "revoked") return "revoked"; // pairing gone → bubble up; leave the record for teardown
+    if (outcome === "revoked") {
+      breadcrumb("revoked", tuiPid);
+      return "revoked"; // pairing gone → bubble up; leave the record for teardown
+    }
     // …and again immediately before the DELETE: the POST above took up to 2 s, which is plenty for a
     // prompt to land. The end frame we just sent is superseded by that hook's own frame; the RECORD must
     // survive so the woken session keeps its reap/heartbeat handle.
     const after = await freshRecord();
-    if (after && recordMovedSince(record, after)) return "skip";
+    if (after && recordMovedSince(record, after)) {
+      breadcrumb("skip-woken-post", tuiPid);
+      return "skip";
+    }
     heartbeatAt.delete(sessionId); // dropping the row → drop its heartbeat-throttle entry (like the sweep's delete)
     clearDoneAttempts(sessionId);
-    await deleteRecord(path);
-    return outcome === "delivered" ? "retired" : "retired-offline";
+    if (record.agent === "codex" && tuiPid !== undefined) {
+      // Durable recreation-loop break: the minimal marker stays in the same known-record set discovery
+      // already consults, but has no blob/op/full text so neither worker nor LAN can serve it. A genuine
+      // hook rewrites this file whole and revives the session; TUI death makes classifySession delete it.
+      await writeRecord(path, {
+        pid: tuiPid,
+        machine: record.machine,
+        label: record.label,
+        ts: record.ts,
+        agent: "codex",
+        tuiPid,
+        retiredAt: now,
+      });
+    } else {
+      await deleteRecord(path);
+    }
+    const verdict = outcome === "delivered" ? "retired" : "retired-offline";
+    breadcrumb(verdict, tuiPid);
+    return verdict;
   } catch {
     return "skip";
   }
@@ -2192,9 +2605,9 @@ export async function buildTitleRepairEnvelope(
     // (a fresh frame with the title fixed), so the phone should treat it as live. Omitted when absent.
     ...(typeof at === "number" && Number.isFinite(at) ? { at } : {}),
   };
-  const dbg = agent === "codex" ? record.dbg ?? formatPlanPickerDebug({
+  const dbg = appendCodexBridgeMarker(agent === "codex" ? record.dbg ?? formatPlanPickerDebug({
     event: "title", classifier: statusFromRecord(record), marker: record.pendingPlanPicker ? "p" : record.planPickerVerificationPending ? "v" : record.planPickerSettled ? "s" : "0", by: "wd",
-  }) : undefined;
+  }) : undefined, codexBridgeIsDown());
   const blob = await encryptBlob(e2eKey, appendFittedPlanAndDebug(base, undefined, dbg));
   return { v: 2, sessionId, op: record.op ?? "update", prio: record.prio ?? 0, ts: now, blob, ...startedAtField(record) };
 }
@@ -2404,6 +2817,14 @@ async function sweep(config: Config | null, deps: SweepDeps = {}): Promise<Sweep
       record = null; // unreadable / half-written / corrupt → classified as delete
     }
     const verdict = classifySession(record, now, pidAlive);
+    // A live retired-owner marker is bookkeeping, not a session: keep the daemon resident so discovery
+    // remains suppressed, but run none of the delivery/corrective/title/heartbeat nets against it. When
+    // its TUI dies classifySession returns delete and the ordinary unlink path below removes it silently.
+    if (verdict === "keep" && record?.agent === "codex" &&
+        typeof record.retiredAt === "number" && Number.isFinite(record.retiredAt)) {
+      remaining++;
+      continue;
+    }
     if (verdict === "keep") {
       // Long-lived Plan verification runs before the done-debt net: a killed/old Stop may have left a
       // donePending record whose terminal state is precisely what still needs classification.
@@ -2433,18 +2854,15 @@ async function sweep(config: Config | null, deps: SweepDeps = {}): Promise<Sweep
         if (pendingDone === "corrected") delivered = true; // its done 2xx'd → the pairing is alive
         pendingDoneHandled = pendingDone === "corrected" || pendingDone === "pending";
       }
-      // Idle-done RETIRE next: a Claude session pinned done (v1.1.6 idle-reap, or a normal Stop) whose
-      // last REAL event is >1 h old — pid still alive — gets a blob-less op:end + its record deleted, so
-      // the per-pairing cap slot its lingering done row occupied is freed. Runs BEFORE remaining++ so a
-      // retired session is neither counted alive nor heartbeated. isRetireEligible never fires for a
-      // working / needsAttention row (those keep heartbeating) nor for codex (discovery would re-surface
-      // it), so this no-ops for everything but a long-idle Claude done row.
+      // Idle-done RETIRE next: any terminal row whose last REAL event is >1 h old gets a blob-less
+      // op:end. Codex retains only an invisible real-TUI owner marker, preventing discoverLive from
+      // undoing the retirement; other rows delete normally. Working / needsAttention never qualify.
       if (config && record && !pendingDoneHandled) {
         const retire = await retireDoneStale(config, path, sessionId, record, now);
         if (retire === "revoked") return { revoked: true };
         if (retire !== "skip") {
           if (retire === "retired") delivered = true; // its op:end 2xx'd → the pairing is alive
-          continue; // record deleted → not counted in remaining, not heartbeated
+          continue; // record deleted or replaced by an invisible owner marker; never heartbeated
         }
       }
       remaining++;
@@ -2488,10 +2906,9 @@ async function sweep(config: Config | null, deps: SweepDeps = {}): Promise<Sweep
           if (attn === "revoked") return { revoked: true };
           if (attn === "corrected") { delivered = true; flaggedAttention = true; }
         }
-        // Idle-CLAUDE reap: a resumed-but-idle Claude session (working/sessionStart then ≥30 min of
-        // silence, pid still alive, no Stop ever coming) gets ONE corrective done instead of being
-        // heartbeated "working" forever. Only if no earlier net already finished the turn this sweep;
-        // Claude-only (isClaudeIdleReapEligible gates codex out — it has discovery + the notify backstop).
+        // Idle-session reap: Claude keeps its historical event/transcript silence rule. Codex additionally
+        // needs a correlated live TUI + readable exact rollout proving no turn is open. Only if no earlier
+        // net already finished the turn this sweep.
         let reapedIdle = false;
         if (idleFix !== "corrected" && !planResolutionHandled && !interruptHandled && !flaggedAttention) {
           const idleClaude = await correctIdleClaude(config, path, sessionId, record, now);
@@ -2593,10 +3010,28 @@ export async function goneStrikeShouldTeardown(goneStrikesPath?: string): Promis
 //   never writes, never exits) used to freeze the whole loop at `await bridge.start()`: no reap, no
 //   heartbeat, no discovery, no gone-strike teardown — with the pidfile still claimed, so nothing could
 //   replace us either. Bridge work now runs DETACHED behind a deadline; the loop never awaits it.
+//
+//   RECOVERY + HONESTY (2026-08-04) — the presence gate is correct but it used to fail SILENTLY, and the
+//   thing it silently disables is the ONLY path by which a phone can answer a Codex TUI
+//   `request_user_input` (codex-remote-input builds the questions and injects the answer through
+//   answerAppServer → client.answerUserInput; there is no hook-shaped substitute — see the deletion note
+//   in core/permission). A daemon that died at 22:14 therefore turned every Codex question into an
+//   attention row nobody could answer, with nothing anywhere saying why. So absence now does two things:
+//     1. TRIES ONCE PER COOLDOWN to bring the daemon back (`codex app-server daemon start`), detached,
+//        bounded, non-interactive, every failure traced and none thrown; and
+//     2. RAISES A BREADCRUMB (`cxbridge:down` in the Codex `dbg` tail) for as long as the socket is gone.
+//   ORDERING TRUTH: starting the daemon does NOT rescue an already-running TUI — a Codex TUI launched
+//   with no daemon hosts its conversation in-process and can never retro-attach. The attempt buys the
+//   NEXT session, and the breadcrumb's wording promises nothing more.
 
 /** The running loop's bridge teardown, published so the SIGTERM/SIGINT handler can stop the proxy child
  *  through the same path run()'s `finally` uses. Undefined outside a live run(). */
 let activeBridgeShutdown: (() => void) | undefined;
+
+/** The running loop's LAN listener teardown, published for the SIGTERM/SIGINT handler for the same
+ *  reason activeBridgeShutdown is: default signal handling skips run()'s `finally`, and a leaked
+ *  listening socket would keep the successor watchdog from re-binding the persisted port. */
+let activeLanShutdown: (() => void) | undefined;
 
 /** How long a detached bridge operation may run before the supervisor stops waiting on it. It is NOT a
  *  cancel (the underlying client owns its own retry/backoff) — it just bounds the supervisor's own
@@ -2632,6 +3067,31 @@ const BRIDGE_REARM_MS = 600_000;
  *  non-load-bearing: if the wording ever drifts, the interval above still re-arms. */
 const GIVE_UP_PATTERN = /gave up/i;
 
+/** At most ONE `codex app-server daemon start` attempt per this window, counted from the moment the
+ *  attempt is launched (not from its outcome), so a slow or wedged start cannot let a second one in.
+ *  Five minutes: long enough that a machine with no codex installed spends effectively nothing on this
+ *  forever, short enough that a user who fixes their install sees the bridge come back within one coffee
+ *  refill. It is NOT a retry budget — there is no cap on total attempts, because the honest recovery for
+ *  a daemon that died hours ago is exactly "try again periodically". */
+const BRIDGE_DAEMON_START_COOLDOWN_MS = 300_000;
+
+/** Is the Codex app-server control socket missing as of the most recent sweep? Module-level because the
+ *  blob builders below are pure functions called from a dozen places and threading a flag through all of
+ *  them would be pure noise; run() republishes it from the supervisor once per cycle. Defaults to FALSE
+ *  so nothing that never runs a sweep (every unit test of a builder, the LAN read path) can accidentally
+ *  stamp the marker. */
+let codexBridgeDown = false;
+
+/** Publish the sweep's observation. Exported for tests and for run()'s once-per-cycle republish. */
+export function setCodexBridgeDown(down: boolean): void {
+  codexBridgeDown = down;
+}
+
+/** The current observation, read by the Codex blob builders when they stamp `dbg`. */
+export function codexBridgeIsDown(): boolean {
+  return codexBridgeDown;
+}
+
 /** The slice of CodexRemoteInputBridge the supervisor drives (start/stop/refresh). Declared structurally
  *  so tests can drive the supervisor with a fake and the real class stays untouched. */
 export interface RemoteInputBridgeLike {
@@ -2655,6 +3115,12 @@ export interface BridgeSupervisorDeps {
   /** Diagnostic passthrough for bridge/client errors (the daemon itself reports nothing — silence is the
    *  contract — but the supervisor still inspects them to spot a parked client). */
   onError?: (error: Error) => void;
+  /** Best-effort recovery for an ABSENT daemon: `codex app-server daemon start`. Defaults to the real
+   *  bounded, non-interactive, never-throwing spawn. Resolves true only when the control socket is
+   *  genuinely there afterwards. */
+  startDaemon?: () => Promise<boolean>;
+  /** Local-only trace sink for the start attempts (never stdout, never the wire). */
+  trace?: (event: object) => void;
   now?: () => number;
 }
 
@@ -2669,11 +3135,23 @@ export function createBridgeSupervisor(deps: BridgeSupervisorDeps = {}) {
     void withDeadline(Promise.resolve().then(work), BRIDGE_OP_DEADLINE_MS).catch(() => {});
   });
   const now = deps.now ?? Date.now;
+  // Under `bun test` the default is a NO-OP: a unit test that drives an absent socket must never spawn a
+  // real `codex` on the developer's machine (same guard, same reason, as the hold-marker writers in
+  // core/permission). Tests that exercise the recovery inject `startDaemon`.
+  const startDaemon = deps.startDaemon
+    ?? (lanRunningUnderTest() ? async () => false : () => startCodexAppServerDaemon());
+  const trace = deps.trace ?? ((event: object) => traceSession(event));
   let bridge: RemoteInputBridgeLike | undefined;
   let pairingId: string | undefined;
   let lastStartAt = 0;
   /** The client told us it gave up reconnecting → re-arm on the very next sweep. */
   let parked = false;
+  /** Was the control socket missing on the most recent PAIRED sync? Read by run() to publish the
+   *  `cxbridge:down` breadcrumb, and reset the moment the socket comes back. */
+  let daemonDown = false;
+  /** When the last daemon start attempt was LAUNCHED (0 = never). Stamped before the work is detached so
+   *  the cooldown holds even while an attempt is still in flight. */
+  let lastDaemonStartAt = 0;
 
   /** The bridge's error sink: watch for the client's give-up so the re-arm is prompt, then pass through. */
   const onError = (error: Error): void => {
@@ -2698,6 +3176,24 @@ export function createBridgeSupervisor(deps: BridgeSupervisorDeps = {}) {
     detach(() => target.start());
   };
 
+  /** Absent socket → try to bring the daemon back, at most once per BRIDGE_DAEMON_START_COOLDOWN_MS.
+   *  DETACHED like every other bridge operation: the sweep must never wait on `codex` starting, and a
+   *  binary that hangs must cost this loop nothing. The cooldown stamp is taken BEFORE detaching, so the
+   *  five-second sweep cadence cannot fire a second attempt while the first is still running. Every
+   *  failure mode is inside startDaemon (which never throws); we only record the decision. */
+  const tryStartDaemon = (): void => {
+    const at = now();
+    if (lastDaemonStartAt !== 0 && at - lastDaemonStartAt < BRIDGE_DAEMON_START_COOLDOWN_MS) return;
+    lastDaemonStartAt = at;
+    try { trace({ event: "codex-daemon-start", outcome: "attempt" }); } catch { /* tracing is never fatal */ }
+    detach(async () => {
+      // The result is deliberately NOT acted on here: the next sweep's own socket probe is the single
+      // source of truth for "is there a daemon", and a successful start therefore builds the bridge on
+      // the very next cycle rather than through a second, racier code path.
+      await startDaemon().catch(() => false);
+    });
+  };
+
   return {
     /** One cycle of supervision. Unpaired → tear down. Paired but no Codex daemon → tear down (and never
      *  construct one, so a Claude-only machine never spawns `codex` at all). Paired + daemon present →
@@ -2706,14 +3202,21 @@ export function createBridgeSupervisor(deps: BridgeSupervisorDeps = {}) {
     async sync(config: Config | null): Promise<void> {
       if (!config) {
         teardown();
+        daemonDown = false; // unpaired: there is no Codex row to be honest to
         return;
       }
       let available = false;
       try { available = await probe(); } catch { available = false; }
       if (!available) {
         teardown(); // daemon went away (or never existed) → stop the bridge, keep the sweep running
+        // …but do NOT stop there: silence here is what made a dead daemon look like a working one for a
+        // whole day. Try to bring it back (bounded, cooldown-gated, detached) and raise the breadcrumb
+        // meanwhile — the attempt is for the NEXT Codex session, never for a TUI already running.
+        daemonDown = true;
+        tryStartDaemon();
         return;
       }
+      daemonDown = false;
       if (!bridge || pairingId !== config.pairingId) {
         teardown();
         const next = create(config, { onError });
@@ -2756,6 +3259,11 @@ export function createBridgeSupervisor(deps: BridgeSupervisorDeps = {}) {
     get active(): boolean {
       return bridge !== undefined;
     },
+    /** Was the Codex control socket missing on the last PAIRED sync? run() republishes this to the blob
+     *  builders as the `cxbridge:down` breadcrumb. */
+    get daemonDown(): boolean {
+      return daemonDown;
+    },
   };
 }
 
@@ -2772,15 +3280,22 @@ export function createBridgeSupervisor(deps: BridgeSupervisorDeps = {}) {
  *     version-mismatched incumbent is taken over. Its own release is ownership-checked, so it can never
  *     stomp our claim on the way out. */
 async function claimSingleInstance(): Promise<boolean> {
+  // OUR bundle's identity, read once. It is stamped into the pidfile so a later hook can tell that a
+  // rebuild happened under an unchanged version (see watchdogBuildStamp) — and it is the same test
+  // applied here, so a same-version incumbent running DIFFERENT code is taken over rather than deferred
+  // to. Without that, ensureWatchdog would SIGTERM the stale daemon and its replacement would politely
+  // back off, leaving the machine with no watchdog at all.
+  const build = watchdogBuildStamp();
   try {
     const holder = parseWatchdogPidfile(readFileSync(WATCHDOG_PID_PATH, "utf8"));
-    if (holder && holder.pid !== process.pid && watchdogHolderIsLive(holder.pid) && holder.version === PLUGIN_VERSION) {
+    if (holder && holder.pid !== process.pid && watchdogHolderIsLive(holder.pid)
+        && holder.version === PLUGIN_VERSION && !watchdogBuildDiffers(holder.build, build)) {
       return false;
     }
   } catch {
     // No pidfile (or unreadable) → free to claim.
   }
-  await atomicWrite(WATCHDOG_PID_PATH, formatWatchdogPidfile(process.pid));
+  await atomicWrite(WATCHDOG_PID_PATH, formatWatchdogPidfile(process.pid, PLUGIN_VERSION, build));
   return true;
 }
 
@@ -2881,19 +3396,61 @@ async function run(): Promise<void> {
   // up to IDLE_GRACE_MS past this so discovery keeps watching for the next freshly-opened Codex TUI
   // instead of retiring the instant the sessions dir empties (see IDLE_GRACE_MS).
   let lastActiveMs = Date.now();
-  const bridges = createBridgeSupervisor();
+  // THE BRIDGE'S ERRORS GET A HOME. The Codex relay reports every refused phone answer and every
+  // undelivered injection through this sink, and until 2026-08-05 run() passed no `onError` at all — so
+  // a rejected answer released the hold in total silence and looked, from the phone, like the card
+  // flapping on its own. Local-only, best-effort, and content-free by construction (the reporters carry
+  // no question, option or answer text), exactly like every other line in this trace.
+  const bridges = createBridgeSupervisor({
+    onError: (error) => traceSession({
+      event: "bridge", error: error.name, msg: String(error.message ?? "").slice(0, 200),
+    }),
+  });
   activeBridgeShutdown = () => bridges.shutdown();
+  // The LAN listener starts only AFTER the single-instance claim: exactly one watchdog per machine may
+  // own the socket (and the persisted port in lan.json), and a losing instance returned above without
+  // ever reaching here. createLanListener returns immediately — the bind runs off this stack, so a
+  // refused/occupied port can never delay the first sweep.
+  const lan = createLanListener({
+    onCommand: acceptLanCommand,
+    // Phase 2: the listener stores the sealed answer itself (the hook's loopback poll and the Codex
+    // relay read that store); this sink only fires the worker echo, off the response path.
+    onAnswer: (answer) => { void acceptLanAnswer(answer); },
+  });
+  activeLanListener = lan;
+  // ONE stop, reached from all three teardown seams: run()'s `finally`, an ownership loss mid-sweep
+  // (both via `shutdown`), and the SIGTERM/SIGINT handler (via activeLanShutdown, which default signal
+  // handling reaches without running the `finally`). lan.stop() is idempotent, so overlapping seams are
+  // free; the try/catch is here rather than at each seam so no caller can forget it.
+  const stopLan = (): void => {
+    try { lan.stop(); } catch { /* best-effort socket teardown */ }
+  };
+  const shutdown = (): void => {
+    bridges.shutdown();
+    stopLan();
+  };
+  activeLanShutdown = stopLan;
   try {
     while (true) {
       // A claim can be stolen or removed after startup (upgrade takeover, reset, racing spawn). An
-      // ownerless daemon must not touch sessions or retain its proxy/bridge children for another tick.
-      if (!enforceWatchdogOwnership(() => bridges.shutdown())) return;
+      // ownerless daemon must not touch sessions or retain its proxy/bridge children — or its LAN
+      // socket, which a successor needs to re-bind — for another tick.
+      if (!enforceWatchdogOwnership(shutdown)) return;
       const config = await loadConfig(); // reload each cycle: a mid-pairing config may complete under us
       // A real Codex request_user_input response must return on the SAME shared app-server process, so
       // the bridge attaches through `codex app-server proxy` — but ONLY while that control socket exists
       // (re-probed every cycle) and never on the sweep's own await path. Fail-open in both directions: no
       // Codex daemon → no bridge and no spawn at all; a wedged proxy child → the sweep keeps its cadence.
       await bridges.sync(config);
+      // Publish the socket observation to this cycle's blob builders. While it is down, every Codex frame
+      // this sweep seals carries `cxbridge:down` in its `dbg` tail — the phone's diagnostics toggle is
+      // then the difference between "my question just sits there" and a nameable cause. It clears itself
+      // the moment a daemon is back.
+      setCodexBridgeDown(bridges.daemonDown);
+      // Re-key the LAN listener from the CURRENT config (a re-pair rotates e2eKey, and K_lan derives
+      // from it). Deliberately NOT awaited-on-IO: sync() only swaps a promise and returns, so the LAN
+      // channel can never sit on the sweep path — the design's non-negotiable.
+      lan.sync(config);
       // Discovery + reconcile run BEFORE the sweep (only when paired). Backstop-reconcile first (retire
       // any provisional whose real session already reported), then discover new TUIs — so a just-
       // surfaced provisional is counted in `remaining` this same cycle, keeping the daemon alive
@@ -2908,7 +3465,7 @@ async function run(): Promise<void> {
       // Commands the worker piggybacked on THIS cycle's POST responses (discovery/reconcile/sweep).
       // Drained once per tick, off the POST path, so a slow osascript can never delay a status event.
       // Best-effort by construction — drainCommands swallows everything and returns a count.
-      if (config) await drainCommands(config);
+      if (config) await enqueueDrainCommands(config);
       if (result.revoked) {
         // A /cc/event POST came back gone (404/410) this sweep. Do NOT tear down on the first one — a
         // single gone can be a transient/racing delete (worker redeploy, KV eventual-consistency), and
@@ -2967,8 +3524,10 @@ async function run(): Promise<void> {
       await new Promise((r) => setTimeout(r, POLL_MS));
     }
   } finally {
-    bridges.shutdown();
+    shutdown(); // bridge child AND the LAN socket — a retired daemon must leave no listener behind
     activeBridgeShutdown = undefined;
+    activeLanShutdown = undefined;
+    activeLanListener = undefined;
     releaseSingleInstance(); // auto-quit on empty: drop our pidfile so the next hook re-spawns
   }
 }
@@ -2986,6 +3545,7 @@ if (import.meta.main) {
   const onTerminate = (): void => {
     try { releaseSingleInstance(); } catch { /* nothing to release */ }
     try { activeBridgeShutdown?.(); } catch { /* best-effort */ }
+    try { activeLanShutdown?.(); } catch { /* best-effort */ }
     const exitTimer = setTimeout(() => process.exit(0), 250);
     (exitTimer as unknown as { unref?: () => void }).unref?.();
   };

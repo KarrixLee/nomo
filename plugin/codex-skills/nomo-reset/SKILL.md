@@ -22,7 +22,7 @@ then run this exact command — it returns in a few seconds, well inside Codex's
 show its output **verbatim** to the user:
 
 ```
-exec "<ROOT>/scripts/run.sh" "<ROOT>/dist/reset.mjs"
+NOMOR="<ROOT>"; NOMOS="$HOME/.config/cc-status/hook-shim.sh"; [ -n "$NOMOR" ] && [ -x "$NOMOR/scripts/run.sh" ] && exec "$NOMOR/scripts/run.sh" "$NOMOR/dist/reset.mjs"; [ -x "$NOMOS" ] && exec "$NOMOS" reset; echo "Nomo could not find its installed files - reinstall the nomo plugin."; exit 1
 ```
 
 What it does (relay the printed summary):

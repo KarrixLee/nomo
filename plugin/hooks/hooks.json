@@ -1,28 +1,28 @@
 {
   "hooks": {
     "SessionStart": [
-      { "hooks": [{ "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}\"/scripts/run.sh \"${CLAUDE_PLUGIN_ROOT}\"/dist/cc-status.mjs" }] }
+      { "hooks": [{ "type": "command", "command": "NOMOR=\"${CLAUDE_PLUGIN_ROOT}\"; NOMOS=\"$HOME/.config/cc-status/hook-shim.sh\"; [ -n \"$NOMOR\" ] && [ -x \"$NOMOR/scripts/run.sh\" ] && exec \"$NOMOR/scripts/run.sh\" \"$NOMOR/dist/cc-status.mjs\"; [ -x \"$NOMOS\" ] && exec \"$NOMOS\" cc-status; exit 0" }] }
     ],
     "UserPromptSubmit": [
-      { "hooks": [{ "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}\"/scripts/run.sh \"${CLAUDE_PLUGIN_ROOT}\"/dist/cc-status.mjs" }] }
+      { "hooks": [{ "type": "command", "command": "NOMOR=\"${CLAUDE_PLUGIN_ROOT}\"; NOMOS=\"$HOME/.config/cc-status/hook-shim.sh\"; [ -n \"$NOMOR\" ] && [ -x \"$NOMOR/scripts/run.sh\" ] && exec \"$NOMOR/scripts/run.sh\" \"$NOMOR/dist/cc-status.mjs\"; [ -x \"$NOMOS\" ] && exec \"$NOMOS\" cc-status; exit 0" }] }
     ],
     "PreToolUse": [
-      { "matcher": "*", "hooks": [{ "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}\"/scripts/run.sh \"${CLAUDE_PLUGIN_ROOT}\"/dist/cc-status.mjs" }] }
+      { "matcher": "*", "hooks": [{ "type": "command", "command": "NOMOR=\"${CLAUDE_PLUGIN_ROOT}\"; NOMOS=\"$HOME/.config/cc-status/hook-shim.sh\"; [ -n \"$NOMOR\" ] && [ -x \"$NOMOR/scripts/run.sh\" ] && exec \"$NOMOR/scripts/run.sh\" \"$NOMOR/dist/cc-status.mjs\"; [ -x \"$NOMOS\" ] && exec \"$NOMOS\" cc-status; exit 0" }] }
     ],
     "PostToolUse": [
-      { "matcher": "*", "hooks": [{ "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}\"/scripts/run.sh \"${CLAUDE_PLUGIN_ROOT}\"/dist/cc-status.mjs" }] }
+      { "matcher": "*", "hooks": [{ "type": "command", "command": "NOMOR=\"${CLAUDE_PLUGIN_ROOT}\"; NOMOS=\"$HOME/.config/cc-status/hook-shim.sh\"; [ -n \"$NOMOR\" ] && [ -x \"$NOMOR/scripts/run.sh\" ] && exec \"$NOMOR/scripts/run.sh\" \"$NOMOR/dist/cc-status.mjs\"; [ -x \"$NOMOS\" ] && exec \"$NOMOS\" cc-status; exit 0" }] }
     ],
     "Notification": [
-      { "hooks": [{ "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}\"/scripts/run.sh \"${CLAUDE_PLUGIN_ROOT}\"/dist/cc-status.mjs" }] }
+      { "hooks": [{ "type": "command", "command": "NOMOR=\"${CLAUDE_PLUGIN_ROOT}\"; NOMOS=\"$HOME/.config/cc-status/hook-shim.sh\"; [ -n \"$NOMOR\" ] && [ -x \"$NOMOR/scripts/run.sh\" ] && exec \"$NOMOR/scripts/run.sh\" \"$NOMOR/dist/cc-status.mjs\"; [ -x \"$NOMOS\" ] && exec \"$NOMOS\" cc-status; exit 0" }] }
     ],
     "PermissionRequest": [
-      { "hooks": [{ "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}\"/scripts/run.sh \"${CLAUDE_PLUGIN_ROOT}\"/dist/cc-permission.mjs", "timeout": 86400 }] }
+      { "hooks": [{ "type": "command", "command": "NOMOR=\"${CLAUDE_PLUGIN_ROOT}\"; NOMOS=\"$HOME/.config/cc-status/hook-shim.sh\"; [ -n \"$NOMOR\" ] && [ -x \"$NOMOR/scripts/run.sh\" ] && exec \"$NOMOR/scripts/run.sh\" \"$NOMOR/dist/cc-permission.mjs\"; [ -x \"$NOMOS\" ] && exec \"$NOMOS\" cc-permission; exit 0", "timeout": 86400 }] }
     ],
     "Stop": [
-      { "hooks": [{ "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}\"/scripts/run.sh \"${CLAUDE_PLUGIN_ROOT}\"/dist/cc-status.mjs" }] }
+      { "hooks": [{ "type": "command", "command": "NOMOR=\"${CLAUDE_PLUGIN_ROOT}\"; NOMOS=\"$HOME/.config/cc-status/hook-shim.sh\"; [ -n \"$NOMOR\" ] && [ -x \"$NOMOR/scripts/run.sh\" ] && exec \"$NOMOR/scripts/run.sh\" \"$NOMOR/dist/cc-status.mjs\"; [ -x \"$NOMOS\" ] && exec \"$NOMOS\" cc-status; exit 0" }] }
     ],
     "SessionEnd": [
-      { "hooks": [{ "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}\"/scripts/run.sh \"${CLAUDE_PLUGIN_ROOT}\"/dist/cc-status.mjs" }] }
+      { "hooks": [{ "type": "command", "command": "NOMOR=\"${CLAUDE_PLUGIN_ROOT}\"; NOMOS=\"$HOME/.config/cc-status/hook-shim.sh\"; [ -n \"$NOMOR\" ] && [ -x \"$NOMOR/scripts/run.sh\" ] && exec \"$NOMOR/scripts/run.sh\" \"$NOMOR/dist/cc-status.mjs\"; [ -x \"$NOMOS\" ] && exec \"$NOMOS\" cc-status; exit 0" }] }
     ]
   }
 }

@@ -21,7 +21,7 @@ Network calls need sandbox escalation in Codex. **Request escalated/approved per
 output **verbatim** to the user:
 
 ```
-exec "<ROOT>/scripts/run.sh" "<ROOT>/dist/unpair.mjs"
+NOMOR="<ROOT>"; NOMOS="$HOME/.config/cc-status/hook-shim.sh"; [ -n "$NOMOR" ] && [ -x "$NOMOR/scripts/run.sh" ] && exec "$NOMOR/scripts/run.sh" "$NOMOR/dist/unpair.mjs"; [ -x "$NOMOS" ] && exec "$NOMOS" unpair; echo "Nomo could not find its installed files - reinstall the nomo plugin."; exit 1
 ```
 
 It revokes the pairing on the server (best-effort) and deletes the local pairing config, then prints a

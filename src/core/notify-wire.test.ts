@@ -1,13 +1,25 @@
-import { describe, expect, test } from "bun:test";
-import { isNomoNotifyChain, parseNotifyFromToml, replaceNotifyInToml, unwrapNotify, wireNotifyArray } from "./notify-wire";
+import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, describe, expect, test } from "bun:test";
+import {
+  isNomoNotifyChain, nomoNotifyProgram, parseNotifyFromToml, repairNotifyWiring, replaceNotifyInToml,
+  tomlMayNeedNotifyRepair, unwrapNotify, wireNotifyArray,
+} from "./notify-wire";
 
 // notify-wire is the Bug-D fix: pairing used to instruct the agent to hand-edit config.toml, which
 // re-wrapped an already-wrapped notify on every re-pair. These pin the idempotent unwrap→wrap cycle,
 // including the EXACT triple-nested value observed in the wild on 2026-07-10.
 
 const ROOT = "/Users/karrix/api-status/nomo/plugin";
+// The LEGACY (≤1.7.8) wrapper: two paths inside the version-pinned plugin root. Still exercised
+// everywhere below, because every existing user's config.toml is in exactly this shape.
 const CHAIN = `${ROOT}/scripts/notify-chain.sh`;
 const MJS = `${ROOT}/dist/codex-notify.mjs`;
+// The STABLE (≥1.7.9) wrapper: the shim, which no version bump can move.
+const HOME = "/Users/karrix";
+const PROGRAM = nomoNotifyProgram(HOME);
+const ENTRY = "codex-notify";
 const SKY = "/Users/karrix/.codex/computer-use/Codex Computer Use.app/Contents/SharedSupport/SkyComputerUseClient.app/Contents/MacOS/SkyComputerUseClient";
 
 describe("isNomoNotifyChain", () => {
@@ -16,6 +28,14 @@ describe("isNomoNotifyChain", () => {
     expect(isNomoNotifyChain(["/other/notify-chain.sh"])).toBe(true);
     expect(isNomoNotifyChain([SKY, "turn-ended"])).toBe(false);
     expect(isNomoNotifyChain([])).toBe(false);
+  });
+
+  test("recognises the STABLE shim form too (or repairs would nest, not replace)", () => {
+    expect(isNomoNotifyChain([PROGRAM, ENTRY])).toBe(true);
+    expect(isNomoNotifyChain([PROGRAM, ENTRY, "--", SKY, "turn-ended"])).toBe(true);
+    // The shim without our entry name is somebody else's business.
+    expect(isNomoNotifyChain([PROGRAM, "cc-status"])).toBe(false);
+    expect(isNomoNotifyChain([PROGRAM])).toBe(false);
   });
 });
 
@@ -70,26 +90,51 @@ describe("unwrapNotify", () => {
   });
 });
 
-describe("wireNotifyArray (idempotent)", () => {
+describe("wireNotifyArray (idempotent, and version-stable)", () => {
+  // THE BUG THIS PINS (v1.7.9): the value used to be two paths inside the version-pinned plugin root,
+  // baked into a config.toml nothing ever rewrites — so the backstop died at the first plugin update
+  // and stayed dead. Nothing it emits may contain the plugin root any more.
+  test("NO VERSION-PINNED SEGMENT: the value names only the stable shim", () => {
+    for (const value of [
+      wireNotifyArray(undefined, PROGRAM),
+      wireNotifyArray([SKY, "turn-ended"], PROGRAM),
+      wireNotifyArray([CHAIN, MJS, "--", SKY, "turn-ended"], PROGRAM),
+    ]) {
+      expect(value.join(" ")).not.toContain("/plugin/");
+      expect(value.join(" ")).not.toContain("notify-chain.sh");
+      expect(value.join(" ")).not.toContain(".mjs");
+      expect(value.join(" ")).not.toContain("plugins/cache");
+      expect(value[0]).toBe(PROGRAM);
+      expect(value[1]).toBe(ENTRY);
+    }
+  });
+
   test("no existing notify → nomo-only chain", () => {
-    expect(wireNotifyArray(undefined, ROOT)).toEqual([CHAIN, MJS]);
-    expect(wireNotifyArray([], ROOT)).toEqual([CHAIN, MJS]);
+    expect(wireNotifyArray(undefined, PROGRAM)).toEqual([PROGRAM, ENTRY]);
+    expect(wireNotifyArray([], PROGRAM)).toEqual([PROGRAM, ENTRY]);
   });
 
   test("wraps a plain original once", () => {
-    expect(wireNotifyArray([SKY, "turn-ended"], ROOT)).toEqual([CHAIN, MJS, "--", SKY, "turn-ended"]);
+    expect(wireNotifyArray([SKY, "turn-ended"], PROGRAM)).toEqual([PROGRAM, ENTRY, "--", SKY, "turn-ended"]);
   });
 
   test("IDEMPOTENT: wiring its own output changes nothing", () => {
-    const once = wireNotifyArray([SKY, "turn-ended"], ROOT);
-    expect(wireNotifyArray(once, ROOT)).toEqual(once);
-    const nomoOnly = wireNotifyArray(undefined, ROOT);
-    expect(wireNotifyArray(nomoOnly, ROOT)).toEqual(nomoOnly);
+    const once = wireNotifyArray([SKY, "turn-ended"], PROGRAM);
+    expect(wireNotifyArray(once, PROGRAM)).toEqual(once);
+    const nomoOnly = wireNotifyArray(undefined, PROGRAM);
+    expect(wireNotifyArray(nomoOnly, PROGRAM)).toEqual(nomoOnly);
   });
 
-  test("re-pairing from a DIFFERENT root refreshes the chain paths in place (no nesting)", () => {
-    const oldRootChain = wireNotifyArray([SKY, "turn-ended"], "/Users/karrix/.codex/.tmp/marketplaces/nomo/plugin");
-    expect(wireNotifyArray(oldRootChain, ROOT)).toEqual([CHAIN, MJS, "--", SKY, "turn-ended"]);
+  test("a LEGACY versioned wrapping is re-pointed in place, preserving the original (no nesting)", () => {
+    expect(wireNotifyArray([CHAIN, MJS, "--", SKY, "turn-ended"], PROGRAM))
+      .toEqual([PROGRAM, ENTRY, "--", SKY, "turn-ended"]);
+    // …and a legacy nomo-ONLY wrapping collapses to a stable nomo-only wrapping.
+    expect(wireNotifyArray([CHAIN, MJS], PROGRAM)).toEqual([PROGRAM, ENTRY]);
+  });
+
+  test("re-pairing under a DIFFERENT home refreshes the program path in place", () => {
+    const other = wireNotifyArray([SKY, "turn-ended"], nomoNotifyProgram("/Users/someone-else"));
+    expect(wireNotifyArray(other, PROGRAM)).toEqual([PROGRAM, ENTRY, "--", SKY, "turn-ended"]);
   });
 
   test("collapses the observed triple nest to one clean wrap", () => {
@@ -100,7 +145,13 @@ describe("wireNotifyArray (idempotent)", () => {
     ]);
     const middle = JSON.stringify([CHAIN, MJS, "--", SKY, "turn-ended", "--previous-notify", innermostNomo]);
     const observed = [CHAIN, MJS, "--", SKY, "turn-ended", "--previous-notify", middle];
-    expect(wireNotifyArray(observed, ROOT)).toEqual([CHAIN, MJS, "--", SKY, "turn-ended"]);
+    expect(wireNotifyArray(observed, PROGRAM)).toEqual([PROGRAM, ENTRY, "--", SKY, "turn-ended"]);
+  });
+
+  test("a STABLE chain re-embedded under a host's --previous-notify still unwraps", () => {
+    const embedded = JSON.stringify([PROGRAM, ENTRY, "--", SKY, "turn-ended"]);
+    expect(wireNotifyArray([SKY, "turn-ended", "--previous-notify", embedded], PROGRAM))
+      .toEqual([PROGRAM, ENTRY, "--", SKY, "turn-ended"]);
   });
 });
 
@@ -145,5 +196,169 @@ describe("parseNotifyFromToml / replaceNotifyInToml", () => {
   test("round-trip: replace then parse yields the exact array", () => {
     const arr = [CHAIN, MJS, "--", SKY, "turn-ended"];
     expect(parseNotifyFromToml(replaceNotifyInToml("", arr))).toEqual({ present: true, value: arr });
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
+// SELF-REPAIR (repairNotifyWiring) — the half of the v1.7.9 fix that reaches users who never re-pair.
+// These drive real files in a throwaway home, because the contract is as much about WHAT IS NOT
+// WRITTEN (backups, byte-identity, unrelated keys) as about the value itself.
+
+describe("repairNotifyWiring", () => {
+  const dirs: string[] = [];
+  afterEach(async () => {
+    await Promise.all(dirs.splice(0).map((d) => rm(d, { recursive: true, force: true })));
+  });
+
+  /** A throwaway home + a config.toml with realistic surrounding keys, tables and comments. */
+  async function scratch(notifyLine: string | null): Promise<{ home: string; tomlPath: string; program: string }> {
+    const home = await mkdtemp(join(tmpdir(), "nomo-notify-"));
+    dirs.push(home);
+    const tomlPath = join(home, "config.toml");
+    const body = [
+      "# Codex config",
+      'model = "gpt-5.4-codex"',
+      'model_reasoning_effort = "high"',
+      ...(notifyLine === null ? [] : [notifyLine]),
+      "",
+      "[tui]",
+      "notifications = true",
+      "",
+      "[mcp_servers.example]",
+      'command = "npx"',
+      "",
+    ].join("\n");
+    await writeFile(tomlPath, body);
+    return { home, tomlPath, program: nomoNotifyProgram(home) };
+  }
+
+  const notifyLine = (arr: readonly string[]): string => `notify = ${JSON.stringify(arr)}`;
+  const readNotify = async (p: string): Promise<string[] | null> =>
+    parseNotifyFromToml(await readFile(p, "utf8")).value;
+
+  test("a config wired to a now-deleted VERSIONED path is rewritten to the stable form", async () => {
+    // Exactly what every ≤1.7.8 Codex user has, with a plugin root that no longer exists.
+    const dead = "/Users/x/.codex/plugins/cache/nomo/nomo/1.7.7/scripts/notify-chain.sh";
+    const deadMjs = "/Users/x/.codex/plugins/cache/nomo/nomo/1.7.7/dist/codex-notify.mjs";
+    const { tomlPath, home, program } = await scratch(notifyLine([dead, deadMjs]));
+
+    expect(await repairNotifyWiring({ tomlPath, home })).toBe("repaired");
+    expect(await readNotify(tomlPath)).toEqual([program, "codex-notify"]);
+    const after = await readFile(tomlPath, "utf8");
+    expect(after).not.toContain("plugins/cache");
+    // Unrelated keys, tables and comments survive.
+    expect(after).toContain("# Codex config");
+    expect(after).toContain('model_reasoning_effort = "high"');
+    expect(after).toContain("[mcp_servers.example]");
+    expect(after).toContain("notifications = true");
+  });
+
+  test("a non-nomo previous-notify payload survives VERBATIM through the repair", async () => {
+    const dead = "/Users/x/.codex/plugins/cache/nomo/nomo/1.7.7/scripts/notify-chain.sh";
+    const deadMjs = "/Users/x/.codex/plugins/cache/nomo/nomo/1.7.7/dist/codex-notify.mjs";
+    const { tomlPath, home, program } = await scratch(notifyLine([dead, deadMjs, "--", SKY, "turn-ended"]));
+
+    expect(await repairNotifyWiring({ tomlPath, home })).toBe("repaired");
+    expect(await readNotify(tomlPath)).toEqual([program, "codex-notify", "--", SKY, "turn-ended"]);
+  });
+
+  test("THE SHAPE ON THE DEV MACHINE: nomo re-embedded under a host's --previous-notify", async () => {
+    // The computer-use client makes ITSELF the outer program and re-embeds the previous notify as an
+    // escaped JSON string. The nomo layer in there is the version-pinned one that has to go.
+    const embedded = JSON.stringify([CHAIN, MJS, "--", SKY, "turn-ended"]);
+    const { tomlPath, home, program } = await scratch(notifyLine([SKY, "turn-ended", "--previous-notify", embedded]));
+
+    expect(await repairNotifyWiring({ tomlPath, home })).toBe("repaired");
+    // Nomo goes back to the outside, still chaining the host command — the same collapse a re-pair does.
+    expect(await readNotify(tomlPath)).toEqual([program, "codex-notify", "--", SKY, "turn-ended"]);
+  });
+
+  test("ALREADY CORRECT: byte-identical file, no write, no backup", async () => {
+    const home = await mkdtemp(join(tmpdir(), "nomo-notify-"));
+    dirs.push(home);
+    const tomlPath = join(home, "config.toml");
+    const program = nomoNotifyProgram(home);
+    const body = `model = "gpt"\n${notifyLine([program, "codex-notify", "--", SKY, "turn-ended"])}\n`;
+    await writeFile(tomlPath, body);
+    const before = await stat(tomlPath);
+    await new Promise((r) => setTimeout(r, 20));
+
+    expect(await repairNotifyWiring({ tomlPath, home })).toBe("unchanged");
+    expect(await readFile(tomlPath, "utf8")).toBe(body);
+    expect((await stat(tomlPath)).mtimeMs).toBe(before.mtimeMs);   // not rewritten at all
+    await expect(stat(`${tomlPath}.bak-nomo`)).rejects.toThrow();  // and nothing to back up
+  });
+
+  test("IDEMPOTENT: a second and third pass after a repair change nothing", async () => {
+    const dead = "/Users/x/.codex/plugins/cache/nomo/nomo/1.7.7/scripts/notify-chain.sh";
+    const { tomlPath, home } = await scratch(notifyLine([dead, `${dead}.mjs`, "--", SKY, "turn-ended"]));
+    expect(await repairNotifyWiring({ tomlPath, home })).toBe("repaired");
+    const repaired = await readFile(tomlPath, "utf8");
+    const mtime = (await stat(tomlPath)).mtimeMs;
+    await new Promise((r) => setTimeout(r, 20));
+
+    expect(await repairNotifyWiring({ tomlPath, home })).toBe("unchanged");
+    expect(await repairNotifyWiring({ tomlPath, home })).toBe("unchanged");
+    expect(await readFile(tomlPath, "utf8")).toBe(repaired);
+    expect((await stat(tomlPath)).mtimeMs).toBe(mtime);
+  });
+
+  test("the pre-change file is BACKED UP to config.toml.bak-nomo, once and only once", async () => {
+    const dead = "/Users/x/.codex/plugins/cache/nomo/nomo/1.7.7/scripts/notify-chain.sh";
+    const { tomlPath, home } = await scratch(notifyLine([dead, `${dead}.mjs`]));
+    const original = await readFile(tomlPath, "utf8");
+
+    expect(await repairNotifyWiring({ tomlPath, home })).toBe("repaired");
+    expect(await readFile(`${tomlPath}.bak-nomo`, "utf8")).toBe(original);
+
+    // A LATER repair (home moved) must not overwrite the first backup — that one is the original.
+    const elsewhere = await mkdtemp(join(tmpdir(), "nomo-notify-"));
+    dirs.push(elsewhere);
+    expect(await repairNotifyWiring({ tomlPath, home: elsewhere })).toBe("repaired");
+    expect(await readFile(`${tomlPath}.bak-nomo`, "utf8")).toBe(original);
+    expect(await readNotify(tomlPath)).toEqual([nomoNotifyProgram(elsewhere), "codex-notify"]);
+  });
+
+  test("REFUSES a notify nomo did not author — repair is not wiring", async () => {
+    // A hook-shim.sh mention with no codex-notify entry: not our notify, and pairing never happened.
+    const { tomlPath, home } = await scratch(notifyLine(["/opt/some-tool/hook-shim.sh", "--flag"]));
+    const before = await readFile(tomlPath, "utf8");
+    expect(await repairNotifyWiring({ tomlPath, home })).toBe("refused");
+    expect(await readFile(tomlPath, "utf8")).toBe(before);
+  });
+
+  test("REFUSES an unparseable notify rather than corrupting it", async () => {
+    const home = await mkdtemp(join(tmpdir(), "nomo-notify-"));
+    dirs.push(home);
+    const tomlPath = join(home, "config.toml");
+    const body = 'notify = [\n  "/old/scripts/notify-chain.sh",\n  "/old/dist/codex-notify.mjs",\n]\n';
+    await writeFile(tomlPath, body);
+    expect(await repairNotifyWiring({ tomlPath, home })).toBe("refused");
+    expect(await readFile(tomlPath, "utf8")).toBe(body);
+  });
+
+  test("no notify at all, and no config.toml at all, are both silent no-ops", async () => {
+    const { tomlPath, home } = await scratch(null);
+    const before = await readFile(tomlPath, "utf8");
+    expect(await repairNotifyWiring({ tomlPath, home })).toBe("unchanged");
+    expect(await readFile(tomlPath, "utf8")).toBe(before);
+    expect(await repairNotifyWiring({ tomlPath: join(home, "nope.toml"), home })).toBe("unchanged");
+  });
+
+  test("THE CHEAP GATE short-circuits before any parse, and never fights another installer", () => {
+    const program = nomoNotifyProgram("/Users/karrix");
+    expect(tomlMayNeedNotifyRepair("", program)).toBe(false);
+    expect(tomlMayNeedNotifyRepair('model = "gpt"\nnotify = ["/usr/bin/say", "hi"]\n', program)).toBe(false);
+    expect(tomlMayNeedNotifyRepair(`notify = ["${CHAIN}"]`, program)).toBe(true);          // legacy
+    expect(tomlMayNeedNotifyRepair(`notify = ["${program}","codex-notify"]`, program)).toBe(false);
+    expect(tomlMayNeedNotifyRepair('notify = ["/other/home/.config/cc-status/hook-shim.sh","codex-notify"]', program)).toBe(true);
+    // An ALREADY-STABLE nomo re-embedded by a host that escapes its slashes must NOT read as stale:
+    // that would hoist it back out on every single session start, forever. These are the RAW bytes
+    // such a line has on disk — a JSON array inside a TOML basic string, so every "/" arrives as "\\/"
+    // (the exact double escaping the computer-use client writes; see config.toml on the dev machine).
+    const escaped = 'notify = ["/opt/host", "turn-ended", "--previous-notify", '
+      + '"[\\"\\\\/Users\\\\/karrix\\\\/.config\\\\/cc-status\\\\/hook-shim.sh\\",\\"codex-notify\\"]"]';
+    expect(escaped).toContain("\\\\/Users");
+    expect(tomlMayNeedNotifyRepair(escaped, program)).toBe(false);
   });
 });

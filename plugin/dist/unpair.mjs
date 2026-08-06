@@ -16,6 +16,7 @@ var textEncoder = new TextEncoder;
 var textDecoder = new TextDecoder;
 var HKDF_INFO = textEncoder.encode("nomo-cc-e2e-v1");
 var RATCHET_INFO_PREFIX = "nomo-cc-ratchet-v1|";
+var LAN_INFO_PREFIX = "nomo-lan-v1|";
 var ECDH_P256 = { name: "ECDH", namedCurve: "P-256" };
 function bytesToBase64(bytes) {
   let binary = "";
@@ -41,6 +42,16 @@ function fromB64url(s) {
 async function deriveE2EKey(qrSecret, phoneNonce) {
   const ikm = await crypto.subtle.importKey("raw", qrSecret, "HKDF", false, ["deriveBits"]);
   const bits = await crypto.subtle.deriveBits({ name: "HKDF", hash: "SHA-256", salt: phoneNonce, info: HKDF_INFO }, ikm, 256);
+  return new Uint8Array(bits);
+}
+async function deriveLanKey(e2eKey, pairingId) {
+  const ikm = await crypto.subtle.importKey("raw", e2eKey, "HKDF", false, ["deriveBits"]);
+  const bits = await crypto.subtle.deriveBits({
+    name: "HKDF",
+    hash: "SHA-256",
+    salt: new Uint8Array(0),
+    info: textEncoder.encode(LAN_INFO_PREFIX + pairingId)
+  }, ikm, 256);
   return new Uint8Array(bits);
 }
 async function generateEphemeralKeyPair() {
@@ -85,7 +96,7 @@ async function sha256Hex(s) {
 }
 
 // src/core/shared.ts
-var PLUGIN_VERSION = "1.4.15";
+var PLUGIN_VERSION = "1.7.9";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -95,6 +106,20 @@ function debugToken(value) {
 function formatPlanPickerDebug(input) {
   const value = `${debugToken(input.version ?? PLUGIN_VERSION)} ev:${debugToken(input.event)} cls:${debugToken(input.classifier)} mk:${input.marker ?? "0"} dq:${input.daemon ?? "na"}(${input.daemonDisposition ?? "na"}) ttl:${debugToken(input.ttl ?? "-")} by:${input.by}`;
   return Array.from(value).slice(0, DBG_BLOB_TEXT_MAX_CHARS).join("");
+}
+function formatDecisionHoldDebug(input) {
+  const value = `${debugToken(input.version ?? PLUGIN_VERSION)} ev:hold req:${debugToken(input.requestId.slice(0, 8))} pid:${input.pid}`;
+  return Array.from(value).slice(0, DBG_BLOB_TEXT_MAX_CHARS).join("");
+}
+var CODEX_BRIDGE_DOWN_MARKER = "cxbridge:down";
+function appendCodexBridgeMarker(dbg, down) {
+  if (typeof dbg !== "string" || dbg.length === 0)
+    return dbg;
+  const bare = dbg.split(` ${CODEX_BRIDGE_DOWN_MARKER}`).join("");
+  if (!down)
+    return bare;
+  const next = `${bare} ${CODEX_BRIDGE_DOWN_MARKER}`;
+  return Array.from(next).length <= DBG_BLOB_TEXT_MAX_CHARS ? next : bare;
 }
 var CC_DIR = `${process.env.HOME}/.config/cc-status`;
 var SESSION_TRACE_PATH = `${CC_DIR}/session-trace.log`;
@@ -173,6 +198,23 @@ function appendFittedPlanAndDebug(base, plan, dbg) {
   const withDebug = { ...withPlan, dbg: capped };
   return sealedBlobChars(encoder.encode(JSON.stringify(withDebug)).length) <= BLOB_FIT_CHARS ? withDebug : withPlan;
 }
+var RECORD_FULL_TEXT_MAX_CHARS = 262144;
+var RECORD_FULL_TEXT_TRUNCATION_MARKER = `
+…[truncated]`;
+function fullTextForRecord(full, fitted) {
+  if (typeof full !== "string" || full.length === 0)
+    return;
+  if (full === fitted)
+    return;
+  const chars = Array.from(full);
+  if (chars.length <= RECORD_FULL_TEXT_MAX_CHARS)
+    return full;
+  const markerChars = Array.from(RECORD_FULL_TEXT_TRUNCATION_MARKER).length;
+  return chars.slice(0, RECORD_FULL_TEXT_MAX_CHARS - markerChars).join("") + RECORD_FULL_TEXT_TRUNCATION_MARKER;
+}
+function recordFullTextIsComplete(value) {
+  return !value.endsWith(RECORD_FULL_TEXT_TRUNCATION_MARKER);
+}
 async function flagExists(path) {
   try {
     await access(path);
@@ -204,6 +246,81 @@ async function codexAppServerSocketAvailable(socketPath = codexAppServerSocketPa
   } catch {
     return false;
   }
+}
+var CODEX_DAEMON_START_ARGS = ["app-server", "daemon", "start"];
+var CODEX_DAEMON_START_TIMEOUT_MS = 8000;
+var CODEX_DAEMON_SOCKET_WAIT_MS = 4000;
+var CODEX_DAEMON_SOCKET_POLL_MS = 250;
+async function startCodexAppServerDaemon(deps = {}) {
+  const trace = deps.trace ?? ((event) => traceSession(event));
+  const probe = deps.probe ?? (() => codexAppServerSocketAvailable());
+  const sleep = deps.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
+  const command = deps.codexPath ?? "codex";
+  const timeoutMs = deps.timeoutMs ?? CODEX_DAEMON_START_TIMEOUT_MS;
+  const socketWaitMs = deps.socketWaitMs ?? CODEX_DAEMON_SOCKET_WAIT_MS;
+  const spawnFn = deps.spawnFn ?? ((cmd, args) => spawn(cmd, [...args], { stdio: "ignore" }));
+  let exit;
+  try {
+    exit = await new Promise((resolve) => {
+      let settled = false;
+      const done = (value) => {
+        if (settled)
+          return;
+        settled = true;
+        resolve(value);
+      };
+      let child;
+      try {
+        child = spawnFn(command, CODEX_DAEMON_START_ARGS);
+      } catch {
+        done("error");
+        return;
+      }
+      const timer = setTimeout(() => {
+        try {
+          child.kill("SIGTERM");
+        } catch {}
+        done("timeout");
+      }, timeoutMs);
+      timer.unref?.();
+      child.on("error", () => {
+        clearTimeout(timer);
+        done("error");
+      });
+      child.on("exit", (code, signal) => {
+        clearTimeout(timer);
+        done({ code, signal });
+      });
+    });
+  } catch {
+    exit = "error";
+  }
+  if (exit === "error" || exit === "timeout" || exit.code !== 0) {
+    trace({
+      event: "codex-daemon-start",
+      outcome: exit === "error" ? "spawn-failed" : exit === "timeout" ? "timeout" : "nonzero-exit",
+      ...typeof exit === "object" ? { code: exit.code, signal: exit.signal } : {}
+    });
+    return false;
+  }
+  const deadline = socketWaitMs;
+  for (let waited = 0;; waited += CODEX_DAEMON_SOCKET_POLL_MS) {
+    let up = false;
+    try {
+      up = await probe();
+    } catch {
+      up = false;
+    }
+    if (up) {
+      trace({ event: "codex-daemon-start", outcome: "started", waitedMs: waited });
+      return true;
+    }
+    if (waited >= deadline)
+      break;
+    await sleep(CODEX_DAEMON_SOCKET_POLL_MS);
+  }
+  trace({ event: "codex-daemon-start", outcome: "no-socket", waitedMs: deadline });
+  return false;
 }
 function lastHookPath(agent) {
   return `${CC_DIR}/last-hook-${agent}`;
@@ -444,15 +561,37 @@ async function completePendingPairing(pending, configPath, opts = {}) {
 function isWatchdogCommand(psCommand) {
   return psCommand.includes("cc-watchdog");
 }
-function formatWatchdogPidfile(pid, version = PLUGIN_VERSION) {
-  return `${pid} ${version}`;
+function watchdogBuildStamp(path = WATCHDOG_PATH) {
+  try {
+    const bytes = readFileSync(path);
+    let hash = 2166136261;
+    for (let i = 0;i < bytes.length; i++) {
+      hash ^= bytes[i];
+      hash = Math.imul(hash, 16777619);
+    }
+    return (hash >>> 0).toString(36);
+  } catch {
+    return;
+  }
+}
+function watchdogBuildDiffers(incumbent, current) {
+  if (incumbent === undefined || current === undefined)
+    return false;
+  return incumbent !== current;
+}
+function formatWatchdogPidfile(pid, version = PLUGIN_VERSION, build) {
+  return `${pid} ${version}${typeof build === "string" && build.length > 0 ? ` ${build}` : ""}`;
 }
 function parseWatchdogPidfile(raw) {
-  const [pidField, versionField] = raw.trim().split(/\s+/);
+  const [pidField, versionField, buildField] = raw.trim().split(/\s+/);
   const pid = Number.parseInt(pidField ?? "", 10);
   if (!Number.isFinite(pid) || pid <= 0)
     return null;
-  return { pid, ...typeof versionField === "string" && versionField.length > 0 ? { version: versionField } : {} };
+  return {
+    pid,
+    ...typeof versionField === "string" && versionField.length > 0 ? { version: versionField } : {},
+    ...typeof buildField === "string" && buildField.length > 0 ? { build: buildField } : {}
+  };
 }
 function watchdogHolderIsLive(pid, deps = {}) {
   const isAlive = deps.isAlive ?? pidAlive;
@@ -472,6 +611,7 @@ function ensureWatchdog(deps = {}) {
       return;
     const pidPath = deps.pidPath ?? WATCHDOG_PID_PATH;
     const version = deps.version ?? PLUGIN_VERSION;
+    const build = "build" in deps ? deps.build : watchdogBuildStamp();
     const readPidfile = deps.readPidfile ?? (() => {
       try {
         return readFileSync(pidPath, "utf8");
@@ -487,7 +627,7 @@ function ensureWatchdog(deps = {}) {
     const raw = readPidfile();
     const holder = typeof raw === "string" ? parseWatchdogPidfile(raw) : null;
     if (holder && watchdogHolderIsLive(holder.pid, deps)) {
-      if (holder.version === version)
+      if (holder.version === version && !watchdogBuildDiffers(holder.build, build))
         return;
       try {
         killPid(holder.pid, "SIGTERM");
@@ -502,6 +642,81 @@ async function readRecord(sessionId, sessionsDir = SESSIONS_DIR) {
   } catch {
     return null;
   }
+}
+async function stampPermissionDetailFullAt(sessionsDir, sessionId, permissionDetailFull) {
+  try {
+    const record = await readRecord(sessionId, sessionsDir);
+    if (!record)
+      return;
+    if (record.permissionDetailFull === permissionDetailFull)
+      return;
+    await atomicWrite(`${sessionsDir}/${sessionId}.json`, JSON.stringify({ ...record, permissionDetailFull }), 384);
+  } catch {}
+}
+async function stampPermissionDetailFull(sessionId, permissionDetailFull) {
+  return stampPermissionDetailFullAt(SESSIONS_DIR, sessionId, permissionDetailFull);
+}
+var DECISION_HOLD_SUFFIX = ".hold";
+function decisionHoldFileName(sessionId) {
+  return `${sessionId}${DECISION_HOLD_SUFFIX}`;
+}
+async function writeDecisionHoldAt(sessionsDir, sessionId, hold) {
+  try {
+    await atomicWrite(`${sessionsDir}/${decisionHoldFileName(sessionId)}`, JSON.stringify(hold), 384);
+  } catch {}
+}
+async function clearDecisionHoldAt(sessionsDir, sessionId, pid, beforeUnlink) {
+  const path = `${sessionsDir}/${decisionHoldFileName(sessionId)}`;
+  try {
+    const raw = await readFile(path, "utf8").catch(() => {
+      return;
+    });
+    if (raw !== undefined) {
+      let owner;
+      try {
+        owner = JSON.parse(raw).pid;
+      } catch {
+        owner = undefined;
+      }
+      if (typeof owner === "number" && owner !== pid)
+        return false;
+    }
+    if (beforeUnlink !== undefined) {
+      try {
+        await beforeUnlink();
+      } catch {}
+    }
+    await unlink(path).catch(() => {});
+    return true;
+  } catch {
+    return false;
+  }
+}
+async function settleDecisionHoldRecordAt(sessionsDir, sessionId, patch) {
+  try {
+    const record = await readRecord(sessionId, sessionsDir);
+    if (!record)
+      return;
+    if (record.op !== "update" || record.prio !== 1)
+      return;
+    await atomicWrite(`${sessionsDir}/${sessionId}.json`, JSON.stringify({ ...record, ...patch }), 384);
+  } catch {}
+}
+async function readDecisionHoldAt(sessionsDir, sessionId) {
+  try {
+    return JSON.parse(await readFile(`${sessionsDir}/${decisionHoldFileName(sessionId)}`, "utf8"));
+  } catch {
+    return null;
+  }
+}
+async function writeDecisionHold(sessionId, hold) {
+  return writeDecisionHoldAt(SESSIONS_DIR, sessionId, hold);
+}
+async function clearDecisionHold(sessionId, pid, beforeUnlink) {
+  return clearDecisionHoldAt(SESSIONS_DIR, sessionId, pid, beforeUnlink);
+}
+async function settleDecisionHoldRecord(sessionId, patch) {
+  return settleDecisionHoldRecordAt(SESSIONS_DIR, sessionId, patch);
 }
 async function readPrefix(path, maxBytes) {
   const fh = await open(path, "r");

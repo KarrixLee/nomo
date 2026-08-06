@@ -55,6 +55,65 @@ export function formatPlanPickerDebug(input: {
   return Array.from(value).slice(0, DBG_BLOB_TEXT_MAX_CHARS).join("");
 }
 
+/** The `dbg` breadcrumb for a LAN decision HOLD — the same space-separated `key:value` line
+ *  formatPlanPickerDebug produces, for the other state machine that can wedge a row.
+ *
+ *  It answers the one question a stuck approval always raises: is the card the phone is showing the
+ *  Mac's hold, or the record's own frame? The hold's blob is this one and carries this line; the
+ *  record's blob never does. `ev:hold` on the row is that statement, and its absence under a
+ *  decisionPending row means the phone is looking at the worker's copy instead.
+ *
+ *  THE `hold@<at>` TAIL IS RETIRED (LAN status v2 phase 3). It carried the marker's own stamp so a
+ *  reader could line it up against the frame stamp the overlay was max()-ed to — an ordering fact, from
+ *  the era when `ts` was an ordering contract. Under v2 the state feed serves whole snapshots and names
+ *  the deciding input on the wire (`why:"hold"`), so there is no stamp to reconcile and the tail was
+ *  reporting a mechanism nobody reads any more. `ev:hold` alone keeps the only question it ever
+ *  answered answered, on BOTH protocols — nothing on either side has ever parsed the tail, so an old
+ *  phone loses no behaviour, only a number it could not use. Fitted into BLOB_FIT_CHARS by
+ *  appendFittedPlanAndDebug like every other dbg, i.e. dropped entirely rather than crowding out the
+ *  card's real content. */
+export function formatDecisionHoldDebug(input: {
+  requestId: string;
+  pid: number;
+  version?: string;
+}): string {
+  const value = `${debugToken(input.version ?? PLUGIN_VERSION)} ev:hold req:${debugToken(input.requestId.slice(0, 8))} pid:${input.pid}`;
+  return Array.from(value).slice(0, DBG_BLOB_TEXT_MAX_CHARS).join("");
+}
+
+/** The `dbg` tail that says "this Codex session has NO app-server bridge, because the control socket is
+ *  missing right now". It exists because the failure it names is otherwise completely silent: phone
+ *  answering of a Codex TUI `request_user_input` works ONLY through the app-server bridge, and with no
+ *  daemon socket the watchdog's presence gate never builds one — every question then degrades to an
+ *  attention row the phone can look at but not answer. The phone already shows `dbg` verbatim under its
+ *  diagnostics toggle, so one token there turns an invisible degradation into a readable one without any
+ *  new UI.
+ *
+ *  ORDERING TRUTH, encoded here so nobody widens the claim: the marker describes the socket's state at
+ *  the moment the frame was built. It never promises that starting the daemon will rescue THIS session —
+ *  a Codex TUI that launched with no daemon hosts its conversation in-process and can never retro-attach.
+ *  The recovery attempt this marker accompanies is only ever about the NEXT session. */
+export const CODEX_BRIDGE_DOWN_MARKER = "cxbridge:down";
+
+/** Bring a Codex `dbg` line into line with the CURRENT socket observation, honoring append-last
+ *  discipline: the marker goes at the very END (never reordering the frozen grammar
+ *  formatPlanPickerDebug produces), it is added at most once, and it is DROPPED WHOLE rather than
+ *  pushing the line past DBG_BLOB_TEXT_MAX_CHARS — the outer appendFittedPlanAndDebug would otherwise
+ *  slice it into a half-token. `undefined` in (a non-Codex frame) is `undefined` out: nothing is ever
+ *  added to a Claude session.
+ *
+ *  It also REMOVES the marker when the socket is back, which is not symmetry for its own sake: several
+ *  producers rebuild a frame from a `dbg` CACHED ON THE SESSION RECORD (the title repair, the
+ *  provisional row), so without the strip a marker stamped during an outage would ride forward forever
+ *  and keep accusing a daemon that has since recovered. */
+export function appendCodexBridgeMarker(dbg: string | undefined, down: boolean): string | undefined {
+  if (typeof dbg !== "string" || dbg.length === 0) return dbg;
+  const bare = dbg.split(` ${CODEX_BRIDGE_DOWN_MARKER}`).join("");
+  if (!down) return bare;
+  const next = `${bare} ${CODEX_BRIDGE_DOWN_MARKER}`;
+  return Array.from(next).length <= DBG_BLOB_TEXT_MAX_CHARS ? next : bare;
+}
+
 /** Root of the on-disk state: config.json, the per-session pid files, the watchdog pidfile. */
 export const CC_DIR = `${process.env.HOME}/.config/cc-status`;
 /** Append-only, local-only session lifecycle/state-machine trace next to config.json. */
@@ -184,6 +243,56 @@ export function appendFittedPlanAndDebug<T extends Record<string, unknown>>(
     : withPlan;
 }
 
+// --- unabridged copies for the LAN read op (NOM-44 phase 4) -------------------------------------
+//
+// Everything above fits text into the WORKER's 3072-char sealed-blob ceiling: a long plan keeps a
+// prefix, a long permission detail keeps a prefix plus an omitted-count. That ceiling is real and stays
+// exactly as it is — every byte that crosses the worker still obeys it. But a phone on the SAME network
+// can pull from this machine directly (lan-listener's `read` op), and there is no ceiling on that path,
+// so the UNABRIDGED string is teed onto the session record and served on demand.
+//
+// POSTURE: session records are 0600 local files that never leave this Mac — the watchdog's heartbeat
+// posts `record.blob` (already sealed under the pairing key) and nothing else, and the LAN frames feed
+// copies only the sealed blob plus the clear envelope fields. Plaintext on the record is therefore
+// exactly the posture the record already has (it holds the hostname, the cwd label, and the absolute
+// transcript path in the clear today).
+
+/** Ceiling on a full copy kept for the LAN read op. "No worker ceiling" is not "unbounded": 256 K
+ *  characters is far past any real plan or shell command, and it bounds what a runaway tool_input can
+ *  make this plugin write per session (and re-write on every watchdog record rewrite). */
+export const RECORD_FULL_TEXT_MAX_CHARS = 262_144;
+/** Appended when the cap above actually clipped the text. It is what lets a reader report
+ *  `complete:false` out loud instead of silently amputating — the same honest-truncation contract
+ *  `fitPermissionDetail`'s omitted-count and `appendFittedPlan`'s "\n…" marker carry on the wire. */
+export const RECORD_FULL_TEXT_TRUNCATION_MARKER = "\n…[truncated]";
+
+/** The value to persist on the session record for a blob field that was fitted, or undefined when
+ *  there is nothing worth keeping.
+ *
+ *  Undefined — meaning "the phone falls back to the copy already in the blob" — in exactly two cases:
+ *  there was no text at all, or the fit changed NOTHING (`full === fitted`), in which case a second copy
+ *  on disk would only be a bigger record saying the same thing. Otherwise the whole string, clipped at
+ *  RECORD_FULL_TEXT_MAX_CHARS code points (never mid-code-point) with the marker appended.
+ *
+ *  `fitted` is undefined when the fit dropped the field ENTIRELY (a plan that could not fit at all) —
+ *  that is a change, so the full text is stored. Pure; never throws. */
+export function fullTextForRecord(full: string | undefined, fitted: string | undefined): string | undefined {
+  if (typeof full !== "string" || full.length === 0) return undefined;
+  if (full === fitted) return undefined;
+  const chars = Array.from(full);
+  if (chars.length <= RECORD_FULL_TEXT_MAX_CHARS) return full;
+  const markerChars = Array.from(RECORD_FULL_TEXT_TRUNCATION_MARKER).length;
+  return chars.slice(0, RECORD_FULL_TEXT_MAX_CHARS - markerChars).join("") + RECORD_FULL_TEXT_TRUNCATION_MARKER;
+}
+
+/** Did a stored full copy survive the cap whole? The marker is the signal (a suffix test, not a length
+ *  test: the stored string is the only thing the reader has). A genuine text that happens to END with
+ *  the exact marker would be reported one notch more conservatively than it deserves — cosmetic, and
+ *  the alternative (a second record field) would spend an append-last slot on it. Pure. */
+export function recordFullTextIsComplete(value: string): boolean {
+  return !value.endsWith(RECORD_FULL_TEXT_TRUNCATION_MARKER);
+}
+
 /** Whether a zero-byte marker/flag file exists on disk. The ONE probe shared by every reader of the
  *  local no-hold flag — the permission hook's escape-hatch gate, the `permission off|on|status` CLI
  *  toggle, and localApprovalsState just below — so the gate, the toggle and the reported header can
@@ -281,6 +390,112 @@ export async function codexAppServerSocketAvailable(socketPath = codexAppServerS
   } catch {
     return false;
   }
+}
+
+/** The EXACT subcommand that brings the shared Codex app-server daemon up, verified against the local
+ *  binary's help (codex-cli 0.146.0): `codex app-server daemon start` — "Start the local app server
+ *  daemon if it is not already running", i.e. it is idempotent by contract. NOTE it is `daemon start`
+ *  and NOT `codex app-server proxy`: proxy only ATTACHES to an existing control socket and fails with a
+ *  connect error when none is there, which is precisely how the daemon's death stayed invisible. */
+export const CODEX_DAEMON_START_ARGS = ["app-server", "daemon", "start"] as const;
+/** Ceiling on the start CHILD itself. `daemon start` forks the server and returns; anything slower than
+ *  this is a wedged binary and waiting longer only delays the trace. */
+const CODEX_DAEMON_START_TIMEOUT_MS = 8_000;
+/** After a clean exit, how long we keep re-statting for the socket before calling the attempt a failure.
+ *  The daemon binds its control socket a beat after the parent returns. */
+const CODEX_DAEMON_SOCKET_WAIT_MS = 4_000;
+const CODEX_DAEMON_SOCKET_POLL_MS = 250;
+
+export interface CodexDaemonStartDeps {
+  /** Spawns the start child. Defaults to the real `codex` binary with stdin CLOSED (see below). */
+  spawnFn?: (command: string, args: readonly string[]) => {
+    on(event: "error", listener: (error: unknown) => void): unknown;
+    on(event: "exit", listener: (code: number | null, signal: string | null) => void): unknown;
+    kill(signal?: string): boolean;
+  };
+  probe?: () => Promise<boolean>;
+  sleep?: (ms: number) => Promise<void>;
+  trace?: (event: object) => void;
+  codexPath?: string;
+  timeoutMs?: number;
+  socketWaitMs?: number;
+}
+
+/** Best-effort recovery for a MISSING Codex app-server daemon: run `codex app-server daemon start` once
+ *  and wait, bounded, for the control socket to appear. Resolves true only when the socket is really
+ *  there afterwards.
+ *
+ *  RULES, all of them load-bearing:
+ *   - NON-INTERACTIVE. stdio is `ignore` — stdin is /dev/null, so the child can never prompt, and it
+ *     inherits none of our streams (the watchdog owes its stdout absolute silence).
+ *   - NEVER THROWS. A missing binary (ENOENT), a non-zero exit, a hang, or a socket that never appears
+ *     all resolve false and are TRACED. The caller degrades; it never fails.
+ *   - IT DOES NOT RESCUE THE SESSION THAT NOTICED. A Codex TUI started while no daemon existed hosts its
+ *     conversation in-process and never retro-attaches, so no amount of starting the daemon makes THAT
+ *     TUI answerable from the phone. This buys the NEXT session, and any wording built on top of it must
+ *     not promise more (see CODEX_BRIDGE_DOWN_MARKER). */
+export async function startCodexAppServerDaemon(deps: CodexDaemonStartDeps = {}): Promise<boolean> {
+  const trace = deps.trace ?? ((event: object) => traceSession(event));
+  const probe = deps.probe ?? (() => codexAppServerSocketAvailable());
+  const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+  const command = deps.codexPath ?? "codex";
+  const timeoutMs = deps.timeoutMs ?? CODEX_DAEMON_START_TIMEOUT_MS;
+  const socketWaitMs = deps.socketWaitMs ?? CODEX_DAEMON_SOCKET_WAIT_MS;
+  const spawnFn = deps.spawnFn
+    ?? ((cmd: string, args: readonly string[]) => spawn(cmd, [...args], { stdio: "ignore" }));
+
+  let exit: { code: number | null; signal: string | null } | "error" | "timeout";
+  try {
+    exit = await new Promise<typeof exit>((resolve) => {
+      let settled = false;
+      const done = (value: typeof exit): void => {
+        if (settled) return;
+        settled = true;
+        resolve(value);
+      };
+      let child: ReturnType<NonNullable<CodexDaemonStartDeps["spawnFn"]>>;
+      try {
+        child = spawnFn(command, CODEX_DAEMON_START_ARGS);
+      } catch {
+        done("error"); // codex not installed / not executable
+        return;
+      }
+      const timer = setTimeout(() => {
+        try { child.kill("SIGTERM"); } catch { /* already gone */ }
+        done("timeout");
+      }, timeoutMs);
+      (timer as unknown as { unref?: () => void }).unref?.();
+      child.on("error", () => { clearTimeout(timer); done("error"); });
+      child.on("exit", (code, signal) => { clearTimeout(timer); done({ code, signal }); });
+    });
+  } catch {
+    exit = "error";
+  }
+
+  if (exit === "error" || exit === "timeout" || exit.code !== 0) {
+    trace({
+      event: "codex-daemon-start", outcome: exit === "error" ? "spawn-failed" : exit === "timeout" ? "timeout" : "nonzero-exit",
+      ...(typeof exit === "object" ? { code: exit.code, signal: exit.signal } : {}),
+    });
+    return false;
+  }
+
+  // Exit 0 is not proof: `daemon start` returns before the socket is necessarily bound (and would also
+  // exit 0 if it decided the daemon was already up while the socket is being replaced). The SOCKET is
+  // the contract, so re-stat until it shows up or the bounded wait expires.
+  const deadline = socketWaitMs;
+  for (let waited = 0; ; waited += CODEX_DAEMON_SOCKET_POLL_MS) {
+    let up = false;
+    try { up = await probe(); } catch { up = false; }
+    if (up) {
+      trace({ event: "codex-daemon-start", outcome: "started", waitedMs: waited });
+      return true;
+    }
+    if (waited >= deadline) break;
+    await sleep(CODEX_DAEMON_SOCKET_POLL_MS);
+  }
+  trace({ event: "codex-daemon-start", outcome: "no-socket", waitedMs: deadline });
+  return false;
 }
 
 /** Per-agent hook-liveness stamp: the hook rewrites `<CC_DIR>/last-hook-<agent>` (epoch-ms text) on
@@ -435,6 +650,60 @@ export interface SessionRecord {
    *  watchdog rewrites. Local-only diagnostic metadata — never copied into the blob or wire envelope.
    *  Optional for backward compatibility with records written before the phantom-session trace fix. */
   origin?: SessionOrigin;
+  /** APPENDED LAST (NOM-44 phase 3). The clear `attentionKind` discriminator just POSTed for this
+   *  session — today only Codex's `request_user_input` ("the model is asking YOU something", as opposed
+   *  to a plain permission approval). It already rides the WORKER envelope (see hook.ts buildEnvelope /
+   *  cc-watchdog's needsAttention corrective), but it was never persisted, so the LAN frames feed — which
+   *  is rebuilt from these records, not from the POSTs — would have dropped the marker and shown a Codex
+   *  question as an ordinary approval on the phone.
+   *
+   *  APPEND-LAST DISCIPLINE (mirrors how `model`/`pairingId` were added): a new optional field goes at
+   *  the END of this interface AND at the END of trackSessionAt's record literal, never interleaved, so
+   *  existing keys keep their order and the diff shows exactly one added line on each side. Parsing is
+   *  tolerant by construction — readRecord is a plain JSON.parse, so a record written by an older plugin
+   *  simply has no `attentionKind` key and reads back `undefined` (never a crash, never a default).
+   *  Absent → no discriminator (a plain approval, or an agent that has none). */
+  attentionKind?: "userInput";
+  /** APPENDED LAST (NOM-44 phase 4), same discipline as `attentionKind` above. The UNABRIDGED plan
+   *  markdown whose FITTED copy rides the sealed blob's `plan` key — present ONLY when appendFittedPlan
+   *  actually had to cut (or drop) it, so `full === fitted` stores nothing and the phone simply reads the
+   *  blob's copy. Served by the LAN listener's `read` op; capped at RECORD_FULL_TEXT_MAX_CHARS with
+   *  RECORD_FULL_TEXT_TRUNCATION_MARKER. Written by trackSessionAt, which rebuilds the record whole, so
+   *  a later event of the same session drops it automatically. */
+  planFull?: string;
+  /** APPENDED LAST (NOM-44 phase 4). The UNABRIDGED `permissionDetail` — the whole ExitPlanMode plan,
+   *  the whole multi-line Bash command — whose fitted prefix rides the decisionPending blob. Present ONLY
+   *  when `fitPermissionDetail` had to cut it. Unlike every other field here it is PATCHED onto an
+   *  existing record (see stampPermissionDetailFullAt): the permission hook is a separate short-lived
+   *  process that reads the record but never rebuilds it. The next ordinary hook rewrite drops it, which
+   *  is exactly the right lifetime — the card is gone by then. */
+  permissionDetailFull?: string;
+  /** APPENDED LAST. Local-only Codex discovery-suppression marker. After a done row's one-hour
+   *  real-event horizon, the watchdog sends op:end but must remember the still-open interactive TUI:
+   *  otherwise process discovery would recreate the retired row on its next five-second pass. The
+   *  marker is a deliberately minimal SessionRecord (no blob/op/full text), with pid === tuiPid, and
+   *  remains only until that TUI exits or a genuine hook rebuilds this file and thereby drops the key.
+   *  It never rides a worker or LAN envelope. */
+  retiredAt?: number;
+  /** APPENDED LAST (NOM-45), same discipline as `attentionKind` above. Epoch ms at which an attention
+   *  episode ended because THE WORKER WAS UNREACHABLE — a first-contact POST that failed at the
+   *  transport layer with nothing found by the did-it-land probe, or a granted hold that rode
+   *  MAX_CONSECUTIVE_MISSES worth of consecutive unusable polls. NOT set for a genuine answer, an
+   *  expiry/supersede, a definitive 401/403/404/410, or a thrown exception: those are all states where
+   *  the phone's row is telling the truth.
+   *
+   *  WHY IT EXISTS (field report, 2026-08-03): the hook is fail-open, so the user is never blocked at
+   *  the Mac — but the PHONE was left showing a yellow needsAttention hand for a hold that no longer
+   *  exists, indistinguishable from a genuine dead end the user could answer. This flag is what lets
+   *  computeSessionState say `attn/net` and the settle re-seal the row's blob with `reconnecting`, so
+   *  the phone renders the honest auto-retrying treatment instead: the Mac lost contact, and it will
+   *  ask again.
+   *
+   *  LIFETIME is the same as `attentionKind`'s and for the same reason: an ordinary hook rewrite
+   *  (trackSessionAt rebuilds the record whole) drops the key, the hold-settle clears it explicitly on
+   *  the working branch so the watchdog's `...record` spreads cannot carry it forward, and
+   *  computeSessionState only reads it on the rung that can honestly show it (`record.prio === 1`). */
+  attentionStalledAt?: number;
 }
 
 /** The plaintext a pending-pairing flush needs to POST the pairing session the instant the shared key
@@ -917,24 +1186,75 @@ export function isWatchdogCommand(psCommand: string): boolean {
   return psCommand.includes("cc-watchdog");
 }
 
-/** The parsed watchdog pidfile: the holder's pid plus, when the incumbent stamped one, its build. */
+/** The parsed watchdog pidfile: the holder's pid plus, when the incumbent stamped them, its version
+ *  and the identity of the BUNDLE it is actually executing. */
 export interface WatchdogPidfile {
   pid: number;
   /** The incumbent's PLUGIN_VERSION. Absent for a pidfile written by a pre-stamp build → older code. */
   version?: string;
+  /** The incumbent's `watchdogBuildStamp` — see below. Absent for a pre-build-stamp build, or when it
+   *  could not read its own bundle. */
+  build?: string;
 }
 
-/** Render the pidfile contents for THIS process (see the format note above). */
-export function formatWatchdogPidfile(pid: number, version: string = PLUGIN_VERSION): string {
-  return `${pid} ${version}`;
+/** The identity of the watchdog BUNDLE — what the version string is not.
+ *
+ *  A version is bumped at RELEASE; a bundle is rebuilt on every iteration of a fix. The daemon lingers
+ *  up to 30 min between sessions, so a rebuild under an unchanged version left the incumbent running
+ *  the OLD code with nothing able to notice: `ensureWatchdog` compared version to version, found them
+ *  equal, and returned. That is how a shipped, on-disk fix ran nowhere for hours (the LAN decisionPending
+ *  hold, 2026-08-02 — the hook wrote its `.hold` markers and the running feed had no code to read them).
+ *
+ *  CONTENT-DERIVED, deliberately, not mtime or size: the same bundle exists in more than one place on a
+ *  real machine (a plugin-cache copy and a dev checkout), and a path-shaped stamp would make two hooks
+ *  running from different copies of the SAME build fight over the daemon on every event. FNV-1a over the
+ *  bundle is ~0.5 ms for the real ~280 KB file, which is nothing beside the network call this hook is
+ *  about to make, and it is not a security boundary — the file is the code we are already executing.
+ *
+ *  UNDEFINED means UNKNOWN (unreadable, absent, a dev entry that isn't there): never a fabricated stamp,
+ *  because a wrong one would either mask a stale daemon or restart a healthy one. */
+export function watchdogBuildStamp(path: string = WATCHDOG_PATH): string | undefined {
+  try {
+    const bytes = readFileSync(path);
+    let hash = 0x811c9dc5;
+    for (let i = 0; i < bytes.length; i++) {
+      hash ^= bytes[i]!;
+      hash = Math.imul(hash, 0x01000193);
+    }
+    return (hash >>> 0).toString(36);
+  } catch {
+    return undefined;
+  }
+}
+
+/** Do two build stamps describe DIFFERENT bundles? Only when both are known and disagree: an unknown
+ *  stamp on either side (a pre-stamp incumbent, an unreadable bundle) falls back to the version
+ *  comparison alone, because guessing "different" there would SIGTERM the daemon on every hook. Pure. */
+export function watchdogBuildDiffers(incumbent: string | undefined, current: string | undefined): boolean {
+  if (incumbent === undefined || current === undefined) return false;
+  return incumbent !== current;
+}
+
+/** Render the pidfile contents for THIS process (see the format note above). The build stamp is
+ *  omitted entirely when unknown, which is byte-for-byte the two-field form earlier builds wrote —
+ *  and it is passed IN rather than defaulted, so this stays pure and nothing stats a bundle just to
+ *  format a string. The daemon's own claim path supplies `watchdogBuildStamp()`. */
+export function formatWatchdogPidfile(
+  pid: number, version: string = PLUGIN_VERSION, build?: string,
+): string {
+  return `${pid} ${version}${typeof build === "string" && build.length > 0 ? ` ${build}` : ""}`;
 }
 
 /** Parse a pidfile's contents. Null when there's no usable pid (empty / non-numeric / ≤ 0). Pure. */
 export function parseWatchdogPidfile(raw: string): WatchdogPidfile | null {
-  const [pidField, versionField] = raw.trim().split(/\s+/);
+  const [pidField, versionField, buildField] = raw.trim().split(/\s+/);
   const pid = Number.parseInt(pidField ?? "", 10);
   if (!Number.isFinite(pid) || pid <= 0) return null;
-  return { pid, ...(typeof versionField === "string" && versionField.length > 0 ? { version: versionField } : {}) };
+  return {
+    pid,
+    ...(typeof versionField === "string" && versionField.length > 0 ? { version: versionField } : {}),
+    ...(typeof buildField === "string" && buildField.length > 0 ? { build: buildField } : {}),
+  };
 }
 
 /** Injectable process-identity seams (so both claim paths are testable with a fake `ps`). */
@@ -971,6 +1291,8 @@ export interface EnsureWatchdogDeps extends WatchdogIdentityDeps {
   spawnWatchdog?: () => void;
   /** THIS build's version (the stamp a live incumbent is compared against). */
   version?: string;
+  /** THIS bundle's `watchdogBuildStamp` — the second half of that comparison. */
+  build?: string;
 }
 
 /** Ensure the detached liveness/self-heal watchdog is running the CURRENT build: if its pidfile is
@@ -992,6 +1314,7 @@ export function ensureWatchdog(deps: EnsureWatchdogDeps = {}): void {
     if (process.env.NOMO_SKIP_WATCHDOG === "1") return;
     const pidPath = deps.pidPath ?? WATCHDOG_PID_PATH;
     const version = deps.version ?? PLUGIN_VERSION;
+    const build = "build" in deps ? deps.build : watchdogBuildStamp();
     const readPidfile = deps.readPidfile ?? (() => {
       try { return readFileSync(pidPath, "utf8"); } catch { return undefined; }
     });
@@ -1006,8 +1329,9 @@ export function ensureWatchdog(deps: EnsureWatchdogDeps = {}): void {
     const holder = typeof raw === "string" ? parseWatchdogPidfile(raw) : null;
     if (holder && watchdogHolderIsLive(holder.pid, deps)) {
       // A live watchdog on OUR build → nothing to do. A live watchdog on any other build (including an
-      // unstamped pre-upgrade one) is running stale code: retire it, then spawn the current bundle.
-      if (holder.version === version) return;
+      // unstamped pre-upgrade one, or the SAME version rebuilt in place — see watchdogBuildStamp) is
+      // running stale code: retire it, then spawn the current bundle.
+      if (holder.version === version && !watchdogBuildDiffers(holder.build, build)) return;
       try { killPid(holder.pid, "SIGTERM"); } catch { /* raced its own exit — spawn anyway */ }
     }
     spawnWatchdog();
@@ -1023,6 +1347,197 @@ export async function readRecord(sessionId: string, sessionsDir: string = SESSIO
   } catch {
     return null;
   }
+}
+
+/** Tee the UNABRIDGED permission detail onto an EXISTING session record (NOM-44 phase 4), so a phone on
+ *  the same network can pull the whole plan/command over LAN instead of the wire-budget prefix.
+ *
+ *  READ-MODIFY-WRITE, exactly like markDoneDeliveredAt and for the same reason: the permission hook is a
+ *  separate short-lived process, so it must patch the one key it owns rather than rewrite a snapshot the
+ *  session's own hooks (or the watchdog) may have moved on from. `undefined` is a legitimate value — it
+ *  DROPS the key on stringify (the same idiom markDoneDeliveredAt uses for donePending), which is how a
+ *  prompt whose detail rode whole clears the copy an earlier prompt in the same session left behind.
+ *
+ *  No record (the session was reaped, or its first hook has not landed) → nothing to patch, and nothing
+ *  to serve either: the LAN read answers not-found, which is the honest answer. Best-effort throughout —
+ *  a failed tee costs the phone the truncated copy it would have had anyway. */
+export async function stampPermissionDetailFullAt(
+  sessionsDir: string, sessionId: string, permissionDetailFull: string | undefined,
+): Promise<void> {
+  try {
+    const record = await readRecord(sessionId, sessionsDir);
+    if (!record) return;
+    if (record.permissionDetailFull === permissionDetailFull) return; // nothing would change
+    await atomicWrite(`${sessionsDir}/${sessionId}.json`, JSON.stringify({ ...record, permissionDetailFull }), 0o600);
+  } catch {
+    // Bookkeeping is best-effort, exactly like trackSession's own write.
+  }
+}
+
+/** Production wrapper for the fixed on-disk sessions root (tests inject a temp dir). */
+export async function stampPermissionDetailFull(
+  sessionId: string, permissionDetailFull: string | undefined,
+): Promise<void> {
+  return stampPermissionDetailFullAt(SESSIONS_DIR, sessionId, permissionDetailFull);
+}
+
+// ---- the remote-approval HOLD marker (the LAN channel's decision-pending guard) ------------------
+//
+// WHY IT EXISTS. `decisionPending` — the violet Allow/Deny card — is a state the permission hook builds
+// ONLY as the body of its POST /v1/cc/decision, never as anything on disk. The worker stores that frame
+// and defends it: while a request is pending it DROPS the concurrent plain prio:1 needsAttention that
+// CC's `Notification` (permission_prompt) hook fires ~1-6 s later (`dropped:"decision-pending"`,
+// server/src/cc.ts). The LAN frames feed, which rebuilds its frames from the SESSION RECORD, had
+// neither half: no card to serve, and no guard — so it shipped that plain needsAttention at a stamp
+// NEWER than the worker's, and the phone's CCWorkerSnapshotMerge (app build 10) correctly held the
+// worker's older decisionPending brief back. The prompt settled on a yellow "needs help" row with no
+// Allow/Deny and the user could not answer from the app at all (field report, session bed2e681,
+// 2026-08-02). This marker is the record channel's copy of both halves.
+//
+// A SIBLING FILE, NOT A SessionRecord FIELD, deliberately. `trackSessionAt` rebuilds the record WHOLE on
+// every hook event (that is what makes attentionKind/planFull expire on their own), so a field would be
+// erased by the very Notification write it exists to outrank — the hook that owns the hold is a separate
+// short-lived process and cannot re-stamp it. A `<sessionId>.hold` file sits in the same directory (so
+// the feed's fs.watch sees it appear and disappear within milliseconds) while being invisible to every
+// other consumer: readdir callers in cc-watchdog, reset, status-cmd, hook.ts and the feed itself all
+// filter `.endsWith(".json")`.
+//
+// CRASH SAFETY IS THE FEED'S, NOT THIS FILE'S. `clearDecisionHold` runs from the hook's `finally`, which
+// a SIGKILL — or the SIGTERM a closed terminal sends, seen on bed2e681 — never reaches. So the marker
+// carries its own holder pid and start time and the feed treats it as inert the moment that process is
+// gone or the TTL lapses (see lanHoldLive). A stale marker can never wedge a row.
+
+/** One live remote-approval hold, as the hook writes it and the LAN frames feed reads it. */
+export interface DecisionHold {
+  /** The SEALED decisionPending frame — byte-identical to the `blob` the hook POSTed to
+   *  /v1/cc/decision, sealed under the pairing e2eKey. The feed is exactly as blind to it as the
+   *  worker is; only the phone can open it. */
+  blob: string;
+  /** Epoch-ms the hold began: the TTL anchor, and the frame's ordering stamp when the record itself
+   *  has not been rewritten since. */
+  at: number;
+  /** The HOLDING HOOK's own pid (not the session's). The feed probes it for liveness, which is what
+   *  makes a killed hook release the card in one reconcile pass instead of at the TTL. */
+  pid: number;
+}
+
+/** Deliberately NOT `.json`: every other readdir consumer of SESSIONS_DIR filters on that extension
+ *  (cc-watchdog's two sweeps, reset, status-cmd, hook.ts's two scans, and the frames feed itself), so
+ *  a marker can never be mistaken for a session row. */
+export const DECISION_HOLD_SUFFIX = ".hold";
+
+/** The marker's file name for a session. */
+export function decisionHoldFileName(sessionId: string): string {
+  return `${sessionId}${DECISION_HOLD_SUFFIX}`;
+}
+
+/** Stamp a live hold beside its session record. Best-effort, like every other write in this file: a
+ *  failed stamp costs the phone the LAN card, and the ≤3 s worker poll still carries it. */
+export async function writeDecisionHoldAt(
+  sessionsDir: string, sessionId: string, hold: DecisionHold,
+): Promise<void> {
+  try {
+    await atomicWrite(`${sessionsDir}/${decisionHoldFileName(sessionId)}`, JSON.stringify(hold), 0o600);
+  } catch {
+    // Bookkeeping is best-effort, exactly like trackSession's own write.
+  }
+}
+
+/** Remove a hold marker — COMPARE-AND-CLEAR on the holder pid. Claude runs tools in PARALLEL, so a
+ *  SECOND permission hook may have stamped ITS hold over ours while we were polling; an exiting hook
+ *  must never silently un-hold a prompt the user is still looking at. A marker we cannot read is
+ *  removed anyway (nobody can own it).
+ *
+ *  Returns whether this pid actually OWNED the marker — which is the gate the caller's record settle
+ *  needs (see settleDecisionHoldRecordAt): if a parallel tool's newer hold owns this session, our exit
+ *  must move neither the marker nor the record, or we would drop a card the user is still looking at.
+ *
+ *  `beforeUnlink` runs ONLY when the compare-and-clear accepts, and ALWAYS BEFORE the unlink — this
+ *  function is the one place that knows both facts. The order is load-bearing: the LAN frames feed reads
+ *  the record and the marker independently per reconcile pass, so a pass that observed "marker gone +
+ *  record stale" would ship exactly the frozen yellow the settle exists to prevent. Best-effort: a
+ *  throwing callback still retires the marker (a wedged card is worse than a stale record). */
+export async function clearDecisionHoldAt(
+  sessionsDir: string, sessionId: string, pid: number,
+  beforeUnlink?: () => Promise<void>,
+): Promise<boolean> {
+  const path = `${sessionsDir}/${decisionHoldFileName(sessionId)}`;
+  try {
+    const raw = await readFile(path, "utf8").catch(() => undefined);
+    if (raw !== undefined) {
+      let owner: number | undefined;
+      try { owner = (JSON.parse(raw) as DecisionHold).pid; } catch { owner = undefined; }
+      if (typeof owner === "number" && owner !== pid) return false; // a newer hold owns this session now
+    }
+    if (beforeUnlink !== undefined) {
+      try { await beforeUnlink(); } catch { /* the marker still goes — see the header */ }
+    }
+    await unlink(path).catch(() => {}); // already gone → nothing to do
+    return true;
+  } catch {
+    // Best-effort: a marker left behind is released by the feed's liveness/TTL guards anyway.
+    return false;
+  }
+}
+
+/** Settle an EXISTING session record out of the hold this process owned (field reports R2/R3, session
+ *  a51208e8). The permission hook never wrote the record, so retiring the marker handed the row back to
+ *  the state CC's `Notification` hook left there — op:update / prio:1 / needsAttention at a FROZEN ts —
+ *  and the LAN feed's monotonic stamp ships that at prevTs+1, where the phone accepts it. Answered, a
+ *  later hook advances the record ~1 s on (a yellow FLASH); superseded/expired/gave-up/threw, NOTHING
+ *  ever follows — no line is emitted, no tool runs, no hook fires, and the watchdog's idle reap
+ *  deliberately skips needsAttention — so the row wedges yellow for good. It also pins the WORKER's
+ *  `decact` overlay, which only clears on a prio:0/done/end frame.
+ *
+ *  READ-MODIFY-WRITE, exactly like markDoneDeliveredAt and stampPermissionDetailFullAt and for the same
+ *  reason: the permission hook is a separate short-lived process, so it patches the keys it owns rather
+ *  than rewriting a snapshot the session's own hooks (or the watchdog) may have moved on from.
+ *
+ *  NO-OP UNLESS THE RECORD IS STILL OURS. Only a plain `update`/prio:1 record is the one we overlaid; if
+ *  a later hook already advanced it (a parallel tool's PostToolUse, a done, an end) that state is newer
+ *  than anything this exiting hook knows and must never be walked back. Best-effort throughout. */
+export async function settleDecisionHoldRecordAt(
+  sessionsDir: string, sessionId: string, patch: Partial<SessionRecord>,
+): Promise<void> {
+  try {
+    const record = await readRecord(sessionId, sessionsDir);
+    if (!record) return;                                        // reaped / never tracked → nothing to settle
+    if (record.op !== "update" || record.prio !== 1) return;     // a later hook already moved it on
+    await atomicWrite(`${sessionsDir}/${sessionId}.json`, JSON.stringify({ ...record, ...patch }), 0o600);
+  } catch {
+    // Bookkeeping is best-effort, exactly like trackSession's own write.
+  }
+}
+
+/** The marker for one session, or null when there is none (the overwhelmingly common case) / it is
+ *  unreadable. Never throws. */
+export async function readDecisionHoldAt(
+  sessionsDir: string, sessionId: string,
+): Promise<DecisionHold | null> {
+  try {
+    return JSON.parse(
+      await readFile(`${sessionsDir}/${decisionHoldFileName(sessionId)}`, "utf8"),
+    ) as DecisionHold;
+  } catch {
+    return null;
+  }
+}
+
+/** Production wrappers for the fixed on-disk sessions root (tests inject a temp dir). */
+export async function writeDecisionHold(sessionId: string, hold: DecisionHold): Promise<void> {
+  return writeDecisionHoldAt(SESSIONS_DIR, sessionId, hold);
+}
+
+export async function clearDecisionHold(
+  sessionId: string, pid: number, beforeUnlink?: () => Promise<void>,
+): Promise<boolean> {
+  return clearDecisionHoldAt(SESSIONS_DIR, sessionId, pid, beforeUnlink);
+}
+
+export async function settleDecisionHoldRecord(
+  sessionId: string, patch: Partial<SessionRecord>,
+): Promise<void> {
+  return settleDecisionHoldRecordAt(SESSIONS_DIR, sessionId, patch);
 }
 
 /** Read up to `maxBytes` from the START of a file (the transcript's ai-title / first prompt sit near

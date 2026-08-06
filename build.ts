@@ -22,7 +22,7 @@ const OUTDIR = join(HERE, "plugin", "dist");
  *  (calls runHook("codex")); cc-watchdog is spawned by either hook (as a sibling dist/cc-watchdog.mjs
  *  — see shared's WATCHDOG_PATH); pair/unpair/status-cmd back the Claude slash commands and the
  *  Codex skills. codex-notify is the Codex `notify`-channel backstop (a done push when the lifecycle
- *  hooks fail to fire) — invoked with its JSON payload as argv by plugin/scripts/notify-chain.sh, not
+ *  hooks fail to fire) — invoked with its JSON payload as argv by plugin/scripts/hook-shim.sh, not
  *  on stdin. cc-permission / codex-permission are the blocking PermissionRequest holds (Claude / Codex
  *  twins — the phone answers Allow/Deny while the terminal dialog waits). Each is bundled standalone
  *  with its local deps inlined. */

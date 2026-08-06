@@ -1,11 +1,18 @@
 import { describe, expect, test } from "bun:test";
 import { decryptBlob, encryptBlob } from "./crypto";
 import { codexAnswersFromPhone, startCodexRemoteInput } from "./codex-remote-input";
+import type { CodexRemoteInputDeps } from "./codex-remote-input";
+import {
+  createPollBudget, POLL_FIRST_CONTACT_TIMEOUT_MS, POLL_TIMEOUT_CEILING_MS, POLL_TIMEOUT_MS,
+} from "./decision-poll";
+import { createLanAnswerStore, LAN_ANSWER_TTL_MS } from "./lan-listener";
+import type { LanAnswerStore } from "./lan-listener";
 import type { CodexUserInputRequest } from "./codex-app-server-client";
 import {
   buildPermissionQuestions, capPermissionWireText, PERMISSION_QUESTION_LABEL_MAX,
 } from "./permission";
 import type { Config, SessionRecord } from "./shared";
+import { renderableCodexUserInput } from "./codex-user-input-shape";
 
 const key = new Uint8Array(Array.from({ length: 32 }, (_, index) => index + 1));
 const config: Config = {
@@ -103,9 +110,126 @@ describe("codexAnswersFromPhone", () => {
     expect(codexAnswersFromPhone(request(), ["Other"])).toBeUndefined();
     expect(codexAnswersFromPhone(request(), [""])).toBeUndefined();
   });
+
+  // THE ANSWER-EATING SHAPE. The id is the map key, so two questions sharing one id used to collapse
+  // into a single entry: app-server got only the SECOND question's pick, and the user's first answer
+  // (the "No" to "Deploy to prod?" below) was discarded with no trace. Falling back to the Mac picker
+  // is the only honest outcome.
+  test("rejects two questions sharing an id instead of dropping the first answer", () => {
+    const duplicate = request({
+      questions: [
+        {
+          id: "dupe", header: "Deploy", question: "Deploy to prod?", isOther: false, isSecret: false,
+          options: [{ label: "Yes", description: "" }, { label: "No", description: "" }],
+        },
+        {
+          id: "dupe", header: "Notify", question: "Tell the channel?", isOther: false, isSecret: false,
+          options: [{ label: "Yes", description: "" }, { label: "No", description: "" }],
+        },
+      ],
+    });
+    expect(codexAnswersFromPhone(duplicate, ["No", "Yes"])).toBeUndefined();
+  });
+
+  test("rejects a question whose id is empty or missing (it would key the map \"undefined\")", () => {
+    const empty = request({ questions: [{ ...request().questions[0], id: "" }] });
+    expect(codexAnswersFromPhone(empty, ["Thorough"])).toBeUndefined();
+
+    const { id: _dropped, ...idless } = request().questions[0];
+    const missing = request({
+      questions: [idless as CodexUserInputRequest["questions"][number]],
+    });
+    expect(codexAnswersFromPhone(missing, ["Thorough"])).toBeUndefined();
+  });
+
+  test("distinct ids on a multi-question request still map every answer (happy path unchanged)", () => {
+    const two = request({
+      questions: [
+        {
+          id: "deploy", header: "Deploy", question: "Deploy to prod?", isOther: false, isSecret: false,
+          options: [{ label: "Yes", description: "" }, { label: "No", description: "" }],
+        },
+        {
+          id: "notify", header: "Notify", question: "Tell the channel?", isOther: false, isSecret: false,
+          options: [{ label: "Yes", description: "" }, { label: "No", description: "" }],
+        },
+      ],
+    });
+    expect(codexAnswersFromPhone(two, ["No", "Yes"])).toEqual({ deploy: ["No"], notify: ["Yes"] });
+  });
+});
+
+// The gate that keeps a duplicate/empty-id request off the phone in the FIRST place: the relay only
+// builds a card when renderableCodexUserInput accepts the shape, so refusing here means the user is
+// never shown a question whose answer could not be attributed back.
+describe("renderableCodexUserInput id shape", () => {
+  const q = (over: Record<string, unknown> = {}) => ({
+    id: "scope", question: "How much?", isSecret: false,
+    options: [{ label: "Fast", description: "" }, { label: "Thorough", description: "" }],
+    ...over,
+  });
+
+  test("accepts distinct non-empty ids", () => {
+    expect(renderableCodexUserInput({ questions: [q(), q({ id: "other" })] })).toBeDefined();
+  });
+
+  test("refuses a duplicate id, an empty id, and a missing id", () => {
+    expect(renderableCodexUserInput({ questions: [q(), q()] })).toBeUndefined();
+    expect(renderableCodexUserInput({ questions: [q({ id: "" })] })).toBeUndefined();
+    expect(renderableCodexUserInput({ questions: [q({ id: undefined })] })).toBeUndefined();
+  });
 });
 
 describe("startCodexRemoteInput", () => {
+  test("mirrors a granted Codex question into the local hold marker and settles it on exit", async () => {
+    const answerBlob = await encryptBlob(key, {
+      requestId: "relay-hold",
+      decision: "answer",
+      answers: ["Fast"],
+    });
+    const lifecycle: string[] = [];
+    let marker: unknown;
+    let settled: Partial<SessionRecord> | undefined;
+    const handle = startCodexRemoteInput(request(), {
+      config,
+      fetchFn: (async (input) => {
+        const url = String(input);
+        if (url.endsWith("/v1/cc/decision")) return Response.json({ hold: true });
+        expect(lifecycle).toEqual(["write"]); // marker precedes the first poll that can deliver an answer
+        return Response.json({ status: "answered", answerBlob });
+      }) as typeof fetch,
+      readRecordFn: async () => record,
+      randomUUID: () => "relay-hold",
+      now: () => 1_234_567,
+      localApprovalsStateFn: async () => "on",
+      sleep: async () => {},
+      answerAppServer: async () => "sent",
+      interruptAppServer: async () => "sent",
+      holdPid: 7708,
+      writeHoldFn: async (_sessionId, hold) => {
+        lifecycle.push("write");
+        marker = hold;
+      },
+      clearHoldFn: async (sessionId, pid, beforeUnlink) => {
+        lifecycle.push(`clear:${sessionId}:${pid}`);
+        await beforeUnlink?.();
+        return true;
+      },
+      settleHoldRecordFn: async (_sessionId, patch) => {
+        lifecycle.push("settle");
+        settled = patch;
+      },
+    });
+
+    expect(await handle.completion).toBe("answered");
+    expect(marker).toMatchObject({ at: 1_234_567, pid: 7708 });
+    expect((await decryptBlob(key, (marker as { blob: string }).blob) as Record<string, unknown>).status)
+      .toBe("decisionPending");
+    expect(lifecycle).toEqual(["write", "clear:thread-1:7708", "settle"]);
+    expect(settled).toMatchObject({ op: "update", prio: 0, lastEvent: "working", attentionKind: undefined });
+    expect((await decryptBlob(key, settled!.blob as string) as Record<string, unknown>).status).toBe("working");
+  });
+
   test("posts an E2E question frame, polls the phone, and answers app-server", async () => {
     const answerBlob = await encryptBlob(key, {
       requestId: "relay-1",
@@ -152,6 +276,85 @@ describe("startCodexRemoteInput", () => {
     const fallback = await decryptBlob(key, posted.fallbackBlob as string) as Record<string, unknown>;
     expect(fallback.status).toBe("needsAttention");
     expect(fallback).not.toHaveProperty("permissionQuestions");
+  });
+
+  // Same route, same credentials, same tunnel — so the same adaptive ceiling as the permission hook.
+  // Without it the Codex channel reproduces the 2026-08-04 field failure on its own: a first contact
+  // that succeeds in 3306 ms followed by steady-state GETs bounded at 2 s, every one of them doomed.
+  test("the relay's poll ceiling is sized by its OWN round trips, first-contact floor first", async () => {
+    const answerBlob = await encryptBlob(key, {
+      requestId: "relay-slow", decision: "answer", answers: ["Fast"],
+    });
+    const budgets: number[] = [];
+    const estimator = createPollBudget();
+    const pollBudget = {
+      next: (seq: number) => { const ms = estimator.next(seq); budgets.push(ms); return ms; },
+      observe: (ms: number) => estimator.observe(ms),
+    };
+    let clock = 1_000;
+    let gets = 0;
+    const fetchFn = async (input: string | URL | Request): Promise<Response> => {
+      const url = String(input);
+      if (url.endsWith("/v1/cc/decision")) return Response.json({ hold: true });
+      gets += 1;
+      clock += 3_306;                                   // the field trace's real tunnel round trip
+      return Response.json(gets >= 3 ? { status: "answered", answerBlob } : { status: "pending" });
+    };
+    const handle = startCodexRemoteInput(request(), {
+      config,
+      fetchFn: fetchFn as typeof fetch,
+      readRecordFn: async () => record,
+      randomUUID: () => "relay-slow",
+      now: () => clock,
+      localApprovalsStateFn: async () => "on",
+      sleep: async () => {},
+      pollBudget,
+      answerAppServer: async () => "sent",
+      interruptAppServer: async () => "sent",
+    });
+
+    expect(await handle.completion).toBe("answered");
+    expect(budgets).toEqual([
+      POLL_FIRST_CONTACT_TIMEOUT_MS,                    // poll 1 — nothing measured yet
+      POLL_TIMEOUT_CEILING_MS,                          // 3 × 3306 ms, clamped
+      POLL_TIMEOUT_CEILING_MS,
+    ]);
+  });
+
+  test("a healthy relay keeps the snappy 2 s steady-state ceiling", async () => {
+    const answerBlob = await encryptBlob(key, {
+      requestId: "relay-fast", decision: "answer", answers: ["Fast"],
+    });
+    const budgets: number[] = [];
+    const estimator = createPollBudget();
+    const pollBudget = {
+      next: (seq: number) => { const ms = estimator.next(seq); budgets.push(ms); return ms; },
+      observe: (ms: number) => estimator.observe(ms),
+    };
+    let clock = 1_000;
+    let gets = 0;
+    const fetchFn = async (input: string | URL | Request): Promise<Response> => {
+      const url = String(input);
+      if (url.endsWith("/v1/cc/decision")) return Response.json({ hold: true });
+      gets += 1;
+      clock += 87;                                      // measured warm round trip to api.nomo.gg
+      return Response.json(gets >= 3 ? { status: "answered", answerBlob } : { status: "pending" });
+    };
+    const handle = startCodexRemoteInput(request(), {
+      config,
+      fetchFn: fetchFn as typeof fetch,
+      readRecordFn: async () => record,
+      randomUUID: () => "relay-fast",
+      now: () => clock,
+      localApprovalsStateFn: async () => "on",
+      sleep: async () => {},
+      pollBudget,
+      answerAppServer: async () => "sent",
+      interruptAppServer: async () => "sent",
+    });
+
+    expect(await handle.completion).toBe("answered");
+    expect(budgets).toEqual([POLL_FIRST_CONTACT_TIMEOUT_MS, POLL_TIMEOUT_MS, POLL_TIMEOUT_MS]);
   });
 
   test("description pressure sheds d and still relays a working bare-label picker", async () => {
@@ -355,6 +558,74 @@ describe("startCodexRemoteInput", () => {
     expect(polls).toBe(100); // MAX_CONSECUTIVE_MISSES
   });
 
+  // ---- NOM-45 · the honest transient state, the permission hook's twin -------------------------
+  test("a POST that never reaches the worker stamps the record RECONNECTING (no hold was ever created)", async () => {
+    let settled: Partial<SessionRecord> | undefined;
+    const handle = startCodexRemoteInput(request(), {
+      config,
+      fetchFn: (async (input) => {
+        // The resolve echo is best-effort and swallows its own failures; the decision POST is what stalls.
+        if (String(input).endsWith("/v1/cc/decision")) { const e = new Error("t"); e.name = "TimeoutError"; throw e; }
+        return Response.json({ ok: true });
+      }) as typeof fetch,
+      readRecordFn: async () => record,
+      randomUUID: () => "relay-stall",
+      now: () => 9_000,
+      localApprovalsStateFn: async () => "on",
+      sleep: async () => {},
+      answerAppServer: async () => "sent",
+      interruptAppServer: async () => "sent",
+      settleHoldRecordFn: async (_sessionId, patch) => { settled = patch; },
+    });
+
+    expect(await handle.completion).toBe("transport-error");     // Codex is unblocked at the Mac, as before
+    expect(settled).toMatchObject({ attentionStalledAt: 9_000 });
+    const blob = await decryptBlob(key, settled!.blob as string) as Record<string, unknown>;
+    expect(blob).toMatchObject({ status: "needsAttention", reconnecting: 9 });
+  });
+
+  test("a give-up after the miss ceiling settles RECONNECTING too — and an ANSWER never does", async () => {
+    const answerBlob = await encryptBlob(key, { requestId: "relay-x", decision: "answer", answers: ["Fast"] });
+    const run = async (id: string, garbageForever: boolean) => {
+      let settled: Partial<SessionRecord> | undefined;
+      const handle = startCodexRemoteInput(request(), {
+        config,
+        fetchFn: (async (input) => {
+          if (String(input).endsWith("/v1/cc/decision")) return Response.json({ hold: true });
+          return garbageForever
+            ? new Response("garbage", { status: 200 })
+            : Response.json({ status: "answered", answerBlob: await encryptBlob(key, {
+              requestId: id, decision: "answer", answers: ["Fast"],
+            }) });
+        }) as typeof fetch,
+        readRecordFn: async () => record,
+        randomUUID: () => id,
+        now: () => 9_000,
+        localApprovalsStateFn: async () => "on",
+        sleep: async () => {},
+        answerAppServer: async () => "sent",
+        interruptAppServer: async () => "sent",
+        writeHoldFn: async () => {},
+        clearHoldFn: async (_s, _p, beforeUnlink) => { await beforeUnlink?.(); return true; },
+        settleHoldRecordFn: async (_sessionId, patch) => { settled = patch; },
+      });
+      return { result: await handle.completion, settled };
+    };
+
+    const gaveUp = await run("relay-giveup", true);
+    expect(gaveUp.result).toBe("transport-error");
+    expect(gaveUp.settled).toMatchObject({ attentionStalledAt: 9_000 });
+    expect(await decryptBlob(key, gaveUp.settled!.blob as string)).toMatchObject({ reconnecting: 9 });
+
+    const answered = await run("relay-answered", false);
+    expect(answered.result).toBe("answered");
+    // CLEARED, not merely omitted: the watchdog rebuilds records by spreading `...record`.
+    expect("attentionStalledAt" in (answered.settled as object)).toBe(true);
+    expect(answered.settled!.attentionStalledAt).toBeUndefined();
+    expect(await decryptBlob(key, answered.settled!.blob as string)).not.toHaveProperty("reconnecting");
+    expect(answerBlob.length).toBeGreaterThan(0);
+  });
+
   test("a throwing dependency degrades instead of rejecting the completion promise", async () => {
     const errors: Error[] = [];
     let fetched = false;
@@ -540,5 +811,155 @@ describe("startCodexRemoteInput", () => {
     await resolving;
     expect(await handle.completion).toBe("resolved-elsewhere");
     expect(calls).toEqual([]);
+  });
+});
+
+// --- the LAN channel (NOM-44 phase 2) ----------------------------------------------------------
+//
+// This relay runs INSIDE the watchdog, which is also the process hosting the LAN listener — so a phone
+// answer delivered over the local network is already in this process's memory. It is applied straight
+// from the store instead of waiting up to 3 s for the next worker poll tick. The worker poll itself is
+// untouched: it keeps its cadence (it is the relay's liveness proof) and every guard it applies to an
+// answer — decrypt, requestId match, deny→interrupt, label re-mapping — is the SAME shared code.
+describe("startCodexRemoteInput — LAN-delivered answers", () => {
+  const NOW = 1_800_000_000_000;
+
+  /** A relay whose worker leg only ever creates the hold and then says "pending" forever, counting the
+   *  polls; the LAN store is the only channel that can finish it. */
+  function relay(store: LanAnswerStore, over: Partial<CodexRemoteInputDeps> = {}) {
+    const polls: number[] = [];
+    let sawPoll!: () => void;
+    const polled = new Promise<void>((resolve) => { sawPoll = resolve; });
+    const appAnswers: unknown[] = [];
+    let interrupted = 0;
+    const handle = startCodexRemoteInput(request(), {
+      config,
+      fetchFn: (async (input: string | URL | Request) => {
+        const url = String(input);
+        if (url.endsWith("/v1/cc/decision")) return Response.json({ hold: true });
+        polls.push(1);
+        sawPoll();
+        return Response.json({ status: "pending" });
+      }) as typeof fetch,
+      readRecordFn: async () => record,
+      randomUUID: () => "relay-lan",
+      localApprovalsStateFn: async () => "on",
+      now: () => NOW,
+      answerStore: store,
+      sleep: () => new Promise<void>(() => { /* the 3 s tick NEVER fires in these tests */ }),
+      answerAppServer: async (answers) => { appAnswers.push(answers); return "sent"; },
+      interruptAppServer: async () => { interrupted += 1; return "sent"; },
+      ...over,
+    });
+    return { handle, polls, polled, appAnswers, interrupted: () => interrupted };
+  }
+
+  test("an answer already in the store is applied without a single worker poll", async () => {
+    const store = createLanAnswerStore();
+    store.put("relay-lan", await encryptBlob(key, {
+      requestId: "relay-lan", decision: "answer", answers: ["Thorough"],
+    }), NOW);
+    const { handle, polls, appAnswers } = relay(store);
+    expect(await handle.completion).toBe("answered");
+    expect(appAnswers).toEqual([{ scope: ["Thorough"] }]);
+    expect(polls).toHaveLength(0); // the store is checked FIRST, before the loop ever hits the network
+  });
+
+  test("an answer that lands mid-hold wakes the relay instead of waiting for the next tick", async () => {
+    const store = createLanAnswerStore();
+    // The sleep in this relay never resolves, so ONLY the store's waiter can move the loop on.
+    const { handle, polls, polled, appAnswers } = relay(store);
+    await polled;
+    store.put("relay-lan", await encryptBlob(key, {
+      requestId: "relay-lan", decision: "answer", answers: ["Fast"],
+    }), NOW);
+    expect(await handle.completion).toBe("answered");
+    expect(appAnswers).toEqual([{ scope: ["Fast"] }]);
+    expect(polls).toHaveLength(1); // one poll happened; the answer did NOT wait for a second
+  });
+
+  test("a LAN deny maps to the same Codex interrupt the worker path uses", async () => {
+    const store = createLanAnswerStore();
+    store.put("relay-lan", await encryptBlob(key, { requestId: "relay-lan", decision: "deny" }), NOW);
+    const { handle, interrupted, appAnswers } = relay(store);
+    expect(await handle.completion).toBe("denied");
+    expect(interrupted()).toBe(1);
+    expect(appAnswers).toEqual([]);
+  });
+
+  test("the requestId-mismatch guard is preserved on the LAN path (never answers off a stale blob)", async () => {
+    const store = createLanAnswerStore();
+    store.put("relay-lan", await encryptBlob(key, {
+      requestId: "some-other-request", decision: "answer", answers: ["Thorough"],
+    }), NOW);
+    const { handle, appAnswers, interrupted } = relay(store);
+    expect(await handle.completion).toBe("unsupported");
+    expect(appAnswers).toEqual([]);
+    expect(interrupted()).toBe(0);
+  });
+
+  test("an unmappable LAN answer falls back to the Mac picker, exactly as a worker-delivered one does", async () => {
+    const store = createLanAnswerStore();
+    store.put("relay-lan", await encryptBlob(key, {
+      requestId: "relay-lan", decision: "answer", answers: ["Not An Option"],
+    }), NOW);
+    const { handle, appAnswers } = relay(store);
+    expect(await handle.completion).toBe("unsupported");
+    expect(appAnswers).toEqual([]);
+  });
+
+  /** A refused answer RELEASES the hold, which the phone can only read as the card flipping back to an
+   *  unanswerable row. That must never be silent — and it must never quote the question, the option or
+   *  the answer into a plaintext local trace. */
+  test("a refused answer is REPORTED, and the report carries no answer content", async () => {
+    const store = createLanAnswerStore();
+    store.put("relay-lan", await encryptBlob(key, {
+      requestId: "relay-lan", decision: "answer", answers: ["Not An Option"],
+    }), NOW);
+    const errors: string[] = [];
+    const { handle } = relay(store, { onError: (error) => { errors.push(error.message); } });
+    expect(await handle.completion).toBe("unsupported");
+    expect(errors).toEqual(["Codex phone answer rejected (unmappable to the app-server questions)"]);
+    expect(errors.join(" ")).not.toContain("Not An Option");
+  });
+
+  /** THE FIELD BUG (2026-08-05). The listener that stores a LAN answer ALSO echoes
+   *  POST /v1/cc/decision/resolve (cc-watchdog's acceptLanAnswer, the split-brain backstop), and that
+   *  route flips the worker record to `superseded`. So the phone's own answer routinely arrives while
+   *  this relay has a GET in flight, and that GET comes back TERMINAL for a request the store can
+   *  answer perfectly well. Honouring the worker there dropped the pick on the floor: the hold released,
+   *  the row fell back to the yellow attention frame, and Codex kept waiting forever. The store is the
+   *  authority on this machine — a terminal worker status may only be honoured when it holds nothing. */
+  for (const status of ["superseded", "expired"] as const) {
+    test(`a store answer that lands mid-poll beats the worker's "${status}"`, async () => {
+      const store = createLanAnswerStore();
+      const blob = await encryptBlob(key, {
+        requestId: "relay-lan", decision: "answer", answers: ["Fast"],
+      });
+      const { handle, appAnswers } = relay(store, {
+        fetchFn: (async (input: string | URL | Request) => {
+          const url = String(input);
+          if (url.endsWith("/v1/cc/decision")) return Response.json({ hold: true });
+          // The listener stores the answer FIRST and only then echoes `resolve` — so by the time the
+          // worker can report a terminal status, this process already holds the phone's answer.
+          store.put("relay-lan", blob, NOW);
+          return Response.json({ status });
+        }) as typeof fetch,
+      });
+      expect(await handle.completion).toBe("answered");
+      expect(appAnswers).toEqual([{ scope: ["Fast"] }]);
+    });
+  }
+
+  test("an EXPIRED store entry is ignored — the relay keeps polling the worker as if nothing arrived", async () => {
+    const store = createLanAnswerStore();
+    store.put("relay-lan", await encryptBlob(key, {
+      requestId: "relay-lan", decision: "answer", answers: ["Thorough"],
+    }), NOW - LAN_ANSWER_TTL_MS - 1);
+    const { handle, polled, appAnswers } = relay(store);
+    await polled;                      // it polled the worker rather than applying the stale answer
+    await handle.resolvedElsewhere();  // and unwinds normally
+    expect(await handle.completion).toBe("resolved-elsewhere");
+    expect(appAnswers).toEqual([]);
   });
 });

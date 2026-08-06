@@ -22,6 +22,14 @@ import {
 } from "./codex-remote-input";
 import { Config, PLUGIN_VERSION } from "./shared";
 
+// NO CROSS-PROCESS ARBITRATION LIVES HERE ANY MORE (removed 2026-08-04). This bridge used to publish a
+// per-thread readiness lease and consult a hook-written fallback fingerprint, so that a blocking
+// PreToolUse handler on `request_user_input` and this bridge could not both (or neither) create a hold.
+// That hook is gone for good — a PreToolUse hook can substitute a tool INPUT (`updatedInput`), never a
+// tool RESULT, and `RequestUserInputAnswer` is an app-server-only response type — so this bridge is now
+// the SOLE producer of a Codex question card and has nobody to arbitrate with. See the long note at the
+// top of core/permission before reintroducing either side.
+
 const LOADED_PAGE_SIZE = 100;
 const RECONNECT_DELAY_MS = 5_000;
 
@@ -74,6 +82,8 @@ export class CodexRemoteInputBridge {
   private readonly startRemoteInputFn: NonNullable<CodexRemoteInputBridgeOptions["startRemoteInputFn"]>;
   private readonly onError: CodexRemoteInputBridgeOptions["onError"];
   private readonly subscribedThreads = new Set<string>();
+  private readonly pendingRequests = new Set<string>();
+  private readonly resolvedWhilePending = new Set<string>();
   private readonly handles = new Map<string, CodexRemoteInputHandle>();
   /** In-flight `resolvedElsewhere()` retirements (each POST /cc/decision/resolve). Tracked so stop() can
    *  await them: the disconnect inside client.stop() routes every pending request through onResolved,
@@ -194,29 +204,45 @@ export class CodexRemoteInputBridge {
   private onRequest(request: CodexUserInputRequest): void {
     if (this.stopping) return;
     const key = requestKey(request);
-    if (this.handles.has(key)) return;
-    const handle = this.startRemoteInputFn(request, {
-      config: this.config,
-      answerAppServer: (answers) => this.client.answerUserInput(request.identity, answers),
-      interruptAppServer: () => this.client.interruptUserInput(request.identity),
-      onError: (error) => this.reportError(error),
-    });
-    this.handles.set(key, handle);
-    // This chain is detached, so it must be terminally handled: `.finally()` returns a NEW promise that
-    // rejects whenever the completion rejects, and voiding that is an unhandled rejection — fatal for
-    // the watchdog process under Node >= 15.
-    handle.completion.then(
-      () => undefined,
-      (error: unknown) => this.reportError(error, "Codex remote input failed"),
-    ).then(() => {
-      if (this.handles.get(key) === handle) this.handles.delete(key);
-    }).catch(() => undefined);
+    if (this.handles.has(key) || this.pendingRequests.has(key)) return;
+    this.pendingRequests.add(key);
+    void this.routeRequest(request, key);
+  }
+
+  private async routeRequest(request: CodexUserInputRequest, key: string): Promise<void> {
+    try {
+      if (this.stopping || this.handles.has(key) || this.resolvedWhilePending.delete(key)) return;
+      const handle = this.startRemoteInputFn(request, {
+        config: this.config,
+        answerAppServer: (answers) => this.client.answerUserInput(request.identity, answers),
+        interruptAppServer: () => this.client.interruptUserInput(request.identity),
+        onError: (error) => this.reportError(error),
+      });
+      this.handles.set(key, handle);
+      // This chain is detached, so it must be terminally handled: `.finally()` returns a NEW promise that
+      // rejects whenever the completion rejects, and voiding that is an unhandled rejection — fatal for
+      // the watchdog process under Node >= 15.
+      handle.completion.then(
+        () => undefined,
+        (error: unknown) => this.reportError(error, "Codex remote input failed"),
+      ).then(() => {
+        if (this.handles.get(key) === handle) this.handles.delete(key);
+      }).catch(() => undefined);
+    } catch (error) {
+      this.reportError(error, "Failed to arbitrate Codex remote input");
+    } finally {
+      this.pendingRequests.delete(key);
+      this.resolvedWhilePending.delete(key);
+    }
   }
 
   private onResolved(request: CodexUserInputRequest, resolution: CodexUserInputResolution): void {
     const key = requestKey(request);
     const handle = this.handles.get(key);
-    if (!handle) return;
+    if (!handle) {
+      if (this.pendingRequests.has(key)) this.resolvedWhilePending.add(key);
+      return;
+    }
     this.handles.delete(key);
     // A response/interrupt sent by this bridge is the acknowledgement for our own phone action. Every
     // other resolution means Desktop, another interrupt, or a disconnect won; retire the phone card.

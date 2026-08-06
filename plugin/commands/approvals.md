@@ -22,7 +22,7 @@ treat as `status`.
 Run this exact command with your chosen sub-command and relay its single output line to the user:
 
 ```
-"${CLAUDE_PLUGIN_ROOT}/scripts/run.sh" "${CLAUDE_PLUGIN_ROOT}/dist/cc-permission.mjs" <on|off|status>
+NOMOR="${CLAUDE_PLUGIN_ROOT}"; NOMOS="$HOME/.config/cc-status/hook-shim.sh"; [ -n "$NOMOR" ] && [ -x "$NOMOR/scripts/run.sh" ] && exec "$NOMOR/scripts/run.sh" "$NOMOR/dist/cc-permission.mjs" <on|off|status>; [ -x "$NOMOS" ] && exec "$NOMOS" cc-permission <on|off|status>; echo "Nomo could not find its installed files - reinstall the nomo plugin."; exit 1
 ```
 
 Notes to relay:

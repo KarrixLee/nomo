@@ -1,10 +1,17 @@
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "bun:test";
 import {
-  codexAppServerSocketAvailable, codexAppServerSocketPath, codexCompanionBrokerEvidence, ensureWatchdog, formatWatchdogPidfile, isWatchdogCommand,
-  localApprovalsState, parseWatchdogPidfile, PLUGIN_VERSION, watchdogHolderIsLive,
+  appendCodexBridgeMarker, clearDecisionHoldAt, CODEX_BRIDGE_DOWN_MARKER, CODEX_DAEMON_START_ARGS,
+  codexAppServerSocketAvailable, codexAppServerSocketPath, codexCompanionBrokerEvidence,
+  DBG_BLOB_TEXT_MAX_CHARS, startCodexAppServerDaemon,
+  decisionHoldFileName, ensureWatchdog, formatWatchdogPidfile, fullTextForRecord, isWatchdogCommand,
+  readDecisionHoldAt, writeDecisionHoldAt,
+  localApprovalsState, parseWatchdogPidfile, PLUGIN_VERSION, RECORD_FULL_TEXT_MAX_CHARS,
+  RECORD_FULL_TEXT_TRUNCATION_MARKER, recordFullTextIsComplete, settleDecisionHoldRecordAt,
+  stampPermissionDetailFullAt, watchdogBuildStamp,
+  watchdogHolderIsLive,
 } from "./shared";
 
 describe("codexCompanionBrokerEvidence (structural companion-session proof)", () => {
@@ -190,6 +197,60 @@ describe("ensureWatchdog (spawn gate: recycled pids and stale builds must not bl
   test("a garbage pidfile → spawn", () => {
     expect(run("nonsense")).toEqual({ kills: [], spawned: 1 });
   });
+
+  // THE FIELD BUG (2026-08-02): the version string is not the build. A bundle rebuilt in place under
+  // the SAME version — every iteration of a fix before its release bump — left the incumbent running
+  // the OLD code forever, because the stamp it was compared against had not changed. The daemon is
+  // long-lived (a 30-min idle grace), so "the fix is on disk" and "the fix is running" diverged
+  // silently: the .hold markers the new permission hook wrote were read by nobody.
+  test("a live watchdog on the same VERSION but a DIFFERENT bundle → takeover", () => {
+    expect(run("777 1.4.4 aaa", { build: "bbb" })).toEqual({ kills: [[777, "SIGTERM"]], spawned: 1 });
+  });
+
+  test("same version AND same bundle → still no spawn, no signal", () => {
+    expect(run("777 1.4.4 aaa", { build: "aaa" })).toEqual({ kills: [], spawned: 0 });
+  });
+
+  test("an UNKNOWN build stamp on either side compares on the version alone (never a restart loop)", () => {
+    // A pre-stamp incumbent, or a bundle we cannot stat: absence of evidence is not evidence of a
+    // different build, and guessing "different" would SIGTERM the daemon on every hook.
+    expect(run("777 1.4.4", { build: "bbb" })).toEqual({ kills: [], spawned: 0 });
+    expect(run("777 1.4.4 aaa", { build: undefined })).toEqual({ kills: [], spawned: 0 });
+    // …but a genuine version change still takes over, stamps or no stamps.
+    expect(run("777 1.4.3", { build: undefined })).toEqual({ kills: [[777, "SIGTERM"]], spawned: 1 });
+  });
+
+  test("the pidfile carries the build as a THIRD field, and stays parseInt-compatible", () => {
+    expect(formatWatchdogPidfile(777, "1.4.4", "abc")).toBe("777 1.4.4 abc");
+    expect(Number.parseInt(formatWatchdogPidfile(777, "1.4.4", "abc"), 10)).toBe(777);
+    expect(parseWatchdogPidfile("777 1.4.4 abc")).toEqual({ pid: 777, version: "1.4.4", build: "abc" });
+    expect(parseWatchdogPidfile("777 1.4.4")).toEqual({ pid: 777, version: "1.4.4" });
+    // No stamp available → the two-field form the previous build wrote, byte for byte.
+    expect(formatWatchdogPidfile(777, "1.4.4", undefined)).toBe("777 1.4.4");
+  });
+});
+
+describe("watchdogBuildStamp (the bundle's identity, not its version)", () => {
+  test("equal for two copies of the SAME bytes, different the moment the bytes change", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "nomo-build-"));
+    try {
+      const a = join(dir, "a.mjs");
+      const b = join(dir, "b.mjs");
+      await writeFile(a, "console.log(1)\n");
+      await writeFile(b, "console.log(1)\n");
+      // CONTENT, not mtime: the same bundle installed twice (a plugin cache copy and a dev checkout)
+      // must not look like two different builds, or every hook would fight over the daemon.
+      expect(watchdogBuildStamp(a)).toBe(watchdogBuildStamp(b));
+      await writeFile(b, "console.log(2)\n");
+      expect(watchdogBuildStamp(a)).not.toBe(watchdogBuildStamp(b));
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("an unreadable path is UNKNOWN (undefined), never a throw and never a fake stamp", () => {
+    expect(watchdogBuildStamp("/does/not/exist/cc-watchdog.mjs")).toBeUndefined();
+  });
 });
 
 // The ONE Codex-daemon presence probe: `status` reports it and the watchdog gates its remote-input
@@ -212,5 +273,333 @@ describe("codexAppServerSocketAvailable (the shared control-socket probe)", () =
 
   test("the default path lives under CODEX_HOME", () => {
     expect(codexAppServerSocketPath().endsWith("/app-server-control/app-server-control.sock")).toBe(true);
+  });
+});
+
+// Recovery for the OTHER half of the presence gate: when the socket is missing, try (once per watchdog
+// cooldown) to bring the daemon back. `codex app-server daemon start` is verified against codex-cli
+// 0.146.0's own help — "Start the local app server daemon if it is not already running" — and is NOT
+// `app-server proxy`, which only attaches to an existing socket and errors when there is none.
+describe("startCodexAppServerDaemon (bounded, non-interactive, never-throwing)", () => {
+  /** A scriptable stand-in for the spawned child. */
+  const child = (script: (emit: (event: "error" | "exit", ...args: unknown[]) => void) => void) => {
+    const listeners = new Map<string, (...args: unknown[]) => void>();
+    const kills: string[] = [];
+    const handle = {
+      on(event: string, listener: (...args: unknown[]) => void) { listeners.set(event, listener); return handle; },
+      kill(signal?: string) { kills.push(signal ?? "SIGTERM"); return true; },
+    };
+    queueMicrotask(() => script((event, ...args) => listeners.get(event)?.(...args)));
+    return { handle, kills };
+  };
+
+  test("runs the exact verified subcommand and reports success only when the SOCKET appears", async () => {
+    const spawned: Array<{ command: string; args: readonly string[] }> = [];
+    const traced: object[] = [];
+    let socket = false;
+    const ok = await startCodexAppServerDaemon({
+      spawnFn: (command, args) => {
+        spawned.push({ command, args });
+        return child((emit) => { socket = true; emit("exit", 0, null); }).handle;
+      },
+      probe: async () => socket,
+      sleep: async () => {},
+      trace: (event) => traced.push(event),
+    });
+    expect(ok).toBe(true);
+    expect(spawned).toEqual([{ command: "codex", args: CODEX_DAEMON_START_ARGS }]);
+    expect(CODEX_DAEMON_START_ARGS).toEqual(["app-server", "daemon", "start"]);
+    expect(traced[0]).toMatchObject({ event: "codex-daemon-start", outcome: "started" });
+  });
+
+  test("exit 0 with NO socket is a failure, traced, bounded — never an infinite wait", async () => {
+    const traced: object[] = [];
+    const ok = await startCodexAppServerDaemon({
+      spawnFn: () => child((emit) => emit("exit", 0, null)).handle,
+      probe: async () => false,
+      sleep: async () => {},
+      trace: (event) => traced.push(event),
+      socketWaitMs: 1_000,
+    });
+    expect(ok).toBe(false);
+    expect(traced).toEqual([{ event: "codex-daemon-start", outcome: "no-socket", waitedMs: 1_000 }]);
+  });
+
+  test("a missing binary (spawn throws / emits error) and a non-zero exit both resolve false, traced", async () => {
+    const traced: object[] = [];
+    expect(await startCodexAppServerDaemon({
+      spawnFn: () => { throw new Error("ENOENT"); },
+      probe: async () => true, trace: (event) => traced.push(event),
+    })).toBe(false);
+    expect(await startCodexAppServerDaemon({
+      spawnFn: () => child((emit) => emit("error", new Error("ENOENT"))).handle,
+      probe: async () => true, trace: (event) => traced.push(event),
+    })).toBe(false);
+    expect(await startCodexAppServerDaemon({
+      spawnFn: () => child((emit) => emit("exit", 1, null)).handle,
+      probe: async () => true, trace: (event) => traced.push(event),
+    })).toBe(false);
+    expect(traced.map((event) => (event as { outcome: string }).outcome))
+      .toEqual(["spawn-failed", "spawn-failed", "nonzero-exit"]);
+  });
+
+  test("a child that never exits is KILLED at the timeout instead of pinning the caller", async () => {
+    const traced: object[] = [];
+    const c = child(() => { /* never exits */ });
+    const ok = await startCodexAppServerDaemon({
+      spawnFn: () => c.handle, probe: async () => true, trace: (event) => traced.push(event), timeoutMs: 20,
+    });
+    expect(ok).toBe(false);
+    expect(c.kills).toEqual(["SIGTERM"]);
+    expect(traced).toEqual([{ event: "codex-daemon-start", outcome: "timeout" }]);
+  });
+});
+
+// The breadcrumb the phone shows under its diagnostics toggle while the socket is gone.
+describe("appendCodexBridgeMarker (append-last, at most once, dropped rather than truncated)", () => {
+  test("appends LAST while down, never doubles, and is STRIPPED once the socket is back", () => {
+    expect(appendCodexBridgeMarker("1.0 ev:attention", true)).toBe(`1.0 ev:attention ${CODEX_BRIDGE_DOWN_MARKER}`);
+    expect(appendCodexBridgeMarker("1.0 ev:attention", false)).toBe("1.0 ev:attention");
+    const once = appendCodexBridgeMarker("1.0 ev:attention", true);
+    expect(appendCodexBridgeMarker(once, true)).toBe(once);
+    // A `dbg` CACHED on the session record (title repair, provisional row) must not keep accusing a
+    // daemon that has since recovered.
+    expect(appendCodexBridgeMarker(once, false)).toBe("1.0 ev:attention");
+  });
+
+  test("a non-Codex frame (undefined dbg) stays undefined — nothing is ever added to Claude", () => {
+    expect(appendCodexBridgeMarker(undefined, true)).toBeUndefined();
+    expect(appendCodexBridgeMarker("", true)).toBe("");
+  });
+
+  test("a dbg that has no room for the marker keeps its own grammar intact (whole-marker drop)", () => {
+    const full = "x".repeat(DBG_BLOB_TEXT_MAX_CHARS);
+    expect(appendCodexBridgeMarker(full, true)).toBe(full);
+    const roomy = "x".repeat(DBG_BLOB_TEXT_MAX_CHARS - CODEX_BRIDGE_DOWN_MARKER.length - 1);
+    expect(appendCodexBridgeMarker(roomy, true)).toBe(`${roomy} ${CODEX_BRIDGE_DOWN_MARKER}`);
+  });
+});
+
+// --- unabridged copies for the LAN read op (NOM-44 phase 4) -------------------------------------
+
+describe("fullTextForRecord (what gets teed onto the session record)", () => {
+  test("stores NOTHING when the fit changed nothing — the phone reads the blob's own copy", () => {
+    expect(fullTextForRecord("# Plan", "# Plan")).toBeUndefined();
+    expect(fullTextForRecord("", "")).toBeUndefined();
+    expect(fullTextForRecord(undefined, undefined)).toBeUndefined();
+    expect(fullTextForRecord(undefined, "anything")).toBeUndefined();
+  });
+
+  test("stores the WHOLE string whenever the fit cut it — including when the field was dropped outright", () => {
+    const full = `${"a".repeat(5000)}END`;
+    expect(fullTextForRecord(full, `${"a".repeat(1200)}\n…`)).toBe(full); // truncated prefix
+    expect(fullTextForRecord(full, undefined)).toBe(full);                // dropped entirely
+    expect(fullTextForRecord(full, "")).toBe(full);                       // shed to empty
+  });
+
+  test("clips at the 256 K cap with the marker, and never mid-code-point", () => {
+    const over = "🙂".repeat(RECORD_FULL_TEXT_MAX_CHARS + 1_000); // astral: 2 UTF-16 units per code point
+    const stored = fullTextForRecord(over, "…")!;
+    const chars = Array.from(stored);
+    expect(chars.length).toBe(RECORD_FULL_TEXT_MAX_CHARS);
+    expect(stored.endsWith(RECORD_FULL_TEXT_TRUNCATION_MARKER)).toBe(true);
+    // No lone surrogate survived the slice: re-encoding is lossless.
+    expect(chars.slice(0, chars.length - Array.from(RECORD_FULL_TEXT_TRUNCATION_MARKER).length).join("")).not.toContain("�");
+    // Exactly AT the cap is not clipped.
+    const exact = "x".repeat(RECORD_FULL_TEXT_MAX_CHARS);
+    expect(fullTextForRecord(exact, "…")).toBe(exact);
+  });
+
+  test("recordFullTextIsComplete keys off the marker the cap appends", () => {
+    expect(recordFullTextIsComplete("the whole plan")).toBe(true);
+    expect(recordFullTextIsComplete(`clipped${RECORD_FULL_TEXT_TRUNCATION_MARKER}`)).toBe(false);
+  });
+});
+
+describe("stampPermissionDetailFullAt (the permission hook's record patch)", () => {
+  const record = (over: Record<string, unknown> = {}): string => JSON.stringify({
+    pid: 4242, machine: "mac", label: "proj", ts: 1_800_000_000_000, op: "update", prio: 1,
+    blob: "SEALED", pairingId: "pairing-abc", ...over,
+  });
+
+  async function dir(): Promise<string> {
+    return await mkdtemp(join(tmpdir(), "nomo-stamp-"));
+  }
+
+  test("patches ONE key onto an existing record, append-last, leaving every other key in place", async () => {
+    const d = await dir();
+    try {
+      await writeFile(join(d, "s1.json"), record());
+      await stampPermissionDetailFullAt(d, "s1", "the whole /bin/sh command");
+      const parsed = JSON.parse(await readFile(join(d, "s1.json"), "utf8")) as Record<string, unknown>;
+      expect(parsed.permissionDetailFull).toBe("the whole /bin/sh command");
+      expect(Object.keys(parsed).at(-1)).toBe("permissionDetailFull");
+      expect(parsed.blob).toBe("SEALED");
+      expect(parsed.pairingId).toBe("pairing-abc");
+    } finally {
+      await rm(d, { recursive: true, force: true });
+    }
+  });
+
+  test("undefined DROPS the key — a prompt that rode whole clears the previous prompt's copy", async () => {
+    const d = await dir();
+    try {
+      await writeFile(join(d, "s1.json"), record({ permissionDetailFull: "stale" }));
+      await stampPermissionDetailFullAt(d, "s1", undefined);
+      const parsed = JSON.parse(await readFile(join(d, "s1.json"), "utf8")) as Record<string, unknown>;
+      expect("permissionDetailFull" in parsed).toBe(false);
+    } finally {
+      await rm(d, { recursive: true, force: true });
+    }
+  });
+
+  test("no record (reaped session) is a silent no-op, never a created file or a throw", async () => {
+    const d = await dir();
+    try {
+      await stampPermissionDetailFullAt(d, "ghost", "content");
+      expect(await readFile(join(d, "ghost.json"), "utf8").catch(() => null)).toBeNull();
+    } finally {
+      await rm(d, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("the remote-approval hold marker (the LAN channel's decision-pending guard)", () => {
+  async function dir(): Promise<string> {
+    return await mkdtemp(join(tmpdir(), "nomo-hold-"));
+  }
+
+  test("round-trips, and lives beside the record WITHOUT ever looking like one", async () => {
+    const d = await dir();
+    try {
+      const hold = { blob: "sealed-decision-pending", at: 1_800_000_000_000, pid: 4242 };
+      await writeDecisionHoldAt(d, "s1", hold);
+      expect(await readDecisionHoldAt(d, "s1")).toEqual(hold);
+      // The whole reason this is not a SessionRecord field: `trackSessionAt` rebuilds the record whole
+      // on every hook event and would erase it. The whole reason it is not a `.json` file: every other
+      // readdir consumer of this directory filters on that extension, and a marker that read as a
+      // session would surface on the phone as a row of its own.
+      expect(decisionHoldFileName("s1")).toBe("s1.hold");
+      expect(decisionHoldFileName("s1").endsWith(".json")).toBe(false);
+      expect(await readdir(d)).toEqual(["s1.hold"]);
+    } finally {
+      await rm(d, { recursive: true, force: true });
+    }
+  });
+
+  test("clearing is COMPARE-AND-CLEAR: a parallel tool's later hold survives our exit", async () => {
+    const d = await dir();
+    try {
+      // Claude runs tools in PARALLEL. Tool A's hook holds, tool B's hook holds over it, then A exits.
+      await writeDecisionHoldAt(d, "s1", { blob: "card-b", at: 2, pid: 777 });
+      expect(await clearDecisionHoldAt(d, "s1", 4242)).toBe(false); // A's exit — not the owner
+      expect(await readDecisionHoldAt(d, "s1")).toMatchObject({ pid: 777 });
+      expect(await clearDecisionHoldAt(d, "s1", 777)).toBe(true);   // B's exit — the owner
+      expect(await readDecisionHoldAt(d, "s1")).toBeNull();
+    } finally {
+      await rm(d, { recursive: true, force: true });
+    }
+  });
+
+  test("an absent or corrupt marker is never a throw: no owner, so it is simply removed", async () => {
+    const d = await dir();
+    try {
+      expect(await clearDecisionHoldAt(d, "ghost", 1)).toBe(true); // nothing there → silent
+      expect(await readDecisionHoldAt(d, "ghost")).toBeNull();
+      await writeFile(join(d, "s1.hold"), "{not json");
+      expect(await readDecisionHoldAt(d, "s1")).toBeNull();
+      expect(await clearDecisionHoldAt(d, "s1", 1)).toBe(true);  // nobody can own it → gone
+      expect(await readFile(join(d, "s1.hold"), "utf8").catch(() => null)).toBeNull();
+    } finally {
+      await rm(d, { recursive: true, force: true });
+    }
+  });
+
+  // The hook's record settle rides in here (field reports R2/R3): it must run only for the OWNER, and
+  // strictly BEFORE the unlink — the LAN feed reads the record and the marker independently per pass, so
+  // "marker gone + record stale" is exactly the frozen-yellow frame the settle exists to prevent.
+  test("beforeUnlink runs for the owner, while the marker is still on disk — and never for anyone else", async () => {
+    const d = await dir();
+    try {
+      await writeDecisionHoldAt(d, "s1", { blob: "card-a", at: 2, pid: 777 });
+      let markerAtCallback: unknown;
+      let calls = 0;
+      // Not the owner → the callback never runs and the marker survives.
+      expect(await clearDecisionHoldAt(d, "s1", 4242, async () => { calls += 1; })).toBe(false);
+      expect(calls).toBe(0);
+      expect(await readDecisionHoldAt(d, "s1")).toMatchObject({ pid: 777 });
+      // The owner → the callback runs FIRST (the marker is still there when it does), then the unlink.
+      expect(await clearDecisionHoldAt(d, "s1", 777, async () => {
+        calls += 1;
+        markerAtCallback = await readDecisionHoldAt(d, "s1");
+      })).toBe(true);
+      expect(calls).toBe(1);
+      expect(markerAtCallback).toMatchObject({ pid: 777 });
+      expect(await readDecisionHoldAt(d, "s1")).toBeNull();
+    } finally {
+      await rm(d, { recursive: true, force: true });
+    }
+  });
+
+  test("a throwing settle still retires the marker (a wedged card is worse than a stale record)", async () => {
+    const d = await dir();
+    try {
+      await writeDecisionHoldAt(d, "s1", { blob: "card-a", at: 2, pid: 777 });
+      expect(await clearDecisionHoldAt(d, "s1", 777, async () => { throw new Error("disk full"); })).toBe(true);
+      expect(await readDecisionHoldAt(d, "s1")).toBeNull();
+    } finally {
+      await rm(d, { recursive: true, force: true });
+    }
+  });
+});
+
+// ---- the hold's RECORD settle (the exit the hook used to never write) --------------------------
+
+describe("settleDecisionHoldRecordAt", () => {
+  async function dir(): Promise<string> {
+    return await mkdtemp(join(tmpdir(), "nomo-settle-"));
+  }
+
+  const held = {
+    pid: 1, machine: "m", label: "l", ts: 1_000, op: "update", prio: 1,
+    lastEvent: "needsAttention", attentionKind: "userInput", blob: "stale-attention",
+  };
+
+  test("patches the record the hold overlaid, keys and all", async () => {
+    const d = await dir();
+    try {
+      await writeFile(join(d, "s1.json"), JSON.stringify(held));
+      await settleDecisionHoldRecordAt(d, "s1", {
+        ts: 2_000, lastEvent: "working", op: "update", prio: 0, sentDone: false,
+        attentionKind: undefined, blob: "sealed-working",
+      });
+      const after = JSON.parse(await readFile(join(d, "s1.json"), "utf8")) as Record<string, unknown>;
+      expect(after).toMatchObject({
+        pid: 1, machine: "m", ts: 2_000, op: "update", prio: 0, lastEvent: "working",
+        sentDone: false, blob: "sealed-working",
+      });
+      expect("attentionKind" in after).toBe(false);            // undefined DROPS the key, like donePending
+    } finally {
+      await rm(d, { recursive: true, force: true });
+    }
+  });
+
+  test("NO-OP unless the record is still the prio:1 update we overlaid", async () => {
+    const d = await dir();
+    try {
+      // A later hook already advanced it (a parallel tool's PostToolUse / a done / an end): that state is
+      // newer than anything this exiting hook knows, and must never be walked back.
+      for (const over of [{ prio: 0 }, { op: "done", prio: 0 }, { op: "end", prio: 0 }, { op: undefined }]) {
+        const moved = { ...held, ...over };
+        await writeFile(join(d, "s1.json"), JSON.stringify(moved));
+        await settleDecisionHoldRecordAt(d, "s1", { ts: 2_000, blob: "sealed-working" });
+        expect(JSON.parse(await readFile(join(d, "s1.json"), "utf8"))).toEqual(JSON.parse(JSON.stringify(moved)));
+      }
+      // …and a record that is gone entirely is simply nothing to patch.
+      await settleDecisionHoldRecordAt(d, "ghost", { ts: 2_000 });
+      expect(await readFile(join(d, "ghost.json"), "utf8").catch(() => null)).toBeNull();
+    } finally {
+      await rm(d, { recursive: true, force: true });
+    }
   });
 });

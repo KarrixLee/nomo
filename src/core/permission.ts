@@ -5,8 +5,11 @@
 // while the phone decides; otherwise it falls straight through to the normal terminal dialog.
 //
 // CONTRACT — this module DELIBERATELY breaks the plugin's "2s, never block" rule that every other
-// entry keeps (see hook.ts:12-14 and cc-watchdog.ts's header). Every poll fetch still has a 2s ceiling
-// and the one blocking POST has a 4s one (so a dead network costs ~6s BEFORE the dialog, never the ~33s
+// entry keeps (see hook.ts:12-14 and cc-watchdog.ts's header). Every STEADY-STATE poll fetch is still
+// BOUNDED — at 2s on a healthy network, and at whatever this process's own measured round trips say it
+// must be (≤8s) on a slow one; see createPollBudget. First contact gets a bigger one for the
+// proxy/tunnel handshake (POST 6s, first GET 4s —
+// so a dead network costs ~10s BEFORE the dialog, never the ~33s
 // the old 15s×2 ceiling cost — see POST_FIRST_CONTACT_TIMEOUT_MS), but the TOTAL wait ONCE A HOLD IS
 // GRANTED is unbounded: the hook polls until the phone answers, the request is
 // expired/superseded server-side, sustained downlink failure trips the give-up cap, or the process is
@@ -18,16 +21,51 @@
 // PORTABILITY: runs unmodified under bun AND node >= 18 — no `Bun.*` APIs. build.ts bundles this into
 // dist/cc-permission.mjs.
 
-import { realpath, unlink } from "node:fs/promises";
+import { readFile, realpath, unlink } from "node:fs/promises";
 import { appendFileSync, statSync, truncateSync } from "node:fs";
 import { hostname } from "node:os";
 import { basename, isAbsolute, relative, resolve } from "node:path";
 import { runHook, buildBlob, OpPlan } from "./hook";
 import {
-  AgentKind, atomicWrite, BLOB_FIT_CHARS, CC_DIR, codexHome, Config, flagExists, loadConfig, NO_HOLD_PATH,
+  AgentKind, appendFittedPlanAndDebug, atomicWrite, BLOB_FIT_CHARS, CC_DIR, clearDecisionHold, codexHome, Config,
+  DecisionHold, flagExists, formatDecisionHoldDebug,
+  fullTextForRecord, loadConfig, NO_HOLD_PATH,
   PLUGIN_VERSION, readPrefix, readRecord, readSuffix, sealedBlobChars, SessionRecord,
+  settleDecisionHoldRecord, stampPermissionDetailFull,
+  writeDecisionHold,
 } from "./shared";
-import { decryptBlob, encryptBlob } from "./crypto";
+import { b64url, decryptBlob, deriveLanKey, encryptBlob } from "./crypto";
+// The relay's timing/give-up rules, shared verbatim with the Codex relay (codex-remote-input.ts) that
+// polls the SAME route with the same credentials. See decision-poll.ts for what is deliberately NOT
+// shared — the first-contact POST ceiling, which each caller bounds by what IT blocks.
+import {
+  createPollBudget, DEFINITIVE_POLL_STATUSES, MAX_CONSECUTIVE_MISSES, MAX_DEFINITIVE_POLL_FAILURES,
+  POLL_INTERVAL_MS, POLL_JITTER_MAX_MS, POST_MAX_ATTEMPTS, POST_RETRY_PAUSE_MS,
+} from "./decision-poll";
+// The PURE wire contract only — deliberately NOT "./lan-listener": this hook is a short-lived process
+// spawned on every permission prompt and must not bundle (or load node:http for) an HTTP server it can
+// never start. See lan-wire.ts's header.
+import {
+  LAN_ENVELOPE_VERSION, LAN_PATH, LAN_STATE_PATH, lanRunningUnderTest, parseLanState,
+} from "./lan-wire";
+// WHY THERE IS NO request_user_input HOOK SURFACE HERE (removed 2026-08-04 — do not rebuild it).
+//
+// A Codex TUI question can be answered from the phone through EXACTLY ONE mechanism: the app-server
+// bridge (core/codex-remote-input → client.answerUserInput, which speaks the app-server-only
+// RequestUserInputAnswer response type). This file once carried a second, hook-shaped attempt — a
+// blocking PreToolUse handler on `request_user_input` plus a cross-process arbitration protocol
+// (core/codex-user-input-arbitration) to keep the two from creating zero or two holds. It cannot work,
+// for a reason no amount of engineering moves:
+//
+//   A PreToolUse hook can only rewrite a tool's INPUT (`updatedInput`) or allow/deny it. There is no
+//   `answers` field and no other channel by which it can substitute a tool RESULT. So the best a hook
+//   could ever do with the phone's answer is rewrite the QUESTIONS and then let Codex ask them at the
+//   Mac — which is not answering from the phone, it is re-asking locally. (It also hung the Codex CLI in
+//   the field, which is why the manifest entry was reverted in v1.6.9.)
+//
+// If a future Codex ships a hook that can return a tool result, that is a NEW contract and deserves a
+// new design — not a revival of this one. Until then, the honest failure mode is the daemon-presence
+// breadcrumb (`cxbridge:down`, see core/shared) plus the watchdog's bounded daemon-start recovery.
 
 /** Local escape-hatch flag: when this file exists, the hook skips the hold entirely and behaves as a
  *  plain fire-and-forget attention event (instant terminal dialog). Toggled by `cc-permission off|on`.
@@ -36,11 +74,6 @@ import { decryptBlob, encryptBlob } from "./crypto";
  *  existing importers are unaffected. */
 export { BLOB_FIT_CHARS, NO_HOLD_PATH, sealedBlobChars };
 
-/** How often to poll for the phone's answer while holding (ms). Small jitter is added per cycle. */
-const POLL_INTERVAL_MS = 3_000;
-/** Per-fetch ceiling for the poll GETs — the "2s" half of the contract survives; only the TOTAL wait
- *  is unbounded. */
-const FETCH_TIMEOUT_MS = 2_000;
 /** FIRST-CONTACT ceiling for the decision POST — the ONE fetch the terminal dialog waits behind before
  *  it is either held (phone card up) or released (normal dialog). It is deliberately LONGER than the
  *  poll's 2s (the worker's decision route can take a moment: cold isolate, KV reads, the gate checks)
@@ -53,24 +86,25 @@ const FETCH_TIMEOUT_MS = 2_000;
  *  under a second; a stall past a few seconds means the network is gone, and the only useful thing to do
  *  with that answer is fail open NOW.
  *
- *  WORST-CASE PRE-DIALOG BLOCK, stalled network: POST_FIRST_CONTACT_TIMEOUT_MS (4s) + FETCH_TIMEOUT_MS
- *  (2s did-it-land probe) ≈ 6s, because a TIMEOUT is never retried (see POST_MAX_ATTEMPTS). A network
- *  that fails FAST (connection refused, DNS NXDOMAIN) costs ~0 + POST_RETRY_PAUSE_MS + ~0 + 2s ≈ 3s.
- *  Both stay under the ~10s bar. The fresh-session re-ask (HOLD_RETRY_DELAY_MS + one more short POST)
- *  rides on top of that, but ONLY on the path where the worker already ANSWERED — i.e. it is reachable,
- *  so it is never the dead-network case. Once a hold IS granted the wait becomes unbounded ON PURPOSE
- *  (the phone owns the dialog) and every fetch from there on is a 2s poll GET. */
-const POST_FIRST_CONTACT_TIMEOUT_MS = 4_000;
-/** One retry of the initial POST — but ONLY when the first attempt failed FAST (connection refused,
- *  DNS, reset). A TIMEOUT is NOT retried: the network is stalled, a second stall buys no new information
- *  and doubles the freeze, and the did-it-land probe below already covers the "it actually landed" case.
- *  A non-ok HTTP status is never retried either — that is a real answer. The retry re-POSTs the SAME
- *  requestId + blobs (with a FRESH `ts`, see postDecision): the worker's supersede no-ops on an identical
- *  id and putDecision idempotently re-stores the pending record, so a re-POST after a first attempt that
- *  actually reached the worker is safe. */
-const POST_MAX_ATTEMPTS = 2;
-/** Pause before the single POST retry. */
-const POST_RETRY_PAUSE_MS = 1_000;
+ *  …AND WHY IT GREW BACK FROM 4s TO 6s (NOM-45, field report 2026-08-03). "A worker that is reachable
+ *  at all answers in well under a second" is true of a DIRECT connection. The user's Mac resolves
+ *  api.nomo.gg through a tunnel/proxy that hands back a fake IP (28.0.0.19): a healthy request through
+ *  it still completes in ~590 ms, but the FIRST connection of a short-lived hook process pays that
+ *  proxy's own DNS + connect + TLS setup, and when it stalls it stalls for SECONDS. At 4s the whole
+ *  first-contact leg — POST *and* the 2s did-it-land probe — timed out on a hold the phone was already
+ *  showing, so the Mac fell open while the phone kept a yellow hand nobody could answer. 6s buys the
+ *  handshake; the steady-state poll cadence is untouched, and its ceiling now sizes itself from the same
+ *  handshake this budget paid for (see POLL_TIMEOUT_MS / createPollBudget).
+ *
+ *  WORST-CASE PRE-DIALOG BLOCK, stalled network: POST_FIRST_CONTACT_TIMEOUT_MS (6s) +
+ *  POLL_FIRST_CONTACT_TIMEOUT_MS (4s did-it-land probe) = 10s, because a TIMEOUT is never retried (see
+ *  POST_MAX_ATTEMPTS). A network that fails FAST (connection refused, DNS NXDOMAIN) costs ~0 +
+ *  POST_RETRY_PAUSE_MS + ~0 + ~0 ≈ 1s. Both stay at or under the ~10s bar, and both remain a fraction of
+ *  the ~33s the old 15s×2 ceiling cost. The fresh-session re-ask (HOLD_RETRY_DELAY_MS + one more short
+ *  POST) rides on top of that, but ONLY on the path where the worker already ANSWERED — i.e. it is
+ *  reachable, so it is never the dead-network case. Once a hold IS granted the wait becomes unbounded ON
+ *  PURPOSE (the phone owns the dialog) and every fetch from there on is a 2s poll GET. */
+export const POST_FIRST_CONTACT_TIMEOUT_MS = 6_000;
 /** A fresh session's FIRST permission prompt can fire BEFORE the phone app's ~3s poll has added the
  *  session to the worker's island shown-list, so the very first decision POST correctly comes back
  *  {hold:false} (session not shown yet) and the prompt falls open — even though the session lands in
@@ -84,24 +118,6 @@ const HOLD_RETRY_DELAY_MS = 4_000;
  *  permission prompt fires. Older, established sessions that come back {hold:false} are genuinely not on
  *  the phone, so they must NOT pay the HOLD_RETRY_DELAY_MS tax on every prompt — they fall open at once. */
 const FRESH_SESSION_MS = 60_000;
-/** Give-up cap: this many consecutive polls without a 2xx (~5 min of sustained failure) → the worker
- *  is unreachable → exit silently (fail open, terminal dialog after Esc/retry). A successful poll —
- *  including a plain {status:"pending"} — resets the counter, so a healthy hold is unbounded. */
-const MAX_CONSECUTIVE_MISSES = 100;
-/** Poll statuses that are DEFINITIVE, not transient: the pairing is unauthorized/revoked/unknown, so
- *  every remaining poll of this request is guaranteed to fail the same way. Mirrors runHook's gone-strike
- *  set (404/410) plus the auth pair (401/403) — there, a gone response tears the pairing down; here it
- *  only means "stop waiting". Anything else (429, 5xx, a transport throw) stays transient and rides the
- *  MAX_CONSECUTIVE_MISSES cap.
- *
- *  EXPORTED as the transport-layer rule for polling `/v1/cc/decision/:id`, not as a permission-hook
- *  detail: codex-remote-input.ts polls the SAME relay route with the same pairing credentials and must
- *  give up on the same evidence (it already imports this module's wire helpers). Per-agent behavior lives
- *  in core/adapter.ts; this is transport. */
-export const DEFINITIVE_POLL_STATUSES = new Set([401, 403, 404, 410]);
-/** …and, like the gone strike, a SINGLE definitive response can be a racing delete/deploy, so require
- *  this many CONSECUTIVE ones before releasing. 2 ⇒ ~3 s to the terminal dialog instead of ~5.4 min. */
-export const MAX_DEFINITIVE_POLL_FAILURES = 2;
 /** How many times the SAME terminal `answered` record may be re-read with a decision verb we do not
  *  recognize before the hold is released. An answered record is TERMINAL server-side (a re-answer 409s
  *  and the same blob is served for the record's whole 24h TTL), so a verb we can never understand would
@@ -470,6 +486,29 @@ function defaultTrace(): (event: object) => void {
   return trace;
 }
 
+/** THE question predicate: is this tool ASKING THE HUMAN SOMETHING, rather than asking for permission?
+ *
+ *  The distinction is the whole reason the permission-mode gate below has an exemption. A permission
+ *  MODE ("auto", "bypassPermissions", "dontAsk", "acceptEdits") auto-approves permission PROMPTS — which
+ *  is exactly why holding those on the phone would be pointless. It can never auto-ANSWER a question:
+ *  the agent is asking WHICH option the human wants, and no mode can answer that on the human's behalf.
+ *
+ *  Verified in the shipped CC bundle (2.1.222): the permission evaluator returns
+ *  `{behavior:"ask", decisionReason:{reason:"requiresUserInteraction"}}` for a tool that declares
+ *  `requiresUserInteraction()` BEFORE the bypassPermissions/dontAsk early-allow and before any
+ *  allow-rule match — so AskUserQuestion reaches the PermissionRequest hook in EVERY mode, and the
+ *  hook's `decision.updatedInput` is consumed by the one shared `runHooks()` implementation regardless
+ *  of mode. That is why the answer path needs no mode-specific handling.
+ *
+ *  DELIBERATELY NARROWER than hook.ts's USER_BLOCKING_TOOLS (which also carries ExitPlanMode): a plan
+ *  approval IS a permission-shaped approval, and an auto mode approving it is the mode working as
+ *  designed. Only genuine questions are exempted. `request_user_input` is Codex's analogue; it is not
+ *  reachable through today's Codex PermissionRequest manifest, but the predicate names the CONCEPT, not
+ *  the reachable surface — the Codex reviewer/dialog gates below still apply to it. */
+export function isQuestionTool(toolName: string): boolean {
+  return toolName === "AskUserQuestion" || toolName === "request_user_input";
+}
+
 /** A concise, human-readable one-liner describing what the tool wants to do — shown on the phone's
  *  card next to Allow/Deny. Pure (unit-tested); never throws (a bad URL etc. falls back to the query
  *  or the tool name). */
@@ -516,6 +555,17 @@ export function buildPermissionSummary(toolName: string, toolInput: Record<strin
     case "AskUserQuestion": {
       const q = str(firstQuestionText(toolInput));
       return q ? truncate(q) : toolName;
+    }
+    // A standalone Codex TUI question deliberately does NOT send its options to the phone: without an
+    // attached app-server there is no transport on which to inject a selected option. The prompt itself
+    // is still useful and honest as the card summary beside Deny / Open on Mac.
+    case "request_user_input": {
+      const questions = Array.isArray(toolInput.questions) ? toolInput.questions : [];
+      const q = questions.find((raw) => {
+        const question = (raw as { question?: unknown } | null)?.question;
+        return typeof question === "string" && question.length > 0;
+      }) as { question?: unknown } | undefined;
+      return typeof q?.question === "string" ? truncate(q.question) : toolName;
     }
     default: {
       if (/^mcp__/.test(toolName)) {
@@ -803,6 +853,257 @@ function emitDecision(
   }
 }
 
+// ---- LAN loopback answer poll (NOM-44 phase 2) ----------------------------------------------
+//
+// The watchdog's LAN listener can be handed the phone's answer DIRECTLY over the local network
+// (op:"answer"), which is ~100 ms instead of the ~5-12 s a worker round trip costs. But this hook is a
+// SEPARATE, short-lived process with no IPC to that daemon, so it reads the store the only way it can:
+// a loopback HTTP poll of the listener's `answer-poll` op, every ~300 ms.
+//
+// THE NON-NEGOTIABLE: the 3 s worker poll is the Mac's LIVENESS PROOF (30 s of silence and the worker
+// expires the hold), so it is not slowed, skipped, or reordered by any of this. The loopback poller runs
+// as its OWN detached ticker and the hold loop merely RACES its unchanged `sleep(interval + jitter())`
+// against "an answer arrived" — the sleep still resolves at exactly the same moment it always did.
+// Everything else follows from "LAN is additive": a loopback failure is silent (one trace line per hold,
+// never per attempt), never counts toward MAX_CONSECUTIVE_MISSES or DEFINITIVE_POLL_STATUSES or a gone
+// strike (those are worker-authority signals), and with no lan.json there is no ticker at all.
+
+/** Loopback poll cadence. ~10 ticks inside one worker poll interval. */
+const LOOPBACK_POLL_INTERVAL_MS = 300;
+/** Per-attempt ceiling. The peer is a socket on this same machine: anything slower than this is a dead
+ *  or wedged listener, and waiting longer only delays the next tick. */
+const LOOPBACK_FETCH_TIMEOUT_MS = 250;
+/** Consecutive loopback failures before this hold stops trying. The watchdog can die mid-hold (that is
+ *  the whole robustness case) and the worker poll is still running, so there is nothing to recover. */
+const LOOPBACK_MAX_CONSECUTIVE_ERRORS = 5;
+
+export interface LoopbackAnswerPollerDeps {
+  fetchFn: typeof fetch;
+  now: () => number;
+  trace: (event: object) => void;
+  /** lan.json (the listener's port). `undefined` disables the poller outright — zero timers, zero HTTP,
+   *  byte-identical behavior to the pre-phase-2 hook. */
+  statePath?: string;
+  /** The ticker's OWN pacing clock — a real unref'd timer by default and deliberately NOT the hook's
+   *  injected `sleep`: the hold tests inject an INSTANT sleep for the worker cadence, and sharing it here
+   *  would turn this ticker into a hot loop. */
+  sleep?: (ms: number) => Promise<void>;
+  intervalMs?: number;
+  /** How often the ABSENCE of lan.json is re-checked. Defaults to the worker poll interval, so a watchdog
+   *  that comes up mid-hold is picked up within one worker cycle — and never re-stat'ed per 300 ms tick. */
+  discoverIntervalMs?: number;
+}
+
+export interface LoopbackAnswerPoller {
+  /** Race the caller's OWN, untouched poll sleep against a LAN-delivered answer. Resolves with the
+   *  sealed answerBlob when one arrived first, or undefined when the sleep simply finished. */
+  wait(sleeping: Promise<void>): Promise<string | undefined>;
+  /** ONE last look at the local answer store before the hold fails open on a TERMINAL worker status.
+   *  Resolves with a sealed answerBlob if the phone's answer is already here, else undefined. */
+  settle(): Promise<string | undefined>;
+  /** Stop the ticker (always call from a `finally` — a hold can return from a dozen places). */
+  stop(): void;
+}
+
+/** The loopback poller for ONE hold. Derives K_lan itself (the hook has config.e2eKey + pairingId) and
+ *  seals every request with a fresh nonce and the current ts, exactly like the phone does. */
+export function createLoopbackAnswerPoller(
+  config: Config,
+  requestId: string,
+  deps: LoopbackAnswerPollerDeps,
+): LoopbackAnswerPoller {
+  const interval = deps.intervalMs ?? LOOPBACK_POLL_INTERVAL_MS;
+  const discoverInterval = deps.discoverIntervalMs ?? POLL_INTERVAL_MS;
+  const tick = deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => {
+    const timer = setTimeout(resolve, ms);
+    (timer as unknown as { unref?: () => void }).unref?.();
+  }));
+
+  let live = deps.statePath !== undefined;
+  let started = false;
+  let port: number | undefined;
+  let lastDiscoverAt = 0;
+  let errors = 0;
+  let traced = false;
+  let pending: string | undefined;
+  /** The one-shot wake. It is never re-armed, because the ticker delivers at most ONE answer per hold
+   *  (see the ticker): after that the poller is retired and only the worker poll remains. */
+  let wakeResolve: () => void = () => { /* replaced immediately below */ };
+  let wake: Promise<void> = new Promise<void>((resolve) => { wakeResolve = resolve; });
+  let keyPromise: Promise<Uint8Array> | undefined;
+
+  /** ONE trace line per hold, never per attempt — a dead listener must not spam permission-trace.log. */
+  const note = (result: string): void => {
+    if (traced) return;
+    traced = true;
+    try { deps.trace({ event: "lan-poll", result }); } catch { /* diagnostics only */ }
+  };
+
+  const key = (): Promise<Uint8Array> => (keyPromise ??= deriveLanKey(config.e2eKey, config.pairingId));
+
+  const readPort = async (): Promise<number | undefined> => {
+    if (deps.statePath === undefined) return undefined;
+    try {
+      return parseLanState(await readFile(deps.statePath, "utf8"))?.port;
+    } catch {
+      return undefined; // no watchdog / no listener → nothing to poll, silently
+    }
+  };
+
+  /** ONE loopback poll. Never throws; every failure just increments the strike counter. */
+  const attempt = async (): Promise<string | undefined> => {
+    try {
+      const k = await key();
+      const nonce = b64url(crypto.getRandomValues(new Uint8Array(16)));
+      const body = JSON.stringify({
+        p: await encryptBlob(k, {
+          v: LAN_ENVELOPE_VERSION, op: "answer-poll", ts: deps.now(), nonce, payload: { requestId },
+        }),
+      });
+      const res = await deps.fetchFn(`http://127.0.0.1:${port}${LAN_PATH}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body,
+        signal: AbortSignal.timeout(LOOPBACK_FETCH_TIMEOUT_MS),
+      });
+      if (!res.ok) { errors += 1; return undefined; }
+      const outer = (await res.json()) as { p?: unknown };
+      if (typeof outer?.p !== "string") { errors += 1; return undefined; }
+      const opened = (await decryptBlob(k, outer.p)) as {
+        reqNonce?: unknown; payload?: { status?: unknown; answerBlob?: unknown };
+      };
+      // The sealed response echoes OUR nonce; anything else is a replayed response and is not an answer.
+      if (opened.reqNonce !== nonce) { errors += 1; return undefined; }
+      errors = 0; // a well-formed sealed answer-poll reply, pending or not, is a healthy listener
+      const payload = opened.payload;
+      if (payload?.status === "answered" && typeof payload.answerBlob === "string" && payload.answerBlob.length > 0) {
+        return payload.answerBlob;
+      }
+      return undefined;
+    } catch {
+      errors += 1;
+      return undefined; // timeout, refused socket, undecryptable reply — all silent, all the same
+    }
+  };
+
+  /** The detached ticker. It is the ONLY thing that touches the network here, and nothing in the hold
+   *  loop ever awaits it — that is what keeps the worker cadence provably untouched. */
+  const ticker = async (): Promise<void> => {
+    while (live) {
+      await tick(interval);
+      if (!live) return;
+      if (port === undefined) {
+        const t = deps.now();
+        if (lastDiscoverAt !== 0 && t - lastDiscoverAt < discoverInterval) continue;
+        lastDiscoverAt = t;
+        port = await readPort();
+        if (port === undefined) continue; // no listener yet: no HTTP at all, re-check next worker cycle
+      }
+      const blob = await attempt();
+      if (!live) return;
+      if (blob !== undefined) {
+        // ONE delivery per hold. The consumer either ends the hold with it or (an unrecognized verb) keeps
+        // waiting on the WORKER — re-serving the same stored blob every 300 ms would spin the hold loop.
+        pending = blob;
+        wakeResolve();
+        return;
+      }
+      if (errors >= LOOPBACK_MAX_CONSECUTIVE_ERRORS) {
+        note("give-up"); // the worker poll is still running; this hold simply stops trying locally
+        live = false;
+        return;
+      }
+    }
+  };
+
+  return {
+    async wait(sleeping: Promise<void>): Promise<string | undefined> {
+      if (!live) { await sleeping; return undefined; }
+      if (!started) {
+        started = true;
+        void ticker().catch(() => { live = false; note("error"); });
+      }
+      await Promise.race([sleeping, wake]);
+      if (pending === undefined) return undefined; // the worker sleep finished first — cadence unchanged
+      const blob = pending;
+      pending = undefined;
+      live = false;
+      return blob;
+    },
+    async settle(): Promise<string | undefined> {
+      // THE LAST WORD BEFORE A TERMINAL WORKER STATUS (NOM-47 / field report R3). A worker
+      // `superseded` is not independent evidence that the user did not answer — it is the ROUTINE
+      // consequence of them answering over LAN: the listener stores the blob synchronously and the
+      // watchdog's answer sink then echoes /v1/cc/decision/resolve, which retires the worker's pending
+      // record. So before the hold fails open on that status, ask the local store once more.
+      //
+      // Two cases, both covered: the ticker had ALREADY read the answer into `pending` (it is simply
+      // handed over — the field case, where the tick beat the worker response by 260 ms), or the answer
+      // landed after the last tick, which the single extra `attempt()` below picks up. Best-effort by
+      // construction: no listener, no port, or a failed read all return undefined and the caller fails
+      // open exactly as before. This runs at most ONCE per hold, off the poll cadence entirely.
+      if (pending !== undefined) {
+        const blob = pending;
+        pending = undefined;
+        live = false;
+        return blob;
+      }
+      if (!live) return undefined;
+      live = false; // one shot, whatever it returns — the hold is ending either way
+      if (port === undefined) port = await readPort();
+      if (port === undefined) return undefined;
+      return await attempt();
+    },
+    stop(): void {
+      live = false;
+      wakeResolve();
+    },
+  };
+}
+
+/** lan.json in production; nothing under `bun test`, where the developer's REAL listener would otherwise
+ *  be polled by unit tests (same guard, same reason, as lan-listener's traceLan). Tests that exercise the
+ *  loopback path inject `lanStatePath` explicitly. */
+function defaultLanStatePath(): string | undefined {
+  return lanRunningUnderTest() ? undefined : LAN_STATE_PATH;
+}
+
+/** The session-record tee for the unabridged permission detail (NOM-44 phase 4). The real writer in
+ *  production; a NO-OP under `bun test`, where a unit test sees the developer's REAL home directory and
+ *  must never patch their live session records — the same guard, and the same reason, as
+ *  defaultLanStatePath above. Tests that exercise the tee inject `stampDetailFullFn`. */
+function defaultStampDetailFull(): (sessionId: string, detailFull: string | undefined) => Promise<void> {
+  return lanRunningUnderTest() ? async () => { /* never touch real records from a test */ } : stampPermissionDetailFull;
+}
+
+/** The hold-marker writer/clearer, under the SAME test guard and for the same reason as
+ *  defaultStampDetailFull: a unit test must never stamp (or, worse, clear) a marker in the developer's
+ *  live session store. Tests that exercise the hold inject `writeHoldFn` / `clearHoldFn`. */
+function defaultWriteHold(): (sessionId: string, hold: DecisionHold) => Promise<void> {
+  return lanRunningUnderTest() ? async () => { /* never touch real records from a test */ } : writeDecisionHold;
+}
+
+function defaultClearHold(): (
+  sessionId: string, pid: number, beforeUnlink?: () => Promise<void>,
+) => Promise<boolean> {
+  return lanRunningUnderTest()
+    // The test stand-in still RUNS the settle callback (which is itself a no-op under `bun test`, see
+    // defaultSettleHoldRecord) so the production ordering is exercised rather than silently skipped.
+    ? async (_sessionId: string, _pid: number, beforeUnlink?: () => Promise<void>) => {
+      await beforeUnlink?.();
+      return true;
+    }
+    : clearDecisionHold;
+}
+
+/** The record settle this process owes the LAN feed on its way out of a hold (see
+ *  settleDecisionHoldRecordAt). Same test guard, same reason, as defaultWriteHold above: a unit test sees
+ *  the developer's REAL home directory and must never rewrite their live session records. Tests that
+ *  exercise the settle inject `settleHoldRecordFn`. */
+function defaultSettleHoldRecord(): (sessionId: string, patch: Partial<SessionRecord>) => Promise<void> {
+  return lanRunningUnderTest() ? async () => { /* never touch real records from a test */ } : settleDecisionHoldRecord;
+}
+
 /** Injectable seams so permission.test.ts drives the state machine with a scripted fetch, an instant
  *  sleep, a deterministic requestId, and a temp flag path — no real stdin/network/timers. Production
  *  uses every default. */
@@ -812,6 +1113,27 @@ export interface PermissionHookDeps {
   readInput?: () => Promise<string>;
   loadConfigFn?: () => Promise<Config | null>;
   readRecordFn?: (sessionId: string) => Promise<SessionRecord | null>;
+  /** Persists the UNABRIDGED permission detail on the session record for the LAN `read` op (NOM-44
+   *  phase 4). Defaults to the real record patcher in production and to a NO-OP under `bun test` — see
+   *  defaultStampDetailFull. Called at most once per prompt, and only when the value would change. */
+  stampDetailFullFn?: (sessionId: string, detailFull: string | undefined) => Promise<void>;
+  /** Stamps / retires the on-disk hold marker the LAN frames feed serves the Allow/Deny card from (see
+   *  shared.ts's DecisionHold header). Defaults to the real writers in production and to NO-OPs under
+   *  `bun test` — see defaultWriteHold. Called exactly once each per granted hold. */
+  writeHoldFn?: (sessionId: string, hold: DecisionHold) => Promise<void>;
+  /** Retires the marker, and answers whether this process actually OWNED it. `beforeUnlink` — the record
+   *  settle below — runs only when it did, and always BEFORE the unlink (see clearDecisionHoldAt). */
+  clearHoldFn?: (
+    sessionId: string, pid: number, beforeUnlink?: () => Promise<void>,
+  ) => Promise<boolean>;
+  /** Moves the SESSION RECORD out of the state the hold overlaid, on the way out (field reports R2/R3 —
+   *  see settleDecisionHoldRecordAt). Defaults to the real record patcher in production and to a NO-OP
+   *  under `bun test` — see defaultSettleHoldRecord. Called at most once per granted hold, and only when
+   *  the compare-and-clear accepts. */
+  settleHoldRecordFn?: (sessionId: string, patch: Partial<SessionRecord>) => Promise<void>;
+  /** The pid stamped as the hold's OWNER (defaults to this process). Injected so a test can drive the
+   *  compare-and-clear rule without spawning processes. */
+  holdPid?: number;
   /** Resolve Codex's effective per-turn approval policy from its rollout. Tests inject this so no
    *  local Codex state is touched; Claude never calls it. */
   loadCodexTurnPolicyFn?: (
@@ -832,6 +1154,15 @@ export interface PermissionHookDeps {
    *  TRACE_PATH plus the signal/exit capture handlers; tests pass a collector or a noop so they touch
    *  neither the real filesystem nor global process handlers. */
   trace?: (event: object) => void;
+  /** lan.json for the LAN loopback answer poll (NOM-44 phase 2). Defaults to the real path in
+   *  production and to NOTHING under `bun test` — see defaultLanStatePath. */
+  lanStatePath?: string;
+  /** Transport for the loopback poll only. Defaults to `fetchFn`, so a test that scripts the worker also
+   *  sees the loopback attempts; a test driving a REAL listener passes the real fetch here. */
+  lanFetchFn?: typeof fetch;
+  /** The loopback ticker's own pacing clock + cadence (never the hook's `sleep` — see the poller). */
+  lanSleep?: (ms: number) => Promise<void>;
+  lanIntervalMs?: number;
 }
 
 async function readStdin(): Promise<string> {
@@ -848,9 +1179,25 @@ async function readStdin(): Promise<string> {
  *  selects the decision-line envelope (Codex wraps in `continue:true`). Everything else — the POST/poll
  *  state machine, the gates, fail-open — is agent-agnostic. cc-permission calls it with the default;
  *  codex-permission calls it with "codex". */
-export async function runPermissionHook(deps: PermissionHookDeps = {}, agent: AgentKind = "claude"): Promise<void> {
+export async function runPermissionHook(
+  deps: PermissionHookDeps = {}, agent: AgentKind = "claude",
+): Promise<void> {
   const noHoldPath = deps.noHoldPath ?? NO_HOLD_PATH;
   const trace = deps.trace ?? defaultTrace();
+  /** The hold's LAN loopback poller, once a hold is granted. Function-scoped ONLY so the `finally` below
+   *  can stop its detached ticker no matter which of the loop's many exits fired. */
+  let loopback: LoopbackAnswerPoller | undefined;
+  /** The session whose on-disk hold marker THIS process owns, once one is stamped — function-scoped for
+   *  the same reason as `loopback`: the `finally` clears it from every exit of the poll loop. */
+  let heldSessionId: string | undefined;
+  /** Is the session actually working after the emitted decision? An ordinary emitted allow/deny is done;
+   *  a `released` exit left the user waiting at the Mac and must remain needsAttention. Set in
+   *  applyAnswerBlob, read by `settleHeldRecord` at exit time. */
+  let settleAsWorking = false;
+  /** The record settle this process owes the LAN feed, built the moment a hold is granted so it closes
+   *  over the config/blobs the `try` scope owns. Read `settleAsWorking` at CALL time — it describes the
+   *  exit that actually happened, not the one we expected when we built it. */
+  let settleHeldRecord: (() => Promise<void>) | undefined;
   try {
     // Escape hatch FIRST (a file stat — no stdin consumed yet): if the user paused remote approvals
     // locally, behave exactly as the old fire-and-forget attention event (instant terminal dialog).
@@ -907,14 +1254,26 @@ export async function runPermissionHook(deps: PermissionHookDeps = {}, agent: Ag
     const interactiveMode = permissionMode === undefined
       || permissionMode === "default"
       || (agent === "claude" && (permissionMode === "acceptEdits" || permissionMode === "plan"));
-    if (!interactiveMode) {
-      // Signal-only (no behavior change): if a future Codex starts reporting claude-style dialog modes,
-      // the `agent === "claude"` narrowing above would silently stop holding for them. Tag that exit so
-      // the trace names the cause instead of reading like an ordinary non-interactive mode.
-      const codexDialogMode = agent === "codex" && (permissionMode === "acceptEdits" || permissionMode === "plan");
+    // Signal-only (no behavior change): if a future Codex starts reporting claude-style dialog modes,
+    // the `agent === "claude"` narrowing above would silently stop holding for them. Tag that exit so
+    // the trace names the cause instead of reading like an ordinary non-interactive mode. It ALSO
+    // suppresses the question exemption below — a mode this hook cannot reason about must keep skipping.
+    const codexDialogMode = agent === "codex" && (permissionMode === "acceptEdits" || permissionMode === "plan");
+    //    …EXCEPT FOR A GENUINE QUESTION (field bug, traced live 2026-08-04: an AskUserQuestion in "auto"
+    //    exited here, so a real question degraded to a plain yellow needsAttention row nobody could
+    //    answer). Everything the paragraph above says is about PERMISSION prompts, which these modes
+    //    auto-approve. A question is the one thing they cannot auto-answer: CC's evaluator forces
+    //    `behavior:"ask"` for a `requiresUserInteraction()` tool ahead of every mode short-circuit, so
+    //    the TUI blocks on a human in auto/bypassPermissions/dontAsk exactly as it does in default —
+    //    which makes a question exactly the case that SHOULD hold in every mode. See isQuestionTool.
+    const questionExempt = !interactiveMode && !codexDialogMode && isQuestionTool(toolName);
+    if (!interactiveMode && !questionExempt) {
       trace({ event: "exit", reason: "mode", mode: permissionMode, ...(codexDialogMode ? { codex_dialog_mode: true } : {}) });
       return;
     }
+    // Its own event, never an "exit": one grep separates "skipped because of the mode" (exit/mode) from
+    // "the mode gate was bypassed because this is a question" (mode-gate-bypass) in the next field trace.
+    if (questionExempt) trace({ event: "mode-gate-bypass", reason: "question", mode: permissionMode, tool_name: toolName });
     // 3. Codex reviewer gate: `permission_mode:"default"` is lossy — it covers BOTH manual review and
     //    "Approve for me". The exact turn_context records the effective reviewer after task/profile/UI
     //    overrides. In auto-review, silently return control to Codex BEFORE any Nomo POST so Codex's
@@ -985,10 +1344,23 @@ export async function runPermissionHook(deps: PermissionHookDeps = {}, agent: Ag
       ...base, status: "decisionPending", permissionSummary: summary, permissionRequestId: requestId,
       permissionToolName: toolName,
     };
+    const rawDetail = buildPermissionDetail(toolName, toolInput);
     const fitted = fitPermissionDetail(
-      permissionBase, buildPermissionDetail(toolName, toolInput), BLOB_FIT_CHARS,
-      buildPermissionQuestions(toolInput),
+      permissionBase, rawDetail, BLOB_FIT_CHARS, buildPermissionQuestions(toolInput),
     );
+    // NOM-44 phase 4: the fit above is the WORKER's ceiling and stays exactly as it is, but a phone on
+    // this network can pull from the Mac directly, where there is none — so tee the UNABRIDGED detail
+    // (the whole ExitPlanMode plan, the whole multi-line Bash command) onto the 0600 session record for
+    // the LAN listener's `read` op. `fullTextForRecord` returns undefined when nothing was cut, and
+    // writing undefined DROPS the key — which is how a prompt that rode whole clears the copy an earlier
+    // prompt in this session left behind. Skipped entirely when the record already holds the right value
+    // (the overwhelmingly common case: no truncation, no stale copy), so an ordinary prompt pays no IO.
+    // Awaited, not fired-and-forgotten: it is one small local write, and the phone must never be able to
+    // see the card (POSTed just below) before the content it may ask for is on disk.
+    const detailFull = fullTextForRecord(rawDetail, fitted.detail);
+    if (record && record.permissionDetailFull !== detailFull) {
+      await (deps.stampDetailFullFn ?? defaultStampDetailFull())(sessionId, detailFull);
+    }
     const blob = await encryptBlob(config.e2eKey, permissionFrame(permissionBase, fitted.detail, fitted.omitted, fitted.questions));
     const fallbackBlob = await encryptBlob(config.e2eKey, base);
 
@@ -1022,7 +1394,9 @@ export async function runPermissionHook(deps: PermissionHookDeps = {}, agent: Ag
           const res = await fetchFn(`${config.url}/v1/cc/decision`, {
             method: "POST",
             headers: { "content-type": "application/json", ...pcHeaders },
-            body: JSON.stringify({ v: 2, sessionId, requestId, op: "update", prio: 1, ts, blob, fallbackBlob }),
+            body: JSON.stringify({
+              v: 2, sessionId, requestId, op: "update", prio: 1, ts, blob, fallbackBlob,
+            }),
             signal: AbortSignal.timeout(POST_FIRST_CONTACT_TIMEOUT_MS),
           });
           if (res.ok) {
@@ -1053,25 +1427,49 @@ export async function runPermissionHook(deps: PermissionHookDeps = {}, agent: Ag
       return { posted, hold, reason };
     };
 
+    // The wall clock this hold measures its own round trips with. Wall, not monotonic, because `deps.now`
+    // is the ONE clock seam this hook has and tests drive it; a backwards NTP step is discarded by
+    // PollBudget.observe and a forward one is a single outlier its median window shrugs off.
+    const clock = deps.now ?? Date.now;
+    /** This process's own latency estimate for /v1/cc/decision — ONE per hold, shared by the did-it-land
+     *  probe and every poll of the hold loop, because they are the same route over the same connection. */
+    const pollBudget = createPollBudget();
+
     // ONE poll GET of this request's decision record. Shared by the post-timeout probe below and the hold
     // loop so both read the record exactly the same way. Returns the parsed body (only on a 2xx) plus the
     // HTTP status (0 = the fetch threw/timed out) — never throws.
     const pollDecision = async (seq: number): Promise<{ data?: { status?: string; answerBlob?: string }; status: number }> => {
+      // THE BUDGET IS MEASURED, NOT ASSUMED. seq 0/1 are the FIRST fetch this short-lived process makes
+      // on this route (the did-it-land probe after a stalled POST, and a freshly granted hold's first
+      // GET), so they pay the proxy/tunnel handshake on the v1.6.6 first-contact floor with nothing yet
+      // measured. From seq 2 on the ceiling is sized from what THIS process's own completed round trips
+      // cost — a healthy Mac stays at the tight 2 s, a tunnel that answers in 3 s gets a budget it can
+      // actually meet. See createPollBudget.
+      const budgetMs = pollBudget.next(seq);
       // poll-begin/poll-end straddle the fetch so an abort or kill MID-FETCH is visible: a begin with
       // no matching end means the process died inside the GET (the prime suspect for a hold that
-      // never completes its first poll).
-      trace({ event: "poll-begin", seq });
+      // never completes its first poll). `budgetMs` rides along so a trace of consecutive TimeoutErrors
+      // says which ceiling each one hit — and now also which ceiling the measurements bought.
+      trace({ event: "poll-begin", seq, budgetMs });
+      const startedAt = clock();
+      // ONE completed round trip = one measurement, ok or not: a 429 or a 5xx still paid the whole
+      // transport cost. A THROW measures nothing (see PollBudget.observe) and is deliberately not fed.
+      const measure = (): number => {
+        const ms = clock() - startedAt;
+        pollBudget.observe(ms);
+        return ms;
+      };
       try {
         const res = await fetchFn(`${config.url}/v1/cc/decision/${requestId}`, {
           headers: pcHeaders,
-          signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+          signal: AbortSignal.timeout(budgetMs),
         });
         if (!res.ok) {
-          trace({ event: "poll-end", seq, outcome: "status", status: res.status });
+          trace({ event: "poll-end", seq, outcome: "status", status: res.status, ms: measure() });
           return { status: res.status };
         }
         const data = (await res.json()) as { status?: string; answerBlob?: string };
-        trace({ event: "poll-end", seq, outcome: "ok" });
+        trace({ event: "poll-end", seq, outcome: "ok", ms: measure() });
         return { data, status: res.status };
       } catch (e) { // transient — counted by the caller, kept polling until the cap
         trace({ event: "poll-end", seq, outcome: "error", ...errorTag(e) });
@@ -1079,17 +1477,62 @@ export async function runPermissionHook(deps: PermissionHookDeps = {}, agent: Ag
       }
     };
 
+    // ---- THE HONEST TRANSIENT STATE (NOM-45) ------------------------------------------------------
+    // When this hook stops because THE WORKER WAS UNREACHABLE, the user is fine — fail-open hands them
+    // the terminal dialog — but the PHONE is not: it keeps whatever attention row the last successful
+    // POST painted, a yellow hand for a hold that no longer exists and that no tap can resolve. Field
+    // report 2026-08-03 (pids 49753/49836): a Codex TUI question held fine, six consecutive polls timed
+    // out through a stalled proxy, the retry hook's POST timed out too, and the phone was left on an
+    // unanswerable `att/ans` row indistinguishable from a genuine dead end.
+    //
+    // So say so, on the record, where BOTH channels read it: `attentionStalledAt` gives
+    // computeSessionState its `attn/net` code, and the blob is re-sealed from the SAME plain attention
+    // frame plus a `reconnecting` key so the phone's row (worker envelope or LAN snapshot — one blob,
+    // both legs) renders the auto-retrying treatment instead. The write goes through
+    // settleDecisionHoldRecord, so it is a no-op unless the record is still the plain update/prio:1 row
+    // this episode owned — a later hook that already moved the session on is never walked back.
+    //
+    // Set ONLY on the transport-failure exits. A definitive 401/403/404/410, a genuine answer, an
+    // expiry/supersede and a thrown exception all leave the row telling the truth already.
+    let attentionStalled = false;
+    /** The stall patch: the plain attention frame the phone already has, plus the one key that turns a
+     *  dead hand into "Reconnecting…". Best-effort seal — a frame that will not encrypt still settles
+     *  with the plain fallback, because a missing breadcrumb is better than a frozen `ts`. */
+    const stalledPatch = async (at: number): Promise<Partial<SessionRecord>> => {
+      let stalledBlob = fallbackBlob;
+      try {
+        stalledBlob = await encryptBlob(config.e2eKey, { ...base, reconnecting: Math.floor(at / 1000) });
+      } catch { /* the plain attention frame is still honest, just less specific */ }
+      return { ts: at, blob: stalledBlob, attentionStalledAt: at };
+    };
+    /** Stamp the stall on a session this hook never got to hold (the POST itself never landed). The
+     *  holds' own exits ride settleHeldRecord below instead, so the marker is written exactly once. */
+    const markAttentionStalled = async (): Promise<void> => {
+      const at = (deps.now ?? Date.now)();
+      try {
+        await (deps.settleHoldRecordFn ?? defaultSettleHoldRecord())(sessionId, await stalledPatch(at));
+      } catch { /* best-effort, exactly like every other settle */ }
+    };
+
     let { posted, hold, reason: holdReason } = await postDecision(1, POST_MAX_ATTEMPTS);
     if (!posted) {
       // Both POSTs failed at the TRANSPORT layer — but a client-side timeout says nothing about whether
       // the request LANDED. If the first one did, the worker is holding a real record and the phone is
       // already showing the card: exiting here would fail open on the Mac while the phone still claims it
-      // can decide, and a tap would be applied to nothing. So spend ONE cheap GET (seq 0, same 2 s
+      // can decide, and a tap would be applied to nothing. So spend ONE cheap GET (seq 0, first-contact
       // ceiling) asking whether the record exists. A live record ⇒ honor the hold and fall into the normal
       // poll loop; anything else — no record, an error, a terminal status — ⇒ fail open exactly as before.
       const probe = await pollDecision(0);
       const live = probe.data?.status === "pending" || probe.data?.status === "answered";
-      if (!live) { trace({ event: "exit", reason: "post-error" }); return; }
+      if (!live) {
+        // TRANSPORT vs ANSWER. `status: 0` means the probe itself never reached the worker, so we do not
+        // know what the phone is showing and must assume the worst (the field case). A real HTTP status
+        // — 404 "no such record", 200 {expired} — is the worker SPEAKING: nothing was ever held, or it is
+        // already retired, and the row is not lying. Only the first case is a stall.
+        if (probe.status === 0) await markAttentionStalled();
+        trace({ event: "exit", reason: "post-error", ...(probe.status === 0 ? { stalled: true } : {}) });
+        return;
+      }
       trace({ event: "post-timeout-landed", status: probe.data?.status });
       hold = true;
       holdReason = undefined;
@@ -1111,19 +1554,132 @@ export async function runPermissionHook(deps: PermissionHookDeps = {}, agent: Ag
       trace({ event: "hold-retry-wait", delayMs: HOLD_RETRY_DELAY_MS });
       await sleep(HOLD_RETRY_DELAY_MS);
       const retry = await postDecision(2, 1);
-      if (!retry.posted) { trace({ event: "exit", reason: "hold-false" }); return; } // re-ask failed at transport → fall open
+      if (!retry.posted) {
+        // The re-ask failed at TRANSPORT → fall open. Round 1 already succeeded, which means the worker
+        // stored and pushed the fallback attention frame — the phone IS showing a yellow row — and the
+        // network then died under us. Same honest transient state as every other unreachable exit.
+        await markAttentionStalled();
+        trace({ event: "exit", reason: "hold-false", stalled: true });
+        return;
+      }
       hold = retry.hold;
       holdReason = retry.reason;
       trace({ event: "hold", hold, ...(holdReason !== undefined ? { reason: holdReason } : {}) });
       if (!hold) { trace({ event: "exit", reason: "hold-false" }); return; } // still not shown → worker applied the attention update → terminal dialog
     }
 
+    // THE HOLD IS REAL — tell the LAN channel. The worker now stores the decisionPending frame and
+    // defends it (it drops the plain prio:1 needsAttention CC's `Notification` hook fires seconds from
+    // now); the LAN frames feed rebuilds its frames from the SESSION RECORD, which has never carried
+    // either half. So stamp the same sealed frame beside the record, where the feed can find it, and
+    // let its guards decide when it stops being the truth (see shared.ts's DecisionHold header and
+    // lanHoldLive). Without this the phone's LAN row settles on a yellow "needs help" with no
+    // Allow/Deny — field report, session bed2e681, 2026-08-02.
+    //
+    // AWAITED, and BEFORE the poll loop, for the same reason the detail tee is: the phone must never be
+    // able to see the card before the local state that describes it is on disk. Best-effort inside.
+    //
+    // The MARKER's card is re-sealed with a `dbg` tail (see formatDecisionHoldDebug) — the SAME card,
+    // plus the one line that tells a diagnosing user which channel painted the row on their phone. The
+    // WORKER's copy (`blob`, already POSTed above) is deliberately left untouched: the two blobs differ
+    // in exactly that line, which is what makes the difference legible. Best-effort by construction — a
+    // seal that throws must not cost the user their approval, so the plain card is the fallback.
+    const holdAt = (deps.now ?? Date.now)();
+    const holdPid = deps.holdPid ?? process.pid;
+    let holdBlob = blob;
+    try {
+      holdBlob = await encryptBlob(config.e2eKey, appendFittedPlanAndDebug(
+        permissionFrame(permissionBase, fitted.detail, fitted.omitted, fitted.questions), undefined,
+        formatDecisionHoldDebug({ requestId, pid: holdPid }),
+      ));
+    } catch { /* the card without its breadcrumb is still the card */ }
+    await (deps.writeHoldFn ?? defaultWriteHold())(
+      sessionId, { blob: holdBlob, at: holdAt, pid: holdPid },
+    );
+    heldSessionId = sessionId;
+
+    // …AND THE PROCESS THAT OWNS THE HOLD OWNS THE RECORD'S EXIT FROM IT (field reports R2/R3, session
+    // a51208e8). Retiring the marker alone hands the row back to the state CC's `Notification` hook left
+    // there — op:update / prio:1 / needsAttention at a FROZEN ts — which the feed's monotonic `stamp`
+    // ships at prevTs+1, where the phone ACCEPTS it. Answered, the next real hook advances the record a
+    // second later (a yellow FLASH); superseded/expired/gave-up/threw, nothing EVER follows and the row
+    // wedges yellow for good (it also pins the worker's `decact` overlay, which only clears on a
+    // prio:0/done/end frame). So this hook writes the record itself, on its way out.
+    //
+    // TWO honest settles, and only two. A terminal approval/deny made the session active again →
+    // prio:0/working with a freshly sealed `working` frame (also releases the worker's overlay).
+    // Anything else — including a PreToolUse allow whose only job was to open Codex's native picker —
+    // leaves the user blocked at the Mac: the SAME yellow, re-sealed from the plain attention frame and
+    // freshly stamped. Claiming progress there would be a lie the phone renders as green.
+    settleHeldRecord = async (): Promise<void> => {
+      const settledAt = (deps.now ?? Date.now)();
+      const patch: Partial<SessionRecord> = settleAsWorking
+        ? {
+          ts: settledAt, lastEvent: "working", op: "update", prio: 0, sentDone: false,
+          // The approval episode is over; a stale marker would otherwise ride forward on every
+          // record the watchdog rebuilds by spreading `...record`.
+          attentionKind: undefined,
+          // …and neither may a stall marker: the phone answered, so contact plainly exists.
+          attentionStalledAt: undefined,
+          blob: await encryptBlob(config.e2eKey, { ...base, status: "working", at: Math.floor(settledAt / 1000) }),
+        }
+        // THREE honest settles now. `attentionStalled` is the third: the hold ended because the worker
+        // went unreachable, so the same yellow gets the `reconnecting` breadcrumb and the phone reads it
+        // as auto-retrying. Every other release re-stamps the plain attention frame and CLEARS any
+        // marker a previous stalled episode left, so a row that has recovered cannot keep claiming it.
+        : attentionStalled
+          ? await stalledPatch(settledAt)
+          : { ts: settledAt, blob: fallbackBlob, attentionStalledAt: undefined };
+      await (deps.settleHoldRecordFn ?? defaultSettleHoldRecord())(sessionId, patch);
+    };
+
     // HOLD: poll until the phone answers, the request leaves "pending", sustained failure trips the
-    // give-up cap, or we're killed. Each fetch keeps its own 2s ceiling; transient failures are
+    // give-up cap, or we're killed. Each fetch keeps its own measured ceiling; transient failures are
     // tolerated (keep polling). A decrypt failure or requestId mismatch exits silently (fail open).
-    const jitter = deps.jitter ?? (() => Math.floor(Math.random() * 500));
+    const jitter = deps.jitter ?? (() => Math.floor(Math.random() * POLL_JITTER_MAX_MS));
     const interval = deps.pollIntervalMs ?? POLL_INTERVAL_MS;
     const emit = deps.emit ?? ((line: string) => process.stdout.write(`${line}\n`));
+
+    /** Apply ONE sealed answer blob to this hold, from EITHER delivery channel — the 3 s worker poll or
+     *  the ~300 ms LAN loopback poll. THE single answered-branch body, so the two sources cannot drift:
+     *  decrypt → requestId match → emitDecision → THE RELEASE RULE (see emitDecision). "done" means the
+     *  hold is over (exactly one line emitted, or deliberately zero); "keep-polling" is only ever an
+     *  UNRECOGNIZED decision verb. A decrypt failure throws to the outer catch → silent exit 0 (fail
+     *  open), unchanged and identical on both channels. */
+    const applyAnswerBlob = async (answerBlob: string, src: "worker" | "lan"): Promise<"done" | "keep-polling"> => {
+      const answer = (await decryptBlob(config.e2eKey, answerBlob)) as
+        { requestId?: unknown; decision?: unknown; message?: unknown; answers?: unknown };
+      const match = answer.requestId === requestId;
+      // A matched, KNOWN decision either emits one line ("emitted") or deliberately emits nothing and
+      // lets the hold go ("released" — THE RELEASE RULE); both are DONE. A requestId MISMATCH is a
+      // replay/stale answer (silent, done). The ONE keep-polling case is a matched but UNRECOGNIZED
+      // decision verb (newer phone, older plugin): a decision we DO understand can still land.
+      const outcome: DecisionOutcome = match
+        ? emitDecision(agent, answer, toolName, toolInput, suggestions, emit, trace)
+        : "released";
+      // Only an emitted decision means WORKING. A `released` exit emitted nothing and left the user at
+      // the Mac, so that row stays honestly attentive.
+      if (outcome === "emitted") settleAsWorking = true;
+      if (outcome !== "keep-polling") {
+        trace({ event: "answered", match, outcome, src });
+        trace({ event: "exit", reason: "answered" });
+        return "done";
+      }
+      return "keep-polling";
+    };
+
+    // The LAN fast path, alongside (never instead of) the worker poll below. Inert when there is no
+    // lan.json — i.e. no watchdog listener — which is byte-for-byte the pre-phase-2 hook. Held in the
+    // function-scope handle so the outer `finally` can stop the ticker from EVERY exit of this loop.
+    loopback = createLoopbackAnswerPoller(config, requestId, {
+      fetchFn: deps.lanFetchFn ?? fetchFn,
+      now: deps.now ?? Date.now,
+      trace,
+      statePath: deps.lanStatePath ?? defaultLanStatePath(),
+      sleep: deps.lanSleep,
+      intervalMs: deps.lanIntervalMs,
+      discoverIntervalMs: interval,
+    });
     let misses = 0;
     let definitiveFailures = 0;
     /** The answerBlob of the last UNRECOGNIZED decision, and how many times in a row it has been read —
@@ -1139,21 +1695,10 @@ export async function runPermissionHook(deps: PermissionHookDeps = {}, agent: Ag
         misses = 0;
         definitiveFailures = 0;
         if (data.status === "answered" && typeof data.answerBlob === "string") {
-          // A decrypt failure here throws to the outer catch → silent exit 0 (fail open), never a retry.
-          const answer = (await decryptBlob(config.e2eKey, data.answerBlob)) as
-            { requestId?: unknown; decision?: unknown; message?: unknown; answers?: unknown };
-          const match = answer.requestId === requestId;
-          // A matched, KNOWN decision either emits one line ("emitted") or deliberately emits nothing
-          // and lets the hold go ("released" — see THE RELEASE RULE in emitDecision); both are DONE. A
-          // requestId MISMATCH is a replay/stale answer (silent, done — unchanged). The ONE keep-polling
-          // case is a matched but UNRECOGNIZED decision verb (newer phone, older plugin): we skip the
-          // return and fall through to the sleep so a decision we DO understand can still land.
-          const outcome: DecisionOutcome = match
-            ? emitDecision(agent, answer, toolName, toolInput, suggestions, emit, trace)
-            : "released";
-          if (outcome !== "keep-polling") {
-            trace({ event: "answered", match, outcome });
-            trace({ event: "exit", reason: "answered" });
+          // The SHARED answered branch (applyAnswerBlob above) — byte-identical handling whether this
+          // blob came from the worker poll or the LAN loopback poll. A decrypt failure inside it throws
+          // to the outer catch → silent exit 0 (fail open), never a retry.
+          if (await applyAnswerBlob(data.answerBlob, "worker") === "done") {
             return; // done — exactly one line emitted, or zero (release / mismatch)
           }
           // UNKNOWN decision verb — keep polling, but BOUNDED. An `answered` record is TERMINAL on the
@@ -1171,6 +1716,13 @@ export async function runPermissionHook(deps: PermissionHookDeps = {}, agent: Ag
             return; // a verb we will never understand on a record that will never change → fail open
           }
         } else if (typeof data.status === "string" && data.status !== "pending") {
+          // A TERMINAL status is not independent evidence that the user did not answer. When the phone
+          // answers over LAN, the watchdog's split-brain backstop echoes /v1/cc/decision/resolve, which
+          // retires this very record as "superseded" — so the answer's OWN delivery is what produces the
+          // status about to fail us open, and the loop returns here long before it reaches the
+          // `loopback.wait` that would have handed the blob over. Ask the local store once, first.
+          const settled = loopback === undefined ? undefined : await loopback.settle();
+          if (settled !== undefined && await applyAnswerBlob(settled, "lan") === "done") return;
           trace({ event: data.status === "expired" ? "expired" : "superseded", status: data.status });
           trace({ event: "exit", reason: data.status });
           return; // expired/superseded/unknown → silent
@@ -1192,18 +1744,54 @@ export async function runPermissionHook(deps: PermissionHookDeps = {}, agent: Ag
           definitiveFailures = 0;
         }
         if (++misses >= MAX_CONSECUTIVE_MISSES) {
-          trace({ event: "giveup", misses });
+          // SUSTAINED unreachability — ~5 min of consecutive unusable polls, transport throws and 429/5xx
+          // alike (a definitive status released two strikes ago, above). Fail open at the Mac, and tell
+          // the phone the truth on the way out: this row is not a question waiting for a tap, it is a
+          // computer that lost contact and will ask again. The settle rides the `finally`'s
+          // compare-and-clear, so it lands before the marker is retired.
+          attentionStalled = true;
+          trace({ event: "giveup", misses, stalled: true });
           trace({ event: "exit", reason: "giveup" });
           return; // sustained downlink failure → fail open silently
         }
       }
-      await sleep(interval + jitter());
+      // THE WORKER CADENCE IS THIS LINE, UNCHANGED: `sleep(interval + jitter())` is still what paces the
+      // loop. The race only lets a LAN-delivered answer cut the wait SHORT — it can never extend it, and
+      // the loopback ticker runs on its own stack, so a wedged listener cannot delay the next poll.
+      const lanBlob = await loopback.wait(sleep(interval + jitter()));
+      if (lanBlob !== undefined) {
+        // Same code path as a worker-delivered answer, by construction. An unrecognized verb here does
+        // NOT keep the LAN channel open (the poller retires itself after one delivery): the worker poll
+        // owns the bounded unknown-answer wait, exactly as before.
+        if (await applyAnswerBlob(lanBlob, "lan") === "done") return;
+      }
     }
   } catch (e) {
     // Silence + exit 0 is the contract — never surface into a Claude Code session, never block. The
     // error is recorded by CLASS (+ code) only — see errorTag: a thrown message can quote the hook
     // payload it choked on, and this trace is a plaintext file on disk.
     trace({ event: "exit", reason: "exception", ...errorTag(e) });
+  } finally {
+    // Stop the detached loopback ticker on EVERY exit (emitted, released, give-up, exception). The
+    // process is normally about to exit anyway; this is what keeps it from outliving the hold in-process.
+    try { loopback?.stop(); } catch { /* best-effort */ }
+    // Retire this process's hold marker the same way — answered, released, expired, gave up, threw. It
+    // is a compare-and-clear (a parallel tool's LATER hold must survive our exit), and it is NOT the
+    // only release: a SIGKILL, or the SIGTERM a closed terminal sends, never reaches a `finally`, so the
+    // feed's own holder-liveness and TTL guards are what make a marker impossible to wedge.
+    //
+    // The record settle rides INSIDE that compare-and-clear, which is the only place that knows both
+    // things it depends on: that we still own the marker (a newer hold's card must not be walked back by
+    // our exit), and that the record is written BEFORE the unlink (a reconcile pass must never observe
+    // "marker gone + record stale" — see clearDecisionHoldAt). Best-effort, like everything here: a
+    // failed settle must never cost the user their approval or surface into the session.
+    if (heldSessionId !== undefined) {
+      try {
+        await (deps.clearHoldFn ?? defaultClearHold())(
+          heldSessionId, deps.holdPid ?? process.pid, settleHeldRecord,
+        );
+      } catch { /* best-effort */ }
+    }
   }
 }
 

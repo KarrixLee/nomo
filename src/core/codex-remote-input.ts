@@ -5,25 +5,36 @@
 import { hostname } from "node:os";
 import { decryptBlob, encryptBlob } from "./crypto";
 import { requestUserInputDetail } from "./adapter";
+import { lanAnswerStore } from "./lan-listener";
+import type { LanAnswerStore } from "./lan-listener";
+// The relay's timing/give-up rules, shared verbatim with the Claude permission hook (permission.ts),
+// which polls the SAME route with the same credentials — see decision-poll.ts.
+import {
+  createPollBudget, DEFINITIVE_POLL_STATUSES, MAX_CONSECUTIVE_MISSES, MAX_DEFINITIVE_POLL_FAILURES,
+  POLL_INTERVAL_MS, POST_MAX_ATTEMPTS, POST_RETRY_PAUSE_MS,
+} from "./decision-poll";
+import type { PollBudget } from "./decision-poll";
 import {
   BLOB_FIT_CHARS, buildPermissionQuestions, buildPermissionSummary, capPermissionWireText,
-  DEFINITIVE_POLL_STATUSES, fitPermissionDetail, MAX_DEFINITIVE_POLL_FAILURES,
-  PERMISSION_QUESTION_LABEL_MAX,
+  fitPermissionDetail, PERMISSION_QUESTION_LABEL_MAX,
 } from "./permission";
 import {
-  Config, localApprovalsState, PLUGIN_VERSION, readRecord, SessionRecord,
+  clearDecisionHold, Config, DecisionHold, localApprovalsState, PLUGIN_VERSION, readRecord, SessionRecord,
+  settleDecisionHoldRecord, writeDecisionHold,
 } from "./shared";
+import { lanRunningUnderTest } from "./lan-wire";
 import type {
   CodexUserInputAnswers, CodexUserInputAnswerResult, CodexUserInputInterruptResult,
   CodexUserInputRequest,
 } from "./codex-app-server-client";
+import { renderableCodexUserInput } from "./codex-user-input-shape";
 
+/** FIRST-CONTACT ceiling for the decision POST. Deliberately NOT the permission hook's 4 s twin
+ *  (POST_FIRST_CONTACT_TIMEOUT_MS): this relay runs detached inside the watchdog and blocks nobody's
+ *  terminal, so it can afford to wait out a slow round trip rather than fall back to Desktop. Same
+ *  ceiling on the best-effort `resolve` echo below. Every OTHER timing/give-up rule on this route is
+ *  shared — see decision-poll.ts. */
 const POST_TIMEOUT_MS = 15_000;
-const POST_MAX_ATTEMPTS = 2;
-const POST_RETRY_PAUSE_MS = 1_000;
-const POLL_TIMEOUT_MS = 2_000;
-const POLL_INTERVAL_MS = 3_000;
-const MAX_CONSECUTIVE_MISSES = 100;
 const ANSWER_MAX = 500;
 
 export type CodexRemoteInputResult =
@@ -47,6 +58,24 @@ export interface CodexRemoteInputDeps {
   sleep?: (ms: number) => Promise<void>;
   pollIntervalMs?: number;
   localApprovalsStateFn?: () => Promise<"on" | "off">;
+  /** The LAN listener's in-process answer store (NOM-44 phase 2). This relay runs INSIDE the watchdog,
+   *  so a phone answer delivered over the LAN is already in this process's memory: it is applied on the
+   *  spot instead of waiting for the next 3 s worker tick. Defaults to the process-wide singleton the
+   *  listener writes; tests inject their own. */
+  answerStore?: LanAnswerStore;
+  /** This relay's own latency estimate for /v1/cc/decision, which sizes every steady-state poll's
+   *  ceiling (see createPollBudget). Defaults to a fresh per-request estimator; injected by tests, which
+   *  is also the only way to OBSERVE the budget here — unlike the permission hook, the relay has no
+   *  trace file to write it to. */
+  pollBudget?: PollBudget;
+  /** Local `.hold` marker lifecycle for the LAN state feed. This relay lives in the watchdog, so its
+   *  owner pid is the watchdog's own pid (unlike permission.ts's short-lived hook process). */
+  writeHoldFn?: (sessionId: string, hold: DecisionHold) => Promise<void>;
+  clearHoldFn?: (
+    sessionId: string, pid: number, beforeUnlink?: () => Promise<void>,
+  ) => Promise<boolean>;
+  settleHoldRecordFn?: (sessionId: string, patch: Partial<SessionRecord>) => Promise<void>;
+  holdPid?: number;
   /** Diagnostic seam. Failures here are never fatal, but they must not be silent either. */
   onError?: (error: Error) => void;
 }
@@ -65,7 +94,37 @@ interface PhoneAnswer {
   answers?: unknown;
 }
 
-/** Map the phone's positional display labels back to Codex's original question ids and labels. */
+/** Unit tests run in the developer's real HOME, so production marker defaults must be inert there.
+ *  Injected seams still exercise the full lifecycle. Mirrors permission.ts's guard exactly. */
+function defaultWriteHold(): (sessionId: string, hold: DecisionHold) => Promise<void> {
+  return lanRunningUnderTest() ? async () => { /* never touch live records from a test */ } : writeDecisionHold;
+}
+
+function defaultClearHold(): (
+  sessionId: string, pid: number, beforeUnlink?: () => Promise<void>,
+) => Promise<boolean> {
+  return lanRunningUnderTest()
+    ? async (_sessionId: string, _pid: number, beforeUnlink?: () => Promise<void>) => {
+      await beforeUnlink?.();
+      return true;
+    }
+    : clearDecisionHold;
+}
+
+function defaultSettleHoldRecord(): (sessionId: string, patch: Partial<SessionRecord>) => Promise<void> {
+  return lanRunningUnderTest() ? async () => { /* never touch live records from a test */ } : settleDecisionHoldRecord;
+}
+
+/** Map the phone's positional display labels back to Codex's original question ids and labels.
+ *
+ *  THE ID IS THE MAP KEY, so it must be a non-empty string AND unique across the request — otherwise
+ *  the answers silently collapse. A malformed row with no id keys the object "undefined"; two rows
+ *  sharing an id overwrite each other, and app-server receives ONLY the last question's pick under the
+ *  shared id while the user's first answer is DISCARDED (field-reproducible: a "No" to "Deploy to
+ *  prod?" vanishing behind a second question). Both are rejected here, which falls the whole request
+ *  back to the Mac picker — the same honest outcome as any other unmappable answer. The primary gate is
+ *  upstream in renderableCodexUserInput (a request like this never reaches the phone at all); this is
+ *  the last line of defence on the only path that can mis-attribute a real human decision. */
 export function codexAnswersFromPhone(
   request: CodexUserInputRequest,
   positional: unknown,
@@ -74,6 +133,7 @@ export function codexAnswersFromPhone(
   const mapped: Record<string, string[]> = {};
   for (let index = 0; index < request.questions.length; index += 1) {
     const question = request.questions[index];
+    if (typeof question?.id !== "string" || question.id.length === 0) return undefined;
     const raw = positional[index];
     if (typeof raw !== "string") return undefined;
     const answer = raw.trim();
@@ -89,32 +149,9 @@ export function codexAnswersFromPhone(
     if (unique.length !== 1) return undefined;
     mapped[question.id] = [unique[0]];
   }
+  // One key per question, or two questions shared an id and one pick was overwritten on the way in.
+  if (Object.keys(mapped).length !== request.questions.length) return undefined;
   return mapped;
-}
-
-function renderableToolInput(request: CodexUserInputRequest): Record<string, unknown> | undefined {
-  if (request.questions.length < 1 || request.questions.length > 3) return undefined;
-  // Secret/free-form-only questions never leave the Mac. `isOther` may coexist with ordinary choices;
-  // Nomo exposes only those explicit labels and leaves free-form "Other" to Codex Desktop.
-  if (request.questions.some((question) => {
-    if (question.isSecret || !question.options?.length) return true;
-    const labels = question.options.map((option) => option.label);
-    // The picker must round-trip exactly. Reject whitespace-normalizing labels, duplicates, and capped
-    // display collisions BEFORE the relay can let the phone terminally answer an ambiguous choice.
-    if (labels.some((label) => label !== label.trim() || label.length > ANSWER_MAX)) return true;
-    if (new Set(labels).size !== labels.length) return true;
-    return new Set(labels.map((label) =>
-      capPermissionWireText(label, PERMISSION_QUESTION_LABEL_MAX)
-    )).size !== labels.length;
-  })) return undefined;
-  return {
-    questions: request.questions.map((question) => ({
-      question: question.question,
-      header: question.header,
-      multiSelect: false,
-      options: question.options!.map((option) => ({ ...option })),
-    })),
-  };
 }
 
 function baseBlob(
@@ -187,7 +224,12 @@ async function parseJson<T>(response: Response): Promise<T | undefined> {
   try { return await response.json() as T; } catch { return undefined; }
 }
 
-async function resolveOnRelay(config: Config, requestId: string, fetchFn: typeof fetch): Promise<void> {
+/** POST /v1/cc/decision/resolve — the blob-free, PC-authenticated "this request is settled on the Mac"
+ *  transition. EXPORTED because the LAN channel needs the identical request: after the watchdog's
+ *  listener stores a LAN-delivered answer it echoes exactly this call, so the worker record retires and
+ *  the island's Allow/Deny buttons drop even when the phone's own worker leg never landed. Best-effort
+ *  by contract — every failure is swallowed (and, on the LAN path, it is NEVER a gone strike). */
+export async function resolveOnRelay(config: Config, requestId: string, fetchFn: typeof fetch = fetch): Promise<void> {
   try {
     await fetchFn(`${config.url}/v1/cc/decision/resolve`, {
       method: "POST",
@@ -213,8 +255,11 @@ async function runRemoteInput(
   onHoldCreated: (created: boolean) => void,
 ): Promise<CodexRemoteInputResult> {
   let holdCreated = false;
+  let heldSessionId: string | undefined;
+  let resumed = false;
+  let settleHeldRecord: (() => Promise<void>) | undefined;
   try {
-    const toolInput = renderableToolInput(request);
+    const toolInput = renderableCodexUserInput({ questions: request.questions });
     if (!toolInput) return "unsupported";
     const record = await (deps.readRecordFn ?? readRecord)(request.identity.threadId);
     if (!record || (record.agent ?? "claude") !== "codex") return "unsupported";
@@ -256,6 +301,32 @@ async function runRemoteInput(
       const timer = setTimeout(resolve, ms);
       timer.unref?.();
     }));
+    // THE HONEST TRANSIENT STATE (NOM-45) — the permission hook's twin, and for the identical reason:
+    // when this relay stops because THE WORKER WAS UNREACHABLE, Codex is unblocked at the Mac but the
+    // phone keeps the yellow attention row the last successful POST painted, unanswerable and
+    // indistinguishable from a real dead end. `attentionStalledAt` + the blob's `reconnecting` key make
+    // it read as auto-retrying on both channels. Set ONLY on the two transport-failure exits; a
+    // definitive status, an expiry/supersede, an unreadable-but-real reply and a genuine answer all
+    // leave the row telling the truth.
+    let attentionStalled = false;
+    const stalledPatch = async (at: number): Promise<Partial<SessionRecord>> => {
+      let stalledBlob = fallbackBlob;
+      try {
+        stalledBlob = await encryptBlob(deps.config.e2eKey, { ...fallback, reconnecting: Math.floor(at / 1000) });
+      } catch { /* the plain attention frame is still honest, just less specific */ }
+      return { ts: at, blob: stalledBlob, attentionStalledAt: at };
+    };
+    /** Stamp the stall on a session this relay never got to hold (the POST itself never landed). A hold
+     *  that DID exist rides settleHeldRecord instead, so the marker is written exactly once. */
+    const markAttentionStalled = async (): Promise<void> => {
+      const at = (deps.now ?? Date.now)();
+      try {
+        await (deps.settleHoldRecordFn ?? defaultSettleHoldRecord())(
+          request.identity.threadId, await stalledPatch(at),
+        );
+      } catch { /* best-effort, exactly like every other settle */ }
+    };
+
     let response: Response | undefined;
     for (let attempt = 1; attempt <= POST_MAX_ATTEMPTS && !signal.aborted; attempt += 1) {
       try {
@@ -294,6 +365,8 @@ async function runRemoteInput(
       // Both responses were ambiguous (including an abort that cancelled the fetch). Retire a same-id hold
       // if either POST committed before its reply was lost; a true no-create returns 404 and costs nothing.
       await resolveOnRelay(deps.config, requestId, fetchFn);
+      // An ABORT is a resolution on the Mac, not a lost worker — only a genuine transport failure stalls.
+      if (!signal.aborted) await markAttentionStalled();
       return signal.aborted ? "resolved-elsewhere" : "transport-error";
     }
     if (!response.ok) return signal.aborted ? "resolved-elsewhere" : "transport-error";
@@ -308,6 +381,33 @@ async function runRemoteInput(
     // The hold EXISTS on the worker. Publish that fact BEFORE honoring the abort, so an abort that lost
     // the race still retires the card through resolvedElsewhere()'s `await holdCreated` branch.
     holdCreated = true;
+    // Worker hold and local LAN marker are one lifecycle. The marker carries the watchdog pid because
+    // this relay is in-process; a watchdog crash makes it dead on the next liveness pass, and the normal
+    // 10-minute marker TTL remains the pid-reuse backstop. Await the write before exposing the created
+    // hold to resolvedElsewhere(), so every exit from that point has a marker it can compare-and-clear.
+    const holdPid = deps.holdPid ?? process.pid;
+    await (deps.writeHoldFn ?? defaultWriteHold())(
+      request.identity.threadId, { blob, at: now, pid: holdPid },
+    );
+    heldSessionId = request.identity.threadId;
+    settleHeldRecord = async (): Promise<void> => {
+      const settledAt = (deps.now ?? Date.now)();
+      const unblocked = resumed || signal.aborted;
+      const patch: Partial<SessionRecord> = unblocked
+        ? {
+          ts: settledAt, lastEvent: "working", op: "update", prio: 0, sentDone: false,
+          attentionKind: undefined,
+          // The phone answered (or the Mac did) — contact plainly exists, so no stall may ride forward.
+          attentionStalledAt: undefined,
+          blob: await encryptBlob(deps.config.e2eKey, {
+            ...promptBase, status: "working", at: Math.floor(settledAt / 1000),
+          }),
+        }
+        : attentionStalled
+          ? await stalledPatch(settledAt)
+          : { ts: settledAt, blob: fallbackBlob, attentionStalledAt: undefined };
+      await (deps.settleHoldRecordFn ?? defaultSettleHoldRecord())(request.identity.threadId, patch);
+    };
     onHoldCreated(true);
     if (signal.aborted) return "resolved-elsewhere";
 
@@ -324,19 +424,90 @@ async function runRemoteInput(
       await resolveOnRelay(deps.config, requestId, fetchFn);
     };
 
+    /** Apply ONE sealed phone answer, from EITHER delivery channel — the 3 s worker poll or the LAN
+     *  listener's in-process answer store. THE single answered-branch body so the two cannot drift: the
+     *  requestId-mismatch guard, the deny→interrupt mapping, and the answer→app-server delivery all
+     *  behave identically no matter how the blob arrived. */
+    const applyAnswerBlob = async (answerBlob: string): Promise<CodexRemoteInputResult> => {
+      // EVERY REJECTION BELOW IS REPORTED. A refused answer releases the hold, which the phone reads as
+      // the card simply flipping back to an unanswerable attention row — indistinguishable from a flap
+      // and, until 2026-08-05, impossible to diagnose because each of these returns was silent. The
+      // messages are deliberately CONTENT-FREE (no question text, no option label, no answer): this
+      // lands in a plaintext local trace, and permission.ts's errorTag discipline applies here too.
+      const reject = (why: string, result: CodexRemoteInputResult): CodexRemoteInputResult => {
+        report(deps, new Error(`Codex phone answer rejected (${why})`), "Codex remote input answer");
+        return result;
+      };
+      let answer: PhoneAnswer;
+      try { answer = await decryptBlob(deps.config.e2eKey, answerBlob) as PhoneAnswer; }
+      catch { return reject("undecryptable", "transport-error"); }
+      if (answer.requestId !== requestId) return reject("request-id mismatch", "unsupported");
+      if (answer.decision === "deny") {
+        const result = await deps.interruptAppServer();
+        if (result === "sent" || result === "already-sent") {
+          resumed = true;
+          return "denied";
+        }
+        await reportUndelivered("deny", result);
+        return "transport-error";
+      }
+      if (answer.decision !== "answer") return reject("unknown decision", "unsupported");
+      const mapped = codexAnswersFromPhone(request, answer.answers);
+      if (!mapped) return reject("unmappable to the app-server questions", "unsupported");
+      const result = await deps.answerAppServer(mapped);
+      if (result === "sent" || result === "already-sent") {
+        resumed = true;
+        return "answered";
+      }
+      await reportUndelivered("answer", result);
+      return "transport-error";
+    };
+
+    // The LAN store lives in THIS process (the listener is hosted by the same watchdog), so a LAN-
+    // delivered answer needs no poll at all: it is checked at the top of every iteration AND raced
+    // against the sleep at the bottom, which is what removes the up-to-3 s tick from the answer path.
+    // The worker poll below keeps its own cadence untouched — it is the relay's liveness proof.
+    const answers = deps.answerStore ?? lanAnswerStore;
+    const clock = deps.now ?? Date.now;
+    /** THE STORE IS THIS MACHINE'S AUTHORITY on a request it is holding, and it OUTRANKS whatever the
+     *  worker says about that request. Not a nicety — the two are causally linked: the listener that
+     *  stores a LAN answer also echoes POST /cc/decision/resolve (cc-watchdog's acceptLanAnswer, the
+     *  split-brain backstop that retires the island's buttons when the phone's own worker leg fails),
+     *  and that route flips the record to `superseded`. The phone's answer therefore routinely lands
+     *  while a poll is in flight, and that poll returns TERMINAL for a prompt this process can answer.
+     *  Honouring it dropped the pick on the floor (field 2026-08-05): the hold released, the row fell
+     *  back to the yellow attention frame, and Codex waited forever. `put` is synchronous and strictly
+     *  precedes the echo, so a terminal status caused by our own echo can never outrun this peek. */
+    const localAnswer = (): string | undefined => answers.peek(requestId, clock())?.answerBlob;
+
     let misses = 0;
     let definitiveFailures = 0;
+    let polls = 0;
+    // The SAME adaptive per-fetch ceiling the permission hook polls on, and for the same reason: first
+    // contact pays a proxy/tunnel's DNS + connect + TLS setup on the v1.6.6 floor, and every poll after
+    // it is bounded by what THIS relay's own completed round trips actually cost — the tight 2s on a
+    // healthy network, up to 8s on a tunnel that cannot meet it. See createPollBudget.
+    const pollBudget = deps.pollBudget ?? createPollBudget();
     while (!signal.aborted) {
+      const local = localAnswer();
+      if (local) return await applyAnswerBlob(local);
+      polls += 1;
+      const budgetMs = pollBudget.next(polls);
+      const startedAt = clock();
       try {
         const response = await fetchFn(`${deps.config.url}/v1/cc/decision/${requestId}`, {
           headers,
-          signal: requestSignal(POLL_TIMEOUT_MS, signal),
+          signal: requestSignal(budgetMs, signal),
         });
         // An unreadable 200 counts as a miss exactly like a non-2xx, so a relay that answers with
         // garbage forever still trips MAX_CONSECUTIVE_MISSES instead of polling until the heat death.
         const data = response.ok
           ? await parseJson<{ status?: unknown; answerBlob?: unknown }>(response)
           : undefined;
+        // A response ARRIVED, body and all — ok or not, the transport cost is a real measurement, and the
+        // budget it must fit under covers the body read too (the abort signal does). A THROW is never fed
+        // (see PollBudget.observe): it measures nothing and must not inflate the give-up clock.
+        pollBudget.observe(clock() - startedAt);
         if (!data) {
           misses += 1;
           if (response.ok) report(deps, new Error("Unparseable relay poll response"), "Relay poll");
@@ -357,32 +528,33 @@ async function runRemoteInput(
           misses = 0;
           definitiveFailures = 0;
           if (data.status === "answered" && typeof data.answerBlob === "string") {
-            let answer: PhoneAnswer;
-            try { answer = await decryptBlob(deps.config.e2eKey, data.answerBlob) as PhoneAnswer; }
-            catch { return "transport-error"; }
-            if (answer.requestId !== requestId) return "unsupported";
-            if (answer.decision === "deny") {
-              const result = await deps.interruptAppServer();
-              if (result === "sent" || result === "already-sent") return "denied";
-              await reportUndelivered("deny", result);
-              return "transport-error";
-            }
-            if (answer.decision !== "answer") return "unsupported";
-            const mapped = codexAnswersFromPhone(request, answer.answers);
-            if (!mapped) return "unsupported";
-            const result = await deps.answerAppServer(mapped);
-            if (result === "sent" || result === "already-sent") return "answered";
-            await reportUndelivered("answer", result);
-            return "transport-error";
-          } else if (data.status === "expired") return "expired";
-          else if (data.status === "superseded") return "superseded";
+            return await applyAnswerBlob(data.answerBlob); // the shared branch — see applyAnswerBlob
+          } else if (data.status === "expired" || data.status === "superseded") {
+            // A TERMINAL worker status is honoured only when the store holds nothing — see localAnswer.
+            const raced = localAnswer();
+            if (raced) return await applyAnswerBlob(raced);
+            return data.status === "expired" ? "expired" : "superseded";
+          }
         }
       } catch {
         misses += 1;
         definitiveFailures = 0; // a transport throw says nothing about the record — never a strike
       }
-      if (misses >= MAX_CONSECUTIVE_MISSES) return "transport-error";
-      await abortableSleep(deps.pollIntervalMs ?? POLL_INTERVAL_MS, signal, sleep);
+      if (misses >= MAX_CONSECUTIVE_MISSES) {
+        // ~5 min of consecutive unusable polls: the worker is gone, not slow. Fail open here, and let the
+        // settle below tell the phone it is a RECONNECTING row rather than a question it can answer.
+        attentionStalled = true;
+        return "transport-error";
+      }
+      // The poll cadence is unchanged: the race can only END this wait EARLY (a LAN answer landed), never
+      // extend it. `cancel()` in the finally is mandatory — without it every abandoned tick would leave a
+      // listener behind in the store.
+      const waiter = answers.waiter(requestId, clock());
+      try {
+        await Promise.race([abortableSleep(deps.pollIntervalMs ?? POLL_INTERVAL_MS, signal, sleep), waiter.promise]);
+      } finally {
+        waiter.cancel();
+      }
     }
     return "resolved-elsewhere";
   } catch (error) {
@@ -393,6 +565,15 @@ async function runRemoteInput(
     if (holdCreated) await resolveOnRelay(deps.config, requestId, deps.fetchFn ?? fetch);
     return signal.aborted ? "resolved-elsewhere" : "transport-error";
   } finally {
+    // Same settle-before-unlink compare-and-clear discipline as permission.ts. A later hold owns the
+    // marker/record if its pid differs; a moved record makes settleDecisionHoldRecord a no-op.
+    if (heldSessionId !== undefined) {
+      try {
+        await (deps.clearHoldFn ?? defaultClearHold())(
+          heldSessionId, deps.holdPid ?? process.pid, settleHeldRecord,
+        );
+      } catch { /* marker liveness + TTL are the crash-safe release */ }
+    }
     if (!holdCreated) onHoldCreated(false);
   }
 }

@@ -3,6 +3,7 @@ import {
   b64url,
   decryptBlob,
   deriveE2EKey,
+  deriveLanKey,
   deriveRatchetKey,
   encryptBlob,
   encryptBlobWithIVForVectors,
@@ -201,6 +202,49 @@ describe("pairing-v3 ECDH ratchet — mandatory cross-platform KAT (Z + K1 byte-
     const k1b = await deriveRatchetKey(b.privPkcs8, a.pubRaw, k0, "pid");
     expect(toHex(k1)).toBe(toHex(k1b)); // ECDH symmetry on freshly generated keys
     expect(k1.length).toBe(32);
+  });
+});
+
+// The FROZEN LAN outer-seal vector (NOM-44 phase 1). K_lan is what the iPhone's CCLanClient derives to
+// talk to the Mac listener; if this changes, every paired phone's LAN channel breaks silently (the
+// listener would answer an opaque 400 forever). Treat a failure here as a contract violation.
+describe("LAN outer seal — cross-platform KAT (K_lan + envelope round trip)", () => {
+  const v = vectors.lan;
+
+  function fromHex(hex: string): Uint8Array {
+    const bytes = new Uint8Array(hex.length / 2);
+    for (let i = 0; i < bytes.length; i++) bytes[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+    return bytes;
+  }
+
+  test("K_lan = HKDF-SHA256(ikm = e2eKey, salt = <empty>, info = \"nomo-lan-v1|\" + pairingId)", async () => {
+    const key = await deriveLanKey(fromHex(v.e2eKeyHex), v.pairingId);
+    expect(key.length).toBe(32);
+    expect(toHex(key)).toBe(v.lanKeyHex);
+    expect(v.info).toBe(`nomo-lan-v1|${v.pairingId}`);
+  });
+
+  test("the vector's e2eKey is the hkdf vector's output, so the two entries chain", () => {
+    expect(v.e2eKeyHex).toBe(vectors.hkdf.expectedKeyHex);
+  });
+
+  test("K_lan is domain-separated from the e2eKey it derives from", async () => {
+    expect(v.lanKeyHex).not.toBe(v.e2eKeyHex);
+    // A blob sealed under the pairing key must NOT open under K_lan — that is what kills cross-channel
+    // replay between the worker path and the LAN path.
+    const workerSealed = await encryptBlob(fromHex(v.e2eKeyHex), { kind: "focus-terminal" });
+    await expect(decryptBlob(fromHex(v.lanKeyHex), workerSealed)).rejects.toThrow();
+  });
+
+  test("the pinned request/response envelopes open under K_lan to their recorded plaintexts", async () => {
+    const key = fromHex(v.lanKeyHex);
+    expect(await decryptBlob(key, v.requestEnvelopeB64)).toEqual(v.requestPlaintextJson);
+    expect(await decryptBlob(key, v.responseEnvelopeB64)).toEqual(v.responsePlaintextJson);
+  });
+
+  test("a different pairingId derives a different K_lan (info is the only domain separator)", async () => {
+    const other = await deriveLanKey(fromHex(v.e2eKeyHex), `${v.pairingId}x`);
+    expect(toHex(other)).not.toBe(v.lanKeyHex);
   });
 });
 

@@ -5,8 +5,8 @@ import { basename, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { b64url, decryptBlob } from "../core/crypto";
 import {
-  BLOB_FIT_CHARS, DBG_BLOB_TEXT_MAX_CHARS, formatPlanPickerDebug, parseConfig, PendingEventStash, PLAN_BLOB_TEXT_MAX_CHARS, PLAN_BLOB_TRUNCATION_MARKER,
-  readRecord, sealedBlobChars, SessionRecord,
+  BLOB_FIT_CHARS, DBG_BLOB_TEXT_MAX_CHARS, formatPlanPickerDebug, fullTextForRecord, parseConfig, PendingEventStash, PLAN_BLOB_TEXT_MAX_CHARS, PLAN_BLOB_TRUNCATION_MARKER,
+  readDecisionHoldAt, readRecord, sealedBlobChars, SessionRecord, writeDecisionHoldAt,
 } from "../core/shared";
 import {
   aiTitle, buildBlob, buildEnvelope, buildPendingStash, cleanPromptTitle, codexIndexTitle, codexSessionTitle,
@@ -40,6 +40,19 @@ describe("native Codex hook manifest", () => {
     // comment: extra JSON keys risk the hook-manifest deserializer rejecting the whole file, which would
     // silently disable EVERY Codex hook.
     expect(sessionEnd?.timeout).toBe(3);
+  });
+
+  // ROLLED BACK 2026-08-05 (field): the blocking request_user_input handler HUNG — its trace showed
+  // `start` with no `posted`/`exit`, and with a 3600s manifest timeout it blocked Codex's own tool call,
+  // so the user saw NO picker in the CLI and nothing answerable on the phone. The app-server bridge
+  // (codex-remote-input) remains the answerable path, exactly as on dev. Re-adding this handler requires
+  // proving, with instrumentation, that every pre-decision path is bounded and fail-open.
+  test("registers NO blocking request_user_input handler (it hung the CLI in the field)", async () => {
+    const path = join(import.meta.dir, "../../plugin/hooks/codex-hooks.json");
+    const manifest = JSON.parse(await readFile(path, "utf8")) as {
+      hooks: Record<string, Array<{ matcher?: string }>>;
+    };
+    expect(manifest.hooks.PreToolUse.some((entry) => entry.matcher === "request_user_input")).toBe(false);
   });
 });
 
@@ -995,6 +1008,23 @@ describe("trackSession + readRecord file glue (sentDone survives a fresh disk re
     }
   });
 
+  test("op:end also retires a hold marker a killed permission hook left behind", async () => {
+    const sessionId = `test-glue-${randomUUID()}`;
+    try {
+      await trackSessionAt(glueSessions, sessionId, "start", 0, "working", "B", "mac", "proj", "/tmp/t.jsonl");
+      // A SIGKILL/SIGTERM skips the holding hook's `finally`, so the marker outlives its hold. The
+      // frames feed already treats it as inert (dead holder / TTL), but nothing removed the FILE — and
+      // "the session is over" is known exactly here.
+      await writeDecisionHoldAt(glueSessions, sessionId, { blob: "card", at: Date.now(), pid: 1 });
+      expect(await readDecisionHoldAt(glueSessions, sessionId)).not.toBeNull();
+      await trackSessionAt(glueSessions, sessionId, "end", 0, "done", undefined, "mac", "proj", "/tmp/t.jsonl");
+      expect(await readDecisionHoldAt(glueSessions, sessionId)).toBeNull();
+    } finally {
+      await unlink(`${glueSessions}/${sessionId}.json`).catch(() => {});
+      await unlink(`${glueSessions}/${sessionId}.hold`).catch(() => {});
+    }
+  });
+
   test("sessionStartedAt round-trips through the record; omitted when unknown (backward-compat)", async () => {
     const sessionId = `test-start-${randomUUID()}`;
     try {
@@ -1064,6 +1094,99 @@ describe("trackSession + readRecord file glue (sentDone survives a fresh disk re
     } finally {
       await unlink(`${glueSessions}/${sessionId}.json`).catch(() => {});
     }
+  });
+
+  test("attentionKind round-trips through the record (append-last), and an OLD record without it still parses", async () => {
+    const sessionId = `test-attn-${randomUUID()}`;
+    const path = `${glueSessions}/${sessionId}.json`;
+    try {
+      // A Codex request_user_input event caches its clear discriminator so the LAN frames feed — which
+      // rebuilds frames from the RECORD, not from the POST — keeps labelling it a question.
+      await trackSessionAt(glueSessions, sessionId, "update", 1, "needsAttention", "B", "mac", "proj", "/tmp/t.jsonl", "codex",
+        undefined, undefined, undefined, undefined, undefined, undefined, false, 4242, undefined, false, undefined, "userInput");
+      expect((await readRecord(sessionId, glueSessions))?.attentionKind).toBe("userInput");
+      // APPEND-LAST: the new key is the LAST one in the serialized record, so no existing key moved.
+      expect(Object.keys(JSON.parse(await readFile(path, "utf8")) as object).at(-1)).toBe("attentionKind");
+      // A plain approval / a later working event writes no discriminator at all — the record is rebuilt
+      // whole on every event, so the marker cannot linger past its episode.
+      await trackSessionAt(glueSessions, sessionId, "update", 0, "working", "B", "mac", "proj", "/tmp/t.jsonl");
+      expect((await readRecord(sessionId, glueSessions))?.attentionKind).toBeUndefined();
+      // An OLD plugin's record (written before the field existed) has no such key: it must load fine and
+      // simply read back undefined — never a crash, never a default.
+      await writeFile(path, JSON.stringify({
+        pid: 4242, machine: "mac", label: "proj", ts: Date.now(), op: "update", prio: 1,
+        lastEvent: "needsAttention", blob: "B", pairingId: "p",
+      }));
+      const legacy = await readRecord(sessionId, glueSessions);
+      expect(legacy).not.toBeNull();
+      expect(legacy?.attentionKind).toBeUndefined();
+      expect(legacy?.blob).toBe("B");
+    } finally {
+      await unlink(path).catch(() => {});
+    }
+  });
+
+  test("planFull round-trips (append-last), is dropped by the next event, and an OLD record still parses", async () => {
+    const sessionId = `test-planfull-${randomUUID()}`;
+    const path = `${glueSessions}/${sessionId}.json`;
+    const full = "# Plan\n".repeat(500);
+    try {
+      // A picker frame whose blob could only carry a PREFIX of the plan tees the whole thing here, so a
+      // phone on the same network can pull it over LAN (the worker's 3072-char ceiling is untouched).
+      await trackSessionAt(glueSessions, sessionId, "update", 1, "needsAttention", "B", "mac", "proj", "/tmp/t.jsonl", "codex",
+        undefined, undefined, undefined, undefined, undefined, undefined, false, 4242, undefined, false, undefined, "userInput", full);
+      expect((await readRecord(sessionId, glueSessions))?.planFull).toBe(full);
+      // APPEND-LAST: the newest key is the LAST one serialized, so no existing key moved.
+      expect(Object.keys(JSON.parse(await readFile(path, "utf8")) as object).at(-1)).toBe("planFull");
+      // The record is rebuilt whole on every event, so the next hook drops the copy with the episode.
+      await trackSessionAt(glueSessions, sessionId, "update", 0, "working", "B", "mac", "proj", "/tmp/t.jsonl");
+      expect((await readRecord(sessionId, glueSessions))?.planFull).toBeUndefined();
+      // A record written before the field existed loads fine and reads back undefined.
+      await writeFile(path, JSON.stringify({
+        pid: 4242, machine: "mac", label: "proj", ts: Date.now(), op: "update", prio: 1,
+        lastEvent: "needsAttention", blob: "B", pairingId: "p",
+      }));
+      const legacy = await readRecord(sessionId, glueSessions);
+      expect(legacy).not.toBeNull();
+      expect(legacy?.planFull).toBeUndefined();
+      expect(legacy?.blob).toBe("B");
+    } finally {
+      await unlink(path).catch(() => {});
+    }
+  });
+});
+
+describe("buildEnvelope's blob-plaintext tee (the unabridged-plan source)", () => {
+  const input = {
+    session_id: "s-tee", hook_event_name: "Stop", cwd: "/Users/x/api-status", transcript_path: "/tmp/t.jsonl",
+  };
+  const plan = { op: "update" as const, prio: 1 as const, status: "needsAttention" as const };
+
+  test("a plan too big for the sealed ceiling is FITTED in the blob and kept whole for the record", async () => {
+    const full = `${"a".repeat(6000)}END`;
+    let teed: { plan?: string } | undefined;
+    await buildEnvelope(input, "mac", 1_800_000_000_000, "T", KEY, false, "codex", undefined, undefined, "proj",
+      undefined, plan, "userInput", full, undefined, (plaintext) => { teed = plaintext; });
+    // What rode the wire is a prefix with the truncation marker — the worker ceiling is untouched.
+    expect(teed?.plan).not.toBe(full);
+    expect(teed?.plan?.endsWith(PLAN_BLOB_TRUNCATION_MARKER)).toBe(true);
+    // What the record keeps is the whole thing, so the LAN read serves the real plan.
+    expect(fullTextForRecord(full, teed?.plan)).toBe(full);
+  });
+
+  test("a plan that rides WHOLE stores nothing — the phone just reads the blob's own copy", async () => {
+    const full = "# Short plan\n- do the thing";
+    let teed: { plan?: string } | undefined;
+    await buildEnvelope(input, "mac", 1_800_000_000_000, "T", KEY, false, "codex", undefined, undefined, "proj",
+      undefined, plan, "userInput", full, undefined, (plaintext) => { teed = plaintext; });
+    expect(teed?.plan).toBe(full);
+    expect(fullTextForRecord(full, teed?.plan)).toBeUndefined();
+  });
+
+  test("a throwing tee never breaks the envelope it observes", async () => {
+    const envelope = await buildEnvelope(input, "mac", 1_800_000_000_000, "T", KEY, false, "claude", undefined, undefined,
+      "proj", undefined, plan, undefined, undefined, undefined, () => { throw new Error("tee exploded"); });
+    expect(typeof envelope?.blob).toBe("string");
   });
 });
 
@@ -1233,6 +1356,70 @@ await child.exited;
       )).toBe(true);
       expect(trace.some((e) => e.event === "create" && e.sessionId === sid)).toBe(true);
       expect(trace.some((e) => e.event === "retire" && e.sessionId === sid)).toBe(true);
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  }, 20000);
+
+  test("a rollout-proven codex exec one-shot is suppressed even though it has a real user message", async () => {
+    const { home, ccDir, sessionsDir } = await setupHookHome("http://127.0.0.1:9");
+    try {
+      const sid = "019f4a6a-88ad-7ed3-8f0a-cdfcc32ff990";
+      // A local discovery-suppression marker is not an existing visible session. Creation guards must
+      // still run, or `codex exec resume <retired-id>` could turn the marker back into a phone row.
+      await writeFile(join(sessionsDir, `${sid}.json`), JSON.stringify({
+        pid: process.pid, tuiPid: process.pid, retiredAt: Date.now(),
+        machine: "m", label: "api-status", ts: Date.now() - 3_600_000, agent: "codex",
+      }));
+      const transcript = join(home, "exec-rollout.jsonl");
+      await writeFile(transcript, [
+        JSON.stringify({ type: "session_meta", payload: {
+          id: sid, source: "exec", originator: "codex_exec", thread_source: "user",
+        } }),
+        JSON.stringify({ type: "event_msg", payload: { type: "user_message", message: "Review this tree" } }),
+      ].join("\n"));
+      await spawnHook(codexEntry, home, {
+        session_id: sid, hook_event_name: "UserPromptSubmit", prompt: "Review this tree",
+        cwd: "/x/api-status", transcript_path: transcript,
+      });
+
+      const marker = await readLocalRecord(sessionsDir, sid);
+      expect(marker).toMatchObject({ agent: "codex", retiredAt: expect.any(Number) });
+      expect(marker?.blob).toBeUndefined();
+      const trace = (await readFile(join(ccDir, "session-trace.log"), "utf8"))
+        .trim().split("\n").map((line) => JSON.parse(line) as Record<string, unknown>);
+      expect(trace).toContainEqual(expect.objectContaining({
+        event: "suppress", sessionId: sid, guard: "codex-headless-exec",
+      }));
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  }, 20000);
+
+  test("a genuine interactive hook revives a retired-owner marker by rebuilding the row", async () => {
+    const { home, sessionsDir } = await setupHookHome("http://127.0.0.1:9");
+    try {
+      const sid = "019f4a6a-88ad-7ed3-8f0a-cdfcc32ff989";
+      await writeFile(join(sessionsDir, `${sid}.json`), JSON.stringify({
+        pid: process.pid, tuiPid: process.pid, retiredAt: Date.now(),
+        machine: "m", label: "api-status", ts: Date.now() - 3_600_000, agent: "codex",
+      }));
+      const transcript = join(home, "interactive-rollout.jsonl");
+      await writeFile(transcript, [
+        JSON.stringify({ type: "session_meta", payload: {
+          id: sid, source: "vscode", originator: "Claude Code", thread_source: "user",
+        } }),
+        JSON.stringify({ type: "event_msg", payload: { type: "user_message", message: "Real prompt" } }),
+      ].join("\n"));
+      await spawnHook(codexEntry, home, {
+        session_id: sid, hook_event_name: "UserPromptSubmit", prompt: "Real prompt",
+        cwd: "/x/api-status", transcript_path: transcript,
+      });
+
+      const revived = await readLocalRecord(sessionsDir, sid);
+      expect(revived?.retiredAt).toBeUndefined();
+      expect(revived).toMatchObject({ agent: "codex", lastEvent: "working", op: "update" });
+      expect(typeof revived?.blob).toBe("string");
     } finally {
       await rm(home, { recursive: true, force: true });
     }
@@ -2247,6 +2434,94 @@ describe("runHook gone-strike teardown (revoked pairing stops POSTing forever)",
       srv.close();
       await rm(home, { recursive: true, force: true });
     }
+  }, 20000);
+});
+
+// --- runHook attentionKind reaches the RECORD, not just the wire (the LAN/worker render split) ----
+//
+// buildEnvelope derives `attentionKind:"userInput"` itself for a Codex PreToolUse request_user_input,
+// but runHook used to hand trackSession its own LOCAL `attentionKind` variable — which only the Codex
+// Plan-picker branch ever sets. So the commonest question there is went out labelled a question on the
+// worker envelope and UNLABELLED on the session record, and lan-frames.ts (which rebuilds its frames
+// from the record, never from the POST) rendered the very same prompt as a plain approval over LAN.
+// This spawns the REAL codex entry against a capturing server so the wire envelope and the on-disk
+// record are compared as the field sees them — a direct trackSessionAt call, which is how the record's
+// own append-last test shipped green, cannot catch a caller passing the wrong argument.
+describe("runHook attentionKind (the record caches what the envelope POSTed)", () => {
+  const rawKey = new Uint8Array(32).fill(9);
+  const codexEntry = join(import.meta.dir, "codex-status.ts");
+
+  /** A 200 server that records every POSTed envelope. */
+  function startCapturingServer(): { url: string; posts: Array<Record<string, unknown>>; close: () => void } {
+    const posts: Array<Record<string, unknown>> = [];
+    const server = Bun.serve({
+      port: 0,
+      async fetch(request) {
+        try { posts.push(await request.json() as Record<string, unknown>); } catch { /* non-JSON probe */ }
+        return new Response("{}", { status: 200 });
+      },
+    });
+    return { url: `http://127.0.0.1:${server.port}`, posts, close: () => server.stop(true) };
+  }
+
+  async function runCodexHook(input: Record<string, unknown>): Promise<{
+    record: SessionRecord | undefined;
+    envelope: Record<string, unknown> | undefined;
+  }> {
+    const srv = startCapturingServer();
+    const home = await mkdtemp(join(tmpdir(), "cc-hook-attn-"));
+    try {
+      const ccDir = join(home, ".config", "cc-status");
+      await mkdir(join(ccDir, "sessions"), { recursive: true });
+      await writeFile(join(ccDir, "config.json"), JSON.stringify({
+        url: srv.url, pairingId: "p", pcSecret: "s", e2eKeyB64: b64url(rawKey),
+      }));
+      // A real rollout with a user_message: without it the codex-promptless-rollout create guard
+      // suppresses the session entirely and no event of any kind is produced.
+      const rollout = join(home, "rollout.jsonl");
+      await writeFile(rollout, [
+        JSON.stringify({ type: "session_meta", payload: { id: input.session_id, source: "vscode" } }),
+        JSON.stringify({ type: "event_msg", payload: { type: "user_message", message: "Ship it" } }),
+      ].join("\n"));
+      const proc = spawnTestProcess({
+        cmd: ["bun", codexEntry],
+        env: isolatedTestEnv(home),
+        stdin: Buffer.from(JSON.stringify({ transcript_path: rollout, ...input })),
+        stdout: "ignore",
+        stderr: "ignore",
+      });
+      await proc.exited;
+      const path = join(ccDir, "sessions", `${input.session_id as string}.json`);
+      let record: SessionRecord | undefined;
+      try { record = JSON.parse(await readFile(path, "utf8")) as SessionRecord; } catch { record = undefined; }
+      // The event POST is the one carrying this session's op — a provisional reconcile can precede it.
+      const envelope = srv.posts.find((post) => post.sessionId === input.session_id);
+      return { record, envelope };
+    } finally {
+      srv.close();
+      await rm(home, { recursive: true, force: true });
+    }
+  }
+
+  test("a Codex request_user_input stamps attentionKind on BOTH the envelope and the record", async () => {
+    const { record, envelope } = await runCodexHook({
+      session_id: "attn-userinput", hook_event_name: "PreToolUse", tool_name: "request_user_input",
+      cwd: "/x/api-status",
+      tool_input: { questions: [{ id: "scope", header: "Scope", question: "Keep the API?" }] },
+    });
+    expect(envelope).toMatchObject({ op: "update", prio: 1, attentionKind: "userInput" });
+    expect(record?.attentionKind).toBe("userInput");
+    // The whole point: the two channels describe the same event with the same discriminator.
+    expect(record?.attentionKind).toBe(envelope?.attentionKind as string);
+  }, 20000);
+
+  test("an ordinary Codex tool event leaves both the envelope and the record without one", async () => {
+    const { record, envelope } = await runCodexHook({
+      session_id: "attn-plain", hook_event_name: "PreToolUse", tool_name: "shell",
+      cwd: "/x/api-status",
+    });
+    expect(envelope).not.toHaveProperty("attentionKind");
+    expect(record?.attentionKind).toBeUndefined();
   }, 20000);
 });
 

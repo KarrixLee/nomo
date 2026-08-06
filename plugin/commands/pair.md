@@ -33,13 +33,13 @@ two). Use **exactly one** of these two forms:
 **Default browser path** (no argument) — opens the QR page, code stays hidden from the terminal:
 
 ```
-"${CLAUDE_PLUGIN_ROOT}/scripts/run.sh" "${CLAUDE_PLUGIN_ROOT}/dist/pair.mjs"
+NOMOR="${CLAUDE_PLUGIN_ROOT}"; NOMOS="$HOME/.config/cc-status/hook-shim.sh"; [ -n "$NOMOR" ] && [ -x "$NOMOR/scripts/run.sh" ] && exec "$NOMOR/scripts/run.sh" "$NOMOR/dist/pair.mjs"; [ -x "$NOMOS" ] && exec "$NOMOS" pair; echo "Nomo could not find its installed files - reinstall the nomo plugin."; exit 1
 ```
 
 **Code path** (`$ARGUMENTS` is `code`) — no browser; prints the one-time code into this terminal:
 
 ```
-"${CLAUDE_PLUGIN_ROOT}/scripts/run.sh" "${CLAUDE_PLUGIN_ROOT}/dist/pair.mjs" --show-code
+NOMOR="${CLAUDE_PLUGIN_ROOT}"; NOMOS="$HOME/.config/cc-status/hook-shim.sh"; [ -n "$NOMOR" ] && [ -x "$NOMOR/scripts/run.sh" ] && exec "$NOMOR/scripts/run.sh" "$NOMOR/dist/pair.mjs" --show-code; [ -x "$NOMOS" ] && exec "$NOMOS" pair --show-code; echo "Nomo could not find its installed files - reinstall the nomo plugin."; exit 1
 ```
 
 - The **default** command registers the pairing, writes a themed pairing **page**, and **opens it in
@@ -79,7 +79,7 @@ Now run this exact command **in the background** — with the Bash tool's `run_i
 option, **not** a trailing `&`:
 
 ```
-"${CLAUDE_PLUGIN_ROOT}/scripts/run.sh" "${CLAUDE_PLUGIN_ROOT}/dist/pair.mjs" wait
+NOMOR="${CLAUDE_PLUGIN_ROOT}"; NOMOS="$HOME/.config/cc-status/hook-shim.sh"; [ -n "$NOMOR" ] && [ -x "$NOMOR/scripts/run.sh" ] && exec "$NOMOR/scripts/run.sh" "$NOMOR/dist/pair.mjs" wait; [ -x "$NOMOS" ] && exec "$NOMOS" pair wait; echo "Nomo could not find its installed files - reinstall the nomo plugin."; exit 1
 ```
 
 - It polls for up to 10 minutes until the phone claims the pairing, then prints `Paired with … ✓`

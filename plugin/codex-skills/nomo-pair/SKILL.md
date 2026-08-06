@@ -51,13 +51,13 @@ wait for it to finish (it returns in a second or two). Use **exactly one** of th
 **Default browser path** (no argument) — opens the QR page, code stays hidden from the transcript:
 
 ```
-exec "<ROOT>/scripts/run.sh" "<ROOT>/dist/pair.mjs"
+NOMOR="<ROOT>"; NOMOS="$HOME/.config/cc-status/hook-shim.sh"; [ -n "$NOMOR" ] && [ -x "$NOMOR/scripts/run.sh" ] && exec "$NOMOR/scripts/run.sh" "$NOMOR/dist/pair.mjs"; [ -x "$NOMOS" ] && exec "$NOMOS" pair; echo "Nomo could not find its installed files - reinstall the nomo plugin."; exit 1
 ```
 
 **Code path** (the argument is `code`) — no browser; prints the one-time code into this transcript:
 
 ```
-exec "<ROOT>/scripts/run.sh" "<ROOT>/dist/pair.mjs" --show-code
+NOMOR="<ROOT>"; NOMOS="$HOME/.config/cc-status/hook-shim.sh"; [ -n "$NOMOR" ] && [ -x "$NOMOR/scripts/run.sh" ] && exec "$NOMOR/scripts/run.sh" "$NOMOR/dist/pair.mjs" --show-code; [ -x "$NOMOS" ] && exec "$NOMOS" pair --show-code; echo "Nomo could not find its installed files - reinstall the nomo plugin."; exit 1
 ```
 
 - The **default** command writes a themed pairing **page** and **opens it in the default browser**,
@@ -86,7 +86,7 @@ exec "<ROOT>/scripts/run.sh" "<ROOT>/dist/pair.mjs" --show-code
 Run this exact command once and relay its final line:
 
 ```
-exec "<ROOT>/scripts/run.sh" "<ROOT>/dist/pair.mjs" wait --timeout 60
+NOMOR="<ROOT>"; NOMOS="$HOME/.config/cc-status/hook-shim.sh"; [ -n "$NOMOR" ] && [ -x "$NOMOR/scripts/run.sh" ] && exec "$NOMOR/scripts/run.sh" "$NOMOR/dist/pair.mjs" wait --timeout 60; [ -x "$NOMOS" ] && exec "$NOMOS" pair wait --timeout 60; echo "Nomo could not find its installed files - reinstall the nomo plugin."; exit 1
 ```
 
 - On `Paired with … ✓` / `Paired ✓`, tell the user pairing is complete and this machine's Codex
@@ -99,8 +99,9 @@ exec "<ROOT>/scripts/run.sh" "<ROOT>/dist/pair.mjs" wait --timeout 60
 Codex's lifecycle hooks occasionally fail to fire a turn's `Stop` (upstream openai/codex#16430,
 #30835), so a finished turn can silently never reach the phone. Codex's separate, stable `notify`
 channel is the backstop: on turn completion Codex runs the configured program with one JSON payload
-appended. Point it at Nomo's chain wrapper, which fires `dist/codex-notify.mjs` (a de-duplicated
-"done" push) **and** forwards the payload to any pre-existing notify program so nothing breaks.
+appended. Point it at Nomo's version-stable hook shim, which fires `dist/codex-notify.mjs` (a
+de-duplicated "done" push) **and** forwards the payload to any pre-existing notify program so nothing
+breaks.
 
 Run this exact command and relay its final line (do NOT hand-edit `config.toml` yourself — the
 command is idempotent: it unwraps any previous Nomo wrapping, preserves the innermost original
@@ -108,7 +109,7 @@ notify program, and rewrites the `notify` line exactly once, backing up the prev
 `config.toml.bak-nomo`):
 
 ```
-exec "<ROOT>/scripts/run.sh" "<ROOT>/dist/pair.mjs" wire-notify "<ROOT>"
+NOMOR="<ROOT>"; NOMOS="$HOME/.config/cc-status/hook-shim.sh"; [ -n "$NOMOR" ] && [ -x "$NOMOR/scripts/run.sh" ] && exec "$NOMOR/scripts/run.sh" "$NOMOR/dist/pair.mjs" wire-notify "<ROOT>"; [ -x "$NOMOS" ] && exec "$NOMOS" pair wire-notify "<ROOT>"; echo "Nomo could not find its installed files - reinstall the nomo plugin."; exit 1
 ```
 
 - `Codex notify backstop wired…` / `already wired — no change` → done; tell the user this makes
@@ -120,6 +121,12 @@ exec "<ROOT>/scripts/run.sh" "<ROOT>/dist/pair.mjs" wire-notify "<ROOT>"
 Codex appends the JSON payload as the final array element at runtime, so the wrapper passes it to
 `codex-notify.mjs` and (after `--`) re-invokes the original program with that payload in the exact
 position it expects.
+
+The value written names `~/.config/cc-status/hook-shim.sh`, which is deliberately OUTSIDE the
+version-pinned plugin directory: `config.toml` is written once and never revisited, so a path inside
+the installed version would break for good at the next plugin update. Users wired by an older release
+are repaired automatically on their next Codex session start — this step is still worth running, it
+just isn't the only thing keeping the backstop alive any more.
 
 ## Step 5 — trust the hooks (fresh install only)
 

@@ -40,7 +40,7 @@ treat as `status`.
 Run this exact command with your chosen sub-command and relay its single output line to the user:
 
 ```
-exec "<ROOT>/scripts/run.sh" "<ROOT>/dist/codex-permission.mjs" <on|off|status>
+NOMOR="<ROOT>"; NOMOS="$HOME/.config/cc-status/hook-shim.sh"; [ -n "$NOMOR" ] && [ -x "$NOMOR/scripts/run.sh" ] && exec "$NOMOR/scripts/run.sh" "$NOMOR/dist/codex-permission.mjs" <on|off|status>; [ -x "$NOMOS" ] && exec "$NOMOS" codex-permission <on|off|status>; echo "Nomo could not find its installed files - reinstall the nomo plugin."; exit 1
 ```
 
 This is a local, read-only toggle — no network, no approval needed. It **always exits 0** — "OFF" is

@@ -2,16 +2,17 @@ import { createRequire } from "node:module";
 var __require = /* @__PURE__ */ createRequire(import.meta.url);
 
 // src/entries/cc-watchdog.ts
-import { readdir as readdir3, readFile as readFile4, unlink as unlink4 } from "node:fs/promises";
+import { readdir as readdir4, readFile as readFile8, unlink as unlink4 } from "node:fs/promises";
 import { readFileSync as readFileSync2, statSync as statSync3, unlinkSync } from "node:fs";
 import { hostname as hostname4 } from "node:os";
-import { basename as basename4 } from "node:path";
+import { basename as basename5 } from "node:path";
 
 // src/core/crypto.ts
 var textEncoder = new TextEncoder;
 var textDecoder = new TextDecoder;
 var HKDF_INFO = textEncoder.encode("nomo-cc-e2e-v1");
 var RATCHET_INFO_PREFIX = "nomo-cc-ratchet-v1|";
+var LAN_INFO_PREFIX = "nomo-lan-v1|";
 var ECDH_P256 = { name: "ECDH", namedCurve: "P-256" };
 function bytesToBase64(bytes) {
   let binary = "";
@@ -37,6 +38,16 @@ function fromB64url(s) {
 async function deriveE2EKey(qrSecret, phoneNonce) {
   const ikm = await crypto.subtle.importKey("raw", qrSecret, "HKDF", false, ["deriveBits"]);
   const bits = await crypto.subtle.deriveBits({ name: "HKDF", hash: "SHA-256", salt: phoneNonce, info: HKDF_INFO }, ikm, 256);
+  return new Uint8Array(bits);
+}
+async function deriveLanKey(e2eKey, pairingId) {
+  const ikm = await crypto.subtle.importKey("raw", e2eKey, "HKDF", false, ["deriveBits"]);
+  const bits = await crypto.subtle.deriveBits({
+    name: "HKDF",
+    hash: "SHA-256",
+    salt: new Uint8Array(0),
+    info: textEncoder.encode(LAN_INFO_PREFIX + pairingId)
+  }, ikm, 256);
   return new Uint8Array(bits);
 }
 async function generateEphemeralKeyPair() {
@@ -81,9 +92,9 @@ async function sha256Hex(s) {
 }
 
 // src/core/adapter.ts
-import { execFile } from "node:child_process";
+import { execFile as execFile2 } from "node:child_process";
 import { readdir, readFile as readFile2, stat as stat2 } from "node:fs/promises";
-import { promisify } from "node:util";
+import { promisify as promisify2 } from "node:util";
 import { basename, join as join2 } from "node:path";
 
 // src/core/shared.ts
@@ -92,7 +103,7 @@ import { appendFileSync, existsSync, readFileSync, statSync, truncateSync } from
 import { execFileSync, spawn } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "1.4.15";
+var PLUGIN_VERSION = "1.7.9";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -102,6 +113,20 @@ function debugToken(value) {
 function formatPlanPickerDebug(input) {
   const value = `${debugToken(input.version ?? PLUGIN_VERSION)} ev:${debugToken(input.event)} cls:${debugToken(input.classifier)} mk:${input.marker ?? "0"} dq:${input.daemon ?? "na"}(${input.daemonDisposition ?? "na"}) ttl:${debugToken(input.ttl ?? "-")} by:${input.by}`;
   return Array.from(value).slice(0, DBG_BLOB_TEXT_MAX_CHARS).join("");
+}
+function formatDecisionHoldDebug(input) {
+  const value = `${debugToken(input.version ?? PLUGIN_VERSION)} ev:hold req:${debugToken(input.requestId.slice(0, 8))} pid:${input.pid}`;
+  return Array.from(value).slice(0, DBG_BLOB_TEXT_MAX_CHARS).join("");
+}
+var CODEX_BRIDGE_DOWN_MARKER = "cxbridge:down";
+function appendCodexBridgeMarker(dbg, down) {
+  if (typeof dbg !== "string" || dbg.length === 0)
+    return dbg;
+  const bare = dbg.split(` ${CODEX_BRIDGE_DOWN_MARKER}`).join("");
+  if (!down)
+    return bare;
+  const next = `${bare} ${CODEX_BRIDGE_DOWN_MARKER}`;
+  return Array.from(next).length <= DBG_BLOB_TEXT_MAX_CHARS ? next : bare;
 }
 var CC_DIR = `${process.env.HOME}/.config/cc-status`;
 var SESSION_TRACE_PATH = `${CC_DIR}/session-trace.log`;
@@ -180,6 +205,23 @@ function appendFittedPlanAndDebug(base, plan, dbg) {
   const withDebug = { ...withPlan, dbg: capped };
   return sealedBlobChars(encoder.encode(JSON.stringify(withDebug)).length) <= BLOB_FIT_CHARS ? withDebug : withPlan;
 }
+var RECORD_FULL_TEXT_MAX_CHARS = 262144;
+var RECORD_FULL_TEXT_TRUNCATION_MARKER = `
+…[truncated]`;
+function fullTextForRecord(full, fitted) {
+  if (typeof full !== "string" || full.length === 0)
+    return;
+  if (full === fitted)
+    return;
+  const chars = Array.from(full);
+  if (chars.length <= RECORD_FULL_TEXT_MAX_CHARS)
+    return full;
+  const markerChars = Array.from(RECORD_FULL_TEXT_TRUNCATION_MARKER).length;
+  return chars.slice(0, RECORD_FULL_TEXT_MAX_CHARS - markerChars).join("") + RECORD_FULL_TEXT_TRUNCATION_MARKER;
+}
+function recordFullTextIsComplete(value) {
+  return !value.endsWith(RECORD_FULL_TEXT_TRUNCATION_MARKER);
+}
 async function flagExists(path) {
   try {
     await access(path);
@@ -211,6 +253,81 @@ async function codexAppServerSocketAvailable(socketPath = codexAppServerSocketPa
   } catch {
     return false;
   }
+}
+var CODEX_DAEMON_START_ARGS = ["app-server", "daemon", "start"];
+var CODEX_DAEMON_START_TIMEOUT_MS = 8000;
+var CODEX_DAEMON_SOCKET_WAIT_MS = 4000;
+var CODEX_DAEMON_SOCKET_POLL_MS = 250;
+async function startCodexAppServerDaemon(deps = {}) {
+  const trace = deps.trace ?? ((event) => traceSession(event));
+  const probe = deps.probe ?? (() => codexAppServerSocketAvailable());
+  const sleep = deps.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
+  const command = deps.codexPath ?? "codex";
+  const timeoutMs = deps.timeoutMs ?? CODEX_DAEMON_START_TIMEOUT_MS;
+  const socketWaitMs = deps.socketWaitMs ?? CODEX_DAEMON_SOCKET_WAIT_MS;
+  const spawnFn = deps.spawnFn ?? ((cmd, args) => spawn(cmd, [...args], { stdio: "ignore" }));
+  let exit;
+  try {
+    exit = await new Promise((resolve) => {
+      let settled = false;
+      const done = (value) => {
+        if (settled)
+          return;
+        settled = true;
+        resolve(value);
+      };
+      let child;
+      try {
+        child = spawnFn(command, CODEX_DAEMON_START_ARGS);
+      } catch {
+        done("error");
+        return;
+      }
+      const timer = setTimeout(() => {
+        try {
+          child.kill("SIGTERM");
+        } catch {}
+        done("timeout");
+      }, timeoutMs);
+      timer.unref?.();
+      child.on("error", () => {
+        clearTimeout(timer);
+        done("error");
+      });
+      child.on("exit", (code, signal) => {
+        clearTimeout(timer);
+        done({ code, signal });
+      });
+    });
+  } catch {
+    exit = "error";
+  }
+  if (exit === "error" || exit === "timeout" || exit.code !== 0) {
+    trace({
+      event: "codex-daemon-start",
+      outcome: exit === "error" ? "spawn-failed" : exit === "timeout" ? "timeout" : "nonzero-exit",
+      ...typeof exit === "object" ? { code: exit.code, signal: exit.signal } : {}
+    });
+    return false;
+  }
+  const deadline = socketWaitMs;
+  for (let waited = 0;; waited += CODEX_DAEMON_SOCKET_POLL_MS) {
+    let up = false;
+    try {
+      up = await probe();
+    } catch {
+      up = false;
+    }
+    if (up) {
+      trace({ event: "codex-daemon-start", outcome: "started", waitedMs: waited });
+      return true;
+    }
+    if (waited >= deadline)
+      break;
+    await sleep(CODEX_DAEMON_SOCKET_POLL_MS);
+  }
+  trace({ event: "codex-daemon-start", outcome: "no-socket", waitedMs: deadline });
+  return false;
 }
 function lastHookPath(agent) {
   return `${CC_DIR}/last-hook-${agent}`;
@@ -451,15 +568,37 @@ async function completePendingPairing(pending, configPath, opts = {}) {
 function isWatchdogCommand(psCommand) {
   return psCommand.includes("cc-watchdog");
 }
-function formatWatchdogPidfile(pid, version = PLUGIN_VERSION) {
-  return `${pid} ${version}`;
+function watchdogBuildStamp(path = WATCHDOG_PATH) {
+  try {
+    const bytes = readFileSync(path);
+    let hash = 2166136261;
+    for (let i = 0;i < bytes.length; i++) {
+      hash ^= bytes[i];
+      hash = Math.imul(hash, 16777619);
+    }
+    return (hash >>> 0).toString(36);
+  } catch {
+    return;
+  }
+}
+function watchdogBuildDiffers(incumbent, current) {
+  if (incumbent === undefined || current === undefined)
+    return false;
+  return incumbent !== current;
+}
+function formatWatchdogPidfile(pid, version = PLUGIN_VERSION, build) {
+  return `${pid} ${version}${typeof build === "string" && build.length > 0 ? ` ${build}` : ""}`;
 }
 function parseWatchdogPidfile(raw) {
-  const [pidField, versionField] = raw.trim().split(/\s+/);
+  const [pidField, versionField, buildField] = raw.trim().split(/\s+/);
   const pid = Number.parseInt(pidField ?? "", 10);
   if (!Number.isFinite(pid) || pid <= 0)
     return null;
-  return { pid, ...typeof versionField === "string" && versionField.length > 0 ? { version: versionField } : {} };
+  return {
+    pid,
+    ...typeof versionField === "string" && versionField.length > 0 ? { version: versionField } : {},
+    ...typeof buildField === "string" && buildField.length > 0 ? { build: buildField } : {}
+  };
 }
 function watchdogHolderIsLive(pid, deps = {}) {
   const isAlive = deps.isAlive ?? pidAlive;
@@ -479,6 +618,7 @@ function ensureWatchdog(deps = {}) {
       return;
     const pidPath = deps.pidPath ?? WATCHDOG_PID_PATH;
     const version = deps.version ?? PLUGIN_VERSION;
+    const build = "build" in deps ? deps.build : watchdogBuildStamp();
     const readPidfile = deps.readPidfile ?? (() => {
       try {
         return readFileSync(pidPath, "utf8");
@@ -494,7 +634,7 @@ function ensureWatchdog(deps = {}) {
     const raw = readPidfile();
     const holder = typeof raw === "string" ? parseWatchdogPidfile(raw) : null;
     if (holder && watchdogHolderIsLive(holder.pid, deps)) {
-      if (holder.version === version)
+      if (holder.version === version && !watchdogBuildDiffers(holder.build, build))
         return;
       try {
         killPid(holder.pid, "SIGTERM");
@@ -509,6 +649,81 @@ async function readRecord(sessionId, sessionsDir = SESSIONS_DIR) {
   } catch {
     return null;
   }
+}
+async function stampPermissionDetailFullAt(sessionsDir, sessionId, permissionDetailFull) {
+  try {
+    const record = await readRecord(sessionId, sessionsDir);
+    if (!record)
+      return;
+    if (record.permissionDetailFull === permissionDetailFull)
+      return;
+    await atomicWrite(`${sessionsDir}/${sessionId}.json`, JSON.stringify({ ...record, permissionDetailFull }), 384);
+  } catch {}
+}
+async function stampPermissionDetailFull(sessionId, permissionDetailFull) {
+  return stampPermissionDetailFullAt(SESSIONS_DIR, sessionId, permissionDetailFull);
+}
+var DECISION_HOLD_SUFFIX = ".hold";
+function decisionHoldFileName(sessionId) {
+  return `${sessionId}${DECISION_HOLD_SUFFIX}`;
+}
+async function writeDecisionHoldAt(sessionsDir, sessionId, hold) {
+  try {
+    await atomicWrite(`${sessionsDir}/${decisionHoldFileName(sessionId)}`, JSON.stringify(hold), 384);
+  } catch {}
+}
+async function clearDecisionHoldAt(sessionsDir, sessionId, pid, beforeUnlink) {
+  const path = `${sessionsDir}/${decisionHoldFileName(sessionId)}`;
+  try {
+    const raw = await readFile(path, "utf8").catch(() => {
+      return;
+    });
+    if (raw !== undefined) {
+      let owner;
+      try {
+        owner = JSON.parse(raw).pid;
+      } catch {
+        owner = undefined;
+      }
+      if (typeof owner === "number" && owner !== pid)
+        return false;
+    }
+    if (beforeUnlink !== undefined) {
+      try {
+        await beforeUnlink();
+      } catch {}
+    }
+    await unlink(path).catch(() => {});
+    return true;
+  } catch {
+    return false;
+  }
+}
+async function settleDecisionHoldRecordAt(sessionsDir, sessionId, patch) {
+  try {
+    const record = await readRecord(sessionId, sessionsDir);
+    if (!record)
+      return;
+    if (record.op !== "update" || record.prio !== 1)
+      return;
+    await atomicWrite(`${sessionsDir}/${sessionId}.json`, JSON.stringify({ ...record, ...patch }), 384);
+  } catch {}
+}
+async function readDecisionHoldAt(sessionsDir, sessionId) {
+  try {
+    return JSON.parse(await readFile(`${sessionsDir}/${decisionHoldFileName(sessionId)}`, "utf8"));
+  } catch {
+    return null;
+  }
+}
+async function writeDecisionHold(sessionId, hold) {
+  return writeDecisionHoldAt(SESSIONS_DIR, sessionId, hold);
+}
+async function clearDecisionHold(sessionId, pid, beforeUnlink) {
+  return clearDecisionHoldAt(SESSIONS_DIR, sessionId, pid, beforeUnlink);
+}
+async function settleDecisionHoldRecord(sessionId, patch) {
+  return settleDecisionHoldRecordAt(SESSIONS_DIR, sessionId, patch);
 }
 async function readPrefix(path, maxBytes) {
   const fh = await open(path, "r");
@@ -635,8 +850,313 @@ function codexCompanionBrokerEvidence(pid, ancestorsOf = pidAncestors, commandOf
   return null;
 }
 
-// src/core/adapter.ts
+// src/core/terminal-focus.ts
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 var execFileP = promisify(execFile);
+var OSASCRIPT_TIMEOUT_MS = 4000;
+var HERDR_TIMEOUT_MS = 4000;
+var HERDR_TAB_ID = /^[A-Za-z0-9:]+$/;
+function commandTokens(command) {
+  return command.trim().split(/\s+/).filter(Boolean);
+}
+function isHerdrCommand(command) {
+  if (typeof command !== "string")
+    return false;
+  const executable = commandTokens(command)[0]?.replace(/^['"]|['"]$/g, "");
+  return typeof executable === "string" && /(?:^|\/)herdr$/.test(executable);
+}
+function isHerdrServer(command) {
+  return typeof command === "string" && isHerdrCommand(command) && commandTokens(command).slice(1).includes("server");
+}
+function ancestryContainsHerdr(pid, ancestorsOf = pidAncestors, commandOf = pidCommand) {
+  let ancestors;
+  try {
+    ancestors = ancestorsOf(pid);
+  } catch {
+    ancestors = [];
+  }
+  for (const candidate of [pid, ...ancestors]) {
+    try {
+      if (isHerdrCommand(commandOf(candidate)))
+        return true;
+    } catch {}
+  }
+  return false;
+}
+function recordTitleMatchesPane(recordTitle, paneTitle) {
+  if (typeof recordTitle !== "string" || typeof paneTitle !== "string")
+    return false;
+  if (recordTitle === paneTitle)
+    return true;
+  const match = /^(.*?)(?:\u2026|\.{3})$/.exec(recordTitle);
+  return !!match && match[1].length > 0 && paneTitle.startsWith(match[1]);
+}
+function correlateHerdrPane(context, panes) {
+  let candidates = context.agent === "claude" ? panes.filter((pane) => pane.agent === "claude" && recordTitleMatchesPane(context.record.title, pane.terminal_title_stripped)) : panes.filter((pane) => pane.agent === "codex" && typeof context.record.origin?.cwd === "string" && context.record.origin.cwd.length > 0 && pane.cwd === context.record.origin.cwd);
+  if (candidates.length > 1) {
+    const working = candidates.filter((pane) => pane.agent_status === "working");
+    if (working.length > 0)
+      candidates = working;
+  }
+  return candidates.length === 1 ? candidates[0] : undefined;
+}
+function parseHerdrPanes(stdout) {
+  const parsed = JSON.parse(stdout);
+  const panes = parsed?.result?.panes;
+  if (!Array.isArray(panes))
+    throw new Error("invalid herdr pane list");
+  return panes.filter((value) => {
+    if (!value || typeof value !== "object")
+      return false;
+    const pane = value;
+    return typeof pane.agent === "string" && typeof pane.tab_id === "string";
+  });
+}
+function parsePsProcesses(stdout) {
+  const out = [];
+  for (const line of stdout.split(/\r?\n/)) {
+    const match = /^\s*(\d+)\s+(\S+)\s+(.+)$/.exec(line);
+    if (!match)
+      continue;
+    const pid = Number.parseInt(match[1], 10);
+    if (Number.isFinite(pid))
+      out.push({ pid, tty: match[2], command: match[3] });
+  }
+  return out;
+}
+async function runExecFile(file, args, options, deps) {
+  if (deps.execFile)
+    return deps.execFile(file, args, options);
+  const { stdout, stderr } = await execFileP(file, args, options);
+  return { stdout: String(stdout), stderr: String(stderr) };
+}
+var TERMINAL_APPS = [
+  { id: "terminal-app", bundleId: "com.apple.Terminal", match: /\/Terminal\.app\// },
+  { id: "iterm2", bundleId: "com.googlecode.iterm2", match: /\/iTerm\.app\/|\/iTerm2\.app\// },
+  { id: "ghostty", bundleId: "com.mitchellh.ghostty", match: /\/Ghostty\.app\/|(?:^|\/)ghostty(?:\s|$)/ },
+  { id: "wezterm", bundleId: "com.github.wez.wezterm", match: /\/WezTerm\.app\/|(?:^|\/)wezterm(?:-gui)?(?:\s|$)/ },
+  { id: "alacritty", bundleId: "org.alacritty", match: /\/Alacritty\.app\/|(?:^|\/)alacritty(?:\s|$)/ },
+  { id: "kitty", bundleId: "net.kovidgoyal.kitty", match: /\/kitty\.app\/|(?:^|\/)kitty(?:\s|$)/ },
+  { id: "hyper", bundleId: "co.zeit.hyper", match: /\/Hyper\.app\// },
+  { id: "warp", bundleId: "dev.warp.Warp-Stable", match: /\/Warp\.app\// },
+  { id: "vscode", bundleId: "com.microsoft.VSCode", match: /\/Visual Studio Code\.app\/|\/Code\.app\/|Code Helper/ }
+];
+function owningTerminalApp(pid, ancestorsOf = pidAncestors, commandOf = pidCommand) {
+  let chain = [];
+  try {
+    chain = ancestorsOf(pid);
+  } catch {
+    chain = [];
+  }
+  for (const candidate of [pid, ...chain]) {
+    let command;
+    try {
+      command = commandOf(candidate);
+    } catch {
+      continue;
+    }
+    if (typeof command !== "string" || command.length === 0)
+      continue;
+    const app = TERMINAL_APPS.find((a) => a.match.test(command));
+    if (app)
+      return app;
+  }
+  return;
+}
+function ttyDevicePath(raw) {
+  if (typeof raw !== "string")
+    return;
+  const trimmed = raw.trim();
+  if (!isRealTty(trimmed))
+    return;
+  const bare = trimmed.startsWith("/dev/") ? trimmed.slice(5) : trimmed;
+  const name = /^s[0-9]+$/.test(bare) ? `tty${bare}` : bare;
+  const path = `/dev/${name}`;
+  return isTtyDevicePath(path) ? path : undefined;
+}
+function isTtyDevicePath(path) {
+  return /^\/dev\/tty[a-z0-9]+$/.test(path);
+}
+function terminalAppScript(devPath) {
+  if (!isTtyDevicePath(devPath))
+    throw new Error("unsafe tty path");
+  return [
+    `tell application "Terminal"`,
+    `	repeat with w in windows`,
+    `		repeat with t in tabs of w`,
+    `			if tty of t is "${devPath}" then`,
+    `				set selected of t to true`,
+    `				set index of w to 1`,
+    `				activate`,
+    `				return "ok"`,
+    `			end if`,
+    `		end repeat`,
+    `	end repeat`,
+    `end tell`,
+    `return "none"`
+  ].join(`
+`);
+}
+function iterm2Script(devPath) {
+  if (!isTtyDevicePath(devPath))
+    throw new Error("unsafe tty path");
+  return [
+    `tell application "iTerm"`,
+    `	repeat with w in windows`,
+    `		repeat with t in tabs of w`,
+    `			repeat with s in sessions of t`,
+    `				if tty of s is "${devPath}" then`,
+    `					select s`,
+    `					select t`,
+    `					select w`,
+    `					activate`,
+    `					return "ok"`,
+    `				end if`,
+    `			end repeat`,
+    `		end repeat`,
+    `	end repeat`,
+    `end tell`,
+    `return "none"`
+  ].join(`
+`);
+}
+function activateScript(bundleId) {
+  if (!/^[A-Za-z0-9.\-]+$/.test(bundleId))
+    throw new Error("unsafe bundle id");
+  return `tell application id "${bundleId}" to activate`;
+}
+async function runOsascript(script) {
+  const { stdout } = await execFileP("osascript", ["-e", script], { timeout: OSASCRIPT_TIMEOUT_MS });
+  return String(stdout).trim();
+}
+async function ttyViaPs(pid) {
+  try {
+    const { stdout } = await execFileP("ps", ["-o", "tty=", "-p", String(pid)]);
+    const trimmed = stdout.trim();
+    return trimmed.length > 0 ? trimmed : undefined;
+  } catch {
+    return;
+  }
+}
+function note(deps, event) {
+  try {
+    deps.trace?.(event);
+  } catch {}
+}
+async function focusHerdr(pid, deps, ancestorsOf, commandOf) {
+  const context = deps.context;
+  if (!context) {
+    note(deps, { event: "terminal-focus", pid, result: "ambiguous", reason: "herdr-ambiguous" });
+    return { ok: false, reason: "herdr-ambiguous" };
+  }
+  let pane;
+  try {
+    const listed = await runExecFile("herdr", ["pane", "list"], { timeout: HERDR_TIMEOUT_MS }, deps);
+    if ((listed.exitCode ?? 0) !== 0)
+      throw new Error("herdr pane list failed");
+    pane = correlateHerdrPane(context, parseHerdrPanes(String(listed.stdout)));
+  } catch {
+    note(deps, { event: "terminal-focus", pid, result: "unsupported", reason: "herdr-cli-failed" });
+    return { ok: false, reason: "herdr-cli-failed" };
+  }
+  if (!pane) {
+    note(deps, { event: "terminal-focus", pid, result: "ambiguous", reason: "herdr-ambiguous" });
+    return { ok: false, reason: "herdr-ambiguous" };
+  }
+  if (!HERDR_TAB_ID.test(pane.tab_id)) {
+    note(deps, { event: "terminal-focus", pid, result: "unsupported", reason: "herdr-cli-failed" });
+    return { ok: false, reason: "herdr-cli-failed" };
+  }
+  try {
+    const focused = await runExecFile("herdr", ["tab", "focus", pane.tab_id], { timeout: HERDR_TIMEOUT_MS }, deps);
+    if ((focused.exitCode ?? 0) !== 0)
+      throw new Error("herdr tab focus failed");
+  } catch {
+    note(deps, { event: "terminal-focus", pid, result: "unsupported", reason: "herdr-cli-failed" });
+    return { ok: false, reason: "herdr-cli-failed" };
+  }
+  let app;
+  try {
+    const scanned = await runExecFile("ps", ["-axo", "pid=,tty=,args="], { timeout: HERDR_TIMEOUT_MS }, deps);
+    if ((scanned.exitCode ?? 0) === 0) {
+      const apps = new Map;
+      for (const process2 of parsePsProcesses(String(scanned.stdout))) {
+        if (!isRealTty(process2.tty) || !isHerdrCommand(process2.command) || isHerdrServer(process2.command))
+          continue;
+        const owner = owningTerminalApp(process2.pid, ancestorsOf, commandOf);
+        if (owner)
+          apps.set(owner.bundleId, owner);
+      }
+      if (apps.size === 1)
+        app = apps.values().next().value;
+    }
+  } catch {}
+  if (!app) {
+    note(deps, { event: "terminal-focus", pid, result: "focused", via: "herdr", reason: "focused-detached" });
+    return { ok: true, via: "herdr", reason: "focused-detached" };
+  }
+  try {
+    await (deps.osascript ?? runOsascript)(activateScript(app.bundleId));
+    note(deps, { event: "terminal-focus", pid, result: "focused", via: "herdr", app: app.id, reason: "herdr-focused" });
+    return { ok: true, via: "herdr", reason: "herdr-focused" };
+  } catch {
+    note(deps, { event: "terminal-focus", pid, result: "osascript-failed", app: app.id });
+    return { ok: false, reason: "osascript-failed" };
+  }
+}
+async function focusTerminalForPid(pid, deps = {}) {
+  try {
+    if ((deps.platform ?? process.platform) !== "darwin") {
+      note(deps, { event: "terminal-focus", pid, result: "unsupported", why: "not-darwin" });
+      return { ok: false, reason: "unsupported" };
+    }
+    const ancestorsOf = deps.ancestorsOf ?? pidAncestors;
+    const commandOf = deps.commandOf ?? pidCommand;
+    if (ancestryContainsHerdr(pid, ancestorsOf, commandOf)) {
+      return await focusHerdr(pid, deps, ancestorsOf, commandOf);
+    }
+    let rawTty;
+    try {
+      rawTty = await (deps.ttyOf ?? ttyViaPs)(pid);
+    } catch {
+      rawTty = undefined;
+    }
+    const devPath = ttyDevicePath(rawTty);
+    if (devPath === undefined) {
+      note(deps, { event: "terminal-focus", pid, result: "no-tty", tty: rawTty ?? "" });
+      return { ok: false, reason: "no-tty" };
+    }
+    const app = owningTerminalApp(pid, ancestorsOf, commandOf);
+    if (!app) {
+      note(deps, { event: "terminal-focus", pid, result: "unsupported", why: "no-owning-app" });
+      return { ok: false, reason: "unsupported" };
+    }
+    const osascript = deps.osascript ?? runOsascript;
+    try {
+      if (app.id === "terminal-app" || app.id === "iterm2") {
+        const script = app.id === "terminal-app" ? terminalAppScript(devPath) : iterm2Script(devPath);
+        const out = await osascript(script);
+        if (String(out).trim() === "ok") {
+          const via = app.id === "terminal-app" ? "terminal-app" : "iterm2";
+          note(deps, { event: "terminal-focus", pid, result: "focused", via, app: app.id });
+          return { ok: true, via };
+        }
+      }
+      await osascript(activateScript(app.bundleId));
+      note(deps, { event: "terminal-focus", pid, result: "focused", via: "app-activate", app: app.id });
+      return { ok: true, via: "app-activate" };
+    } catch {
+      note(deps, { event: "terminal-focus", pid, result: "osascript-failed", app: app.id });
+      return { ok: false, reason: "osascript-failed" };
+    }
+  } catch {
+    return { ok: false, reason: "osascript-failed" };
+  }
+}
+
+// src/core/adapter.ts
+var execFileP2 = promisify2(execFile2);
 var claudeToolDetail = {
   Bash: "running",
   Edit: "editing",
@@ -1333,7 +1853,7 @@ function rolloutPathFromLsof(output) {
 }
 async function rolloutViaLsof(pid) {
   try {
-    const { stdout } = await execFileP("lsof", ["-a", "-p", String(pid), "-Fn"]);
+    const { stdout } = await execFileP2("lsof", ["-a", "-p", String(pid), "-Fn"]);
     return rolloutPathFromLsof(stdout);
   } catch {
     return;
@@ -1497,12 +2017,12 @@ function labelFromCwd(cwd) {
   return b.length > 0 ? b : "session";
 }
 async function runPs() {
-  const { stdout } = await execFileP("ps", ["-axo", "pid=,tty=,args="]);
+  const { stdout } = await execFileP2("ps", ["-axo", "pid=,tty=,args="]);
   return stdout;
 }
 async function cwdViaLsof(pid) {
   try {
-    const { stdout } = await execFileP("lsof", ["-a", "-p", String(pid), "-d", "cwd", "-Fn"]);
+    const { stdout } = await execFileP2("lsof", ["-a", "-p", String(pid), "-d", "cwd", "-Fn"]);
     for (const line of stdout.split(`
 `))
       if (line.startsWith("n"))
@@ -1514,7 +2034,7 @@ async function cwdViaLsof(pid) {
 }
 async function processStartedAtViaPs(pid) {
   try {
-    const { stdout } = await execFileP("ps", ["-p", String(pid), "-o", "lstart="]);
+    const { stdout } = await execFileP2("ps", ["-p", String(pid), "-o", "lstart="]);
     const value = Date.parse(stdout.trim());
     return Number.isFinite(value) ? value : undefined;
   } catch {
@@ -1532,12 +2052,16 @@ async function codexDiscoverLive(known, deps = {}) {
   } catch {
     return [];
   }
-  const knownPids = new Set(known.map((r) => r.pid).filter((p) => typeof p === "number" && Number.isFinite(p)));
+  const retiredOwners = known.filter((r) => r.agent === "codex" && typeof r.retiredAt === "number" && Number.isFinite(r.retiredAt));
+  const knownPids = new Set(known.filter((r) => !retiredOwners.includes(r)).flatMap((r) => [r.pid, r.tuiPid]).filter((p) => typeof p === "number" && Number.isFinite(p)));
   const tuis = filterCodexTuis(parseCodexProcs(output), knownPids);
   const out = [];
   for (const { pid } of tuis) {
     const cwd = await cwdOf(pid);
     const startedAt = await startedAtOf(pid);
+    const retiredOwner = retiredOwners.find((r) => r.tuiPid === pid || r.pid === pid);
+    if (retiredOwner && typeof startedAt === "number" && Number.isFinite(startedAt) && startedAt <= retiredOwner.retiredAt)
+      continue;
     const label = labelFromCwd(cwd);
     let active = false;
     try {
@@ -1555,9 +2079,9 @@ async function codexDiscoverLive(known, deps = {}) {
   }
   return out;
 }
-async function ttyViaPs(pid) {
+async function ttyViaPs2(pid) {
   try {
-    const { stdout } = await execFileP("ps", ["-o", "tty=", "-p", String(pid)]);
+    const { stdout } = await execFileP2("ps", ["-o", "tty=", "-p", String(pid)]);
     const trimmed = stdout.trim();
     return trimmed.length > 0 ? trimmed : undefined;
   } catch {
@@ -1566,7 +2090,7 @@ async function ttyViaPs(pid) {
 }
 async function startTimeViaPs(pid) {
   try {
-    const { stdout } = await execFileP("ps", ["-o", "lstart=", "-p", String(pid)]);
+    const { stdout } = await execFileP2("ps", ["-o", "lstart=", "-p", String(pid)]);
     const parsed = Date.parse(stdout.trim());
     return Number.isFinite(parsed) ? parsed : undefined;
   } catch {
@@ -1681,9 +2205,13 @@ async function claudeLocateTuiPid(ctx, deps = {}) {
       noteLocate(deps, "no-candidate");
       return;
     }
+    if (ancestryContainsHerdr(pid, deps.ancestorsOf ?? pidAncestors, deps.commandOf ?? pidCommand)) {
+      noteLocate(deps, "record-pid");
+      return pid;
+    }
     let tty;
     try {
-      tty = await (deps.ttyOf ?? ttyViaPs)(pid);
+      tty = await (deps.ttyOf ?? ttyViaPs2)(pid);
     } catch {
       tty = undefined;
     }
@@ -1735,6 +2263,7 @@ function codexSubagentSource(source) {
 function codexRolloutCreationEvidence(prefix) {
   let subagent = false;
   let hasUserMessage = false;
+  let headlessExec = false;
   for (const line of prefix.split(`
 `)) {
     if (!line.trim())
@@ -1751,12 +2280,16 @@ function codexRolloutCreationEvidence(prefix) {
       continue;
     const r = row;
     const payload = r.payload;
-    if (r.type === "session_meta" && codexSubagentSource(payload?.source ?? r.source))
-      subagent = true;
+    if (r.type === "session_meta") {
+      if (codexSubagentSource(payload?.source ?? r.source))
+        subagent = true;
+      if (payload?.originator === "codex_exec" || payload?.source === "exec")
+        headlessExec = true;
+    }
     if (r.type === "event_msg" && payload?.type === "user_message")
       hasUserMessage = true;
   }
-  return { subagent, hasUserMessage };
+  return { subagent, hasUserMessage, headlessExec };
 }
 async function codexSessionCreationSuppression(sessionId, transcriptPrefix, transcriptPath, input = {}, deps = {}) {
   const evidence = codexRolloutCreationEvidence(transcriptPrefix);
@@ -1764,6 +2297,12 @@ async function codexSessionCreationSuppression(sessionId, transcriptPrefix, tran
     return {
       guard: "codex-subagent-rollout",
       reason: "session_meta.source is a subagent variant"
+    };
+  }
+  if (evidence.headlessExec) {
+    return {
+      guard: "codex-headless-exec",
+      reason: "session_meta identifies a non-interactive codex exec run"
     };
   }
   const hookName = typeof input.hook_event_name === "string" ? input.hook_event_name : "";
@@ -1904,311 +2443,6 @@ function adapterFor(agent) {
   return agent === "codex" ? codexAdapter : claudeAdapter;
 }
 var allAdapters = [claudeAdapter, codexAdapter];
-
-// src/core/terminal-focus.ts
-import { execFile as execFile2 } from "node:child_process";
-import { promisify as promisify2 } from "node:util";
-var execFileP2 = promisify2(execFile2);
-var OSASCRIPT_TIMEOUT_MS = 4000;
-var HERDR_TIMEOUT_MS = 4000;
-var HERDR_TAB_ID = /^[A-Za-z0-9:]+$/;
-function commandTokens(command) {
-  return command.trim().split(/\s+/).filter(Boolean);
-}
-function isHerdrCommand(command) {
-  if (typeof command !== "string")
-    return false;
-  const executable = commandTokens(command)[0]?.replace(/^['"]|['"]$/g, "");
-  return typeof executable === "string" && /(?:^|\/)herdr$/.test(executable);
-}
-function isHerdrServer(command) {
-  return typeof command === "string" && isHerdrCommand(command) && commandTokens(command).slice(1).includes("server");
-}
-function ancestryContainsHerdr(pid, ancestorsOf, commandOf) {
-  let ancestors;
-  try {
-    ancestors = ancestorsOf(pid);
-  } catch {
-    ancestors = [];
-  }
-  for (const candidate of [pid, ...ancestors]) {
-    try {
-      if (isHerdrCommand(commandOf(candidate)))
-        return true;
-    } catch {}
-  }
-  return false;
-}
-function recordTitleMatchesPane(recordTitle, paneTitle) {
-  if (typeof recordTitle !== "string" || typeof paneTitle !== "string")
-    return false;
-  if (recordTitle === paneTitle)
-    return true;
-  const match = /^(.*?)(?:\u2026|\.{3})$/.exec(recordTitle);
-  return !!match && match[1].length > 0 && paneTitle.startsWith(match[1]);
-}
-function correlateHerdrPane(context, panes) {
-  let candidates = context.agent === "claude" ? panes.filter((pane) => pane.agent === "claude" && recordTitleMatchesPane(context.record.title, pane.terminal_title_stripped)) : panes.filter((pane) => pane.agent === "codex" && typeof context.record.origin?.cwd === "string" && context.record.origin.cwd.length > 0 && pane.cwd === context.record.origin.cwd);
-  if (candidates.length > 1) {
-    const working = candidates.filter((pane) => pane.agent_status === "working");
-    if (working.length > 0)
-      candidates = working;
-  }
-  return candidates.length === 1 ? candidates[0] : undefined;
-}
-function parseHerdrPanes(stdout) {
-  const parsed = JSON.parse(stdout);
-  const panes = parsed?.result?.panes;
-  if (!Array.isArray(panes))
-    throw new Error("invalid herdr pane list");
-  return panes.filter((value) => {
-    if (!value || typeof value !== "object")
-      return false;
-    const pane = value;
-    return typeof pane.agent === "string" && typeof pane.tab_id === "string";
-  });
-}
-function parsePsProcesses(stdout) {
-  const out = [];
-  for (const line of stdout.split(/\r?\n/)) {
-    const match = /^\s*(\d+)\s+(\S+)\s+(.+)$/.exec(line);
-    if (!match)
-      continue;
-    const pid = Number.parseInt(match[1], 10);
-    if (Number.isFinite(pid))
-      out.push({ pid, tty: match[2], command: match[3] });
-  }
-  return out;
-}
-async function runExecFile(file, args, options, deps) {
-  if (deps.execFile)
-    return deps.execFile(file, args, options);
-  const { stdout, stderr } = await execFileP2(file, args, options);
-  return { stdout: String(stdout), stderr: String(stderr) };
-}
-var TERMINAL_APPS = [
-  { id: "terminal-app", bundleId: "com.apple.Terminal", match: /\/Terminal\.app\// },
-  { id: "iterm2", bundleId: "com.googlecode.iterm2", match: /\/iTerm\.app\/|\/iTerm2\.app\// },
-  { id: "ghostty", bundleId: "com.mitchellh.ghostty", match: /\/Ghostty\.app\/|(?:^|\/)ghostty(?:\s|$)/ },
-  { id: "wezterm", bundleId: "com.github.wez.wezterm", match: /\/WezTerm\.app\/|(?:^|\/)wezterm(?:-gui)?(?:\s|$)/ },
-  { id: "alacritty", bundleId: "org.alacritty", match: /\/Alacritty\.app\/|(?:^|\/)alacritty(?:\s|$)/ },
-  { id: "kitty", bundleId: "net.kovidgoyal.kitty", match: /\/kitty\.app\/|(?:^|\/)kitty(?:\s|$)/ },
-  { id: "hyper", bundleId: "co.zeit.hyper", match: /\/Hyper\.app\// },
-  { id: "warp", bundleId: "dev.warp.Warp-Stable", match: /\/Warp\.app\// },
-  { id: "vscode", bundleId: "com.microsoft.VSCode", match: /\/Visual Studio Code\.app\/|\/Code\.app\/|Code Helper/ }
-];
-function owningTerminalApp(pid, ancestorsOf = pidAncestors, commandOf = pidCommand) {
-  let chain = [];
-  try {
-    chain = ancestorsOf(pid);
-  } catch {
-    chain = [];
-  }
-  for (const candidate of [pid, ...chain]) {
-    let command;
-    try {
-      command = commandOf(candidate);
-    } catch {
-      continue;
-    }
-    if (typeof command !== "string" || command.length === 0)
-      continue;
-    const app = TERMINAL_APPS.find((a) => a.match.test(command));
-    if (app)
-      return app;
-  }
-  return;
-}
-function ttyDevicePath(raw) {
-  if (typeof raw !== "string")
-    return;
-  const trimmed = raw.trim();
-  if (!isRealTty(trimmed))
-    return;
-  const bare = trimmed.startsWith("/dev/") ? trimmed.slice(5) : trimmed;
-  const name = /^s[0-9]+$/.test(bare) ? `tty${bare}` : bare;
-  const path = `/dev/${name}`;
-  return isTtyDevicePath(path) ? path : undefined;
-}
-function isTtyDevicePath(path) {
-  return /^\/dev\/tty[a-z0-9]+$/.test(path);
-}
-function terminalAppScript(devPath) {
-  if (!isTtyDevicePath(devPath))
-    throw new Error("unsafe tty path");
-  return [
-    `tell application "Terminal"`,
-    `	repeat with w in windows`,
-    `		repeat with t in tabs of w`,
-    `			if tty of t is "${devPath}" then`,
-    `				set selected of t to true`,
-    `				set index of w to 1`,
-    `				activate`,
-    `				return "ok"`,
-    `			end if`,
-    `		end repeat`,
-    `	end repeat`,
-    `end tell`,
-    `return "none"`
-  ].join(`
-`);
-}
-function iterm2Script(devPath) {
-  if (!isTtyDevicePath(devPath))
-    throw new Error("unsafe tty path");
-  return [
-    `tell application "iTerm"`,
-    `	repeat with w in windows`,
-    `		repeat with t in tabs of w`,
-    `			repeat with s in sessions of t`,
-    `				if tty of s is "${devPath}" then`,
-    `					select s`,
-    `					select t`,
-    `					select w`,
-    `					activate`,
-    `					return "ok"`,
-    `				end if`,
-    `			end repeat`,
-    `		end repeat`,
-    `	end repeat`,
-    `end tell`,
-    `return "none"`
-  ].join(`
-`);
-}
-function activateScript(bundleId) {
-  if (!/^[A-Za-z0-9.\-]+$/.test(bundleId))
-    throw new Error("unsafe bundle id");
-  return `tell application id "${bundleId}" to activate`;
-}
-async function runOsascript(script) {
-  const { stdout } = await execFileP2("osascript", ["-e", script], { timeout: OSASCRIPT_TIMEOUT_MS });
-  return String(stdout).trim();
-}
-async function ttyViaPs2(pid) {
-  try {
-    const { stdout } = await execFileP2("ps", ["-o", "tty=", "-p", String(pid)]);
-    const trimmed = stdout.trim();
-    return trimmed.length > 0 ? trimmed : undefined;
-  } catch {
-    return;
-  }
-}
-function note(deps, event) {
-  try {
-    deps.trace?.(event);
-  } catch {}
-}
-async function focusHerdr(pid, deps, ancestorsOf, commandOf) {
-  const context = deps.context;
-  if (!context) {
-    note(deps, { event: "terminal-focus", pid, result: "ambiguous", reason: "herdr-ambiguous" });
-    return { ok: false, reason: "herdr-ambiguous" };
-  }
-  let pane;
-  try {
-    const listed = await runExecFile("herdr", ["pane", "list"], { timeout: HERDR_TIMEOUT_MS }, deps);
-    if ((listed.exitCode ?? 0) !== 0)
-      throw new Error("herdr pane list failed");
-    pane = correlateHerdrPane(context, parseHerdrPanes(String(listed.stdout)));
-  } catch {
-    note(deps, { event: "terminal-focus", pid, result: "unsupported", reason: "herdr-cli-failed" });
-    return { ok: false, reason: "herdr-cli-failed" };
-  }
-  if (!pane) {
-    note(deps, { event: "terminal-focus", pid, result: "ambiguous", reason: "herdr-ambiguous" });
-    return { ok: false, reason: "herdr-ambiguous" };
-  }
-  if (!HERDR_TAB_ID.test(pane.tab_id)) {
-    note(deps, { event: "terminal-focus", pid, result: "unsupported", reason: "herdr-cli-failed" });
-    return { ok: false, reason: "herdr-cli-failed" };
-  }
-  try {
-    const focused = await runExecFile("herdr", ["tab", "focus", pane.tab_id], { timeout: HERDR_TIMEOUT_MS }, deps);
-    if ((focused.exitCode ?? 0) !== 0)
-      throw new Error("herdr tab focus failed");
-  } catch {
-    note(deps, { event: "terminal-focus", pid, result: "unsupported", reason: "herdr-cli-failed" });
-    return { ok: false, reason: "herdr-cli-failed" };
-  }
-  let app;
-  try {
-    const scanned = await runExecFile("ps", ["-axo", "pid=,tty=,args="], { timeout: HERDR_TIMEOUT_MS }, deps);
-    if ((scanned.exitCode ?? 0) === 0) {
-      const apps = new Map;
-      for (const process2 of parsePsProcesses(String(scanned.stdout))) {
-        if (!isRealTty(process2.tty) || !isHerdrCommand(process2.command) || isHerdrServer(process2.command))
-          continue;
-        const owner = owningTerminalApp(process2.pid, ancestorsOf, commandOf);
-        if (owner)
-          apps.set(owner.bundleId, owner);
-      }
-      if (apps.size === 1)
-        app = apps.values().next().value;
-    }
-  } catch {}
-  if (!app) {
-    note(deps, { event: "terminal-focus", pid, result: "focused", via: "herdr", reason: "focused-detached" });
-    return { ok: true, via: "herdr", reason: "focused-detached" };
-  }
-  try {
-    await (deps.osascript ?? runOsascript)(activateScript(app.bundleId));
-    note(deps, { event: "terminal-focus", pid, result: "focused", via: "herdr", app: app.id, reason: "herdr-focused" });
-    return { ok: true, via: "herdr", reason: "herdr-focused" };
-  } catch {
-    note(deps, { event: "terminal-focus", pid, result: "osascript-failed", app: app.id });
-    return { ok: false, reason: "osascript-failed" };
-  }
-}
-async function focusTerminalForPid(pid, deps = {}) {
-  try {
-    if ((deps.platform ?? process.platform) !== "darwin") {
-      note(deps, { event: "terminal-focus", pid, result: "unsupported", why: "not-darwin" });
-      return { ok: false, reason: "unsupported" };
-    }
-    let rawTty;
-    try {
-      rawTty = await (deps.ttyOf ?? ttyViaPs2)(pid);
-    } catch {
-      rawTty = undefined;
-    }
-    const devPath = ttyDevicePath(rawTty);
-    if (devPath === undefined) {
-      note(deps, { event: "terminal-focus", pid, result: "no-tty", tty: rawTty ?? "" });
-      return { ok: false, reason: "no-tty" };
-    }
-    const ancestorsOf = deps.ancestorsOf ?? pidAncestors;
-    const commandOf = deps.commandOf ?? pidCommand;
-    if (ancestryContainsHerdr(pid, ancestorsOf, commandOf)) {
-      return await focusHerdr(pid, deps, ancestorsOf, commandOf);
-    }
-    const app = owningTerminalApp(pid, ancestorsOf, commandOf);
-    if (!app) {
-      note(deps, { event: "terminal-focus", pid, result: "unsupported", why: "no-owning-app" });
-      return { ok: false, reason: "unsupported" };
-    }
-    const osascript = deps.osascript ?? runOsascript;
-    try {
-      if (app.id === "terminal-app" || app.id === "iterm2") {
-        const script = app.id === "terminal-app" ? terminalAppScript(devPath) : iterm2Script(devPath);
-        const out = await osascript(script);
-        if (String(out).trim() === "ok") {
-          const via = app.id === "terminal-app" ? "terminal-app" : "iterm2";
-          note(deps, { event: "terminal-focus", pid, result: "focused", via, app: app.id });
-          return { ok: true, via };
-        }
-      }
-      await osascript(activateScript(app.bundleId));
-      note(deps, { event: "terminal-focus", pid, result: "focused", via: "app-activate", app: app.id });
-      return { ok: true, via: "app-activate" };
-    } catch {
-      note(deps, { event: "terminal-focus", pid, result: "osascript-failed", app: app.id });
-      return { ok: false, reason: "osascript-failed" };
-    }
-  } catch {
-    return { ok: false, reason: "osascript-failed" };
-  }
-}
 
 // src/core/codex-app-server-client.ts
 var DEFAULT_RECONNECT_DELAY_MS = 1000;
@@ -3109,16 +3343,1539 @@ class CodexProxyTransport {
 // src/core/codex-remote-input.ts
 import { hostname as hostname3 } from "node:os";
 
+// src/core/lan-listener.ts
+import { createServer } from "node:http";
+import { readFile as readFile4 } from "node:fs/promises";
+import { networkInterfaces } from "node:os";
+
+// src/core/lan-frames.ts
+import { execFile as execFile3 } from "node:child_process";
+import { watch } from "node:fs";
+import { readdir as readdir2, readFile as readFile3 } from "node:fs/promises";
+import { basename as basename2 } from "node:path";
+import { promisify as promisify3 } from "node:util";
+
+// src/core/lan-wire.ts
+var LAN_PATH = "/v1/lan";
+var LAN_ENVELOPE_VERSION = 1;
+var LAN_TTL_MS = 120000;
+var LAN_FUTURE_SKEW_MS = 30000;
+var LAN_NONCE_MAX_CHARS = 64;
+var LAN_REQUEST_ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
+var LAN_ANSWER_BLOB_MAX_CHARS = 3072;
+var LAN_COMMAND_BLOB_MAX_CHARS = 8192;
+var LAN_FRAMES_WAIT_MAX_MS = 25000;
+function parseLanFramesRequest(payload) {
+  const sinceSeq = payload.sinceSeq;
+  const waitMs = payload.waitMs;
+  if (typeof sinceSeq !== "number" || !Number.isInteger(sinceSeq))
+    return null;
+  if (sinceSeq < 0 || sinceSeq > Number.MAX_SAFE_INTEGER)
+    return null;
+  if (typeof waitMs !== "number" || !Number.isInteger(waitMs))
+    return null;
+  if (waitMs < 0 || waitMs > LAN_FRAMES_WAIT_MAX_MS)
+    return null;
+  return { sinceSeq, waitMs };
+}
+var LAN_SESSION_ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
+function parseLanReadRequest(payload) {
+  const what = payload.what;
+  const sessionId = payload.sessionId;
+  if (what !== "plan" && what !== "permission-detail")
+    return null;
+  if (typeof sessionId !== "string" || !LAN_SESSION_ID_RE.test(sessionId))
+    return null;
+  return { what, sessionId };
+}
+var LAN_STATE_PATH = `${CC_DIR}/lan.json`;
+function parseLanState(raw) {
+  try {
+    const parsed = JSON.parse(raw);
+    if (typeof parsed !== "object" || parsed === null)
+      return null;
+    const s = parsed;
+    if (typeof s.port !== "number" || !Number.isInteger(s.port) || s.port < 1 || s.port > 65535)
+      return null;
+    if (typeof s.lid !== "string" || s.lid.length === 0 || s.lid.length > 128)
+      return null;
+    const createdAt = typeof s.createdAt === "number" && Number.isFinite(s.createdAt) ? s.createdAt : 0;
+    return { port: s.port, lid: s.lid, createdAt };
+  } catch {
+    return null;
+  }
+}
+function parseLanEnvelope(plain) {
+  if (typeof plain !== "object" || plain === null)
+    return null;
+  const e = plain;
+  if (e.v !== LAN_ENVELOPE_VERSION)
+    return null;
+  if (typeof e.op !== "string" || e.op.length === 0 || e.op.length > 32)
+    return null;
+  if (typeof e.ts !== "number" || !Number.isFinite(e.ts))
+    return null;
+  if (typeof e.nonce !== "string" || e.nonce.length === 0 || e.nonce.length > LAN_NONCE_MAX_CHARS)
+    return null;
+  if (typeof e.payload !== "object" || e.payload === null || Array.isArray(e.payload))
+    return null;
+  return { v: e.v, op: e.op, ts: e.ts, nonce: e.nonce, payload: e.payload };
+}
+function lanEnvelopeIsFresh(ts, now) {
+  if (ts > now + LAN_FUTURE_SKEW_MS)
+    return false;
+  return now - ts <= LAN_TTL_MS;
+}
+function isLoopbackAddress(address) {
+  if (typeof address !== "string" || address.length === 0)
+    return false;
+  const bare = address.startsWith("::ffff:") ? address.slice(7) : address;
+  return bare === "::1" || bare === "127.0.0.1" || bare.startsWith("127.");
+}
+function lanRunningUnderTest() {
+  return process.argv.some((arg) => arg === "test" || arg.endsWith(".test.ts"));
+}
+
+// src/core/session-state.ts
+var SESSION_STATE_STALE_MS = 86400000;
+var STATE_HOLD_MAX_AGE_MS = 600000;
+var CC_STATUS_MAX_AGE_MS = 600000;
+var CC_STATUS_FUTURE_SKEW_MS = 5000;
+var CC_PROC_START_TOLERANCE_MS = 5000;
+var CC_IDLE_DONE_GRACE_MS = 3000;
+var MONTHS = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
+function parseCcProcStart(value) {
+  if (typeof value !== "string")
+    return;
+  const m = /^\s*[A-Za-z]{3}\s+([A-Za-z]{3})\s+(\d{1,2})\s+(\d{2}):(\d{2}):(\d{2})\s+(\d{4})\s*$/.exec(value);
+  if (!m)
+    return;
+  const month = MONTHS.indexOf(m[1].toLowerCase());
+  if (month < 0)
+    return;
+  const day = Number(m[2]);
+  const utc = Date.UTC(Number(m[6]), month, day, Number(m[3]), Number(m[4]), Number(m[5]));
+  if (!Number.isFinite(utc))
+    return;
+  return new Date(utc).getUTCDate() === day ? utc : undefined;
+}
+function parseCcSessionFile(raw) {
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed))
+    return null;
+  const f = parsed;
+  if (typeof f.pid !== "number" || !Number.isFinite(f.pid))
+    return null;
+  if (typeof f.sessionId !== "string" || f.sessionId.length === 0)
+    return null;
+  const str = (key) => typeof f[key] === "string" && f[key].length > 0 ? f[key] : undefined;
+  const num = (key) => typeof f[key] === "number" && Number.isFinite(f[key]) ? f[key] : undefined;
+  return {
+    pid: f.pid,
+    sessionId: f.sessionId,
+    ...str("cwd") ? { cwd: str("cwd") } : {},
+    ...num("startedAt") !== undefined ? { startedAt: num("startedAt") } : {},
+    ...str("procStart") ? { procStart: str("procStart") } : {},
+    ...str("version") ? { version: str("version") } : {},
+    ...str("kind") ? { kind: str("kind") } : {},
+    ...str("entrypoint") ? { entrypoint: str("entrypoint") } : {},
+    ...str("name") ? { name: str("name") } : {},
+    ...str("nameSource") ? { nameSource: str("nameSource") } : {},
+    ...str("status") ? { status: str("status") } : {},
+    ...num("updatedAt") !== undefined ? { updatedAt: num("updatedAt") } : {},
+    ...num("statusUpdatedAt") !== undefined ? { statusUpdatedAt: num("statusUpdatedAt") } : {}
+  };
+}
+function ccOpinion(file, join3, now) {
+  if (!file)
+    return null;
+  if (typeof join3.pid !== "number" || !Number.isFinite(join3.pid) || file.pid !== join3.pid)
+    return null;
+  if (file.sessionId !== join3.sessionId)
+    return null;
+  const probed = join3.procStartedAt;
+  if (typeof probed !== "number" || !Number.isFinite(probed))
+    return null;
+  const claimed = typeof file.startedAt === "number" && Number.isFinite(file.startedAt) ? file.startedAt : parseCcProcStart(file.procStart);
+  if (typeof claimed !== "number")
+    return null;
+  if (Math.abs(claimed - probed) > CC_PROC_START_TOLERANCE_MS)
+    return null;
+  if (file.status !== "busy" && file.status !== "idle")
+    return null;
+  const at = file.statusUpdatedAt;
+  if (typeof at !== "number" || !Number.isFinite(at))
+    return null;
+  if (now - at >= CC_STATUS_MAX_AGE_MS)
+    return null;
+  if (at - now > CC_STATUS_FUTURE_SKEW_MS)
+    return null;
+  return {
+    status: file.status,
+    statusUpdatedAt: at,
+    ...file.name && file.nameSource === "derived" ? { name: file.name } : {}
+  };
+}
+var finite = (value) => typeof value === "number" && Number.isFinite(value);
+var filled = (value) => typeof value === "string" && value.length > 0;
+function buildStatePlaintext(record, status, at, titleFallback) {
+  const agent = record.agent === "codex" ? "codex" : "claude";
+  const base = {
+    status,
+    title: filled(record.title) ? record.title : filled(titleFallback) ? titleFallback : "",
+    machine: typeof record.machine === "string" ? record.machine : "",
+    label: typeof record.label === "string" ? record.label : "",
+    ...adapterFor(agent).blobAgentFields,
+    ...finite(record.turnStartedAt) ? { turnStartedAt: record.turnStartedAt } : {},
+    ...filled(record.model) ? { model: record.model } : {},
+    at: Math.floor(at / 1000)
+  };
+  const dbg = agent === "codex" ? formatPlanPickerDebug({
+    event: status === "done" ? "done" : "working",
+    classifier: status === "done" ? "done" : "resolved",
+    marker: "0",
+    by: "wd"
+  }) : undefined;
+  return appendFittedPlanAndDebug(base, undefined, dbg);
+}
+function stateHoldLive(hold, holdPidAlive, now) {
+  if (!hold || !filled(hold.blob))
+    return false;
+  if (!finite(hold.at))
+    return false;
+  if (now - hold.at > STATE_HOLD_MAX_AGE_MS)
+    return false;
+  if (!finite(hold.pid) || holdPidAlive !== true)
+    return false;
+  return true;
+}
+function computeSessionState(input) {
+  const { sessionId, record, pairingId, hold, pidAlive: pidAlive2, holdPidAlive, cc, ccProcStartedAt, correctives, now } = input;
+  if (record === null) {
+    return { state: "ended", terminal: true, ts: now, why: "reap", blob: { kind: "last" }, agent: "claude" };
+  }
+  if (!filled(record.blob))
+    return null;
+  if (pairingId === undefined || record.pairingId !== pairingId)
+    return null;
+  const agent = record.agent === "codex" ? "codex" : "claude";
+  const ts = finite(record.ts) ? record.ts : now;
+  const startedAt = finite(record.sessionStartedAt) ? { startedAt: record.sessionStartedAt } : {};
+  const sealed = { kind: "sealed", value: record.blob };
+  const asking = record.attentionKind === "userInput" ? { attentionKind: "userInput" } : {};
+  const of = (state, why, blob, at, terminal = false) => ({ state, terminal, ts: at, why, blob, agent, ...startedAt });
+  if (correctives?.ended === true)
+    return of("ended", "end", sealed, ts, true);
+  if (record.op === "end")
+    return of("ended", "end", sealed, ts, true);
+  if (finite(record.ts) && now - record.ts > SESSION_STATE_STALE_MS)
+    return of("ended", "stale", sealed, ts, true);
+  if (!pidAlive2)
+    return of("ended", "reap", sealed, ts, true);
+  const ccUsable = agent === "claude" && record.provisional !== true;
+  const opinion = ccUsable ? ccOpinion(cc, { pid: record.pid, sessionId, procStartedAt: ccProcStartedAt }, now) : null;
+  const suffix = (base) => agent === "codex" ? `${base}/cx` : base;
+  const recordDone = correctives?.done === true || record.op === "done" || record.lastEvent === "done";
+  if (recordDone) {
+    const heldBack = opinion?.status === "busy" && opinion.statusUpdatedAt > ts;
+    if (!heldBack) {
+      return of("done", opinion?.status === "idle" ? "done+cc" : suffix("done"), { kind: "plain", value: buildStatePlaintext(record, "done", ts, opinion?.name) }, ts, false);
+    }
+  }
+  if (stateHoldLive(hold, holdPidAlive, now)) {
+    return {
+      state: "decisionPending",
+      terminal: false,
+      ts,
+      why: "hold",
+      blob: { kind: "sealed", value: hold.blob },
+      agent,
+      ...startedAt,
+      ...asking
+    };
+  }
+  if (!recordDone && opinion?.status === "idle" && record.prio !== 1 && record.lastEvent !== "needsAttention" && opinion.statusUpdatedAt > ts + CC_IDLE_DONE_GRACE_MS) {
+    return of("done", "done+cc", { kind: "plain", value: buildStatePlaintext(record, "done", opinion.statusUpdatedAt, opinion.name) }, ts, false);
+  }
+  if (record.prio === 1) {
+    const why = finite(record.attentionStalledAt) ? "attn/net" : "attn";
+    return { ...of("needsAttention", why, sealed, ts, false), ...asking };
+  }
+  const busy = opinion?.status === "busy" && opinion.statusUpdatedAt > ts;
+  return of("working", busy ? "work+cc" : suffix("work"), recordDone ? { kind: "plain", value: buildStatePlaintext(record, "working", now, opinion?.name) } : sealed, ts, false);
+}
+
+// src/core/lan-frames.ts
+var execFileP3 = promisify3(execFile3);
+var LAN_FRAME_RETIRE_GRACE_MS = 60000;
+var LAN_FRAMES_WATCH_DEBOUNCE_MS = 100;
+var LAN_FRAMES_WAITERS_MAX = 4;
+var LAN_FRAME_SESSION_STALE_MS = 86400000;
+var LAN_HOLD_MAX_AGE_MS = 600000;
+var LAN_STATE_SESSIONS_MAX = 20;
+var CC_SESSIONS_DIR = `${process.env.HOME}/.claude/sessions`;
+var CC_CAPABILITY_LATCH_SWEEPS = 5;
+function lanFrameSessionLive(record, now, isAlive) {
+  if (typeof record.retiredAt === "number" && Number.isFinite(record.retiredAt))
+    return false;
+  if (typeof record.pid !== "number" || !Number.isFinite(record.pid))
+    return false;
+  if (typeof record.ts !== "number" || !Number.isFinite(record.ts))
+    return false;
+  if (now - record.ts > LAN_FRAME_SESSION_STALE_MS)
+    return false;
+  return isAlive(record.pid);
+}
+function lanFrameContent(record, pairingId, hold = null, now = Date.now(), isAlive = pidAlive) {
+  if (typeof record.retiredAt === "number" && Number.isFinite(record.retiredAt))
+    return null;
+  if (typeof record.blob !== "string" || record.blob.length === 0)
+    return null;
+  if (pairingId === undefined || record.pairingId !== pairingId)
+    return null;
+  if (typeof record.ts !== "number" || !Number.isFinite(record.ts))
+    return null;
+  if (lanHoldLive(hold, record, now, isAlive)) {
+    return {
+      op: "update",
+      prio: 1,
+      ts: Math.max(record.ts, hold.at),
+      blob: hold.blob,
+      ...record.agent === "codex" ? { agent: "codex" } : {},
+      ...record.attentionKind === "userInput" ? { attentionKind: "userInput" } : {}
+    };
+  }
+  const prio = record.prio === 1 ? 1 : 0;
+  return {
+    op: record.op ?? "update",
+    prio,
+    ts: record.ts,
+    blob: record.blob,
+    ...record.agent === "codex" ? { agent: "codex" } : {},
+    ...prio === 1 && record.attentionKind === "userInput" ? { attentionKind: "userInput" } : {}
+  };
+}
+function lanHoldLive(hold, record, now, isAlive) {
+  if (!hold || typeof hold.blob !== "string" || hold.blob.length === 0)
+    return false;
+  if (typeof hold.at !== "number" || !Number.isFinite(hold.at))
+    return false;
+  if (now - hold.at > LAN_HOLD_MAX_AGE_MS)
+    return false;
+  if (typeof hold.pid !== "number" || !Number.isFinite(hold.pid) || !isAlive(hold.pid))
+    return false;
+  const suppressible = (record.op ?? "update") === "update" && record.prio === 1;
+  return record.ts <= hold.at || suppressible;
+}
+function sameKey(a, b) {
+  if (a === b)
+    return true;
+  if (!a || !b || a.length !== b.length)
+    return false;
+  for (let i = 0;i < a.length; i += 1) {
+    if (a[i] !== b[i])
+      return false;
+  }
+  return true;
+}
+async function defaultProcStartedAt(pid) {
+  try {
+    const { stdout } = await execFileP3("ps", ["-o", "lstart=", "-p", String(pid)]);
+    const parsed = Date.parse(String(stdout).trim());
+    return Number.isFinite(parsed) ? parsed : undefined;
+  } catch {
+    return;
+  }
+}
+function defaultWatchDir(dir, onChange) {
+  try {
+    const watcher = watch(dir, { persistent: false }, () => onChange());
+    try {
+      watcher.on?.("error", () => {});
+    } catch {}
+    try {
+      watcher.unref?.();
+    } catch {}
+    return watcher;
+  } catch {
+    return null;
+  }
+}
+function createLanFrameStore(deps = {}) {
+  const sessionsDir = deps.sessionsDir ?? (lanRunningUnderTest() ? undefined : SESSIONS_DIR);
+  const isAlive = deps.isAlive ?? pidAlive;
+  const now = deps.now ?? Date.now;
+  const retireGraceMs = deps.retireGraceMs ?? LAN_FRAME_RETIRE_GRACE_MS;
+  const debounceMs = deps.debounceMs ?? LAN_FRAMES_WATCH_DEBOUNCE_MS;
+  const maxWaiters = deps.maxWaiters ?? LAN_FRAMES_WAITERS_MAX;
+  const watchDir = deps.watchDir ?? defaultWatchDir;
+  const ccSessionsDir = deps.ccSessionsDir ?? (lanRunningUnderTest() ? undefined : CC_SESSIONS_DIR);
+  const procStartedAt = deps.procStartedAt ?? defaultProcStartedAt;
+  const entries = new Map;
+  const stateEntries = new Map;
+  const waiters = new Set;
+  const stateWaiters = new Set;
+  let counter = 0;
+  let stateCounter = 0;
+  let completeFromSeq = 0;
+  let pairingId;
+  let e2eKey;
+  let stopped = false;
+  let watcher = null;
+  let ccWatcher = null;
+  let debounce;
+  const procStartCache = new Map;
+  const ccSeenPids = new Set;
+  let ccMissStreak = 0;
+  let ccLatchedOff = false;
+  let chain = Promise.resolve();
+  const drop = (waiter) => {
+    if (waiter.timer !== undefined) {
+      clearTimeout(waiter.timer);
+      waiter.timer = undefined;
+    }
+    waiters.delete(waiter);
+    stateWaiters.delete(waiter);
+    try {
+      waiter.resolve();
+    } catch {}
+  };
+  const wake = (set) => {
+    for (const waiter of [...set])
+      drop(waiter);
+  };
+  const park = async (set, waitMs) => {
+    let settle;
+    const promise = new Promise((resolve) => {
+      settle = resolve;
+    });
+    const waiter = { resolve: settle };
+    set.add(waiter);
+    while (set.size > maxWaiters) {
+      const oldest = set.values().next();
+      if (oldest.done || oldest.value === waiter)
+        break;
+      drop(oldest.value);
+    }
+    const timer = setTimeout(() => drop(waiter), waitMs);
+    timer.unref?.();
+    waiter.timer = timer;
+    await promise;
+  };
+  const stamp = (sessionId, content, retiredAt) => {
+    const sig = `${retiredAt === undefined ? "live" : "term"}|${JSON.stringify(content)}`;
+    const prev = entries.get(sessionId);
+    if (prev && prev.sig === sig && prev.retiredAt === undefined === (retiredAt === undefined))
+      return false;
+    counter += 1;
+    const ts = prev && content.ts <= prev.frame.ts ? prev.frame.ts + 1 : content.ts;
+    entries.set(sessionId, {
+      frame: { seq: counter, sessionId, ...content, ts },
+      sig,
+      ...retiredAt === undefined ? {} : { retiredAt }
+    });
+    return true;
+  };
+  const terminalContent = (frame, at) => ({
+    op: "end",
+    prio: 0,
+    ts: at,
+    blob: frame.blob,
+    ...frame.agent ? { agent: frame.agent } : {}
+  });
+  const startOf = async (pid) => {
+    if (typeof pid !== "number" || !Number.isFinite(pid))
+      return;
+    if (procStartCache.has(pid))
+      return procStartCache.get(pid);
+    let value;
+    try {
+      value = await procStartedAt(pid);
+    } catch {
+      value = undefined;
+    }
+    procStartCache.set(pid, value);
+    return value;
+  };
+  const ccFileOf = async (pid) => {
+    if (!ccSessionsDir || ccLatchedOff)
+      return null;
+    if (typeof pid !== "number" || !Number.isFinite(pid))
+      return null;
+    try {
+      return parseCcSessionFile(await readFile3(`${ccSessionsDir}/${pid}.json`, "utf8"));
+    } catch {
+      return null;
+    }
+  };
+  const commitState = async (sessionId, computed, at) => {
+    const prev = stateEntries.get(sessionId);
+    const blob = computed.blob;
+    if (blob.kind === "last" && !prev)
+      return false;
+    const blobSig = blob.kind === "sealed" ? `s:${blob.value}` : blob.kind === "plain" ? `p:${JSON.stringify(blob.value)}` : `l:${prev.state.blob}`;
+    const agent = blob.kind === "last" ? prev.state.agent : computed.agent === "codex" ? "codex" : undefined;
+    const startedAt = blob.kind === "last" ? prev.state.startedAt : computed.startedAt;
+    const asking = blob.kind === "last" ? undefined : computed.attentionKind;
+    const sig = `${computed.terminal ? "term" : "live"}|${computed.ts}|${computed.why}|${agent ?? ""}` + `|${startedAt ?? ""}|${asking ?? ""}|${blobSig}`;
+    if (prev && prev.sig === sig)
+      return false;
+    let sealed;
+    if (blob.kind === "sealed") {
+      sealed = blob.value;
+    } else if (blob.kind === "last") {
+      sealed = prev.state.blob;
+    } else {
+      if (!e2eKey)
+        return false;
+      try {
+        sealed = await encryptBlob(e2eKey, blob.value);
+      } catch {
+        return false;
+      }
+    }
+    stateCounter += 1;
+    stateEntries.set(sessionId, {
+      seq: stateCounter,
+      state: {
+        sessionId,
+        ts: computed.ts,
+        terminal: computed.terminal,
+        blob: sealed,
+        ...agent ? { agent } : {},
+        ...startedAt !== undefined ? { startedAt } : {},
+        ...asking ? { attentionKind: asking } : {},
+        why: computed.why.slice(0, 16)
+      },
+      sig,
+      ...computed.terminal ? { retiredAt: at } : {}
+    });
+    return true;
+  };
+  const reconcileOnce = async () => {
+    if (!sessionsDir)
+      return;
+    const at = now();
+    let files = [];
+    try {
+      files = await readdir2(sessionsDir);
+    } catch {
+      files = [];
+    }
+    let changed = false;
+    let stateChanged = false;
+    const seen = new Set;
+    const aliveCache = new Map;
+    const alive = (pid) => {
+      const memo = aliveCache.get(pid);
+      if (memo !== undefined)
+        return memo;
+      const value = isAlive(pid);
+      aliveCache.set(pid, value);
+      return value;
+    };
+    const held = new Set;
+    for (const file of files) {
+      if (file.endsWith(DECISION_HOLD_SUFFIX))
+        held.add(file.slice(0, -DECISION_HOLD_SUFFIX.length));
+    }
+    let ccConsulted = false;
+    let ccAnswered = false;
+    let freshPid = false;
+    const livePids = new Set;
+    for (const file of files) {
+      if (!file.endsWith(".json"))
+        continue;
+      const sessionId = basename2(file, ".json");
+      seen.add(sessionId);
+      const v1Retired = entries.get(sessionId)?.retiredAt !== undefined;
+      const v2Retired = stateEntries.get(sessionId)?.retiredAt !== undefined;
+      let record = null;
+      try {
+        record = JSON.parse(await readFile3(`${sessionsDir}/${file}`, "utf8"));
+      } catch {
+        continue;
+      }
+      if (record.agent === "codex" && typeof record.retiredAt === "number" && Number.isFinite(record.retiredAt)) {
+        seen.delete(sessionId);
+        continue;
+      }
+      let hold = null;
+      if (held.has(sessionId)) {
+        try {
+          hold = JSON.parse(await readFile3(`${sessionsDir}/${decisionHoldFileName(sessionId)}`, "utf8"));
+        } catch {
+          hold = null;
+        }
+      }
+      if (typeof record.pid === "number" && Number.isFinite(record.pid))
+        livePids.add(record.pid);
+      const v1LiveNow = lanFrameSessionLive(record, at, alive);
+      if (!v1Retired || v1LiveNow) {
+        const content = lanFrameContent(record, pairingId, hold, at, alive);
+        if (content) {
+          changed = v1LiveNow ? stamp(sessionId, content) || changed : stamp(sessionId, terminalContent({ seq: 0, sessionId, ...content }, at), at) || changed;
+        }
+      }
+      {
+        const askCc = record.agent !== "codex" && record.provisional !== true;
+        let cc = null;
+        let ccProcStartedAt;
+        if (askCc && ccSessionsDir) {
+          if (typeof record.pid === "number" && Number.isFinite(record.pid) && !ccSeenPids.has(record.pid)) {
+            freshPid = true;
+            ccSeenPids.add(record.pid);
+          }
+          if (!ccLatchedOff) {
+            ccConsulted = true;
+            cc = await ccFileOf(record.pid);
+            if (cc?.status === "busy" || cc?.status === "idle")
+              ccAnswered = true;
+            ccProcStartedAt = await startOf(record.pid);
+          }
+        }
+        const statePid = record.agent === "codex" && typeof record.tuiPid === "number" && Number.isFinite(record.tuiPid) ? record.tuiPid : record.pid;
+        const computed = computeSessionState({
+          sessionId,
+          record,
+          pairingId,
+          hold,
+          pidAlive: typeof statePid === "number" && Number.isFinite(statePid) ? alive(statePid) : false,
+          holdPidAlive: hold && typeof hold.pid === "number" && Number.isFinite(hold.pid) ? alive(hold.pid) : false,
+          cc,
+          ccProcStartedAt,
+          now: at
+        });
+        if (computed && (!v2Retired || !computed.terminal)) {
+          stateChanged = await commitState(sessionId, computed, at) || stateChanged;
+        }
+      }
+    }
+    for (const [sessionId, entry] of [...entries]) {
+      if (entry.retiredAt === undefined && !seen.has(sessionId)) {
+        changed = stamp(sessionId, terminalContent(entry.frame, at), at) || changed;
+        continue;
+      }
+      if (entry.retiredAt !== undefined && at - entry.retiredAt > retireGraceMs && !seen.has(sessionId)) {
+        entries.delete(sessionId);
+      }
+    }
+    for (const [sessionId, entry] of [...stateEntries]) {
+      if (entry.retiredAt === undefined && !seen.has(sessionId)) {
+        const gone = computeSessionState({ sessionId, record: null, pairingId, pidAlive: false, now: at });
+        if (gone)
+          stateChanged = await commitState(sessionId, gone, at) || stateChanged;
+        continue;
+      }
+      if (entry.retiredAt !== undefined && at - entry.retiredAt > retireGraceMs && !seen.has(sessionId)) {
+        stateEntries.delete(sessionId);
+      }
+    }
+    if (freshPid) {
+      ccMissStreak = 0;
+      ccLatchedOff = false;
+    } else if (ccConsulted) {
+      ccMissStreak = ccAnswered ? 0 : ccMissStreak + 1;
+      if (ccMissStreak >= CC_CAPABILITY_LATCH_SWEEPS)
+        ccLatchedOff = true;
+    }
+    for (const pid of [...procStartCache.keys()]) {
+      if (!livePids.has(pid))
+        procStartCache.delete(pid);
+    }
+    for (const pid of [...ccSeenPids]) {
+      if (!livePids.has(pid))
+        ccSeenPids.delete(pid);
+    }
+    if (changed)
+      wake(waiters);
+    if (stateChanged)
+      wake(stateWaiters);
+  };
+  const store = {
+    seq() {
+      return counter;
+    },
+    since(sinceSeq) {
+      const from = !Number.isFinite(sinceSeq) || sinceSeq < 0 || sinceSeq > counter ? 0 : sinceSeq;
+      const frames = [];
+      const at = now();
+      for (const entry of entries.values()) {
+        if (entry.retiredAt !== undefined && at - entry.retiredAt > retireGraceMs)
+          continue;
+        if (entry.frame.seq > from)
+          frames.push(entry.frame);
+      }
+      frames.sort((a, b) => a.seq - b.seq);
+      return { seq: counter, frames };
+    },
+    async wait(sinceSeq, waitMs) {
+      const immediate = store.since(sinceSeq);
+      if (stopped || waitMs <= 0 || immediate.frames.length > 0)
+        return immediate;
+      await park(waiters, waitMs);
+      return store.since(sinceSeq);
+    },
+    states(sinceSeq) {
+      const from = !Number.isFinite(sinceSeq) || sinceSeq < 0 || sinceSeq > stateCounter ? 0 : sinceSeq;
+      const complete = from === 0 || from <= completeFromSeq;
+      const picked = [];
+      const instant = now();
+      for (const entry of stateEntries.values()) {
+        if (entry.retiredAt !== undefined && instant - entry.retiredAt > retireGraceMs)
+          continue;
+        if (complete || entry.seq > from)
+          picked.push(entry);
+      }
+      picked.sort((a, b) => a.seq - b.seq);
+      const capped = picked.length <= LAN_STATE_SESSIONS_MAX ? picked : [...picked].sort((a, b) => b.state.ts - a.state.ts).slice(0, LAN_STATE_SESSIONS_MAX).sort((a, b) => a.seq - b.seq);
+      return { seq: stateCounter, at: now(), complete, sessions: capped.map((entry) => entry.state) };
+    },
+    async waitStates(sinceSeq, waitMs) {
+      const immediate = store.states(sinceSeq);
+      if (stopped || waitMs <= 0 || immediate.sessions.length > 0 || immediate.complete && stateCounter > 0) {
+        return immediate;
+      }
+      await park(stateWaiters, waitMs);
+      return store.states(sinceSeq);
+    },
+    setPairing(next, key) {
+      const rotated = next !== pairingId || e2eKey !== undefined && key !== undefined && !sameKey(e2eKey, key);
+      pairingId = next;
+      e2eKey = key;
+      if (!rotated)
+        return;
+      entries.clear();
+      stateEntries.clear();
+      completeFromSeq = stateCounter;
+      store.reconcile();
+    },
+    async readFull(sessionId, what) {
+      try {
+        if (!sessionsDir)
+          return null;
+        if (!LAN_SESSION_ID_RE.test(sessionId))
+          return null;
+        let record;
+        try {
+          record = JSON.parse(await readFile3(`${sessionsDir}/${sessionId}.json`, "utf8"));
+        } catch {
+          return null;
+        }
+        if (pairingId === undefined || record.pairingId !== pairingId)
+          return null;
+        if (typeof record.ts !== "number" || !Number.isFinite(record.ts))
+          return null;
+        if (now() - record.ts > LAN_FRAME_SESSION_STALE_MS)
+          return null;
+        const content = what === "plan" ? record.planFull : record.permissionDetailFull;
+        if (typeof content !== "string" || content.length === 0)
+          return null;
+        return { content, complete: recordFullTextIsComplete(content) };
+      } catch {
+        return null;
+      }
+    },
+    reconcile() {
+      if (stopped)
+        return Promise.resolve();
+      chain = chain.then(async () => {
+        if (stopped)
+          return;
+        try {
+          await reconcileOnce();
+        } catch {}
+        if (!stopped && !watcher)
+          store.start();
+      }).catch(() => {});
+      return chain;
+    },
+    start() {
+      if (stopped)
+        return;
+      const bump = () => {
+        if (stopped)
+          return;
+        if (debounce !== undefined)
+          clearTimeout(debounce);
+        debounce = setTimeout(() => {
+          debounce = undefined;
+          store.reconcile();
+        }, debounceMs);
+        debounce.unref?.();
+      };
+      if (!watcher && sessionsDir)
+        watcher = watchDir(sessionsDir, bump);
+      if (!ccWatcher && ccSessionsDir)
+        ccWatcher = watchDir(ccSessionsDir, bump);
+    },
+    stop() {
+      stopped = true;
+      if (debounce !== undefined) {
+        clearTimeout(debounce);
+        debounce = undefined;
+      }
+      const dying = watcher;
+      watcher = null;
+      try {
+        dying?.close();
+      } catch {}
+      const dyingCc = ccWatcher;
+      ccWatcher = null;
+      try {
+        dyingCc?.close();
+      } catch {}
+      wake(waiters);
+      wake(stateWaiters);
+    },
+    size() {
+      const at = now();
+      let visible = 0;
+      for (const entry of entries.values()) {
+        if (entry.retiredAt === undefined || at - entry.retiredAt <= retireGraceMs)
+          visible += 1;
+      }
+      return visible;
+    }
+  };
+  return store;
+}
+
+// src/core/bounded-set.ts
+function rememberBounded(set, value, max) {
+  set.add(value);
+  while (set.size > max) {
+    const oldest = set.values().next();
+    if (oldest.done)
+      break;
+    set.delete(oldest.value);
+  }
+}
+
+// src/core/lan-listener.ts
+var LAN_BODY_MAX_BYTES = 65536;
+var LAN_SEEN_NONCES_MAX = 512;
+var LAN_KEEPALIVE_MS = 5000;
+var LAN_REQUEST_TIMEOUT_MS = 1e4;
+var LAN_ANSWER_TTL_MS = 120000;
+var LAN_ANSWER_STORE_MAX = 64;
+function createLanAnswerStore(options = {}) {
+  const ttl = options.ttlMs ?? LAN_ANSWER_TTL_MS;
+  const max = options.max ?? LAN_ANSWER_STORE_MAX;
+  const entries = new Map;
+  const waiters = new Map;
+  const live = (entry, now) => entry && now - entry.at <= ttl && entry.at - now <= ttl ? entry : undefined;
+  return {
+    put(requestId, answerBlob, at) {
+      const existing = entries.get(requestId);
+      if (live(existing, at))
+        return "duplicate";
+      entries.delete(requestId);
+      entries.set(requestId, { answerBlob, at });
+      while (entries.size > max) {
+        const oldest = entries.keys().next();
+        if (oldest.done)
+          break;
+        entries.delete(oldest.value);
+      }
+      for (const notify of waiters.get(requestId) ?? []) {
+        try {
+          notify();
+        } catch {}
+      }
+      return "stored";
+    },
+    peek(requestId, now) {
+      const entry = entries.get(requestId);
+      const fresh = live(entry, now);
+      if (entry && !fresh)
+        entries.delete(requestId);
+      return fresh;
+    },
+    waiter(requestId, now) {
+      if (this.peek(requestId, now))
+        return { promise: Promise.resolve(), cancel: () => {} };
+      let settle;
+      const promise = new Promise((resolve) => {
+        settle = resolve;
+      });
+      const set = waiters.get(requestId) ?? new Set;
+      set.add(settle);
+      waiters.set(requestId, set);
+      return {
+        promise,
+        cancel() {
+          const current = waiters.get(requestId);
+          if (current) {
+            current.delete(settle);
+            if (current.size === 0)
+              waiters.delete(requestId);
+          }
+          settle();
+        }
+      };
+    },
+    size() {
+      return entries.size;
+    }
+  };
+}
+var lanAnswerStore = createLanAnswerStore();
+var textDecoder2 = new TextDecoder;
+function traceLan(deps, event) {
+  if (deps.trace) {
+    try {
+      deps.trace(event);
+    } catch {}
+    return;
+  }
+  if (lanRunningUnderTest())
+    return;
+  traceSession({ event: "lan", ...event });
+}
+function defaultListenerId() {
+  const c = globalThis.crypto;
+  try {
+    if (typeof c?.randomUUID === "function")
+      return c.randomUUID();
+  } catch {}
+  return b64url(crypto.getRandomValues(new Uint8Array(16)));
+}
+function requestIdOf(payload) {
+  const requestId = payload.requestId;
+  return typeof requestId === "string" && LAN_REQUEST_ID_RE.test(requestId) ? requestId : null;
+}
+function readBody(req, max) {
+  return new Promise((resolve) => {
+    const declared = Number(req.headers["content-length"]);
+    if (Number.isFinite(declared) && declared > max) {
+      try {
+        req.pause();
+      } catch {}
+      resolve(null);
+      return;
+    }
+    const chunks = [];
+    let total = 0;
+    let settled = false;
+    const done = (value) => {
+      if (settled)
+        return;
+      settled = true;
+      resolve(value);
+    };
+    req.on("data", (chunk) => {
+      const bytes = chunk;
+      total += bytes.length;
+      if (total > max) {
+        try {
+          req.pause();
+        } catch {}
+        done(null);
+        return;
+      }
+      chunks.push(bytes);
+    });
+    req.on("end", () => {
+      const merged = new Uint8Array(total);
+      let offset = 0;
+      for (const c of chunks) {
+        merged.set(c, offset);
+        offset += c.length;
+      }
+      done(textDecoder2.decode(merged));
+    });
+    req.on("error", () => done(null));
+    req.on("aborted", () => done(null));
+  });
+}
+function createLanListener(deps = {}) {
+  const host = deps.host ?? "0.0.0.0";
+  const statePath = deps.statePath ?? LAN_STATE_PATH;
+  const now = deps.now ?? Date.now;
+  const newListenerId = deps.newListenerId ?? defaultListenerId;
+  let server;
+  let address = null;
+  let stopped = false;
+  const sockets = new Set;
+  const seenNonces = new Set;
+  const answers = deps.answers ?? lanAnswerStore;
+  const frames = deps.frames ?? createLanFrameStore();
+  const peerAddress = deps.remoteAddress ?? ((req) => req?.socket?.remoteAddress);
+  let config = null;
+  let keyPromise = Promise.resolve(null);
+  let keyMemo;
+  const send = (res, status, body) => {
+    try {
+      res.writeHead(status, { "content-type": "application/json", "cache-control": "no-store" });
+      res.end(JSON.stringify(body));
+    } catch {}
+  };
+  const reject = (res, why) => {
+    traceLan(deps, { result: "reject", why });
+    send(res, 400, {});
+  };
+  const handle = async (req, res) => {
+    try {
+      if ((req.method ?? "").toUpperCase() !== "POST")
+        return reject(res, "method");
+      if ((req.url ?? "").split("?")[0] !== LAN_PATH)
+        return reject(res, "path");
+      const raw = await readBody(req, LAN_BODY_MAX_BYTES);
+      if (raw === null)
+        return reject(res, "body-size");
+      let outer;
+      try {
+        outer = JSON.parse(raw);
+      } catch {
+        return reject(res, "json");
+      }
+      if (typeof outer !== "object" || outer === null)
+        return reject(res, "shape");
+      const p = outer.p;
+      if (typeof p !== "string" || p.length === 0)
+        return reject(res, "shape");
+      const key = await keyPromise;
+      const pairing = config;
+      if (!key || !pairing)
+        return reject(res, "unpaired");
+      let plain;
+      try {
+        plain = await decryptBlob(key, p);
+      } catch {
+        return reject(res, "decrypt");
+      }
+      const envelope = parseLanEnvelope(plain);
+      if (!envelope)
+        return reject(res, "envelope");
+      if (!lanEnvelopeIsFresh(envelope.ts, now()))
+        return reject(res, "stale");
+      if (seenNonces.has(envelope.nonce))
+        return reject(res, "replay");
+      rememberBounded(seenNonces, envelope.nonce, LAN_SEEN_NONCES_MAX);
+      let payload;
+      if (envelope.op === "ping") {
+        payload = { ok: true };
+      } else if (envelope.op === "command") {
+        const blob = envelope.payload.blob;
+        if (typeof blob !== "string" || blob.length === 0 || blob.length > LAN_COMMAND_BLOB_MAX_CHARS) {
+          return reject(res, "command-payload");
+        }
+        try {
+          deps.onCommand?.({ nonce: envelope.nonce, blob, config: pairing });
+        } catch {}
+        payload = { ok: true };
+      } else if (envelope.op === "answer") {
+        const requestId = requestIdOf(envelope.payload);
+        const answerBlob = envelope.payload.answerBlob;
+        if (requestId === null)
+          return reject(res, "answer-request-id");
+        if (typeof answerBlob !== "string" || answerBlob.length === 0 || answerBlob.length > LAN_ANSWER_BLOB_MAX_CHARS) {
+          return reject(res, "answer-blob");
+        }
+        const stored = answers.put(requestId, answerBlob, now());
+        if (stored === "stored") {
+          try {
+            deps.onAnswer?.({ requestId, answerBlob, config: pairing });
+          } catch {}
+        }
+        payload = { ok: true };
+      } else if (envelope.op === "frames") {
+        const request = parseLanFramesRequest(envelope.payload);
+        if (!request)
+          return reject(res, "frames-payload");
+        const lid = address?.lid ?? "";
+        const slice = await frames.wait(request.sinceSeq, request.waitMs);
+        payload = { ok: true, seq: slice.seq, lid, frames: slice.frames };
+      } else if (envelope.op === "state") {
+        const request = parseLanFramesRequest(envelope.payload);
+        if (!request)
+          return reject(res, "state-payload");
+        const lid = address?.lid ?? "";
+        const slice = await frames.waitStates(request.sinceSeq, request.waitMs);
+        payload = {
+          ok: true,
+          seq: slice.seq,
+          lid,
+          at: slice.at,
+          complete: slice.complete,
+          sessions: slice.sessions
+        };
+      } else if (envelope.op === "read") {
+        const request = parseLanReadRequest(envelope.payload);
+        if (!request)
+          return reject(res, "read-payload");
+        const hit = await frames.readFull(request.sessionId, request.what);
+        payload = hit ? { ok: true, content: hit.content, complete: hit.complete } : { ok: false, err: "not-found" };
+      } else if (envelope.op === "answer-poll" && isLoopbackAddress(peerAddress(req))) {
+        const requestId = requestIdOf(envelope.payload);
+        if (requestId === null)
+          return reject(res, "answer-poll-request-id");
+        const hit = answers.peek(requestId, now());
+        payload = hit ? { status: "answered", answerBlob: hit.answerBlob } : { status: "pending" };
+      } else {
+        payload = { ok: false, err: "bad-op" };
+      }
+      const sealed = await encryptBlob(key, {
+        v: LAN_ENVELOPE_VERSION,
+        reqNonce: envelope.nonce,
+        ts: now(),
+        payload
+      });
+      traceLan(deps, { result: "ok", op: envelope.op });
+      send(res, 200, { p: sealed });
+    } catch {
+      try {
+        send(res, 400, {});
+      } catch {}
+    }
+  };
+  const tryListen = (port) => new Promise((resolve) => {
+    let settled = false;
+    let candidate;
+    try {
+      candidate = createServer((req, res) => {
+        handle(req, res);
+      });
+    } catch {
+      resolve(null);
+      return;
+    }
+    const finish = (value) => {
+      if (settled)
+        return;
+      settled = true;
+      resolve(value);
+    };
+    try {
+      candidate.keepAliveTimeout = LAN_KEEPALIVE_MS;
+      candidate.requestTimeout = LAN_REQUEST_TIMEOUT_MS;
+      candidate.timeout = 0;
+      candidate.on("error", () => {
+        try {
+          candidate.close();
+        } catch {}
+        finish(null);
+      });
+      candidate.on("connection", (socket) => {
+        const s = socket;
+        sockets.add(s);
+        try {
+          s.on("close", () => {
+            sockets.delete(s);
+          });
+        } catch {}
+      });
+      candidate.once("listening", () => finish(candidate));
+      candidate.listen(port, host);
+    } catch {
+      finish(null);
+    }
+  });
+  const bind = async () => {
+    let persisted = null;
+    try {
+      persisted = parseLanState(await readFile4(statePath, "utf8"));
+    } catch {
+      persisted = null;
+    }
+    if (persisted) {
+      const bound = await tryListen(persisted.port);
+      if (stopped) {
+        try {
+          bound?.close();
+        } catch {}
+        return null;
+      }
+      if (bound) {
+        server = bound;
+        try {
+          bound.unref?.();
+        } catch {}
+        address = { port: persisted.port, lid: newListenerId() };
+        const rotated = { port: address.port, lid: address.lid, createdAt: now() };
+        try {
+          await atomicWrite(statePath, JSON.stringify(rotated), 384);
+        } catch {
+          traceLan(deps, { result: "state-write-failed" });
+        }
+        traceLan(deps, { result: "bound", port: address.port, lid: address.lid, reused: true });
+        return address;
+      }
+    }
+    const fresh = await tryListen(0);
+    if (stopped) {
+      try {
+        fresh?.close();
+      } catch {}
+      return null;
+    }
+    if (!fresh) {
+      traceLan(deps, { result: "bind-failed" });
+      return null;
+    }
+    server = fresh;
+    try {
+      fresh.unref?.();
+    } catch {}
+    const info = fresh.address();
+    const port = typeof info?.port === "number" ? info.port : 0;
+    if (port === 0) {
+      traceLan(deps, { result: "bind-failed", why: "no-port" });
+      return null;
+    }
+    address = { port, lid: newListenerId() };
+    const state = { port, lid: address.lid, createdAt: now() };
+    try {
+      await atomicWrite(statePath, JSON.stringify(state), 384);
+    } catch {
+      traceLan(deps, { result: "state-write-failed" });
+    }
+    traceLan(deps, { result: "bound", port, lid: address.lid, reused: false });
+    return address;
+  };
+  const ready = bind().catch(() => null);
+  frames.start();
+  return {
+    ready,
+    sync(next) {
+      try {
+        config = next;
+        frames.setPairing(next?.pairingId, next?.e2eKey);
+        frames.reconcile();
+        const memo = next ? `${next.pairingId}|${b64url(next.e2eKey)}` : "";
+        if (memo === keyMemo)
+          return;
+        keyMemo = memo;
+        keyPromise = next ? deriveLanKey(next.e2eKey, next.pairingId).catch(() => null) : Promise.resolve(null);
+        seenNonces.clear();
+      } catch {}
+    },
+    address() {
+      return address;
+    },
+    stop() {
+      stopped = true;
+      address = null;
+      try {
+        frames.stop();
+      } catch {}
+      const dying = server;
+      server = undefined;
+      for (const s of sockets) {
+        try {
+          s.destroy();
+        } catch {}
+      }
+      sockets.clear();
+      if (!dying)
+        return;
+      try {
+        dying.removeAllListeners("error");
+      } catch {}
+      try {
+        dying.on("error", () => {});
+      } catch {}
+      try {
+        dying.close();
+      } catch {}
+    }
+  };
+}
+var LAN_HINT_REFRESH_MS = 300000;
+var LAN_HINT_MAX_CHARS = 2048;
+var LAN_HOSTS_CACHE_MS = 5000;
+function lanHostAddresses(interfaces = networkInterfaces()) {
+  const v4 = [];
+  const v6 = [];
+  try {
+    for (const entries of Object.values(interfaces)) {
+      if (!entries)
+        continue;
+      for (const entry of entries) {
+        const address = entry?.address;
+        if (typeof address !== "string" || address.length === 0)
+          continue;
+        if (entry.internal)
+          continue;
+        const isV6 = entry.family === "IPv6" || entry.family === 6;
+        if (isV6) {
+          const lower = address.toLowerCase();
+          if (lower.startsWith("fe80:") || lower.startsWith("::"))
+            continue;
+          if (!v6.includes(address))
+            v6.push(address);
+          continue;
+        }
+        if (address.startsWith("169.254."))
+          continue;
+        if (!v4.includes(address))
+          v4.push(address);
+      }
+    }
+  } catch {
+    return [];
+  }
+  return [...v4, ...v6];
+}
+async function sealHint(key, hosts, port, lid, ts) {
+  let list = hosts;
+  for (;; ) {
+    const sealed = await encryptBlob(key, { v: LAN_ENVELOPE_VERSION, hosts: list, port, lid, ts });
+    if (sealed.length <= LAN_HINT_MAX_CHARS)
+      return sealed;
+    if (list.length <= 1)
+      return;
+    list = list.slice(0, list.length - 1);
+  }
+}
+function createLanHintPublisher(deps) {
+  const hostsOf = deps.hosts ?? (() => lanHostAddresses());
+  const now = deps.now ?? Date.now;
+  let lastState;
+  let lastSentAt = 0;
+  let lastSealed;
+  let cachedHosts = [];
+  let cachedAt = 0;
+  const hosts = (t) => {
+    if (t - cachedAt < LAN_HOSTS_CACHE_MS && cachedAt !== 0)
+      return cachedHosts;
+    cachedAt = t;
+    try {
+      cachedHosts = hostsOf();
+    } catch {
+      cachedHosts = [];
+    }
+    return cachedHosts;
+  };
+  return {
+    async take(config) {
+      try {
+        if (!config)
+          return;
+        const addr = deps.address();
+        if (!addr)
+          return;
+        const t = now();
+        const list = hosts(t);
+        if (list.length === 0)
+          return;
+        const state = `${config.pairingId}|${addr.port}|${addr.lid}|${list.join(",")}`;
+        if (state === lastState) {
+          if (t - lastSentAt < LAN_HINT_REFRESH_MS)
+            return;
+          if (lastSealed) {
+            lastSentAt = t;
+            return lastSealed;
+          }
+        }
+        const sealed = await sealHint(config.e2eKey, list, addr.port, addr.lid, t);
+        if (!sealed)
+          return;
+        lastState = state;
+        lastSealed = sealed;
+        lastSentAt = t;
+        return sealed;
+      } catch {
+        return;
+      }
+    }
+  };
+}
+
+// src/core/decision-poll.ts
+var POLL_INTERVAL_MS = 3000;
+var POLL_JITTER_MAX_MS = 500;
+var POLL_TIMEOUT_MS = 2000;
+var POLL_TIMEOUT_CEILING_MS = 8000;
+var POLL_BUDGET_LATENCY_FACTOR = 3;
+var POLL_LATENCY_SAMPLES = 5;
+var POLL_FIRST_CONTACT_TIMEOUT_MS = 4000;
+function createPollBudget() {
+  const window = [];
+  return {
+    next(seq) {
+      const floorMs = seq <= 1 ? POLL_FIRST_CONTACT_TIMEOUT_MS : POLL_TIMEOUT_MS;
+      if (window.length === 0)
+        return floorMs;
+      const sorted = [...window].sort((a, b) => a - b);
+      const typical = sorted[Math.floor(sorted.length / 2)];
+      return Math.min(POLL_TIMEOUT_CEILING_MS, Math.max(floorMs, Math.ceil(typical * POLL_BUDGET_LATENCY_FACTOR)));
+    },
+    observe(roundTripMs) {
+      if (!Number.isFinite(roundTripMs) || roundTripMs < 0)
+        return;
+      window.push(roundTripMs);
+      if (window.length > POLL_LATENCY_SAMPLES)
+        window.shift();
+    }
+  };
+}
+var POST_MAX_ATTEMPTS = 2;
+var POST_RETRY_PAUSE_MS = 1000;
+var MAX_CONSECUTIVE_MISSES = 100;
+var DEFINITIVE_POLL_STATUSES = new Set([401, 403, 404, 410]);
+var MAX_DEFINITIVE_POLL_FAILURES = 2;
+
 // src/core/permission.ts
-import { realpath, unlink as unlink3 } from "node:fs/promises";
+import { readFile as readFile7, realpath, unlink as unlink3 } from "node:fs/promises";
 import { appendFileSync as appendFileSync2, statSync as statSync2, truncateSync as truncateSync2 } from "node:fs";
 import { hostname as hostname2 } from "node:os";
-import { basename as basename3, isAbsolute, relative, resolve } from "node:path";
+import { basename as basename4, isAbsolute, relative, resolve } from "node:path";
 
 // src/core/hook.ts
-import { readdir as readdir2, readFile as readFile3, unlink as unlink2 } from "node:fs/promises";
+import { readdir as readdir3, readFile as readFile6, unlink as unlink2 } from "node:fs/promises";
 import { hostname } from "node:os";
-import { basename as basename2 } from "node:path";
+import { basename as basename3 } from "node:path";
+
+// src/core/notify-wire.ts
+import { readFile as readFile5 } from "node:fs/promises";
+var NOMO_NOTIFY_ENTRY = "codex-notify";
+function nomoNotifyProgram(home) {
+  return `${home}/.config/cc-status/hook-shim.sh`;
+}
+function isNomoNotifyChain(arr) {
+  const prog = arr[0] ?? "";
+  if (/(^|\/)notify-chain\.sh$/.test(prog))
+    return true;
+  return /(^|\/)hook-shim\.sh$/.test(prog) && arr[1] === NOMO_NOTIFY_ENTRY;
+}
+function referencesNomoNotify(text) {
+  if (text.includes("notify-chain.sh"))
+    return true;
+  return text.includes("hook-shim.sh") && text.includes(NOMO_NOTIFY_ENTRY);
+}
+function arrayReferencesNomoNotify(arr) {
+  return isNomoNotifyChain(arr) || arr.some((s) => referencesNomoNotify(s));
+}
+function sameCommand(a, b) {
+  return a.length === b.length && a.every((v, i) => v === b[i]);
+}
+function unwrapNotify(arr) {
+  if (arr.length === 0)
+    return null;
+  if (isNomoNotifyChain(arr)) {
+    const sep = arr.indexOf("--");
+    if (sep === -1)
+      return null;
+    return unwrapNotify(arr.slice(sep + 1));
+  }
+  const i = arr.indexOf("--previous-notify");
+  if (i !== -1 && i + 1 < arr.length && referencesNomoNotify(arr[i + 1] ?? "")) {
+    const host = [...arr.slice(0, i), ...arr.slice(i + 2)];
+    let embedded = null;
+    try {
+      embedded = JSON.parse(arr[i + 1]);
+    } catch {}
+    if (Array.isArray(embedded) && embedded.every((x) => typeof x === "string")) {
+      const inner = unwrapNotify(embedded);
+      if (inner !== null && inner.length > 0 && !sameCommand(inner, host)) {
+        return [...arr.slice(0, i), "--previous-notify", JSON.stringify(inner), ...arr.slice(i + 2)];
+      }
+    }
+    return host;
+  }
+  return [...arr];
+}
+function wireNotifyArray(existing, program) {
+  const orig = existing && existing.length > 0 ? unwrapNotify(existing) : null;
+  return orig && orig.length > 0 ? [program, NOMO_NOTIFY_ENTRY, "--", ...orig] : [program, NOMO_NOTIFY_ENTRY];
+}
+function parseNotifyFromToml(toml) {
+  for (const line of toml.split(`
+`)) {
+    if (/^\s*\[/.test(line))
+      break;
+    const m = line.match(/^\s*notify\s*=\s*(.*)$/);
+    if (!m)
+      continue;
+    try {
+      const parsed = JSON.parse(m[1]);
+      if (Array.isArray(parsed) && parsed.every((x) => typeof x === "string")) {
+        return { present: true, value: parsed };
+      }
+    } catch {}
+    return { present: true, value: null };
+  }
+  return { present: false, value: null };
+}
+function replaceNotifyInToml(toml, arr) {
+  const line = `notify = ${JSON.stringify(arr)}`;
+  const lines = toml.split(`
+`);
+  let firstTable = -1;
+  for (let i = 0;i < lines.length; i++) {
+    if (/^\s*\[/.test(lines[i])) {
+      firstTable = i;
+      break;
+    }
+    if (/^\s*notify\s*=/.test(lines[i])) {
+      lines[i] = line;
+      return lines.join(`
+`);
+    }
+  }
+  if (firstTable === -1) {
+    const sep = toml.length === 0 || toml.endsWith(`
+`) ? "" : `
+`;
+    return `${toml}${sep}${line}
+`;
+  }
+  lines.splice(firstTable, 0, line, "");
+  return lines.join(`
+`);
+}
+function tomlMayNeedNotifyRepair(toml, program) {
+  const flat = toml.includes("\\") ? toml.split("\\").join("") : toml;
+  if (flat.includes("notify-chain.sh"))
+    return true;
+  if (!flat.includes("hook-shim.sh"))
+    return false;
+  return !flat.includes(program);
+}
+async function repairNotifyWiring(deps = {}) {
+  try {
+    const home = deps.home ?? process.env.HOME ?? "";
+    if (home.length === 0)
+      return "unchanged";
+    const program = nomoNotifyProgram(home);
+    const tomlPath = deps.tomlPath ?? `${codexHome()}/config.toml`;
+    let toml;
+    try {
+      toml = await readFile5(tomlPath, "utf8");
+    } catch {
+      return "unchanged";
+    }
+    if (!tomlMayNeedNotifyRepair(toml, program))
+      return "unchanged";
+    const parsed = parseNotifyFromToml(toml);
+    if (!parsed.present || parsed.value === null)
+      return "refused";
+    if (!arrayReferencesNomoNotify(parsed.value))
+      return "refused";
+    const next = wireNotifyArray(parsed.value, program);
+    if (sameCommand(next, parsed.value))
+      return "unchanged";
+    const bak = `${tomlPath}.bak-nomo`;
+    try {
+      await readFile5(bak);
+    } catch {
+      await atomicWrite(bak, toml);
+    }
+    await atomicWrite(tomlPath, replaceNotifyInToml(toml, next));
+    return "repaired";
+  } catch {
+    return "refused";
+  }
+}
+
+// src/core/hook.ts
 var TOOL_DETAIL = { ...claudeToolDetail, ...codexToolDetail };
 function sessionOrigin(input, ppid = process.ppid, command = pidCommand(ppid)) {
   const stringField = (key) => typeof input[key] === "string" && input[key].length > 0 ? input[key] : undefined;
@@ -3197,7 +4954,7 @@ function transcriptStartMs(prefix) {
   return;
 }
 function buildBlob(input, machine, title, plan, agent = "claude", turnStartedAt, pinnedLabel, model, at, proposedPlan, dbgOverride) {
-  const label = typeof pinnedLabel === "string" && pinnedLabel.length > 0 ? pinnedLabel : typeof input.cwd === "string" && input.cwd.length > 0 ? basename2(input.cwd) : "session";
+  const label = typeof pinnedLabel === "string" && pinnedLabel.length > 0 ? pinnedLabel : typeof input.cwd === "string" && input.cwd.length > 0 ? basename3(input.cwd) : "session";
   const hookName = typeof input.hook_event_name === "string" ? input.hook_event_name : "";
   const detail = detailForHook(hookName, typeof input.tool_name === "string" ? input.tool_name : undefined, input.tool_input);
   const base = {
@@ -3218,7 +4975,7 @@ function buildBlob(input, machine, title, plan, agent = "claude", turnStartedAt,
   }) : undefined;
   return appendFittedPlanAndDebug(base, proposedPlan, dbg);
 }
-async function buildEnvelope(input, machine, now, title, e2eKey, sentDone, agent = "claude", startedAt, turnStartedAt, pinnedLabel, model, planOverride, attentionKindOverride, proposedPlan, dbg) {
+async function buildEnvelope(input, machine, now, title, e2eKey, sentDone, agent = "claude", startedAt, turnStartedAt, pinnedLabel, model, planOverride, attentionKindOverride, proposedPlan, dbg, onBlobPlaintext) {
   if (typeof input !== "object" || input === null)
     return null;
   const i = input;
@@ -3232,7 +4989,11 @@ async function buildEnvelope(input, machine, now, title, e2eKey, sentDone, agent
   if (typeof startedAt === "number" && Number.isFinite(startedAt))
     base.startedAt = startedAt;
   const at = Math.floor(now / 1000);
-  const blob = await encryptBlob(e2eKey, buildBlob(i, machine, title, plan, agent, turnStartedAt, pinnedLabel, model, at, proposedPlan, dbg));
+  const plaintext = buildBlob(i, machine, title, plan, agent, turnStartedAt, pinnedLabel, model, at, proposedPlan, dbg);
+  try {
+    onBlobPlaintext?.(plaintext);
+  } catch {}
+  const blob = await encryptBlob(e2eKey, plaintext);
   const attentionKind = attentionKindOverride ?? (agent === "codex" && hookName === "PreToolUse" && i.tool_name === "request_user_input" ? "userInput" : undefined);
   return { ...base, ...attentionKind ? { attentionKind } : {}, blob };
 }
@@ -3255,11 +5016,12 @@ async function stashPendingEvent(input, machine, title, now, stashPath = PENDING
     await atomicWrite(stashPath, JSON.stringify(stash), 384);
   } catch {}
 }
-async function trackSessionAt(sessionsDir, sessionId, op, prio, status, blob, machine, label, transcript, agent = "claude", sessionStartedAt, turnStartedAt, turnId, title, pairingId, model, pendingPlanPicker = false, pid = process.ppid, origin, planPickerVerificationPending = false, dbg) {
+async function trackSessionAt(sessionsDir, sessionId, op, prio, status, blob, machine, label, transcript, agent = "claude", sessionStartedAt, turnStartedAt, turnId, title, pairingId, model, pendingPlanPicker = false, pid = process.ppid, origin, planPickerVerificationPending = false, dbg, attentionKind, planFull) {
   try {
     const path = `${sessionsDir}/${sessionId}.json`;
     if (op === "end") {
       await unlink2(path).catch(() => {});
+      await unlink2(`${sessionsDir}/${decisionHoldFileName(sessionId)}`).catch(() => {});
       return;
     }
     const recordedAt = Date.now();
@@ -3286,13 +5048,15 @@ async function trackSessionAt(sessionsDir, sessionId, op, prio, status, blob, ma
       ...planPickerVerificationPending ? { planPickerVerificationPending: true } : {},
       ...pendingPlanPicker || planPickerVerificationPending ? { planPickerPendingSince: recordedAt } : {},
       ...typeof dbg === "string" && dbg.length > 0 ? { dbg } : {},
-      ...origin ? { origin } : {}
+      ...origin ? { origin } : {},
+      ...attentionKind ? { attentionKind } : {},
+      ...typeof planFull === "string" && planFull.length > 0 ? { planFull } : {}
     };
     await atomicWrite(path, JSON.stringify(record), 384);
   } catch {}
 }
-async function trackSession(sessionId, op, prio, status, blob, machine, label, transcript, agent = "claude", sessionStartedAt, turnStartedAt, turnId, title, pairingId, model, pendingPlanPicker = false, pid = process.ppid, origin, planPickerVerificationPending = false, dbg) {
-  return trackSessionAt(SESSIONS_DIR, sessionId, op, prio, status, blob, machine, label, transcript, agent, sessionStartedAt, turnStartedAt, turnId, title, pairingId, model, pendingPlanPicker, pid, origin, planPickerVerificationPending, dbg);
+async function trackSession(sessionId, op, prio, status, blob, machine, label, transcript, agent = "claude", sessionStartedAt, turnStartedAt, turnId, title, pairingId, model, pendingPlanPicker = false, pid = process.ppid, origin, planPickerVerificationPending = false, dbg, attentionKind, planFull) {
+  return trackSessionAt(SESSIONS_DIR, sessionId, op, prio, status, blob, machine, label, transcript, agent, sessionStartedAt, turnStartedAt, turnId, title, pairingId, model, pendingPlanPicker, pid, origin, planPickerVerificationPending, dbg, attentionKind, planFull);
 }
 async function markDoneDeliveredAt(sessionsDir, sessionId) {
   try {
@@ -3307,19 +5071,19 @@ async function markDoneDelivered(sessionId) {
 }
 async function reconcileProvisional(config, hookPid) {
   try {
-    const files = await readdir2(SESSIONS_DIR).catch(() => []);
+    const files = await readdir3(SESSIONS_DIR).catch(() => []);
     const provisionals = [];
     for (const f of files) {
       if (!f.endsWith(".json"))
         continue;
       let r;
       try {
-        r = JSON.parse(await readFile3(`${SESSIONS_DIR}/${f}`, "utf8"));
+        r = JSON.parse(await readFile6(`${SESSIONS_DIR}/${f}`, "utf8"));
       } catch {
         continue;
       }
       if (r.provisional === true && typeof r.pid === "number")
-        provisionals.push({ sessionId: basename2(f, ".json"), pid: r.pid });
+        provisionals.push({ sessionId: basename3(f, ".json"), pid: r.pid });
     }
     if (provisionals.length === 0)
       return;
@@ -3341,14 +5105,14 @@ async function reconcileProvisional(config, hookPid) {
   } catch {}
 }
 async function readTrackedSessions() {
-  const files = await readdir2(SESSIONS_DIR).catch(() => []);
+  const files = await readdir3(SESSIONS_DIR).catch(() => []);
   const out = [];
   for (const f of files) {
     if (!f.endsWith(".json"))
       continue;
     try {
-      const r = JSON.parse(await readFile3(`${SESSIONS_DIR}/${f}`, "utf8"));
-      out.push({ sessionId: basename2(f, ".json"), pid: r.pid, provisional: r.provisional, agent: r.agent, ts: r.ts });
+      const r = JSON.parse(await readFile6(`${SESSIONS_DIR}/${f}`, "utf8"));
+      out.push({ sessionId: basename3(f, ".json"), pid: r.pid, provisional: r.provisional, agent: r.agent, ts: r.ts });
     } catch {}
   }
   return out;
@@ -3398,6 +5162,9 @@ async function runHook(agent) {
     }
     const adapter2 = adapterFor(agent);
     await atomicWrite(lastHookPath(agent), String(Date.now())).catch(() => {});
+    if (agent === "codex" && input.hook_event_name === "SessionStart") {
+      await repairNotifyWiring().catch(() => {});
+    }
     const transcriptPath = typeof input.transcript_path === "string" ? input.transcript_path : "";
     let prefixCache;
     const getPrefix = async () => {
@@ -3431,6 +5198,8 @@ async function runHook(agent) {
     let eventInput = input;
     let reusedForkPredecessor = false;
     let existingRecord = await readRecord(reportedSessionId);
+    if (existingRecord?.agent === "codex" && typeof existingRecord.retiredAt === "number" && Number.isFinite(existingRecord.retiredAt))
+      existingRecord = null;
     let trackedCache;
     const trackedSessions = async () => {
       if (trackedCache === undefined)
@@ -3564,7 +5333,7 @@ async function runHook(agent) {
         planPickerVerificationPending = true;
       }
     }
-    const label = typeof existingRecord?.label === "string" && existingRecord.label.length > 0 ? existingRecord.label : typeof input.cwd === "string" && input.cwd.length > 0 ? basename2(input.cwd) : "session";
+    const label = typeof existingRecord?.label === "string" && existingRecord.label.length > 0 ? existingRecord.label : typeof input.cwd === "string" && input.cwd.length > 0 ? basename3(input.cwd) : "session";
     const dbg = agent === "codex" ? formatPlanPickerDebug({
       event: hookName || "event",
       classifier: pickerClassifier,
@@ -3572,7 +5341,10 @@ async function runHook(agent) {
       ttl: pendingPlanPicker || planPickerVerificationPending ? "0m" : "-",
       by: "h"
     }) : undefined;
-    const envelope = await buildEnvelope(eventInput, machine, Date.now(), title, config.e2eKey, sentDone, agent, startedAt, turnStartedAt, label, model, plan, attentionKind, proposedPlan, dbg);
+    let planFull;
+    const envelope = await buildEnvelope(eventInput, machine, Date.now(), title, config.e2eKey, sentDone, agent, startedAt, turnStartedAt, label, model, plan, attentionKind, proposedPlan, dbg, (plaintext) => {
+      planFull = fullTextForRecord(proposedPlan, plaintext.plan);
+    });
     if (!envelope)
       return;
     const createsRecord = !existingRecord && plan.op !== "end";
@@ -3580,7 +5352,7 @@ async function runHook(agent) {
     const origin = existingRecord?.origin ?? sessionOrigin(input, hookPid, hookCommand);
     const recordPid = reusedForkPredecessor ? existingRecord.pid : hookPid;
     const recordTranscript = reusedForkPredecessor ? existingRecord.transcript ?? transcriptPath : transcriptPath;
-    await trackSession(sessionId, plan.op, plan.prio, plan.status, envelope.blob, machine, label, recordTranscript, agent, startedAt, turnStartedAt, turnId, title, config.pairingId, model, pendingPlanPicker, recordPid, origin, planPickerVerificationPending, dbg);
+    await trackSession(sessionId, plan.op, plan.prio, plan.status, envelope.blob, machine, label, recordTranscript, agent, startedAt, turnStartedAt, turnId, title, config.pairingId, model, pendingPlanPicker, recordPid, origin, planPickerVerificationPending, dbg, envelope.attentionKind, planFull);
     const clearedPickerMarker = pendingPlanPicker === false && planPickerVerificationPending === false && (existingRecord?.pendingPlanPicker === true || existingRecord?.planPickerVerificationPending === true || existingRecord?.planPickerSettled === true);
     if (agent === "codex" && (hookName === "Stop" || pendingPlanPicker || planPickerVerificationPending || clearedPickerMarker)) {
       tracePlanPickerDecision(sessionId, {
@@ -3644,16 +5416,9 @@ async function runHook(agent) {
 }
 
 // src/core/permission.ts
-var POLL_INTERVAL_MS = 3000;
-var FETCH_TIMEOUT_MS = 2000;
-var POST_FIRST_CONTACT_TIMEOUT_MS = 4000;
-var POST_MAX_ATTEMPTS = 2;
-var POST_RETRY_PAUSE_MS = 1000;
+var POST_FIRST_CONTACT_TIMEOUT_MS = 6000;
 var HOLD_RETRY_DELAY_MS = 4000;
 var FRESH_SESSION_MS = 60000;
-var MAX_CONSECUTIVE_MISSES = 100;
-var DEFINITIVE_POLL_STATUSES = new Set([401, 403, 404, 410]);
-var MAX_DEFINITIVE_POLL_FAILURES = 2;
 var MAX_UNKNOWN_ANSWER_READS = 3;
 var CODEX_POLICY_TAIL_BYTES = 8 * 1024 * 1024;
 var CODEX_ROLLOUT_HEAD_BYTES = 1024 * 1024;
@@ -3716,7 +5481,7 @@ function codexRolloutSessionId(text) {
   return;
 }
 async function loadCodexTurnPolicy(transcriptPath, turnId, sessionId, home = codexHome()) {
-  if (!transcriptPath || !turnId || !sessionId || !basename3(transcriptPath).match(/^rollout-.*\.jsonl$/))
+  if (!transcriptPath || !turnId || !sessionId || !basename4(transcriptPath).match(/^rollout-.*\.jsonl$/))
     return null;
   try {
     const sessionsRoot = await realpath(resolve(home, "sessions"));
@@ -3872,6 +5637,9 @@ function defaultTrace() {
   }
   return trace;
 }
+function isQuestionTool(toolName) {
+  return toolName === "AskUserQuestion" || toolName === "request_user_input";
+}
 function buildPermissionSummary(toolName, toolInput) {
   const str = (v) => typeof v === "string" && v.length > 0 ? v : undefined;
   const truncate = (s, n = 80) => s.length <= n ? s : `${s.slice(0, n - 1)}…`;
@@ -3892,7 +5660,7 @@ function buildPermissionSummary(toolName, toolInput) {
     case "Read":
     case "NotebookEdit": {
       const fp = str(toolInput.file_path);
-      return fp ? basename3(fp) : toolName;
+      return fp ? basename4(fp) : toolName;
     }
     case "WebFetch":
     case "WebSearch": {
@@ -3910,6 +5678,14 @@ function buildPermissionSummary(toolName, toolInput) {
     case "AskUserQuestion": {
       const q = str(firstQuestionText(toolInput));
       return q ? truncate(q) : toolName;
+    }
+    case "request_user_input": {
+      const questions = Array.isArray(toolInput.questions) ? toolInput.questions : [];
+      const q = questions.find((raw) => {
+        const question = raw?.question;
+        return typeof question === "string" && question.length > 0;
+      });
+      return typeof q?.question === "string" ? truncate(q.question) : toolName;
     }
     default: {
       if (/^mcp__/.test(toolName)) {
@@ -4086,6 +5862,180 @@ function emitDecision(agent, answer, toolName, toolInput, suggestions, emit, tra
       return "keep-polling";
   }
 }
+var LOOPBACK_POLL_INTERVAL_MS = 300;
+var LOOPBACK_FETCH_TIMEOUT_MS = 250;
+var LOOPBACK_MAX_CONSECUTIVE_ERRORS = 5;
+function createLoopbackAnswerPoller(config, requestId, deps) {
+  const interval = deps.intervalMs ?? LOOPBACK_POLL_INTERVAL_MS;
+  const discoverInterval = deps.discoverIntervalMs ?? POLL_INTERVAL_MS;
+  const tick = deps.sleep ?? ((ms) => new Promise((resolve2) => {
+    const timer = setTimeout(resolve2, ms);
+    timer.unref?.();
+  }));
+  let live = deps.statePath !== undefined;
+  let started = false;
+  let port;
+  let lastDiscoverAt = 0;
+  let errors = 0;
+  let traced = false;
+  let pending;
+  let wakeResolve = () => {};
+  let wake = new Promise((resolve2) => {
+    wakeResolve = resolve2;
+  });
+  let keyPromise;
+  const note2 = (result) => {
+    if (traced)
+      return;
+    traced = true;
+    try {
+      deps.trace({ event: "lan-poll", result });
+    } catch {}
+  };
+  const key = () => keyPromise ??= deriveLanKey(config.e2eKey, config.pairingId);
+  const readPort = async () => {
+    if (deps.statePath === undefined)
+      return;
+    try {
+      return parseLanState(await readFile7(deps.statePath, "utf8"))?.port;
+    } catch {
+      return;
+    }
+  };
+  const attempt = async () => {
+    try {
+      const k = await key();
+      const nonce = b64url(crypto.getRandomValues(new Uint8Array(16)));
+      const body = JSON.stringify({
+        p: await encryptBlob(k, {
+          v: LAN_ENVELOPE_VERSION,
+          op: "answer-poll",
+          ts: deps.now(),
+          nonce,
+          payload: { requestId }
+        })
+      });
+      const res = await deps.fetchFn(`http://127.0.0.1:${port}${LAN_PATH}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body,
+        signal: AbortSignal.timeout(LOOPBACK_FETCH_TIMEOUT_MS)
+      });
+      if (!res.ok) {
+        errors += 1;
+        return;
+      }
+      const outer = await res.json();
+      if (typeof outer?.p !== "string") {
+        errors += 1;
+        return;
+      }
+      const opened = await decryptBlob(k, outer.p);
+      if (opened.reqNonce !== nonce) {
+        errors += 1;
+        return;
+      }
+      errors = 0;
+      const payload = opened.payload;
+      if (payload?.status === "answered" && typeof payload.answerBlob === "string" && payload.answerBlob.length > 0) {
+        return payload.answerBlob;
+      }
+      return;
+    } catch {
+      errors += 1;
+      return;
+    }
+  };
+  const ticker = async () => {
+    while (live) {
+      await tick(interval);
+      if (!live)
+        return;
+      if (port === undefined) {
+        const t = deps.now();
+        if (lastDiscoverAt !== 0 && t - lastDiscoverAt < discoverInterval)
+          continue;
+        lastDiscoverAt = t;
+        port = await readPort();
+        if (port === undefined)
+          continue;
+      }
+      const blob = await attempt();
+      if (!live)
+        return;
+      if (blob !== undefined) {
+        pending = blob;
+        wakeResolve();
+        return;
+      }
+      if (errors >= LOOPBACK_MAX_CONSECUTIVE_ERRORS) {
+        note2("give-up");
+        live = false;
+        return;
+      }
+    }
+  };
+  return {
+    async wait(sleeping) {
+      if (!live) {
+        await sleeping;
+        return;
+      }
+      if (!started) {
+        started = true;
+        ticker().catch(() => {
+          live = false;
+          note2("error");
+        });
+      }
+      await Promise.race([sleeping, wake]);
+      if (pending === undefined)
+        return;
+      const blob = pending;
+      pending = undefined;
+      live = false;
+      return blob;
+    },
+    async settle() {
+      if (pending !== undefined) {
+        const blob = pending;
+        pending = undefined;
+        live = false;
+        return blob;
+      }
+      if (!live)
+        return;
+      live = false;
+      if (port === undefined)
+        port = await readPort();
+      if (port === undefined)
+        return;
+      return await attempt();
+    },
+    stop() {
+      live = false;
+      wakeResolve();
+    }
+  };
+}
+function defaultLanStatePath() {
+  return lanRunningUnderTest() ? undefined : LAN_STATE_PATH;
+}
+function defaultStampDetailFull() {
+  return lanRunningUnderTest() ? async () => {} : stampPermissionDetailFull;
+}
+function defaultWriteHold() {
+  return lanRunningUnderTest() ? async () => {} : writeDecisionHold;
+}
+function defaultClearHold() {
+  return lanRunningUnderTest() ? async (_sessionId, _pid, beforeUnlink) => {
+    await beforeUnlink?.();
+    return true;
+  } : clearDecisionHold;
+}
+function defaultSettleHoldRecord() {
+  return lanRunningUnderTest() ? async () => {} : settleDecisionHoldRecord;
+}
 async function readStdin2() {
   const chunks = [];
   for await (const chunk of process.stdin)
@@ -4095,6 +6045,10 @@ async function readStdin2() {
 async function runPermissionHook(deps = {}, agent = "claude") {
   const noHoldPath = deps.noHoldPath ?? NO_HOLD_PATH;
   const trace = deps.trace ?? defaultTrace();
+  let loopback;
+  let heldSessionId;
+  let settleAsWorking = false;
+  let settleHeldRecord;
   try {
     if (await flagExists(noHoldPath)) {
       await (deps.delegate ?? (() => runHook(agent)))();
@@ -4131,11 +6085,14 @@ async function runPermissionHook(deps = {}, agent = "claude") {
       return;
     }
     const interactiveMode = permissionMode === undefined || permissionMode === "default" || agent === "claude" && (permissionMode === "acceptEdits" || permissionMode === "plan");
-    if (!interactiveMode) {
-      const codexDialogMode = agent === "codex" && (permissionMode === "acceptEdits" || permissionMode === "plan");
+    const codexDialogMode = agent === "codex" && (permissionMode === "acceptEdits" || permissionMode === "plan");
+    const questionExempt = !interactiveMode && !codexDialogMode && isQuestionTool(toolName);
+    if (!interactiveMode && !questionExempt) {
       trace({ event: "exit", reason: "mode", mode: permissionMode, ...codexDialogMode ? { codex_dialog_mode: true } : {} });
       return;
     }
+    if (questionExempt)
+      trace({ event: "mode-gate-bypass", reason: "question", mode: permissionMode, tool_name: toolName });
     if (agent === "codex" && !toolName.startsWith("mcp__")) {
       const transcriptPath = typeof input.transcript_path === "string" ? input.transcript_path : "";
       const turnId = typeof input.turn_id === "string" ? input.turn_id : "";
@@ -4167,7 +6124,12 @@ async function runPermissionHook(deps = {}, agent = "claude") {
       permissionRequestId: requestId,
       permissionToolName: toolName
     };
-    const fitted = fitPermissionDetail(permissionBase, buildPermissionDetail(toolName, toolInput), BLOB_FIT_CHARS, buildPermissionQuestions(toolInput));
+    const rawDetail = buildPermissionDetail(toolName, toolInput);
+    const fitted = fitPermissionDetail(permissionBase, rawDetail, BLOB_FIT_CHARS, buildPermissionQuestions(toolInput));
+    const detailFull = fullTextForRecord(rawDetail, fitted.detail);
+    if (record && record.permissionDetailFull !== detailFull) {
+      await (deps.stampDetailFullFn ?? defaultStampDetailFull())(sessionId, detailFull);
+    }
     const blob = await encryptBlob(config.e2eKey, permissionFrame(permissionBase, fitted.detail, fitted.omitted, fitted.questions));
     const fallbackBlob = await encryptBlob(config.e2eKey, base);
     const pcHeaders = { "x-cc-pairing": config.pairingId, "x-cc-auth": config.pcSecret, "x-cc-version": PLUGIN_VERSION };
@@ -4184,7 +6146,16 @@ async function runPermissionHook(deps = {}, agent = "claude") {
           const res = await fetchFn(`${config.url}/v1/cc/decision`, {
             method: "POST",
             headers: { "content-type": "application/json", ...pcHeaders },
-            body: JSON.stringify({ v: 2, sessionId, requestId, op: "update", prio: 1, ts, blob, fallbackBlob }),
+            body: JSON.stringify({
+              v: 2,
+              sessionId,
+              requestId,
+              op: "update",
+              prio: 1,
+              ts,
+              blob,
+              fallbackBlob
+            }),
             signal: AbortSignal.timeout(POST_FIRST_CONTACT_TIMEOUT_MS)
           });
           if (res.ok) {
@@ -4218,31 +6189,56 @@ async function runPermissionHook(deps = {}, agent = "claude") {
       }
       return { posted: posted2, hold: hold2, reason };
     };
+    const clock = deps.now ?? Date.now;
+    const pollBudget = createPollBudget();
     const pollDecision = async (seq2) => {
-      trace({ event: "poll-begin", seq: seq2 });
+      const budgetMs = pollBudget.next(seq2);
+      trace({ event: "poll-begin", seq: seq2, budgetMs });
+      const startedAt = clock();
+      const measure = () => {
+        const ms = clock() - startedAt;
+        pollBudget.observe(ms);
+        return ms;
+      };
       try {
         const res = await fetchFn(`${config.url}/v1/cc/decision/${requestId}`, {
           headers: pcHeaders,
-          signal: AbortSignal.timeout(FETCH_TIMEOUT_MS)
+          signal: AbortSignal.timeout(budgetMs)
         });
         if (!res.ok) {
-          trace({ event: "poll-end", seq: seq2, outcome: "status", status: res.status });
+          trace({ event: "poll-end", seq: seq2, outcome: "status", status: res.status, ms: measure() });
           return { status: res.status };
         }
         const data = await res.json();
-        trace({ event: "poll-end", seq: seq2, outcome: "ok" });
+        trace({ event: "poll-end", seq: seq2, outcome: "ok", ms: measure() });
         return { data, status: res.status };
       } catch (e) {
         trace({ event: "poll-end", seq: seq2, outcome: "error", ...errorTag(e) });
         return { status: 0 };
       }
     };
+    let attentionStalled = false;
+    const stalledPatch = async (at2) => {
+      let stalledBlob = fallbackBlob;
+      try {
+        stalledBlob = await encryptBlob(config.e2eKey, { ...base, reconnecting: Math.floor(at2 / 1000) });
+      } catch {}
+      return { ts: at2, blob: stalledBlob, attentionStalledAt: at2 };
+    };
+    const markAttentionStalled = async () => {
+      const at2 = (deps.now ?? Date.now)();
+      try {
+        await (deps.settleHoldRecordFn ?? defaultSettleHoldRecord())(sessionId, await stalledPatch(at2));
+      } catch {}
+    };
     let { posted, hold, reason: holdReason } = await postDecision(1, POST_MAX_ATTEMPTS);
     if (!posted) {
       const probe = await pollDecision(0);
       const live = probe.data?.status === "pending" || probe.data?.status === "answered";
       if (!live) {
-        trace({ event: "exit", reason: "post-error" });
+        if (probe.status === 0)
+          await markAttentionStalled();
+        trace({ event: "exit", reason: "post-error", ...probe.status === 0 ? { stalled: true } : {} });
         return;
       }
       trace({ event: "post-timeout-landed", status: probe.data?.status });
@@ -4260,7 +6256,8 @@ async function runPermissionHook(deps = {}, agent = "claude") {
       await sleep(HOLD_RETRY_DELAY_MS);
       const retry = await postDecision(2, 1);
       if (!retry.posted) {
-        trace({ event: "exit", reason: "hold-false" });
+        await markAttentionStalled();
+        trace({ event: "exit", reason: "hold-false", stalled: true });
         return;
       }
       hold = retry.hold;
@@ -4271,10 +6268,54 @@ async function runPermissionHook(deps = {}, agent = "claude") {
         return;
       }
     }
-    const jitter = deps.jitter ?? (() => Math.floor(Math.random() * 500));
+    const holdAt = (deps.now ?? Date.now)();
+    const holdPid = deps.holdPid ?? process.pid;
+    let holdBlob = blob;
+    try {
+      holdBlob = await encryptBlob(config.e2eKey, appendFittedPlanAndDebug(permissionFrame(permissionBase, fitted.detail, fitted.omitted, fitted.questions), undefined, formatDecisionHoldDebug({ requestId, pid: holdPid })));
+    } catch {}
+    await (deps.writeHoldFn ?? defaultWriteHold())(sessionId, { blob: holdBlob, at: holdAt, pid: holdPid });
+    heldSessionId = sessionId;
+    settleHeldRecord = async () => {
+      const settledAt = (deps.now ?? Date.now)();
+      const patch = settleAsWorking ? {
+        ts: settledAt,
+        lastEvent: "working",
+        op: "update",
+        prio: 0,
+        sentDone: false,
+        attentionKind: undefined,
+        attentionStalledAt: undefined,
+        blob: await encryptBlob(config.e2eKey, { ...base, status: "working", at: Math.floor(settledAt / 1000) })
+      } : attentionStalled ? await stalledPatch(settledAt) : { ts: settledAt, blob: fallbackBlob, attentionStalledAt: undefined };
+      await (deps.settleHoldRecordFn ?? defaultSettleHoldRecord())(sessionId, patch);
+    };
+    const jitter = deps.jitter ?? (() => Math.floor(Math.random() * POLL_JITTER_MAX_MS));
     const interval = deps.pollIntervalMs ?? POLL_INTERVAL_MS;
     const emit = deps.emit ?? ((line) => process.stdout.write(`${line}
 `));
+    const applyAnswerBlob = async (answerBlob, src) => {
+      const answer = await decryptBlob(config.e2eKey, answerBlob);
+      const match = answer.requestId === requestId;
+      const outcome = match ? emitDecision(agent, answer, toolName, toolInput, suggestions, emit, trace) : "released";
+      if (outcome === "emitted")
+        settleAsWorking = true;
+      if (outcome !== "keep-polling") {
+        trace({ event: "answered", match, outcome, src });
+        trace({ event: "exit", reason: "answered" });
+        return "done";
+      }
+      return "keep-polling";
+    };
+    loopback = createLoopbackAnswerPoller(config, requestId, {
+      fetchFn: deps.lanFetchFn ?? fetchFn,
+      now: deps.now ?? Date.now,
+      trace,
+      statePath: deps.lanStatePath ?? defaultLanStatePath(),
+      sleep: deps.lanSleep,
+      intervalMs: deps.lanIntervalMs,
+      discoverIntervalMs: interval
+    });
     let misses = 0;
     let definitiveFailures = 0;
     let unknownBlob;
@@ -4287,12 +6328,7 @@ async function runPermissionHook(deps = {}, agent = "claude") {
         misses = 0;
         definitiveFailures = 0;
         if (data.status === "answered" && typeof data.answerBlob === "string") {
-          const answer = await decryptBlob(config.e2eKey, data.answerBlob);
-          const match = answer.requestId === requestId;
-          const outcome = match ? emitDecision(agent, answer, toolName, toolInput, suggestions, emit, trace) : "released";
-          if (outcome !== "keep-polling") {
-            trace({ event: "answered", match, outcome });
-            trace({ event: "exit", reason: "answered" });
+          if (await applyAnswerBlob(data.answerBlob, "worker") === "done") {
             return;
           }
           unknownReads = data.answerBlob === unknownBlob ? unknownReads + 1 : 1;
@@ -4303,6 +6339,9 @@ async function runPermissionHook(deps = {}, agent = "claude") {
             return;
           }
         } else if (typeof data.status === "string" && data.status !== "pending") {
+          const settled = loopback === undefined ? undefined : await loopback.settle();
+          if (settled !== undefined && await applyAnswerBlob(settled, "lan") === "done")
+            return;
           trace({ event: data.status === "expired" ? "expired" : "superseded", status: data.status });
           trace({ event: "exit", reason: data.status });
           return;
@@ -4319,15 +6358,29 @@ async function runPermissionHook(deps = {}, agent = "claude") {
           definitiveFailures = 0;
         }
         if (++misses >= MAX_CONSECUTIVE_MISSES) {
-          trace({ event: "giveup", misses });
+          attentionStalled = true;
+          trace({ event: "giveup", misses, stalled: true });
           trace({ event: "exit", reason: "giveup" });
           return;
         }
       }
-      await sleep(interval + jitter());
+      const lanBlob = await loopback.wait(sleep(interval + jitter()));
+      if (lanBlob !== undefined) {
+        if (await applyAnswerBlob(lanBlob, "lan") === "done")
+          return;
+      }
     }
   } catch (e) {
     trace({ event: "exit", reason: "exception", ...errorTag(e) });
+  } finally {
+    try {
+      loopback?.stop();
+    } catch {}
+    if (heldSessionId !== undefined) {
+      try {
+        await (deps.clearHoldFn ?? defaultClearHold())(heldSessionId, deps.holdPid ?? process.pid, settleHeldRecord);
+      } catch {}
+    }
   }
 }
 async function approvalsCommand(sub, deps = {}) {
@@ -4347,25 +6400,87 @@ async function approvalsCommand(sub, deps = {}) {
   return 0;
 }
 
+// src/core/codex-user-input-shape.ts
+var ANSWER_MAX2 = 500;
+var OPTION_LABEL_WIRE_MAX = 60;
+function capLabel(value) {
+  const characters = Array.from(value);
+  return characters.length <= OPTION_LABEL_WIRE_MAX ? value : `${characters.slice(0, OPTION_LABEL_WIRE_MAX - 1).join("")}…`;
+}
+function renderableCodexUserInput(toolInput) {
+  const rawQuestions = toolInput.questions;
+  if (!Array.isArray(rawQuestions) || rawQuestions.length < 1 || rawQuestions.length > 3)
+    return;
+  const questions = [];
+  const ids = [];
+  for (const raw of rawQuestions) {
+    if (!raw || raw.isSecret === true || typeof raw.question !== "string" || raw.question.length === 0) {
+      return;
+    }
+    if (typeof raw.id !== "string" || raw.id.length === 0)
+      return;
+    ids.push(raw.id);
+    if (!Array.isArray(raw.options) || raw.options.length === 0)
+      return;
+    const options = [];
+    const labels = [];
+    for (const candidate of raw.options) {
+      const option = candidate;
+      if (!option || typeof option.label !== "string" || option.label.length === 0)
+        return;
+      const label = option.label;
+      if (label !== label.trim() || label.length > ANSWER_MAX2)
+        return;
+      labels.push(label);
+      options.push({
+        label,
+        description: typeof option.description === "string" ? option.description : ""
+      });
+    }
+    if (new Set(labels).size !== labels.length)
+      return;
+    if (new Set(labels.map(capLabel)).size !== labels.length)
+      return;
+    questions.push({
+      question: raw.question,
+      ...typeof raw.header === "string" ? { header: raw.header } : {},
+      multiSelect: false,
+      options
+    });
+  }
+  if (new Set(ids).size !== ids.length)
+    return;
+  return { questions };
+}
+
 // src/core/codex-remote-input.ts
 var POST_TIMEOUT_MS = 15000;
-var POST_MAX_ATTEMPTS2 = 2;
-var POST_RETRY_PAUSE_MS2 = 1000;
-var POLL_TIMEOUT_MS = 2000;
-var POLL_INTERVAL_MS2 = 3000;
-var MAX_CONSECUTIVE_MISSES2 = 100;
-var ANSWER_MAX2 = 500;
+var ANSWER_MAX3 = 500;
+function defaultWriteHold2() {
+  return lanRunningUnderTest() ? async () => {} : writeDecisionHold;
+}
+function defaultClearHold2() {
+  return lanRunningUnderTest() ? async (_sessionId, _pid, beforeUnlink) => {
+    await beforeUnlink?.();
+    return true;
+  } : clearDecisionHold;
+}
+function defaultSettleHoldRecord2() {
+  return lanRunningUnderTest() ? async () => {} : settleDecisionHoldRecord;
+}
 function codexAnswersFromPhone(request, positional) {
   if (!Array.isArray(positional) || positional.length !== request.questions.length)
     return;
   const mapped = {};
   for (let index = 0;index < request.questions.length; index += 1) {
     const question = request.questions[index];
+    if (typeof question?.id !== "string" || question.id.length === 0)
+      return;
     const raw = positional[index];
     if (typeof raw !== "string")
       return;
     const answer = raw.trim();
-    if (answer.length === 0 || answer.length > ANSWER_MAX2 || !question.options?.length)
+    if (answer.length === 0 || answer.length > ANSWER_MAX3 || !question.options?.length)
       return;
     const hits = question.options.map((option) => option.label).filter((label) => label === answer || capPermissionWireText(label, PERMISSION_QUESTION_LABEL_MAX) === answer);
     const unique = Array.from(new Set(hits));
@@ -4373,30 +6488,9 @@ function codexAnswersFromPhone(request, positional) {
       return;
     mapped[question.id] = [unique[0]];
   }
+  if (Object.keys(mapped).length !== request.questions.length)
+    return;
   return mapped;
-}
-function renderableToolInput(request) {
-  if (request.questions.length < 1 || request.questions.length > 3)
-    return;
-  if (request.questions.some((question) => {
-    if (question.isSecret || !question.options?.length)
-      return true;
-    const labels = question.options.map((option) => option.label);
-    if (labels.some((label) => label !== label.trim() || label.length > ANSWER_MAX2))
-      return true;
-    if (new Set(labels).size !== labels.length)
-      return true;
-    return new Set(labels.map((label) => capPermissionWireText(label, PERMISSION_QUESTION_LABEL_MAX))).size !== labels.length;
-  }))
-    return;
-  return {
-    questions: request.questions.map((question) => ({
-      question: question.question,
-      header: question.header,
-      multiSelect: false,
-      options: question.options.map((option) => ({ ...option }))
-    }))
-  };
 }
 function baseBlob(request, record, config, now) {
   const preview = requestUserInputDetail({ questions: request.questions });
@@ -4455,7 +6549,7 @@ async function parseJson(response) {
     return;
   }
 }
-async function resolveOnRelay(config, requestId, fetchFn) {
+async function resolveOnRelay(config, requestId, fetchFn = fetch) {
   try {
     await fetchFn(`${config.url}/v1/cc/decision/resolve`, {
       method: "POST",
@@ -4472,8 +6566,11 @@ async function resolveOnRelay(config, requestId, fetchFn) {
 }
 async function runRemoteInput(request, requestId, signal, deps, onHoldCreated) {
   let holdCreated = false;
+  let heldSessionId;
+  let resumed = false;
+  let settleHeldRecord;
   try {
-    const toolInput = renderableToolInput(request);
+    const toolInput = renderableCodexUserInput({ questions: request.questions });
     if (!toolInput)
       return "unsupported";
     const record = await (deps.readRecordFn ?? readRecord)(request.identity.threadId);
@@ -4515,8 +6612,22 @@ async function runRemoteInput(request, requestId, signal, deps, onHoldCreated) {
       const timer = setTimeout(resolve2, ms);
       timer.unref?.();
     }));
+    let attentionStalled = false;
+    const stalledPatch = async (at) => {
+      let stalledBlob = fallbackBlob;
+      try {
+        stalledBlob = await encryptBlob(deps.config.e2eKey, { ...fallback, reconnecting: Math.floor(at / 1000) });
+      } catch {}
+      return { ts: at, blob: stalledBlob, attentionStalledAt: at };
+    };
+    const markAttentionStalled = async () => {
+      const at = (deps.now ?? Date.now)();
+      try {
+        await (deps.settleHoldRecordFn ?? defaultSettleHoldRecord2())(request.identity.threadId, await stalledPatch(at));
+      } catch {}
+    };
     let response;
-    for (let attempt = 1;attempt <= POST_MAX_ATTEMPTS2 && !signal.aborted; attempt += 1) {
+    for (let attempt = 1;attempt <= POST_MAX_ATTEMPTS && !signal.aborted; attempt += 1) {
       try {
         response = await fetchFn(`${deps.config.url}/v1/cc/decision`, {
           method: "POST",
@@ -4537,13 +6648,15 @@ async function runRemoteInput(request, requestId, signal, deps, onHoldCreated) {
         });
         break;
       } catch {
-        if (attempt < POST_MAX_ATTEMPTS2 && !signal.aborted) {
-          await abortableSleep(POST_RETRY_PAUSE_MS2, signal, sleep);
+        if (attempt < POST_MAX_ATTEMPTS && !signal.aborted) {
+          await abortableSleep(POST_RETRY_PAUSE_MS, signal, sleep);
         }
       }
     }
     if (!response) {
       await resolveOnRelay(deps.config, requestId, fetchFn);
+      if (!signal.aborted)
+        await markAttentionStalled();
       return signal.aborted ? "resolved-elsewhere" : "transport-error";
     }
     if (!response.ok)
@@ -4557,6 +6670,28 @@ async function runRemoteInput(request, requestId, signal, deps, onHoldCreated) {
     if (created.hold !== true)
       return signal.aborted ? "resolved-elsewhere" : "not-held";
     holdCreated = true;
+    const holdPid = deps.holdPid ?? process.pid;
+    await (deps.writeHoldFn ?? defaultWriteHold2())(request.identity.threadId, { blob, at: now, pid: holdPid });
+    heldSessionId = request.identity.threadId;
+    settleHeldRecord = async () => {
+      const settledAt = (deps.now ?? Date.now)();
+      const unblocked = resumed || signal.aborted;
+      const patch = unblocked ? {
+        ts: settledAt,
+        lastEvent: "working",
+        op: "update",
+        prio: 0,
+        sentDone: false,
+        attentionKind: undefined,
+        attentionStalledAt: undefined,
+        blob: await encryptBlob(deps.config.e2eKey, {
+          ...promptBase,
+          status: "working",
+          at: Math.floor(settledAt / 1000)
+        })
+      } : attentionStalled ? await stalledPatch(settledAt) : { ts: settledAt, blob: fallbackBlob, attentionStalledAt: undefined };
+      await (deps.settleHoldRecordFn ?? defaultSettleHoldRecord2())(request.identity.threadId, patch);
+    };
     onHoldCreated(true);
     if (signal.aborted)
       return "resolved-elsewhere";
@@ -4564,15 +6699,62 @@ async function runRemoteInput(request, requestId, signal, deps, onHoldCreated) {
       report(deps, new Error(`Codex ${action} was not delivered to app-server (${outcome})`), "Codex remote input delivery");
       await resolveOnRelay(deps.config, requestId, fetchFn);
     };
+    const applyAnswerBlob = async (answerBlob) => {
+      const reject = (why, result2) => {
+        report(deps, new Error(`Codex phone answer rejected (${why})`), "Codex remote input answer");
+        return result2;
+      };
+      let answer;
+      try {
+        answer = await decryptBlob(deps.config.e2eKey, answerBlob);
+      } catch {
+        return reject("undecryptable", "transport-error");
+      }
+      if (answer.requestId !== requestId)
+        return reject("request-id mismatch", "unsupported");
+      if (answer.decision === "deny") {
+        const result2 = await deps.interruptAppServer();
+        if (result2 === "sent" || result2 === "already-sent") {
+          resumed = true;
+          return "denied";
+        }
+        await reportUndelivered("deny", result2);
+        return "transport-error";
+      }
+      if (answer.decision !== "answer")
+        return reject("unknown decision", "unsupported");
+      const mapped = codexAnswersFromPhone(request, answer.answers);
+      if (!mapped)
+        return reject("unmappable to the app-server questions", "unsupported");
+      const result = await deps.answerAppServer(mapped);
+      if (result === "sent" || result === "already-sent") {
+        resumed = true;
+        return "answered";
+      }
+      await reportUndelivered("answer", result);
+      return "transport-error";
+    };
+    const answers = deps.answerStore ?? lanAnswerStore;
+    const clock = deps.now ?? Date.now;
+    const localAnswer = () => answers.peek(requestId, clock())?.answerBlob;
     let misses = 0;
     let definitiveFailures = 0;
+    let polls = 0;
+    const pollBudget = deps.pollBudget ?? createPollBudget();
     while (!signal.aborted) {
+      const local = localAnswer();
+      if (local)
+        return await applyAnswerBlob(local);
+      polls += 1;
+      const budgetMs = pollBudget.next(polls);
+      const startedAt = clock();
       try {
         const response2 = await fetchFn(`${deps.config.url}/v1/cc/decision/${requestId}`, {
           headers,
-          signal: requestSignal(POLL_TIMEOUT_MS, signal)
+          signal: requestSignal(budgetMs, signal)
         });
         const data = response2.ok ? await parseJson(response2) : undefined;
+        pollBudget.observe(clock() - startedAt);
         if (!data) {
           misses += 1;
           if (response2.ok)
@@ -4588,43 +6770,28 @@ async function runRemoteInput(request, requestId, signal, deps, onHoldCreated) {
           misses = 0;
           definitiveFailures = 0;
           if (data.status === "answered" && typeof data.answerBlob === "string") {
-            let answer;
-            try {
-              answer = await decryptBlob(deps.config.e2eKey, data.answerBlob);
-            } catch {
-              return "transport-error";
-            }
-            if (answer.requestId !== requestId)
-              return "unsupported";
-            if (answer.decision === "deny") {
-              const result2 = await deps.interruptAppServer();
-              if (result2 === "sent" || result2 === "already-sent")
-                return "denied";
-              await reportUndelivered("deny", result2);
-              return "transport-error";
-            }
-            if (answer.decision !== "answer")
-              return "unsupported";
-            const mapped = codexAnswersFromPhone(request, answer.answers);
-            if (!mapped)
-              return "unsupported";
-            const result = await deps.answerAppServer(mapped);
-            if (result === "sent" || result === "already-sent")
-              return "answered";
-            await reportUndelivered("answer", result);
-            return "transport-error";
-          } else if (data.status === "expired")
-            return "expired";
-          else if (data.status === "superseded")
-            return "superseded";
+            return await applyAnswerBlob(data.answerBlob);
+          } else if (data.status === "expired" || data.status === "superseded") {
+            const raced = localAnswer();
+            if (raced)
+              return await applyAnswerBlob(raced);
+            return data.status === "expired" ? "expired" : "superseded";
+          }
         }
       } catch {
         misses += 1;
         definitiveFailures = 0;
       }
-      if (misses >= MAX_CONSECUTIVE_MISSES2)
+      if (misses >= MAX_CONSECUTIVE_MISSES) {
+        attentionStalled = true;
         return "transport-error";
-      await abortableSleep(deps.pollIntervalMs ?? POLL_INTERVAL_MS2, signal, sleep);
+      }
+      const waiter = answers.waiter(requestId, clock());
+      try {
+        await Promise.race([abortableSleep(deps.pollIntervalMs ?? POLL_INTERVAL_MS, signal, sleep), waiter.promise]);
+      } finally {
+        waiter.cancel();
+      }
     }
     return "resolved-elsewhere";
   } catch (error) {
@@ -4633,6 +6800,11 @@ async function runRemoteInput(request, requestId, signal, deps, onHoldCreated) {
       await resolveOnRelay(deps.config, requestId, deps.fetchFn ?? fetch);
     return signal.aborted ? "resolved-elsewhere" : "transport-error";
   } finally {
+    if (heldSessionId !== undefined) {
+      try {
+        await (deps.clearHoldFn ?? defaultClearHold2())(heldSessionId, deps.holdPid ?? process.pid, settleHeldRecord);
+      } catch {}
+    }
     if (!holdCreated)
       onHoldCreated(false);
   }
@@ -4687,6 +6859,8 @@ class CodexRemoteInputBridge {
   startRemoteInputFn;
   onError;
   subscribedThreads = new Set;
+  pendingRequests = new Set;
+  resolvedWhilePending = new Set;
   handles = new Map;
   pendingRetirements = new Set;
   refreshPromise;
@@ -4796,29 +6970,45 @@ class CodexRemoteInputBridge {
     if (this.stopping)
       return;
     const key = requestKey(request);
-    if (this.handles.has(key))
+    if (this.handles.has(key) || this.pendingRequests.has(key))
       return;
-    const handle = this.startRemoteInputFn(request, {
-      config: this.config,
-      answerAppServer: (answers) => this.client.answerUserInput(request.identity, answers),
-      interruptAppServer: () => this.client.interruptUserInput(request.identity),
-      onError: (error) => this.reportError(error)
-    });
-    this.handles.set(key, handle);
-    handle.completion.then(() => {
-      return;
-    }, (error) => this.reportError(error, "Codex remote input failed")).then(() => {
-      if (this.handles.get(key) === handle)
-        this.handles.delete(key);
-    }).catch(() => {
-      return;
-    });
+    this.pendingRequests.add(key);
+    this.routeRequest(request, key);
+  }
+  async routeRequest(request, key) {
+    try {
+      if (this.stopping || this.handles.has(key) || this.resolvedWhilePending.delete(key))
+        return;
+      const handle = this.startRemoteInputFn(request, {
+        config: this.config,
+        answerAppServer: (answers) => this.client.answerUserInput(request.identity, answers),
+        interruptAppServer: () => this.client.interruptUserInput(request.identity),
+        onError: (error) => this.reportError(error)
+      });
+      this.handles.set(key, handle);
+      handle.completion.then(() => {
+        return;
+      }, (error) => this.reportError(error, "Codex remote input failed")).then(() => {
+        if (this.handles.get(key) === handle)
+          this.handles.delete(key);
+      }).catch(() => {
+        return;
+      });
+    } catch (error) {
+      this.reportError(error, "Failed to arbitrate Codex remote input");
+    } finally {
+      this.pendingRequests.delete(key);
+      this.resolvedWhilePending.delete(key);
+    }
   }
   onResolved(request, resolution) {
     const key = requestKey(request);
     const handle = this.handles.get(key);
-    if (!handle)
+    if (!handle) {
+      if (this.pendingRequests.has(key))
+        this.resolvedWhilePending.add(key);
       return;
+    }
     this.handles.delete(key);
     if (resolution !== "response-sent" && resolution !== "interrupt-sent") {
       this.retire(handle, "Failed to retire a Codex phone card");
@@ -4856,7 +7046,7 @@ function resetDoneAttemptMemory() {
 }
 async function readRecordAt(path) {
   try {
-    return JSON.parse(await readFile4(path, "utf8"));
+    return JSON.parse(await readFile8(path, "utf8"));
   } catch {
     return null;
   }
@@ -4892,9 +7082,28 @@ function classifySession(record, now, isAlive) {
     return "delete";
   if (typeof record.ts !== "number")
     return "delete";
+  if (record.agent === "codex" && typeof record.retiredAt === "number" && Number.isFinite(record.retiredAt)) {
+    if (typeof record.tuiPid !== "number" || !Number.isFinite(record.tuiPid))
+      return "delete";
+    return isAlive(record.tuiPid) ? "keep" : "delete";
+  }
   if (now - record.ts > SESSION_STALE_MS)
     return "stale";
-  return isAlive(record.pid) ? "keep" : "end";
+  const ownerPid = record.agent === "codex" && typeof record.tuiPid === "number" && Number.isFinite(record.tuiPid) ? record.tuiPid : record.pid;
+  return isAlive(ownerPid) ? "keep" : "end";
+}
+async function locateCodexOwnedTui(sessionId, record) {
+  const resolved = resolveCodexTuiOwner(record, await readAllRecords(), pidAlive);
+  if (resolved !== undefined)
+    return resolved;
+  const locate = adapterFor("codex").locateTuiPid;
+  if (!locate)
+    return;
+  let reason;
+  const pid = await locate({ sessionId, record }, { note: (value) => {
+    reason = value;
+  } });
+  return reason === "record-pid" || reason === "sentinel-pid" ? pid : undefined;
 }
 function startedAtField(record) {
   return typeof record.sessionStartedAt === "number" && Number.isFinite(record.sessionStartedAt) ? { startedAt: record.sessionStartedAt } : {};
@@ -4921,7 +7130,7 @@ async function buildDoneEnvelope(sessionId, record, now, e2eKey, agent = "claude
     ...typeof record.model === "string" && record.model.length > 0 ? { model: record.model } : {},
     ...typeof at === "number" && Number.isFinite(at) ? { at } : {}
   };
-  const debug = agent === "codex" ? dbg ?? formatPlanPickerDebug({ event: "done", classifier: "done", marker: "0", by: "wd" }) : undefined;
+  const debug = appendCodexBridgeMarker(agent === "codex" ? dbg ?? formatPlanPickerDebug({ event: "done", classifier: "done", marker: "0", by: "wd" }) : undefined, codexBridgeIsDown());
   const blob = await encryptBlob(e2eKey, appendFittedPlanAndDebug(base, undefined, debug));
   return { v: 2, sessionId, op: "done", prio: 0, ts: now, blob, ...startedAtField(record) };
 }
@@ -4937,7 +7146,7 @@ async function buildNeedsAttentionEnvelope(sessionId, record, now, e2eKey, agent
     ...typeof record.model === "string" && record.model.length > 0 ? { model: record.model } : {},
     ...typeof at === "number" && Number.isFinite(at) ? { at } : {}
   };
-  const debug = agent === "codex" ? dbg ?? formatPlanPickerDebug({ event: "attention", classifier: "pending", marker: "0", by: "wd" }) : undefined;
+  const debug = appendCodexBridgeMarker(agent === "codex" ? dbg ?? formatPlanPickerDebug({ event: "attention", classifier: "pending", marker: "0", by: "wd" }) : undefined, codexBridgeIsDown());
   const blob = await encryptBlob(e2eKey, appendFittedPlanAndDebug(base, proposedPlan, debug));
   return {
     v: 2,
@@ -4961,7 +7170,7 @@ async function buildWorkingEnvelope(sessionId, record, now, e2eKey, agent = "cla
     ...typeof record.model === "string" && record.model.length > 0 ? { model: record.model } : {},
     at: Math.floor(now / 1000)
   };
-  const debug = agent === "codex" ? dbg ?? formatPlanPickerDebug({ event: "working", classifier: "resolved", marker: "0", by: "wd" }) : undefined;
+  const debug = appendCodexBridgeMarker(agent === "codex" ? dbg ?? formatPlanPickerDebug({ event: "working", classifier: "resolved", marker: "0", by: "wd" }) : undefined, codexBridgeIsDown());
   const blob = await encryptBlob(e2eKey, appendFittedPlanAndDebug(base, undefined, debug));
   return { v: 2, sessionId, op: "update", prio: 0, ts: now, blob, ...startedAtField(record) };
 }
@@ -5003,6 +7212,7 @@ async function settlePendingPlanPickerDone(config, path, sessionId, snapshot, no
   const envelope = await buildDoneEnvelope(sessionId, snapshot, now, config.e2eKey, "codex", at, dbg);
   const next = {
     ...fresh,
+    ts: now,
     lastEvent: "done",
     sentDone: true,
     donePending: true,
@@ -5066,6 +7276,24 @@ function correlateCodexTuiPid(record, candidates, alive = pidAlive) {
     return;
   const matches = candidates.filter((candidate) => candidate.provisional === true && candidate.agent === "codex" && candidate.tuiCwd === cwd && typeof candidate.pid === "number" && Number.isFinite(candidate.pid) && typeof candidate.tuiStartedAt === "number" && Number.isFinite(candidate.tuiStartedAt) && startedAt - candidate.tuiStartedAt >= -CODEX_TUI_SESSION_START_FUTURE_SLOP_MS && startedAt - candidate.tuiStartedAt <= CODEX_TUI_SESSION_START_SKEW_MS && alive(candidate.pid));
   return matches.length === 1 ? matches[0].pid : undefined;
+}
+function resolveCodexTuiOwner(record, candidates, alive = pidAlive) {
+  if (record.agent !== "codex")
+    return;
+  if (typeof record.tuiPid === "number" && Number.isFinite(record.tuiPid) && alive(record.tuiPid)) {
+    return record.tuiPid;
+  }
+  if (record.provisional === true && typeof record.pid === "number" && Number.isFinite(record.pid) && alive(record.pid)) {
+    return record.pid;
+  }
+  const command = record.origin?.ppid_command;
+  if (typeof command === "string") {
+    const tokens = command.trim().split(/\s+/);
+    if (basename5(tokens[0] ?? "") === "codex" && tokens[1] !== "app-server" && !tokens.slice(1).includes("exec") && typeof record.pid === "number" && alive(record.pid)) {
+      return record.pid;
+    }
+  }
+  return correlateCodexTuiPid(record, candidates, alive);
 }
 async function correctResolvedPlanPicker(config, path, sessionId, record, deps = {}) {
   try {
@@ -5177,6 +7405,8 @@ function shouldPlanPickerVerificationCheck(record, now) {
     return false;
   if (record.planPickerVerificationPending === true)
     return true;
+  if (record.planPickerSettled === true)
+    return false;
   if (record.op !== "done" || record.lastEvent !== "done" || record.sentDone !== true)
     return false;
   if (typeof record.ts !== "number" || !Number.isFinite(record.ts))
@@ -5196,7 +7426,8 @@ async function correctPlanPickerVerification(config, path, sessionId, record, de
     if (!shouldPlanPickerVerificationCheck(record, now))
       return "uncorrected";
     const recentDoneBackstop = record.planPickerVerificationPending !== true;
-    if (recentDoneBackstop && !(deps.pidAlive ?? pidAlive)(record.pid)) {
+    const ownerPid = typeof record.tuiPid === "number" && Number.isFinite(record.tuiPid) ? record.tuiPid : record.pid;
+    if (recentDoneBackstop && !(deps.pidAlive ?? pidAlive)(ownerPid)) {
       tracePicker(sessionId, deps, {
         source: "watchdog",
         classifier: "dead-pid",
@@ -5380,12 +7611,16 @@ function watchdogEventHeaders(config, approvals) {
     "x-cc-role": "watchdog"
   };
 }
+var activeLanListener;
+var lanHintPublisher = createLanHintPublisher({ address: () => activeLanListener?.address() ?? null });
 async function postEvent(config, body) {
   try {
+    const lanHint = await lanHintPublisher.take(config);
+    const payload = lanHint ? { ...body, lanHint } : body;
     const res = await fetch(`${config.url}/v1/cc/event`, {
       method: "POST",
       headers: watchdogEventHeaders(config, await localApprovalsState()),
-      body: JSON.stringify(body),
+      body: JSON.stringify(payload),
       signal: AbortSignal.timeout(2000)
     });
     const outcome = postOutcomeForStatus(res.status);
@@ -5460,15 +7695,6 @@ function bufferCommands(commands) {
     commandBuffer.push(c);
   }
 }
-function rememberBounded(set, value, max) {
-  set.add(value);
-  while (set.size > max) {
-    const oldest = set.values().next();
-    if (oldest.done)
-      break;
-    set.delete(oldest.value);
-  }
-}
 function resetCommandState() {
   commandBuffer.length = 0;
   executedCommandIds.clear();
@@ -5484,6 +7710,37 @@ function traceFocus(deps, event) {
   if (process.argv.some((arg) => arg === "test" || arg.endsWith(".test.ts")))
     return;
   traceSession(event);
+}
+async function releaseFocusedTuiUserInputHold(config, sessionId, now, deps) {
+  const readHold = deps.readDecisionHoldFn ?? (lanRunningUnderTest() ? async () => null : (id) => readDecisionHoldAt(SESSIONS_DIR, id));
+  const hold = await readHold(sessionId);
+  const alive = hold && typeof hold.pid === "number" ? (deps.holdPidAliveFn ?? pidAlive)(hold.pid) : false;
+  if (!stateHoldLive(hold, alive, now))
+    return false;
+  let card;
+  try {
+    const plain = await decryptBlob(config.e2eKey, hold.blob);
+    if (typeof plain !== "object" || plain === null)
+      return false;
+    card = plain;
+  } catch {
+    return false;
+  }
+  const requestId = card.permissionRequestId;
+  if (card.status !== "decisionPending" || card.agent !== "codex" || card.permissionToolName !== "request_user_input" || typeof requestId !== "string" || requestId.length === 0 || Object.prototype.hasOwnProperty.call(card, "permissionQuestions"))
+    return false;
+  const answerBlob = await encryptBlob(config.e2eKey, {
+    requestId,
+    decision: "allow",
+    ts: Math.floor(now / 1000)
+  });
+  const stored = (deps.answerStore ?? lanAnswerStore).put(requestId, answerBlob, now);
+  if (stored !== "stored")
+    return false;
+  try {
+    Promise.resolve((deps.resolveDecisionFn ?? resolveOnRelay)(config, requestId)).catch(() => {});
+  } catch {}
+  return true;
 }
 async function drainCommands(config, deps = {}) {
   try {
@@ -5562,13 +7819,15 @@ async function drainCommands(config, deps = {}) {
         const outcome = await focus(pid, { agent, record: entry.rec });
         if (outcome.ok) {
           focused += 1;
+          const releasedTuiInput = await releaseFocusedTuiUserInputHold(config, payload.sessionId, now, deps).catch(() => false);
           traceFocus(deps, {
             ...base,
             agent,
             pid,
             result: "focused",
             via: outcome.via,
-            reason: outcome.reason ?? reason
+            reason: outcome.reason ?? reason,
+            ...releasedTuiInput ? { releasedTuiInput: true } : {}
           });
           continue;
         }
@@ -5584,18 +7843,52 @@ async function drainCommands(config, deps = {}) {
     return 0;
   }
 }
+var drainChain = Promise.resolve();
+function enqueueDrainCommands(config, deps = {}) {
+  const run = () => drainCommands(config, deps);
+  const next = drainChain.then(run, run);
+  drainChain = next.catch(() => {});
+  return next;
+}
+var LAN_COMMAND_ID_PREFIX = "lan:";
+function acceptLanCommand(command, deps = {}) {
+  try {
+    if (commandBuffer.length >= COMMAND_BUFFER_MAX)
+      return Promise.resolve(0);
+    commandBuffer.push({ id: `${LAN_COMMAND_ID_PREFIX}${command.nonce}`, blob: command.blob });
+    return enqueueDrainCommands(command.config, deps).catch(() => 0);
+  } catch {
+    return Promise.resolve(0);
+  }
+}
+var LAN_ANSWER_ECHO_DELAY_MS = 5000;
+function acceptLanAnswer(answer, deps = {}) {
+  try {
+    const resolve2 = deps.resolveFn ?? ((config, requestId) => resolveOnRelay(config, requestId, fetch));
+    const delayMs = deps.delayMs ?? LAN_ANSWER_ECHO_DELAY_MS;
+    const sleep = deps.sleep ?? ((ms) => new Promise((done) => {
+      const timer = setTimeout(done, ms);
+      timer.unref?.();
+    }));
+    return (delayMs > 0 ? sleep(delayMs) : Promise.resolve()).then(() => resolve2(answer.config, answer.requestId)).catch(() => {
+      traceFocus(deps, { event: "lan", result: "echo-failed", requestId: answer.requestId });
+    });
+  } catch {
+    return Promise.resolve();
+  }
+}
 function machineName(config) {
   return config.machineName ?? hostname4().replace(/\.local$/, "");
 }
 async function readAllRecordEntries() {
   try {
-    const files = await readdir3(SESSIONS_DIR);
+    const files = await readdir4(SESSIONS_DIR);
     const out = [];
     for (const f of files) {
       if (!f.endsWith(".json"))
         continue;
       try {
-        out.push({ sessionId: basename4(f, ".json"), rec: JSON.parse(await readFile4(`${SESSIONS_DIR}/${f}`, "utf8")) });
+        out.push({ sessionId: basename5(f, ".json"), rec: JSON.parse(await readFile8(`${SESSIONS_DIR}/${f}`, "utf8")) });
       } catch {}
     }
     return out;
@@ -5615,12 +7908,12 @@ async function buildProvisionalBlob(d, machine, blobAgentFields, e2eKey, at) {
     ...blobAgentFields,
     ...typeof at === "number" && Number.isFinite(at) ? { at } : {}
   };
-  const dbg = blobAgentFields.agent === "codex" ? formatPlanPickerDebug({
+  const dbg = appendCodexBridgeMarker(blobAgentFields.agent === "codex" ? formatPlanPickerDebug({
     event: "discover",
     classifier: d.idle === true ? "done" : "work",
     marker: "0",
     by: "wd"
-  }) : undefined;
+  }) : undefined, codexBridgeIsDown());
   return encryptBlob(e2eKey, appendFittedPlanAndDebug(base, undefined, dbg));
 }
 function buildProvisionalEnvelope(sessionId, blob, now, idle) {
@@ -5645,12 +7938,12 @@ function buildProvisionalRecord(d, machine, blob, blobAgentFields, now, pairingI
     ...typeof d.startedAt === "number" && Number.isFinite(d.startedAt) ? { tuiStartedAt: d.startedAt } : {},
     ...typeof d.title === "string" && d.title.length > 0 ? { title: d.title } : {},
     ...blobAgentFields,
-    ...blobAgentFields.agent === "codex" ? { dbg: formatPlanPickerDebug({
+    ...blobAgentFields.agent === "codex" ? { dbg: appendCodexBridgeMarker(formatPlanPickerDebug({
       event: "discover",
       classifier: idle ? "done" : "work",
       marker: "0",
       by: "wd"
-    }) } : {},
+    }), codexBridgeIsDown()) } : {},
     ...typeof pairingId === "string" && pairingId.length > 0 ? { pairingId } : {}
   };
 }
@@ -5808,7 +8101,8 @@ async function correctPendingApproval(config, path, sessionId, record, now, deps
         op: "update",
         prio: 1,
         sentDone: false,
-        ...typeof envelope.blob === "string" ? { blob: envelope.blob } : {}
+        ...typeof envelope.blob === "string" ? { blob: envelope.blob } : {},
+        attentionKind
       };
       await writeRecord(path, next);
     } catch {}
@@ -5869,6 +8163,9 @@ function isClaudeIdleReapEligible(record, now, transcriptMtimeMs = transcriptMti
     return false;
   if (record.provisional === true)
     return false;
+  return idleReapAgeEligible(record, now, transcriptMtimeMs);
+}
+function idleReapAgeEligible(record, now, transcriptMtimeMs = transcriptMtimeMsDefault) {
   if (record.lastEvent !== "working" && record.lastEvent !== "sessionStart")
     return false;
   if (typeof record.ts !== "number")
@@ -5889,8 +8186,37 @@ async function correctIdleClaude(config, path, sessionId, record, now, deps = {}
   const writeRecord = deps.writeRecord ?? ((p, rec) => atomicWrite(p, JSON.stringify(rec), 384));
   const clock = deps.now ?? Date.now;
   try {
-    if (!isClaudeIdleReapEligible(record, now))
+    const agent = record.agent === "codex" ? "codex" : "claude";
+    if (agent === "codex") {
+      if (record.provisional === true || !idleReapAgeEligible(record, now) || typeof record.transcript !== "string" || record.transcript.length === 0)
+        return "uncorrected";
+      let tuiPid = typeof record.tuiPid === "number" && Number.isFinite(record.tuiPid) ? record.tuiPid : undefined;
+      if (tuiPid === undefined) {
+        const locate = deps.locateTuiPid ?? locateCodexOwnedTui;
+        try {
+          tuiPid = await locate(sessionId, record);
+        } catch {
+          return "uncorrected";
+        }
+      }
+      if (typeof tuiPid !== "number" || !Number.isFinite(tuiPid) || !(deps.pidAlive ?? pidAlive)(tuiPid)) {
+        return "uncorrected";
+      }
+      const transcript = record.transcript;
+      const active = deps.codexTurnActive ?? (async (_pid, path2) => {
+        const tail = await readSuffix(path2, 8 * 1024);
+        return codexTurnActiveFromTail(tail, Date.now() - statSync3(path2).mtimeMs);
+      });
+      try {
+        if (await active(tuiPid, transcript))
+          return "uncorrected";
+      } catch {
+        return "uncorrected";
+      }
+      record = { ...record, tuiPid };
+    } else if (!isClaudeIdleReapEligible(record, now)) {
       return "uncorrected";
+    }
     const attempts = effectiveDoneAttempts(record, sessionId);
     if (attempts >= CLAUDE_IDLE_REAP_MAX_ATTEMPTS) {
       try {
@@ -5900,7 +8226,7 @@ async function correctIdleClaude(config, path, sessionId, record, now, deps = {}
       return "pending";
     }
     const doneNow = clock();
-    const outcome = await post(await buildDoneEnvelope(sessionId, record, doneNow, config.e2eKey, "claude", Math.floor(record.ts / 1000)));
+    const outcome = await post(await buildDoneEnvelope(sessionId, record, doneNow, config.e2eKey, agent, Math.floor(record.ts / 1000)));
     if (outcome === "revoked")
       return "revoked";
     if (outcome === "delivered") {
@@ -5962,10 +8288,19 @@ async function correctPendingDone(config, path, sessionId, record, now, deps = {
         await writeRecord(path, write);
         clearDoneAttempts(sessionId);
       } catch {}
+      traceFocus(deps, { event: "pending-done", sessionId, outcome: "capped", attempts, delivered: false });
       return "pending";
     }
     const at = typeof record.ts === "number" && Number.isFinite(record.ts) ? Math.floor(record.ts / 1000) : undefined;
     const outcome = await post(await buildDoneEnvelope(sessionId, record, clock(), config.e2eKey, agent, at));
+    traceFocus(deps, {
+      event: "pending-done",
+      sessionId,
+      outcome,
+      attempts,
+      delivered: outcome === "delivered",
+      at
+    });
     if (outcome === "revoked")
       return "revoked";
     if (outcome === "delivered") {
@@ -5990,11 +8325,11 @@ async function correctPendingDone(config, path, sessionId, record, now, deps = {
     return "uncorrected";
   }
 }
-var RETIRE_AFTER_MS = 3600000;
+var RETIRE_AFTER_MS = PLAN_PICKER_PENDING_MAX_MS + 15 * 60000;
 function isRetireEligible(record, now) {
-  if (record.agent === "codex")
+  if (typeof record.retiredAt === "number" && Number.isFinite(record.retiredAt))
     return false;
-  if (record.provisional === true)
+  if (record.provisional === true && record.agent !== "codex")
     return false;
   if (record.op !== "done" && record.lastEvent !== "done")
     return false;
@@ -6005,6 +8340,9 @@ function isRetireEligible(record, now) {
 async function retireDoneStale(config, path, sessionId, record, now, deps = {}) {
   const post = deps.post ?? ((body) => postEvent(config, body));
   const deleteRecord = deps.deleteRecord ?? ((p) => unlink4(p).catch(() => {}));
+  const writeRecord = deps.writeRecord ?? ((p, rec) => atomicWrite(p, JSON.stringify(rec), 384));
+  const alive = deps.pidAlive ?? pidAlive;
+  const locateTuiPid = deps.locateTuiPid ?? locateCodexOwnedTui;
   const reread = deps.readRecord ?? readRecordAt;
   const freshRecord = async () => {
     try {
@@ -6013,22 +8351,64 @@ async function retireDoneStale(config, path, sessionId, record, now, deps = {}) 
       return null;
     }
   };
+  const breadcrumb = (outcome, tuiPid) => traceFocus(deps, {
+    event: "retire",
+    reason: "idle-done",
+    sessionId,
+    recordTs: record.ts,
+    ageMs: typeof record.ts === "number" ? now - record.ts : undefined,
+    tuiPid,
+    outcome
+  });
   try {
     if (!isRetireEligible(record, now))
       return "skip";
+    let tuiPid;
+    if (record.agent === "codex") {
+      const cached = typeof record.tuiPid === "number" && Number.isFinite(record.tuiPid) ? record.tuiPid : undefined;
+      if (cached !== undefined && alive(cached))
+        tuiPid = cached;
+      if (tuiPid === undefined) {
+        try {
+          const located = await locateTuiPid(sessionId, record);
+          if (typeof located === "number" && Number.isFinite(located) && alive(located))
+            tuiPid = located;
+        } catch {}
+      }
+    }
     const before = await freshRecord();
-    if (before && (recordMovedSince(record, before) || !isRetireEligible(before, now)))
+    if (before && (recordMovedSince(record, before) || !isRetireEligible(before, now))) {
+      breadcrumb("skip-woken", tuiPid);
       return "skip";
+    }
     const outcome = await post(buildEndEnvelope(sessionId, now, record, Math.floor(record.ts / 1000)));
-    if (outcome === "revoked")
+    if (outcome === "revoked") {
+      breadcrumb("revoked", tuiPid);
       return "revoked";
+    }
     const after = await freshRecord();
-    if (after && recordMovedSince(record, after))
+    if (after && recordMovedSince(record, after)) {
+      breadcrumb("skip-woken-post", tuiPid);
       return "skip";
+    }
     heartbeatAt.delete(sessionId);
     clearDoneAttempts(sessionId);
-    await deleteRecord(path);
-    return outcome === "delivered" ? "retired" : "retired-offline";
+    if (record.agent === "codex" && tuiPid !== undefined) {
+      await writeRecord(path, {
+        pid: tuiPid,
+        machine: record.machine,
+        label: record.label,
+        ts: record.ts,
+        agent: "codex",
+        tuiPid,
+        retiredAt: now
+      });
+    } else {
+      await deleteRecord(path);
+    }
+    const verdict = outcome === "delivered" ? "retired" : "retired-offline";
+    breadcrumb(verdict, tuiPid);
+    return verdict;
   } catch {
     return "skip";
   }
@@ -6052,12 +8432,12 @@ async function buildTitleRepairEnvelope(sessionId, record, title, now, e2eKey, a
     ...typeof record.model === "string" && record.model.length > 0 ? { model: record.model } : {},
     ...typeof at === "number" && Number.isFinite(at) ? { at } : {}
   };
-  const dbg = agent === "codex" ? record.dbg ?? formatPlanPickerDebug({
+  const dbg = appendCodexBridgeMarker(agent === "codex" ? record.dbg ?? formatPlanPickerDebug({
     event: "title",
     classifier: statusFromRecord(record),
     marker: record.pendingPlanPicker ? "p" : record.planPickerVerificationPending ? "v" : record.planPickerSettled ? "s" : "0",
     by: "wd"
-  }) : undefined;
+  }) : undefined, codexBridgeIsDown());
   const blob = await encryptBlob(e2eKey, appendFittedPlanAndDebug(base, undefined, dbg));
   return { v: 2, sessionId, op: record.op ?? "update", prio: record.prio ?? 0, ts: now, blob, ...startedAtField(record) };
 }
@@ -6151,7 +8531,7 @@ var waitingBeatAt;
 async function sweep(config, deps = {}) {
   let files;
   try {
-    files = await readdir3(SESSIONS_DIR);
+    files = await readdir4(SESSIONS_DIR);
   } catch {
     return { revoked: false, remaining: 0, delivered: false };
   }
@@ -6162,14 +8542,18 @@ async function sweep(config, deps = {}) {
     if (!file.endsWith(".json"))
       continue;
     const path = `${SESSIONS_DIR}/${file}`;
-    const sessionId = basename4(file, ".json");
+    const sessionId = basename5(file, ".json");
     let record = null;
     try {
-      record = JSON.parse(await readFile4(path, "utf8"));
+      record = JSON.parse(await readFile8(path, "utf8"));
     } catch {
       record = null;
     }
     const verdict = classifySession(record, now, pidAlive);
+    if (verdict === "keep" && record?.agent === "codex" && typeof record.retiredAt === "number" && Number.isFinite(record.retiredAt)) {
+      remaining++;
+      continue;
+    }
     if (verdict === "keep") {
       let planVerificationHandled = false;
       if (config && record) {
@@ -6305,6 +8689,7 @@ async function goneStrikeShouldTeardown(goneStrikesPath) {
   return await recordGoneStrike(goneStrikesPath) >= GONE_STRIKE_LIMIT;
 }
 var activeBridgeShutdown;
+var activeLanShutdown;
 var BRIDGE_OP_DEADLINE_MS = 15000;
 var PLAN_PICKER_STATUS_QUERY_DEADLINE_MS = 2000;
 function withDeadline(work, ms) {
@@ -6320,6 +8705,14 @@ function withDeadline(work, ms) {
 }
 var BRIDGE_REARM_MS = 600000;
 var GIVE_UP_PATTERN = /gave up/i;
+var BRIDGE_DAEMON_START_COOLDOWN_MS = 300000;
+var codexBridgeDown = false;
+function setCodexBridgeDown(down) {
+  codexBridgeDown = down;
+}
+function codexBridgeIsDown() {
+  return codexBridgeDown;
+}
 function createBridgeSupervisor(deps = {}) {
   const probe = deps.probe ?? (() => codexAppServerSocketAvailable());
   const create = deps.create ?? ((config, options) => new CodexRemoteInputBridge(config, options));
@@ -6327,10 +8720,14 @@ function createBridgeSupervisor(deps = {}) {
     withDeadline(Promise.resolve().then(work), BRIDGE_OP_DEADLINE_MS).catch(() => {});
   });
   const now = deps.now ?? Date.now;
+  const startDaemon = deps.startDaemon ?? (lanRunningUnderTest() ? async () => false : () => startCodexAppServerDaemon());
+  const trace = deps.trace ?? ((event) => traceSession(event));
   let bridge;
   let pairingId;
   let lastStartAt = 0;
   let parked = false;
+  let daemonDown = false;
+  let lastDaemonStartAt = 0;
   const onError = (error) => {
     try {
       if (GIVE_UP_PATTERN.test(error.message))
@@ -6353,10 +8750,23 @@ function createBridgeSupervisor(deps = {}) {
     parked = false;
     detach(() => target.start());
   };
+  const tryStartDaemon = () => {
+    const at = now();
+    if (lastDaemonStartAt !== 0 && at - lastDaemonStartAt < BRIDGE_DAEMON_START_COOLDOWN_MS)
+      return;
+    lastDaemonStartAt = at;
+    try {
+      trace({ event: "codex-daemon-start", outcome: "attempt" });
+    } catch {}
+    detach(async () => {
+      await startDaemon().catch(() => false);
+    });
+  };
   return {
     async sync(config) {
       if (!config) {
         teardown();
+        daemonDown = false;
         return;
       }
       let available = false;
@@ -6367,8 +8777,11 @@ function createBridgeSupervisor(deps = {}) {
       }
       if (!available) {
         teardown();
+        daemonDown = true;
+        tryStartDaemon();
         return;
       }
+      daemonDown = false;
       if (!bridge || pairingId !== config.pairingId) {
         teardown();
         const next = create(config, { onError });
@@ -6406,17 +8819,21 @@ function createBridgeSupervisor(deps = {}) {
     },
     get active() {
       return bridge !== undefined;
+    },
+    get daemonDown() {
+      return daemonDown;
     }
   };
 }
 async function claimSingleInstance() {
+  const build = watchdogBuildStamp();
   try {
     const holder = parseWatchdogPidfile(readFileSync2(WATCHDOG_PID_PATH, "utf8"));
-    if (holder && holder.pid !== process.pid && watchdogHolderIsLive(holder.pid) && holder.version === PLUGIN_VERSION) {
+    if (holder && holder.pid !== process.pid && watchdogHolderIsLive(holder.pid) && holder.version === PLUGIN_VERSION && !watchdogBuildDiffers(holder.build, build)) {
       return false;
     }
   } catch {}
-  await atomicWrite(WATCHDOG_PID_PATH, formatWatchdogPidfile(process.pid));
+  await atomicWrite(WATCHDOG_PID_PATH, formatWatchdogPidfile(process.pid, PLUGIN_VERSION, build));
   return true;
 }
 function isRightfulWatchdogOwner(deps = {}) {
@@ -6472,14 +8889,39 @@ async function run() {
     return;
   const fallbackDeadline = Date.now() + PAIRING_TTL_MS;
   let lastActiveMs = Date.now();
-  const bridges = createBridgeSupervisor();
+  const bridges = createBridgeSupervisor({
+    onError: (error) => traceSession({
+      event: "bridge",
+      error: error.name,
+      msg: String(error.message ?? "").slice(0, 200)
+    })
+  });
   activeBridgeShutdown = () => bridges.shutdown();
+  const lan = createLanListener({
+    onCommand: acceptLanCommand,
+    onAnswer: (answer) => {
+      acceptLanAnswer(answer);
+    }
+  });
+  activeLanListener = lan;
+  const stopLan = () => {
+    try {
+      lan.stop();
+    } catch {}
+  };
+  const shutdown = () => {
+    bridges.shutdown();
+    stopLan();
+  };
+  activeLanShutdown = stopLan;
   try {
     while (true) {
-      if (!enforceWatchdogOwnership(() => bridges.shutdown()))
+      if (!enforceWatchdogOwnership(shutdown))
         return;
       const config = await loadConfig();
       await bridges.sync(config);
+      setCodexBridgeDown(bridges.daemonDown);
+      lan.sync(config);
       if (config) {
         await reconcileProvisionalsSweep(config);
         await discoverLiveSessions(config);
@@ -6488,7 +8930,7 @@ async function run() {
         threadWaitState: (threadId) => bridges.threadWaitState(threadId)
       });
       if (config)
-        await drainCommands(config);
+        await enqueueDrainCommands(config);
       if (result.revoked) {
         if (await goneStrikeShouldTeardown()) {
           await removeRevokedConfig();
@@ -6529,8 +8971,10 @@ async function run() {
       await new Promise((r) => setTimeout(r, POLL_MS));
     }
   } finally {
-    bridges.shutdown();
+    shutdown();
     activeBridgeShutdown = undefined;
+    activeLanShutdown = undefined;
+    activeLanListener = undefined;
     releaseSingleInstance();
   }
 }
@@ -6542,6 +8986,9 @@ if (__require.main == __require.module) {
     } catch {}
     try {
       activeBridgeShutdown?.();
+    } catch {}
+    try {
+      activeLanShutdown?.();
     } catch {}
     const exitTimer = setTimeout(() => process.exit(0), 250);
     exitTimer.unref?.();
@@ -6566,7 +9013,9 @@ export {
   shouldInterruptCheck,
   shouldIdleProvisionalCheck,
   shouldHeartbeat,
+  setCodexBridgeDown,
   retireDoneStale,
+  resolveCodexTuiOwner,
   resetDoneAttemptMemory,
   resetCommandState,
   recordMovedSince,
@@ -6588,6 +9037,7 @@ export {
   hasInterruptMarker,
   goneStrikeShouldTeardown,
   extractCommands,
+  enqueueDrainCommands,
   enforceWatchdogOwnership,
   effectiveDoneAttempts,
   drainCommands,
@@ -6603,6 +9053,7 @@ export {
   commandIsFresh,
   codexTailPendingApproval,
   codexLastTurnEvent,
+  codexBridgeIsDown,
   clearDoneAttempts,
   claudeTailPendingApproval,
   classifySession,
@@ -6616,11 +9067,16 @@ export {
   buildHeartbeatEnvelope,
   buildEndEnvelope,
   buildDoneEnvelope,
+  acceptLanCommand,
+  acceptLanAnswer,
   WAITING_HEARTBEAT_AFTER_MS,
+  RETIRE_AFTER_MS,
   PLAN_PICKER_VERIFY_MAX_MS,
   PLAN_PICKER_RECENT_DONE_MS,
   PLAN_PICKER_PENDING_MAX_MS,
   PAIRING_TTL_MS,
+  LAN_COMMAND_ID_PREFIX,
+  LAN_ANSWER_ECHO_DELAY_MS,
   IDLE_GRACE_MS,
   COMMAND_TTL_MS,
   COMMAND_FUTURE_SKEW_MS,

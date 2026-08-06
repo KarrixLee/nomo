@@ -5,7 +5,7 @@ description: Unpair this computer from the Nomo iPhone app and remove local pair
 Run this exact command and show its output verbatim to the user:
 
 ```
-"${CLAUDE_PLUGIN_ROOT}/scripts/run.sh" "${CLAUDE_PLUGIN_ROOT}/dist/unpair.mjs"
+NOMOR="${CLAUDE_PLUGIN_ROOT}"; NOMOS="$HOME/.config/cc-status/hook-shim.sh"; [ -n "$NOMOR" ] && [ -x "$NOMOR/scripts/run.sh" ] && exec "$NOMOR/scripts/run.sh" "$NOMOR/dist/unpair.mjs"; [ -x "$NOMOS" ] && exec "$NOMOS" unpair; echo "Nomo could not find its installed files - reinstall the nomo plugin."; exit 1
 ```
 
 It revokes the pairing on the server (best-effort) and deletes the local pairing config, then

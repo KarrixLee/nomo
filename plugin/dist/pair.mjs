@@ -3,7 +3,8 @@ var __require = /* @__PURE__ */ createRequire(import.meta.url);
 
 // src/entries/pair.ts
 import { spawn as spawn2 } from "node:child_process";
-import { readFile as readFile2, unlink as unlink2 } from "node:fs/promises";
+import { constants as fsConstants } from "node:fs";
+import { access as access2, mkdir as mkdir2, readFile as readFile3, unlink as unlink2 } from "node:fs/promises";
 import { dirname as dirname2, join as join2 } from "node:path";
 import { fileURLToPath as fileURLToPath2 } from "node:url";
 
@@ -19,6 +20,7 @@ var textEncoder = new TextEncoder;
 var textDecoder = new TextDecoder;
 var HKDF_INFO = textEncoder.encode("nomo-cc-e2e-v1");
 var RATCHET_INFO_PREFIX = "nomo-cc-ratchet-v1|";
+var LAN_INFO_PREFIX = "nomo-lan-v1|";
 var ECDH_P256 = { name: "ECDH", namedCurve: "P-256" };
 function bytesToBase64(bytes) {
   let binary = "";
@@ -44,6 +46,16 @@ function fromB64url(s) {
 async function deriveE2EKey(qrSecret, phoneNonce) {
   const ikm = await crypto.subtle.importKey("raw", qrSecret, "HKDF", false, ["deriveBits"]);
   const bits = await crypto.subtle.deriveBits({ name: "HKDF", hash: "SHA-256", salt: phoneNonce, info: HKDF_INFO }, ikm, 256);
+  return new Uint8Array(bits);
+}
+async function deriveLanKey(e2eKey, pairingId) {
+  const ikm = await crypto.subtle.importKey("raw", e2eKey, "HKDF", false, ["deriveBits"]);
+  const bits = await crypto.subtle.deriveBits({
+    name: "HKDF",
+    hash: "SHA-256",
+    salt: new Uint8Array(0),
+    info: textEncoder.encode(LAN_INFO_PREFIX + pairingId)
+  }, ikm, 256);
   return new Uint8Array(bits);
 }
 async function generateEphemeralKeyPair() {
@@ -88,7 +100,7 @@ async function sha256Hex(s) {
 }
 
 // src/core/shared.ts
-var PLUGIN_VERSION = "1.4.15";
+var PLUGIN_VERSION = "1.7.9";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -98,6 +110,20 @@ function debugToken(value) {
 function formatPlanPickerDebug(input) {
   const value = `${debugToken(input.version ?? PLUGIN_VERSION)} ev:${debugToken(input.event)} cls:${debugToken(input.classifier)} mk:${input.marker ?? "0"} dq:${input.daemon ?? "na"}(${input.daemonDisposition ?? "na"}) ttl:${debugToken(input.ttl ?? "-")} by:${input.by}`;
   return Array.from(value).slice(0, DBG_BLOB_TEXT_MAX_CHARS).join("");
+}
+function formatDecisionHoldDebug(input) {
+  const value = `${debugToken(input.version ?? PLUGIN_VERSION)} ev:hold req:${debugToken(input.requestId.slice(0, 8))} pid:${input.pid}`;
+  return Array.from(value).slice(0, DBG_BLOB_TEXT_MAX_CHARS).join("");
+}
+var CODEX_BRIDGE_DOWN_MARKER = "cxbridge:down";
+function appendCodexBridgeMarker(dbg, down) {
+  if (typeof dbg !== "string" || dbg.length === 0)
+    return dbg;
+  const bare = dbg.split(` ${CODEX_BRIDGE_DOWN_MARKER}`).join("");
+  if (!down)
+    return bare;
+  const next = `${bare} ${CODEX_BRIDGE_DOWN_MARKER}`;
+  return Array.from(next).length <= DBG_BLOB_TEXT_MAX_CHARS ? next : bare;
 }
 var CC_DIR = `${process.env.HOME}/.config/cc-status`;
 var SESSION_TRACE_PATH = `${CC_DIR}/session-trace.log`;
@@ -176,6 +202,23 @@ function appendFittedPlanAndDebug(base, plan, dbg) {
   const withDebug = { ...withPlan, dbg: capped };
   return sealedBlobChars(encoder.encode(JSON.stringify(withDebug)).length) <= BLOB_FIT_CHARS ? withDebug : withPlan;
 }
+var RECORD_FULL_TEXT_MAX_CHARS = 262144;
+var RECORD_FULL_TEXT_TRUNCATION_MARKER = `
+…[truncated]`;
+function fullTextForRecord(full, fitted) {
+  if (typeof full !== "string" || full.length === 0)
+    return;
+  if (full === fitted)
+    return;
+  const chars = Array.from(full);
+  if (chars.length <= RECORD_FULL_TEXT_MAX_CHARS)
+    return full;
+  const markerChars = Array.from(RECORD_FULL_TEXT_TRUNCATION_MARKER).length;
+  return chars.slice(0, RECORD_FULL_TEXT_MAX_CHARS - markerChars).join("") + RECORD_FULL_TEXT_TRUNCATION_MARKER;
+}
+function recordFullTextIsComplete(value) {
+  return !value.endsWith(RECORD_FULL_TEXT_TRUNCATION_MARKER);
+}
 async function flagExists(path) {
   try {
     await access(path);
@@ -207,6 +250,81 @@ async function codexAppServerSocketAvailable(socketPath = codexAppServerSocketPa
   } catch {
     return false;
   }
+}
+var CODEX_DAEMON_START_ARGS = ["app-server", "daemon", "start"];
+var CODEX_DAEMON_START_TIMEOUT_MS = 8000;
+var CODEX_DAEMON_SOCKET_WAIT_MS = 4000;
+var CODEX_DAEMON_SOCKET_POLL_MS = 250;
+async function startCodexAppServerDaemon(deps = {}) {
+  const trace = deps.trace ?? ((event) => traceSession(event));
+  const probe = deps.probe ?? (() => codexAppServerSocketAvailable());
+  const sleep = deps.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
+  const command = deps.codexPath ?? "codex";
+  const timeoutMs = deps.timeoutMs ?? CODEX_DAEMON_START_TIMEOUT_MS;
+  const socketWaitMs = deps.socketWaitMs ?? CODEX_DAEMON_SOCKET_WAIT_MS;
+  const spawnFn = deps.spawnFn ?? ((cmd, args) => spawn(cmd, [...args], { stdio: "ignore" }));
+  let exit;
+  try {
+    exit = await new Promise((resolve) => {
+      let settled = false;
+      const done = (value) => {
+        if (settled)
+          return;
+        settled = true;
+        resolve(value);
+      };
+      let child;
+      try {
+        child = spawnFn(command, CODEX_DAEMON_START_ARGS);
+      } catch {
+        done("error");
+        return;
+      }
+      const timer = setTimeout(() => {
+        try {
+          child.kill("SIGTERM");
+        } catch {}
+        done("timeout");
+      }, timeoutMs);
+      timer.unref?.();
+      child.on("error", () => {
+        clearTimeout(timer);
+        done("error");
+      });
+      child.on("exit", (code, signal) => {
+        clearTimeout(timer);
+        done({ code, signal });
+      });
+    });
+  } catch {
+    exit = "error";
+  }
+  if (exit === "error" || exit === "timeout" || exit.code !== 0) {
+    trace({
+      event: "codex-daemon-start",
+      outcome: exit === "error" ? "spawn-failed" : exit === "timeout" ? "timeout" : "nonzero-exit",
+      ...typeof exit === "object" ? { code: exit.code, signal: exit.signal } : {}
+    });
+    return false;
+  }
+  const deadline = socketWaitMs;
+  for (let waited = 0;; waited += CODEX_DAEMON_SOCKET_POLL_MS) {
+    let up = false;
+    try {
+      up = await probe();
+    } catch {
+      up = false;
+    }
+    if (up) {
+      trace({ event: "codex-daemon-start", outcome: "started", waitedMs: waited });
+      return true;
+    }
+    if (waited >= deadline)
+      break;
+    await sleep(CODEX_DAEMON_SOCKET_POLL_MS);
+  }
+  trace({ event: "codex-daemon-start", outcome: "no-socket", waitedMs: deadline });
+  return false;
 }
 function lastHookPath(agent) {
   return `${CC_DIR}/last-hook-${agent}`;
@@ -447,15 +565,37 @@ async function completePendingPairing(pending, configPath, opts = {}) {
 function isWatchdogCommand(psCommand) {
   return psCommand.includes("cc-watchdog");
 }
-function formatWatchdogPidfile(pid, version = PLUGIN_VERSION) {
-  return `${pid} ${version}`;
+function watchdogBuildStamp(path = WATCHDOG_PATH) {
+  try {
+    const bytes = readFileSync(path);
+    let hash = 2166136261;
+    for (let i = 0;i < bytes.length; i++) {
+      hash ^= bytes[i];
+      hash = Math.imul(hash, 16777619);
+    }
+    return (hash >>> 0).toString(36);
+  } catch {
+    return;
+  }
+}
+function watchdogBuildDiffers(incumbent, current) {
+  if (incumbent === undefined || current === undefined)
+    return false;
+  return incumbent !== current;
+}
+function formatWatchdogPidfile(pid, version = PLUGIN_VERSION, build) {
+  return `${pid} ${version}${typeof build === "string" && build.length > 0 ? ` ${build}` : ""}`;
 }
 function parseWatchdogPidfile(raw) {
-  const [pidField, versionField] = raw.trim().split(/\s+/);
+  const [pidField, versionField, buildField] = raw.trim().split(/\s+/);
   const pid = Number.parseInt(pidField ?? "", 10);
   if (!Number.isFinite(pid) || pid <= 0)
     return null;
-  return { pid, ...typeof versionField === "string" && versionField.length > 0 ? { version: versionField } : {} };
+  return {
+    pid,
+    ...typeof versionField === "string" && versionField.length > 0 ? { version: versionField } : {},
+    ...typeof buildField === "string" && buildField.length > 0 ? { build: buildField } : {}
+  };
 }
 function watchdogHolderIsLive(pid, deps = {}) {
   const isAlive = deps.isAlive ?? pidAlive;
@@ -475,6 +615,7 @@ function ensureWatchdog(deps = {}) {
       return;
     const pidPath = deps.pidPath ?? WATCHDOG_PID_PATH;
     const version = deps.version ?? PLUGIN_VERSION;
+    const build = "build" in deps ? deps.build : watchdogBuildStamp();
     const readPidfile = deps.readPidfile ?? (() => {
       try {
         return readFileSync(pidPath, "utf8");
@@ -490,7 +631,7 @@ function ensureWatchdog(deps = {}) {
     const raw = readPidfile();
     const holder = typeof raw === "string" ? parseWatchdogPidfile(raw) : null;
     if (holder && watchdogHolderIsLive(holder.pid, deps)) {
-      if (holder.version === version)
+      if (holder.version === version && !watchdogBuildDiffers(holder.build, build))
         return;
       try {
         killPid(holder.pid, "SIGTERM");
@@ -505,6 +646,81 @@ async function readRecord(sessionId, sessionsDir = SESSIONS_DIR) {
   } catch {
     return null;
   }
+}
+async function stampPermissionDetailFullAt(sessionsDir, sessionId, permissionDetailFull) {
+  try {
+    const record = await readRecord(sessionId, sessionsDir);
+    if (!record)
+      return;
+    if (record.permissionDetailFull === permissionDetailFull)
+      return;
+    await atomicWrite(`${sessionsDir}/${sessionId}.json`, JSON.stringify({ ...record, permissionDetailFull }), 384);
+  } catch {}
+}
+async function stampPermissionDetailFull(sessionId, permissionDetailFull) {
+  return stampPermissionDetailFullAt(SESSIONS_DIR, sessionId, permissionDetailFull);
+}
+var DECISION_HOLD_SUFFIX = ".hold";
+function decisionHoldFileName(sessionId) {
+  return `${sessionId}${DECISION_HOLD_SUFFIX}`;
+}
+async function writeDecisionHoldAt(sessionsDir, sessionId, hold) {
+  try {
+    await atomicWrite(`${sessionsDir}/${decisionHoldFileName(sessionId)}`, JSON.stringify(hold), 384);
+  } catch {}
+}
+async function clearDecisionHoldAt(sessionsDir, sessionId, pid, beforeUnlink) {
+  const path = `${sessionsDir}/${decisionHoldFileName(sessionId)}`;
+  try {
+    const raw = await readFile(path, "utf8").catch(() => {
+      return;
+    });
+    if (raw !== undefined) {
+      let owner;
+      try {
+        owner = JSON.parse(raw).pid;
+      } catch {
+        owner = undefined;
+      }
+      if (typeof owner === "number" && owner !== pid)
+        return false;
+    }
+    if (beforeUnlink !== undefined) {
+      try {
+        await beforeUnlink();
+      } catch {}
+    }
+    await unlink(path).catch(() => {});
+    return true;
+  } catch {
+    return false;
+  }
+}
+async function settleDecisionHoldRecordAt(sessionsDir, sessionId, patch) {
+  try {
+    const record = await readRecord(sessionId, sessionsDir);
+    if (!record)
+      return;
+    if (record.op !== "update" || record.prio !== 1)
+      return;
+    await atomicWrite(`${sessionsDir}/${sessionId}.json`, JSON.stringify({ ...record, ...patch }), 384);
+  } catch {}
+}
+async function readDecisionHoldAt(sessionsDir, sessionId) {
+  try {
+    return JSON.parse(await readFile(`${sessionsDir}/${decisionHoldFileName(sessionId)}`, "utf8"));
+  } catch {
+    return null;
+  }
+}
+async function writeDecisionHold(sessionId, hold) {
+  return writeDecisionHoldAt(SESSIONS_DIR, sessionId, hold);
+}
+async function clearDecisionHold(sessionId, pid, beforeUnlink) {
+  return clearDecisionHoldAt(SESSIONS_DIR, sessionId, pid, beforeUnlink);
+}
+async function settleDecisionHoldRecord(sessionId, patch) {
+  return settleDecisionHoldRecordAt(SESSIONS_DIR, sessionId, patch);
 }
 async function readPrefix(path, maxBytes) {
   const fh = await open(path, "r");
@@ -632,8 +848,24 @@ function codexCompanionBrokerEvidence(pid, ancestorsOf = pidAncestors, commandOf
 }
 
 // src/core/notify-wire.ts
+import { readFile as readFile2 } from "node:fs/promises";
+var NOMO_NOTIFY_ENTRY = "codex-notify";
+function nomoNotifyProgram(home) {
+  return `${home}/.config/cc-status/hook-shim.sh`;
+}
 function isNomoNotifyChain(arr) {
-  return arr.length > 0 && /(^|\/)notify-chain\.sh$/.test(arr[0] ?? "");
+  const prog = arr[0] ?? "";
+  if (/(^|\/)notify-chain\.sh$/.test(prog))
+    return true;
+  return /(^|\/)hook-shim\.sh$/.test(prog) && arr[1] === NOMO_NOTIFY_ENTRY;
+}
+function referencesNomoNotify(text) {
+  if (text.includes("notify-chain.sh"))
+    return true;
+  return text.includes("hook-shim.sh") && text.includes(NOMO_NOTIFY_ENTRY);
+}
+function arrayReferencesNomoNotify(arr) {
+  return isNomoNotifyChain(arr) || arr.some((s) => referencesNomoNotify(s));
 }
 function sameCommand(a, b) {
   return a.length === b.length && a.every((v, i) => v === b[i]);
@@ -648,7 +880,7 @@ function unwrapNotify(arr) {
     return unwrapNotify(arr.slice(sep + 1));
   }
   const i = arr.indexOf("--previous-notify");
-  if (i !== -1 && i + 1 < arr.length && (arr[i + 1] ?? "").includes("notify-chain.sh")) {
+  if (i !== -1 && i + 1 < arr.length && referencesNomoNotify(arr[i + 1] ?? "")) {
     const host = [...arr.slice(0, i), ...arr.slice(i + 2)];
     let embedded = null;
     try {
@@ -664,11 +896,9 @@ function unwrapNotify(arr) {
   }
   return [...arr];
 }
-function wireNotifyArray(existing, root) {
-  const chain = `${root}/scripts/notify-chain.sh`;
-  const mjs = `${root}/dist/codex-notify.mjs`;
+function wireNotifyArray(existing, program) {
   const orig = existing && existing.length > 0 ? unwrapNotify(existing) : null;
-  return orig && orig.length > 0 ? [chain, mjs, "--", ...orig] : [chain, mjs];
+  return orig && orig.length > 0 ? [program, NOMO_NOTIFY_ENTRY, "--", ...orig] : [program, NOMO_NOTIFY_ENTRY];
 }
 function parseNotifyFromToml(toml) {
   for (const line of toml.split(`
@@ -714,6 +944,49 @@ function replaceNotifyInToml(toml, arr) {
   lines.splice(firstTable, 0, line, "");
   return lines.join(`
 `);
+}
+function tomlMayNeedNotifyRepair(toml, program) {
+  const flat = toml.includes("\\") ? toml.split("\\").join("") : toml;
+  if (flat.includes("notify-chain.sh"))
+    return true;
+  if (!flat.includes("hook-shim.sh"))
+    return false;
+  return !flat.includes(program);
+}
+async function repairNotifyWiring(deps = {}) {
+  try {
+    const home = deps.home ?? process.env.HOME ?? "";
+    if (home.length === 0)
+      return "unchanged";
+    const program = nomoNotifyProgram(home);
+    const tomlPath = deps.tomlPath ?? `${codexHome()}/config.toml`;
+    let toml;
+    try {
+      toml = await readFile2(tomlPath, "utf8");
+    } catch {
+      return "unchanged";
+    }
+    if (!tomlMayNeedNotifyRepair(toml, program))
+      return "unchanged";
+    const parsed = parseNotifyFromToml(toml);
+    if (!parsed.present || parsed.value === null)
+      return "refused";
+    if (!arrayReferencesNomoNotify(parsed.value))
+      return "refused";
+    const next = wireNotifyArray(parsed.value, program);
+    if (sameCommand(next, parsed.value))
+      return "unchanged";
+    const bak = `${tomlPath}.bak-nomo`;
+    try {
+      await readFile2(bak);
+    } catch {
+      await atomicWrite(bak, toml);
+    }
+    await atomicWrite(tomlPath, replaceNotifyInToml(toml, next));
+    return "repaired";
+  } catch {
+    return "refused";
+  }
 }
 
 // src/core/pair-code.ts
@@ -3598,7 +3871,7 @@ function revokeCreds(raw) {
 async function revokeExisting(fetchFn, configPath, print) {
   let raw;
   try {
-    raw = await readFile2(configPath, "utf8");
+    raw = await readFile3(configPath, "utf8");
   } catch {
     return;
   }
@@ -3715,7 +3988,7 @@ async function pairWait(deps = {}) {
   const now = deps.now ?? Date.now;
   const readCompleted = async () => {
     try {
-      return parseConfig(await readFile2(configPath, "utf8"));
+      return parseConfig(await readFile3(configPath, "utf8"));
     } catch {
       return null;
     }
@@ -3723,7 +3996,7 @@ async function pairWait(deps = {}) {
   const printPaired = (c) => print(c.machineName ? `Paired with ${c.machineName} ✓` : "Paired ✓");
   let raw;
   try {
-    raw = await readFile2(configPath, "utf8");
+    raw = await readFile3(configPath, "utf8");
   } catch {
     print("No pairing in progress — run /nomo-cc:pair first.");
     return 1;
@@ -3792,23 +4065,38 @@ async function pairWait(deps = {}) {
 function pluginRootFromHere() {
   return dirname2(dirname2(fileURLToPath2(import.meta.url)));
 }
+async function ensureNotifyProgram(root, program) {
+  try {
+    await access2(program, fsConstants.X_OK);
+    return true;
+  } catch {}
+  try {
+    await mkdir2(dirname2(program), { recursive: true, mode: 448 });
+    await atomicWrite(program, await readFile3(join2(root, "scripts", "hook-shim.sh"), "utf8"), 448);
+    return true;
+  } catch {
+    return false;
+  }
+}
 async function wireNotify(deps = {}) {
   const print = deps.print ?? ((line) => console.log(line));
   const tomlPath = deps.tomlPath ?? join2(codexHome(), "config.toml");
   const root = deps.pluginRoot ?? pluginRootFromHere();
+  const program = nomoNotifyProgram(deps.home ?? process.env.HOME ?? "");
+  const installed = await ensureNotifyProgram(root, program);
   let toml = "";
   try {
-    toml = await readFile2(tomlPath, "utf8");
+    toml = await readFile3(tomlPath, "utf8");
   } catch {
     toml = "";
   }
   const parsed = parseNotifyFromToml(toml);
   if (parsed.present && parsed.value === null) {
     print(`Couldn't safely parse the existing notify line in ${tomlPath} — set it manually to:`);
-    print(`notify = ["${root}/scripts/notify-chain.sh", "${root}/dist/codex-notify.mjs", "--", <your original notify command…>]`);
+    print(`notify = ["${program}", "codex-notify", "--", <your original notify command…>]`);
     return 1;
   }
-  const next = wireNotifyArray(parsed.value ?? undefined, root);
+  const next = wireNotifyArray(parsed.value ?? undefined, program);
   if (parsed.value && next.length === parsed.value.length && next.every((v, i) => v === parsed.value[i])) {
     print("Codex notify backstop already wired — no change.");
     return 0;
@@ -3816,7 +4104,7 @@ async function wireNotify(deps = {}) {
   if (toml.length > 0) {
     const bak = `${tomlPath}.bak-nomo`;
     try {
-      await readFile2(bak);
+      await readFile3(bak);
     } catch {
       await atomicWrite(bak, toml);
     }
@@ -3824,6 +4112,8 @@ async function wireNotify(deps = {}) {
   await atomicWrite(tomlPath, replaceNotifyInToml(toml, next));
   const preserved = next.includes("--");
   print(preserved ? "Codex notify backstop wired (your original notify command is preserved and still runs)." : "Codex notify backstop wired.");
+  if (!installed)
+    print(`Note: ${program} isn't installed yet — it appears on the next Codex hook.`);
   return 0;
 }
 function parseTimeoutMs(argv) {
