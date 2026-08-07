@@ -28,7 +28,7 @@ import {
 import {
   AgentKind, appendFittedPlanAndDebug, atomicWrite, CCOp, CCStatus, codexCompanionBrokerEvidence, Config, decisionHoldFileName, ensureWatchdog, FolderIdentity, folderIdentity, formatPlanPickerDebug, fullTextForRecord, GONE_STRIKE_LIMIT,
   LAST_SEND_PATH, lastHookPath, loadConfig, loadPendingConfig, localApprovalsState, PENDING_STASH_PATH, PendingEventStash, pidAncestors, pidCommand, PLUGIN_VERSION, readPrefix,
-  readRecord, recordGoneStrike, removeRevokedConfig, resetGoneStrikes, SessionOrigin, SessionRecord, SESSIONS_DIR, tracePlanPickerDecision, traceSession,
+  readRecord, recordGoneStrike, removeRevokedConfig, resetGoneStrikes, SessionOrigin, SessionRecord, SESSIONS_DIR, sessionBranch, tracePlanPickerDecision, traceSession,
 } from "./shared";
 import { repairNotifyWiring } from "./notify-wire";
 
@@ -186,12 +186,17 @@ export function transcriptStartMs(prefix: string): number | undefined {
  *  for the positional callers that predate the key) — wins over the event's cwd when given: a
  *  mid-session `cd` changes input.cwd on every later hook, and re-deriving per event silently renamed
  *  the phone row / island folder chip (observed live: "api-status" → "server" after a `cd server`).
- *  Absent/empty → first event (or a recordless caller): derive from cwd as before. `label` and
- *  `folderKey` come out of ONE call to `folderIdentity`, so they always describe the same cwd. */
-export function buildBlob(input: Record<string, unknown>, machine: string, title: string | undefined, plan: OpPlan, agent: AgentKind = "claude", turnStartedAt?: number, pinnedFolder?: string | { label?: unknown; folderKey?: unknown } | null, model?: string, at?: number, proposedPlan?: string, dbgOverride?: string): {
-  status: CCStatus; detail?: string; title: string; machine: string; label: string; agent?: AgentKind; turnStartedAt?: number; model?: string; at?: number; folderKey?: string; plan?: string; dbg?: string;
+ *  Absent/empty → first event (or a recordless caller): derive from cwd as before. `label`,
+ *  `folderKey` and the local-only path facts come out of ONE call to `folderIdentity`, so they always
+ *  describe the same cwd. */
+export function buildBlob(input: Record<string, unknown>, machine: string, title: string | undefined, plan: OpPlan, agent: AgentKind = "claude", turnStartedAt?: number, pinnedFolder?: string | { label?: unknown; folderKey?: unknown; cwd?: unknown; gitDir?: unknown } | null, model?: string, at?: number, proposedPlan?: string, dbgOverride?: string): {
+  status: CCStatus; detail?: string; title: string; machine: string; label: string; agent?: AgentKind; turnStartedAt?: number; model?: string; at?: number; folderKey?: string; branch?: string; plan?: string; dbg?: string;
 } {
-  const { label, folderKey } = folderIdentity(input.cwd, pinnedFolder);
+  const folder = folderIdentity(input.cwd, pinnedFolder);
+  const { label, folderKey } = folder;
+  // The folder's LIVE branch, re-read from HEAD on every event (the paths are pinned, the branch is
+  // not — a mid-session `git checkout` must reach the phone). Omitted when the folder is not a repo.
+  const branch = sessionBranch(folder);
   const hookName = typeof input.hook_event_name === "string" ? input.hook_event_name : "";
   const detail = detailForHook(
     hookName,
@@ -223,6 +228,11 @@ export function buildBlob(input: Record<string, unknown>, machine: string, title
   // phone's GROUPING identity, while `label` stays the DISPLAY name: two checkouts both named `api`
   // merged into one card when the basename was the only key. OMITTED whenever unknown — never null,
   // never empty — so an older phone simply ignores it and this stays an append-only wire change.
+  //
+  // `branch` (v1.9.0 — the folder's CURRENT git branch, or a detached HEAD's short SHA) sits
+  // immediately after `folderKey`, in that same slot in EVERY producer, and is likewise OMITTED when
+  // unknown. Unlike the two folder keys it is LIVE: `folderIdentity` pins only the paths it is read
+  // from, and HEAD is re-read per event so a `git checkout` shows up on the phone.
   const base = {
     status: plan.status, title: title ?? "", machine, label,
     ...(detail ? { detail } : {}),
@@ -231,6 +241,7 @@ export function buildBlob(input: Record<string, unknown>, machine: string, title
     ...(typeof model === "string" && model.length > 0 ? { model } : {}),
     ...(typeof at === "number" && Number.isFinite(at) ? { at } : {}),
     ...(folderKey ? { folderKey } : {}),
+    ...(branch ? { branch } : {}),
   };
   const dbg = agent === "codex"
     ? dbgOverride ?? formatPlanPickerDebug({
@@ -254,8 +265,8 @@ export async function buildEnvelope(
   input: unknown, machine: string, now: number, title: string | undefined, e2eKey: Uint8Array, sentDone: boolean,
   agent: AgentKind = "claude", startedAt?: number, turnStartedAt?: number,
   /** The session record (or, for positional callers predating the folder key, just its label) — the
-   *  FIRST-SEEN folder identity buildBlob pins both `label` and `folderKey` to. */
-  pinnedFolder?: string | { label?: unknown; folderKey?: unknown } | null, model?: string,
+   *  FIRST-SEEN folder identity buildBlob pins `label`, `folderKey` and the branch's source paths to. */
+  pinnedFolder?: string | { label?: unknown; folderKey?: unknown; cwd?: unknown; gitDir?: unknown } | null, model?: string,
   planOverride?: OpPlan, attentionKindOverride?: "userInput", proposedPlan?: string, dbg?: string,
   /** APPEND-LAST tee (NOM-44 phase 4). Called with the blob PLAINTEXT this envelope is about to seal,
    *  so the caller can compare the FITTED `plan` against the full one it passed in and persist the
@@ -367,9 +378,11 @@ export async function trackSessionAt(
     // otherwise the semantic status (working / needsAttention / done). `agent` (omitted for claude)
     // tells the watchdog which interrupt marker to scan the transcript tail for.
     const recordedAt = Date.now();
-    // The two halves of the folder identity travel together or not at all (see folderIdentity): the
-    // record must never pin one folder's name next to another folder's key.
-    const { label, folderKey } = typeof folder === "string" ? { label: folder, folderKey: undefined } : folder;
+    // Every part of the folder identity travels together or not at all (see folderIdentity): the
+    // record must never pin one folder's name next to another folder's key — or another folder's path.
+    const { label, folderKey, cwd, gitDir } = typeof folder === "string"
+      ? { label: folder, folderKey: undefined, cwd: undefined, gitDir: undefined }
+      : folder;
     const record: SessionRecord = {
       pid,
       machine,
@@ -378,6 +391,12 @@ export async function trackSessionAt(
       // reuses it verbatim and a mid-session `cd` cannot move the row to another folder card. Omitted
       // when unknown (no cwd, or a session first recorded by a plugin predating the key).
       ...(folderKey ? { folderKey } : {}),
+      // The pinned ABSOLUTE cwd and its cached git dir — LOCAL ONLY (never in a blob; this file is
+      // 0600). They are what lets the watchdog's correctives and the LAN state frame re-read the
+      // folder's LIVE branch, which none of them has a cwd of its own to find. Omitted when unknown,
+      // exactly like the key, and a bare-string caller pins neither.
+      ...(cwd ? { cwd } : {}),
+      ...(gitDir ? { gitDir } : {}),
       ts: recordedAt,
       transcript,
       lastEvent: op === "start" ? "sessionStart" : status,

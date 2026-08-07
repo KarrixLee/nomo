@@ -1,3 +1,6 @@
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, test } from "bun:test";
 import { decryptBlob, encryptBlob } from "./crypto";
 import { codexAnswersFromPhone, startCodexRemoteInput } from "./codex-remote-input";
@@ -276,6 +279,70 @@ describe("startCodexRemoteInput", () => {
     const fallback = await decryptBlob(key, posted.fallbackBlob as string) as Record<string, unknown>;
     expect(fallback.status).toBe("needsAttention");
     expect(fallback).not.toHaveProperty("permissionQuestions");
+  });
+
+  // The folder's LIVE git branch, read off the record's pinned paths — the same key, in the same slot
+  // (right after `folderKey`, before the permission tail), that every other producer of this shape uses.
+  test("the question frame carries the folder's live `branch` after folderKey, before the permission tail", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "nomo-cxri-branch-"));
+    try {
+      const gitDir = join(cwd, ".git");
+      await mkdir(gitDir, { recursive: true });
+      await writeFile(join(gitDir, "HEAD"), "ref: refs/heads/feat/hybrid-lan\n");
+      const answerBlob = await encryptBlob(key, { requestId: "relay-1", decision: "answer", answers: ["Fast"] });
+      const calls: Array<{ url: string; init?: RequestInit }> = [];
+      const fetchFn = async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+        const url = String(input); calls.push({ url, init });
+        if (url.endsWith("/v1/cc/decision")) return Response.json({ hold: true });
+        return Response.json({ status: "answered", answerBlob });
+      };
+      const handle = startCodexRemoteInput(request(), {
+        config,
+        fetchFn: fetchFn as typeof fetch,
+        readRecordFn: async () => ({ ...record, folderKey: "0123456789ab", cwd, gitDir }),
+        randomUUID: () => "relay-1",
+        now: () => 1_234_567,
+        localApprovalsStateFn: async () => "on",
+        sleep: async () => {},
+        answerAppServer: async () => "sent",
+        interruptAppServer: async () => "sent",
+      });
+      expect(await handle.completion).toBe("answered");
+      const posted = JSON.parse(String(calls[0].init?.body)) as Record<string, unknown>;
+      const prompt = await decryptBlob(key, posted.blob as string) as Record<string, unknown>;
+      expect(prompt.branch).toBe("feat/hybrid-lan");
+      const keys = Object.keys(prompt);
+      const firstPermission = keys.findIndex((k) => k.startsWith("permission"));
+      expect(keys.slice(firstPermission - 2, firstPermission)).toEqual(["folderKey", "branch"]);
+      // The pinned ABSOLUTE cwd stays local — only the digest and the branch name cross the wire.
+      expect(JSON.stringify(prompt)).not.toContain(cwd);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test("a record with no pinned cwd omits `branch` entirely (never empty, never guessed)", async () => {
+    const answerBlob = await encryptBlob(key, { requestId: "relay-1", decision: "answer", answers: ["Fast"] });
+    const calls: Array<{ url: string; init?: RequestInit }> = [];
+    const fetchFn = async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+      const url = String(input); calls.push({ url, init });
+      if (url.endsWith("/v1/cc/decision")) return Response.json({ hold: true });
+      return Response.json({ status: "answered", answerBlob });
+    };
+    const handle = startCodexRemoteInput(request(), {
+      config,
+      fetchFn: fetchFn as typeof fetch,
+      readRecordFn: async () => record, // the shared fixture: label pinned, no cwd
+      randomUUID: () => "relay-1",
+      now: () => 1_234_567,
+      localApprovalsStateFn: async () => "on",
+      sleep: async () => {},
+      answerAppServer: async () => "sent",
+      interruptAppServer: async () => "sent",
+    });
+    expect(await handle.completion).toBe("answered");
+    const posted = JSON.parse(String(calls[0].init?.body)) as Record<string, unknown>;
+    expect(await decryptBlob(key, posted.blob as string)).not.toHaveProperty("branch");
   });
 
   // Same route, same credentials, same tunnel — so the same adaptive ceiling as the permission hook.

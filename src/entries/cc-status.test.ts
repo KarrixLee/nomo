@@ -5,8 +5,8 @@ import { basename, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { b64url, decryptBlob } from "../core/crypto";
 import {
-  BLOB_FIT_CHARS, DBG_BLOB_TEXT_MAX_CHARS, folderKeyFromCwd, formatPlanPickerDebug, fullTextForRecord, parseConfig, PendingEventStash, PLAN_BLOB_TEXT_MAX_CHARS, PLAN_BLOB_TRUNCATION_MARKER,
-  readDecisionHoldAt, readRecord, sealedBlobChars, SessionRecord, writeDecisionHoldAt,
+  BLOB_FIT_CHARS, DBG_BLOB_TEXT_MAX_CHARS, folderIdentity, folderKeyFromCwd, formatPlanPickerDebug, fullTextForRecord, parseConfig, PendingEventStash, PLAN_BLOB_TEXT_MAX_CHARS, PLAN_BLOB_TRUNCATION_MARKER,
+  readDecisionHoldAt, readRecord, sealedBlobChars, SessionRecord, sessionBranch, writeDecisionHoldAt,
 } from "../core/shared";
 import {
   aiTitle, buildBlob, buildEnvelope, buildPendingStash, cleanPromptTitle, codexIndexTitle, codexSessionTitle,
@@ -551,8 +551,104 @@ describe("folderKey (grouping identity derived from the first-seen absolute cwd)
   });
 });
 
+// --- branch (the session folder's LIVE git branch; the phone shows it next to the folder name) ----
+//
+// Optional and omitted when absent, in ONE slot — immediately after `folderKey`, before the fitted
+// plan/dbg tail — in every producer of this shape, because the phone's decrypt is all-or-nothing and a
+// LAN row and a worker row for one state must stay textually identical. The resolver itself (the
+// upward walk, worktree/submodule pointers, detached HEAD, the cap) is covered in shared.test.ts;
+// these cover the THREADING: the slot, the omission, and that it is live rather than pinned.
+describe("branch (live git branch of the pinned folder, threaded into the blob)", () => {
+  const plan = planOp("PreToolUse", { session_id: "s" }, false)!;
+  const roots: string[] = [];
+  /** A real temp checkout: `<dir>/.git/HEAD` naming `head`. */
+  const repo = async (head: string): Promise<string> => {
+    const dir = await mkdtemp(join(tmpdir(), "nomo-blob-branch-"));
+    roots.push(dir);
+    await mkdir(join(dir, ".git"), { recursive: true });
+    await writeFile(join(dir, ".git", "HEAD"), `ref: refs/heads/${head}\n`);
+    return dir;
+  };
+  const plain = async (): Promise<string> => {
+    const dir = await mkdtemp(join(tmpdir(), "nomo-blob-plain-"));
+    roots.push(dir);
+    return dir;
+  };
+  afterEach(async () => {
+    await Promise.all(roots.splice(0).map((d) => rm(d, { recursive: true, force: true })));
+  });
+
+  test("rides immediately AFTER folderKey and BEFORE the plan/dbg tail", async () => {
+    const cwd = await repo("feat/hybrid-lan");
+    const blob = buildBlob(
+      { session_id: "s", cwd, hook_event_name: "PreToolUse", tool_name: "Edit" },
+      "Mac", "t", plan, "codex", 1_751_900_000, undefined, "gpt-5-codex", 1_751_900_999,
+    );
+    expect(blob.branch).toBe("feat/hybrid-lan");
+    expect(Object.keys(blob)).toEqual([
+      "status", "title", "machine", "label", "detail", "agent", "turnStartedAt", "model", "at", "folderKey", "branch", "dbg",
+    ]);
+  });
+
+  test("a folder that is not a repo OMITS the key entirely — never null, never empty", async () => {
+    const cwd = await plain();
+    const blob = buildBlob({ session_id: "s", cwd, hook_event_name: "PreToolUse", tool_name: "Edit" }, "Mac", "t", plan);
+    expect(blob).not.toHaveProperty("branch");
+    expect(JSON.stringify(blob)).not.toContain("branch");
+    // …as does an event with no cwd at all.
+    expect(buildBlob({ session_id: "s", hook_event_name: "Stop" }, "Mac", "t", plan)).not.toHaveProperty("branch");
+  });
+
+  test("LIVE, not pinned: a `git checkout` mid-session changes the branch the next event carries", async () => {
+    const cwd = await repo("main");
+    const input = { session_id: "s", cwd, hook_event_name: "PreToolUse", tool_name: "Edit" };
+    // Event 1 pins the folder (what the record then stores); event 2 is pinned off it, as every later
+    // hook of a session is.
+    const pin = folderIdentity(cwd);
+    const first = buildBlob(input, "Mac", "t", plan);
+    expect(first.branch).toBe("main");
+    // The user checks out a branch. The label/key stay pinned to the same folder; the BRANCH moves.
+    await writeFile(join(cwd, ".git", "HEAD"), "ref: refs/heads/release/2.0\n");
+    const second = buildBlob(input, "Mac", "t", plan, "claude", undefined, pin);
+    expect(second.branch).toBe("release/2.0");
+    expect(second.label).toBe(first.label);
+    expect(second.folderKey).toBe(first.folderKey);
+  });
+
+  test("the ABSOLUTE cwd is pinned on the RECORD and never in the blob", async () => {
+    const cwd = await repo("dev");
+    const dir = await mkdtemp(join(tmpdir(), "nomo-branch-rec-"));
+    try {
+      const folder = folderIdentity(cwd);
+      // The blob carries the digest and the branch — never the path (adapter.ts's DiscoveredSession rule).
+      const blob = buildBlob({ session_id: "s", cwd, hook_event_name: "PreToolUse", tool_name: "Edit" }, "Mac", "t", plan, "claude", undefined, folder);
+      expect(blob.branch).toBe("dev");
+      expect(JSON.stringify(blob)).not.toContain(cwd);
+      // The record pins the path facts so the watchdog/LAN producers — which have no cwd of their own —
+      // can re-read HEAD for the SAME folder later.
+      await trackSessionAt(dir, "s1", "update", 0, "working", "b", "Mac", folder, "/t.jsonl");
+      const rec = JSON.parse(await readFile(join(dir, "s1.json"), "utf8")) as SessionRecord;
+      expect(rec.cwd).toBe(cwd);
+      expect(rec.gitDir).toBe(join(cwd, ".git"));
+      expect(sessionBranch(rec)).toBe("dev");
+      // A bare-string caller (every call site predating the pin) writes neither, so such a session
+      // simply shows no branch rather than one read from wherever the shell has since wandered.
+      await trackSessionAt(dir, "s2", "update", 0, "working", "b", "Mac", "api-status", "/t.jsonl");
+      const legacy = JSON.parse(await readFile(join(dir, "s2.json"), "utf8")) as SessionRecord;
+      expect(legacy).not.toHaveProperty("cwd");
+      expect(legacy).not.toHaveProperty("gitDir");
+      expect(sessionBranch(legacy)).toBeUndefined();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("buildEnvelope (v2 envelope + encrypted blob)", () => {
-  const input = { session_id: "abc", hook_event_name: "PreToolUse", tool_name: "Edit", cwd: "/Users/karrix/api-status" };
+  // A cwd that exists on NO machine: buildBlob reads the folder's live git HEAD (see the `branch`
+  // describe below), so a fixture pointing at a real checkout would make this assertion depend on
+  // whichever branch the machine running the suite happens to be on.
+  const input = { session_id: "abc", hook_event_name: "PreToolUse", tool_name: "Edit", cwd: "/Users/x/api-status" };
 
   test("builds a v2 envelope whose blob decrypts back to the plaintext", async () => {
     const env = (await buildEnvelope(input, "Karrix's MacBook", 1234, "add font and timer", KEY, false))!;

@@ -16,7 +16,7 @@ import { encryptBlob, decryptBlob } from "./crypto";
 import { createLanAnswerStore, createLanListener } from "./lan-listener";
 import type { LanAnswerStore, LanListener } from "./lan-listener";
 import type { Config } from "./shared";
-import { PLUGIN_VERSION } from "./shared";
+import { folderIdentity, PLUGIN_VERSION } from "./shared";
 import { startCodexRemoteInput } from "./codex-remote-input";
 
 // ---- summary builder (pure) ---------------------------------------------------------------
@@ -925,6 +925,34 @@ describe("runPermissionHook — hold state machine", () => {
     expect(keys.slice(keys.indexOf("permissionSummary") - 2, keys.indexOf("permissionSummary")))
       .toEqual(["at", "folderKey"]);
     expect(Object.keys(fb).slice(-2)).toEqual(["at", "folderKey"]);
+  });
+
+  // The held frames get `branch` for free: runPermissionHook hands buildBlob the WHOLE record, so the
+  // session's pinned folder paths come with it and the live HEAD is read from them. This asserts that
+  // it lands in the one slot every other producer uses — after `folderKey`, before the permission tail.
+  test("the held frames carry the folder's live `branch` right after folderKey, in BOTH sealed variants", async () => {
+    const repo = await mkdtemp(join(tmpdir(), "nomo-perm-branch-"));
+    try {
+      await mkdir(join(repo, ".git"), { recursive: true });
+      await writeFile(join(repo, ".git", "HEAD"), "ref: refs/heads/feat/hybrid-lan\n");
+      // A session pinned to that folder — exactly what the hook's first event wrote.
+      const record = { pid: 1, machine: "Mac", ...folderIdentity(repo), ts: 0 };
+      const { fn, calls } = scriptFetch(false, []);
+      await runPermissionHook(baseDeps({ fetchFn: fn, emit: () => {}, readRecordFn: async () => record }) as never);
+      const body = JSON.parse(calls.find((c) => c.method === "POST")!.body!);
+      const blob = (await decryptBlob(KEY, body.blob)) as Record<string, unknown>;
+      const fb = (await decryptBlob(KEY, body.fallbackBlob)) as Record<string, unknown>;
+      expect(blob.branch).toBe("feat/hybrid-lan");
+      expect(fb.branch).toBe("feat/hybrid-lan");
+      const keys = Object.keys(blob);
+      expect(keys.slice(keys.indexOf("permissionSummary") - 3, keys.indexOf("permissionSummary")))
+        .toEqual(["at", "folderKey", "branch"]);
+      expect(Object.keys(fb).slice(-3)).toEqual(["at", "folderKey", "branch"]);
+      // The absolute path itself never crosses the wire — only the digest and the branch name.
+      expect(JSON.stringify(blob)).not.toContain(repo);
+    } finally {
+      await rm(repo, { recursive: true, force: true });
+    }
   });
 
   test("hold=true, answered allow → emits exactly the allow line", async () => {

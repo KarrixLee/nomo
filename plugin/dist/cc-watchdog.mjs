@@ -101,10 +101,10 @@ import { basename as basename2, join as join2 } from "node:path";
 import { access, chmod, open, readFile, rename, stat, mkdir, unlink, writeFile } from "node:fs/promises";
 import { appendFileSync, existsSync, readFileSync, statSync, truncateSync } from "node:fs";
 import { execFileSync, spawn } from "node:child_process";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "1.8.0";
+var PLUGIN_VERSION = "1.9.0";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -262,20 +262,20 @@ var CODEX_DAEMON_SOCKET_POLL_MS = 250;
 async function startCodexAppServerDaemon(deps = {}) {
   const trace = deps.trace ?? ((event) => traceSession(event));
   const probe = deps.probe ?? (() => codexAppServerSocketAvailable());
-  const sleep = deps.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
+  const sleep = deps.sleep ?? ((ms) => new Promise((resolve2) => setTimeout(resolve2, ms)));
   const command = deps.codexPath ?? "codex";
   const timeoutMs = deps.timeoutMs ?? CODEX_DAEMON_START_TIMEOUT_MS;
   const socketWaitMs = deps.socketWaitMs ?? CODEX_DAEMON_SOCKET_WAIT_MS;
   const spawnFn = deps.spawnFn ?? ((cmd, args) => spawn(cmd, [...args], { stdio: "ignore" }));
   let exit;
   try {
-    exit = await new Promise((resolve) => {
+    exit = await new Promise((resolve2) => {
       let settled = false;
       const done = (value) => {
         if (settled)
           return;
         settled = true;
-        resolve(value);
+        resolve2(value);
       };
       let child;
       try {
@@ -334,23 +334,93 @@ function lastHookPath(agent) {
   return `${CC_DIR}/last-hook-${agent}`;
 }
 var FOLDER_KEY_HEX_CHARS = 12;
+var BRANCH_MAX_CHARS = 60;
+var GIT_DIR_WALK_MAX_DEPTH = 64;
+function gitDirPointer(content, containingDir) {
+  const match = /^[ \t]*gitdir:[ \t]*(.+?)[ \t\r]*$/m.exec(content);
+  const target = match?.[1];
+  if (typeof target !== "string" || target.length === 0)
+    return;
+  return isAbsolute(target) ? target : resolve(containingDir, target);
+}
+function resolveGitDir(cwd) {
+  if (typeof cwd !== "string" || cwd.length === 0)
+    return;
+  let dir = cwd;
+  for (let depth = 0;depth < GIT_DIR_WALK_MAX_DEPTH; depth++) {
+    const candidate = join(dir, ".git");
+    try {
+      const st = statSync(candidate);
+      if (st.isDirectory())
+        return candidate;
+      if (st.isFile())
+        return gitDirPointer(readFileSync(candidate, "utf8"), dir);
+    } catch {}
+    const parent = dirname(dir);
+    if (parent === dir)
+      return;
+    dir = parent;
+  }
+  return;
+}
+function branchFromHead(gitDir) {
+  if (typeof gitDir !== "string" || gitDir.length === 0)
+    return;
+  let head;
+  try {
+    head = readFileSync(join(gitDir, "HEAD"), "utf8");
+  } catch {
+    return;
+  }
+  const first = (head.split(`
+`, 1)[0] ?? "").trim();
+  if (first.length === 0)
+    return;
+  const ref = /^ref:[ \t]*refs\/heads\/(.+)$/.exec(first);
+  if (ref) {
+    const name = ref[1].trim();
+    return name.length > 0 ? name.slice(0, BRANCH_MAX_CHARS) : undefined;
+  }
+  if (/^[0-9a-f]{40}$/.test(first) || /^[0-9a-f]{64}$/.test(first))
+    return first.slice(0, 7);
+  return;
+}
+function sessionBranch(folder) {
+  if (!folder)
+    return;
+  const cached = typeof folder.gitDir === "string" && folder.gitDir.length > 0 ? folder.gitDir : undefined;
+  if (cached) {
+    const branch = branchFromHead(cached);
+    if (branch)
+      return branch;
+  }
+  const fresh = resolveGitDir(folder.cwd);
+  if (!fresh || fresh === cached)
+    return;
+  return branchFromHead(fresh);
+}
 function folderKeyFromCwd(cwd) {
   if (typeof cwd !== "string" || cwd.length === 0)
     return;
   return createHash("sha256").update(cwd, "utf8").digest("hex").slice(0, FOLDER_KEY_HEX_CHARS);
 }
 function folderIdentity(cwd, pinned) {
-  const pin = typeof pinned === "string" ? { label: pinned, folderKey: undefined } : pinned;
+  const pin = typeof pinned === "string" ? { label: pinned, folderKey: undefined, cwd: undefined, gitDir: undefined } : pinned;
   if (typeof pin?.label === "string" && pin.label.length > 0) {
     return {
       label: pin.label,
-      ...typeof pin.folderKey === "string" && pin.folderKey.length > 0 ? { folderKey: pin.folderKey } : {}
+      ...typeof pin.folderKey === "string" && pin.folderKey.length > 0 ? { folderKey: pin.folderKey } : {},
+      ...typeof pin.cwd === "string" && pin.cwd.length > 0 ? { cwd: pin.cwd } : {},
+      ...typeof pin.gitDir === "string" && pin.gitDir.length > 0 ? { gitDir: pin.gitDir } : {}
     };
   }
   const key = folderKeyFromCwd(cwd);
+  const gitDir = typeof cwd === "string" && cwd.length > 0 ? resolveGitDir(cwd) : undefined;
   return {
     label: typeof cwd === "string" && cwd.length > 0 ? basename(cwd) : "session",
-    ...key ? { folderKey: key } : {}
+    ...key ? { folderKey: key } : {},
+    ...typeof cwd === "string" && cwd.length > 0 ? { cwd } : {},
+    ...gitDir ? { gitDir } : {}
   };
 }
 function parseConfig(raw) {
@@ -2785,12 +2855,12 @@ class CodexAppServerClient {
     }
     const id = this.nextRpcId++;
     const key = rpcIdKey(id);
-    return new Promise((resolve, reject) => {
+    return new Promise((resolve2, reject) => {
       const timer = this.options.setTimer(() => {
         this.pendingRpc.delete(key);
         reject(new Error(`${method} timed out`));
       }, this.options.requestTimeoutMs);
-      this.pendingRpc.set(key, { resolve, reject, timer });
+      this.pendingRpc.set(key, { resolve: resolve2, reject, timer });
       this.transport.send({ method, id, params }).catch((error) => {
         const pending = this.pendingRpc.get(key);
         if (!pending)
@@ -3117,8 +3187,8 @@ class CodexProxyTransport {
       ""
     ].join(`\r
 `);
-    return new Promise((resolve, reject) => {
-      this.openResolve = resolve;
+    return new Promise((resolve2, reject) => {
+      this.openResolve = resolve2;
       this.openReject = reject;
       this.writeRaw(request).catch((error) => this.finish(error));
     });
@@ -3192,10 +3262,10 @@ class CodexProxyTransport {
     parseUpgradeResponse(this.buffer.subarray(0, end), this.handshakeKey);
     this.buffer = this.buffer.subarray(end);
     this.upgraded = true;
-    const resolve = this.openResolve;
+    const resolve2 = this.openResolve;
     this.openResolve = undefined;
     this.openReject = undefined;
-    resolve?.();
+    resolve2?.();
     return true;
   }
   consumeFrames() {
@@ -3317,9 +3387,9 @@ class CodexProxyTransport {
     const child = this.child;
     if (!child || this.ended)
       return Promise.reject(new Error("Codex proxy transport is closed"));
-    return new Promise((resolve, reject) => {
+    return new Promise((resolve2, reject) => {
       try {
-        child.stdin.write(chunk, (error) => error ? reject(error) : resolve());
+        child.stdin.write(chunk, (error) => error ? reject(error) : resolve2());
       } catch (error) {
         reject(asError(error, "Could not write to Codex app-server proxy"));
       }
@@ -3548,6 +3618,7 @@ var finite = (value) => typeof value === "number" && Number.isFinite(value);
 var filled = (value) => typeof value === "string" && value.length > 0;
 function buildStatePlaintext(record, status, at, titleFallback) {
   const agent = record.agent === "codex" ? "codex" : "claude";
+  const branch = sessionBranch(record);
   const base = {
     status,
     title: filled(record.title) ? record.title : filled(titleFallback) ? titleFallback : "",
@@ -3557,7 +3628,8 @@ function buildStatePlaintext(record, status, at, titleFallback) {
     ...finite(record.turnStartedAt) ? { turnStartedAt: record.turnStartedAt } : {},
     ...filled(record.model) ? { model: record.model } : {},
     at: Math.floor(at / 1000),
-    ...filled(record.folderKey) ? { folderKey: record.folderKey } : {}
+    ...filled(record.folderKey) ? { folderKey: record.folderKey } : {},
+    ...branch ? { branch } : {}
   };
   const dbg = agent === "codex" ? formatPlanPickerDebug({
     event: status === "done" ? "done" : "working",
@@ -3775,8 +3847,8 @@ function createLanFrameStore(deps = {}) {
   };
   const park = async (set, waitMs) => {
     let settle;
-    const promise = new Promise((resolve) => {
-      settle = resolve;
+    const promise = new Promise((resolve2) => {
+      settle = resolve2;
     });
     const waiter = { resolve: settle };
     set.add(waiter);
@@ -4225,8 +4297,8 @@ function createLanAnswerStore(options = {}) {
       if (this.peek(requestId, now))
         return { promise: Promise.resolve(), cancel: () => {} };
       let settle;
-      const promise = new Promise((resolve) => {
-        settle = resolve;
+      const promise = new Promise((resolve2) => {
+        settle = resolve2;
       });
       const set = waiters.get(requestId) ?? new Set;
       set.add(settle);
@@ -4275,13 +4347,13 @@ function requestIdOf(payload) {
   return typeof requestId === "string" && LAN_REQUEST_ID_RE.test(requestId) ? requestId : null;
 }
 function readBody(req, max) {
-  return new Promise((resolve) => {
+  return new Promise((resolve2) => {
     const declared = Number(req.headers["content-length"]);
     if (Number.isFinite(declared) && declared > max) {
       try {
         req.pause();
       } catch {}
-      resolve(null);
+      resolve2(null);
       return;
     }
     const chunks = [];
@@ -4291,7 +4363,7 @@ function readBody(req, max) {
       if (settled)
         return;
       settled = true;
-      resolve(value);
+      resolve2(value);
     };
     req.on("data", (chunk) => {
       const bytes = chunk;
@@ -4459,7 +4531,7 @@ function createLanListener(deps = {}) {
       } catch {}
     }
   };
-  const tryListen = (port) => new Promise((resolve) => {
+  const tryListen = (port) => new Promise((resolve2) => {
     let settled = false;
     let candidate;
     try {
@@ -4467,14 +4539,14 @@ function createLanListener(deps = {}) {
         handle(req, res);
       });
     } catch {
-      resolve(null);
+      resolve2(null);
       return;
     }
     const finish = (value) => {
       if (settled)
         return;
       settled = true;
-      resolve(value);
+      resolve2(value);
     };
     try {
       candidate.keepAliveTimeout = LAN_KEEPALIVE_MS;
@@ -4750,7 +4822,7 @@ var MAX_DEFINITIVE_POLL_FAILURES = 2;
 import { readFile as readFile7, realpath, unlink as unlink3 } from "node:fs/promises";
 import { appendFileSync as appendFileSync2, statSync as statSync2, truncateSync as truncateSync2 } from "node:fs";
 import { hostname as hostname2 } from "node:os";
-import { basename as basename5, isAbsolute, relative, resolve } from "node:path";
+import { basename as basename5, isAbsolute as isAbsolute2, relative, resolve as resolve2 } from "node:path";
 
 // src/core/hook.ts
 import { readdir as readdir3, readFile as readFile6, unlink as unlink2 } from "node:fs/promises";
@@ -4978,7 +5050,9 @@ function transcriptStartMs(prefix) {
   return;
 }
 function buildBlob(input, machine, title, plan, agent = "claude", turnStartedAt, pinnedFolder, model, at, proposedPlan, dbgOverride) {
-  const { label, folderKey } = folderIdentity(input.cwd, pinnedFolder);
+  const folder = folderIdentity(input.cwd, pinnedFolder);
+  const { label, folderKey } = folder;
+  const branch = sessionBranch(folder);
   const hookName = typeof input.hook_event_name === "string" ? input.hook_event_name : "";
   const detail = detailForHook(hookName, typeof input.tool_name === "string" ? input.tool_name : undefined, input.tool_input);
   const base = {
@@ -4991,7 +5065,8 @@ function buildBlob(input, machine, title, plan, agent = "claude", turnStartedAt,
     ...typeof turnStartedAt === "number" && Number.isFinite(turnStartedAt) ? { turnStartedAt } : {},
     ...typeof model === "string" && model.length > 0 ? { model } : {},
     ...typeof at === "number" && Number.isFinite(at) ? { at } : {},
-    ...folderKey ? { folderKey } : {}
+    ...folderKey ? { folderKey } : {},
+    ...branch ? { branch } : {}
   };
   const dbg = agent === "codex" ? dbgOverride ?? formatPlanPickerDebug({
     event: hookName || "event",
@@ -5050,12 +5125,14 @@ async function trackSessionAt(sessionsDir, sessionId, op, prio, status, blob, ma
       return;
     }
     const recordedAt = Date.now();
-    const { label, folderKey } = typeof folder === "string" ? { label: folder, folderKey: undefined } : folder;
+    const { label, folderKey, cwd, gitDir } = typeof folder === "string" ? { label: folder, folderKey: undefined, cwd: undefined, gitDir: undefined } : folder;
     const record = {
       pid,
       machine,
       label,
       ...folderKey ? { folderKey } : {},
+      ...cwd ? { cwd } : {},
+      ...gitDir ? { gitDir } : {},
       ts: recordedAt,
       transcript,
       lastEvent: op === "start" ? "sessionStart" : status,
@@ -5511,10 +5588,10 @@ async function loadCodexTurnPolicy(transcriptPath, turnId, sessionId, home = cod
   if (!transcriptPath || !turnId || !sessionId || !basename5(transcriptPath).match(/^rollout-.*\.jsonl$/))
     return null;
   try {
-    const sessionsRoot = await realpath(resolve(home, "sessions"));
+    const sessionsRoot = await realpath(resolve2(home, "sessions"));
     const rollout = await realpath(transcriptPath);
     const rel = relative(sessionsRoot, rollout);
-    if (rel === "" || rel.startsWith("..") || isAbsolute(rel))
+    if (rel === "" || rel.startsWith("..") || isAbsolute2(rel))
       return null;
     const head = await readPrefix(rollout, CODEX_ROLLOUT_HEAD_BYTES);
     if (codexRolloutSessionId(head) !== sessionId)
@@ -5895,8 +5972,8 @@ var LOOPBACK_MAX_CONSECUTIVE_ERRORS = 5;
 function createLoopbackAnswerPoller(config, requestId, deps) {
   const interval = deps.intervalMs ?? LOOPBACK_POLL_INTERVAL_MS;
   const discoverInterval = deps.discoverIntervalMs ?? POLL_INTERVAL_MS;
-  const tick = deps.sleep ?? ((ms) => new Promise((resolve2) => {
-    const timer = setTimeout(resolve2, ms);
+  const tick = deps.sleep ?? ((ms) => new Promise((resolve3) => {
+    const timer = setTimeout(resolve3, ms);
     timer.unref?.();
   }));
   let live = deps.statePath !== undefined;
@@ -5907,8 +5984,8 @@ function createLoopbackAnswerPoller(config, requestId, deps) {
   let traced = false;
   let pending;
   let wakeResolve = () => {};
-  let wake = new Promise((resolve2) => {
-    wakeResolve = resolve2;
+  let wake = new Promise((resolve3) => {
+    wakeResolve = resolve3;
   });
   let keyPromise;
   const note2 = (result) => {
@@ -6521,6 +6598,7 @@ function codexAnswersFromPhone(request, positional) {
 }
 function baseBlob(request, record, config, now) {
   const preview = requestUserInputDetail({ questions: request.questions });
+  const branch = sessionBranch(record);
   return {
     status: "needsAttention",
     title: typeof record.title === "string" ? record.title : "",
@@ -6531,7 +6609,8 @@ function baseBlob(request, record, config, now) {
     ...typeof record.turnStartedAt === "number" && Number.isFinite(record.turnStartedAt) ? { turnStartedAt: record.turnStartedAt } : {},
     ...typeof record.model === "string" && record.model.length > 0 ? { model: record.model } : {},
     at: Math.floor(now / 1000),
-    ...typeof record.folderKey === "string" && record.folderKey.length > 0 ? { folderKey: record.folderKey } : {}
+    ...typeof record.folderKey === "string" && record.folderKey.length > 0 ? { folderKey: record.folderKey } : {},
+    ...branch ? { branch } : {}
   };
 }
 function requestSignal(ms, signal) {
@@ -6552,14 +6631,14 @@ function requestSignal(ms, signal) {
 function abortableSleep(ms, signal, sleep) {
   if (signal.aborted)
     return Promise.resolve();
-  return new Promise((resolve2) => {
+  return new Promise((resolve3) => {
     let done = false;
     const finish = () => {
       if (done)
         return;
       done = true;
       signal.removeEventListener("abort", finish);
-      resolve2();
+      resolve3();
     };
     signal.addEventListener("abort", finish, { once: true });
     sleep(ms).then(finish, finish);
@@ -6636,8 +6715,8 @@ async function runRemoteInput(request, requestId, signal, deps, onHoldCreated) {
       "x-cc-auth": deps.config.pcSecret,
       "x-cc-version": PLUGIN_VERSION
     };
-    const sleep = deps.sleep ?? ((ms) => new Promise((resolve2) => {
-      const timer = setTimeout(resolve2, ms);
+    const sleep = deps.sleep ?? ((ms) => new Promise((resolve3) => {
+      const timer = setTimeout(resolve3, ms);
       timer.unref?.();
     }));
     let attentionStalled = false;
@@ -6842,8 +6921,8 @@ function startCodexRemoteInput(request, deps) {
   const controller = new AbortController;
   const fetchFn = deps.fetchFn ?? fetch;
   let settleHold;
-  const holdCreated = new Promise((resolve2) => {
-    settleHold = resolve2;
+  const holdCreated = new Promise((resolve3) => {
+    settleHold = resolve3;
   });
   let resolvePromise;
   const completion = runRemoteInput(request, requestId, controller.signal, deps, settleHold).catch((error) => {
@@ -7148,6 +7227,7 @@ function buildEndEnvelope(sessionId, now, record, at) {
   };
 }
 async function buildDoneEnvelope(sessionId, record, now, e2eKey, agent = "claude", at, dbg) {
+  const branch = sessionBranch(record);
   const base = {
     status: "done",
     title: typeof record.title === "string" ? record.title : "",
@@ -7157,13 +7237,15 @@ async function buildDoneEnvelope(sessionId, record, now, e2eKey, agent = "claude
     ...typeof record.turnStartedAt === "number" && Number.isFinite(record.turnStartedAt) ? { turnStartedAt: record.turnStartedAt } : {},
     ...typeof record.model === "string" && record.model.length > 0 ? { model: record.model } : {},
     ...typeof at === "number" && Number.isFinite(at) ? { at } : {},
-    ...typeof record.folderKey === "string" && record.folderKey.length > 0 ? { folderKey: record.folderKey } : {}
+    ...typeof record.folderKey === "string" && record.folderKey.length > 0 ? { folderKey: record.folderKey } : {},
+    ...branch ? { branch } : {}
   };
   const debug = appendCodexBridgeMarker(agent === "codex" ? dbg ?? formatPlanPickerDebug({ event: "done", classifier: "done", marker: "0", by: "wd" }) : undefined, codexBridgeIsDown());
   const blob = await encryptBlob(e2eKey, appendFittedPlanAndDebug(base, undefined, debug));
   return { v: 2, sessionId, op: "done", prio: 0, ts: now, blob, ...startedAtField(record) };
 }
 async function buildNeedsAttentionEnvelope(sessionId, record, now, e2eKey, agent = "claude", at, detail, attentionKind, proposedPlan, dbg) {
+  const branch = sessionBranch(record);
   const base = {
     status: "needsAttention",
     title: typeof record.title === "string" ? record.title : "",
@@ -7174,7 +7256,8 @@ async function buildNeedsAttentionEnvelope(sessionId, record, now, e2eKey, agent
     ...typeof record.turnStartedAt === "number" && Number.isFinite(record.turnStartedAt) ? { turnStartedAt: record.turnStartedAt } : {},
     ...typeof record.model === "string" && record.model.length > 0 ? { model: record.model } : {},
     ...typeof at === "number" && Number.isFinite(at) ? { at } : {},
-    ...typeof record.folderKey === "string" && record.folderKey.length > 0 ? { folderKey: record.folderKey } : {}
+    ...typeof record.folderKey === "string" && record.folderKey.length > 0 ? { folderKey: record.folderKey } : {},
+    ...branch ? { branch } : {}
   };
   const debug = appendCodexBridgeMarker(agent === "codex" ? dbg ?? formatPlanPickerDebug({ event: "attention", classifier: "pending", marker: "0", by: "wd" }) : undefined, codexBridgeIsDown());
   const blob = await encryptBlob(e2eKey, appendFittedPlanAndDebug(base, proposedPlan, debug));
@@ -7190,6 +7273,7 @@ async function buildNeedsAttentionEnvelope(sessionId, record, now, e2eKey, agent
   };
 }
 async function buildWorkingEnvelope(sessionId, record, now, e2eKey, agent = "claude", dbg) {
+  const branch = sessionBranch(record);
   const base = {
     status: "working",
     title: typeof record.title === "string" ? record.title : "",
@@ -7199,7 +7283,8 @@ async function buildWorkingEnvelope(sessionId, record, now, e2eKey, agent = "cla
     ...typeof record.turnStartedAt === "number" && Number.isFinite(record.turnStartedAt) ? { turnStartedAt: record.turnStartedAt } : {},
     ...typeof record.model === "string" && record.model.length > 0 ? { model: record.model } : {},
     at: Math.floor(now / 1000),
-    ...typeof record.folderKey === "string" && record.folderKey.length > 0 ? { folderKey: record.folderKey } : {}
+    ...typeof record.folderKey === "string" && record.folderKey.length > 0 ? { folderKey: record.folderKey } : {},
+    ...branch ? { branch } : {}
   };
   const debug = appendCodexBridgeMarker(agent === "codex" ? dbg ?? formatPlanPickerDebug({ event: "working", classifier: "resolved", marker: "0", by: "wd" }) : undefined, codexBridgeIsDown());
   const blob = await encryptBlob(e2eKey, appendFittedPlanAndDebug(base, undefined, debug));
@@ -7895,13 +7980,13 @@ function acceptLanCommand(command, deps = {}) {
 var LAN_ANSWER_ECHO_DELAY_MS = 5000;
 function acceptLanAnswer(answer, deps = {}) {
   try {
-    const resolve2 = deps.resolveFn ?? ((config, requestId) => resolveOnRelay(config, requestId, fetch));
+    const resolve3 = deps.resolveFn ?? ((config, requestId) => resolveOnRelay(config, requestId, fetch));
     const delayMs = deps.delayMs ?? LAN_ANSWER_ECHO_DELAY_MS;
     const sleep = deps.sleep ?? ((ms) => new Promise((done) => {
       const timer = setTimeout(done, ms);
       timer.unref?.();
     }));
-    return (delayMs > 0 ? sleep(delayMs) : Promise.resolve()).then(() => resolve2(answer.config, answer.requestId)).catch(() => {
+    return (delayMs > 0 ? sleep(delayMs) : Promise.resolve()).then(() => resolve3(answer.config, answer.requestId)).catch(() => {
       traceFocus(deps, { event: "lan", result: "echo-failed", requestId: answer.requestId });
     });
   } catch {
@@ -7931,6 +8016,7 @@ async function readAllRecords() {
   return (await readAllRecordEntries()).map((e) => e.rec);
 }
 async function buildProvisionalBlob(d, machine, blobAgentFields, e2eKey, at) {
+  const branch = sessionBranch({ cwd: d.cwd });
   const base = {
     status: d.idle === true ? "done" : "working",
     title: d.title ?? "",
@@ -7938,7 +8024,8 @@ async function buildProvisionalBlob(d, machine, blobAgentFields, e2eKey, at) {
     label: d.label,
     ...blobAgentFields,
     ...typeof at === "number" && Number.isFinite(at) ? { at } : {},
-    ...typeof d.folderKey === "string" && d.folderKey.length > 0 ? { folderKey: d.folderKey } : {}
+    ...typeof d.folderKey === "string" && d.folderKey.length > 0 ? { folderKey: d.folderKey } : {},
+    ...branch ? { branch } : {}
   };
   const dbg = appendCodexBridgeMarker(blobAgentFields.agent === "codex" ? formatPlanPickerDebug({
     event: "discover",
@@ -7955,11 +8042,14 @@ function buildStartEnvelope(sessionId, blob, now) {
   return buildProvisionalEnvelope(sessionId, blob, now, false);
 }
 function buildProvisionalRecord(d, machine, blob, blobAgentFields, now, pairingId, idle = false) {
+  const gitDir = resolveGitDir(d.cwd);
   return {
     pid: d.pid,
     machine,
     label: d.label,
     ...typeof d.folderKey === "string" && d.folderKey.length > 0 ? { folderKey: d.folderKey } : {},
+    ...typeof d.cwd === "string" && d.cwd.length > 0 ? { cwd: d.cwd } : {},
+    ...gitDir ? { gitDir } : {},
     ts: now,
     lastEvent: idle ? "done" : "sessionStart",
     op: idle ? "done" : "start",
@@ -8455,6 +8545,7 @@ function statusFromRecord(record) {
   return "working";
 }
 async function buildTitleRepairEnvelope(sessionId, record, title, now, e2eKey, agent = "codex", at) {
+  const branch = sessionBranch(record);
   const base = {
     status: statusFromRecord(record),
     title,
@@ -8464,7 +8555,8 @@ async function buildTitleRepairEnvelope(sessionId, record, title, now, e2eKey, a
     ...typeof record.turnStartedAt === "number" && Number.isFinite(record.turnStartedAt) ? { turnStartedAt: record.turnStartedAt } : {},
     ...typeof record.model === "string" && record.model.length > 0 ? { model: record.model } : {},
     ...typeof at === "number" && Number.isFinite(at) ? { at } : {},
-    ...typeof record.folderKey === "string" && record.folderKey.length > 0 ? { folderKey: record.folderKey } : {}
+    ...typeof record.folderKey === "string" && record.folderKey.length > 0 ? { folderKey: record.folderKey } : {},
+    ...branch ? { branch } : {}
   };
   const dbg = appendCodexBridgeMarker(agent === "codex" ? record.dbg ?? formatPlanPickerDebug({
     event: "title",
@@ -8728,8 +8820,8 @@ var BRIDGE_OP_DEADLINE_MS = 15000;
 var PLAN_PICKER_STATUS_QUERY_DEADLINE_MS = 2000;
 function withDeadline(work, ms) {
   let timer;
-  const deadline = new Promise((resolve2) => {
-    timer = setTimeout(() => resolve2(undefined), ms);
+  const deadline = new Promise((resolve3) => {
+    timer = setTimeout(() => resolve3(undefined), ms);
     timer.unref?.();
   });
   return Promise.race([work, deadline]).finally(() => {

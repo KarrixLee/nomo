@@ -50,7 +50,7 @@ import {
   startCodexAppServerDaemon,
   GONE_STRIKE_LIMIT, loadConfig, loadPendingConfig, localApprovalsState,
   PAIR_HTML_FILE, PairPollResult, parseWatchdogPidfile, PendingConfig, pidAlive, PLUGIN_VERSION, readDecisionHoldAt, readPrefix, readSuffix, recordGoneStrike, removeRevokedConfig,
-  resetGoneStrikes, SessionRecord, SESSIONS_DIR, traceSession, tracePlanPickerDecision, watchdogBuildDiffers,
+  resetGoneStrikes, resolveGitDir, SessionRecord, sessionBranch, SESSIONS_DIR, traceSession, tracePlanPickerDecision, watchdogBuildDiffers,
   watchdogBuildStamp, watchdogHolderIsLive, WATCHDOG_PID_PATH,
 } from "../core/shared";
 import { rememberBounded } from "../core/bounded-set";
@@ -273,6 +273,10 @@ export function buildEndEnvelope(sessionId: string, now: number, record?: Sessio
  *  likewise restamped into the rebuilt blob — omitted when unknown — so the island's frozen
  *  "done in Xm" keeps measuring the TURN, exactly as a hook-built done blob would. */
 export async function buildDoneEnvelope(sessionId: string, record: SessionRecord, now: number, e2eKey: Uint8Array, agent: AgentKind = "claude", at?: number, dbg?: string): Promise<object> {
+  // The folder's LIVE branch, re-READ (not restamped like the keys above): the paths it reads are
+  // pinned on the record, but HEAD is current state — a `git checkout` since the last hook must reach
+  // the phone. Omitted when the record predates the pin or the folder is not a repo.
+  const branch = sessionBranch(record);
   const base = {
     status: "done",
     title: typeof record.title === "string" ? record.title : "",
@@ -294,6 +298,7 @@ export async function buildDoneEnvelope(sessionId: string, record: SessionRecord
     // cwd to derive from, and a corrective that dropped the key would move a live row onto a second
     // card for the same folder. OMITTED when the record has none (a pre-key session).
     ...(typeof record.folderKey === "string" && record.folderKey.length > 0 ? { folderKey: record.folderKey } : {}),
+    ...(branch ? { branch } : {}),
   };
   const debug = appendCodexBridgeMarker(
     agent === "codex" ? dbg ?? formatPlanPickerDebug({ event: "done", classifier: "done", marker: "0", by: "wd" }) : undefined,
@@ -318,6 +323,8 @@ export async function buildNeedsAttentionEnvelope(
   agent: AgentKind = "claude", at?: number, detail?: string, attentionKind?: "userInput", proposedPlan?: string,
   dbg?: string,
 ): Promise<object> {
+  // Re-read live, exactly as buildDoneEnvelope does (see there).
+  const branch = sessionBranch(record);
   const base = {
     status: "needsAttention",
     title: typeof record.title === "string" ? record.title : "",
@@ -339,6 +346,7 @@ export async function buildNeedsAttentionEnvelope(
     // ordinary permissions/questions.
     ...(typeof at === "number" && Number.isFinite(at) ? { at } : {}),
     ...(typeof record.folderKey === "string" && record.folderKey.length > 0 ? { folderKey: record.folderKey } : {}),
+    ...(branch ? { branch } : {}),
   };
   const debug = appendCodexBridgeMarker(
     agent === "codex" ? dbg ?? formatPlanPickerDebug({ event: "attention", classifier: "pending", marker: "0", by: "wd" }) : undefined,
@@ -361,6 +369,8 @@ export async function buildNeedsAttentionEnvelope(
 export async function buildWorkingEnvelope(
   sessionId: string, record: SessionRecord, now: number, e2eKey: Uint8Array, agent: AgentKind = "claude", dbg?: string,
 ): Promise<Record<string, unknown>> {
+  // Re-read live, exactly as buildDoneEnvelope does (see there).
+  const branch = sessionBranch(record);
   const base = {
     status: "working",
     title: typeof record.title === "string" ? record.title : "",
@@ -372,6 +382,7 @@ export async function buildWorkingEnvelope(
     at: Math.floor(now / 1000),
     // The record's pinned folder key, in the same slot as buildDoneEnvelope's (see there).
     ...(typeof record.folderKey === "string" && record.folderKey.length > 0 ? { folderKey: record.folderKey } : {}),
+    ...(branch ? { branch } : {}),
   };
   const debug = appendCodexBridgeMarker(
     agent === "codex" ? dbg ?? formatPlanPickerDebug({ event: "working", classifier: "resolved", marker: "0", by: "wd" }) : undefined,
@@ -1582,6 +1593,10 @@ async function readAllRecords(): Promise<SessionRecord[]> {
 export async function buildProvisionalBlob(
   d: DiscoveredSession, machine: string, blobAgentFields: { agent?: AgentKind }, e2eKey: Uint8Array, at?: number,
 ): Promise<string> {
+  // The discovered cwd's LIVE branch. Resolved from `d.cwd` (the discovery has no cached git dir yet —
+  // buildProvisionalRecord pins one for every later frame), so a discovered row shows its branch from
+  // the very first frame and the real hook that reconciles it away carries the same value.
+  const branch = sessionBranch({ cwd: d.cwd });
   // `at` (epoch SECONDS) appended LAST — the OBSERVED discovery time (a process-scan can't know the
   // TUI's real last-activity, so "now" is the honest value). OMITTED when the caller has none.
   const base = {
@@ -1592,6 +1607,7 @@ export async function buildProvisionalBlob(
     // right folder card immediately, and the real hook that reconciles it away carries the identical
     // key — so the row never jumps cards on reconcile. Omitted when the cwd could not be read.
     ...(typeof d.folderKey === "string" && d.folderKey.length > 0 ? { folderKey: d.folderKey } : {}),
+    ...(branch ? { branch } : {}),
   };
   const dbg = appendCodexBridgeMarker(blobAgentFields.agent === "codex" ? formatPlanPickerDebug({
     event: "discover", classifier: d.idle === true ? "done" : "work", marker: "0", by: "wd",
@@ -1624,6 +1640,10 @@ export function buildProvisionalRecord(
   d: DiscoveredSession, machine: string, blob: string, blobAgentFields: { agent?: AgentKind }, now: number,
   pairingId?: string, idle = false,
 ): SessionRecord {
+  // The git dir of the discovered cwd, resolved ONCE here and pinned like the folder key: every later
+  // corrective this daemon rebuilds from the record then re-reads HEAD directly instead of walking the
+  // tree again. Undefined when the cwd is unknown or outside a repo — the key is then omitted.
+  const gitDir = resolveGitDir(d.cwd);
   return {
     pid: d.pid,
     machine,
@@ -1631,6 +1651,12 @@ export function buildProvisionalRecord(
     // Pinned on the provisional exactly as trackSession pins it on a real record, so the sweep's own
     // correctives (which rebuild from the record) keep the folder card the provisional advertised.
     ...(typeof d.folderKey === "string" && d.folderKey.length > 0 ? { folderKey: d.folderKey } : {}),
+    // The same pin for the branch's source paths (LOCAL ONLY — neither ever enters a blob). `cwd` is
+    // deliberately its own field rather than a re-read of `tuiCwd` below: that one is TUI-correlation
+    // evidence with its own lifecycle, while this is the folder identity every blob producer resolves
+    // the live branch from, and the two must not become each other's implicit contract.
+    ...(typeof d.cwd === "string" && d.cwd.length > 0 ? { cwd: d.cwd } : {}),
+    ...(gitDir ? { gitDir } : {}),
     ts: now,
     lastEvent: idle ? "done" : "sessionStart",
     op: idle ? "done" : "start",
@@ -2611,6 +2637,8 @@ function statusFromRecord(record: SessionRecord): CCStatus {
 export async function buildTitleRepairEnvelope(
   sessionId: string, record: SessionRecord, title: string, now: number, e2eKey: Uint8Array, agent: AgentKind = "codex", at?: number,
 ): Promise<{ v: 2; sessionId: string; op: CCOp; prio: 0 | 1; ts: number; blob: string; startedAt?: number }> {
+  // Re-read live, exactly as buildDoneEnvelope does (see there).
+  const branch = sessionBranch(record);
   const base = {
     status: statusFromRecord(record),
     title,
@@ -2625,6 +2653,7 @@ export async function buildTitleRepairEnvelope(
     // The record's pinned folder key, in the same slot as buildDoneEnvelope's (see there) — a title
     // repair must not cost the row its folder card.
     ...(typeof record.folderKey === "string" && record.folderKey.length > 0 ? { folderKey: record.folderKey } : {}),
+    ...(branch ? { branch } : {}),
   };
   const dbg = appendCodexBridgeMarker(agent === "codex" ? record.dbg ?? formatPlanPickerDebug({
     event: "title", classifier: statusFromRecord(record), marker: record.pendingPlanPicker ? "p" : record.planPickerVerificationPending ? "v" : record.planPickerSettled ? "s" : "0", by: "wd",

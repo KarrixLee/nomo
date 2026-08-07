@@ -1,3 +1,6 @@
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, test } from "bun:test";
 import {
   buildStatePlaintext,
@@ -605,6 +608,9 @@ describe("buildStatePlaintext — the Mac-authored blob (invariants 22 and 23)",
     "status", "detail", "title", "machine", "label", "agent", "turnStartedAt", "model",
     "permissionSummary", "permissionRequestId", "at", "permissionToolName", "permissionDetail",
     "permissionDetailOmitted", "permissionQuestions", "plan",
+    // …plus the two optional folder keys the phone renders beside the folder name: the grouping digest
+    // (v1.8.0) and the folder's live git branch (v1.9.0). Both OPTIONAL and omitted when unknown.
+    "folderKey", "branch",
   ]);
 
   test("every key it emits is one of the 16 the phone renders — nothing invented, nothing stray", () => {
@@ -631,6 +637,28 @@ describe("buildStatePlaintext — the Mac-authored blob (invariants 22 and 23)",
       { pid: 1, ts: NOW } as unknown as SessionRecord, "done", NOW,
     );
     expect(bare).toMatchObject({ title: "", machine: "", label: "" });
+  });
+
+  test("the folder's LIVE branch rides after folderKey — the same slot the worker leg's builders use", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "nomo-lan-branch-"));
+    try {
+      const gitDir = join(cwd, ".git");
+      await mkdir(gitDir, { recursive: true });
+      await writeFile(join(gitDir, "HEAD"), "ref: refs/heads/feat/hybrid-lan\n");
+      const record = rec({ title: "t", folderKey: "0123456789ab", cwd, gitDir });
+      const blob = buildStatePlaintext(record, "working", NOW);
+      expect(blob.branch).toBe("feat/hybrid-lan");
+      expect(Object.keys(blob)).toEqual(["status", "title", "machine", "label", "at", "folderKey", "branch"]);
+      // The pinned ABSOLUTE cwd is local-only: it is what the branch is READ from, never what is sent.
+      expect(JSON.stringify(blob)).not.toContain(cwd);
+      // LIVE on this leg too — the LAN frame and the worker frame for one state must not disagree.
+      await writeFile(join(gitDir, "HEAD"), "ref: refs/heads/release/2.0\n");
+      expect(buildStatePlaintext(record, "working", NOW).branch).toBe("release/2.0");
+      // A record with no pinned cwd (pre-v1.9.0, or a session whose cwd was never known) omits the key.
+      expect(buildStatePlaintext(rec({ title: "t" }), "working", NOW)).not.toHaveProperty("branch");
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
   });
 
   test("BLOB_FIT_CHARS still applies on a leg with no worker in it (invariant 22)", () => {
