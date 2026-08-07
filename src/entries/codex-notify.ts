@@ -22,10 +22,9 @@
 // `notify` names, because that file is written once at pairing and never rewritten; see core/notify-wire.
 
 import { hostname } from "node:os";
-import { basename } from "node:path";
 import { cleanPromptTitle, codexAdapter } from "../core/adapter";
 import { buildEnvelope, markDoneDelivered, sessionOrigin, trackSession } from "../core/hook";
-import { atomicWrite, ensureWatchdog, formatPlanPickerDebug, fullTextForRecord, LAST_SEND_PATH, loadConfig, localApprovalsState, pidCommand, PLUGIN_VERSION, readRecord, tracePlanPickerDecision } from "../core/shared";
+import { atomicWrite, ensureWatchdog, folderIdentity, formatPlanPickerDebug, fullTextForRecord, LAST_SEND_PATH, loadConfig, localApprovalsState, pidCommand, PLUGIN_VERSION, readRecord, tracePlanPickerDecision } from "../core/shared";
 
 /** Map the notify JSON onto the runHook/planOp Stop-hook input shape. Null for any payload that isn't
  *  an agent-turn-complete carrying a non-empty thread-id (the only kind we back-stop) or isn't JSON. */
@@ -167,12 +166,20 @@ export async function runNotify(raw: string, deferMs = notifyDeferMs(), sleep: (
     // picker frame leave the phone the same pull-the-full-plan affordance.
     const proposedPlan = pendingPlanPicker ? evidence.plan : undefined;
     let planFull: string | undefined;
-    const envelope = await buildEnvelope(input, machine, now, title, config.e2eKey, false, "codex", startedAt, turnStartedAt, undefined, model, plan, attentionKind,
+    // The session's folder identity, pinned EXACTLY as runHook pins it: the record's existing pin wins
+    // over the notify payload's cwd (a mid-session `cd` must not rename the phone row or move it to
+    // another folder card), and only a session with no record yet derives from the event's cwd. It is
+    // ONE call because label/folderKey/cwd/gitDir travel together or not at all (see folderIdentity) —
+    // deriving the label inline here instead handed trackSession a BARE STRING, which rebuilds the
+    // record with no folderKey/cwd/gitDir at all, so every notify erased the pin the Codex status hook
+    // had just written (and the sealed blob lost both `folderKey` and `branch` with it). The no-cwd,
+    // no-record fallback is unchanged: folderIdentity yields the same literal "session" label.
+    const folder = folderIdentity(input.cwd, record);
+    const envelope = await buildEnvelope(input, machine, now, title, config.e2eKey, false, "codex", startedAt, turnStartedAt, folder, model, plan, attentionKind,
       proposedPlan, dbg, (plaintext) => { planFull = fullTextForRecord(proposedPlan, plaintext.plan); });
     if (!envelope) return;
 
-    const label = typeof input.cwd === "string" && input.cwd.length > 0 ? basename(input.cwd) : "session";
-    await trackSession(sessionId, plan.op, plan.prio, plan.status, envelope.blob as string | undefined, machine, label,
+    await trackSession(sessionId, plan.op, plan.prio, plan.status, envelope.blob as string | undefined, machine, folder,
       transcriptPath, "codex", startedAt, turnStartedAt, payloadTurnId,
       title ?? record?.title, config.pairingId, model, pendingPlanPicker, sessionPid,
       record?.origin ?? sessionOrigin(input, sessionPid, pidCommand(sessionPid)),

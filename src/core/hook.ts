@@ -26,9 +26,9 @@ import {
   SessionCreationSuppression, TrackedSessionLite,
 } from "./adapter";
 import {
-  AgentKind, appendFittedPlanAndDebug, atomicWrite, CCOp, CCStatus, codexCompanionBrokerEvidence, Config, decisionHoldFileName, ensureWatchdog, formatPlanPickerDebug, fullTextForRecord, GONE_STRIKE_LIMIT,
+  AgentKind, appendFittedPlanAndDebug, atomicWrite, CCOp, CCStatus, codexCompanionBrokerEvidence, Config, decisionHoldFileName, ensureWatchdog, FolderIdentity, folderIdentity, formatPlanPickerDebug, fullTextForRecord, GONE_STRIKE_LIMIT,
   LAST_SEND_PATH, lastHookPath, loadConfig, loadPendingConfig, localApprovalsState, PENDING_STASH_PATH, PendingEventStash, pidAncestors, pidCommand, PLUGIN_VERSION, readPrefix,
-  readRecord, recordGoneStrike, removeRevokedConfig, resetGoneStrikes, SessionOrigin, SessionRecord, SESSIONS_DIR, tracePlanPickerDecision, traceSession,
+  readRecord, recordGoneStrike, removeRevokedConfig, resetGoneStrikes, SessionOrigin, SessionRecord, SESSIONS_DIR, sessionBranch, tracePlanPickerDecision, traceSession,
 } from "./shared";
 import { repairNotifyWiring } from "./notify-wire";
 
@@ -182,16 +182,21 @@ export function transcriptStartMs(prefix: string): number | undefined {
  *  display fields (title/machine/label), and the optional per-turn anchor. This is ALL the worker
  *  never sees. Shape must match the Swift `CCBlobPlaintext` the phone/widget decode.
  *
- *  `pinnedLabel` — the session's FIRST-SEEN label (from its record) — wins over the event's cwd when
- *  given: a mid-session `cd` changes input.cwd on every later hook, and re-deriving the label per event
- *  silently renamed the phone row / island folder chip (observed live: "api-status" → "server" after a
- *  `cd server`). Absent/empty → first event (or a recordless caller): derive from cwd as before. */
-export function buildBlob(input: Record<string, unknown>, machine: string, title: string | undefined, plan: OpPlan, agent: AgentKind = "claude", turnStartedAt?: number, pinnedLabel?: string, model?: string, at?: number, proposedPlan?: string, dbgOverride?: string): {
-  status: CCStatus; detail?: string; title: string; machine: string; label: string; agent?: AgentKind; turnStartedAt?: number; model?: string; at?: number; plan?: string; dbg?: string;
+ *  `pinnedFolder` — the session's FIRST-SEEN folder identity (its record, or just the record's label
+ *  for the positional callers that predate the key) — wins over the event's cwd when given: a
+ *  mid-session `cd` changes input.cwd on every later hook, and re-deriving per event silently renamed
+ *  the phone row / island folder chip (observed live: "api-status" → "server" after a `cd server`).
+ *  Absent/empty → first event (or a recordless caller): derive from cwd as before. `label`,
+ *  `folderKey` and the local-only path facts come out of ONE call to `folderIdentity`, so they always
+ *  describe the same cwd. */
+export function buildBlob(input: Record<string, unknown>, machine: string, title: string | undefined, plan: OpPlan, agent: AgentKind = "claude", turnStartedAt?: number, pinnedFolder?: string | { label?: unknown; folderKey?: unknown; cwd?: unknown; gitDir?: unknown } | null, model?: string, at?: number, proposedPlan?: string, dbgOverride?: string): {
+  status: CCStatus; detail?: string; title: string; machine: string; label: string; agent?: AgentKind; turnStartedAt?: number; model?: string; at?: number; folderKey?: string; branch?: string; plan?: string; dbg?: string;
 } {
-  const label = typeof pinnedLabel === "string" && pinnedLabel.length > 0
-    ? pinnedLabel
-    : typeof input.cwd === "string" && input.cwd.length > 0 ? basename(input.cwd) : "session";
+  const folder = folderIdentity(input.cwd, pinnedFolder);
+  const { label, folderKey } = folder;
+  // The folder's LIVE branch, re-read from HEAD on every event (the paths are pinned, the branch is
+  // not — a mid-session `git checkout` must reach the phone). Omitted when the folder is not a repo.
+  const branch = sessionBranch(folder);
   const hookName = typeof input.hook_event_name === "string" ? input.hook_event_name : "";
   const detail = detailForHook(
     hookName,
@@ -215,6 +220,19 @@ export function buildBlob(input: Record<string, unknown>, machine: string, title
   // PINNED CROSS-REPO CONTRACT: key `at`, epoch seconds. It remains after `model`; the OPTIONAL Plan
   // picker `plan` key is appended after EVERY existing key and omitted everywhere except a proven
   // pending picker. The optional `dbg` follows `plan` LAST and is the first budget sacrifice.
+  //
+  // `folderKey` (the truncated digest of the session's first-seen ABSOLUTE cwd — see folderIdentity)
+  // sits after `at` and before the fitted plan/dbg tail, and EVERY producer of this blob shape puts it
+  // in that same slot (cc-watchdog's three corrective builders, session-state's LAN plaintext,
+  // codex-remote-input's fallback) so two producers of one frame stay textually identical. It is the
+  // phone's GROUPING identity, while `label` stays the DISPLAY name: two checkouts both named `api`
+  // merged into one card when the basename was the only key. OMITTED whenever unknown — never null,
+  // never empty — so an older phone simply ignores it and this stays an append-only wire change.
+  //
+  // `branch` (v1.9.0 — the folder's CURRENT git branch, or a detached HEAD's short SHA) sits
+  // immediately after `folderKey`, in that same slot in EVERY producer, and is likewise OMITTED when
+  // unknown. Unlike the two folder keys it is LIVE: `folderIdentity` pins only the paths it is read
+  // from, and HEAD is re-read per event so a `git checkout` shows up on the phone.
   const base = {
     status: plan.status, title: title ?? "", machine, label,
     ...(detail ? { detail } : {}),
@@ -222,6 +240,8 @@ export function buildBlob(input: Record<string, unknown>, machine: string, title
     ...(typeof turnStartedAt === "number" && Number.isFinite(turnStartedAt) ? { turnStartedAt } : {}),
     ...(typeof model === "string" && model.length > 0 ? { model } : {}),
     ...(typeof at === "number" && Number.isFinite(at) ? { at } : {}),
+    ...(folderKey ? { folderKey } : {}),
+    ...(branch ? { branch } : {}),
   };
   const dbg = agent === "codex"
     ? dbgOverride ?? formatPlanPickerDebug({
@@ -243,7 +263,10 @@ export function buildBlob(input: Record<string, unknown>, machine: string, title
  *  worker to distinguish a Plan question from an ordinary permission decision without reading `blob`. */
 export async function buildEnvelope(
   input: unknown, machine: string, now: number, title: string | undefined, e2eKey: Uint8Array, sentDone: boolean,
-  agent: AgentKind = "claude", startedAt?: number, turnStartedAt?: number, pinnedLabel?: string, model?: string,
+  agent: AgentKind = "claude", startedAt?: number, turnStartedAt?: number,
+  /** The session record (or, for positional callers predating the folder key, just its label) — the
+   *  FIRST-SEEN folder identity buildBlob pins `label`, `folderKey` and the branch's source paths to. */
+  pinnedFolder?: string | { label?: unknown; folderKey?: unknown; cwd?: unknown; gitDir?: unknown } | null, model?: string,
   planOverride?: OpPlan, attentionKindOverride?: "userInput", proposedPlan?: string, dbg?: string,
   /** APPEND-LAST tee (NOM-44 phase 4). Called with the blob PLAINTEXT this envelope is about to seal,
    *  so the caller can compare the FITTED `plan` against the full one it passed in and persist the
@@ -266,7 +289,7 @@ export async function buildEnvelope(
   // `at` is the real event time (`now`) in epoch SECONDS — the phone's honest sort/age key, frozen here
   // and re-sent verbatim by every watchdog heartbeat so an idle-but-heartbeated session ages out.
   const at = Math.floor(now / 1000);
-  const plaintext = buildBlob(i, machine, title, plan, agent, turnStartedAt, pinnedLabel, model, at, proposedPlan, dbg);
+  const plaintext = buildBlob(i, machine, title, plan, agent, turnStartedAt, pinnedFolder, model, at, proposedPlan, dbg);
   try { onBlobPlaintext?.(plaintext); } catch { /* a tee must never break an envelope */ }
   const blob = await encryptBlob(e2eKey, plaintext);
   const attentionKind = attentionKindOverride ?? (
@@ -326,11 +349,15 @@ export async function stashPendingEvent(
 /** Per-session liveness bookkeeping. Record the session's `claude` process (process.ppid) so a
  *  detached watchdog can notice a force-killed terminal that fires no SessionEnd hook; on op:end,
  *  delete the record instead (nothing to reap). Persists the op/prio/blob so the watchdog can re-send
- *  a staleness heartbeat verbatim, and `sentDone` so the next hook re-arms correctly. Best-effort. */
+ *  a staleness heartbeat verbatim, and `sentDone` so the next hook re-arms correctly. Best-effort.
+ *
+ *  `folder` is the session's folder identity — pass the whole `FolderIdentity` (label + grouping key)
+ *  so the record pins BOTH halves of what buildBlob just sealed. A bare string is still accepted for
+ *  the callers/tests that predate the key; such a record simply carries no `folderKey`. */
 export async function trackSessionAt(
   sessionsDir: string,
   sessionId: string, op: CCOp, prio: 0 | 1, status: CCStatus, blob: string | undefined,
-  machine: string, label: string, transcript: string, agent: AgentKind = "claude", sessionStartedAt?: number,
+  machine: string, folder: string | FolderIdentity, transcript: string, agent: AgentKind = "claude", sessionStartedAt?: number,
   turnStartedAt?: number, turnId?: string, title?: string, pairingId?: string, model?: string,
   pendingPlanPicker: boolean = false, pid: number = process.ppid, origin?: SessionOrigin,
   planPickerVerificationPending: boolean = false, dbg?: string, attentionKind?: "userInput",
@@ -351,10 +378,25 @@ export async function trackSessionAt(
     // otherwise the semantic status (working / needsAttention / done). `agent` (omitted for claude)
     // tells the watchdog which interrupt marker to scan the transcript tail for.
     const recordedAt = Date.now();
+    // Every part of the folder identity travels together or not at all (see folderIdentity): the
+    // record must never pin one folder's name next to another folder's key — or another folder's path.
+    const { label, folderKey, cwd, gitDir } = typeof folder === "string"
+      ? { label: folder, folderKey: undefined, cwd: undefined, gitDir: undefined }
+      : folder;
     const record: SessionRecord = {
       pid,
       machine,
       label,
+      // Pinned alongside `label` so every later blob for this session — corrective, heartbeat or LAN —
+      // reuses it verbatim and a mid-session `cd` cannot move the row to another folder card. Omitted
+      // when unknown (no cwd, or a session first recorded by a plugin predating the key).
+      ...(folderKey ? { folderKey } : {}),
+      // The pinned ABSOLUTE cwd and its cached git dir — LOCAL ONLY (never in a blob; this file is
+      // 0600). They are what lets the watchdog's correctives and the LAN state frame re-read the
+      // folder's LIVE branch, which none of them has a cwd of its own to find. Omitted when unknown,
+      // exactly like the key, and a bare-string caller pins neither.
+      ...(cwd ? { cwd } : {}),
+      ...(gitDir ? { gitDir } : {}),
       ts: recordedAt,
       transcript,
       lastEvent: op === "start" ? "sessionStart" : status,
@@ -425,7 +467,7 @@ export async function trackSessionAt(
  *  trackSessionAt with a temp directory so a live production watchdog can never observe their rows. */
 export async function trackSession(
   sessionId: string, op: CCOp, prio: 0 | 1, status: CCStatus, blob: string | undefined,
-  machine: string, label: string, transcript: string, agent: AgentKind = "claude", sessionStartedAt?: number,
+  machine: string, folder: string | FolderIdentity, transcript: string, agent: AgentKind = "claude", sessionStartedAt?: number,
   turnStartedAt?: number, turnId?: string, title?: string, pairingId?: string, model?: string,
   pendingPlanPicker: boolean = false, pid: number = process.ppid, origin?: SessionOrigin,
   planPickerVerificationPending: boolean = false, dbg?: string, attentionKind?: "userInput",
@@ -433,7 +475,7 @@ export async function trackSession(
 ): Promise<void> {
   return trackSessionAt(
     SESSIONS_DIR,
-    sessionId, op, prio, status, blob, machine, label, transcript, agent, sessionStartedAt,
+    sessionId, op, prio, status, blob, machine, folder, transcript, agent, sessionStartedAt,
     turnStartedAt, turnId, title, pairingId, model, pendingPlanPicker, pid, origin,
     planPickerVerificationPending, dbg, attentionKind, planFull,
   );
@@ -888,14 +930,13 @@ export async function runHook(agent: AgentKind): Promise<void> {
         planPickerVerificationPending = true;
       }
     }
-    // Pin the label to the session's FIRST-SEEN cwd: a mid-session `cd` changes input.cwd on every
-    // later hook, and re-deriving the label per event silently renamed the phone row / island folder
-    // chip (observed live: "api-status" → "server" after a `cd server`). A session's identity must not
-    // follow its shell around, so once the record holds a label it is reused verbatim; only the first
-    // event (no record yet) derives it from cwd.
-    const label = typeof existingRecord?.label === "string" && existingRecord.label.length > 0
-      ? existingRecord.label
-      : typeof input.cwd === "string" && input.cwd.length > 0 ? basename(input.cwd) : "session";
+    // Pin the folder to the session's FIRST-SEEN cwd: a mid-session `cd` changes input.cwd on every
+    // later hook, and re-deriving per event silently renamed the phone row / island folder chip
+    // (observed live: "api-status" → "server" after a `cd server`). A session's identity must not
+    // follow its shell around, so once the record holds a folder it is reused verbatim; only the first
+    // event (no record yet) derives it from cwd. `label` (what the phone SHOWS) and `folderKey` (what
+    // it GROUPS by) come out of one call, so the pair can never describe two different folders.
+    const folder = folderIdentity(input.cwd, existingRecord);
     const dbg = agent === "codex" ? formatPlanPickerDebug({
       event: hookName || "event",
       classifier: pickerClassifier,
@@ -907,7 +948,7 @@ export async function runHook(agent: AgentKind): Promise<void> {
     // ceiling (NOM-44 phase 4). The tee hands back the exact plaintext buildBlob produced, so the
     // comparison is against the real fitted value rather than a re-derivation that could drift.
     let planFull: string | undefined;
-    const envelope = await buildEnvelope(eventInput, machine, Date.now(), title, config.e2eKey, sentDone, agent, startedAt, turnStartedAt, label, model, plan, attentionKind, proposedPlan, dbg,
+    const envelope = await buildEnvelope(eventInput, machine, Date.now(), title, config.e2eKey, sentDone, agent, startedAt, turnStartedAt, folder, model, plan, attentionKind, proposedPlan, dbg,
       (plaintext) => { planFull = fullTextForRecord(proposedPlan, plaintext.plan); });
     if (!envelope) return;
 
@@ -927,7 +968,7 @@ export async function runHook(agent: AgentKind): Promise<void> {
     const recordTranscript = reusedForkPredecessor
       ? (existingRecord!.transcript ?? transcriptPath)
       : transcriptPath;
-    await trackSession(sessionId, plan.op, plan.prio, plan.status, envelope.blob as string | undefined, machine, label, recordTranscript, agent, startedAt, turnStartedAt, turnId,
+    await trackSession(sessionId, plan.op, plan.prio, plan.status, envelope.blob as string | undefined, machine, folder, recordTranscript, agent, startedAt, turnStartedAt, turnId,
       title, config.pairingId, model, pendingPlanPicker, recordPid, origin, planPickerVerificationPending, dbg,
       // The SAME discriminator this event's envelope carries — READ BACK OFF THE ENVELOPE, not from the
       // local `attentionKind` above. buildEnvelope derives it itself for a Codex PreToolUse

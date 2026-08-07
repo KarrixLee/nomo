@@ -5,8 +5,8 @@ import { basename, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { b64url, decryptBlob } from "../core/crypto";
 import {
-  BLOB_FIT_CHARS, DBG_BLOB_TEXT_MAX_CHARS, formatPlanPickerDebug, fullTextForRecord, parseConfig, PendingEventStash, PLAN_BLOB_TEXT_MAX_CHARS, PLAN_BLOB_TRUNCATION_MARKER,
-  readDecisionHoldAt, readRecord, sealedBlobChars, SessionRecord, writeDecisionHoldAt,
+  BLOB_FIT_CHARS, DBG_BLOB_TEXT_MAX_CHARS, folderIdentity, folderKeyFromCwd, formatPlanPickerDebug, fullTextForRecord, parseConfig, PendingEventStash, PLAN_BLOB_TEXT_MAX_CHARS, PLAN_BLOB_TRUNCATION_MARKER,
+  readDecisionHoldAt, readRecord, sealedBlobChars, SessionRecord, sessionBranch, writeDecisionHoldAt,
 } from "../core/shared";
 import {
   aiTitle, buildBlob, buildEnvelope, buildPendingStash, cleanPromptTitle, codexIndexTitle, codexSessionTitle,
@@ -19,6 +19,9 @@ import { createProcessHygiene, isolatedTestEnv } from "../test/process-hygiene";
 
 // A fixed 32-byte test key; the real one is HKDF-derived, but any 32 bytes exercise the round-trip.
 const KEY = new Uint8Array(32).fill(7);
+// The grouping key for the fixture cwd most blob assertions below use. Computed, never hard-coded:
+// the digest is the contract, and a literal would just be a second (drifting) implementation of it.
+const KEY_API_STATUS = folderKeyFromCwd("/Users/x/api-status");
 const { spawnTestProcess } = createProcessHygiene();
 
 describe("native Codex hook manifest", () => {
@@ -115,7 +118,7 @@ describe("planOp (op mapping table)", () => {
     expect(plan).toEqual({ op: "update", prio: 1, status: "needsAttention" });
     // AskUserQuestion has no tool→detail mapping, so the blob carries needsAttention with no `detail`.
     expect(buildBlob({ session_id: "s", cwd: "/Users/x/api-status", hook_event_name: "PreToolUse", tool_name: "AskUserQuestion" }, "Mac", "t", plan))
-      .toEqual({ status: "needsAttention", title: "t", machine: "Mac", label: "api-status" });
+      .toEqual({ status: "needsAttention", title: "t", machine: "Mac", label: "api-status", folderKey: KEY_API_STATUS });
   });
   test("Codex request_user_input carries needsAttention through blob construction", () => {
     const input = { session_id: "s", cwd: "/Users/x/api-status", hook_event_name: "PreToolUse", tool_name: "request_user_input" };
@@ -376,7 +379,7 @@ describe("buildBlob (plaintext content of the encrypted blob)", () => {
   test("carries status/title/machine/label and the tool detail", () => {
     const plan = planOp("PreToolUse", { session_id: "s", cwd: "/Users/x/api-status" }, false)!;
     expect(buildBlob({ session_id: "s", cwd: "/Users/x/api-status", hook_event_name: "PreToolUse", tool_name: "Edit" }, "Mac", "add font", plan))
-      .toEqual({ status: "working", detail: "editing", title: "add font", machine: "Mac", label: "api-status" });
+      .toEqual({ status: "working", detail: "editing", title: "add font", machine: "Mac", label: "api-status", folderKey: KEY_API_STATUS });
   });
   test("no detail field for a hook with no detail; label falls back to 'session'", () => {
     const plan = planOp("Stop", { session_id: "s" }, false)!;
@@ -475,8 +478,177 @@ describe("label pinning (first-seen cwd wins — a mid-session `cd` must not ren
   });
 });
 
+// --- folderKey (the phone's folder GROUPING identity; `label` stays the DISPLAY name) ----------
+//
+// `label` is the cwd BASENAME, and basenames collide: two checkouts both called `api` under different
+// parents merged into ONE card in the phone's session list. `folderKey` is the truncated SHA-256 of the
+// session's first-seen ABSOLUTE cwd, so the two are told apart WITHOUT the path ever entering a blob.
+// It is pinned exactly like `label`, and by the same mechanism (one folderIdentity call), so the pair
+// can never end up describing two different folders.
+describe("folderKey (grouping identity derived from the first-seen absolute cwd)", () => {
+  const plan = planOp("PreToolUse", { session_id: "s" }, false)!;
+  const blobFor = (cwd: string | undefined, pinned?: string | { label?: unknown; folderKey?: unknown }) =>
+    buildBlob({ session_id: "s", hook_event_name: "PreToolUse", tool_name: "Edit", ...(cwd ? { cwd } : {}) },
+              "Mac", "t", plan, "claude", undefined, pinned);
+
+  test("SAME basename under different parents ⇒ same label, DIFFERENT keys (the whole point)", () => {
+    const work = blobFor("/w/api");
+    const side = blobFor("/s/api");
+    expect(work.label).toBe("api");
+    expect(side.label).toBe("api");
+    expect(work.folderKey).not.toBe(side.folderKey);
+    // 12 lowercase hex chars, and nothing path-shaped: the digest is all that crosses the wire.
+    expect(work.folderKey).toMatch(/^[0-9a-f]{12}$/);
+    expect(work.folderKey).toBe(folderKeyFromCwd("/w/api"));
+  });
+
+  test("the key is PINNED across a mid-session `cd`, and stays the one that matches the label", () => {
+    // Event 1: no record yet → both halves derive from the first-seen cwd.
+    const first = blobFor("/w/api");
+    // The shell then `cd`s into a DIFFERENT project whose basename also happens to collide. Both the
+    // record's label and its key win, so the row cannot hop to another folder card mid-flight — and it
+    // must be the key OF THE LABEL'S folder, never the one the shell has wandered into.
+    const second = blobFor("/s/api", { label: first.label, folderKey: first.folderKey });
+    expect(second.label).toBe("api");
+    expect(second.folderKey).toBe(folderKeyFromCwd("/w/api"));
+    expect(second.folderKey).not.toBe(folderKeyFromCwd("/s/api"));
+    // …and a third event, pinned off the second, still describes the same first-seen folder.
+    expect(blobFor("/elsewhere/api", second).folderKey).toBe(folderKeyFromCwd("/w/api"));
+  });
+
+  test("a record pinned by an OLDER plugin keeps no key rather than inventing one from the current cwd", () => {
+    // Such a record has a label and no folderKey. Deriving a key here would pair THIS folder's name
+    // with WHEREVER the shell now is — so the session simply keeps grouping by label (what the phone
+    // falls back to) until it ends.
+    const blob = blobFor("/s/api", { label: "api" });
+    expect(blob.label).toBe("api");
+    expect(blob).not.toHaveProperty("folderKey");
+  });
+
+  test("an unknown cwd omits the key entirely — never null, never empty", () => {
+    const blob = blobFor(undefined);
+    expect(blob.label).toBe("session");
+    expect(blob).not.toHaveProperty("folderKey");
+    expect(JSON.stringify(blob)).not.toContain("folderKey");
+  });
+
+  test("trackSessionAt pins BOTH halves on the record, so every later blob reuses them verbatim", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "nomo-folderkey-"));
+    try {
+      const folder = { label: "api", folderKey: folderKeyFromCwd("/w/api")! };
+      await trackSessionAt(dir, "s1", "update", 0, "working", "b", "Mac", folder, "/t.jsonl");
+      const rec = JSON.parse(await readFile(join(dir, "s1.json"), "utf8")) as SessionRecord;
+      expect(rec.label).toBe("api");
+      expect(rec.folderKey).toBe(folder.folderKey);
+      // A bare-string caller (every pre-folderKey call site, and the tests below) writes no key at all.
+      await trackSessionAt(dir, "s2", "update", 0, "working", "b", "Mac", "api", "/t.jsonl");
+      const legacy = JSON.parse(await readFile(join(dir, "s2.json"), "utf8")) as SessionRecord;
+      expect(legacy.label).toBe("api");
+      expect(legacy).not.toHaveProperty("folderKey");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+// --- branch (the session folder's LIVE git branch; the phone shows it next to the folder name) ----
+//
+// Optional and omitted when absent, in ONE slot — immediately after `folderKey`, before the fitted
+// plan/dbg tail — in every producer of this shape, because the phone's decrypt is all-or-nothing and a
+// LAN row and a worker row for one state must stay textually identical. The resolver itself (the
+// upward walk, worktree/submodule pointers, detached HEAD, the cap) is covered in shared.test.ts;
+// these cover the THREADING: the slot, the omission, and that it is live rather than pinned.
+describe("branch (live git branch of the pinned folder, threaded into the blob)", () => {
+  const plan = planOp("PreToolUse", { session_id: "s" }, false)!;
+  const roots: string[] = [];
+  /** A real temp checkout: `<dir>/.git/HEAD` naming `head`. */
+  const repo = async (head: string): Promise<string> => {
+    const dir = await mkdtemp(join(tmpdir(), "nomo-blob-branch-"));
+    roots.push(dir);
+    await mkdir(join(dir, ".git"), { recursive: true });
+    await writeFile(join(dir, ".git", "HEAD"), `ref: refs/heads/${head}\n`);
+    return dir;
+  };
+  const plain = async (): Promise<string> => {
+    const dir = await mkdtemp(join(tmpdir(), "nomo-blob-plain-"));
+    roots.push(dir);
+    return dir;
+  };
+  afterEach(async () => {
+    await Promise.all(roots.splice(0).map((d) => rm(d, { recursive: true, force: true })));
+  });
+
+  test("rides immediately AFTER folderKey and BEFORE the plan/dbg tail", async () => {
+    const cwd = await repo("feat/hybrid-lan");
+    const blob = buildBlob(
+      { session_id: "s", cwd, hook_event_name: "PreToolUse", tool_name: "Edit" },
+      "Mac", "t", plan, "codex", 1_751_900_000, undefined, "gpt-5-codex", 1_751_900_999,
+    );
+    expect(blob.branch).toBe("feat/hybrid-lan");
+    expect(Object.keys(blob)).toEqual([
+      "status", "title", "machine", "label", "detail", "agent", "turnStartedAt", "model", "at", "folderKey", "branch", "dbg",
+    ]);
+  });
+
+  test("a folder that is not a repo OMITS the key entirely — never null, never empty", async () => {
+    const cwd = await plain();
+    const blob = buildBlob({ session_id: "s", cwd, hook_event_name: "PreToolUse", tool_name: "Edit" }, "Mac", "t", plan);
+    expect(blob).not.toHaveProperty("branch");
+    expect(JSON.stringify(blob)).not.toContain("branch");
+    // …as does an event with no cwd at all.
+    expect(buildBlob({ session_id: "s", hook_event_name: "Stop" }, "Mac", "t", plan)).not.toHaveProperty("branch");
+  });
+
+  test("LIVE, not pinned: a `git checkout` mid-session changes the branch the next event carries", async () => {
+    const cwd = await repo("main");
+    const input = { session_id: "s", cwd, hook_event_name: "PreToolUse", tool_name: "Edit" };
+    // Event 1 pins the folder (what the record then stores); event 2 is pinned off it, as every later
+    // hook of a session is.
+    const pin = folderIdentity(cwd);
+    const first = buildBlob(input, "Mac", "t", plan);
+    expect(first.branch).toBe("main");
+    // The user checks out a branch. The label/key stay pinned to the same folder; the BRANCH moves.
+    await writeFile(join(cwd, ".git", "HEAD"), "ref: refs/heads/release/2.0\n");
+    const second = buildBlob(input, "Mac", "t", plan, "claude", undefined, pin);
+    expect(second.branch).toBe("release/2.0");
+    expect(second.label).toBe(first.label);
+    expect(second.folderKey).toBe(first.folderKey);
+  });
+
+  test("the ABSOLUTE cwd is pinned on the RECORD and never in the blob", async () => {
+    const cwd = await repo("dev");
+    const dir = await mkdtemp(join(tmpdir(), "nomo-branch-rec-"));
+    try {
+      const folder = folderIdentity(cwd);
+      // The blob carries the digest and the branch — never the path (adapter.ts's DiscoveredSession rule).
+      const blob = buildBlob({ session_id: "s", cwd, hook_event_name: "PreToolUse", tool_name: "Edit" }, "Mac", "t", plan, "claude", undefined, folder);
+      expect(blob.branch).toBe("dev");
+      expect(JSON.stringify(blob)).not.toContain(cwd);
+      // The record pins the path facts so the watchdog/LAN producers — which have no cwd of their own —
+      // can re-read HEAD for the SAME folder later.
+      await trackSessionAt(dir, "s1", "update", 0, "working", "b", "Mac", folder, "/t.jsonl");
+      const rec = JSON.parse(await readFile(join(dir, "s1.json"), "utf8")) as SessionRecord;
+      expect(rec.cwd).toBe(cwd);
+      expect(rec.gitDir).toBe(join(cwd, ".git"));
+      expect(sessionBranch(rec)).toBe("dev");
+      // A bare-string caller (every call site predating the pin) writes neither, so such a session
+      // simply shows no branch rather than one read from wherever the shell has since wandered.
+      await trackSessionAt(dir, "s2", "update", 0, "working", "b", "Mac", "api-status", "/t.jsonl");
+      const legacy = JSON.parse(await readFile(join(dir, "s2.json"), "utf8")) as SessionRecord;
+      expect(legacy).not.toHaveProperty("cwd");
+      expect(legacy).not.toHaveProperty("gitDir");
+      expect(sessionBranch(legacy)).toBeUndefined();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("buildEnvelope (v2 envelope + encrypted blob)", () => {
-  const input = { session_id: "abc", hook_event_name: "PreToolUse", tool_name: "Edit", cwd: "/Users/karrix/api-status" };
+  // A cwd that exists on NO machine: buildBlob reads the folder's live git HEAD (see the `branch`
+  // describe below), so a fixture pointing at a real checkout would make this assertion depend on
+  // whichever branch the machine running the suite happens to be on.
+  const input = { session_id: "abc", hook_event_name: "PreToolUse", tool_name: "Edit", cwd: "/Users/x/api-status" };
 
   test("builds a v2 envelope whose blob decrypts back to the plaintext", async () => {
     const env = (await buildEnvelope(input, "Karrix's MacBook", 1234, "add font and timer", KEY, false))!;
@@ -485,6 +657,7 @@ describe("buildEnvelope (v2 envelope + encrypted blob)", () => {
     expect(await decryptBlob(KEY, (env as { blob: string }).blob)).toEqual({
       status: "working", detail: "editing", title: "add font and timer", machine: "Karrix's MacBook", label: "api-status",
       at: 1, // buildEnvelope always freezes the real event time (floor(now/1000); now=1234 → 1)
+      folderKey: folderKeyFromCwd(input.cwd),
     });
   });
 
@@ -594,7 +767,7 @@ describe("turnStartedAt threading (blob-only; omitted when unknown)", () => {
   test("buildBlob includes a known turnStartedAt; OMITS the key when undefined or non-finite", () => {
     const plan = planOp("PreToolUse", input, false)!;
     expect(buildBlob(input, "Mac", "t", plan, "claude", 1_751_900_000))
-      .toEqual({ status: "working", detail: "editing", title: "t", machine: "Mac", label: "api-status", turnStartedAt: 1_751_900_000 });
+      .toEqual({ status: "working", detail: "editing", title: "t", machine: "Mac", label: "api-status", turnStartedAt: 1_751_900_000, folderKey: folderKeyFromCwd(input.cwd) });
     expect(buildBlob(input, "Mac", "t", plan)).not.toHaveProperty("turnStartedAt");
     expect(buildBlob(input, "Mac", "t", plan, "claude", Infinity)).not.toHaveProperty("turnStartedAt");
   });
@@ -623,7 +796,7 @@ describe("model threading (blob-only, optional; omitted when unknown — never a
 
   test("buildBlob includes a known model; OMITS the key when undefined or empty", () => {
     expect(buildBlob(input, "Mac", "t", plan, "claude", undefined, undefined, "claude-fable-5"))
-      .toEqual({ status: "working", detail: "editing", title: "t", machine: "Mac", label: "api-status", model: "claude-fable-5" });
+      .toEqual({ status: "working", detail: "editing", title: "t", machine: "Mac", label: "api-status", model: "claude-fable-5", folderKey: folderKeyFromCwd(input.cwd) });
     expect(buildBlob(input, "Mac", "t", plan)).not.toHaveProperty("model");
     expect(buildBlob(input, "Mac", "t", plan, "claude", undefined, undefined, "")).not.toHaveProperty("model");
   });
@@ -658,14 +831,17 @@ describe("at threading (frozen real-event time, blob-only, epoch seconds; append
 
   test("buildBlob includes a known at; OMITS the key when undefined or non-finite", () => {
     expect(buildBlob(input, "Mac", "t", plan, "claude", undefined, undefined, undefined, 1_751_900_000))
-      .toEqual({ status: "working", detail: "editing", title: "t", machine: "Mac", label: "api-status", at: 1_751_900_000 });
+      .toEqual({ status: "working", detail: "editing", title: "t", machine: "Mac", label: "api-status", at: 1_751_900_000, folderKey: folderKeyFromCwd(input.cwd) });
     expect(buildBlob(input, "Mac", "t", plan)).not.toHaveProperty("at");
     expect(buildBlob(input, "Mac", "t", plan, "claude", undefined, undefined, undefined, Infinity)).not.toHaveProperty("at");
   });
 
-  test("at is the LAST key in the blob, after model (append-last discipline for byte-stable decoders)", () => {
+  test("at, then folderKey, close the base blob (append-last discipline for byte-stable decoders)", () => {
     const blob = buildBlob(input, "Mac", "t", plan, "codex", 1_751_900_000, undefined, "gpt-5-codex", 1_751_900_999);
-    expect(Object.keys(blob)).toEqual(["status", "title", "machine", "label", "detail", "agent", "turnStartedAt", "model", "at", "dbg"]);
+    expect(Object.keys(blob)).toEqual(["status", "title", "machine", "label", "detail", "agent", "turnStartedAt", "model", "at", "folderKey", "dbg"]);
+    // …and a cwd-less event simply omits the grouping key, leaving the pre-folderKey order untouched.
+    expect(Object.keys(buildBlob({ session_id: "abc", hook_event_name: "Stop" }, "Mac", "t", plan, "claude", undefined, undefined, undefined, 1_751_900_999)))
+      .toEqual(["status", "title", "machine", "label", "at"]);
   });
 
   test("buildEnvelope ALWAYS freezes at = floor(now/1000) INSIDE the blob; the clear envelope stays blind", async () => {
@@ -691,7 +867,9 @@ describe("buildPendingStash (plaintext event stashed while pairing is pending)",
     const input = { session_id: "s1", hook_event_name: "Stop", cwd: "/Users/x/api-status" };
     expect(buildPendingStash(input, "Mac", "add font", 1234, 4242)).toEqual({
       sessionId: "s1", op: "done", prio: 0, stashedAt: 1234, pid: 4242,
-      blob: { status: "done", title: "add font", machine: "Mac", label: "api-status", at: 1 }, // real event time frozen (floor(1234/1000))
+      // real event time frozen (floor(1234/1000)); the stash derives its folder from cwd like any
+      // first event, so the flushed first pairing frame already groups correctly on the phone.
+      blob: { status: "done", title: "add font", machine: "Mac", label: "api-status", at: 1, folderKey: folderKeyFromCwd(input.cwd) },
     });
   });
   test("records process.ppid as the session pid by default (the `claude` process, per trackSession)", () => {

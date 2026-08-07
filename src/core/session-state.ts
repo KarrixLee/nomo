@@ -22,7 +22,7 @@
 // the decay, i.e. two numbers about the transport and nothing about the status.
 
 import { adapterFor } from "./adapter";
-import { appendFittedPlanAndDebug, formatPlanPickerDebug } from "./shared";
+import { appendFittedPlanAndDebug, formatPlanPickerDebug, sessionBranch } from "./shared";
 import type { AgentKind, CCStatus, DecisionHold, SessionRecord } from "./shared";
 
 /** The 24 h abandonment cap — cc-watchdog's SESSION_STALE_MS, mirrored (an entry module must not be
@@ -338,6 +338,9 @@ export function buildStatePlaintext(
   record: SessionRecord, status: CCStatus, at: number, titleFallback?: string,
 ): Record<string, unknown> {
   const agent: AgentKind = record.agent === "codex" ? "codex" : "claude";
+  // The folder's LIVE branch, re-read from the record's pinned paths — the same thing the watchdog's
+  // corrective builders do for the worker leg, so the two frames stay textually identical.
+  const branch = sessionBranch(record);
   const base = {
     status,
     // The record's cached last non-empty title, else CC's derived name, else "". Re-pushing title:""
@@ -349,6 +352,11 @@ export function buildStatePlaintext(
     ...(finite(record.turnStartedAt) ? { turnStartedAt: record.turnStartedAt } : {}),
     ...(filled(record.model) ? { model: record.model } : {}),
     at: Math.floor(at / 1000),
+    // The record's PINNED folder key (the phone's grouping identity), in the slot every producer of
+    // this shape uses — hook.ts buildBlob and the watchdog's three corrective builders. A LAN row and
+    // a worker row for one state must stay textually identical, so it is restamped here too.
+    ...(filled(record.folderKey) ? { folderKey: record.folderKey } : {}),
+    ...(branch ? { branch } : {}),
   };
   const dbg = agent === "codex"
     ? formatPlanPickerDebug({

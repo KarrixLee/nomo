@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { b64url, decryptBlob } from "../core/crypto";
+import { folderKeyFromCwd } from "../core/shared";
 import { createProcessHygiene, isolatedTestEnv } from "../test/process-hygiene";
 import { notifyFallbackTitle, synthStopInput } from "./codex-notify";
 
@@ -296,4 +297,91 @@ describe("runNotify E2E (argv payload, dedupe against a sent Stop)", () => {
     expect(record?.op).toBe("done");
     expect(record?.turnId).toBe("tu-1");
   }, 20000);
+
+  // --- folder identity on the notify path (v1.8.0 folderKey + v1.9.0 branch) ----------------------
+  //
+  // notify fires on EVERY turn completion and every plan-picker attention, so it writes the session
+  // record as often as the hooks do. It used to derive `basename(cwd)` inline and hand trackSession a
+  // BARE STRING, which rebuilds the record from scratch with no folderKey/cwd/gitDir — so each notify
+  // ERASED the pin codex-status had just written, and its sealed blob carried neither `folderKey` nor
+  // `branch`. It now goes through the ONE shared `folderIdentity` call runHook uses, which prefers the
+  // record's existing pin over the live event cwd.
+  describe("folder identity (pinned label/folderKey/cwd/gitDir, live branch)", () => {
+    const roots: string[] = [];
+    /** A synthetic temp checkout: `<dir>/.git/HEAD` naming `head`. */
+    const repo = async (head: string): Promise<string> => {
+      const dir = await mkdtemp(join(tmpdir(), "codex-notify-repo-"));
+      roots.push(dir);
+      await mkdir(join(dir, ".git"), { recursive: true });
+      await writeFile(join(dir, ".git", "HEAD"), `ref: refs/heads/${head}\n`);
+      return dir;
+    };
+    afterEach(async () => {
+      await Promise.all(roots.splice(0).map((d) => rm(d, { recursive: true, force: true })));
+    });
+    const payloadFor = (cwd: string | undefined) => JSON.stringify({
+      type: "agent-turn-complete", "thread-id": "th-folder", "turn-id": "tu-1",
+      ...(cwd === undefined ? {} : { cwd }),
+      "input-messages": ["make the widget faster"], "last-assistant-message": "done",
+    });
+    const midWorkSeed = (over: Record<string, unknown>) => ({
+      pid: process.ppid, machine: "mac", ts: 111, transcript: "",
+      lastEvent: "working", sentDone: false, op: "update", prio: 0, blob: "OLD", agent: "codex",
+      turnId: "tu-1", ...over,
+    });
+
+    test("REGRESSION: a notify write PRESERVES the folderKey/cwd/gitDir a prior hook pinned", async () => {
+      // The hook pinned the session to `pinned` on its first event. The shell has since `cd`'d, so the
+      // notify payload carries a DIFFERENT folder — which must change nothing about the row's identity.
+      const pinned = await repo("feat/hybrid-lan");
+      const wandered = await repo("main");
+      const seed = midWorkSeed({
+        label: "pinned-project", folderKey: folderKeyFromCwd(pinned), cwd: pinned, gitDir: join(pinned, ".git"),
+      });
+      const { record, blob } = await runNotifyEntry(payloadFor(wandered), { seedRecord: seed });
+      expect(record?.op).toBe("done"); // the backstop really did rewrite the record…
+      expect(record?.label).toBe("pinned-project"); // …and every part of the pin survived it
+      expect(record?.folderKey).toBe(folderKeyFromCwd(pinned));
+      expect(record?.cwd).toBe(pinned);
+      expect(record?.gitDir).toBe(join(pinned, ".git"));
+      // The blob describes the PINNED folder too — never the one the shell wandered into.
+      expect(blob).toMatchObject({ folderKey: folderKeyFromCwd(pinned), branch: "feat/hybrid-lan" });
+    }, 20000);
+
+    test("no prior record (hooks never fired) → the pin is derived from the event cwd", async () => {
+      const cwd = await repo("dev");
+      const { record, blob } = await runNotifyEntry(payloadFor(cwd));
+      expect(record?.label).toBe(cwd.split("/").pop());
+      expect(record?.folderKey).toBe(folderKeyFromCwd(cwd));
+      expect(record?.cwd).toBe(cwd);
+      expect(record?.gitDir).toBe(join(cwd, ".git"));
+      expect(blob).toMatchObject({ folderKey: folderKeyFromCwd(cwd), branch: "dev" });
+    }, 20000);
+
+    test("the sealed blob carries folderKey AND branch (both were missing before the fix)", async () => {
+      const cwd = await repo("release/2.0");
+      const seed = midWorkSeed({ label: "proj", folderKey: folderKeyFromCwd(cwd), cwd, gitDir: join(cwd, ".git") });
+      const { blob } = await runNotifyEntry(payloadFor(cwd), { seedRecord: seed });
+      expect(blob?.folderKey).toBe(folderKeyFromCwd(cwd));
+      expect(blob?.branch).toBe("release/2.0");
+    }, 20000);
+
+    test("the pinned ABSOLUTE cwd is on the record and NEVER in the sealed blob", async () => {
+      const cwd = await repo("dev");
+      const { record, blob } = await runNotifyEntry(payloadFor(cwd));
+      expect(record?.cwd).toBe(cwd); // local only, in a 0600 record
+      expect(JSON.stringify(blob)).not.toContain(cwd); // the digest crosses the wire, the path never does
+    }, 20000);
+
+    test("a session with no usable cwd still falls back to the literal \"session\" label", async () => {
+      const { record, blob } = await runNotifyEntry(payloadFor(undefined));
+      expect(record?.label).toBe("session");
+      expect(record).not.toHaveProperty("folderKey");
+      expect(record).not.toHaveProperty("cwd");
+      expect(record).not.toHaveProperty("gitDir");
+      expect(blob).toMatchObject({ label: "session" });
+      expect(blob).not.toHaveProperty("folderKey");
+      expect(blob).not.toHaveProperty("branch");
+    }, 20000);
+  });
 });

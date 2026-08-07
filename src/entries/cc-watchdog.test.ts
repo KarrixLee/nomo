@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
-import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { decryptBlob, encryptBlob } from "../core/crypto";
@@ -686,6 +686,80 @@ describe("buildProvisionalRecord (flagged provisional, reap/reconcile-ready)", (
   });
   test("claude-style omits the agent field (empty blobAgentFields)", () => {
     expect(buildProvisionalRecord(disc(), "Mac", "BLOB", {}, 1)).not.toHaveProperty("agent");
+  });
+});
+
+// --- branch (the folder's LIVE git branch) in the daemon's rebuilt frames ------------------------
+//
+// This daemon has no cwd of its own — it rebuilds blobs from the record. `label`/`folderKey` are
+// RESTAMPED from the record's pins; `branch` is RE-READ from the pinned paths, because it is live
+// state: a `git checkout` between the last hook and this corrective must reach the phone.
+describe("branch in the watchdog's rebuilt blobs", () => {
+  const roots: string[] = [];
+  /** A real temp checkout, plus the record fields a session pinned to it would carry. */
+  const repo = async (head: string): Promise<{ cwd: string; gitDir: string }> => {
+    const cwd = await mkdtemp(join(tmpdir(), "nomo-wd-branch-"));
+    roots.push(cwd);
+    const gitDir = join(cwd, ".git");
+    await mkdir(gitDir, { recursive: true });
+    await writeFile(join(gitDir, "HEAD"), `ref: refs/heads/${head}\n`);
+    return { cwd, gitDir };
+  };
+  afterEach(async () => {
+    await Promise.all(roots.splice(0).map((d) => rm(d, { recursive: true, force: true })));
+  });
+
+  test("all four correctives put `branch` immediately after folderKey", async () => {
+    const { cwd, gitDir } = await repo("feat/hybrid-lan");
+    const r = rec({ cwd, gitDir, folderKey: "0123456789ab", turnStartedAt: 111, model: "claude-fable-5", title: "t" });
+    const blobOf = async (env: object) => (await decryptBlob(KEY, (env as { blob: string }).blob)) as Record<string, unknown>;
+    const frames = [
+      await blobOf(await buildDoneEnvelope("s", r, 5_000, KEY, "claude", 5)),
+      await blobOf(await buildNeedsAttentionEnvelope("s", r, 5_000, KEY, "claude", 5)),
+      await blobOf(await buildWorkingEnvelope("s", r, 5_000, KEY, "claude")),
+      await blobOf(await buildTitleRepairEnvelope("s", r, "fixed", 5_000, KEY, "claude", 5)),
+    ];
+    for (const blob of frames) {
+      expect(blob.branch).toBe("feat/hybrid-lan");
+      expect(Object.keys(blob).slice(-2)).toEqual(["folderKey", "branch"]);
+      expect(JSON.stringify(blob)).not.toContain(cwd); // the path itself never rides
+    }
+  });
+
+  test("a record with no pinned cwd (written before the pin existed) simply OMITS the key", async () => {
+    const r = rec({ folderKey: "0123456789ab", title: "t" });
+    const env = await buildDoneEnvelope("s", r, 5_000, KEY, "claude", 5);
+    const blob = await decryptBlob(KEY, (env as { blob: string }).blob) as Record<string, unknown>;
+    expect(blob).not.toHaveProperty("branch");
+    expect(Object.keys(blob).at(-1)).toBe("folderKey");
+  });
+
+  test("RE-READ, not restamped: a checkout since the last hook shows up in the next corrective", async () => {
+    const { cwd, gitDir } = await repo("main");
+    const r = rec({ cwd, gitDir, title: "t" });
+    const first = await decryptBlob(KEY, (await buildDoneEnvelope("s", r, 5_000, KEY, "claude", 5) as { blob: string }).blob) as Record<string, unknown>;
+    expect(first.branch).toBe("main");
+    await writeFile(join(gitDir, "HEAD"), "ref: refs/heads/release/2.0\n");
+    const second = await decryptBlob(KEY, (await buildDoneEnvelope("s", r, 6_000, KEY, "claude", 6) as { blob: string }).blob) as Record<string, unknown>;
+    expect(second.branch).toBe("release/2.0");
+  });
+
+  test("the provisional pair: the blob carries the branch, the record pins the paths it came from", async () => {
+    const { cwd, gitDir } = await repo("dev");
+    const d = disc({ cwd });
+    const blob = await decryptBlob(KEY, await buildProvisionalBlob(d, "Mac", {}, KEY, 5)) as Record<string, unknown>;
+    expect(blob.branch).toBe("dev");
+    expect(Object.keys(blob).at(-1)).toBe("branch"); // after `at`/`folderKey`, both absent for this fixture
+    // The record pins cwd + the resolved git dir, so every later corrective rebuilt from it re-reads
+    // HEAD directly instead of walking the tree again.
+    const r = buildProvisionalRecord(d, "Mac", "BLOB", {}, 4242);
+    expect(r).toMatchObject({ cwd, gitDir });
+    await writeFile(join(gitDir, "HEAD"), "ref: refs/heads/feat/hybrid-lan\n");
+    const corrective = await decryptBlob(KEY, (await buildDoneEnvelope("s", r, 6_000, KEY, "claude", 6) as { blob: string }).blob) as Record<string, unknown>;
+    expect(corrective.branch).toBe("feat/hybrid-lan");
+    // A discovery whose cwd could not be read pins nothing and emits nothing.
+    expect(buildProvisionalRecord(disc(), "Mac", "BLOB", {}, 1)).not.toHaveProperty("cwd");
+    expect(await decryptBlob(KEY, await buildProvisionalBlob(disc(), "Mac", {}, KEY, 5))).not.toHaveProperty("branch");
   });
 });
 

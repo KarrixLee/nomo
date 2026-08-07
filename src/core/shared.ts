@@ -13,7 +13,8 @@
 import { access, chmod, open, readFile, rename, stat, mkdir, unlink, writeFile } from "node:fs/promises";
 import { appendFileSync, existsSync, readFileSync, statSync, truncateSync } from "node:fs";
 import { execFileSync, spawn } from "node:child_process";
-import { dirname, join } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
+import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { b64url, deriveE2EKey, deriveRatchetKey, encryptBlob, fromB64url } from "./crypto";
 
@@ -506,6 +507,213 @@ export function lastHookPath(agent: AgentKind): string {
   return `${CC_DIR}/last-hook-${agent}`;
 }
 
+// --- project-folder identity (the phone's session grouping) -------------------------------------
+
+/** How many hex characters of the cwd digest ride in the blob. 12 hex = 48 bits: collision-free for
+ *  the handful of project folders one machine ever has (birthday-bound ~16M folders for a 1-in-a-
+ *  million collision), and short enough to be free against the worker's 3072-char sealed ceiling. */
+export const FOLDER_KEY_HEX_CHARS = 12;
+
+/** A session's project folder, as the phone sees it: the DISPLAY name, the optional grouping key, and
+ *  the LOCAL-ONLY path facts the live branch is read from. All of them ALWAYS describe the same cwd —
+ *  see `folderIdentity`, which is the only thing that makes them, precisely so no caller can pair one
+ *  folder's name with another folder's key (or another folder's branch). */
+export interface FolderIdentity {
+  /** `basename(cwd)` — what the phone renders as the folder title. */
+  label: string;
+  /** The GROUPING identity (see `folderKeyFromCwd`). Absent when the cwd was unknown, and absent on a
+   *  session pinned by a plugin old enough to predate the key (the phone then groups by `label`). */
+  folderKey?: string;
+  /** The session's pinned ABSOLUTE cwd. LOCAL ONLY — it is kept so `sessionBranch` has something to
+   *  resolve a git dir from, and it must NEVER enter a blob (the rule adapter.ts states on
+   *  `DiscoveredSession.cwd`; `folderKey` exists precisely so the wire carries a digest instead).
+   *  Absent when the cwd was unknown, and absent on a session pinned before this field existed. */
+  cwd?: string;
+  /** The git directory `cwd` resolved to (see `resolveGitDir`), cached so a later event is one small
+   *  HEAD read instead of a fresh upward walk. Local only, like `cwd`. Absent when `cwd` is not inside
+   *  a repo — or when it is, but the record predates the cache. */
+  gitDir?: string;
+}
+
+// --- the session folder's LIVE git branch -------------------------------------------------------
+
+/** Cap on the emitted `branch` string. Ref names are almost never near this, but they are
+ *  user-controlled and effectively unbounded, and the blob has to fit the worker's ~3072-char sealed
+ *  ceiling with the plan/dbg tail still to come (see appendFittedPlanAndDebug). 60 chars shows every
+ *  realistic branch whole and makes a pathological one harmless rather than a frame-eating cost. */
+export const BRANCH_MAX_CHARS = 60;
+
+/** How many parent directories the `.git` search visits before giving up. A session started deep in a
+ *  monorepo is ordinary; an unbounded loop on a pathological path (or a symlink cycle presented as a
+ *  very deep tree) inside a hook that BLOCKS the agent is not. The walk also stops at the filesystem
+ *  root, which is what ends it in practice. */
+const GIT_DIR_WALK_MAX_DEPTH = 64;
+
+/** The `gitdir: <path>` target of a `.git` FILE, resolved to an absolute path.
+ *
+ *  A `.git` file (rather than a directory) is how git represents a WORKTREE and a SUBMODULE, and its
+ *  pointer may be either absolute (`gitdir: /abs/repo/.git/worktrees/x`, what `git worktree add`
+ *  writes) or RELATIVE (`gitdir: ../.git/modules/x`, what `git submodule` commonly writes, and what a
+ *  moved checkout ends up with). A relative target resolves against the directory CONTAINING the `.git`
+ *  file, not against the process cwd — the hook's own cwd is unrelated to the session's. */
+function gitDirPointer(content: string, containingDir: string): string | undefined {
+  const match = /^[ \t]*gitdir:[ \t]*(.+?)[ \t\r]*$/m.exec(content);
+  const target = match?.[1];
+  if (typeof target !== "string" || target.length === 0) return undefined;
+  return isAbsolute(target) ? target : resolve(containingDir, target);
+}
+
+/** The git directory governing `cwd`, or undefined when `cwd` is not inside a repository.
+ *
+ *  THE UPWARD WALK IS THE POINT. A session is very often started in a SUBDIRECTORY of its repo (a
+ *  `server/` or `app/` inside the checkout), where there is no `.git` at all — the repo's is several
+ *  levels up. Checking only `cwd` would silently report "no branch" for a large share of real sessions.
+ *
+ *  FILE READS ONLY, NEVER A SUBPROCESS: this runs on EVERY hook event, and a hook blocks the agent.
+ *  `git rev-parse` would cost a process spawn per event for something two `statSync`/`readFileSync`
+ *  calls answer.
+ *
+ *  A `.git` that is a FILE ends the walk whether or not its pointer parses: that file IS the repository
+ *  boundary (a worktree/submodule), so falling through to an ancestor would report the SUPERPROJECT's
+ *  branch for a submodule — a confident wrong answer, which is worse than none. */
+export function resolveGitDir(cwd: unknown): string | undefined {
+  if (typeof cwd !== "string" || cwd.length === 0) return undefined;
+  let dir = cwd;
+  for (let depth = 0; depth < GIT_DIR_WALK_MAX_DEPTH; depth++) {
+    const candidate = join(dir, ".git");
+    try {
+      const st = statSync(candidate);
+      if (st.isDirectory()) return candidate;
+      if (st.isFile()) return gitDirPointer(readFileSync(candidate, "utf8"), dir);
+    } catch {
+      // No `.git` here (or it is unreadable) — keep walking up.
+    }
+    const parent = dirname(dir);
+    if (parent === dir) return undefined; // filesystem root reached
+    dir = parent;
+  }
+  return undefined;
+}
+
+/** The branch (or short SHA) `gitDir/HEAD` currently names, capped at `BRANCH_MAX_CHARS`.
+ *
+ *  HEAD holds either `ref: refs/heads/<name>` on a branch — and a branch name may itself contain `/`
+ *  (`feat/hybrid-lan`), so everything after `refs/heads/` is the name, never just the last segment — or
+ *  a bare object id when the checkout is DETACHED, which is reported as its 7-char short form (what
+ *  `git status` shows). A HEAD pointing at any other ref, an empty/short/malformed file, or a missing
+ *  one yields UNDEFINED: the key is then omitted entirely rather than guessed or emitted empty. */
+export function branchFromHead(gitDir: unknown): string | undefined {
+  if (typeof gitDir !== "string" || gitDir.length === 0) return undefined;
+  let head: string;
+  try {
+    head = readFileSync(join(gitDir, "HEAD"), "utf8");
+  } catch {
+    return undefined; // not a git dir, or unreadable — omit
+  }
+  const first = (head.split("\n", 1)[0] ?? "").trim();
+  if (first.length === 0) return undefined;
+  const ref = /^ref:[ \t]*refs\/heads\/(.+)$/.exec(first);
+  if (ref) {
+    const name = ref[1].trim();
+    return name.length > 0 ? name.slice(0, BRANCH_MAX_CHARS) : undefined;
+  }
+  // Detached HEAD: a bare object id (40 hex for sha1 repos, 64 for the sha256 object format).
+  if (/^[0-9a-f]{40}$/.test(first) || /^[0-9a-f]{64}$/.test(first)) return first.slice(0, 7);
+  return undefined;
+}
+
+/** The LIVE branch of a session's pinned folder — the single producer every blob builder calls.
+ *
+ *  LIVE, NOT PINNED, and deliberately so: unlike `label`/`folderKey` (which pin the session to its
+ *  first-seen folder so a `cd` cannot move the row), the branch is current state — a `git checkout`
+ *  mid-session must show up on the phone. Only the PATHS are pinned; HEAD is re-read on every call.
+ *
+ *  The cached `gitDir` makes that re-read one small file read instead of a fresh upward walk. When the
+ *  cache stops resolving — the worktree was pruned, the repo moved, `.git` was re-created by a fresh
+ *  `git init`, or the record was pinned before the cache existed — it falls back to walking from `cwd`
+ *  again, so a stale cache degrades to the slow path rather than to a permanently branch-less row.
+ *
+ *  Undefined (⇒ the key is omitted) whenever the folder is not a repo, the paths are unknown, or HEAD
+ *  cannot be understood. A record carrying a `label` but no `cwd` — one pinned by a plugin predating
+ *  the pin — gets no branch at all, and must NEVER fall back to the live event's cwd: that describes
+ *  whatever directory the shell has since wandered into, not the folder the pinned label/key name. */
+export function sessionBranch(folder: { cwd?: unknown; gitDir?: unknown } | null | undefined): string | undefined {
+  if (!folder) return undefined;
+  const cached = typeof folder.gitDir === "string" && folder.gitDir.length > 0 ? folder.gitDir : undefined;
+  if (cached) {
+    const branch = branchFromHead(cached);
+    if (branch) return branch;
+  }
+  const fresh = resolveGitDir(folder.cwd);
+  if (!fresh || fresh === cached) return undefined; // no repo, or the same dead cache re-derived
+  return branchFromHead(fresh);
+}
+
+/** The grouping identity of a project folder: the first `FOLDER_KEY_HEX_CHARS` hex chars of SHA-256
+ *  over the ABSOLUTE cwd.
+ *
+ *  WHY A HASH AND NOT THE PATH. `label` (the cwd BASENAME) is not unique — two checkouts named `api`
+ *  under different parents merged into one card on the phone. The full path would disambiguate them,
+ *  but the exact cwd is deliberately local-only (see adapter.ts's `DiscoveredSession.cwd`: "Never
+ *  enters a blob"), and that rule stands. A truncated digest reveals strictly no more than the
+ *  basename already does while still being collision-free identity.
+ *
+ *  WHY THE CWD AND NOT THE GIT TOPLEVEL. Both agents key a project on its absolute cwd — Claude Code
+ *  slugifies it into its `~/.claude/projects/<slug>` directory, Codex records it as
+ *  `session_meta.payload.cwd` — and Claude Code treats a git WORKTREE as its own project. Keying on
+ *  the git root would merge a worktree back into its parent repo, which is the opposite of what both
+ *  agents (and the user) mean by "project".
+ *
+ *  Undefined for an unknown/empty cwd: there is nothing to identify, and the phone falls back to
+ *  grouping by `label` exactly as it did before the key existed. */
+export function folderKeyFromCwd(cwd: unknown): string | undefined {
+  if (typeof cwd !== "string" || cwd.length === 0) return undefined;
+  return createHash("sha256").update(cwd, "utf8").digest("hex").slice(0, FOLDER_KEY_HEX_CHARS);
+}
+
+/** BOTH halves of a session's folder identity, from ONE source — the single place either is derived.
+ *
+ *  PINNING, exactly as `label` has always been pinned (hook.ts): a mid-session `cd` changes `input.cwd`
+ *  on every later hook, and re-deriving per event silently renamed the phone row ("api-status" →
+ *  "server" after a `cd server`). So once a session's record carries a label, `pinned` wins and the
+ *  event's cwd is ignored — for the KEY too, or a `cd` would move a live session between folder cards
+ *  on the phone.
+ *
+ *  The two can never drift apart because they are only ever produced together: either both come from
+ *  the pin, or both are derived from the same `cwd`. A record pinned by an older plugin has a label and
+ *  no key; it keeps having no key for the rest of that session rather than picking up one derived from
+ *  wherever the shell has since wandered. The phone documents that mixed state (it groups such rows by
+ *  label) and it self-resolves when the session ends.
+ *
+ *  `cwd`/`gitDir` (v1.9.0) travel in the SAME parcel for the SAME reason. They are LOCAL ONLY — never
+ *  in a blob — and exist so `sessionBranch` can re-read the folder's live HEAD. Same rule, same trap: a
+ *  record pinned by a plugin predating them has a label and NO cwd, and it gets none here. Deriving one
+ *  from the event's cwd would describe a directory the pinned label/key may not even name (the shell
+ *  `cd`'d), so such a session simply shows no branch until it ends. */
+export function folderIdentity(
+  cwd: unknown, pinned?: string | { label?: unknown; folderKey?: unknown; cwd?: unknown; gitDir?: unknown } | null,
+): FolderIdentity {
+  const pin = typeof pinned === "string" ? { label: pinned, folderKey: undefined, cwd: undefined, gitDir: undefined } : pinned;
+  if (typeof pin?.label === "string" && pin.label.length > 0) {
+    return {
+      label: pin.label,
+      ...(typeof pin.folderKey === "string" && pin.folderKey.length > 0 ? { folderKey: pin.folderKey } : {}),
+      ...(typeof pin.cwd === "string" && pin.cwd.length > 0 ? { cwd: pin.cwd } : {}),
+      ...(typeof pin.gitDir === "string" && pin.gitDir.length > 0 ? { gitDir: pin.gitDir } : {}),
+    };
+  }
+  const key = folderKeyFromCwd(cwd);
+  // FIRST event: everything comes off the one cwd being pinned right now, including the git dir the
+  // branch will be re-read from for the rest of the session.
+  const gitDir = typeof cwd === "string" && cwd.length > 0 ? resolveGitDir(cwd) : undefined;
+  return {
+    label: typeof cwd === "string" && cwd.length > 0 ? basename(cwd) : "session",
+    ...(key ? { folderKey: key } : {}),
+    ...(typeof cwd === "string" && cwd.length > 0 ? { cwd } : {}),
+    ...(gitDir ? { gitDir } : {}),
+  };
+}
+
 /** Local-only provenance for the hook invocation that FIRST created a session record. This is
  *  deliberately absent from the encrypted blob and clear wire envelope: it exists solely to make a
  *  phantom row diagnosable from the Mac. Field names mirror the hook payload / process vocabulary so
@@ -528,6 +736,24 @@ export interface SessionRecord {
   pid: number;
   machine: string;
   label: string;
+  /** The PINNED grouping key for `label`'s folder (see `folderIdentity`). Written together with
+   *  `label` on the record's FIRST event and reused verbatim by every later blob this session
+   *  produces — the hook's, the watchdog's correctives, the LAN state blob — so a mid-session `cd`
+   *  cannot move the row to another folder card. Optional: a record written by a plugin predating the
+   *  key has none, and a session whose cwd was unknown never had one. */
+  folderKey?: string;
+  /** The session's PINNED ABSOLUTE cwd — LOCAL ONLY. It NEVER enters a blob (that is exactly why
+   *  `folderKey` is a digest; see adapter.ts's `DiscoveredSession.cwd`), and this file is 0600 like the
+   *  rest of the record. It exists so every producer that rebuilds a blob from the record — the
+   *  watchdog's correctives, the LAN state frame — can re-read the folder's LIVE git branch without a
+   *  cwd of its own. Pinned with `label`/`folderKey` on the first event (see `folderIdentity`), so it
+   *  always names the folder those two describe. Optional: absent on a record written by a plugin
+   *  predating it, and absent when the cwd was unknown — such a session emits no `branch`. */
+  cwd?: string;
+  /** The git directory `cwd` resolved to, cached at pin time (see `resolveGitDir`) so each later event
+   *  is ONE small HEAD read rather than a fresh upward walk. Local only. Absent when the folder is not
+   *  a repo; a cache that stops resolving makes `sessionBranch` re-walk instead of going blank. */
+  gitDir?: string;
   /** Epoch-ms the file was last written — drives the 24 h staleness cap in the watchdog. */
   ts: number;
   /** Absolute path to the session's JSONL transcript (the hook input's `transcript_path`); "" if

@@ -4,13 +4,14 @@ var __require = /* @__PURE__ */ createRequire(import.meta.url);
 // src/entries/reset.ts
 import { execFileSync as execFileSync2 } from "node:child_process";
 import { readdir, readFile as readFile2, unlink as unlink2 } from "node:fs/promises";
-import { basename } from "node:path";
+import { basename as basename2 } from "node:path";
 
 // src/core/shared.ts
 import { access, chmod, open, readFile, rename, stat, mkdir, unlink, writeFile } from "node:fs/promises";
 import { appendFileSync, existsSync, readFileSync, statSync, truncateSync } from "node:fs";
 import { execFileSync, spawn } from "node:child_process";
-import { dirname, join } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
+import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 
 // src/core/crypto.ts
@@ -98,7 +99,7 @@ async function sha256Hex(s) {
 }
 
 // src/core/shared.ts
-var PLUGIN_VERSION = "1.7.9";
+var PLUGIN_VERSION = "1.9.1";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -256,20 +257,20 @@ var CODEX_DAEMON_SOCKET_POLL_MS = 250;
 async function startCodexAppServerDaemon(deps = {}) {
   const trace = deps.trace ?? ((event) => traceSession(event));
   const probe = deps.probe ?? (() => codexAppServerSocketAvailable());
-  const sleep = deps.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
+  const sleep = deps.sleep ?? ((ms) => new Promise((resolve2) => setTimeout(resolve2, ms)));
   const command = deps.codexPath ?? "codex";
   const timeoutMs = deps.timeoutMs ?? CODEX_DAEMON_START_TIMEOUT_MS;
   const socketWaitMs = deps.socketWaitMs ?? CODEX_DAEMON_SOCKET_WAIT_MS;
   const spawnFn = deps.spawnFn ?? ((cmd, args) => spawn(cmd, [...args], { stdio: "ignore" }));
   let exit;
   try {
-    exit = await new Promise((resolve) => {
+    exit = await new Promise((resolve2) => {
       let settled = false;
       const done = (value) => {
         if (settled)
           return;
         settled = true;
-        resolve(value);
+        resolve2(value);
       };
       let child;
       try {
@@ -326,6 +327,96 @@ async function startCodexAppServerDaemon(deps = {}) {
 }
 function lastHookPath(agent) {
   return `${CC_DIR}/last-hook-${agent}`;
+}
+var FOLDER_KEY_HEX_CHARS = 12;
+var BRANCH_MAX_CHARS = 60;
+var GIT_DIR_WALK_MAX_DEPTH = 64;
+function gitDirPointer(content, containingDir) {
+  const match = /^[ \t]*gitdir:[ \t]*(.+?)[ \t\r]*$/m.exec(content);
+  const target = match?.[1];
+  if (typeof target !== "string" || target.length === 0)
+    return;
+  return isAbsolute(target) ? target : resolve(containingDir, target);
+}
+function resolveGitDir(cwd) {
+  if (typeof cwd !== "string" || cwd.length === 0)
+    return;
+  let dir = cwd;
+  for (let depth = 0;depth < GIT_DIR_WALK_MAX_DEPTH; depth++) {
+    const candidate = join(dir, ".git");
+    try {
+      const st = statSync(candidate);
+      if (st.isDirectory())
+        return candidate;
+      if (st.isFile())
+        return gitDirPointer(readFileSync(candidate, "utf8"), dir);
+    } catch {}
+    const parent = dirname(dir);
+    if (parent === dir)
+      return;
+    dir = parent;
+  }
+  return;
+}
+function branchFromHead(gitDir) {
+  if (typeof gitDir !== "string" || gitDir.length === 0)
+    return;
+  let head;
+  try {
+    head = readFileSync(join(gitDir, "HEAD"), "utf8");
+  } catch {
+    return;
+  }
+  const first = (head.split(`
+`, 1)[0] ?? "").trim();
+  if (first.length === 0)
+    return;
+  const ref = /^ref:[ \t]*refs\/heads\/(.+)$/.exec(first);
+  if (ref) {
+    const name = ref[1].trim();
+    return name.length > 0 ? name.slice(0, BRANCH_MAX_CHARS) : undefined;
+  }
+  if (/^[0-9a-f]{40}$/.test(first) || /^[0-9a-f]{64}$/.test(first))
+    return first.slice(0, 7);
+  return;
+}
+function sessionBranch(folder) {
+  if (!folder)
+    return;
+  const cached = typeof folder.gitDir === "string" && folder.gitDir.length > 0 ? folder.gitDir : undefined;
+  if (cached) {
+    const branch = branchFromHead(cached);
+    if (branch)
+      return branch;
+  }
+  const fresh = resolveGitDir(folder.cwd);
+  if (!fresh || fresh === cached)
+    return;
+  return branchFromHead(fresh);
+}
+function folderKeyFromCwd(cwd) {
+  if (typeof cwd !== "string" || cwd.length === 0)
+    return;
+  return createHash("sha256").update(cwd, "utf8").digest("hex").slice(0, FOLDER_KEY_HEX_CHARS);
+}
+function folderIdentity(cwd, pinned) {
+  const pin = typeof pinned === "string" ? { label: pinned, folderKey: undefined, cwd: undefined, gitDir: undefined } : pinned;
+  if (typeof pin?.label === "string" && pin.label.length > 0) {
+    return {
+      label: pin.label,
+      ...typeof pin.folderKey === "string" && pin.folderKey.length > 0 ? { folderKey: pin.folderKey } : {},
+      ...typeof pin.cwd === "string" && pin.cwd.length > 0 ? { cwd: pin.cwd } : {},
+      ...typeof pin.gitDir === "string" && pin.gitDir.length > 0 ? { gitDir: pin.gitDir } : {}
+    };
+  }
+  const key = folderKeyFromCwd(cwd);
+  const gitDir = typeof cwd === "string" && cwd.length > 0 ? resolveGitDir(cwd) : undefined;
+  return {
+    label: typeof cwd === "string" && cwd.length > 0 ? basename(cwd) : "session",
+    ...key ? { folderKey: key } : {},
+    ...typeof cwd === "string" && cwd.length > 0 ? { cwd } : {},
+    ...gitDir ? { gitDir } : {}
+  };
 }
 function parseConfig(raw) {
   let parsed;
@@ -933,7 +1024,7 @@ async function reset(deps = {}) {
       kept++;
       continue;
     }
-    if (config && await postEnd(config, basename(f, ".json"), fetchFn))
+    if (config && await postEnd(config, basename2(f, ".json"), fetchFn))
       ended++;
     await unlink2(path).catch(() => {});
     cleared++;

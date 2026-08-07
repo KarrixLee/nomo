@@ -20,7 +20,7 @@ import {
 } from "./permission";
 import {
   clearDecisionHold, Config, DecisionHold, localApprovalsState, PLUGIN_VERSION, readRecord, SessionRecord,
-  settleDecisionHoldRecord, writeDecisionHold,
+  sessionBranch, settleDecisionHoldRecord, writeDecisionHold,
 } from "./shared";
 import { lanRunningUnderTest } from "./lan-wire";
 import type {
@@ -161,6 +161,7 @@ function baseBlob(
   now: number,
 ): Record<string, unknown> {
   const preview = requestUserInputDetail({ questions: request.questions });
+  const branch = sessionBranch(record);
   return {
     status: "needsAttention",
     title: typeof record.title === "string" ? record.title : "",
@@ -173,6 +174,10 @@ function baseBlob(
       ? { turnStartedAt: record.turnStartedAt } : {}),
     ...(typeof record.model === "string" && record.model.length > 0 ? { model: record.model } : {}),
     at: Math.floor(now / 1000),
+    // The record's pinned folder key, in the same slot every other producer of this shape uses, then
+    // the folder's LIVE branch — re-read from the record's pinned paths, never restamped.
+    ...(typeof record.folderKey === "string" && record.folderKey.length > 0 ? { folderKey: record.folderKey } : {}),
+    ...(branch ? { branch } : {}),
   };
 }
 

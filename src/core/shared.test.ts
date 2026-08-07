@@ -1,9 +1,10 @@
-import { mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { describe, expect, test } from "bun:test";
+import { basename, join } from "node:path";
+import { afterEach, describe, expect, test } from "bun:test";
 import {
-  appendCodexBridgeMarker, clearDecisionHoldAt, CODEX_BRIDGE_DOWN_MARKER, CODEX_DAEMON_START_ARGS,
+  appendCodexBridgeMarker, BRANCH_MAX_CHARS, branchFromHead, clearDecisionHoldAt, CODEX_BRIDGE_DOWN_MARKER, CODEX_DAEMON_START_ARGS,
+  folderIdentity, resolveGitDir, sessionBranch,
   codexAppServerSocketAvailable, codexAppServerSocketPath, codexCompanionBrokerEvidence,
   DBG_BLOB_TEXT_MAX_CHARS, startCodexAppServerDaemon,
   decisionHoldFileName, ensureWatchdog, formatWatchdogPidfile, fullTextForRecord, isWatchdogCommand,
@@ -601,5 +602,193 @@ describe("settleDecisionHoldRecordAt", () => {
     } finally {
       await rm(d, { recursive: true, force: true });
     }
+  });
+});
+
+// --- the session folder's LIVE git branch --------------------------------------------------------
+//
+// Every fixture below is a REAL directory tree under os.tmpdir() — nothing here is mocked, because the
+// whole feature is "what do these two files on disk actually say". The resolver is file reads only (no
+// `git` subprocess): it runs inside a hook that BLOCKS the agent, on every single event.
+describe("resolveGitDir / branchFromHead / sessionBranch (the folder's live git branch)", () => {
+  const roots: string[] = [];
+  const tmp = async (): Promise<string> => {
+    const d = await mkdtemp(join(tmpdir(), "nomo-branch-"));
+    roots.push(d);
+    return d;
+  };
+  /** A plain checkout: `<dir>/.git/` holding HEAD. */
+  const repoAt = async (dir: string, head = "ref: refs/heads/main\n"): Promise<string> => {
+    await mkdir(join(dir, ".git"), { recursive: true });
+    await writeFile(join(dir, ".git", "HEAD"), head);
+    return join(dir, ".git");
+  };
+  afterEach(async () => {
+    await Promise.all(roots.splice(0).map((d) => rm(d, { recursive: true, force: true })));
+  });
+
+  test("a plain repo: `.git` is a DIRECTORY, and HEAD names the branch", async () => {
+    const root = await tmp();
+    const gitDir = await repoAt(root);
+    expect(resolveGitDir(root)).toBe(gitDir);
+    expect(branchFromHead(gitDir)).toBe("main");
+    expect(sessionBranch({ cwd: root })).toBe("main");
+  });
+
+  test("a session started in a SUBDIRECTORY walks UP to the repo's `.git`", async () => {
+    // The common shape in the field: the agent is launched in `server/` (or deeper) inside a checkout,
+    // where there is no `.git` at all. Checking only the cwd would report no branch for a large share of
+    // real sessions, which is why the upward walk exists.
+    const root = await tmp();
+    const gitDir = await repoAt(root, "ref: refs/heads/dev\n");
+    const deep = join(root, "packages", "server", "src", "handlers");
+    await mkdir(deep, { recursive: true });
+    expect(resolveGitDir(deep)).toBe(gitDir);
+    expect(sessionBranch({ cwd: deep })).toBe("dev");
+  });
+
+  test("`.git` as a FILE with an ABSOLUTE gitdir: (a worktree) resolves to the pointed-at dir", async () => {
+    const base = await tmp();
+    const store = join(base, "store", "worktrees", "feature");
+    await mkdir(store, { recursive: true });
+    await writeFile(join(store, "HEAD"), "ref: refs/heads/feature-work\n");
+    const work = join(base, "wt");
+    await mkdir(work, { recursive: true });
+    await writeFile(join(work, ".git"), `gitdir: ${store}\n`);
+    expect(resolveGitDir(work)).toBe(store);
+    expect(sessionBranch({ cwd: work })).toBe("feature-work");
+  });
+
+  test("`.git` as a FILE with a RELATIVE gitdir: resolves against the file's OWN directory", async () => {
+    // What `git submodule` commonly writes (`gitdir: ../.git/modules/x`). Resolving it against the
+    // process cwd instead — the hook's own, which has nothing to do with the session — would miss.
+    const base = await tmp();
+    const store = join(base, "modules", "plugin");
+    await mkdir(store, { recursive: true });
+    await writeFile(join(store, "HEAD"), "ref: refs/heads/sub-branch\n");
+    const sub = join(base, "checkout", "plugin");
+    await mkdir(sub, { recursive: true });
+    await writeFile(join(sub, ".git"), "gitdir: ../../modules/plugin\n");
+    expect(resolveGitDir(sub)).toBe(store);
+    expect(sessionBranch({ cwd: sub })).toBe("sub-branch");
+    // …and from a subdirectory of the submodule, the walk finds the SAME pointer file.
+    const inner = join(sub, "src");
+    await mkdir(inner, { recursive: true });
+    expect(sessionBranch({ cwd: inner })).toBe("sub-branch");
+  });
+
+  test("a submodule whose pointer is unreadable reports NOTHING, never the superproject's branch", async () => {
+    // The `.git` FILE is the repository boundary. Falling through to the parent would confidently show
+    // the wrong branch — worse than showing none.
+    const base = await tmp();
+    await repoAt(base, "ref: refs/heads/superproject\n");
+    const sub = join(base, "vendor", "lib");
+    await mkdir(sub, { recursive: true });
+    await writeFile(join(sub, ".git"), "this is not a gitdir pointer\n");
+    expect(resolveGitDir(sub)).toBeUndefined();
+    expect(sessionBranch({ cwd: sub })).toBeUndefined();
+  });
+
+  test("a DETACHED HEAD (bare 40-hex sha) becomes the 7-char short sha", async () => {
+    const root = await tmp();
+    const gitDir = await repoAt(root, "9f1a2b3c4d5e60718293a4b5c6d7e8f901234567\n");
+    expect(branchFromHead(gitDir)).toBe("9f1a2b3");
+    expect(sessionBranch({ cwd: root })).toBe("9f1a2b3");
+  });
+
+  test("a branch name containing `/` survives INTACT (never split on the separator)", async () => {
+    const root = await tmp();
+    await repoAt(root, "ref: refs/heads/feat/hybrid-lan\n");
+    expect(sessionBranch({ cwd: root })).toBe("feat/hybrid-lan");
+  });
+
+  test("a pathological ref name is CAPPED at BRANCH_MAX_CHARS (the sealed frame has a ceiling)", async () => {
+    const root = await tmp();
+    const long = "a".repeat(BRANCH_MAX_CHARS * 3);
+    await repoAt(root, `ref: refs/heads/${long}\n`);
+    const branch = sessionBranch({ cwd: root })!;
+    expect(branch.length).toBe(BRANCH_MAX_CHARS);
+    expect(branch).toBe(long.slice(0, BRANCH_MAX_CHARS));
+  });
+
+  test("NOT a repo at all ⇒ undefined — the key is omitted, never an empty string", async () => {
+    const root = await tmp();
+    expect(resolveGitDir(root)).toBeUndefined();
+    expect(sessionBranch({ cwd: root })).toBeUndefined();
+    expect(sessionBranch({})).toBeUndefined();
+    expect(sessionBranch(undefined)).toBeUndefined();
+    expect(sessionBranch({ cwd: "" })).toBeUndefined();
+  });
+
+  test("an empty / malformed / non-branch HEAD is undefined, never a guess", async () => {
+    for (const head of ["", "   \n", "garbage\n", "ref: \n", "ref: refs/tags/v1.2.3\n", "ref: refs/remotes/origin/main\n", "9f1a2b3\n"]) {
+      const root = await tmp();
+      const gitDir = await repoAt(root, head);
+      expect(branchFromHead(gitDir)).toBeUndefined();
+      expect(sessionBranch({ cwd: root })).toBeUndefined();
+    }
+    // …and a `.git` directory with no HEAD in it at all.
+    const bare = await tmp();
+    await mkdir(join(bare, ".git"), { recursive: true });
+    expect(resolveGitDir(bare)).toBe(join(bare, ".git"));
+    expect(sessionBranch({ cwd: bare })).toBeUndefined();
+  });
+
+  test("LIVE, not pinned: a `git checkout` between two calls CHANGES the emitted value", async () => {
+    // The paths are pinned so a `cd` cannot move the phone row; the branch deliberately is not. HEAD is
+    // re-read on every call precisely so a checkout shows up on the phone.
+    const root = await tmp();
+    const gitDir = await repoAt(root, "ref: refs/heads/main\n");
+    expect(sessionBranch({ cwd: root })).toBe("main");
+    await writeFile(join(gitDir, "HEAD"), "ref: refs/heads/feat/hybrid-lan\n");
+    expect(sessionBranch({ cwd: root })).toBe("feat/hybrid-lan");
+    await writeFile(join(gitDir, "HEAD"), "9f1a2b3c4d5e60718293a4b5c6d7e8f901234567\n");
+    expect(sessionBranch({ cwd: root })).toBe("9f1a2b3");
+  });
+
+  test("the CACHED gitDir skips the walk but still re-reads HEAD (a checkout is not cached away)", async () => {
+    const root = await tmp();
+    const gitDir = await repoAt(root, "ref: refs/heads/main\n");
+    // A pinned record: cwd + the git dir resolved once, at pin time.
+    const pinned = { cwd: root, gitDir };
+    expect(sessionBranch(pinned)).toBe("main");
+    await writeFile(join(gitDir, "HEAD"), "ref: refs/heads/release/2.0\n");
+    expect(sessionBranch(pinned)).toBe("release/2.0");
+    // The cache is genuinely used: with a cwd that is nowhere near a repo, the cached dir still answers.
+    expect(sessionBranch({ cwd: join(root, "does", "not", "exist"), gitDir })).toBe("release/2.0");
+  });
+
+  test("a cached gitDir that stops resolving falls back to a FRESH walk rather than going blank", async () => {
+    // The worktree was pruned / the repo moved / `git init` re-made it. A dead cache must degrade to the
+    // slow path, not to a permanently branch-less row.
+    const root = await tmp();
+    await repoAt(root, "ref: refs/heads/main\n");
+    expect(sessionBranch({ cwd: root, gitDir: join(root, "gone", "worktrees", "x") })).toBe("main");
+    // …and when the fresh walk finds nothing either, the key is simply omitted.
+    const bare = await tmp();
+    expect(sessionBranch({ cwd: bare, gitDir: join(bare, "gone") })).toBeUndefined();
+  });
+
+  test("folderIdentity pins cwd + gitDir alongside label/folderKey, and never re-derives them from a pin", async () => {
+    const root = await tmp();
+    const gitDir = await repoAt(root, "ref: refs/heads/main\n");
+    // FIRST event: everything is derived from the one cwd being pinned.
+    const first = folderIdentity(root);
+    expect(first).toMatchObject({ label: basename(root), cwd: root, gitDir });
+    // A LATER event after the shell `cd`s elsewhere: the pin wins for the paths too, so the branch keeps
+    // describing the folder the pinned label names — not wherever the shell wandered.
+    const other = await tmp();
+    await repoAt(other, "ref: refs/heads/elsewhere\n");
+    const later = folderIdentity(other, first);
+    expect(later.cwd).toBe(root);
+    expect(later.gitDir).toBe(gitDir);
+    expect(sessionBranch(later)).toBe("main");
+    // A record pinned by a plugin PREDATING the pin has a label and no cwd: it yields no cwd (and so no
+    // branch) rather than adopting the live event's, which would describe a different directory.
+    const legacy = folderIdentity(other, { label: "api-status", folderKey: "0123456789ab" });
+    expect(legacy).toEqual({ label: "api-status", folderKey: "0123456789ab" });
+    expect(sessionBranch(legacy)).toBeUndefined();
+    // …as does a bare-string pin (every positional caller predating the folder key).
+    expect(sessionBranch(folderIdentity(other, "api-status"))).toBeUndefined();
   });
 });

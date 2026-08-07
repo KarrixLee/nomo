@@ -5,12 +5,12 @@ var __require = /* @__PURE__ */ createRequire(import.meta.url);
 import { readFile as readFile5, realpath, unlink as unlink3 } from "node:fs/promises";
 import { appendFileSync as appendFileSync2, statSync as statSync2, truncateSync as truncateSync2 } from "node:fs";
 import { hostname as hostname2 } from "node:os";
-import { basename as basename3, isAbsolute, relative, resolve } from "node:path";
+import { basename as basename4, isAbsolute as isAbsolute2, relative, resolve as resolve2 } from "node:path";
 
 // src/core/hook.ts
 import { readdir as readdir2, readFile as readFile4, unlink as unlink2 } from "node:fs/promises";
 import { hostname } from "node:os";
-import { basename as basename2 } from "node:path";
+import { basename as basename3 } from "node:path";
 
 // src/core/crypto.ts
 var textEncoder = new TextEncoder;
@@ -100,15 +100,16 @@ async function sha256Hex(s) {
 import { execFile as execFile2 } from "node:child_process";
 import { readdir, readFile as readFile2, stat as stat2 } from "node:fs/promises";
 import { promisify as promisify2 } from "node:util";
-import { basename, join as join2 } from "node:path";
+import { basename as basename2, join as join2 } from "node:path";
 
 // src/core/shared.ts
 import { access, chmod, open, readFile, rename, stat, mkdir, unlink, writeFile } from "node:fs/promises";
 import { appendFileSync, existsSync, readFileSync, statSync, truncateSync } from "node:fs";
 import { execFileSync, spawn } from "node:child_process";
-import { dirname, join } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
+import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "1.7.9";
+var PLUGIN_VERSION = "1.9.1";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -266,20 +267,20 @@ var CODEX_DAEMON_SOCKET_POLL_MS = 250;
 async function startCodexAppServerDaemon(deps = {}) {
   const trace = deps.trace ?? ((event) => traceSession(event));
   const probe = deps.probe ?? (() => codexAppServerSocketAvailable());
-  const sleep = deps.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
+  const sleep = deps.sleep ?? ((ms) => new Promise((resolve2) => setTimeout(resolve2, ms)));
   const command = deps.codexPath ?? "codex";
   const timeoutMs = deps.timeoutMs ?? CODEX_DAEMON_START_TIMEOUT_MS;
   const socketWaitMs = deps.socketWaitMs ?? CODEX_DAEMON_SOCKET_WAIT_MS;
   const spawnFn = deps.spawnFn ?? ((cmd, args) => spawn(cmd, [...args], { stdio: "ignore" }));
   let exit;
   try {
-    exit = await new Promise((resolve) => {
+    exit = await new Promise((resolve2) => {
       let settled = false;
       const done = (value) => {
         if (settled)
           return;
         settled = true;
-        resolve(value);
+        resolve2(value);
       };
       let child;
       try {
@@ -336,6 +337,96 @@ async function startCodexAppServerDaemon(deps = {}) {
 }
 function lastHookPath(agent) {
   return `${CC_DIR}/last-hook-${agent}`;
+}
+var FOLDER_KEY_HEX_CHARS = 12;
+var BRANCH_MAX_CHARS = 60;
+var GIT_DIR_WALK_MAX_DEPTH = 64;
+function gitDirPointer(content, containingDir) {
+  const match = /^[ \t]*gitdir:[ \t]*(.+?)[ \t\r]*$/m.exec(content);
+  const target = match?.[1];
+  if (typeof target !== "string" || target.length === 0)
+    return;
+  return isAbsolute(target) ? target : resolve(containingDir, target);
+}
+function resolveGitDir(cwd) {
+  if (typeof cwd !== "string" || cwd.length === 0)
+    return;
+  let dir = cwd;
+  for (let depth = 0;depth < GIT_DIR_WALK_MAX_DEPTH; depth++) {
+    const candidate = join(dir, ".git");
+    try {
+      const st = statSync(candidate);
+      if (st.isDirectory())
+        return candidate;
+      if (st.isFile())
+        return gitDirPointer(readFileSync(candidate, "utf8"), dir);
+    } catch {}
+    const parent = dirname(dir);
+    if (parent === dir)
+      return;
+    dir = parent;
+  }
+  return;
+}
+function branchFromHead(gitDir) {
+  if (typeof gitDir !== "string" || gitDir.length === 0)
+    return;
+  let head;
+  try {
+    head = readFileSync(join(gitDir, "HEAD"), "utf8");
+  } catch {
+    return;
+  }
+  const first = (head.split(`
+`, 1)[0] ?? "").trim();
+  if (first.length === 0)
+    return;
+  const ref = /^ref:[ \t]*refs\/heads\/(.+)$/.exec(first);
+  if (ref) {
+    const name = ref[1].trim();
+    return name.length > 0 ? name.slice(0, BRANCH_MAX_CHARS) : undefined;
+  }
+  if (/^[0-9a-f]{40}$/.test(first) || /^[0-9a-f]{64}$/.test(first))
+    return first.slice(0, 7);
+  return;
+}
+function sessionBranch(folder) {
+  if (!folder)
+    return;
+  const cached = typeof folder.gitDir === "string" && folder.gitDir.length > 0 ? folder.gitDir : undefined;
+  if (cached) {
+    const branch = branchFromHead(cached);
+    if (branch)
+      return branch;
+  }
+  const fresh = resolveGitDir(folder.cwd);
+  if (!fresh || fresh === cached)
+    return;
+  return branchFromHead(fresh);
+}
+function folderKeyFromCwd(cwd) {
+  if (typeof cwd !== "string" || cwd.length === 0)
+    return;
+  return createHash("sha256").update(cwd, "utf8").digest("hex").slice(0, FOLDER_KEY_HEX_CHARS);
+}
+function folderIdentity(cwd, pinned) {
+  const pin = typeof pinned === "string" ? { label: pinned, folderKey: undefined, cwd: undefined, gitDir: undefined } : pinned;
+  if (typeof pin?.label === "string" && pin.label.length > 0) {
+    return {
+      label: pin.label,
+      ...typeof pin.folderKey === "string" && pin.folderKey.length > 0 ? { folderKey: pin.folderKey } : {},
+      ...typeof pin.cwd === "string" && pin.cwd.length > 0 ? { cwd: pin.cwd } : {},
+      ...typeof pin.gitDir === "string" && pin.gitDir.length > 0 ? { gitDir: pin.gitDir } : {}
+    };
+  }
+  const key = folderKeyFromCwd(cwd);
+  const gitDir = typeof cwd === "string" && cwd.length > 0 ? resolveGitDir(cwd) : undefined;
+  return {
+    label: typeof cwd === "string" && cwd.length > 0 ? basename(cwd) : "session",
+    ...key ? { folderKey: key } : {},
+    ...typeof cwd === "string" && cwd.length > 0 ? { cwd } : {},
+    ...gitDir ? { gitDir } : {}
+  };
 }
 function parseConfig(raw) {
   let parsed;
@@ -1816,7 +1907,7 @@ function claudeForkResumePredecessor(command) {
   const resume = match?.[1] ?? match?.[2] ?? match?.[3];
   if (!resume || !resume.endsWith(".jsonl"))
     return;
-  const id = basename(resume, ".jsonl");
+  const id = basename2(resume, ".jsonl");
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id) ? id : undefined;
 }
 function claudeHeadlessInvocation(selfArgs, ancestorArgs) {
@@ -1850,7 +1941,7 @@ function rolloutPathFromLsof(output) {
     if (!line.startsWith("n"))
       continue;
     const path = line.slice(1);
-    const name = basename(path);
+    const name = basename2(path);
     if (name.startsWith("rollout-") && name.endsWith(".jsonl"))
       return path;
   }
@@ -2002,7 +2093,7 @@ function codexTuiCandidates(rows, knownPids) {
     if (knownPids.has(r.pid))
       continue;
     const tokens = r.args.trim().split(/\s+/);
-    if (basename(tokens[0] ?? "") !== "codex")
+    if (basename2(tokens[0] ?? "") !== "codex")
       continue;
     if (!isRealTty(r.tty))
       continue;
@@ -2018,7 +2109,7 @@ function filterCodexTuis(rows, knownPids) {
 function labelFromCwd(cwd) {
   if (!cwd)
     return "session";
-  const b = basename(cwd);
+  const b = basename2(cwd);
   return b.length > 0 ? b : "session";
 }
 async function runPs() {
@@ -2068,6 +2159,7 @@ async function codexDiscoverLive(known, deps = {}) {
     if (retiredOwner && typeof startedAt === "number" && Number.isFinite(startedAt) && startedAt <= retiredOwner.retiredAt)
       continue;
     const label = labelFromCwd(cwd);
+    const folderKey = folderKeyFromCwd(cwd);
     let active = false;
     try {
       active = await turnActive(pid);
@@ -2078,6 +2170,7 @@ async function codexDiscoverLive(known, deps = {}) {
       title: label,
       label,
       idle: !active,
+      ...folderKey ? { folderKey } : {},
       ...cwd ? { cwd } : {},
       ...typeof startedAt === "number" && Number.isFinite(startedAt) ? { startedAt } : {}
     });
@@ -2669,8 +2762,10 @@ function transcriptStartMs(prefix) {
   }
   return;
 }
-function buildBlob(input, machine, title, plan, agent = "claude", turnStartedAt, pinnedLabel, model, at, proposedPlan, dbgOverride) {
-  const label = typeof pinnedLabel === "string" && pinnedLabel.length > 0 ? pinnedLabel : typeof input.cwd === "string" && input.cwd.length > 0 ? basename2(input.cwd) : "session";
+function buildBlob(input, machine, title, plan, agent = "claude", turnStartedAt, pinnedFolder, model, at, proposedPlan, dbgOverride) {
+  const folder = folderIdentity(input.cwd, pinnedFolder);
+  const { label, folderKey } = folder;
+  const branch = sessionBranch(folder);
   const hookName = typeof input.hook_event_name === "string" ? input.hook_event_name : "";
   const detail = detailForHook(hookName, typeof input.tool_name === "string" ? input.tool_name : undefined, input.tool_input);
   const base = {
@@ -2682,7 +2777,9 @@ function buildBlob(input, machine, title, plan, agent = "claude", turnStartedAt,
     ...agent === "codex" ? { agent: "codex" } : {},
     ...typeof turnStartedAt === "number" && Number.isFinite(turnStartedAt) ? { turnStartedAt } : {},
     ...typeof model === "string" && model.length > 0 ? { model } : {},
-    ...typeof at === "number" && Number.isFinite(at) ? { at } : {}
+    ...typeof at === "number" && Number.isFinite(at) ? { at } : {},
+    ...folderKey ? { folderKey } : {},
+    ...branch ? { branch } : {}
   };
   const dbg = agent === "codex" ? dbgOverride ?? formatPlanPickerDebug({
     event: hookName || "event",
@@ -2691,7 +2788,7 @@ function buildBlob(input, machine, title, plan, agent = "claude", turnStartedAt,
   }) : undefined;
   return appendFittedPlanAndDebug(base, proposedPlan, dbg);
 }
-async function buildEnvelope(input, machine, now, title, e2eKey, sentDone, agent = "claude", startedAt, turnStartedAt, pinnedLabel, model, planOverride, attentionKindOverride, proposedPlan, dbg, onBlobPlaintext) {
+async function buildEnvelope(input, machine, now, title, e2eKey, sentDone, agent = "claude", startedAt, turnStartedAt, pinnedFolder, model, planOverride, attentionKindOverride, proposedPlan, dbg, onBlobPlaintext) {
   if (typeof input !== "object" || input === null)
     return null;
   const i = input;
@@ -2705,7 +2802,7 @@ async function buildEnvelope(input, machine, now, title, e2eKey, sentDone, agent
   if (typeof startedAt === "number" && Number.isFinite(startedAt))
     base.startedAt = startedAt;
   const at = Math.floor(now / 1000);
-  const plaintext = buildBlob(i, machine, title, plan, agent, turnStartedAt, pinnedLabel, model, at, proposedPlan, dbg);
+  const plaintext = buildBlob(i, machine, title, plan, agent, turnStartedAt, pinnedFolder, model, at, proposedPlan, dbg);
   try {
     onBlobPlaintext?.(plaintext);
   } catch {}
@@ -2732,7 +2829,7 @@ async function stashPendingEvent(input, machine, title, now, stashPath = PENDING
     await atomicWrite(stashPath, JSON.stringify(stash), 384);
   } catch {}
 }
-async function trackSessionAt(sessionsDir, sessionId, op, prio, status, blob, machine, label, transcript, agent = "claude", sessionStartedAt, turnStartedAt, turnId, title, pairingId, model, pendingPlanPicker = false, pid = process.ppid, origin, planPickerVerificationPending = false, dbg, attentionKind, planFull) {
+async function trackSessionAt(sessionsDir, sessionId, op, prio, status, blob, machine, folder, transcript, agent = "claude", sessionStartedAt, turnStartedAt, turnId, title, pairingId, model, pendingPlanPicker = false, pid = process.ppid, origin, planPickerVerificationPending = false, dbg, attentionKind, planFull) {
   try {
     const path = `${sessionsDir}/${sessionId}.json`;
     if (op === "end") {
@@ -2741,10 +2838,14 @@ async function trackSessionAt(sessionsDir, sessionId, op, prio, status, blob, ma
       return;
     }
     const recordedAt = Date.now();
+    const { label, folderKey, cwd, gitDir } = typeof folder === "string" ? { label: folder, folderKey: undefined, cwd: undefined, gitDir: undefined } : folder;
     const record = {
       pid,
       machine,
       label,
+      ...folderKey ? { folderKey } : {},
+      ...cwd ? { cwd } : {},
+      ...gitDir ? { gitDir } : {},
       ts: recordedAt,
       transcript,
       lastEvent: op === "start" ? "sessionStart" : status,
@@ -2771,8 +2872,8 @@ async function trackSessionAt(sessionsDir, sessionId, op, prio, status, blob, ma
     await atomicWrite(path, JSON.stringify(record), 384);
   } catch {}
 }
-async function trackSession(sessionId, op, prio, status, blob, machine, label, transcript, agent = "claude", sessionStartedAt, turnStartedAt, turnId, title, pairingId, model, pendingPlanPicker = false, pid = process.ppid, origin, planPickerVerificationPending = false, dbg, attentionKind, planFull) {
-  return trackSessionAt(SESSIONS_DIR, sessionId, op, prio, status, blob, machine, label, transcript, agent, sessionStartedAt, turnStartedAt, turnId, title, pairingId, model, pendingPlanPicker, pid, origin, planPickerVerificationPending, dbg, attentionKind, planFull);
+async function trackSession(sessionId, op, prio, status, blob, machine, folder, transcript, agent = "claude", sessionStartedAt, turnStartedAt, turnId, title, pairingId, model, pendingPlanPicker = false, pid = process.ppid, origin, planPickerVerificationPending = false, dbg, attentionKind, planFull) {
+  return trackSessionAt(SESSIONS_DIR, sessionId, op, prio, status, blob, machine, folder, transcript, agent, sessionStartedAt, turnStartedAt, turnId, title, pairingId, model, pendingPlanPicker, pid, origin, planPickerVerificationPending, dbg, attentionKind, planFull);
 }
 async function markDoneDeliveredAt(sessionsDir, sessionId) {
   try {
@@ -2799,7 +2900,7 @@ async function reconcileProvisional(config, hookPid) {
         continue;
       }
       if (r.provisional === true && typeof r.pid === "number")
-        provisionals.push({ sessionId: basename2(f, ".json"), pid: r.pid });
+        provisionals.push({ sessionId: basename3(f, ".json"), pid: r.pid });
     }
     if (provisionals.length === 0)
       return;
@@ -2828,7 +2929,7 @@ async function readTrackedSessions() {
       continue;
     try {
       const r = JSON.parse(await readFile4(`${SESSIONS_DIR}/${f}`, "utf8"));
-      out.push({ sessionId: basename2(f, ".json"), pid: r.pid, provisional: r.provisional, agent: r.agent, ts: r.ts });
+      out.push({ sessionId: basename3(f, ".json"), pid: r.pid, provisional: r.provisional, agent: r.agent, ts: r.ts });
     } catch {}
   }
   return out;
@@ -3049,7 +3150,7 @@ async function runHook(agent) {
         planPickerVerificationPending = true;
       }
     }
-    const label = typeof existingRecord?.label === "string" && existingRecord.label.length > 0 ? existingRecord.label : typeof input.cwd === "string" && input.cwd.length > 0 ? basename2(input.cwd) : "session";
+    const folder = folderIdentity(input.cwd, existingRecord);
     const dbg = agent === "codex" ? formatPlanPickerDebug({
       event: hookName || "event",
       classifier: pickerClassifier,
@@ -3058,7 +3159,7 @@ async function runHook(agent) {
       by: "h"
     }) : undefined;
     let planFull;
-    const envelope = await buildEnvelope(eventInput, machine, Date.now(), title, config.e2eKey, sentDone, agent, startedAt, turnStartedAt, label, model, plan, attentionKind, proposedPlan, dbg, (plaintext) => {
+    const envelope = await buildEnvelope(eventInput, machine, Date.now(), title, config.e2eKey, sentDone, agent, startedAt, turnStartedAt, folder, model, plan, attentionKind, proposedPlan, dbg, (plaintext) => {
       planFull = fullTextForRecord(proposedPlan, plaintext.plan);
     });
     if (!envelope)
@@ -3068,7 +3169,7 @@ async function runHook(agent) {
     const origin = existingRecord?.origin ?? sessionOrigin(input, hookPid, hookCommand);
     const recordPid = reusedForkPredecessor ? existingRecord.pid : hookPid;
     const recordTranscript = reusedForkPredecessor ? existingRecord.transcript ?? transcriptPath : transcriptPath;
-    await trackSession(sessionId, plan.op, plan.prio, plan.status, envelope.blob, machine, label, recordTranscript, agent, startedAt, turnStartedAt, turnId, title, config.pairingId, model, pendingPlanPicker, recordPid, origin, planPickerVerificationPending, dbg, envelope.attentionKind, planFull);
+    await trackSession(sessionId, plan.op, plan.prio, plan.status, envelope.blob, machine, folder, recordTranscript, agent, startedAt, turnStartedAt, turnId, title, config.pairingId, model, pendingPlanPicker, recordPid, origin, planPickerVerificationPending, dbg, envelope.attentionKind, planFull);
     const clearedPickerMarker = pendingPlanPicker === false && planPickerVerificationPending === false && (existingRecord?.pendingPlanPicker === true || existingRecord?.planPickerVerificationPending === true || existingRecord?.planPickerSettled === true);
     if (agent === "codex" && (hookName === "Stop" || pendingPlanPicker || planPickerVerificationPending || clearedPickerMarker)) {
       tracePlanPickerDecision(sessionId, {
@@ -3312,13 +3413,13 @@ function codexRolloutSessionId(text) {
   return;
 }
 async function loadCodexTurnPolicy(transcriptPath, turnId, sessionId, home = codexHome()) {
-  if (!transcriptPath || !turnId || !sessionId || !basename3(transcriptPath).match(/^rollout-.*\.jsonl$/))
+  if (!transcriptPath || !turnId || !sessionId || !basename4(transcriptPath).match(/^rollout-.*\.jsonl$/))
     return null;
   try {
-    const sessionsRoot = await realpath(resolve(home, "sessions"));
+    const sessionsRoot = await realpath(resolve2(home, "sessions"));
     const rollout = await realpath(transcriptPath);
     const rel = relative(sessionsRoot, rollout);
-    if (rel === "" || rel.startsWith("..") || isAbsolute(rel))
+    if (rel === "" || rel.startsWith("..") || isAbsolute2(rel))
       return null;
     const head = await readPrefix(rollout, CODEX_ROLLOUT_HEAD_BYTES);
     if (codexRolloutSessionId(head) !== sessionId)
@@ -3491,7 +3592,7 @@ function buildPermissionSummary(toolName, toolInput) {
     case "Read":
     case "NotebookEdit": {
       const fp = str(toolInput.file_path);
-      return fp ? basename3(fp) : toolName;
+      return fp ? basename4(fp) : toolName;
     }
     case "WebFetch":
     case "WebSearch": {
@@ -3699,8 +3800,8 @@ var LOOPBACK_MAX_CONSECUTIVE_ERRORS = 5;
 function createLoopbackAnswerPoller(config, requestId, deps) {
   const interval = deps.intervalMs ?? LOOPBACK_POLL_INTERVAL_MS;
   const discoverInterval = deps.discoverIntervalMs ?? POLL_INTERVAL_MS;
-  const tick = deps.sleep ?? ((ms) => new Promise((resolve2) => {
-    const timer = setTimeout(resolve2, ms);
+  const tick = deps.sleep ?? ((ms) => new Promise((resolve3) => {
+    const timer = setTimeout(resolve3, ms);
     timer.unref?.();
   }));
   let live = deps.statePath !== undefined;
@@ -3711,8 +3812,8 @@ function createLoopbackAnswerPoller(config, requestId, deps) {
   let traced = false;
   let pending;
   let wakeResolve = () => {};
-  let wake = new Promise((resolve2) => {
-    wakeResolve = resolve2;
+  let wake = new Promise((resolve3) => {
+    wakeResolve = resolve3;
   });
   let keyPromise;
   const note2 = (result) => {
@@ -3947,7 +4048,7 @@ async function runPermissionHook(deps = {}, agent = "claude") {
     const machine = config.machineName ?? hostname2().replace(/\.local$/, "");
     const plan = { op: "update", prio: 1, status: "needsAttention" };
     const at = Math.floor(now / 1000);
-    const base = buildBlob(input, machine, record?.title, plan, agent, record?.turnStartedAt, record?.label, record?.model, at);
+    const base = buildBlob(input, machine, record?.title, plan, agent, record?.turnStartedAt, record, record?.model, at);
     const permissionBase = {
       ...base,
       status: "decisionPending",
@@ -4244,13 +4345,13 @@ if (__require.main == __require.module) {
   let flushed = Promise.resolve();
   await runPermissionHook({
     emit: (line) => {
-      flushed = new Promise((resolve2) => {
-        const timer = setTimeout(resolve2, 1000);
+      flushed = new Promise((resolve3) => {
+        const timer = setTimeout(resolve3, 1000);
         timer.unref?.();
         process.stdout.write(`${line}
 `, () => {
           clearTimeout(timer);
-          resolve2();
+          resolve3();
         });
       });
     }
