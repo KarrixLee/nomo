@@ -5,7 +5,7 @@ var __require = /* @__PURE__ */ createRequire(import.meta.url);
 import { readdir as readdir4, readFile as readFile8, unlink as unlink4 } from "node:fs/promises";
 import { readFileSync as readFileSync2, statSync as statSync3, unlinkSync } from "node:fs";
 import { hostname as hostname4 } from "node:os";
-import { basename as basename5 } from "node:path";
+import { basename as basename6 } from "node:path";
 
 // src/core/crypto.ts
 var textEncoder = new TextEncoder;
@@ -95,15 +95,16 @@ async function sha256Hex(s) {
 import { execFile as execFile2 } from "node:child_process";
 import { readdir, readFile as readFile2, stat as stat2 } from "node:fs/promises";
 import { promisify as promisify2 } from "node:util";
-import { basename, join as join2 } from "node:path";
+import { basename as basename2, join as join2 } from "node:path";
 
 // src/core/shared.ts
 import { access, chmod, open, readFile, rename, stat, mkdir, unlink, writeFile } from "node:fs/promises";
 import { appendFileSync, existsSync, readFileSync, statSync, truncateSync } from "node:fs";
 import { execFileSync, spawn } from "node:child_process";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
+import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "1.7.9";
+var PLUGIN_VERSION = "1.8.0";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -331,6 +332,26 @@ async function startCodexAppServerDaemon(deps = {}) {
 }
 function lastHookPath(agent) {
   return `${CC_DIR}/last-hook-${agent}`;
+}
+var FOLDER_KEY_HEX_CHARS = 12;
+function folderKeyFromCwd(cwd) {
+  if (typeof cwd !== "string" || cwd.length === 0)
+    return;
+  return createHash("sha256").update(cwd, "utf8").digest("hex").slice(0, FOLDER_KEY_HEX_CHARS);
+}
+function folderIdentity(cwd, pinned) {
+  const pin = typeof pinned === "string" ? { label: pinned, folderKey: undefined } : pinned;
+  if (typeof pin?.label === "string" && pin.label.length > 0) {
+    return {
+      label: pin.label,
+      ...typeof pin.folderKey === "string" && pin.folderKey.length > 0 ? { folderKey: pin.folderKey } : {}
+    };
+  }
+  const key = folderKeyFromCwd(cwd);
+  return {
+    label: typeof cwd === "string" && cwd.length > 0 ? basename(cwd) : "session",
+    ...key ? { folderKey: key } : {}
+  };
 }
 function parseConfig(raw) {
   let parsed;
@@ -1811,7 +1832,7 @@ function claudeForkResumePredecessor(command) {
   const resume = match?.[1] ?? match?.[2] ?? match?.[3];
   if (!resume || !resume.endsWith(".jsonl"))
     return;
-  const id = basename(resume, ".jsonl");
+  const id = basename2(resume, ".jsonl");
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id) ? id : undefined;
 }
 function claudeHeadlessInvocation(selfArgs, ancestorArgs) {
@@ -1845,7 +1866,7 @@ function rolloutPathFromLsof(output) {
     if (!line.startsWith("n"))
       continue;
     const path = line.slice(1);
-    const name = basename(path);
+    const name = basename2(path);
     if (name.startsWith("rollout-") && name.endsWith(".jsonl"))
       return path;
   }
@@ -1997,7 +2018,7 @@ function codexTuiCandidates(rows, knownPids) {
     if (knownPids.has(r.pid))
       continue;
     const tokens = r.args.trim().split(/\s+/);
-    if (basename(tokens[0] ?? "") !== "codex")
+    if (basename2(tokens[0] ?? "") !== "codex")
       continue;
     if (!isRealTty(r.tty))
       continue;
@@ -2013,7 +2034,7 @@ function filterCodexTuis(rows, knownPids) {
 function labelFromCwd(cwd) {
   if (!cwd)
     return "session";
-  const b = basename(cwd);
+  const b = basename2(cwd);
   return b.length > 0 ? b : "session";
 }
 async function runPs() {
@@ -2063,6 +2084,7 @@ async function codexDiscoverLive(known, deps = {}) {
     if (retiredOwner && typeof startedAt === "number" && Number.isFinite(startedAt) && startedAt <= retiredOwner.retiredAt)
       continue;
     const label = labelFromCwd(cwd);
+    const folderKey = folderKeyFromCwd(cwd);
     let active = false;
     try {
       active = await turnActive(pid);
@@ -2073,6 +2095,7 @@ async function codexDiscoverLive(known, deps = {}) {
       title: label,
       label,
       idle: !active,
+      ...folderKey ? { folderKey } : {},
       ...cwd ? { cwd } : {},
       ...typeof startedAt === "number" && Number.isFinite(startedAt) ? { startedAt } : {}
     });
@@ -2954,7 +2977,7 @@ class CodexAppServerClient {
 
 // src/core/codex-proxy-transport.ts
 import { spawn as spawn2 } from "node:child_process";
-import { createHash, randomBytes } from "node:crypto";
+import { createHash as createHash2, randomBytes } from "node:crypto";
 var WEBSOCKET_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 var DEFAULT_MAX_BUFFER_BYTES = 1 << 20;
 var DEFAULT_MAX_HANDSHAKE_BYTES = 16 << 10;
@@ -2966,7 +2989,7 @@ function asError(value, fallback) {
   return value instanceof Error ? value : new Error(value === undefined ? fallback : String(value));
 }
 function websocketAccept(key) {
-  return createHash("sha1").update(key + WEBSOCKET_GUID).digest("base64");
+  return createHash2("sha1").update(key + WEBSOCKET_GUID).digest("base64");
 }
 function parseUpgradeResponse(raw, key) {
   const text = raw.toString("latin1");
@@ -3352,7 +3375,7 @@ import { networkInterfaces } from "node:os";
 import { execFile as execFile3 } from "node:child_process";
 import { watch } from "node:fs";
 import { readdir as readdir2, readFile as readFile3 } from "node:fs/promises";
-import { basename as basename2 } from "node:path";
+import { basename as basename3 } from "node:path";
 import { promisify as promisify3 } from "node:util";
 
 // src/core/lan-wire.ts
@@ -3533,7 +3556,8 @@ function buildStatePlaintext(record, status, at, titleFallback) {
     ...adapterFor(agent).blobAgentFields,
     ...finite(record.turnStartedAt) ? { turnStartedAt: record.turnStartedAt } : {},
     ...filled(record.model) ? { model: record.model } : {},
-    at: Math.floor(at / 1000)
+    at: Math.floor(at / 1000),
+    ...filled(record.folderKey) ? { folderKey: record.folderKey } : {}
   };
   const dbg = agent === "codex" ? formatPlanPickerDebug({
     event: status === "done" ? "done" : "working",
@@ -3891,7 +3915,7 @@ function createLanFrameStore(deps = {}) {
     for (const file of files) {
       if (!file.endsWith(".json"))
         continue;
-      const sessionId = basename2(file, ".json");
+      const sessionId = basename3(file, ".json");
       seen.add(sessionId);
       const v1Retired = entries.get(sessionId)?.retiredAt !== undefined;
       const v2Retired = stateEntries.get(sessionId)?.retiredAt !== undefined;
@@ -4726,12 +4750,12 @@ var MAX_DEFINITIVE_POLL_FAILURES = 2;
 import { readFile as readFile7, realpath, unlink as unlink3 } from "node:fs/promises";
 import { appendFileSync as appendFileSync2, statSync as statSync2, truncateSync as truncateSync2 } from "node:fs";
 import { hostname as hostname2 } from "node:os";
-import { basename as basename4, isAbsolute, relative, resolve } from "node:path";
+import { basename as basename5, isAbsolute, relative, resolve } from "node:path";
 
 // src/core/hook.ts
 import { readdir as readdir3, readFile as readFile6, unlink as unlink2 } from "node:fs/promises";
 import { hostname } from "node:os";
-import { basename as basename3 } from "node:path";
+import { basename as basename4 } from "node:path";
 
 // src/core/notify-wire.ts
 import { readFile as readFile5 } from "node:fs/promises";
@@ -4953,8 +4977,8 @@ function transcriptStartMs(prefix) {
   }
   return;
 }
-function buildBlob(input, machine, title, plan, agent = "claude", turnStartedAt, pinnedLabel, model, at, proposedPlan, dbgOverride) {
-  const label = typeof pinnedLabel === "string" && pinnedLabel.length > 0 ? pinnedLabel : typeof input.cwd === "string" && input.cwd.length > 0 ? basename3(input.cwd) : "session";
+function buildBlob(input, machine, title, plan, agent = "claude", turnStartedAt, pinnedFolder, model, at, proposedPlan, dbgOverride) {
+  const { label, folderKey } = folderIdentity(input.cwd, pinnedFolder);
   const hookName = typeof input.hook_event_name === "string" ? input.hook_event_name : "";
   const detail = detailForHook(hookName, typeof input.tool_name === "string" ? input.tool_name : undefined, input.tool_input);
   const base = {
@@ -4966,7 +4990,8 @@ function buildBlob(input, machine, title, plan, agent = "claude", turnStartedAt,
     ...agent === "codex" ? { agent: "codex" } : {},
     ...typeof turnStartedAt === "number" && Number.isFinite(turnStartedAt) ? { turnStartedAt } : {},
     ...typeof model === "string" && model.length > 0 ? { model } : {},
-    ...typeof at === "number" && Number.isFinite(at) ? { at } : {}
+    ...typeof at === "number" && Number.isFinite(at) ? { at } : {},
+    ...folderKey ? { folderKey } : {}
   };
   const dbg = agent === "codex" ? dbgOverride ?? formatPlanPickerDebug({
     event: hookName || "event",
@@ -4975,7 +5000,7 @@ function buildBlob(input, machine, title, plan, agent = "claude", turnStartedAt,
   }) : undefined;
   return appendFittedPlanAndDebug(base, proposedPlan, dbg);
 }
-async function buildEnvelope(input, machine, now, title, e2eKey, sentDone, agent = "claude", startedAt, turnStartedAt, pinnedLabel, model, planOverride, attentionKindOverride, proposedPlan, dbg, onBlobPlaintext) {
+async function buildEnvelope(input, machine, now, title, e2eKey, sentDone, agent = "claude", startedAt, turnStartedAt, pinnedFolder, model, planOverride, attentionKindOverride, proposedPlan, dbg, onBlobPlaintext) {
   if (typeof input !== "object" || input === null)
     return null;
   const i = input;
@@ -4989,7 +5014,7 @@ async function buildEnvelope(input, machine, now, title, e2eKey, sentDone, agent
   if (typeof startedAt === "number" && Number.isFinite(startedAt))
     base.startedAt = startedAt;
   const at = Math.floor(now / 1000);
-  const plaintext = buildBlob(i, machine, title, plan, agent, turnStartedAt, pinnedLabel, model, at, proposedPlan, dbg);
+  const plaintext = buildBlob(i, machine, title, plan, agent, turnStartedAt, pinnedFolder, model, at, proposedPlan, dbg);
   try {
     onBlobPlaintext?.(plaintext);
   } catch {}
@@ -5016,7 +5041,7 @@ async function stashPendingEvent(input, machine, title, now, stashPath = PENDING
     await atomicWrite(stashPath, JSON.stringify(stash), 384);
   } catch {}
 }
-async function trackSessionAt(sessionsDir, sessionId, op, prio, status, blob, machine, label, transcript, agent = "claude", sessionStartedAt, turnStartedAt, turnId, title, pairingId, model, pendingPlanPicker = false, pid = process.ppid, origin, planPickerVerificationPending = false, dbg, attentionKind, planFull) {
+async function trackSessionAt(sessionsDir, sessionId, op, prio, status, blob, machine, folder, transcript, agent = "claude", sessionStartedAt, turnStartedAt, turnId, title, pairingId, model, pendingPlanPicker = false, pid = process.ppid, origin, planPickerVerificationPending = false, dbg, attentionKind, planFull) {
   try {
     const path = `${sessionsDir}/${sessionId}.json`;
     if (op === "end") {
@@ -5025,10 +5050,12 @@ async function trackSessionAt(sessionsDir, sessionId, op, prio, status, blob, ma
       return;
     }
     const recordedAt = Date.now();
+    const { label, folderKey } = typeof folder === "string" ? { label: folder, folderKey: undefined } : folder;
     const record = {
       pid,
       machine,
       label,
+      ...folderKey ? { folderKey } : {},
       ts: recordedAt,
       transcript,
       lastEvent: op === "start" ? "sessionStart" : status,
@@ -5055,8 +5082,8 @@ async function trackSessionAt(sessionsDir, sessionId, op, prio, status, blob, ma
     await atomicWrite(path, JSON.stringify(record), 384);
   } catch {}
 }
-async function trackSession(sessionId, op, prio, status, blob, machine, label, transcript, agent = "claude", sessionStartedAt, turnStartedAt, turnId, title, pairingId, model, pendingPlanPicker = false, pid = process.ppid, origin, planPickerVerificationPending = false, dbg, attentionKind, planFull) {
-  return trackSessionAt(SESSIONS_DIR, sessionId, op, prio, status, blob, machine, label, transcript, agent, sessionStartedAt, turnStartedAt, turnId, title, pairingId, model, pendingPlanPicker, pid, origin, planPickerVerificationPending, dbg, attentionKind, planFull);
+async function trackSession(sessionId, op, prio, status, blob, machine, folder, transcript, agent = "claude", sessionStartedAt, turnStartedAt, turnId, title, pairingId, model, pendingPlanPicker = false, pid = process.ppid, origin, planPickerVerificationPending = false, dbg, attentionKind, planFull) {
+  return trackSessionAt(SESSIONS_DIR, sessionId, op, prio, status, blob, machine, folder, transcript, agent, sessionStartedAt, turnStartedAt, turnId, title, pairingId, model, pendingPlanPicker, pid, origin, planPickerVerificationPending, dbg, attentionKind, planFull);
 }
 async function markDoneDeliveredAt(sessionsDir, sessionId) {
   try {
@@ -5083,7 +5110,7 @@ async function reconcileProvisional(config, hookPid) {
         continue;
       }
       if (r.provisional === true && typeof r.pid === "number")
-        provisionals.push({ sessionId: basename3(f, ".json"), pid: r.pid });
+        provisionals.push({ sessionId: basename4(f, ".json"), pid: r.pid });
     }
     if (provisionals.length === 0)
       return;
@@ -5112,7 +5139,7 @@ async function readTrackedSessions() {
       continue;
     try {
       const r = JSON.parse(await readFile6(`${SESSIONS_DIR}/${f}`, "utf8"));
-      out.push({ sessionId: basename3(f, ".json"), pid: r.pid, provisional: r.provisional, agent: r.agent, ts: r.ts });
+      out.push({ sessionId: basename4(f, ".json"), pid: r.pid, provisional: r.provisional, agent: r.agent, ts: r.ts });
     } catch {}
   }
   return out;
@@ -5333,7 +5360,7 @@ async function runHook(agent) {
         planPickerVerificationPending = true;
       }
     }
-    const label = typeof existingRecord?.label === "string" && existingRecord.label.length > 0 ? existingRecord.label : typeof input.cwd === "string" && input.cwd.length > 0 ? basename3(input.cwd) : "session";
+    const folder = folderIdentity(input.cwd, existingRecord);
     const dbg = agent === "codex" ? formatPlanPickerDebug({
       event: hookName || "event",
       classifier: pickerClassifier,
@@ -5342,7 +5369,7 @@ async function runHook(agent) {
       by: "h"
     }) : undefined;
     let planFull;
-    const envelope = await buildEnvelope(eventInput, machine, Date.now(), title, config.e2eKey, sentDone, agent, startedAt, turnStartedAt, label, model, plan, attentionKind, proposedPlan, dbg, (plaintext) => {
+    const envelope = await buildEnvelope(eventInput, machine, Date.now(), title, config.e2eKey, sentDone, agent, startedAt, turnStartedAt, folder, model, plan, attentionKind, proposedPlan, dbg, (plaintext) => {
       planFull = fullTextForRecord(proposedPlan, plaintext.plan);
     });
     if (!envelope)
@@ -5352,7 +5379,7 @@ async function runHook(agent) {
     const origin = existingRecord?.origin ?? sessionOrigin(input, hookPid, hookCommand);
     const recordPid = reusedForkPredecessor ? existingRecord.pid : hookPid;
     const recordTranscript = reusedForkPredecessor ? existingRecord.transcript ?? transcriptPath : transcriptPath;
-    await trackSession(sessionId, plan.op, plan.prio, plan.status, envelope.blob, machine, label, recordTranscript, agent, startedAt, turnStartedAt, turnId, title, config.pairingId, model, pendingPlanPicker, recordPid, origin, planPickerVerificationPending, dbg, envelope.attentionKind, planFull);
+    await trackSession(sessionId, plan.op, plan.prio, plan.status, envelope.blob, machine, folder, recordTranscript, agent, startedAt, turnStartedAt, turnId, title, config.pairingId, model, pendingPlanPicker, recordPid, origin, planPickerVerificationPending, dbg, envelope.attentionKind, planFull);
     const clearedPickerMarker = pendingPlanPicker === false && planPickerVerificationPending === false && (existingRecord?.pendingPlanPicker === true || existingRecord?.planPickerVerificationPending === true || existingRecord?.planPickerSettled === true);
     if (agent === "codex" && (hookName === "Stop" || pendingPlanPicker || planPickerVerificationPending || clearedPickerMarker)) {
       tracePlanPickerDecision(sessionId, {
@@ -5481,7 +5508,7 @@ function codexRolloutSessionId(text) {
   return;
 }
 async function loadCodexTurnPolicy(transcriptPath, turnId, sessionId, home = codexHome()) {
-  if (!transcriptPath || !turnId || !sessionId || !basename4(transcriptPath).match(/^rollout-.*\.jsonl$/))
+  if (!transcriptPath || !turnId || !sessionId || !basename5(transcriptPath).match(/^rollout-.*\.jsonl$/))
     return null;
   try {
     const sessionsRoot = await realpath(resolve(home, "sessions"));
@@ -5660,7 +5687,7 @@ function buildPermissionSummary(toolName, toolInput) {
     case "Read":
     case "NotebookEdit": {
       const fp = str(toolInput.file_path);
-      return fp ? basename4(fp) : toolName;
+      return fp ? basename5(fp) : toolName;
     }
     case "WebFetch":
     case "WebSearch": {
@@ -6116,7 +6143,7 @@ async function runPermissionHook(deps = {}, agent = "claude") {
     const machine = config.machineName ?? hostname2().replace(/\.local$/, "");
     const plan = { op: "update", prio: 1, status: "needsAttention" };
     const at = Math.floor(now / 1000);
-    const base = buildBlob(input, machine, record?.title, plan, agent, record?.turnStartedAt, record?.label, record?.model, at);
+    const base = buildBlob(input, machine, record?.title, plan, agent, record?.turnStartedAt, record, record?.model, at);
     const permissionBase = {
       ...base,
       status: "decisionPending",
@@ -6503,7 +6530,8 @@ function baseBlob(request, record, config, now) {
     agent: "codex",
     ...typeof record.turnStartedAt === "number" && Number.isFinite(record.turnStartedAt) ? { turnStartedAt: record.turnStartedAt } : {},
     ...typeof record.model === "string" && record.model.length > 0 ? { model: record.model } : {},
-    at: Math.floor(now / 1000)
+    at: Math.floor(now / 1000),
+    ...typeof record.folderKey === "string" && record.folderKey.length > 0 ? { folderKey: record.folderKey } : {}
   };
 }
 function requestSignal(ms, signal) {
@@ -7128,7 +7156,8 @@ async function buildDoneEnvelope(sessionId, record, now, e2eKey, agent = "claude
     ...adapterFor(agent).blobAgentFields,
     ...typeof record.turnStartedAt === "number" && Number.isFinite(record.turnStartedAt) ? { turnStartedAt: record.turnStartedAt } : {},
     ...typeof record.model === "string" && record.model.length > 0 ? { model: record.model } : {},
-    ...typeof at === "number" && Number.isFinite(at) ? { at } : {}
+    ...typeof at === "number" && Number.isFinite(at) ? { at } : {},
+    ...typeof record.folderKey === "string" && record.folderKey.length > 0 ? { folderKey: record.folderKey } : {}
   };
   const debug = appendCodexBridgeMarker(agent === "codex" ? dbg ?? formatPlanPickerDebug({ event: "done", classifier: "done", marker: "0", by: "wd" }) : undefined, codexBridgeIsDown());
   const blob = await encryptBlob(e2eKey, appendFittedPlanAndDebug(base, undefined, debug));
@@ -7144,7 +7173,8 @@ async function buildNeedsAttentionEnvelope(sessionId, record, now, e2eKey, agent
     ...adapterFor(agent).blobAgentFields,
     ...typeof record.turnStartedAt === "number" && Number.isFinite(record.turnStartedAt) ? { turnStartedAt: record.turnStartedAt } : {},
     ...typeof record.model === "string" && record.model.length > 0 ? { model: record.model } : {},
-    ...typeof at === "number" && Number.isFinite(at) ? { at } : {}
+    ...typeof at === "number" && Number.isFinite(at) ? { at } : {},
+    ...typeof record.folderKey === "string" && record.folderKey.length > 0 ? { folderKey: record.folderKey } : {}
   };
   const debug = appendCodexBridgeMarker(agent === "codex" ? dbg ?? formatPlanPickerDebug({ event: "attention", classifier: "pending", marker: "0", by: "wd" }) : undefined, codexBridgeIsDown());
   const blob = await encryptBlob(e2eKey, appendFittedPlanAndDebug(base, proposedPlan, debug));
@@ -7168,7 +7198,8 @@ async function buildWorkingEnvelope(sessionId, record, now, e2eKey, agent = "cla
     ...adapterFor(agent).blobAgentFields,
     ...typeof record.turnStartedAt === "number" && Number.isFinite(record.turnStartedAt) ? { turnStartedAt: record.turnStartedAt } : {},
     ...typeof record.model === "string" && record.model.length > 0 ? { model: record.model } : {},
-    at: Math.floor(now / 1000)
+    at: Math.floor(now / 1000),
+    ...typeof record.folderKey === "string" && record.folderKey.length > 0 ? { folderKey: record.folderKey } : {}
   };
   const debug = appendCodexBridgeMarker(agent === "codex" ? dbg ?? formatPlanPickerDebug({ event: "working", classifier: "resolved", marker: "0", by: "wd" }) : undefined, codexBridgeIsDown());
   const blob = await encryptBlob(e2eKey, appendFittedPlanAndDebug(base, undefined, debug));
@@ -7289,7 +7320,7 @@ function resolveCodexTuiOwner(record, candidates, alive = pidAlive) {
   const command = record.origin?.ppid_command;
   if (typeof command === "string") {
     const tokens = command.trim().split(/\s+/);
-    if (basename5(tokens[0] ?? "") === "codex" && tokens[1] !== "app-server" && !tokens.slice(1).includes("exec") && typeof record.pid === "number" && alive(record.pid)) {
+    if (basename6(tokens[0] ?? "") === "codex" && tokens[1] !== "app-server" && !tokens.slice(1).includes("exec") && typeof record.pid === "number" && alive(record.pid)) {
       return record.pid;
     }
   }
@@ -7888,7 +7919,7 @@ async function readAllRecordEntries() {
       if (!f.endsWith(".json"))
         continue;
       try {
-        out.push({ sessionId: basename5(f, ".json"), rec: JSON.parse(await readFile8(`${SESSIONS_DIR}/${f}`, "utf8")) });
+        out.push({ sessionId: basename6(f, ".json"), rec: JSON.parse(await readFile8(`${SESSIONS_DIR}/${f}`, "utf8")) });
       } catch {}
     }
     return out;
@@ -7906,7 +7937,8 @@ async function buildProvisionalBlob(d, machine, blobAgentFields, e2eKey, at) {
     machine,
     label: d.label,
     ...blobAgentFields,
-    ...typeof at === "number" && Number.isFinite(at) ? { at } : {}
+    ...typeof at === "number" && Number.isFinite(at) ? { at } : {},
+    ...typeof d.folderKey === "string" && d.folderKey.length > 0 ? { folderKey: d.folderKey } : {}
   };
   const dbg = appendCodexBridgeMarker(blobAgentFields.agent === "codex" ? formatPlanPickerDebug({
     event: "discover",
@@ -7927,6 +7959,7 @@ function buildProvisionalRecord(d, machine, blob, blobAgentFields, now, pairingI
     pid: d.pid,
     machine,
     label: d.label,
+    ...typeof d.folderKey === "string" && d.folderKey.length > 0 ? { folderKey: d.folderKey } : {},
     ts: now,
     lastEvent: idle ? "done" : "sessionStart",
     op: idle ? "done" : "start",
@@ -8430,7 +8463,8 @@ async function buildTitleRepairEnvelope(sessionId, record, title, now, e2eKey, a
     ...adapterFor(agent).blobAgentFields,
     ...typeof record.turnStartedAt === "number" && Number.isFinite(record.turnStartedAt) ? { turnStartedAt: record.turnStartedAt } : {},
     ...typeof record.model === "string" && record.model.length > 0 ? { model: record.model } : {},
-    ...typeof at === "number" && Number.isFinite(at) ? { at } : {}
+    ...typeof at === "number" && Number.isFinite(at) ? { at } : {},
+    ...typeof record.folderKey === "string" && record.folderKey.length > 0 ? { folderKey: record.folderKey } : {}
   };
   const dbg = appendCodexBridgeMarker(agent === "codex" ? record.dbg ?? formatPlanPickerDebug({
     event: "title",
@@ -8542,7 +8576,7 @@ async function sweep(config, deps = {}) {
     if (!file.endsWith(".json"))
       continue;
     const path = `${SESSIONS_DIR}/${file}`;
-    const sessionId = basename5(file, ".json");
+    const sessionId = basename6(file, ".json");
     let record = null;
     try {
       record = JSON.parse(await readFile8(path, "utf8"));

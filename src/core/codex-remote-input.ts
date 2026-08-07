@@ -173,6 +173,8 @@ function baseBlob(
       ? { turnStartedAt: record.turnStartedAt } : {}),
     ...(typeof record.model === "string" && record.model.length > 0 ? { model: record.model } : {}),
     at: Math.floor(now / 1000),
+    // The record's pinned folder key, in the same slot every other producer of this shape uses.
+    ...(typeof record.folderKey === "string" && record.folderKey.length > 0 ? { folderKey: record.folderKey } : {}),
   };
 }
 

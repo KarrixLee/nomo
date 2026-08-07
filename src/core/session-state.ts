@@ -349,6 +349,10 @@ export function buildStatePlaintext(
     ...(finite(record.turnStartedAt) ? { turnStartedAt: record.turnStartedAt } : {}),
     ...(filled(record.model) ? { model: record.model } : {}),
     at: Math.floor(at / 1000),
+    // The record's PINNED folder key (the phone's grouping identity), in the slot every producer of
+    // this shape uses — hook.ts buildBlob and the watchdog's three corrective builders. A LAN row and
+    // a worker row for one state must stay textually identical, so it is restamped here too.
+    ...(filled(record.folderKey) ? { folderKey: record.folderKey } : {}),
   };
   const dbg = agent === "codex"
     ? formatPlanPickerDebug({

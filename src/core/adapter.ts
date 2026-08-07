@@ -16,7 +16,7 @@ import { execFile } from "node:child_process";
 import { readdir, readFile, stat } from "node:fs/promises";
 import { promisify } from "node:util";
 import { basename, join } from "node:path";
-import { AgentKind, codexHome, isRealTty, lastHookPath, pidAlive, pidAncestors, pidCommand, readPrefix, readSuffix, SessionRecord } from "./shared";
+import { AgentKind, codexHome, folderKeyFromCwd, isRealTty, lastHookPath, pidAlive, pidAncestors, pidCommand, readPrefix, readSuffix, SessionRecord } from "./shared";
 import { ancestryContainsHerdr } from "./terminal-focus";
 
 const execFileP = promisify(execFile);
@@ -1199,6 +1199,12 @@ export interface DiscoveredSession {
   title?: string;
   /** cwd-basename label, exactly like buildBlob's `label`. */
   label: string;
+  /** The GROUPING key for that same cwd — `folderKeyFromCwd(cwd)`, derived from the SAME path as
+   *  `label` so the pair can never describe two different folders (see shared.ts `folderIdentity`).
+   *  The truncated digest is what rides in the blob; the path itself never does (`cwd` above).
+   *  Absent when the cwd could not be read — the phone then groups this row by `label`, as it did
+   *  before the key existed. */
+  folderKey?: string;
   /** True when the TUI has NO turn in flight (an idle REPL at its prompt — see codexTurnActiveFromTail).
    *  The watchdog then advertises the provisional as done/idle instead of "working", so an idle TUI can
    *  never sit "Running" on the phone forever. Absent/false → a turn is open → working. */
@@ -1345,6 +1351,9 @@ export async function codexDiscoverLive(known: SessionRecord[], deps: CodexDisco
     if (retiredOwner && typeof startedAt === "number" && Number.isFinite(startedAt) &&
         startedAt <= (retiredOwner.retiredAt as number)) continue;
     const label = labelFromCwd(cwd);
+    // Derived from the SAME `cwd` as the label above, in the same pass — the anti-drift rule the hook
+    // path gets from folderIdentity, applied to the discovery path.
+    const folderKey = folderKeyFromCwd(cwd);
     // Idle unless a turn is PROVABLY open — a probe failure must never resurrect the stuck-"Running"
     // ghost this flag exists to kill (misread-active self-corrects via the next real hook; misread-idle
     // never would).
@@ -1353,6 +1362,7 @@ export async function codexDiscoverLive(known: SessionRecord[], deps: CodexDisco
     // title == label (cwd basename): a freshly-opened TUI has no prompt yet, so the cwd names it.
     out.push({
       pid, sessionId: codexSentinelSessionId(pid), title: label, label, idle: !active,
+      ...(folderKey ? { folderKey } : {}),
       ...(cwd ? { cwd } : {}),
       ...(typeof startedAt === "number" && Number.isFinite(startedAt) ? { startedAt } : {}),
     });

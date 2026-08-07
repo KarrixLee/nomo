@@ -1339,7 +1339,10 @@ export async function runPermissionHook(
     // (and the plugin never emitted the frame the codex E2E vector describes). buildBlob appends it LAST,
     // before the permission tail, so the append-only wire discipline is unchanged.
     const at = Math.floor(now / 1000);
-    const base = buildBlob(input, machine, record?.title, plan, agent, record?.turnStartedAt, record?.label, record?.model, at);
+    // The WHOLE record is the pin, not just its label: buildBlob reuses both halves of the session's
+    // folder identity from it, so a held frame lands on the same phone folder card as every other
+    // frame this session sends (and a mid-session `cd` cannot move it).
+    const base = buildBlob(input, machine, record?.title, plan, agent, record?.turnStartedAt, record, record?.model, at);
     const permissionBase = {
       ...base, status: "decisionPending", permissionSummary: summary, permissionRequestId: requestId,
       permissionToolName: toolName,

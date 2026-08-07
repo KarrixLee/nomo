@@ -8,7 +8,8 @@ import { readFile as readFile2, unlink as unlink2 } from "node:fs/promises";
 import { access, chmod, open, readFile, rename, stat, mkdir, unlink, writeFile } from "node:fs/promises";
 import { appendFileSync, existsSync, readFileSync, statSync, truncateSync } from "node:fs";
 import { execFileSync, spawn } from "node:child_process";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
+import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 
 // src/core/crypto.ts
@@ -96,7 +97,7 @@ async function sha256Hex(s) {
 }
 
 // src/core/shared.ts
-var PLUGIN_VERSION = "1.7.9";
+var PLUGIN_VERSION = "1.8.0";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -324,6 +325,26 @@ async function startCodexAppServerDaemon(deps = {}) {
 }
 function lastHookPath(agent) {
   return `${CC_DIR}/last-hook-${agent}`;
+}
+var FOLDER_KEY_HEX_CHARS = 12;
+function folderKeyFromCwd(cwd) {
+  if (typeof cwd !== "string" || cwd.length === 0)
+    return;
+  return createHash("sha256").update(cwd, "utf8").digest("hex").slice(0, FOLDER_KEY_HEX_CHARS);
+}
+function folderIdentity(cwd, pinned) {
+  const pin = typeof pinned === "string" ? { label: pinned, folderKey: undefined } : pinned;
+  if (typeof pin?.label === "string" && pin.label.length > 0) {
+    return {
+      label: pin.label,
+      ...typeof pin.folderKey === "string" && pin.folderKey.length > 0 ? { folderKey: pin.folderKey } : {}
+    };
+  }
+  const key = folderKeyFromCwd(cwd);
+  return {
+    label: typeof cwd === "string" && cwd.length > 0 ? basename(cwd) : "session",
+    ...key ? { folderKey: key } : {}
+  };
 }
 function parseConfig(raw) {
   let parsed;

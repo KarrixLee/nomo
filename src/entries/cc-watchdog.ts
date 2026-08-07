@@ -289,6 +289,11 @@ export async function buildDoneEnvelope(sessionId: string, record: SessionRecord
     // idle-CLAUDE reap passes a FROZEN record.ts so a session idle for hours ages out immediately
     // instead of looking freshly finished. OMITTED when the caller has no honest time.
     ...(typeof at === "number" && Number.isFinite(at) ? { at } : {}),
+    // The record's PINNED folder key — the phone's grouping identity for this session (hook.ts
+    // buildBlob puts it in exactly this slot). Restamped rather than re-derived: this daemon has no
+    // cwd to derive from, and a corrective that dropped the key would move a live row onto a second
+    // card for the same folder. OMITTED when the record has none (a pre-key session).
+    ...(typeof record.folderKey === "string" && record.folderKey.length > 0 ? { folderKey: record.folderKey } : {}),
   };
   const debug = appendCodexBridgeMarker(
     agent === "codex" ? dbg ?? formatPlanPickerDebug({ event: "done", classifier: "done", marker: "0", by: "wd" }) : undefined,
@@ -328,9 +333,12 @@ export async function buildNeedsAttentionEnvelope(
     ...(typeof record.turnStartedAt === "number" && Number.isFinite(record.turnStartedAt) ? { turnStartedAt: record.turnStartedAt } : {}),
     // The record's cached model id, restamped exactly as buildDoneEnvelope does (omitted when absent).
     ...(typeof record.model === "string" && record.model.length > 0 ? { model: record.model } : {}),
-    // `at` (epoch SECONDS) remains after model. The optional Plan-picker `plan` is appended LAST below,
-    // preserving the existing order and omitted for ordinary permissions/questions.
+    // `at` (epoch SECONDS) remains after model, then the record's pinned `folderKey` — the same slot
+    // buildDoneEnvelope/hook.ts buildBlob use, restamped for the same reason (see there). The optional
+    // Plan-picker `plan` is appended LAST below, preserving the existing order and omitted for
+    // ordinary permissions/questions.
     ...(typeof at === "number" && Number.isFinite(at) ? { at } : {}),
+    ...(typeof record.folderKey === "string" && record.folderKey.length > 0 ? { folderKey: record.folderKey } : {}),
   };
   const debug = appendCodexBridgeMarker(
     agent === "codex" ? dbg ?? formatPlanPickerDebug({ event: "attention", classifier: "pending", marker: "0", by: "wd" }) : undefined,
@@ -362,6 +370,8 @@ export async function buildWorkingEnvelope(
     ...(typeof record.turnStartedAt === "number" && Number.isFinite(record.turnStartedAt) ? { turnStartedAt: record.turnStartedAt } : {}),
     ...(typeof record.model === "string" && record.model.length > 0 ? { model: record.model } : {}),
     at: Math.floor(now / 1000),
+    // The record's pinned folder key, in the same slot as buildDoneEnvelope's (see there).
+    ...(typeof record.folderKey === "string" && record.folderKey.length > 0 ? { folderKey: record.folderKey } : {}),
   };
   const debug = appendCodexBridgeMarker(
     agent === "codex" ? dbg ?? formatPlanPickerDebug({ event: "working", classifier: "resolved", marker: "0", by: "wd" }) : undefined,
@@ -1577,6 +1587,11 @@ export async function buildProvisionalBlob(
   const base = {
     status: d.idle === true ? "done" : "working", title: d.title ?? "", machine, label: d.label, ...blobAgentFields,
     ...(typeof at === "number" && Number.isFinite(at) ? { at } : {}),
+    // The discovered cwd's folder key, derived alongside `d.label` from the SAME path (adapter.ts's
+    // discoverLive), in the slot every other producer uses. The provisional therefore lands on the
+    // right folder card immediately, and the real hook that reconciles it away carries the identical
+    // key — so the row never jumps cards on reconcile. Omitted when the cwd could not be read.
+    ...(typeof d.folderKey === "string" && d.folderKey.length > 0 ? { folderKey: d.folderKey } : {}),
   };
   const dbg = appendCodexBridgeMarker(blobAgentFields.agent === "codex" ? formatPlanPickerDebug({
     event: "discover", classifier: d.idle === true ? "done" : "work", marker: "0", by: "wd",
@@ -1613,6 +1628,9 @@ export function buildProvisionalRecord(
     pid: d.pid,
     machine,
     label: d.label,
+    // Pinned on the provisional exactly as trackSession pins it on a real record, so the sweep's own
+    // correctives (which rebuild from the record) keep the folder card the provisional advertised.
+    ...(typeof d.folderKey === "string" && d.folderKey.length > 0 ? { folderKey: d.folderKey } : {}),
     ts: now,
     lastEvent: idle ? "done" : "sessionStart",
     op: idle ? "done" : "start",
@@ -2604,6 +2622,9 @@ export async function buildTitleRepairEnvelope(
     // `at` (epoch SECONDS) appended LAST — the OBSERVED now: this re-POSTs the session's CURRENT state
     // (a fresh frame with the title fixed), so the phone should treat it as live. Omitted when absent.
     ...(typeof at === "number" && Number.isFinite(at) ? { at } : {}),
+    // The record's pinned folder key, in the same slot as buildDoneEnvelope's (see there) — a title
+    // repair must not cost the row its folder card.
+    ...(typeof record.folderKey === "string" && record.folderKey.length > 0 ? { folderKey: record.folderKey } : {}),
   };
   const dbg = appendCodexBridgeMarker(agent === "codex" ? record.dbg ?? formatPlanPickerDebug({
     event: "title", classifier: statusFromRecord(record), marker: record.pendingPlanPicker ? "p" : record.planPickerVerificationPending ? "v" : record.planPickerSettled ? "s" : "0", by: "wd",

@@ -13,6 +13,7 @@ import {
   requestUserInputDetail, rolloutPathFromLsof, sessionTitle, TrackedSessionLite,
 } from "./adapter";
 import type { LocateTuiReason } from "./adapter";
+import { folderKeyFromCwd } from "./shared";
 import type { SessionRecord } from "./shared";
 
 // The adapter surface is the per-agent half of the hook pipeline. These cover the two branches that
@@ -393,9 +394,12 @@ describe("codexDiscoverLive (full pipeline with injected ps/lsof)", () => {
       startedAtOf: async (pid) => pid === 16029 ? 1_000 : 2_000,
       turnActive: async (pid) => pid === 16029, // 16029 has a turn in flight; 33198 sits idle
     });
+    // `folderKey` is DERIVED here rather than written out: it is the digest of the same cwd the label
+    // comes from, and pinning a literal would just be a second implementation of the hash. That the two
+    // halves agree on one path is the whole invariant (see shared.ts folderIdentity).
     expect(discovered).toEqual([
-      { pid: 16029, sessionId: "codex-pid-16029", title: "nomo", label: "nomo", idle: false, cwd: cwds[16029], startedAt: 1_000 },
-      { pid: 33198, sessionId: "codex-pid-33198", title: "WidgetAnimation", label: "WidgetAnimation", idle: true, cwd: cwds[33198], startedAt: 2_000 },
+      { pid: 16029, sessionId: "codex-pid-16029", title: "nomo", label: "nomo", idle: false, folderKey: folderKeyFromCwd(cwds[16029]), cwd: cwds[16029], startedAt: 1_000 },
+      { pid: 33198, sessionId: "codex-pid-33198", title: "WidgetAnimation", label: "WidgetAnimation", idle: true, folderKey: folderKeyFromCwd(cwds[33198]), cwd: cwds[33198], startedAt: 2_000 },
     ]);
   });
 

@@ -13,7 +13,8 @@
 import { access, chmod, open, readFile, rename, stat, mkdir, unlink, writeFile } from "node:fs/promises";
 import { appendFileSync, existsSync, readFileSync, statSync, truncateSync } from "node:fs";
 import { execFileSync, spawn } from "node:child_process";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
+import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { b64url, deriveE2EKey, deriveRatchetKey, encryptBlob, fromB64url } from "./crypto";
 
@@ -506,6 +507,76 @@ export function lastHookPath(agent: AgentKind): string {
   return `${CC_DIR}/last-hook-${agent}`;
 }
 
+// --- project-folder identity (the phone's session grouping) -------------------------------------
+
+/** How many hex characters of the cwd digest ride in the blob. 12 hex = 48 bits: collision-free for
+ *  the handful of project folders one machine ever has (birthday-bound ~16M folders for a 1-in-a-
+ *  million collision), and short enough to be free against the worker's 3072-char sealed ceiling. */
+export const FOLDER_KEY_HEX_CHARS = 12;
+
+/** A session's project folder, as the phone sees it: the DISPLAY name and the optional grouping key.
+ *  The two ALWAYS describe the same cwd — see `folderIdentity`, which is the only thing that makes
+ *  them, precisely so no caller can pair one folder's name with another folder's key. */
+export interface FolderIdentity {
+  /** `basename(cwd)` — what the phone renders as the folder title. */
+  label: string;
+  /** The GROUPING identity (see `folderKeyFromCwd`). Absent when the cwd was unknown, and absent on a
+   *  session pinned by a plugin old enough to predate the key (the phone then groups by `label`). */
+  folderKey?: string;
+}
+
+/** The grouping identity of a project folder: the first `FOLDER_KEY_HEX_CHARS` hex chars of SHA-256
+ *  over the ABSOLUTE cwd.
+ *
+ *  WHY A HASH AND NOT THE PATH. `label` (the cwd BASENAME) is not unique — two checkouts named `api`
+ *  under different parents merged into one card on the phone. The full path would disambiguate them,
+ *  but the exact cwd is deliberately local-only (see adapter.ts's `DiscoveredSession.cwd`: "Never
+ *  enters a blob"), and that rule stands. A truncated digest reveals strictly no more than the
+ *  basename already does while still being collision-free identity.
+ *
+ *  WHY THE CWD AND NOT THE GIT TOPLEVEL. Both agents key a project on its absolute cwd — Claude Code
+ *  slugifies it into its `~/.claude/projects/<slug>` directory, Codex records it as
+ *  `session_meta.payload.cwd` — and Claude Code treats a git WORKTREE as its own project. Keying on
+ *  the git root would merge a worktree back into its parent repo, which is the opposite of what both
+ *  agents (and the user) mean by "project".
+ *
+ *  Undefined for an unknown/empty cwd: there is nothing to identify, and the phone falls back to
+ *  grouping by `label` exactly as it did before the key existed. */
+export function folderKeyFromCwd(cwd: unknown): string | undefined {
+  if (typeof cwd !== "string" || cwd.length === 0) return undefined;
+  return createHash("sha256").update(cwd, "utf8").digest("hex").slice(0, FOLDER_KEY_HEX_CHARS);
+}
+
+/** BOTH halves of a session's folder identity, from ONE source — the single place either is derived.
+ *
+ *  PINNING, exactly as `label` has always been pinned (hook.ts): a mid-session `cd` changes `input.cwd`
+ *  on every later hook, and re-deriving per event silently renamed the phone row ("api-status" →
+ *  "server" after a `cd server`). So once a session's record carries a label, `pinned` wins and the
+ *  event's cwd is ignored — for the KEY too, or a `cd` would move a live session between folder cards
+ *  on the phone.
+ *
+ *  The two can never drift apart because they are only ever produced together: either both come from
+ *  the pin, or both are derived from the same `cwd`. A record pinned by an older plugin has a label and
+ *  no key; it keeps having no key for the rest of that session rather than picking up one derived from
+ *  wherever the shell has since wandered. The phone documents that mixed state (it groups such rows by
+ *  label) and it self-resolves when the session ends. */
+export function folderIdentity(
+  cwd: unknown, pinned?: string | { label?: unknown; folderKey?: unknown } | null,
+): FolderIdentity {
+  const pin = typeof pinned === "string" ? { label: pinned, folderKey: undefined } : pinned;
+  if (typeof pin?.label === "string" && pin.label.length > 0) {
+    return {
+      label: pin.label,
+      ...(typeof pin.folderKey === "string" && pin.folderKey.length > 0 ? { folderKey: pin.folderKey } : {}),
+    };
+  }
+  const key = folderKeyFromCwd(cwd);
+  return {
+    label: typeof cwd === "string" && cwd.length > 0 ? basename(cwd) : "session",
+    ...(key ? { folderKey: key } : {}),
+  };
+}
+
 /** Local-only provenance for the hook invocation that FIRST created a session record. This is
  *  deliberately absent from the encrypted blob and clear wire envelope: it exists solely to make a
  *  phantom row diagnosable from the Mac. Field names mirror the hook payload / process vocabulary so
@@ -528,6 +599,12 @@ export interface SessionRecord {
   pid: number;
   machine: string;
   label: string;
+  /** The PINNED grouping key for `label`'s folder (see `folderIdentity`). Written together with
+   *  `label` on the record's FIRST event and reused verbatim by every later blob this session
+   *  produces — the hook's, the watchdog's correctives, the LAN state blob — so a mid-session `cd`
+   *  cannot move the row to another folder card. Optional: a record written by a plugin predating the
+   *  key has none, and a session whose cwd was unknown never had one. */
+  folderKey?: string;
   /** Epoch-ms the file was last written — drives the 24 h staleness cap in the watchdog. */
   ts: number;
   /** Absolute path to the session's JSONL transcript (the hook input's `transcript_path`); "" if

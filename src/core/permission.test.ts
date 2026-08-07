@@ -918,11 +918,13 @@ describe("runPermissionHook — hold state machine", () => {
     expect(blob.at).toBe(1_784_937_605);                              // FLOORED seconds, the vector's shape
     expect(fb.at).toBe(1_784_937_605);
     expect(body.ts).toBe(nowMs);                                      // the envelope stays in MILLIseconds
-    // Appended LAST in the base blob — i.e. immediately BEFORE the permission tail, so the frozen
-    // append-only order of the permission keys is untouched.
+    // Appended in the base blob — i.e. BEFORE the permission tail, so the frozen append-only order of
+    // the permission keys is untouched. `folderKey` (the phone's folder-grouping identity) closes the
+    // base after `at`, the same slot every other producer of this shape puts it in.
     const keys = Object.keys(blob);
-    expect(keys[keys.indexOf("permissionSummary") - 1]).toBe("at");
-    expect(Object.keys(fb).at(-1)).toBe("at");
+    expect(keys.slice(keys.indexOf("permissionSummary") - 2, keys.indexOf("permissionSummary")))
+      .toEqual(["at", "folderKey"]);
+    expect(Object.keys(fb).slice(-2)).toEqual(["at", "folderKey"]);
   });
 
   test("hold=true, answered allow → emits exactly the allow line", async () => {
