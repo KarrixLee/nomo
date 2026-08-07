@@ -3,7 +3,6 @@ var __require = /* @__PURE__ */ createRequire(import.meta.url);
 
 // src/entries/codex-notify.ts
 import { hostname as hostname2 } from "node:os";
-import { basename as basename4 } from "node:path";
 
 // src/core/adapter.ts
 import { execFile as execFile2 } from "node:child_process";
@@ -104,7 +103,7 @@ async function sha256Hex(s) {
 }
 
 // src/core/shared.ts
-var PLUGIN_VERSION = "1.9.0";
+var PLUGIN_VERSION = "1.9.1";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -3328,13 +3327,13 @@ async function runNotify(raw, deferMs = notifyDeferMs(), sleep = (ms) => new Pro
     });
     const proposedPlan = pendingPlanPicker ? evidence.plan : undefined;
     let planFull;
-    const envelope = await buildEnvelope(input, machine, now, title, config.e2eKey, false, "codex", startedAt, turnStartedAt, undefined, model, plan, attentionKind, proposedPlan, dbg, (plaintext) => {
+    const folder = folderIdentity(input.cwd, record);
+    const envelope = await buildEnvelope(input, machine, now, title, config.e2eKey, false, "codex", startedAt, turnStartedAt, folder, model, plan, attentionKind, proposedPlan, dbg, (plaintext) => {
       planFull = fullTextForRecord(proposedPlan, plaintext.plan);
     });
     if (!envelope)
       return;
-    const label = typeof input.cwd === "string" && input.cwd.length > 0 ? basename4(input.cwd) : "session";
-    await trackSession(sessionId, plan.op, plan.prio, plan.status, envelope.blob, machine, label, transcriptPath, "codex", startedAt, turnStartedAt, payloadTurnId, title ?? record?.title, config.pairingId, model, pendingPlanPicker, sessionPid, record?.origin ?? sessionOrigin(input, sessionPid, pidCommand(sessionPid)), planPickerVerificationPending, dbg, attentionKind, planFull);
+    await trackSession(sessionId, plan.op, plan.prio, plan.status, envelope.blob, machine, folder, transcriptPath, "codex", startedAt, turnStartedAt, payloadTurnId, title ?? record?.title, config.pairingId, model, pendingPlanPicker, sessionPid, record?.origin ?? sessionOrigin(input, sessionPid, pidCommand(sessionPid)), planPickerVerificationPending, dbg, attentionKind, planFull);
     const clearedPickerMarker = !pendingPlanPicker && !planPickerVerificationPending && (record?.pendingPlanPicker === true || record?.planPickerSettled === true);
     tracePlanPickerDecision(sessionId, {
       source: "notify",
