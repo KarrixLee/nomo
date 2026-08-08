@@ -104,7 +104,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "1.9.1";
+var PLUGIN_VERSION = "1.9.2";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -5840,7 +5840,11 @@ function buildPermissionDetail(toolName, toolInput) {
 }
 var QUESTION_TEXT_MAX = 240;
 var PERMISSION_QUESTION_LABEL_MAX = 60;
-var QUESTION_DESCRIPTION_MAX = 160;
+var QUESTION_DESCRIPTION_MAX = 600;
+var QUESTION_DESCRIPTION_LADDER = [400, 280, 200, 160, 120, 80];
+function withDescriptionCap(questions, max) {
+  return questions.map((question) => question.d === undefined ? question : { ...question, d: question.d.map((description) => capPermissionWireText(description, max)) });
+}
 function capPermissionWireText(value, max) {
   const characters = Array.from(value);
   return characters.length <= max ? value : `${characters.slice(0, max - 1).join("")}…`;
@@ -5896,7 +5900,12 @@ function fitPermissionDetail(base, detail, maxChars = BLOB_FIT_CHARS, questions 
   const measure = (d, omitted, qs) => sealedBlobChars(encoder.encode(JSON.stringify(permissionFrame(base, d, omitted, qs))).length);
   const worstCase = all.length;
   const bareQuestions = questions.map(({ d: _descriptions, ...question }) => question);
-  const kept = questions.length > 0 && measure("", worstCase, questions) <= maxChars ? questions : bareQuestions.length > 0 && measure("", worstCase, bareQuestions) <= maxChars ? bareQuestions : [];
+  const candidates = questions.length === 0 ? [] : [
+    questions,
+    ...QUESTION_DESCRIPTION_LADDER.map((max) => withDescriptionCap(questions, max)),
+    bareQuestions
+  ];
+  const kept = candidates.find((candidate) => measure("", worstCase, candidate) <= maxChars) ?? [];
   const tail = kept.length > 0 ? { questions: kept } : {};
   const frameChars = (d, omitted) => measure(d, omitted, kept);
   if (chars.length === 0)

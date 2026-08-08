@@ -622,8 +622,25 @@ export interface PermissionQuestion {
 const QUESTION_TEXT_MAX = 240;
 /** Longest option label kept in the blob. */
 export const PERMISSION_QUESTION_LABEL_MAX = 60;
-/** Longest option description kept in the blob. */
-const QUESTION_DESCRIPTION_MAX = 160;
+/** Longest option description kept in the blob. Generous on purpose: the description is the ONLY place
+ *  an option explains itself, and the phone opens the selected row to its full height to show it — so a
+ *  description cut at 160 made that opening pointless. This is a SANITY ceiling, not a budget: when the
+ *  frame is tight `fitPermissionDetail` steps the real cap down rung by rung (see
+ *  QUESTION_DESCRIPTION_LADDER), so a long description costs detail text before it costs itself. */
+const QUESTION_DESCRIPTION_MAX = 600;
+
+/** Description caps `fitPermissionDetail` tries, widest first, before the picker gives up its
+ *  descriptions ENTIRELY. Without these rungs the choice was all-or-nothing — one fat description sank
+ *  every description on the card — which is exactly what a wider ceiling would have made common. */
+const QUESTION_DESCRIPTION_LADDER = [400, 280, 200, 160, 120, 80];
+
+/** `questions` with every description re-capped at `max`. Positional alignment is untouched: an empty
+ *  description stays empty, so `d` never stops lining up with `o`. */
+function withDescriptionCap(questions: PermissionQuestion[], max: number): PermissionQuestion[] {
+  return questions.map((question) => question.d === undefined
+    ? question
+    : { ...question, d: question.d.map((description) => capPermissionWireText(description, max)) });
+}
 
 /** Ellipsis-cap shared by the blob builder and the answer re-mapper, so the two can never disagree
  *  about what the phone was actually shown. Count Unicode code points rather than UTF-16 code units
@@ -741,18 +758,20 @@ export function fitPermissionDetail(
   const worstCase = all.length; // most digits `permissionDetailOmitted` can ever take
 
   // The QUESTIONS are the actionable part of a question card (the detail is only context), so they get
-  // first claim on the budget. Descriptions are useful but non-actionable and therefore shed FIRST:
-  // keep the full questions when they fit with NO detail, otherwise retry the entire label-only picker,
-  // otherwise omit the entire picker. A partial question or option list would be a lie, and the phone
-  // degrades cleanly to the read-only prompt when the field is absent. Candidates are measured WITH the
-  // worst-case `permissionDetailOmitted`, so the chosen variant stays valid even on the
-  // drop-the-detail-entirely branch below (where that key is present and the detail is not).
+  // first claim on the budget. Descriptions are useful but non-actionable and therefore shed FIRST —
+  // GRADUALLY though, not all at once: try the full descriptions, then each rung of the cap ladder, then
+  // the label-only picker, then omit the picker entirely. Only descriptions are ever shortened this way;
+  // a partial question or option LIST would be a lie, and the phone degrades cleanly to the read-only
+  // prompt when the field is absent. Candidates are measured WITH the worst-case
+  // `permissionDetailOmitted`, so the chosen variant stays valid even on the drop-the-detail-entirely
+  // branch below (where that key is present and the detail is not).
   const bareQuestions = questions.map(({ d: _descriptions, ...question }) => question);
-  const kept = questions.length > 0 && measure("", worstCase, questions) <= maxChars
-    ? questions
-    : bareQuestions.length > 0 && measure("", worstCase, bareQuestions) <= maxChars
-    ? bareQuestions
-    : [];
+  const candidates = questions.length === 0 ? [] : [
+    questions,
+    ...QUESTION_DESCRIPTION_LADDER.map((max) => withDescriptionCap(questions, max)),
+    bareQuestions,
+  ];
+  const kept = candidates.find((candidate) => measure("", worstCase, candidate) <= maxChars) ?? [];
   const tail = kept.length > 0 ? { questions: kept } : {};
 
   const frameChars = (d: string, omitted: number): number => measure(d, omitted, kept);

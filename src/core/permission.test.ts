@@ -240,7 +240,7 @@ describe("buildPermissionQuestions", () => {
     ]);
   });
 
-  test("descriptions stay label-aligned, cap at 160 code points, and are omitted when all empty", () => {
+  test("descriptions stay label-aligned, cap at 600 code points, and are omitted when all empty", () => {
     const [described] = buildPermissionQuestions({
       questions: [{
         question: "Pick one",
@@ -248,15 +248,25 @@ describe("buildPermissionQuestions", () => {
           { label: "A" },
           { label: "discard me", description: "wrong row" },
           { label: "", description: "must not shift" },
-          { label: "B", description: "😀".repeat(200) },
+          { label: "B", description: "😀".repeat(700) },
         ],
       }],
     });
     expect(described.o).toEqual(["A", "discard me", "B"]);
     expect(described.d?.[0]).toBe("");
     expect(described.d?.[1]).toBe("wrong row");
-    expect(described.d?.[2]).toBe(`${"😀".repeat(159)}…`);
-    expect([...(described.d?.[2] ?? "")]).toHaveLength(160);
+    expect(described.d?.[2]).toBe(`${"😀".repeat(599)}…`);
+    expect([...(described.d?.[2] ?? "")]).toHaveLength(600);
+
+    // A description that used to be amputated at 160 now rides WHOLE — the phone opens the selected row
+    // to full height, so anything the ceiling cut was simply unreadable.
+    const realistic = "Rewrites the parser to a recursive-descent design. Slower to land than patching the "
+      + "existing regex path, but it fixes the whole class of nesting bugs instead of the one reported, "
+      + "and it gives the error messages a place to point at.";
+    expect(realistic.length).toBeGreaterThan(160);
+    expect(buildPermissionQuestions({
+      questions: [{ question: "Pick one", options: [{ label: "Rewrite", description: realistic }] }],
+    })[0].d?.[0]).toBe(realistic);
 
     expect(buildPermissionQuestions({
       questions: [{ question: "No descriptions", options: [{ label: "A" }, { label: "B", description: "" }] }],
@@ -395,6 +405,33 @@ describe("fitPermissionDetail", () => {
     expect(fitPermissionDetail(base, "", fullBudget, questions).questions).toEqual(questions);
     expect(fitPermissionDetail(base, "", bareBudget, questions).questions).toEqual(bare);
     expect(fitPermissionDetail(base, "", bareBudget - 4, questions)).toEqual({ detail: "", omitted: 0 });
+  });
+
+  test("a description too long for the budget is SHORTENED, not thrown away with every other one", () => {
+    // The all-or-nothing shed meant one fat description sank the short ones beside it. With the ladder,
+    // the budget between "everything fits" and "nothing fits" buys capped descriptions instead of none.
+    const questions = buildPermissionQuestions({
+      questions: [{
+        question: "Choose",
+        options: [
+          { label: "Fast", description: "Smallest safe change" },
+          { label: "Thorough", description: "H".repeat(600) },
+        ],
+      }],
+    });
+    const bare = questions.map(({ d: _descriptions, ...question }) => question);
+    const frameChars = (qs: typeof questions) => sealedBlobChars(new TextEncoder().encode(JSON.stringify({
+      ...base, permissionQuestions: qs,
+    })).length);
+
+    // One char under "the whole thing fits": the widest rung that fits rides, and BOTH descriptions
+    // survive — the short one whole, the long one ellipsis-capped.
+    const kept = fitPermissionDetail(base, "", frameChars(questions) - 1, questions).questions;
+    expect(kept).not.toEqual(bare);
+    expect(kept?.[0].d?.[0]).toBe("Smallest safe change");
+    expect(kept?.[0].d?.[1].endsWith("…")).toBe(true);
+    expect([...(kept?.[0].d?.[1] ?? "")].length).toBeLessThan(600);
+    expect(frameChars(kept ?? [])).toBeLessThanOrEqual(frameChars(questions) - 1);
   });
 
   test("a long plan keeps FAR more than the old 400-char cap and still fits the blob ceiling", () => {
