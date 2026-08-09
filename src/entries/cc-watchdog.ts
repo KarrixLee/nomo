@@ -46,7 +46,7 @@ import { stateHoldLive } from "../core/session-state";
 import { resolveOnRelay } from "../core/codex-remote-input";
 import type { DecisionHold, PlanPickerTraceDecision } from "../core/shared";
 import {
-  AgentKind, appendCodexBridgeMarker, appendFittedPlanAndDebug, atomicWrite, CC_DIR, CCOp, CCStatus, codexAppServerSocketAvailable, Config, completePendingPairing, formatPlanPickerDebug, formatWatchdogPidfile,
+  AgentKind, appendCodexBridgeMarker, appendFittedPlanAndDebug, atomicWrite, CC_DIR, CCOp, CCStatus, codexAppServerSocketAvailable, Config, completePendingPairing, DECISION_HOLD_SUFFIX, decisionHoldFileName, formatPlanPickerDebug, formatWatchdogPidfile,
   startCodexAppServerDaemon,
   GONE_STRIKE_LIMIT, loadConfig, loadPendingConfig, localApprovalsState,
   PAIR_HTML_FILE, PairPollResult, parseWatchdogPidfile, PendingConfig, pidAlive, PLUGIN_VERSION, readDecisionHoldAt, readPrefix, readSuffix, recordGoneStrike, removeRevokedConfig,
@@ -1182,7 +1182,8 @@ export type FocusTraceResult =
 
 /** The module's generic best-effort trace, with the same argv guard tracePicker uses: pure unit calls run
  *  inside `bun test` with the production HOME visible and must never pollute the user's live trace. Named
- *  for its first caller; also carries the "lan", "retire" and "pending-done" breadcrumbs. */
+ *  for its first caller; also carries the "lan", "retire", "pending-done", "interrupt" and "hold-prune"
+ *  breadcrumbs. */
 function traceFocus(deps: { trace?: (event: object) => void }, event: object): void {
   if (deps.trace) {
     try { deps.trace(event); } catch { /* diagnostics only */ }
@@ -1774,6 +1775,69 @@ export async function reconcileProvisionalsSweep(config: Config, deps: SweepReco
   }
 }
 
+// --- The live-decision-hold gate shared by every corrective that POSTs an op:"done" -------------
+//
+// WHY. A blocking permission hook holds the terminal dialog open and polls for the phone's Allow/Deny;
+// while it does, the sealed `decisionPending` card it POSTed is the session's true state. The worker
+// stores that card, and the `permissionRequestId` the phone answers with rides INSIDE the sealed blob —
+// so any op:"done" frame delivered mid-hold overwrites the card, the phone recomputes the row as a plain
+// needsAttention, and the approval becomes unanswerable from the app (the yellow hand only NOTIFIES;
+// only the violet card offers Allow/Deny). Field report 2026-08-09: a corrective done landed 12.0 s into
+// a hold that was still polling, and the prompt could then only be answered at the Mac.
+//
+// WHY THE CORRECTIVES CANNOT SEE IT. Every net in this file reads the session RECORD, and a record
+// mid-hold is byte-for-byte indistinguishable from an abandoned needsAttention: the permission hook never
+// writes the record, and CC's own `Notification` hook stamps the same prio:1/needsAttention it would
+// stamp for a prompt nobody is watching. The `.hold` marker beside the record is the missing fact.
+//
+// ONE PREDICATE, NOT A SECOND NOTION OF LIVENESS. `stateHoldLive` is how the LAN state feed already
+// decides this exact question (marker present with a blob, HOLDER pid alive, inside
+// STATE_HOLD_MAX_AGE_MS), so the gate is that predicate and nothing else — a divergent local rule would
+// be a second bug waiting to disagree with the frame the phone is rendering.
+//
+// A STALE MARKER SUPPRESSES NOTHING. `clearDecisionHold` runs from the hook's `finally`, which a SIGKILL
+// (or the SIGTERM a closed terminal sends) never reaches, so killed hooks leak markers — three were
+// found on the reporter's disk, one four days old (see pruneStaleDecisionHolds). Because liveness
+// requires the holder pid to still exist, a leaked marker gates nothing and a genuinely interrupted
+// session still settles. That is the property that keeps this fix from trading a P0 for a stuck row.
+//
+// SUPPRESSION IS A DEFERRAL, NOT A DECISION. Nothing is written when the gate closes — no record
+// rewrite, no `doneAttempts` bump — so the corrective is simply re-derived from disk next sweep. The
+// moment the hold clears, the same net reaches the same conclusion and delivers it.
+
+/** The two probes the hold gate needs, injectable so each corrective's tests can drive it with no real
+ *  marker and no real process (the same seam pair DrainCommandsDeps exposes for Open-on-Mac's release). */
+export interface DecisionHoldGateDeps {
+  /** Read the `.hold` marker beside this session's record. */
+  readDecisionHoldFn?: (sessionId: string) => Promise<DecisionHold | null>;
+  /** Is the HOLDING hook's pid still alive? */
+  holdPidAliveFn?: (pid: number) => boolean;
+}
+
+/** Is a remote-approval prompt for this session LIVE right now — i.e. is there a phone-answerable card
+ *  that an op:"done" would overwrite?
+ *
+ *  FAILS OPEN (false) on any error, deliberately: failing open restores the pre-gate behavior, whereas
+ *  failing closed on an unreadable directory would suppress every corrective on the machine. */
+export async function decisionHoldIsLive(
+  sessionId: string, now: number, deps: DecisionHoldGateDeps = {},
+): Promise<boolean> {
+  try {
+    const readHold = deps.readDecisionHoldFn ?? (
+      // Under `bun test` the default must never read the DEVELOPER's real session directory — the same
+      // guard releaseFocusedTuiUserInputHold's seam uses. Tests inject the reader.
+      lanRunningUnderTest() ? async () => null : (id: string) => readDecisionHoldAt(SESSIONS_DIR, id)
+    );
+    const hold = await readHold(sessionId);
+    const alive = hold && typeof hold.pid === "number"
+      ? (deps.holdPidAliveFn ?? pidAlive)(hold.pid)
+      : false;
+    return stateHoldLive(hold, alive, now);
+  } catch {
+    return false;
+  }
+}
+
 // --- Transcript interrupt recovery net -------------------------------------------------------
 //
 // An Esc-interrupt or a denied permission fires NO hook (on either agent), so the phone sticks on
@@ -1818,12 +1882,33 @@ export function shouldInterruptCheck(record: SessionRecord, now: number): boolea
 }
 
 /** Injectable side-effect seams for the interrupt net, so its settle/retry logic is testable without
- *  real fs/network. `now` clocks the corrective done's envelope ts + the record rewrite. */
-export interface InterruptDeps {
+ *  real fs/network. `now` clocks the corrective done's envelope ts + the record rewrite. The hold-gate
+ *  seams come from DecisionHoldGateDeps (see decisionHoldIsLive). */
+export interface InterruptDeps extends DecisionHoldGateDeps {
   post?: (body: object) => Promise<PostOutcome>;
   readTail?: (path: string, bytes: number) => Promise<string>;
   writeRecord?: (path: string, rec: SessionRecord) => Promise<void>;
   now?: () => number;
+  /** Diagnostics seam, mirroring PendingDoneDeps'. Defaults to the session trace (argv-guarded). This
+   *  net emitted NOTHING for its whole life, which is why attributing the 2026-08-09 P0 to it needed
+   *  inference from the record's shape rather than a log line. */
+  trace?: (event: object) => void;
+}
+
+/** The record the interrupt net pins when its corrective done is settled (delivered, or capped locally).
+ *
+ *  `prio: 0` IS THE FIX FOR A SECOND, LATENT DEFECT. This pin is reached from a `needsAttention` record —
+ *  op:"update"/prio:1 — and the old spread `{ ...record, op: "done" }` carried that prio:1 onto a TERMINAL
+ *  record, which is self-contradictory: buildDoneEnvelope hard-codes prio:0, so the frame the worker was
+ *  handed and the record left on disk disagreed about the same event. Two readers of `record.prio` then
+ *  read the stale attention marker off a finished row: lanFrameContent (core/lan-frames.ts) shipped a
+ *  contradictory op:"done"/prio:1 LAN frame, and — because it gates `attentionKind` on exactly that
+ *  prio — re-attached the finished episode's question discriminator to it. Stamping prio:0 makes the
+ *  record say what the wire says. It cannot resurrect anything: nothing anywhere keys "show the card" on
+ *  prio:0, and every guard that keys on prio:1 (settleDecisionHoldRecordAt, isWaitingSession,
+ *  computeSessionState's needsAttention rung) already short-circuits on the terminal `done` this pin sets. */
+function doneSettledRecord(record: SessionRecord): SessionRecord {
+  return { ...record, lastEvent: "done", sentDone: true, op: "done", prio: 0, doneAttempts: undefined };
 }
 
 /** The interrupt recovery net for one still-alive session. Gated by shouldInterruptCheck, then it tails
@@ -1869,6 +1954,16 @@ export async function correctInterrupt(
     }
     const agent: AgentKind = record.agent === "codex" ? "codex" : "claude";
     if (!tailShowsInterrupt(tail, agent)) return "uncorrected"; // live turn or no interrupt → leave it
+    // THE LIVE-HOLD GATE (see decisionHoldIsLive). A remote approval is open on THIS session, so the
+    // interrupt marker in the tail describes an earlier abort, not the prompt the user is looking at —
+    // and a done now would overwrite the only frame that carries Allow/Deny. Read here rather than at the
+    // gate above so the marker costs one file read per CONFIRMED interrupt instead of one per sweep per
+    // parked session. Verdict "uncorrected", not "pending": while the card is up this session is an
+    // ordinary parked row, and the waiting heartbeat should keep it fresh exactly as it does any other.
+    if (await decisionHoldIsLive(sessionId, now, deps)) {
+      traceFocus(deps, { event: "interrupt", sessionId, outcome: "held", delivered: false, held: true });
+      return "uncorrected";
+    }
     // The interrupt is CONFIRMED from here — the session is decided done regardless of this POST's fate.
     // Bounded against disk AND this process's memory, so a record rewrite that keeps failing (full disk /
     // read-only home) can't reset the counter to zero every sweep and re-POST a doomed done forever.
@@ -1878,22 +1973,29 @@ export async function correctInterrupt(
     // backstop. "pending": interrupt handled (caller skips the heartbeat), not delivered.
     if (attempts >= INTERRUPT_DONE_MAX_ATTEMPTS) {
       try {
-        await writeRecord(path, { ...record, lastEvent: "done", sentDone: true, op: "done", doneAttempts: undefined });
+        await writeRecord(path, doneSettledRecord(record));
         clearDoneAttempts(sessionId); // pinned done ON DISK → the gate closes; the bound has done its job
       } catch {
         // The pin didn't land, so the gate stays OPEN and this net will be asked again next sweep. KEEP
         // the in-memory count: clearing it here would restart the whole retry cycle every cap, which is
         // exactly the unbounded re-POST spin the memory mirror exists to stop.
       }
+      traceFocus(deps, { event: "interrupt", sessionId, outcome: "capped", attempts, delivered: false, held: false });
       return "pending";
     }
     // The interrupt was just detected, so the corrective done's `at` is the OBSERVED now (epoch seconds).
     const doneNow = clock();
     const outcome = await post(await buildDoneEnvelope(sessionId, record, doneNow, config.e2eKey, agent, Math.floor(doneNow / 1000)));
+    // One line per attempt, whatever happens — the same discipline correctPendingDone follows. Until now
+    // this net was completely silent, so "which producer overwrote the decision card?" had to be inferred
+    // from the record it left behind (the 2026-08-09 P0). `held` names the gate above either way.
+    traceFocus(deps, {
+      event: "interrupt", sessionId, outcome, attempts, delivered: outcome === "delivered", held: false,
+    });
     if (outcome === "revoked") return "revoked"; // pairing gone → bubble up so the loop can tear down
     if (outcome === "delivered") {
       // 2xx: pin the session done and CLEAR the retry counter so the gate skips it and the next hook re-arms.
-      try { await writeRecord(path, { ...record, lastEvent: "done", sentDone: true, op: "done", doneAttempts: undefined }); } catch {
+      try { await writeRecord(path, doneSettledRecord(record)); } catch {
         // Rewrite failed — worst case the net re-POSTs a done next sweep, which the worker drops.
       }
       clearDoneAttempts(sessionId);
@@ -2161,8 +2263,9 @@ function idleReapAgeEligible(
 }
 
 /** Injectable side-effect seams for the idle-session reap, so its settle/retry logic is testable without
- *  real fs/network — mirrors InterruptDeps. Codex's extra seams enforce its TUI + exact-rollout proof. */
-export interface IdleReapDeps {
+ *  real fs/network — mirrors InterruptDeps (including its hold-gate seams). Codex's extra seams enforce
+ *  its TUI + exact-rollout proof. */
+export interface IdleReapDeps extends DecisionHoldGateDeps {
   post?: (body: object) => Promise<PostOutcome>;
   writeRecord?: (path: string, rec: SessionRecord) => Promise<void>;
   locateTuiPid?: (sessionId: string, record: SessionRecord) => Promise<number | undefined>;
@@ -2242,6 +2345,12 @@ export async function correctIdleClaude(
     } else if (!isClaudeIdleReapEligible(record, now)) {
       return "uncorrected";
     }
+    // THE LIVE-HOLD GATE — the same rule the interrupt net applies (see decisionHoldIsLive): a session
+    // with an open Allow/Deny card is not idle, whatever its clocks say. Reachable when the record still
+    // reads a long-silent `working`/`sessionStart` mid-hold, i.e. CC's permission `Notification` (which
+    // would have written needsAttention, a state this reap already excludes) was dropped. Deferral, never
+    // a write: the reap re-derives the same verdict on any later sweep once the hold is gone.
+    if (await decisionHoldIsLive(sessionId, now, deps)) return "uncorrected";
     // Bounded against disk AND memory (see effectiveDoneAttempts) — a persistently-failing record write
     // must not reset the reap's retry budget to zero on every sweep.
     const attempts = effectiveDoneAttempts(record, sessionId);
@@ -2329,7 +2438,7 @@ export function shouldPendingDoneCheck(record: SessionRecord): boolean {
 
 /** Injectable seams for the undelivered-done net, mirroring IdleReapDeps. `now` clocks the re-POSTed
  *  envelope's ts (its blob `at` stays FROZEN at the record's real done time — see below). */
-export interface PendingDoneDeps {
+export interface PendingDoneDeps extends DecisionHoldGateDeps {
   post?: (body: object) => Promise<PostOutcome>;
   writeRecord?: (path: string, rec: SessionRecord) => Promise<void>;
   /** Re-reads the record from disk immediately before a write, so a hook that landed DURING the POST is
@@ -2373,6 +2482,19 @@ export async function correctPendingDone(
   const clock = deps.now ?? Date.now;
   try {
     if (!shouldPendingDoneCheck(record)) return "uncorrected";
+    // THE LIVE-HOLD GATE (see decisionHoldIsLive). Re-paying the done debt over an open Allow/Deny card
+    // costs the user the only frame they can answer, and the debt is DURABLE — `donePending` stays on the
+    // record — so deferring costs one sweep and loses nothing. Checked before anything else: this net's
+    // very first act would otherwise be the POST.
+    //
+    // "pending", NOT "uncorrected", and that is the load-bearing part: "pending" makes this net the
+    // session's OWNER for the sweep, which is what stands retireDoneStale down. A donePending record is
+    // terminal-done by construction, so an hour-old one is retire-eligible — and a retire would DELETE
+    // the row out from under the open prompt, the same P0 wearing an op:"end".
+    if (await decisionHoldIsLive(sessionId, now, deps)) {
+      traceFocus(deps, { event: "pending-done", sessionId, outcome: "held", delivered: false, held: true });
+      return "pending";
+    }
     const agent: AgentKind = record.agent === "codex" ? "codex" : "claude";
     // The settled record: the debt dropped and the terminal done state pinned (the hook already wrote
     // these, but a watchdog rewrite between then and now could have moved them — pin explicitly). It is
@@ -2824,6 +2946,66 @@ export function heartbeatKind(
   return "none";
 }
 
+// --- Stale `.hold` marker housekeeping ---------------------------------------------------------
+//
+// `clearDecisionHold` runs from the permission hook's `finally`, which a SIGKILL — or the SIGTERM a closed
+// terminal sends — never reaches, so a killed hook leaves its marker behind forever. Three leftovers were
+// found on the reporter's disk on 2026-08-09, one of them four days old, all with dead holder pids.
+//
+// The leak was harmless while a marker was only ever read to DECIDE A FRAME (both stateHoldLive and
+// lanHoldLive require the holder pid alive, so an orphan already rendered nothing). It stops being
+// harmless now that a live marker SUPPRESSES the done correctives: the pid probe is what keeps an orphan
+// from wedging a session, and this sweep is the housekeeping half, so the sessions directory does not
+// accumulate one file per killed hook indefinitely.
+//
+// CONSERVATIVE BY DESIGN — only a marker NOBODY COULD OWN is removed: unreadable/corrupt
+// (writeDecisionHoldAt goes through atomicWrite's rename, so a reader never sees a partial file — a parse
+// failure is real corruption), no usable holder pid, or a holder pid that is gone. A marker whose holder
+// is still ALIVE is left alone even past its TTL: every reader already ignores it, and unlinking a file a
+// live hook still expects to compare-and-clear (clearDecisionHoldAt) buys nothing.
+
+/** Injectable seams for the stale-marker sweep. The defaults are inert under `bun test` — a unit test
+ *  sees the developer's REAL session directory, and unlinking their live markers is not acceptable. */
+export interface PruneHoldsDeps {
+  readHold?: (sessionId: string) => Promise<DecisionHold | null>;
+  isAlive?: (pid: number) => boolean;
+  removeHold?: (sessionId: string) => Promise<void>;
+  trace?: (event: object) => void;
+}
+
+/** Remove every `.hold` marker among `files` (one SESSIONS_DIR listing, which the sweep already has)
+ *  whose holding process is gone. Returns how many were removed. Best-effort; never throws. */
+export async function pruneStaleDecisionHolds(files: string[], deps: PruneHoldsDeps = {}): Promise<number> {
+  const inert = lanRunningUnderTest();
+  // Fully inert under `bun test` unless a test injected its own seams: a unit test sees the DEVELOPER's
+  // real session directory, and neither reading nor unlinking their live markers is acceptable.
+  if (inert && deps.readHold === undefined && deps.removeHold === undefined) return 0;
+  const readHold = deps.readHold
+    ?? (inert ? async () => null : (id: string) => readDecisionHoldAt(SESSIONS_DIR, id));
+  const removeHold = deps.removeHold ?? (inert ? async () => {} : async (id: string) => {
+    await unlink(`${SESSIONS_DIR}/${decisionHoldFileName(id)}`).catch(() => {});
+  });
+  const isAlive = deps.isAlive ?? pidAlive;
+  let removed = 0;
+  for (const file of files) {
+    if (!file.endsWith(DECISION_HOLD_SUFFIX)) continue;
+    const sessionId = basename(file, DECISION_HOLD_SUFFIX);
+    if (sessionId.length === 0) continue;
+    let hold: DecisionHold | null = null;
+    try { hold = await readHold(sessionId); } catch { hold = null; }
+    if (hold && typeof hold.pid === "number" && Number.isFinite(hold.pid)) {
+      // A THROWING probe counts as alive: this sweep may only ever remove a marker it has POSITIVELY
+      // established nobody owns. Guessing the other way would delete a card the user is looking at.
+      let alive = true;
+      try { alive = isAlive(hold.pid); } catch { alive = true; }
+      if (alive) continue;
+    }
+    try { await removeHold(sessionId); removed++; } catch { /* best-effort, like every write here */ }
+  }
+  if (removed > 0) traceFocus(deps, { event: "hold-prune", removed });
+  return removed;
+}
+
 /** The pairing-wide clock behind the waiting fast beat (in-memory, exactly like heartbeatAt: a
  *  waiting session is by definition alive, so the daemon outlives the wait it is throttling). */
 let waitingBeatAt: number | undefined;
@@ -2852,6 +3034,10 @@ async function sweep(config: Config | null, deps: SweepDeps = {}): Promise<Sweep
     return { revoked: false, remaining: 0, delivered: false }; // no sessions dir yet → nothing to reap
   }
   const now = Date.now();
+  // Housekeeping FIRST, off the listing we already have: retire the `.hold` markers of hooks that were
+  // killed before their `finally` could compare-and-clear. An orphan gates nothing (the correctives'
+  // hold gate probes the holder pid), but the directory must not grow one per killed hook forever.
+  await pruneStaleDecisionHolds(files);
   let remaining = 0;
   // Any 2xx POST this sweep proves the pairing is alive → the loop resets the gone-strike streak, so a
   // real success from EITHER the watchdog or the hook clears a stray transient strike.

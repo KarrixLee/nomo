@@ -16,7 +16,7 @@ import {
   COMMAND_FUTURE_SKEW_MS, COMMAND_TTL_MS, commandIsFresh,
   codexBridgeIsDown, correctPendingApproval, correctPendingDone, correctPlanPickerVerification, correctResolvedPlanPicker, createBridgeSupervisor, discoverLiveSessions, drainCommands, effectiveDoneAttempts, extractCommands, goneStrikeShouldTeardown,
   enforceWatchdogOwnership, hasInterruptMarker, IDLE_GRACE_MS, isClaudeIdleReapEligible, isRetireEligible, isRightfulWatchdogOwner, lastTurnLine, PAIRING_TTL_MS, pendingDoneRetryWrite,
-  pendingDoneSettleWrite, pendingPairingExpired, planPickerPendingExpired, PLAN_PICKER_PENDING_MAX_MS,
+  pendingDoneSettleWrite, pendingPairingExpired, planPickerPendingExpired, PLAN_PICKER_PENDING_MAX_MS, pruneStaleDecisionHolds,
   PLAN_PICKER_RECENT_DONE_MS, PLAN_PICKER_VERIFY_MAX_MS, RETIRE_AFTER_MS,
   buildWorkingEnvelope, postOutcomeForStatus, provisionalsCoveredByReal, reconcileProvisionalsSweep, recordMovedSince, resetCommandState, resetDoneAttemptMemory, retireDoneStale,
   setCodexBridgeDown, shouldHeartbeat, shouldIdleProvisionalCheck,
@@ -26,6 +26,7 @@ import {
 } from "./cc-watchdog";
 import type { CommandPayload, DrainCommandsDeps, PostOutcome, RecordEntry } from "./cc-watchdog";
 import { resolveOnRelay } from "../core/codex-remote-input";
+import { STATE_HOLD_MAX_AGE_MS } from "../core/session-state";
 import { claudeAdapter, codexAdapter } from "../core/adapter";
 import type { AgentAdapter, DiscoveredSession } from "../core/adapter";
 import type { Config, PendingConfig } from "../core/shared";
@@ -2404,6 +2405,262 @@ describe("correctInterrupt (settle an interrupted session — the done pin stick
     });
     expect(v).toBe("uncorrected");
     expect(posted).toBe(false);
+  });
+});
+
+// --- the live-decision-hold gate on the op:"done" correctives ---------------------------------
+//
+// P0, 2026-08-09. While a Claude permission approval is HELD (the blocking hook is polling for the
+// phone's Allow/Deny), the watchdog's correctives POSTed `op:"done"` for that very session. The worker
+// stores the done over the sealed `decisionPending` blob, and because `permissionRequestId` rides INSIDE
+// that blob the phone then computes `isHeld == false` and renders the yellow needsAttention hand — which
+// by design only NOTIFIES. Only the violet card offers Allow/Deny, so the approval became unanswerable
+// from the phone. Log-proven: `op:"done", sentDone:true` stamped 12.0 s into a hold that was still
+// polling. The correctives read the RECORD, and a record mid-hold is indistinguishable from an abandoned
+// needsAttention — the `.hold` marker beside it is the missing fact, and `stateHoldLive` (the LAN state
+// feed's own predicate) is the gate.
+//
+// The gate must be exactly as robust as that predicate: a marker whose HOLDER PID IS GONE — the leak a
+// SIGTERMed hook leaves, three of them observed on the reporter's disk — must suppress NOTHING, or a P0
+// would have been traded for a permanently un-settleable row.
+
+describe("live-decision-hold gate: no op:done corrective may land while an approval is held", () => {
+  const NOW = 9_000_000;
+  const HOLDER = 51_515;
+  const liveHold = (over: Partial<DecisionHold> = {}): DecisionHold =>
+    ({ blob: "SEALED-CARD", at: NOW - 12_000, pid: HOLDER, ...over }); // 12.0 s in, exactly as reported
+  /** The gate's two seams, wired to a hold whose holder is ALIVE. */
+  const held = { readDecisionHoldFn: async () => liveHold(), holdPidAliveFn: (p: number) => p === HOLDER };
+  /** A LEAKED marker: same file, but the hook that owned it is gone. */
+  const stale = { readDecisionHoldFn: async () => liveHold(), holdPidAliveFn: () => false };
+  /** The hold answered/released — the marker is gone from disk. */
+  const cleared = { readDecisionHoldFn: async () => null, holdPidAliveFn: () => true };
+
+  describe("correctInterrupt (the prime producer: a needsAttention record + an interrupt marker)", () => {
+    const interruptTail = asstTurn("[Request interrupted by user]");
+    const attn = (over: Partial<SessionRecord> = {}): SessionRecord =>
+      irec({ lastEvent: "needsAttention", op: "update", prio: 1, blob: "ATTN", transcript: "/tmp/t.jsonl", ...over });
+    const seams = (extra: object) => ({
+      readTail: async () => interruptTail,
+      ...extra,
+    });
+
+    test("a LIVE hold suppresses the corrective done entirely — nothing POSTed, nothing written", async () => {
+      const posts: object[] = [];
+      const writes: SessionRecord[] = [];
+      const traces: object[] = [];
+      const v = await correctInterrupt(cfg(), "/tmp/s.json", "s", attn(), NOW, seams({
+        post: async (b: object) => { posts.push(b); return "delivered" as PostOutcome; },
+        writeRecord: async (_p: string, r: SessionRecord) => { writes.push(r); },
+        trace: (e: object) => { traces.push(e); },
+        ...held,
+      }));
+      expect(posts).toEqual([]);           // THE BUG: this was one op:"done" over the user's open card
+      expect(writes).toEqual([]);          // and no local done-pin either — the session is NOT settled
+      expect(v).toBe("uncorrected");       // the heartbeat/other nets carry on exactly as for any parked row
+      expect(traces).toContainEqual({ event: "interrupt", sessionId: "s", outcome: "held", delivered: false, held: true });
+    });
+
+    test("a STALE hold (holder pid gone) does NOT suppress it — the leak can never wedge a session", async () => {
+      const posts: object[] = [];
+      const writes: SessionRecord[] = [];
+      const v = await correctInterrupt(cfg(), "/tmp/s.json", "s", attn(), NOW, seams({
+        post: async (b: object) => { posts.push(b); return "delivered" as PostOutcome; },
+        writeRecord: async (_p: string, r: SessionRecord) => { writes.push(r); },
+        ...stale,
+      }));
+      expect(v).toBe("corrected");
+      expect(posts).toHaveLength(1);
+      expect(posts[0]).toMatchObject({ op: "done" });
+      expect(writes[0]).toMatchObject({ lastEvent: "done", op: "done", sentDone: true });
+    });
+
+    test("a hold past the TTL with a live holder does not suppress it either (same ceiling as the feed)", async () => {
+      const posts: object[] = [];
+      const v = await correctInterrupt(cfg(), "/tmp/s.json", "s", attn(), NOW, seams({
+        post: async (b: object) => { posts.push(b); return "delivered" as PostOutcome; },
+        writeRecord: async () => {},
+        readDecisionHoldFn: async () => liveHold({ at: NOW - STATE_HOLD_MAX_AGE_MS - 1 }),
+        holdPidAliveFn: () => true,
+      }));
+      expect(v).toBe("corrected");
+      expect(posts).toHaveLength(1);
+    });
+
+    test("once the hold CLEARS the deferred corrective fires on the next sweep (suppression wrote nothing)", async () => {
+      const record = attn();
+      const posts: object[] = [];
+      // Sweep 1: held → deferred, and crucially no counter/pin was persisted…
+      const first = await correctInterrupt(cfg(), "/tmp/s.json", "s", record, NOW, seams({
+        post: async (b: object) => { posts.push(b); return "delivered" as PostOutcome; },
+        writeRecord: async () => { throw new Error("must not write while held"); },
+        ...held,
+      }));
+      expect(first).toBe("uncorrected");
+      expect(record).toMatchObject({ lastEvent: "needsAttention", op: "update" }); // …the record is untouched
+      expect(effectiveDoneAttempts(record, "s")).toBe(0);                          // …and no attempt was burnt
+      // Sweep 2: the user answered, the hook released its marker → the same record settles normally.
+      const writes: SessionRecord[] = [];
+      const second = await correctInterrupt(cfg(), "/tmp/s.json", "s", record, NOW + 5_000, seams({
+        post: async (b: object) => { posts.push(b); return "delivered" as PostOutcome; },
+        writeRecord: async (_p: string, r: SessionRecord) => { writes.push(r); },
+        ...cleared,
+      }));
+      expect(second).toBe("corrected");
+      expect(posts).toHaveLength(1);
+      expect(writes[0]).toMatchObject({ lastEvent: "done", op: "done" });
+    });
+
+    test("the done-pin no longer carries the needsAttention prio:1 forward (a done frame is prio 0)", async () => {
+      const writes: SessionRecord[] = [];
+      await correctInterrupt(cfg(), "/tmp/s.json", "s", attn(), NOW, seams({
+        post: async () => "delivered" as PostOutcome,
+        writeRecord: async (_p: string, r: SessionRecord) => { writes.push(r); },
+        ...cleared,
+      }));
+      // `{...record, op:"done"}` used to leave prio:1 on a terminal record, and lanFrameContent then
+      // shipped a contradictory op:"done"/prio:1 LAN frame (and re-attached the episode's attentionKind).
+      expect(writes[0].prio).toBe(0);
+    });
+
+    test("the local done-pin at the retry cap is gated too (the cap must not settle a held session)", async () => {
+      const writes: SessionRecord[] = [];
+      let last = attn({ doneAttempts: 5 }); // already at INTERRUPT_DONE_MAX_ATTEMPTS
+      const v = await correctInterrupt(cfg(), "/tmp/s.json", "s", last, NOW, seams({
+        post: async () => "failed" as PostOutcome,
+        writeRecord: async (_p: string, r: SessionRecord) => { writes.push(r); last = r; },
+        ...held,
+      }));
+      expect(v).toBe("uncorrected");
+      expect(writes).toEqual([]); // the cap's LOCAL pin is a done too — it would strand the card offline
+    });
+  });
+
+  describe("correctPendingDone (the undelivered-done debt must not be paid over an open card)", () => {
+    const owed = (over: Partial<SessionRecord> = {}): SessionRecord =>
+      rec({ lastEvent: "done", op: "done", sentDone: true, donePending: true, blob: "B", ts: NOW - 30_000, ...over });
+
+    test("a LIVE hold defers the re-POST and OWNS the sweep (so the retire net stands down too)", async () => {
+      const posts: object[] = [];
+      const writes: SessionRecord[] = [];
+      const v = await correctPendingDone(cfg(), "/tmp/s.json", "s", owed(), NOW, {
+        post: async (b) => { posts.push(b); return "delivered" as PostOutcome; },
+        writeRecord: async (_p, r) => { writes.push(r); },
+        ...held,
+      });
+      expect(posts).toEqual([]);
+      expect(writes).toEqual([]);
+      // "pending", NOT "uncorrected": pending makes this net the session's owner for the sweep, which is
+      // what holds retireDoneStale off — a retire would DELETE the row under the open prompt instead.
+      expect(v).toBe("pending");
+    });
+
+    test("the debt survives the deferral: donePending is still set, so a later sweep pays it", async () => {
+      const record = owed();
+      await correctPendingDone(cfg(), "/tmp/s.json", "s", record, NOW, {
+        post: async () => "delivered" as PostOutcome, writeRecord: async () => {}, ...held,
+      });
+      expect(record.donePending).toBe(true);
+      expect(shouldPendingDoneCheck(record)).toBe(true);
+      const posts: object[] = [];
+      const v = await correctPendingDone(cfg(), "/tmp/s.json", "s", record, NOW + 5_000, {
+        post: async (b) => { posts.push(b); return "delivered" as PostOutcome; },
+        writeRecord: async () => {}, readRecord: async () => record, ...cleared,
+      });
+      expect(v).toBe("corrected");
+      expect(posts).toHaveLength(1);
+    });
+
+    test("a STALE hold does NOT defer it — the debt is still settled", async () => {
+      const posts: object[] = [];
+      const v = await correctPendingDone(cfg(), "/tmp/s.json", "s", owed(), NOW, {
+        post: async (b) => { posts.push(b); return "delivered" as PostOutcome; },
+        writeRecord: async () => {}, readRecord: async () => owed(), ...stale,
+      });
+      expect(v).toBe("corrected");
+      expect(posts).toHaveLength(1);
+    });
+  });
+
+  describe("correctIdleClaude (a session with an open card is not idle, whatever its clocks say)", () => {
+    const R_MS = 1_800_000; // CLAUDE_IDLE_REAP_MS
+    // Reap-eligible by the clock, and mid-hold: reachable when CC's permission Notification hook (which
+    // would have written needsAttention) was dropped, so the record still reads a long-silent `working`.
+    const idle = (over: Partial<SessionRecord> = {}): SessionRecord =>
+      rec({ lastEvent: "working", op: "update", blob: "B", ts: NOW - 4 * R_MS, ...over });
+
+    test("a LIVE hold suppresses the reap's done", async () => {
+      const posts: object[] = [];
+      const writes: SessionRecord[] = [];
+      const v = await correctIdleClaude(cfg(), "/tmp/s.json", "s", idle(), NOW, {
+        post: async (b) => { posts.push(b); return "delivered" as PostOutcome; },
+        writeRecord: async (_p, r) => { writes.push(r); },
+        ...held,
+      });
+      expect(posts).toEqual([]);
+      expect(writes).toEqual([]);
+      expect(v).toBe("uncorrected");
+    });
+
+    test("a STALE hold does NOT suppress it (a 30-min-idle session still reaps)", async () => {
+      const posts: object[] = [];
+      const v = await correctIdleClaude(cfg(), "/tmp/s.json", "s", idle(), NOW, {
+        post: async (b) => { posts.push(b); return "delivered" as PostOutcome; },
+        writeRecord: async () => {},
+        ...stale,
+      });
+      expect(v).toBe("corrected");
+      expect(posts).toHaveLength(1);
+    });
+  });
+
+  // The housekeeping half of the same fix: markers leak because clearDecisionHold runs from the hook's
+  // `finally`, which a SIGTERM/SIGKILL never reaches. Three orphans (dead holder pids, one four days old)
+  // were sitting in the reporter's sessions dir when the P0 was filed.
+  describe("pruneStaleDecisionHolds (the SIGTERM leak: retire markers nobody can own)", () => {
+    const holdFor = (pid: number): DecisionHold => ({ blob: "CARD", at: NOW, pid });
+
+    test("a DEAD holder's marker is removed; a LIVE holder's is left strictly alone", async () => {
+      const removed: string[] = [];
+      const count = await pruneStaleDecisionHolds(
+        ["live.hold", "dead.hold", "live.json", "dead.json", "codex-pid-1.json", "x.input-fallback"],
+        {
+          readHold: async (id) => holdFor(id === "live" ? 900 : 901),
+          isAlive: (pid) => pid === 900,
+          removeHold: async (id) => { removed.push(id); },
+        },
+      );
+      expect(removed).toEqual(["dead"]); // ONLY the orphan; and no `.json` record was ever touched
+      expect(count).toBe(1);
+    });
+
+    test("a marker past its TTL whose holder is ALIVE is kept (the readers already ignore it)", async () => {
+      const removed: string[] = [];
+      await pruneStaleDecisionHolds(["ancient.hold"], {
+        readHold: async () => ({ blob: "CARD", at: NOW - STATE_HOLD_MAX_AGE_MS * 10, pid: 900 }),
+        isAlive: () => true,
+        removeHold: async (id) => { removed.push(id); },
+      });
+      expect(removed).toEqual([]); // unlinking a file a live hook still compare-and-clears buys nothing
+    });
+
+    test("corrupt / pid-less markers are removed, and a THROWING liveness probe removes nothing", async () => {
+      const removed: string[] = [];
+      await pruneStaleDecisionHolds(["corrupt.hold", "pidless.hold"], {
+        readHold: async (id) => (id === "corrupt" ? null : { blob: "CARD", at: NOW } as DecisionHold),
+        isAlive: () => false,
+        removeHold: async (id) => { removed.push(id); },
+      });
+      expect(removed).toEqual(["corrupt", "pidless"]);
+
+      const kept: string[] = [];
+      await pruneStaleDecisionHolds(["unknown.hold"], {
+        readHold: async () => holdFor(900),
+        isAlive: () => { throw new Error("ps unavailable"); },
+        removeHold: async (id) => { kept.push(id); },
+      });
+      expect(kept).toEqual([]); // an unanswerable probe must never delete a card the user may be holding
+    });
   });
 });
 

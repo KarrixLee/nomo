@@ -8127,6 +8127,16 @@ async function reconcileProvisionalsSweep(config, deps = {}) {
       await deleteRecord(sessionId);
   }
 }
+async function decisionHoldIsLive(sessionId, now, deps = {}) {
+  try {
+    const readHold = deps.readDecisionHoldFn ?? (lanRunningUnderTest() ? async () => null : (id) => readDecisionHoldAt(SESSIONS_DIR, id));
+    const hold = await readHold(sessionId);
+    const alive = hold && typeof hold.pid === "number" ? (deps.holdPidAliveFn ?? pidAlive)(hold.pid) : false;
+    return stateHoldLive(hold, alive, now);
+  } catch {
+    return false;
+  }
+}
 var INTERRUPT_TAIL_BYTES = 8 * 1024;
 var WORKING_STALE_MS = 20000;
 var INTERRUPT_DONE_MAX_ATTEMPTS = 5;
@@ -8142,6 +8152,9 @@ function shouldInterruptCheck(record, now) {
     return typeof record.ts === "number" && now - record.ts > WORKING_STALE_MS;
   }
   return false;
+}
+function doneSettledRecord(record) {
+  return { ...record, lastEvent: "done", sentDone: true, op: "done", prio: 0, doneAttempts: undefined };
 }
 async function correctInterrupt(config, path, sessionId, record, now, deps = {}) {
   const post = deps.post ?? ((body) => postEvent(config, body));
@@ -8160,21 +8173,34 @@ async function correctInterrupt(config, path, sessionId, record, now, deps = {})
     const agent = record.agent === "codex" ? "codex" : "claude";
     if (!tailShowsInterrupt(tail, agent))
       return "uncorrected";
+    if (await decisionHoldIsLive(sessionId, now, deps)) {
+      traceFocus(deps, { event: "interrupt", sessionId, outcome: "held", delivered: false, held: true });
+      return "uncorrected";
+    }
     const attempts = effectiveDoneAttempts(record, sessionId);
     if (attempts >= INTERRUPT_DONE_MAX_ATTEMPTS) {
       try {
-        await writeRecord(path, { ...record, lastEvent: "done", sentDone: true, op: "done", doneAttempts: undefined });
+        await writeRecord(path, doneSettledRecord(record));
         clearDoneAttempts(sessionId);
       } catch {}
+      traceFocus(deps, { event: "interrupt", sessionId, outcome: "capped", attempts, delivered: false, held: false });
       return "pending";
     }
     const doneNow = clock();
     const outcome = await post(await buildDoneEnvelope(sessionId, record, doneNow, config.e2eKey, agent, Math.floor(doneNow / 1000)));
+    traceFocus(deps, {
+      event: "interrupt",
+      sessionId,
+      outcome,
+      attempts,
+      delivered: outcome === "delivered",
+      held: false
+    });
     if (outcome === "revoked")
       return "revoked";
     if (outcome === "delivered") {
       try {
-        await writeRecord(path, { ...record, lastEvent: "done", sentDone: true, op: "done", doneAttempts: undefined });
+        await writeRecord(path, doneSettledRecord(record));
       } catch {}
       clearDoneAttempts(sessionId);
       return "corrected";
@@ -8349,6 +8375,8 @@ async function correctIdleClaude(config, path, sessionId, record, now, deps = {}
     } else if (!isClaudeIdleReapEligible(record, now)) {
       return "uncorrected";
     }
+    if (await decisionHoldIsLive(sessionId, now, deps))
+      return "uncorrected";
     const attempts = effectiveDoneAttempts(record, sessionId);
     if (attempts >= CLAUDE_IDLE_REAP_MAX_ATTEMPTS) {
       try {
@@ -8400,6 +8428,10 @@ async function correctPendingDone(config, path, sessionId, record, now, deps = {
   try {
     if (!shouldPendingDoneCheck(record))
       return "uncorrected";
+    if (await decisionHoldIsLive(sessionId, now, deps)) {
+      traceFocus(deps, { event: "pending-done", sessionId, outcome: "held", delivered: false, held: true });
+      return "pending";
+    }
     const agent = record.agent === "codex" ? "codex" : "claude";
     const settled = {
       ...record,
@@ -8662,6 +8694,47 @@ function heartbeatKind(record, now, lastHeartbeat, lastWaitingBeat, correctedThi
     return "waiting";
   return "none";
 }
+async function pruneStaleDecisionHolds(files, deps = {}) {
+  const inert = lanRunningUnderTest();
+  if (inert && deps.readHold === undefined && deps.removeHold === undefined)
+    return 0;
+  const readHold = deps.readHold ?? (inert ? async () => null : (id) => readDecisionHoldAt(SESSIONS_DIR, id));
+  const removeHold = deps.removeHold ?? (inert ? async () => {} : async (id) => {
+    await unlink4(`${SESSIONS_DIR}/${decisionHoldFileName(id)}`).catch(() => {});
+  });
+  const isAlive = deps.isAlive ?? pidAlive;
+  let removed = 0;
+  for (const file of files) {
+    if (!file.endsWith(DECISION_HOLD_SUFFIX))
+      continue;
+    const sessionId = basename6(file, DECISION_HOLD_SUFFIX);
+    if (sessionId.length === 0)
+      continue;
+    let hold = null;
+    try {
+      hold = await readHold(sessionId);
+    } catch {
+      hold = null;
+    }
+    if (hold && typeof hold.pid === "number" && Number.isFinite(hold.pid)) {
+      let alive = true;
+      try {
+        alive = isAlive(hold.pid);
+      } catch {
+        alive = true;
+      }
+      if (alive)
+        continue;
+    }
+    try {
+      await removeHold(sessionId);
+      removed++;
+    } catch {}
+  }
+  if (removed > 0)
+    traceFocus(deps, { event: "hold-prune", removed });
+  return removed;
+}
 var waitingBeatAt;
 async function sweep(config, deps = {}) {
   let files;
@@ -8671,6 +8744,7 @@ async function sweep(config, deps = {}) {
     return { revoked: false, remaining: 0, delivered: false };
   }
   const now = Date.now();
+  await pruneStaleDecisionHolds(files);
   let remaining = 0;
   let delivered = false;
   for (const file of files) {
@@ -9155,6 +9229,7 @@ export {
   resetCommandState,
   recordMovedSince,
   reconcileProvisionalsSweep,
+  pruneStaleDecisionHolds,
   provisionalsCoveredByReal,
   postOutcomeForStatus,
   planPickerPendingExpired,
@@ -9177,6 +9252,7 @@ export {
   effectiveDoneAttempts,
   drainCommands,
   discoverLiveSessions,
+  decisionHoldIsLive,
   createBridgeSupervisor,
   correlateCodexTuiPid,
   correctResolvedPlanPicker,
