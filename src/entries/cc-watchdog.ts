@@ -44,9 +44,10 @@ import type { LanAnswerDelivery, LanAnswerStore, LanCommand, LanListener } from 
 import { lanRunningUnderTest } from "../core/lan-wire";
 import { stateHoldLive } from "../core/session-state";
 import { resolveOnRelay } from "../core/codex-remote-input";
-import type { DecisionHold, PlanPickerTraceDecision } from "../core/shared";
+import { CODEX_PROXY_STDOUT_ENDED } from "../core/codex-proxy-transport";
+import type { CodexAppServerSocketState, DecisionHold, PlanPickerTraceDecision } from "../core/shared";
 import {
-  AgentKind, appendCodexBridgeMarker, appendFittedPlanAndDebug, atomicWrite, CC_DIR, CCOp, CCStatus, codexAppServerSocketAvailable, Config, completePendingPairing, DECISION_HOLD_SUFFIX, decisionHoldFileName, formatPlanPickerDebug, formatWatchdogPidfile,
+  AgentKind, appendCodexBridgeMarker, appendFittedPlanAndDebug, atomicWrite, CC_DIR, CCOp, CCStatus, codexAppServerSocketAvailable, codexAppServerSocketState, Config, completePendingPairing, DECISION_HOLD_SUFFIX, decisionHoldFileName, formatPlanPickerDebug, formatWatchdogPidfile,
   startCodexAppServerDaemon,
   GONE_STRIKE_LIMIT, loadConfig, loadPendingConfig, localApprovalsState,
   PAIR_HTML_FILE, PairPollResult, parseWatchdogPidfile, PendingConfig, pidAlive, PLUGIN_VERSION, readDecisionHoldAt, readPrefix, readSuffix, recordGoneStrike, removeRevokedConfig,
@@ -3238,9 +3239,11 @@ export async function goneStrikeShouldTeardown(goneStrikesPath?: string): Promis
 //
 //   PRESENCE GATE — construct/start it ONLY while a Codex app-server daemon is actually up. Unguarded,
 //   a Claude-only user (no codex installed, or codex installed but never run as a daemon) got a fresh
-//   `codex` child spawned on every cycle forever. The probe is one stat of the control socket
+//   `codex` child spawned on every cycle forever. The probe is one bounded CONNECT to the control socket
 //   (codexAppServerSocketAvailable), cheap enough to re-run EVERY sweep — so a user who starts the
 //   daemon later gets the bridge without restarting the watchdog, and a daemon that goes away stops it.
+//   It is a connect and not a stat because a dead daemon can leave its socket FILE behind, and a stat
+//   read that corpse as a healthy daemon (see the 2026-08-09 note below).
 //
 //   DEADLINE — never let the sweep cadence depend on Codex responsiveness. A wedged proxy child (spawned,
 //   never writes, never exits) used to freeze the whole loop at `await bridge.start()`: no reap, no
@@ -3259,6 +3262,17 @@ export async function goneStrikeShouldTeardown(goneStrikesPath?: string): Promis
 //   ORDERING TRUTH: starting the daemon does NOT rescue an already-running TUI — a Codex TUI launched
 //   with no daemon hosts its conversation in-process and can never retro-attach. The attempt buys the
 //   NEXT session, and the breadcrumb's wording promises nothing more.
+//
+//   TWO WAYS TO LEARN THE DAEMON IS GONE (2026-08-09) — the recovery above was real but unreachable,
+//   because BOTH halves of it hung off a probe that was a `stat`, and the daemon that died that day left
+//   its socket file behind. The supervisor believed a corpse, built a bridge on it, and `codex app-server
+//   proxy` died on the spot 240 times over five hours; every one of those errors was traced and none of
+//   them was ever interpreted. So the supervisor now concludes "daemon down" from EITHER signal:
+//     PROBE — a connect, not a stat, so a stale socket reads as absent (core/shared); and
+//     THE BRIDGE'S OWN ERRORS — CODEX_PROXY_STDOUT_ENDED means proxy lost the control socket it exists to
+//       relay, which is the daemon's death reported by the one component that had already noticed.
+//   Both land in the same place: raise the breadcrumb, and arm the SAME cooldown-gated restart, so the
+//   two signals together can never attempt more starts than one signal alone.
 
 /** The running loop's bridge teardown, published so the SIGTERM/SIGINT handler can stop the proxy child
  *  through the same path run()'s `finally` uses. Undefined outside a live run(). */
@@ -3303,6 +3317,19 @@ const BRIDGE_REARM_MS = 600_000;
  *  non-load-bearing: if the wording ever drifts, the interval above still re-arms. */
 const GIVE_UP_PATTERN = /gave up/i;
 
+/** Does this bridge error mean the shared DAEMON is gone (as opposed to one unlucky connection)? Exactly
+ *  one shape qualifies: `codex app-server proxy` ending its stdout unbidden, i.e. the relay lost the
+ *  control socket it exists to relay. Deliberately narrow — a transport parse error, a refused answer or
+ *  a protocol surprise says nothing about the daemon's liveness, and the sweep's own probe already covers
+ *  every case that does. Never throws: an exotic error object reads as "not daemon-down". */
+function isDaemonDownError(error: Error): boolean {
+  try {
+    return String(error.message ?? "").includes(CODEX_PROXY_STDOUT_ENDED);
+  } catch {
+    return false;
+  }
+}
+
 /** At most ONE `codex app-server daemon start` attempt per this window, counted from the moment the
  *  attempt is launched (not from its outcome), so a slow or wedged start cannot let a second one in.
  *  Five minutes: long enough that a machine with no codex installed spends effectively nothing on this
@@ -3337,10 +3364,18 @@ export interface RemoteInputBridgeLike {
   readThreadWaitState?(threadId: string): Promise<CodexThreadWaitState>;
 }
 
+/** How the supervisor learned the daemon is gone: the sweep's own probe, or the bridge reporting that
+ *  `codex app-server proxy` lost the control socket. Both drive the identical response; the distinction
+ *  exists so the trace says which one spoke first. */
+export type DaemonDownCause = "socket-unavailable" | "proxy-stdout-ended";
+
 /** Injectable seams for the bridge supervisor. */
 export interface BridgeSupervisorDeps {
-  /** Is a Codex app-server daemon present right now? Defaults to the control-socket stat. */
+  /** Is a Codex app-server daemon present right now? Defaults to the bounded control-socket connect. */
   probe?: () => Promise<boolean>;
+  /** WHY the socket is unusable, read ONCE per outage for the trace line (never per sweep — it costs an
+   *  extra syscall pass). Defaults to the real stale/absent/live classification. */
+  diagnose?: () => Promise<CodexAppServerSocketState>;
   /** Builds a bridge for a pairing, wired to the supervisor's error sink. Defaults to the real
    *  CodexRemoteInputBridge. */
   create?: (config: Config, options: { onError: (error: Error) => void }) => RemoteInputBridgeLike;
@@ -3364,6 +3399,7 @@ export interface BridgeSupervisorDeps {
  *  the CURRENT config and returns as soon as the bookkeeping is done — never after the bridge's IO. */
 export function createBridgeSupervisor(deps: BridgeSupervisorDeps = {}) {
   const probe = deps.probe ?? (() => codexAppServerSocketAvailable());
+  const diagnose = deps.diagnose ?? (() => codexAppServerSocketState());
   const create = deps.create
     ?? ((config: Config, options: { onError: (error: Error) => void }) =>
       new CodexRemoteInputBridge(config, options) as RemoteInputBridgeLike);
@@ -3388,10 +3424,42 @@ export function createBridgeSupervisor(deps: BridgeSupervisorDeps = {}) {
   /** When the last daemon start attempt was LAUNCHED (0 = never). Stamped before the work is detached so
    *  the cooldown holds even while an attempt is still in flight. */
   let lastDaemonStartAt = 0;
+  /** Which signal has already been REPORTED for the current outage, so the trace carries one line per
+   *  outage instead of one per error (the 2026-08-09 outage produced 240 identical error lines and no
+   *  conclusion). Cleared the moment a probe finds the daemon back, so a later outage speaks again. */
+  let reportedDownCause: DaemonDownCause | undefined;
 
-  /** The bridge's error sink: watch for the client's give-up so the re-arm is prompt, then pass through. */
+  /** THE diagnosis line. One `codex-bridge-down` per outage, naming the signal, the socket's real state
+   *  (`stale` = a dead daemon left its file behind — the case that used to be invisible), what is broken
+   *  while it lasts, and what recovery can and cannot do. The detail is fetched off the sweep path
+   *  because it costs a second probe pass; only its absence would be worth hurrying for. */
+  const reportDown = (cause: DaemonDownCause): void => {
+    if (reportedDownCause === cause) return; // this outage has already been named
+    reportedDownCause = cause;
+    detach(async () => {
+      let socket: CodexAppServerSocketState = "absent";
+      try { socket = await diagnose(); } catch { /* the classification is best-effort */ }
+      trace({
+        event: "codex-bridge-down", cause, socket,
+        impact: "codex request_user_input cannot be answered from the phone",
+        recovery: `codex app-server daemon start, at most once per ${BRIDGE_DAEMON_START_COOLDOWN_MS / 60_000}min; helps the NEXT codex session, never a running TUI`,
+      });
+    });
+  };
+
+  /** The bridge's error sink: watch for the client's give-up so the re-arm is prompt, notice a daemon
+   *  death the probe has not caught up with yet, then pass through. */
   const onError = (error: Error): void => {
     try { if (GIVE_UP_PATTERN.test(error.message)) parked = true; } catch { /* exotic error object */ }
+    // `proxy stdout ended` is the daemon's death certificate, delivered by the only component that saw it.
+    // Acting on it here means the outage self-heals even if the probe were ever to regress to a `stat`:
+    // the breadcrumb goes up now (run() republishes it on this same cycle) and the restart is armed under
+    // the SAME cooldown the probe path uses, so no combination of signals can produce a restart storm.
+    if (isDaemonDownError(error)) {
+      daemonDown = true;
+      reportDown("proxy-stdout-ended");
+      tryStartDaemon();
+    }
     try { deps.onError?.(error); } catch { /* a broken reporter must not break the supervisor */ }
   };
 
@@ -3439,6 +3507,7 @@ export function createBridgeSupervisor(deps: BridgeSupervisorDeps = {}) {
       if (!config) {
         teardown();
         daemonDown = false; // unpaired: there is no Codex row to be honest to
+        reportedDownCause = undefined;
         return;
       }
       let available = false;
@@ -3446,13 +3515,16 @@ export function createBridgeSupervisor(deps: BridgeSupervisorDeps = {}) {
       if (!available) {
         teardown(); // daemon went away (or never existed) → stop the bridge, keep the sweep running
         // …but do NOT stop there: silence here is what made a dead daemon look like a working one for a
-        // whole day. Try to bring it back (bounded, cooldown-gated, detached) and raise the breadcrumb
-        // meanwhile — the attempt is for the NEXT Codex session, never for a TUI already running.
+        // whole day. Try to bring it back (bounded, cooldown-gated, detached), name the outage once in the
+        // trace, and raise the breadcrumb meanwhile — the attempt is for the NEXT Codex session, never for
+        // a TUI already running.
         daemonDown = true;
+        reportDown("socket-unavailable");
         tryStartDaemon();
         return;
       }
       daemonDown = false;
+      reportedDownCause = undefined; // the outage is over; a future one gets its own line
       if (!bridge || pairingId !== config.pairingId) {
         teardown();
         const next = create(config, { onError });

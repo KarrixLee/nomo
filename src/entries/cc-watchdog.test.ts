@@ -26,6 +26,7 @@ import {
 } from "./cc-watchdog";
 import type { CommandPayload, DrainCommandsDeps, PostOutcome, RecordEntry } from "./cc-watchdog";
 import { resolveOnRelay } from "../core/codex-remote-input";
+import { CODEX_PROXY_STDOUT_ENDED } from "../core/codex-proxy-transport";
 import { STATE_HOLD_MAX_AGE_MS } from "../core/session-state";
 import { claudeAdapter, codexAdapter } from "../core/adapter";
 import type { AgentAdapter, DiscoveredSession } from "../core/adapter";
@@ -2914,6 +2915,7 @@ describe("createBridgeSupervisor (presence gate: no Codex daemon → no bridge, 
       create: () => { throw new Error("unreachable"); },
       // No `detach` injected: the production fire-and-forget path must swallow this rejection itself.
       startDaemon: () => Promise.reject(new Error("codex: command not found")),
+      diagnose: async () => "absent",
       trace: (event) => traced.push(event),
     });
     const raced = await Promise.race([
@@ -2922,7 +2924,14 @@ describe("createBridgeSupervisor (presence gate: no Codex daemon → no bridge, 
     ]);
     expect(raced).toBe("synced");
     await new Promise((r) => setTimeout(r, 10)); // let the detached rejection land
-    expect(traced).toEqual([{ event: "codex-daemon-start", outcome: "attempt" }]);
+    expect(traced).toEqual([
+      { event: "codex-daemon-start", outcome: "attempt" },
+      {
+        event: "codex-bridge-down", cause: "socket-unavailable", socket: "absent",
+        impact: "codex request_user_input cannot be answered from the phone",
+        recovery: "codex app-server daemon start, at most once per 5min; helps the NEXT codex session, never a running TUI",
+      },
+    ]);
     expect(s.daemonDown).toBe(true);
   });
 
@@ -2942,6 +2951,124 @@ describe("createBridgeSupervisor (presence gate: no Codex daemon → no bridge, 
     await c.settle();
     expect(f.calls).toEqual(["start"]);
     expect(s.daemonDown).toBe(false); // …and the breadcrumb clears itself
+  });
+
+  // THE OTHER HALF of the 2026-08-09 outage. The probe said "socket present" (it was a stat, and the dead
+  // daemon had left its socket file behind), so the supervisor happily built a bridge — and `codex
+  // app-server proxy` died on the spot, reporting "stdout ended" 240 times between 13:47 and 18:36. Every
+  // one of those was traced and NONE of them was interpreted: no breadcrumb, no restart, no diagnosis.
+  test("`proxy stdout ended` from the bridge IS a dead daemon: breadcrumb + ONE restart + ONE trace line", async () => {
+    const f = fakeBridge();
+    const c = collector();
+    const traced: object[] = [];
+    let starts = 0;
+    let sink: ((e: Error) => void) | undefined;
+    const s = createBridgeSupervisor({
+      // The pessimal case on purpose: a probe that keeps insisting the daemon is fine (a stale socket, or
+      // a future regression back to a stat). The bridge's own error must be enough on its own.
+      probe: async () => true,
+      create: (_cfg, opts) => { sink = opts.onError; return f.bridge; },
+      detach: c.detach,
+      diagnose: async () => "stale",
+      startDaemon: async () => { starts += 1; return false; },
+      trace: (event) => traced.push(event),
+      now: () => 1_000_000,
+    });
+    await s.sync(cfg());
+    await c.settle();
+    expect(s.daemonDown).toBe(false); // nothing has gone wrong yet
+
+    sink!(new Error(CODEX_PROXY_STDOUT_ENDED));
+    await c.settle();
+    expect(s.daemonDown).toBe(true); // → run() stamps `cxbridge:down` on this very cycle's Codex frames
+    expect(starts).toBe(1);
+    expect(traced).toEqual([
+      { event: "codex-daemon-start", outcome: "attempt" },
+      {
+        event: "codex-bridge-down", cause: "proxy-stdout-ended", socket: "stale",
+        impact: "codex request_user_input cannot be answered from the phone",
+        recovery: "codex app-server daemon start, at most once per 5min; helps the NEXT codex session, never a running TUI",
+      },
+    ]);
+
+    // 239 more of the same error: still ONE restart, and still ONE diagnosis line. That is the whole
+    // difference between tonight's trace and a legible one.
+    for (let i = 0; i < 239; i++) sink!(new Error(CODEX_PROXY_STDOUT_ENDED));
+    await c.settle();
+    expect(starts).toBe(1);
+    expect(traced.filter((e) => (e as { event: string }).event === "codex-bridge-down")).toHaveLength(1);
+  });
+
+  test("an ordinary bridge error is NOT read as a dead daemon (no restart, no breadcrumb)", async () => {
+    const f = fakeBridge();
+    const c = collector();
+    let starts = 0;
+    let sink: ((e: Error) => void) | undefined;
+    const s = createBridgeSupervisor({
+      probe: async () => true,
+      create: (_cfg, opts) => { sink = opts.onError; return f.bridge; },
+      detach: c.detach,
+      startDaemon: async () => { starts += 1; return true; },
+    });
+    await s.sync(cfg());
+    sink!(new Error("Codex app-server rejected the answer"));
+    sink!(new Error("Invalid Codex app-server websocket data"));
+    await c.settle();
+    expect(starts).toBe(0);
+    expect(s.daemonDown).toBe(false);
+  });
+
+  test("the two down signals SHARE one cooldown — they can never add up to a restart storm", async () => {
+    const f = fakeBridge();
+    const c = collector();
+    let clock = 1_000_000;
+    let available = true;
+    let starts = 0;
+    let sink: ((e: Error) => void) | undefined;
+    const s = createBridgeSupervisor({
+      probe: async () => available,
+      create: (_cfg, opts) => { sink = opts.onError; return f.bridge; },
+      detach: c.detach,
+      diagnose: async () => "stale",
+      startDaemon: async () => { starts += 1; return false; },
+      now: () => clock,
+    });
+    await s.sync(cfg());
+    sink!(new Error(CODEX_PROXY_STDOUT_ENDED)); // signal 1 → the one attempt
+    await c.settle();
+    expect(starts).toBe(1);                     // the error alone armed the restart
+    available = false;                          // and now the probe agrees
+    clock += 5_000; await s.sync(cfg());        // signal 2, same cooldown window
+    clock += 5_000; await s.sync(cfg());
+    sink!(new Error(CODEX_PROXY_STDOUT_ENDED));
+    await c.settle();
+    expect(starts).toBe(1);
+    clock += 300_000;                           // cooldown expired
+    await s.sync(cfg());
+    await c.settle();
+    expect(starts).toBe(2);                     // one per cooldown, no matter how many signals arrive
+  });
+
+  test("a daemon that comes BACK clears the outage, and a later one gets its own diagnosis line", async () => {
+    const f = fakeBridge();
+    const c = collector();
+    const traced: object[] = [];
+    let available = false;
+    const s = createBridgeSupervisor({
+      probe: async () => available, create: () => f.bridge, detach: c.detach,
+      diagnose: async () => "absent", startDaemon: async () => false,
+      trace: (event) => traced.push(event), now: () => 1_000_000,
+    });
+    await s.sync(cfg());
+    await c.settle();
+    available = true;
+    await s.sync(cfg());        // recovered
+    await c.settle();
+    expect(s.daemonDown).toBe(false);
+    available = false;
+    await s.sync(cfg());        // a NEW outage
+    await c.settle();
+    expect(traced.filter((e) => (e as { event: string }).event === "codex-bridge-down")).toHaveLength(2);
   });
 
   test("unpaired never attempts a start (no config, no Codex row to be honest to)", async () => {

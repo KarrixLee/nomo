@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
 import {
+  CODEX_PROXY_STDOUT_ENDED,
   CodexProxyChild,
   CodexProxyTransport,
   CodexProxyWritable,
@@ -238,6 +239,18 @@ describe("CodexProxyTransport", () => {
     await expect(transport.open({ onMessage: () => {}, onClose: () => {} }))
       .rejects.toThrow("already been opened");
     expect(spawns).toBe(1);
+  });
+
+  // The watchdog's bridge supervisor concludes "the shared daemon is dead" from this exact message and
+  // arms its (cooldown-gated) `codex app-server daemon start` on it, so the wording is a contract between
+  // the two modules — not a log string. Pin it here rather than in a regex over there.
+  test("proxy stdout ending unbidden reports CODEX_PROXY_STDOUT_ENDED verbatim", async () => {
+    const h = harness();
+    upgrade(h.child, Buffer.alloc(0), 17);
+    await h.opening;
+    h.child.stdout.finish();
+    expect(h.closes).toHaveLength(1);
+    expect((h.closes[0] as Error).message).toBe(CODEX_PROXY_STDOUT_ENDED);
   });
 
   test("subprocess exit includes bounded stderr context", async () => {

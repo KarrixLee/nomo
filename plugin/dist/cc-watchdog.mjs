@@ -104,7 +104,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "1.9.3";
+var PLUGIN_VERSION = "1.9.4";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -248,11 +248,51 @@ var CODEX_HOOK_MARKER = "codex-status.mjs";
 function codexAppServerSocketPath() {
   return `${codexHome()}/app-server-control/app-server-control.sock`;
 }
-async function codexAppServerSocketAvailable(socketPath = codexAppServerSocketPath()) {
+var CODEX_SOCKET_PROBE_TIMEOUT_MS = 200;
+async function unixSocketAccepts(socketPath, timeoutMs) {
+  let createConnection;
   try {
-    return (await stat(socketPath)).isSocket();
+    ({ createConnection } = await import("node:net"));
   } catch {
     return false;
+  }
+  return await new Promise((resolve2) => {
+    let settled = false;
+    let socket;
+    const timer = setTimeout(() => done(false), timeoutMs);
+    timer.unref?.();
+    function done(accepted) {
+      if (settled)
+        return;
+      settled = true;
+      clearTimeout(timer);
+      try {
+        socket?.destroy();
+      } catch {}
+      resolve2(accepted);
+    }
+    try {
+      socket = createConnection({ path: socketPath });
+    } catch {
+      done(false);
+      return;
+    }
+    socket.unref?.();
+    socket.once("connect", () => done(true));
+    socket.once("error", () => done(false));
+    socket.once("close", () => done(false));
+  });
+}
+async function codexAppServerSocketAvailable(socketPath = codexAppServerSocketPath()) {
+  return await unixSocketAccepts(socketPath, CODEX_SOCKET_PROBE_TIMEOUT_MS);
+}
+async function codexAppServerSocketState(socketPath = codexAppServerSocketPath()) {
+  if (await codexAppServerSocketAvailable(socketPath))
+    return "live";
+  try {
+    return (await stat(socketPath)).isSocket() ? "stale" : "absent";
+  } catch {
+    return "absent";
   }
 }
 var CODEX_DAEMON_START_ARGS = ["app-server", "daemon", "start"];
@@ -3052,6 +3092,7 @@ var WEBSOCKET_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 var DEFAULT_MAX_BUFFER_BYTES = 1 << 20;
 var DEFAULT_MAX_HANDSHAKE_BYTES = 16 << 10;
 var MAX_FRAME_HEADER_BYTES = 10;
+var CODEX_PROXY_STDOUT_ENDED = "Codex app-server proxy stdout ended";
 function defaultSpawnProxy(command, args) {
   return spawn2(command, [...args], { stdio: ["pipe", "pipe", "pipe"] });
 }
@@ -3235,7 +3276,7 @@ class CodexProxyTransport {
       this.finish(asError(error, "Invalid Codex app-server websocket data"));
     }
   };
-  onStdoutEnd = () => this.finish(new Error("Codex app-server proxy stdout ended"));
+  onStdoutEnd = () => this.finish(new Error(CODEX_PROXY_STDOUT_ENDED));
   onStreamError = (error) => this.finish(asError(error, "Codex app-server proxy stream failed"));
   onStderrError = () => {};
   onStderrData = (chunk) => {
@@ -8914,6 +8955,13 @@ function withDeadline(work, ms) {
 }
 var BRIDGE_REARM_MS = 600000;
 var GIVE_UP_PATTERN = /gave up/i;
+function isDaemonDownError(error) {
+  try {
+    return String(error.message ?? "").includes(CODEX_PROXY_STDOUT_ENDED);
+  } catch {
+    return false;
+  }
+}
 var BRIDGE_DAEMON_START_COOLDOWN_MS = 300000;
 var codexBridgeDown = false;
 function setCodexBridgeDown(down) {
@@ -8924,6 +8972,7 @@ function codexBridgeIsDown() {
 }
 function createBridgeSupervisor(deps = {}) {
   const probe = deps.probe ?? (() => codexAppServerSocketAvailable());
+  const diagnose = deps.diagnose ?? (() => codexAppServerSocketState());
   const create = deps.create ?? ((config, options) => new CodexRemoteInputBridge(config, options));
   const detach = deps.detach ?? ((work) => {
     withDeadline(Promise.resolve().then(work), BRIDGE_OP_DEADLINE_MS).catch(() => {});
@@ -8937,11 +8986,35 @@ function createBridgeSupervisor(deps = {}) {
   let parked = false;
   let daemonDown = false;
   let lastDaemonStartAt = 0;
+  let reportedDownCause;
+  const reportDown = (cause) => {
+    if (reportedDownCause === cause)
+      return;
+    reportedDownCause = cause;
+    detach(async () => {
+      let socket = "absent";
+      try {
+        socket = await diagnose();
+      } catch {}
+      trace({
+        event: "codex-bridge-down",
+        cause,
+        socket,
+        impact: "codex request_user_input cannot be answered from the phone",
+        recovery: `codex app-server daemon start, at most once per ${BRIDGE_DAEMON_START_COOLDOWN_MS / 60000}min; helps the NEXT codex session, never a running TUI`
+      });
+    });
+  };
   const onError = (error) => {
     try {
       if (GIVE_UP_PATTERN.test(error.message))
         parked = true;
     } catch {}
+    if (isDaemonDownError(error)) {
+      daemonDown = true;
+      reportDown("proxy-stdout-ended");
+      tryStartDaemon();
+    }
     try {
       deps.onError?.(error);
     } catch {}
@@ -8976,6 +9049,7 @@ function createBridgeSupervisor(deps = {}) {
       if (!config) {
         teardown();
         daemonDown = false;
+        reportedDownCause = undefined;
         return;
       }
       let available = false;
@@ -8987,10 +9061,12 @@ function createBridgeSupervisor(deps = {}) {
       if (!available) {
         teardown();
         daemonDown = true;
+        reportDown("socket-unavailable");
         tryStartDaemon();
         return;
       }
       daemonDown = false;
+      reportedDownCause = undefined;
       if (!bridge || pairingId !== config.pairingId) {
         teardown();
         const next = create(config, { onError });

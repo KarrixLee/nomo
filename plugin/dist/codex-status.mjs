@@ -103,7 +103,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "1.9.3";
+var PLUGIN_VERSION = "1.9.4";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -247,11 +247,51 @@ var CODEX_HOOK_MARKER = "codex-status.mjs";
 function codexAppServerSocketPath() {
   return `${codexHome()}/app-server-control/app-server-control.sock`;
 }
-async function codexAppServerSocketAvailable(socketPath = codexAppServerSocketPath()) {
+var CODEX_SOCKET_PROBE_TIMEOUT_MS = 200;
+async function unixSocketAccepts(socketPath, timeoutMs) {
+  let createConnection;
   try {
-    return (await stat(socketPath)).isSocket();
+    ({ createConnection } = await import("node:net"));
   } catch {
     return false;
+  }
+  return await new Promise((resolve2) => {
+    let settled = false;
+    let socket;
+    const timer = setTimeout(() => done(false), timeoutMs);
+    timer.unref?.();
+    function done(accepted) {
+      if (settled)
+        return;
+      settled = true;
+      clearTimeout(timer);
+      try {
+        socket?.destroy();
+      } catch {}
+      resolve2(accepted);
+    }
+    try {
+      socket = createConnection({ path: socketPath });
+    } catch {
+      done(false);
+      return;
+    }
+    socket.unref?.();
+    socket.once("connect", () => done(true));
+    socket.once("error", () => done(false));
+    socket.once("close", () => done(false));
+  });
+}
+async function codexAppServerSocketAvailable(socketPath = codexAppServerSocketPath()) {
+  return await unixSocketAccepts(socketPath, CODEX_SOCKET_PROBE_TIMEOUT_MS);
+}
+async function codexAppServerSocketState(socketPath = codexAppServerSocketPath()) {
+  if (await codexAppServerSocketAvailable(socketPath))
+    return "live";
+  try {
+    return (await stat(socketPath)).isSocket() ? "stale" : "absent";
+  } catch {
+    return "absent";
   }
 }
 var CODEX_DAEMON_START_ARGS = ["app-server", "daemon", "start"];

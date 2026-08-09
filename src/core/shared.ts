@@ -373,23 +373,95 @@ export function codexHome(): string {
  *  hook's basename). status-cmd greps for it to flag leftover legacy (pre-native-plugin) installs. */
 export const CODEX_HOOK_MARKER = "codex-status.mjs";
 
-/** The shared Codex app-server CONTROL socket — the one `codex app-server proxy` attaches to. Its mere
- *  existence is the cheapest honest signal that a Codex app-server daemon is up on this machine (the
- *  socket is created by the daemon and disappears with it). */
+/** The shared Codex app-server CONTROL socket — the one `codex app-server proxy` attaches to. The
+ *  daemon creates it on startup.
+ *
+ *  IT DOES NOT RELIABLY DISAPPEAR WITH THE DAEMON. This comment used to claim it did, and the
+ *  presence probe below was a single `stat` built on that claim. Field evidence (2026-08-09): the
+ *  daemon's recorded pid was long dead, no process held the socket, `connect()` returned
+ *  ECONNREFUSED — and the socket FILE was still sitting there. A daemon killed abruptly (crash,
+ *  SIGKILL, reboot with a surviving filesystem) leaves the inode behind, so existence proves only
+ *  that a daemon once ran. Only a connect proves one is listening now. */
 export function codexAppServerSocketPath(): string {
   return `${codexHome()}/app-server-control/app-server-control.sock`;
 }
 
-/** Is a Codex app-server daemon present right now? ONE stat of the control socket — the presence probe
- *  shared by `status` (which reports it) and the watchdog (which gates the remote-input bridge on it, so
- *  a Claude-only user never gets a perpetual `codex app-server proxy` spawn loop). Cheap enough to
- *  re-run every sweep, so a daemon that appears/disappears later is picked up without a restart. Never
- *  throws: any error (absent socket, no ~/.codex, permission) reads as "not available". */
-export async function codexAppServerSocketAvailable(socketPath = codexAppServerSocketPath()): Promise<boolean> {
+/** Ceiling on the presence probe's connect. A unix-domain connect to a listening peer is a
+ *  kernel-local handshake (microseconds); anything slower is a wedged or backlogged daemon, and for
+ *  the purposes of "can the bridge attach right now" that reads the same as absent. Short enough to sit
+ *  on the watchdog's five-second sweep and on `status`'s output path without being felt. */
+export const CODEX_SOCKET_PROBE_TIMEOUT_MS = 200;
+
+/** What the control socket actually IS right now. `stale` is the case that cost a day: the socket file
+ *  exists (so every `stat`-based check said "daemon up") but nothing is listening on it. */
+export type CodexAppServerSocketState = "live" | "stale" | "absent";
+
+/** Bounded, never-throwing "is someone listening on this unix socket". Resolves false on any error
+ *  (ENOENT, ECONNREFUSED, EACCES, EPERM, a non-socket inode) and on the timeout. The socket is closed
+ *  immediately either way — we send nothing and read nothing, so a live app-server sees an ordinary
+ *  client that hung up before speaking. */
+async function unixSocketAccepts(socketPath: string, timeoutMs: number): Promise<boolean> {
+  // node:net is imported lazily: this module is inlined into the per-event hook bundles, whose startup
+  // cost is paid on every agent event, and only the watchdog/status probe ever needs a socket.
+  let createConnection: typeof import("node:net").createConnection;
   try {
-    return (await stat(socketPath)).isSocket();
+    ({ createConnection } = await import("node:net"));
   } catch {
     return false;
+  }
+  return await new Promise<boolean>((resolve) => {
+    let settled = false;
+    let socket: import("node:net").Socket | undefined;
+    const timer = setTimeout(() => done(false), timeoutMs);
+    (timer as unknown as { unref?: () => void }).unref?.();
+    function done(accepted: boolean): void {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try { socket?.destroy(); } catch { /* already gone */ }
+      resolve(accepted);
+    }
+    try {
+      socket = createConnection({ path: socketPath });
+    } catch {
+      done(false); // an unusable path never even reaches the kernel
+      return;
+    }
+    socket.unref?.(); // a probe must never hold a process open
+    socket.once("connect", () => done(true));
+    socket.once("error", () => done(false));
+    socket.once("close", () => done(false));
+  });
+}
+
+/** Is a Codex app-server daemon present right now? A bounded CONNECT to the control socket — the
+ *  presence probe shared by `status` (which reports it) and the watchdog (which gates the remote-input
+ *  bridge on it, so a Claude-only user never gets a perpetual `codex app-server proxy` spawn loop).
+ *  Cheap enough to re-run every sweep, so a daemon that appears/disappears later is picked up without a
+ *  restart. Never throws: any error (absent socket, no ~/.codex, permission, refused) reads as "not
+ *  available".
+ *
+ *  WHY NOT A STAT (the 2026-08-09 outage): a dead daemon can leave its socket file behind, and a `stat`
+ *  probe read that corpse as a healthy daemon. Everything downstream then behaved as if the bridge could
+ *  work — the bridge was built, `codex app-server proxy` died instantly 240 times over five hours, the
+ *  `cxbridge:down` breadcrumb never stamped, and the daemon-restart recovery never armed, because all
+ *  three of those hang off exactly this boolean. A connect is the only answer that cannot be a corpse. */
+export async function codexAppServerSocketAvailable(socketPath = codexAppServerSocketPath()): Promise<boolean> {
+  return await unixSocketAccepts(socketPath, CODEX_SOCKET_PROBE_TIMEOUT_MS);
+}
+
+/** The probe's answer WITH its reason, for the one trace line an outage gets. Only called when
+ *  something has already gone wrong (a down-transition), never per sweep, because it costs a second
+ *  syscall pass to tell `stale` from `absent` — and that distinction is the whole diagnosis: `stale`
+ *  means "a daemon died and left its socket", `absent` means "no daemon has run here". */
+export async function codexAppServerSocketState(
+  socketPath = codexAppServerSocketPath(),
+): Promise<CodexAppServerSocketState> {
+  if (await codexAppServerSocketAvailable(socketPath)) return "live";
+  try {
+    return (await stat(socketPath)).isSocket() ? "stale" : "absent";
+  } catch {
+    return "absent"; // nothing at the path at all
   }
 }
 
@@ -402,7 +474,7 @@ export const CODEX_DAEMON_START_ARGS = ["app-server", "daemon", "start"] as cons
 /** Ceiling on the start CHILD itself. `daemon start` forks the server and returns; anything slower than
  *  this is a wedged binary and waiting longer only delays the trace. */
 const CODEX_DAEMON_START_TIMEOUT_MS = 8_000;
-/** After a clean exit, how long we keep re-statting for the socket before calling the attempt a failure.
+/** After a clean exit, how long we keep re-probing the socket before calling the attempt a failure.
  *  The daemon binds its control socket a beat after the parent returns. */
 const CODEX_DAEMON_SOCKET_WAIT_MS = 4_000;
 const CODEX_DAEMON_SOCKET_POLL_MS = 250;
@@ -482,8 +554,9 @@ export async function startCodexAppServerDaemon(deps: CodexDaemonStartDeps = {})
   }
 
   // Exit 0 is not proof: `daemon start` returns before the socket is necessarily bound (and would also
-  // exit 0 if it decided the daemon was already up while the socket is being replaced). The SOCKET is
-  // the contract, so re-stat until it shows up or the bounded wait expires.
+  // exit 0 if it decided the daemon was already up while the socket is being replaced — including when
+  // what it "decided" from was a stale socket file). A socket that ACCEPTS is the contract, so re-probe
+  // until it does or the bounded wait expires.
   const deadline = socketWaitMs;
   for (let waited = 0; ; waited += CODEX_DAEMON_SOCKET_POLL_MS) {
     let up = false;

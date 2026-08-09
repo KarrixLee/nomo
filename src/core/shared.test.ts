@@ -1,11 +1,12 @@
-import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { afterEach, describe, expect, test } from "bun:test";
 import {
   appendCodexBridgeMarker, BRANCH_MAX_CHARS, branchFromHead, clearDecisionHoldAt, CODEX_BRIDGE_DOWN_MARKER, CODEX_DAEMON_START_ARGS,
   folderIdentity, resolveGitDir, sessionBranch,
-  codexAppServerSocketAvailable, codexAppServerSocketPath, codexCompanionBrokerEvidence,
+  codexAppServerSocketAvailable, codexAppServerSocketPath, codexAppServerSocketState, codexCompanionBrokerEvidence,
   DBG_BLOB_TEXT_MAX_CHARS, startCodexAppServerDaemon,
   decisionHoldFileName, ensureWatchdog, formatWatchdogPidfile, fullTextForRecord, isWatchdogCommand,
   readDecisionHoldAt, writeDecisionHoldAt,
@@ -325,6 +326,69 @@ describe("codexAppServerSocketAvailable (the shared control-socket probe)", () =
 
   test("the default path lives under CODEX_HOME", () => {
     expect(codexAppServerSocketPath().endsWith("/app-server-control/app-server-control.sock")).toBe(true);
+  });
+
+  // THE 2026-08-09 OUTAGE, reproduced. A Codex app-server daemon died and left its control socket file
+  // behind (recorded pid gone, nothing holding the inode, connect → ECONNREFUSED). The probe was a
+  // `stat().isSocket()`, which is TRUE for that corpse — so the watchdog built a bridge on a daemon that
+  // was not there, `cxbridge:down` never stamped, the daemon restart never armed, and every Codex
+  // question for five hours arrived on the phone as an unanswerable attention row.
+  //
+  // Building a genuinely stale socket: bind a listener, RENAME its socket file aside, then close the
+  // listener. Closing unlinks the name it bound (now gone), so the renamed inode survives as a socket
+  // file that no process is listening on — exactly tonight's filesystem state.
+  const staleSocket = async (dir: string): Promise<string> => {
+    const bound = join(dir, "bound.sock");
+    const orphan = join(dir, "app-server-control.sock");
+    const server = createServer();
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(bound, () => resolve());
+    });
+    await rename(bound, orphan);
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    return orphan;
+  };
+
+  test("a DEAD daemon's leftover socket file reads UNAVAILABLE (a stat would have said 'up')", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "nomo-sock-"));
+    try {
+      const orphan = await staleSocket(dir);
+      expect((await stat(orphan)).isSocket()).toBe(true); // the old probe's whole test — still true
+      expect(await codexAppServerSocketAvailable(orphan)).toBe(false); // …and still not a daemon
+      expect(await codexAppServerSocketState(orphan)).toBe("stale");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("a LIVE listener still reads available (the probe did not just turn everything off)", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "nomo-sock-"));
+    const server = createServer();
+    try {
+      const live = join(dir, "app-server-control.sock");
+      await new Promise<void>((resolve, reject) => {
+        server.once("error", reject);
+        server.listen(live, () => resolve());
+      });
+      expect(await codexAppServerSocketAvailable(live)).toBe(true);
+      expect(await codexAppServerSocketState(live)).toBe("live");
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("nothing at the path at all is ABSENT, and a plain file is ABSENT too (never 'stale')", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "nomo-sock-"));
+    try {
+      expect(await codexAppServerSocketState(join(dir, "nope.sock"))).toBe("absent");
+      const plain = join(dir, "plain.sock");
+      await writeFile(plain, "");
+      expect(await codexAppServerSocketState(plain)).toBe("absent");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 });
 

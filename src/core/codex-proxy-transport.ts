@@ -14,6 +14,17 @@ const DEFAULT_MAX_HANDSHAKE_BYTES = 16 << 10;
 /** Largest unmasked server frame header: 2 bytes + an 8-byte extended length. */
 const MAX_FRAME_HEADER_BYTES = 10;
 
+/** The transport failure that means THE SHARED DAEMON IS GONE, rather than "this connection had a bad
+ *  day": `codex app-server proxy` closed its stdout without the transport asking it to. proxy does one
+ *  thing — relay the app-server's control socket — so its stream ending unbidden means it could not
+ *  reach (or lost) that socket. Named and exported because the watchdog's bridge supervisor matches on
+ *  it to conclude "daemon down" and arm the cooldown-gated restart: in the 2026-08-09 outage this exact
+ *  error arrived 240 times in five hours and nothing anywhere drew that conclusion.
+ *
+ *  Kept as a whole-message constant so the match is a substring test against the string that is
+ *  actually thrown, not a regex re-guessing the wording. */
+export const CODEX_PROXY_STDOUT_ENDED = "Codex app-server proxy stdout ended";
+
 export interface CodexProxyReadable {
   on(event: "data", listener: (chunk: Buffer | Uint8Array | string) => void): this;
   on(event: "end" | "error", listener: (error?: unknown) => void): this;
@@ -239,7 +250,7 @@ export class CodexProxyTransport implements CodexRpcTransport {
     }
   };
 
-  private readonly onStdoutEnd = (): void => this.finish(new Error("Codex app-server proxy stdout ended"));
+  private readonly onStdoutEnd = (): void => this.finish(new Error(CODEX_PROXY_STDOUT_ENDED));
   private readonly onStreamError = (error?: unknown): void => this.finish(asError(error, "Codex app-server proxy stream failed"));
   private readonly onStderrError = (): void => { /* stderr is diagnostic-only */ };
   private readonly onStderrData = (chunk: Buffer | Uint8Array | string): void => {

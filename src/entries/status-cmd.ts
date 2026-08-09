@@ -40,7 +40,8 @@ export interface StatusDeps {
   lastHookCodexPath?: string;
   lastHookClaudePath?: string;
   /** Whether the shared Codex app-server control socket is reachable. Tests inject this to avoid
-   * touching the user's daemon; production defaults to checking the standard Unix socket. */
+   * touching the user's daemon; production defaults to a bounded connect to the standard Unix socket
+   * (a stat cannot tell a live daemon from the socket file a dead one left behind). */
   codexAppServerAvailable?: () => Promise<boolean>;
   isAlive?: (pid: number) => boolean;
   now?: () => number;
@@ -281,8 +282,10 @@ export async function statusCmd(deps: StatusDeps = {}): Promise<number> {
   print(`Codex plugin: ${pluginState}`);
 
   if (await codexAppServerAvailable()) {
-    print("Codex Plan answers: bridge available (shared app-server socket found)");
+    print("Codex Plan answers: bridge available (shared app-server socket accepted a connection)");
   } else {
+    // Deliberately not "socket missing": the socket FILE can outlive its daemon, and this line's job is
+    // to name the only thing that matters — nothing is listening, so start the daemon.
     print("Codex Plan answers: status-only (start `codex app-server daemon start` before launching Codex)");
   }
 
