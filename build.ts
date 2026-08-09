@@ -18,6 +18,37 @@ import { fileURLToPath } from "node:url";
 const HERE = dirname(fileURLToPath(import.meta.url));
 const OUTDIR = join(HERE, "plugin", "dist");
 
+/** Every manifest that carries the plugin version, and how to pull it out. The Claude plugin manifest
+ *  is the source of truth (see readVersion below); the rest must agree with it. A release that bumps
+ *  only some of them ships hosts a version that disagrees with what the bundle reports, so the build
+ *  refuses rather than baking the disagreement into dist/. */
+const VERSION_MANIFESTS: { path: string; versions: (doc: any) => (string | undefined)[] }[] = [
+  { path: join("plugin", ".claude-plugin", "plugin.json"), versions: (d) => [d.version] },
+  { path: join("plugin", ".codex-plugin", "plugin.json"), versions: (d) => [d.version] },
+  { path: join(".claude-plugin", "marketplace.json"), versions: (d) => (d.plugins ?? []).map((p: any) => p.version) },
+  { path: join(".agents", "plugins", "marketplace.json"), versions: (d) => (d.plugins ?? []).map((p: any) => p.version) },
+];
+
+/** The Claude plugin manifest's version, after proving every other manifest agrees with it.
+ *  PLUGIN_VERSION is injected from this single value, so agreement here is what makes the version the
+ *  bundle self-reports trustworthy in a diagnosis. */
+function readVersion(): string {
+  const readings = VERSION_MANIFESTS.map(({ path, versions }) => {
+    const doc = JSON.parse(readFileSync(join(HERE, path), "utf8"));
+    return { path, found: versions(doc) };
+  });
+
+  const source = readings[0].found[0];
+  if (!source) throw new Error(`build: ${VERSION_MANIFESTS[0].path} has no "version"`);
+
+  const disagree = readings.flatMap(({ path, found }) =>
+    found.filter((v) => v !== source).map((v) => `  ${path}: ${v ?? "(missing)"}`));
+  if (disagree.length > 0) {
+    throw new Error(`build: manifest versions disagree — expected ${source} from ${VERSION_MANIFESTS[0].path}:\n${disagree.join("\n")}`);
+  }
+  return source;
+}
+
 /** The entrypoints. cc-status is the Claude hook run on every event; codex-status is its Codex twin
  *  (calls runHook("codex")); cc-watchdog is spawned by either hook (as a sibling dist/cc-watchdog.mjs
  *  — see shared's WATCHDOG_PATH); pair/unpair/status-cmd back the Claude slash commands and the
@@ -40,13 +71,14 @@ const ENTRYPOINTS = [
 ].map((f) => join(HERE, "src", "entries", f));
 
 async function main(): Promise<void> {
-  // Clean so a removed/renamed entrypoint can never leave a stale .mjs behind.
-  await rm(OUTDIR, { recursive: true, force: true });
-
   // The plugin's version is single-sourced from the Claude plugin manifest; inject it as a build-time
   // define so PLUGIN_VERSION (src/core/shared.ts) resolves to it in the committed dist/*.mjs bundles.
-  const manifestPath = join(HERE, "plugin", ".claude-plugin", "plugin.json");
-  const version = (JSON.parse(readFileSync(manifestPath, "utf8")) as { version?: string }).version ?? "0.0.0-dev";
+  // Read (and cross-check) BEFORE the clean below: dist/ is committed, so a build that refuses must
+  // leave the working tree's bundles intact rather than deleting them on the way out.
+  const version = readVersion();
+
+  // Clean so a removed/renamed entrypoint can never leave a stale .mjs behind.
+  await rm(OUTDIR, { recursive: true, force: true });
 
   const result = await Bun.build({
     entrypoints: ENTRYPOINTS,
@@ -71,7 +103,7 @@ async function main(): Promise<void> {
   }
 
   const names = result.outputs.map((o) => o.path.split("/").pop()).sort();
-  console.log(`Built ${result.outputs.length} artifacts into ${OUTDIR}:`);
+  console.log(`Built ${result.outputs.length} artifacts stamped ${version} into ${OUTDIR}:`);
   for (const n of names) console.log(`  ${n}`);
 }
 

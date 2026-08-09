@@ -56,6 +56,57 @@ describe("PLUGIN_VERSION", () => {
   });
 });
 
+// The version a running daemon self-reports (watchdog pidfile, a record's `dbg`, the x-cc-version
+// header) comes from the stamp baked into the COMMITTED plugin/dist/*.mjs — not from the manifests a
+// host reads. Those two drift apart the moment a version bump edits the manifests without re-running
+// `bun build.ts`, and the result is a daemon that runs new code while reporting the old version, which
+// costs real time in a diagnosis. build.ts refuses to bundle manifests that disagree with each other;
+// this is the other half — it proves the checked-in bundle actually carries the current version.
+const REPO_ROOT = join(import.meta.dir, "..", "..");
+
+/** Every manifest carrying the plugin version. The Claude plugin manifest is the source build.ts
+ *  injects from; the rest are what the Claude/Codex marketplaces and the Codex host display. */
+const VERSION_MANIFESTS: [path: string, pick: (doc: any) => (string | undefined)[]][] = [
+  ["plugin/.claude-plugin/plugin.json", (d) => [d.version]],
+  ["plugin/.codex-plugin/plugin.json", (d) => [d.version]],
+  [".claude-plugin/marketplace.json", (d) => (d.plugins ?? []).map((p: any) => p.version)],
+  [".agents/plugins/marketplace.json", (d) => (d.plugins ?? []).map((p: any) => p.version)],
+];
+
+const manifestVersion = async (path: string): Promise<any> =>
+  JSON.parse(await readFile(join(REPO_ROOT, path), "utf8"));
+
+describe("release version stamp (manifests ↔ committed dist)", () => {
+  test("every manifest declares the same version", async () => {
+    const [sourcePath, sourcePick] = VERSION_MANIFESTS[0];
+    const expected = sourcePick(await manifestVersion(sourcePath))[0];
+    expect(expected).toMatch(/^\d+\.\d+\.\d+$/);
+
+    for (const [path, pick] of VERSION_MANIFESTS) {
+      const found = pick(await manifestVersion(path));
+      expect(found.length).toBeGreaterThan(0);
+      // Named per-manifest so a partial bump names the file that was missed.
+      for (const version of found) expect({ path, version }).toEqual({ path, version: expected });
+    }
+  });
+
+  test("every committed dist bundle is stamped with the manifest version (rebuild after a bump)", async () => {
+    const [sourcePath, sourcePick] = VERSION_MANIFESTS[0];
+    const expected = sourcePick(await manifestVersion(sourcePath))[0];
+
+    const distDir = join(REPO_ROOT, "plugin", "dist");
+    const bundles = (await readdir(distDir)).filter((f) => f.endsWith(".mjs"));
+    expect(bundles.length).toBeGreaterThan(0);
+
+    for (const bundle of bundles) {
+      const source = await readFile(join(distDir, bundle), "utf8");
+      const stamp = source.match(/PLUGIN_VERSION = "([^"]+)"/)?.[1];
+      // Named per-bundle so a stale dist/ names the artifact and the version it is stuck on.
+      expect({ bundle, stamp }).toEqual({ bundle, stamp: expected });
+    }
+  });
+});
+
 // localApprovalsState is the ONE place that turns the local `no-hold` pause flag into the wire value
 // carried by every /cc/event POST. The worker literal-matches "on"/"off" and silently ignores every
 // other string, so these assert the EXACT bytes — no case folding, no substring.
