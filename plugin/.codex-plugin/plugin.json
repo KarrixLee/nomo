@@ -22,6 +22,7 @@
     "displayName": "Nomo",
     "shortDescription": "Mirror Codex sessions to your iPhone as a Live Activity",
     "category": "Productivity",
+    "websiteURL": "https://nomo.gg",
     "logo": "./assets/icon.png",
     "logoDark": "./assets/icon-dark.png",
     "composerIcon": "./assets/icon.png"
