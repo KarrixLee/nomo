@@ -16,6 +16,8 @@ Mirror your **Claude Code** and **OpenAI Codex** session milestones to the
 **Nomo iPhone app** as a Live Activity (Dynamic Island). A
 session's status — working, needs-your-approval, done — shows up on your phone in real time,
 so you can step away from the terminal and still know when an agent needs you or has finished.
+When an agent stops for a permission prompt or a question, you can **answer it from the phone** —
+tap Allow/Deny or pick an option and the session carries on without you at the keyboard.
 Works with **Codex** in the terminal and the **Codex desktop app** alike.
 
 > [!NOTE]
@@ -130,6 +132,8 @@ Other commands:
 - `/nomo-cc:pair code` — no-browser variant for a headless/SSH box: skips the QR page and prints the
   one-time typeable code straight into the terminal, so you can enter it in the app by hand.
 - `/nomo-cc:status` — pairing / watchdog / last-delivery health at a glance.
+- `/nomo-cc:approvals` — pause or resume remote approvals on this computer (one switch, both agents),
+  for when your phone is away and you want prompts to stay in the terminal.
 - `/nomo-cc:reset` — panic button for stuck/phantom sessions: stops the watchdog and clears
   dead session rows from the phone, **without** unpairing.
 - `/nomo-cc:unpair` — revoke the pairing on the server and delete local pairing state.
@@ -158,12 +162,14 @@ plugin (`hooks/codex-hooks.json`) but stay **inert until trusted** — this is C
 gate, which Nomo cannot pre-approve. The hook command lines are byte-stable across releases, so
 trusting once holds through updates (only a changed hook line re-arms the review).
 
-The plugin bundles four **skills** — invoke them by typing `$<skill>` (or in natural language):
+The plugin bundles five **skills** — invoke them by typing `$<skill>` (or in natural language):
 
 - `$nomo-pair` — pair this machine with your phone (opens a browser page with the QR code + one-time
   code, then confirms the scan). One pairing is **shared** with Claude Code if both agents run on this
   machine.
 - `$nomo-status` — pairing / watchdog / hook-trust / last-delivery health.
+- `$nomo-approvals` — pause or resume remote approvals on this computer (one switch, shared with
+  Claude Code).
 - `$nomo-reset` — panic button for stuck/phantom sessions: stops the watchdog and clears dead
   session rows from the phone, without unpairing.
 - `$nomo-unpair` — revoke the pairing and clear local state.
@@ -174,11 +180,23 @@ the only difference from Claude Code is that Codex's encrypted blob is tagged `a
 the phone can brand it. The island shows the **most-recently-active** session regardless of which
 agent produced it.
 
-### Answer Codex Plan questions from Nomo
+## Answer from your phone
 
-Nomo 1.4 can answer Codex `request_user_input` multiple-choice prompts from the existing encrypted
-question picker. This responder path requires the Codex task and Nomo watchdog to share the same
-app-server process. Start Codex's local daemon **before** opening a new Codex terminal session:
+When a session stops for a **permission prompt** (run a shell command, apply a patch, …) or a
+multiple-choice **question**, the card reaches the phone with its options. Tap **Allow** / **Deny**
+or pick an option and the terminal — which was waiting — carries on. Works for both Claude Code and
+Codex; the answer rides back inside the same E2E-encrypted blob, so the relay never learns what you
+chose. `/nomo-cc:approvals` (or `$nomo-approvals`) is the local off switch when your phone is away.
+
+Only sessions your phone is actually showing are answerable, and a hold is never open-ended — it is
+**fail-open**: if no answer arrives (phone asleep, network down, ~5 min ceiling), the prompt simply
+reappears in the terminal. Nomo can delay a decision; it can never make one for you.
+
+### Codex questions need the shared daemon
+
+Codex `request_user_input` prompts additionally require the Codex task and the Nomo watchdog to
+share one app-server process. Start Codex's local daemon **before** opening a new Codex terminal
+session:
 
 ```sh
 codex app-server daemon start
@@ -205,6 +223,13 @@ Codex exposes or adopts the shared control socket.
   pid; a single detached `cc-watchdog.mjs` polls every 5 s and POSTs a corrective `end` once that
   pid is dead (Codex interrupts are detected from the rollout transcript). When no sessions remain
   it exits; the next hook re-spawns it.
+- **LAN fast path.** When the phone is on the same network, the watchdog hosts a tiny local HTTP
+  listener so commands and answers travel direct (<200 ms) instead of waiting to be piggybacked on
+  the next relay response (~5–12 s). It is strictly additive: the relay leg runs in parallel and
+  stays canonical, so every LAN failure collapses into "the relay wins", never a lost command. The
+  envelope carries a **second** seal (`K_lan`, HKDF-derived from the pairing key) so nobody on the
+  Wi-Fi can read even the metadata, and a relay ciphertext simply won't open on the LAN channel.
+  Off by default — turn it on in the Nomo app.
 - **Encryption boundary.** The Worker only ever sees ciphertext; decryption happens on the phone
   (and, for the Live Activity, in the widget at render time). The agent marker is inside the blob,
   so even the fan-out relay can't tell Claude from Codex.
@@ -225,13 +250,13 @@ agent adapters), and `qr/` (the vendored QR encoder). All are written to run unm
 bun test
 ```
 
-Runs the full suite (~318 tests across `core/`, `entries/`, and `qr/`).
+Runs the full suite (~1500 tests across `core/`, `entries/`, and `qr/`).
 
 ### Building the plugin bundle
 
-`build.ts` bundles the eight entrypoints (`cc-status`, `codex-status`, `codex-notify`,
-`cc-watchdog`, `pair`, `unpair`, `reset`, `status-cmd`) into `plugin/dist/*.mjs`, inlining every local
-import so each artifact is a single node-runnable file:
+`build.ts` bundles the ten entrypoints (`cc-status`, `cc-permission`, `codex-status`,
+`codex-permission`, `codex-notify`, `cc-watchdog`, `pair`, `unpair`, `reset`, `status-cmd`) into
+`plugin/dist/*.mjs`, inlining every local import so each artifact is a single node-runnable file:
 
 ```
 bun build.ts
