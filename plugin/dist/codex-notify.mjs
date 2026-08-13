@@ -103,7 +103,7 @@ async function sha256Hex(s) {
 }
 
 // src/core/shared.ts
-var PLUGIN_VERSION = "2.0.0";
+var PLUGIN_VERSION = "2.0.1";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -1924,13 +1924,24 @@ function claudeTailPendingApproval(tail) {
   return false;
 }
 var CLAUDE_HEADLESS_ARG_TOKENS = new Set(["-p", "--print", "--output-format"]);
-var CLAUDE_DAEMON_MARKERS = [
-  "claude-mem",
-  "worker-service",
+var CLAUDE_SELF_DAEMON_MARKERS = [
   "daemon run --origin transient",
   "bg-pty-host",
   "bg-spare"
 ];
+var CLAUDE_LAUNCHER_MARKERS = ["claude-mem", "worker-service"];
+var CLAUDE_DESKTOP_BUNDLED_PATH_PARTS = [
+  "/Library/Application Support/Claude/claude-code/",
+  "/claude.app/Contents/MacOS/claude"
+];
+var CLAUDE_DESKTOP_LAUNCHER = "Claude.app/Contents/Helpers/disclaimer";
+function claudeDesktopInvocation(selfArgs, ancestorArgs) {
+  if (typeof selfArgs !== "string" || selfArgs.length === 0)
+    return false;
+  if (!CLAUDE_DESKTOP_BUNDLED_PATH_PARTS.every((part) => selfArgs.includes(part)))
+    return false;
+  return ancestorArgs.some((a) => typeof a === "string" && a.includes(CLAUDE_DESKTOP_LAUNCHER));
+}
 function claudeForkResumePredecessor(command) {
   if (typeof command !== "string" || command.length === 0)
     return;
@@ -1946,14 +1957,16 @@ function claudeForkResumePredecessor(command) {
 }
 function claudeHeadlessInvocation(selfArgs, ancestorArgs) {
   const chain = [selfArgs, ...ancestorArgs].filter((s) => typeof s === "string" && s.length > 0);
-  if (chain.some((args) => CLAUDE_DAEMON_MARKERS.some((m) => args.includes(m))))
+  if (chain.some((args) => CLAUDE_SELF_DAEMON_MARKERS.some((m) => args.includes(m))))
     return true;
-  if (typeof selfArgs !== "string" || selfArgs.length === 0)
+  const tokens = typeof selfArgs === "string" ? selfArgs.trim().split(/\s+/) : [];
+  if (tokens.includes("--fork-session") && tokens.includes("--reply-on-resume"))
+    return true;
+  if (claudeDesktopInvocation(selfArgs, ancestorArgs))
     return false;
-  const tokens = selfArgs.trim().split(/\s+/);
-  if (tokens.some((tok) => CLAUDE_HEADLESS_ARG_TOKENS.has(tok)))
+  if (chain.some((args) => CLAUDE_LAUNCHER_MARKERS.some((m) => args.includes(m))))
     return true;
-  return tokens.includes("--fork-session") && tokens.includes("--reply-on-resume");
+  return tokens.some((tok) => CLAUDE_HEADLESS_ARG_TOKENS.has(tok));
 }
 var CODEX_ROLLOUT_IDLE_SILENCE_MS = 30000;
 var CODEX_TURN_OPEN_EVENT = "task_started";
@@ -2501,6 +2514,9 @@ var claudeAdapter = {
   isHeadlessInvocation({ pid, ancestorsOf, commandOf }) {
     return claudeHeadlessInvocation(commandOf(pid), ancestorsOf(pid).map((p) => commandOf(p)));
   },
+  isDesktopInvocation({ pid, ancestorsOf, commandOf }) {
+    return claudeDesktopInvocation(commandOf(pid), ancestorsOf(pid).map((p) => commandOf(p)));
+  },
   forkResumePredecessor(command) {
     return claudeForkResumePredecessor(command);
   },
@@ -2577,7 +2593,7 @@ function adapterFor(agent) {
 var allAdapters = [claudeAdapter, codexAdapter];
 
 // src/core/hook.ts
-import { readdir as readdir2, readFile as readFile4, unlink as unlink2 } from "node:fs/promises";
+import { readdir as readdir2, readFile as readFile4, stat as stat3, unlink as unlink2 } from "node:fs/promises";
 import { hostname } from "node:os";
 import { basename as basename3 } from "node:path";
 
@@ -3150,6 +3166,20 @@ async function runHook(agent) {
         reason: "invoking process or ancestor matches a non-interactive/daemon discriminator"
       });
       return;
+    }
+    if (!existingRecord && adapter2.isDesktopInvocation?.({
+      pid: hookPid,
+      ancestorsOf: pidAncestors,
+      commandOf: pidCommand
+    })) {
+      const transcriptOnDisk = transcriptPath.length > 0 && await stat3(transcriptPath).then(() => true, () => false);
+      if (!transcriptOnDisk) {
+        suppress({
+          guard: "claude-desktop-no-transcript",
+          reason: "desktop-app session id has no transcript file yet"
+        });
+        return;
+      }
     }
     const title = await readTitle() ?? existingRecord?.title;
     if (!existingRecord && clearLineage && !title) {

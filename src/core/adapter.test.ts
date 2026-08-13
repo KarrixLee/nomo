@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, test } from "bun:test";
 import {
-  adapterFor, allAdapters, claudeAdapter, claudeClearPredecessor, claudeForkResumePredecessor, claudeHeadlessInvocation, claudeLocateTuiPid, claudeSessionModel, claudeSessionTitle,
+  adapterFor, allAdapters, claudeAdapter, claudeClearPredecessor, claudeDesktopInvocation, claudeForkResumePredecessor, claudeHeadlessInvocation, claudeLocateTuiPid, claudeSessionModel, claudeSessionTitle,
   claudeTailPendingApproval, codexAdapter, codexChildSessionGhost, codexLocateTuiPid, codexTuiCandidates,
   codexConfigModel, codexDiscoverLive, codexInternalSessionGhost, codexModelFromRollout,
   CODEX_ROLLOUT_IDLE_SILENCE_MS,
@@ -1218,6 +1218,99 @@ describe("claudeHeadlessInvocation (skip a non-interactive / daemon-spawned clau
     const interactive: Record<number, string> = { 100: "claude", 200: "/bin/zsh" };
     expect(claudeAdapter.isHeadlessInvocation!({
       pid: 100, ancestorsOf: () => [200], commandOf: (p) => interactive[p],
+    })).toBe(false);
+  });
+});
+
+// --- Claude DESKTOP app sessions must mirror (they are human interactive sessions) --------------
+//
+// The desktop app runs a bundled `claude` per conversation window, tty-less, with an argv that trips
+// BOTH headless branches: `--output-format stream-json` (headless token) and
+// `--plugin-dir …/claude-mem/<version>` (a launcher marker matched inside a flag VALUE). It must be
+// allow-listed — but its bundled binary ALSO self-forks the `--bg-spare` / `--bg-pty-host` ring under
+// the very same ancestry, and those must stay suppressed.
+
+describe("claudeHeadlessInvocation — Claude desktop app (bundled binary under the disclaimer launcher)", () => {
+  const bundled = "/Users/karrix/Library/Application Support/Claude/claude-code/2.1.227/claude.app/Contents/MacOS/claude";
+  const desktopAncestors = [
+    "/Applications/Claude.app/Contents/Helpers/disclaimer /Users/karrix/Library/Application Support/Claude/claude-code/2.1.227/claude.app/Contents/MacOS/claude",
+    "/Applications/Claude.app/Contents/MacOS/Claude",
+  ];
+  /** The live desktop argv (pid 1426), including the claude-mem --plugin-dir that is the whole bug. */
+  const desktopArgs = (extra = ""): string =>
+    `${bundled} --output-format stream-json --verbose --input-format stream-json --effort high` +
+    ` --model claude-opus-4-8 --permission-prompt-tool stdio${extra ? ` ${extra}` : ""}` +
+    " --allowedTools mcp__computer-use,mcp__web" +
+    " --setting-sources=user,project,local --permission-mode auto --include-partial-messages" +
+    " --plugin-dir /Users/karrix/.claude/plugins/cache/thedotmack/claude-mem/13.12.4" +
+    " --plugin-dir /Users/karrix/.claude/plugins/cache/karrixlee/nomo/2.0.1" +
+    " --thinking-display summarized --replay-user-messages --settings {}";
+  /** claude-mem's observer run: PATH claude, not the bundled binary. */
+  const observerArgs = "/Users/karrix/.local/bin/claude --output-format stream-json --verbose" +
+    " --input-format stream-json --model claude-sonnet-4-6 --permission-prompt-tool stdio" +
+    " --permission-mode dontAsk --no-session-persistence";
+  const observerAncestors = [
+    "/Users/karrix/.bun/bin/bun /Users/karrix/.claude/plugins/cache/thedotmack/claude-mem/13.12.4/scripts/worker-service.cjs --daemon",
+  ];
+
+  test("a real desktop session mirrors — first start AND resume", () => {
+    expect(claudeHeadlessInvocation(desktopArgs(), desktopAncestors)).toBe(false);
+    expect(claudeHeadlessInvocation(
+      desktopArgs("--resume=ef0bb7c5-d12e-4763-82a5-0d03999ed407"), desktopAncestors,
+    )).toBe(false);
+  });
+
+  test("the allow-list is version- and location-agnostic", () => {
+    const future = desktopArgs().replace("claude-code/2.1.227/", "claude-code/9.9.999/");
+    expect(claudeHeadlessInvocation(future, desktopAncestors)).toBe(false);
+    const relocated = desktopAncestors.map((a) => a.replace("/Applications/", "/Users/karrix/Applications/"));
+    expect(claudeHeadlessInvocation(desktopArgs(), relocated)).toBe(false);
+  });
+
+  test("a user folder whose NAME contains a launcher marker can't re-suppress the desktop", () => {
+    expect(claudeHeadlessInvocation(
+      desktopArgs(`--add-dir "/Users/karrix/Downloads/some claude-mem folder"`), desktopAncestors,
+    )).toBe(false);
+  });
+
+  test("the desktop's own detached spare ring stays suppressed (allow-list must not rescue it)", () => {
+    expect(claudeHeadlessInvocation(`${bundled} --bg-spare 3`, desktopAncestors)).toBe(true);
+    expect(claudeHeadlessInvocation(desktopArgs(), [...desktopAncestors, `${bundled} --bg-pty-host`])).toBe(true);
+    expect(claudeHeadlessInvocation(desktopArgs(), [...desktopAncestors, "claude daemon run --origin transient"])).toBe(true);
+    expect(claudeHeadlessInvocation(
+      `${bundled} --fork-session --resume old.jsonl --reply-on-resume`, desktopAncestors,
+    )).toBe(true);
+  });
+
+  test("claude-mem's observer stays suppressed even when the desktop app is its ancestor", () => {
+    expect(claudeHeadlessInvocation(observerArgs, observerAncestors)).toBe(true);
+    expect(claudeHeadlessInvocation(observerArgs, [...observerAncestors, ...desktopAncestors])).toBe(true);
+  });
+
+  test("half a match is no match, in either direction", () => {
+    expect(claudeHeadlessInvocation(desktopArgs(), ["/bin/zsh -l"])).toBe(true); // bundled, no disclaimer
+    expect(claudeHeadlessInvocation(observerArgs, desktopAncestors)).toBe(true); // disclaimer, PATH claude
+    expect(claudeDesktopInvocation(desktopArgs(), ["/bin/zsh -l"])).toBe(false);
+    expect(claudeDesktopInvocation(observerArgs, desktopAncestors)).toBe(false);
+    expect(claudeDesktopInvocation(desktopArgs(), desktopAncestors)).toBe(true);
+    expect(claudeDesktopInvocation(undefined, [undefined])).toBe(false);
+  });
+
+  test("terminal sessions are untouched", () => {
+    expect(claudeHeadlessInvocation("claude", ["/bin/zsh -l", "/opt/homebrew/bin/herdr", "ghostty"])).toBe(false);
+    expect(claudeHeadlessInvocation("claude --resume ef0bb7c5-d12e-4763-82a5-0d03999ed407", ["/bin/zsh -l"])).toBe(false);
+    expect(claudeHeadlessInvocation("claude -p 'x'", ["/bin/zsh -l"])).toBe(true);
+    expect(claudeHeadlessInvocation("claude --print", ["/bin/zsh -l"])).toBe(true);
+  });
+
+  test("claudeAdapter wires the desktop seam (codex omits it)", () => {
+    expect(codexAdapter.isDesktopInvocation).toBeUndefined();
+    const commands: Record<number, string> = { 100: desktopArgs(), 200: desktopAncestors[0]!, 300: desktopAncestors[1]! };
+    expect(claudeAdapter.isDesktopInvocation!({
+      pid: 100, ancestorsOf: () => [200, 300], commandOf: (p) => commands[p],
+    })).toBe(true);
+    expect(claudeAdapter.isDesktopInvocation!({
+      pid: 100, ancestorsOf: () => [], commandOf: () => "claude",
     })).toBe(false);
   });
 });

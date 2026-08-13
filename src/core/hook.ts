@@ -17,7 +17,7 @@
 // async-iterable process.stdin, file IO via node:fs/promises (shared helpers). build.ts bundles
 // this (inlined into each entry) to a .mjs.
 
-import { readdir, readFile, unlink } from "node:fs/promises";
+import { readdir, readFile, stat, unlink } from "node:fs/promises";
 import { hostname } from "node:os";
 import { basename } from "node:path";
 import { encryptBlob } from "./crypto";
@@ -857,6 +857,30 @@ export async function runHook(agent: AgentKind): Promise<void> {
         reason: "invoking process or ancestor matches a non-interactive/daemon discriminator",
       });
       return;
+    }
+
+    // Desktop-app LAUNCH phantoms (adapter seam; claude-only). Opening the Claude desktop app mints a
+    // handful of session ids (9 of 11 observed in one day, three within the same millisecond) that fire
+    // SessionStart source:"startup" → SessionEnd inside 200-600 ms, never a UserPromptSubmit, and NEVER
+    // get a transcript file — across 148 recorded sessions the transcript-less population IS exactly the
+    // phantom population. Left unguarded every app launch would make ~9 untitled rows appear and vanish
+    // on the phone within a second. Like the codex internal-job net this is a DEFER, not a verdict: the
+    // id is never-tracked, hooks fire many times per turn, and a real desktop session (fresh OR resumed —
+    // Claude writes the transcript at session creation) already has its file, so at worst a session
+    // racing its very first flush loses one frame. Scoped to DESKTOP invocations because a terminal
+    // `claude` legitimately creates its row at startup before any transcript exists.
+    if (!existingRecord && adapter.isDesktopInvocation?.({
+      pid: hookPid, ancestorsOf: pidAncestors, commandOf: pidCommand,
+    })) {
+      const transcriptOnDisk = transcriptPath.length > 0 &&
+        await stat(transcriptPath).then(() => true, () => false);
+      if (!transcriptOnDisk) {
+        suppress({
+          guard: "claude-desktop-no-transcript",
+          reason: "desktop-app session id has no transcript file yet",
+        });
+        return;
+      }
     }
 
     // Keep the LAST NON-EMPTY title, like model below: a later hook whose bounded reads find nothing

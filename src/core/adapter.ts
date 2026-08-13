@@ -902,16 +902,50 @@ export function claudeTailPendingApproval(tail: string): boolean {
  *  non-interactive print mode (`-p` / `--print`). An interactive human session carries none of these. */
 const CLAUDE_HEADLESS_ARG_TOKENS = new Set(["-p", "--print", "--output-format"]);
 
-/** Command-line shapes of known daemons/harnesses that spawn headless Claude (claude-mem's
- *  worker-service). Matched as SUBSTRINGS against the invoking process AND its ancestor chain, since a
- *  bundled worker shows up as an absolute script path rather than a bare token. */
-const CLAUDE_DAEMON_MARKERS = [
-  "claude-mem",
-  "worker-service",
+/** Command-line shapes of the claude BINARY's OWN detached modes: `claude daemon run --origin
+ *  transient` and the `--bg-pty-host` / `--bg-spare` ring it self-forks with `pinToCurrentBinary`.
+ *  These are real flags of the binary, so the DESKTOP-bundled binary forks the same spare ring under
+ *  the same `Claude.app` ancestry — the desktop allow-list below must NEVER rescue them. Matched as
+ *  SUBSTRINGS against the invoking process AND its ancestor chain. */
+const CLAUDE_SELF_DAEMON_MARKERS = [
   "daemon run --origin transient",
   "bg-pty-host",
   "bg-spare",
 ];
+
+/** Command-line shapes of THIRD-PARTY launchers that spawn headless Claude (claude-mem's
+ *  worker-service). Also substring-matched over the whole chain, because a bundled worker shows up as
+ *  an absolute script path rather than a bare token — which means these also match a mere flag VALUE.
+ *  The Claude desktop app passes exactly such values (`--plugin-dir …/claude-mem/13.12.4`, and
+ *  `--add-dir "<any user folder>"`), which is why the desktop allow-list is consulted BEFORE these.
+ *  ponytail: substring match can still hit a flag value on a NON-desktop invoker; the general cure is
+ *  a shell-quote-aware argv split, worth writing only if a second false-positive source appears. */
+const CLAUDE_LAUNCHER_MARKERS = ["claude-mem", "worker-service"];
+
+/** The two halves of the path the Claude DESKTOP app runs its bundled `claude` from:
+ *  `~/Library/Application Support/Claude/claude-code/<version>/claude.app/Contents/MacOS/claude`.
+ *  Split around the version segment and anchored on neither `$HOME` nor `/Applications`: this project
+ *  has been bitten by version-pinned paths before (the hook shim), and a relocated bundle or a newer
+ *  claude-code must classify identically. */
+const CLAUDE_DESKTOP_BUNDLED_PATH_PARTS = [
+  "/Library/Application Support/Claude/claude-code/",
+  "/claude.app/Contents/MacOS/claude",
+];
+
+/** The desktop app's launcher, which sits between the Electron main process and the bundled `claude`:
+ *  `…/Claude.app/Contents/Helpers/disclaimer <cmd…>`. Location-agnostic on purpose. */
+const CLAUDE_DESKTOP_LAUNCHER = "Claude.app/Contents/Helpers/disclaimer";
+
+/** Pure: is this hook's invoking `claude` a conversation window of the Claude DESKTOP app? BOTH
+ *  anchors are required — the bundled binary path on the invoker's OWN argv AND the `disclaimer`
+ *  launcher somewhere in its ancestry. Either half alone is NOT enough: claude-mem shells out to the
+ *  PATH `claude` (so desktop ancestry with a `~/.local/bin/claude` self argv is still an observer
+ *  run), and the bundled binary self-forks its detached `--bg-spare` ring with no disclaimer parent. */
+export function claudeDesktopInvocation(selfArgs: string | undefined, ancestorArgs: (string | undefined)[]): boolean {
+  if (typeof selfArgs !== "string" || selfArgs.length === 0) return false;
+  if (!CLAUDE_DESKTOP_BUNDLED_PATH_PARTS.every((part) => selfArgs.includes(part))) return false;
+  return ancestorArgs.some((a) => typeof a === "string" && a.includes(CLAUDE_DESKTOP_LAUNCHER));
+}
 
 /** Extract the predecessor session id from the precise Claude daemon fork/replay argv shape:
  *  `--fork-session --resume <old-transcript>.jsonl --reply-on-resume`. Requiring BOTH replay flags,
@@ -934,19 +968,25 @@ export function claudeForkResumePredecessor(command: string | undefined): string
 /** Pure: does the invoking `claude`'s own argv, or any ANCESTOR's argv, look like a non-interactive /
  *  daemon-spawned run whose session must NOT become a phone row? `selfArgs` is process.ppid's command
  *  line (the `claude` that ran this hook); `ancestorArgs` are its ancestors' command lines (undefined
- *  entries — a `ps` that failed for that pid — are ignored). True iff a known daemon marker appears
- *  anywhere in the chain, OR the self argv carries a headless flag as a whole token (`--output-format`
- *  is followed by its value as a separate arg, so an exact-token match catches it; tokenizing means a
- *  path that merely contains "-p" can't false-trigger). */
+ *  entries — a `ps` that failed for that pid — are ignored).
+ *
+ *  Order matters. The binary's own detached modes are checked FIRST and are unconditional, because the
+ *  Claude desktop app's bundled binary self-forks that very spare ring (`--bg-spare`, `--bg-pty-host`,
+ *  pinned to the same bundled path under the same `Claude.app` ancestry) — a desktop allow-list ahead
+ *  of them would resurrect every one of those phantoms. Only then is the DESKTOP allow-list consulted:
+ *  a real desktop conversation window is a human's interactive session and must mirror, yet its argv
+ *  trips both remaining branches — it carries `--output-format stream-json` (headless token) and it
+ *  passes `--plugin-dir …/claude-mem/<version>` (launcher marker matched inside a flag VALUE). */
 export function claudeHeadlessInvocation(selfArgs: string | undefined, ancestorArgs: (string | undefined)[]): boolean {
   const chain = [selfArgs, ...ancestorArgs].filter((s): s is string => typeof s === "string" && s.length > 0);
-  if (chain.some((args) => CLAUDE_DAEMON_MARKERS.some((m) => args.includes(m)))) return true;
-  if (typeof selfArgs !== "string" || selfArgs.length === 0) return false;
-  const tokens = selfArgs.trim().split(/\s+/);
-  if (tokens.some((tok) => CLAUDE_HEADLESS_ARG_TOKENS.has(tok))) return true;
+  if (chain.some((args) => CLAUDE_SELF_DAEMON_MARKERS.some((m) => args.includes(m)))) return true;
+  const tokens = typeof selfArgs === "string" ? selfArgs.trim().split(/\s+/) : [];
   // The replay daemon carries neither -p nor --print. The pair is load-bearing: --fork-session alone
   // is a legitimate interactive feature, while --reply-on-resume is the daemon's auto-reply mode.
-  return tokens.includes("--fork-session") && tokens.includes("--reply-on-resume");
+  if (tokens.includes("--fork-session") && tokens.includes("--reply-on-resume")) return true;
+  if (claudeDesktopInvocation(selfArgs, ancestorArgs)) return false;
+  if (chain.some((args) => CLAUDE_LAUNCHER_MARKERS.some((m) => args.includes(m)))) return true;
+  return tokens.some((tok) => CLAUDE_HEADLESS_ARG_TOKENS.has(tok));
 }
 
 // --- Codex idle-vs-in-flight turn classification (for discovery/provisional rows) -------------
@@ -1921,6 +1961,12 @@ export interface AgentAdapter {
    *  reader (pidCommand) so the pure classifier stays testable. Called by runHook only when NO session
    *  record exists yet, so an already-live interactive session can never be silenced. */
   isHeadlessInvocation?(ctx: { pid: number; ancestorsOf: (pid: number) => number[]; commandOf: (pid: number) => string | undefined }): boolean;
+  /** OPTIONAL: is the INVOKING agent process a DESKTOP-app conversation window (as opposed to a
+   *  terminal CLI)? Same ctx as isHeadlessInvocation. Claude implements it (see
+   *  claudeDesktopInvocation); Codex OMITS it. runHook uses it to scope the transcript-less launch
+   *  phantom defer to desktop invocations only — a fresh terminal `claude` legitimately creates its
+   *  row before its transcript exists, and that must keep working. */
+  isDesktopInvocation?(ctx: { pid: number; ancestorsOf: (pid: number) => number[]; commandOf: (pid: number) => string | undefined }): boolean;
   /** Where this agent's session transcripts live (recursively scanned for liveness). */
   sessionsDir(): string;
   /** Whether a filename under sessionsDir() is one of this agent's session transcripts. */
@@ -2003,6 +2049,12 @@ export const claudeAdapter: AgentAdapter = {
   // never becomes a stuck "working" phone row. See claudeHeadlessInvocation.
   isHeadlessInvocation({ pid, ancestorsOf, commandOf }): boolean {
     return claudeHeadlessInvocation(commandOf(pid), ancestorsOf(pid).map((p) => commandOf(p)));
+  },
+  // Launch-phantom scope: opening the Claude desktop app fires SessionStart→SessionEnd within a
+  // second for ~9 session ids that never get a prompt and never get a transcript file. Only desktop
+  // invocations are subject to that defer. See claudeDesktopInvocation.
+  isDesktopInvocation({ pid, ancestorsOf, commandOf }): boolean {
+    return claudeDesktopInvocation(commandOf(pid), ancestorsOf(pid).map((p) => commandOf(p)));
   },
   forkResumePredecessor(command: string | undefined): string | undefined {
     return claudeForkResumePredecessor(command);
