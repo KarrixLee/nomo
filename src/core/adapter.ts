@@ -922,6 +922,13 @@ const CLAUDE_SELF_DAEMON_MARKERS = [
  *  a shell-quote-aware argv split, worth writing only if a second false-positive source appears. */
 const CLAUDE_LAUNCHER_MARKERS = ["claude-mem", "worker-service"];
 
+/** The value Claude Code puts in `CLAUDE_CODE_ENTRYPOINT` for a desktop-app conversation window (a
+ *  terminal CLI session says `cli`). Claude Code exports it into the environment it spawns hooks
+ *  with, and it is inherited by their children, so it is the PRIMARY desktop signal: no version
+ *  segment, no bundle location, no ancestor walk — and it works on Windows, where the `ps`-based
+ *  pidAncestors/pidCommand return nothing at all. */
+const CLAUDE_DESKTOP_ENTRYPOINT = "claude-desktop";
+
 /** The two halves of the path the Claude DESKTOP app runs its bundled `claude` from:
  *  `~/Library/Application Support/Claude/claude-code/<version>/claude.app/Contents/MacOS/claude`.
  *  Split around the version segment and anchored on neither `$HOME` nor `/Applications`: this project
@@ -936,12 +943,39 @@ const CLAUDE_DESKTOP_BUNDLED_PATH_PARTS = [
  *  `…/Claude.app/Contents/Helpers/disclaimer <cmd…>`. Location-agnostic on purpose. */
 const CLAUDE_DESKTOP_LAUNCHER = "Claude.app/Contents/Helpers/disclaimer";
 
-/** Pure: is this hook's invoking `claude` a conversation window of the Claude DESKTOP app? BOTH
- *  anchors are required — the bundled binary path on the invoker's OWN argv AND the `disclaimer`
- *  launcher somewhere in its ancestry. Either half alone is NOT enough: claude-mem shells out to the
- *  PATH `claude` (so desktop ancestry with a `~/.local/bin/claude` self argv is still an observer
- *  run), and the bundled binary self-forks its detached `--bg-spare` ring with no disclaimer parent. */
-export function claudeDesktopInvocation(selfArgs: string | undefined, ancestorArgs: (string | undefined)[]): boolean {
+/** Pure: is this hook's invoking `claude` a conversation window of the Claude DESKTOP app?
+ *
+ *  PRIMARY signal: `entrypoint` — the process env's `CLAUDE_CODE_ENTRYPOINT`, read at the adapter
+ *  seam and injected here so this stays a pure classifier. Claude Code itself declares what it is.
+ *
+ *  FALLBACK (deliberately kept, not dead weight): the two path anchors — the bundled binary path on
+ *  the invoker's OWN argv AND the `disclaimer` launcher somewhere in its ancestry. The env var is
+ *  occasionally absent in practice (claude-status-bar carries the last known value forward across
+ *  events for exactly that reason), and a fingerprint that silently degraded to "not desktop" would
+ *  resurrect the suppressed-desktop-session bug INTERMITTENTLY — far worse to diagnose than the
+ *  deterministic version. Both anchors are required: either half alone is NOT enough — claude-mem
+ *  shells out to the PATH `claude` (so desktop ancestry with a `~/.local/bin/claude` self argv is
+ *  still an observer run), and the bundled binary self-forks its detached `--bg-spare` ring with no
+ *  disclaimer parent. The anchors are a fallback, never a VETO: a non-desktop entrypoint on the
+ *  bundled binary under `disclaimer` ancestry does not occur, and trusting the paths there keeps a
+ *  real conversation window mirroring.
+ *
+ *  ponytail: `claude-desktop` marks a desktop LINEAGE, not strictly a conversation WINDOW — the CLI
+ *  keeps an inherited entrypoint verbatim (it only rewrites an empty/`cli` one to `sdk-cli` for a
+ *  non-interactive run), so a third-party launcher that forwards its whole environment AND was itself
+ *  first started from a desktop session would hand its headless `claude` children `claude-desktop`
+ *  too, and this would allow-list them. Not a live risk here: claude-mem's worker daemon and its
+ *  observer runs were both verified to carry NO `CLAUDE_CODE_ENTRYPOINT` at all, and the argv anchors
+ *  still separate window from child on macOS. Upgrade path if a leaking launcher ever appears: gate
+ *  the entrypoint-only branch on the invoker's own argv being the bundled binary — which forfeits the
+ *  Windows/relocated-bundle coverage that is the whole point of the env var, so only pay it for a
+ *  real repro. */
+export function claudeDesktopInvocation(
+  selfArgs: string | undefined,
+  ancestorArgs: (string | undefined)[],
+  entrypoint?: string,
+): boolean {
+  if (entrypoint === CLAUDE_DESKTOP_ENTRYPOINT) return true;
   if (typeof selfArgs !== "string" || selfArgs.length === 0) return false;
   if (!CLAUDE_DESKTOP_BUNDLED_PATH_PARTS.every((part) => selfArgs.includes(part))) return false;
   return ancestorArgs.some((a) => typeof a === "string" && a.includes(CLAUDE_DESKTOP_LAUNCHER));
@@ -976,15 +1010,24 @@ export function claudeForkResumePredecessor(command: string | undefined): string
  *  of them would resurrect every one of those phantoms. Only then is the DESKTOP allow-list consulted:
  *  a real desktop conversation window is a human's interactive session and must mirror, yet its argv
  *  trips both remaining branches — it carries `--output-format stream-json` (headless token) and it
- *  passes `--plugin-dir …/claude-mem/<version>` (launcher marker matched inside a flag VALUE). */
-export function claudeHeadlessInvocation(selfArgs: string | undefined, ancestorArgs: (string | undefined)[]): boolean {
+ *  passes `--plugin-dir …/claude-mem/<version>` (launcher marker matched inside a flag VALUE).
+ *
+ *  `entrypoint` (`CLAUDE_CODE_ENTRYPOINT`) reaches ONLY the desktop allow-list, and only at its
+ *  existing position. It must not be consulted earlier: that spare ring is forked BY the desktop
+ *  binary, so it inherits the desktop entrypoint too — an entrypoint check ahead of
+ *  CLAUDE_SELF_DAEMON_MARKERS would rescue every one of those phantoms. */
+export function claudeHeadlessInvocation(
+  selfArgs: string | undefined,
+  ancestorArgs: (string | undefined)[],
+  entrypoint?: string,
+): boolean {
   const chain = [selfArgs, ...ancestorArgs].filter((s): s is string => typeof s === "string" && s.length > 0);
   if (chain.some((args) => CLAUDE_SELF_DAEMON_MARKERS.some((m) => args.includes(m)))) return true;
   const tokens = typeof selfArgs === "string" ? selfArgs.trim().split(/\s+/) : [];
   // The replay daemon carries neither -p nor --print. The pair is load-bearing: --fork-session alone
   // is a legitimate interactive feature, while --reply-on-resume is the daemon's auto-reply mode.
   if (tokens.includes("--fork-session") && tokens.includes("--reply-on-resume")) return true;
-  if (claudeDesktopInvocation(selfArgs, ancestorArgs)) return false;
+  if (claudeDesktopInvocation(selfArgs, ancestorArgs, entrypoint)) return false;
   if (chain.some((args) => CLAUDE_LAUNCHER_MARKERS.some((m) => args.includes(m)))) return true;
   return tokens.some((tok) => CLAUDE_HEADLESS_ARG_TOKENS.has(tok));
 }
@@ -2048,13 +2091,19 @@ export const claudeAdapter: AgentAdapter = {
   // Fingerprint it from the invoking process's argv + ancestor chain and DEFER (skip mirroring) so it
   // never becomes a stuck "working" phone row. See claudeHeadlessInvocation.
   isHeadlessInvocation({ pid, ancestorsOf, commandOf }): boolean {
-    return claudeHeadlessInvocation(commandOf(pid), ancestorsOf(pid).map((p) => commandOf(p)));
+    return claudeHeadlessInvocation(
+      commandOf(pid), ancestorsOf(pid).map((p) => commandOf(p)), process.env.CLAUDE_CODE_ENTRYPOINT,
+    );
   },
   // Launch-phantom scope: opening the Claude desktop app fires SessionStart→SessionEnd within a
   // second for ~9 session ids that never get a prompt and never get a transcript file. Only desktop
-  // invocations are subject to that defer. See claudeDesktopInvocation.
+  // invocations are subject to that defer. See claudeDesktopInvocation. `CLAUDE_CODE_ENTRYPOINT` is
+  // read HERE, at the IO boundary, so the classifier itself stays pure and testable — same discipline
+  // as injecting commandOf/ancestorsOf rather than shelling out inside it.
   isDesktopInvocation({ pid, ancestorsOf, commandOf }): boolean {
-    return claudeDesktopInvocation(commandOf(pid), ancestorsOf(pid).map((p) => commandOf(p)));
+    return claudeDesktopInvocation(
+      commandOf(pid), ancestorsOf(pid).map((p) => commandOf(p)), process.env.CLAUDE_CODE_ENTRYPOINT,
+    );
   },
   forkResumePredecessor(command: string | undefined): string | undefined {
     return claudeForkResumePredecessor(command);

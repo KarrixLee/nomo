@@ -1930,12 +1930,15 @@ var CLAUDE_SELF_DAEMON_MARKERS = [
   "bg-spare"
 ];
 var CLAUDE_LAUNCHER_MARKERS = ["claude-mem", "worker-service"];
+var CLAUDE_DESKTOP_ENTRYPOINT = "claude-desktop";
 var CLAUDE_DESKTOP_BUNDLED_PATH_PARTS = [
   "/Library/Application Support/Claude/claude-code/",
   "/claude.app/Contents/MacOS/claude"
 ];
 var CLAUDE_DESKTOP_LAUNCHER = "Claude.app/Contents/Helpers/disclaimer";
-function claudeDesktopInvocation(selfArgs, ancestorArgs) {
+function claudeDesktopInvocation(selfArgs, ancestorArgs, entrypoint) {
+  if (entrypoint === CLAUDE_DESKTOP_ENTRYPOINT)
+    return true;
   if (typeof selfArgs !== "string" || selfArgs.length === 0)
     return false;
   if (!CLAUDE_DESKTOP_BUNDLED_PATH_PARTS.every((part) => selfArgs.includes(part)))
@@ -1955,14 +1958,14 @@ function claudeForkResumePredecessor(command) {
   const id = basename2(resume, ".jsonl");
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id) ? id : undefined;
 }
-function claudeHeadlessInvocation(selfArgs, ancestorArgs) {
+function claudeHeadlessInvocation(selfArgs, ancestorArgs, entrypoint) {
   const chain = [selfArgs, ...ancestorArgs].filter((s) => typeof s === "string" && s.length > 0);
   if (chain.some((args) => CLAUDE_SELF_DAEMON_MARKERS.some((m) => args.includes(m))))
     return true;
   const tokens = typeof selfArgs === "string" ? selfArgs.trim().split(/\s+/) : [];
   if (tokens.includes("--fork-session") && tokens.includes("--reply-on-resume"))
     return true;
-  if (claudeDesktopInvocation(selfArgs, ancestorArgs))
+  if (claudeDesktopInvocation(selfArgs, ancestorArgs, entrypoint))
     return false;
   if (chain.some((args) => CLAUDE_LAUNCHER_MARKERS.some((m) => args.includes(m))))
     return true;
@@ -2512,10 +2515,10 @@ var claudeAdapter = {
     return claudeTailPendingApproval(tail);
   },
   isHeadlessInvocation({ pid, ancestorsOf, commandOf }) {
-    return claudeHeadlessInvocation(commandOf(pid), ancestorsOf(pid).map((p) => commandOf(p)));
+    return claudeHeadlessInvocation(commandOf(pid), ancestorsOf(pid).map((p) => commandOf(p)), process.env.CLAUDE_CODE_ENTRYPOINT);
   },
   isDesktopInvocation({ pid, ancestorsOf, commandOf }) {
-    return claudeDesktopInvocation(commandOf(pid), ancestorsOf(pid).map((p) => commandOf(p)));
+    return claudeDesktopInvocation(commandOf(pid), ancestorsOf(pid).map((p) => commandOf(p)), process.env.CLAUDE_CODE_ENTRYPOINT);
   },
   forkResumePredecessor(command) {
     return claudeForkResumePredecessor(command);
