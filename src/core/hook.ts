@@ -1030,7 +1030,7 @@ export async function runHook(agent: AgentKind): Promise<void> {
         "x-cc-pairing": config.pairingId,
         "x-cc-auth": config.pcSecret,
         "x-cc-version": PLUGIN_VERSION,
-        // Whether remote approvals are paused ON THIS COMPUTER (`nomo-cc permission off`), so the phone
+        // Whether remote approvals are paused ON THIS COMPUTER (`/nomo-cc:approvals off`), so the phone
         // can stop claiming approvals are on while nothing will ever arrive. Plaintext, never in the
         // blob; the worker literal-matches "on"/"off" — see localApprovalsState's contract note.
         "x-cc-approvals": await localApprovalsState(),

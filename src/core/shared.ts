@@ -182,9 +182,10 @@ export const GONE_STRIKES_PATH = `${CC_DIR}/gone-strikes`;
 export const GONE_STRIKE_LIMIT = 2;
 /** Local escape-hatch flag for remote approvals: when this zero-byte file exists, the permission hook
  *  skips the phone hold entirely and behaves as a plain fire-and-forget attention event (instant
- *  terminal dialog). Toggled by `nomo-cc permission off|on`. It lives HERE (not in permission.ts, which
- *  re-exports it) because every /cc/event POSTer must report it — and permission.ts already imports
- *  this module, so the reverse import would be a cycle. */
+ *  terminal dialog). Toggled by `/nomo-cc:approvals off|on` (or `$nomo-approvals off|on` in Codex).
+ *  It lives HERE (not in permission.ts, which re-exports it) because every /cc/event POSTer must
+ *  report it — and permission.ts already imports this module, so the reverse import would be a
+ *  cycle. */
 export const NO_HOLD_PATH = `${CC_DIR}/no-hold`;
 
 /** Shared sealed-blob fit ceiling. The worker's hard limit is 3072 base64 characters; keep the

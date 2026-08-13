@@ -3037,7 +3037,7 @@ describe("runHook sends the plugin version as the x-cc-version header", () => {
 
 // --- runHook reports this computer's LOCAL approvals pause as x-cc-approvals -------------------
 //
-// `nomo-cc permission off` writes a zero-byte <CC_DIR>/no-hold flag that pauses remote approvals ON
+// `/nomo-cc:approvals off` writes a zero-byte <CC_DIR>/no-hold flag that pauses remote approvals ON
 // THIS MAC — the phone could not see it, so its "Answer permission prompts from iPhone" toggle read
 // ON while nothing would ever arrive. Every /cc/event POST now carries the state as a plaintext
 // header so the worker can record it per computer.
