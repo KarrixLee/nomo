@@ -5823,6 +5823,9 @@ function buildPermissionSummary(toolName, toolInput) {
     case "Bash":
     case "shell":
     case "local_shell": {
+      const desc = str(toolInput.description);
+      if (desc)
+        return truncate(desc);
       const cmd = str(toolInput.command);
       return cmd ? truncate(cmd.split(`
 `)[0]) : toolName;

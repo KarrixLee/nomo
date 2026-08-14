@@ -25,6 +25,20 @@ describe("buildPermissionSummary", () => {
   test("Bash → first line of the command", () => {
     expect(buildPermissionSummary("Bash", { command: "rm -rf build\necho done" })).toBe("rm -rf build");
   });
+  test("Bash → description wins over the command when Claude sends one", () => {
+    expect(buildPermissionSummary("Bash", {
+      command: 'NOMOR="/Users/k/Library/Application Support/Claude/…"; exec "$NOMOR/scripts/run.sh"',
+      description: "Run nomo-cc reset to clear stale sessions and stop watchdog",
+    })).toBe("Run nomo-cc reset to clear stale sessions and stop watchdog");
+  });
+  test("Bash → blank description falls back to the command", () => {
+    expect(buildPermissionSummary("Bash", { command: "rm -rf build", description: "" })).toBe("rm -rf build");
+  });
+  test("Codex shell/local_shell → command, they send no description", () => {
+    for (const t of ["shell", "local_shell"]) {
+      expect(buildPermissionSummary(t, { command: "ls -la\necho hi" })).toBe("ls -la");
+    }
+  });
   test("Bash → truncated to <=80 chars with an ellipsis", () => {
     const long = "echo " + "x".repeat(200);
     const out = buildPermissionSummary("Bash", { command: long });
