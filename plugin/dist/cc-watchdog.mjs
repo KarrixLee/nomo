@@ -4885,7 +4885,7 @@ import { hostname as hostname2 } from "node:os";
 import { basename as basename5, isAbsolute as isAbsolute2, relative, resolve as resolve2 } from "node:path";
 
 // src/core/hook.ts
-import { readdir as readdir3, readFile as readFile6, stat as stat3, unlink as unlink2 } from "node:fs/promises";
+import { readdir as readdir3, readFile as readFile6, unlink as unlink2 } from "node:fs/promises";
 import { hostname } from "node:os";
 import { basename as basename4 } from "node:path";
 
@@ -5447,7 +5447,8 @@ async function runHook(agent) {
         return;
       }
     }
-    const continuedForkPrompt = hookName === "UserPromptSubmit" && typeof input.prompt === "string" && input.prompt.trim().length > 0 && !!adapter2.forkResumePredecessor?.(hookCommand);
+    const promptBearingHook = hookName === "UserPromptSubmit" && typeof input.prompt === "string" && input.prompt.trim().length > 0;
+    const continuedForkPrompt = promptBearingHook && !!adapter2.forkResumePredecessor?.(hookCommand);
     if (!existingRecord && !continuedForkPrompt && adapter2.isHeadlessInvocation && adapter2.isHeadlessInvocation({
       pid: hookPid,
       ancestorsOf: pidAncestors,
@@ -5459,19 +5460,16 @@ async function runHook(agent) {
       });
       return;
     }
-    if (!existingRecord && adapter2.isDesktopInvocation?.({
+    if (!existingRecord && !promptBearingHook && adapter2.isDesktopInvocation?.({
       pid: hookPid,
       ancestorsOf: pidAncestors,
       commandOf: pidCommand
     })) {
-      const transcriptOnDisk = transcriptPath.length > 0 && await stat3(transcriptPath).then(() => true, () => false);
-      if (!transcriptOnDisk) {
-        suppress({
-          guard: "claude-desktop-no-transcript",
-          reason: "desktop-app session id has no transcript file yet"
-        });
-        return;
-      }
+      suppress({
+        guard: "claude-desktop-no-prompt",
+        reason: "never-tracked desktop-app session id has not carried a user prompt yet"
+      });
+      return;
     }
     const title = await readTitle() ?? existingRecord?.title;
     if (!existingRecord && clearLineage && !title) {

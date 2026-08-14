@@ -17,7 +17,7 @@
 // async-iterable process.stdin, file IO via node:fs/promises (shared helpers). build.ts bundles
 // this (inlined into each entry) to a .mjs.
 
-import { readdir, readFile, stat, unlink } from "node:fs/promises";
+import { readdir, readFile, unlink } from "node:fs/promises";
 import { hostname } from "node:os";
 import { basename } from "node:path";
 import { encryptBlob } from "./crypto";
@@ -846,9 +846,9 @@ export async function runHook(agent: AgentKind): Promise<void> {
     // that only the watchdog's 30-min idle reap (or the worker's eviction) ever clears. The invoking
     // process's argv (process.ppid) and its ancestor chain fingerprint it. Only consulted for a NEVER-
     // tracked id, so an already-live interactive session can never be silenced.
-    const continuedForkPrompt = hookName === "UserPromptSubmit" &&
-      typeof input.prompt === "string" && input.prompt.trim().length > 0 &&
-      !!adapter.forkResumePredecessor?.(hookCommand);
+    const promptBearingHook = hookName === "UserPromptSubmit" &&
+      typeof input.prompt === "string" && input.prompt.trim().length > 0;
+    const continuedForkPrompt = promptBearingHook && !!adapter.forkResumePredecessor?.(hookCommand);
     if (!existingRecord && !continuedForkPrompt && adapter.isHeadlessInvocation && adapter.isHeadlessInvocation({
       pid: hookPid, ancestorsOf: pidAncestors, commandOf: pidCommand,
     })) {
@@ -859,28 +859,27 @@ export async function runHook(agent: AgentKind): Promise<void> {
       return;
     }
 
-    // Desktop-app LAUNCH phantoms (adapter seam; claude-only). Opening the Claude desktop app mints a
-    // handful of session ids (9 of 11 observed in one day, three within the same millisecond) that fire
-    // SessionStart source:"startup" → SessionEnd inside 200-600 ms, never a UserPromptSubmit, and NEVER
-    // get a transcript file — across 148 recorded sessions the transcript-less population IS exactly the
-    // phantom population. Left unguarded every app launch would make ~9 untitled rows appear and vanish
-    // on the phone within a second. Like the codex internal-job net this is a DEFER, not a verdict: the
-    // id is never-tracked, hooks fire many times per turn, and a real desktop session (fresh OR resumed —
-    // Claude writes the transcript at session creation) already has its file, so at worst a session
-    // racing its very first flush loses one frame. Scoped to DESKTOP invocations because a terminal
-    // `claude` legitimately creates its row at startup before any transcript exists.
-    if (!existingRecord && adapter.isDesktopInvocation?.({
+    // Desktop-app phantoms (adapter seam; claude-only). A desktop session id is only worth a phone row
+    // once the USER has said something, so a never-tracked desktop id waits for its first prompt-bearing
+    // hook. `SessionStart` is not evidence of user intent there: opening the app mints ~9 ids that fire
+    // SessionStart source:"startup" → SessionEnd inside 200-600 ms and never a prompt, AND the app
+    // silently re-warms old conversations in the background with `--resume=<id>`, whose SessionStart
+    // source:"resume" the user never asked for — one of those sat "Running" on the phone for 10+ minutes
+    // untouched. Transcript existence was tried as the discriminator and is wrong in BOTH directions: a
+    // background re-warm has a full transcript (that ghost sailed straight through), while a real desktop
+    // session has NO transcript yet at its first UserPromptSubmit — traced live, ids e4890328 and
+    // 8fc9dfd6 were deferred at the prompt and only surfaced at Stop, i.e. after the whole first turn was
+    // already finished, with no model badge. A DEFER, not a verdict: the id is never-tracked and any
+    // later prompt-bearing hook creates the row normally. Scoped to DESKTOP invocations because a
+    // terminal `claude` legitimately creates its row at SessionStart.
+    if (!existingRecord && !promptBearingHook && adapter.isDesktopInvocation?.({
       pid: hookPid, ancestorsOf: pidAncestors, commandOf: pidCommand,
     })) {
-      const transcriptOnDisk = transcriptPath.length > 0 &&
-        await stat(transcriptPath).then(() => true, () => false);
-      if (!transcriptOnDisk) {
-        suppress({
-          guard: "claude-desktop-no-transcript",
-          reason: "desktop-app session id has no transcript file yet",
-        });
-        return;
-      }
+      suppress({
+        guard: "claude-desktop-no-prompt",
+        reason: "never-tracked desktop-app session id has not carried a user prompt yet",
+      });
+      return;
     }
 
     // Keep the LAST NON-EMPTY title, like model below: a later hook whose bounded reads find nothing

@@ -2095,9 +2095,10 @@ export const claudeAdapter: AgentAdapter = {
       commandOf(pid), ancestorsOf(pid).map((p) => commandOf(p)), process.env.CLAUDE_CODE_ENTRYPOINT,
     );
   },
-  // Launch-phantom scope: opening the Claude desktop app fires SessionStart→SessionEnd within a
-  // second for ~9 session ids that never get a prompt and never get a transcript file. Only desktop
-  // invocations are subject to that defer. See claudeDesktopInvocation. `CLAUDE_CODE_ENTRYPOINT` is
+  // Phantom scope: opening the Claude desktop app fires SessionStart→SessionEnd within a second for
+  // ~9 session ids that never get a prompt, and the app re-warms old conversations in the background
+  // with `--resume`. Only desktop invocations wait for a first user prompt before creating a row.
+  // See claudeDesktopInvocation. `CLAUDE_CODE_ENTRYPOINT` is
   // read HERE, at the IO boundary, so the classifier itself stays pure and testable — same discipline
   // as injecting commandOf/ancestorsOf rather than shelling out inside it.
   isDesktopInvocation({ pid, ancestorsOf, commandOf }): boolean {

@@ -1386,10 +1386,13 @@ describe("runHook phantom-session lineage, origin stamp, and session-trace.log",
     return { home, ccDir, sessionsDir };
   }
 
-  async function spawnHook(entry: string, home: string, payload: Record<string, unknown>): Promise<void> {
+  async function spawnHook(
+    entry: string, home: string, payload: Record<string, unknown>,
+    env: Record<string, string | undefined> = {},
+  ): Promise<void> {
     const proc = spawnTestProcess({
       cmd: ["bun", entry],
-      env: isolatedTestEnv(home),
+      env: isolatedTestEnv(home, env),
       stdin: Buffer.from(JSON.stringify(payload)),
       stdout: "ignore",
       stderr: "ignore",
@@ -1665,6 +1668,102 @@ await child.exited;
       )).toBe(true);
     } finally {
       server.stop(true);
+      await rm(home, { recursive: true, force: true });
+    }
+  }, 20000);
+
+  // --- Claude desktop app: the row is minted by the first PROMPT, never by SessionStart -----------
+  //
+  // Transcript existence was tried as the discriminator first and is wrong in BOTH directions: the
+  // desktop app silently re-warms old conversations with `--resume=<id>`, and those HAVE a transcript
+  // (one such ghost sat "Running" on the phone for 10+ minutes untouched), while a real desktop
+  // session has NO transcript yet at its first UserPromptSubmit (traced live: the row only appeared
+  // at Stop, after the whole first turn, with no model badge).
+  const desktopEnv = { CLAUDE_CODE_ENTRYPOINT: "claude-desktop" };
+
+  test("a desktop launch phantom defers, and the first real prompt creates the row with NO transcript on disk", async () => {
+    const { home, ccDir, sessionsDir } = await setupHookHome("http://127.0.0.1:9");
+    try {
+      const sid = "5c0a2f10-1b7c-4a1e-9f3a-2d6e8b41c701";
+      // Deliberately never written: the desktop app's first-turn hooks run before Claude flushes it.
+      const transcript = join(home, "desktop-absent.jsonl");
+
+      await spawnHook(claudeEntry, home, {
+        session_id: sid, hook_event_name: "SessionStart", source: "startup",
+        cwd: "/x/api-status", transcript_path: transcript,
+      }, desktopEnv);
+      expect(await readLocalRecord(sessionsDir, sid)).toBeNull();
+
+      // A whitespace-only prompt is not a prompt.
+      await spawnHook(claudeEntry, home, {
+        session_id: sid, hook_event_name: "UserPromptSubmit", prompt: "   ",
+        cwd: "/x/api-status", transcript_path: transcript,
+      }, desktopEnv);
+      expect(await readLocalRecord(sessionsDir, sid)).toBeNull();
+
+      await spawnHook(claudeEntry, home, {
+        session_id: sid, hook_event_name: "UserPromptSubmit", prompt: "Ship the desktop fix",
+        cwd: "/x/api-status", transcript_path: transcript,
+      }, desktopEnv);
+      expect(await readLocalRecord(sessionsDir, sid))
+        .toMatchObject({ lastEvent: "working", op: "update", title: "Ship the desktop fix" });
+      expect(await stat(transcript).then(() => true, () => false)).toBe(false);
+
+      // An EXISTING record is never subject to the defer, whatever the hook.
+      await spawnHook(claudeEntry, home, {
+        session_id: sid, hook_event_name: "PreToolUse", tool_name: "Bash",
+        cwd: "/x/api-status", transcript_path: transcript,
+      }, desktopEnv);
+      expect(await readLocalRecord(sessionsDir, sid)).not.toBeNull();
+
+      const trace = (await readFile(join(ccDir, "session-trace.log"), "utf8"))
+        .trim().split("\n").map((line) => JSON.parse(line) as Record<string, unknown>);
+      expect(trace.filter((e) => e.event === "suppress" && e.guard === "claude-desktop-no-prompt")
+        .map((e) => e.hook_event_name)).toEqual(["SessionStart", "UserPromptSubmit"]);
+      expect(trace.some((e) => e.event === "create" && e.sessionId === sid)).toBe(true);
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  }, 20000);
+
+  test("a background desktop --resume re-warm mints no row even though its transcript is fully written", async () => {
+    const { home, ccDir, sessionsDir } = await setupHookHome("http://127.0.0.1:9");
+    try {
+      const sid = "b4348975-45a5-4b90-a84d-70581c75336b";
+      const transcript = join(home, "rewarmed.jsonl");
+      await writeFile(transcript, [
+        JSON.stringify({ type: "user", message: { role: "user", content: "an old conversation" } }),
+        JSON.stringify({ type: "assistant", message: { role: "assistant", model: "claude-opus-4-8", content: [] } }),
+      ].join("\n"));
+
+      await spawnHook(claudeEntry, home, {
+        session_id: sid, hook_event_name: "SessionStart", source: "resume",
+        cwd: "/x/fruit-game", transcript_path: transcript,
+      }, desktopEnv);
+
+      expect(await readLocalRecord(sessionsDir, sid)).toBeNull();
+      const trace = (await readFile(join(ccDir, "session-trace.log"), "utf8"))
+        .trim().split("\n").map((line) => JSON.parse(line) as Record<string, unknown>);
+      expect(trace).toContainEqual(expect.objectContaining({
+        event: "suppress", sessionId: sid, hook_event_name: "SessionStart", source: "resume",
+        guard: "claude-desktop-no-prompt",
+      }));
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  }, 20000);
+
+  test("a terminal CLI SessionStart still creates its row at startup, before any transcript exists", async () => {
+    const { home, sessionsDir } = await setupHookHome("http://127.0.0.1:9");
+    try {
+      const sid = "5c0a2f10-1b7c-4a1e-9f3a-2d6e8b41c702";
+      await spawnHook(claudeEntry, home, {
+        session_id: sid, hook_event_name: "SessionStart", source: "startup",
+        cwd: "/x/api-status", transcript_path: join(home, "terminal-absent.jsonl"),
+      });
+      expect(await readLocalRecord(sessionsDir, sid))
+        .toMatchObject({ lastEvent: "sessionStart", op: "start" });
+    } finally {
       await rm(home, { recursive: true, force: true });
     }
   }, 20000);
