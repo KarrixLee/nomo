@@ -529,7 +529,19 @@ export function computeSessionState(input: SessionStateInput): SessionState | nu
     "working",
     busy ? "work+cc" : suffix("work"),
     // The one case the record's own blob cannot carry: it says done, we computed working.
-    recordDone ? { kind: "plain", value: buildStatePlaintext(record, "working", now, opinion?.name) } : sealed,
+    //
+    // Stamped at CC'S OWN STATUS WRITE, not `now` — the done rung's rule (see there), applied to the rung
+    // that fell into it. commitState signs the pre-seal description, so `now` re-signed this blob every
+    // wall second and woke every LAN long poll for a session where nothing had happened, for as long as
+    // CC kept saying busy (up to CC_STATUS_MAX_AGE_MS). `statusUpdatedAt` is the ONLY evidence this state
+    // has and the only clock that moves when something actually changes.
+    //
+    // `busy` is guaranteed true here whenever `recordDone` is: the sole path to this rung with a done
+    // record is the held-back branch above, whose condition is this same expression, and neither the hold
+    // nor the attention rung in between can fall through. `?? ts` is the free belt-and-braces.
+    recordDone
+      ? { kind: "plain", value: buildStatePlaintext(record, "working", opinion?.statusUpdatedAt ?? ts, opinion?.name) }
+      : sealed,
     ts,
     false,
   );
