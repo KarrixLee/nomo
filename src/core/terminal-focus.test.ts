@@ -15,6 +15,19 @@ const ITERM_ARGV = "/Applications/iTerm.app/Contents/MacOS/iTerm2";
 const GHOSTTY_ARGV = "/Applications/Ghostty.app/Contents/MacOS/ghostty";
 const HERDR_SERVER_ARGV = "/opt/homebrew/bin/herdr server";
 
+// The Claude DESKTOP app's three-process shape, captured verbatim off this machine (Claude 1.30096.1,
+// claude-code 2.1.229) and trimmed only in the flag tail. The session's own `claude` is the record's
+// pid; note its bundled path is a LOWERCASE `claude.app`, which the desktop entry must not match, or
+// the owner would resolve to the session's own process instead of to the app.
+const CLAUDE_DESKTOP_SESSION_ARGV =
+  "/Users/karrix/Library/Application Support/Claude/claude-code/2.1.229/claude.app/Contents/MacOS/claude"
+  + " --output-format stream-json --verbose --input-format stream-json --permission-prompt-tool stdio"
+  + " --resume=8fc9dfd6-adde-4da4-9afb-e209b4c1947e"
+  + " --plugin-dir /Users/karrix/.claude/plugins/cache/thedotmack/claude-mem/13.12.4";
+const CLAUDE_DESKTOP_LAUNCHER_ARGV =
+  "/Applications/Claude.app/Contents/Helpers/disclaimer " + CLAUDE_DESKTOP_SESSION_ARGV;
+const CLAUDE_DESKTOP_APP_ARGV = "/Applications/Claude.app/Contents/MacOS/Claude";
+
 const REAL_HERDR_PANE_LIST = JSON.stringify({
   result: {
     panes: [
@@ -186,6 +199,33 @@ describe("owningTerminalApp", () => {
   test("a throwing ancestor walk degrades to inspecting the pid itself", () => {
     expect(owningTerminalApp(9, () => { throw new Error("ps died"); }, () => GHOSTTY_ARGV)?.id).toBe("ghostty");
   });
+
+  test("a Claude DESKTOP conversation window resolves to the desktop app", () => {
+    const argv: Record<number, string> = {
+      27773: CLAUDE_DESKTOP_SESSION_ARGV,
+      27772: CLAUDE_DESKTOP_LAUNCHER_ARGV,
+      52631: CLAUDE_DESKTOP_APP_ARGV,
+      1: "/sbin/launchd",
+    };
+    const app = owningTerminalApp(27773, () => [27772, 52631, 1], (p) => argv[p]);
+    expect(app?.id).toBe("claude-desktop");
+    expect(app?.bundleId).toBe("com.anthropic.claudefordesktop");
+  });
+
+  test("the session's OWN bundled binary is not the app (the lowercase claude.app must not match)", () => {
+    expect(owningTerminalApp(27773, () => [], () => CLAUDE_DESKTOP_SESSION_ARGV)).toBeUndefined();
+  });
+
+  test("a desktop app installed outside /Applications resolves identically (no location pin)", () => {
+    const relocated = "/Users/karrix/Applications/Claude.app/Contents/MacOS/Claude";
+    expect(owningTerminalApp(1, () => [2], (p) => (p === 2 ? relocated : "claude"))?.id).toBe("claude-desktop");
+  });
+
+  test("a CLI session in a terminal launched from the desktop app still resolves to the terminal", () => {
+    // The NEAREST ancestor wins, so an app further up the chain can never steal a real emulator.
+    const argv: Record<number, string> = { 1: "claude", 2: "-zsh", 3: GHOSTTY_ARGV, 4: CLAUDE_DESKTOP_APP_ARGV };
+    expect(owningTerminalApp(1, () => [2, 3, 4], (p) => argv[p])?.id).toBe("ghostty");
+  });
 });
 
 describe("focusTerminalForPid", () => {
@@ -196,6 +236,35 @@ describe("focusTerminalForPid", () => {
   test("a pid with no real controlling tty owns no window → no-tty", async () => {
     expect(await focusTerminalForPid(100, deps({ ttyOf: async () => "??" }))).toEqual({ ok: false, reason: "no-tty" });
     expect(await focusTerminalForPid(100, deps({ ttyOf: async () => undefined }))).toEqual({ ok: false, reason: "no-tty" });
+  });
+
+  // FIELD REGRESSION: "Open on Mac" was a silent no-op for every session started in the Claude desktop
+  // app. Its `claude` has no controlling tty, so the tty gate refused the pid before the owning app was
+  // ever consulted — the same shape as the 2026-08-02 herdr bug, in its second guise.
+  test("a tty-less Claude DESKTOP session activates the app instead of refusing on no-tty", async () => {
+    const scripts: string[] = [];
+    const result = await focusTerminalForPid(27773, deps({
+      ttyOf: async () => "??",
+      argvOf: {
+        27773: CLAUDE_DESKTOP_SESSION_ARGV, 27772: CLAUDE_DESKTOP_LAUNCHER_ARGV,
+        52631: CLAUDE_DESKTOP_APP_ARGV,
+      },
+      ancestorsOf: () => [27772, 52631],
+      osascript: async (s) => { scripts.push(s); return ""; },
+    }));
+    expect(result).toEqual({ ok: true, via: "app-activate" });
+    expect(scripts).toEqual([`tell application id "com.anthropic.claudefordesktop" to activate`]);
+  });
+
+  test("the tty exemption is scoped to the desktop app — a tty-less Ghostty pid is still no-tty", async () => {
+    let calls = 0;
+    const result = await focusTerminalForPid(100, deps({
+      ttyOf: async () => "??",
+      argvOf: { 100: "claude", 200: GHOSTTY_ARGV },
+      osascript: async () => { calls++; return ""; },
+    }));
+    expect(result).toEqual({ ok: false, reason: "no-tty" });
+    expect(calls).toBe(0);
   });
 
   test("a Terminal.app-owned pid takes the exact tty→tab path", async () => {

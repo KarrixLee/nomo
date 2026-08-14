@@ -1762,6 +1762,78 @@ describe("claudeLocateTuiPid (the recorded pid IS the TUI)", () => {
       { sessionId: "s", record: locRec({ pid: Number.NaN }) }, { ttyOf: async () => "ttys004" },
     )).toBeUndefined();
   });
+
+  // FIELD REGRESSION, the second shape of the herdr bug above: a session started in the Claude DESKTOP
+  // app records the ppid of a `claude` that runs under the app bundle with tty "??". Refusing it here
+  // made "Open on Mac" a silent no-op for every desktop-app session (the watchdog traced
+  // result:"no-candidate" and did nothing — it never focused the wrong app, it just never focused).
+  // The argv are verbatim off a live desktop session (Claude 1.30096.1 / claude-code 2.1.229).
+  const DESKTOP_SESSION_ARGV =
+    "/Users/karrix/Library/Application Support/Claude/claude-code/2.1.229/claude.app/Contents/MacOS/claude"
+    + " --output-format stream-json --resume=8fc9dfd6-adde-4da4-9afb-e209b4c1947e";
+  const DESKTOP_COMMANDS: Record<number, string> = {
+    27773: DESKTOP_SESSION_ARGV,
+    27772: "/Applications/Claude.app/Contents/Helpers/disclaimer " + DESKTOP_SESSION_ARGV,
+    52631: "/Applications/Claude.app/Contents/MacOS/Claude",
+  };
+
+  test("a tty-less pid owned by the Claude DESKTOP app is still the TUI", async () => {
+    const notes: LocateTuiReason[] = [];
+    const pid = await claudeLocateTuiPid(
+      { sessionId: "s", record: locRec({ pid: 27773, agent: undefined }) },
+      {
+        ttyOf: async () => "??",
+        ancestorsOf: () => [27772, 52631],
+        commandOf: (p) => DESKTOP_COMMANDS[p],
+        note: (r) => notes.push(r),
+      },
+    );
+    expect(pid).toBe(27773);
+    expect(notes).toEqual(["record-pid"]);
+  });
+
+  test("a pid that is GONE is never resurrected by a desktop-app ancestry either", async () => {
+    // A dead pid reads back no tty, no ancestry and no argv, so the desktop clause cannot fire — the
+    // same property that keeps the herdr escape hatch from focusing a live window for a stale record.
+    const notes: LocateTuiReason[] = [];
+    expect(await claudeLocateTuiPid(
+      { sessionId: "s", record: locRec({ pid: 27773, agent: undefined }) },
+      {
+        ttyOf: async () => undefined, ancestorsOf: () => [], commandOf: () => undefined,
+        note: (r) => notes.push(r),
+      },
+    )).toBeUndefined();
+    expect(notes).toEqual(["no-candidate"]);
+  });
+
+  test("a CLI session under Ghostty resolves exactly as before (the tty is still the signal)", async () => {
+    const notes: LocateTuiReason[] = [];
+    const argv: Record<number, string> = {
+      6757: "claude", 6700: "-zsh", 900: "/Applications/Ghostty.app/Contents/MacOS/ghostty",
+    };
+    const pid = await claudeLocateTuiPid(
+      { sessionId: "s", record: locRec({ pid: 6757, agent: undefined }) },
+      {
+        ttyOf: async () => "ttys004", ancestorsOf: () => [6700, 900], commandOf: (p) => argv[p],
+        note: (r) => notes.push(r),
+      },
+    );
+    expect(pid).toBe(6757);
+    expect(notes).toEqual(["record-pid"]);
+  });
+
+  test("the desktop clause is the CLAUDE locator's alone — Codex still needs its own correlation", async () => {
+    // Codex sessions must be untouched: a tty-less codex pid under a Claude-desktop-looking ancestry
+    // is not rescued, because codexLocateTuiPid never consults the owning app at all.
+    expect(await codexLocateTuiPid(
+      { sessionId: "codex-uuid", record: locRec({ pid: 27773 }) },
+      {
+        ps: async () => PS_ONE_TUI,
+        ancestorsOf: () => [27772, 52631],
+        commandOf: (p) => DESKTOP_COMMANDS[p],
+      },
+    )).toBe(16029); // the lone real codex TUI, never the desktop-owned pid
+  });
 });
 
 describe("both adapters expose the locate seam", () => {

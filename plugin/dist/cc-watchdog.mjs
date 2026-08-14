@@ -1071,7 +1071,8 @@ var TERMINAL_APPS = [
   { id: "kitty", bundleId: "net.kovidgoyal.kitty", match: /\/kitty\.app\/|(?:^|\/)kitty(?:\s|$)/ },
   { id: "hyper", bundleId: "co.zeit.hyper", match: /\/Hyper\.app\// },
   { id: "warp", bundleId: "dev.warp.Warp-Stable", match: /\/Warp\.app\// },
-  { id: "vscode", bundleId: "com.microsoft.VSCode", match: /\/Visual Studio Code\.app\/|\/Code\.app\/|Code Helper/ }
+  { id: "vscode", bundleId: "com.microsoft.VSCode", match: /\/Visual Studio Code\.app\/|\/Code\.app\/|Code Helper/ },
+  { id: "claude-desktop", bundleId: "com.anthropic.claudefordesktop", match: /\/Claude\.app\/Contents\// }
 ];
 function owningTerminalApp(pid, ancestorsOf = pidAncestors, commandOf = pidCommand) {
   let chain = [];
@@ -1254,18 +1255,18 @@ async function focusTerminalForPid(pid, deps = {}) {
       rawTty = undefined;
     }
     const devPath = ttyDevicePath(rawTty);
-    if (devPath === undefined) {
+    const app = owningTerminalApp(pid, ancestorsOf, commandOf);
+    if (devPath === undefined && app?.id !== "claude-desktop") {
       note(deps, { event: "terminal-focus", pid, result: "no-tty", tty: rawTty ?? "" });
       return { ok: false, reason: "no-tty" };
     }
-    const app = owningTerminalApp(pid, ancestorsOf, commandOf);
     if (!app) {
       note(deps, { event: "terminal-focus", pid, result: "unsupported", why: "no-owning-app" });
       return { ok: false, reason: "unsupported" };
     }
     const osascript = deps.osascript ?? runOsascript;
     try {
-      if (app.id === "terminal-app" || app.id === "iterm2") {
+      if (devPath !== undefined && (app.id === "terminal-app" || app.id === "iterm2")) {
         const script = app.id === "terminal-app" ? terminalAppScript(devPath) : iterm2Script(devPath);
         const out = await osascript(script);
         if (String(out).trim() === "ok") {
@@ -2354,7 +2355,13 @@ async function claudeLocateTuiPid(ctx, deps = {}) {
       noteLocate(deps, "no-candidate");
       return;
     }
-    if (ancestryContainsHerdr(pid, deps.ancestorsOf ?? pidAncestors, deps.commandOf ?? pidCommand)) {
+    const ancestorsOf = deps.ancestorsOf ?? pidAncestors;
+    const commandOf = deps.commandOf ?? pidCommand;
+    if (ancestryContainsHerdr(pid, ancestorsOf, commandOf)) {
+      noteLocate(deps, "record-pid");
+      return pid;
+    }
+    if (owningTerminalApp(pid, ancestorsOf, commandOf)?.id === "claude-desktop") {
       noteLocate(deps, "record-pid");
       return pid;
     }
