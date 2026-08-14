@@ -846,15 +846,38 @@ export async function runHook(agent: AgentKind): Promise<void> {
     // that only the watchdog's 30-min idle reap (or the worker's eviction) ever clears. The invoking
     // process's argv (process.ppid) and its ancestor chain fingerprint it. Only consulted for a NEVER-
     // tracked id, so an already-live interactive session can never be silenced.
-    const continuedForkPrompt = hookName === "UserPromptSubmit" &&
-      typeof input.prompt === "string" && input.prompt.trim().length > 0 &&
-      !!adapter.forkResumePredecessor?.(hookCommand);
+    const promptBearingHook = hookName === "UserPromptSubmit" &&
+      typeof input.prompt === "string" && input.prompt.trim().length > 0;
+    const continuedForkPrompt = promptBearingHook && !!adapter.forkResumePredecessor?.(hookCommand);
     if (!existingRecord && !continuedForkPrompt && adapter.isHeadlessInvocation && adapter.isHeadlessInvocation({
       pid: hookPid, ancestorsOf: pidAncestors, commandOf: pidCommand,
     })) {
       suppress({
         guard: "claude-headless-invocation",
         reason: "invoking process or ancestor matches a non-interactive/daemon discriminator",
+      });
+      return;
+    }
+
+    // Desktop-app phantoms (adapter seam; claude-only). A desktop session id is only worth a phone row
+    // once the USER has said something, so a never-tracked desktop id waits for its first prompt-bearing
+    // hook. `SessionStart` is not evidence of user intent there: opening the app mints ~9 ids that fire
+    // SessionStart source:"startup" → SessionEnd inside 200-600 ms and never a prompt, AND the app
+    // silently re-warms old conversations in the background with `--resume=<id>`, whose SessionStart
+    // source:"resume" the user never asked for — one of those sat "Running" on the phone for 10+ minutes
+    // untouched. Transcript existence was tried as the discriminator and is wrong in BOTH directions: a
+    // background re-warm has a full transcript (that ghost sailed straight through), while a real desktop
+    // session has NO transcript yet at its first UserPromptSubmit — traced live, ids e4890328 and
+    // 8fc9dfd6 were deferred at the prompt and only surfaced at Stop, i.e. after the whole first turn was
+    // already finished, with no model badge. A DEFER, not a verdict: the id is never-tracked and any
+    // later prompt-bearing hook creates the row normally. Scoped to DESKTOP invocations because a
+    // terminal `claude` legitimately creates its row at SessionStart.
+    if (!existingRecord && !promptBearingHook && adapter.isDesktopInvocation?.({
+      pid: hookPid, ancestorsOf: pidAncestors, commandOf: pidCommand,
+    })) {
+      suppress({
+        guard: "claude-desktop-no-prompt",
+        reason: "never-tracked desktop-app session id has not carried a user prompt yet",
       });
       return;
     }

@@ -521,6 +521,13 @@ export function buildPermissionSummary(toolName: string, toolInput: Record<strin
     // tool_name (Codex + Claude names never collide) so these are additive, not an agent branch.
     case "shell":
     case "local_shell": {
+      // Claude fills tool_input.description with the human-readable intent ("Run nomo-cc reset to clear
+      // stale sessions and stop watchdog") and the desktop/CLI prompts headline it, so the phone card
+      // leads with it too — the raw argv is the LEAST readable string available for a hook command or a
+      // long pipeline, and it still rides in buildPermissionDetail below. Codex's shell/local_shell send
+      // no description, so they keep the first command line exactly as before.
+      const desc = str(toolInput.description);
+      if (desc) return truncate(desc);
       const cmd = str(toolInput.command);
       return cmd ? truncate(cmd.split("\n")[0]) : toolName;
     }

@@ -1394,7 +1394,7 @@ export async function drainCommands(config: Config, deps: DrainCommandsDeps = {}
           traceFocus(deps, { ...base, agent, result, reason: reason ?? "no-candidate" });
           continue;
         }
-        const outcome = await focus(pid, { agent, record: entry.rec });
+        const outcome = await focus(pid, { agent, record: entry.rec, sessionId: payload.sessionId });
         if (outcome.ok) {
           focused += 1;
           const releasedTuiInput = await releaseFocusedTuiUserInputHold(

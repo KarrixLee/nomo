@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, test } from "bun:test";
 import {
-  adapterFor, allAdapters, claudeAdapter, claudeClearPredecessor, claudeForkResumePredecessor, claudeHeadlessInvocation, claudeLocateTuiPid, claudeSessionModel, claudeSessionTitle,
+  adapterFor, allAdapters, claudeAdapter, claudeClearPredecessor, claudeDesktopInvocation, claudeForkResumePredecessor, claudeHeadlessInvocation, claudeLocateTuiPid, claudeSessionModel, claudeSessionTitle,
   claudeTailPendingApproval, codexAdapter, codexChildSessionGhost, codexLocateTuiPid, codexTuiCandidates,
   codexConfigModel, codexDiscoverLive, codexInternalSessionGhost, codexModelFromRollout,
   CODEX_ROLLOUT_IDLE_SILENCE_MS,
@@ -1174,6 +1174,21 @@ describe("Codex rollout create suppression (subagents + promptless deferral)", (
 // observation runs, or any tool shelling out to headless Claude) fires hooks under a session id that
 // never gets a Stop. The classifier fingerprints it from the invoking process's argv + ancestor chain.
 
+/** Run `fn` with `CLAUDE_CODE_ENTRYPOINT` pinned (undefined = unset), then restore it. The adapter
+ *  seams read that var from process.env, and `bun test` inherits whatever entrypoint the Claude Code
+ *  session running the suite has — so every seam assertion must pin it or it is a coin flip. */
+function withEntrypoint<T>(value: string | undefined, fn: () => T): T {
+  const prev = process.env.CLAUDE_CODE_ENTRYPOINT;
+  if (value === undefined) delete process.env.CLAUDE_CODE_ENTRYPOINT;
+  else process.env.CLAUDE_CODE_ENTRYPOINT = value;
+  try {
+    return fn();
+  } finally {
+    if (prev === undefined) delete process.env.CLAUDE_CODE_ENTRYPOINT;
+    else process.env.CLAUDE_CODE_ENTRYPOINT = prev;
+  }
+}
+
 describe("claudeHeadlessInvocation (skip a non-interactive / daemon-spawned claude)", () => {
   test("interactive TUI (a bare `claude`, no ancestors match) → not headless", () => {
     expect(claudeHeadlessInvocation("/usr/local/bin/claude", [])).toBe(false);
@@ -1212,13 +1227,163 @@ describe("claudeHeadlessInvocation (skip a non-interactive / daemon-spawned clau
     expect(typeof claudeAdapter.isHeadlessInvocation).toBe("function");
     expect(codexAdapter.isHeadlessInvocation).toBeUndefined();
     const commands: Record<number, string> = { 100: "claude --output-format stream-json", 200: "node worker-service.js" };
-    expect(claudeAdapter.isHeadlessInvocation!({
+    expect(withEntrypoint("cli", () => claudeAdapter.isHeadlessInvocation!({
       pid: 100, ancestorsOf: () => [200], commandOf: (p) => commands[p],
-    })).toBe(true);
+    }))).toBe(true);
     const interactive: Record<number, string> = { 100: "claude", 200: "/bin/zsh" };
-    expect(claudeAdapter.isHeadlessInvocation!({
+    expect(withEntrypoint("cli", () => claudeAdapter.isHeadlessInvocation!({
       pid: 100, ancestorsOf: () => [200], commandOf: (p) => interactive[p],
-    })).toBe(false);
+    }))).toBe(false);
+  });
+});
+
+// --- Claude DESKTOP app sessions must mirror (they are human interactive sessions) --------------
+//
+// The desktop app runs a bundled `claude` per conversation window, tty-less, with an argv that trips
+// BOTH headless branches: `--output-format stream-json` (headless token) and
+// `--plugin-dir …/claude-mem/<version>` (a launcher marker matched inside a flag VALUE). It must be
+// allow-listed — but its bundled binary ALSO self-forks the `--bg-spare` / `--bg-pty-host` ring under
+// the very same ancestry, and those must stay suppressed.
+
+describe("claudeHeadlessInvocation — Claude desktop app (bundled binary under the disclaimer launcher)", () => {
+  const bundled = "/Users/karrix/Library/Application Support/Claude/claude-code/2.1.227/claude.app/Contents/MacOS/claude";
+  const desktopAncestors = [
+    "/Applications/Claude.app/Contents/Helpers/disclaimer /Users/karrix/Library/Application Support/Claude/claude-code/2.1.227/claude.app/Contents/MacOS/claude",
+    "/Applications/Claude.app/Contents/MacOS/Claude",
+  ];
+  /** The live desktop argv (pid 1426), including the claude-mem --plugin-dir that is the whole bug. */
+  const desktopArgs = (extra = ""): string =>
+    `${bundled} --output-format stream-json --verbose --input-format stream-json --effort high` +
+    ` --model claude-opus-4-8 --permission-prompt-tool stdio${extra ? ` ${extra}` : ""}` +
+    " --allowedTools mcp__computer-use,mcp__web" +
+    " --setting-sources=user,project,local --permission-mode auto --include-partial-messages" +
+    " --plugin-dir /Users/karrix/.claude/plugins/cache/thedotmack/claude-mem/13.12.4" +
+    " --plugin-dir /Users/karrix/.claude/plugins/cache/karrixlee/nomo/2.0.1" +
+    " --thinking-display summarized --replay-user-messages --settings {}";
+  /** claude-mem's observer run: PATH claude, not the bundled binary. */
+  const observerArgs = "/Users/karrix/.local/bin/claude --output-format stream-json --verbose" +
+    " --input-format stream-json --model claude-sonnet-4-6 --permission-prompt-tool stdio" +
+    " --permission-mode dontAsk --no-session-persistence";
+  const observerAncestors = [
+    "/Users/karrix/.bun/bin/bun /Users/karrix/.claude/plugins/cache/thedotmack/claude-mem/13.12.4/scripts/worker-service.cjs --daemon",
+  ];
+
+  test("a real desktop session mirrors — first start AND resume", () => {
+    expect(claudeHeadlessInvocation(desktopArgs(), desktopAncestors)).toBe(false);
+    expect(claudeHeadlessInvocation(
+      desktopArgs("--resume=ef0bb7c5-d12e-4763-82a5-0d03999ed407"), desktopAncestors,
+    )).toBe(false);
+  });
+
+  test("the allow-list is version- and location-agnostic", () => {
+    const future = desktopArgs().replace("claude-code/2.1.227/", "claude-code/9.9.999/");
+    expect(claudeHeadlessInvocation(future, desktopAncestors)).toBe(false);
+    const relocated = desktopAncestors.map((a) => a.replace("/Applications/", "/Users/karrix/Applications/"));
+    expect(claudeHeadlessInvocation(desktopArgs(), relocated)).toBe(false);
+  });
+
+  test("a user folder whose NAME contains a launcher marker can't re-suppress the desktop", () => {
+    expect(claudeHeadlessInvocation(
+      desktopArgs(`--add-dir "/Users/karrix/Downloads/some claude-mem folder"`), desktopAncestors,
+    )).toBe(false);
+  });
+
+  test("the desktop's own detached spare ring stays suppressed (allow-list must not rescue it)", () => {
+    expect(claudeHeadlessInvocation(`${bundled} --bg-spare 3`, desktopAncestors)).toBe(true);
+    expect(claudeHeadlessInvocation(desktopArgs(), [...desktopAncestors, `${bundled} --bg-pty-host`])).toBe(true);
+    expect(claudeHeadlessInvocation(desktopArgs(), [...desktopAncestors, "claude daemon run --origin transient"])).toBe(true);
+    expect(claudeHeadlessInvocation(
+      `${bundled} --fork-session --resume old.jsonl --reply-on-resume`, desktopAncestors,
+    )).toBe(true);
+  });
+
+  test("claude-mem's observer stays suppressed even when the desktop app is its ancestor", () => {
+    expect(claudeHeadlessInvocation(observerArgs, observerAncestors)).toBe(true);
+    expect(claudeHeadlessInvocation(observerArgs, [...observerAncestors, ...desktopAncestors])).toBe(true);
+  });
+
+  test("half a match is no match, in either direction", () => {
+    expect(claudeHeadlessInvocation(desktopArgs(), ["/bin/zsh -l"])).toBe(true); // bundled, no disclaimer
+    expect(claudeHeadlessInvocation(observerArgs, desktopAncestors)).toBe(true); // disclaimer, PATH claude
+    expect(claudeDesktopInvocation(desktopArgs(), ["/bin/zsh -l"])).toBe(false);
+    expect(claudeDesktopInvocation(observerArgs, desktopAncestors)).toBe(false);
+    expect(claudeDesktopInvocation(desktopArgs(), desktopAncestors)).toBe(true);
+    expect(claudeDesktopInvocation(undefined, [undefined])).toBe(false);
+  });
+
+  test("terminal sessions are untouched", () => {
+    expect(claudeHeadlessInvocation("claude", ["/bin/zsh -l", "/opt/homebrew/bin/herdr", "ghostty"])).toBe(false);
+    expect(claudeHeadlessInvocation("claude --resume ef0bb7c5-d12e-4763-82a5-0d03999ed407", ["/bin/zsh -l"])).toBe(false);
+    expect(claudeHeadlessInvocation("claude -p 'x'", ["/bin/zsh -l"])).toBe(true);
+    expect(claudeHeadlessInvocation("claude --print", ["/bin/zsh -l"])).toBe(true);
+  });
+
+  test("claudeAdapter wires the desktop seam (codex omits it)", () => {
+    expect(codexAdapter.isDesktopInvocation).toBeUndefined();
+    const commands: Record<number, string> = { 100: desktopArgs(), 200: desktopAncestors[0]!, 300: desktopAncestors[1]! };
+    expect(withEntrypoint(undefined, () => claudeAdapter.isDesktopInvocation!({
+      pid: 100, ancestorsOf: () => [200, 300], commandOf: (p) => commands[p],
+    }))).toBe(true);
+    expect(withEntrypoint("cli", () => claudeAdapter.isDesktopInvocation!({
+      pid: 100, ancestorsOf: () => [], commandOf: () => "claude",
+    }))).toBe(false);
+  });
+
+  // --- CLAUDE_CODE_ENTRYPOINT: the primary signal, the paths demoted to fallback ------------------
+  //
+  // Claude Code stamps `CLAUDE_CODE_ENTRYPOINT` into the env it spawns hooks with ("claude-desktop"
+  // for an app conversation window, "cli" for a terminal one) and children inherit it. It beats argv
+  // archaeology on every axis — no version segment, no bundle location, no ancestor walk, and it is
+  // the ONLY one of the two that can work on Windows, where the ps-based readers return nothing.
+
+  test("the entrypoint alone identifies the desktop — no path anchors needed (Windows, relocated bundle, future layout)", () => {
+    expect(claudeDesktopInvocation("claude", [], "claude-desktop")).toBe(true);
+    expect(claudeDesktopInvocation(undefined, [undefined], "claude-desktop")).toBe(true);
+    expect(claudeDesktopInvocation(
+      "C:\\Users\\k\\AppData\\Local\\Claude\\claude.exe --output-format stream-json", [], "claude-desktop",
+    )).toBe(true);
+    expect(claudeHeadlessInvocation("claude --output-format stream-json", [], "claude-desktop")).toBe(false);
+    expect(withEntrypoint("claude-desktop", () => claudeAdapter.isDesktopInvocation!({
+      pid: 100, ancestorsOf: () => [], commandOf: () => "claude",
+    }))).toBe(true);
+  });
+
+  test("a NON-desktop entrypoint is not a desktop verdict on an ordinary invoker", () => {
+    expect(claudeDesktopInvocation("claude", ["/bin/zsh -l"], "cli")).toBe(false);
+    expect(claudeHeadlessInvocation(observerArgs, observerAncestors, "cli")).toBe(true);
+    expect(claudeHeadlessInvocation("claude -p 'x'", ["/bin/zsh -l"], "cli")).toBe(true);
+    expect(claudeHeadlessInvocation("claude", ["/bin/zsh -l"], "cli")).toBe(false);
+  });
+
+  test("the path anchors still stand alone when the env var is missing or empty (the deliberate fallback)", () => {
+    // claude-status-bar carries the last known entrypoint forward "for the odd event where the env
+    // var isn't set" — direct evidence from a shipping project that it is sometimes absent. Without
+    // this fallback the suppressed-desktop bug would come back INTERMITTENTLY.
+    expect(claudeDesktopInvocation(desktopArgs(), desktopAncestors, undefined)).toBe(true);
+    expect(claudeDesktopInvocation(desktopArgs(), desktopAncestors, "")).toBe(true);
+    expect(claudeHeadlessInvocation(desktopArgs(), desktopAncestors, undefined)).toBe(false);
+    expect(claudeHeadlessInvocation(desktopArgs(), desktopAncestors, "")).toBe(false);
+  });
+
+  test("the anchors are a FALLBACK, not a veto: a `cli` entrypoint on the bundled binary is still desktop", () => {
+    // A cli entrypoint on the bundled binary under `disclaimer` ancestry does not occur in reality;
+    // where both signals somehow disagree, trusting the paths keeps a real conversation window
+    // mirroring, which is the conservative failure direction (the bug this whole guard fixes).
+    expect(claudeDesktopInvocation(desktopArgs(), desktopAncestors, "cli")).toBe(true);
+    expect(claudeHeadlessInvocation(desktopArgs(), desktopAncestors, "cli")).toBe(false);
+  });
+
+  test("ORDERING: a desktop entrypoint must NOT rescue the self-forked spare ring", () => {
+    // The spare ring is forked BY the desktop binary, so it inherits the desktop entrypoint too.
+    // CLAUDE_SELF_DAEMON_MARKERS are checked first and unconditionally for exactly this reason —
+    // consulting the entrypoint any earlier would resurrect every one of these phantoms.
+    expect(claudeHeadlessInvocation(`${bundled} --bg-spare 3`, desktopAncestors, "claude-desktop")).toBe(true);
+    expect(claudeHeadlessInvocation("claude --bg-spare 3", [], "claude-desktop")).toBe(true);
+    expect(claudeHeadlessInvocation(desktopArgs(), [...desktopAncestors, `${bundled} --bg-pty-host`], "claude-desktop")).toBe(true);
+    expect(claudeHeadlessInvocation(desktopArgs(), [...desktopAncestors, "claude daemon run --origin transient"], "claude-desktop")).toBe(true);
+    expect(claudeHeadlessInvocation(
+      `${bundled} --fork-session --resume old.jsonl --reply-on-resume`, desktopAncestors, "claude-desktop",
+    )).toBe(true);
   });
 });
 
@@ -1596,6 +1761,78 @@ describe("claudeLocateTuiPid (the recorded pid IS the TUI)", () => {
     expect(await claudeLocateTuiPid(
       { sessionId: "s", record: locRec({ pid: Number.NaN }) }, { ttyOf: async () => "ttys004" },
     )).toBeUndefined();
+  });
+
+  // FIELD REGRESSION, the second shape of the herdr bug above: a session started in the Claude DESKTOP
+  // app records the ppid of a `claude` that runs under the app bundle with tty "??". Refusing it here
+  // made "Open on Mac" a silent no-op for every desktop-app session (the watchdog traced
+  // result:"no-candidate" and did nothing — it never focused the wrong app, it just never focused).
+  // The argv are verbatim off a live desktop session (Claude 1.30096.1 / claude-code 2.1.229).
+  const DESKTOP_SESSION_ARGV =
+    "/Users/karrix/Library/Application Support/Claude/claude-code/2.1.229/claude.app/Contents/MacOS/claude"
+    + " --output-format stream-json --resume=8fc9dfd6-adde-4da4-9afb-e209b4c1947e";
+  const DESKTOP_COMMANDS: Record<number, string> = {
+    27773: DESKTOP_SESSION_ARGV,
+    27772: "/Applications/Claude.app/Contents/Helpers/disclaimer " + DESKTOP_SESSION_ARGV,
+    52631: "/Applications/Claude.app/Contents/MacOS/Claude",
+  };
+
+  test("a tty-less pid owned by the Claude DESKTOP app is still the TUI", async () => {
+    const notes: LocateTuiReason[] = [];
+    const pid = await claudeLocateTuiPid(
+      { sessionId: "s", record: locRec({ pid: 27773, agent: undefined }) },
+      {
+        ttyOf: async () => "??",
+        ancestorsOf: () => [27772, 52631],
+        commandOf: (p) => DESKTOP_COMMANDS[p],
+        note: (r) => notes.push(r),
+      },
+    );
+    expect(pid).toBe(27773);
+    expect(notes).toEqual(["record-pid"]);
+  });
+
+  test("a pid that is GONE is never resurrected by a desktop-app ancestry either", async () => {
+    // A dead pid reads back no tty, no ancestry and no argv, so the desktop clause cannot fire — the
+    // same property that keeps the herdr escape hatch from focusing a live window for a stale record.
+    const notes: LocateTuiReason[] = [];
+    expect(await claudeLocateTuiPid(
+      { sessionId: "s", record: locRec({ pid: 27773, agent: undefined }) },
+      {
+        ttyOf: async () => undefined, ancestorsOf: () => [], commandOf: () => undefined,
+        note: (r) => notes.push(r),
+      },
+    )).toBeUndefined();
+    expect(notes).toEqual(["no-candidate"]);
+  });
+
+  test("a CLI session under Ghostty resolves exactly as before (the tty is still the signal)", async () => {
+    const notes: LocateTuiReason[] = [];
+    const argv: Record<number, string> = {
+      6757: "claude", 6700: "-zsh", 900: "/Applications/Ghostty.app/Contents/MacOS/ghostty",
+    };
+    const pid = await claudeLocateTuiPid(
+      { sessionId: "s", record: locRec({ pid: 6757, agent: undefined }) },
+      {
+        ttyOf: async () => "ttys004", ancestorsOf: () => [6700, 900], commandOf: (p) => argv[p],
+        note: (r) => notes.push(r),
+      },
+    );
+    expect(pid).toBe(6757);
+    expect(notes).toEqual(["record-pid"]);
+  });
+
+  test("the desktop clause is the CLAUDE locator's alone — Codex still needs its own correlation", async () => {
+    // Codex sessions must be untouched: a tty-less codex pid under a Claude-desktop-looking ancestry
+    // is not rescued, because codexLocateTuiPid never consults the owning app at all.
+    expect(await codexLocateTuiPid(
+      { sessionId: "codex-uuid", record: locRec({ pid: 27773 }) },
+      {
+        ps: async () => PS_ONE_TUI,
+        ancestorsOf: () => [27772, 52631],
+        commandOf: (p) => DESKTOP_COMMANDS[p],
+      },
+    )).toBe(16029); // the lone real codex TUI, never the desktop-owned pid
   });
 });
 
