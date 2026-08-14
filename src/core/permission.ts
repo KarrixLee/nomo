@@ -29,7 +29,7 @@ import { runHook, buildBlob, OpPlan } from "./hook";
 import {
   AgentKind, appendFittedPlanAndDebug, atomicWrite, BLOB_FIT_CHARS, CC_DIR, clearDecisionHold, codexHome, Config,
   DecisionHold, flagExists, formatDecisionHoldDebug,
-  fullTextForRecord, loadConfig, NO_HOLD_PATH,
+  fullTextForRecord, loadConfig, NO_HOLD_PATH, postFullText,
   PLUGIN_VERSION, readPrefix, readRecord, readSuffix, sealedBlobChars, SessionRecord,
   settleDecisionHoldRecord, stampPermissionDetailFull,
   writeDecisionHold,
@@ -1390,6 +1390,15 @@ export async function runPermissionHook(
     if (record && record.permissionDetailFull !== detailFull) {
       await (deps.stampDetailFullFn ?? defaultStampDetailFull())(sessionId, detailFull);
     }
+    // The SAME cut text, sealed and pushed to the blind worker so a phone that is NOT on this network can
+    // pull it too (NOM-44 phase 5). The disk tee above keeps its await — it is a local write, so ordering
+    // it before the card costs nothing. This one CANNOT have that: a 5 s upload awaited here would sit
+    // directly in front of the decision POST, and the decision POST is the thing that puts an answerable
+    // card on the user's phone. So it is STARTED here — strictly before the card goes out — and awaited
+    // only after, which buys the full head start without spending a millisecond of the card's latency.
+    // The residual window (card up, upload still in flight) is closed by the phone, which falls back to
+    // the LAN read and then to the truncated preview already on the card; nothing here retries.
+    const fullUpload = postFullText(config, sessionId, "permission-detail", detailFull, fetchFn, trace);
     const blob = await encryptBlob(config.e2eKey, permissionFrame(permissionBase, fitted.detail, fitted.omitted, fitted.questions));
     const fallbackBlob = await encryptBlob(config.e2eKey, base);
 
@@ -1544,6 +1553,10 @@ export async function runPermissionHook(
     };
 
     let { posted, hold, reason: holdReason } = await postDecision(1, POST_MAX_ATTEMPTS);
+    // Settle the full-text upload started above. It has been in flight for the whole POST, so this is
+    // almost always already resolved; it exists so a hook that exits immediately (hold:false) cannot kill
+    // the request mid-upload. postFullText never rejects, so there is nothing to catch.
+    await fullUpload;
     if (!posted) {
       // Both POSTs failed at the TRANSPORT layer — but a client-side timeout says nothing about whether
       // the request LANDED. If the first one did, the worker is holding a real record and the phone is

@@ -27,7 +27,7 @@ import {
 } from "./adapter";
 import {
   AgentKind, appendFittedPlanAndDebug, atomicWrite, CCOp, CCStatus, codexCompanionBrokerEvidence, Config, decisionHoldFileName, ensureWatchdog, FolderIdentity, folderIdentity, formatPlanPickerDebug, fullTextForRecord, GONE_STRIKE_LIMIT,
-  LAST_SEND_PATH, lastHookPath, loadConfig, loadPendingConfig, localApprovalsState, PENDING_STASH_PATH, PendingEventStash, pidAncestors, pidCommand, PLUGIN_VERSION, readPrefix,
+  LAST_SEND_PATH, lastHookPath, loadConfig, loadPendingConfig, localApprovalsState, PENDING_STASH_PATH, PendingEventStash, pidAncestors, pidCommand, PLUGIN_VERSION, postFullText, readPrefix,
   readRecord, recordGoneStrike, removeRevokedConfig, resetGoneStrikes, SessionOrigin, SessionRecord, SESSIONS_DIR, sessionBranch, tracePlanPickerDecision, traceSession,
 } from "./shared";
 import { repairNotifyWiring } from "./notify-wire";
@@ -614,6 +614,10 @@ async function readStdin(): Promise<string> {
 // helpers (readGoneStrikes/resetGoneStrikes/recordGoneStrike) live in shared so the watchdog's
 // sweep counts against the SAME streak — see the shared-counter note there.
 export async function runHook(agent: AgentKind): Promise<void> {
+  /** The remote full-text upload (NOM-44 phase 5), once a truncated plan starts one. Function-scoped so
+   *  the `finally` below can settle it on EVERY exit — the entries call `process.exit(0)` the moment this
+   *  resolves, which would otherwise kill the request mid-flight. */
+  let fullUpload: Promise<void> | undefined;
   try {
     const [config, raw] = await Promise.all([loadConfig(), readStdin()]);
     const input = JSON.parse(raw) as Record<string, unknown>;
@@ -975,6 +979,13 @@ export async function runHook(agent: AgentKind): Promise<void> {
       (plaintext) => { planFull = fullTextForRecord(proposedPlan, plaintext.plan); });
     if (!envelope) return;
 
+    // The same cut plan, sealed and pushed to the blind worker so a phone that is NOT on this network can
+    // pull it too (NOM-44 phase 5) — the LAN `read` op's remote twin. STARTED here, strictly before the
+    // event POST below, and awaited after it: the upload rides in parallel with the event that puts the
+    // row on the phone, so it costs that event no latency, and the await is what stops this short-lived
+    // hook from exiting mid-upload. `postFullText` no-ops when nothing was cut and never throws.
+    fullUpload = postFullText(config, sessionId, "plan", planFull);
+
     // Record (or, on op:end, remove) this session's file and make sure the liveness watchdog is
     // running before we POST — a force-killed terminal fires no SessionEnd, so this is how the phone
     // learns of a dead session in seconds instead of after the one-hour worker eviction.
@@ -1088,5 +1099,10 @@ export async function runHook(agent: AgentKind): Promise<void> {
     }
   } catch {
     // Silence is the contract — never surface errors into a Claude Code (or Codex) session.
+  } finally {
+    // Let the parallel full-text upload finish before the entry's process.exit(0). It has been in flight
+    // for the whole event POST, so this is almost always already resolved, and postFullText never
+    // rejects — so this can neither delay a healthy hook nor turn a soft miss into a thrown error.
+    await fullUpload;
   }
 }

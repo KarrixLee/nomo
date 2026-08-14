@@ -16,7 +16,7 @@ import { encryptBlob, decryptBlob } from "./crypto";
 import { createLanAnswerStore, createLanListener } from "./lan-listener";
 import type { LanAnswerStore, LanListener } from "./lan-listener";
 import type { Config } from "./shared";
-import { folderIdentity, PLUGIN_VERSION } from "./shared";
+import { folderIdentity, PLUGIN_VERSION, RECORD_FULL_TEXT_MAX_CHARS, RECORD_FULL_TEXT_TRUNCATION_MARKER } from "./shared";
 import { startCodexRemoteInput } from "./codex-remote-input";
 
 // ---- summary builder (pure) ---------------------------------------------------------------
@@ -490,15 +490,23 @@ const DENY = '{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decisi
  *  array supplies a per-POST-call sequence (repeating the last entry) so the hold-retry re-POST can
  *  answer differently from the first. `gets` is the sequence of GET replies: an object is a 200 body,
  *  "throw" is a transport failure, and a NUMBER is a non-2xx HTTP status with an empty body (used to
- *  drive the definitive-status release). */
-function scriptFetch(hold: boolean | boolean[], gets: Array<Record<string, unknown> | "throw" | number>) {
-  const calls: Array<{ url: string; method: string; body?: string }> = [];
+ *  drive the definitive-status release). `full` scripts the POST /v1/cc/full reply (200 by default;
+ *  a number is a non-2xx, "throw" a transport failure) so a test can prove the upload is soft. */
+function scriptFetch(
+  hold: boolean | boolean[], gets: Array<Record<string, unknown> | "throw" | number>,
+  full: number | "throw" = 200,
+) {
+  const calls: Array<{ url: string; method: string; body?: string; headers?: Record<string, string> }> = [];
   let g = 0;
   let p = 0;
   const holdFor = () => (Array.isArray(hold) ? hold[Math.min(p++, hold.length - 1)] : hold);
-  const fn = (async (url: string, init?: { method?: string; body?: string }) => {
+  const fn = (async (url: string, init?: { method?: string; body?: string; headers?: Record<string, string> }) => {
     const method = init?.method ?? "GET";
-    calls.push({ url, method, body: init?.body });
+    calls.push({ url, method, body: init?.body, headers: init?.headers });
+    if (url.endsWith("/v1/cc/full")) {
+      if (full === "throw") throw new Error("network");
+      return new Response(JSON.stringify({ ok: full === 200 }), { status: full });
+    }
     if (url.endsWith("/v1/cc/decision")) return new Response(JSON.stringify({ hold: holdFor() }), { status: 200 });
     // GET /v1/cc/decision/<id>
     const next = gets[Math.min(g++, gets.length - 1)];
@@ -650,7 +658,7 @@ describe("runPermissionHook — hold state machine", () => {
     // The marker carries the SAME card that was POSTed — one frame, two channels — plus the `dbg`
     // breadcrumb that names the channel. Everything the phone RENDERS must be identical; the tail is
     // the only difference, and it is the whole point (see formatDecisionHoldDebug).
-    const posted = (await decryptBlob(KEY, JSON.parse(calls.find((c) => c.method === "POST")!.body!).blob)) as Record<string, unknown>;
+    const posted = (await decryptBlob(KEY, JSON.parse(calls.find((c) => c.method === "POST" && c.url.endsWith("/v1/cc/decision"))!.body!).blob)) as Record<string, unknown>;
     const held = (await decryptBlob(KEY, writes[0].hold.blob)) as Record<string, unknown>;
     expect({ ...held, dbg: undefined }).toEqual({ ...posted, dbg: undefined });
     expect("dbg" in posted).toBe(false);
@@ -931,7 +939,7 @@ describe("runPermissionHook — hold state machine", () => {
   test("POST body is the frozen wire shape: decisionPending blob + needsAttention fallbackBlob", async () => {
     const { fn, calls } = scriptFetch(false, []);
     await runPermissionHook(baseDeps({ fetchFn: fn, emit: () => {} }) as never);
-    const post = calls.find((c) => c.method === "POST")!;
+    const post = calls.find((c) => c.method === "POST" && c.url.endsWith("/v1/cc/decision"))!;
     const body = JSON.parse(post.body!);
     expect(body).toMatchObject({ v: 2, sessionId: "sess-1", requestId: "req-fixed", op: "update", prio: 1, ts: 1000 });
     expect(typeof body.blob).toBe("string");
@@ -963,7 +971,7 @@ describe("runPermissionHook — hold state machine", () => {
     const nowMs = 1_784_937_605_400;                                  // the vector's epoch second, plus 400 ms
     const { fn, calls } = scriptFetch(false, []);
     await runPermissionHook(baseDeps({ fetchFn: fn, emit: () => {}, now: () => nowMs }) as never);
-    const body = JSON.parse(calls.find((c) => c.method === "POST")!.body!);
+    const body = JSON.parse(calls.find((c) => c.method === "POST" && c.url.endsWith("/v1/cc/decision"))!.body!);
     const blob = (await decryptBlob(KEY, body.blob)) as Record<string, unknown>;
     const fb = (await decryptBlob(KEY, body.fallbackBlob)) as Record<string, unknown>;
     expect(blob.at).toBe(1_784_937_605);                              // FLOORED seconds, the vector's shape
@@ -990,7 +998,7 @@ describe("runPermissionHook — hold state machine", () => {
       const record = { pid: 1, machine: "Mac", ...folderIdentity(repo), ts: 0 };
       const { fn, calls } = scriptFetch(false, []);
       await runPermissionHook(baseDeps({ fetchFn: fn, emit: () => {}, readRecordFn: async () => record }) as never);
-      const body = JSON.parse(calls.find((c) => c.method === "POST")!.body!);
+      const body = JSON.parse(calls.find((c) => c.method === "POST" && c.url.endsWith("/v1/cc/decision"))!.body!);
       const blob = (await decryptBlob(KEY, body.blob)) as Record<string, unknown>;
       const fb = (await decryptBlob(KEY, body.fallbackBlob)) as Record<string, unknown>;
       expect(blob.branch).toBe("feat/hybrid-lan");
@@ -1911,7 +1919,9 @@ describe("runPermissionHook — decision blob detail fields", () => {
   const postedBlob = async (over: Record<string, unknown>) => {
     const { fn, calls } = scriptFetch(false, []); // hold:false is fine — the POST body is built regardless
     await runPermissionHook(baseDeps({ fetchFn: fn, emit: () => {}, ...over }) as never);
-    const body = JSON.parse(calls.find((c) => c.method === "POST")!.body!);
+    // The DECISION POST specifically: a detail long enough to be cut ALSO fires the /v1/cc/full upload,
+    // which is a POST to another route carrying a different (and much larger) sealed body.
+    const body = JSON.parse(calls.find((c) => c.method === "POST" && c.url.endsWith("/v1/cc/decision"))!.body!);
     return { body, blob: (await decryptBlob(KEY, body.blob)) as Record<string, unknown> };
   };
 
@@ -2046,7 +2056,7 @@ describe("runPermissionHook — AskUserQuestion holds", () => {
   test("the blob carries permissionQuestions LAST, options intact", async () => {
     const { fn, calls } = scriptFetch(false, []);
     await runPermissionHook(baseDeps({ fetchFn: fn, emit: () => {}, readInput: async () => questionInput() }) as never);
-    const body = JSON.parse(calls.find((c) => c.method === "POST")!.body!);
+    const body = JSON.parse(calls.find((c) => c.method === "POST" && c.url.endsWith("/v1/cc/decision"))!.body!);
     const blob = (await decryptBlob(KEY, body.blob)) as Record<string, unknown>;
     expect(blob.permissionToolName).toBe("AskUserQuestion");
     expect(blob.permissionSummary).toBe("Which testing approach should I use for the new parser?");
@@ -2070,7 +2080,7 @@ describe("runPermissionHook — AskUserQuestion holds", () => {
       fetchFn: fn, emit: () => {},
       readInput: async () => questionInput([{ question: "q".repeat(9000), options: [{ label: "A" }, { label: "B" }] }]),
     }) as never);
-    const body = JSON.parse(calls.find((c) => c.method === "POST")!.body!);
+    const body = JSON.parse(calls.find((c) => c.method === "POST" && c.url.endsWith("/v1/cc/decision"))!.body!);
     const blob = (await decryptBlob(KEY, body.blob)) as Record<string, unknown>;
     expect("permissionDetail" in blob).toBe(false);
     expect("permissionDetailOmitted" in blob).toBe(false);
@@ -2095,7 +2105,7 @@ describe("runPermissionHook — AskUserQuestion holds", () => {
       readRecordFn: async () => ({ pid: 1, machine: "m", label: "api-status", title: "y".repeat(120), ts: 1000 }),
       readInput: async () => questionInput(questions),
     }) as never);
-    const body = JSON.parse(calls.find((c) => c.method === "POST")!.body!);
+    const body = JSON.parse(calls.find((c) => c.method === "POST" && c.url.endsWith("/v1/cc/decision"))!.body!);
     return { body, blob: (await decryptBlob(KEY, body.blob)) as Record<string, unknown> };
   };
 
@@ -2266,7 +2276,7 @@ describe("runPermissionHook — AskUserQuestion holds", () => {
     await runPermissionHook(baseDeps({
       fetchFn: fn, emit: () => {}, readInput: async () => questionInput(qs),
     }) as never);
-    const posted = JSON.parse(calls.find((c) => c.method === "POST")!.body!);
+    const posted = JSON.parse(calls.find((c) => c.method === "POST" && c.url.endsWith("/v1/cc/decision"))!.body!);
     const blob = (await decryptBlob(KEY, posted.blob)) as Record<string, unknown>;
     expect(blob.permissionQuestions).toEqual([                       // the phone is SHOWN exactly two rows
       { q: "First?", o: ["A", "B"] },
@@ -2651,7 +2661,7 @@ describe("runPermissionHook — codex agent", () => {
 
   test("the posted blob + fallbackBlob both carry agent:'codex'", async () => {
     const { calls } = await answerCodex({ decision: "allow" });
-    const body = JSON.parse(calls.find((c) => c.method === "POST")!.body!);
+    const body = JSON.parse(calls.find((c) => c.method === "POST" && c.url.endsWith("/v1/cc/decision"))!.body!);
     const blob = (await decryptBlob(KEY, body.blob)) as Record<string, unknown>;
     const fb = (await decryptBlob(KEY, body.fallbackBlob)) as Record<string, unknown>;
     expect(blob.status).toBe("decisionPending");
@@ -2668,7 +2678,7 @@ describe("runPermissionHook — codex agent", () => {
     });
     const { fn, calls } = scriptFetch(false, []);
     await runPermissionHook(baseDeps({ fetchFn: fn, emit: () => {}, readInput: async () => codexInput }) as never, "codex");
-    const body = JSON.parse(calls.find((c) => c.method === "POST")!.body!);
+    const body = JSON.parse(calls.find((c) => c.method === "POST" && c.url.endsWith("/v1/cc/decision"))!.body!);
     const blob = (await decryptBlob(KEY, body.blob)) as Record<string, unknown>;
     expect(blob.permissionToolName).toBe("shell");
     expect(blob.permissionSummary).toBe("rm -rf build");           // first line only
@@ -3000,5 +3010,80 @@ describe("runPermissionHook — the unabridged-detail record tee", () => {
       readRecordFn: async () => record(),
       readInput: async () => inputWith({ tool_name: "ExitPlanMode", tool_input: { plan } }),
     })).toEqual([plan]);
+  });
+});
+
+// ---- NOM-44 phase 5: the REMOTE half of the same pull -------------------------------------------
+//
+// The disk tee above only reaches a phone on this network. This POSTs the same sealed text to the blind
+// worker so a phone anywhere can pull it. Same gate (fullTextForRecord), same fallbacks on failure.
+
+describe("runPermissionHook — the remote full-text upload", () => {
+  const record = () => ({ pid: 1, machine: "m", label: "l", ts: 1000 });
+  const uploads = (calls: Array<{ url: string; method: string; body?: string; headers?: Record<string, string> }>) =>
+    calls.filter((c) => c.url.endsWith("/v1/cc/full"));
+
+  const run = async (over: Record<string, unknown>, full: number | "throw" = 200) => {
+    const { fn, calls } = scriptFetch(false, [], full);
+    const seen: Array<string | undefined> = [];
+    await runPermissionHook(baseDeps({
+      fetchFn: fn, emit: () => {}, readRecordFn: async () => record(),
+      stampDetailFullFn: async (_s: string, d: string | undefined) => { seen.push(d); },
+      ...over,
+    }) as never);
+    return { calls, seen };
+  };
+
+  test("a TRUNCATED detail is uploaded once, sealed, with sessionId + what + complete inside", async () => {
+    const command = `${"x".repeat(20_000)}END`;
+    const { calls } = await run({ readInput: async () => inputWith({ tool_input: { command } }) });
+    const posts = uploads(calls);
+    expect(posts).toHaveLength(1);
+    expect(posts[0].method).toBe("POST");
+    const body = JSON.parse(posts[0].body!) as { v: number; sessionId: string; what: string; blob: string };
+    expect(body.v).toBe(2);
+    expect(body.sessionId).toBe("sess-1");
+    expect(body.what).toBe("permission-detail");
+    // The Mac auth headers the sibling POSTs carry — the worker authenticates the writer, then stays blind.
+    expect(posts[0].headers?.["x-cc-pairing"]).toBe("p1");
+    expect(posts[0].headers?.["x-cc-auth"]).toBe("s1");
+    // THE ANTI-SUBSTITUTION CHECK: sessionId and what live INSIDE the seal too, so a blind relay that
+    // answered this pull with another session's body would hand the phone self-contradicting plaintext.
+    expect(await decryptBlob(KEY, body.blob)).toEqual({
+      sessionId: "sess-1", what: "permission-detail", content: command, complete: true,
+    });
+  });
+
+  test("text past RECORD_FULL_TEXT_MAX_CHARS seals complete:false rather than lying", async () => {
+    const command = "z".repeat(300_000);
+    const { calls } = await run({ readInput: async () => inputWith({ tool_input: { command } }) });
+    const sealed = await decryptBlob(KEY, (JSON.parse(uploads(calls)[0].body!) as { blob: string }).blob) as
+      { content: string; complete: boolean };
+    expect(sealed.complete).toBe(false);
+    expect(sealed.content.endsWith(RECORD_FULL_TEXT_TRUNCATION_MARKER)).toBe(true);
+    expect(Array.from(sealed.content)).toHaveLength(RECORD_FULL_TEXT_MAX_CHARS);
+  });
+
+  test("a detail that rides WHOLE uploads NOTHING — no KV write for the common prompt", async () => {
+    const { calls } = await run({ readInput: async () => inputWith({ tool_input: { command: "ls -la" } }) });
+    expect(uploads(calls)).toHaveLength(0);
+  });
+
+  test("the upload is STARTED before the decision POST (the card can never precede its content)", async () => {
+    const { calls } = await run({
+      readInput: async () => inputWith({ tool_name: "ExitPlanMode", tool_input: { plan: "p".repeat(20_000) } }),
+    });
+    expect(calls[0].url.endsWith("/v1/cc/full")).toBe(true);
+    expect(calls[1].url.endsWith("/v1/cc/decision")).toBe(true);
+  });
+
+  test("a FAILING upload breaks neither the decision POST nor the record tee", async () => {
+    const command = `${"x".repeat(20_000)}END`;
+    for (const full of [500, "throw"] as const) {
+      const { calls, seen } = await run({ readInput: async () => inputWith({ tool_input: { command } }) }, full);
+      expect(uploads(calls)).toHaveLength(1);                                   // tried once, never retried
+      expect(calls.filter((c) => c.url.endsWith("/v1/cc/decision")).length).toBe(2); // initial + re-ask, untouched
+      expect(seen).toEqual([command]);                                          // the LAN tee still landed
+    }
   });
 });

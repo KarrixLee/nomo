@@ -104,7 +104,7 @@ async function sha256Hex(s) {
 }
 
 // src/core/shared.ts
-var PLUGIN_VERSION = "2.0.2";
+var PLUGIN_VERSION = "2.0.3";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -222,6 +222,33 @@ function fullTextForRecord(full, fitted) {
 }
 function recordFullTextIsComplete(value) {
   return !value.endsWith(RECORD_FULL_TEXT_TRUNCATION_MARKER);
+}
+var FULL_TEXT_POST_TIMEOUT_MS = 5000;
+async function postFullText(config, sessionId, what, content, fetchFn = fetch, trace) {
+  if (content === undefined)
+    return;
+  try {
+    const blob = await encryptBlob(config.e2eKey, {
+      sessionId,
+      what,
+      content,
+      complete: recordFullTextIsComplete(content)
+    });
+    const res = await fetchFn(`${config.url}/v1/cc/full`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-cc-pairing": config.pairingId,
+        "x-cc-auth": config.pcSecret,
+        "x-cc-version": PLUGIN_VERSION
+      },
+      body: JSON.stringify({ v: 2, sessionId, what, blob }),
+      signal: AbortSignal.timeout(FULL_TEXT_POST_TIMEOUT_MS)
+    });
+    trace?.({ event: "full-text", what, chars: content.length, status: res.status });
+  } catch (e) {
+    trace?.({ event: "full-text", what, chars: content.length, status: 0, error: e?.name ?? "Error" });
+  }
 }
 async function flagExists(path) {
   try {

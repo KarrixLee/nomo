@@ -109,7 +109,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "2.0.2";
+var PLUGIN_VERSION = "2.0.3";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -227,6 +227,33 @@ function fullTextForRecord(full, fitted) {
 }
 function recordFullTextIsComplete(value) {
   return !value.endsWith(RECORD_FULL_TEXT_TRUNCATION_MARKER);
+}
+var FULL_TEXT_POST_TIMEOUT_MS = 5000;
+async function postFullText(config, sessionId, what, content, fetchFn = fetch, trace) {
+  if (content === undefined)
+    return;
+  try {
+    const blob = await encryptBlob(config.e2eKey, {
+      sessionId,
+      what,
+      content,
+      complete: recordFullTextIsComplete(content)
+    });
+    const res = await fetchFn(`${config.url}/v1/cc/full`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-cc-pairing": config.pairingId,
+        "x-cc-auth": config.pcSecret,
+        "x-cc-version": PLUGIN_VERSION
+      },
+      body: JSON.stringify({ v: 2, sessionId, what, blob }),
+      signal: AbortSignal.timeout(FULL_TEXT_POST_TIMEOUT_MS)
+    });
+    trace?.({ event: "full-text", what, chars: content.length, status: res.status });
+  } catch (e) {
+    trace?.({ event: "full-text", what, chars: content.length, status: 0, error: e?.name ?? "Error" });
+  }
 }
 async function flagExists(path) {
   try {
@@ -3038,6 +3065,7 @@ async function readStdin() {
   return Buffer.concat(chunks).toString("utf8");
 }
 async function runHook(agent) {
+  let fullUpload;
   try {
     const [config, raw] = await Promise.all([loadConfig(), readStdin()]);
     const input = JSON.parse(raw);
@@ -3245,6 +3273,7 @@ async function runHook(agent) {
     });
     if (!envelope)
       return;
+    fullUpload = postFullText(config, sessionId, "plan", planFull);
     const createsRecord = !existingRecord && plan.op !== "end";
     const retiresRecord = !!existingRecord && plan.op === "end";
     const origin = existingRecord?.origin ?? sessionOrigin(input, hookPid, hookCommand);
@@ -3310,7 +3339,9 @@ async function runHook(agent) {
     } else {
       await resetGoneStrikes();
     }
-  } catch {}
+  } catch {} finally {
+    await fullUpload;
+  }
 }
 
 // src/core/decision-poll.ts
@@ -4155,6 +4186,7 @@ async function runPermissionHook(deps = {}, agent = "claude") {
     if (record && record.permissionDetailFull !== detailFull) {
       await (deps.stampDetailFullFn ?? defaultStampDetailFull())(sessionId, detailFull);
     }
+    const fullUpload = postFullText(config, sessionId, "permission-detail", detailFull, fetchFn, trace);
     const blob = await encryptBlob(config.e2eKey, permissionFrame(permissionBase, fitted.detail, fitted.omitted, fitted.questions));
     const fallbackBlob = await encryptBlob(config.e2eKey, base);
     const pcHeaders = { "x-cc-pairing": config.pairingId, "x-cc-auth": config.pcSecret, "x-cc-version": PLUGIN_VERSION };
@@ -4257,6 +4289,7 @@ async function runPermissionHook(deps = {}, agent = "claude") {
       } catch {}
     };
     let { posted, hold, reason: holdReason } = await postDecision(1, POST_MAX_ATTEMPTS);
+    await fullUpload;
     if (!posted) {
       const probe = await pollDecision(0);
       const live = probe.data?.status === "pending" || probe.data?.status === "answered";

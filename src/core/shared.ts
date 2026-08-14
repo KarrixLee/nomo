@@ -295,6 +295,54 @@ export function recordFullTextIsComplete(value: string): boolean {
   return !value.endsWith(RECORD_FULL_TEXT_TRUNCATION_MARKER);
 }
 
+/** What a full-text upload is a copy OF. Rides in the clear body (so the blind worker can key the
+ *  record) AND inside the sealed plaintext (so the phone can check them against what it asked for). */
+export type FullTextKind = "plan" | "permission-detail";
+
+/** The event/decision POSTs' 2 s idiom, widened for a payload that is up to ~350 KB of base64 rather
+ *  than a ~3 KB frame. It never delays anything the user is waiting on: the upload rides in PARALLEL
+ *  with the card's own POST (see the two call sites) and a miss is soft. */
+export const FULL_TEXT_POST_TIMEOUT_MS = 5000;
+
+/** Ship a text that had to be CUT to fit the sealed frame to the (blind) worker, so a phone that is NOT
+ *  on this network can still pull the whole thing — the LAN `read` op's remote twin. The inline preview
+ *  on the card is untouched and stays the degraded mode when this never lands.
+ *
+ *  GATED ON `fullTextForRecord`: `content === undefined` means nothing was cut, so there is nothing to
+ *  pull and no POST happens at all — no upload, no KV write — for the overwhelmingly common prompt.
+ *
+ *  `sessionId` and `what` ride INSIDE the sealed plaintext as well as in the clear body, and that is not
+ *  redundancy: the relay is blind and can read neither copy, so anything that answered one session's
+ *  pull with another session's body would hand the phone a plaintext whose own labels disagree with what
+ *  it asked for. Dropping them would make substitution undetectable.
+ *
+ *  NEVER THROWS, never retries (the phone falls back to the LAN read, then to the truncated preview).
+ *  Callers START it before the event/decision POST and AWAIT it after, so it adds no latency to the card
+ *  yet still finishes before a short-lived hook process exits. */
+export async function postFullText(
+  config: Config, sessionId: string, what: FullTextKind, content: string | undefined,
+  fetchFn: typeof fetch = fetch, trace?: (event: object) => void,
+): Promise<void> {
+  if (content === undefined) return;
+  try {
+    const blob = await encryptBlob(config.e2eKey, {
+      sessionId, what, content, complete: recordFullTextIsComplete(content),
+    });
+    const res = await fetchFn(`${config.url}/v1/cc/full`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-cc-pairing": config.pairingId, "x-cc-auth": config.pcSecret, "x-cc-version": PLUGIN_VERSION,
+      },
+      body: JSON.stringify({ v: 2, sessionId, what, blob }),
+      signal: AbortSignal.timeout(FULL_TEXT_POST_TIMEOUT_MS),
+    });
+    trace?.({ event: "full-text", what, chars: content.length, status: res.status });
+  } catch (e) {
+    trace?.({ event: "full-text", what, chars: content.length, status: 0, error: (e as { name?: string })?.name ?? "Error" });
+  }
+}
+
 /** Whether a zero-byte marker/flag file exists on disk. The ONE probe shared by every reader of the
  *  local no-hold flag — the permission hook's escape-hatch gate, the `permission off|on|status` CLI
  *  toggle, and localApprovalsState just below — so the gate, the toggle and the reported header can

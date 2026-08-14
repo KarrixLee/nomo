@@ -5,7 +5,7 @@ import { basename, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { b64url, decryptBlob } from "../core/crypto";
 import {
-  BLOB_FIT_CHARS, DBG_BLOB_TEXT_MAX_CHARS, folderIdentity, folderKeyFromCwd, formatPlanPickerDebug, fullTextForRecord, parseConfig, PendingEventStash, PLAN_BLOB_TEXT_MAX_CHARS, PLAN_BLOB_TRUNCATION_MARKER,
+  BLOB_FIT_CHARS, DBG_BLOB_TEXT_MAX_CHARS, folderIdentity, folderKeyFromCwd, formatPlanPickerDebug, fullTextForRecord, parseConfig, PendingEventStash, PLAN_BLOB_TEXT_MAX_CHARS, PLAN_BLOB_TRUNCATION_MARKER, postFullText,
   readDecisionHoldAt, readRecord, sealedBlobChars, SessionRecord, sessionBranch, writeDecisionHoldAt,
 } from "../core/shared";
 import {
@@ -1365,6 +1365,60 @@ describe("buildEnvelope's blob-plaintext tee (the unabridged-plan source)", () =
     const envelope = await buildEnvelope(input, "mac", 1_800_000_000_000, "T", KEY, false, "claude", undefined, undefined,
       "proj", undefined, plan, undefined, undefined, undefined, () => { throw new Error("tee exploded"); });
     expect(typeof envelope?.blob).toBe("string");
+  });
+});
+
+// ---- NOM-44 phase 5: the same cut text, pushed to the blind worker for an OFF-network pull --------
+//
+// runHook has no fetch seam, so the wire contract is asserted on postFullText itself (the permission
+// hook's end-to-end wiring is covered in permission.test.ts). What it is a copy OF — `what:"plan"` here,
+// `"permission-detail"` there — is the only difference between the two call sites.
+
+describe("postFullText — the remote full-text upload", () => {
+  const CONFIG = { url: "https://w.example", pairingId: "p1", pcSecret: "s1", e2eKey: KEY };
+  const spy = (status: number | "throw" = 200) => {
+    const calls: Array<{ url: string; init: { method?: string; body?: string; headers?: Record<string, string> } }> = [];
+    const fn = (async (url: string, init: { method?: string; body?: string; headers?: Record<string, string> }) => {
+      calls.push({ url, init });
+      if (status === "throw") throw new Error("network");
+      return new Response(JSON.stringify({ ok: status === 200 }), { status });
+    }) as unknown as typeof fetch;
+    return { fn, calls };
+  };
+
+  test("nothing was cut (fullTextForRecord → undefined) ⇒ no POST at all", async () => {
+    const { fn, calls } = spy();
+    await postFullText(CONFIG, "s1", "plan", fullTextForRecord("# Short plan", "# Short plan"), fn);
+    expect(calls).toHaveLength(0);
+  });
+
+  test("a cut plan POSTs /v1/cc/full with sessionId + what + complete sealed inside", async () => {
+    const full = "# Plan\n".repeat(2000);
+    const { fn, calls } = spy();
+    const traced: object[] = [];
+    await postFullText(CONFIG, "sess-9", "plan", fullTextForRecord(full, "# Plan\n…"), fn, (e) => traced.push(e));
+    expect(calls).toHaveLength(1);
+    expect(calls[0].url).toBe("https://w.example/v1/cc/full");
+    expect(calls[0].init.method).toBe("POST");
+    expect(calls[0].init.headers?.["x-cc-pairing"]).toBe("p1");
+    expect(calls[0].init.headers?.["x-cc-auth"]).toBe("s1");
+    const body = JSON.parse(calls[0].init.body!) as { v: number; sessionId: string; what: string; blob: string };
+    expect({ v: body.v, sessionId: body.sessionId, what: body.what }).toEqual({ v: 2, sessionId: "sess-9", what: "plan" });
+    // The sealed copy repeats sessionId/what so the phone can reject a body the blind relay substituted.
+    expect(await decryptBlob(KEY, body.blob)).toEqual({
+      sessionId: "sess-9", what: "plan", content: full, complete: true,
+    });
+    expect(traced).toEqual([{ event: "full-text", what: "plan", chars: full.length, status: 200 }]);
+  });
+
+  test("a non-200 and a transport failure are both SOFT — traced, never thrown, never retried", async () => {
+    for (const status of [500, "throw"] as const) {
+      const { fn, calls } = spy(status);
+      const traced: Array<{ status?: number }> = [];
+      await postFullText(CONFIG, "s", "permission-detail", "cut text", fn, (e) => traced.push(e));
+      expect(calls).toHaveLength(1);                      // exactly one attempt
+      expect(traced[0].status).toBe(status === 500 ? 500 : 0);
+    }
   });
 });
 
