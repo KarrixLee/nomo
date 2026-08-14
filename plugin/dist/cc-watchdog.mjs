@@ -1024,6 +1024,9 @@ function recordTitleMatchesPane(recordTitle, paneTitle) {
   return !!match && match[1].length > 0 && paneTitle.startsWith(match[1]);
 }
 function correlateHerdrPane(context, panes) {
+  const byId = panes.filter((pane) => pane.agent === context.agent && pane.agent_session?.value === context.sessionId && (pane.agent_session?.agent ?? context.agent) === context.agent);
+  if (byId.length > 0)
+    return byId.length === 1 ? byId[0] : undefined;
   let candidates = context.agent === "claude" ? panes.filter((pane) => pane.agent === "claude" && recordTitleMatchesPane(context.record.title, pane.terminal_title_stripped)) : panes.filter((pane) => pane.agent === "codex" && typeof context.record.origin?.cwd === "string" && context.record.origin.cwd.length > 0 && pane.cwd === context.record.origin.cwd);
   if (candidates.length > 1) {
     const working = candidates.filter((pane) => pane.agent_status === "working");
@@ -8023,7 +8026,7 @@ async function drainCommands(config, deps = {}) {
           traceFocus(deps, { ...base, agent, result: result2, reason: reason ?? "no-candidate" });
           continue;
         }
-        const outcome = await focus(pid, { agent, record: entry.rec });
+        const outcome = await focus(pid, { agent, record: entry.rec, sessionId: payload.sessionId });
         if (outcome.ok) {
           focused += 1;
           const releasedTuiInput = await releaseFocusedTuiUserInputHold(config, payload.sessionId, now, deps).catch(() => false);

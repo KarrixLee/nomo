@@ -71,6 +71,7 @@ function herdrRecord(over: Partial<SessionRecord> = {}): SessionRecord {
 function herdrDeps(over: {
   agent?: "claude" | "codex";
   record?: SessionRecord;
+  sessionId?: string;
   paneList?: string;
   focusResult?: { stdout: string; exitCode?: number };
   ps?: string;
@@ -90,7 +91,13 @@ function herdrDeps(over: {
       ttyOf: async () => "ttys001",
       ancestorsOf: (pid) => pid === 500 ? [501, 502, 503] : [101, 102, 1],
       commandOf: (pid) => commands[pid],
-      context: { agent: over.agent ?? "claude", record: over.record ?? herdrRecord() },
+      context: {
+        agent: over.agent ?? "claude",
+        record: over.record ?? herdrRecord(),
+        // The default is deliberately an id NO pane in REAL_HERDR_PANE_LIST carries, so every
+        // pre-existing case still exercises the title/cwd path byte-for-byte.
+        sessionId: over.sessionId ?? "no-such-session",
+      },
       execFile: async (file, args) => {
         calls.push({ file, args });
         if (file === "herdr" && args[0] === "pane") return { stdout: over.paneList ?? REAL_HERDR_PANE_LIST };
@@ -448,6 +455,140 @@ describe("focusTerminalForPid through herdr", () => {
     const h = herdrDeps({ focusResult: { stdout: "failed", exitCode: 1 } });
     expect(await focusTerminalForPid(100, h.deps)).toEqual({ ok: false, reason: "herdr-cli-failed" });
     expect(h.calls).toHaveLength(2);
+    expect(h.calls[1]).toEqual({ file: "herdr", args: ["tab", "focus", "w2:t8"] });
+  });
+});
+
+describe("herdr correlation by agent_session id", () => {
+  // FIELD REGRESSION (2026-08-14): "Open on Mac" reported herdr-ambiguous for every Claude pane that
+  // still showed its DEFAULT title. Correlation was fuzzy-title-only, so a record titled "hi" could
+  // never match a pane titled "Claude Code" — while herdr was publishing the session's exact uuid on
+  // that very pane object. Shapes below are copied verbatim off `herdr pane list` on this machine.
+  const LIVE_SESSION = "abbf78fa-47d0-4bb4-bb97-e98981e20c60";
+  const OTHER_SESSION = "b275a98b-901e-48c8-aef2-fa92fd1bb977";
+
+  function claudePane(over: Record<string, unknown> = {}): Record<string, unknown> {
+    return {
+      agent: "claude",
+      agent_session: { agent: "claude", kind: "id", source: "herdr:claude", value: LIVE_SESSION },
+      agent_status: "idle", cwd: "/Users/karrix/api-status", tab_id: "w2:tR",
+      terminal_title: "✳ Claude Code", terminal_title_stripped: "Claude Code",
+      ...over,
+    };
+  }
+  const paneList = (...panes: Array<Record<string, unknown>>) =>
+    JSON.stringify({ id: "cli:pane:list", result: { panes, type: "pane_list" } });
+
+  test("THE FIELD FAILURE: a default-titled pane is reached by its session id", async () => {
+    const h = herdrDeps({
+      record: herdrRecord({ title: "hi" }), sessionId: LIVE_SESSION, paneList: paneList(claudePane()),
+    });
+    expect(await focusTerminalForPid(100, h.deps)).toEqual({ ok: true, via: "herdr", reason: "herdr-focused" });
+    expect(h.calls[1]).toEqual({ file: "herdr", args: ["tab", "focus", "w2:tR"] });
+  });
+
+  test("…and the SAME input is ambiguous without the id — this is what regressed", async () => {
+    // Identical to the case above but for the id the command names, which is the only thing the fix
+    // added. Title/cwd alone still cannot correlate "hi" to "Claude Code".
+    const h = herdrDeps({
+      record: herdrRecord({ title: "hi" }), sessionId: OTHER_SESSION, paneList: paneList(claudePane()),
+    });
+    expect(await focusTerminalForPid(100, h.deps)).toEqual({ ok: false, reason: "herdr-ambiguous" });
+    expect(h.calls).toEqual([{ file: "herdr", args: ["pane", "list"] }]);
+  });
+
+  test("an id match BEATS a title match on a different pane", async () => {
+    const h = herdrDeps({
+      record: herdrRecord({ title: "Some other session" }), sessionId: LIVE_SESSION,
+      paneList: paneList(
+        claudePane({ tab_id: "w2:tTitle", terminal_title_stripped: "Some other session",
+          agent_session: { agent: "claude", value: OTHER_SESSION } }),
+        claudePane(),
+      ),
+    });
+    expect(await focusTerminalForPid(100, h.deps)).toEqual({ ok: true, via: "herdr", reason: "herdr-focused" });
+    expect(h.calls[1]).toEqual({ file: "herdr", args: ["tab", "focus", "w2:tR"] });
+  });
+
+  test("an id match needs no agent_status tie-break", async () => {
+    const h = herdrDeps({
+      record: herdrRecord({ title: "hi" }), sessionId: LIVE_SESSION,
+      paneList: paneList(
+        claudePane({ agent_status: "idle" }),
+        claudePane({ tab_id: "w2:tW", agent_status: "working",
+          agent_session: { agent: "claude", value: OTHER_SESSION } }),
+      ),
+    });
+    expect(await focusTerminalForPid(100, h.deps)).toEqual({ ok: true, via: "herdr", reason: "herdr-focused" });
+    expect(h.calls[1]).toEqual({ file: "herdr", args: ["tab", "focus", "w2:tR"] });
+  });
+
+  test("with NO agent_session anywhere the title path is unchanged", async () => {
+    const h = herdrDeps({
+      sessionId: LIVE_SESSION,
+      paneList: paneList(
+        claudePane({ agent_session: undefined, tab_id: "w2:t8",
+          terminal_title_stripped: "Review and clean up test cases for NOM-42" }),
+        claudePane({ agent_session: undefined, tab_id: "w2:tR" }),
+      ),
+    });
+    expect(await focusTerminalForPid(100, h.deps)).toEqual({ ok: true, via: "herdr", reason: "herdr-focused" });
+    expect(h.calls[1]).toEqual({ file: "herdr", args: ["tab", "focus", "w2:t8"] });
+  });
+
+  test("a Codex pane carrying no agent_session still correlates by cwd", async () => {
+    // Exactly as sampled: claude panes publish an id, the codex pane does not.
+    const h = herdrDeps({
+      agent: "codex", record: herdrRecord({ agent: "codex", title: "unrelated" }),
+      sessionId: LIVE_SESSION,
+      paneList: paneList(
+        claudePane(),
+        { agent: "codex", agent_status: "idle", cwd: "/Users/karrix/api-status", tab_id: "w2:tX",
+          terminal_title_stripped: "api-status" },
+      ),
+    });
+    expect(await focusTerminalForPid(100, h.deps)).toEqual({ ok: true, via: "herdr", reason: "herdr-focused" });
+    expect(h.calls[1]).toEqual({ file: "herdr", args: ["tab", "focus", "w2:tX"] });
+  });
+
+  test("an id may never match across agents", async () => {
+    // A codex session whose uuid somehow collides with a claude pane's: the pane's own `agent`, and
+    // the id record's, both have to agree before the id is decisive.
+    const h = herdrDeps({
+      agent: "codex", record: herdrRecord({ agent: "codex", title: "unrelated" }),
+      sessionId: LIVE_SESSION, paneList: paneList(claudePane()),
+    });
+    expect(await focusTerminalForPid(100, h.deps)).toEqual({ ok: false, reason: "herdr-ambiguous" });
+    expect(h.calls).toEqual([{ file: "herdr", args: ["pane", "list"] }]);
+  });
+
+  test("a pane whose agent_session names ANOTHER agent is not an id match", async () => {
+    const h = herdrDeps({
+      record: herdrRecord({ title: "hi" }), sessionId: LIVE_SESSION,
+      paneList: paneList(claudePane({ agent_session: { agent: "grok", value: LIVE_SESSION } })),
+    });
+    expect(await focusTerminalForPid(100, h.deps)).toEqual({ ok: false, reason: "herdr-ambiguous" });
+  });
+
+  test("two panes claiming the SAME id are ambiguous, never a coin flip", async () => {
+    const h = herdrDeps({
+      record: herdrRecord({ title: "hi" }), sessionId: LIVE_SESSION,
+      paneList: paneList(claudePane(), claudePane({ tab_id: "w2:tS", agent_status: "working" })),
+    });
+    expect(await focusTerminalForPid(100, h.deps)).toEqual({ ok: false, reason: "herdr-ambiguous" });
+    expect(h.calls).toEqual([{ file: "herdr", args: ["pane", "list"] }]);
+  });
+
+  test("a malformed agent_session is simply 'no id', never a parse failure", async () => {
+    const h = herdrDeps({
+      sessionId: LIVE_SESSION,
+      paneList: paneList(
+        claudePane({ agent_session: "abbf78fa-47d0-4bb4-bb97-e98981e20c60", tab_id: "w2:t8",
+          terminal_title_stripped: "Review and clean up test cases for NOM-42" }),
+        claudePane({ agent_session: null }),
+      ),
+    });
+    expect(await focusTerminalForPid(100, h.deps)).toEqual({ ok: true, via: "herdr", reason: "herdr-focused" });
     expect(h.calls[1]).toEqual({ file: "herdr", args: ["tab", "focus", "w2:t8"] });
   });
 });

@@ -64,6 +64,10 @@ export type FocusResult =
 export interface FocusContext {
   agent: AgentKind;
   record: SessionRecord;
+  /** The session's id — the agent's OWN uuid, which herdr publishes per pane as `agent_session.value`.
+   *  It is the only EXACT correlation key available, so it is required: a SessionRecord does not carry
+   *  its own id (the id is the record's FILENAME), and the caller that has one always knows it. */
+  sessionId: string;
 }
 
 export interface ExecFileResult {
@@ -97,6 +101,10 @@ export interface FocusDeps {
 
 interface HerdrPane {
   agent: string;
+  /** herdr's own record of WHICH agent session this pane is running (`{agent, kind:"id", source,
+   *  value}`). Present on every claude/grok pane sampled 2026-08-14; a codex pane has none, and an
+   *  older herdr has none anywhere — hence optional, and hence the fuzzy fallback below stays. */
+  agent_session?: { agent?: string; value?: string };
   agent_status?: string;
   cwd?: string;
   tab_id: string;
@@ -152,6 +160,19 @@ function recordTitleMatchesPane(recordTitle: unknown, paneTitle: unknown): boole
 }
 
 function correlateHerdrPane(context: FocusContext, panes: HerdrPane[]): HerdrPane | undefined {
+  // The EXACT signal first: herdr publishes the agent's own session id on the pane, so the id the
+  // command already named is ground truth and short-circuits everything below — no title, no cwd, no
+  // status tie-break. Correlating by title instead is what made "Open on Mac" fail for any pane still
+  // showing its default title (field report 2026-08-14: record title "hi" vs pane "Claude Code").
+  // Cross-agent is refused even on an id hit, and a duplicated id is ambiguous rather than a coin
+  // flip. A pane with no `agent_session` (codex, or an older herdr) contributes nothing here and
+  // falls through to the fuzzy signals exactly as before. `?.` is also the malformed-value guard:
+  // any non-object agent_session simply reads back undefined.
+  const byId = panes.filter((pane) => pane.agent === context.agent
+    && pane.agent_session?.value === context.sessionId
+    && (pane.agent_session?.agent ?? context.agent) === context.agent);
+  if (byId.length > 0) return byId.length === 1 ? byId[0] : undefined;
+
   let candidates = context.agent === "claude"
     ? panes.filter((pane) => pane.agent === "claude"
       && recordTitleMatchesPane(context.record.title, pane.terminal_title_stripped))
