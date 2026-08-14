@@ -474,6 +474,42 @@ describe("computeSessionState — what CC's file may and may not do (invariant 1
     expect((s.blob as { value: Record<string, unknown> }).value.status).toBe("working");
   });
 
+  // THE STAMP ON THAT AUTHORED BLOB IS THE SAME TRAP THE DONE RUNG NAMES 44 LINES UP, and this rung fell
+  // into it. Every reconcile pass re-describes EVERY tracked session (the 5 s sweep, plus the 100 ms
+  // debounced watch, which any other session's record write also fires), and commitState signs the
+  // PRE-SEAL description. So a blob field that moves with the wall clock re-signs, re-seals, and wakes
+  // every LAN long poll — on a session where nothing whatsoever has happened. `at` is floored to whole
+  // seconds, which is the only reason the churn ceiling is one wakeup per second rather than ten.
+  //
+  // This rung holds for as long as CC keeps saying busy — up to CC_STATUS_MAX_AGE_MS — so it is a
+  // MINUTES-LONG stream of no-op wakeups, not a blip.
+  const heldBackWorld = { record: older({ op: "done" }) };
+  const busyNow = { status: "busy" as const, statusUpdatedAt: CC_AT };
+  const sweep = (now: number, over: Partial<SessionStateInput> = {}): SessionState =>
+    withCc(busyNow, { ...heldBackWorld, now, ...over })!;
+
+  test("two sweeps with ONLY the wall clock moving describe the session identically", () => {
+    const first = sweep(NOW);
+    expect(first.why).toBe("work+cc");        // the rung under test, not some neighbour
+    // A whole wall second later, then ten, then a minute — CC has not written, the record has not moved.
+    for (const later of [NOW + 1_000, NOW + 10_000, NOW + 60_000]) {
+      expect(sweep(later)).toEqual(first);   // byte-identical ⇒ commitState returns false ⇒ no wakeup
+    }
+  });
+
+  test("…stamped at CC's own status write, which is the only evidence this state has", () => {
+    expect((sweep(NOW).blob as { value: Record<string, unknown> }).value.at).toBe(Math.floor(CC_AT / 1_000));
+  });
+
+  test("but a REAL change still re-describes — the fix is not 'never re-sign'", () => {
+    const first = sweep(NOW);
+    // A new title on the record.
+    expect(sweep(NOW, { record: older({ op: "done", title: "Fix the LAN feed" }) })).not.toEqual(first);
+    // CC saying busy again at a NEW moment — the one clock that means something happened.
+    expect(withCc({ status: "busy", statusUpdatedAt: CC_AT + 5_000 }, { ...heldBackWorld, now: NOW + 5_000 }))
+      .not.toEqual(first);
+  });
+
   test("a busy that is OLDER than the record's own write does not hold anything back", () => {
     expect(withCc({ status: "busy", statusUpdatedAt: NOW - 1 }, { record: rec({ op: "done" }) }))
       .toMatchObject({ state: "done", why: "done" });
