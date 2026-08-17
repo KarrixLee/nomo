@@ -8,10 +8,10 @@
 //   0. if herdr owns the pty (the pid or an ancestor IS a herdr process), the pane list — not the
 //      tty — is the correlation key, so that branch is taken FIRST and the tty is never consulted,
 //   1. the pid's controlling tty (`ps -o tty=` → "ttys004" → the device path "/dev/ttys004"), which
-//      the Claude DESKTOP app is exempt from for the same reason herdr is: its conversation window
-//      runs `claude` with no controlling tty, so a tty-first refusal no-ops the whole command,
+//      the DESKTOP agent apps (Claude, Codex) are exempt from for the same reason herdr is: their
+//      conversation windows run with no controlling tty, so a tty-first refusal no-ops the command,
 //   2. the OWNING terminal application, from the pid's ancestor chain's argv (Terminal.app, iTerm2,
-//      Ghostty, WezTerm, Alacritty, kitty, Hyper, Warp, VS Code, and the Claude desktop app),
+//      Ghostty, WezTerm, Alacritty, kitty, Hyper, Warp, VS Code, and the Claude/Codex desktop apps),
 //   3. for the two emulators with a scriptable tty→tab mapping (Terminal.app, iTerm2), an AppleScript
 //      that finds the tab/session whose `tty` is that device path, selects it and raises its window;
 //      for everything else — and for a tty scan that matches nothing — merely ACTIVATING the owning
@@ -224,22 +224,28 @@ async function runExecFile(
  *  other entry is activate-only by design (guessing a window in kitty/WezTerm/Ghostty from a tty is
  *  not possible over AppleScript, and a wrong guess is the one outcome worth avoiding). */
 export interface TerminalApp {
-  id: "terminal-app" | "iterm2" | "ghostty" | "wezterm" | "alacritty" | "kitty" | "hyper" | "warp" | "vscode" | "claude-desktop";
+  id: "terminal-app" | "iterm2" | "ghostty" | "wezterm" | "alacritty" | "kitty" | "hyper" | "warp" | "vscode" | "claude-desktop" | "codex-desktop";
   /** CFBundleIdentifier — `tell application id "…"` binds to the installed copy, wherever it lives. */
   bundleId: string;
   /** Matched against a process's full argv (the .app bundle path, or the binary name for the
    *  bundle-less launches WezTerm/kitty/Alacritty can have). */
   match: RegExp;
+  /** This owner is a GUI AGENT APP, not an emulator: the process it owns holds no controlling terminal
+   *  at all, and its window is raised by bundle id without one. Declared on the TABLE — rather than
+   *  re-tested as an id comparison at the gate — so the next such app is one row and cannot forget the
+   *  exemption. Absent for every real emulator: there a tty-less pid genuinely owns no window, and
+   *  refusing is correct. */
+  ttyless?: true;
 }
 
 /** The known emulators, most specific first. VS Code's integrated terminal is included because a
- *  session started from it is genuinely owned by VS Code (activate-only). The Claude DESKTOP app is
- *  the one entry that is not an emulator at all: a desktop conversation window runs its `claude`
- *  under the app bundle with NO controlling tty, so it is the owning front-end in exactly the sense
- *  this table means, and activating it is the whole of what can be done (see the entry's note).
+ *  session started from it is genuinely owned by VS Code (activate-only). The two DESKTOP agent apps
+ *  are the entries that are not emulators at all: a desktop conversation window runs its agent with
+ *  NO controlling tty, so each is the owning front-end in exactly the sense this table means, and
+ *  activating it is the whole of what can be done (see the entries' notes).
  *  Ordering is irrelevant across processes — owningTerminalApp takes the NEAREST matching ancestor —
  *  so a real terminal always wins over an app further up the chain; within one argv the first match
- *  wins, which is why the desktop entry sits last. */
+ *  wins, which is why the desktop entries sit last. */
 const TERMINAL_APPS: TerminalApp[] = [
   { id: "terminal-app", bundleId: "com.apple.Terminal", match: /\/Terminal\.app\// },
   { id: "iterm2", bundleId: "com.googlecode.iterm2", match: /\/iTerm\.app\/|\/iTerm2\.app\// },
@@ -262,7 +268,15 @@ const TERMINAL_APPS: TerminalApp[] = [
   // gate, and `claude://resume?session=<uuid>` is an IMPORT that rewrites the session's transcript on
   // disk (verified in app.asar, Claude 1.30096.1). Upgrade path: a deep link that takes a CC session
   // uuid and focuses it without mutating anything.
-  { id: "claude-desktop", bundleId: "com.anthropic.claudefordesktop", match: /\/Claude\.app\/Contents\// },
+  { id: "claude-desktop", bundleId: "com.anthropic.claudefordesktop", match: /\/Claude\.app\/Contents\//, ttyless: true },
+  // The Codex desktop app — shipped as `ChatGPT.app`, bundle id com.openai.codex. Same ceiling and
+  // same tty-lessness as the Claude entry, but it is reached differently: a desktop conversation is
+  // hosted by an app-server whose ancestry frequently does NOT include the bundle (the standalone
+  // ~/.codex daemon is parented to launchd), so codexLocateTuiPid identifies the session from its
+  // rollout and hands this module the APP's own Electron main pid — whose argv is what this matches.
+  // A session that DOES run under the bundle's own `…/ChatGPT.app/Contents/Resources/codex` resolves
+  // here by plain ancestry too, so both process shapes land on one rule.
+  { id: "codex-desktop", bundleId: "com.openai.codex", match: /\/ChatGPT\.app\/Contents\//, ttyless: true },
 ];
 
 /** The terminal application owning `pid`, found by walking its ancestor chain's argv. The chain is
@@ -484,10 +498,11 @@ export async function focusTerminalForPid(pid: number, deps: FocusDeps = {}): Pr
     const devPath = ttyDevicePath(rawTty);
     const app = owningTerminalApp(pid, ancestorsOf, commandOf);
     // The tty gate, with the same exemption the herdr branch takes above and for the same reason: a
-    // Claude DESKTOP conversation window has no controlling tty at all ("??"), so a tty-first refusal
-    // made "Open on Mac" a silent no-op for every desktop session. The exemption is scoped to that one
-    // owner — for every emulator a tty-less pid still owns no window and there is nothing to raise.
-    if (devPath === undefined && app?.id !== "claude-desktop") {
+    // DESKTOP agent app's window has no controlling tty at all ("??"), so a tty-first refusal made
+    // "Open on Mac" a silent no-op for every one of its sessions. The exemption is scoped to the
+    // owners that declare `ttyless` — for every emulator a tty-less pid still owns no window and there
+    // is nothing to raise.
+    if (devPath === undefined && app?.ttyless !== true) {
       note(deps, { event: "terminal-focus", pid, result: "no-tty", tty: rawTty ?? "" });
       return { ok: false, reason: "no-tty" };
     }

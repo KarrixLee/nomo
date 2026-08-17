@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { describe, expect, test } from "bun:test";
 import {
   adapterFor, allAdapters, claudeAdapter, claudeClearPredecessor, claudeDesktopInvocation, claudeForkResumePredecessor, claudeHeadlessInvocation, claudeLocateTuiPid, claudeSessionModel, claudeSessionTitle,
-  claudeTailPendingApproval, codexAdapter, codexChildSessionGhost, codexLocateTuiPid, codexTuiCandidates,
+  claudeTailPendingApproval, codexAdapter, codexChildSessionGhost, codexDesktopAppPid, codexDesktopOriginator, codexLocateTuiPid, codexTuiCandidates,
   codexConfigModel, codexDiscoverLive, codexInternalSessionGhost, codexModelFromRollout,
   CODEX_ROLLOUT_IDLE_SILENCE_MS,
   codexNewestRolloutForCwd, codexPidPlanPickerEvidence, codexPidPlanPickerState, codexPidTurnActive, codexPlanPickerStateFromTail, codexProposedPlanMarkdown, codexRolloutExistsForSession, codexSentinelSessionId, codexSessionModel,
@@ -1690,6 +1690,108 @@ describe("codexLocateTuiPid (ordered correlation heuristic)", () => {
       { ps, note: () => { throw new Error("bad sink"); } },
     );
     expect(pid).toBe(16029);
+  });
+});
+
+// FIELD REGRESSION: "Open on Mac" was a silent no-op for every session started in the Codex DESKTOP
+// app. Its conversation is hosted by a tty-less `codex app-server`, which codexTuiCandidates drops by
+// design, so the locate found nothing — and on a machine that also had ONE terminal codex open, step 5
+// would have raised THAT window instead, which is worse than nothing.
+describe("codexLocateTuiPid — the Codex DESKTOP app (no terminal exists)", () => {
+  const notes: LocateTuiReason[] = [];
+  const note = (r: LocateTuiReason): void => { notes.push(r); };
+
+  const meta = (originator: string): string =>
+    JSON.stringify({ type: "session_meta", payload: { originator, cwd: "/Users/karrix/Documents/Codex/x" } });
+
+  /** The desktop app's live process shape. The renderer helper also lives under ChatGPT.app and also
+   *  ends in `/Contents/MacOS/…`, so it pins that only the app's OWN executable path is matched. */
+  const PS_DESKTOP = [
+    "83329 ??       /Applications/ChatGPT.app/Contents/MacOS/ChatGPT",
+    "83396 ??       /Applications/ChatGPT.app/Contents/Resources/codex -c features.code_mode_host=true app-server",
+    "83409 ??       /Applications/ChatGPT.app/Contents/Frameworks/Codex Framework.framework/Versions/151.0/Helpers/Codex (Renderer).app/Contents/MacOS/Codex (Renderer) --type=renderer",
+    "16029 ttys017  codex",
+  ].join("\n");
+
+  test("a desktop session resolves to the app's own GUI process, not to any helper", async () => {
+    notes.length = 0;
+    const pid = await codexLocateTuiPid(
+      { sessionId: "some-uuid", record: locRec({ pid: 83396, transcript: "/r.jsonl" }) },
+      { ps: async () => PS_DESKTOP, readHead: async () => meta("Codex Desktop"), note },
+    );
+    expect(pid).toBe(83329);
+    expect(notes).toEqual(["desktop-app"]);
+  });
+
+  test("the app's older `codex_work_desktop` stamp resolves identically", async () => {
+    notes.length = 0;
+    const pid = await codexLocateTuiPid(
+      { sessionId: "some-uuid", record: locRec({ pid: 83396, transcript: "/r.jsonl" }) },
+      { ps: async () => PS_DESKTOP, readHead: async () => meta("codex_work_desktop"), note },
+    );
+    expect(pid).toBe(83329);
+  });
+
+  test("a desktop session NEVER falls through to a lone terminal TUI (the wrong-window guard)", async () => {
+    notes.length = 0;
+    const pid = await codexLocateTuiPid(
+      { sessionId: "some-uuid", record: locRec({ pid: 83396, transcript: "/r.jsonl" }) },
+      { ps: async () => PS_ONE_TUI, readHead: async () => meta("Codex Desktop"), note },
+    );
+    expect(pid).toBeUndefined(); // app not running → nothing to raise
+    expect(notes).toEqual(["no-candidate"]);
+  });
+
+  test("a terminal session's rollout leaves the ordered heuristic exactly as it was", async () => {
+    notes.length = 0;
+    const pid = await codexLocateTuiPid(
+      { sessionId: "some-uuid", record: locRec({ pid: 42, transcript: "/r.jsonl" }) },
+      { ps: async () => PS_ONE_TUI, readHead: async () => meta("codex-tui"), note },
+    );
+    expect(pid).toBe(16029);
+    expect(notes).toEqual(["only-candidate"]);
+  });
+
+  test("an unreadable or absent rollout is no evidence, not a verdict", async () => {
+    notes.length = 0;
+    expect(await codexLocateTuiPid(
+      { sessionId: "some-uuid", record: locRec({ pid: 42, transcript: "/gone.jsonl" }) },
+      { ps: async () => PS_ONE_TUI, readHead: async () => { throw new Error("ENOENT"); }, note },
+    )).toBe(16029);
+    expect(await codexLocateTuiPid(
+      { sessionId: "some-uuid", record: locRec({ pid: 42 }) },
+      { ps: async () => PS_ONE_TUI, readHead: async () => meta("Codex Desktop"), note },
+    )).toBe(16029);
+    expect(notes).toEqual(["only-candidate", "only-candidate"]);
+  });
+
+  test("an exact pid hit never pays for the rollout read", async () => {
+    notes.length = 0;
+    let reads = 0;
+    const pid = await codexLocateTuiPid(
+      { sessionId: "some-uuid", record: locRec({ pid: 16029, transcript: "/r.jsonl" }) },
+      { ps: async () => PS_ONE_TUI, readHead: async () => { reads++; return meta("Codex Desktop"); }, note },
+    );
+    expect(pid).toBe(16029);
+    expect(reads).toBe(0);
+    expect(notes).toEqual(["record-pid"]);
+  });
+
+  test("only a Mac-app front-end counts as desktop — an editor's or an MCP client's does not", () => {
+    expect(codexDesktopOriginator(meta("Codex Desktop"))).toBe(true);
+    for (const other of ["codex-tui", "codex_exec", "Claude Code", "nomo", ""]) {
+      expect(codexDesktopOriginator(meta(other))).toBe(false);
+    }
+    expect(codexDesktopOriginator("not json at all")).toBe(false);
+  });
+
+  test("codexDesktopAppPid refuses to guess between two app processes", () => {
+    expect(codexDesktopAppPid(parseCodexProcs(PS_DESKTOP))).toBe(83329);
+    expect(codexDesktopAppPid([
+      { pid: 1, args: "/Applications/ChatGPT.app/Contents/MacOS/ChatGPT" },
+      { pid: 2, args: "/Users/x/Applications/ChatGPT.app/Contents/MacOS/ChatGPT" },
+    ])).toBeUndefined();
+    expect(codexDesktopAppPid(parseCodexProcs(PS_ONE_TUI))).toBeUndefined();
   });
 });
 
