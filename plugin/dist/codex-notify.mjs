@@ -103,7 +103,7 @@ async function sha256Hex(s) {
 }
 
 // src/core/shared.ts
-var PLUGIN_VERSION = "2.0.3";
+var PLUGIN_VERSION = "2.0.4";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -1101,7 +1101,8 @@ var TERMINAL_APPS = [
   { id: "hyper", bundleId: "co.zeit.hyper", match: /\/Hyper\.app\// },
   { id: "warp", bundleId: "dev.warp.Warp-Stable", match: /\/Warp\.app\// },
   { id: "vscode", bundleId: "com.microsoft.VSCode", match: /\/Visual Studio Code\.app\/|\/Code\.app\/|Code Helper/ },
-  { id: "claude-desktop", bundleId: "com.anthropic.claudefordesktop", match: /\/Claude\.app\/Contents\// }
+  { id: "claude-desktop", bundleId: "com.anthropic.claudefordesktop", match: /\/Claude\.app\/Contents\//, ttyless: true },
+  { id: "codex-desktop", bundleId: "com.openai.codex", match: /\/ChatGPT\.app\/Contents\//, ttyless: true }
 ];
 function owningTerminalApp(pid, ancestorsOf = pidAncestors, commandOf = pidCommand) {
   let chain = [];
@@ -1285,7 +1286,7 @@ async function focusTerminalForPid(pid, deps = {}) {
     }
     const devPath = ttyDevicePath(rawTty);
     const app = owningTerminalApp(pid, ancestorsOf, commandOf);
-    if (devPath === undefined && app?.id !== "claude-desktop") {
+    if (devPath === undefined && app?.ttyless !== true) {
       note(deps, { event: "terminal-focus", pid, result: "no-tty", tty: rawTty ?? "" });
       return { ok: false, reason: "no-tty" };
     }
@@ -2036,7 +2037,7 @@ async function rolloutViaLsof(pid) {
     return;
   }
 }
-function rolloutMetaCwd(head) {
+function rolloutMetaField(head, key) {
   for (const line of head.split(`
 `)) {
     if (!line.includes("session_meta"))
@@ -2052,11 +2053,17 @@ function rolloutMetaCwd(head) {
     const r = row;
     if (r.type !== "session_meta")
       continue;
-    const cwd = r.payload?.cwd;
-    if (typeof cwd === "string" && cwd.length > 0)
-      return cwd;
+    const value = r.payload?.[key];
+    if (typeof value === "string" && value.length > 0)
+      return value;
   }
   return;
+}
+function rolloutMetaCwd(head) {
+  return rolloutMetaField(head, "cwd");
+}
+function rolloutMetaOriginator(head) {
+  return rolloutMetaField(head, "originator");
 }
 var ROLLOUT_SCAN_MAX_DAYS = 10;
 var ROLLOUT_SCAN_MAX_HEADS = 40;
@@ -2187,6 +2194,15 @@ function codexTuiCandidates(rows, knownPids) {
 function filterCodexTuis(rows, knownPids) {
   return codexTuiCandidates(rows, knownPids).map(({ pid }) => ({ pid }));
 }
+var CODEX_DESKTOP_ORIGINATORS = new Set(["Codex Desktop", "codex_work_desktop"]);
+function codexDesktopOriginator(head) {
+  const originator = rolloutMetaOriginator(head);
+  return originator !== undefined && CODEX_DESKTOP_ORIGINATORS.has(originator);
+}
+function codexDesktopAppPid(rows) {
+  const matched = rows.filter((r) => /\/ChatGPT\.app\/Contents\/MacOS\//.test(r.args));
+  return matched.length === 1 ? matched[0].pid : undefined;
+}
 function labelFromCwd(cwd) {
   if (!cwd)
     return "session";
@@ -2288,6 +2304,16 @@ function sentinelPid(sessionId) {
   const pid = Number.parseInt(m[1], 10);
   return Number.isFinite(pid) ? pid : undefined;
 }
+async function codexSessionIsDesktop(record, deps) {
+  const rollout = record.transcript;
+  if (typeof rollout !== "string" || rollout.length === 0)
+    return false;
+  try {
+    return codexDesktopOriginator(await (deps.readHead ?? readPrefix)(rollout, ROLLOUT_META_HEAD_BYTES));
+  } catch {
+    return false;
+  }
+}
 async function codexLocateTuiPid(ctx, deps = {}) {
   try {
     let output;
@@ -2297,11 +2323,8 @@ async function codexLocateTuiPid(ctx, deps = {}) {
       noteLocate(deps, "error");
       return;
     }
-    const candidates = codexTuiCandidates(parseCodexProcs(output), new Set);
-    if (candidates.length === 0) {
-      noteLocate(deps, "no-candidate");
-      return;
-    }
+    const rows = parseCodexProcs(output);
+    const candidates = codexTuiCandidates(rows, new Set);
     const pids = new Set(candidates.map((c) => c.pid));
     if (typeof ctx.record.pid === "number" && Number.isFinite(ctx.record.pid) && pids.has(ctx.record.pid)) {
       noteLocate(deps, "record-pid");
@@ -2311,6 +2334,19 @@ async function codexLocateTuiPid(ctx, deps = {}) {
     if (sentinel !== undefined && pids.has(sentinel)) {
       noteLocate(deps, "sentinel-pid");
       return sentinel;
+    }
+    if (await codexSessionIsDesktop(ctx.record, deps)) {
+      const appPid = codexDesktopAppPid(rows);
+      if (appPid !== undefined) {
+        noteLocate(deps, "desktop-app");
+        return appPid;
+      }
+      noteLocate(deps, "no-candidate");
+      return;
+    }
+    if (candidates.length === 0) {
+      noteLocate(deps, "no-candidate");
+      return;
     }
     let subset = candidates;
     const cwd = ctx.record.origin?.cwd;
@@ -2390,7 +2426,7 @@ async function claudeLocateTuiPid(ctx, deps = {}) {
       noteLocate(deps, "record-pid");
       return pid;
     }
-    if (owningTerminalApp(pid, ancestorsOf, commandOf)?.id === "claude-desktop") {
+    if (owningTerminalApp(pid, ancestorsOf, commandOf)?.ttyless === true) {
       noteLocate(deps, "record-pid");
       return pid;
     }

@@ -28,6 +28,14 @@ const CLAUDE_DESKTOP_LAUNCHER_ARGV =
   "/Applications/Claude.app/Contents/Helpers/disclaimer " + CLAUDE_DESKTOP_SESSION_ARGV;
 const CLAUDE_DESKTOP_APP_ARGV = "/Applications/Claude.app/Contents/MacOS/Claude";
 
+// The Codex DESKTOP app, captured verbatim off this machine (ChatGPT.app 151.0.7922.137, codex
+// 0.147.0). It ships as ChatGPT.app and its Electron main is the process codexLocateTuiPid hands over;
+// its bundled app-server resolves to the same owner by plain ancestry when a session does run under it.
+const CODEX_DESKTOP_APP_ARGV = "/Applications/ChatGPT.app/Contents/MacOS/ChatGPT";
+const CODEX_DESKTOP_SERVER_ARGV =
+  "/Applications/ChatGPT.app/Contents/Resources/codex -c features.code_mode_host=true app-server"
+  + " --analytics-default-enabled";
+
 const REAL_HERDR_PANE_LIST = JSON.stringify({
   result: {
     panes: [
@@ -228,6 +236,20 @@ describe("owningTerminalApp", () => {
     expect(owningTerminalApp(1, () => [2], (p) => (p === 2 ? relocated : "claude"))?.id).toBe("claude-desktop");
   });
 
+  test("the Codex DESKTOP app resolves from its own GUI process and from its bundled app-server", () => {
+    const main = owningTerminalApp(83329, () => [1], () => CODEX_DESKTOP_APP_ARGV);
+    expect(main?.id).toBe("codex-desktop");
+    expect(main?.bundleId).toBe("com.openai.codex");
+    expect(owningTerminalApp(83396, () => [83329], (p) => (
+      p === 83396 ? CODEX_DESKTOP_SERVER_ARGV : CODEX_DESKTOP_APP_ARGV
+    ))?.id).toBe("codex-desktop");
+  });
+
+  test("a codex TUI in a real terminal is never stolen by the desktop app", () => {
+    const argv: Record<number, string> = { 1: "codex", 2: "-zsh", 3: GHOSTTY_ARGV, 4: CODEX_DESKTOP_APP_ARGV };
+    expect(owningTerminalApp(1, () => [2, 3, 4], (p) => argv[p])?.id).toBe("ghostty");
+  });
+
   test("a CLI session in a terminal launched from the desktop app still resolves to the terminal", () => {
     // The NEAREST ancestor wins, so an app further up the chain can never steal a real emulator.
     const argv: Record<number, string> = { 1: "claude", 2: "-zsh", 3: GHOSTTY_ARGV, 4: CLAUDE_DESKTOP_APP_ARGV };
@@ -261,6 +283,21 @@ describe("focusTerminalForPid", () => {
     }));
     expect(result).toEqual({ ok: true, via: "app-activate" });
     expect(scripts).toEqual([`tell application id "com.anthropic.claudefordesktop" to activate`]);
+  });
+
+  // FIELD REGRESSION (the same bug's THIRD shape): "Open on Mac" was a silent no-op for every session
+  // started in the Codex desktop app. The tty exemption used to name `claude-desktop` literally, so the
+  // Codex app — equally tty-less — was refused before its bundle id was ever reached.
+  test("a tty-less Codex DESKTOP session activates the app instead of refusing on no-tty", async () => {
+    const scripts: string[] = [];
+    const result = await focusTerminalForPid(83329, deps({
+      ttyOf: async () => "??",
+      argvOf: { 83329: CODEX_DESKTOP_APP_ARGV },
+      ancestorsOf: () => [],
+      osascript: async (s) => { scripts.push(s); return ""; },
+    }));
+    expect(result).toEqual({ ok: true, via: "app-activate" });
+    expect(scripts).toEqual([`tell application id "com.openai.codex" to activate`]);
   });
 
   test("the tty exemption is scoped to the desktop app — a tty-less Ghostty pid is still no-tty", async () => {

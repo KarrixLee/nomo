@@ -1105,10 +1105,11 @@ async function rolloutViaLsof(pid: number): Promise<string | undefined> {
   }
 }
 
-/** Pure: the session_meta `payload.cwd` from a rollout HEAD (its first line — verified live:
- *  `{"timestamp":…,"type":"session_meta","payload":{…,"cwd":"/Users/…",…}}`). Undefined when the head
- *  carries no parseable session_meta (byte-sliced/corrupt lines are skipped, like every tail scanner). */
-export function rolloutMetaCwd(head: string): string | undefined {
+/** Pure: one non-empty STRING field of the session_meta payload in a rollout HEAD (its first line —
+ *  verified live: `{"timestamp":…,"type":"session_meta","payload":{…,"cwd":"/Users/…",…}}`). Undefined
+ *  when the head carries no parseable session_meta (byte-sliced/corrupt lines are skipped, like every
+ *  tail scanner) or the field is absent/not a non-empty string. */
+function rolloutMetaField(head: string, key: string): string | undefined {
   for (const line of head.split("\n")) {
     if (!line.includes("session_meta")) continue; // cheap pre-filter
     let row: unknown;
@@ -1116,10 +1117,23 @@ export function rolloutMetaCwd(head: string): string | undefined {
     if (typeof row !== "object" || row === null) continue;
     const r = row as Record<string, unknown>;
     if (r.type !== "session_meta") continue;
-    const cwd = (r.payload as Record<string, unknown> | undefined)?.cwd;
-    if (typeof cwd === "string" && cwd.length > 0) return cwd;
+    const value = (r.payload as Record<string, unknown> | undefined)?.[key];
+    if (typeof value === "string" && value.length > 0) return value;
   }
   return undefined;
+}
+
+/** Pure: the session_meta `payload.cwd` from a rollout HEAD. */
+export function rolloutMetaCwd(head: string): string | undefined {
+  return rolloutMetaField(head, "cwd");
+}
+
+/** Pure: the session_meta `payload.originator` from a rollout HEAD — the FRONT-END that created the
+ *  session, stamped by codex at creation ("codex-tui" for the terminal, "Codex Desktop" for the
+ *  desktop app, "codex_exec" for automation). It is the only signal that survives the desktop app's
+ *  process shape; see codexDesktopAppPid. */
+export function rolloutMetaOriginator(head: string): string | undefined {
+  return rolloutMetaField(head, "originator");
 }
 
 /** Bounds for the cwd+recency fallback scan: only the most recent day-directories are visited and at
@@ -1355,6 +1369,49 @@ export function filterCodexTuis(
   return codexTuiCandidates(rows, knownPids).map(({ pid }) => ({ pid }));
 }
 
+// --- Codex DESKTOP app ("Open on Mac" for a session that never had a terminal) ----------------
+//
+// The Codex desktop app — the `Codex`-branded ChatGPT.app, bundle id com.openai.codex — hosts its
+// conversations inside a tty-less `codex app-server`, so a desktop session is refused by every gate
+// on the focus path: codexTuiCandidates drops it (no controlling tty, deliberately — that filter is
+// what keeps editor/app daemons out of DISCOVERY), and its ancestry names no window either, because
+// the app-server it runs under is often the standalone ~/.codex daemon whose parent is launchd, not
+// the app bundle. Exactly the Claude-desktop bug of 2026-08-14 in its third shape, minus the one
+// affordance that fix had: there is no ancestor to recognise.
+//
+// The ROLLOUT is what still knows. Codex stamps the creating front-end into session_meta.originator
+// at session creation (the same durable, creation-time discriminator codexRolloutCreationEvidence
+// already trusts for `codex exec`), so a desktop session is identifiable from the record alone, and
+// the window to raise is then the app's OWN GUI process rather than anything the session runs in.
+//
+// ponytail: the originator strings are matched literally, so an OpenAI rename silently reverts this
+// to today's no-op. Upgrade path if that ever bites: a structural signal (the app's bundle path in
+// the rollout) — none exists in 0.147's session_meta.
+
+/** Rollout `originator` values that mean "this session was created by the Codex DESKTOP app".
+ *  "Codex Desktop" is current (0.147); "codex_work_desktop" is the same app's older stamp, still
+ *  present in rollouts on disk. Every other originator — "codex-tui", an editor extension's, an
+ *  MCP client's — is deliberately absent: only a session whose front-end IS a Mac app has a Mac app
+ *  window to raise. */
+const CODEX_DESKTOP_ORIGINATORS = new Set(["Codex Desktop", "codex_work_desktop"]);
+
+/** True when a rollout head identifies a Codex DESKTOP app session. */
+export function codexDesktopOriginator(head: string): boolean {
+  const originator = rolloutMetaOriginator(head);
+  return originator !== undefined && CODEX_DESKTOP_ORIGINATORS.has(originator);
+}
+
+/** The Codex desktop app's own GUI process, from the process rows the locator already scanned. The
+ *  app's Electron main is the ONE process whose argv carries the bundle's executable path
+ *  `…/ChatGPT.app/Contents/MacOS/…`; every helper (renderer, GPU, network, the bundled `codex`
+ *  app-server) lives under `Contents/Frameworks/` or `Contents/Resources/` instead, so none of them
+ *  can be mistaken for it. Undefined when the app is not running — the command then no-ops honestly
+ *  rather than raising something else. Pure. */
+export function codexDesktopAppPid(rows: { pid: number; args: string }[]): number | undefined {
+  const matched = rows.filter((r) => /\/ChatGPT\.app\/Contents\/MacOS\//.test(r.args));
+  return matched.length === 1 ? matched[0].pid : undefined;
+}
+
 /** cwd basename → the provisional's label/title, exactly like buildBlob's cwd-basename `label`
  *  ("session" when the cwd is unknown or the filesystem root). */
 function labelFromCwd(cwd: string | undefined): string {
@@ -1473,6 +1530,7 @@ export type LocateTuiReason =
   | "sentinel-pid"    // 2. the codex-pid-<n> provisional sentinel names a live TUI
   | "cwd-unique"      // 3. exactly one live TUI runs in the record's origin cwd
   | "start-time"      // 4. the strictly closest process start to the session's start
+  | "desktop-app"     // the session's front-end is the Codex DESKTOP app; its GUI process was found
   | "only-candidate"  // 5. nothing correlated, but the machine has exactly ONE TUI
   | "ambiguous"       // two or more equally-plausible TUIs — deliberately no guess
   | "no-candidate"    // no live TUI at all (or the record has no usable pid)
@@ -1493,6 +1551,8 @@ export interface LocateTuiDeps {
   ancestorsOf?: (pid: number) => number[];
   /** A pid's full argv (shared.pidCommand) — the herdr-ownership probe. */
   commandOf?: (pid: number) => string | undefined;
+  /** Bounded head read of a rollout (shared.readPrefix) — the desktop-originator probe. */
+  readHead?: (path: string, maxBytes: number) => Promise<string>;
   /** Optional outcome sink (see LocateTuiReason). Best-effort; never throws into the caller. */
   note?: (reason: LocateTuiReason) => void;
 }
@@ -1533,10 +1593,29 @@ function sentinelPid(sessionId: string): number | undefined {
   return Number.isFinite(pid) ? pid : undefined;
 }
 
-/** Locate the interactive Codex TUI process for a session record. ORDERED heuristic; the first
- *  unambiguous hit wins and nothing later can override it:
+/** Whether this session was created by the Codex DESKTOP app, read from its rollout's session_meta
+ *  (see the CODEX_DESKTOP_ORIGINATORS note). A record with no rollout path, an unreadable rollout, or
+ *  any other originator answers false — the terminal heuristics below then run exactly as before. */
+async function codexSessionIsDesktop(record: SessionRecord, deps: LocateTuiDeps): Promise<boolean> {
+  const rollout = record.transcript;
+  if (typeof rollout !== "string" || rollout.length === 0) return false;
+  try {
+    return codexDesktopOriginator(await (deps.readHead ?? readPrefix)(rollout, ROLLOUT_META_HEAD_BYTES));
+  } catch {
+    return false; // rollout gone/unreadable → no evidence, not a verdict
+  }
+}
+
+/** Locate the process whose macOS window "Open on Mac" should raise for a Codex session. ORDERED
+ *  heuristic; the first unambiguous hit wins and nothing later can override it:
  *    1. `record.pid` is itself one of the live codex TUI candidates → that process.
  *    2. the session id is the `codex-pid-<n>` discovery sentinel and <n> is a candidate → that one.
+ *    2.5 the rollout says the session's front-end is the Codex DESKTOP app → the APP's own GUI
+ *       process (it has no terminal at all). Decisive either way: a desktop session whose app is not
+ *       running yields nothing rather than falling through to the terminal heuristics, where step 5
+ *       would hand it whatever lone codex TUI happens to be open — the wrong window, which is the one
+ *       outcome this whole path exists to prevent. It sits AFTER the two exact pid hits so an ordinary
+ *       terminal session never pays for the rollout read.
  *    3. cwd: resolve each candidate's cwd and keep those equal to `record.origin?.cwd`. Exactly one
  *       → that one; several → continue with ONLY that subset. (Skipped entirely when the record has
  *       no origin cwd — older/provisional records — and NEVER approximated by `record.label`, the cwd
@@ -1559,11 +1638,8 @@ export async function codexLocateTuiPid(
     }
     // knownPids is EMPTY here on purpose: discovery excludes already-tracked pids, but a locate is
     // asking about a tracked session, so its own process must remain a candidate.
-    const candidates = codexTuiCandidates(parseCodexProcs(output), new Set());
-    if (candidates.length === 0) {
-      noteLocate(deps, "no-candidate");
-      return undefined;
-    }
+    const rows = parseCodexProcs(output);
+    const candidates = codexTuiCandidates(rows, new Set());
     const pids = new Set(candidates.map((c) => c.pid));
 
     // 1. the record's own pid is a live TUI (the common, exact case).
@@ -1577,6 +1653,23 @@ export async function codexLocateTuiPid(
     if (sentinel !== undefined && pids.has(sentinel)) {
       noteLocate(deps, "sentinel-pid");
       return sentinel;
+    }
+
+    // 2.5 the Codex DESKTOP app: no terminal exists, so the app's own window is the answer — and the
+    // terminal heuristics below must not run for it (see the header).
+    if (await codexSessionIsDesktop(ctx.record, deps)) {
+      const appPid = codexDesktopAppPid(rows);
+      if (appPid !== undefined) {
+        noteLocate(deps, "desktop-app");
+        return appPid;
+      }
+      noteLocate(deps, "no-candidate"); // the desktop app is not running
+      return undefined;
+    }
+
+    if (candidates.length === 0) {
+      noteLocate(deps, "no-candidate");
+      return undefined;
     }
 
     // 3. cwd equality (exact path, never the basename).
@@ -1680,7 +1773,9 @@ export async function claudeLocateTuiPid(
     // a window for this pid? The only honest answer is to ask terminal-focus itself. Two agreeing-but-
     // separate desktop rules is precisely how this project grows recurring defects: a pid admitted here
     // that the focus module then refuses is a no-op again, with a locate trace that says it worked.
-    if (owningTerminalApp(pid, ancestorsOf, commandOf)?.id === "claude-desktop") {
+    // For the same reason this asks for the OWNER'S declared tty-lessness rather than naming the one
+    // app: the gate it is predicting is spelled exactly that way.
+    if (owningTerminalApp(pid, ancestorsOf, commandOf)?.ttyless === true) {
       noteLocate(deps, "record-pid");
       return pid;
     }
