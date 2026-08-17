@@ -1398,7 +1398,13 @@ export async function runPermissionHook(
     // only after, which buys the full head start without spending a millisecond of the card's latency.
     // The residual window (card up, upload still in flight) is closed by the phone, which falls back to
     // the LAN read and then to the truncated preview already on the card; nothing here retries.
-    const fullUpload = postFullText(config, sessionId, "permission-detail", detailFull, fetchFn, trace);
+    //
+    // `requestId` is sealed IN with the text, and it is what makes that residual window safe rather than
+    // merely slow: the worker's slot is per (session, what) and lives a day, so during the window — and
+    // after a 429 or a timeout — the phone's pull would otherwise be answered with the PREVIOUS hold's
+    // parked detail, which agrees about session and `what` and disagrees about nothing the phone could
+    // see. It rejects a detail sealed under a different hold outright (see postFullText).
+    const fullUpload = postFullText(config, sessionId, "permission-detail", detailFull, fetchFn, trace, requestId);
     const blob = await encryptBlob(config.e2eKey, permissionFrame(permissionBase, fitted.detail, fitted.omitted, fitted.questions));
     const fallbackBlob = await encryptBlob(config.e2eKey, base);
 

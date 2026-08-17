@@ -3034,7 +3034,7 @@ describe("runPermissionHook — the remote full-text upload", () => {
     return { calls, seen };
   };
 
-  test("a TRUNCATED detail is uploaded once, sealed, with sessionId + what + complete inside", async () => {
+  test("a TRUNCATED detail is uploaded once, sealed, with sessionId + what + requestId + complete inside", async () => {
     const command = `${"x".repeat(20_000)}END`;
     const { calls } = await run({ readInput: async () => inputWith({ tool_input: { command } }) });
     const posts = uploads(calls);
@@ -3047,11 +3047,40 @@ describe("runPermissionHook — the remote full-text upload", () => {
     // The Mac auth headers the sibling POSTs carry — the worker authenticates the writer, then stays blind.
     expect(posts[0].headers?.["x-cc-pairing"]).toBe("p1");
     expect(posts[0].headers?.["x-cc-auth"]).toBe("s1");
-    // THE ANTI-SUBSTITUTION CHECK: sessionId and what live INSIDE the seal too, so a blind relay that
-    // answered this pull with another session's body would hand the phone self-contradicting plaintext.
+    // The clear body is EXACTLY what the (blind) worker keys on and nothing more — the request id is not
+    // in it, and must never be: the worker's slot stays `<pid>:full:<sid>:<what>` and it stays blind.
+    expect(Object.keys(body).sort()).toEqual(["blob", "sessionId", "v", "what"]);
+    // THE ANTI-SUBSTITUTION CHECK: sessionId, what AND the hold's requestId live INSIDE the seal too, so
+    // a body that is not this pull's — another session's, another `what`'s, or the PREVIOUS hold's still
+    // parked under this very key — hands the phone self-contradicting plaintext instead of a command it
+    // would render above an Allow button bound to a different request.
     expect(await decryptBlob(KEY, body.blob)).toEqual({
-      sessionId: "sess-1", what: "permission-detail", content: command, complete: true,
+      sessionId: "sess-1", what: "permission-detail", requestId: "req-fixed",
+      content: command, complete: true,
     });
+  });
+
+  // THE FAILURE THIS CLOSES. Hold #1 parks its detail. Hold #2 arrives in the same session and its own
+  // park 429s, times out (FULL_TEXT_POST_TIMEOUT_MS), or is simply still in flight — and nothing retries.
+  // The worker's slot is per (session, what) and lives 24 h, so the phone's pull for hold #2 is answered
+  // with hold #1's body: same sessionId, same what, both re-assertions pass, the sheet swaps it in and a
+  // `complete:true` retires the truncation note. The id is the ONE field that differs, so it is what the
+  // phone rejects on.
+  test("a SUCCESSOR hold seals a DIFFERENT request id under the same session + what", async () => {
+    const sealedFor = async (requestId: string) => {
+      const { calls } = await run({
+        randomUUID: () => requestId,
+        readInput: async () => inputWith({ tool_input: { command: `${"x".repeat(20_000)}${requestId}` } }),
+      });
+      return await decryptBlob(KEY, (JSON.parse(uploads(calls)[0].body!) as { blob: string }).blob) as
+        { sessionId: string; what: string; requestId: string; content: string };
+    };
+    const first = await sealedFor("hold-1");
+    const second = await sealedFor("hold-2");
+
+    expect([first.sessionId, first.what]).toEqual([second.sessionId, second.what]); // indistinguishable…
+    expect(first.content).not.toBe(second.content);                                 // …yet different text
+    expect([first.requestId, second.requestId]).toEqual(["hold-1", "hold-2"]);      // …told apart by this
   });
 
   test("text past RECORD_FULL_TEXT_MAX_CHARS seals complete:false rather than lying", async () => {

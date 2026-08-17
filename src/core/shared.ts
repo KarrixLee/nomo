@@ -316,17 +316,26 @@ export const FULL_TEXT_POST_TIMEOUT_MS = 5000;
  *  pull with another session's body would hand the phone a plaintext whose own labels disagree with what
  *  it asked for. Dropping them would make substitution undetectable.
  *
+ *  `requestId` rides there for that reason AND ONE MORE, which is why a permission detail must carry it.
+ *  The worker's slot is `<pid>:full:<sid>:<what>` and lives 24 h, so a SUCCESSOR hold in the SAME session
+ *  is a DIFFERENT text under the SAME key — and this POST never retries, so hold #2's upload can 429, time
+ *  out, or simply still be in flight when the phone pulls. Session and `what` both agree in that case, so
+ *  they cannot tell hold #1's parked text apart from hold #2's: without the id the phone would render one
+ *  prompt's command above an Allow button sealed to another's, on a consent surface. It goes only inside
+ *  the seal — the worker keys nothing by it and must stay blind. A plan passes none (no hold, no decision
+ *  bar) and `undefined` drops the key, so a plan's plaintext is byte-for-byte what it always was.
+ *
  *  NEVER THROWS, never retries (the phone falls back to the LAN read, then to the truncated preview).
  *  Callers START it before the event/decision POST and AWAIT it after, so it adds no latency to the card
  *  yet still finishes before a short-lived hook process exits. */
 export async function postFullText(
   config: Config, sessionId: string, what: FullTextKind, content: string | undefined,
-  fetchFn: typeof fetch = fetch, trace?: (event: object) => void,
+  fetchFn: typeof fetch = fetch, trace?: (event: object) => void, requestId?: string,
 ): Promise<void> {
   if (content === undefined) return;
   try {
     const blob = await encryptBlob(config.e2eKey, {
-      sessionId, what, content, complete: recordFullTextIsComplete(content),
+      sessionId, what, requestId, content, complete: recordFullTextIsComplete(content),
     });
     const res = await fetchFn(`${config.url}/v1/cc/full`, {
       method: "POST",

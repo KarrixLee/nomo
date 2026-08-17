@@ -104,7 +104,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "2.0.4";
+var PLUGIN_VERSION = "2.0.5";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -224,13 +224,14 @@ function recordFullTextIsComplete(value) {
   return !value.endsWith(RECORD_FULL_TEXT_TRUNCATION_MARKER);
 }
 var FULL_TEXT_POST_TIMEOUT_MS = 5000;
-async function postFullText(config, sessionId, what, content, fetchFn = fetch, trace) {
+async function postFullText(config, sessionId, what, content, fetchFn = fetch, trace, requestId) {
   if (content === undefined)
     return;
   try {
     const blob = await encryptBlob(config.e2eKey, {
       sessionId,
       what,
+      requestId,
       content,
       complete: recordFullTextIsComplete(content)
     });
@@ -6395,7 +6396,7 @@ async function runPermissionHook(deps = {}, agent = "claude") {
     if (record && record.permissionDetailFull !== detailFull) {
       await (deps.stampDetailFullFn ?? defaultStampDetailFull())(sessionId, detailFull);
     }
-    const fullUpload = postFullText(config, sessionId, "permission-detail", detailFull, fetchFn, trace);
+    const fullUpload = postFullText(config, sessionId, "permission-detail", detailFull, fetchFn, trace, requestId);
     const blob = await encryptBlob(config.e2eKey, permissionFrame(permissionBase, fitted.detail, fitted.omitted, fitted.questions));
     const fallbackBlob = await encryptBlob(config.e2eKey, base);
     const pcHeaders = { "x-cc-pairing": config.pairingId, "x-cc-auth": config.pcSecret, "x-cc-version": PLUGIN_VERSION };
