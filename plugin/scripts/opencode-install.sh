@@ -6,7 +6,7 @@
 # (packages/opencode/src/config/plugin.ts). So the install is one generated file per artifact, and
 # this script is what generates them instead of the user hand-editing shell lines.
 #
-# A STUB, NOT A COPY. `~/.config/opencode/plugin/nomo.js` is a one-line re-export of this checkout's
+# A STUB, NOT A COPY. `~/.config/opencode/plugins/nomo.js` is a one-line re-export of this checkout's
 # `dist/opencode.js`. The bundle must EXECUTE from dist/, because shared.ts resolves the watchdog
 # (cc-watchdog.mjs) as a sibling of `import.meta.url` — a copied file would look for a watchdog that
 # is not there. The indirection is also what makes `git pull` an upgrade: the stub names a path, not
@@ -94,9 +94,9 @@ claim() {
   fail "$dest already exists and was not written by this script — move it aside, or re-run with --force"
 }
 
-STUB="$CONFIG_DIR/plugin/nomo.js"
+STUB="$CONFIG_DIR/plugins/nomo.js"
 claim "$STUB" 'dist/opencode\.js'
-mkdir -p "$CONFIG_DIR/plugin"
+mkdir -p "$(dirname "$STUB")"
 printf '// %s — regenerate with %s\nexport { default } from "%s";\n' \
   "$MARK" "$ROOT/scripts/opencode-install.sh" "$BUNDLE" > "$STUB"
 

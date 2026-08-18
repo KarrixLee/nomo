@@ -2350,7 +2350,7 @@ export const opencodeAdapter: AgentAdapter = {
   sessionsDir: () => `${CC_DIR}/opencode-has-no-sessions-dir`,
   sessionMatch: () => false,
   hookStampPath: () => lastHookPath("opencode"),
-  hooksNotFiringHint: "  OpenCode loads the plugin at server start — restart OpenCode, or check that ~/.config/opencode/plugin/nomo.js still points at this install.",
+  hooksNotFiringHint: "  OpenCode loads the plugin at server start — restart OpenCode, or check that ~/.config/opencode/plugins/nomo.js still points at this install.",
   toolDetail: {},
   // The one live member besides `kind`: OpenCode blobs carry `agent:"opencode"` so the phone tabs and
   // icons the session correctly (an app build that predates the literal reads it as claude, by design).

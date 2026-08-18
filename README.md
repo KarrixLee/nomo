@@ -199,7 +199,7 @@ git clone https://github.com/KarrixLee/nomo.git ~/.nomo
 That is the whole install. The script resolves its own location, so there is no path to look up and
 nothing to hand-edit. It writes two things and prints exactly what it wrote:
 
-- `~/.config/opencode/plugin/nomo.js` — a one-line stub re-exporting `<ROOT>/dist/opencode.js`.
+- `~/.config/opencode/plugins/nomo.js` — a one-line stub re-exporting `<ROOT>/dist/opencode.js`.
 - `~/.config/opencode/commands/nomo-*.md` — the five slash commands, with the plugin path baked in.
 
 Re-running it is safe and idempotent; run it again if you move the checkout. It refuses to overwrite
