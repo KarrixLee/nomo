@@ -103,7 +103,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "2.1.0";
+var PLUGIN_VERSION = "2.2.0";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -2664,8 +2664,28 @@ var codexAdapter = {
   pidTurnActive: (pid) => codexPidTurnActive(pid),
   locateTuiPid: (ctx, deps) => codexLocateTuiPid(ctx, deps)
 };
+var opencodeAdapter = {
+  kind: "opencode",
+  title: async () => {
+    return;
+  },
+  detectInterrupt: () => false,
+  sessionsDir: () => `${CC_DIR}/opencode-has-no-sessions-dir`,
+  sessionMatch: () => false,
+  hookStampPath: () => lastHookPath("opencode"),
+  hooksNotFiringHint: "  OpenCode loads the plugin at server start — restart OpenCode, or check that ~/.config/opencode/plugin/nomo.js still points at this install.",
+  toolDetail: {},
+  blobAgentFields: { agent: "opencode" }
+};
 function adapterFor(agent) {
-  return agent === "codex" ? codexAdapter : claudeAdapter;
+  switch (agent) {
+    case "codex":
+      return codexAdapter;
+    case "opencode":
+      return opencodeAdapter;
+    default:
+      return claudeAdapter;
+  }
 }
 var allAdapters = [claudeAdapter, codexAdapter];
 
@@ -2901,7 +2921,7 @@ function buildBlob(input, machine, title, plan, agent = "claude", turnStartedAt,
     machine,
     label,
     ...detail ? { detail } : {},
-    ...agent === "codex" ? { agent: "codex" } : {},
+    ...agent === "claude" ? {} : { agent },
     ...typeof turnStartedAt === "number" && Number.isFinite(turnStartedAt) ? { turnStartedAt } : {},
     ...typeof model === "string" && model.length > 0 ? { model } : {},
     ...typeof at === "number" && Number.isFinite(at) ? { at } : {},
@@ -2981,7 +3001,7 @@ async function trackSessionAt(sessionsDir, sessionId, op, prio, status, blob, ma
       op,
       prio,
       ...blob ? { blob } : {},
-      ...agent === "codex" ? { agent } : {},
+      ...agent === "claude" ? {} : { agent },
       ...typeof sessionStartedAt === "number" && Number.isFinite(sessionStartedAt) ? { sessionStartedAt } : {},
       ...typeof turnStartedAt === "number" && Number.isFinite(turnStartedAt) ? { turnStartedAt } : {},
       ...typeof turnId === "string" && turnId.length > 0 ? { turnId } : {},

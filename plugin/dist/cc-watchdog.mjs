@@ -104,7 +104,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "2.1.0";
+var PLUGIN_VERSION = "2.2.0";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -2665,8 +2665,28 @@ var codexAdapter = {
   pidTurnActive: (pid) => codexPidTurnActive(pid),
   locateTuiPid: (ctx, deps) => codexLocateTuiPid(ctx, deps)
 };
+var opencodeAdapter = {
+  kind: "opencode",
+  title: async () => {
+    return;
+  },
+  detectInterrupt: () => false,
+  sessionsDir: () => `${CC_DIR}/opencode-has-no-sessions-dir`,
+  sessionMatch: () => false,
+  hookStampPath: () => lastHookPath("opencode"),
+  hooksNotFiringHint: "  OpenCode loads the plugin at server start — restart OpenCode, or check that ~/.config/opencode/plugin/nomo.js still points at this install.",
+  toolDetail: {},
+  blobAgentFields: { agent: "opencode" }
+};
 function adapterFor(agent) {
-  return agent === "codex" ? codexAdapter : claudeAdapter;
+  switch (agent) {
+    case "codex":
+      return codexAdapter;
+    case "opencode":
+      return opencodeAdapter;
+    default:
+      return claudeAdapter;
+  }
 }
 var allAdapters = [claudeAdapter, codexAdapter];
 
@@ -3751,7 +3771,7 @@ function ccOpinion(file, join3, now) {
 var finite = (value) => typeof value === "number" && Number.isFinite(value);
 var filled = (value) => typeof value === "string" && value.length > 0;
 function buildStatePlaintext(record, status, at, titleFallback) {
-  const agent = record.agent === "codex" ? "codex" : "claude";
+  const agent = record.agent ?? "claude";
   const branch = sessionBranch(record);
   const base = {
     status,
@@ -3793,7 +3813,7 @@ function computeSessionState(input) {
     return null;
   if (pairingId === undefined || record.pairingId !== pairingId)
     return null;
-  const agent = record.agent === "codex" ? "codex" : "claude";
+  const agent = record.agent ?? "claude";
   const ts = finite(record.ts) ? record.ts : now;
   const startedAt = finite(record.sessionStartedAt) ? { startedAt: record.sessionStartedAt } : {};
   const sealed = { kind: "sealed", value: record.blob };
@@ -3876,7 +3896,7 @@ function lanFrameContent(record, pairingId, hold = null, now = Date.now(), isAli
       prio: 1,
       ts: Math.max(record.ts, hold.at),
       blob: hold.blob,
-      ...record.agent === "codex" ? { agent: "codex" } : {},
+      ...record.agent && record.agent !== "claude" ? { agent: record.agent } : {},
       ...record.attentionKind === "userInput" ? { attentionKind: "userInput" } : {}
     };
   }
@@ -3886,7 +3906,7 @@ function lanFrameContent(record, pairingId, hold = null, now = Date.now(), isAli
     prio,
     ts: record.ts,
     blob: record.blob,
-    ...record.agent === "codex" ? { agent: "codex" } : {},
+    ...record.agent && record.agent !== "claude" ? { agent: record.agent } : {},
     ...prio === 1 && record.attentionKind === "userInput" ? { attentionKind: "userInput" } : {}
   };
 }
@@ -4049,7 +4069,7 @@ function createLanFrameStore(deps = {}) {
     if (blob.kind === "last" && !prev)
       return false;
     const blobSig = blob.kind === "sealed" ? `s:${blob.value}` : blob.kind === "plain" ? `p:${JSON.stringify(blob.value)}` : `l:${prev.state.blob}`;
-    const agent = blob.kind === "last" ? prev.state.agent : computed.agent === "codex" ? "codex" : undefined;
+    const agent = blob.kind === "last" ? prev.state.agent : computed.agent === "claude" ? undefined : computed.agent;
     const startedAt = blob.kind === "last" ? prev.state.startedAt : computed.startedAt;
     const asking = blob.kind === "last" ? undefined : computed.attentionKind;
     const sig = `${computed.terminal ? "term" : "live"}|${computed.ts}|${computed.why}|${agent ?? ""}` + `|${startedAt ?? ""}|${asking ?? ""}|${blobSig}`;
@@ -4153,7 +4173,7 @@ function createLanFrameStore(deps = {}) {
         }
       }
       {
-        const askCc = record.agent !== "codex" && record.provisional !== true;
+        const askCc = (record.agent ?? "claude") === "claude" && record.provisional !== true;
         let cc = null;
         let ccProcStartedAt;
         if (askCc && ccSessionsDir) {
@@ -5195,7 +5215,7 @@ function buildBlob(input, machine, title, plan, agent = "claude", turnStartedAt,
     machine,
     label,
     ...detail ? { detail } : {},
-    ...agent === "codex" ? { agent: "codex" } : {},
+    ...agent === "claude" ? {} : { agent },
     ...typeof turnStartedAt === "number" && Number.isFinite(turnStartedAt) ? { turnStartedAt } : {},
     ...typeof model === "string" && model.length > 0 ? { model } : {},
     ...typeof at === "number" && Number.isFinite(at) ? { at } : {},
@@ -5275,7 +5295,7 @@ async function trackSessionAt(sessionsDir, sessionId, op, prio, status, blob, ma
       op,
       prio,
       ...blob ? { blob } : {},
-      ...agent === "codex" ? { agent } : {},
+      ...agent === "claude" ? {} : { agent },
       ...typeof sessionStartedAt === "number" && Number.isFinite(sessionStartedAt) ? { sessionStartedAt } : {},
       ...typeof turnStartedAt === "number" && Number.isFinite(turnStartedAt) ? { turnStartedAt } : {},
       ...typeof turnId === "string" && turnId.length > 0 ? { turnId } : {},
@@ -7600,7 +7620,7 @@ async function correctResolvedPlanPicker(config, path, sessionId, record, deps =
     if (tuiPid !== undefined && !(deps.pidAlive ?? pidAlive)(tuiPid)) {
       return await settlePendingPlanPickerDone(config, path, sessionId, snapshot, now, deps, "exit");
     }
-    const agent = snapshot.agent === "codex" ? "codex" : "claude";
+    const agent = recordAgent(snapshot);
     const adapter2 = adapterFor(agent);
     if (!adapter2.completedTurnWaitState)
       return "uncorrected";
@@ -8263,7 +8283,7 @@ async function discoverLiveSessions(config, deps = {}) {
   }
 }
 function recordAgent(record) {
-  return record.agent === "codex" ? "codex" : "claude";
+  return record.agent ?? "claude";
 }
 function provisionalsCoveredByReal(entries, adapters = allAdapters) {
   const discoveryCapable = new Set(adapters.filter((a) => typeof a.discoverLive === "function").map((a) => a.kind));
@@ -8325,7 +8345,7 @@ async function correctInterrupt(config, path, sessionId, record, now, deps = {})
     } catch {
       return "uncorrected";
     }
-    const agent = record.agent === "codex" ? "codex" : "claude";
+    const agent = recordAgent(record);
     if (!tailShowsInterrupt(tail, agent))
       return "uncorrected";
     if (await decisionHoldIsLive(sessionId, now, deps)) {
@@ -8386,7 +8406,7 @@ async function correctPendingApproval(config, path, sessionId, record, now, deps
   const writeRecord = deps.writeRecord ?? ((p, rec) => atomicWrite(p, JSON.stringify(rec), 384));
   const clock = deps.now ?? Date.now;
   try {
-    const agent = record.agent === "codex" ? "codex" : "claude";
+    const agent = recordAgent(record);
     const adapter2 = adapterFor(agent);
     if (!shouldPendingApprovalCheck(record, adapter2))
       return "uncorrected";
@@ -8437,7 +8457,7 @@ function shouldIdleProvisionalCheck(record, adapter2) {
 }
 async function correctIdleProvisional(config, path, sessionId, record) {
   try {
-    const agent = record.agent === "codex" ? "codex" : "claude";
+    const agent = recordAgent(record);
     const adapter2 = adapterFor(agent);
     if (!shouldIdleProvisionalCheck(record, adapter2))
       return "uncorrected";
@@ -8472,7 +8492,7 @@ function transcriptMtimeMsDefault(path) {
   }
 }
 function isClaudeIdleReapEligible(record, now, transcriptMtimeMs = transcriptMtimeMsDefault) {
-  if (record.agent === "codex")
+  if (recordAgent(record) !== "claude")
     return false;
   if (record.provisional === true)
     return false;
@@ -8499,7 +8519,7 @@ async function correctIdleClaude(config, path, sessionId, record, now, deps = {}
   const writeRecord = deps.writeRecord ?? ((p, rec) => atomicWrite(p, JSON.stringify(rec), 384));
   const clock = deps.now ?? Date.now;
   try {
-    const agent = record.agent === "codex" ? "codex" : "claude";
+    const agent = recordAgent(record);
     if (agent === "codex") {
       if (record.provisional === true || !idleReapAgeEligible(record, now) || typeof record.transcript !== "string" || record.transcript.length === 0)
         return "uncorrected";
@@ -8587,7 +8607,7 @@ async function correctPendingDone(config, path, sessionId, record, now, deps = {
       traceFocus(deps, { event: "pending-done", sessionId, outcome: "held", delivered: false, held: true });
       return "pending";
     }
-    const agent = record.agent === "codex" ? "codex" : "claude";
+    const agent = recordAgent(record);
     const settled = {
       ...record,
       lastEvent: "done",

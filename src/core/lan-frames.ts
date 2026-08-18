@@ -212,7 +212,7 @@ export function lanFrameContent(
       prio: 1,
       ts: Math.max(record.ts, hold!.at),
       blob: hold!.blob,
-      ...(record.agent === "codex" ? { agent: "codex" as AgentKind } : {}),
+      ...(record.agent && record.agent !== "claude" ? { agent: record.agent } : {}),
       ...(record.attentionKind === "userInput" ? { attentionKind: "userInput" as const } : {}),
     };
   }
@@ -222,7 +222,7 @@ export function lanFrameContent(
     prio,
     ts: record.ts,
     blob: record.blob,
-    ...(record.agent === "codex" ? { agent: "codex" as AgentKind } : {}),
+    ...(record.agent && record.agent !== "claude" ? { agent: record.agent } : {}),
     ...(prio === 1 && record.attentionKind === "userInput" ? { attentionKind: "userInput" as const } : {}),
   };
 }
@@ -603,7 +603,7 @@ export function createLanFrameStore(deps: LanFrameStoreDeps = {}): LanFrameStore
     const blobSig = blob.kind === "sealed" ? `s:${blob.value}`
       : blob.kind === "plain" ? `p:${JSON.stringify(blob.value)}`
         : `l:${prev!.state.blob}`;
-    const agent = blob.kind === "last" ? prev!.state.agent : (computed.agent === "codex" ? "codex" : undefined);
+    const agent = blob.kind === "last" ? prev!.state.agent : (computed.agent === "claude" ? undefined : computed.agent);
     const startedAt = blob.kind === "last" ? prev!.state.startedAt : computed.startedAt;
     // Never inherited through a `last` (that is a terminal row, which is nobody's open question).
     const asking = blob.kind === "last" ? undefined : computed.attentionKind;
@@ -726,10 +726,12 @@ export function createLanFrameStore(deps: LanFrameStoreDeps = {}): LanFrameStore
 
       // --- v2: the computed display state -----------------------------------------------------------
       {
-        // CC is consulted for CLAUDE, non-provisional sessions only: there is no CC-equivalent for Codex,
-        // and a provisional row's `pid` is an immortal app-server rather than a session process. Both stay
-        // on the record-only path, and say so on the wire through the `/cx` suffix.
-        const askCc = record.agent !== "codex" && record.provisional !== true;
+        // CC is consulted for CLAUDE, non-provisional sessions only: the CC session file is Claude
+        // Code's own and NO other agent has an equivalent, so any other kind joined against it reads
+        // another process's status. A provisional row's `pid` is likewise an immortal app-server rather
+        // than a session process. Both stay on the record-only path, and say so on the wire via `/cx`.
+        // Absent `agent` MEANS claude (the historical default), which is why this asks positively.
+        const askCc = (record.agent ?? "claude") === "claude" && record.provisional !== true;
         let cc: CcSessionFile | null = null;
         let ccProcStartedAt: number | undefined;
         if (askCc && ccSessionsDir) {

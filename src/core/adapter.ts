@@ -16,7 +16,7 @@ import { execFile } from "node:child_process";
 import { readdir, readFile, stat } from "node:fs/promises";
 import { promisify } from "node:util";
 import { basename, join } from "node:path";
-import { AgentKind, codexHome, folderKeyFromCwd, isRealTty, lastHookPath, pidAlive, pidAncestors, pidCommand, readPrefix, readSuffix, SessionRecord } from "./shared";
+import { AgentKind, CC_DIR, codexHome, folderKeyFromCwd, isRealTty, lastHookPath, pidAlive, pidAncestors, pidCommand, readPrefix, readSuffix, SessionRecord } from "./shared";
 import { ancestryContainsHerdr, owningTerminalApp } from "./terminal-focus";
 
 const execFileP = promisify(execFile);
@@ -2324,11 +2324,51 @@ export const codexAdapter: AgentAdapter = {
   locateTuiPid: (ctx, deps) => codexLocateTuiPid(ctx, deps),
 };
 
+/** OpenCode's adapter is a STUB, and deliberately so. OpenCode has no hooks: it loads one resident
+ *  plugin into its own server process (`src/opencode/plugin.ts`) which owns the whole lifecycle —
+ *  session identity, title, model, busy/idle — from an in-process event firehose. Nothing in the
+ *  transcript-scanning pipeline this interface was shaped around applies.
+ *
+ *  What is LIVE here is `kind` and `blobAgentFields`: three call sites (`cc-watchdog`'s corrective
+ *  builders, `session-state`'s rollup, `computeSessionState`) reach `adapterFor()` on an OpenCode
+ *  record and want only the `agent:"opencode"` literal to thread into the blob they are rebuilding.
+ *  Every other member is inert — a path that does not exist, a matcher that never matches, an
+ *  interrupt detector that never fires. They are present because the interface requires them, not
+ *  because anything calls them.
+ *
+ *  NOT in `allAdapters` (see below). That list drives the watchdog's per-agent discovery sweep and
+ *  status-cmd's health rows; a resident plugin has nothing to discover (it reports its own sessions
+ *  from inside the server) and no hook channel whose silence would mean anything. */
+export const opencodeAdapter: AgentAdapter = {
+  kind: "opencode",
+  // The plugin resolves the title itself from `session.updated` and puts it on the record; nothing
+  // ever asks the adapter. Same for interrupts (OpenCode has no transcript to scan) and tool detail.
+  title: async () => undefined,
+  detectInterrupt: () => false,
+  // OpenCode's history is SQLite (`~/.local/share/opencode/opencode.db`), not per-session transcript
+  // files — there is no directory to sweep, so this names one that cannot exist and matches nothing.
+  sessionsDir: () => `${CC_DIR}/opencode-has-no-sessions-dir`,
+  sessionMatch: () => false,
+  hookStampPath: () => lastHookPath("opencode"),
+  hooksNotFiringHint: "  OpenCode loads the plugin at server start — restart OpenCode, or check that ~/.config/opencode/plugin/nomo.js still points at this install.",
+  toolDetail: {},
+  // The one live member besides `kind`: OpenCode blobs carry `agent:"opencode"` so the phone tabs and
+  // icons the session correctly (an app build that predates the literal reads it as claude, by design).
+  blobAgentFields: { agent: "opencode" as const },
+};
+
 /** Select the concrete adapter for an agent kind. */
 export function adapterFor(agent: AgentKind): AgentAdapter {
-  return agent === "codex" ? codexAdapter : claudeAdapter;
+  switch (agent) {
+    case "codex": return codexAdapter;
+    case "opencode": return opencodeAdapter;
+    default: return claudeAdapter;
+  }
 }
 
 /** Every concrete adapter, so the agent-agnostic watchdog can drive its generic per-agent steps
- *  (e.g. discovery) across all agents without an inline `agent === …` branch. */
+ *  (e.g. discovery) across all agents without an inline `agent === …` branch.
+ *
+ *  `opencodeAdapter` is DELIBERATELY absent — see its declaration. It is reachable only through
+ *  `adapterFor()`, which is the only thing that needs it. */
 export const allAdapters: AgentAdapter[] = [claudeAdapter, codexAdapter];

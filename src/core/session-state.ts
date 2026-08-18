@@ -337,7 +337,7 @@ const filled = (value: unknown): value is string => typeof value === "string" &&
 export function buildStatePlaintext(
   record: SessionRecord, status: CCStatus, at: number, titleFallback?: string,
 ): Record<string, unknown> {
-  const agent: AgentKind = record.agent === "codex" ? "codex" : "claude";
+  const agent: AgentKind = record.agent ?? "claude";
   // The folder's LIVE branch, re-read from the record's pinned paths — the same thing the watchdog's
   // corrective builders do for the worker leg, so the two frames stay textually identical.
   const branch = sessionBranch(record);
@@ -428,7 +428,7 @@ export function computeSessionState(input: SessionStateInput): SessionState | nu
   // with no pairingId is UNKNOWN, never assumed — same rule.
   if (pairingId === undefined || record.pairingId !== pairingId) return null;
 
-  const agent: AgentKind = record.agent === "codex" ? "codex" : "claude";
+  const agent: AgentKind = record.agent ?? "claude";
   const ts = finite(record.ts) ? record.ts : now;
   const startedAt = finite(record.sessionStartedAt) ? { startedAt: record.sessionStartedAt } : {};
   const sealed = { kind: "sealed" as const, value: record.blob };
@@ -448,9 +448,10 @@ export function computeSessionState(input: SessionStateInput): SessionState | nu
   if (!pidAlive) return of("ended", "reap", sealed, ts, true);
 
   // --- CC's opinion, gated ------------------------------------------------------------------------
-  // NEVER consulted for Codex (no equivalent file exists) nor for a PROVISIONAL row (which has no
-  // trustworthy CC-file join). Those stay on the record-only path by construction, and Codex says so
-  // on the wire through the `/cx` suffix.
+  // CLAUDE ONLY. The CC session file is Claude Code's own; no other agent has an equivalent, so a
+  // non-claude row joined against it would read another process's status. Nor is it consulted for a
+  // PROVISIONAL row (which has no trustworthy CC-file join). Those stay on the record-only path by
+  // construction, and Codex says so on the wire through the `/cx` suffix.
   const ccUsable = agent === "claude" && record.provisional !== true;
   const opinion = ccUsable
     ? ccOpinion(cc, { pid: record.pid, sessionId, procStartedAt: ccProcStartedAt }, now)

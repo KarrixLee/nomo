@@ -204,7 +204,9 @@ export function buildBlob(input: Record<string, unknown>, machine: string, title
     input.tool_input,
   );
   // The `agent` key is OMITTED for claude (byte-identical to the pre-codex blob so old Swift builds and
-  // the existing snapshots are unaffected) and the literal "codex" for a codex session. `turnStartedAt`
+  // the existing snapshots are unaffected) and the agent's OWN literal for every other kind ("codex",
+  // "opencode", …) — the rule is stated once, so a new AgentKind carries through here for free and can
+  // never silently render as Claude on the phone. Mirrors Swift's CCAgent.blobValue. `turnStartedAt`
   // (epoch SECONDS — the current turn's start, see runHook) is likewise OMITTED when unknown, so a blob
   // from a session with no prompt seen yet stays byte-identical to a pre-0.3.5 one. `model` (v0.8.5 —
   // the session's raw model id, e.g. "claude-fable-5" / "gpt-5-codex", resolved by the adapter's
@@ -236,7 +238,7 @@ export function buildBlob(input: Record<string, unknown>, machine: string, title
   const base = {
     status: plan.status, title: title ?? "", machine, label,
     ...(detail ? { detail } : {}),
-    ...(agent === "codex" ? { agent: "codex" as const } : {}),
+    ...(agent === "claude" ? {} : { agent }),
     ...(typeof turnStartedAt === "number" && Number.isFinite(turnStartedAt) ? { turnStartedAt } : {}),
     ...(typeof model === "string" && model.length > 0 ? { model } : {}),
     ...(typeof at === "number" && Number.isFinite(at) ? { at } : {}),
@@ -412,7 +414,9 @@ export async function trackSessionAt(
       op,
       prio,
       ...(blob ? { blob } : {}),
-      ...(agent === "codex" ? { agent } : {}),
+      // Same omit-for-claude rule as the blob's key above: absent MEANS claude on every reader
+      // (recordAgent/`record.agent ?? "claude"`), and any other kind is stored as its own literal.
+      ...(agent === "claude" ? {} : { agent }),
       // Cache the parsed start so the next hook and the watchdog re-send it without re-reading the
       // transcript (and so it survives the transcript later going away). Omitted when unknown.
       ...(typeof sessionStartedAt === "number" && Number.isFinite(sessionStartedAt) ? { sessionStartedAt } : {}),

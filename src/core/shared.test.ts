@@ -97,7 +97,10 @@ describe("release version stamp (manifests ↔ committed dist)", () => {
     const expected = sourcePick(await manifestVersion(sourcePath))[0];
 
     const distDir = join(REPO_ROOT, "plugin", "dist");
-    const bundles = (await readdir(distDir)).filter((f) => f.endsWith(".mjs"));
+    // .mjs is every hook/command entry; .js is the OpenCode plugin, whose extension is forced
+    // by OpenCode's `{plugin,plugins}/*.{ts,js}` discovery glob. Both carry the injected stamp,
+    // so both must be checked or a stale OpenCode bundle ships unnoticed.
+    const bundles = (await readdir(distDir)).filter((f) => /\.(mjs|js)$/.test(f));
     expect(bundles.length).toBeGreaterThan(0);
 
     for (const bundle of bundles) {

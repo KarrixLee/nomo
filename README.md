@@ -180,6 +180,50 @@ the only difference from Claude Code is that Codex's encrypted blob is tagged `a
 the phone can brand it. The island shows the **most-recently-active** session regardless of which
 agent produced it.
 
+## Install — OpenCode
+
+OpenCode has no marketplace and no hooks: it loads **one resident plugin module** inside its own
+server process. So the install is a clone plus a one-line stub file — no `opencode plugin` command,
+no npm package (OpenCode's npm plugin cache is install-once and never re-resolves, so an npm install
+would freeze at whatever version you first got).
+
+**Step 1 — get the plugin on disk and resolve `<ROOT>`.**
+
+Already installed it for Claude Code or Codex? Reuse that copy. Run `claude plugin list` (or
+`codex plugin list`), find the `nomo-cc` / `nomo@nomo` row and take its **PATH** — that is `<ROOT>`.
+Otherwise clone the repo anywhere:
+
+```sh
+git clone https://github.com/KarrixLee/nomo.git ~/.nomo
+# <ROOT> is then ~/.nomo/plugin
+```
+
+`<ROOT>` is the directory that contains `dist/` — i.e. it ends in `/plugin`.
+
+**Step 2 — drop the stub.** Substitute the real `<ROOT>` you just read:
+
+```sh
+mkdir -p ~/.config/opencode/plugin
+printf 'export { default } from "%s/dist/opencode.js";\n' "<ROOT>" > ~/.config/opencode/plugin/nomo.js
+```
+
+OpenCode auto-discovers `~/.config/opencode/plugin/*.{ts,js}`, so there is nothing to add to
+`opencode.json`. The stub is a **re-export, not a copy**: the bundle keeps executing from `dist/`,
+where it can find its sibling `cc-watchdog.mjs`, and a `git pull` in `<ROOT>` upgrades you with no
+reinstall. Put the stub in a project's `.opencode/plugin/nomo.js` instead if you want it in one repo
+only.
+
+**Step 3 — restart OpenCode.** Plugins are imported once at server start; there is no hot reload.
+
+**Pairing.** There is none to do — the plugin reads the same `~/.config/cc-status/config.json` as the
+other two agents. If you have already paired with `/nomo-cc:pair` or `$nomo-pair`, this machine's
+OpenCode sessions just appear. If you have not, pair once from Claude Code or Codex. Unpaired, the
+plugin no-ops silently. On the wire the only difference is that the encrypted blob is tagged
+`agent: "opencode"`, so the phone can brand it.
+
+`opencode --pure` starts without external plugins, if you ever need to A/B whether Nomo is involved
+in something.
+
 ## Answer from your phone
 
 When a session stops for a **permission prompt** (run a shell command, apply a patch, …) or a
@@ -254,13 +298,18 @@ Runs the full suite (~1500 tests across `core/`, `entries/`, and `qr/`).
 
 ### Building the plugin bundle
 
-`build.ts` bundles the ten entrypoints (`cc-status`, `cc-permission`, `codex-status`,
+`build.ts` bundles the ten hook/command entrypoints (`cc-status`, `cc-permission`, `codex-status`,
 `codex-permission`, `codex-notify`, `cc-watchdog`, `pair`, `unpair`, `reset`, `status-cmd`) into
 `plugin/dist/*.mjs`, inlining every local import so each artifact is a single node-runnable file:
 
 ```
 bun build.ts
 ```
+
+A second pass bundles `src/opencode/plugin.ts` into `plugin/dist/opencode.js` — **`.js`, not
+`.mjs`**, because OpenCode discovers plugins with the glob `{plugin,plugins}/*.{ts,js}` and would
+never see a `.mjs`. It is the one resident module (no hooks, no shim, no one-shot processes), which
+is why it has no `hooks.json` entry and no `hook-shim.sh` whitelist row.
 
 `plugin/dist/` **is committed to the repo.** Marketplace installs are a plain `git clone` of this
 repository — there is no publish, npm, or CI build step, so the committed bundle is what actually

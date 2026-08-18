@@ -415,9 +415,16 @@ export type CCOp = "start" | "update" | "done" | "end";
 export type CCStatus = "working" | "needsAttention" | "done";
 
 /** Which coding agent drove this event. Omitted-from-the-blob for `claude` (the historical default,
- *  so old records/blobs read as claude); the literal `"codex"` for Codex CLI sessions. The Swift side
- *  keys its per-agent icon/label off the blob's optional `agent` field. */
-export type AgentKind = "claude" | "codex";
+ *  so old records/blobs read as claude); the literal `"codex"` for Codex CLI sessions and
+ *  `"opencode"` for OpenCode ones. The Swift side keys its per-agent icon/label off the blob's
+ *  optional `agent` field — and maps an UNKNOWN value to claude ON PURPOSE, so the OpenCode plugin can
+ *  ship before the app release without crashing or losing rows.
+ *
+ *  A third kind is NOT free: the dominant coercion idiom in this repo is
+ *  `record.agent === "codex" ? "codex" : "claude"`, which silently reads opencode as CLAUDE. The ones
+ *  that matter are the blob/record agent literals and anything that would join an OpenCode session
+ *  against a Claude transcript or CC file. */
+export type AgentKind = "claude" | "codex" | "opencode";
 
 /** Codex's config home — `$CODEX_HOME` when set & non-empty, else `~/.codex`. Mirrors codex's own
  *  `find_codex_home` (codex-rs/utils/home-dir): the env var wins, otherwise the default dot-dir. Used

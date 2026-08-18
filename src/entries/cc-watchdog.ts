@@ -604,7 +604,7 @@ export async function correctResolvedPlanPicker(
     if (tuiPid !== undefined && !(deps.pidAlive ?? pidAlive)(tuiPid)) {
       return await settlePendingPlanPickerDone(config, path, sessionId, snapshot, now, deps, "exit");
     }
-    const agent: AgentKind = snapshot.agent === "codex" ? "codex" : "claude";
+    const agent: AgentKind = recordAgent(snapshot);
     const adapter = adapterFor(agent);
     if (!adapter.completedTurnWaitState) return "uncorrected";
     const state = await (deps.state ?? (() => adapter.completedTurnWaitState!({
@@ -1725,7 +1725,7 @@ export async function discoverLiveSessions(config: Config, deps: DiscoverDeps = 
 
 /** The agent a record belongs to (absent → claude, the historical default). */
 function recordAgent(record: SessionRecord): AgentKind {
-  return record.agent === "codex" ? "codex" : "claude";
+  return record.agent ?? "claude";
 }
 
 /** The sentinel ids of PROVISIONAL records whose pid is now also held by a REAL (non-provisional) record
@@ -1953,7 +1953,7 @@ export async function correctInterrupt(
       // we land here, and the session is simply left for its dead-pid reap / staleness eviction.
       return "uncorrected";
     }
-    const agent: AgentKind = record.agent === "codex" ? "codex" : "claude";
+    const agent: AgentKind = recordAgent(record);
     if (!tailShowsInterrupt(tail, agent)) return "uncorrected"; // live turn or no interrupt → leave it
     // THE LIVE-HOLD GATE (see decisionHoldIsLive). A remote approval is open on THIS session, so the
     // interrupt marker in the tail describes an earlier abort, not the prompt the user is looking at —
@@ -2071,7 +2071,7 @@ export async function correctPendingApproval(
     ?? ((p: string, rec: SessionRecord) => atomicWrite(p, JSON.stringify(rec), 0o600));
   const clock = deps.now ?? Date.now;
   try {
-    const agent: AgentKind = record.agent === "codex" ? "codex" : "claude";
+    const agent: AgentKind = recordAgent(record);
     const adapter = adapterFor(agent);
     if (!shouldPendingApprovalCheck(record, adapter)) return "uncorrected";
     let tail: string;
@@ -2152,7 +2152,7 @@ export function shouldIdleProvisionalCheck(record: SessionRecord, adapter: Agent
  *  same verdict triple as the other nets ("corrected" → the caller must not also heartbeat it). */
 async function correctIdleProvisional(config: Config, path: string, sessionId: string, record: SessionRecord): Promise<"corrected" | "uncorrected" | "revoked"> {
   try {
-    const agent: AgentKind = record.agent === "codex" ? "codex" : "claude";
+    const agent: AgentKind = recordAgent(record);
     const adapter = adapterFor(agent);
     if (!shouldIdleProvisionalCheck(record, adapter)) return "uncorrected";
     let active = false;
@@ -2221,12 +2221,16 @@ const CLAUDE_IDLE_REAP_MAX_ATTEMPTS = 5;
 
 /** Whether a KEPT (alive) session is an idle CLAUDE session past the reap threshold — the shared predicate
  *  the reap net and the heartbeat guard BOTH key on, so the two always agree (a session the reaper wants to
- *  finish is never simultaneously heartbeated back to "working"). True iff: it's a Claude session (codex has
- *  its own discovery / idle-provisional + notify-backstop machinery, so it's left to those), not a
+ *  finish is never simultaneously heartbeated back to "working"). True iff: it's a Claude session, not a
  *  provisional discovery row, its last REAL event was a plain `working` update or a bare `sessionStart` (a
  *  resumed session that fired SessionStart then nothing — never `needsAttention`, which can legitimately sit
  *  >30 min awaiting a permission answer, nor `done`, already finished), and record.ts is older than
- *  CLAUDE_IDLE_REAP_MS. Pure so the whole matrix is unit-testable. */
+ *  CLAUDE_IDLE_REAP_MS. Pure so the whole matrix is unit-testable.
+ *
+ *  THE AGENT GATE IS "claude ONLY", never "not codex": this 30-min clock is a HEURISTIC, and every other
+ *  agent is excluded because it owns an authoritative end signal instead (codex: discovery /
+ *  idle-provisional + the notify backstop; opencode: the plugin's `session.idle` event). Guessing "done"
+ *  over one of those is a lie, not a backstop — a quiet-but-live session would be marked finished. */
 /** Default transcript-mtime reader for the reap guard: epoch-ms mtime, undefined on any error. */
 function transcriptMtimeMsDefault(path: string): number | undefined {
   try { return statSync(path).mtimeMs; } catch { return undefined; }
@@ -2236,7 +2240,7 @@ export function isClaudeIdleReapEligible(
   record: SessionRecord, now: number,
   transcriptMtimeMs: (path: string) => number | undefined = transcriptMtimeMsDefault,
 ): boolean {
-  if (record.agent === "codex") return false;
+  if (recordAgent(record) !== "claude") return false;
   if (record.provisional === true) return false;
   return idleReapAgeEligible(record, now, transcriptMtimeMs);
 }
@@ -2311,7 +2315,7 @@ export async function correctIdleClaude(
     ?? ((p: string, rec: SessionRecord) => atomicWrite(p, JSON.stringify(rec), 0o600));
   const clock = deps.now ?? Date.now;
   try {
-    const agent: AgentKind = record.agent === "codex" ? "codex" : "claude";
+    const agent: AgentKind = recordAgent(record);
     if (agent === "codex") {
       // Sound Codex equivalent: clock silence alone is insufficient because record.pid may be the
       // immortal app-server and a legitimate long turn can be hook-quiet. Require all three pieces:
@@ -2496,7 +2500,7 @@ export async function correctPendingDone(
       traceFocus(deps, { event: "pending-done", sessionId, outcome: "held", delivered: false, held: true });
       return "pending";
     }
-    const agent: AgentKind = record.agent === "codex" ? "codex" : "claude";
+    const agent: AgentKind = recordAgent(record);
     // The settled record: the debt dropped and the terminal done state pinned (the hook already wrote
     // these, but a watchdog rewrite between then and now could have moved them — pin explicitly). It is
     // only ever written after the stale-snapshot guard proves the record hasn't moved under us.

@@ -1,0 +1,272 @@
+import { describe, expect, test } from "bun:test";
+import {
+  isDefaultOcTitle, newOcState, ocEndFrames, ocModelFromMessage, reduceOcEvent,
+} from "./state";
+import type { OcState } from "./state";
+
+// -------------------------------------------------------------------------------------------------
+// THE FIXTURES ARE REAL. Every payload below was captured off a live `opencode serve` 1.18.15 SSE
+// stream (see the live-probe report: `oc-probe/events.md`, `sse3.log`/`sse4.log`), because the
+// published `Event` TypeScript union is STALE — it still describes v1 while the runtime delivers v2
+// names. A test written against the type would pass and the plugin would still see nothing.
+// -------------------------------------------------------------------------------------------------
+
+const ROOT = "ses_fe9c7c13fffeLuB2yMpkVjwaMo";
+const CHILD = "ses_child00000000000000000000";
+
+const created = (sessionID: string, title: string, extra: Record<string, unknown> = {}) => ({
+  id: "evt_016383ec0002BwfhZXX3JAjVZF",
+  type: "session.created",
+  properties: {
+    sessionID,
+    info: {
+      id: sessionID, slug: "hidden-knight", version: "1.18.15", projectID: "global",
+      directory: "/tmp/oc-probe", path: "", title, cost: 0,
+      time: { created: 1787079179968, updated: 1787079179968 },
+      ...extra,
+    },
+  },
+});
+
+const status = (sessionID: string, value: unknown) => ({
+  id: "evt_0163741fd001Rp8FShe71BoEc2",
+  type: "session.status",
+  properties: { sessionID, status: value },
+});
+
+const idle = (sessionID: string) => ({
+  id: "evt_01637443d002IQkZqRfyEtUMWq",
+  type: "session.idle",
+  properties: { sessionID },
+});
+
+const assistantMessage = (sessionID: string, providerID: string, modelID: string) => ({
+  id: "evt_0163aa0d0001gFT58uSRiSm2cH",
+  type: "message.updated",
+  properties: {
+    sessionID,
+    info: {
+      id: "msg_0163aa0d0001A0sadEqzAdxowG", parentID: "msg_0163a9f06001IRc8Y1JU3LerD2",
+      role: "assistant", mode: "build", agent: "build", cost: 0,
+      modelID, providerID, time: { created: 1787079336144 }, sessionID,
+    },
+  },
+});
+
+/** A started, working root session — the state every turn-level test wants as its precondition. */
+function startedRoot(): OcState {
+  const state = newOcState();
+  expect(reduceOcEvent(state, created(ROOT, "Explore codebase structure"), 1_000)).not.toBeNull();
+  return state;
+}
+
+describe("reduceOcEvent lifecycle", () => {
+  test("session.created for a root session opens with start/working", () => {
+    const state = newOcState();
+    const frame = reduceOcEvent(state, created(ROOT, "Explore codebase structure"), 1_000);
+    expect(frame).toEqual({
+      sessionId: ROOT,
+      op: "start",
+      prio: 0,
+      status: "working",
+      title: "Explore codebase structure",
+      // From `info.time.created`, NOT the reducer's clock — the session's real start.
+      startedAt: 1787079179968,
+    });
+  });
+
+  test("session.status {busy} is an update/working carrying the accumulated title", () => {
+    const state = startedRoot();
+    const frame = reduceOcEvent(state, status(ROOT, { type: "busy" }), 60_000);
+    expect(frame).toMatchObject({ sessionId: ROOT, op: "update", prio: 0, status: "working" });
+    // The turn anchor is stamped on the edge INTO working, in epoch SECONDS (the blob's unit, which
+    // is NOT the envelope's ms).
+    expect(frame?.turnStartedAt).toBe(60);
+  });
+
+  test("session.status {retry} carries the retry message as detail", () => {
+    const state = startedRoot();
+    // A real free-tier-exhaustion payload.
+    const frame = reduceOcEvent(state, status(ROOT, {
+      type: "retry", attempt: 2, message: "Free usage exceeded, subscribe to Go", next: 1787097600565,
+    }), 2_000);
+    expect(frame).toMatchObject({
+      op: "update", status: "working", detail: "Free usage exceeded, subscribe to Go",
+    });
+  });
+
+  test("session.status {idle} sends nothing — session.idle is the authoritative done", () => {
+    const state = startedRoot();
+    expect(reduceOcEvent(state, status(ROOT, { type: "idle" }), 2_000)).toBeNull();
+  });
+
+  test("a legacy bare-string status is still understood", () => {
+    const state = startedRoot();
+    expect(reduceOcEvent(state, status(ROOT, "busy"), 2_000)).toMatchObject({ status: "working" });
+  });
+
+  test("session.idle closes the turn with done, and re-arms for the next one", () => {
+    const state = startedRoot();
+    expect(reduceOcEvent(state, status(ROOT, { type: "busy" }), 2_000)).not.toBeNull();
+    const done = reduceOcEvent(state, idle(ROOT), 3_000);
+    expect(done).toMatchObject({ sessionId: ROOT, op: "done", status: "done" });
+    // No turn anchor on a done frame, and the next busy is NEVER swallowed by the dedupe.
+    expect(done?.turnStartedAt).toBeUndefined();
+    const next = reduceOcEvent(state, status(ROOT, { type: "busy" }), 90_000);
+    expect(next).toMatchObject({ op: "update", status: "working", turnStartedAt: 90 });
+  });
+
+  test("session.deleted ends the session and forgets it", () => {
+    const state = startedRoot();
+    expect(reduceOcEvent(state, { type: "session.deleted", properties: { sessionID: ROOT } }, 4_000))
+      .toMatchObject({ sessionId: ROOT, op: "end" });
+    expect(state.sessions.size).toBe(0);
+    // A stray later event for a dead session sends nothing.
+    expect(reduceOcEvent(state, idle(ROOT), 5_000)).toBeNull();
+  });
+
+  test("dispose ends every live session exactly once", () => {
+    const state = startedRoot();
+    expect(reduceOcEvent(state, created("ses_second0000000000000000000", "Second"), 1_000)).not.toBeNull();
+    const frames = ocEndFrames(state, 6_000);
+    expect(frames.map((f) => f.op)).toEqual(["end", "end"]);
+    expect(ocEndFrames(state, 6_000)).toEqual([]);
+  });
+
+  test("an unknown event type is inert", () => {
+    const state = startedRoot();
+    expect(reduceOcEvent(state, { type: "server.heartbeat", properties: {} }, 7_000)).toBeNull();
+    expect(reduceOcEvent(state, { type: "file.edited", properties: { file: "x" } }, 7_000)).toBeNull();
+    expect(reduceOcEvent(state, null, 7_000)).toBeNull();
+    expect(reduceOcEvent(state, { properties: {} }, 7_000)).toBeNull();
+  });
+});
+
+describe("title", () => {
+  test("OpenCode's default title is never shown", () => {
+    expect(isDefaultOcTitle("New session - 2026-08-19T03:12:11.101Z")).toBe(true);
+    expect(isDefaultOcTitle("Child session - 2026-08-19T03:12:11.101Z")).toBe(true);
+    expect(isDefaultOcTitle("Explore codebase structure")).toBe(false);
+    // A fork keeps the real title plus a suffix — that must still be a title.
+    expect(isDefaultOcTitle("Explore codebase structure (fork #2)")).toBe(false);
+
+    const state = newOcState();
+    const frame = reduceOcEvent(state, created(ROOT, "New session - 2026-08-19T03:12:11.101Z"), 1_000);
+    expect(frame?.title).toBeUndefined();
+  });
+
+  test("session.updated upgrades the title without sending a frame of its own", () => {
+    const state = newOcState();
+    reduceOcEvent(state, created(ROOT, "New session - 2026-08-19T03:12:11.101Z"), 1_000);
+    const noFrame = reduceOcEvent(state, {
+      type: "session.updated",
+      properties: { sessionID: ROOT, info: { id: ROOT, title: "Comment input UI design" } },
+    }, 2_000);
+    expect(noFrame).toBeNull();
+    // …but the very next frame carries it.
+    expect(reduceOcEvent(state, status(ROOT, { type: "busy" }), 3_000)?.title)
+      .toBe("Comment input UI design");
+  });
+});
+
+describe("model", () => {
+  test("model comes from the newest ASSISTANT message.updated, as provider/model", () => {
+    expect(ocModelFromMessage({ role: "assistant", providerID: "anthropic", modelID: "claude-opus-4-6" }))
+      .toBe("anthropic/claude-opus-4-6");
+    // A user message.updated ALSO carries a model (nested under `model`) — it is not ours to read.
+    expect(ocModelFromMessage({ role: "user", model: { providerID: "opencode", modelID: "x" } }))
+      .toBeUndefined();
+    expect(ocModelFromMessage({ role: "assistant", providerID: "anthropic" })).toBeUndefined();
+  });
+
+  test("the model reaches the next frame, and a mid-session switch replaces it", () => {
+    const state = startedRoot();
+    expect(reduceOcEvent(state, assistantMessage(ROOT, "opencode", "nemotron-3.5-lightning-free"), 2_000))
+      .toBeNull();
+    expect(reduceOcEvent(state, status(ROOT, { type: "busy" }), 3_000)?.model)
+      .toBe("opencode/nemotron-3.5-lightning-free");
+    reduceOcEvent(state, assistantMessage(ROOT, "anthropic", "claude-opus-4-6"), 4_000);
+    expect(reduceOcEvent(state, idle(ROOT), 5_000)?.model).toBe("anthropic/claude-opus-4-6");
+  });
+});
+
+describe("dedupe", () => {
+  test("an identical session.status is not re-sent", () => {
+    const state = startedRoot();
+    expect(reduceOcEvent(state, status(ROOT, { type: "busy" }), 2_000)).not.toBeNull();
+    // `busy` fires several times per turn with a byte-identical payload.
+    expect(reduceOcEvent(state, status(ROOT, { type: "busy" }), 2_100)).toBeNull();
+    expect(reduceOcEvent(state, status(ROOT, { type: "busy" }), 2_200)).toBeNull();
+  });
+
+  test("a changed title or model breaks the dedupe", () => {
+    const state = startedRoot();
+    expect(reduceOcEvent(state, status(ROOT, { type: "busy" }), 2_000)).not.toBeNull();
+    expect(reduceOcEvent(state, status(ROOT, { type: "busy" }), 2_100)).toBeNull();
+    reduceOcEvent(state, {
+      type: "session.updated",
+      properties: { sessionID: ROOT, info: { id: ROOT, title: "Clarifying what happened" } },
+    }, 2_200);
+    expect(reduceOcEvent(state, status(ROOT, { type: "busy" }), 2_300)?.title)
+      .toBe("Clarifying what happened");
+    reduceOcEvent(state, assistantMessage(ROOT, "opencode", "nemotron-3.5-lightning-free"), 2_400);
+    expect(reduceOcEvent(state, status(ROOT, { type: "busy" }), 2_500)?.model)
+      .toBe("opencode/nemotron-3.5-lightning-free");
+  });
+
+  test("a retry's changing message is never deduped away", () => {
+    const state = startedRoot();
+    const first = reduceOcEvent(state, status(ROOT, { type: "retry", attempt: 1, message: "429" }), 2_000);
+    expect(first?.detail).toBe("429");
+    expect(reduceOcEvent(state, status(ROOT, { type: "retry", attempt: 2, message: "429" }), 2_100)).toBeNull();
+    expect(reduceOcEvent(state, status(ROOT, { type: "retry", attempt: 3, message: "Free usage exceeded" }), 2_200)?.detail)
+      .toBe("Free usage exceeded");
+  });
+});
+
+describe("subagent filter", () => {
+  test("a child session's whole lifecycle is dropped", () => {
+    const state = startedRoot();
+    // The `task` tool creates a child session; its `info` carries a parentID.
+    expect(reduceOcEvent(state, created(CHILD, "Child session - 2026-08-19T03:12:11.101Z", { parentID: ROOT }), 2_000))
+      .toBeNull();
+    expect(state.children.has(CHILD)).toBe(true);
+    // Without this, ONE task fan-out paints N island rows.
+    expect(reduceOcEvent(state, status(CHILD, { type: "busy" }), 2_100)).toBeNull();
+    expect(reduceOcEvent(state, idle(CHILD), 2_200)).toBeNull();
+    expect(reduceOcEvent(state, { type: "session.deleted", properties: { sessionID: CHILD } }, 2_300)).toBeNull();
+    expect(state.sessions.has(CHILD)).toBe(false);
+    // The root is untouched by any of it.
+    expect(reduceOcEvent(state, idle(ROOT), 2_400)).toMatchObject({ sessionId: ROOT, op: "done" });
+  });
+
+  test("a child learned from session.updated is dropped from then on", () => {
+    const state = startedRoot();
+    reduceOcEvent(state, {
+      type: "session.updated",
+      properties: { sessionID: CHILD, info: { id: CHILD, parentID: ROOT, title: "Explore (@explore subagent)" } },
+    }, 2_000);
+    expect(state.children.has(CHILD)).toBe(true);
+    expect(reduceOcEvent(state, status(CHILD, { type: "busy" }), 2_100)).toBeNull();
+  });
+
+  test("an assistant message's parentID is a MESSAGE id and must not poison the child set", () => {
+    const state = startedRoot();
+    reduceOcEvent(state, assistantMessage(ROOT, "opencode", "nemotron-3.5-lightning-free"), 2_000);
+    expect(state.children.size).toBe(0);
+    expect(reduceOcEvent(state, status(ROOT, { type: "busy" }), 2_100)).not.toBeNull();
+  });
+});
+
+describe("mid-flight adoption", () => {
+  test("a session first seen at session.status is adopted as an update, never a start", () => {
+    const state = newOcState();
+    const frame = reduceOcEvent(state, status(ROOT, { type: "busy" }), 5_000);
+    expect(frame).toMatchObject({ sessionId: ROOT, op: "update", status: "working", startedAt: 5_000 });
+  });
+
+  test("an idle for a session we never saw sends nothing", () => {
+    const state = newOcState();
+    expect(reduceOcEvent(state, idle(ROOT), 5_000)).toBeNull();
+  });
+});
