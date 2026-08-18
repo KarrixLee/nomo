@@ -183,41 +183,52 @@ agent produced it.
 ## Install — OpenCode
 
 OpenCode has no marketplace and no hooks: it loads **one resident plugin module** inside its own
-server process. So the install is a clone plus a one-line stub file — no `opencode plugin` command,
-no npm package (OpenCode's npm plugin cache is install-once and never re-resolves, so an npm install
-would freeze at whatever version you first got).
+server process, auto-discovering `{plugin,plugins}/*.{ts,js}` in its config directories. So the
+install is a clone plus **one command** — no `opencode plugin` command, no npm package (OpenCode's
+npm plugin cache is install-once and never re-resolves, so an npm install would freeze at whatever
+version you first got).
 
-**Step 1 — get the plugin on disk and resolve `<ROOT>`.**
-
-Already installed it for Claude Code or Codex? Reuse that copy. Run `claude plugin list` (or
-`codex plugin list`), find the `nomo-cc` / `nomo@nomo` row and take its **PATH** — that is `<ROOT>`.
-Otherwise clone the repo anywhere:
+Already installed Nomo for Claude Code or Codex? Reuse that copy — `claude plugin list` /
+`codex plugin list` prints its PATH. Otherwise clone the repo anywhere:
 
 ```sh
 git clone https://github.com/KarrixLee/nomo.git ~/.nomo
-# <ROOT> is then ~/.nomo/plugin
+~/.nomo/plugin/scripts/opencode-install.sh
 ```
 
-`<ROOT>` is the directory that contains `dist/` — i.e. it ends in `/plugin`.
+That is the whole install. The script resolves its own location, so there is no path to look up and
+nothing to hand-edit. It writes two things and prints exactly what it wrote:
 
-**Step 2 — drop the stub.** Substitute the real `<ROOT>` you just read:
+- `~/.config/opencode/plugin/nomo.js` — a one-line stub re-exporting `<ROOT>/dist/opencode.js`.
+- `~/.config/opencode/commands/nomo-*.md` — the five slash commands, with the plugin path baked in.
 
-```sh
-mkdir -p ~/.config/opencode/plugin
-printf 'export { default } from "%s/dist/opencode.js";\n' "<ROOT>" > ~/.config/opencode/plugin/nomo.js
-```
+Re-running it is safe and idempotent; run it again if you move the checkout. It refuses to overwrite
+a same-named file it did not write (pass `--force` to override), and `--project` installs into
+`./.opencode/` for one repo instead of globally.
 
-OpenCode auto-discovers `~/.config/opencode/plugin/*.{ts,js}`, so there is nothing to add to
-`opencode.json`. The stub is a **re-export, not a copy**: the bundle keeps executing from `dist/`,
-where it can find its sibling `cc-watchdog.mjs`, and a `git pull` in `<ROOT>` upgrades you with no
-reinstall. Put the stub in a project's `.opencode/plugin/nomo.js` instead if you want it in one repo
-only.
+**Restart OpenCode** — plugins are imported once at server start; there is no hot reload.
 
-**Step 3 — restart OpenCode.** Plugins are imported once at server start; there is no hot reload.
+The stub is a **re-export, not a copy**: the bundle keeps executing from `dist/`, where it can find
+its sibling `cc-watchdog.mjs`, and a `git pull` in the checkout upgrades you with no reinstall.
+OpenCode auto-discovers the directory, so there is nothing to add to `opencode.json`.
 
-**Pairing.** There is none to do — the plugin reads the same `~/.config/cc-status/config.json` as the
-other two agents. If you have already paired with `/nomo-cc:pair` or `$nomo-pair`, this machine's
-OpenCode sessions just appear. If you have not, pair once from Claude Code or Codex. Unpaired, the
+The five commands are the same ones the other two agents ship, minus the plugin namespace — OpenCode
+command names are flat and global, so they are `/nomo-pair`, `/nomo-status`, `/nomo-approvals`,
+`/nomo-reset`, `/nomo-unpair`:
+
+- `/nomo-pair` — pair this machine with your phone (opens a browser page with the QR code + one-time
+  code, then confirms the scan). `/nomo-pair code` prints the typeable code instead, for a headless
+  box.
+- `/nomo-status` — pairing / watchdog / last-delivery health.
+- `/nomo-approvals` — the machine's remote-approvals switch. It is shared with Claude Code and Codex;
+  OpenCode sessions themselves never hold a prompt for the phone (the integration is read-only), so
+  this only changes what your *other* agents do.
+- `/nomo-reset` — panic button for stuck/phantom sessions, without unpairing.
+- `/nomo-unpair` — revoke the pairing and clear local state.
+
+**Pairing is shared.** The plugin reads the same `~/.config/cc-status/config.json` as the other two
+agents, so if you have already paired with `/nomo-cc:pair` or `$nomo-pair`, this machine's OpenCode
+sessions just appear — `/nomo-pair` is only for a machine that has never been paired. Unpaired, the
 plugin no-ops silently. On the wire the only difference is that the encrypted blob is tagged
 `agent: "opencode"`, so the phone can brand it.
 
@@ -310,6 +321,14 @@ A second pass bundles `src/opencode/plugin.ts` into `plugin/dist/opencode.js` �
 `.mjs`**, because OpenCode discovers plugins with the glob `{plugin,plugins}/*.{ts,js}` and would
 never see a `.mjs`. It is the one resident module (no hooks, no shim, no one-shot processes), which
 is why it has no `hooks.json` entry and no `hook-shim.sh` whitelist row.
+
+The OpenCode slash commands are **templates**, not built artifacts: `plugin/opencode-commands/*.md`
+(filename = command name) each carry a `__NOMO_ROOT__` placeholder, and
+`plugin/scripts/opencode-install.sh` substitutes the resolved plugin path as it copies them into the
+user's `commands/` directory. Baking the path in is unavoidable — OpenCode gives a command file no
+equivalent of Claude's `${CLAUDE_PLUGIN_ROOT}` and no `plugin list` to recover it from, the way the
+Codex skills do. Add a command by dropping another `.md` in that directory; the installer picks it
+up with no code change.
 
 `plugin/dist/` **is committed to the repo.** Marketplace installs are a plain `git clone` of this
 repository — there is no publish, npm, or CI build step, so the committed bundle is what actually

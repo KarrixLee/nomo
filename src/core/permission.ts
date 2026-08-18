@@ -333,7 +333,7 @@ function answerLine(
   toolInput: Record<string, unknown>,
   answers: unknown,
 ): string | undefined {
-  if (toolName !== "AskUserQuestion" || !Array.isArray(answers)) return undefined;
+  if (!isAnswerTool(toolName) || !Array.isArray(answers)) return undefined;
   // Zipped against the SAME usable-question list that built `permissionQuestions`, so index i of the
   // phone's array is index i of what the phone was SHOWN — a skipped entry can never shift the mapping.
   // The key is the ORIGINAL, untruncated question text (the blob's copy may be capped).
@@ -506,7 +506,36 @@ function defaultTrace(): (event: object) => void {
  *  reachable through today's Codex PermissionRequest manifest, but the predicate names the CONCEPT, not
  *  the reachable surface — the Codex reviewer/dialog gates below still apply to it. */
 export function isQuestionTool(toolName: string): boolean {
-  return toolName === "AskUserQuestion" || toolName === "request_user_input";
+  return toolName === "AskUserQuestion" || toolName === "request_user_input" || toolName === OPENCODE_QUESTION_TOOL;
+}
+
+/** OpenCode's question tool is literally named `question` — a first-class tool, not a permission. It is
+ *  a PINNED CROSS-REPO CONTRACT: iOS matches this exact spelling (`CCEnvelopeCrypto.opencodeToolName`)
+ *  to route the question matrix, so a frame whose `permissionToolName` differs by one character falls
+ *  through to the ordinary Allow/Deny card and the user gets no options and no Dismiss warning.
+ *
+ *  WHY NOT JUST SEND `AskUserQuestion`. It would have been the shorter diff — this module's question
+ *  machinery was built around Claude's spelling and keys on it in four places (`isQuestionTool`,
+ *  `isAnswerTool`, and the summary + detail switches). But `permissionToolName` is what the phone shows
+ *  and reasons about, not an internal shape tag, and iOS's `CCPermissionQuestion.isOwnQuestionChannel`
+ *  reads (name, agent) TOGETHER to decide what to PROMISE: Claude's question rides the permission hook
+ *  and a refusal is "none of these, think again", while OpenCode's `/question/{id}/reject` ENDS THE TURN
+ *  and the card must warn the user so. Borrowing Claude's name for an OpenCode prompt would have made
+ *  those two indistinguishable on the wire and silently dropped that warning. So the four switches were
+ *  widened to name both spellings instead, and the wire keeps telling the truth about which tool asked. */
+export const OPENCODE_QUESTION_TOOL = "question";
+
+/** Tools whose decision is an ANSWER (an option the user picked) rather than an allow/deny — the ones
+ *  whose phone answer is injected as tool input and whose bare allow must therefore be RELEASED, not
+ *  emitted (see THE RELEASE RULE in emitDecision).
+ *
+ *  Deliberately NARROWER than isQuestionTool: Codex's `request_user_input` is a question but has no
+ *  answer-injection channel on the hook surface, and folding it in here would change Codex behavior.
+ *  The two members are Claude's `AskUserQuestion` and OpenCode's `question`, whose payload shapes
+ *  ({question, options:[{label, description}]}) are field-for-field identical — which is why one
+ *  code path serves both. */
+function isAnswerTool(toolName: string): boolean {
+  return toolName === "AskUserQuestion" || toolName === OPENCODE_QUESTION_TOOL;
 }
 
 /** A concise, human-readable one-liner describing what the tool wants to do — shown on the phone's
@@ -559,7 +588,9 @@ export function buildPermissionSummary(toolName: string, toolInput: Record<strin
       return "Approve Claude's plan";
     // AskUserQuestion holds like any other tool now: the summary is the FIRST question's text (CC sends
     // 1–4; the phone's card leads with it), the option list rides separately in `permissionQuestions`.
-    case "AskUserQuestion": {
+    // OpenCode's `question` tool carries the identical {question, options:[{label,description}]}
+    // payload, so it takes the same arm rather than a copy of it.
+    case "AskUserQuestion": case OPENCODE_QUESTION_TOOL: {
       const q = str(firstQuestionText(toolInput));
       return q ? truncate(q) : toolName;
     }
@@ -608,7 +639,7 @@ export function buildPermissionDetail(toolName: string, toolInput: Record<string
     // and a third full copy competed with the option list for the same 3072-char ceiling, which is what
     // pushed real frames over the worker's cap. CONTRACT the phone must honor: for a question card,
     // render the prompt from `permissionQuestions`, never from `permissionDetail`.
-    case "AskUserQuestion": return "";
+    case "AskUserQuestion": case OPENCODE_QUESTION_TOOL: return "";
     default: return "";
   }
 }
@@ -852,7 +883,7 @@ function emitDecision(
   emit: (line: string) => void,
   trace: (event: object) => void,
 ): DecisionOutcome {
-  const isQuestion = toolName === "AskUserQuestion";
+  const isQuestion = isAnswerTool(toolName);
   switch (answer.decision) {
     case "allow":
       if (isQuestion) { trace({ event: "release", reason: "bare-allow-on-question" }); return "released"; }

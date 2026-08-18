@@ -30,6 +30,8 @@ export interface OcFrame {
   detail?: string;
   title?: string;
   model?: string;
+  /** The session's todo list rendered as markdown, for the blob's `plan` key. */
+  plan?: string;
   /** Epoch MS — the session's start, matching the envelope's `startedAt` unit. */
   startedAt: number;
   /** Epoch SECONDS — the current turn's anchor, matching the blob's `turnStartedAt` unit. */
@@ -45,6 +47,8 @@ export interface OcSessionState {
   turnStartedAt?: number;
   /** The last `session.status`-derived frame we planned, for the identical-frame skip. */
   lastStatusFrame?: string;
+  /** The last `todo.updated` list, already rendered to markdown. */
+  plan?: string;
 }
 
 export interface OcState {
@@ -64,6 +68,40 @@ export function newOcState(): OcState {
  *  the first ~10s of every session and leave it there forever for a session that never gets a title. */
 export function isDefaultOcTitle(title: string): boolean {
   return /^(New|Child) session - /.test(title);
+}
+
+/** Per-item content cap. Measured over 99 real historical lists (`opencode.db`): median 4 items, max
+ *  11, longest single `content` 117 chars, and the whole compact-JSON list maxed at 972 chars — so this
+ *  never fires in practice. It is here so ONE pathological item cannot eat the entire 1800-char plan
+ *  budget: `appendFittedPlan` truncates the TAIL, so an unbounded first line would hide every item
+ *  after it rather than the list simply ending early. */
+const TODO_CONTENT_MAX_CHARS = 120;
+
+/** Render a `todo.updated` list as the markdown checklist the phone's read-only plan reader already
+ *  knows how to draw. `todo.updated` ALWAYS carries the complete list (OpenCode's `Todo.update` deletes
+ *  every row for the session and re-inserts the array), so this is a whole-list render, never a merge —
+ *  there is no id field to merge on, identity is array position and nothing more.
+ *
+ *  Status → mark: `completed` ticks, `in_progress` is bolded (the documented invariant is exactly one),
+ *  `cancelled` is struck through, `pending` is a plain empty box. `priority` is deliberately NOT drawn:
+ *  the array is already in the model's authored order, and a second ranking next to it is noise.
+ *  Returns undefined for an empty/absent list so the blob simply omits `plan`. */
+export function ocTodoMarkdown(todos: unknown): string | undefined {
+  if (!Array.isArray(todos) || todos.length === 0) return undefined;
+  const lines: string[] = [];
+  for (const raw of todos) {
+    const todo = asRecord(raw);
+    const content = asString(todo?.content);
+    if (!content) continue;
+    const text = Array.from(content).slice(0, TODO_CONTENT_MAX_CHARS).join("");
+    switch (todo?.status) {
+      case "completed": lines.push(`- [x] ${text}`); break;
+      case "in_progress": lines.push(`- [ ] **${text}**`); break;
+      case "cancelled": lines.push(`- [ ] ~~${text}~~`); break;
+      default: lines.push(`- [ ] ${text}`); break; // `pending`, and any future status we don't know
+    }
+  }
+  return lines.length > 0 ? lines.join("\n") : undefined;
 }
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
@@ -107,6 +145,11 @@ function statusType(status: unknown): string | undefined {
  *  | `session.deleted`              | end                                                      |
  *  | `session.updated`              | (title only, no frame)                                   |
  *  | `message.updated` (assistant)  | (model only, no frame)                                   |
+ *  | `todo.updated`                 | update / working, `plan` = the whole list as markdown     |
+ *
+ *  The approval channels (`permission.asked` / `question.asked`) are DELIBERATELY absent: they are not
+ *  session-lifecycle frames at all — they open a blocking hold that POSTs its own decision frame on a
+ *  different route entirely. See approvals.ts.
  */
 export function reduceOcEvent(state: OcState, event: unknown, now: number = Date.now()): OcFrame | null {
   const e = asRecord(event);
@@ -161,12 +204,26 @@ export function reduceOcEvent(state: OcState, event: unknown, now: number = Date
       const planned = frame(sessionId, live, "update", "working", now, detail);
       // The identical-frame skip. `session.status {busy}` fires several times per turn with the exact
       // same payload; re-POSTing it costs a round trip and a re-seal for a frame the phone already
-      // shows. The key spans everything that can change the RENDERED frame (title/model included), so
-      // a title landing mid-turn still gets through on the very next busy.
-      const key = JSON.stringify([planned.status, planned.detail, planned.title, planned.model]);
+      // shows. The key spans everything that can change the RENDERED frame (title/model/todos included),
+      // so a title or a todo tick landing mid-turn still gets through on the very next busy.
+      const key = JSON.stringify([planned.status, planned.detail, planned.title, planned.model, planned.plan]);
       if (live.lastStatusFrame === key) return null;
       live.lastStatusFrame = key;
       return planned;
+    }
+
+    // AMBIENT STATE, NOT A PROMPT. A todo list is what the agent is working through, so it rides the
+    // ordinary working frame — never `needsAttention`, never an `attentionKind`. The list lands in the
+    // blob's `plan` key, which is what makes the phone's existing read-only plan reader light up with
+    // no per-agent routing (`showsIslandPlanLink` / `CCPlanLinkKind.forSession` key on data, not agent).
+    // A SUBAGENT's todos are dropped by the child filter above — they arrive under the child's own
+    // sessionID (the event carries no parentID), so they can never clobber the root row.
+    case "todo.updated": {
+      if (!entry) return null; // a session we never saw start — nothing to hang the list off
+      const plan = ocTodoMarkdown(properties.todos);
+      if (plan === entry.plan) return null; // the same list twice — the phone already shows it
+      entry.plan = plan;
+      return frame(sessionId, entry, "update", "working", now);
     }
 
     case "session.idle": {
@@ -196,6 +253,19 @@ export function ocEndFrames(state: OcState, now: number = Date.now()): OcFrame[]
   return frames;
 }
 
+/** The plain needs-attention frame for a session that is blocked on the user but whose prompt is NOT
+ *  being held on the phone — the local `no-hold` escape hatch. It is the exact shape the Claude/Codex
+ *  hooks' `delegate` produces (runHook's PermissionRequest branch: update / prio 1 / needsAttention),
+ *  so a paused-approvals OpenCode row looks the same as a paused-approvals Claude one. Null for a
+ *  session we never saw start. */
+export function ocAttentionFrame(
+  state: OcState, sessionId: string, detail: string | undefined, now: number = Date.now(),
+): OcFrame | null {
+  const entry = state.sessions.get(sessionId);
+  if (!entry || state.children.has(sessionId)) return null;
+  return frame(sessionId, entry, "update", "needsAttention", now, detail, 1);
+}
+
 /** Adopt a session first seen mid-flight (the plugin loaded into a server that already had sessions,
  *  or `session.created` predated us). Its first frame is an `update`, not a `start`. */
 function adopt(state: OcState, sessionId: string, now: number): OcSessionState {
@@ -211,6 +281,7 @@ function applyTitle(entry: OcSessionState, info: Record<string, unknown> | undef
 
 function frame(
   sessionId: string, entry: OcSessionState, op: CCOp, status: CCStatus, now: number, detail?: string,
+  prio: 0 | 1 = 0,
 ): OcFrame {
   // The turn anchor (epoch SECONDS, the blob's unit) is stamped on the EDGE into working, so the
   // island's turn clock counts this turn and not the session. A session sitting idle for an hour and
@@ -222,11 +293,12 @@ function frame(
   return {
     sessionId,
     op,
-    prio: 0,
+    prio,
     status,
     ...(detail ? { detail } : {}),
     ...(entry.title ? { title: entry.title } : {}),
     ...(entry.model ? { model: entry.model } : {}),
+    ...(entry.plan ? { plan: entry.plan } : {}),
     startedAt: entry.startedAt,
     ...(status === "working" && entry.turnStartedAt !== undefined ? { turnStartedAt: entry.turnStartedAt } : {}),
   };

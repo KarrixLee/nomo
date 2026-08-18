@@ -23,10 +23,15 @@ import { accessSync, constants, readFileSync } from "node:fs";
 import { hostname } from "node:os";
 import { buildEnvelope, markDoneDelivered, trackSession } from "../core/hook";
 import {
-  CC_DIR, Config, ensureWatchdog, folderIdentity, FolderIdentity, loadConfig, SessionOrigin,
-  WATCHDOG_PATH,
+  CC_DIR, Config, ensureWatchdog, folderIdentity, FolderIdentity, fullTextForRecord, loadConfig,
+  postFullText, SessionOrigin, WATCHDOG_PATH,
 } from "../core/shared";
-import { newOcState, ocEndFrames, OcFrame, OcState, postOcEvent, reduceOcEvent } from "./state";
+import {
+  ocDecisionRequest, OcDecisionRequest, ocResolvedRequestId, ocResolveOnRelay, runOcApproval,
+} from "./approvals";
+import {
+  newOcState, ocAttentionFrame, ocEndFrames, OcFrame, OcState, postOcEvent, reduceOcEvent,
+} from "./state";
 
 /** The verified-live shape of OpenCode's `PluginInput` (1.18.15). Declared structurally rather than
  *  imported from `@opencode-ai/plugin`, which is not a dependency of this repo (the plugin ships as a
@@ -35,6 +40,9 @@ import { newOcState, ocEndFrames, OcFrame, OcState, postOcEvent, reduceOcEvent }
 interface OpenCodePluginInput {
   directory?: string;
   worktree?: string;
+  /** A URL OBJECT ending in "/" (e.g. `http://127.0.0.1:4396/`) — this server's own origin, and the
+   *  only way to reach the permission/question reply routes: the typed `client` has no namespace for
+   *  either (verified live). */
   serverUrl?: unknown;
 }
 
@@ -91,37 +99,39 @@ interface OcContext {
  *  the watchdog reaps this row within ~5s of that process dying. */
 async function send(ctx: OcContext, frame: OcFrame): Promise<void> {
   const now = Date.now();
-  // buildBlob derives `detail` from a hook payload's tool fields, and this path has no hook payload.
-  // A `retry` message is exactly what `detail` is for (the island's sub-status line), so we hand
-  // buildBlob the one input shape that yields free-text detail rather than duplicating the pinned
-  // blob key order here — two producers of one blob shape drifting is a bug this repo has shipped
-  // before. ponytail: a `detailOverride` seam on buildBlob would retire the disguise; not worth
-  // touching a file three other agents are editing.
-  const input: Record<string, unknown> = frame.detail
-    ? {
-      session_id: frame.sessionId,
-      cwd: ctx.folder.cwd,
-      hook_event_name: "PreToolUse",
-      tool_name: "request_user_input",
-      tool_input: { questions: [{ question: frame.detail }] },
-    }
-    : { session_id: frame.sessionId, cwd: ctx.folder.cwd };
+  // There is no hook payload on this path — the frame IS the payload — so the input carries only what
+  // buildBlob genuinely needs from it (the session id and the cwd the folder identity is pinned to) and
+  // the free-text sub-status rides the `detailOverride` seam instead of a hook shape reverse-engineered
+  // to produce it.
+  const input: Record<string, unknown> = { session_id: frame.sessionId, cwd: ctx.folder.cwd };
+  /** The `plan` the blob actually ended up carrying — appendFittedPlan may truncate a long todo list
+   *  (or drop it) to stay inside the worker's 3072-char sealed ceiling. Captured from the tee so the
+   *  overflow can be parked for the LAN `read` op and the remote /v1/cc/full pull. */
+  let fittedPlan: string | undefined;
   const envelope = await buildEnvelope(
     input, ctx.machine, now, frame.title, ctx.config.e2eKey, false, "opencode",
     frame.startedAt, frame.turnStartedAt, ctx.folder, frame.model,
     { op: frame.op, prio: frame.prio, status: frame.status },
+    undefined, frame.plan, undefined, (plain) => { fittedPlan = plain.plan; }, frame.detail,
   );
   if (!envelope) return;
+  const planFull = fullTextForRecord(frame.plan, fittedPlan);
+  // Started BEFORE the event POST and awaited after, exactly like the permission hold's own upload: a
+  // parked list must never sit in front of the frame that puts the row on the phone. Undefined content
+  // (the overwhelmingly common case — a real todo list maxes at ~972 chars against an 1800 budget) is a
+  // no-op inside postFullText: no upload, no KV write.
+  const fullUpload = postFullText(ctx.config, frame.sessionId, "plan", planFull);
   await trackSession(
     frame.sessionId, frame.op, frame.prio, frame.status, envelope.blob as string | undefined,
     ctx.machine, ctx.folder,
     "", // no transcript: OpenCode's history is SQLite, and every reader guards an empty path
     "opencode", frame.startedAt, frame.turnStartedAt, undefined, frame.title, ctx.config.pairingId,
-    frame.model, false, process.pid, ctx.origin,
+    frame.model, false, process.pid, ctx.origin, false, undefined, undefined, planFull,
   );
   ensureWatchdog({ spawnWatchdog });
   const delivered = await postOcEvent(ctx.config, envelope);
   if (delivered && frame.op === "done") await markDoneDelivered(frame.sessionId);
+  await fullUpload;
 }
 
 const server = async (input: OpenCodePluginInput): Promise<OpenCodeHooks> => {
@@ -153,15 +163,72 @@ const server = async (input: OpenCodePluginInput): Promise<OpenCodeHooks> => {
       return chain;
     };
 
+    // The reply origin. Without it a hold could put an Allow button on the phone that this process has
+    // no route to honor, which is strictly worse than not holding at all — so no serverUrl, no
+    // approvals, and the TUI dialog stays the only way to answer.
+    const serverUrl = input?.serverUrl === undefined || input.serverUrl === null
+      ? undefined
+      : String(input.serverUrl);
+
+    /** OpenCode request id (`per_…` / `que_…`) → the decision id its hold is polling the worker for.
+     *  The map IS the hold registry: an entry means "a hold for this request is still running", which
+     *  is what makes the reject/always cascades resolvable (see ocResolveOnRelay). */
+    const holds = new Map<string, string>();
+
+    /** Start ONE hold, detached. Deliberately NOT on `enqueue`: a hold is unbounded by design (the
+     *  phone owns the dialog), and putting it on the send chain would freeze every session frame on
+     *  this server behind one unanswered prompt. */
+    const hold = (request: OcDecisionRequest): void => {
+      // A subagent's prompt is not human-facing here — its session is filtered out of the phone's
+      // rows entirely, so a card for it would be answerable against a row the user cannot see. Same
+      // policy as the Claude hook's `agent_id` subagent pass-through.
+      if (!serverUrl || ctx.state.children.has(request.sessionID) || holds.has(request.id)) return;
+      const requestId = crypto.randomUUID();
+      holds.set(request.id, requestId);
+      void runOcApproval(request, {
+        config: ctx.config,
+        serverUrl,
+        cwd: ctx.folder.cwd,
+        requestId,
+        // The local no-hold escape hatch: report the session as blocked on the user and let OpenCode's
+        // own dialog take it, exactly like the hooks' fire-and-forget delegate.
+        delegate: async () => {
+          const attention = ocAttentionFrame(ctx.state, request.sessionID, undefined);
+          if (attention) await enqueue(() => send(ctx, attention));
+        },
+      }).catch(() => { /* runOcApproval swallows everything; this is the belt */ })
+        .finally(() => { holds.delete(request.id); });
+    };
+
+    /** OpenCode resolved a request without us — the user answered at the Mac, or a reject/always
+     *  cascade took it down with a sibling. Retire the phone's card so it cannot be left hanging. */
+    const retire = (opencodeId: string): void => {
+      const requestId = holds.get(opencodeId);
+      if (requestId === undefined) return;
+      holds.delete(opencodeId);
+      void ocResolveOnRelay(ctx.config, requestId);
+    };
+
     return {
       event: async ({ event }) => {
         try {
+          // The approval channels first, and they are EXCLUSIVE of the lifecycle reducer: neither
+          // `permission.asked` nor `question.asked` is a session frame — each opens a hold that POSTs
+          // its own decisionPending frame on a different route entirely.
+          const request = ocDecisionRequest(event);
+          if (request) { hold(request); return; }
+          const resolved = ocResolvedRequestId(event);
+          if (resolved) { retire(resolved); return; }
           const frame = reduceOcEvent(ctx.state, event);
           if (frame) await enqueue(() => send(ctx, frame));
         } catch { /* one malformed event must never break the firehose */ }
       },
       dispose: async () => {
         try {
+          // Every pending question/permission is auto-rejected by OpenCode's own service finalizer at
+          // shutdown, and it publishes no event for that — so the cards have to be retired from here or
+          // they outlive the server that could have answered them.
+          for (const opencodeId of [...holds.keys()]) retire(opencodeId);
           const frames = ocEndFrames(ctx.state);
           await enqueue(async () => { for (const frame of frames) await send(ctx, frame); });
         } catch { /* teardown is best-effort; the watchdog's pid sweep is the backstop */ }

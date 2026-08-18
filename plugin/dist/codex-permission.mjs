@@ -109,7 +109,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "2.2.0";
+var PLUGIN_VERSION = "2.3.0";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -2915,12 +2915,12 @@ function transcriptStartMs(prefix) {
   }
   return;
 }
-function buildBlob(input, machine, title, plan, agent = "claude", turnStartedAt, pinnedFolder, model, at, proposedPlan, dbgOverride) {
+function buildBlob(input, machine, title, plan, agent = "claude", turnStartedAt, pinnedFolder, model, at, proposedPlan, dbgOverride, detailOverride) {
   const folder = folderIdentity(input.cwd, pinnedFolder);
   const { label, folderKey } = folder;
   const branch = sessionBranch(folder);
   const hookName = typeof input.hook_event_name === "string" ? input.hook_event_name : "";
-  const detail = detailForHook(hookName, typeof input.tool_name === "string" ? input.tool_name : undefined, input.tool_input);
+  const detail = detailOverride ?? detailForHook(hookName, typeof input.tool_name === "string" ? input.tool_name : undefined, input.tool_input);
   const base = {
     status: plan.status,
     title: title ?? "",
@@ -2941,7 +2941,7 @@ function buildBlob(input, machine, title, plan, agent = "claude", turnStartedAt,
   }) : undefined;
   return appendFittedPlanAndDebug(base, proposedPlan, dbg);
 }
-async function buildEnvelope(input, machine, now, title, e2eKey, sentDone, agent = "claude", startedAt, turnStartedAt, pinnedFolder, model, planOverride, attentionKindOverride, proposedPlan, dbg, onBlobPlaintext) {
+async function buildEnvelope(input, machine, now, title, e2eKey, sentDone, agent = "claude", startedAt, turnStartedAt, pinnedFolder, model, planOverride, attentionKindOverride, proposedPlan, dbg, onBlobPlaintext, detailOverride) {
   if (typeof input !== "object" || input === null)
     return null;
   const i = input;
@@ -2955,7 +2955,7 @@ async function buildEnvelope(input, machine, now, title, e2eKey, sentDone, agent
   if (typeof startedAt === "number" && Number.isFinite(startedAt))
     base.startedAt = startedAt;
   const at = Math.floor(now / 1000);
-  const plaintext = buildBlob(i, machine, title, plan, agent, turnStartedAt, pinnedFolder, model, at, proposedPlan, dbg);
+  const plaintext = buildBlob(i, machine, title, plan, agent, turnStartedAt, pinnedFolder, model, at, proposedPlan, dbg, detailOverride);
   try {
     onBlobPlaintext?.(plaintext);
   } catch {}
@@ -3638,7 +3638,7 @@ function allowAlwaysLine(agent, toolName, toolInput, suggestions) {
   return decisionLine(agent, { hookEventName: "PermissionRequest", decision });
 }
 function answerLine(agent, toolName, toolInput, answers) {
-  if (toolName !== "AskUserQuestion" || !Array.isArray(answers))
+  if (!isAnswerTool(toolName) || !Array.isArray(answers))
     return;
   const questions = usableQuestions(toolInput);
   if (questions.length === 0)
@@ -3739,7 +3739,11 @@ function defaultTrace() {
   return trace;
 }
 function isQuestionTool(toolName) {
-  return toolName === "AskUserQuestion" || toolName === "request_user_input";
+  return toolName === "AskUserQuestion" || toolName === "request_user_input" || toolName === OPENCODE_QUESTION_TOOL;
+}
+var OPENCODE_QUESTION_TOOL = "question";
+function isAnswerTool(toolName) {
+  return toolName === "AskUserQuestion" || toolName === OPENCODE_QUESTION_TOOL;
 }
 function buildPermissionSummary(toolName, toolInput) {
   const str = (v) => typeof v === "string" && v.length > 0 ? v : undefined;
@@ -3779,7 +3783,8 @@ function buildPermissionSummary(toolName, toolInput) {
     }
     case "ExitPlanMode":
       return "Approve Claude's plan";
-    case "AskUserQuestion": {
+    case "AskUserQuestion":
+    case OPENCODE_QUESTION_TOOL: {
       const q = str(firstQuestionText(toolInput));
       return q ? truncate(q) : toolName;
     }
@@ -3833,6 +3838,7 @@ function buildPermissionDetail(toolName, toolInput) {
       return p ?? "";
     }
     case "AskUserQuestion":
+    case OPENCODE_QUESTION_TOOL:
       return "";
     default:
       return "";
@@ -3938,7 +3944,7 @@ function permissionFrame(base, detail, omitted, questions = []) {
   };
 }
 function emitDecision(agent, answer, toolName, toolInput, suggestions, emit, trace) {
-  const isQuestion = toolName === "AskUserQuestion";
+  const isQuestion = isAnswerTool(toolName);
   switch (answer.decision) {
     case "allow":
       if (isQuestion) {

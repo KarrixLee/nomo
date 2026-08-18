@@ -1,6 +1,8 @@
 import { describe, expect, test } from "bun:test";
+import { PLAN_BLOB_TEXT_MAX_CHARS } from "../core/shared";
 import {
-  isDefaultOcTitle, newOcState, ocEndFrames, ocModelFromMessage, reduceOcEvent,
+  isDefaultOcTitle, newOcState, ocAttentionFrame, ocEndFrames, ocModelFromMessage, ocTodoMarkdown,
+  reduceOcEvent,
 } from "./state";
 import type { OcState } from "./state";
 
@@ -268,5 +270,121 @@ describe("mid-flight adoption", () => {
   test("an idle for a session we never saw sends nothing", () => {
     const state = newOcState();
     expect(reduceOcEvent(state, idle(ROOT), 5_000)).toBeNull();
+  });
+});
+
+// -------------------------------------------------------------------------------------------------
+// Todos (phase 4). The fixtures are the LIVE `todo.updated` payloads from the questions/todos probe.
+// -------------------------------------------------------------------------------------------------
+
+const todos = (sessionID: string, list: unknown[]) => ({
+  id: "evt_016b5d99e001NyLbt3FJNHAXjn",
+  type: "todo.updated",
+  properties: { sessionID, todos: list },
+});
+
+const THREE = [
+  { content: "Create a.txt with one letter", status: "pending", priority: "high" },
+  { content: "Create b.txt with one letter", status: "pending", priority: "high" },
+  { content: "Create c.txt with one letter", status: "pending", priority: "high" },
+];
+
+describe("todos", () => {
+  test("todo.updated is an ambient working update whose list rides the blob's plan key", () => {
+    const state = startedRoot();
+    const frame = reduceOcEvent(state, todos(ROOT, THREE), 10_000);
+    expect(frame).toMatchObject({ sessionId: ROOT, op: "update", prio: 0, status: "working" });
+    // AMBIENT, NOT A PROMPT: never needsAttention, never prio 1.
+    expect(frame?.status).not.toBe("needsAttention");
+    expect(frame?.plan).toBe(
+      "- [ ] Create a.txt with one letter\n- [ ] Create b.txt with one letter\n- [ ] Create c.txt with one letter",
+    );
+  });
+
+  test("every status maps to its own mark, in the model's authored order", () => {
+    expect(ocTodoMarkdown([
+      { content: "done", status: "completed", priority: "high" },
+      { content: "now", status: "in_progress", priority: "medium" },
+      { content: "later", status: "pending", priority: "low" },
+      { content: "dropped", status: "cancelled", priority: "low" },
+      { content: "future", status: "some_new_status", priority: "low" },
+    ])).toBe("- [x] done\n- [ ] **now**\n- [ ] later\n- [ ] ~~dropped~~\n- [ ] future");
+  });
+
+  test("an empty or contentless list produces no plan at all", () => {
+    expect(ocTodoMarkdown([])).toBeUndefined();
+    expect(ocTodoMarkdown(undefined)).toBeUndefined();
+    expect(ocTodoMarkdown([{ status: "pending" }])).toBeUndefined();
+  });
+
+  test("one pathological item cannot eat the whole plan budget", () => {
+    const line = ocTodoMarkdown([{ content: "x".repeat(5_000), status: "pending", priority: "low" }]);
+    expect(line).toHaveLength("- [ ] ".length + 120);
+  });
+
+  test("the list is REPLACED wholesale — todo.updated is never a delta", () => {
+    const state = startedRoot();
+    reduceOcEvent(state, todos(ROOT, THREE), 10_000);
+    const frame = reduceOcEvent(state, todos(ROOT, [
+      { content: "Create a.txt with one letter", status: "completed", priority: "high" },
+    ]), 11_000);
+    expect(frame?.plan).toBe("- [x] Create a.txt with one letter");
+  });
+
+  test("an identical list is not re-sent, and the list survives onto later frames", () => {
+    const state = startedRoot();
+    expect(reduceOcEvent(state, todos(ROOT, THREE), 10_000)).not.toBeNull();
+    expect(reduceOcEvent(state, todos(ROOT, THREE), 11_000)).toBeNull();
+    // …and the next lifecycle frame still carries it (the phone's plan reader must not blink).
+    expect(reduceOcEvent(state, idle(ROOT), 12_000)?.plan).toContain("- [ ] Create a.txt");
+  });
+
+  test("a changed list breaks the session.status dedupe", () => {
+    const state = startedRoot();
+    expect(reduceOcEvent(state, status(ROOT, { type: "busy" }), 10_000)).not.toBeNull();
+    expect(reduceOcEvent(state, status(ROOT, { type: "busy" }), 10_100)).toBeNull();
+    reduceOcEvent(state, todos(ROOT, THREE), 10_200);
+    expect(reduceOcEvent(state, status(ROOT, { type: "busy" }), 10_300)).not.toBeNull();
+  });
+
+  test("a SUBAGENT's todos never clobber the root row", () => {
+    const state = startedRoot();
+    reduceOcEvent(state, created(CHILD, "Child session - x", { parentID: ROOT }), 1_000);
+    reduceOcEvent(state, todos(ROOT, THREE), 10_000);
+    expect(reduceOcEvent(state, todos(CHILD, [
+      { content: "subagent work", status: "in_progress", priority: "high" },
+    ]), 10_100)).toBeNull();
+    expect(reduceOcEvent(state, status(ROOT, { type: "busy" }), 10_200)?.plan)
+      .toContain("Create a.txt");
+  });
+
+  test("todos for a session we never saw start are dropped", () => {
+    expect(reduceOcEvent(newOcState(), todos(ROOT, THREE), 10_000)).toBeNull();
+  });
+
+  test("a realistic list fits the 1800-char plan budget with room to spare", () => {
+    // The p90 real list: 6 items at the p90 content length.
+    const plan = ocTodoMarkdown(Array.from({ length: 6 }, (_, i) => ({
+      content: `Step ${i + 1}: ${"refactor the session state reducer ".repeat(2)}`,
+      status: i === 0 ? "completed" : i === 1 ? "in_progress" : "pending",
+      priority: "medium",
+    })))!;
+    expect(plan.length).toBeLessThan(PLAN_BLOB_TEXT_MAX_CHARS);
+  });
+});
+
+describe("the no-hold attention frame", () => {
+  test("is the hooks' own update/prio-1/needsAttention shape", () => {
+    const state = startedRoot();
+    expect(ocAttentionFrame(state, ROOT, undefined, 20_000)).toMatchObject({
+      sessionId: ROOT, op: "update", prio: 1, status: "needsAttention",
+    });
+  });
+
+  test("is null for an unknown or child session", () => {
+    const state = startedRoot();
+    reduceOcEvent(state, created(CHILD, "Child session - x", { parentID: ROOT }), 1_000);
+    expect(ocAttentionFrame(state, CHILD, undefined, 20_000)).toBeNull();
+    expect(ocAttentionFrame(state, "ses_nope", undefined, 20_000)).toBeNull();
   });
 });
