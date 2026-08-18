@@ -205,7 +205,7 @@ export async function runNotify(raw: string, deferMs = notifyDeferMs(), sleep: (
         "x-cc-pairing": config.pairingId,
         "x-cc-auth": config.pcSecret,
         "x-cc-version": PLUGIN_VERSION,
-        // This computer's local remote-approvals pause (`nomo-cc permission off`) — same plaintext
+        // This computer's local remote-approvals pause (`$nomo-approvals off`) — same plaintext
         // report every /cc/event POSTer sends; the worker literal-matches "on"/"off".
         "x-cc-approvals": await localApprovalsState(),
       },

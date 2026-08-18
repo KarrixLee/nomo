@@ -15,6 +15,27 @@ const ITERM_ARGV = "/Applications/iTerm.app/Contents/MacOS/iTerm2";
 const GHOSTTY_ARGV = "/Applications/Ghostty.app/Contents/MacOS/ghostty";
 const HERDR_SERVER_ARGV = "/opt/homebrew/bin/herdr server";
 
+// The Claude DESKTOP app's three-process shape, captured verbatim off this machine (Claude 1.30096.1,
+// claude-code 2.1.229) and trimmed only in the flag tail. The session's own `claude` is the record's
+// pid; note its bundled path is a LOWERCASE `claude.app`, which the desktop entry must not match, or
+// the owner would resolve to the session's own process instead of to the app.
+const CLAUDE_DESKTOP_SESSION_ARGV =
+  "/Users/karrix/Library/Application Support/Claude/claude-code/2.1.229/claude.app/Contents/MacOS/claude"
+  + " --output-format stream-json --verbose --input-format stream-json --permission-prompt-tool stdio"
+  + " --resume=8fc9dfd6-adde-4da4-9afb-e209b4c1947e"
+  + " --plugin-dir /Users/karrix/.claude/plugins/cache/thedotmack/claude-mem/13.12.4";
+const CLAUDE_DESKTOP_LAUNCHER_ARGV =
+  "/Applications/Claude.app/Contents/Helpers/disclaimer " + CLAUDE_DESKTOP_SESSION_ARGV;
+const CLAUDE_DESKTOP_APP_ARGV = "/Applications/Claude.app/Contents/MacOS/Claude";
+
+// The Codex DESKTOP app, captured verbatim off this machine (ChatGPT.app 151.0.7922.137, codex
+// 0.147.0). It ships as ChatGPT.app and its Electron main is the process codexLocateTuiPid hands over;
+// its bundled app-server resolves to the same owner by plain ancestry when a session does run under it.
+const CODEX_DESKTOP_APP_ARGV = "/Applications/ChatGPT.app/Contents/MacOS/ChatGPT";
+const CODEX_DESKTOP_SERVER_ARGV =
+  "/Applications/ChatGPT.app/Contents/Resources/codex -c features.code_mode_host=true app-server"
+  + " --analytics-default-enabled";
+
 const REAL_HERDR_PANE_LIST = JSON.stringify({
   result: {
     panes: [
@@ -58,6 +79,7 @@ function herdrRecord(over: Partial<SessionRecord> = {}): SessionRecord {
 function herdrDeps(over: {
   agent?: "claude" | "codex";
   record?: SessionRecord;
+  sessionId?: string;
   paneList?: string;
   focusResult?: { stdout: string; exitCode?: number };
   ps?: string;
@@ -77,7 +99,13 @@ function herdrDeps(over: {
       ttyOf: async () => "ttys001",
       ancestorsOf: (pid) => pid === 500 ? [501, 502, 503] : [101, 102, 1],
       commandOf: (pid) => commands[pid],
-      context: { agent: over.agent ?? "claude", record: over.record ?? herdrRecord() },
+      context: {
+        agent: over.agent ?? "claude",
+        record: over.record ?? herdrRecord(),
+        // The default is deliberately an id NO pane in REAL_HERDR_PANE_LIST carries, so every
+        // pre-existing case still exercises the title/cwd path byte-for-byte.
+        sessionId: over.sessionId ?? "no-such-session",
+      },
       execFile: async (file, args) => {
         calls.push({ file, args });
         if (file === "herdr" && args[0] === "pane") return { stdout: over.paneList ?? REAL_HERDR_PANE_LIST };
@@ -186,6 +214,47 @@ describe("owningTerminalApp", () => {
   test("a throwing ancestor walk degrades to inspecting the pid itself", () => {
     expect(owningTerminalApp(9, () => { throw new Error("ps died"); }, () => GHOSTTY_ARGV)?.id).toBe("ghostty");
   });
+
+  test("a Claude DESKTOP conversation window resolves to the desktop app", () => {
+    const argv: Record<number, string> = {
+      27773: CLAUDE_DESKTOP_SESSION_ARGV,
+      27772: CLAUDE_DESKTOP_LAUNCHER_ARGV,
+      52631: CLAUDE_DESKTOP_APP_ARGV,
+      1: "/sbin/launchd",
+    };
+    const app = owningTerminalApp(27773, () => [27772, 52631, 1], (p) => argv[p]);
+    expect(app?.id).toBe("claude-desktop");
+    expect(app?.bundleId).toBe("com.anthropic.claudefordesktop");
+  });
+
+  test("the session's OWN bundled binary is not the app (the lowercase claude.app must not match)", () => {
+    expect(owningTerminalApp(27773, () => [], () => CLAUDE_DESKTOP_SESSION_ARGV)).toBeUndefined();
+  });
+
+  test("a desktop app installed outside /Applications resolves identically (no location pin)", () => {
+    const relocated = "/Users/karrix/Applications/Claude.app/Contents/MacOS/Claude";
+    expect(owningTerminalApp(1, () => [2], (p) => (p === 2 ? relocated : "claude"))?.id).toBe("claude-desktop");
+  });
+
+  test("the Codex DESKTOP app resolves from its own GUI process and from its bundled app-server", () => {
+    const main = owningTerminalApp(83329, () => [1], () => CODEX_DESKTOP_APP_ARGV);
+    expect(main?.id).toBe("codex-desktop");
+    expect(main?.bundleId).toBe("com.openai.codex");
+    expect(owningTerminalApp(83396, () => [83329], (p) => (
+      p === 83396 ? CODEX_DESKTOP_SERVER_ARGV : CODEX_DESKTOP_APP_ARGV
+    ))?.id).toBe("codex-desktop");
+  });
+
+  test("a codex TUI in a real terminal is never stolen by the desktop app", () => {
+    const argv: Record<number, string> = { 1: "codex", 2: "-zsh", 3: GHOSTTY_ARGV, 4: CODEX_DESKTOP_APP_ARGV };
+    expect(owningTerminalApp(1, () => [2, 3, 4], (p) => argv[p])?.id).toBe("ghostty");
+  });
+
+  test("a CLI session in a terminal launched from the desktop app still resolves to the terminal", () => {
+    // The NEAREST ancestor wins, so an app further up the chain can never steal a real emulator.
+    const argv: Record<number, string> = { 1: "claude", 2: "-zsh", 3: GHOSTTY_ARGV, 4: CLAUDE_DESKTOP_APP_ARGV };
+    expect(owningTerminalApp(1, () => [2, 3, 4], (p) => argv[p])?.id).toBe("ghostty");
+  });
 });
 
 describe("focusTerminalForPid", () => {
@@ -196,6 +265,50 @@ describe("focusTerminalForPid", () => {
   test("a pid with no real controlling tty owns no window → no-tty", async () => {
     expect(await focusTerminalForPid(100, deps({ ttyOf: async () => "??" }))).toEqual({ ok: false, reason: "no-tty" });
     expect(await focusTerminalForPid(100, deps({ ttyOf: async () => undefined }))).toEqual({ ok: false, reason: "no-tty" });
+  });
+
+  // FIELD REGRESSION: "Open on Mac" was a silent no-op for every session started in the Claude desktop
+  // app. Its `claude` has no controlling tty, so the tty gate refused the pid before the owning app was
+  // ever consulted — the same shape as the 2026-08-02 herdr bug, in its second guise.
+  test("a tty-less Claude DESKTOP session activates the app instead of refusing on no-tty", async () => {
+    const scripts: string[] = [];
+    const result = await focusTerminalForPid(27773, deps({
+      ttyOf: async () => "??",
+      argvOf: {
+        27773: CLAUDE_DESKTOP_SESSION_ARGV, 27772: CLAUDE_DESKTOP_LAUNCHER_ARGV,
+        52631: CLAUDE_DESKTOP_APP_ARGV,
+      },
+      ancestorsOf: () => [27772, 52631],
+      osascript: async (s) => { scripts.push(s); return ""; },
+    }));
+    expect(result).toEqual({ ok: true, via: "app-activate" });
+    expect(scripts).toEqual([`tell application id "com.anthropic.claudefordesktop" to activate`]);
+  });
+
+  // FIELD REGRESSION (the same bug's THIRD shape): "Open on Mac" was a silent no-op for every session
+  // started in the Codex desktop app. The tty exemption used to name `claude-desktop` literally, so the
+  // Codex app — equally tty-less — was refused before its bundle id was ever reached.
+  test("a tty-less Codex DESKTOP session activates the app instead of refusing on no-tty", async () => {
+    const scripts: string[] = [];
+    const result = await focusTerminalForPid(83329, deps({
+      ttyOf: async () => "??",
+      argvOf: { 83329: CODEX_DESKTOP_APP_ARGV },
+      ancestorsOf: () => [],
+      osascript: async (s) => { scripts.push(s); return ""; },
+    }));
+    expect(result).toEqual({ ok: true, via: "app-activate" });
+    expect(scripts).toEqual([`tell application id "com.openai.codex" to activate`]);
+  });
+
+  test("the tty exemption is scoped to the desktop app — a tty-less Ghostty pid is still no-tty", async () => {
+    let calls = 0;
+    const result = await focusTerminalForPid(100, deps({
+      ttyOf: async () => "??",
+      argvOf: { 100: "claude", 200: GHOSTTY_ARGV },
+      osascript: async () => { calls++; return ""; },
+    }));
+    expect(result).toEqual({ ok: false, reason: "no-tty" });
+    expect(calls).toBe(0);
   });
 
   test("a Terminal.app-owned pid takes the exact tty→tab path", async () => {
@@ -379,6 +492,140 @@ describe("focusTerminalForPid through herdr", () => {
     const h = herdrDeps({ focusResult: { stdout: "failed", exitCode: 1 } });
     expect(await focusTerminalForPid(100, h.deps)).toEqual({ ok: false, reason: "herdr-cli-failed" });
     expect(h.calls).toHaveLength(2);
+    expect(h.calls[1]).toEqual({ file: "herdr", args: ["tab", "focus", "w2:t8"] });
+  });
+});
+
+describe("herdr correlation by agent_session id", () => {
+  // FIELD REGRESSION (2026-08-14): "Open on Mac" reported herdr-ambiguous for every Claude pane that
+  // still showed its DEFAULT title. Correlation was fuzzy-title-only, so a record titled "hi" could
+  // never match a pane titled "Claude Code" — while herdr was publishing the session's exact uuid on
+  // that very pane object. Shapes below are copied verbatim off `herdr pane list` on this machine.
+  const LIVE_SESSION = "abbf78fa-47d0-4bb4-bb97-e98981e20c60";
+  const OTHER_SESSION = "b275a98b-901e-48c8-aef2-fa92fd1bb977";
+
+  function claudePane(over: Record<string, unknown> = {}): Record<string, unknown> {
+    return {
+      agent: "claude",
+      agent_session: { agent: "claude", kind: "id", source: "herdr:claude", value: LIVE_SESSION },
+      agent_status: "idle", cwd: "/Users/karrix/api-status", tab_id: "w2:tR",
+      terminal_title: "✳ Claude Code", terminal_title_stripped: "Claude Code",
+      ...over,
+    };
+  }
+  const paneList = (...panes: Array<Record<string, unknown>>) =>
+    JSON.stringify({ id: "cli:pane:list", result: { panes, type: "pane_list" } });
+
+  test("THE FIELD FAILURE: a default-titled pane is reached by its session id", async () => {
+    const h = herdrDeps({
+      record: herdrRecord({ title: "hi" }), sessionId: LIVE_SESSION, paneList: paneList(claudePane()),
+    });
+    expect(await focusTerminalForPid(100, h.deps)).toEqual({ ok: true, via: "herdr", reason: "herdr-focused" });
+    expect(h.calls[1]).toEqual({ file: "herdr", args: ["tab", "focus", "w2:tR"] });
+  });
+
+  test("…and the SAME input is ambiguous without the id — this is what regressed", async () => {
+    // Identical to the case above but for the id the command names, which is the only thing the fix
+    // added. Title/cwd alone still cannot correlate "hi" to "Claude Code".
+    const h = herdrDeps({
+      record: herdrRecord({ title: "hi" }), sessionId: OTHER_SESSION, paneList: paneList(claudePane()),
+    });
+    expect(await focusTerminalForPid(100, h.deps)).toEqual({ ok: false, reason: "herdr-ambiguous" });
+    expect(h.calls).toEqual([{ file: "herdr", args: ["pane", "list"] }]);
+  });
+
+  test("an id match BEATS a title match on a different pane", async () => {
+    const h = herdrDeps({
+      record: herdrRecord({ title: "Some other session" }), sessionId: LIVE_SESSION,
+      paneList: paneList(
+        claudePane({ tab_id: "w2:tTitle", terminal_title_stripped: "Some other session",
+          agent_session: { agent: "claude", value: OTHER_SESSION } }),
+        claudePane(),
+      ),
+    });
+    expect(await focusTerminalForPid(100, h.deps)).toEqual({ ok: true, via: "herdr", reason: "herdr-focused" });
+    expect(h.calls[1]).toEqual({ file: "herdr", args: ["tab", "focus", "w2:tR"] });
+  });
+
+  test("an id match needs no agent_status tie-break", async () => {
+    const h = herdrDeps({
+      record: herdrRecord({ title: "hi" }), sessionId: LIVE_SESSION,
+      paneList: paneList(
+        claudePane({ agent_status: "idle" }),
+        claudePane({ tab_id: "w2:tW", agent_status: "working",
+          agent_session: { agent: "claude", value: OTHER_SESSION } }),
+      ),
+    });
+    expect(await focusTerminalForPid(100, h.deps)).toEqual({ ok: true, via: "herdr", reason: "herdr-focused" });
+    expect(h.calls[1]).toEqual({ file: "herdr", args: ["tab", "focus", "w2:tR"] });
+  });
+
+  test("with NO agent_session anywhere the title path is unchanged", async () => {
+    const h = herdrDeps({
+      sessionId: LIVE_SESSION,
+      paneList: paneList(
+        claudePane({ agent_session: undefined, tab_id: "w2:t8",
+          terminal_title_stripped: "Review and clean up test cases for NOM-42" }),
+        claudePane({ agent_session: undefined, tab_id: "w2:tR" }),
+      ),
+    });
+    expect(await focusTerminalForPid(100, h.deps)).toEqual({ ok: true, via: "herdr", reason: "herdr-focused" });
+    expect(h.calls[1]).toEqual({ file: "herdr", args: ["tab", "focus", "w2:t8"] });
+  });
+
+  test("a Codex pane carrying no agent_session still correlates by cwd", async () => {
+    // Exactly as sampled: claude panes publish an id, the codex pane does not.
+    const h = herdrDeps({
+      agent: "codex", record: herdrRecord({ agent: "codex", title: "unrelated" }),
+      sessionId: LIVE_SESSION,
+      paneList: paneList(
+        claudePane(),
+        { agent: "codex", agent_status: "idle", cwd: "/Users/karrix/api-status", tab_id: "w2:tX",
+          terminal_title_stripped: "api-status" },
+      ),
+    });
+    expect(await focusTerminalForPid(100, h.deps)).toEqual({ ok: true, via: "herdr", reason: "herdr-focused" });
+    expect(h.calls[1]).toEqual({ file: "herdr", args: ["tab", "focus", "w2:tX"] });
+  });
+
+  test("an id may never match across agents", async () => {
+    // A codex session whose uuid somehow collides with a claude pane's: the pane's own `agent`, and
+    // the id record's, both have to agree before the id is decisive.
+    const h = herdrDeps({
+      agent: "codex", record: herdrRecord({ agent: "codex", title: "unrelated" }),
+      sessionId: LIVE_SESSION, paneList: paneList(claudePane()),
+    });
+    expect(await focusTerminalForPid(100, h.deps)).toEqual({ ok: false, reason: "herdr-ambiguous" });
+    expect(h.calls).toEqual([{ file: "herdr", args: ["pane", "list"] }]);
+  });
+
+  test("a pane whose agent_session names ANOTHER agent is not an id match", async () => {
+    const h = herdrDeps({
+      record: herdrRecord({ title: "hi" }), sessionId: LIVE_SESSION,
+      paneList: paneList(claudePane({ agent_session: { agent: "grok", value: LIVE_SESSION } })),
+    });
+    expect(await focusTerminalForPid(100, h.deps)).toEqual({ ok: false, reason: "herdr-ambiguous" });
+  });
+
+  test("two panes claiming the SAME id are ambiguous, never a coin flip", async () => {
+    const h = herdrDeps({
+      record: herdrRecord({ title: "hi" }), sessionId: LIVE_SESSION,
+      paneList: paneList(claudePane(), claudePane({ tab_id: "w2:tS", agent_status: "working" })),
+    });
+    expect(await focusTerminalForPid(100, h.deps)).toEqual({ ok: false, reason: "herdr-ambiguous" });
+    expect(h.calls).toEqual([{ file: "herdr", args: ["pane", "list"] }]);
+  });
+
+  test("a malformed agent_session is simply 'no id', never a parse failure", async () => {
+    const h = herdrDeps({
+      sessionId: LIVE_SESSION,
+      paneList: paneList(
+        claudePane({ agent_session: "abbf78fa-47d0-4bb4-bb97-e98981e20c60", tab_id: "w2:t8",
+          terminal_title_stripped: "Review and clean up test cases for NOM-42" }),
+        claudePane({ agent_session: null }),
+      ),
+    });
+    expect(await focusTerminalForPid(100, h.deps)).toEqual({ ok: true, via: "herdr", reason: "herdr-focused" });
     expect(h.calls[1]).toEqual({ file: "herdr", args: ["tab", "focus", "w2:t8"] });
   });
 });

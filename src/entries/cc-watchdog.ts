@@ -966,7 +966,7 @@ export function watchdogEventHeaders(config: Config, approvals: string): Record<
     "x-cc-pairing": config.pairingId,
     "x-cc-auth": config.pcSecret,
     "x-cc-version": PLUGIN_VERSION,
-    // This computer's local remote-approvals pause (`nomo-cc permission off`) — same plaintext
+    // This computer's local remote-approvals pause (`/nomo-cc:approvals off`) — same plaintext
     // report every /cc/event POSTer sends; the worker literal-matches "on"/"off".
     "x-cc-approvals": approvals,
     // Only this POSTer drains the command queue (see the doc comment above).
@@ -1394,7 +1394,7 @@ export async function drainCommands(config: Config, deps: DrainCommandsDeps = {}
           traceFocus(deps, { ...base, agent, result, reason: reason ?? "no-candidate" });
           continue;
         }
-        const outcome = await focus(pid, { agent, record: entry.rec });
+        const outcome = await focus(pid, { agent, record: entry.rec, sessionId: payload.sessionId });
         if (outcome.ok) {
           focused += 1;
           const releasedTuiInput = await releaseFocusedTuiUserInputHold(

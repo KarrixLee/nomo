@@ -7,9 +7,11 @@
 // How a pid becomes a window:
 //   0. if herdr owns the pty (the pid or an ancestor IS a herdr process), the pane list — not the
 //      tty — is the correlation key, so that branch is taken FIRST and the tty is never consulted,
-//   1. the pid's controlling tty (`ps -o tty=` → "ttys004" → the device path "/dev/ttys004"),
+//   1. the pid's controlling tty (`ps -o tty=` → "ttys004" → the device path "/dev/ttys004"), which
+//      the DESKTOP agent apps (Claude, Codex) are exempt from for the same reason herdr is: their
+//      conversation windows run with no controlling tty, so a tty-first refusal no-ops the command,
 //   2. the OWNING terminal application, from the pid's ancestor chain's argv (Terminal.app, iTerm2,
-//      Ghostty, WezTerm, Alacritty, kitty, Hyper, Warp, VS Code),
+//      Ghostty, WezTerm, Alacritty, kitty, Hyper, Warp, VS Code, and the Claude/Codex desktop apps),
 //   3. for the two emulators with a scriptable tty→tab mapping (Terminal.app, iTerm2), an AppleScript
 //      that finds the tab/session whose `tty` is that device path, selects it and raises its window;
 //      for everything else — and for a tty scan that matches nothing — merely ACTIVATING the owning
@@ -62,6 +64,10 @@ export type FocusResult =
 export interface FocusContext {
   agent: AgentKind;
   record: SessionRecord;
+  /** The session's id — the agent's OWN uuid, which herdr publishes per pane as `agent_session.value`.
+   *  It is the only EXACT correlation key available, so it is required: a SessionRecord does not carry
+   *  its own id (the id is the record's FILENAME), and the caller that has one always knows it. */
+  sessionId: string;
 }
 
 export interface ExecFileResult {
@@ -95,6 +101,10 @@ export interface FocusDeps {
 
 interface HerdrPane {
   agent: string;
+  /** herdr's own record of WHICH agent session this pane is running (`{agent, kind:"id", source,
+   *  value}`). Present on every claude/grok pane sampled 2026-08-14; a codex pane has none, and an
+   *  older herdr has none anywhere — hence optional, and hence the fuzzy fallback below stays. */
+  agent_session?: { agent?: string; value?: string };
   agent_status?: string;
   cwd?: string;
   tab_id: string;
@@ -150,6 +160,19 @@ function recordTitleMatchesPane(recordTitle: unknown, paneTitle: unknown): boole
 }
 
 function correlateHerdrPane(context: FocusContext, panes: HerdrPane[]): HerdrPane | undefined {
+  // The EXACT signal first: herdr publishes the agent's own session id on the pane, so the id the
+  // command already named is ground truth and short-circuits everything below — no title, no cwd, no
+  // status tie-break. Correlating by title instead is what made "Open on Mac" fail for any pane still
+  // showing its default title (field report 2026-08-14: record title "hi" vs pane "Claude Code").
+  // Cross-agent is refused even on an id hit, and a duplicated id is ambiguous rather than a coin
+  // flip. A pane with no `agent_session` (codex, or an older herdr) contributes nothing here and
+  // falls through to the fuzzy signals exactly as before. `?.` is also the malformed-value guard:
+  // any non-object agent_session simply reads back undefined.
+  const byId = panes.filter((pane) => pane.agent === context.agent
+    && pane.agent_session?.value === context.sessionId
+    && (pane.agent_session?.agent ?? context.agent) === context.agent);
+  if (byId.length > 0) return byId.length === 1 ? byId[0] : undefined;
+
   let candidates = context.agent === "claude"
     ? panes.filter((pane) => pane.agent === "claude"
       && recordTitleMatchesPane(context.record.title, pane.terminal_title_stripped))
@@ -201,16 +224,28 @@ async function runExecFile(
  *  other entry is activate-only by design (guessing a window in kitty/WezTerm/Ghostty from a tty is
  *  not possible over AppleScript, and a wrong guess is the one outcome worth avoiding). */
 export interface TerminalApp {
-  id: "terminal-app" | "iterm2" | "ghostty" | "wezterm" | "alacritty" | "kitty" | "hyper" | "warp" | "vscode";
+  id: "terminal-app" | "iterm2" | "ghostty" | "wezterm" | "alacritty" | "kitty" | "hyper" | "warp" | "vscode" | "claude-desktop" | "codex-desktop";
   /** CFBundleIdentifier — `tell application id "…"` binds to the installed copy, wherever it lives. */
   bundleId: string;
   /** Matched against a process's full argv (the .app bundle path, or the binary name for the
    *  bundle-less launches WezTerm/kitty/Alacritty can have). */
   match: RegExp;
+  /** This owner is a GUI AGENT APP, not an emulator: the process it owns holds no controlling terminal
+   *  at all, and its window is raised by bundle id without one. Declared on the TABLE — rather than
+   *  re-tested as an id comparison at the gate — so the next such app is one row and cannot forget the
+   *  exemption. Absent for every real emulator: there a tty-less pid genuinely owns no window, and
+   *  refusing is correct. */
+  ttyless?: true;
 }
 
 /** The known emulators, most specific first. VS Code's integrated terminal is included because a
- *  session started from it is genuinely owned by VS Code (activate-only). */
+ *  session started from it is genuinely owned by VS Code (activate-only). The two DESKTOP agent apps
+ *  are the entries that are not emulators at all: a desktop conversation window runs its agent with
+ *  NO controlling tty, so each is the owning front-end in exactly the sense this table means, and
+ *  activating it is the whole of what can be done (see the entries' notes).
+ *  Ordering is irrelevant across processes — owningTerminalApp takes the NEAREST matching ancestor —
+ *  so a real terminal always wins over an app further up the chain; within one argv the first match
+ *  wins, which is why the desktop entries sit last. */
 const TERMINAL_APPS: TerminalApp[] = [
   { id: "terminal-app", bundleId: "com.apple.Terminal", match: /\/Terminal\.app\// },
   { id: "iterm2", bundleId: "com.googlecode.iterm2", match: /\/iTerm\.app\/|\/iTerm2\.app\// },
@@ -221,6 +256,27 @@ const TERMINAL_APPS: TerminalApp[] = [
   { id: "hyper", bundleId: "co.zeit.hyper", match: /\/Hyper\.app\// },
   { id: "warp", bundleId: "dev.warp.Warp-Stable", match: /\/Warp\.app\// },
   { id: "vscode", bundleId: "com.microsoft.VSCode", match: /\/Visual Studio Code\.app\/|\/Code\.app\/|Code Helper/ },
+  // The Claude desktop app. Matched on the bundle path fragment shared by its Electron main
+  // (`…/Claude.app/Contents/MacOS/Claude`) and the `disclaimer` launcher that sits between it and the
+  // session's `claude` (`…/Claude.app/Contents/Helpers/disclaimer`) — location-agnostic (never
+  // `/Applications`) and version-agnostic. CASE MATTERS: the bundled binary the app runs lives under a
+  // lowercase `…/claude-code/<version>/claude.app/…`, which this deliberately does NOT match, so the
+  // owner resolves to the app rather than to the session's own process.
+  // ponytail: app-activate is the ceiling — nothing raises a specific conversation tab inside the
+  // Electron window. The two deep links that exist do not close it: `claude://code/<id>` addresses the
+  // app's OWN `session_`/`cse_`-prefixed ids (which nothing here ever sees) behind a runtime feature
+  // gate, and `claude://resume?session=<uuid>` is an IMPORT that rewrites the session's transcript on
+  // disk (verified in app.asar, Claude 1.30096.1). Upgrade path: a deep link that takes a CC session
+  // uuid and focuses it without mutating anything.
+  { id: "claude-desktop", bundleId: "com.anthropic.claudefordesktop", match: /\/Claude\.app\/Contents\//, ttyless: true },
+  // The Codex desktop app — shipped as `ChatGPT.app`, bundle id com.openai.codex. Same ceiling and
+  // same tty-lessness as the Claude entry, but it is reached differently: a desktop conversation is
+  // hosted by an app-server whose ancestry frequently does NOT include the bundle (the standalone
+  // ~/.codex daemon is parented to launchd), so codexLocateTuiPid identifies the session from its
+  // rollout and hands this module the APP's own Electron main pid — whose argv is what this matches.
+  // A session that DOES run under the bundle's own `…/ChatGPT.app/Contents/Resources/codex` resolves
+  // here by plain ancestry too, so both process shapes land on one rule.
+  { id: "codex-desktop", bundleId: "com.openai.codex", match: /\/ChatGPT\.app\/Contents\//, ttyless: true },
 ];
 
 /** The terminal application owning `pid`, found by walking its ancestor chain's argv. The chain is
@@ -440,19 +496,26 @@ export async function focusTerminalForPid(pid: number, deps: FocusDeps = {}): Pr
     let rawTty: string | undefined;
     try { rawTty = await (deps.ttyOf ?? ttyViaPs)(pid); } catch { rawTty = undefined; }
     const devPath = ttyDevicePath(rawTty);
-    if (devPath === undefined) {
+    const app = owningTerminalApp(pid, ancestorsOf, commandOf);
+    // The tty gate, with the same exemption the herdr branch takes above and for the same reason: a
+    // DESKTOP agent app's window has no controlling tty at all ("??"), so a tty-first refusal made
+    // "Open on Mac" a silent no-op for every one of its sessions. The exemption is scoped to the
+    // owners that declare `ttyless` — for every emulator a tty-less pid still owns no window and there
+    // is nothing to raise.
+    if (devPath === undefined && app?.ttyless !== true) {
       note(deps, { event: "terminal-focus", pid, result: "no-tty", tty: rawTty ?? "" });
       return { ok: false, reason: "no-tty" };
     }
-    const app = owningTerminalApp(pid, ancestorsOf, commandOf);
     if (!app) {
       note(deps, { event: "terminal-focus", pid, result: "unsupported", why: "no-owning-app" });
       return { ok: false, reason: "unsupported" };
     }
     const osascript = deps.osascript ?? runOsascript;
     try {
-      // The two emulators that can map a tty to an exact tab/session get the precise treatment.
-      if (app.id === "terminal-app" || app.id === "iterm2") {
+      // The two emulators that can map a tty to an exact tab/session get the precise treatment. Both
+      // always reach here WITH a devPath (only the desktop app is exempt from the gate above); the
+      // check is what tells the compiler so.
+      if (devPath !== undefined && (app.id === "terminal-app" || app.id === "iterm2")) {
         const script = app.id === "terminal-app" ? terminalAppScript(devPath) : iterm2Script(devPath);
         const out = await osascript(script);
         if (String(out).trim() === "ok") {

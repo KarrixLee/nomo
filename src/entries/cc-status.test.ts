@@ -5,7 +5,7 @@ import { basename, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { b64url, decryptBlob } from "../core/crypto";
 import {
-  BLOB_FIT_CHARS, DBG_BLOB_TEXT_MAX_CHARS, folderIdentity, folderKeyFromCwd, formatPlanPickerDebug, fullTextForRecord, parseConfig, PendingEventStash, PLAN_BLOB_TEXT_MAX_CHARS, PLAN_BLOB_TRUNCATION_MARKER,
+  BLOB_FIT_CHARS, DBG_BLOB_TEXT_MAX_CHARS, folderIdentity, folderKeyFromCwd, formatPlanPickerDebug, fullTextForRecord, parseConfig, PendingEventStash, PLAN_BLOB_TEXT_MAX_CHARS, PLAN_BLOB_TRUNCATION_MARKER, postFullText,
   readDecisionHoldAt, readRecord, sealedBlobChars, SessionRecord, sessionBranch, writeDecisionHoldAt,
 } from "../core/shared";
 import {
@@ -1368,6 +1368,60 @@ describe("buildEnvelope's blob-plaintext tee (the unabridged-plan source)", () =
   });
 });
 
+// ---- NOM-44 phase 5: the same cut text, pushed to the blind worker for an OFF-network pull --------
+//
+// runHook has no fetch seam, so the wire contract is asserted on postFullText itself (the permission
+// hook's end-to-end wiring is covered in permission.test.ts). What it is a copy OF — `what:"plan"` here,
+// `"permission-detail"` there — is the only difference between the two call sites.
+
+describe("postFullText — the remote full-text upload", () => {
+  const CONFIG = { url: "https://w.example", pairingId: "p1", pcSecret: "s1", e2eKey: KEY };
+  const spy = (status: number | "throw" = 200) => {
+    const calls: Array<{ url: string; init: { method?: string; body?: string; headers?: Record<string, string> } }> = [];
+    const fn = (async (url: string, init: { method?: string; body?: string; headers?: Record<string, string> }) => {
+      calls.push({ url, init });
+      if (status === "throw") throw new Error("network");
+      return new Response(JSON.stringify({ ok: status === 200 }), { status });
+    }) as unknown as typeof fetch;
+    return { fn, calls };
+  };
+
+  test("nothing was cut (fullTextForRecord → undefined) ⇒ no POST at all", async () => {
+    const { fn, calls } = spy();
+    await postFullText(CONFIG, "s1", "plan", fullTextForRecord("# Short plan", "# Short plan"), fn);
+    expect(calls).toHaveLength(0);
+  });
+
+  test("a cut plan POSTs /v1/cc/full with sessionId + what + complete sealed inside", async () => {
+    const full = "# Plan\n".repeat(2000);
+    const { fn, calls } = spy();
+    const traced: object[] = [];
+    await postFullText(CONFIG, "sess-9", "plan", fullTextForRecord(full, "# Plan\n…"), fn, (e) => traced.push(e));
+    expect(calls).toHaveLength(1);
+    expect(calls[0].url).toBe("https://w.example/v1/cc/full");
+    expect(calls[0].init.method).toBe("POST");
+    expect(calls[0].init.headers?.["x-cc-pairing"]).toBe("p1");
+    expect(calls[0].init.headers?.["x-cc-auth"]).toBe("s1");
+    const body = JSON.parse(calls[0].init.body!) as { v: number; sessionId: string; what: string; blob: string };
+    expect({ v: body.v, sessionId: body.sessionId, what: body.what }).toEqual({ v: 2, sessionId: "sess-9", what: "plan" });
+    // The sealed copy repeats sessionId/what so the phone can reject a body the blind relay substituted.
+    expect(await decryptBlob(KEY, body.blob)).toEqual({
+      sessionId: "sess-9", what: "plan", content: full, complete: true,
+    });
+    expect(traced).toEqual([{ event: "full-text", what: "plan", chars: full.length, status: 200 }]);
+  });
+
+  test("a non-200 and a transport failure are both SOFT — traced, never thrown, never retried", async () => {
+    for (const status of [500, "throw"] as const) {
+      const { fn, calls } = spy(status);
+      const traced: Array<{ status?: number }> = [];
+      await postFullText(CONFIG, "s", "permission-detail", "cut text", fn, (e) => traced.push(e));
+      expect(calls).toHaveLength(1);                      // exactly one attempt
+      expect(traced[0].status).toBe(status === 500 ? 500 : 0);
+    }
+  });
+});
+
 // --- F6 phantom-session lineage + local trace ------------------------------------------------
 
 describe("runHook phantom-session lineage, origin stamp, and session-trace.log", () => {
@@ -1386,10 +1440,13 @@ describe("runHook phantom-session lineage, origin stamp, and session-trace.log",
     return { home, ccDir, sessionsDir };
   }
 
-  async function spawnHook(entry: string, home: string, payload: Record<string, unknown>): Promise<void> {
+  async function spawnHook(
+    entry: string, home: string, payload: Record<string, unknown>,
+    env: Record<string, string | undefined> = {},
+  ): Promise<void> {
     const proc = spawnTestProcess({
       cmd: ["bun", entry],
-      env: isolatedTestEnv(home),
+      env: isolatedTestEnv(home, env),
       stdin: Buffer.from(JSON.stringify(payload)),
       stdout: "ignore",
       stderr: "ignore",
@@ -1665,6 +1722,102 @@ await child.exited;
       )).toBe(true);
     } finally {
       server.stop(true);
+      await rm(home, { recursive: true, force: true });
+    }
+  }, 20000);
+
+  // --- Claude desktop app: the row is minted by the first PROMPT, never by SessionStart -----------
+  //
+  // Transcript existence was tried as the discriminator first and is wrong in BOTH directions: the
+  // desktop app silently re-warms old conversations with `--resume=<id>`, and those HAVE a transcript
+  // (one such ghost sat "Running" on the phone for 10+ minutes untouched), while a real desktop
+  // session has NO transcript yet at its first UserPromptSubmit (traced live: the row only appeared
+  // at Stop, after the whole first turn, with no model badge).
+  const desktopEnv = { CLAUDE_CODE_ENTRYPOINT: "claude-desktop" };
+
+  test("a desktop launch phantom defers, and the first real prompt creates the row with NO transcript on disk", async () => {
+    const { home, ccDir, sessionsDir } = await setupHookHome("http://127.0.0.1:9");
+    try {
+      const sid = "5c0a2f10-1b7c-4a1e-9f3a-2d6e8b41c701";
+      // Deliberately never written: the desktop app's first-turn hooks run before Claude flushes it.
+      const transcript = join(home, "desktop-absent.jsonl");
+
+      await spawnHook(claudeEntry, home, {
+        session_id: sid, hook_event_name: "SessionStart", source: "startup",
+        cwd: "/x/api-status", transcript_path: transcript,
+      }, desktopEnv);
+      expect(await readLocalRecord(sessionsDir, sid)).toBeNull();
+
+      // A whitespace-only prompt is not a prompt.
+      await spawnHook(claudeEntry, home, {
+        session_id: sid, hook_event_name: "UserPromptSubmit", prompt: "   ",
+        cwd: "/x/api-status", transcript_path: transcript,
+      }, desktopEnv);
+      expect(await readLocalRecord(sessionsDir, sid)).toBeNull();
+
+      await spawnHook(claudeEntry, home, {
+        session_id: sid, hook_event_name: "UserPromptSubmit", prompt: "Ship the desktop fix",
+        cwd: "/x/api-status", transcript_path: transcript,
+      }, desktopEnv);
+      expect(await readLocalRecord(sessionsDir, sid))
+        .toMatchObject({ lastEvent: "working", op: "update", title: "Ship the desktop fix" });
+      expect(await stat(transcript).then(() => true, () => false)).toBe(false);
+
+      // An EXISTING record is never subject to the defer, whatever the hook.
+      await spawnHook(claudeEntry, home, {
+        session_id: sid, hook_event_name: "PreToolUse", tool_name: "Bash",
+        cwd: "/x/api-status", transcript_path: transcript,
+      }, desktopEnv);
+      expect(await readLocalRecord(sessionsDir, sid)).not.toBeNull();
+
+      const trace = (await readFile(join(ccDir, "session-trace.log"), "utf8"))
+        .trim().split("\n").map((line) => JSON.parse(line) as Record<string, unknown>);
+      expect(trace.filter((e) => e.event === "suppress" && e.guard === "claude-desktop-no-prompt")
+        .map((e) => e.hook_event_name)).toEqual(["SessionStart", "UserPromptSubmit"]);
+      expect(trace.some((e) => e.event === "create" && e.sessionId === sid)).toBe(true);
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  }, 20000);
+
+  test("a background desktop --resume re-warm mints no row even though its transcript is fully written", async () => {
+    const { home, ccDir, sessionsDir } = await setupHookHome("http://127.0.0.1:9");
+    try {
+      const sid = "b4348975-45a5-4b90-a84d-70581c75336b";
+      const transcript = join(home, "rewarmed.jsonl");
+      await writeFile(transcript, [
+        JSON.stringify({ type: "user", message: { role: "user", content: "an old conversation" } }),
+        JSON.stringify({ type: "assistant", message: { role: "assistant", model: "claude-opus-4-8", content: [] } }),
+      ].join("\n"));
+
+      await spawnHook(claudeEntry, home, {
+        session_id: sid, hook_event_name: "SessionStart", source: "resume",
+        cwd: "/x/fruit-game", transcript_path: transcript,
+      }, desktopEnv);
+
+      expect(await readLocalRecord(sessionsDir, sid)).toBeNull();
+      const trace = (await readFile(join(ccDir, "session-trace.log"), "utf8"))
+        .trim().split("\n").map((line) => JSON.parse(line) as Record<string, unknown>);
+      expect(trace).toContainEqual(expect.objectContaining({
+        event: "suppress", sessionId: sid, hook_event_name: "SessionStart", source: "resume",
+        guard: "claude-desktop-no-prompt",
+      }));
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  }, 20000);
+
+  test("a terminal CLI SessionStart still creates its row at startup, before any transcript exists", async () => {
+    const { home, sessionsDir } = await setupHookHome("http://127.0.0.1:9");
+    try {
+      const sid = "5c0a2f10-1b7c-4a1e-9f3a-2d6e8b41c702";
+      await spawnHook(claudeEntry, home, {
+        session_id: sid, hook_event_name: "SessionStart", source: "startup",
+        cwd: "/x/api-status", transcript_path: join(home, "terminal-absent.jsonl"),
+      });
+      expect(await readLocalRecord(sessionsDir, sid))
+        .toMatchObject({ lastEvent: "sessionStart", op: "start" });
+    } finally {
       await rm(home, { recursive: true, force: true });
     }
   }, 20000);
@@ -3037,7 +3190,7 @@ describe("runHook sends the plugin version as the x-cc-version header", () => {
 
 // --- runHook reports this computer's LOCAL approvals pause as x-cc-approvals -------------------
 //
-// `nomo-cc permission off` writes a zero-byte <CC_DIR>/no-hold flag that pauses remote approvals ON
+// `/nomo-cc:approvals off` writes a zero-byte <CC_DIR>/no-hold flag that pauses remote approvals ON
 // THIS MAC — the phone could not see it, so its "Answer permission prompts from iPhone" toggle read
 // ON while nothing would ever arrive. Every /cc/event POST now carries the state as a plaintext
 // header so the worker can record it per computer.

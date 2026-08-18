@@ -29,7 +29,7 @@ import { runHook, buildBlob, OpPlan } from "./hook";
 import {
   AgentKind, appendFittedPlanAndDebug, atomicWrite, BLOB_FIT_CHARS, CC_DIR, clearDecisionHold, codexHome, Config,
   DecisionHold, flagExists, formatDecisionHoldDebug,
-  fullTextForRecord, loadConfig, NO_HOLD_PATH,
+  fullTextForRecord, loadConfig, NO_HOLD_PATH, postFullText,
   PLUGIN_VERSION, readPrefix, readRecord, readSuffix, sealedBlobChars, SessionRecord,
   settleDecisionHoldRecord, stampPermissionDetailFull,
   writeDecisionHold,
@@ -521,6 +521,13 @@ export function buildPermissionSummary(toolName: string, toolInput: Record<strin
     // tool_name (Codex + Claude names never collide) so these are additive, not an agent branch.
     case "shell":
     case "local_shell": {
+      // Claude fills tool_input.description with the human-readable intent ("Run nomo-cc reset to clear
+      // stale sessions and stop watchdog") and the desktop/CLI prompts headline it, so the phone card
+      // leads with it too — the raw argv is the LEAST readable string available for a hook command or a
+      // long pipeline, and it still rides in buildPermissionDetail below. Codex's shell/local_shell send
+      // no description, so they keep the first command line exactly as before.
+      const desc = str(toolInput.description);
+      if (desc) return truncate(desc);
       const cmd = str(toolInput.command);
       return cmd ? truncate(cmd.split("\n")[0]) : toolName;
     }
@@ -1383,6 +1390,21 @@ export async function runPermissionHook(
     if (record && record.permissionDetailFull !== detailFull) {
       await (deps.stampDetailFullFn ?? defaultStampDetailFull())(sessionId, detailFull);
     }
+    // The SAME cut text, sealed and pushed to the blind worker so a phone that is NOT on this network can
+    // pull it too (NOM-44 phase 5). The disk tee above keeps its await — it is a local write, so ordering
+    // it before the card costs nothing. This one CANNOT have that: a 5 s upload awaited here would sit
+    // directly in front of the decision POST, and the decision POST is the thing that puts an answerable
+    // card on the user's phone. So it is STARTED here — strictly before the card goes out — and awaited
+    // only after, which buys the full head start without spending a millisecond of the card's latency.
+    // The residual window (card up, upload still in flight) is closed by the phone, which falls back to
+    // the LAN read and then to the truncated preview already on the card; nothing here retries.
+    //
+    // `requestId` is sealed IN with the text, and it is what makes that residual window safe rather than
+    // merely slow: the worker's slot is per (session, what) and lives a day, so during the window — and
+    // after a 429 or a timeout — the phone's pull would otherwise be answered with the PREVIOUS hold's
+    // parked detail, which agrees about session and `what` and disagrees about nothing the phone could
+    // see. It rejects a detail sealed under a different hold outright (see postFullText).
+    const fullUpload = postFullText(config, sessionId, "permission-detail", detailFull, fetchFn, trace, requestId);
     const blob = await encryptBlob(config.e2eKey, permissionFrame(permissionBase, fitted.detail, fitted.omitted, fitted.questions));
     const fallbackBlob = await encryptBlob(config.e2eKey, base);
 
@@ -1537,6 +1559,10 @@ export async function runPermissionHook(
     };
 
     let { posted, hold, reason: holdReason } = await postDecision(1, POST_MAX_ATTEMPTS);
+    // Settle the full-text upload started above. It has been in flight for the whole POST, so this is
+    // almost always already resolved; it exists so a hook that exits immediately (hold:false) cannot kill
+    // the request mid-upload. postFullText never rejects, so there is nothing to catch.
+    await fullUpload;
     if (!posted) {
       // Both POSTs failed at the TRANSPORT layer — but a client-side timeout says nothing about whether
       // the request LANDED. If the first one did, the worker is holding a real record and the phone is

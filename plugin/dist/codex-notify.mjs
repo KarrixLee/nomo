@@ -103,7 +103,7 @@ async function sha256Hex(s) {
 }
 
 // src/core/shared.ts
-var PLUGIN_VERSION = "2.0.0";
+var PLUGIN_VERSION = "2.1.0";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -221,6 +221,34 @@ function fullTextForRecord(full, fitted) {
 }
 function recordFullTextIsComplete(value) {
   return !value.endsWith(RECORD_FULL_TEXT_TRUNCATION_MARKER);
+}
+var FULL_TEXT_POST_TIMEOUT_MS = 5000;
+async function postFullText(config, sessionId, what, content, fetchFn = fetch, trace, requestId) {
+  if (content === undefined)
+    return;
+  try {
+    const blob = await encryptBlob(config.e2eKey, {
+      sessionId,
+      what,
+      requestId,
+      content,
+      complete: recordFullTextIsComplete(content)
+    });
+    const res = await fetchFn(`${config.url}/v1/cc/full`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-cc-pairing": config.pairingId,
+        "x-cc-auth": config.pcSecret,
+        "x-cc-version": PLUGIN_VERSION
+      },
+      body: JSON.stringify({ v: 2, sessionId, what, blob }),
+      signal: AbortSignal.timeout(FULL_TEXT_POST_TIMEOUT_MS)
+    });
+    trace?.({ event: "full-text", what, chars: content.length, status: res.status });
+  } catch (e) {
+    trace?.({ event: "full-text", what, chars: content.length, status: 0, error: e?.name ?? "Error" });
+  }
 }
 async function flagExists(path) {
   try {
@@ -1023,6 +1051,9 @@ function recordTitleMatchesPane(recordTitle, paneTitle) {
   return !!match && match[1].length > 0 && paneTitle.startsWith(match[1]);
 }
 function correlateHerdrPane(context, panes) {
+  const byId = panes.filter((pane) => pane.agent === context.agent && pane.agent_session?.value === context.sessionId && (pane.agent_session?.agent ?? context.agent) === context.agent);
+  if (byId.length > 0)
+    return byId.length === 1 ? byId[0] : undefined;
   let candidates = context.agent === "claude" ? panes.filter((pane) => pane.agent === "claude" && recordTitleMatchesPane(context.record.title, pane.terminal_title_stripped)) : panes.filter((pane) => pane.agent === "codex" && typeof context.record.origin?.cwd === "string" && context.record.origin.cwd.length > 0 && pane.cwd === context.record.origin.cwd);
   if (candidates.length > 1) {
     const working = candidates.filter((pane) => pane.agent_status === "working");
@@ -1070,7 +1101,9 @@ var TERMINAL_APPS = [
   { id: "kitty", bundleId: "net.kovidgoyal.kitty", match: /\/kitty\.app\/|(?:^|\/)kitty(?:\s|$)/ },
   { id: "hyper", bundleId: "co.zeit.hyper", match: /\/Hyper\.app\// },
   { id: "warp", bundleId: "dev.warp.Warp-Stable", match: /\/Warp\.app\// },
-  { id: "vscode", bundleId: "com.microsoft.VSCode", match: /\/Visual Studio Code\.app\/|\/Code\.app\/|Code Helper/ }
+  { id: "vscode", bundleId: "com.microsoft.VSCode", match: /\/Visual Studio Code\.app\/|\/Code\.app\/|Code Helper/ },
+  { id: "claude-desktop", bundleId: "com.anthropic.claudefordesktop", match: /\/Claude\.app\/Contents\//, ttyless: true },
+  { id: "codex-desktop", bundleId: "com.openai.codex", match: /\/ChatGPT\.app\/Contents\//, ttyless: true }
 ];
 function owningTerminalApp(pid, ancestorsOf = pidAncestors, commandOf = pidCommand) {
   let chain = [];
@@ -1253,18 +1286,18 @@ async function focusTerminalForPid(pid, deps = {}) {
       rawTty = undefined;
     }
     const devPath = ttyDevicePath(rawTty);
-    if (devPath === undefined) {
+    const app = owningTerminalApp(pid, ancestorsOf, commandOf);
+    if (devPath === undefined && app?.ttyless !== true) {
       note(deps, { event: "terminal-focus", pid, result: "no-tty", tty: rawTty ?? "" });
       return { ok: false, reason: "no-tty" };
     }
-    const app = owningTerminalApp(pid, ancestorsOf, commandOf);
     if (!app) {
       note(deps, { event: "terminal-focus", pid, result: "unsupported", why: "no-owning-app" });
       return { ok: false, reason: "unsupported" };
     }
     const osascript = deps.osascript ?? runOsascript;
     try {
-      if (app.id === "terminal-app" || app.id === "iterm2") {
+      if (devPath !== undefined && (app.id === "terminal-app" || app.id === "iterm2")) {
         const script = app.id === "terminal-app" ? terminalAppScript(devPath) : iterm2Script(devPath);
         const out = await osascript(script);
         if (String(out).trim() === "ok") {
@@ -1924,13 +1957,27 @@ function claudeTailPendingApproval(tail) {
   return false;
 }
 var CLAUDE_HEADLESS_ARG_TOKENS = new Set(["-p", "--print", "--output-format"]);
-var CLAUDE_DAEMON_MARKERS = [
-  "claude-mem",
-  "worker-service",
+var CLAUDE_SELF_DAEMON_MARKERS = [
   "daemon run --origin transient",
   "bg-pty-host",
   "bg-spare"
 ];
+var CLAUDE_LAUNCHER_MARKERS = ["claude-mem", "worker-service"];
+var CLAUDE_DESKTOP_ENTRYPOINT = "claude-desktop";
+var CLAUDE_DESKTOP_BUNDLED_PATH_PARTS = [
+  "/Library/Application Support/Claude/claude-code/",
+  "/claude.app/Contents/MacOS/claude"
+];
+var CLAUDE_DESKTOP_LAUNCHER = "Claude.app/Contents/Helpers/disclaimer";
+function claudeDesktopInvocation(selfArgs, ancestorArgs, entrypoint) {
+  if (entrypoint === CLAUDE_DESKTOP_ENTRYPOINT)
+    return true;
+  if (typeof selfArgs !== "string" || selfArgs.length === 0)
+    return false;
+  if (!CLAUDE_DESKTOP_BUNDLED_PATH_PARTS.every((part) => selfArgs.includes(part)))
+    return false;
+  return ancestorArgs.some((a) => typeof a === "string" && a.includes(CLAUDE_DESKTOP_LAUNCHER));
+}
 function claudeForkResumePredecessor(command) {
   if (typeof command !== "string" || command.length === 0)
     return;
@@ -1944,16 +1991,18 @@ function claudeForkResumePredecessor(command) {
   const id = basename2(resume, ".jsonl");
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id) ? id : undefined;
 }
-function claudeHeadlessInvocation(selfArgs, ancestorArgs) {
+function claudeHeadlessInvocation(selfArgs, ancestorArgs, entrypoint) {
   const chain = [selfArgs, ...ancestorArgs].filter((s) => typeof s === "string" && s.length > 0);
-  if (chain.some((args) => CLAUDE_DAEMON_MARKERS.some((m) => args.includes(m))))
+  if (chain.some((args) => CLAUDE_SELF_DAEMON_MARKERS.some((m) => args.includes(m))))
     return true;
-  if (typeof selfArgs !== "string" || selfArgs.length === 0)
+  const tokens = typeof selfArgs === "string" ? selfArgs.trim().split(/\s+/) : [];
+  if (tokens.includes("--fork-session") && tokens.includes("--reply-on-resume"))
+    return true;
+  if (claudeDesktopInvocation(selfArgs, ancestorArgs, entrypoint))
     return false;
-  const tokens = selfArgs.trim().split(/\s+/);
-  if (tokens.some((tok) => CLAUDE_HEADLESS_ARG_TOKENS.has(tok)))
+  if (chain.some((args) => CLAUDE_LAUNCHER_MARKERS.some((m) => args.includes(m))))
     return true;
-  return tokens.includes("--fork-session") && tokens.includes("--reply-on-resume");
+  return tokens.some((tok) => CLAUDE_HEADLESS_ARG_TOKENS.has(tok));
 }
 var CODEX_ROLLOUT_IDLE_SILENCE_MS = 30000;
 var CODEX_TURN_OPEN_EVENT = "task_started";
@@ -1989,7 +2038,7 @@ async function rolloutViaLsof(pid) {
     return;
   }
 }
-function rolloutMetaCwd(head) {
+function rolloutMetaField(head, key) {
   for (const line of head.split(`
 `)) {
     if (!line.includes("session_meta"))
@@ -2005,11 +2054,17 @@ function rolloutMetaCwd(head) {
     const r = row;
     if (r.type !== "session_meta")
       continue;
-    const cwd = r.payload?.cwd;
-    if (typeof cwd === "string" && cwd.length > 0)
-      return cwd;
+    const value = r.payload?.[key];
+    if (typeof value === "string" && value.length > 0)
+      return value;
   }
   return;
+}
+function rolloutMetaCwd(head) {
+  return rolloutMetaField(head, "cwd");
+}
+function rolloutMetaOriginator(head) {
+  return rolloutMetaField(head, "originator");
 }
 var ROLLOUT_SCAN_MAX_DAYS = 10;
 var ROLLOUT_SCAN_MAX_HEADS = 40;
@@ -2140,6 +2195,15 @@ function codexTuiCandidates(rows, knownPids) {
 function filterCodexTuis(rows, knownPids) {
   return codexTuiCandidates(rows, knownPids).map(({ pid }) => ({ pid }));
 }
+var CODEX_DESKTOP_ORIGINATORS = new Set(["Codex Desktop", "codex_work_desktop"]);
+function codexDesktopOriginator(head) {
+  const originator = rolloutMetaOriginator(head);
+  return originator !== undefined && CODEX_DESKTOP_ORIGINATORS.has(originator);
+}
+function codexDesktopAppPid(rows) {
+  const matched = rows.filter((r) => /\/ChatGPT\.app\/Contents\/MacOS\//.test(r.args));
+  return matched.length === 1 ? matched[0].pid : undefined;
+}
 function labelFromCwd(cwd) {
   if (!cwd)
     return "session";
@@ -2241,6 +2305,16 @@ function sentinelPid(sessionId) {
   const pid = Number.parseInt(m[1], 10);
   return Number.isFinite(pid) ? pid : undefined;
 }
+async function codexSessionIsDesktop(record, deps) {
+  const rollout = record.transcript;
+  if (typeof rollout !== "string" || rollout.length === 0)
+    return false;
+  try {
+    return codexDesktopOriginator(await (deps.readHead ?? readPrefix)(rollout, ROLLOUT_META_HEAD_BYTES));
+  } catch {
+    return false;
+  }
+}
 async function codexLocateTuiPid(ctx, deps = {}) {
   try {
     let output;
@@ -2250,11 +2324,8 @@ async function codexLocateTuiPid(ctx, deps = {}) {
       noteLocate(deps, "error");
       return;
     }
-    const candidates = codexTuiCandidates(parseCodexProcs(output), new Set);
-    if (candidates.length === 0) {
-      noteLocate(deps, "no-candidate");
-      return;
-    }
+    const rows = parseCodexProcs(output);
+    const candidates = codexTuiCandidates(rows, new Set);
     const pids = new Set(candidates.map((c) => c.pid));
     if (typeof ctx.record.pid === "number" && Number.isFinite(ctx.record.pid) && pids.has(ctx.record.pid)) {
       noteLocate(deps, "record-pid");
@@ -2264,6 +2335,19 @@ async function codexLocateTuiPid(ctx, deps = {}) {
     if (sentinel !== undefined && pids.has(sentinel)) {
       noteLocate(deps, "sentinel-pid");
       return sentinel;
+    }
+    if (await codexSessionIsDesktop(ctx.record, deps)) {
+      const appPid = codexDesktopAppPid(rows);
+      if (appPid !== undefined) {
+        noteLocate(deps, "desktop-app");
+        return appPid;
+      }
+      noteLocate(deps, "no-candidate");
+      return;
+    }
+    if (candidates.length === 0) {
+      noteLocate(deps, "no-candidate");
+      return;
     }
     let subset = candidates;
     const cwd = ctx.record.origin?.cwd;
@@ -2337,7 +2421,13 @@ async function claudeLocateTuiPid(ctx, deps = {}) {
       noteLocate(deps, "no-candidate");
       return;
     }
-    if (ancestryContainsHerdr(pid, deps.ancestorsOf ?? pidAncestors, deps.commandOf ?? pidCommand)) {
+    const ancestorsOf = deps.ancestorsOf ?? pidAncestors;
+    const commandOf = deps.commandOf ?? pidCommand;
+    if (ancestryContainsHerdr(pid, ancestorsOf, commandOf)) {
+      noteLocate(deps, "record-pid");
+      return pid;
+    }
+    if (owningTerminalApp(pid, ancestorsOf, commandOf)?.ttyless === true) {
       noteLocate(deps, "record-pid");
       return pid;
     }
@@ -2499,7 +2589,10 @@ var claudeAdapter = {
     return claudeTailPendingApproval(tail);
   },
   isHeadlessInvocation({ pid, ancestorsOf, commandOf }) {
-    return claudeHeadlessInvocation(commandOf(pid), ancestorsOf(pid).map((p) => commandOf(p)));
+    return claudeHeadlessInvocation(commandOf(pid), ancestorsOf(pid).map((p) => commandOf(p)), process.env.CLAUDE_CODE_ENTRYPOINT);
+  },
+  isDesktopInvocation({ pid, ancestorsOf, commandOf }) {
+    return claudeDesktopInvocation(commandOf(pid), ancestorsOf(pid).map((p) => commandOf(p)), process.env.CLAUDE_CODE_ENTRYPOINT);
   },
   forkResumePredecessor(command) {
     return claudeForkResumePredecessor(command);
@@ -3008,6 +3101,7 @@ async function readStdin() {
   return Buffer.concat(chunks).toString("utf8");
 }
 async function runHook(agent) {
+  let fullUpload;
   try {
     const [config, raw] = await Promise.all([loadConfig(), readStdin()]);
     const input = JSON.parse(raw);
@@ -3139,7 +3233,8 @@ async function runHook(agent) {
         return;
       }
     }
-    const continuedForkPrompt = hookName === "UserPromptSubmit" && typeof input.prompt === "string" && input.prompt.trim().length > 0 && !!adapter2.forkResumePredecessor?.(hookCommand);
+    const promptBearingHook = hookName === "UserPromptSubmit" && typeof input.prompt === "string" && input.prompt.trim().length > 0;
+    const continuedForkPrompt = promptBearingHook && !!adapter2.forkResumePredecessor?.(hookCommand);
     if (!existingRecord && !continuedForkPrompt && adapter2.isHeadlessInvocation && adapter2.isHeadlessInvocation({
       pid: hookPid,
       ancestorsOf: pidAncestors,
@@ -3148,6 +3243,17 @@ async function runHook(agent) {
       suppress({
         guard: "claude-headless-invocation",
         reason: "invoking process or ancestor matches a non-interactive/daemon discriminator"
+      });
+      return;
+    }
+    if (!existingRecord && !promptBearingHook && adapter2.isDesktopInvocation?.({
+      pid: hookPid,
+      ancestorsOf: pidAncestors,
+      commandOf: pidCommand
+    })) {
+      suppress({
+        guard: "claude-desktop-no-prompt",
+        reason: "never-tracked desktop-app session id has not carried a user prompt yet"
       });
       return;
     }
@@ -3203,6 +3309,7 @@ async function runHook(agent) {
     });
     if (!envelope)
       return;
+    fullUpload = postFullText(config, sessionId, "plan", planFull);
     const createsRecord = !existingRecord && plan.op !== "end";
     const retiresRecord = !!existingRecord && plan.op === "end";
     const origin = existingRecord?.origin ?? sessionOrigin(input, hookPid, hookCommand);
@@ -3268,7 +3375,9 @@ async function runHook(agent) {
     } else {
       await resetGoneStrikes();
     }
-  } catch {}
+  } catch {} finally {
+    await fullUpload;
+  }
 }
 
 // src/entries/codex-notify.ts

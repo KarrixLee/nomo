@@ -3,6 +3,7 @@ import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { afterEach, describe, expect, test } from "bun:test";
+import { decryptBlob } from "./crypto";
 import {
   appendCodexBridgeMarker, BRANCH_MAX_CHARS, branchFromHead, clearDecisionHoldAt, CODEX_BRIDGE_DOWN_MARKER, CODEX_DAEMON_START_ARGS,
   folderIdentity, resolveGitDir, sessionBranch,
@@ -10,7 +11,7 @@ import {
   DBG_BLOB_TEXT_MAX_CHARS, startCodexAppServerDaemon,
   decisionHoldFileName, ensureWatchdog, formatWatchdogPidfile, fullTextForRecord, isWatchdogCommand,
   readDecisionHoldAt, writeDecisionHoldAt,
-  localApprovalsState, parseWatchdogPidfile, PLUGIN_VERSION, RECORD_FULL_TEXT_MAX_CHARS,
+  localApprovalsState, parseWatchdogPidfile, PLUGIN_VERSION, postFullText, RECORD_FULL_TEXT_MAX_CHARS,
   RECORD_FULL_TEXT_TRUNCATION_MARKER, recordFullTextIsComplete, settleDecisionHoldRecordAt,
   stampPermissionDetailFullAt, watchdogBuildStamp,
   watchdogHolderIsLive,
@@ -529,6 +530,40 @@ describe("fullTextForRecord (what gets teed onto the session record)", () => {
   test("recordFullTextIsComplete keys off the marker the cap appends", () => {
     expect(recordFullTextIsComplete("the whole plan")).toBe(true);
     expect(recordFullTextIsComplete(`clipped${RECORD_FULL_TEXT_TRUNCATION_MARKER}`)).toBe(false);
+  });
+});
+
+// --- the remote half: what postFullText puts on the wire vs. inside the seal (NOM-44 phase 5) ----
+//
+// The split is the whole security property: the CLEAR body is what the blind worker keys on and must
+// stay exactly `{v, sessionId, what, blob}`; everything the phone re-asserts an answer against lives
+// INSIDE the seal, where only this Mac could have written it.
+
+describe("postFullText (the sealed identity vs. the clear body)", () => {
+  const KEY = new Uint8Array(32).fill(7);
+  const CONFIG = { url: "https://w.example", pairingId: "p1", pcSecret: "s1", e2eKey: KEY };
+
+  /** Runs one upload against a capturing fetch and hands back both halves of what it sent. */
+  const post = async (what: "plan" | "permission-detail", requestId?: string) => {
+    let sent: Record<string, unknown> | undefined;
+    const fn = (async (_url: string, init?: { body?: string }) => {
+      sent = JSON.parse(init!.body!) as Record<string, unknown>;
+      return new Response("{}", { status: 200 });
+    }) as unknown as typeof fetch;
+    await postFullText(CONFIG, "sess-1", what, "the whole thing", fn, undefined, requestId);
+    return { body: sent!, sealed: await decryptBlob(KEY, sent!.blob as string) as Record<string, unknown> };
+  };
+
+  test("the clear body is FROZEN — the request id rides only inside the seal", async () => {
+    const { body, sealed } = await post("permission-detail", "req-9");
+    expect(body).toEqual({ v: 2, sessionId: "sess-1", what: "permission-detail", blob: body.blob });
+    expect(sealed.requestId).toBe("req-9");
+  });
+
+  test("a PLAN seals no request id at all — it has no hold, and the phone asserts the absence", async () => {
+    const { sealed } = await post("plan");
+    expect(sealed).toEqual({ sessionId: "sess-1", what: "plan", content: "the whole thing", complete: true });
+    expect("requestId" in sealed).toBe(false); // `undefined` drops the key: byte-identical to before
   });
 });
 

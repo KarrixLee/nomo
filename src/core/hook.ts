@@ -27,7 +27,7 @@ import {
 } from "./adapter";
 import {
   AgentKind, appendFittedPlanAndDebug, atomicWrite, CCOp, CCStatus, codexCompanionBrokerEvidence, Config, decisionHoldFileName, ensureWatchdog, FolderIdentity, folderIdentity, formatPlanPickerDebug, fullTextForRecord, GONE_STRIKE_LIMIT,
-  LAST_SEND_PATH, lastHookPath, loadConfig, loadPendingConfig, localApprovalsState, PENDING_STASH_PATH, PendingEventStash, pidAncestors, pidCommand, PLUGIN_VERSION, readPrefix,
+  LAST_SEND_PATH, lastHookPath, loadConfig, loadPendingConfig, localApprovalsState, PENDING_STASH_PATH, PendingEventStash, pidAncestors, pidCommand, PLUGIN_VERSION, postFullText, readPrefix,
   readRecord, recordGoneStrike, removeRevokedConfig, resetGoneStrikes, SessionOrigin, SessionRecord, SESSIONS_DIR, sessionBranch, tracePlanPickerDecision, traceSession,
 } from "./shared";
 import { repairNotifyWiring } from "./notify-wire";
@@ -614,6 +614,10 @@ async function readStdin(): Promise<string> {
 // helpers (readGoneStrikes/resetGoneStrikes/recordGoneStrike) live in shared so the watchdog's
 // sweep counts against the SAME streak — see the shared-counter note there.
 export async function runHook(agent: AgentKind): Promise<void> {
+  /** The remote full-text upload (NOM-44 phase 5), once a truncated plan starts one. Function-scoped so
+   *  the `finally` below can settle it on EVERY exit — the entries call `process.exit(0)` the moment this
+   *  resolves, which would otherwise kill the request mid-flight. */
+  let fullUpload: Promise<void> | undefined;
   try {
     const [config, raw] = await Promise.all([loadConfig(), readStdin()]);
     const input = JSON.parse(raw) as Record<string, unknown>;
@@ -846,15 +850,38 @@ export async function runHook(agent: AgentKind): Promise<void> {
     // that only the watchdog's 30-min idle reap (or the worker's eviction) ever clears. The invoking
     // process's argv (process.ppid) and its ancestor chain fingerprint it. Only consulted for a NEVER-
     // tracked id, so an already-live interactive session can never be silenced.
-    const continuedForkPrompt = hookName === "UserPromptSubmit" &&
-      typeof input.prompt === "string" && input.prompt.trim().length > 0 &&
-      !!adapter.forkResumePredecessor?.(hookCommand);
+    const promptBearingHook = hookName === "UserPromptSubmit" &&
+      typeof input.prompt === "string" && input.prompt.trim().length > 0;
+    const continuedForkPrompt = promptBearingHook && !!adapter.forkResumePredecessor?.(hookCommand);
     if (!existingRecord && !continuedForkPrompt && adapter.isHeadlessInvocation && adapter.isHeadlessInvocation({
       pid: hookPid, ancestorsOf: pidAncestors, commandOf: pidCommand,
     })) {
       suppress({
         guard: "claude-headless-invocation",
         reason: "invoking process or ancestor matches a non-interactive/daemon discriminator",
+      });
+      return;
+    }
+
+    // Desktop-app phantoms (adapter seam; claude-only). A desktop session id is only worth a phone row
+    // once the USER has said something, so a never-tracked desktop id waits for its first prompt-bearing
+    // hook. `SessionStart` is not evidence of user intent there: opening the app mints ~9 ids that fire
+    // SessionStart source:"startup" → SessionEnd inside 200-600 ms and never a prompt, AND the app
+    // silently re-warms old conversations in the background with `--resume=<id>`, whose SessionStart
+    // source:"resume" the user never asked for — one of those sat "Running" on the phone for 10+ minutes
+    // untouched. Transcript existence was tried as the discriminator and is wrong in BOTH directions: a
+    // background re-warm has a full transcript (that ghost sailed straight through), while a real desktop
+    // session has NO transcript yet at its first UserPromptSubmit — traced live, ids e4890328 and
+    // 8fc9dfd6 were deferred at the prompt and only surfaced at Stop, i.e. after the whole first turn was
+    // already finished, with no model badge. A DEFER, not a verdict: the id is never-tracked and any
+    // later prompt-bearing hook creates the row normally. Scoped to DESKTOP invocations because a
+    // terminal `claude` legitimately creates its row at SessionStart.
+    if (!existingRecord && !promptBearingHook && adapter.isDesktopInvocation?.({
+      pid: hookPid, ancestorsOf: pidAncestors, commandOf: pidCommand,
+    })) {
+      suppress({
+        guard: "claude-desktop-no-prompt",
+        reason: "never-tracked desktop-app session id has not carried a user prompt yet",
       });
       return;
     }
@@ -952,6 +979,13 @@ export async function runHook(agent: AgentKind): Promise<void> {
       (plaintext) => { planFull = fullTextForRecord(proposedPlan, plaintext.plan); });
     if (!envelope) return;
 
+    // The same cut plan, sealed and pushed to the blind worker so a phone that is NOT on this network can
+    // pull it too (NOM-44 phase 5) — the LAN `read` op's remote twin. STARTED here, strictly before the
+    // event POST below, and awaited after it: the upload rides in parallel with the event that puts the
+    // row on the phone, so it costs that event no latency, and the await is what stops this short-lived
+    // hook from exiting mid-upload. `postFullText` no-ops when nothing was cut and never throws.
+    fullUpload = postFullText(config, sessionId, "plan", planFull);
+
     // Record (or, on op:end, remove) this session's file and make sure the liveness watchdog is
     // running before we POST — a force-killed terminal fires no SessionEnd, so this is how the phone
     // learns of a dead session in seconds instead of after the one-hour worker eviction.
@@ -1030,7 +1064,7 @@ export async function runHook(agent: AgentKind): Promise<void> {
         "x-cc-pairing": config.pairingId,
         "x-cc-auth": config.pcSecret,
         "x-cc-version": PLUGIN_VERSION,
-        // Whether remote approvals are paused ON THIS COMPUTER (`nomo-cc permission off`), so the phone
+        // Whether remote approvals are paused ON THIS COMPUTER (`/nomo-cc:approvals off`), so the phone
         // can stop claiming approvals are on while nothing will ever arrive. Plaintext, never in the
         // blob; the worker literal-matches "on"/"off" — see localApprovalsState's contract note.
         "x-cc-approvals": await localApprovalsState(),
@@ -1065,5 +1099,10 @@ export async function runHook(agent: AgentKind): Promise<void> {
     }
   } catch {
     // Silence is the contract — never surface errors into a Claude Code (or Codex) session.
+  } finally {
+    // Let the parallel full-text upload finish before the entry's process.exit(0). It has been in flight
+    // for the whole event POST, so this is almost always already resolved, and postFullText never
+    // rejects — so this can neither delay a healthy hook nor turn a soft miss into a thrown error.
+    await fullUpload;
   }
 }

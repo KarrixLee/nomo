@@ -59,6 +59,10 @@ export function isolatedTestEnv(
     XDG_CONFIG_HOME: join(home, ".config"),
     CODEX_HOME: join(home, ".codex"),
     NOMO_SKIP_WATCHDOG: "1",
+    // Pinned, not inherited: the Claude adapter classifies a desktop invocation from this var, so a
+    // suite run FROM the desktop app would otherwise make every spawned claude hook a desktop one and
+    // defer the rows the tests assert on. Desktop cases opt in through `overrides`.
+    CLAUDE_CODE_ENTRYPOINT: "cli",
     ...overrides,
   };
 }

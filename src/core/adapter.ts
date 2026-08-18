@@ -17,7 +17,7 @@ import { readdir, readFile, stat } from "node:fs/promises";
 import { promisify } from "node:util";
 import { basename, join } from "node:path";
 import { AgentKind, codexHome, folderKeyFromCwd, isRealTty, lastHookPath, pidAlive, pidAncestors, pidCommand, readPrefix, readSuffix, SessionRecord } from "./shared";
-import { ancestryContainsHerdr } from "./terminal-focus";
+import { ancestryContainsHerdr, owningTerminalApp } from "./terminal-focus";
 
 const execFileP = promisify(execFile);
 
@@ -902,16 +902,84 @@ export function claudeTailPendingApproval(tail: string): boolean {
  *  non-interactive print mode (`-p` / `--print`). An interactive human session carries none of these. */
 const CLAUDE_HEADLESS_ARG_TOKENS = new Set(["-p", "--print", "--output-format"]);
 
-/** Command-line shapes of known daemons/harnesses that spawn headless Claude (claude-mem's
- *  worker-service). Matched as SUBSTRINGS against the invoking process AND its ancestor chain, since a
- *  bundled worker shows up as an absolute script path rather than a bare token. */
-const CLAUDE_DAEMON_MARKERS = [
-  "claude-mem",
-  "worker-service",
+/** Command-line shapes of the claude BINARY's OWN detached modes: `claude daemon run --origin
+ *  transient` and the `--bg-pty-host` / `--bg-spare` ring it self-forks with `pinToCurrentBinary`.
+ *  These are real flags of the binary, so the DESKTOP-bundled binary forks the same spare ring under
+ *  the same `Claude.app` ancestry — the desktop allow-list below must NEVER rescue them. Matched as
+ *  SUBSTRINGS against the invoking process AND its ancestor chain. */
+const CLAUDE_SELF_DAEMON_MARKERS = [
   "daemon run --origin transient",
   "bg-pty-host",
   "bg-spare",
 ];
+
+/** Command-line shapes of THIRD-PARTY launchers that spawn headless Claude (claude-mem's
+ *  worker-service). Also substring-matched over the whole chain, because a bundled worker shows up as
+ *  an absolute script path rather than a bare token — which means these also match a mere flag VALUE.
+ *  The Claude desktop app passes exactly such values (`--plugin-dir …/claude-mem/13.12.4`, and
+ *  `--add-dir "<any user folder>"`), which is why the desktop allow-list is consulted BEFORE these.
+ *  ponytail: substring match can still hit a flag value on a NON-desktop invoker; the general cure is
+ *  a shell-quote-aware argv split, worth writing only if a second false-positive source appears. */
+const CLAUDE_LAUNCHER_MARKERS = ["claude-mem", "worker-service"];
+
+/** The value Claude Code puts in `CLAUDE_CODE_ENTRYPOINT` for a desktop-app conversation window (a
+ *  terminal CLI session says `cli`). Claude Code exports it into the environment it spawns hooks
+ *  with, and it is inherited by their children, so it is the PRIMARY desktop signal: no version
+ *  segment, no bundle location, no ancestor walk — and it works on Windows, where the `ps`-based
+ *  pidAncestors/pidCommand return nothing at all. */
+const CLAUDE_DESKTOP_ENTRYPOINT = "claude-desktop";
+
+/** The two halves of the path the Claude DESKTOP app runs its bundled `claude` from:
+ *  `~/Library/Application Support/Claude/claude-code/<version>/claude.app/Contents/MacOS/claude`.
+ *  Split around the version segment and anchored on neither `$HOME` nor `/Applications`: this project
+ *  has been bitten by version-pinned paths before (the hook shim), and a relocated bundle or a newer
+ *  claude-code must classify identically. */
+const CLAUDE_DESKTOP_BUNDLED_PATH_PARTS = [
+  "/Library/Application Support/Claude/claude-code/",
+  "/claude.app/Contents/MacOS/claude",
+];
+
+/** The desktop app's launcher, which sits between the Electron main process and the bundled `claude`:
+ *  `…/Claude.app/Contents/Helpers/disclaimer <cmd…>`. Location-agnostic on purpose. */
+const CLAUDE_DESKTOP_LAUNCHER = "Claude.app/Contents/Helpers/disclaimer";
+
+/** Pure: is this hook's invoking `claude` a conversation window of the Claude DESKTOP app?
+ *
+ *  PRIMARY signal: `entrypoint` — the process env's `CLAUDE_CODE_ENTRYPOINT`, read at the adapter
+ *  seam and injected here so this stays a pure classifier. Claude Code itself declares what it is.
+ *
+ *  FALLBACK (deliberately kept, not dead weight): the two path anchors — the bundled binary path on
+ *  the invoker's OWN argv AND the `disclaimer` launcher somewhere in its ancestry. The env var is
+ *  occasionally absent in practice (claude-status-bar carries the last known value forward across
+ *  events for exactly that reason), and a fingerprint that silently degraded to "not desktop" would
+ *  resurrect the suppressed-desktop-session bug INTERMITTENTLY — far worse to diagnose than the
+ *  deterministic version. Both anchors are required: either half alone is NOT enough — claude-mem
+ *  shells out to the PATH `claude` (so desktop ancestry with a `~/.local/bin/claude` self argv is
+ *  still an observer run), and the bundled binary self-forks its detached `--bg-spare` ring with no
+ *  disclaimer parent. The anchors are a fallback, never a VETO: a non-desktop entrypoint on the
+ *  bundled binary under `disclaimer` ancestry does not occur, and trusting the paths there keeps a
+ *  real conversation window mirroring.
+ *
+ *  ponytail: `claude-desktop` marks a desktop LINEAGE, not strictly a conversation WINDOW — the CLI
+ *  keeps an inherited entrypoint verbatim (it only rewrites an empty/`cli` one to `sdk-cli` for a
+ *  non-interactive run), so a third-party launcher that forwards its whole environment AND was itself
+ *  first started from a desktop session would hand its headless `claude` children `claude-desktop`
+ *  too, and this would allow-list them. Not a live risk here: claude-mem's worker daemon and its
+ *  observer runs were both verified to carry NO `CLAUDE_CODE_ENTRYPOINT` at all, and the argv anchors
+ *  still separate window from child on macOS. Upgrade path if a leaking launcher ever appears: gate
+ *  the entrypoint-only branch on the invoker's own argv being the bundled binary — which forfeits the
+ *  Windows/relocated-bundle coverage that is the whole point of the env var, so only pay it for a
+ *  real repro. */
+export function claudeDesktopInvocation(
+  selfArgs: string | undefined,
+  ancestorArgs: (string | undefined)[],
+  entrypoint?: string,
+): boolean {
+  if (entrypoint === CLAUDE_DESKTOP_ENTRYPOINT) return true;
+  if (typeof selfArgs !== "string" || selfArgs.length === 0) return false;
+  if (!CLAUDE_DESKTOP_BUNDLED_PATH_PARTS.every((part) => selfArgs.includes(part))) return false;
+  return ancestorArgs.some((a) => typeof a === "string" && a.includes(CLAUDE_DESKTOP_LAUNCHER));
+}
 
 /** Extract the predecessor session id from the precise Claude daemon fork/replay argv shape:
  *  `--fork-session --resume <old-transcript>.jsonl --reply-on-resume`. Requiring BOTH replay flags,
@@ -934,19 +1002,34 @@ export function claudeForkResumePredecessor(command: string | undefined): string
 /** Pure: does the invoking `claude`'s own argv, or any ANCESTOR's argv, look like a non-interactive /
  *  daemon-spawned run whose session must NOT become a phone row? `selfArgs` is process.ppid's command
  *  line (the `claude` that ran this hook); `ancestorArgs` are its ancestors' command lines (undefined
- *  entries — a `ps` that failed for that pid — are ignored). True iff a known daemon marker appears
- *  anywhere in the chain, OR the self argv carries a headless flag as a whole token (`--output-format`
- *  is followed by its value as a separate arg, so an exact-token match catches it; tokenizing means a
- *  path that merely contains "-p" can't false-trigger). */
-export function claudeHeadlessInvocation(selfArgs: string | undefined, ancestorArgs: (string | undefined)[]): boolean {
+ *  entries — a `ps` that failed for that pid — are ignored).
+ *
+ *  Order matters. The binary's own detached modes are checked FIRST and are unconditional, because the
+ *  Claude desktop app's bundled binary self-forks that very spare ring (`--bg-spare`, `--bg-pty-host`,
+ *  pinned to the same bundled path under the same `Claude.app` ancestry) — a desktop allow-list ahead
+ *  of them would resurrect every one of those phantoms. Only then is the DESKTOP allow-list consulted:
+ *  a real desktop conversation window is a human's interactive session and must mirror, yet its argv
+ *  trips both remaining branches — it carries `--output-format stream-json` (headless token) and it
+ *  passes `--plugin-dir …/claude-mem/<version>` (launcher marker matched inside a flag VALUE).
+ *
+ *  `entrypoint` (`CLAUDE_CODE_ENTRYPOINT`) reaches ONLY the desktop allow-list, and only at its
+ *  existing position. It must not be consulted earlier: that spare ring is forked BY the desktop
+ *  binary, so it inherits the desktop entrypoint too — an entrypoint check ahead of
+ *  CLAUDE_SELF_DAEMON_MARKERS would rescue every one of those phantoms. */
+export function claudeHeadlessInvocation(
+  selfArgs: string | undefined,
+  ancestorArgs: (string | undefined)[],
+  entrypoint?: string,
+): boolean {
   const chain = [selfArgs, ...ancestorArgs].filter((s): s is string => typeof s === "string" && s.length > 0);
-  if (chain.some((args) => CLAUDE_DAEMON_MARKERS.some((m) => args.includes(m)))) return true;
-  if (typeof selfArgs !== "string" || selfArgs.length === 0) return false;
-  const tokens = selfArgs.trim().split(/\s+/);
-  if (tokens.some((tok) => CLAUDE_HEADLESS_ARG_TOKENS.has(tok))) return true;
+  if (chain.some((args) => CLAUDE_SELF_DAEMON_MARKERS.some((m) => args.includes(m)))) return true;
+  const tokens = typeof selfArgs === "string" ? selfArgs.trim().split(/\s+/) : [];
   // The replay daemon carries neither -p nor --print. The pair is load-bearing: --fork-session alone
   // is a legitimate interactive feature, while --reply-on-resume is the daemon's auto-reply mode.
-  return tokens.includes("--fork-session") && tokens.includes("--reply-on-resume");
+  if (tokens.includes("--fork-session") && tokens.includes("--reply-on-resume")) return true;
+  if (claudeDesktopInvocation(selfArgs, ancestorArgs, entrypoint)) return false;
+  if (chain.some((args) => CLAUDE_LAUNCHER_MARKERS.some((m) => args.includes(m)))) return true;
+  return tokens.some((tok) => CLAUDE_HEADLESS_ARG_TOKENS.has(tok));
 }
 
 // --- Codex idle-vs-in-flight turn classification (for discovery/provisional rows) -------------
@@ -1022,10 +1105,11 @@ async function rolloutViaLsof(pid: number): Promise<string | undefined> {
   }
 }
 
-/** Pure: the session_meta `payload.cwd` from a rollout HEAD (its first line — verified live:
- *  `{"timestamp":…,"type":"session_meta","payload":{…,"cwd":"/Users/…",…}}`). Undefined when the head
- *  carries no parseable session_meta (byte-sliced/corrupt lines are skipped, like every tail scanner). */
-export function rolloutMetaCwd(head: string): string | undefined {
+/** Pure: one non-empty STRING field of the session_meta payload in a rollout HEAD (its first line —
+ *  verified live: `{"timestamp":…,"type":"session_meta","payload":{…,"cwd":"/Users/…",…}}`). Undefined
+ *  when the head carries no parseable session_meta (byte-sliced/corrupt lines are skipped, like every
+ *  tail scanner) or the field is absent/not a non-empty string. */
+function rolloutMetaField(head: string, key: string): string | undefined {
   for (const line of head.split("\n")) {
     if (!line.includes("session_meta")) continue; // cheap pre-filter
     let row: unknown;
@@ -1033,10 +1117,23 @@ export function rolloutMetaCwd(head: string): string | undefined {
     if (typeof row !== "object" || row === null) continue;
     const r = row as Record<string, unknown>;
     if (r.type !== "session_meta") continue;
-    const cwd = (r.payload as Record<string, unknown> | undefined)?.cwd;
-    if (typeof cwd === "string" && cwd.length > 0) return cwd;
+    const value = (r.payload as Record<string, unknown> | undefined)?.[key];
+    if (typeof value === "string" && value.length > 0) return value;
   }
   return undefined;
+}
+
+/** Pure: the session_meta `payload.cwd` from a rollout HEAD. */
+export function rolloutMetaCwd(head: string): string | undefined {
+  return rolloutMetaField(head, "cwd");
+}
+
+/** Pure: the session_meta `payload.originator` from a rollout HEAD — the FRONT-END that created the
+ *  session, stamped by codex at creation ("codex-tui" for the terminal, "Codex Desktop" for the
+ *  desktop app, "codex_exec" for automation). It is the only signal that survives the desktop app's
+ *  process shape; see codexDesktopAppPid. */
+export function rolloutMetaOriginator(head: string): string | undefined {
+  return rolloutMetaField(head, "originator");
 }
 
 /** Bounds for the cwd+recency fallback scan: only the most recent day-directories are visited and at
@@ -1272,6 +1369,49 @@ export function filterCodexTuis(
   return codexTuiCandidates(rows, knownPids).map(({ pid }) => ({ pid }));
 }
 
+// --- Codex DESKTOP app ("Open on Mac" for a session that never had a terminal) ----------------
+//
+// The Codex desktop app — the `Codex`-branded ChatGPT.app, bundle id com.openai.codex — hosts its
+// conversations inside a tty-less `codex app-server`, so a desktop session is refused by every gate
+// on the focus path: codexTuiCandidates drops it (no controlling tty, deliberately — that filter is
+// what keeps editor/app daemons out of DISCOVERY), and its ancestry names no window either, because
+// the app-server it runs under is often the standalone ~/.codex daemon whose parent is launchd, not
+// the app bundle. Exactly the Claude-desktop bug of 2026-08-14 in its third shape, minus the one
+// affordance that fix had: there is no ancestor to recognise.
+//
+// The ROLLOUT is what still knows. Codex stamps the creating front-end into session_meta.originator
+// at session creation (the same durable, creation-time discriminator codexRolloutCreationEvidence
+// already trusts for `codex exec`), so a desktop session is identifiable from the record alone, and
+// the window to raise is then the app's OWN GUI process rather than anything the session runs in.
+//
+// ponytail: the originator strings are matched literally, so an OpenAI rename silently reverts this
+// to today's no-op. Upgrade path if that ever bites: a structural signal (the app's bundle path in
+// the rollout) — none exists in 0.147's session_meta.
+
+/** Rollout `originator` values that mean "this session was created by the Codex DESKTOP app".
+ *  "Codex Desktop" is current (0.147); "codex_work_desktop" is the same app's older stamp, still
+ *  present in rollouts on disk. Every other originator — "codex-tui", an editor extension's, an
+ *  MCP client's — is deliberately absent: only a session whose front-end IS a Mac app has a Mac app
+ *  window to raise. */
+const CODEX_DESKTOP_ORIGINATORS = new Set(["Codex Desktop", "codex_work_desktop"]);
+
+/** True when a rollout head identifies a Codex DESKTOP app session. */
+export function codexDesktopOriginator(head: string): boolean {
+  const originator = rolloutMetaOriginator(head);
+  return originator !== undefined && CODEX_DESKTOP_ORIGINATORS.has(originator);
+}
+
+/** The Codex desktop app's own GUI process, from the process rows the locator already scanned. The
+ *  app's Electron main is the ONE process whose argv carries the bundle's executable path
+ *  `…/ChatGPT.app/Contents/MacOS/…`; every helper (renderer, GPU, network, the bundled `codex`
+ *  app-server) lives under `Contents/Frameworks/` or `Contents/Resources/` instead, so none of them
+ *  can be mistaken for it. Undefined when the app is not running — the command then no-ops honestly
+ *  rather than raising something else. Pure. */
+export function codexDesktopAppPid(rows: { pid: number; args: string }[]): number | undefined {
+  const matched = rows.filter((r) => /\/ChatGPT\.app\/Contents\/MacOS\//.test(r.args));
+  return matched.length === 1 ? matched[0].pid : undefined;
+}
+
 /** cwd basename → the provisional's label/title, exactly like buildBlob's cwd-basename `label`
  *  ("session" when the cwd is unknown or the filesystem root). */
 function labelFromCwd(cwd: string | undefined): string {
@@ -1390,6 +1530,7 @@ export type LocateTuiReason =
   | "sentinel-pid"    // 2. the codex-pid-<n> provisional sentinel names a live TUI
   | "cwd-unique"      // 3. exactly one live TUI runs in the record's origin cwd
   | "start-time"      // 4. the strictly closest process start to the session's start
+  | "desktop-app"     // the session's front-end is the Codex DESKTOP app; its GUI process was found
   | "only-candidate"  // 5. nothing correlated, but the machine has exactly ONE TUI
   | "ambiguous"       // two or more equally-plausible TUIs — deliberately no guess
   | "no-candidate"    // no live TUI at all (or the record has no usable pid)
@@ -1410,6 +1551,8 @@ export interface LocateTuiDeps {
   ancestorsOf?: (pid: number) => number[];
   /** A pid's full argv (shared.pidCommand) — the herdr-ownership probe. */
   commandOf?: (pid: number) => string | undefined;
+  /** Bounded head read of a rollout (shared.readPrefix) — the desktop-originator probe. */
+  readHead?: (path: string, maxBytes: number) => Promise<string>;
   /** Optional outcome sink (see LocateTuiReason). Best-effort; never throws into the caller. */
   note?: (reason: LocateTuiReason) => void;
 }
@@ -1450,10 +1593,29 @@ function sentinelPid(sessionId: string): number | undefined {
   return Number.isFinite(pid) ? pid : undefined;
 }
 
-/** Locate the interactive Codex TUI process for a session record. ORDERED heuristic; the first
- *  unambiguous hit wins and nothing later can override it:
+/** Whether this session was created by the Codex DESKTOP app, read from its rollout's session_meta
+ *  (see the CODEX_DESKTOP_ORIGINATORS note). A record with no rollout path, an unreadable rollout, or
+ *  any other originator answers false — the terminal heuristics below then run exactly as before. */
+async function codexSessionIsDesktop(record: SessionRecord, deps: LocateTuiDeps): Promise<boolean> {
+  const rollout = record.transcript;
+  if (typeof rollout !== "string" || rollout.length === 0) return false;
+  try {
+    return codexDesktopOriginator(await (deps.readHead ?? readPrefix)(rollout, ROLLOUT_META_HEAD_BYTES));
+  } catch {
+    return false; // rollout gone/unreadable → no evidence, not a verdict
+  }
+}
+
+/** Locate the process whose macOS window "Open on Mac" should raise for a Codex session. ORDERED
+ *  heuristic; the first unambiguous hit wins and nothing later can override it:
  *    1. `record.pid` is itself one of the live codex TUI candidates → that process.
  *    2. the session id is the `codex-pid-<n>` discovery sentinel and <n> is a candidate → that one.
+ *    2.5 the rollout says the session's front-end is the Codex DESKTOP app → the APP's own GUI
+ *       process (it has no terminal at all). Decisive either way: a desktop session whose app is not
+ *       running yields nothing rather than falling through to the terminal heuristics, where step 5
+ *       would hand it whatever lone codex TUI happens to be open — the wrong window, which is the one
+ *       outcome this whole path exists to prevent. It sits AFTER the two exact pid hits so an ordinary
+ *       terminal session never pays for the rollout read.
  *    3. cwd: resolve each candidate's cwd and keep those equal to `record.origin?.cwd`. Exactly one
  *       → that one; several → continue with ONLY that subset. (Skipped entirely when the record has
  *       no origin cwd — older/provisional records — and NEVER approximated by `record.label`, the cwd
@@ -1476,11 +1638,8 @@ export async function codexLocateTuiPid(
     }
     // knownPids is EMPTY here on purpose: discovery excludes already-tracked pids, but a locate is
     // asking about a tracked session, so its own process must remain a candidate.
-    const candidates = codexTuiCandidates(parseCodexProcs(output), new Set());
-    if (candidates.length === 0) {
-      noteLocate(deps, "no-candidate");
-      return undefined;
-    }
+    const rows = parseCodexProcs(output);
+    const candidates = codexTuiCandidates(rows, new Set());
     const pids = new Set(candidates.map((c) => c.pid));
 
     // 1. the record's own pid is a live TUI (the common, exact case).
@@ -1494,6 +1653,23 @@ export async function codexLocateTuiPid(
     if (sentinel !== undefined && pids.has(sentinel)) {
       noteLocate(deps, "sentinel-pid");
       return sentinel;
+    }
+
+    // 2.5 the Codex DESKTOP app: no terminal exists, so the app's own window is the answer — and the
+    // terminal heuristics below must not run for it (see the header).
+    if (await codexSessionIsDesktop(ctx.record, deps)) {
+      const appPid = codexDesktopAppPid(rows);
+      if (appPid !== undefined) {
+        noteLocate(deps, "desktop-app");
+        return appPid;
+      }
+      noteLocate(deps, "no-candidate"); // the desktop app is not running
+      return undefined;
+    }
+
+    if (candidates.length === 0) {
+      noteLocate(deps, "no-candidate");
+      return undefined;
     }
 
     // 3. cwd equality (exact path, never the basename).
@@ -1560,13 +1736,16 @@ export async function codexLocateTuiPid(
  *  process.ppid, the `claude` process). The check is that the pid still owns a window:
  *    • if herdr's daemon owns its pty (the pid or an ancestor IS a herdr process) the pid's own tty
  *      is MEANINGLESS — terminal-focus correlates the herdr PANE instead — so it is accepted as-is;
+ *    • if the Claude DESKTOP app owns it, likewise: a conversation window is a GUI window, and
+ *      terminal-focus raises it by bundle id without ever consulting a tty;
  *    • otherwise it must hold a REAL controlling tty, because a dead pid, or one whose tty is "??"
  *      (a headless `claude`), owns no terminal window and there is nothing to focus.
  *  The herdr clause exists because a Claude BACKGROUND/forked session (`claude daemon run` →
  *  `--bg-pty-host`) records a daemon-hosted ppid that always reads "??" while its herdr tab is open
  *  and uniquely correlatable — the tty-only rule silently no-opped "Open on Mac" for every one of
- *  them (field report 2026-08-02). A dead pid has no readable ancestry, so it can never take that
- *  clause. Never throws. */
+ *  them (field report 2026-08-02). The desktop clause is the same bug in its second shape. Both are
+ *  safe on a dead pid: `ps` reports no ancestry and no argv for one, so neither predicate can answer
+ *  true and a stale record can never be resurrected onto a live window. Never throws. */
 export async function claudeLocateTuiPid(
   ctx: { sessionId: string; record: SessionRecord }, deps: LocateTuiDeps = {},
 ): Promise<number | undefined> {
@@ -1576,7 +1755,27 @@ export async function claudeLocateTuiPid(
       noteLocate(deps, "no-candidate");
       return undefined;
     }
-    if (ancestryContainsHerdr(pid, deps.ancestorsOf ?? pidAncestors, deps.commandOf ?? pidCommand)) {
+    const ancestorsOf = deps.ancestorsOf ?? pidAncestors;
+    const commandOf = deps.commandOf ?? pidCommand;
+    if (ancestryContainsHerdr(pid, ancestorsOf, commandOf)) {
+      noteLocate(deps, "record-pid");
+      return pid;
+    }
+    // The second tty-less-but-focusable owner: a Claude DESKTOP conversation window. Its `claude` runs
+    // under the app bundle and reads tty "??", so the gate below refused it and "Open on Mac" was a
+    // silent no-op for every desktop-app session.
+    //
+    // WHY owningTerminalApp AND NOT claudeDesktopInvocation, which also identifies a desktop session:
+    // the two answer different questions and only one of them is the question here. That classifier
+    // decides whether a HOOK's session should mirror to the phone (it reads CLAUDE_CODE_ENTRYPOINT out
+    // of the live hook environment, which the watchdog — reading a persisted record minutes later — has
+    // no access to). This clause has to decide something narrower: will terminal-focus be able to raise
+    // a window for this pid? The only honest answer is to ask terminal-focus itself. Two agreeing-but-
+    // separate desktop rules is precisely how this project grows recurring defects: a pid admitted here
+    // that the focus module then refuses is a no-op again, with a locate trace that says it worked.
+    // For the same reason this asks for the OWNER'S declared tty-lessness rather than naming the one
+    // app: the gate it is predicting is spelled exactly that way.
+    if (owningTerminalApp(pid, ancestorsOf, commandOf)?.ttyless === true) {
       noteLocate(deps, "record-pid");
       return pid;
     }
@@ -1921,6 +2120,12 @@ export interface AgentAdapter {
    *  reader (pidCommand) so the pure classifier stays testable. Called by runHook only when NO session
    *  record exists yet, so an already-live interactive session can never be silenced. */
   isHeadlessInvocation?(ctx: { pid: number; ancestorsOf: (pid: number) => number[]; commandOf: (pid: number) => string | undefined }): boolean;
+  /** OPTIONAL: is the INVOKING agent process a DESKTOP-app conversation window (as opposed to a
+   *  terminal CLI)? Same ctx as isHeadlessInvocation. Claude implements it (see
+   *  claudeDesktopInvocation); Codex OMITS it. runHook uses it to scope the transcript-less launch
+   *  phantom defer to desktop invocations only — a fresh terminal `claude` legitimately creates its
+   *  row before its transcript exists, and that must keep working. */
+  isDesktopInvocation?(ctx: { pid: number; ancestorsOf: (pid: number) => number[]; commandOf: (pid: number) => string | undefined }): boolean;
   /** Where this agent's session transcripts live (recursively scanned for liveness). */
   sessionsDir(): string;
   /** Whether a filename under sessionsDir() is one of this agent's session transcripts. */
@@ -2002,7 +2207,20 @@ export const claudeAdapter: AgentAdapter = {
   // Fingerprint it from the invoking process's argv + ancestor chain and DEFER (skip mirroring) so it
   // never becomes a stuck "working" phone row. See claudeHeadlessInvocation.
   isHeadlessInvocation({ pid, ancestorsOf, commandOf }): boolean {
-    return claudeHeadlessInvocation(commandOf(pid), ancestorsOf(pid).map((p) => commandOf(p)));
+    return claudeHeadlessInvocation(
+      commandOf(pid), ancestorsOf(pid).map((p) => commandOf(p)), process.env.CLAUDE_CODE_ENTRYPOINT,
+    );
+  },
+  // Phantom scope: opening the Claude desktop app fires SessionStart→SessionEnd within a second for
+  // ~9 session ids that never get a prompt, and the app re-warms old conversations in the background
+  // with `--resume`. Only desktop invocations wait for a first user prompt before creating a row.
+  // See claudeDesktopInvocation. `CLAUDE_CODE_ENTRYPOINT` is
+  // read HERE, at the IO boundary, so the classifier itself stays pure and testable — same discipline
+  // as injecting commandOf/ancestorsOf rather than shelling out inside it.
+  isDesktopInvocation({ pid, ancestorsOf, commandOf }): boolean {
+    return claudeDesktopInvocation(
+      commandOf(pid), ancestorsOf(pid).map((p) => commandOf(p)), process.env.CLAUDE_CODE_ENTRYPOINT,
+    );
   },
   forkResumePredecessor(command: string | undefined): string | undefined {
     return claudeForkResumePredecessor(command);
