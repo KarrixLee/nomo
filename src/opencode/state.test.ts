@@ -42,14 +42,14 @@ const idle = (sessionID: string) => ({
   properties: { sessionID },
 });
 
-const assistantMessage = (sessionID: string, providerID: string, modelID: string) => ({
+const assistantMessage = (sessionID: string, providerID: string, modelID: string, agent = "build") => ({
   id: "evt_0163aa0d0001gFT58uSRiSm2cH",
   type: "message.updated",
   properties: {
     sessionID,
     info: {
       id: "msg_0163aa0d0001A0sadEqzAdxowG", parentID: "msg_0163a9f06001IRc8Y1JU3LerD2",
-      role: "assistant", mode: "build", agent: "build", cost: 0,
+      role: "assistant", mode: agent, agent, cost: 0,
       modelID, providerID, time: { created: 1787079336144 }, sessionID,
     },
   },
@@ -370,6 +370,76 @@ describe("todos", () => {
       priority: "medium",
     })))!;
     expect(plan.length).toBeLessThan(PLAN_BLOB_TEXT_MAX_CHARS);
+  });
+});
+
+describe("plan mode rides the detail seam", () => {
+  const sessionUpdated = (sessionID: string, agent: string | null) => ({
+    id: "evt_0163741fd009Rp8FShe71BoEc2",
+    type: "session.updated",
+    properties: { sessionID, info: { id: sessionID, title: "Explore codebase structure", agent } },
+  });
+
+  test("an assistant message in the plan agent puts \"Planning\" on the next working frame", () => {
+    const state = startedRoot();
+    expect(reduceOcEvent(state, assistantMessage(ROOT, "opencode", "nemotron-3.5-lightning-free", "plan"), 2_000))
+      .toBeNull(); // agent only, no frame of its own
+    const frame = reduceOcEvent(state, status(ROOT, { type: "busy" }), 2_100)!;
+    expect(frame.detail).toBe("Planning");
+    // Ambient, exactly like todos: no attention, no status change.
+    expect(frame.status).toBe("working");
+    expect(frame.prio).toBe(0);
+  });
+
+  test("the TUI's create-time agent stamp lands on the very first frame", () => {
+    const state = newOcState();
+    expect(reduceOcEvent(state, created(ROOT, "Explore codebase structure", { agent: "plan" }), 1_000)?.detail)
+      .toBe("Planning");
+  });
+
+  test("going back to build clears the detail", () => {
+    const state = startedRoot();
+    reduceOcEvent(state, assistantMessage(ROOT, "opencode", "nemotron-3.5-lightning-free", "plan"), 2_000);
+    expect(reduceOcEvent(state, status(ROOT, { type: "busy" }), 2_100)?.detail).toBe("Planning");
+    reduceOcEvent(state, assistantMessage(ROOT, "opencode", "nemotron-3.5-lightning-free", "build"), 3_000);
+    expect(reduceOcEvent(state, status(ROOT, { type: "busy" }), 3_100)?.detail).toBeUndefined();
+  });
+
+  // The plan_exit trap: plan_exit bypasses setAgentModel, so session.updated keeps saying "plan"
+  // after the assistant has already flipped to build. The assistant message must win.
+  test("a stale session.updated saying plan does not override a newer assistant build message", () => {
+    const state = startedRoot();
+    reduceOcEvent(state, assistantMessage(ROOT, "opencode", "nemotron-3.5-lightning-free", "plan"), 2_000);
+    reduceOcEvent(state, assistantMessage(ROOT, "opencode", "nemotron-3.5-lightning-free", "build"), 3_000);
+    reduceOcEvent(state, sessionUpdated(ROOT, "plan"), 3_100); // STALE
+    expect(reduceOcEvent(state, status(ROOT, { type: "busy" }), 3_200)?.detail).toBeUndefined();
+    reduceOcEvent(state, idle(ROOT), 3_300);
+    reduceOcEvent(state, sessionUpdated(ROOT, "plan"), 3_400); // still stale at end of turn
+    expect(reduceOcEvent(state, status(ROOT, { type: "busy" }), 3_500)?.detail).toBeUndefined();
+  });
+
+  test("session.updated seeds the agent before any assistant message has spoken", () => {
+    const state = startedRoot();
+    reduceOcEvent(state, sessionUpdated(ROOT, "plan"), 1_500);
+    expect(reduceOcEvent(state, status(ROOT, { type: "busy" }), 1_600)?.detail).toBe("Planning");
+  });
+
+  test("a null or absent agent leaves what we already know alone", () => {
+    const state = newOcState();
+    // HTTP `POST /session` creates with agent: null.
+    expect(reduceOcEvent(state, created(ROOT, "Explore codebase structure", { agent: null }), 1_000)?.detail)
+      .toBeUndefined();
+    reduceOcEvent(state, sessionUpdated(ROOT, "plan"), 1_500);
+    reduceOcEvent(state, sessionUpdated(ROOT, null), 1_600);
+    expect(reduceOcEvent(state, status(ROOT, { type: "busy" }), 1_700)?.detail).toBe("Planning");
+  });
+
+  test("a retry message still wins over Planning, and Planning is not on the done frame", () => {
+    const state = startedRoot();
+    reduceOcEvent(state, assistantMessage(ROOT, "opencode", "nemotron-3.5-lightning-free", "plan"), 2_000);
+    expect(reduceOcEvent(state, status(ROOT, { type: "retry", message: "overloaded, retrying" }), 2_100)?.detail)
+      .toBe("overloaded, retrying");
+    expect(reduceOcEvent(state, idle(ROOT), 2_200)?.detail).toBeUndefined();
   });
 });
 

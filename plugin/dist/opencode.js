@@ -79,7 +79,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "2.1.2";
+var PLUGIN_VERSION = "2.1.3";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -4216,6 +4216,7 @@ function reduceOcEvent(state, event, now = Date.now()) {
         working: false
       };
       applyTitle(created, info);
+      applyAgent(created, info, false);
       state.sessions.set(sessionId, created);
       return frame(sessionId, created, "start", "working", now);
     }
@@ -4223,6 +4224,7 @@ function reduceOcEvent(state, event, now = Date.now()) {
       if (!entry)
         return null;
       applyTitle(entry, info);
+      applyAgent(entry, info, false);
       return null;
     }
     case "message.updated": {
@@ -4231,6 +4233,8 @@ function reduceOcEvent(state, event, now = Date.now()) {
       const model = ocModelFromMessage(info);
       if (model)
         entry.model = model;
+      if (info.role === "assistant")
+        applyAgent(entry, info, true);
       return null;
     }
     case "session.status": {
@@ -4289,6 +4293,14 @@ function adopt(state, sessionId, now) {
   state.sessions.set(sessionId, entry);
   return entry;
 }
+function applyAgent(entry, info, fromMessage) {
+  const agent = asString2(info?.agent);
+  if (!agent || entry.agentFromMessage && !fromMessage)
+    return;
+  entry.agent = agent;
+  if (fromMessage)
+    entry.agentFromMessage = true;
+}
 function applyTitle(entry, info) {
   const title = asString2(info?.title);
   if (title && !isDefaultOcTitle(title))
@@ -4300,12 +4312,13 @@ function frame(sessionId, entry, op, status, now, detail, prio = 0) {
       entry.turnStartedAt = Math.floor(now / 1000);
     entry.working = true;
   }
+  const sub = detail ?? (status === "working" && entry.agent === "plan" ? "Planning" : undefined);
   return {
     sessionId,
     op,
     prio,
     status,
-    ...detail ? { detail } : {},
+    ...sub ? { detail: sub } : {},
     ...entry.title ? { title: entry.title } : {},
     ...entry.model ? { model: entry.model } : {},
     ...entry.plan ? { plan: entry.plan } : {},

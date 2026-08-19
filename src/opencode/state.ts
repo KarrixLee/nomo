@@ -26,7 +26,7 @@ export interface OcFrame {
   op: CCOp;
   prio: 0 | 1;
   status: CCStatus;
-  /** Sub-status line (only a `retry`'s message today). */
+  /** Sub-status line: a `retry`'s message, else `"Planning"` while the plan agent holds the session. */
   detail?: string;
   title?: string;
   model?: string;
@@ -49,6 +49,13 @@ export interface OcSessionState {
   lastStatusFrame?: string;
   /** The last `todo.updated` list, already rendered to markdown. */
   plan?: string;
+  /** The session's current agent (`"plan"` / `"build"` / a user-defined primary). */
+  agent?: string;
+  /** Whether `agent` came from an assistant message. Once it has, a `session.*` event may never
+   *  overwrite it: `session.updated.agent` goes STALE after a `plan_exit` build switch (it keeps
+   *  saying `plan` until the next user prompt, because plan_exit bypasses `setAgentModel`), while the
+   *  assistant message is right every turn. Session events are a first-frame SEED, nothing more. */
+  agentFromMessage?: boolean;
 }
 
 export interface OcState {
@@ -114,8 +121,10 @@ function asString(value: unknown): string | undefined {
 
 /** `provider/model` — OpenCode's own spelling for a model reference (`Provider.parseModel` splits on
  *  the first `/`), and the string the user picked in the TUI. Read from the newest ASSISTANT
- *  `message.updated`, never from `session.model`: those columns exist on 1.18.15 but are entirely
- *  unpopulated (322 rows, 0 models) — that write is a dev-branch addition. */
+ *  `message.updated`, never from `session.model`: `session.model` IS populated on 1.18.15 (both
+ *  `session.created` from the TUI and `session.updated` carry `{id, providerID, variant}` — the 322
+ *  model-less rows in `opencode.db` are pre-existing history), but the assistant message is the
+ *  per-turn truth and already visited here, so there is nothing to gain by reading two sources. */
 export function ocModelFromMessage(info: Record<string, unknown>): string | undefined {
   if (info.role !== "assistant") return undefined;
   const providerID = asString(info.providerID);
@@ -143,8 +152,8 @@ function statusType(status: unknown): string | undefined {
  *  | `session.status {idle}`        | (nothing — `session.idle` is the authoritative done)      |
  *  | `session.idle` (root)          | done / done                                              |
  *  | `session.deleted`              | end                                                      |
- *  | `session.updated`              | (title only, no frame)                                   |
- *  | `message.updated` (assistant)  | (model only, no frame)                                   |
+ *  | `session.updated`              | (title + agent seed only, no frame)                      |
+ *  | `message.updated` (assistant)  | (model + agent only, no frame)                           |
  *  | `todo.updated`                 | update / working, `plan` = the whole list as markdown     |
  *
  *  The approval channels (`permission.asked` / `question.asked`) are DELIBERATELY absent: they are not
@@ -179,6 +188,7 @@ export function reduceOcEvent(state: OcState, event: unknown, now: number = Date
         working: false,
       };
       applyTitle(created, info);
+      applyAgent(created, info, false); // the TUI stamps the agent at create; HTTP `POST /session` sends null
       state.sessions.set(sessionId, created);
       return frame(sessionId, created, "start", "working", now);
     }
@@ -186,6 +196,7 @@ export function reduceOcEvent(state: OcState, event: unknown, now: number = Date
     case "session.updated": {
       if (!entry) return null; // a session we never saw start — the plugin loaded mid-flight
       applyTitle(entry, info);
+      applyAgent(entry, info, false);
       return null; // the next status/idle frame carries the new title
     }
 
@@ -193,6 +204,7 @@ export function reduceOcEvent(state: OcState, event: unknown, now: number = Date
       if (!entry || !info) return null;
       const model = ocModelFromMessage(info);
       if (model) entry.model = model;
+      if (info.role === "assistant") applyAgent(entry, info, true);
       return null;
     }
 
@@ -274,6 +286,18 @@ function adopt(state: OcState, sessionId: string, now: number): OcSessionState {
   return entry;
 }
 
+/** Record the session's agent. `fromMessage` marks the never-stale assistant-message source, which
+ *  latches: after it has spoken, `session.*` is ignored. An absent/null agent (every HTTP
+ *  `POST /session`) changes nothing rather than clearing what we already know. */
+function applyAgent(
+  entry: OcSessionState, info: Record<string, unknown> | undefined, fromMessage: boolean,
+): void {
+  const agent = asString(info?.agent);
+  if (!agent || (entry.agentFromMessage && !fromMessage)) return;
+  entry.agent = agent;
+  if (fromMessage) entry.agentFromMessage = true;
+}
+
 function applyTitle(entry: OcSessionState, info: Record<string, unknown> | undefined): void {
   const title = asString(info?.title);
   if (title && !isDefaultOcTitle(title)) entry.title = title;
@@ -290,12 +314,20 @@ function frame(
     if (!entry.working || entry.turnStartedAt === undefined) entry.turnStartedAt = Math.floor(now / 1000);
     entry.working = true;
   }
+  // AMBIENT, EXACTLY LIKE TODOS. With `OPENCODE_EXPERIMENTAL_PLAN_MODE` off (the default) a plan turn
+  // emits an event stream identical to a build turn — no plan file, no `plan_exit`, no extra events —
+  // and the ONLY thing that differs is this string. So it rides the existing free-text detail seam on
+  // a working frame: no blob key, no iOS change, no `attentionKind`, no status change. Gated to
+  // `working` so a finished row does not claim to still be planning, and yielding to an explicit
+  // detail (a `retry` message) — that is a transient the user needs, and the agent is still there on
+  // the next busy.
+  const sub = detail ?? (status === "working" && entry.agent === "plan" ? "Planning" : undefined);
   return {
     sessionId,
     op,
     prio,
     status,
-    ...(detail ? { detail } : {}),
+    ...(sub ? { detail: sub } : {}),
     ...(entry.title ? { title: entry.title } : {}),
     ...(entry.model ? { model: entry.model } : {}),
     ...(entry.plan ? { plan: entry.plan } : {}),
