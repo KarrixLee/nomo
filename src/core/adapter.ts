@@ -16,7 +16,7 @@ import { execFile } from "node:child_process";
 import { readdir, readFile, stat } from "node:fs/promises";
 import { promisify } from "node:util";
 import { basename, join } from "node:path";
-import { AgentKind, CC_DIR, codexHome, folderKeyFromCwd, isRealTty, lastHookPath, pidAlive, pidAncestors, pidCommand, readPrefix, readSuffix, SessionRecord } from "./shared";
+import { AgentKind, AgentKindWire, CC_DIR, codexHome, folderKeyFromCwd, isRealTty, lastHookPath, pidAlive, pidAncestors, pidCommand, readPrefix, readSuffix, SessionRecord } from "./shared";
 import { ancestryContainsHerdr, owningTerminalApp } from "./terminal-focus";
 
 const execFileP = promisify(execFile);
@@ -2035,8 +2035,9 @@ export function findProvisionalForPid(
  *  selects the concrete adapter; the agent-agnostic pipeline dispatches through it. */
 export interface AgentAdapter {
   /** The blob/record `agent` literal — baked into on-disk `last-hook-<agent>` names, so it MUST equal
-   *  the existing "claude"/"codex" values. */
-  kind: AgentKind;
+   *  the existing "claude"/"codex" values. WIRE-wide because `adapterFor` also answers for kinds this
+   *  build has never heard of (see its passthrough adapter). */
+  kind: AgentKindWire;
   /** Resolve the session's display title from the (already-read) transcript prefix + hook input.
    *  Async because the codex path reads the session_index and the claude path reads a bounded
    *  transcript TAIL — on a long session the freshest ai-title lives near the END, outside the head
@@ -2143,7 +2144,7 @@ export interface AgentAdapter {
    *  per-agent branch remains in the agent-agnostic daemon. Typed as `{ agent?: AgentKind }` so it
    *  spreads cleanly into both a blob object and a SessionRecord (whose `agent` follows the same
    *  omit-for-claude convention). */
-  blobAgentFields: { agent?: AgentKind };
+  blobAgentFields: { agent?: AgentKindWire };
   /** OPTIONAL: discover live sessions the hooks can't see yet — interactive TUIs for which NO
    *  SessionStart has fired. Called on every watchdog sweep with the already-tracked sessions (so their
    *  pids can be excluded). Claude OMITS it (its SessionStart fires at true session open, so there's
@@ -2357,12 +2358,44 @@ export const opencodeAdapter: AgentAdapter = {
   blobAgentFields: { agent: "opencode" as const },
 };
 
-/** Select the concrete adapter for an agent kind. */
-export function adapterFor(agent: AgentKind): AgentAdapter {
+/** The adapter for an agent kind THIS BUILD DOES NOT KNOW — a record stamped by a newer peer install
+ *  (see AgentKindWire). Its whole job is `blobAgentFields`: carry the raw literal back out, so a
+ *  rebuild by an older build re-emits the agent it was handed instead of silently dropping the key and
+ *  demoting the row to Claude Code on the phone. Every optional seam is ABSENT and every required one
+ *  is inert (same shape as opencodeAdapter, which is a stub for the same reason): this build has no
+ *  transcript format, no hook channel and no discovery for an agent it has never heard of, so the
+ *  honest answer everywhere else is "nothing".
+ *
+ *  Never registered in `allAdapters` and never reachable from the hook (which resolves its own agent
+ *  from its own event) — only from the REBUILD paths, which is exactly where the coercion bug lived. */
+function unknownAgentAdapter(kind: string): AgentAdapter {
+  return {
+    kind,
+    title: async () => undefined,
+    detectInterrupt: () => false,
+    // Deliberately not derived from `kind`: an unknown literal is untrusted text, and neither of these
+    // is ever read for a passthrough adapter anyway (nothing sweeps or health-checks an agent we do
+    // not implement). Naming a path that cannot exist keeps a stray caller harmless.
+    sessionsDir: () => `${CC_DIR}/unknown-agent-has-no-sessions-dir`,
+    sessionMatch: () => false,
+    hookStampPath: () => `${CC_DIR}/last-hook-unknown-agent`,
+    hooksNotFiringHint: "  This session was created by a newer nomo install — update this one.",
+    toolDetail: {},
+    // THE ONE LIVE MEMBER: the literal, passed straight through.
+    blobAgentFields: { agent: kind },
+  };
+}
+
+/** Select the concrete adapter for an agent kind. An unrecognised (but non-empty) literal gets the
+ *  passthrough adapter above rather than being coerced to claude — see AgentKindWire for the frame
+ *  corruption that coercion caused. A missing/empty/non-string value is NOT an unknown agent, it is a
+ *  corrupt one, and keeps the historical claude default. */
+export function adapterFor(agent: AgentKindWire): AgentAdapter {
   switch (agent) {
     case "codex": return codexAdapter;
     case "opencode": return opencodeAdapter;
-    default: return claudeAdapter;
+    case "claude": return claudeAdapter;
+    default: return typeof agent === "string" && agent.length > 0 ? unknownAgentAdapter(agent) : claudeAdapter;
   }
 }
 

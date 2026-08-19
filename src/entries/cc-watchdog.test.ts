@@ -27,7 +27,8 @@ import {
 import type { CommandPayload, DrainCommandsDeps, PostOutcome, RecordEntry } from "./cc-watchdog";
 import { resolveOnRelay } from "../core/codex-remote-input";
 import { CODEX_PROXY_STDOUT_ENDED } from "../core/codex-proxy-transport";
-import { STATE_HOLD_MAX_AGE_MS } from "../core/session-state";
+import { buildStatePlaintext, STATE_HOLD_MAX_AGE_MS } from "../core/session-state";
+import { lanFrameContent } from "../core/lan-frames";
 import { claudeAdapter, codexAdapter } from "../core/adapter";
 import type { AgentAdapter, DiscoveredSession } from "../core/adapter";
 import type { Config, PendingConfig } from "../core/shared";
@@ -479,6 +480,54 @@ describe("shouldRepairTitle (heal a permanent blank codex title)", () => {
   test("claude sessions and provisional rows are never title-repaired here", () => {
     expect(shouldRepairTitle(rec({ title: "" }))).toBe(false); // claude (no agent) → not this net's job
     expect(shouldRepairTitle(rec({ agent: "codex", provisional: true }))).toBe(false);
+  });
+});
+
+// THE REBRAND BUG (2026-08-19, observed live on a real record): `agent:"opencode"` on disk but
+// `blob.agent === undefined` on the phone, so the island rendered it as Claude Code. A 2.0.2 watchdog
+// picked up a failed `done` retry, rebuilt the envelope, and `adapterFor("opencode")` — a kind that
+// build had never heard of — fell through to claudeAdapter, whose `blobAgentFields` is `{}`. The agent
+// key did not survive the rebuild.
+//
+// The invariant: a blob field must be threaded through BOTH frame producers — the POST path (these
+// envelopes) and the app-local LAN rollup (buildStatePlaintext) — or the local frame silently reverts.
+// So this covers every rebuild path at once, for a kind THIS build does not know either.
+describe("an agent kind this build does not know survives every rebuild path", () => {
+  const FUTURE = "some-future-agent";
+  const r = rec({ agent: FUTURE, title: "t", folderKey: "0123456789ab", blob: "sealed-by-the-peer", ts: 5_000, pairingId: "p1" });
+  const blobOf = async (env: object) => (await decryptBlob(KEY, (env as { blob: string }).blob)) as Record<string, unknown>;
+
+  test("the four watchdog correctives re-emit the raw literal (not claude, not nothing)", async () => {
+    const frames = [
+      await blobOf(await buildDoneEnvelope("s", r, 5_000, KEY, FUTURE, 5)),
+      await blobOf(await buildNeedsAttentionEnvelope("s", r, 5_000, KEY, FUTURE, 5)),
+      await blobOf(await buildWorkingEnvelope("s", r, 5_000, KEY, FUTURE)),
+      await blobOf(await buildTitleRepairEnvelope("s", r, "fixed", 5_000, KEY, FUTURE, 5)),
+    ];
+    for (const blob of frames) expect(blob.agent).toBe(FUTURE);
+  });
+
+  test("the heartbeat/discovery builders carry it too", async () => {
+    const fields = { agent: FUTURE } as { agent?: undefined };
+    const d = { sessionId: "s", pid: 4242, title: "t", label: "proj", cwd: "/w" } as unknown as DiscoveredSession;
+    expect(await decryptBlob(KEY, await buildProvisionalBlob(d, "mac", fields, KEY, 5)))
+      .toMatchObject({ agent: FUTURE });
+    expect(buildProvisionalRecord(d, "mac", "b", fields, 5_000, "p1", false).agent).toBe(FUTURE);
+  });
+
+  test("the app-local rollup (buildStatePlaintext) agrees with the POST path, key for key", () => {
+    expect(buildStatePlaintext(r, "done", 5_000).agent).toBe(FUTURE);
+  });
+
+  test("the clear LAN envelope carries it as well (it was never the coercing half)", () => {
+    expect(lanFrameContent(r, "p1")?.agent).toBe(FUTURE);
+  });
+
+  test("…and claude is still OMITTED everywhere, which is what the coercion was hiding behind", async () => {
+    const c = { ...r, agent: undefined };
+    expect(await blobOf(await buildDoneEnvelope("s", c, 5_000, KEY, "claude", 5))).not.toHaveProperty("agent");
+    expect(buildStatePlaintext(c, "done", 5_000)).not.toHaveProperty("agent");
+    expect(lanFrameContent(c, "p1")).not.toHaveProperty("agent");
   });
 });
 

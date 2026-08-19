@@ -426,6 +426,19 @@ export type CCStatus = "working" | "needsAttention" | "done";
  *  against a Claude transcript or CC file. */
 export type AgentKind = "claude" | "codex" | "opencode";
 
+/** An agent literal AS IT ARRIVES — off a session record, out of a blob a peer install wrote. It is
+ *  `AgentKind` plus "some string this build has never heard of", because that case is now REAL: two
+ *  nomo installs at different versions coexist on one machine (Claude Code and OpenCode ship separate
+ *  dists), so the OLDER build routinely reads records stamped by the NEWER one.
+ *
+ *  Nothing may COERCE such a value. Observed live: a 2.0.2 watchdog rebuilt a `done` envelope for an
+ *  `agent:"opencode"` record, `adapterFor` fell through to claude, claude's `blobAgentFields` is `{}`,
+ *  and the agent key vanished from the rebuilt blob — the Dynamic Island flipped from OpenCode to
+ *  Claude Code. The wire value must survive a build that does not understand it; see adapterFor's
+ *  passthrough adapter. This mirrors iOS, where `CCAgent.from(blobValue:)` maps unknown → .claude for
+ *  RENDERING only and never rewrites what it was sent. */
+export type AgentKindWire = AgentKind | (string & {});
+
 /** Codex's config home — `$CODEX_HOME` when set & non-empty, else `~/.codex`. Mirrors codex's own
  *  `find_codex_home` (codex-rs/utils/home-dir): the env var wins, otherwise the default dot-dir. Used
  *  by status-cmd (to read config.toml plugin/trust state and probe legacy hooks.json entries). */
@@ -916,8 +929,9 @@ export interface SessionRecord {
   /** Which agent drove this session. Absent → claude (backward-compat for records the pre-codex hook
    *  wrote). The watchdog reads it to pick the agent-specific interrupt marker (claude "interrupted
    *  by user" vs codex "turn_aborted") and to rebuild an interrupt-corrective done blob with the same
-   *  `agent` key the hook stamped. */
-  agent?: AgentKind;
+   *  `agent` key the hook stamped. Typed WIRE-wide (see AgentKindWire): a record on this disk may have
+   *  been written by a NEWER peer install that knows agent kinds this build does not. */
+  agent?: AgentKindWire;
   /** The session's TRUE start (epoch ms), parsed once from the transcript head and cached here so
    *  subsequent hooks and the watchdog re-send it WITHOUT re-parsing — and so it survives even if the
    *  transcript is later unavailable. Threaded into the envelope's optional `startedAt` on every POST;
@@ -1537,6 +1551,20 @@ export async function completePendingPairing(
 //   2. UPGRADE UNDER A LIVE DAEMON — the watchdog lingers up to 30 min between sessions, so a plugin
 //      update installed mid-session would keep running the OLD bundle indefinitely. The pidfile carries
 //      the incumbent's PLUGIN_VERSION so ensureWatchdog can SIGTERM a mismatched build and spawn fresh.
+//   3. PEER INSTALLS AT DIFFERENT VERSIONS — the rule in (2) was written when a mismatch could only
+//      mean an UPGRADE: Claude Code and Codex ship from one build, so their versions could never
+//      disagree. OpenCode is the first PEER install (its own dist, updated on its own schedule), and a
+//      plain "mismatch → SIGTERM" makes two peers evict each other forever: an OpenCode event spawns
+//      the newer daemon, the next Claude hook SIGTERMs it back to the older one, round and round. That
+//      is not just churn — the LAN listener lives IN the watchdog, so it flaps down/up on every event
+//      (`{"event":"lan","result":"bound","reused":true}`), and the older daemon then REBUILDS frames
+//      with an adapter table that predates the newer peer's agent kinds.
+//      So: HIGHEST VERSION WINS (watchdogVersionOutranks). Strictly newer → evict and take over. Equal
+//      → leave it alone. Older → accept the newer daemon and do NOT downgrade it. The newest build
+//      knows the most agent kinds, so it is the one that must own frame rebuilding; an older peer
+//      pulling the daemon back down is exactly what corrupts frames. A DELIBERATE downgrade therefore
+//      needs an explicit reset — `reset` (src/entries/reset.ts, `/nomo-cc:reset`) stops the watchdog
+//      and removes the pidfile, after which the next hook of any build spawns fresh.
 //
 // FORMAT — `"<pid> <version>"`, deliberately parseInt-COMPATIBLE: every existing reader (status-cmd,
 // reset, this module, the watchdog's own claim/release) does `parseInt(raw.trim(), 10)`, which stops at
@@ -1597,6 +1625,39 @@ export function watchdogBuildStamp(path: string = WATCHDOG_PATH): string | undef
 export function watchdogBuildDiffers(incumbent: string | undefined, current: string | undefined): boolean {
   if (incumbent === undefined || current === undefined) return false;
   return incumbent !== current;
+}
+
+/** Does the build stamped `mine` OUTRANK a live incumbent stamped `incumbent` — i.e. may it evict it?
+ *  The peer-install rule from note (3) above, and the ONLY place versions are ordered.
+ *
+ *  RULES, all fail-safe (when in doubt, leave the running daemon alone):
+ *    - incumbent version ABSENT (a pre-stamp build wrote a bare-pid pidfile) → older by construction →
+ *      outranked, we take over. That is the one "unknown" that is genuinely knowable.
+ *    - both parse → strict numeric comparison, component by component. Numeric, never lexical:
+ *      "2.10.0" outranks "2.9.0" and "2.1.1" outranks "2.0.2", both of which a string compare gets
+ *      backwards.
+ *    - EITHER side unparseable → false. Not evicting costs at worst a stale daemon until the next
+ *      real upgrade or a `reset`; evicting on a version we cannot read is how the eviction loop starts.
+ *  Build metadata ("0.8.10+codex.3") and prerelease tags ("0.0.0-dev", the unbundled sentinel) are
+ *  dropped before comparison, so the dev sentinel orders as 0.0.0 — the LOWEST version there is. A raw
+ *  source run therefore never evicts an installed release; `reset` is the way to hand it the daemon.
+ *  Equal versions return false here; the same-version REBUILD case is handled by the build stamp
+ *  (watchdogBuildDiffers), which is what keeps a fix rebuilt in place from running nowhere. Pure. */
+export function watchdogVersionOutranks(mine: string, incumbent: string | undefined): boolean {
+  if (incumbent === undefined) return true;
+  const parse = (v: string): number[] | undefined => {
+    const core = v.trim().split("+")[0]!.split("-")[0]!;
+    if (core.length === 0) return undefined;
+    const parts = core.split(".").map((p) => (/^\d+$/.test(p) ? Number(p) : Number.NaN));
+    return parts.some((n) => !Number.isFinite(n)) ? undefined : parts;
+  };
+  const a = parse(mine), b = parse(incumbent);
+  if (a === undefined || b === undefined) return false;
+  for (let i = 0; i < Math.max(a.length, b.length); i++) {
+    const x = a[i] ?? 0, y = b[i] ?? 0;
+    if (x !== y) return x > y;
+  }
+  return false;
 }
 
 /** Render the pidfile contents for THIS process (see the format note above). The build stamp is
@@ -1661,11 +1722,13 @@ export interface EnsureWatchdogDeps extends WatchdogIdentityDeps {
 
 /** Ensure the detached liveness/self-heal watchdog is running the CURRENT build: if its pidfile is
  *  missing, names a dead process, names a RECYCLED pid (alive but not a watchdog — see
- *  watchdogHolderIsLive), or names a live watchdog running a DIFFERENT plugin version, spawn a fresh one
- *  and let go of it (detached + unref'd, no stdio) so the caller never waits on it. A version-mismatched
- *  incumbent is SIGTERMed first — exactly once per call, and only after the identity check proves it
- *  really is our watchdog — so it releases the pidfile through its normal shutdown path instead of being
- *  left to run stale code for the rest of its 30-min idle grace. The runtime is NOMO_RUNTIME (the run.sh
+ *  watchdogHolderIsLive), or names a live watchdog this build OUTRANKS (an older plugin version, or the
+ *  same version rebuilt in place), spawn a fresh one and let go of it (detached + unref'd, no stdio) so
+ *  the caller never waits on it. Such an incumbent is SIGTERMed first — exactly once per call, and only
+ *  after the identity check proves it really is our watchdog — so it releases the pidfile through its
+ *  normal shutdown path instead of being left to run stale code for the rest of its 30-min idle grace.
+ *  A live watchdog from an EQUAL-or-NEWER build is left strictly alone and nothing is spawned: peers at
+ *  different versions would otherwise evict each other forever (see note (3) on the pidfile above). The runtime is NOMO_RUNTIME (the run.sh
  *  shim's resolved interpreter) when set, else this process's own execPath. Shared by the hook
  *  (post-pair) and `pair` (so a mid-pairing config self-heals even if `wait` is never run). Best-effort
  *  — a spawn failure just falls back to the worker's own staleness eviction / the next hook. */
@@ -1692,10 +1755,16 @@ export function ensureWatchdog(deps: EnsureWatchdogDeps = {}): void {
     const raw = readPidfile();
     const holder = typeof raw === "string" ? parseWatchdogPidfile(raw) : null;
     if (holder && watchdogHolderIsLive(holder.pid, deps)) {
-      // A live watchdog on OUR build → nothing to do. A live watchdog on any other build (including an
-      // unstamped pre-upgrade one, or the SAME version rebuilt in place — see watchdogBuildStamp) is
-      // running stale code: retire it, then spawn the current bundle.
-      if (holder.version === version && !watchdogBuildDiffers(holder.build, build)) return;
+      if (holder.version === version) {
+        // Same VERSION: only the build stamp can tell us anything. Identical bundle → nothing to do;
+        // the same version rebuilt in place (the dev loop) → retire the stale bundle. Unchanged.
+        if (!watchdogBuildDiffers(holder.build, build)) return;
+      } else if (!watchdogVersionOutranks(version, holder.version)) {
+        // A DIFFERENT version we do not outrank: an equal-but-differently-spelled stamp, a NEWER peer
+        // install (OpenCode vs Claude Code — see note (3) above), or a version we cannot parse. Leave
+        // the running daemon alone and do not spawn a second one; the newest build owns the daemon.
+        return;
+      }
       try { killPid(holder.pid, "SIGTERM"); } catch { /* raced its own exit — spawn anyway */ }
     }
     spawnWatchdog();

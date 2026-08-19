@@ -55,7 +55,7 @@ import type { LanReadWhat } from "./lan-wire";
 import { computeSessionState, parseCcSessionFile } from "./session-state";
 import type { CcSessionFile, SessionState } from "./session-state";
 import { DECISION_HOLD_SUFFIX, decisionHoldFileName, pidAlive, recordFullTextIsComplete, SESSIONS_DIR } from "./shared";
-import type { AgentKind, CCOp, DecisionHold, SessionRecord } from "./shared";
+import type { AgentKindWire, CCOp, DecisionHold, SessionRecord } from "./shared";
 
 const execFileP = promisify(execFile);
 
@@ -114,7 +114,7 @@ export interface LanSessionState {
    *  verbatim — that is what "1:1 with the hooks" means) or one this store sealed from a plaintext the
    *  Mac authored because no existing blob described the state it computed. */
   blob: string;
-  agent?: AgentKind;
+  agent?: AgentKindWire;
   startedAt?: number;
   /** The CLEAR question discriminator (`"userInput"` — a Codex `request_user_input`), carried here for
    *  the same reason it rides the v1 `frames` envelope and the worker's: it is the established field the
@@ -146,7 +146,7 @@ export interface LanFrame {
   prio: 0 | 1;
   ts: number;
   blob: string;
-  agent?: AgentKind;
+  agent?: AgentKindWire;
   attentionKind?: "userInput";
 }
 

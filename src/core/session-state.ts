@@ -23,7 +23,7 @@
 
 import { adapterFor } from "./adapter";
 import { appendFittedPlanAndDebug, formatPlanPickerDebug, sessionBranch } from "./shared";
-import type { AgentKind, CCStatus, DecisionHold, SessionRecord } from "./shared";
+import type { AgentKindWire, CCStatus, DecisionHold, SessionRecord } from "./shared";
 
 /** The 24 h abandonment cap — cc-watchdog's SESSION_STALE_MS, mirrored (an entry module must not be
  *  imported from core/). Past it the sweep retires the record; rank 1 calls the session ended at the
@@ -273,7 +273,7 @@ export interface SessionState {
   ts: number;
   why: SessionStateWhy;
   blob: SessionStateBlob;
-  agent: AgentKind;
+  agent: AgentKindWire;
   startedAt?: number;
   /** The CLEAR discriminator that says this attention episode is a QUESTION ("the model is asking YOU
    *  something" — Codex's `request_user_input`) rather than a plain permission approval. It rides the
@@ -337,7 +337,7 @@ const filled = (value: unknown): value is string => typeof value === "string" &&
 export function buildStatePlaintext(
   record: SessionRecord, status: CCStatus, at: number, titleFallback?: string,
 ): Record<string, unknown> {
-  const agent: AgentKind = record.agent ?? "claude";
+  const agent: AgentKindWire = record.agent ?? "claude";
   // The folder's LIVE branch, re-read from the record's pinned paths — the same thing the watchdog's
   // corrective builders do for the worker leg, so the two frames stay textually identical.
   const branch = sessionBranch(record);
@@ -428,7 +428,7 @@ export function computeSessionState(input: SessionStateInput): SessionState | nu
   // with no pairingId is UNKNOWN, never assumed — same rule.
   if (pairingId === undefined || record.pairingId !== pairingId) return null;
 
-  const agent: AgentKind = record.agent ?? "claude";
+  const agent: AgentKindWire = record.agent ?? "claude";
   const ts = finite(record.ts) ? record.ts : now;
   const startedAt = finite(record.sessionStartedAt) ? { startedAt: record.sessionStartedAt } : {};
   const sealed = { kind: "sealed" as const, value: record.blob };

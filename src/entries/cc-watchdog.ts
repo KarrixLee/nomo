@@ -47,7 +47,7 @@ import { resolveOnRelay } from "../core/codex-remote-input";
 import { CODEX_PROXY_STDOUT_ENDED } from "../core/codex-proxy-transport";
 import type { CodexAppServerSocketState, DecisionHold, PlanPickerTraceDecision } from "../core/shared";
 import {
-  AgentKind, appendCodexBridgeMarker, appendFittedPlanAndDebug, atomicWrite, CC_DIR, CCOp, CCStatus, codexAppServerSocketAvailable, codexAppServerSocketState, Config, completePendingPairing, DECISION_HOLD_SUFFIX, decisionHoldFileName, formatPlanPickerDebug, formatWatchdogPidfile,
+  AgentKind, AgentKindWire, appendCodexBridgeMarker, appendFittedPlanAndDebug, atomicWrite, CC_DIR, CCOp, CCStatus, codexAppServerSocketAvailable, codexAppServerSocketState, Config, completePendingPairing, DECISION_HOLD_SUFFIX, decisionHoldFileName, formatPlanPickerDebug, formatWatchdogPidfile,
   startCodexAppServerDaemon,
   GONE_STRIKE_LIMIT, loadConfig, loadPendingConfig, localApprovalsState,
   PAIR_HTML_FILE, PairPollResult, parseWatchdogPidfile, PendingConfig, pidAlive, PLUGIN_VERSION, readDecisionHoldAt, readPrefix, readSuffix, recordGoneStrike, removeRevokedConfig,
@@ -273,7 +273,7 @@ export function buildEndEnvelope(sessionId: string, now: number, record?: Sessio
  *  record's cached `turnStartedAt` (epoch seconds, stamped by the turn's UserPromptSubmit) is
  *  likewise restamped into the rebuilt blob — omitted when unknown — so the island's frozen
  *  "done in Xm" keeps measuring the TURN, exactly as a hook-built done blob would. */
-export async function buildDoneEnvelope(sessionId: string, record: SessionRecord, now: number, e2eKey: Uint8Array, agent: AgentKind = "claude", at?: number, dbg?: string): Promise<object> {
+export async function buildDoneEnvelope(sessionId: string, record: SessionRecord, now: number, e2eKey: Uint8Array, agent: AgentKindWire = "claude", at?: number, dbg?: string): Promise<object> {
   // The folder's LIVE branch, re-READ (not restamped like the keys above): the paths it reads are
   // pinned on the record, but HEAD is current state — a `git checkout` since the last hook must reach
   // the phone. Omitted when the record predates the pin or the folder is not a repo.
@@ -321,7 +321,7 @@ export async function buildDoneEnvelope(sessionId: string, record: SessionRecord
  *  permission approvals omit it so the server can end an older decision episode without cross-talk. */
 export async function buildNeedsAttentionEnvelope(
   sessionId: string, record: SessionRecord, now: number, e2eKey: Uint8Array,
-  agent: AgentKind = "claude", at?: number, detail?: string, attentionKind?: "userInput", proposedPlan?: string,
+  agent: AgentKindWire = "claude", at?: number, detail?: string, attentionKind?: "userInput", proposedPlan?: string,
   dbg?: string,
 ): Promise<object> {
   // Re-read live, exactly as buildDoneEnvelope does (see there).
@@ -368,7 +368,7 @@ export async function buildNeedsAttentionEnvelope(
  *  (not a verbatim heartbeat). It intentionally carries no attentionKind: op:update/prio:0 closes the
  *  attention episode and returns the session to its ordinary in-flight state. */
 export async function buildWorkingEnvelope(
-  sessionId: string, record: SessionRecord, now: number, e2eKey: Uint8Array, agent: AgentKind = "claude", dbg?: string,
+  sessionId: string, record: SessionRecord, now: number, e2eKey: Uint8Array, agent: AgentKindWire = "claude", dbg?: string,
 ): Promise<Record<string, unknown>> {
   // Re-read live, exactly as buildDoneEnvelope does (see there).
   const branch = sessionBranch(record);
@@ -604,7 +604,7 @@ export async function correctResolvedPlanPicker(
     if (tuiPid !== undefined && !(deps.pidAlive ?? pidAlive)(tuiPid)) {
       return await settlePendingPlanPickerDone(config, path, sessionId, snapshot, now, deps, "exit");
     }
-    const agent: AgentKind = recordAgent(snapshot);
+    const agent: AgentKindWire = recordAgent(snapshot);
     const adapter = adapterFor(agent);
     if (!adapter.completedTurnWaitState) return "uncorrected";
     const state = await (deps.state ?? (() => adapter.completedTurnWaitState!({
@@ -1593,7 +1593,7 @@ async function readAllRecords(): Promise<SessionRecord[]> {
  *  idle TUI advertised as working stuck "Running" on the phone forever (the v0.8.4 idle-TUI fix; see
  *  codexTurnActiveFromTail in adapter.ts). */
 export async function buildProvisionalBlob(
-  d: DiscoveredSession, machine: string, blobAgentFields: { agent?: AgentKind }, e2eKey: Uint8Array, at?: number,
+  d: DiscoveredSession, machine: string, blobAgentFields: { agent?: AgentKindWire }, e2eKey: Uint8Array, at?: number,
 ): Promise<string> {
   // The discovered cwd's LIVE branch. Resolved from `d.cwd` (the discovery has no cached git dir yet —
   // buildProvisionalRecord pins one for every later frame), so a discovered row shows its branch from
@@ -1639,7 +1639,7 @@ export function buildStartEnvelope(sessionId: string, blob: string, now: number)
  *  nets all treat it as finished — exactly what was advertised. The discovery title (cwd basename) is
  *  cached like trackSession's, so a later corrective done never regresses to title:"" (v0.8.3 rule). */
 export function buildProvisionalRecord(
-  d: DiscoveredSession, machine: string, blob: string, blobAgentFields: { agent?: AgentKind }, now: number,
+  d: DiscoveredSession, machine: string, blob: string, blobAgentFields: { agent?: AgentKindWire }, now: number,
   pairingId?: string, idle = false,
 ): SessionRecord {
   // The git dir of the discovered cwd, resolved ONCE here and pinned like the folder key: every later
@@ -1723,8 +1723,10 @@ export async function discoverLiveSessions(config: Config, deps: DiscoverDeps = 
   }
 }
 
-/** The agent a record belongs to (absent → claude, the historical default). */
-function recordAgent(record: SessionRecord): AgentKind {
+/** The agent a record belongs to (absent → claude, the historical default). WIRE-wide: a record this
+ *  daemon rebuilds may have been written by a NEWER peer install whose agent kinds this build does not
+ *  know, and that literal must reach adapterFor intact rather than be flattened to claude here. */
+function recordAgent(record: SessionRecord): AgentKindWire {
   return record.agent ?? "claude";
 }
 
@@ -1953,7 +1955,7 @@ export async function correctInterrupt(
       // we land here, and the session is simply left for its dead-pid reap / staleness eviction.
       return "uncorrected";
     }
-    const agent: AgentKind = recordAgent(record);
+    const agent: AgentKindWire = recordAgent(record);
     if (!tailShowsInterrupt(tail, agent)) return "uncorrected"; // live turn or no interrupt → leave it
     // THE LIVE-HOLD GATE (see decisionHoldIsLive). A remote approval is open on THIS session, so the
     // interrupt marker in the tail describes an earlier abort, not the prompt the user is looking at —
@@ -2071,7 +2073,7 @@ export async function correctPendingApproval(
     ?? ((p: string, rec: SessionRecord) => atomicWrite(p, JSON.stringify(rec), 0o600));
   const clock = deps.now ?? Date.now;
   try {
-    const agent: AgentKind = recordAgent(record);
+    const agent: AgentKindWire = recordAgent(record);
     const adapter = adapterFor(agent);
     if (!shouldPendingApprovalCheck(record, adapter)) return "uncorrected";
     let tail: string;
@@ -2152,7 +2154,7 @@ export function shouldIdleProvisionalCheck(record: SessionRecord, adapter: Agent
  *  same verdict triple as the other nets ("corrected" → the caller must not also heartbeat it). */
 async function correctIdleProvisional(config: Config, path: string, sessionId: string, record: SessionRecord): Promise<"corrected" | "uncorrected" | "revoked"> {
   try {
-    const agent: AgentKind = recordAgent(record);
+    const agent: AgentKindWire = recordAgent(record);
     const adapter = adapterFor(agent);
     if (!shouldIdleProvisionalCheck(record, adapter)) return "uncorrected";
     let active = false;
@@ -2315,7 +2317,7 @@ export async function correctIdleClaude(
     ?? ((p: string, rec: SessionRecord) => atomicWrite(p, JSON.stringify(rec), 0o600));
   const clock = deps.now ?? Date.now;
   try {
-    const agent: AgentKind = recordAgent(record);
+    const agent: AgentKindWire = recordAgent(record);
     if (agent === "codex") {
       // Sound Codex equivalent: clock silence alone is insufficient because record.pid may be the
       // immortal app-server and a legitimate long turn can be hook-quiet. Require all three pieces:
@@ -2500,7 +2502,7 @@ export async function correctPendingDone(
       traceFocus(deps, { event: "pending-done", sessionId, outcome: "held", delivered: false, held: true });
       return "pending";
     }
-    const agent: AgentKind = recordAgent(record);
+    const agent: AgentKindWire = recordAgent(record);
     // The settled record: the debt dropped and the terminal done state pinned (the hook already wrote
     // these, but a watchdog rewrite between then and now could have moved them — pin explicitly). It is
     // only ever written after the stale-snapshot guard proves the record hasn't moved under us.
@@ -2762,7 +2764,7 @@ function statusFromRecord(record: SessionRecord): CCStatus {
  *  session_index thread_name existed and then had every later hook dropped. Loses only the transient tool
  *  `detail` sub-status (never cached on the record) — restored by the next real hook. */
 export async function buildTitleRepairEnvelope(
-  sessionId: string, record: SessionRecord, title: string, now: number, e2eKey: Uint8Array, agent: AgentKind = "codex", at?: number,
+  sessionId: string, record: SessionRecord, title: string, now: number, e2eKey: Uint8Array, agent: AgentKindWire = "codex", at?: number,
 ): Promise<{ v: 2; sessionId: string; op: CCOp; prio: 0 | 1; ts: number; blob: string; startedAt?: number }> {
   // Re-read live, exactly as buildDoneEnvelope does (see there).
   const branch = sessionBranch(record);
