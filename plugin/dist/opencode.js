@@ -79,7 +79,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "2.1.1";
+var PLUGIN_VERSION = "2.1.2";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -4024,6 +4024,34 @@ function ocReplyFor(request, line) {
   const always = Array.isArray(decision.updatedPermissions) && decision.updatedPermissions.length > 0;
   return { path: `permission/${request.id}/reply`, body: { reply: always ? "always" : "once" } };
 }
+function ocPost(client, serverUrl, fetchFn = fetch) {
+  const post = client?._client?.post;
+  if (typeof post === "function") {
+    return Object.assign(async (reply) => {
+      const res = await post({
+        url: `/${reply.path}`,
+        ...reply.body === undefined ? {} : { body: reply.body }
+      });
+      const status = res?.response?.status;
+      if (typeof status !== "number")
+        throw new Error("opencode client returned no response");
+      return { via: "client", status };
+    }, { via: "client" });
+  }
+  if (!serverUrl)
+    return;
+  return Object.assign(async (reply) => {
+    const res = await fetchFn(new URL(reply.path, serverUrl), {
+      method: "POST",
+      ...reply.body === undefined ? {} : {
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(reply.body)
+      },
+      signal: AbortSignal.timeout(2000)
+    });
+    return { via: "url", status: res.status };
+  }, { via: "url" });
+}
 var TRACE_MAX_BYTES2 = 256 * 1024;
 var rotated = false;
 function ocTrace(event) {
@@ -4041,7 +4069,6 @@ function ocTrace(event) {
 }
 async function runOcApproval(request, o) {
   const trace = o.trace ?? ocTrace;
-  const fetchFn = o.fetchFn ?? fetch;
   const stdin = JSON.stringify({
     session_id: request.sessionID,
     ...o.cwd ? { cwd: o.cwd } : {},
@@ -4072,18 +4099,25 @@ async function runOcApproval(request, o) {
     trace({ event: "oc-no-reply", kind: request.kind, id: request.id });
     return;
   }
+  const post = ocPost(o.client, o.serverUrl, o.fetchFn);
+  if (!post) {
+    trace({ event: "oc-replied", kind: request.kind, id: request.id, path: reply.path, status: 0, via: "none", error: "NoTransport" });
+    return;
+  }
   try {
-    const res = await fetchFn(new URL(reply.path, o.serverUrl), {
-      method: "POST",
-      ...reply.body === undefined ? {} : {
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify(reply.body)
-      },
-      signal: AbortSignal.timeout(2000)
-    });
-    trace({ event: "oc-replied", kind: request.kind, id: request.id, path: reply.path, status: res.status });
+    const { status } = await post(reply);
+    trace({ event: "oc-replied", kind: request.kind, id: request.id, path: reply.path, via: post.via, status });
   } catch (e) {
-    trace({ event: "oc-replied", kind: request.kind, id: request.id, path: reply.path, status: 0, error: e?.name ?? "Error" });
+    trace({
+      event: "oc-replied",
+      kind: request.kind,
+      id: request.id,
+      path: reply.path,
+      status: 0,
+      via: post.via,
+      error: e?.name ?? "Error",
+      message: String(e?.message ?? "").slice(0, 200)
+    });
   }
 }
 async function ocResolveOnRelay(config, requestId, fetchFn = fetch) {
@@ -4365,14 +4399,16 @@ var server = async (input) => {
       return chain;
     };
     const serverUrl = input?.serverUrl === undefined || input.serverUrl === null ? undefined : String(input.serverUrl);
+    const canReply = ocPost(input?.client, serverUrl) !== undefined;
     const holds = new Map;
     const hold = (request) => {
-      if (!serverUrl || ctx.state.children.has(request.sessionID) || holds.has(request.id))
+      if (!canReply || ctx.state.children.has(request.sessionID) || holds.has(request.id))
         return;
       const requestId = crypto.randomUUID();
       holds.set(request.id, requestId);
       runOcApproval(request, {
         config: ctx.config,
+        client: input?.client,
         serverUrl,
         cwd: ctx.folder.cwd,
         requestId,

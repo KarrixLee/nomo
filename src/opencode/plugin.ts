@@ -27,7 +27,7 @@ import {
   postFullText, SessionOrigin, WATCHDOG_PATH,
 } from "../core/shared";
 import {
-  ocDecisionRequest, OcDecisionRequest, ocResolvedRequestId, ocResolveOnRelay, runOcApproval,
+  ocDecisionRequest, OcDecisionRequest, ocPost, ocResolvedRequestId, ocResolveOnRelay, runOcApproval,
 } from "./approvals";
 import {
   newOcState, ocAttentionFrame, ocEndFrames, OcFrame, OcState, postOcEvent, reduceOcEvent,
@@ -40,9 +40,13 @@ import {
 interface OpenCodePluginInput {
   directory?: string;
   worktree?: string;
-  /** A URL OBJECT ending in "/" (e.g. `http://127.0.0.1:4396/`) — this server's own origin, and the
-   *  only way to reach the permission/question reply routes: the typed `client` has no namespace for
-   *  either (verified live). */
+  /** OpenCode's own `OpencodeClient`. THE reply transport for the permission/question routes — the
+   *  typed surface has no namespace for either, so `approvals.ts`'s `ocPost` goes through the
+   *  generated SDK's `_client.post`. Untyped here for the same reason the rest of this interface is. */
+  client?: unknown;
+  /** A URL OBJECT ending in "/". LOOKS like this server's origin and IS NOT: OpenCode's getter
+   *  fabricates `http://localhost:4096` whenever there is no TCP listener, which is every TUI session.
+   *  Never reach for it without reading `ocPost` first — it is a fallback, not a route. */
   serverUrl?: unknown;
 }
 
@@ -163,12 +167,13 @@ const server = async (input: OpenCodePluginInput): Promise<OpenCodeHooks> => {
       return chain;
     };
 
-    // The reply origin. Without it a hold could put an Allow button on the phone that this process has
-    // no route to honor, which is strictly worse than not holding at all — so no serverUrl, no
-    // approvals, and the TUI dialog stays the only way to answer.
+    // The reply transport, resolved ONCE at init. Without it a hold could put an Allow button on the
+    // phone that this process has no route to honor, which is strictly worse than not holding at all —
+    // so no transport, no approvals, and the TUI dialog stays the only way to answer.
     const serverUrl = input?.serverUrl === undefined || input.serverUrl === null
       ? undefined
       : String(input.serverUrl);
+    const canReply = ocPost(input?.client, serverUrl) !== undefined;
 
     /** OpenCode request id (`per_…` / `que_…`) → the decision id its hold is polling the worker for.
      *  The map IS the hold registry: an entry means "a hold for this request is still running", which
@@ -182,11 +187,12 @@ const server = async (input: OpenCodePluginInput): Promise<OpenCodeHooks> => {
       // A subagent's prompt is not human-facing here — its session is filtered out of the phone's
       // rows entirely, so a card for it would be answerable against a row the user cannot see. Same
       // policy as the Claude hook's `agent_id` subagent pass-through.
-      if (!serverUrl || ctx.state.children.has(request.sessionID) || holds.has(request.id)) return;
+      if (!canReply || ctx.state.children.has(request.sessionID) || holds.has(request.id)) return;
       const requestId = crypto.randomUUID();
       holds.set(request.id, requestId);
       void runOcApproval(request, {
         config: ctx.config,
+        client: input?.client,
         serverUrl,
         cwd: ctx.folder.cwd,
         requestId,

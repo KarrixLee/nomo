@@ -9,7 +9,8 @@ import {
 } from "../core/permission";
 import type { PermissionHookDeps } from "../core/permission";
 import {
-  ocAnswers, ocDecisionRequest, ocReplyFor, ocResolvedRequestId, ocResolveOnRelay, runOcApproval,
+  ocAnswers, ocDecisionRequest, ocPost, ocReplyFor, ocResolvedRequestId, ocResolveOnRelay,
+  runOcApproval,
 } from "./approvals";
 import type { OcDecisionRequest } from "./approvals";
 
@@ -354,5 +355,105 @@ describe("the reject cascade", () => {
       properties: { sessionID: SESSION, requestID, reply: "reject" },
     }));
     expect(cascade.map(ocResolvedRequestId)).toEqual(["per_primary", "per_sibling_a", "per_sibling_b"]);
+  });
+});
+
+// -------------------------------------------------------------------------------------------------
+// THE TUI REGRESSION. `input.serverUrl` is a FABRICATED `http://localhost:4096` whenever OpenCode has
+// no TCP listener — which is every TUI session, i.e. nearly every session. Replying over it threw, so
+// no phone answer ever reached the primary configuration (trace: `oc-replied … status:0`). The reply
+// MUST go through `input.client`, whose fetch is wired to the in-process app handler.
+// -------------------------------------------------------------------------------------------------
+
+/** The shape `createOpencodeClient` really returns: an `OpencodeClient` whose generated namespaces all
+ *  dispatch through the hey-api client hanging off `_client` (verified against @opencode-ai/sdk). */
+const fakeClient = (status = 200) => {
+  const calls: { url: string; body?: unknown }[] = [];
+  return {
+    calls,
+    client: {
+      session: {}, // no reply method — and there is no `permission` namespace at all
+      _client: {
+        post: async (o: { url: string; body?: unknown }) => {
+          calls.push(o);
+          return { data: true, response: new Response("true", { status }) };
+        },
+      },
+    },
+  };
+};
+
+describe("the reply transport (TUI regression)", () => {
+  test("`client` wins: the serverUrl fetch is NOT taken when a client seam exists", async () => {
+    const fake = fakeClient();
+    let fetched = 0;
+    const post = ocPost(fake.client, "http://localhost:4096/", (async () => { fetched++; return new Response(""); }) as unknown as typeof fetch);
+    expect(await post!({ path: "permission/per_x/reply", body: { reply: "once" } }))
+      .toEqual({ via: "client", status: 200 });
+    expect(fetched).toBe(0);
+    expect(fake.calls).toEqual([{ url: "/permission/per_x/reply", body: { reply: "once" } }]);
+  });
+
+  test("a bodyless reject stays bodyless through the client (the /question/{id}/reject route)", async () => {
+    const fake = fakeClient();
+    await ocPost(fake.client, undefined)!({ path: "question/que_x/reject" });
+    expect(fake.calls).toEqual([{ url: "/question/que_x/reject" }]);
+    expect("body" in fake.calls[0]).toBe(false);
+  });
+
+  test("an HTTP failure is a real status, not the thrown-transport 0", async () => {
+    const fake = fakeClient(404);
+    expect(await ocPost(fake.client, undefined)!({ path: "permission/per_x/reply", body: {} }))
+      .toEqual({ via: "client", status: 404 });
+  });
+
+  test("a client that returns no Response throws rather than reporting a silent success", async () => {
+    const client = { _client: { post: async () => ({ data: undefined }) } };
+    await expect(ocPost(client, undefined)!({ path: "permission/per_x/reply" })).rejects.toThrow();
+  });
+
+  test("no client seam falls back to serverUrl — `opencode serve` still works", async () => {
+    const calls: string[] = [];
+    const fetchFn = (async (u: string | URL, i?: RequestInit) => {
+      calls.push(`${i?.method} ${String(u)}`); return new Response("true", { status: 200 });
+    }) as unknown as typeof fetch;
+    // `{}` and a client with no `_client` are both "no seam" — neither may silently no-op.
+    for (const client of [undefined, {}, { session: {} }]) {
+      expect(await ocPost(client, "http://127.0.0.1:4396/", fetchFn)!({ path: "permission/per_x/reply", body: { reply: "once" } }))
+        .toEqual({ via: "url", status: 200 });
+    }
+    expect(calls).toEqual(Array(3).fill("POST http://127.0.0.1:4396/permission/per_x/reply"));
+  });
+
+  test("no client and no serverUrl is NO transport — never a fetch at a made-up origin", () => {
+    expect(ocPost(undefined, undefined)).toBeUndefined();
+    expect(ocPost({}, "")).toBeUndefined();
+  });
+
+  test("a REAL hold with a client replies through it, and traces `via:\"client\"`", async () => {
+    const fake = fakeClient();
+    const traced: Record<string, unknown>[] = [];
+    const answerBlob = await encryptBlob(config.e2eKey, { requestId: "req-tui", decision: "deny" });
+    const fetchFn = (async (input: string | URL) => {
+      const url = String(input);
+      if (url.endsWith("/v1/cc/decision")) return Response.json({ hold: true });
+      if (url.includes("/v1/cc/decision/")) return Response.json({ status: "answered", answerBlob });
+      throw new Error("connection refused"); // localhost:4096 — nothing is listening under the TUI
+    }) as unknown as typeof fetch;
+
+    await runOcApproval(PERMISSION, {
+      config,
+      client: fake.client,
+      serverUrl: "http://localhost:4096/", // the lie OpenCode hands every TUI plugin
+      requestId: "req-tui",
+      delegate: async () => { throw new Error("the no-hold path must not be taken here"); },
+      noHoldPath: join(tmpdir(), `nomo-oc-no-such-flag-${process.pid}`),
+      fetchFn,
+      trace: (e) => traced.push(e as Record<string, unknown>),
+    });
+
+    expect(fake.calls).toEqual([{ url: "/permission/per_01638472f0016YZI7giyZgEWE6/reply", body: { reply: "reject" } }]);
+    const replied = traced.find((e) => e.event === "oc-replied");
+    expect(replied).toMatchObject({ via: "client", status: 200 });
   });
 });

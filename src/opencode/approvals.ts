@@ -4,10 +4,14 @@
  *  ("awaiting permission" / "awaiting answer"):
  *
  *    permission.asked  {id, sessionID, permission, patterns, metadata, tool}
- *      → POST {serverUrl}permission/{id}/reply  {"reply":"once"|"always"|"reject"}
+ *      → POST /permission/{id}/reply  {"reply":"once"|"always"|"reject"}
  *    question.asked    {id, sessionID, questions[], tool}
- *      → POST {serverUrl}question/{id}/reply    {"answers":[["Red"]]}     (option LABELS, verbatim)
- *      → POST {serverUrl}question/{id}/reject   (no body)                 — NEVER /session/{id}/abort
+ *      → POST /question/{id}/reply    {"answers":[["Red"]]}     (option LABELS, verbatim)
+ *      → POST /question/{id}/reject   (no body)                 — NEVER /session/{id}/abort
+ *
+ *  All three go out over `input.client`, NEVER over `input.serverUrl` — see `ocPost`, which is where
+ *  the whole reason lives. `serverUrl` is a fabricated `http://localhost:4096` whenever OpenCode has no
+ *  TCP listener, which is every TUI session, which is nearly every session.
  *
  *  To the PHONE they are both one thing: a decisionPending frame with Allow/Deny (or an option list).
  *  The decision transport — the /v1/cc/decision POST, the hold, the 3 s poll, the LAN loopback, the
@@ -51,7 +55,8 @@ export interface OcDecisionRequest {
 
 /** What to send back to OpenCode. `body` absent = a bodyless POST (the question reject route). */
 export interface OcReply {
-  /** Relative to `serverUrl`, no leading slash — `serverUrl` is a URL ending in "/". */
+  /** Route-relative, NO leading slash — `ocPost` adds one for the client transport and resolves it
+   *  against `serverUrl` (a URL ending in "/") for the fallback. */
   path: string;
   body?: unknown;
 }
@@ -209,6 +214,70 @@ export function ocReplyFor(request: OcDecisionRequest, line: string | undefined)
   return { path: `permission/${request.id}/reply`, body: { reply: always ? "always" : "once" } };
 }
 
+// ---- the reply transport --------------------------------------------------------------------
+
+/** The generated SDK's low-level request seam, hanging off every `OpencodeClient` as `_client`. */
+type HeyApiPost = (o: { url: string; body?: unknown }) => Promise<{ response?: { status?: number } }>;
+
+/** Resolve the ONE way to POST a reply to OpenCode, or undefined when there is no route at all.
+ *
+ *  `input.client` FIRST, ALWAYS — `input.serverUrl` IS A LIE IN THE TUI. The TUI runs its server
+ *  in-process with no TCP listener (`cli/cmd/tui.ts` mounts it at "http://opencode.internal" over a
+ *  worker fetch), so `Server.url` is undefined and OpenCode's own getter hands us
+ *  `http://localhost:4096` — a plausible URL with nothing bound to it. A plain fetch there THROWS, and
+ *  that is exactly how every phone answer was lost on the primary (TUI) configuration: the trace shows
+ *  `oc-replied … status:0 error:"Error"`. It only ever worked under `opencode serve`/`--port`, the one
+ *  shape where `Server.url` is real. `client` is correct in BOTH worlds: with no listener OpenCode
+ *  constructs it with a `fetch` that calls the in-process app handler directly, and it also carries the
+ *  `ServerAuth` basic-auth header (OPENCODE_SERVER_PASSWORD) that a raw fetch has never sent.
+ *
+ *  VERIFIED LIVE on 1.18.15: the typed client has NO `permission` or `question` namespace — the only
+ *  permission method on it is `postSessionIdPermissionsPermissionId`, a stale `/session/{id}/
+ *  permissions/{permissionID}` route that is not what `permission.asked` is answered on. The supported
+ *  seam is therefore the hey-api client under `_client`, whose `.post({url, body})` is literally what
+ *  every generated namespace method calls; it defaults to a JSON body serializer, drops the
+ *  Content-Type when there is no body (the /reject route), and does NOT throw on a non-2xx — the real
+ *  status is on `.response`.
+ *
+ *  The fallback is STRUCTURAL, not a retry: taken only when that seam is missing (an SDK reshape),
+ *  never because a client POST failed. Re-firing a failed reply at the bogus localhost:4096 would just
+ *  swap one lost answer for a lost answer plus a double-reply risk. */
+export type OcPoster = ((reply: OcReply) => Promise<{ via: OcVia; status: number }>) & { via: OcVia };
+export type OcVia = "client" | "url";
+
+export function ocPost(
+  client: unknown, serverUrl: string | undefined, fetchFn: typeof fetch = fetch,
+): OcPoster | undefined {
+  const post = (client as { _client?: { post?: HeyApiPost } } | null | undefined)?._client?.post;
+  if (typeof post === "function") {
+    // `via` is on the FUNCTION too so a caller tracing a THROW can name the transport honestly
+    // instead of re-guessing it from `client` (present ≠ used — the seam may be missing).
+    return Object.assign(async (reply: OcReply) => {
+      const res = await post({
+        url: `/${reply.path}`,
+        ...(reply.body === undefined ? {} : { body: reply.body }),
+      });
+      const status = res?.response?.status;
+      // No Response object at all means the transport never completed; make that a throw so the
+      // caller traces it as status 0 + error rather than as a silent success.
+      if (typeof status !== "number") throw new Error("opencode client returned no response");
+      return { via: "client" as const, status };
+    }, { via: "client" as const });
+  }
+  if (!serverUrl) return undefined;
+  return Object.assign(async (reply: OcReply) => {
+    const res = await fetchFn(new URL(reply.path, serverUrl), {
+      method: "POST",
+      ...(reply.body === undefined ? {} : {
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(reply.body),
+      }),
+      signal: AbortSignal.timeout(2000),
+    });
+    return { via: "url" as const, status: res.status };
+  }, { via: "url" as const });
+}
+
 // ---- the operational trace ------------------------------------------------------------------
 
 /** Same append-only single-line JSON log the Claude/Codex holds write (the debug-session-state skill
@@ -237,8 +306,12 @@ export function ocTrace(event: object): void {
 
 export interface OcApprovalOptions {
   config: Config;
-  /** `input.serverUrl` stringified — a URL ending in "/", e.g. "http://127.0.0.1:4396/". */
-  serverUrl: string;
+  /** `input.client` — OpenCode's own `OpencodeClient`. THE reply transport; see `ocPost`. */
+  client?: unknown;
+  /** `input.serverUrl` stringified — a URL ending in "/", e.g. "http://127.0.0.1:4396/". Only used
+   *  when `client` carries no request seam, and NOT trustworthy on its own: under the TUI it is a
+   *  fabricated `http://localhost:4096` with nothing listening (see `ocPost`). */
+  serverUrl?: string;
   /** The plugin instance's pinned directory, for the blob's folder identity. */
   cwd?: string;
   /** The decision id the phone answers against. Generated by the CALLER so it can retire this hold
@@ -263,7 +336,6 @@ export interface OcApprovalOptions {
  *  time, so an unanswered hold degrades to "answer at your Mac" rather than wedging anything. */
 export async function runOcApproval(request: OcDecisionRequest, o: OcApprovalOptions): Promise<void> {
   const trace = o.trace ?? ocTrace;
-  const fetchFn = o.fetchFn ?? fetch;
   // The synthesized hook stdin. `permission_mode` and `agent_id` are ABSENT on purpose: absent mode is
   // the interactive arm (the hold), and an agent_id would take the subagent pass-through. The Codex
   // reviewer gate is `agent === "codex"` only, so "opencode" never reaches it either.
@@ -292,20 +364,21 @@ export async function runOcApproval(request: OcDecisionRequest, o: OcApprovalOpt
   }
   const reply = ocReplyFor(request, line);
   if (!reply) { trace({ event: "oc-no-reply", kind: request.kind, id: request.id }); return; }
+  const post = ocPost(o.client, o.serverUrl, o.fetchFn);
+  if (!post) { trace({ event: "oc-replied", kind: request.kind, id: request.id, path: reply.path, status: 0, via: "none", error: "NoTransport" }); return; }
   try {
-    const res = await fetchFn(new URL(reply.path, o.serverUrl), {
-      method: "POST",
-      ...(reply.body === undefined ? {} : {
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify(reply.body),
-      }),
-      signal: AbortSignal.timeout(2000),
-    });
-    trace({ event: "oc-replied", kind: request.kind, id: request.id, path: reply.path, status: res.status });
+    const { status } = await post(reply);
+    trace({ event: "oc-replied", kind: request.kind, id: request.id, path: reply.path, via: post.via, status });
   } catch (e) {
     // The answer is lost and OpenCode is still blocked — but its own dialog never went away, so the
     // user can still answer at the Mac. Silence is the contract; never surface into the editor.
-    trace({ event: "oc-replied", kind: request.kind, id: request.id, path: reply.path, status: 0, error: (e as { name?: string })?.name ?? "Error" });
+    // `status:0` is the THREW case and is not a status — an HTTP failure arrives as a real status.
+    trace({
+      event: "oc-replied", kind: request.kind, id: request.id, path: reply.path, status: 0,
+      via: post.via,
+      error: (e as { name?: string })?.name ?? "Error",
+      message: String((e as { message?: unknown })?.message ?? "").slice(0, 200),
+    });
   }
 }
 
