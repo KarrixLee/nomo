@@ -348,8 +348,11 @@ major/minor to reproduce it byte-for-byte.
 
 ### Releasing
 
-The plugin version (currently **2.1.5**) is written in **five manifests that must move together** —
-a release that bumps four of them installs a stale version somewhere:
+The plugin version is written in **manifests that must move together** — a release that bumps all
+but one installs a stale version somewhere. The current number is deliberately NOT repeated in this
+sentence: `build.ts` cross-checks the JSON manifests against each other, never prose, so a version
+written here goes stale silently with nothing to catch it (it had already drifted to 2.1.5 while the
+manifests said 2.1.7). The manifests are the source of truth; read them.
 
 - `.claude-plugin/marketplace.json` (Claude Code marketplace)
 - `.agents/plugins/marketplace.json` (Codex marketplace)
