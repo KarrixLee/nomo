@@ -104,6 +104,44 @@ In plain English:
   quietly swapping the public keys (a man-in-the-middle): if it tampers, pairing fails instead of
   silently succeeding under the attacker's key.
 
+## Install — one command
+
+```sh
+bunx nomo-ai     # or: npx nomo-ai
+```
+
+It detects which of Claude Code, Codex and OpenCode are on this machine, shows exactly what it
+will run for each, and lets you toggle the list before anything happens. Then it drives **each
+host's own install path** — the same three flows spelled out below — and prints the restart-and-pair
+step for each one it installed.
+
+It is a **bootstrapper, not a package manager**: it never writes into `~/.claude` or `~/.codex`
+itself, because those hosts own install *and* update through their marketplaces, and a second writer
+racing `claude plugin update` is how you end up with two versions fighting over one watchdog daemon.
+There is deliberately **no `postinstall` hook** — a package that edits your agent config just because
+you `npm install`ed it is the shape you should distrust. It only does something when you run it.
+
+It never pairs your phone. Pairing stays the deliberate step you run from inside the agent
+afterwards.
+
+For scripting and CI:
+
+| Flag | |
+|---|---|
+| `--claude` `--codex` `--opencode` | install exactly these — naming any one of them skips the prompt |
+| `--all` | all three, detected or not |
+| `-y`, `--yes` | no prompt; install everything detected |
+| `-n`, `--dry-run` | print the commands, run nothing |
+| `-h`, `--help` / `-v`, `--version` | |
+
+With no flags and no terminal to ask, it refuses rather than guessing. Every failure names the step,
+the exit code, and the command to run by hand; the exit status is non-zero if any agent failed.
+
+The OpenCode leg clones this repo to `~/.nomo` (or `git pull`s an existing one) and runs
+`plugin/scripts/opencode-install.sh` from there — the same thing you would do by hand below. It has
+to be a durable checkout, not the npm tarball: the installed stub re-exports an absolute path, and a
+`bunx` cache directory does not survive the week.
+
 ## <img src="assets/claude.png" height="22" align="center" alt=""> Install — Claude Code
 
 From inside Claude Code:
@@ -160,9 +198,10 @@ one app-server process — see [docs.nomo.gg/sessions/codex](https://docs.nomo.g
 
 OpenCode has no marketplace and no hooks: it loads **one resident plugin module** inside its own
 server process, auto-discovering `{plugin,plugins}/*.{ts,js}` in its config directories. So the
-install is a clone plus **one command** — no `opencode plugin` command, and deliberately **no npm
-package**: OpenCode's `Npm.add` short-circuits on an existing cache directory, so a bare spec
-resolves `@latest` exactly once and never updates again.
+install is a clone plus **one command** — no `opencode plugin` command, and deliberately **no
+npm-resolved plugin**: OpenCode's `Npm.add` short-circuits on an existing cache directory, so a bare
+spec resolves `@latest` exactly once and never updates again. (`bunx nomo-ai` automates the clone
+below; it hands OpenCode a filesystem path, never a package spec.)
 
 Already installed Nomo for Claude Code or Codex? Reuse that copy — `claude plugin list` /
 `codex plugin list` prints its path. Otherwise clone the repo anywhere:
@@ -302,22 +341,28 @@ Codex skills do. Add a command by dropping another `.md` in that directory; the 
 up with no code change.
 
 `plugin/dist/` **is committed to the repo.** Marketplace installs are a plain `git clone` of this
-repository — there is no publish, npm, or CI build step, so the committed bundle is what actually
-runs. Re-run `bun build.ts` after any source change so `dist/` stays reproducible from source, and
+repository — there is no CI build step, and the `nomo-ai` npm package ships only the installer, not
+the bundle — so the committed `dist/` is what actually runs. Re-run `bun build.ts` after any source change so `dist/` stays reproducible from source, and
 commit the regenerated bundles. The committed bundle was built with `bun 1.3.10`; use the same
 major/minor to reproduce it byte-for-byte.
 
 ### Releasing
 
-The plugin version (currently **2.1.3**) is written in **four manifests that must move together** —
-a release that bumps three of them installs a stale version somewhere:
+The plugin version (currently **2.1.5**) is written in **five manifests that must move together** —
+a release that bumps four of them installs a stale version somewhere:
 
 - `.claude-plugin/marketplace.json` (Claude Code marketplace)
 - `.agents/plugins/marketplace.json` (Codex marketplace)
 - `plugin/.claude-plugin/plugin.json` (`nomo-cc`)
 - `plugin/.codex-plugin/plugin.json` (`nomo`)
+- `package.json` (the `nomo-ai` npm bootstrapper)
 
 OpenCode has no manifest — it installs from the checkout, so `git pull` is its version.
+
+`bun build.ts` cross-checks all five and refuses to build on disagreement. `package.json` carries the
+version only so `bunx nomo-ai --version` is quotable in a bug report; it ships no plugin code. The
+npm publish is a separate manual step — `npm pack --dry-run` first: the tarball is `bin/` plus the
+three files npm always adds (`package.json`, `README.md`, `LICENSE`), and nothing else.
 
 ## License — MIT
 

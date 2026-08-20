@@ -21,12 +21,19 @@ const OUTDIR = join(HERE, "plugin", "dist");
 /** Every manifest that carries the plugin version, and how to pull it out. The Claude plugin manifest
  *  is the source of truth (see readVersion below); the rest must agree with it. A release that bumps
  *  only some of them ships hosts a version that disagrees with what the bundle reports, so the build
- *  refuses rather than baking the disagreement into dist/. */
+ *  refuses rather than baking the disagreement into dist/.
+ *
+ *  package.json is the FIFTH and newest of them (the `nomo-ai` npm bootstrapper). It ships no plugin
+ *  code — it only drives `claude plugin install` / `codex plugin add` / opencode-install.sh — so
+ *  there was an argument for versioning it independently. It is here anyway: same product, same
+ *  repo, and `bunx nomo-ai --version` is what a user will quote in a bug report. Locking it in means
+ *  the build fails loudly on drift instead of leaving that trap for a future release to find. */
 const VERSION_MANIFESTS: { path: string; versions: (doc: any) => (string | undefined)[] }[] = [
   { path: join("plugin", ".claude-plugin", "plugin.json"), versions: (d) => [d.version] },
   { path: join("plugin", ".codex-plugin", "plugin.json"), versions: (d) => [d.version] },
   { path: join(".claude-plugin", "marketplace.json"), versions: (d) => (d.plugins ?? []).map((p: any) => p.version) },
   { path: join(".agents", "plugins", "marketplace.json"), versions: (d) => (d.plugins ?? []).map((p: any) => p.version) },
+  { path: "package.json", versions: (d) => [d.version] },
 ];
 
 /** The Claude plugin manifest's version, after proving every other manifest agrees with it.
