@@ -79,7 +79,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "2.1.3";
+var PLUGIN_VERSION = "2.1.4";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -4312,7 +4312,7 @@ function frame(sessionId, entry, op, status, now, detail, prio = 0) {
       entry.turnStartedAt = Math.floor(now / 1000);
     entry.working = true;
   }
-  const sub = detail ?? (status === "working" && entry.agent === "plan" ? "Planning" : undefined);
+  const sub = detail ?? (status === "working" && entry.agent === "plan" ? "planning" : undefined);
   return {
     sessionId,
     op,

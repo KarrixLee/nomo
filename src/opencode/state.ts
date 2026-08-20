@@ -26,7 +26,7 @@ export interface OcFrame {
   op: CCOp;
   prio: 0 | 1;
   status: CCStatus;
-  /** Sub-status line: a `retry`'s message, else `"Planning"` while the plan agent holds the session. */
+  /** Sub-status line: a `retry`'s message, else the `"planning"` CCDetailKey while the plan agent holds the session. */
   detail?: string;
   title?: string;
   model?: string;
@@ -321,7 +321,14 @@ function frame(
   // `working` so a finished row does not claim to still be planning, and yielding to an explicit
   // detail (a `retry` message) — that is a transient the user needs, and the agent is still there on
   // the next busy.
-  const sub = detail ?? (status === "working" && entry.agent === "plan" ? "Planning" : undefined);
+  //
+  // LOWERCASE, and it is a PINNED CROSS-REPO CONTRACT: the phone maps this through
+  // `CCDetailKey.label` (Shared/ClaudeCodeActivity.swift), whose keys are all lowercase —
+  // editing/running/reading/searching/web/delegating/planning/thinking. An unrecognised key hits
+  // `default: nil` and the raw string renders VERBATIM, so a capital "Planning" shipped English to
+  // every locale even though 計画中 / 계획 중 / 规划中 / 規劃中 / Planificando are already in the
+  // catalog. It fails silently and looks like a missing translation rather than a bad key.
+  const sub = detail ?? (status === "working" && entry.agent === "plan" ? "planning" : undefined);
   return {
     sessionId,
     op,

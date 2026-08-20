@@ -385,7 +385,7 @@ describe("plan mode rides the detail seam", () => {
     expect(reduceOcEvent(state, assistantMessage(ROOT, "opencode", "nemotron-3.5-lightning-free", "plan"), 2_000))
       .toBeNull(); // agent only, no frame of its own
     const frame = reduceOcEvent(state, status(ROOT, { type: "busy" }), 2_100)!;
-    expect(frame.detail).toBe("Planning");
+    expect(frame.detail).toBe("planning");
     // Ambient, exactly like todos: no attention, no status change.
     expect(frame.status).toBe("working");
     expect(frame.prio).toBe(0);
@@ -394,13 +394,13 @@ describe("plan mode rides the detail seam", () => {
   test("the TUI's create-time agent stamp lands on the very first frame", () => {
     const state = newOcState();
     expect(reduceOcEvent(state, created(ROOT, "Explore codebase structure", { agent: "plan" }), 1_000)?.detail)
-      .toBe("Planning");
+      .toBe("planning");
   });
 
   test("going back to build clears the detail", () => {
     const state = startedRoot();
     reduceOcEvent(state, assistantMessage(ROOT, "opencode", "nemotron-3.5-lightning-free", "plan"), 2_000);
-    expect(reduceOcEvent(state, status(ROOT, { type: "busy" }), 2_100)?.detail).toBe("Planning");
+    expect(reduceOcEvent(state, status(ROOT, { type: "busy" }), 2_100)?.detail).toBe("planning");
     reduceOcEvent(state, assistantMessage(ROOT, "opencode", "nemotron-3.5-lightning-free", "build"), 3_000);
     expect(reduceOcEvent(state, status(ROOT, { type: "busy" }), 3_100)?.detail).toBeUndefined();
   });
@@ -421,7 +421,7 @@ describe("plan mode rides the detail seam", () => {
   test("session.updated seeds the agent before any assistant message has spoken", () => {
     const state = startedRoot();
     reduceOcEvent(state, sessionUpdated(ROOT, "plan"), 1_500);
-    expect(reduceOcEvent(state, status(ROOT, { type: "busy" }), 1_600)?.detail).toBe("Planning");
+    expect(reduceOcEvent(state, status(ROOT, { type: "busy" }), 1_600)?.detail).toBe("planning");
   });
 
   test("a null or absent agent leaves what we already know alone", () => {
@@ -431,7 +431,7 @@ describe("plan mode rides the detail seam", () => {
       .toBeUndefined();
     reduceOcEvent(state, sessionUpdated(ROOT, "plan"), 1_500);
     reduceOcEvent(state, sessionUpdated(ROOT, null), 1_600);
-    expect(reduceOcEvent(state, status(ROOT, { type: "busy" }), 1_700)?.detail).toBe("Planning");
+    expect(reduceOcEvent(state, status(ROOT, { type: "busy" }), 1_700)?.detail).toBe("planning");
   });
 
   test("a retry message still wins over Planning, and Planning is not on the done frame", () => {
