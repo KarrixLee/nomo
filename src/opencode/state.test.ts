@@ -112,8 +112,11 @@ describe("reduceOcEvent lifecycle", () => {
     expect(reduceOcEvent(state, status(ROOT, { type: "busy" }), 2_000)).not.toBeNull();
     const done = reduceOcEvent(state, idle(ROOT), 3_000);
     expect(done).toMatchObject({ sessionId: ROOT, op: "done", status: "done" });
-    // No turn anchor on a done frame, and the next busy is NEVER swallowed by the dedupe.
-    expect(done?.turnStartedAt).toBeUndefined();
+    // The done frame KEEPS the turn's anchor: the phone renders "done in X" as the turn's end minus
+    // this. Without it the anchor falls back to the SESSION start, which the phone only trusts inside
+    // a 30-minute window, so the timer vanished on anything older. It is cleared only AFTER the frame
+    // is built, so the next turn still anchors fresh — and the next busy is never swallowed by dedupe.
+    expect(done?.turnStartedAt).toBe(2);
     const next = reduceOcEvent(state, status(ROOT, { type: "busy" }), 90_000);
     expect(next).toMatchObject({ op: "update", status: "working", turnStartedAt: 90 });
   });

@@ -241,9 +241,16 @@ export function reduceOcEvent(state: OcState, event: unknown, now: number = Date
     case "session.idle": {
       if (!entry) return null;
       entry.working = false;
-      entry.turnStartedAt = undefined;
       entry.lastStatusFrame = undefined; // the next busy must always get through
-      return frame(sessionId, entry, "done", "done", now);
+      // Build the done frame BEFORE clearing the anchor: the phone's "done in X" is the turn's END
+      // minus `turnStartedAt`, i.e. the frozen version of the count-up that was running. Clearing
+      // first shipped a done frame with no anchor, and the phone then falls back to `startedAt` —
+      // the SESSION's start — which it only trusts inside a 30-minute plausibility window (that
+      // window exists to stop a resumed session flashing its whole age, "40h"). So the timer simply
+      // vanished on any session older than half an hour.
+      const done = frame(sessionId, entry, "done", "done", now);
+      entry.turnStartedAt = undefined;
+      return done;
     }
 
     case "session.deleted": {
@@ -339,7 +346,12 @@ function frame(
     ...(entry.model ? { model: entry.model } : {}),
     ...(entry.plan ? { plan: entry.plan } : {}),
     startedAt: entry.startedAt,
-    ...(status === "working" && entry.turnStartedAt !== undefined ? { turnStartedAt: entry.turnStartedAt } : {}),
+    // NOT gated on `working`. The phone renders a finished row's "done in X" as the turn's end minus
+    // this anchor — the frozen form of the count-up that was running — so a done frame needs it just
+    // as much as a working one. Omitting it there made the phone fall back to `startedAt`, the
+    // SESSION's start, which it only trusts inside a 30-minute plausibility window (that window stops
+    // a resumed session flashing its whole age), so the timer silently vanished on anything older.
+    ...(entry.turnStartedAt !== undefined ? { turnStartedAt: entry.turnStartedAt } : {}),
   };
 }
 

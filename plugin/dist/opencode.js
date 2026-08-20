@@ -79,7 +79,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "2.1.4";
+var PLUGIN_VERSION = "2.1.5";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -4263,9 +4263,10 @@ function reduceOcEvent(state, event, now = Date.now()) {
       if (!entry)
         return null;
       entry.working = false;
-      entry.turnStartedAt = undefined;
       entry.lastStatusFrame = undefined;
-      return frame(sessionId, entry, "done", "done", now);
+      const done = frame(sessionId, entry, "done", "done", now);
+      entry.turnStartedAt = undefined;
+      return done;
     }
     case "session.deleted": {
       if (!entry)
@@ -4323,7 +4324,7 @@ function frame(sessionId, entry, op, status, now, detail, prio = 0) {
     ...entry.model ? { model: entry.model } : {},
     ...entry.plan ? { plan: entry.plan } : {},
     startedAt: entry.startedAt,
-    ...status === "working" && entry.turnStartedAt !== undefined ? { turnStartedAt: entry.turnStartedAt } : {}
+    ...entry.turnStartedAt !== undefined ? { turnStartedAt: entry.turnStartedAt } : {}
   };
 }
 async function postOcEvent(config, envelope) {
