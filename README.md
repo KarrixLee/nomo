@@ -132,6 +132,7 @@ For scripting and CI:
 | `--all` | all three, detected or not |
 | `-y`, `--yes` | no prompt; install everything detected |
 | `-n`, `--dry-run` | print the commands, run nothing |
+| `--ref <branch\|tag>` | **OpenCode only** — install from that ref instead of the default branch |
 | `-h`, `--help` / `-v`, `--version` | |
 
 With no flags and no terminal to ask, it refuses rather than guessing. Every failure names the step,
@@ -141,6 +142,14 @@ The OpenCode leg clones this repo to `~/.nomo` (or `git pull`s an existing one) 
 `plugin/scripts/opencode-install.sh` from there — the same thing you would do by hand below. It has
 to be a durable checkout, not the npm tarball: the installed stub re-exports an absolute path, and a
 `bunx` cache directory does not survive the week.
+
+`--ref` exists for testing a branch or tag before it merges, and it reaches **one leg**: the OpenCode
+checkout is the only thing the installer owns. `claude plugin marketplace add` and `codex plugin
+marketplace add` take an owner/repo and read the default branch — there is no ref to hand them — so
+the installer says so out loud when you combine `--ref` with those legs rather than implying it
+pinned all three. A `--ref` checkout is left **detached** on purpose: that is how a later plain
+`bunx nomo-ai` recognises a pin and refuses to quietly fast-forward it back (delete `~/.nomo`, or
+pass `--ref` again, to move it).
 
 ## <img src="assets/claude.png" height="22" align="center" alt=""> Install — Claude Code
 

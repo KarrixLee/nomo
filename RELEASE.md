@@ -114,6 +114,15 @@ Recommendation: keep `main`. Two independent reasons, either sufficient:
   `~/.nomo`. A tag clone is a detached HEAD, where `git pull --ff-only` fails outright; pinning would
   force a rewrite to `git fetch --tags && git checkout <tag>` and a way to learn the new tag.
 
+**Update (`--ref`, shipped).** The installer now takes `--ref <branch-or-tag>`, which neither of
+those two reasons contradicts: the *default* is still the default branch, so a plain `bunx nomo-ai`
+keeps all three legs on one branch, and the flag prints the caveat above — that Claude Code and Codex
+install from the default branch regardless — whenever it is used with those legs. The `--ff-only`
+problem is avoided structurally rather than solved: a `--ref` checkout is deliberately **detached**
+and reconciles with `git fetch --depth 1 origin <ref> && git checkout --detach FETCH_HEAD`, one path
+for a branch and a tag alike, so `git pull --ff-only` only ever runs on an attached branch. A plain
+run that finds a detached `~/.nomo` refuses and names the pin instead of failing inside git.
+
 The real cost of tracking `main` is the one D1 names: `main` must always be installable. That is a
 branch-discipline commitment, not a code change — no half-finished merges on `main`, releases land as
 one merge, and the `v*` tag is a marker for humans rather than something the installer reads.
