@@ -2325,12 +2325,63 @@ export const codexAdapter: AgentAdapter = {
   locateTuiPid: (ctx, deps) => codexLocateTuiPid(ctx, deps),
 };
 
+/** Which live process the phone's `focus-terminal` should raise for an OpenCode session — the DESKTOP
+ *  app's Electron main pid, or nothing.
+ *
+ *  The record's pid is `process.pid` of whatever hosts the OpenCode server (see opencode/plugin.ts),
+ *  and its ANCESTRY is what tells the two deployments apart:
+ *    • DESKTOP: the plugin is resident in the app's node utility process, so the chain runs
+ *      `…/OpenCode Helper.app/…/MacOS/OpenCode Helper --utility-sub-type=node.mojom.NodeService`
+ *      → `…/OpenCode.app/Contents/MacOS/OpenCode` (verified against the running app 2026-08-19).
+ *      Only the Electron MAIN carries the bundle's own executable path `…/OpenCode.app/Contents/MacOS/`
+ *      — every helper lives under `Contents/Frameworks/` — so that one regex names it and can never
+ *      name a helper (same shape, same reasoning as codexDesktopAppPid). The main is handed over
+ *      rather than the record's own pid because it outlives a recycled utility process.
+ *    • CLI / `opencode serve`: UNSUPPORTED, and returns undefined on purpose. The session belongs to
+ *      the server process, not to any terminal window — under `serve` there may be no window at all —
+ *      so the pid's terminal ancestry (a shell, an emulator) describes whoever LAUNCHED the server,
+ *      not where the session is being read. Raising that terminal would be a button that lies, which
+ *      this project treats as strictly worse than a button that is absent.
+ *
+ *  Deliberately NOT a `ps` table scan: the ancestry IS the evidence that this session is a desktop one,
+ *  and a scan that found the app some other way would happily answer for a CLI session too. A dead pid
+ *  has no readable ancestry, so a stale record can never be resurrected onto a live window.
+ *  Never throws. */
+export async function opencodeLocateTuiPid(
+  ctx: { sessionId: string; record: SessionRecord }, deps: LocateTuiDeps = {},
+): Promise<number | undefined> {
+  try {
+    const pid = ctx.record.pid;
+    if (typeof pid !== "number" || !Number.isFinite(pid) || pid <= 0) {
+      noteLocate(deps, "no-candidate");
+      return undefined;
+    }
+    const ancestorsOf = deps.ancestorsOf ?? pidAncestors;
+    const commandOf = deps.commandOf ?? pidCommand;
+    let chain: number[] = [];
+    try { chain = ancestorsOf(pid); } catch { chain = []; }
+    for (const candidate of [pid, ...chain]) {
+      let command: string | undefined;
+      try { command = commandOf(candidate); } catch { continue; }
+      if (typeof command === "string" && /\/OpenCode\.app\/Contents\/MacOS\//.test(command)) {
+        noteLocate(deps, "desktop-app");
+        return candidate;
+      }
+    }
+    noteLocate(deps, "no-candidate"); // CLI / serve / app not running → nothing honest to focus
+    return undefined;
+  } catch {
+    noteLocate(deps, "error");
+    return undefined;
+  }
+}
+
 /** OpenCode's adapter is a STUB, and deliberately so. OpenCode has no hooks: it loads one resident
  *  plugin into its own server process (`src/opencode/plugin.ts`) which owns the whole lifecycle —
  *  session identity, title, model, busy/idle — from an in-process event firehose. Nothing in the
  *  transcript-scanning pipeline this interface was shaped around applies.
  *
- *  What is LIVE here is `kind` and `blobAgentFields`: three call sites (`cc-watchdog`'s corrective
+ *  What is LIVE here is `kind`, `blobAgentFields` and `locateTuiPid`: three call sites (`cc-watchdog`'s corrective
  *  builders, `session-state`'s rollup, `computeSessionState`) reach `adapterFor()` on an OpenCode
  *  record and want only the `agent:"opencode"` literal to thread into the blob they are rebuilding.
  *  Every other member is inert — a path that does not exist, a matcher that never matches, an
@@ -2356,6 +2407,9 @@ export const opencodeAdapter: AgentAdapter = {
   // The one live member besides `kind`: OpenCode blobs carry `agent:"opencode"` so the phone tabs and
   // icons the session correctly (an app build that predates the literal reads it as claude, by design).
   blobAgentFields: { agent: "opencode" as const },
+  // The third live member: "Open on Mac" for the DESKTOP app only. See opencodeLocateTuiPid — a CLI /
+  // `opencode serve` session returns undefined and the phone keeps the button hidden, as before.
+  locateTuiPid: (ctx, deps) => opencodeLocateTuiPid(ctx, deps),
 };
 
 /** The adapter for an agent kind THIS BUILD DOES NOT KNOW — a record stamped by a newer peer install

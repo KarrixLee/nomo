@@ -97,14 +97,37 @@ export { BLOB_FIT_CHARS, NO_HOLD_PATH, sealedBlobChars };
  *  handshake this budget paid for (see POLL_TIMEOUT_MS / createPollBudget).
  *
  *  WORST-CASE PRE-DIALOG BLOCK, stalled network: POST_FIRST_CONTACT_TIMEOUT_MS (6s) +
- *  POLL_FIRST_CONTACT_TIMEOUT_MS (4s did-it-land probe) = 10s, because a TIMEOUT is never retried (see
- *  POST_MAX_ATTEMPTS). A network that fails FAST (connection refused, DNS NXDOMAIN) costs ~0 +
+ *  POLL_FIRST_CONTACT_TIMEOUT_MS (4s did-it-land probe) = 10s, because a TIMEOUT is never retried on a
+ *  hold that blocks a dialog (see HOLD_BLOCKS_DIALOG / POST_MAX_ATTEMPTS). A network that fails FAST
+ *  (connection refused, DNS NXDOMAIN) costs ~0 +
  *  POST_RETRY_PAUSE_MS + ~0 + ~0 ≈ 1s. Both stay at or under the ~10s bar, and both remain a fraction of
  *  the ~33s the old 15s×2 ceiling cost. The fresh-session re-ask (HOLD_RETRY_DELAY_MS + one more short
  *  POST) rides on top of that, but ONLY on the path where the worker already ANSWERED — i.e. it is
  *  reachable, so it is never the dead-network case. Once a hold IS granted the wait becomes unbounded ON
  *  PURPOSE (the phone owns the dialog) and every fetch from there on is a 2s poll GET. */
 export const POST_FIRST_CONTACT_TIMEOUT_MS = 6_000;
+
+/** Does a hold on this agent BLOCK A USER-FACING DIALOG for as long as it runs?
+ *
+ *  This is the property every "how long may first contact cost?" trade in this file is really about,
+ *  and it is NOT the same question as "which agent is this". Claude and Codex run this code as a
+ *  BLOCKING hook process: the hook IS the gate, the terminal dialog does not exist until we exit, and
+ *  every second spent here is a second the user stares at a frozen terminal. OpenCode runs it from a
+ *  RESIDENT plugin's `event` handler, started detached (`void runOcApproval(…)`, see opencode/plugin.ts's
+ *  `hold`), while OpenCode has ALREADY rendered its own prompt in its own UI — nothing waits on us, so
+ *  time spent here costs the user nothing, and giving up early costs them the entire remote path.
+ *
+ *  WHAT IT CHANGES: the initial decision POST's TIMEOUT retry, and only that. See postDecision.
+ *
+ *  DECLARED AS AN EXHAUSTIVE Record<AgentKind, …> ON PURPOSE. The recurring defect in this codebase is
+ *  the `agent === "codex"` branch that silently means "not claude"; a FOURTH agent added to AgentKind
+ *  must fail to COMPILE here rather than inherit whichever behaviour it happened to fall into. */
+export const HOLD_BLOCKS_DIALOG: Record<AgentKind, boolean> = {
+  claude: true,    // PermissionRequest hook — the terminal dialog appears only once this process exits
+  codex: true,     // same blocking-hook contract, same frozen TUI
+  opencode: false, // resident plugin, fired detached; OpenCode's own prompt is already on screen
+};
+
 /** A fresh session's FIRST permission prompt can fire BEFORE the phone app's ~3s poll has added the
  *  session to the worker's island shown-list, so the very first decision POST correctly comes back
  *  {hold:false} (session not shown yet) and the prompt falls open — even though the session lands in
@@ -1443,10 +1466,25 @@ export async function runPermissionHook(
     const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
 
     // The initial POST is the one place this hook is ALLOWED to block, and it is bounded tightly (see
-    // POST_FIRST_CONTACT_TIMEOUT_MS for the worst-case pre-dialog arithmetic). One retry, and ONLY after a
-    // FAST transport failure — a timeout ends the round at once. A non-ok HTTP status is a real answer and
-    // is never retried. `round` (1 = initial, 2 = post-race re-ask) is threaded through the trace alongside
-    // `attempt` (the per-round transport retry) so both rounds are legible in the log.
+    // POST_FIRST_CONTACT_TIMEOUT_MS for the worst-case pre-dialog arithmetic). One retry after a FAST
+    // transport failure; a non-ok HTTP status is a real answer and is never retried. `round` (1 =
+    // initial, 2 = post-race re-ask) is threaded through the trace alongside `attempt` (the per-round
+    // transport retry) so both rounds are legible in the log.
+    //
+    // A TIMEOUT is the one case that depends on WHAT THIS HOLD BLOCKS (HOLD_BLOCKS_DIALOG):
+    //
+    //   BLOCKING (claude, codex) — the terminal dialog is frozen behind us, so a second stall buys no
+    //   new information and doubles the freeze for the same answer. The round ends at once.
+    //     worst case: POST 6s + probe 4s = 10s to the dialog.
+    //
+    //   NON-BLOCKING (opencode) — OpenCode's own prompt is already up and nothing waits on us, so a
+    //   timeout costs the user NOTHING while giving up costs them the whole remote path. Field trace
+    //   2026-08-19, ses_fe0d…: one `TimeoutError` on round 1 attempt 1 (4 in that log's entire history —
+    //   a blip, not a break) and the session's remote answer path was gone; the user tapped Allow into a
+    //   void. So retry, on the SAME POST_MAX_ATTEMPTS ceiling every other failure mode uses.
+    //     worst case: POST 6s + pause 1s + POST 6s + probe 4s = 17s before the hold either exists or is
+    //     abandoned — all of it off the user's clock, and still bounded by POST_MAX_ATTEMPTS (2).
+    //   The round-2 re-ask is called with maxAttempts 1, so this can never compound across rounds.
     //
     // FRESH `ts` PER ATTEMPT. Every POST must carry a STRICTLY NEWER timestamp than the last one this hook
     // sent. The hold:false path is not a no-op server-side: the worker stores/pushes the fallback frame,
@@ -1493,9 +1531,10 @@ export async function runPermissionHook(
         } catch (e) {
           const name = (e as { name?: string })?.name ?? "Error";
           trace({ event: "posted", requestId, round, attempt, status: 0, ts, error: name });
-          // A TIMEOUT means the network is stalled: retrying only doubles the terminal freeze for the
-          // same answer. Anything else failed FAST, so one cheap retry is worth it.
-          if (name === "TimeoutError") break;
+          // A TIMEOUT means the network is stalled. Where a dialog is frozen behind us, retrying only
+          // doubles that freeze for the same answer; where nothing is, the retry is free and the hold
+          // is what is at stake. Anything else failed FAST, so one cheap retry is always worth it.
+          if (name === "TimeoutError" && HOLD_BLOCKS_DIALOG[agent]) break;
           if (attempt < maxAttempts) { await sleep(POST_RETRY_PAUSE_MS); continue; }
         }
       }

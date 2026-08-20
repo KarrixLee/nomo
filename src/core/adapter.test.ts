@@ -5,6 +5,7 @@ import { describe, expect, test } from "bun:test";
 import {
   adapterFor, allAdapters, claudeAdapter, claudeClearPredecessor, claudeDesktopInvocation, claudeForkResumePredecessor, claudeHeadlessInvocation, claudeLocateTuiPid, claudeSessionModel, claudeSessionTitle,
   claudeTailPendingApproval, codexAdapter, codexChildSessionGhost, codexDesktopAppPid, codexDesktopOriginator, codexLocateTuiPid, codexTuiCandidates,
+  opencodeAdapter, opencodeLocateTuiPid,
   codexConfigModel, codexDiscoverLive, codexInternalSessionGhost, codexModelFromRollout,
   CODEX_ROLLOUT_IDLE_SILENCE_MS,
   codexNewestRolloutForCwd, codexPidPlanPickerEvidence, codexPidPlanPickerState, codexPidTurnActive, codexPlanPickerStateFromTail, codexProposedPlanMarkdown, codexRolloutExistsForSession, codexSentinelSessionId, codexSessionModel,
@@ -1972,6 +1973,105 @@ describe("claudeLocateTuiPid (the recorded pid IS the TUI)", () => {
         commandOf: (p) => DESKTOP_COMMANDS[p],
       },
     )).toBe(16029); // the lone real codex TUI, never the desktop-owned pid
+  });
+});
+
+describe("opencodeLocateTuiPid (the DESKTOP app only, never the CLI)", () => {
+  // Verbatim off the running app (OpenCode 1.18.19, Electron 42.3.3), trimmed in the flag tail. The
+  // plugin's `process.pid` is the node UTILITY process; its parent is the Electron main.
+  const OC_APP_ARGV = "/Applications/OpenCode.app/Contents/MacOS/OpenCode";
+  const OC_UTILITY_ARGV =
+    "/Applications/OpenCode.app/Contents/Frameworks/OpenCode Helper.app/Contents/MacOS/OpenCode Helper"
+    + " --type=utility --utility-sub-type=node.mojom.NodeService --service-sandbox-type=none";
+  const OC_DESKTOP_COMMANDS: Record<number, string> = { 99802: OC_UTILITY_ARGV, 99632: OC_APP_ARGV };
+  const ocRec = (over: Partial<SessionRecord> = {}): SessionRecord =>
+    locRec({ agent: "opencode", ...over });
+
+  test("a desktop session resolves to the Electron MAIN pid, not to the utility helper", async () => {
+    const notes: LocateTuiReason[] = [];
+    const pid = await opencodeLocateTuiPid(
+      { sessionId: "ses_abc", record: ocRec({ pid: 99802 }) },
+      { ancestorsOf: () => [99632, 1], commandOf: (p) => OC_DESKTOP_COMMANDS[p], note: (r) => notes.push(r) },
+    );
+    // The helper is deliberately NOT the answer: it is recycled independently of the app, and its
+    // argv ("OpenCode Helper") is the string that used to resolve to VS Code in terminal-focus.
+    expect(pid).toBe(99632);
+    expect(notes).toEqual(["desktop-app"]);
+  });
+
+  test("the app's own main pid answers itself (a record written by a future in-main plugin)", async () => {
+    expect(await opencodeLocateTuiPid(
+      { sessionId: "s", record: ocRec({ pid: 99632 }) },
+      { ancestorsOf: () => [1], commandOf: () => OC_APP_ARGV },
+    )).toBe(99632);
+  });
+
+  test("a CLI session is UNSUPPORTED even though a real terminal owns it", async () => {
+    // The whole point: the pid is the opencode SERVER, so its terminal ancestry describes whoever
+    // launched the server, not where the session is read. Ghostty is right there in the chain and is
+    // still not offered — a button that raises the wrong window is worse than no button.
+    const notes: LocateTuiReason[] = [];
+    const argv: Record<number, string> = {
+      1150: "opencode", 45541: "-zsh", 900: "/Applications/Ghostty.app/Contents/MacOS/ghostty",
+    };
+    expect(await opencodeLocateTuiPid(
+      { sessionId: "s", record: ocRec({ pid: 1150 }) },
+      { ancestorsOf: () => [45541, 900, 1], commandOf: (p) => argv[p], note: (r) => notes.push(r) },
+    )).toBeUndefined();
+    expect(notes).toEqual(["no-candidate"]);
+  });
+
+  test("a headless `opencode serve` — no window exists at all — is UNSUPPORTED", async () => {
+    expect(await opencodeLocateTuiPid(
+      { sessionId: "s", record: ocRec({ pid: 4242 }) },
+      { ancestorsOf: () => [1], commandOf: (p) => (p === 4242 ? "opencode serve --port 4096" : "/sbin/launchd") },
+    )).toBeUndefined();
+  });
+
+  test("a pid that is GONE is never resurrected onto the live app", async () => {
+    // A dead pid has no readable ancestry and no argv, so nothing can match — the same property that
+    // protects the claude/codex locators from focusing a window for a stale record.
+    const notes: LocateTuiReason[] = [];
+    expect(await opencodeLocateTuiPid(
+      { sessionId: "s", record: ocRec({ pid: 99802 }) },
+      { ancestorsOf: () => [], commandOf: () => undefined, note: (r) => notes.push(r) },
+    )).toBeUndefined();
+    expect(notes).toEqual(["no-candidate"]);
+  });
+
+  test("an unusable pid, and a throwing process walk, are quiet no-ops", async () => {
+    expect(await opencodeLocateTuiPid({ sessionId: "s", record: ocRec({ pid: undefined }) })).toBeUndefined();
+    expect(await opencodeLocateTuiPid({ sessionId: "s", record: ocRec({ pid: Number.NaN }) })).toBeUndefined();
+    expect(await opencodeLocateTuiPid(
+      { sessionId: "s", record: ocRec({ pid: 99802 }) },
+      { ancestorsOf: () => { throw new Error("ps died"); }, commandOf: () => OC_UTILITY_ARGV },
+    )).toBeUndefined(); // the walk failed → only the pid itself is inspected, and it is not the main
+  });
+
+  test("the adapter wires it, and the codex locator is unaffected by an OpenCode ancestry", async () => {
+    expect(typeof opencodeAdapter.locateTuiPid).toBe("function");
+    expect(await opencodeAdapter.locateTuiPid!(
+      { sessionId: "s", record: ocRec({ pid: 99802 }) },
+      { ancestorsOf: () => [99632, 1], commandOf: (p) => OC_DESKTOP_COMMANDS[p] },
+    )).toBe(99632);
+    // Codex never consults the owning app, so an OpenCode ancestry cannot reach its heuristic at all.
+    expect(await codexLocateTuiPid(
+      { sessionId: "codex-uuid", record: locRec({ pid: 99802 }) },
+      { ps: async () => PS_ONE_TUI, ancestorsOf: () => [99632, 1], commandOf: (p) => OC_DESKTOP_COMMANDS[p] },
+    )).toBe(16029);
+  });
+
+  // The ONE deliberate spillover onto Claude, stated so it is a decision and not a surprise: the
+  // ttyless-desktop clause is shared and table-driven (`owningTerminalApp(pid)?.ttyless`), so adding
+  // the OpenCode row means a tty-less `claude` running inside OpenCode desktop's integrated terminal
+  // is now located and raises OPENCODE. That is a strict improvement on both prior outcomes: before
+  // the vscode rule was anchored, "OpenCode Helper" matched "Code Helper" and the same pid resolved to
+  // VS Code — a WRONG-app activation for a tty-holding session, and a no-tty refusal without one.
+  test("a tty-less Claude session hosted by OpenCode desktop now raises OpenCode, not VS Code", async () => {
+    expect(await claudeLocateTuiPid(
+      { sessionId: "s", record: locRec({ pid: 99802, agent: undefined }) },
+      { ttyOf: async () => "??", ancestorsOf: () => [99632, 1], commandOf: (p) => OC_DESKTOP_COMMANDS[p] },
+    )).toBe(99802);
   });
 });
 

@@ -104,7 +104,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "2.1.5";
+var PLUGIN_VERSION = "2.1.7";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -1075,11 +1075,16 @@ function recordTitleMatchesPane(recordTitle, paneTitle) {
   const match = /^(.*?)(?:\u2026|\.{3})$/.exec(recordTitle);
   return !!match && match[1].length > 0 && paneTitle.startsWith(match[1]);
 }
+var HERDR_FUZZY_SIGNAL = {
+  claude: (pane, context) => recordTitleMatchesPane(context.record.title, pane.terminal_title_stripped),
+  codex: (pane, context) => typeof context.record.origin?.cwd === "string" && context.record.origin.cwd.length > 0 && pane.cwd === context.record.origin.cwd
+};
 function correlateHerdrPane(context, panes) {
   const byId = panes.filter((pane) => pane.agent === context.agent && pane.agent_session?.value === context.sessionId && (pane.agent_session?.agent ?? context.agent) === context.agent);
   if (byId.length > 0)
     return byId.length === 1 ? byId[0] : undefined;
-  let candidates = context.agent === "claude" ? panes.filter((pane) => pane.agent === "claude" && recordTitleMatchesPane(context.record.title, pane.terminal_title_stripped)) : panes.filter((pane) => pane.agent === "codex" && typeof context.record.origin?.cwd === "string" && context.record.origin.cwd.length > 0 && pane.cwd === context.record.origin.cwd);
+  const fuzzy = HERDR_FUZZY_SIGNAL[context.agent];
+  let candidates = fuzzy === undefined ? [] : panes.filter((pane) => pane.agent === context.agent && fuzzy(pane, context));
   if (candidates.length > 1) {
     const working = candidates.filter((pane) => pane.agent_status === "working");
     if (working.length > 0)
@@ -1126,9 +1131,10 @@ var TERMINAL_APPS = [
   { id: "kitty", bundleId: "net.kovidgoyal.kitty", match: /\/kitty\.app\/|(?:^|\/)kitty(?:\s|$)/ },
   { id: "hyper", bundleId: "co.zeit.hyper", match: /\/Hyper\.app\// },
   { id: "warp", bundleId: "dev.warp.Warp-Stable", match: /\/Warp\.app\// },
-  { id: "vscode", bundleId: "com.microsoft.VSCode", match: /\/Visual Studio Code\.app\/|\/Code\.app\/|Code Helper/ },
+  { id: "vscode", bundleId: "com.microsoft.VSCode", match: /\/Visual Studio Code\.app\/|\/Code\.app\/|\/Code Helper/ },
   { id: "claude-desktop", bundleId: "com.anthropic.claudefordesktop", match: /\/Claude\.app\/Contents\//, ttyless: true },
-  { id: "codex-desktop", bundleId: "com.openai.codex", match: /\/ChatGPT\.app\/Contents\//, ttyless: true }
+  { id: "codex-desktop", bundleId: "com.openai.codex", match: /\/ChatGPT\.app\/Contents\//, ttyless: true },
+  { id: "opencode-desktop", bundleId: "ai.opencode.desktop", match: /\/OpenCode\.app\/Contents\//, ttyless: true }
 ];
 function owningTerminalApp(pid, ancestorsOf = pidAncestors, commandOf = pidCommand) {
   let chain = [];
@@ -2689,6 +2695,40 @@ var codexAdapter = {
   pidTurnActive: (pid) => codexPidTurnActive(pid),
   locateTuiPid: (ctx, deps) => codexLocateTuiPid(ctx, deps)
 };
+async function opencodeLocateTuiPid(ctx, deps = {}) {
+  try {
+    const pid = ctx.record.pid;
+    if (typeof pid !== "number" || !Number.isFinite(pid) || pid <= 0) {
+      noteLocate(deps, "no-candidate");
+      return;
+    }
+    const ancestorsOf = deps.ancestorsOf ?? pidAncestors;
+    const commandOf = deps.commandOf ?? pidCommand;
+    let chain = [];
+    try {
+      chain = ancestorsOf(pid);
+    } catch {
+      chain = [];
+    }
+    for (const candidate of [pid, ...chain]) {
+      let command;
+      try {
+        command = commandOf(candidate);
+      } catch {
+        continue;
+      }
+      if (typeof command === "string" && /\/OpenCode\.app\/Contents\/MacOS\//.test(command)) {
+        noteLocate(deps, "desktop-app");
+        return candidate;
+      }
+    }
+    noteLocate(deps, "no-candidate");
+    return;
+  } catch {
+    noteLocate(deps, "error");
+    return;
+  }
+}
 var opencodeAdapter = {
   kind: "opencode",
   title: async () => {
@@ -2700,7 +2740,8 @@ var opencodeAdapter = {
   hookStampPath: () => lastHookPath("opencode"),
   hooksNotFiringHint: "  OpenCode loads the plugin at server start — restart OpenCode, or check that ~/.config/opencode/plugins/nomo.js still points at this install.",
   toolDetail: {},
-  blobAgentFields: { agent: "opencode" }
+  blobAgentFields: { agent: "opencode" },
+  locateTuiPid: (ctx, deps) => opencodeLocateTuiPid(ctx, deps)
 };
 function unknownAgentAdapter(kind) {
   return {
@@ -5732,6 +5773,11 @@ async function runHook(agent) {
 
 // src/core/permission.ts
 var POST_FIRST_CONTACT_TIMEOUT_MS = 6000;
+var HOLD_BLOCKS_DIALOG = {
+  claude: true,
+  codex: true,
+  opencode: false
+};
 var HOLD_RETRY_DELAY_MS = 4000;
 var FRESH_SESSION_MS = 60000;
 var MAX_UNKNOWN_ANSWER_READS = 3;
@@ -6513,7 +6559,7 @@ async function runPermissionHook(deps = {}, agent = "claude") {
         } catch (e) {
           const name = e?.name ?? "Error";
           trace({ event: "posted", requestId, round, attempt, status: 0, ts, error: name });
-          if (name === "TimeoutError")
+          if (name === "TimeoutError" && HOLD_BLOCKS_DIALOG[agent])
             break;
           if (attempt < maxAttempts) {
             await sleep(POST_RETRY_PAUSE_MS);
