@@ -8,10 +8,9 @@ computer, useful when your phone is unreachable and you just want prompts to app
 as usual.
 
 **Scope, and say this to the user when they ask what it changed:** the flag is per-computer and
-SHARED by every agent — Claude Code and Codex both read it. OpenCode itself never holds a prompt for
-the phone (its integration is read-only: sessions mirror to the Live Activity, decisions stay in the
-terminal), so this switch changes nothing about OpenCode sessions. It is here so you can flip the
-machine's switch without leaving OpenCode.
+SHARED by every agent — Claude Code, Codex and OpenCode all read it. OpenCode holds on both of its
+approval channels: an ordinary permission prompt (run a command, edit a file, …) and a question the
+agent asks you. Turning this off means those wait in the terminal instead of reaching your phone.
 
 ## Read `$ARGUMENTS` first
 

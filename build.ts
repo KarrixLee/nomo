@@ -77,7 +77,7 @@ const ENTRYPOINTS = [
  *  server process, so there is no hooks.json, no hook-shim entry and no NOMO_SHIM_REV bump.
  *  It still lands in plugin/dist/ because shared.ts's WATCHDOG_PATH resolves cc-watchdog.mjs as a
  *  sibling of import.meta.url — the bundle must EXECUTE from dist/. The installed file at
- *  ~/.config/opencode/plugin/nomo.js is a one-line stub re-exporting this absolute path (see README);
+ *  ~/.config/opencode/plugins/nomo.js is a one-line stub re-exporting this absolute path (see README);
  *  that indirection is also what keeps an install from going stale across plugin upgrades. */
 const OPENCODE_ENTRY = join(HERE, "src", "opencode", "plugin.ts");
 
