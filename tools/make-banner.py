@@ -3,14 +3,16 @@
     uv run --with pillow tools/make-banner.py --preview
     uv run --with pillow tools/make-banner.py --png /tmp/opt-a   # dark + light PNGs to look at
 
-This generates the ART constant that bin/nomo-ai.mjs ships, at the default 16 cols x 8 rows. Other
-techniques were tried against it and lost -- character-density ramps, an ASCII shade ramp, the arc
-alone, a redrawn thin concentric sweep -- so --cols/--rows/--arc-only survive to make re-taking that
-call cheap rather than a re-derivation. Run --preview and look.
+NOT CURRENTLY SHIPPED. bin/nomo-ai.mjs draws a typographic lockup instead, and that was a finding,
+not a shortcut: the Nomo mark is a soft pastel gradient with no strong silhouette, and at the 6-9
+rows that can sit above a 15-line install plan it collapses into a coral smudge next to a blue lump
+no matter which technique draws it. Half-blocks, character-density ramps, an ASCII shade ramp, the
+arc alone, and a redrawn thin concentric sweep were all rendered to PNG and looked at; the smallest
+readable picture was still worse than no picture. This file survives so that call can be re-taken
+cheaply rather than re-derived -- run --preview and look.
 
-The output is pasted in, never imported: package.json `files` is ["bin/"], so this file is not in
-the tarball, and the installer stays dependency-free and never touches assets/ at run time. Change
-anything here and you must paste the new ART into bin/nomo-ai.mjs for it to reach anyone.
+Not in the tarball either: package.json `files` is ["bin/"]. The installer must stay dependency-free
+and never touch assets/ at run time, so this runs by hand and its output is pasted in.
 
 Two half-pixels per cell via U+2580 / U+2584: the foreground paints one half, the background the
 other, and a cell with only one live half leaves the other the terminal's own background. That is
@@ -158,23 +160,8 @@ def render(cols, rows, **kw):
         line = "".join(out).rstrip()
         if line.endswith("\x1b[49m"):
             line = line[: -len("\x1b[49m")]
-        # Padded back out to the full column count, plain spaces after the reset. The wordmark is
-        # set to the RIGHT of the art, so every row has to end at the same column -- and a width
-        # baked into the data is one less number for bin/nomo-ai.mjs to be told and get wrong.
-        lines.append((line + "\x1b[0m" if line else "") + " " * (cols - visible(line)))
+        lines.append(line + "\x1b[0m" if line else "")
     return lines
-
-
-def visible(line):
-    """Cells the line actually occupies: everything that is not an escape sequence."""
-    n = i = 0
-    while i < len(line):
-        if line[i] == "\x1b":
-            i = line.index("m", i) + 1
-        else:
-            n += 1
-            i += 1
-    return n
 
 
 def to_png(cols, rows, path, bg, cell=(11, 24), **kw):

@@ -574,36 +574,13 @@ async function chooseNumbered(selected) {
 
 // ── the banner ───────────────────────────────────────────────────────────────────────────────────
 //
-// The Nomo mark, pre-rendered to half-blocks: 16 columns by 8 terminal rows, two half-pixels per
-// cell via U+2580/U+2584 — a cell with only one live half leaves the other the terminal's OWN
-// background, which is what drops the icon's near-white ground instead of painting a white slab
-// into a dark terminal. Wordmark, version and tagline are set to the art's RIGHT; stacked beneath
-// it the block runs twelve rows and stops fitting above a fifteen-line install plan.
-//
-// Two things here are load-bearing and were both wrong in an earlier pass:
-//
-//   * THE COLOURS ARE A SCALAR RGB MULTIPLY over values sampled off assets/icon.png — never a
-//     lightness cut at held saturation. Saturation is a ratio against the room a given lightness
-//     leaves, so holding it while darkening WIDENS the colour: that is what turned the pastel
-//     periwinkle electric indigo. A scalar multiply darkens at exactly the source hue.
-//   * IT IS PRE-RENDERED. The tarball stays four files with no runtime dependencies and never
-//     reads assets/ when it runs. tools/make-banner.py regenerates ART below and is deliberately
-//     NOT in package.json `files`.
-
-/** The mark. Regenerate with `uv run --with pillow tools/make-banner.py`. Every row is padded to
- *  one width by that tool, so the text beside it lines up without a column number kept in sync
- *  here — ask the art how wide the art is. */
-const ART = [
-  "         \u001b[38;2;176;128;112m▄\u001b[38;2;176;112;96m▄\u001b[38;2;176;128;112;48;2;160;112;96m▀\u001b[38;2;176;128;96m▀\u001b[38;2;176;112;96m▀▀\u001b[0m   ",
-  "      \u001b[38;2;176;128;112m▄\u001b[48;2;160;112;96m▀\u001b[38;2;176;112;96m▀\u001b[38;2;160;112;96m▀▀\u001b[48;2;160;112;112m▀▀▀\u001b[38;2;160;112;112;48;2;160;128;128m▀\u001b[0m   ",
-  "    \u001b[38;2;176;128;112m▄\u001b[48;2;160;112;96m▀\u001b[38;2;160;112;96m▀▀\u001b[48;2;160;112;112m▀\u001b[38;2;160;112;112m▀▀\u001b[48;2;144;112;128m▀\u001b[38;2;160;112;128;48;2;144;128;128m▀\u001b[38;2;160;128;128m▀\u001b[49m▀\u001b[0m   ",
-  "   \u001b[38;2;176;128;112m▄\u001b[38;2;160;112;96;48;2;160;112;96m▀▀\u001b[48;2;160;112;112m▀\u001b[38;2;160;112;112m▀\u001b[48;2;144;112;128m▀\u001b[38;2;160;112;128m▀\u001b[49;38;2;144;112;128m▀\u001b[0m       ",
-  "  \u001b[38;2;176;128;112m▄\u001b[38;2;160;112;96;48;2;160;112;96m▀▀\u001b[48;2;160;112;112m▀\u001b[38;2;160;112;112m▀\u001b[48;2;144;112;128m▀\u001b[49;38;2;144;112;128m▀\u001b[0m         ",
-  "  \u001b[38;2;176;128;96;48;2;176;112;96m▀\u001b[38;2;160;112;96;48;2;160;112;96m▀\u001b[48;2;160;112;112m▀\u001b[38;2;160;112;112m▀\u001b[38;2;144;112;128;48;2;144;112;128m▀\u001b[49m▀    \u001b[38;2;144;128;176m▄\u001b[48;2;128;128;176m▀\u001b[38;2;128;128;176;48;2;96;96;160m▀\u001b[48;2;96;112;160m▀\u001b[48;2;96;112;176m▀\u001b[48;2;112;128;176m▀\u001b[0m",
-  "  \u001b[38;2;176;128;112m▀\u001b[38;2;160;112;112m▀\u001b[38;2;160;128;112m▀\u001b[38;2;160;128;128m▀▀     \u001b[38;2;112;112;160;48;2;112;112;160m▀\u001b[48;2;64;64;128m▀\u001b[38;2;80;96;160;48;2;96;112;176m▀\u001b[38;2;64;64;128;48;2;80;96;176m▀\u001b[38;2;96;96;176;48;2;80;80;176m▀\u001b[38;2;96;112;176;48;2;96;112;176m▀\u001b[0m",
-  "            \u001b[38;2;128;128;176;48;2;128;128;176m▀\u001b[38;2;96;112;176;48;2;112;128;176m▀\u001b[38;2;96;96;176;48;2;96;112;176m▀\u001b[38;2;80;80;176m▀\u001b[49;38;2;80;96;176m▀\u001b[0m ",
-];
-const ART_W = ART[0].replace(/\u001b\[[0-9;]*m/g, "").length;
+// TYPOGRAPHIC, not pictorial — and that is a finding, not a shortcut. The Nomo mark is a soft
+// pastel gradient with no strong silhouette: pre-rendered into the 6–9 rows that can sit above a
+// 15-line install plan it collapses into a coral smudge beside a blue lump, whichever technique
+// draws it (half-blocks, character density, arc-only, a redrawn thin sweep — all four were
+// rendered and looked at; tools/make-banner.py still generates the block form if that call is
+// ever revisited). What survives at terminal resolution is the icon's COLOUR, so that is all the
+// banner keeps: the coral→periwinkle sweep, run across the wordmark and a rule under it.
 
 const CORAL = [222, 152, 131]; // sampled straight off assets/icon.png — the arc's far end...
 const PERI = [150, 158, 240]; //  ...and the blob, which is periwinkle, not the blue it looks at 1px
@@ -628,25 +605,19 @@ function sweep(s, isBold) {
 }
 
 function banner() {
-  // Not a TTY means something is READING this — a pipe, a CI log, `| tee`. A picture there is
-  // noise, so the whole lockup goes and not merely its colour; NO_COLOR lands in the same branch,
-  // because half-blocks with their colour stripped are a field of grey rectangles. A window too
-  // narrow to stand the art and the tagline side by side gets the same one-liner, which was the
-  // entire output before any of this existed.
-  if (!COLOR || (process.stdout.columns ?? 0) < ART_W + TAGLINE.length + 4) {
+  // Not a TTY means something is READING this — a pipe, a CI log, `| tee`. Colour there is noise,
+  // so the whole lockup goes and not merely its colour; NO_COLOR lands in the same branch, because
+  // an uncoloured rule under an uncoloured wordmark is just two lines of clutter. A window too
+  // narrow to hold the rule gets the same one-liner, which was the entire output before any of
+  // this existed.
+  if (!COLOR || (process.stdout.columns ?? 0) < TAGLINE.length + 4) {
     say(`${bold("nomo-ai")} ${dim(VERSION)} — ${TAGLINE}`);
     return;
   }
-  // Hung off the art's middle rows: the mark's mass sits high and left, so starting at row 3 sets
-  // the text BESIDE the icon rather than off past the tail it thins into.
-  const SIDE_TOP = 3;
-  const side = [`${sweep("nomo-ai", true)} ${dim(VERSION)}`, dim(TAGLINE)];
   say();
-  ART.forEach((row, i) => {
-    const text = side[i - SIDE_TOP];
-    say(text ? `${row}  ${text}` : row);
-  });
-  say();
+  say(`  ${sweep("nomo-ai", true)} ${dim(VERSION)}`);
+  say(`  ${sweep("─".repeat(TAGLINE.length))}`);
+  say(`  ${dim(TAGLINE)}`);
 }
 
 // ── main ─────────────────────────────────────────────────────────────────────────────────────────
