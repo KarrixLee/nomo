@@ -2237,7 +2237,7 @@ export const claudeAdapter: AgentAdapter = {
   sessionsDir: () => `${process.env.HOME}/.claude/projects`,
   sessionMatch: (name: string) => name.endsWith(".jsonl"),
   hookStampPath: () => lastHookPath("claude"),
-  hooksNotFiringHint: "  Reinstall the plugin / check /plugin.",
+  hooksNotFiringHint: "  run /plugin in Claude Code, check the nomo plugin is enabled, then restart Claude Code",
   toolDetail: claudeToolDetail,
   // Claude blobs OMIT the agent key (byte-identical to the pre-codex blob), so this is empty.
   blobAgentFields: {},
@@ -2315,7 +2315,7 @@ export const codexAdapter = {
   sessionsDir: () => `${codexHome()}/sessions`,
   sessionMatch: (name: string) => name.startsWith("rollout-") && name.endsWith(".jsonl"),
   hookStampPath: () => lastHookPath("codex"),
-  hooksNotFiringHint: "  Run /hooks in Codex to re-trust, or reinstall the plugin — known upstream bugs #16430/#30835.",
+  hooksNotFiringHint: "  run /hooks in Codex to re-trust, or reinstall the plugin — known upstream bugs #16430/#30835",
   toolDetail: codexToolDetail,
   // Codex blobs carry `agent:"codex"` so the phone tabs/icons the session correctly.
   blobAgentFields: { agent: "codex" as const },
@@ -2407,7 +2407,7 @@ export const opencodeAdapter: AgentAdapter = {
   sessionsDir: () => `${CC_DIR}/opencode-has-no-sessions-dir`,
   sessionMatch: () => false,
   hookStampPath: () => lastHookPath("opencode"),
-  hooksNotFiringHint: "  OpenCode loads the plugin at server start — restart OpenCode, or check that ~/.config/opencode/plugins/nomo.js still points at this install.",
+  hooksNotFiringHint: "  restart OpenCode (it loads the plugin at server start), or check that ~/.config/opencode/plugins/nomo.js still points at this install",
   toolDetail: {},
   // The one live member besides `kind`: OpenCode blobs carry `agent:"opencode"` so the phone tabs and
   // icons the session correctly (an app build that predates the literal reads it as claude, by design).

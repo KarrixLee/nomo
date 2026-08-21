@@ -1831,7 +1831,7 @@ await child.exited;
 //
 // status-cmd learns to read the native plugin's state from <CODEX_HOME>/config.toml (naive line-scan,
 // no TOML dep) and to warn when the legacy hooks.json path overlaps it (double-fire). These cover the
-// pure parser and the end-to-end `Codex plugin:` status line across every detection state.
+// pure parser and the end-to-end Codex `Plugin` row across every detection state.
 describe("parseCodexPluginState (naive config.toml line-scan)", () => {
   test("empty / unrelated config → not installed, default-enabled, 0 trusted, 0 ccTrusted", () => {
     expect(parseCodexPluginState("")).toEqual({ installed: false, enabled: true, trusted: 0, ccTrusted: 0 });
@@ -1905,12 +1905,21 @@ describe("statusCmd — Codex plugin detection states", () => {
       const lines: string[] = [];
       await statusCmd({
         print: (l) => lines.push(l),
+        // Asked FROM Codex: the plugin/trust rows are Codex's own detail, and detail only prints in
+        // the section belonging to the agent that asked.
+        audience: "codex",
         configPath: join(dir, "config.json"),      // absent → the pairing lines are irrelevant here
         lastSendPath: join(dir, "last-send"),
         sessionsDir: join(dir, "sessions"),
         watchdogPidPath: join(dir, "watchdog.pid"),
         codexConfigPath,
         codexHooksPath,
+        codexSessionsDir: join(dir, "codex-sessions"),
+        claudeProjectsDir: join(dir, "claude-projects"),
+        lastHookCodexPath: join(dir, "lh-codex"),
+        lastHookClaudePath: join(dir, "lh-claude"),
+        lastHookOpencodePath: join(dir, "lh-opencode"),
+        noHoldPath: join(dir, "no-hold"),
         codexAppServerAvailable: async () => false,
         isAlive: () => false,
         now: () => 0,
@@ -1920,7 +1929,8 @@ describe("statusCmd — Codex plugin detection states", () => {
       await rm(dir, { recursive: true, force: true });
     }
   }
-  const pluginLine = (lines: string[]): string => lines.find((l) => l.startsWith("Codex plugin:"))!;
+  /** The Codex section's Plugin row, minus its label column. */
+  const pluginLine = (lines: string[]): string => lines.find((l) => l.startsWith("  Plugin"))!.slice(14);
 
   test("reports whether the responder-backed Codex Plan bridge is actually available", async () => {
     const dir = await mkdtemp(join(tmpdir(), "cc-status-bridge-"));
@@ -1928,12 +1938,15 @@ describe("statusCmd — Codex plugin detection states", () => {
       for (const available of [false, true]) {
         const lines: string[] = [];
         await statusCmd({
-          print: (line) => lines.push(line),
+          print: (line) => lines.push(line), audience: "codex",
           configPath: join(dir, "config.json"), codexConfigPath: join(dir, "config.toml"),
-          codexHooksPath: join(dir, "hooks.json"), codexAppServerAvailable: async () => available,
+          codexHooksPath: join(dir, "hooks.json"), noHoldPath: join(dir, "no-hold"),
+          codexAppServerAvailable: async () => available,
         });
-        const bridge = lines.find((line) => line.startsWith("Codex Plan answers:"));
-        expect(bridge).toContain(available ? "bridge available" : "status-only");
+        // A capability, not a fault: it is a row in Codex's own section and never a warning, because a
+        // perfectly healthy plugin can simply have no daemon running.
+        const bridge = lines.find((line) => line.startsWith("  Plan"));
+        expect(bridge).toContain(available ? "answerable from your phone" : "answered here");
       }
     } finally {
       await rm(dir, { recursive: true, force: true });
@@ -1949,60 +1962,64 @@ describe("statusCmd — Codex plugin detection states", () => {
   });
 
   test("nothing installed → `not installed`", async () => {
-    expect(pluginLine(await runStatus({}))).toBe("Codex plugin: not installed");
+    expect(pluginLine(await runStatus({}))).toBe("not installed");
   });
 
   test("installed + all 7 hooks trusted → `installed, trusted (7/7)`", async () => {
     expect(pluginLine(await runStatus({ configToml: cfgToml({ enabled: true, trusted: 7 }) })))
-      .toBe("Codex plugin: installed, trusted (7/7)");
+      .toBe("installed, trusted (7/7)");
   });
 
   test("installed + a partial N trusted → `installed, trusted (N/7)`", async () => {
     expect(pluginLine(await runStatus({ configToml: cfgToml({ trusted: 3 }) })))
-      .toBe("Codex plugin: installed, trusted (3/7)");
+      .toBe("installed, trusted (3/7)");
   });
 
-  test("installed but no hooks trusted yet → `installed, hooks NOT trusted (run /hooks in Codex)`", async () => {
-    expect(pluginLine(await runStatus({ configToml: cfgToml({ enabled: true, trusted: 0 }) })))
-      .toBe("Codex plugin: installed, hooks NOT trusted (run /hooks in Codex)");
+  test("installed but no hooks trusted yet → the row says so AND it becomes a problem with a fix", async () => {
+    const lines = await runStatus({ configToml: cfgToml({ enabled: true, trusted: 0 }) });
+    expect(pluginLine(lines)).toBe("installed, hooks NOT trusted");
+    // Untrusted hooks mean Codex sessions never reach the phone at all — that is a fault, not a state,
+    // so it earns a `!` line and the command that fixes it rather than a parenthetical.
+    expect(lines.some((l) => l.includes("! Codex has not trust-reviewed Nomo's hooks"))).toBe(true);
+    expect(lines.some((l) => l.includes("→ in Codex run /hooks and trust the Nomo entries"))).toBe(true);
   });
 
-  test("installed but explicitly disabled → `installed, disabled`", async () => {
-    expect(pluginLine(await runStatus({ configToml: cfgToml({ enabled: false, trusted: 7 }) })))
-      .toBe("Codex plugin: installed, disabled");
+  test("installed but explicitly disabled → `installed, disabled` AND a problem with a fix", async () => {
+    const lines = await runStatus({ configToml: cfgToml({ enabled: false, trusted: 7 }) });
+    expect(pluginLine(lines)).toBe("installed, disabled");
+    expect(lines.some((l) => l.includes("! The Nomo plugin is switched off in Codex"))).toBe(true);
   });
 
   test("legacy hooks.json only (no native plugin) → `legacy hooks.json (N events)` + migrate hint", async () => {
     const lines = await runStatus({ hooksJson: legacyHooks(6) });
-    expect(pluginLine(lines)).toBe("Codex plugin: legacy hooks.json (6 events)");
-    expect(lines.some((l) => l.includes("migrating to the native"))).toBe(true);
+    expect(pluginLine(lines)).toBe("legacy hooks.json (6 events)");
+    expect(lines.some((l) => l.includes("the native Nomo plugin is the supported path now"))).toBe(true);
   });
 
   test("overlap (native enabled+trusted AND legacy) → trusted line + a double-fire WARNING naming codex-status.mjs", async () => {
     const lines = await runStatus({ configToml: cfgToml({ enabled: true, trusted: 7 }), hooksJson: legacyHooks(6) });
-    expect(pluginLine(lines)).toBe("Codex plugin: installed, trusted (7/7)");
-    const warn = lines.find((l) => l.includes("double-fire"));
+    expect(pluginLine(lines)).toBe("installed, trusted (7/7)");
+    const warn = lines.find((l) => l.includes("every Codex event is sent twice"));
     expect(warn).toContain("6 legacy Nomo event");
     expect(lines.some((l) => l.includes("codex-status.mjs"))).toBe(true);
     // No spurious "migrate" hint when the native plugin is present.
-    expect(lines.some((l) => l.includes("migrating to the native"))).toBe(false);
+    expect(lines.some((l) => l.includes("the supported path now"))).toBe(false);
   });
 
   // Auto-discovery double-fire (D7.2): Codex auto-discovers the CLAUDE plugin (nomo-cc) and, when its
   // hooks.json hooks are ALSO trusted in Codex's config.toml, runs BOTH plugins on every Codex event.
   const ccWarn = (lines: string[]): string | undefined =>
-    lines.find((l) => l.includes("WARNING") && l.includes("auto-discovered the Claude plugin"));
+    lines.find((l) => l.includes("! Also runs the Claude Code plugin's hooks on every Codex event"));
 
   test("both nomo AND nomo-cc trusted in Codex → auto-discovery double-fire WARNING + untrust hint", async () => {
     const lines = await runStatus({ configToml: cfgToml({ enabled: true, trusted: 7, ccTrusted: 6 }) });
     const warn = ccWarn(lines);
     expect(warn).toBeDefined();
-    expect(warn).toContain("redundant double-fire");
-    // Two-space indent + an indented hint line naming the nomo-cc entries to remove.
-    expect(warn!.startsWith("  WARNING:")).toBe(true);
-    const hint = lines.find((l) => l.includes("`nomo-cc@nomo`") && l.includes("/hooks"));
-    expect(hint).toBeDefined();
-    expect(hint!.startsWith("  ")).toBe(true);
+    expect(warn).toContain("double the work, no benefit");
+    // Every problem line sits in the value column and is immediately followed by its `→` fix.
+    expect(warn!.startsWith(" ".repeat(14) + "!")).toBe(true);
+    const hint = lines[lines.indexOf(warn!) + 1]!;
+    expect(hint).toBe(" ".repeat(14) + "→ in Codex run /hooks and untrust the `nomo-cc@nomo` entries");
   });
 
   test("only the native nomo trusted (no nomo-cc) → NO auto-discovery warning", async () => {
@@ -2057,6 +2074,8 @@ describe("statusCmd — hooks-not-firing warning", () => {
   // nested rollout file, a claude projects tree with one nested transcript, and optional per-agent
   // stamp files — each aged relative to NOW. Returns the printed lines.
   async function run(opts: {
+    /** Which agent asked. Undefined = the no-argument render (every agent in full). */
+    audience?: "claude" | "codex" | "opencode";
     paired?: boolean;
     // Whether the native Codex plugin is installed+trusted in config.toml. Default true so the Codex
     // detector is eligible (its `enabled` gate keys off plugin.installed); set false to exercise the
@@ -2103,6 +2122,7 @@ describe("statusCmd — hooks-not-firing warning", () => {
       const lines: string[] = [];
       await statusCmd({
         print: (l) => lines.push(l),
+        audience: opts.audience,
         configPath,
         lastSendPath: join(dir, "last-send"),
         sessionsDir: join(dir, "sessions"),
@@ -2110,6 +2130,9 @@ describe("statusCmd — hooks-not-firing warning", () => {
         codexConfigPath,
         codexHooksPath: join(dir, "hooks.json"),
         codexSessionsDir, claudeProjectsDir, lastHookCodexPath, lastHookClaudePath,
+        lastHookOpencodePath: join(dir, "last-hook-opencode"),
+        noHoldPath: join(dir, "no-hold"),
+        codexAppServerAvailable: async () => false,
         isAlive: () => false,
         now: () => NOW,
       });
@@ -2118,8 +2141,13 @@ describe("statusCmd — hooks-not-firing warning", () => {
       await rm(dir, { recursive: true, force: true });
     }
   }
-  const warnedFor = (lines: string[], agent: string): boolean =>
-    lines.some((l) => l.includes("WARNING") && l.includes(agent) && l.toLowerCase().includes("hooks appear"));
+  /** A hooks-not-firing verdict for `agent`. The ROW only says "NOT FIRING" (it has to survive the
+   *  one-line collapsed view); the plain-English explanation and its fix live on the `!` line, which
+   *  prints identically whether the agent is the subject or somebody else. */
+  const warnedFor = (lines: string[], agent: "Codex" | "Claude"): boolean => {
+    const name = agent === "Codex" ? "Codex" : "Claude Code";
+    return lines.some((l) => l.includes(`! ${name} was active`) && l.includes("Nomo never heard about it"));
+  };
 
   test("recent codex rollout + NO stamp → codex hooks-not-firing warning with the #16430/#30835 hint", async () => {
     const lines = await run({ codexSessionAgeMs: 3 * MIN });
@@ -2185,6 +2213,17 @@ describe("statusCmd — hooks-not-firing warning", () => {
   test("claude stamp EXISTS but lags the newest transcript by >10min → STILL warns (preserved true-positive)", async () => {
     const lines = await run({ claudeSessionAgeMs: 2 * MIN, claudeStampAgeMs: 20 * MIN });
     expect(warnedFor(lines, "Claude")).toBe(true);
+  });
+
+  test("claude ASKED and has never stamped → NOW warns (the caller's plugin is installed by definition)", async () => {
+    // The old gate stayed silent here because a never-written Claude stamp is indistinguishable from
+    // "the Nomo plugin isn't installed in Claude Code". That ambiguity vanishes the moment Claude Code
+    // is the agent invoking this command — the command only exists as a slash command the plugin
+    // ships — so the caller's own agent is always judged, and this true positive stops being invisible.
+    const lines = await run({ audience: "claude", claudeSessionAgeMs: 3 * MIN });
+    expect(warnedFor(lines, "Claude")).toBe(true);
+    // Somebody else's Claude, same disk state, still keeps the old gate.
+    expect(warnedFor(await run({ audience: "codex", claudeSessionAgeMs: 3 * MIN }), "Claude")).toBe(false);
   });
 });
 

@@ -507,14 +507,16 @@ describe("run.sh shim upkeep", () => {
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────────
 
-describe("slash commands and Codex skills carry the shim fallback", () => {
+describe("slash commands, Codex skills and OpenCode commands carry the shim fallback", () => {
   // ISSUE B, same bug class as the hooks: these address the plugin through ${CLAUDE_PLUGIN_ROOT} (the
-  // Claude commands) or a <ROOT> the agent substitutes (the Codex skills), and both go stale the same
-  // way after a version bump. They fail LOUDLY rather than silently, so they were never the outage the
-  // hooks were — but "the plugin is gone" is not an acceptable answer to /nomo-cc:status either.
+  // Claude commands), a <ROOT> the agent substitutes (the Codex skills) or a __NOMO_ROOT__ the
+  // installer bakes in (the OpenCode commands), and all three go stale the same way after a version
+  // bump. They fail LOUDLY rather than silently, so they were never the outage the hooks were — but
+  // "the plugin is gone" is not an acceptable answer to /nomo-cc:status either.
   // A LINT, not a behavior test: a command added next year must not be able to skip the fallback.
   const COMMANDS = join(PLUGIN_DIR, "commands");
   const SKILLS = join(PLUGIN_DIR, "codex-skills");
+  const OPENCODE = join(PLUGIN_DIR, "opencode-commands");
 
   /** Every fenced block in a doc that actually LAUNCHES a bundle. Prose, `codex plugin list` and the
    *  user-facing `/nomo-cc:…` / `$nomo-…` invocations are deliberately not matched: they are things
@@ -535,9 +537,12 @@ describe("slash commands and Codex skills carry the shim fallback", () => {
     return out;
   }
 
-  for (const [label, dir, rootExpr] of [
-    ["commands", COMMANDS, '${CLAUDE_PLUGIN_ROOT}'],
-    ["codex-skills", SKILLS, "<ROOT>"],
+  // `agent` is the argument the status launch block MUST pass so status-cmd knows who asked (see the
+  // dedicated test at the bottom of this describe). It is per-host because the answer is per-host.
+  for (const [label, dir, rootExpr, agent] of [
+    ["commands", COMMANDS, '${CLAUDE_PLUGIN_ROOT}', "claude"],
+    ["codex-skills", SKILLS, "<ROOT>", "codex"],
+    ["opencode-commands", OPENCODE, "__NOMO_ROOT__", "opencode"],
   ] as const) {
     test(`${label}: every launch block prefers the live root, then falls back to the shim`, async () => {
       const files = await docs(dir);
@@ -548,7 +553,10 @@ describe("slash commands and Codex skills carry the shim fallback", () => {
           blocks += 1;
           const where = `${basename(dirname(file))}/${basename(file)}: ${block.slice(0, 60)}`;
           expect(where + block).toContain(rootExpr);
-          expect(where + block).toContain('[ -n "$NOMOR" ]');
+          // The emptiness guard exists because an UNSET env var would leave a bogus "/scripts/run.sh"
+          // that passes -x on some boxes. OpenCode's root is a literal the installer substituted, so
+          // it cannot be unset and there is nothing to guard.
+          if (rootExpr.startsWith("$")) expect(where + block).toContain('[ -n "$NOMOR" ]');
           expect(where + block).toContain('[ -x "$NOMOR/scripts/run.sh" ]');
           expect(where + block).toContain("$HOME/.config/cc-status/hook-shim.sh");
           expect(where + block).toContain('[ -x "$NOMOS" ]');
@@ -575,6 +583,20 @@ describe("slash commands and Codex skills carry the shim fallback", () => {
           expect(`${where}args ${live?.[2]?.trim()}`).toBe(`${where}args ${fallback?.[2]?.trim()}`);
         }
       }
+    });
+
+    // THE POINT OF THE ARGUMENT. status-cmd cannot know which agent the user is sitting in, so it used
+    // to print every agent's internals at everyone — a Claude Code user pressing status got four lines
+    // of Codex. The launch block is the only place that knows, so it says so. BOTH halves must carry
+    // it: the shim forwards argv verbatim, and dropping the agent on the fallback half would silently
+    // restore the old everything-at-everyone output on exactly the machines the shim exists for.
+    test(`${label}: the status launch block tells status-cmd that ${agent} is asking`, async () => {
+      const file = (await docs(dir)).find((f) => f.includes("status"));
+      expect(file).toBeDefined();
+      const blocks = (await launchBlocks(file!)).filter((b) => b.includes("status-cmd"));
+      expect(blocks.length).toBe(1);
+      expect(blocks[0]).toContain(`dist/status-cmd.mjs" ${agent};`);
+      expect(blocks[0]).toContain(`exec "$NOMOS" status-cmd ${agent};`);
     });
   }
 });

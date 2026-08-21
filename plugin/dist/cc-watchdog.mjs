@@ -104,7 +104,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "2.1.15";
+var PLUGIN_VERSION = "2.1.16";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -2634,7 +2634,7 @@ var claudeAdapter = {
   sessionsDir: () => `${process.env.HOME}/.claude/projects`,
   sessionMatch: (name) => name.endsWith(".jsonl"),
   hookStampPath: () => lastHookPath("claude"),
-  hooksNotFiringHint: "  Reinstall the plugin / check /plugin.",
+  hooksNotFiringHint: "  run /plugin in Claude Code, check the nomo plugin is enabled, then restart Claude Code",
   toolDetail: claudeToolDetail,
   blobAgentFields: {},
   locateTuiPid: (ctx, deps) => claudeLocateTuiPid(ctx, deps)
@@ -2688,7 +2688,7 @@ var codexAdapter = {
   sessionsDir: () => `${codexHome()}/sessions`,
   sessionMatch: (name) => name.startsWith("rollout-") && name.endsWith(".jsonl"),
   hookStampPath: () => lastHookPath("codex"),
-  hooksNotFiringHint: "  Run /hooks in Codex to re-trust, or reinstall the plugin — known upstream bugs #16430/#30835.",
+  hooksNotFiringHint: "  run /hooks in Codex to re-trust, or reinstall the plugin — known upstream bugs #16430/#30835",
   toolDetail: codexToolDetail,
   blobAgentFields: { agent: "codex" },
   discoverLive: (known) => codexDiscoverLive(known),
@@ -2738,7 +2738,7 @@ var opencodeAdapter = {
   sessionsDir: () => `${CC_DIR}/opencode-has-no-sessions-dir`,
   sessionMatch: () => false,
   hookStampPath: () => lastHookPath("opencode"),
-  hooksNotFiringHint: "  OpenCode loads the plugin at server start — restart OpenCode, or check that ~/.config/opencode/plugins/nomo.js still points at this install.",
+  hooksNotFiringHint: "  restart OpenCode (it loads the plugin at server start), or check that ~/.config/opencode/plugins/nomo.js still points at this install",
   toolDetail: {},
   blobAgentFields: { agent: "opencode" },
   locateTuiPid: (ctx, deps) => opencodeLocateTuiPid(ctx, deps)

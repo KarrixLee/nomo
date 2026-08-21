@@ -23,8 +23,8 @@ import { accessSync, constants, readFileSync } from "node:fs";
 import { hostname } from "node:os";
 import { buildEnvelope, markDoneDelivered, trackSession } from "../core/hook";
 import {
-  CC_DIR, Config, ensureWatchdog, folderIdentity, FolderIdentity, fullTextForRecord, loadConfig,
-  postFullText, SessionOrigin, WATCHDOG_PATH,
+  atomicWrite, CC_DIR, Config, ensureWatchdog, folderIdentity, FolderIdentity, fullTextForRecord,
+  lastHookPath, loadConfig, postFullText, SessionOrigin, WATCHDOG_PATH,
 } from "../core/shared";
 import {
   ocDecisionRequest, OcDecisionRequest, ocPost, ocResolvedRequestId, ocResolveOnRelay, runOcApproval,
@@ -133,6 +133,12 @@ async function send(ctx: OcContext, frame: OcFrame): Promise<void> {
     frame.model, false, process.pid, ctx.origin, false, undefined, undefined, planFull,
   );
   ensureWatchdog({ spawnWatchdog });
+  // Liveness stamp — the OpenCode twin of the one runHook writes for Claude/Codex (core/hook.ts). It
+  // is the ONLY on-disk proof this resident plugin is loaded and producing frames: OpenCode has no
+  // hooks to count and no transcript directory to date, so without it `nomo status` cannot tell "the
+  // plugin is running, you just haven't started a turn" from "the plugin never loaded". Best-effort
+  // and swallowed, like every other write on this path — the editor must never see it fail.
+  await atomicWrite(lastHookPath("opencode"), String(now)).catch(() => {});
   const delivered = await postOcEvent(ctx.config, envelope);
   if (delivered && frame.op === "done") await markDoneDelivered(frame.sessionId);
   await fullUpload;

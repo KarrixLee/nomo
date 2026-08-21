@@ -1130,19 +1130,24 @@ describe("humanAge", () => {
 });
 
 describe("statusCmd", () => {
-  test("unpaired, no watchdog, never sent, zero sessions", async () => {
+  // The machine-wide block: pairing, delivery, approvals. True regardless of which agent asked, which
+  // is exactly why it prints FIRST and carries no agent label.
+  test("unpaired → the phone row says so and names the fix; nothing else is claimed", async () => {
     expect(await statusCmd({
       print, configPath, lastSendPath: join(dir, "last-send"),
       sessionsDir: join(dir, "sessions"), watchdogPidPath: join(dir, "watchdog.pid"),
     })).toBe(0);
     const out = lines.join("\n");
-    expect(out).toContain("Paired: no");
-    expect(out).toContain("Watchdog: not running");
-    expect(out).toContain("Last event sent: never");
-    expect(out).toContain("Tracked sessions: 0");
+    expect(out).toContain("Phone");
+    expect(out).toContain("NOT PAIRED");
+    expect(out).toContain("→ run /nomo-cc:pair");
+    // Delivery and Approvals are meaningless on an unpaired machine — printing them would be four
+    // lines of reassurance about a bridge that does not exist.
+    expect(out).not.toContain("Delivery");
+    expect(out).not.toContain("Approvals");
   });
 
-  test("paired + live watchdog + recent send + session count", async () => {
+  test("paired + live watchdog + recent send → one Phone row and one Delivery row", async () => {
     const sessionsDir = join(dir, "sessions");
     await writeFile(configPath, JSON.stringify({
       url: WORKER, pairingId: "abcdef0123456789".repeat(2), pcSecret: "s", e2eKeyB64: b64url(new Uint8Array(32)),
@@ -1158,22 +1163,25 @@ describe("statusCmd", () => {
 
     const seenPids: number[] = [];
     expect(await statusCmd({
-      print, configPath, lastSendPath: join(dir, "last-send"), sessionsDir,
-      watchdogPidPath: join(dir, "watchdog.pid"),
+      print, audience: "claude", configPath, lastSendPath: join(dir, "last-send"), sessionsDir,
+      watchdogPidPath: join(dir, "watchdog.pid"), noHoldPath: join(dir, "no-hold"),
       isAlive: (pid) => { seenPids.push(pid); return true; },
       now: () => now,
     })).toBe(0);
 
     const out = lines.join("\n");
-    expect(out).toContain("Paired: yes (pairing abcdef01…)");
-    expect(out).toContain(`Worker: ${WORKER}`);
-    expect(out).toContain("Watchdog: running (pid 4242)");
+    expect(out).toContain(`paired · ${WORKER} · pairing abcdef01…`);
+    expect(out).toContain("last event sent 42s ago · watchdog running (pid 4242)");
     expect(seenPids).toEqual([4242]);
-    expect(out).toContain("Last event sent: 42s ago");
-    expect(out).toContain("Tracked sessions: 2");
+    // Sessions are attributed to the agent that wrote them — a record with no `agent` key predates the
+    // Codex work and is Claude's. "Tracked sessions: 2" told a Claude Code user nothing about its own.
+    expect(out).toContain("Claude Code — you are here");
+    expect(out).toContain("2 tracked");
+    // `ignore.tmp` is not a session record and must not be counted.
+    expect(out).not.toContain("3 tracked");
   });
 
-  test("a PENDING config → reports pairing-in-progress, not 'no'", async () => {
+  test("a PENDING config → reports pairing-in-progress, not a flat 'not paired'", async () => {
     await writeFile(configPath, JSON.stringify({
       url: WORKER, pairingId: EXPECTED_PAIRING_ID, pcSecret: EXPECTED_PC_SECRET, qrSecretB64: b64url(QR_SECRET),
     }));
@@ -1182,18 +1190,94 @@ describe("statusCmd", () => {
       sessionsDir: join(dir, "sessions"), watchdogPidPath: join(dir, "watchdog.pid"),
     })).toBe(0);
     const out = lines.join("\n");
-    expect(out).toContain("pairing started, waiting for phone scan");
-    expect(out).not.toContain("Paired: no");
+    expect(out).toContain("waiting for the QR scan");
+    expect(out).not.toContain("NOT PAIRED");
   });
 
-  test("dead watchdog pid → not running", async () => {
+  test("dead watchdog pid → idle, phrased as normal rather than as a fault", async () => {
+    await writeFile(configPath, JSON.stringify({
+      url: WORKER, pairingId: "abcdef0123456789".repeat(2), pcSecret: "s", e2eKeyB64: b64url(new Uint8Array(32)),
+    }));
     await writeFile(join(dir, "watchdog.pid"), "999999");
     expect(await statusCmd({
       print, configPath, lastSendPath: join(dir, "last-send"),
       sessionsDir: join(dir, "sessions"), watchdogPidPath: join(dir, "watchdog.pid"),
-      isAlive: () => false,
+      noHoldPath: join(dir, "no-hold"), isAlive: () => false,
     })).toBe(0);
-    expect(lines.join("\n")).toContain("Watchdog: not running");
+    // The watchdog is spawned BY the hooks, so "not running" on an idle machine is expected — saying
+    // it like a failure sends users chasing a problem they do not have.
+    expect(lines.join("\n")).toContain("watchdog idle (the next turn starts it)");
+  });
+
+  // The whole point of the argument: "is MY agent working" must be answerable without reading another
+  // agent's internals, and the fix a user is told to type must be one their host actually accepts.
+  test("the calling agent is the subject, and fixes name commands THAT host accepts", async () => {
+    // Unpaired on purpose: "not paired" is the one problem every host can hit, and the command that
+    // fixes it is spelled differently in each — /nomo-cc:pair, $nomo-pair, /nomo-pair. Telling a Codex
+    // user to type a Claude slash command is the same confusion this whole change is about.
+    for (const [audience, heading, pairCmd] of [
+      ["claude", "Claude Code — you are here", "→ run /nomo-cc:pair"],
+      ["codex", "Codex — you are here", "→ run $nomo-pair"],
+      ["opencode", "OpenCode — you are here", "→ run /nomo-pair"],
+    ] as const) {
+      lines.length = 0;
+      await statusCmd({
+        print, audience, configPath, lastSendPath: join(dir, "last-send"),
+        sessionsDir: join(dir, "sessions"), watchdogPidPath: join(dir, "watchdog.pid"),
+        codexConfigPath: join(dir, "config.toml"), codexHooksPath: join(dir, "hooks.json"),
+        codexSessionsDir: join(dir, "codex-sessions"), claudeProjectsDir: join(dir, "claude-projects"),
+        lastHookClaudePath: join(dir, "lh-claude"), lastHookCodexPath: join(dir, "lh-codex"),
+        lastHookOpencodePath: join(dir, "lh-opencode"), noHoldPath: join(dir, "no-hold"),
+        codexAppServerAvailable: async () => false, isAlive: () => false,
+      });
+      const out = lines.join("\n");
+      expect(out.split("\n")[0]).toBe(`Nomo ${PLUGIN_VERSION} · ${heading.split(" — ")[0]}`);
+      expect(out).toContain(heading);
+      expect(out).toContain(pairCmd);
+      // No other agent has left a trace on this machine, so none of them is mentioned at all.
+      expect(out).not.toContain("Also on this computer");
+      for (const other of ["Claude Code", "Codex", "OpenCode"].filter((n) => !heading.startsWith(n))) {
+        expect(out).not.toContain(`  ${other} `);
+      }
+    }
+  });
+
+  test("NO argument → no agent is the subject, and every agent is rendered in full", async () => {
+    await statusCmd({
+      print, configPath, lastSendPath: join(dir, "last-send"),
+      sessionsDir: join(dir, "sessions"), watchdogPidPath: join(dir, "watchdog.pid"),
+      codexConfigPath: join(dir, "config.toml"), codexHooksPath: join(dir, "hooks.json"),
+      codexSessionsDir: join(dir, "codex-sessions"), claudeProjectsDir: join(dir, "claude-projects"),
+      lastHookClaudePath: join(dir, "lh-claude"), lastHookCodexPath: join(dir, "lh-codex"),
+      lastHookOpencodePath: join(dir, "lh-opencode"), noHoldPath: join(dir, "no-hold"),
+      codexAppServerAvailable: async () => false, isAlive: () => false,
+    });
+    const out = lines.join("\n");
+    // Backward compatibility: an older command file (or a hand-run bundle) passes nothing, and must
+    // still get the complete picture rather than a Claude-shaped one.
+    for (const name of ["Claude Code", "Codex", "OpenCode"]) expect(out).toContain(`\n${name}\n`);
+    expect(out).not.toContain("you are here");
+  });
+
+  test("remote approvals paused → the row that explains 'my phone never asked me', with the fix", async () => {
+    await writeFile(configPath, JSON.stringify({
+      url: WORKER, pairingId: "abcdef0123456789".repeat(2), pcSecret: "s", e2eKeyB64: b64url(new Uint8Array(32)),
+    }));
+    const noHoldPath = join(dir, "no-hold");
+    for (const [paused, expected] of [[false, "Approvals     on —"], [true, "Approvals     PAUSED"]] as const) {
+      if (paused) await writeFile(noHoldPath, "");
+      lines.length = 0;
+      await statusCmd({
+        print, audience: "codex", configPath, lastSendPath: join(dir, "last-send"),
+        sessionsDir: join(dir, "sessions"), watchdogPidPath: join(dir, "watchdog.pid"),
+        codexConfigPath: join(dir, "config.toml"), codexHooksPath: join(dir, "hooks.json"),
+        noHoldPath, codexAppServerAvailable: async () => false, isAlive: () => false,
+      });
+      const out = lines.join("\n");
+      expect(out).toContain(expected);
+      // The fix must be a command THIS host accepts — a Codex user cannot type a Claude slash command.
+      if (paused) expect(out).toContain("→ run $nomo-approvals on");
+    }
   });
 });
 
