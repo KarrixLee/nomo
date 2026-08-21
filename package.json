@@ -32,6 +32,12 @@
   ],
   "scripts": {
     "build": "bun build.ts",
-    "test": "bun test"
+    "test": "bun test",
+    "typecheck": "tsc",
+    "typecheck:bin": "tsc -p tsconfig.bin.json"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.4.0",
+    "typescript": "^7.0.2"
   }
 }
