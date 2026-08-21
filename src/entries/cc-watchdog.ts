@@ -32,7 +32,7 @@ import { readdir, readFile, unlink } from "node:fs/promises";
 import { readFileSync, statSync, unlinkSync } from "node:fs";
 import { hostname } from "node:os";
 import { basename } from "node:path";
-import { decryptBlob, encryptBlob } from "../core/crypto";
+import { Bytes, decryptBlob, encryptBlob } from "../core/crypto";
 import { adapterFor, AgentAdapter, allAdapters, codexAdapter, codexTurnActiveFromTail, CodexPlanPickerEvidence, DiscoveredSession } from "../core/adapter";
 import type { LocateTuiReason } from "../core/adapter";
 import { focusTerminalForPid } from "../core/terminal-focus";
@@ -273,7 +273,7 @@ export function buildEndEnvelope(sessionId: string, now: number, record?: Sessio
  *  record's cached `turnStartedAt` (epoch seconds, stamped by the turn's UserPromptSubmit) is
  *  likewise restamped into the rebuilt blob — omitted when unknown — so the island's frozen
  *  "done in Xm" keeps measuring the TURN, exactly as a hook-built done blob would. */
-export async function buildDoneEnvelope(sessionId: string, record: SessionRecord, now: number, e2eKey: Uint8Array, agent: AgentKindWire = "claude", at?: number, dbg?: string): Promise<object> {
+export async function buildDoneEnvelope(sessionId: string, record: SessionRecord, now: number, e2eKey: Bytes, agent: AgentKindWire = "claude", at?: number, dbg?: string): Promise<object> {
   // The folder's LIVE branch, re-READ (not restamped like the keys above): the paths it reads are
   // pinned on the record, but HEAD is current state — a `git checkout` since the last hook must reach
   // the phone. Omitted when the record predates the pin or the folder is not a repo.
@@ -320,7 +320,7 @@ export async function buildDoneEnvelope(sessionId: string, record: SessionRecord
  *  A recovered Codex request_user_input additionally carries clear `attentionKind:"userInput"`; plain
  *  permission approvals omit it so the server can end an older decision episode without cross-talk. */
 export async function buildNeedsAttentionEnvelope(
-  sessionId: string, record: SessionRecord, now: number, e2eKey: Uint8Array,
+  sessionId: string, record: SessionRecord, now: number, e2eKey: Bytes,
   agent: AgentKindWire = "claude", at?: number, detail?: string, attentionKind?: "userInput", proposedPlan?: string,
   dbg?: string,
 ): Promise<object> {
@@ -368,7 +368,7 @@ export async function buildNeedsAttentionEnvelope(
  *  (not a verbatim heartbeat). It intentionally carries no attentionKind: op:update/prio:0 closes the
  *  attention episode and returns the session to its ordinary in-flight state. */
 export async function buildWorkingEnvelope(
-  sessionId: string, record: SessionRecord, now: number, e2eKey: Uint8Array, agent: AgentKindWire = "claude", dbg?: string,
+  sessionId: string, record: SessionRecord, now: number, e2eKey: Bytes, agent: AgentKindWire = "claude", dbg?: string,
 ): Promise<Record<string, unknown>> {
   // Re-read live, exactly as buildDoneEnvelope does (see there).
   const branch = sessionBranch(record);
@@ -1593,7 +1593,7 @@ async function readAllRecords(): Promise<SessionRecord[]> {
  *  idle TUI advertised as working stuck "Running" on the phone forever (the v0.8.4 idle-TUI fix; see
  *  codexTurnActiveFromTail in adapter.ts). */
 export async function buildProvisionalBlob(
-  d: DiscoveredSession, machine: string, blobAgentFields: { agent?: AgentKindWire }, e2eKey: Uint8Array, at?: number,
+  d: DiscoveredSession, machine: string, blobAgentFields: { agent?: AgentKindWire }, e2eKey: Bytes, at?: number,
 ): Promise<string> {
   // The discovered cwd's LIVE branch. Resolved from `d.cwd` (the discovery has no cached git dir yet —
   // buildProvisionalRecord pins one for every later frame), so a discovered row shows its branch from
@@ -1866,8 +1866,15 @@ const INTERRUPT_DONE_MAX_ATTEMPTS = 5;
 
 /** Whether the transcript tail shows the last turn was interrupted, for the given agent — a thin
  *  wrapper over the session adapter's detectInterrupt (the two agents' detections differ; see
- *  adapter.ts). Kept exported so the per-agent detection stays unit-testable through "./cc-watchdog". */
-export function tailShowsInterrupt(tail: string, agent: AgentKind): boolean {
+ *  adapter.ts). Kept exported so the per-agent detection stays unit-testable through "./cc-watchdog".
+ *
+ *  WIRE-typed on purpose (see AgentKindWire): the only caller reads the agent off a session record a
+ *  NEWER peer install may have stamped. An unrecognised kind gets adapterFor's passthrough adapter,
+ *  whose detectInterrupt is `false` — we have no transcript format for an agent we do not implement,
+ *  so the honest answer is "no interrupt seen", and this net simply declines to correct that session
+ *  (its dead-pid reap and staleness eviction are unaffected). Coercing to claude here would run
+ *  CLAUDE's marker detection over a foreign transcript and could fire a `done` at a LIVE turn. */
+export function tailShowsInterrupt(tail: string, agent: AgentKindWire): boolean {
   return adapterFor(agent).detectInterrupt(tail);
 }
 
@@ -2764,7 +2771,7 @@ function statusFromRecord(record: SessionRecord): CCStatus {
  *  session_index thread_name existed and then had every later hook dropped. Loses only the transient tool
  *  `detail` sub-status (never cached on the record) — restored by the next real hook. */
 export async function buildTitleRepairEnvelope(
-  sessionId: string, record: SessionRecord, title: string, now: number, e2eKey: Uint8Array, agent: AgentKindWire = "codex", at?: number,
+  sessionId: string, record: SessionRecord, title: string, now: number, e2eKey: Bytes, agent: AgentKindWire = "codex", at?: number,
 ): Promise<{ v: 2; sessionId: string; op: CCOp; prio: 0 | 1; ts: number; blob: string; startedAt?: number }> {
   // Re-read live, exactly as buildDoneEnvelope does (see there).
   const branch = sessionBranch(record);

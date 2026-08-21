@@ -465,8 +465,13 @@ describe("startCodexAppServerDaemon (bounded, non-interactive, never-throwing)",
     const listeners = new Map<string, (...args: unknown[]) => void>();
     const kills: string[] = [];
     const handle = {
-      on(event: string, listener: (...args: unknown[]) => void) { listeners.set(event, listener); return handle; },
-      kill(signal?: string) { kills.push(signal ?? "SIGTERM"); return true; },
+      // `never[]` args is what makes ONE signature stand in for spawnFn's two typed `on` overloads
+      // (parameter positions are contravariant); the fake itself is event-agnostic, hence the store cast.
+      on(event: string, listener: (...args: never[]) => void) {
+        listeners.set(event, listener as (...args: unknown[]) => void);
+        return handle;
+      },
+      kill(signal?: NodeJS.Signals | number) { kills.push(String(signal ?? "SIGTERM")); return true; },
     };
     queueMicrotask(() => script((event, ...args) => listeners.get(event)?.(...args)));
     return { handle, kills };

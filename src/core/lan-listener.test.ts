@@ -2240,7 +2240,7 @@ describe("state — the snapshot store", () => {
       const record = JSON.parse(await readFile(join(dir, "s1.json"), "utf8")) as SessionRecord;
       const expected = lanFrameContent(record, "pairing-abc", c.hold ?? null, NOW, () => c.alive);
       const served = store.since(0).frames[0];
-      expect({ case: i, ...served, seq: undefined, sessionId: undefined })
+      expect({ case: i, ...served, seq: undefined, sessionId: undefined } as Record<string, unknown>)
         .toEqual({ case: i, ...expected, seq: undefined, sessionId: undefined });
     }
   });

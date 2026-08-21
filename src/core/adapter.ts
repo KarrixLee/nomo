@@ -1810,7 +1810,12 @@ export interface TrackedSessionLite {
   sessionId: string;
   pid?: number;
   provisional?: boolean;
-  agent?: AgentKind;
+  /** WIRE-typed (see AgentKindWire): this is `SessionRecord.agent` read straight off disk, and a peer
+   *  install one version ahead stamps literals this build has never heard of. Both readers below only
+   *  ever COMPARE it to "codex", so an unknown agent is correctly neither a codex ghost's owner nor a
+   *  claude `/clear` predecessor — narrowing it to AgentKind would have been a claim the file's own
+   *  source (JSON.parse of an untrusted record) cannot make. */
+  agent?: AgentKindWire;
   ts?: number;
 }
 
@@ -2242,7 +2247,7 @@ export const claudeAdapter: AgentAdapter = {
   locateTuiPid: (ctx, deps) => claudeLocateTuiPid(ctx, deps),
 };
 
-export const codexAdapter: AgentAdapter = {
+export const codexAdapter = {
   kind: "codex",
   async title({ sessionId, prefix, input }): Promise<string | undefined> {
     // PRIMARY: the clean AI-generated thread_name codex writes to session_index.jsonl ~30-40s in.
@@ -2323,7 +2328,7 @@ export const codexAdapter: AgentAdapter = {
   // A codex record's pid may be an app-server host or a discovery sentinel, so locating the TUI is an
   // ordered correlation heuristic that refuses to guess (see codexLocateTuiPid).
   locateTuiPid: (ctx, deps) => codexLocateTuiPid(ctx, deps),
-};
+} satisfies AgentAdapter;
 
 /** Which live process the phone's `focus-terminal` should raise for an OpenCode session — the DESKTOP
  *  app's Electron main pid, or nothing.

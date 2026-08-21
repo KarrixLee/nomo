@@ -93,7 +93,7 @@ describe("reset (end-to-end with injected seams)", () => {
     // rest. The flag is read from the real CC_DIR here (no seam), so assert the LITERAL union the
     // worker matches rather than a fixed value — a missing/typo'd header fails either way.
     expect(approvalsHeaders).toHaveLength(3);
-    for (const h of approvalsHeaders) expect(["on", "off"]).toContain(h);
+    for (const h of approvalsHeaders) expect(["on", "off"]).toContain(h as string);
     // summary mentions the kill, the clears, the kept session, and the pairing guarantee
     const all = lines.join("\n");
     expect(all).toContain("Stopped the watchdog");

@@ -2843,7 +2843,7 @@ describe("runHook attentionKind (the record caches what the envelope POSTed)", (
     expect(envelope).toMatchObject({ op: "update", prio: 1, attentionKind: "userInput" });
     expect(record?.attentionKind).toBe("userInput");
     // The whole point: the two channels describe the same event with the same discriminator.
-    expect(record?.attentionKind).toBe(envelope?.attentionKind as string);
+    expect(envelope?.attentionKind).toBe(record?.attentionKind);
   }, 20000);
 
   test("an ordinary Codex tool event leaves both the envelope and the record without one", async () => {

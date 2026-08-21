@@ -28,7 +28,7 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { isRealTty, pidAncestors, pidCommand } from "./shared";
-import type { AgentKind, SessionRecord } from "./shared";
+import type { AgentKind, AgentKindWire, SessionRecord } from "./shared";
 
 const execFileP = promisify(execFile);
 
@@ -62,7 +62,12 @@ export type FocusResult =
 /** Session evidence herdr needs because its daemon owns the TUI pty: the pane, rather than the pid's
  *  terminal ancestry, is correlated to the record. */
 export interface FocusContext {
-  agent: AgentKind;
+  /** WIRE-typed (see AgentKindWire): the caller reads it off the session record, which a NEWER peer
+   *  install may have stamped with a kind this build has never heard of. Nothing here coerces it —
+   *  the exact-id correlation below still works for such a session (herdr publishes the agent's own
+   *  name on the pane), and the per-kind fuzzy fallback simply has no entry for it, which is the same
+   *  "no signal → refuse" outcome a known-but-unlisted agent already gets. */
+  agent: AgentKindWire;
   record: SessionRecord;
   /** The session's id — the agent's OWN uuid, which herdr publishes per pane as `agent_session.value`.
    *  It is the only EXACT correlation key available, so it is required: a SessionRecord does not carry
@@ -166,12 +171,15 @@ function recordTitleMatchesPane(recordTitle: unknown, paneTitle: unknown): boole
  *  correlation then refuses rather than borrowing another agent's rule. OpenCode is deliberately
  *  absent: its desktop sessions never reach herdr (the app owns no pty), and its CLI sessions belong
  *  to a server process that no pane runs, so cwd equality would be a guess dressed as evidence. */
-const HERDR_FUZZY_SIGNAL: Partial<Record<AgentKind, (pane: HerdrPane, context: FocusContext) => boolean>> = {
+const HERDR_FUZZY_SIGNAL: Partial<Record<AgentKindWire, (pane: HerdrPane, context: FocusContext) => boolean>> = {
   claude: (pane, context) => recordTitleMatchesPane(context.record.title, pane.terminal_title_stripped),
   codex: (pane, context) => typeof context.record.origin?.cwd === "string"
     && context.record.origin.cwd.length > 0
     && pane.cwd === context.record.origin.cwd,
-};
+  // Keyed WIRE-wide so an unknown agent literal reads back `undefined` (no signal) instead of failing
+  // to index; `satisfies` keeps the KEYS checked against the kinds this build implements, so a typo or
+  // a stale kind still fails to compile.
+} satisfies Partial<Record<AgentKind, (pane: HerdrPane, context: FocusContext) => boolean>>;
 
 function correlateHerdrPane(context: FocusContext, panes: HerdrPane[]): HerdrPane | undefined {
   // The EXACT signal first: herdr publishes the agent's own session id on the pane, so the id the

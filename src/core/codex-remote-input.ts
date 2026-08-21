@@ -3,7 +3,7 @@
 // E2E question frame, phone poll, answer validation, and "resolved elsewhere" cleanup.
 
 import { hostname } from "node:os";
-import { decryptBlob, encryptBlob } from "./crypto";
+import { Bytes, decryptBlob, encryptBlob } from "./crypto";
 import { requestUserInputDetail } from "./adapter";
 import { lanAnswerStore } from "./lan-listener";
 import type { LanAnswerStore } from "./lan-listener";

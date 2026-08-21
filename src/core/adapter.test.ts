@@ -11,10 +11,9 @@ import {
   codexNewestRolloutForCwd, codexPidPlanPickerEvidence, codexPidPlanPickerState, codexPidTurnActive, codexPlanPickerStateFromTail, codexProposedPlanMarkdown, codexRolloutExistsForSession, codexSentinelSessionId, codexSessionModel,
   codexRolloutCreationEvidence, codexSessionCreationSuppression, codexTailPendingApproval, codexTailPendingAttentionKind, codexTailPendingUserInputDetail, codexTurnActiveFromTail, filterCodexTuis, findProvisionalForPid,
   firstAssistantModel, firstUserPrompt, lastAssistantModel, parseCodexProcs, rolloutMetaCwd,
-  opencodeAdapter,
   requestUserInputDetail, rolloutPathFromLsof, sessionTitle, TrackedSessionLite,
 } from "./adapter";
-import type { LocateTuiReason } from "./adapter";
+import type { AgentAdapter, LocateTuiReason } from "./adapter";
 import { folderKeyFromCwd } from "./shared";
 import type { SessionRecord } from "./shared";
 
@@ -1263,7 +1262,7 @@ describe("claudeHeadlessInvocation (skip a non-interactive / daemon-spawned clau
 
   test("claudeAdapter wires the seam (codex omits it); it walks pid → command via the injected readers", () => {
     expect(typeof claudeAdapter.isHeadlessInvocation).toBe("function");
-    expect(codexAdapter.isHeadlessInvocation).toBeUndefined();
+    expect((codexAdapter as AgentAdapter).isHeadlessInvocation).toBeUndefined();
     const commands: Record<number, string> = { 100: "claude --output-format stream-json", 200: "node worker-service.js" };
     expect(withEntrypoint("cli", () => claudeAdapter.isHeadlessInvocation!({
       pid: 100, ancestorsOf: () => [200], commandOf: (p) => commands[p],
@@ -1357,7 +1356,7 @@ describe("claudeHeadlessInvocation — Claude desktop app (bundled binary under 
   });
 
   test("claudeAdapter wires the desktop seam (codex omits it)", () => {
-    expect(codexAdapter.isDesktopInvocation).toBeUndefined();
+    expect((codexAdapter as AgentAdapter).isDesktopInvocation).toBeUndefined();
     const commands: Record<number, string> = { 100: desktopArgs(), 200: desktopAncestors[0]!, 300: desktopAncestors[1]! };
     expect(withEntrypoint(undefined, () => claudeAdapter.isDesktopInvocation!({
       pid: 100, ancestorsOf: () => [200, 300], commandOf: (p) => commands[p],

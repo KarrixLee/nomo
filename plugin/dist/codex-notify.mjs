@@ -103,7 +103,7 @@ async function sha256Hex(s) {
 }
 
 // src/core/shared.ts
-var PLUGIN_VERSION = "2.1.10";
+var PLUGIN_VERSION = "2.1.11";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -3563,7 +3563,7 @@ async function runNotify(raw, deferMs = notifyDeferMs(), sleep = (ms) => new Pro
     const now = Date.now();
     const sessionPid = typeof record?.pid === "number" && Number.isFinite(record.pid) ? record.pid : process.ppid;
     const transcriptPath = typeof record?.transcript === "string" ? record.transcript : "";
-    const evidence = codexAdapter.completedTurnWaitEvidence ? await codexAdapter.completedTurnWaitEvidence({ pid: sessionPid, transcriptPath }) : { state: await codexAdapter.completedTurnWaitState?.({ pid: sessionPid, transcriptPath }) };
+    const evidence = await codexAdapter.completedTurnWaitEvidence({ pid: sessionPid, transcriptPath });
     const wait = evidence.state;
     const pendingPlanPicker = wait === "pending";
     const planPickerVerificationPending = wait === "incomplete";

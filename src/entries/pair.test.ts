@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import {
-  b64url, decryptBlob, deriveE2EKey, deriveRatchetKey, fromB64url, generateEphemeralKeyPair, sha256Hex,
+  b64url, Bytes, decryptBlob, deriveE2EKey, deriveRatchetKey, fromB64url, generateEphemeralKeyPair, sha256Hex,
 } from "../core/crypto";
 import {
   buildPairURL, bytesToHex, decryptDeviceName, DEFAULT_WORKER_URL, pairStart, pairWait, wireNotify,
@@ -35,7 +35,7 @@ function json(body: unknown, status = 200): Response {
 }
 
 /** Deterministic randomness: hands out the queued arrays in order, asserting requested sizes. */
-function scriptedRandom(queue: Uint8Array[]): (n: number) => Uint8Array {
+function scriptedRandom(queue: Bytes[]): (n: number) => Bytes {
   return (n: number) => {
     const next = queue.shift();
     if (!next) throw new Error("randomBytes called more times than scripted");
@@ -46,7 +46,7 @@ function scriptedRandom(queue: Uint8Array[]): (n: number) => Uint8Array {
 
 /** AES-256-GCM seal of raw plaintext bytes as standard base64(iv ‖ ct ‖ tag) — the phone side of
  *  deviceNameEnc, built with WebCrypto directly so the test derives everything independently. */
-async function seal(key: Uint8Array, plaintext: Uint8Array): Promise<string> {
+async function seal(key: Bytes, plaintext: Bytes): Promise<string> {
   const iv = crypto.getRandomValues(new Uint8Array(12));
   const ck = await crypto.subtle.importKey("raw", key, "AES-GCM", false, ["encrypt"]);
   const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, ck, plaintext));
@@ -68,8 +68,8 @@ const EXPECTED_PC_SECRET = b64url(PC_SECRET_BYTES);
 // Pairing-v3 ratchet fixtures: one PC ephemeral keypair (what pairStart persists / the phone reads as
 // QPC) and one phone ephemeral keypair (what the phone sends in its claim as phoneEphPub). Generated
 // once per run; the ECDH is symmetric so either side derives the same durable K1.
-let PC_EPH: { privPkcs8: Uint8Array; pubRaw: Uint8Array };
-let PHONE_EPH: { privPkcs8: Uint8Array; pubRaw: Uint8Array };
+let PC_EPH: { privPkcs8: Bytes; pubRaw: Bytes };
+let PHONE_EPH: { privPkcs8: Bytes; pubRaw: Bytes };
 beforeAll(async () => {
   PC_EPH = await generateEphemeralKeyPair();
   PHONE_EPH = await generateEphemeralKeyPair();
@@ -79,8 +79,8 @@ beforeAll(async () => {
  *  where K0 = HKDF(ikm, phoneNonce). Mirrors completePendingPairing's PC-side derivation (which uses
  *  the symmetric ECDH dPC·QPh), so both arrive at the same K1. */
 async function ratchetK1(
-  ikm: Uint8Array, nonce: Uint8Array = PHONE_NONCE, pairingId: string = EXPECTED_PAIRING_ID,
-): Promise<Uint8Array> {
+  ikm: Bytes, nonce: Bytes = PHONE_NONCE, pairingId: string = EXPECTED_PAIRING_ID,
+): Promise<Bytes> {
   const k0 = await deriveE2EKey(ikm, nonce);
   return deriveRatchetKey(PHONE_EPH.privPkcs8, PC_EPH.pubRaw, k0, pairingId);
 }

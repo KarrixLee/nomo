@@ -9,7 +9,15 @@ type TestProcess = {
 /** One process registry per importing test file. A shared global registry could let one file's
  *  afterEach kill another concurrently-running file's child, so callers instantiate their own. */
 export function createProcessHygiene(): {
-  spawnTestProcess(options: Parameters<typeof Bun.spawn>[0]): ReturnType<typeof Bun.spawn>;
+  // Mirrors Bun.spawn's OPTIONS-OBJECT overload explicitly. `Parameters<typeof Bun.spawn>[0]` resolves
+  // to the LAST overload's first parameter (`cmd: string[]`), so every `{cmd, env, stdout}` call site
+  // was being checked against a string array, and the returned Subprocess lost its stdio generics —
+  // `proc.stderr` typed itself off the "inherit" default no matter what the caller asked for.
+  spawnTestProcess<
+    const In extends Bun.SpawnOptions.Writable = "ignore",
+    const Out extends Bun.SpawnOptions.Readable = "pipe",
+    const Err extends Bun.SpawnOptions.Readable = "inherit",
+  >(options: Bun.SpawnOptions.SpawnOptions<In, Out, Err> & { cmd: string[] }): Bun.Subprocess<In, Out, Err>;
 } {
   const live = new Set<TestProcess>();
 
@@ -20,9 +28,13 @@ export function createProcessHygiene(): {
     return proc;
   };
 
-  const spawnTestProcess = (
-    options: Parameters<typeof Bun.spawn>[0],
-  ): ReturnType<typeof Bun.spawn> => trackTestProcess(Bun.spawn(options));
+  const spawnTestProcess = <
+    const In extends Bun.SpawnOptions.Writable = "ignore",
+    const Out extends Bun.SpawnOptions.Readable = "pipe",
+    const Err extends Bun.SpawnOptions.Readable = "inherit",
+  >(
+    options: Bun.SpawnOptions.SpawnOptions<In, Out, Err> & { cmd: string[] },
+  ): Bun.Subprocess<In, Out, Err> => trackTestProcess(Bun.spawn(options));
 
   const stopTrackedProcesses = async (): Promise<void> => {
     const pending = [...live];

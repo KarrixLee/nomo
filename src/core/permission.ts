@@ -34,7 +34,7 @@ import {
   settleDecisionHoldRecord, stampPermissionDetailFull,
   writeDecisionHold,
 } from "./shared";
-import { b64url, decryptBlob, deriveLanKey, encryptBlob } from "./crypto";
+import { b64url, Bytes, decryptBlob, deriveLanKey, encryptBlob } from "./crypto";
 // The relay's timing/give-up rules, shared verbatim with the Codex relay (codex-remote-input.ts) that
 // polls the SAME route with the same credentials. See decision-poll.ts for what is deliberately NOT
 // shared — the first-contact POST ceiling, which each caller bounds by what IT blocks.
@@ -1010,7 +1010,7 @@ export function createLoopbackAnswerPoller(
    *  (see the ticker): after that the poller is retired and only the worker poll remains. */
   let wakeResolve: () => void = () => { /* replaced immediately below */ };
   let wake: Promise<void> = new Promise<void>((resolve) => { wakeResolve = resolve; });
-  let keyPromise: Promise<Uint8Array> | undefined;
+  let keyPromise: Promise<Bytes> | undefined;
 
   /** ONE trace line per hold, never per attempt — a dead listener must not spam permission-trace.log. */
   const note = (result: string): void => {
@@ -1019,7 +1019,7 @@ export function createLoopbackAnswerPoller(
     try { deps.trace({ event: "lan-poll", result }); } catch { /* diagnostics only */ }
   };
 
-  const key = (): Promise<Uint8Array> => (keyPromise ??= deriveLanKey(config.e2eKey, config.pairingId));
+  const key = (): Promise<Bytes> => (keyPromise ??= deriveLanKey(config.e2eKey, config.pairingId));
 
   const readPort = async (): Promise<number | undefined> => {
     if (deps.statePath === undefined) return undefined;

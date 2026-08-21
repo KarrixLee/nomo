@@ -34,7 +34,7 @@ import {
   parseConfig, parsePendingConfig,
 } from "../core/shared";
 import { nomoNotifyProgram, parseNotifyFromToml, replaceNotifyInToml, wireNotifyArray } from "../core/notify-wire";
-import { b64url, generateEphemeralKeyPair, sha256Hex } from "../core/crypto";
+import { b64url, Bytes, generateEphemeralKeyPair, sha256Hex } from "../core/crypto";
 import { deriveCodeIkm, formatCodeString, randomCodeWords } from "../core/pair-code";
 import { renderPairPage } from "../core/pair-page";
 import { renderQRSVG } from "../qr/qr-svg";
@@ -70,7 +70,7 @@ export interface PairDeps {
   /** Awaited between status polls; tests inject an instant resolver and assert the call pattern. */
   sleep?: (ms: number) => Promise<void>;
   print?: (line: string) => void;
-  randomBytes?: (n: number) => Uint8Array;
+  randomBytes?: (n: number) => Bytes;
   configPath?: string;
   workerUrl?: string;
   pollIntervalMs?: number;
@@ -91,7 +91,7 @@ export interface PairDeps {
   pickWords?: () => string[];
   /** Generates the PC's ephemeral P-256 ratchet keypair. Defaults to generateEphemeralKeyPair (WebCrypto
    *  ECDH); tests inject a fixed keypair for deterministic config/QR content. */
-  genEphemeralKeyPair?: () => Promise<{ privPkcs8: Uint8Array; pubRaw: Uint8Array }>;
+  genEphemeralKeyPair?: () => Promise<{ privPkcs8: Bytes; pubRaw: Bytes }>;
   /** `wait --timeout <seconds>` (as ms): bounds the poll loop. A timeout is then a SOFT exit-0 (the
    *  Codex flow — self-heal finishes in the background), not the hard 10-min "window expired" exit-1.
    *  The QR's real 10-min TTL (the createdAt guard) is unchanged. Absent → historical full-window wait. */
@@ -135,7 +135,7 @@ async function removePendingConfig(configPath: string): Promise<void> {
   await unlink(join(dirname(configPath), PAIR_HTML_FILE)).catch(() => {});
 }
 
-export function bytesToHex(bytes: Uint8Array): string {
+export function bytesToHex(bytes: Bytes): string {
   return Array.from(bytes).map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
@@ -150,7 +150,7 @@ export function bytesToHex(bytes: Uint8Array): string {
  *  with the added `e=` key. The 65-byte `e=` (~87 chars) can push the default payload past level-Q's
  *  v10 capacity; renderQRSVG already falls back to level L (larger capacity) so it always renders. */
 export function buildPairURL(
-  workerUrl: string, pairingId: string, qrSecret: Uint8Array, pcEphPub: Uint8Array,
+  workerUrl: string, pairingId: string, qrSecret: Bytes, pcEphPub: Bytes,
 ): string {
   const u = workerUrl === DEFAULT_WORKER_URL ? "" : `&u=${b64url(textEncoder.encode(workerUrl))}`;
   return `nomo://pair?v=1${u}&p=${pairingId}&s=${b64url(qrSecret)}&e=${b64url(pcEphPub)}`;
@@ -278,7 +278,7 @@ export async function pairStart(deps: PairDeps = {}): Promise<number> {
   // (`<channel>-w1-w2-w3-w4`) is shown on the page only; codeIkm is persisted so `wait` / the watchdog
   // can complete a code claim without recomputing the 600k-iteration PBKDF2.
   let codeString: string | undefined;
-  let codeIkm: Uint8Array | undefined;
+  let codeIkm: Bytes | undefined;
   if (channel !== undefined) {
     const words = pickWords();
     codeIkm = await deriveCodeIkm(words, pairingId);
