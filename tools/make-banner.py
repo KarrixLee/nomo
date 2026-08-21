@@ -1,61 +1,53 @@
-"""Pre-render assets/icon.png into the half-block ANSI banner embedded in bin/nomo-ai.mjs.
+"""Pre-render assets/icon.png into a half-block ANSI banner for bin/nomo-ai.mjs.
 
-Run:  uv run --with pillow tools/make-banner.py [--preview] [--cols N]
+    uv run --with pillow tools/make-banner.py --preview
+    uv run --with pillow tools/make-banner.py --png /tmp/opt-a   # dark + light PNGs to look at
 
-Not shipped: package.json `files` is ["bin/"], so nothing here reaches the tarball. The installer
-must stay dependency-free and never touch assets/ at run time (the tarball has no assets/), so this
-runs by hand and its output is pasted in.
+NOT CURRENTLY SHIPPED. bin/nomo-ai.mjs draws a typographic lockup instead, and that was a finding,
+not a shortcut: the Nomo mark is a soft pastel gradient with no strong silhouette, and at the 6-9
+rows that can sit above a 15-line install plan it collapses into a coral smudge next to a blue lump
+no matter which technique draws it. Half-blocks, character-density ramps, an ASCII shade ramp, the
+arc alone, and a redrawn thin concentric sweep were all rendered to PNG and looked at; the smallest
+readable picture was still worse than no picture. This file survives so that call can be re-taken
+cheaply rather than re-derived -- run --preview and look.
 
-Two half-pixels per cell via U+2580 / U+2584: foreground paints one half, background the other, and
-a cell with only one live half leaves the other the terminal's own background. That is what drops
-the icon's near-white ground instead of painting it -- a white slab in a terminal reads as a
-rendering bug, not a logo.
+Not in the tarball either: package.json `files` is ["bin/"]. The installer must stay dependency-free
+and never touch assets/ at run time, so this runs by hand and its output is pasted in.
 
-The colours are deliberately NOT the icon's. The art is drawn against white, so its palest tones
-would all but vanish on a light terminal; every kept pixel is pulled down in lightness (see
-LUM_SCALE / LUM_CAP) at partly-held chroma (CHROMA_HOLD), which is what makes ONE banner legible on
-a light and a dark terminal both. The tuning target is the silhouette-edge contrast ratio against
-white and against #1a1b1e; at the values here the worst edge cell is 2.12 : 1 on white and
-1.99 : 1 on dark.
+Two half-pixels per cell via U+2580 / U+2584: the foreground paints one half, the background the
+other, and a cell with only one live half leaves the other the terminal's own background. That is
+what drops the icon's near-white ground instead of painting it -- a white slab in a terminal reads
+as a rendering bug, not a logo.
+
+Two things here are load-bearing and were both wrong in the first pass:
+
+  * COVERAGE AND COLOUR ARE SAMPLED SEPARATELY. Resampling the RGB and then asking "is this pixel
+    white?" averages the white ground into every edge cell, which fattens a thin sweep into a wedge
+    and washes the coral to salmon. Instead a 1-bit ink mask is box-filtered to a coverage fraction
+    (that decides which cells are ink), and the colour is averaged over the ink pixels ONLY.
+  * THE DARKENING IS A SCALAR MULTIPLY. The source is drawn on white and its palest tones would
+    vanish on a light terminal, so everything is pulled down -- but in HLS. Lowering lightness at
+    held saturation widens the colour, because saturation is a ratio against the room a given
+    lightness leaves; that is what turned the periwinkle blob electric indigo. Multiplying RGB by a
+    scalar darkens at EXACTLY the source hue and saturation ratio. Boring, and correct.
 """
 
 import argparse
-import colorsys
 from pathlib import Path
 
-from PIL import Image, ImageFilter
+from PIL import Image
 
 ROOT = Path(__file__).resolve().parent.parent
 
-# What counts as ink. The art is drawn on white, so "how far from white" IS its alpha: the arc fades
-# to near-white at its inner edge and that fade should become transparency, not a solid mauve slab
-# that fattens a thin sweep into a wedge. min(r,g,b) is the cheap read of it -- white is 255, the
-# dark eyes are ~30 -- and it keeps dark low-chroma pixels a saturation test would throw away.
+# What counts as ink. The art is drawn on white, so "how far from white" IS its alpha.
 INK_MIN = 55
-# ...and the icon's drop shadow, which is neutral grey. It survives the whiteness test where it
-# overlaps the coral (the mix is a light tan) and reads in a terminal as a dirty smear under the
-# arc, so anything light and near-colourless is ground too.
+# ...and the icon's drop shadow, which is neutral grey and reads in a terminal as a dirty smear.
 SHADOW_CHROMA = 0.16
 SHADOW_LUM = 0.68
 
-LUM_SCALE = 0.86   # pull everything down off white...
-LUM_CAP = 0.70     # ...and hard-cap it, so nothing lands too close to a white terminal
-CHROMA_HOLD = 0.4  # 0 = keep HLS saturation (vivid, drifts), 1 = keep chroma (faithful, dusty)
-QUANT = 24         # round channels to this step: fewer distinct colours, longer runs, fewer escapes
-
-
-def transform(rgb):
-    """Darken at CONSTANT chroma. Naively lowering HLS lightness holds saturation, and saturation is
-    a ratio against the room a given lightness leaves -- so the same s at a darker l is a wider
-    colour, and the icon's blue-violet face comes out electric. Re-solving s to keep chroma where it
-    was darkens without changing the colour."""
-    h, l, s = colorsys.rgb_to_hls(*(c / 255 for c in rgb))
-    chroma = (1 - abs(2 * l - 1)) * s
-    l = min(l * LUM_SCALE, LUM_CAP)
-    room = 1 - abs(2 * l - 1)
-    keep = min(1.0, chroma / room) if room else 0
-    out = colorsys.hls_to_rgb(h, l, s * (1 - CHROMA_HOLD) + keep * CHROMA_HOLD)
-    return tuple(min(255, max(0, round(c * 255 / QUANT) * QUANT)) for c in out)
+COVERAGE = 0.42  # a cell is ink once this much of it is ink
+DARKEN = 0.72    # scalar multiply -- see the module docstring
+QUANT = 16       # round channels to this step: fewer distinct colours, fewer escapes
 
 
 def is_ground(rgb):
@@ -66,69 +58,92 @@ def is_ground(rgb):
     return chroma < SHADOW_CHROMA and lum > SHADOW_LUM
 
 
-def sample(cols):
+def load(arc_only):
     im = Image.open(ROOT / "assets" / "icon.png").convert("RGBA")
     im = Image.alpha_composite(Image.new("RGBA", im.size, (255, 255, 255, 255)), im).convert("RGB")
-
-    # Crop to the ink, not to the rounded square: the square IS the ground we are dropping.
-    px = im.load()
     w, h = im.size
-    box = [w, h, 0, 0]
-    for y in range(h):
-        for x in range(w):
-            if not is_ground(px[x, y]):
-                box[0] = min(box[0], x); box[1] = min(box[1], y)
-                box[2] = max(box[2], x + 1); box[3] = max(box[3], y + 1)
-    im = im.crop(tuple(box))
+    px = im.load()
+    mask = [[0 if is_ground(px[x, y]) else 1 for x in range(w)] for y in range(h)]
+    if arc_only:  # the face is the blue lobe
+        for y in range(h):
+            for x in range(w):
+                r, _, b = px[x, y]
+                if b > r + 20:
+                    mask[y][x] = 0
+    return im, mask
 
-    # One half-pixel is one cell wide and half a cell tall, i.e. square on a ~1:2 terminal cell.
-    # So the sample grid just keeps the crop's own aspect ratio.
-    cw, ch = im.size
-    rows = round(cols * ch / cw)
-    rows += rows % 2  # whole cells
-    # Small dark features (the two eyes) are ~1.5 samples wide at this size and LANCZOS averages
-    # them into the face. A pre-downscale unsharp pass is what keeps them from vanishing.
-    im = im.filter(ImageFilter.UnsharpMask(radius=cw / cols, percent=110, threshold=6))
-    im = im.resize((cols, rows), Image.LANCZOS)
+
+def sample(cols, rows, arc_only=False):
+    """-> live[r][c], colour[r][c]. rows counts HALF-pixels, so 2 per terminal row."""
+    im, mask = load(arc_only)
+    h, w = len(mask), len(mask[0])
+    xs = [x for x in range(w) if any(mask[y][x] for y in range(h))]
+    ys = [y for y in range(h) if any(mask[y])]
+    # Crop to the ink, not to the rounded square: the square IS the ground we are dropping.
+    x0, y0, W, H = xs[0], ys[0], xs[-1] + 1 - xs[0], ys[-1] + 1 - ys[0]
 
     px = im.load()
-    grid = [[None if is_ground(px[x, y]) else transform(px[x, y]) for x in range(cols)] for y in range(rows)]
+    cov = [[0.0] * cols for _ in range(rows)]
+    col = [[None] * cols for _ in range(rows)]
+    for r in range(rows):
+        for c in range(cols):
+            sx0, sx1 = x0 + round(c * W / cols), x0 + round((c + 1) * W / cols)
+            sy0, sy1 = y0 + round(r * H / rows), y0 + round((r + 1) * H / rows)
+            n = tot = 0
+            acc = [0, 0, 0]
+            for y in range(sy0, max(sy1, sy0 + 1)):
+                for x in range(sx0, max(sx1, sx0 + 1)):
+                    tot += 1
+                    if mask[y][x]:
+                        n += 1
+                        for i, v in enumerate(px[x, y]):
+                            acc[i] += v
+            cov[r][c] = n / tot if tot else 0
+            if n:
+                col[r][c] = tuple(a // n for a in acc)
 
-    # Despeckle. The arc's antialiased tip leaves a lone surviving sample floating in the gap between
-    # the arc and the face, and one isolated cell in a terminal does not read as art, it reads as
-    # dirt on the screen. Anything with fewer than two ink neighbours goes.
-    live = lambda y, x: 0 <= y < rows and 0 <= x < cols and grid[y][x] is not None
-    return [
-        [
-            c if c is None or sum(live(y + dy, x + dx) for dy in (-1, 0, 1) for dx in (-1, 0, 1)) - 1 >= 2 else None
-            for x, c in enumerate(row)
-        ]
-        for y, row in enumerate(grid)
-    ]
+    # Despeckle, twice. The arc's antialiased terminus leaves a few surviving cells hanging in the
+    # gap below it, and a lone cell in a terminal does not read as art, it reads as dirt on the
+    # screen. One pass leaves the survivors of the survivors, hence two.
+    live = [[cov[r][c] >= COVERAGE for c in range(cols)] for r in range(rows)]
+    for _ in range(2):
+        nxt = [row[:] for row in live]
+        for r in range(rows):
+            for c in range(cols):
+                if live[r][c]:
+                    n = sum(
+                        live[r + dr][c + dc]
+                        for dr in (-1, 0, 1)
+                        for dc in (-1, 0, 1)
+                        if 0 <= r + dr < rows and 0 <= c + dc < cols
+                    ) - 1
+                    if n < 3:
+                        nxt[r][c] = False
+        live = nxt
+    return live, col
 
 
-def render(grid, label_rows=()):
-    """Half-blocks with run-length escape elision: emit a colour only when it changes.
+def darken(rgb):
+    return tuple(min(255, round(c * DARKEN / QUANT) * QUANT) for c in rgb)
 
-    Rows in label_rows keep their trailing spaces so the caller can concatenate text at a fixed
-    column: once a line carries ANSI, .length is no longer its printed width, so the padding has to
-    be baked in here where the cell count is still known."""
+
+def render(cols, rows, **kw):
+    """Half-blocks with run-length escape elision: emit a colour only when it changes."""
+    live, col = sample(cols, rows * 2, **kw)
     lines = []
-    for y in range(0, len(grid), 2):
-        top, bot = grid[y], grid[y + 1] if y + 1 < len(grid) else [None] * len(grid[y])
+    for y in range(0, rows * 2, 2):
         out, fg, bg = [], None, None
-        for x in range(len(top)):
-            t, b = top[x], bot[x]
+        for x in range(cols):
+            t = darken(col[y][x]) if live[y][x] else None
+            b = darken(col[y + 1][x]) if live[y + 1][x] else None
             # A cell with one live half uses the block that paints only that half, so the dead half
-            # stays the terminal's own background instead of a guessed colour. That is what makes the
-            # icon's near-white ground droppable: nothing is painted where the ground was.
+            # stays the terminal's own background instead of a guessed colour.
             if t is None and b is None:
                 char, want_fg, want_bg = " ", fg, None
             elif t is None:
                 char, want_fg, want_bg = "\u2584", b, None
             else:
                 char, want_fg, want_bg = "\u2580", t, b
-            # One SGR per cell, carrying only what changed: 38;2 and 48;2 merge into a single escape.
             sgr = []
             if want_bg is None and bg is not None:
                 sgr.append("49")
@@ -142,28 +157,25 @@ def render(grid, label_rows=()):
             if sgr:
                 out.append("\x1b[" + ";".join(sgr) + "m")
             out.append(char)
-        line = "".join(out)
-        trimmed = line.rstrip()
-        # A trailing "back to default bg" is redundant right before the full reset.
-        if trimmed.endswith("\x1b[49m"):
-            trimmed = trimmed[: -len("\x1b[49m")]
-        pad = " " * (len(line) - len(line.rstrip())) if y // 2 in label_rows else ""
-        lines.append(trimmed + "\x1b[0m" + pad if trimmed else pad)
+        line = "".join(out).rstrip()
+        if line.endswith("\x1b[49m"):
+            line = line[: -len("\x1b[49m")]
+        lines.append(line + "\x1b[0m" if line else "")
     return lines
 
 
-def to_png(grid, path, bg, cell=(9, 20)):
-    """Exactly what a terminal paints, so the result can be looked at instead of imagined:
-    one cell = cell px, top half the fg colour, bottom half the bg colour, dead halves the
-    terminal's own background."""
+def to_png(cols, rows, path, bg, cell=(11, 24), **kw):
+    """Exactly what a terminal paints, so the result can be looked at instead of imagined."""
+    live, col = sample(cols, rows * 2, **kw)
     cw, chh = cell
     half = chh // 2
-    im = Image.new("RGB", (len(grid[0]) * cw, (len(grid) // 2) * chh), bg)
+    im = Image.new("RGB", (cols * cw, rows * chh), bg)
     px = im.load()
-    for y, row in enumerate(grid):
-        for x, c in enumerate(row):
-            if c is None:
+    for y in range(rows * 2):
+        for x in range(cols):
+            if not live[y][x]:
                 continue
+            c = darken(col[y][x])
             y0 = (y // 2) * chh + (y % 2) * half
             for yy in range(y0, y0 + half):
                 for xx in range(x * cw, (x + 1) * cw):
@@ -173,26 +185,29 @@ def to_png(grid, path, bg, cell=(9, 20)):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--cols", type=int, default=24)
-    ap.add_argument("--preview", action="store_true")
-    ap.add_argument("--png")
-    ap.add_argument("--label-rows", default="6,7")
+    ap.add_argument("--cols", type=int, default=16)
+    ap.add_argument("--rows", type=int, default=8, help="terminal rows, i.e. half the half-pixels")
+    ap.add_argument("--arc-only", action="store_true", help="drop the face, keep the sweep")
     ap.add_argument("--indent", type=int, default=2)
+    ap.add_argument("--preview", action="store_true")
+    ap.add_argument("--png", help="write <arg>.dark.png and <arg>.light.png and stop")
     args = ap.parse_args()
-    label_rows = {int(n) for n in args.label_rows.split(",") if n != ""}
+    kw = dict(arc_only=args.arc_only)
 
-    grid = sample(args.cols)
     if args.png:
-        to_png(grid, args.png + ".dark.png", (26, 27, 30))
-        to_png(grid, args.png + ".light.png", (255, 255, 255))
+        to_png(args.cols, args.rows, args.png + ".dark.png", (26, 27, 30), **kw)
+        to_png(args.cols, args.rows, args.png + ".light.png", (255, 255, 255), **kw)
         return
-    lines = [(" " * args.indent + l if l else l) for l in render(grid, label_rows)]
+
+    lines = [(" " * args.indent + l if l else l) for l in render(args.cols, args.rows, **kw)]
     if args.preview:
         print("\n".join(lines))
-        print(f"\n{len(lines)} rows x {args.cols} cols, {sum(len(l) for l in lines)} bytes of string")
+        print(f"\n{len(lines)} rows x {args.cols} cols, {sum(len(l) for l in lines)} bytes")
         return
-
-    body = ",\n".join('  "%s"' % l.replace("\\", "\\\\").replace('"', '\\"').replace("\x1b", "\\u001b") for l in lines)
+    body = ",\n".join(
+        '  "%s"' % l.replace("\\", "\\\\").replace('"', '\\"').replace("\x1b", "\\u001b")
+        for l in lines
+    )
     print("const ART = [\n%s,\n];" % body)
 
 

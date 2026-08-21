@@ -369,57 +369,50 @@ async function choose(selected) {
 
 // ── the banner ───────────────────────────────────────────────────────────────────────────────────
 //
-// The Nomo mark, PRE-RENDERED by tools/make-banner.py and pasted in. Nothing here decodes anything:
-// this file ships unbundled with no dependencies, and `files` is ["bin/"] so assets/icon.png is not
-// even present once installed.
-//
-// Two pixels per cell. U+2580 paints the top half in the foreground colour and the bottom half in
-// the background colour; U+2584 paints only the bottom, leaving the top the terminal's own
-// background. That last case is what lets the icon's near-white ground be DROPPED rather than
-// painted — a white slab in a terminal reads as a rendering bug, not as a logo.
-//
-// The colours are deliberately not the icon's. The source art is drawn against white, so its pale
-// periwinkle face would all but disappear on a light terminal; the generator pulls lightness down
-// and caps it, which is what makes one banner legible on both. See tools/make-banner.py.
+// TYPOGRAPHIC, not pictorial — and that is a finding, not a shortcut. The Nomo mark is a soft
+// pastel gradient with no strong silhouette: pre-rendered into the 6–9 rows that can sit above a
+// 15-line install plan it collapses into a coral smudge beside a blue lump, whichever technique
+// draws it (half-blocks, character density, arc-only, a redrawn thin sweep — all four were
+// rendered and looked at; tools/make-banner.py still generates the block form if that call is
+// ever revisited). What survives at terminal resolution is the icon's COLOUR, so that is all the
+// banner keeps: the coral→periwinkle sweep, run across the wordmark and a rule under it.
 
-const ART_COLS = 28; // 26 of art, indented 2 for breathing room
-// The one row padded out to ART_COLS (and the row under it), so the wordmark can be concatenated at
-// a fixed column — once a line carries ANSI its .length is no longer its printed width.
-const ART_LABEL_ROW = 6;
-const ART = [
-  "               \u001b[38;2;216;168;120m▄\u001b[38;2;240;144;96m▄\u001b[38;2;216;120;72m▄\u001b[38;2;216;168;120;48;2;216;96;72m▀\u001b[38;2;240;144;120m▀\u001b[38;2;240;144;96;48;2;216;120;72m▀\u001b[38;2;216;120;72;48;2;216;96;48m▀\u001b[38;2;216;144;120;48;2;216;144;120m▀\u001b[0m",
-  "            \u001b[38;2;240;144;96m▄\u001b[38;2;216;168;120;48;2;216;96;72m▀\u001b[38;2;216;120;96m▀\u001b[38;2;216;96;72;48;2;216;120;72m▀\u001b[48;2;216;120;96m▀\u001b[38;2;216;120;72m▀\u001b[38;2;216;120;96m▀▀▀\u001b[38;2;216;96;72;48;2;216;96;96m▀\u001b[38;2;216;144;120;48;2;216;144;120m▀\u001b[0m",
-  "         \u001b[38;2;240;144;120m▄\u001b[38;2;216;168;120;48;2;216;96;72m▀\u001b[38;2;216;120;72;48;2;216;120;72m▀\u001b[38;2;216;96;72;48;2;216;120;96m▀\u001b[38;2;216;120;72m▀\u001b[38;2;216;120;96m▀\u001b[48;2;192;120;96m▀▀\u001b[38;2;192;120;96;48;2;192;120;120m▀▀\u001b[38;2;192;120;120m▀\u001b[48;2;192;144;120m▀\u001b[38;2;216;120;96;48;2;192;120;120m▀\u001b[38;2;216;144;120;48;2;216;144;120m▀\u001b[0m",
-  "       \u001b[38;2;240;144;120m▄\u001b[48;2;216;96;72m▀\u001b[38;2;216;96;72;48;2;216;120;72m▀\u001b[38;2;216;120;72;48;2;216;120;96m▀\u001b[38;2;216;120;96m▀\u001b[48;2;192;120;96m▀\u001b[38;2;192;120;96;48;2;192;120;120m▀▀\u001b[38;2;192;120;120m▀▀▀\u001b[48;2;192;144;144m▀▀\u001b[38;2;192;144;144m▀\u001b[38;2;192;120;120;48;2;192;120;144m▀\u001b[38;2;216;144;144m▀\u001b[0m",
-  "      \u001b[38;2;216;168;144;48;2;216;120;72m▀\u001b[38;2;216;96;72m▀\u001b[38;2;216;120;72;48;2;216;120;96m▀\u001b[38;2;216;120;96m▀\u001b[48;2;192;120;96m▀\u001b[38;2;192;120;96;48;2;192;120;120m▀\u001b[38;2;192;120;120m▀▀▀\u001b[48;2;192;144;144m▀\u001b[38;2;192;144;144m▀▀\u001b[49m▀▀▀\u001b[38;2;192;120;144m▀\u001b[38;2;192;144;168m▀\u001b[0m",
-  "    \u001b[38;2;216;168;144m▄\u001b[38;2;240;144;96;48;2;216;96;72m▀\u001b[38;2;216;96;72;48;2;216;120;72m▀\u001b[38;2;216;120;96;48;2;216;120;96m▀\u001b[48;2;192;120;96m▀\u001b[38;2;192;120;96;48;2;192;120;120m▀\u001b[38;2;192;120;120m▀▀\u001b[48;2;192;120;144m▀\u001b[38;2;192;120;144;48;2;192;144;144m▀\u001b[38;2;192;144;144m▀\u001b[49m▀▀\u001b[0m",
-  "    \u001b[38;2;216;120;96;48;2;216;96;72m▀\u001b[38;2;216;96;72;48;2;216;120;96m▀\u001b[38;2;216;120;96m▀\u001b[38;2;192;120;96;48;2;192;120;96m▀\u001b[48;2;192;120;120m▀\u001b[38;2;192;120;120m▀▀\u001b[38;2;192;120;144;48;2;192;144;144m▀\u001b[38;2;192;144;144m▀\u001b[49m▀\u001b[0m              ",
-  "   \u001b[38;2;216;144;120;48;2;216;120;72m▀\u001b[38;2;216;96;72m▀\u001b[38;2;216;120;96;48;2;216;120;96m▀\u001b[38;2;192;120;96;48;2;192;120;96m▀\u001b[38;2;192;120;120;48;2;192;120;120m▀▀\u001b[48;2;192;120;144m▀\u001b[38;2;192;144;144;48;2;192;144;144m▀▀\u001b[49m▀\u001b[0m               ",
-  "  \u001b[38;2;216;168;120m▄\u001b[38;2;216;120;72;48;2;216;96;72m▀\u001b[38;2;216;120;96;48;2;216;120;96m▀\u001b[38;2;192;120;96;48;2;192;120;96m▀\u001b[48;2;192;120;120m▀\u001b[38;2;192;120;120m▀\u001b[48;2;192;120;144m▀\u001b[38;2;192;144;144;48;2;192;144;144m▀▀\u001b[49m        \u001b[38;2;168;144;216m▄\u001b[38;2;144;120;240m▄\u001b[48;2;144;120;240m▀\u001b[48;2;120;120;240m▀▀\u001b[48;2;120;144;240m▀▀\u001b[48;2;120;120;240m▀\u001b[49;38;2;120;120;240m▄\u001b[0m",
-  "  \u001b[38;2;216;144;120;48;2;216;120;72m▀\u001b[38;2;216;96;72;48;2;216;96;48m▀\u001b[38;2;216;120;96;48;2;216;96;72m▀\u001b[38;2;192;120;96;48;2;216;96;96m▀\u001b[38;2;192;120;120;48;2;192;120;96m▀\u001b[38;2;192;144;120;48;2;192;120;120m▀\u001b[38;2;192;144;144m▀\u001b[48;2;192;120;144m▀▀\u001b[49m       \u001b[38;2;144;120;240m▄\u001b[38;2;144;120;216;48;2;144;120;240m▀\u001b[48;2;120;120;240m▀\u001b[38;2;120;120;240;48;2;120;144;240m▀\u001b[38;2;96;120;168;48;2;48;48;72m▀\u001b[38;2;96;120;192;48;2;24;24;48m▀\u001b[38;2;120;144;240;48;2;120;144;240m▀\u001b[38;2;96;144;240;48;2;96;120;240m▀\u001b[38;2;96;120;240;48;2;72;96;240m▀\u001b[38;2;120;144;240;48;2;96;120;240m▀\u001b[0m",
-  "   \u001b[38;2;216;168;144m▀ ▀   \u001b[38;2;192;144;168m▀        \u001b[38;2;144;120;240;48;2;144;120;240m▀\u001b[38;2;96;96;144;48;2;48;48;72m▀\u001b[38;2;120;120;168;48;2;24;24;72m▀\u001b[38;2;120;168;240;48;2;120;168;240m▀\u001b[38;2;96;120;192;48;2;96;120;240m▀\u001b[38;2;0;0;48;48;2;72;96;216m▀\u001b[38;2;96;96;216;48;2;72;96;240m▀\u001b[38;2;96;120;240m▀\u001b[38;2;48;72;240;48;2;24;48;240m▀\u001b[38;2;96;120;240;48;2;120;144;240m▀\u001b[0m",
-  "                  \u001b[38;2;144;120;240;48;2;120;120;240m▀\u001b[38;2;120;120;192;48;2;120;144;240m▀\u001b[38;2;0;24;72;48;2;96;144;240m▀\u001b[38;2;96;120;240;48;2;96;120;240m▀\u001b[48;2;72;96;240m▀\u001b[38;2;72;96;240;48;2;72;72;216m▀\u001b[38;2;72;72;240;48;2;24;24;240m▀\u001b[38;2;24;48;240m▀\u001b[49;38;2;72;72;240m▀\u001b[0m",
-  "                  \u001b[38;2;144;120;240m▀\u001b[38;2;96;120;240;48;2;120;120;240m▀\u001b[48;2;96;144;240m▀\u001b[38;2;72;96;240;48;2;96;120;240m▀\u001b[38;2;48;72;240m▀\u001b[38;2;24;48;240;48;2;120;144;240m▀\u001b[49;38;2;48;72;240m▀\u001b[0m",
-];
+const CORAL = [222, 152, 131]; // sampled straight off assets/icon.png — the arc's far end...
+const PERI = [150, 158, 240]; //  ...and the blob, which is periwinkle, not the blue it looks at 1px
+// Both source tones are pale enough to vanish on a white terminal, so every step is darkened by
+// this much. At 0.78 the worst letter clears 4.5 : 1 against white AND against #1a1b1e, which is
+// what lets ONE banner ship for light and dark terminals both.
+const SWEEP_DIM = 0.78;
+const TAGLINE = "Nomo plugin installer";
+
+/** `s` painted with the icon's gradient, one 24-bit escape per character. Short strings only —
+ *  this is ~15 bytes a char and the whole banner is under 40 of them.
+ *  @param {string} s @param {boolean} [isBold] */
+function sweep(s, isBold) {
+  const n = Math.max(s.length - 1, 1);
+  const body = [...s]
+    .map((ch, i) => {
+      const [r, g, b] = CORAL.map((a, k) => Math.round((a + ((PERI[k] - a) * i) / n) * SWEEP_DIM));
+      return `\u001b[38;2;${r};${g};${b}m${ch}`;
+    })
+    .join("");
+  return `${isBold ? "\u001b[1m" : ""}${body}\u001b[0m`;
+}
 
 function banner() {
-  // Not a TTY means something is READING this — a pipe, a CI log, `| tee`. Art there is noise, so
-  // the whole banner goes and not merely its colour; NO_COLOR lands in the same branch because
-  // uncoloured half-blocks are a grey smear. A window too narrow to hold the art and the wordmark
-  // side by side gets the wordmark, which was the entire output before this banner existed.
-  if (!COLOR || (process.stdout.columns ?? 0) < ART_COLS + 30) {
-    say(`${bold("nomo-ai")} ${dim(VERSION)} — Nomo plugin installer`);
+  // Not a TTY means something is READING this — a pipe, a CI log, `| tee`. Colour there is noise,
+  // so the whole lockup goes and not merely its colour; NO_COLOR lands in the same branch, because
+  // an uncoloured rule under an uncoloured wordmark is just two lines of clutter. A window too
+  // narrow to hold the rule gets the same one-liner, which was the entire output before any of
+  // this existed.
+  if (!COLOR || (process.stdout.columns ?? 0) < TAGLINE.length + 4) {
+    say(`${bold("nomo-ai")} ${dim(VERSION)} — ${TAGLINE}`);
     return;
   }
-  ART.forEach((row, i) =>
-    say(
-      i === ART_LABEL_ROW
-        ? `${row}   ${bold("nomo-ai")} ${dim(VERSION)}`
-        : i === ART_LABEL_ROW + 1
-          ? `${row}   ${dim("Nomo plugin installer")}`
-          : row,
-    ),
-  );
+  say();
+  say(`  ${sweep("nomo-ai", true)} ${dim(VERSION)}`);
+  say(`  ${sweep("─".repeat(TAGLINE.length))}`);
+  say(`  ${dim(TAGLINE)}`);
 }
 
 // ── main ─────────────────────────────────────────────────────────────────────────────────────────
