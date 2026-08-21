@@ -25,10 +25,32 @@ import { readdir, readFile, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { claudeAdapter, codexAdapter, opencodeAdapter } from "../core/adapter";
 import {
-  AgentKind, CC_DIR, CODEX_HOOK_MARKER, codexAppServerSocketAvailable, codexHome, LAST_SEND_PATH,
-  localApprovalsState, NO_HOLD_PATH, parseConfig, parsePendingConfig, pidAlive, PLUGIN_VERSION,
-  SESSIONS_DIR, WATCHDOG_PID_PATH,
+  AgentKind, CC_DIR, CODEX_HOOK_MARKER, codexAppServerSocketAvailable, codexHome, flagExists,
+  LAST_SEND_PATH, localApprovalsState, NO_HOLD_PATH, parseConfig, parsePendingConfig, pidAlive,
+  PLUGIN_VERSION, SESSIONS_DIR, WATCHDOG_PID_PATH,
 } from "../core/shared";
+
+/** Where a GLOBAL OpenCode plugin stub lives, newest name first.
+ *
+ *  WHY THIS EXISTS. OpenCode is the one agent with no hooks to count and no transcript directory to
+ *  date, so before this its ONLY evidence was a liveness stamp — and an installed-but-never-restarted
+ *  OpenCode (the stamp is new in 2.1.16, and plugins import once at server start) was indistinguishable
+ *  from one that was never installed. Status then said nothing at all about it, which is the same
+ *  confusion this whole readout exists to end, just relocated.
+ *
+ *  BOTH DIRECTORY NAMES. OpenCode's discovery glob is `{plugin,plugins}/*.{ts,js}` and this repo wrote
+ *  the SINGULAR alias until 631f3f2 (2026-08-19). A machine that installed before that and has not
+ *  re-run the installer still loads a perfectly good plugin out of `plugin/`; reading it as absent
+ *  would reintroduce the exact bug. `plugins/` is checked first because it is what we write now.
+ *
+ *  GLOBAL SCOPE ONLY. `opencode-install.sh --project` writes into `<project>/.opencode`, and this
+ *  command has no project context to look in — a project-scope install simply falls back to the
+ *  stamp, exactly as before. */
+function opencodeStubPaths(): string[] {
+  // Mirrors the installer's own `${XDG_CONFIG_HOME:-$HOME/.config}/opencode`.
+  const base = `${process.env.XDG_CONFIG_HOME || `${process.env.HOME}/.config`}/opencode`;
+  return [`${base}/plugins/nomo.js`, `${base}/plugin/nomo.js`];
+}
 
 /** Native Codex plugin hook declarations in plugin/hooks/codex-hooks.json. Keep the status denominator
  *  in lockstep with the manifest; SessionEnd is the seventh entry and records terminal history. */
@@ -67,6 +89,9 @@ export interface StatusDeps {
   codexAppServerAvailable?: () => Promise<boolean>;
   /** Where the OpenCode plugin stamps its liveness (defaults to `<CC_DIR>/last-hook-opencode`). */
   lastHookOpencodePath?: string;
+  /** Candidate paths for the global OpenCode plugin stub (see opencodeStubPaths). Injected so a test
+   *  can point them at a temp dir instead of the developer's real ~/.config/opencode. */
+  opencodeStubPaths?: string[];
   /** The local remote-approvals escape-hatch flag (`<CC_DIR>/no-hold`). Its presence means permission
    *  prompts stay in the terminal and never reach the phone — the single commonest reason a user
    *  reports "my phone never asked me". Injected so a test can point it at a temp file. */
@@ -124,6 +149,9 @@ interface AgentReport {
   /** The Sessions row's value — "why can't I see a session on my phone". Already phrased against the
    *  machine total, because "Tracked sessions: 4" told a Claude Code user nothing about their own. */
   sessions: string;
+  /** The raw count behind it. The collapsed one-line view drops the Sessions half entirely at zero —
+   *  "no activity yet · no sessions" says one thing twice and crowds out the part that matters. */
+  sessionCount: number;
   /** Rows that only matter to a reader sitting IN this agent (Codex's plugin/trust state, its Plan
    *  answer bridge). Suppressed in the collapsed view — they are capability, not fault. */
   detail: [label: string, value: string][];
@@ -149,7 +177,7 @@ function renderOwn(r: AgentReport, heading: string, print: (l: string) => void):
  *  status for the detail this view dropped. */
 function renderOther(r: AgentReport, print: (l: string) => void): void {
   const ui = AGENT_UI[r.kind];
-  print(subRow(ui.name, `${r.hooks} · ${r.sessions}`));
+  print(subRow(ui.name, r.sessionCount > 0 ? `${r.hooks} · ${r.sessions}` : r.hooks));
   for (const p of r.problems) {
     print(cont(`! ${p.what}`));
     if (p.fix) print(cont(`→ ${p.fix}`));
@@ -307,6 +335,7 @@ export async function statusCmd(deps: StatusDeps = {}): Promise<number> {
   const lastHookCodexPath = deps.lastHookCodexPath ?? codexAdapter.hookStampPath();
   const lastHookClaudePath = deps.lastHookClaudePath ?? claudeAdapter.hookStampPath();
   const lastHookOpencodePath = deps.lastHookOpencodePath ?? opencodeAdapter.hookStampPath();
+  const opencodeStubs = deps.opencodeStubPaths ?? opencodeStubPaths();
   const noHoldPath = deps.noHoldPath ?? NO_HOLD_PATH;
   const isAlive = deps.isAlive ?? pidAlive;
   const now = deps.now ?? Date.now;
@@ -480,7 +509,7 @@ export async function statusCmd(deps: StatusDeps = {}): Promise<number> {
   });
   const claudeReport: AgentReport = {
     kind: "claude", present: perAgent.claude! > 0 || claudeHooks.stamp > 0, hooksLabel: "Hooks",
-    hooks: claudeHooks.value, sessions: sessionText(perAgent.claude!), detail: [],
+    hooks: claudeHooks.value, sessions: sessionText(perAgent.claude!), sessionCount: perAgent.claude!, detail: [],
     problems: claudeHooks.problem ? [claudeHooks.problem] : [],
   };
 
@@ -548,22 +577,58 @@ export async function statusCmd(deps: StatusDeps = {}): Promise<number> {
     : "questions can only be answered here — run `codex app-server daemon start` before launching Codex"]);
   const codexReport: AgentReport = {
     kind: "codex", present: plugin.installed || legacyEvents > 0 || perAgent.codex! > 0 || codexHooks.stamp > 0,
-    hooksLabel: "Hooks", hooks: codexHooks.value, sessions: sessionText(perAgent.codex!), detail: codexDetail,
+    hooksLabel: "Hooks", hooks: codexHooks.value, sessions: sessionText(perAgent.codex!),
+    sessionCount: perAgent.codex!, detail: codexDetail,
     problems: codexProblems,
   };
 
-  // OpenCode. No hooks and no transcript directory of its own (see opencodeAdapter) — the resident
-  // plugin stamps its own liveness on every frame it sends, and that stamp is the whole signal.
+  // OpenCode. No hooks and no transcript directory of its own (see opencodeAdapter), so its evidence
+  // is two things: the liveness stamp the resident plugin writes on every frame, and the installed
+  // stub on disk. The stub is what makes an installed-but-silent OpenCode visible at all.
   const opencodeStamp = await readMsMarker(lastHookOpencodePath);
-  const opencodeReport: AgentReport = {
-    kind: "opencode", present: perAgent.opencode! > 0 || opencodeStamp > 0, hooksLabel: "Plugin",
-    hooks: opencodeStamp > 0
-      ? `loaded · last activity ${humanAge(now() - opencodeStamp)}`
+  // The stub is a one-line `export { default } from "<abs path to dist/opencode.js>";` the installer
+  // generates. Reading it (187 bytes) gets BOTH facts in one open: that OpenCode is set up here, and
+  // which bundle it re-exports — which is checked below, because a moved or deleted checkout leaves a
+  // stub that imports nothing and OpenCode fails it silently, forever, with no other symptom.
+  let opencodeStub: string | undefined;
+  let opencodeTarget: string | undefined;
+  for (const path of opencodeStubs) {
+    const text = await readFile(path, "utf8").catch(() => null);
+    if (text === null) continue;
+    opencodeStub = path;
+    opencodeTarget = /^export \{ default \} from "(.+)";$/m.exec(text)?.[1];
+    break;
+  }
+  const opencodeProblems: { what: string; fix?: string }[] = [];
+  if (opencodeTarget !== undefined && !(await flagExists(opencodeTarget))) {
+    opencodeProblems.push({
+      what: `The OpenCode plugin points at ${opencodeTarget}, which is gone — OpenCode loads nothing.`,
+      fix: "re-run plugin/scripts/opencode-install.sh from your nomo checkout",
+    });
+  }
+  /** NOT a warning when merely quiet, and that is deliberate. A freshly installed OpenCode that has not
+   *  been opened is completely normal, and "installed but never ran" cannot be told apart from
+   *  "installed, ran before, now silent": the stamp is the only record of either and it has no session
+   *  activity to be judged against (unlike Claude/Codex, OpenCode has no transcript directory whose
+   *  mtime could prove the agent was busy while Nomo stayed quiet). Inventing that distinction would be
+   *  a guess, so the row states the fact and names the one action that would change it. */
+  const quiet = opencodeStamp <= 0 && opencodeStub !== undefined;
+  const opencodeLiveness = opencodeStamp > 0
+    ? `loaded · last activity ${humanAge(now() - opencodeStamp)}`
+    : quiet
+      ? "installed · no activity yet"
       : audience === "opencode"
         ? "no activity yet — the plugin stamps on your next turn"
-        : "not set up here",
-    sessions: sessionText(perAgent.opencode!),
-    detail: [], problems: [],
+        : "not set up here";
+  const opencodeReport: AgentReport = {
+    kind: "opencode",
+    present: opencodeStub !== undefined || perAgent.opencode! > 0 || opencodeStamp > 0,
+    hooksLabel: "Plugin", hooks: opencodeLiveness,
+    sessions: sessionText(perAgent.opencode!), sessionCount: perAgent.opencode!,
+    // WHY it might be quiet, for the only reader who can act on it. Own-section only: from Claude Code
+    // this is somebody else's housekeeping, and the compact line already says OpenCode is here.
+    detail: quiet ? [["", "plugins load once at OpenCode start — restart it if sessions aren't reaching your phone"]] : [],
+    problems: opencodeProblems,
   };
 
   // ── render ────────────────────────────────────────────────────────────────────────────────────

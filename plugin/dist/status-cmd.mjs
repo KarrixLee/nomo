@@ -104,7 +104,7 @@ async function sha256Hex(s) {
 }
 
 // src/core/shared.ts
-var PLUGIN_VERSION = "2.1.16";
+var PLUGIN_VERSION = "2.1.17";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -2773,6 +2773,10 @@ function adapterFor(agent) {
 var allAdapters = [claudeAdapter, codexAdapter];
 
 // src/entries/status-cmd.ts
+function opencodeStubPaths() {
+  const base = `${process.env.XDG_CONFIG_HOME || `${process.env.HOME}/.config`}/opencode`;
+  return [`${base}/plugins/nomo.js`, `${base}/plugin/nomo.js`];
+}
 var CODEX_PLUGIN_HOOK_COUNT = 7;
 var AGENT_UI = {
   claude: { name: "Claude Code", pair: "/nomo-cc:pair", approvalsOn: "/nomo-cc:approvals on", status: "/nomo-cc:status" },
@@ -2799,7 +2803,7 @@ function renderOwn(r, heading, print) {
 }
 function renderOther(r, print) {
   const ui = AGENT_UI[r.kind];
-  print(subRow(ui.name, `${r.hooks} · ${r.sessions}`));
+  print(subRow(ui.name, r.sessionCount > 0 ? `${r.hooks} · ${r.sessions}` : r.hooks));
   for (const p of r.problems) {
     print(cont(`! ${p.what}`));
     if (p.fix)
@@ -2931,6 +2935,7 @@ async function statusCmd(deps = {}) {
   const lastHookCodexPath = deps.lastHookCodexPath ?? codexAdapter.hookStampPath();
   const lastHookClaudePath = deps.lastHookClaudePath ?? claudeAdapter.hookStampPath();
   const lastHookOpencodePath = deps.lastHookOpencodePath ?? opencodeAdapter.hookStampPath();
+  const opencodeStubs = deps.opencodeStubPaths ?? opencodeStubPaths();
   const noHoldPath = deps.noHoldPath ?? NO_HOLD_PATH;
   const isAlive = deps.isAlive ?? pidAlive;
   const now = deps.now ?? Date.now;
@@ -3041,6 +3046,7 @@ async function statusCmd(deps = {}) {
     hooksLabel: "Hooks",
     hooks: claudeHooks.value,
     sessions: sessionText(perAgent.claude),
+    sessionCount: perAgent.claude,
     detail: [],
     problems: claudeHooks.problem ? [claudeHooks.problem] : []
   };
@@ -3102,18 +3108,39 @@ async function statusCmd(deps = {}) {
     hooksLabel: "Hooks",
     hooks: codexHooks.value,
     sessions: sessionText(perAgent.codex),
+    sessionCount: perAgent.codex,
     detail: codexDetail,
     problems: codexProblems
   };
   const opencodeStamp = await readMsMarker(lastHookOpencodePath);
+  let opencodeStub;
+  let opencodeTarget;
+  for (const path of opencodeStubs) {
+    const text = await readFile3(path, "utf8").catch(() => null);
+    if (text === null)
+      continue;
+    opencodeStub = path;
+    opencodeTarget = /^export \{ default \} from "(.+)";$/m.exec(text)?.[1];
+    break;
+  }
+  const opencodeProblems = [];
+  if (opencodeTarget !== undefined && !await flagExists(opencodeTarget)) {
+    opencodeProblems.push({
+      what: `The OpenCode plugin points at ${opencodeTarget}, which is gone — OpenCode loads nothing.`,
+      fix: "re-run plugin/scripts/opencode-install.sh from your nomo checkout"
+    });
+  }
+  const quiet = opencodeStamp <= 0 && opencodeStub !== undefined;
+  const opencodeLiveness = opencodeStamp > 0 ? `loaded · last activity ${humanAge(now() - opencodeStamp)}` : quiet ? "installed · no activity yet" : audience === "opencode" ? "no activity yet — the plugin stamps on your next turn" : "not set up here";
   const opencodeReport = {
     kind: "opencode",
-    present: perAgent.opencode > 0 || opencodeStamp > 0,
+    present: opencodeStub !== undefined || perAgent.opencode > 0 || opencodeStamp > 0,
     hooksLabel: "Plugin",
-    hooks: opencodeStamp > 0 ? `loaded · last activity ${humanAge(now() - opencodeStamp)}` : audience === "opencode" ? "no activity yet — the plugin stamps on your next turn" : "not set up here",
+    hooks: opencodeLiveness,
     sessions: sessionText(perAgent.opencode),
-    detail: [],
-    problems: []
+    sessionCount: perAgent.opencode,
+    detail: quiet ? [["", "plugins load once at OpenCode start — restart it if sessions aren't reaching your phone"]] : [],
+    problems: opencodeProblems
   };
   const reports = { claude: claudeReport, codex: codexReport, opencode: opencodeReport };
   if (audience) {

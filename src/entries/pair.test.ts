@@ -1228,6 +1228,7 @@ describe("statusCmd", () => {
         codexSessionsDir: join(dir, "codex-sessions"), claudeProjectsDir: join(dir, "claude-projects"),
         lastHookClaudePath: join(dir, "lh-claude"), lastHookCodexPath: join(dir, "lh-codex"),
         lastHookOpencodePath: join(dir, "lh-opencode"), noHoldPath: join(dir, "no-hold"),
+        opencodeStubPaths: [join(dir, "absent-stub.js")],
         codexAppServerAvailable: async () => false, isAlive: () => false,
       });
       const out = lines.join("\n");
@@ -1250,6 +1251,7 @@ describe("statusCmd", () => {
       codexSessionsDir: join(dir, "codex-sessions"), claudeProjectsDir: join(dir, "claude-projects"),
       lastHookClaudePath: join(dir, "lh-claude"), lastHookCodexPath: join(dir, "lh-codex"),
       lastHookOpencodePath: join(dir, "lh-opencode"), noHoldPath: join(dir, "no-hold"),
+        opencodeStubPaths: [join(dir, "absent-stub.js")],
       codexAppServerAvailable: async () => false, isAlive: () => false,
     });
     const out = lines.join("\n");
@@ -1257,6 +1259,78 @@ describe("statusCmd", () => {
     // still get the complete picture rather than a Claude-shaped one.
     for (const name of ["Claude Code", "Codex", "OpenCode"]) expect(out).toContain(`\n${name}\n`);
     expect(out).not.toContain("you are here");
+  });
+
+  // OpenCode presence. It is the only agent with no hooks and no transcript directory, so before the
+  // stub check an INSTALLED-but-silent OpenCode was indistinguishable from an absent one and vanished
+  // from the readout entirely — meaning a broken one would say nothing at all, which is the confusion
+  // this whole redesign exists to end.
+  describe("OpenCode presence comes from the installed stub, not just activity", () => {
+    const stub = (target: string): string => `// nomo-opencode-install\nexport { default } from "${target}";\n`;
+
+    async function run(stubPaths: string[], audience?: "claude" | "opencode"): Promise<string> {
+      lines.length = 0;
+      await writeFile(configPath, JSON.stringify({
+        url: WORKER, pairingId: "abcdef0123456789".repeat(2), pcSecret: "s", e2eKeyB64: b64url(new Uint8Array(32)),
+      }));
+      await statusCmd({
+        print, audience, configPath, lastSendPath: join(dir, "last-send"),
+        sessionsDir: join(dir, "sessions"), watchdogPidPath: join(dir, "watchdog.pid"),
+        codexConfigPath: join(dir, "config.toml"), codexHooksPath: join(dir, "hooks.json"),
+        codexSessionsDir: join(dir, "codex-sessions"), claudeProjectsDir: join(dir, "claude-projects"),
+        lastHookClaudePath: join(dir, "lh-claude"), lastHookCodexPath: join(dir, "lh-codex"),
+        lastHookOpencodePath: join(dir, "lh-opencode"), noHoldPath: join(dir, "no-hold"),
+        opencodeStubPaths: stubPaths, codexAppServerAvailable: async () => false, isAlive: () => false,
+      });
+      return lines.join("\n");
+    }
+
+    test("no stub, no activity → genuinely absent, and stays off the readout", async () => {
+      const out = await run([join(dir, "absent-stub.js")], "claude");
+      expect(out).not.toContain("OpenCode");
+    });
+
+    test("installed but never heard from → a CALM row, no warning", async () => {
+      const stubPath = join(dir, "plugins-nomo.js");
+      await writeFile(stubPath, stub(join(dir, "opencode-bundle.js")));
+      await writeFile(join(dir, "opencode-bundle.js"), "export default {};");
+      const out = await run([stubPath], "claude");
+      expect(out).toContain("Also on this computer");
+      // The COLLAPSED line stays short — presence and nothing else. No trailing "no sessions": at
+      // zero that half says the same thing twice and crowds out the part that matters.
+      expect(out).toContain("  OpenCode    installed · no activity yet");
+      expect(out).not.toContain("no activity yet ·");
+      // A freshly installed OpenCode that has simply not been opened is normal, not a fault.
+      expect(out).not.toContain("! ");
+      // The reader who can act on it — someone sitting IN OpenCode — gets the reason.
+      const own = await run([stubPath], "opencode");
+      expect(own).toContain("plugins load once at OpenCode start — restart it if sessions aren't reaching your phone");
+    });
+
+    test("the SINGULAR `plugin/` alias still counts as installed", async () => {
+      // OpenCode's discovery glob is `{plugin,plugins}`, and this repo wrote the singular name until
+      // 631f3f2. Someone who installed before that and never re-ran the installer has a working
+      // plugin — reading it as absent is the bug this check exists to fix.
+      const singular = join(dir, "plugin-alias-nomo.js");
+      await writeFile(singular, stub(join(dir, "opencode-bundle.js")));
+      await writeFile(join(dir, "opencode-bundle.js"), "export default {};");
+      const out = await run([join(dir, "absent-stub.js"), singular], "claude");
+      expect(out).toContain("installed · no activity yet");
+    });
+
+    test("stub pointing at a checkout that has moved → a `!` problem with the fix", async () => {
+      // The one OpenCode failure that IS a fault and IS detectable: the stub re-exports an absolute
+      // path, so moving or deleting the checkout leaves an import that fails silently at server start
+      // with no other symptom anywhere.
+      const stubPath = join(dir, "plugins-nomo.js");
+      const gone = join(dir, "moved-away", "dist", "opencode.js");
+      await writeFile(stubPath, stub(gone));
+      const out = await run([stubPath], "claude");
+      expect(out).toContain(`! The OpenCode plugin points at ${gone}, which is gone`);
+      expect(out).toContain("→ re-run plugin/scripts/opencode-install.sh from your nomo checkout");
+      // A problem in somebody else's agent still points at where the detail lives.
+      expect(out).toContain("→ full detail: run /nomo-status inside OpenCode");
+    });
   });
 
   test("remote approvals paused → the row that explains 'my phone never asked me', with the fix", async () => {
