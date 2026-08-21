@@ -354,10 +354,10 @@ const KEYS = { escapeCodeTimeout: 50 };
 
 /** One terminal row per line, so the cursor-up count below stays true: a line that wrapped would
  *  make the next redraw start mid-block and walk the list down the screen. ANSI runs are copied
- *  through and cost no width.
- *  @param {string} s */
-function fit(s) {
-  const w = Math.max((process.stdout.columns ?? 80) - 2, 8);
+ *  through and cost no width. The width comes back with the line because the redraw needs it later,
+ *  at a window size that may no longer be this one.
+ *  @param {string} s @param {number} w @returns {[string, number]} the line, and its visible width */
+function fit(s, w) {
   let out = "";
   let n = 0;
   for (let i = 0; i < s.length; i++) {
@@ -369,9 +369,9 @@ function fit(s) {
     } else if (n < w) {
       out += s[i];
       n++;
-    } else return out + (COLOR ? "\u001b[0m…" : "…");
+    } else return [out + (COLOR ? "\u001b[0m…" : "…"), n + 1];
   }
-  return out;
+  return [out, n];
 }
 
 /** The frame as lines. `cursor < 0` is the settled frame left on screen after the prompt ends —
@@ -398,7 +398,9 @@ function frame(selected, detected, cursor) {
   return rows;
 }
 
-let painted = 0;
+/** The visible width of every line in the frame currently on screen — not a count of them. See
+ *  paint: after a resize those are different numbers, and it is the widths that survive. */
+let painted = /** @type {number[]} */ ([]);
 
 /** Redraw in place: back up over the last frame, overwrite it line by line, then erase whatever the
  *  old frame had below the new one (the block shrinks every time an agent is unticked). Never a
@@ -406,9 +408,23 @@ let painted = 0;
  *  collect one copy of the list per keypress.
  *  @param {string[]} rows */
 function paint(rows) {
-  const up = painted > 0 ? `\u001b[${painted}A` : "";
-  process.stdout.write(`${up}\r${rows.map((r) => `\u001b[2K${fit(r)}`).join("\n")}\n\u001b[0J`);
-  painted = rows.length;
+  const cols = process.stdout.columns ?? 80;
+  // How many ROWS the last frame occupies right now, which is its line count only until the window
+  // narrows under one of those lines: the terminal has since reflowed that line into two, and a
+  // plain line count would move up too few and start redrawing inside the old frame. Both misses are
+  // bounded and neither survives the next keypress, but they are not equally tidy — counting high
+  // walks the block up over the banner and the trailing erase leaves that clean, while counting low
+  // strands the old frame's top rows on screen. So when the two models disagree, this counts high.
+  //
+  // ponytail: assumes the emulator reflows on resize — Terminal.app, iTerm2, VS Code, Ghostty, vte
+  // and Windows Terminal all do. One that clips instead (xterm) loses the banner for one frame.
+  // Exact for both would need a cursor-position report round-tripped through the key decoder.
+  const up = painted.reduce((n, w) => n + Math.max(1, Math.ceil(w / Math.max(cols, 1))), 0);
+  const lines = rows.map((r) => fit(r, Math.max(cols - 2, 8)));
+  painted = lines.map(([, w]) => w);
+  process.stdout.write(
+    `${up > 0 ? `\u001b[${up}A` : ""}\r${lines.map(([text]) => `\u001b[2K${text}`).join("\n")}\n\u001b[0J`,
+  );
 }
 
 /** @param {Set<string>} selected @returns {Promise<"install"|"quit"|"interrupt"|"fallback">} */
@@ -421,7 +437,7 @@ function chooseArrows(selected) {
   // space-enter and never "arrow past the two I do not own". All-missing falls back to the top.
   let cursor = Math.max(AGENTS.findIndex((a) => detected.get(a.id)), 0);
   let live = true;
-  painted = 0;
+  painted = [];
 
   return new Promise((resolve) => {
     // ONE teardown, reached by every exit there is: Enter, q, Esc, Ctrl-C, Ctrl-D, a SIGINT sent
@@ -432,6 +448,7 @@ function chooseArrows(selected) {
       if (!live) return;
       live = false;
       stdin.off("keypress", onKey);
+      process.stdout.off("resize", onResize);
       process.off("SIGINT", onSigint);
       process.off("exit", teardown);
       try {
@@ -451,6 +468,16 @@ function chooseArrows(selected) {
     // it. It is also nearly unreachable — in raw mode Ctrl-C is delivered as the \u0003 byte below,
     // not as a signal — so it is here for a `kill -INT` from elsewhere.
     const onSigint = () => finish("interrupt");
+    // A resize is not a keypress, so without this the frame sits at the old width until the user
+    // happens to touch a key — every line in it fitted to a window that no longer exists. It goes
+    // through the same teardown as the rest: node keeps a SIGWINCH handler alive for as long as one
+    // `resize` listener is attached, and this stream outlives the prompt by the whole install.
+    //
+    // It cannot interleave with a keypress redraw. Both are ordinary callbacks on one thread and
+    // paint is a single synchronous write, so one always finishes before the other starts and a lock
+    // here would be theatre. What DOES cross between them is `painted`, which is why that is the
+    // widths of what is on screen rather than a count of lines — see paint.
+    const onResize = () => paint(frame(selected, detected, cursor));
     /** @param {string} str @param {{name?: string, ctrl?: boolean}} [key] */
     const onKey = (str, key) => {
       const n = AGENTS.length;
@@ -474,6 +501,7 @@ function chooseArrows(selected) {
       paint(frame(selected, detected, cursor));
     };
 
+    process.stdout.on("resize", onResize);
     process.on("SIGINT", onSigint);
     process.on("exit", teardown);
     emitKeypressEvents(stdin, /** @type {any} */ (KEYS));
