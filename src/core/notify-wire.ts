@@ -21,7 +21,7 @@
 // Everything here is pure except repairNotifyWiring at the bottom, which owns the self-repair file IO
 // for users who never re-pair. PORTABILITY: bun AND node >= 18 — no Bun.* APIs.
 
-import { readFile } from "node:fs/promises";
+import { readFile, stat } from "node:fs/promises";
 import { atomicWrite, codexHome } from "./shared";
 
 /** The shim sub-command that runs the notify backstop. Matches the entry whitelist in hook-shim.sh
@@ -222,13 +222,17 @@ export async function repairNotifyWiring(deps: RepairNotifyDeps = {}): Promise<N
     const next = wireNotifyArray(parsed.value, program);
     if (sameCommand(next, parsed.value)) return "unchanged";
 
+    // Preserve the existing config.toml's permission bits (it may hold MCP API keys). atomicWrite's
+    // rename does NOT inherit the target's mode, so without this a user's 0600 config silently becomes
+    // 0644 — and the .bak-nomo copy would leak a 0644 duplicate. Default to 0600 when the file is gone.
+    const mode = ((await stat(tomlPath).catch(() => null))?.mode ?? 0o600) & 0o777;
     // One-time backup of the pre-change file, under the SAME name the pair flow uses, and likewise
     // never overwritten — the first version nomo ever changed is the one worth keeping.
     const bak = `${tomlPath}.bak-nomo`;
-    try { await readFile(bak); } catch { await atomicWrite(bak, toml); }
+    try { await readFile(bak); } catch { await atomicWrite(bak, toml, mode); }
     // replaceNotifyInToml rewrites exactly the top-level `notify` line; every other key, comment and
     // table in the file is carried through byte-for-byte.
-    await atomicWrite(tomlPath, replaceNotifyInToml(toml, next));
+    await atomicWrite(tomlPath, replaceNotifyInToml(toml, next), mode);
     return "repaired";
   } catch {
     return "refused";

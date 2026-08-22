@@ -103,7 +103,7 @@ async function sha256Hex(s) {
 }
 
 // src/core/shared.ts
-var PLUGIN_VERSION = "2.1.20";
+var PLUGIN_VERSION = "2.1.21";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -2784,7 +2784,7 @@ import { hostname } from "node:os";
 import { basename as basename3 } from "node:path";
 
 // src/core/notify-wire.ts
-import { readFile as readFile3 } from "node:fs/promises";
+import { readFile as readFile3, stat as stat3 } from "node:fs/promises";
 var NOMO_NOTIFY_ENTRY = "codex-notify";
 function nomoNotifyProgram(home) {
   return `${home}/.config/cc-status/hook-shim.sh`;
@@ -2912,13 +2912,14 @@ async function repairNotifyWiring(deps = {}) {
     const next = wireNotifyArray(parsed.value, program);
     if (sameCommand(next, parsed.value))
       return "unchanged";
+    const mode = ((await stat3(tomlPath).catch(() => null))?.mode ?? 384) & 511;
     const bak = `${tomlPath}.bak-nomo`;
     try {
       await readFile3(bak);
     } catch {
-      await atomicWrite(bak, toml);
+      await atomicWrite(bak, toml, mode);
     }
-    await atomicWrite(tomlPath, replaceNotifyInToml(toml, next));
+    await atomicWrite(tomlPath, replaceNotifyInToml(toml, next), mode);
     return "repaired";
   } catch {
     return "refused";

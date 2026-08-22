@@ -4,7 +4,7 @@ var __require = /* @__PURE__ */ createRequire(import.meta.url);
 // src/entries/pair.ts
 import { spawn as spawn2 } from "node:child_process";
 import { constants as fsConstants } from "node:fs";
-import { access as access2, mkdir as mkdir2, readFile as readFile3, unlink as unlink2 } from "node:fs/promises";
+import { access as access2, mkdir as mkdir2, readFile as readFile3, stat as stat3, unlink as unlink2 } from "node:fs/promises";
 import { dirname as dirname2, join as join2 } from "node:path";
 import { fileURLToPath as fileURLToPath2 } from "node:url";
 
@@ -101,7 +101,7 @@ async function sha256Hex(s) {
 }
 
 // src/core/shared.ts
-var PLUGIN_VERSION = "2.1.20";
+var PLUGIN_VERSION = "2.1.21";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -1037,7 +1037,7 @@ function codexCompanionBrokerEvidence(pid, ancestorsOf = pidAncestors, commandOf
 }
 
 // src/core/notify-wire.ts
-import { readFile as readFile2 } from "node:fs/promises";
+import { readFile as readFile2, stat as stat2 } from "node:fs/promises";
 var NOMO_NOTIFY_ENTRY = "codex-notify";
 function nomoNotifyProgram(home) {
   return `${home}/.config/cc-status/hook-shim.sh`;
@@ -1165,13 +1165,14 @@ async function repairNotifyWiring(deps = {}) {
     const next = wireNotifyArray(parsed.value, program);
     if (sameCommand(next, parsed.value))
       return "unchanged";
+    const mode = ((await stat2(tomlPath).catch(() => null))?.mode ?? 384) & 511;
     const bak = `${tomlPath}.bak-nomo`;
     try {
       await readFile2(bak);
     } catch {
-      await atomicWrite(bak, toml);
+      await atomicWrite(bak, toml, mode);
     }
-    await atomicWrite(tomlPath, replaceNotifyInToml(toml, next));
+    await atomicWrite(tomlPath, replaceNotifyInToml(toml, next), mode);
     return "repaired";
   } catch {
     return "refused";
@@ -4290,15 +4291,16 @@ async function wireNotify(deps = {}) {
     print("Codex notify backstop already wired — no change.");
     return 0;
   }
+  const mode = ((await stat3(tomlPath).catch(() => null))?.mode ?? 384) & 511;
   if (toml.length > 0) {
     const bak = `${tomlPath}.bak-nomo`;
     try {
       await readFile3(bak);
     } catch {
-      await atomicWrite(bak, toml);
+      await atomicWrite(bak, toml, mode);
     }
   }
-  await atomicWrite(tomlPath, replaceNotifyInToml(toml, next));
+  await atomicWrite(tomlPath, replaceNotifyInToml(toml, next), mode);
   const preserved = next.includes("--");
   print(preserved ? "Codex notify backstop wired (your original notify command is preserved and still runs)." : "Codex notify backstop wired.");
   if (!installed)

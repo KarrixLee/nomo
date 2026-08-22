@@ -26,7 +26,7 @@
 
 import { spawn } from "node:child_process";
 import { constants as fsConstants } from "node:fs";
-import { access, mkdir, readFile, unlink } from "node:fs/promises";
+import { access, mkdir, readFile, stat, unlink } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -532,12 +532,16 @@ export async function wireNotify(deps: WireNotifyDeps = {}): Promise<number> {
     print("Codex notify backstop already wired — no change.");
     return 0;
   }
+  // Preserve config.toml's permission bits (it may hold MCP API keys). atomicWrite's rename does NOT
+  // inherit the target's mode, so without this a user's 0600 config silently becomes 0644 (and the
+  // .bak-nomo copy would leak a 0644 duplicate). Default to 0600 when the file doesn't exist yet.
+  const mode = ((await stat(tomlPath).catch(() => null))?.mode ?? 0o600) & 0o777;
   // One-time backup of the pre-change file (never overwritten by later runs).
   if (toml.length > 0) {
     const bak = `${tomlPath}.bak-nomo`;
-    try { await readFile(bak); } catch { await atomicWrite(bak, toml); }
+    try { await readFile(bak); } catch { await atomicWrite(bak, toml, mode); }
   }
-  await atomicWrite(tomlPath, replaceNotifyInToml(toml, next));
+  await atomicWrite(tomlPath, replaceNotifyInToml(toml, next), mode);
   const preserved = next.includes("--");
   print(preserved
     ? "Codex notify backstop wired (your original notify command is preserved and still runs)."

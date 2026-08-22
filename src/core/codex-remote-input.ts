@@ -294,6 +294,13 @@ async function runRemoteInput(
       encryptBlob(deps.config.e2eKey, fallback),
       (deps.localApprovalsStateFn ?? localApprovalsState)(),
     ]);
+    // Remote approvals paused on this Mac ($nomo-approvals off): the Mac picker owns this decision. Do
+    // NOT create a hold, POST the decisionPending frame, or apply a phone answer — decline exactly like
+    // the other "unsupported" exits above, which the caller falls back to a plain attention notification.
+    // The permission hook hard-gates the same flag (permission.ts's noHoldPath escape hatch); the server
+    // does not compensate (its decision route reads the phone's own KV toggle, not the x-cc-approvals
+    // header this value would otherwise set below).
+    if (approvals === "off") return "unsupported";
     if (signal.aborted) return "resolved-elsewhere";
 
     const fetchFn = deps.fetchFn ?? fetch;
