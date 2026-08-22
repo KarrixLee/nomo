@@ -26,7 +26,8 @@ export interface OcFrame {
   op: CCOp;
   prio: 0 | 1;
   status: CCStatus;
-  /** Sub-status line: a `retry`'s message, else the `"planning"` CCDetailKey while the plan agent holds the session. */
+  /** Sub-status line, always a CLOSED `CCDetailKey` (never free text): `"retrying"` while the provider
+   *  is retrying, else `"planning"` while the plan agent holds the session. */
   detail?: string;
   title?: string;
   model?: string;
@@ -119,18 +120,25 @@ function asString(value: unknown): string | undefined {
   return typeof value === "string" && value.length > 0 ? value : undefined;
 }
 
-/** `provider/model` — OpenCode's own spelling for a model reference (`Provider.parseModel` splits on
- *  the first `/`), and the string the user picked in the TUI. Read from the newest ASSISTANT
- *  `message.updated`, never from `session.model`: `session.model` IS populated on 1.18.15 (both
- *  `session.created` from the TUI and `session.updated` carry `{id, providerID, variant}` — the 322
- *  model-less rows in `opencode.db` are pre-existing history), but the assistant message is the
- *  per-turn truth and already visited here, so there is nothing to gain by reading two sources. */
+/** The BARE model id (`claude-sonnet-4-5`, `gpt-5-codex`) for the blob's `model` key. Read from the
+ *  newest ASSISTANT `message.updated`, never from `session.model`: `session.model` IS populated on
+ *  1.18.15 (both `session.created` from the TUI and `session.updated` carry `{id, providerID,
+ *  variant}` — the 322 model-less rows in `opencode.db` are pre-existing history), but the assistant
+ *  message is the per-turn truth and already visited here, so there is nothing to gain by reading two
+ *  sources.
+ *
+ *  THE PROVIDER PREFIX IS DROPPED ON PURPOSE. OpenCode spells a model reference `provider/model`
+ *  (`Provider.parseModel` splits on the first `/`), but the phone's badge is a lookup table of BARE
+ *  ids — the same strings Claude's transcript and Codex's hook payload already carry — and an
+ *  unrecognised key falls through to a prettified raw string, so `anthropic/claude-sonnet-4-5`
+ *  rendered as the mangled "Anthropic/claude Sonnet 4.5". `providerID` is still required as a
+ *  well-formedness gate (a message with only half the pair is not a model reference). */
 export function ocModelFromMessage(info: Record<string, unknown>): string | undefined {
   if (info.role !== "assistant") return undefined;
   const providerID = asString(info.providerID);
   const modelID = asString(info.modelID);
   if (!providerID || !modelID) return undefined;
-  return `${providerID}/${modelID}`;
+  return modelID;
 }
 
 /** Normalize `session.status`'s payload. The modern shape is `{type:"idle"|"busy"|"retry", …}`; a
@@ -148,7 +156,7 @@ function statusType(status: unknown): string | undefined {
  *  |--------------------------------|---------------------------------------------------------|
  *  | `session.created` (root only)  | start / working                                          |
  *  | `session.status {busy}`        | update / working — skipped when identical to the last     |
- *  | `session.status {retry}`       | update / working, detail = the retry message              |
+ *  | `session.status {retry}`       | update / working, detail = the `"retrying"` key           |
  *  | `session.status {idle}`        | (nothing — `session.idle` is the authoritative done)      |
  *  | `session.idle` (root)          | done / done                                              |
  *  | `session.deleted`              | end                                                      |
@@ -212,12 +220,22 @@ export function reduceOcEvent(state: OcState, event: unknown, now: number = Date
       const live = entry ?? adopt(state, sessionId, now);
       const status = statusType(properties.status);
       if (status !== "busy" && status !== "retry") return null; // `idle` is session.idle's job
-      const detail = status === "retry" ? asString(asRecord(properties.status)?.message) : undefined;
+      // A FIXED KEY, NEVER THE PROVIDER'S MESSAGE. `detail` is a closed enum on the phone
+      // (`CCDetailKey.label`, see `frame` below): an unknown key renders nothing in the widget and
+      // raw unlocalized English in the app row, and a provider's retry sentence would additionally
+      // eat the 3072-char seal budget the plan/dbg tail is fitted into. "retrying" maps to the
+      // localized "Reconnecting…" — a transient the user should read as recovery, not failure.
+      const detail = status === "retry" ? "retrying" : undefined;
       const planned = frame(sessionId, live, "update", "working", now, detail);
       // The identical-frame skip. `session.status {busy}` fires several times per turn with the exact
       // same payload; re-POSTing it costs a round trip and a re-seal for a frame the phone already
       // shows. The key spans everything that can change the RENDERED frame (title/model/todos included),
       // so a title or a todo tick landing mid-turn still gets through on the very next busy.
+      //
+      // CACHED ON PLAN, RETRACTED ON A FAILED SEND. The key says "the phone already shows this", which
+      // is only true once the POST is CONFIRMED — and postOcEvent swallows every failure. So the
+      // sender calls ocForgetStatusFrame on a frame it could not deliver; otherwise one dropped POST
+      // silenced every byte-identical busy for the rest of the turn (~5 min of frozen island).
       const key = JSON.stringify([planned.status, planned.detail, planned.title, planned.model, planned.plan]);
       if (live.lastStatusFrame === key) return null;
       live.lastStatusFrame = key;
@@ -272,6 +290,19 @@ export function ocEndFrames(state: OcState, now: number = Date.now()): OcFrame[]
   return frames;
 }
 
+/** Retract the identical-frame skip key for one session, so the very next `session.status {busy}`
+ *  is sent even though it is byte-identical to the frame we last PLANNED.
+ *
+ *  The sender calls this for any frame it could not deliver. The cache means "the phone already shows
+ *  this"; a POST that timed out, 4xx'd or threw makes that false, and postOcEvent reports failure by
+ *  returning false rather than throwing — so without this retraction one lost POST muted the whole
+ *  remainder of a turn (busy repeats identically until a todo/title/model changes), leaving the island
+ *  frozen for the ~5 minutes until `session.idle`. No-op for a session we no longer track. */
+export function ocForgetStatusFrame(state: OcState, sessionId: string): void {
+  const entry = state.sessions.get(sessionId);
+  if (entry) entry.lastStatusFrame = undefined;
+}
+
 /** The plain needs-attention frame for a session that is blocked on the user but whose prompt is NOT
  *  being held on the phone — the local `no-hold` escape hatch. It is the exact shape the Claude/Codex
  *  hooks' `delegate` produces (runHook's PermissionRequest branch: update / prio 1 / needsAttention),
@@ -323,11 +354,11 @@ function frame(
   }
   // AMBIENT, EXACTLY LIKE TODOS. With `OPENCODE_EXPERIMENTAL_PLAN_MODE` off (the default) a plan turn
   // emits an event stream identical to a build turn — no plan file, no `plan_exit`, no extra events —
-  // and the ONLY thing that differs is this string. So it rides the existing free-text detail seam on
-  // a working frame: no blob key, no iOS change, no `attentionKind`, no status change. Gated to
-  // `working` so a finished row does not claim to still be planning, and yielding to an explicit
-  // detail (a `retry` message) — that is a transient the user needs, and the agent is still there on
-  // the next busy.
+  // and the ONLY thing that differs is this string. So it rides the existing detail seam on a working
+  // frame: no blob key, no iOS change, no `attentionKind`, no status change. Gated to `working` so a
+  // finished row does not claim to still be planning, and yielding to an explicit detail (the
+  // `"retrying"` key) — that is a transient the user needs, and the agent is still there on the next
+  // busy.
   //
   // LOWERCASE, and it is a PINNED CROSS-REPO CONTRACT: the phone maps this through
   // `CCDetailKey.label` (Shared/ClaudeCodeActivity.swift), whose keys are all lowercase —

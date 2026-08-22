@@ -34,7 +34,7 @@ import {
   settleDecisionHoldRecord, stampPermissionDetailFull,
   writeDecisionHold,
 } from "./shared";
-import { b64url, decryptBlob, deriveLanKey, encryptBlob } from "./crypto";
+import { b64url, Bytes, decryptBlob, deriveLanKey, encryptBlob } from "./crypto";
 // The relay's timing/give-up rules, shared verbatim with the Codex relay (codex-remote-input.ts) that
 // polls the SAME route with the same credentials. See decision-poll.ts for what is deliberately NOT
 // shared — the first-contact POST ceiling, which each caller bounds by what IT blocks.
@@ -97,14 +97,37 @@ export { BLOB_FIT_CHARS, NO_HOLD_PATH, sealedBlobChars };
  *  handshake this budget paid for (see POLL_TIMEOUT_MS / createPollBudget).
  *
  *  WORST-CASE PRE-DIALOG BLOCK, stalled network: POST_FIRST_CONTACT_TIMEOUT_MS (6s) +
- *  POLL_FIRST_CONTACT_TIMEOUT_MS (4s did-it-land probe) = 10s, because a TIMEOUT is never retried (see
- *  POST_MAX_ATTEMPTS). A network that fails FAST (connection refused, DNS NXDOMAIN) costs ~0 +
+ *  POLL_FIRST_CONTACT_TIMEOUT_MS (4s did-it-land probe) = 10s, because a TIMEOUT is never retried on a
+ *  hold that blocks a dialog (see HOLD_BLOCKS_DIALOG / POST_MAX_ATTEMPTS). A network that fails FAST
+ *  (connection refused, DNS NXDOMAIN) costs ~0 +
  *  POST_RETRY_PAUSE_MS + ~0 + ~0 ≈ 1s. Both stay at or under the ~10s bar, and both remain a fraction of
  *  the ~33s the old 15s×2 ceiling cost. The fresh-session re-ask (HOLD_RETRY_DELAY_MS + one more short
  *  POST) rides on top of that, but ONLY on the path where the worker already ANSWERED — i.e. it is
  *  reachable, so it is never the dead-network case. Once a hold IS granted the wait becomes unbounded ON
  *  PURPOSE (the phone owns the dialog) and every fetch from there on is a 2s poll GET. */
 export const POST_FIRST_CONTACT_TIMEOUT_MS = 6_000;
+
+/** Does a hold on this agent BLOCK A USER-FACING DIALOG for as long as it runs?
+ *
+ *  This is the property every "how long may first contact cost?" trade in this file is really about,
+ *  and it is NOT the same question as "which agent is this". Claude and Codex run this code as a
+ *  BLOCKING hook process: the hook IS the gate, the terminal dialog does not exist until we exit, and
+ *  every second spent here is a second the user stares at a frozen terminal. OpenCode runs it from a
+ *  RESIDENT plugin's `event` handler, started detached (`void runOcApproval(…)`, see opencode/plugin.ts's
+ *  `hold`), while OpenCode has ALREADY rendered its own prompt in its own UI — nothing waits on us, so
+ *  time spent here costs the user nothing, and giving up early costs them the entire remote path.
+ *
+ *  WHAT IT CHANGES: the initial decision POST's TIMEOUT retry, and only that. See postDecision.
+ *
+ *  DECLARED AS AN EXHAUSTIVE Record<AgentKind, …> ON PURPOSE. The recurring defect in this codebase is
+ *  the `agent === "codex"` branch that silently means "not claude"; a FOURTH agent added to AgentKind
+ *  must fail to COMPILE here rather than inherit whichever behaviour it happened to fall into. */
+export const HOLD_BLOCKS_DIALOG: Record<AgentKind, boolean> = {
+  claude: true,    // PermissionRequest hook — the terminal dialog appears only once this process exits
+  codex: true,     // same blocking-hook contract, same frozen TUI
+  opencode: false, // resident plugin, fired detached; OpenCode's own prompt is already on screen
+};
+
 /** A fresh session's FIRST permission prompt can fire BEFORE the phone app's ~3s poll has added the
  *  session to the worker's island shown-list, so the very first decision POST correctly comes back
  *  {hold:false} (session not shown yet) and the prompt falls open — even though the session lands in
@@ -333,7 +356,7 @@ function answerLine(
   toolInput: Record<string, unknown>,
   answers: unknown,
 ): string | undefined {
-  if (!isAnswerTool(toolName) || !Array.isArray(answers)) return undefined;
+  if (!isAnswerTool(toolName, agent) || !Array.isArray(answers)) return undefined;
   // Zipped against the SAME usable-question list that built `permissionQuestions`, so index i of the
   // phone's array is index i of what the phone was SHOWN — a skipped entry can never shift the mapping.
   // The key is the ORIGINAL, untruncated question text (the blob's copy may be capped).
@@ -533,9 +556,15 @@ export const OPENCODE_QUESTION_TOOL = "question";
  *  answer-injection channel on the hook surface, and folding it in here would change Codex behavior.
  *  The two members are Claude's `AskUserQuestion` and OpenCode's `question`, whose payload shapes
  *  ({question, options:[{label, description}]}) are field-for-field identical — which is why one
- *  code path serves both. */
-function isAnswerTool(toolName: string): boolean {
-  return toolName === "AskUserQuestion" || toolName === OPENCODE_QUESTION_TOOL;
+ *  code path serves both.
+ *
+ *  (name, agent) TOGETHER, exactly like the phone's `CCPermissionQuestion.isOwnQuestionChannel`.
+ *  `question` is an ordinary lowercase word, and OpenCode is the only agent for which it names the
+ *  question CHANNEL: a Claude or Codex MCP server exposing a tool called `question` would otherwise
+ *  have its Allow silently swallowed by the release rule — the user taps Allow and nothing happens. */
+function isAnswerTool(toolName: string, agent: AgentKind): boolean {
+  return toolName === "AskUserQuestion"
+    || (agent === "opencode" && toolName === OPENCODE_QUESTION_TOOL);
 }
 
 /** A concise, human-readable one-liner describing what the tool wants to do — shown on the phone's
@@ -883,7 +912,7 @@ function emitDecision(
   emit: (line: string) => void,
   trace: (event: object) => void,
 ): DecisionOutcome {
-  const isQuestion = isAnswerTool(toolName);
+  const isQuestion = isAnswerTool(toolName, agent);
   switch (answer.decision) {
     case "allow":
       if (isQuestion) { trace({ event: "release", reason: "bare-allow-on-question" }); return "released"; }
@@ -987,7 +1016,7 @@ export function createLoopbackAnswerPoller(
    *  (see the ticker): after that the poller is retired and only the worker poll remains. */
   let wakeResolve: () => void = () => { /* replaced immediately below */ };
   let wake: Promise<void> = new Promise<void>((resolve) => { wakeResolve = resolve; });
-  let keyPromise: Promise<Uint8Array> | undefined;
+  let keyPromise: Promise<Bytes> | undefined;
 
   /** ONE trace line per hold, never per attempt — a dead listener must not spam permission-trace.log. */
   const note = (result: string): void => {
@@ -996,7 +1025,7 @@ export function createLoopbackAnswerPoller(
     try { deps.trace({ event: "lan-poll", result }); } catch { /* diagnostics only */ }
   };
 
-  const key = (): Promise<Uint8Array> => (keyPromise ??= deriveLanKey(config.e2eKey, config.pairingId));
+  const key = (): Promise<Bytes> => (keyPromise ??= deriveLanKey(config.e2eKey, config.pairingId));
 
   const readPort = async (): Promise<number | undefined> => {
     if (deps.statePath === undefined) return undefined;
@@ -1141,7 +1170,7 @@ function defaultWriteHold(): (sessionId: string, hold: DecisionHold) => Promise<
 }
 
 function defaultClearHold(): (
-  sessionId: string, pid: number, beforeUnlink?: () => Promise<void>,
+  sessionId: string, pid: number, beforeUnlink?: () => Promise<void>, holdId?: string,
 ) => Promise<boolean> {
   return lanRunningUnderTest()
     // The test stand-in still RUNS the settle callback (which is itself a no-op under `bun test`, see
@@ -1181,7 +1210,7 @@ export interface PermissionHookDeps {
   /** Retires the marker, and answers whether this process actually OWNED it. `beforeUnlink` — the record
    *  settle below — runs only when it did, and always BEFORE the unlink (see clearDecisionHoldAt). */
   clearHoldFn?: (
-    sessionId: string, pid: number, beforeUnlink?: () => Promise<void>,
+    sessionId: string, pid: number, beforeUnlink?: () => Promise<void>, holdId?: string,
   ) => Promise<boolean>;
   /** Moves the SESSION RECORD out of the state the hold overlaid, on the way out (field reports R2/R3 —
    *  see settleDecisionHoldRecordAt). Defaults to the real record patcher in production and to a NO-OP
@@ -1191,6 +1220,11 @@ export interface PermissionHookDeps {
   /** The pid stamped as the hold's OWNER (defaults to this process). Injected so a test can drive the
    *  compare-and-clear rule without spawning processes. */
   holdPid?: number;
+  /** OPTIONAL per-hold discriminator stamped alongside `holdPid`, for a caller whose concurrent holds
+   *  all run in ONE process (OpenCode's resident plugin passes its decision id here). Absent for the
+   *  Claude/Codex hooks — one hold per short-lived process, so the pid IS the discriminator and their
+   *  marker keeps its exact byte shape. See DecisionHold.holdId. */
+  holdId?: string;
   /** Resolve Codex's effective per-turn approval policy from its rollout. Tests inject this so no
    *  local Codex state is touched; Claude never calls it. */
   loadCodexTurnPolicyFn?: (
@@ -1443,10 +1477,25 @@ export async function runPermissionHook(
     const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
 
     // The initial POST is the one place this hook is ALLOWED to block, and it is bounded tightly (see
-    // POST_FIRST_CONTACT_TIMEOUT_MS for the worst-case pre-dialog arithmetic). One retry, and ONLY after a
-    // FAST transport failure — a timeout ends the round at once. A non-ok HTTP status is a real answer and
-    // is never retried. `round` (1 = initial, 2 = post-race re-ask) is threaded through the trace alongside
-    // `attempt` (the per-round transport retry) so both rounds are legible in the log.
+    // POST_FIRST_CONTACT_TIMEOUT_MS for the worst-case pre-dialog arithmetic). One retry after a FAST
+    // transport failure; a non-ok HTTP status is a real answer and is never retried. `round` (1 =
+    // initial, 2 = post-race re-ask) is threaded through the trace alongside `attempt` (the per-round
+    // transport retry) so both rounds are legible in the log.
+    //
+    // A TIMEOUT is the one case that depends on WHAT THIS HOLD BLOCKS (HOLD_BLOCKS_DIALOG):
+    //
+    //   BLOCKING (claude, codex) — the terminal dialog is frozen behind us, so a second stall buys no
+    //   new information and doubles the freeze for the same answer. The round ends at once.
+    //     worst case: POST 6s + probe 4s = 10s to the dialog.
+    //
+    //   NON-BLOCKING (opencode) — OpenCode's own prompt is already up and nothing waits on us, so a
+    //   timeout costs the user NOTHING while giving up costs them the whole remote path. Field trace
+    //   2026-08-19, ses_fe0d…: one `TimeoutError` on round 1 attempt 1 (4 in that log's entire history —
+    //   a blip, not a break) and the session's remote answer path was gone; the user tapped Allow into a
+    //   void. So retry, on the SAME POST_MAX_ATTEMPTS ceiling every other failure mode uses.
+    //     worst case: POST 6s + pause 1s + POST 6s + probe 4s = 17s before the hold either exists or is
+    //     abandoned — all of it off the user's clock, and still bounded by POST_MAX_ATTEMPTS (2).
+    //   The round-2 re-ask is called with maxAttempts 1, so this can never compound across rounds.
     //
     // FRESH `ts` PER ATTEMPT. Every POST must carry a STRICTLY NEWER timestamp than the last one this hook
     // sent. The hold:false path is not a no-op server-side: the worker stores/pushes the fallback frame,
@@ -1493,9 +1542,10 @@ export async function runPermissionHook(
         } catch (e) {
           const name = (e as { name?: string })?.name ?? "Error";
           trace({ event: "posted", requestId, round, attempt, status: 0, ts, error: name });
-          // A TIMEOUT means the network is stalled: retrying only doubles the terminal freeze for the
-          // same answer. Anything else failed FAST, so one cheap retry is worth it.
-          if (name === "TimeoutError") break;
+          // A TIMEOUT means the network is stalled. Where a dialog is frozen behind us, retrying only
+          // doubles that freeze for the same answer; where nothing is, the retry is free and the hold
+          // is what is at stake. Anything else failed FAST, so one cheap retry is always worth it.
+          if (name === "TimeoutError" && HOLD_BLOCKS_DIALOG[agent]) break;
           if (attempt < maxAttempts) { await sleep(POST_RETRY_PAUSE_MS); continue; }
         }
       }
@@ -1673,7 +1723,9 @@ export async function runPermissionHook(
       ));
     } catch { /* the card without its breadcrumb is still the card */ }
     await (deps.writeHoldFn ?? defaultWriteHold())(
-      sessionId, { blob: holdBlob, at: holdAt, pid: holdPid },
+      // `holdId` is APPEND-LAST and omitted unless the caller supplied one, so the hook agents' marker
+      // stays byte-for-byte what it was; see DecisionHold.holdId for who needs it and why.
+      sessionId, { blob: holdBlob, at: holdAt, pid: holdPid, ...(deps.holdId ? { holdId: deps.holdId } : {}) },
     );
     heldSessionId = sessionId;
 
@@ -1867,7 +1919,9 @@ export async function runPermissionHook(
     if (heldSessionId !== undefined) {
       try {
         await (deps.clearHoldFn ?? defaultClearHold())(
-          heldSessionId, deps.holdPid ?? process.pid, settleHeldRecord,
+          // `holdId` (undefined for the hook agents) is what keeps a sibling hold running in the SAME
+          // process from being cleared by ours — the pid compare cannot tell those two apart.
+          heldSessionId, deps.holdPid ?? process.pid, settleHeldRecord, deps.holdId,
         );
       } catch { /* best-effort */ }
     }

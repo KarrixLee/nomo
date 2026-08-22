@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { b64url, decryptBlob } from "../core/crypto";
-import { folderKeyFromCwd } from "../core/shared";
+import { folderKeyFromCwd, PLAN_BLOB_TEXT_MAX_CHARS, PLAN_BLOB_TRUNCATION_MARKER } from "../core/shared";
 import { createProcessHygiene, isolatedTestEnv } from "../test/process-hygiene";
 import { notifyFallbackTitle, synthStopInput } from "./codex-notify";
 
@@ -205,6 +205,36 @@ describe("runNotify E2E (argv payload, dedupe against a sent Stop)", () => {
     });
     expect(record?.donePending).toBeUndefined();
     expect(blob).toMatchObject({ status: "needsAttention", agent: "codex", plan: "Implement it." });
+  }, 20000);
+
+  // REGRESSION (typecheck spike, 2026-08): notify used to read the picker through a ternary that fell
+  // back to the STATE-ONLY probe — a shape with no `plan` at all. The fallback could never run (this is
+  // the codex adapter, which implements the richer evidence probe), but nothing said so, and had it run
+  // the turn would still have been classified `needsAttention` correctly while `proposedPlan` silently
+  // went undefined: the phone would show a picker frame with no plan text and no full-plan to pull.
+  // Both halves of that affordance are asserted here, on a plan long enough to prove the tee.
+  test("a long picker plan reaches the phone BOTH ways: fitted into the blob, unabridged on the record", async () => {
+    const seed = {
+      pid: process.pid, machine: "mac", label: "proj", ts: 111, transcript: "",
+      lastEvent: "working", sentDone: false, op: "update", prio: 0, blob: "OLD", agent: "codex",
+    };
+    const plan = `# Plan\n\n${"x".repeat(5000)}`;
+    const finalPlan = JSON.stringify({
+      type: "response_item",
+      payload: {
+        type: "message", role: "assistant", phase: "final_answer",
+        content: [{ type: "output_text", text: `<proposed_plan>\n${plan}\n</proposed_plan>` }],
+      },
+    });
+    const complete = JSON.stringify({ type: "event_msg", payload: { type: "task_complete" } });
+    const { record, blob } = await runNotifyEntry(payload, { seedRecord: seed, rolloutTail: `${finalPlan}\n${complete}\n` });
+    expect(record).toMatchObject({ op: "update", prio: 1, pendingPlanPicker: true });
+    // The blob carries a CUT copy (the sealed-frame ceiling)…
+    const fitted = blob?.plan as string;
+    expect(fitted.endsWith(PLAN_BLOB_TRUNCATION_MARKER)).toBe(true);
+    expect(Array.from(fitted).length).toBe(PLAN_BLOB_TEXT_MAX_CHARS);
+    // …and the record keeps the whole thing, which is what the LAN `read` / remote full-text pull serves.
+    expect(record?.planFull).toBe(plan);
   }, 20000);
 
   test("wrapper durable but task_complete absent → working verification marker, never plain done", async () => {

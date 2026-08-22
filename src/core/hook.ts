@@ -20,7 +20,7 @@
 import { readdir, readFile, unlink } from "node:fs/promises";
 import { hostname } from "node:os";
 import { basename } from "node:path";
-import { encryptBlob } from "./crypto";
+import { Bytes, encryptBlob } from "./crypto";
 import {
   adapterFor, claudeToolDetail, codexToolDetail, findProvisionalForPid, requestUserInputDetail,
   SessionCreationSuppression, TrackedSessionLite,
@@ -270,7 +270,7 @@ export function buildBlob(input: Record<string, unknown>, machine: string, title
  *  narrow and backward-compatible: ONLY Codex's request_user_input carries `"userInput"`, allowing the
  *  worker to distinguish a Plan question from an ordinary permission decision without reading `blob`. */
 export async function buildEnvelope(
-  input: unknown, machine: string, now: number, title: string | undefined, e2eKey: Uint8Array, sentDone: boolean,
+  input: unknown, machine: string, now: number, title: string | undefined, e2eKey: Bytes, sentDone: boolean,
   agent: AgentKind = "claude", startedAt?: number, turnStartedAt?: number,
   /** The session record (or, for positional callers predating the folder key, just its label) — the
    *  FIRST-SEEN folder identity buildBlob pins `label`, `folderKey` and the branch's source paths to. */

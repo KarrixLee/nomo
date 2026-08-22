@@ -1,0 +1,27 @@
+{
+  // Typecheck only. `bun build.ts` owns the build — nothing here may emit.
+  "compilerOptions": {
+    "noEmit": true,
+
+    // Runtime floor is Node >=18 (package.json engines) and Bun. ES2022 is the
+    // newest target Node 18 fully implements; anything the code uses beyond it
+    // (toSorted, Object.groupBy, ...) should surface as an error, not be waved through.
+    "target": "ES2022",
+    "lib": ["ES2022"],
+
+    // ESM ("type": "module"), bundled by Bun, so imports stay extensionless.
+    "module": "preserve",
+    "moduleResolution": "bundler",
+    "moduleDetection": "force",
+    "resolveJsonModule": true,
+
+    // Bun globals + bun:test + node: builtins (@types/bun re-exports @types/node).
+    "types": ["bun"],
+
+    "strict": true,
+    "skipLibCheck": true,
+    "esModuleInterop": true,
+    "forceConsistentCasingInFileNames": true
+  },
+  "include": ["src/**/*.ts"]
+}

@@ -142,9 +142,12 @@ export async function runNotify(raw: string, deferMs = notifyDeferMs(), sleep: (
     // rollout; with no record this remains best-effort through the notify process's pid locator.
     const sessionPid = typeof record?.pid === "number" && Number.isFinite(record.pid) ? record.pid : process.ppid;
     const transcriptPath = typeof record?.transcript === "string" ? record.transcript : "";
-    const evidence = codexAdapter.completedTurnWaitEvidence
-      ? await codexAdapter.completedTurnWaitEvidence({ pid: sessionPid, transcriptPath })
-      : { state: await codexAdapter.completedTurnWaitState?.({ pid: sessionPid, transcriptPath }) };
+    // EVIDENCE, never bare state: `state` alone decides needsAttention-vs-done, but only the evidence
+    // carries the picker's `plan` text, and that is what becomes the phone's pull-the-full-plan
+    // affordance below. This used to fall back to `completedTurnWaitState?.()` when the richer probe
+    // "was missing" — a branch that can never run (this is the codex adapter, which implements both)
+    // and that silently dropped `proposedPlan` if it ever did.
+    const evidence = await codexAdapter.completedTurnWaitEvidence({ pid: sessionPid, transcriptPath });
     const wait = evidence.state;
     const pendingPlanPicker = wait === "pending";
     const planPickerVerificationPending = wait === "incomplete";

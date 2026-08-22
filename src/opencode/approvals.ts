@@ -353,6 +353,13 @@ export async function runOcApproval(request: OcDecisionRequest, o: OcApprovalOpt
       loadConfigFn: async () => o.config,
       emit: (l) => { line = l; },
       randomUUID: () => o.requestId,
+      // EVERY OpenCode hold shares the resident server's pid, so the `.hold` marker's compare-and-clear
+      // needs a per-hold discriminator: without one, the first of two concurrent holds in a session to
+      // settle passed the pid compare against the SECOND's marker, unlinked it and re-sealed the record
+      // to working — taking down a live Allow/Deny card and masking its decisionPending. The decision id
+      // is already unique per hold (the caller mints it), so it IS the discriminator. The hook agents
+      // pass none and keep the pid-only rule they always had. See DecisionHold.holdId.
+      holdId: o.requestId,
       trace,
       fetchFn: o.fetchFn,
       delegate: o.delegate,

@@ -1,0 +1,13 @@
+{
+  // The npm bootstrapper ships unbundled and hand-written — checked on its own so its
+  // JS-only diagnostics never mix into the src/ number. `bun tsc -p tsconfig.bin.json`.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "allowJs": true,
+    "checkJs": true,
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+    "types": ["node"]
+  },
+  "include": ["bin/**/*.mjs"]
+}

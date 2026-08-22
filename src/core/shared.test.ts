@@ -336,6 +336,35 @@ describe("ensureWatchdog (spawn gate: recycled pids and stale builds must not bl
     });
   });
 
+  // The RESIDENT (OpenCode) plugin calls this on every frame, and the check is a ~341 KB hash plus a
+  // `ps` fork on OpenCode's own event loop. It may cache the answer — but only a POSITIVE one, or a
+  // daemon that died mid-session would never be respawned. So the verdict has to be reported.
+  describe("the return value: only a CONFIRMED-live watchdog is cacheable", () => {
+    const seams = (over: Parameters<typeof ensureWatchdog>[0] = {}) => ({
+      readPidfile: () => "777 1.4.4",
+      isAlive: () => true,
+      commandOf: () => WATCHDOG_CMD,
+      killPid: () => {},
+      spawnWatchdog: () => {},
+      version: "1.4.4",
+      ...over,
+    });
+
+    test("a live watchdog this build accepts → true (nothing was done)", () => {
+      expect(ensureWatchdog(seams())).toBe(true);
+      // A NEWER peer owns the daemon: also nothing to do, also cacheable.
+      expect(ensureWatchdog(seams({ readPidfile: () => "777 2.3.0" }))).toBe(true);
+    });
+
+    test("every other outcome is false — a spawn is not a confirmation", () => {
+      expect(ensureWatchdog(seams({ readPidfile: () => undefined }))).toBe(false); // spawned fresh
+      expect(ensureWatchdog(seams({ isAlive: () => false }))).toBe(false);         // dead pid → spawned
+      expect(ensureWatchdog(seams({ readPidfile: () => "777 1.4.3" }))).toBe(false); // takeover
+      expect(ensureWatchdog(seams({ commandOf: () => "/usr/sbin/cupsd" }))).toBe(false); // recycled pid
+      expect(ensureWatchdog(seams({ readPidfile: () => { throw new Error("EIO"); } }))).toBe(false);
+    });
+  });
+
   test("the pidfile carries the build as a THIRD field, and stays parseInt-compatible", () => {
     expect(formatWatchdogPidfile(777, "1.4.4", "abc")).toBe("777 1.4.4 abc");
     expect(Number.parseInt(formatWatchdogPidfile(777, "1.4.4", "abc"), 10)).toBe(777);
@@ -465,8 +494,13 @@ describe("startCodexAppServerDaemon (bounded, non-interactive, never-throwing)",
     const listeners = new Map<string, (...args: unknown[]) => void>();
     const kills: string[] = [];
     const handle = {
-      on(event: string, listener: (...args: unknown[]) => void) { listeners.set(event, listener); return handle; },
-      kill(signal?: string) { kills.push(signal ?? "SIGTERM"); return true; },
+      // `never[]` args is what makes ONE signature stand in for spawnFn's two typed `on` overloads
+      // (parameter positions are contravariant); the fake itself is event-agnostic, hence the store cast.
+      on(event: string, listener: (...args: never[]) => void) {
+        listeners.set(event, listener as (...args: unknown[]) => void);
+        return handle;
+      },
+      kill(signal?: NodeJS.Signals | number) { kills.push(String(signal ?? "SIGTERM")); return true; },
     };
     queueMicrotask(() => script((event, ...args) => listeners.get(event)?.(...args)));
     return { handle, kills };
@@ -709,6 +743,30 @@ describe("the remote-approval hold marker (the LAN channel's decision-pending gu
       expect(await readDecisionHoldAt(d, "s1")).toMatchObject({ pid: 777 });
       expect(await clearDecisionHoldAt(d, "s1", 777)).toBe(true);   // B's exit — the owner
       expect(await readDecisionHoldAt(d, "s1")).toBeNull();
+    } finally {
+      await rm(d, { recursive: true, force: true });
+    }
+  });
+
+  // OpenCode runs EVERY hold inside one resident server, so both concurrent holds carry the same pid
+  // and the pid compare alone cannot tell them apart: hold A's exit unlinked hold B's marker and
+  // re-sealed the record to working, taking down a card the user was still looking at.
+  test("same-pid concurrent holds are told apart by holdId, and the hook agents keep the pid rule", async () => {
+    const d = await dir();
+    try {
+      await writeDecisionHoldAt(d, "s1", { blob: "card-b", at: 2, pid: 777, holdId: "req-b" });
+      // A's exit: same process, DIFFERENT decision → not ours to clear.
+      expect(await clearDecisionHoldAt(d, "s1", 777, undefined, "req-a")).toBe(false);
+      expect(await readDecisionHoldAt(d, "s1")).toMatchObject({ pid: 777, holdId: "req-b" });
+      expect(await clearDecisionHoldAt(d, "s1", 777, undefined, "req-b")).toBe(true);
+      expect(await readDecisionHoldAt(d, "s1")).toBeNull();
+
+      // A marker with NO holdId (every Claude/Codex hold) is unchanged by the new rule, whether or not
+      // the caller has one — one hold per short-lived process, so the pid IS the discriminator.
+      await writeDecisionHoldAt(d, "s1", { blob: "card-a", at: 2, pid: 777 });
+      expect(await readDecisionHoldAt(d, "s1")).toEqual({ blob: "card-a", at: 2, pid: 777 });
+      expect(await clearDecisionHoldAt(d, "s1", 4242, undefined, "req-a")).toBe(false);
+      expect(await clearDecisionHoldAt(d, "s1", 777)).toBe(true);
     } finally {
       await rm(d, { recursive: true, force: true });
     }

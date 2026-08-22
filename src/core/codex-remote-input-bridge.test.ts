@@ -22,7 +22,7 @@ const config = {
   pairingId: "pair-1",
   pcSecret: "pc-secret",
   appSecret: "app-secret",
-  e2eKey: "e2e-key",
+  e2eKey: new Uint8Array(32).fill(7), // never used by these tests, but it must BE a key
 } as Config;
 
 const request: CodexUserInputRequest = {

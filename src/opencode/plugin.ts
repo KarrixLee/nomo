@@ -23,14 +23,15 @@ import { accessSync, constants, readFileSync } from "node:fs";
 import { hostname } from "node:os";
 import { buildEnvelope, markDoneDelivered, trackSession } from "../core/hook";
 import {
-  CC_DIR, Config, ensureWatchdog, folderIdentity, FolderIdentity, fullTextForRecord, loadConfig,
-  postFullText, SessionOrigin, WATCHDOG_PATH,
+  atomicWrite, CC_DIR, Config, ensureWatchdog, folderIdentity, FolderIdentity, fullTextForRecord,
+  lastHookPath, loadConfig, postFullText, SessionOrigin, WATCHDOG_PATH,
 } from "../core/shared";
 import {
   ocDecisionRequest, OcDecisionRequest, ocPost, ocResolvedRequestId, ocResolveOnRelay, runOcApproval,
 } from "./approvals";
 import {
-  newOcState, ocAttentionFrame, ocEndFrames, OcFrame, OcState, postOcEvent, reduceOcEvent,
+  newOcState, ocAttentionFrame, ocEndFrames, ocForgetStatusFrame, OcFrame, OcState, postOcEvent,
+  reduceOcEvent,
 } from "./state";
 
 /** The verified-live shape of OpenCode's `PluginInput` (1.18.15). Declared structurally rather than
@@ -87,6 +88,23 @@ function spawnWatchdog(): void {
   spawn(runtime, [WATCHDOG_PATH], { detached: true, stdio: "ignore" }).unref();
 }
 
+/** How long a CONFIRMED-live watchdog is taken on trust before we look again. A hook pays the check
+ *  once per process; this plugin is RESIDENT and calls it on every frame, and the check is not cheap —
+ *  it hashes the whole ~341 KB watchdog bundle and forks a `ps` — all of it on the thread OpenCode
+ *  runs its own server on. A minute of trust turns steady-state frames into no syscalls at all while
+ *  still re-verifying often enough that a daemon killed mid-session is respawned long before the
+ *  worker's one-hour eviction would matter. */
+const WATCHDOG_TRUST_MS = 60_000;
+/** When that trust expires. Only a POSITIVE verdict extends it (ensureWatchdog's return): a spawn, a
+ *  failure, or the test opt-out leaves it in the past, so the very next frame checks again. */
+let watchdogTrustedUntil = 0;
+
+/** The resident twin of a hook's bare `ensureWatchdog()` call — same guarantee, TTL'd. */
+function ensureWatchdogCached(now: number): void {
+  if (now < watchdogTrustedUntil) return;
+  watchdogTrustedUntil = ensureWatchdog({ spawnWatchdog }) ? now + WATCHDOG_TRUST_MS : 0;
+}
+
 interface OcContext {
   config: Config;
   machine: string;
@@ -118,13 +136,23 @@ async function send(ctx: OcContext, frame: OcFrame): Promise<void> {
     { op: frame.op, prio: frame.prio, status: frame.status },
     undefined, frame.plan, undefined, (plain) => { fittedPlan = plain.plan; }, frame.detail,
   );
-  if (!envelope) return;
-  const planFull = fullTextForRecord(frame.plan, fittedPlan);
+  // An unsealable frame reaches the phone exactly as little as a failed POST does — retract the skip
+  // key for the same reason (see ocForgetStatusFrame).
+  if (!envelope) { ocForgetStatusFrame(ctx.state, frame.sessionId); return; }
+  /** The WHOLE todo list, capped, parked on the session record — even when it fitted the blob whole.
+   *  This is the only copy of an OpenCode plan any REBUILT frame has: a watchdog corrective or a LAN
+   *  record-terminal frame re-seals a fresh plaintext from the record and would otherwise ship the row
+   *  with no plan at all until the next plugin-authored frame (see the adapter's `ambientPlan`). It
+   *  also serves the LAN `read` op, which simply returns the same text the blob already carries when
+   *  nothing was cut. */
+  const planFull = fullTextForRecord(frame.plan, undefined);
   // Started BEFORE the event POST and awaited after, exactly like the permission hold's own upload: a
-  // parked list must never sit in front of the frame that puts the row on the phone. Undefined content
-  // (the overwhelmingly common case — a real todo list maxes at ~972 chars against an 1800 budget) is a
-  // no-op inside postFullText: no upload, no KV write.
-  const fullUpload = postFullText(ctx.config, frame.sessionId, "plan", planFull);
+  // parked list must never sit in front of the frame that puts the row on the phone. The UPLOAD is
+  // still gated on something actually having been CUT (`fullTextForRecord` against the fitted copy →
+  // undefined when the blob already carries the whole list), which is the overwhelmingly common case —
+  // a real todo list maxes at ~972 chars against an 1800 budget — and is a no-op inside postFullText:
+  // no upload, no KV write.
+  const fullUpload = postFullText(ctx.config, frame.sessionId, "plan", fullTextForRecord(frame.plan, fittedPlan));
   await trackSession(
     frame.sessionId, frame.op, frame.prio, frame.status, envelope.blob as string | undefined,
     ctx.machine, ctx.folder,
@@ -132,9 +160,17 @@ async function send(ctx: OcContext, frame: OcFrame): Promise<void> {
     "opencode", frame.startedAt, frame.turnStartedAt, undefined, frame.title, ctx.config.pairingId,
     frame.model, false, process.pid, ctx.origin, false, undefined, undefined, planFull,
   );
-  ensureWatchdog({ spawnWatchdog });
+  ensureWatchdogCached(now);
+  // Liveness stamp — the OpenCode twin of the one runHook writes for Claude/Codex (core/hook.ts). It
+  // is the ONLY on-disk proof this resident plugin is loaded and producing frames: OpenCode has no
+  // hooks to count and no transcript directory to date, so without it `nomo status` cannot tell "the
+  // plugin is running, you just haven't started a turn" from "the plugin never loaded". Best-effort
+  // and swallowed, like every other write on this path — the editor must never see it fail.
+  await atomicWrite(lastHookPath("opencode"), String(now)).catch(() => {});
   const delivered = await postOcEvent(ctx.config, envelope);
   if (delivered && frame.op === "done") await markDoneDelivered(frame.sessionId);
+  // NOT delivered → the phone never saw this frame, so the reducer must stop believing it did.
+  if (!delivered) ocForgetStatusFrame(ctx.state, frame.sessionId);
   await fullUpload;
 }
 

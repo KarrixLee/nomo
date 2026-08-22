@@ -49,7 +49,7 @@ import { watch } from "node:fs";
 import { readdir, readFile } from "node:fs/promises";
 import { basename } from "node:path";
 import { promisify } from "node:util";
-import { encryptBlob } from "./crypto";
+import { Bytes, encryptBlob } from "./crypto";
 import { LAN_SESSION_ID_RE, lanRunningUnderTest } from "./lan-wire";
 import type { LanReadWhat } from "./lan-wire";
 import { computeSessionState, parseCcSessionFile } from "./session-state";
@@ -310,7 +310,7 @@ export interface LanFrameStore {
    *  `config.e2eKey` since pairing. Hook-authored blobs still ride verbatim and are never opened here —
    *  the key exists only to SEAL the plaintexts the Mac itself authored. Nothing new crosses the worker,
    *  because nothing here crosses the worker at all. */
-  setPairing(pairingId: string | undefined, e2eKey?: Uint8Array): void;
+  setPairing(pairingId: string | undefined, e2eKey?: Bytes): void;
   /** The UNABRIDGED plan / permission detail for ONE session (the `read` op, phase 4), or null when
    *  there is nothing honest to serve.
    *
@@ -374,7 +374,7 @@ interface Waiter {
 /** Are these the same pairing key? Both absent counts as same (an unpaired feed stays unpaired). Plain
  *  byte compare — 32 bytes, once per sweep; nothing here is a secret-comparison timing surface (the
  *  caller already holds both). */
-function sameKey(a: Uint8Array | undefined, b: Uint8Array | undefined): boolean {
+function sameKey(a: Bytes | undefined, b: Bytes | undefined): boolean {
   if (a === b) return true;
   if (!a || !b || a.length !== b.length) return false;
   for (let i = 0; i < a.length; i += 1) {
@@ -459,7 +459,7 @@ export function createLanFrameStore(deps: LanFrameStoreDeps = {}): LanFrameStore
    *  `complete` — and why a phone whose stale-high cursor gets coerced to 0 is too. */
   let completeFromSeq = 0;
   let pairingId: string | undefined;
-  let e2eKey: Uint8Array | undefined;
+  let e2eKey: Bytes | undefined;
   let stopped = false;
   let watcher: LanFramesWatcher | null = null;
   let ccWatcher: LanFramesWatcher | null = null;
@@ -882,7 +882,7 @@ export function createLanFrameStore(deps: LanFrameStoreDeps = {}): LanFrameStore
       await park(stateWaiters, waitMs);
       return store.states(sinceSeq);
     },
-    setPairing(next: string | undefined, key?: Uint8Array): void {
+    setPairing(next: string | undefined, key?: Bytes): void {
       // The KEY is compared too, not just the id: a re-pair can in principle keep the pairing id while
       // ROTATING the key, and a stale key would seal Mac-authored plaintexts nothing can open. LEARNING a
       // key we did not have is not a rotation, though — every cached blob is the HOOK's, already sealed

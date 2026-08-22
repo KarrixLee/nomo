@@ -1,12 +1,12 @@
 import { describe, expect, test } from "bun:test";
 import { deriveCodeIkm, formatCodeString, randomCodeWords, uniformIndex } from "./pair-code";
-import { deriveE2EKey } from "./crypto";
+import { Bytes, deriveE2EKey } from "./crypto";
 import { BIP39_WORDLIST } from "./wordlist";
 
 function hex(bytes: Uint8Array): string {
   return Array.from(bytes).map((b) => b.toString(16).padStart(2, "0")).join("");
 }
-function fromHex(s: string): Uint8Array {
+function fromHex(s: string): Bytes {
   const out = new Uint8Array(s.length / 2);
   for (let i = 0; i < out.length; i++) out[i] = parseInt(s.slice(i * 2, i * 2 + 2), 16);
   return out;

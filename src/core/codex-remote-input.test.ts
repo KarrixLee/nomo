@@ -511,7 +511,7 @@ describe("startCodexRemoteInput", () => {
       let fetched = false;
       const handle = startCodexRemoteInput(request({ questions }), {
         config,
-        fetchFn: (async () => { fetched = true; return Response.json({}); }) as typeof fetch,
+        fetchFn: (async () => { fetched = true; return Response.json({}); }) as unknown as typeof fetch,
         readRecordFn: async () => record,
         randomUUID: () => "relay-2",
         answerAppServer: async () => "sent",
@@ -698,7 +698,7 @@ describe("startCodexRemoteInput", () => {
     let fetched = false;
     const handle = startCodexRemoteInput(request(), {
       config,
-      fetchFn: (async () => { fetched = true; return Response.json({ hold: true }); }) as typeof fetch,
+      fetchFn: (async () => { fetched = true; return Response.json({ hold: true }); }) as unknown as typeof fetch,
       readRecordFn: async () => { throw new Error("session store is corrupt"); },
       randomUUID: () => "relay-throw",
       localApprovalsStateFn: async () => "on",

@@ -112,7 +112,7 @@
 import { createServer } from "node:http";
 import { readFile } from "node:fs/promises";
 import { networkInterfaces } from "node:os";
-import { b64url, decryptBlob, deriveLanKey, encryptBlob } from "./crypto";
+import { b64url, Bytes, decryptBlob, deriveLanKey, encryptBlob } from "./crypto";
 import { createLanFrameStore } from "./lan-frames";
 import type { LanFrameStore } from "./lan-frames";
 import { rememberBounded } from "./bounded-set";
@@ -460,7 +460,7 @@ export function createLanListener(deps: LanListenerDeps = {}): LanListener {
    *  decrypt (there is no key) and gets the same opaque 400 as a wrong-key probe. */
   let config: Config | null = null;
   /** K_lan for `config`, as a promise so a request never races the derivation. */
-  let keyPromise: Promise<Uint8Array | null> = Promise.resolve(null);
+  let keyPromise: Promise<Bytes | null> = Promise.resolve(null);
   /** Memo of what keyPromise was derived from — pairingId AND the key bytes, because a re-pair can in
    *  principle keep the id while rotating the key, and a stale K_lan would silently 400 everything. */
   let keyMemo: string | undefined;
@@ -857,7 +857,7 @@ export interface LanHintPublisher {
 /** Seal the hint, trimming the host list until it fits the ceiling. Returns undefined when even a
  *  single-host hint does not fit (impossible in practice; a hint is ~150 bytes). */
 async function sealHint(
-  key: Uint8Array,
+  key: Bytes,
   hosts: string[],
   port: number,
   lid: string,

@@ -366,7 +366,11 @@ export function buildStatePlaintext(
       by: "wd",
     })
     : undefined;
-  return appendFittedPlanAndDebug(base, undefined, dbg);
+  // The record's parked plan, but ONLY for an agent whose plan is AMBIENT session state (OpenCode's
+  // live todo list). A Claude/Codex `planFull` belongs to one attention episode, so restating it here
+  // would put a stale proposal on a working/done row — every non-ambient agent keeps the
+  // byte-identical `undefined` this has always passed. See AgentAdapter.ambientPlan.
+  return appendFittedPlanAndDebug(base, adapterFor(agent).ambientPlan ? record.planFull : undefined, dbg);
 }
 
 /** Is this `.hold` marker LIVE? Marker present with a blob, holder pid alive, inside the TTL.

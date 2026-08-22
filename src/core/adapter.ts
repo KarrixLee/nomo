@@ -1810,7 +1810,13 @@ export interface TrackedSessionLite {
   sessionId: string;
   pid?: number;
   provisional?: boolean;
-  agent?: AgentKind;
+  /** WIRE-typed (see AgentKindWire): this is `SessionRecord.agent` read straight off disk, and a peer
+   *  install one version ahead stamps literals this build has never heard of. Each reader below names
+   *  the ONE kind it wants — the ghost check requires "codex", the `/clear` check requires claude (the
+   *  absent key, per the wire discipline) — so an unknown agent is correctly neither a codex ghost's
+   *  owner nor a claude `/clear` predecessor. Narrowing it to AgentKind would have been a claim the
+   *  file's own source (JSON.parse of an untrusted record) cannot make. */
+  agent?: AgentKindWire;
   ts?: number;
 }
 
@@ -1824,14 +1830,20 @@ export interface SessionCreationSuppression {
 
 /** The most recent Claude record on the SAME process is the predecessor of a `SessionStart` whose
  *  source is `clear`. Claude keeps the TUI process alive across `/clear`, changes only the session id,
- *  and emits no SessionEnd for the old id. Codex records and provisional discovery rows are excluded;
- *  newest `ts` wins if an earlier bug already left more than one stale record on the pid. */
+ *  and emits no SessionEnd for the old id. Provisional discovery rows and every NON-Claude record are
+ *  excluded; newest `ts` wins if an earlier bug already left more than one stale record on the pid.
+ *
+ *  CLAUDE-ONLY, positively: a missing `agent` key means claude (the wire discipline hook.ts writes), so
+ *  the test is `(t.agent ?? "claude") === "claude"`. It used to be `!== "codex"`, which was the same
+ *  thing only while claude and codex were the only kinds — it silently adopted an OpenCode row (and
+ *  every future kind, and any literal a newer peer install stamps) as a Claude `/clear` predecessor and
+ *  would have retired someone else's live session. */
 export function claudeClearPredecessor(
   sessionId: string, hookPid: number, tracked: TrackedSessionLite[],
 ): string | undefined {
   return tracked
     .filter((t) =>
-      t.sessionId !== sessionId && t.provisional !== true && t.agent !== "codex" &&
+      t.sessionId !== sessionId && t.provisional !== true && (t.agent ?? "claude") === "claude" &&
       typeof t.pid === "number" && Number.isFinite(t.pid) && t.pid === hookPid)
     .sort((a, b) => (b.ts ?? 0) - (a.ts ?? 0))[0]?.sessionId;
 }
@@ -2145,6 +2157,16 @@ export interface AgentAdapter {
    *  spreads cleanly into both a blob object and a SessionRecord (whose `agent` follows the same
    *  omit-for-claude convention). */
   blobAgentFields: { agent?: AgentKindWire };
+  /** OPTIONAL: is this agent's blob `plan` AMBIENT SESSION STATE rather than a one-shot proposal?
+   *
+   *  OpenCode's plan is its live todo list: it is restated by EVERY frame the resident plugin sends
+   *  and is the phone's plan link for the whole session. Claude's and Codex's are the opposite — an
+   *  ExitPlanMode / update_plan proposal that belongs to ONE attention episode, which is why their
+   *  correctives deliberately carry no plan (only buildNeedsAttentionEnvelope takes an explicit
+   *  `proposedPlan`). So the rebuild sites — the watchdog's done/working correctives and
+   *  session-state's LAN rollup — restate `record.planFull` only for an agent that declares this, and
+   *  every Claude/Codex frame stays byte-identical to what it was. Absent = one-shot (the default). */
+  ambientPlan?: true;
   /** OPTIONAL: discover live sessions the hooks can't see yet — interactive TUIs for which NO
    *  SessionStart has fired. Called on every watchdog sweep with the already-tracked sessions (so their
    *  pids can be excluded). Claude OMITS it (its SessionStart fires at true session open, so there's
@@ -2232,7 +2254,7 @@ export const claudeAdapter: AgentAdapter = {
   sessionsDir: () => `${process.env.HOME}/.claude/projects`,
   sessionMatch: (name: string) => name.endsWith(".jsonl"),
   hookStampPath: () => lastHookPath("claude"),
-  hooksNotFiringHint: "  Reinstall the plugin / check /plugin.",
+  hooksNotFiringHint: "  run /plugin in Claude Code, check the nomo plugin is enabled, then restart Claude Code",
   toolDetail: claudeToolDetail,
   // Claude blobs OMIT the agent key (byte-identical to the pre-codex blob), so this is empty.
   blobAgentFields: {},
@@ -2242,7 +2264,7 @@ export const claudeAdapter: AgentAdapter = {
   locateTuiPid: (ctx, deps) => claudeLocateTuiPid(ctx, deps),
 };
 
-export const codexAdapter: AgentAdapter = {
+export const codexAdapter = {
   kind: "codex",
   async title({ sessionId, prefix, input }): Promise<string | undefined> {
     // PRIMARY: the clean AI-generated thread_name codex writes to session_index.jsonl ~30-40s in.
@@ -2310,7 +2332,7 @@ export const codexAdapter: AgentAdapter = {
   sessionsDir: () => `${codexHome()}/sessions`,
   sessionMatch: (name: string) => name.startsWith("rollout-") && name.endsWith(".jsonl"),
   hookStampPath: () => lastHookPath("codex"),
-  hooksNotFiringHint: "  Run /hooks in Codex to re-trust, or reinstall the plugin — known upstream bugs #16430/#30835.",
+  hooksNotFiringHint: "  run /hooks in Codex to re-trust, or reinstall the plugin — known upstream bugs #16430/#30835",
   toolDetail: codexToolDetail,
   // Codex blobs carry `agent:"codex"` so the phone tabs/icons the session correctly.
   blobAgentFields: { agent: "codex" as const },
@@ -2323,14 +2345,65 @@ export const codexAdapter: AgentAdapter = {
   // A codex record's pid may be an app-server host or a discovery sentinel, so locating the TUI is an
   // ordered correlation heuristic that refuses to guess (see codexLocateTuiPid).
   locateTuiPid: (ctx, deps) => codexLocateTuiPid(ctx, deps),
-};
+} satisfies AgentAdapter;
+
+/** Which live process the phone's `focus-terminal` should raise for an OpenCode session — the DESKTOP
+ *  app's Electron main pid, or nothing.
+ *
+ *  The record's pid is `process.pid` of whatever hosts the OpenCode server (see opencode/plugin.ts),
+ *  and its ANCESTRY is what tells the two deployments apart:
+ *    • DESKTOP: the plugin is resident in the app's node utility process, so the chain runs
+ *      `…/OpenCode Helper.app/…/MacOS/OpenCode Helper --utility-sub-type=node.mojom.NodeService`
+ *      → `…/OpenCode.app/Contents/MacOS/OpenCode` (verified against the running app 2026-08-19).
+ *      Only the Electron MAIN carries the bundle's own executable path `…/OpenCode.app/Contents/MacOS/`
+ *      — every helper lives under `Contents/Frameworks/` — so that one regex names it and can never
+ *      name a helper (same shape, same reasoning as codexDesktopAppPid). The main is handed over
+ *      rather than the record's own pid because it outlives a recycled utility process.
+ *    • CLI / `opencode serve`: UNSUPPORTED, and returns undefined on purpose. The session belongs to
+ *      the server process, not to any terminal window — under `serve` there may be no window at all —
+ *      so the pid's terminal ancestry (a shell, an emulator) describes whoever LAUNCHED the server,
+ *      not where the session is being read. Raising that terminal would be a button that lies, which
+ *      this project treats as strictly worse than a button that is absent.
+ *
+ *  Deliberately NOT a `ps` table scan: the ancestry IS the evidence that this session is a desktop one,
+ *  and a scan that found the app some other way would happily answer for a CLI session too. A dead pid
+ *  has no readable ancestry, so a stale record can never be resurrected onto a live window.
+ *  Never throws. */
+export async function opencodeLocateTuiPid(
+  ctx: { sessionId: string; record: SessionRecord }, deps: LocateTuiDeps = {},
+): Promise<number | undefined> {
+  try {
+    const pid = ctx.record.pid;
+    if (typeof pid !== "number" || !Number.isFinite(pid) || pid <= 0) {
+      noteLocate(deps, "no-candidate");
+      return undefined;
+    }
+    const ancestorsOf = deps.ancestorsOf ?? pidAncestors;
+    const commandOf = deps.commandOf ?? pidCommand;
+    let chain: number[] = [];
+    try { chain = ancestorsOf(pid); } catch { chain = []; }
+    for (const candidate of [pid, ...chain]) {
+      let command: string | undefined;
+      try { command = commandOf(candidate); } catch { continue; }
+      if (typeof command === "string" && /\/OpenCode\.app\/Contents\/MacOS\//.test(command)) {
+        noteLocate(deps, "desktop-app");
+        return candidate;
+      }
+    }
+    noteLocate(deps, "no-candidate"); // CLI / serve / app not running → nothing honest to focus
+    return undefined;
+  } catch {
+    noteLocate(deps, "error");
+    return undefined;
+  }
+}
 
 /** OpenCode's adapter is a STUB, and deliberately so. OpenCode has no hooks: it loads one resident
  *  plugin into its own server process (`src/opencode/plugin.ts`) which owns the whole lifecycle —
  *  session identity, title, model, busy/idle — from an in-process event firehose. Nothing in the
  *  transcript-scanning pipeline this interface was shaped around applies.
  *
- *  What is LIVE here is `kind` and `blobAgentFields`: three call sites (`cc-watchdog`'s corrective
+ *  What is LIVE here is `kind`, `blobAgentFields`, `ambientPlan` and `locateTuiPid`: three call sites (`cc-watchdog`'s corrective
  *  builders, `session-state`'s rollup, `computeSessionState`) reach `adapterFor()` on an OpenCode
  *  record and want only the `agent:"opencode"` literal to thread into the blob they are rebuilding.
  *  Every other member is inert — a path that does not exist, a matcher that never matches, an
@@ -2351,11 +2424,17 @@ export const opencodeAdapter: AgentAdapter = {
   sessionsDir: () => `${CC_DIR}/opencode-has-no-sessions-dir`,
   sessionMatch: () => false,
   hookStampPath: () => lastHookPath("opencode"),
-  hooksNotFiringHint: "  OpenCode loads the plugin at server start — restart OpenCode, or check that ~/.config/opencode/plugins/nomo.js still points at this install.",
+  hooksNotFiringHint: "  restart OpenCode (it loads the plugin at server start), or check that ~/.config/opencode/plugins/nomo.js still points at this install",
   toolDetail: {},
   // The one live member besides `kind`: OpenCode blobs carry `agent:"opencode"` so the phone tabs and
   // icons the session correctly (an app build that predates the literal reads it as claude, by design).
   blobAgentFields: { agent: "opencode" as const },
+  // The fourth live member: OpenCode's `plan` is the session's LIVE todo list, not a one-shot
+  // proposal, so every rebuilt blob restates the record's parked copy (see `ambientPlan`).
+  ambientPlan: true as const,
+  // The third live member: "Open on Mac" for the DESKTOP app only. See opencodeLocateTuiPid — a CLI /
+  // `opencode serve` session returns undefined and the phone keeps the button hidden, as before.
+  locateTuiPid: (ctx, deps) => opencodeLocateTuiPid(ctx, deps),
 };
 
 /** The adapter for an agent kind THIS BUILD DOES NOT KNOW — a record stamped by a newer peer install

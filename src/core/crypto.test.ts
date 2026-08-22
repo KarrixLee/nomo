@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   b64url,
+  Bytes,
   decryptBlob,
   deriveE2EKey,
   deriveLanKey,
@@ -21,7 +22,7 @@ const QR_SECRET = new Uint8Array(16).fill(1);
 const PHONE_NONCE = new Uint8Array(16).fill(2);
 const EXPECTED_KEY_HEX = "256a40ccc3cbb4c7338d5fe2bfbf7ae2f021d46a71a99c0d9a935f48e9a6fe22";
 
-function toHex(bytes: Uint8Array): string {
+function toHex(bytes: Bytes): string {
   return Array.from(bytes).map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
@@ -118,7 +119,7 @@ describe("encryptBlobWithIVForVectors (test-only deterministic export)", () => {
 });
 
 describe("cc-e2e-test-vectors.json (cross-platform fixture consumed by the Swift counterpart)", () => {
-  function fromHex(hex: string): Uint8Array {
+  function fromHex(hex: string): Bytes {
     const bytes = new Uint8Array(hex.length / 2);
     for (let i = 0; i < bytes.length; i++) bytes[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
     return bytes;
@@ -150,13 +151,13 @@ describe("cc-e2e-test-vectors.json (cross-platform fixture consumed by the Swift
 describe("pairing-v3 ECDH ratchet — mandatory cross-platform KAT (Z + K1 byte-equality)", () => {
   const r = vectors.ratchet;
 
-  function fromHex(hex: string): Uint8Array {
+  function fromHex(hex: string): Bytes {
     const bytes = new Uint8Array(hex.length / 2);
     for (let i = 0; i < bytes.length; i++) bytes[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
     return bytes;
   }
   /** The spec's pkcs8 blobs are standard base64 with NO padding — decode via atob after re-padding. */
-  function pkcs8Bytes(b64: string): Uint8Array {
+  function pkcs8Bytes(b64: string): Bytes {
     const padded = b64 + "=".repeat((4 - (b64.length % 4)) % 4);
     const bin = atob(padded);
     const bytes = new Uint8Array(bin.length);
@@ -211,7 +212,7 @@ describe("pairing-v3 ECDH ratchet — mandatory cross-platform KAT (Z + K1 byte-
 describe("LAN outer seal — cross-platform KAT (K_lan + envelope round trip)", () => {
   const v = vectors.lan;
 
-  function fromHex(hex: string): Uint8Array {
+  function fromHex(hex: string): Bytes {
     const bytes = new Uint8Array(hex.length / 2);
     for (let i = 0; i < bytes.length; i++) bytes[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
     return bytes;
@@ -249,13 +250,13 @@ describe("LAN outer seal — cross-platform KAT (K_lan + envelope round trip)", 
 });
 
 // --- local helpers for the tamper test (standard base64 <-> bytes, no crypto.ts internals) ---
-function fromB64urlPadded(b64: string): Uint8Array {
+function fromB64urlPadded(b64: string): Bytes {
   const binary = atob(b64);
   const bytes = new Uint8Array(binary.length);
   for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
   return bytes;
 }
-function toBase64Padded(bytes: Uint8Array): string {
+function toBase64Padded(bytes: Bytes): string {
   let binary = "";
   for (const b of bytes) binary += String.fromCharCode(b);
   return btoa(binary);

@@ -36,6 +36,19 @@ const CODEX_DESKTOP_SERVER_ARGV =
   "/Applications/ChatGPT.app/Contents/Resources/codex -c features.code_mode_host=true app-server"
   + " --analytics-default-enabled";
 
+// The OpenCode DESKTOP app, captured verbatim off this machine (OpenCode 1.18.19, Electron 42.3.3)
+// and trimmed only in the flag tail. The plugin is resident in the node UTILITY process, which is the
+// record's pid; opencodeLocateTuiPid hands over the Electron MAIN below.
+// NOTE the helper's name: "OpenCode Helper" CONTAINS "Code Helper", which is exactly why the VS Code
+// entry's rule had to be path-anchored (see the vscode collision test below).
+const OPENCODE_DESKTOP_APP_ARGV = "/Applications/OpenCode.app/Contents/MacOS/OpenCode";
+const OPENCODE_DESKTOP_UTILITY_ARGV =
+  "/Applications/OpenCode.app/Contents/Frameworks/OpenCode Helper.app/Contents/MacOS/OpenCode Helper"
+  + " --type=utility --utility-sub-type=node.mojom.NodeService --lang=en-US --service-sandbox-type=none"
+  + " --user-data-dir=/Users/karrix/Library/Application Support/ai.opencode.desktop --standard-schemes=oc";
+const VSCODE_HELPER_ARGV =
+  "/Applications/Visual Studio Code.app/Contents/Frameworks/Code Helper.app/Contents/MacOS/Code Helper";
+
 const REAL_HERDR_PANE_LIST = JSON.stringify({
   result: {
     panes: [
@@ -77,7 +90,7 @@ function herdrRecord(over: Partial<SessionRecord> = {}): SessionRecord {
 }
 
 function herdrDeps(over: {
-  agent?: "claude" | "codex";
+  agent?: "claude" | "codex" | "opencode";
   record?: SessionRecord;
   sessionId?: string;
   paneList?: string;
@@ -250,6 +263,24 @@ describe("owningTerminalApp", () => {
     expect(owningTerminalApp(1, () => [2, 3, 4], (p) => argv[p])?.id).toBe("ghostty");
   });
 
+  test("the OpenCode DESKTOP app resolves from its Electron main and from its node utility helper", () => {
+    const main = owningTerminalApp(99632, () => [1], () => OPENCODE_DESKTOP_APP_ARGV);
+    expect(main?.id).toBe("opencode-desktop");
+    expect(main?.bundleId).toBe("ai.opencode.desktop");
+    // The utility process (where the plugin lives) resolves to the same owner by plain ancestry.
+    expect(owningTerminalApp(99802, () => [99632, 1], (p) => (
+      p === 99802 ? OPENCODE_DESKTOP_UTILITY_ARGV : OPENCODE_DESKTOP_APP_ARGV
+    ))?.id).toBe("opencode-desktop");
+  });
+
+  test("'OpenCode Helper' is NOT VS Code (the substring collision that raised the wrong app)", () => {
+    // Observed live 2026-08-19 before the fix: owningTerminalApp(<OpenCode utility pid>) === "vscode",
+    // because the vscode rule matched the bare substring "Code Helper" inside "OpenCode Helper".
+    // Both directions are asserted — the anchor must not cost VS Code its own helper.
+    expect(owningTerminalApp(1, () => [], () => OPENCODE_DESKTOP_UTILITY_ARGV)?.id).toBe("opencode-desktop");
+    expect(owningTerminalApp(1, () => [], () => VSCODE_HELPER_ARGV)?.id).toBe("vscode");
+  });
+
   test("a CLI session in a terminal launched from the desktop app still resolves to the terminal", () => {
     // The NEAREST ancestor wins, so an app further up the chain can never steal a real emulator.
     const argv: Record<number, string> = { 1: "claude", 2: "-zsh", 3: GHOSTTY_ARGV, 4: CLAUDE_DESKTOP_APP_ARGV };
@@ -298,6 +329,20 @@ describe("focusTerminalForPid", () => {
     }));
     expect(result).toEqual({ ok: true, via: "app-activate" });
     expect(scripts).toEqual([`tell application id "com.openai.codex" to activate`]);
+  });
+
+  // The FOURTH tty-less owner: OpenCode's desktop app. opencodeLocateTuiPid hands over the Electron
+  // main, which — like the other two GUI apps — reads tty "??" and is raised by bundle id alone.
+  test("a tty-less OpenCode DESKTOP session activates the app instead of refusing on no-tty", async () => {
+    const scripts: string[] = [];
+    const result = await focusTerminalForPid(99632, deps({
+      ttyOf: async () => "??",
+      argvOf: { 99632: OPENCODE_DESKTOP_APP_ARGV },
+      ancestorsOf: () => [],
+      osascript: async (s) => { scripts.push(s); return ""; },
+    }));
+    expect(result).toEqual({ ok: true, via: "app-activate" });
+    expect(scripts).toEqual([`tell application id "ai.opencode.desktop" to activate`]);
   });
 
   test("the tty exemption is scoped to the desktop app — a tty-less Ghostty pid is still no-tty", async () => {
@@ -614,6 +659,46 @@ describe("herdr correlation by agent_session id", () => {
     });
     expect(await focusTerminalForPid(100, h.deps)).toEqual({ ok: false, reason: "herdr-ambiguous" });
     expect(h.calls).toEqual([{ file: "herdr", args: ["pane", "list"] }]);
+  });
+
+  // THE DORMANT TRAP, armed by giving opencodeAdapter a locateTuiPid. The fuzzy fallback used to read
+  // `context.agent === "claude" ? title-match : cwd-match-against-CODEX-panes`, so any non-Claude agent
+  // silently meant "codex". REAL_HERDR_PANE_LIST's codex pane sits in /Users/karrix/api-status — the
+  // same cwd an OpenCode session there would record — so the old ternary would have focused w2:tB and
+  // raised somebody else's Codex window.
+  test("an OpenCode session never correlates to a CODEX pane that merely shares its cwd", async () => {
+    const h = herdrDeps({
+      agent: "opencode",
+      record: herdrRecord({ agent: "opencode", title: "unrelated" }),
+      sessionId: LIVE_SESSION, // no pane publishes it → the fuzzy path is what is under test
+    });
+    expect(await focusTerminalForPid(100, h.deps)).toEqual({ ok: false, reason: "herdr-ambiguous" });
+    expect(h.calls).toEqual([{ file: "herdr", args: ["pane", "list"] }]); // never reached `tab focus`
+  });
+
+  test("…and the very same pane list still correlates correctly for Codex itself", async () => {
+    // The other half of the fix: per-agent-correct, not per-agent-absent. Identical deps but for the
+    // agent, and the codex pane in that cwd is still found.
+    const h = herdrDeps({
+      agent: "codex", record: herdrRecord({ agent: "codex", title: "unrelated" }),
+      sessionId: LIVE_SESSION,
+    });
+    expect(await focusTerminalForPid(100, h.deps)).toEqual({ ok: true, via: "herdr", reason: "herdr-focused" });
+    expect(h.calls[1]).toEqual({ file: "herdr", args: ["tab", "focus", "w2:tB"] });
+  });
+
+  test("an OpenCode session is still reachable by its EXACT herdr session id", async () => {
+    // Refusing the fuzzy signal is not refusing the agent: an id match needs no per-agent rule.
+    const h = herdrDeps({
+      agent: "opencode", record: herdrRecord({ agent: "opencode", title: "hi" }),
+      sessionId: LIVE_SESSION,
+      paneList: paneList(claudePane({
+        agent: "opencode", tab_id: "w2:tO",
+        agent_session: { agent: "opencode", value: LIVE_SESSION },
+      })),
+    });
+    expect(await focusTerminalForPid(100, h.deps)).toEqual({ ok: true, via: "herdr", reason: "herdr-focused" });
+    expect(h.calls[1]).toEqual({ file: "herdr", args: ["tab", "focus", "w2:tO"] });
   });
 
   test("a malformed agent_session is simply 'no id', never a parse failure", async () => {

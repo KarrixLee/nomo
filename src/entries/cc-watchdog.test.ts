@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { decryptBlob, encryptBlob } from "../core/crypto";
+import { Bytes, decryptBlob, encryptBlob } from "../core/crypto";
 import { createLanAnswerStore } from "../core/lan-listener";
 import type { DecisionHold, PlanPickerTraceDecision, SessionRecord } from "../core/shared";
 import { GONE_STRIKE_LIMIT, readGoneStrikes, recordGoneStrike, resetGoneStrikes, tracePlanPickerDecision } from "../core/shared";
@@ -508,7 +508,7 @@ describe("an agent kind this build does not know survives every rebuild path", (
   });
 
   test("the heartbeat/discovery builders carry it too", async () => {
-    const fields = { agent: FUTURE } as { agent?: undefined };
+    const fields = { agent: FUTURE };
     const d = { sessionId: "s", pid: 4242, title: "t", label: "proj", cwd: "/w" } as unknown as DiscoveredSession;
     expect(await decryptBlob(KEY, await buildProvisionalBlob(d, "mac", fields, KEY, 5)))
       .toMatchObject({ agent: FUTURE });
@@ -584,8 +584,8 @@ describe("buildEndEnvelope (reap → v2 op:end, no blob)", () => {
     expect(e.v).toBe(2);
     expect(typeof e.sessionId).toBe("string");
     expect(e.op).toBe("end");
-    expect([0, 1]).toContain(e.prio);
-    expect(Number.isFinite(e.ts) && (e.ts as number) > 0).toBe(true);
+    expect([0, 1]).toContain(e.prio as number);
+    expect(Number.isFinite(e.ts as number) && (e.ts as number) > 0).toBe(true);
     expect(e).not.toHaveProperty("blob");
   });
   test("carries the record's cached start when given one; omits it for the recordless call", () => {
@@ -904,7 +904,7 @@ describe("discoverLiveSessions (generic adapter-driven step)", () => {
     const adapter = { kind: "codex", blobAgentFields: { agent: "codex" },
       discoverLive: async (k: SessionRecord[]) => { seen = k; return []; } } as unknown as AgentAdapter;
     await discoverLiveSessions(cfg(), { adapters: [adapter], readRecords: async () => known, post: async () => "delivered" as PostOutcome, writeRecord: async () => {} });
-    expect(seen).toBe(known);
+    expect(seen as SessionRecord[] | null).toBe(known);
   });
 
   test("a discoverLive throw never derails the step (best-effort)", async () => {
@@ -1579,7 +1579,7 @@ describe("buildNeedsAttentionEnvelope (dropped-hook corrective → same envelope
       "s", rec({ machine: "Mac", label: "proj" }), 5, KEY, "codex", 5, undefined, "userInput",
       "# Plan\n\n" + "x".repeat(5000),
     ) as Record<string, unknown>;
-    const pendingBlob = await decryptBlob(KEY, pending.blob as string);
+    const pendingBlob = await decryptBlob(KEY, pending.blob as string) as Record<string, unknown>;
     expect(pendingBlob.plan).toBeString();
     expect((pendingBlob.plan as string).endsWith("\n…")).toBe(true);
     const ordinary = await buildNeedsAttentionEnvelope(
@@ -2020,7 +2020,7 @@ describe("correctPlanPickerVerification (watchdog owns flush settlement)", () =>
     expect(writes[0].planPickerVerificationPending).toBeUndefined();
     expect(writes[0].planPickerSettled).toBeUndefined();
     expect(writes[0].planPickerPendingSince).toBe(NOW);
-    expect((await decryptBlob(KEY, posts[0].blob as string)).dbg).toContain("dq:idle(ign)");
+    expect((await decryptBlob(KEY, posts[0].blob as string) as Record<string, unknown>).dbg).toContain("dq:idle(ign)");
   });
 
   test("daemon unavailable sustains the picker initially, but the hard TTL still resolves it", async () => {
@@ -3541,7 +3541,7 @@ describe("drainCommands (authenticate, validate, then execute)", () => {
 
   /** A sealed command exactly as the phone would produce it. */
   const sealed = async (
-    over: Partial<CommandPayload> = {}, opts: { id?: string; key?: Uint8Array } = {},
+    over: Partial<CommandPayload> = {}, opts: { id?: string; key?: Bytes } = {},
   ): Promise<{ id: string; blob: string }> => ({
     id: opts.id ?? `cmd-${++nonceSeq}`,
     blob: await encryptBlob(opts.key ?? KEY, {

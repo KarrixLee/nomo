@@ -103,7 +103,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "2.1.5";
+var PLUGIN_VERSION = "2.1.19";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -643,7 +643,7 @@ async function flushPendingStash(stashPath, url, pairingId, pcSecret, e2eKey, no
           op: stash.op,
           prio: stash.prio,
           blob,
-          ...stash.blob.agent === "codex" ? { agent: "codex" } : {},
+          ...stash.blob.agent && stash.blob.agent !== "claude" ? { agent: stash.blob.agent } : {},
           ...typeof stash.blob.title === "string" && stash.blob.title.length > 0 ? { title: stash.blob.title } : {},
           ...typeof stash.blob.model === "string" && stash.blob.model.length > 0 ? { model: stash.blob.model } : {},
           ...pairingId.length > 0 ? { pairingId } : {}
@@ -793,7 +793,7 @@ function watchdogHolderIsLive(pid, deps = {}) {
 function ensureWatchdog(deps = {}) {
   try {
     if (process.env.NOMO_SKIP_WATCHDOG === "1")
-      return;
+      return false;
     const pidPath = deps.pidPath ?? WATCHDOG_PID_PATH;
     const version = deps.version ?? PLUGIN_VERSION;
     const build = "build" in deps ? deps.build : watchdogBuildStamp();
@@ -814,16 +814,19 @@ function ensureWatchdog(deps = {}) {
     if (holder && watchdogHolderIsLive(holder.pid, deps)) {
       if (holder.version === version) {
         if (!watchdogBuildDiffers(holder.build, build))
-          return;
+          return true;
       } else if (!watchdogVersionOutranks(version, holder.version)) {
-        return;
+        return true;
       }
       try {
         killPid(holder.pid, "SIGTERM");
       } catch {}
     }
     spawnWatchdog();
-  } catch {}
+    return false;
+  } catch {
+    return false;
+  }
 }
 async function readRecord(sessionId, sessionsDir = SESSIONS_DIR) {
   try {
@@ -854,20 +857,23 @@ async function writeDecisionHoldAt(sessionsDir, sessionId, hold) {
     await atomicWrite(`${sessionsDir}/${decisionHoldFileName(sessionId)}`, JSON.stringify(hold), 384);
   } catch {}
 }
-async function clearDecisionHoldAt(sessionsDir, sessionId, pid, beforeUnlink) {
+async function clearDecisionHoldAt(sessionsDir, sessionId, pid, beforeUnlink, holdId) {
   const path = `${sessionsDir}/${decisionHoldFileName(sessionId)}`;
   try {
     const raw = await readFile(path, "utf8").catch(() => {
       return;
     });
     if (raw !== undefined) {
-      let owner;
+      let marker;
       try {
-        owner = JSON.parse(raw).pid;
+        marker = JSON.parse(raw);
       } catch {
-        owner = undefined;
+        marker = undefined;
       }
+      const owner = marker?.pid;
       if (typeof owner === "number" && owner !== pid)
+        return false;
+      if (holdId !== undefined && typeof marker?.holdId === "string" && marker.holdId !== holdId)
         return false;
     }
     if (beforeUnlink !== undefined) {
@@ -901,8 +907,8 @@ async function readDecisionHoldAt(sessionsDir, sessionId) {
 async function writeDecisionHold(sessionId, hold) {
   return writeDecisionHoldAt(SESSIONS_DIR, sessionId, hold);
 }
-async function clearDecisionHold(sessionId, pid, beforeUnlink) {
-  return clearDecisionHoldAt(SESSIONS_DIR, sessionId, pid, beforeUnlink);
+async function clearDecisionHold(sessionId, pid, beforeUnlink, holdId) {
+  return clearDecisionHoldAt(SESSIONS_DIR, sessionId, pid, beforeUnlink, holdId);
 }
 async function settleDecisionHoldRecord(sessionId, patch) {
   return settleDecisionHoldRecordAt(SESSIONS_DIR, sessionId, patch);
@@ -1074,11 +1080,16 @@ function recordTitleMatchesPane(recordTitle, paneTitle) {
   const match = /^(.*?)(?:\u2026|\.{3})$/.exec(recordTitle);
   return !!match && match[1].length > 0 && paneTitle.startsWith(match[1]);
 }
+var HERDR_FUZZY_SIGNAL = {
+  claude: (pane, context) => recordTitleMatchesPane(context.record.title, pane.terminal_title_stripped),
+  codex: (pane, context) => typeof context.record.origin?.cwd === "string" && context.record.origin.cwd.length > 0 && pane.cwd === context.record.origin.cwd
+};
 function correlateHerdrPane(context, panes) {
   const byId = panes.filter((pane) => pane.agent === context.agent && pane.agent_session?.value === context.sessionId && (pane.agent_session?.agent ?? context.agent) === context.agent);
   if (byId.length > 0)
     return byId.length === 1 ? byId[0] : undefined;
-  let candidates = context.agent === "claude" ? panes.filter((pane) => pane.agent === "claude" && recordTitleMatchesPane(context.record.title, pane.terminal_title_stripped)) : panes.filter((pane) => pane.agent === "codex" && typeof context.record.origin?.cwd === "string" && context.record.origin.cwd.length > 0 && pane.cwd === context.record.origin.cwd);
+  const fuzzy = HERDR_FUZZY_SIGNAL[context.agent];
+  let candidates = fuzzy === undefined ? [] : panes.filter((pane) => pane.agent === context.agent && fuzzy(pane, context));
   if (candidates.length > 1) {
     const working = candidates.filter((pane) => pane.agent_status === "working");
     if (working.length > 0)
@@ -1125,9 +1136,10 @@ var TERMINAL_APPS = [
   { id: "kitty", bundleId: "net.kovidgoyal.kitty", match: /\/kitty\.app\/|(?:^|\/)kitty(?:\s|$)/ },
   { id: "hyper", bundleId: "co.zeit.hyper", match: /\/Hyper\.app\// },
   { id: "warp", bundleId: "dev.warp.Warp-Stable", match: /\/Warp\.app\// },
-  { id: "vscode", bundleId: "com.microsoft.VSCode", match: /\/Visual Studio Code\.app\/|\/Code\.app\/|Code Helper/ },
+  { id: "vscode", bundleId: "com.microsoft.VSCode", match: /\/Visual Studio Code\.app\/|\/Code\.app\/|\/Code Helper/ },
   { id: "claude-desktop", bundleId: "com.anthropic.claudefordesktop", match: /\/Claude\.app\/Contents\//, ttyless: true },
-  { id: "codex-desktop", bundleId: "com.openai.codex", match: /\/ChatGPT\.app\/Contents\//, ttyless: true }
+  { id: "codex-desktop", bundleId: "com.openai.codex", match: /\/ChatGPT\.app\/Contents\//, ttyless: true },
+  { id: "opencode-desktop", bundleId: "ai.opencode.desktop", match: /\/OpenCode\.app\/Contents\//, ttyless: true }
 ];
 function owningTerminalApp(pid, ancestorsOf = pidAncestors, commandOf = pidCommand) {
   let chain = [];
@@ -2473,7 +2485,7 @@ async function claudeLocateTuiPid(ctx, deps = {}) {
   }
 }
 function claudeClearPredecessor(sessionId, hookPid, tracked) {
-  return tracked.filter((t) => t.sessionId !== sessionId && t.provisional !== true && t.agent !== "codex" && typeof t.pid === "number" && Number.isFinite(t.pid) && t.pid === hookPid).sort((a, b) => (b.ts ?? 0) - (a.ts ?? 0))[0]?.sessionId;
+  return tracked.filter((t) => t.sessionId !== sessionId && t.provisional !== true && (t.agent ?? "claude") === "claude" && typeof t.pid === "number" && Number.isFinite(t.pid) && t.pid === hookPid).sort((a, b) => (b.ts ?? 0) - (a.ts ?? 0))[0]?.sessionId;
 }
 function codexChildSessionGhost(sessionId, transcriptPrefix, hookPid, tracked) {
   if (transcriptPrefix.trim().length > 0)
@@ -2627,7 +2639,7 @@ var claudeAdapter = {
   sessionsDir: () => `${process.env.HOME}/.claude/projects`,
   sessionMatch: (name) => name.endsWith(".jsonl"),
   hookStampPath: () => lastHookPath("claude"),
-  hooksNotFiringHint: "  Reinstall the plugin / check /plugin.",
+  hooksNotFiringHint: "  run /plugin in Claude Code, check the nomo plugin is enabled, then restart Claude Code",
   toolDetail: claudeToolDetail,
   blobAgentFields: {},
   locateTuiPid: (ctx, deps) => claudeLocateTuiPid(ctx, deps)
@@ -2681,13 +2693,47 @@ var codexAdapter = {
   sessionsDir: () => `${codexHome()}/sessions`,
   sessionMatch: (name) => name.startsWith("rollout-") && name.endsWith(".jsonl"),
   hookStampPath: () => lastHookPath("codex"),
-  hooksNotFiringHint: "  Run /hooks in Codex to re-trust, or reinstall the plugin — known upstream bugs #16430/#30835.",
+  hooksNotFiringHint: "  run /hooks in Codex to re-trust, or reinstall the plugin — known upstream bugs #16430/#30835",
   toolDetail: codexToolDetail,
   blobAgentFields: { agent: "codex" },
   discoverLive: (known) => codexDiscoverLive(known),
   pidTurnActive: (pid) => codexPidTurnActive(pid),
   locateTuiPid: (ctx, deps) => codexLocateTuiPid(ctx, deps)
 };
+async function opencodeLocateTuiPid(ctx, deps = {}) {
+  try {
+    const pid = ctx.record.pid;
+    if (typeof pid !== "number" || !Number.isFinite(pid) || pid <= 0) {
+      noteLocate(deps, "no-candidate");
+      return;
+    }
+    const ancestorsOf = deps.ancestorsOf ?? pidAncestors;
+    const commandOf = deps.commandOf ?? pidCommand;
+    let chain = [];
+    try {
+      chain = ancestorsOf(pid);
+    } catch {
+      chain = [];
+    }
+    for (const candidate of [pid, ...chain]) {
+      let command;
+      try {
+        command = commandOf(candidate);
+      } catch {
+        continue;
+      }
+      if (typeof command === "string" && /\/OpenCode\.app\/Contents\/MacOS\//.test(command)) {
+        noteLocate(deps, "desktop-app");
+        return candidate;
+      }
+    }
+    noteLocate(deps, "no-candidate");
+    return;
+  } catch {
+    noteLocate(deps, "error");
+    return;
+  }
+}
 var opencodeAdapter = {
   kind: "opencode",
   title: async () => {
@@ -2697,9 +2743,11 @@ var opencodeAdapter = {
   sessionsDir: () => `${CC_DIR}/opencode-has-no-sessions-dir`,
   sessionMatch: () => false,
   hookStampPath: () => lastHookPath("opencode"),
-  hooksNotFiringHint: "  OpenCode loads the plugin at server start — restart OpenCode, or check that ~/.config/opencode/plugins/nomo.js still points at this install.",
+  hooksNotFiringHint: "  restart OpenCode (it loads the plugin at server start), or check that ~/.config/opencode/plugins/nomo.js still points at this install",
   toolDetail: {},
-  blobAgentFields: { agent: "opencode" }
+  blobAgentFields: { agent: "opencode" },
+  ambientPlan: true,
+  locateTuiPid: (ctx, deps) => opencodeLocateTuiPid(ctx, deps)
 };
 function unknownAgentAdapter(kind) {
   return {
@@ -3455,6 +3503,7 @@ export {
   requestUserInputDetail,
   planOp,
   parseCodexProcs,
+  opencodeLocateTuiPid,
   opencodeAdapter,
   markDoneDeliveredAt,
   markDoneDelivered,
