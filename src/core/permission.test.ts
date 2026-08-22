@@ -6,7 +6,7 @@ import {
   buildPermissionSummary, buildPermissionDetail, buildPermissionQuestions, fitPermissionDetail,
   sealedBlobChars, BLOB_FIT_CHARS, runPermissionHook, approvalsCommand, NO_HOLD_PATH, TRACE_PATH,
   codexRolloutSessionId, codexTurnPolicyFromRollout, loadCodexTurnPolicy,
-  POST_FIRST_CONTACT_TIMEOUT_MS,
+  POST_FIRST_CONTACT_TIMEOUT_MS, OPENCODE_QUESTION_TOOL,
 } from "./permission";
 import {
   createPollBudget, MAX_CONSECUTIVE_MISSES, POLL_FIRST_CONTACT_TIMEOUT_MS,
@@ -2545,6 +2545,45 @@ describe("runPermissionHook — AskUserQuestion holds", () => {
     expect(updatedInput.answers).toEqual({
       "Which testing approach should I use for the new parser?": "Integration tests",
     });
+  });
+
+  // THE ANSWER TOOL IS (name, agent), never a name alone. `question` is an ordinary lowercase word: it
+  // names OpenCode's question CHANNEL and, for any other agent, whatever tool an MCP server happens to
+  // have called that. Ungated, the release rule swallowed such a tool's Allow — the user taps Allow on
+  // the phone and the Mac just sits there. iOS reads the pair together
+  // (CCPermissionQuestion.isOwnQuestionChannel); this is the plugin-side twin of that reading.
+  const namedQuestion = JSON.stringify({
+    session_id: "sess-1", hook_event_name: "PermissionRequest",
+    tool_name: OPENCODE_QUESTION_TOOL, tool_input: { questions: CC_QUESTIONS },
+    cwd: "/Users/x/proj", transcript_path: "/tmp/t.jsonl",
+  });
+
+  test("a CLAUDE tool literally named `question` is an ORDINARY tool — its allow is EMITTED, not released", async () => {
+    const answerBlob = await encryptBlob(KEY, { requestId: "req-fixed", ts: 5, decision: "allow" });
+    const emitted: string[] = [];
+    const { fn } = scriptFetch(true, [{ status: "answered", answerBlob }]);
+    await runPermissionHook(baseDeps({
+      fetchFn: fn, emit: (l: string) => emitted.push(l), readInput: async () => namedQuestion,
+    }) as never);
+    expect(emitted).toEqual([ALLOW]);
+  });
+
+  test("…while under OPENCODE that same name IS the answer channel: a bare allow is RELEASED", async () => {
+    const answerBlob = await encryptBlob(KEY, { requestId: "req-fixed", ts: 5, decision: "allow" });
+    const emitted: string[] = [];
+    const { fn } = scriptFetch(true, [{ status: "answered", answerBlob }]);
+    await runPermissionHook(baseDeps({
+      fetchFn: fn, emit: (l: string) => emitted.push(l), readInput: async () => namedQuestion,
+      writeHoldFn: async () => {}, clearHoldFn: async () => {}, settleHoldRecordFn: async () => {},
+    }) as never, "opencode");
+    expect(emitted).toEqual([]);
+  });
+
+  // Claude's own AskUserQuestion carries a name nothing else ships, so the gate above must NOT have
+  // narrowed it by agent — codex keeps releasing a bare allow on it exactly as before.
+  test("AskUserQuestion still releases a bare allow under codex", async () => {
+    const { emitted } = await answerQuestion({ decision: "allow" }, {}, "codex");
+    expect(emitted).toEqual([]);
   });
 });
 

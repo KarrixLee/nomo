@@ -356,7 +356,7 @@ function answerLine(
   toolInput: Record<string, unknown>,
   answers: unknown,
 ): string | undefined {
-  if (!isAnswerTool(toolName) || !Array.isArray(answers)) return undefined;
+  if (!isAnswerTool(toolName, agent) || !Array.isArray(answers)) return undefined;
   // Zipped against the SAME usable-question list that built `permissionQuestions`, so index i of the
   // phone's array is index i of what the phone was SHOWN — a skipped entry can never shift the mapping.
   // The key is the ORIGINAL, untruncated question text (the blob's copy may be capped).
@@ -556,9 +556,15 @@ export const OPENCODE_QUESTION_TOOL = "question";
  *  answer-injection channel on the hook surface, and folding it in here would change Codex behavior.
  *  The two members are Claude's `AskUserQuestion` and OpenCode's `question`, whose payload shapes
  *  ({question, options:[{label, description}]}) are field-for-field identical — which is why one
- *  code path serves both. */
-function isAnswerTool(toolName: string): boolean {
-  return toolName === "AskUserQuestion" || toolName === OPENCODE_QUESTION_TOOL;
+ *  code path serves both.
+ *
+ *  (name, agent) TOGETHER, exactly like the phone's `CCPermissionQuestion.isOwnQuestionChannel`.
+ *  `question` is an ordinary lowercase word, and OpenCode is the only agent for which it names the
+ *  question CHANNEL: a Claude or Codex MCP server exposing a tool called `question` would otherwise
+ *  have its Allow silently swallowed by the release rule — the user taps Allow and nothing happens. */
+function isAnswerTool(toolName: string, agent: AgentKind): boolean {
+  return toolName === "AskUserQuestion"
+    || (agent === "opencode" && toolName === OPENCODE_QUESTION_TOOL);
 }
 
 /** A concise, human-readable one-liner describing what the tool wants to do — shown on the phone's
@@ -906,7 +912,7 @@ function emitDecision(
   emit: (line: string) => void,
   trace: (event: object) => void,
 ): DecisionOutcome {
-  const isQuestion = isAnswerTool(toolName);
+  const isQuestion = isAnswerTool(toolName, agent);
   switch (answer.decision) {
     case "allow":
       if (isQuestion) { trace({ event: "release", reason: "bare-allow-on-question" }); return "released"; }

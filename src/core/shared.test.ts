@@ -336,6 +336,35 @@ describe("ensureWatchdog (spawn gate: recycled pids and stale builds must not bl
     });
   });
 
+  // The RESIDENT (OpenCode) plugin calls this on every frame, and the check is a ~341 KB hash plus a
+  // `ps` fork on OpenCode's own event loop. It may cache the answer — but only a POSITIVE one, or a
+  // daemon that died mid-session would never be respawned. So the verdict has to be reported.
+  describe("the return value: only a CONFIRMED-live watchdog is cacheable", () => {
+    const seams = (over: Parameters<typeof ensureWatchdog>[0] = {}) => ({
+      readPidfile: () => "777 1.4.4",
+      isAlive: () => true,
+      commandOf: () => WATCHDOG_CMD,
+      killPid: () => {},
+      spawnWatchdog: () => {},
+      version: "1.4.4",
+      ...over,
+    });
+
+    test("a live watchdog this build accepts → true (nothing was done)", () => {
+      expect(ensureWatchdog(seams())).toBe(true);
+      // A NEWER peer owns the daemon: also nothing to do, also cacheable.
+      expect(ensureWatchdog(seams({ readPidfile: () => "777 2.3.0" }))).toBe(true);
+    });
+
+    test("every other outcome is false — a spawn is not a confirmation", () => {
+      expect(ensureWatchdog(seams({ readPidfile: () => undefined }))).toBe(false); // spawned fresh
+      expect(ensureWatchdog(seams({ isAlive: () => false }))).toBe(false);         // dead pid → spawned
+      expect(ensureWatchdog(seams({ readPidfile: () => "777 1.4.3" }))).toBe(false); // takeover
+      expect(ensureWatchdog(seams({ commandOf: () => "/usr/sbin/cupsd" }))).toBe(false); // recycled pid
+      expect(ensureWatchdog(seams({ readPidfile: () => { throw new Error("EIO"); } }))).toBe(false);
+    });
+  });
+
   test("the pidfile carries the build as a THIRD field, and stays parseInt-compatible", () => {
     expect(formatWatchdogPidfile(777, "1.4.4", "abc")).toBe("777 1.4.4 abc");
     expect(Number.parseInt(formatWatchdogPidfile(777, "1.4.4", "abc"), 10)).toBe(777);

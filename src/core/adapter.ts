@@ -1811,10 +1811,11 @@ export interface TrackedSessionLite {
   pid?: number;
   provisional?: boolean;
   /** WIRE-typed (see AgentKindWire): this is `SessionRecord.agent` read straight off disk, and a peer
-   *  install one version ahead stamps literals this build has never heard of. Both readers below only
-   *  ever COMPARE it to "codex", so an unknown agent is correctly neither a codex ghost's owner nor a
-   *  claude `/clear` predecessor — narrowing it to AgentKind would have been a claim the file's own
-   *  source (JSON.parse of an untrusted record) cannot make. */
+   *  install one version ahead stamps literals this build has never heard of. Each reader below names
+   *  the ONE kind it wants — the ghost check requires "codex", the `/clear` check requires claude (the
+   *  absent key, per the wire discipline) — so an unknown agent is correctly neither a codex ghost's
+   *  owner nor a claude `/clear` predecessor. Narrowing it to AgentKind would have been a claim the
+   *  file's own source (JSON.parse of an untrusted record) cannot make. */
   agent?: AgentKindWire;
   ts?: number;
 }
@@ -1829,14 +1830,20 @@ export interface SessionCreationSuppression {
 
 /** The most recent Claude record on the SAME process is the predecessor of a `SessionStart` whose
  *  source is `clear`. Claude keeps the TUI process alive across `/clear`, changes only the session id,
- *  and emits no SessionEnd for the old id. Codex records and provisional discovery rows are excluded;
- *  newest `ts` wins if an earlier bug already left more than one stale record on the pid. */
+ *  and emits no SessionEnd for the old id. Provisional discovery rows and every NON-Claude record are
+ *  excluded; newest `ts` wins if an earlier bug already left more than one stale record on the pid.
+ *
+ *  CLAUDE-ONLY, positively: a missing `agent` key means claude (the wire discipline hook.ts writes), so
+ *  the test is `(t.agent ?? "claude") === "claude"`. It used to be `!== "codex"`, which was the same
+ *  thing only while claude and codex were the only kinds — it silently adopted an OpenCode row (and
+ *  every future kind, and any literal a newer peer install stamps) as a Claude `/clear` predecessor and
+ *  would have retired someone else's live session. */
 export function claudeClearPredecessor(
   sessionId: string, hookPid: number, tracked: TrackedSessionLite[],
 ): string | undefined {
   return tracked
     .filter((t) =>
-      t.sessionId !== sessionId && t.provisional !== true && t.agent !== "codex" &&
+      t.sessionId !== sessionId && t.provisional !== true && (t.agent ?? "claude") === "claude" &&
       typeof t.pid === "number" && Number.isFinite(t.pid) && t.pid === hookPid)
     .sort((a, b) => (b.ts ?? 0) - (a.ts ?? 0))[0]?.sessionId;
 }

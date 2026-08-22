@@ -1745,14 +1745,22 @@ export interface EnsureWatchdogDeps extends WatchdogIdentityDeps {
  *  different versions would otherwise evict each other forever (see note (3) on the pidfile above). The runtime is NOMO_RUNTIME (the run.sh
  *  shim's resolved interpreter) when set, else this process's own execPath. Shared by the hook
  *  (post-pair) and `pair` (so a mid-pairing config self-heals even if `wait` is never run). Best-effort
- *  — a spawn failure just falls back to the worker's own staleness eviction / the next hook. */
-export function ensureWatchdog(deps: EnsureWatchdogDeps = {}): void {
+ *  — a spawn failure just falls back to the worker's own staleness eviction / the next hook.
+ *
+ *  RETURNS whether a live watchdog of an acceptable build was CONFIRMED already running — i.e. this
+ *  call had nothing to do. Every other outcome is false: spawned, opted out, or the check itself threw.
+ *  The one-shot hooks ignore it (their per-invocation cost is inherent). The RESIDENT OpenCode plugin
+ *  uses it to cache that positive for a while, because the check costs a ~341 KB read+hash plus a `ps`
+ *  fork and would otherwise run on every frame inside OpenCode's own event loop. Only the POSITIVE is
+ *  cacheable: a false answer must be re-checked on the very next call, or a dead daemon — the thing
+ *  that reaps rows when the editor dies — would never be respawned. */
+export function ensureWatchdog(deps: EnsureWatchdogDeps = {}): boolean {
   try {
     // Real-entry E2E tests exercise the hook in a child process. They do not need a second, detached
     // daemon to validate hook behavior, and a detached child cannot be joined by Bun's test runner.
     // Keep the opt-out explicit (never inferred from NODE_ENV) so production behavior is unchanged
     // unless a caller deliberately requests it.
-    if (process.env.NOMO_SKIP_WATCHDOG === "1") return;
+    if (process.env.NOMO_SKIP_WATCHDOG === "1") return false;
     const pidPath = deps.pidPath ?? WATCHDOG_PID_PATH;
     const version = deps.version ?? PLUGIN_VERSION;
     const build = "build" in deps ? deps.build : watchdogBuildStamp();
@@ -1772,18 +1780,22 @@ export function ensureWatchdog(deps: EnsureWatchdogDeps = {}): void {
       if (holder.version === version) {
         // Same VERSION: only the build stamp can tell us anything. Identical bundle → nothing to do;
         // the same version rebuilt in place (the dev loop) → retire the stale bundle. Unchanged.
-        if (!watchdogBuildDiffers(holder.build, build)) return;
+        if (!watchdogBuildDiffers(holder.build, build)) return true;
       } else if (!watchdogVersionOutranks(version, holder.version)) {
         // A DIFFERENT version we do not outrank: an equal-but-differently-spelled stamp, a NEWER peer
         // install (OpenCode vs Claude Code — see note (3) above), or a version we cannot parse. Leave
         // the running daemon alone and do not spawn a second one; the newest build owns the daemon.
-        return;
+        return true;
       }
       try { killPid(holder.pid, "SIGTERM"); } catch { /* raced its own exit — spawn anyway */ }
     }
     spawnWatchdog();
+    // A spawn is NOT a confirmation: the daemon is detached and best-effort, so the next caller must
+    // look again (and will then find it live, and only THEN may cache that).
+    return false;
   } catch {
     // Couldn't start it → the Worker's staleness eviction / the next hook still applies.
+    return false;
   }
 }
 

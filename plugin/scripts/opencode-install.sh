@@ -107,6 +107,18 @@ resolved=$(sed -n 's|^export { default } from "\(.*\)";$|\1|p' "$STUB")
 [ -n "$resolved" ] || fail "wrote $STUB but could not read the export target back out of it"
 [ -f "$resolved" ] || fail "$STUB points at $resolved, which does not exist"
 
+# UPGRADE MIGRATION. Until 631f3f2 this script wrote the stub to `plugin/nomo.js` — OpenCode's
+# discovery glob is `{plugin,plugins}/*.{ts,js}`, so BOTH names load and an upgraded machine would run
+# two copies of the resident plugin (two event streams, two rows, two watchdog spawns) forever. Only a
+# stub that re-exports our bundle is removed — the same ownership test `claim` uses — so a file
+# somebody else put there is left alone, and a fresh install (no such file) is a silent no-op.
+LEGACY_STUB="$CONFIG_DIR/plugin/nomo.js"
+if [ -f "$LEGACY_STUB" ] && grep -q 'dist/opencode\.js' "$LEGACY_STUB" 2>/dev/null; then
+  rm -f "$LEGACY_STUB"
+  rmdir "$CONFIG_DIR/plugin" 2>/dev/null || true   # only if it held nothing else
+  echo "opencode-install: removed the superseded stub at $LEGACY_STUB (it would have loaded a second copy)"
+fi
+
 mkdir -p "$CONFIG_DIR/commands"
 installed=""
 for template in "$TEMPLATES"/*.md; do

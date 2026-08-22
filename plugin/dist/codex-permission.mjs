@@ -109,7 +109,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "2.1.18";
+var PLUGIN_VERSION = "2.1.19";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -799,7 +799,7 @@ function watchdogHolderIsLive(pid, deps = {}) {
 function ensureWatchdog(deps = {}) {
   try {
     if (process.env.NOMO_SKIP_WATCHDOG === "1")
-      return;
+      return false;
     const pidPath = deps.pidPath ?? WATCHDOG_PID_PATH;
     const version = deps.version ?? PLUGIN_VERSION;
     const build = "build" in deps ? deps.build : watchdogBuildStamp();
@@ -820,16 +820,19 @@ function ensureWatchdog(deps = {}) {
     if (holder && watchdogHolderIsLive(holder.pid, deps)) {
       if (holder.version === version) {
         if (!watchdogBuildDiffers(holder.build, build))
-          return;
+          return true;
       } else if (!watchdogVersionOutranks(version, holder.version)) {
-        return;
+        return true;
       }
       try {
         killPid(holder.pid, "SIGTERM");
       } catch {}
     }
     spawnWatchdog();
-  } catch {}
+    return false;
+  } catch {
+    return false;
+  }
 }
 async function readRecord(sessionId, sessionsDir = SESSIONS_DIR) {
   try {
@@ -2488,7 +2491,7 @@ async function claudeLocateTuiPid(ctx, deps = {}) {
   }
 }
 function claudeClearPredecessor(sessionId, hookPid, tracked) {
-  return tracked.filter((t) => t.sessionId !== sessionId && t.provisional !== true && t.agent !== "codex" && typeof t.pid === "number" && Number.isFinite(t.pid) && t.pid === hookPid).sort((a, b) => (b.ts ?? 0) - (a.ts ?? 0))[0]?.sessionId;
+  return tracked.filter((t) => t.sessionId !== sessionId && t.provisional !== true && (t.agent ?? "claude") === "claude" && typeof t.pid === "number" && Number.isFinite(t.pid) && t.pid === hookPid).sort((a, b) => (b.ts ?? 0) - (a.ts ?? 0))[0]?.sessionId;
 }
 function codexChildSessionGhost(sessionId, transcriptPrefix, hookPid, tracked) {
   if (transcriptPrefix.trim().length > 0)
@@ -3729,7 +3732,7 @@ function allowAlwaysLine(agent, toolName, toolInput, suggestions) {
   return decisionLine(agent, { hookEventName: "PermissionRequest", decision });
 }
 function answerLine(agent, toolName, toolInput, answers) {
-  if (!isAnswerTool(toolName) || !Array.isArray(answers))
+  if (!isAnswerTool(toolName, agent) || !Array.isArray(answers))
     return;
   const questions = usableQuestions(toolInput);
   if (questions.length === 0)
@@ -3833,8 +3836,8 @@ function isQuestionTool(toolName) {
   return toolName === "AskUserQuestion" || toolName === "request_user_input" || toolName === OPENCODE_QUESTION_TOOL;
 }
 var OPENCODE_QUESTION_TOOL = "question";
-function isAnswerTool(toolName) {
-  return toolName === "AskUserQuestion" || toolName === OPENCODE_QUESTION_TOOL;
+function isAnswerTool(toolName, agent) {
+  return toolName === "AskUserQuestion" || agent === "opencode" && toolName === OPENCODE_QUESTION_TOOL;
 }
 function buildPermissionSummary(toolName, toolInput) {
   const str = (v) => typeof v === "string" && v.length > 0 ? v : undefined;
@@ -4035,7 +4038,7 @@ function permissionFrame(base, detail, omitted, questions = []) {
   };
 }
 function emitDecision(agent, answer, toolName, toolInput, suggestions, emit, trace) {
-  const isQuestion = isAnswerTool(toolName);
+  const isQuestion = isAnswerTool(toolName, agent);
   switch (answer.decision) {
     case "allow":
       if (isQuestion) {

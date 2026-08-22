@@ -1458,6 +1458,22 @@ describe("Claude fork/clear lineage classifiers", () => {
     expect(claudeClearPredecessor(newId, 42, tracked)).toBe("newer-old");
     expect(claudeAdapter.clearPredecessor!({ sessionId: newId, hookPid: 42, tracked })).toBe("newer-old");
   });
+
+  // THE SIXTH COERCION: this filter used to read `agent !== "codex"`, which only meant "claude" while
+  // claude and codex were the whole world. An OpenCode row — or any literal a newer peer install
+  // stamps — shares the pid space, and a Claude `/clear` would have retired somebody else's session.
+  test("clear NEVER retires another agent's row: claude-only, not merely not-codex", () => {
+    const tracked: TrackedSessionLite[] = [
+      { sessionId: "oc", pid: 42, ts: 30, agent: "opencode" },
+      { sessionId: "future", pid: 42, ts: 40, agent: "somethingnew" as never },
+    ];
+    expect(claudeClearPredecessor(newId, 42, tracked)).toBeUndefined();
+    // …while the record that OMITS the key is claude (the wire discipline) and still matches, even
+    // with those two newer rows sitting in front of it.
+    expect(claudeClearPredecessor(newId, 42, [...tracked, { sessionId: oldId, pid: 42, ts: 10 }])).toBe(oldId);
+    // An EXPLICIT agent:"claude" matches too — both spellings name the same agent.
+    expect(claudeClearPredecessor(newId, 42, [{ sessionId: oldId, pid: 42, ts: 10, agent: "claude" }])).toBe(oldId);
+  });
 });
 
 describe("codexRolloutExistsForSession (filename-only scan under sessions/YYYY/MM/DD)", () => {

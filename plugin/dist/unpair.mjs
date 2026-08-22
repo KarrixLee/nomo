@@ -97,7 +97,7 @@ async function sha256Hex(s) {
 }
 
 // src/core/shared.ts
-var PLUGIN_VERSION = "2.1.18";
+var PLUGIN_VERSION = "2.1.19";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -787,7 +787,7 @@ function watchdogHolderIsLive(pid, deps = {}) {
 function ensureWatchdog(deps = {}) {
   try {
     if (process.env.NOMO_SKIP_WATCHDOG === "1")
-      return;
+      return false;
     const pidPath = deps.pidPath ?? WATCHDOG_PID_PATH;
     const version = deps.version ?? PLUGIN_VERSION;
     const build = "build" in deps ? deps.build : watchdogBuildStamp();
@@ -808,16 +808,19 @@ function ensureWatchdog(deps = {}) {
     if (holder && watchdogHolderIsLive(holder.pid, deps)) {
       if (holder.version === version) {
         if (!watchdogBuildDiffers(holder.build, build))
-          return;
+          return true;
       } else if (!watchdogVersionOutranks(version, holder.version)) {
-        return;
+        return true;
       }
       try {
         killPid(holder.pid, "SIGTERM");
       } catch {}
     }
     spawnWatchdog();
-  } catch {}
+    return false;
+  } catch {
+    return false;
+  }
 }
 async function readRecord(sessionId, sessionsDir = SESSIONS_DIR) {
   try {

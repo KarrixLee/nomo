@@ -88,6 +88,23 @@ function spawnWatchdog(): void {
   spawn(runtime, [WATCHDOG_PATH], { detached: true, stdio: "ignore" }).unref();
 }
 
+/** How long a CONFIRMED-live watchdog is taken on trust before we look again. A hook pays the check
+ *  once per process; this plugin is RESIDENT and calls it on every frame, and the check is not cheap —
+ *  it hashes the whole ~341 KB watchdog bundle and forks a `ps` — all of it on the thread OpenCode
+ *  runs its own server on. A minute of trust turns steady-state frames into no syscalls at all while
+ *  still re-verifying often enough that a daemon killed mid-session is respawned long before the
+ *  worker's one-hour eviction would matter. */
+const WATCHDOG_TRUST_MS = 60_000;
+/** When that trust expires. Only a POSITIVE verdict extends it (ensureWatchdog's return): a spawn, a
+ *  failure, or the test opt-out leaves it in the past, so the very next frame checks again. */
+let watchdogTrustedUntil = 0;
+
+/** The resident twin of a hook's bare `ensureWatchdog()` call — same guarantee, TTL'd. */
+function ensureWatchdogCached(now: number): void {
+  if (now < watchdogTrustedUntil) return;
+  watchdogTrustedUntil = ensureWatchdog({ spawnWatchdog }) ? now + WATCHDOG_TRUST_MS : 0;
+}
+
 interface OcContext {
   config: Config;
   machine: string;
@@ -143,7 +160,7 @@ async function send(ctx: OcContext, frame: OcFrame): Promise<void> {
     "opencode", frame.startedAt, frame.turnStartedAt, undefined, frame.title, ctx.config.pairingId,
     frame.model, false, process.pid, ctx.origin, false, undefined, undefined, planFull,
   );
-  ensureWatchdog({ spawnWatchdog });
+  ensureWatchdogCached(now);
   // Liveness stamp — the OpenCode twin of the one runHook writes for Claude/Codex (core/hook.ts). It
   // is the ONLY on-disk proof this resident plugin is loaded and producing frames: OpenCode has no
   // hooks to count and no transcript directory to date, so without it `nomo status` cannot tell "the

@@ -116,6 +116,19 @@ function run(cmd, args) {
 const git = (...args) =>
   (spawnSync("git", ["-C", CHECKOUT, ...args], { encoding: "utf8" }).stdout || "").trim();
 
+/** Does this `git remote get-url origin` output name EXACTLY our repo? Anchored on the owner/name
+ *  SEGMENT, because a substring test also accepts `KarrixLee/nomo-evil` (or any URL that merely
+ *  contains the name) — and what follows this check is a `git pull` aimed at that checkout. Both
+ *  spellings git writes are accepted: `https://host/owner/name[.git][/]` and `git@host:owner/name…`. */
+const REMOTE_IS_OURS = new RegExp(`(^|[/:])${REPO}(\\.git)?/?$`);
+/** @param {string} remote */
+const isOurCheckout = (remote) => REMOTE_IS_OURS.test(remote.trim());
+
+/** THE one interactivity gate. Both ends have to be a terminal: with stdin piped there is nobody to
+ *  answer the arrow menu, and with stdout piped the menu is painted into a file. Checking only one of
+ *  them (stdin here, stdout there) is how the same piped run took two different paths. */
+const interactive = () => Boolean(process.stdin.isTTY && process.stdout.isTTY);
+
 // ── the three agents ─────────────────────────────────────────────────────────────────────────────
 //
 // `detect` is "is this agent on this machine at all" (binary or config dir — a user who has run the
@@ -195,7 +208,7 @@ const AGENTS = [
       if (existsSync(join(CHECKOUT, ".git"))) {
         // Somebody else's ~/.nomo would get a `git pull` aimed at it. Prove it is ours first.
         const remote = git("remote", "get-url", "origin");
-        if (!remote.includes(REPO)) {
+        if (!isOurCheckout(remote)) {
           return {
             error: `${CHECKOUT} is a git checkout of something else (origin: ${remote || "?"})`,
             hint: `Move it aside, then re-run. Or install from a checkout you already have:\n    <checkout>/plugin/scripts/opencode-install.sh`,
@@ -522,7 +535,7 @@ function chooseArrows(selected) {
 
 /** @param {Set<string>} selected @returns {Promise<"install"|"quit"|"interrupt">} */
 async function choose(selected) {
-  if (process.stdout.isTTY && typeof process.stdin.setRawMode === "function") {
+  if (interactive() && typeof process.stdin.setRawMode === "function") {
     const result = await chooseArrows(selected);
     if (result !== "fallback") return result;
   }
@@ -669,7 +682,7 @@ async function main() {
   // just spelled out is theatre. Otherwise: prompt unless told not to, and refuse to guess when there
   // is no terminal to ask (a CI run that silently installed three agents is the worse outcome).
   if (!explicit && !args.yes) {
-    if (!process.stdin.isTTY) {
+    if (!interactive()) {
       err("\nnomo-ai: not a terminal, so there is nobody to ask.");
       err("  Pass --yes to install everything detected, or name agents: --claude --codex --opencode / --all.");
       return 2;
