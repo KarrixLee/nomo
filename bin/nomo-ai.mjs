@@ -49,12 +49,19 @@ const CLONE_URL = `https://github.com/${REPO}.git`;
 const CHECKOUT = join(homedir(), ".nomo");
 
 // THE HOSTS' OWN UPDATE COMMANDS — printed for the user to run, never executed here (see the header).
-// Claude has a first-class `plugin update`. Codex has no such verb at all: `codex plugin` is
-// add/list/marketplace/remove, and refreshing means upgrading the marketplace SNAPSHOT and then
-// re-adding the plugin from it. Checked against `codex plugin --help` rather than assumed to mirror
-// Claude's, because a guessed command run inside someone's editor is worse than a correct one printed.
+//
+// Claude has a first-class `plugin update`, and it is the ONLY thing that moves a Nomo install. Claude
+// Code does auto-update plugins, but per-marketplace behind an `autoUpdate` flag that defaults ON for
+// Anthropic-official marketplaces and OFF for third-party and local ones — measured, not assumed: on a
+// machine here an official plugin moved 6.2.0 → 6.3.0 unattended while three third-party marketplaces
+// had no `.git/FETCH_HEAD` at all, i.e. nothing had ever pulled them since clone. Nomo is third-party.
+// Dropping this row would strand every user.
+//
+// Codex has no update verb whatsoever — `codex plugin` is add/list/marketplace/remove — so its row is
+// GATED on how the marketplace was added and is built in preflight(); see codexMarketplaceSourceType.
 const CLAUDE_UPDATE = "claude plugin update nomo-cc@nomo";
-const CODEX_UPDATE = ["codex plugin marketplace upgrade nomo", "codex plugin add nomo@nomo"];
+/** The plan lines for a host that already has Nomo. A two-space prefix marks a line to TYPE. */
+const CLAUDE_ROW = ["already installed — update it yourself with:", `  ${CLAUDE_UPDATE}`];
 
 const VERSION = JSON.parse(
   readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", "package.json"), "utf8"),
@@ -175,13 +182,56 @@ const UPDATE_ENTRY = join(CHECKOUT, "plugin", "dist", "opencode-update.mjs");
  *  NO VERSION IS REPORTED, on purpose: the cache keeps every version a host has ever fetched and the
  *  enabled one is recorded elsewhere, so the newest directory is a guess. A wrong version number here
  *  is worse than none.
- *  @param {string} cacheDir @param {string} plugin */
+ *
+ *  Returns the MARKETPLACE NAME rather than a boolean, because Codex's update command names it and
+ *  that name is user-chosen — `nomo` is only what our own install happens to produce. It falls out of
+ *  the same scan for free, so nothing here guesses it.
+ *  @param {string} cacheDir @param {string} plugin @returns {string | undefined} */
 function hostHasNomo(cacheDir, plugin) {
   try {
-    return readdirSync(cacheDir).some((marketplace) => existsSync(join(cacheDir, marketplace, plugin)));
+    return readdirSync(cacheDir).find((marketplace) => existsSync(join(cacheDir, marketplace, plugin)));
   } catch {
-    return false; // no cache directory at all — nothing installed
+    return undefined; // no cache directory at all — nothing installed
   }
+}
+
+/** `source_type` for one Codex marketplace, read out of ~/.codex/config.toml.
+ *
+ *  WHY IT DECIDES THE CODEX ROW. There is no `codex plugin update` verb at all, and what "update"
+ *  means depends entirely on how the marketplace was added — which is exactly what this key records:
+ *
+ *    "git"   → Codex holds a SNAPSHOT, and `codex plugin marketplace upgrade <name>` refreshes it.
+ *              That refresh IS the plugin update, so it is worth printing.
+ *    "local" → Codex reads the plugin LIVE from the path; there is no snapshot and no versioned cache
+ *              to refresh. A `git pull` in that directory is the whole update and there is nothing for
+ *              the user to run, so printing a command would send them chasing a no-op.
+ *
+ *  Missing, unreadable, or any other value is treated as "not git" for the same reason: a missing line
+ *  is invisible, a wrong one costs somebody an afternoon.
+ *
+ *  A five-line scan, not a TOML parser. This package's only real security claim is that it has zero
+ *  dependencies, and one key out of one section does not justify spending it. Both spellings Codex can
+ *  write are accepted — bare `[marketplaces.nomo]` and quoted `[marketplaces."my nomo"]`.
+ *  @param {string} name @returns {string | undefined} */
+function codexMarketplaceSourceType(name) {
+  let text;
+  try {
+    text = readFileSync(join(homedir(), ".codex", "config.toml"), "utf8");
+  } catch {
+    return undefined;
+  }
+  let inSection = false;
+  for (const raw of text.split("\n")) {
+    const line = raw.trim();
+    if (line.startsWith("[")) {
+      inSection = line === `[marketplaces.${name}]` || line === `[marketplaces."${name}"]`;
+      continue;
+    }
+    if (!inSection) continue;
+    const m = /^source_type\s*=\s*"([^"]*)"/.exec(line);
+    if (m) return m[1];
+  }
+  return undefined;
 }
 
 /** What preflight() learned, keyed by agent id: `{ installed, lines }`. Read by plan(), which the
@@ -189,12 +239,13 @@ function hostHasNomo(cacheDir, plugin) {
  *  whole reason it is a cache and not a function. */
 const STATUS = new Map();
 
-/** An agent that owns its own updates: show the command, never run it. Returns null because from the
- *  caller's point of view this leg succeeded — there was simply nothing for us to do.
- *  @param {string[]} cmds */
-function showUpdate(cmds) {
-  say(`  ${dim("already installed — this host owns its own update, so run it yourself:")}`);
-  for (const c of cmds) say(`    ${bold(c)}`);
+/** An agent that owns its own updates: say what the plan row already said, and run nothing. Returns
+ *  null because from the caller's point of view this leg succeeded — there was simply nothing for us
+ *  to do. The two-space prefix marks a line the user is meant to TYPE, which is the same convention
+ *  the plan rows use, so a row with no command to type simply has no bold line.
+ *  @param {string[]} lines */
+function showUpdate(lines) {
+  for (const l of lines) say(l.startsWith("  ") ? `    ${bold(l.trim())}` : `  ${dim(l)}`);
   return null;
 }
 
@@ -210,9 +261,8 @@ const AGENTS = [
     id: "claude",
     label: "Claude Code",
     plan: () =>
-      STATUS.get("claude")?.installed
-        ? ["already installed — update it yourself with:", `  ${CLAUDE_UPDATE}`]
-        : [`claude plugin marketplace add ${REPO}`, `claude plugin install nomo-cc@nomo -y`],
+      STATUS.get("claude")?.lines ??
+      [`claude plugin marketplace add ${REPO}`, `claude plugin install nomo-cc@nomo -y`],
     next: () =>
       STATUS.get("claude")?.installed
         ? [`run \`${CLAUDE_UPDATE}\`, then restart Claude Code`]
@@ -220,7 +270,7 @@ const AGENTS = [
     detect: () => onPath("claude") || existsSync(join(homedir(), ".claude")),
     installed: () => hostHasNomo(join(homedir(), ".claude", "plugins", "cache"), "nomo-cc"),
     install() {
-      if (STATUS.get("claude")?.installed) return showUpdate([CLAUDE_UPDATE]);
+      if (STATUS.get("claude")?.installed) return showUpdate(CLAUDE_ROW);
       if (!onPath("claude")) {
         return {
           error: "`claude` is not on PATH",
@@ -246,19 +296,19 @@ const AGENTS = [
     id: "codex",
     label: "OpenAI Codex",
     plan: () =>
-      STATUS.get("codex")?.installed
-        ? ["already installed — update it yourself with:", ...CODEX_UPDATE.map((c) => `  ${c}`)]
-        : [`codex plugin marketplace add ${REPO}`, `codex plugin add nomo@nomo`],
+      STATUS.get("codex")?.lines ?? [`codex plugin marketplace add ${REPO}`, `codex plugin add nomo@nomo`],
     // The /hooks step is Codex's own safety gate and nothing here can pre-approve it. Skipping it
     // leaves the plugin installed and silently doing nothing, so it leads the list.
     next: () =>
       STATUS.get("codex")?.installed
-        ? ["run the two commands above, then re-run /hooks if Codex asks again"]
+        ? STATUS.get("codex").lines.some((l) => l.startsWith("  "))
+          ? ["run the command above, then restart Codex"]
+          : ["nothing to run here — this row printed no command on purpose"]
         : ["run /hooks in Codex and trust the seven Nomo entries", "run $nomo-pair"],
     detect: () => onPath("codex") || existsSync(join(homedir(), ".codex")),
     installed: () => hostHasNomo(join(homedir(), ".codex", "plugins", "cache"), "nomo"),
     install() {
-      if (STATUS.get("codex")?.installed) return showUpdate(CODEX_UPDATE);
+      if (STATUS.get("codex")?.installed) return showUpdate(STATUS.get("codex").lines);
       if (!onPath("codex")) {
         return {
           error: "`codex` is not on PATH",
@@ -412,6 +462,28 @@ const AGENTS = [
  *  @param {Set<string>} selected @param {boolean} explicit */
 function preflight(selected, explicit) {
   for (const a of AGENTS) STATUS.set(a.id, { installed: a.installed() });
+
+  if (STATUS.get("claude").installed) STATUS.get("claude").lines = CLAUDE_ROW;
+
+  // THE CODEX GATE. `installed` carries the marketplace NAME, and its source_type says whether an
+  // update is a command at all. A local marketplace is read live, so there is genuinely nothing to
+  // run — and every marketplace Codex ships with is local, which makes that the common case rather
+  // than the corner one. Saying "installed" and stopping is the honest row; a command that no-ops is
+  // not a smaller mistake for being well meant.
+  const codex = STATUS.get("codex");
+  if (codex.installed) {
+    // Three answers, not two: an UNKNOWN source_type must not borrow local's explanation. Claiming
+    // "Codex reads it live" when the file could not be read is the same wrong-line mistake, one level
+    // up. It says the one thing it is sure of and stops.
+    const kind = codexMarketplaceSourceType(codex.installed);
+    codex.lines =
+      kind === "git"
+        ? ["already installed — update it yourself with:", `  codex plugin marketplace upgrade ${codex.installed}`]
+        : kind === "local"
+          ? ["already installed — Codex reads this one live from a local marketplace, so pulling that", "checkout is the whole update and there is no Codex command to run"]
+          : ["already installed"];
+  }
+
   const oc = STATUS.get("opencode");
   // The menu shows every agent, so the answer is needed whether or not OpenCode is ticked — but a
   // caller who named their agents will never see that row, and owes nobody a network call.

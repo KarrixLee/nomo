@@ -146,19 +146,32 @@ the week.
 **It updates as well as installs**, and only one leg does it for you. An agent that already has Nomo
 shows an update in the plan instead of an install. For OpenCode that update really runs — it is the
 only agent with no host update path, so `~/.nomo` is fetched, compared and pulled by the same code
-`/nomo-update` uses. For Claude Code and Codex the row **prints** the host's own command and runs
-nothing:
+`/nomo-update` uses. For Claude Code the row **prints** the host's own command and runs nothing:
 
 ```sh
 claude plugin update nomo-cc@nomo
-codex plugin marketplace upgrade nomo && codex plugin add nomo@nomo
 ```
 
-That asymmetry is deliberate. Those two already update in one command you own, so running it for you
+Claude Code does auto-update plugins, but per-marketplace behind an `autoUpdate` flag that defaults
+**on** for Anthropic-official marketplaces and **off** for third-party and local ones. Nomo is
+third-party, so that command is the only thing that moves your install.
+
+**Codex has no update verb at all** — `codex plugin` is add/list/marketplace/remove — so its row is
+gated on how the marketplace was added, which `~/.codex/config.toml` records as `source_type`:
+
+| `source_type` | what an update is | the row |
+| --- | --- | --- |
+| `local` | Codex reads the plugin **live from the path**; a `git pull` there is the whole update | prints no command — there is nothing to run |
+| `git` | Codex holds a snapshot, and refreshing it *is* the plugin update | `codex plugin marketplace upgrade <marketplace>` |
+| missing / unreadable | unknown | prints no command |
+
+Every marketplace Codex ships with is local, so "nothing to run" is the common case, not the corner
+one. A printed no-op is worse than a missing line: one is invisible, the other sends you chasing it.
+
+The asymmetry is deliberate. Both hosts already update in one command you own, so running it for you
 buys almost nothing — and install begins with `marketplace add`, which would silently repoint a
-marketplace you had aimed somewhere else (a local checkout, a fork) and send every later
-`claude plugin update` to the wrong place. Repointing a marketplace is install-time behaviour; it has
-no business in an update.
+marketplace you had aimed somewhere else (a local checkout, a fork) and send every later update to the
+wrong place. Repointing a marketplace is install-time behaviour; it has no business in an update.
 
 `--ref` exists for testing a branch or tag before it merges, and it reaches **one leg**: the OpenCode
 checkout is the only thing the installer owns. `claude plugin marketplace add` and `codex plugin
