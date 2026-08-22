@@ -1164,7 +1164,7 @@ function defaultWriteHold(): (sessionId: string, hold: DecisionHold) => Promise<
 }
 
 function defaultClearHold(): (
-  sessionId: string, pid: number, beforeUnlink?: () => Promise<void>,
+  sessionId: string, pid: number, beforeUnlink?: () => Promise<void>, holdId?: string,
 ) => Promise<boolean> {
   return lanRunningUnderTest()
     // The test stand-in still RUNS the settle callback (which is itself a no-op under `bun test`, see
@@ -1204,7 +1204,7 @@ export interface PermissionHookDeps {
   /** Retires the marker, and answers whether this process actually OWNED it. `beforeUnlink` — the record
    *  settle below — runs only when it did, and always BEFORE the unlink (see clearDecisionHoldAt). */
   clearHoldFn?: (
-    sessionId: string, pid: number, beforeUnlink?: () => Promise<void>,
+    sessionId: string, pid: number, beforeUnlink?: () => Promise<void>, holdId?: string,
   ) => Promise<boolean>;
   /** Moves the SESSION RECORD out of the state the hold overlaid, on the way out (field reports R2/R3 —
    *  see settleDecisionHoldRecordAt). Defaults to the real record patcher in production and to a NO-OP
@@ -1214,6 +1214,11 @@ export interface PermissionHookDeps {
   /** The pid stamped as the hold's OWNER (defaults to this process). Injected so a test can drive the
    *  compare-and-clear rule without spawning processes. */
   holdPid?: number;
+  /** OPTIONAL per-hold discriminator stamped alongside `holdPid`, for a caller whose concurrent holds
+   *  all run in ONE process (OpenCode's resident plugin passes its decision id here). Absent for the
+   *  Claude/Codex hooks — one hold per short-lived process, so the pid IS the discriminator and their
+   *  marker keeps its exact byte shape. See DecisionHold.holdId. */
+  holdId?: string;
   /** Resolve Codex's effective per-turn approval policy from its rollout. Tests inject this so no
    *  local Codex state is touched; Claude never calls it. */
   loadCodexTurnPolicyFn?: (
@@ -1712,7 +1717,9 @@ export async function runPermissionHook(
       ));
     } catch { /* the card without its breadcrumb is still the card */ }
     await (deps.writeHoldFn ?? defaultWriteHold())(
-      sessionId, { blob: holdBlob, at: holdAt, pid: holdPid },
+      // `holdId` is APPEND-LAST and omitted unless the caller supplied one, so the hook agents' marker
+      // stays byte-for-byte what it was; see DecisionHold.holdId for who needs it and why.
+      sessionId, { blob: holdBlob, at: holdAt, pid: holdPid, ...(deps.holdId ? { holdId: deps.holdId } : {}) },
     );
     heldSessionId = sessionId;
 
@@ -1906,7 +1913,9 @@ export async function runPermissionHook(
     if (heldSessionId !== undefined) {
       try {
         await (deps.clearHoldFn ?? defaultClearHold())(
-          heldSessionId, deps.holdPid ?? process.pid, settleHeldRecord,
+          // `holdId` (undefined for the hook agents) is what keeps a sibling hold running in the SAME
+          // process from being cleared by ours — the pid compare cannot tell those two apart.
+          heldSessionId, deps.holdPid ?? process.pid, settleHeldRecord, deps.holdId,
         );
       } catch { /* best-effort */ }
     }

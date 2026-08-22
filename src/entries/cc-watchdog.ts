@@ -263,6 +263,18 @@ export function buildEndEnvelope(sessionId: string, now: number, record?: Sessio
   };
 }
 
+/** The plan a REBUILT blob should restate: the record's parked copy for an agent whose plan is
+ *  ambient session state (OpenCode's live todo list), and nothing at all for everyone else.
+ *
+ *  Per-agent behaviour comes from the adapter, never an inline `agent === …` branch in this daemon —
+ *  the same rule `blobAgentFields` follows. Claude's and Codex's `planFull` is a one-shot ExitPlanMode
+ *  / update_plan proposal owned by ONE attention episode (only buildNeedsAttentionEnvelope passes a
+ *  plan, and it is handed one explicitly), so they keep the `undefined` these builders always passed
+ *  and their frames stay byte-identical. */
+function ambientPlan(agent: AgentKindWire, record: SessionRecord): string | undefined {
+  return adapterFor(agent).ambientPlan ? record.planFull : undefined;
+}
+
 /** The interrupt-corrective envelope: a v2 op:done carrying a freshly-encrypted blob with status
  *  "done" and the record's machine/label (coerced to "" if a corrupt record dropped them). title is
  *  the record's cached last non-empty title (the hook stamps it on every emit) — the watchdog has no
@@ -305,7 +317,11 @@ export async function buildDoneEnvelope(sessionId: string, record: SessionRecord
     agent === "codex" ? dbg ?? formatPlanPickerDebug({ event: "done", classifier: "done", marker: "0", by: "wd" }) : undefined,
     codexBridgeIsDown(),
   );
-  const blob = await encryptBlob(e2eKey, appendFittedPlanAndDebug(base, undefined, debug));
+  // The record's parked plan, restated ONLY for an agent whose plan is ambient session state (see
+  // AgentAdapter.ambientPlan — OpenCode's live todo list). Claude/Codex plans are one-shot proposals
+  // tied to an attention episode, so their correctives keep passing the `undefined` they always have
+  // and stay byte-identical.
+  const blob = await encryptBlob(e2eKey, appendFittedPlanAndDebug(base, ambientPlan(agent, record), debug));
   return { v: 2, sessionId, op: "done", prio: 0, ts: now, blob, ...startedAtField(record) };
 }
 
@@ -389,7 +405,8 @@ export async function buildWorkingEnvelope(
     agent === "codex" ? dbg ?? formatPlanPickerDebug({ event: "working", classifier: "resolved", marker: "0", by: "wd" }) : undefined,
     codexBridgeIsDown(),
   );
-  const blob = await encryptBlob(e2eKey, appendFittedPlanAndDebug(base, undefined, debug));
+  // The record's parked plan for an ambient-plan agent only — see buildDoneEnvelope's note.
+  const blob = await encryptBlob(e2eKey, appendFittedPlanAndDebug(base, ambientPlan(agent, record), debug));
   return { v: 2, sessionId, op: "update", prio: 0, ts: now, blob, ...startedAtField(record) };
 }
 

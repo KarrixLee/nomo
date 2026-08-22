@@ -1410,7 +1410,12 @@ async function flushPendingStash(
           // Carry the agent so a LATER interrupt/heartbeat on this flushed session uses the right
           // marker. The stash's plaintext blob already holds `agent` (buildBlob stamped it), so we
           // derive it from there rather than adding a redundant top-level stash field.
-          ...(stash.blob.agent === "codex" ? { agent: "codex" as const } : {}),
+          //
+          // THE SAME OMIT-FOR-CLAUDE RULE every other producer uses (hook.ts's blob/record literals,
+          // lan-frames' two frame builders): absent MEANS claude, and any OTHER kind rides out
+          // verbatim. A binary `=== "codex"` test here silently demoted opencode — and every future
+          // agent a newer peer install may have stamped — to Claude Code for the flushed session's life.
+          ...(stash.blob.agent && stash.blob.agent !== "claude" ? { agent: stash.blob.agent } : {}),
           // Cache the stash's title (if any) and the pairing this blob was sealed under, mirroring
           // trackSession — so a watchdog corrective keeps the title and the heartbeat's key-rotation
           // guard can prove the blob decryptable.
@@ -1861,6 +1866,17 @@ export interface DecisionHold {
   /** The HOLDING HOOK's own pid (not the session's). The feed probes it for liveness, which is what
    *  makes a killed hook release the card in one reconcile pass instead of at the TTL. */
   pid: number;
+  /** APPEND-LAST, OPTIONAL. The holding DECISION's id — the compare-and-clear discriminator for an
+   *  agent whose holds all share one process.
+   *
+   *  Claude and Codex run one hold per short-lived hook PROCESS, so `pid` alone identifies the owner
+   *  and this key is absent (a byte-identical marker to the one they always wrote). OpenCode's holds
+   *  all run inside the ONE resident server, so every concurrent hold in a session stamps the same
+   *  `pid`: without this the first hold to settle passed the pid compare against the SECOND hold's
+   *  marker, unlinked it and re-sealed the record to working — taking down a card the user was still
+   *  looking at and masking the live decisionPending. Never read by the feed (it probes `pid`, which
+   *  is still the truthful liveness handle) — only by clearDecisionHoldAt. */
+  holdId?: string;
 }
 
 /** Deliberately NOT `.json`: every other readdir consumer of SESSIONS_DIR filters on that extension
@@ -1894,6 +1910,12 @@ export async function writeDecisionHoldAt(
  *  needs (see settleDecisionHoldRecordAt): if a parallel tool's newer hold owns this session, our exit
  *  must move neither the marker nor the record, or we would drop a card the user is still looking at.
  *
+ *  `holdId` IS THE SAME RULE FOR AN AGENT WHOSE HOLDS SHARE A PROCESS. OpenCode runs every hold inside
+ *  the one resident server, so pid can no longer tell two concurrent holds in a session apart and the
+ *  first to settle would clear the second's marker (see DecisionHold.holdId). It is compared only when
+ *  BOTH sides have one, so the hook agents — which pass none and write none — take the identical pid
+ *  path they always did.
+ *
  *  `beforeUnlink` runs ONLY when the compare-and-clear accepts, and ALWAYS BEFORE the unlink — this
  *  function is the one place that knows both facts. The order is load-bearing: the LAN frames feed reads
  *  the record and the marker independently per reconcile pass, so a pass that observed "marker gone +
@@ -1901,15 +1923,18 @@ export async function writeDecisionHoldAt(
  *  throwing callback still retires the marker (a wedged card is worse than a stale record). */
 export async function clearDecisionHoldAt(
   sessionsDir: string, sessionId: string, pid: number,
-  beforeUnlink?: () => Promise<void>,
+  beforeUnlink?: () => Promise<void>, holdId?: string,
 ): Promise<boolean> {
   const path = `${sessionsDir}/${decisionHoldFileName(sessionId)}`;
   try {
     const raw = await readFile(path, "utf8").catch(() => undefined);
     if (raw !== undefined) {
-      let owner: number | undefined;
-      try { owner = (JSON.parse(raw) as DecisionHold).pid; } catch { owner = undefined; }
+      let marker: DecisionHold | undefined;
+      try { marker = JSON.parse(raw) as DecisionHold; } catch { marker = undefined; }
+      const owner = marker?.pid;
       if (typeof owner === "number" && owner !== pid) return false; // a newer hold owns this session now
+      // Same session, same process, DIFFERENT decision — a sibling hold stamped over ours.
+      if (holdId !== undefined && typeof marker?.holdId === "string" && marker.holdId !== holdId) return false;
     }
     if (beforeUnlink !== undefined) {
       try { await beforeUnlink(); } catch { /* the marker still goes — see the header */ }
@@ -1971,9 +1996,9 @@ export async function writeDecisionHold(sessionId: string, hold: DecisionHold): 
 }
 
 export async function clearDecisionHold(
-  sessionId: string, pid: number, beforeUnlink?: () => Promise<void>,
+  sessionId: string, pid: number, beforeUnlink?: () => Promise<void>, holdId?: string,
 ): Promise<boolean> {
-  return clearDecisionHoldAt(SESSIONS_DIR, sessionId, pid, beforeUnlink);
+  return clearDecisionHoldAt(SESSIONS_DIR, sessionId, pid, beforeUnlink, holdId);
 }
 
 export async function settleDecisionHoldRecord(

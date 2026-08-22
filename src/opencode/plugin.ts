@@ -30,7 +30,8 @@ import {
   ocDecisionRequest, OcDecisionRequest, ocPost, ocResolvedRequestId, ocResolveOnRelay, runOcApproval,
 } from "./approvals";
 import {
-  newOcState, ocAttentionFrame, ocEndFrames, OcFrame, OcState, postOcEvent, reduceOcEvent,
+  newOcState, ocAttentionFrame, ocEndFrames, ocForgetStatusFrame, OcFrame, OcState, postOcEvent,
+  reduceOcEvent,
 } from "./state";
 
 /** The verified-live shape of OpenCode's `PluginInput` (1.18.15). Declared structurally rather than
@@ -118,13 +119,23 @@ async function send(ctx: OcContext, frame: OcFrame): Promise<void> {
     { op: frame.op, prio: frame.prio, status: frame.status },
     undefined, frame.plan, undefined, (plain) => { fittedPlan = plain.plan; }, frame.detail,
   );
-  if (!envelope) return;
-  const planFull = fullTextForRecord(frame.plan, fittedPlan);
+  // An unsealable frame reaches the phone exactly as little as a failed POST does — retract the skip
+  // key for the same reason (see ocForgetStatusFrame).
+  if (!envelope) { ocForgetStatusFrame(ctx.state, frame.sessionId); return; }
+  /** The WHOLE todo list, capped, parked on the session record — even when it fitted the blob whole.
+   *  This is the only copy of an OpenCode plan any REBUILT frame has: a watchdog corrective or a LAN
+   *  record-terminal frame re-seals a fresh plaintext from the record and would otherwise ship the row
+   *  with no plan at all until the next plugin-authored frame (see the adapter's `ambientPlan`). It
+   *  also serves the LAN `read` op, which simply returns the same text the blob already carries when
+   *  nothing was cut. */
+  const planFull = fullTextForRecord(frame.plan, undefined);
   // Started BEFORE the event POST and awaited after, exactly like the permission hold's own upload: a
-  // parked list must never sit in front of the frame that puts the row on the phone. Undefined content
-  // (the overwhelmingly common case — a real todo list maxes at ~972 chars against an 1800 budget) is a
-  // no-op inside postFullText: no upload, no KV write.
-  const fullUpload = postFullText(ctx.config, frame.sessionId, "plan", planFull);
+  // parked list must never sit in front of the frame that puts the row on the phone. The UPLOAD is
+  // still gated on something actually having been CUT (`fullTextForRecord` against the fitted copy →
+  // undefined when the blob already carries the whole list), which is the overwhelmingly common case —
+  // a real todo list maxes at ~972 chars against an 1800 budget — and is a no-op inside postFullText:
+  // no upload, no KV write.
+  const fullUpload = postFullText(ctx.config, frame.sessionId, "plan", fullTextForRecord(frame.plan, fittedPlan));
   await trackSession(
     frame.sessionId, frame.op, frame.prio, frame.status, envelope.blob as string | undefined,
     ctx.machine, ctx.folder,
@@ -141,6 +152,8 @@ async function send(ctx: OcContext, frame: OcFrame): Promise<void> {
   await atomicWrite(lastHookPath("opencode"), String(now)).catch(() => {});
   const delivered = await postOcEvent(ctx.config, envelope);
   if (delivered && frame.op === "done") await markDoneDelivered(frame.sessionId);
+  // NOT delivered → the phone never saw this frame, so the reducer must stop believing it did.
+  if (!delivered) ocForgetStatusFrame(ctx.state, frame.sessionId);
   await fullUpload;
 }
 

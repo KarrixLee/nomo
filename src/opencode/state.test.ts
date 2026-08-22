@@ -1,8 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import { PLAN_BLOB_TEXT_MAX_CHARS } from "../core/shared";
 import {
-  isDefaultOcTitle, newOcState, ocAttentionFrame, ocEndFrames, ocModelFromMessage, ocTodoMarkdown,
-  reduceOcEvent,
+  isDefaultOcTitle, newOcState, ocAttentionFrame, ocEndFrames, ocForgetStatusFrame, ocModelFromMessage,
+  ocTodoMarkdown, reduceOcEvent,
 } from "./state";
 import type { OcState } from "./state";
 
@@ -86,15 +86,14 @@ describe("reduceOcEvent lifecycle", () => {
     expect(frame?.turnStartedAt).toBe(60);
   });
 
-  test("session.status {retry} carries the retry message as detail", () => {
+  test("session.status {retry} carries the FIXED `retrying` key, never the provider's message", () => {
     const state = startedRoot();
-    // A real free-tier-exhaustion payload.
+    // A real free-tier-exhaustion payload. `detail` is a closed key set on the phone — free text
+    // renders nothing in the widget and raw English in the app row — so the message never rides it.
     const frame = reduceOcEvent(state, status(ROOT, {
       type: "retry", attempt: 2, message: "Free usage exceeded, subscribe to Go", next: 1787097600565,
     }), 2_000);
-    expect(frame).toMatchObject({
-      op: "update", status: "working", detail: "Free usage exceeded, subscribe to Go",
-    });
+    expect(frame).toMatchObject({ op: "update", status: "working", detail: "retrying" });
   });
 
   test("session.status {idle} sends nothing — session.idle is the authoritative done", () => {
@@ -175,9 +174,11 @@ describe("title", () => {
 });
 
 describe("model", () => {
-  test("model comes from the newest ASSISTANT message.updated, as provider/model", () => {
+  test("model comes from the newest ASSISTANT message.updated, as the BARE model id", () => {
+    // The `providerID/` prefix is dropped: the phone's badge table is keyed on bare ids, and an
+    // unrecognised key is prettified verbatim ("Anthropic/claude Opus 4.6").
     expect(ocModelFromMessage({ role: "assistant", providerID: "anthropic", modelID: "claude-opus-4-6" }))
-      .toBe("anthropic/claude-opus-4-6");
+      .toBe("claude-opus-4-6");
     // A user message.updated ALSO carries a model (nested under `model`) — it is not ours to read.
     expect(ocModelFromMessage({ role: "user", model: { providerID: "opencode", modelID: "x" } }))
       .toBeUndefined();
@@ -189,9 +190,9 @@ describe("model", () => {
     expect(reduceOcEvent(state, assistantMessage(ROOT, "opencode", "nemotron-3.5-lightning-free"), 2_000))
       .toBeNull();
     expect(reduceOcEvent(state, status(ROOT, { type: "busy" }), 3_000)?.model)
-      .toBe("opencode/nemotron-3.5-lightning-free");
+      .toBe("nemotron-3.5-lightning-free");
     reduceOcEvent(state, assistantMessage(ROOT, "anthropic", "claude-opus-4-6"), 4_000);
-    expect(reduceOcEvent(state, idle(ROOT), 5_000)?.model).toBe("anthropic/claude-opus-4-6");
+    expect(reduceOcEvent(state, idle(ROOT), 5_000)?.model).toBe("claude-opus-4-6");
   });
 });
 
@@ -202,6 +203,21 @@ describe("dedupe", () => {
     // `busy` fires several times per turn with a byte-identical payload.
     expect(reduceOcEvent(state, status(ROOT, { type: "busy" }), 2_100)).toBeNull();
     expect(reduceOcEvent(state, status(ROOT, { type: "busy" }), 2_200)).toBeNull();
+  });
+
+  // The skip key means "the phone already shows this", which a FAILED POST makes false — and
+  // postOcEvent reports failure by returning false rather than throwing. The sender retracts the key
+  // for any frame it could not deliver; without that, one dropped POST silenced every byte-identical
+  // busy for the rest of the turn (~5 minutes of frozen island).
+  test("a retracted key re-sends the very next identical busy", () => {
+    const state = startedRoot();
+    expect(reduceOcEvent(state, status(ROOT, { type: "busy" }), 2_000)).not.toBeNull();
+    expect(reduceOcEvent(state, status(ROOT, { type: "busy" }), 2_100)).toBeNull();
+    ocForgetStatusFrame(state, ROOT); // ← the send failed
+    expect(reduceOcEvent(state, status(ROOT, { type: "busy" }), 2_200)).not.toBeNull();
+    // …and the skip is back in force once one lands.
+    expect(reduceOcEvent(state, status(ROOT, { type: "busy" }), 2_300)).toBeNull();
+    ocForgetStatusFrame(state, "ses_never_seen_by_this_plugin"); // an untracked session is a no-op
   });
 
   test("a changed title or model breaks the dedupe", () => {
@@ -216,16 +232,20 @@ describe("dedupe", () => {
       .toBe("Clarifying what happened");
     reduceOcEvent(state, assistantMessage(ROOT, "opencode", "nemotron-3.5-lightning-free"), 2_400);
     expect(reduceOcEvent(state, status(ROOT, { type: "busy" }), 2_500)?.model)
-      .toBe("opencode/nemotron-3.5-lightning-free");
+      .toBe("nemotron-3.5-lightning-free");
   });
 
-  test("a retry's changing message is never deduped away", () => {
+  test("a retry storm sends ONE frame — the key is fixed — and the busy that follows breaks it", () => {
     const state = startedRoot();
     const first = reduceOcEvent(state, status(ROOT, { type: "retry", attempt: 1, message: "429" }), 2_000);
-    expect(first?.detail).toBe("429");
+    expect(first?.detail).toBe("retrying");
     expect(reduceOcEvent(state, status(ROOT, { type: "retry", attempt: 2, message: "429" }), 2_100)).toBeNull();
-    expect(reduceOcEvent(state, status(ROOT, { type: "retry", attempt: 3, message: "Free usage exceeded" }), 2_200)?.detail)
-      .toBe("Free usage exceeded");
+    // A DIFFERENT message is the same rendered frame now, so it is deduped too — the provider's text
+    // was never something the phone could show (see the `retrying` key).
+    expect(reduceOcEvent(state, status(ROOT, { type: "retry", attempt: 3, message: "Free usage exceeded" }), 2_200))
+      .toBeNull();
+    // Recovery is a real change of rendered state and always gets through.
+    expect(reduceOcEvent(state, status(ROOT, { type: "busy" }), 2_300)?.detail).toBeUndefined();
   });
 });
 
@@ -441,7 +461,7 @@ describe("plan mode rides the detail seam", () => {
     const state = startedRoot();
     reduceOcEvent(state, assistantMessage(ROOT, "opencode", "nemotron-3.5-lightning-free", "plan"), 2_000);
     expect(reduceOcEvent(state, status(ROOT, { type: "retry", message: "overloaded, retrying" }), 2_100)?.detail)
-      .toBe("overloaded, retrying");
+      .toBe("retrying");
     expect(reduceOcEvent(state, idle(ROOT), 2_200)?.detail).toBeUndefined();
   });
 });

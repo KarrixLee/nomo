@@ -675,6 +675,22 @@ describe("buildStatePlaintext — the Mac-authored blob (invariants 22 and 23)",
     expect(bare).toMatchObject({ title: "", machine: "", label: "" });
   });
 
+  // OpenCode's `plan` is the session's LIVE todo list, restated by every frame the plugin sends — so a
+  // Mac-authored rebuild that dropped it blanked the phone's plan link until the next plugin frame.
+  // Claude's/Codex's planFull is a one-shot proposal owned by ONE attention episode: restating it on a
+  // working/done rollup would be a stale plan on a row that has moved on, so those frames are unchanged.
+  test("an AMBIENT plan is restated on a rebuild; a one-shot proposal never is", () => {
+    const planFull = "- [x] read the feed\n- [ ] **fix the skip**";
+    expect(buildStatePlaintext(rec({ title: "t", agent: "opencode", planFull }), "working", NOW).plan)
+      .toBe(planFull);
+    for (const agent of [undefined, "codex"]) {
+      const blob = buildStatePlaintext(rec({ title: "t", agent, planFull }), "working", NOW);
+      expect(blob).not.toHaveProperty("plan");
+    }
+    // No parked plan → nothing to restate, for anyone.
+    expect(buildStatePlaintext(rec({ title: "t", agent: "opencode" }), "done", NOW)).not.toHaveProperty("plan");
+  });
+
   test("the folder's LIVE branch rides after folderKey — the same slot the worker leg's builders use", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "nomo-lan-branch-"));
     try {

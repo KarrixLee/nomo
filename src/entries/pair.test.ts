@@ -1018,6 +1018,45 @@ describe("completePendingPairing stash flush — pid-liveness gate + watchdog at
     await expect(stat(join(dir, PENDING_STASH_FILE))).rejects.toBeDefined(); // one-shot: stash consumed
   });
 
+  // THE TWO-AGENT FALLBACK, in the one reader that kept the binary test: the flushed record's `agent`
+  // was `blob.agent === "codex" ? "codex" : {}`, so an OpenCode (or any future agent's) stash came back
+  // as a CLAUDE row — wrong tab, wrong icon, wrong marker for every later heartbeat/corrective. The rule
+  // is the same one every other producer uses: absent means claude, anything else rides out verbatim.
+  test("a non-claude stash keeps ITS agent on the flushed record — never coerced to claude", async () => {
+    for (const agent of ["opencode", "codex", "kilo"]) {
+      await writeStash({ pid: 4242, blob: { status: "done", title: "t", machine: "MacHost", label: "api-status", agent } });
+      const phoneKey = await ratchetK1(QR_SECRET);
+      const deviceNameEnc = await seal(phoneKey, new TextEncoder().encode(JSON.stringify("iPhone")));
+      const sessionsDir = join(dir, `sessions-${agent}`);
+      const { fn } = scriptedFetch([
+        () => json({ state: "claimed", phoneNonce: b64url(PHONE_NONCE), deviceNameEnc, phoneEphPub: phoneEphPubB64() }),
+        () => json({ ok: true }),
+        () => json({ ok: true }),
+      ]);
+      await completePendingPairing(pending(), configPath, {
+        fetchFn: fn, ackAttempts: 1, sleep, sessionsDir, isAlive: () => true, ensureWatchdog: () => {},
+      });
+      const rec = JSON.parse(await readFile(join(sessionsDir, "pair-sess.json"), "utf8")) as Record<string, unknown>;
+      expect(rec.agent).toBe(agent);
+      await writeFile(configPath, JSON.stringify(pending())); // re-arm: the flush rewrote config.json
+    }
+    // Claude still OMITS the key entirely (absent MEANS claude on every reader).
+    await writeStash({ pid: 4242, blob: { status: "done", title: "t", machine: "MacHost", label: "api-status" } });
+    const phoneKey = await ratchetK1(QR_SECRET);
+    const deviceNameEnc = await seal(phoneKey, new TextEncoder().encode(JSON.stringify("iPhone")));
+    const sessionsDir = join(dir, "sessions-claude");
+    const { fn } = scriptedFetch([
+      () => json({ state: "claimed", phoneNonce: b64url(PHONE_NONCE), deviceNameEnc, phoneEphPub: phoneEphPubB64() }),
+      () => json({ ok: true }),
+      () => json({ ok: true }),
+    ]);
+    await completePendingPairing(pending(), configPath, {
+      fetchFn: fn, ackAttempts: 1, sleep, sessionsDir, isAlive: () => true, ensureWatchdog: () => {},
+    });
+    const rec = JSON.parse(await readFile(join(sessionsDir, "pair-sess.json"), "utf8")) as Record<string, unknown>;
+    expect("agent" in rec).toBe(false);
+  });
+
   test("a DEAD stashed session → flush DROPS it silently: no event POST, no record, no watchdog", async () => {
     await writeStash({ pid: 5555 });
     const phoneKey = await ratchetK1(QR_SECRET);

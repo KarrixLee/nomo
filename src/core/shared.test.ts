@@ -719,6 +719,30 @@ describe("the remote-approval hold marker (the LAN channel's decision-pending gu
     }
   });
 
+  // OpenCode runs EVERY hold inside one resident server, so both concurrent holds carry the same pid
+  // and the pid compare alone cannot tell them apart: hold A's exit unlinked hold B's marker and
+  // re-sealed the record to working, taking down a card the user was still looking at.
+  test("same-pid concurrent holds are told apart by holdId, and the hook agents keep the pid rule", async () => {
+    const d = await dir();
+    try {
+      await writeDecisionHoldAt(d, "s1", { blob: "card-b", at: 2, pid: 777, holdId: "req-b" });
+      // A's exit: same process, DIFFERENT decision → not ours to clear.
+      expect(await clearDecisionHoldAt(d, "s1", 777, undefined, "req-a")).toBe(false);
+      expect(await readDecisionHoldAt(d, "s1")).toMatchObject({ pid: 777, holdId: "req-b" });
+      expect(await clearDecisionHoldAt(d, "s1", 777, undefined, "req-b")).toBe(true);
+      expect(await readDecisionHoldAt(d, "s1")).toBeNull();
+
+      // A marker with NO holdId (every Claude/Codex hold) is unchanged by the new rule, whether or not
+      // the caller has one — one hold per short-lived process, so the pid IS the discriminator.
+      await writeDecisionHoldAt(d, "s1", { blob: "card-a", at: 2, pid: 777 });
+      expect(await readDecisionHoldAt(d, "s1")).toEqual({ blob: "card-a", at: 2, pid: 777 });
+      expect(await clearDecisionHoldAt(d, "s1", 4242, undefined, "req-a")).toBe(false);
+      expect(await clearDecisionHoldAt(d, "s1", 777)).toBe(true);
+    } finally {
+      await rm(d, { recursive: true, force: true });
+    }
+  });
+
   test("an absent or corrupt marker is never a throw: no owner, so it is simply removed", async () => {
     const d = await dir();
     try {

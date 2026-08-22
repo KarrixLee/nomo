@@ -103,7 +103,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "2.1.17";
+var PLUGIN_VERSION = "2.1.18";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -643,7 +643,7 @@ async function flushPendingStash(stashPath, url, pairingId, pcSecret, e2eKey, no
           op: stash.op,
           prio: stash.prio,
           blob,
-          ...stash.blob.agent === "codex" ? { agent: "codex" } : {},
+          ...stash.blob.agent && stash.blob.agent !== "claude" ? { agent: stash.blob.agent } : {},
           ...typeof stash.blob.title === "string" && stash.blob.title.length > 0 ? { title: stash.blob.title } : {},
           ...typeof stash.blob.model === "string" && stash.blob.model.length > 0 ? { model: stash.blob.model } : {},
           ...pairingId.length > 0 ? { pairingId } : {}
@@ -854,20 +854,23 @@ async function writeDecisionHoldAt(sessionsDir, sessionId, hold) {
     await atomicWrite(`${sessionsDir}/${decisionHoldFileName(sessionId)}`, JSON.stringify(hold), 384);
   } catch {}
 }
-async function clearDecisionHoldAt(sessionsDir, sessionId, pid, beforeUnlink) {
+async function clearDecisionHoldAt(sessionsDir, sessionId, pid, beforeUnlink, holdId) {
   const path = `${sessionsDir}/${decisionHoldFileName(sessionId)}`;
   try {
     const raw = await readFile(path, "utf8").catch(() => {
       return;
     });
     if (raw !== undefined) {
-      let owner;
+      let marker;
       try {
-        owner = JSON.parse(raw).pid;
+        marker = JSON.parse(raw);
       } catch {
-        owner = undefined;
+        marker = undefined;
       }
+      const owner = marker?.pid;
       if (typeof owner === "number" && owner !== pid)
+        return false;
+      if (holdId !== undefined && typeof marker?.holdId === "string" && marker.holdId !== holdId)
         return false;
     }
     if (beforeUnlink !== undefined) {
@@ -901,8 +904,8 @@ async function readDecisionHoldAt(sessionsDir, sessionId) {
 async function writeDecisionHold(sessionId, hold) {
   return writeDecisionHoldAt(SESSIONS_DIR, sessionId, hold);
 }
-async function clearDecisionHold(sessionId, pid, beforeUnlink) {
-  return clearDecisionHoldAt(SESSIONS_DIR, sessionId, pid, beforeUnlink);
+async function clearDecisionHold(sessionId, pid, beforeUnlink, holdId) {
+  return clearDecisionHoldAt(SESSIONS_DIR, sessionId, pid, beforeUnlink, holdId);
 }
 async function settleDecisionHoldRecord(sessionId, patch) {
   return settleDecisionHoldRecordAt(SESSIONS_DIR, sessionId, patch);
@@ -2740,6 +2743,7 @@ var opencodeAdapter = {
   hooksNotFiringHint: "  restart OpenCode (it loads the plugin at server start), or check that ~/.config/opencode/plugins/nomo.js still points at this install",
   toolDetail: {},
   blobAgentFields: { agent: "opencode" },
+  ambientPlan: true,
   locateTuiPid: (ctx, deps) => opencodeLocateTuiPid(ctx, deps)
 };
 function unknownAgentAdapter(kind) {

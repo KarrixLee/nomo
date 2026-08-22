@@ -79,7 +79,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "2.1.17";
+var PLUGIN_VERSION = "2.1.18";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -549,20 +549,23 @@ async function writeDecisionHoldAt(sessionsDir, sessionId, hold) {
     await atomicWrite(`${sessionsDir}/${decisionHoldFileName(sessionId)}`, JSON.stringify(hold), 384);
   } catch {}
 }
-async function clearDecisionHoldAt(sessionsDir, sessionId, pid, beforeUnlink) {
+async function clearDecisionHoldAt(sessionsDir, sessionId, pid, beforeUnlink, holdId) {
   const path = `${sessionsDir}/${decisionHoldFileName(sessionId)}`;
   try {
     const raw = await readFile(path, "utf8").catch(() => {
       return;
     });
     if (raw !== undefined) {
-      let owner;
+      let marker;
       try {
-        owner = JSON.parse(raw).pid;
+        marker = JSON.parse(raw);
       } catch {
-        owner = undefined;
+        marker = undefined;
       }
+      const owner = marker?.pid;
       if (typeof owner === "number" && owner !== pid)
+        return false;
+      if (holdId !== undefined && typeof marker?.holdId === "string" && marker.holdId !== holdId)
         return false;
     }
     if (beforeUnlink !== undefined) {
@@ -589,8 +592,8 @@ async function settleDecisionHoldRecordAt(sessionsDir, sessionId, patch) {
 async function writeDecisionHold(sessionId, hold) {
   return writeDecisionHoldAt(SESSIONS_DIR, sessionId, hold);
 }
-async function clearDecisionHold(sessionId, pid, beforeUnlink) {
-  return clearDecisionHoldAt(SESSIONS_DIR, sessionId, pid, beforeUnlink);
+async function clearDecisionHold(sessionId, pid, beforeUnlink, holdId) {
+  return clearDecisionHoldAt(SESSIONS_DIR, sessionId, pid, beforeUnlink, holdId);
 }
 async function settleDecisionHoldRecord(sessionId, patch) {
   return settleDecisionHoldRecordAt(SESSIONS_DIR, sessionId, patch);
@@ -2167,6 +2170,7 @@ var opencodeAdapter = {
   hooksNotFiringHint: "  restart OpenCode (it loads the plugin at server start), or check that ~/.config/opencode/plugins/nomo.js still points at this install",
   toolDetail: {},
   blobAgentFields: { agent: "opencode" },
+  ambientPlan: true,
   locateTuiPid: (ctx, deps) => opencodeLocateTuiPid(ctx, deps)
 };
 function unknownAgentAdapter(kind) {
@@ -3854,7 +3858,7 @@ async function runPermissionHook(deps = {}, agent = "claude") {
     try {
       holdBlob = await encryptBlob(config.e2eKey, appendFittedPlanAndDebug(permissionFrame(permissionBase, fitted.detail, fitted.omitted, fitted.questions), undefined, formatDecisionHoldDebug({ requestId, pid: holdPid })));
     } catch {}
-    await (deps.writeHoldFn ?? defaultWriteHold())(sessionId, { blob: holdBlob, at: holdAt, pid: holdPid });
+    await (deps.writeHoldFn ?? defaultWriteHold())(sessionId, { blob: holdBlob, at: holdAt, pid: holdPid, ...deps.holdId ? { holdId: deps.holdId } : {} });
     heldSessionId = sessionId;
     settleHeldRecord = async () => {
       const settledAt = (deps.now ?? Date.now)();
@@ -3958,7 +3962,7 @@ async function runPermissionHook(deps = {}, agent = "claude") {
     } catch {}
     if (heldSessionId !== undefined) {
       try {
-        await (deps.clearHoldFn ?? defaultClearHold())(heldSessionId, deps.holdPid ?? process.pid, settleHeldRecord);
+        await (deps.clearHoldFn ?? defaultClearHold())(heldSessionId, deps.holdPid ?? process.pid, settleHeldRecord, deps.holdId);
       } catch {}
     }
   }
@@ -4126,6 +4130,7 @@ async function runOcApproval(request, o) {
         line = l;
       },
       randomUUID: () => o.requestId,
+      holdId: o.requestId,
       trace,
       fetchFn: o.fetchFn,
       delegate: o.delegate,
@@ -4226,7 +4231,7 @@ function ocModelFromMessage(info) {
   const modelID = asString2(info.modelID);
   if (!providerID || !modelID)
     return;
-  return `${providerID}/${modelID}`;
+  return modelID;
 }
 function statusType(status) {
   if (typeof status === "string")
@@ -4283,7 +4288,7 @@ function reduceOcEvent(state, event, now = Date.now()) {
       const status = statusType(properties.status);
       if (status !== "busy" && status !== "retry")
         return null;
-      const detail = status === "retry" ? asString2(asRecord2(properties.status)?.message) : undefined;
+      const detail = status === "retry" ? "retrying" : undefined;
       const planned = frame(sessionId, live, "update", "working", now, detail);
       const key = JSON.stringify([planned.status, planned.detail, planned.title, planned.model, planned.plan]);
       if (live.lastStatusFrame === key)
@@ -4323,6 +4328,11 @@ function ocEndFrames(state, now = Date.now()) {
   const frames = [...state.sessions].map(([sessionId, entry]) => frame(sessionId, entry, "end", "done", now));
   state.sessions.clear();
   return frames;
+}
+function ocForgetStatusFrame(state, sessionId) {
+  const entry = state.sessions.get(sessionId);
+  if (entry)
+    entry.lastStatusFrame = undefined;
 }
 function ocAttentionFrame(state, sessionId, detail, now = Date.now()) {
   const entry = state.sessions.get(sessionId);
@@ -4424,16 +4434,20 @@ async function send(ctx, frame2) {
   const envelope = await buildEnvelope(input, ctx.machine, now, frame2.title, ctx.config.e2eKey, false, "opencode", frame2.startedAt, frame2.turnStartedAt, ctx.folder, frame2.model, { op: frame2.op, prio: frame2.prio, status: frame2.status }, undefined, frame2.plan, undefined, (plain) => {
     fittedPlan = plain.plan;
   }, frame2.detail);
-  if (!envelope)
+  if (!envelope) {
+    ocForgetStatusFrame(ctx.state, frame2.sessionId);
     return;
-  const planFull = fullTextForRecord(frame2.plan, fittedPlan);
-  const fullUpload = postFullText(ctx.config, frame2.sessionId, "plan", planFull);
+  }
+  const planFull = fullTextForRecord(frame2.plan, undefined);
+  const fullUpload = postFullText(ctx.config, frame2.sessionId, "plan", fullTextForRecord(frame2.plan, fittedPlan));
   await trackSession(frame2.sessionId, frame2.op, frame2.prio, frame2.status, envelope.blob, ctx.machine, ctx.folder, "", "opencode", frame2.startedAt, frame2.turnStartedAt, undefined, frame2.title, ctx.config.pairingId, frame2.model, false, process.pid, ctx.origin, false, undefined, undefined, planFull);
   ensureWatchdog({ spawnWatchdog });
   await atomicWrite(lastHookPath("opencode"), String(now)).catch(() => {});
   const delivered = await postOcEvent(ctx.config, envelope);
   if (delivered && frame2.op === "done")
     await markDoneDelivered(frame2.sessionId);
+  if (!delivered)
+    ocForgetStatusFrame(ctx.state, frame2.sessionId);
   await fullUpload;
 }
 var server = async (input) => {

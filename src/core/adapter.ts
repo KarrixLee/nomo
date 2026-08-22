@@ -2150,6 +2150,16 @@ export interface AgentAdapter {
    *  spreads cleanly into both a blob object and a SessionRecord (whose `agent` follows the same
    *  omit-for-claude convention). */
   blobAgentFields: { agent?: AgentKindWire };
+  /** OPTIONAL: is this agent's blob `plan` AMBIENT SESSION STATE rather than a one-shot proposal?
+   *
+   *  OpenCode's plan is its live todo list: it is restated by EVERY frame the resident plugin sends
+   *  and is the phone's plan link for the whole session. Claude's and Codex's are the opposite — an
+   *  ExitPlanMode / update_plan proposal that belongs to ONE attention episode, which is why their
+   *  correctives deliberately carry no plan (only buildNeedsAttentionEnvelope takes an explicit
+   *  `proposedPlan`). So the rebuild sites — the watchdog's done/working correctives and
+   *  session-state's LAN rollup — restate `record.planFull` only for an agent that declares this, and
+   *  every Claude/Codex frame stays byte-identical to what it was. Absent = one-shot (the default). */
+  ambientPlan?: true;
   /** OPTIONAL: discover live sessions the hooks can't see yet — interactive TUIs for which NO
    *  SessionStart has fired. Called on every watchdog sweep with the already-tracked sessions (so their
    *  pids can be excluded). Claude OMITS it (its SessionStart fires at true session open, so there's
@@ -2386,7 +2396,7 @@ export async function opencodeLocateTuiPid(
  *  session identity, title, model, busy/idle — from an in-process event firehose. Nothing in the
  *  transcript-scanning pipeline this interface was shaped around applies.
  *
- *  What is LIVE here is `kind`, `blobAgentFields` and `locateTuiPid`: three call sites (`cc-watchdog`'s corrective
+ *  What is LIVE here is `kind`, `blobAgentFields`, `ambientPlan` and `locateTuiPid`: three call sites (`cc-watchdog`'s corrective
  *  builders, `session-state`'s rollup, `computeSessionState`) reach `adapterFor()` on an OpenCode
  *  record and want only the `agent:"opencode"` literal to thread into the blob they are rebuilding.
  *  Every other member is inert — a path that does not exist, a matcher that never matches, an
@@ -2412,6 +2422,9 @@ export const opencodeAdapter: AgentAdapter = {
   // The one live member besides `kind`: OpenCode blobs carry `agent:"opencode"` so the phone tabs and
   // icons the session correctly (an app build that predates the literal reads it as claude, by design).
   blobAgentFields: { agent: "opencode" as const },
+  // The fourth live member: OpenCode's `plan` is the session's LIVE todo list, not a one-shot
+  // proposal, so every rebuilt blob restates the record's parked copy (see `ambientPlan`).
+  ambientPlan: true as const,
   // The third live member: "Open on Mac" for the DESKTOP app only. See opencodeLocateTuiPid — a CLI /
   // `opencode serve` session returns undefined and the phone keeps the button hidden, as before.
   locateTuiPid: (ctx, deps) => opencodeLocateTuiPid(ctx, deps),

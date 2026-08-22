@@ -104,7 +104,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "2.1.17";
+var PLUGIN_VERSION = "2.1.18";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -644,7 +644,7 @@ async function flushPendingStash(stashPath, url, pairingId, pcSecret, e2eKey, no
           op: stash.op,
           prio: stash.prio,
           blob,
-          ...stash.blob.agent === "codex" ? { agent: "codex" } : {},
+          ...stash.blob.agent && stash.blob.agent !== "claude" ? { agent: stash.blob.agent } : {},
           ...typeof stash.blob.title === "string" && stash.blob.title.length > 0 ? { title: stash.blob.title } : {},
           ...typeof stash.blob.model === "string" && stash.blob.model.length > 0 ? { model: stash.blob.model } : {},
           ...pairingId.length > 0 ? { pairingId } : {}
@@ -855,20 +855,23 @@ async function writeDecisionHoldAt(sessionsDir, sessionId, hold) {
     await atomicWrite(`${sessionsDir}/${decisionHoldFileName(sessionId)}`, JSON.stringify(hold), 384);
   } catch {}
 }
-async function clearDecisionHoldAt(sessionsDir, sessionId, pid, beforeUnlink) {
+async function clearDecisionHoldAt(sessionsDir, sessionId, pid, beforeUnlink, holdId) {
   const path = `${sessionsDir}/${decisionHoldFileName(sessionId)}`;
   try {
     const raw = await readFile(path, "utf8").catch(() => {
       return;
     });
     if (raw !== undefined) {
-      let owner;
+      let marker;
       try {
-        owner = JSON.parse(raw).pid;
+        marker = JSON.parse(raw);
       } catch {
-        owner = undefined;
+        marker = undefined;
       }
+      const owner = marker?.pid;
       if (typeof owner === "number" && owner !== pid)
+        return false;
+      if (holdId !== undefined && typeof marker?.holdId === "string" && marker.holdId !== holdId)
         return false;
     }
     if (beforeUnlink !== undefined) {
@@ -902,8 +905,8 @@ async function readDecisionHoldAt(sessionsDir, sessionId) {
 async function writeDecisionHold(sessionId, hold) {
   return writeDecisionHoldAt(SESSIONS_DIR, sessionId, hold);
 }
-async function clearDecisionHold(sessionId, pid, beforeUnlink) {
-  return clearDecisionHoldAt(SESSIONS_DIR, sessionId, pid, beforeUnlink);
+async function clearDecisionHold(sessionId, pid, beforeUnlink, holdId) {
+  return clearDecisionHoldAt(SESSIONS_DIR, sessionId, pid, beforeUnlink, holdId);
 }
 async function settleDecisionHoldRecord(sessionId, patch) {
   return settleDecisionHoldRecordAt(SESSIONS_DIR, sessionId, patch);
@@ -2741,6 +2744,7 @@ var opencodeAdapter = {
   hooksNotFiringHint: "  restart OpenCode (it loads the plugin at server start), or check that ~/.config/opencode/plugins/nomo.js still points at this install",
   toolDetail: {},
   blobAgentFields: { agent: "opencode" },
+  ambientPlan: true,
   locateTuiPid: (ctx, deps) => opencodeLocateTuiPid(ctx, deps)
 };
 function unknownAgentAdapter(kind) {
@@ -3873,7 +3877,7 @@ function buildStatePlaintext(record, status, at, titleFallback) {
     marker: "0",
     by: "wd"
   }) : undefined;
-  return appendFittedPlanAndDebug(base, undefined, dbg);
+  return appendFittedPlanAndDebug(base, adapterFor(agent).ambientPlan ? record.planFull : undefined, dbg);
 }
 function stateHoldLive(hold, holdPidAlive, now) {
   if (!hold || !filled(hold.blob))
@@ -6655,7 +6659,7 @@ async function runPermissionHook(deps = {}, agent = "claude") {
     try {
       holdBlob = await encryptBlob(config.e2eKey, appendFittedPlanAndDebug(permissionFrame(permissionBase, fitted.detail, fitted.omitted, fitted.questions), undefined, formatDecisionHoldDebug({ requestId, pid: holdPid })));
     } catch {}
-    await (deps.writeHoldFn ?? defaultWriteHold())(sessionId, { blob: holdBlob, at: holdAt, pid: holdPid });
+    await (deps.writeHoldFn ?? defaultWriteHold())(sessionId, { blob: holdBlob, at: holdAt, pid: holdPid, ...deps.holdId ? { holdId: deps.holdId } : {} });
     heldSessionId = sessionId;
     settleHeldRecord = async () => {
       const settledAt = (deps.now ?? Date.now)();
@@ -6759,7 +6763,7 @@ async function runPermissionHook(deps = {}, agent = "claude") {
     } catch {}
     if (heldSessionId !== undefined) {
       try {
-        await (deps.clearHoldFn ?? defaultClearHold())(heldSessionId, deps.holdPid ?? process.pid, settleHeldRecord);
+        await (deps.clearHoldFn ?? defaultClearHold())(heldSessionId, deps.holdPid ?? process.pid, settleHeldRecord, deps.holdId);
       } catch {}
     }
   }
@@ -7503,6 +7507,9 @@ function buildEndEnvelope(sessionId, now, record, at) {
     ...typeof at === "number" && Number.isFinite(at) ? { at } : {}
   };
 }
+function ambientPlan(agent, record) {
+  return adapterFor(agent).ambientPlan ? record.planFull : undefined;
+}
 async function buildDoneEnvelope(sessionId, record, now, e2eKey, agent = "claude", at, dbg) {
   const branch = sessionBranch(record);
   const base = {
@@ -7518,7 +7525,7 @@ async function buildDoneEnvelope(sessionId, record, now, e2eKey, agent = "claude
     ...branch ? { branch } : {}
   };
   const debug = appendCodexBridgeMarker(agent === "codex" ? dbg ?? formatPlanPickerDebug({ event: "done", classifier: "done", marker: "0", by: "wd" }) : undefined, codexBridgeIsDown());
-  const blob = await encryptBlob(e2eKey, appendFittedPlanAndDebug(base, undefined, debug));
+  const blob = await encryptBlob(e2eKey, appendFittedPlanAndDebug(base, ambientPlan(agent, record), debug));
   return { v: 2, sessionId, op: "done", prio: 0, ts: now, blob, ...startedAtField(record) };
 }
 async function buildNeedsAttentionEnvelope(sessionId, record, now, e2eKey, agent = "claude", at, detail, attentionKind, proposedPlan, dbg) {
@@ -7564,7 +7571,7 @@ async function buildWorkingEnvelope(sessionId, record, now, e2eKey, agent = "cla
     ...branch ? { branch } : {}
   };
   const debug = appendCodexBridgeMarker(agent === "codex" ? dbg ?? formatPlanPickerDebug({ event: "working", classifier: "resolved", marker: "0", by: "wd" }) : undefined, codexBridgeIsDown());
-  const blob = await encryptBlob(e2eKey, appendFittedPlanAndDebug(base, undefined, debug));
+  const blob = await encryptBlob(e2eKey, appendFittedPlanAndDebug(base, ambientPlan(agent, record), debug));
   return { v: 2, sessionId, op: "update", prio: 0, ts: now, blob, ...startedAtField(record) };
 }
 function markerAge(record, now) {
