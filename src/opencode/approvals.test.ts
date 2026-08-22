@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { encryptBlob } from "../core/crypto";
+import { decryptBlob, encryptBlob } from "../core/crypto";
 import type { Config } from "../core/shared";
 import {
   buildPermissionDetail, buildPermissionQuestions, buildPermissionSummary, isQuestionTool,
@@ -85,10 +85,21 @@ describe("ocDecisionRequest", () => {
     // Metadata missing → `patterns` is the fallback, because it is the one field every ask carries.
     expect(ask("bash", ["rm -rf /tmp/x"], {}))
       .toMatchObject({ toolName: "shell", toolInput: { command: "rm -rf /tmp/x" } });
-    // KNOWN GAP (documented on PERMISSION_TOOL): an unmapped permission keeps its own name and gets
-    // no detail line.
+    // An UNMAPPED permission keeps its own name (the shared summary switch has no arm for it) but its
+    // `patterns` still reach the card, as the detail line.
     expect(ask("grep", ["TODO"], { pattern: "TODO" }))
-      .toMatchObject({ toolName: "grep", toolInput: {} });
+      .toEqual({ kind: "permission", id: "per_x", sessionID: SESSION, toolName: "grep", toolInput: {}, detail: "TODO" });
+    // The one that matters: an `external_directory` Allow grants THIS path, so the path must be on the
+    // card. Multiple patterns join like the bash arm's own join.
+    expect(ask("external_directory", ["/Users/x/secrets", "/etc"], {}))
+      .toMatchObject({ toolName: "external_directory", detail: "/Users/x/secrets /etc" });
+    // No patterns → no key at all, so the card degrades to the bare name exactly as it used to.
+    expect(ask("doom_loop", [], {})).not.toHaveProperty("detail");
+    expect(ask("skill", ["", "  "], {})).not.toHaveProperty("detail");
+    expect(ocDecisionRequest({ type: "permission.asked", properties: { id: "per_x", sessionID: SESSION, permission: "task" } }))
+      .not.toHaveProperty("detail");
+    // A MAPPED permission is untouched — its detail is still derived from tool_input downstream.
+    expect(ask("bash", ["echo hi"], {})).not.toHaveProperty("detail");
   });
 
   test("question.asked becomes an AskUserQuestion-shaped card, questions verbatim", () => {
@@ -324,6 +335,61 @@ describe("the question channel end to end", () => {
   test("a bare allow on a question is released — the user answers at the Mac, we send nothing", async () => {
     const calls = await holdWith(QUESTION, { decision: "allow" });
     expect(calls.some((c) => c.includes("127.0.0.1:4396"))).toBe(false);
+  });
+});
+
+describe("an unmapped permission still names its target on the card", () => {
+  /** Run a real hold and open the sealed decisionPending frame it POSTed — the exact bytes the phone
+   *  decrypts, so this asserts what the user actually sees, not an intermediate. */
+  const sealedFrame = async (request: OcDecisionRequest): Promise<Record<string, unknown>> => {
+    let blob = "";
+    const answerBlob = await encryptBlob(config.e2eKey, { requestId: "req-d", decision: "allow" });
+    const fetchFn = (async (input: string | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/v1/cc/decision")) {
+        blob = (JSON.parse(String(init?.body)) as { blob: string }).blob;
+        return Response.json({ hold: true });
+      }
+      if (url.includes("/v1/cc/decision/")) return Response.json({ status: "answered", answerBlob });
+      return new Response("true", { status: 200 });
+    }) as unknown as typeof fetch;
+    await runOcApproval(request, {
+      config,
+      serverUrl: "http://127.0.0.1:4396/",
+      requestId: "req-d",
+      delegate: async () => { throw new Error("the no-hold path must not be taken here"); },
+      noHoldPath: join(tmpdir(), `nomo-oc-no-such-flag-${process.pid}`),
+      fetchFn,
+      trace: () => {},
+    });
+    return await decryptBlob(config.e2eKey, blob) as Record<string, unknown>;
+  };
+
+  test("external_directory ships the PATH the Allow would grant", async () => {
+    const frame = await sealedFrame(ocDecisionRequest({
+      type: "permission.asked",
+      properties: {
+        id: "per_ext", sessionID: SESSION, permission: "external_directory",
+        patterns: ["/Users/x/secrets"], metadata: {},
+      },
+    })!);
+    expect(frame.permissionToolName).toBe("external_directory");
+    expect(frame.permissionDetail).toBe("/Users/x/secrets");
+  });
+
+  test("a mapped permission is byte-identical to before — detail still comes from tool_input", async () => {
+    const frame = await sealedFrame(PERMISSION);
+    expect(frame.permissionToolName).toBe("shell");
+    expect(frame.permissionDetail).toBe("echo hello");
+  });
+
+  test("no patterns → the key is OMITTED, like every other empty optional blob field", async () => {
+    const frame = await sealedFrame(ocDecisionRequest({
+      type: "permission.asked",
+      properties: { id: "per_dl", sessionID: SESSION, permission: "doom_loop", patterns: [], metadata: {} },
+    })!);
+    expect(frame.permissionToolName).toBe("doom_loop");
+    expect(frame).not.toHaveProperty("permissionDetail");
   });
 });
 

@@ -48,6 +48,13 @@ export interface OcDecisionRequest {
    *  Claude-side tool name for a permission (see PERMISSION_TOOL). */
   toolName: string;
   toolInput: Record<string, unknown>;
+  /** OPTIONAL detail line, for a permission with no PERMISSION_TOOL entry: its `patterns` joined, which
+   *  is the only place the target (a path, a glob, an MCP argument) is stated. Absent for a mapped
+   *  permission — `buildPermissionDetail` already derives that one from `toolInput` — and absent when
+   *  there are no patterns, so the card degrades to the bare name exactly as before. NOT truncated
+   *  here: `permissionDetail` is uncapped by contract and `fitPermissionDetail` applies the frame's
+   *  real ceiling at the seal site (see buildPermissionDetail's header). */
+  detail?: string;
   /** OpenCode's own `questions` array, kept verbatim so the answers round-trip can re-find each
    *  question's original option labels. Questions only. */
   questions?: unknown[];
@@ -73,10 +80,15 @@ function asString(value: unknown): string | undefined {
  *  to render. `buildPermissionSummary` / `buildPermissionDetail` are tool-name switches, so this is
  *  the whole difference between a card that says "example.com" and one that says "webfetch".
  *
- *  KNOWN GAP: OpenCode's other permission names (`grep`, `glob`, `skill`, `task`, `external_directory`,
- *  `doom_loop`, an MCP tool id) fall through to the bare name with no detail line — their useful text
- *  lives in `patterns`, and the shared summary switch has no generic arm to put it in. Adding one would
- *  change what an unknown Claude/Codex MCP tool renders as, which is not this feature's business. */
+ *  OpenCode's OTHER permission names (`grep`, `glob`, `skill`, `task`, `external_directory`,
+ *  `doom_loop`, an MCP tool id) have no entry here, so the card's SUMMARY stays the bare permission
+ *  name — the shared summary switch has no generic arm to put `patterns` in, and adding one would
+ *  change what an unknown Claude/Codex MCP tool renders as, which is not this feature's business.
+ *  Their `patterns` do reach the card, as the DETAIL line: `ocDecisionRequest` joins them into
+ *  `OcDecisionRequest.detail`, which `runOcApproval` hands to the hold as `deps.detail` — an
+ *  OpenCode-only override of `buildPermissionDetail`, so nothing about Claude/Codex moves. That
+ *  matters most for `external_directory`, where the pattern IS the path being granted and an "Allow"
+ *  with no detail line grants access the user never saw. */
 const PERMISSION_TOOL: Record<string, { name: string; input: (props: OcPermissionProps) => Record<string, unknown> }> = {
   // OpenCode's `metadata:{command}` is Codex's `shell` tool_input exactly; `patterns` is the same
   // command when metadata is missing.
@@ -111,12 +123,16 @@ export function ocDecisionRequest(event: unknown): OcDecisionRequest | null {
       : [];
     const metadata = asRecord(properties.metadata) ?? {};
     const mapped = PERMISSION_TOOL[permission];
+    // The join matches the `bash` arm's own `patterns.join(" ")` — one line, and it is what an `always`
+    // reply persists as the rule.
+    const detail = mapped ? undefined : asString(patterns.join(" ").trim());
     return {
       kind: "permission",
       id,
       sessionID,
       toolName: mapped?.name ?? permission,
       toolInput: mapped ? mapped.input({ metadata, patterns }) : {},
+      ...(detail ? { detail } : {}),
     };
   }
 
@@ -360,6 +376,9 @@ export async function runOcApproval(request: OcDecisionRequest, o: OcApprovalOpt
       // is already unique per hold (the caller mints it), so it IS the discriminator. The hook agents
       // pass none and keep the pid-only rule they always had. See DecisionHold.holdId.
       holdId: o.requestId,
+      // The card's detail line for a permission the shared switch cannot render — see PERMISSION_TOOL's
+      // header. Undefined for everything else, which is every Claude/Codex hold and every mapped one.
+      detail: request.detail,
       trace,
       fetchFn: o.fetchFn,
       delegate: o.delegate,

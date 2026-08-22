@@ -591,7 +591,9 @@ describe("slash commands, Codex skills and OpenCode commands carry the shim fall
     // it: the shim forwards argv verbatim, and dropping the agent on the fallback half would silently
     // restore the old everything-at-everyone output on exactly the machines the shim exists for.
     test(`${label}: the status launch block tells status-cmd that ${agent} is asking`, async () => {
-      const file = (await docs(dir)).find((f) => f.includes("status"));
+      // Match below the docs dir, not the absolute path — a checkout under a directory whose
+      // NAME contains "status" (this repo lives inside api-status/) would otherwise match every file.
+      const file = (await docs(dir)).find((f) => f.slice(dir.length).includes("status"));
       expect(file).toBeDefined();
       const blocks = (await launchBlocks(file!)).filter((b) => b.includes("status-cmd"));
       expect(blocks.length).toBe(1);

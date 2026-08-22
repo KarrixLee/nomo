@@ -104,7 +104,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "2.1.19";
+var PLUGIN_VERSION = "2.1.20";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -6510,7 +6510,7 @@ async function runPermissionHook(deps = {}, agent = "claude") {
       permissionRequestId: requestId,
       permissionToolName: toolName
     };
-    const rawDetail = buildPermissionDetail(toolName, toolInput);
+    const rawDetail = deps.detail ?? buildPermissionDetail(toolName, toolInput);
     const fitted = fitPermissionDetail(permissionBase, rawDetail, BLOB_FIT_CHARS, buildPermissionQuestions(toolInput));
     const detailFull = fullTextForRecord(rawDetail, fitted.detail);
     if (record && record.permissionDetailFull !== detailFull) {

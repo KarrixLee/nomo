@@ -1225,6 +1225,13 @@ export interface PermissionHookDeps {
    *  Claude/Codex hooks — one hold per short-lived process, so the pid IS the discriminator and their
    *  marker keeps its exact byte shape. See DecisionHold.holdId. */
   holdId?: string;
+  /** OPTIONAL override for the card's `permissionDetail`, for a caller whose tool name the shared
+   *  `buildPermissionDetail` switch cannot render. OpenCode's resident plugin passes the joined
+   *  `patterns` of a permission it has no PERMISSION_TOOL entry for (`external_directory`, `grep`,
+   *  `skill`, an MCP tool id) — otherwise those cards offer Allow with no target at all. Absent for the
+   *  Claude/Codex hooks and for OpenCode's mapped permissions, which all keep the built detail
+   *  byte-for-byte. Uncapped, exactly like the built one: `fitPermissionDetail` owns the ceiling. */
+  detail?: string;
   /** Resolve Codex's effective per-turn approval policy from its rollout. Tests inject this so no
    *  local Codex state is touched; Claude never calls it. */
   loadCodexTurnPolicyFn?: (
@@ -1438,7 +1445,7 @@ export async function runPermissionHook(
       ...base, status: "decisionPending", permissionSummary: summary, permissionRequestId: requestId,
       permissionToolName: toolName,
     };
-    const rawDetail = buildPermissionDetail(toolName, toolInput);
+    const rawDetail = deps.detail ?? buildPermissionDetail(toolName, toolInput);
     const fitted = fitPermissionDetail(
       permissionBase, rawDetail, BLOB_FIT_CHARS, buildPermissionQuestions(toolInput),
     );
