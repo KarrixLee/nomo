@@ -138,10 +138,27 @@ For scripting and CI:
 With no flags and no terminal to ask, it refuses rather than guessing. Every failure names the step,
 the exit code, and the command to run by hand; the exit status is non-zero if any agent failed.
 
-The OpenCode leg clones this repo to `~/.nomo` (or `git pull`s an existing one) and runs
-`plugin/scripts/opencode-install.sh` from there — the same thing you would do by hand below. It has
-to be a durable checkout, not the npm tarball: the installed stub re-exports an absolute path, and a
-`bunx` cache directory does not survive the week.
+The OpenCode leg clones this repo to `~/.nomo` and runs `plugin/scripts/opencode-install.sh` from
+there — the same thing you would do by hand below. It has to be a durable checkout, not the npm
+tarball: the installed stub re-exports an absolute path, and a `bunx` cache directory does not survive
+the week.
+
+**It updates as well as installs**, and only one leg does it for you. An agent that already has Nomo
+shows an update in the plan instead of an install. For OpenCode that update really runs — it is the
+only agent with no host update path, so `~/.nomo` is fetched, compared and pulled by the same code
+`/nomo-update` uses. For Claude Code and Codex the row **prints** the host's own command and runs
+nothing:
+
+```sh
+claude plugin update nomo-cc@nomo
+codex plugin marketplace upgrade nomo && codex plugin add nomo@nomo
+```
+
+That asymmetry is deliberate. Those two already update in one command you own, so running it for you
+buys almost nothing — and install begins with `marketplace add`, which would silently repoint a
+marketplace you had aimed somewhere else (a local checkout, a fork) and send every later
+`claude plugin update` to the wrong place. Repointing a marketplace is install-time behaviour; it has
+no business in an update.
 
 `--ref` exists for testing a branch or tag before it merges, and it reaches **one leg**: the OpenCode
 checkout is the only thing the installer owns. `claude plugin marketplace add` and `codex plugin
@@ -224,7 +241,7 @@ That is the whole install. The script resolves its own location, so there is no 
 nothing to hand-edit. It writes two things and prints exactly what it wrote:
 
 - `~/.config/opencode/plugins/nomo.js` — a one-line stub re-exporting `<checkout>/plugin/dist/opencode.js`.
-- `~/.config/opencode/commands/nomo-*.md` — the five slash commands, with the plugin path baked in.
+- `~/.config/opencode/commands/nomo-*.md` — the six slash commands, with the plugin path baked in.
 
 Re-running it is safe and idempotent; run it again if you move the checkout. It refuses to overwrite
 a same-named file it did not write (pass `--force` to override), and `--project` installs into
@@ -233,12 +250,40 @@ a same-named file it did not write (pass `--force` to override), and `--project`
 **Restart OpenCode** — plugins are imported once at server start; there is no hot reload.
 
 The stub is a **re-export, not a copy**: the bundle keeps executing from `plugin/dist/`, where it can
-find its sibling `cc-watchdog.mjs`, and a `git pull` in the checkout upgrades you with no reinstall.
-OpenCode auto-discovers the directory, so there is nothing to add to `opencode.json`.
+find its sibling `cc-watchdog.mjs`. OpenCode auto-discovers the directory, so there is nothing to add
+to `opencode.json`.
 
-The five commands are the same ones the other two agents ship, minus the namespace — OpenCode command
+The six commands are the same ones the other two agents ship, minus the namespace — OpenCode command
 names are flat and global, so they are `/nomo-pair`, `/nomo-status`, `/nomo-approvals`,
-`/nomo-reset`, `/nomo-unpair` ([reference](https://docs.nomo.gg/sessions/commands)).
+`/nomo-reset`, `/nomo-unpair` ([reference](https://docs.nomo.gg/sessions/commands)) — plus
+`/nomo-update`, which the other two do not need.
+
+### Updating — `/nomo-update`
+
+```
+/nomo-update
+```
+
+Then restart OpenCode. That is the whole thing.
+
+It checks before it changes anything: fetch, read the target version straight off the remote
+(`git show <upstream>:plugin/.claude-plugin/plugin.json` — nothing is checked out), compare. Already
+current prints `Already on 2.1.21 — nothing to do.` and stops — no pull, no reinstall, and no restart
+advice for a restart that would change nothing. Behind prints the delta (`2.1.21 → 2.1.23`) **before**
+pulling, fast-forwards, and re-runs the installer so a new `/nomo-*` command appears and the stub is
+refreshed.
+
+It refuses, loudly and specifically, rather than guessing: a checkout pinned to a branch or tag by
+`bunx nomo-ai --ref` (deliberately detached — fast-forwarding it would silently un-pin someone testing
+a branch), a dirty tree, no upstream, a diverged history, an unreachable remote, and a stub whose
+checkout has been moved or deleted. Every refusal names the command to run by hand.
+
+**The mechanism, for the curious.** OpenCode has no marketplace and no `plugin update`, so the
+*checkout is the version* — `~/.config/opencode/plugins/nomo.js` is a one-line re-export of an
+absolute `<checkout>/plugin/dist/opencode.js`, and updating means pulling that checkout and re-running
+the installer. `/nomo-update` reads its own path back out of that stub, which is why it updates the
+copy OpenCode actually imports rather than whichever one the command file was installed from. Doing it
+by hand is still exactly `git -C <checkout> pull --ff-only && <checkout>/plugin/scripts/opencode-install.sh`.
 
 **Pairing is shared, and `/nomo-pair` also works standalone.** The plugin reads the same
 `~/.config/cc-status/config.json` as the other two agents, so if you already paired with
@@ -332,8 +377,9 @@ Runs the full suite (1677 tests across `core/`, `entries/`, `opencode/`, and `qr
 bun build.ts
 ```
 
-`build.ts` bundles the ten hook/command entrypoints (`cc-status`, `cc-permission`, `codex-status`,
-`codex-permission`, `codex-notify`, `cc-watchdog`, `pair`, `unpair`, `reset`, `status-cmd`) into
+`build.ts` bundles the eleven hook/command entrypoints (`cc-status`, `cc-permission`, `codex-status`,
+`codex-permission`, `codex-notify`, `cc-watchdog`, `pair`, `unpair`, `reset`, `status-cmd`,
+`opencode-update`) into
 `plugin/dist/*.mjs`, inlining every local import so each artifact is a single node-runnable file.
 
 A second pass bundles `src/opencode/plugin.ts` into `plugin/dist/opencode.js` — **`.js`, not
@@ -369,7 +415,8 @@ manifests said 2.1.7). The manifests are the source of truth; read them.
 - `plugin/.codex-plugin/plugin.json` (`nomo`)
 - `package.json` (the `nomo-ai` npm bootstrapper)
 
-OpenCode has no manifest — it installs from the checkout, so `git pull` is its version.
+OpenCode has no manifest — it installs from the checkout, so the checkout is its version. That is
+what makes `/nomo-update` a `git pull`, and what makes these manifests the number it reports.
 
 `bun build.ts` cross-checks all five and refuses to build on disagreement. `package.json` carries the
 version only so `bunx nomo-ai --version` is quotable in a bug report; it ships no plugin code. The

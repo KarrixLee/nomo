@@ -29,7 +29,7 @@ const CLAUDE_HOOKS = join(PLUGIN_DIR, "hooks/hooks.json");
 /** The entry names the shim is allowed to launch — kept in step with plugin/dist/*.mjs. */
 const ENTRIES = [
   "cc-status", "cc-permission", "cc-watchdog", "codex-status", "codex-permission",
-  "codex-notify", "pair", "unpair", "reset", "status-cmd",
+  "codex-notify", "pair", "unpair", "reset", "status-cmd", "opencode-update",
 ];
 
 /** The shim revision run.sh currently installs. Read from the script rather than hard-coded, so a

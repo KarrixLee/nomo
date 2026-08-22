@@ -99,7 +99,7 @@ async function sha256Hex(s) {
 }
 
 // src/core/shared.ts
-var PLUGIN_VERSION = "2.1.21";
+var PLUGIN_VERSION = "2.1.22";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -395,6 +395,13 @@ async function startCodexAppServerDaemon(deps = {}) {
 }
 function lastHookPath(agent) {
   return `${CC_DIR}/last-hook-${agent}`;
+}
+function opencodeStubPaths() {
+  const base = `${process.env.XDG_CONFIG_HOME || `${process.env.HOME}/.config`}/opencode`;
+  return [`${base}/plugins/nomo.js`, `${base}/plugin/nomo.js`];
+}
+function opencodeStubTarget(text) {
+  return /^export \{ default \} from "(.+)";$/m.exec(text)?.[1];
 }
 var FOLDER_KEY_HEX_CHARS = 12;
 var BRANCH_MAX_CHARS = 60;

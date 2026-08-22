@@ -27,30 +27,21 @@ import { claudeAdapter, codexAdapter, opencodeAdapter } from "../core/adapter";
 import {
   AgentKind, CC_DIR, CODEX_HOOK_MARKER, codexAppServerSocketAvailable, codexHome, flagExists,
   LAST_SEND_PATH, localApprovalsState, NO_HOLD_PATH, parseConfig, parsePendingConfig, pidAlive,
-  PLUGIN_VERSION, SESSIONS_DIR, WATCHDOG_PID_PATH,
+  opencodeStubPaths, opencodeStubTarget, PLUGIN_VERSION, SESSIONS_DIR, WATCHDOG_PID_PATH,
 } from "../core/shared";
 
-/** Where a GLOBAL OpenCode plugin stub lives, newest name first.
+/** Where a GLOBAL OpenCode plugin stub lives — see core/shared's opencodeStubPaths for the two
+ *  directory names and why both are read.
  *
- *  WHY THIS EXISTS. OpenCode is the one agent with no hooks to count and no transcript directory to
- *  date, so before this its ONLY evidence was a liveness stamp — and an installed-but-never-restarted
- *  OpenCode (the stamp is new in 2.1.16, and plugins import once at server start) was indistinguishable
- *  from one that was never installed. Status then said nothing at all about it, which is the same
- *  confusion this whole readout exists to end, just relocated.
- *
- *  BOTH DIRECTORY NAMES. OpenCode's discovery glob is `{plugin,plugins}/*.{ts,js}` and this repo wrote
- *  the SINGULAR alias until 631f3f2 (2026-08-19). A machine that installed before that and has not
- *  re-run the installer still loads a perfectly good plugin out of `plugin/`; reading it as absent
- *  would reintroduce the exact bug. `plugins/` is checked first because it is what we write now.
+ *  WHY THIS READOUT NEEDS IT AT ALL. OpenCode is the one agent with no hooks to count and no
+ *  transcript directory to date, so before this its ONLY evidence was a liveness stamp — and an
+ *  installed-but-never-restarted OpenCode (the stamp is new in 2.1.16, and plugins import once at
+ *  server start) was indistinguishable from one that was never installed. Status then said nothing at
+ *  all about it, which is the same confusion this whole readout exists to end, just relocated.
  *
  *  GLOBAL SCOPE ONLY. `opencode-install.sh --project` writes into `<project>/.opencode`, and this
  *  command has no project context to look in — a project-scope install simply falls back to the
  *  stamp, exactly as before. */
-function opencodeStubPaths(): string[] {
-  // Mirrors the installer's own `${XDG_CONFIG_HOME:-$HOME/.config}/opencode`.
-  const base = `${process.env.XDG_CONFIG_HOME || `${process.env.HOME}/.config`}/opencode`;
-  return [`${base}/plugins/nomo.js`, `${base}/plugin/nomo.js`];
-}
 
 /** Native Codex plugin hook declarations in plugin/hooks/codex-hooks.json. Keep the status denominator
  *  in lockstep with the manifest; SessionEnd is the seventh entry and records terminal history. */
@@ -596,7 +587,7 @@ export async function statusCmd(deps: StatusDeps = {}): Promise<number> {
     const text = await readFile(path, "utf8").catch(() => null);
     if (text === null) continue;
     opencodeStub = path;
-    opencodeTarget = /^export \{ default \} from "(.+)";$/m.exec(text)?.[1];
+    opencodeTarget = opencodeStubTarget(text);
     break;
   }
   const opencodeProblems: { what: string; fix?: string }[] = [];

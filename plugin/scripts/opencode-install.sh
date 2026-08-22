@@ -16,7 +16,12 @@
 # skills recover it from `codex plugin list`. OpenCode offers neither — a command file is a plain
 # prompt template with no notion of which plugin (if any) shipped it. So the templates in
 # ../opencode-commands carry a `__NOMO_ROOT__` placeholder and this script substitutes the real path
-# on the way in. Move the checkout and you re-run this script; that is the whole upgrade story.
+# on the way in. Move the checkout and you re-run this script.
+#
+# WHICH IS WHY `/nomo-update` RE-RUNS IT. Pulling the checkout is only half an upgrade: a version that
+# added a `/nomo-*` command would ship a command file nobody ever installs, and a moved checkout would
+# leave every baked-in root pointing at nothing. dist/opencode-update.mjs pulls and then calls this
+# script, so the two halves cannot drift apart.
 #
 # LOUD ON FAILURE, deliberately unlike the hooks. run.sh and every hook exit 0 on any problem so a
 # broken install never disturbs the user's agent. This is an interactive command the user typed on

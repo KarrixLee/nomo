@@ -62,8 +62,10 @@ function readVersion(): string {
  *  Codex skills. codex-notify is the Codex `notify`-channel backstop (a done push when the lifecycle
  *  hooks fail to fire) — invoked with its JSON payload as argv by plugin/scripts/hook-shim.sh, not
  *  on stdin. cc-permission / codex-permission are the blocking PermissionRequest holds (Claude / Codex
- *  twins — the phone answers Allow/Deny while the terminal dialog waits). Each is bundled standalone
- *  with its local deps inlined. */
+ *  twins — the phone answers Allow/Deny while the terminal dialog waits). opencode-update backs
+ *  /nomo-update: OpenCode is the one agent whose host has no update command of its own, so its
+ *  checkout IS its version and pulling it is ours to do. Each is bundled standalone with its local
+ *  deps inlined. */
 const ENTRYPOINTS = [
   "cc-status.ts",
   "cc-permission.ts",
@@ -75,6 +77,7 @@ const ENTRYPOINTS = [
   "unpair.ts",
   "reset.ts",
   "status-cmd.ts",
+  "opencode-update.ts",
 ].map((f) => join(HERE, "src", "entries", f));
 
 /** The OpenCode plugin — a SECOND build pass, not another ENTRYPOINTS row, because it needs a

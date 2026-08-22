@@ -663,6 +663,32 @@ export function lastHookPath(agent: AgentKind): string {
   return `${CC_DIR}/last-hook-${agent}`;
 }
 
+/** Where a GLOBAL OpenCode plugin stub lives, newest name first.
+ *
+ *  BOTH DIRECTORY NAMES. OpenCode's discovery glob is `{plugin,plugins}/*.{ts,js}` and this repo wrote
+ *  the SINGULAR alias until 631f3f2 (2026-08-19). A machine that installed before that and has not
+ *  re-run the installer still loads a perfectly good plugin out of `plugin/`; reading it as absent
+ *  would report a working install as missing. `plugins/` is checked first because it is what we write
+ *  now.
+ *
+ *  GLOBAL SCOPE ONLY — `opencode-install.sh --project` writes into `<project>/.opencode`, which a
+ *  caller with project context appends itself (opencode-update does; status-cmd has none). */
+export function opencodeStubPaths(): string[] {
+  // Mirrors the installer's own `${XDG_CONFIG_HOME:-$HOME/.config}/opencode`.
+  const base = `${process.env.XDG_CONFIG_HOME || `${process.env.HOME}/.config`}/opencode`;
+  return [`${base}/plugins/nomo.js`, `${base}/plugin/nomo.js`];
+}
+
+/** The absolute `<plugin-root>/dist/opencode.js` an installed stub re-exports, or undefined when the
+ *  file is not one of ours. THE ONE PARSE, shared by status-cmd (which reports a dangling stub) and
+ *  opencode-update (which recovers the checkout to update FROM it — the stub is the only statement of
+ *  which copy OpenCode actually imports). Deliberately the same shape opencode-install.sh verifies
+ *  with after writing the file; two readers of a one-line format is exactly where a second, subtly
+ *  different regex would rot. */
+export function opencodeStubTarget(text: string): string | undefined {
+  return /^export \{ default \} from "(.+)";$/m.exec(text)?.[1];
+}
+
 // --- project-folder identity (the phone's session grouping) -------------------------------------
 
 /** How many hex characters of the cwd digest ride in the blob. 12 hex = 48 bits: collision-free for

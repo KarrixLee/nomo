@@ -1,8 +1,11 @@
 import { createRequire } from "node:module";
 var __require = /* @__PURE__ */ createRequire(import.meta.url);
 
-// src/entries/unpair.ts
-import { readFile as readFile2, unlink as unlink2 } from "node:fs/promises";
+// src/entries/opencode-update.ts
+import { spawnSync } from "node:child_process";
+import { existsSync as existsSync2, readFileSync as readFileSync2 } from "node:fs";
+import { dirname as dirname2, join as join2 } from "node:path";
+import { fileURLToPath as fileURLToPath2 } from "node:url";
 
 // src/core/shared.ts
 import { access, chmod, open, readFile, rename, stat, mkdir, unlink, writeFile } from "node:fs/promises";
@@ -1039,64 +1042,221 @@ function codexCompanionBrokerEvidence(pid, ancestorsOf = pidAncestors, commandOf
   return null;
 }
 
-// src/entries/unpair.ts
-function revokeCreds(raw) {
-  const completed = parseConfig(raw);
-  if (completed)
-    return { url: completed.url, pairingId: completed.pairingId, pcSecret: completed.pcSecret };
-  const pending = parsePendingConfig(raw);
-  if (pending)
-    return { url: pending.url, pairingId: pending.pairingId, pcSecret: pending.pcSecret };
-  return null;
+// src/entries/opencode-update.ts
+var VERSION_MANIFEST = "plugin/.claude-plugin/plugin.json";
+function realGit(dir, args) {
+  const r = spawnSync("git", ["-C", dir, ...args], { encoding: "utf8" });
+  if (r.error)
+    return { status: 127, stdout: "", stderr: r.error.message };
+  return { status: r.status ?? 1, stdout: (r.stdout || "").trim(), stderr: (r.stderr || "").trim() };
 }
-async function unpair(deps = {}) {
-  const fetchFn = deps.fetchFn ?? fetch;
-  const print = deps.print ?? ((line) => console.log(line));
-  const configPath = deps.configPath ?? `${CC_DIR}/config.json`;
-  const lastSendPath = deps.lastSendPath ?? LAST_SEND_PATH;
-  const htmlPath = deps.htmlPath ?? PAIR_HTML_PATH;
-  const revokeTimeoutMs = deps.revokeTimeoutMs ?? 5000;
-  let raw;
+function manifestVersion(text) {
+  if (text === undefined)
+    return;
   try {
-    raw = await readFile2(configPath, "utf8");
+    const v = JSON.parse(text).version;
+    return typeof v === "string" && v.length > 0 ? v : undefined;
   } catch {
-    print("Not paired.");
+    return;
+  }
+}
+function checkUpdate(deps = {}) {
+  const git = deps.git ?? realGit;
+  const cwd = deps.cwd ?? process.cwd();
+  const self = deps.self ?? dirname2(fileURLToPath2(import.meta.url));
+  const candidates = [
+    ...(deps.stubPaths ?? opencodeStubPaths()).map((path) => ({ path, project: false })),
+    { path: join2(cwd, ".opencode", "plugins", "nomo.js"), project: true },
+    { path: join2(cwd, ".opencode", "plugin", "nomo.js"), project: true }
+  ];
+  let stub;
+  let target;
+  let project = false;
+  for (const c of candidates) {
+    let text;
+    try {
+      text = readFileSync2(c.path, "utf8");
+    } catch {
+      continue;
+    }
+    stub = c.path;
+    project = c.project;
+    target = opencodeStubTarget(text);
+    break;
+  }
+  const installer = join2(dirname2(self), "scripts", "opencode-install.sh");
+  if (stub === undefined) {
+    return {
+      state: "blocked",
+      line: "OpenCode has no Nomo plugin stub — nothing here is installed, so there is nothing to update.",
+      hint: `install it: ${installer}`
+    };
+  }
+  if (target === undefined) {
+    return {
+      state: "blocked",
+      line: `${stub} exists but is not a Nomo stub — something else wrote that file.`,
+      hint: `move it aside, then: ${installer}`
+    };
+  }
+  if (!existsSync2(target)) {
+    return {
+      state: "blocked",
+      line: `${stub} points at ${target}, which is gone — the checkout was moved or deleted.`,
+      hint: `re-run the installer from wherever your nomo checkout is now:
+  <checkout>/plugin/scripts/opencode-install.sh`
+    };
+  }
+  const pluginRoot = dirname2(dirname2(target));
+  const top = git(pluginRoot, ["rev-parse", "--show-toplevel"]);
+  if (top.status !== 0 || top.stdout.length === 0) {
+    return {
+      state: "blocked",
+      line: `${pluginRoot} is not a git checkout — this copy of Nomo cannot be updated in place.`,
+      hint: `clone it and re-install:
+  git clone https://github.com/KarrixLee/nomo.git ~/.nomo
+  ~/.nomo/plugin/scripts/opencode-install.sh`
+    };
+  }
+  const root = top.stdout;
+  let from;
+  try {
+    from = manifestVersion(readFileSync2(join2(root, VERSION_MANIFEST), "utf8"));
+  } catch {
+    from = undefined;
+  }
+  if (from === undefined) {
+    return {
+      state: "blocked",
+      line: `${root} has no readable ${VERSION_MANIFEST} — it does not look like a nomo checkout.`,
+      hint: `check what is there: git -C ${root} remote -v`
+    };
+  }
+  const branch = git(root, ["symbolic-ref", "--short", "-q", "HEAD"]).stdout;
+  if (branch.length === 0) {
+    const at = git(root, ["describe", "--tags", "--always"]).stdout || "?";
+    return {
+      state: "blocked",
+      root,
+      line: `${root} is detached at ${at} — pinned by an earlier --ref install, so it is left alone.`,
+      hint: `a detached HEAD cannot fast-forward. Move the pin, or go back to a branch:
+` + `  bunx nomo-ai --opencode --ref <branch-or-tag>
+  git -C ${root} checkout main`
+    };
+  }
+  const dirty = git(root, ["status", "--porcelain"]).stdout;
+  if (dirty.length > 0) {
+    const n = dirty.split(`
+`).length;
+    return {
+      state: "blocked",
+      root,
+      line: `${root} has ${n} uncommitted change${n === 1 ? "" : "s"} — a pull would fight them.`,
+      hint: `commit or stash them first:
+  git -C ${root} status`
+    };
+  }
+  const upstream = git(root, ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"]).stdout;
+  if (upstream.length === 0) {
+    return {
+      state: "blocked",
+      root,
+      line: `${root} is on ${branch}, which tracks nothing — there is no upstream to update from.`,
+      hint: `point it at one:
+  git -C ${root} branch --set-upstream-to origin/${branch} ${branch}`
+    };
+  }
+  const fetched = git(root, ["fetch", "--quiet"]);
+  if (fetched.status !== 0) {
+    return {
+      state: "blocked",
+      root,
+      upstream,
+      line: `could not reach the remote for ${root}${fetched.stderr ? ` — ${fetched.stderr.split(`
+`)[0]}` : "."}`,
+      hint: `check network access to github.com, then:
+  git -C ${root} fetch`
+    };
+  }
+  if (git(root, ["merge-base", "--is-ancestor", upstream, "HEAD"]).status === 0) {
+    return { state: "current", root, upstream, from, to: from, project, line: `Already on ${from} — nothing to do.` };
+  }
+  if (git(root, ["merge-base", "--is-ancestor", "HEAD", upstream]).status !== 0) {
+    return {
+      state: "blocked",
+      root,
+      upstream,
+      line: `${root} has diverged from ${upstream} — it cannot fast-forward.`,
+      hint: `see what is local, then rebase or reset it yourself:
+  git -C ${root} log --oneline ${upstream}..HEAD`
+    };
+  }
+  const remoteManifest = git(root, ["show", `${upstream}:${VERSION_MANIFEST}`]);
+  const to = manifestVersion(remoteManifest.status === 0 ? remoteManifest.stdout : undefined);
+  return {
+    state: "behind",
+    root,
+    upstream,
+    from,
+    to,
+    project,
+    line: to === undefined || to === from ? `Newer commits on ${upstream} — still ${from}.` : `Update available: ${from} → ${to}.`
+  };
+}
+function opencodeUpdate(deps = {}) {
+  const print = deps.print ?? ((line) => console.log(line));
+  const git = deps.git ?? realGit;
+  const found = checkUpdate(deps);
+  if (found.state === "blocked") {
+    print(`Nomo could not update OpenCode: ${found.line}`);
+    if (found.hint)
+      for (const l of found.hint.split(`
+`))
+        print(`→ ${l}`);
+    return 1;
+  }
+  print(`OpenCode plugin: ${found.root}`);
+  if (found.state === "current") {
+    print(found.line);
     return 0;
   }
-  const creds = revokeCreds(raw);
-  if (creds) {
-    try {
-      const res = await fetchFn(`${creds.url}/v1/cc/pair/revoke`, {
-        method: "POST",
-        headers: { "x-cc-pairing": creds.pairingId, "x-cc-auth": creds.pcSecret },
-        signal: AbortSignal.timeout(revokeTimeoutMs)
-      });
-      if (res.ok) {
-        print("Revoked the pairing on the server.");
-      } else if (res.status === 404) {
-        print("Pairing was already revoked on the server.");
-      } else {
-        print(`Server revoke returned HTTP ${res.status} — removing the local pairing anyway.`);
-      }
-    } catch {
-      print("Could not reach the worker to revoke — removing the local pairing anyway.");
-    }
-  } else {
-    print("Local config is not a valid pairing — removing it.");
+  print(found.line);
+  const merged = git(found.root, ["merge", "--ff-only", found.upstream]);
+  if (merged.status !== 0) {
+    print(`Nomo could not fast-forward ${found.root}${merged.stderr ? ` — ${merged.stderr.split(`
+`)[0]}` : "."}`);
+    print(`→ run it by hand: git -C ${found.root} merge --ff-only ${found.upstream}`);
+    return 1;
   }
-  await unlink2(configPath).catch(() => {});
-  await unlink2(lastSendPath).catch(() => {});
-  await unlink2(htmlPath).catch(() => {});
-  print("Unpaired ✓");
+  const installer = join2(found.root, "plugin", "scripts", "opencode-install.sh");
+  const args = found.project ? ["--project"] : [];
+  const r = spawnSync(installer, args, { stdio: "inherit", cwd: found.project ? deps.cwd ?? process.cwd() : found.root });
+  if (r.error || r.status !== 0) {
+    print(`Nomo pulled ${found.to ?? "the update"} but the installer failed.`);
+    print(`→ run it by hand: ${installer}${args.length ? ` ${args.join(" ")}` : ""}`);
+    return 1;
+  }
+  print(found.to && found.to !== found.from ? `Updated to ${found.to}.` : "Updated.");
+  print("Restart OpenCode — plugins are imported once at server start, so this one is still running the old copy.");
   return 0;
 }
 if (__require.main == __require.module) {
   if (process.argv.includes("--check")) {
-    console.log("usage: unpair [--check]  — revoke and remove this machine's Nomo pairing");
+    console.log("usage: opencode-update [--dry-run] [--check]  — pull the checkout OpenCode loads Nomo from, then re-run its installer (--dry-run reports the verdict and changes nothing)");
     process.exit(0);
   }
-  process.exit(await unpair());
+  if (process.argv.includes("--dry-run") || process.argv.includes("-n")) {
+    const found = checkUpdate();
+    console.log(found.line);
+    if (found.hint)
+      for (const l of found.hint.split(`
+`))
+        console.log(`→ ${l}`);
+    process.exit(found.state === "blocked" ? 1 : 0);
+  }
+  process.exit(opencodeUpdate());
 }
 export {
-  unpair
+  opencodeUpdate,
+  checkUpdate
 };

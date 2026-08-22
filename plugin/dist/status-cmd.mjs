@@ -104,7 +104,7 @@ async function sha256Hex(s) {
 }
 
 // src/core/shared.ts
-var PLUGIN_VERSION = "2.1.21";
+var PLUGIN_VERSION = "2.1.22";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -400,6 +400,13 @@ async function startCodexAppServerDaemon(deps = {}) {
 }
 function lastHookPath(agent) {
   return `${CC_DIR}/last-hook-${agent}`;
+}
+function opencodeStubPaths() {
+  const base = `${process.env.XDG_CONFIG_HOME || `${process.env.HOME}/.config`}/opencode`;
+  return [`${base}/plugins/nomo.js`, `${base}/plugin/nomo.js`];
+}
+function opencodeStubTarget(text) {
+  return /^export \{ default \} from "(.+)";$/m.exec(text)?.[1];
 }
 var FOLDER_KEY_HEX_CHARS = 12;
 var BRANCH_MAX_CHARS = 60;
@@ -2780,10 +2787,6 @@ function adapterFor(agent) {
 var allAdapters = [claudeAdapter, codexAdapter];
 
 // src/entries/status-cmd.ts
-function opencodeStubPaths() {
-  const base = `${process.env.XDG_CONFIG_HOME || `${process.env.HOME}/.config`}/opencode`;
-  return [`${base}/plugins/nomo.js`, `${base}/plugin/nomo.js`];
-}
 var CODEX_PLUGIN_HOOK_COUNT = 7;
 var AGENT_UI = {
   claude: { name: "Claude Code", pair: "/nomo-cc:pair", approvalsOn: "/nomo-cc:approvals on", status: "/nomo-cc:status" },
@@ -3127,7 +3130,7 @@ async function statusCmd(deps = {}) {
     if (text === null)
       continue;
     opencodeStub = path;
-    opencodeTarget = /^export \{ default \} from "(.+)";$/m.exec(text)?.[1];
+    opencodeTarget = opencodeStubTarget(text);
     break;
   }
   const opencodeProblems = [];

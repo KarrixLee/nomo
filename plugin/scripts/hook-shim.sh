@@ -41,7 +41,7 @@
 # exact-literal `case`, which is why this is a whitelist and not a character filter. An unknown name is
 # not an error: exit 0 and leave the session alone.
 case "$1" in
-  cc-status|cc-permission|cc-watchdog|codex-status|codex-permission|codex-notify|pair|unpair|reset|status-cmd)
+  cc-status|cc-permission|cc-watchdog|codex-status|codex-permission|codex-notify|pair|unpair|reset|status-cmd|opencode-update)
     NOMO_ENTRY=$1 ;;
   *) exit 0 ;;
 esac

@@ -16,9 +16,23 @@
 // LOUD ON FAILURE, unlike the plugin's hooks. run.sh and every hook exit 0 on any problem so a broken
 // install never disturbs a session. This is the opposite: the user typed it on purpose, so every
 // failure names the step, the command, and what to run by hand.
+//
+// IT UPDATES TOO, BUT ONLY ONE LEG DOES IT FOR YOU. Detection already knows which agents are here; for
+// an agent that ALREADY has Nomo the useful action is update, not install — so the row becomes one.
+// The value is not evenly spread, though, and the asymmetry is deliberate:
+//
+//   * OpenCode is the only agent with no host update path at all (no marketplace, no `plugin update`),
+//     which is the entire reason this exists. That leg really does fetch, compare and pull, by handing
+//     off to the checkout's own dist/opencode-update.mjs — the SAME code /nomo-update runs, because
+//     two implementations of "is there an update" drift.
+//   * Claude Code and Codex already update in one command the user owns, so their row PRINTS that
+//     command and runs nothing. Running it would buy almost nothing and can do real damage: install
+//     starts with `marketplace add`, and re-adding a marketplace someone deliberately repointed at a
+//     local checkout silently sends their next `claude plugin update` somewhere else. Repointing a
+//     marketplace is install-time behaviour; it has no business in an update.
 
 import { spawnSync } from "node:child_process";
-import { accessSync, constants, existsSync, readFileSync } from "node:fs";
+import { accessSync, constants, existsSync, readdirSync, readFileSync } from "node:fs";
 import { emitKeypressEvents } from "node:readline";
 import { createInterface } from "node:readline/promises";
 import { homedir } from "node:os";
@@ -34,14 +48,26 @@ const CLONE_URL = `https://github.com/${REPO}.git`;
 // update`. A checkout we own upgrades with `git pull` and never moves.
 const CHECKOUT = join(homedir(), ".nomo");
 
+// THE HOSTS' OWN UPDATE COMMANDS — printed for the user to run, never executed here (see the header).
+// Claude has a first-class `plugin update`. Codex has no such verb at all: `codex plugin` is
+// add/list/marketplace/remove, and refreshing means upgrading the marketplace SNAPSHOT and then
+// re-adding the plugin from it. Checked against `codex plugin --help` rather than assumed to mirror
+// Claude's, because a guessed command run inside someone's editor is worse than a correct one printed.
+const CLAUDE_UPDATE = "claude plugin update nomo-cc@nomo";
+const CODEX_UPDATE = ["codex plugin marketplace upgrade nomo", "codex plugin add nomo@nomo"];
+
 const VERSION = JSON.parse(
   readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", "package.json"), "utf8"),
 ).version;
 
-const USAGE = `nomo-ai ${VERSION} — install the Nomo plugin for your coding agents.
+const USAGE = `nomo-ai ${VERSION} — install (or update) the Nomo plugin for your coding agents.
 
   bunx nomo-ai            detect agents, confirm, install
   npx nomo-ai             same, without bun
+
+An agent that already has Nomo shows an update instead of an install. OpenCode's is
+done for you — it has no marketplace, so its checkout is its version. Claude Code and
+Codex own their own updates, so their command is printed for you to run.
 
 Agents (naming any one of these skips the prompt):
   --claude                Claude Code
@@ -69,6 +95,7 @@ let DRY = false;
 // is also the ONLY thing the other two legs can ever install (their marketplaces take an owner/repo
 // and read the default branch — there is no ref to pass them). So this is deliberately not a global
 // "install this version": it is scoped to the one leg that owns its own checkout.
+/** @type {string | null} */
 let REF = null;
 
 /** One colour decision for the whole file, so NO_COLOR turns off the banner and the bold/dim runs
@@ -129,6 +156,48 @@ const isOurCheckout = (remote) => REMOTE_IS_OURS.test(remote.trim());
  *  them (stdin here, stdout there) is how the same piped run took two different paths. */
 const interactive = () => Boolean(process.stdin.isTTY && process.stdout.isTTY);
 
+/** The bundle that owns the OpenCode fetch/compare/pull. Present only from 2.1.22 on, so an older
+ *  ~/.nomo simply takes the install path below — which pulls, and thereby installs this file for next
+ *  time. Nothing to migrate. */
+const UPDATE_ENTRY = join(CHECKOUT, "plugin", "dist", "opencode-update.mjs");
+
+/** Is Nomo already installed for this host? Answered from the host's OWN plugin cache
+ *  (`<cache>/<marketplace>/<plugin>/`): the MARKETPLACE directory name is whatever the user called it,
+ *  so it is scanned, while the PLUGIN directory name is derived from our manifest and is an exact
+ *  literal. Same discovery the plugin's hook-shim relies on in production.
+ *
+ *  DELIBERATELY BIASED TOWARDS "yes". A cache directory can outlive an uninstall, so this can read an
+ *  uninstalled plugin as installed — and the consequence of that is a printed update command the user
+ *  can read and ignore. The opposite mistake runs `marketplace add` over a source they repointed by
+ *  hand, which is silent and wrong for every later update. Only one of those is recoverable by
+ *  reading the screen.
+ *
+ *  NO VERSION IS REPORTED, on purpose: the cache keeps every version a host has ever fetched and the
+ *  enabled one is recorded elsewhere, so the newest directory is a guess. A wrong version number here
+ *  is worse than none.
+ *  @param {string} cacheDir @param {string} plugin */
+function hostHasNomo(cacheDir, plugin) {
+  try {
+    return readdirSync(cacheDir).some((marketplace) => existsSync(join(cacheDir, marketplace, plugin)));
+  } catch {
+    return false; // no cache directory at all — nothing installed
+  }
+}
+
+/** What preflight() learned, keyed by agent id: `{ installed, lines }`. Read by plan(), which the
+ *  arrow menu calls on EVERY keypress — so nothing in here may fork or touch the network. That is the
+ *  whole reason it is a cache and not a function. */
+const STATUS = new Map();
+
+/** An agent that owns its own updates: show the command, never run it. Returns null because from the
+ *  caller's point of view this leg succeeded — there was simply nothing for us to do.
+ *  @param {string[]} cmds */
+function showUpdate(cmds) {
+  say(`  ${dim("already installed — this host owns its own update, so run it yourself:")}`);
+  for (const c of cmds) say(`    ${bold(c)}`);
+  return null;
+}
+
 // ── the three agents ─────────────────────────────────────────────────────────────────────────────
 //
 // `detect` is "is this agent on this machine at all" (binary or config dir — a user who has run the
@@ -140,10 +209,18 @@ const AGENTS = [
   {
     id: "claude",
     label: "Claude Code",
-    plan: () => [`claude plugin marketplace add ${REPO}`, `claude plugin install nomo-cc@nomo -y`],
-    next: ["restart Claude Code so the hooks load", "run /nomo-cc:pair"],
+    plan: () =>
+      STATUS.get("claude")?.installed
+        ? ["already installed — update it yourself with:", `  ${CLAUDE_UPDATE}`]
+        : [`claude plugin marketplace add ${REPO}`, `claude plugin install nomo-cc@nomo -y`],
+    next: () =>
+      STATUS.get("claude")?.installed
+        ? [`run \`${CLAUDE_UPDATE}\`, then restart Claude Code`]
+        : ["restart Claude Code so the hooks load", "run /nomo-cc:pair"],
     detect: () => onPath("claude") || existsSync(join(homedir(), ".claude")),
+    installed: () => hostHasNomo(join(homedir(), ".claude", "plugins", "cache"), "nomo-cc"),
     install() {
+      if (STATUS.get("claude")?.installed) return showUpdate([CLAUDE_UPDATE]);
       if (!onPath("claude")) {
         return {
           error: "`claude` is not on PATH",
@@ -168,12 +245,20 @@ const AGENTS = [
   {
     id: "codex",
     label: "OpenAI Codex",
-    plan: () => [`codex plugin marketplace add ${REPO}`, `codex plugin add nomo@nomo`],
+    plan: () =>
+      STATUS.get("codex")?.installed
+        ? ["already installed — update it yourself with:", ...CODEX_UPDATE.map((c) => `  ${c}`)]
+        : [`codex plugin marketplace add ${REPO}`, `codex plugin add nomo@nomo`],
     // The /hooks step is Codex's own safety gate and nothing here can pre-approve it. Skipping it
     // leaves the plugin installed and silently doing nothing, so it leads the list.
-    next: ["run /hooks in Codex and trust the seven Nomo entries", "run $nomo-pair"],
+    next: () =>
+      STATUS.get("codex")?.installed
+        ? ["run the two commands above, then re-run /hooks if Codex asks again"]
+        : ["run /hooks in Codex and trust the seven Nomo entries", "run $nomo-pair"],
     detect: () => onPath("codex") || existsSync(join(homedir(), ".codex")),
+    installed: () => hostHasNomo(join(homedir(), ".codex", "plugins", "cache"), "nomo"),
     install() {
+      if (STATUS.get("codex")?.installed) return showUpdate(CODEX_UPDATE);
       if (!onPath("codex")) {
         return {
           error: "`codex` is not on PATH",
@@ -192,15 +277,31 @@ const AGENTS = [
   {
     id: "opencode",
     label: "OpenCode",
-    plan: () => [
-      `git clone --depth 1 ${REF ? `--branch ${REF} ` : ""}${CLONE_URL} ${CHECKOUT}`,
-      `${CHECKOUT}/plugin/scripts/opencode-install.sh`,
-    ],
-    next: ["restart OpenCode (plugins load once at server start; no hot reload)", "run /nomo-pair"],
+    plan: () =>
+      STATUS.get("opencode")?.lines ?? [
+        `git clone --depth 1 ${REF ? `--branch ${REF} ` : ""}${CLONE_URL} ${CHECKOUT}`,
+        `${CHECKOUT}/plugin/scripts/opencode-install.sh`,
+      ],
+    next: () =>
+      STATUS.get("opencode")?.installed
+        ? ["restart OpenCode (plugins load once at server start; no hot reload)"]
+        : ["restart OpenCode (plugins load once at server start; no hot reload)", "run /nomo-pair"],
     detect: () =>
       onPath("opencode") ||
       existsSync(join(process.env.XDG_CONFIG_HOME || join(homedir(), ".config"), "opencode")),
+    // Updatable means "there is a bundle here that knows how to update" — an older ~/.nomo predating
+    // 2.1.22 has none, and takes the install path, which pulls and thereby installs it.
+    installed: () => existsSync(UPDATE_ENTRY),
     install() {
+      // --ref is a re-PIN, which is install-time behaviour: it detaches deliberately, and the update
+      // path refuses a detached checkout precisely so it can never undo one. So the flag keeps the
+      // clone/pin leg below, and only a plain run hands off to the updater.
+      if (!REF && STATUS.get("opencode")?.installed) {
+        const fail = run(process.execPath, [UPDATE_ENTRY]);
+        return fail
+          ? { error: fail, hint: `The updater prints what it refused to do and the command to run by hand.\n    git -C ${CHECKOUT} status` }
+          : null;
+      }
       if (!onPath("git")) {
         return { error: "`git` is not on PATH", hint: "OpenCode installs from a checkout; install git and re-run." };
       }
@@ -297,6 +398,33 @@ const AGENTS = [
     },
   },
 ];
+
+/** Fill STATUS, ONCE, before anything is rendered. Everything expensive lives here for one reason:
+ *  the arrow menu repaints the plan on every keypress, and a network round-trip per arrow key would
+ *  be unusable. It runs before the prompt rather than after it because the whole point is that the
+ *  user decides with the answer already on screen.
+ *
+ *  ONLY OpenCode costs a round-trip, and only when it already has an updater to ask. `--dry-run` DOES
+ *  still make that call, which is not a contradiction: the flag means "install nothing", and the check
+ *  is read-only — it fetches and compares, it never touches the working tree. Skipping it would make
+ *  the dry run's whole reason for existing (showing what the real run would do) the one thing it
+ *  could not show.
+ *  @param {Set<string>} selected @param {boolean} explicit */
+function preflight(selected, explicit) {
+  for (const a of AGENTS) STATUS.set(a.id, { installed: a.installed() });
+  const oc = STATUS.get("opencode");
+  // The menu shows every agent, so the answer is needed whether or not OpenCode is ticked — but a
+  // caller who named their agents will never see that row, and owes nobody a network call.
+  if (!oc.installed || REF || (explicit && !selected.has("opencode"))) return;
+  say(dim(`  checking ${CHECKOUT} for updates…`));
+  // --dry-run on the updater is its READ-ONLY half: fetch, compare, report, change nothing. Its stdout
+  // is already the one line a human should read (plus a `→` fix line when it refuses), so it is shown
+  // verbatim rather than re-worded here — the plan preview and /nomo-update must not describe the same
+  // state in two different sentences.
+  const r = spawnSync(process.execPath, [UPDATE_ENTRY, "--dry-run"], { encoding: "utf8" });
+  const out = `${r.stdout || ""}${r.stderr || ""}`.trim();
+  oc.lines = out.length > 0 ? out.split("\n") : [`could not check ${CHECKOUT} for updates`];
+}
 
 // ── argv ─────────────────────────────────────────────────────────────────────────────────────────
 
@@ -678,6 +806,8 @@ async function main() {
     return 1;
   }
 
+  preflight(selected, explicit);
+
   // An agent flag IS the non-interactive signal — asking for confirmation of a selection the caller
   // just spelled out is theatre. Otherwise: prompt unless told not to, and refuse to guess when there
   // is no terminal to ask (a CI run that silently installed three agents is the worse outcome).
@@ -732,7 +862,7 @@ async function main() {
     say(bold("Next:"));
     for (const a of done) {
       say(`  ${a.label}`);
-      for (const step of a.next) say(`    - ${step}`);
+      for (const step of a.next()) say(`    - ${step}`);
     }
     say();
     say(dim("Pairing is one QR scan from the Nomo app's Sessions tab. One pairing covers every agent."));
