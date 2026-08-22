@@ -99,7 +99,7 @@ async function sha256Hex(s) {
 }
 
 // src/core/shared.ts
-var PLUGIN_VERSION = "2.1.0";
+var PLUGIN_VERSION = "2.1.5";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -740,6 +740,26 @@ function watchdogBuildDiffers(incumbent, current) {
     return false;
   return incumbent !== current;
 }
+function watchdogVersionOutranks(mine, incumbent) {
+  if (incumbent === undefined)
+    return true;
+  const parse = (v) => {
+    const core = v.trim().split("+")[0].split("-")[0];
+    if (core.length === 0)
+      return;
+    const parts = core.split(".").map((p) => /^\d+$/.test(p) ? Number(p) : Number.NaN);
+    return parts.some((n) => !Number.isFinite(n)) ? undefined : parts;
+  };
+  const a = parse(mine), b = parse(incumbent);
+  if (a === undefined || b === undefined)
+    return false;
+  for (let i = 0;i < Math.max(a.length, b.length); i++) {
+    const x = a[i] ?? 0, y = b[i] ?? 0;
+    if (x !== y)
+      return x > y;
+  }
+  return false;
+}
 function formatWatchdogPidfile(pid, version = PLUGIN_VERSION, build) {
   return `${pid} ${version}${typeof build === "string" && build.length > 0 ? ` ${build}` : ""}`;
 }
@@ -788,8 +808,12 @@ function ensureWatchdog(deps = {}) {
     const raw = readPidfile();
     const holder = typeof raw === "string" ? parseWatchdogPidfile(raw) : null;
     if (holder && watchdogHolderIsLive(holder.pid, deps)) {
-      if (holder.version === version && !watchdogBuildDiffers(holder.build, build))
+      if (holder.version === version) {
+        if (!watchdogBuildDiffers(holder.build, build))
+          return;
+      } else if (!watchdogVersionOutranks(version, holder.version)) {
         return;
+      }
       try {
         killPid(holder.pid, "SIGTERM");
       } catch {}

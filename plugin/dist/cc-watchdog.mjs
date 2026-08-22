@@ -104,7 +104,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "2.1.0";
+var PLUGIN_VERSION = "2.1.5";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -745,6 +745,26 @@ function watchdogBuildDiffers(incumbent, current) {
     return false;
   return incumbent !== current;
 }
+function watchdogVersionOutranks(mine, incumbent) {
+  if (incumbent === undefined)
+    return true;
+  const parse = (v) => {
+    const core = v.trim().split("+")[0].split("-")[0];
+    if (core.length === 0)
+      return;
+    const parts = core.split(".").map((p) => /^\d+$/.test(p) ? Number(p) : Number.NaN);
+    return parts.some((n) => !Number.isFinite(n)) ? undefined : parts;
+  };
+  const a = parse(mine), b = parse(incumbent);
+  if (a === undefined || b === undefined)
+    return false;
+  for (let i = 0;i < Math.max(a.length, b.length); i++) {
+    const x = a[i] ?? 0, y = b[i] ?? 0;
+    if (x !== y)
+      return x > y;
+  }
+  return false;
+}
 function formatWatchdogPidfile(pid, version = PLUGIN_VERSION, build) {
   return `${pid} ${version}${typeof build === "string" && build.length > 0 ? ` ${build}` : ""}`;
 }
@@ -793,8 +813,12 @@ function ensureWatchdog(deps = {}) {
     const raw = readPidfile();
     const holder = typeof raw === "string" ? parseWatchdogPidfile(raw) : null;
     if (holder && watchdogHolderIsLive(holder.pid, deps)) {
-      if (holder.version === version && !watchdogBuildDiffers(holder.build, build))
+      if (holder.version === version) {
+        if (!watchdogBuildDiffers(holder.build, build))
+          return;
+      } else if (!watchdogVersionOutranks(version, holder.version)) {
         return;
+      }
       try {
         killPid(holder.pid, "SIGTERM");
       } catch {}
@@ -2665,8 +2689,45 @@ var codexAdapter = {
   pidTurnActive: (pid) => codexPidTurnActive(pid),
   locateTuiPid: (ctx, deps) => codexLocateTuiPid(ctx, deps)
 };
+var opencodeAdapter = {
+  kind: "opencode",
+  title: async () => {
+    return;
+  },
+  detectInterrupt: () => false,
+  sessionsDir: () => `${CC_DIR}/opencode-has-no-sessions-dir`,
+  sessionMatch: () => false,
+  hookStampPath: () => lastHookPath("opencode"),
+  hooksNotFiringHint: "  OpenCode loads the plugin at server start — restart OpenCode, or check that ~/.config/opencode/plugins/nomo.js still points at this install.",
+  toolDetail: {},
+  blobAgentFields: { agent: "opencode" }
+};
+function unknownAgentAdapter(kind) {
+  return {
+    kind,
+    title: async () => {
+      return;
+    },
+    detectInterrupt: () => false,
+    sessionsDir: () => `${CC_DIR}/unknown-agent-has-no-sessions-dir`,
+    sessionMatch: () => false,
+    hookStampPath: () => `${CC_DIR}/last-hook-unknown-agent`,
+    hooksNotFiringHint: "  This session was created by a newer nomo install — update this one.",
+    toolDetail: {},
+    blobAgentFields: { agent: kind }
+  };
+}
 function adapterFor(agent) {
-  return agent === "codex" ? codexAdapter : claudeAdapter;
+  switch (agent) {
+    case "codex":
+      return codexAdapter;
+    case "opencode":
+      return opencodeAdapter;
+    case "claude":
+      return claudeAdapter;
+    default:
+      return typeof agent === "string" && agent.length > 0 ? unknownAgentAdapter(agent) : claudeAdapter;
+  }
 }
 var allAdapters = [claudeAdapter, codexAdapter];
 
@@ -3751,7 +3812,7 @@ function ccOpinion(file, join3, now) {
 var finite = (value) => typeof value === "number" && Number.isFinite(value);
 var filled = (value) => typeof value === "string" && value.length > 0;
 function buildStatePlaintext(record, status, at, titleFallback) {
-  const agent = record.agent === "codex" ? "codex" : "claude";
+  const agent = record.agent ?? "claude";
   const branch = sessionBranch(record);
   const base = {
     status,
@@ -3793,7 +3854,7 @@ function computeSessionState(input) {
     return null;
   if (pairingId === undefined || record.pairingId !== pairingId)
     return null;
-  const agent = record.agent === "codex" ? "codex" : "claude";
+  const agent = record.agent ?? "claude";
   const ts = finite(record.ts) ? record.ts : now;
   const startedAt = finite(record.sessionStartedAt) ? { startedAt: record.sessionStartedAt } : {};
   const sealed = { kind: "sealed", value: record.blob };
@@ -3876,7 +3937,7 @@ function lanFrameContent(record, pairingId, hold = null, now = Date.now(), isAli
       prio: 1,
       ts: Math.max(record.ts, hold.at),
       blob: hold.blob,
-      ...record.agent === "codex" ? { agent: "codex" } : {},
+      ...record.agent && record.agent !== "claude" ? { agent: record.agent } : {},
       ...record.attentionKind === "userInput" ? { attentionKind: "userInput" } : {}
     };
   }
@@ -3886,7 +3947,7 @@ function lanFrameContent(record, pairingId, hold = null, now = Date.now(), isAli
     prio,
     ts: record.ts,
     blob: record.blob,
-    ...record.agent === "codex" ? { agent: "codex" } : {},
+    ...record.agent && record.agent !== "claude" ? { agent: record.agent } : {},
     ...prio === 1 && record.attentionKind === "userInput" ? { attentionKind: "userInput" } : {}
   };
 }
@@ -4049,7 +4110,7 @@ function createLanFrameStore(deps = {}) {
     if (blob.kind === "last" && !prev)
       return false;
     const blobSig = blob.kind === "sealed" ? `s:${blob.value}` : blob.kind === "plain" ? `p:${JSON.stringify(blob.value)}` : `l:${prev.state.blob}`;
-    const agent = blob.kind === "last" ? prev.state.agent : computed.agent === "codex" ? "codex" : undefined;
+    const agent = blob.kind === "last" ? prev.state.agent : computed.agent === "claude" ? undefined : computed.agent;
     const startedAt = blob.kind === "last" ? prev.state.startedAt : computed.startedAt;
     const asking = blob.kind === "last" ? undefined : computed.attentionKind;
     const sig = `${computed.terminal ? "term" : "live"}|${computed.ts}|${computed.why}|${agent ?? ""}` + `|${startedAt ?? ""}|${asking ?? ""}|${blobSig}`;
@@ -4153,7 +4214,7 @@ function createLanFrameStore(deps = {}) {
         }
       }
       {
-        const askCc = record.agent !== "codex" && record.provisional !== true;
+        const askCc = (record.agent ?? "claude") === "claude" && record.provisional !== true;
         let cc = null;
         let ccProcStartedAt;
         if (askCc && ccSessionsDir) {
@@ -5183,19 +5244,19 @@ function transcriptStartMs(prefix) {
   }
   return;
 }
-function buildBlob(input, machine, title, plan, agent = "claude", turnStartedAt, pinnedFolder, model, at, proposedPlan, dbgOverride) {
+function buildBlob(input, machine, title, plan, agent = "claude", turnStartedAt, pinnedFolder, model, at, proposedPlan, dbgOverride, detailOverride) {
   const folder = folderIdentity(input.cwd, pinnedFolder);
   const { label, folderKey } = folder;
   const branch = sessionBranch(folder);
   const hookName = typeof input.hook_event_name === "string" ? input.hook_event_name : "";
-  const detail = detailForHook(hookName, typeof input.tool_name === "string" ? input.tool_name : undefined, input.tool_input);
+  const detail = detailOverride ?? detailForHook(hookName, typeof input.tool_name === "string" ? input.tool_name : undefined, input.tool_input);
   const base = {
     status: plan.status,
     title: title ?? "",
     machine,
     label,
     ...detail ? { detail } : {},
-    ...agent === "codex" ? { agent: "codex" } : {},
+    ...agent === "claude" ? {} : { agent },
     ...typeof turnStartedAt === "number" && Number.isFinite(turnStartedAt) ? { turnStartedAt } : {},
     ...typeof model === "string" && model.length > 0 ? { model } : {},
     ...typeof at === "number" && Number.isFinite(at) ? { at } : {},
@@ -5209,7 +5270,7 @@ function buildBlob(input, machine, title, plan, agent = "claude", turnStartedAt,
   }) : undefined;
   return appendFittedPlanAndDebug(base, proposedPlan, dbg);
 }
-async function buildEnvelope(input, machine, now, title, e2eKey, sentDone, agent = "claude", startedAt, turnStartedAt, pinnedFolder, model, planOverride, attentionKindOverride, proposedPlan, dbg, onBlobPlaintext) {
+async function buildEnvelope(input, machine, now, title, e2eKey, sentDone, agent = "claude", startedAt, turnStartedAt, pinnedFolder, model, planOverride, attentionKindOverride, proposedPlan, dbg, onBlobPlaintext, detailOverride) {
   if (typeof input !== "object" || input === null)
     return null;
   const i = input;
@@ -5223,7 +5284,7 @@ async function buildEnvelope(input, machine, now, title, e2eKey, sentDone, agent
   if (typeof startedAt === "number" && Number.isFinite(startedAt))
     base.startedAt = startedAt;
   const at = Math.floor(now / 1000);
-  const plaintext = buildBlob(i, machine, title, plan, agent, turnStartedAt, pinnedFolder, model, at, proposedPlan, dbg);
+  const plaintext = buildBlob(i, machine, title, plan, agent, turnStartedAt, pinnedFolder, model, at, proposedPlan, dbg, detailOverride);
   try {
     onBlobPlaintext?.(plaintext);
   } catch {}
@@ -5275,7 +5336,7 @@ async function trackSessionAt(sessionsDir, sessionId, op, prio, status, blob, ma
       op,
       prio,
       ...blob ? { blob } : {},
-      ...agent === "codex" ? { agent } : {},
+      ...agent === "claude" ? {} : { agent },
       ...typeof sessionStartedAt === "number" && Number.isFinite(sessionStartedAt) ? { sessionStartedAt } : {},
       ...typeof turnStartedAt === "number" && Number.isFinite(turnStartedAt) ? { turnStartedAt } : {},
       ...typeof turnId === "string" && turnId.length > 0 ? { turnId } : {},
@@ -5791,7 +5852,7 @@ function allowAlwaysLine(agent, toolName, toolInput, suggestions) {
   return decisionLine(agent, { hookEventName: "PermissionRequest", decision });
 }
 function answerLine(agent, toolName, toolInput, answers) {
-  if (toolName !== "AskUserQuestion" || !Array.isArray(answers))
+  if (!isAnswerTool(toolName) || !Array.isArray(answers))
     return;
   const questions = usableQuestions(toolInput);
   if (questions.length === 0)
@@ -5892,7 +5953,11 @@ function defaultTrace() {
   return trace;
 }
 function isQuestionTool(toolName) {
-  return toolName === "AskUserQuestion" || toolName === "request_user_input";
+  return toolName === "AskUserQuestion" || toolName === "request_user_input" || toolName === OPENCODE_QUESTION_TOOL;
+}
+var OPENCODE_QUESTION_TOOL = "question";
+function isAnswerTool(toolName) {
+  return toolName === "AskUserQuestion" || toolName === OPENCODE_QUESTION_TOOL;
 }
 function buildPermissionSummary(toolName, toolInput) {
   const str = (v) => typeof v === "string" && v.length > 0 ? v : undefined;
@@ -5932,7 +5997,8 @@ function buildPermissionSummary(toolName, toolInput) {
     }
     case "ExitPlanMode":
       return "Approve Claude's plan";
-    case "AskUserQuestion": {
+    case "AskUserQuestion":
+    case OPENCODE_QUESTION_TOOL: {
       const q = str(firstQuestionText(toolInput));
       return q ? truncate(q) : toolName;
     }
@@ -5986,6 +6052,7 @@ function buildPermissionDetail(toolName, toolInput) {
       return p ?? "";
     }
     case "AskUserQuestion":
+    case OPENCODE_QUESTION_TOOL:
       return "";
     default:
       return "";
@@ -6091,7 +6158,7 @@ function permissionFrame(base, detail, omitted, questions = []) {
   };
 }
 function emitDecision(agent, answer, toolName, toolInput, suggestions, emit, trace) {
-  const isQuestion = toolName === "AskUserQuestion";
+  const isQuestion = isAnswerTool(toolName);
   switch (answer.decision) {
     case "allow":
       if (isQuestion) {
@@ -7600,7 +7667,7 @@ async function correctResolvedPlanPicker(config, path, sessionId, record, deps =
     if (tuiPid !== undefined && !(deps.pidAlive ?? pidAlive)(tuiPid)) {
       return await settlePendingPlanPickerDone(config, path, sessionId, snapshot, now, deps, "exit");
     }
-    const agent = snapshot.agent === "codex" ? "codex" : "claude";
+    const agent = recordAgent(snapshot);
     const adapter2 = adapterFor(agent);
     if (!adapter2.completedTurnWaitState)
       return "uncorrected";
@@ -8263,7 +8330,7 @@ async function discoverLiveSessions(config, deps = {}) {
   }
 }
 function recordAgent(record) {
-  return record.agent === "codex" ? "codex" : "claude";
+  return record.agent ?? "claude";
 }
 function provisionalsCoveredByReal(entries, adapters = allAdapters) {
   const discoveryCapable = new Set(adapters.filter((a) => typeof a.discoverLive === "function").map((a) => a.kind));
@@ -8325,7 +8392,7 @@ async function correctInterrupt(config, path, sessionId, record, now, deps = {})
     } catch {
       return "uncorrected";
     }
-    const agent = record.agent === "codex" ? "codex" : "claude";
+    const agent = recordAgent(record);
     if (!tailShowsInterrupt(tail, agent))
       return "uncorrected";
     if (await decisionHoldIsLive(sessionId, now, deps)) {
@@ -8386,7 +8453,7 @@ async function correctPendingApproval(config, path, sessionId, record, now, deps
   const writeRecord = deps.writeRecord ?? ((p, rec) => atomicWrite(p, JSON.stringify(rec), 384));
   const clock = deps.now ?? Date.now;
   try {
-    const agent = record.agent === "codex" ? "codex" : "claude";
+    const agent = recordAgent(record);
     const adapter2 = adapterFor(agent);
     if (!shouldPendingApprovalCheck(record, adapter2))
       return "uncorrected";
@@ -8437,7 +8504,7 @@ function shouldIdleProvisionalCheck(record, adapter2) {
 }
 async function correctIdleProvisional(config, path, sessionId, record) {
   try {
-    const agent = record.agent === "codex" ? "codex" : "claude";
+    const agent = recordAgent(record);
     const adapter2 = adapterFor(agent);
     if (!shouldIdleProvisionalCheck(record, adapter2))
       return "uncorrected";
@@ -8472,7 +8539,7 @@ function transcriptMtimeMsDefault(path) {
   }
 }
 function isClaudeIdleReapEligible(record, now, transcriptMtimeMs = transcriptMtimeMsDefault) {
-  if (record.agent === "codex")
+  if (recordAgent(record) !== "claude")
     return false;
   if (record.provisional === true)
     return false;
@@ -8499,7 +8566,7 @@ async function correctIdleClaude(config, path, sessionId, record, now, deps = {}
   const writeRecord = deps.writeRecord ?? ((p, rec) => atomicWrite(p, JSON.stringify(rec), 384));
   const clock = deps.now ?? Date.now;
   try {
-    const agent = record.agent === "codex" ? "codex" : "claude";
+    const agent = recordAgent(record);
     if (agent === "codex") {
       if (record.provisional === true || !idleReapAgeEligible(record, now) || typeof record.transcript !== "string" || record.transcript.length === 0)
         return "uncorrected";
@@ -8587,7 +8654,7 @@ async function correctPendingDone(config, path, sessionId, record, now, deps = {
       traceFocus(deps, { event: "pending-done", sessionId, outcome: "held", delivered: false, held: true });
       return "pending";
     }
-    const agent = record.agent === "codex" ? "codex" : "claude";
+    const agent = recordAgent(record);
     const settled = {
       ...record,
       lastEvent: "done",

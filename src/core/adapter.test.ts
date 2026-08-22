@@ -10,6 +10,7 @@ import {
   codexNewestRolloutForCwd, codexPidPlanPickerEvidence, codexPidPlanPickerState, codexPidTurnActive, codexPlanPickerStateFromTail, codexProposedPlanMarkdown, codexRolloutExistsForSession, codexSentinelSessionId, codexSessionModel,
   codexRolloutCreationEvidence, codexSessionCreationSuppression, codexTailPendingApproval, codexTailPendingAttentionKind, codexTailPendingUserInputDetail, codexTurnActiveFromTail, filterCodexTuis, findProvisionalForPid,
   firstAssistantModel, firstUserPrompt, lastAssistantModel, parseCodexProcs, rolloutMetaCwd,
+  opencodeAdapter,
   requestUserInputDetail, rolloutPathFromLsof, sessionTitle, TrackedSessionLite,
 } from "./adapter";
 import type { LocateTuiReason } from "./adapter";
@@ -30,6 +31,42 @@ describe("adapterFor", () => {
   test("kinds match the on-disk literals", () => {
     expect(claudeAdapter.kind).toBe("claude");
     expect(codexAdapter.kind).toBe("codex");
+  });
+
+  // THE REBRAND BUG (2026-08-19, observed live): a 2.0.2 watchdog picked up a failed `done` retry for
+  // an `agent:"opencode"` record, adapterFor fell through to claude, claude's blobAgentFields is `{}`,
+  // and the agent key vanished from the rebuilt blob — the island flipped OpenCode → Claude Code. An
+  // agent this build does not understand must ride through a rebuild untouched.
+  describe("an UNKNOWN agent kind is passed through, never coerced to claude", () => {
+    test("blobAgentFields carries the raw literal back out", () => {
+      expect(adapterFor("opencode")).toBe(opencodeAdapter);
+      const future = adapterFor("some-future-agent");
+      expect(future).not.toBe(claudeAdapter);
+      expect(future.kind).toBe("some-future-agent");
+      expect(future.blobAgentFields).toEqual({ agent: "some-future-agent" });
+    });
+
+    test("every optional seam is absent, and the inert ones cannot match a real agent's files", () => {
+      const future = adapterFor("some-future-agent");
+      for (const seam of [
+        "model", "tailShowsPendingApproval", "tailPendingAttentionDetail", "tailPendingAttentionKind",
+        "completedTurnWaitState", "completedTurnWaitEvidence", "isChildSessionGhost",
+        "isInternalSessionGhost", "sessionCreationSuppression", "forkResumePredecessor",
+        "clearPredecessor", "isHeadlessInvocation", "isDesktopInvocation", "discoverLive",
+        "pidTurnActive", "locateTuiPid",
+      ]) expect(future[seam as keyof typeof future]).toBeUndefined();
+      expect(future.sessionMatch("abc.jsonl")).toBe(false);
+      expect(future.detectInterrupt("anything")).toBe(false);
+      // The untrusted literal never reaches a path (a record could name anything at all).
+      expect(adapterFor("../../etc/passwd").hookStampPath()).not.toContain("..");
+      // …and it is never registered, so no sweep or health row ever calls into it.
+      expect(allAdapters.some((a) => a.kind === "some-future-agent")).toBe(false);
+    });
+
+    test("a MISSING or empty agent is corrupt, not unknown — the claude default is unchanged", () => {
+      expect(adapterFor("")).toBe(claudeAdapter);
+      expect(adapterFor(undefined as unknown as string)).toBe(claudeAdapter);
+    });
   });
 });
 

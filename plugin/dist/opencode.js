@@ -1,5 +1,7 @@
-import { createRequire } from "node:module";
-var __require = /* @__PURE__ */ createRequire(import.meta.url);
+// src/opencode/plugin.ts
+import { spawn as spawn2 } from "node:child_process";
+import { accessSync, constants, readFileSync as readFileSync2 } from "node:fs";
+import { hostname as hostname3 } from "node:os";
 
 // src/core/hook.ts
 import { readdir as readdir2, readFile as readFile4, unlink as unlink2 } from "node:fs/promises";
@@ -10,9 +12,7 @@ import { basename as basename3 } from "node:path";
 var textEncoder = new TextEncoder;
 var textDecoder = new TextDecoder;
 var HKDF_INFO = textEncoder.encode("nomo-cc-e2e-v1");
-var RATCHET_INFO_PREFIX = "nomo-cc-ratchet-v1|";
 var LAN_INFO_PREFIX = "nomo-lan-v1|";
-var ECDH_P256 = { name: "ECDH", namedCurve: "P-256" };
 function bytesToBase64(bytes) {
   let binary = "";
   for (const b of bytes)
@@ -34,11 +34,6 @@ function fromB64url(s) {
   const padded = standard + "=".repeat((4 - standard.length % 4) % 4);
   return base64ToBytes(padded);
 }
-async function deriveE2EKey(qrSecret, phoneNonce) {
-  const ikm = await crypto.subtle.importKey("raw", qrSecret, "HKDF", false, ["deriveBits"]);
-  const bits = await crypto.subtle.deriveBits({ name: "HKDF", hash: "SHA-256", salt: phoneNonce, info: HKDF_INFO }, ikm, 256);
-  return new Uint8Array(bits);
-}
 async function deriveLanKey(e2eKey, pairingId) {
   const ikm = await crypto.subtle.importKey("raw", e2eKey, "HKDF", false, ["deriveBits"]);
   const bits = await crypto.subtle.deriveBits({
@@ -47,21 +42,6 @@ async function deriveLanKey(e2eKey, pairingId) {
     salt: new Uint8Array(0),
     info: textEncoder.encode(LAN_INFO_PREFIX + pairingId)
   }, ikm, 256);
-  return new Uint8Array(bits);
-}
-async function generateEphemeralKeyPair() {
-  const kp = await crypto.subtle.generateKey(ECDH_P256, true, ["deriveBits"]);
-  const privPkcs8 = new Uint8Array(await crypto.subtle.exportKey("pkcs8", kp.privateKey));
-  const pubRaw = new Uint8Array(await crypto.subtle.exportKey("raw", kp.publicKey));
-  return { privPkcs8, pubRaw };
-}
-async function deriveRatchetKey(ownPrivPkcs8, otherPubRaw, k0, pairingId) {
-  const priv = await crypto.subtle.importKey("pkcs8", ownPrivPkcs8, ECDH_P256, false, ["deriveBits"]);
-  const pub = await crypto.subtle.importKey("raw", otherPubRaw, ECDH_P256, false, []);
-  const z = new Uint8Array(await crypto.subtle.deriveBits({ name: "ECDH", public: pub }, priv, 256));
-  const zKey = await crypto.subtle.importKey("raw", z, "HKDF", false, ["deriveBits"]);
-  const info = textEncoder.encode(RATCHET_INFO_PREFIX + pairingId);
-  const bits = await crypto.subtle.deriveBits({ name: "HKDF", hash: "SHA-256", salt: k0, info }, zKey, 256);
   return new Uint8Array(bits);
 }
 async function sealCombined(key, plaintext, iv) {
@@ -84,10 +64,6 @@ async function decryptBlob(key, blob) {
   const cryptoKey = await crypto.subtle.importKey("raw", key, "AES-GCM", false, ["decrypt"]);
   const plaintext = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, cryptoKey, ciphertext);
   return JSON.parse(textDecoder.decode(plaintext));
-}
-async function sha256Hex(s) {
-  const digest = await crypto.subtle.digest("SHA-256", textEncoder.encode(s));
-  return Array.from(new Uint8Array(digest)).map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
 // src/core/adapter.ts
@@ -117,16 +93,6 @@ function formatPlanPickerDebug(input) {
 function formatDecisionHoldDebug(input) {
   const value = `${debugToken(input.version ?? PLUGIN_VERSION)} ev:hold req:${debugToken(input.requestId.slice(0, 8))} pid:${input.pid}`;
   return Array.from(value).slice(0, DBG_BLOB_TEXT_MAX_CHARS).join("");
-}
-var CODEX_BRIDGE_DOWN_MARKER = "cxbridge:down";
-function appendCodexBridgeMarker(dbg, down) {
-  if (typeof dbg !== "string" || dbg.length === 0)
-    return dbg;
-  const bare = dbg.split(` ${CODEX_BRIDGE_DOWN_MARKER}`).join("");
-  if (!down)
-    return bare;
-  const next = `${bare} ${CODEX_BRIDGE_DOWN_MARKER}`;
-  return Array.from(next).length <= DBG_BLOB_TEXT_MAX_CHARS ? next : bare;
 }
 var CC_DIR = `${process.env.HOME}/.config/cc-status`;
 var SESSION_TRACE_PATH = `${CC_DIR}/session-trace.log`;
@@ -270,132 +236,6 @@ var WATCHDOG_PATH = existsSync(`${HERE}/cc-watchdog.mjs`) ? `${HERE}/cc-watchdog
 function codexHome() {
   const env = process.env.CODEX_HOME;
   return env && env.length > 0 ? env : `${process.env.HOME}/.codex`;
-}
-var CODEX_HOOK_MARKER = "codex-status.mjs";
-function codexAppServerSocketPath() {
-  return `${codexHome()}/app-server-control/app-server-control.sock`;
-}
-var CODEX_SOCKET_PROBE_TIMEOUT_MS = 200;
-async function unixSocketAccepts(socketPath, timeoutMs) {
-  let createConnection;
-  try {
-    ({ createConnection } = await import("node:net"));
-  } catch {
-    return false;
-  }
-  return await new Promise((resolve2) => {
-    let settled = false;
-    let socket;
-    const timer = setTimeout(() => done(false), timeoutMs);
-    timer.unref?.();
-    function done(accepted) {
-      if (settled)
-        return;
-      settled = true;
-      clearTimeout(timer);
-      try {
-        socket?.destroy();
-      } catch {}
-      resolve2(accepted);
-    }
-    try {
-      socket = createConnection({ path: socketPath });
-    } catch {
-      done(false);
-      return;
-    }
-    socket.unref?.();
-    socket.once("connect", () => done(true));
-    socket.once("error", () => done(false));
-    socket.once("close", () => done(false));
-  });
-}
-async function codexAppServerSocketAvailable(socketPath = codexAppServerSocketPath()) {
-  return await unixSocketAccepts(socketPath, CODEX_SOCKET_PROBE_TIMEOUT_MS);
-}
-async function codexAppServerSocketState(socketPath = codexAppServerSocketPath()) {
-  if (await codexAppServerSocketAvailable(socketPath))
-    return "live";
-  try {
-    return (await stat(socketPath)).isSocket() ? "stale" : "absent";
-  } catch {
-    return "absent";
-  }
-}
-var CODEX_DAEMON_START_ARGS = ["app-server", "daemon", "start"];
-var CODEX_DAEMON_START_TIMEOUT_MS = 8000;
-var CODEX_DAEMON_SOCKET_WAIT_MS = 4000;
-var CODEX_DAEMON_SOCKET_POLL_MS = 250;
-async function startCodexAppServerDaemon(deps = {}) {
-  const trace = deps.trace ?? ((event) => traceSession(event));
-  const probe = deps.probe ?? (() => codexAppServerSocketAvailable());
-  const sleep = deps.sleep ?? ((ms) => new Promise((resolve2) => setTimeout(resolve2, ms)));
-  const command = deps.codexPath ?? "codex";
-  const timeoutMs = deps.timeoutMs ?? CODEX_DAEMON_START_TIMEOUT_MS;
-  const socketWaitMs = deps.socketWaitMs ?? CODEX_DAEMON_SOCKET_WAIT_MS;
-  const spawnFn = deps.spawnFn ?? ((cmd, args) => spawn(cmd, [...args], { stdio: "ignore" }));
-  let exit;
-  try {
-    exit = await new Promise((resolve2) => {
-      let settled = false;
-      const done = (value) => {
-        if (settled)
-          return;
-        settled = true;
-        resolve2(value);
-      };
-      let child;
-      try {
-        child = spawnFn(command, CODEX_DAEMON_START_ARGS);
-      } catch {
-        done("error");
-        return;
-      }
-      const timer = setTimeout(() => {
-        try {
-          child.kill("SIGTERM");
-        } catch {}
-        done("timeout");
-      }, timeoutMs);
-      timer.unref?.();
-      child.on("error", () => {
-        clearTimeout(timer);
-        done("error");
-      });
-      child.on("exit", (code, signal) => {
-        clearTimeout(timer);
-        done({ code, signal });
-      });
-    });
-  } catch {
-    exit = "error";
-  }
-  if (exit === "error" || exit === "timeout" || exit.code !== 0) {
-    trace({
-      event: "codex-daemon-start",
-      outcome: exit === "error" ? "spawn-failed" : exit === "timeout" ? "timeout" : "nonzero-exit",
-      ...typeof exit === "object" ? { code: exit.code, signal: exit.signal } : {}
-    });
-    return false;
-  }
-  const deadline = socketWaitMs;
-  for (let waited = 0;; waited += CODEX_DAEMON_SOCKET_POLL_MS) {
-    let up = false;
-    try {
-      up = await probe();
-    } catch {
-      up = false;
-    }
-    if (up) {
-      trace({ event: "codex-daemon-start", outcome: "started", waitedMs: waited });
-      return true;
-    }
-    if (waited >= deadline)
-      break;
-    await sleep(CODEX_DAEMON_SOCKET_POLL_MS);
-  }
-  trace({ event: "codex-daemon-start", outcome: "no-socket", waitedMs: deadline });
-  return false;
 }
 function lastHookPath(agent) {
   return `${CC_DIR}/last-hook-${agent}`;
@@ -581,148 +421,6 @@ async function loadPendingConfig(configPath = `${CC_DIR}/config.json`) {
     return null;
   }
 }
-var CONFIG_MODE = 384;
-async function decryptDeviceName(key, blob) {
-  const bin = atob(blob);
-  const combined = new Uint8Array(bin.length);
-  for (let i = 0;i < bin.length; i++)
-    combined[i] = bin.charCodeAt(i);
-  const cryptoKey = await crypto.subtle.importKey("raw", key, "AES-GCM", false, ["decrypt"]);
-  const plain = await crypto.subtle.decrypt({ name: "AES-GCM", iv: combined.slice(0, 12) }, cryptoKey, combined.slice(12));
-  const utf8 = new TextDecoder().decode(plain);
-  try {
-    const parsed = JSON.parse(utf8);
-    if (typeof parsed === "string" && parsed.length > 0)
-      return parsed;
-  } catch {}
-  const raw = utf8.trim();
-  return raw.length > 0 ? raw : "your phone";
-}
-var PENDING_STASH_STALE_MS = 600000;
-async function flushPendingStash(stashPath, url, pairingId, pcSecret, e2eKey, now, fetchFn, fetchTimeoutMs, attempts, retryDelayMs, sleep, isAlive, ensureWD, sessionsDir) {
-  let stash;
-  try {
-    stash = JSON.parse(await readFile(stashPath, "utf8"));
-  } catch {
-    return;
-  }
-  if (typeof stash.stashedAt !== "number" || now - stash.stashedAt >= PENDING_STASH_STALE_MS) {
-    await unlink(stashPath).catch(() => {});
-    return;
-  }
-  if (typeof stash.pid === "number" && !isAlive(stash.pid)) {
-    await unlink(stashPath).catch(() => {});
-    return;
-  }
-  try {
-    const blob = await encryptBlob(e2eKey, stash.blob);
-    const envelope = { v: 2, sessionId: stash.sessionId, op: stash.op, prio: stash.prio, ts: now, blob };
-    for (let attempt = 0;attempt < attempts; attempt++) {
-      try {
-        const res = await fetchFn(`${url}/v1/cc/event`, {
-          method: "POST",
-          headers: { "content-type": "application/json", "x-cc-pairing": pairingId, "x-cc-auth": pcSecret, "x-cc-version": PLUGIN_VERSION, "x-cc-approvals": await localApprovalsState() },
-          body: JSON.stringify(envelope),
-          signal: AbortSignal.timeout(fetchTimeoutMs)
-        });
-        if (res.ok)
-          break;
-      } catch {}
-      if (attempt < attempts - 1)
-        await sleep(retryDelayMs);
-    }
-    if (typeof stash.pid === "number") {
-      try {
-        const record = {
-          pid: stash.pid,
-          machine: stash.blob.machine,
-          label: stash.blob.label,
-          ts: Date.now(),
-          lastEvent: stash.op === "start" ? "sessionStart" : stash.blob.status,
-          sentDone: stash.op === "done",
-          op: stash.op,
-          prio: stash.prio,
-          blob,
-          ...stash.blob.agent === "codex" ? { agent: "codex" } : {},
-          ...typeof stash.blob.title === "string" && stash.blob.title.length > 0 ? { title: stash.blob.title } : {},
-          ...typeof stash.blob.model === "string" && stash.blob.model.length > 0 ? { model: stash.blob.model } : {},
-          ...pairingId.length > 0 ? { pairingId } : {}
-        };
-        await atomicWrite(`${sessionsDir}/${stash.sessionId}.json`, JSON.stringify(record), 384);
-        ensureWD();
-      } catch {}
-    }
-  } finally {
-    await unlink(stashPath).catch(() => {});
-  }
-}
-async function completePendingPairing(pending, configPath, opts = {}) {
-  const fetchFn = opts.fetchFn ?? fetch;
-  const fetchTimeoutMs = opts.fetchTimeoutMs ?? 1e4;
-  const ackAttempts = opts.ackAttempts ?? 3;
-  const ackRetryDelayMs = opts.ackRetryDelayMs ?? 1000;
-  const sleep = opts.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
-  let res;
-  try {
-    res = await fetchFn(`${pending.url}/v1/cc/pair/status?p=${pending.pairingId}`, {
-      headers: { "x-cc-auth": pending.pcSecret },
-      signal: AbortSignal.timeout(fetchTimeoutMs)
-    });
-  } catch {
-    return { state: "network" };
-  }
-  if (res.status === 404)
-    return { state: "gone" };
-  if (!res.ok)
-    return { state: "rejected", httpStatus: res.status };
-  const body = await res.json();
-  if (body.state === "claimed" && typeof body.phoneNonce !== "string") {
-    return { state: "already-completed" };
-  }
-  if (body.state !== "claimed" || typeof body.phoneNonce !== "string" || typeof body.deviceNameEnc !== "string") {
-    return { state: "pending" };
-  }
-  const ikm = body.path === "code" ? pending.codeIkm : pending.qrSecret;
-  if (!ikm)
-    return { state: "tampered" };
-  const k0 = await deriveE2EKey(ikm, fromB64url(body.phoneNonce));
-  if (!pending.pcEphPriv || typeof body.phoneEphPub !== "string")
-    return { state: "tampered" };
-  let e2eKey;
-  let deviceName;
-  try {
-    e2eKey = await deriveRatchetKey(pending.pcEphPriv, fromB64url(body.phoneEphPub), k0, pending.pairingId);
-    deviceName = await decryptDeviceName(e2eKey, body.deviceNameEnc);
-  } catch {
-    return { state: "tampered" };
-  }
-  try {
-    await chmod(configPath, CONFIG_MODE);
-  } catch {}
-  await atomicWrite(configPath, JSON.stringify({
-    url: pending.url,
-    pairingId: pending.pairingId,
-    pcSecret: pending.pcSecret,
-    e2eKeyB64: b64url(e2eKey),
-    ...pending.machineName ? { machineName: pending.machineName } : {}
-  }), CONFIG_MODE);
-  for (let attempt = 0;attempt < ackAttempts; attempt++) {
-    try {
-      await fetchFn(`${pending.url}/v1/cc/pair/ack`, {
-        method: "POST",
-        headers: { "x-cc-pairing": pending.pairingId, "x-cc-auth": pending.pcSecret, "x-cc-version": PLUGIN_VERSION },
-        signal: AbortSignal.timeout(fetchTimeoutMs)
-      });
-      break;
-    } catch {
-      if (attempt < ackAttempts - 1)
-        await sleep(ackRetryDelayMs);
-    }
-  }
-  await flushPendingStash(join(dirname(configPath), PENDING_STASH_FILE), pending.url, pending.pairingId, pending.pcSecret, e2eKey, Date.now(), fetchFn, fetchTimeoutMs, ackAttempts, ackRetryDelayMs, sleep, opts.isAlive ?? pidAlive, opts.ensureWatchdog ?? ensureWatchdog, opts.sessionsDir ?? SESSIONS_DIR);
-  await unlink(join(dirname(configPath), PAIR_HTML_FILE)).catch(() => {});
-  return { state: "completed", deviceName };
-}
 function isWatchdogCommand(psCommand) {
   return psCommand.includes("cc-watchdog");
 }
@@ -763,9 +461,6 @@ function watchdogVersionOutranks(mine, incumbent) {
       return x > y;
   }
   return false;
-}
-function formatWatchdogPidfile(pid, version = PLUGIN_VERSION, build) {
-  return `${pid} ${version}${typeof build === "string" && build.length > 0 ? ` ${build}` : ""}`;
 }
 function parseWatchdogPidfile(raw) {
   const [pidField, versionField, buildField] = raw.trim().split(/\s+/);
@@ -890,13 +585,6 @@ async function settleDecisionHoldRecordAt(sessionsDir, sessionId, patch) {
       return;
     await atomicWrite(`${sessionsDir}/${sessionId}.json`, JSON.stringify({ ...record, ...patch }), 384);
   } catch {}
-}
-async function readDecisionHoldAt(sessionsDir, sessionId) {
-  try {
-    return JSON.parse(await readFile(`${sessionsDir}/${decisionHoldFileName(sessionId)}`, "utf8"));
-  } catch {
-    return null;
-  }
 }
 async function writeDecisionHold(sessionId, hold) {
   return writeDecisionHoldAt(SESSIONS_DIR, sessionId, hold);
@@ -1036,9 +724,6 @@ function codexCompanionBrokerEvidence(pid, ancestorsOf = pidAncestors, commandOf
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 var execFileP = promisify(execFile);
-var OSASCRIPT_TIMEOUT_MS = 4000;
-var HERDR_TIMEOUT_MS = 4000;
-var HERDR_TAB_ID = /^[A-Za-z0-9:]+$/;
 function commandTokens(command) {
   return command.trim().split(/\s+/).filter(Boolean);
 }
@@ -1047,9 +732,6 @@ function isHerdrCommand(command) {
     return false;
   const executable = commandTokens(command)[0]?.replace(/^['"]|['"]$/g, "");
   return typeof executable === "string" && /(?:^|\/)herdr$/.test(executable);
-}
-function isHerdrServer(command) {
-  return typeof command === "string" && isHerdrCommand(command) && commandTokens(command).slice(1).includes("server");
 }
 function ancestryContainsHerdr(pid, ancestorsOf = pidAncestors, commandOf = pidCommand) {
   let ancestors;
@@ -1065,56 +747,6 @@ function ancestryContainsHerdr(pid, ancestorsOf = pidAncestors, commandOf = pidC
     } catch {}
   }
   return false;
-}
-function recordTitleMatchesPane(recordTitle, paneTitle) {
-  if (typeof recordTitle !== "string" || typeof paneTitle !== "string")
-    return false;
-  if (recordTitle === paneTitle)
-    return true;
-  const match = /^(.*?)(?:\u2026|\.{3})$/.exec(recordTitle);
-  return !!match && match[1].length > 0 && paneTitle.startsWith(match[1]);
-}
-function correlateHerdrPane(context, panes) {
-  const byId = panes.filter((pane) => pane.agent === context.agent && pane.agent_session?.value === context.sessionId && (pane.agent_session?.agent ?? context.agent) === context.agent);
-  if (byId.length > 0)
-    return byId.length === 1 ? byId[0] : undefined;
-  let candidates = context.agent === "claude" ? panes.filter((pane) => pane.agent === "claude" && recordTitleMatchesPane(context.record.title, pane.terminal_title_stripped)) : panes.filter((pane) => pane.agent === "codex" && typeof context.record.origin?.cwd === "string" && context.record.origin.cwd.length > 0 && pane.cwd === context.record.origin.cwd);
-  if (candidates.length > 1) {
-    const working = candidates.filter((pane) => pane.agent_status === "working");
-    if (working.length > 0)
-      candidates = working;
-  }
-  return candidates.length === 1 ? candidates[0] : undefined;
-}
-function parseHerdrPanes(stdout) {
-  const parsed = JSON.parse(stdout);
-  const panes = parsed?.result?.panes;
-  if (!Array.isArray(panes))
-    throw new Error("invalid herdr pane list");
-  return panes.filter((value) => {
-    if (!value || typeof value !== "object")
-      return false;
-    const pane = value;
-    return typeof pane.agent === "string" && typeof pane.tab_id === "string";
-  });
-}
-function parsePsProcesses(stdout) {
-  const out = [];
-  for (const line of stdout.split(/\r?\n/)) {
-    const match = /^\s*(\d+)\s+(\S+)\s+(.+)$/.exec(line);
-    if (!match)
-      continue;
-    const pid = Number.parseInt(match[1], 10);
-    if (Number.isFinite(pid))
-      out.push({ pid, tty: match[2], command: match[3] });
-  }
-  return out;
-}
-async function runExecFile(file, args, options, deps) {
-  if (deps.execFile)
-    return deps.execFile(file, args, options);
-  const { stdout, stderr } = await execFileP(file, args, options);
-  return { stdout: String(stdout), stderr: String(stderr) };
 }
 var TERMINAL_APPS = [
   { id: "terminal-app", bundleId: "com.apple.Terminal", match: /\/Terminal\.app\// },
@@ -1150,196 +782,6 @@ function owningTerminalApp(pid, ancestorsOf = pidAncestors, commandOf = pidComma
       return app;
   }
   return;
-}
-function ttyDevicePath(raw) {
-  if (typeof raw !== "string")
-    return;
-  const trimmed = raw.trim();
-  if (!isRealTty(trimmed))
-    return;
-  const bare = trimmed.startsWith("/dev/") ? trimmed.slice(5) : trimmed;
-  const name = /^s[0-9]+$/.test(bare) ? `tty${bare}` : bare;
-  const path = `/dev/${name}`;
-  return isTtyDevicePath(path) ? path : undefined;
-}
-function isTtyDevicePath(path) {
-  return /^\/dev\/tty[a-z0-9]+$/.test(path);
-}
-function terminalAppScript(devPath) {
-  if (!isTtyDevicePath(devPath))
-    throw new Error("unsafe tty path");
-  return [
-    `tell application "Terminal"`,
-    `	repeat with w in windows`,
-    `		repeat with t in tabs of w`,
-    `			if tty of t is "${devPath}" then`,
-    `				set selected of t to true`,
-    `				set index of w to 1`,
-    `				activate`,
-    `				return "ok"`,
-    `			end if`,
-    `		end repeat`,
-    `	end repeat`,
-    `end tell`,
-    `return "none"`
-  ].join(`
-`);
-}
-function iterm2Script(devPath) {
-  if (!isTtyDevicePath(devPath))
-    throw new Error("unsafe tty path");
-  return [
-    `tell application "iTerm"`,
-    `	repeat with w in windows`,
-    `		repeat with t in tabs of w`,
-    `			repeat with s in sessions of t`,
-    `				if tty of s is "${devPath}" then`,
-    `					select s`,
-    `					select t`,
-    `					select w`,
-    `					activate`,
-    `					return "ok"`,
-    `				end if`,
-    `			end repeat`,
-    `		end repeat`,
-    `	end repeat`,
-    `end tell`,
-    `return "none"`
-  ].join(`
-`);
-}
-function activateScript(bundleId) {
-  if (!/^[A-Za-z0-9.\-]+$/.test(bundleId))
-    throw new Error("unsafe bundle id");
-  return `tell application id "${bundleId}" to activate`;
-}
-async function runOsascript(script) {
-  const { stdout } = await execFileP("osascript", ["-e", script], { timeout: OSASCRIPT_TIMEOUT_MS });
-  return String(stdout).trim();
-}
-async function ttyViaPs(pid) {
-  try {
-    const { stdout } = await execFileP("ps", ["-o", "tty=", "-p", String(pid)]);
-    const trimmed = stdout.trim();
-    return trimmed.length > 0 ? trimmed : undefined;
-  } catch {
-    return;
-  }
-}
-function note(deps, event) {
-  try {
-    deps.trace?.(event);
-  } catch {}
-}
-async function focusHerdr(pid, deps, ancestorsOf, commandOf) {
-  const context = deps.context;
-  if (!context) {
-    note(deps, { event: "terminal-focus", pid, result: "ambiguous", reason: "herdr-ambiguous" });
-    return { ok: false, reason: "herdr-ambiguous" };
-  }
-  let pane;
-  try {
-    const listed = await runExecFile("herdr", ["pane", "list"], { timeout: HERDR_TIMEOUT_MS }, deps);
-    if ((listed.exitCode ?? 0) !== 0)
-      throw new Error("herdr pane list failed");
-    pane = correlateHerdrPane(context, parseHerdrPanes(String(listed.stdout)));
-  } catch {
-    note(deps, { event: "terminal-focus", pid, result: "unsupported", reason: "herdr-cli-failed" });
-    return { ok: false, reason: "herdr-cli-failed" };
-  }
-  if (!pane) {
-    note(deps, { event: "terminal-focus", pid, result: "ambiguous", reason: "herdr-ambiguous" });
-    return { ok: false, reason: "herdr-ambiguous" };
-  }
-  if (!HERDR_TAB_ID.test(pane.tab_id)) {
-    note(deps, { event: "terminal-focus", pid, result: "unsupported", reason: "herdr-cli-failed" });
-    return { ok: false, reason: "herdr-cli-failed" };
-  }
-  try {
-    const focused = await runExecFile("herdr", ["tab", "focus", pane.tab_id], { timeout: HERDR_TIMEOUT_MS }, deps);
-    if ((focused.exitCode ?? 0) !== 0)
-      throw new Error("herdr tab focus failed");
-  } catch {
-    note(deps, { event: "terminal-focus", pid, result: "unsupported", reason: "herdr-cli-failed" });
-    return { ok: false, reason: "herdr-cli-failed" };
-  }
-  let app;
-  try {
-    const scanned = await runExecFile("ps", ["-axo", "pid=,tty=,args="], { timeout: HERDR_TIMEOUT_MS }, deps);
-    if ((scanned.exitCode ?? 0) === 0) {
-      const apps = new Map;
-      for (const process2 of parsePsProcesses(String(scanned.stdout))) {
-        if (!isRealTty(process2.tty) || !isHerdrCommand(process2.command) || isHerdrServer(process2.command))
-          continue;
-        const owner = owningTerminalApp(process2.pid, ancestorsOf, commandOf);
-        if (owner)
-          apps.set(owner.bundleId, owner);
-      }
-      if (apps.size === 1)
-        app = apps.values().next().value;
-    }
-  } catch {}
-  if (!app) {
-    note(deps, { event: "terminal-focus", pid, result: "focused", via: "herdr", reason: "focused-detached" });
-    return { ok: true, via: "herdr", reason: "focused-detached" };
-  }
-  try {
-    await (deps.osascript ?? runOsascript)(activateScript(app.bundleId));
-    note(deps, { event: "terminal-focus", pid, result: "focused", via: "herdr", app: app.id, reason: "herdr-focused" });
-    return { ok: true, via: "herdr", reason: "herdr-focused" };
-  } catch {
-    note(deps, { event: "terminal-focus", pid, result: "osascript-failed", app: app.id });
-    return { ok: false, reason: "osascript-failed" };
-  }
-}
-async function focusTerminalForPid(pid, deps = {}) {
-  try {
-    if ((deps.platform ?? process.platform) !== "darwin") {
-      note(deps, { event: "terminal-focus", pid, result: "unsupported", why: "not-darwin" });
-      return { ok: false, reason: "unsupported" };
-    }
-    const ancestorsOf = deps.ancestorsOf ?? pidAncestors;
-    const commandOf = deps.commandOf ?? pidCommand;
-    if (ancestryContainsHerdr(pid, ancestorsOf, commandOf)) {
-      return await focusHerdr(pid, deps, ancestorsOf, commandOf);
-    }
-    let rawTty;
-    try {
-      rawTty = await (deps.ttyOf ?? ttyViaPs)(pid);
-    } catch {
-      rawTty = undefined;
-    }
-    const devPath = ttyDevicePath(rawTty);
-    const app = owningTerminalApp(pid, ancestorsOf, commandOf);
-    if (devPath === undefined && app?.ttyless !== true) {
-      note(deps, { event: "terminal-focus", pid, result: "no-tty", tty: rawTty ?? "" });
-      return { ok: false, reason: "no-tty" };
-    }
-    if (!app) {
-      note(deps, { event: "terminal-focus", pid, result: "unsupported", why: "no-owning-app" });
-      return { ok: false, reason: "unsupported" };
-    }
-    const osascript = deps.osascript ?? runOsascript;
-    try {
-      if (devPath !== undefined && (app.id === "terminal-app" || app.id === "iterm2")) {
-        const script = app.id === "terminal-app" ? terminalAppScript(devPath) : iterm2Script(devPath);
-        const out = await osascript(script);
-        if (String(out).trim() === "ok") {
-          const via = app.id === "terminal-app" ? "terminal-app" : "iterm2";
-          note(deps, { event: "terminal-focus", pid, result: "focused", via, app: app.id });
-          return { ok: true, via };
-        }
-      }
-      await osascript(activateScript(app.bundleId));
-      note(deps, { event: "terminal-focus", pid, result: "focused", via: "app-activate", app: app.id });
-      return { ok: true, via: "app-activate" };
-    } catch {
-      note(deps, { event: "terminal-focus", pid, result: "osascript-failed", app: app.id });
-      return { ok: false, reason: "osascript-failed" };
-    }
-  } catch {
-    return { ok: false, reason: "osascript-failed" };
-  }
 }
 
 // src/core/adapter.ts
@@ -1562,10 +1004,6 @@ function displayTitleFromUserText(text) {
     return;
   const title = cleanPromptTitle(cleaned);
   return title.length > 0 ? title : undefined;
-}
-function firstUserPrompt(transcript) {
-  return firstUserPromptFromLines(transcript.split(`
-`));
 }
 var MODEL_TAIL_BYTES = 64 * 1024;
 function assistantModelFromLine(line) {
@@ -1790,9 +1228,6 @@ function codexTailPendingApproval(tail) {
   }
   return false;
 }
-function codexProposedPlanText(text) {
-  return codexProposedPlanMarkdown(text) !== undefined;
-}
 function codexProposedPlanMarkdown(text) {
   if (typeof text !== "string")
     return;
@@ -1869,9 +1304,6 @@ function codexPlanPickerTailAnalysis(tail) {
     }
   }
   return { state, ...state === "pending" && plan !== undefined ? { plan } : {}, incompleteFinalPlan: finalPlanInTurn !== undefined };
-}
-function codexPlanPickerStateFromTail(tail) {
-  return codexPlanPickerTailAnalysis(tail).state;
 }
 function codexTailPendingUserInput(tail) {
   const lines = tail.split(`
@@ -2299,7 +1731,7 @@ async function codexDiscoverLive(known, deps = {}) {
   }
   return out;
 }
-async function ttyViaPs2(pid) {
+async function ttyViaPs(pid) {
   try {
     const { stdout } = await execFileP2("ps", ["-o", "tty=", "-p", String(pid)]);
     const trimmed = stdout.trim();
@@ -2457,7 +1889,7 @@ async function claudeLocateTuiPid(ctx, deps = {}) {
     }
     let tty;
     try {
-      tty = await (deps.ttyOf ?? ttyViaPs2)(pid);
+      tty = await (deps.ttyOf ?? ttyViaPs)(pid);
     } catch {
       tty = undefined;
     }
@@ -2728,7 +2160,6 @@ function adapterFor(agent) {
       return typeof agent === "string" && agent.length > 0 ? unknownAgentAdapter(agent) : claudeAdapter;
   }
 }
-var allAdapters = [claudeAdapter, codexAdapter];
 
 // src/core/notify-wire.ts
 import { readFile as readFile3 } from "node:fs/promises";
@@ -3435,87 +2866,1617 @@ async function runHook(agent) {
     await fullUpload;
   }
 }
-// src/entries/cc-status.ts
-if (__require.main == __require.module) {
-  await runHook("claude");
-  process.exit(0);
+
+// src/opencode/approvals.ts
+import { appendFileSync as appendFileSync3, statSync as statSync3, truncateSync as truncateSync3 } from "node:fs";
+
+// src/core/permission.ts
+import { readFile as readFile5, realpath, unlink as unlink3 } from "node:fs/promises";
+import { appendFileSync as appendFileSync2, statSync as statSync2, truncateSync as truncateSync2 } from "node:fs";
+import { hostname as hostname2 } from "node:os";
+import { basename as basename4, isAbsolute as isAbsolute2, relative, resolve as resolve2 } from "node:path";
+
+// src/core/decision-poll.ts
+var POLL_INTERVAL_MS = 3000;
+var POLL_JITTER_MAX_MS = 500;
+var POLL_TIMEOUT_MS = 2000;
+var POLL_TIMEOUT_CEILING_MS = 8000;
+var POLL_BUDGET_LATENCY_FACTOR = 3;
+var POLL_LATENCY_SAMPLES = 5;
+var POLL_FIRST_CONTACT_TIMEOUT_MS = 4000;
+function createPollBudget() {
+  const window = [];
+  return {
+    next(seq) {
+      const floorMs = seq <= 1 ? POLL_FIRST_CONTACT_TIMEOUT_MS : POLL_TIMEOUT_MS;
+      if (window.length === 0)
+        return floorMs;
+      const sorted = [...window].sort((a, b) => a - b);
+      const typical = sorted[Math.floor(sorted.length / 2)];
+      return Math.min(POLL_TIMEOUT_CEILING_MS, Math.max(floorMs, Math.ceil(typical * POLL_BUDGET_LATENCY_FACTOR)));
+    },
+    observe(roundTripMs) {
+      if (!Number.isFinite(roundTripMs) || roundTripMs < 0)
+        return;
+      window.push(roundTripMs);
+      if (window.length > POLL_LATENCY_SAMPLES)
+        window.shift();
+    }
+  };
 }
+var POST_MAX_ATTEMPTS = 2;
+var POST_RETRY_PAUSE_MS = 1000;
+var MAX_CONSECUTIVE_MISSES = 100;
+var DEFINITIVE_POLL_STATUSES = new Set([401, 403, 404, 410]);
+var MAX_DEFINITIVE_POLL_FAILURES = 2;
+
+// src/core/lan-wire.ts
+var LAN_PATH = "/v1/lan";
+var LAN_ENVELOPE_VERSION = 1;
+var LAN_STATE_PATH = `${CC_DIR}/lan.json`;
+function parseLanState(raw) {
+  try {
+    const parsed = JSON.parse(raw);
+    if (typeof parsed !== "object" || parsed === null)
+      return null;
+    const s = parsed;
+    if (typeof s.port !== "number" || !Number.isInteger(s.port) || s.port < 1 || s.port > 65535)
+      return null;
+    if (typeof s.lid !== "string" || s.lid.length === 0 || s.lid.length > 128)
+      return null;
+    const createdAt = typeof s.createdAt === "number" && Number.isFinite(s.createdAt) ? s.createdAt : 0;
+    return { port: s.port, lid: s.lid, createdAt };
+  } catch {
+    return null;
+  }
+}
+function lanRunningUnderTest() {
+  return process.argv.some((arg) => arg === "test" || arg.endsWith(".test.ts"));
+}
+
+// src/core/permission.ts
+var POST_FIRST_CONTACT_TIMEOUT_MS = 6000;
+var HOLD_RETRY_DELAY_MS = 4000;
+var FRESH_SESSION_MS = 60000;
+var MAX_UNKNOWN_ANSWER_READS = 3;
+var CODEX_POLICY_TAIL_BYTES = 8 * 1024 * 1024;
+var CODEX_ROLLOUT_HEAD_BYTES = 1024 * 1024;
+function codexTurnPolicyFromRollout(text, turnId) {
+  if (turnId.length === 0)
+    return null;
+  const lines = text.split(`
+`);
+  for (let i = lines.length - 1;i >= 0; i -= 1) {
+    const line = lines[i];
+    if (!line.includes("turn_context") || !line.includes(turnId))
+      continue;
+    let row;
+    try {
+      row = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (typeof row !== "object" || row === null)
+      continue;
+    const record = row;
+    if (record.type !== "turn_context")
+      continue;
+    const payload = record.payload;
+    if (typeof payload !== "object" || payload === null)
+      continue;
+    const context = payload;
+    if (context.turn_id !== turnId)
+      continue;
+    const sandbox = typeof context.sandbox_policy === "object" && context.sandbox_policy !== null ? context.sandbox_policy : undefined;
+    const profile = typeof context.permission_profile === "object" && context.permission_profile !== null ? context.permission_profile : undefined;
+    return {
+      approvalPolicy: context.approval_policy,
+      approvalsReviewer: typeof context.approvals_reviewer === "string" ? context.approvals_reviewer : undefined,
+      sandboxType: typeof sandbox?.type === "string" ? sandbox.type : undefined,
+      permissionProfileType: typeof profile?.type === "string" ? profile.type : undefined
+    };
+  }
+  return null;
+}
+function codexRolloutSessionId(text) {
+  for (const line of text.split(`
+`)) {
+    if (!line.includes("session_meta"))
+      continue;
+    let row;
+    try {
+      row = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (typeof row !== "object" || row === null)
+      continue;
+    const record = row;
+    if (record.type !== "session_meta")
+      continue;
+    const id = record.payload?.id;
+    return typeof id === "string" && id.length > 0 ? id : undefined;
+  }
+  return;
+}
+async function loadCodexTurnPolicy(transcriptPath, turnId, sessionId, home = codexHome()) {
+  if (!transcriptPath || !turnId || !sessionId || !basename4(transcriptPath).match(/^rollout-.*\.jsonl$/))
+    return null;
+  try {
+    const sessionsRoot = await realpath(resolve2(home, "sessions"));
+    const rollout = await realpath(transcriptPath);
+    const rel = relative(sessionsRoot, rollout);
+    if (rel === "" || rel.startsWith("..") || isAbsolute2(rel))
+      return null;
+    const head = await readPrefix(rollout, CODEX_ROLLOUT_HEAD_BYTES);
+    if (codexRolloutSessionId(head) !== sessionId)
+      return null;
+    return codexTurnPolicyFromRollout(await readSuffix(rollout, CODEX_POLICY_TAIL_BYTES), turnId);
+  } catch {
+    return null;
+  }
+}
+function codexPassThroughReason(policy) {
+  if (!policy)
+    return "codex-context-unknown";
+  if (policy.approvalPolicy === "never")
+    return "codex-full-access";
+  const guardianReviewer = policy.approvalsReviewer === "auto_review" || policy.approvalsReviewer === "guardian_subagent";
+  const reviewablePolicy = policy.approvalPolicy === "on-request" || policy.approvalPolicy === "granular" || typeof policy.approvalPolicy === "object" && policy.approvalPolicy !== null;
+  if (guardianReviewer && reviewablePolicy)
+    return "codex-auto-review";
+  if (policy.approvalPolicy === "untrusted" || policy.approvalsReviewer === "user")
+    return;
+  return "codex-context-unknown";
+}
+function decisionLine(agent, hookSpecificOutput) {
+  return JSON.stringify(agent === "codex" ? { continue: true, hookSpecificOutput } : { hookSpecificOutput });
+}
+var ALLOW_HSO = { hookEventName: "PermissionRequest", decision: { behavior: "allow" } };
+var DENY_HSO = { hookEventName: "PermissionRequest", decision: { behavior: "deny", message: "Denied from phone" } };
+var DENY_MESSAGE_MAX = 500;
+var ANSWER_MAX = 500;
+function allowLine(agent, toolName, toolInput) {
+  if (toolName === "ExitPlanMode") {
+    return decisionLine(agent, { hookEventName: "PermissionRequest", decision: { behavior: "allow", updatedInput: toolInput } });
+  }
+  return decisionLine(agent, ALLOW_HSO);
+}
+function denyLine(agent, message) {
+  const m = typeof message === "string" ? message.trim().slice(0, DENY_MESSAGE_MAX) : "";
+  if (m.length === 0)
+    return decisionLine(agent, DENY_HSO);
+  return decisionLine(agent, { hookEventName: "PermissionRequest", decision: { behavior: "deny", message: m } });
+}
+function allowAlwaysLine(agent, toolName, toolInput, suggestions) {
+  if (agent === "codex")
+    return allowLine(agent, toolName, toolInput);
+  const updatedPermissions = Array.isArray(suggestions) && suggestions.length > 0 ? suggestions : [{ type: "addRules", rules: [{ toolName }], behavior: "allow", destination: "session" }];
+  const decision = toolName === "ExitPlanMode" ? { behavior: "allow", updatedInput: toolInput, updatedPermissions } : { behavior: "allow", updatedPermissions };
+  return decisionLine(agent, { hookEventName: "PermissionRequest", decision });
+}
+function answerLine(agent, toolName, toolInput, answers) {
+  if (!isAnswerTool(toolName) || !Array.isArray(answers))
+    return;
+  const questions = usableQuestions(toolInput);
+  if (questions.length === 0)
+    return;
+  if (new Set(questions.map((q) => q.text)).size !== questions.length)
+    return;
+  const map = {};
+  for (let i = 0;i < questions.length; i += 1) {
+    const a = answers[i];
+    if (typeof a !== "string")
+      return;
+    const raw = a.trim();
+    if (raw.length === 0)
+      return;
+    if (raw.length > ANSWER_MAX)
+      return;
+    const resolved = resolveAnswer(raw, questions[i].labels);
+    if (resolved === undefined)
+      return;
+    map[questions[i].text] = resolved;
+  }
+  if (Object.keys(map).length !== questions.length)
+    return;
+  return decisionLine(agent, {
+    hookEventName: "PermissionRequest",
+    decision: { behavior: "allow", updatedInput: { ...toolInput, answers: map } }
+  });
+}
+function resolveAnswer(answer, labels) {
+  const matchOne = (piece) => {
+    const hits = Array.from(new Set(labels.filter((l) => l === piece || capPermissionWireText(l, PERMISSION_QUESTION_LABEL_MAX) === piece)));
+    return hits.length === 1 ? hits[0] : undefined;
+  };
+  const whole = matchOne(answer);
+  if (whole !== undefined)
+    return whole;
+  const pieces = answer.split(",").map((p) => p.trim()).filter((p) => p.length > 0);
+  if (pieces.length === 0)
+    return;
+  const mapped = [];
+  for (const piece of pieces) {
+    const hit = matchOne(piece);
+    if (hit === undefined)
+      return;
+    mapped.push(hit);
+  }
+  return mapped.join(", ");
+}
+var TRACE_PATH = `${CC_DIR}/permission-trace.log`;
+var TRACE_MAX_BYTES = 256 * 1024;
+function errorTag(e) {
+  const name = typeof e?.name === "string" ? e.name : typeof e;
+  const code = e?.code;
+  return { error: name, ...typeof code === "string" ? { code } : {} };
+}
+function parseErrorPosition(e) {
+  const m = typeof e?.message === "string" ? /position (\d+)/.exec(e.message) : null;
+  return m ? Number(m[1]) : undefined;
+}
+function appendTrace(path, event) {
+  try {
+    appendFileSync2(path, `${JSON.stringify({ ts: Date.now(), pid: process.pid, ...event })}
+`, { mode: 384 });
+  } catch {}
+}
+var traceRotated = false;
+function rotateTraceOnce(path) {
+  if (traceRotated)
+    return;
+  traceRotated = true;
+  try {
+    if (statSync2(path).size > TRACE_MAX_BYTES)
+      truncateSync2(path, 0);
+  } catch {}
+}
+var signalHandlersInstalled = false;
+function defaultTrace() {
+  rotateTraceOnce(TRACE_PATH);
+  const trace = (event) => appendTrace(TRACE_PATH, event);
+  if (!signalHandlersInstalled) {
+    signalHandlersInstalled = true;
+    for (const sig of ["SIGTERM", "SIGINT", "SIGHUP"]) {
+      process.on(sig, () => {
+        trace({ event: "signal", signal: sig });
+        process.exit(0);
+      });
+    }
+    process.on("uncaughtException", (e) => {
+      trace({ event: "uncaughtException", ...errorTag(e) });
+      process.exit(0);
+    });
+    process.on("unhandledRejection", (e) => {
+      trace({ event: "unhandledRejection", ...errorTag(e) });
+      process.exit(0);
+    });
+    process.on("exit", (code) => appendTrace(TRACE_PATH, { event: "exit-event", code }));
+  }
+  return trace;
+}
+function isQuestionTool(toolName) {
+  return toolName === "AskUserQuestion" || toolName === "request_user_input" || toolName === OPENCODE_QUESTION_TOOL;
+}
+var OPENCODE_QUESTION_TOOL = "question";
+function isAnswerTool(toolName) {
+  return toolName === "AskUserQuestion" || toolName === OPENCODE_QUESTION_TOOL;
+}
+function buildPermissionSummary(toolName, toolInput) {
+  const str = (v) => typeof v === "string" && v.length > 0 ? v : undefined;
+  const truncate = (s, n = 80) => s.length <= n ? s : `${s.slice(0, n - 1)}…`;
+  switch (toolName) {
+    case "Bash":
+    case "shell":
+    case "local_shell": {
+      const desc = str(toolInput.description);
+      if (desc)
+        return truncate(desc);
+      const cmd = str(toolInput.command);
+      return cmd ? truncate(cmd.split(`
+`)[0]) : toolName;
+    }
+    case "apply_patch": {
+      const desc = str(toolInput.description);
+      return desc ? truncate(desc) : toolName;
+    }
+    case "Edit":
+    case "Write":
+    case "Read":
+    case "NotebookEdit": {
+      const fp = str(toolInput.file_path);
+      return fp ? basename4(fp) : toolName;
+    }
+    case "WebFetch":
+    case "WebSearch": {
+      const url = str(toolInput.url);
+      if (url) {
+        try {
+          return new URL(url).host;
+        } catch {}
+      }
+      const query = str(toolInput.query);
+      return query ? truncate(query) : toolName;
+    }
+    case "ExitPlanMode":
+      return "Approve Claude's plan";
+    case "AskUserQuestion":
+    case OPENCODE_QUESTION_TOOL: {
+      const q = str(firstQuestionText(toolInput));
+      return q ? truncate(q) : toolName;
+    }
+    case "request_user_input": {
+      const questions = Array.isArray(toolInput.questions) ? toolInput.questions : [];
+      const q = questions.find((raw) => {
+        const question = raw?.question;
+        return typeof question === "string" && question.length > 0;
+      });
+      return typeof q?.question === "string" ? truncate(q.question) : toolName;
+    }
+    default: {
+      if (/^mcp__/.test(toolName)) {
+        const seg = toolName.split("__").pop();
+        return seg && seg.length > 0 ? seg : toolName;
+      }
+      return toolName;
+    }
+  }
+}
+function buildPermissionDetail(toolName, toolInput) {
+  const str = (v) => typeof v === "string" && v.length > 0 ? v : undefined;
+  switch (toolName) {
+    case "Bash":
+    case "shell":
+    case "local_shell": {
+      const c = str(toolInput.command);
+      return c ?? "";
+    }
+    case "apply_patch": {
+      const d = str(toolInput.description);
+      return d ?? "";
+    }
+    case "Edit":
+    case "Write":
+    case "Read":
+    case "NotebookEdit": {
+      const fp = str(toolInput.file_path);
+      return fp ?? "";
+    }
+    case "WebFetch": {
+      const u = str(toolInput.url);
+      return u ?? "";
+    }
+    case "WebSearch": {
+      const q = str(toolInput.query);
+      return q ?? "";
+    }
+    case "ExitPlanMode": {
+      const p = str(toolInput.plan);
+      return p ?? "";
+    }
+    case "AskUserQuestion":
+    case OPENCODE_QUESTION_TOOL:
+      return "";
+    default:
+      return "";
+  }
+}
+var QUESTION_TEXT_MAX = 240;
+var PERMISSION_QUESTION_LABEL_MAX = 60;
+var QUESTION_DESCRIPTION_MAX = 600;
+var QUESTION_DESCRIPTION_LADDER = [400, 280, 200, 160, 120, 80];
+function withDescriptionCap(questions, max) {
+  return questions.map((question) => question.d === undefined ? question : { ...question, d: question.d.map((description) => capPermissionWireText(description, max)) });
+}
+function capPermissionWireText(value, max) {
+  const characters = Array.from(value);
+  return characters.length <= max ? value : `${characters.slice(0, max - 1).join("")}…`;
+}
+function usableQuestions(toolInput) {
+  const qs = toolInput.questions;
+  if (!Array.isArray(qs))
+    return [];
+  const out = [];
+  for (const raw of qs) {
+    const text = typeof raw?.question === "string" ? raw.question : "";
+    if (text.length === 0)
+      continue;
+    const labels = [];
+    const descriptions = [];
+    if (Array.isArray(raw?.options)) {
+      for (const opt of raw.options) {
+        const label = opt?.label;
+        if (typeof label === "string" && label.length > 0) {
+          labels.push(label);
+          const description = opt?.description;
+          descriptions.push(typeof description === "string" ? description : "");
+        }
+      }
+    }
+    if (labels.length === 0)
+      continue;
+    out.push({ text, raw, labels, descriptions });
+  }
+  return out;
+}
+function firstQuestionText(toolInput) {
+  return usableQuestions(toolInput)[0]?.text ?? "";
+}
+function buildPermissionQuestions(toolInput) {
+  return usableQuestions(toolInput).map(({ text, raw, labels, descriptions }) => {
+    const wireDescriptions = descriptions.map((description) => capPermissionWireText(description, QUESTION_DESCRIPTION_MAX));
+    return {
+      q: capPermissionWireText(text, QUESTION_TEXT_MAX),
+      ...typeof raw?.header === "string" && raw.header.length > 0 ? { h: raw.header } : {},
+      ...raw?.multiSelect === true ? { m: true } : {},
+      o: labels.map((l) => capPermissionWireText(l, PERMISSION_QUESTION_LABEL_MAX)),
+      ...wireDescriptions.some((description) => description.length > 0) ? { d: wireDescriptions } : {}
+    };
+  });
+}
+var MAX_DETAIL_CHARS = 20000;
+function fitPermissionDetail(base, detail, maxChars = BLOB_FIT_CHARS, questions = []) {
+  const all = Array.from(detail);
+  const hardLoss = Math.max(0, all.length - MAX_DETAIL_CHARS);
+  const chars = hardLoss > 0 ? all.slice(0, MAX_DETAIL_CHARS) : all;
+  const encoder = new TextEncoder;
+  const measure = (d, omitted, qs) => sealedBlobChars(encoder.encode(JSON.stringify(permissionFrame(base, d, omitted, qs))).length);
+  const worstCase = all.length;
+  const bareQuestions = questions.map(({ d: _descriptions, ...question }) => question);
+  const candidates = questions.length === 0 ? [] : [
+    questions,
+    ...QUESTION_DESCRIPTION_LADDER.map((max) => withDescriptionCap(questions, max)),
+    bareQuestions
+  ];
+  const kept = candidates.find((candidate) => measure("", worstCase, candidate) <= maxChars) ?? [];
+  const tail = kept.length > 0 ? { questions: kept } : {};
+  const frameChars = (d, omitted) => measure(d, omitted, kept);
+  if (chars.length === 0)
+    return { detail: "", omitted: 0, ...tail };
+  if (hardLoss === 0 && frameChars(detail, 0) <= maxChars)
+    return { detail, omitted: 0, ...tail };
+  let lo = 0;
+  let hi = chars.length - 1;
+  while (lo < hi) {
+    const mid = Math.ceil((lo + hi) / 2);
+    if (frameChars(`${chars.slice(0, mid).join("")}…`, worstCase) <= maxChars)
+      lo = mid;
+    else
+      hi = mid - 1;
+  }
+  const shortest = `${chars.slice(0, lo).join("")}…`;
+  if (lo === 0 && frameChars(shortest, worstCase) > maxChars) {
+    if (frameChars("", all.length) <= maxChars)
+      return { detail: "", omitted: all.length, ...tail };
+    return { detail: "", omitted: 0, ...tail };
+  }
+  return { detail: shortest, omitted: all.length - lo, ...tail };
+}
+function permissionFrame(base, detail, omitted, questions = []) {
+  return {
+    ...base,
+    ...detail.length > 0 ? { permissionDetail: detail } : {},
+    ...omitted > 0 ? { permissionDetailOmitted: omitted } : {},
+    ...questions.length > 0 ? { permissionQuestions: questions } : {}
+  };
+}
+function emitDecision(agent, answer, toolName, toolInput, suggestions, emit, trace) {
+  const isQuestion = isAnswerTool(toolName);
+  switch (answer.decision) {
+    case "allow":
+      if (isQuestion) {
+        trace({ event: "release", reason: "bare-allow-on-question" });
+        return "released";
+      }
+      emit(allowLine(agent, toolName, toolInput));
+      trace({ event: "emit", decision: "allow" });
+      return "emitted";
+    case "allow_always":
+      if (isQuestion) {
+        trace({ event: "release", reason: "bare-allow-on-question" });
+        return "released";
+      }
+      emit(allowAlwaysLine(agent, toolName, toolInput, suggestions));
+      trace({ event: "emit", decision: agent === "codex" ? "allow_always_degraded_to_allow" : "allow_always" });
+      return "emitted";
+    case "deny":
+      emit(denyLine(agent, answer.message));
+      trace({ event: "emit", decision: "deny", hasMessage: typeof answer.message === "string" && answer.message.trim().length > 0 });
+      return "emitted";
+    case "answer": {
+      const line = answerLine(agent, toolName, toolInput, answer.answers);
+      if (line === undefined) {
+        trace({ event: "release", reason: "answer-unmappable", tool_name: toolName });
+        return "released";
+      }
+      emit(line);
+      trace({ event: "emit", decision: "answer" });
+      return "emitted";
+    }
+    default:
+      trace({ event: "answer-unknown-decision" });
+      return "keep-polling";
+  }
+}
+var LOOPBACK_POLL_INTERVAL_MS = 300;
+var LOOPBACK_FETCH_TIMEOUT_MS = 250;
+var LOOPBACK_MAX_CONSECUTIVE_ERRORS = 5;
+function createLoopbackAnswerPoller(config, requestId, deps) {
+  const interval = deps.intervalMs ?? LOOPBACK_POLL_INTERVAL_MS;
+  const discoverInterval = deps.discoverIntervalMs ?? POLL_INTERVAL_MS;
+  const tick = deps.sleep ?? ((ms) => new Promise((resolve3) => {
+    const timer = setTimeout(resolve3, ms);
+    timer.unref?.();
+  }));
+  let live = deps.statePath !== undefined;
+  let started = false;
+  let port;
+  let lastDiscoverAt = 0;
+  let errors = 0;
+  let traced = false;
+  let pending;
+  let wakeResolve = () => {};
+  let wake = new Promise((resolve3) => {
+    wakeResolve = resolve3;
+  });
+  let keyPromise;
+  const note = (result) => {
+    if (traced)
+      return;
+    traced = true;
+    try {
+      deps.trace({ event: "lan-poll", result });
+    } catch {}
+  };
+  const key = () => keyPromise ??= deriveLanKey(config.e2eKey, config.pairingId);
+  const readPort = async () => {
+    if (deps.statePath === undefined)
+      return;
+    try {
+      return parseLanState(await readFile5(deps.statePath, "utf8"))?.port;
+    } catch {
+      return;
+    }
+  };
+  const attempt = async () => {
+    try {
+      const k = await key();
+      const nonce = b64url(crypto.getRandomValues(new Uint8Array(16)));
+      const body = JSON.stringify({
+        p: await encryptBlob(k, {
+          v: LAN_ENVELOPE_VERSION,
+          op: "answer-poll",
+          ts: deps.now(),
+          nonce,
+          payload: { requestId }
+        })
+      });
+      const res = await deps.fetchFn(`http://127.0.0.1:${port}${LAN_PATH}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body,
+        signal: AbortSignal.timeout(LOOPBACK_FETCH_TIMEOUT_MS)
+      });
+      if (!res.ok) {
+        errors += 1;
+        return;
+      }
+      const outer = await res.json();
+      if (typeof outer?.p !== "string") {
+        errors += 1;
+        return;
+      }
+      const opened = await decryptBlob(k, outer.p);
+      if (opened.reqNonce !== nonce) {
+        errors += 1;
+        return;
+      }
+      errors = 0;
+      const payload = opened.payload;
+      if (payload?.status === "answered" && typeof payload.answerBlob === "string" && payload.answerBlob.length > 0) {
+        return payload.answerBlob;
+      }
+      return;
+    } catch {
+      errors += 1;
+      return;
+    }
+  };
+  const ticker = async () => {
+    while (live) {
+      await tick(interval);
+      if (!live)
+        return;
+      if (port === undefined) {
+        const t = deps.now();
+        if (lastDiscoverAt !== 0 && t - lastDiscoverAt < discoverInterval)
+          continue;
+        lastDiscoverAt = t;
+        port = await readPort();
+        if (port === undefined)
+          continue;
+      }
+      const blob = await attempt();
+      if (!live)
+        return;
+      if (blob !== undefined) {
+        pending = blob;
+        wakeResolve();
+        return;
+      }
+      if (errors >= LOOPBACK_MAX_CONSECUTIVE_ERRORS) {
+        note("give-up");
+        live = false;
+        return;
+      }
+    }
+  };
+  return {
+    async wait(sleeping) {
+      if (!live) {
+        await sleeping;
+        return;
+      }
+      if (!started) {
+        started = true;
+        ticker().catch(() => {
+          live = false;
+          note("error");
+        });
+      }
+      await Promise.race([sleeping, wake]);
+      if (pending === undefined)
+        return;
+      const blob = pending;
+      pending = undefined;
+      live = false;
+      return blob;
+    },
+    async settle() {
+      if (pending !== undefined) {
+        const blob = pending;
+        pending = undefined;
+        live = false;
+        return blob;
+      }
+      if (!live)
+        return;
+      live = false;
+      if (port === undefined)
+        port = await readPort();
+      if (port === undefined)
+        return;
+      return await attempt();
+    },
+    stop() {
+      live = false;
+      wakeResolve();
+    }
+  };
+}
+function defaultLanStatePath() {
+  return lanRunningUnderTest() ? undefined : LAN_STATE_PATH;
+}
+function defaultStampDetailFull() {
+  return lanRunningUnderTest() ? async () => {} : stampPermissionDetailFull;
+}
+function defaultWriteHold() {
+  return lanRunningUnderTest() ? async () => {} : writeDecisionHold;
+}
+function defaultClearHold() {
+  return lanRunningUnderTest() ? async (_sessionId, _pid, beforeUnlink) => {
+    await beforeUnlink?.();
+    return true;
+  } : clearDecisionHold;
+}
+function defaultSettleHoldRecord() {
+  return lanRunningUnderTest() ? async () => {} : settleDecisionHoldRecord;
+}
+async function readStdin2() {
+  const chunks = [];
+  for await (const chunk of process.stdin)
+    chunks.push(chunk);
+  return Buffer.concat(chunks).toString("utf8");
+}
+async function runPermissionHook(deps = {}, agent = "claude") {
+  const noHoldPath = deps.noHoldPath ?? NO_HOLD_PATH;
+  const trace = deps.trace ?? defaultTrace();
+  let loopback;
+  let heldSessionId;
+  let settleAsWorking = false;
+  let settleHeldRecord;
+  try {
+    if (await flagExists(noHoldPath)) {
+      await (deps.delegate ?? (() => runHook(agent)))();
+      return;
+    }
+    const [config, raw] = await Promise.all([
+      (deps.loadConfigFn ?? loadConfig)(),
+      (deps.readInput ?? readStdin2)()
+    ]);
+    trace({ event: "stdin-read", bytes: raw.length });
+    if (!config) {
+      trace({ event: "exit", reason: "unpaired" });
+      return;
+    }
+    let input;
+    try {
+      input = JSON.parse(raw);
+    } catch (e) {
+      trace({ event: "exit", reason: "bad-stdin", ...errorTag(e), pos: parseErrorPosition(e) });
+      return;
+    }
+    const sessionId = typeof input.session_id === "string" ? input.session_id : "";
+    if (sessionId.length === 0) {
+      trace({ event: "exit", reason: "no-session-id" });
+      return;
+    }
+    const toolName = typeof input.tool_name === "string" ? input.tool_name : "";
+    const agentId = typeof input.agent_id === "string" ? input.agent_id : "";
+    const permissionMode = typeof input.permission_mode === "string" ? input.permission_mode : undefined;
+    trace({ event: "start", session_id: sessionId, tool_name: toolName, permission_mode: permissionMode, agent: agentId.length > 0 });
+    if (agentId.length > 0) {
+      const agentType = typeof input.agent_type === "string" ? input.agent_type : undefined;
+      trace({ event: "exit", reason: "subagent", agent_type: agentType });
+      return;
+    }
+    const interactiveMode = permissionMode === undefined || permissionMode === "default" || agent === "claude" && (permissionMode === "acceptEdits" || permissionMode === "plan");
+    const codexDialogMode = agent === "codex" && (permissionMode === "acceptEdits" || permissionMode === "plan");
+    const questionExempt = !interactiveMode && !codexDialogMode && isQuestionTool(toolName);
+    if (!interactiveMode && !questionExempt) {
+      trace({ event: "exit", reason: "mode", mode: permissionMode, ...codexDialogMode ? { codex_dialog_mode: true } : {} });
+      return;
+    }
+    if (questionExempt)
+      trace({ event: "mode-gate-bypass", reason: "question", mode: permissionMode, tool_name: toolName });
+    if (agent === "codex" && !toolName.startsWith("mcp__")) {
+      const transcriptPath = typeof input.transcript_path === "string" ? input.transcript_path : "";
+      const turnId = typeof input.turn_id === "string" ? input.turn_id : "";
+      const policy = await (deps.loadCodexTurnPolicyFn ?? loadCodexTurnPolicy)(transcriptPath, turnId, sessionId);
+      const reason = codexPassThroughReason(policy);
+      if (reason) {
+        trace({ event: "exit", reason });
+        return;
+      }
+      trace({ event: "codex-reviewer", disposition: "hold", reason: "manual" });
+    } else if (agent === "codex") {
+      trace({ event: "codex-reviewer", disposition: "hold", reason: "mcp-reviewer-unknown" });
+    }
+    const toolInput = typeof input.tool_input === "object" && input.tool_input !== null ? input.tool_input : {};
+    const suggestions = input.permission_suggestions;
+    const requestId = (deps.randomUUID ?? (() => crypto.randomUUID()))();
+    const summary = buildPermissionSummary(toolName, toolInput);
+    const now = (deps.now ?? Date.now)();
+    const fetchFn = deps.fetchFn ?? fetch;
+    const record = await (deps.readRecordFn ?? readRecord)(sessionId);
+    const machine = config.machineName ?? hostname2().replace(/\.local$/, "");
+    const plan = { op: "update", prio: 1, status: "needsAttention" };
+    const at = Math.floor(now / 1000);
+    const base = buildBlob(input, machine, record?.title, plan, agent, record?.turnStartedAt, record, record?.model, at);
+    const permissionBase = {
+      ...base,
+      status: "decisionPending",
+      permissionSummary: summary,
+      permissionRequestId: requestId,
+      permissionToolName: toolName
+    };
+    const rawDetail = buildPermissionDetail(toolName, toolInput);
+    const fitted = fitPermissionDetail(permissionBase, rawDetail, BLOB_FIT_CHARS, buildPermissionQuestions(toolInput));
+    const detailFull = fullTextForRecord(rawDetail, fitted.detail);
+    if (record && record.permissionDetailFull !== detailFull) {
+      await (deps.stampDetailFullFn ?? defaultStampDetailFull())(sessionId, detailFull);
+    }
+    const fullUpload = postFullText(config, sessionId, "permission-detail", detailFull, fetchFn, trace, requestId);
+    const blob = await encryptBlob(config.e2eKey, permissionFrame(permissionBase, fitted.detail, fitted.omitted, fitted.questions));
+    const fallbackBlob = await encryptBlob(config.e2eKey, base);
+    const pcHeaders = { "x-cc-pairing": config.pairingId, "x-cc-auth": config.pcSecret, "x-cc-version": PLUGIN_VERSION };
+    const sleep = deps.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
+    let lastPostTs = 0;
+    const postDecision = async (round, maxAttempts) => {
+      let hold2 = false;
+      let posted2 = false;
+      let reason;
+      for (let attempt = 1;attempt <= maxAttempts; attempt += 1) {
+        const ts = Math.max((deps.now ?? Date.now)(), lastPostTs + 1);
+        lastPostTs = ts;
+        try {
+          const res = await fetchFn(`${config.url}/v1/cc/decision`, {
+            method: "POST",
+            headers: { "content-type": "application/json", ...pcHeaders },
+            body: JSON.stringify({
+              v: 2,
+              sessionId,
+              requestId,
+              op: "update",
+              prio: 1,
+              ts,
+              blob,
+              fallbackBlob
+            }),
+            signal: AbortSignal.timeout(POST_FIRST_CONTACT_TIMEOUT_MS)
+          });
+          if (res.ok) {
+            const body = await res.json().catch(() => ({}));
+            hold2 = body.hold === true;
+            if (typeof body.reason === "string")
+              reason = body.reason;
+          }
+          trace({
+            event: "posted",
+            requestId,
+            round,
+            attempt,
+            status: res.status,
+            ts,
+            ...res.ok ? { hold: hold2 } : {},
+            ...reason !== undefined ? { reason } : {}
+          });
+          posted2 = true;
+          break;
+        } catch (e) {
+          const name = e?.name ?? "Error";
+          trace({ event: "posted", requestId, round, attempt, status: 0, ts, error: name });
+          if (name === "TimeoutError")
+            break;
+          if (attempt < maxAttempts) {
+            await sleep(POST_RETRY_PAUSE_MS);
+            continue;
+          }
+        }
+      }
+      return { posted: posted2, hold: hold2, reason };
+    };
+    const clock = deps.now ?? Date.now;
+    const pollBudget = createPollBudget();
+    const pollDecision = async (seq2) => {
+      const budgetMs = pollBudget.next(seq2);
+      trace({ event: "poll-begin", seq: seq2, budgetMs });
+      const startedAt = clock();
+      const measure = () => {
+        const ms = clock() - startedAt;
+        pollBudget.observe(ms);
+        return ms;
+      };
+      try {
+        const res = await fetchFn(`${config.url}/v1/cc/decision/${requestId}`, {
+          headers: pcHeaders,
+          signal: AbortSignal.timeout(budgetMs)
+        });
+        if (!res.ok) {
+          trace({ event: "poll-end", seq: seq2, outcome: "status", status: res.status, ms: measure() });
+          return { status: res.status };
+        }
+        const data = await res.json();
+        trace({ event: "poll-end", seq: seq2, outcome: "ok", ms: measure() });
+        return { data, status: res.status };
+      } catch (e) {
+        trace({ event: "poll-end", seq: seq2, outcome: "error", ...errorTag(e) });
+        return { status: 0 };
+      }
+    };
+    let attentionStalled = false;
+    const stalledPatch = async (at2) => {
+      let stalledBlob = fallbackBlob;
+      try {
+        stalledBlob = await encryptBlob(config.e2eKey, { ...base, reconnecting: Math.floor(at2 / 1000) });
+      } catch {}
+      return { ts: at2, blob: stalledBlob, attentionStalledAt: at2 };
+    };
+    const markAttentionStalled = async () => {
+      const at2 = (deps.now ?? Date.now)();
+      try {
+        await (deps.settleHoldRecordFn ?? defaultSettleHoldRecord())(sessionId, await stalledPatch(at2));
+      } catch {}
+    };
+    let { posted, hold, reason: holdReason } = await postDecision(1, POST_MAX_ATTEMPTS);
+    await fullUpload;
+    if (!posted) {
+      const probe = await pollDecision(0);
+      const live = probe.data?.status === "pending" || probe.data?.status === "answered";
+      if (!live) {
+        if (probe.status === 0)
+          await markAttentionStalled();
+        trace({ event: "exit", reason: "post-error", ...probe.status === 0 ? { stalled: true } : {} });
+        return;
+      }
+      trace({ event: "post-timeout-landed", status: probe.data?.status });
+      hold = true;
+      holdReason = undefined;
+    }
+    trace({ event: "hold", hold, ...holdReason !== undefined ? { reason: holdReason } : {} });
+    if (!hold) {
+      const fresh = !record || now - record.ts < FRESH_SESSION_MS;
+      if (!fresh) {
+        trace({ event: "exit", reason: "hold-false" });
+        return;
+      }
+      trace({ event: "hold-retry-wait", delayMs: HOLD_RETRY_DELAY_MS });
+      await sleep(HOLD_RETRY_DELAY_MS);
+      const retry = await postDecision(2, 1);
+      if (!retry.posted) {
+        await markAttentionStalled();
+        trace({ event: "exit", reason: "hold-false", stalled: true });
+        return;
+      }
+      hold = retry.hold;
+      holdReason = retry.reason;
+      trace({ event: "hold", hold, ...holdReason !== undefined ? { reason: holdReason } : {} });
+      if (!hold) {
+        trace({ event: "exit", reason: "hold-false" });
+        return;
+      }
+    }
+    const holdAt = (deps.now ?? Date.now)();
+    const holdPid = deps.holdPid ?? process.pid;
+    let holdBlob = blob;
+    try {
+      holdBlob = await encryptBlob(config.e2eKey, appendFittedPlanAndDebug(permissionFrame(permissionBase, fitted.detail, fitted.omitted, fitted.questions), undefined, formatDecisionHoldDebug({ requestId, pid: holdPid })));
+    } catch {}
+    await (deps.writeHoldFn ?? defaultWriteHold())(sessionId, { blob: holdBlob, at: holdAt, pid: holdPid });
+    heldSessionId = sessionId;
+    settleHeldRecord = async () => {
+      const settledAt = (deps.now ?? Date.now)();
+      const patch = settleAsWorking ? {
+        ts: settledAt,
+        lastEvent: "working",
+        op: "update",
+        prio: 0,
+        sentDone: false,
+        attentionKind: undefined,
+        attentionStalledAt: undefined,
+        blob: await encryptBlob(config.e2eKey, { ...base, status: "working", at: Math.floor(settledAt / 1000) })
+      } : attentionStalled ? await stalledPatch(settledAt) : { ts: settledAt, blob: fallbackBlob, attentionStalledAt: undefined };
+      await (deps.settleHoldRecordFn ?? defaultSettleHoldRecord())(sessionId, patch);
+    };
+    const jitter = deps.jitter ?? (() => Math.floor(Math.random() * POLL_JITTER_MAX_MS));
+    const interval = deps.pollIntervalMs ?? POLL_INTERVAL_MS;
+    const emit = deps.emit ?? ((line) => process.stdout.write(`${line}
+`));
+    const applyAnswerBlob = async (answerBlob, src) => {
+      const answer = await decryptBlob(config.e2eKey, answerBlob);
+      const match = answer.requestId === requestId;
+      const outcome = match ? emitDecision(agent, answer, toolName, toolInput, suggestions, emit, trace) : "released";
+      if (outcome === "emitted")
+        settleAsWorking = true;
+      if (outcome !== "keep-polling") {
+        trace({ event: "answered", match, outcome, src });
+        trace({ event: "exit", reason: "answered" });
+        return "done";
+      }
+      return "keep-polling";
+    };
+    loopback = createLoopbackAnswerPoller(config, requestId, {
+      fetchFn: deps.lanFetchFn ?? fetchFn,
+      now: deps.now ?? Date.now,
+      trace,
+      statePath: deps.lanStatePath ?? defaultLanStatePath(),
+      sleep: deps.lanSleep,
+      intervalMs: deps.lanIntervalMs,
+      discoverIntervalMs: interval
+    });
+    let misses = 0;
+    let definitiveFailures = 0;
+    let unknownBlob;
+    let unknownReads = 0;
+    let seq = 0;
+    for (;; ) {
+      seq += 1;
+      const { data, status: httpStatus } = await pollDecision(seq);
+      if (data) {
+        misses = 0;
+        definitiveFailures = 0;
+        if (data.status === "answered" && typeof data.answerBlob === "string") {
+          if (await applyAnswerBlob(data.answerBlob, "worker") === "done") {
+            return;
+          }
+          unknownReads = data.answerBlob === unknownBlob ? unknownReads + 1 : 1;
+          unknownBlob = data.answerBlob;
+          if (unknownReads >= MAX_UNKNOWN_ANSWER_READS) {
+            trace({ event: "release", reason: "unknown-decision-terminal", reads: unknownReads });
+            trace({ event: "exit", reason: "unknown-decision" });
+            return;
+          }
+        } else if (typeof data.status === "string" && data.status !== "pending") {
+          const settled = loopback === undefined ? undefined : await loopback.settle();
+          if (settled !== undefined && await applyAnswerBlob(settled, "lan") === "done")
+            return;
+          trace({ event: data.status === "expired" ? "expired" : "superseded", status: data.status });
+          trace({ event: "exit", reason: data.status });
+          return;
+        }
+      } else {
+        if (DEFINITIVE_POLL_STATUSES.has(httpStatus)) {
+          definitiveFailures += 1;
+          if (definitiveFailures >= MAX_DEFINITIVE_POLL_FAILURES) {
+            trace({ event: "giveup", reason: "definitive", status: httpStatus, strikes: definitiveFailures });
+            trace({ event: "exit", reason: "definitive" });
+            return;
+          }
+        } else {
+          definitiveFailures = 0;
+        }
+        if (++misses >= MAX_CONSECUTIVE_MISSES) {
+          attentionStalled = true;
+          trace({ event: "giveup", misses, stalled: true });
+          trace({ event: "exit", reason: "giveup" });
+          return;
+        }
+      }
+      const lanBlob = await loopback.wait(sleep(interval + jitter()));
+      if (lanBlob !== undefined) {
+        if (await applyAnswerBlob(lanBlob, "lan") === "done")
+          return;
+      }
+    }
+  } catch (e) {
+    trace({ event: "exit", reason: "exception", ...errorTag(e) });
+  } finally {
+    try {
+      loopback?.stop();
+    } catch {}
+    if (heldSessionId !== undefined) {
+      try {
+        await (deps.clearHoldFn ?? defaultClearHold())(heldSessionId, deps.holdPid ?? process.pid, settleHeldRecord);
+      } catch {}
+    }
+  }
+}
+
+// src/opencode/approvals.ts
+function asRecord(value) {
+  return typeof value === "object" && value !== null ? value : undefined;
+}
+function asString(value) {
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+var PERMISSION_TOOL = {
+  bash: { name: "shell", input: (p) => ({ command: asString(p.metadata.command) ?? p.patterns.join(" ") }) },
+  edit: { name: "Edit", input: (p) => ({ file_path: asString(p.metadata.filepath) ?? p.patterns[0] }) },
+  read: { name: "Read", input: (p) => ({ file_path: asString(p.metadata.uri) ?? p.patterns[0] }) },
+  webfetch: { name: "WebFetch", input: (p) => ({ url: asString(p.metadata.url) ?? p.patterns[0] }) },
+  websearch: { name: "WebSearch", input: (p) => ({ query: asString(p.metadata.query) ?? p.patterns[0] }) }
+};
+function ocDecisionRequest(event) {
+  const e = asRecord(event);
+  const type = asString(e?.type);
+  const properties = asRecord(e?.properties);
+  if (!type || !properties)
+    return null;
+  const id = asString(properties.id);
+  const sessionID = asString(properties.sessionID);
+  if (!id || !sessionID)
+    return null;
+  if (type === "permission.asked") {
+    const permission = asString(properties.permission) ?? "permission";
+    const patterns = Array.isArray(properties.patterns) ? properties.patterns.filter((p) => typeof p === "string") : [];
+    const metadata = asRecord(properties.metadata) ?? {};
+    const mapped = PERMISSION_TOOL[permission];
+    return {
+      kind: "permission",
+      id,
+      sessionID,
+      toolName: mapped?.name ?? permission,
+      toolInput: mapped ? mapped.input({ metadata, patterns }) : {}
+    };
+  }
+  if (type === "question.asked") {
+    const questions = Array.isArray(properties.questions) ? properties.questions : [];
+    if (questions.length === 0)
+      return null;
+    return {
+      kind: "question",
+      id,
+      sessionID,
+      toolName: OPENCODE_QUESTION_TOOL,
+      toolInput: { questions },
+      questions
+    };
+  }
+  return null;
+}
+function ocResolvedRequestId(event) {
+  const e = asRecord(event);
+  const type = asString(e?.type);
+  if (type !== "permission.replied" && type !== "question.replied" && type !== "question.rejected")
+    return null;
+  return asString(asRecord(e?.properties)?.requestID) ?? null;
+}
+function ocAnswers(questions, map) {
+  return questions.map((raw) => {
+    const question = asRecord(raw);
+    const text = asString(question?.question);
+    const picked = text === undefined ? undefined : asString(map[text]);
+    if (picked === undefined)
+      return [];
+    const labels = (Array.isArray(question?.options) ? question.options : []).map((o) => asString(asRecord(o)?.label)).filter((l) => l !== undefined);
+    if (labels.includes(picked))
+      return [picked];
+    const pieces = picked.split(", ").filter((p) => labels.includes(p));
+    return pieces.length > 0 ? pieces : [picked];
+  });
+}
+function ocReplyFor(request, line) {
+  if (line === undefined)
+    return null;
+  let decision;
+  try {
+    const parsed = asRecord(JSON.parse(line));
+    decision = asRecord(asRecord(parsed?.hookSpecificOutput)?.decision);
+  } catch {
+    return null;
+  }
+  if (!decision)
+    return null;
+  if (request.kind === "question") {
+    if (decision.behavior === "deny")
+      return { path: `question/${request.id}/reject` };
+    const answers = asRecord(asRecord(decision.updatedInput)?.answers);
+    if (decision.behavior === "allow" && answers) {
+      return { path: `question/${request.id}/reply`, body: { answers: ocAnswers(request.questions ?? [], answers) } };
+    }
+    return null;
+  }
+  if (decision.behavior === "deny")
+    return { path: `permission/${request.id}/reply`, body: { reply: "reject" } };
+  if (decision.behavior !== "allow")
+    return null;
+  const always = Array.isArray(decision.updatedPermissions) && decision.updatedPermissions.length > 0;
+  return { path: `permission/${request.id}/reply`, body: { reply: always ? "always" : "once" } };
+}
+function ocPost(client, serverUrl, fetchFn = fetch) {
+  const post = client?._client?.post;
+  if (typeof post === "function") {
+    return Object.assign(async (reply) => {
+      const res = await post({
+        url: `/${reply.path}`,
+        ...reply.body === undefined ? {} : { body: reply.body }
+      });
+      const status = res?.response?.status;
+      if (typeof status !== "number")
+        throw new Error("opencode client returned no response");
+      return { via: "client", status };
+    }, { via: "client" });
+  }
+  if (!serverUrl)
+    return;
+  return Object.assign(async (reply) => {
+    const res = await fetchFn(new URL(reply.path, serverUrl), {
+      method: "POST",
+      ...reply.body === undefined ? {} : {
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(reply.body)
+      },
+      signal: AbortSignal.timeout(2000)
+    });
+    return { via: "url", status: res.status };
+  }, { via: "url" });
+}
+var TRACE_MAX_BYTES2 = 256 * 1024;
+var rotated = false;
+function ocTrace(event) {
+  try {
+    if (!rotated) {
+      rotated = true;
+      try {
+        if (statSync3(TRACE_PATH).size > TRACE_MAX_BYTES2)
+          truncateSync3(TRACE_PATH, 0);
+      } catch {}
+    }
+    appendFileSync3(TRACE_PATH, `${JSON.stringify({ ts: Date.now(), pid: process.pid, agent: "opencode", ...event })}
+`, { mode: 384 });
+  } catch {}
+}
+async function runOcApproval(request, o) {
+  const trace = o.trace ?? ocTrace;
+  const stdin = JSON.stringify({
+    session_id: request.sessionID,
+    ...o.cwd ? { cwd: o.cwd } : {},
+    hook_event_name: "PermissionRequest",
+    tool_name: request.toolName,
+    tool_input: request.toolInput
+  });
+  let line;
+  try {
+    await (o.runHold ?? runPermissionHook)({
+      readInput: async () => stdin,
+      loadConfigFn: async () => o.config,
+      emit: (l) => {
+        line = l;
+      },
+      randomUUID: () => o.requestId,
+      trace,
+      fetchFn: o.fetchFn,
+      delegate: o.delegate,
+      noHoldPath: o.noHoldPath
+    }, "opencode");
+  } catch (e) {
+    trace({ event: "oc-hold-threw", kind: request.kind, error: e?.name ?? "Error" });
+    return;
+  }
+  const reply = ocReplyFor(request, line);
+  if (!reply) {
+    trace({ event: "oc-no-reply", kind: request.kind, id: request.id });
+    return;
+  }
+  const post = ocPost(o.client, o.serverUrl, o.fetchFn);
+  if (!post) {
+    trace({ event: "oc-replied", kind: request.kind, id: request.id, path: reply.path, status: 0, via: "none", error: "NoTransport" });
+    return;
+  }
+  try {
+    const { status } = await post(reply);
+    trace({ event: "oc-replied", kind: request.kind, id: request.id, path: reply.path, via: post.via, status });
+  } catch (e) {
+    trace({
+      event: "oc-replied",
+      kind: request.kind,
+      id: request.id,
+      path: reply.path,
+      status: 0,
+      via: post.via,
+      error: e?.name ?? "Error",
+      message: String(e?.message ?? "").slice(0, 200)
+    });
+  }
+}
+async function ocResolveOnRelay(config, requestId, fetchFn = fetch) {
+  try {
+    await fetchFn(`${config.url}/v1/cc/decision/resolve`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-cc-pairing": config.pairingId,
+        "x-cc-auth": config.pcSecret,
+        "x-cc-version": PLUGIN_VERSION
+      },
+      body: JSON.stringify({ requestId }),
+      signal: AbortSignal.timeout(2000)
+    });
+  } catch {}
+}
+
+// src/opencode/state.ts
+function newOcState() {
+  return { sessions: new Map, children: new Set };
+}
+function isDefaultOcTitle(title) {
+  return /^(New|Child) session - /.test(title);
+}
+var TODO_CONTENT_MAX_CHARS = 120;
+function ocTodoMarkdown(todos) {
+  if (!Array.isArray(todos) || todos.length === 0)
+    return;
+  const lines = [];
+  for (const raw of todos) {
+    const todo = asRecord2(raw);
+    const content = asString2(todo?.content);
+    if (!content)
+      continue;
+    const text = Array.from(content).slice(0, TODO_CONTENT_MAX_CHARS).join("");
+    switch (todo?.status) {
+      case "completed":
+        lines.push(`- [x] ${text}`);
+        break;
+      case "in_progress":
+        lines.push(`- [ ] **${text}**`);
+        break;
+      case "cancelled":
+        lines.push(`- [ ] ~~${text}~~`);
+        break;
+      default:
+        lines.push(`- [ ] ${text}`);
+        break;
+    }
+  }
+  return lines.length > 0 ? lines.join(`
+`) : undefined;
+}
+function asRecord2(value) {
+  return typeof value === "object" && value !== null ? value : undefined;
+}
+function asString2(value) {
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+function ocModelFromMessage(info) {
+  if (info.role !== "assistant")
+    return;
+  const providerID = asString2(info.providerID);
+  const modelID = asString2(info.modelID);
+  if (!providerID || !modelID)
+    return;
+  return `${providerID}/${modelID}`;
+}
+function statusType(status) {
+  if (typeof status === "string")
+    return status;
+  return asString2(asRecord2(status)?.type);
+}
+function reduceOcEvent(state, event, now = Date.now()) {
+  const e = asRecord2(event);
+  const type = asString2(e?.type);
+  if (!e || !type)
+    return null;
+  const properties = asRecord2(e.properties) ?? {};
+  const info = asRecord2(properties.info);
+  if (info && type.startsWith("session.")) {
+    const id = asString2(info.id);
+    if (id && asString2(info.parentID))
+      state.children.add(id);
+  }
+  const sessionId = asString2(properties.sessionID) ?? (type.startsWith("session.") ? asString2(info?.id) : undefined);
+  if (!sessionId || state.children.has(sessionId))
+    return null;
+  const entry = state.sessions.get(sessionId);
+  switch (type) {
+    case "session.created": {
+      const startedAt = Number(asRecord2(info?.time)?.created);
+      const created = {
+        startedAt: Number.isFinite(startedAt) && startedAt > 0 ? startedAt : now,
+        working: false
+      };
+      applyTitle(created, info);
+      applyAgent(created, info, false);
+      state.sessions.set(sessionId, created);
+      return frame(sessionId, created, "start", "working", now);
+    }
+    case "session.updated": {
+      if (!entry)
+        return null;
+      applyTitle(entry, info);
+      applyAgent(entry, info, false);
+      return null;
+    }
+    case "message.updated": {
+      if (!entry || !info)
+        return null;
+      const model = ocModelFromMessage(info);
+      if (model)
+        entry.model = model;
+      if (info.role === "assistant")
+        applyAgent(entry, info, true);
+      return null;
+    }
+    case "session.status": {
+      const live = entry ?? adopt(state, sessionId, now);
+      const status = statusType(properties.status);
+      if (status !== "busy" && status !== "retry")
+        return null;
+      const detail = status === "retry" ? asString2(asRecord2(properties.status)?.message) : undefined;
+      const planned = frame(sessionId, live, "update", "working", now, detail);
+      const key = JSON.stringify([planned.status, planned.detail, planned.title, planned.model, planned.plan]);
+      if (live.lastStatusFrame === key)
+        return null;
+      live.lastStatusFrame = key;
+      return planned;
+    }
+    case "todo.updated": {
+      if (!entry)
+        return null;
+      const plan = ocTodoMarkdown(properties.todos);
+      if (plan === entry.plan)
+        return null;
+      entry.plan = plan;
+      return frame(sessionId, entry, "update", "working", now);
+    }
+    case "session.idle": {
+      if (!entry)
+        return null;
+      entry.working = false;
+      entry.lastStatusFrame = undefined;
+      const done = frame(sessionId, entry, "done", "done", now);
+      entry.turnStartedAt = undefined;
+      return done;
+    }
+    case "session.deleted": {
+      if (!entry)
+        return null;
+      state.sessions.delete(sessionId);
+      return frame(sessionId, entry, "end", "done", now);
+    }
+    default:
+      return null;
+  }
+}
+function ocEndFrames(state, now = Date.now()) {
+  const frames = [...state.sessions].map(([sessionId, entry]) => frame(sessionId, entry, "end", "done", now));
+  state.sessions.clear();
+  return frames;
+}
+function ocAttentionFrame(state, sessionId, detail, now = Date.now()) {
+  const entry = state.sessions.get(sessionId);
+  if (!entry || state.children.has(sessionId))
+    return null;
+  return frame(sessionId, entry, "update", "needsAttention", now, detail, 1);
+}
+function adopt(state, sessionId, now) {
+  const entry = { startedAt: now, working: false };
+  state.sessions.set(sessionId, entry);
+  return entry;
+}
+function applyAgent(entry, info, fromMessage) {
+  const agent = asString2(info?.agent);
+  if (!agent || entry.agentFromMessage && !fromMessage)
+    return;
+  entry.agent = agent;
+  if (fromMessage)
+    entry.agentFromMessage = true;
+}
+function applyTitle(entry, info) {
+  const title = asString2(info?.title);
+  if (title && !isDefaultOcTitle(title))
+    entry.title = title;
+}
+function frame(sessionId, entry, op, status, now, detail, prio = 0) {
+  if (status === "working" && op !== "start") {
+    if (!entry.working || entry.turnStartedAt === undefined)
+      entry.turnStartedAt = Math.floor(now / 1000);
+    entry.working = true;
+  }
+  const sub = detail ?? (status === "working" && entry.agent === "plan" ? "planning" : undefined);
+  return {
+    sessionId,
+    op,
+    prio,
+    status,
+    ...sub ? { detail: sub } : {},
+    ...entry.title ? { title: entry.title } : {},
+    ...entry.model ? { model: entry.model } : {},
+    ...entry.plan ? { plan: entry.plan } : {},
+    startedAt: entry.startedAt,
+    ...entry.turnStartedAt !== undefined ? { turnStartedAt: entry.turnStartedAt } : {}
+  };
+}
+async function postOcEvent(config, envelope) {
+  try {
+    const res = await fetch(`${config.url}/v1/cc/event`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-cc-pairing": config.pairingId,
+        "x-cc-auth": config.pcSecret,
+        "x-cc-version": PLUGIN_VERSION,
+        "x-cc-approvals": await localApprovalsState()
+      },
+      body: JSON.stringify(envelope),
+      signal: AbortSignal.timeout(2000)
+    });
+    if (!res.ok)
+      return false;
+    await atomicWrite(LAST_SEND_PATH, String(Date.now())).catch(() => {});
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// src/opencode/plugin.ts
+function resolveRuntime() {
+  const env = process.env.NOMO_RUNTIME;
+  if (env && env.length > 0 && isExecutable(env))
+    return env;
+  try {
+    const cached = readFileSync2(`${CC_DIR}/runtime`, "utf8").trim();
+    if (cached.length > 0 && !cached.startsWith("NONE:") && isExecutable(cached))
+      return cached;
+  } catch {}
+  return;
+}
+function isExecutable(path) {
+  try {
+    accessSync(path, constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+function spawnWatchdog() {
+  const runtime = resolveRuntime();
+  if (!runtime)
+    return;
+  spawn2(runtime, [WATCHDOG_PATH], { detached: true, stdio: "ignore" }).unref();
+}
+async function send(ctx, frame2) {
+  const now = Date.now();
+  const input = { session_id: frame2.sessionId, cwd: ctx.folder.cwd };
+  let fittedPlan;
+  const envelope = await buildEnvelope(input, ctx.machine, now, frame2.title, ctx.config.e2eKey, false, "opencode", frame2.startedAt, frame2.turnStartedAt, ctx.folder, frame2.model, { op: frame2.op, prio: frame2.prio, status: frame2.status }, undefined, frame2.plan, undefined, (plain) => {
+    fittedPlan = plain.plan;
+  }, frame2.detail);
+  if (!envelope)
+    return;
+  const planFull = fullTextForRecord(frame2.plan, fittedPlan);
+  const fullUpload = postFullText(ctx.config, frame2.sessionId, "plan", planFull);
+  await trackSession(frame2.sessionId, frame2.op, frame2.prio, frame2.status, envelope.blob, ctx.machine, ctx.folder, "", "opencode", frame2.startedAt, frame2.turnStartedAt, undefined, frame2.title, ctx.config.pairingId, frame2.model, false, process.pid, ctx.origin, false, undefined, undefined, planFull);
+  ensureWatchdog({ spawnWatchdog });
+  const delivered = await postOcEvent(ctx.config, envelope);
+  if (delivered && frame2.op === "done")
+    await markDoneDelivered(frame2.sessionId);
+  await fullUpload;
+}
+var server = async (input) => {
+  try {
+    const config = await loadConfig();
+    if (!config)
+      return {};
+    const directory = typeof input?.directory === "string" && input.directory.length > 0 ? input.directory : typeof input?.worktree === "string" ? input.worktree : undefined;
+    const ctx = {
+      config,
+      machine: config.machineName ?? hostname3().replace(/\.local$/, ""),
+      folder: folderIdentity(directory),
+      origin: { hook_event_name: "opencode", ...directory ? { cwd: directory } : {}, ppid: process.ppid },
+      state: newOcState()
+    };
+    let chain = Promise.resolve();
+    const enqueue = (task) => {
+      chain = chain.then(task).catch(() => {});
+      return chain;
+    };
+    const serverUrl = input?.serverUrl === undefined || input.serverUrl === null ? undefined : String(input.serverUrl);
+    const canReply = ocPost(input?.client, serverUrl) !== undefined;
+    const holds = new Map;
+    const hold = (request) => {
+      if (!canReply || ctx.state.children.has(request.sessionID) || holds.has(request.id))
+        return;
+      const requestId = crypto.randomUUID();
+      holds.set(request.id, requestId);
+      runOcApproval(request, {
+        config: ctx.config,
+        client: input?.client,
+        serverUrl,
+        cwd: ctx.folder.cwd,
+        requestId,
+        delegate: async () => {
+          const attention = ocAttentionFrame(ctx.state, request.sessionID, undefined);
+          if (attention)
+            await enqueue(() => send(ctx, attention));
+        }
+      }).catch(() => {}).finally(() => {
+        holds.delete(request.id);
+      });
+    };
+    const retire = (opencodeId) => {
+      const requestId = holds.get(opencodeId);
+      if (requestId === undefined)
+        return;
+      holds.delete(opencodeId);
+      ocResolveOnRelay(ctx.config, requestId);
+    };
+    return {
+      event: async ({ event }) => {
+        try {
+          const request = ocDecisionRequest(event);
+          if (request) {
+            hold(request);
+            return;
+          }
+          const resolved = ocResolvedRequestId(event);
+          if (resolved) {
+            retire(resolved);
+            return;
+          }
+          const frame2 = reduceOcEvent(ctx.state, event);
+          if (frame2)
+            await enqueue(() => send(ctx, frame2));
+        } catch {}
+      },
+      dispose: async () => {
+        try {
+          for (const opencodeId of [...holds.keys()])
+            retire(opencodeId);
+          const frames = ocEndFrames(ctx.state);
+          await enqueue(async () => {
+            for (const frame2 of frames)
+              await send(ctx, frame2);
+          });
+        } catch {}
+      }
+    };
+  } catch {
+    return {};
+  }
+};
+var plugin_default = { id: "nomo", server };
 export {
-  truncateOnWord,
-  transcriptStartMs,
-  trackSessionAt,
-  trackSession,
-  stashPendingEvent,
-  sessionTitle,
-  sessionOrigin,
-  runHook,
-  rolloutPathFromLsof,
-  rolloutMetaOriginator,
-  rolloutMetaCwd,
-  requestUserInputDetail,
-  planOp,
-  parseCodexProcs,
-  opencodeAdapter,
-  markDoneDeliveredAt,
-  markDoneDelivered,
-  lastTurnLine,
-  lastAssistantModel,
-  isPermissionNotification,
-  hasInterruptMarker,
-  firstUserPrompt,
-  firstAssistantModel,
-  findProvisionalForPid,
-  filterCodexTuis,
-  displayTitleFromUserText,
-  detailForHook,
-  codexTurnActiveFromTail,
-  codexTuiCandidates,
-  codexToolDetail,
-  codexThreadName,
-  codexTailPendingUserInputDetail,
-  codexTailPendingAttentionKind,
-  codexTailPendingApproval,
-  codexSessionTitle,
-  codexSessionModel,
-  codexSessionCreationSuppression,
-  codexSentinelSessionId,
-  codexRolloutExistsForSession,
-  codexRolloutCreationEvidence,
-  codexProposedPlanText,
-  codexProposedPlanMarkdown,
-  codexPlanPickerStateFromTail,
-  codexPidTurnActive,
-  codexPidPlanPickerState,
-  codexPidPlanPickerEvidence,
-  codexNewestRolloutForCwd,
-  codexModelFromRollout,
-  codexLocateTuiPid,
-  codexLastTurnEvent,
-  codexInternalSessionGhost,
-  codexIndexTitle,
-  codexDiscoverLive,
-  codexDesktopOriginator,
-  codexDesktopAppPid,
-  codexConfigModel,
-  codexChildSessionGhost,
-  codexAdapter,
-  cleanPromptTitle,
-  claudeToolDetail,
-  claudeTailPendingApproval,
-  claudeSessionTitle,
-  claudeSessionModel,
-  claudeLocateTuiPid,
-  claudeHeadlessInvocation,
-  claudeForkResumePredecessor,
-  claudeDesktopInvocation,
-  claudeClearPredecessor,
-  claudeAdapter,
-  buildPendingStash,
-  buildEnvelope,
-  buildBlob,
-  allAdapters,
-  aiTitle,
-  adapterFor,
-  SESSION_TRACE_PATH,
-  CODEX_ROLLOUT_IDLE_SILENCE_MS
+  plugin_default as default
 };

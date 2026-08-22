@@ -103,7 +103,7 @@ async function sha256Hex(s) {
 }
 
 // src/core/shared.ts
-var PLUGIN_VERSION = "2.1.0";
+var PLUGIN_VERSION = "2.1.5";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -744,6 +744,26 @@ function watchdogBuildDiffers(incumbent, current) {
     return false;
   return incumbent !== current;
 }
+function watchdogVersionOutranks(mine, incumbent) {
+  if (incumbent === undefined)
+    return true;
+  const parse = (v) => {
+    const core = v.trim().split("+")[0].split("-")[0];
+    if (core.length === 0)
+      return;
+    const parts = core.split(".").map((p) => /^\d+$/.test(p) ? Number(p) : Number.NaN);
+    return parts.some((n) => !Number.isFinite(n)) ? undefined : parts;
+  };
+  const a = parse(mine), b = parse(incumbent);
+  if (a === undefined || b === undefined)
+    return false;
+  for (let i = 0;i < Math.max(a.length, b.length); i++) {
+    const x = a[i] ?? 0, y = b[i] ?? 0;
+    if (x !== y)
+      return x > y;
+  }
+  return false;
+}
 function formatWatchdogPidfile(pid, version = PLUGIN_VERSION, build) {
   return `${pid} ${version}${typeof build === "string" && build.length > 0 ? ` ${build}` : ""}`;
 }
@@ -792,8 +812,12 @@ function ensureWatchdog(deps = {}) {
     const raw = readPidfile();
     const holder = typeof raw === "string" ? parseWatchdogPidfile(raw) : null;
     if (holder && watchdogHolderIsLive(holder.pid, deps)) {
-      if (holder.version === version && !watchdogBuildDiffers(holder.build, build))
+      if (holder.version === version) {
+        if (!watchdogBuildDiffers(holder.build, build))
+          return;
+      } else if (!watchdogVersionOutranks(version, holder.version)) {
         return;
+      }
       try {
         killPid(holder.pid, "SIGTERM");
       } catch {}
@@ -2664,8 +2688,45 @@ var codexAdapter = {
   pidTurnActive: (pid) => codexPidTurnActive(pid),
   locateTuiPid: (ctx, deps) => codexLocateTuiPid(ctx, deps)
 };
+var opencodeAdapter = {
+  kind: "opencode",
+  title: async () => {
+    return;
+  },
+  detectInterrupt: () => false,
+  sessionsDir: () => `${CC_DIR}/opencode-has-no-sessions-dir`,
+  sessionMatch: () => false,
+  hookStampPath: () => lastHookPath("opencode"),
+  hooksNotFiringHint: "  OpenCode loads the plugin at server start — restart OpenCode, or check that ~/.config/opencode/plugins/nomo.js still points at this install.",
+  toolDetail: {},
+  blobAgentFields: { agent: "opencode" }
+};
+function unknownAgentAdapter(kind) {
+  return {
+    kind,
+    title: async () => {
+      return;
+    },
+    detectInterrupt: () => false,
+    sessionsDir: () => `${CC_DIR}/unknown-agent-has-no-sessions-dir`,
+    sessionMatch: () => false,
+    hookStampPath: () => `${CC_DIR}/last-hook-unknown-agent`,
+    hooksNotFiringHint: "  This session was created by a newer nomo install — update this one.",
+    toolDetail: {},
+    blobAgentFields: { agent: kind }
+  };
+}
 function adapterFor(agent) {
-  return agent === "codex" ? codexAdapter : claudeAdapter;
+  switch (agent) {
+    case "codex":
+      return codexAdapter;
+    case "opencode":
+      return opencodeAdapter;
+    case "claude":
+      return claudeAdapter;
+    default:
+      return typeof agent === "string" && agent.length > 0 ? unknownAgentAdapter(agent) : claudeAdapter;
+  }
 }
 var allAdapters = [claudeAdapter, codexAdapter];
 
@@ -2894,19 +2955,19 @@ function transcriptStartMs(prefix) {
   }
   return;
 }
-function buildBlob(input, machine, title, plan, agent = "claude", turnStartedAt, pinnedFolder, model, at, proposedPlan, dbgOverride) {
+function buildBlob(input, machine, title, plan, agent = "claude", turnStartedAt, pinnedFolder, model, at, proposedPlan, dbgOverride, detailOverride) {
   const folder = folderIdentity(input.cwd, pinnedFolder);
   const { label, folderKey } = folder;
   const branch = sessionBranch(folder);
   const hookName = typeof input.hook_event_name === "string" ? input.hook_event_name : "";
-  const detail = detailForHook(hookName, typeof input.tool_name === "string" ? input.tool_name : undefined, input.tool_input);
+  const detail = detailOverride ?? detailForHook(hookName, typeof input.tool_name === "string" ? input.tool_name : undefined, input.tool_input);
   const base = {
     status: plan.status,
     title: title ?? "",
     machine,
     label,
     ...detail ? { detail } : {},
-    ...agent === "codex" ? { agent: "codex" } : {},
+    ...agent === "claude" ? {} : { agent },
     ...typeof turnStartedAt === "number" && Number.isFinite(turnStartedAt) ? { turnStartedAt } : {},
     ...typeof model === "string" && model.length > 0 ? { model } : {},
     ...typeof at === "number" && Number.isFinite(at) ? { at } : {},
@@ -2920,7 +2981,7 @@ function buildBlob(input, machine, title, plan, agent = "claude", turnStartedAt,
   }) : undefined;
   return appendFittedPlanAndDebug(base, proposedPlan, dbg);
 }
-async function buildEnvelope(input, machine, now, title, e2eKey, sentDone, agent = "claude", startedAt, turnStartedAt, pinnedFolder, model, planOverride, attentionKindOverride, proposedPlan, dbg, onBlobPlaintext) {
+async function buildEnvelope(input, machine, now, title, e2eKey, sentDone, agent = "claude", startedAt, turnStartedAt, pinnedFolder, model, planOverride, attentionKindOverride, proposedPlan, dbg, onBlobPlaintext, detailOverride) {
   if (typeof input !== "object" || input === null)
     return null;
   const i = input;
@@ -2934,7 +2995,7 @@ async function buildEnvelope(input, machine, now, title, e2eKey, sentDone, agent
   if (typeof startedAt === "number" && Number.isFinite(startedAt))
     base.startedAt = startedAt;
   const at = Math.floor(now / 1000);
-  const plaintext = buildBlob(i, machine, title, plan, agent, turnStartedAt, pinnedFolder, model, at, proposedPlan, dbg);
+  const plaintext = buildBlob(i, machine, title, plan, agent, turnStartedAt, pinnedFolder, model, at, proposedPlan, dbg, detailOverride);
   try {
     onBlobPlaintext?.(plaintext);
   } catch {}
@@ -2986,7 +3047,7 @@ async function trackSessionAt(sessionsDir, sessionId, op, prio, status, blob, ma
       op,
       prio,
       ...blob ? { blob } : {},
-      ...agent === "codex" ? { agent } : {},
+      ...agent === "claude" ? {} : { agent },
       ...typeof sessionStartedAt === "number" && Number.isFinite(sessionStartedAt) ? { sessionStartedAt } : {},
       ...typeof turnStartedAt === "number" && Number.isFinite(turnStartedAt) ? { turnStartedAt } : {},
       ...typeof turnId === "string" && turnId.length > 0 ? { turnId } : {},

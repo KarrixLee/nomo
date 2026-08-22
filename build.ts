@@ -21,12 +21,19 @@ const OUTDIR = join(HERE, "plugin", "dist");
 /** Every manifest that carries the plugin version, and how to pull it out. The Claude plugin manifest
  *  is the source of truth (see readVersion below); the rest must agree with it. A release that bumps
  *  only some of them ships hosts a version that disagrees with what the bundle reports, so the build
- *  refuses rather than baking the disagreement into dist/. */
+ *  refuses rather than baking the disagreement into dist/.
+ *
+ *  package.json is the FIFTH and newest of them (the `nomo-ai` npm bootstrapper). It ships no plugin
+ *  code — it only drives `claude plugin install` / `codex plugin add` / opencode-install.sh — so
+ *  there was an argument for versioning it independently. It is here anyway: same product, same
+ *  repo, and `bunx nomo-ai --version` is what a user will quote in a bug report. Locking it in means
+ *  the build fails loudly on drift instead of leaving that trap for a future release to find. */
 const VERSION_MANIFESTS: { path: string; versions: (doc: any) => (string | undefined)[] }[] = [
   { path: join("plugin", ".claude-plugin", "plugin.json"), versions: (d) => [d.version] },
   { path: join("plugin", ".codex-plugin", "plugin.json"), versions: (d) => [d.version] },
   { path: join(".claude-plugin", "marketplace.json"), versions: (d) => (d.plugins ?? []).map((p: any) => p.version) },
   { path: join(".agents", "plugins", "marketplace.json"), versions: (d) => (d.plugins ?? []).map((p: any) => p.version) },
+  { path: "package.json", versions: (d) => [d.version] },
 ];
 
 /** The Claude plugin manifest's version, after proving every other manifest agrees with it.
@@ -70,6 +77,17 @@ const ENTRYPOINTS = [
   "status-cmd.ts",
 ].map((f) => join(HERE, "src", "entries", f));
 
+/** The OpenCode plugin — a SECOND build pass, not another ENTRYPOINTS row, because it needs a
+ *  different extension. OpenCode auto-discovers plugins with the glob `{plugin,plugins}/*.{ts,js}`
+ *  (packages/opencode/src/config/plugin.ts), so a `.mjs` bundle would never load. Unlike the hooks
+ *  this is not a one-shot process: OpenCode imports it once and keeps it resident inside its own
+ *  server process, so there is no hooks.json, no hook-shim entry and no NOMO_SHIM_REV bump.
+ *  It still lands in plugin/dist/ because shared.ts's WATCHDOG_PATH resolves cc-watchdog.mjs as a
+ *  sibling of import.meta.url — the bundle must EXECUTE from dist/. The installed file at
+ *  ~/.config/opencode/plugins/nomo.js is a one-line stub re-exporting this absolute path (see README);
+ *  that indirection is also what keeps an install from going stale across plugin upgrades. */
+const OPENCODE_ENTRY = join(HERE, "src", "opencode", "plugin.ts");
+
 async function main(): Promise<void> {
   // The plugin's version is single-sourced from the Claude plugin manifest; inject it as a build-time
   // define so PLUGIN_VERSION (src/core/shared.ts) resolves to it in the committed dist/*.mjs bundles.
@@ -102,8 +120,30 @@ async function main(): Promise<void> {
     throw new Error("bun build failed");
   }
 
-  const names = result.outputs.map((o) => o.path.split("/").pop()).sort();
-  console.log(`Built ${result.outputs.length} artifacts stamped ${version} into ${OUTDIR}:`);
+  // Pass 2 — the OpenCode plugin. Same target/define as above so __NOMO_VERSION__ still injects and
+  // the output stays free of Bun-only globals. `naming` is the LITERAL "opencode.js", not
+  // "[name].js": the entry is src/opencode/plugin.ts, so `[name]` would emit dist/plugin.js — a
+  // meaningless name inside plugin/dist/, and not the dist/opencode.js the install stub points at.
+  // Safe as a literal only because this pass has exactly one entrypoint.
+  const oc = await Bun.build({
+    entrypoints: [OPENCODE_ENTRY],
+    outdir: OUTDIR,
+    target: "node",
+    format: "esm",
+    naming: "opencode.js",
+    sourcemap: "none",
+    minify: false,
+    define: { __NOMO_VERSION__: JSON.stringify(version) },
+  });
+
+  if (!oc.success) {
+    for (const log of oc.logs) console.error(log);
+    throw new Error("bun build failed (opencode)");
+  }
+
+  const outputs = [...result.outputs, ...oc.outputs];
+  const names = outputs.map((o) => o.path.split("/").pop()).sort();
+  console.log(`Built ${outputs.length} artifacts stamped ${version} into ${OUTDIR}:`);
   for (const n of names) console.log(`  ${n}`);
 }
 

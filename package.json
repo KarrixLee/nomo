@@ -1,0 +1,37 @@
+{
+  "name": "nomo-ai",
+  "version": "2.1.5",
+  "description": "One-command installer for the Nomo plugin — mirror Claude Code, OpenAI Codex and OpenCode sessions to the Nomo iPhone app as an end-to-end-encrypted Live Activity.",
+  "type": "module",
+  "bin": {
+    "nomo-ai": "bin/nomo-ai.mjs"
+  },
+  "files": [
+    "bin/"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT",
+  "homepage": "https://nomo.gg",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/KarrixLee/nomo.git"
+  },
+  "bugs": {
+    "url": "https://github.com/KarrixLee/nomo/issues"
+  },
+  "keywords": [
+    "claude-code",
+    "codex",
+    "opencode",
+    "live-activity",
+    "dynamic-island",
+    "ios",
+    "installer"
+  ],
+  "scripts": {
+    "build": "bun build.ts",
+    "test": "bun test"
+  }
+}
