@@ -1011,11 +1011,13 @@ const lanHintPublisher = createLanHintPublisher({ address: () => activeLanListen
  *  `revoked` (the definitive pairing-is-gone signal, keyed on the server's own not-found response).
  *  Any network error / timeout is a transient `failed`. Best-effort: never throws across its boundary. */
 async function postEvent(config: Config, body: object): Promise<PostOutcome> {
+  // The LAN listener's sealed host hint rides along on the POSTs this daemon already makes — no new
+  // request is ever issued for discovery, and `take` returns undefined unless the hint actually
+  // changed or its 5-minute refresh came due (so the overwhelming majority of POSTs are untouched).
+  // Hoisted out of the try so the catch below can settle it: a hint on a POST that threw is NOT
+  // published, and must be re-attached to the next one.
+  const lanHint = await lanHintPublisher.take(config);
   try {
-    // The LAN listener's sealed host hint rides along on the POSTs this daemon already makes — no new
-    // request is ever issued for discovery, and `take` returns undefined unless the hint actually
-    // changed or its 5-minute refresh came due (so the overwhelming majority of POSTs are untouched).
-    const lanHint = await lanHintPublisher.take(config);
     const payload = lanHint ? { ...body, lanHint } : body;
     const res = await fetch(`${config.url}/v1/cc/event`, {
       method: "POST",
@@ -1024,6 +1026,10 @@ async function postEvent(config: Config, body: object): Promise<PostOutcome> {
       signal: AbortSignal.timeout(2000),
     });
     const outcome = postOutcomeForStatus(res.status);
+    // Tell the hint publisher what became of the hint this POST carried. A hint handed to a POST that
+    // failed must NOT count as published — see LanHintPublisher.settle. `revoked` settles as undelivered
+    // too: the pairing is gone, so nothing was advertised to anyone.
+    if (lanHint) lanHintPublisher.settle(outcome === "delivered");
     // A 2xx MAY piggyback queued phone→Mac commands (see the command-intake section below). The
     // worker consumes them as it answers, so this response is the ONLY time we will ever see them —
     // buffer them here and let the sweep loop execute them off the POST path. Best-effort: a
@@ -1034,6 +1040,8 @@ async function postEvent(config: Config, body: object): Promise<PostOutcome> {
     }
     return outcome;
   } catch {
+    // fetch threw (timeout, DNS, offline) — the hint never reached the wire.
+    if (lanHint) lanHintPublisher.settle(false);
     return "failed";
   }
 }
@@ -2964,16 +2972,67 @@ export function shouldWaitingHeartbeat(
   return true;
 }
 
+// --- Fresh-pairing greet beat (the just-paired latency floor) ----------------------------------
+//
+// A brand-new pairing starts EMPTY, and nothing in the sweep fills it: every net above no-ops on a
+// healthy row, and the staleness heartbeat is gated on `now - record.ts >= HEARTBEAT_AFTER_MS`
+// (5 min) — so a session that fired hooks seconds ago (the one that just ran the pair command, which
+// is the overwhelmingly common case) sends NOTHING to the new pairing until the user's next prompt.
+// The app renders that gap as a spinner: its `isSyncing` holds while the pairing has no sessions and
+// still carries the "Computer" placeholder name, for a 120 s fresh window.
+//
+// This was masked until 2026-08-23. Pairing itself used to take just under 60 s (Workers KV's 60 s
+// per-colo read cache — see server/src/pairing-window.ts), and that stall ran CONCURRENTLY with this
+// wait, so by the time pairing reported success the first envelope had usually landed. Making pairing
+// fast (~12 s) did not create this delay, it merely stopped hiding it.
+//
+// The fix is one unthrottled beat per pairing per daemon run. It reuses the existing heartbeat
+// envelope (the record's last blob, unchanged op/prio) so it can never alter state, and it keeps
+// every ownership guard the other beats enforce. Two things ride on it:
+//   - the app's spinner clears on its next 3 s poll instead of on the user's next prompt;
+//   - the LAN hint travels ONLY as a passenger on /cc/event (createLanHintPublisher in
+//     core/lan-listener.ts attaches it, it has no request of its own), so the greet beat is also
+//     what gets the Mac's address to a freshly paired phone without waiting out the 5 min cadence.
+//
+// SCOPE — "new" means new TO THIS PROCESS, not new in wall-clock: Config carries no createdAt, and a
+// pairing age is not worth persisting for this. The cost of that approximation is exactly one extra
+// POST per daemon start on an already-paired machine, against a 300-per-60 s-per-pairing budget.
+
+/** The pairing this daemon has already greeted (in-memory, like waitingBeatAt). Undefined until the
+ *  first sweep that finds a config, so the greet fires once and never again for that pairing. */
+let greetedPairingId: string | undefined;
+
+/** Should this session carry the pairing's one-shot greet beat? Deliberately skips BOTH quiet gates
+ *  (`record.ts` freshness and the per-session throttle) — a just-paired phone needs the envelope the
+ *  session's recent hook activity is the very reason it would otherwise not get. Every OWNERSHIP
+ *  guard shouldHeartbeat enforces still applies unchanged: a terminal row, a net that took the
+ *  session this sweep, an in-flight corrective done, and an idle-reap-eligible Claude row all stand
+ *  down, so the greet can never resurrect a session the other nets are retiring. */
+export function shouldGreetHeartbeat(record: SessionRecord, now: number, pairingIsNew: boolean, correctedThisSweep: boolean): boolean {
+  if (!pairingIsNew) return false;
+  if (record.op === "done") return false;
+  if (typeof record.doneAttempts === "number" && record.doneAttempts > 0) return false;
+  if (isClaudeIdleReapEligible(record, now)) return false;
+  if (correctedThisSweep) return false;
+  if (typeof record.ts !== "number") return false;
+  return true;
+}
+
 /** Which heartbeat (if any) this session gets this sweep. The stale beat wins when both apply, so a
  *  waiting session that has ALSO been quiet for five minutes still only sends one POST. Pure — the
- *  whole cadence matrix is unit-testable without fs/network. */
-export type HeartbeatKind = "none" | "stale" | "waiting";
+ *  whole cadence matrix is unit-testable without fs/network.
+ *
+ *  `pairingIsNew` is optional and last so every existing 5-argument call — and every existing test —
+ *  keeps its exact behaviour (undefined → no greet). */
+export type HeartbeatKind = "none" | "stale" | "waiting" | "greet";
 export function heartbeatKind(
   record: SessionRecord, now: number, lastHeartbeat: number | undefined,
-  lastWaitingBeat: number | undefined, correctedThisSweep: boolean,
+  lastWaitingBeat: number | undefined, correctedThisSweep: boolean, pairingIsNew = false,
 ): HeartbeatKind {
   if (shouldHeartbeat(record, now, lastHeartbeat, correctedThisSweep)) return "stale";
   if (shouldWaitingHeartbeat(record, now, lastWaitingBeat, correctedThisSweep)) return "waiting";
+  // Last: a session that already earns a stale/waiting beat needs no second POST to say the same thing.
+  if (shouldGreetHeartbeat(record, now, pairingIsNew, correctedThisSweep)) return "greet";
   return "none";
 }
 
@@ -3073,6 +3132,11 @@ async function sweep(config: Config | null, deps: SweepDeps = {}): Promise<Sweep
   // Any 2xx POST this sweep proves the pairing is alive → the loop resets the gone-strike streak, so a
   // real success from EITHER the watchdog or the hook clears a stray transient strike.
   let delivered = false;
+  // The one-shot greet beat for a pairing this daemon has not yet fed (see shouldGreetHeartbeat).
+  // Claimed only on DELIVERY, below: a greet whose POST failed must be retried on the next sweep —
+  // a wifi flap at pair time is exactly the case this exists to cover.
+  const pairingIsNew = config !== null && config.pairingId !== greetedPairingId;
+  let greetDelivered = false;
   for (const file of files) {
     if (!file.endsWith(".json")) continue;
     const path = `${SESSIONS_DIR}/${file}`;
@@ -3199,6 +3263,7 @@ async function sweep(config: Config | null, deps: SweepDeps = {}): Promise<Sweep
         const beatKind = heartbeatKind(
           record, now, heartbeatAt.get(sessionId), waitingBeatAt,
           idleFix === "corrected" || planResolutionHandled || interruptHandled || flaggedAttention || reapedIdle || repairedTitle,
+          pairingIsNew,
         );
         if (beatKind !== "none") {
           const beat = buildHeartbeatEnvelope(sessionId, record, Date.now(), config.pairingId);
@@ -3211,6 +3276,7 @@ async function sweep(config: Config | null, deps: SweepDeps = {}): Promise<Sweep
             if (outcome === "delivered") {
               heartbeatAt.set(sessionId, now); // a fast beat IS a heartbeat — it advances both clocks
               if (beatKind === "waiting") waitingBeatAt = now;
+              if (beatKind === "greet") greetDelivered = true;
               delivered = true;
             }
           }
@@ -3248,6 +3314,9 @@ async function sweep(config: Config | null, deps: SweepDeps = {}): Promise<Sweep
       // Already gone (raced with another sweep or a SessionEnd hook) — fine.
     }
   }
+  // Claim the greet only once an envelope actually landed. With no sessions on disk there is nothing
+  // to greet WITH, so the flag stays unclaimed and the very first session to appear gets the beat.
+  if (config !== null && greetDelivered) greetedPairingId = config.pairingId;
   return { revoked: false, remaining, delivered };
 }
 

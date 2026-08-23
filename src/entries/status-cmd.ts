@@ -27,7 +27,8 @@ import { claudeAdapter, codexAdapter, opencodeAdapter } from "../core/adapter";
 import {
   AgentKind, CC_DIR, CODEX_HOOK_MARKER, codexAppServerSocketAvailable, codexHome, flagExists,
   LAST_SEND_PATH, localApprovalsState, NO_HOLD_PATH, parseConfig, parsePendingConfig, pidAlive,
-  opencodeStubPaths, opencodeStubTarget, PLUGIN_VERSION, SESSIONS_DIR, WATCHDOG_PID_PATH,
+  opencodeStubPaths, opencodeStubTarget, PLUGIN_VERSION, SESSION_TRACE_PATH, SESSIONS_DIR,
+  WATCHDOG_PID_PATH,
 } from "../core/shared";
 
 /** Where a GLOBAL OpenCode plugin stub lives — see core/shared's opencodeStubPaths for the two
@@ -58,6 +59,9 @@ export interface StatusDeps {
   lastSendPath?: string;
   sessionsDir?: string;
   watchdogPidPath?: string;
+  /** The session trace the LAN readout is distilled from; defaults to `<CC_DIR>/session-trace.log`.
+   *  Injected so a test can point it at a temp file instead of the developer's live trace. */
+  sessionTracePath?: string;
   /** Path to codex's hooks.json; defaults to `<CODEX_HOME>/hooks.json`. Injected so a test can point
    *  it at a temp file instead of the real ~/.codex. */
   codexHooksPath?: string;
@@ -267,6 +271,93 @@ const HOOK_ACTIVITY_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
  *    - recent activity, no stamp                → true  (hook never fired)
  *    - recent activity, stamp lags by > grace   → true
  *    - stamp at/after the newest session         → false (healthy) */
+/** What the LAN leg of `nomo status` reports, distilled from the session trace. Pure so the whole
+ *  rendering matrix is unit-testable without a socket or a real trace file.
+ *
+ *  WHY THE TRACE AND NOT NEW STATE. Every fact here is already written to session-trace.log by
+ *  core/lan-listener.ts (`bound` at bind, `hint` when the address is attached to a POST, `ok` per
+ *  served request, `reject` per refusal). Reading it back costs one file read in a command that
+ *  already does several, and adds no writes to the request path. */
+export interface LanTraceSummary {
+  /** Last successful bind, if any — the listener half. */
+  bound?: { ts: number; port: number; lid: string };
+  /** Last time this Mac attached its address to a /cc/event POST — the advertise half. */
+  hint?: { ts: number; hosts: number };
+  /** Last request the phone actually made to us. THE detection signal: its age is how long ago LAN
+   *  last demonstrably worked, measured end-to-end on this machine's single clock. */
+  served?: { ts: number; op?: string };
+  /** Last refusal, so a wrong key / stale lid / unknown pairing does not look like silence. */
+  reject?: { ts: number; why?: string };
+  /** Last bind failure, when nothing ever bound. */
+  bindFailed?: { ts: number; why?: string };
+}
+
+/** Fold the trace file (newest line last) into the summary. Unparseable lines are skipped — the file
+ *  is append-only from several processes and is truncated at 256 KB mid-stream, so a torn first line
+ *  is normal and must never break the command. */
+export function parseLanTrace(raw: string): LanTraceSummary {
+  const out: LanTraceSummary = {};
+  for (const line of raw.split("\n")) {
+    if (!line || !line.includes('"lan"')) continue;
+    let e: Record<string, unknown>;
+    try { e = JSON.parse(line) as Record<string, unknown>; } catch { continue; }
+    if (e.event !== "lan" || typeof e.ts !== "number") continue;
+    const ts = e.ts;
+    switch (e.result) {
+      case "bound":
+        if (typeof e.port === "number") out.bound = { ts, port: e.port, lid: String(e.lid ?? "") };
+        break;
+      case "hint":
+        out.hint = { ts, hosts: typeof e.hosts === "number" ? e.hosts : 0 };
+        break;
+      case "ok":
+        out.served = { ts, op: typeof e.op === "string" ? e.op : undefined };
+        break;
+      case "reject":
+        out.reject = { ts, why: typeof e.why === "string" ? e.why : undefined };
+        break;
+      case "bind-failed":
+        out.bindFailed = { ts, why: typeof e.why === "string" ? e.why : undefined };
+        break;
+    }
+  }
+  return out;
+}
+
+/** The LAN rows, as `[row, ...continuations]`. Empty when this machine has no LAN history at all —
+ *  LAN is opt-in on the phone and off by default, so a silent section beats a permanent "off" row on
+ *  every machine that never uses it.
+ *
+ *  THE ONE NUMBER THIS EXISTS FOR is `served`: the phone's own arrival, stamped by us. Comparing it
+ *  against `hint` splits the delay onto a leg — advertised long ago but never reached = the phone
+ *  never got the hint (worker/KV leg) or cannot route to us (network/permission); advertised just now
+ *  and not yet reached = simply too early to judge. */
+export function renderLanTrace(s: LanTraceSummary, now: number): string[] {
+  if (!s.bound && !s.hint && !s.served && !s.bindFailed) return [];
+  const lines: string[] = [];
+  if (s.bound) {
+    lines.push(`listening on port ${s.bound.port} (id ${s.bound.lid.slice(0, 8)}) since ${humanAge(now - s.bound.ts)}`);
+  } else if (s.bindFailed) {
+    lines.push(`NOT listening — bind failed ${humanAge(now - s.bindFailed.ts)}${s.bindFailed.why ? ` (${s.bindFailed.why})` : ""}`);
+  } else {
+    lines.push("not listening");
+  }
+  if (s.served) {
+    lines.push(`phone last reached this Mac ${humanAge(now - s.served.ts)}${s.served.op ? ` (${s.served.op})` : ""}`);
+  } else if (s.hint) {
+    lines.push("phone has NEVER reached this Mac — LAN has not worked yet on this machine");
+  }
+  if (s.hint) {
+    lines.push(`address last advertised ${humanAge(now - s.hint.ts)} (${s.hint.hosts} interface${s.hint.hosts === 1 ? "" : "s"})`);
+  } else {
+    lines.push("address NEVER advertised — it rides on watchdog POSTs, so this needs an active session");
+  }
+  if (s.reject && (!s.served || s.reject.ts > s.served.ts)) {
+    lines.push(`last request REFUSED ${humanAge(now - s.reject.ts)}${s.reject.why ? `: ${s.reject.why}` : ""}`);
+  }
+  return lines;
+}
+
 export function hooksAppearStale(now: number, sessionMtime: number, hookStamp: number): boolean {
   if (sessionMtime <= 0) return false;
   if (now - sessionMtime > HOOK_ACTIVITY_WINDOW_MS) return false;
@@ -319,6 +410,7 @@ export async function statusCmd(deps: StatusDeps = {}): Promise<number> {
   const lastSendPath = deps.lastSendPath ?? LAST_SEND_PATH;
   const sessionsDir = deps.sessionsDir ?? SESSIONS_DIR;
   const watchdogPidPath = deps.watchdogPidPath ?? WATCHDOG_PID_PATH;
+  const sessionTracePath = deps.sessionTracePath ?? SESSION_TRACE_PATH;
   const codexHooksPath = deps.codexHooksPath ?? `${codexHome()}/hooks.json`;
   const codexConfigPath = deps.codexConfigPath ?? `${codexHome()}/config.toml`;
   const codexSessionsDir = deps.codexSessionsDir ?? codexAdapter.sessionsDir();
@@ -389,6 +481,16 @@ export async function statusCmd(deps: StatusDeps = {}): Promise<number> {
       // marker absent → never
     }
     print(row("Delivery", `${lastSend} · ${watchdog}`));
+
+    // LAN, from the trace the listener already writes. Silent on a machine with no LAN history: the
+    // phone-side switch is opt-in and off by default, so most machines have nothing to say here.
+    let lanTrace = "";
+    try { lanTrace = await readFile(sessionTracePath, "utf8"); } catch { /* no trace yet */ }
+    const lanLines = renderLanTrace(parseLanTrace(lanTrace), now());
+    if (lanLines.length > 0) {
+      print(row("LAN", lanLines[0]!));
+      for (const l of lanLines.slice(1)) print(cont(l));
+    }
 
     // The local remote-approvals escape hatch. This is the whole answer to "why didn't my phone ask
     // me?", and nothing else on the machine hints at it — so it earns a permanent row, one calm line

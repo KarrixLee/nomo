@@ -104,7 +104,7 @@ async function sha256Hex(s) {
 }
 
 // src/core/shared.ts
-var PLUGIN_VERSION = "2.1.23";
+var PLUGIN_VERSION = "2.1.24";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -2891,6 +2891,68 @@ function humanAge(ms) {
 }
 var HOOK_STALE_MS = 10 * 60 * 1000;
 var HOOK_ACTIVITY_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
+function parseLanTrace(raw) {
+  const out = {};
+  for (const line of raw.split(`
+`)) {
+    if (!line || !line.includes('"lan"'))
+      continue;
+    let e;
+    try {
+      e = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (e.event !== "lan" || typeof e.ts !== "number")
+      continue;
+    const ts = e.ts;
+    switch (e.result) {
+      case "bound":
+        if (typeof e.port === "number")
+          out.bound = { ts, port: e.port, lid: String(e.lid ?? "") };
+        break;
+      case "hint":
+        out.hint = { ts, hosts: typeof e.hosts === "number" ? e.hosts : 0 };
+        break;
+      case "ok":
+        out.served = { ts, op: typeof e.op === "string" ? e.op : undefined };
+        break;
+      case "reject":
+        out.reject = { ts, why: typeof e.why === "string" ? e.why : undefined };
+        break;
+      case "bind-failed":
+        out.bindFailed = { ts, why: typeof e.why === "string" ? e.why : undefined };
+        break;
+    }
+  }
+  return out;
+}
+function renderLanTrace(s, now) {
+  if (!s.bound && !s.hint && !s.served && !s.bindFailed)
+    return [];
+  const lines = [];
+  if (s.bound) {
+    lines.push(`listening on port ${s.bound.port} (id ${s.bound.lid.slice(0, 8)}) since ${humanAge(now - s.bound.ts)}`);
+  } else if (s.bindFailed) {
+    lines.push(`NOT listening — bind failed ${humanAge(now - s.bindFailed.ts)}${s.bindFailed.why ? ` (${s.bindFailed.why})` : ""}`);
+  } else {
+    lines.push("not listening");
+  }
+  if (s.served) {
+    lines.push(`phone last reached this Mac ${humanAge(now - s.served.ts)}${s.served.op ? ` (${s.served.op})` : ""}`);
+  } else if (s.hint) {
+    lines.push("phone has NEVER reached this Mac — LAN has not worked yet on this machine");
+  }
+  if (s.hint) {
+    lines.push(`address last advertised ${humanAge(now - s.hint.ts)} (${s.hint.hosts} interface${s.hint.hosts === 1 ? "" : "s"})`);
+  } else {
+    lines.push("address NEVER advertised — it rides on watchdog POSTs, so this needs an active session");
+  }
+  if (s.reject && (!s.served || s.reject.ts > s.served.ts)) {
+    lines.push(`last request REFUSED ${humanAge(now - s.reject.ts)}${s.reject.why ? `: ${s.reject.why}` : ""}`);
+  }
+  return lines;
+}
 function hooksAppearStale(now, sessionMtime, hookStamp) {
   if (sessionMtime <= 0)
     return false;
@@ -2938,6 +3000,7 @@ async function statusCmd(deps = {}) {
   const lastSendPath = deps.lastSendPath ?? LAST_SEND_PATH;
   const sessionsDir = deps.sessionsDir ?? SESSIONS_DIR;
   const watchdogPidPath = deps.watchdogPidPath ?? WATCHDOG_PID_PATH;
+  const sessionTracePath = deps.sessionTracePath ?? SESSION_TRACE_PATH;
   const codexHooksPath = deps.codexHooksPath ?? `${codexHome()}/hooks.json`;
   const codexConfigPath = deps.codexConfigPath ?? `${codexHome()}/config.toml`;
   const codexSessionsDir = deps.codexSessionsDir ?? codexAdapter.sessionsDir();
@@ -2983,6 +3046,16 @@ async function statusCmd(deps = {}) {
         lastSend = `last event sent ${humanAge(now() - ts)}`;
     } catch {}
     print(row("Delivery", `${lastSend} · ${watchdog}`));
+    let lanTrace = "";
+    try {
+      lanTrace = await readFile3(sessionTracePath, "utf8");
+    } catch {}
+    const lanLines = renderLanTrace(parseLanTrace(lanTrace), now());
+    if (lanLines.length > 0) {
+      print(row("LAN", lanLines[0]));
+      for (const l of lanLines.slice(1))
+        print(cont(l));
+    }
     if (await localApprovalsState(noHoldPath) === "on") {
       print(row("Approvals", "on — permission prompts are held and sent to your phone"));
     } else {
@@ -3184,6 +3257,8 @@ if (__require.main == __require.module) {
 }
 export {
   statusCmd,
+  renderLanTrace,
+  parseLanTrace,
   parseCodexPluginState,
   parseAudience,
   humanAge,

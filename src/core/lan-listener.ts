@@ -333,7 +333,7 @@ const textDecoder = new TextDecoder();
 
 /** Best-effort trace with the same argv guard the watchdog's traceFocus uses: unit tests run with the
  *  user's real HOME visible and must never pollute their live session trace. */
-function traceLan(deps: LanListenerDeps, event: object): void {
+function traceLan(deps: { trace?: (event: object) => void }, event: object): void {
   if (deps.trace) {
     try { deps.trace(event); } catch { /* diagnostics only */ }
     return;
@@ -845,13 +845,30 @@ export interface LanHintPublisherDeps {
   address: () => LanAddress | null;
   hosts?: () => string[];
   now?: () => number;
+  /** Diagnostics seam, same contract as LanListenerDeps.trace (tests inject; production writes to the
+   *  session trace). Without it the Mac never recorded that it advertised, which made "was the delay on
+   *  my side or the worker's?" unanswerable from this machine — see the `lan` section of `nomo status`. */
+  trace?: (event: object) => void;
 }
 
 export interface LanHintPublisher {
-  /** The sealed hint to attach to the NEXT /cc/event POST, or undefined when nothing is due. Marks
-   *  itself as published on return — a POST that then fails is covered by the refresh interval, which
-   *  is far cheaper than threading a delivery outcome back through a dozen injected `post:` deps. */
+  /** The sealed hint to attach to the NEXT /cc/event POST, or undefined when nothing is due. The hint
+   *  is IN FLIGHT, not published, until `settle` says otherwise — see settle. */
   take(config: Config | null): Promise<string | undefined>;
+  /** Report what happened to the POST the last `take` attached a hint to.
+   *
+   *  WHY THIS EXISTS. `take` used to stamp its publish clock on RETURN, so a hint handed to a POST that
+   *  then failed — a worker blip, a wifi flap on the interface we just advertised, a 401 — counted as
+   *  published and was not re-attached for another LAN_HINT_REFRESH_MS (5 min). The failure mode is
+   *  self-selecting: the moments a POST fails are exactly the moments the address is likely to have
+   *  just changed. The original note reasoned that threading an outcome back would cost "a dozen
+   *  injected post: deps", but the watchdog has exactly ONE call site (postEvent), so it costs one call.
+   *
+   *  Only the CLOCK rolls back on failure. The sealed ciphertext and its state key are kept, because
+   *  the worker's "is this hint unchanged?" test is a string compare on that exact ciphertext and
+   *  encryptBlob draws a fresh IV every call — so a retry re-attaches the identical bytes (no KV write)
+   *  rather than a resealed copy of the same content. */
+  settle(delivered: boolean): void;
 }
 
 /** Seal the hint, trimming the host list until it fits the ceiling. Returns undefined when even a
@@ -886,6 +903,9 @@ export function createLanHintPublisher(deps: LanHintPublisherDeps): LanHintPubli
   let lastSealed: string | undefined;
   let cachedHosts: string[] = [];
   let cachedAt = 0;
+  /** The publish clock + trace line for the hint currently IN FLIGHT, applied only once the POST that
+   *  carries it lands (see settle). Null whenever no take is outstanding. */
+  let pending: { at: number; trace: object } | null = null;
 
   const hosts = (t: number): string[] => {
     if (t - cachedAt < LAN_HOSTS_CACHE_MS && cachedAt !== 0) return cachedHosts;
@@ -907,19 +927,31 @@ export function createLanHintPublisher(deps: LanHintPublisherDeps): LanHintPubli
         if (state === lastState) {
           if (t - lastSentAt < LAN_HINT_REFRESH_MS) return undefined;
           if (lastSealed) {
-            lastSentAt = t;
+            pending = { at: t, trace: { result: "hint", why: "refresh", port: addr.port, lid: addr.lid, hosts: list.length } };
             return lastSealed; // byte-identical refresh — see the lastSealed note above
           }
         }
         const sealed = await sealHint(config.e2eKey, list, addr.port, addr.lid, t);
         if (!sealed) return undefined;
+        // The ciphertext is cached immediately (a retry must re-send these exact bytes), but the CLOCK
+        // waits for settle — nothing here counts as published until a POST actually carries it.
         lastState = state;
         lastSealed = sealed;
-        lastSentAt = t;
+        pending = { at: t, trace: { result: "hint", why: "changed", port: addr.port, lid: addr.lid, hosts: list.length } };
         return sealed;
       } catch {
+        pending = null;
         return undefined; // a hint is an optimization; never let it break a status POST
       }
+    },
+    settle(delivered: boolean): void {
+      const p = pending;
+      pending = null;
+      if (!p || !delivered) return; // failed → clock untouched, so the next POST re-attaches immediately
+      lastSentAt = p.at;
+      // Traced on DELIVERY only, so `nomo status` reports when the address actually went out rather
+      // than when we hoped it would — the whole point of having the line.
+      traceLan(deps, p.trace);
     },
   };
 }

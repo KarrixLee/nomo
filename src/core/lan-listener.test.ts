@@ -746,6 +746,7 @@ describe("sealed host-hint publisher", () => {
     });
     const first = await publisher.take(cfg);
     expect(typeof first).toBe("string");
+    publisher.settle(true);                                // the POST landed — now it is published
     expect(await publisher.take(cfg)).toBeUndefined();     // unchanged → nothing to say
     now += LAN_HINT_REFRESH_MS - 1;
     expect(await publisher.take(cfg)).toBeUndefined();     // still inside the refresh window
@@ -783,17 +784,52 @@ describe("sealed host-hint publisher", () => {
     let hosts = ["192.168.1.42"];
     let now = 1_000_000;
     const publisher = createLanHintPublisher({ address: () => current, hosts: () => hosts, now: () => now });
-    expect(typeof await publisher.take(cfg)).toBe("string");
+    const send = async () => { const h = await publisher.take(cfg); publisher.settle(true); return h; };
+    expect(typeof await send()).toBe("string");
 
     now += 6_000; // past the host-enumeration cache
     hosts = ["192.168.1.99"];
-    expect(typeof await publisher.take(cfg)).toBe("string");
+    expect(typeof await send()).toBe("string");
 
     now += 6_000;
     current = { port: 51234, lid: "lid-2" };
-    expect(typeof await publisher.take(cfg)).toBe("string");
+    expect(typeof await send()).toBe("string");
 
     now += 6_000;
+    expect(await publisher.take(cfg)).toBeUndefined();
+  });
+
+  test("a hint on a POST that FAILED is re-attached to the very next one, not silenced for 5 min", async () => {
+    // The self-selecting failure this exists for: a POST fails exactly when the network just moved,
+    // which is exactly when the advertised address is most likely to be wrong.
+    const cfg = config();
+    let now = 1_000_000;
+    const publisher = createLanHintPublisher({
+      address: () => address, hosts: () => ["192.168.1.42"], now: () => now,
+    });
+    const first = await publisher.take(cfg);
+    expect(typeof first).toBe("string");
+    publisher.settle(false);                               // the POST threw / 500'd / 401'd
+    now += 1_000;                                          // far inside LAN_HINT_REFRESH_MS
+    // Re-offered immediately, and as the IDENTICAL ciphertext — a reseal would defeat the worker's
+    // string-compare "unchanged?" test into a needless KV write.
+    const retry = await publisher.take(cfg);
+    expect(retry).toBe(first!);
+    publisher.settle(true);
+    expect(await publisher.take(cfg)).toBeUndefined();     // now published, and quiet again
+  });
+
+  test("settle is inert without an outstanding take, and never double-counts one", async () => {
+    const cfg = config();
+    let now = 1_000_000;
+    const publisher = createLanHintPublisher({
+      address: () => address, hosts: () => ["192.168.1.42"], now: () => now,
+    });
+    publisher.settle(true);                                // nothing in flight → no-op
+    expect(typeof await publisher.take(cfg)).toBe("string");
+    publisher.settle(true);
+    publisher.settle(false);                               // a second settle must not roll the clock back
+    now += 1_000;
     expect(await publisher.take(cfg)).toBeUndefined();
   });
 

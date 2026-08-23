@@ -14,7 +14,7 @@ import {
   markDoneDeliveredAt, SESSION_TRACE_PATH, stashPendingEvent, trackSessionAt, transcriptStartMs,
 } from "./cc-status";
 import { provisionalsCoveredByReal, reconcileProvisionalsSweep } from "./cc-watchdog";
-import { hooksAppearStale, parseCodexPluginState, statusCmd } from "./status-cmd";
+import { hooksAppearStale, parseCodexPluginState, parseLanTrace, renderLanTrace, statusCmd } from "./status-cmd";
 import { createProcessHygiene, isolatedTestEnv } from "../test/process-hygiene";
 
 // A fixed 32-byte test key; the real one is HKDF-derived, but any 32 bytes exercise the round-trip.
@@ -2039,6 +2039,74 @@ describe("statusCmd — Codex plugin detection states", () => {
 // A paired machine with RECENT session activity but a last-hook stamp that's absent or badly lagging
 // the newest session means the agent's plugin-bundled hooks are silently not firing. hooksAppearStale
 // is the pure decision rule; the statusCmd cases exercise the end-to-end warning render + the gates.
+describe("the LAN readout (parseLanTrace + renderLanTrace)", () => {
+  const NOW = 1_000_000_000;
+  const line = (o: object) => JSON.stringify({ ts: NOW, pid: 1, event: "lan", ...o });
+
+  test("a machine with no LAN history prints NOTHING — LAN is opt-in and off by default", () => {
+    expect(renderLanTrace(parseLanTrace(""), NOW)).toEqual([]);
+    // other events in the same file must not conjure a section
+    expect(renderLanTrace(parseLanTrace(JSON.stringify({ ts: NOW, event: "hold-prune" })), NOW)).toEqual([]);
+  });
+
+  test("newest line of each kind wins, and a torn/foreign line never breaks the read", () => {
+    const raw = [
+      "{ this is a torn line",
+      line({ result: "bound", port: 1111, lid: "aaaaaaaa-old", ts: NOW - 60_000 }),
+      JSON.stringify({ ts: NOW - 5_000, pid: 1, event: "lan", result: "bound", port: 2222, lid: "bbbbbbbb-new" }),
+      JSON.stringify({ ts: NOW - 1_000, pid: 1, event: "focus", result: "ok" }),
+    ].join("\n");
+    const s = parseLanTrace(raw);
+    expect(s.bound?.port).toBe(2222);
+    expect(s.bound?.lid).toBe("bbbbbbbb-new");
+  });
+
+  test("THE headline number: the phone's own arrival, stamped by this Mac", () => {
+    const raw = [
+      JSON.stringify({ ts: NOW - 90_000, pid: 1, event: "lan", result: "bound", port: 5000, lid: "abcdefgh-1" }),
+      JSON.stringify({ ts: NOW - 40_000, pid: 1, event: "lan", result: "hint", hosts: 2 }),
+      JSON.stringify({ ts: NOW - 10_000, pid: 1, event: "lan", result: "ok", op: "ping" }),
+    ].join("\n");
+    const out = renderLanTrace(parseLanTrace(raw), NOW);
+    expect(out[0]).toContain("listening on port 5000");
+    expect(out[1]).toContain("phone last reached this Mac");
+    expect(out[1]).toContain("(ping)");
+    expect(out[2]).toContain("address last advertised");
+    expect(out[2]).toContain("2 interfaces");
+  });
+
+  test("advertised but never reached is called out — that is the leg-splitting case", () => {
+    const raw = [
+      JSON.stringify({ ts: NOW - 90_000, pid: 1, event: "lan", result: "bound", port: 5000, lid: "abcdefgh-1" }),
+      JSON.stringify({ ts: NOW - 40_000, pid: 1, event: "lan", result: "hint", hosts: 1 }),
+    ].join("\n");
+    const out = renderLanTrace(parseLanTrace(raw), NOW);
+    expect(out.some((l) => l.includes("NEVER reached this Mac"))).toBe(true);
+    expect(out.some((l) => l.includes("1 interface") && !l.includes("interfaces"))).toBe(true);
+  });
+
+  test("bound but never advertised names the actual cause: the hint has no request of its own", () => {
+    const raw = JSON.stringify({ ts: NOW - 5_000, pid: 1, event: "lan", result: "bound", port: 5000, lid: "abcdefgh-1" });
+    const out = renderLanTrace(parseLanTrace(raw), NOW);
+    expect(out.some((l) => l.includes("NEVER advertised"))).toBe(true);
+  });
+
+  test("a bind failure reads as NOT listening, not as silence", () => {
+    const raw = JSON.stringify({ ts: NOW - 5_000, pid: 1, event: "lan", result: "bind-failed", why: "no-port" });
+    const out = renderLanTrace(parseLanTrace(raw), NOW);
+    expect(out[0]).toContain("NOT listening");
+    expect(out[0]).toContain("no-port");
+  });
+
+  test("a refusal surfaces ONLY while it is the latest word — a served request supersedes it", () => {
+    const bound = JSON.stringify({ ts: NOW - 90_000, pid: 1, event: "lan", result: "bound", port: 5000, lid: "abcdefgh-1" });
+    const rejected = [bound, JSON.stringify({ ts: NOW - 3_000, pid: 1, event: "lan", result: "reject", why: "bad-lid" })].join("\n");
+    expect(renderLanTrace(parseLanTrace(rejected), NOW).some((l) => l.includes("REFUSED") && l.includes("bad-lid"))).toBe(true);
+    const healed = [rejected, JSON.stringify({ ts: NOW - 1_000, pid: 1, event: "lan", result: "ok", op: "ping" })].join("\n");
+    expect(renderLanTrace(parseLanTrace(healed), NOW).some((l) => l.includes("REFUSED"))).toBe(false);
+  });
+});
+
 describe("hooksAppearStale (pure decision rule)", () => {
   const NOW = 1_000_000_000_000;
   const MIN = 60_000;

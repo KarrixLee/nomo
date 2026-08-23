@@ -4128,6 +4128,45 @@ describe("isWaitingSession", () => {
   });
 });
 
+describe("heartbeatKind — the fresh-pairing greet beat", () => {
+  const fresh = (over: Partial<SessionRecord> = {}): SessionRecord =>
+    rec({ ts: 1_000_000, lastEvent: "working", op: "update", prio: 0, blob: "B", ...over });
+
+  test("a just-paired phone gets the envelope a hook-fresh session would otherwise withhold for 5 min", () => {
+    // The regression case verbatim: the session that ran the pair command fired its hooks seconds ago,
+    // so BOTH quiet gates say "skip" and the app spins until the user's next prompt.
+    const now = 1_000_000 + 1_000;
+    expect(heartbeatKind(fresh(), now, undefined, undefined, false)).toBe("none");
+    expect(heartbeatKind(fresh(), now, undefined, undefined, false, true)).toBe("greet");
+  });
+
+  test("it is one-shot: once the sweep claims the pairing, the 5-minute cadence resumes exactly", () => {
+    const now = 1_000_000 + 1_000;
+    expect(heartbeatKind(fresh(), now, undefined, undefined, false, false)).toBe("none");
+    expect(heartbeatKind(fresh(), 1_000_000 + 300_000, undefined, undefined, false, false)).toBe("stale");
+  });
+
+  test("it never adds a SECOND post to a session already beating", () => {
+    // Stale and waiting both outrank greet, so a fresh pairing costs at most one POST per session.
+    expect(heartbeatKind(fresh(), 1_000_000 + 300_000, undefined, undefined, false, true)).toBe("stale");
+    const parked = rec({ ts: 1_000_000, lastEvent: "needsAttention", op: "update", prio: 1, blob: "B" });
+    expect(heartbeatKind(parked, 1_000_000 + WAITING_HEARTBEAT_AFTER_MS, undefined, undefined, false, true)).toBe("waiting");
+  });
+
+  test("every ownership guard still stands down — the greet can never resurrect a retiring session", () => {
+    const now = 1_000_000 + 1_000;
+    expect(heartbeatKind(fresh({ op: "done" }), now, undefined, undefined, false, true)).toBe("none");
+    expect(heartbeatKind(fresh({ doneAttempts: 1 }), now, undefined, undefined, false, true)).toBe("none");
+    expect(heartbeatKind(fresh(), now, undefined, undefined, true, true)).toBe("none"); // a net owns it this sweep
+    expect(heartbeatKind(fresh({ ts: undefined as unknown as number }), now, undefined, undefined, false, true)).toBe("none");
+  });
+
+  test("pairingIsNew defaults to false, so every existing 5-argument call is unchanged", () => {
+    const now = 1_000_000 + 1_000;
+    expect(heartbeatKind(fresh(), now, undefined, undefined, false)).toBe("none");
+  });
+});
+
 describe("heartbeatKind (both cadences at once)", () => {
   const waiting = (over: Partial<SessionRecord> = {}): SessionRecord =>
     rec({ ts: 1_000_000, lastEvent: "needsAttention", op: "update", prio: 1, blob: "B", ...over });

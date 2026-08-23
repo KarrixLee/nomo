@@ -104,7 +104,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "2.1.23";
+var PLUGIN_VERSION = "2.1.24";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -4988,6 +4988,7 @@ function createLanHintPublisher(deps) {
   let lastSealed;
   let cachedHosts = [];
   let cachedAt = 0;
+  let pending = null;
   const hosts = (t) => {
     if (t - cachedAt < LAN_HOSTS_CACHE_MS && cachedAt !== 0)
       return cachedHosts;
@@ -5016,7 +5017,7 @@ function createLanHintPublisher(deps) {
           if (t - lastSentAt < LAN_HINT_REFRESH_MS)
             return;
           if (lastSealed) {
-            lastSentAt = t;
+            pending = { at: t, trace: { result: "hint", why: "refresh", port: addr.port, lid: addr.lid, hosts: list.length } };
             return lastSealed;
           }
         }
@@ -5025,11 +5026,20 @@ function createLanHintPublisher(deps) {
           return;
         lastState = state;
         lastSealed = sealed;
-        lastSentAt = t;
+        pending = { at: t, trace: { result: "hint", why: "changed", port: addr.port, lid: addr.lid, hosts: list.length } };
         return sealed;
       } catch {
+        pending = null;
         return;
       }
+    },
+    settle(delivered) {
+      const p = pending;
+      pending = null;
+      if (!p || !delivered)
+        return;
+      lastSentAt = p.at;
+      traceLan(deps, p.trace);
     }
   };
 }
@@ -8027,8 +8037,8 @@ function watchdogEventHeaders(config, approvals) {
 var activeLanListener;
 var lanHintPublisher = createLanHintPublisher({ address: () => activeLanListener?.address() ?? null });
 async function postEvent(config, body) {
+  const lanHint = await lanHintPublisher.take(config);
   try {
-    const lanHint = await lanHintPublisher.take(config);
     const payload = lanHint ? { ...body, lanHint } : body;
     const res = await fetch(`${config.url}/v1/cc/event`, {
       method: "POST",
@@ -8037,6 +8047,8 @@ async function postEvent(config, body) {
       signal: AbortSignal.timeout(2000)
     });
     const outcome = postOutcomeForStatus(res.status);
+    if (lanHint)
+      lanHintPublisher.settle(outcome === "delivered");
     if (outcome === "delivered") {
       try {
         bufferCommands(extractCommands(await res.json()));
@@ -8044,6 +8056,8 @@ async function postEvent(config, body) {
     }
     return outcome;
   } catch {
+    if (lanHint)
+      lanHintPublisher.settle(false);
     return "failed";
   }
 }
@@ -8975,11 +8989,29 @@ function shouldWaitingHeartbeat(record, now, lastWaitingBeat, correctedThisSweep
     return false;
   return true;
 }
-function heartbeatKind(record, now, lastHeartbeat, lastWaitingBeat, correctedThisSweep) {
+var greetedPairingId;
+function shouldGreetHeartbeat(record, now, pairingIsNew, correctedThisSweep) {
+  if (!pairingIsNew)
+    return false;
+  if (record.op === "done")
+    return false;
+  if (typeof record.doneAttempts === "number" && record.doneAttempts > 0)
+    return false;
+  if (isClaudeIdleReapEligible(record, now))
+    return false;
+  if (correctedThisSweep)
+    return false;
+  if (typeof record.ts !== "number")
+    return false;
+  return true;
+}
+function heartbeatKind(record, now, lastHeartbeat, lastWaitingBeat, correctedThisSweep, pairingIsNew = false) {
   if (shouldHeartbeat(record, now, lastHeartbeat, correctedThisSweep))
     return "stale";
   if (shouldWaitingHeartbeat(record, now, lastWaitingBeat, correctedThisSweep))
     return "waiting";
+  if (shouldGreetHeartbeat(record, now, pairingIsNew, correctedThisSweep))
+    return "greet";
   return "none";
 }
 async function pruneStaleDecisionHolds(files, deps = {}) {
@@ -9035,6 +9067,8 @@ async function sweep(config, deps = {}) {
   await pruneStaleDecisionHolds(files);
   let remaining = 0;
   let delivered = false;
+  const pairingIsNew = config !== null && config.pairingId !== greetedPairingId;
+  let greetDelivered = false;
   for (const file of files) {
     if (!file.endsWith(".json"))
       continue;
@@ -9139,7 +9173,7 @@ async function sweep(config, deps = {}) {
             repairedTitle = true;
           }
         }
-        const beatKind = heartbeatKind(record, now, heartbeatAt.get(sessionId), waitingBeatAt, idleFix === "corrected" || planResolutionHandled || interruptHandled || flaggedAttention || reapedIdle || repairedTitle);
+        const beatKind = heartbeatKind(record, now, heartbeatAt.get(sessionId), waitingBeatAt, idleFix === "corrected" || planResolutionHandled || interruptHandled || flaggedAttention || reapedIdle || repairedTitle, pairingIsNew);
         if (beatKind !== "none") {
           const beat = buildHeartbeatEnvelope(sessionId, record, Date.now(), config.pairingId);
           if (beat) {
@@ -9150,6 +9184,8 @@ async function sweep(config, deps = {}) {
               heartbeatAt.set(sessionId, now);
               if (beatKind === "waiting")
                 waitingBeatAt = now;
+              if (beatKind === "greet")
+                greetDelivered = true;
               delivered = true;
             }
           }
@@ -9180,6 +9216,8 @@ async function sweep(config, deps = {}) {
       await unlink4(path);
     } catch {}
   }
+  if (config !== null && greetDelivered)
+    greetedPairingId = config.pairingId;
   return { revoked: false, remaining, delivered };
 }
 async function goneStrikeShouldTeardown(goneStrikesPath) {
@@ -9545,6 +9583,7 @@ export {
   shouldInterruptCheck,
   shouldIdleProvisionalCheck,
   shouldHeartbeat,
+  shouldGreetHeartbeat,
   setCodexBridgeDown,
   retireDoneStale,
   resolveCodexTuiOwner,
