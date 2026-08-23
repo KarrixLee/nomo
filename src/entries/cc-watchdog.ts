@@ -32,7 +32,7 @@ import { readdir, readFile, unlink } from "node:fs/promises";
 import { readFileSync, statSync, unlinkSync } from "node:fs";
 import { hostname } from "node:os";
 import { basename } from "node:path";
-import { decryptBlob, encryptBlob } from "../core/crypto";
+import { Bytes, decryptBlob, encryptBlob } from "../core/crypto";
 import { adapterFor, AgentAdapter, allAdapters, codexAdapter, codexTurnActiveFromTail, CodexPlanPickerEvidence, DiscoveredSession } from "../core/adapter";
 import type { LocateTuiReason } from "../core/adapter";
 import { focusTerminalForPid } from "../core/terminal-focus";
@@ -47,7 +47,7 @@ import { resolveOnRelay } from "../core/codex-remote-input";
 import { CODEX_PROXY_STDOUT_ENDED } from "../core/codex-proxy-transport";
 import type { CodexAppServerSocketState, DecisionHold, PlanPickerTraceDecision } from "../core/shared";
 import {
-  AgentKind, appendCodexBridgeMarker, appendFittedPlanAndDebug, atomicWrite, CC_DIR, CCOp, CCStatus, codexAppServerSocketAvailable, codexAppServerSocketState, Config, completePendingPairing, DECISION_HOLD_SUFFIX, decisionHoldFileName, formatPlanPickerDebug, formatWatchdogPidfile,
+  AgentKind, AgentKindWire, appendCodexBridgeMarker, appendFittedPlanAndDebug, atomicWrite, CC_DIR, CCOp, CCStatus, codexAppServerSocketAvailable, codexAppServerSocketState, Config, completePendingPairing, DECISION_HOLD_SUFFIX, decisionHoldFileName, formatPlanPickerDebug, formatWatchdogPidfile,
   startCodexAppServerDaemon,
   GONE_STRIKE_LIMIT, loadConfig, loadPendingConfig, localApprovalsState,
   PAIR_HTML_FILE, PairPollResult, parseWatchdogPidfile, PendingConfig, pidAlive, PLUGIN_VERSION, readDecisionHoldAt, readPrefix, readSuffix, recordGoneStrike, removeRevokedConfig,
@@ -263,6 +263,18 @@ export function buildEndEnvelope(sessionId: string, now: number, record?: Sessio
   };
 }
 
+/** The plan a REBUILT blob should restate: the record's parked copy for an agent whose plan is
+ *  ambient session state (OpenCode's live todo list), and nothing at all for everyone else.
+ *
+ *  Per-agent behaviour comes from the adapter, never an inline `agent === …` branch in this daemon —
+ *  the same rule `blobAgentFields` follows. Claude's and Codex's `planFull` is a one-shot ExitPlanMode
+ *  / update_plan proposal owned by ONE attention episode (only buildNeedsAttentionEnvelope passes a
+ *  plan, and it is handed one explicitly), so they keep the `undefined` these builders always passed
+ *  and their frames stay byte-identical. */
+function ambientPlan(agent: AgentKindWire, record: SessionRecord): string | undefined {
+  return adapterFor(agent).ambientPlan ? record.planFull : undefined;
+}
+
 /** The interrupt-corrective envelope: a v2 op:done carrying a freshly-encrypted blob with status
  *  "done" and the record's machine/label (coerced to "" if a corrupt record dropped them). title is
  *  the record's cached last non-empty title (the hook stamps it on every emit) — the watchdog has no
@@ -273,7 +285,7 @@ export function buildEndEnvelope(sessionId: string, now: number, record?: Sessio
  *  record's cached `turnStartedAt` (epoch seconds, stamped by the turn's UserPromptSubmit) is
  *  likewise restamped into the rebuilt blob — omitted when unknown — so the island's frozen
  *  "done in Xm" keeps measuring the TURN, exactly as a hook-built done blob would. */
-export async function buildDoneEnvelope(sessionId: string, record: SessionRecord, now: number, e2eKey: Uint8Array, agent: AgentKind = "claude", at?: number, dbg?: string): Promise<object> {
+export async function buildDoneEnvelope(sessionId: string, record: SessionRecord, now: number, e2eKey: Bytes, agent: AgentKindWire = "claude", at?: number, dbg?: string): Promise<object> {
   // The folder's LIVE branch, re-READ (not restamped like the keys above): the paths it reads are
   // pinned on the record, but HEAD is current state — a `git checkout` since the last hook must reach
   // the phone. Omitted when the record predates the pin or the folder is not a repo.
@@ -305,7 +317,11 @@ export async function buildDoneEnvelope(sessionId: string, record: SessionRecord
     agent === "codex" ? dbg ?? formatPlanPickerDebug({ event: "done", classifier: "done", marker: "0", by: "wd" }) : undefined,
     codexBridgeIsDown(),
   );
-  const blob = await encryptBlob(e2eKey, appendFittedPlanAndDebug(base, undefined, debug));
+  // The record's parked plan, restated ONLY for an agent whose plan is ambient session state (see
+  // AgentAdapter.ambientPlan — OpenCode's live todo list). Claude/Codex plans are one-shot proposals
+  // tied to an attention episode, so their correctives keep passing the `undefined` they always have
+  // and stay byte-identical.
+  const blob = await encryptBlob(e2eKey, appendFittedPlanAndDebug(base, ambientPlan(agent, record), debug));
   return { v: 2, sessionId, op: "done", prio: 0, ts: now, blob, ...startedAtField(record) };
 }
 
@@ -320,8 +336,8 @@ export async function buildDoneEnvelope(sessionId: string, record: SessionRecord
  *  A recovered Codex request_user_input additionally carries clear `attentionKind:"userInput"`; plain
  *  permission approvals omit it so the server can end an older decision episode without cross-talk. */
 export async function buildNeedsAttentionEnvelope(
-  sessionId: string, record: SessionRecord, now: number, e2eKey: Uint8Array,
-  agent: AgentKind = "claude", at?: number, detail?: string, attentionKind?: "userInput", proposedPlan?: string,
+  sessionId: string, record: SessionRecord, now: number, e2eKey: Bytes,
+  agent: AgentKindWire = "claude", at?: number, detail?: string, attentionKind?: "userInput", proposedPlan?: string,
   dbg?: string,
 ): Promise<object> {
   // Re-read live, exactly as buildDoneEnvelope does (see there).
@@ -368,7 +384,7 @@ export async function buildNeedsAttentionEnvelope(
  *  (not a verbatim heartbeat). It intentionally carries no attentionKind: op:update/prio:0 closes the
  *  attention episode and returns the session to its ordinary in-flight state. */
 export async function buildWorkingEnvelope(
-  sessionId: string, record: SessionRecord, now: number, e2eKey: Uint8Array, agent: AgentKind = "claude", dbg?: string,
+  sessionId: string, record: SessionRecord, now: number, e2eKey: Bytes, agent: AgentKindWire = "claude", dbg?: string,
 ): Promise<Record<string, unknown>> {
   // Re-read live, exactly as buildDoneEnvelope does (see there).
   const branch = sessionBranch(record);
@@ -389,7 +405,8 @@ export async function buildWorkingEnvelope(
     agent === "codex" ? dbg ?? formatPlanPickerDebug({ event: "working", classifier: "resolved", marker: "0", by: "wd" }) : undefined,
     codexBridgeIsDown(),
   );
-  const blob = await encryptBlob(e2eKey, appendFittedPlanAndDebug(base, undefined, debug));
+  // The record's parked plan for an ambient-plan agent only — see buildDoneEnvelope's note.
+  const blob = await encryptBlob(e2eKey, appendFittedPlanAndDebug(base, ambientPlan(agent, record), debug));
   return { v: 2, sessionId, op: "update", prio: 0, ts: now, blob, ...startedAtField(record) };
 }
 
@@ -604,7 +621,7 @@ export async function correctResolvedPlanPicker(
     if (tuiPid !== undefined && !(deps.pidAlive ?? pidAlive)(tuiPid)) {
       return await settlePendingPlanPickerDone(config, path, sessionId, snapshot, now, deps, "exit");
     }
-    const agent: AgentKind = snapshot.agent === "codex" ? "codex" : "claude";
+    const agent: AgentKindWire = recordAgent(snapshot);
     const adapter = adapterFor(agent);
     if (!adapter.completedTurnWaitState) return "uncorrected";
     const state = await (deps.state ?? (() => adapter.completedTurnWaitState!({
@@ -994,11 +1011,13 @@ const lanHintPublisher = createLanHintPublisher({ address: () => activeLanListen
  *  `revoked` (the definitive pairing-is-gone signal, keyed on the server's own not-found response).
  *  Any network error / timeout is a transient `failed`. Best-effort: never throws across its boundary. */
 async function postEvent(config: Config, body: object): Promise<PostOutcome> {
+  // The LAN listener's sealed host hint rides along on the POSTs this daemon already makes — no new
+  // request is ever issued for discovery, and `take` returns undefined unless the hint actually
+  // changed or its 5-minute refresh came due (so the overwhelming majority of POSTs are untouched).
+  // Hoisted out of the try so the catch below can settle it: a hint on a POST that threw is NOT
+  // published, and must be re-attached to the next one.
+  const lanHint = await lanHintPublisher.take(config);
   try {
-    // The LAN listener's sealed host hint rides along on the POSTs this daemon already makes — no new
-    // request is ever issued for discovery, and `take` returns undefined unless the hint actually
-    // changed or its 5-minute refresh came due (so the overwhelming majority of POSTs are untouched).
-    const lanHint = await lanHintPublisher.take(config);
     const payload = lanHint ? { ...body, lanHint } : body;
     const res = await fetch(`${config.url}/v1/cc/event`, {
       method: "POST",
@@ -1007,6 +1026,10 @@ async function postEvent(config: Config, body: object): Promise<PostOutcome> {
       signal: AbortSignal.timeout(2000),
     });
     const outcome = postOutcomeForStatus(res.status);
+    // Tell the hint publisher what became of the hint this POST carried. A hint handed to a POST that
+    // failed must NOT count as published — see LanHintPublisher.settle. `revoked` settles as undelivered
+    // too: the pairing is gone, so nothing was advertised to anyone.
+    if (lanHint) lanHintPublisher.settle(outcome === "delivered");
     // A 2xx MAY piggyback queued phone→Mac commands (see the command-intake section below). The
     // worker consumes them as it answers, so this response is the ONLY time we will ever see them —
     // buffer them here and let the sweep loop execute them off the POST path. Best-effort: a
@@ -1017,6 +1040,8 @@ async function postEvent(config: Config, body: object): Promise<PostOutcome> {
     }
     return outcome;
   } catch {
+    // fetch threw (timeout, DNS, offline) — the hint never reached the wire.
+    if (lanHint) lanHintPublisher.settle(false);
     return "failed";
   }
 }
@@ -1593,7 +1618,7 @@ async function readAllRecords(): Promise<SessionRecord[]> {
  *  idle TUI advertised as working stuck "Running" on the phone forever (the v0.8.4 idle-TUI fix; see
  *  codexTurnActiveFromTail in adapter.ts). */
 export async function buildProvisionalBlob(
-  d: DiscoveredSession, machine: string, blobAgentFields: { agent?: AgentKind }, e2eKey: Uint8Array, at?: number,
+  d: DiscoveredSession, machine: string, blobAgentFields: { agent?: AgentKindWire }, e2eKey: Bytes, at?: number,
 ): Promise<string> {
   // The discovered cwd's LIVE branch. Resolved from `d.cwd` (the discovery has no cached git dir yet —
   // buildProvisionalRecord pins one for every later frame), so a discovered row shows its branch from
@@ -1639,7 +1664,7 @@ export function buildStartEnvelope(sessionId: string, blob: string, now: number)
  *  nets all treat it as finished — exactly what was advertised. The discovery title (cwd basename) is
  *  cached like trackSession's, so a later corrective done never regresses to title:"" (v0.8.3 rule). */
 export function buildProvisionalRecord(
-  d: DiscoveredSession, machine: string, blob: string, blobAgentFields: { agent?: AgentKind }, now: number,
+  d: DiscoveredSession, machine: string, blob: string, blobAgentFields: { agent?: AgentKindWire }, now: number,
   pairingId?: string, idle = false,
 ): SessionRecord {
   // The git dir of the discovered cwd, resolved ONCE here and pinned like the folder key: every later
@@ -1723,9 +1748,11 @@ export async function discoverLiveSessions(config: Config, deps: DiscoverDeps = 
   }
 }
 
-/** The agent a record belongs to (absent → claude, the historical default). */
-function recordAgent(record: SessionRecord): AgentKind {
-  return record.agent === "codex" ? "codex" : "claude";
+/** The agent a record belongs to (absent → claude, the historical default). WIRE-wide: a record this
+ *  daemon rebuilds may have been written by a NEWER peer install whose agent kinds this build does not
+ *  know, and that literal must reach adapterFor intact rather than be flattened to claude here. */
+function recordAgent(record: SessionRecord): AgentKindWire {
+  return record.agent ?? "claude";
 }
 
 /** The sentinel ids of PROVISIONAL records whose pid is now also held by a REAL (non-provisional) record
@@ -1864,8 +1891,15 @@ const INTERRUPT_DONE_MAX_ATTEMPTS = 5;
 
 /** Whether the transcript tail shows the last turn was interrupted, for the given agent — a thin
  *  wrapper over the session adapter's detectInterrupt (the two agents' detections differ; see
- *  adapter.ts). Kept exported so the per-agent detection stays unit-testable through "./cc-watchdog". */
-export function tailShowsInterrupt(tail: string, agent: AgentKind): boolean {
+ *  adapter.ts). Kept exported so the per-agent detection stays unit-testable through "./cc-watchdog".
+ *
+ *  WIRE-typed on purpose (see AgentKindWire): the only caller reads the agent off a session record a
+ *  NEWER peer install may have stamped. An unrecognised kind gets adapterFor's passthrough adapter,
+ *  whose detectInterrupt is `false` — we have no transcript format for an agent we do not implement,
+ *  so the honest answer is "no interrupt seen", and this net simply declines to correct that session
+ *  (its dead-pid reap and staleness eviction are unaffected). Coercing to claude here would run
+ *  CLAUDE's marker detection over a foreign transcript and could fire a `done` at a LIVE turn. */
+export function tailShowsInterrupt(tail: string, agent: AgentKindWire): boolean {
   return adapterFor(agent).detectInterrupt(tail);
 }
 
@@ -1953,7 +1987,7 @@ export async function correctInterrupt(
       // we land here, and the session is simply left for its dead-pid reap / staleness eviction.
       return "uncorrected";
     }
-    const agent: AgentKind = record.agent === "codex" ? "codex" : "claude";
+    const agent: AgentKindWire = recordAgent(record);
     if (!tailShowsInterrupt(tail, agent)) return "uncorrected"; // live turn or no interrupt → leave it
     // THE LIVE-HOLD GATE (see decisionHoldIsLive). A remote approval is open on THIS session, so the
     // interrupt marker in the tail describes an earlier abort, not the prompt the user is looking at —
@@ -2071,7 +2105,7 @@ export async function correctPendingApproval(
     ?? ((p: string, rec: SessionRecord) => atomicWrite(p, JSON.stringify(rec), 0o600));
   const clock = deps.now ?? Date.now;
   try {
-    const agent: AgentKind = record.agent === "codex" ? "codex" : "claude";
+    const agent: AgentKindWire = recordAgent(record);
     const adapter = adapterFor(agent);
     if (!shouldPendingApprovalCheck(record, adapter)) return "uncorrected";
     let tail: string;
@@ -2152,7 +2186,7 @@ export function shouldIdleProvisionalCheck(record: SessionRecord, adapter: Agent
  *  same verdict triple as the other nets ("corrected" → the caller must not also heartbeat it). */
 async function correctIdleProvisional(config: Config, path: string, sessionId: string, record: SessionRecord): Promise<"corrected" | "uncorrected" | "revoked"> {
   try {
-    const agent: AgentKind = record.agent === "codex" ? "codex" : "claude";
+    const agent: AgentKindWire = recordAgent(record);
     const adapter = adapterFor(agent);
     if (!shouldIdleProvisionalCheck(record, adapter)) return "uncorrected";
     let active = false;
@@ -2221,12 +2255,16 @@ const CLAUDE_IDLE_REAP_MAX_ATTEMPTS = 5;
 
 /** Whether a KEPT (alive) session is an idle CLAUDE session past the reap threshold — the shared predicate
  *  the reap net and the heartbeat guard BOTH key on, so the two always agree (a session the reaper wants to
- *  finish is never simultaneously heartbeated back to "working"). True iff: it's a Claude session (codex has
- *  its own discovery / idle-provisional + notify-backstop machinery, so it's left to those), not a
+ *  finish is never simultaneously heartbeated back to "working"). True iff: it's a Claude session, not a
  *  provisional discovery row, its last REAL event was a plain `working` update or a bare `sessionStart` (a
  *  resumed session that fired SessionStart then nothing — never `needsAttention`, which can legitimately sit
  *  >30 min awaiting a permission answer, nor `done`, already finished), and record.ts is older than
- *  CLAUDE_IDLE_REAP_MS. Pure so the whole matrix is unit-testable. */
+ *  CLAUDE_IDLE_REAP_MS. Pure so the whole matrix is unit-testable.
+ *
+ *  THE AGENT GATE IS "claude ONLY", never "not codex": this 30-min clock is a HEURISTIC, and every other
+ *  agent is excluded because it owns an authoritative end signal instead (codex: discovery /
+ *  idle-provisional + the notify backstop; opencode: the plugin's `session.idle` event). Guessing "done"
+ *  over one of those is a lie, not a backstop — a quiet-but-live session would be marked finished. */
 /** Default transcript-mtime reader for the reap guard: epoch-ms mtime, undefined on any error. */
 function transcriptMtimeMsDefault(path: string): number | undefined {
   try { return statSync(path).mtimeMs; } catch { return undefined; }
@@ -2236,7 +2274,7 @@ export function isClaudeIdleReapEligible(
   record: SessionRecord, now: number,
   transcriptMtimeMs: (path: string) => number | undefined = transcriptMtimeMsDefault,
 ): boolean {
-  if (record.agent === "codex") return false;
+  if (recordAgent(record) !== "claude") return false;
   if (record.provisional === true) return false;
   return idleReapAgeEligible(record, now, transcriptMtimeMs);
 }
@@ -2311,7 +2349,7 @@ export async function correctIdleClaude(
     ?? ((p: string, rec: SessionRecord) => atomicWrite(p, JSON.stringify(rec), 0o600));
   const clock = deps.now ?? Date.now;
   try {
-    const agent: AgentKind = record.agent === "codex" ? "codex" : "claude";
+    const agent: AgentKindWire = recordAgent(record);
     if (agent === "codex") {
       // Sound Codex equivalent: clock silence alone is insufficient because record.pid may be the
       // immortal app-server and a legitimate long turn can be hook-quiet. Require all three pieces:
@@ -2496,7 +2534,7 @@ export async function correctPendingDone(
       traceFocus(deps, { event: "pending-done", sessionId, outcome: "held", delivered: false, held: true });
       return "pending";
     }
-    const agent: AgentKind = record.agent === "codex" ? "codex" : "claude";
+    const agent: AgentKindWire = recordAgent(record);
     // The settled record: the debt dropped and the terminal done state pinned (the hook already wrote
     // these, but a watchdog rewrite between then and now could have moved them — pin explicitly). It is
     // only ever written after the stale-snapshot guard proves the record hasn't moved under us.
@@ -2758,7 +2796,7 @@ function statusFromRecord(record: SessionRecord): CCStatus {
  *  session_index thread_name existed and then had every later hook dropped. Loses only the transient tool
  *  `detail` sub-status (never cached on the record) — restored by the next real hook. */
 export async function buildTitleRepairEnvelope(
-  sessionId: string, record: SessionRecord, title: string, now: number, e2eKey: Uint8Array, agent: AgentKind = "codex", at?: number,
+  sessionId: string, record: SessionRecord, title: string, now: number, e2eKey: Bytes, agent: AgentKindWire = "codex", at?: number,
 ): Promise<{ v: 2; sessionId: string; op: CCOp; prio: 0 | 1; ts: number; blob: string; startedAt?: number }> {
   // Re-read live, exactly as buildDoneEnvelope does (see there).
   const branch = sessionBranch(record);
@@ -2934,16 +2972,67 @@ export function shouldWaitingHeartbeat(
   return true;
 }
 
+// --- Fresh-pairing greet beat (the just-paired latency floor) ----------------------------------
+//
+// A brand-new pairing starts EMPTY, and nothing in the sweep fills it: every net above no-ops on a
+// healthy row, and the staleness heartbeat is gated on `now - record.ts >= HEARTBEAT_AFTER_MS`
+// (5 min) — so a session that fired hooks seconds ago (the one that just ran the pair command, which
+// is the overwhelmingly common case) sends NOTHING to the new pairing until the user's next prompt.
+// The app renders that gap as a spinner: its `isSyncing` holds while the pairing has no sessions and
+// still carries the "Computer" placeholder name, for a 120 s fresh window.
+//
+// This was masked until 2026-08-23. Pairing itself used to take just under 60 s (Workers KV's 60 s
+// per-colo read cache — see server/src/pairing-window.ts), and that stall ran CONCURRENTLY with this
+// wait, so by the time pairing reported success the first envelope had usually landed. Making pairing
+// fast (~12 s) did not create this delay, it merely stopped hiding it.
+//
+// The fix is one unthrottled beat per pairing per daemon run. It reuses the existing heartbeat
+// envelope (the record's last blob, unchanged op/prio) so it can never alter state, and it keeps
+// every ownership guard the other beats enforce. Two things ride on it:
+//   - the app's spinner clears on its next 3 s poll instead of on the user's next prompt;
+//   - the LAN hint travels ONLY as a passenger on /cc/event (createLanHintPublisher in
+//     core/lan-listener.ts attaches it, it has no request of its own), so the greet beat is also
+//     what gets the Mac's address to a freshly paired phone without waiting out the 5 min cadence.
+//
+// SCOPE — "new" means new TO THIS PROCESS, not new in wall-clock: Config carries no createdAt, and a
+// pairing age is not worth persisting for this. The cost of that approximation is exactly one extra
+// POST per daemon start on an already-paired machine, against a 300-per-60 s-per-pairing budget.
+
+/** The pairing this daemon has already greeted (in-memory, like waitingBeatAt). Undefined until the
+ *  first sweep that finds a config, so the greet fires once and never again for that pairing. */
+let greetedPairingId: string | undefined;
+
+/** Should this session carry the pairing's one-shot greet beat? Deliberately skips BOTH quiet gates
+ *  (`record.ts` freshness and the per-session throttle) — a just-paired phone needs the envelope the
+ *  session's recent hook activity is the very reason it would otherwise not get. Every OWNERSHIP
+ *  guard shouldHeartbeat enforces still applies unchanged: a terminal row, a net that took the
+ *  session this sweep, an in-flight corrective done, and an idle-reap-eligible Claude row all stand
+ *  down, so the greet can never resurrect a session the other nets are retiring. */
+export function shouldGreetHeartbeat(record: SessionRecord, now: number, pairingIsNew: boolean, correctedThisSweep: boolean): boolean {
+  if (!pairingIsNew) return false;
+  if (record.op === "done") return false;
+  if (typeof record.doneAttempts === "number" && record.doneAttempts > 0) return false;
+  if (isClaudeIdleReapEligible(record, now)) return false;
+  if (correctedThisSweep) return false;
+  if (typeof record.ts !== "number") return false;
+  return true;
+}
+
 /** Which heartbeat (if any) this session gets this sweep. The stale beat wins when both apply, so a
  *  waiting session that has ALSO been quiet for five minutes still only sends one POST. Pure — the
- *  whole cadence matrix is unit-testable without fs/network. */
-export type HeartbeatKind = "none" | "stale" | "waiting";
+ *  whole cadence matrix is unit-testable without fs/network.
+ *
+ *  `pairingIsNew` is optional and last so every existing 5-argument call — and every existing test —
+ *  keeps its exact behaviour (undefined → no greet). */
+export type HeartbeatKind = "none" | "stale" | "waiting" | "greet";
 export function heartbeatKind(
   record: SessionRecord, now: number, lastHeartbeat: number | undefined,
-  lastWaitingBeat: number | undefined, correctedThisSweep: boolean,
+  lastWaitingBeat: number | undefined, correctedThisSweep: boolean, pairingIsNew = false,
 ): HeartbeatKind {
   if (shouldHeartbeat(record, now, lastHeartbeat, correctedThisSweep)) return "stale";
   if (shouldWaitingHeartbeat(record, now, lastWaitingBeat, correctedThisSweep)) return "waiting";
+  // Last: a session that already earns a stale/waiting beat needs no second POST to say the same thing.
+  if (shouldGreetHeartbeat(record, now, pairingIsNew, correctedThisSweep)) return "greet";
   return "none";
 }
 
@@ -3043,6 +3132,11 @@ async function sweep(config: Config | null, deps: SweepDeps = {}): Promise<Sweep
   // Any 2xx POST this sweep proves the pairing is alive → the loop resets the gone-strike streak, so a
   // real success from EITHER the watchdog or the hook clears a stray transient strike.
   let delivered = false;
+  // The one-shot greet beat for a pairing this daemon has not yet fed (see shouldGreetHeartbeat).
+  // Claimed only on DELIVERY, below: a greet whose POST failed must be retried on the next sweep —
+  // a wifi flap at pair time is exactly the case this exists to cover.
+  const pairingIsNew = config !== null && config.pairingId !== greetedPairingId;
+  let greetDelivered = false;
   for (const file of files) {
     if (!file.endsWith(".json")) continue;
     const path = `${SESSIONS_DIR}/${file}`;
@@ -3169,6 +3263,7 @@ async function sweep(config: Config | null, deps: SweepDeps = {}): Promise<Sweep
         const beatKind = heartbeatKind(
           record, now, heartbeatAt.get(sessionId), waitingBeatAt,
           idleFix === "corrected" || planResolutionHandled || interruptHandled || flaggedAttention || reapedIdle || repairedTitle,
+          pairingIsNew,
         );
         if (beatKind !== "none") {
           const beat = buildHeartbeatEnvelope(sessionId, record, Date.now(), config.pairingId);
@@ -3181,6 +3276,7 @@ async function sweep(config: Config | null, deps: SweepDeps = {}): Promise<Sweep
             if (outcome === "delivered") {
               heartbeatAt.set(sessionId, now); // a fast beat IS a heartbeat — it advances both clocks
               if (beatKind === "waiting") waitingBeatAt = now;
+              if (beatKind === "greet") greetDelivered = true;
               delivered = true;
             }
           }
@@ -3218,6 +3314,9 @@ async function sweep(config: Config | null, deps: SweepDeps = {}): Promise<Sweep
       // Already gone (raced with another sweep or a SessionEnd hook) — fine.
     }
   }
+  // Claim the greet only once an envelope actually landed. With no sessions on disk there is nothing
+  // to greet WITH, so the flag stays unclaimed and the very first session to appear gets the beat.
+  if (config !== null && greetDelivered) greetedPairingId = config.pairingId;
   return { revoked: false, remaining, delivered };
 }
 

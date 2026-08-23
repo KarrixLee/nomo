@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test } from "bun:test";
@@ -251,6 +251,19 @@ describe("repairNotifyWiring", () => {
     expect(after).toContain('model_reasoning_effort = "high"');
     expect(after).toContain("[mcp_servers.example]");
     expect(after).toContain("notifications = true");
+  });
+
+  test("a 0600 config.toml (may hold MCP keys) keeps 0600 after the repair rewrite", async () => {
+    const dead = "/Users/x/.codex/plugins/cache/nomo/nomo/1.7.7/scripts/notify-chain.sh";
+    const deadMjs = "/Users/x/.codex/plugins/cache/nomo/nomo/1.7.7/dist/codex-notify.mjs";
+    const { tomlPath, home } = await scratch(notifyLine([dead, deadMjs]));
+    await chmod(tomlPath, 0o600);
+
+    expect(await repairNotifyWiring({ tomlPath, home })).toBe("repaired");
+    // The rewritten config and the backup both keep the private mode — atomicWrite's rename would have
+    // dropped it to 0644 without an explicit mode arg.
+    expect((await stat(tomlPath)).mode & 0o777).toBe(0o600);
+    expect((await stat(`${tomlPath}.bak-nomo`)).mode & 0o777).toBe(0o600);
   });
 
   test("a non-nomo previous-notify payload survives VERBATIM through the repair", async () => {

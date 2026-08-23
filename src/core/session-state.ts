@@ -23,7 +23,7 @@
 
 import { adapterFor } from "./adapter";
 import { appendFittedPlanAndDebug, formatPlanPickerDebug, sessionBranch } from "./shared";
-import type { AgentKind, CCStatus, DecisionHold, SessionRecord } from "./shared";
+import type { AgentKindWire, CCStatus, DecisionHold, SessionRecord } from "./shared";
 
 /** The 24 h abandonment cap — cc-watchdog's SESSION_STALE_MS, mirrored (an entry module must not be
  *  imported from core/). Past it the sweep retires the record; rank 1 calls the session ended at the
@@ -273,7 +273,7 @@ export interface SessionState {
   ts: number;
   why: SessionStateWhy;
   blob: SessionStateBlob;
-  agent: AgentKind;
+  agent: AgentKindWire;
   startedAt?: number;
   /** The CLEAR discriminator that says this attention episode is a QUESTION ("the model is asking YOU
    *  something" — Codex's `request_user_input`) rather than a plain permission approval. It rides the
@@ -337,7 +337,7 @@ const filled = (value: unknown): value is string => typeof value === "string" &&
 export function buildStatePlaintext(
   record: SessionRecord, status: CCStatus, at: number, titleFallback?: string,
 ): Record<string, unknown> {
-  const agent: AgentKind = record.agent === "codex" ? "codex" : "claude";
+  const agent: AgentKindWire = record.agent ?? "claude";
   // The folder's LIVE branch, re-read from the record's pinned paths — the same thing the watchdog's
   // corrective builders do for the worker leg, so the two frames stay textually identical.
   const branch = sessionBranch(record);
@@ -366,7 +366,11 @@ export function buildStatePlaintext(
       by: "wd",
     })
     : undefined;
-  return appendFittedPlanAndDebug(base, undefined, dbg);
+  // The record's parked plan, but ONLY for an agent whose plan is AMBIENT session state (OpenCode's
+  // live todo list). A Claude/Codex `planFull` belongs to one attention episode, so restating it here
+  // would put a stale proposal on a working/done row — every non-ambient agent keeps the
+  // byte-identical `undefined` this has always passed. See AgentAdapter.ambientPlan.
+  return appendFittedPlanAndDebug(base, adapterFor(agent).ambientPlan ? record.planFull : undefined, dbg);
 }
 
 /** Is this `.hold` marker LIVE? Marker present with a blob, holder pid alive, inside the TTL.
@@ -428,7 +432,7 @@ export function computeSessionState(input: SessionStateInput): SessionState | nu
   // with no pairingId is UNKNOWN, never assumed — same rule.
   if (pairingId === undefined || record.pairingId !== pairingId) return null;
 
-  const agent: AgentKind = record.agent === "codex" ? "codex" : "claude";
+  const agent: AgentKindWire = record.agent ?? "claude";
   const ts = finite(record.ts) ? record.ts : now;
   const startedAt = finite(record.sessionStartedAt) ? { startedAt: record.sessionStartedAt } : {};
   const sealed = { kind: "sealed" as const, value: record.blob };
@@ -448,9 +452,10 @@ export function computeSessionState(input: SessionStateInput): SessionState | nu
   if (!pidAlive) return of("ended", "reap", sealed, ts, true);
 
   // --- CC's opinion, gated ------------------------------------------------------------------------
-  // NEVER consulted for Codex (no equivalent file exists) nor for a PROVISIONAL row (which has no
-  // trustworthy CC-file join). Those stay on the record-only path by construction, and Codex says so
-  // on the wire through the `/cx` suffix.
+  // CLAUDE ONLY. The CC session file is Claude Code's own; no other agent has an equivalent, so a
+  // non-claude row joined against it would read another process's status. Nor is it consulted for a
+  // PROVISIONAL row (which has no trustworthy CC-file join). Those stay on the record-only path by
+  // construction, and Codex says so on the wire through the `/cx` suffix.
   const ccUsable = agent === "claude" && record.provisional !== true;
   const opinion = ccUsable
     ? ccOpinion(cc, { pid: record.pid, sessionId, procStartedAt: ccProcStartedAt }, now)

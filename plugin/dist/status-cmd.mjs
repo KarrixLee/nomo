@@ -104,7 +104,7 @@ async function sha256Hex(s) {
 }
 
 // src/core/shared.ts
-var PLUGIN_VERSION = "2.1.0";
+var PLUGIN_VERSION = "2.2.0";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -401,6 +401,13 @@ async function startCodexAppServerDaemon(deps = {}) {
 function lastHookPath(agent) {
   return `${CC_DIR}/last-hook-${agent}`;
 }
+function opencodeStubPaths() {
+  const base = `${process.env.XDG_CONFIG_HOME || `${process.env.HOME}/.config`}/opencode`;
+  return [`${base}/plugins/nomo.js`, `${base}/plugin/nomo.js`];
+}
+function opencodeStubTarget(text) {
+  return /^export \{ default \} from "(.+)";$/m.exec(text)?.[1];
+}
 var FOLDER_KEY_HEX_CHARS = 12;
 var BRANCH_MAX_CHARS = 60;
 var GIT_DIR_WALK_MAX_DEPTH = 64;
@@ -644,7 +651,7 @@ async function flushPendingStash(stashPath, url, pairingId, pcSecret, e2eKey, no
           op: stash.op,
           prio: stash.prio,
           blob,
-          ...stash.blob.agent === "codex" ? { agent: "codex" } : {},
+          ...stash.blob.agent && stash.blob.agent !== "claude" ? { agent: stash.blob.agent } : {},
           ...typeof stash.blob.title === "string" && stash.blob.title.length > 0 ? { title: stash.blob.title } : {},
           ...typeof stash.blob.model === "string" && stash.blob.model.length > 0 ? { model: stash.blob.model } : {},
           ...pairingId.length > 0 ? { pairingId } : {}
@@ -745,6 +752,26 @@ function watchdogBuildDiffers(incumbent, current) {
     return false;
   return incumbent !== current;
 }
+function watchdogVersionOutranks(mine, incumbent) {
+  if (incumbent === undefined)
+    return true;
+  const parse = (v) => {
+    const core = v.trim().split("+")[0].split("-")[0];
+    if (core.length === 0)
+      return;
+    const parts = core.split(".").map((p) => /^\d+$/.test(p) ? Number(p) : Number.NaN);
+    return parts.some((n) => !Number.isFinite(n)) ? undefined : parts;
+  };
+  const a = parse(mine), b = parse(incumbent);
+  if (a === undefined || b === undefined)
+    return false;
+  for (let i = 0;i < Math.max(a.length, b.length); i++) {
+    const x = a[i] ?? 0, y = b[i] ?? 0;
+    if (x !== y)
+      return x > y;
+  }
+  return false;
+}
 function formatWatchdogPidfile(pid, version = PLUGIN_VERSION, build) {
   return `${pid} ${version}${typeof build === "string" && build.length > 0 ? ` ${build}` : ""}`;
 }
@@ -774,7 +801,7 @@ function watchdogHolderIsLive(pid, deps = {}) {
 function ensureWatchdog(deps = {}) {
   try {
     if (process.env.NOMO_SKIP_WATCHDOG === "1")
-      return;
+      return false;
     const pidPath = deps.pidPath ?? WATCHDOG_PID_PATH;
     const version = deps.version ?? PLUGIN_VERSION;
     const build = "build" in deps ? deps.build : watchdogBuildStamp();
@@ -793,14 +820,21 @@ function ensureWatchdog(deps = {}) {
     const raw = readPidfile();
     const holder = typeof raw === "string" ? parseWatchdogPidfile(raw) : null;
     if (holder && watchdogHolderIsLive(holder.pid, deps)) {
-      if (holder.version === version && !watchdogBuildDiffers(holder.build, build))
-        return;
+      if (holder.version === version) {
+        if (!watchdogBuildDiffers(holder.build, build))
+          return true;
+      } else if (!watchdogVersionOutranks(version, holder.version)) {
+        return true;
+      }
       try {
         killPid(holder.pid, "SIGTERM");
       } catch {}
     }
     spawnWatchdog();
-  } catch {}
+    return false;
+  } catch {
+    return false;
+  }
 }
 async function readRecord(sessionId, sessionsDir = SESSIONS_DIR) {
   try {
@@ -831,20 +865,23 @@ async function writeDecisionHoldAt(sessionsDir, sessionId, hold) {
     await atomicWrite(`${sessionsDir}/${decisionHoldFileName(sessionId)}`, JSON.stringify(hold), 384);
   } catch {}
 }
-async function clearDecisionHoldAt(sessionsDir, sessionId, pid, beforeUnlink) {
+async function clearDecisionHoldAt(sessionsDir, sessionId, pid, beforeUnlink, holdId) {
   const path = `${sessionsDir}/${decisionHoldFileName(sessionId)}`;
   try {
     const raw = await readFile(path, "utf8").catch(() => {
       return;
     });
     if (raw !== undefined) {
-      let owner;
+      let marker;
       try {
-        owner = JSON.parse(raw).pid;
+        marker = JSON.parse(raw);
       } catch {
-        owner = undefined;
+        marker = undefined;
       }
+      const owner = marker?.pid;
       if (typeof owner === "number" && owner !== pid)
+        return false;
+      if (holdId !== undefined && typeof marker?.holdId === "string" && marker.holdId !== holdId)
         return false;
     }
     if (beforeUnlink !== undefined) {
@@ -878,8 +915,8 @@ async function readDecisionHoldAt(sessionsDir, sessionId) {
 async function writeDecisionHold(sessionId, hold) {
   return writeDecisionHoldAt(SESSIONS_DIR, sessionId, hold);
 }
-async function clearDecisionHold(sessionId, pid, beforeUnlink) {
-  return clearDecisionHoldAt(SESSIONS_DIR, sessionId, pid, beforeUnlink);
+async function clearDecisionHold(sessionId, pid, beforeUnlink, holdId) {
+  return clearDecisionHoldAt(SESSIONS_DIR, sessionId, pid, beforeUnlink, holdId);
 }
 async function settleDecisionHoldRecord(sessionId, patch) {
   return settleDecisionHoldRecordAt(SESSIONS_DIR, sessionId, patch);
@@ -1051,11 +1088,16 @@ function recordTitleMatchesPane(recordTitle, paneTitle) {
   const match = /^(.*?)(?:\u2026|\.{3})$/.exec(recordTitle);
   return !!match && match[1].length > 0 && paneTitle.startsWith(match[1]);
 }
+var HERDR_FUZZY_SIGNAL = {
+  claude: (pane, context) => recordTitleMatchesPane(context.record.title, pane.terminal_title_stripped),
+  codex: (pane, context) => typeof context.record.origin?.cwd === "string" && context.record.origin.cwd.length > 0 && pane.cwd === context.record.origin.cwd
+};
 function correlateHerdrPane(context, panes) {
   const byId = panes.filter((pane) => pane.agent === context.agent && pane.agent_session?.value === context.sessionId && (pane.agent_session?.agent ?? context.agent) === context.agent);
   if (byId.length > 0)
     return byId.length === 1 ? byId[0] : undefined;
-  let candidates = context.agent === "claude" ? panes.filter((pane) => pane.agent === "claude" && recordTitleMatchesPane(context.record.title, pane.terminal_title_stripped)) : panes.filter((pane) => pane.agent === "codex" && typeof context.record.origin?.cwd === "string" && context.record.origin.cwd.length > 0 && pane.cwd === context.record.origin.cwd);
+  const fuzzy = HERDR_FUZZY_SIGNAL[context.agent];
+  let candidates = fuzzy === undefined ? [] : panes.filter((pane) => pane.agent === context.agent && fuzzy(pane, context));
   if (candidates.length > 1) {
     const working = candidates.filter((pane) => pane.agent_status === "working");
     if (working.length > 0)
@@ -1102,9 +1144,10 @@ var TERMINAL_APPS = [
   { id: "kitty", bundleId: "net.kovidgoyal.kitty", match: /\/kitty\.app\/|(?:^|\/)kitty(?:\s|$)/ },
   { id: "hyper", bundleId: "co.zeit.hyper", match: /\/Hyper\.app\// },
   { id: "warp", bundleId: "dev.warp.Warp-Stable", match: /\/Warp\.app\// },
-  { id: "vscode", bundleId: "com.microsoft.VSCode", match: /\/Visual Studio Code\.app\/|\/Code\.app\/|Code Helper/ },
+  { id: "vscode", bundleId: "com.microsoft.VSCode", match: /\/Visual Studio Code\.app\/|\/Code\.app\/|\/Code Helper/ },
   { id: "claude-desktop", bundleId: "com.anthropic.claudefordesktop", match: /\/Claude\.app\/Contents\//, ttyless: true },
-  { id: "codex-desktop", bundleId: "com.openai.codex", match: /\/ChatGPT\.app\/Contents\//, ttyless: true }
+  { id: "codex-desktop", bundleId: "com.openai.codex", match: /\/ChatGPT\.app\/Contents\//, ttyless: true },
+  { id: "opencode-desktop", bundleId: "ai.opencode.desktop", match: /\/OpenCode\.app\/Contents\//, ttyless: true }
 ];
 function owningTerminalApp(pid, ancestorsOf = pidAncestors, commandOf = pidCommand) {
   let chain = [];
@@ -2450,7 +2493,7 @@ async function claudeLocateTuiPid(ctx, deps = {}) {
   }
 }
 function claudeClearPredecessor(sessionId, hookPid, tracked) {
-  return tracked.filter((t) => t.sessionId !== sessionId && t.provisional !== true && t.agent !== "codex" && typeof t.pid === "number" && Number.isFinite(t.pid) && t.pid === hookPid).sort((a, b) => (b.ts ?? 0) - (a.ts ?? 0))[0]?.sessionId;
+  return tracked.filter((t) => t.sessionId !== sessionId && t.provisional !== true && (t.agent ?? "claude") === "claude" && typeof t.pid === "number" && Number.isFinite(t.pid) && t.pid === hookPid).sort((a, b) => (b.ts ?? 0) - (a.ts ?? 0))[0]?.sessionId;
 }
 function codexChildSessionGhost(sessionId, transcriptPrefix, hookPid, tracked) {
   if (transcriptPrefix.trim().length > 0)
@@ -2604,7 +2647,7 @@ var claudeAdapter = {
   sessionsDir: () => `${process.env.HOME}/.claude/projects`,
   sessionMatch: (name) => name.endsWith(".jsonl"),
   hookStampPath: () => lastHookPath("claude"),
-  hooksNotFiringHint: "  Reinstall the plugin / check /plugin.",
+  hooksNotFiringHint: "  run /plugin in Claude Code, check the nomo plugin is enabled, then restart Claude Code",
   toolDetail: claudeToolDetail,
   blobAgentFields: {},
   locateTuiPid: (ctx, deps) => claudeLocateTuiPid(ctx, deps)
@@ -2658,20 +2701,127 @@ var codexAdapter = {
   sessionsDir: () => `${codexHome()}/sessions`,
   sessionMatch: (name) => name.startsWith("rollout-") && name.endsWith(".jsonl"),
   hookStampPath: () => lastHookPath("codex"),
-  hooksNotFiringHint: "  Run /hooks in Codex to re-trust, or reinstall the plugin — known upstream bugs #16430/#30835.",
+  hooksNotFiringHint: "  run /hooks in Codex to re-trust, or reinstall the plugin — known upstream bugs #16430/#30835",
   toolDetail: codexToolDetail,
   blobAgentFields: { agent: "codex" },
   discoverLive: (known) => codexDiscoverLive(known),
   pidTurnActive: (pid) => codexPidTurnActive(pid),
   locateTuiPid: (ctx, deps) => codexLocateTuiPid(ctx, deps)
 };
+async function opencodeLocateTuiPid(ctx, deps = {}) {
+  try {
+    const pid = ctx.record.pid;
+    if (typeof pid !== "number" || !Number.isFinite(pid) || pid <= 0) {
+      noteLocate(deps, "no-candidate");
+      return;
+    }
+    const ancestorsOf = deps.ancestorsOf ?? pidAncestors;
+    const commandOf = deps.commandOf ?? pidCommand;
+    let chain = [];
+    try {
+      chain = ancestorsOf(pid);
+    } catch {
+      chain = [];
+    }
+    for (const candidate of [pid, ...chain]) {
+      let command;
+      try {
+        command = commandOf(candidate);
+      } catch {
+        continue;
+      }
+      if (typeof command === "string" && /\/OpenCode\.app\/Contents\/MacOS\//.test(command)) {
+        noteLocate(deps, "desktop-app");
+        return candidate;
+      }
+    }
+    noteLocate(deps, "no-candidate");
+    return;
+  } catch {
+    noteLocate(deps, "error");
+    return;
+  }
+}
+var opencodeAdapter = {
+  kind: "opencode",
+  title: async () => {
+    return;
+  },
+  detectInterrupt: () => false,
+  sessionsDir: () => `${CC_DIR}/opencode-has-no-sessions-dir`,
+  sessionMatch: () => false,
+  hookStampPath: () => lastHookPath("opencode"),
+  hooksNotFiringHint: "  restart OpenCode (it loads the plugin at server start), or check that ~/.config/opencode/plugins/nomo.js still points at this install",
+  toolDetail: {},
+  blobAgentFields: { agent: "opencode" },
+  ambientPlan: true,
+  locateTuiPid: (ctx, deps) => opencodeLocateTuiPid(ctx, deps)
+};
+function unknownAgentAdapter(kind) {
+  return {
+    kind,
+    title: async () => {
+      return;
+    },
+    detectInterrupt: () => false,
+    sessionsDir: () => `${CC_DIR}/unknown-agent-has-no-sessions-dir`,
+    sessionMatch: () => false,
+    hookStampPath: () => `${CC_DIR}/last-hook-unknown-agent`,
+    hooksNotFiringHint: "  This session was created by a newer nomo install — update this one.",
+    toolDetail: {},
+    blobAgentFields: { agent: kind }
+  };
+}
 function adapterFor(agent) {
-  return agent === "codex" ? codexAdapter : claudeAdapter;
+  switch (agent) {
+    case "codex":
+      return codexAdapter;
+    case "opencode":
+      return opencodeAdapter;
+    case "claude":
+      return claudeAdapter;
+    default:
+      return typeof agent === "string" && agent.length > 0 ? unknownAgentAdapter(agent) : claudeAdapter;
+  }
 }
 var allAdapters = [claudeAdapter, codexAdapter];
 
 // src/entries/status-cmd.ts
 var CODEX_PLUGIN_HOOK_COUNT = 7;
+var AGENT_UI = {
+  claude: { name: "Claude Code", pair: "/nomo-cc:pair", approvalsOn: "/nomo-cc:approvals on", status: "/nomo-cc:status" },
+  codex: { name: "Codex", pair: "$nomo-pair", approvalsOn: "$nomo-approvals on", status: "$nomo-status" },
+  opencode: { name: "OpenCode", pair: "/nomo-pair", approvalsOn: "/nomo-approvals on", status: "/nomo-status" }
+};
+var AGENT_ORDER = ["claude", "codex", "opencode"];
+var VALUE_COL = 14;
+var row = (label, value) => `${label.padEnd(VALUE_COL)}${value}`;
+var subRow = (label, value) => `  ${label.padEnd(VALUE_COL - 2)}${value}`;
+var cont = (text) => `${" ".repeat(VALUE_COL)}${text}`;
+function renderOwn(r, heading, print) {
+  print("");
+  print(heading);
+  print(subRow(r.hooksLabel, r.hooks));
+  print(subRow("Sessions", r.sessions));
+  for (const [label, value] of r.detail)
+    print(subRow(label, value));
+  for (const p of r.problems) {
+    print(cont(`! ${p.what}`));
+    if (p.fix)
+      print(cont(`→ ${p.fix}`));
+  }
+}
+function renderOther(r, print) {
+  const ui = AGENT_UI[r.kind];
+  print(subRow(ui.name, r.sessionCount > 0 ? `${r.hooks} · ${r.sessions}` : r.hooks));
+  for (const p of r.problems) {
+    print(cont(`! ${p.what}`));
+    if (p.fix)
+      print(cont(`→ ${p.fix}`));
+  }
+  if (r.problems.length > 0)
+    print(cont(`→ full detail: run ${ui.status} inside ${ui.name}`));
+}
 function countCodexHookEvents(raw) {
   let parsed;
   try {
@@ -2741,6 +2891,68 @@ function humanAge(ms) {
 }
 var HOOK_STALE_MS = 10 * 60 * 1000;
 var HOOK_ACTIVITY_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
+function parseLanTrace(raw) {
+  const out = {};
+  for (const line of raw.split(`
+`)) {
+    if (!line || !line.includes('"lan"'))
+      continue;
+    let e;
+    try {
+      e = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (e.event !== "lan" || typeof e.ts !== "number")
+      continue;
+    const ts = e.ts;
+    switch (e.result) {
+      case "bound":
+        if (typeof e.port === "number")
+          out.bound = { ts, port: e.port, lid: String(e.lid ?? "") };
+        break;
+      case "hint":
+        out.hint = { ts, hosts: typeof e.hosts === "number" ? e.hosts : 0 };
+        break;
+      case "ok":
+        out.served = { ts, op: typeof e.op === "string" ? e.op : undefined };
+        break;
+      case "reject":
+        out.reject = { ts, why: typeof e.why === "string" ? e.why : undefined };
+        break;
+      case "bind-failed":
+        out.bindFailed = { ts, why: typeof e.why === "string" ? e.why : undefined };
+        break;
+    }
+  }
+  return out;
+}
+function renderLanTrace(s, now) {
+  if (!s.bound && !s.hint && !s.served && !s.bindFailed)
+    return [];
+  const lines = [];
+  if (s.bound) {
+    lines.push(`listening on port ${s.bound.port} (id ${s.bound.lid.slice(0, 8)}) since ${humanAge(now - s.bound.ts)}`);
+  } else if (s.bindFailed) {
+    lines.push(`NOT listening — bind failed ${humanAge(now - s.bindFailed.ts)}${s.bindFailed.why ? ` (${s.bindFailed.why})` : ""}`);
+  } else {
+    lines.push("not listening");
+  }
+  if (s.served) {
+    lines.push(`phone last reached this Mac ${humanAge(now - s.served.ts)}${s.served.op ? ` (${s.served.op})` : ""}`);
+  } else if (s.hint) {
+    lines.push("phone has NEVER reached this Mac — LAN has not worked yet on this machine");
+  }
+  if (s.hint) {
+    lines.push(`address last advertised ${humanAge(now - s.hint.ts)} (${s.hint.hosts} interface${s.hint.hosts === 1 ? "" : "s"})`);
+  } else {
+    lines.push("address NEVER advertised — it rides on watchdog POSTs, so this needs an active session");
+  }
+  if (s.reject && (!s.served || s.reject.ts > s.served.ts)) {
+    lines.push(`last request REFUSED ${humanAge(now - s.reject.ts)}${s.reject.why ? `: ${s.reject.why}` : ""}`);
+  }
+  return lines;
+}
 function hooksAppearStale(now, sessionMtime, hookStamp) {
   if (sessionMtime <= 0)
     return false;
@@ -2788,47 +3000,86 @@ async function statusCmd(deps = {}) {
   const lastSendPath = deps.lastSendPath ?? LAST_SEND_PATH;
   const sessionsDir = deps.sessionsDir ?? SESSIONS_DIR;
   const watchdogPidPath = deps.watchdogPidPath ?? WATCHDOG_PID_PATH;
+  const sessionTracePath = deps.sessionTracePath ?? SESSION_TRACE_PATH;
   const codexHooksPath = deps.codexHooksPath ?? `${codexHome()}/hooks.json`;
   const codexConfigPath = deps.codexConfigPath ?? `${codexHome()}/config.toml`;
   const codexSessionsDir = deps.codexSessionsDir ?? codexAdapter.sessionsDir();
   const claudeProjectsDir = deps.claudeProjectsDir ?? claudeAdapter.sessionsDir();
   const lastHookCodexPath = deps.lastHookCodexPath ?? codexAdapter.hookStampPath();
   const lastHookClaudePath = deps.lastHookClaudePath ?? claudeAdapter.hookStampPath();
+  const lastHookOpencodePath = deps.lastHookOpencodePath ?? opencodeAdapter.hookStampPath();
+  const opencodeStubs = deps.opencodeStubPaths ?? opencodeStubPaths();
+  const noHoldPath = deps.noHoldPath ?? NO_HOLD_PATH;
   const isAlive = deps.isAlive ?? pidAlive;
   const now = deps.now ?? Date.now;
   const codexAppServerAvailable = deps.codexAppServerAvailable ?? (() => codexAppServerSocketAvailable());
+  const audience = deps.audience;
+  const ui = AGENT_UI[audience ?? "claude"];
+  print(audience ? `Nomo ${PLUGIN_VERSION} · ${AGENT_UI[audience].name}` : `Nomo ${PLUGIN_VERSION}`);
   let raw = null;
   try {
     raw = await readFile3(configPath, "utf8");
   } catch {}
   const config = raw !== null ? parseConfig(raw) : null;
+  const pending = config === null && raw !== null && parsePendingConfig(raw);
+  print("");
   if (config) {
-    print(`Paired: yes (pairing ${config.pairingId.slice(0, 8)}…)`);
-    print(`Worker: ${config.url}`);
-  } else if (raw !== null && parsePendingConfig(raw)) {
-    print("Paired: pairing started, waiting for phone scan — run /nomo-cc:pair to finish or retry.");
+    print(row("Phone", `paired · ${config.url} · pairing ${config.pairingId.slice(0, 8)}…`));
+  } else if (pending) {
+    print(row("Phone", "waiting for the QR scan — pairing was started but no phone has claimed it"));
+    print(cont(`→ run ${ui.pair} to finish or retry`));
   } else {
-    print("Paired: no — run pair to connect this machine to the Nomo app.");
+    print(row("Phone", "NOT PAIRED — nothing from this computer reaches the app"));
+    print(cont(`→ run ${ui.pair}`));
   }
-  let watchdog = "not running";
+  if (config) {
+    let watchdog = "watchdog idle (the next turn starts it)";
+    try {
+      const pid = Number.parseInt((await readFile3(watchdogPidPath, "utf8")).trim(), 10);
+      if (Number.isFinite(pid) && pid > 0 && isAlive(pid))
+        watchdog = `watchdog running (pid ${pid})`;
+    } catch {}
+    let lastSend = "nothing sent yet";
+    try {
+      const ts = Number.parseInt((await readFile3(lastSendPath, "utf8")).trim(), 10);
+      if (Number.isFinite(ts) && ts > 0)
+        lastSend = `last event sent ${humanAge(now() - ts)}`;
+    } catch {}
+    print(row("Delivery", `${lastSend} · ${watchdog}`));
+    let lanTrace = "";
+    try {
+      lanTrace = await readFile3(sessionTracePath, "utf8");
+    } catch {}
+    const lanLines = renderLanTrace(parseLanTrace(lanTrace), now());
+    if (lanLines.length > 0) {
+      print(row("LAN", lanLines[0]));
+      for (const l of lanLines.slice(1))
+        print(cont(l));
+    }
+    if (await localApprovalsState(noHoldPath) === "on") {
+      print(row("Approvals", "on — permission prompts are held and sent to your phone"));
+    } else {
+      print(row("Approvals", "PAUSED — prompts stay in this terminal, your phone is never asked"));
+      print(cont(`→ run ${ui.approvalsOn}`));
+    }
+  }
+  const perAgent = { claude: 0, codex: 0, opencode: 0 };
+  let totalSessions = 0;
   try {
-    const pid = Number.parseInt((await readFile3(watchdogPidPath, "utf8")).trim(), 10);
-    if (Number.isFinite(pid) && pid > 0 && isAlive(pid))
-      watchdog = `running (pid ${pid})`;
+    for (const name of await readdir2(sessionsDir)) {
+      if (!name.endsWith(".json"))
+        continue;
+      totalSessions++;
+      let kind = "claude";
+      try {
+        const parsed = JSON.parse(await readFile3(join3(sessionsDir, name), "utf8"));
+        if (typeof parsed.agent === "string" && parsed.agent.length > 0)
+          kind = parsed.agent;
+      } catch {}
+      if (kind in perAgent)
+        perAgent[kind]++;
+    }
   } catch {}
-  print(`Watchdog: ${watchdog}`);
-  let lastSend = "never";
-  try {
-    const ts = Number.parseInt((await readFile3(lastSendPath, "utf8")).trim(), 10);
-    if (Number.isFinite(ts) && ts > 0)
-      lastSend = humanAge(now() - ts);
-  } catch {}
-  print(`Last event sent: ${lastSend}`);
-  let sessions = 0;
-  try {
-    sessions = (await readdir2(sessionsDir)).filter((f) => f.endsWith(".json")).length;
-  } catch {}
-  print(`Tracked sessions: ${sessions}`);
   let plugin = { installed: false, enabled: true, trusted: 0, ccTrusted: 0 };
   try {
     plugin = parseCodexPluginState(await readFile3(codexConfigPath, "utf8"));
@@ -2837,12 +3088,64 @@ async function statusCmd(deps = {}) {
   try {
     legacyEvents = countCodexHookEvents(await readFile3(codexHooksPath, "utf8"));
   } catch {}
+  async function hooksRow(kind, opts) {
+    const stamp = await readMsMarker(opts.stampPath);
+    const own = audience === kind;
+    if (!own && !opts.installed && stamp <= 0)
+      return { value: "not set up here", stamp };
+    const sessionMtime = config ? await newestFileMtime(opts.sessionsDir, opts.match) : 0;
+    if (hooksAppearStale(now(), sessionMtime, stamp)) {
+      const seen = stamp > 0 ? `the last one was ${humanAge(now() - stamp)}` : "none has ever run";
+      return {
+        value: "NOT FIRING",
+        problem: {
+          what: `${AGENT_UI[kind].name} was active ${humanAge(now() - sessionMtime)} but Nomo never heard about it (${seen}) — nothing new will reach your phone.`,
+          fix: opts.hint.trim()
+        },
+        stamp
+      };
+    }
+    if (stamp > 0)
+      return { value: `firing · last ${humanAge(now() - stamp)}`, stamp };
+    return { value: own ? "no activity yet — it stamps on your next turn" : "not set up here", stamp };
+  }
+  const sessionText = (n) => {
+    if (n === 0)
+      return "none yet";
+    if (n === totalSessions)
+      return `${n} tracked`;
+    return `${n} of ${totalSessions} tracked here`;
+  };
+  const claudeHooks = await hooksRow("claude", {
+    installed: audience === "claude",
+    sessionsDir: claudeProjectsDir,
+    match: claudeAdapter.sessionMatch,
+    stampPath: lastHookClaudePath,
+    hint: claudeAdapter.hooksNotFiringHint
+  });
+  const claudeReport = {
+    kind: "claude",
+    present: perAgent.claude > 0 || claudeHooks.stamp > 0,
+    hooksLabel: "Hooks",
+    hooks: claudeHooks.value,
+    sessions: sessionText(perAgent.claude),
+    sessionCount: perAgent.claude,
+    detail: [],
+    problems: claudeHooks.problem ? [claudeHooks.problem] : []
+  };
+  const codexHooks = await hooksRow("codex", {
+    installed: plugin.installed,
+    sessionsDir: codexSessionsDir,
+    match: codexAdapter.sessionMatch,
+    stampPath: lastHookCodexPath,
+    hint: codexAdapter.hooksNotFiringHint
+  });
   let pluginState;
   if (plugin.installed) {
     if (!plugin.enabled)
       pluginState = "installed, disabled";
     else if (plugin.trusted === 0)
-      pluginState = "installed, hooks NOT trusted (run /hooks in Codex)";
+      pluginState = "installed, hooks NOT trusted";
     else
       pluginState = `installed, trusted (${plugin.trusted}/${CODEX_PLUGIN_HOOK_COUNT})`;
   } else if (legacyEvents > 0) {
@@ -2850,70 +3153,114 @@ async function statusCmd(deps = {}) {
   } else {
     pluginState = "not installed";
   }
-  print(`Codex plugin: ${pluginState}`);
-  if (await codexAppServerAvailable()) {
-    print("Codex Plan answers: bridge available (shared app-server socket accepted a connection)");
-  } else {
-    print("Codex Plan answers: status-only (start `codex app-server daemon start` before launching Codex)");
+  const codexProblems = [];
+  if (codexHooks.problem)
+    codexProblems.push(codexHooks.problem);
+  if (plugin.installed && !plugin.enabled) {
+    codexProblems.push({
+      what: "The Nomo plugin is switched off in Codex — Codex sessions never reach your phone.",
+      fix: "re-enable the nomo plugin in Codex"
+    });
   }
-  if (!plugin.installed && legacyEvents > 0) {
-    print("  Legacy Codex hooks still work — consider migrating to the native Nomo plugin.");
+  if (plugin.installed && plugin.enabled && plugin.trusted === 0) {
+    codexProblems.push({
+      what: "Codex has not trust-reviewed Nomo's hooks, so Codex sessions stay invisible.",
+      fix: "in Codex run /hooks and trust the Nomo entries"
+    });
   }
   if (plugin.installed && plugin.enabled && legacyEvents > 0) {
-    print(`  WARNING: ~/.codex/hooks.json ALSO has ${legacyEvents} legacy Nomo event(s) — events will double-fire.`);
-    print("  Delete the six Nomo entries (command contains codex-status.mjs) from ~/.codex/hooks.json.");
+    codexProblems.push({
+      what: `~/.codex/hooks.json still has ${legacyEvents} legacy Nomo event(s) — every Codex event is sent twice.`,
+      fix: "delete the Nomo entries (command contains codex-status.mjs) from ~/.codex/hooks.json"
+    });
   }
   if (plugin.trusted > 0 && plugin.ccTrusted > 0) {
-    print("  WARNING: Codex auto-discovered the Claude plugin and runs BOTH plugins' hooks on every Codex event (redundant double-fire).");
-    print('  Untrust/remove the `nomo-cc@nomo` entries in Codex (`/hooks` in Codex, or delete those `[hooks.state."nomo-cc@…"]` blocks from <CODEX_HOME>/config.toml) — the native `nomo` plugin alone is correct.');
+    codexProblems.push({
+      what: "Also runs the Claude Code plugin's hooks on every Codex event — double the work, no benefit.",
+      fix: "in Codex run /hooks and untrust the `nomo-cc@nomo` entries"
+    });
   }
-  if (config) {
-    const checks = [
-      {
-        name: "Codex",
-        enabled: plugin.installed,
-        requireStamp: false,
-        sessionsDir: codexSessionsDir,
-        match: codexAdapter.sessionMatch,
-        stampPath: lastHookCodexPath,
-        hint: codexAdapter.hooksNotFiringHint
-      },
-      {
-        name: "Claude",
-        enabled: true,
-        requireStamp: true,
-        sessionsDir: claudeProjectsDir,
-        match: claudeAdapter.sessionMatch,
-        stampPath: lastHookClaudePath,
-        hint: claudeAdapter.hooksNotFiringHint
-      }
-    ];
-    for (const c of checks) {
-      if (!c.enabled)
-        continue;
-      const sessionMtime = await newestFileMtime(c.sessionsDir, c.match);
-      const hookStamp = await readMsMarker(c.stampPath);
-      if (c.requireStamp && hookStamp <= 0)
-        continue;
-      if (!hooksAppearStale(now(), sessionMtime, hookStamp))
-        continue;
-      const stampAge = hookStamp > 0 ? humanAge(now() - hookStamp) : "never";
-      print(`  WARNING: ${c.name} hooks appear NOT to be firing — session active ${humanAge(now() - sessionMtime)}, last hook ${stampAge}.`);
-      print(c.hint);
+  const codexDetail = [["Plugin", pluginState]];
+  if (!plugin.installed && legacyEvents > 0) {
+    codexDetail.push(["", "these still work, but the native Nomo plugin is the supported path now"]);
+  }
+  codexDetail.push(["Plan", await codexAppServerAvailable() ? "questions are answerable from your phone" : "questions can only be answered here — run `codex app-server daemon start` before launching Codex"]);
+  const codexReport = {
+    kind: "codex",
+    present: plugin.installed || legacyEvents > 0 || perAgent.codex > 0 || codexHooks.stamp > 0,
+    hooksLabel: "Hooks",
+    hooks: codexHooks.value,
+    sessions: sessionText(perAgent.codex),
+    sessionCount: perAgent.codex,
+    detail: codexDetail,
+    problems: codexProblems
+  };
+  const opencodeStamp = await readMsMarker(lastHookOpencodePath);
+  let opencodeStub;
+  let opencodeTarget;
+  for (const path of opencodeStubs) {
+    const text = await readFile3(path, "utf8").catch(() => null);
+    if (text === null)
+      continue;
+    opencodeStub = path;
+    opencodeTarget = opencodeStubTarget(text);
+    break;
+  }
+  const opencodeProblems = [];
+  if (opencodeTarget !== undefined && !await flagExists(opencodeTarget)) {
+    opencodeProblems.push({
+      what: `The OpenCode plugin points at ${opencodeTarget}, which is gone — OpenCode loads nothing.`,
+      fix: "re-run plugin/scripts/opencode-install.sh from your nomo checkout"
+    });
+  }
+  const quiet = opencodeStamp <= 0 && opencodeStub !== undefined;
+  const opencodeLiveness = opencodeStamp > 0 ? `loaded · last activity ${humanAge(now() - opencodeStamp)}` : quiet ? "installed · no activity yet" : audience === "opencode" ? "no activity yet — the plugin stamps on your next turn" : "not set up here";
+  const opencodeReport = {
+    kind: "opencode",
+    present: opencodeStub !== undefined || perAgent.opencode > 0 || opencodeStamp > 0,
+    hooksLabel: "Plugin",
+    hooks: opencodeLiveness,
+    sessions: sessionText(perAgent.opencode),
+    sessionCount: perAgent.opencode,
+    detail: quiet ? [["", "plugins load once at OpenCode start — restart it if sessions aren't reaching your phone"]] : [],
+    problems: opencodeProblems
+  };
+  const reports = { claude: claudeReport, codex: codexReport, opencode: opencodeReport };
+  if (audience) {
+    renderOwn(reports[audience], `${AGENT_UI[audience].name} — you are here`, print);
+    const others = AGENT_ORDER.filter((k) => k !== audience && reports[k].present);
+    if (others.length > 0) {
+      print("");
+      print("Also on this computer");
+      for (const k of others)
+        renderOther(reports[k], print);
     }
+  } else {
+    for (const k of AGENT_ORDER)
+      renderOwn(reports[k], AGENT_UI[k].name, print);
   }
   return 0;
 }
+function parseAudience(argv) {
+  for (const arg of argv) {
+    if (arg === "claude" || arg === "codex" || arg === "opencode")
+      return arg;
+  }
+  return;
+}
 if (__require.main == __require.module) {
   if (process.argv.includes("--check")) {
-    console.log("usage: status [--check]  — show pairing, watchdog, and delivery health");
+    console.log("usage: status [claude|codex|opencode] [--check]  — show pairing, delivery and per-agent health");
     process.exit(0);
   }
-  process.exit(await statusCmd());
+  process.exit(await statusCmd({ audience: parseAudience(process.argv.slice(2)) }));
 }
 export {
   statusCmd,
+  renderLanTrace,
+  parseLanTrace,
   parseCodexPluginState,
+  parseAudience,
   humanAge,
   hooksAppearStale,
   countCodexHookEvents

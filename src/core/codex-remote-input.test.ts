@@ -281,6 +281,33 @@ describe("startCodexRemoteInput", () => {
     expect(fallback).not.toHaveProperty("permissionQuestions");
   });
 
+  test("with remote approvals paused ($nomo-approvals off) the relay declines without posting a decision", async () => {
+    const calls: string[] = [];
+    let answered = 0;
+    let interrupted = 0;
+    const handle = startCodexRemoteInput(request(), {
+      config,
+      fetchFn: (async (input: string | URL | Request): Promise<Response> => {
+        calls.push(String(input));
+        return Response.json({ hold: true });
+      }) as typeof fetch,
+      readRecordFn: async () => record,
+      randomUUID: () => "relay-off",
+      now: () => 1_234_567,
+      localApprovalsStateFn: async () => "off",
+      sleep: async () => {},
+      answerAppServer: async () => { answered += 1; return "sent"; },
+      interruptAppServer: async () => { interrupted += 1; return "sent"; },
+    });
+
+    expect(await handle.completion).toBe("unsupported");
+    // No hold created, no decision POST, no phone answer applied — the Mac picker owns it.
+    expect(calls.some((url) => url.includes("/v1/cc/decision"))).toBe(false);
+    expect(calls).toEqual([]);
+    expect(answered).toBe(0);
+    expect(interrupted).toBe(0);
+  });
+
   // The folder's LIVE git branch, read off the record's pinned paths — the same key, in the same slot
   // (right after `folderKey`, before the permission tail), that every other producer of this shape uses.
   test("the question frame carries the folder's live `branch` after folderKey, before the permission tail", async () => {
@@ -511,7 +538,7 @@ describe("startCodexRemoteInput", () => {
       let fetched = false;
       const handle = startCodexRemoteInput(request({ questions }), {
         config,
-        fetchFn: (async () => { fetched = true; return Response.json({}); }) as typeof fetch,
+        fetchFn: (async () => { fetched = true; return Response.json({}); }) as unknown as typeof fetch,
         readRecordFn: async () => record,
         randomUUID: () => "relay-2",
         answerAppServer: async () => "sent",
@@ -698,7 +725,7 @@ describe("startCodexRemoteInput", () => {
     let fetched = false;
     const handle = startCodexRemoteInput(request(), {
       config,
-      fetchFn: (async () => { fetched = true; return Response.json({ hold: true }); }) as typeof fetch,
+      fetchFn: (async () => { fetched = true; return Response.json({ hold: true }); }) as unknown as typeof fetch,
       readRecordFn: async () => { throw new Error("session store is corrupt"); },
       randomUUID: () => "relay-throw",
       localApprovalsStateFn: async () => "on",

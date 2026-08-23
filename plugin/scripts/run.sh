@@ -80,7 +80,11 @@ nomo_atomic_copy() {
 # launches every hook correctly; it just drops the notify payload, and this block replaces it on the
 # first hook after the upgrade — which is BEFORE the SessionStart self-repair rewrites config.toml,
 # because that repair runs inside a bundle this file exec's.
-NOMO_SHIM_REV=2
+# rev 3 (v2.1.22): `opencode-update` joins the entry whitelist, so /nomo-update still resolves when the
+# root baked into the command file has gone stale. A rev-2 shim silently exits 0 on that name, which
+# for an interactive command reads as "did nothing" — the one outcome this project treats as worse
+# than an error.
+NOMO_SHIM_REV=3
 
 # Numeric semver compare: true when $1 sorts strictly AFTER $2. A DELIBERATE TWIN of the function in
 # hook-shim.sh — run.sh has to stay a standalone file that works when nothing else on disk does, so it

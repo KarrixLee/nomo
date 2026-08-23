@@ -6,7 +6,7 @@ import {
   buildPermissionSummary, buildPermissionDetail, buildPermissionQuestions, fitPermissionDetail,
   sealedBlobChars, BLOB_FIT_CHARS, runPermissionHook, approvalsCommand, NO_HOLD_PATH, TRACE_PATH,
   codexRolloutSessionId, codexTurnPolicyFromRollout, loadCodexTurnPolicy,
-  POST_FIRST_CONTACT_TIMEOUT_MS,
+  POST_FIRST_CONTACT_TIMEOUT_MS, OPENCODE_QUESTION_TOOL,
 } from "./permission";
 import {
   createPollBudget, MAX_CONSECUTIVE_MISSES, POLL_FIRST_CONTACT_TIMEOUT_MS,
@@ -604,6 +604,80 @@ describe("runPermissionHook — hold state machine", () => {
     await runPermissionHook(baseDeps({ fetchFn: fn, emit: () => {} }) as never); // now: () => 1000, sleep: noop
     const posts = calls.filter((c) => c.method === "POST").map((c) => JSON.parse(c.body!).ts as number);
     expect(posts).toEqual([1000, 1001]);
+  });
+
+  // ---- the initial POST's TIMEOUT retry, scoped by what the hold BLOCKS (HOLD_BLOCKS_DIALOG) --------
+  //
+  // Field trace 2026-08-19, ses_fe0d…: ONE `TimeoutError` on round 1 attempt 1 (the fourth in that log's
+  // entire history — a blip, not a break) cost an OpenCode session its whole remote-approval path, and
+  // the user tapped an answer into a void. Claude/Codex must keep ending the round on a timeout — their
+  // hook IS the terminal dialog's gate — but OpenCode's hold is started detached beside a prompt
+  // OpenCode already rendered itself, so the retry is free there and the hold is what is at stake.
+
+  /** A decision POST that TIMES OUT on its first `timeouts` attempts, then answers `{hold}`. */
+  const flakyPost = (timeouts: number, hold: boolean, gets: Array<Record<string, unknown>> = []) => {
+    const posts: Array<{ ts: number }> = [];
+    let g = 0;
+    const fn = (async (url: string, init?: { method?: string; body?: string }) => {
+      if (url.endsWith("/v1/cc/full")) return new Response(JSON.stringify({ ok: true }), { status: 200 });
+      if (url.endsWith("/v1/cc/decision")) {
+        posts.push(JSON.parse(init!.body!) as { ts: number });
+        if (posts.length <= timeouts) { const e = new Error("timeout"); e.name = "TimeoutError"; throw e; }
+        return new Response(JSON.stringify({ hold }), { status: 200 });
+      }
+      return new Response(JSON.stringify(gets[Math.min(g++, gets.length - 1)] ?? {}), { status: 200 });
+    }) as unknown as typeof fetch;
+    return { fn, posts };
+  };
+  const quietHoldDeps = { writeHoldFn: async () => {}, clearHoldFn: async () => {}, settleHoldRecordFn: async () => {} };
+
+  test("NON-BLOCKING hold (opencode): a timeout on attempt 1 is RETRIED, and the retry gets the hold", async () => {
+    const answerBlob = await encryptBlob(KEY, { requestId: "req-fixed", decision: "allow", ts: 5 });
+    const { fn, posts } = flakyPost(1, true, [{ status: "answered", answerBlob }]);
+    const emitted: string[] = [];
+    await runPermissionHook(baseDeps({
+      fetchFn: fn, emit: (l: string) => emitted.push(l), ...quietHoldDeps,
+    }) as never, "opencode");
+    expect(posts).toHaveLength(2);      // attempt 1 timed out; attempt 2 ran instead of giving up
+    expect(emitted).toEqual([ALLOW]);   // …and the phone's answer reached OpenCode
+  });
+
+  test("NON-BLOCKING hold: the retry POST carries a STRICTLY NEWER ts even on a frozen clock", async () => {
+    const answerBlob = await encryptBlob(KEY, { requestId: "req-fixed", decision: "allow", ts: 5 });
+    const { fn, posts } = flakyPost(1, true, [{ status: "answered", answerBlob }]);
+    await runPermissionHook(baseDeps({ fetchFn: fn, emit: () => {}, ...quietHoldDeps }) as never, "opencode");
+    // now: () => 1000 throughout — a re-POST at the SAME ts trips the worker's ordering guard and is
+    // dropped as stale, so the retry would silently never establish anything.
+    expect(posts.map((p) => p.ts)).toEqual([1000, 1001]);
+  });
+
+  for (const agent of ["claude", "codex"] as const) {
+    test(`BLOCKING hold (${agent}): a timeout ends the round at once — exactly 1 POST`, async () => {
+      const { fn, posts } = flakyPost(1, true); // attempt 2 WOULD have succeeded, if it ran
+      const events: Array<{ event: string; [k: string]: unknown }> = [];
+      await runPermissionHook(baseDeps({
+        fetchFn: fn, emit: () => {}, ...quietHoldDeps,
+        trace: (e: { event: string }) => events.push(e as { event: string }),
+      }) as never, agent);
+      expect(posts).toHaveLength(1);    // the terminal dialog is frozen behind us — never double the freeze
+      expect(events.at(-1)).toMatchObject({ event: "exit", reason: "post-error" });
+    });
+  }
+
+  test("a non-ok HTTP status is NEVER retried, not even on the non-blocking path", async () => {
+    const posts: string[] = [];
+    const fn = (async (url: string, init?: { body?: string }) => {
+      if (url.endsWith("/v1/cc/full")) return new Response(JSON.stringify({ ok: true }), { status: 200 });
+      if (url.endsWith("/v1/cc/decision")) { posts.push(init!.body!); return new Response("", { status: 503 }); }
+      throw new Error("no GET expected");
+    }) as unknown as typeof fetch;
+    await runPermissionHook(baseDeps({
+      fetchFn: fn, emit: () => {}, ...quietHoldDeps,
+      // ESTABLISHED session, so the hold:false fresh-session re-ask (a second ROUND, not a retry) is out
+      // of the picture and the count below is unambiguous.
+      now: () => 1_000_000, readRecordFn: async () => ({ pid: 1, machine: "m", label: "l", ts: 1_000_000 - 10 * 60_000 }),
+    }) as never, "opencode");
+    expect(posts).toHaveLength(1); // a real HTTP response is a real answer, whatever it says
   });
 
   // The worker names the FIRST failing gate in `reason` (stale-session / toggle-off / no-activity). Without
@@ -2471,6 +2545,45 @@ describe("runPermissionHook — AskUserQuestion holds", () => {
     expect(updatedInput.answers).toEqual({
       "Which testing approach should I use for the new parser?": "Integration tests",
     });
+  });
+
+  // THE ANSWER TOOL IS (name, agent), never a name alone. `question` is an ordinary lowercase word: it
+  // names OpenCode's question CHANNEL and, for any other agent, whatever tool an MCP server happens to
+  // have called that. Ungated, the release rule swallowed such a tool's Allow — the user taps Allow on
+  // the phone and the Mac just sits there. iOS reads the pair together
+  // (CCPermissionQuestion.isOwnQuestionChannel); this is the plugin-side twin of that reading.
+  const namedQuestion = JSON.stringify({
+    session_id: "sess-1", hook_event_name: "PermissionRequest",
+    tool_name: OPENCODE_QUESTION_TOOL, tool_input: { questions: CC_QUESTIONS },
+    cwd: "/Users/x/proj", transcript_path: "/tmp/t.jsonl",
+  });
+
+  test("a CLAUDE tool literally named `question` is an ORDINARY tool — its allow is EMITTED, not released", async () => {
+    const answerBlob = await encryptBlob(KEY, { requestId: "req-fixed", ts: 5, decision: "allow" });
+    const emitted: string[] = [];
+    const { fn } = scriptFetch(true, [{ status: "answered", answerBlob }]);
+    await runPermissionHook(baseDeps({
+      fetchFn: fn, emit: (l: string) => emitted.push(l), readInput: async () => namedQuestion,
+    }) as never);
+    expect(emitted).toEqual([ALLOW]);
+  });
+
+  test("…while under OPENCODE that same name IS the answer channel: a bare allow is RELEASED", async () => {
+    const answerBlob = await encryptBlob(KEY, { requestId: "req-fixed", ts: 5, decision: "allow" });
+    const emitted: string[] = [];
+    const { fn } = scriptFetch(true, [{ status: "answered", answerBlob }]);
+    await runPermissionHook(baseDeps({
+      fetchFn: fn, emit: (l: string) => emitted.push(l), readInput: async () => namedQuestion,
+      writeHoldFn: async () => {}, clearHoldFn: async () => {}, settleHoldRecordFn: async () => {},
+    }) as never, "opencode");
+    expect(emitted).toEqual([]);
+  });
+
+  // Claude's own AskUserQuestion carries a name nothing else ships, so the gate above must NOT have
+  // narrowed it by agent — codex keeps releasing a bare allow on it exactly as before.
+  test("AskUserQuestion still releases a bare allow under codex", async () => {
+    const { emitted } = await answerQuestion({ decision: "allow" }, {}, "codex");
+    expect(emitted).toEqual([]);
   });
 });
 

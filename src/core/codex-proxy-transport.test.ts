@@ -11,7 +11,7 @@ import {
 const GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
 class FakeReadable extends EventEmitter {
-  push(chunk: Buffer | string): void { this.emit("data", chunk); }
+  push(chunk: Uint8Array | string): void { this.emit("data", chunk); }
   finish(): void { this.emit("end"); }
 }
 
@@ -45,7 +45,7 @@ function acceptForRequest(request: Buffer): string {
   return createHash("sha1").update(match[1].trim() + GUID).digest("base64");
 }
 
-function upgrade(child: FakeChild, extra = Buffer.alloc(0), splitAt?: number): void {
+function upgrade(child: FakeChild, extra: Uint8Array = Buffer.alloc(0), splitAt?: number): void {
   const accept = acceptForRequest(child.stdin.writes[0]);
   const response = Buffer.concat([Buffer.from([
     "HTTP/1.1 101 Switching Protocols",

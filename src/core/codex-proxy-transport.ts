@@ -28,14 +28,19 @@ export const CODEX_PROXY_STDOUT_ENDED = "Codex app-server proxy stdout ended";
 export interface CodexProxyReadable {
   on(event: "data", listener: (chunk: Buffer | Uint8Array | string) => void): this;
   on(event: "end" | "error", listener: (error?: unknown) => void): this;
-  removeListener(event: "data" | "end" | "error", listener: (...args: never[]) => void): this;
+  /** `any[]` mirrors node's own EventEmitter.removeListener. It was `never[]`, which nothing that
+   *  actually extends EventEmitter — node's real streams included — can implement, so the only
+   *  structural check on these shapes (the test double's `implements`) could not pass and every
+   *  call site needed a cast back to `never[]`. */
+  removeListener(event: "data" | "end" | "error", listener: (...args: any[]) => void): this;
 }
 
 export interface CodexProxyWritable {
   write(chunk: Uint8Array | string, callback?: (error?: Error | null) => void): boolean;
   end(): void;
   on(event: "error", listener: (error: unknown) => void): this;
-  removeListener(event: "error", listener: (...args: never[]) => void): this;
+  /** `any[]` per node's EventEmitter — see CodexProxyReadable.removeListener. */
+  removeListener(event: "error", listener: (...args: any[]) => void): this;
 }
 
 export interface CodexProxyChild {
@@ -44,7 +49,8 @@ export interface CodexProxyChild {
   stderr?: CodexProxyReadable;
   on(event: "error", listener: (error: unknown) => void): this;
   on(event: "exit", listener: (code: number | null, signal: string | null) => void): this;
-  removeListener(event: "error" | "exit", listener: (...args: never[]) => void): this;
+  /** `any[]` per node's EventEmitter — see CodexProxyReadable.removeListener. */
+  removeListener(event: "error" | "exit", listener: (...args: any[]) => void): this;
   kill(signal?: string): boolean;
 }
 
@@ -403,14 +409,14 @@ export class CodexProxyTransport implements CodexRpcTransport {
     const child = this.child;
     this.child = undefined;
     if (child) {
-      child.stdout.removeListener("data", this.onStdoutData as (...args: never[]) => void);
-      child.stdout.removeListener("end", this.onStdoutEnd as (...args: never[]) => void);
-      child.stdout.removeListener("error", this.onStreamError as (...args: never[]) => void);
-      child.stdin.removeListener("error", this.onStreamError as (...args: never[]) => void);
-      child.stderr?.removeListener("data", this.onStderrData as (...args: never[]) => void);
-      child.stderr?.removeListener("error", this.onStderrError as (...args: never[]) => void);
-      child.removeListener("error", this.onChildError as (...args: never[]) => void);
-      child.removeListener("exit", this.onChildExit as (...args: never[]) => void);
+      child.stdout.removeListener("data", this.onStdoutData);
+      child.stdout.removeListener("end", this.onStdoutEnd);
+      child.stdout.removeListener("error", this.onStreamError);
+      child.stdin.removeListener("error", this.onStreamError);
+      child.stderr?.removeListener("data", this.onStderrData);
+      child.stderr?.removeListener("error", this.onStderrError);
+      child.removeListener("error", this.onChildError);
+      child.removeListener("exit", this.onChildExit);
       try { child.stdin.end(); } catch { /* process already gone */ }
       try { child.kill(); } catch { /* process already gone */ }
     }

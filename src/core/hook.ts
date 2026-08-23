@@ -20,7 +20,7 @@
 import { readdir, readFile, unlink } from "node:fs/promises";
 import { hostname } from "node:os";
 import { basename } from "node:path";
-import { encryptBlob } from "./crypto";
+import { Bytes, encryptBlob } from "./crypto";
 import {
   adapterFor, claudeToolDetail, codexToolDetail, findProvisionalForPid, requestUserInputDetail,
   SessionCreationSuppression, TrackedSessionLite,
@@ -189,7 +189,13 @@ export function transcriptStartMs(prefix: string): number | undefined {
  *  Absent/empty → first event (or a recordless caller): derive from cwd as before. `label`,
  *  `folderKey` and the local-only path facts come out of ONE call to `folderIdentity`, so they always
  *  describe the same cwd. */
-export function buildBlob(input: Record<string, unknown>, machine: string, title: string | undefined, plan: OpPlan, agent: AgentKind = "claude", turnStartedAt?: number, pinnedFolder?: string | { label?: unknown; folderKey?: unknown; cwd?: unknown; gitDir?: unknown } | null, model?: string, at?: number, proposedPlan?: string, dbgOverride?: string): {
+export function buildBlob(input: Record<string, unknown>, machine: string, title: string | undefined, plan: OpPlan, agent: AgentKind = "claude", turnStartedAt?: number, pinnedFolder?: string | { label?: unknown; folderKey?: unknown; cwd?: unknown; gitDir?: unknown } | null, model?: string, at?: number, proposedPlan?: string, dbgOverride?: string,
+  /** APPEND-LAST. The working sub-status stated OUTRIGHT instead of derived from a hook payload's
+   *  `hook_event_name`/`tool_name`. It exists for the OpenCode plugin, which has no hook payload at all
+   *  — its frames come off a resident event firehose, and a `session.status {retry}` message is free
+   *  text no tool name can encode. Undefined for EVERY Claude/Codex caller, which leaves detailForHook
+   *  as the only source and keeps their blobs byte-identical. */
+  detailOverride?: string): {
   status: CCStatus; detail?: string; title: string; machine: string; label: string; agent?: AgentKind; turnStartedAt?: number; model?: string; at?: number; folderKey?: string; branch?: string; plan?: string; dbg?: string;
 } {
   const folder = folderIdentity(input.cwd, pinnedFolder);
@@ -198,13 +204,15 @@ export function buildBlob(input: Record<string, unknown>, machine: string, title
   // not — a mid-session `git checkout` must reach the phone). Omitted when the folder is not a repo.
   const branch = sessionBranch(folder);
   const hookName = typeof input.hook_event_name === "string" ? input.hook_event_name : "";
-  const detail = detailForHook(
+  const detail = detailOverride ?? detailForHook(
     hookName,
     typeof input.tool_name === "string" ? input.tool_name : undefined,
     input.tool_input,
   );
   // The `agent` key is OMITTED for claude (byte-identical to the pre-codex blob so old Swift builds and
-  // the existing snapshots are unaffected) and the literal "codex" for a codex session. `turnStartedAt`
+  // the existing snapshots are unaffected) and the agent's OWN literal for every other kind ("codex",
+  // "opencode", …) — the rule is stated once, so a new AgentKind carries through here for free and can
+  // never silently render as Claude on the phone. Mirrors Swift's CCAgent.blobValue. `turnStartedAt`
   // (epoch SECONDS — the current turn's start, see runHook) is likewise OMITTED when unknown, so a blob
   // from a session with no prompt seen yet stays byte-identical to a pre-0.3.5 one. `model` (v0.8.5 —
   // the session's raw model id, e.g. "claude-fable-5" / "gpt-5-codex", resolved by the adapter's
@@ -236,7 +244,7 @@ export function buildBlob(input: Record<string, unknown>, machine: string, title
   const base = {
     status: plan.status, title: title ?? "", machine, label,
     ...(detail ? { detail } : {}),
-    ...(agent === "codex" ? { agent: "codex" as const } : {}),
+    ...(agent === "claude" ? {} : { agent }),
     ...(typeof turnStartedAt === "number" && Number.isFinite(turnStartedAt) ? { turnStartedAt } : {}),
     ...(typeof model === "string" && model.length > 0 ? { model } : {}),
     ...(typeof at === "number" && Number.isFinite(at) ? { at } : {}),
@@ -262,7 +270,7 @@ export function buildBlob(input: Record<string, unknown>, machine: string, title
  *  narrow and backward-compatible: ONLY Codex's request_user_input carries `"userInput"`, allowing the
  *  worker to distinguish a Plan question from an ordinary permission decision without reading `blob`. */
 export async function buildEnvelope(
-  input: unknown, machine: string, now: number, title: string | undefined, e2eKey: Uint8Array, sentDone: boolean,
+  input: unknown, machine: string, now: number, title: string | undefined, e2eKey: Bytes, sentDone: boolean,
   agent: AgentKind = "claude", startedAt?: number, turnStartedAt?: number,
   /** The session record (or, for positional callers predating the folder key, just its label) — the
    *  FIRST-SEEN folder identity buildBlob pins `label`, `folderKey` and the branch's source paths to. */
@@ -273,6 +281,9 @@ export async function buildEnvelope(
    *  unabridged copy on the session record for the LAN `read` op. Purely observational — it runs before
    *  the seal, never mutates, and a throw is swallowed: a diagnostic tee must not break an envelope. */
   onBlobPlaintext?: (plain: ReturnType<typeof buildBlob>) => void,
+  /** APPEND-LAST. Threaded straight through to buildBlob's own append-last `detailOverride` — see
+   *  there. Undefined for every Claude/Codex caller. */
+  detailOverride?: string,
 ): Promise<Record<string, unknown> | null> {
   if (typeof input !== "object" || input === null) return null;
   const i = input as Record<string, unknown>;
@@ -289,7 +300,7 @@ export async function buildEnvelope(
   // `at` is the real event time (`now`) in epoch SECONDS — the phone's honest sort/age key, frozen here
   // and re-sent verbatim by every watchdog heartbeat so an idle-but-heartbeated session ages out.
   const at = Math.floor(now / 1000);
-  const plaintext = buildBlob(i, machine, title, plan, agent, turnStartedAt, pinnedFolder, model, at, proposedPlan, dbg);
+  const plaintext = buildBlob(i, machine, title, plan, agent, turnStartedAt, pinnedFolder, model, at, proposedPlan, dbg, detailOverride);
   try { onBlobPlaintext?.(plaintext); } catch { /* a tee must never break an envelope */ }
   const blob = await encryptBlob(e2eKey, plaintext);
   const attentionKind = attentionKindOverride ?? (
@@ -412,7 +423,9 @@ export async function trackSessionAt(
       op,
       prio,
       ...(blob ? { blob } : {}),
-      ...(agent === "codex" ? { agent } : {}),
+      // Same omit-for-claude rule as the blob's key above: absent MEANS claude on every reader
+      // (recordAgent/`record.agent ?? "claude"`), and any other kind is stored as its own literal.
+      ...(agent === "claude" ? {} : { agent }),
       // Cache the parsed start so the next hook and the watchdog re-send it without re-reading the
       // transcript (and so it survives the transcript later going away). Omitted when unknown.
       ...(typeof sessionStartedAt === "number" && Number.isFinite(sessionStartedAt) ? { sessionStartedAt } : {}),

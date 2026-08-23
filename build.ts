@@ -21,12 +21,19 @@ const OUTDIR = join(HERE, "plugin", "dist");
 /** Every manifest that carries the plugin version, and how to pull it out. The Claude plugin manifest
  *  is the source of truth (see readVersion below); the rest must agree with it. A release that bumps
  *  only some of them ships hosts a version that disagrees with what the bundle reports, so the build
- *  refuses rather than baking the disagreement into dist/. */
+ *  refuses rather than baking the disagreement into dist/.
+ *
+ *  package.json is the FIFTH and newest of them (the `nomo-ai` npm bootstrapper). It ships no plugin
+ *  code — it only drives `claude plugin install` / `codex plugin add` / opencode-install.sh — so
+ *  there was an argument for versioning it independently. It is here anyway: same product, same
+ *  repo, and `bunx nomo-ai --version` is what a user will quote in a bug report. Locking it in means
+ *  the build fails loudly on drift instead of leaving that trap for a future release to find. */
 const VERSION_MANIFESTS: { path: string; versions: (doc: any) => (string | undefined)[] }[] = [
   { path: join("plugin", ".claude-plugin", "plugin.json"), versions: (d) => [d.version] },
   { path: join("plugin", ".codex-plugin", "plugin.json"), versions: (d) => [d.version] },
   { path: join(".claude-plugin", "marketplace.json"), versions: (d) => (d.plugins ?? []).map((p: any) => p.version) },
   { path: join(".agents", "plugins", "marketplace.json"), versions: (d) => (d.plugins ?? []).map((p: any) => p.version) },
+  { path: "package.json", versions: (d) => [d.version] },
 ];
 
 /** The Claude plugin manifest's version, after proving every other manifest agrees with it.
@@ -55,8 +62,10 @@ function readVersion(): string {
  *  Codex skills. codex-notify is the Codex `notify`-channel backstop (a done push when the lifecycle
  *  hooks fail to fire) — invoked with its JSON payload as argv by plugin/scripts/hook-shim.sh, not
  *  on stdin. cc-permission / codex-permission are the blocking PermissionRequest holds (Claude / Codex
- *  twins — the phone answers Allow/Deny while the terminal dialog waits). Each is bundled standalone
- *  with its local deps inlined. */
+ *  twins — the phone answers Allow/Deny while the terminal dialog waits). opencode-update backs
+ *  /nomo-update: OpenCode is the one agent whose host has no update command of its own, so its
+ *  checkout IS its version and pulling it is ours to do. Each is bundled standalone with its local
+ *  deps inlined. */
 const ENTRYPOINTS = [
   "cc-status.ts",
   "cc-permission.ts",
@@ -68,7 +77,19 @@ const ENTRYPOINTS = [
   "unpair.ts",
   "reset.ts",
   "status-cmd.ts",
+  "opencode-update.ts",
 ].map((f) => join(HERE, "src", "entries", f));
+
+/** The OpenCode plugin — a SECOND build pass, not another ENTRYPOINTS row, because it needs a
+ *  different extension. OpenCode auto-discovers plugins with the glob `{plugin,plugins}/*.{ts,js}`
+ *  (packages/opencode/src/config/plugin.ts), so a `.mjs` bundle would never load. Unlike the hooks
+ *  this is not a one-shot process: OpenCode imports it once and keeps it resident inside its own
+ *  server process, so there is no hooks.json, no hook-shim entry and no NOMO_SHIM_REV bump.
+ *  It still lands in plugin/dist/ because shared.ts's WATCHDOG_PATH resolves cc-watchdog.mjs as a
+ *  sibling of import.meta.url — the bundle must EXECUTE from dist/. The installed file at
+ *  ~/.config/opencode/plugins/nomo.js is a one-line stub re-exporting this absolute path (see README);
+ *  that indirection is also what keeps an install from going stale across plugin upgrades. */
+const OPENCODE_ENTRY = join(HERE, "src", "opencode", "plugin.ts");
 
 async function main(): Promise<void> {
   // The plugin's version is single-sourced from the Claude plugin manifest; inject it as a build-time
@@ -102,8 +123,30 @@ async function main(): Promise<void> {
     throw new Error("bun build failed");
   }
 
-  const names = result.outputs.map((o) => o.path.split("/").pop()).sort();
-  console.log(`Built ${result.outputs.length} artifacts stamped ${version} into ${OUTDIR}:`);
+  // Pass 2 — the OpenCode plugin. Same target/define as above so __NOMO_VERSION__ still injects and
+  // the output stays free of Bun-only globals. `naming` is the LITERAL "opencode.js", not
+  // "[name].js": the entry is src/opencode/plugin.ts, so `[name]` would emit dist/plugin.js — a
+  // meaningless name inside plugin/dist/, and not the dist/opencode.js the install stub points at.
+  // Safe as a literal only because this pass has exactly one entrypoint.
+  const oc = await Bun.build({
+    entrypoints: [OPENCODE_ENTRY],
+    outdir: OUTDIR,
+    target: "node",
+    format: "esm",
+    naming: "opencode.js",
+    sourcemap: "none",
+    minify: false,
+    define: { __NOMO_VERSION__: JSON.stringify(version) },
+  });
+
+  if (!oc.success) {
+    for (const log of oc.logs) console.error(log);
+    throw new Error("bun build failed (opencode)");
+  }
+
+  const outputs = [...result.outputs, ...oc.outputs];
+  const names = outputs.map((o) => o.path.split("/").pop()).sort();
+  console.log(`Built ${outputs.length} artifacts stamped ${version} into ${OUTDIR}:`);
   for (const n of names) console.log(`  ${n}`);
 }
 

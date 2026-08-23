@@ -28,7 +28,7 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { isRealTty, pidAncestors, pidCommand } from "./shared";
-import type { AgentKind, SessionRecord } from "./shared";
+import type { AgentKind, AgentKindWire, SessionRecord } from "./shared";
 
 const execFileP = promisify(execFile);
 
@@ -62,7 +62,12 @@ export type FocusResult =
 /** Session evidence herdr needs because its daemon owns the TUI pty: the pane, rather than the pid's
  *  terminal ancestry, is correlated to the record. */
 export interface FocusContext {
-  agent: AgentKind;
+  /** WIRE-typed (see AgentKindWire): the caller reads it off the session record, which a NEWER peer
+   *  install may have stamped with a kind this build has never heard of. Nothing here coerces it —
+   *  the exact-id correlation below still works for such a session (herdr publishes the agent's own
+   *  name on the pane), and the per-kind fuzzy fallback simply has no entry for it, which is the same
+   *  "no signal → refuse" outcome a known-but-unlisted agent already gets. */
+  agent: AgentKindWire;
   record: SessionRecord;
   /** The session's id — the agent's OWN uuid, which herdr publishes per pane as `agent_session.value`.
    *  It is the only EXACT correlation key available, so it is required: a SessionRecord does not carry
@@ -159,6 +164,23 @@ function recordTitleMatchesPane(recordTitle: unknown, paneTitle: unknown): boole
   return !!match && match[1].length > 0 && paneTitle.startsWith(match[1]);
 }
 
+/** The per-agent fuzzy correlation signal used only when herdr published no `agent_session` id: the
+ *  claim "this pane is that record" for an agent whose panes carry nothing exact. Claude's is the
+ *  pane's stripped terminal title vs the record title; Codex's is exact cwd equality (its panes have
+ *  no title worth matching). An agent ABSENT from this table has no fuzzy signal at all — the
+ *  correlation then refuses rather than borrowing another agent's rule. OpenCode is deliberately
+ *  absent: its desktop sessions never reach herdr (the app owns no pty), and its CLI sessions belong
+ *  to a server process that no pane runs, so cwd equality would be a guess dressed as evidence. */
+const HERDR_FUZZY_SIGNAL: Partial<Record<AgentKindWire, (pane: HerdrPane, context: FocusContext) => boolean>> = {
+  claude: (pane, context) => recordTitleMatchesPane(context.record.title, pane.terminal_title_stripped),
+  codex: (pane, context) => typeof context.record.origin?.cwd === "string"
+    && context.record.origin.cwd.length > 0
+    && pane.cwd === context.record.origin.cwd,
+  // Keyed WIRE-wide so an unknown agent literal reads back `undefined` (no signal) instead of failing
+  // to index; `satisfies` keeps the KEYS checked against the kinds this build implements, so a typo or
+  // a stale kind still fails to compile.
+} satisfies Partial<Record<AgentKind, (pane: HerdrPane, context: FocusContext) => boolean>>;
+
 function correlateHerdrPane(context: FocusContext, panes: HerdrPane[]): HerdrPane | undefined {
   // The EXACT signal first: herdr publishes the agent's own session id on the pane, so the id the
   // command already named is ground truth and short-circuits everything below — no title, no cwd, no
@@ -173,13 +195,16 @@ function correlateHerdrPane(context: FocusContext, panes: HerdrPane[]): HerdrPan
     && (pane.agent_session?.agent ?? context.agent) === context.agent);
   if (byId.length > 0) return byId.length === 1 ? byId[0] : undefined;
 
-  let candidates = context.agent === "claude"
-    ? panes.filter((pane) => pane.agent === "claude"
-      && recordTitleMatchesPane(context.record.title, pane.terminal_title_stripped))
-    : panes.filter((pane) => pane.agent === "codex"
-      && typeof context.record.origin?.cwd === "string"
-      && context.record.origin.cwd.length > 0
-      && pane.cwd === context.record.origin.cwd);
+  // The FUZZY fallback, looked up BY AGENT rather than branched on. This was
+  // `context.agent === "claude" ? title-match : cwd-match-on-codex-panes`, i.e. every non-Claude
+  // agent silently meant "codex" — dead only because no third agent kind could reach here. An
+  // OpenCode record hitting that ternary would have correlated to a CODEX pane sharing its cwd and
+  // raised the wrong window. Keyed lookup makes the default for an unlisted agent NO fuzzy signal
+  // (id-only, then refuse) instead of an inherited one: a new agent has to prove a signal to get one.
+  const fuzzy = HERDR_FUZZY_SIGNAL[context.agent];
+  let candidates = fuzzy === undefined
+    ? []
+    : panes.filter((pane) => pane.agent === context.agent && fuzzy(pane, context));
 
   // Status may break a primary-signal tie, but can never introduce a pane that title/cwd rejected.
   if (candidates.length > 1) {
@@ -224,7 +249,7 @@ async function runExecFile(
  *  other entry is activate-only by design (guessing a window in kitty/WezTerm/Ghostty from a tty is
  *  not possible over AppleScript, and a wrong guess is the one outcome worth avoiding). */
 export interface TerminalApp {
-  id: "terminal-app" | "iterm2" | "ghostty" | "wezterm" | "alacritty" | "kitty" | "hyper" | "warp" | "vscode" | "claude-desktop" | "codex-desktop";
+  id: "terminal-app" | "iterm2" | "ghostty" | "wezterm" | "alacritty" | "kitty" | "hyper" | "warp" | "vscode" | "claude-desktop" | "codex-desktop" | "opencode-desktop";
   /** CFBundleIdentifier — `tell application id "…"` binds to the installed copy, wherever it lives. */
   bundleId: string;
   /** Matched against a process's full argv (the .app bundle path, or the binary name for the
@@ -255,7 +280,12 @@ const TERMINAL_APPS: TerminalApp[] = [
   { id: "kitty", bundleId: "net.kovidgoyal.kitty", match: /\/kitty\.app\/|(?:^|\/)kitty(?:\s|$)/ },
   { id: "hyper", bundleId: "co.zeit.hyper", match: /\/Hyper\.app\// },
   { id: "warp", bundleId: "dev.warp.Warp-Stable", match: /\/Warp\.app\// },
-  { id: "vscode", bundleId: "com.microsoft.VSCode", match: /\/Visual Studio Code\.app\/|\/Code\.app\/|Code Helper/ },
+  // `Code Helper` is PATH-ANCHORED (`/Code Helper`). Unanchored it was a substring rule, and the
+  // OpenCode desktop app's own Electron helper — `…/Frameworks/OpenCode Helper.app/Contents/MacOS/
+  // OpenCode Helper` — matched it, resolving to VS Code and activating the WRONG APP (observed live
+  // 2026-08-19: owningTerminalApp(<OpenCode utility pid>) === "vscode"). VS Code's real helper is
+  // always `…/Frameworks/Code Helper*.app/…`, so the leading slash costs nothing and closes the class.
+  { id: "vscode", bundleId: "com.microsoft.VSCode", match: /\/Visual Studio Code\.app\/|\/Code\.app\/|\/Code Helper/ },
   // The Claude desktop app. Matched on the bundle path fragment shared by its Electron main
   // (`…/Claude.app/Contents/MacOS/Claude`) and the `disclaimer` launcher that sits between it and the
   // session's `claude` (`…/Claude.app/Contents/Helpers/disclaimer`) — location-agnostic (never
@@ -277,6 +307,16 @@ const TERMINAL_APPS: TerminalApp[] = [
   // A session that DOES run under the bundle's own `…/ChatGPT.app/Contents/Resources/codex` resolves
   // here by plain ancestry too, so both process shapes land on one rule.
   { id: "codex-desktop", bundleId: "com.openai.codex", match: /\/ChatGPT\.app\/Contents\//, ttyless: true },
+  // The OpenCode desktop app (Electron, bundle id ai.opencode.desktop). The plugin is resident in the
+  // app's node UTILITY process (`…/OpenCode.app/Contents/Frameworks/OpenCode Helper.app/…
+  // --utility-sub-type=node.mojom.NodeService`, verified against the running app 2026-08-19), which is
+  // tty-less exactly like the two entries above — hence `ttyless`. The bundle-path fragment matches the
+  // Electron main AND every helper, so ancestry from the utility process resolves here either way;
+  // opencodeLocateTuiPid hands over the MAIN pid, which outlives a recycled helper.
+  // ponytail: app-activate is the ceiling and it is a COARSER promise than the other two entries make
+  // — this raises the OpenCode app, not the session's window. Upgrade path: an OpenCode deep link (or
+  // a plugin-side window API) that can address one session's window.
+  { id: "opencode-desktop", bundleId: "ai.opencode.desktop", match: /\/OpenCode\.app\/Contents\//, ttyless: true },
 ];
 
 /** The terminal application owning `pid`, found by walking its ancestor chain's argv. The chain is

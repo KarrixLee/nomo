@@ -16,7 +16,10 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-import { b64url, deriveE2EKey, deriveRatchetKey, encryptBlob, fromB64url } from "./crypto";
+import { b64url, Bytes, deriveE2EKey, deriveRatchetKey, encryptBlob, fromB64url } from "./crypto";
+// TYPE-ONLY (erased at build): PendingEventStash.blob IS buildBlob's return type, and duplicating it
+// here is what let the two drift apart.
+import type { buildBlob } from "./hook";
 
 // The plugin's own build version, injected by build.ts as a compile-time define (`__NOMO_VERSION__`,
 // read from plugin/.claude-plugin/plugin.json). Sent as the plaintext `x-cc-version` request header on
@@ -415,9 +418,29 @@ export type CCOp = "start" | "update" | "done" | "end";
 export type CCStatus = "working" | "needsAttention" | "done";
 
 /** Which coding agent drove this event. Omitted-from-the-blob for `claude` (the historical default,
- *  so old records/blobs read as claude); the literal `"codex"` for Codex CLI sessions. The Swift side
- *  keys its per-agent icon/label off the blob's optional `agent` field. */
-export type AgentKind = "claude" | "codex";
+ *  so old records/blobs read as claude); the literal `"codex"` for Codex CLI sessions and
+ *  `"opencode"` for OpenCode ones. The Swift side keys its per-agent icon/label off the blob's
+ *  optional `agent` field — and maps an UNKNOWN value to claude ON PURPOSE, so the OpenCode plugin can
+ *  ship before the app release without crashing or losing rows.
+ *
+ *  A third kind is NOT free: the dominant coercion idiom in this repo is
+ *  `record.agent === "codex" ? "codex" : "claude"`, which silently reads opencode as CLAUDE. The ones
+ *  that matter are the blob/record agent literals and anything that would join an OpenCode session
+ *  against a Claude transcript or CC file. */
+export type AgentKind = "claude" | "codex" | "opencode";
+
+/** An agent literal AS IT ARRIVES — off a session record, out of a blob a peer install wrote. It is
+ *  `AgentKind` plus "some string this build has never heard of", because that case is now REAL: two
+ *  nomo installs at different versions coexist on one machine (Claude Code and OpenCode ship separate
+ *  dists), so the OLDER build routinely reads records stamped by the NEWER one.
+ *
+ *  Nothing may COERCE such a value. Observed live: a 2.0.2 watchdog rebuilt a `done` envelope for an
+ *  `agent:"opencode"` record, `adapterFor` fell through to claude, claude's `blobAgentFields` is `{}`,
+ *  and the agent key vanished from the rebuilt blob — the Dynamic Island flipped from OpenCode to
+ *  Claude Code. The wire value must survive a build that does not understand it; see adapterFor's
+ *  passthrough adapter. This mirrors iOS, where `CCAgent.from(blobValue:)` maps unknown → .claude for
+ *  RENDERING only and never rewrites what it was sent. */
+export type AgentKindWire = AgentKind | (string & {});
 
 /** Codex's config home — `$CODEX_HOME` when set & non-empty, else `~/.codex`. Mirrors codex's own
  *  `find_codex_home` (codex-rs/utils/home-dir): the env var wins, otherwise the default dot-dir. Used
@@ -542,7 +565,9 @@ export interface CodexDaemonStartDeps {
   spawnFn?: (command: string, args: readonly string[]) => {
     on(event: "error", listener: (error: unknown) => void): unknown;
     on(event: "exit", listener: (code: number | null, signal: string | null) => void): unknown;
-    kill(signal?: string): boolean;
+    // Mirrors node's ChildProcess.kill EXACTLY. Declared `signal?: string` it no longer described the
+    // real default (child_process.spawn), so the union of dep-or-default failed to type at all.
+    kill(signal?: NodeJS.Signals | number): boolean;
   };
   probe?: () => Promise<boolean>;
   sleep?: (ms: number) => Promise<void>;
@@ -636,6 +661,32 @@ export async function startCodexAppServerDaemon(deps: CodexDaemonStartDeps = {})
  *  to flag an agent whose hooks aren't firing despite recent activity. */
 export function lastHookPath(agent: AgentKind): string {
   return `${CC_DIR}/last-hook-${agent}`;
+}
+
+/** Where a GLOBAL OpenCode plugin stub lives, newest name first.
+ *
+ *  BOTH DIRECTORY NAMES. OpenCode's discovery glob is `{plugin,plugins}/*.{ts,js}` and this repo wrote
+ *  the SINGULAR alias until 631f3f2 (2026-08-19). A machine that installed before that and has not
+ *  re-run the installer still loads a perfectly good plugin out of `plugin/`; reading it as absent
+ *  would report a working install as missing. `plugins/` is checked first because it is what we write
+ *  now.
+ *
+ *  GLOBAL SCOPE ONLY — `opencode-install.sh --project` writes into `<project>/.opencode`, which a
+ *  caller with project context appends itself (opencode-update does; status-cmd has none). */
+export function opencodeStubPaths(): string[] {
+  // Mirrors the installer's own `${XDG_CONFIG_HOME:-$HOME/.config}/opencode`.
+  const base = `${process.env.XDG_CONFIG_HOME || `${process.env.HOME}/.config`}/opencode`;
+  return [`${base}/plugins/nomo.js`, `${base}/plugin/nomo.js`];
+}
+
+/** The absolute `<plugin-root>/dist/opencode.js` an installed stub re-exports, or undefined when the
+ *  file is not one of ours. THE ONE PARSE, shared by status-cmd (which reports a dangling stub) and
+ *  opencode-update (which recovers the checkout to update FROM it — the stub is the only statement of
+ *  which copy OpenCode actually imports). Deliberately the same shape opencode-install.sh verifies
+ *  with after writing the file; two readers of a one-line format is exactly where a second, subtly
+ *  different regex would rot. */
+export function opencodeStubTarget(text: string): string | undefined {
+  return /^export \{ default \} from "(.+)";$/m.exec(text)?.[1];
 }
 
 // --- project-folder identity (the phone's session grouping) -------------------------------------
@@ -909,8 +960,9 @@ export interface SessionRecord {
   /** Which agent drove this session. Absent → claude (backward-compat for records the pre-codex hook
    *  wrote). The watchdog reads it to pick the agent-specific interrupt marker (claude "interrupted
    *  by user" vs codex "turn_aborted") and to rebuild an interrupt-corrective done blob with the same
-   *  `agent` key the hook stamped. */
-  agent?: AgentKind;
+   *  `agent` key the hook stamped. Typed WIRE-wide (see AgentKindWire): a record on this disk may have
+   *  been written by a NEWER peer install that knows agent kinds this build does not. */
+  agent?: AgentKindWire;
   /** The session's TRUE start (epoch ms), parsed once from the transcript head and cached here so
    *  subsequent hooks and the watchdog re-send it WITHOUT re-parsing — and so it survives even if the
    *  transcript is later unavailable. Threaded into the envelope's optional `startedAt` on every POST;
@@ -1072,7 +1124,11 @@ export interface PendingEventStash {
   sessionId: string;
   op: CCOp;
   prio: 0 | 1;
-  blob: { status: CCStatus; detail?: string; title: string; machine: string; label: string; agent?: AgentKind; turnStartedAt?: number; model?: string; at?: number; plan?: string; dbg?: string };
+  /** EXACTLY what buildBlob produced — read from its signature rather than re-declared here. The
+   *  hand-copied duplicate this replaces had already drifted: it was missing `folderKey` and `branch`,
+   *  the two keys a stash flush is most likely to be blamed for losing (see codex-notify's note on the
+   *  sealed blob losing both). */
+  blob: ReturnType<typeof buildBlob>;
   /** Epoch-ms the stashing hook fired — bounds the flush to the QR's 10-min TTL (a stale stash is a
    *  ghost from a turn long since over and is dropped, not posted). */
   stashedAt: number;
@@ -1091,7 +1147,7 @@ export interface Config {
   url: string;
   pairingId: string;
   pcSecret: string;
-  e2eKey: Uint8Array;
+  e2eKey: Bytes;
   /** Optional friendly machine name; overrides the OS hostname in the blob when set. */
   machineName?: string;
 }
@@ -1114,7 +1170,7 @@ export function parseConfig(raw: string): Config | null {
   ) {
     return null;
   }
-  let e2eKey: Uint8Array;
+  let e2eKey: Bytes;
   try {
     e2eKey = fromB64url(c.e2eKeyB64);
   } catch {
@@ -1149,17 +1205,17 @@ export interface PendingConfig {
   url: string;
   pairingId: string;
   pcSecret: string;
-  qrSecret: Uint8Array;
+  qrSecret: Bytes;
   /** The 32-byte PBKDF2 codeIkm for the magic-code pairing path (pairing v2), persisted alongside
    *  qrSecret so `wait` / the watchdog self-heal can complete a CODE claim without recomputing the
    *  600k-iteration PBKDF2. Absent when the worker assigned no channel (QR-only) or for a config
    *  written by an older `pair` — a `path:"code"` claim then can't be completed (treated as tampered). */
-  codeIkm?: Uint8Array;
+  codeIkm?: Bytes;
   /** The PC's ephemeral P-256 private key (pkcs8 DER), generated by pairStart and persisted 0600 so
    *  `wait` / the watchdog self-heal can finish the pairing-v3 ratchet once the phone claims (it needs
    *  the phone's ephemeral public key from /pair/status to derive the durable K1). Absent for a config
    *  written by an older `pair` (pre-v3) — a claim then can't complete the ratchet (treated as tampered). */
-  pcEphPriv?: Uint8Array;
+  pcEphPriv?: Bytes;
   machineName?: string;
   /** Epoch-ms the pairing was STARTED (stamped by pairStart). Bounds the self-heal window: past
    *  createdAt + the 10-min QR TTL, a still-pending config is expired. Optional so a config written by
@@ -1186,7 +1242,7 @@ export function parsePendingConfig(raw: string): PendingConfig | null {
   ) {
     return null;
   }
-  let qrSecret: Uint8Array;
+  let qrSecret: Bytes;
   try {
     qrSecret = fromB64url(c.qrSecretB64);
   } catch {
@@ -1196,7 +1252,7 @@ export function parsePendingConfig(raw: string): PendingConfig | null {
   // codeIkm is optional (the magic-code path): present only when the worker assigned a channel. A
   // malformed or wrong-length value is ignored (treated as absent) — a code claim then fails the tamper
   // gate rather than crashing the parse; the QR path is unaffected.
-  let codeIkm: Uint8Array | undefined;
+  let codeIkm: Bytes | undefined;
   if (typeof c.codeIkmB64 === "string") {
     try {
       const decoded = fromB64url(c.codeIkmB64);
@@ -1208,7 +1264,7 @@ export function parsePendingConfig(raw: string): PendingConfig | null {
   // The PC's ephemeral ratchet private key (pkcs8 DER). Optional (absent for a pre-v3 config); a
   // corrupt value is ignored (treated as absent) so the pending config still parses — completion then
   // fails the ratchet's tamper gate rather than crashing here.
-  let pcEphPriv: Uint8Array | undefined;
+  let pcEphPriv: Bytes | undefined;
   if (typeof c.pcEphPrivB64 === "string") {
     try {
       pcEphPriv = fromB64url(c.pcEphPrivB64);
@@ -1247,7 +1303,7 @@ const CONFIG_MODE = 0o600;
  *  yields a non-string), fall back to the raw UTF-8. Doubles as the pairing's tamper gate — a wrong
  *  key (a manipulated QR/nonce) fails GCM's tag check and rejects, so a tampered claim never persists
  *  a bogus key. Kept here (not in crypto.ts) so both the pair CLI and the watchdog self-heal share it. */
-export async function decryptDeviceName(key: Uint8Array, blob: string): Promise<string> {
+export async function decryptDeviceName(key: Bytes, blob: string): Promise<string> {
   const bin = atob(blob);
   const combined = new Uint8Array(bin.length);
   for (let i = 0; i < bin.length; i++) combined[i] = bin.charCodeAt(i);
@@ -1318,7 +1374,7 @@ const PENDING_STASH_STALE_MS = 600_000;
  *  a CC session) or a stale stash → silent no-op. One-shot: the stash is deleted regardless of POST
  *  outcome, so a leftover can never resurface as a ghost session on a later pairing. */
 async function flushPendingStash(
-  stashPath: string, url: string, pairingId: string, pcSecret: string, e2eKey: Uint8Array, now: number,
+  stashPath: string, url: string, pairingId: string, pcSecret: string, e2eKey: Bytes, now: number,
   fetchFn: typeof fetch, fetchTimeoutMs: number, attempts: number, retryDelayMs: number, sleep: (ms: number) => Promise<void>,
   isAlive: (pid: number) => boolean, ensureWD: () => void, sessionsDir: string,
 ): Promise<void> {
@@ -1380,7 +1436,12 @@ async function flushPendingStash(
           // Carry the agent so a LATER interrupt/heartbeat on this flushed session uses the right
           // marker. The stash's plaintext blob already holds `agent` (buildBlob stamped it), so we
           // derive it from there rather than adding a redundant top-level stash field.
-          ...(stash.blob.agent === "codex" ? { agent: "codex" as const } : {}),
+          //
+          // THE SAME OMIT-FOR-CLAUDE RULE every other producer uses (hook.ts's blob/record literals,
+          // lan-frames' two frame builders): absent MEANS claude, and any OTHER kind rides out
+          // verbatim. A binary `=== "codex"` test here silently demoted opencode — and every future
+          // agent a newer peer install may have stamped — to Claude Code for the flushed session's life.
+          ...(stash.blob.agent && stash.blob.agent !== "claude" ? { agent: stash.blob.agent } : {}),
           // Cache the stash's title (if any) and the pairing this blob was sealed under, mirroring
           // trackSession — so a watchdog corrective keeps the title and the heartbeat's key-rotation
           // guard can prove the blob decryptable.
@@ -1457,7 +1518,7 @@ export async function completePendingPairing(
   // phone's ephemeral public key from the claim. Missing either → we can't finish the ratchet, so this
   // claim can't be completed: treat it as tampered rather than persisting a bogus key.
   if (!pending.pcEphPriv || typeof body.phoneEphPub !== "string") return { state: "tampered" };
-  let e2eKey: Uint8Array;
+  let e2eKey: Bytes;
   let deviceName: string;
   try {
     // K1 = HKDF(ikm=ECDH(dPC, QPh), salt=K0, info="nomo-cc-ratchet-v1|"+pairingId). deviceNameEnc is
@@ -1530,6 +1591,20 @@ export async function completePendingPairing(
 //   2. UPGRADE UNDER A LIVE DAEMON — the watchdog lingers up to 30 min between sessions, so a plugin
 //      update installed mid-session would keep running the OLD bundle indefinitely. The pidfile carries
 //      the incumbent's PLUGIN_VERSION so ensureWatchdog can SIGTERM a mismatched build and spawn fresh.
+//   3. PEER INSTALLS AT DIFFERENT VERSIONS — the rule in (2) was written when a mismatch could only
+//      mean an UPGRADE: Claude Code and Codex ship from one build, so their versions could never
+//      disagree. OpenCode is the first PEER install (its own dist, updated on its own schedule), and a
+//      plain "mismatch → SIGTERM" makes two peers evict each other forever: an OpenCode event spawns
+//      the newer daemon, the next Claude hook SIGTERMs it back to the older one, round and round. That
+//      is not just churn — the LAN listener lives IN the watchdog, so it flaps down/up on every event
+//      (`{"event":"lan","result":"bound","reused":true}`), and the older daemon then REBUILDS frames
+//      with an adapter table that predates the newer peer's agent kinds.
+//      So: HIGHEST VERSION WINS (watchdogVersionOutranks). Strictly newer → evict and take over. Equal
+//      → leave it alone. Older → accept the newer daemon and do NOT downgrade it. The newest build
+//      knows the most agent kinds, so it is the one that must own frame rebuilding; an older peer
+//      pulling the daemon back down is exactly what corrupts frames. A DELIBERATE downgrade therefore
+//      needs an explicit reset — `reset` (src/entries/reset.ts, `/nomo-cc:reset`) stops the watchdog
+//      and removes the pidfile, after which the next hook of any build spawns fresh.
 //
 // FORMAT — `"<pid> <version>"`, deliberately parseInt-COMPATIBLE: every existing reader (status-cmd,
 // reset, this module, the watchdog's own claim/release) does `parseInt(raw.trim(), 10)`, which stops at
@@ -1590,6 +1665,39 @@ export function watchdogBuildStamp(path: string = WATCHDOG_PATH): string | undef
 export function watchdogBuildDiffers(incumbent: string | undefined, current: string | undefined): boolean {
   if (incumbent === undefined || current === undefined) return false;
   return incumbent !== current;
+}
+
+/** Does the build stamped `mine` OUTRANK a live incumbent stamped `incumbent` — i.e. may it evict it?
+ *  The peer-install rule from note (3) above, and the ONLY place versions are ordered.
+ *
+ *  RULES, all fail-safe (when in doubt, leave the running daemon alone):
+ *    - incumbent version ABSENT (a pre-stamp build wrote a bare-pid pidfile) → older by construction →
+ *      outranked, we take over. That is the one "unknown" that is genuinely knowable.
+ *    - both parse → strict numeric comparison, component by component. Numeric, never lexical:
+ *      "2.10.0" outranks "2.9.0" and "2.1.1" outranks "2.0.2", both of which a string compare gets
+ *      backwards.
+ *    - EITHER side unparseable → false. Not evicting costs at worst a stale daemon until the next
+ *      real upgrade or a `reset`; evicting on a version we cannot read is how the eviction loop starts.
+ *  Build metadata ("0.8.10+codex.3") and prerelease tags ("0.0.0-dev", the unbundled sentinel) are
+ *  dropped before comparison, so the dev sentinel orders as 0.0.0 — the LOWEST version there is. A raw
+ *  source run therefore never evicts an installed release; `reset` is the way to hand it the daemon.
+ *  Equal versions return false here; the same-version REBUILD case is handled by the build stamp
+ *  (watchdogBuildDiffers), which is what keeps a fix rebuilt in place from running nowhere. Pure. */
+export function watchdogVersionOutranks(mine: string, incumbent: string | undefined): boolean {
+  if (incumbent === undefined) return true;
+  const parse = (v: string): number[] | undefined => {
+    const core = v.trim().split("+")[0]!.split("-")[0]!;
+    if (core.length === 0) return undefined;
+    const parts = core.split(".").map((p) => (/^\d+$/.test(p) ? Number(p) : Number.NaN));
+    return parts.some((n) => !Number.isFinite(n)) ? undefined : parts;
+  };
+  const a = parse(mine), b = parse(incumbent);
+  if (a === undefined || b === undefined) return false;
+  for (let i = 0; i < Math.max(a.length, b.length); i++) {
+    const x = a[i] ?? 0, y = b[i] ?? 0;
+    if (x !== y) return x > y;
+  }
+  return false;
 }
 
 /** Render the pidfile contents for THIS process (see the format note above). The build stamp is
@@ -1654,21 +1762,31 @@ export interface EnsureWatchdogDeps extends WatchdogIdentityDeps {
 
 /** Ensure the detached liveness/self-heal watchdog is running the CURRENT build: if its pidfile is
  *  missing, names a dead process, names a RECYCLED pid (alive but not a watchdog — see
- *  watchdogHolderIsLive), or names a live watchdog running a DIFFERENT plugin version, spawn a fresh one
- *  and let go of it (detached + unref'd, no stdio) so the caller never waits on it. A version-mismatched
- *  incumbent is SIGTERMed first — exactly once per call, and only after the identity check proves it
- *  really is our watchdog — so it releases the pidfile through its normal shutdown path instead of being
- *  left to run stale code for the rest of its 30-min idle grace. The runtime is NOMO_RUNTIME (the run.sh
+ *  watchdogHolderIsLive), or names a live watchdog this build OUTRANKS (an older plugin version, or the
+ *  same version rebuilt in place), spawn a fresh one and let go of it (detached + unref'd, no stdio) so
+ *  the caller never waits on it. Such an incumbent is SIGTERMed first — exactly once per call, and only
+ *  after the identity check proves it really is our watchdog — so it releases the pidfile through its
+ *  normal shutdown path instead of being left to run stale code for the rest of its 30-min idle grace.
+ *  A live watchdog from an EQUAL-or-NEWER build is left strictly alone and nothing is spawned: peers at
+ *  different versions would otherwise evict each other forever (see note (3) on the pidfile above). The runtime is NOMO_RUNTIME (the run.sh
  *  shim's resolved interpreter) when set, else this process's own execPath. Shared by the hook
  *  (post-pair) and `pair` (so a mid-pairing config self-heals even if `wait` is never run). Best-effort
- *  — a spawn failure just falls back to the worker's own staleness eviction / the next hook. */
-export function ensureWatchdog(deps: EnsureWatchdogDeps = {}): void {
+ *  — a spawn failure just falls back to the worker's own staleness eviction / the next hook.
+ *
+ *  RETURNS whether a live watchdog of an acceptable build was CONFIRMED already running — i.e. this
+ *  call had nothing to do. Every other outcome is false: spawned, opted out, or the check itself threw.
+ *  The one-shot hooks ignore it (their per-invocation cost is inherent). The RESIDENT OpenCode plugin
+ *  uses it to cache that positive for a while, because the check costs a ~341 KB read+hash plus a `ps`
+ *  fork and would otherwise run on every frame inside OpenCode's own event loop. Only the POSITIVE is
+ *  cacheable: a false answer must be re-checked on the very next call, or a dead daemon — the thing
+ *  that reaps rows when the editor dies — would never be respawned. */
+export function ensureWatchdog(deps: EnsureWatchdogDeps = {}): boolean {
   try {
     // Real-entry E2E tests exercise the hook in a child process. They do not need a second, detached
     // daemon to validate hook behavior, and a detached child cannot be joined by Bun's test runner.
     // Keep the opt-out explicit (never inferred from NODE_ENV) so production behavior is unchanged
     // unless a caller deliberately requests it.
-    if (process.env.NOMO_SKIP_WATCHDOG === "1") return;
+    if (process.env.NOMO_SKIP_WATCHDOG === "1") return false;
     const pidPath = deps.pidPath ?? WATCHDOG_PID_PATH;
     const version = deps.version ?? PLUGIN_VERSION;
     const build = "build" in deps ? deps.build : watchdogBuildStamp();
@@ -1685,15 +1803,25 @@ export function ensureWatchdog(deps: EnsureWatchdogDeps = {}): void {
     const raw = readPidfile();
     const holder = typeof raw === "string" ? parseWatchdogPidfile(raw) : null;
     if (holder && watchdogHolderIsLive(holder.pid, deps)) {
-      // A live watchdog on OUR build → nothing to do. A live watchdog on any other build (including an
-      // unstamped pre-upgrade one, or the SAME version rebuilt in place — see watchdogBuildStamp) is
-      // running stale code: retire it, then spawn the current bundle.
-      if (holder.version === version && !watchdogBuildDiffers(holder.build, build)) return;
+      if (holder.version === version) {
+        // Same VERSION: only the build stamp can tell us anything. Identical bundle → nothing to do;
+        // the same version rebuilt in place (the dev loop) → retire the stale bundle. Unchanged.
+        if (!watchdogBuildDiffers(holder.build, build)) return true;
+      } else if (!watchdogVersionOutranks(version, holder.version)) {
+        // A DIFFERENT version we do not outrank: an equal-but-differently-spelled stamp, a NEWER peer
+        // install (OpenCode vs Claude Code — see note (3) above), or a version we cannot parse. Leave
+        // the running daemon alone and do not spawn a second one; the newest build owns the daemon.
+        return true;
+      }
       try { killPid(holder.pid, "SIGTERM"); } catch { /* raced its own exit — spawn anyway */ }
     }
     spawnWatchdog();
+    // A spawn is NOT a confirmation: the daemon is detached and best-effort, so the next caller must
+    // look again (and will then find it live, and only THEN may cache that).
+    return false;
   } catch {
     // Couldn't start it → the Worker's staleness eviction / the next hook still applies.
+    return false;
   }
 }
 
@@ -1776,6 +1904,17 @@ export interface DecisionHold {
   /** The HOLDING HOOK's own pid (not the session's). The feed probes it for liveness, which is what
    *  makes a killed hook release the card in one reconcile pass instead of at the TTL. */
   pid: number;
+  /** APPEND-LAST, OPTIONAL. The holding DECISION's id — the compare-and-clear discriminator for an
+   *  agent whose holds all share one process.
+   *
+   *  Claude and Codex run one hold per short-lived hook PROCESS, so `pid` alone identifies the owner
+   *  and this key is absent (a byte-identical marker to the one they always wrote). OpenCode's holds
+   *  all run inside the ONE resident server, so every concurrent hold in a session stamps the same
+   *  `pid`: without this the first hold to settle passed the pid compare against the SECOND hold's
+   *  marker, unlinked it and re-sealed the record to working — taking down a card the user was still
+   *  looking at and masking the live decisionPending. Never read by the feed (it probes `pid`, which
+   *  is still the truthful liveness handle) — only by clearDecisionHoldAt. */
+  holdId?: string;
 }
 
 /** Deliberately NOT `.json`: every other readdir consumer of SESSIONS_DIR filters on that extension
@@ -1809,6 +1948,12 @@ export async function writeDecisionHoldAt(
  *  needs (see settleDecisionHoldRecordAt): if a parallel tool's newer hold owns this session, our exit
  *  must move neither the marker nor the record, or we would drop a card the user is still looking at.
  *
+ *  `holdId` IS THE SAME RULE FOR AN AGENT WHOSE HOLDS SHARE A PROCESS. OpenCode runs every hold inside
+ *  the one resident server, so pid can no longer tell two concurrent holds in a session apart and the
+ *  first to settle would clear the second's marker (see DecisionHold.holdId). It is compared only when
+ *  BOTH sides have one, so the hook agents — which pass none and write none — take the identical pid
+ *  path they always did.
+ *
  *  `beforeUnlink` runs ONLY when the compare-and-clear accepts, and ALWAYS BEFORE the unlink — this
  *  function is the one place that knows both facts. The order is load-bearing: the LAN frames feed reads
  *  the record and the marker independently per reconcile pass, so a pass that observed "marker gone +
@@ -1816,15 +1961,18 @@ export async function writeDecisionHoldAt(
  *  throwing callback still retires the marker (a wedged card is worse than a stale record). */
 export async function clearDecisionHoldAt(
   sessionsDir: string, sessionId: string, pid: number,
-  beforeUnlink?: () => Promise<void>,
+  beforeUnlink?: () => Promise<void>, holdId?: string,
 ): Promise<boolean> {
   const path = `${sessionsDir}/${decisionHoldFileName(sessionId)}`;
   try {
     const raw = await readFile(path, "utf8").catch(() => undefined);
     if (raw !== undefined) {
-      let owner: number | undefined;
-      try { owner = (JSON.parse(raw) as DecisionHold).pid; } catch { owner = undefined; }
+      let marker: DecisionHold | undefined;
+      try { marker = JSON.parse(raw) as DecisionHold; } catch { marker = undefined; }
+      const owner = marker?.pid;
       if (typeof owner === "number" && owner !== pid) return false; // a newer hold owns this session now
+      // Same session, same process, DIFFERENT decision — a sibling hold stamped over ours.
+      if (holdId !== undefined && typeof marker?.holdId === "string" && marker.holdId !== holdId) return false;
     }
     if (beforeUnlink !== undefined) {
       try { await beforeUnlink(); } catch { /* the marker still goes — see the header */ }
@@ -1886,9 +2034,9 @@ export async function writeDecisionHold(sessionId: string, hold: DecisionHold): 
 }
 
 export async function clearDecisionHold(
-  sessionId: string, pid: number, beforeUnlink?: () => Promise<void>,
+  sessionId: string, pid: number, beforeUnlink?: () => Promise<void>, holdId?: string,
 ): Promise<boolean> {
-  return clearDecisionHoldAt(SESSIONS_DIR, sessionId, pid, beforeUnlink);
+  return clearDecisionHoldAt(SESSIONS_DIR, sessionId, pid, beforeUnlink, holdId);
 }
 
 export async function settleDecisionHoldRecord(

@@ -112,7 +112,7 @@
 import { createServer } from "node:http";
 import { readFile } from "node:fs/promises";
 import { networkInterfaces } from "node:os";
-import { b64url, decryptBlob, deriveLanKey, encryptBlob } from "./crypto";
+import { b64url, Bytes, decryptBlob, deriveLanKey, encryptBlob } from "./crypto";
 import { createLanFrameStore } from "./lan-frames";
 import type { LanFrameStore } from "./lan-frames";
 import { rememberBounded } from "./bounded-set";
@@ -333,7 +333,7 @@ const textDecoder = new TextDecoder();
 
 /** Best-effort trace with the same argv guard the watchdog's traceFocus uses: unit tests run with the
  *  user's real HOME visible and must never pollute their live session trace. */
-function traceLan(deps: LanListenerDeps, event: object): void {
+function traceLan(deps: { trace?: (event: object) => void }, event: object): void {
   if (deps.trace) {
     try { deps.trace(event); } catch { /* diagnostics only */ }
     return;
@@ -460,7 +460,7 @@ export function createLanListener(deps: LanListenerDeps = {}): LanListener {
    *  decrypt (there is no key) and gets the same opaque 400 as a wrong-key probe. */
   let config: Config | null = null;
   /** K_lan for `config`, as a promise so a request never races the derivation. */
-  let keyPromise: Promise<Uint8Array | null> = Promise.resolve(null);
+  let keyPromise: Promise<Bytes | null> = Promise.resolve(null);
   /** Memo of what keyPromise was derived from — pairingId AND the key bytes, because a re-pair can in
    *  principle keep the id while rotating the key, and a stale K_lan would silently 400 everything. */
   let keyMemo: string | undefined;
@@ -845,19 +845,36 @@ export interface LanHintPublisherDeps {
   address: () => LanAddress | null;
   hosts?: () => string[];
   now?: () => number;
+  /** Diagnostics seam, same contract as LanListenerDeps.trace (tests inject; production writes to the
+   *  session trace). Without it the Mac never recorded that it advertised, which made "was the delay on
+   *  my side or the worker's?" unanswerable from this machine — see the `lan` section of `nomo status`. */
+  trace?: (event: object) => void;
 }
 
 export interface LanHintPublisher {
-  /** The sealed hint to attach to the NEXT /cc/event POST, or undefined when nothing is due. Marks
-   *  itself as published on return — a POST that then fails is covered by the refresh interval, which
-   *  is far cheaper than threading a delivery outcome back through a dozen injected `post:` deps. */
+  /** The sealed hint to attach to the NEXT /cc/event POST, or undefined when nothing is due. The hint
+   *  is IN FLIGHT, not published, until `settle` says otherwise — see settle. */
   take(config: Config | null): Promise<string | undefined>;
+  /** Report what happened to the POST the last `take` attached a hint to.
+   *
+   *  WHY THIS EXISTS. `take` used to stamp its publish clock on RETURN, so a hint handed to a POST that
+   *  then failed — a worker blip, a wifi flap on the interface we just advertised, a 401 — counted as
+   *  published and was not re-attached for another LAN_HINT_REFRESH_MS (5 min). The failure mode is
+   *  self-selecting: the moments a POST fails are exactly the moments the address is likely to have
+   *  just changed. The original note reasoned that threading an outcome back would cost "a dozen
+   *  injected post: deps", but the watchdog has exactly ONE call site (postEvent), so it costs one call.
+   *
+   *  Only the CLOCK rolls back on failure. The sealed ciphertext and its state key are kept, because
+   *  the worker's "is this hint unchanged?" test is a string compare on that exact ciphertext and
+   *  encryptBlob draws a fresh IV every call — so a retry re-attaches the identical bytes (no KV write)
+   *  rather than a resealed copy of the same content. */
+  settle(delivered: boolean): void;
 }
 
 /** Seal the hint, trimming the host list until it fits the ceiling. Returns undefined when even a
  *  single-host hint does not fit (impossible in practice; a hint is ~150 bytes). */
 async function sealHint(
-  key: Uint8Array,
+  key: Bytes,
   hosts: string[],
   port: number,
   lid: string,
@@ -886,6 +903,16 @@ export function createLanHintPublisher(deps: LanHintPublisherDeps): LanHintPubli
   let lastSealed: string | undefined;
   let cachedHosts: string[] = [];
   let cachedAt = 0;
+  /** EVERYTHING the in-flight hint would commit, applied only once the POST carrying it lands (see
+   *  settle). Null whenever no take is outstanding.
+   *
+   *  All three fields commit TOGETHER or not at all. Committing `lastState` early (at seal time, when
+   *  delivery is still unknown) while the clock waited for settle reintroduced the very bug this class
+   *  exists to prevent, one step further in: the next take would match `state === lastState`, fall into
+   *  the refresh branch, and be blocked by a `lastSentAt` still pointing at the last SUCCESSFUL send —
+   *  silent for up to LAN_HINT_REFRESH_MS. Observed 2026-08-23; it escaped notice only because a
+   *  re-pair left lastSentAt at 0, which holds the refresh window open by accident. */
+  let pending: { at: number; state: string; sealed: string; trace: object } | null = null;
 
   const hosts = (t: number): string[] => {
     if (t - cachedAt < LAN_HOSTS_CACHE_MS && cachedAt !== 0) return cachedHosts;
@@ -907,19 +934,32 @@ export function createLanHintPublisher(deps: LanHintPublisherDeps): LanHintPubli
         if (state === lastState) {
           if (t - lastSentAt < LAN_HINT_REFRESH_MS) return undefined;
           if (lastSealed) {
-            lastSentAt = t;
+            pending = { at: t, state, sealed: lastSealed, trace: { result: "hint", why: "refresh", port: addr.port, lid: addr.lid, hosts: list.length } };
             return lastSealed; // byte-identical refresh — see the lastSealed note above
           }
         }
         const sealed = await sealHint(config.e2eKey, list, addr.port, addr.lid, t);
         if (!sealed) return undefined;
-        lastState = state;
-        lastSealed = sealed;
-        lastSentAt = t;
+        // NOTHING is committed here — see the `pending` note. A retry after a failed POST reseals under
+        // a fresh IV, which is correct: the worker never received the earlier bytes, so there is no
+        // string-compare to preserve and no extra KV write to avoid.
+        pending = { at: t, state, sealed, trace: { result: "hint", why: "changed", port: addr.port, lid: addr.lid, hosts: list.length } };
         return sealed;
       } catch {
+        pending = null;
         return undefined; // a hint is an optimization; never let it break a status POST
       }
+    },
+    settle(delivered: boolean): void {
+      const p = pending;
+      pending = null;
+      if (!p || !delivered) return; // failed → NOTHING committed, so the next POST re-attaches immediately
+      lastState = p.state;
+      lastSealed = p.sealed;
+      lastSentAt = p.at;
+      // Traced on DELIVERY only, so `nomo status` reports when the address actually went out rather
+      // than when we hoped it would — the whole point of having the line.
+      traceLan(deps, p.trace);
     },
   };
 }

@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { decryptBlob, encryptBlob } from "../core/crypto";
+import { Bytes, decryptBlob, encryptBlob } from "../core/crypto";
 import { createLanAnswerStore } from "../core/lan-listener";
 import type { DecisionHold, PlanPickerTraceDecision, SessionRecord } from "../core/shared";
 import { GONE_STRIKE_LIMIT, readGoneStrikes, recordGoneStrike, resetGoneStrikes, tracePlanPickerDecision } from "../core/shared";
@@ -27,7 +27,8 @@ import {
 import type { CommandPayload, DrainCommandsDeps, PostOutcome, RecordEntry } from "./cc-watchdog";
 import { resolveOnRelay } from "../core/codex-remote-input";
 import { CODEX_PROXY_STDOUT_ENDED } from "../core/codex-proxy-transport";
-import { STATE_HOLD_MAX_AGE_MS } from "../core/session-state";
+import { buildStatePlaintext, STATE_HOLD_MAX_AGE_MS } from "../core/session-state";
+import { lanFrameContent } from "../core/lan-frames";
 import { claudeAdapter, codexAdapter } from "../core/adapter";
 import type { AgentAdapter, DiscoveredSession } from "../core/adapter";
 import type { Config, PendingConfig } from "../core/shared";
@@ -482,6 +483,54 @@ describe("shouldRepairTitle (heal a permanent blank codex title)", () => {
   });
 });
 
+// THE REBRAND BUG (2026-08-19, observed live on a real record): `agent:"opencode"` on disk but
+// `blob.agent === undefined` on the phone, so the island rendered it as Claude Code. A 2.0.2 watchdog
+// picked up a failed `done` retry, rebuilt the envelope, and `adapterFor("opencode")` — a kind that
+// build had never heard of — fell through to claudeAdapter, whose `blobAgentFields` is `{}`. The agent
+// key did not survive the rebuild.
+//
+// The invariant: a blob field must be threaded through BOTH frame producers — the POST path (these
+// envelopes) and the app-local LAN rollup (buildStatePlaintext) — or the local frame silently reverts.
+// So this covers every rebuild path at once, for a kind THIS build does not know either.
+describe("an agent kind this build does not know survives every rebuild path", () => {
+  const FUTURE = "some-future-agent";
+  const r = rec({ agent: FUTURE, title: "t", folderKey: "0123456789ab", blob: "sealed-by-the-peer", ts: 5_000, pairingId: "p1" });
+  const blobOf = async (env: object) => (await decryptBlob(KEY, (env as { blob: string }).blob)) as Record<string, unknown>;
+
+  test("the four watchdog correctives re-emit the raw literal (not claude, not nothing)", async () => {
+    const frames = [
+      await blobOf(await buildDoneEnvelope("s", r, 5_000, KEY, FUTURE, 5)),
+      await blobOf(await buildNeedsAttentionEnvelope("s", r, 5_000, KEY, FUTURE, 5)),
+      await blobOf(await buildWorkingEnvelope("s", r, 5_000, KEY, FUTURE)),
+      await blobOf(await buildTitleRepairEnvelope("s", r, "fixed", 5_000, KEY, FUTURE, 5)),
+    ];
+    for (const blob of frames) expect(blob.agent).toBe(FUTURE);
+  });
+
+  test("the heartbeat/discovery builders carry it too", async () => {
+    const fields = { agent: FUTURE };
+    const d = { sessionId: "s", pid: 4242, title: "t", label: "proj", cwd: "/w" } as unknown as DiscoveredSession;
+    expect(await decryptBlob(KEY, await buildProvisionalBlob(d, "mac", fields, KEY, 5)))
+      .toMatchObject({ agent: FUTURE });
+    expect(buildProvisionalRecord(d, "mac", "b", fields, 5_000, "p1", false).agent).toBe(FUTURE);
+  });
+
+  test("the app-local rollup (buildStatePlaintext) agrees with the POST path, key for key", () => {
+    expect(buildStatePlaintext(r, "done", 5_000).agent).toBe(FUTURE);
+  });
+
+  test("the clear LAN envelope carries it as well (it was never the coercing half)", () => {
+    expect(lanFrameContent(r, "p1")?.agent).toBe(FUTURE);
+  });
+
+  test("…and claude is still OMITTED everywhere, which is what the coercion was hiding behind", async () => {
+    const c = { ...r, agent: undefined };
+    expect(await blobOf(await buildDoneEnvelope("s", c, 5_000, KEY, "claude", 5))).not.toHaveProperty("agent");
+    expect(buildStatePlaintext(c, "done", 5_000)).not.toHaveProperty("agent");
+    expect(lanFrameContent(c, "p1")).not.toHaveProperty("agent");
+  });
+});
+
 describe("buildTitleRepairEnvelope (re-POST current state with only the title fixed)", () => {
   test("preserves the session's op/prio/status and fixes the title in the rebuilt blob", async () => {
     const record = rec({ agent: "codex", lastEvent: "working", op: "update", prio: 0, model: "gpt-5-codex" });
@@ -535,8 +584,8 @@ describe("buildEndEnvelope (reap → v2 op:end, no blob)", () => {
     expect(e.v).toBe(2);
     expect(typeof e.sessionId).toBe("string");
     expect(e.op).toBe("end");
-    expect([0, 1]).toContain(e.prio);
-    expect(Number.isFinite(e.ts) && (e.ts as number) > 0).toBe(true);
+    expect([0, 1]).toContain(e.prio as number);
+    expect(Number.isFinite(e.ts as number) && (e.ts as number) > 0).toBe(true);
     expect(e).not.toHaveProperty("blob");
   });
   test("carries the record's cached start when given one; omits it for the recordless call", () => {
@@ -855,7 +904,7 @@ describe("discoverLiveSessions (generic adapter-driven step)", () => {
     const adapter = { kind: "codex", blobAgentFields: { agent: "codex" },
       discoverLive: async (k: SessionRecord[]) => { seen = k; return []; } } as unknown as AgentAdapter;
     await discoverLiveSessions(cfg(), { adapters: [adapter], readRecords: async () => known, post: async () => "delivered" as PostOutcome, writeRecord: async () => {} });
-    expect(seen).toBe(known);
+    expect(seen as SessionRecord[] | null).toBe(known);
   });
 
   test("a discoverLive throw never derails the step (best-effort)", async () => {
@@ -1530,7 +1579,7 @@ describe("buildNeedsAttentionEnvelope (dropped-hook corrective → same envelope
       "s", rec({ machine: "Mac", label: "proj" }), 5, KEY, "codex", 5, undefined, "userInput",
       "# Plan\n\n" + "x".repeat(5000),
     ) as Record<string, unknown>;
-    const pendingBlob = await decryptBlob(KEY, pending.blob as string);
+    const pendingBlob = await decryptBlob(KEY, pending.blob as string) as Record<string, unknown>;
     expect(pendingBlob.plan).toBeString();
     expect((pendingBlob.plan as string).endsWith("\n…")).toBe(true);
     const ordinary = await buildNeedsAttentionEnvelope(
@@ -1971,7 +2020,7 @@ describe("correctPlanPickerVerification (watchdog owns flush settlement)", () =>
     expect(writes[0].planPickerVerificationPending).toBeUndefined();
     expect(writes[0].planPickerSettled).toBeUndefined();
     expect(writes[0].planPickerPendingSince).toBe(NOW);
-    expect((await decryptBlob(KEY, posts[0].blob as string)).dbg).toContain("dq:idle(ign)");
+    expect((await decryptBlob(KEY, posts[0].blob as string) as Record<string, unknown>).dbg).toContain("dq:idle(ign)");
   });
 
   test("daemon unavailable sustains the picker initially, but the hard TTL still resolves it", async () => {
@@ -3492,7 +3541,7 @@ describe("drainCommands (authenticate, validate, then execute)", () => {
 
   /** A sealed command exactly as the phone would produce it. */
   const sealed = async (
-    over: Partial<CommandPayload> = {}, opts: { id?: string; key?: Uint8Array } = {},
+    over: Partial<CommandPayload> = {}, opts: { id?: string; key?: Bytes } = {},
   ): Promise<{ id: string; blob: string }> => ({
     id: opts.id ?? `cmd-${++nonceSeq}`,
     blob: await encryptBlob(opts.key ?? KEY, {
@@ -4076,6 +4125,45 @@ describe("isWaitingSession", () => {
   test("a terminal row is never waiting, whatever else it still carries", () => {
     expect(isWaitingSession(rec({ op: "done", prio: 1 }))).toBe(false);
     expect(isWaitingSession(rec({ lastEvent: "done", pendingPlanPicker: true }))).toBe(false);
+  });
+});
+
+describe("heartbeatKind — the fresh-pairing greet beat", () => {
+  const fresh = (over: Partial<SessionRecord> = {}): SessionRecord =>
+    rec({ ts: 1_000_000, lastEvent: "working", op: "update", prio: 0, blob: "B", ...over });
+
+  test("a just-paired phone gets the envelope a hook-fresh session would otherwise withhold for 5 min", () => {
+    // The regression case verbatim: the session that ran the pair command fired its hooks seconds ago,
+    // so BOTH quiet gates say "skip" and the app spins until the user's next prompt.
+    const now = 1_000_000 + 1_000;
+    expect(heartbeatKind(fresh(), now, undefined, undefined, false)).toBe("none");
+    expect(heartbeatKind(fresh(), now, undefined, undefined, false, true)).toBe("greet");
+  });
+
+  test("it is one-shot: once the sweep claims the pairing, the 5-minute cadence resumes exactly", () => {
+    const now = 1_000_000 + 1_000;
+    expect(heartbeatKind(fresh(), now, undefined, undefined, false, false)).toBe("none");
+    expect(heartbeatKind(fresh(), 1_000_000 + 300_000, undefined, undefined, false, false)).toBe("stale");
+  });
+
+  test("it never adds a SECOND post to a session already beating", () => {
+    // Stale and waiting both outrank greet, so a fresh pairing costs at most one POST per session.
+    expect(heartbeatKind(fresh(), 1_000_000 + 300_000, undefined, undefined, false, true)).toBe("stale");
+    const parked = rec({ ts: 1_000_000, lastEvent: "needsAttention", op: "update", prio: 1, blob: "B" });
+    expect(heartbeatKind(parked, 1_000_000 + WAITING_HEARTBEAT_AFTER_MS, undefined, undefined, false, true)).toBe("waiting");
+  });
+
+  test("every ownership guard still stands down — the greet can never resurrect a retiring session", () => {
+    const now = 1_000_000 + 1_000;
+    expect(heartbeatKind(fresh({ op: "done" }), now, undefined, undefined, false, true)).toBe("none");
+    expect(heartbeatKind(fresh({ doneAttempts: 1 }), now, undefined, undefined, false, true)).toBe("none");
+    expect(heartbeatKind(fresh(), now, undefined, undefined, true, true)).toBe("none"); // a net owns it this sweep
+    expect(heartbeatKind(fresh({ ts: undefined as unknown as number }), now, undefined, undefined, false, true)).toBe("none");
+  });
+
+  test("pairingIsNew defaults to false, so every existing 5-argument call is unchanged", () => {
+    const now = 1_000_000 + 1_000;
+    expect(heartbeatKind(fresh(), now, undefined, undefined, false)).toBe("none");
   });
 });
 

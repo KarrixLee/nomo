@@ -18,6 +18,7 @@
 // option, but node:crypto keeps the 600k-iteration call synchronous-friendly and matches the app).
 
 import { pbkdf2 } from "node:crypto";
+import { Bytes } from "./crypto";
 import { BIP39_WORDLIST } from "./wordlist";
 
 /** The pending-pairing TTL / code lifetime salt tag — bumping this string invalidates every code, so
@@ -62,10 +63,10 @@ export function randomCodeWords(
 /** PBKDF2-SHA256(password = words.join("-"), salt = "nomo-pair-code-v2|" + pairingId, 600000, 32) →
  *  the 32-byte codeIkm that replaces qrSecret as the HKDF input for the code pairing path. Words ONLY —
  *  the channel is never part of the password. */
-export function deriveCodeIkm(words: string[], pairingId: string): Promise<Uint8Array> {
+export function deriveCodeIkm(words: string[], pairingId: string): Promise<Bytes> {
   const password = words.join("-");
   const salt = `${CODE_SALT_PREFIX}${pairingId}`;
-  return new Promise<Uint8Array>((resolve, reject) => {
+  return new Promise<Bytes>((resolve, reject) => {
     pbkdf2(password, salt, PBKDF2_ITERATIONS, CODE_KEY_LEN, "sha256", (err, derived) => {
       if (err) reject(err);
       else resolve(new Uint8Array(derived));

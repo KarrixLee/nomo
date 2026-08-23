@@ -9,7 +9,7 @@ import {
   folderIdentity, resolveGitDir, sessionBranch,
   codexAppServerSocketAvailable, codexAppServerSocketPath, codexAppServerSocketState, codexCompanionBrokerEvidence,
   DBG_BLOB_TEXT_MAX_CHARS, startCodexAppServerDaemon,
-  decisionHoldFileName, ensureWatchdog, formatWatchdogPidfile, fullTextForRecord, isWatchdogCommand,
+  decisionHoldFileName, ensureWatchdog, formatWatchdogPidfile, fullTextForRecord, isWatchdogCommand, watchdogVersionOutranks,
   readDecisionHoldAt, writeDecisionHoldAt,
   localApprovalsState, parseWatchdogPidfile, PLUGIN_VERSION, postFullText, RECORD_FULL_TEXT_MAX_CHARS,
   RECORD_FULL_TEXT_TRUNCATION_MARKER, recordFullTextIsComplete, settleDecisionHoldRecordAt,
@@ -97,7 +97,10 @@ describe("release version stamp (manifests ↔ committed dist)", () => {
     const expected = sourcePick(await manifestVersion(sourcePath))[0];
 
     const distDir = join(REPO_ROOT, "plugin", "dist");
-    const bundles = (await readdir(distDir)).filter((f) => f.endsWith(".mjs"));
+    // .mjs is every hook/command entry; .js is the OpenCode plugin, whose extension is forced
+    // by OpenCode's `{plugin,plugins}/*.{ts,js}` discovery glob. Both carry the injected stamp,
+    // so both must be checked or a stale OpenCode bundle ships unnoticed.
+    const bundles = (await readdir(distDir)).filter((f) => /\.(mjs|js)$/.test(f));
     expect(bundles.length).toBeGreaterThan(0);
 
     for (const bundle of bundles) {
@@ -274,6 +277,94 @@ describe("ensureWatchdog (spawn gate: recycled pids and stale builds must not bl
     expect(run("777 1.4.3", { build: undefined })).toEqual({ kills: [[777, "SIGTERM"]], spawned: 1 });
   });
 
+  // THE PEER BUG (2026-08-19): "different build" used to mean "an upgrade", because Claude Code and
+  // Codex ship from ONE bundle and could not disagree. OpenCode is the first PEER install, so the two
+  // now sit at different versions on one machine — and plain mismatch→SIGTERM made them evict each
+  // other on every event (observed live: the watchdog-hosted LAN listener rebinding in a loop, and a
+  // 2.0.2 daemon rebuilding an OpenCode frame it had no adapter for). Highest version wins.
+  describe("peer installs: only a STRICTLY NEWER build may take the daemon", () => {
+    test("newer → SIGTERM the incumbent and spawn", () => {
+      expect(run("777 1.4.3", { version: "1.4.4" })).toEqual({ kills: [[777, "SIGTERM"]], spawned: 1 });
+      // The live pair, and the case a LEXICAL compare gets backwards: "2.1.1" < "2.0.2" as strings.
+      expect(run("777 2.0.2", { version: "2.1.1" })).toEqual({ kills: [[777, "SIGTERM"]], spawned: 1 });
+    });
+
+    test("EQUAL → leave it strictly alone (no kill, and no second daemon either)", () => {
+      expect(run("777 1.4.4", { version: "1.4.4" })).toEqual({ kills: [], spawned: 0 });
+      // Numerically equal but spelled differently (build metadata) is still equal — not a takeover.
+      expect(run("777 1.4.4", { version: "1.4.4+codex.3" })).toEqual({ kills: [], spawned: 0 });
+    });
+
+    test("OLDER → accept the newer daemon: never downgrade it, never spawn beside it", () => {
+      expect(run("777 2.3.0", { version: "2.1.1" })).toEqual({ kills: [], spawned: 0 });
+      expect(run("777 2.10.0", { version: "2.9.0" })).toEqual({ kills: [], spawned: 0 });
+    });
+
+    test("the two-digit trap: 2.10.0 outranks 2.9.0, both directions", () => {
+      expect(watchdogVersionOutranks("2.10.0", "2.9.0")).toBe(true);
+      expect(watchdogVersionOutranks("2.9.0", "2.10.0")).toBe(false);
+      expect(watchdogVersionOutranks("2.1.1", "2.0.2")).toBe(true);
+      expect(watchdogVersionOutranks("2.0.2", "2.1.1")).toBe(false);
+    });
+
+    test("ABSENT version (a pre-stamp pidfile) counts as older → we take over", () => {
+      expect(watchdogVersionOutranks("2.1.1", undefined)).toBe(true);
+      expect(run("777", { version: "2.1.1" })).toEqual({ kills: [[777, "SIGTERM"]], spawned: 1 });
+    });
+
+    test("an UNPARSEABLE version on either side fails SAFE — no eviction, no spawn", () => {
+      expect(watchdogVersionOutranks("2.1.1", "who-knows")).toBe(false);
+      expect(watchdogVersionOutranks("who-knows", "2.1.1")).toBe(false);
+      expect(watchdogVersionOutranks("2.1.1", "")).toBe(false);
+      expect(run("777 who-knows", { version: "2.1.1" })).toEqual({ kills: [], spawned: 0 });
+    });
+
+    test("build metadata and the 0.0.0-dev sentinel parse; dev orders LOWEST", () => {
+      expect(watchdogVersionOutranks("0.8.10+codex.3", "0.8.9")).toBe(true);
+      expect(watchdogVersionOutranks("0.8.10+codex.3", "0.8.10+codex.2")).toBe(false); // same numbers
+      // The unbundled sentinel is 0.0.0: a raw-source run never evicts an installed release (use
+      // `reset`), and a release always outranks it.
+      expect(watchdogVersionOutranks("0.0.0-dev", "2.1.1")).toBe(false);
+      expect(watchdogVersionOutranks("2.1.1", "0.0.0-dev")).toBe(true);
+    });
+
+    test("a SAME-version rebuild in place still takes over (the build stamp, unchanged by all this)", () => {
+      expect(run("777 2.1.1 aaa", { version: "2.1.1", build: "bbb" }))
+        .toEqual({ kills: [[777, "SIGTERM"]], spawned: 1 });
+      // …and a build stamp never rescues an OLDER build: the version decides first.
+      expect(run("777 2.3.0 aaa", { version: "2.1.1", build: "bbb" })).toEqual({ kills: [], spawned: 0 });
+    });
+  });
+
+  // The RESIDENT (OpenCode) plugin calls this on every frame, and the check is a ~341 KB hash plus a
+  // `ps` fork on OpenCode's own event loop. It may cache the answer — but only a POSITIVE one, or a
+  // daemon that died mid-session would never be respawned. So the verdict has to be reported.
+  describe("the return value: only a CONFIRMED-live watchdog is cacheable", () => {
+    const seams = (over: Parameters<typeof ensureWatchdog>[0] = {}) => ({
+      readPidfile: () => "777 1.4.4",
+      isAlive: () => true,
+      commandOf: () => WATCHDOG_CMD,
+      killPid: () => {},
+      spawnWatchdog: () => {},
+      version: "1.4.4",
+      ...over,
+    });
+
+    test("a live watchdog this build accepts → true (nothing was done)", () => {
+      expect(ensureWatchdog(seams())).toBe(true);
+      // A NEWER peer owns the daemon: also nothing to do, also cacheable.
+      expect(ensureWatchdog(seams({ readPidfile: () => "777 2.3.0" }))).toBe(true);
+    });
+
+    test("every other outcome is false — a spawn is not a confirmation", () => {
+      expect(ensureWatchdog(seams({ readPidfile: () => undefined }))).toBe(false); // spawned fresh
+      expect(ensureWatchdog(seams({ isAlive: () => false }))).toBe(false);         // dead pid → spawned
+      expect(ensureWatchdog(seams({ readPidfile: () => "777 1.4.3" }))).toBe(false); // takeover
+      expect(ensureWatchdog(seams({ commandOf: () => "/usr/sbin/cupsd" }))).toBe(false); // recycled pid
+      expect(ensureWatchdog(seams({ readPidfile: () => { throw new Error("EIO"); } }))).toBe(false);
+    });
+  });
+
   test("the pidfile carries the build as a THIRD field, and stays parseInt-compatible", () => {
     expect(formatWatchdogPidfile(777, "1.4.4", "abc")).toBe("777 1.4.4 abc");
     expect(Number.parseInt(formatWatchdogPidfile(777, "1.4.4", "abc"), 10)).toBe(777);
@@ -403,8 +494,13 @@ describe("startCodexAppServerDaemon (bounded, non-interactive, never-throwing)",
     const listeners = new Map<string, (...args: unknown[]) => void>();
     const kills: string[] = [];
     const handle = {
-      on(event: string, listener: (...args: unknown[]) => void) { listeners.set(event, listener); return handle; },
-      kill(signal?: string) { kills.push(signal ?? "SIGTERM"); return true; },
+      // `never[]` args is what makes ONE signature stand in for spawnFn's two typed `on` overloads
+      // (parameter positions are contravariant); the fake itself is event-agnostic, hence the store cast.
+      on(event: string, listener: (...args: never[]) => void) {
+        listeners.set(event, listener as (...args: unknown[]) => void);
+        return handle;
+      },
+      kill(signal?: NodeJS.Signals | number) { kills.push(String(signal ?? "SIGTERM")); return true; },
     };
     queueMicrotask(() => script((event, ...args) => listeners.get(event)?.(...args)));
     return { handle, kills };
@@ -647,6 +743,30 @@ describe("the remote-approval hold marker (the LAN channel's decision-pending gu
       expect(await readDecisionHoldAt(d, "s1")).toMatchObject({ pid: 777 });
       expect(await clearDecisionHoldAt(d, "s1", 777)).toBe(true);   // B's exit — the owner
       expect(await readDecisionHoldAt(d, "s1")).toBeNull();
+    } finally {
+      await rm(d, { recursive: true, force: true });
+    }
+  });
+
+  // OpenCode runs EVERY hold inside one resident server, so both concurrent holds carry the same pid
+  // and the pid compare alone cannot tell them apart: hold A's exit unlinked hold B's marker and
+  // re-sealed the record to working, taking down a card the user was still looking at.
+  test("same-pid concurrent holds are told apart by holdId, and the hook agents keep the pid rule", async () => {
+    const d = await dir();
+    try {
+      await writeDecisionHoldAt(d, "s1", { blob: "card-b", at: 2, pid: 777, holdId: "req-b" });
+      // A's exit: same process, DIFFERENT decision → not ours to clear.
+      expect(await clearDecisionHoldAt(d, "s1", 777, undefined, "req-a")).toBe(false);
+      expect(await readDecisionHoldAt(d, "s1")).toMatchObject({ pid: 777, holdId: "req-b" });
+      expect(await clearDecisionHoldAt(d, "s1", 777, undefined, "req-b")).toBe(true);
+      expect(await readDecisionHoldAt(d, "s1")).toBeNull();
+
+      // A marker with NO holdId (every Claude/Codex hold) is unchanged by the new rule, whether or not
+      // the caller has one — one hold per short-lived process, so the pid IS the discriminator.
+      await writeDecisionHoldAt(d, "s1", { blob: "card-a", at: 2, pid: 777 });
+      expect(await readDecisionHoldAt(d, "s1")).toEqual({ blob: "card-a", at: 2, pid: 777 });
+      expect(await clearDecisionHoldAt(d, "s1", 4242, undefined, "req-a")).toBe(false);
+      expect(await clearDecisionHoldAt(d, "s1", 777)).toBe(true);
     } finally {
       await rm(d, { recursive: true, force: true });
     }

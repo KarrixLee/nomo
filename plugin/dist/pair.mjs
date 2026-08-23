@@ -4,7 +4,7 @@ var __require = /* @__PURE__ */ createRequire(import.meta.url);
 // src/entries/pair.ts
 import { spawn as spawn2 } from "node:child_process";
 import { constants as fsConstants } from "node:fs";
-import { access as access2, mkdir as mkdir2, readFile as readFile3, unlink as unlink2 } from "node:fs/promises";
+import { access as access2, mkdir as mkdir2, readFile as readFile3, stat as stat3, unlink as unlink2 } from "node:fs/promises";
 import { dirname as dirname2, join as join2 } from "node:path";
 import { fileURLToPath as fileURLToPath2 } from "node:url";
 
@@ -101,7 +101,7 @@ async function sha256Hex(s) {
 }
 
 // src/core/shared.ts
-var PLUGIN_VERSION = "2.1.0";
+var PLUGIN_VERSION = "2.2.0";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -398,6 +398,13 @@ async function startCodexAppServerDaemon(deps = {}) {
 function lastHookPath(agent) {
   return `${CC_DIR}/last-hook-${agent}`;
 }
+function opencodeStubPaths() {
+  const base = `${process.env.XDG_CONFIG_HOME || `${process.env.HOME}/.config`}/opencode`;
+  return [`${base}/plugins/nomo.js`, `${base}/plugin/nomo.js`];
+}
+function opencodeStubTarget(text) {
+  return /^export \{ default \} from "(.+)";$/m.exec(text)?.[1];
+}
 var FOLDER_KEY_HEX_CHARS = 12;
 var BRANCH_MAX_CHARS = 60;
 var GIT_DIR_WALK_MAX_DEPTH = 64;
@@ -641,7 +648,7 @@ async function flushPendingStash(stashPath, url, pairingId, pcSecret, e2eKey, no
           op: stash.op,
           prio: stash.prio,
           blob,
-          ...stash.blob.agent === "codex" ? { agent: "codex" } : {},
+          ...stash.blob.agent && stash.blob.agent !== "claude" ? { agent: stash.blob.agent } : {},
           ...typeof stash.blob.title === "string" && stash.blob.title.length > 0 ? { title: stash.blob.title } : {},
           ...typeof stash.blob.model === "string" && stash.blob.model.length > 0 ? { model: stash.blob.model } : {},
           ...pairingId.length > 0 ? { pairingId } : {}
@@ -742,6 +749,26 @@ function watchdogBuildDiffers(incumbent, current) {
     return false;
   return incumbent !== current;
 }
+function watchdogVersionOutranks(mine, incumbent) {
+  if (incumbent === undefined)
+    return true;
+  const parse = (v) => {
+    const core = v.trim().split("+")[0].split("-")[0];
+    if (core.length === 0)
+      return;
+    const parts = core.split(".").map((p) => /^\d+$/.test(p) ? Number(p) : Number.NaN);
+    return parts.some((n) => !Number.isFinite(n)) ? undefined : parts;
+  };
+  const a = parse(mine), b = parse(incumbent);
+  if (a === undefined || b === undefined)
+    return false;
+  for (let i = 0;i < Math.max(a.length, b.length); i++) {
+    const x = a[i] ?? 0, y = b[i] ?? 0;
+    if (x !== y)
+      return x > y;
+  }
+  return false;
+}
 function formatWatchdogPidfile(pid, version = PLUGIN_VERSION, build) {
   return `${pid} ${version}${typeof build === "string" && build.length > 0 ? ` ${build}` : ""}`;
 }
@@ -771,7 +798,7 @@ function watchdogHolderIsLive(pid, deps = {}) {
 function ensureWatchdog(deps = {}) {
   try {
     if (process.env.NOMO_SKIP_WATCHDOG === "1")
-      return;
+      return false;
     const pidPath = deps.pidPath ?? WATCHDOG_PID_PATH;
     const version = deps.version ?? PLUGIN_VERSION;
     const build = "build" in deps ? deps.build : watchdogBuildStamp();
@@ -790,14 +817,21 @@ function ensureWatchdog(deps = {}) {
     const raw = readPidfile();
     const holder = typeof raw === "string" ? parseWatchdogPidfile(raw) : null;
     if (holder && watchdogHolderIsLive(holder.pid, deps)) {
-      if (holder.version === version && !watchdogBuildDiffers(holder.build, build))
-        return;
+      if (holder.version === version) {
+        if (!watchdogBuildDiffers(holder.build, build))
+          return true;
+      } else if (!watchdogVersionOutranks(version, holder.version)) {
+        return true;
+      }
       try {
         killPid(holder.pid, "SIGTERM");
       } catch {}
     }
     spawnWatchdog();
-  } catch {}
+    return false;
+  } catch {
+    return false;
+  }
 }
 async function readRecord(sessionId, sessionsDir = SESSIONS_DIR) {
   try {
@@ -828,20 +862,23 @@ async function writeDecisionHoldAt(sessionsDir, sessionId, hold) {
     await atomicWrite(`${sessionsDir}/${decisionHoldFileName(sessionId)}`, JSON.stringify(hold), 384);
   } catch {}
 }
-async function clearDecisionHoldAt(sessionsDir, sessionId, pid, beforeUnlink) {
+async function clearDecisionHoldAt(sessionsDir, sessionId, pid, beforeUnlink, holdId) {
   const path = `${sessionsDir}/${decisionHoldFileName(sessionId)}`;
   try {
     const raw = await readFile(path, "utf8").catch(() => {
       return;
     });
     if (raw !== undefined) {
-      let owner;
+      let marker;
       try {
-        owner = JSON.parse(raw).pid;
+        marker = JSON.parse(raw);
       } catch {
-        owner = undefined;
+        marker = undefined;
       }
+      const owner = marker?.pid;
       if (typeof owner === "number" && owner !== pid)
+        return false;
+      if (holdId !== undefined && typeof marker?.holdId === "string" && marker.holdId !== holdId)
         return false;
     }
     if (beforeUnlink !== undefined) {
@@ -875,8 +912,8 @@ async function readDecisionHoldAt(sessionsDir, sessionId) {
 async function writeDecisionHold(sessionId, hold) {
   return writeDecisionHoldAt(SESSIONS_DIR, sessionId, hold);
 }
-async function clearDecisionHold(sessionId, pid, beforeUnlink) {
-  return clearDecisionHoldAt(SESSIONS_DIR, sessionId, pid, beforeUnlink);
+async function clearDecisionHold(sessionId, pid, beforeUnlink, holdId) {
+  return clearDecisionHoldAt(SESSIONS_DIR, sessionId, pid, beforeUnlink, holdId);
 }
 async function settleDecisionHoldRecord(sessionId, patch) {
   return settleDecisionHoldRecordAt(SESSIONS_DIR, sessionId, patch);
@@ -1007,7 +1044,7 @@ function codexCompanionBrokerEvidence(pid, ancestorsOf = pidAncestors, commandOf
 }
 
 // src/core/notify-wire.ts
-import { readFile as readFile2 } from "node:fs/promises";
+import { readFile as readFile2, stat as stat2 } from "node:fs/promises";
 var NOMO_NOTIFY_ENTRY = "codex-notify";
 function nomoNotifyProgram(home) {
   return `${home}/.config/cc-status/hook-shim.sh`;
@@ -1135,13 +1172,14 @@ async function repairNotifyWiring(deps = {}) {
     const next = wireNotifyArray(parsed.value, program);
     if (sameCommand(next, parsed.value))
       return "unchanged";
+    const mode = ((await stat2(tomlPath).catch(() => null))?.mode ?? 384) & 511;
     const bak = `${tomlPath}.bak-nomo`;
     try {
       await readFile2(bak);
     } catch {
-      await atomicWrite(bak, toml);
+      await atomicWrite(bak, toml, mode);
     }
-    await atomicWrite(tomlPath, replaceNotifyInToml(toml, next));
+    await atomicWrite(tomlPath, replaceNotifyInToml(toml, next), mode);
     return "repaired";
   } catch {
     return "refused";
@@ -4260,15 +4298,16 @@ async function wireNotify(deps = {}) {
     print("Codex notify backstop already wired — no change.");
     return 0;
   }
+  const mode = ((await stat3(tomlPath).catch(() => null))?.mode ?? 384) & 511;
   if (toml.length > 0) {
     const bak = `${tomlPath}.bak-nomo`;
     try {
       await readFile3(bak);
     } catch {
-      await atomicWrite(bak, toml);
+      await atomicWrite(bak, toml, mode);
     }
   }
-  await atomicWrite(tomlPath, replaceNotifyInToml(toml, next));
+  await atomicWrite(tomlPath, replaceNotifyInToml(toml, next), mode);
   const preserved = next.includes("--");
   print(preserved ? "Codex notify backstop wired (your original notify command is preserved and still runs)." : "Codex notify backstop wired.");
   if (!installed)

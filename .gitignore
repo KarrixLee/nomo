@@ -1,2 +1,6 @@
 node_modules/
 .DS_Store
+
+# Python bytecode from tools/ (generator scripts, never shipped)
+__pycache__/
+*.pyc
