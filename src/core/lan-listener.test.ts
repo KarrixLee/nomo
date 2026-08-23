@@ -811,12 +811,51 @@ describe("sealed host-hint publisher", () => {
     expect(typeof first).toBe("string");
     publisher.settle(false);                               // the POST threw / 500'd / 401'd
     now += 1_000;                                          // far inside LAN_HINT_REFRESH_MS
-    // Re-offered immediately, and as the IDENTICAL ciphertext — a reseal would defeat the worker's
-    // string-compare "unchanged?" test into a needless KV write.
+    // Re-offered immediately. The bytes DIFFER (a fresh IV per seal) and that is correct: the worker
+    // never received the first attempt, so there is no string-compare to preserve. Byte-identity is
+    // only promised for a REFRESH of an already-delivered hint, which the test above covers.
     const retry = await publisher.take(cfg);
-    expect(retry).toBe(first!);
+    expect(retry).toBeDefined();
+    const { ts: retryTs, ...retryRest } = await decryptBlob(cfg.e2eKey, retry!) as Record<string, unknown>;
+    const { ts: firstTs, ...firstRest } = await decryptBlob(cfg.e2eKey, first!) as Record<string, unknown>;
+    expect(retryRest).toEqual(firstRest);                  // same address, same hosts, same lid
+    // …and a FRESHER stamp, which the reseal gets for free. The phone rejects a hint older than
+    // maxHintAge, so a retry carrying the original attempt's timestamp would age toward that ceiling
+    // while never having been delivered.
+    expect(retryTs).toBeGreaterThan(firstTs as number);
     publisher.settle(true);
     expect(await publisher.take(cfg)).toBeUndefined();     // now published, and quiet again
+  });
+
+  test("a failed send AFTER a successful one still retries — the state must not commit early", async () => {
+    // REGRESSION. Committing lastState at seal time while the clock waited for settle meant the next
+    // take matched `state === lastState`, fell into the refresh branch, and was blocked by a lastSentAt
+    // still pointing at the last SUCCESSFUL send — silent for a full LAN_HINT_REFRESH_MS. It hides
+    // whenever lastSentAt is still 0 (a fresh pairing), which is exactly why it survived first review.
+    const cfg = config();
+    let now = 1_000_000;
+    let current = { port: 51234, lid: "lid-1" };
+    const publisher = createLanHintPublisher({
+      address: () => current, hosts: () => ["192.168.1.42"], now: () => now,
+    });
+    // 1. one GOOD send, so lastSentAt is a real timestamp rather than 0
+    expect(typeof await publisher.take(cfg)).toBe("string");
+    publisher.settle(true);
+
+    // 2. the address changes, and that send FAILS
+    now += 6_000;                                          // past the host-enumeration cache
+    current = { port: 51234, lid: "lid-2" };
+    expect(typeof await publisher.take(cfg)).toBe("string");
+    publisher.settle(false);
+
+    // 3. the NEW address must go out on the very next POST, nowhere near the 5-minute window
+    now += 1_000;
+    const retry = await publisher.take(cfg);
+    expect(retry).toBeDefined();
+    const opened = await decryptBlob(cfg.e2eKey, retry!) as Record<string, unknown>;
+    expect(opened.lid).toBe("lid-2");                      // the CURRENT address, not the stale one
+    publisher.settle(true);
+    expect(await publisher.take(cfg)).toBeUndefined();      // published → quiet again
   });
 
   test("settle is inert without an outstanding take, and never double-counts one", async () => {

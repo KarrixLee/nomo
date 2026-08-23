@@ -104,7 +104,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "2.1.24";
+var PLUGIN_VERSION = "2.1.25";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -5017,16 +5017,14 @@ function createLanHintPublisher(deps) {
           if (t - lastSentAt < LAN_HINT_REFRESH_MS)
             return;
           if (lastSealed) {
-            pending = { at: t, trace: { result: "hint", why: "refresh", port: addr.port, lid: addr.lid, hosts: list.length } };
+            pending = { at: t, state, sealed: lastSealed, trace: { result: "hint", why: "refresh", port: addr.port, lid: addr.lid, hosts: list.length } };
             return lastSealed;
           }
         }
         const sealed = await sealHint(config.e2eKey, list, addr.port, addr.lid, t);
         if (!sealed)
           return;
-        lastState = state;
-        lastSealed = sealed;
-        pending = { at: t, trace: { result: "hint", why: "changed", port: addr.port, lid: addr.lid, hosts: list.length } };
+        pending = { at: t, state, sealed, trace: { result: "hint", why: "changed", port: addr.port, lid: addr.lid, hosts: list.length } };
         return sealed;
       } catch {
         pending = null;
@@ -5038,6 +5036,8 @@ function createLanHintPublisher(deps) {
       pending = null;
       if (!p || !delivered)
         return;
+      lastState = p.state;
+      lastSealed = p.sealed;
       lastSentAt = p.at;
       traceLan(deps, p.trace);
     }

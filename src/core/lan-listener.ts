@@ -903,9 +903,16 @@ export function createLanHintPublisher(deps: LanHintPublisherDeps): LanHintPubli
   let lastSealed: string | undefined;
   let cachedHosts: string[] = [];
   let cachedAt = 0;
-  /** The publish clock + trace line for the hint currently IN FLIGHT, applied only once the POST that
-   *  carries it lands (see settle). Null whenever no take is outstanding. */
-  let pending: { at: number; trace: object } | null = null;
+  /** EVERYTHING the in-flight hint would commit, applied only once the POST carrying it lands (see
+   *  settle). Null whenever no take is outstanding.
+   *
+   *  All three fields commit TOGETHER or not at all. Committing `lastState` early (at seal time, when
+   *  delivery is still unknown) while the clock waited for settle reintroduced the very bug this class
+   *  exists to prevent, one step further in: the next take would match `state === lastState`, fall into
+   *  the refresh branch, and be blocked by a `lastSentAt` still pointing at the last SUCCESSFUL send —
+   *  silent for up to LAN_HINT_REFRESH_MS. Observed 2026-08-23; it escaped notice only because a
+   *  re-pair left lastSentAt at 0, which holds the refresh window open by accident. */
+  let pending: { at: number; state: string; sealed: string; trace: object } | null = null;
 
   const hosts = (t: number): string[] => {
     if (t - cachedAt < LAN_HOSTS_CACHE_MS && cachedAt !== 0) return cachedHosts;
@@ -927,17 +934,16 @@ export function createLanHintPublisher(deps: LanHintPublisherDeps): LanHintPubli
         if (state === lastState) {
           if (t - lastSentAt < LAN_HINT_REFRESH_MS) return undefined;
           if (lastSealed) {
-            pending = { at: t, trace: { result: "hint", why: "refresh", port: addr.port, lid: addr.lid, hosts: list.length } };
+            pending = { at: t, state, sealed: lastSealed, trace: { result: "hint", why: "refresh", port: addr.port, lid: addr.lid, hosts: list.length } };
             return lastSealed; // byte-identical refresh — see the lastSealed note above
           }
         }
         const sealed = await sealHint(config.e2eKey, list, addr.port, addr.lid, t);
         if (!sealed) return undefined;
-        // The ciphertext is cached immediately (a retry must re-send these exact bytes), but the CLOCK
-        // waits for settle — nothing here counts as published until a POST actually carries it.
-        lastState = state;
-        lastSealed = sealed;
-        pending = { at: t, trace: { result: "hint", why: "changed", port: addr.port, lid: addr.lid, hosts: list.length } };
+        // NOTHING is committed here — see the `pending` note. A retry after a failed POST reseals under
+        // a fresh IV, which is correct: the worker never received the earlier bytes, so there is no
+        // string-compare to preserve and no extra KV write to avoid.
+        pending = { at: t, state, sealed, trace: { result: "hint", why: "changed", port: addr.port, lid: addr.lid, hosts: list.length } };
         return sealed;
       } catch {
         pending = null;
@@ -947,7 +953,9 @@ export function createLanHintPublisher(deps: LanHintPublisherDeps): LanHintPubli
     settle(delivered: boolean): void {
       const p = pending;
       pending = null;
-      if (!p || !delivered) return; // failed → clock untouched, so the next POST re-attaches immediately
+      if (!p || !delivered) return; // failed → NOTHING committed, so the next POST re-attaches immediately
+      lastState = p.state;
+      lastSealed = p.sealed;
       lastSentAt = p.at;
       // Traced on DELIVERY only, so `nomo status` reports when the address actually went out rather
       // than when we hoped it would — the whole point of having the line.
