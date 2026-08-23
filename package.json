@@ -1,6 +1,6 @@
 {
   "name": "nomo-ai",
-  "version": "2.1.25",
+  "version": "2.2.0",
   "description": "One-command installer for the Nomo plugin — mirror Claude Code, OpenAI Codex and OpenCode sessions to the Nomo iPhone app as an end-to-end-encrypted Live Activity.",
   "type": "module",
   "bin": {
