@@ -6,7 +6,7 @@ import {
   buildPermissionSummary, buildPermissionDetail, buildPermissionQuestions, fitPermissionDetail,
   sealedBlobChars, BLOB_FIT_CHARS, runPermissionHook, approvalsCommand, NO_HOLD_PATH, TRACE_PATH,
   codexRolloutSessionId, codexTurnPolicyFromRollout, loadCodexTurnPolicy,
-  POST_FIRST_CONTACT_TIMEOUT_MS, OPENCODE_QUESTION_TOOL,
+  POST_FIRST_CONTACT_TIMEOUT_MS, OPENCODE_QUESTION_TOOL, localAnswerProbe,
 } from "./permission";
 import {
   createPollBudget, MAX_CONSECUTIVE_MISSES, POLL_FIRST_CONTACT_TIMEOUT_MS,
@@ -3227,5 +3227,138 @@ describe("runPermissionHook — the remote full-text upload", () => {
       expect(calls.filter((c) => c.url.endsWith("/v1/cc/decision")).length).toBe(2); // initial + re-ask, untouched
       expect(seen).toEqual([command]);                                          // the LAN tee still landed
     }
+  });
+});
+
+// ---- the local-answer watch (field trace 2026-08-25) ---------------------------------------------
+//
+// CC renders the AskUserQuestion / ExitPlanMode picker ITSELF while this hook polls, so the user can
+// answer at the Mac; CC then continues the turn WITHOUT signalling the hook. Before this watch, the
+// orphan held the phone's Allow/Deny card alive until the worker's expiry — 3 m 40 s in the trace.
+
+/** A transcript tail with a user-blocking tool_use pending (no tool_result yet). */
+const TAIL_PENDING = [
+  JSON.stringify({ type: "assistant", message: { content: [{ type: "tool_use", id: "toolu_1", name: "AskUserQuestion" }] } }),
+].join("\n");
+
+/** …and the same tail once the user answered it at the Mac. */
+const TAIL_ANSWERED = [
+  TAIL_PENDING,
+  JSON.stringify({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: "toolu_1" }] } }),
+].join("\n");
+
+describe("localAnswerProbe", () => {
+  const probeOver = (tails: string[], tool = "AskUserQuestion", path = "/tmp/t.jsonl") => {
+    let i = 0;
+    return localAnswerProbe("claude", tool, path, async () => tails[Math.min(i++, tails.length - 1)]);
+  };
+
+  test("pending → answered flips true (the whole point)", async () => {
+    const probe = probeOver([TAIL_PENDING, TAIL_ANSWERED]);
+    expect(await probe()).toBe(false);
+    expect(await probe()).toBe(true);
+  });
+
+  test("LATCH: a first read that is already not-pending never releases", async () => {
+    // A transcript handed to us late/truncated must not read as an answer — that would steal a live
+    // card out from under the phone mid-question.
+    const probe = probeOver([TAIL_ANSWERED, TAIL_ANSWERED]);
+    expect(await probe()).toBe(false);
+    expect(await probe()).toBe(false);
+  });
+
+  test("an unreadable transcript is not evidence of an answer", async () => {
+    const probe = localAnswerProbe("claude", "AskUserQuestion", "/tmp/t.jsonl", async () => {
+      throw new Error("ENOENT");
+    });
+    expect(await probe()).toBe(false);
+  });
+
+  test("still false after a throw that follows a pending read (never a one-way latch into true)", async () => {
+    let n = 0;
+    const probe = localAnswerProbe("claude", "AskUserQuestion", "/tmp/t.jsonl", async () => {
+      if (n++ === 0) return TAIL_PENDING;
+      throw new Error("ENOENT");
+    });
+    expect(await probe()).toBe(false);
+    expect(await probe()).toBe(false);
+  });
+
+  test("ExitPlanMode is watched too; an ordinary permission prompt is NOT", async () => {
+    // claudeTailPendingApproval only reports on the two user-blocking tools, so a Bash hold consulting
+    // it would read "not pending" on poll 1 and release instantly. The name gate is what prevents that.
+    expect(await probeOver([TAIL_PENDING, TAIL_ANSWERED], "ExitPlanMode")()).toBe(false);
+    const bash = probeOver([TAIL_PENDING, TAIL_ANSWERED], "Bash");
+    expect(await bash()).toBe(false);
+    expect(await bash()).toBe(false);
+  });
+
+  test("disabled with no transcript path, and for codex (no such racing picker)", async () => {
+    expect(await probeOver([TAIL_PENDING, TAIL_ANSWERED], "AskUserQuestion", "")()).toBe(false);
+    const codex = localAnswerProbe("codex", "AskUserQuestion", "/tmp/t.jsonl", async () => TAIL_ANSWERED);
+    expect(await codex()).toBe(false);
+  });
+});
+
+describe("runPermissionHook — answered at the Mac", () => {
+  const questionInput = JSON.stringify({
+    session_id: "sess-1", hook_event_name: "PermissionRequest",
+    tool_name: "AskUserQuestion", tool_input: { questions: CC_QUESTIONS },
+    cwd: "/Users/x/proj", transcript_path: "/tmp/t.jsonl",
+  });
+
+  test("a local answer ends the hold: no stdout, polling stops, record settles as WORKING", async () => {
+    // The worker stays `pending` forever — exactly the field case, where only its expiry ever freed the
+    // card. The transcript flips on the second round, and that alone must end the hold.
+    const { fn, calls } = scriptFetch(true, [{ status: "pending" }]);
+    const emitted: string[] = [];
+    const traced: Array<Record<string, unknown>> = [];
+    const patches: Array<Record<string, unknown>> = [];
+    let reads = 0;
+    await runPermissionHook(baseDeps({
+      fetchFn: fn, emit: (l: string) => emitted.push(l), readInput: async () => questionInput,
+      trace: (e: Record<string, unknown>) => traced.push(e),
+      settleHoldRecordFn: async (_id: string, patch: Record<string, unknown>) => { patches.push(patch); },
+      readTailFn: async () => (reads++ === 0 ? TAIL_PENDING : TAIL_ANSWERED),
+    }) as never);
+
+    expect(emitted).toEqual([]);                                   // CC already took the local answer
+    expect(traced.some((e) => e.event === "local-answer")).toBe(true);
+    expect(traced.find((e) => e.event === "exit")?.reason).toBe("local-answer");
+    expect(calls.filter((c) => c.method === "GET").length).toBe(1); // one poll, then out — not ~90
+    // WORKING is what clears the worker's decision overlay and retires the phone's Allow/Deny card.
+    expect(patches).toHaveLength(1);
+    expect(patches[0]!.lastEvent).toBe("working");
+    expect(patches[0]!.prio).toBe(0);
+    expect(patches[0]!.attentionKind).toBeUndefined();
+  });
+
+  test("an UNANSWERED question is untouched — the phone still gets its answer", async () => {
+    // A bare allow is a deliberate RELEASE for a question (CC drops it), so the phone's real verb here
+    // is `answer` — the one that injects the selection through updatedInput.
+    const answerBlob = await encryptBlob(KEY, {
+      requestId: "req-fixed", decision: "answer", answers: ["Unit tests only"], ts: 5,
+    });
+    const { fn } = scriptFetch(true, [{ status: "pending" }, { status: "answered", answerBlob }]);
+    const emitted: string[] = [];
+    await runPermissionHook(baseDeps({
+      fetchFn: fn, emit: (l: string) => emitted.push(l), readInput: async () => questionInput,
+      readTailFn: async () => TAIL_PENDING,                        // still parked on the user
+    }) as never);
+    expect(emitted).toHaveLength(1);
+    expect(JSON.parse(emitted[0]!).hookSpecificOutput.decision.updatedInput.answers).toEqual({
+      "Which testing approach should I use for the new parser?": "Unit tests only",
+    });
+  });
+
+  test("a Bash hold is unaffected by the transcript (name gate)", async () => {
+    const answerBlob = await encryptBlob(KEY, { requestId: "req-fixed", decision: "allow", ts: 5 });
+    const { fn } = scriptFetch(true, [{ status: "answered", answerBlob }]);
+    const emitted: string[] = [];
+    await runPermissionHook(baseDeps({
+      fetchFn: fn, emit: (l: string) => emitted.push(l),           // default INPUT = Bash
+      readTailFn: async () => { throw new Error("must not be consulted"); },
+    }) as never);
+    expect(emitted).toEqual([ALLOW]);
   });
 });
