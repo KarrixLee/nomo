@@ -104,7 +104,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "2.2.0";
+var PLUGIN_VERSION = "2.2.1";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -5803,6 +5803,27 @@ var HOLD_BLOCKS_DIALOG = {
   codex: true,
   opencode: false
 };
+var LOCAL_ANSWER_TOOLS = new Set(["AskUserQuestion", "ExitPlanMode"]);
+var LOCAL_ANSWER_TAIL_BYTES = 64000;
+function localAnswerProbe(agent, toolName, transcriptPath, readTail) {
+  if (agent !== "claude" || !LOCAL_ANSWER_TOOLS.has(toolName) || transcriptPath.length === 0) {
+    return async () => false;
+  }
+  let sawPending = false;
+  return async () => {
+    let pending;
+    try {
+      pending = claudeTailPendingApproval(await readTail(transcriptPath, LOCAL_ANSWER_TAIL_BYTES));
+    } catch {
+      return false;
+    }
+    if (pending) {
+      sawPending = true;
+      return false;
+    }
+    return sawPending;
+  };
+}
 var HOLD_RETRY_DELAY_MS = 4000;
 var FRESH_SESSION_MS = 60000;
 var MAX_UNKNOWN_ANSWER_READS = 3;
@@ -6481,6 +6502,7 @@ async function runPermissionHook(deps = {}, agent = "claude") {
     }
     const toolName = typeof input.tool_name === "string" ? input.tool_name : "";
     const agentId = typeof input.agent_id === "string" ? input.agent_id : "";
+    const transcriptPath = typeof input.transcript_path === "string" ? input.transcript_path : "";
     const permissionMode = typeof input.permission_mode === "string" ? input.permission_mode : undefined;
     trace({ event: "start", session_id: sessionId, tool_name: toolName, permission_mode: permissionMode, agent: agentId.length > 0 });
     if (agentId.length > 0) {
@@ -6498,7 +6520,6 @@ async function runPermissionHook(deps = {}, agent = "claude") {
     if (questionExempt)
       trace({ event: "mode-gate-bypass", reason: "question", mode: permissionMode, tool_name: toolName });
     if (agent === "codex" && !toolName.startsWith("mcp__")) {
-      const transcriptPath = typeof input.transcript_path === "string" ? input.transcript_path : "";
       const turnId = typeof input.turn_id === "string" ? input.turn_id : "";
       const policy = await (deps.loadCodexTurnPolicyFn ?? loadCodexTurnPolicy)(transcriptPath, turnId, sessionId);
       const reason = codexPassThroughReason(policy);
@@ -6700,6 +6721,7 @@ async function runPermissionHook(deps = {}, agent = "claude") {
     const interval = deps.pollIntervalMs ?? POLL_INTERVAL_MS;
     const emit = deps.emit ?? ((line) => process.stdout.write(`${line}
 `));
+    const answeredAtTheMac = localAnswerProbe(agent, toolName, transcriptPath, deps.readTailFn ?? readSuffix);
     const applyAnswerBlob = async (answerBlob, src) => {
       const answer = await decryptBlob(config.e2eKey, answerBlob);
       const match = answer.requestId === requestId;
@@ -6729,6 +6751,12 @@ async function runPermissionHook(deps = {}, agent = "claude") {
     let seq = 0;
     for (;; ) {
       seq += 1;
+      if (await answeredAtTheMac()) {
+        settleAsWorking = true;
+        trace({ event: "local-answer", seq });
+        trace({ event: "exit", reason: "local-answer" });
+        return;
+      }
       const { data, status: httpStatus } = await pollDecision(seq);
       if (data) {
         misses = 0;

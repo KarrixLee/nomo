@@ -35,6 +35,9 @@ import {
   writeDecisionHold,
 } from "./shared";
 import { b64url, Bytes, decryptBlob, deriveLanKey, encryptBlob } from "./crypto";
+// The ONE transcript classifier for "is Claude still parked on a user-blocking tool" — the watchdog's
+// dropped-PreToolUse backstop (adapter.ts) and this hold's local-answer watch must never drift apart.
+import { claudeTailPendingApproval } from "./adapter";
 // The relay's timing/give-up rules, shared verbatim with the Codex relay (codex-remote-input.ts) that
 // polls the SAME route with the same credentials. See decision-poll.ts for what is deliberately NOT
 // shared — the first-contact POST ceiling, which each caller bounds by what IT blocks.
@@ -127,6 +130,58 @@ export const HOLD_BLOCKS_DIALOG: Record<AgentKind, boolean> = {
   codex: true,     // same blocking-hook contract, same frozen TUI
   opencode: false, // resident plugin, fired detached; OpenCode's own prompt is already on screen
 };
+
+/** The Claude tools whose picker Claude Code renders ITSELF, concurrently with this hook — so the user
+ *  can answer AT THE MAC while the hold is still polling, and CC then moves the turn on without ever
+ *  telling us.
+ *
+ *  FIELD TRACE 2026-08-25 (session a00021fa): an AskUserQuestion hold was posted at 05:07:38, the user
+ *  answered it in the terminal at 05:08:24 (`tool_result` in the transcript, session working again from
+ *  05:09:08), and CC signalled this process NOTHING — no SIGTERM in permission-trace, unlike the ordinary
+ *  Esc/close path. The orphan kept polling for another 45 rounds, holding `heldRequestId` alive, so the
+ *  phone rendered an actionable Allow/Deny card for an already-settled question for 3 m 40 s, until the
+ *  worker expired the request.
+ *
+ *  Mirrors adapter.ts's CLAUDE_USER_BLOCKING_TOOLS, and the gate is load-bearing in BOTH directions:
+ *  claudeTailPendingApproval only ever reports on these two tool names, so consulting it for an ordinary
+ *  Bash/Edit prompt would read "not pending" on the very first poll and release every hold instantly. */
+const LOCAL_ANSWER_TOOLS = new Set(["AskUserQuestion", "ExitPlanMode"]);
+
+/** Transcript tail read per poll for the local-answer watch. The answer we look for is at the END of the
+ *  file by construction, and this matches the order the watchdog's own tail scans already read. */
+export const LOCAL_ANSWER_TAIL_BYTES = 64_000;
+
+/** "Has the user answered this at the Mac?" — polled ALONGSIDE the worker, never instead of it.
+ *
+ *  The probe stays false until the transcript has been SEEN carrying the pending tool_use at least once.
+ *  CC writes that row before it spawns us, so the latch primes on the first poll; but a probe that
+ *  trusted a first "not pending" read would release the hold on a transcript that is merely late,
+ *  truncated, or unparseable. Once seen, pending -> gone means exactly one thing — CC can only continue
+ *  past a user-blocking tool once a tool_result is written — so the hold is genuinely over.
+ *
+ *  THE FAIL-SAFE DIRECTION IS DELIBERATE. A missed local answer costs exactly what it cost before this
+ *  existed (the worker's expiry); a false positive would steal a live card out from under the phone
+ *  mid-question. So: unreadable transcript never releases, and an absent path or a non-racing tool
+ *  disables the watch entirely. */
+export function localAnswerProbe(
+  agent: AgentKind, toolName: string, transcriptPath: string,
+  readTail: (path: string, maxBytes: number) => Promise<string>,
+): () => Promise<boolean> {
+  if (agent !== "claude" || !LOCAL_ANSWER_TOOLS.has(toolName) || transcriptPath.length === 0) {
+    return async () => false;
+  }
+  let sawPending = false;
+  return async (): Promise<boolean> => {
+    let pending: boolean;
+    try {
+      pending = claudeTailPendingApproval(await readTail(transcriptPath, LOCAL_ANSWER_TAIL_BYTES));
+    } catch {
+      return false; // a transcript we cannot read is not evidence of an answer
+    }
+    if (pending) { sawPending = true; return false; }
+    return sawPending;
+  };
+}
 
 /** A fresh session's FIRST permission prompt can fire BEFORE the phone app's ~3s poll has added the
  *  session to the worker's island shown-list, so the very first decision POST correctly comes back
@@ -1261,6 +1316,9 @@ export interface PermissionHookDeps {
   /** The loopback ticker's own pacing clock + cadence (never the hook's `sleep` — see the poller). */
   lanSleep?: (ms: number) => Promise<void>;
   lanIntervalMs?: number;
+  /** Reads the tail of the session transcript for the local-answer watch (see localAnswerProbe).
+   *  Defaults to the real bounded suffix read; tests script it. */
+  readTailFn?: (path: string, maxBytes: number) => Promise<string>;
 }
 
 async function readStdin(): Promise<string> {
@@ -1328,6 +1386,8 @@ export async function runPermissionHook(
 
     const toolName = typeof input.tool_name === "string" ? input.tool_name : "";
     const agentId = typeof input.agent_id === "string" ? input.agent_id : "";
+    // Read ONCE here: both the Codex reviewer gate and the local-answer watch below key off it.
+    const transcriptPath = typeof input.transcript_path === "string" ? input.transcript_path : "";
     const permissionMode = typeof input.permission_mode === "string" ? input.permission_mode : undefined;
     trace({ event: "start", session_id: sessionId, tool_name: toolName, permission_mode: permissionMode, agent: agentId.length > 0 });
 
@@ -1378,7 +1438,6 @@ export async function runPermissionHook(
     //    built-in reviewer can decide. Full Access normally took the mode gate above, but the rollout
     //    checks make that promise resilient to a producer that reports `default` by mistake.
     if (agent === "codex" && !toolName.startsWith("mcp__")) {
-      const transcriptPath = typeof input.transcript_path === "string" ? input.transcript_path : "";
       const turnId = typeof input.turn_id === "string" ? input.turn_id : "";
       const policy = await (deps.loadCodexTurnPolicyFn ?? loadCodexTurnPolicy)(transcriptPath, turnId, sessionId);
       const reason = codexPassThroughReason(policy);
@@ -1777,6 +1836,8 @@ export async function runPermissionHook(
     const jitter = deps.jitter ?? (() => Math.floor(Math.random() * POLL_JITTER_MAX_MS));
     const interval = deps.pollIntervalMs ?? POLL_INTERVAL_MS;
     const emit = deps.emit ?? ((line: string) => process.stdout.write(`${line}\n`));
+    // …and the FOURTH way a hold ends: the user answered it at the Mac. See localAnswerProbe.
+    const answeredAtTheMac = localAnswerProbe(agent, toolName, transcriptPath, deps.readTailFn ?? readSuffix);
 
     /** Apply ONE sealed answer blob to this hold, from EITHER delivery channel — the 3 s worker poll or
      *  the ~300 ms LAN loopback poll. THE single answered-branch body, so the two sources cannot drift:
@@ -1827,6 +1888,16 @@ export async function runPermissionHook(
     let seq = 0;
     for (;;) {
       seq += 1;
+      // ANSWERED AT THE MAC. Checked BEFORE the poll so the latch primes on round 1, and before the
+      // network so a worker outage can never keep a settled card on the phone. Nothing goes to stdout —
+      // CC already took the local answer and moved the turn on — but the record settles as WORKING,
+      // which is what clears the worker's decision overlay and retires the phone's Allow/Deny card.
+      if (await answeredAtTheMac()) {
+        settleAsWorking = true;
+        trace({ event: "local-answer", seq });
+        trace({ event: "exit", reason: "local-answer" });
+        return;
+      }
       const { data, status: httpStatus } = await pollDecision(seq);
 
       if (data) {
