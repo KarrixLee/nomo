@@ -3470,3 +3470,69 @@ describe("runPermissionHook — NOM-54 allow_mode / answer extras", () => {
     expect(gets).toBe(1);
   });
 });
+
+// ---- NOM-59: AskUserQuestion option previews ------------------------------------------------
+
+describe("NOM-59 option previews", () => {
+  const LONG = "```\n" + "x".repeat(900) + "\n```";
+  const PQ = [{
+    question: "Layout?",
+    options: [{ label: "Grid", preview: LONG }, { label: "List" }, { label: "Cards", preview: "## cards" }],
+  }];
+  const question = (questions: unknown) => JSON.stringify({
+    session_id: "sess-1", hook_event_name: "PermissionRequest", tool_name: "AskUserQuestion",
+    tool_input: { questions }, cwd: "/Users/x/proj", transcript_path: "/tmp/t.jsonl",
+  });
+  const run = async (answer: Record<string, unknown>, input: string) => {
+    const answerBlob = await encryptBlob(KEY, { requestId: "req-fixed", ts: 5, ...answer });
+    const emitted: string[] = [];
+    const { fn } = scriptFetch(true, [{ status: "answered", answerBlob }]);
+    await runPermissionHook(baseDeps({ fetchFn: fn, emit: (l: string) => emitted.push(l), readInput: async () => input }) as never);
+    return emitted;
+  };
+  const updatedInput = (line: string) => JSON.parse(line).hookSpecificOutput.decision.updatedInput;
+
+  test("p rides aligned with o (null = no preview), capped with an ellipsis", () => {
+    const [q] = buildPermissionQuestions({ questions: PQ });
+    expect(q.p?.length).toBe(3);
+    expect(q.p?.[1]).toBeNull();
+    expect(q.p?.[2]).toBe("## cards");
+    expect([...(q.p?.[0] ?? "")].length).toBe(600);
+    expect(q.p?.[0]?.endsWith("…")).toBe(true);
+  });
+
+  test("p omitted when no option has a preview, and always for multiSelect", () => {
+    expect("p" in buildPermissionQuestions({ questions: [{ question: "Q", options: [{ label: "A", preview: "" }] }] })[0]).toBe(false);
+    expect("p" in buildPermissionQuestions({ questions: [{ ...PQ[0], multiSelect: true }] })[0]).toBe(false);
+  });
+
+  test("budget: previews shed before any description is capped", () => {
+    const base = { sessionId: "s", title: "t" };
+    const questions = buildPermissionQuestions({ questions: [{
+      question: "Layout?", options: [{ label: "Grid", description: "D".repeat(300), preview: "P".repeat(500) }],
+    }] });
+    const noP = questions.map(({ p: _p, ...q }) => q);
+    const chars = (qs: typeof questions) => sealedBlobChars(new TextEncoder().encode(JSON.stringify({ ...base, permissionQuestions: qs })).length);
+    expect(fitPermissionDetail(base, "", chars(questions), questions).questions).toEqual(questions);
+    expect(fitPermissionDetail(base, "", chars(questions) - 1, questions).questions).toEqual(noP);
+  });
+
+  test("answer echoes the FULL original preview (not the capped wire copy)", async () => {
+    const emitted = await run({ decision: "answer", answers: ["Grid"] }, question(PQ));
+    expect(updatedInput(emitted[0]).annotations).toEqual({ "Layout?": { preview: LONG } });
+  });
+
+  test("preview merges with notes; no preview for a preview-less option", async () => {
+    const both = await run({ decision: "answer", answers: ["Cards"], notes: ["why not"] }, question(PQ));
+    expect(updatedInput(both[0]).annotations).toEqual({ "Layout?": { notes: "why not", preview: "## cards" } });
+    const none = await run({ decision: "answer", answers: ["List"] }, question(PQ));
+    expect("annotations" in updatedInput(none[0])).toBe(false);
+  });
+
+  test("no preview annotation for Other text (with or without a pick)", async () => {
+    for (const answers of [["Grid"], [""]]) {
+      const emitted = await run({ decision: "answer", answers, other: ["something else"] }, question(PQ));
+      expect("annotations" in updatedInput(emitted[0])).toBe(false);
+    }
+  });
+});

@@ -109,7 +109,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "2.3.0";
+var PLUGIN_VERSION = "2.3.1";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -3807,6 +3807,9 @@ function answerLine(agent, toolName, toolInput, answers, other, notes) {
     if (resolved === undefined)
       return;
     map[questions[i].text] = typed.length > 0 ? `${resolved}, ${typed}` : resolved;
+    const preview = questions[i].raw?.multiSelect === true || typed.length > 0 ? "" : questions[i].previews[questions[i].labels.indexOf(resolved)] ?? "";
+    if (preview.length > 0)
+      annotations[questions[i].text] = { ...annotations[questions[i].text], preview };
   }
   if (Object.keys(map).length !== questions.length)
     return;
@@ -4019,6 +4022,7 @@ var QUESTION_TEXT_MAX = 240;
 var PERMISSION_QUESTION_LABEL_MAX = 60;
 var QUESTION_DESCRIPTION_MAX = 600;
 var QUESTION_DESCRIPTION_LADDER = [400, 280, 200, 160, 120, 80];
+var QUESTION_PREVIEW_MAX = 600;
 function withDescriptionCap(questions, max) {
   return questions.map((question) => question.d === undefined ? question : { ...question, d: question.d.map((description) => capPermissionWireText(description, max)) });
 }
@@ -4039,6 +4043,7 @@ function usableQuestions(toolInput) {
       continue;
     const labels = [];
     const descriptions = [];
+    const previews = [];
     if (Array.isArray(raw?.options)) {
       for (const opt of raw.options) {
         const label = opt?.label;
@@ -4046,12 +4051,14 @@ function usableQuestions(toolInput) {
           labels.push(label);
           const description = opt?.description;
           descriptions.push(typeof description === "string" ? description : "");
+          const preview = opt?.preview;
+          previews.push(typeof preview === "string" ? preview : "");
         }
       }
     }
     if (labels.length === 0)
       continue;
-    out.push({ text, raw, labels, descriptions });
+    out.push({ text, raw, labels, descriptions, previews });
   }
   return out;
 }
@@ -4059,14 +4066,15 @@ function firstQuestionText(toolInput) {
   return usableQuestions(toolInput)[0]?.text ?? "";
 }
 function buildPermissionQuestions(toolInput) {
-  return usableQuestions(toolInput).map(({ text, raw, labels, descriptions }) => {
+  return usableQuestions(toolInput).map(({ text, raw, labels, descriptions, previews }) => {
     const wireDescriptions = descriptions.map((description) => capPermissionWireText(description, QUESTION_DESCRIPTION_MAX));
     return {
       q: capPermissionWireText(text, QUESTION_TEXT_MAX),
       ...typeof raw?.header === "string" && raw.header.length > 0 ? { h: raw.header } : {},
       ...raw?.multiSelect === true ? { m: true } : {},
       o: labels.map((l) => capPermissionWireText(l, PERMISSION_QUESTION_LABEL_MAX)),
-      ...wireDescriptions.some((description) => description.length > 0) ? { d: wireDescriptions } : {}
+      ...wireDescriptions.some((description) => description.length > 0) ? { d: wireDescriptions } : {},
+      ...raw?.multiSelect !== true && previews.some((pv) => pv.length > 0) ? { p: previews.map((pv) => pv.length > 0 ? capPermissionWireText(pv, QUESTION_PREVIEW_MAX) : null) } : {}
     };
   });
 }
@@ -4078,10 +4086,12 @@ function fitPermissionDetail(base, detail, maxChars = BLOB_FIT_CHARS, questions 
   const encoder = new TextEncoder;
   const measure = (d, omitted, qs) => sealedBlobChars(encoder.encode(JSON.stringify(permissionFrame(base, d, omitted, qs))).length);
   const worstCase = all.length;
-  const bareQuestions = questions.map(({ d: _descriptions, ...question }) => question);
+  const noPreviews = questions.map(({ p: _previews, ...question }) => question);
+  const bareQuestions = noPreviews.map(({ d: _descriptions, ...question }) => question);
   const candidates = questions.length === 0 ? [] : [
     questions,
-    ...QUESTION_DESCRIPTION_LADDER.map((max) => withDescriptionCap(questions, max)),
+    noPreviews,
+    ...QUESTION_DESCRIPTION_LADDER.map((max) => withDescriptionCap(noPreviews, max)),
     bareQuestions
   ];
   const kept = candidates.find((candidate) => measure("", worstCase, candidate) <= maxChars) ?? [];

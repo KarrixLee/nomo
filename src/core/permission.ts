@@ -452,7 +452,7 @@ function answerLine(
   if (otherTexts === undefined || noteTexts === undefined) return undefined;
   if (!adapterFor(agent).answerExtras && [...otherTexts, ...noteTexts].some((t) => t.length > 0)) return undefined;
   const map: Record<string, string> = {};
-  const annotations: Record<string, { notes: string }> = {};
+  const annotations: Record<string, { notes?: string; preview?: string }> = {};
   for (let i = 0; i < questions.length; i += 1) {
     const a = answers[i];
     // A question left WITHOUT an answer (missing/non-string/blank entry) would make the map PARTIAL. CC's
@@ -482,6 +482,11 @@ function answerLine(
     // Free text is NEVER inferred from a label mismatch: it only ever comes from `other[i]`.
     if (resolved === undefined) return undefined;
     map[questions[i].text] = typed.length > 0 ? `${resolved}, ${typed}` : resolved;
+    // NOM-59: a single-select pick of exactly one label whose option carries a preview echoes the ORIGINAL
+    // preview string — CC rejects anything that isn't byte-equal to one of the question's previews.
+    const preview = questions[i].raw?.multiSelect === true || typed.length > 0
+      ? "" : questions[i].previews[questions[i].labels.indexOf(resolved)] ?? "";
+    if (preview.length > 0) annotations[questions[i].text] = { ...annotations[questions[i].text], preview };
   }
   // Every question answered, or nothing goes out (the loop above already released on the first gap; this
   // is the invariant stated as an assertion — an empty map can never be a bare allow either).
@@ -797,6 +802,9 @@ export interface PermissionQuestion {
   m?: boolean;
   o: string[];
   d?: string[];
+  /** NOM-59: option previews (markdown, or an HTML fragment), aligned with `o`; null = that option has
+   *  none. Single-select only, omitted when no option has one. Shed FIRST under budget pressure. */
+  p?: (string | null)[];
 }
 
 /** Longest question text kept in the blob (display only — the answers map is keyed by the ORIGINAL,
@@ -815,6 +823,10 @@ const QUESTION_DESCRIPTION_MAX = 600;
  *  descriptions ENTIRELY. Without these rungs the choice was all-or-nothing — one fat description sank
  *  every description on the card — which is exactly what a wider ceiling would have made common. */
 const QUESTION_DESCRIPTION_LADDER = [400, 280, 200, 160, 120, 80];
+
+/** Longest option preview kept in the blob (NOM-59). Display only — the answer path echoes the ORIGINAL
+ *  preview from tool_input, never this capped copy (CC validates it strictly against the options). */
+const QUESTION_PREVIEW_MAX = 600;
 
 /** `questions` with every description re-capped at `max`. Positional alignment is untouched: an empty
  *  description stays empty, so `d` never stops lining up with `o`. */
@@ -837,7 +849,7 @@ type RawQuestion = { question?: unknown; header?: unknown; multiSelect?: unknown
 
 /** A question CC sent that is both SHOWABLE and ANSWERABLE, with its ORIGINAL (untruncated) text,
  *  option labels, and positionally aligned descriptions. */
-interface UsableQuestion { text: string; raw: RawQuestion; labels: string[]; descriptions: string[] }
+interface UsableQuestion { text: string; raw: RawQuestion; labels: string[]; descriptions: string[]; previews: string[] }
 
 /** THE single question filter. `buildPermissionQuestions` (what the phone renders) and `answerLine`
  *  (what the phone's positional answers zip against) both derive from this list, so an entry skipped
@@ -862,6 +874,7 @@ function usableQuestions(toolInput: Record<string, unknown>): UsableQuestion[] {
     if (text.length === 0) continue;
     const labels: string[] = [];
     const descriptions: string[] = [];
+    const previews: string[] = [];
     if (Array.isArray(raw?.options)) {
       for (const opt of raw.options) {
         const label = (opt as { label?: unknown } | null)?.label;
@@ -869,11 +882,13 @@ function usableQuestions(toolInput: Record<string, unknown>): UsableQuestion[] {
           labels.push(label);
           const description = (opt as { description?: unknown } | null)?.description;
           descriptions.push(typeof description === "string" ? description : "");
+          const preview = (opt as { preview?: unknown } | null)?.preview;
+          previews.push(typeof preview === "string" ? preview : "");
         }
       }
     }
     if (labels.length === 0) continue;
-    out.push({ text, raw, labels, descriptions });
+    out.push({ text, raw, labels, descriptions, previews });
   }
   return out;
 }
@@ -893,7 +908,7 @@ function firstQuestionText(toolInput: Record<string, unknown>): string {
  *  is skipped rather than poisoning the hold. Truncation is display-only — `answerLine` re-maps the
  *  phone's echo back onto the ORIGINAL labels, so a capped label never reaches CC. */
 export function buildPermissionQuestions(toolInput: Record<string, unknown>): PermissionQuestion[] {
-  return usableQuestions(toolInput).map(({ text, raw, labels, descriptions }) => {
+  return usableQuestions(toolInput).map(({ text, raw, labels, descriptions, previews }) => {
     const wireDescriptions = descriptions.map((description) =>
       capPermissionWireText(description, QUESTION_DESCRIPTION_MAX)
     );
@@ -903,6 +918,10 @@ export function buildPermissionQuestions(toolInput: Record<string, unknown>): Pe
       ...(raw?.multiSelect === true ? { m: true } : {}),
       o: labels.map((l) => capPermissionWireText(l, PERMISSION_QUESTION_LABEL_MAX)),
       ...(wireDescriptions.some((description) => description.length > 0) ? { d: wireDescriptions } : {}),
+      // CC only renders previews for single-select questions, so a multi-select never carries `p`.
+      ...(raw?.multiSelect !== true && previews.some((pv) => pv.length > 0)
+        ? { p: previews.map((pv) => pv.length > 0 ? capPermissionWireText(pv, QUESTION_PREVIEW_MAX) : null) }
+        : {}),
     };
   });
 }
@@ -951,10 +970,13 @@ export function fitPermissionDetail(
   // prompt when the field is absent. Candidates are measured WITH the worst-case
   // `permissionDetailOmitted`, so the chosen variant stays valid even on the drop-the-detail-entirely
   // branch below (where that key is present and the detail is not).
-  const bareQuestions = questions.map(({ d: _descriptions, ...question }) => question);
+  // NOM-59: previews are the LEAST essential field, so every preview goes before any description is cut.
+  const noPreviews = questions.map(({ p: _previews, ...question }) => question);
+  const bareQuestions = noPreviews.map(({ d: _descriptions, ...question }) => question);
   const candidates = questions.length === 0 ? [] : [
     questions,
-    ...QUESTION_DESCRIPTION_LADDER.map((max) => withDescriptionCap(questions, max)),
+    noPreviews,
+    ...QUESTION_DESCRIPTION_LADDER.map((max) => withDescriptionCap(noPreviews, max)),
     bareQuestions,
   ];
   const kept = candidates.find((candidate) => measure("", worstCase, candidate) <= maxChars) ?? [];
