@@ -109,7 +109,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "2.2.1";
+var PLUGIN_VERSION = "2.3.0";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -2616,6 +2616,8 @@ function findProvisionalForPid(provisionals, hookPid, ancestorsOf) {
 }
 var claudeAdapter = {
   kind: "claude",
+  allowMode: true,
+  answerExtras: true,
   async title({ prefix, input, transcriptPath }) {
     const fromTranscript = await claudeSessionTitle(prefix, transcriptPath ?? "");
     if (fromTranscript)
@@ -3757,10 +3759,19 @@ function allowAlwaysLine(agent, toolName, toolInput, suggestions) {
   if (agent === "codex")
     return allowLine(agent, toolName, toolInput);
   const updatedPermissions = Array.isArray(suggestions) && suggestions.length > 0 ? suggestions : [{ type: "addRules", rules: [{ toolName }], behavior: "allow", destination: "session" }];
+  return allowWithPermissionsLine(agent, toolName, toolInput, updatedPermissions);
+}
+function allowWithPermissionsLine(agent, toolName, toolInput, updatedPermissions) {
   const decision = toolName === "ExitPlanMode" ? { behavior: "allow", updatedInput: toolInput, updatedPermissions } : { behavior: "allow", updatedPermissions };
   return decisionLine(agent, { hookEventName: "PermissionRequest", decision });
 }
-function answerLine(agent, toolName, toolInput, answers) {
+var ALLOW_MODES = new Set(["acceptEdits", "auto"]);
+function allowModeLine(agent, toolName, toolInput, mode) {
+  if (!adapterFor(agent).allowMode)
+    return allowLine(agent, toolName, toolInput);
+  return allowWithPermissionsLine(agent, toolName, toolInput, [{ type: "setMode", mode, destination: "session" }]);
+}
+function answerLine(agent, toolName, toolInput, answers, other, notes) {
   if (!isAnswerTool(toolName, agent) || !Array.isArray(answers))
     return;
   const questions = usableQuestions(toolInput);
@@ -3768,27 +3779,64 @@ function answerLine(agent, toolName, toolInput, answers) {
     return;
   if (new Set(questions.map((q) => q.text)).size !== questions.length)
     return;
+  const otherTexts = extrasArray(other, questions.length);
+  const noteTexts = extrasArray(notes, questions.length);
+  if (otherTexts === undefined || noteTexts === undefined)
+    return;
+  if (!adapterFor(agent).answerExtras && [...otherTexts, ...noteTexts].some((t) => t.length > 0))
+    return;
   const map = {};
+  const annotations = {};
   for (let i = 0;i < questions.length; i += 1) {
     const a = answers[i];
     if (typeof a !== "string")
       return;
     const raw = a.trim();
-    if (raw.length === 0)
-      return;
+    const typed = otherTexts[i];
+    if (noteTexts[i].length > 0)
+      annotations[questions[i].text] = { notes: noteTexts[i] };
+    if (raw.length === 0) {
+      if (typed.length === 0)
+        return;
+      map[questions[i].text] = typed;
+      continue;
+    }
     if (raw.length > ANSWER_MAX)
       return;
     const resolved = resolveAnswer(raw, questions[i].labels);
     if (resolved === undefined)
       return;
-    map[questions[i].text] = resolved;
+    map[questions[i].text] = typed.length > 0 ? `${resolved}, ${typed}` : resolved;
   }
   if (Object.keys(map).length !== questions.length)
     return;
   return decisionLine(agent, {
     hookEventName: "PermissionRequest",
-    decision: { behavior: "allow", updatedInput: { ...toolInput, answers: map } }
+    decision: {
+      behavior: "allow",
+      updatedInput: Object.keys(annotations).length > 0 ? { ...toolInput, answers: map, annotations: { ...toolInput.annotations, ...annotations } } : { ...toolInput, answers: map }
+    }
   });
+}
+function extrasArray(value, length) {
+  if (value === undefined || value === null)
+    return Array.from({ length }, () => "");
+  if (!Array.isArray(value) || value.length !== length)
+    return;
+  const out = [];
+  for (const entry of value) {
+    if (entry === null || entry === undefined) {
+      out.push("");
+      continue;
+    }
+    if (typeof entry !== "string")
+      return;
+    const t = entry.trim();
+    if (t.length > ANSWER_MAX)
+      return;
+    out.push(t);
+  }
+  return out;
 }
 function resolveAnswer(answer, labels) {
   const matchOne = (piece) => {
@@ -3982,6 +4030,8 @@ function usableQuestions(toolInput) {
   const qs = toolInput.questions;
   if (!Array.isArray(qs))
     return [];
+  if (qs.some((q) => q?.kind !== undefined && q.kind !== "choice"))
+    return [];
   const out = [];
   for (const raw of qs) {
     const text = typeof raw?.question === "string" ? raw.question : "";
@@ -4085,12 +4135,24 @@ function emitDecision(agent, answer, toolName, toolInput, suggestions, emit, tra
       emit(allowAlwaysLine(agent, toolName, toolInput, suggestions));
       trace({ event: "emit", decision: agent === "codex" ? "allow_always_degraded_to_allow" : "allow_always" });
       return "emitted";
+    case "allow_mode":
+      if (typeof answer.mode !== "string" || !ALLOW_MODES.has(answer.mode)) {
+        trace({ event: "answer-unknown-decision" });
+        return "keep-polling";
+      }
+      if (isQuestion) {
+        trace({ event: "release", reason: "bare-allow-on-question" });
+        return "released";
+      }
+      emit(allowModeLine(agent, toolName, toolInput, answer.mode));
+      trace({ event: "emit", decision: adapterFor(agent).allowMode ? "allow_mode" : "allow_mode_degraded_to_allow", mode: answer.mode });
+      return "emitted";
     case "deny":
       emit(denyLine(agent, answer.message));
       trace({ event: "emit", decision: "deny", hasMessage: typeof answer.message === "string" && answer.message.trim().length > 0 });
       return "emitted";
     case "answer": {
-      const line = answerLine(agent, toolName, toolInput, answer.answers);
+      const line = answerLine(agent, toolName, toolInput, answer.answers, answer.other, answer.notes);
       if (line === undefined) {
         trace({ event: "release", reason: "answer-unmappable", tool_name: toolName });
         return "released";

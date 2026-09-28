@@ -3362,3 +3362,111 @@ describe("runPermissionHook — answered at the Mac", () => {
     expect(emitted).toEqual([ALLOW]);
   });
 });
+
+// ---- NOM-54: allow_mode + answer extras (other / notes) + NOM-60 non-choice guard -------------
+
+describe("runPermissionHook — NOM-54 allow_mode / answer extras", () => {
+  const PLAN = "## Plan\n- do it";
+  const exitPlan = JSON.stringify({
+    session_id: "sess-1", hook_event_name: "PermissionRequest", tool_name: "ExitPlanMode",
+    tool_input: { plan: PLAN }, cwd: "/Users/x/proj", transcript_path: "/tmp/t.jsonl",
+  });
+  const MULTI = [{
+    question: "Pick?", multiSelect: true,
+    options: [{ label: "A" }, { label: "B" }, { label: "C" }],
+  }];
+  const question = (questions: unknown) => JSON.stringify({
+    session_id: "sess-1", hook_event_name: "PermissionRequest", tool_name: "AskUserQuestion",
+    tool_input: { questions }, cwd: "/Users/x/proj", transcript_path: "/tmp/t.jsonl",
+  });
+  const run = async (answer: Record<string, unknown>, input?: string, agent?: "codex") => {
+    const answerBlob = await encryptBlob(KEY, { requestId: "req-fixed", ts: 5, ...answer });
+    const emitted: string[] = [];
+    const { fn, calls } = scriptFetch(true, [{ status: "answered", answerBlob }]);
+    const deps = baseDeps({
+      fetchFn: fn, emit: (l: string) => emitted.push(l), ...(input ? { readInput: async () => input } : {}),
+    }) as never;
+    await (agent ? runPermissionHook(deps, agent) : runPermissionHook(deps));
+    return { emitted, gets: calls.filter((c) => c.method === "GET").length };
+  };
+  const decision = (line: string) => JSON.parse(line).hookSpecificOutput.decision;
+  const setMode = (mode: string) => [{ type: "setMode", mode, destination: "session" }];
+
+  for (const mode of ["acceptEdits", "auto"]) {
+    test(`allow_mode ${mode} on ExitPlanMode → allow + NOM-36 echo + session setMode`, async () => {
+      const { emitted } = await run({ decision: "allow_mode", mode }, exitPlan);
+      expect(emitted.length).toBe(1);
+      expect(decision(emitted[0])).toEqual({ behavior: "allow", updatedInput: { plan: PLAN }, updatedPermissions: setMode(mode) });
+    });
+    test(`allow_mode ${mode} on Bash → allow + session setMode, no updatedInput`, async () => {
+      const { emitted } = await run({ decision: "allow_mode", mode });
+      expect(decision(emitted[0])).toEqual({ behavior: "allow", updatedPermissions: setMode(mode) });
+    });
+  }
+
+  test("allow_mode with an unknown / missing mode → treated as an unknown verb: nothing emitted, bounded polling", async () => {
+    for (const mode of ["bypassPermissions", "plan", undefined, 3]) {
+      const { emitted, gets } = await run({ decision: "allow_mode", mode });
+      expect(emitted).toEqual([]);
+      expect(gets).toBe(3); // MAX_UNKNOWN_ANSWER_READS — kept polling, never a guessed allow
+    }
+  });
+
+  test("allow_mode on Codex → plain allow (no updatedPermissions ever reaches Codex)", async () => {
+    const { emitted } = await run({ decision: "allow_mode", mode: "acceptEdits" }, undefined, "codex");
+    const parsed = JSON.parse(emitted[0]);
+    expect(parsed.continue).toBe(true);
+    expect(parsed.hookSpecificOutput.decision).toEqual({ behavior: "allow" });
+  });
+
+  test("allow_mode on a question → released, never a bare allow", async () => {
+    const { emitted, gets } = await run({ decision: "allow_mode", mode: "acceptEdits" }, question(MULTI));
+    expect(emitted).toEqual([]);
+    expect(gets).toBe(1);
+  });
+
+  test("other-only: empty pick + typed text → the text IS the answer", async () => {
+    const { emitted } = await run({ decision: "answer", answers: [""], other: ["  my own idea  "] }, question(MULTI));
+    expect(decision(emitted[0]).updatedInput).toEqual({ questions: MULTI, answers: { "Pick?": "my own idea" } });
+  });
+
+  test("labels + other on multi-select → picked labels then the typed text, joined ', '", async () => {
+    const { emitted } = await run({ decision: "answer", answers: ["A, C"], other: ["also D"], notes: [null] }, question(MULTI));
+    expect(decision(emitted[0]).updatedInput.answers).toEqual({ "Pick?": "A, C, also D" });
+    expect("annotations" in decision(emitted[0]).updatedInput).toBe(false);
+  });
+
+  test("notes → annotations[questionText].notes", async () => {
+    const qs = [{ question: "One?", options: [{ label: "A" }] }, { question: "Two?", options: [{ label: "B" }] }];
+    const { emitted } = await run({ decision: "answer", answers: ["A", "B"], notes: ["", "because"] }, question(qs));
+    const updatedInput = decision(emitted[0]).updatedInput;
+    expect(updatedInput.answers).toEqual({ "One?": "A", "Two?": "B" });
+    expect(updatedInput.annotations).toEqual({ "Two?": { notes: "because" } });
+    expect(Object.keys(updatedInput).sort()).toEqual(["annotations", "answers", "questions"]);
+  });
+
+  test("a label mismatch still releases — free text is never inferred from it", async () => {
+    const { emitted, gets } = await run({ decision: "answer", answers: ["Z"], other: ["x"] }, question(MULTI));
+    expect(emitted).toEqual([]);
+    expect(gets).toBe(1);
+  });
+
+  test("extras of the wrong length / wrong type / over cap → release", async () => {
+    for (const extra of [
+      { other: ["a", "b"] }, { notes: [] }, { other: "a" }, { notes: [5] }, { other: ["x".repeat(501)] },
+    ]) {
+      const { emitted, gets } = await run({ decision: "answer", answers: ["A"], ...extra }, question(MULTI));
+      expect(emitted).toEqual([]);
+      expect(gets).toBe(1);
+    }
+  });
+
+  test("NOM-60: any question with kind !== 'choice' drops the picker (blob) and releases an answer", async () => {
+    const qs = [{ question: "Pick?", options: [{ label: "A" }] }, { question: "Name?", kind: "text", options: [{ label: "x" }] }];
+    expect(buildPermissionQuestions({ questions: qs })).toEqual([]);
+    expect(buildPermissionQuestions({ questions: [{ ...qs[0], kind: "choice" }] }).length).toBe(1);
+    const { emitted, gets } = await run({ decision: "answer", answers: ["A", "x"] }, question(qs));
+    expect(emitted).toEqual([]);
+    expect(gets).toBe(1);
+  });
+});

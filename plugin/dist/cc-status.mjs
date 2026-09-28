@@ -103,7 +103,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "2.2.1";
+var PLUGIN_VERSION = "2.3.0";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -2610,6 +2610,8 @@ function findProvisionalForPid(provisionals, hookPid, ancestorsOf) {
 }
 var claudeAdapter = {
   kind: "claude",
+  allowMode: true,
+  answerExtras: true,
   async title({ prefix, input, transcriptPath }) {
     const fromTranscript = await claudeSessionTitle(prefix, transcriptPath ?? "");
     if (fromTranscript)
