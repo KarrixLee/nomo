@@ -104,7 +104,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "2.2.1";
+var PLUGIN_VERSION = "2.3.5";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -2611,6 +2611,8 @@ function findProvisionalForPid(provisionals, hookPid, ancestorsOf) {
 }
 var claudeAdapter = {
   kind: "claude",
+  allowMode: true,
+  answerExtras: true,
   async title({ prefix, input, transcriptPath }) {
     const fromTranscript = await claudeSessionTitle(prefix, transcriptPath ?? "");
     if (fromTranscript)
@@ -2654,6 +2656,7 @@ var claudeAdapter = {
 };
 var codexAdapter = {
   kind: "codex",
+  answerExtras: "other",
   async title({ sessionId, prefix, input }) {
     const indexTitle = await codexIndexTitle(sessionId);
     if (indexTitle)
@@ -5377,7 +5380,7 @@ async function stashPendingEvent(input, machine, title, now, stashPath = PENDING
     await atomicWrite(stashPath, JSON.stringify(stash), 384);
   } catch {}
 }
-async function trackSessionAt(sessionsDir, sessionId, op, prio, status, blob, machine, folder, transcript, agent = "claude", sessionStartedAt, turnStartedAt, turnId, title, pairingId, model, pendingPlanPicker = false, pid = process.ppid, origin, planPickerVerificationPending = false, dbg, attentionKind, planFull) {
+async function trackSessionAt(sessionsDir, sessionId, op, prio, status, blob, machine, folder, transcript, agent = "claude", sessionStartedAt, turnStartedAt, turnId, title, pairingId, model, pendingPlanPicker = false, pid = process.ppid, origin, planPickerVerificationPending = false, dbg, attentionKind, planFull, awaitingPrompt = false) {
   try {
     const path = `${sessionsDir}/${sessionId}.json`;
     if (op === "end") {
@@ -5415,13 +5418,14 @@ async function trackSessionAt(sessionsDir, sessionId, op, prio, status, blob, ma
       ...typeof dbg === "string" && dbg.length > 0 ? { dbg } : {},
       ...origin ? { origin } : {},
       ...attentionKind ? { attentionKind } : {},
-      ...typeof planFull === "string" && planFull.length > 0 ? { planFull } : {}
+      ...typeof planFull === "string" && planFull.length > 0 ? { planFull } : {},
+      ...awaitingPrompt ? { awaitingPrompt: true } : {}
     };
     await atomicWrite(path, JSON.stringify(record), 384);
   } catch {}
 }
-async function trackSession(sessionId, op, prio, status, blob, machine, folder, transcript, agent = "claude", sessionStartedAt, turnStartedAt, turnId, title, pairingId, model, pendingPlanPicker = false, pid = process.ppid, origin, planPickerVerificationPending = false, dbg, attentionKind, planFull) {
-  return trackSessionAt(SESSIONS_DIR, sessionId, op, prio, status, blob, machine, folder, transcript, agent, sessionStartedAt, turnStartedAt, turnId, title, pairingId, model, pendingPlanPicker, pid, origin, planPickerVerificationPending, dbg, attentionKind, planFull);
+async function trackSession(sessionId, op, prio, status, blob, machine, folder, transcript, agent = "claude", sessionStartedAt, turnStartedAt, turnId, title, pairingId, model, pendingPlanPicker = false, pid = process.ppid, origin, planPickerVerificationPending = false, dbg, attentionKind, planFull, awaitingPrompt = false) {
+  return trackSessionAt(SESSIONS_DIR, sessionId, op, prio, status, blob, machine, folder, transcript, agent, sessionStartedAt, turnStartedAt, turnId, title, pairingId, model, pendingPlanPicker, pid, origin, planPickerVerificationPending, dbg, attentionKind, planFull, awaitingPrompt);
 }
 async function markDoneDeliveredAt(sessionsDir, sessionId) {
   try {
@@ -5688,6 +5692,7 @@ async function runHook(agent) {
     const cachedTurn = typeof existingRecord?.turnStartedAt === "number" && Number.isFinite(existingRecord.turnStartedAt) ? existingRecord.turnStartedAt : undefined;
     const isTurnOpener = hookName === "UserPromptSubmit" || hookName === "SessionStart" && sessionStartSource !== "compact";
     const turnStartedAt = isTurnOpener ? Math.floor(Date.now() / 1000) : cachedTurn;
+    const awaitingPrompt = hookName === "SessionStart" && !reusedForkPredecessor && (existingRecord ? sentDone || existingRecord.awaitingPrompt === true : sessionStartSource !== "compact");
     const turnId = typeof input.turn_id === "string" && input.turn_id.length > 0 ? input.turn_id : undefined;
     let plan = planOp(hookName, input, sentDone);
     if (!plan)
@@ -5731,7 +5736,7 @@ async function runHook(agent) {
     const origin = existingRecord?.origin ?? sessionOrigin(input, hookPid, hookCommand);
     const recordPid = reusedForkPredecessor ? existingRecord.pid : hookPid;
     const recordTranscript = reusedForkPredecessor ? existingRecord.transcript ?? transcriptPath : transcriptPath;
-    await trackSession(sessionId, plan.op, plan.prio, plan.status, envelope.blob, machine, folder, recordTranscript, agent, startedAt, turnStartedAt, turnId, title, config.pairingId, model, pendingPlanPicker, recordPid, origin, planPickerVerificationPending, dbg, envelope.attentionKind, planFull);
+    await trackSession(sessionId, plan.op, plan.prio, plan.status, envelope.blob, machine, folder, recordTranscript, agent, startedAt, turnStartedAt, turnId, title, config.pairingId, model, pendingPlanPicker, recordPid, origin, planPickerVerificationPending, dbg, envelope.attentionKind, planFull, awaitingPrompt);
     const clearedPickerMarker = pendingPlanPicker === false && planPickerVerificationPending === false && (existingRecord?.pendingPlanPicker === true || existingRecord?.planPickerVerificationPending === true || existingRecord?.planPickerSettled === true);
     if (agent === "codex" && (hookName === "Stop" || pendingPlanPicker || planPickerVerificationPending || clearedPickerMarker)) {
       tracePlanPickerDecision(sessionId, {
@@ -5940,10 +5945,19 @@ function allowAlwaysLine(agent, toolName, toolInput, suggestions) {
   if (agent === "codex")
     return allowLine(agent, toolName, toolInput);
   const updatedPermissions = Array.isArray(suggestions) && suggestions.length > 0 ? suggestions : [{ type: "addRules", rules: [{ toolName }], behavior: "allow", destination: "session" }];
+  return allowWithPermissionsLine(agent, toolName, toolInput, updatedPermissions);
+}
+function allowWithPermissionsLine(agent, toolName, toolInput, updatedPermissions) {
   const decision = toolName === "ExitPlanMode" ? { behavior: "allow", updatedInput: toolInput, updatedPermissions } : { behavior: "allow", updatedPermissions };
   return decisionLine(agent, { hookEventName: "PermissionRequest", decision });
 }
-function answerLine(agent, toolName, toolInput, answers) {
+var ALLOW_MODES = new Set(["acceptEdits", "auto"]);
+function allowModeLine(agent, toolName, toolInput, mode) {
+  if (!adapterFor(agent).allowMode)
+    return allowLine(agent, toolName, toolInput);
+  return allowWithPermissionsLine(agent, toolName, toolInput, [{ type: "setMode", mode, destination: "session" }]);
+}
+function answerLine(agent, toolName, toolInput, answers, other, notes) {
   if (!isAnswerTool(toolName, agent) || !Array.isArray(answers))
     return;
   const questions = usableQuestions(toolInput);
@@ -5951,27 +5965,74 @@ function answerLine(agent, toolName, toolInput, answers) {
     return;
   if (new Set(questions.map((q) => q.text)).size !== questions.length)
     return;
+  const otherTexts = extrasArray(other, questions.length);
+  const noteTexts = extrasArray(notes, questions.length);
+  if (otherTexts === undefined || noteTexts === undefined)
+    return;
+  if (!answerExtrasAccepted(adapterFor(agent).answerExtras, otherTexts, noteTexts))
+    return;
   const map = {};
+  const annotations = {};
   for (let i = 0;i < questions.length; i += 1) {
     const a = answers[i];
     if (typeof a !== "string")
       return;
     const raw = a.trim();
-    if (raw.length === 0)
-      return;
+    const typed = otherTexts[i];
+    if (noteTexts[i].length > 0)
+      annotations[questions[i].text] = { notes: noteTexts[i] };
+    if (raw.length === 0) {
+      if (typed.length === 0)
+        return;
+      map[questions[i].text] = typed;
+      continue;
+    }
     if (raw.length > ANSWER_MAX)
       return;
     const resolved = resolveAnswer(raw, questions[i].labels);
     if (resolved === undefined)
       return;
-    map[questions[i].text] = resolved;
+    map[questions[i].text] = typed.length > 0 ? `${resolved}, ${typed}` : resolved;
+    const preview = questions[i].raw?.multiSelect === true || typed.length > 0 ? "" : questions[i].previews[questions[i].labels.indexOf(resolved)] ?? "";
+    if (preview.length > 0)
+      annotations[questions[i].text] = { ...annotations[questions[i].text], preview };
   }
   if (Object.keys(map).length !== questions.length)
     return;
   return decisionLine(agent, {
     hookEventName: "PermissionRequest",
-    decision: { behavior: "allow", updatedInput: { ...toolInput, answers: map } }
+    decision: {
+      behavior: "allow",
+      updatedInput: Object.keys(annotations).length > 0 ? { ...toolInput, answers: map, annotations: { ...toolInput.annotations, ...annotations } } : { ...toolInput, answers: map }
+    }
   });
+}
+function answerExtrasAccepted(cap, other, notes) {
+  if (cap === true)
+    return true;
+  if (notes.some((t) => t.length > 0))
+    return false;
+  return cap === "other" || other.every((t) => t.length === 0);
+}
+function extrasArray(value, length) {
+  if (value === undefined || value === null)
+    return Array.from({ length }, () => "");
+  if (!Array.isArray(value) || value.length !== length)
+    return;
+  const out = [];
+  for (const entry of value) {
+    if (entry === null || entry === undefined) {
+      out.push("");
+      continue;
+    }
+    if (typeof entry !== "string")
+      return;
+    const t = entry.trim();
+    if (t.length > ANSWER_MAX)
+      return;
+    out.push(t);
+  }
+  return out;
 }
 function resolveAnswer(answer, labels) {
   const matchOne = (piece) => {
@@ -6154,6 +6215,7 @@ var QUESTION_TEXT_MAX = 240;
 var PERMISSION_QUESTION_LABEL_MAX = 60;
 var QUESTION_DESCRIPTION_MAX = 600;
 var QUESTION_DESCRIPTION_LADDER = [400, 280, 200, 160, 120, 80];
+var QUESTION_PREVIEW_MAX = 600;
 function withDescriptionCap(questions, max) {
   return questions.map((question) => question.d === undefined ? question : { ...question, d: question.d.map((description) => capPermissionWireText(description, max)) });
 }
@@ -6165,6 +6227,8 @@ function usableQuestions(toolInput) {
   const qs = toolInput.questions;
   if (!Array.isArray(qs))
     return [];
+  if (qs.some((q) => q?.kind !== undefined && q.kind !== "choice"))
+    return [];
   const out = [];
   for (const raw of qs) {
     const text = typeof raw?.question === "string" ? raw.question : "";
@@ -6172,6 +6236,7 @@ function usableQuestions(toolInput) {
       continue;
     const labels = [];
     const descriptions = [];
+    const previews = [];
     if (Array.isArray(raw?.options)) {
       for (const opt of raw.options) {
         const label = opt?.label;
@@ -6179,12 +6244,14 @@ function usableQuestions(toolInput) {
           labels.push(label);
           const description = opt?.description;
           descriptions.push(typeof description === "string" ? description : "");
+          const preview = opt?.preview;
+          previews.push(typeof preview === "string" ? preview : "");
         }
       }
     }
     if (labels.length === 0)
       continue;
-    out.push({ text, raw, labels, descriptions });
+    out.push({ text, raw, labels, descriptions, previews });
   }
   return out;
 }
@@ -6192,14 +6259,16 @@ function firstQuestionText(toolInput) {
   return usableQuestions(toolInput)[0]?.text ?? "";
 }
 function buildPermissionQuestions(toolInput) {
-  return usableQuestions(toolInput).map(({ text, raw, labels, descriptions }) => {
+  return usableQuestions(toolInput).map(({ text, raw, labels, descriptions, previews }) => {
     const wireDescriptions = descriptions.map((description) => capPermissionWireText(description, QUESTION_DESCRIPTION_MAX));
     return {
       q: capPermissionWireText(text, QUESTION_TEXT_MAX),
       ...typeof raw?.header === "string" && raw.header.length > 0 ? { h: raw.header } : {},
       ...raw?.multiSelect === true ? { m: true } : {},
       o: labels.map((l) => capPermissionWireText(l, PERMISSION_QUESTION_LABEL_MAX)),
-      ...wireDescriptions.some((description) => description.length > 0) ? { d: wireDescriptions } : {}
+      ...wireDescriptions.some((description) => description.length > 0) ? { d: wireDescriptions } : {},
+      ...raw?.multiSelect !== true && previews.some((pv) => pv.length > 0) ? { p: previews.map((pv) => pv.length > 0 ? capPermissionWireText(pv, QUESTION_PREVIEW_MAX) : null) } : {},
+      ...raw?.isOther === true ? { x: true } : {}
     };
   });
 }
@@ -6211,10 +6280,12 @@ function fitPermissionDetail(base, detail, maxChars = BLOB_FIT_CHARS, questions 
   const encoder = new TextEncoder;
   const measure = (d, omitted, qs) => sealedBlobChars(encoder.encode(JSON.stringify(permissionFrame(base, d, omitted, qs))).length);
   const worstCase = all.length;
-  const bareQuestions = questions.map(({ d: _descriptions, ...question }) => question);
+  const noPreviews = questions.map(({ p: _previews, ...question }) => question);
+  const bareQuestions = noPreviews.map(({ d: _descriptions, ...question }) => question);
   const candidates = questions.length === 0 ? [] : [
     questions,
-    ...QUESTION_DESCRIPTION_LADDER.map((max) => withDescriptionCap(questions, max)),
+    noPreviews,
+    ...QUESTION_DESCRIPTION_LADDER.map((max) => withDescriptionCap(noPreviews, max)),
     bareQuestions
   ];
   const kept = candidates.find((candidate) => measure("", worstCase, candidate) <= maxChars) ?? [];
@@ -6268,12 +6339,24 @@ function emitDecision(agent, answer, toolName, toolInput, suggestions, emit, tra
       emit(allowAlwaysLine(agent, toolName, toolInput, suggestions));
       trace({ event: "emit", decision: agent === "codex" ? "allow_always_degraded_to_allow" : "allow_always" });
       return "emitted";
+    case "allow_mode":
+      if (typeof answer.mode !== "string" || !ALLOW_MODES.has(answer.mode)) {
+        trace({ event: "answer-unknown-decision" });
+        return "keep-polling";
+      }
+      if (isQuestion) {
+        trace({ event: "release", reason: "bare-allow-on-question" });
+        return "released";
+      }
+      emit(allowModeLine(agent, toolName, toolInput, answer.mode));
+      trace({ event: "emit", decision: adapterFor(agent).allowMode ? "allow_mode" : "allow_mode_degraded_to_allow", mode: answer.mode });
+      return "emitted";
     case "deny":
       emit(denyLine(agent, answer.message));
       trace({ event: "emit", decision: "deny", hasMessage: typeof answer.message === "string" && answer.message.trim().length > 0 });
       return "emitted";
     case "answer": {
-      const line = answerLine(agent, toolName, toolInput, answer.answers);
+      const line = answerLine(agent, toolName, toolInput, answer.answers, answer.other, answer.notes);
       if (line === undefined) {
         trace({ event: "release", reason: "answer-unmappable", tool_name: toolName });
         return "released";
@@ -6879,7 +6962,8 @@ function renderableCodexUserInput(toolInput) {
       question: raw.question,
       ...typeof raw.header === "string" ? { header: raw.header } : {},
       multiSelect: false,
-      options
+      options,
+      ...raw.isOther === true ? { isOther: true } : {}
     });
   }
   if (new Set(ids).size !== ids.length)
@@ -6890,6 +6974,8 @@ function renderableCodexUserInput(toolInput) {
 // src/core/codex-remote-input.ts
 var POST_TIMEOUT_MS = 15000;
 var ANSWER_MAX3 = 500;
+var CODEX_OTHER_LABEL = "None of the above";
+var CODEX_NOTE_PREFIX = "user_note: ";
 function defaultWriteHold2() {
   return lanRunningUnderTest() ? async () => {} : writeDecisionHold;
 }
@@ -6902,8 +6988,12 @@ function defaultClearHold2() {
 function defaultSettleHoldRecord2() {
   return lanRunningUnderTest() ? async () => {} : settleDecisionHoldRecord;
 }
-function codexAnswersFromPhone(request, positional) {
+function codexAnswersFromPhone(request, positional, other, notes) {
   if (!Array.isArray(positional) || positional.length !== request.questions.length)
+    return;
+  const otherTexts = extrasArray(other, request.questions.length);
+  const noteTexts = extrasArray(notes, request.questions.length);
+  if (!otherTexts || !noteTexts || !answerExtrasAccepted(codexAdapter.answerExtras, otherTexts, noteTexts))
     return;
   const mapped = {};
   for (let index = 0;index < request.questions.length; index += 1) {
@@ -6914,13 +7004,23 @@ function codexAnswersFromPhone(request, positional) {
     if (typeof raw !== "string")
       return;
     const answer = raw.trim();
-    if (answer.length === 0 || answer.length > ANSWER_MAX3 || !question.options?.length)
+    const typed = otherTexts[index];
+    if (typed.length > 0 && !question.isOther)
+      return;
+    if (!question.options?.length)
+      return;
+    const note2 = typed.length > 0 ? [`${CODEX_NOTE_PREFIX}${typed}`] : [];
+    if (answer.length === 0 && note2.length > 0) {
+      mapped[question.id] = [CODEX_OTHER_LABEL, ...note2];
+      continue;
+    }
+    if (answer.length === 0 || answer.length > ANSWER_MAX3)
       return;
     const hits = question.options.map((option) => option.label).filter((label) => label === answer || capPermissionWireText(label, PERMISSION_QUESTION_LABEL_MAX) === answer);
     const unique = Array.from(new Set(hits));
     if (unique.length !== 1)
       return;
-    mapped[question.id] = [unique[0]];
+    mapped[question.id] = [unique[0], ...note2];
   }
   if (Object.keys(mapped).length !== request.questions.length)
     return;
@@ -7162,7 +7262,7 @@ async function runRemoteInput(request, requestId, signal, deps, onHoldCreated) {
       }
       if (answer.decision !== "answer")
         return reject("unknown decision", "unsupported");
-      const mapped = codexAnswersFromPhone(request, answer.answers);
+      const mapped = codexAnswersFromPhone(request, answer.answers, answer.other, answer.notes);
       if (!mapped)
         return reject("unmappable to the app-server questions", "unsupported");
       const result = await deps.answerAppServer(mapped);
@@ -8638,6 +8738,7 @@ async function correctIdleProvisional(config, path, sessionId, record) {
   }
 }
 var CLAUDE_IDLE_REAP_MS = 1800000;
+var CLAUDE_AWAITING_PROMPT_REAP_MS = 20000;
 var CLAUDE_IDLE_REAP_MAX_ATTEMPTS = 5;
 function transcriptMtimeMsDefault(path) {
   try {
@@ -8651,19 +8752,19 @@ function isClaudeIdleReapEligible(record, now, transcriptMtimeMs = transcriptMti
     return false;
   if (record.provisional === true)
     return false;
-  return idleReapAgeEligible(record, now, transcriptMtimeMs);
+  return idleReapAgeEligible(record, now, transcriptMtimeMs, record.awaitingPrompt === true ? CLAUDE_AWAITING_PROMPT_REAP_MS : CLAUDE_IDLE_REAP_MS);
 }
-function idleReapAgeEligible(record, now, transcriptMtimeMs = transcriptMtimeMsDefault) {
+function idleReapAgeEligible(record, now, transcriptMtimeMs = transcriptMtimeMsDefault, idleMs = CLAUDE_IDLE_REAP_MS) {
   if (record.lastEvent !== "working" && record.lastEvent !== "sessionStart")
     return false;
   if (typeof record.ts !== "number")
     return false;
-  if (now - record.ts < CLAUDE_IDLE_REAP_MS)
+  if (now - record.ts < idleMs)
     return false;
   if (typeof record.transcript === "string" && record.transcript.length > 0) {
     try {
       const m = transcriptMtimeMs(record.transcript);
-      if (typeof m === "number" && Number.isFinite(m) && now - m < CLAUDE_IDLE_REAP_MS)
+      if (typeof m === "number" && Number.isFinite(m) && now - m < idleMs)
         return false;
     } catch {}
   }
@@ -8673,6 +8774,16 @@ async function correctIdleClaude(config, path, sessionId, record, now, deps = {}
   const post = deps.post ?? ((body) => postEvent(config, body));
   const writeRecord = deps.writeRecord ?? ((p, rec) => atomicWrite(p, JSON.stringify(rec), 384));
   const clock = deps.now ?? Date.now;
+  const reread = deps.readRecord ?? readRecordAt;
+  const snapshot = record;
+  const unmoved = async () => {
+    try {
+      const fresh = await reread(path);
+      return fresh !== null && !recordMovedSince(snapshot, fresh);
+    } catch {
+      return false;
+    }
+  };
   try {
     const agent = recordAgent(record);
     if (agent === "codex") {
@@ -8709,19 +8820,27 @@ async function correctIdleClaude(config, path, sessionId, record, now, deps = {}
       return "uncorrected";
     const attempts = effectiveDoneAttempts(record, sessionId);
     if (attempts >= CLAUDE_IDLE_REAP_MAX_ATTEMPTS) {
+      if (!await unmoved())
+        return "uncorrected";
       try {
-        await writeRecord(path, { ...record, lastEvent: "done", sentDone: true, op: "done", doneAttempts: undefined });
+        await writeRecord(path, { ...record, lastEvent: "done", sentDone: true, op: "done", doneAttempts: undefined, awaitingPrompt: undefined });
         clearDoneAttempts(sessionId);
       } catch {}
       return "pending";
     }
+    if (!await unmoved())
+      return "uncorrected";
     const doneNow = clock();
     const outcome = await post(await buildDoneEnvelope(sessionId, record, doneNow, config.e2eKey, agent, Math.floor(record.ts / 1000)));
     if (outcome === "revoked")
       return "revoked";
+    if (!await unmoved()) {
+      clearDoneAttempts(sessionId);
+      return "uncorrected";
+    }
     if (outcome === "delivered") {
       try {
-        await writeRecord(path, { ...record, lastEvent: "done", sentDone: true, op: "done", doneAttempts: undefined });
+        await writeRecord(path, { ...record, lastEvent: "done", sentDone: true, op: "done", doneAttempts: undefined, awaitingPrompt: undefined });
       } catch {}
       clearDoneAttempts(sessionId);
       return "corrected";
@@ -9672,6 +9791,7 @@ export {
   acceptLanAnswer,
   WAITING_HEARTBEAT_AFTER_MS,
   RETIRE_AFTER_MS,
+  POLL_MS,
   PLAN_PICKER_VERIFY_MAX_MS,
   PLAN_PICKER_RECENT_DONE_MS,
   PLAN_PICKER_PENDING_MAX_MS,
@@ -9681,5 +9801,7 @@ export {
   IDLE_GRACE_MS,
   COMMAND_TTL_MS,
   COMMAND_FUTURE_SKEW_MS,
-  CODEX_TUI_SESSION_START_SKEW_MS
+  CODEX_TUI_SESSION_START_SKEW_MS,
+  CLAUDE_IDLE_REAP_MAX_ATTEMPTS,
+  CLAUDE_AWAITING_PROMPT_REAP_MS
 };

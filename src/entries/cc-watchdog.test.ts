@@ -20,7 +20,7 @@ import {
   PLAN_PICKER_RECENT_DONE_MS, PLAN_PICKER_VERIFY_MAX_MS, RETIRE_AFTER_MS,
   buildWorkingEnvelope, postOutcomeForStatus, provisionalsCoveredByReal, reconcileProvisionalsSweep, recordMovedSince, resetCommandState, resetDoneAttemptMemory, retireDoneStale,
   setCodexBridgeDown, shouldHeartbeat, shouldIdleProvisionalCheck,
-  heartbeatKind, isWaitingSession,
+  heartbeatKind, isWaitingSession, CLAUDE_AWAITING_PROMPT_REAP_MS, CLAUDE_IDLE_REAP_MAX_ATTEMPTS, POLL_MS,
   shouldInterruptCheck, shouldPendingApprovalCheck, shouldPendingDoneCheck, shouldPlanPickerVerificationCheck, shouldRepairTitle, tailShowsInterrupt, titleRepairedRecord,
   watchdogEventHeaders, WAITING_HEARTBEAT_AFTER_MS, withDeadline,
 } from "./cc-watchdog";
@@ -174,6 +174,146 @@ describe("isClaudeIdleReapEligible (a resumed Claude session gone silent past th
   });
 });
 
+// A session OPENED but never prompted (`claude --resume`, left at the empty prompt): the hook's
+// SessionStart said "working" and Claude Code has no idle hook to retract it, so it showed "Running" for
+// the full 30-min grace. The hook's `awaitingPrompt` marker shortens the SAME predicate's clock to 60 s.
+describe("isClaudeIdleReapEligible — awaitingPrompt (opened, never prompted) reaps on the short clock", () => {
+  const SHORT_MS = CLAUDE_AWAITING_PROMPT_REAP_MS;
+  const now = 100_000_000;
+  const opened = (over: Partial<SessionRecord> = {}): SessionRecord =>
+    rec({ lastEvent: "sessionStart", op: "start", awaitingPrompt: true, ...over });
+
+  test("marker + threshold+1 s → eligible; threshold−1 s → not", () => {
+    expect(isClaudeIdleReapEligible(opened({ ts: now - (SHORT_MS + 1_000) }), now)).toBe(true);
+    expect(isClaudeIdleReapEligible(opened({ ts: now - (SHORT_MS - 1_000) }), now)).toBe(false);
+  });
+
+  test("NO marker past the short clock → not eligible (the 30-min rule is unchanged)", () => {
+    expect(isClaudeIdleReapEligible(rec({ lastEvent: "sessionStart", op: "start", ts: now - (SHORT_MS + 1_000) }), now)).toBe(false);
+    expect(isClaudeIdleReapEligible(rec({ lastEvent: "working", op: "update", ts: now - (SHORT_MS + 1_000) }), now)).toBe(false);
+  });
+
+  test("marker with lastEvent working (a resume over a done record) → eligible past the short clock", () => {
+    expect(isClaudeIdleReapEligible(opened({ lastEvent: "working", op: "update", ts: now - (SHORT_MS + 1_000) }), now)).toBe(true);
+  });
+
+  test("the marker never overrides the state gate or the agent gate", () => {
+    expect(isClaudeIdleReapEligible(opened({ lastEvent: "needsAttention", ts: now - (SHORT_MS + 1_000) }), now)).toBe(false);
+    expect(isClaudeIdleReapEligible(opened({ lastEvent: "done", op: "done", ts: now - (SHORT_MS + 1_000) }), now)).toBe(false);
+    expect(isClaudeIdleReapEligible(opened({ agent: "codex", ts: now - (SHORT_MS + 1_000) }), now)).toBe(false);
+    expect(isClaudeIdleReapEligible(opened({ agent: "opencode", ts: now - (SHORT_MS + 1_000) }), now)).toBe(false);
+    expect(isClaudeIdleReapEligible(opened({ provisional: true, ts: now - (SHORT_MS + 1_000) }), now)).toBe(false);
+  });
+
+  test("the transcript veto is measured against the SAME short clock", () => {
+    const r = opened({ ts: now - (SHORT_MS + 1_000), transcript: "/tmp/t.jsonl" });
+    expect(isClaudeIdleReapEligible(r, now, () => now - (SHORT_MS - 1_000))).toBe(false); // written inside the window → alive
+    expect(isClaudeIdleReapEligible(r, now, () => now - (SHORT_MS + 1_000))).toBe(true);
+  });
+
+  test("the heartbeats AGREE — a marker row past the short clock is never beaten back to working", () => {
+    const quiet = opened({ blob: "B", ts: now - 600_000 }); // 10 min: squarely inside the ordinary heartbeat window
+    expect(shouldHeartbeat(quiet, now, undefined, false)).toBe(false);
+    expect(heartbeatKind(opened({ blob: "B", ts: now - (SHORT_MS + 1_000) }), now, undefined, undefined, false, true)).toBe("none");
+    // …while the same row WITHOUT the marker is heartbeated exactly as before.
+    expect(shouldHeartbeat({ ...quiet, awaitingPrompt: undefined }, now, undefined, false)).toBe(true);
+  });
+
+  test("correctIdleClaude reaps it past the short clock: done `at` frozen at record.ts, and the pin CLEARS the marker", async () => {
+    const posts: object[] = [];
+    const writes: SessionRecord[] = [];
+    const v = await correctIdleClaude(cfg(), "/tmp/s.json", "s", opened({ blob: "B", ts: now - (SHORT_MS + 1_000) }), now, {
+      readRecord: async () => opened({ blob: "B", ts: now - (SHORT_MS + 1_000) }),
+      post: async (b) => { posts.push(b); return "delivered" as PostOutcome; },
+      writeRecord: async (_p, r) => { writes.push(r); },
+    });
+    expect(v).toBe("corrected");
+    expect(posts).toHaveLength(1);
+    expect(posts[0]).toMatchObject({ op: "done" });
+    expect(writes[0]).toMatchObject({ lastEvent: "done", op: "done", sentDone: true });
+    expect(writes[0].awaitingPrompt).toBeUndefined();
+    expect(isClaudeIdleReapEligible(writes[0], now + SHORT_MS)).toBe(false);
+  });
+
+  // CROSS-REPO: the worker (api-status server/src/cc.ts, DONE_ALERT_MIN_TURN_MS) buzzes "Task finished"
+  // when a done's envelope ts is ≥ 60 s after the SessionStart that opened the "turn". This reap's done
+  // must land under that even on its LAST bounded retry, or every opened-and-left session buzzes.
+  test("the worst-case DELIVERED reap stays under the worker's done-alert threshold", () => {
+    const DONE_ALERT_MIN_TURN_MS = 60_000; // must mirror server/src/cc.ts
+    const worst = CLAUDE_AWAITING_PROMPT_REAP_MS + POLL_MS + CLAUDE_IDLE_REAP_MAX_ATTEMPTS * POLL_MS;
+    expect(worst).toBeLessThan(DONE_ALERT_MIN_TURN_MS);
+  });
+
+  describe("stale-snapshot guard (the user's first prompt can land seconds after the open)", () => {
+    const snap = () => opened({ blob: "B", ts: now - (SHORT_MS + 1_000) });
+    const prompted = () => rec({ lastEvent: "working", op: "update", blob: "B2", ts: now });
+
+    test("record CHANGED before the post → nothing posted, nothing written", async () => {
+      let posts = 0; const writes: SessionRecord[] = [];
+      const v = await correctIdleClaude(cfg(), "/tmp/s.json", "s", snap(), now, {
+        readRecord: async () => prompted(),
+        post: async () => { posts++; return "delivered" as PostOutcome; },
+        writeRecord: async (_p, r) => { writes.push(r); },
+      });
+      expect(v).toBe("uncorrected");
+      expect(posts).toBe(0);
+      expect(writes).toEqual([]);
+    });
+
+    test("record GONE before the post (SessionEnd) → nothing posted, never resurrected", async () => {
+      let posts = 0; const writes: SessionRecord[] = [];
+      const v = await correctIdleClaude(cfg(), "/tmp/s.json", "s", snap(), now, {
+        readRecord: async () => null,
+        post: async () => { posts++; return "delivered" as PostOutcome; },
+        writeRecord: async (_p, r) => { writes.push(r); },
+      });
+      expect(v).toBe("uncorrected");
+      expect(posts).toBe(0);
+      expect(writes).toEqual([]);
+    });
+
+    for (const outcome of ["delivered", "failed"] as PostOutcome[]) {
+      test(`record changed DURING a ${outcome} post → the stale done/counter is never written over it`, async () => {
+        let reads = 0; const writes: SessionRecord[] = [];
+        const v = await correctIdleClaude(cfg(), "/tmp/s.json", "s", snap(), now, {
+          readRecord: async () => (reads++ === 0 ? snap() : prompted()), // the prompt lands mid-POST
+          post: async () => outcome,
+          writeRecord: async (_p, r) => { writes.push(r); },
+        });
+        expect(v).toBe("uncorrected");
+        expect(writes).toEqual([]);
+      });
+    }
+
+    test("the guard covers the Codex branch too", async () => {
+      let posts = 0;
+      const record = rec({ agent: "codex", pid: 937, transcript: "/tmp/rollout.jsonl", lastEvent: "working", op: "update", blob: "B", ts: now - 7_200_000 });
+      const v = await correctIdleClaude(cfg(), "/tmp/s.json", "s", record, now, {
+        readRecord: async () => ({ ...record, ts: now }),
+        locateTuiPid: async () => 64799, pidAlive: () => true, codexTurnActive: async () => false,
+        post: async () => { posts++; return "delivered" as PostOutcome; }, writeRecord: async () => {},
+      });
+      expect(v).toBe("uncorrected");
+      expect(posts).toBe(0);
+    });
+  });
+
+  test("a codex record carrying the marker is untouched past the short clock (its reap still needs the 30-min clock + TUI proof)", async () => {
+    const posts: object[] = [];
+    const v = await correctIdleClaude(cfg(), "/tmp/s.json", "s",
+      opened({ agent: "codex", transcript: "/tmp/rollout.jsonl", ts: now - (SHORT_MS + 1_000) }), now, {
+        readRecord: async () => opened({ agent: "codex", transcript: "/tmp/rollout.jsonl", ts: now - (SHORT_MS + 1_000) }),
+        post: async (b) => { posts.push(b); return "delivered" as PostOutcome; },
+        writeRecord: async () => {},
+        locateTuiPid: async () => 64799,
+        pidAlive: () => true,
+        codexTurnActive: async () => false,
+      });
+    expect(v).toBe("uncorrected");
+    expect(posts).toHaveLength(0);
+  });
+});
+
 // The idle-CLAUDE reap must make DURABLE progress even when its corrective done can't reach the worker —
 // the live failure mode (2026-07-20): seven resumed-but-never-prompted Claude sessions (lastEvent
 // "sessionStart", pid alive, transcript's last real turn DAYS old) sat unreaped because every corrective
@@ -193,6 +333,7 @@ describe("correctIdleClaude (resumed-idle reap — bounded retry + local done-pi
     const posts: object[] = [];
     const writes: SessionRecord[] = [];
     const v = await correctIdleClaude(cfg(), "/tmp/s.json", "s", resumed(), NOW, {
+      readRecord: async () => resumed(),
       post: async (b) => { posts.push(b); return "delivered" as PostOutcome; },
       writeRecord: async (_p, r) => { writes.push(r); },
       now: () => 4242,
@@ -209,6 +350,7 @@ describe("correctIdleClaude (resumed-idle reap — bounded retry + local done-pi
     const writes: SessionRecord[] = [];
     const record = resumed({ agent: "codex", pid: 937, transcript: "/tmp/rollout.jsonl" });
     const v = await correctIdleClaude(cfg(), "/tmp/s.json", "s", record, NOW, {
+      readRecord: async () => record,
       locateTuiPid: async () => 64799,
       pidAlive: (pid) => pid === 64799,
       codexTurnActive: async (pid, transcript) => {
@@ -229,12 +371,14 @@ describe("correctIdleClaude (resumed-idle reap — bounded retry + local done-pi
     const record = resumed({ agent: "codex", pid: 937, transcript: "/tmp/rollout.jsonl" });
     let posts = 0;
     expect(await correctIdleClaude(cfg(), "/tmp/s.json", "s", record, NOW, {
+      readRecord: async () => record,
       locateTuiPid: async () => 64799,
       pidAlive: () => true,
       codexTurnActive: async () => true,
       post: async () => { posts++; return "delivered" as PostOutcome; },
     })).toBe("uncorrected");
     expect(await correctIdleClaude(cfg(), "/tmp/s.json", "s", record, NOW, {
+      readRecord: async () => record,
       locateTuiPid: async () => undefined,
       post: async () => { posts++; return "delivered" as PostOutcome; },
     })).toBe("uncorrected");
@@ -244,6 +388,7 @@ describe("correctIdleClaude (resumed-idle reap — bounded retry + local done-pi
   test("a transiently FAILING done POST persists a bounded doneAttempts counter (verdict 'pending', record stays retryable)", async () => {
     const writes: SessionRecord[] = [];
     const v = await correctIdleClaude(cfg(), "/tmp/s.json", "s", resumed(), NOW, {
+      readRecord: async () => resumed(),
       post: async () => "failed" as PostOutcome,
       writeRecord: async (_p, r) => { writes.push(r); },
     });
@@ -257,6 +402,7 @@ describe("correctIdleClaude (resumed-idle reap — bounded retry + local done-pi
     let last: SessionRecord = resumed();
     for (let i = 0; i < 20; i++) {
       const v = await correctIdleClaude(cfg(), "/tmp/s.json", "s", last, NOW, {
+        readRecord: async () => last,
         post: async () => { posts++; return "failed" as PostOutcome; },
         writeRecord: async (_p, r) => { last = r; },
       });
@@ -273,6 +419,7 @@ describe("correctIdleClaude (resumed-idle reap — bounded retry + local done-pi
 
   test("a revoke bubbles up so the loop can tear the pairing down", async () => {
     const v = await correctIdleClaude(cfg(), "/tmp/s.json", "s", resumed(), NOW, {
+      readRecord: async () => resumed(),
       post: async () => "revoked" as PostOutcome, writeRecord: async () => {},
     });
     expect(v).toBe("revoked");
@@ -290,6 +437,7 @@ describe("correctIdleClaude (resumed-idle reap — bounded retry + local done-pi
     let posts = 0;
     let last: SessionRecord = resumed();
     const v = await correctIdleClaude(cfg(), "/tmp/s.json", "s", last, NOW, {
+      readRecord: async () => last,
       post: async () => { posts++; return "delivered" as PostOutcome; },
       writeRecord: async (_p, r) => { last = r; },
     });
@@ -2643,6 +2791,7 @@ describe("live-decision-hold gate: no op:done corrective may land while an appro
       const posts: object[] = [];
       const writes: SessionRecord[] = [];
       const v = await correctIdleClaude(cfg(), "/tmp/s.json", "s", idle(), NOW, {
+        readRecord: async () => idle(),
         post: async (b) => { posts.push(b); return "delivered" as PostOutcome; },
         writeRecord: async (_p, r) => { writes.push(r); },
         ...held,
@@ -2655,6 +2804,7 @@ describe("live-decision-hold gate: no op:done corrective may land while an appro
     test("a STALE hold does NOT suppress it (a 30-min-idle session still reaps)", async () => {
       const posts: object[] = [];
       const v = await correctIdleClaude(cfg(), "/tmp/s.json", "s", idle(), NOW, {
+        readRecord: async () => idle(),
         post: async (b) => { posts.push(b); return "delivered" as PostOutcome; },
         writeRecord: async () => {},
         ...stale,
@@ -3403,6 +3553,7 @@ describe("corrective-done retries stay bounded even when EVERY record write fail
     const idle = rec({ lastEvent: "sessionStart", ts: NOW - 3_600_000, blob: "W" });
     for (let i = 0; i < 20; i++) {
       await correctIdleClaude(cfg(), "/tmp/s.json", "wedged-idle", idle, NOW, {
+        readRecord: async () => idle,
         post: async () => { posts++; return "failed" as PostOutcome; },
         writeRecord: async () => { throw new Error("EROFS"); },
       });

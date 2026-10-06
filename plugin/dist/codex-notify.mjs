@@ -103,7 +103,7 @@ async function sha256Hex(s) {
 }
 
 // src/core/shared.ts
-var PLUGIN_VERSION = "2.2.1";
+var PLUGIN_VERSION = "2.3.5";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -2610,6 +2610,8 @@ function findProvisionalForPid(provisionals, hookPid, ancestorsOf) {
 }
 var claudeAdapter = {
   kind: "claude",
+  allowMode: true,
+  answerExtras: true,
   async title({ prefix, input, transcriptPath }) {
     const fromTranscript = await claudeSessionTitle(prefix, transcriptPath ?? "");
     if (fromTranscript)
@@ -2653,6 +2655,7 @@ var claudeAdapter = {
 };
 var codexAdapter = {
   kind: "codex",
+  answerExtras: "other",
   async title({ sessionId, prefix, input }) {
     const indexTitle = await codexIndexTitle(sessionId);
     if (indexTitle)
@@ -3078,7 +3081,7 @@ async function stashPendingEvent(input, machine, title, now, stashPath = PENDING
     await atomicWrite(stashPath, JSON.stringify(stash), 384);
   } catch {}
 }
-async function trackSessionAt(sessionsDir, sessionId, op, prio, status, blob, machine, folder, transcript, agent = "claude", sessionStartedAt, turnStartedAt, turnId, title, pairingId, model, pendingPlanPicker = false, pid = process.ppid, origin, planPickerVerificationPending = false, dbg, attentionKind, planFull) {
+async function trackSessionAt(sessionsDir, sessionId, op, prio, status, blob, machine, folder, transcript, agent = "claude", sessionStartedAt, turnStartedAt, turnId, title, pairingId, model, pendingPlanPicker = false, pid = process.ppid, origin, planPickerVerificationPending = false, dbg, attentionKind, planFull, awaitingPrompt = false) {
   try {
     const path = `${sessionsDir}/${sessionId}.json`;
     if (op === "end") {
@@ -3116,13 +3119,14 @@ async function trackSessionAt(sessionsDir, sessionId, op, prio, status, blob, ma
       ...typeof dbg === "string" && dbg.length > 0 ? { dbg } : {},
       ...origin ? { origin } : {},
       ...attentionKind ? { attentionKind } : {},
-      ...typeof planFull === "string" && planFull.length > 0 ? { planFull } : {}
+      ...typeof planFull === "string" && planFull.length > 0 ? { planFull } : {},
+      ...awaitingPrompt ? { awaitingPrompt: true } : {}
     };
     await atomicWrite(path, JSON.stringify(record), 384);
   } catch {}
 }
-async function trackSession(sessionId, op, prio, status, blob, machine, folder, transcript, agent = "claude", sessionStartedAt, turnStartedAt, turnId, title, pairingId, model, pendingPlanPicker = false, pid = process.ppid, origin, planPickerVerificationPending = false, dbg, attentionKind, planFull) {
-  return trackSessionAt(SESSIONS_DIR, sessionId, op, prio, status, blob, machine, folder, transcript, agent, sessionStartedAt, turnStartedAt, turnId, title, pairingId, model, pendingPlanPicker, pid, origin, planPickerVerificationPending, dbg, attentionKind, planFull);
+async function trackSession(sessionId, op, prio, status, blob, machine, folder, transcript, agent = "claude", sessionStartedAt, turnStartedAt, turnId, title, pairingId, model, pendingPlanPicker = false, pid = process.ppid, origin, planPickerVerificationPending = false, dbg, attentionKind, planFull, awaitingPrompt = false) {
+  return trackSessionAt(SESSIONS_DIR, sessionId, op, prio, status, blob, machine, folder, transcript, agent, sessionStartedAt, turnStartedAt, turnId, title, pairingId, model, pendingPlanPicker, pid, origin, planPickerVerificationPending, dbg, attentionKind, planFull, awaitingPrompt);
 }
 async function markDoneDeliveredAt(sessionsDir, sessionId) {
   try {
@@ -3389,6 +3393,7 @@ async function runHook(agent) {
     const cachedTurn = typeof existingRecord?.turnStartedAt === "number" && Number.isFinite(existingRecord.turnStartedAt) ? existingRecord.turnStartedAt : undefined;
     const isTurnOpener = hookName === "UserPromptSubmit" || hookName === "SessionStart" && sessionStartSource !== "compact";
     const turnStartedAt = isTurnOpener ? Math.floor(Date.now() / 1000) : cachedTurn;
+    const awaitingPrompt = hookName === "SessionStart" && !reusedForkPredecessor && (existingRecord ? sentDone || existingRecord.awaitingPrompt === true : sessionStartSource !== "compact");
     const turnId = typeof input.turn_id === "string" && input.turn_id.length > 0 ? input.turn_id : undefined;
     let plan = planOp(hookName, input, sentDone);
     if (!plan)
@@ -3432,7 +3437,7 @@ async function runHook(agent) {
     const origin = existingRecord?.origin ?? sessionOrigin(input, hookPid, hookCommand);
     const recordPid = reusedForkPredecessor ? existingRecord.pid : hookPid;
     const recordTranscript = reusedForkPredecessor ? existingRecord.transcript ?? transcriptPath : transcriptPath;
-    await trackSession(sessionId, plan.op, plan.prio, plan.status, envelope.blob, machine, folder, recordTranscript, agent, startedAt, turnStartedAt, turnId, title, config.pairingId, model, pendingPlanPicker, recordPid, origin, planPickerVerificationPending, dbg, envelope.attentionKind, planFull);
+    await trackSession(sessionId, plan.op, plan.prio, plan.status, envelope.blob, machine, folder, recordTranscript, agent, startedAt, turnStartedAt, turnId, title, config.pairingId, model, pendingPlanPicker, recordPid, origin, planPickerVerificationPending, dbg, envelope.attentionKind, planFull, awaitingPrompt);
     const clearedPickerMarker = pendingPlanPicker === false && planPickerVerificationPending === false && (existingRecord?.pendingPlanPicker === true || existingRecord?.planPickerVerificationPending === true || existingRecord?.planPickerSettled === true);
     if (agent === "codex" && (hookName === "Stop" || pendingPlanPicker || planPickerVerificationPending || clearedPickerMarker)) {
       tracePlanPickerDecision(sessionId, {

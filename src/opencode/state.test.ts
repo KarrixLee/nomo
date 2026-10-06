@@ -55,25 +55,126 @@ const assistantMessage = (sessionID: string, providerID: string, modelID: string
   },
 });
 
-/** A started, working root session — the state every turn-level test wants as its precondition. */
+/** A root session the phone already knows, sitting BETWEEN turns (created → busy → idle) — the state
+ *  every turn-level test wants as its precondition. A bare `session.created` is not enough any more:
+ *  it claims nothing, so the row does not exist on the phone until the first busy. */
 function startedRoot(): OcState {
   const state = newOcState();
-  expect(reduceOcEvent(state, created(ROOT, "Explore codebase structure"), 1_000)).not.toBeNull();
+  expect(reduceOcEvent(state, created(ROOT, "Explore codebase structure"), 1_000)).toBeNull();
+  expect(reduceOcEvent(state, status(ROOT, { type: "busy" }), 1_000)).not.toBeNull();
+  expect(reduceOcEvent(state, idle(ROOT), 1_000)).not.toBeNull();
   return state;
 }
 
+/** `Session.fork`'s copy of one parent message part — a `message.part.updated` under the NEW session's
+ *  id. A fork replays the parent's whole history this way and never emits a `session.status`. */
+const partCopy = (sessionID: string) => ({
+  id: "evt_0163aa0d0002gFT58uSRiSm2cH",
+  type: "message.part.updated",
+  properties: { sessionID, part: { id: "prt_0163aa0d0001", sessionID, type: "text", text: "hello" } },
+});
+
 describe("reduceOcEvent lifecycle", () => {
-  test("session.created for a root session opens with start/working", () => {
+  // A session can be created with NO prompt behind it (`--fork`, ACP `session/new`, a bare
+  // `POST /session`): no status event ever follows and `session.idle` is never emitted, so a working
+  // frame sent here had nothing to retract it until the OpenCode process exited.
+  test("session.created alone sends nothing — it only seeds the entry", () => {
     const state = newOcState();
-    const frame = reduceOcEvent(state, created(ROOT, "Explore codebase structure"), 1_000);
-    expect(frame).toEqual({
+    expect(reduceOcEvent(state, created(ROOT, "Explore codebase structure"), 1_000)).toBeNull();
+    expect(state.sessions.has(ROOT)).toBe(true);
+  });
+
+  test("the first busy opens the row with start/working, seeded from session.created", () => {
+    const state = newOcState();
+    reduceOcEvent(state, created(ROOT, "Explore codebase structure", { agent: "plan" }), 1_000);
+    expect(reduceOcEvent(state, status(ROOT, { type: "busy" }), 60_000)).toEqual({
       sessionId: ROOT,
       op: "start",
       prio: 0,
       status: "working",
+      detail: "planning",
       title: "Explore codebase structure",
       // From `info.time.created`, NOT the reducer's clock — the session's real start.
       startedAt: 1787079179968,
+      // …while the turn is anchored on the busy itself, in epoch SECONDS.
+      turnStartedAt: 60,
+    });
+    // Exactly one first frame: the repeats are deduped, and whatever follows is an ordinary update.
+    expect(reduceOcEvent(state, status(ROOT, { type: "busy" }), 60_100)).toBeNull();
+    ocForgetStatusFrame(state, ROOT);
+    expect(reduceOcEvent(state, status(ROOT, { type: "busy" }), 60_200))
+      .toMatchObject({ op: "update", turnStartedAt: 60 });
+  });
+
+  test("a first frame that is a retry is still the start", () => {
+    const state = newOcState();
+    reduceOcEvent(state, created(ROOT, "Explore codebase structure"), 1_000);
+    expect(reduceOcEvent(state, status(ROOT, { type: "retry", attempt: 1, message: "429" }), 2_000))
+      .toMatchObject({ op: "start", status: "working", detail: "retrying", turnStartedAt: 2 });
+  });
+
+  test("created → busy → idle is start then done, as before", () => {
+    const state = newOcState();
+    reduceOcEvent(state, created(ROOT, "Explore codebase structure"), 1_000);
+    expect(reduceOcEvent(state, status(ROOT, { type: "busy" }), 2_000)).toMatchObject({ op: "start" });
+    expect(reduceOcEvent(state, idle(ROOT), 9_000))
+      .toMatchObject({ op: "done", status: "done", turnStartedAt: 2 });
+  });
+
+  describe("a session that is never prompted", () => {
+    // An abort on a never-prompted session: OpenCode emits the idle pair with no busy before it.
+    test("idle with no busy posts no orphan done", () => {
+      const state = newOcState();
+      reduceOcEvent(state, created(ROOT, "Explore codebase structure"), 1_000);
+      expect(reduceOcEvent(state, status(ROOT, { type: "idle" }), 2_000)).toBeNull();
+      expect(reduceOcEvent(state, idle(ROOT), 2_000)).toBeNull();
+      // …and the entry is intact: a prompt that finally arrives still opens the row.
+      expect(reduceOcEvent(state, status(ROOT, { type: "busy" }), 3_000)).toMatchObject({ op: "start" });
+    });
+
+    test("a fork — created, then the parent's history copied in, no status — sends no frame at all", () => {
+      const state = newOcState();
+      const frames = [
+        created(ROOT, "Explore codebase structure (fork #1)"),
+        assistantMessage(ROOT, "anthropic", "claude-opus-4-6"),
+        partCopy(ROOT),
+        assistantMessage(ROOT, "anthropic", "claude-opus-4-6"),
+        partCopy(ROOT),
+      ].map((event) => reduceOcEvent(state, event, 1_000));
+      expect(frames).toEqual([null, null, null, null, null]);
+      // The copies still taught us the model, so the first real frame is complete.
+      expect(reduceOcEvent(state, status(ROOT, { type: "busy" }), 5_000)).toMatchObject({
+        op: "start", title: "Explore codebase structure (fork #1)", model: "claude-opus-4-6",
+      });
+    });
+
+    test("todos are kept for the first frame but send nothing themselves", () => {
+      const state = newOcState();
+      reduceOcEvent(state, created(ROOT, "Explore codebase structure"), 1_000);
+      expect(reduceOcEvent(state, todos(ROOT, THREE), 2_000)).toBeNull();
+      expect(reduceOcEvent(state, status(ROOT, { type: "busy" }), 3_000)?.plan).toContain("Create a.txt");
+    });
+
+    test("session.deleted forgets it without posting an end", () => {
+      const state = newOcState();
+      reduceOcEvent(state, created(ROOT, "Explore codebase structure"), 1_000);
+      expect(reduceOcEvent(state, { type: "session.deleted", properties: { sessionID: ROOT } }, 4_000))
+        .toBeNull();
+      expect(state.sessions.size).toBe(0);
+    });
+
+    test("dispose drains it without posting an end", () => {
+      const state = startedRoot();
+      reduceOcEvent(state, created("ses_second0000000000000000000", "Second"), 1_000);
+      expect(ocEndFrames(state, 6_000).map((f) => f.sessionId)).toEqual([ROOT]);
+      expect(state.sessions.size).toBe(0);
+    });
+
+    test("an attention frame announces it, so the idle that follows can still close the row", () => {
+      const state = newOcState();
+      reduceOcEvent(state, created(ROOT, "Explore codebase structure"), 1_000);
+      expect(ocAttentionFrame(state, ROOT, undefined, 2_000)).toMatchObject({ status: "needsAttention" });
+      expect(reduceOcEvent(state, idle(ROOT), 3_000)).toMatchObject({ op: "done" });
     });
   });
 
@@ -131,7 +232,8 @@ describe("reduceOcEvent lifecycle", () => {
 
   test("dispose ends every live session exactly once", () => {
     const state = startedRoot();
-    expect(reduceOcEvent(state, created("ses_second0000000000000000000", "Second"), 1_000)).not.toBeNull();
+    reduceOcEvent(state, created("ses_second0000000000000000000", "Second"), 1_000);
+    expect(reduceOcEvent(state, status("ses_second0000000000000000000", { type: "busy" }), 1_000)).not.toBeNull();
     const frames = ocEndFrames(state, 6_000);
     expect(frames.map((f) => f.op)).toEqual(["end", "end"]);
     expect(ocEndFrames(state, 6_000)).toEqual([]);
@@ -155,7 +257,9 @@ describe("title", () => {
     expect(isDefaultOcTitle("Explore codebase structure (fork #2)")).toBe(false);
 
     const state = newOcState();
-    const frame = reduceOcEvent(state, created(ROOT, "New session - 2026-08-19T03:12:11.101Z"), 1_000);
+    reduceOcEvent(state, created(ROOT, "New session - 2026-08-19T03:12:11.101Z"), 1_000);
+    const frame = reduceOcEvent(state, status(ROOT, { type: "busy" }), 1_100);
+    expect(frame).not.toBeNull();
     expect(frame?.title).toBeUndefined();
   });
 
@@ -416,8 +520,8 @@ describe("plan mode rides the detail seam", () => {
 
   test("the TUI's create-time agent stamp lands on the very first frame", () => {
     const state = newOcState();
-    expect(reduceOcEvent(state, created(ROOT, "Explore codebase structure", { agent: "plan" }), 1_000)?.detail)
-      .toBe("planning");
+    reduceOcEvent(state, created(ROOT, "Explore codebase structure", { agent: "plan" }), 1_000);
+    expect(reduceOcEvent(state, status(ROOT, { type: "busy" }), 1_100)?.detail).toBe("planning");
   });
 
   test("going back to build clears the detail", () => {
@@ -450,8 +554,9 @@ describe("plan mode rides the detail seam", () => {
   test("a null or absent agent leaves what we already know alone", () => {
     const state = newOcState();
     // HTTP `POST /session` creates with agent: null.
-    expect(reduceOcEvent(state, created(ROOT, "Explore codebase structure", { agent: null }), 1_000)?.detail)
-      .toBeUndefined();
+    reduceOcEvent(state, created(ROOT, "Explore codebase structure", { agent: null }), 1_000);
+    expect(reduceOcEvent(state, status(ROOT, { type: "busy" }), 1_100)?.detail).toBeUndefined();
+    reduceOcEvent(state, idle(ROOT), 1_200);
     reduceOcEvent(state, sessionUpdated(ROOT, "plan"), 1_500);
     reduceOcEvent(state, sessionUpdated(ROOT, null), 1_600);
     expect(reduceOcEvent(state, status(ROOT, { type: "busy" }), 1_700)?.detail).toBe("planning");
