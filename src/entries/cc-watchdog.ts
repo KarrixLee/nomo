@@ -2232,6 +2232,11 @@ async function correctIdleProvisional(config: Config, path: string, sessionId: s
 // never a real event, so without a frozen blob `at` the row could never age). IDLE-biased, like the
 // codex-side defaults documented in adapter.ts: reaping a session that turns out still-live merely costs
 // one frame — its next real hook re-arms it to working — whereas never reaping sticks forever.
+//
+// v2.3.3: a record the hook marked `awaitingPrompt` (a SessionStart with no hook since) does not wait out
+// those 30 min — it is the one case where "no turn is running" is KNOWN rather than inferred from
+// silence, so the same predicate holds it to CLAUDE_AWAITING_PROMPT_REAP_MS instead. The 30-min clock
+// remains the backstop for everything else (a dropped Stop, a record from a plugin predating the marker).
 
 /** How long a CLAUDE session may sit event-idle (no REAL hook since record.ts — a heartbeat never rewrites
  *  it) while its pid is alive before the watchdog reaps it with a corrective done. 30 min sits FAR above
@@ -2241,6 +2246,15 @@ async function correctIdleProvisional(config: Config, path: string, sessionId: s
  *  window is still heartbeated "working" (a legitimate long tool run / subagent / permission wait), and
  *  only past 30 min does the reap take over. */
 const CLAUDE_IDLE_REAP_MS = 1_800_000; // 30 min
+
+/** The same clock for a CLAUDE session that was OPENED but never PROMPTED (record.awaitingPrompt — a
+ *  SessionStart with no hook after it; see SessionRecord). There the 30-min grace protects nothing: it
+ *  exists to cover a long hook-quiet tool run, and a session that has not taken a prompt has no turn to
+ *  be in the middle of. Live repro 2026-10-06: `claude --resume` left at the empty prompt sat "Running"
+ *  12+ min (lastEvent "sessionStart", origin.source "resume", pid alive). 60 s comfortably clears the gap
+ *  between a SessionStart and the UserPromptSubmit of a prompt passed on the command line, and a wrong
+ *  guess still costs one frame — the first real hook drops the marker and re-arms the row to working. */
+const CLAUDE_AWAITING_PROMPT_REAP_MS = 60_000;
 
 /** Bound on the idle-reap's corrective-done RETRIES — the SAME discipline the interrupt net enforces
  *  (INTERRUPT_DONE_MAX_ATTEMPTS). Once a session is reap-DECIDED (idle past the grace) the only question is
@@ -2259,7 +2273,10 @@ const CLAUDE_IDLE_REAP_MAX_ATTEMPTS = 5;
  *  provisional discovery row, its last REAL event was a plain `working` update or a bare `sessionStart` (a
  *  resumed session that fired SessionStart then nothing — never `needsAttention`, which can legitimately sit
  *  >30 min awaiting a permission answer, nor `done`, already finished), and record.ts is older than
- *  CLAUDE_IDLE_REAP_MS. Pure so the whole matrix is unit-testable.
+ *  CLAUDE_IDLE_REAP_MS — or than CLAUDE_AWAITING_PROMPT_REAP_MS when the hook marked the session
+ *  `awaitingPrompt`. The short clock is chosen HERE, inside the one shared predicate and behind the
+ *  Claude-only gate, so the reap, all three heartbeats and the transcript veto move to it together and
+ *  no other agent can reach it. Pure so the whole matrix is unit-testable.
  *
  *  THE AGENT GATE IS "claude ONLY", never "not codex": this 30-min clock is a HEURISTIC, and every other
  *  agent is excluded because it owns an authoritative end signal instead (codex: discovery /
@@ -2276,18 +2293,21 @@ export function isClaudeIdleReapEligible(
 ): boolean {
   if (recordAgent(record) !== "claude") return false;
   if (record.provisional === true) return false;
-  return idleReapAgeEligible(record, now, transcriptMtimeMs);
+  return idleReapAgeEligible(record, now, transcriptMtimeMs,
+    record.awaitingPrompt === true ? CLAUDE_AWAITING_PROMPT_REAP_MS : CLAUDE_IDLE_REAP_MS);
 }
 
 /** Shared clock/transcript half of idle reaping. Agent ownership stays outside: Claude's process is
- * authoritative directly; Codex must first correlate a real TUI and prove the exact rollout idle. */
+ * authoritative directly; Codex must first correlate a real TUI and prove the exact rollout idle.
+ * `idleMs` is the silence both clocks are held to; only the Claude gate above ever shortens it. */
 function idleReapAgeEligible(
   record: SessionRecord, now: number,
   transcriptMtimeMs: (path: string) => number | undefined = transcriptMtimeMsDefault,
+  idleMs: number = CLAUDE_IDLE_REAP_MS,
 ): boolean {
   if (record.lastEvent !== "working" && record.lastEvent !== "sessionStart") return false;
   if (typeof record.ts !== "number") return false;
-  if (now - record.ts < CLAUDE_IDLE_REAP_MS) return false;
+  if (now - record.ts < idleMs) return false;
   // Transcript-liveness veto: record.ts only advances on real hooks, but CC streams the turn into the
   // session JSONL continuously — a transcript written within the reap window means the turn is alive
   // (long tool run / subagent fan-out), so reaping it "done" would be a lie. Any stat failure falls
@@ -2295,7 +2315,7 @@ function idleReapAgeEligible(
   if (typeof record.transcript === "string" && record.transcript.length > 0) {
     try {
       const m = transcriptMtimeMs(record.transcript);
-      if (typeof m === "number" && Number.isFinite(m) && now - m < CLAUDE_IDLE_REAP_MS) return false;
+      if (typeof m === "number" && Number.isFinite(m) && now - m < idleMs) return false;
     } catch { /* eligible — same as before the guard */ }
   }
   return true;
@@ -2398,7 +2418,7 @@ export async function correctIdleClaude(
     // worker unreachable, instead of spinning a doomed done forever. "pending": reap handled, not delivered.
     if (attempts >= CLAUDE_IDLE_REAP_MAX_ATTEMPTS) {
       try {
-        await writeRecord(path, { ...record, lastEvent: "done", sentDone: true, op: "done", doneAttempts: undefined });
+        await writeRecord(path, { ...record, lastEvent: "done", sentDone: true, op: "done", doneAttempts: undefined, awaitingPrompt: undefined });
         clearDoneAttempts(sessionId); // pinned done ON DISK → the gate closes; the bound has done its job
       } catch {
         // Pin didn't land → keep the in-memory count, or the cap would restart the retry cycle forever
@@ -2419,7 +2439,9 @@ export async function correctIdleClaude(
     if (outcome === "delivered") {
       // 2xx: pin the session done and CLEAR the retry counter so the gate closes, the heartbeat can never
       // re-arm "working", and the next real hook re-arms from a done exactly as the interrupt net's rewrite does.
-      try { await writeRecord(path, { ...record, lastEvent: "done", sentDone: true, op: "done", doneAttempts: undefined }); } catch {
+      // `awaitingPrompt` is spent with the reap it triggered (here and in the capped pin above): a done row
+      // must not keep claiming a prompt is owed. A later SessionStart sets it afresh.
+      try { await writeRecord(path, { ...record, lastEvent: "done", sentDone: true, op: "done", doneAttempts: undefined, awaitingPrompt: undefined }); } catch {
         // Rewrite failed — worst case the net re-POSTs a done next sweep, which the worker drops.
       }
       clearDoneAttempts(sessionId);

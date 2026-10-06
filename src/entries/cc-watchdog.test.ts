@@ -174,6 +174,81 @@ describe("isClaudeIdleReapEligible (a resumed Claude session gone silent past th
   });
 });
 
+// A session OPENED but never prompted (`claude --resume`, left at the empty prompt): the hook's
+// SessionStart said "working" and Claude Code has no idle hook to retract it, so it showed "Running" for
+// the full 30-min grace. The hook's `awaitingPrompt` marker shortens the SAME predicate's clock to 60 s.
+describe("isClaudeIdleReapEligible — awaitingPrompt (opened, never prompted) reaps on the short clock", () => {
+  const SHORT_MS = 60_000; // must mirror CLAUDE_AWAITING_PROMPT_REAP_MS in cc-watchdog.ts
+  const now = 100_000_000;
+  const opened = (over: Partial<SessionRecord> = {}): SessionRecord =>
+    rec({ lastEvent: "sessionStart", op: "start", awaitingPrompt: true, ...over });
+
+  test("marker + 61 s → eligible; 59 s → not", () => {
+    expect(isClaudeIdleReapEligible(opened({ ts: now - 61_000 }), now)).toBe(true);
+    expect(isClaudeIdleReapEligible(opened({ ts: now - 59_000 }), now)).toBe(false);
+  });
+
+  test("NO marker at 61 s → not eligible (the 30-min rule is unchanged)", () => {
+    expect(isClaudeIdleReapEligible(rec({ lastEvent: "sessionStart", op: "start", ts: now - 61_000 }), now)).toBe(false);
+    expect(isClaudeIdleReapEligible(rec({ lastEvent: "working", op: "update", ts: now - 61_000 }), now)).toBe(false);
+  });
+
+  test("marker with lastEvent working (a resume over a done record) → eligible at 61 s", () => {
+    expect(isClaudeIdleReapEligible(opened({ lastEvent: "working", op: "update", ts: now - 61_000 }), now)).toBe(true);
+  });
+
+  test("the marker never overrides the state gate or the agent gate", () => {
+    expect(isClaudeIdleReapEligible(opened({ lastEvent: "needsAttention", ts: now - 61_000 }), now)).toBe(false);
+    expect(isClaudeIdleReapEligible(opened({ lastEvent: "done", op: "done", ts: now - 61_000 }), now)).toBe(false);
+    expect(isClaudeIdleReapEligible(opened({ agent: "codex", ts: now - 61_000 }), now)).toBe(false);
+    expect(isClaudeIdleReapEligible(opened({ agent: "opencode", ts: now - 61_000 }), now)).toBe(false);
+    expect(isClaudeIdleReapEligible(opened({ provisional: true, ts: now - 61_000 }), now)).toBe(false);
+  });
+
+  test("the transcript veto is measured against the SAME short clock", () => {
+    const r = opened({ ts: now - 61_000, transcript: "/tmp/t.jsonl" });
+    expect(isClaudeIdleReapEligible(r, now, () => now - 59_000)).toBe(false); // written inside the window → alive
+    expect(isClaudeIdleReapEligible(r, now, () => now - 61_000)).toBe(true);
+  });
+
+  test("the heartbeats AGREE — a marker row past the short clock is never beaten back to working", () => {
+    const quiet = opened({ blob: "B", ts: now - 600_000 }); // 10 min: squarely inside the ordinary heartbeat window
+    expect(shouldHeartbeat(quiet, now, undefined, false)).toBe(false);
+    expect(heartbeatKind(opened({ blob: "B", ts: now - 61_000 }), now, undefined, undefined, false, true)).toBe("none");
+    // …while the same row WITHOUT the marker is heartbeated exactly as before.
+    expect(shouldHeartbeat({ ...quiet, awaitingPrompt: undefined }, now, undefined, false)).toBe(true);
+  });
+
+  test("correctIdleClaude reaps it at 61 s: done `at` frozen at record.ts, and the pin CLEARS the marker", async () => {
+    const posts: object[] = [];
+    const writes: SessionRecord[] = [];
+    const v = await correctIdleClaude(cfg(), "/tmp/s.json", "s", opened({ blob: "B", ts: now - 61_000 }), now, {
+      post: async (b) => { posts.push(b); return "delivered" as PostOutcome; },
+      writeRecord: async (_p, r) => { writes.push(r); },
+    });
+    expect(v).toBe("corrected");
+    expect(posts).toHaveLength(1);
+    expect(posts[0]).toMatchObject({ op: "done" });
+    expect(writes[0]).toMatchObject({ lastEvent: "done", op: "done", sentDone: true });
+    expect(writes[0].awaitingPrompt).toBeUndefined();
+    expect(isClaudeIdleReapEligible(writes[0], now + SHORT_MS)).toBe(false);
+  });
+
+  test("a codex record carrying the marker is untouched at 61 s (its reap still needs the 30-min clock + TUI proof)", async () => {
+    const posts: object[] = [];
+    const v = await correctIdleClaude(cfg(), "/tmp/s.json", "s",
+      opened({ agent: "codex", transcript: "/tmp/rollout.jsonl", ts: now - 61_000 }), now, {
+        post: async (b) => { posts.push(b); return "delivered" as PostOutcome; },
+        writeRecord: async () => {},
+        locateTuiPid: async () => 64799,
+        pidAlive: () => true,
+        codexTurnActive: async () => false,
+      });
+    expect(v).toBe("uncorrected");
+    expect(posts).toHaveLength(0);
+  });
+});
+
 // The idle-CLAUDE reap must make DURABLE progress even when its corrective done can't reach the worker —
 // the live failure mode (2026-07-20): seven resumed-but-never-prompted Claude sessions (lastEvent
 // "sessionStart", pid alive, transcript's last real turn DAYS old) sat unreaped because every corrective

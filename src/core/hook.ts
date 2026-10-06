@@ -372,7 +372,7 @@ export async function trackSessionAt(
   turnStartedAt?: number, turnId?: string, title?: string, pairingId?: string, model?: string,
   pendingPlanPicker: boolean = false, pid: number = process.ppid, origin?: SessionOrigin,
   planPickerVerificationPending: boolean = false, dbg?: string, attentionKind?: "userInput",
-  planFull?: string,
+  planFull?: string, awaitingPrompt: boolean = false,
 ): Promise<void> {
   try {
     const path = `${sessionsDir}/${sessionId}.json`;
@@ -467,6 +467,10 @@ export async function trackSessionAt(
       // whenever the whole thing already rode. Written through like every field here (the record is
       // rebuilt whole, never patched), so the next event of this session drops it automatically.
       ...(typeof planFull === "string" && planFull.length > 0 ? { planFull } : {}),
+      // APPENDED LAST. "Opened, no prompt yet" — the caller passes true only for a SessionStart (see
+      // runHook), so every other hook's whole-record rewrite drops the key and the watchdog's short
+      // awaiting-prompt reap can never fire on a session that has taken a turn.
+      ...(awaitingPrompt ? { awaitingPrompt: true } : {}),
     };
     // Owner-only (0600): the record carries hostname, cwd basename, the session pid, and the ABSOLUTE
     // transcript path — never group/world readable, matching config.json / the pending stash.
@@ -484,13 +488,13 @@ export async function trackSession(
   turnStartedAt?: number, turnId?: string, title?: string, pairingId?: string, model?: string,
   pendingPlanPicker: boolean = false, pid: number = process.ppid, origin?: SessionOrigin,
   planPickerVerificationPending: boolean = false, dbg?: string, attentionKind?: "userInput",
-  planFull?: string,
+  planFull?: string, awaitingPrompt: boolean = false,
 ): Promise<void> {
   return trackSessionAt(
     SESSIONS_DIR,
     sessionId, op, prio, status, blob, machine, folder, transcript, agent, sessionStartedAt,
     turnStartedAt, turnId, title, pairingId, model, pendingPlanPicker, pid, origin,
-    planPickerVerificationPending, dbg, attentionKind, planFull,
+    planPickerVerificationPending, dbg, attentionKind, planFull, awaitingPrompt,
   );
 }
 
@@ -939,6 +943,14 @@ export async function runHook(agent: AgentKind): Promise<void> {
     const isTurnOpener = hookName === "UserPromptSubmit"
       || (hookName === "SessionStart" && sessionStartSource !== "compact");
     const turnStartedAt = isTurnOpener ? Math.floor(Date.now() / 1000) : cachedTurn;
+    // "Opened, no prompt yet" (see SessionRecord.awaitingPrompt): a SessionStart leaves the session at
+    // the empty prompt reading "working" with no hook left to retract it, so it is marked for the
+    // watchdog's short reap. Any other hook is proof of a turn and clears it. The same compact exception
+    // as the anchor above, for the same reason — compaction fires MID-turn, so it neither sets the
+    // marker (that would reap a live turn in 60 s) nor clears it: the previous value rides through.
+    // NOT keyed on the record's lastEvent, which reads "working" for a resume over a done record.
+    const awaitingPrompt = hookName === "SessionStart"
+      && (sessionStartSource !== "compact" || existingRecord?.awaitingPrompt === true);
     // The Codex turn id (Claude payloads carry none → undefined). Cached on the record so the notify
     // backstop's stale-turn guard can compare it against a delayed notify's payload turn-id.
     const turnId = typeof input.turn_id === "string" && input.turn_id.length > 0 ? input.turn_id : undefined;
@@ -1025,7 +1037,7 @@ export async function runHook(agent: AgentKind): Promise<void> {
       // "plain approval", and the same prompt rendered two different cards depending on the transport.
       envelope.attentionKind as "userInput" | undefined,
       // The unabridged plan for the LAN `read` op — undefined unless the blob's copy was truncated.
-      planFull);
+      planFull, awaitingPrompt);
     const clearedPickerMarker = pendingPlanPicker === false && planPickerVerificationPending === false
       && (existingRecord?.pendingPlanPicker === true || existingRecord?.planPickerVerificationPending === true || existingRecord?.planPickerSettled === true);
     if (agent === "codex" && (hookName === "Stop" || pendingPlanPicker || planPickerVerificationPending || clearedPickerMarker)) {

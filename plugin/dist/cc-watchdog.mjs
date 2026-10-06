@@ -104,7 +104,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "2.3.2";
+var PLUGIN_VERSION = "2.3.3";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -5380,7 +5380,7 @@ async function stashPendingEvent(input, machine, title, now, stashPath = PENDING
     await atomicWrite(stashPath, JSON.stringify(stash), 384);
   } catch {}
 }
-async function trackSessionAt(sessionsDir, sessionId, op, prio, status, blob, machine, folder, transcript, agent = "claude", sessionStartedAt, turnStartedAt, turnId, title, pairingId, model, pendingPlanPicker = false, pid = process.ppid, origin, planPickerVerificationPending = false, dbg, attentionKind, planFull) {
+async function trackSessionAt(sessionsDir, sessionId, op, prio, status, blob, machine, folder, transcript, agent = "claude", sessionStartedAt, turnStartedAt, turnId, title, pairingId, model, pendingPlanPicker = false, pid = process.ppid, origin, planPickerVerificationPending = false, dbg, attentionKind, planFull, awaitingPrompt = false) {
   try {
     const path = `${sessionsDir}/${sessionId}.json`;
     if (op === "end") {
@@ -5418,13 +5418,14 @@ async function trackSessionAt(sessionsDir, sessionId, op, prio, status, blob, ma
       ...typeof dbg === "string" && dbg.length > 0 ? { dbg } : {},
       ...origin ? { origin } : {},
       ...attentionKind ? { attentionKind } : {},
-      ...typeof planFull === "string" && planFull.length > 0 ? { planFull } : {}
+      ...typeof planFull === "string" && planFull.length > 0 ? { planFull } : {},
+      ...awaitingPrompt ? { awaitingPrompt: true } : {}
     };
     await atomicWrite(path, JSON.stringify(record), 384);
   } catch {}
 }
-async function trackSession(sessionId, op, prio, status, blob, machine, folder, transcript, agent = "claude", sessionStartedAt, turnStartedAt, turnId, title, pairingId, model, pendingPlanPicker = false, pid = process.ppid, origin, planPickerVerificationPending = false, dbg, attentionKind, planFull) {
-  return trackSessionAt(SESSIONS_DIR, sessionId, op, prio, status, blob, machine, folder, transcript, agent, sessionStartedAt, turnStartedAt, turnId, title, pairingId, model, pendingPlanPicker, pid, origin, planPickerVerificationPending, dbg, attentionKind, planFull);
+async function trackSession(sessionId, op, prio, status, blob, machine, folder, transcript, agent = "claude", sessionStartedAt, turnStartedAt, turnId, title, pairingId, model, pendingPlanPicker = false, pid = process.ppid, origin, planPickerVerificationPending = false, dbg, attentionKind, planFull, awaitingPrompt = false) {
+  return trackSessionAt(SESSIONS_DIR, sessionId, op, prio, status, blob, machine, folder, transcript, agent, sessionStartedAt, turnStartedAt, turnId, title, pairingId, model, pendingPlanPicker, pid, origin, planPickerVerificationPending, dbg, attentionKind, planFull, awaitingPrompt);
 }
 async function markDoneDeliveredAt(sessionsDir, sessionId) {
   try {
@@ -5691,6 +5692,7 @@ async function runHook(agent) {
     const cachedTurn = typeof existingRecord?.turnStartedAt === "number" && Number.isFinite(existingRecord.turnStartedAt) ? existingRecord.turnStartedAt : undefined;
     const isTurnOpener = hookName === "UserPromptSubmit" || hookName === "SessionStart" && sessionStartSource !== "compact";
     const turnStartedAt = isTurnOpener ? Math.floor(Date.now() / 1000) : cachedTurn;
+    const awaitingPrompt = hookName === "SessionStart" && (sessionStartSource !== "compact" || existingRecord?.awaitingPrompt === true);
     const turnId = typeof input.turn_id === "string" && input.turn_id.length > 0 ? input.turn_id : undefined;
     let plan = planOp(hookName, input, sentDone);
     if (!plan)
@@ -5734,7 +5736,7 @@ async function runHook(agent) {
     const origin = existingRecord?.origin ?? sessionOrigin(input, hookPid, hookCommand);
     const recordPid = reusedForkPredecessor ? existingRecord.pid : hookPid;
     const recordTranscript = reusedForkPredecessor ? existingRecord.transcript ?? transcriptPath : transcriptPath;
-    await trackSession(sessionId, plan.op, plan.prio, plan.status, envelope.blob, machine, folder, recordTranscript, agent, startedAt, turnStartedAt, turnId, title, config.pairingId, model, pendingPlanPicker, recordPid, origin, planPickerVerificationPending, dbg, envelope.attentionKind, planFull);
+    await trackSession(sessionId, plan.op, plan.prio, plan.status, envelope.blob, machine, folder, recordTranscript, agent, startedAt, turnStartedAt, turnId, title, config.pairingId, model, pendingPlanPicker, recordPid, origin, planPickerVerificationPending, dbg, envelope.attentionKind, planFull, awaitingPrompt);
     const clearedPickerMarker = pendingPlanPicker === false && planPickerVerificationPending === false && (existingRecord?.pendingPlanPicker === true || existingRecord?.planPickerVerificationPending === true || existingRecord?.planPickerSettled === true);
     if (agent === "codex" && (hookName === "Stop" || pendingPlanPicker || planPickerVerificationPending || clearedPickerMarker)) {
       tracePlanPickerDecision(sessionId, {
@@ -8736,6 +8738,7 @@ async function correctIdleProvisional(config, path, sessionId, record) {
   }
 }
 var CLAUDE_IDLE_REAP_MS = 1800000;
+var CLAUDE_AWAITING_PROMPT_REAP_MS = 60000;
 var CLAUDE_IDLE_REAP_MAX_ATTEMPTS = 5;
 function transcriptMtimeMsDefault(path) {
   try {
@@ -8749,19 +8752,19 @@ function isClaudeIdleReapEligible(record, now, transcriptMtimeMs = transcriptMti
     return false;
   if (record.provisional === true)
     return false;
-  return idleReapAgeEligible(record, now, transcriptMtimeMs);
+  return idleReapAgeEligible(record, now, transcriptMtimeMs, record.awaitingPrompt === true ? CLAUDE_AWAITING_PROMPT_REAP_MS : CLAUDE_IDLE_REAP_MS);
 }
-function idleReapAgeEligible(record, now, transcriptMtimeMs = transcriptMtimeMsDefault) {
+function idleReapAgeEligible(record, now, transcriptMtimeMs = transcriptMtimeMsDefault, idleMs = CLAUDE_IDLE_REAP_MS) {
   if (record.lastEvent !== "working" && record.lastEvent !== "sessionStart")
     return false;
   if (typeof record.ts !== "number")
     return false;
-  if (now - record.ts < CLAUDE_IDLE_REAP_MS)
+  if (now - record.ts < idleMs)
     return false;
   if (typeof record.transcript === "string" && record.transcript.length > 0) {
     try {
       const m = transcriptMtimeMs(record.transcript);
-      if (typeof m === "number" && Number.isFinite(m) && now - m < CLAUDE_IDLE_REAP_MS)
+      if (typeof m === "number" && Number.isFinite(m) && now - m < idleMs)
         return false;
     } catch {}
   }
@@ -8808,7 +8811,7 @@ async function correctIdleClaude(config, path, sessionId, record, now, deps = {}
     const attempts = effectiveDoneAttempts(record, sessionId);
     if (attempts >= CLAUDE_IDLE_REAP_MAX_ATTEMPTS) {
       try {
-        await writeRecord(path, { ...record, lastEvent: "done", sentDone: true, op: "done", doneAttempts: undefined });
+        await writeRecord(path, { ...record, lastEvent: "done", sentDone: true, op: "done", doneAttempts: undefined, awaitingPrompt: undefined });
         clearDoneAttempts(sessionId);
       } catch {}
       return "pending";
@@ -8819,7 +8822,7 @@ async function correctIdleClaude(config, path, sessionId, record, now, deps = {}
       return "revoked";
     if (outcome === "delivered") {
       try {
-        await writeRecord(path, { ...record, lastEvent: "done", sentDone: true, op: "done", doneAttempts: undefined });
+        await writeRecord(path, { ...record, lastEvent: "done", sentDone: true, op: "done", doneAttempts: undefined, awaitingPrompt: undefined });
       } catch {}
       clearDoneAttempts(sessionId);
       return "corrected";

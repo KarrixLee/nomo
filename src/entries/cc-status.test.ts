@@ -2722,6 +2722,83 @@ describe("runHook label pinning (a mid-session cd must not rename the session)",
   }, 20000);
 });
 
+// --- runHook awaitingPrompt (the "session opened, no prompt yet" marker) -----------------------
+//
+// Claude Code has no idle hook: a SessionStart maps to "working" and only a Stop (which needs a turn) or
+// a SessionEnd retracts it, so a session resumed and left at the empty prompt showed "Running" until the
+// watchdog's 30-min idle reap. The hook stamps `awaitingPrompt` on a non-compact SessionStart and every
+// other hook's whole-record rewrite drops it; a source:"compact" SessionStart fires MID-turn and must
+// carry the previous value through untouched. Same faithful spawn-the-real-entry harness as above.
+describe("runHook awaitingPrompt (set by SessionStart, cleared by any other hook, preserved by compact)", () => {
+  const rawKey = new Uint8Array(32).fill(9);
+  const entry = join(import.meta.dir, "cc-status.ts");
+  const sid = "awaiting-prompt";
+
+  /** Runs each hook payload in order in ONE home and returns the record as it stood after each. */
+  async function runHooks(hooks: Record<string, unknown>[], seed?: Record<string, unknown>): Promise<SessionRecord[]> {
+    const home = await mkdtemp(join(tmpdir(), "cc-hook-awaiting-"));
+    try {
+      const ccDir = join(home, ".config", "cc-status");
+      await mkdir(join(ccDir, "sessions"), { recursive: true });
+      await writeFile(join(ccDir, "config.json"), JSON.stringify({
+        url: "http://127.0.0.1:9", pairingId: "p", pcSecret: "s", e2eKeyB64: b64url(rawKey),
+      }));
+      const recordPath = join(ccDir, "sessions", `${sid}.json`);
+      if (seed) await writeFile(recordPath, JSON.stringify({ pid: process.ppid, machine: "m", label: "l", ts: Date.now(), ...seed }));
+      const out: SessionRecord[] = [];
+      for (const hook of hooks) {
+        const proc = spawnTestProcess({
+          cmd: ["bun", entry],
+          env: isolatedTestEnv(home),
+          stdin: Buffer.from(JSON.stringify({ session_id: sid, cwd: "/x/api-status", transcript_path: "", ...hook })),
+          stdout: "ignore",
+          stderr: "ignore",
+        });
+        await proc.exited;
+        out.push(JSON.parse(await readFile(recordPath, "utf8")) as SessionRecord);
+      }
+      return out;
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  }
+
+  const resume = { hook_event_name: "SessionStart", source: "resume" };
+  const compact = { hook_event_name: "SessionStart", source: "compact" };
+
+  test("a resume SessionStart sets the marker", async () => {
+    const [rec] = await runHooks([resume]);
+    expect(rec).toMatchObject({ lastEvent: "sessionStart", op: "start", awaitingPrompt: true });
+  }, 20000);
+
+  for (const next of [
+    { hook_event_name: "UserPromptSubmit", prompt: "hi" },
+    { hook_event_name: "PreToolUse", tool_name: "Edit" },
+    { hook_event_name: "Stop" },
+  ]) {
+    test(`${next.hook_event_name} after the SessionStart clears it`, async () => {
+      const [start, after] = await runHooks([resume, next]);
+      expect(start.awaitingPrompt).toBe(true);
+      expect("awaitingPrompt" in after).toBe(false);
+    }, 20000);
+  }
+
+  test("a resume over a DONE record still sets it, though lastEvent reads working (not sessionStart)", async () => {
+    const [rec] = await runHooks([resume], { lastEvent: "done", op: "done", sentDone: true });
+    expect(rec).toMatchObject({ lastEvent: "working", op: "update", awaitingPrompt: true });
+  }, 20000);
+
+  test("a compact SessionStart mid-turn (marker unset) leaves it unset — a live turn is never reaped early", async () => {
+    const [rec] = await runHooks([compact], { lastEvent: "working", op: "update" });
+    expect("awaitingPrompt" in rec).toBe(false);
+  }, 20000);
+
+  test("a compact SessionStart on a still-unprompted session (marker set) keeps it set", async () => {
+    const [rec] = await runHooks([compact], { lastEvent: "sessionStart", op: "start", awaitingPrompt: true });
+    expect(rec.awaitingPrompt).toBe(true);
+  }, 20000);
+});
+
 // --- runHook gone-strike teardown (a revoked pairing must stop POSTing forever) -----------------
 //
 // The hook's POST path counts CONSECUTIVE "gone" responses (404 = pairing deleted, 410 = dormant-GC'd)
