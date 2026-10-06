@@ -2175,10 +2175,13 @@ export interface AgentAdapter {
    *  `CCAgent.supportsAllowMode`. */
   allowMode?: true;
   /** OPTIONAL (NOM-54): does this agent's question channel accept the `answer` verb's extras — free-text
-   *  "Other" (`other[]`) and per-question notes (`notes[]` → `annotations[q].notes`)? Claude Code only.
-   *  Absent = any NON-EMPTY extra releases the hold (answer at the Mac) rather than being silently
-   *  dropped. The phone mirrors this as `CCAgent.supportsAnswerExtras`. */
-  answerExtras?: true;
+   *  "Other" (`other[]`) and per-question notes (`notes[]` → `annotations[q].notes`)? `true` = both
+   *  (Claude Code). `"other"` = free-text Other only, and only on a question the agent flagged as taking
+   *  it (the compact question's `x: true`) — Codex (NOM-63), whose app-server reply has no notes slot the
+   *  phone's notes could honestly map to. Absent = any NON-EMPTY extra releases the hold (answer at the
+   *  Mac) rather than being silently dropped; so does a non-empty note under `"other"`. The phone mirrors
+   *  this as `CCAgent.supportsAnswerExtras`. */
+  answerExtras?: true | "other";
   /** OPTIONAL: discover live sessions the hooks can't see yet — interactive TUIs for which NO
    *  SessionStart has fired. Called on every watchdog sweep with the already-tracked sessions (so their
    *  pids can be excluded). Claude OMITS it (its SessionStart fires at true session open, so there's
@@ -2280,6 +2283,10 @@ export const claudeAdapter: AgentAdapter = {
 
 export const codexAdapter = {
   kind: "codex",
+  // NOM-63: free-text Other via the app-server bridge (codex-remote-input). NO allowMode, and "Always
+  // allow" stays a plain allow (NOM-62): Codex's PermissionRequest hook — the only path its command/patch
+  // approvals reach Nomo on — fails closed on `updatedPermissions`, so there is no session grant to send.
+  answerExtras: "other",
   async title({ sessionId, prefix, input }): Promise<string | undefined> {
     // PRIMARY: the clean AI-generated thread_name codex writes to session_index.jsonl ~30-40s in.
     // Re-read every hook (no memo) so a later hook UPGRADES an earlier prompt-derived fallback the

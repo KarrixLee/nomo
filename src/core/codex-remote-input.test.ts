@@ -162,6 +162,68 @@ describe("codexAnswersFromPhone", () => {
   });
 });
 
+// NOM-63: typed "Other" on an isOther question, matching Codex TUI's own submit_answers shape.
+describe("codexAnswersFromPhone free-text Other", () => {
+  const otherReq = (isOther = true) => request({
+    questions: [{ ...request().questions[0], isOther }],
+  });
+
+  test("typed text with no pick = TUI's None-of-the-above row + user_note", () => {
+    expect(codexAnswersFromPhone(otherReq(), [""], ["  ship it tomorrow  "]))
+      .toEqual({ scope: ["None of the above", "user_note: ship it tomorrow"] });
+  });
+
+  test("pick + typed text = label + user_note", () => {
+    expect(codexAnswersFromPhone(otherReq(), ["Fast"], ["but add a test"]))
+      .toEqual({ scope: ["Fast", "user_note: but add a test"] });
+  });
+
+  test("empty/null other is a plain pick", () => {
+    expect(codexAnswersFromPhone(otherReq(), ["Fast"], [null])).toEqual({ scope: ["Fast"] });
+    expect(codexAnswersFromPhone(otherReq(), ["Fast"], [""])).toEqual({ scope: ["Fast"] });
+  });
+
+  test("typed text on a question without isOther releases", () => {
+    expect(codexAnswersFromPhone(otherReq(false), [""], ["free text"])).toBeUndefined();
+    expect(codexAnswersFromPhone(otherReq(false), ["Fast"], ["free text"])).toBeUndefined();
+  });
+
+  test("any non-empty note releases (Codex answerExtras is other-only)", () => {
+    expect(codexAnswersFromPhone(otherReq(), ["Fast"], undefined, ["a note"])).toBeUndefined();
+    expect(codexAnswersFromPhone(otherReq(), ["Fast"], undefined, [""])).toEqual({ scope: ["Fast"] });
+  });
+
+  test("malformed extras release", () => {
+    expect(codexAnswersFromPhone(otherReq(), ["Fast"], "x")).toBeUndefined();
+    expect(codexAnswersFromPhone(otherReq(), ["Fast"], ["a", "b"])).toBeUndefined();
+    expect(codexAnswersFromPhone(otherReq(), ["Fast"], [7])).toBeUndefined();
+    expect(codexAnswersFromPhone(otherReq(), [""], ["y".repeat(501)])).toBeUndefined();
+  });
+
+  test("blank pick with no typed text still releases", () => {
+    expect(codexAnswersFromPhone(otherReq(), [""], [""])).toBeUndefined();
+  });
+});
+
+describe("renderableCodexUserInput Other/secret", () => {
+  const q = (over: Record<string, unknown> = {}) => ({
+    id: "scope", question: "How much?", isSecret: false, isOther: false,
+    options: [{ label: "Fast", description: "" }],
+    ...over,
+  });
+
+  test("isOther rides to the compact question as x:true; absent otherwise", () => {
+    const withOther = buildPermissionQuestions(renderableCodexUserInput({ questions: [q({ isOther: true })] })!);
+    expect(withOther[0].x).toBe(true);
+    const without = buildPermissionQuestions(renderableCodexUserInput({ questions: [q()] })!);
+    expect(without[0]).not.toHaveProperty("x");
+  });
+
+  test("an isSecret question drops the whole picker (never relayed)", () => {
+    expect(renderableCodexUserInput({ questions: [q(), q({ id: "pw", isSecret: true })] })).toBeUndefined();
+  });
+});
+
 // The gate that keeps a duplicate/empty-id request off the phone in the FIRST place: the relay only
 // builds a card when renderableCodexUserInput accepts the shape, so refusing here means the user is
 // never shown a question whose answer could not be attributed back.
@@ -493,6 +555,35 @@ describe("startCodexRemoteInput", () => {
     expect(wireQuestions).toHaveLength(3);
     expect(wireQuestions.every((question) => !("d" in question))).toBe(true);
     expect(wireQuestions[0].o).toEqual(Array.from({ length: 8 }, (_, index) => `Choice ${index}`));
+  });
+
+  test("NOM-63: delivers a phone's typed Other to app-server in the TUI's shape", async () => {
+    const answerBlob = await encryptBlob(key, {
+      requestId: "relay-other", decision: "answer", answers: [""], other: ["do it my way"],
+    });
+    const appAnswers: unknown[] = [];
+    let posted: Record<string, unknown> | undefined;
+    const req = request({ questions: [{ ...request().questions[0], isOther: true }] });
+    const handle = startCodexRemoteInput(req, {
+      config,
+      fetchFn: (async (input, init) => {
+        if (String(input).endsWith("/v1/cc/decision")) {
+          posted = JSON.parse(String(init?.body));
+          return Response.json({ hold: true });
+        }
+        return Response.json({ status: "answered", answerBlob });
+      }) as typeof fetch,
+      readRecordFn: async () => record,
+      randomUUID: () => "relay-other",
+      localApprovalsStateFn: async () => "on",
+      sleep: async () => {},
+      answerAppServer: async (answers) => { appAnswers.push(answers); return "sent"; },
+      interruptAppServer: async () => "sent",
+    });
+    expect(await handle.completion).toBe("answered");
+    expect(appAnswers).toEqual([{ scope: ["None of the above", "user_note: do it my way"] }]);
+    const prompt = await decryptBlob(key, posted!.blob as string) as Record<string, unknown>;
+    expect((prompt.permissionQuestions as Array<Record<string, unknown>>)[0].x).toBe(true);
   });
 
   test("maps a phone deny to Codex turn interruption instead of forging an answer", async () => {

@@ -79,7 +79,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "2.3.1";
+var PLUGIN_VERSION = "2.3.2";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -2075,6 +2075,7 @@ var claudeAdapter = {
 };
 var codexAdapter = {
   kind: "codex",
+  answerExtras: "other",
   async title({ sessionId, prefix, input }) {
     const indexTitle = await codexIndexTitle(sessionId);
     if (indexTitle)
@@ -3148,7 +3149,7 @@ function answerLine(agent, toolName, toolInput, answers, other, notes) {
   const noteTexts = extrasArray(notes, questions.length);
   if (otherTexts === undefined || noteTexts === undefined)
     return;
-  if (!adapterFor(agent).answerExtras && [...otherTexts, ...noteTexts].some((t) => t.length > 0))
+  if (!answerExtrasAccepted(adapterFor(agent).answerExtras, otherTexts, noteTexts))
     return;
   const map = {};
   const annotations = {};
@@ -3185,6 +3186,13 @@ function answerLine(agent, toolName, toolInput, answers, other, notes) {
       updatedInput: Object.keys(annotations).length > 0 ? { ...toolInput, answers: map, annotations: { ...toolInput.annotations, ...annotations } } : { ...toolInput, answers: map }
     }
   });
+}
+function answerExtrasAccepted(cap, other, notes) {
+  if (cap === true)
+    return true;
+  if (notes.some((t) => t.length > 0))
+    return false;
+  return cap === "other" || other.every((t) => t.length === 0);
 }
 function extrasArray(value, length) {
   if (value === undefined || value === null)
@@ -3439,7 +3447,8 @@ function buildPermissionQuestions(toolInput) {
       ...raw?.multiSelect === true ? { m: true } : {},
       o: labels.map((l) => capPermissionWireText(l, PERMISSION_QUESTION_LABEL_MAX)),
       ...wireDescriptions.some((description) => description.length > 0) ? { d: wireDescriptions } : {},
-      ...raw?.multiSelect !== true && previews.some((pv) => pv.length > 0) ? { p: previews.map((pv) => pv.length > 0 ? capPermissionWireText(pv, QUESTION_PREVIEW_MAX) : null) } : {}
+      ...raw?.multiSelect !== true && previews.some((pv) => pv.length > 0) ? { p: previews.map((pv) => pv.length > 0 ? capPermissionWireText(pv, QUESTION_PREVIEW_MAX) : null) } : {},
+      ...raw?.isOther === true ? { x: true } : {}
     };
   });
 }

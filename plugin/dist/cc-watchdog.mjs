@@ -104,7 +104,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "2.3.1";
+var PLUGIN_VERSION = "2.3.2";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -2656,6 +2656,7 @@ var claudeAdapter = {
 };
 var codexAdapter = {
   kind: "codex",
+  answerExtras: "other",
   async title({ sessionId, prefix, input }) {
     const indexTitle = await codexIndexTitle(sessionId);
     if (indexTitle)
@@ -5966,7 +5967,7 @@ function answerLine(agent, toolName, toolInput, answers, other, notes) {
   const noteTexts = extrasArray(notes, questions.length);
   if (otherTexts === undefined || noteTexts === undefined)
     return;
-  if (!adapterFor(agent).answerExtras && [...otherTexts, ...noteTexts].some((t) => t.length > 0))
+  if (!answerExtrasAccepted(adapterFor(agent).answerExtras, otherTexts, noteTexts))
     return;
   const map = {};
   const annotations = {};
@@ -6003,6 +6004,13 @@ function answerLine(agent, toolName, toolInput, answers, other, notes) {
       updatedInput: Object.keys(annotations).length > 0 ? { ...toolInput, answers: map, annotations: { ...toolInput.annotations, ...annotations } } : { ...toolInput, answers: map }
     }
   });
+}
+function answerExtrasAccepted(cap, other, notes) {
+  if (cap === true)
+    return true;
+  if (notes.some((t) => t.length > 0))
+    return false;
+  return cap === "other" || other.every((t) => t.length === 0);
 }
 function extrasArray(value, length) {
   if (value === undefined || value === null)
@@ -6257,7 +6265,8 @@ function buildPermissionQuestions(toolInput) {
       ...raw?.multiSelect === true ? { m: true } : {},
       o: labels.map((l) => capPermissionWireText(l, PERMISSION_QUESTION_LABEL_MAX)),
       ...wireDescriptions.some((description) => description.length > 0) ? { d: wireDescriptions } : {},
-      ...raw?.multiSelect !== true && previews.some((pv) => pv.length > 0) ? { p: previews.map((pv) => pv.length > 0 ? capPermissionWireText(pv, QUESTION_PREVIEW_MAX) : null) } : {}
+      ...raw?.multiSelect !== true && previews.some((pv) => pv.length > 0) ? { p: previews.map((pv) => pv.length > 0 ? capPermissionWireText(pv, QUESTION_PREVIEW_MAX) : null) } : {},
+      ...raw?.isOther === true ? { x: true } : {}
     };
   });
 }
@@ -6951,7 +6960,8 @@ function renderableCodexUserInput(toolInput) {
       question: raw.question,
       ...typeof raw.header === "string" ? { header: raw.header } : {},
       multiSelect: false,
-      options
+      options,
+      ...raw.isOther === true ? { isOther: true } : {}
     });
   }
   if (new Set(ids).size !== ids.length)
@@ -6962,6 +6972,8 @@ function renderableCodexUserInput(toolInput) {
 // src/core/codex-remote-input.ts
 var POST_TIMEOUT_MS = 15000;
 var ANSWER_MAX3 = 500;
+var CODEX_OTHER_LABEL = "None of the above";
+var CODEX_NOTE_PREFIX = "user_note: ";
 function defaultWriteHold2() {
   return lanRunningUnderTest() ? async () => {} : writeDecisionHold;
 }
@@ -6974,8 +6986,12 @@ function defaultClearHold2() {
 function defaultSettleHoldRecord2() {
   return lanRunningUnderTest() ? async () => {} : settleDecisionHoldRecord;
 }
-function codexAnswersFromPhone(request, positional) {
+function codexAnswersFromPhone(request, positional, other, notes) {
   if (!Array.isArray(positional) || positional.length !== request.questions.length)
+    return;
+  const otherTexts = extrasArray(other, request.questions.length);
+  const noteTexts = extrasArray(notes, request.questions.length);
+  if (!otherTexts || !noteTexts || !answerExtrasAccepted(codexAdapter.answerExtras, otherTexts, noteTexts))
     return;
   const mapped = {};
   for (let index = 0;index < request.questions.length; index += 1) {
@@ -6986,13 +7002,23 @@ function codexAnswersFromPhone(request, positional) {
     if (typeof raw !== "string")
       return;
     const answer = raw.trim();
-    if (answer.length === 0 || answer.length > ANSWER_MAX3 || !question.options?.length)
+    const typed = otherTexts[index];
+    if (typed.length > 0 && !question.isOther)
+      return;
+    if (!question.options?.length)
+      return;
+    const note2 = typed.length > 0 ? [`${CODEX_NOTE_PREFIX}${typed}`] : [];
+    if (answer.length === 0 && note2.length > 0) {
+      mapped[question.id] = [CODEX_OTHER_LABEL, ...note2];
+      continue;
+    }
+    if (answer.length === 0 || answer.length > ANSWER_MAX3)
       return;
     const hits = question.options.map((option) => option.label).filter((label) => label === answer || capPermissionWireText(label, PERMISSION_QUESTION_LABEL_MAX) === answer);
     const unique = Array.from(new Set(hits));
     if (unique.length !== 1)
       return;
-    mapped[question.id] = [unique[0]];
+    mapped[question.id] = [unique[0], ...note2];
   }
   if (Object.keys(mapped).length !== request.questions.length)
     return;
@@ -7234,7 +7260,7 @@ async function runRemoteInput(request, requestId, signal, deps, onHoldCreated) {
       }
       if (answer.decision !== "answer")
         return reject("unknown decision", "unsupported");
-      const mapped = codexAnswersFromPhone(request, answer.answers);
+      const mapped = codexAnswersFromPhone(request, answer.answers, answer.other, answer.notes);
       if (!mapped)
         return reject("unmappable to the app-server questions", "unsupported");
       const result = await deps.answerAppServer(mapped);

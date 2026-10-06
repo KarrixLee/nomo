@@ -103,7 +103,7 @@ async function sha256Hex(s) {
 }
 
 // src/core/shared.ts
-var PLUGIN_VERSION = "2.3.1";
+var PLUGIN_VERSION = "2.3.2";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -2655,6 +2655,7 @@ var claudeAdapter = {
 };
 var codexAdapter = {
   kind: "codex",
+  answerExtras: "other",
   async title({ sessionId, prefix, input }) {
     const indexTitle = await codexIndexTitle(sessionId);
     if (indexTitle)

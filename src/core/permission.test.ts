@@ -6,7 +6,7 @@ import {
   buildPermissionSummary, buildPermissionDetail, buildPermissionQuestions, fitPermissionDetail,
   sealedBlobChars, BLOB_FIT_CHARS, runPermissionHook, approvalsCommand, NO_HOLD_PATH, TRACE_PATH,
   codexRolloutSessionId, codexTurnPolicyFromRollout, loadCodexTurnPolicy,
-  POST_FIRST_CONTACT_TIMEOUT_MS, OPENCODE_QUESTION_TOOL, localAnswerProbe,
+  POST_FIRST_CONTACT_TIMEOUT_MS, OPENCODE_QUESTION_TOOL, localAnswerProbe, answerExtrasAccepted,
 } from "./permission";
 import {
   createPollBudget, MAX_CONSECUTIVE_MISSES, POLL_FIRST_CONTACT_TIMEOUT_MS,
@@ -3534,5 +3534,27 @@ describe("NOM-59 option previews", () => {
       const emitted = await run({ decision: "answer", answers, other: ["something else"] }, question(PQ));
       expect("annotations" in updatedInput(emitted[0])).toBe(false);
     }
+  });
+});
+
+describe("NOM-63 answerExtrasAccepted + x wire key", () => {
+  test("true takes both, other takes Other only, absent takes neither", () => {
+    expect(answerExtrasAccepted(true, ["o"], ["n"])).toBe(true);
+    expect(answerExtrasAccepted("other", ["o"], [""])).toBe(true);
+    expect(answerExtrasAccepted("other", [""], ["n"])).toBe(false);
+    expect(answerExtrasAccepted(undefined, ["o"], [""])).toBe(false);
+    expect(answerExtrasAccepted(undefined, [""], [""])).toBe(true);
+  });
+
+  test("a Claude Code question never carries x", () => {
+    const qs = buildPermissionQuestions({ questions: [{ question: "Pick?", options: [{ label: "A" }, { label: "B" }] }] });
+    expect(qs).toEqual([{ q: "Pick?", o: ["A", "B"] }]);
+  });
+
+  test("x survives the budget ladder down to the label-only picker", () => {
+    const qs = buildPermissionQuestions({ questions: [{ question: "Pick?", isOther: true,
+      options: [{ label: "A", description: "d".repeat(600) }] }] });
+    const fit = fitPermissionDetail({ title: "t" }, "", 900, qs);
+    expect(fit.questions?.[0].x).toBe(true);
   });
 });

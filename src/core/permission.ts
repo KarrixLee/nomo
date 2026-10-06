@@ -450,7 +450,7 @@ function answerLine(
   const otherTexts = extrasArray(other, questions.length);
   const noteTexts = extrasArray(notes, questions.length);
   if (otherTexts === undefined || noteTexts === undefined) return undefined;
-  if (!adapterFor(agent).answerExtras && [...otherTexts, ...noteTexts].some((t) => t.length > 0)) return undefined;
+  if (!answerExtrasAccepted(adapterFor(agent).answerExtras, otherTexts, noteTexts)) return undefined;
   const map: Record<string, string> = {};
   const annotations: Record<string, { notes?: string; preview?: string }> = {};
   for (let i = 0; i < questions.length; i += 1) {
@@ -502,10 +502,19 @@ function answerLine(
   });
 }
 
+/** Whether an agent's `answerExtras` capability can carry these (normalized) extras: `true` takes both,
+ *  `"other"` (Codex, NOM-63) takes typed Other but never a note, absent takes neither. Per-question
+ *  eligibility for Other under `"other"` (the question's own isOther flag) is the caller's job. */
+export function answerExtrasAccepted(cap: true | "other" | undefined, other: string[], notes: string[]): boolean {
+  if (cap === true) return true;
+  if (notes.some((t) => t.length > 0)) return false;
+  return cap === "other" || other.every((t) => t.length === 0);
+}
+
 /** One NOM-54 extras array (`other` / `notes`), normalized to trimmed strings ("" = none). Absent →
  *  all-empty. `undefined` = unrepresentable (not an array, wrong length, a non-string/non-null entry,
  *  or a string over ANSWER_MAX — refused, never sliced, same rule as the answer itself). */
-function extrasArray(value: unknown, length: number): string[] | undefined {
+export function extrasArray(value: unknown, length: number): string[] | undefined {
   if (value === undefined || value === null) return Array.from({ length }, () => "");
   if (!Array.isArray(value) || value.length !== length) return undefined;
   const out: string[] = [];
@@ -805,6 +814,9 @@ export interface PermissionQuestion {
   /** NOM-59: option previews (markdown, or an HTML fragment), aligned with `o`; null = that option has
    *  none. Single-select only, omitted when no option has one. Shed FIRST under budget pressure. */
   p?: (string | null)[];
+  /** NOM-63: this question accepts free-text "Other" (the answer verb's `other[i]`). Set only for a Codex
+   *  question with isOther — Claude Code questions always accept Other and never carry it. */
+  x?: true;
 }
 
 /** Longest question text kept in the blob (display only — the answers map is keyed by the ORIGINAL,
@@ -845,7 +857,7 @@ export function capPermissionWireText(value: string, max: number): string {
 }
 
 /** One raw CC question, narrowed. */
-type RawQuestion = { question?: unknown; header?: unknown; multiSelect?: unknown; options?: unknown } | null;
+type RawQuestion = { question?: unknown; header?: unknown; multiSelect?: unknown; options?: unknown; isOther?: unknown } | null;
 
 /** A question CC sent that is both SHOWABLE and ANSWERABLE, with its ORIGINAL (untruncated) text,
  *  option labels, and positionally aligned descriptions. */
@@ -922,6 +934,8 @@ export function buildPermissionQuestions(toolInput: Record<string, unknown>): Pe
       ...(raw?.multiSelect !== true && previews.some((pv) => pv.length > 0)
         ? { p: previews.map((pv) => pv.length > 0 ? capPermissionWireText(pv, QUESTION_PREVIEW_MAX) : null) }
         : {}),
+      // NOM-63: only renderableCodexUserInput carries isOther (Codex app-server questions); CC never does.
+      ...(raw?.isOther === true ? { x: true as const } : {}),
     };
   });
 }
