@@ -79,7 +79,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "2.3.3";
+var PLUGIN_VERSION = "2.3.4";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -4377,12 +4377,13 @@ function reduceOcEvent(state, event, now = Date.now()) {
       const startedAt = Number(asRecord2(info?.time)?.created);
       const created = {
         startedAt: Number.isFinite(startedAt) && startedAt > 0 ? startedAt : now,
+        announced: false,
         working: false
       };
       applyTitle(created, info);
       applyAgent(created, info, false);
       state.sessions.set(sessionId, created);
-      return frame(sessionId, created, "start", "working", now);
+      return null;
     }
     case "session.updated": {
       if (!entry)
@@ -4407,7 +4408,8 @@ function reduceOcEvent(state, event, now = Date.now()) {
       if (status !== "busy" && status !== "retry")
         return null;
       const detail = status === "retry" ? "retrying" : undefined;
-      const planned = frame(sessionId, live, "update", "working", now, detail);
+      const planned = frame(sessionId, live, live.announced ? "update" : "start", "working", now, detail);
+      live.announced = true;
       const key = JSON.stringify([planned.status, planned.detail, planned.title, planned.model, planned.plan]);
       if (live.lastStatusFrame === key)
         return null;
@@ -4421,10 +4423,12 @@ function reduceOcEvent(state, event, now = Date.now()) {
       if (plan === entry.plan)
         return null;
       entry.plan = plan;
+      if (!entry.announced)
+        return null;
       return frame(sessionId, entry, "update", "working", now);
     }
     case "session.idle": {
-      if (!entry)
+      if (!entry?.announced)
         return null;
       entry.working = false;
       entry.lastStatusFrame = undefined;
@@ -4436,14 +4440,14 @@ function reduceOcEvent(state, event, now = Date.now()) {
       if (!entry)
         return null;
       state.sessions.delete(sessionId);
-      return frame(sessionId, entry, "end", "done", now);
+      return entry.announced ? frame(sessionId, entry, "end", "done", now) : null;
     }
     default:
       return null;
   }
 }
 function ocEndFrames(state, now = Date.now()) {
-  const frames = [...state.sessions].map(([sessionId, entry]) => frame(sessionId, entry, "end", "done", now));
+  const frames = [...state.sessions].filter(([, entry]) => entry.announced).map(([sessionId, entry]) => frame(sessionId, entry, "end", "done", now));
   state.sessions.clear();
   return frames;
 }
@@ -4456,10 +4460,11 @@ function ocAttentionFrame(state, sessionId, detail, now = Date.now()) {
   const entry = state.sessions.get(sessionId);
   if (!entry || state.children.has(sessionId))
     return null;
+  entry.announced = true;
   return frame(sessionId, entry, "update", "needsAttention", now, detail, 1);
 }
 function adopt(state, sessionId, now) {
-  const entry = { startedAt: now, working: false };
+  const entry = { startedAt: now, announced: true, working: false };
   state.sessions.set(sessionId, entry);
   return entry;
 }
@@ -4477,7 +4482,7 @@ function applyTitle(entry, info) {
     entry.title = title;
 }
 function frame(sessionId, entry, op, status, now, detail, prio = 0) {
-  if (status === "working" && op !== "start") {
+  if (status === "working") {
     if (!entry.working || entry.turnStartedAt === undefined)
       entry.turnStartedAt = Math.floor(now / 1000);
     entry.working = true;

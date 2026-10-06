@@ -41,6 +41,10 @@ export interface OcFrame {
 
 export interface OcSessionState {
   startedAt: number;
+  /** Whether the phone may know this row. False only between a `session.created` and the first frame
+   *  planned for it — a created-but-never-prompted session (a fork, ACP `session/new`, a bare
+   *  `POST /session`) stays here forever, and nothing may be posted about a row that was never opened. */
+  announced: boolean;
   title?: string;
   model?: string;
   /** Whether the last frame we planned was a working one — the turn-anchor edge detector. */
@@ -154,15 +158,19 @@ function statusType(status: unknown): string | undefined {
  *
  *  | event                          | op / status                                             |
  *  |--------------------------------|---------------------------------------------------------|
- *  | `session.created` (root only)  | start / working                                          |
+ *  | `session.created` (root only)  | (seeds startedAt + title + agent only, no frame)          |
  *  | `session.status {busy}`        | update / working — skipped when identical to the last     |
- *  | `session.status {retry}`       | update / working, detail = the `"retrying"` key           |
+ *  |                                | (start / working when it is a created session's FIRST)    |
+ *  | `session.status {retry}`       | the same, detail = the `"retrying"` key                   |
  *  | `session.status {idle}`        | (nothing — `session.idle` is the authoritative done)      |
  *  | `session.idle` (root)          | done / done                                              |
  *  | `session.deleted`              | end                                                      |
  *  | `session.updated`              | (title + agent seed only, no frame)                      |
  *  | `message.updated` (assistant)  | (model + agent only, no frame)                           |
  *  | `todo.updated`                 | update / working, `plan` = the whole list as markdown     |
+ *
+ *  A session that has not been ANNOUNCED yet (created, never busy) sends nothing from any row above
+ *  but the busy one: no done, no end, no todo frame.
  *
  *  The approval channels (`permission.asked` / `question.asked`) are DELIBERATELY absent: they are not
  *  session-lifecycle frames at all — they open a blocking hold that POSTs its own decision frame on a
@@ -193,12 +201,20 @@ export function reduceOcEvent(state: OcState, event: unknown, now: number = Date
       const startedAt = Number(asRecord(info?.time)?.created);
       const created: OcSessionState = {
         startedAt: Number.isFinite(startedAt) && startedAt > 0 ? startedAt : now,
+        announced: false,
         working: false,
       };
       applyTitle(created, info);
       applyAgent(created, info, false); // the TUI stamps the agent at create; HTTP `POST /session` sends null
       state.sessions.set(sessionId, created);
-      return frame(sessionId, created, "start", "working", now);
+      // NO FRAME: CREATED IS NOT WORKING. The TUI and the desktop app create the session lazily at
+      // prompt submit, so there a busy follows within ~250 ms — but `Session.fork`, ACP `session/new`
+      // and a bare `POST /session` create one with no prompt behind it, and then NO status event ever
+      // follows and `session.idle` is never emitted. A working frame sent from here had nothing to
+      // retract it (no idle reap, no transcript for the interrupt net, and the heartbeat kept the row
+      // fresh), so it sat "working" until the OpenCode process exited. OpenCode has an authoritative
+      // busy signal; the row opens on that.
+      return null;
     }
 
     case "session.updated": {
@@ -226,7 +242,11 @@ export function reduceOcEvent(state: OcState, event: unknown, now: number = Date
       // eat the 3072-char seal budget the plan/dbg tail is fitted into. "retrying" maps to the
       // localized "Reconnecting…" — a transient the user should read as recovery, not failure.
       const detail = status === "retry" ? "retrying" : undefined;
-      const planned = frame(sessionId, live, "update", "working", now, detail);
+      // A created session's FIRST frame is the `start` that `session.created` used to send — the worker
+      // pushes a start to the island at once, where a first-seen prio-0 update can sit out its 5 s
+      // coalescing window. An adopted session is already `announced`, so it stays an `update`.
+      const planned = frame(sessionId, live, live.announced ? "update" : "start", "working", now, detail);
+      live.announced = true;
       // The identical-frame skip. `session.status {busy}` fires several times per turn with the exact
       // same payload; re-POSTing it costs a round trip and a re-seal for a frame the phone already
       // shows. The key spans everything that can change the RENDERED frame (title/model/todos included),
@@ -253,11 +273,14 @@ export function reduceOcEvent(state: OcState, event: unknown, now: number = Date
       const plan = ocTodoMarkdown(properties.todos);
       if (plan === entry.plan) return null; // the same list twice — the phone already shows it
       entry.plan = plan;
+      if (!entry.announced) return null; // kept for the first busy, which is what opens the row
       return frame(sessionId, entry, "update", "working", now);
     }
 
     case "session.idle": {
-      if (!entry) return null;
+      // Never announced = never prompted (an abort on a fresh fork): there is no row to finish, and a
+      // done here would CREATE one.
+      if (!entry?.announced) return null;
       entry.working = false;
       entry.lastStatusFrame = undefined; // the next busy must always get through
       // Build the done frame BEFORE clearing the anchor: the phone's "done in X" is the turn's END
@@ -274,7 +297,7 @@ export function reduceOcEvent(state: OcState, event: unknown, now: number = Date
     case "session.deleted": {
       if (!entry) return null;
       state.sessions.delete(sessionId);
-      return frame(sessionId, entry, "end", "done", now);
+      return entry.announced ? frame(sessionId, entry, "end", "done", now) : null;
     }
 
     default:
@@ -283,9 +306,11 @@ export function reduceOcEvent(state: OcState, event: unknown, now: number = Date
 }
 
 /** Terminal frames for every still-live session — the `dispose()` path (OpenCode is shutting the
- *  plugin down, so the sessions are going away with it). Drains the map: dispose runs once. */
+ *  plugin down, so the sessions are going away with it). Drains the map: dispose runs once. A session
+ *  that was never announced has no row to end and is simply dropped with the rest. */
 export function ocEndFrames(state: OcState, now: number = Date.now()): OcFrame[] {
-  const frames = [...state.sessions].map(([sessionId, entry]) => frame(sessionId, entry, "end", "done", now));
+  const frames = [...state.sessions].filter(([, entry]) => entry.announced)
+    .map(([sessionId, entry]) => frame(sessionId, entry, "end", "done", now));
   state.sessions.clear();
   return frames;
 }
@@ -307,19 +332,22 @@ export function ocForgetStatusFrame(state: OcState, sessionId: string): void {
  *  being held on the phone — the local `no-hold` escape hatch. It is the exact shape the Claude/Codex
  *  hooks' `delegate` produces (runHook's PermissionRequest branch: update / prio 1 / needsAttention),
  *  so a paused-approvals OpenCode row looks the same as a paused-approvals Claude one. Null for a
- *  session we never saw start. */
+ *  session we never saw start. It ANNOUNCES the row (the worker takes a first-seen update as
+ *  discovery), so the idle that follows is allowed to close it. */
 export function ocAttentionFrame(
   state: OcState, sessionId: string, detail: string | undefined, now: number = Date.now(),
 ): OcFrame | null {
   const entry = state.sessions.get(sessionId);
   if (!entry || state.children.has(sessionId)) return null;
+  entry.announced = true;
   return frame(sessionId, entry, "update", "needsAttention", now, detail, 1);
 }
 
 /** Adopt a session first seen mid-flight (the plugin loaded into a server that already had sessions,
- *  or `session.created` predated us). Its first frame is an `update`, not a `start`. */
+ *  or `session.created` predated us). Its first frame is an `update`, not a `start` — so it is born
+ *  `announced`: it predates us, and the phone may well hold its row from an earlier plugin instance. */
 function adopt(state: OcState, sessionId: string, now: number): OcSessionState {
-  const entry: OcSessionState = { startedAt: now, working: false };
+  const entry: OcSessionState = { startedAt: now, announced: true, working: false };
   state.sessions.set(sessionId, entry);
   return entry;
 }
@@ -347,8 +375,8 @@ function frame(
 ): OcFrame {
   // The turn anchor (epoch SECONDS, the blob's unit) is stamped on the EDGE into working, so the
   // island's turn clock counts this turn and not the session. A session sitting idle for an hour and
-  // then prompted must show 0s, not 1h.
-  if (status === "working" && op !== "start") {
+  // then prompted must show 0s, not 1h. A `start` is stamped too: it is only ever a real busy now.
+  if (status === "working") {
     if (!entry.working || entry.turnStartedAt === undefined) entry.turnStartedAt = Math.floor(now / 1000);
     entry.working = true;
   }
