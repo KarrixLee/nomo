@@ -104,7 +104,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "2.3.4";
+var PLUGIN_VERSION = "2.3.5";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -5692,7 +5692,7 @@ async function runHook(agent) {
     const cachedTurn = typeof existingRecord?.turnStartedAt === "number" && Number.isFinite(existingRecord.turnStartedAt) ? existingRecord.turnStartedAt : undefined;
     const isTurnOpener = hookName === "UserPromptSubmit" || hookName === "SessionStart" && sessionStartSource !== "compact";
     const turnStartedAt = isTurnOpener ? Math.floor(Date.now() / 1000) : cachedTurn;
-    const awaitingPrompt = hookName === "SessionStart" && (sessionStartSource !== "compact" || existingRecord?.awaitingPrompt === true);
+    const awaitingPrompt = hookName === "SessionStart" && !reusedForkPredecessor && (existingRecord ? sentDone || existingRecord.awaitingPrompt === true : sessionStartSource !== "compact");
     const turnId = typeof input.turn_id === "string" && input.turn_id.length > 0 ? input.turn_id : undefined;
     let plan = planOp(hookName, input, sentDone);
     if (!plan)
@@ -8738,7 +8738,7 @@ async function correctIdleProvisional(config, path, sessionId, record) {
   }
 }
 var CLAUDE_IDLE_REAP_MS = 1800000;
-var CLAUDE_AWAITING_PROMPT_REAP_MS = 60000;
+var CLAUDE_AWAITING_PROMPT_REAP_MS = 20000;
 var CLAUDE_IDLE_REAP_MAX_ATTEMPTS = 5;
 function transcriptMtimeMsDefault(path) {
   try {
@@ -8774,6 +8774,16 @@ async function correctIdleClaude(config, path, sessionId, record, now, deps = {}
   const post = deps.post ?? ((body) => postEvent(config, body));
   const writeRecord = deps.writeRecord ?? ((p, rec) => atomicWrite(p, JSON.stringify(rec), 384));
   const clock = deps.now ?? Date.now;
+  const reread = deps.readRecord ?? readRecordAt;
+  const snapshot = record;
+  const unmoved = async () => {
+    try {
+      const fresh = await reread(path);
+      return fresh !== null && !recordMovedSince(snapshot, fresh);
+    } catch {
+      return false;
+    }
+  };
   try {
     const agent = recordAgent(record);
     if (agent === "codex") {
@@ -8810,16 +8820,24 @@ async function correctIdleClaude(config, path, sessionId, record, now, deps = {}
       return "uncorrected";
     const attempts = effectiveDoneAttempts(record, sessionId);
     if (attempts >= CLAUDE_IDLE_REAP_MAX_ATTEMPTS) {
+      if (!await unmoved())
+        return "uncorrected";
       try {
         await writeRecord(path, { ...record, lastEvent: "done", sentDone: true, op: "done", doneAttempts: undefined, awaitingPrompt: undefined });
         clearDoneAttempts(sessionId);
       } catch {}
       return "pending";
     }
+    if (!await unmoved())
+      return "uncorrected";
     const doneNow = clock();
     const outcome = await post(await buildDoneEnvelope(sessionId, record, doneNow, config.e2eKey, agent, Math.floor(record.ts / 1000)));
     if (outcome === "revoked")
       return "revoked";
+    if (!await unmoved()) {
+      clearDoneAttempts(sessionId);
+      return "uncorrected";
+    }
     if (outcome === "delivered") {
       try {
         await writeRecord(path, { ...record, lastEvent: "done", sentDone: true, op: "done", doneAttempts: undefined, awaitingPrompt: undefined });
@@ -9773,6 +9791,7 @@ export {
   acceptLanAnswer,
   WAITING_HEARTBEAT_AFTER_MS,
   RETIRE_AFTER_MS,
+  POLL_MS,
   PLAN_PICKER_VERIFY_MAX_MS,
   PLAN_PICKER_RECENT_DONE_MS,
   PLAN_PICKER_PENDING_MAX_MS,
@@ -9782,5 +9801,7 @@ export {
   IDLE_GRACE_MS,
   COMMAND_TTL_MS,
   COMMAND_FUTURE_SKEW_MS,
-  CODEX_TUI_SESSION_START_SKEW_MS
+  CODEX_TUI_SESSION_START_SKEW_MS,
+  CLAUDE_IDLE_REAP_MAX_ATTEMPTS,
+  CLAUDE_AWAITING_PROMPT_REAP_MS
 };

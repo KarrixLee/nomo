@@ -1114,9 +1114,10 @@ export interface SessionRecord {
    *  computeSessionState only reads it on the rung that can honestly show it (`record.prio === 1`). */
   attentionStalledAt?: number;
   /** APPENDED LAST, same discipline as `attentionKind` above. True while the session has been OPENED
-   *  but not yet PROMPTED: stamped by a SessionStart hook (startup / resume / clear) and dropped by the
-   *  very next hook that writes the record, because trackSessionAt rebuilds it whole. Local only — it
-   *  never enters a blob or an envelope.
+   *  but not yet PROMPTED: stamped by a SessionStart hook that lands on no record, a done record, or one
+   *  already awaiting (never on a live turn's — see runHook), and dropped by the very next hook that
+   *  writes the record, because trackSessionAt rebuilds it whole. Local only — it never enters a blob
+   *  or an envelope.
    *
    *  WHY IT EXISTS: Claude Code has no idle hook. SessionStart maps to "working" and only a Stop (which
    *  needs a turn) or a SessionEnd retracts it, so `claude --resume` left at the empty prompt showed
@@ -1125,8 +1126,7 @@ export interface SessionRecord {
    *
    *  NOT derivable from `lastEvent === "sessionStart"`, in either direction: a resume over a done record
    *  re-arms as an `update` and writes lastEvent:"working", while a source:"compact" SessionStart fires
-   *  MID-turn on a session with no record yet and writes lastEvent:"sessionStart" over a live turn. A
-   *  compact SessionStart therefore carries the previous value through rather than setting it. */
+   *  MID-turn on a session with no record yet and writes lastEvent:"sessionStart" over a live turn. */
   awaitingPrompt?: boolean;
 }
 

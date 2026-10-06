@@ -945,12 +945,21 @@ export async function runHook(agent: AgentKind): Promise<void> {
     const turnStartedAt = isTurnOpener ? Math.floor(Date.now() / 1000) : cachedTurn;
     // "Opened, no prompt yet" (see SessionRecord.awaitingPrompt): a SessionStart leaves the session at
     // the empty prompt reading "working" with no hook left to retract it, so it is marked for the
-    // watchdog's short reap. Any other hook is proof of a turn and clears it. The same compact exception
-    // as the anchor above, for the same reason — compaction fires MID-turn, so it neither sets the
-    // marker (that would reap a live turn in 60 s) nor clears it: the previous value rides through.
+    // watchdog's short reap. Any other hook is proof of a turn and clears it. The marker may only ever
+    // describe a session that is NOT in a turn, and a SessionStart alone does not prove that — so it is
+    // set only over a record that says so:
+    //   - no record yet → a fresh open. (Not for source:"compact": compaction of a session we have
+    //     never tracked — the plugin enabled mid-turn — is a live turn, the anchor's exception above.)
+    //   - a DONE record → reopened at the idle prompt: a resume, or a manual `/compact` there, which
+    //     re-arms "working" with nothing left to retract it either.
+    //   - a record ALREADY awaiting → still unprompted; the value rides through.
+    // Over a live working/needsAttention record it stays unset — a second `claude --resume <same id>`
+    // or a mid-turn auto-compact must not expose a real turn to the reap during a hook-quiet stretch.
+    // And never through the fork alias: that SessionStart is a daemon replay rewriting ANOTHER session's
+    // row, so it says nothing about whether the predecessor's user has prompted.
     // NOT keyed on the record's lastEvent, which reads "working" for a resume over a done record.
-    const awaitingPrompt = hookName === "SessionStart"
-      && (sessionStartSource !== "compact" || existingRecord?.awaitingPrompt === true);
+    const awaitingPrompt = hookName === "SessionStart" && !reusedForkPredecessor
+      && (existingRecord ? sentDone || existingRecord.awaitingPrompt === true : sessionStartSource !== "compact");
     // The Codex turn id (Claude payloads carry none → undefined). Cached on the record so the notify
     // backstop's stale-turn guard can compare it against a delayed notify's payload turn-id.
     const turnId = typeof input.turn_id === "string" && input.turn_id.length > 0 ? input.turn_id : undefined;

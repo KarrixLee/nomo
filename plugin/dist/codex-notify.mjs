@@ -103,7 +103,7 @@ async function sha256Hex(s) {
 }
 
 // src/core/shared.ts
-var PLUGIN_VERSION = "2.3.4";
+var PLUGIN_VERSION = "2.3.5";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -3393,7 +3393,7 @@ async function runHook(agent) {
     const cachedTurn = typeof existingRecord?.turnStartedAt === "number" && Number.isFinite(existingRecord.turnStartedAt) ? existingRecord.turnStartedAt : undefined;
     const isTurnOpener = hookName === "UserPromptSubmit" || hookName === "SessionStart" && sessionStartSource !== "compact";
     const turnStartedAt = isTurnOpener ? Math.floor(Date.now() / 1000) : cachedTurn;
-    const awaitingPrompt = hookName === "SessionStart" && (sessionStartSource !== "compact" || existingRecord?.awaitingPrompt === true);
+    const awaitingPrompt = hookName === "SessionStart" && !reusedForkPredecessor && (existingRecord ? sentDone || existingRecord.awaitingPrompt === true : sessionStartSource !== "compact");
     const turnId = typeof input.turn_id === "string" && input.turn_id.length > 0 ? input.turn_id : undefined;
     let plan = planOp(hookName, input, sentDone);
     if (!plan)
