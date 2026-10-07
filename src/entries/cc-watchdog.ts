@@ -2233,7 +2233,7 @@ async function correctIdleProvisional(config: Config, path: string, sessionId: s
 // codex-side defaults documented in adapter.ts: reaping a session that turns out still-live merely costs
 // one frame — its next real hook re-arms it to working — whereas never reaping sticks forever.
 //
-// v2.3.3: a record the hook marked `awaitingPrompt` (a SessionStart with no hook since) does not wait out
+// v2.3.3 (a dev build number; first released in 2.2.2): a record the hook marked `awaitingPrompt` (a SessionStart with no hook since) does not wait out
 // those 30 min — it is the one case where "no turn is running" is KNOWN rather than inferred from
 // silence, so the same predicate holds it to CLAUDE_AWAITING_PROMPT_REAP_MS (20 s) instead. The 30-min clock
 // remains the backstop for everything else (a dropped Stop, a record from a plugin predating the marker).
