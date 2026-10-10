@@ -6,7 +6,7 @@ import {
   buildPermissionSummary, buildPermissionDetail, buildPermissionQuestions, fitPermissionDetail,
   sealedBlobChars, BLOB_FIT_CHARS, runPermissionHook, approvalsCommand, NO_HOLD_PATH, TRACE_PATH,
   codexRolloutSessionId, codexTurnPolicyFromRollout, loadCodexTurnPolicy,
-  POST_FIRST_CONTACT_TIMEOUT_MS, OPENCODE_QUESTION_TOOL, localAnswerProbe,
+  POST_FIRST_CONTACT_TIMEOUT_MS, OPENCODE_QUESTION_TOOL, localAnswerProbe, answerExtrasAccepted,
 } from "./permission";
 import {
   createPollBudget, MAX_CONSECUTIVE_MISSES, POLL_FIRST_CONTACT_TIMEOUT_MS,
@@ -3360,5 +3360,201 @@ describe("runPermissionHook — answered at the Mac", () => {
       readTailFn: async () => { throw new Error("must not be consulted"); },
     }) as never);
     expect(emitted).toEqual([ALLOW]);
+  });
+});
+
+// ---- NOM-54: allow_mode + answer extras (other / notes) + NOM-60 non-choice guard -------------
+
+describe("runPermissionHook — NOM-54 allow_mode / answer extras", () => {
+  const PLAN = "## Plan\n- do it";
+  const exitPlan = JSON.stringify({
+    session_id: "sess-1", hook_event_name: "PermissionRequest", tool_name: "ExitPlanMode",
+    tool_input: { plan: PLAN }, cwd: "/Users/x/proj", transcript_path: "/tmp/t.jsonl",
+  });
+  const MULTI = [{
+    question: "Pick?", multiSelect: true,
+    options: [{ label: "A" }, { label: "B" }, { label: "C" }],
+  }];
+  const question = (questions: unknown) => JSON.stringify({
+    session_id: "sess-1", hook_event_name: "PermissionRequest", tool_name: "AskUserQuestion",
+    tool_input: { questions }, cwd: "/Users/x/proj", transcript_path: "/tmp/t.jsonl",
+  });
+  const run = async (answer: Record<string, unknown>, input?: string, agent?: "codex") => {
+    const answerBlob = await encryptBlob(KEY, { requestId: "req-fixed", ts: 5, ...answer });
+    const emitted: string[] = [];
+    const { fn, calls } = scriptFetch(true, [{ status: "answered", answerBlob }]);
+    const deps = baseDeps({
+      fetchFn: fn, emit: (l: string) => emitted.push(l), ...(input ? { readInput: async () => input } : {}),
+    }) as never;
+    await (agent ? runPermissionHook(deps, agent) : runPermissionHook(deps));
+    return { emitted, gets: calls.filter((c) => c.method === "GET").length };
+  };
+  const decision = (line: string) => JSON.parse(line).hookSpecificOutput.decision;
+  const setMode = (mode: string) => [{ type: "setMode", mode, destination: "session" }];
+
+  for (const mode of ["acceptEdits", "auto"]) {
+    test(`allow_mode ${mode} on ExitPlanMode → allow + NOM-36 echo + session setMode`, async () => {
+      const { emitted } = await run({ decision: "allow_mode", mode }, exitPlan);
+      expect(emitted.length).toBe(1);
+      expect(decision(emitted[0])).toEqual({ behavior: "allow", updatedInput: { plan: PLAN }, updatedPermissions: setMode(mode) });
+    });
+    test(`allow_mode ${mode} on Bash → allow + session setMode, no updatedInput`, async () => {
+      const { emitted } = await run({ decision: "allow_mode", mode });
+      expect(decision(emitted[0])).toEqual({ behavior: "allow", updatedPermissions: setMode(mode) });
+    });
+  }
+
+  test("allow_mode with an unknown / missing mode → treated as an unknown verb: nothing emitted, bounded polling", async () => {
+    for (const mode of ["bypassPermissions", "plan", undefined, 3]) {
+      const { emitted, gets } = await run({ decision: "allow_mode", mode });
+      expect(emitted).toEqual([]);
+      expect(gets).toBe(3); // MAX_UNKNOWN_ANSWER_READS — kept polling, never a guessed allow
+    }
+  });
+
+  test("allow_mode on Codex → plain allow (no updatedPermissions ever reaches Codex)", async () => {
+    const { emitted } = await run({ decision: "allow_mode", mode: "acceptEdits" }, undefined, "codex");
+    const parsed = JSON.parse(emitted[0]);
+    expect(parsed.continue).toBe(true);
+    expect(parsed.hookSpecificOutput.decision).toEqual({ behavior: "allow" });
+  });
+
+  test("allow_mode on a question → released, never a bare allow", async () => {
+    const { emitted, gets } = await run({ decision: "allow_mode", mode: "acceptEdits" }, question(MULTI));
+    expect(emitted).toEqual([]);
+    expect(gets).toBe(1);
+  });
+
+  test("other-only: empty pick + typed text → the text IS the answer", async () => {
+    const { emitted } = await run({ decision: "answer", answers: [""], other: ["  my own idea  "] }, question(MULTI));
+    expect(decision(emitted[0]).updatedInput).toEqual({ questions: MULTI, answers: { "Pick?": "my own idea" } });
+  });
+
+  test("labels + other on multi-select → picked labels then the typed text, joined ', '", async () => {
+    const { emitted } = await run({ decision: "answer", answers: ["A, C"], other: ["also D"], notes: [null] }, question(MULTI));
+    expect(decision(emitted[0]).updatedInput.answers).toEqual({ "Pick?": "A, C, also D" });
+    expect("annotations" in decision(emitted[0]).updatedInput).toBe(false);
+  });
+
+  test("notes → annotations[questionText].notes", async () => {
+    const qs = [{ question: "One?", options: [{ label: "A" }] }, { question: "Two?", options: [{ label: "B" }] }];
+    const { emitted } = await run({ decision: "answer", answers: ["A", "B"], notes: ["", "because"] }, question(qs));
+    const updatedInput = decision(emitted[0]).updatedInput;
+    expect(updatedInput.answers).toEqual({ "One?": "A", "Two?": "B" });
+    expect(updatedInput.annotations).toEqual({ "Two?": { notes: "because" } });
+    expect(Object.keys(updatedInput).sort()).toEqual(["annotations", "answers", "questions"]);
+  });
+
+  test("a label mismatch still releases — free text is never inferred from it", async () => {
+    const { emitted, gets } = await run({ decision: "answer", answers: ["Z"], other: ["x"] }, question(MULTI));
+    expect(emitted).toEqual([]);
+    expect(gets).toBe(1);
+  });
+
+  test("extras of the wrong length / wrong type / over cap → release", async () => {
+    for (const extra of [
+      { other: ["a", "b"] }, { notes: [] }, { other: "a" }, { notes: [5] }, { other: ["x".repeat(501)] },
+    ]) {
+      const { emitted, gets } = await run({ decision: "answer", answers: ["A"], ...extra }, question(MULTI));
+      expect(emitted).toEqual([]);
+      expect(gets).toBe(1);
+    }
+  });
+
+  test("NOM-60: any question with kind !== 'choice' drops the picker (blob) and releases an answer", async () => {
+    const qs = [{ question: "Pick?", options: [{ label: "A" }] }, { question: "Name?", kind: "text", options: [{ label: "x" }] }];
+    expect(buildPermissionQuestions({ questions: qs })).toEqual([]);
+    expect(buildPermissionQuestions({ questions: [{ ...qs[0], kind: "choice" }] }).length).toBe(1);
+    const { emitted, gets } = await run({ decision: "answer", answers: ["A", "x"] }, question(qs));
+    expect(emitted).toEqual([]);
+    expect(gets).toBe(1);
+  });
+});
+
+// ---- NOM-59: AskUserQuestion option previews ------------------------------------------------
+
+describe("NOM-59 option previews", () => {
+  const LONG = "```\n" + "x".repeat(900) + "\n```";
+  const PQ = [{
+    question: "Layout?",
+    options: [{ label: "Grid", preview: LONG }, { label: "List" }, { label: "Cards", preview: "## cards" }],
+  }];
+  const question = (questions: unknown) => JSON.stringify({
+    session_id: "sess-1", hook_event_name: "PermissionRequest", tool_name: "AskUserQuestion",
+    tool_input: { questions }, cwd: "/Users/x/proj", transcript_path: "/tmp/t.jsonl",
+  });
+  const run = async (answer: Record<string, unknown>, input: string) => {
+    const answerBlob = await encryptBlob(KEY, { requestId: "req-fixed", ts: 5, ...answer });
+    const emitted: string[] = [];
+    const { fn } = scriptFetch(true, [{ status: "answered", answerBlob }]);
+    await runPermissionHook(baseDeps({ fetchFn: fn, emit: (l: string) => emitted.push(l), readInput: async () => input }) as never);
+    return emitted;
+  };
+  const updatedInput = (line: string) => JSON.parse(line).hookSpecificOutput.decision.updatedInput;
+
+  test("p rides aligned with o (null = no preview), capped with an ellipsis", () => {
+    const [q] = buildPermissionQuestions({ questions: PQ });
+    expect(q.p?.length).toBe(3);
+    expect(q.p?.[1]).toBeNull();
+    expect(q.p?.[2]).toBe("## cards");
+    expect([...(q.p?.[0] ?? "")].length).toBe(600);
+    expect(q.p?.[0]?.endsWith("…")).toBe(true);
+  });
+
+  test("p omitted when no option has a preview, and always for multiSelect", () => {
+    expect("p" in buildPermissionQuestions({ questions: [{ question: "Q", options: [{ label: "A", preview: "" }] }] })[0]).toBe(false);
+    expect("p" in buildPermissionQuestions({ questions: [{ ...PQ[0], multiSelect: true }] })[0]).toBe(false);
+  });
+
+  test("budget: previews shed before any description is capped", () => {
+    const base = { sessionId: "s", title: "t" };
+    const questions = buildPermissionQuestions({ questions: [{
+      question: "Layout?", options: [{ label: "Grid", description: "D".repeat(300), preview: "P".repeat(500) }],
+    }] });
+    const noP = questions.map(({ p: _p, ...q }) => q);
+    const chars = (qs: typeof questions) => sealedBlobChars(new TextEncoder().encode(JSON.stringify({ ...base, permissionQuestions: qs })).length);
+    expect(fitPermissionDetail(base, "", chars(questions), questions).questions).toEqual(questions);
+    expect(fitPermissionDetail(base, "", chars(questions) - 1, questions).questions).toEqual(noP);
+  });
+
+  test("answer echoes the FULL original preview (not the capped wire copy)", async () => {
+    const emitted = await run({ decision: "answer", answers: ["Grid"] }, question(PQ));
+    expect(updatedInput(emitted[0]).annotations).toEqual({ "Layout?": { preview: LONG } });
+  });
+
+  test("preview merges with notes; no preview for a preview-less option", async () => {
+    const both = await run({ decision: "answer", answers: ["Cards"], notes: ["why not"] }, question(PQ));
+    expect(updatedInput(both[0]).annotations).toEqual({ "Layout?": { notes: "why not", preview: "## cards" } });
+    const none = await run({ decision: "answer", answers: ["List"] }, question(PQ));
+    expect("annotations" in updatedInput(none[0])).toBe(false);
+  });
+
+  test("no preview annotation for Other text (with or without a pick)", async () => {
+    for (const answers of [["Grid"], [""]]) {
+      const emitted = await run({ decision: "answer", answers, other: ["something else"] }, question(PQ));
+      expect("annotations" in updatedInput(emitted[0])).toBe(false);
+    }
+  });
+});
+
+describe("NOM-63 answerExtrasAccepted + x wire key", () => {
+  test("true takes both, other takes Other only, absent takes neither", () => {
+    expect(answerExtrasAccepted(true, ["o"], ["n"])).toBe(true);
+    expect(answerExtrasAccepted("other", ["o"], [""])).toBe(true);
+    expect(answerExtrasAccepted("other", [""], ["n"])).toBe(false);
+    expect(answerExtrasAccepted(undefined, ["o"], [""])).toBe(false);
+    expect(answerExtrasAccepted(undefined, [""], [""])).toBe(true);
+  });
+
+  test("a Claude Code question never carries x", () => {
+    const qs = buildPermissionQuestions({ questions: [{ question: "Pick?", options: [{ label: "A" }, { label: "B" }] }] });
+    expect(qs).toEqual([{ q: "Pick?", o: ["A", "B"] }]);
+  });
+
+  test("x survives the budget ladder down to the label-only picker", () => {
+    const qs = buildPermissionQuestions({ questions: [{ question: "Pick?", isOther: true,
+      options: [{ label: "A", description: "d".repeat(600) }] }] });
+    const fit = fitPermissionDetail({ title: "t" }, "", 900, qs);
+    expect(fit.questions?.[0].x).toBe(true);
   });
 });

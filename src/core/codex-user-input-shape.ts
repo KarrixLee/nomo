@@ -12,6 +12,7 @@ type RawQuestion = {
   header?: unknown;
   question?: unknown;
   isSecret?: unknown;
+  isOther?: unknown;
   options?: unknown;
 } | null;
 
@@ -64,6 +65,8 @@ export function renderableCodexUserInput(
       ...(typeof raw.header === "string" ? { header: raw.header } : {}),
       multiSelect: false,
       options,
+      // NOM-63: rides to the phone as the compact question's `x: true` (free-text Other accepted).
+      ...(raw.isOther === true ? { isOther: true } : {}),
     });
   }
   if (new Set(ids).size !== ids.length) return undefined;

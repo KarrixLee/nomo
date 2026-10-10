@@ -4,7 +4,7 @@
 
 import { hostname } from "node:os";
 import { Bytes, decryptBlob, encryptBlob } from "./crypto";
-import { requestUserInputDetail } from "./adapter";
+import { codexAdapter, requestUserInputDetail } from "./adapter";
 import { lanAnswerStore } from "./lan-listener";
 import type { LanAnswerStore } from "./lan-listener";
 // The relay's timing/give-up rules, shared verbatim with the Claude permission hook (permission.ts),
@@ -15,8 +15,8 @@ import {
 } from "./decision-poll";
 import type { PollBudget } from "./decision-poll";
 import {
-  BLOB_FIT_CHARS, buildPermissionQuestions, buildPermissionSummary, capPermissionWireText,
-  fitPermissionDetail, PERMISSION_QUESTION_LABEL_MAX,
+  answerExtrasAccepted, BLOB_FIT_CHARS, buildPermissionQuestions, buildPermissionSummary, capPermissionWireText,
+  extrasArray, fitPermissionDetail, PERMISSION_QUESTION_LABEL_MAX,
 } from "./permission";
 import {
   clearDecisionHold, Config, DecisionHold, localApprovalsState, PLUGIN_VERSION, readRecord, SessionRecord,
@@ -36,6 +36,10 @@ import { renderableCodexUserInput } from "./codex-user-input-shape";
  *  shared — see decision-poll.ts. */
 const POST_TIMEOUT_MS = 15_000;
 const ANSWER_MAX = 500;
+/** Codex TUI's synthetic Other row label and note prefix (tui request_user_input OTHER_OPTION_LABEL /
+ *  submit_answers, 0.159.2) — the model sees exactly these strings when the user answers at the Mac. */
+const CODEX_OTHER_LABEL = "None of the above";
+const CODEX_NOTE_PREFIX = "user_note: ";
 
 export type CodexRemoteInputResult =
   | "answered"
@@ -92,6 +96,8 @@ interface PhoneAnswer {
   requestId?: unknown;
   decision?: unknown;
   answers?: unknown;
+  other?: unknown;
+  notes?: unknown;
 }
 
 /** Unit tests run in the developer's real HOME, so production marker defaults must be inert there.
@@ -128,8 +134,15 @@ function defaultSettleHoldRecord(): (sessionId: string, patch: Partial<SessionRe
 export function codexAnswersFromPhone(
   request: CodexUserInputRequest,
   positional: unknown,
+  other?: unknown,
+  notes?: unknown,
 ): CodexUserInputAnswers | undefined {
   if (!Array.isArray(positional) || positional.length !== request.questions.length) return undefined;
+  // NOM-63 extras, same normalization/refusal rules as the Claude hook (permission.ts answerLine). Notes
+  // always release (answerExtras "other"); typed Other is honored only on an isOther question.
+  const otherTexts = extrasArray(other, request.questions.length);
+  const noteTexts = extrasArray(notes, request.questions.length);
+  if (!otherTexts || !noteTexts || !answerExtrasAccepted(codexAdapter.answerExtras, otherTexts, noteTexts)) return undefined;
   const mapped: Record<string, string[]> = {};
   for (let index = 0; index < request.questions.length; index += 1) {
     const question = request.questions[index];
@@ -137,7 +150,18 @@ export function codexAnswersFromPhone(
     const raw = positional[index];
     if (typeof raw !== "string") return undefined;
     const answer = raw.trim();
-    if (answer.length === 0 || answer.length > ANSWER_MAX || !question.options?.length) return undefined;
+    const typed = otherTexts[index];
+    if (typed.length > 0 && !question.isOther) return undefined;
+    if (!question.options?.length) return undefined;
+    // Exactly what Codex's own TUI sends (tui/src/bottom_pane/request_user_input submit_answers, 0.159):
+    // the picked label (the synthetic "None of the above" row when the user typed instead of picking),
+    // then the typed text as a `user_note: ` entry.
+    const note = typed.length > 0 ? [`${CODEX_NOTE_PREFIX}${typed}`] : [];
+    if (answer.length === 0 && note.length > 0) {
+      mapped[question.id] = [CODEX_OTHER_LABEL, ...note];
+      continue;
+    }
+    if (answer.length === 0 || answer.length > ANSWER_MAX) return undefined;
     // The phone may echo the compact 60-character display label. Re-expand only when it identifies
     // exactly one original option; a collision is ambiguous and must fall back to the Mac picker.
     const hits = question.options
@@ -147,7 +171,7 @@ export function codexAnswersFromPhone(
       );
     const unique = Array.from(new Set(hits));
     if (unique.length !== 1) return undefined;
-    mapped[question.id] = [unique[0]];
+    mapped[question.id] = [unique[0], ...note];
   }
   // One key per question, or two questions shared an id and one pick was overwritten on the way in.
   if (Object.keys(mapped).length !== request.questions.length) return undefined;
@@ -464,7 +488,7 @@ async function runRemoteInput(
         return "transport-error";
       }
       if (answer.decision !== "answer") return reject("unknown decision", "unsupported");
-      const mapped = codexAnswersFromPhone(request, answer.answers);
+      const mapped = codexAnswersFromPhone(request, answer.answers, answer.other, answer.notes);
       if (!mapped) return reject("unmappable to the app-server questions", "unsupported");
       const result = await deps.answerAppServer(mapped);
       if (result === "sent" || result === "already-sent") {

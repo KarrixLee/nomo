@@ -37,7 +37,7 @@ import {
 import { b64url, Bytes, decryptBlob, deriveLanKey, encryptBlob } from "./crypto";
 // The ONE transcript classifier for "is Claude still parked on a user-blocking tool" — the watchdog's
 // dropped-PreToolUse backstop (adapter.ts) and this hold's local-answer watch must never drift apart.
-import { claudeTailPendingApproval } from "./adapter";
+import { adapterFor, claudeTailPendingApproval } from "./adapter";
 // The relay's timing/give-up rules, shared verbatim with the Codex relay (codex-remote-input.ts) that
 // polls the SAME route with the same credentials. See decision-poll.ts for what is deliberately NOT
 // shared — the first-contact POST ceiling, which each caller bounds by what IT blocks.
@@ -378,12 +378,31 @@ function allowAlwaysLine(agent: AgentKind, toolName: string, toolInput: Record<s
   const updatedPermissions = Array.isArray(suggestions) && suggestions.length > 0
     ? suggestions
     : [{ type: "addRules", rules: [{ toolName }], behavior: "allow", destination: "session" }];
-  // ExitPlanMode needs the same updatedInput echo as the plain allow (see allowLine / NOM-36) or the
-  // approval no-ops. Key order matches the reference: behavior, updatedInput, updatedPermissions.
+  return allowWithPermissionsLine(agent, toolName, toolInput, updatedPermissions);
+}
+
+/** Allow carrying `updatedPermissions`. ExitPlanMode needs the same updatedInput echo as the plain
+ *  allow (see allowLine / NOM-36) or the approval no-ops. Key order matches the reference: behavior,
+ *  updatedInput, updatedPermissions. */
+function allowWithPermissionsLine(agent: AgentKind, toolName: string, toolInput: Record<string, unknown>, updatedPermissions: unknown[]): string {
   const decision = toolName === "ExitPlanMode"
     ? { behavior: "allow", updatedInput: toolInput, updatedPermissions }
     : { behavior: "allow", updatedPermissions };
   return decisionLine(agent, { hookEventName: "PermissionRequest", decision });
+}
+
+/** The modes the phone's `allow_mode` verb may carry (NOM-54). Any other value is treated as an
+ *  UNKNOWN verb (keep polling) — never guessed into a plain allow, never forwarded to CC. */
+const ALLOW_MODES: ReadonlySet<string> = new Set(["acceptEdits", "auto"]);
+
+/** Allow + switch the SESSION's permission mode — CC's own "Yes, and auto-accept edits" shape
+ *  (`setMode` is exactly what CC's permission suggestions carry for that option). Session-scoped only,
+ *  never persisted. CC 2.1.283's permission-update sink gates only `bypassPermissions` on availability;
+ *  an unavailable `auto` is applied as-is and reverted to default by CC's next auto-mode gate recheck.
+ *  An agent that cannot take `updatedPermissions` (AgentAdapter.allowMode absent) gets a plain allow. */
+function allowModeLine(agent: AgentKind, toolName: string, toolInput: Record<string, unknown>, mode: string): string {
+  if (!adapterFor(agent).allowMode) return allowLine(agent, toolName, toolInput);
+  return allowWithPermissionsLine(agent, toolName, toolInput, [{ type: "setMode", mode, destination: "session" }]);
 }
 
 /** Allow + the phone's ANSWER to an AskUserQuestion, injected through `updatedInput`.
@@ -410,6 +429,8 @@ function answerLine(
   toolName: string,
   toolInput: Record<string, unknown>,
   answers: unknown,
+  other?: unknown,
+  notes?: unknown,
 ): string | undefined {
   if (!isAnswerTool(toolName, agent) || !Array.isArray(answers)) return undefined;
   // Zipped against the SAME usable-question list that built `permissionQuestions`, so index i of the
@@ -422,16 +443,32 @@ function answerLine(
   // silently answered with the other's pick. Nothing on the wire can disambiguate them (the key IS the
   // text), so the payload is unanswerable: release, exactly like an ambiguous option label.
   if (new Set(questions.map((q) => q.text)).size !== questions.length) return undefined;
+  // NOM-54 extras: optional positional arrays parallel to `answers` — free-text "Other" and per-question
+  // notes. Present-but-malformed (not an array, wrong length, a non-string/non-null entry, over cap) is
+  // unrepresentable → release. A NON-EMPTY extra for an agent whose channel cannot carry it
+  // (AgentAdapter.answerExtras absent) also releases — silently dropping typed text is a lie.
+  const otherTexts = extrasArray(other, questions.length);
+  const noteTexts = extrasArray(notes, questions.length);
+  if (otherTexts === undefined || noteTexts === undefined) return undefined;
+  if (!answerExtrasAccepted(adapterFor(agent).answerExtras, otherTexts, noteTexts)) return undefined;
   const map: Record<string, string> = {};
+  const annotations: Record<string, { notes?: string; preview?: string }> = {};
   for (let i = 0; i < questions.length; i += 1) {
     const a = answers[i];
     // A question left WITHOUT an answer (missing/non-string/blank entry) would make the map PARTIAL. CC's
     // behavior on a partial `answers` map is unverified — the tool body is a pass-through, so a missing
     // key could be read as an empty pick — and guessing wrong tells the user's session something they
     // never said. Same policy as every other unrepresentable answer: release to the terminal picker.
+    // (A blank pick is fine when the user TYPED an "Other" answer instead — that text IS the answer.)
     if (typeof a !== "string") return undefined;
     const raw = a.trim();
-    if (raw.length === 0) return undefined;
+    const typed = otherTexts[i];
+    if (noteTexts[i].length > 0) annotations[questions[i].text] = { notes: noteTexts[i] };
+    if (raw.length === 0) {
+      if (typed.length === 0) return undefined;
+      map[questions[i].text] = typed;
+      continue;
+    }
     // Bound the stdout line — by REFUSING, never by slicing. Truncating at ANSWER_MAX can land exactly
     // on a multi-select ", " boundary such that what SURVIVES is itself a valid but SHORTER real
     // selection (e.g. a 495-char label + ", Yes and more" slices to "<label>, Yes"), which would tell
@@ -442,16 +479,53 @@ function answerLine(
     const resolved = resolveAnswer(raw, questions[i].labels);
     // An answer we cannot pin to exactly one REAL option is unanswerable: sending a guess (or the
     // phone's capped echo) would tell CC the user picked something they never picked. Release instead.
+    // Free text is NEVER inferred from a label mismatch: it only ever comes from `other[i]`.
     if (resolved === undefined) return undefined;
-    map[questions[i].text] = resolved;
+    map[questions[i].text] = typed.length > 0 ? `${resolved}, ${typed}` : resolved;
+    // NOM-59: a single-select pick of exactly one label whose option carries a preview echoes the ORIGINAL
+    // preview string — CC rejects anything that isn't byte-equal to one of the question's previews.
+    const preview = questions[i].raw?.multiSelect === true || typed.length > 0
+      ? "" : questions[i].previews[questions[i].labels.indexOf(resolved)] ?? "";
+    if (preview.length > 0) annotations[questions[i].text] = { ...annotations[questions[i].text], preview };
   }
   // Every question answered, or nothing goes out (the loop above already released on the first gap; this
   // is the invariant stated as an assertion — an empty map can never be a bare allow either).
   if (Object.keys(map).length !== questions.length) return undefined;
   return decisionLine(agent, {
     hookEventName: "PermissionRequest",
-    decision: { behavior: "allow", updatedInput: { ...toolInput, answers: map } },
+    decision: {
+      behavior: "allow",
+      updatedInput: Object.keys(annotations).length > 0
+        ? { ...toolInput, answers: map, annotations: { ...(toolInput.annotations as object | undefined), ...annotations } }
+        : { ...toolInput, answers: map },
+    },
   });
+}
+
+/** Whether an agent's `answerExtras` capability can carry these (normalized) extras: `true` takes both,
+ *  `"other"` (Codex, NOM-63) takes typed Other but never a note, absent takes neither. Per-question
+ *  eligibility for Other under `"other"` (the question's own isOther flag) is the caller's job. */
+export function answerExtrasAccepted(cap: true | "other" | undefined, other: string[], notes: string[]): boolean {
+  if (cap === true) return true;
+  if (notes.some((t) => t.length > 0)) return false;
+  return cap === "other" || other.every((t) => t.length === 0);
+}
+
+/** One NOM-54 extras array (`other` / `notes`), normalized to trimmed strings ("" = none). Absent →
+ *  all-empty. `undefined` = unrepresentable (not an array, wrong length, a non-string/non-null entry,
+ *  or a string over ANSWER_MAX — refused, never sliced, same rule as the answer itself). */
+export function extrasArray(value: unknown, length: number): string[] | undefined {
+  if (value === undefined || value === null) return Array.from({ length }, () => "");
+  if (!Array.isArray(value) || value.length !== length) return undefined;
+  const out: string[] = [];
+  for (const entry of value) {
+    if (entry === null || entry === undefined) { out.push(""); continue; }
+    if (typeof entry !== "string") return undefined;
+    const t = entry.trim();
+    if (t.length > ANSWER_MAX) return undefined;
+    out.push(t);
+  }
+  return out;
 }
 
 /** Map ONE question's answer string from the phone back onto that question's ORIGINAL option labels.
@@ -737,6 +811,12 @@ export interface PermissionQuestion {
   m?: boolean;
   o: string[];
   d?: string[];
+  /** NOM-59: option previews (markdown, or an HTML fragment), aligned with `o`; null = that option has
+   *  none. Single-select only, omitted when no option has one. Shed FIRST under budget pressure. */
+  p?: (string | null)[];
+  /** NOM-63: this question accepts free-text "Other" (the answer verb's `other[i]`). Set only for a Codex
+   *  question with isOther — Claude Code questions always accept Other and never carry it. */
+  x?: true;
 }
 
 /** Longest question text kept in the blob (display only — the answers map is keyed by the ORIGINAL,
@@ -756,6 +836,10 @@ const QUESTION_DESCRIPTION_MAX = 600;
  *  every description on the card — which is exactly what a wider ceiling would have made common. */
 const QUESTION_DESCRIPTION_LADDER = [400, 280, 200, 160, 120, 80];
 
+/** Longest option preview kept in the blob (NOM-59). Display only — the answer path echoes the ORIGINAL
+ *  preview from tool_input, never this capped copy (CC validates it strictly against the options). */
+const QUESTION_PREVIEW_MAX = 600;
+
 /** `questions` with every description re-capped at `max`. Positional alignment is untouched: an empty
  *  description stays empty, so `d` never stops lining up with `o`. */
 function withDescriptionCap(questions: PermissionQuestion[], max: number): PermissionQuestion[] {
@@ -773,11 +857,11 @@ export function capPermissionWireText(value: string, max: number): string {
 }
 
 /** One raw CC question, narrowed. */
-type RawQuestion = { question?: unknown; header?: unknown; multiSelect?: unknown; options?: unknown } | null;
+type RawQuestion = { question?: unknown; header?: unknown; multiSelect?: unknown; options?: unknown; isOther?: unknown } | null;
 
 /** A question CC sent that is both SHOWABLE and ANSWERABLE, with its ORIGINAL (untruncated) text,
  *  option labels, and positionally aligned descriptions. */
-interface UsableQuestion { text: string; raw: RawQuestion; labels: string[]; descriptions: string[] }
+interface UsableQuestion { text: string; raw: RawQuestion; labels: string[]; descriptions: string[]; previews: string[] }
 
 /** THE single question filter. `buildPermissionQuestions` (what the phone renders) and `answerLine`
  *  (what the phone's positional answers zip against) both derive from this list, so an entry skipped
@@ -792,12 +876,17 @@ interface UsableQuestion { text: string; raw: RawQuestion; labels: string[]; des
 function usableQuestions(toolInput: Record<string, unknown>): UsableQuestion[] {
   const qs = toolInput.questions;
   if (!Array.isArray(qs)) return [];
+  // NOM-60: CC's extended schema lets a question be `kind: "text" | "number"` — no option list to pick
+  // from. A picker covering only SOME of the questions would make the answers map partial, so ANY
+  // non-choice question drops the whole picker (the phone shows deny-only / answer at the Mac).
+  if (qs.some((q) => (q as { kind?: unknown } | null)?.kind !== undefined && (q as { kind?: unknown }).kind !== "choice")) return [];
   const out: UsableQuestion[] = [];
   for (const raw of qs as RawQuestion[]) {
     const text = typeof raw?.question === "string" ? raw.question : "";
     if (text.length === 0) continue;
     const labels: string[] = [];
     const descriptions: string[] = [];
+    const previews: string[] = [];
     if (Array.isArray(raw?.options)) {
       for (const opt of raw.options) {
         const label = (opt as { label?: unknown } | null)?.label;
@@ -805,11 +894,13 @@ function usableQuestions(toolInput: Record<string, unknown>): UsableQuestion[] {
           labels.push(label);
           const description = (opt as { description?: unknown } | null)?.description;
           descriptions.push(typeof description === "string" ? description : "");
+          const preview = (opt as { preview?: unknown } | null)?.preview;
+          previews.push(typeof preview === "string" ? preview : "");
         }
       }
     }
     if (labels.length === 0) continue;
-    out.push({ text, raw, labels, descriptions });
+    out.push({ text, raw, labels, descriptions, previews });
   }
   return out;
 }
@@ -829,7 +920,7 @@ function firstQuestionText(toolInput: Record<string, unknown>): string {
  *  is skipped rather than poisoning the hold. Truncation is display-only — `answerLine` re-maps the
  *  phone's echo back onto the ORIGINAL labels, so a capped label never reaches CC. */
 export function buildPermissionQuestions(toolInput: Record<string, unknown>): PermissionQuestion[] {
-  return usableQuestions(toolInput).map(({ text, raw, labels, descriptions }) => {
+  return usableQuestions(toolInput).map(({ text, raw, labels, descriptions, previews }) => {
     const wireDescriptions = descriptions.map((description) =>
       capPermissionWireText(description, QUESTION_DESCRIPTION_MAX)
     );
@@ -839,6 +930,12 @@ export function buildPermissionQuestions(toolInput: Record<string, unknown>): Pe
       ...(raw?.multiSelect === true ? { m: true } : {}),
       o: labels.map((l) => capPermissionWireText(l, PERMISSION_QUESTION_LABEL_MAX)),
       ...(wireDescriptions.some((description) => description.length > 0) ? { d: wireDescriptions } : {}),
+      // CC only renders previews for single-select questions, so a multi-select never carries `p`.
+      ...(raw?.multiSelect !== true && previews.some((pv) => pv.length > 0)
+        ? { p: previews.map((pv) => pv.length > 0 ? capPermissionWireText(pv, QUESTION_PREVIEW_MAX) : null) }
+        : {}),
+      // NOM-63: only renderableCodexUserInput carries isOther (Codex app-server questions); CC never does.
+      ...(raw?.isOther === true ? { x: true as const } : {}),
     };
   });
 }
@@ -887,10 +984,13 @@ export function fitPermissionDetail(
   // prompt when the field is absent. Candidates are measured WITH the worst-case
   // `permissionDetailOmitted`, so the chosen variant stays valid even on the drop-the-detail-entirely
   // branch below (where that key is present and the detail is not).
-  const bareQuestions = questions.map(({ d: _descriptions, ...question }) => question);
+  // NOM-59: previews are the LEAST essential field, so every preview goes before any description is cut.
+  const noPreviews = questions.map(({ p: _previews, ...question }) => question);
+  const bareQuestions = noPreviews.map(({ d: _descriptions, ...question }) => question);
   const candidates = questions.length === 0 ? [] : [
     questions,
-    ...QUESTION_DESCRIPTION_LADDER.map((max) => withDescriptionCap(questions, max)),
+    noPreviews,
+    ...QUESTION_DESCRIPTION_LADDER.map((max) => withDescriptionCap(noPreviews, max)),
     bareQuestions,
   ];
   const kept = candidates.find((candidate) => measure("", worstCase, candidate) <= maxChars) ?? [];
@@ -960,7 +1060,7 @@ function permissionFrame(
  *  terminal, so the hook would re-read the same unusable answer forever while the phone says "answered". */
 function emitDecision(
   agent: AgentKind,
-  answer: { decision?: unknown; message?: unknown; answers?: unknown },
+  answer: { decision?: unknown; message?: unknown; answers?: unknown; mode?: unknown; other?: unknown; notes?: unknown },
   toolName: string,
   toolInput: Record<string, unknown>,
   suggestions: unknown,
@@ -977,6 +1077,13 @@ function emitDecision(
       emit(allowAlwaysLine(agent, toolName, toolInput, suggestions));
       trace({ event: "emit", decision: agent === "codex" ? "allow_always_degraded_to_allow" : "allow_always" });
       return "emitted";
+    case "allow_mode":
+      // A mode we do not know is a verb we do not know: keep polling (bounded), never guess.
+      if (typeof answer.mode !== "string" || !ALLOW_MODES.has(answer.mode)) { trace({ event: "answer-unknown-decision" }); return "keep-polling"; }
+      if (isQuestion) { trace({ event: "release", reason: "bare-allow-on-question" }); return "released"; }
+      emit(allowModeLine(agent, toolName, toolInput, answer.mode));
+      trace({ event: "emit", decision: adapterFor(agent).allowMode ? "allow_mode" : "allow_mode_degraded_to_allow", mode: answer.mode });
+      return "emitted";
     case "deny":
       emit(denyLine(agent, answer.message));
       trace({ event: "emit", decision: "deny", hasMessage: typeof answer.message === "string" && answer.message.trim().length > 0 });
@@ -985,7 +1092,7 @@ function emitDecision(
       // The phone picked option(s) for an AskUserQuestion. An answer we cannot turn into a REAL answers
       // map — a non-question tool, a missing/!array/empty answers, or a piece that re-matches no option
       // label — emits NOTHING and releases the hold (see THE RELEASE RULE above).
-      const line = answerLine(agent, toolName, toolInput, answer.answers);
+      const line = answerLine(agent, toolName, toolInput, answer.answers, answer.other, answer.notes);
       if (line === undefined) { trace({ event: "release", reason: "answer-unmappable", tool_name: toolName }); return "released"; }
       emit(line); trace({ event: "emit", decision: "answer" }); return "emitted";
     }
@@ -1847,7 +1954,7 @@ export async function runPermissionHook(
      *  open), unchanged and identical on both channels. */
     const applyAnswerBlob = async (answerBlob: string, src: "worker" | "lan"): Promise<"done" | "keep-polling"> => {
       const answer = (await decryptBlob(config.e2eKey, answerBlob)) as
-        { requestId?: unknown; decision?: unknown; message?: unknown; answers?: unknown };
+        { requestId?: unknown; decision?: unknown; message?: unknown; answers?: unknown; mode?: unknown; other?: unknown; notes?: unknown };
       const match = answer.requestId === requestId;
       // A matched, KNOWN decision either emits one line ("emitted") or deliberately emits nothing and
       // lets the hold go ("released" — THE RELEASE RULE); both are DONE. A requestId MISMATCH is a

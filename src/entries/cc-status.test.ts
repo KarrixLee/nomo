@@ -2722,6 +2722,139 @@ describe("runHook label pinning (a mid-session cd must not rename the session)",
   }, 20000);
 });
 
+// --- runHook awaitingPrompt (the "session opened, no prompt yet" marker) -----------------------
+//
+// Claude Code has no idle hook: a SessionStart maps to "working" and only a Stop (which needs a turn) or
+// a SessionEnd retracts it, so a session resumed and left at the empty prompt showed "Running" until the
+// watchdog's 30-min idle reap. The hook stamps `awaitingPrompt` on a non-compact SessionStart and every
+// other hook's whole-record rewrite drops it; a source:"compact" SessionStart fires MID-turn and must
+// carry the previous value through untouched. Same faithful spawn-the-real-entry harness as above.
+describe("runHook awaitingPrompt (set by SessionStart, cleared by any other hook, preserved by compact)", () => {
+  const rawKey = new Uint8Array(32).fill(9);
+  const entry = join(import.meta.dir, "cc-status.ts");
+  const sid = "awaiting-prompt";
+
+  /** Runs each hook payload in order in ONE home and returns the record as it stood after each. */
+  async function runHooks(hooks: Record<string, unknown>[], seed?: Record<string, unknown>): Promise<SessionRecord[]> {
+    const home = await mkdtemp(join(tmpdir(), "cc-hook-awaiting-"));
+    try {
+      const ccDir = join(home, ".config", "cc-status");
+      await mkdir(join(ccDir, "sessions"), { recursive: true });
+      await writeFile(join(ccDir, "config.json"), JSON.stringify({
+        url: "http://127.0.0.1:9", pairingId: "p", pcSecret: "s", e2eKeyB64: b64url(rawKey),
+      }));
+      const recordPath = join(ccDir, "sessions", `${sid}.json`);
+      if (seed) await writeFile(recordPath, JSON.stringify({ pid: process.ppid, machine: "m", label: "l", ts: Date.now(), ...seed }));
+      const out: SessionRecord[] = [];
+      for (const hook of hooks) {
+        const proc = spawnTestProcess({
+          cmd: ["bun", entry],
+          env: isolatedTestEnv(home),
+          stdin: Buffer.from(JSON.stringify({ session_id: sid, cwd: "/x/api-status", transcript_path: "", ...hook })),
+          stdout: "ignore",
+          stderr: "ignore",
+        });
+        await proc.exited;
+        out.push(JSON.parse(await readFile(recordPath, "utf8")) as SessionRecord);
+      }
+      return out;
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  }
+
+  const resume = { hook_event_name: "SessionStart", source: "resume" };
+  const compact = { hook_event_name: "SessionStart", source: "compact" };
+
+  test("a resume SessionStart sets the marker", async () => {
+    const [rec] = await runHooks([resume]);
+    expect(rec).toMatchObject({ lastEvent: "sessionStart", op: "start", awaitingPrompt: true });
+  }, 20000);
+
+  for (const next of [
+    { hook_event_name: "UserPromptSubmit", prompt: "hi" },
+    { hook_event_name: "PreToolUse", tool_name: "Edit" },
+    { hook_event_name: "Stop" },
+  ]) {
+    test(`${next.hook_event_name} after the SessionStart clears it`, async () => {
+      const [start, after] = await runHooks([resume, next]);
+      expect(start.awaitingPrompt).toBe(true);
+      expect("awaitingPrompt" in after).toBe(false);
+    }, 20000);
+  }
+
+  test("a resume over a DONE record still sets it, though lastEvent reads working (not sessionStart)", async () => {
+    const [rec] = await runHooks([resume], { lastEvent: "done", op: "done", sentDone: true });
+    expect(rec).toMatchObject({ lastEvent: "working", op: "update", awaitingPrompt: true });
+  }, 20000);
+
+  // The marker may only ever describe a session that is NOT in a turn. A SessionStart landing on a
+  // record that is live-working (a second `claude --resume <same id>`, a mid-turn auto-compact) must
+  // not mark it, or the short reap could finish a real turn during a hook-quiet stretch.
+  test("a resume over a LIVE working record leaves it unset", async () => {
+    const [rec] = await runHooks([resume], { lastEvent: "working", op: "update" });
+    expect("awaitingPrompt" in rec).toBe(false);
+  }, 20000);
+
+  test("a compact SessionStart mid-turn (working record) leaves it unset", async () => {
+    const [rec] = await runHooks([compact], { lastEvent: "working", op: "update" });
+    expect("awaitingPrompt" in rec).toBe(false);
+  }, 20000);
+
+  test("a compact SessionStart over a DONE record (manual /compact at the idle prompt) sets it", async () => {
+    const [rec] = await runHooks([compact], { lastEvent: "done", op: "done", sentDone: true });
+    expect(rec).toMatchObject({ lastEvent: "working", awaitingPrompt: true });
+  }, 20000);
+
+  test("a compact SessionStart on a still-unprompted session (marker set) keeps it set", async () => {
+    const [rec] = await runHooks([compact], { lastEvent: "sessionStart", op: "start", awaitingPrompt: true });
+    expect(rec.awaitingPrompt).toBe(true);
+  }, 20000);
+
+  test("a compact SessionStart with NO record yet (plugin enabled mid-turn) leaves it unset", async () => {
+    const [rec] = await runHooks([compact]);
+    expect("awaitingPrompt" in rec).toBe(false);
+  }, 20000);
+
+  test("a daemon fork/replay SessionStart reusing its predecessor's row never marks it — even a done one", async () => {
+    const predecessor = "11111111-2222-3333-4444-555555555555";
+    const home = await mkdtemp(join(tmpdir(), "cc-hook-awaiting-fork-"));
+    try {
+      const ccDir = join(home, ".config", "cc-status");
+      await mkdir(join(ccDir, "sessions"), { recursive: true });
+      await writeFile(join(ccDir, "config.json"), JSON.stringify({
+        url: "http://127.0.0.1:9", pairingId: "p", pcSecret: "s", e2eKeyB64: b64url(rawKey),
+      }));
+      const recordPath = join(ccDir, "sessions", `${predecessor}.json`);
+      await writeFile(recordPath, JSON.stringify({
+        pid: process.ppid, machine: "m", label: "l", ts: 1, lastEvent: "done", op: "done", sentDone: true,
+      }));
+      // The hook's PARENT must carry the daemon's argv (adapter.forkResumePredecessor reads process.ppid's
+      // command line), so a tiny wrapper process stands in for that `claude --fork-session …` daemon.
+      const wrapper = join(home, "daemon.mjs");
+      await writeFile(wrapper, `
+const [entry, encoded] = process.argv.slice(2);
+const child = Bun.spawn({ cmd: ["bun", entry], env: process.env, stdin: Buffer.from(encoded, "base64"), stdout: "ignore", stderr: "ignore" });
+await child.exited;
+`);
+      const payload = { session_id: "99999999-2222-3333-4444-555555555555", hook_event_name: "SessionStart", source: "resume", cwd: "/x/api-status", transcript_path: "" };
+      const proc = spawnTestProcess({
+        cmd: ["bun", wrapper, entry, Buffer.from(JSON.stringify(payload)).toString("base64"),
+          "--fork-session", "--resume", `/x/${predecessor}.jsonl`, "--reply-on-resume"],
+        env: isolatedTestEnv(home),
+        stdout: "ignore",
+        stderr: "ignore",
+      });
+      await proc.exited;
+      const rec = JSON.parse(await readFile(recordPath, "utf8")) as SessionRecord;
+      expect(rec.ts).toBeGreaterThan(1); // the alias path really rewrote the predecessor's row…
+      expect("awaitingPrompt" in rec).toBe(false); // …without marking it
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  }, 20000);
+});
+
 // --- runHook gone-strike teardown (a revoked pairing must stop POSTing forever) -----------------
 //
 // The hook's POST path counts CONSECUTIVE "gone" responses (404 = pairing deleted, 410 = dormant-GC'd)

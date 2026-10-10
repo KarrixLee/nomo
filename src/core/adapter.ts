@@ -2167,6 +2167,21 @@ export interface AgentAdapter {
    *  session-state's LAN rollup — restate `record.planFull` only for an agent that declares this, and
    *  every Claude/Codex frame stays byte-identical to what it was. Absent = one-shot (the default). */
   ambientPlan?: true;
+  /** OPTIONAL (NOM-54): can this agent's decision line carry a session permission-MODE switch — the
+   *  phone's `allow_mode` verb, emitted as `updatedPermissions:[{type:"setMode", mode, destination:
+   *  "session"}]`? Claude Code only. Absent = the verb degrades to a PLAIN allow: Codex rejects the whole
+   *  decision when `updatedPermissions` is present, and OpenCode's reply mapper reads a non-empty
+   *  `updatedPermissions` as "always" — neither may ever see it. The phone mirrors this as
+   *  `CCAgent.supportsAllowMode`. */
+  allowMode?: true;
+  /** OPTIONAL (NOM-54): does this agent's question channel accept the `answer` verb's extras — free-text
+   *  "Other" (`other[]`) and per-question notes (`notes[]` → `annotations[q].notes`)? `true` = both
+   *  (Claude Code). `"other"` = free-text Other only, and only on a question the agent flagged as taking
+   *  it (the compact question's `x: true`) — Codex (NOM-63), whose app-server reply has no notes slot the
+   *  phone's notes could honestly map to. Absent = any NON-EMPTY extra releases the hold (answer at the
+   *  Mac) rather than being silently dropped; so does a non-empty note under `"other"`. The phone mirrors
+   *  this as `CCAgent.supportsAnswerExtras`. */
+  answerExtras?: true | "other";
   /** OPTIONAL: discover live sessions the hooks can't see yet — interactive TUIs for which NO
    *  SessionStart has fired. Called on every watchdog sweep with the already-tracked sessions (so their
    *  pids can be excluded). Claude OMITS it (its SessionStart fires at true session open, so there's
@@ -2192,6 +2207,8 @@ export interface AgentAdapter {
 
 export const claudeAdapter: AgentAdapter = {
   kind: "claude",
+  allowMode: true,
+  answerExtras: true,
   async title({ prefix, input, transcriptPath }): Promise<string | undefined> {
     // Freshest ai-title from the transcript TAIL, else the head's ai-title / first user prompt —
     // on a long session CC's newest ai-title sits near EOF, outside the head window entirely (see
@@ -2266,6 +2283,10 @@ export const claudeAdapter: AgentAdapter = {
 
 export const codexAdapter = {
   kind: "codex",
+  // NOM-63: free-text Other via the app-server bridge (codex-remote-input). NO allowMode, and "Always
+  // allow" stays a plain allow (NOM-62): Codex's PermissionRequest hook — the only path its command/patch
+  // approvals reach Nomo on — fails closed on `updatedPermissions`, so there is no session grant to send.
+  answerExtras: "other",
   async title({ sessionId, prefix, input }): Promise<string | undefined> {
     // PRIMARY: the clean AI-generated thread_name codex writes to session_index.jsonl ~30-40s in.
     // Re-read every hook (no memo) so a later hook UPGRADES an earlier prompt-derived fallback the
