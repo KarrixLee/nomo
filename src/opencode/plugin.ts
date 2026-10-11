@@ -30,8 +30,8 @@ import {
   ocDecisionRequest, OcDecisionRequest, ocPost, ocResolvedRequestId, ocResolveOnRelay, runOcApproval,
 } from "./approvals";
 import {
-  newOcState, ocAttentionFrame, ocEndFrames, ocForgetStatusFrame, OcFrame, OcState, postOcEvent,
-  reduceOcEvent,
+  newOcState, ocEndFrames, ocForgetStatusFrame, OcFrame, ocPromptAsked, ocPromptFrame, ocPromptHeld,
+  ocPromptResolved, ocPromptsEndedBy, OcState, postOcEvent, reduceOcEvent,
 } from "./state";
 
 /** The verified-live shape of OpenCode's `PluginInput` (1.18.15). Declared structurally rather than
@@ -216,16 +216,30 @@ const server = async (input: OpenCodePluginInput): Promise<OpenCodeHooks> => {
      *  is what makes the reject/always cascades resolvable (see ocResolveOnRelay). */
     const holds = new Map<string, string>();
 
+    /** Repaint a session's ROOT row from the pending-prompt registry: needsAttention while a prompt is
+     *  up, working again once the last one is gone. Called on every edge (asked, replied, hold ended)
+     *  and it READS the answer each time, so no edge has to know what the others did. Paints nothing
+     *  while a hold's card owns the row — see ocPromptHeld. `workingOnly` is for the one caller that
+     *  must never repaint attention (the hold's exit, below). */
+    const repaint = (sessionID: string, workingOnly = false): Promise<void> => {
+      const frame = ocPromptFrame(ctx.state, sessionID);
+      if (!frame || (workingOnly && frame.status !== "working")) return Promise.resolve();
+      return enqueue(() => send(ctx, frame));
+    };
+
     /** Start ONE hold, detached. Deliberately NOT on `enqueue`: a hold is unbounded by design (the
      *  phone owns the dialog), and putting it on the send chain would freeze every session frame on
      *  this server behind one unanswered prompt. */
     const hold = (request: OcDecisionRequest): void => {
-      // A subagent's prompt is not human-facing here — its session is filtered out of the phone's
-      // rows entirely, so a card for it would be answerable against a row the user cannot see. Same
-      // policy as the Claude hook's `agent_id` subagent pass-through.
-      if (!canReply || ctx.state.children.has(request.sessionID) || holds.has(request.id)) return;
+      if (holds.has(request.id)) return;
+      // A SUBAGENT's prompt is SHOWN, not held: its root row goes needsAttention ("answer at your
+      // Mac") instead of sitting on working while OpenCode waits on a human. It gets no Allow/Deny
+      // card — the hold machinery (marker, record, settle) is keyed by the session that asked, and
+      // that session has no row. The same plain attention covers a server we have no reply route to.
+      if (!canReply || ctx.state.children.has(request.sessionID)) { void repaint(request.sessionID); return; }
       const requestId = crypto.randomUUID();
       holds.set(request.id, requestId);
+      ocPromptHeld(ctx.state, request.id, true);
       void runOcApproval(request, {
         config: ctx.config,
         client: input?.client,
@@ -235,11 +249,26 @@ const server = async (input: OpenCodePluginInput): Promise<OpenCodeHooks> => {
         // The local no-hold escape hatch: report the session as blocked on the user and let OpenCode's
         // own dialog take it, exactly like the hooks' fire-and-forget delegate.
         delegate: async () => {
-          const attention = ocAttentionFrame(ctx.state, request.sessionID, undefined);
-          if (attention) await enqueue(() => send(ctx, attention));
+          ocPromptHeld(ctx.state, request.id, false); // paused = no card, so the row is ours to paint
+          await repaint(request.sessionID);
         },
-      }).catch(() => { /* runOcApproval swallows everything; this is the belt */ })
-        .finally(() => { holds.delete(request.id); });
+      }).catch(() => false /* runOcApproval swallows everything; this is the belt */)
+        .then((answered) => {
+          holds.delete(request.id);
+          ocPromptHeld(ctx.state, request.id, false);
+          // AN UNANSWERED EXIT RE-SEALS THE RECORD AS needsAttention (runPermissionHook's settle), up
+          // to one poll (~3 s) AFTER the `permission.replied` that already repainted the row working
+          // when the user answered at the Mac — a stale yellow the watchdog/LAN feed would then
+          // re-ship. So re-assert working here if that is what the registry says. Never attention:
+          // the settle already wrote it, with its `reconnecting` marker when the hold gave up.
+          if (!answered) void repaint(request.sessionID, true);
+        });
+    };
+
+    /** A prompt is over (replied, its tool finished, its session ended): forget it and repaint. */
+    const settle = (opencodeId: string): void => {
+      const root = ocPromptResolved(ctx.state, opencodeId);
+      if (root !== undefined) void repaint(root);
     };
 
     /** OpenCode resolved a request without us — the user answered at the Mac, or a reject/always
@@ -258,11 +287,20 @@ const server = async (input: OpenCodePluginInput): Promise<OpenCodeHooks> => {
           // `permission.asked` nor `question.asked` is a session frame — each opens a hold that POSTs
           // its own decisionPending frame on a different route entirely.
           const request = ocDecisionRequest(event);
-          if (request) { hold(request); return; }
+          if (request) { ocPromptAsked(ctx.state, event); hold(request); return; }
           const resolved = ocResolvedRequestId(event);
-          if (resolved) { retire(resolved); return; }
+          if (resolved) { retire(resolved); settle(resolved); return; }
           const frame = reduceOcEvent(ctx.state, event);
-          if (frame) await enqueue(() => send(ctx, frame));
+          // AFTER the reducer (a turn end plans its done first, and then there is nothing to repaint)
+          // and BEFORE the await (state must be folded in arrival order; sends are ordered by the chain).
+          const sent = frame ? enqueue(() => send(ctx, frame)) : undefined;
+          for (const ended of ocPromptsEndedBy(ctx.state, event)) {
+            // Only a finished TOOL retires a card: that is per-call proof the request is gone. A turn
+            // end just stops the prompt muting the row — a hold is never taken down on inference.
+            if (ended.byTool) retire(ended.id);
+            settle(ended.id);
+          }
+          await sent;
         } catch { /* one malformed event must never break the firehose */ }
       },
       dispose: async () => {
