@@ -1363,7 +1363,7 @@ describe("codexLastTurnEvent + tailShowsInterrupt (agent-parametrized marker)", 
     expect(tailShowsInterrupt(ev("task_complete"), "codex")).toBe(false);
     expect(tailShowsInterrupt([ev("turn_aborted"), ev("task_started")].join("\n"), "codex")).toBe(false);
     // Claude path is unchanged: its assistant line carrying the marker still triggers.
-    const claudeTail = asstTurn("[Request interrupted by user]");
+    const claudeTail = userTurn("[Request interrupted by user]");
     expect(tailShowsInterrupt(claudeTail, "claude")).toBe(true);
     expect(tailShowsInterrupt(asstTurn("still working"), "claude")).toBe(false);
     // Cross-agent guard: a codex tail read with the claude marker (no user/assistant line) → false.
@@ -2526,7 +2526,7 @@ describe("buildProvisionalRecord stamps the sealing pairing", () => {
 //   * past the cap   → pin done LOCALLY so the every-sweep flap ends (the worker's eviction resolves it).
 
 describe("correctInterrupt (settle an interrupted session — the done pin sticks, retry is bounded)", () => {
-  const interruptTail = asstTurn("[Request interrupted by user]");
+  const interruptTail = userTurn("[Request interrupted by user]");
   const attn = (over: Partial<SessionRecord> = {}): SessionRecord =>
     irec({ lastEvent: "needsAttention", op: "update", prio: 1, blob: "ATTN", transcript: "/tmp/t.jsonl", ...over });
   const NOW = 9_000_000;
@@ -2635,7 +2635,7 @@ describe("live-decision-hold gate: no op:done corrective may land while an appro
   const cleared = { readDecisionHoldFn: async () => null, holdPidAliveFn: () => true };
 
   describe("correctInterrupt (the prime producer: a needsAttention record + an interrupt marker)", () => {
-    const interruptTail = asstTurn("[Request interrupted by user]");
+    const interruptTail = userTurn("[Request interrupted by user]");
     const attn = (over: Partial<SessionRecord> = {}): SessionRecord =>
       irec({ lastEvent: "needsAttention", op: "update", prio: 1, blob: "ATTN", transcript: "/tmp/t.jsonl", ...over });
     const seams = (extra: object) => ({
@@ -3532,7 +3532,7 @@ describe("retireDoneStale re-reads before it deletes (a woken session is never r
 // bound at zero forever — one doomed done POST every 5 s, indefinitely.
 describe("corrective-done retries stay bounded even when EVERY record write fails", () => {
   const NOW = 9_000_000;
-  const interruptTail = asstTurn("[Request interrupted by user]");
+  const interruptTail = userTurn("[Request interrupted by user]");
 
   test("correctInterrupt: a never-persisting counter still hits the cap (memory-backed bound)", async () => {
     let posts = 0;

@@ -104,7 +104,7 @@ async function sha256Hex(s) {
 }
 
 // src/core/shared.ts
-var PLUGIN_VERSION = "2.2.2";
+var PLUGIN_VERSION = "2.2.3";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -1714,7 +1714,7 @@ async function codexSessionModel(input, prefix, transcriptPath, home = codexHome
     return;
   }
 }
-var INTERRUPT_MARKER = "interrupted by user";
+var INTERRUPT_MARKER = "[Request interrupted by user";
 var CODEX_TURN_EVENTS = new Set(["task_started", "task_complete", "turn_aborted"]);
 var CODEX_ABORT_EVENT = "turn_aborted";
 function lastTurnLine(text) {
@@ -1739,7 +1739,23 @@ function lastTurnLine(text) {
   return null;
 }
 function hasInterruptMarker(line) {
-  return line.includes(INTERRUPT_MARKER);
+  let row;
+  try {
+    row = JSON.parse(line);
+  } catch {
+    return false;
+  }
+  if (typeof row !== "object" || row === null)
+    return false;
+  if (row.type !== "user")
+    return false;
+  const message = row.message;
+  const content = typeof message === "object" && message !== null ? message.content : message;
+  const texts = Array.isArray(content) ? content.map((part) => {
+    const p = part;
+    return p !== null && typeof p === "object" && p.type === "text" ? p.text : undefined;
+  }) : [content];
+  return texts.some((t) => typeof t === "string" && t.trimStart().startsWith(INTERRUPT_MARKER));
 }
 function codexLastTurnEvent(text) {
   const lines = text.split(`
@@ -2013,6 +2029,9 @@ var CLAUDE_DESKTOP_BUNDLED_PATH_PARTS = [
   "/claude.app/Contents/MacOS/claude"
 ];
 var CLAUDE_DESKTOP_LAUNCHER = "Claude.app/Contents/Helpers/disclaimer";
+function cursorHostInvocation(input, env = process.env) {
+  return env.CURSOR_VERSION !== undefined || typeof input === "object" && input !== null && "cursor_version" in input;
+}
 function claudeDesktopInvocation(selfArgs, ancestorArgs, entrypoint) {
   if (entrypoint === CLAUDE_DESKTOP_ENTRYPOINT)
     return true;
@@ -2790,7 +2809,7 @@ function adapterFor(agent) {
 var allAdapters = [claudeAdapter, codexAdapter];
 
 // src/entries/status-cmd.ts
-var CODEX_PLUGIN_HOOK_COUNT = 7;
+var CODEX_PLUGIN_HOOK_COUNT = 10;
 var AGENT_UI = {
   claude: { name: "Claude Code", pair: "/nomo-cc:pair", approvalsOn: "/nomo-cc:approvals on", status: "/nomo-cc:status" },
   codex: { name: "Codex", pair: "$nomo-pair", approvalsOn: "$nomo-approvals on", status: "$nomo-status" },

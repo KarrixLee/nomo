@@ -1328,7 +1328,7 @@ function defaultStampDetailFull(): (sessionId: string, detailFull: string | unde
 /** The hold-marker writer/clearer, under the SAME test guard and for the same reason as
  *  defaultStampDetailFull: a unit test must never stamp (or, worse, clear) a marker in the developer's
  *  live session store. Tests that exercise the hold inject `writeHoldFn` / `clearHoldFn`. */
-function defaultWriteHold(): (sessionId: string, hold: DecisionHold) => Promise<void> {
+export function defaultWriteHold(): (sessionId: string, hold: DecisionHold) => Promise<void> {
   return lanRunningUnderTest() ? async () => { /* never touch real records from a test */ } : writeDecisionHold;
 }
 

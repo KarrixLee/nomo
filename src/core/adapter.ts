@@ -538,6 +538,9 @@ export function hasInterruptMarker(line: string): boolean {
   let row: unknown;
   try { row = JSON.parse(line); } catch { return false; }
   if (typeof row !== "object" || row === null) return false;
+  // Claude Code writes the marker as a `user` row; an assistant reply that merely OPENS with the phrase
+  // (explaining it, quoting a transcript) is not an interrupt.
+  if ((row as Record<string, unknown>).type !== "user") return false;
   const message = (row as Record<string, unknown>).message;
   const content = typeof message === "object" && message !== null
     ? (message as Record<string, unknown>).content

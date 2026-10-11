@@ -796,7 +796,7 @@ describe("findProvisionalForPid (reconcile pid matcher)", () => {
 
 describe("detectInterrupt", () => {
   test("claude keys on the interrupt marker in the last turn line", () => {
-    expect(claudeAdapter.detectInterrupt(`{"type":"assistant","message":"[Request interrupted by user]"}`)).toBe(true);
+    expect(claudeAdapter.detectInterrupt(`{"type":"user","message":"[Request interrupted by user]"}`)).toBe(true);
     expect(claudeAdapter.detectInterrupt(`{"type":"assistant","message":"all done"}`)).toBe(false);
     expect(claudeAdapter.detectInterrupt("")).toBe(false);
   });
@@ -2145,6 +2145,12 @@ describe("hasInterruptMarker (parsed, never inside a tool block)", () => {
     expect(hasInterruptMarker(line("assistant", [{
       type: "tool_use", id: "toolu_2", name: "Grep", input: { pattern: "[Request interrupted by user" },
     }]))).toBe(false);
+  });
+  test("false on an ASSISTANT row that opens with the phrase — only Claude Code's own `user` row is the marker", () => {
+    expect(hasInterruptMarker(line("assistant", [{ type: "text", text: "[Request interrupted by user] is the marker Claude Code writes." }]))).toBe(false);
+    expect(hasInterruptMarker(line("assistant", "[Request interrupted by user]"))).toBe(false);
+    expect(hasInterruptMarker(JSON.stringify({ message: { content: "[Request interrupted by user]" } }))).toBe(false);
+    expect(claudeAdapter.detectInterrupt(line("assistant", [{ type: "text", text: "[Request interrupted by user for tool use]" }]))).toBe(false);
   });
   test("false when prose merely mentions the phrase mid-text", () => {
     expect(hasInterruptMarker(line("assistant", [{ type: "text", text: "The turn was interrupted by user action earlier." }]))).toBe(false);
