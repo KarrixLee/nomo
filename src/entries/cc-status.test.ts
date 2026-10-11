@@ -10,7 +10,7 @@ import {
 } from "../core/shared";
 import {
   aiTitle, buildBlob, buildEnvelope, buildPendingStash, cleanPromptTitle, clearsInterruptFlag, codexIndexTitle, codexSessionTitle,
-  codexThreadName, detailForHook, firstUserPrompt, INTERRUPT_STOP_REASON, interruptHookOutput, isPermissionNotification, planOp, sessionTitle,
+  codexThreadName, detailForHook, firstUserPrompt, INTERRUPT_STOP_REASON, interruptedEventInput, interruptHookOutput, isPermissionNotification, planOp, sessionTitle,
   markDoneDeliveredAt, SESSION_TRACE_PATH, stashPendingEvent, trackSessionAt, transcriptStartMs,
 } from "./cc-status";
 import { provisionalsCoveredByReal, reconcileProvisionalsSweep } from "./cc-watchdog";
@@ -3531,5 +3531,23 @@ describe("interrupt: what the status hook tells Claude Code when the phone asked
 
   test("an interrupted tool event is reported exactly like Stop — Claude Code fires no Stop hook after a hook-stopped turn", () => {
     expect(planOp("Stop", { tool_name: "Bash" }, false)).toEqual({ op: "done", prio: 0, status: "done" });
+  });
+
+  test("the blob an interrupted tool event seals IS the blob a real Stop seals — done, with no working detail left on it", () => {
+    const plan = { op: "done", prio: 0, status: "done" } as const;
+    const stop = buildBlob({ session_id: "s", cwd: "/Users/x/api-status", hook_event_name: "Stop" }, "Mac", "t", plan);
+    expect(stop).not.toHaveProperty("detail");
+    for (const hook_event_name of ["PreToolUse", "PostToolUse"]) {
+      const input = { session_id: "s", cwd: "/Users/x/api-status", hook_event_name, tool_name: "Bash", tool_input: { command: "sleep 600" } };
+      // Bracket: the raw tool event really does carry a working detail, so the equality below is the remap's doing.
+      expect(buildBlob(input, "Mac", "t", plan).detail).toBeDefined();
+      expect(buildBlob(interruptedEventInput(input), "Mac", "t", plan)).toEqual(stop);
+    }
+  });
+
+  test("the remap changes the event name and nothing else (the session id still addresses the same row)", () => {
+    const input = { session_id: "s", cwd: "/x", hook_event_name: "PreToolUse", tool_name: "Bash" };
+    expect(interruptedEventInput(input)).toEqual({ ...input, hook_event_name: "Stop" });
+    expect(input.hook_event_name).toBe("PreToolUse");
   });
 });

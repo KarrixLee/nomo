@@ -136,6 +136,13 @@ export function clearsInterruptFlag(hookName: string): boolean {
   return hookName === "UserPromptSubmit" || hookName === "Stop" || hookName === "SessionEnd";
 }
 
+/** The event an interrupted tool hook is reported AS. Claude Code fires no Stop after a hook-stopped
+ *  turn, so the event that stopped it stands in for one — for the plan AND for the blob, which reads
+ *  the event name itself (detailForHook) and would otherwise seal a done still labelled with the tool. */
+export function interruptedEventInput(input: Record<string, unknown>): Record<string, unknown> {
+  return { ...input, hook_event_name: "Stop" };
+}
+
 /// The LOCAL op planner (the worker is now blind — lifecycle semantics live here). Maps a hook to a
 /// v2 op, its delivery prio, and the semantic status carried in the blob:
 ///   SessionStart                                → start,  prio 0, working
@@ -1018,6 +1025,8 @@ export async function runHook(agent: AgentKind): Promise<void> {
     // for the watchdog's net to find — so the event that stops the turn must report the done itself.
     // The flag is not consumed, so the PostToolUse events of tool calls already in the same message
     // take this path too and cannot flip the row back to working.
+    // `eventInput` is what buildEnvelope seals; `hookName` keeps the TRUE event for the traces below.
+    if (interrupted) eventInput = interruptedEventInput(eventInput);
     let plan = planOp(interrupted ? "Stop" : hookName, input, sentDone);
     if (!plan) return;
     // Some clients can remain blocked on USER input after the model turn itself completes. The
