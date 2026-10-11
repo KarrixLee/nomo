@@ -93,17 +93,24 @@ export function detailForHook(hookName: string, toolName?: string, toolInput?: u
 /// agent_completed, the quota_auto_resume_* family, …) and their free-text messages can say "allow" or
 /// "permission" without anyone being asked anything. The message sniff survives ONLY as the fallback
 /// for a payload with no type at all (a Claude Code predating the field).
+///
+/// `worker_permission_prompt` is the same prompt raised on behalf of a teammate/worker agent ("<name>
+/// needs permission for <tool>", "<name> needs network access to <host>") — the lead session is the one
+/// blocked on the user, so it counts.
 export function isPermissionNotification(i: Record<string, unknown>): boolean {
   const type = typeof i.notification_type === "string" ? i.notification_type : "";
-  if (type.length > 0) return type === "permission_prompt";
+  if (type.length > 0) return type === "permission_prompt" || type === "worker_permission_prompt";
   const msg = (typeof i.message === "string" ? i.message : "").toLowerCase();
   return msg.includes("permission") || msg.includes("approve") || msg.includes("allow");
 }
 
-/// The Notification twins of the `Elicitation` hook: an MCP server's form / browser-URL request has
-/// sat unanswered ~6 s. Same meaning as the hook (blocked on the user), so the same needsAttention —
-/// a backstop for a dropped Elicitation hook, never an answerable approval.
-const ELICITATION_NOTIFICATIONS = new Set(["elicitation_dialog", "elicitation_url_dialog"]);
+/// The Notification types that mean "blocked on the user" WITHOUT being a permission prompt — the
+/// notify-only needsAttention, never an answerable approval:
+///   - the twins of the `Elicitation` hook: an MCP server's form / browser-URL request has sat
+///     unanswered ~6 s (a backstop for a dropped Elicitation hook);
+///   - `agent_needs_input`: a dialog only the user can dismiss (teammate setup, the auto-mode billing
+///     notice) or a background agent of this session that is blocked on input.
+const ATTENTION_NOTIFICATIONS = new Set(["elicitation_dialog", "elicitation_url_dialog", "agent_needs_input"]);
 
 /// Does a `Stop` payload say a background SUBAGENT is still running? Claude Code's Stop carries
 /// `background_tasks` ("in-flight" tasks, each with a `type` label and a `status`) precisely so a hook
@@ -111,29 +118,40 @@ const ELICITATION_NOTIFICATIONS = new Set(["elicitation_dialog", "elicitation_ur
 /// counts: a background `shell` (a dev server, `tail -f`) or a `monitor` can outlive the session's
 /// usefulness forever and would pin the row working, whereas a subagent ends and REPORTS BACK — which
 /// fires UserPromptSubmit and then a fresh Stop with the list re-evaluated, so the row still reaches
-/// done. Strict on `status` too: an unknown status reads as "not running" and keeps the old done.
+/// done. Strict on `status` too: Claude Code lists a task while its status is `running` or `pending`
+/// (registered, not started yet — it will run and report back just the same; read off the 2.1.296
+/// binary's own in-flight filter), and anything else reads as "not in flight" and keeps the old done.
 function hasRunningBackgroundAgent(input: Record<string, unknown>): boolean {
   const tasks = input.background_tasks;
   return Array.isArray(tasks) && tasks.some((t) => {
     const task = t as Record<string, unknown> | null;
-    return typeof task === "object" && task !== null && task.type === "subagent" && task.status === "running";
+    return typeof task === "object" && task !== null && task.type === "subagent"
+      && (task.status === "running" || task.status === "pending");
   });
 }
 
-/// The NOM-67 events — every one of them added long after the approval hold existed — YIELD to a live
-/// hold instead of writing over it. While a PermissionRequest hook is blocked on the phone, that card is
-/// the truth about the session (see stateHoldLive); a compaction notice, a failed parallel tool, an MCP
-/// form or an API-error stop from elsewhere in the same session must not take the row back, because the
-/// worker clears its decision overlay on any prio:0/done frame and the answerable card is then gone for
-/// good. Same rule, same three inputs, as the watchdog's corrective gate (decisionHoldIsLive). The
-/// pre-existing events are deliberately NOT in here — their behaviour under a hold is unchanged.
+/// The MID-TURN NOM-67 events — every one of them added long after the approval hold existed — YIELD to
+/// a live hold instead of writing over it. While a PermissionRequest hook is blocked on the phone, that
+/// card is the truth about the session (see stateHoldLive); a compaction notice, a failed parallel tool
+/// or an MCP form from elsewhere in the same session must not take the row back, because the worker
+/// clears its decision overlay on any prio:0 frame and the answerable card is then gone for good. Same
+/// rule, same three inputs, as the watchdog's corrective gate (decisionHoldIsLive). The pre-existing
+/// events are deliberately NOT in here — their behaviour under a hold is unchanged.
+///
+/// THE TURN ENDS ARE NOT IN HERE EITHER: StopFailure and Interrupt behave exactly like plain Stop. The
+/// main thread cannot end its turn while its own permission prompt is genuinely open, so a turn end
+/// arriving under a "live" hold means the hold is an orphan and done is the truth. Yielding there left a
+/// dead card up (Codex Esc with a card on the phone — and the watchdog's interrupt net is hold-gated too,
+/// so nothing else would say so) or a row stuck working until the idle reap. Their done takes the card
+/// down the same way Stop's does: the worker supersedes a pending decision on a hook `done`, and the LAN
+/// state ranks a done record above a live hold.
 const HOLD_YIELDING_EVENTS = new Set([
-  "StopFailure", "PostToolUseFailure", "PreCompact", "PostCompact", "Elicitation", "ElicitationResult", "Interrupt",
+  "PostToolUseFailure", "PreCompact", "PostCompact", "Elicitation", "ElicitationResult",
 ]);
 export function yieldsToLiveHold(hookName: string, input: Record<string, unknown>): boolean {
   if (HOLD_YIELDING_EVENTS.has(hookName)) return true;
   if (hookName === "Stop") return hasRunningBackgroundAgent(input);       // the new working-not-done Stop
-  if (hookName === "Notification") return !isPermissionNotification(input); // the elicitation twins
+  if (hookName === "Notification") return !isPermissionNotification(input); // the notify-only attention types
   return false;
 }
 
@@ -172,7 +190,7 @@ const USER_BLOCKING_TOOLS = new Set(["AskUserQuestion", "ExitPlanMode", "request
 ///   Elicitation (+ its Notification twins)      → update, prio 1, needsAttention
 ///   ElicitationResult                           → update, prio 0, working
 ///   PreCompact / PostCompact (auto)             → update, prio 0, working
-///   PostCompact (manual)                        → done,   prio 0, done
+///   PreCompact / PostCompact (manual)           → (no frame)
 ///   SessionEnd                                  → end,    prio 0, done
 /// Re-arm: a SessionStart AFTER an op:done was sent for this session (sentDone) restarts as a fresh
 /// `update`/working — the session already exists in the worker, so it's an update, not a new start.
@@ -203,7 +221,7 @@ export function planOp(hookName: string, input: Record<string, unknown>, sentDon
     case "Notification":
       // Drop the idle-waiting Notification so it can't masquerade as "needs help".
       if (!isPermissionNotification(input) &&
-          !(typeof input.notification_type === "string" && ELICITATION_NOTIFICATIONS.has(input.notification_type))) return null;
+          !(typeof input.notification_type === "string" && ATTENTION_NOTIFICATIONS.has(input.notification_type))) return null;
       return { op: "update", prio: 1, status: "needsAttention" };
     case "PermissionRequest":
     // An MCP server asking the user for input mid-tool: blocked on the user, like a permission prompt —
@@ -213,14 +231,14 @@ export function planOp(hookName: string, input: Record<string, unknown>, sentDon
     case "ElicitationResult":
       return { op: "update", prio: 0, status: "working" };
     case "PreCompact":
-      // Compaction is a minute of hook silence that otherwise reads as a stalled row.
-      return { op: "update", prio: 0, status: "working" };
     case "PostCompact":
-      // A MANUAL compact runs at the idle prompt: no turn follows it, so "working" would never be
-      // retracted. An auto compact is mid-turn and the turn carries on.
-      return input.trigger === "manual"
-        ? { op: "done", prio: 0, status: "done" }
-        : { op: "update", prio: 0, status: "working" };
+      // An AUTO compaction is mid-turn: a minute of hook silence that otherwise reads as a stalled row,
+      // and the turn carries on after it. A MANUAL `/compact` runs at the idle prompt and says NOTHING:
+      // cancelled or failed it fires no PostCompact, so a working raised here would sit on a finished row
+      // until the 30-minute idle reap; completed, a working-then-done pair is indistinguishable to the
+      // worker from a real turn and buzzes "Task finished" for a compact. The SessionStart source:"compact"
+      // that follows a completed one already settles the idle-prompt row (see awaitingPrompt in runHook).
+      return input.trigger === "manual" ? null : { op: "update", prio: 0, status: "working" };
     case "Stop":
       // The main agent stopped but a background subagent it launched has not: still working. That
       // subagent's report-back fires UserPromptSubmit and then another Stop, which lands the done.
@@ -1075,7 +1093,7 @@ export async function runHook(agent: AgentKind): Promise<void> {
     let attentionKind: "userInput" | undefined;
     let proposedPlan: string | undefined;
     let pickerClassifier = plan.op === "done" ? "none" : plan.status;
-    // Stop ONLY: an interrupted turn (Interrupt) or a manual compact never ends on a Plan picker.
+    // Stop ONLY: an interrupted turn (Interrupt) never ends on a Plan picker.
     if (hookName === "Stop" && plan.op === "done" && adapter.completedTurnWaitState) {
       const evidence = adapter.completedTurnWaitEvidence
         ? await adapter.completedTurnWaitEvidence({ pid: hookPid, transcriptPath })

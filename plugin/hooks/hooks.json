@@ -31,13 +31,13 @@
       { "matcher": "*", "hooks": [{ "type": "command", "command": "NOMOR=\"${CLAUDE_PLUGIN_ROOT}\"; NOMOS=\"$HOME/.config/cc-status/hook-shim.sh\"; [ -n \"$NOMOR\" ] && [ -x \"$NOMOR/scripts/run.sh\" ] && exec \"$NOMOR/scripts/run.sh\" \"$NOMOR/dist/cc-status.mjs\"; [ -x \"$NOMOS\" ] && exec \"$NOMOS\" cc-status; exit 0" }] }
     ],
     "PreCompact": [
-      { "hooks": [{ "type": "command", "command": "NOMOR=\"${CLAUDE_PLUGIN_ROOT}\"; NOMOS=\"$HOME/.config/cc-status/hook-shim.sh\"; [ -n \"$NOMOR\" ] && [ -x \"$NOMOR/scripts/run.sh\" ] && exec \"$NOMOR/scripts/run.sh\" \"$NOMOR/dist/cc-status.mjs\"; [ -x \"$NOMOS\" ] && exec \"$NOMOS\" cc-status; exit 0" }] }
+      { "hooks": [{ "type": "command", "command": "NOMOR=\"${CLAUDE_PLUGIN_ROOT}\"; NOMOS=\"$HOME/.config/cc-status/hook-shim.sh\"; [ -n \"$NOMOR\" ] && [ -x \"$NOMOR/scripts/run.sh\" ] && exec \"$NOMOR/scripts/run.sh\" \"$NOMOR/dist/cc-status.mjs\"; [ -x \"$NOMOS\" ] && exec \"$NOMOS\" cc-status; exit 0", "timeout": 10 }] }
     ],
     "PostCompact": [
       { "hooks": [{ "type": "command", "command": "NOMOR=\"${CLAUDE_PLUGIN_ROOT}\"; NOMOS=\"$HOME/.config/cc-status/hook-shim.sh\"; [ -n \"$NOMOR\" ] && [ -x \"$NOMOR/scripts/run.sh\" ] && exec \"$NOMOR/scripts/run.sh\" \"$NOMOR/dist/cc-status.mjs\"; [ -x \"$NOMOS\" ] && exec \"$NOMOS\" cc-status; exit 0" }] }
     ],
     "Elicitation": [
-      { "hooks": [{ "type": "command", "command": "NOMOR=\"${CLAUDE_PLUGIN_ROOT}\"; NOMOS=\"$HOME/.config/cc-status/hook-shim.sh\"; [ -n \"$NOMOR\" ] && [ -x \"$NOMOR/scripts/run.sh\" ] && exec \"$NOMOR/scripts/run.sh\" \"$NOMOR/dist/cc-status.mjs\"; [ -x \"$NOMOS\" ] && exec \"$NOMOS\" cc-status; exit 0" }] }
+      { "hooks": [{ "type": "command", "command": "NOMOR=\"${CLAUDE_PLUGIN_ROOT}\"; NOMOS=\"$HOME/.config/cc-status/hook-shim.sh\"; [ -n \"$NOMOR\" ] && [ -x \"$NOMOR/scripts/run.sh\" ] && exec \"$NOMOR/scripts/run.sh\" \"$NOMOR/dist/cc-status.mjs\"; [ -x \"$NOMOS\" ] && exec \"$NOMOS\" cc-status; exit 0", "timeout": 10 }] }
     ],
     "ElicitationResult": [
       { "hooks": [{ "type": "command", "command": "NOMOR=\"${CLAUDE_PLUGIN_ROOT}\"; NOMOS=\"$HOME/.config/cc-status/hook-shim.sh\"; [ -n \"$NOMOR\" ] && [ -x \"$NOMOR/scripts/run.sh\" ] && exec \"$NOMOR/scripts/run.sh\" \"$NOMOR/dist/cc-status.mjs\"; [ -x \"$NOMOS\" ] && exec \"$NOMOS\" cc-status; exit 0" }] }
