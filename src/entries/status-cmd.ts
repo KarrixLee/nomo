@@ -45,8 +45,10 @@ import {
  *  stamp, exactly as before. */
 
 /** Native Codex plugin hook declarations in plugin/hooks/codex-hooks.json. Keep the status denominator
- *  in lockstep with the manifest; SessionEnd is the seventh entry and records terminal history. */
-const CODEX_PLUGIN_HOOK_COUNT = 7;
+ *  in lockstep with the manifest; SessionEnd is the seventh entry and records terminal history, and
+ *  PreCompact / PostCompact / Interrupt (NOM-67) make ten. An install that trusted the first seven
+ *  reads 7/10 until the user re-opens /hooks — Codex skips a new hook until it is trusted. */
+const CODEX_PLUGIN_HOOK_COUNT = 10;
 
 export interface StatusDeps {
   print?: (line: string) => void;
@@ -215,7 +217,7 @@ export function countCodexHookEvents(raw: string): number {
  *                 with no `enabled` key is enabled by default).
  *    - trusted:   how many `[hooks.state."nomo@…"]` section headers exist — Codex writes one (with a
  *                 trusted_hash) per hook it has trust-reviewed, so this is the N-of-CODEX_PLUGIN_HOOK_COUNT
- *                 (7 since SessionEnd) trusted count — NOT the legacy config-layer hooks.json's 6.
+ *                 (10 since NOM-67) trusted count — NOT the legacy config-layer hooks.json's 6.
  *    - ccTrusted: how many `[hooks.state."nomo-cc@…"]` section headers exist — Codex auto-discovers the
  *                 CLAUDE plugin (nomo-cc, hooks/hooks.json) and lets you trust ITS hooks too; when both
  *                 this and `trusted` are >0 every Codex event runs BOTH plugins' hooks (double-fire). */

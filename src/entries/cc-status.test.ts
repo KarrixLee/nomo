@@ -25,12 +25,12 @@ const KEY_API_STATUS = folderKeyFromCwd("/Users/x/api-status");
 const { spawnTestProcess } = createProcessHygiene();
 
 describe("native Codex hook manifest", () => {
-  test("registers all seven lifecycle hooks, including bounded SessionEnd cleanup", async () => {
+  test("registers all ten lifecycle hooks, including bounded SessionEnd cleanup", async () => {
     const path = join(import.meta.dir, "../../plugin/hooks/codex-hooks.json");
     const manifest = JSON.parse(await readFile(path, "utf8")) as {
       hooks: Record<string, Array<{ hooks?: Array<{ command?: string; timeout?: number }> }>>;
     };
-    expect(Object.keys(manifest.hooks)).toHaveLength(7);
+    expect(Object.keys(manifest.hooks)).toHaveLength(10);
     const sessionEnd = manifest.hooks.SessionEnd?.[0]?.hooks?.[0];
     expect(sessionEnd?.command).toContain("dist/codex-status.mjs");
     // WHY 3: Codex hard-caps SessionEnd hook timeouts at 3s (SessionEnd blocks its shutdown) and, since
@@ -43,6 +43,23 @@ describe("native Codex hook manifest", () => {
     // comment: extra JSON keys risk the hook-manifest deserializer rejecting the whole file, which would
     // silently disable EVERY Codex hook.
     expect(sessionEnd?.timeout).toBe(3);
+  });
+
+  // NOM-67. Esc used to reach the phone only through the watchdog's rollout scan (20-25 s); Codex's
+  // Interrupt hook says so directly. Its timeout is capped by Codex at 3 s (default 1 s — too short for
+  // one 2 s-budget POST), the same clamp as SessionEnd; a hook killed mid-POST leaves the done's
+  // `donePending` on disk for the watchdog, and the rollout scan stays as the backstop.
+  test("registers Interrupt (3 s, Codex's cap) and both compaction hooks on the status entry", async () => {
+    const path = join(import.meta.dir, "../../plugin/hooks/codex-hooks.json");
+    const manifest = JSON.parse(await readFile(path, "utf8")) as {
+      hooks: Record<string, Array<{ matcher?: string; hooks?: Array<{ command?: string; timeout?: number }> }>>;
+    };
+    for (const event of ["Interrupt", "PreCompact", "PostCompact"]) {
+      expect(manifest.hooks[event]).toHaveLength(1);
+      expect(manifest.hooks[event][0].matcher).toBeUndefined(); // both compaction triggers; Interrupt ignores it
+      expect(manifest.hooks[event][0].hooks?.[0]?.command).toContain("dist/codex-status.mjs");
+    }
+    expect(manifest.hooks.Interrupt[0].hooks?.[0]?.timeout).toBe(3);
   });
 
   // ROLLED BACK 2026-08-05 (field): the blocking request_user_input handler HUNG — its trace showed
@@ -2219,14 +2236,21 @@ describe("statusCmd — Codex plugin detection states", () => {
     expect(pluginLine(await runStatus({}))).toBe("not installed");
   });
 
-  test("installed + all 7 hooks trusted → `installed, trusted (7/7)`", async () => {
-    expect(pluginLine(await runStatus({ configToml: cfgToml({ enabled: true, trusted: 7 }) })))
-      .toBe("installed, trusted (7/7)");
+  test("installed + all 10 hooks trusted → `installed, trusted (10/10)`", async () => {
+    expect(pluginLine(await runStatus({ configToml: cfgToml({ enabled: true, trusted: 10 }) })))
+      .toBe("installed, trusted (10/10)");
   });
 
-  test("installed + a partial N trusted → `installed, trusted (N/7)`", async () => {
+  // An install from before NOM-67 trusted seven; the three new hooks are skipped by Codex until the
+  // user re-opens /hooks, and the readout has to say so rather than claim a full house.
+  test("an upgraded install that trusted the old seven reads 7/10", async () => {
+    expect(pluginLine(await runStatus({ configToml: cfgToml({ enabled: true, trusted: 7 }) })))
+      .toBe("installed, trusted (7/10)");
+  });
+
+  test("installed + a partial N trusted → `installed, trusted (N/10)`", async () => {
     expect(pluginLine(await runStatus({ configToml: cfgToml({ trusted: 3 }) })))
-      .toBe("installed, trusted (3/7)");
+      .toBe("installed, trusted (3/10)");
   });
 
   test("installed but no hooks trusted yet → the row says so AND it becomes a problem with a fix", async () => {
@@ -2251,8 +2275,8 @@ describe("statusCmd — Codex plugin detection states", () => {
   });
 
   test("overlap (native enabled+trusted AND legacy) → trusted line + a double-fire WARNING naming codex-status.mjs", async () => {
-    const lines = await runStatus({ configToml: cfgToml({ enabled: true, trusted: 7 }), hooksJson: legacyHooks(6) });
-    expect(pluginLine(lines)).toBe("installed, trusted (7/7)");
+    const lines = await runStatus({ configToml: cfgToml({ enabled: true, trusted: 10 }), hooksJson: legacyHooks(6) });
+    expect(pluginLine(lines)).toBe("installed, trusted (10/10)");
     const warn = lines.find((l) => l.includes("every Codex event is sent twice"));
     expect(warn).toContain("6 legacy Nomo event");
     expect(lines.some((l) => l.includes("codex-status.mjs"))).toBe(true);
