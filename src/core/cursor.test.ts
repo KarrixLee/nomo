@@ -6,14 +6,14 @@ import { mkdir, mkdtemp, readdir, readFile, rm, utimes, writeFile } from "node:f
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test } from "bun:test";
-import { adapterFor, cursorAdapter } from "./adapter";
+import { adapterFor, cursorAdapter, cursorHostInvocation } from "./adapter";
 import { b64url, decryptBlob } from "./crypto";
 import {
-  CURSOR_KEEPALIVE_MS, CURSOR_UNKNOWN_OWNER_PID, CursorHookDeps, cursorEventKind, cursorOwnerPid,
+  CURSOR_KEEPALIVE_MS, CURSOR_OWNER_RETRY_MS, CURSOR_UNKNOWN_OWNER_PID, CursorHookDeps, cursorEventKind, cursorOwnerPid,
   cursorSessionIds, isCursorInvocation, planCursor, runCursorHook,
 } from "./cursor";
 import { Config, pidAlive, readRecord, SessionRecord } from "./shared";
-import { classifySession, isClaudeIdleReapEligible } from "../entries/cc-watchdog";
+import { classifySession, correctIdleClaude, isClaudeIdleReapEligible } from "../entries/cc-watchdog";
 import { parseAudience, statusCmd } from "../entries/status-cmd";
 
 const KEY = new Uint8Array(32).fill(7);
@@ -120,8 +120,9 @@ describe("reading a Cursor payload", () => {
     expect(cursorEventKind(bare({}))).toBeUndefined();
   });
 
-  test("ids are read tolerantly, in order, and never trusted as a path", () => {
-    expect(cursorSessionIds({ session_id: "a", sessionId: "b", conversation_id: "c", conversationId: "d" })).toEqual(["a", "b", "c", "d"]);
+  test("ids are read tolerantly, conversation id first, and never trusted as a path", () => {
+    // conversation_id rides EVERY event; session_id only sessionStart/sessionEnd — so the former keys rows.
+    expect(cursorSessionIds({ session_id: "a", sessionId: "b", conversation_id: "c", conversationId: "d" })).toEqual(["c", "d", "a", "b"]);
     expect(cursorSessionIds({ conversationId: "only" })).toEqual(["only"]);
     expect(cursorSessionIds({ session_id: CONV, conversation_id: CONV })).toEqual([CONV]);
     expect(cursorSessionIds({ session_id: "../../etc/passwd", conversation_id: "ok-1" })).toEqual(["ok-1"]);
@@ -132,6 +133,21 @@ describe("reading a Cursor payload", () => {
     expect(isCursorInvocation({ cursor_version: "1.0" }, {})).toBe(true);
     expect(isCursorInvocation({}, { CURSOR_VERSION: "1.0" })).toBe(true);
     expect(isCursorInvocation({ hook_event_name: "Stop", session_id: "x" }, {})).toBe(false);
+  });
+
+  test("it is the SAME predicate the Claude entries stand down on — no payload is claimed by neither", () => {
+    // If the two disagreed, a payload could make the Claude entry exit ("this is Cursor") AND the
+    // Cursor entry exit ("this is not Cursor"), and the session would be reported by nobody.
+    const inputs: Record<string, unknown>[] = [
+      {}, { cursor_version: "1.0" }, { cursor_version: "" }, { cursor_version: null }, { cursor_version: 7 },
+      { hook_event_name: "Stop" },
+    ];
+    const envs: Record<string, string | undefined>[] = [{}, { CURSOR_VERSION: "1.0" }, { CURSOR_VERSION: "" }, { CURSOR_VERSION: undefined }];
+    for (const input of inputs) for (const env of envs) {
+      expect(isCursorInvocation(input, env)).toBe(cursorHostInvocation(input, env));
+    }
+    expect(isCursorInvocation({ cursor_version: "" }, {})).toBe(true);
+    expect(isCursorInvocation({}, { CURSOR_VERSION: "" })).toBe(true);
   });
 });
 
@@ -150,6 +166,27 @@ describe("the owner pid", () => {
   });
   test("a CLI run inside Cursor's own terminal is owned by the CLI", () => {
     expect(cursorOwnerPid([sh, { pid: 20, command: "cursor-agent" }, { pid: 41, command: "/Applications/Cursor.app/Contents/MacOS/Cursor" }])).toBe(20);
+  });
+  test("only the EXECUTABLE counts — a Cursor-looking argument does not make a process the owner", () => {
+    for (const command of [
+      "vim /Users/k/dev/cursor",
+      "node /Users/k/cursor --x",
+      "tail -f /var/log/cursor-agent",
+      "/usr/bin/vim /Applications/Cursor.app/Contents/MacOS/Cursor",
+      "node /Users/k/.local/share/cursor-agent/versions/1.2.3/index.js",
+      "/bin/zsh -c cursor-agent",
+    ]) expect(cursorOwnerPid([sh, { pid: 50, command }])).toBeUndefined();
+    // …while the real things, with arguments and in a path with a space, still do.
+    expect(cursorOwnerPid([sh, { pid: 51, command: "/Users/John Doe/Applications/Cursor.app/Contents/MacOS/Cursor --no-sandbox" }])).toBe(51);
+    expect(cursorOwnerPid([sh, { pid: 52, command: "/usr/local/bin/cursor-agent --resume abc" }])).toBe(52);
+    expect(cursorOwnerPid([sh, { pid: 53, command: "/opt/cursor/cursor --type=x" }])).toBe(53);
+  });
+  test("an executable named `agent` is the CLI only when it resolves under a cursor-agent directory", () => {
+    const chain = [sh, { pid: 60, command: "/Users/x/.local/bin/agent chat" }];
+    expect(cursorOwnerPid(chain)).toBeUndefined();
+    expect(cursorOwnerPid(chain, () => "/Users/x/.local/share/cursor-agent/versions/1.2.3/cursor-agent")).toBe(60);
+    expect(cursorOwnerPid(chain, () => "/opt/some-other/agent")).toBeUndefined();
+    expect(cursorOwnerPid([sh, { pid: 61, command: "vim agent" }], () => "/x/cursor-agent/agent")).toBeUndefined();
   });
   test("no Cursor process in the chain → undefined, never the hook's shell", () => {
     expect(cursorOwnerPid([sh, { pid: 10, command: "-zsh" }, { pid: 9, command: undefined }])).toBeUndefined();
@@ -182,12 +219,42 @@ describe("planCursor — the state mapping", () => {
       .toEqual({ op: "update", prio: 0, status: "working", turnStartedAt: 111, generation: GEN1 });
   });
 
-  test("a late tool event from the turn that already stopped does not re-arm the row", () => {
-    const done = rec({ op: "done", lastEvent: "done", sentDone: true, turnId: GEN1 });
-    expect(planCursor("tool", { generation_id: GEN1 }, done, NOW)).toBeNull();
+  test("after a stop, no tool event re-arms the row — only a prompt starts a turn", () => {
+    const done = rec({ op: "done", lastEvent: "done", sentDone: true, turnId: GEN1, stoppedGeneration: GEN1 });
+    expect(planCursor("tool", { generation_id: GEN1 }, done, NOW)).toBeNull(); // late event of the stopped turn
     expect(planCursor("tool", {}, done, NOW)).toBeNull();
-    // A different generation is a new turn (e.g. a followup that fired no prompt hook).
-    expect(planCursor("tool", { generation_id: GEN2 }, done, NOW)).toMatchObject({ op: "update", status: "working", generation: GEN2 });
+    // A generation no prompt created (a subagent, a straggler from an older turn): nothing would ever
+    // retract the working state it raised, so it is dropped too.
+    expect(planCursor("tool", { generation_id: GEN2 }, done, NOW)).toBeNull();
+    expect(planCursor("tool", { generation_id: GEN2 }, { ...done, stoppedGeneration: "" }, NOW)).toBeNull();
+    expect(planCursor("prompt", { generation_id: GEN2 }, done, NOW)).toMatchObject({ op: "update", status: "working", generation: GEN2 });
+  });
+
+  test("a row the watchdog finished mid-turn (no stop seen) re-arms on that turn's next tool event", () => {
+    // The idle reap pins done but the turn never stopped: `stoppedGeneration` is absent.
+    const reaped = rec({ op: "done", lastEvent: "done", sentDone: true, turnId: GEN1 });
+    expect(planCursor("tool", { generation_id: GEN1 }, reaped, NOW))
+      .toEqual({ op: "update", prio: 0, status: "working", turnStartedAt: 111, generation: GEN1 });
+    expect(planCursor("tool", {}, reaped, NOW)).toMatchObject({ op: "update", status: "working", generation: GEN1 });
+    // …but not on a generation the prompt did not stamp.
+    expect(planCursor("tool", { generation_id: GEN2 }, reaped, NOW)).toBeNull();
+    // Its real stop, when it does arrive, is recorded (so the stragglers after it are dropped).
+    expect(planCursor("stop", { generation_id: GEN1 }, reaped, NOW)).toMatchObject({ op: "done", stoppedGeneration: GEN1 });
+  });
+
+  test("a keep-alive never overwrites the prompt-stamped generation", () => {
+    const working = rec({ ts: NOW - CURSOR_KEEPALIVE_MS, turnId: GEN1 });
+    expect(planCursor("tool", { generation_id: GEN2 }, working, NOW)).toMatchObject({ op: "update", status: "working", generation: GEN1 });
+  });
+
+  test("a stale stop for the previous generation does not finish the new turn; a bare stop still does", () => {
+    const working = rec({ turnId: GEN2 });
+    expect(planCursor("stop", { generation_id: GEN1, status: "completed" }, working, NOW)).toBeNull();
+    expect(planCursor("stop", { generation_id: GEN2 }, working, NOW)).toMatchObject({ op: "done", generation: GEN2, stoppedGeneration: GEN2 });
+    expect(planCursor("stop", { status: "completed" }, working, NOW)).toMatchObject({ op: "done", generation: GEN2, stoppedGeneration: GEN2 });
+    // A row whose prompt carried no generation cannot tell a stale stop from its own: it ends.
+    expect(planCursor("stop", { generation_id: GEN1 }, rec({ turnId: undefined }), NOW)).toMatchObject({ op: "done", stoppedGeneration: GEN1 });
+    expect(planCursor("stop", {}, rec({ turnId: undefined }), NOW)).toMatchObject({ op: "done", stoppedGeneration: "" });
   });
 
   test("stop is done whatever its status, and never needsAttention", () => {
@@ -195,7 +262,7 @@ describe("planCursor — the state mapping", () => {
       const plan = planCursor("stop", { generation_id: GEN1, status }, rec(), NOW);
       expect(plan).toMatchObject({ op: "done", prio: 0, status: "done" });
     }
-    const done = rec({ op: "done", lastEvent: "done", sentDone: true });
+    const done = rec({ op: "done", lastEvent: "done", sentDone: true, stoppedGeneration: GEN1 });
     expect(planCursor("stop", { generation_id: GEN1 }, done, NOW)).toBeNull(); // duplicate
     expect(planCursor("stop", { generation_id: GEN1 }, { ...done, donePending: true }, NOW)).toMatchObject({ op: "done" }); // still owed
   });
@@ -258,6 +325,66 @@ describe("runCursorHook — one event at a time", () => {
     expect(h.posts.every((p) => p.attentionKind === undefined)).toBe(true);
   });
 
+  test("generations: stragglers and stale stops never move a row; only the prompt's own stop ends it", async () => {
+    const h = await harness();
+    await h.fire(FIXTURES.beforeSubmitPrompt);
+    await h.fire(FIXTURES.stop);
+    expect(await h.record()).toMatchObject({ op: "done", turnId: GEN1, stoppedGeneration: GEN1 });
+    const settled = h.posts.length;
+    h.clock.now += CURSOR_KEEPALIVE_MS;
+    await h.fire(FIXTURES.postToolUse);                                   // late, same generation
+    await h.fire(common("postToolUse", { tool_name: "Task", generation_id: "gen-subagent" })); // foreign generation
+    expect(h.posts).toHaveLength(settled);
+    expect(await h.record()).toMatchObject({ op: "done", turnId: GEN1, stoppedGeneration: GEN1 });
+
+    // The user sends a new message mid-run: prompt(g2), then the OLD turn's stop arrives.
+    await h.fire(common("beforeSubmitPrompt", { prompt: "next", generation_id: GEN2 }));
+    const working = await h.record();
+    expect(working).toMatchObject({ lastEvent: "working", turnId: GEN2 });
+    expect(working!.stoppedGeneration).toBeUndefined();
+    await h.fire(common("stop", { status: "aborted", generation_id: GEN1 }));
+    expect(await h.record()).toMatchObject({ lastEvent: "working", turnId: GEN2 });
+    expect(h.posts.at(-1)).toMatchObject({ op: "update" });
+    // A foreign-generation keep-alive leaves the prompt's generation in place…
+    h.clock.now += CURSOR_KEEPALIVE_MS;
+    await h.fire(common("postToolUse", { tool_name: "Task", generation_id: "gen-subagent" }));
+    expect(await h.record()).toMatchObject({ lastEvent: "working", turnId: GEN2 });
+    // …so the turn's own stop still ends it.
+    await h.fire(common("stop", { status: "completed", generation_id: GEN2 }));
+    expect(await h.record()).toMatchObject({ op: "done", turnId: GEN2, stoppedGeneration: GEN2 });
+  });
+
+  test("a turn the watchdog idle-reaped re-arms on its next tool event, and then stops normally", async () => {
+    const h = await harness();
+    await h.fire(FIXTURES.beforeSubmitPrompt);
+    const before = (await h.record())!;
+    // The REAL reap, 30 quiet minutes later, with only its POST replaced.
+    const path = join(h.sessionsDir, `${CONV}.json`);
+    expect(await correctIdleClaude(CONFIG, path, CONV, before, before.ts + 1_800_000, { post: async () => "delivered" })).toBe("corrected");
+    expect(await h.record()).toMatchObject({ op: "done", lastEvent: "done", turnId: GEN1 });
+
+    h.clock.now += 1_800_000;
+    await h.fire(FIXTURES.postToolUse);
+    expect(h.posts.at(-1)).toMatchObject({ op: "update" });
+    expect(await h.record()).toMatchObject({ lastEvent: "working", turnId: GEN1 });
+    await h.fire(FIXTURES.stop);
+    expect(await h.record()).toMatchObject({ op: "done", stoppedGeneration: GEN1 });
+    // The watchdog's later rewrites spread the record, so the marker survives them.
+    const after = (await h.record())!;
+    expect({ ...after, doneAttempts: undefined }.stoppedGeneration).toBe(GEN1);
+  });
+
+  test("a prompt carrying BOTH ids keys the row by conversation_id, so conversation-only events land", async () => {
+    const h = await harness();
+    await h.fire({ ...FIXTURES.beforeSubmitPrompt, session_id: "session-only-id" });
+    expect(h.posts.at(-1)).toMatchObject({ sessionId: CONV, op: "start" });
+    expect(await h.record("session-only-id")).toBeNull();
+    await h.fire(FIXTURES.stop); // conversation_id only
+    expect(h.posts.at(-1)).toMatchObject({ sessionId: CONV, op: "done" });
+    await h.fire({ ...FIXTURES.sessionEnd, session_id: "session-only-id" });
+    expect(h.posts.at(-1)).toMatchObject({ sessionId: CONV, op: "end" });
+  });
+
   test("the title stays the FIRST prompt; the model follows the latest payload", async () => {
     const h = await harness();
     await h.fire(FIXTURES.beforeSubmitPrompt);
@@ -315,14 +442,29 @@ describe("runCursorHook — one event at a time", () => {
     expect(await readdir(h.sessionsDir).catch(() => [])).toEqual([]);
   });
 
-  test("an unknown owner falls back to the always-alive pid, and a prompt retries it", async () => {
+  test("an unknown owner falls back to the always-alive pid; a prompt retries it, but not on every prompt", async () => {
     const h = await harness();
-    await h.fire(FIXTURES.beforeSubmitPrompt, { ownerPid: () => undefined });
+    let walks = 0;
+    const unknown = () => { walks++; return undefined; };
+    await h.fire(FIXTURES.beforeSubmitPrompt, { ownerPid: unknown });
     expect((await h.record())!.pid).toBe(CURSOR_UNKNOWN_OWNER_PID);
-    await h.fire(common("beforeSubmitPrompt", { generation_id: GEN2, prompt: "again" }), { ownerPid: () => 999_999_999 }); // dead pid → still unknown
+    expect(walks).toBe(1);
+    // Inside the retry interval the slow ancestor walk is NOT repeated — by prompts or by anything else.
+    h.clock.now += 60_000;
+    await h.fire(common("beforeSubmitPrompt", { generation_id: GEN2, prompt: "again" }), { ownerPid: unknown });
+    await h.fire(FIXTURES.postToolUse, { ownerPid: unknown });
+    await h.fire(common("stop", { generation_id: GEN2 }), { ownerPid: unknown });
+    expect(walks).toBe(1);
     expect((await h.record())!.pid).toBe(CURSOR_UNKNOWN_OWNER_PID);
-    await h.fire(common("beforeSubmitPrompt", { generation_id: "gen-3", prompt: "again" }));
+    // Past it, a prompt looks again: a dead pid is still unknown…
+    h.clock.now += CURSOR_OWNER_RETRY_MS;
+    await h.fire(common("beforeSubmitPrompt", { generation_id: "gen-3", prompt: "again" }), { ownerPid: () => 999_999_999 });
+    expect((await h.record())!.pid).toBe(CURSOR_UNKNOWN_OWNER_PID);
+    // …and a live one is adopted.
+    h.clock.now += CURSOR_OWNER_RETRY_MS;
+    await h.fire(common("beforeSubmitPrompt", { generation_id: "gen-4", prompt: "again" }));
     expect((await h.record())!.pid).toBe(process.pid);
+    expect((await h.record())!.ownerCheckedAt).toBeUndefined();
   });
 
   test("user_email never reaches a frame, a record, a trace or the stamp", async () => {
@@ -356,9 +498,17 @@ describe("runCursorHook — one event at a time", () => {
     await h.fire("[1,2]");
     await h.fire({ hook_event_name: "beforeSubmitPrompt", conversation_id: CONV, prompt: "no cursor_version here" });
     await h.fire(FIXTURES.beforeSubmitPrompt, { config: null });
-    await h.fire(FIXTURES.beforeSubmitPrompt, { post: async () => { throw new Error("network down"); } });
+    // None of those reached the POST (the harness's default `post` records every attempt) or the disk.
     expect(h.posts).toHaveLength(0);
-    // The throwing POST still left the row recorded; a failed done stays owed for the watchdog.
+    expect(await h.record()).toBeNull();
+    expect(await readdir(h.sessionsDir).catch(() => [])).toEqual([]);
+
+    // A THROWING POST is swallowed too — and the row is recorded before it is attempted.
+    let attempts = 0;
+    await h.fire(FIXTURES.beforeSubmitPrompt, { post: async () => { attempts++; throw new Error("network down"); } });
+    expect(attempts).toBe(1);
+    expect(await h.record()).toMatchObject({ agent: "cursor", op: "start", lastEvent: "sessionStart", turnId: GEN1 });
+    // A failed done stays owed for the watchdog.
     await h.fire(FIXTURES.stop, { post: async () => false });
     expect(await h.record()).toMatchObject({ op: "done", donePending: true });
   });
@@ -394,6 +544,8 @@ describe("cursorAdapter", () => {
     expect(await cursorAdapter.model!({ ...ctx, input: { model: "a", model_id: "b" } })).toBe("a");
     expect(await cursorAdapter.model!({ ...ctx, input: { model_id: "b" } })).toBe("b");
     expect(await cursorAdapter.model!({ ...ctx, input: { model: "" } })).toBeUndefined();
+    // Bounded like the title: the payload is not ours, and the model rides every sealed blob.
+    expect(await cursorAdapter.model!({ ...ctx, input: { model: "m".repeat(500) } })).toBe("m".repeat(80));
   });
 });
 

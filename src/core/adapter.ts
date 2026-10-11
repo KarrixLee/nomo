@@ -2493,11 +2493,13 @@ export const opencodeAdapter: AgentAdapter = {
 };
 
 /** Cursor's model id off a hook payload: `model` (on every event, e.g. "cursor-grok-4.6-high-fast"),
- *  else the optional `model_id`. Undefined → the blob omits the key. */
+ *  else the optional `model_id`. Undefined → the blob omits the key. Capped at 80 chars, the same
+ *  bound an `ai-title` gets (BRANCH_MAX_CHARS is the other one): it comes off stdin and rides every
+ *  sealed blob. */
 export function cursorModel(input: Record<string, unknown>): string | undefined {
   for (const key of ["model", "model_id"]) {
     const v = input[key];
-    if (typeof v === "string" && v.trim().length > 0) return v.trim();
+    if (typeof v === "string" && v.trim().length > 0) return v.trim().slice(0, 80);
   }
   return undefined;
 }

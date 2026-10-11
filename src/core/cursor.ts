@@ -17,8 +17,9 @@
 // cannot leak by default either.
 
 import { hostname } from "node:os";
+import { realpathSync } from "node:fs";
 import { readdir, stat, unlink } from "node:fs/promises";
-import { cursorAdapter, cursorModel } from "./adapter";
+import { cursorAdapter, cursorHostInvocation, cursorModel } from "./adapter";
 import { buildEnvelope, markDoneDeliveredAt, OpPlan, trackSessionAt } from "./hook";
 import {
   atomicWrite, CC_DIR, Config, ensureWatchdog, folderIdentity, lastHookPath, loadConfig, pidAlive,
@@ -62,24 +63,31 @@ export function cursorEventKind(input: Record<string, unknown>): CursorEventKind
  *  against a conservative shape instead of trusted (no slash, no leading dot, bounded). */
 const SAFE_ID = /^[A-Za-z0-9_-][A-Za-z0-9._-]{0,127}$/;
 
-/** Every candidate session id on the payload, in the tolerant read order (field naming has varied
- *  across Cursor versions), de-duplicated. More than one can be present AND differ — `session_id`
- *  rides sessionStart/sessionEnd only, `conversation_id` rides everything — which is why the caller
- *  prefers whichever candidate is already tracked rather than blindly taking the first. */
+/** Every candidate session id on the payload, de-duplicated, in KEYING order (both spellings of each:
+ *  field naming has varied across Cursor versions). More than one can be present AND differ.
+ *
+ *  `conversation_id` FIRST: Cursor's hooks docs list it as a common field on EVERY event, and
+ *  `session_id` only on sessionStart/sessionEnd — so a new row is keyed by the id every later event of
+ *  the chat is guaranteed to carry. (Keyed by `session_id`, a prompt carrying both made a row the
+ *  conversation-only tool/stop events could never find.) The caller still prefers whichever candidate
+ *  is ALREADY tracked, so a sessionEnd that carries only `session_id` lands on a row keyed that way. */
 export function cursorSessionIds(input: Record<string, unknown>): string[] {
   const out: string[] = [];
-  for (const key of ["session_id", "sessionId", "conversation_id", "conversationId"]) {
+  for (const key of ["conversation_id", "conversationId", "session_id", "sessionId"]) {
     const v = input[key];
     if (typeof v === "string" && SAFE_ID.test(v) && !out.includes(v)) out.push(v);
   }
   return out;
 }
 
-/** Sanity check only: is this really Cursor calling? The payload's `cursor_version`, or the
- *  `CURSOR_VERSION` Cursor sets on every hook process. Guards against this bundle being run by some
- *  other host that imported the hooks file — it must not mint Cursor rows from a foreign event. */
+/** Sanity check only: is this really Cursor calling? Guards against this bundle being run by some
+ *  other host that imported the hooks file — it must not mint Cursor rows from a foreign event.
+ *
+ *  ONE DEFINITION, adapter.ts's `cursorHostInvocation` (a `cursor_version` payload key or a
+ *  `CURSOR_VERSION` env var, PRESENT — even empty): it is the predicate the Claude entries stand DOWN
+ *  on. Were this one stricter, a payload could make both entries exit and nobody report the session. */
 export function isCursorInvocation(input: Record<string, unknown>, env: Record<string, string | undefined> = process.env): boolean {
-  return str(input.cursor_version) !== undefined || str(env.CURSOR_VERSION) !== undefined;
+  return cursorHostInvocation(input, env);
 }
 
 /** The record pid used when no Cursor process could be found in the hook's ancestry. pid 1 is always
@@ -90,8 +98,43 @@ export function isCursorInvocation(input: Record<string, unknown>, env: Record<s
  *  owner once the desktop app's hook parent is verified live. */
 export const CURSOR_UNKNOWN_OWNER_PID = 1;
 
-const CLI_PROCESS = /(^|[/\s])cursor-agent([/\s]|$)/;
-const APP_PROCESS = /\/Cursor\.app\/|(^|\/)[Cc]ursor(\s|$)/;
+/** How long an "owner not found" verdict stands before a prompt may look again. The ancestor walk is
+ *  a `ps` per ancestor — the slow part of this hook — and the ancestry of a chat that had no Cursor
+ *  process in it does not grow one, so re-walking on every prompt bought nothing but latency. */
+export const CURSOR_OWNER_RETRY_MS = 600_000;
+
+/** The macOS app's MAIN executable, as the command's own executable (anchored at the start). The path
+ *  may contain spaces ("/Users/John Doe/Applications/…"), so it cannot be cut at the first one; what it
+ *  may not contain is " /" — the start of a second, absolute-path ARGUMENT, which is what
+ *  `vim /Applications/Cursor.app/Contents/MacOS/Cursor` looks like. Helpers ("Cursor Helper (Plugin)")
+ *  deliberately do not match: they may not outlive the turn. */
+const APP_BUNDLE = /^\/(?:(?! \/).)*\/Cursor\.app\/Contents\/MacOS\/Cursor(?:\s|$)/;
+/** The CLI's bundled-node layout, as argv[0]: `…/cursor-agent/versions/<ver>/<binary>`. */
+const CLI_BUNDLED = /\/cursor-agent\/versions\/[^/]+\/[^/]+$/;
+
+/** argv[0] of a `ps -o args=` line.
+ *  ponytail: cut at the first whitespace, so an executable under a path with a space is not
+ *  recognised (the app bundle has its own space-tolerant pattern). The cost is an unknown owner —
+ *  CURSOR_UNKNOWN_OWNER_PID and the idle nets — never a wrong one. */
+const argv0 = (command: string): string => command.trimStart().split(/\s/, 1)[0] ?? "";
+const basename = (path: string): string => path.slice(path.lastIndexOf("/") + 1);
+
+/** Is this process the `cursor-agent` CLI? Judged on the EXECUTABLE only — never on an argument, so
+ *  `tail -f /var/log/cursor-agent` or `node …/cursor-agent/versions/1/index.js` run by hand is not.
+ *  The CLI also installs itself as plain `agent`; that name is far too generic to trust, so it counts
+ *  only when it RESOLVES (symlinks followed) into a `cursor-agent` directory. */
+function isCliProcess(command: string, resolve: (path: string) => string | undefined): boolean {
+  const exe = argv0(command);
+  const name = basename(exe);
+  if (name === "cursor-agent" || CLI_BUNDLED.test(exe)) return true;
+  return name === "agent" && /\/cursor-agent\//.test(resolve(exe) ?? "");
+}
+
+/** Is this process the Cursor desktop app itself? The macOS bundle path, or (Linux) an executable
+ *  whose own basename is `cursor`/`Cursor`. */
+function isAppProcess(command: string): boolean {
+  return APP_BUNDLE.test(command) || /^[Cc]ursor$/.test(basename(argv0(command)));
+}
 
 /** Pick the process that OWNS this session out of the hook's ancestor chain (nearest first).
  *
@@ -103,20 +146,28 @@ const APP_PROCESS = /\/Cursor\.app\/|(^|\/)[Cc]ursor(\s|$)/;
  *      helper that might not outlive the turn;
  *   3. else undefined → the caller records CURSOR_UNKNOWN_OWNER_PID.
  *  CLI first, so a `cursor-agent` run inside Cursor's own integrated terminal is still owned by the
- *  CLI process and not by the app around it. Pure. */
-export function cursorOwnerPid(chain: { pid: number; command: string | undefined }[]): number | undefined {
-  const cli = chain.find((p) => p.command !== undefined && CLI_PROCESS.test(p.command));
+ *  CLI process and not by the app around it. A match is on the process's EXECUTABLE, never on an
+ *  argument (see isCliProcess / isAppProcess). Pure — `resolve` (path → its real path) is injected and
+ *  defaults to "cannot tell", which only ever withholds the `agent` alias. */
+export function cursorOwnerPid(
+  chain: { pid: number; command: string | undefined }[],
+  resolve: (path: string) => string | undefined = () => undefined,
+): number | undefined {
+  const cli = chain.find((p) => p.command !== undefined && isCliProcess(p.command, resolve));
   if (cli) return cli.pid;
   for (let i = chain.length - 1; i >= 0; i--) {
     const command = chain[i]!.command;
-    if (command !== undefined && APP_PROCESS.test(command)) return chain[i]!.pid;
+    if (command !== undefined && isAppProcess(command)) return chain[i]!.pid;
   }
   return undefined;
 }
 
 function resolveOwnerPid(): number | undefined {
   const pids = [process.ppid, ...pidAncestors(process.ppid)];
-  return cursorOwnerPid(pids.map((pid) => ({ pid, command: pidCommand(pid) })));
+  return cursorOwnerPid(pids.map((pid) => ({ pid, command: pidCommand(pid) })), (path) => {
+    // Only an absolute argv[0] can be resolved: a bare `agent` was found through a PATH we cannot see.
+    try { return path.startsWith("/") ? realpathSync(path) : undefined; } catch { return undefined; }
+  });
 }
 
 /** How long a `working` row is left alone before another tool event re-sends it. A turn fires several
@@ -128,16 +179,22 @@ export const CURSOR_KEEPALIVE_MS = 15_000;
 export interface CursorPlan extends OpPlan {
   /** Epoch SECONDS (the blob's unit) — re-stamped by whatever opens a turn, else the cached anchor. */
   turnStartedAt?: number;
-  /** The `generation_id` this frame belongs to (one per user message), parked in the record's `turnId`. */
+  /** The turn's `generation_id` (one per user message) as the PROMPT stamped it, parked in the
+   *  record's `turnId`. Only a prompt sets a new one; every other plan carries the record's forward. */
   generation?: string;
+  /** Set by a `stop` plan only: the generation that stopped ("" when unknown) — see
+   *  SessionRecord.stoppedGeneration. */
+  stoppedGeneration?: string;
 }
 
 /** The state mapping, pure:
  *
  *    beforeSubmitPrompt                 → start (no record yet) / update · working, new turn anchor
  *    tool events, row working           → update · working, at most once per CURSOR_KEEPALIVE_MS
- *    tool events, row done              → re-arm ONLY for a generation other than the one that stopped
+ *    tool events, row done by a stop    → nothing
+ *    tool events, row done, NO stop seen→ re-arm, unless the event names a different generation
  *    stop (completed | aborted | error) → done      (an aborted turn is still a finished turn)
+ *    stop for another generation        → nothing
  *    sessionEnd                         → end
  *    sessionStart, or anything else     → nothing
  *
@@ -145,10 +202,23 @@ export interface CursorPlan extends OpPlan {
  *  chats on its own), and a tool/stop event for an id we never saw a prompt for may be a subagent or
  *  an inline edit — each would be a phantom row with nothing left to finish it.
  *
- *  THE GENERATION GATE exists because Cursor runs the after-hooks fire-and-forget: a tool hook can
- *  land AFTER its own turn's `stop`, and re-arming on it would leave a finished row "working" with no
- *  stop left to retract it. A different generation is a genuinely new turn (e.g. a stop-hook
- *  followup, which may not fire beforeSubmitPrompt). */
+ *  ONLY A PROMPT STARTS A TURN, for the same reason. The record's `turnId` is the generation the
+ *  PROMPT stamped and nothing else ever rewrites it; `stoppedGeneration` is present once that turn's
+ *  `stop` has been seen. Cursor runs the after-hooks fire-and-forget and runs subagents under
+ *  generations of their own, so events arrive late and from generations no prompt of ours opened:
+ *
+ *   - a tool event on a row a STOP finished is dropped, whatever generation it names. It is either a
+ *     straggler of the finished turn or foreign, and re-arming on it would leave the row "working"
+ *     with no stop left to retract it. (Cost, accepted: a stop-hook FOLLOWUP that fires no
+ *     beforeSubmitPrompt stays "done" on the phone while it runs.)
+ *   - a tool event on a row that is done WITHOUT a stop — the watchdog's 30-min idle reap guessed,
+ *     mid-turn — re-arms it: the turn is demonstrably still running and its own stop is still to
+ *     come. Unless the event names a generation other than the prompt's, which proves nothing about
+ *     this turn.
+ *   - a keep-alive on a working row never changes the generation, so the turn's own stop still matches.
+ *   - a stop naming a generation other than the prompt's is the PREVIOUS turn's, arriving after the
+ *     user already sent the next message: ignored. A stop with no generation, or on a row whose prompt
+ *     carried none, cannot be told apart from the turn's own and ends it. */
 export function planCursor(
   kind: CursorEventKind, input: Record<string, unknown>, record: SessionRecord | null, now: number,
 ): CursorPlan | null {
@@ -160,22 +230,27 @@ export function planCursor(
   const cachedTurn = typeof record.turnStartedAt === "number" && Number.isFinite(record.turnStartedAt)
     ? record.turnStartedAt : undefined;
   const isDone = record.op === "done" || record.lastEvent === "done";
+  const turn = str(record.turnId);
+  const stopSeen = typeof record.stoppedGeneration === "string";
+  // The event names a generation, the prompt stamped one, and they differ.
+  const foreign = generation !== undefined && turn !== undefined && generation !== turn;
   switch (kind) {
     case "prompt":
       return { op: "update", prio: 0, status: "working", turnStartedAt: nowSec, generation };
     case "tool":
       if (isDone) {
-        if (!generation || generation === record.turnId) return null;
-        return { op: "update", prio: 0, status: "working", turnStartedAt: nowSec, generation };
+        if (stopSeen || foreign) return null;
+        return { op: "update", prio: 0, status: "working", turnStartedAt: cachedTurn, generation: turn };
       }
       if (typeof record.ts === "number" && now - record.ts < CURSOR_KEEPALIVE_MS) return null;
-      return { op: "update", prio: 0, status: "working", turnStartedAt: cachedTurn, generation: generation ?? record.turnId };
+      return { op: "update", prio: 0, status: "working", turnStartedAt: cachedTurn, generation: turn };
     case "stop":
+      if (foreign) return null;
       // A second stop for a turn already reported done (and delivered) adds nothing.
-      if (isDone && record.donePending !== true && (!generation || generation === record.turnId)) return null;
-      return { op: "done", prio: 0, status: "done", turnStartedAt: cachedTurn, generation: generation ?? record.turnId };
+      if (isDone && stopSeen && record.donePending !== true) return null;
+      return { op: "done", prio: 0, status: "done", turnStartedAt: cachedTurn, generation: turn, stoppedGeneration: generation ?? turn ?? "" };
     case "end":
-      return { op: "end", prio: 0, status: "done", turnStartedAt: cachedTurn, generation: record.turnId };
+      return { op: "end", prio: 0, status: "done", turnStartedAt: cachedTurn, generation: turn };
     default:
       return null;
   }
@@ -272,13 +347,20 @@ export async function runCursorHook(raw: string, deps: CursorHookDeps = {}): Pro
       ? record.sessionStartedAt : now;
     const transcript = str(input.transcript_path) ?? record?.transcript ?? "";
 
-    // The owner is resolved when the row is created, and retried from a prompt while still unknown.
-    // Every other event reuses the record's pid: the `ps` walk is the slow part of this hook.
+    // The owner is resolved when the row is created, and retried from a prompt while still unknown —
+    // but only once the last "not found" is CURSOR_OWNER_RETRY_MS old (a record that predates the
+    // stamp retries once). Every other event reuses the record's pid: the `ps` walk is the slow part
+    // of this hook.
     let pid = record?.pid;
-    if (typeof pid !== "number" || (pid === CURSOR_UNKNOWN_OWNER_PID && kind === "prompt")) {
+    let ownerCheckedAt = typeof record?.ownerCheckedAt === "number" ? record.ownerCheckedAt : undefined;
+    const retryDue = pid === CURSOR_UNKNOWN_OWNER_PID && kind === "prompt" &&
+      (ownerCheckedAt === undefined || now - ownerCheckedAt >= CURSOR_OWNER_RETRY_MS);
+    if (typeof pid !== "number" || retryDue) {
       pid = (deps.ownerPid ?? resolveOwnerPid)() ?? CURSOR_UNKNOWN_OWNER_PID;
       if (pid !== CURSOR_UNKNOWN_OWNER_PID && !pidAlive(pid)) pid = CURSOR_UNKNOWN_OWNER_PID;
+      ownerCheckedAt = now;
     }
+    if (pid !== CURSOR_UNKNOWN_OWNER_PID) ownerCheckedAt = undefined;
 
     // An allow-listed input, NOT the payload: buildBlob reads only the id and the cwd from it.
     const envelope = await buildEnvelope(
@@ -298,6 +380,16 @@ export async function runCursorHook(raw: string, deps: CursorHookDeps = {}): Pro
       machine, folder, transcript, "cursor", startedAt, plan.turnStartedAt, plan.generation, title,
       config.pairingId, model, false, pid, origin,
     );
+    // trackSessionAt rebuilds the record whole and has no slot for Cursor's own keys, so they are
+    // patched on right behind it (read-modify-write, like markDoneDeliveredAt). A prompt opens a new
+    // turn and so DROPS the stop marker; a stop sets it; everything else carries it forward.
+    const stoppedGeneration = plan.stoppedGeneration ?? (kind === "prompt" ? undefined : record?.stoppedGeneration);
+    if (plan.op !== "end" && (stoppedGeneration !== undefined || ownerCheckedAt !== undefined)) {
+      const written = await readRecord(sessionId, sessionsDir);
+      if (written) {
+        await atomicWrite(`${sessionsDir}/${sessionId}.json`, JSON.stringify({ ...written, stoppedGeneration, ownerCheckedAt }), 0o600);
+      }
+    }
     const trace = deps.trace ?? traceSession;
     if (!record) trace({ event: "create", sessionId, agent: "cursor", hook_event_name: origin.hook_event_name, origin });
     else if (plan.op === "end") trace({ event: "retire", sessionId, agent: "cursor", reason: "hook op:end" });

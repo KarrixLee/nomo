@@ -1143,6 +1143,17 @@ export interface SessionRecord {
    *  re-arms as an `update` and writes lastEvent:"working", while a source:"compact" SessionStart fires
    *  MID-turn on a session with no record yet and writes lastEvent:"sessionStart" over a live turn. */
   awaitingPrompt?: boolean;
+  /** CURSOR ONLY (core/cursor.ts; patched onto the record after trackSessionAt, which rebuilds it
+   *  whole). The `generation_id` whose `stop` hook ended the current turn — "" when neither the stop
+   *  nor the prompt carried one. PRESENT means "a real stop was seen since the last prompt", which is
+   *  what tells a finished turn (late tool events are dropped) from one the watchdog's idle reap only
+   *  GUESSED finished (the turn's next tool event re-arms it). A prompt clears it. The watchdog never
+   *  reads it and its rewrites spread `...record`, so it survives them. Absent on every other agent. */
+  stoppedGeneration?: string;
+  /** CURSOR ONLY. Epoch ms of the last owner-pid lookup that found NO Cursor process (the record's
+   *  `pid` is then CURSOR_UNKNOWN_OWNER_PID). A negative cache: a prompt re-walks the process ancestry
+   *  only once this is CURSOR_OWNER_RETRY_MS old. Absent once an owner is known. */
+  ownerCheckedAt?: number;
 }
 
 /** The plaintext a pending-pairing flush needs to POST the pairing session the instant the shared key
