@@ -432,6 +432,16 @@ export function ocPromptHeld(state: OcState, id: string, held: boolean): void {
   if (prompt) prompt.held = held;
 }
 
+/** Is a hold's card on this ROOT row right now — any of its pending prompts (its own or a subagent's)
+ *  marked held? Read at SEND time by the plugin: the card is posted on its own route, off the send
+ *  chain, so a working frame that was planned before the prompt can still be queued behind it. */
+export function ocRowHeld(state: OcState, rootId: string): boolean {
+  for (const prompt of state.prompts.values()) {
+    if (prompt.held && ocRootSession(state, prompt.sessionID) === rootId) return true;
+  }
+  return false;
+}
+
 /** Forget one prompt. Returns the ROOT session whose row may need repainting (ocPromptFrame), or
  *  undefined when we were not tracking it — so two signals for one answer repaint once. */
 export function ocPromptResolved(state: OcState, id: string): string | undefined {
@@ -491,9 +501,7 @@ export function ocPromptsEndedBy(state: OcState, event: unknown): { id: string; 
  *  goes away; it is NOT skip-keyed, because every call follows a frame that was not `working`. */
 export function ocPromptFrame(state: OcState, sessionId: string, now: number = Date.now()): OcFrame | null {
   const rootId = ocRootSession(state, sessionId);
-  for (const prompt of state.prompts.values()) {
-    if (prompt.held && ocRootSession(state, prompt.sessionID) === rootId) return null;
-  }
+  if (ocRowHeld(state, rootId)) return null;
   if (hasPrompt(state, rootId)) return ocAttentionFrame(state, rootId, undefined, now);
   const entry = state.sessions.get(rootId);
   if (!entry?.announced || !entry.working) return null;

@@ -248,8 +248,22 @@ describe("no process handlers are ever installed", () => {
 
   test("a hold that ends WITHOUT the phone's decision says so (paused, superseded, threw)", async () => {
     const base = { config, serverUrl: "http://127.0.0.1:4396/", requestId: "req-1", delegate: async () => {}, trace: () => {} };
-    expect(await runOcApproval(PERMISSION, { ...base, runHold: async () => {} })).toBe(false);
-    expect(await runOcApproval(PERMISSION, { ...base, runHold: async () => { throw new Error("boom"); } })).toBe(false);
+    const none = { answered: false, granted: false };
+    expect(await runOcApproval(PERMISSION, { ...base, runHold: async () => {} })).toEqual(none);
+    expect(await runOcApproval(PERMISSION, { ...base, runHold: async () => { throw new Error("boom"); } })).toEqual(none);
+  });
+
+  // `granted` is what tells the caller whether the hold's own settle will write the row: no grant means
+  // no marker, no settle, and a row nobody has painted.
+  test("it reports whether the worker GRANTED the hold, separately from whether it was answered", async () => {
+    // Granted, then retired unanswered (the user answered at the Mac → superseded).
+    expect(await runOcApproval(PERMISSION, {
+      config, serverUrl: "http://127.0.0.1:4396/", requestId: "req-g", delegate: async () => {}, trace: () => {},
+      noHoldPath: join(tmpdir(), `nomo-oc-no-such-flag-${process.pid}`),
+      fetchFn: (async (input: string | URL) => Response.json(
+        String(input).endsWith("/v1/cc/decision") ? { hold: true } : { status: "superseded" },
+      )) as unknown as typeof fetch,
+    })).toEqual({ answered: false, granted: true });
   });
 
   test("a REAL end-to-end hold answers OpenCode and adds no listener to `process`", async () => {
@@ -276,7 +290,8 @@ describe("no process handlers are ever installed", () => {
     });
 
     expect(listenerCounts()).toEqual(before);
-    expect(answered).toBe(true); // the hold settled the record as working — the caller must not re-settle it
+    // the hold settled the record as working — the caller must not re-settle it
+    expect(answered).toEqual({ answered: true, granted: true });
     // "Always allow" on the phone is `always` on the wire, on the verified reply route.
     expect(calls).toContain('POST http://127.0.0.1:4396/permission/per_01638472f0016YZI7giyZgEWE6/reply {"reply":"always"}');
   });
