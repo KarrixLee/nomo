@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, test } from "bun:test";
 import {
-  adapterFor, allAdapters, claudeAdapter, claudeClearPredecessor, claudeDesktopInvocation, claudeForkResumePredecessor, claudeHeadlessInvocation, claudeLocateTuiPid, claudeSessionModel, claudeSessionTitle,
+  adapterFor, allAdapters, claudeAdapter, claudeClearPredecessor, claudeDesktopInvocation, cursorHostInvocation, claudeForkResumePredecessor, claudeHeadlessInvocation, claudeLocateTuiPid, claudeSessionModel, claudeSessionTitle,
   claudeTailPendingApproval, codexAdapter, codexChildSessionGhost, codexDesktopAppPid, codexDesktopOriginator, codexLocateTuiPid, codexTuiCandidates,
   opencodeAdapter, opencodeLocateTuiPid,
   codexConfigModel, codexDiscoverLive, codexInternalSessionGhost, codexModelFromRollout,
@@ -11,7 +11,7 @@ import {
   codexNewestRolloutForCwd, codexPidPlanPickerEvidence, codexPidPlanPickerState, codexPidTurnActive, codexPlanPickerStateFromTail, codexProposedPlanMarkdown, codexRolloutExistsForSession, codexSentinelSessionId, codexSessionModel,
   codexRolloutCreationEvidence, codexSessionCreationSuppression, codexTailPendingApproval, codexTailPendingAttentionKind, codexTailPendingUserInputDetail, codexTurnActiveFromTail, filterCodexTuis, findProvisionalForPid,
   firstAssistantModel, firstUserPrompt, lastAssistantModel, parseCodexProcs, rolloutMetaCwd,
-  requestUserInputDetail, rolloutPathFromLsof, sessionTitle, TrackedSessionLite,
+  hasInterruptMarker, requestUserInputDetail, rolloutPathFromLsof, sessionTitle, TrackedSessionLite,
 } from "./adapter";
 import type { AgentAdapter, LocateTuiReason } from "./adapter";
 import { folderKeyFromCwd } from "./shared";
@@ -2102,5 +2102,63 @@ describe("both adapters expose the locate seam", () => {
       { sessionId: "s", record: locRec({ pid: 77, agent: undefined }) },
       { ttyOf: async () => "ttys009" },
     )).toBe(77);
+  });
+});
+
+// NOM-67. Cursor (desktop + `cursor-agent`) imports Claude Code plugins and ~/.claude hooks and runs them
+// with Cursor-shaped payloads, so the CLAUDE entries can fire inside Cursor. Either fingerprint alone is
+// enough; both are Cursor's own documented hook contract (env CURSOR_VERSION, input cursor_version).
+describe("cursorHostInvocation", () => {
+  test("true when CURSOR_VERSION is in the environment — even when empty", () => {
+    expect(cursorHostInvocation({}, { CURSOR_VERSION: "1.7.52" })).toBe(true);
+    expect(cursorHostInvocation({}, { CURSOR_VERSION: "" })).toBe(true);
+    expect(cursorHostInvocation(undefined, { CURSOR_VERSION: "" })).toBe(true);
+  });
+  test("true when the payload carries a cursor_version key, whatever its value", () => {
+    expect(cursorHostInvocation({ hook_event_name: "PreToolUse", cursor_version: "1.7.52" }, {})).toBe(true);
+    expect(cursorHostInvocation({ cursor_version: null }, {})).toBe(true);
+  });
+  test("false for a genuine Claude Code / Codex hook, and for junk input", () => {
+    expect(cursorHostInvocation({ session_id: "s", hook_event_name: "Stop" }, { HOME: "/x", TERM_PROGRAM: "vscode" })).toBe(false);
+    expect(cursorHostInvocation(undefined, {})).toBe(false);
+    expect(cursorHostInvocation("cursor_version", {})).toBe(false);
+    expect(cursorHostInvocation(null, {})).toBe(false);
+  });
+});
+
+// NOM-67. The marker is a `user` row whose content is ONE text block "[Request interrupted by user…]"
+// (shape checked against live ~/.claude/projects transcripts). The same phrase also turns up INSIDE
+// tool results and tool inputs — reading a transcript, grepping this repo — and a substring match over
+// the raw line called those turns interrupted and POSTed a false done.
+describe("hasInterruptMarker (parsed, never inside a tool block)", () => {
+  const line = (type: string, content: unknown) => JSON.stringify({ type, message: { role: type, content } });
+  test("true for the real marker, both spellings", () => {
+    expect(hasInterruptMarker(line("user", [{ type: "text", text: "[Request interrupted by user]" }]))).toBe(true);
+    expect(hasInterruptMarker(line("user", [{ type: "text", text: "[Request interrupted by user for tool use]" }]))).toBe(true);
+  });
+  test("false when the phrase only appears inside a tool_result or tool_use block", () => {
+    expect(hasInterruptMarker(line("user", [{
+      type: "tool_result", tool_use_id: "toolu_1",
+      content: [{ type: "text", text: "adapter.ts:507: const INTERRUPT_MARKER = \"interrupted by user\";" }],
+    }]))).toBe(false);
+    expect(hasInterruptMarker(line("user", [{ type: "tool_result", tool_use_id: "toolu_1", content: "[Request interrupted by user]" }]))).toBe(false);
+    expect(hasInterruptMarker(line("assistant", [{
+      type: "tool_use", id: "toolu_2", name: "Grep", input: { pattern: "[Request interrupted by user" },
+    }]))).toBe(false);
+  });
+  test("false when prose merely mentions the phrase mid-text", () => {
+    expect(hasInterruptMarker(line("assistant", [{ type: "text", text: "The turn was interrupted by user action earlier." }]))).toBe(false);
+    expect(hasInterruptMarker(line("user", "why does it say [Request interrupted by user]?"))).toBe(false);
+  });
+  test("false for an unparseable line", () => {
+    expect(hasInterruptMarker('{"type":"user","message":"[Request interrupted by user')).toBe(false);
+    expect(hasInterruptMarker("")).toBe(false);
+  });
+  test("detectInterrupt ignores a tool result quoting the marker on the last turn line", () => {
+    const tail = [
+      line("assistant", [{ type: "tool_use", id: "toolu_1", name: "Read", input: { file_path: "/x/t.jsonl" } }]),
+      line("user", [{ type: "tool_result", tool_use_id: "toolu_1", content: "…[Request interrupted by user]…" }]),
+    ].join("\n");
+    expect(claudeAdapter.detectInterrupt(tail)).toBe(false);
   });
 });

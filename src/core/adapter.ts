@@ -502,9 +502,9 @@ export async function codexSessionModel(
 //     (task_started / task_complete / turn_aborted): if that boundary is turn_aborted, the turn was
 //     aborted; a later task_started (a fresh/resumed turn) means it wasn't.
 
-/** The raw substring Claude Code writes into the aborted turn ("[Request interrupted by user]" or
- *  "…for tool use"); matching the substring covers both. */
-const INTERRUPT_MARKER = "interrupted by user";
+/** How Claude Code's interrupt marker BEGINS ("[Request interrupted by user]" or "…for tool use]");
+ *  the shared prefix covers both. */
+const INTERRUPT_MARKER = "[Request interrupted by user";
 /** Codex rollout turn-lifecycle `event_msg` payload.type values (task_started/task_complete are
  *  EventMsg::TurnStarted/TurnComplete serde-renamed; turn_aborted is EventMsg::TurnAborted). The net
  *  inspects the LAST of these in the tail — turn_aborted means the turn was Esc/aborted. */
@@ -529,9 +529,26 @@ export function lastTurnLine(text: string): string | null {
   return null;
 }
 
-/** Whether a raw transcript line carries the user-interrupt marker (Claude Code). */
+/** Whether a raw transcript line IS the user-interrupt marker (Claude Code): a turn whose own text
+ *  BEGINS with it. Claude writes the marker as a `user` row with one text block (verified against live
+ *  transcripts); a bare-string `message`/`content` is accepted too. Parsed, never substring-matched over
+ *  the raw line: the phrase also sits INSIDE tool_result / tool_use blocks whenever a tool reads a
+ *  transcript or greps for it, and those turns are not interrupts — matching them POSTed a false done. */
 export function hasInterruptMarker(line: string): boolean {
-  return line.includes(INTERRUPT_MARKER);
+  let row: unknown;
+  try { row = JSON.parse(line); } catch { return false; }
+  if (typeof row !== "object" || row === null) return false;
+  const message = (row as Record<string, unknown>).message;
+  const content = typeof message === "object" && message !== null
+    ? (message as Record<string, unknown>).content
+    : message;
+  const texts = Array.isArray(content)
+    ? content.map((part) => {
+      const p = part as Record<string, unknown> | null;
+      return p !== null && typeof p === "object" && p.type === "text" ? p.text : undefined;
+    })
+    : [content];
+  return texts.some((t) => typeof t === "string" && t.trimStart().startsWith(INTERRUPT_MARKER));
 }
 
 /** The codex rollout's LAST turn-lifecycle event type (payload.type), scanning from the end and
@@ -942,6 +959,23 @@ const CLAUDE_DESKTOP_BUNDLED_PATH_PARTS = [
 /** The desktop app's launcher, which sits between the Electron main process and the bundled `claude`:
  *  `…/Claude.app/Contents/Helpers/disclaimer <cmd…>`. Location-agnostic on purpose. */
 const CLAUDE_DESKTOP_LAUNCHER = "Claude.app/Contents/Helpers/disclaimer";
+
+/** Is this hook running INSIDE CURSOR rather than the agent whose entry it is? Cursor (the desktop app
+ *  and the `cursor-agent` CLI) imports Claude Code plugins and `~/.claude` hooks by default and runs
+ *  them with Cursor-shaped payloads, so Nomo's CLAUDE entries fire inside Cursor and would report a
+ *  Cursor chat as a Claude Code session. Two independent fingerprints, both Cursor's own documented
+ *  hook contract — EITHER is enough:
+ *    - env `CURSOR_VERSION` ("Cursor version string", always set for hook scripts) — PRESENT counts,
+ *      even empty;
+ *    - a `cursor_version` key in the stdin payload (one of Cursor's base input fields).
+ *  The Claude entries exit silently on it (hook.ts runHook, permission.ts runPermissionHook); a native
+ *  Cursor entry can import the same predicate to assert the opposite. Pure — env is injected. */
+export function cursorHostInvocation(
+  input: unknown, env: Record<string, string | undefined> = process.env,
+): boolean {
+  return env.CURSOR_VERSION !== undefined ||
+    (typeof input === "object" && input !== null && "cursor_version" in input);
+}
 
 /** Pure: is this hook's invoking `claude` a conversation window of the Claude DESKTOP app?
  *
