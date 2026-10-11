@@ -246,6 +246,12 @@ describe("no process handlers are ever installed", () => {
     expect(seen?.delegate).toBeDefined();
   });
 
+  test("a hold that ends WITHOUT the phone's decision says so (paused, superseded, threw)", async () => {
+    const base = { config, serverUrl: "http://127.0.0.1:4396/", requestId: "req-1", delegate: async () => {}, trace: () => {} };
+    expect(await runOcApproval(PERMISSION, { ...base, runHold: async () => {} })).toBe(false);
+    expect(await runOcApproval(PERMISSION, { ...base, runHold: async () => { throw new Error("boom"); } })).toBe(false);
+  });
+
   test("a REAL end-to-end hold answers OpenCode and adds no listener to `process`", async () => {
     const before = listenerCounts();
     const calls: string[] = [];
@@ -258,7 +264,7 @@ describe("no process handlers are ever installed", () => {
       return new Response("true", { status: 200 });
     }) as unknown as typeof fetch;
 
-    await runOcApproval(PERMISSION, {
+    const answered = await runOcApproval(PERMISSION, {
       config,
       serverUrl: "http://127.0.0.1:4396/",
       cwd: "/tmp/oc-probe",
@@ -270,6 +276,7 @@ describe("no process handlers are ever installed", () => {
     });
 
     expect(listenerCounts()).toEqual(before);
+    expect(answered).toBe(true); // the hold settled the record as working — the caller must not re-settle it
     // "Always allow" on the phone is `always` on the wire, on the verified reply route.
     expect(calls).toContain('POST http://127.0.0.1:4396/permission/per_01638472f0016YZI7giyZgEWE6/reply {"reply":"always"}');
   });
