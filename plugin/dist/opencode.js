@@ -2728,8 +2728,13 @@ async function runHook(agent) {
         if (line !== null && await interruptFlagSetAt(SESSIONS_DIR, reportedSessionId, Date.now())) {
           interrupted = true;
           await new Promise((resolve2) => {
-            process.stdout.write(`${line}
+            process.stdout.on("error", () => resolve2());
+            try {
+              process.stdout.write(`${line}
 `, () => resolve2());
+            } catch {
+              resolve2();
+            }
           });
         }
       }

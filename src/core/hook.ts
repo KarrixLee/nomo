@@ -787,7 +787,12 @@ export async function runHook(agent: AgentKind): Promise<void> {
         const line = interruptHookOutput(hookName);
         if (line !== null && await interruptFlagSetAt(SESSIONS_DIR, reportedSessionId, Date.now())) {
           interrupted = true;
-          await new Promise<void>((resolve) => { process.stdout.write(`${line}\n`, () => resolve()); });
+          // With the reader gone, node raises EPIPE as an unhandled stream 'error' (bun does not), which
+          // would exit 1 before the done is recorded. The listener stays on: resolve either way and carry on.
+          await new Promise<void>((resolve) => {
+            process.stdout.on("error", () => resolve());
+            try { process.stdout.write(`${line}\n`, () => resolve()); } catch { resolve(); }
+          });
         }
       }
     }
