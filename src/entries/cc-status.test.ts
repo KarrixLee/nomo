@@ -9,8 +9,8 @@ import {
   readDecisionHoldAt, readRecord, sealedBlobChars, SessionRecord, sessionBranch, writeDecisionHoldAt,
 } from "../core/shared";
 import {
-  aiTitle, buildBlob, buildEnvelope, buildPendingStash, cleanPromptTitle, codexIndexTitle, codexSessionTitle,
-  codexThreadName, detailForHook, firstUserPrompt, isPermissionNotification, planOp, sessionTitle,
+  aiTitle, buildBlob, buildEnvelope, buildPendingStash, cleanPromptTitle, clearsInterruptFlag, codexIndexTitle, codexSessionTitle,
+  codexThreadName, detailForHook, firstUserPrompt, INTERRUPT_STOP_REASON, interruptHookOutput, isPermissionNotification, planOp, sessionTitle,
   markDoneDeliveredAt, SESSION_TRACE_PATH, stashPendingEvent, trackSessionAt, transcriptStartMs,
 } from "./cc-status";
 import { provisionalsCoveredByReal, reconcileProvisionalsSweep } from "./cc-watchdog";
@@ -3487,4 +3487,49 @@ describe("runHook sends the local approvals pause as the x-cc-approvals header",
   test("no flag → exactly \"on\" (byte-for-byte; bracketed against the \"off\" case above)", async () => {
     expect(await headerFor(false)).toBe("on");
   }, 20000);
+});
+
+describe("interrupt: what the status hook tells Claude Code when the phone asked to stop", () => {
+  test("PreToolUse stops the turn AND denies the tool (continue:false alone lets the tool run)", () => {
+    expect(JSON.parse(interruptHookOutput("PreToolUse")!)).toEqual({
+      continue: false,
+      stopReason: INTERRUPT_STOP_REASON,
+      hookSpecificOutput: {
+        hookEventName: "PreToolUse",
+        permissionDecision: "deny",
+        permissionDecisionReason: INTERRUPT_STOP_REASON,
+      },
+    });
+  });
+
+  test("PostToolUse stops the turn (this is how a long-running tool's turn ends when it finishes)", () => {
+    expect(JSON.parse(interruptHookOutput("PostToolUse")!)).toEqual({
+      continue: false, stopReason: INTERRUPT_STOP_REASON,
+    });
+  });
+
+  test("no other event can carry it", () => {
+    for (const name of ["SessionStart", "UserPromptSubmit", "Notification", "Stop", "SessionEnd", "PermissionRequest", ""]) {
+      expect(interruptHookOutput(name)).toBeNull();
+    }
+  });
+
+  test("the output is one line (hook stdout is parsed as a single JSON document)", () => {
+    expect(interruptHookOutput("PreToolUse")!.includes("\n")).toBe(false);
+  });
+
+  test("a turn boundary clears the flag, so a late flag can never stop the user's NEXT prompt", () => {
+    expect(clearsInterruptFlag("UserPromptSubmit")).toBe(true);
+    expect(clearsInterruptFlag("Stop")).toBe(true);
+    expect(clearsInterruptFlag("SessionEnd")).toBe(true);
+  });
+
+  test("a tool event never clears it (the remaining tool calls in the message must be denied too)", () => {
+    expect(clearsInterruptFlag("PreToolUse")).toBe(false);
+    expect(clearsInterruptFlag("PostToolUse")).toBe(false);
+  });
+
+  test("an interrupted tool event is reported exactly like Stop — Claude Code fires no Stop hook after a hook-stopped turn", () => {
+    expect(planOp("Stop", { tool_name: "Bash" }, false)).toEqual({ op: "done", prio: 0, status: "done" });
+  });
 });
