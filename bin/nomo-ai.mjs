@@ -486,6 +486,11 @@ const AGENTS = [
         ? ["restart Cursor (and any open cursor-agent) so it re-reads hooks.json"]
         : ["restart Cursor (and any open cursor-agent) so it re-reads hooks.json", "run /nomo-pair"],
     detect: () => onPath("cursor-agent") || onPath("cursor") || existsSync(cursorDir()),
+    // The one agent whose installer NEEDS the host's own directory to exist (it merges into a file
+    // there). Claude and Codex go through their CLI and say so when it is missing; OpenCode's script
+    // creates what it needs. So `--all` on a machine without Cursor would fail the whole run on an
+    // agent nobody there uses — it is skipped instead. Naming `--cursor` still tries, and fails clearly.
+    skipUndetectedUnderAll: true,
     // Our own command sitting in Cursor's hooks.json — the bundle name is one only Nomo ships.
     installed: () => {
       try {
@@ -510,8 +515,8 @@ const AGENTS = [
       return fail
         ? {
             error: fail,
-            hint: "The script prints what it refused to do and changed nothing — an unparseable\n" +
-              "hooks.json, or a same-named skill it did not write (re-run it with --force).",
+            hint: "The script's own line above says what it refused and why. Fix that and re-run;\n" +
+              `    ${process.execPath} ${CURSOR_SCRIPT}`,
           }
         : null;
     },
@@ -571,6 +576,9 @@ function preflight(selected, explicit) {
 
 function parseArgs(argv) {
   const picked = new Set();
+  /** The agents spelled out by flag — as opposed to swept in by --all. */
+  const named = new Set();
+  let all = false;
   let yes = false;
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -578,15 +586,20 @@ function parseArgs(argv) {
     else if (a === "-v" || a === "--version") return { showVersion: true };
     else if (a === "-y" || a === "--yes") yes = true;
     else if (a === "-n" || a === "--dry-run") DRY = true;
-    else if (a === "--all") for (const ag of AGENTS) picked.add(ag.id);
+    else if (a === "--all") {
+      all = true;
+      for (const ag of AGENTS) picked.add(ag.id);
+    }
     else if (a === "--ref" || a.startsWith("--ref=")) {
       // A missing value would otherwise swallow the next flag and pin the checkout to "--opencode".
       REF = a === "--ref" ? argv[++i] : a.slice("--ref=".length);
       if (!REF || REF.startsWith("-")) return { needsValue: "--ref" };
-    } else if (a.startsWith("--") && AGENTS.some((ag) => ag.id === a.slice(2))) picked.add(a.slice(2));
-    else return { bad: a };
+    } else if (a.startsWith("--") && AGENTS.some((ag) => ag.id === a.slice(2))) {
+      picked.add(a.slice(2));
+      named.add(a.slice(2));
+    } else return { bad: a };
   }
-  return { picked, yes };
+  return { picked, yes, all, named };
 }
 
 /** --ref reaches exactly one leg. Saying so out loud is the whole point: a flag that reads as
@@ -949,6 +962,14 @@ async function main() {
     return 1;
   }
 
+  // --all is "everything", but an agent that cannot be installed without its host (see
+  // skipUndetectedUnderAll) and is not on this machine is left out rather than failed — unless the
+  // caller also named it.
+  const skipped = args.all
+    ? AGENTS.filter((a) => a.skipUndetectedUnderAll && !args.named.has(a.id) && !a.detect())
+    : [];
+  for (const a of skipped) selected.delete(a.id);
+
   preflight(selected, explicit);
 
   // An agent flag IS the non-interactive signal — asking for confirmation of a selection the caller
@@ -974,6 +995,10 @@ async function main() {
     }
   } else {
     render(selected);
+  }
+
+  for (const a of skipped) {
+    say(`${a.label} was not found on this machine — skipped. Name it with --${a.id} to install it anyway.\n`);
   }
 
   if (REF) refCaveat(selected);

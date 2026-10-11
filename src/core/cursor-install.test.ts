@@ -420,6 +420,46 @@ describe("bunx nomo-ai --cursor", () => {
     return `${out}${err}`;
   }
 
+  /** `nomo-ai --dry-run <flags>` on a machine that has Claude Code and Codex but NO Cursor: PATH is a
+   *  temp bin (stub `claude`/`codex`) plus the system dirs (for git), and CURSOR_CONFIG_DIR is absent. */
+  async function noCursor(flags: string[]): Promise<{ code: number; out: string }> {
+    const b = await box();
+    await rm(b.cursor, { recursive: true });
+    const bin = join(b.tmp, "bin");
+    await mkdir(bin, { recursive: true });
+    await mkdir(b.home, { recursive: true });
+    for (const name of ["claude", "codex"]) await writeFile(join(bin, name), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    const proc = spawnTestProcess({
+      cmd: [Bun.which("node")!, NOMO_AI, "--dry-run", ...flags],
+      cwd: b.tmp,
+      env: isolatedTestEnv(b.home, { NO_COLOR: "1", CURSOR_CONFIG_DIR: b.cursor, PATH: `${bin}:/usr/bin:/bin` }),
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [out, err] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
+    return { code: await proc.exited, out: `${out}${err}` };
+  }
+
+  test("--all on a machine without Cursor skips it with a note instead of failing the run", async () => {
+    const r = await noCursor(["--all"]);
+    expect(r.out).toContain("Cursor was not found on this machine — skipped");
+    expect(r.out).toContain("--cursor");
+    expect(r.out).not.toContain("cursor-install.mjs"); // neither planned nor run
+    expect(r.out).not.toContain("FAILED");
+    expect(r.code).toBe(0);
+    // The agents that ARE there are still installed.
+    expect(r.out).toContain("claude plugin install nomo-cc@nomo");
+    expect(r.out).toContain("opencode-install.sh");
+  });
+
+  test("an explicit --cursor is never skipped, with or without --all", async () => {
+    for (const flags of [["--cursor"], ["--all", "--cursor"]]) {
+      const r = await noCursor(flags);
+      expect(r.out).not.toContain("skipped");
+      expect(r.out).toContain("cursor-install.mjs");
+    }
+  });
+
   test("fresh: clones the checkout and runs the Cursor installer from it (dry run writes nothing)", async () => {
     const out = await plan(async () => {});
     expect(out).toContain("git clone --depth 1 https://github.com/KarrixLee/nomo.git");
