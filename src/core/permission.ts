@@ -37,7 +37,7 @@ import {
 import { b64url, Bytes, decryptBlob, deriveLanKey, encryptBlob } from "./crypto";
 // The ONE transcript classifier for "is Claude still parked on a user-blocking tool" — the watchdog's
 // dropped-PreToolUse backstop (adapter.ts) and this hold's local-answer watch must never drift apart.
-import { adapterFor, claudeTailPendingApproval } from "./adapter";
+import { adapterFor, claudeTailPendingApproval, cursorHostInvocation } from "./adapter";
 // The relay's timing/give-up rules, shared verbatim with the Codex relay (codex-remote-input.ts) that
 // polls the SAME route with the same credentials. See decision-poll.ts for what is deliberately NOT
 // shared — the first-contact POST ceiling, which each caller bounds by what IT blocks.
@@ -1463,6 +1463,11 @@ export async function runPermissionHook(
    *  exit that actually happened, not the one we expected when we built it. */
   let settleHeldRecord: (() => Promise<void>) | undefined;
   try {
+    // Cursor import guard, ahead of everything: Cursor runs the Claude plugin's PermissionRequest hook
+    // itself. Exit with NO decision line so Cursor falls back to its own prompt. See cursorHostInvocation;
+    // the payload half of the predicate is checked once stdin is parsed, below.
+    if (agent === "claude" && cursorHostInvocation(undefined)) return;
+
     // Escape hatch FIRST (a file stat — no stdin consumed yet): if the user paused remote approvals
     // locally, behave exactly as the old fire-and-forget attention event (instant terminal dialog).
     // Delegating to runHook reuses the entire needs-attention pipeline (POST, tracking, watchdog) and
@@ -1489,6 +1494,7 @@ export async function runPermissionHook(
       trace({ event: "exit", reason: "bad-stdin", ...errorTag(e), pos: parseErrorPosition(e) });
       return; // unreadable hook input → fail open, silent
     }
+    if (agent === "claude" && cursorHostInvocation(input)) return; // Cursor payload → no decision, no network
     const sessionId = typeof input.session_id === "string" ? input.session_id : "";
     if (sessionId.length === 0) { trace({ event: "exit", reason: "no-session-id" }); return; }
 

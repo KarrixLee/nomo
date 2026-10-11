@@ -50,6 +50,27 @@
           { "type": "command", "command": "NOMOR=\"${PLUGIN_ROOT}\"; NOMOS=\"$HOME/.config/cc-status/hook-shim.sh\"; [ -n \"$NOMOR\" ] && [ -x \"$NOMOR/scripts/run.sh\" ] && exec \"$NOMOR/scripts/run.sh\" \"$NOMOR/dist/codex-status.mjs\"; [ -x \"$NOMOS\" ] && exec \"$NOMOS\" codex-status; exit 0", "timeout": 3 }
         ]
       }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          { "type": "command", "command": "NOMOR=\"${PLUGIN_ROOT}\"; NOMOS=\"$HOME/.config/cc-status/hook-shim.sh\"; [ -n \"$NOMOR\" ] && [ -x \"$NOMOR/scripts/run.sh\" ] && exec \"$NOMOR/scripts/run.sh\" \"$NOMOR/dist/codex-status.mjs\"; [ -x \"$NOMOS\" ] && exec \"$NOMOS\" codex-status; exit 0", "timeout": 30 }
+        ]
+      }
+    ],
+    "PostCompact": [
+      {
+        "hooks": [
+          { "type": "command", "command": "NOMOR=\"${PLUGIN_ROOT}\"; NOMOS=\"$HOME/.config/cc-status/hook-shim.sh\"; [ -n \"$NOMOR\" ] && [ -x \"$NOMOR/scripts/run.sh\" ] && exec \"$NOMOR/scripts/run.sh\" \"$NOMOR/dist/codex-status.mjs\"; [ -x \"$NOMOS\" ] && exec \"$NOMOS\" codex-status; exit 0", "timeout": 30 }
+        ]
+      }
+    ],
+    "Interrupt": [
+      {
+        "hooks": [
+          { "type": "command", "command": "NOMOR=\"${PLUGIN_ROOT}\"; NOMOS=\"$HOME/.config/cc-status/hook-shim.sh\"; [ -n \"$NOMOR\" ] && [ -x \"$NOMOR/scripts/run.sh\" ] && exec \"$NOMOR/scripts/run.sh\" \"$NOMOR/dist/codex-status.mjs\"; [ -x \"$NOMOS\" ] && exec \"$NOMOS\" codex-status; exit 0", "timeout": 3 }
+        ]
+      }
     ]
   }
 }

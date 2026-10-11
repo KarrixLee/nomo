@@ -22,15 +22,16 @@ import { hostname } from "node:os";
 import { basename } from "node:path";
 import { Bytes, encryptBlob } from "./crypto";
 import {
-  adapterFor, claudeToolDetail, codexToolDetail, findProvisionalForPid, requestUserInputDetail,
+  adapterFor, claudeToolDetail, codexToolDetail, cursorHostInvocation, findProvisionalForPid, requestUserInputDetail,
   SessionCreationSuppression, TrackedSessionLite,
 } from "./adapter";
 import {
   AgentKind, appendFittedPlanAndDebug, atomicWrite, CCOp, CCStatus, codexCompanionBrokerEvidence, Config, decisionHoldFileName, ensureWatchdog, FolderIdentity, folderIdentity, formatPlanPickerDebug, fullTextForRecord, GONE_STRIKE_LIMIT,
-  LAST_SEND_PATH, lastHookPath, loadConfig, loadPendingConfig, localApprovalsState, PENDING_STASH_PATH, PendingEventStash, pidAncestors, pidCommand, PLUGIN_VERSION, postFullText, readPrefix,
+  LAST_SEND_PATH, lastHookPath, loadConfig, loadPendingConfig, localApprovalsState, PENDING_STASH_PATH, PendingEventStash, pidAlive, pidAncestors, pidCommand, PLUGIN_VERSION, postFullText, readDecisionHoldAt, readPrefix,
   readRecord, recordGoneStrike, removeRevokedConfig, resetGoneStrikes, SessionOrigin, SessionRecord, SESSIONS_DIR, sessionBranch, tracePlanPickerDecision, traceSession,
 } from "./shared";
 import { repairNotifyWiring } from "./notify-wire";
+import { stateHoldLive } from "./session-state";
 
 export { SESSION_TRACE_PATH } from "./shared";
 
@@ -79,17 +80,71 @@ export function detailForHook(hookName: string, toolName?: string, toolInput?: u
     return requestUserInputDetail(toolInput);
   }
   if (hookName === "PreToolUse") return toolName ? TOOL_DETAIL[toolName] : undefined;
-  if (hookName === "PostToolUse") return "thinking";
+  // A FAILED tool hands control back to the model exactly like a finished one.
+  if (hookName === "PostToolUse" || hookName === "PostToolUseFailure") return "thinking";
   return undefined;
 }
 
 /// Notification fires for BOTH a real permission prompt and the ~60s idle "Claude is waiting
 /// for your input" nudge. Only the permission case actually needs the user — the idle nudge must
 /// not flip a finished/working session to "needs help". Mirrors the reference app's `isPerm` gate.
+///
+/// `notification_type` is AUTHORITATIVE when present: the type list has grown (auth_success,
+/// agent_completed, the quota_auto_resume_* family, …) and their free-text messages can say "allow" or
+/// "permission" without anyone being asked anything. The message sniff survives ONLY as the fallback
+/// for a payload with no type at all (a Claude Code predating the field).
 export function isPermissionNotification(i: Record<string, unknown>): boolean {
   const type = typeof i.notification_type === "string" ? i.notification_type : "";
+  if (type.length > 0) return type === "permission_prompt";
   const msg = (typeof i.message === "string" ? i.message : "").toLowerCase();
-  return type === "permission_prompt" || msg.includes("permission") || msg.includes("approve") || msg.includes("allow");
+  return msg.includes("permission") || msg.includes("approve") || msg.includes("allow");
+}
+
+/// The Notification twins of the `Elicitation` hook: an MCP server's form / browser-URL request has
+/// sat unanswered ~6 s. Same meaning as the hook (blocked on the user), so the same needsAttention —
+/// a backstop for a dropped Elicitation hook, never an answerable approval.
+const ELICITATION_NOTIFICATIONS = new Set(["elicitation_dialog", "elicitation_url_dialog"]);
+
+/// Does a `Stop` payload say a background SUBAGENT is still running? Claude Code's Stop carries
+/// `background_tasks` ("in-flight" tasks, each with a `type` label and a `status`) precisely so a hook
+/// can tell "done" from "paused waiting for background work to wake it back up". ONLY `subagent`
+/// counts: a background `shell` (a dev server, `tail -f`) or a `monitor` can outlive the session's
+/// usefulness forever and would pin the row working, whereas a subagent ends and REPORTS BACK — which
+/// fires UserPromptSubmit and then a fresh Stop with the list re-evaluated, so the row still reaches
+/// done. Strict on `status` too: an unknown status reads as "not running" and keeps the old done.
+function hasRunningBackgroundAgent(input: Record<string, unknown>): boolean {
+  const tasks = input.background_tasks;
+  return Array.isArray(tasks) && tasks.some((t) => {
+    const task = t as Record<string, unknown> | null;
+    return typeof task === "object" && task !== null && task.type === "subagent" && task.status === "running";
+  });
+}
+
+/// The NOM-67 events — every one of them added long after the approval hold existed — YIELD to a live
+/// hold instead of writing over it. While a PermissionRequest hook is blocked on the phone, that card is
+/// the truth about the session (see stateHoldLive); a compaction notice, a failed parallel tool, an MCP
+/// form or an API-error stop from elsewhere in the same session must not take the row back, because the
+/// worker clears its decision overlay on any prio:0/done frame and the answerable card is then gone for
+/// good. Same rule, same three inputs, as the watchdog's corrective gate (decisionHoldIsLive). The
+/// pre-existing events are deliberately NOT in here — their behaviour under a hold is unchanged.
+const HOLD_YIELDING_EVENTS = new Set([
+  "StopFailure", "PostToolUseFailure", "PreCompact", "PostCompact", "Elicitation", "ElicitationResult", "Interrupt",
+]);
+export function yieldsToLiveHold(hookName: string, input: Record<string, unknown>): boolean {
+  if (HOLD_YIELDING_EVENTS.has(hookName)) return true;
+  if (hookName === "Stop") return hasRunningBackgroundAgent(input);       // the new working-not-done Stop
+  if (hookName === "Notification") return !isPermissionNotification(input); // the elicitation twins
+  return false;
+}
+
+/** Is a remote-approval hold LIVE on this session right now (marker + holder pid alive + inside the
+ *  TTL)? The hook-side twin of cc-watchdog's decisionHoldIsLive, built from the same parts. Never
+ *  throws; no marker (the overwhelmingly common case) is one failed read. */
+export async function sessionHoldIsLive(
+  sessionsDir: string, sessionId: string, now: number = Date.now(), alive: (pid: number) => boolean = pidAlive,
+): Promise<boolean> {
+  const hold = await readDecisionHoldAt(sessionsDir, sessionId);
+  return stateHoldLive(hold, hold !== null && typeof hold.pid === "number" ? alive(hold.pid) : false, now);
 }
 
 /// Tools that block on the USER (not on the machine): Claude presents them and then WAITS for a human
@@ -111,6 +166,13 @@ const USER_BLOCKING_TOOLS = new Set(["AskUserQuestion", "ExitPlanMode", "request
 ///   PreToolUse (AskUserQuestion / ExitPlanMode) → update, prio 1, needsAttention  (blocked on the user)
 ///   Notification (permission only) / PermissionRequest → update, prio 1, needsAttention
 ///   Stop                                        → done,   prio 0, done
+///   Stop (a background subagent still running)  → update, prio 0, working
+///   StopFailure (API error) / Interrupt (Codex) → done,   prio 0, done
+///   PostToolUseFailure                          → update, prio 0, working   (dropped on is_interrupt)
+///   Elicitation (+ its Notification twins)      → update, prio 1, needsAttention
+///   ElicitationResult                           → update, prio 0, working
+///   PreCompact / PostCompact (auto)             → update, prio 0, working
+///   PostCompact (manual)                        → done,   prio 0, done
 ///   SessionEnd                                  → end,    prio 0, done
 /// Re-arm: a SessionStart AFTER an op:done was sent for this session (sentDone) restarts as a fresh
 /// `update`/working — the session already exists in the worker, so it's an update, not a new start.
@@ -133,13 +195,42 @@ export function planOp(hookName: string, input: Record<string, unknown>, sentDon
     case "UserPromptSubmit":
     case "PostToolUse":
       return { op: "update", prio: 0, status: "working" };
+    case "PostToolUseFailure":
+      // A failed tool fires NO PostToolUse, so without this a needsAttention raised for it (a permission
+      // prompt answered at the terminal, then the tool erroring) stays up until the next tool. An abort
+      // is the exception: the turn is ending, and asserting "working" would be the stale state.
+      return input.is_interrupt === true ? null : { op: "update", prio: 0, status: "working" };
     case "Notification":
       // Drop the idle-waiting Notification so it can't masquerade as "needs help".
-      if (!isPermissionNotification(input)) return null;
+      if (!isPermissionNotification(input) &&
+          !(typeof input.notification_type === "string" && ELICITATION_NOTIFICATIONS.has(input.notification_type))) return null;
       return { op: "update", prio: 1, status: "needsAttention" };
     case "PermissionRequest":
+    // An MCP server asking the user for input mid-tool: blocked on the user, like a permission prompt —
+    // but only ever the notify-only needsAttention. Nothing here mints a decision card.
+    case "Elicitation":
       return { op: "update", prio: 1, status: "needsAttention" };
+    case "ElicitationResult":
+      return { op: "update", prio: 0, status: "working" };
+    case "PreCompact":
+      // Compaction is a minute of hook silence that otherwise reads as a stalled row.
+      return { op: "update", prio: 0, status: "working" };
+    case "PostCompact":
+      // A MANUAL compact runs at the idle prompt: no turn follows it, so "working" would never be
+      // retracted. An auto compact is mid-turn and the turn carries on.
+      return input.trigger === "manual"
+        ? { op: "done", prio: 0, status: "done" }
+        : { op: "update", prio: 0, status: "working" };
     case "Stop":
+      // The main agent stopped but a background subagent it launched has not: still working. That
+      // subagent's report-back fires UserPromptSubmit and then another Stop, which lands the done.
+      return hasRunningBackgroundAgent(input)
+        ? { op: "update", prio: 0, status: "working" }
+        : { op: "done", prio: 0, status: "done" };
+    // StopFailure: Claude Code fires it INSTEAD of Stop when the turn dies on an API error. Interrupt:
+    // Codex fires it when the user interrupts an active turn. Either way the turn is over.
+    case "StopFailure":
+    case "Interrupt":
       return { op: "done", prio: 0, status: "done" };
     case "SessionEnd":
       return { op: "end", prio: 0, status: "done" };
@@ -204,11 +295,12 @@ export function buildBlob(input: Record<string, unknown>, machine: string, title
   // not — a mid-session `git checkout` must reach the phone). Omitted when the folder is not a repo.
   const branch = sessionBranch(folder);
   const hookName = typeof input.hook_event_name === "string" ? input.hook_event_name : "";
-  const detail = detailOverride ?? detailForHook(
+  // A Stop that stays working (see planOp) is waiting on a background subagent — the Task tool's label.
+  const detail = detailOverride ?? (hookName === "Stop" && hasRunningBackgroundAgent(input) ? TOOL_DETAIL.Task : detailForHook(
     hookName,
     typeof input.tool_name === "string" ? input.tool_name : undefined,
     input.tool_input,
-  );
+  ));
   // The `agent` key is OMITTED for claude (byte-identical to the pre-codex blob so old Swift builds and
   // the existing snapshots are unaffected) and the agent's OWN literal for every other kind ("codex",
   // "opencode", …) — the rule is stated once, so a new AgentKind carries through here for free and can
@@ -638,6 +730,10 @@ export async function runHook(agent: AgentKind): Promise<void> {
   try {
     const [config, raw] = await Promise.all([loadConfig(), readStdin()]);
     const input = JSON.parse(raw) as Record<string, unknown>;
+    // Cursor import guard — FIRST, before the liveness stamp, any record or any POST. Cursor runs the
+    // Claude plugin's hooks itself, with Cursor-shaped payloads; mirroring those would report a Cursor
+    // chat as a Claude Code session. Only the CLAUDE entry is imported that way. See cursorHostInvocation.
+    if (agent === "claude" && cursorHostInvocation(input)) return;
     if (typeof input.session_id !== "string" || input.session_id.length === 0) return;
 
     // Codex compat-layer guard: Codex ≥0.142 auto-discovers installed Claude Code plugins as hook
@@ -965,6 +1061,12 @@ export async function runHook(agent: AgentKind): Promise<void> {
     const turnId = typeof input.turn_id === "string" && input.turn_id.length > 0 ? input.turn_id : undefined;
     let plan = planOp(hookName, input, sentDone);
     if (!plan) return;
+    // A live approval hold outranks the NOM-67 events — drop the event whole (no record write, no POST)
+    // so neither the LAN feed nor the worker's decision overlay loses the card. See yieldsToLiveHold.
+    if (yieldsToLiveHold(hookName, input) && await sessionHoldIsLive(SESSIONS_DIR, sessionId)) {
+      traceSession({ event: "hold-yield", sessionId, agent, hook_event_name: hookName });
+      return;
+    }
     // Some clients can remain blocked on USER input after the model turn itself completes. The
     // adapter owns that agent-specific proof. Today Codex uses it for the hookless TUI Plan picker:
     // keep the session in the attention queue instead of letting a Stop lie that it is done.
@@ -973,7 +1075,8 @@ export async function runHook(agent: AgentKind): Promise<void> {
     let attentionKind: "userInput" | undefined;
     let proposedPlan: string | undefined;
     let pickerClassifier = plan.op === "done" ? "none" : plan.status;
-    if (plan.op === "done" && adapter.completedTurnWaitState) {
+    // Stop ONLY: an interrupted turn (Interrupt) or a manual compact never ends on a Plan picker.
+    if (hookName === "Stop" && plan.op === "done" && adapter.completedTurnWaitState) {
       const evidence = adapter.completedTurnWaitEvidence
         ? await adapter.completedTurnWaitEvidence({ pid: hookPid, transcriptPath })
         : { state: await adapter.completedTurnWaitState({ pid: hookPid, transcriptPath }) };
