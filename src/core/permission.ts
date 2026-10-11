@@ -129,6 +129,7 @@ export const HOLD_BLOCKS_DIALOG: Record<AgentKind, boolean> = {
   claude: true,    // PermissionRequest hook — the terminal dialog appears only once this process exits
   codex: true,     // same blocking-hook contract, same frozen TUI
   opencode: false, // resident plugin, fired detached; OpenCode's own prompt is already on screen
+  cursor: false,   // NEVER holds: v1 is read-only and registers no permission-class hook at all
 };
 
 /** The Claude tools whose picker Claude Code renders ITSELF, concurrently with this hook — so the user

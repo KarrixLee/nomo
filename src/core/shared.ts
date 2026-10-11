@@ -426,8 +426,11 @@ export type CCStatus = "working" | "needsAttention" | "done";
  *  A third kind is NOT free: the dominant coercion idiom in this repo is
  *  `record.agent === "codex" ? "codex" : "claude"`, which silently reads opencode as CLAUDE. The ones
  *  that matter are the blob/record agent literals and anything that would join an OpenCode session
- *  against a Claude transcript or CC file. */
-export type AgentKind = "claude" | "codex" | "opencode";
+ *  against a Claude transcript or CC file.
+ *
+ *  `"cursor"` (the fourth) covers BOTH the Cursor desktop app's agent and the `cursor-agent` CLI — one
+ *  kind, one hook binary (entries/cursor-status.ts → core/cursor.ts). Read-only in v1. */
+export type AgentKind = "claude" | "codex" | "opencode" | "cursor";
 
 /** An agent literal AS IT ARRIVES — off a session record, out of a blob a peer install wrote. It is
  *  `AgentKind` plus "some string this build has never heard of", because that case is now REAL: two
@@ -449,6 +452,18 @@ export function codexHome(): string {
   const env = process.env.CODEX_HOME;
   return env && env.length > 0 ? env : `${process.env.HOME}/.codex`;
 }
+
+/** Cursor's config home — `$CURSOR_CONFIG_DIR` when set & non-empty (the CLI's documented override),
+ *  else `~/.cursor`. Holds the user-level `hooks.json` the installer merges Nomo's entries into, and
+ *  the desktop app's `projects/<slug>/agent-transcripts/`. */
+export function cursorHome(): string {
+  const env = process.env.CURSOR_CONFIG_DIR;
+  return env && env.length > 0 ? env : `${process.env.HOME}/.cursor`;
+}
+
+/** The substring that identifies OUR hook command inside Cursor's `hooks.json` (the bundled hook's
+ *  basename) — what status-cmd greps for to tell "installed" from "not set up here". */
+export const CURSOR_HOOK_MARKER = "cursor-status.mjs";
 
 /** The substring that identifies OUR hook command inside a codex `hooks.json` entry (the bundled
  *  hook's basename). status-cmd greps for it to flag leftover legacy (pre-native-plugin) installs. */

@@ -16,7 +16,7 @@ import { execFile } from "node:child_process";
 import { readdir, readFile, stat } from "node:fs/promises";
 import { promisify } from "node:util";
 import { basename, join } from "node:path";
-import { AgentKind, AgentKindWire, CC_DIR, codexHome, folderKeyFromCwd, isRealTty, lastHookPath, pidAlive, pidAncestors, pidCommand, readPrefix, readSuffix, SessionRecord } from "./shared";
+import { AgentKind, AgentKindWire, CC_DIR, codexHome, cursorHome, folderKeyFromCwd, isRealTty, lastHookPath, pidAlive, pidAncestors, pidCommand, readPrefix, readSuffix, SessionRecord } from "./shared";
 import { ancestryContainsHerdr, owningTerminalApp } from "./terminal-focus";
 
 const execFileP = promisify(execFile);
@@ -2458,6 +2458,47 @@ export const opencodeAdapter: AgentAdapter = {
   locateTuiPid: (ctx, deps) => opencodeLocateTuiPid(ctx, deps),
 };
 
+/** Cursor's model id off a hook payload: `model` (on every event, e.g. "cursor-grok-4.6-high-fast"),
+ *  else the optional `model_id`. Undefined → the blob omits the key. */
+export function cursorModel(input: Record<string, unknown>): string | undefined {
+  for (const key of ["model", "model_id"]) {
+    const v = input[key];
+    if (typeof v === "string" && v.trim().length > 0) return v.trim();
+  }
+  return undefined;
+}
+
+/** Cursor (desktop app + `cursor-agent` CLI) — a READ-ONLY v1 driven by Cursor's hooks.
+ *
+ *  Like `opencodeAdapter`, this is mostly reached through `adapterFor()` by the REBUILD paths (the
+ *  watchdog's corrective done/heartbeat, session-state's LAN rollup) for the `agent:"cursor"` literal.
+ *  The producer is core/cursor.ts, not runHook — Cursor's event names and payload differ from the
+ *  Claude-shaped ones planOp understands — and it calls `title`/`model` below with the raw payload.
+ *
+ *  TITLE = THE FIRST USER PROMPT. Cursor keeps the chat title only in an undocumented SQLite file
+ *  (state.vscdb), which is deliberately never read. The producer keeps the first non-empty title on
+ *  the record, so a later prompt cannot rename the row.
+ *
+ *  NO interrupt / approval / discovery / locate seams: v1 never reports needsAttention and never
+ *  answers anything. `sessionsDir` exists for status-cmd's hooks-not-firing check only (the desktop
+ *  app writes agent-transcripts there; the CLI may write none, which just means no warning).
+ *
+ *  NOT in `allAdapters`: that list drives the watchdog's discovery sweep, and Cursor has nothing to
+ *  discover — a row exists only once a prompt hook created it. */
+export const cursorAdapter: AgentAdapter = {
+  kind: "cursor",
+  title: async ({ input }) =>
+    typeof input.prompt === "string" ? displayTitleFromUserText(input.prompt) : undefined,
+  model: async ({ input }) => cursorModel(input),
+  detectInterrupt: () => false,
+  sessionsDir: () => `${cursorHome()}/projects`,
+  sessionMatch: (name: string) => name.endsWith(".jsonl"),
+  hookStampPath: () => lastHookPath("cursor"),
+  hooksNotFiringHint: "  run `bunx nomo-ai --cursor` again, then restart Cursor (Settings → Hooks shows what it loaded)",
+  toolDetail: {},
+  blobAgentFields: { agent: "cursor" as const },
+};
+
 /** The adapter for an agent kind THIS BUILD DOES NOT KNOW — a record stamped by a newer peer install
  *  (see AgentKindWire). Its whole job is `blobAgentFields`: carry the raw literal back out, so a
  *  rebuild by an older build re-emits the agent it was handed instead of silently dropping the key and
@@ -2494,6 +2535,7 @@ export function adapterFor(agent: AgentKindWire): AgentAdapter {
   switch (agent) {
     case "codex": return codexAdapter;
     case "opencode": return opencodeAdapter;
+    case "cursor": return cursorAdapter;
     case "claude": return claudeAdapter;
     default: return typeof agent === "string" && agent.length > 0 ? unknownAgentAdapter(agent) : claudeAdapter;
   }

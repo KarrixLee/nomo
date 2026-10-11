@@ -2307,7 +2307,12 @@ export function isClaudeIdleReapEligible(
   record: SessionRecord, now: number,
   transcriptMtimeMs: (path: string) => number | undefined = transcriptMtimeMsDefault,
 ): boolean {
-  if (recordAgent(record) !== "claude") return false;
+  // Cursor joins Claude here, and ONLY here: like Claude its hooks are its sole signal (no discovery,
+  // no notify, no resident plugin), so a dropped `stop` — or a row whose owner pid could not be found
+  // (CURSOR_UNKNOWN_OWNER_PID) — has nothing else to finish it. It never sets `awaitingPrompt`, so it
+  // only ever gets the 30-min clock.
+  const agent = recordAgent(record);
+  if (agent !== "claude" && agent !== "cursor") return false;
   if (record.provisional === true) return false;
   return idleReapAgeEligible(record, now, transcriptMtimeMs,
     record.awaitingPrompt === true ? CLAUDE_AWAITING_PROMPT_REAP_MS : CLAUDE_IDLE_REAP_MS);
