@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { PLAN_BLOB_TEXT_MAX_CHARS } from "../core/shared";
 import {
   isDefaultOcTitle, newOcState, ocAttentionFrame, ocEndFrames, ocForgetStatusFrame, ocModelFromMessage,
+  ocPromptAsked, ocPromptFrame, ocPromptHeld, ocPromptResolved, ocPromptsEndedBy,
   ocTodoMarkdown, reduceOcEvent,
 } from "./state";
 import type { OcState } from "./state";
@@ -366,6 +367,7 @@ describe("subagent filter", () => {
     expect(reduceOcEvent(state, { type: "session.deleted", properties: { sessionID: CHILD } }, 2_300)).toBeNull();
     expect(state.sessions.has(CHILD)).toBe(false);
     // The root is untouched by any of it.
+    expect(reduceOcEvent(state, status(ROOT, { type: "busy" }), 2_350)).toMatchObject({ sessionId: ROOT, status: "working" });
     expect(reduceOcEvent(state, idle(ROOT), 2_400)).toMatchObject({ sessionId: ROOT, op: "done" });
   });
 
@@ -579,10 +581,176 @@ describe("the no-hold attention frame", () => {
     });
   });
 
-  test("is null for an unknown or child session", () => {
+  test("is null for an unknown session, and lands on the ROOT row for a child", () => {
     const state = startedRoot();
     reduceOcEvent(state, created(CHILD, "Child session - x", { parentID: ROOT }), 1_000);
-    expect(ocAttentionFrame(state, CHILD, undefined, 20_000)).toBeNull();
+    expect(ocAttentionFrame(state, CHILD, undefined, 20_000)).toMatchObject({
+      sessionId: ROOT, op: "update", prio: 1, status: "needsAttention",
+    });
     expect(ocAttentionFrame(state, "ses_nope", undefined, 20_000)).toBeNull();
+  });
+});
+
+// -------------------------------------------------------------------------------------------------
+// Pending prompts (NOM-67). Shapes: `permission.asked {id, sessionID, …, tool:{messageID, callID}}`
+// (approvals.ts header; the 1.18.30 bundle maps `source` → exactly that `tool` pair) and a tool
+// `message.part.updated {part:{type:"tool", sessionID, messageID, callID, state:{status}}}`.
+// -------------------------------------------------------------------------------------------------
+
+const GRANDCHILD = "ses_grandchild000000000000000";
+const asked = (sessionID: string, id: string, callID = "call_1") => ({
+  type: "permission.asked",
+  properties: { id, sessionID, permission: "bash", patterns: ["ls"], metadata: {}, tool: { messageID: "msg_1", callID } },
+});
+const toolPart = (sessionID: string, state: string, callID = "call_1") => ({
+  type: "message.part.updated",
+  properties: { part: { id: "prt_1", sessionID, messageID: "msg_1", type: "tool", callID, tool: "bash", state: { status: state } } },
+});
+/** A root mid-turn (busy sent), with a subagent and a subagent-of-a-subagent. */
+function workingRoot(): OcState {
+  const state = startedRoot();
+  expect(reduceOcEvent(state, status(ROOT, { type: "busy" }), 2_000)).toMatchObject({ status: "working" });
+  reduceOcEvent(state, created(CHILD, "Child session - x", { parentID: ROOT }), 2_000);
+  reduceOcEvent(state, created(GRANDCHILD, "Child session - y", { parentID: CHILD }), 2_000);
+  return state;
+}
+
+describe("pending prompts", () => {
+  test("a subagent's prompt raises attention on the ROOT row, however deep", () => {
+    const state = workingRoot();
+    ocPromptAsked(state, asked(GRANDCHILD, "per_1"));
+    expect(ocPromptFrame(state, GRANDCHILD, 3_000)).toMatchObject({
+      sessionId: ROOT, op: "update", prio: 1, status: "needsAttention",
+    });
+    expect(state.sessions.has(GRANDCHILD)).toBe(false); // still no row of its own
+  });
+
+  test("the row returns to working once the prompt is answered, exactly once", () => {
+    const state = workingRoot();
+    ocPromptAsked(state, asked(ROOT, "per_1"));
+    expect(ocPromptFrame(state, ROOT, 3_000)).toMatchObject({ status: "needsAttention" });
+    expect(ocPromptResolved(state, "per_1")).toBe(ROOT);
+    expect(ocPromptFrame(state, ROOT, 3_100)).toMatchObject({
+      sessionId: ROOT, op: "update", prio: 0, status: "working", turnStartedAt: 2,
+    });
+    // …and the busy OpenCode repeats afterwards is the frame the phone now shows.
+    expect(reduceOcEvent(state, status(ROOT, { type: "busy" }), 3_200)).toBeNull();
+    expect(ocPromptResolved(state, "per_1")).toBeUndefined(); // already gone
+  });
+
+  test("an attention frame never leaves the identical-busy skip armed", () => {
+    const state = workingRoot();
+    expect(ocAttentionFrame(state, ROOT, undefined, 3_000)).not.toBeNull();
+    // No prompt was registered (a caller that only painted): the very next busy must repaint working.
+    expect(reduceOcEvent(state, status(ROOT, { type: "busy" }), 3_100)).toMatchObject({ status: "working" });
+  });
+
+  test("while ANY prompt is pending nothing paints working over it", () => {
+    const state = workingRoot();
+    ocPromptAsked(state, asked(ROOT, "per_1"));
+    ocPromptAsked(state, asked(CHILD, "per_2", "call_2"));
+    reduceOcEvent(state, { type: "session.updated", properties: { sessionID: ROOT, info: { id: ROOT, title: "Renamed" } } }, 3_000);
+    expect(reduceOcEvent(state, status(ROOT, { type: "busy" }), 3_100)).toBeNull();
+    expect(reduceOcEvent(state, todos(ROOT, THREE), 3_200)).toBeNull();
+    ocPromptResolved(state, "per_1");
+    expect(ocPromptFrame(state, ROOT, 3_300)).toMatchObject({ status: "needsAttention" }); // the child's is still up
+    ocPromptResolved(state, "per_2");
+    // The frame that finally clears it carries everything that was held back.
+    const frame = ocPromptFrame(state, ROOT, 3_400);
+    expect(frame).toMatchObject({ status: "working", title: "Renamed" });
+    expect(frame?.plan).toContain("Create a.txt");
+  });
+
+  test("a prompt HELD on the phone owns the row — nothing here may paint over its card", () => {
+    const state = workingRoot();
+    ocPromptAsked(state, asked(ROOT, "per_1"));
+    ocPromptHeld(state, "per_1", true);
+    // A subagent asks while the root's Allow/Deny card is up: yellow must not replace purple.
+    ocPromptAsked(state, asked(CHILD, "per_2", "call_2"));
+    expect(ocPromptFrame(state, CHILD, 3_000)).toBeNull();
+    // The subagent's is answered at the Mac: working must not replace purple either.
+    ocPromptResolved(state, "per_2");
+    expect(ocPromptFrame(state, ROOT, 3_100)).toBeNull();
+    // The hold ends unanswered (expired / gave up) with the prompt still open: the row is ours again.
+    ocPromptHeld(state, "per_1", false);
+    expect(ocPromptFrame(state, ROOT, 3_200)).toMatchObject({ status: "needsAttention" });
+    // A re-delivered ask keeps the flag that guards a live card.
+    ocPromptHeld(state, "per_1", true);
+    ocPromptAsked(state, asked(ROOT, "per_1"));
+    expect(ocPromptFrame(state, ROOT, 3_300)).toBeNull();
+    ocPromptHeld(state, "per_gone", true); // a prompt we are not tracking is not conjured
+    expect(state.prompts.has("per_gone")).toBe(false);
+  });
+
+  test("a finished tool part ends exactly the prompt that tool was blocked on", () => {
+    const state = workingRoot();
+    ocPromptAsked(state, asked(CHILD, "per_1", "call_1"));
+    ocPromptAsked(state, asked(CHILD, "per_2", "call_2"));
+    expect(ocPromptsEndedBy(state, toolPart(CHILD, "running"))).toEqual([]);
+    expect(ocPromptsEndedBy(state, toolPart(ROOT, "completed"))).toEqual([]); // another session's call
+    expect(ocPromptsEndedBy(state, toolPart(CHILD, "completed"))).toEqual([{ id: "per_1", byTool: true }]);
+    expect(ocPromptsEndedBy(state, toolPart(CHILD, "error", "call_2"))).toEqual([{ id: "per_2", byTool: true }]);
+    expect(ocPromptsEndedBy(state, partCopy(CHILD))).toEqual([]);
+  });
+
+  test("a session going idle or away ends its own prompts and its subagents'", () => {
+    const state = workingRoot();
+    ocPromptAsked(state, asked(GRANDCHILD, "per_1"));
+    ocPromptAsked(state, asked(ROOT, "per_2", "call_2"));
+    expect(ocPromptsEndedBy(state, idle(CHILD))).toEqual([{ id: "per_1", byTool: false }]);
+    expect(ocPromptsEndedBy(state, status(GRANDCHILD, { type: "idle" }))).toEqual([{ id: "per_1", byTool: false }]);
+    expect(ocPromptsEndedBy(state, status(GRANDCHILD, { type: "busy" }))).toEqual([]);
+    expect(ocPromptsEndedBy(state, { type: "session.deleted", properties: { sessionID: ROOT } }).map((p) => p.id).sort())
+      .toEqual(["per_1", "per_2"]);
+  });
+
+  test("a prompt resolved after the turn ended paints nothing", () => {
+    const state = workingRoot();
+    ocPromptAsked(state, asked(ROOT, "per_1"));
+    expect(reduceOcEvent(state, idle(ROOT), 3_000)).toMatchObject({ op: "done" });
+    ocPromptResolved(state, "per_1");
+    expect(ocPromptFrame(state, ROOT, 3_100)).toBeNull();
+    expect(ocPromptFrame(state, "ses_nope", 3_100)).toBeNull();
+  });
+});
+
+describe("turn end", () => {
+  test("session.status {idle} alone finishes the turn", () => {
+    const state = workingRoot();
+    expect(reduceOcEvent(state, status(ROOT, { type: "idle" }), 9_000)).toMatchObject({
+      sessionId: ROOT, op: "done", status: "done", turnStartedAt: 2,
+    });
+  });
+
+  test("idle arriving on BOTH channels is one done frame, in either order", () => {
+    for (const pair of [[status(ROOT, { type: "idle" }), idle(ROOT)], [idle(ROOT), status(ROOT, "idle")]]) {
+      const state = workingRoot();
+      expect(reduceOcEvent(state, pair[0], 9_000)).toMatchObject({ op: "done" });
+      expect(reduceOcEvent(state, pair[1], 9_001)).toBeNull();
+      // The next turn opens and closes normally.
+      expect(reduceOcEvent(state, status(ROOT, { type: "busy" }), 9_500)).toMatchObject({ status: "working" });
+      expect(reduceOcEvent(state, idle(ROOT), 9_900)).toMatchObject({ op: "done" });
+    }
+  });
+
+  test("a done that was NOT delivered is owed again on the next idle", () => {
+    const state = workingRoot();
+    expect(reduceOcEvent(state, status(ROOT, { type: "idle" }), 9_000)).toMatchObject({ op: "done" });
+    ocForgetStatusFrame(state, ROOT);
+    expect(reduceOcEvent(state, idle(ROOT), 9_001)).toMatchObject({ op: "done" });
+  });
+
+  test("an idle status for a session we never saw neither adopts it nor finishes it", () => {
+    const state = newOcState();
+    expect(reduceOcEvent(state, status(ROOT, { type: "idle" }), 5_000)).toBeNull();
+    expect(reduceOcEvent(state, idle(ROOT), 5_001)).toBeNull();
+    expect(state.sessions.size).toBe(0);
+  });
+
+  test("a todo landing after done re-opens the row, and the idle after it still closes it", () => {
+    const state = workingRoot();
+    expect(reduceOcEvent(state, idle(ROOT), 9_000)).toMatchObject({ op: "done" });
+    expect(reduceOcEvent(state, todos(ROOT, THREE), 9_100)).toMatchObject({ status: "working" });
+    expect(reduceOcEvent(state, status(ROOT, { type: "idle" }), 9_200)).toMatchObject({ op: "done" });
   });
 });
