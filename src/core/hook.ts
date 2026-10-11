@@ -22,15 +22,16 @@ import { hostname } from "node:os";
 import { basename } from "node:path";
 import { Bytes, encryptBlob } from "./crypto";
 import {
-  adapterFor, claudeToolDetail, codexToolDetail, findProvisionalForPid, requestUserInputDetail,
+  adapterFor, claudeToolDetail, codexToolDetail, cursorHostInvocation, findProvisionalForPid, requestUserInputDetail,
   SessionCreationSuppression, TrackedSessionLite,
 } from "./adapter";
 import {
   AgentKind, appendFittedPlanAndDebug, atomicWrite, CCOp, CCStatus, codexCompanionBrokerEvidence, Config, decisionHoldFileName, ensureWatchdog, FolderIdentity, folderIdentity, formatPlanPickerDebug, fullTextForRecord, GONE_STRIKE_LIMIT,
-  LAST_SEND_PATH, lastHookPath, loadConfig, loadPendingConfig, localApprovalsState, PENDING_STASH_PATH, PendingEventStash, pidAncestors, pidCommand, PLUGIN_VERSION, postFullText, readPrefix,
+  LAST_SEND_PATH, lastHookPath, loadConfig, loadPendingConfig, localApprovalsState, PENDING_STASH_PATH, PendingEventStash, pidAlive, pidAncestors, pidCommand, PLUGIN_VERSION, postFullText, readDecisionHoldAt, readPrefix,
   readRecord, recordGoneStrike, removeRevokedConfig, resetGoneStrikes, SessionOrigin, SessionRecord, SESSIONS_DIR, sessionBranch, tracePlanPickerDecision, traceSession,
 } from "./shared";
 import { repairNotifyWiring } from "./notify-wire";
+import { stateHoldLive } from "./session-state";
 
 export { SESSION_TRACE_PATH } from "./shared";
 
@@ -638,6 +639,10 @@ export async function runHook(agent: AgentKind): Promise<void> {
   try {
     const [config, raw] = await Promise.all([loadConfig(), readStdin()]);
     const input = JSON.parse(raw) as Record<string, unknown>;
+    // Cursor import guard — FIRST, before the liveness stamp, any record or any POST. Cursor runs the
+    // Claude plugin's hooks itself, with Cursor-shaped payloads; mirroring those would report a Cursor
+    // chat as a Claude Code session. Only the CLAUDE entry is imported that way. See cursorHostInvocation.
+    if (agent === "claude" && cursorHostInvocation(input)) return;
     if (typeof input.session_id !== "string" || input.session_id.length === 0) return;
 
     // Codex compat-layer guard: Codex ≥0.142 auto-discovers installed Claude Code plugins as hook
