@@ -104,7 +104,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "2.2.2";
+var PLUGIN_VERSION = "2.2.3";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -1714,7 +1714,7 @@ async function codexSessionModel(input, prefix, transcriptPath, home = codexHome
     return;
   }
 }
-var INTERRUPT_MARKER = "interrupted by user";
+var INTERRUPT_MARKER = "[Request interrupted by user";
 var CODEX_TURN_EVENTS = new Set(["task_started", "task_complete", "turn_aborted"]);
 var CODEX_ABORT_EVENT = "turn_aborted";
 function lastTurnLine(text) {
@@ -1739,7 +1739,23 @@ function lastTurnLine(text) {
   return null;
 }
 function hasInterruptMarker(line) {
-  return line.includes(INTERRUPT_MARKER);
+  let row;
+  try {
+    row = JSON.parse(line);
+  } catch {
+    return false;
+  }
+  if (typeof row !== "object" || row === null)
+    return false;
+  if (row.type !== "user")
+    return false;
+  const message = row.message;
+  const content = typeof message === "object" && message !== null ? message.content : message;
+  const texts = Array.isArray(content) ? content.map((part) => {
+    const p = part;
+    return p !== null && typeof p === "object" && p.type === "text" ? p.text : undefined;
+  }) : [content];
+  return texts.some((t) => typeof t === "string" && t.trimStart().startsWith(INTERRUPT_MARKER));
 }
 function codexLastTurnEvent(text) {
   const lines = text.split(`
@@ -2013,6 +2029,9 @@ var CLAUDE_DESKTOP_BUNDLED_PATH_PARTS = [
   "/claude.app/Contents/MacOS/claude"
 ];
 var CLAUDE_DESKTOP_LAUNCHER = "Claude.app/Contents/Helpers/disclaimer";
+function cursorHostInvocation(input, env = process.env) {
+  return env.CURSOR_VERSION !== undefined || typeof input === "object" && input !== null && "cursor_version" in input;
+}
 function claudeDesktopInvocation(selfArgs, ancestorArgs, entrypoint) {
   if (entrypoint === CLAUDE_DESKTOP_ENTRYPOINT)
     return true;
@@ -5255,14 +5274,44 @@ function detailForHook(hookName, toolName, toolInput) {
   }
   if (hookName === "PreToolUse")
     return toolName ? TOOL_DETAIL[toolName] : undefined;
-  if (hookName === "PostToolUse")
+  if (hookName === "PostToolUse" || hookName === "PostToolUseFailure")
     return "thinking";
   return;
 }
 function isPermissionNotification(i) {
   const type = typeof i.notification_type === "string" ? i.notification_type : "";
+  if (type.length > 0)
+    return type === "permission_prompt" || type === "worker_permission_prompt";
   const msg = (typeof i.message === "string" ? i.message : "").toLowerCase();
-  return type === "permission_prompt" || msg.includes("permission") || msg.includes("approve") || msg.includes("allow");
+  return msg.includes("permission") || msg.includes("approve") || msg.includes("allow");
+}
+var ATTENTION_NOTIFICATIONS = new Set(["elicitation_dialog", "elicitation_url_dialog", "agent_needs_input"]);
+function hasRunningBackgroundAgent(input) {
+  const tasks = input.background_tasks;
+  return Array.isArray(tasks) && tasks.some((t) => {
+    const task = t;
+    return typeof task === "object" && task !== null && task.type === "subagent" && (task.status === "running" || task.status === "pending");
+  });
+}
+var HOLD_YIELDING_EVENTS = new Set([
+  "PostToolUseFailure",
+  "PreCompact",
+  "PostCompact",
+  "Elicitation",
+  "ElicitationResult"
+]);
+function yieldsToLiveHold(hookName, input) {
+  if (HOLD_YIELDING_EVENTS.has(hookName))
+    return true;
+  if (hookName === "Stop")
+    return hasRunningBackgroundAgent(input);
+  if (hookName === "Notification")
+    return !isPermissionNotification(input);
+  return false;
+}
+async function sessionHoldIsLive(sessionsDir, sessionId, now = Date.now(), alive = pidAlive) {
+  const hold = await readDecisionHoldAt(sessionsDir, sessionId);
+  return stateHoldLive(hold, hold !== null && typeof hold.pid === "number" ? alive(hold.pid) : false, now);
 }
 var USER_BLOCKING_TOOLS = new Set(["AskUserQuestion", "ExitPlanMode", "request_user_input"]);
 function planOp(hookName, input, sentDone) {
@@ -5276,13 +5325,24 @@ function planOp(hookName, input, sentDone) {
     case "UserPromptSubmit":
     case "PostToolUse":
       return { op: "update", prio: 0, status: "working" };
+    case "PostToolUseFailure":
+      return input.is_interrupt === true ? null : { op: "update", prio: 0, status: "working" };
     case "Notification":
-      if (!isPermissionNotification(input))
+      if (!isPermissionNotification(input) && !(typeof input.notification_type === "string" && ATTENTION_NOTIFICATIONS.has(input.notification_type)))
         return null;
       return { op: "update", prio: 1, status: "needsAttention" };
     case "PermissionRequest":
+    case "Elicitation":
       return { op: "update", prio: 1, status: "needsAttention" };
+    case "ElicitationResult":
+      return { op: "update", prio: 0, status: "working" };
+    case "PreCompact":
+    case "PostCompact":
+      return input.trigger === "manual" ? null : { op: "update", prio: 0, status: "working" };
     case "Stop":
+      return hasRunningBackgroundAgent(input) ? { op: "update", prio: 0, status: "working" } : { op: "done", prio: 0, status: "done" };
+    case "StopFailure":
+    case "Interrupt":
       return { op: "done", prio: 0, status: "done" };
     case "SessionEnd":
       return { op: "end", prio: 0, status: "done" };
@@ -5318,7 +5378,7 @@ function buildBlob(input, machine, title, plan, agent = "claude", turnStartedAt,
   const { label, folderKey } = folder;
   const branch = sessionBranch(folder);
   const hookName = typeof input.hook_event_name === "string" ? input.hook_event_name : "";
-  const detail = detailOverride ?? detailForHook(hookName, typeof input.tool_name === "string" ? input.tool_name : undefined, input.tool_input);
+  const detail = detailOverride ?? (hookName === "Stop" && hasRunningBackgroundAgent(input) ? TOOL_DETAIL.Task : detailForHook(hookName, typeof input.tool_name === "string" ? input.tool_name : undefined, input.tool_input));
   const base = {
     status: plan.status,
     title: title ?? "",
@@ -5525,6 +5585,8 @@ async function runHook(agent) {
   try {
     const [config, raw] = await Promise.all([loadConfig(), readStdin()]);
     const input = JSON.parse(raw);
+    if (agent === "claude" && cursorHostInvocation(input))
+      return;
     if (typeof input.session_id !== "string" || input.session_id.length === 0)
       return;
     if (agent === "claude" && (typeof input.turn_id === "string" && input.turn_id.length > 0 || typeof input.transcript_path === "string" && input.transcript_path.includes("/.codex/"))) {
@@ -5697,12 +5759,16 @@ async function runHook(agent) {
     let plan = planOp(hookName, input, sentDone);
     if (!plan)
       return;
+    if (yieldsToLiveHold(hookName, input) && await sessionHoldIsLive(SESSIONS_DIR, sessionId)) {
+      traceSession({ event: "hold-yield", sessionId, agent, hook_event_name: hookName });
+      return;
+    }
     let pendingPlanPicker = false;
     let planPickerVerificationPending = false;
     let attentionKind;
     let proposedPlan;
     let pickerClassifier = plan.op === "done" ? "none" : plan.status;
-    if (plan.op === "done" && adapter2.completedTurnWaitState) {
+    if (hookName === "Stop" && plan.op === "done" && adapter2.completedTurnWaitState) {
       const evidence = adapter2.completedTurnWaitEvidence ? await adapter2.completedTurnWaitEvidence({ pid: hookPid, transcriptPath }) : { state: await adapter2.completedTurnWaitState({ pid: hookPid, transcriptPath }) };
       const wait = evidence.state;
       pickerClassifier = wait;
@@ -6558,6 +6624,8 @@ async function runPermissionHook(deps = {}, agent = "claude") {
   let settleAsWorking = false;
   let settleHeldRecord;
   try {
+    if (agent === "claude" && cursorHostInvocation(undefined))
+      return;
     if (await flagExists(noHoldPath)) {
       await (deps.delegate ?? (() => runHook(agent)))();
       return;
@@ -6578,6 +6646,8 @@ async function runPermissionHook(deps = {}, agent = "claude") {
       trace({ event: "exit", reason: "bad-stdin", ...errorTag(e), pos: parseErrorPosition(e) });
       return;
     }
+    if (agent === "claude" && cursorHostInvocation(input))
+      return;
     const sessionId = typeof input.session_id === "string" ? input.session_id : "";
     if (sessionId.length === 0) {
       trace({ event: "exit", reason: "no-session-id" });
