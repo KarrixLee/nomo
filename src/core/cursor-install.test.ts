@@ -7,7 +7,7 @@
 // the script is a zero-dependency .mjs that runs on import, and what matters is what lands on disk.
 // The real ~/.cursor is never read or written — CURSOR_CONFIG_DIR and HOME both point into the temp dir.
 
-import { cp, lstat, mkdir, mkdtemp, readdir, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, cp, link, lstat, mkdir, mkdtemp, readdir, readFile, readlink, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test } from "bun:test";
@@ -68,11 +68,13 @@ async function checkout(tmp: string, name: string): Promise<{ root: string; scri
   return { root, script: join(root, "scripts", "cursor-install.mjs") };
 }
 
-async function run(b: Box, args: string[] = [], script = b.script): Promise<{ code: number; out: string }> {
+async function run(
+  b: Box, args: string[] = [], script = b.script, env: Record<string, string> = {},
+): Promise<{ code: number; out: string }> {
   const proc = spawnTestProcess({
     cmd: ["node", script, ...args],
     cwd: b.tmp,
-    env: isolatedTestEnv(b.home, { CURSOR_CONFIG_DIR: b.cursor }),
+    env: isolatedTestEnv(b.home, { CURSOR_CONFIG_DIR: b.cursor, ...env }),
     stdout: "pipe",
     stderr: "pipe",
   });
@@ -99,6 +101,20 @@ describe("install into a hooks.json another tool already uses", () => {
     }
     expect(doc.hooks.sessionStart).toEqual([...FOREIGN.hooks.sessionStart, { command: ours(b.root), timeout: 10 }]);
     expect(doc.hooks.afterFileEdit[0]).toEqual(FOREIGN.hooks.afterFileEdit[0]);
+    // …and not merely equal as data: every foreign entry keeps its own key order (compared as TEXT),
+    // every foreign event keeps its position, and so do the top-level keys.
+    for (const [event, entries] of Object.entries(FOREIGN.hooks)) {
+      expect(JSON.stringify(doc.hooks[event].slice(0, entries.length))).toBe(JSON.stringify(entries));
+    }
+    expect(Object.keys(doc.hooks).slice(0, 4)).toEqual(Object.keys(FOREIGN.hooks));
+    expect(Object.keys(doc)).toEqual(Object.keys(FOREIGN));
+    const text = await readFile(b.hooks, "utf8");
+    for (const entries of Object.values(FOREIGN.hooks)) {
+      for (const entry of entries) {
+        // The entry's exact bytes as a 2-space document holds them (6 = hooks → event → entry).
+        expect(text).toContain(JSON.stringify(entry, null, 2).replace(/\n/g, "\n      "));
+      }
+    }
     // Theirs: every key we do not own is exactly as it was.
     expect(doc.hooks.beforeShellExecution).toEqual(FOREIGN.hooks.beforeShellExecution);
     expect(doc.hooks.preCompact).toEqual([]);
@@ -119,6 +135,8 @@ describe("install into a hooks.json another tool already uses", () => {
     // Uninstall: back to exactly the foreign document, then a second uninstall is a no-op.
     expect((await run(b, ["--uninstall"])).code).toBe(0);
     expect(await readJson(b.hooks)).toEqual(FOREIGN);
+    // The original was a 2-space document, so the round trip is exact to the BYTE.
+    expect(await readFile(b.hooks, "utf8")).toBe(original);
     const before = await readFile(b.hooks, "utf8");
     const noop = await run(b, ["--uninstall"]);
     expect(noop.out).toContain("no Nomo entries found");
@@ -156,6 +174,73 @@ describe("install into a hooks.json another tool already uses", () => {
     expect((await lstat(b.hooks)).isSymbolicLink()).toBe(true);
     expect((await readJson(real)).hooks.stop).toEqual([{ command: ours(b.root), timeout: 10 }]);
   });
+
+  test("the file's mode is preserved (a 0600 hooks.json stays 0600)", async () => {
+    const b = await box();
+    await writeFile(b.hooks, JSON.stringify(FOREIGN), { mode: 0o600 });
+    await chmod(b.hooks, 0o600);
+    expect((await run(b)).code).toBe(0);
+    expect((await stat(b.hooks)).mode & 0o777).toBe(0o600);
+    expect((await readJson(b.hooks)).hooks.stop).toEqual([{ command: ours(b.root), timeout: 10 }]);
+    expect((await run(b, ["--uninstall"])).code).toBe(0);
+    expect((await stat(b.hooks)).mode & 0o777).toBe(0o600);
+  });
+
+  test("look-alike entries are not ours: they survive install AND uninstall, in place", async () => {
+    const b = await box();
+    const lookalikes = {
+      // Our bundle name, but the two paths do not share a root — not a command we could have written.
+      stop: [{ command: "'/a/scripts/run.sh' '/b/dist/cursor-status.mjs'", timeout: 10 }],
+      // Our exact shape, but somebody added keys of their own to it.
+      postToolUse: [{ command: ours("/elsewhere/plugin"), timeout: 10, matcher: "Shell", failClosed: true }],
+      // Our exact shape on an event we never register.
+      preCompact: [{ command: ours("/elsewhere/plugin"), timeout: 10 }],
+      // The genuine article from another checkout: THIS one is replaced.
+      sessionEnd: [{ command: ours("/old/plugin"), timeout: 10 }, { command: "./theirs.sh" }],
+    };
+    await writeFile(b.hooks, JSON.stringify({ version: 1, hooks: lookalikes }));
+    expect((await run(b)).code).toBe(0);
+    let doc = await readJson(b.hooks);
+    expect(doc.hooks.stop).toEqual([...lookalikes.stop, { command: ours(b.root), timeout: 10 }]);
+    expect(doc.hooks.postToolUse).toEqual([...lookalikes.postToolUse, { command: ours(b.root), timeout: 10 }]);
+    expect(doc.hooks.preCompact).toEqual(lookalikes.preCompact);
+    expect(doc.hooks.sessionEnd).toEqual([{ command: "./theirs.sh" }, { command: ours(b.root), timeout: 10 }]);
+    expect(Object.keys(doc.hooks).slice(0, 4)).toEqual(Object.keys(lookalikes)); // nothing re-ordered
+
+    expect((await run(b, ["--uninstall"])).code).toBe(0);
+    doc = await readJson(b.hooks);
+    expect(doc.hooks).toEqual({
+      stop: lookalikes.stop, postToolUse: lookalikes.postToolUse, preCompact: lookalikes.preCompact,
+      sessionEnd: [{ command: "./theirs.sh" }],
+    });
+  });
+
+  test("uninstall drops an event only when removing OUR entry emptied it — an empty array it found stays", async () => {
+    const b = await box();
+    const text = JSON.stringify({ version: 1, hooks: { stop: [], preCompact: [], sessionEnd: [{ command: ours("/gone/plugin"), timeout: 10 }] } });
+    await writeFile(b.hooks, text);
+    expect((await run(b, ["--uninstall"])).code).toBe(0);
+    expect(await readJson(b.hooks)).toEqual({ version: 1, hooks: { stop: [], preCompact: [] } });
+  });
+
+  test("another tool's write between our read and our rename is merged, not overwritten", async () => {
+    const b = await box();
+    await writeFile(b.hooks, JSON.stringify(FOREIGN));
+    // The installer holds still (test seam) after preparing its temp file; that file is our cue.
+    const pending = run(b, [], b.script, { NOMO_CURSOR_INSTALL_TEST_PAUSE_MS: "1500" });
+    const deadline = Date.now() + 10_000;
+    while (!(await readdir(b.cursor)).some((n) => n.endsWith(".tmp"))) {
+      if (Date.now() > deadline) throw new Error("the installer never reached its write");
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    const theirs = { ...FOREIGN, hooks: { ...FOREIGN.hooks, stop: [{ command: "./landed-in-the-gap.sh" }] } };
+    await writeFile(b.hooks, JSON.stringify(theirs));
+    expect((await pending).code).toBe(0);
+    const doc = await readJson(b.hooks);
+    expect(doc.hooks.stop).toEqual([{ command: "./landed-in-the-gap.sh" }, { command: ours(b.root), timeout: 10 }]);
+    expect(doc.hooks.sessionStart).toEqual([...FOREIGN.hooks.sessionStart, { command: ours(b.root), timeout: 10 }]);
+    expect((await readdir(b.cursor)).filter((n) => n.endsWith(".tmp"))).toEqual([]);
+  }, 20_000);
 
   test("a re-install from a moved checkout replaces its old entries instead of doubling them", async () => {
     const b = await box("old-place");
@@ -204,6 +289,80 @@ describe("refusals change nothing", () => {
 
     expect((await run(b, ["--force"])).code).toBe(0);
     expect(await readFile(theirs, "utf8")).toContain("nomo-cursor-install");
+  });
+
+  test("a dangling symlink: refused, the link is left exactly as it was", async () => {
+    const b = await box();
+    await symlink(join(b.tmp, "nowhere.json"), b.hooks);
+    const r = await run(b);
+    expect(r.code).toBe(1);
+    expect(r.out).toContain("symlink whose target does not exist");
+    expect(r.out).toContain("nothing was changed");
+    expect(await readlink(b.hooks)).toBe(join(b.tmp, "nowhere.json"));
+    expect(await readdir(b.cursor)).toEqual(["hooks.json"]);
+    expect((await readdir(b.tmp)).includes("nowhere.json")).toBe(false);
+  });
+
+  test("a hard-linked hooks.json: refused rather than silently detached from its other name", async () => {
+    const b = await box();
+    const other = join(b.tmp, "dotfiles-hooks.json");
+    const text = JSON.stringify(FOREIGN);
+    await writeFile(other, text);
+    await link(other, b.hooks);
+    const r = await run(b);
+    expect(r.code).toBe(1);
+    expect(r.out).toContain("hard link");
+    expect(r.out).toContain("nothing was changed");
+    expect(await readFile(b.hooks, "utf8")).toBe(text);
+    expect((await stat(b.hooks)).ino).toBe((await stat(other)).ino);
+    expect(await skillsIn(b)).toEqual([]);
+  });
+
+  test("an unwritable Cursor dir: one named failure, no stack trace, nothing written", async () => {
+    for (const withHooks of [false, true]) {
+      const b = await box();
+      if (withHooks) await writeFile(b.hooks, JSON.stringify(FOREIGN));
+      await chmod(b.cursor, 0o555);
+      try {
+        const r = await run(b);
+        expect(r.code).toBe(1);
+        expect(r.out).toContain("cursor-install:");
+        expect(r.out).toContain("not writable");
+        expect(r.out).not.toMatch(/\n\s+at |node:fs|node:internal/);
+        expect(await readdir(b.cursor)).toEqual(withHooks ? ["hooks.json"] : []);
+        if (withHooks) expect(await readFile(b.hooks, "utf8")).toBe(JSON.stringify(FOREIGN));
+      } finally {
+        await chmod(b.cursor, 0o755);
+      }
+    }
+  });
+
+  test("an unwritable skills dir is refused BEFORE hooks.json is written", async () => {
+    const b = await box();
+    await mkdir(join(b.cursor, "skills"));
+    await chmod(join(b.cursor, "skills"), 0o555);
+    try {
+      const r = await run(b);
+      expect(r.code).toBe(1);
+      expect(r.out).toContain("not writable");
+      expect(r.out).not.toMatch(/node:fs|node:internal/);
+      expect(await readdir(b.cursor)).toEqual(["skills"]);
+    } finally {
+      await chmod(join(b.cursor, "skills"), 0o755);
+    }
+  });
+
+  test("a checkout path that is not shell-safe inside the skills' double quotes is refused", async () => {
+    // Each of these would run, expand or break out of `NOMOR="<root>"` when a skill's command runs.
+    // (`\` is rejected by the same check but cannot be driven from here: node itself refuses to load
+    // an ES module from a path containing one.)
+    for (const name of ["a$(touch pwned)", "back`tick", "dou\"ble", "dollar$&amp", "it's"]) {
+      const b = await box(name);
+      const r = await run(b);
+      expect(r.code).toBe(1);
+      expect(r.out).toContain("cannot be written safely");
+      expect(await readdir(b.cursor)).toEqual([]);
+    }
   });
 
   test("no Cursor config dir, or no built bundle: a named failure", async () => {
