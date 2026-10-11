@@ -104,7 +104,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "2.2.2";
+var PLUGIN_VERSION = "2.3.0";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -917,6 +917,27 @@ async function writeDecisionHold(sessionId, hold) {
 }
 async function clearDecisionHold(sessionId, pid, beforeUnlink, holdId) {
   return clearDecisionHoldAt(SESSIONS_DIR, sessionId, pid, beforeUnlink, holdId);
+}
+var INTERRUPT_FLAG_SUFFIX = ".interrupt";
+var INTERRUPT_FLAG_MAX_AGE_MS = 3600000;
+function interruptFlagFileName(sessionId) {
+  return `${sessionId}${INTERRUPT_FLAG_SUFFIX}`;
+}
+async function writeInterruptFlagAt(sessionsDir, sessionId, now) {
+  try {
+    await atomicWrite(`${sessionsDir}/${interruptFlagFileName(sessionId)}`, JSON.stringify({ at: now }), 384);
+  } catch {}
+}
+async function interruptFlagSetAt(sessionsDir, sessionId, now) {
+  try {
+    const flag = JSON.parse(await readFile(`${sessionsDir}/${interruptFlagFileName(sessionId)}`, "utf8"));
+    return typeof flag.at === "number" && now - flag.at <= INTERRUPT_FLAG_MAX_AGE_MS;
+  } catch {
+    return false;
+  }
+}
+async function clearInterruptFlagAt(sessionsDir, sessionId) {
+  await unlink(`${sessionsDir}/${interruptFlagFileName(sessionId)}`).catch(() => {});
 }
 async function settleDecisionHoldRecord(sessionId, patch) {
   return settleDecisionHoldRecordAt(SESSIONS_DIR, sessionId, patch);
@@ -2652,7 +2673,8 @@ var claudeAdapter = {
   hooksNotFiringHint: "  run /plugin in Claude Code, check the nomo plugin is enabled, then restart Claude Code",
   toolDetail: claudeToolDetail,
   blobAgentFields: {},
-  locateTuiPid: (ctx, deps) => claudeLocateTuiPid(ctx, deps)
+  locateTuiPid: (ctx, deps) => claudeLocateTuiPid(ctx, deps),
+  interrupt: "hook-flag"
 };
 var codexAdapter = {
   kind: "codex",
@@ -2709,7 +2731,8 @@ var codexAdapter = {
   blobAgentFields: { agent: "codex" },
   discoverLive: (known) => codexDiscoverLive(known),
   pidTurnActive: (pid) => codexPidTurnActive(pid),
-  locateTuiPid: (ctx, deps) => codexLocateTuiPid(ctx, deps)
+  locateTuiPid: (ctx, deps) => codexLocateTuiPid(ctx, deps),
+  interrupt: "app-server"
 };
 async function opencodeLocateTuiPid(ctx, deps = {}) {
   try {
@@ -3042,6 +3065,17 @@ class CodexAppServerClient {
       pending.interruptInFlight = false;
       this.reportError(error, "Failed to interrupt Codex user input");
       return "transport-error";
+    }
+  }
+  async interruptTurn(threadId, turnId) {
+    if (this.stateValue !== "ready" || !this.transport)
+      return "unavailable";
+    try {
+      await this.request("turn/interrupt", { threadId, turnId });
+      return "sent";
+    } catch (error) {
+      this.reportError(error, "Failed to interrupt Codex turn");
+      return "failed";
     }
   }
   connect() {
@@ -5265,6 +5299,30 @@ function isPermissionNotification(i) {
   return type === "permission_prompt" || msg.includes("permission") || msg.includes("approve") || msg.includes("allow");
 }
 var USER_BLOCKING_TOOLS = new Set(["AskUserQuestion", "ExitPlanMode", "request_user_input"]);
+var INTERRUPT_STOP_REASON = "Interrupted from Nomo";
+function interruptHookOutput(hookName) {
+  if (hookName === "PreToolUse") {
+    return JSON.stringify({
+      continue: false,
+      stopReason: INTERRUPT_STOP_REASON,
+      hookSpecificOutput: {
+        hookEventName: "PreToolUse",
+        permissionDecision: "deny",
+        permissionDecisionReason: INTERRUPT_STOP_REASON
+      }
+    });
+  }
+  if (hookName === "PostToolUse") {
+    return JSON.stringify({ continue: false, stopReason: INTERRUPT_STOP_REASON });
+  }
+  return null;
+}
+function clearsInterruptFlag(hookName) {
+  return hookName === "UserPromptSubmit" || hookName === "Stop" || hookName === "SessionEnd";
+}
+function interruptedEventInput(input) {
+  return { ...input, hook_event_name: "Stop" };
+}
 function planOp(hookName, input, sentDone) {
   switch (hookName) {
     case "SessionStart":
@@ -5386,6 +5444,7 @@ async function trackSessionAt(sessionsDir, sessionId, op, prio, status, blob, ma
     if (op === "end") {
       await unlink2(path).catch(() => {});
       await unlink2(`${sessionsDir}/${decisionHoldFileName(sessionId)}`).catch(() => {});
+      await unlink2(`${sessionsDir}/${interruptFlagFileName(sessionId)}`).catch(() => {});
       return;
     }
     const recordedAt = Date.now();
@@ -5561,6 +5620,21 @@ async function runHook(agent) {
     const machine = config.machineName ?? hostname().replace(/\.local$/, "");
     const reportedSessionId = input.session_id;
     const hookName = typeof input.hook_event_name === "string" ? input.hook_event_name : "";
+    let interrupted = false;
+    if (adapter2.interrupt === "hook-flag") {
+      if (clearsInterruptFlag(hookName)) {
+        await clearInterruptFlagAt(SESSIONS_DIR, reportedSessionId);
+      } else {
+        const line = interruptHookOutput(hookName);
+        if (line !== null && await interruptFlagSetAt(SESSIONS_DIR, reportedSessionId, Date.now())) {
+          interrupted = true;
+          await new Promise((resolve2) => {
+            process.stdout.write(`${line}
+`, () => resolve2());
+          });
+        }
+      }
+    }
     const sessionStartSource = typeof input.source === "string" ? input.source : "";
     const hookPid = process.ppid;
     const hookCommand = pidCommand(hookPid);
@@ -5694,7 +5768,9 @@ async function runHook(agent) {
     const turnStartedAt = isTurnOpener ? Math.floor(Date.now() / 1000) : cachedTurn;
     const awaitingPrompt = hookName === "SessionStart" && !reusedForkPredecessor && (existingRecord ? sentDone || existingRecord.awaitingPrompt === true : sessionStartSource !== "compact");
     const turnId = typeof input.turn_id === "string" && input.turn_id.length > 0 ? input.turn_id : undefined;
-    let plan = planOp(hookName, input, sentDone);
+    if (interrupted)
+      eventInput = interruptedEventInput(eventInput);
+    let plan = planOp(interrupted ? "Stop" : hookName, input, sentDone);
     if (!plan)
       return;
     let pendingPlanPicker = false;
@@ -7458,6 +7534,11 @@ class CodexRemoteInputBridge {
       return "unavailable";
     }
   }
+  async interruptTurn(threadId, turnId) {
+    if (this.client.state !== "ready" || this.stopping)
+      return "unavailable";
+    return this.client.interruptTurn(threadId, turnId);
+  }
   retire(handle, fallback) {
     const retirement = handle.resolvedElsewhere().catch((error) => this.reportError(error, fallback));
     this.pendingRetirements.add(retirement);
@@ -8189,7 +8270,8 @@ async function postEvent(config, body) {
     return "failed";
   }
 }
-var COMMAND_KINDS_ALLOWED = new Set(["focus-terminal"]);
+var INTERRUPT_COMMAND_KIND = "interrupt-session";
+var COMMAND_KINDS_ALLOWED = new Set(["focus-terminal", INTERRUPT_COMMAND_KIND]);
 var COMMANDS_PER_RESPONSE_MAX = 8;
 var COMMAND_BUFFER_MAX = 32;
 var EXECUTED_COMMAND_IDS_MAX = 64;
@@ -8297,6 +8379,26 @@ async function releaseFocusedTuiUserInputHold(config, sessionId, now, deps) {
   } catch {}
   return true;
 }
+async function interruptSession(adapter2, sessionId, record, now, deps) {
+  if (isDoneState(record))
+    return "not-running";
+  if (adapter2.interrupt === "hook-flag") {
+    const write = deps.writeInterruptFlagFn ?? (lanRunningUnderTest() ? async () => {} : (id, at) => writeInterruptFlagAt(SESSIONS_DIR, id, at));
+    await write(sessionId, now);
+    return "interrupt-flagged";
+  }
+  if (adapter2.interrupt === "app-server") {
+    const turnId = typeof record.turnId === "string" ? record.turnId : "";
+    if (turnId.length === 0)
+      return "no-turn";
+    const interrupt = deps.interruptCodexTurnFn ?? activeCodexInterrupt;
+    if (!interrupt)
+      return "bridge-unavailable";
+    const result = await interrupt(sessionId, turnId).catch(() => "failed");
+    return result === "sent" ? "interrupt-sent" : result === "unavailable" ? "bridge-unavailable" : "interrupt-failed";
+  }
+  return "unsupported";
+}
 async function drainCommands(config, deps = {}) {
   try {
     const pending = (deps.take ?? (() => commandBuffer.splice(0, commandBuffer.length)))();
@@ -8358,6 +8460,11 @@ async function drainCommands(config, deps = {}) {
         batchTargets.add(target);
         const agent = recordAgent(entry.rec);
         const adapter2 = deps.adapters ? deps.adapters.find((a) => a.kind === agent) ?? adapterFor(agent) : adapterFor(agent);
+        if (payload.kind === INTERRUPT_COMMAND_KIND) {
+          const result2 = await interruptSession(adapter2, payload.sessionId, entry.rec, now, deps);
+          traceFocus(deps, { ...base, agent, result: result2 });
+          continue;
+        }
         if (!adapter2.locateTuiPid) {
           traceFocus(deps, { ...base, agent, result: "unsupported" });
           continue;
@@ -9371,6 +9478,7 @@ async function goneStrikeShouldTeardown(goneStrikesPath) {
   return await recordGoneStrike(goneStrikesPath) >= GONE_STRIKE_LIMIT;
 }
 var activeBridgeShutdown;
+var activeCodexInterrupt;
 var activeLanShutdown;
 var BRIDGE_OP_DEADLINE_MS = 15000;
 var PLAN_PICKER_STATUS_QUERY_DEADLINE_MS = 2000;
@@ -9534,6 +9642,15 @@ function createBridgeSupervisor(deps = {}) {
         return "unavailable";
       }
     },
+    async interruptTurn(threadId, turnId) {
+      if (!bridge?.interruptTurn)
+        return "unavailable";
+      try {
+        return await withDeadline(bridge.interruptTurn(threadId, turnId), BRIDGE_OP_DEADLINE_MS) ?? "failed";
+      } catch {
+        return "failed";
+      }
+    },
     get active() {
       return bridge !== undefined;
     },
@@ -9614,6 +9731,7 @@ async function run() {
     })
   });
   activeBridgeShutdown = () => bridges.shutdown();
+  activeCodexInterrupt = (threadId, turnId) => bridges.interruptTurn(threadId, turnId);
   const lan = createLanListener({
     onCommand: acceptLanCommand,
     onAnswer: (answer) => {
@@ -9690,6 +9808,7 @@ async function run() {
   } finally {
     shutdown();
     activeBridgeShutdown = undefined;
+    activeCodexInterrupt = undefined;
     activeLanShutdown = undefined;
     activeLanListener = undefined;
     releaseSingleInstance();

@@ -97,7 +97,7 @@ async function sha256Hex(s) {
 }
 
 // src/core/shared.ts
-var PLUGIN_VERSION = "2.2.2";
+var PLUGIN_VERSION = "2.3.0";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -910,6 +910,27 @@ async function writeDecisionHold(sessionId, hold) {
 }
 async function clearDecisionHold(sessionId, pid, beforeUnlink, holdId) {
   return clearDecisionHoldAt(SESSIONS_DIR, sessionId, pid, beforeUnlink, holdId);
+}
+var INTERRUPT_FLAG_SUFFIX = ".interrupt";
+var INTERRUPT_FLAG_MAX_AGE_MS = 3600000;
+function interruptFlagFileName(sessionId) {
+  return `${sessionId}${INTERRUPT_FLAG_SUFFIX}`;
+}
+async function writeInterruptFlagAt(sessionsDir, sessionId, now) {
+  try {
+    await atomicWrite(`${sessionsDir}/${interruptFlagFileName(sessionId)}`, JSON.stringify({ at: now }), 384);
+  } catch {}
+}
+async function interruptFlagSetAt(sessionsDir, sessionId, now) {
+  try {
+    const flag = JSON.parse(await readFile(`${sessionsDir}/${interruptFlagFileName(sessionId)}`, "utf8"));
+    return typeof flag.at === "number" && now - flag.at <= INTERRUPT_FLAG_MAX_AGE_MS;
+  } catch {
+    return false;
+  }
+}
+async function clearInterruptFlagAt(sessionsDir, sessionId) {
+  await unlink(`${sessionsDir}/${interruptFlagFileName(sessionId)}`).catch(() => {});
 }
 async function settleDecisionHoldRecord(sessionId, patch) {
   return settleDecisionHoldRecordAt(SESSIONS_DIR, sessionId, patch);
