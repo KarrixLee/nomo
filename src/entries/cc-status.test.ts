@@ -3545,12 +3545,12 @@ describe("interrupt: what the status hook tells Claude Code when the phone asked
       url: `http://127.0.0.1:${server.port}`, pairingId: "p", pcSecret: "s", e2eKeyB64: b64url(rawKey),
     }));
     /** Spawn the real hook for one event and return exactly what it printed. */
-    const stdoutFor = async (hook_event_name: string): Promise<string> => {
+    const stdoutFor = async (hook_event_name: string, extra: Record<string, unknown> = {}): Promise<string> => {
       const proc = spawnTestProcess({
         cmd: ["bun", entry],
         env: isolatedTestEnv(home),
         stdin: Buffer.from(JSON.stringify({
-          session_id: "int-1", hook_event_name, tool_name: "Bash", cwd: "/x/api-status", transcript_path: "",
+          session_id: "int-1", hook_event_name, tool_name: "Bash", cwd: "/x/api-status", transcript_path: "", ...extra,
         })),
         stdout: "pipe", stderr: "ignore",
       });
@@ -3572,6 +3572,11 @@ describe("interrupt: what the status hook tells Claude Code when the phone asked
       expect(blob).toMatchObject({ status: "done" });
       expect(blob).not.toHaveProperty("detail");
       // Not consumed: the other tool calls of the same message must be stopped too.
+      expect(await readdir(sessions)).toContain(interruptFlagFileName("int-1"));
+
+      // A Codex-in-Claude event (this entry invoked inside a Codex session: the payload carries turn_id)
+      // is restamped to the codex adapter, whose interrupt is the app-server's — the hook prints nothing.
+      expect(await stdoutFor("PreToolUse", { turn_id: "turn-1" })).toBe("");
       expect(await readdir(sessions)).toContain(interruptFlagFileName("int-1"));
 
       expect(await stdoutFor("Stop")).toBe("");

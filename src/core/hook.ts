@@ -775,7 +775,8 @@ export async function runHook(agent: AgentKind): Promise<void> {
     const hookName = typeof input.hook_event_name === "string" ? input.hook_event_name : "";
     // PHONE INTERRUPT. Placed before every suppression return and before any network call, so a slow or
     // failed POST can never cost the user their interrupt. Keyed on the REPORTED id: that is the record
-    // file's stem, which is what the phone sealed into the command.
+    // file's stem (tool events never take the fork-alias path, which rewrites the id on SessionStart
+    // only), which is what the phone sealed into the command.
     // This is the one place the status hook writes stdout; the write is awaited so the line is flushed
     // before the entry's process.exit(0). Claude Code only ACTS on the line once this process exits, so
     // the stop itself can still lag by the event POST's 2-second timeout plus the full-text upload await.

@@ -1211,8 +1211,9 @@ export type FocusTraceResult =
   | "interrupt-flagged"  // interrupt-session: the hook flag was stamped (Claude stops at its next tool call)
   | "interrupt-sent"     // interrupt-session: the Codex app-server confirmed the turn aborted
   | "interrupt-failed"   // interrupt-session: the app-server refused (stale turn id) or timed out — after
-                         // a timeout the interrupt may still land
-  | "bridge-unavailable" // interrupt-session: no ready Codex bridge (daemon down, or an embedded TUI)
+                         // a timeout the interrupt may still land. Also what a thread NOT hosted by the
+                         // shared daemon returns when the daemon is up (the server refuses an unknown thread)
+  | "bridge-unavailable" // interrupt-session: no ready Codex bridge (daemon down, bridge parked or stopping)
   | "no-turn";           // interrupt-session: the Codex record carries no active turn id
 
 /** The module's generic best-effort trace, with the same argv guard tracePicker uses: pure unit calls run
@@ -1326,8 +1327,10 @@ async function interruptSession(
     if (turnId.length === 0) return "no-turn";
     const interrupt = deps.interruptCodexTurnFn ?? activeCodexInterrupt;
     if (!interrupt) return "bridge-unavailable";
-    // ponytail: no re-read + retry on a stale turn id (-32600). The hook restamps turnId on every
-    // event, so a mismatch is a turn that just ended. Add thread/read includeTurns if traces show it.
+    // ponytail: no re-read + retry on a stale turn id (-32600). The hook stamps turnId only when the
+    // event carries `turn_id` and the record drops the field otherwise, so a turn-id-less Codex event
+    // mid-turn yields `no-turn` until the next tool event; a mismatch is a turn that just ended. Add
+    // thread/read includeTurns if traces show it.
     const result = await interrupt(sessionId, turnId).catch(() => "failed" as const);
     return result === "sent" ? "interrupt-sent" : result === "unavailable" ? "bridge-unavailable" : "interrupt-failed";
   }
@@ -1424,12 +1427,15 @@ export async function drainCommands(config: Config, deps: DrainCommandsDeps = {}
         //       <SESSIONS_DIR>/<d.sessionId>.json, where d.sessionId is codexSentinelSessionId(pid),
         //       i.e. "codex-pid-<n>" — so a command naming the sentinel resolves here, it does not
         //       fall through to unknown-session;
-        //   (b) a provisional row can never be in the state the phone's button is offered for anyway:
+        //   (b) for focus-terminal (offered on waiting states), a provisional row can never be in the
+        //       state the phone's button is offered for anyway:
         //       buildProvisionalRecord only ever writes lastEvent sessionStart/done (op start/done,
         //       prio 0), and no net can flip one to needsAttention — correctPendingApproval requires a
         //       non-empty `transcript` (a provisional has none), shouldPlanPickerVerificationCheck
         //       excludes `provisional === true` outright, and correctResolvedPlanPicker needs a
         //       pendingPlanPicker marker a provisional never carries.
+        //       An interrupt-session (offered on working) naming a provisional row is refused later as
+        //       `no-turn` (it has no turn id), and the phone does not offer the button for `codex-pid-` rows.
         // So the sentinel is accepted if it ever arrives, and it realistically never will.
         if (entries === null) entries = await readRecords(); // one dir read per drain, not per command
         const entry = entries.find((e) => e.sessionId === payload.sessionId);
