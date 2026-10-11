@@ -4,6 +4,7 @@
 //
 // Contract with Cursor: read the event JSON on stdin, print NOTHING, exit 0 — always. No stdout means
 // no permission decision, no `continue`, no followup: this hook observes and can never steer or block.
+// It can DELAY a prompt submission, by as long as its own POST takes (≤ 2 s) — see core/cursor.ts.
 // PORTABILITY: bun AND node >= 18 — no `Bun.*` APIs.
 
 import { runCursorHook } from "../core/cursor";

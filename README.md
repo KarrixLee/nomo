@@ -129,7 +129,7 @@ For scripting and CI:
 | Flag | |
 |---|---|
 | `--claude` `--codex` `--opencode` `--cursor` | install exactly these — naming any one of them skips the prompt |
-| `--all` | all four, detected or not |
+| `--all` | all four, detected or not — except Cursor, which is skipped with a note when it is not on this machine (name `--cursor` to try anyway) |
 | `-y`, `--yes` | no prompt; install everything detected |
 | `-n`, `--dry-run` | print the commands, run nothing |
 | `--ref <branch\|tag>` | **OpenCode and Cursor only** — install from that ref instead of the default branch |
@@ -358,16 +358,31 @@ describe it for the desktop app only, so Nomo uses the hook source both surfaces
 read: `~/.cursor/hooks.json` (or `$CURSOR_CONFIG_DIR/hooks.json`). That file is yours and may already
 carry other tools' hooks, so the installer **merges**:
 
-- it parses the file first and **refuses to write** if it is not valid JSON or not the expected shape;
+- it checks everything first and **refuses before writing anything** if the file is not valid JSON or
+  not the expected shape, is a dangling symlink or has more than one hard link, or if it (or the
+  skills directory) is not writable. A live symlink is written through, not replaced;
 - it appends one entry per event, only if that exact entry is absent, and adds `"version": 1` only if
   the key is missing;
-- it never edits, reorders or removes an entry it did not write;
-- it writes atomically (temp file + rename), and re-running it changes nothing.
+- it never edits, reorders or removes an entry it did not write. An entry counts as Nomo's only if it
+  sits on one of the eight events below, its command is exactly Nomo's two quoted paths under one
+  checkout, and it has no keys besides `command` and `timeout` — anything else, however similar, is
+  yours and survives install and uninstall;
+- when something does change, the file is **re-serialised as 2-space JSON**: every entry, its key
+  order and its position are kept, hand formatting is not. A file that already has the entries is not
+  rewritten at all;
+- it writes atomically (temp file + rename) with the file's existing permissions, and re-reads the
+  file just before the rename so another tool's write in between is merged rather than lost.
+
+The checkout path is written into the hook command and the skills, so the installer refuses a path
+containing `'`, `"`, `$`, `\` or a backtick.
 
 It registers eight events — `sessionStart`, `beforeSubmitPrompt`, `postToolUse`,
-`postToolUseFailure`, `afterShellExecution`, `afterFileEdit`, `stop`, `sessionEnd` — and **no
-permission-class hook** (`preToolUse`, `beforeShellExecution`, …). The hook prints nothing and always
-exits 0, so it cannot allow, deny, delay or redirect anything Cursor does.
+`postToolUseFailure`, `afterShellExecution`, `afterFileEdit`, `stop`, `sessionEnd` — and no tool,
+shell, MCP or file **permission hook** (`preToolUse`, `beforeShellExecution`, …). The hook prints
+nothing and always exits 0, so it cannot allow, deny or redirect anything Cursor does.
+`beforeSubmitPrompt` is an event Cursor lets a hook block; Nomo's never answers it, but Cursor does
+wait for it, so the hook can **delay** a prompt: by the time one small HTTPS request takes, and up to about
+2 seconds when the Nomo relay cannot be reached (the send is awaited, with a 2-second timeout).
 
 To update, run `bunx nomo-ai --cursor` again (it pulls `~/.nomo`; the hook entries point at that
 checkout, so a pull is the whole update). To remove it:
@@ -394,7 +409,10 @@ was. Pairing is untouched — it belongs to every agent on the computer.
 - Your Cursor account email is present in Cursor's hook payloads; Nomo never reads it, and it is in no
   frame, record or log.
 - If a turn's `stop` hook never arrives, the row is marked done after 30 quiet minutes; a finished row
-  retires on its own after a little over an hour.
+  retires on its own after a little over an hour. If that turn then shows activity again, the row goes
+  back to working.
+- **Only your prompt starts a turn.** Once a turn has stopped, the row stays done until you send the
+  next message — activity from subagents, or a follow-up Cursor starts by itself, does not bring it back.
 
 ## Answering from your phone
 

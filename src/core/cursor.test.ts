@@ -15,6 +15,10 @@ import {
 import { Config, pidAlive, readRecord, SessionRecord } from "./shared";
 import { classifySession, correctIdleClaude, isClaudeIdleReapEligible } from "../entries/cc-watchdog";
 import { parseAudience, statusCmd } from "../entries/status-cmd";
+import { createProcessHygiene, isolatedTestEnv } from "../test/process-hygiene";
+
+const { spawnTestProcess } = createProcessHygiene();
+const ENTRY = join(import.meta.dir, "../entries/cursor-status.ts");
 
 const KEY = new Uint8Array(32).fill(7);
 const CONFIG: Config = { url: "https://example.invalid", pairingId: "pairing-1", pcSecret: "secret", e2eKey: KEY };
@@ -522,6 +526,72 @@ describe("runCursorHook — one event at a time", () => {
     await h.fire(FIXTURES.stop);
     expect(h.posts).toHaveLength(1);
     expect(await readFile(path, "utf8")).toBe(foreign);
+  });
+});
+
+describe("the real entry (src/entries/cursor-status.ts), spawned", () => {
+  // The contract with Cursor is about the PROCESS: nothing on stdout (anything there is read as a
+  // decision), nothing on stderr, exit 0 — whatever arrives on stdin. Only a spawn can see that.
+  async function spawnEntry(home: string, stdin: string): Promise<{ code: number; out: string; err: string }> {
+    const proc = spawnTestProcess({
+      cmd: ["bun", ENTRY],
+      env: isolatedTestEnv(home),
+      stdin: Buffer.from(stdin),
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [out, err] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
+    return { code: await proc.exited, out, err };
+  }
+  const GARBAGE = ["", "{not json", "[1,2]", "null", "\u0000\u0001", JSON.stringify({ hook_event_name: "stop" })];
+
+  test("unpaired: silent and exit 0 for every registered event and for garbage", async () => {
+    const home = await mkdtemp(join(tmpdir(), "nomo-cursor-entry-"));
+    dirs.push(home);
+    for (const stdin of [...Object.values(FIXTURES).map((f) => JSON.stringify(f)), ...GARBAGE]) {
+      expect(await spawnEntry(home, stdin)).toEqual({ code: 0, out: "", err: "" });
+    }
+  }, 60_000);
+
+  test("paired: still silent while it really records and POSTs; and silent when the relay is down", async () => {
+    const home = await mkdtemp(join(tmpdir(), "nomo-cursor-entry-"));
+    dirs.push(home);
+    const seen: string[] = [];
+    const relay = Bun.serve({
+      port: 0,
+      fetch: async (req) => { seen.push(((await req.json()) as { op: string }).op); return new Response("{}"); },
+    });
+    const cc = join(home, ".config", "cc-status");
+    await mkdir(cc, { recursive: true });
+    const writeConfig = (url: string) => writeFile(join(cc, "config.json"),
+      JSON.stringify({ url, pairingId: "a".repeat(32), pcSecret: "s", e2eKeyB64: b64url(KEY) }));
+    try {
+      await writeConfig(`http://127.0.0.1:${relay.port}`);
+      for (const f of Object.values(FIXTURES)) {
+        expect(await spawnEntry(home, JSON.stringify(f))).toEqual({ code: 0, out: "", err: "" });
+      }
+      expect(seen).toEqual(["start", "done", "end"]); // tool events fell inside the keep-alive window
+      for (const stdin of GARBAGE) expect(await spawnEntry(home, stdin)).toEqual({ code: 0, out: "", err: "" });
+    } finally {
+      relay.stop(true);
+    }
+    // Relay gone (connection refused): the prompt hook is as quiet as ever, and the row is on disk.
+    expect(await spawnEntry(home, JSON.stringify(FIXTURES.beforeSubmitPrompt))).toEqual({ code: 0, out: "", err: "" });
+    expect(await readRecord(CONV, join(cc, "sessions"))).toMatchObject({ agent: "cursor", lastEvent: "sessionStart" });
+  }, 60_000);
+});
+
+describe("the build", () => {
+  test("build.ts lists cursor-status.ts as an entrypoint, and the entry file exists", async () => {
+    // Read as text: build.ts builds on import. This pins the ENTRYPOINTS row — without it the
+    // installer's hook command points at a bundle no build ever produces — and needs no plugin/dist.
+    const build = await readFile(join(import.meta.dir, "../../build.ts"), "utf8");
+    const list = build.slice(build.indexOf("const ENTRYPOINTS = ["), build.indexOf('].map((f) => join(HERE, "src", "entries", f))'));
+    expect(list.length).toBeGreaterThan(0);
+    const entries = [...list.matchAll(/^\s*"([^"]+\.ts)",/gm)].map((m) => m[1]);
+    expect(entries).toContain("cursor-status.ts");
+    expect(entries).toContain("cc-status.ts"); // the parse itself is sound
+    expect(await Bun.file(ENTRY).exists()).toBe(true);
   });
 });
 

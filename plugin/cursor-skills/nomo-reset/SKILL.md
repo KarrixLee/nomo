@@ -20,8 +20,10 @@ What it does (relay the printed summary):
 - Pairing and encryption keys are NOT touched — the phone stays paired. To disconnect entirely, use
   `/nomo-unpair`.
 
-One caveat specific to Cursor: a desktop-app session's liveness is the **Cursor app**, so a
-stale-looking row belonging to a running Cursor is not cleared here — it retires on its own once the
-chat has been idle, or when Cursor quits.
+One caveat specific to Cursor: a row is cleared here only when Nomo knows which Cursor process owns
+it **and** that process has exited. A stale-looking row is therefore left alone in two cases — it
+belongs to a Cursor that is still running, or Nomo could not identify its owning process at all (then
+quitting Cursor does not clear it either). In both it is marked done after 30 quiet minutes and
+retires on its own about an hour later.
 
 It always exits 0 — "No watchdog running" / "No stale sessions to clear" are normal outcomes.

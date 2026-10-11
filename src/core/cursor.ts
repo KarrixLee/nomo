@@ -9,8 +9,18 @@
 //
 // THE CONTRACT WITH CURSOR: observe only. This process never writes to stdout (so it can never return
 // a permission decision, a `continue:false`, or a followup), always exits 0, and swallows every error.
-// It is also registered on NO permission-class event (preToolUse / beforeShellExecution / …) — Cursor
-// blocks those on malformed output, and the after-events carry everything a status row needs.
+// It is registered on NO tool/shell/MCP/file permission event (preToolUse / beforeShellExecution / …)
+// — Cursor blocks those on malformed output, and the after-events carry everything a status row needs.
+// `beforeSubmitPrompt` IS an event whose hook output can block a prompt (`continue: false`); it is
+// registered because only a prompt may create a row, and the no-stdout rule is what keeps it inert.
+//
+// WHAT IT COSTS. Cursor waits for the prompt hook, and this process AWAITS its POST (2 s timeout), so
+// an unreachable relay adds up to ~2 s to a prompt submission — and to a `stop`. A chat's first
+// prompt also pays the owner lookup (one `ps` per ancestor; retried at most every
+// CURSOR_OWNER_RETRY_MS while no owner is found). Tool events inside CURSOR_KEEPALIVE_MS do neither.
+// The POST is not detached, deliberately: nothing outlives `process.exit` in the entry, so a detached
+// send would need a second process per event, and a `done` needs the POST's answer to settle its
+// delivery marker (markDoneDeliveredAt). The Claude and Codex hooks await theirs the same way.
 //
 // PRIVACY: Cursor's payloads carry `user_email`. Nothing here reads it, and the blob/record/trace are
 // built from a fresh allow-listed object rather than the payload, so a new personal field upstream

@@ -81,7 +81,7 @@ Agents (naming any one of these skips the prompt):
   --codex                 OpenAI Codex
   --opencode              OpenCode
   --cursor                Cursor (desktop app + cursor-agent CLI)
-  --all                   all four
+  --all                   all four (Cursor only if it is on this machine)
 
 Options:
   -y, --yes               no prompt; install every agent detected on this machine
