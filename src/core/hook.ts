@@ -777,7 +777,8 @@ export async function runHook(agent: AgentKind): Promise<void> {
     // failed POST can never cost the user their interrupt. Keyed on the REPORTED id: that is the record
     // file's stem, which is what the phone sealed into the command.
     // This is the one place the status hook writes stdout; the write is awaited so the line is flushed
-    // before the entry's process.exit(0).
+    // before the entry's process.exit(0). Claude Code only ACTS on the line once this process exits, so
+    // the stop itself can still lag by the event POST's 2-second timeout plus the full-text upload await.
     let interrupted = false;
     if (adapter.interrupt === "hook-flag") {
       if (clearsInterruptFlag(hookName)) {
