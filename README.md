@@ -128,11 +128,11 @@ For scripting and CI:
 
 | Flag | |
 |---|---|
-| `--claude` `--codex` `--opencode` | install exactly these — naming any one of them skips the prompt |
-| `--all` | all three, detected or not |
+| `--claude` `--codex` `--opencode` `--cursor` | install exactly these — naming any one of them skips the prompt |
+| `--all` | all four, detected or not |
 | `-y`, `--yes` | no prompt; install everything detected |
 | `-n`, `--dry-run` | print the commands, run nothing |
-| `--ref <branch\|tag>` | **OpenCode only** — install from that ref instead of the default branch |
+| `--ref <branch\|tag>` | **OpenCode and Cursor only** — install from that ref instead of the default branch |
 | `-h`, `--help` / `-v`, `--version` | |
 
 With no flags and no terminal to ask, it refuses rather than guessing. Every failure names the step,
@@ -323,6 +323,78 @@ in something.
   normal approval, with no plugin change.
 - A session's liveness is the **OpenCode server process**, not the terminal — quit OpenCode to retire
   a row that looks stale.
+
+## Install — Cursor
+
+One install covers **both** the Cursor desktop app's agent and the `cursor-agent` CLI — they read the
+same user-level hooks file, and Nomo runs one hook binary for both.
+
+```sh
+bunx nomo-ai --cursor     # or: npx nomo-ai --cursor
+```
+
+That clones this repo to `~/.nomo` (the same checkout the OpenCode leg uses) and runs
+`plugin/scripts/cursor-install.mjs` from it. To do it by hand from a checkout you already have:
+
+```sh
+bun build.ts                                  # only if plugin/dist/ is not built
+node plugin/scripts/cursor-install.mjs
+```
+
+**Restart Cursor** (and any open `cursor-agent`) so it re-reads its hooks, then pair from inside it:
+
+```
+/nomo-pair
+```
+
+`/nomo-status`, `/nomo-reset` and `/nomo-unpair` are installed next to it. They are Cursor **skills**
+(`~/.cursor/skills/nomo-*/SKILL.md`) rather than legacy command files — that is the one format
+Cursor documents for the app and lists in the CLI's `/` menu. Pairing is shared: if this computer is
+already paired from Claude Code, Codex or OpenCode there is nothing to pair, and no restart is needed
+after pairing.
+
+**What the installer writes, and what it will not touch.** Cursor has a plugin format, but its docs
+describe it for the desktop app only, so Nomo uses the hook source both surfaces are documented to
+read: `~/.cursor/hooks.json` (or `$CURSOR_CONFIG_DIR/hooks.json`). That file is yours and may already
+carry other tools' hooks, so the installer **merges**:
+
+- it parses the file first and **refuses to write** if it is not valid JSON or not the expected shape;
+- it appends one entry per event, only if that exact entry is absent, and adds `"version": 1` only if
+  the key is missing;
+- it never edits, reorders or removes an entry it did not write;
+- it writes atomically (temp file + rename), and re-running it changes nothing.
+
+It registers eight events — `sessionStart`, `beforeSubmitPrompt`, `postToolUse`,
+`postToolUseFailure`, `afterShellExecution`, `afterFileEdit`, `stop`, `sessionEnd` — and **no
+permission-class hook** (`preToolUse`, `beforeShellExecution`, …). The hook prints nothing and always
+exits 0, so it cannot allow, deny, delay or redirect anything Cursor does.
+
+To update, run `bunx nomo-ai --cursor` again (it pulls `~/.nomo`; the hook entries point at that
+checkout, so a pull is the whole update). To remove it:
+
+```sh
+node ~/.nomo/plugin/scripts/cursor-install.mjs --uninstall
+```
+
+which removes exactly Nomo's hook entries and skills and leaves everything else in `hooks.json` as it
+was. Pairing is untouched — it belongs to every agent on the computer.
+
+### What Cursor does and doesn't do
+
+- **Read-only.** A Cursor session shows on the phone and the Dynamic Island as **working** or
+  **done**, with its folder, branch and model, and it ends when the chat or the CLI does.
+- **No remote approvals.** Cursor's approval prompts stay in Cursor; a Cursor session never shows a
+  "needs you" state on the phone, because nothing in v1 would let you answer it from there.
+- **The title is your first prompt.** Cursor keeps a chat's generated title only in an internal
+  database Nomo does not read, so the row is named after the first thing you asked.
+- **A row appears at your first prompt**, not when a chat window opens — an empty chat is not a
+  session worth a notification.
+- **Cloud / background agents are not mirrored.**
+- **"Open on Mac" is not available** for Cursor sessions.
+- Your Cursor account email is present in Cursor's hook payloads; Nomo never reads it, and it is in no
+  frame, record or log.
+- If a turn's `stop` hook never arrives, the row is marked done after 30 quiet minutes; a finished row
+  retires on its own after a little over an hour.
 
 ## Answering from your phone
 
