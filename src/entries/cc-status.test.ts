@@ -6,12 +6,12 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { b64url, decryptBlob } from "../core/crypto";
 import {
   BLOB_FIT_CHARS, DBG_BLOB_TEXT_MAX_CHARS, folderIdentity, folderKeyFromCwd, formatPlanPickerDebug, fullTextForRecord, parseConfig, PendingEventStash, PLAN_BLOB_TEXT_MAX_CHARS, PLAN_BLOB_TRUNCATION_MARKER, postFullText,
-  interruptFlagFileName, readDecisionHoldAt, readRecord, sealedBlobChars, SessionRecord, sessionBranch, writeDecisionHoldAt, writeInterruptFlagAt,
+  decisionHoldFileName, interruptFlagFileName, readDecisionHoldAt, readRecord, sealedBlobChars, SessionRecord, sessionBranch, writeDecisionHoldAt, writeInterruptFlagAt,
 } from "../core/shared";
 import {
   aiTitle, buildBlob, buildEnvelope, buildPendingStash, cleanPromptTitle, clearsInterruptFlag, codexIndexTitle, codexSessionTitle,
   codexThreadName, detailForHook, firstUserPrompt, INTERRUPT_STOP_REASON, interruptedEventInput, interruptHookOutput, isPermissionNotification, planOp, sessionTitle,
-  markDoneDeliveredAt, SESSION_TRACE_PATH, stashPendingEvent, trackSessionAt, transcriptStartMs,
+  markDoneDeliveredAt, SESSION_TRACE_PATH, sessionHoldIsLive, stashPendingEvent, trackSessionAt, transcriptStartMs, yieldsToLiveHold,
 } from "./cc-status";
 import { provisionalsCoveredByReal, reconcileProvisionalsSweep } from "./cc-watchdog";
 import { hooksAppearStale, parseCodexPluginState, parseLanTrace, renderLanTrace, statusCmd } from "./status-cmd";
@@ -25,12 +25,12 @@ const KEY_API_STATUS = folderKeyFromCwd("/Users/x/api-status");
 const { spawnTestProcess } = createProcessHygiene();
 
 describe("native Codex hook manifest", () => {
-  test("registers all seven lifecycle hooks, including bounded SessionEnd cleanup", async () => {
+  test("registers all ten lifecycle hooks, including bounded SessionEnd cleanup", async () => {
     const path = join(import.meta.dir, "../../plugin/hooks/codex-hooks.json");
     const manifest = JSON.parse(await readFile(path, "utf8")) as {
       hooks: Record<string, Array<{ hooks?: Array<{ command?: string; timeout?: number }> }>>;
     };
-    expect(Object.keys(manifest.hooks)).toHaveLength(7);
+    expect(Object.keys(manifest.hooks)).toHaveLength(10);
     const sessionEnd = manifest.hooks.SessionEnd?.[0]?.hooks?.[0];
     expect(sessionEnd?.command).toContain("dist/codex-status.mjs");
     // WHY 3: Codex hard-caps SessionEnd hook timeouts at 3s (SessionEnd blocks its shutdown) and, since
@@ -45,6 +45,23 @@ describe("native Codex hook manifest", () => {
     expect(sessionEnd?.timeout).toBe(3);
   });
 
+  // NOM-67. Esc used to reach the phone only through the watchdog's rollout scan (20-25 s); Codex's
+  // Interrupt hook says so directly. Its timeout is capped by Codex at 3 s (default 1 s — too short for
+  // one 2 s-budget POST), the same clamp as SessionEnd; a hook killed mid-POST leaves the done's
+  // `donePending` on disk for the watchdog, and the rollout scan stays as the backstop.
+  test("registers Interrupt (3 s, Codex's cap) and both compaction hooks on the status entry", async () => {
+    const path = join(import.meta.dir, "../../plugin/hooks/codex-hooks.json");
+    const manifest = JSON.parse(await readFile(path, "utf8")) as {
+      hooks: Record<string, Array<{ matcher?: string; hooks?: Array<{ command?: string; timeout?: number }> }>>;
+    };
+    for (const event of ["Interrupt", "PreCompact", "PostCompact"]) {
+      expect(manifest.hooks[event]).toHaveLength(1);
+      expect(manifest.hooks[event][0].matcher).toBeUndefined(); // both compaction triggers; Interrupt ignores it
+      expect(manifest.hooks[event][0].hooks?.[0]?.command).toContain("dist/codex-status.mjs");
+    }
+    expect(manifest.hooks.Interrupt[0].hooks?.[0]?.timeout).toBe(3);
+  });
+
   // ROLLED BACK 2026-08-05 (field): the blocking request_user_input handler HUNG — its trace showed
   // `start` with no `posted`/`exit`, and with a 3600s manifest timeout it blocked Codex's own tool call,
   // so the user saw NO picker in the CLI and nothing answerable on the phone. The app-server bridge
@@ -56,6 +73,34 @@ describe("native Codex hook manifest", () => {
       hooks: Record<string, Array<{ matcher?: string }>>;
     };
     expect(manifest.hooks.PreToolUse.some((entry) => entry.matcher === "request_user_input")).toBe(false);
+  });
+});
+
+describe("Claude Code hook manifest (NOM-67 coverage)", () => {
+  test("every newly mapped event is registered on the status entry — and on nothing that can decide", async () => {
+    const path = join(import.meta.dir, "../../plugin/hooks/hooks.json");
+    const manifest = JSON.parse(await readFile(path, "utf8")) as {
+      hooks: Record<string, Array<{ matcher?: string; hooks?: Array<{ command?: string }> }>>;
+    };
+    for (const event of ["StopFailure", "PostToolUseFailure", "PreCompact", "PostCompact", "Elicitation", "ElicitationResult"]) {
+      expect(manifest.hooks[event]).toHaveLength(1);
+      const command = manifest.hooks[event][0].hooks?.[0]?.command ?? "";
+      expect(`${event}: ${command}`).toContain("dist/cc-status.mjs");
+      // cc-status prints NOTHING, so it can never answer an elicitation or block a compaction.
+      expect(`${event}: ${command}`).not.toContain("cc-permission");
+    }
+    expect(manifest.hooks.PostToolUseFailure[0].matcher).toBe("*");
+    // Elicitation and PreCompact run BEFORE something the user is waiting on (the MCP dialog, the
+    // compaction), so a wedged hook may only ever cost a bounded, short wait.
+    const timeouts = manifest as unknown as { hooks: Record<string, Array<{ hooks?: Array<{ timeout?: number }> }>> };
+    for (const event of ["Elicitation", "PreCompact"]) {
+      expect(`${event}: ${timeouts.hooks[event][0].hooks?.[0]?.timeout}`).toBe(`${event}: 10`);
+    }
+    // The permission entry stays wired to PermissionRequest alone.
+    const deciders = Object.entries(manifest.hooks)
+      .filter(([, groups]) => groups.some((g) => g.hooks?.some((h) => h.command?.includes("cc-permission"))))
+      .map(([event]) => event);
+    expect(deciders).toEqual(["PermissionRequest"]);
   });
 });
 
@@ -85,8 +130,79 @@ describe("planOp (op mapping table)", () => {
     expect(planOp("SessionEnd", i(), false)).toMatchObject({ op: "end", prio: 0 });
   });
   test("unknown hooks are ignored", () => {
-    expect(planOp("PreCompact", i(), false)).toBeNull();
+    expect(planOp("SubagentStop", i(), false)).toBeNull();
     expect(planOp("", i(), false)).toBeNull();
+  });
+
+  // --- NOM-67 hook coverage -------------------------------------------------------------------
+  const working = { op: "update", prio: 0, status: "working" } as const;
+  const attention = { op: "update", prio: 1, status: "needsAttention" } as const;
+  const done = { op: "done", prio: 0, status: "done" } as const;
+
+  test("StopFailure (the turn died on an API error — fired INSTEAD of Stop) → done", () => {
+    expect(planOp("StopFailure", i({ error: "rate_limit", error_details: "429 Too Many Requests" }), false)).toEqual(done);
+  });
+  test("PostToolUseFailure → working like PostToolUse (clears a stale needsAttention); an abort is dropped", () => {
+    expect(planOp("PostToolUseFailure", i({ tool_name: "Bash", error: "Exit code 1", is_interrupt: false }), false)).toEqual(working);
+    expect(planOp("PostToolUseFailure", i({ tool_name: "Bash", error: "Exit code 1" }), false)).toEqual(working);
+    expect(planOp("PostToolUseFailure", i({ tool_name: "Bash", is_interrupt: true }), false)).toBeNull();
+    expect(detailForHook("PostToolUseFailure", "Bash")).toBe("thinking");
+  });
+  test("Elicitation → needsAttention; ElicitationResult → working", () => {
+    expect(planOp("Elicitation", i({ mcp_server_name: "srv", message: "Please authenticate", mode: "url" }), false)).toEqual(attention);
+    expect(planOp("ElicitationResult", i({ mcp_server_name: "srv", action: "accept" }), false)).toEqual(working);
+    expect(planOp("ElicitationResult", i({ mcp_server_name: "srv", action: "cancel" }), false)).toEqual(working);
+  });
+  test("the elicitation Notification types raise needsAttention too; the others stay dropped", () => {
+    expect(planOp("Notification", i({ notification_type: "elicitation_dialog", message: "x" }), false)).toEqual(attention);
+    expect(planOp("Notification", i({ notification_type: "elicitation_url_dialog", message: "x" }), false)).toEqual(attention);
+    for (const type of ["elicitation_complete", "elicitation_response", "idle_prompt", "auth_success", "agent_completed"]) {
+      expect(planOp("Notification", i({ notification_type: type, message: "Please allow permission to approve" }), false)).toBeNull();
+    }
+  });
+  test("an elicitation is NEVER an answerable approval: plain needsAttention blob, no decision keys", async () => {
+    const input = { session_id: "s", cwd: "/Users/x/api-status", hook_event_name: "Elicitation", mcp_server_name: "srv", message: "Token?" };
+    const blob = buildBlob(input, "Mac", "t", planOp("Elicitation", input, false)!);
+    expect(blob).toEqual({ status: "needsAttention", title: "t", machine: "Mac", label: "api-status", folderKey: KEY_API_STATUS });
+    const envelope = await buildEnvelope(input, "Mac", 1, "t", KEY, false);
+    expect(envelope?.attentionKind).toBeUndefined();
+  });
+  test("an AUTO compaction (mid-turn) reads working; a MANUAL one (at the idle prompt) plans no frame at all", () => {
+    expect(planOp("PreCompact", i({ trigger: "auto" }), false)).toEqual(working);
+    expect(planOp("PostCompact", i({ trigger: "auto", compact_summary: "…" }), false)).toEqual(working);
+    // Manual: a cancelled/failed /compact fires no PostCompact to retract a working, and a completed one
+    // would read to the worker as a finished turn ("Task finished" for a compact). So neither half speaks.
+    expect(planOp("PreCompact", i({ trigger: "manual", custom_instructions: null }), false)).toBeNull();
+    expect(planOp("PostCompact", i({ trigger: "manual", compact_summary: "…" }), false)).toBeNull();
+    expect(planOp("PreCompact", i({ trigger: "manual" }), true)).toBeNull();
+    expect(planOp("PostCompact", i({ trigger: "manual" }), true)).toBeNull();
+    // No trigger at all (a payload shape we have not seen) keeps the mid-turn reading.
+    expect(planOp("PreCompact", i(), false)).toEqual(working);
+  });
+  test("Codex Interrupt → done", () => {
+    expect(planOp("Interrupt", i({ turn_id: "t1", permission_mode: "default" }), false)).toEqual(done);
+  });
+  test("Stop with a RUNNING background subagent stays working (delegating); anything else is done", () => {
+    const stop = (background_tasks: unknown) => i({ hook_event_name: "Stop", background_tasks, session_crons: [] });
+    const running = stop([{ id: "t1", type: "subagent", status: "running", description: "audit", agent_type: "Explore" }]);
+    expect(planOp("Stop", running, false)).toEqual(working);
+    expect(buildBlob({ ...running, cwd: "/Users/x/api-status" }, "Mac", "t", planOp("Stop", running, false)!))
+      .toMatchObject({ status: "working", detail: "delegating" });
+    // The subagent reported back and the list emptied → the SAME hook now lands the done.
+    expect(planOp("Stop", stop([]), false)).toEqual(done);
+    expect(buildBlob({ ...stop([]), cwd: "/x" }, "Mac", "t", done).detail).toBeUndefined();
+    // A background shell / monitor can run forever (a dev server) — it must not pin the row working.
+    expect(planOp("Stop", stop([{ id: "t2", type: "shell", status: "running", command: "tail -f log" }]), false)).toEqual(done);
+    expect(planOp("Stop", stop([{ id: "t3", type: "monitor", status: "running" }]), false)).toEqual(done);
+    // `pending` is the other in-flight status Claude Code lists (registered, not started yet).
+    expect(planOp("Stop", stop([{ id: "t6", type: "subagent", status: "pending" }]), false)).toEqual(working);
+    expect(planOp("Stop", stop([{ id: "t7", type: "shell", status: "pending" }]), false)).toEqual(done);
+    // Not in flight, absent, or malformed → the pre-existing done.
+    expect(planOp("Stop", stop([{ id: "t4", type: "subagent", status: "completed" }]), false)).toEqual(done);
+    expect(planOp("Stop", stop([{ id: "t5", type: "subagent" }]), false)).toEqual(done);
+    expect(planOp("Stop", stop("subagent"), false)).toEqual(done);
+    expect(planOp("Stop", stop([null, "subagent", 3]), false)).toEqual(done);
+    expect(planOp("Stop", i(), false)).toEqual(done);
   });
 
   // --- PreToolUse for a USER-blocking tool → instant needsAttention --------------------------
@@ -360,6 +476,60 @@ describe("detailForHook", () => {
     expect(detailForHook("PostToolUse", "Edit")).toBe("thinking");
     expect(detailForHook("Stop")).toBeUndefined();
     expect(detailForHook("UserPromptSubmit")).toBeUndefined();
+  });
+});
+
+// NOM-67. `notification_type` decides when it is there; the message sniff is a no-type fallback only.
+describe("isPermissionNotification (type is authoritative)", () => {
+  test("a typed non-permission notification is never a permission prompt, whatever its message says", () => {
+    for (const type of ["idle_prompt", "auth_success", "agent_completed", "quota_auto_resume_disabled", "elicitation_dialog"]) {
+      expect(isPermissionNotification({ notification_type: type, message: "Allow? Claude needs your permission to approve" })).toBe(false);
+    }
+    expect(isPermissionNotification({ notification_type: "permission_prompt", message: "" })).toBe(true);
+  });
+  test("a teammate/worker's permission prompt is a permission prompt too", () => {
+    expect(isPermissionNotification({ notification_type: "worker_permission_prompt", message: "researcher needs permission for Bash" })).toBe(true);
+    expect(planOp("Notification", { notification_type: "worker_permission_prompt", message: "x" }, false))
+      .toEqual({ op: "update", prio: 1, status: "needsAttention" });
+  });
+  test("agent_needs_input is notify-only needsAttention — never classed as a permission prompt", () => {
+    const input = { session_id: "s", cwd: "/Users/x/api-status", hook_event_name: "Notification", notification_type: "agent_needs_input", message: "Teammate setup needs your input" };
+    expect(isPermissionNotification(input)).toBe(false);
+    expect(planOp("Notification", input, false)).toEqual({ op: "update", prio: 1, status: "needsAttention" });
+    expect(yieldsToLiveHold("Notification", input)).toBe(true); // informational: never writes over a live card
+  });
+});
+
+// NOM-67. The new events must never write over a live approval hold.
+describe("yieldsToLiveHold / sessionHoldIsLive", () => {
+  test("every newly mapped event yields; the pre-existing ones are untouched", () => {
+    for (const h of ["PostToolUseFailure", "PreCompact", "PostCompact", "Elicitation", "ElicitationResult"]) {
+      expect(yieldsToLiveHold(h, {})).toBe(true);
+    }
+    expect(yieldsToLiveHold("Notification", { notification_type: "elicitation_dialog" })).toBe(true);
+    expect(yieldsToLiveHold("Stop", { background_tasks: [{ type: "subagent", status: "running" }] })).toBe(true);
+    expect(yieldsToLiveHold("Stop", { background_tasks: [] })).toBe(false);
+    expect(yieldsToLiveHold("Notification", { notification_type: "permission_prompt" })).toBe(false);
+    // A TURN END never yields — StopFailure and Interrupt exactly like Stop. The main thread cannot end
+    // its turn while its own prompt is genuinely open, so a hold still "live" at that point is an orphan.
+    for (const h of ["SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "PermissionRequest", "SessionEnd", "Stop", "StopFailure", "Interrupt"]) {
+      expect(yieldsToLiveHold(h, {})).toBe(false);
+    }
+  });
+
+  test("live = marker present + holder pid alive + inside the TTL", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "cc-hold-"));
+    try {
+      const now = 10_000_000;
+      expect(await sessionHoldIsLive(dir, "s1", now, () => true)).toBe(false); // no marker
+      await writeDecisionHoldAt(dir, "s1", { blob: "sealed", at: now - 1_000, pid: 4242 });
+      expect(await sessionHoldIsLive(dir, "s1", now, (pid) => pid === 4242)).toBe(true);
+      expect(await sessionHoldIsLive(dir, "s1", now, () => false)).toBe(false);          // holder died
+      expect(await sessionHoldIsLive(dir, "s1", now + 7 * 86_400_000, () => true)).toBe(false); // TTL lapsed
+      expect(await sessionHoldIsLive(dir, "other", now, () => true)).toBe(false);        // another session's hold
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 });
 
@@ -731,7 +901,7 @@ describe("buildEnvelope (v2 envelope + encrypted blob)", () => {
   });
 
   test("null for unknown hooks, dropped idle nudge, or missing session id", async () => {
-    expect(await buildEnvelope({ session_id: "abc", hook_event_name: "PreCompact" }, "m", 1, "t", KEY, false)).toBeNull();
+    expect(await buildEnvelope({ session_id: "abc", hook_event_name: "SubagentStop" }, "m", 1, "t", KEY, false)).toBeNull();
     expect(await buildEnvelope({ session_id: "abc", hook_event_name: "Notification", message: "waiting for your input" }, "m", 1, "t", KEY, false)).toBeNull();
     expect(await buildEnvelope({ hook_event_name: "Stop" }, "m", 1, "t", KEY, false)).toBeNull();
     expect(await buildEnvelope(null, "m", 1, "t", KEY, false)).toBeNull();
@@ -883,7 +1053,7 @@ describe("buildPendingStash (plaintext event stashed while pairing is pending)",
     });
   });
   test("returns null for a hook with nothing to post: unknown hook, dropped idle nudge, no session id", () => {
-    expect(buildPendingStash({ session_id: "s", hook_event_name: "PreCompact" }, "m", "t", 1)).toBeNull();
+    expect(buildPendingStash({ session_id: "s", hook_event_name: "SubagentStop" }, "m", "t", 1)).toBeNull();
     expect(buildPendingStash({ session_id: "s", hook_event_name: "Notification", message: "waiting for your input" }, "m", "t", 1)).toBeNull();
     expect(buildPendingStash({ hook_event_name: "Stop" }, "m", "t", 1)).toBeNull();
   });
@@ -917,7 +1087,7 @@ describe("stashPendingEvent (owner-only write; no-op when nothing to stash)", ()
     expect((await stat(stashPath)).mode & 0o777).toBe(0o600);
   });
   test("writes NOTHING when there is nothing to stash (a dropped hook)", async () => {
-    await stashPendingEvent({ session_id: "s", hook_event_name: "PreCompact" }, "Mac", "t", 1, stashPath);
+    await stashPendingEvent({ session_id: "s", hook_event_name: "SubagentStop" }, "Mac", "t", 1, stashPath);
     await expect(stat(stashPath)).rejects.toBeDefined();
   });
 });
@@ -1549,6 +1719,198 @@ await child.exited;
     }
   }, 20000);
 
+  // --- NOM-67 ---------------------------------------------------------------------------------
+  async function withEventServer<T>(
+    run: (ctx: { home: string; ccDir: string; sessionsDir: string; bodies: Record<string, unknown>[] }) => Promise<T>,
+  ): Promise<T> {
+    const bodies: Record<string, unknown>[] = [];
+    const server = Bun.serve({
+      port: 0,
+      async fetch(req) {
+        bodies.push(await req.json() as Record<string, unknown>);
+        return new Response("{}", { status: 200 });
+      },
+    });
+    const ctx = await setupHookHome(`http://127.0.0.1:${server.port}`);
+    try {
+      return await run({ ...ctx, bodies });
+    } finally {
+      server.stop(true);
+      await rm(ctx.home, { recursive: true, force: true });
+    }
+  }
+  const exists = (path: string) => stat(path).then(() => true, () => false);
+
+  test("Cursor import guard: the Claude entry writes NOTHING and POSTs nothing inside Cursor", async () => {
+    await withEventServer(async ({ home, ccDir, sessionsDir, bodies }) => {
+      const payload = (sid: string) => ({
+        session_id: sid, hook_event_name: "UserPromptSubmit", prompt: "hello from a chat", cwd: "/x/api-status",
+      });
+      // (a) the environment fingerprint — present counts, even empty
+      await spawnHook(claudeEntry, home, payload("cursor-env"), { CURSOR_VERSION: "" });
+      // (b) the payload fingerprint
+      await spawnHook(claudeEntry, home, { ...payload("cursor-payload"), cursor_version: "1.7.52" });
+      expect(bodies).toEqual([]);
+      expect(await readdir(sessionsDir)).toEqual([]);
+      expect(await exists(join(ccDir, "last-hook-claude"))).toBe(false); // not even the liveness stamp
+      expect(await exists(join(ccDir, "session-trace.log"))).toBe(false);
+
+      // CONTROL: the identical hook from real Claude Code is mirrored.
+      await spawnHook(claudeEntry, home, payload("real-claude"));
+      expect(await readLocalRecord(sessionsDir, "real-claude")).not.toBeNull();
+      expect(bodies.map((b) => b.sessionId)).toEqual(["real-claude"]);
+      expect(await exists(join(ccDir, "last-hook-claude"))).toBe(true);
+    });
+  }, 20000);
+
+  const workingRecord = (over: Record<string, unknown> = {}) => JSON.stringify({
+    pid: process.pid, machine: "m", label: "api-status", ts: Date.now(), lastEvent: "working",
+    sentDone: false, op: "update", prio: 0, title: "Kept title", ...over,
+  });
+
+  test("the mid-turn NOM-67 events yield to a LIVE approval hold; a turn end (StopFailure, like Stop) lands its done over it", async () => {
+    await withEventServer(async ({ home, ccDir, sessionsDir, bodies }) => {
+      const stopFailure = (sid: string) => ({
+        session_id: sid, hook_event_name: "StopFailure", cwd: "/x/api-status",
+        error: "rate_limit", error_details: "429 Too Many Requests", last_assistant_message: "API Error: Rate limit reached",
+      });
+      await writeFile(join(sessionsDir, "free.json"), workingRecord());
+      await spawnHook(claudeEntry, home, stopFailure("free"));
+      expect(await readLocalRecord(sessionsDir, "free")).toMatchObject({ op: "done", lastEvent: "done", sentDone: true });
+      expect(bodies).toEqual([expect.objectContaining({ sessionId: "free", op: "done", prio: 0 })]);
+
+      // A parked approval: needsAttention record + a hold whose holder (this test process) is alive.
+      const held = workingRecord({ lastEvent: "needsAttention", prio: 1 });
+      await writeFile(join(sessionsDir, "held.json"), held);
+      await writeDecisionHoldAt(sessionsDir, "held", { blob: "sealed-card", at: Date.now(), pid: process.pid });
+      for (const event of ["PostToolUseFailure", "PreCompact", "PostCompact", "Elicitation", "ElicitationResult"]) {
+        await spawnHook(claudeEntry, home, { ...stopFailure("held"), hook_event_name: event, trigger: "auto" });
+      }
+      expect(await readFile(join(sessionsDir, "held.json"), "utf8")).toBe(held);
+      expect(bodies.filter((b) => b.sessionId === "held")).toEqual([]);
+      expect(await readDecisionHoldAt(sessionsDir, "held")).toMatchObject({ blob: "sealed-card" });
+      const trace = (await readFile(join(ccDir, "session-trace.log"), "utf8")).trim().split("\n")
+        .map((line) => JSON.parse(line) as Record<string, unknown>);
+      expect(trace.filter((e) => e.event === "hold-yield" && e.sessionId === "held")).toHaveLength(5);
+
+      // The holder is gone (a dead pid) → the marker is inert and a yielding event goes through again.
+      await writeDecisionHoldAt(sessionsDir, "held", { blob: "sealed-card", at: Date.now(), pid: 2_147_483_646 });
+      await spawnHook(claudeEntry, home, { ...stopFailure("held"), hook_event_name: "PostToolUseFailure" });
+      expect(await readLocalRecord(sessionsDir, "held")).toMatchObject({ op: "update", prio: 0, lastEvent: "working" });
+      await writeDecisionHoldAt(sessionsDir, "held", { blob: "sealed-card", at: Date.now(), pid: process.pid });
+
+      // The turn died UNDER the still-live hold. Byte-for-byte what a plain Stop does there: the done is
+      // recorded and POSTed (the worker supersedes the pending decision on a hook done, and the LAN state
+      // ranks a done record above a live hold), and the marker is left to the hook that owns it.
+      for (const event of ["Stop", "StopFailure"]) {
+        await writeFile(join(sessionsDir, "held.json"), held);
+        bodies.length = 0;
+        await spawnHook(claudeEntry, home, { ...stopFailure("held"), hook_event_name: event });
+        expect(await readLocalRecord(sessionsDir, "held")).toMatchObject({ op: "done", lastEvent: "done", sentDone: true });
+        expect(bodies).toEqual([expect.objectContaining({ sessionId: "held", op: "done", prio: 0 })]);
+        expect(await readDecisionHoldAt(sessionsDir, "held")).toMatchObject({ blob: "sealed-card", pid: process.pid });
+      }
+    });
+  }, 30000);
+
+  test("a Stop with a running background subagent keeps the row working, and the later plain Stop finishes it", async () => {
+    await withEventServer(async ({ home, sessionsDir, bodies }) => {
+      await writeFile(join(sessionsDir, "bg.json"), workingRecord());
+      const stop = (background_tasks: unknown[]) => ({
+        session_id: "bg", hook_event_name: "Stop", cwd: "/x/api-status", background_tasks, session_crons: [],
+      });
+      await spawnHook(claudeEntry, home, stop([{ id: "t1", type: "subagent", status: "running", agent_type: "Explore" }]));
+      expect(await readLocalRecord(sessionsDir, "bg")).toMatchObject({ op: "update", lastEvent: "working", sentDone: false });
+      expect((await readLocalRecord(sessionsDir, "bg"))?.donePending).toBeUndefined();
+      const frame = await decryptBlob(rawKey, bodies[0].blob as string) as Record<string, unknown>;
+      expect(frame).toMatchObject({ status: "working", detail: "delegating" });
+
+      await spawnHook(claudeEntry, home, stop([]));
+      expect(await readLocalRecord(sessionsDir, "bg")).toMatchObject({ op: "done", lastEvent: "done", sentDone: true });
+      expect(bodies.map((b) => b.op)).toEqual(["update", "done"]);
+    });
+  }, 20000);
+
+  test("a manual compact at the idle prompt touches nothing (both agents); an auto compact still reads working", async () => {
+    await withEventServer(async ({ home, sessionsDir, bodies }) => {
+      const doneRecord = workingRecord({ lastEvent: "done", sentDone: true, op: "done" });
+      await writeFile(join(sessionsDir, "cmp.json"), doneRecord);
+      const compact = (event: string, trigger: string) => ({ session_id: "cmp", hook_event_name: event, cwd: "/x/api-status", trigger });
+      // A CANCELLED manual compact is just the PreCompact with no PostCompact after it: the done row
+      // must already be untouched at this point, not rescued by a second hook that may never fire.
+      await spawnHook(claudeEntry, home, compact("PreCompact", "manual"));
+      expect(await readFile(join(sessionsDir, "cmp.json"), "utf8")).toBe(doneRecord);
+      await spawnHook(claudeEntry, home, compact("PostCompact", "manual"));
+      await spawnHook(codexEntry, home, { ...compact("PreCompact", "manual"), turn_id: "t1" });
+      await spawnHook(codexEntry, home, { ...compact("PostCompact", "manual"), turn_id: "t1" });
+      expect(await readFile(join(sessionsDir, "cmp.json"), "utf8")).toBe(doneRecord);
+      expect(bodies).toEqual([]);
+
+      await writeFile(join(sessionsDir, "cmp.json"), workingRecord());
+      await spawnHook(claudeEntry, home, compact("PreCompact", "auto"));
+      await spawnHook(claudeEntry, home, compact("PostCompact", "auto"));
+      expect(await readLocalRecord(sessionsDir, "cmp")).toMatchObject({ op: "update", lastEvent: "working" });
+      expect(bodies.map((b) => b.op)).toEqual(["update", "update"]);
+    });
+  }, 30000);
+
+  // Claude Code reads a hook's exit code 2 as a DECISION on these two: it declines the MCP elicitation and
+  // blocks the compaction. The status entry is an observer, so whatever it is fed it must exit 0 and
+  // print nothing — a paired machine, a dead worker and unparseable stdin alike.
+  test("the status entry can never decline an elicitation or block a compact: exit 0, silent, on every path", async () => {
+    const run = async (home: string, stdin: string): Promise<{ code: number; out: string }> => {
+      const proc = spawnTestProcess({
+        cmd: ["bun", claudeEntry], env: isolatedTestEnv(home), stdin: Buffer.from(stdin), stdout: "pipe", stderr: "ignore",
+      });
+      const out = await new Response(proc.stdout).text();
+      return { code: await proc.exited, out };
+    };
+    const payloads = [
+      { session_id: "x2", hook_event_name: "Elicitation", cwd: "/x/api-status", mcp_server_name: "srv", message: "Token?", mode: "form" },
+      { session_id: "x2", hook_event_name: "PreCompact", cwd: "/x/api-status", trigger: "auto", custom_instructions: null },
+      { session_id: "x2", hook_event_name: "PreCompact", cwd: "/x/api-status", trigger: "manual", custom_instructions: null },
+    ];
+    await withEventServer(async ({ home }) => {
+      for (const payload of payloads) expect(await run(home, JSON.stringify(payload))).toEqual({ code: 0, out: "" });
+      expect(await run(home, "{not json")).toEqual({ code: 0, out: "" });
+      expect(await run(home, "")).toEqual({ code: 0, out: "" });
+    });
+    // A worker that refuses the connection (the POST throws inside runHook).
+    const dead = await setupHookHome("http://127.0.0.1:9");
+    try {
+      for (const payload of payloads) expect(await run(dead.home, JSON.stringify(payload))).toEqual({ code: 0, out: "" });
+    } finally {
+      await rm(dead.home, { recursive: true, force: true });
+    }
+  }, 30000);
+
+  test("Codex Interrupt under a LIVE approval hold still finishes the row (Esc with a card up)", async () => {
+    await withEventServer(async ({ home, sessionsDir, bodies }) => {
+      await writeFile(join(sessionsDir, "cxh.json"), workingRecord({ agent: "codex", turnId: "turn-1", lastEvent: "needsAttention", prio: 1 }));
+      await writeDecisionHoldAt(sessionsDir, "cxh", { blob: "sealed-card", at: Date.now(), pid: process.pid });
+      await spawnHook(codexEntry, home, {
+        session_id: "cxh", hook_event_name: "Interrupt", cwd: "/x/api-status", turn_id: "turn-1", permission_mode: "default",
+        transcript_path: join(home, "missing-rollout.jsonl"),
+      });
+      expect(await readLocalRecord(sessionsDir, "cxh")).toMatchObject({ agent: "codex", op: "done", lastEvent: "done", sentDone: true });
+      expect(bodies).toEqual([expect.objectContaining({ sessionId: "cxh", op: "done", prio: 0 })]);
+    });
+  }, 20000);
+
+  test("Codex Interrupt finishes the row at once, without the Stop-only Plan-picker probe", async () => {
+    await withEventServer(async ({ home, sessionsDir, bodies }) => {
+      await writeFile(join(sessionsDir, "cx.json"), workingRecord({ agent: "codex", turnId: "turn-1" }));
+      await spawnHook(codexEntry, home, {
+        session_id: "cx", hook_event_name: "Interrupt", cwd: "/x/api-status", turn_id: "turn-1", permission_mode: "default",
+        transcript_path: join(home, "missing-rollout.jsonl"),
+      });
+      const record = await readLocalRecord(sessionsDir, "cx");
+      expect(record).toMatchObject({ agent: "codex", op: "done", lastEvent: "done", sentDone: true });
+      expect(record?.planPickerVerificationPending).toBeUndefined();
+      expect(bodies).toEqual([expect.objectContaining({ sessionId: "cx", op: "done", prio: 0 })]);
+    });
+  }, 20000);
+
   test("promptless Codex create is traced as suppressed, then first prompt creates, and SessionEnd traces retire", async () => {
     const { home, ccDir, sessionsDir } = await setupHookHome("http://127.0.0.1:9");
     try {
@@ -1966,14 +2328,21 @@ describe("statusCmd — Codex plugin detection states", () => {
     expect(pluginLine(await runStatus({}))).toBe("not installed");
   });
 
-  test("installed + all 7 hooks trusted → `installed, trusted (7/7)`", async () => {
-    expect(pluginLine(await runStatus({ configToml: cfgToml({ enabled: true, trusted: 7 }) })))
-      .toBe("installed, trusted (7/7)");
+  test("installed + all 10 hooks trusted → `installed, trusted (10/10)`", async () => {
+    expect(pluginLine(await runStatus({ configToml: cfgToml({ enabled: true, trusted: 10 }) })))
+      .toBe("installed, trusted (10/10)");
   });
 
-  test("installed + a partial N trusted → `installed, trusted (N/7)`", async () => {
+  // An install from before NOM-67 trusted seven; the three new hooks are skipped by Codex until the
+  // user re-opens /hooks, and the readout has to say so rather than claim a full house.
+  test("an upgraded install that trusted the old seven reads 7/10", async () => {
+    expect(pluginLine(await runStatus({ configToml: cfgToml({ enabled: true, trusted: 7 }) })))
+      .toBe("installed, trusted (7/10)");
+  });
+
+  test("installed + a partial N trusted → `installed, trusted (N/10)`", async () => {
     expect(pluginLine(await runStatus({ configToml: cfgToml({ trusted: 3 }) })))
-      .toBe("installed, trusted (3/7)");
+      .toBe("installed, trusted (3/10)");
   });
 
   test("installed but no hooks trusted yet → the row says so AND it becomes a problem with a fix", async () => {
@@ -1998,8 +2367,8 @@ describe("statusCmd — Codex plugin detection states", () => {
   });
 
   test("overlap (native enabled+trusted AND legacy) → trusted line + a double-fire WARNING naming codex-status.mjs", async () => {
-    const lines = await runStatus({ configToml: cfgToml({ enabled: true, trusted: 7 }), hooksJson: legacyHooks(6) });
-    expect(pluginLine(lines)).toBe("installed, trusted (7/7)");
+    const lines = await runStatus({ configToml: cfgToml({ enabled: true, trusted: 10 }), hooksJson: legacyHooks(6) });
+    expect(pluginLine(lines)).toBe("installed, trusted (10/10)");
     const warn = lines.find((l) => l.includes("every Codex event is sent twice"));
     expect(warn).toContain("6 legacy Nomo event");
     expect(lines.some((l) => l.includes("codex-status.mjs"))).toBe(true);
@@ -3508,8 +3877,13 @@ describe("interrupt: what the status hook tells Claude Code when the phone asked
     });
   });
 
+  test("PostToolUseFailure is the same tool boundary for a tool that errored (it fires INSTEAD of PostToolUse)", () => {
+    expect(interruptHookOutput("PostToolUseFailure")).toBe(interruptHookOutput("PostToolUse"));
+  });
+
   test("no other event can carry it", () => {
-    for (const name of ["SessionStart", "UserPromptSubmit", "Notification", "Stop", "SessionEnd", "PermissionRequest", ""]) {
+    for (const name of ["SessionStart", "UserPromptSubmit", "Notification", "Stop", "StopFailure", "SessionEnd", "PermissionRequest",
+      "Elicitation", "ElicitationResult", "PreCompact", "PostCompact", "Interrupt", ""]) {
       expect(interruptHookOutput(name)).toBeNull();
     }
   });
@@ -3521,12 +3895,24 @@ describe("interrupt: what the status hook tells Claude Code when the phone asked
   test("a turn boundary clears the flag, so a late flag can never stop the user's NEXT prompt", () => {
     expect(clearsInterruptFlag("UserPromptSubmit")).toBe(true);
     expect(clearsInterruptFlag("Stop")).toBe(true);
+    expect(clearsInterruptFlag("StopFailure")).toBe(true);
     expect(clearsInterruptFlag("SessionEnd")).toBe(true);
+  });
+
+  test("a Stop that is not a turn end (a background subagent still in flight) keeps the flag", () => {
+    const stop = (status: string) => clearsInterruptFlag("Stop", { background_tasks: [{ type: "subagent", status }] });
+    expect(stop("running")).toBe(false);
+    expect(stop("pending")).toBe(false);
+    expect(stop("completed")).toBe(true);
+    expect(clearsInterruptFlag("Stop", { background_tasks: [] })).toBe(true);
+    // StopFailure is always the end of the turn, whatever is listed.
+    expect(clearsInterruptFlag("StopFailure", { background_tasks: [{ type: "subagent", status: "running" }] })).toBe(true);
   });
 
   test("a tool event never clears it (the remaining tool calls in the message must be denied too)", () => {
     expect(clearsInterruptFlag("PreToolUse")).toBe(false);
     expect(clearsInterruptFlag("PostToolUse")).toBe(false);
+    expect(clearsInterruptFlag("PostToolUseFailure")).toBe(false);
   });
 
   test("the real hook: silent without a flag; with one it prints the stop line and reports a Stop-shaped done; Stop clears the flag", async () => {
@@ -3574,12 +3960,32 @@ describe("interrupt: what the status hook tells Claude Code when the phone asked
       // Not consumed: the other tool calls of the same message must be stopped too.
       expect(await readdir(sessions)).toContain(interruptFlagFileName("int-1"));
 
+      // A parallel tool FAILING after the stop must not plan `working` and flip the row back (no Stop
+      // would ever correct it) — and it lands as a done even under a live approval hold, like Stop does.
+      await writeDecisionHoldAt(sessions, "int-1", { blob: "sealed-card", pid: process.pid, at: Date.now() });
+      expect(await sessionHoldIsLive(sessions, "int-1")).toBe(true);
+      const before = posts.length;
+      expect(await stdoutFor("PostToolUseFailure")).toBe(`${interruptHookOutput("PostToolUseFailure")}\n`);
+      expect(posts.at(-1)?.op).toBe("done");
+      expect(posts.length).toBe(before + 1);
+      await rm(join(sessions, decisionHoldFileName("int-1")), { force: true });
+
       // A Codex-in-Claude event (this entry invoked inside a Codex session: the payload carries turn_id)
       // is restamped to the codex adapter, whose interrupt is the app-server's — the hook prints nothing.
       expect(await stdoutFor("PreToolUse", { turn_id: "turn-1" })).toBe("");
       expect(await readdir(sessions)).toContain(interruptFlagFileName("int-1"));
 
+      // A Stop with a background subagent still running plans `working`, not a turn end: the interrupt
+      // is still owed, so the flag survives it. A plain Stop and a StopFailure both retire it.
+      expect(await stdoutFor("Stop", { background_tasks: [{ type: "subagent", status: "running" }] })).toBe("");
+      expect(posts.at(-1)?.op).toBe("update");
+      expect(await readdir(sessions)).toContain(interruptFlagFileName("int-1"));
+
       expect(await stdoutFor("Stop")).toBe("");
+      expect(await readdir(sessions)).not.toContain(interruptFlagFileName("int-1"));
+
+      await writeInterruptFlagAt(sessions, "int-1", Date.now());
+      expect(await stdoutFor("StopFailure", { background_tasks: [{ type: "subagent", status: "running" }] })).toBe("");
       expect(await readdir(sessions)).not.toContain(interruptFlagFileName("int-1"));
     } finally {
       server.stop(true);

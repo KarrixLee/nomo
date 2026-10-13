@@ -78,6 +78,10 @@ const ENTRYPOINTS = [
   "reset.ts",
   "status-cmd.ts",
   "opencode-update.ts",
+  // The Cursor hook (desktop app + cursor-agent CLI). Addressed by absolute path from Cursor's
+  // user-level hooks.json (see plugin/scripts/cursor-install.mjs), never through hook-shim.sh — so it
+  // needs no shim whitelist entry and no NOMO_SHIM_REV bump.
+  "cursor-status.ts",
 ].map((f) => join(HERE, "src", "entries", f));
 
 /** The OpenCode plugin — a SECOND build pass, not another ENTRYPOINTS row, because it needs a

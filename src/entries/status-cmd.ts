@@ -23,9 +23,9 @@
 
 import { readdir, readFile, stat } from "node:fs/promises";
 import { join } from "node:path";
-import { claudeAdapter, codexAdapter, opencodeAdapter } from "../core/adapter";
+import { claudeAdapter, codexAdapter, cursorAdapter, opencodeAdapter } from "../core/adapter";
 import {
-  AgentKind, CC_DIR, CODEX_HOOK_MARKER, codexAppServerSocketAvailable, codexHome, flagExists,
+  AgentKind, CC_DIR, CODEX_HOOK_MARKER, codexAppServerSocketAvailable, codexHome, CURSOR_HOOK_MARKER, cursorHome, flagExists,
   LAST_SEND_PATH, localApprovalsState, NO_HOLD_PATH, parseConfig, parsePendingConfig, pidAlive,
   opencodeStubPaths, opencodeStubTarget, PLUGIN_VERSION, SESSION_TRACE_PATH, SESSIONS_DIR,
   WATCHDOG_PID_PATH,
@@ -45,8 +45,10 @@ import {
  *  stamp, exactly as before. */
 
 /** Native Codex plugin hook declarations in plugin/hooks/codex-hooks.json. Keep the status denominator
- *  in lockstep with the manifest; SessionEnd is the seventh entry and records terminal history. */
-const CODEX_PLUGIN_HOOK_COUNT = 7;
+ *  in lockstep with the manifest; SessionEnd is the seventh entry and records terminal history, and
+ *  PreCompact / PostCompact / Interrupt (NOM-67) make ten. An install that trusted the first seven
+ *  reads 7/10 until the user re-opens /hooks — Codex skips a new hook until it is trusted. */
+const CODEX_PLUGIN_HOOK_COUNT = 10;
 
 export interface StatusDeps {
   print?: (line: string) => void;
@@ -91,6 +93,11 @@ export interface StatusDeps {
    *  prompts stay in the terminal and never reach the phone — the single commonest reason a user
    *  reports "my phone never asked me". Injected so a test can point it at a temp file. */
   noHoldPath?: string;
+  /** Cursor's user-level hooks.json (defaults to `<cursorHome>/hooks.json`), its transcripts dir and
+   *  its liveness stamp. Injected so a test never reads the developer's real ~/.cursor. */
+  cursorHooksPath?: string;
+  cursorProjectsDir?: string;
+  lastHookCursorPath?: string;
   isAlive?: (pid: number) => boolean;
   now?: () => number;
 }
@@ -116,10 +123,13 @@ const AGENT_UI: Record<AgentKind, { name: string; pair: string; approvalsOn: str
   claude: { name: "Claude Code", pair: "/nomo-cc:pair", approvalsOn: "/nomo-cc:approvals on", status: "/nomo-cc:status" },
   codex: { name: "Codex", pair: "$nomo-pair", approvalsOn: "$nomo-approvals on", status: "$nomo-status" },
   opencode: { name: "OpenCode", pair: "/nomo-pair", approvalsOn: "/nomo-approvals on", status: "/nomo-status" },
+  // Cursor has no approvals command (v1 is read-only), but the Approvals row is machine-wide — so a
+  // Cursor reader who sees it PAUSED is pointed at an agent that does have the switch.
+  cursor: { name: "Cursor", pair: "/nomo-pair", approvalsOn: "/nomo-cc:approvals on (in Claude Code — Cursor sessions are read-only)", status: "/nomo-status" },
 };
 
 /** Fixed order, so two runs on the same machine never disagree about where to look. */
-const AGENT_ORDER: AgentKind[] = ["claude", "codex", "opencode"];
+const AGENT_ORDER: AgentKind[] = ["claude", "codex", "opencode", "cursor"];
 
 /** Value column. Top-level rows pad the label to it; an agent's rows indent 2 and pad to it minus 2,
  *  so every value on the screen starts in the same column and the eye can run straight down it. Wide
@@ -215,7 +225,7 @@ export function countCodexHookEvents(raw: string): number {
  *                 with no `enabled` key is enabled by default).
  *    - trusted:   how many `[hooks.state."nomo@…"]` section headers exist — Codex writes one (with a
  *                 trusted_hash) per hook it has trust-reviewed, so this is the N-of-CODEX_PLUGIN_HOOK_COUNT
- *                 (7 since SessionEnd) trusted count — NOT the legacy config-layer hooks.json's 6.
+ *                 (10 since NOM-67) trusted count — NOT the legacy config-layer hooks.json's 6.
  *    - ccTrusted: how many `[hooks.state."nomo-cc@…"]` section headers exist — Codex auto-discovers the
  *                 CLAUDE plugin (nomo-cc, hooks/hooks.json) and lets you trust ITS hooks too; when both
  *                 this and `trusted` are >0 every Codex event runs BOTH plugins' hooks (double-fire). */
@@ -419,6 +429,9 @@ export async function statusCmd(deps: StatusDeps = {}): Promise<number> {
   const lastHookClaudePath = deps.lastHookClaudePath ?? claudeAdapter.hookStampPath();
   const lastHookOpencodePath = deps.lastHookOpencodePath ?? opencodeAdapter.hookStampPath();
   const opencodeStubs = deps.opencodeStubPaths ?? opencodeStubPaths();
+  const cursorHooksPath = deps.cursorHooksPath ?? `${cursorHome()}/hooks.json`;
+  const cursorProjectsDir = deps.cursorProjectsDir ?? cursorAdapter.sessionsDir();
+  const lastHookCursorPath = deps.lastHookCursorPath ?? cursorAdapter.hookStampPath();
   const noHoldPath = deps.noHoldPath ?? NO_HOLD_PATH;
   const isAlive = deps.isAlive ?? pidAlive;
   const now = deps.now ?? Date.now;
@@ -507,7 +520,7 @@ export async function statusCmd(deps: StatusDeps = {}): Promise<number> {
   // Session records, split by the agent that wrote them. "Tracked sessions: 4" was machine-wide and so
   // answered nobody's question; what a reader wants is how many of those are THEIRS. A record with no
   // `agent` key predates the Codex work and is Claude's by definition (same rule the watchdog uses).
-  const perAgent: Record<string, number> = { claude: 0, codex: 0, opencode: 0 };
+  const perAgent: Record<string, number> = { claude: 0, codex: 0, opencode: 0, cursor: 0 };
   let totalSessions = 0;
   try {
     for (const name of await readdir(sessionsDir)) {
@@ -724,8 +737,26 @@ export async function statusCmd(deps: StatusDeps = {}): Promise<number> {
     problems: opencodeProblems,
   };
 
+  // Cursor. Hooks like Claude/Codex, so it gets the same hooks-not-firing detector — and, unlike
+  // Claude, a real install signal: our command sitting in Cursor's user-level hooks.json. The desktop
+  // app's agent-transcripts date its last activity; the CLI may write none, in which case the row can
+  // only ever say "firing" or "no activity yet", never a false NOT FIRING.
+  const cursorInstalled = (await readFile(cursorHooksPath, "utf8").catch(() => "")).includes(CURSOR_HOOK_MARKER);
+  const cursorHooks = await hooksRow("cursor", {
+    installed: cursorInstalled, sessionsDir: cursorProjectsDir,
+    match: cursorAdapter.sessionMatch, stampPath: lastHookCursorPath,
+    hint: cursorAdapter.hooksNotFiringHint,
+  });
+  const cursorReport: AgentReport = {
+    kind: "cursor", present: cursorInstalled || perAgent.cursor! > 0 || cursorHooks.stamp > 0,
+    hooksLabel: "Hooks", hooks: cursorHooks.value, sessions: sessionText(perAgent.cursor!),
+    sessionCount: perAgent.cursor!,
+    detail: [["Mode", "read-only — sessions show on your phone; approvals stay in Cursor"]],
+    problems: cursorHooks.problem ? [cursorHooks.problem] : [],
+  };
+
   // ── render ────────────────────────────────────────────────────────────────────────────────────
-  const reports: Record<AgentKind, AgentReport> = { claude: claudeReport, codex: codexReport, opencode: opencodeReport };
+  const reports: Record<AgentKind, AgentReport> = { claude: claudeReport, codex: codexReport, opencode: opencodeReport, cursor: cursorReport };
   if (audience) {
     // The subject, in full and immediately under the machine facts.
     renderOwn(reports[audience], `${AGENT_UI[audience].name} — you are here`, print);
@@ -752,14 +783,14 @@ export async function statusCmd(deps: StatusDeps = {}): Promise<number> {
  *  hand-run bundle, must keep working exactly as it did. */
 export function parseAudience(argv: readonly string[]): AgentKind | undefined {
   for (const arg of argv) {
-    if (arg === "claude" || arg === "codex" || arg === "opencode") return arg;
+    if (arg === "claude" || arg === "codex" || arg === "opencode" || arg === "cursor") return arg;
   }
   return undefined;
 }
 
 if (import.meta.main) {
   if (process.argv.includes("--check")) {
-    console.log("usage: status [claude|codex|opencode] [--check]  — show pairing, delivery and per-agent health");
+    console.log("usage: status [claude|codex|opencode|cursor] [--check]  — show pairing, delivery and per-agent health");
     process.exit(0);
   }
   process.exit(await statusCmd({ audience: parseAudience(process.argv.slice(2)) }));

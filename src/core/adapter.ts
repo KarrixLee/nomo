@@ -12,11 +12,13 @@
 //
 // PORTABILITY: bun AND node >= 18 — no `Bun.*` APIs; file IO via node:fs/promises (shared helpers).
 
-import { execFile } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
+import { existsSync } from "node:fs";
 import { readdir, readFile, stat } from "node:fs/promises";
+import { devNull } from "node:os";
 import { promisify } from "node:util";
 import { basename, join } from "node:path";
-import { AgentKind, AgentKindWire, CC_DIR, codexHome, folderKeyFromCwd, isRealTty, lastHookPath, pidAlive, pidAncestors, pidCommand, readPrefix, readSuffix, SessionRecord } from "./shared";
+import { AgentKind, AgentKindWire, CC_DIR, codexHome, cursorHome, folderKeyFromCwd, isRealTty, lastHookPath, pidAlive, pidAncestors, pidCommand, readPrefix, readSuffix, SessionRecord } from "./shared";
 import { ancestryContainsHerdr, owningTerminalApp } from "./terminal-focus";
 
 const execFileP = promisify(execFile);
@@ -502,9 +504,9 @@ export async function codexSessionModel(
 //     (task_started / task_complete / turn_aborted): if that boundary is turn_aborted, the turn was
 //     aborted; a later task_started (a fresh/resumed turn) means it wasn't.
 
-/** The raw substring Claude Code writes into the aborted turn ("[Request interrupted by user]" or
- *  "…for tool use"); matching the substring covers both. */
-const INTERRUPT_MARKER = "interrupted by user";
+/** How Claude Code's interrupt marker BEGINS ("[Request interrupted by user]" or "…for tool use]");
+ *  the shared prefix covers both. */
+const INTERRUPT_MARKER = "[Request interrupted by user";
 /** Codex rollout turn-lifecycle `event_msg` payload.type values (task_started/task_complete are
  *  EventMsg::TurnStarted/TurnComplete serde-renamed; turn_aborted is EventMsg::TurnAborted). The net
  *  inspects the LAST of these in the tail — turn_aborted means the turn was Esc/aborted. */
@@ -529,9 +531,29 @@ export function lastTurnLine(text: string): string | null {
   return null;
 }
 
-/** Whether a raw transcript line carries the user-interrupt marker (Claude Code). */
+/** Whether a raw transcript line IS the user-interrupt marker (Claude Code): a turn whose own text
+ *  BEGINS with it. Claude writes the marker as a `user` row with one text block (verified against live
+ *  transcripts); a bare-string `message`/`content` is accepted too. Parsed, never substring-matched over
+ *  the raw line: the phrase also sits INSIDE tool_result / tool_use blocks whenever a tool reads a
+ *  transcript or greps for it, and those turns are not interrupts — matching them POSTed a false done. */
 export function hasInterruptMarker(line: string): boolean {
-  return line.includes(INTERRUPT_MARKER);
+  let row: unknown;
+  try { row = JSON.parse(line); } catch { return false; }
+  if (typeof row !== "object" || row === null) return false;
+  // Claude Code writes the marker as a `user` row; an assistant reply that merely OPENS with the phrase
+  // (explaining it, quoting a transcript) is not an interrupt.
+  if ((row as Record<string, unknown>).type !== "user") return false;
+  const message = (row as Record<string, unknown>).message;
+  const content = typeof message === "object" && message !== null
+    ? (message as Record<string, unknown>).content
+    : message;
+  const texts = Array.isArray(content)
+    ? content.map((part) => {
+      const p = part as Record<string, unknown> | null;
+      return p !== null && typeof p === "object" && p.type === "text" ? p.text : undefined;
+    })
+    : [content];
+  return texts.some((t) => typeof t === "string" && t.trimStart().startsWith(INTERRUPT_MARKER));
 }
 
 /** The codex rollout's LAST turn-lifecycle event type (payload.type), scanning from the end and
@@ -942,6 +964,23 @@ const CLAUDE_DESKTOP_BUNDLED_PATH_PARTS = [
 /** The desktop app's launcher, which sits between the Electron main process and the bundled `claude`:
  *  `…/Claude.app/Contents/Helpers/disclaimer <cmd…>`. Location-agnostic on purpose. */
 const CLAUDE_DESKTOP_LAUNCHER = "Claude.app/Contents/Helpers/disclaimer";
+
+/** Is this hook running INSIDE CURSOR rather than the agent whose entry it is? Cursor (the desktop app
+ *  and the `cursor-agent` CLI) imports Claude Code plugins and `~/.claude` hooks by default and runs
+ *  them with Cursor-shaped payloads, so Nomo's CLAUDE entries fire inside Cursor and would report a
+ *  Cursor chat as a Claude Code session. Two independent fingerprints, both Cursor's own documented
+ *  hook contract — EITHER is enough:
+ *    - env `CURSOR_VERSION` ("Cursor version string", always set for hook scripts) — PRESENT counts,
+ *      even empty;
+ *    - a `cursor_version` key in the stdin payload (one of Cursor's base input fields).
+ *  The Claude entries exit silently on it (hook.ts runHook, permission.ts runPermissionHook); a native
+ *  Cursor entry can import the same predicate to assert the opposite. Pure — env is injected. */
+export function cursorHostInvocation(
+  input: unknown, env: Record<string, string | undefined> = process.env,
+): boolean {
+  return env.CURSOR_VERSION !== undefined ||
+    (typeof input === "object" && input !== null && "cursor_version" in input);
+}
 
 /** Pure: is this hook's invoking `claude` a conversation window of the Claude DESKTOP app?
  *
@@ -2157,6 +2196,11 @@ export interface AgentAdapter {
    *  spreads cleanly into both a blob object and a SessionRecord (whose `agent` follows the same
    *  omit-for-claude convention). */
   blobAgentFields: { agent?: AgentKindWire };
+  /** OPTIONAL: the watchdog's title net (cc-watchdog repairTitle) for an agent whose real title can
+   *  land on disk AFTER its last hook. `due` gates the sweep (pure, cheap); `resolve` is the lookup —
+   *  absent = the `title` seam above over the transcript head. A resolved title equal to the record's
+   *  sends nothing. Absent = this agent's hooks always carry the title themselves. */
+  titleRepair?: { due(record: SessionRecord, now: number): boolean; resolve?(sessionId: string): string | undefined };
   /** OPTIONAL: is this agent's blob `plan` AMBIENT SESSION STATE rather than a one-shot proposal?
    *
    *  OpenCode's plan is its live todo list: it is restated by EVERY frame the resident plugin sends
@@ -2294,6 +2338,8 @@ export const codexAdapter = {
   // allow" stays a plain allow (NOM-62): Codex's PermissionRequest hook — the only path its command/patch
   // approvals reach Nomo on — fails closed on `updatedPermissions`, so there is no session grant to send.
   answerExtras: "other",
+  // A SessionStart ships title:"" and Codex can drop every later hook — repair until one lands.
+  titleRepair: { due: (record) => typeof record.title !== "string" || record.title.length === 0 },
   async title({ sessionId, prefix, input }): Promise<string | undefined> {
     // PRIMARY: the clean AI-generated thread_name codex writes to session_index.jsonl ~30-40s in.
     // Re-read every hook (no memo) so a later hook UPGRADES an earlier prompt-derived fallback the
@@ -2466,6 +2512,109 @@ export const opencodeAdapter: AgentAdapter = {
   locateTuiPid: (ctx, deps) => opencodeLocateTuiPid(ctx, deps),
 };
 
+/** Cursor's model id off a hook payload: `model` (on every event, e.g. "cursor-grok-4.6-high-fast"),
+ *  else the optional `model_id`. Undefined → the blob omits the key. Capped at 80 chars, the same
+ *  bound an `ai-title` gets (BRANCH_MAX_CHARS is the other one): it comes off stdin and rides every
+ *  sealed blob. */
+export function cursorModel(input: Record<string, unknown>): string | undefined {
+  for (const key of ["model", "model_id"]) {
+    const v = input[key];
+    if (typeof v === "string" && v.trim().length > 0) return v.trim().slice(0, 80);
+  }
+  return undefined;
+}
+
+/** Where the Cursor DESKTOP app keeps its global state (VS Code's user-data layout). */
+export function cursorStateDb(): string {
+  const home = process.env.HOME ?? "";
+  const data = process.platform === "darwin" ? `${home}/Library/Application Support`
+    : process.platform === "win32" ? process.env.APPDATA ?? ""
+    : process.env.XDG_CONFIG_HOME || `${home}/.config`;
+  return `${data}/Cursor/User/globalStorage/state.vscdb`;
+}
+
+/** How long the watchdog keeps looking for a chat name after a Cursor turn's stop (one lookup per
+ *  sweep). Cursor names a chat within seconds of its first prompt; this is slack for its disk flush. */
+export const CURSOR_TITLE_REPAIR_MS = 120_000;
+/** Hard ceiling on one lookup. A healthy one is ~15 ms (measured against a 970 MB state.vscdb). */
+const CURSOR_TITLE_TIMEOUT_MS = 300;
+
+/** The name Cursor itself gave a chat (its tab / history label), or undefined — which every caller
+ *  answers with the first-prompt title. Verified on Cursor 3.24 (macOS): state.vscdb, table
+ *  `cursorDiskKV`, key `composerData:<id>` where <id> IS the hooks' `conversation_id`; the value is
+ *  JSON with a string `name`.
+ *
+ *  The SYSTEM `sqlite3`, not a built-in module: the bundle runs under bun OR node >= 18, and their
+ *  SQLite modules differ (`bun:sqlite`; `node:sqlite` only from 22.5). No sqlite3 on the box, no
+ *  database (the `cursor-agent` CLI keeps its chats elsewhere), a locked file, a changed schema,
+ *  malformed JSON, a non-string or blank name, or the time budget running out are all the same
+ *  answer: undefined.
+ *
+ *  READ-ONLY, EXACT KEY: `-readonly` can neither create a missing file nor write an existing one, and
+ *  the lookup is one unique-index probe — never a scan of that table. Only `name` is extracted, inside
+ *  SQLite: the rest of the record (chat content) never enters this process.
+ *  Synchronous on purpose — the hook has nothing else to do meanwhile, and the timeout is the bound. */
+export function cursorChatTitle(sessionId: string, db: string = cursorStateDb(), env: NodeJS.ProcessEnv = process.env): string | undefined {
+  // The id is spliced into the SQL text (the sqlite3 CLI takes no bound parameters).
+  if (!/^[A-Za-z0-9_-]{1,128}$/.test(sessionId)) return undefined;
+  try {
+    // `-init <null device>`: the CLI otherwise loads the user's rc (~/.sqliterc, or
+    // $XDG_CONFIG_HOME/sqlite3/sqliterc), where `.headers on` / `.mode box` put the column header (the
+    // SQL text) or box-drawing characters INTO the title. -batch/-noheader/-list pin the rest of the
+    // output shape. macOS ships sqlite3 at a fixed absolute path, which a `.`/empty PATH entry (the cwd
+    // is the workspace) cannot shadow with a repo-planted binary; elsewhere it is a PATH lookup.
+    const bin = process.platform === "darwin" && existsSync("/usr/bin/sqlite3") ? "/usr/bin/sqlite3" : "sqlite3";
+    const out = execFileSync(bin, ["-init", devNull, "-batch", "-noheader", "-list", "-readonly", db,
+      "select case when json_type(cast(value as text),'$.name')='text' then json_extract(cast(value as text),'$.name') end" +
+      ` from cursorDiskKV where key='composerData:${sessionId}'`,
+    ], { timeout: CURSOR_TITLE_TIMEOUT_MS, encoding: "utf8", maxBuffer: 65_536, stdio: ["ignore", "pipe", "ignore"], env });
+    const cleaned = out.replace(/\s+/g, " ").trim();
+    return cleaned ? truncateOnWord(cleaned) : undefined; // capped like every other generated title
+  } catch {
+    return undefined;
+  }
+}
+
+/** Cursor (desktop app + `cursor-agent` CLI) — a READ-ONLY v1 driven by Cursor's hooks.
+ *
+ *  Like `opencodeAdapter`, this is mostly reached through `adapterFor()` by the REBUILD paths (the
+ *  watchdog's corrective done/heartbeat, session-state's LAN rollup) for the `agent:"cursor"` literal.
+ *  The producer is core/cursor.ts, not runHook — Cursor's event names and payload differ from the
+ *  Claude-shaped ones planOp understands — and it calls `title`/`model` below with the raw payload.
+ *
+ *  TITLE = CURSOR'S OWN CHAT NAME, the first user prompt until it can be read (cursorChatTitle
+ *  below). Cursor generates the name a moment after the first prompt, so `title` — the prompt hook's
+ *  seam, which Cursor waits on — never reads it: the producer looks it up on the frames it already
+ *  sends after that (keep-alives, the stop), and `titleRepair` covers a name that lands after the
+ *  stop of a short chat.
+ *
+ *  NO interrupt / approval / discovery / locate seams: v1 never reports needsAttention and never
+ *  answers anything. `sessionsDir` exists for status-cmd's hooks-not-firing check only (the desktop
+ *  app writes agent-transcripts there; the CLI may write none, which just means no warning).
+ *
+ *  NOT in `allAdapters`: that list drives the watchdog's discovery sweep, and Cursor has nothing to
+ *  discover — a row exists only once a prompt hook created it. */
+export const cursorAdapter: AgentAdapter = {
+  kind: "cursor",
+  title: async ({ input }) =>
+    typeof input.prompt === "string" ? displayTitleFromUserText(input.prompt) : undefined,
+  model: async ({ input }) => cursorModel(input),
+  detectInterrupt: () => false,
+  sessionsDir: () => `${cursorHome()}/projects`,
+  sessionMatch: (name: string) => name.endsWith(".jsonl"),
+  hookStampPath: () => lastHookPath("cursor"),
+  hooksNotFiringHint: "  run `bunx nomo-ai --cursor` again, then restart Cursor (Settings → Hooks shows what it loaded)",
+  // DONE rows only, and only for a short while after the stop. A finished row is the one state no
+  // hook is about to rewrite, so a title-only frame cannot cross a live turn's own frames; and a row
+  // whose chat has no name (the CLI) stops costing a lookup per sweep after the window.
+  titleRepair: {
+    due: (record, now) => record.lastEvent === "done" && typeof record.ts === "number" && now - record.ts < CURSOR_TITLE_REPAIR_MS,
+    resolve: (sessionId) => cursorChatTitle(sessionId),
+  },
+  toolDetail: {},
+  blobAgentFields: { agent: "cursor" as const },
+};
+
 /** The adapter for an agent kind THIS BUILD DOES NOT KNOW — a record stamped by a newer peer install
  *  (see AgentKindWire). Its whole job is `blobAgentFields`: carry the raw literal back out, so a
  *  rebuild by an older build re-emits the agent it was handed instead of silently dropping the key and
@@ -2502,6 +2651,7 @@ export function adapterFor(agent: AgentKindWire): AgentAdapter {
   switch (agent) {
     case "codex": return codexAdapter;
     case "opencode": return opencodeAdapter;
+    case "cursor": return cursorAdapter;
     case "claude": return claudeAdapter;
     default: return typeof agent === "string" && agent.length > 0 ? unknownAgentAdapter(agent) : claudeAdapter;
   }

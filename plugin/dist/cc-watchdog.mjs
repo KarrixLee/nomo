@@ -92,8 +92,10 @@ async function sha256Hex(s) {
 }
 
 // src/core/adapter.ts
-import { execFile as execFile2 } from "node:child_process";
+import { execFile as execFile2, execFileSync as execFileSync2 } from "node:child_process";
+import { existsSync as existsSync2 } from "node:fs";
 import { readdir, readFile as readFile2, stat as stat2 } from "node:fs/promises";
+import { devNull } from "node:os";
 import { promisify as promisify2 } from "node:util";
 import { basename as basename2, join as join2 } from "node:path";
 
@@ -104,7 +106,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "2.3.0";
+var PLUGIN_VERSION = "2.3.5";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -272,6 +274,11 @@ function codexHome() {
   const env = process.env.CODEX_HOME;
   return env && env.length > 0 ? env : `${process.env.HOME}/.codex`;
 }
+function cursorHome() {
+  const env = process.env.CURSOR_CONFIG_DIR;
+  return env && env.length > 0 ? env : `${process.env.HOME}/.cursor`;
+}
+var CURSOR_HOOK_MARKER = "cursor-status.mjs";
 var CODEX_HOOK_MARKER = "codex-status.mjs";
 function codexAppServerSocketPath() {
   return `${codexHome()}/app-server-control/app-server-control.sock`;
@@ -1735,7 +1742,7 @@ async function codexSessionModel(input, prefix, transcriptPath, home = codexHome
     return;
   }
 }
-var INTERRUPT_MARKER = "interrupted by user";
+var INTERRUPT_MARKER = "[Request interrupted by user";
 var CODEX_TURN_EVENTS = new Set(["task_started", "task_complete", "turn_aborted"]);
 var CODEX_ABORT_EVENT = "turn_aborted";
 function lastTurnLine(text) {
@@ -1760,7 +1767,23 @@ function lastTurnLine(text) {
   return null;
 }
 function hasInterruptMarker(line) {
-  return line.includes(INTERRUPT_MARKER);
+  let row;
+  try {
+    row = JSON.parse(line);
+  } catch {
+    return false;
+  }
+  if (typeof row !== "object" || row === null)
+    return false;
+  if (row.type !== "user")
+    return false;
+  const message = row.message;
+  const content = typeof message === "object" && message !== null ? message.content : message;
+  const texts = Array.isArray(content) ? content.map((part) => {
+    const p = part;
+    return p !== null && typeof p === "object" && p.type === "text" ? p.text : undefined;
+  }) : [content];
+  return texts.some((t) => typeof t === "string" && t.trimStart().startsWith(INTERRUPT_MARKER));
 }
 function codexLastTurnEvent(text) {
   const lines = text.split(`
@@ -2034,6 +2057,9 @@ var CLAUDE_DESKTOP_BUNDLED_PATH_PARTS = [
   "/claude.app/Contents/MacOS/claude"
 ];
 var CLAUDE_DESKTOP_LAUNCHER = "Claude.app/Contents/Helpers/disclaimer";
+function cursorHostInvocation(input, env = process.env) {
+  return env.CURSOR_VERSION !== undefined || typeof input === "object" && input !== null && "cursor_version" in input;
+}
 function claudeDesktopInvocation(selfArgs, ancestorArgs, entrypoint) {
   if (entrypoint === CLAUDE_DESKTOP_ENTRYPOINT)
     return true;
@@ -2679,6 +2705,7 @@ var claudeAdapter = {
 var codexAdapter = {
   kind: "codex",
   answerExtras: "other",
+  titleRepair: { due: (record) => typeof record.title !== "string" || record.title.length === 0 },
   async title({ sessionId, prefix, input }) {
     const indexTitle = await codexIndexTitle(sessionId);
     if (indexTitle)
@@ -2783,6 +2810,58 @@ var opencodeAdapter = {
   ambientPlan: true,
   locateTuiPid: (ctx, deps) => opencodeLocateTuiPid(ctx, deps)
 };
+function cursorModel(input) {
+  for (const key of ["model", "model_id"]) {
+    const v = input[key];
+    if (typeof v === "string" && v.trim().length > 0)
+      return v.trim().slice(0, 80);
+  }
+  return;
+}
+function cursorStateDb() {
+  const home = process.env.HOME ?? "";
+  const data = process.platform === "darwin" ? `${home}/Library/Application Support` : process.platform === "win32" ? process.env.APPDATA ?? "" : process.env.XDG_CONFIG_HOME || `${home}/.config`;
+  return `${data}/Cursor/User/globalStorage/state.vscdb`;
+}
+var CURSOR_TITLE_REPAIR_MS = 120000;
+var CURSOR_TITLE_TIMEOUT_MS = 300;
+function cursorChatTitle(sessionId, db = cursorStateDb(), env = process.env) {
+  if (!/^[A-Za-z0-9_-]{1,128}$/.test(sessionId))
+    return;
+  try {
+    const bin = process.platform === "darwin" && existsSync2("/usr/bin/sqlite3") ? "/usr/bin/sqlite3" : "sqlite3";
+    const out = execFileSync2(bin, [
+      "-init",
+      devNull,
+      "-batch",
+      "-noheader",
+      "-list",
+      "-readonly",
+      db,
+      "select case when json_type(cast(value as text),'$.name')='text' then json_extract(cast(value as text),'$.name') end" + ` from cursorDiskKV where key='composerData:${sessionId}'`
+    ], { timeout: CURSOR_TITLE_TIMEOUT_MS, encoding: "utf8", maxBuffer: 65536, stdio: ["ignore", "pipe", "ignore"], env });
+    const cleaned = out.replace(/\s+/g, " ").trim();
+    return cleaned ? truncateOnWord(cleaned) : undefined;
+  } catch {
+    return;
+  }
+}
+var cursorAdapter = {
+  kind: "cursor",
+  title: async ({ input }) => typeof input.prompt === "string" ? displayTitleFromUserText(input.prompt) : undefined,
+  model: async ({ input }) => cursorModel(input),
+  detectInterrupt: () => false,
+  sessionsDir: () => `${cursorHome()}/projects`,
+  sessionMatch: (name) => name.endsWith(".jsonl"),
+  hookStampPath: () => lastHookPath("cursor"),
+  hooksNotFiringHint: "  run `bunx nomo-ai --cursor` again, then restart Cursor (Settings → Hooks shows what it loaded)",
+  titleRepair: {
+    due: (record, now) => record.lastEvent === "done" && typeof record.ts === "number" && now - record.ts < CURSOR_TITLE_REPAIR_MS,
+    resolve: (sessionId) => cursorChatTitle(sessionId)
+  },
+  toolDetail: {},
+  blobAgentFields: { agent: "cursor" }
+};
 function unknownAgentAdapter(kind) {
   return {
     kind,
@@ -2804,6 +2883,8 @@ function adapterFor(agent) {
       return codexAdapter;
     case "opencode":
       return opencodeAdapter;
+    case "cursor":
+      return cursorAdapter;
     case "claude":
       return claudeAdapter;
     default:
@@ -5289,14 +5370,44 @@ function detailForHook(hookName, toolName, toolInput) {
   }
   if (hookName === "PreToolUse")
     return toolName ? TOOL_DETAIL[toolName] : undefined;
-  if (hookName === "PostToolUse")
+  if (hookName === "PostToolUse" || hookName === "PostToolUseFailure")
     return "thinking";
   return;
 }
 function isPermissionNotification(i) {
   const type = typeof i.notification_type === "string" ? i.notification_type : "";
+  if (type.length > 0)
+    return type === "permission_prompt" || type === "worker_permission_prompt";
   const msg = (typeof i.message === "string" ? i.message : "").toLowerCase();
-  return type === "permission_prompt" || msg.includes("permission") || msg.includes("approve") || msg.includes("allow");
+  return msg.includes("permission") || msg.includes("approve") || msg.includes("allow");
+}
+var ATTENTION_NOTIFICATIONS = new Set(["elicitation_dialog", "elicitation_url_dialog", "agent_needs_input"]);
+function hasRunningBackgroundAgent(input) {
+  const tasks = input.background_tasks;
+  return Array.isArray(tasks) && tasks.some((t) => {
+    const task = t;
+    return typeof task === "object" && task !== null && task.type === "subagent" && (task.status === "running" || task.status === "pending");
+  });
+}
+var HOLD_YIELDING_EVENTS = new Set([
+  "PostToolUseFailure",
+  "PreCompact",
+  "PostCompact",
+  "Elicitation",
+  "ElicitationResult"
+]);
+function yieldsToLiveHold(hookName, input) {
+  if (HOLD_YIELDING_EVENTS.has(hookName))
+    return true;
+  if (hookName === "Stop")
+    return hasRunningBackgroundAgent(input);
+  if (hookName === "Notification")
+    return !isPermissionNotification(input);
+  return false;
+}
+async function sessionHoldIsLive(sessionsDir, sessionId, now = Date.now(), alive = pidAlive) {
+  const hold = await readDecisionHoldAt(sessionsDir, sessionId);
+  return stateHoldLive(hold, hold !== null && typeof hold.pid === "number" ? alive(hold.pid) : false, now);
 }
 var USER_BLOCKING_TOOLS = new Set(["AskUserQuestion", "ExitPlanMode", "request_user_input"]);
 var INTERRUPT_STOP_REASON = "Interrupted from Nomo";
@@ -5312,13 +5423,15 @@ function interruptHookOutput(hookName) {
       }
     });
   }
-  if (hookName === "PostToolUse") {
+  if (hookName === "PostToolUse" || hookName === "PostToolUseFailure") {
     return JSON.stringify({ continue: false, stopReason: INTERRUPT_STOP_REASON });
   }
   return null;
 }
-function clearsInterruptFlag(hookName) {
-  return hookName === "UserPromptSubmit" || hookName === "Stop" || hookName === "SessionEnd";
+function clearsInterruptFlag(hookName, input = {}) {
+  if (hookName === "Stop")
+    return !hasRunningBackgroundAgent(input);
+  return hookName === "UserPromptSubmit" || hookName === "StopFailure" || hookName === "SessionEnd";
 }
 function interruptedEventInput(input) {
   return { ...input, hook_event_name: "Stop" };
@@ -5334,13 +5447,24 @@ function planOp(hookName, input, sentDone) {
     case "UserPromptSubmit":
     case "PostToolUse":
       return { op: "update", prio: 0, status: "working" };
+    case "PostToolUseFailure":
+      return input.is_interrupt === true ? null : { op: "update", prio: 0, status: "working" };
     case "Notification":
-      if (!isPermissionNotification(input))
+      if (!isPermissionNotification(input) && !(typeof input.notification_type === "string" && ATTENTION_NOTIFICATIONS.has(input.notification_type)))
         return null;
       return { op: "update", prio: 1, status: "needsAttention" };
     case "PermissionRequest":
+    case "Elicitation":
       return { op: "update", prio: 1, status: "needsAttention" };
+    case "ElicitationResult":
+      return { op: "update", prio: 0, status: "working" };
+    case "PreCompact":
+    case "PostCompact":
+      return input.trigger === "manual" ? null : { op: "update", prio: 0, status: "working" };
     case "Stop":
+      return hasRunningBackgroundAgent(input) ? { op: "update", prio: 0, status: "working" } : { op: "done", prio: 0, status: "done" };
+    case "StopFailure":
+    case "Interrupt":
       return { op: "done", prio: 0, status: "done" };
     case "SessionEnd":
       return { op: "end", prio: 0, status: "done" };
@@ -5376,7 +5500,7 @@ function buildBlob(input, machine, title, plan, agent = "claude", turnStartedAt,
   const { label, folderKey } = folder;
   const branch = sessionBranch(folder);
   const hookName = typeof input.hook_event_name === "string" ? input.hook_event_name : "";
-  const detail = detailOverride ?? detailForHook(hookName, typeof input.tool_name === "string" ? input.tool_name : undefined, input.tool_input);
+  const detail = detailOverride ?? (hookName === "Stop" && hasRunningBackgroundAgent(input) ? TOOL_DETAIL.Task : detailForHook(hookName, typeof input.tool_name === "string" ? input.tool_name : undefined, input.tool_input));
   const base = {
     status: plan.status,
     title: title ?? "",
@@ -5584,6 +5708,8 @@ async function runHook(agent) {
   try {
     const [config, raw] = await Promise.all([loadConfig(), readStdin()]);
     const input = JSON.parse(raw);
+    if (agent === "claude" && cursorHostInvocation(input))
+      return;
     if (typeof input.session_id !== "string" || input.session_id.length === 0)
       return;
     if (agent === "claude" && (typeof input.turn_id === "string" && input.turn_id.length > 0 || typeof input.transcript_path === "string" && input.transcript_path.includes("/.codex/"))) {
@@ -5622,7 +5748,7 @@ async function runHook(agent) {
     const hookName = typeof input.hook_event_name === "string" ? input.hook_event_name : "";
     let interrupted = false;
     if (adapter2.interrupt === "hook-flag") {
-      if (clearsInterruptFlag(hookName)) {
+      if (clearsInterruptFlag(hookName, input)) {
         await clearInterruptFlagAt(SESSIONS_DIR, reportedSessionId);
       } else {
         const line = interruptHookOutput(hookName);
@@ -5778,12 +5904,16 @@ async function runHook(agent) {
     let plan = planOp(interrupted ? "Stop" : hookName, input, sentDone);
     if (!plan)
       return;
+    if (!interrupted && yieldsToLiveHold(hookName, input) && await sessionHoldIsLive(SESSIONS_DIR, sessionId)) {
+      traceSession({ event: "hold-yield", sessionId, agent, hook_event_name: hookName });
+      return;
+    }
     let pendingPlanPicker = false;
     let planPickerVerificationPending = false;
     let attentionKind;
     let proposedPlan;
     let pickerClassifier = plan.op === "done" ? "none" : plan.status;
-    if (plan.op === "done" && adapter2.completedTurnWaitState) {
+    if (hookName === "Stop" && plan.op === "done" && adapter2.completedTurnWaitState) {
       const evidence = adapter2.completedTurnWaitEvidence ? await adapter2.completedTurnWaitEvidence({ pid: hookPid, transcriptPath }) : { state: await adapter2.completedTurnWaitState({ pid: hookPid, transcriptPath }) };
       const wait = evidence.state;
       pickerClassifier = wait;
@@ -5887,7 +6017,8 @@ var POST_FIRST_CONTACT_TIMEOUT_MS = 6000;
 var HOLD_BLOCKS_DIALOG = {
   claude: true,
   codex: true,
-  opencode: false
+  opencode: false,
+  cursor: false
 };
 var LOCAL_ANSWER_TOOLS = new Set(["AskUserQuestion", "ExitPlanMode"]);
 var LOCAL_ANSWER_TAIL_BYTES = 64000;
@@ -6639,6 +6770,8 @@ async function runPermissionHook(deps = {}, agent = "claude") {
   let settleAsWorking = false;
   let settleHeldRecord;
   try {
+    if (agent === "claude" && cursorHostInvocation(undefined))
+      return;
     if (await flagExists(noHoldPath)) {
       await (deps.delegate ?? (() => runHook(agent)))();
       return;
@@ -6659,6 +6792,8 @@ async function runPermissionHook(deps = {}, agent = "claude") {
       trace({ event: "exit", reason: "bad-stdin", ...errorTag(e), pos: parseErrorPosition(e) });
       return;
     }
+    if (agent === "claude" && cursorHostInvocation(input))
+      return;
     const sessionId = typeof input.session_id === "string" ? input.session_id : "";
     if (sessionId.length === 0) {
       trace({ event: "exit", reason: "no-session-id" });
@@ -8250,7 +8385,10 @@ function watchdogEventHeaders(config, approvals) {
 }
 var activeLanListener;
 var lanHintPublisher = createLanHintPublisher({ address: () => activeLanListener?.address() ?? null });
-async function postEvent(config, body) {
+var POST_TIMEOUT_MS2 = 2000;
+async function postEvent(config, body, opts = {}) {
+  const started = Date.now();
+  const detail = opts.detail;
   const lanHint = await lanHintPublisher.take(config);
   try {
     const payload = lanHint ? { ...body, lanHint } : body;
@@ -8258,8 +8396,12 @@ async function postEvent(config, body) {
       method: "POST",
       headers: watchdogEventHeaders(config, await localApprovalsState()),
       body: JSON.stringify(payload),
-      signal: AbortSignal.timeout(2000)
+      signal: AbortSignal.timeout(opts.timeoutMs ?? POST_TIMEOUT_MS2)
     });
+    if (detail) {
+      detail.status = res.status;
+      detail.ms = Date.now() - started;
+    }
     const outcome = postOutcomeForStatus(res.status);
     if (lanHint)
       lanHintPublisher.settle(outcome === "delivered");
@@ -8269,7 +8411,11 @@ async function postEvent(config, body) {
       } catch {}
     }
     return outcome;
-  } catch {
+  } catch (e) {
+    if (detail) {
+      detail.error = e?.name === "TimeoutError" ? "timeout" : "network";
+      detail.ms = Date.now() - started;
+    }
     if (lanHint)
       lanHintPublisher.settle(false);
     return "failed";
@@ -8860,7 +9006,8 @@ function transcriptMtimeMsDefault(path) {
   }
 }
 function isClaudeIdleReapEligible(record, now, transcriptMtimeMs = transcriptMtimeMsDefault) {
-  if (recordAgent(record) !== "claude")
+  const agent = recordAgent(record);
+  if (agent !== "claude" && agent !== "cursor")
     return false;
   if (record.provisional === true)
     return false;
@@ -8967,6 +9114,8 @@ async function correctIdleClaude(config, path, sessionId, record, now, deps = {}
   }
 }
 var PENDING_DONE_MAX_ATTEMPTS = 5;
+var PENDING_DONE_GRACE_MS = 4000;
+var PENDING_DONE_POST_TIMEOUT_MS = 5000;
 function shouldPendingDoneCheck(record) {
   if (record.donePending !== true)
     return false;
@@ -8975,7 +9124,7 @@ function shouldPendingDoneCheck(record) {
   return true;
 }
 async function correctPendingDone(config, path, sessionId, record, now, deps = {}) {
-  const post = deps.post ?? ((body) => postEvent(config, body));
+  const post = deps.post ?? ((body, detail) => postEvent(config, body, { timeoutMs: PENDING_DONE_POST_TIMEOUT_MS, detail }));
   const writeRecord = deps.writeRecord ?? ((p, rec) => atomicWrite(p, JSON.stringify(rec), 384));
   const reread = deps.readRecord ?? readRecordAt;
   const freshRecord = async () => {
@@ -8989,6 +9138,9 @@ async function correctPendingDone(config, path, sessionId, record, now, deps = {
   try {
     if (!shouldPendingDoneCheck(record))
       return "uncorrected";
+    const age = now - record.ts;
+    if (age >= 0 && age < PENDING_DONE_GRACE_MS)
+      return "pending";
     if (await decisionHoldIsLive(sessionId, now, deps)) {
       traceFocus(deps, { event: "pending-done", sessionId, outcome: "held", delivered: false, held: true });
       return "pending";
@@ -9017,14 +9169,18 @@ async function correctPendingDone(config, path, sessionId, record, now, deps = {
       return "pending";
     }
     const at = typeof record.ts === "number" && Number.isFinite(record.ts) ? Math.floor(record.ts / 1000) : undefined;
-    const outcome = await post(await buildDoneEnvelope(sessionId, record, clock(), config.e2eKey, agent, at));
+    const detail = {};
+    const outcome = await post(await buildDoneEnvelope(sessionId, record, clock(), config.e2eKey, agent, at), detail);
     traceFocus(deps, {
       event: "pending-done",
       sessionId,
       outcome,
       attempts,
       delivered: outcome === "delivered",
-      at
+      at,
+      status: detail.status,
+      error: detail.error,
+      ms: detail.ms
     });
     if (outcome === "revoked")
       return "revoked";
@@ -9169,39 +9325,54 @@ async function buildTitleRepairEnvelope(sessionId, record, title, now, e2eKey, a
   const blob = await encryptBlob(e2eKey, appendFittedPlanAndDebug(base, undefined, dbg));
   return { v: 2, sessionId, op: record.op ?? "update", prio: record.prio ?? 0, ts: now, blob, ...startedAtField(record) };
 }
-function shouldRepairTitle(record) {
-  if (record.agent !== "codex")
-    return false;
+function shouldRepairTitle(record, now = Date.now()) {
   if (record.provisional === true)
     return false;
-  return typeof record.title !== "string" || record.title.length === 0;
+  return adapterFor(recordAgent(record)).titleRepair?.due(record, now) === true;
 }
 function titleRepairedRecord(record, title, blob, pairingId) {
   return { ...record, title, blob, ...pairingId.length > 0 ? { pairingId } : {} };
 }
-async function repairTitle(config, path, sessionId, record) {
+async function repairTitle(config, path, sessionId, record, deps = {}) {
   try {
     if (!shouldRepairTitle(record))
       return "uncorrected";
-    let prefix = "";
-    if (typeof record.transcript === "string" && record.transcript.length > 0) {
-      try {
-        prefix = await readPrefix(record.transcript, TITLE_REPAIR_HEAD_BYTES);
-      } catch {}
+    const adapter2 = adapterFor(recordAgent(record));
+    const resolve3 = deps.resolve ?? adapter2.titleRepair?.resolve;
+    let title;
+    if (resolve3) {
+      title = resolve3(sessionId);
+    } else {
+      let prefix = "";
+      if (typeof record.transcript === "string" && record.transcript.length > 0) {
+        try {
+          prefix = await readPrefix(record.transcript, TITLE_REPAIR_HEAD_BYTES);
+        } catch {}
+      }
+      title = await adapter2.title({ sessionId, prefix, input: {}, transcriptPath: record.transcript });
     }
-    const title = await codexAdapter.title({ sessionId, prefix, input: {}, transcriptPath: record.transcript });
-    if (!title)
+    if (!title || title === record.title)
+      return "uncorrected";
+    const unmoved = async () => {
+      try {
+        const fresh = await readRecordAt(path);
+        return fresh !== null && !recordMovedSince(record, fresh);
+      } catch {
+        return false;
+      }
+    };
+    if (!await unmoved())
       return "uncorrected";
     const repairNow = Date.now();
-    const envelope = await buildTitleRepairEnvelope(sessionId, record, title, repairNow, config.e2eKey, "codex", Math.floor(repairNow / 1000));
-    const outcome = await postEvent(config, envelope);
+    const envelope = await buildTitleRepairEnvelope(sessionId, record, title, repairNow, config.e2eKey, adapter2.kind, Math.floor(repairNow / 1000));
+    const outcome = await (deps.post ?? ((body) => postEvent(config, body)))(envelope);
     if (outcome === "revoked")
       return "revoked";
     if (outcome !== "delivered")
       return "uncorrected";
     try {
-      const next = titleRepairedRecord(record, title, envelope.blob, config.pairingId);
-      await atomicWrite(path, JSON.stringify(next), 384);
+      if (await unmoved())
+        await atomicWrite(path, JSON.stringify(titleRepairedRecord(record, title, envelope.blob, config.pairingId)), 384);
     } catch {}
     return "corrected";
   } catch {
@@ -9860,6 +10031,7 @@ export {
   resolveCodexTuiOwner,
   resetDoneAttemptMemory,
   resetCommandState,
+  repairTitle,
   recordMovedSince,
   reconcileProvisionalsSweep,
   pruneStaleDecisionHolds,
@@ -9919,6 +10091,8 @@ export {
   PLAN_PICKER_VERIFY_MAX_MS,
   PLAN_PICKER_RECENT_DONE_MS,
   PLAN_PICKER_PENDING_MAX_MS,
+  PENDING_DONE_POST_TIMEOUT_MS,
+  PENDING_DONE_GRACE_MS,
   PAIRING_TTL_MS,
   LAN_COMMAND_ID_PREFIX,
   LAN_ANSWER_ECHO_DELAY_MS,

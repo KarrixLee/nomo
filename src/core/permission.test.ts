@@ -533,6 +533,37 @@ const baseDeps = (over: Record<string, unknown>) => ({
 });
 
 describe("runPermissionHook — hold state machine", () => {
+  // NOM-67. Cursor imports the Claude plugin and runs THIS hook with a Cursor-shaped payload. It must
+  // print no decision (so Cursor falls back to its own prompt) and touch neither disk nor network. The
+  // control is the very next test: the same input without the fingerprint POSTs twice.
+  test("Cursor payload (a cursor_version key) → no decision line, zero network, even with a hold on offer", async () => {
+    const emitted: string[] = [];
+    const { fn, calls } = scriptFetch(true, [{ decision: "allow" }]);
+    const input = JSON.stringify({ ...JSON.parse(INPUT) as Record<string, unknown>, cursor_version: "1.7.52" });
+    await runPermissionHook(baseDeps({ readInput: async () => input, fetchFn: fn, emit: (l: string) => emitted.push(l) }) as never);
+    expect(calls).toEqual([]);
+    expect(emitted).toEqual([]);
+  });
+
+  test("CURSOR_VERSION in the environment (even empty) → exits before stdin is read", async () => {
+    const emitted: string[] = [];
+    const { fn, calls } = scriptFetch(true, [{ decision: "allow" }]);
+    let read = false;
+    const previous = process.env.CURSOR_VERSION;
+    process.env.CURSOR_VERSION = "";
+    try {
+      await runPermissionHook(baseDeps({
+        readInput: async () => { read = true; return INPUT; },
+        noHoldPath: "/does/not/exist/no-hold", fetchFn: fn, emit: (l: string) => emitted.push(l),
+      }) as never);
+    } finally {
+      if (previous === undefined) delete process.env.CURSOR_VERSION; else process.env.CURSOR_VERSION = previous;
+    }
+    expect(read).toBe(false);
+    expect(calls).toEqual([]);
+    expect(emitted).toEqual([]);
+  });
+
   test("hold=false twice (first ask + post-race re-ask) → silent, exactly 2 POSTs, no polling", async () => {
     const emitted: string[] = [];
     const { fn, calls } = scriptFetch(false, []);

@@ -63,15 +63,47 @@ export interface OcSessionState {
   agentFromMessage?: boolean;
 }
 
+/** One permission/question OpenCode is blocked on a human for. */
+export interface OcPrompt {
+  /** The session that ASKED — a subagent's own id when a subagent asked. */
+  sessionID: string;
+  /** The tool call it is blocking, when the asked event named one (`tool:{messageID, callID}`). */
+  messageID?: string;
+  callID?: string;
+  /** A hold has this prompt on the phone as an Allow/Deny card right now (see ocPromptHeld). */
+  held?: boolean;
+}
+
 export interface OcState {
   sessions: Map<string, OcSessionState>;
-  /** Session ids known to have a `parentID` — subagent (`task`) fan-out. Their lifecycle events are
-   *  dropped, or one fan-out paints N island rows for what the user sees as one session. */
-  children: Set<string>;
+  /** Subagent (`task`) session id → its `parentID`. Their lifecycle events are dropped, or one
+   *  fan-out paints N island rows for what the user sees as one session — but a subagent blocked on
+   *  the user IS the root row's business, and this is how its prompt finds that row. */
+  children: Map<string, string>;
+  /** OpenCode request id (`per_…` / `que_…`) → the prompt still waiting on the user. READ, never
+   *  inferred from the last frame sent: "is this row blocked?" is answered from here every time. */
+  prompts: Map<string, OcPrompt>;
 }
 
 export function newOcState(): OcState {
-  return { sessions: new Map(), children: new Set() };
+  return { sessions: new Map(), children: new Map(), prompts: new Map() };
+}
+
+/** The row a session's events belong to: itself, or the top of its subagent chain. */
+export function ocRootSession(state: OcState, sessionId: string): string {
+  let id = sessionId;
+  // Bounded by the map's size, so a parent cycle (never observed) cannot spin the editor's thread.
+  for (let hops = state.children.size; hops > 0; hops -= 1) {
+    const parent = state.children.get(id);
+    if (parent === undefined) break;
+    id = parent;
+  }
+  return id;
+}
+
+function hasPrompt(state: OcState, rootId: string): boolean {
+  for (const prompt of state.prompts.values()) if (ocRootSession(state, prompt.sessionID) === rootId) return true;
+  return false;
 }
 
 /** OpenCode's own default title (`session.ts`: `"New session - " + new Date().toISOString()`, and
@@ -162,8 +194,8 @@ function statusType(status: unknown): string | undefined {
  *  | `session.status {busy}`        | update / working — skipped when identical to the last     |
  *  |                                | (start / working when it is a created session's FIRST)    |
  *  | `session.status {retry}`       | the same, detail = the `"retrying"` key                   |
- *  | `session.status {idle}`        | (nothing — `session.idle` is the authoritative done)      |
- *  | `session.idle` (root)          | done / done                                              |
+ *  | `session.status {idle}`        | done / done — once per turn, whichever of the two idle    |
+ *  | `session.idle` (root)          | signals lands first (see finishTurn)                      |
  *  | `session.deleted`              | end                                                      |
  *  | `session.updated`              | (title + agent seed only, no frame)                      |
  *  | `message.updated` (assistant)  | (model + agent only, no frame)                           |
@@ -174,7 +206,8 @@ function statusType(status: unknown): string | undefined {
  *
  *  The approval channels (`permission.asked` / `question.asked`) are DELIBERATELY absent: they are not
  *  session-lifecycle frames at all — they open a blocking hold that POSTs its own decision frame on a
- *  different route entirely. See approvals.ts.
+ *  different route entirely. See approvals.ts. What this reducer DOES do for them is stay out of the
+ *  way: while a prompt is registered (ocPromptAsked) no working frame is planned for its row.
  */
 export function reduceOcEvent(state: OcState, event: unknown, now: number = Date.now()): OcFrame | null {
   const e = asRecord(event);
@@ -188,7 +221,8 @@ export function reduceOcEvent(state: OcState, event: unknown, now: number = Date
   // (the previous MESSAGE), and feeding those into the child set would be pure noise at best.
   if (info && type.startsWith("session.")) {
     const id = asString(info.id);
-    if (id && asString(info.parentID)) state.children.add(id);
+    const parentID = asString(info.parentID);
+    if (id && parentID && parentID !== id) state.children.set(id, parentID);
   }
 
   const sessionId = asString(properties.sessionID) ?? (type.startsWith("session.") ? asString(info?.id) : undefined);
@@ -233,9 +267,18 @@ export function reduceOcEvent(state: OcState, event: unknown, now: number = Date
     }
 
     case "session.status": {
-      const live = entry ?? adopt(state, sessionId, now);
       const status = statusType(properties.status);
-      if (status !== "busy" && status !== "retry") return null; // `idle` is session.idle's job
+      // THE SAME TURN END AS `session.idle`, which is a deprecated twin of this that a build may stop
+      // sending. Checked BEFORE the adopt below: an idle status for a session we never saw must not
+      // conjure an `announced` entry for the done to then "finish".
+      if (status === "idle") return finishTurn(sessionId, entry, now);
+      if (status !== "busy" && status !== "retry") return null;
+      const live = entry ?? adopt(state, sessionId, now);
+      // A PROMPT IS UP — the row is needsAttention, or a hold's Allow/Deny card. Busy keeps repeating
+      // underneath it, and one that differs from the last (a title landed) would paint working straight
+      // over a card that is the only way to answer. Whoever resolves the prompt repaints (ocPromptFrame).
+      // A never-announced session cannot have a prompt and its `start` is never held back.
+      if (live.announced && hasPrompt(state, sessionId)) return null;
       // A FIXED KEY, NEVER THE PROVIDER'S MESSAGE. `detail` is a closed enum on the phone
       // (`CCDetailKey.label`, see `frame` below): an unknown key renders nothing in the widget and
       // raw unlocalized English in the app row, and a provider's retry sentence would additionally
@@ -256,7 +299,7 @@ export function reduceOcEvent(state: OcState, event: unknown, now: number = Date
       // is only true once the POST is CONFIRMED — and postOcEvent swallows every failure. So the
       // sender calls ocForgetStatusFrame on a frame it could not deliver; otherwise one dropped POST
       // silenced every byte-identical busy for the rest of the turn (~5 min of frozen island).
-      const key = JSON.stringify([planned.status, planned.detail, planned.title, planned.model, planned.plan]);
+      const key = statusKey(planned);
       if (live.lastStatusFrame === key) return null;
       live.lastStatusFrame = key;
       return planned;
@@ -274,25 +317,12 @@ export function reduceOcEvent(state: OcState, event: unknown, now: number = Date
       if (plan === entry.plan) return null; // the same list twice — the phone already shows it
       entry.plan = plan;
       if (!entry.announced) return null; // kept for the first busy, which is what opens the row
+      if (hasPrompt(state, sessionId)) return null; // kept for the frame that clears the prompt — see busy
       return frame(sessionId, entry, "update", "working", now);
     }
 
-    case "session.idle": {
-      // Never announced = never prompted (an abort on a fresh fork): there is no row to finish, and a
-      // done here would CREATE one.
-      if (!entry?.announced) return null;
-      entry.working = false;
-      entry.lastStatusFrame = undefined; // the next busy must always get through
-      // Build the done frame BEFORE clearing the anchor: the phone's "done in X" is the turn's END
-      // minus `turnStartedAt`, i.e. the frozen version of the count-up that was running. Clearing
-      // first shipped a done frame with no anchor, and the phone then falls back to `startedAt` —
-      // the SESSION's start — which it only trusts inside a 30-minute plausibility window (that
-      // window exists to stop a resumed session flashing its whole age, "40h"). So the timer simply
-      // vanished on any session older than half an hour.
-      const done = frame(sessionId, entry, "done", "done", now);
-      entry.turnStartedAt = undefined;
-      return done;
-    }
+    case "session.idle":
+      return finishTurn(sessionId, entry, now);
 
     case "session.deleted": {
       if (!entry) return null;
@@ -303,6 +333,36 @@ export function reduceOcEvent(state: OcState, event: unknown, now: number = Date
     default:
       return null;
   }
+}
+
+/** The turn is over: `session.idle`, or `session.status {idle}` — OpenCode publishes both for one
+ *  turn end, so whichever lands second must be a no-op or the phone gets two done notifications. */
+function finishTurn(sessionId: string, entry: OcSessionState | undefined, now: number): OcFrame | null {
+  // Never announced = never prompted (an abort on a fresh fork): there is no row to finish, and a
+  // done here would CREATE one.
+  if (!entry?.announced) return null;
+  // ALREADY DONE, and nothing has re-opened the row since (a todo frame sets `working` again). The
+  // key is retracted on a failed send like any other, which is right: an undelivered done is still
+  // owed, and a second idle is the cheapest retry there is.
+  if (entry.lastStatusFrame === DONE_KEY && !entry.working) return null;
+  entry.working = false;
+  entry.lastStatusFrame = DONE_KEY; // never equal to a busy key, so the next busy always gets through
+  // Build the done frame BEFORE clearing the anchor: the phone's "done in X" is the turn's END
+  // minus `turnStartedAt`, i.e. the frozen version of the count-up that was running. Clearing
+  // first shipped a done frame with no anchor, and the phone then falls back to `startedAt` —
+  // the SESSION's start — which it only trusts inside a 30-minute plausibility window (that
+  // window exists to stop a resumed session flashing its whole age, "40h"). So the timer simply
+  // vanished on any session older than half an hour.
+  const done = frame(sessionId, entry, "done", "done", now);
+  entry.turnStartedAt = undefined;
+  return done;
+}
+
+const DONE_KEY = "done";
+
+/** Everything that can change a RENDERED working frame — the identical-frame skip's key. */
+function statusKey(planned: OcFrame): string {
+  return JSON.stringify([planned.status, planned.detail, planned.title, planned.model, planned.plan]);
 }
 
 /** Terminal frames for every still-live session — the `dispose()` path (OpenCode is shutting the
@@ -333,14 +393,121 @@ export function ocForgetStatusFrame(state: OcState, sessionId: string): void {
  *  hooks' `delegate` produces (runHook's PermissionRequest branch: update / prio 1 / needsAttention),
  *  so a paused-approvals OpenCode row looks the same as a paused-approvals Claude one. Null for a
  *  session we never saw start. It ANNOUNCES the row (the worker takes a first-seen update as
- *  discovery), so the idle that follows is allowed to close it. */
+ *  discovery), so the idle that follows is allowed to close it.
+ *
+ *  A SUBAGENT's prompt lands on its ROOT's row: the child has no row of its own, and OpenCode is
+ *  blocked on a human all the same. */
 export function ocAttentionFrame(
   state: OcState, sessionId: string, detail: string | undefined, now: number = Date.now(),
 ): OcFrame | null {
-  const entry = state.sessions.get(sessionId);
-  if (!entry || state.children.has(sessionId)) return null;
+  const rootId = ocRootSession(state, sessionId);
+  const entry = state.sessions.get(rootId);
+  if (!entry) return null;
   entry.announced = true;
-  return frame(sessionId, entry, "update", "needsAttention", now, detail, 1);
+  // The phone no longer shows the last working frame, so the skip key that says it does is void.
+  entry.lastStatusFrame = undefined;
+  return frame(rootId, entry, "update", "needsAttention", now, detail, 1);
+}
+
+/** Record a `permission.asked` / `question.asked` as pending. Reads the raw event because the tool
+ *  call it blocks (`tool:{messageID, callID}`) is not part of what a hold needs. */
+export function ocPromptAsked(state: OcState, event: unknown): void {
+  const properties = asRecord(asRecord(event)?.properties);
+  const id = asString(properties?.id);
+  const sessionID = asString(properties?.sessionID);
+  // A re-delivered ask must not reset a prompt we already track — its `held` flag guards a live card.
+  if (!id || !sessionID || state.prompts.has(id)) return;
+  const tool = asRecord(properties?.tool);
+  const messageID = asString(tool?.messageID);
+  const callID = asString(tool?.callID);
+  state.prompts.set(id, { sessionID, ...(messageID ? { messageID } : {}), ...(callID ? { callID } : {}) });
+}
+
+/** Mark a pending prompt as held on the phone (a hold started) or not (it ended, or was never
+ *  granted). While ANY of a row's pending prompts is held, ocPromptFrame paints nothing: the hold's
+ *  decisionPending card is the only way to answer from the phone, and both a needsAttention frame (a
+ *  subagent asking meanwhile) and a working one (a sibling answered) would replace it. */
+export function ocPromptHeld(state: OcState, id: string, held: boolean): void {
+  const prompt = state.prompts.get(id);
+  if (prompt) prompt.held = held;
+}
+
+/** Is a hold's card on this ROOT row right now — any of its pending prompts (its own or a subagent's)
+ *  marked held? Read at SEND time by the plugin: the card is posted on its own route, off the send
+ *  chain, so a working frame that was planned before the prompt can still be queued behind it. */
+export function ocRowHeld(state: OcState, rootId: string): boolean {
+  for (const prompt of state.prompts.values()) {
+    if (prompt.held && ocRootSession(state, prompt.sessionID) === rootId) return true;
+  }
+  return false;
+}
+
+/** Forget one prompt. Returns the ROOT session whose row may need repainting (ocPromptFrame), or
+ *  undefined when we were not tracking it — so two signals for one answer repaint once. */
+export function ocPromptResolved(state: OcState, id: string): string | undefined {
+  const prompt = state.prompts.get(id);
+  if (!prompt) return undefined;
+  state.prompts.delete(id);
+  return ocRootSession(state, prompt.sessionID);
+}
+
+/** The pending prompts an event proves are over WITHOUT a `*.replied` — a lookup, it removes nothing.
+ *
+ *   - `byTool`: the tool call a prompt was blocking reached `completed`/`error`. A tool cannot finish
+ *     while its permission is open, so that request is answered (or was aborted) — per call, so a
+ *     parallel sibling's prompt is untouched.
+ *   - otherwise: the asking session (or an ancestor of it) went idle or was deleted. Nothing in a
+ *     finished turn is still waiting, and OpenCode can retain a request across an abort without ever
+ *     publishing a reply for it — without this bound one lost reply would mute the row for good. */
+export function ocPromptsEndedBy(state: OcState, event: unknown): { id: string; byTool: boolean }[] {
+  const e = asRecord(event);
+  const type = asString(e?.type);
+  const properties = asRecord(e?.properties);
+  if (!type || !properties || state.prompts.size === 0) return [];
+  const ended: { id: string; byTool: boolean }[] = [];
+  if (type === "message.part.updated") {
+    const part = asRecord(properties.part);
+    const partStatus = asRecord(part?.state)?.status;
+    const callID = asString(part?.callID);
+    if (part?.type !== "tool" || !callID || (partStatus !== "completed" && partStatus !== "error")) return [];
+    const sessionID = asString(part.sessionID) ?? asString(properties.sessionID);
+    const messageID = asString(part.messageID);
+    for (const [id, prompt] of state.prompts) {
+      if (prompt.sessionID !== sessionID || prompt.callID !== callID) continue;
+      if (prompt.messageID && messageID && prompt.messageID !== messageID) continue;
+      ended.push({ id, byTool: true });
+    }
+    return ended;
+  }
+  const over = type === "session.idle" || type === "session.deleted"
+    || (type === "session.status" && statusType(properties.status) === "idle");
+  const sessionID = asString(properties.sessionID) ?? asString(asRecord(properties.info)?.id);
+  if (!over || !sessionID) return [];
+  for (const [id, prompt] of state.prompts) {
+    // Walk the asker's own chain rather than comparing roots: a mid-level subagent ending takes its
+    // own subagents' prompts with it, and nobody else's.
+    for (let at: string | undefined = prompt.sessionID, hops = state.children.size + 1; at !== undefined && hops > 0; hops -= 1) {
+      if (at === sessionID) { ended.push({ id, byTool: false }); break; }
+      at = state.children.get(at);
+    }
+  }
+  return ended;
+}
+
+/** What a session's row should show RIGHT NOW as far as prompts go, read from state rather than
+ *  remembered from the last event: needsAttention while any prompt (its own or a subagent's) is
+ *  pending, working once none is and the turn is still running, null otherwise (turn over — the done
+ *  frame owns the row — a session we never saw, or a row a live hold owns). The caller sends it whenever a prompt appears or
+ *  goes away; it is NOT skip-keyed, because every call follows a frame that was not `working`. */
+export function ocPromptFrame(state: OcState, sessionId: string, now: number = Date.now()): OcFrame | null {
+  const rootId = ocRootSession(state, sessionId);
+  if (ocRowHeld(state, rootId)) return null;
+  if (hasPrompt(state, rootId)) return ocAttentionFrame(state, rootId, undefined, now);
+  const entry = state.sessions.get(rootId);
+  if (!entry?.announced || !entry.working) return null;
+  const planned = frame(rootId, entry, "update", "working", now);
+  entry.lastStatusFrame = statusKey(planned); // the busy OpenCode repeats next is this very frame
+  return planned;
 }
 
 /** Adopt a session first seen mid-flight (the plugin loaded into a server that already had sessions,

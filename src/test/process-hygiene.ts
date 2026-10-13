@@ -75,6 +75,9 @@ export function isolatedTestEnv(
     // suite run FROM the desktop app would otherwise make every spawned claude hook a desktop one and
     // defer the rows the tests assert on. Desktop cases opt in through `overrides`.
     CLAUDE_CODE_ENTRYPOINT: "cli",
+    // Dropped, not inherited, for the same reason: a suite run from inside Cursor would otherwise trip
+    // the Claude entries' Cursor import guard and silence every spawned hook.
+    CURSOR_VERSION: undefined,
     ...overrides,
   };
 }

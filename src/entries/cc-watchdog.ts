@@ -1006,12 +1006,29 @@ let activeLanListener: LanListener | undefined;
  *  a module singleton for the same reason the buffers above are: postEvent has no place to hang state. */
 const lanHintPublisher = createLanHintPublisher({ address: () => activeLanListener?.address() ?? null });
 
+/** Default budget for every watchdog POST — the same 2 s the hooks use, because the sweep awaits its
+ *  POSTs one after another and an unreachable relay must not stretch a tick by more than this per send. */
+const POST_TIMEOUT_MS = 2000;
+
+/** WHY a POST ended the way it did, filled in by postEvent when the caller hands one over. PostOutcome
+ *  folds a timeout, a network error and a 5xx into one "failed"; this keeps them apart for the trace.
+ *  Status code, error class and elapsed time ONLY — never a header, body or blob. */
+export interface PostDetail {
+  status?: number;
+  error?: "timeout" | "network";
+  ms?: number;
+}
+
 /** POST a v2 envelope to the Worker with the per-pairing auth headers. `delivered` ONLY on a 2xx:
  *  a 401/500 is a FAILURE, not success — otherwise a bad secret or a Worker error would count as
  *  delivered and the caller would delete/rewrite the session file, losing the session. A 404 is
  *  `revoked` (the definitive pairing-is-gone signal, keyed on the server's own not-found response).
  *  Any network error / timeout is a transient `failed`. Best-effort: never throws across its boundary. */
-async function postEvent(config: Config, body: object): Promise<PostOutcome> {
+async function postEvent(
+  config: Config, body: object, opts: { timeoutMs?: number; detail?: PostDetail } = {},
+): Promise<PostOutcome> {
+  const started = Date.now();
+  const detail = opts.detail;
   // The LAN listener's sealed host hint rides along on the POSTs this daemon already makes — no new
   // request is ever issued for discovery, and `take` returns undefined unless the hint actually
   // changed or its 5-minute refresh came due (so the overwhelming majority of POSTs are untouched).
@@ -1024,8 +1041,9 @@ async function postEvent(config: Config, body: object): Promise<PostOutcome> {
       method: "POST",
       headers: watchdogEventHeaders(config, await localApprovalsState()),
       body: JSON.stringify(payload),
-      signal: AbortSignal.timeout(2000),
+      signal: AbortSignal.timeout(opts.timeoutMs ?? POST_TIMEOUT_MS),
     });
+    if (detail) { detail.status = res.status; detail.ms = Date.now() - started; }
     const outcome = postOutcomeForStatus(res.status);
     // Tell the hint publisher what became of the hint this POST carried. A hint handed to a POST that
     // failed must NOT count as published — see LanHintPublisher.settle. `revoked` settles as undelivered
@@ -1040,8 +1058,12 @@ async function postEvent(config: Config, body: object): Promise<PostOutcome> {
       try { bufferCommands(extractCommands(await res.json())); } catch { /* not JSON → no commands */ }
     }
     return outcome;
-  } catch {
+  } catch (e) {
     // fetch threw (timeout, DNS, offline) — the hint never reached the wire.
+    if (detail) {
+      detail.error = (e as { name?: string } | null)?.name === "TimeoutError" ? "timeout" : "network";
+      detail.ms = Date.now() - started;
+    }
     if (lanHint) lanHintPublisher.settle(false);
     return "failed";
   }
@@ -2362,7 +2384,12 @@ export function isClaudeIdleReapEligible(
   record: SessionRecord, now: number,
   transcriptMtimeMs: (path: string) => number | undefined = transcriptMtimeMsDefault,
 ): boolean {
-  if (recordAgent(record) !== "claude") return false;
+  // Cursor joins Claude here, and ONLY here: like Claude its hooks are its sole signal (no discovery,
+  // no notify, no resident plugin), so a dropped `stop` — or a row whose owner pid could not be found
+  // (CURSOR_UNKNOWN_OWNER_PID) — has nothing else to finish it. It never sets `awaitingPrompt`, so it
+  // only ever gets the 30-min clock.
+  const agent = recordAgent(record);
+  if (agent !== "claude" && agent !== "cursor") return false;
   if (record.provisional === true) return false;
   return idleReapAgeEligible(record, now, transcriptMtimeMs,
     record.awaitingPrompt === true ? CLAUDE_AWAITING_PROMPT_REAP_MS : CLAUDE_IDLE_REAP_MS);
@@ -2581,6 +2608,14 @@ export async function correctIdleClaude(
  *  re-POSTing a doomed done every 5 s forever. */
 const PENDING_DONE_MAX_ATTEMPTS = 5;
 
+/** Age grace: the hook writes the record BEFORE its own 2 s done POST, so a debt younger than this may
+ *  simply be that send still in flight — re-POSTing then only duplicates it (and burns an attempt). */
+export const PENDING_DONE_GRACE_MS = 4000;
+
+/** Budget for the corrective re-POST. A background daemon, not a hook an agent waits on, so it can
+ *  afford more than the hook's 2 s — which a ~1.8 s relay round trip was missing by a hair, five times. */
+export const PENDING_DONE_POST_TIMEOUT_MS = 5000;
+
 /** Gate: does this record owe the worker a done? Only the pessimistic marker matters — the record is
  *  already in its terminal done state, so there is no status to re-derive and nothing to disambiguate
  *  from a transcript. Provisional discovery rows are excluded: their op:done is POSTed by discovery
@@ -2595,7 +2630,8 @@ export function shouldPendingDoneCheck(record: SessionRecord): boolean {
 /** Injectable seams for the undelivered-done net, mirroring IdleReapDeps. `now` clocks the re-POSTed
  *  envelope's ts (its blob `at` stays FROZEN at the record's real done time — see below). */
 export interface PendingDoneDeps extends DecisionHoldGateDeps {
-  post?: (body: object) => Promise<PostOutcome>;
+  /** `detail` is an out-param the poster may fill with why the send ended as it did (see PostDetail). */
+  post?: (body: object, detail: PostDetail) => Promise<PostOutcome>;
   writeRecord?: (path: string, rec: SessionRecord) => Promise<void>;
   /** Re-reads the record from disk immediately before a write, so a hook that landed DURING the POST is
    *  never clobbered back to the pre-POST snapshot (see pendingDoneSettleWrite). Defaults to a real read;
@@ -2625,7 +2661,8 @@ export interface PendingDoneDeps extends DecisionHoldGateDeps {
 export async function correctPendingDone(
   config: Config, path: string, sessionId: string, record: SessionRecord, now: number, deps: PendingDoneDeps = {},
 ): Promise<"corrected" | "pending" | "uncorrected" | "revoked"> {
-  const post = deps.post ?? ((body: object) => postEvent(config, body));
+  const post = deps.post ?? ((body: object, detail: PostDetail) =>
+    postEvent(config, body, { timeoutMs: PENDING_DONE_POST_TIMEOUT_MS, detail }));
   const writeRecord = deps.writeRecord
     // Owner-only (0600), same as the hook's trackSession / every other record rewrite in this file.
     ?? ((p: string, rec: SessionRecord) => atomicWrite(p, JSON.stringify(rec), 0o600));
@@ -2638,6 +2675,11 @@ export async function correctPendingDone(
   const clock = deps.now ?? Date.now;
   try {
     if (!shouldPendingDoneCheck(record)) return "uncorrected";
+    // THE AGE GRACE (see PENDING_DONE_GRACE_MS): the hook's own POST may still be in flight. "pending",
+    // like the hold gate below — the debt is durable, and owning the sweep keeps every other net off a
+    // record whose delivery is still undecided. Untraced: it is not an attempt.
+    const age = now - record.ts;
+    if (age >= 0 && age < PENDING_DONE_GRACE_MS) return "pending";
     // THE LIVE-HOLD GATE (see decisionHoldIsLive). Re-paying the done debt over an open Allow/Deny card
     // costs the user the only frame they can answer, and the debt is DURABLE — `donePending` stays on the
     // record — so deferring costs one sweep and loses nothing. Checked before anything else: this net's
@@ -2679,15 +2721,18 @@ export async function correctPendingDone(
     // record.ts is the Stop's own write time; a corrupt record with no numeric ts simply omits `at`
     // (the phone then falls back to its own receipt time, as it does for every pre-`at` frame).
     const at = typeof record.ts === "number" && Number.isFinite(record.ts) ? Math.floor(record.ts / 1000) : undefined;
-    const outcome = await post(await buildDoneEnvelope(sessionId, record, clock(), config.e2eKey, agent, at));
+    const detail: PostDetail = {};
+    const outcome = await post(await buildDoneEnvelope(sessionId, record, clock(), config.e2eKey, agent, at), detail);
     // One line per attempt, whatever happens: the retry ladder is otherwise invisible, and "did this done
-    // ever reach the worker" is exactly the question a vanished row raises.
+    // ever reach the worker" is exactly the question a vanished row raises. `status` / `error` / `ms`
+    // say WHY — a 2.00 s "failed" used to be only a guess at a timeout.
     traceFocus(deps, {
       event: "pending-done", sessionId, outcome, attempts, delivered: outcome === "delivered", at,
+      status: detail.status, error: detail.error, ms: detail.ms,
     });
     if (outcome === "revoked") return "revoked"; // pairing gone → bubble up so the loop can tear down
     if (outcome === "delivered") {
-      // RE-READ before writing: the POST above took up to 2 s, and a user prompt landing in that window
+      // RE-READ before writing: the POST above took up to 5 s, and a user prompt landing in that window
       // already flipped this record to `working`. Stamping the pre-POST snapshot back would resurrect
       // `done` on a live session and silence every net that gates off a done record (see
       // pendingDoneSettleWrite for the full matrix).
@@ -2894,6 +2939,10 @@ export async function retireDoneStale(
 // rollout — and, once a title resolves, caches it on the record and POSTs a corrective blob carrying the
 // SAME op/status with only the title fixed. Idempotent: a record that already holds a non-empty title is
 // skipped, so this fires at most until the first title lands.
+//
+// Which records are due, and where the title comes from, is the adapter's `titleRepair` seam. Cursor is
+// the second user: its chat name can land in Cursor's own store after a short chat's stop, so a DONE
+// Cursor row is looked up for a short window and re-POSTed only when the name differs from the record's.
 
 /** How much of the codex rollout HEAD the title-repair fallback scans (the first user_message rides the
  *  opening lines). Matches the hook's TITLE_SCAN_BYTES. */
@@ -2940,14 +2989,13 @@ export async function buildTitleRepairEnvelope(
   return { v: 2, sessionId, op: record.op ?? "update", prio: record.prio ?? 0, ts: now, blob, ...startedAtField(record) };
 }
 
-/** Gate: should this sweep try to repair a still-tracked session's blank title? Only CODEX sessions (Claude
- *  names its session from the transcript on the very first hook, so a claude blank is a transient read-miss
- *  the next hook fixes, not the structural SessionStart gap), not a provisional discovery row (those carry a
- *  cwd-basename title), whose record holds no non-empty title yet. Pure. */
-export function shouldRepairTitle(record: SessionRecord): boolean {
-  if (record.agent !== "codex") return false;
+/** Gate: should this sweep try to repair a still-tracked session's title? The agent's own rule
+ *  (adapter `titleRepair.due` — Codex: no non-empty title yet; Cursor: done moments ago; Claude names
+ *  its session from the transcript on the very first hook, so it has no seam), and never a provisional
+ *  discovery row (those carry a cwd-basename title). Pure. */
+export function shouldRepairTitle(record: SessionRecord, now: number = Date.now()): boolean {
   if (record.provisional === true) return false;
-  return typeof record.title !== "string" || record.title.length === 0;
+  return adapterFor(recordAgent(record)).titleRepair?.due(record, now) === true;
 }
 
 /** The rewritten record after a delivered title repair: the resolved title, the freshly-sealed blob, AND
@@ -2968,27 +3016,50 @@ export function titleRepairedRecord(record: SessionRecord, title: string, blob: 
  *  titleRepairedRecord) and POSTs the corrective at the session's CURRENT op/status. No title yet (still
  *  pre-thread_name / empty rollout) → nothing to do, retried next sweep. Returns the same verdict triple
  *  as the other nets. */
-async function repairTitle(config: Config, path: string, sessionId: string, record: SessionRecord): Promise<"corrected" | "uncorrected" | "revoked"> {
+export async function repairTitle(
+  config: Config, path: string, sessionId: string, record: SessionRecord,
+  deps: { post?: (body: object) => Promise<PostOutcome>; resolve?: (sessionId: string) => string | undefined } = {},
+): Promise<"corrected" | "uncorrected" | "revoked"> {
   try {
     if (!shouldRepairTitle(record)) return "uncorrected";
-    let prefix = "";
-    if (typeof record.transcript === "string" && record.transcript.length > 0) {
-      try { prefix = await readPrefix(record.transcript, TITLE_REPAIR_HEAD_BYTES); } catch { /* rollout gone / unreadable → index-only */ }
+    const adapter = adapterFor(recordAgent(record));
+    const resolve = deps.resolve ?? adapter.titleRepair?.resolve;
+    let title: string | undefined;
+    if (resolve) {
+      title = resolve(sessionId);
+    } else {
+      let prefix = "";
+      if (typeof record.transcript === "string" && record.transcript.length > 0) {
+        try { prefix = await readPrefix(record.transcript, TITLE_REPAIR_HEAD_BYTES); } catch { /* rollout gone / unreadable → index-only */ }
+      }
+      // input:{} — the watchdog has no hook payload, so this reduces to the PRIMARY session_index lookup plus
+      // the rollout-prefix fallback (the UserPromptSubmit input.prompt path is inert without an input).
+      title = await adapter.title({ sessionId, prefix, input: {}, transcriptPath: record.transcript });
     }
-    // input:{} — the watchdog has no hook payload, so this reduces to the PRIMARY session_index lookup plus
-    // the rollout-prefix fallback (the UserPromptSubmit input.prompt path is inert without an input).
-    const title = await codexAdapter.title({ sessionId, prefix, input: {}, transcriptPath: record.transcript });
-    if (!title) return "uncorrected"; // still no title (pre-thread_name, empty rollout) → retry next sweep
+    // No title yet (pre-thread_name, empty rollout, no chat name) or nothing new → retry next sweep.
+    if (!title || title === record.title) return "uncorrected";
+    // The stale-snapshot guard (see correctIdleClaude): this re-POSTs the snapshot's op/status, so a
+    // record a hook has moved since the sweep read it must not be answered with its old state.
+    const unmoved = async (): Promise<boolean> => {
+      try {
+        const fresh = await readRecordAt(path);
+        return fresh !== null && !recordMovedSince(record, fresh);
+      } catch { return false; }
+    };
+    if (!await unmoved()) return "uncorrected";
     // Re-POSTing the CURRENT state with the title fixed → `at` is the OBSERVED now (epoch seconds).
+    // The envelope `ts` is now too, NOT record.ts + 1: the worker's lastTs is advanced past record.ts by
+    // a watchdog-reported finish (the interrupt / idle / pending-done nets post their done at "now" and
+    // leave record.ts on the last real event), so a record-derived stamp is strictly older there and the
+    // title frame of a watchdog-finished row is dropped as stale — on a 2xx, so it is never retried.
     const repairNow = Date.now();
-    const envelope = await buildTitleRepairEnvelope(sessionId, record, title, repairNow, config.e2eKey, "codex", Math.floor(repairNow / 1000));
-    const outcome = await postEvent(config, envelope);
+    const envelope = await buildTitleRepairEnvelope(sessionId, record, title, repairNow, config.e2eKey, adapter.kind, Math.floor(repairNow / 1000));
+    const outcome = await (deps.post ?? ((body: object) => postEvent(config, body)))(envelope);
     if (outcome === "revoked") return "revoked"; // pairing gone → bubble up so the loop can tear down
     if (outcome !== "delivered") return "uncorrected"; // failed POST → keep the old record, retry next sweep
     try {
-      const next = titleRepairedRecord(record, title, envelope.blob, config.pairingId);
       // Owner-only (0600), same as every other record rewrite in this file.
-      await atomicWrite(path, JSON.stringify(next), 0o600);
+      if (await unmoved()) await atomicWrite(path, JSON.stringify(titleRepairedRecord(record, title, envelope.blob, config.pairingId)), 0o600);
     } catch {
       // Rewrite failed — worst case we re-resolve + re-POST next sweep (the worker dedupes the frame).
     }

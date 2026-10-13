@@ -97,7 +97,7 @@ async function sha256Hex(s) {
 }
 
 // src/core/shared.ts
-var PLUGIN_VERSION = "2.3.0";
+var PLUGIN_VERSION = "2.3.5";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -265,6 +265,11 @@ function codexHome() {
   const env = process.env.CODEX_HOME;
   return env && env.length > 0 ? env : `${process.env.HOME}/.codex`;
 }
+function cursorHome() {
+  const env = process.env.CURSOR_CONFIG_DIR;
+  return env && env.length > 0 ? env : `${process.env.HOME}/.cursor`;
+}
+var CURSOR_HOOK_MARKER = "cursor-status.mjs";
 var CODEX_HOOK_MARKER = "codex-status.mjs";
 function codexAppServerSocketPath() {
   return `${codexHome()}/app-server-control/app-server-control.sock`;

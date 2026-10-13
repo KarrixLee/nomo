@@ -426,8 +426,11 @@ export type CCStatus = "working" | "needsAttention" | "done";
  *  A third kind is NOT free: the dominant coercion idiom in this repo is
  *  `record.agent === "codex" ? "codex" : "claude"`, which silently reads opencode as CLAUDE. The ones
  *  that matter are the blob/record agent literals and anything that would join an OpenCode session
- *  against a Claude transcript or CC file. */
-export type AgentKind = "claude" | "codex" | "opencode";
+ *  against a Claude transcript or CC file.
+ *
+ *  `"cursor"` (the fourth) covers BOTH the Cursor desktop app's agent and the `cursor-agent` CLI — one
+ *  kind, one hook binary (entries/cursor-status.ts → core/cursor.ts). Read-only in v1. */
+export type AgentKind = "claude" | "codex" | "opencode" | "cursor";
 
 /** An agent literal AS IT ARRIVES — off a session record, out of a blob a peer install wrote. It is
  *  `AgentKind` plus "some string this build has never heard of", because that case is now REAL: two
@@ -449,6 +452,18 @@ export function codexHome(): string {
   const env = process.env.CODEX_HOME;
   return env && env.length > 0 ? env : `${process.env.HOME}/.codex`;
 }
+
+/** Cursor's config home — `$CURSOR_CONFIG_DIR` when set & non-empty (the CLI's documented override),
+ *  else `~/.cursor`. Holds the user-level `hooks.json` the installer merges Nomo's entries into, and
+ *  the desktop app's `projects/<slug>/agent-transcripts/`. */
+export function cursorHome(): string {
+  const env = process.env.CURSOR_CONFIG_DIR;
+  return env && env.length > 0 ? env : `${process.env.HOME}/.cursor`;
+}
+
+/** The substring that identifies OUR hook command inside Cursor's `hooks.json` (the bundled hook's
+ *  basename) — what status-cmd greps for to tell "installed" from "not set up here". */
+export const CURSOR_HOOK_MARKER = "cursor-status.mjs";
 
 /** The substring that identifies OUR hook command inside a codex `hooks.json` entry (the bundled
  *  hook's basename). status-cmd greps for it to flag leftover legacy (pre-native-plugin) installs. */
@@ -1128,6 +1143,17 @@ export interface SessionRecord {
    *  re-arms as an `update` and writes lastEvent:"working", while a source:"compact" SessionStart fires
    *  MID-turn on a session with no record yet and writes lastEvent:"sessionStart" over a live turn. */
   awaitingPrompt?: boolean;
+  /** CURSOR ONLY (core/cursor.ts; patched onto the record after trackSessionAt, which rebuilds it
+   *  whole). The `generation_id` whose `stop` hook ended the current turn — "" when neither the stop
+   *  nor the prompt carried one. PRESENT means "a real stop was seen since the last prompt", which is
+   *  what tells a finished turn (late tool events are dropped) from one the watchdog's idle reap only
+   *  GUESSED finished (the turn's next tool event re-arms it). A prompt clears it. The watchdog never
+   *  reads it and its rewrites spread `...record`, so it survives them. Absent on every other agent. */
+  stoppedGeneration?: string;
+  /** CURSOR ONLY. Epoch ms of the last owner-pid lookup that found NO Cursor process (the record's
+   *  `pid` is then CURSOR_UNKNOWN_OWNER_PID). A negative cache: a prompt re-walks the process ancestry
+   *  only once this is CURSOR_OWNER_RETRY_MS old. Absent once an owner is known. */
+  ownerCheckedAt?: number;
 }
 
 /** The plaintext a pending-pairing flush needs to POST the pairing session the instant the shared key

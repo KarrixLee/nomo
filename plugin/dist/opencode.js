@@ -67,8 +67,10 @@ async function decryptBlob(key, blob) {
 }
 
 // src/core/adapter.ts
-import { execFile as execFile2 } from "node:child_process";
+import { execFile as execFile2, execFileSync as execFileSync2 } from "node:child_process";
+import { existsSync as existsSync2 } from "node:fs";
 import { readdir, readFile as readFile2, stat as stat2 } from "node:fs/promises";
+import { devNull } from "node:os";
 import { promisify as promisify2 } from "node:util";
 import { basename as basename2, join as join2 } from "node:path";
 
@@ -79,7 +81,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "2.3.0";
+var PLUGIN_VERSION = "2.3.5";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -236,6 +238,10 @@ var WATCHDOG_PATH = existsSync(`${HERE}/cc-watchdog.mjs`) ? `${HERE}/cc-watchdog
 function codexHome() {
   const env = process.env.CODEX_HOME;
   return env && env.length > 0 ? env : `${process.env.HOME}/.codex`;
+}
+function cursorHome() {
+  const env = process.env.CURSOR_CONFIG_DIR;
+  return env && env.length > 0 ? env : `${process.env.HOME}/.cursor`;
 }
 function lastHookPath(agent) {
   return `${CC_DIR}/last-hook-${agent}`;
@@ -591,6 +597,13 @@ async function settleDecisionHoldRecordAt(sessionsDir, sessionId, patch) {
       return;
     await atomicWrite(`${sessionsDir}/${sessionId}.json`, JSON.stringify({ ...record, ...patch }), 384);
   } catch {}
+}
+async function readDecisionHoldAt(sessionsDir, sessionId) {
+  try {
+    return JSON.parse(await readFile(`${sessionsDir}/${decisionHoldFileName(sessionId)}`, "utf8"));
+  } catch {
+    return null;
+  }
 }
 async function writeDecisionHold(sessionId, hold) {
   return writeDecisionHoldAt(SESSIONS_DIR, sessionId, hold);
@@ -1155,7 +1168,7 @@ async function codexSessionModel(input, prefix, transcriptPath, home = codexHome
     return;
   }
 }
-var INTERRUPT_MARKER = "interrupted by user";
+var INTERRUPT_MARKER = "[Request interrupted by user";
 var CODEX_TURN_EVENTS = new Set(["task_started", "task_complete", "turn_aborted"]);
 var CODEX_ABORT_EVENT = "turn_aborted";
 function lastTurnLine(text) {
@@ -1180,7 +1193,23 @@ function lastTurnLine(text) {
   return null;
 }
 function hasInterruptMarker(line) {
-  return line.includes(INTERRUPT_MARKER);
+  let row;
+  try {
+    row = JSON.parse(line);
+  } catch {
+    return false;
+  }
+  if (typeof row !== "object" || row === null)
+    return false;
+  if (row.type !== "user")
+    return false;
+  const message = row.message;
+  const content = typeof message === "object" && message !== null ? message.content : message;
+  const texts = Array.isArray(content) ? content.map((part) => {
+    const p = part;
+    return p !== null && typeof p === "object" && p.type === "text" ? p.text : undefined;
+  }) : [content];
+  return texts.some((t) => typeof t === "string" && t.trimStart().startsWith(INTERRUPT_MARKER));
 }
 function codexLastTurnEvent(text) {
   const lines = text.split(`
@@ -1448,6 +1477,9 @@ var CLAUDE_DESKTOP_BUNDLED_PATH_PARTS = [
   "/claude.app/Contents/MacOS/claude"
 ];
 var CLAUDE_DESKTOP_LAUNCHER = "Claude.app/Contents/Helpers/disclaimer";
+function cursorHostInvocation(input, env = process.env) {
+  return env.CURSOR_VERSION !== undefined || typeof input === "object" && input !== null && "cursor_version" in input;
+}
 function claudeDesktopInvocation(selfArgs, ancestorArgs, entrypoint) {
   if (entrypoint === CLAUDE_DESKTOP_ENTRYPOINT)
     return true;
@@ -2093,6 +2125,7 @@ var claudeAdapter = {
 var codexAdapter = {
   kind: "codex",
   answerExtras: "other",
+  titleRepair: { due: (record) => typeof record.title !== "string" || record.title.length === 0 },
   async title({ sessionId, prefix, input }) {
     const indexTitle = await codexIndexTitle(sessionId);
     if (indexTitle)
@@ -2197,6 +2230,58 @@ var opencodeAdapter = {
   ambientPlan: true,
   locateTuiPid: (ctx, deps) => opencodeLocateTuiPid(ctx, deps)
 };
+function cursorModel(input) {
+  for (const key of ["model", "model_id"]) {
+    const v = input[key];
+    if (typeof v === "string" && v.trim().length > 0)
+      return v.trim().slice(0, 80);
+  }
+  return;
+}
+function cursorStateDb() {
+  const home = process.env.HOME ?? "";
+  const data = process.platform === "darwin" ? `${home}/Library/Application Support` : process.platform === "win32" ? process.env.APPDATA ?? "" : process.env.XDG_CONFIG_HOME || `${home}/.config`;
+  return `${data}/Cursor/User/globalStorage/state.vscdb`;
+}
+var CURSOR_TITLE_REPAIR_MS = 120000;
+var CURSOR_TITLE_TIMEOUT_MS = 300;
+function cursorChatTitle(sessionId, db = cursorStateDb(), env = process.env) {
+  if (!/^[A-Za-z0-9_-]{1,128}$/.test(sessionId))
+    return;
+  try {
+    const bin = process.platform === "darwin" && existsSync2("/usr/bin/sqlite3") ? "/usr/bin/sqlite3" : "sqlite3";
+    const out = execFileSync2(bin, [
+      "-init",
+      devNull,
+      "-batch",
+      "-noheader",
+      "-list",
+      "-readonly",
+      db,
+      "select case when json_type(cast(value as text),'$.name')='text' then json_extract(cast(value as text),'$.name') end" + ` from cursorDiskKV where key='composerData:${sessionId}'`
+    ], { timeout: CURSOR_TITLE_TIMEOUT_MS, encoding: "utf8", maxBuffer: 65536, stdio: ["ignore", "pipe", "ignore"], env });
+    const cleaned = out.replace(/\s+/g, " ").trim();
+    return cleaned ? truncateOnWord(cleaned) : undefined;
+  } catch {
+    return;
+  }
+}
+var cursorAdapter = {
+  kind: "cursor",
+  title: async ({ input }) => typeof input.prompt === "string" ? displayTitleFromUserText(input.prompt) : undefined,
+  model: async ({ input }) => cursorModel(input),
+  detectInterrupt: () => false,
+  sessionsDir: () => `${cursorHome()}/projects`,
+  sessionMatch: (name) => name.endsWith(".jsonl"),
+  hookStampPath: () => lastHookPath("cursor"),
+  hooksNotFiringHint: "  run `bunx nomo-ai --cursor` again, then restart Cursor (Settings → Hooks shows what it loaded)",
+  titleRepair: {
+    due: (record, now) => record.lastEvent === "done" && typeof record.ts === "number" && now - record.ts < CURSOR_TITLE_REPAIR_MS,
+    resolve: (sessionId) => cursorChatTitle(sessionId)
+  },
+  toolDetail: {},
+  blobAgentFields: { agent: "cursor" }
+};
 function unknownAgentAdapter(kind) {
   return {
     kind,
@@ -2218,6 +2303,8 @@ function adapterFor(agent) {
       return codexAdapter;
     case "opencode":
       return opencodeAdapter;
+    case "cursor":
+      return cursorAdapter;
     case "claude":
       return claudeAdapter;
     default:
@@ -2368,6 +2455,22 @@ async function repairNotifyWiring(deps = {}) {
   }
 }
 
+// src/core/session-state.ts
+var STATE_HOLD_MAX_AGE_MS = 600000;
+var finite = (value) => typeof value === "number" && Number.isFinite(value);
+var filled = (value) => typeof value === "string" && value.length > 0;
+function stateHoldLive(hold, holdPidAlive, now) {
+  if (!hold || !filled(hold.blob))
+    return false;
+  if (!finite(hold.at))
+    return false;
+  if (now - hold.at > STATE_HOLD_MAX_AGE_MS)
+    return false;
+  if (!finite(hold.pid) || holdPidAlive !== true)
+    return false;
+  return true;
+}
+
 // src/core/hook.ts
 var TOOL_DETAIL = { ...claudeToolDetail, ...codexToolDetail };
 function sessionOrigin(input, ppid = process.ppid, command = pidCommand(ppid)) {
@@ -2388,14 +2491,44 @@ function detailForHook(hookName, toolName, toolInput) {
   }
   if (hookName === "PreToolUse")
     return toolName ? TOOL_DETAIL[toolName] : undefined;
-  if (hookName === "PostToolUse")
+  if (hookName === "PostToolUse" || hookName === "PostToolUseFailure")
     return "thinking";
   return;
 }
 function isPermissionNotification(i) {
   const type = typeof i.notification_type === "string" ? i.notification_type : "";
+  if (type.length > 0)
+    return type === "permission_prompt" || type === "worker_permission_prompt";
   const msg = (typeof i.message === "string" ? i.message : "").toLowerCase();
-  return type === "permission_prompt" || msg.includes("permission") || msg.includes("approve") || msg.includes("allow");
+  return msg.includes("permission") || msg.includes("approve") || msg.includes("allow");
+}
+var ATTENTION_NOTIFICATIONS = new Set(["elicitation_dialog", "elicitation_url_dialog", "agent_needs_input"]);
+function hasRunningBackgroundAgent(input) {
+  const tasks = input.background_tasks;
+  return Array.isArray(tasks) && tasks.some((t) => {
+    const task = t;
+    return typeof task === "object" && task !== null && task.type === "subagent" && (task.status === "running" || task.status === "pending");
+  });
+}
+var HOLD_YIELDING_EVENTS = new Set([
+  "PostToolUseFailure",
+  "PreCompact",
+  "PostCompact",
+  "Elicitation",
+  "ElicitationResult"
+]);
+function yieldsToLiveHold(hookName, input) {
+  if (HOLD_YIELDING_EVENTS.has(hookName))
+    return true;
+  if (hookName === "Stop")
+    return hasRunningBackgroundAgent(input);
+  if (hookName === "Notification")
+    return !isPermissionNotification(input);
+  return false;
+}
+async function sessionHoldIsLive(sessionsDir, sessionId, now = Date.now(), alive = pidAlive) {
+  const hold = await readDecisionHoldAt(sessionsDir, sessionId);
+  return stateHoldLive(hold, hold !== null && typeof hold.pid === "number" ? alive(hold.pid) : false, now);
 }
 var USER_BLOCKING_TOOLS = new Set(["AskUserQuestion", "ExitPlanMode", "request_user_input"]);
 var INTERRUPT_STOP_REASON = "Interrupted from Nomo";
@@ -2411,13 +2544,15 @@ function interruptHookOutput(hookName) {
       }
     });
   }
-  if (hookName === "PostToolUse") {
+  if (hookName === "PostToolUse" || hookName === "PostToolUseFailure") {
     return JSON.stringify({ continue: false, stopReason: INTERRUPT_STOP_REASON });
   }
   return null;
 }
-function clearsInterruptFlag(hookName) {
-  return hookName === "UserPromptSubmit" || hookName === "Stop" || hookName === "SessionEnd";
+function clearsInterruptFlag(hookName, input = {}) {
+  if (hookName === "Stop")
+    return !hasRunningBackgroundAgent(input);
+  return hookName === "UserPromptSubmit" || hookName === "StopFailure" || hookName === "SessionEnd";
 }
 function interruptedEventInput(input) {
   return { ...input, hook_event_name: "Stop" };
@@ -2433,13 +2568,24 @@ function planOp(hookName, input, sentDone) {
     case "UserPromptSubmit":
     case "PostToolUse":
       return { op: "update", prio: 0, status: "working" };
+    case "PostToolUseFailure":
+      return input.is_interrupt === true ? null : { op: "update", prio: 0, status: "working" };
     case "Notification":
-      if (!isPermissionNotification(input))
+      if (!isPermissionNotification(input) && !(typeof input.notification_type === "string" && ATTENTION_NOTIFICATIONS.has(input.notification_type)))
         return null;
       return { op: "update", prio: 1, status: "needsAttention" };
     case "PermissionRequest":
+    case "Elicitation":
       return { op: "update", prio: 1, status: "needsAttention" };
+    case "ElicitationResult":
+      return { op: "update", prio: 0, status: "working" };
+    case "PreCompact":
+    case "PostCompact":
+      return input.trigger === "manual" ? null : { op: "update", prio: 0, status: "working" };
     case "Stop":
+      return hasRunningBackgroundAgent(input) ? { op: "update", prio: 0, status: "working" } : { op: "done", prio: 0, status: "done" };
+    case "StopFailure":
+    case "Interrupt":
       return { op: "done", prio: 0, status: "done" };
     case "SessionEnd":
       return { op: "end", prio: 0, status: "done" };
@@ -2475,7 +2621,7 @@ function buildBlob(input, machine, title, plan, agent = "claude", turnStartedAt,
   const { label, folderKey } = folder;
   const branch = sessionBranch(folder);
   const hookName = typeof input.hook_event_name === "string" ? input.hook_event_name : "";
-  const detail = detailOverride ?? detailForHook(hookName, typeof input.tool_name === "string" ? input.tool_name : undefined, input.tool_input);
+  const detail = detailOverride ?? (hookName === "Stop" && hasRunningBackgroundAgent(input) ? TOOL_DETAIL.Task : detailForHook(hookName, typeof input.tool_name === "string" ? input.tool_name : undefined, input.tool_input));
   const base = {
     status: plan.status,
     title: title ?? "",
@@ -2683,6 +2829,8 @@ async function runHook(agent) {
   try {
     const [config, raw] = await Promise.all([loadConfig(), readStdin()]);
     const input = JSON.parse(raw);
+    if (agent === "claude" && cursorHostInvocation(input))
+      return;
     if (typeof input.session_id !== "string" || input.session_id.length === 0)
       return;
     if (agent === "claude" && (typeof input.turn_id === "string" && input.turn_id.length > 0 || typeof input.transcript_path === "string" && input.transcript_path.includes("/.codex/"))) {
@@ -2721,7 +2869,7 @@ async function runHook(agent) {
     const hookName = typeof input.hook_event_name === "string" ? input.hook_event_name : "";
     let interrupted = false;
     if (adapter2.interrupt === "hook-flag") {
-      if (clearsInterruptFlag(hookName)) {
+      if (clearsInterruptFlag(hookName, input)) {
         await clearInterruptFlagAt(SESSIONS_DIR, reportedSessionId);
       } else {
         const line = interruptHookOutput(hookName);
@@ -2877,12 +3025,16 @@ async function runHook(agent) {
     let plan = planOp(interrupted ? "Stop" : hookName, input, sentDone);
     if (!plan)
       return;
+    if (!interrupted && yieldsToLiveHold(hookName, input) && await sessionHoldIsLive(SESSIONS_DIR, sessionId)) {
+      traceSession({ event: "hold-yield", sessionId, agent, hook_event_name: hookName });
+      return;
+    }
     let pendingPlanPicker = false;
     let planPickerVerificationPending = false;
     let attentionKind;
     let proposedPlan;
     let pickerClassifier = plan.op === "done" ? "none" : plan.status;
-    if (plan.op === "done" && adapter2.completedTurnWaitState) {
+    if (hookName === "Stop" && plan.op === "done" && adapter2.completedTurnWaitState) {
       const evidence = adapter2.completedTurnWaitEvidence ? await adapter2.completedTurnWaitEvidence({ pid: hookPid, transcriptPath }) : { state: await adapter2.completedTurnWaitState({ pid: hookPid, transcriptPath }) };
       const wait = evidence.state;
       pickerClassifier = wait;
@@ -3053,7 +3205,8 @@ var POST_FIRST_CONTACT_TIMEOUT_MS = 6000;
 var HOLD_BLOCKS_DIALOG = {
   claude: true,
   codex: true,
-  opencode: false
+  opencode: false,
+  cursor: false
 };
 var LOCAL_ANSWER_TOOLS = new Set(["AskUserQuestion", "ExitPlanMode"]);
 var LOCAL_ANSWER_TAIL_BYTES = 64000;
@@ -3805,6 +3958,8 @@ async function runPermissionHook(deps = {}, agent = "claude") {
   let settleAsWorking = false;
   let settleHeldRecord;
   try {
+    if (agent === "claude" && cursorHostInvocation(undefined))
+      return;
     if (await flagExists(noHoldPath)) {
       await (deps.delegate ?? (() => runHook(agent)))();
       return;
@@ -3825,6 +3980,8 @@ async function runPermissionHook(deps = {}, agent = "claude") {
       trace({ event: "exit", reason: "bad-stdin", ...errorTag(e), pos: parseErrorPosition(e) });
       return;
     }
+    if (agent === "claude" && cursorHostInvocation(input))
+      return;
     const sessionId = typeof input.session_id === "string" ? input.session_id : "";
     if (sessionId.length === 0) {
       trace({ event: "exit", reason: "no-session-id" });
@@ -4296,6 +4453,7 @@ function ocTrace(event) {
 }
 async function runOcApproval(request, o) {
   const trace = o.trace ?? ocTrace;
+  let granted = false;
   const stdin = JSON.stringify({
     session_id: request.sessionID,
     ...o.cwd ? { cwd: o.cwd } : {},
@@ -4313,6 +4471,10 @@ async function runOcApproval(request, o) {
       },
       randomUUID: () => o.requestId,
       holdId: o.requestId,
+      writeHoldFn: async (sessionId, hold) => {
+        granted = true;
+        await defaultWriteHold()(sessionId, hold);
+      },
       detail: request.detail,
       trace,
       fetchFn: o.fetchFn,
@@ -4321,17 +4483,17 @@ async function runOcApproval(request, o) {
     }, "opencode");
   } catch (e) {
     trace({ event: "oc-hold-threw", kind: request.kind, error: e?.name ?? "Error" });
-    return;
+    return { answered: false, granted };
   }
   const reply = ocReplyFor(request, line);
   if (!reply) {
     trace({ event: "oc-no-reply", kind: request.kind, id: request.id });
-    return;
+    return { answered: line !== undefined, granted };
   }
   const post = ocPost(o.client, o.serverUrl, o.fetchFn);
   if (!post) {
     trace({ event: "oc-replied", kind: request.kind, id: request.id, path: reply.path, status: 0, via: "none", error: "NoTransport" });
-    return;
+    return { answered: true, granted };
   }
   try {
     const { status } = await post(reply);
@@ -4348,6 +4510,7 @@ async function runOcApproval(request, o) {
       message: String(e?.message ?? "").slice(0, 200)
     });
   }
+  return { answered: true, granted };
 }
 async function ocResolveOnRelay(config, requestId, fetchFn = fetch) {
   try {
@@ -4367,7 +4530,23 @@ async function ocResolveOnRelay(config, requestId, fetchFn = fetch) {
 
 // src/opencode/state.ts
 function newOcState() {
-  return { sessions: new Map, children: new Set };
+  return { sessions: new Map, children: new Map, prompts: new Map };
+}
+function ocRootSession(state, sessionId) {
+  let id = sessionId;
+  for (let hops = state.children.size;hops > 0; hops -= 1) {
+    const parent = state.children.get(id);
+    if (parent === undefined)
+      break;
+    id = parent;
+  }
+  return id;
+}
+function hasPrompt(state, rootId) {
+  for (const prompt of state.prompts.values())
+    if (ocRootSession(state, prompt.sessionID) === rootId)
+      return true;
+  return false;
 }
 function isDefaultOcTitle(title) {
   return /^(New|Child) session - /.test(title);
@@ -4430,8 +4609,9 @@ function reduceOcEvent(state, event, now = Date.now()) {
   const info = asRecord2(properties.info);
   if (info && type.startsWith("session.")) {
     const id = asString2(info.id);
-    if (id && asString2(info.parentID))
-      state.children.add(id);
+    const parentID = asString2(info.parentID);
+    if (id && parentID && parentID !== id)
+      state.children.set(id, parentID);
   }
   const sessionId = asString2(properties.sessionID) ?? (type.startsWith("session.") ? asString2(info?.id) : undefined);
   if (!sessionId || state.children.has(sessionId))
@@ -4468,14 +4648,18 @@ function reduceOcEvent(state, event, now = Date.now()) {
       return null;
     }
     case "session.status": {
-      const live = entry ?? adopt(state, sessionId, now);
       const status = statusType(properties.status);
+      if (status === "idle")
+        return finishTurn(sessionId, entry, now);
       if (status !== "busy" && status !== "retry")
+        return null;
+      const live = entry ?? adopt(state, sessionId, now);
+      if (live.announced && hasPrompt(state, sessionId))
         return null;
       const detail = status === "retry" ? "retrying" : undefined;
       const planned = frame(sessionId, live, live.announced ? "update" : "start", "working", now, detail);
       live.announced = true;
-      const key = JSON.stringify([planned.status, planned.detail, planned.title, planned.model, planned.plan]);
+      const key = statusKey(planned);
       if (live.lastStatusFrame === key)
         return null;
       live.lastStatusFrame = key;
@@ -4490,17 +4674,12 @@ function reduceOcEvent(state, event, now = Date.now()) {
       entry.plan = plan;
       if (!entry.announced)
         return null;
+      if (hasPrompt(state, sessionId))
+        return null;
       return frame(sessionId, entry, "update", "working", now);
     }
-    case "session.idle": {
-      if (!entry?.announced)
-        return null;
-      entry.working = false;
-      entry.lastStatusFrame = undefined;
-      const done = frame(sessionId, entry, "done", "done", now);
-      entry.turnStartedAt = undefined;
-      return done;
-    }
+    case "session.idle":
+      return finishTurn(sessionId, entry, now);
     case "session.deleted": {
       if (!entry)
         return null;
@@ -4510,6 +4689,21 @@ function reduceOcEvent(state, event, now = Date.now()) {
     default:
       return null;
   }
+}
+function finishTurn(sessionId, entry, now) {
+  if (!entry?.announced)
+    return null;
+  if (entry.lastStatusFrame === DONE_KEY && !entry.working)
+    return null;
+  entry.working = false;
+  entry.lastStatusFrame = DONE_KEY;
+  const done = frame(sessionId, entry, "done", "done", now);
+  entry.turnStartedAt = undefined;
+  return done;
+}
+var DONE_KEY = "done";
+function statusKey(planned) {
+  return JSON.stringify([planned.status, planned.detail, planned.title, planned.model, planned.plan]);
 }
 function ocEndFrames(state, now = Date.now()) {
   const frames = [...state.sessions].filter(([, entry]) => entry.announced).map(([sessionId, entry]) => frame(sessionId, entry, "end", "done", now));
@@ -4522,11 +4716,95 @@ function ocForgetStatusFrame(state, sessionId) {
     entry.lastStatusFrame = undefined;
 }
 function ocAttentionFrame(state, sessionId, detail, now = Date.now()) {
-  const entry = state.sessions.get(sessionId);
-  if (!entry || state.children.has(sessionId))
+  const rootId = ocRootSession(state, sessionId);
+  const entry = state.sessions.get(rootId);
+  if (!entry)
     return null;
   entry.announced = true;
-  return frame(sessionId, entry, "update", "needsAttention", now, detail, 1);
+  entry.lastStatusFrame = undefined;
+  return frame(rootId, entry, "update", "needsAttention", now, detail, 1);
+}
+function ocPromptAsked(state, event) {
+  const properties = asRecord2(asRecord2(event)?.properties);
+  const id = asString2(properties?.id);
+  const sessionID = asString2(properties?.sessionID);
+  if (!id || !sessionID || state.prompts.has(id))
+    return;
+  const tool = asRecord2(properties?.tool);
+  const messageID = asString2(tool?.messageID);
+  const callID = asString2(tool?.callID);
+  state.prompts.set(id, { sessionID, ...messageID ? { messageID } : {}, ...callID ? { callID } : {} });
+}
+function ocPromptHeld(state, id, held) {
+  const prompt = state.prompts.get(id);
+  if (prompt)
+    prompt.held = held;
+}
+function ocRowHeld(state, rootId) {
+  for (const prompt of state.prompts.values()) {
+    if (prompt.held && ocRootSession(state, prompt.sessionID) === rootId)
+      return true;
+  }
+  return false;
+}
+function ocPromptResolved(state, id) {
+  const prompt = state.prompts.get(id);
+  if (!prompt)
+    return;
+  state.prompts.delete(id);
+  return ocRootSession(state, prompt.sessionID);
+}
+function ocPromptsEndedBy(state, event) {
+  const e = asRecord2(event);
+  const type = asString2(e?.type);
+  const properties = asRecord2(e?.properties);
+  if (!type || !properties || state.prompts.size === 0)
+    return [];
+  const ended = [];
+  if (type === "message.part.updated") {
+    const part = asRecord2(properties.part);
+    const partStatus = asRecord2(part?.state)?.status;
+    const callID = asString2(part?.callID);
+    if (part?.type !== "tool" || !callID || partStatus !== "completed" && partStatus !== "error")
+      return [];
+    const sessionID2 = asString2(part.sessionID) ?? asString2(properties.sessionID);
+    const messageID = asString2(part.messageID);
+    for (const [id, prompt] of state.prompts) {
+      if (prompt.sessionID !== sessionID2 || prompt.callID !== callID)
+        continue;
+      if (prompt.messageID && messageID && prompt.messageID !== messageID)
+        continue;
+      ended.push({ id, byTool: true });
+    }
+    return ended;
+  }
+  const over = type === "session.idle" || type === "session.deleted" || type === "session.status" && statusType(properties.status) === "idle";
+  const sessionID = asString2(properties.sessionID) ?? asString2(asRecord2(properties.info)?.id);
+  if (!over || !sessionID)
+    return [];
+  for (const [id, prompt] of state.prompts) {
+    for (let at = prompt.sessionID, hops = state.children.size + 1;at !== undefined && hops > 0; hops -= 1) {
+      if (at === sessionID) {
+        ended.push({ id, byTool: false });
+        break;
+      }
+      at = state.children.get(at);
+    }
+  }
+  return ended;
+}
+function ocPromptFrame(state, sessionId, now = Date.now()) {
+  const rootId = ocRootSession(state, sessionId);
+  if (ocRowHeld(state, rootId))
+    return null;
+  if (hasPrompt(state, rootId))
+    return ocAttentionFrame(state, rootId, undefined, now);
+  const entry = state.sessions.get(rootId);
+  if (!entry?.announced || !entry.working)
+    return null;
+  const planned = frame(rootId, entry, "update", "working", now);
+  entry.lastStatusFrame = statusKey(planned);
+  return planned;
 }
 function adopt(state, sessionId, now) {
   const entry = { startedAt: now, announced: true, working: false };
@@ -4666,11 +4944,29 @@ var server = async (input) => {
     const serverUrl = input?.serverUrl === undefined || input.serverUrl === null ? undefined : String(input.serverUrl);
     const canReply = ocPost(input?.client, serverUrl) !== undefined;
     const holds = new Map;
-    const hold = (request) => {
-      if (!canReply || ctx.state.children.has(request.sessionID) || holds.has(request.id))
+    const repaint = (sessionID, workingOnly = false) => enqueue(async () => {
+      const frame2 = ocPromptFrame(ctx.state, sessionID);
+      if (frame2 && !(workingOnly && frame2.status !== "working"))
+        await send(ctx, frame2);
+    });
+    const sendPlanned = async (frame2) => {
+      if (frame2.op === "update" && frame2.status === "working" && ocRowHeld(ctx.state, frame2.sessionId)) {
+        ocForgetStatusFrame(ctx.state, frame2.sessionId);
         return;
+      }
+      await send(ctx, frame2);
+    };
+    const hold = (request) => {
+      if (holds.has(request.id))
+        return;
+      if (!canReply || ctx.state.children.has(request.sessionID)) {
+        repaint(request.sessionID);
+        return;
+      }
       const requestId = crypto.randomUUID();
       holds.set(request.id, requestId);
+      ocPromptHeld(ctx.state, request.id, true);
+      let delegated = false;
       runOcApproval(request, {
         config: ctx.config,
         client: input?.client,
@@ -4678,13 +4974,22 @@ var server = async (input) => {
         cwd: ctx.folder.cwd,
         requestId,
         delegate: async () => {
-          const attention = ocAttentionFrame(ctx.state, request.sessionID, undefined);
-          if (attention)
-            await enqueue(() => send(ctx, attention));
+          delegated = true;
+          ocPromptHeld(ctx.state, request.id, false);
+          await repaint(request.sessionID);
         }
-      }).catch(() => {}).finally(() => {
+      }).catch(() => ({ answered: false, granted: false })).then(({ answered, granted }) => {
         holds.delete(request.id);
+        ocPromptHeld(ctx.state, request.id, false);
+        if (answered)
+          return;
+        repaint(request.sessionID, granted || delegated);
       });
+    };
+    const settle = (opencodeId) => {
+      const root = ocPromptResolved(ctx.state, opencodeId);
+      if (root !== undefined)
+        repaint(root);
     };
     const retire = (opencodeId) => {
       const requestId = holds.get(opencodeId);
@@ -4698,17 +5003,24 @@ var server = async (input) => {
         try {
           const request = ocDecisionRequest(event);
           if (request) {
+            ocPromptAsked(ctx.state, event);
             hold(request);
             return;
           }
           const resolved = ocResolvedRequestId(event);
           if (resolved) {
             retire(resolved);
+            settle(resolved);
             return;
           }
           const frame2 = reduceOcEvent(ctx.state, event);
-          if (frame2)
-            await enqueue(() => send(ctx, frame2));
+          const sent = frame2 ? enqueue(() => sendPlanned(frame2)) : undefined;
+          for (const ended of ocPromptsEndedBy(ctx.state, event)) {
+            if (ended.byTool)
+              retire(ended.id);
+            settle(ended.id);
+          }
+          await sent;
         } catch {}
       },
       dispose: async () => {

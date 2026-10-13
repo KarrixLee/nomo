@@ -34,7 +34,7 @@
 import { appendFileSync, statSync, truncateSync } from "node:fs";
 import type { AgentKind, Config } from "../core/shared";
 import { PLUGIN_VERSION } from "../core/shared";
-import { OPENCODE_QUESTION_TOOL, runPermissionHook, TRACE_PATH } from "../core/permission";
+import { defaultWriteHold, OPENCODE_QUESTION_TOOL, runPermissionHook, TRACE_PATH } from "../core/permission";
 import type { PermissionHookDeps } from "../core/permission";
 
 /** One pending human decision, normalized across the two channels. */
@@ -345,13 +345,30 @@ export interface OcApprovalOptions {
   noHoldPath?: string;
 }
 
+/** How one hold ended, for the caller that owns the row afterwards. */
+export interface OcApprovalResult {
+  /** The phone's decision was emitted — the one exit on which the hold itself re-sealed the session
+   *  record as working. */
+  answered: boolean;
+  /** The worker GRANTED the hold (its marker was stamped), so the hold's own exit settle wrote the
+   *  record. False = paused, refused by the worker, or the POST never landed: no card ever went up, no
+   *  settle ran, and nothing has painted the row. */
+  granted: boolean;
+}
+
 /** Hold ONE OpenCode decision on the phone, then reply to OpenCode with the answer.
  *
  *  Never throws and never blocks the event firehose: the caller starts this detached (a permission hold
  *  is unbounded by design — the phone owns the dialog) and OpenCode's own TUI dialog stays up the whole
- *  time, so an unanswered hold degrades to "answer at your Mac" rather than wedging anything. */
-export async function runOcApproval(request: OcDecisionRequest, o: OcApprovalOptions): Promise<void> {
+ *  time, so an unanswered hold degrades to "answer at your Mac" rather than wedging anything.
+ *
+ *  `answered` is true only when the phone's decision was emitted — the one exit on which the hold itself
+ *  re-sealed the session record as working. Every other exit of a GRANTED hold (expired, superseded by
+ *  an answer at the Mac, gave up, threw) leaves the record as the plain attention frame; an exit with no
+ *  grant at all leaves it untouched. Either way the caller owns what the row shows next. */
+export async function runOcApproval(request: OcDecisionRequest, o: OcApprovalOptions): Promise<OcApprovalResult> {
   const trace = o.trace ?? ocTrace;
+  let granted = false;
   // The synthesized hook stdin. `permission_mode` and `agent_id` are ABSENT on purpose: absent mode is
   // the interactive arm (the hold), and an agent_id would take the subagent pass-through. The Codex
   // reviewer gate is `agent === "codex"` only, so "opencode" never reaches it either.
@@ -376,6 +393,9 @@ export async function runOcApproval(request: OcDecisionRequest, o: OcApprovalOpt
       // is already unique per hold (the caller mints it), so it IS the discriminator. The hook agents
       // pass none and keep the pid-only rule they always had. See DecisionHold.holdId.
       holdId: o.requestId,
+      // The marker is stamped exactly once per GRANTED hold, and only then — which makes this the one
+      // seam that knows a card really went up.
+      writeHoldFn: async (sessionId, hold) => { granted = true; await defaultWriteHold()(sessionId, hold); },
       // The card's detail line for a permission the shared switch cannot render — see PERMISSION_TOOL's
       // header. Undefined for everything else, which is every Claude/Codex hold and every mapped one.
       detail: request.detail,
@@ -386,12 +406,12 @@ export async function runOcApproval(request: OcDecisionRequest, o: OcApprovalOpt
     }, "opencode");
   } catch (e) {
     trace({ event: "oc-hold-threw", kind: request.kind, error: (e as { name?: string })?.name ?? "Error" });
-    return; // fail open — OpenCode's own dialog is still up
+    return { answered: false, granted }; // fail open — OpenCode's own dialog is still up
   }
   const reply = ocReplyFor(request, line);
-  if (!reply) { trace({ event: "oc-no-reply", kind: request.kind, id: request.id }); return; }
+  if (!reply) { trace({ event: "oc-no-reply", kind: request.kind, id: request.id }); return { answered: line !== undefined, granted }; }
   const post = ocPost(o.client, o.serverUrl, o.fetchFn);
-  if (!post) { trace({ event: "oc-replied", kind: request.kind, id: request.id, path: reply.path, status: 0, via: "none", error: "NoTransport" }); return; }
+  if (!post) { trace({ event: "oc-replied", kind: request.kind, id: request.id, path: reply.path, status: 0, via: "none", error: "NoTransport" }); return { answered: true, granted }; }
   try {
     const { status } = await post(reply);
     trace({ event: "oc-replied", kind: request.kind, id: request.id, path: reply.path, via: post.via, status });
@@ -406,6 +426,7 @@ export async function runOcApproval(request: OcDecisionRequest, o: OcApprovalOpt
       message: String((e as { message?: unknown })?.message ?? "").slice(0, 200),
     });
   }
+  return { answered: true, granted };
 }
 
 /** Retire a hold this process is STILL polling for, because OpenCode resolved its request some other
