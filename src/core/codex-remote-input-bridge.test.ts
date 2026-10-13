@@ -87,6 +87,7 @@ class FakeClient {
     this.interrupts.push(identity);
     return "sent";
   }
+  interruptTurn = async () => "sent" as const;
 }
 
 function deferred<T>() {

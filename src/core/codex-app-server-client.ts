@@ -49,6 +49,10 @@ export type CodexUserInputAnswerResult =
 
 export type CodexUserInputInterruptResult = Exclude<CodexUserInputAnswerResult, "invalid">;
 
+/** Outcome of a phone-initiated turn interrupt. "sent" means the app-server REPLIED, and it defers that
+ *  reply until the turn has actually aborted — so "sent" is confirmation, not just delivery. */
+export type CodexTurnInterruptResult = "sent" | "unavailable" | "failed";
+
 export type CodexUserInputResolution =
   /** This client sent a response and app-server subsequently closed the request. */
   | "response-sent"
@@ -459,6 +463,21 @@ export class CodexAppServerClient {
       pending.interruptInFlight = false;
       this.reportError(error, "Failed to interrupt Codex user input");
       return "transport-error";
+    }
+  }
+
+  /** Interrupt a running turn by id, with no pending server request involved — the phone's "Interrupt".
+   *  The app-server does not check which connection started the turn (verified on codex 0.162.1), so
+   *  this reaches a turn the user's own TUI started. `turnId` must be the ACTIVE turn or the server
+   *  answers -32600; an empty one means "startup interrupt" there, which the caller must never send. */
+  async interruptTurn(threadId: string, turnId: string): Promise<CodexTurnInterruptResult> {
+    if (this.stateValue !== "ready" || !this.transport) return "unavailable";
+    try {
+      await this.request("turn/interrupt", { threadId, turnId });
+      return "sent";
+    } catch (error) {
+      this.reportError(error, "Failed to interrupt Codex turn");
+      return "failed";
     }
   }
 

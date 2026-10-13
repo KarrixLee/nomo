@@ -39,6 +39,7 @@ import { focusTerminalForPid } from "../core/terminal-focus";
 import type { FocusContext, FocusResult } from "../core/terminal-focus";
 import { CodexRemoteInputBridge } from "../core/codex-remote-input-bridge";
 import type { CodexThreadWaitState } from "../core/codex-remote-input-bridge";
+import type { CodexTurnInterruptResult } from "../core/codex-app-server-client";
 import { createLanHintPublisher, createLanListener, lanAnswerStore } from "../core/lan-listener";
 import type { LanAnswerDelivery, LanAnswerStore, LanCommand, LanListener } from "../core/lan-listener";
 import { lanRunningUnderTest } from "../core/lan-wire";
@@ -52,7 +53,7 @@ import {
   GONE_STRIKE_LIMIT, loadConfig, loadPendingConfig, localApprovalsState,
   PAIR_HTML_FILE, PairPollResult, parseWatchdogPidfile, PendingConfig, pidAlive, PLUGIN_VERSION, readDecisionHoldAt, readPrefix, readSuffix, recordGoneStrike, removeRevokedConfig,
   resetGoneStrikes, resolveGitDir, SessionRecord, sessionBranch, SESSIONS_DIR, traceSession, tracePlanPickerDecision, watchdogBuildDiffers,
-  watchdogBuildStamp, watchdogHolderIsLive, WATCHDOG_PID_PATH,
+  watchdogBuildStamp, watchdogHolderIsLive, WATCHDOG_PID_PATH, writeInterruptFlagAt,
 } from "../core/shared";
 import { rememberBounded } from "../core/bounded-set";
 
@@ -1094,7 +1095,8 @@ export interface CommandPayload {
 /** The kinds this plugin will act on. The allow-list lives HERE, not on the worker, because the
  *  plugin is now the ONLY party that can read the blob — a blind relay cannot filter what it can't
  *  see. Anything else decrypts fine and is then rejected as bad-kind. */
-const COMMAND_KINDS_ALLOWED = new Set(["focus-terminal"]);
+const INTERRUPT_COMMAND_KIND = "interrupt-session";
+const COMMAND_KINDS_ALLOWED = new Set(["focus-terminal", INTERRUPT_COMMAND_KIND]);
 
 /** Cap on commands accepted from ONE response. A compromised/buggy worker must not be able to hand
  *  this daemon an unbounded work list; 8 is far above the real ceiling (a user taps one row). */
@@ -1204,7 +1206,15 @@ export type FocusTraceResult =
   | "no-candidate"      // no live TUI process could be identified for it
   | "ambiguous"         // several equally-plausible TUIs — deliberately no guess
   | "osascript-failed"  // AppleScript refused (TCC denial / timeout / app error)
-  | "unsupported";      // not macOS, unknown terminal app, or an agent with no locate seam
+  | "unsupported"       // not macOS, unknown terminal app, or an agent with no locate / interrupt seam
+  | "not-running"        // interrupt-session: the record already reads done — there is no turn to stop
+  | "interrupt-flagged"  // interrupt-session: the hook flag was stamped (Claude stops at its next tool call)
+  | "interrupt-sent"     // interrupt-session: the Codex app-server confirmed the turn aborted
+  | "interrupt-failed"   // interrupt-session: the app-server refused (stale turn id) or timed out — after
+                         // a timeout the interrupt may still land. Also what a thread NOT hosted by the
+                         // shared daemon returns when the daemon is up (the server refuses an unknown thread)
+  | "bridge-unavailable" // interrupt-session: no ready Codex bridge (daemon down, bridge parked or stopping)
+  | "no-turn";           // interrupt-session: the Codex record carries no active turn id
 
 /** The module's generic best-effort trace, with the same argv guard tracePicker uses: pure unit calls run
  *  inside `bun test` with the production HOME visible and must never pollute the user's live trace. Named
@@ -1240,6 +1250,11 @@ export interface DrainCommandsDeps {
   holdPidAliveFn?: (pid: number) => boolean;
   answerStore?: LanAnswerStore;
   resolveDecisionFn?: typeof resolveOnRelay;
+  /** Stamp a hook-flag agent's interrupt flag. Test defaults never write the developer's real
+   *  session directory. */
+  writeInterruptFlagFn?: (sessionId: string, now: number) => Promise<void>;
+  /** Send turn/interrupt for an app-server agent. Defaults to the running loop's bridge supervisor. */
+  interruptCodexTurnFn?: (threadId: string, turnId: string) => Promise<CodexTurnInterruptResult>;
   now?: () => number;
   trace?: (event: object) => void;
 }
@@ -1292,6 +1307,36 @@ async function releaseFocusedTuiUserInputHold(
   return true;
 }
 
+/** Execute a validated interrupt-session command. The adapter says HOW this agent's turn is stopped;
+ *  an agent without the seam is a deliberate no-op. Never throws. */
+async function interruptSession(
+  adapter: AgentAdapter, sessionId: string, record: SessionRecord, now: number, deps: DrainCommandsDeps,
+): Promise<FocusTraceResult> {
+  // The turn is already over: a flag stamped now would sit until the NEXT turn and stop that instead.
+  if (isDoneState(record)) return "not-running";
+  if (adapter.interrupt === "hook-flag") {
+    const write = deps.writeInterruptFlagFn ?? (
+      lanRunningUnderTest() ? async () => {} : (id: string, at: number) => writeInterruptFlagAt(SESSIONS_DIR, id, at)
+    );
+    await write(sessionId, now);
+    return "interrupt-flagged";
+  }
+  if (adapter.interrupt === "app-server") {
+    // The Nomo session id IS the Codex thread id, and the hook stamps the active turn id on the record.
+    const turnId = typeof record.turnId === "string" ? record.turnId : "";
+    if (turnId.length === 0) return "no-turn";
+    const interrupt = deps.interruptCodexTurnFn ?? activeCodexInterrupt;
+    if (!interrupt) return "bridge-unavailable";
+    // ponytail: no re-read + retry on a stale turn id (-32600). The hook stamps turnId only when the
+    // event carries `turn_id` and the record drops the field otherwise, so a turn-id-less Codex event
+    // mid-turn yields `no-turn` until the next tool event; a mismatch is a turn that just ended. Add
+    // thread/read includeTurns if traces show it.
+    const result = await interrupt(sessionId, turnId).catch(() => "failed" as const);
+    return result === "sent" ? "interrupt-sent" : result === "unavailable" ? "bridge-unavailable" : "interrupt-failed";
+  }
+  return "unsupported";
+}
+
 /** Decrypt, VALIDATE, then execute every buffered command; returns how many actually focused
  *  something. Nothing is acted on until the blob authenticates, because the relay is blind and a
  *  compromised worker must not be able to author a control message this daemon obeys.
@@ -1316,6 +1361,8 @@ async function releaseFocusedTuiUserInputHold(
  *  recordAgent/adapterFor dispatch every other net uses, and ask the adapter's optional locate seam
  *  WHICH live process is that session's interactive TUI. Undefined — no candidate, or several equally
  *  plausible ones — is a deliberate NO-OP: focusing the wrong window is worse than doing nothing.
+ *  An interrupt-session command passes the same eight gates and is then handed to interruptSession
+ *  instead of the locate + focus path.
  *  Every outcome is traced. The whole drain is wrapped: a command must never derail the sweep. */
 export async function drainCommands(config: Config, deps: DrainCommandsDeps = {}): Promise<number> {
   try {
@@ -1380,12 +1427,15 @@ export async function drainCommands(config: Config, deps: DrainCommandsDeps = {}
         //       <SESSIONS_DIR>/<d.sessionId>.json, where d.sessionId is codexSentinelSessionId(pid),
         //       i.e. "codex-pid-<n>" — so a command naming the sentinel resolves here, it does not
         //       fall through to unknown-session;
-        //   (b) a provisional row can never be in the state the phone's button is offered for anyway:
+        //   (b) for focus-terminal (offered on waiting states), a provisional row can never be in the
+        //       state the phone's button is offered for anyway:
         //       buildProvisionalRecord only ever writes lastEvent sessionStart/done (op start/done,
         //       prio 0), and no net can flip one to needsAttention — correctPendingApproval requires a
         //       non-empty `transcript` (a provisional has none), shouldPlanPickerVerificationCheck
         //       excludes `provisional === true` outright, and correctResolvedPlanPicker needs a
         //       pendingPlanPicker marker a provisional never carries.
+        //       An interrupt-session (offered on working) naming a provisional row is refused later as
+        //       `no-turn` (it has no turn id), and the phone does not offer the button for `codex-pid-` rows.
         // So the sentinel is accepted if it ever arrives, and it realistically never will.
         if (entries === null) entries = await readRecords(); // one dir read per drain, not per command
         const entry = entries.find((e) => e.sessionId === payload.sessionId);
@@ -1405,6 +1455,11 @@ export async function drainCommands(config: Config, deps: DrainCommandsDeps = {}
         const adapter = deps.adapters
           ? deps.adapters.find((a) => a.kind === agent) ?? adapterFor(agent)
           : adapterFor(agent);
+        if (payload.kind === INTERRUPT_COMMAND_KIND) {
+          const result = await interruptSession(adapter, payload.sessionId, entry.rec, now, deps);
+          traceFocus(deps, { ...base, agent, result });
+          continue;
+        }
         if (!adapter.locateTuiPid) {
           traceFocus(deps, { ...base, agent, result: "unsupported" as FocusTraceResult });
           continue;
@@ -3444,6 +3499,11 @@ export async function goneStrikeShouldTeardown(goneStrikesPath?: string): Promis
  *  through the same path run()'s `finally` uses. Undefined outside a live run(). */
 let activeBridgeShutdown: (() => void) | undefined;
 
+/** The running loop's Codex interrupt, published for drainCommands the same way activeBridgeShutdown is
+ *  published for the signal handler: the LAN listener's sink is a module function with no handle on
+ *  run()'s supervisor. Undefined outside a live run(). */
+let activeCodexInterrupt: ((threadId: string, turnId: string) => Promise<CodexTurnInterruptResult>) | undefined;
+
 /** The running loop's LAN listener teardown, published for the SIGTERM/SIGINT handler for the same
  *  reason activeBridgeShutdown is: default signal handling skips run()'s `finally`, and a leaked
  *  listening socket would keep the successor watchdog from re-binding the persisted port. */
@@ -3528,6 +3588,7 @@ export interface RemoteInputBridgeLike {
   stop(): Promise<void>;
   refreshSubscriptions(): Promise<void>;
   readThreadWaitState?(threadId: string): Promise<CodexThreadWaitState>;
+  interruptTurn?(threadId: string, turnId: string): Promise<CodexTurnInterruptResult>;
 }
 
 /** How the supervisor learned the daemon is gone: the sweep's own probe, or the bridge reporting that
@@ -3729,6 +3790,16 @@ export function createBridgeSupervisor(deps: BridgeSupervisorDeps = {}) {
         return "unavailable";
       }
     },
+    /** The phone's "Interrupt" for a Codex turn. No probe here: a bridge that is not ready answers
+     *  "unavailable" itself, and the deadline keeps a wedged proxy from pinning the command drain. */
+    async interruptTurn(threadId: string, turnId: string): Promise<CodexTurnInterruptResult> {
+      if (!bridge?.interruptTurn) return "unavailable";
+      try {
+        return await withDeadline(bridge.interruptTurn(threadId, turnId), BRIDGE_OP_DEADLINE_MS) ?? "failed";
+      } catch {
+        return "failed";
+      }
+    },
     /** Whether a bridge is currently constructed (test/diagnostic seam). */
     get active(): boolean {
       return bridge !== undefined;
@@ -3881,6 +3952,7 @@ async function run(): Promise<void> {
     }),
   });
   activeBridgeShutdown = () => bridges.shutdown();
+  activeCodexInterrupt = (threadId, turnId) => bridges.interruptTurn(threadId, turnId);
   // The LAN listener starts only AFTER the single-instance claim: exactly one watchdog per machine may
   // own the socket (and the persisted port in lan.json), and a losing instance returned above without
   // ever reaching here. createLanListener returns immediately — the bind runs off this stack, so a
@@ -4000,6 +4072,7 @@ async function run(): Promise<void> {
   } finally {
     shutdown(); // bridge child AND the LAN socket — a retired daemon must leave no listener behind
     activeBridgeShutdown = undefined;
+    activeCodexInterrupt = undefined;
     activeLanShutdown = undefined;
     activeLanListener = undefined;
     releaseSingleInstance(); // auto-quit on empty: drop our pidfile so the next hook re-spawns

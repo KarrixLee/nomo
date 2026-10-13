@@ -4050,6 +4050,150 @@ describe("drainCommands (authenticate, validate, then execute)", () => {
   test("a throwing take() cannot derail the sweep", async () => {
     expect(await drainCommands(cfg(), { take: () => { throw new Error("boom"); } })).toBe(0);
   });
+
+  describe("interrupt-session", () => {
+    /** A mid-turn record: the interrupt is refused outright once the record reads done. */
+    const running = (over: Partial<SessionRecord>): RecordEntry => entry("sess-a", { lastEvent: "working", ...over });
+
+    test("a Claude session gets its interrupt flag stamped, and nothing is focused", async () => {
+      const { focused, traces, deps } = harness();
+      const flagged: Array<[string, number]> = [];
+      const cmd = await sealed({ kind: "interrupt-session" });
+      const count = await drainCommands(cfg(), {
+        ...deps,
+        take: () => [cmd],
+        readRecords: async () => [running({ agent: "claude" })],
+        writeInterruptFlagFn: async (sessionId, now) => { flagged.push([sessionId, now]); },
+      });
+      expect(count).toBe(0);                       // the return value counts focused windows only
+      expect(focused).toEqual([]);
+      expect(flagged).toEqual([["sess-a", NOW]]);
+      expect(traces[0]).toMatchObject({ kind: "interrupt-session", agent: "claude", result: "interrupt-flagged" });
+    });
+
+    test("a Codex session is interrupted through the bridge with the record's own turn id", async () => {
+      const { traces, deps } = harness();
+      const calls: Array<[string, string]> = [];
+      const cmd = await sealed({ kind: "interrupt-session" });
+      await drainCommands(cfg(), {
+        ...deps,
+        take: () => [cmd],
+        readRecords: async () => [running({ agent: "codex", turnId: "turn-9" })],
+        interruptCodexTurnFn: async (threadId, turnId) => { calls.push([threadId, turnId]); return "sent"; },
+      });
+      expect(calls).toEqual([["sess-a", "turn-9"]]);
+      expect(traces[0]).toMatchObject({ agent: "codex", result: "interrupt-sent" });
+    });
+
+    test("a Codex record with no turn id is refused — an empty turnId means 'startup interrupt' to the app-server", async () => {
+      const { traces, deps } = harness();
+      let called = false;
+      const cmd = await sealed({ kind: "interrupt-session" });
+      await drainCommands(cfg(), {
+        ...deps,
+        take: () => [cmd],
+        readRecords: async () => [running({ agent: "codex" })],
+        interruptCodexTurnFn: async () => { called = true; return "sent"; },
+      });
+      expect(called).toBe(false);
+      expect(traces[0]).toMatchObject({ result: "no-turn" });
+    });
+
+    test("Codex with the bridge down is traced, not thrown", async () => {
+      const { traces, deps } = harness();
+      const cmd = await sealed({ kind: "interrupt-session" });
+      await drainCommands(cfg(), {
+        ...deps,
+        take: () => [cmd],
+        readRecords: async () => [running({ agent: "codex", turnId: "turn-9" })],
+        interruptCodexTurnFn: async () => "unavailable",
+      });
+      expect(traces[0]).toMatchObject({ result: "bridge-unavailable" });
+    });
+
+    test("a Codex interrupt the app-server refuses, or that throws, is interrupt-failed", async () => {
+      for (const interruptCodexTurnFn of [async () => "failed" as const, async () => { throw new Error("boom"); }]) {
+        resetCommandState();
+        const { traces, deps } = harness();
+        const cmd = await sealed({ kind: "interrupt-session" });
+        await drainCommands(cfg(), {
+          ...deps,
+          take: () => [cmd],
+          readRecords: async () => [running({ agent: "codex", turnId: "turn-9" })],
+          interruptCodexTurnFn,
+        });
+        expect(traces[0]).toMatchObject({ result: "interrupt-failed" });
+      }
+    });
+
+    test("an agent with no interrupt seam is unsupported", async () => {
+      const { traces, deps } = harness();
+      const cmd = await sealed({ kind: "interrupt-session" });
+      await drainCommands(cfg(), {
+        ...deps,
+        take: () => [cmd],
+        readRecords: async () => [running({ agent: "opencode" })],
+      });
+      expect(traces[0]).toMatchObject({ result: "unsupported" });
+    });
+
+    test("a Cursor session is read-only: no flag is stamped and no bridge is asked", async () => {
+      const { focused, traces, deps } = harness();
+      const touched: string[] = [];
+      const cmd = await sealed({ kind: "interrupt-session" });
+      const count = await drainCommands(cfg(), {
+        ...deps,
+        take: () => [cmd],
+        readRecords: async () => [running({ agent: "cursor", turnId: "turn-9" })],
+        writeInterruptFlagFn: async () => { touched.push("flag"); },
+        interruptCodexTurnFn: async () => { touched.push("bridge"); return "sent"; },
+      });
+      expect(count).toBe(0);
+      expect(focused).toEqual([]);
+      expect(touched).toEqual([]);
+      expect(traces[0]).toMatchObject({ kind: "interrupt-session", agent: "cursor", result: "unsupported" });
+    });
+
+    test("a session whose turn is already over is not flagged — the flag would sit until the NEXT turn", async () => {
+      const { traces, deps } = harness();
+      const flagged: string[] = [];
+      const cmd = await sealed({ kind: "interrupt-session" });
+      await drainCommands(cfg(), {
+        ...deps,
+        take: () => [cmd],
+        readRecords: async () => [entry("sess-a", { agent: "claude", lastEvent: "done" })],
+        writeInterruptFlagFn: async (sessionId) => { flagged.push(sessionId); },
+      });
+      expect(flagged).toEqual([]);
+      expect(traces[0]).toMatchObject({ agent: "claude", result: "not-running" });
+    });
+
+    test("a done Codex session never reaches the bridge", async () => {
+      const { traces, deps } = harness();
+      let called = false;
+      const cmd = await sealed({ kind: "interrupt-session" });
+      await drainCommands(cfg(), {
+        ...deps,
+        take: () => [cmd],
+        readRecords: async () => [entry("sess-a", { agent: "codex", turnId: "turn-9", lastEvent: "done" })],
+        interruptCodexTurnFn: async () => { called = true; return "sent"; },
+      });
+      expect(called).toBe(false);
+      expect(traces[0]).toMatchObject({ agent: "codex", result: "not-running" });
+    });
+
+    test("it passes the same gates as focus: an unknown session is refused before anything is stamped", async () => {
+      const { traces, deps } = harness();
+      const flagged: string[] = [];
+      const cmd = await sealed({ kind: "interrupt-session", sessionId: "nope" });
+      await drainCommands(cfg(), {
+        ...deps, take: () => [cmd],
+        writeInterruptFlagFn: async (sessionId) => { flagged.push(sessionId); },
+      });
+      expect(flagged).toEqual([]);
+      expect(traces[0]).toMatchObject({ result: "unknown-session" });
+    });
+  });
 });
 
 // --- the LAN channel's glue into the SAME command chain (NOM-44 phase 1) -----------------------

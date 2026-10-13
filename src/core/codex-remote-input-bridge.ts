@@ -7,6 +7,7 @@ import {
   CodexLoadedThreadListResult,
   CodexThreadResumeResult,
   CodexThreadStatus,
+  CodexTurnInterruptResult,
   CodexUserInputAnswerResult,
   CodexUserInputAnswers,
   CodexUserInputInterruptResult,
@@ -42,6 +43,7 @@ interface BridgeClient {
   readThreadStatus(threadId: string): Promise<CodexThreadStatus>;
   answerUserInput(identity: CodexUserInputRequestIdentity, answers: CodexUserInputAnswers): Promise<CodexUserInputAnswerResult>;
   interruptUserInput(identity: CodexUserInputRequestIdentity): Promise<CodexUserInputInterruptResult>;
+  interruptTurn(threadId: string, turnId: string): Promise<CodexTurnInterruptResult>;
 }
 
 /** The only distinction the watchdog needs. Unknown means there is no authoritative dismissal proof. */
@@ -149,6 +151,12 @@ export class CodexRemoteInputBridge {
     } catch {
       return "unavailable";
     }
+  }
+
+  /** The phone's "Interrupt" for a Codex session. Unavailable while the bridge is down or stopping. */
+  async interruptTurn(threadId: string, turnId: string): Promise<CodexTurnInterruptResult> {
+    if (this.client.state !== "ready" || this.stopping) return "unavailable";
+    return this.client.interruptTurn(threadId, turnId);
   }
 
   /** Start one handle's retirement and REMEMBER the promise, so stop() can wait for the POST that tells
