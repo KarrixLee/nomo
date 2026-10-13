@@ -14,20 +14,20 @@
 <a href="https://apps.apple.com/app/nomo-ai-status-usage/id6779366830"><img src="assets/app-store-badge.svg" height="48" alt="Download Nomo on the App Store"></a>
 </p>
 
-Mirror your **Claude Code**, **OpenAI Codex** and **OpenCode** session milestones to the
-**Nomo iPhone app** as a Live Activity (Dynamic Island). A session's status — working,
+Mirror your **Claude Code**, **OpenAI Codex**, **OpenCode** and **Cursor** session milestones to
+the **Nomo iPhone app** as a Live Activity (Dynamic Island). A session's status — working,
 needs-your-approval, done — shows up on your phone in real time, so you can step away from the
-terminal and still know when an agent needs you or has finished. When an agent stops for a
-permission prompt or a question, you can **answer it from the phone** — tap Allow/Deny or pick an
-option and the session carries on without you at the keyboard. Works with **Codex** in the terminal
-and the **Codex desktop app** alike.
+terminal and still know when an agent needs you or has finished. When a Claude Code, Codex or
+OpenCode session stops for a permission prompt or a question, you can **answer it from the phone** —
+tap Allow/Deny or pick an option and the session carries on without you at the keyboard (Cursor is
+status-only). Works with **Codex** in the terminal and the **Codex desktop app** alike.
 
 Everything is **end-to-end encrypted**. Pairing is a single QR-code scan (or a short typed code);
 there is no server key to copy. All session content (titles, machine name, status, even *which* agent
 produced an event) rides **inside** an encrypted blob, so the relay Worker that fans out the APNs
 push is a blind relay and never sees plaintext. **One pairing covers every agent** on a machine —
-Claude Code, Codex and OpenCode share the same credentials, encryption key, watchdog, and Live
-Activity.
+Claude Code, Codex, OpenCode and Cursor share the same credentials, encryption key, watchdog, and
+Live Activity.
 
 > [!NOTE]
 > **This README is the contributor and security view** — how it's built, how it's wired, and what
@@ -39,12 +39,13 @@ Activity.
 > work (the hooks are pure Node built-ins), but nothing on Windows has been verified, so treat it as
 > unsupported for now.
 
-The PC side ships as **three integrations over one shared `plugin/` directory**: a **Claude Code
-plugin** (`nomo-cc`), a **native Codex plugin** (`nomo`), and an **OpenCode plugin module**. Claude
-Code and Codex bundle the same self-contained `.mjs` hooks, the liveness watchdog, and the
-interactive commands as single-file artifacts that run under **either bun or node ≥ 18** (a `run.sh`
-shim picks whichever is installed); OpenCode instead loads one resident `.js` bundle inside its own
-server process. There are **zero npm dependencies** — Node built-ins only.
+The PC side ships as **four integrations over one shared `plugin/` directory**: a **Claude Code
+plugin** (`nomo-cc`), a **native Codex plugin** (`nomo`), an **OpenCode plugin module**, and a
+**Cursor hook** merged into Cursor's `hooks.json`. Claude Code, Codex and Cursor run the same kind of
+self-contained `.mjs` hooks, the liveness watchdog, and the interactive commands as single-file
+artifacts that run under **either bun or node ≥ 18** (a `run.sh` shim picks whichever is installed);
+OpenCode instead loads one resident `.js` bundle inside its own server process. There are **zero
+npm dependencies** — Node built-ins only.
 
 ## Architecture — end-to-end encrypted
 
@@ -111,9 +112,9 @@ In plain English:
 bunx nomo-ai     # or: npx nomo-ai
 ```
 
-It detects which of Claude Code, Codex and OpenCode are on this machine, shows exactly what it
-will run for each, and lets you toggle the list before anything happens. Then it drives **each
-host's own install path** — the same three flows spelled out below — and prints the restart-and-pair
+It detects which of Claude Code, Codex, OpenCode and Cursor are on this machine, shows exactly what
+it will run for each, and lets you toggle the list before anything happens. Then it drives **each
+host's own install path** — the same four flows spelled out below — and prints the restart-and-pair
 step for each one it installed.
 
 It is a **bootstrapper, not a package manager**: it never writes into `~/.claude` or `~/.codex`
@@ -144,10 +145,12 @@ there — the same thing you would do by hand below. It has to be a durable chec
 tarball: the installed stub re-exports an absolute path, and a `bunx` cache directory does not survive
 the week.
 
-**It updates as well as installs**, and only one leg does it for you. An agent that already has Nomo
-shows an update in the plan instead of an install. For OpenCode that update really runs — it is the
-only agent with no host update path, so `~/.nomo` is fetched, compared and pulled by the same code
-`/nomo-update` uses. For Claude Code the row **prints** the host's own command and runs nothing:
+**It updates as well as installs**, and the two clone-based legs do it for you. An agent that already
+has Nomo shows an update in the plan instead of an install. For OpenCode and Cursor that update really
+runs — neither host has an update path for Nomo, so the `~/.nomo` checkout is the version. OpenCode's
+`~/.nomo` is fetched, compared and pulled by the same code `/nomo-update` uses; Cursor's is
+fast-forwarded (`git pull --ff-only`) and `cursor-install.mjs` re-run to refresh `hooks.json` and the
+skills. For Claude Code the row **prints** the host's own command and runs nothing:
 
 ```sh
 claude plugin update nomo-cc@nomo
@@ -174,13 +177,13 @@ buys almost nothing — and install begins with `marketplace add`, which would s
 marketplace you had aimed somewhere else (a local checkout, a fork) and send every later update to the
 wrong place. Repointing a marketplace is install-time behaviour; it has no business in an update.
 
-`--ref` exists for testing a branch or tag before it merges, and it reaches **one leg**: the OpenCode
-checkout is the only thing the installer owns. `claude plugin marketplace add` and `codex plugin
-marketplace add` take an owner/repo and read the default branch — there is no ref to hand them — so
-the installer says so out loud when you combine `--ref` with those legs rather than implying it
-pinned all three. A `--ref` checkout is left **detached** on purpose: that is how a later plain
-`bunx nomo-ai` recognises a pin and refuses to quietly fast-forward it back (delete `~/.nomo`, or
-pass `--ref` again, to move it).
+`--ref` exists for testing a branch or tag before it merges, and it reaches **two legs**: the
+`~/.nomo` checkout that OpenCode and Cursor share is the only thing the installer owns. `claude plugin
+marketplace add` and `codex plugin marketplace add` take an owner/repo and read the default branch —
+there is no ref to hand them — so the installer says so out loud when you combine `--ref` with those
+legs rather than implying it pinned all four. A `--ref` checkout is left **detached** on purpose:
+that is how a later plain `bunx nomo-ai` recognises a pin and refuses to quietly fast-forward it
+back (delete `~/.nomo`, or pass `--ref` again, to move it).
 
 ## <img src="assets/claude.png" height="22" align="center" alt=""> Install — Claude Code
 
@@ -204,11 +207,13 @@ Five commands, all namespaced `nomo-cc:` — `pair`, `status`, `approvals`, `res
 ([reference](https://docs.nomo.gg/sessions/commands)).
 
 The lifecycle hooks (`SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`,
-`Notification`, `PermissionRequest`, `Stop`, `SessionEnd`) are wired automatically by the plugin —
-no `settings.json` edits. The hook is deliberately silent: no pairing → no-op; network down → 2 s
-timeout, exit 0. It cannot affect a Claude Code session. A send that the timeout cuts off is
-not lost: the hook records the debt and the watchdog re-sends that session's current state a few
-seconds later, so a running session never stays stale on the phone because of one bad request.
+`Notification`, `PermissionRequest`, `Stop`, `SessionEnd`, `StopFailure`, `PostToolUseFailure`,
+`PreCompact`, `PostCompact`, `Elicitation`, `ElicitationResult`) are wired automatically by the
+plugin — no `settings.json` edits. The hook is deliberately silent: no pairing → no-op; network down
+→ 2 s timeout, exit 0. It cannot affect a Claude Code session. A `start`/`update` POST the timeout
+cuts off marks the session record `updatePending`; the watchdog's next 5 s sweep re-sends the
+record's current state with a 5 s POST timeout, backing off 5 s → 60 s after a failure and holding
+back while an approval hold is live.
 
 ## <img src="assets/codex.png" height="22" align="center" alt=""> Install — OpenAI Codex
 
@@ -221,7 +226,7 @@ codex plugin marketplace add KarrixLee/nomo
 codex plugin add nomo@nomo
 ```
 
-Then **trust the hooks once**: run `/hooks` and trust the **seven Nomo entries**. They ship with the
+Then **trust the hooks once**: run `/hooks` and trust the **ten Nomo entries**. They ship with the
 plugin (`plugin/hooks/codex-hooks.json`) but stay **inert until trusted** — this is Codex's own
 safety gate, which Nomo cannot pre-approve. Skipping it leaves the plugin installed and silently
 doing nothing. The hook command lines are byte-stable across releases, so trusting once holds
@@ -269,10 +274,10 @@ The stub is a **re-export, not a copy**: the bundle keeps executing from `plugin
 find its sibling `cc-watchdog.mjs`. OpenCode auto-discovers the directory, so there is nothing to add
 to `opencode.json`.
 
-The six commands are the same ones the other two agents ship, minus the namespace — OpenCode command
+The six commands are the same ones Claude Code and Codex ship, minus the namespace — OpenCode command
 names are flat and global, so they are `/nomo-pair`, `/nomo-status`, `/nomo-approvals`,
 `/nomo-reset`, `/nomo-unpair` ([reference](https://docs.nomo.gg/sessions/commands)) — plus
-`/nomo-update`, which the other two do not need.
+`/nomo-update`, which those two do not need.
 
 ### Updating — `/nomo-update`
 
@@ -302,7 +307,7 @@ copy OpenCode actually imports rather than whichever one the command file was in
 by hand is still exactly `git -C <checkout> pull --ff-only && <checkout>/plugin/scripts/opencode-install.sh`.
 
 **Pairing is shared, and `/nomo-pair` also works standalone.** The plugin reads the same
-`~/.config/cc-status/config.json` as the other two agents, so if you already paired with
+`~/.config/cc-status/config.json` as the other agents, so if you already paired with
 `/nomo-cc:pair` or `$nomo-pair` there is nothing to do. If this machine has never been paired,
 `/nomo-pair` does the whole pairing from inside OpenCode — then **quit and reopen OpenCode**, because
 the plugin read the (absent) config once at server start and already decided to no-op for that
@@ -316,8 +321,9 @@ in something.
 
 - **Approvals work**, on both channels: `permission.asked` (Allow / Always / Deny) and
   `question.asked` (pick an option, or decline). Todo lists ride along as ambient plan detail.
-- **"Open on Mac" is not available** for OpenCode sessions — `opencodeAdapter` has no `locateTuiPid`,
-  so nothing can point at the terminal that owns the session.
+- **"Open on Mac" works for the desktop app only.** `opencodeLocateTuiPid` walks the server pid's
+  ancestry for the `/OpenCode.app/Contents/MacOS/` main process; a CLI or `opencode serve` session
+  belongs to the server, not to any terminal window, so it returns nothing and the button stays hidden.
 - **Auto vs. manual approval mode is not observable.** It is TUI-side state that never crosses HTTP,
   so the phone cannot show which mode a session is in.
 - **Plan mode shows a "Planning" indicator only.** With `OPENCODE_EXPERIMENTAL_PLAN_MODE` off (the
@@ -346,8 +352,9 @@ node plugin/scripts/cursor-install.mjs
 
 **Restart Cursor** (and any open `cursor-agent`) so it re-reads its hooks, then `/nomo-pair` from
 inside it. `/nomo-status`, `/nomo-reset` and `/nomo-unpair` are installed next to it as Cursor
-**skills** (`~/.cursor/skills/nomo-*/SKILL.md`) — the one format Cursor documents for the app and
-lists in the CLI's `/` menu. Pairing is shared with the other agents, and needs no restart.
+**skills** (`~/.cursor/skills/nomo-*/SKILL.md`, or `$CURSOR_CONFIG_DIR/skills/` when that is set) —
+the one format Cursor documents for the app and lists in the CLI's `/` menu. Pairing is shared with
+the other agents, and needs no restart.
 
 **What the installer writes.** Cursor's plugin format is documented for the desktop app only, so Nomo
 uses the hook source both surfaces read: `~/.cursor/hooks.json` (or `$CURSOR_CONFIG_DIR/hooks.json`).
@@ -355,7 +362,9 @@ That file is yours and may carry other tools' hooks, so the installer **merges**
 
 - it checks first and **refuses before writing anything** if the file is not valid JSON of the
   expected shape, is a dangling symlink or has more than one hard link, or if it or the skills
-  directory is not writable. A live symlink is written through, not replaced;
+  directory is not writable; if a same-named skill exists that it did not write (pass `--force` to
+  override); if the Cursor config directory does not exist; or if `plugin/dist/` is not built. A live
+  symlink is written through, not replaced;
 - it appends one entry per event only if that exact entry is absent, adds `"version": 1` only if the
   key is missing, and never edits, reorders or removes an entry it did not write. An entry is Nomo's
   only if it sits on one of the eight events below, its command is exactly Nomo's two quoted paths
@@ -407,12 +416,17 @@ was. Pairing is untouched — it belongs to every agent on the computer.
 
 When a session stops for a **permission prompt** or a multiple-choice **question**, the card reaches
 the phone with its options; the answer rides back inside the same E2E-encrypted blob, so the relay
-never learns what you chose. Works for all three agents. `/nomo-cc:approvals` (or `$nomo-approvals`,
-`/nomo-approvals`) is the local off switch when your phone is away — one switch, machine-wide.
+never learns what you chose. Works for Claude Code, Codex and OpenCode (Cursor is read-only).
+`/nomo-cc:approvals` (or `$nomo-approvals`, `/nomo-approvals`) is the local off switch when your
+phone is away — one switch, machine-wide.
 
-Only sessions your phone is actually showing are answerable, and a hold is never open-ended — it is
-**fail-open**: if no answer arrives (phone asleep, network down, ~5 min ceiling), the prompt simply
-reappears in the terminal. Nomo can delay a decision; it can never make one for you. Details:
+Only sessions your phone is actually showing are answerable, and a hold is **fail-open**: a
+network error, timeout or unpaired state before the hold is granted drops straight to the terminal
+dialog; once it is granted, a failed poll only counts as a miss, and ~5 min of consecutive misses
+gives up the same way. While the relay is reachable the hold has no ceiling of its own — it waits
+until the phone answers, the request is expired or superseded server-side, or the hook process is
+killed (Esc at the terminal, or the agent's own hook timeout). Nomo can delay a decision; it can
+never make one for you. Details:
 [docs.nomo.gg/sessions/approvals](https://docs.nomo.gg/sessions/approvals).
 
 ## How it works
@@ -421,9 +435,10 @@ reappears in the terminal. Nomo can delay a decision; it can never make one for 
   per-pairing E2E key from the QR-scanned secret (or the typed code, via PBKDF2) + the phone's nonce
   (HKDF-SHA256), and writes `~/.config/cc-status/config.json` (mode `0600`) with the pairing id,
   the PC secret, and the 32-byte key. Nothing is copied by hand.
-- **Hook.** On every Claude Code / Codex lifecycle event the hook plans a v2 op (`start` / `update` /
-  `done` / `end` with a `working` / `needsAttention` / `done` status), encrypts the payload, and POSTs
-  the blob to the relay Worker, which pushes it to the phone via APNs.
+- **Hook.** On every Claude Code / Codex / Cursor lifecycle event the hook (`cursor-status` for
+  Cursor) plans a v2 op (`start` / `update` / `done` / `end` with a `working` / `needsAttention` /
+  `done` status), encrypts the payload, and POSTs the blob to the relay Worker, which pushes it to
+  the phone via APNs.
 - **Resident module (OpenCode).** No hooks and no one-shot processes: a single module runs inside
   OpenCode's own server process and reduces its event firehose into the same frames. Because it is a
   guest in the user's editor, it must never throw, block, print, or install process-wide signal
@@ -432,9 +447,10 @@ reappears in the terminal. Nomo can delay a decision; it can never make one for 
   could otherwise show "working" forever. Each event records `sessions/<id>.json` with the agent's
   pid; a single detached `cc-watchdog.mjs` polls every 5 s and POSTs a corrective `end` once that
   pid is dead (Codex interrupts are detected from the rollout transcript). It also settles the
-  hook's undelivered-update debt: a `start`/`update` whose POST was cut off is re-sent within a few
-  seconds, with a 5 s limit so it can't pile up. When no sessions remain it exits; the next hook
-  re-spawns it.
+  hook's undelivered-update debt: a record the hook marked `updatePending` is re-sent on the next
+  sweep with a 5 s POST timeout, backing off 5 s → 60 s after a failure and held back while an
+  approval hold is live. When no sessions remain it lingers, while paired, up to 30 min
+  (`IDLE_GRACE_MS`) before exiting; the next hook re-spawns it.
 - **LAN fast path.** When the phone is on the same network, the watchdog hosts a tiny local HTTP
   listener so commands and answers travel direct (<200 ms) instead of waiting to be piggybacked on
   the next relay response (~5–12 s). It is strictly additive: the relay leg runs in parallel and
@@ -463,7 +479,7 @@ dependencies.
 bun test
 ```
 
-Runs the full suite (1677 tests across `core/`, `entries/`, `opencode/`, and `qr/`).
+Runs the full suite (2011 tests across `core/`, `entries/`, `opencode/`, and `qr/`).
 
 ### Building the plugin bundle
 
@@ -471,9 +487,9 @@ Runs the full suite (1677 tests across `core/`, `entries/`, `opencode/`, and `qr
 bun build.ts
 ```
 
-`build.ts` bundles the eleven hook/command entrypoints (`cc-status`, `cc-permission`, `codex-status`,
+`build.ts` bundles the twelve hook/command entrypoints (`cc-status`, `cc-permission`, `codex-status`,
 `codex-permission`, `codex-notify`, `cc-watchdog`, `pair`, `unpair`, `reset`, `status-cmd`,
-`opencode-update`) into
+`opencode-update`, `cursor-status`) into
 `plugin/dist/*.mjs`, inlining every local import so each artifact is a single node-runnable file.
 
 A second pass bundles `src/opencode/plugin.ts` into `plugin/dist/opencode.js` — **`.js`, not
@@ -492,7 +508,7 @@ up with no code change.
 `plugin/dist/` **is committed to the repo.** Marketplace installs are a plain `git clone` of this
 repository — there is no CI build step, and the `nomo-ai` npm package ships only the installer, not
 the bundle — so the committed `dist/` is what actually runs. Re-run `bun build.ts` after any source change so `dist/` stays reproducible from source, and
-commit the regenerated bundles. The committed bundle was built with `bun 1.3.10`; use the same
+commit the regenerated bundles. The committed bundle was built with `bun 1.3.14`; use the same
 major/minor to reproduce it byte-for-byte.
 
 ### Releasing
