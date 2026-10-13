@@ -11,7 +11,7 @@ import {
   codexNewestRolloutForCwd, codexPidPlanPickerEvidence, codexPidPlanPickerState, codexPidTurnActive, codexPlanPickerStateFromTail, codexProposedPlanMarkdown, codexRolloutExistsForSession, codexSentinelSessionId, codexSessionModel,
   codexRolloutCreationEvidence, codexSessionCreationSuppression, codexTailPendingApproval, codexTailPendingAttentionKind, codexTailPendingUserInputDetail, codexTurnActiveFromTail, filterCodexTuis, findProvisionalForPid,
   firstAssistantModel, firstUserPrompt, lastAssistantModel, parseCodexProcs, rolloutMetaCwd,
-  requestUserInputDetail, rolloutPathFromLsof, sessionTitle, TrackedSessionLite,
+  requestUserInputDetail, rolloutPathFromLsof, sessionTitle, TrackedSessionLite, unknownAgentAdapter,
 } from "./adapter";
 import type { AgentAdapter, LocateTuiReason } from "./adapter";
 import { folderKeyFromCwd } from "./shared";
@@ -2102,5 +2102,18 @@ describe("both adapters expose the locate seam", () => {
       { sessionId: "s", record: locRec({ pid: 77, agent: undefined }) },
       { ttyOf: async () => "ttys009" },
     )).toBe(77);
+  });
+});
+
+describe("interrupt capability is stated per agent", () => {
+  test("claude stops at the next tool call via the hook flag", () => {
+    expect(claudeAdapter.interrupt).toBe("hook-flag");
+  });
+  test("codex interrupts through the app-server bridge", () => {
+    expect(codexAdapter.interrupt).toBe("app-server");
+  });
+  test("opencode and unknown agents have none", () => {
+    expect(opencodeAdapter.interrupt).toBeUndefined();
+    expect(unknownAgentAdapter("some-future-agent").interrupt).toBeUndefined();
   });
 });

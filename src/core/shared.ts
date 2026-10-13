@@ -2054,6 +2054,52 @@ export async function clearDecisionHold(
   return clearDecisionHoldAt(SESSIONS_DIR, sessionId, pid, beforeUnlink, holdId);
 }
 
+// --- Interrupt flag (phone → "stop this session's turn") ----------------------------------------
+//
+// Written by the watchdog when a validated `interrupt-session` command names a hook-flag agent, read by
+// that session's status hook on its next tool event. A sibling FILE for the same reason the `.hold`
+// marker is one: trackSessionAt rebuilds the record whole on every hook, so a record field would be
+// erased by the very event that should act on it.
+
+/** Not `.json`, so no SESSIONS_DIR reader mistakes it for a session row. */
+export const INTERRUPT_FLAG_SUFFIX = ".interrupt";
+
+/** A flag older than this is ignored. An hour covers the longest tool a turn can be sitting in; the
+ *  hook clears the flag itself at every turn boundary, so only a crashed session leaves one behind.
+ *  ponytail: leaked flags are never swept (tiny, inert after this age); add a prune beside
+ *  pruneStaleDecisionHolds if the sessions dir ever needs to be tidy. */
+export const INTERRUPT_FLAG_MAX_AGE_MS = 3_600_000;
+
+export function interruptFlagFileName(sessionId: string): string {
+  return `${sessionId}${INTERRUPT_FLAG_SUFFIX}`;
+}
+
+/** Best-effort, like every other write in this file. */
+export async function writeInterruptFlagAt(sessionsDir: string, sessionId: string, now: number): Promise<void> {
+  try {
+    await atomicWrite(`${sessionsDir}/${interruptFlagFileName(sessionId)}`, JSON.stringify({ at: now }), 0o600);
+  } catch {
+    // A flag that failed to land is an interrupt that did not happen; the phone's row stays Running.
+  }
+}
+
+/** Is a fresh flag present? Deliberately does NOT consume it: Claude Code still runs every other tool
+ *  call already in the same assistant message, and each of those must be denied too. */
+export async function interruptFlagSetAt(sessionsDir: string, sessionId: string, now: number): Promise<boolean> {
+  try {
+    const flag = JSON.parse(
+      await readFile(`${sessionsDir}/${interruptFlagFileName(sessionId)}`, "utf8"),
+    ) as { at?: unknown };
+    return typeof flag.at === "number" && now - flag.at <= INTERRUPT_FLAG_MAX_AGE_MS;
+  } catch {
+    return false;
+  }
+}
+
+export async function clearInterruptFlagAt(sessionsDir: string, sessionId: string): Promise<void> {
+  await unlink(`${sessionsDir}/${interruptFlagFileName(sessionId)}`).catch(() => {});
+}
+
 export async function settleDecisionHoldRecord(
   sessionId: string, patch: Partial<SessionRecord>,
 ): Promise<void> {

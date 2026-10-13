@@ -6,11 +6,11 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { b64url, decryptBlob } from "../core/crypto";
 import {
   BLOB_FIT_CHARS, DBG_BLOB_TEXT_MAX_CHARS, folderIdentity, folderKeyFromCwd, formatPlanPickerDebug, fullTextForRecord, parseConfig, PendingEventStash, PLAN_BLOB_TEXT_MAX_CHARS, PLAN_BLOB_TRUNCATION_MARKER, postFullText,
-  readDecisionHoldAt, readRecord, sealedBlobChars, SessionRecord, sessionBranch, writeDecisionHoldAt,
+  interruptFlagFileName, readDecisionHoldAt, readRecord, sealedBlobChars, SessionRecord, sessionBranch, writeDecisionHoldAt, writeInterruptFlagAt,
 } from "../core/shared";
 import {
-  aiTitle, buildBlob, buildEnvelope, buildPendingStash, cleanPromptTitle, codexIndexTitle, codexSessionTitle,
-  codexThreadName, detailForHook, firstUserPrompt, isPermissionNotification, planOp, sessionTitle,
+  aiTitle, buildBlob, buildEnvelope, buildPendingStash, cleanPromptTitle, clearsInterruptFlag, codexIndexTitle, codexSessionTitle,
+  codexThreadName, detailForHook, firstUserPrompt, INTERRUPT_STOP_REASON, interruptedEventInput, interruptHookOutput, isPermissionNotification, planOp, sessionTitle,
   markDoneDeliveredAt, SESSION_TRACE_PATH, stashPendingEvent, trackSessionAt, transcriptStartMs,
 } from "./cc-status";
 import { provisionalsCoveredByReal, reconcileProvisionalsSweep } from "./cc-watchdog";
@@ -3487,4 +3487,132 @@ describe("runHook sends the local approvals pause as the x-cc-approvals header",
   test("no flag → exactly \"on\" (byte-for-byte; bracketed against the \"off\" case above)", async () => {
     expect(await headerFor(false)).toBe("on");
   }, 20000);
+});
+
+describe("interrupt: what the status hook tells Claude Code when the phone asked to stop", () => {
+  test("PreToolUse stops the turn AND denies the tool (continue:false alone lets the tool run)", () => {
+    expect(JSON.parse(interruptHookOutput("PreToolUse")!)).toEqual({
+      continue: false,
+      stopReason: INTERRUPT_STOP_REASON,
+      hookSpecificOutput: {
+        hookEventName: "PreToolUse",
+        permissionDecision: "deny",
+        permissionDecisionReason: INTERRUPT_STOP_REASON,
+      },
+    });
+  });
+
+  test("PostToolUse stops the turn (this is how a long-running tool's turn ends when it finishes)", () => {
+    expect(JSON.parse(interruptHookOutput("PostToolUse")!)).toEqual({
+      continue: false, stopReason: INTERRUPT_STOP_REASON,
+    });
+  });
+
+  test("no other event can carry it", () => {
+    for (const name of ["SessionStart", "UserPromptSubmit", "Notification", "Stop", "SessionEnd", "PermissionRequest", ""]) {
+      expect(interruptHookOutput(name)).toBeNull();
+    }
+  });
+
+  test("the output is one line (hook stdout is parsed as a single JSON document)", () => {
+    expect(interruptHookOutput("PreToolUse")!.includes("\n")).toBe(false);
+  });
+
+  test("a turn boundary clears the flag, so a late flag can never stop the user's NEXT prompt", () => {
+    expect(clearsInterruptFlag("UserPromptSubmit")).toBe(true);
+    expect(clearsInterruptFlag("Stop")).toBe(true);
+    expect(clearsInterruptFlag("SessionEnd")).toBe(true);
+  });
+
+  test("a tool event never clears it (the remaining tool calls in the message must be denied too)", () => {
+    expect(clearsInterruptFlag("PreToolUse")).toBe(false);
+    expect(clearsInterruptFlag("PostToolUse")).toBe(false);
+  });
+
+  test("the real hook: silent without a flag; with one it prints the stop line and reports a Stop-shaped done; Stop clears the flag", async () => {
+    const rawKey = new Uint8Array(32).fill(9);
+    const entry = join(import.meta.dir, "cc-status.ts");
+    const posts: Array<{ op?: string; blob?: string }> = [];
+    const server = Bun.serve({
+      port: 0,
+      async fetch(req) { posts.push(await req.json() as { op?: string; blob?: string }); return new Response("{}", { status: 200 }); },
+    });
+    const home = await mkdtemp(join(tmpdir(), "cc-hook-int-"));
+    const ccDir = join(home, ".config", "cc-status");
+    const sessions = join(ccDir, "sessions");
+    await mkdir(sessions, { recursive: true });
+    await writeFile(join(ccDir, "config.json"), JSON.stringify({
+      url: `http://127.0.0.1:${server.port}`, pairingId: "p", pcSecret: "s", e2eKeyB64: b64url(rawKey),
+    }));
+    /** Spawn the real hook for one event and return exactly what it printed. */
+    const stdoutFor = async (hook_event_name: string, extra: Record<string, unknown> = {}): Promise<string> => {
+      const proc = spawnTestProcess({
+        cmd: ["bun", entry],
+        env: isolatedTestEnv(home),
+        stdin: Buffer.from(JSON.stringify({
+          session_id: "int-1", hook_event_name, tool_name: "Bash", cwd: "/x/api-status", transcript_path: "", ...extra,
+        })),
+        stdout: "pipe", stderr: "ignore",
+      });
+      const out = await new Response(proc.stdout).text();
+      await proc.exited;
+      return out;
+    };
+    try {
+      // No flag: the contract's NOTHING on stdout, and an ordinary working update (this also creates the record).
+      expect(await stdoutFor("PreToolUse")).toBe("");
+      expect(posts.at(-1)?.op).toBe("update");
+
+      await writeInterruptFlagAt(sessions, "int-1", Date.now());
+      expect(await stdoutFor("PreToolUse")).toBe(`${interruptHookOutput("PreToolUse")}\n`);
+      // Claude Code fires no Stop hook after a hook-stopped turn, so THIS event is the done — and its blob
+      // is a Stop's, not a done still labelled with the tool it interrupted.
+      expect(posts.at(-1)?.op).toBe("done");
+      const blob = await decryptBlob(rawKey, posts.at(-1)!.blob!);
+      expect(blob).toMatchObject({ status: "done" });
+      expect(blob).not.toHaveProperty("detail");
+      // Not consumed: the other tool calls of the same message must be stopped too.
+      expect(await readdir(sessions)).toContain(interruptFlagFileName("int-1"));
+
+      // A Codex-in-Claude event (this entry invoked inside a Codex session: the payload carries turn_id)
+      // is restamped to the codex adapter, whose interrupt is the app-server's — the hook prints nothing.
+      expect(await stdoutFor("PreToolUse", { turn_id: "turn-1" })).toBe("");
+      expect(await readdir(sessions)).toContain(interruptFlagFileName("int-1"));
+
+      expect(await stdoutFor("Stop")).toBe("");
+      expect(await readdir(sessions)).not.toContain(interruptFlagFileName("int-1"));
+    } finally {
+      server.stop(true);
+      await rm(home, { recursive: true, force: true });
+    }
+  }, 30000);
+
+  test("op:end leaves no flag behind, under the id the record was tracked as", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "cc-int-end-"));
+    try {
+      await writeInterruptFlagAt(dir, "s", Date.now());
+      await trackSessionAt(dir, "s", "end", 0, "done", undefined, "Mac", "x", "");
+      expect(await readdir(dir)).toEqual([]);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("the blob an interrupted tool event seals IS the blob a real Stop seals — done, with no working detail left on it", () => {
+    const plan = { op: "done", prio: 0, status: "done" } as const;
+    const stop = buildBlob({ session_id: "s", cwd: "/Users/x/api-status", hook_event_name: "Stop" }, "Mac", "t", plan);
+    expect(stop).not.toHaveProperty("detail");
+    for (const hook_event_name of ["PreToolUse", "PostToolUse"]) {
+      const input = { session_id: "s", cwd: "/Users/x/api-status", hook_event_name, tool_name: "Bash", tool_input: { command: "sleep 600" } };
+      // Bracket: the raw tool event really does carry a working detail, so the equality below is the remap's doing.
+      expect(buildBlob(input, "Mac", "t", plan).detail).toBeDefined();
+      expect(buildBlob(interruptedEventInput(input), "Mac", "t", plan)).toEqual(stop);
+    }
+  });
+
+  test("the remap changes the event name and nothing else (the session id still addresses the same row)", () => {
+    const input = { session_id: "s", cwd: "/x", hook_event_name: "PreToolUse", tool_name: "Bash" };
+    expect(interruptedEventInput(input)).toEqual({ ...input, hook_event_name: "Stop" });
+    expect(input.hook_event_name).toBe("PreToolUse");
+  });
 });
