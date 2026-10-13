@@ -400,8 +400,11 @@ was. Pairing is untouched — it belongs to every agent on the computer.
   **done**, with its folder, branch and model, and it ends when the chat or the CLI does.
 - **No remote approvals.** Cursor's approval prompts stay in Cursor; a Cursor session never shows a
   "needs you" state on the phone, because nothing in v1 would let you answer it from there.
-- **The title is your first prompt.** Cursor keeps a chat's generated title only in an internal
-  database Nomo does not read, so the row is named after the first thing you asked.
+- **The title is Cursor's own chat name** — the one on the chat tab — as soon as Cursor has
+  generated it; until then, and whenever it can't be read, the row is named after your first prompt.
+  Nomo reads that one field from the desktop app's local state database (read-only, using the
+  system `sqlite3`) and nothing else from it. `cursor-agent` CLI chats are not stored there, so they
+  keep the first-prompt title.
 - **A row appears at your first prompt**, not when a chat window opens — an empty chat is not a
   session worth a notification.
 - **Cloud / background agents are not mirrored.**

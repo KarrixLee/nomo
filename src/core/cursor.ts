@@ -2,8 +2,8 @@
 //
 // WHY THIS IS NOT runHook("cursor"). Cursor's hooks are camelCase events with their own payload
 // (`conversation_id`, `generation_id`, `workspace_roots`, …), not the Claude-shaped names planOp maps,
-// and three of its rules have no Claude equivalent: only a PROMPT may create a row, the title is the
-// FIRST prompt, and the owning pid is not the hook's parent. So this is a small producer of its own —
+// and three of its rules have no Claude equivalent: only a PROMPT may create a row, the title is
+// Cursor's own chat name (the FIRST prompt until that exists), and the owning pid is not the hook's parent. So this is a small producer of its own —
 // the same shape as the OpenCode plugin's `send` — that reuses the shared seal/record/POST pieces
 // (buildEnvelope, trackSession, postOcEvent, ensureWatchdog) and touches nothing in hook.ts.
 //
@@ -18,6 +18,7 @@
 // an unreachable relay adds up to ~2 s to a prompt submission — and to a `stop`. A chat's first
 // prompt also pays the owner lookup (one `ps` per ancestor; retried at most every
 // CURSOR_OWNER_RETRY_MS while no owner is found). Tool events inside CURSOR_KEEPALIVE_MS do neither.
+// The chat-name lookup (cursorChatTitle: ~15 ms, 300 ms ceiling) is never on the prompt path.
 // The POST is not detached, deliberately: nothing outlives `process.exit` in the entry, so a detached
 // send would need a second process per event, and a `done` needs the POST's answer to settle its
 // delivery marker (markDoneDeliveredAt). The Claude and Codex hooks await theirs the same way.
@@ -29,7 +30,7 @@
 import { hostname } from "node:os";
 import { realpathSync } from "node:fs";
 import { readdir, stat, unlink } from "node:fs/promises";
-import { cursorAdapter, cursorHostInvocation, cursorModel } from "./adapter";
+import { cursorAdapter, cursorChatTitle, cursorHostInvocation, cursorModel } from "./adapter";
 import { buildEnvelope, markDoneDeliveredAt, OpPlan, trackSessionAt } from "./hook";
 import {
   atomicWrite, CC_DIR, Config, ensureWatchdog, folderIdentity, lastHookPath, loadConfig, pidAlive,
@@ -295,6 +296,7 @@ export interface CursorHookDeps {
   now?: () => number;
   env?: Record<string, string | undefined>;
   ownerPid?: () => number | undefined;
+  chatTitle?: (sessionId: string) => string | undefined;
   post?: (config: Config, envelope: Record<string, unknown>) => Promise<boolean>;
   ensureWatchdog?: () => void;
   trace?: (event: object) => void;
@@ -350,8 +352,11 @@ export async function runCursorHook(raw: string, deps: CursorHookDeps = {}): Pro
     const roots = Array.isArray(input.workspace_roots) ? input.workspace_roots : [];
     const cwd = str(roots[0]) ?? str(input.cwd);
     const folder = folderIdentity(cwd, record);
-    // The FIRST non-empty title wins and is never replaced: it is the first prompt, by decision.
-    const title = record?.title ?? await cursorAdapter.title({ sessionId, prefix: "", input });
+    // Cursor's own chat name once it exists, looked up only on a frame that is going out anyway — a
+    // keep-alive or the stop, never the prompt (Cursor waits on that hook, and a new chat has no name
+    // yet). Until then the first prompt, which a later prompt never replaces.
+    const title = (kind === "tool" || kind === "stop" ? (deps.chatTitle ?? cursorChatTitle)(sessionId) : undefined)
+      ?? record?.title ?? await cursorAdapter.title({ sessionId, prefix: "", input });
     const model = cursorModel(input) ?? record?.model;
     const startedAt = typeof record?.sessionStartedAt === "number" && Number.isFinite(record.sessionStartedAt)
       ? record.sessionStartedAt : now;

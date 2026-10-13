@@ -12,7 +12,7 @@
 //
 // PORTABILITY: bun AND node >= 18 — no `Bun.*` APIs; file IO via node:fs/promises (shared helpers).
 
-import { execFile } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import { readdir, readFile, stat } from "node:fs/promises";
 import { promisify } from "node:util";
 import { basename, join } from "node:path";
@@ -2194,6 +2194,11 @@ export interface AgentAdapter {
    *  spreads cleanly into both a blob object and a SessionRecord (whose `agent` follows the same
    *  omit-for-claude convention). */
   blobAgentFields: { agent?: AgentKindWire };
+  /** OPTIONAL: the watchdog's title net (cc-watchdog repairTitle) for an agent whose real title can
+   *  land on disk AFTER its last hook. `due` gates the sweep (pure, cheap); `resolve` is the lookup —
+   *  absent = the `title` seam above over the transcript head. A resolved title equal to the record's
+   *  sends nothing. Absent = this agent's hooks always carry the title themselves. */
+  titleRepair?: { due(record: SessionRecord, now: number): boolean; resolve?(sessionId: string): string | undefined };
   /** OPTIONAL: is this agent's blob `plan` AMBIENT SESSION STATE rather than a one-shot proposal?
    *
    *  OpenCode's plan is its live todo list: it is restated by EVERY frame the resident plugin sends
@@ -2331,6 +2336,8 @@ export const codexAdapter = {
   // allow" stays a plain allow (NOM-62): Codex's PermissionRequest hook — the only path its command/patch
   // approvals reach Nomo on — fails closed on `updatedPermissions`, so there is no session grant to send.
   answerExtras: "other",
+  // A SessionStart ships title:"" and Codex can drop every later hook — repair until one lands.
+  titleRepair: { due: (record) => typeof record.title !== "string" || record.title.length === 0 },
   async title({ sessionId, prefix, input }): Promise<string | undefined> {
     // PRIMARY: the clean AI-generated thread_name codex writes to session_index.jsonl ~30-40s in.
     // Re-read every hook (no memo) so a later hook UPGRADES an earlier prompt-derived fallback the
@@ -2515,6 +2522,51 @@ export function cursorModel(input: Record<string, unknown>): string | undefined 
   return undefined;
 }
 
+/** Where the Cursor DESKTOP app keeps its global state (VS Code's user-data layout). */
+export function cursorStateDb(): string {
+  const home = process.env.HOME ?? "";
+  const data = process.platform === "darwin" ? `${home}/Library/Application Support`
+    : process.platform === "win32" ? process.env.APPDATA ?? ""
+    : process.env.XDG_CONFIG_HOME || `${home}/.config`;
+  return `${data}/Cursor/User/globalStorage/state.vscdb`;
+}
+
+/** How long the watchdog keeps looking for a chat name after a Cursor turn's stop (one lookup per
+ *  sweep). Cursor names a chat within seconds of its first prompt; this is slack for its disk flush. */
+export const CURSOR_TITLE_REPAIR_MS = 120_000;
+/** Hard ceiling on one lookup. A healthy one is ~15 ms (measured against a 970 MB state.vscdb). */
+const CURSOR_TITLE_TIMEOUT_MS = 300;
+
+/** The name Cursor itself gave a chat (its tab / history label), or undefined — which every caller
+ *  answers with the first-prompt title. Verified on Cursor 3.24 (macOS): state.vscdb, table
+ *  `cursorDiskKV`, key `composerData:<id>` where <id> IS the hooks' `conversation_id`; the value is
+ *  JSON with a string `name`.
+ *
+ *  The SYSTEM `sqlite3`, not a built-in module: the bundle runs under bun OR node >= 18, and their
+ *  SQLite modules differ (`bun:sqlite`; `node:sqlite` only from 22.5). No sqlite3 on the box, no
+ *  database (the `cursor-agent` CLI keeps its chats elsewhere), a locked file, a changed schema,
+ *  malformed JSON, a non-string or blank name, or the time budget running out are all the same
+ *  answer: undefined.
+ *
+ *  READ-ONLY, EXACT KEY: `-readonly` can neither create a missing file nor write an existing one, and
+ *  the lookup is one unique-index probe — never a scan of that table. Only `name` is extracted, inside
+ *  SQLite: the rest of the record (chat content) never enters this process.
+ *  Synchronous on purpose — the hook has nothing else to do meanwhile, and the timeout is the bound. */
+export function cursorChatTitle(sessionId: string, db: string = cursorStateDb()): string | undefined {
+  // The id is spliced into the SQL text (the sqlite3 CLI takes no bound parameters).
+  if (!/^[A-Za-z0-9_-]{1,128}$/.test(sessionId)) return undefined;
+  try {
+    const out = execFileSync("sqlite3", ["-readonly", db,
+      "select case when json_type(cast(value as text),'$.name')='text' then json_extract(cast(value as text),'$.name') end" +
+      ` from cursorDiskKV where key='composerData:${sessionId}'`,
+    ], { timeout: CURSOR_TITLE_TIMEOUT_MS, encoding: "utf8", maxBuffer: 65_536, stdio: ["ignore", "pipe", "ignore"] });
+    const cleaned = out.replace(/\s+/g, " ").trim();
+    return cleaned ? truncateOnWord(cleaned) : undefined; // capped like every other generated title
+  } catch {
+    return undefined;
+  }
+}
+
 /** Cursor (desktop app + `cursor-agent` CLI) — a READ-ONLY v1 driven by Cursor's hooks.
  *
  *  Like `opencodeAdapter`, this is mostly reached through `adapterFor()` by the REBUILD paths (the
@@ -2522,9 +2574,11 @@ export function cursorModel(input: Record<string, unknown>): string | undefined 
  *  The producer is core/cursor.ts, not runHook — Cursor's event names and payload differ from the
  *  Claude-shaped ones planOp understands — and it calls `title`/`model` below with the raw payload.
  *
- *  TITLE = THE FIRST USER PROMPT. Cursor keeps the chat title only in an undocumented SQLite file
- *  (state.vscdb), which is deliberately never read. The producer keeps the first non-empty title on
- *  the record, so a later prompt cannot rename the row.
+ *  TITLE = CURSOR'S OWN CHAT NAME, the first user prompt until it can be read (cursorChatTitle
+ *  below). Cursor generates the name a moment after the first prompt, so `title` — the prompt hook's
+ *  seam, which Cursor waits on — never reads it: the producer looks it up on the frames it already
+ *  sends after that (keep-alives, the stop), and `titleRepair` covers a name that lands after the
+ *  stop of a short chat.
  *
  *  NO interrupt / approval / discovery / locate seams: v1 never reports needsAttention and never
  *  answers anything. `sessionsDir` exists for status-cmd's hooks-not-firing check only (the desktop
@@ -2542,6 +2596,13 @@ export const cursorAdapter: AgentAdapter = {
   sessionMatch: (name: string) => name.endsWith(".jsonl"),
   hookStampPath: () => lastHookPath("cursor"),
   hooksNotFiringHint: "  run `bunx nomo-ai --cursor` again, then restart Cursor (Settings → Hooks shows what it loaded)",
+  // DONE rows only, and only for a short while after the stop. A finished row is the one state no
+  // hook is about to rewrite, so a title-only frame cannot cross a live turn's own frames; and a row
+  // whose chat has no name (the CLI) stops costing a lookup per sweep after the window.
+  titleRepair: {
+    due: (record, now) => record.lastEvent === "done" && typeof record.ts === "number" && now - record.ts < CURSOR_TITLE_REPAIR_MS,
+    resolve: (sessionId) => cursorChatTitle(sessionId),
+  },
   toolDetail: {},
   blobAgentFields: { agent: "cursor" as const },
 };

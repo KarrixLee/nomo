@@ -92,7 +92,7 @@ async function sha256Hex(s) {
 }
 
 // src/core/adapter.ts
-import { execFile as execFile2 } from "node:child_process";
+import { execFile as execFile2, execFileSync as execFileSync2 } from "node:child_process";
 import { readdir, readFile as readFile2, stat as stat2 } from "node:fs/promises";
 import { promisify as promisify2 } from "node:util";
 import { basename as basename2, join as join2 } from "node:path";
@@ -104,7 +104,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "2.3.2";
+var PLUGIN_VERSION = "2.3.3";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -2703,6 +2703,7 @@ var claudeAdapter = {
 var codexAdapter = {
   kind: "codex",
   answerExtras: "other",
+  titleRepair: { due: (record) => typeof record.title !== "string" || record.title.length === 0 },
   async title({ sessionId, prefix, input }) {
     const indexTitle = await codexIndexTitle(sessionId);
     if (indexTitle)
@@ -2815,6 +2816,28 @@ function cursorModel(input) {
   }
   return;
 }
+function cursorStateDb() {
+  const home = process.env.HOME ?? "";
+  const data = process.platform === "darwin" ? `${home}/Library/Application Support` : process.platform === "win32" ? process.env.APPDATA ?? "" : process.env.XDG_CONFIG_HOME || `${home}/.config`;
+  return `${data}/Cursor/User/globalStorage/state.vscdb`;
+}
+var CURSOR_TITLE_REPAIR_MS = 120000;
+var CURSOR_TITLE_TIMEOUT_MS = 300;
+function cursorChatTitle(sessionId, db = cursorStateDb()) {
+  if (!/^[A-Za-z0-9_-]{1,128}$/.test(sessionId))
+    return;
+  try {
+    const out = execFileSync2("sqlite3", [
+      "-readonly",
+      db,
+      "select case when json_type(cast(value as text),'$.name')='text' then json_extract(cast(value as text),'$.name') end" + ` from cursorDiskKV where key='composerData:${sessionId}'`
+    ], { timeout: CURSOR_TITLE_TIMEOUT_MS, encoding: "utf8", maxBuffer: 65536, stdio: ["ignore", "pipe", "ignore"] });
+    const cleaned = out.replace(/\s+/g, " ").trim();
+    return cleaned ? truncateOnWord(cleaned) : undefined;
+  } catch {
+    return;
+  }
+}
 var cursorAdapter = {
   kind: "cursor",
   title: async ({ input }) => typeof input.prompt === "string" ? displayTitleFromUserText(input.prompt) : undefined,
@@ -2824,6 +2847,10 @@ var cursorAdapter = {
   sessionMatch: (name) => name.endsWith(".jsonl"),
   hookStampPath: () => lastHookPath("cursor"),
   hooksNotFiringHint: "  run `bunx nomo-ai --cursor` again, then restart Cursor (Settings → Hooks shows what it loaded)",
+  titleRepair: {
+    due: (record, now) => record.lastEvent === "done" && typeof record.ts === "number" && now - record.ts < CURSOR_TITLE_REPAIR_MS,
+    resolve: (sessionId) => cursorChatTitle(sessionId)
+  },
   toolDetail: {},
   blobAgentFields: { agent: "cursor" }
 };
@@ -9268,39 +9295,54 @@ async function buildTitleRepairEnvelope(sessionId, record, title, now, e2eKey, a
   const blob = await encryptBlob(e2eKey, appendFittedPlanAndDebug(base, undefined, dbg));
   return { v: 2, sessionId, op: record.op ?? "update", prio: record.prio ?? 0, ts: now, blob, ...startedAtField(record) };
 }
-function shouldRepairTitle(record) {
-  if (record.agent !== "codex")
-    return false;
+function shouldRepairTitle(record, now = Date.now()) {
   if (record.provisional === true)
     return false;
-  return typeof record.title !== "string" || record.title.length === 0;
+  return adapterFor(recordAgent(record)).titleRepair?.due(record, now) === true;
 }
 function titleRepairedRecord(record, title, blob, pairingId) {
   return { ...record, title, blob, ...pairingId.length > 0 ? { pairingId } : {} };
 }
-async function repairTitle(config, path, sessionId, record) {
+async function repairTitle(config, path, sessionId, record, deps = {}) {
   try {
     if (!shouldRepairTitle(record))
       return "uncorrected";
-    let prefix = "";
-    if (typeof record.transcript === "string" && record.transcript.length > 0) {
-      try {
-        prefix = await readPrefix(record.transcript, TITLE_REPAIR_HEAD_BYTES);
-      } catch {}
+    const adapter2 = adapterFor(recordAgent(record));
+    const resolve3 = deps.resolve ?? adapter2.titleRepair?.resolve;
+    let title;
+    if (resolve3) {
+      title = resolve3(sessionId);
+    } else {
+      let prefix = "";
+      if (typeof record.transcript === "string" && record.transcript.length > 0) {
+        try {
+          prefix = await readPrefix(record.transcript, TITLE_REPAIR_HEAD_BYTES);
+        } catch {}
+      }
+      title = await adapter2.title({ sessionId, prefix, input: {}, transcriptPath: record.transcript });
     }
-    const title = await codexAdapter.title({ sessionId, prefix, input: {}, transcriptPath: record.transcript });
-    if (!title)
+    if (!title || title === record.title)
+      return "uncorrected";
+    const unmoved = async () => {
+      try {
+        const fresh = await readRecordAt(path);
+        return fresh !== null && !recordMovedSince(record, fresh);
+      } catch {
+        return false;
+      }
+    };
+    if (!await unmoved())
       return "uncorrected";
     const repairNow = Date.now();
-    const envelope = await buildTitleRepairEnvelope(sessionId, record, title, repairNow, config.e2eKey, "codex", Math.floor(repairNow / 1000));
-    const outcome = await postEvent(config, envelope);
+    const envelope = await buildTitleRepairEnvelope(sessionId, record, title, repairNow, config.e2eKey, adapter2.kind, Math.floor(repairNow / 1000));
+    const outcome = await (deps.post ?? ((body) => postEvent(config, body)))(envelope);
     if (outcome === "revoked")
       return "revoked";
     if (outcome !== "delivered")
       return "uncorrected";
     try {
-      const next = titleRepairedRecord(record, title, envelope.blob, config.pairingId);
-      await atomicWrite(path, JSON.stringify(next), 384);
+      if (await unmoved())
+        await atomicWrite(path, JSON.stringify(titleRepairedRecord(record, title, envelope.blob, config.pairingId)), 384);
     } catch {}
     return "corrected";
   } catch {
@@ -9959,6 +10001,7 @@ export {
   resolveCodexTuiOwner,
   resetDoneAttemptMemory,
   resetCommandState,
+  repairTitle,
   recordMovedSince,
   reconcileProvisionalsSweep,
   pruneStaleDecisionHolds,

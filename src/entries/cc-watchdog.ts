@@ -2899,6 +2899,10 @@ export async function retireDoneStale(
 // rollout — and, once a title resolves, caches it on the record and POSTs a corrective blob carrying the
 // SAME op/status with only the title fixed. Idempotent: a record that already holds a non-empty title is
 // skipped, so this fires at most until the first title lands.
+//
+// Which records are due, and where the title comes from, is the adapter's `titleRepair` seam. Cursor is
+// the second user: its chat name can land in Cursor's own store after a short chat's stop, so a DONE
+// Cursor row is looked up for a short window and re-POSTed only when the name differs from the record's.
 
 /** How much of the codex rollout HEAD the title-repair fallback scans (the first user_message rides the
  *  opening lines). Matches the hook's TITLE_SCAN_BYTES. */
@@ -2945,14 +2949,13 @@ export async function buildTitleRepairEnvelope(
   return { v: 2, sessionId, op: record.op ?? "update", prio: record.prio ?? 0, ts: now, blob, ...startedAtField(record) };
 }
 
-/** Gate: should this sweep try to repair a still-tracked session's blank title? Only CODEX sessions (Claude
- *  names its session from the transcript on the very first hook, so a claude blank is a transient read-miss
- *  the next hook fixes, not the structural SessionStart gap), not a provisional discovery row (those carry a
- *  cwd-basename title), whose record holds no non-empty title yet. Pure. */
-export function shouldRepairTitle(record: SessionRecord): boolean {
-  if (record.agent !== "codex") return false;
+/** Gate: should this sweep try to repair a still-tracked session's title? The agent's own rule
+ *  (adapter `titleRepair.due` — Codex: no non-empty title yet; Cursor: done moments ago; Claude names
+ *  its session from the transcript on the very first hook, so it has no seam), and never a provisional
+ *  discovery row (those carry a cwd-basename title). Pure. */
+export function shouldRepairTitle(record: SessionRecord, now: number = Date.now()): boolean {
   if (record.provisional === true) return false;
-  return typeof record.title !== "string" || record.title.length === 0;
+  return adapterFor(recordAgent(record)).titleRepair?.due(record, now) === true;
 }
 
 /** The rewritten record after a delivered title repair: the resolved title, the freshly-sealed blob, AND
@@ -2973,27 +2976,46 @@ export function titleRepairedRecord(record: SessionRecord, title: string, blob: 
  *  titleRepairedRecord) and POSTs the corrective at the session's CURRENT op/status. No title yet (still
  *  pre-thread_name / empty rollout) → nothing to do, retried next sweep. Returns the same verdict triple
  *  as the other nets. */
-async function repairTitle(config: Config, path: string, sessionId: string, record: SessionRecord): Promise<"corrected" | "uncorrected" | "revoked"> {
+export async function repairTitle(
+  config: Config, path: string, sessionId: string, record: SessionRecord,
+  deps: { post?: (body: object) => Promise<PostOutcome>; resolve?: (sessionId: string) => string | undefined } = {},
+): Promise<"corrected" | "uncorrected" | "revoked"> {
   try {
     if (!shouldRepairTitle(record)) return "uncorrected";
-    let prefix = "";
-    if (typeof record.transcript === "string" && record.transcript.length > 0) {
-      try { prefix = await readPrefix(record.transcript, TITLE_REPAIR_HEAD_BYTES); } catch { /* rollout gone / unreadable → index-only */ }
+    const adapter = adapterFor(recordAgent(record));
+    const resolve = deps.resolve ?? adapter.titleRepair?.resolve;
+    let title: string | undefined;
+    if (resolve) {
+      title = resolve(sessionId);
+    } else {
+      let prefix = "";
+      if (typeof record.transcript === "string" && record.transcript.length > 0) {
+        try { prefix = await readPrefix(record.transcript, TITLE_REPAIR_HEAD_BYTES); } catch { /* rollout gone / unreadable → index-only */ }
+      }
+      // input:{} — the watchdog has no hook payload, so this reduces to the PRIMARY session_index lookup plus
+      // the rollout-prefix fallback (the UserPromptSubmit input.prompt path is inert without an input).
+      title = await adapter.title({ sessionId, prefix, input: {}, transcriptPath: record.transcript });
     }
-    // input:{} — the watchdog has no hook payload, so this reduces to the PRIMARY session_index lookup plus
-    // the rollout-prefix fallback (the UserPromptSubmit input.prompt path is inert without an input).
-    const title = await codexAdapter.title({ sessionId, prefix, input: {}, transcriptPath: record.transcript });
-    if (!title) return "uncorrected"; // still no title (pre-thread_name, empty rollout) → retry next sweep
+    // No title yet (pre-thread_name, empty rollout, no chat name) or nothing new → retry next sweep.
+    if (!title || title === record.title) return "uncorrected";
+    // The stale-snapshot guard (see correctIdleClaude): this re-POSTs the snapshot's op/status, so a
+    // record a hook has moved since the sweep read it must not be answered with its old state.
+    const unmoved = async (): Promise<boolean> => {
+      try {
+        const fresh = await readRecordAt(path);
+        return fresh !== null && !recordMovedSince(record, fresh);
+      } catch { return false; }
+    };
+    if (!await unmoved()) return "uncorrected";
     // Re-POSTing the CURRENT state with the title fixed → `at` is the OBSERVED now (epoch seconds).
     const repairNow = Date.now();
-    const envelope = await buildTitleRepairEnvelope(sessionId, record, title, repairNow, config.e2eKey, "codex", Math.floor(repairNow / 1000));
-    const outcome = await postEvent(config, envelope);
+    const envelope = await buildTitleRepairEnvelope(sessionId, record, title, repairNow, config.e2eKey, adapter.kind, Math.floor(repairNow / 1000));
+    const outcome = await (deps.post ?? ((body: object) => postEvent(config, body)))(envelope);
     if (outcome === "revoked") return "revoked"; // pairing gone → bubble up so the loop can tear down
     if (outcome !== "delivered") return "uncorrected"; // failed POST → keep the old record, retry next sweep
     try {
-      const next = titleRepairedRecord(record, title, envelope.blob, config.pairingId);
       // Owner-only (0600), same as every other record rewrite in this file.
-      await atomicWrite(path, JSON.stringify(next), 0o600);
+      if (await unmoved()) await atomicWrite(path, JSON.stringify(titleRepairedRecord(record, title, envelope.blob, config.pairingId)), 0o600);
     } catch {
       // Rewrite failed — worst case we re-resolve + re-POST next sweep (the worker dedupes the frame).
     }

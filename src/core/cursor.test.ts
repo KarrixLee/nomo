@@ -6,14 +6,15 @@ import { mkdir, mkdtemp, readdir, readFile, rm, utimes, writeFile } from "node:f
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test } from "bun:test";
-import { adapterFor, cursorAdapter, cursorHostInvocation } from "./adapter";
+import { execFileSync } from "node:child_process";
+import { adapterFor, cursorAdapter, cursorChatTitle, cursorHostInvocation, CURSOR_TITLE_REPAIR_MS } from "./adapter";
 import { b64url, decryptBlob } from "./crypto";
 import {
   CURSOR_KEEPALIVE_MS, CURSOR_OWNER_RETRY_MS, CURSOR_UNKNOWN_OWNER_PID, CursorHookDeps, cursorEventKind, cursorOwnerPid,
   cursorSessionIds, isCursorInvocation, planCursor, runCursorHook,
 } from "./cursor";
 import { Config, pidAlive, readRecord, SessionRecord } from "./shared";
-import { classifySession, correctIdleClaude, isClaudeIdleReapEligible } from "../entries/cc-watchdog";
+import { classifySession, correctIdleClaude, isClaudeIdleReapEligible, repairTitle, shouldRepairTitle } from "../entries/cc-watchdog";
 import { parseAudience, statusCmd } from "../entries/status-cmd";
 import { createProcessHygiene, isolatedTestEnv } from "../test/process-hygiene";
 
@@ -86,6 +87,7 @@ async function harness(): Promise<Harness> {
     now: () => clock.now,
     env: {},
     ownerPid: () => process.pid, // a pid that is certainly alive
+    chatTitle: () => undefined, // never the developer's real Cursor database
     post: async (_config, envelope) => { posts.push(envelope); return true; },
     ensureWatchdog: () => {},
     trace: (event) => { traces.push(event); },
@@ -701,5 +703,112 @@ describe("status — the Cursor row", () => {
   test("not installed and never seen: another agent's reader is told nothing about Cursor", async () => {
     const out = (await status({ audience: "claude", transcriptAgeMs: 2 * MIN })).join("\n");
     expect(out).not.toContain("Cursor");
+  });
+});
+
+describe("Cursor's own chat title", () => {
+  /** A state.vscdb with Cursor's real table shape, built by the same system sqlite3 the lookup uses. */
+  async function fixtureDb(rows: Record<string, string>): Promise<string> {
+    const root = await mkdtemp(join(tmpdir(), "nomo-cursor-db-"));
+    dirs.push(root);
+    const db = join(root, "state.vscdb");
+    const q = (v: string) => `'${v.replaceAll("'", "''")}'`;
+    execFileSync("sqlite3", [db, [
+      "CREATE TABLE cursorDiskKV (key TEXT UNIQUE ON CONFLICT REPLACE, value BLOB);",
+      ...Object.entries(rows).map(([id, value]) => `INSERT INTO cursorDiskKV VALUES (${q(`composerData:${id}`)}, ${q(value)});`),
+    ].join("\n")]);
+    return db;
+  }
+
+  test("reads `name` by exact conversation id — and nothing else from the record", async () => {
+    const db = await fixtureDb({
+      [CONV]: JSON.stringify({ composerId: CONV, name: "  Flaky retry\ntest fix ", user_email: EMAIL, text: "secret chat body" }),
+      long: JSON.stringify({ name: "word ".repeat(60) }),
+    });
+    expect(cursorChatTitle(CONV, db)).toBe("Flaky retry test fix");
+    expect(cursorChatTitle("long", db)!.length).toBeLessThanOrEqual(81); // the cap every generated title gets
+  });
+
+  test("absent, blank, non-string, malformed, hostile id, missing database → undefined (and nothing is created)", async () => {
+    const db = await fixtureDb({
+      unnamed: JSON.stringify({ composerId: "unnamed" }),
+      blank: JSON.stringify({ name: "   " }),
+      numeric: JSON.stringify({ name: 42 }),
+      object: JSON.stringify({ name: { text: "x" } }),
+      broken: "{ not json",
+    });
+    for (const id of ["unnamed", "blank", "numeric", "object", "broken", "no-such-chat", "x' or '1'='1", ""]) {
+      expect(cursorChatTitle(id, db)).toBeUndefined();
+    }
+    const missing = join(db, "..", "nope.vscdb");
+    expect(cursorChatTitle(CONV, missing)).toBeUndefined();
+    expect(await readdir(join(db, ".."))).toEqual(["state.vscdb"]); // -readonly never creates a file
+    await writeFile(missing, "this is not a database");
+    expect(cursorChatTitle(CONV, missing)).toBeUndefined();
+  });
+
+  test("the hook: never looked up on a prompt; a keep-alive and the stop carry it; a later prompt keeps it", async () => {
+    const h = await harness();
+    const asked: string[] = [];
+    let name: string | undefined;
+    const chatTitle = (id: string) => { asked.push(id); return name; };
+
+    await h.fire(FIXTURES.beforeSubmitPrompt, { chatTitle });
+    expect(asked).toEqual([]); // Cursor waits on this hook
+    expect(await h.lastBlob()).toMatchObject({ title: "Fix the flaky retry test" });
+
+    h.clock.now += 1000;
+    await h.fire(FIXTURES.postToolUse, { chatTitle }); // inside the keep-alive window: no send, no read
+    expect(asked).toEqual([]);
+
+    h.clock.now += CURSOR_KEEPALIVE_MS;
+    await h.fire(FIXTURES.afterFileEdit, { chatTitle }); // no name yet → the first prompt stands
+    expect(asked).toEqual([CONV]);
+    expect(await h.lastBlob()).toMatchObject({ status: "working", title: "Fix the flaky retry test" });
+
+    name = "Flaky retry test fix";
+    await h.fire(FIXTURES.stop, { chatTitle });
+    expect(await h.lastBlob()).toMatchObject({ status: "done", title: "Flaky retry test fix" });
+    expect((await h.record())!.title).toBe("Flaky retry test fix");
+
+    name = undefined; // unreadable from here on: the title already learned is kept, not regressed
+    await h.fire(common("beforeSubmitPrompt", { prompt: "And another thing", generation_id: GEN2 }), { chatTitle });
+    await h.fire(common("stop", { status: "completed", generation_id: GEN2 }), { chatTitle });
+    expect(await h.lastBlob()).toMatchObject({ status: "done", title: "Flaky retry test fix" });
+    expect(JSON.stringify(h.posts) + JSON.stringify(await h.record())).not.toContain(EMAIL);
+  });
+
+  test("the watchdog: a name that lands after the stop → ONE title frame; unchanged or absent → none", async () => {
+    const h = await harness();
+    await h.fire(FIXTURES.beforeSubmitPrompt);
+    await h.fire(FIXTURES.stop);
+    const path = join(h.sessionsDir, `${CONV}.json`);
+    const sent: Record<string, unknown>[] = [];
+    const post = async (body: object) => { sent.push(body as Record<string, unknown>); return "delivered" as const; };
+    const sweep = async (name: string | undefined) => repairTitle(CONFIG, path, CONV, (await h.record())!, { post, resolve: () => name });
+
+    expect(await sweep(undefined)).toBe("uncorrected"); // no name yet (or the CLI: never one)
+    expect(await sweep("Fix the flaky retry test")).toBe("uncorrected"); // same as the record's
+    expect(sent).toHaveLength(0);
+
+    expect(await sweep("Flaky retry test fix")).toBe("corrected");
+    expect(sent).toHaveLength(1);
+    expect(sent[0]).toMatchObject({ sessionId: CONV, op: "done", prio: 0 }); // the row's state is untouched
+    expect(await decryptBlob(KEY, sent[0]!.blob as string)).toMatchObject({ status: "done", title: "Flaky retry test fix", agent: "cursor" });
+    expect((await h.record())!.title).toBe("Flaky retry test fix");
+
+    expect(await sweep("Flaky retry test fix")).toBe("uncorrected"); // the next sweep finds nothing new
+    expect(sent).toHaveLength(1);
+  });
+
+  test("the watchdog only looks at a row that finished moments ago", () => {
+    const now = 100_000_000_000;
+    const rec = (over: Partial<SessionRecord>): SessionRecord => ({
+      pid: 1, machine: "m", label: "l", ts: now - 1000, transcript: "", lastEvent: "done", sentDone: true,
+      op: "done", prio: 0, agent: "cursor", title: "first prompt", ...over,
+    } as SessionRecord);
+    expect(shouldRepairTitle(rec({}), now)).toBe(true);
+    expect(shouldRepairTitle(rec({ lastEvent: "working", op: "update" }), now)).toBe(false); // the hook's frames carry it
+    expect(shouldRepairTitle(rec({ ts: now - CURSOR_TITLE_REPAIR_MS }), now)).toBe(false);
   });
 });
