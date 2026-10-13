@@ -104,7 +104,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "2.3.3";
+var PLUGIN_VERSION = "2.3.4";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -8375,7 +8375,10 @@ function watchdogEventHeaders(config, approvals) {
 }
 var activeLanListener;
 var lanHintPublisher = createLanHintPublisher({ address: () => activeLanListener?.address() ?? null });
-async function postEvent(config, body) {
+var POST_TIMEOUT_MS2 = 2000;
+async function postEvent(config, body, opts = {}) {
+  const started = Date.now();
+  const detail = opts.detail;
   const lanHint = await lanHintPublisher.take(config);
   try {
     const payload = lanHint ? { ...body, lanHint } : body;
@@ -8383,8 +8386,12 @@ async function postEvent(config, body) {
       method: "POST",
       headers: watchdogEventHeaders(config, await localApprovalsState()),
       body: JSON.stringify(payload),
-      signal: AbortSignal.timeout(2000)
+      signal: AbortSignal.timeout(opts.timeoutMs ?? POST_TIMEOUT_MS2)
     });
+    if (detail) {
+      detail.status = res.status;
+      detail.ms = Date.now() - started;
+    }
     const outcome = postOutcomeForStatus(res.status);
     if (lanHint)
       lanHintPublisher.settle(outcome === "delivered");
@@ -8394,7 +8401,11 @@ async function postEvent(config, body) {
       } catch {}
     }
     return outcome;
-  } catch {
+  } catch (e) {
+    if (detail) {
+      detail.error = e?.name === "TimeoutError" ? "timeout" : "network";
+      detail.ms = Date.now() - started;
+    }
     if (lanHint)
       lanHintPublisher.settle(false);
     return "failed";
@@ -9093,6 +9104,8 @@ async function correctIdleClaude(config, path, sessionId, record, now, deps = {}
   }
 }
 var PENDING_DONE_MAX_ATTEMPTS = 5;
+var PENDING_DONE_GRACE_MS = 4000;
+var PENDING_DONE_POST_TIMEOUT_MS = 5000;
 function shouldPendingDoneCheck(record) {
   if (record.donePending !== true)
     return false;
@@ -9101,7 +9114,7 @@ function shouldPendingDoneCheck(record) {
   return true;
 }
 async function correctPendingDone(config, path, sessionId, record, now, deps = {}) {
-  const post = deps.post ?? ((body) => postEvent(config, body));
+  const post = deps.post ?? ((body, detail) => postEvent(config, body, { timeoutMs: PENDING_DONE_POST_TIMEOUT_MS, detail }));
   const writeRecord = deps.writeRecord ?? ((p, rec) => atomicWrite(p, JSON.stringify(rec), 384));
   const reread = deps.readRecord ?? readRecordAt;
   const freshRecord = async () => {
@@ -9115,6 +9128,9 @@ async function correctPendingDone(config, path, sessionId, record, now, deps = {
   try {
     if (!shouldPendingDoneCheck(record))
       return "uncorrected";
+    const age = now - record.ts;
+    if (age >= 0 && age < PENDING_DONE_GRACE_MS)
+      return "pending";
     if (await decisionHoldIsLive(sessionId, now, deps)) {
       traceFocus(deps, { event: "pending-done", sessionId, outcome: "held", delivered: false, held: true });
       return "pending";
@@ -9143,14 +9159,18 @@ async function correctPendingDone(config, path, sessionId, record, now, deps = {
       return "pending";
     }
     const at = typeof record.ts === "number" && Number.isFinite(record.ts) ? Math.floor(record.ts / 1000) : undefined;
-    const outcome = await post(await buildDoneEnvelope(sessionId, record, clock(), config.e2eKey, agent, at));
+    const detail = {};
+    const outcome = await post(await buildDoneEnvelope(sessionId, record, clock(), config.e2eKey, agent, at), detail);
     traceFocus(deps, {
       event: "pending-done",
       sessionId,
       outcome,
       attempts,
       delivered: outcome === "delivered",
-      at
+      at,
+      status: detail.status,
+      error: detail.error,
+      ms: detail.ms
     });
     if (outcome === "revoked")
       return "revoked";
@@ -10061,6 +10081,8 @@ export {
   PLAN_PICKER_VERIFY_MAX_MS,
   PLAN_PICKER_RECENT_DONE_MS,
   PLAN_PICKER_PENDING_MAX_MS,
+  PENDING_DONE_POST_TIMEOUT_MS,
+  PENDING_DONE_GRACE_MS,
   PAIRING_TTL_MS,
   LAN_COMMAND_ID_PREFIX,
   LAN_ANSWER_ECHO_DELAY_MS,

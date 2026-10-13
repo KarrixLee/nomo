@@ -21,7 +21,7 @@ import {
   buildWorkingEnvelope, postOutcomeForStatus, provisionalsCoveredByReal, reconcileProvisionalsSweep, recordMovedSince, resetCommandState, resetDoneAttemptMemory, retireDoneStale,
   setCodexBridgeDown, shouldHeartbeat, shouldIdleProvisionalCheck,
   heartbeatKind, isWaitingSession, CLAUDE_AWAITING_PROMPT_REAP_MS, CLAUDE_IDLE_REAP_MAX_ATTEMPTS, POLL_MS,
-  shouldInterruptCheck, shouldPendingApprovalCheck, shouldPendingDoneCheck, shouldPlanPickerVerificationCheck, shouldRepairTitle, tailShowsInterrupt, titleRepairedRecord,
+  shouldInterruptCheck, shouldPendingApprovalCheck, shouldPendingDoneCheck, PENDING_DONE_GRACE_MS, PENDING_DONE_POST_TIMEOUT_MS, shouldPlanPickerVerificationCheck, shouldRepairTitle, tailShowsInterrupt, titleRepairedRecord,
   watchdogEventHeaders, WAITING_HEARTBEAT_AFTER_MS, withDeadline,
 } from "./cc-watchdog";
 import type { CommandPayload, DrainCommandsDeps, PostOutcome, RecordEntry } from "./cc-watchdog";
@@ -551,6 +551,52 @@ describe("correctPendingDone (re-POST a done whose delivery was never confirmed)
     expect(traces).toEqual([expect.objectContaining({
       event: "pending-done", sessionId: "s2", outcome: "delivered", delivered: true,
     })]);
+  });
+
+  // A 2.00 s "failed" used to be only a guess at a timeout; the line now says which it was.
+  test("the breadcrumb says WHY a send failed: HTTP status, or timeout/network, and how long it took", async () => {
+    const traces: Record<string, unknown>[] = [];
+    const seams = { writeRecord: async () => {}, trace: (e: object) => { traces.push(e as Record<string, unknown>); } };
+    await correctPendingDone(cfg(), "/tmp/s.json", "why-1", owed(), NOW, {
+      ...seams, post: async (_b, d) => { d.error = "timeout"; d.ms = 5001; return "failed" as PostOutcome; },
+    });
+    await correctPendingDone(cfg(), "/tmp/s.json", "why-2", owed(), NOW, {
+      ...seams, post: async (_b, d) => { d.status = 503; d.ms = 120; return "failed" as PostOutcome; },
+    });
+    expect(traces[0]).toMatchObject({ event: "pending-done", outcome: "failed", error: "timeout", ms: 5001 });
+    expect(traces[0].status).toBeUndefined();
+    expect(traces[1]).toMatchObject({ event: "pending-done", outcome: "failed", status: 503, ms: 120 });
+    // Diagnostics only: nothing of the envelope (blob, secrets) may ride along.
+    expect(Object.keys(traces[0]).sort()).toEqual(
+      ["at", "attempts", "delivered", "error", "event", "ms", "outcome", "sessionId", "status"]);
+  });
+
+  // The hook writes the record BEFORE its own 2 s POST; a sweep landing in that window used to re-send
+  // the very done that was still in flight (observed 0.36 s after the Stop) and burn an attempt on it.
+  test("a debt younger than the grace is left alone — the hook's own send may still be in flight", async () => {
+    let posts = 0;
+    const writes: SessionRecord[] = [];
+    const traces: object[] = [];
+    const seams = {
+      post: async () => { posts++; return "delivered" as PostOutcome; },
+      writeRecord: async (_p: string, r: SessionRecord) => { writes.push(r); },
+      trace: (e: object) => { traces.push(e); },
+    };
+    const young = owed({ ts: NOW - 360 });
+    // "pending": the net still OWNS the session this sweep, and the debt stays on the record.
+    expect(await correctPendingDone(cfg(), "/tmp/s.json", "g", young, NOW, seams)).toBe("pending");
+    expect(await correctPendingDone(cfg(), "/tmp/s.json", "g", young, NOW - 360 + PENDING_DONE_GRACE_MS - 1, seams)).toBe("pending");
+    expect([posts, writes.length, traces.length]).toEqual([0, 0, 0]);
+    expect(young.donePending).toBe(true);
+    // Once the hook's 2 s budget is safely past, the same record is paid.
+    expect(await correctPendingDone(cfg(), "/tmp/s.json", "g", young, NOW - 360 + PENDING_DONE_GRACE_MS, seams)).toBe("corrected");
+    expect(posts).toBe(1);
+  });
+
+  test("the corrective send gets more room than a hook's 2 s, and the grace outlasts that 2 s", () => {
+    expect(PENDING_DONE_POST_TIMEOUT_MS).toBe(5000);
+    expect(PENDING_DONE_GRACE_MS).toBeGreaterThan(2000);
+    expect(PENDING_DONE_GRACE_MS).toBeLessThan(POLL_MS); // at most ONE sweep is ever skipped
   });
 
   test("a revoke bubbles up so the loop can tear the pairing down", async () => {

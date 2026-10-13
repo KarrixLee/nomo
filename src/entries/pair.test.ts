@@ -1267,6 +1267,8 @@ describe("statusCmd", () => {
         codexSessionsDir: join(dir, "codex-sessions"), claudeProjectsDir: join(dir, "claude-projects"),
         lastHookClaudePath: join(dir, "lh-claude"), lastHookCodexPath: join(dir, "lh-codex"),
         lastHookOpencodePath: join(dir, "lh-opencode"), noHoldPath: join(dir, "no-hold"),
+        cursorHooksPath: join(dir, "cursor-hooks.json"), cursorProjectsDir: join(dir, "cursor-projects"),
+        lastHookCursorPath: join(dir, "lh-cursor"),
         opencodeStubPaths: [join(dir, "absent-stub.js")],
         codexAppServerAvailable: async () => false, isAlive: () => false,
       });
@@ -1290,6 +1292,8 @@ describe("statusCmd", () => {
       codexSessionsDir: join(dir, "codex-sessions"), claudeProjectsDir: join(dir, "claude-projects"),
       lastHookClaudePath: join(dir, "lh-claude"), lastHookCodexPath: join(dir, "lh-codex"),
       lastHookOpencodePath: join(dir, "lh-opencode"), noHoldPath: join(dir, "no-hold"),
+        cursorHooksPath: join(dir, "cursor-hooks.json"), cursorProjectsDir: join(dir, "cursor-projects"),
+        lastHookCursorPath: join(dir, "lh-cursor"),
         opencodeStubPaths: [join(dir, "absent-stub.js")],
       codexAppServerAvailable: async () => false, isAlive: () => false,
     });
@@ -1319,6 +1323,8 @@ describe("statusCmd", () => {
         codexSessionsDir: join(dir, "codex-sessions"), claudeProjectsDir: join(dir, "claude-projects"),
         lastHookClaudePath: join(dir, "lh-claude"), lastHookCodexPath: join(dir, "lh-codex"),
         lastHookOpencodePath: join(dir, "lh-opencode"), noHoldPath: join(dir, "no-hold"),
+        cursorHooksPath: join(dir, "cursor-hooks.json"), cursorProjectsDir: join(dir, "cursor-projects"),
+        lastHookCursorPath: join(dir, "lh-cursor"),
         opencodeStubPaths: stubPaths, codexAppServerAvailable: async () => false, isAlive: () => false,
       });
       return lines.join("\n");
