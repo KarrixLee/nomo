@@ -1424,6 +1424,43 @@ describe("claudeHeadlessInvocation — Claude desktop app (bundled binary under 
   });
 });
 
+describe("claudeHeadlessInvocation — a session's own daemon spare-shell ring (Claude Code 2.1.296+)", () => {
+  // Captured live: once an interactive session has spawned its background daemon, every later hook
+  // of that session runs in a pre-warmed spare shell under it.
+  const hook = "bun /Users/karrix/.claude/plugins/cache/karrixlee/nomo/2.3.0/plugin/dist/cc-status.mjs";
+  const ring = [
+    "claude bg-spare --bg-spare /tmp/cc-daemon-501/55d18213/spare/0d5a9b0d.claim.sock",
+    "claude bg-pty-host --bg-pty-host /tmp/cc-daemon-501/55d18213/spare/0d5a9b0d.pty.sock 200 50 -- /Users/karrix/.local/share/claude/versions/2.1.296 --bg-spare /tmp/cc-daemon-501/55d18213/spare/0d5a9b0d.claim.sock",
+    '/Users/karrix/.local/bin/claude daemon run --origin transient --spawned-by {"label":"claude","cwd":"/Users/karrix/api-status/nomo","pid":18723}',
+  ];
+
+  test("a ring hanging off an interactive claude is that session, not headless", () => {
+    expect(claudeHeadlessInvocation(hook, [...ring, "claude --resume 4b10f02c-592f-4824-a4fb-4a2ff32732d8", "-zsh"], "cli")).toBe(false);
+    expect(claudeHeadlessInvocation(hook, [...ring, "claude", "-zsh"], "cli")).toBe(false);
+    expect(claudeHeadlessInvocation(hook, [...ring, "/Users/karrix/.local/bin/claude", "/bin/zsh -l"])).toBe(false);
+  });
+
+  test("a ring under a headless claude stays headless", () => {
+    expect(claudeHeadlessInvocation(hook, [...ring, "claude -p 'summarize'", "-zsh"], "cli")).toBe(true);
+    expect(claudeHeadlessInvocation(hook, [...ring, "claude --print", "-zsh"], "cli")).toBe(true);
+    expect(claudeHeadlessInvocation(hook, [...ring, "claude --output-format stream-json --verbose", "-zsh"], "cli")).toBe(true);
+  });
+
+  test("a ring with no claude above the daemon stays headless", () => {
+    expect(claudeHeadlessInvocation(hook, [...ring, "-zsh"], "cli")).toBe(true);
+    expect(claudeHeadlessInvocation(hook, [...ring, "/sbin/launchd"], "cli")).toBe(true);
+    expect(claudeHeadlessInvocation(hook, ring, "cli")).toBe(true);
+    expect(claudeHeadlessInvocation(hook, [...ring, "node /Users/x/.claude-mem/worker-service.js", "claude"], "cli")).toBe(true);
+  });
+
+  test("a ring under a desktop conversation window stays headless (unchanged desktop ordering)", () => {
+    const bundled = "/Users/karrix/Library/Application Support/Claude/claude-code/2.1.296/claude.app/Contents/MacOS/claude";
+    const window = `${bundled} --output-format stream-json --verbose --input-format stream-json`;
+    const desktop = ["/Applications/Claude.app/Contents/Helpers/disclaimer " + bundled, "/Applications/Claude.app/Contents/MacOS/Claude"];
+    expect(claudeHeadlessInvocation(hook, [...ring, window, ...desktop], "claude-desktop")).toBe(true);
+  });
+});
+
 describe("Claude fork/clear lineage classifiers", () => {
   const oldId = "11111111-2222-4333-8444-555555555555";
   const newId = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";

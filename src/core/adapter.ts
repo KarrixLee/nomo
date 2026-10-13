@@ -928,7 +928,11 @@ const CLAUDE_HEADLESS_ARG_TOKENS = new Set(["-p", "--print", "--output-format"])
  *  transient` and the `--bg-pty-host` / `--bg-spare` ring it self-forks with `pinToCurrentBinary`.
  *  These are real flags of the binary, so the DESKTOP-bundled binary forks the same spare ring under
  *  the same `Claude.app` ancestry — the desktop allow-list below must NEVER rescue them. Matched as
- *  SUBSTRINGS against the invoking process AND its ancestor chain. */
+ *  SUBSTRINGS against the invoking process AND its ancestor chain.
+ *  One rescue: since Claude Code 2.1.296 an INTERACTIVE session's own daemon runs every later hook of
+ *  that session in this ring, so a ring whose outermost marker hangs directly off a `claude` with no
+ *  headless token is that session, not a phantom. A ring under a headless claude, a launcher, a shell
+ *  or nothing at all stays headless; so does the desktop window's (its argv is headless-shaped). */
 const CLAUDE_SELF_DAEMON_MARKERS = [
   "daemon run --origin transient",
   "bg-pty-host",
@@ -1061,7 +1065,13 @@ export function claudeHeadlessInvocation(
   entrypoint?: string,
 ): boolean {
   const chain = [selfArgs, ...ancestorArgs].filter((s): s is string => typeof s === "string" && s.length > 0);
-  if (chain.some((args) => CLAUDE_SELF_DAEMON_MARKERS.some((m) => args.includes(m)))) return true;
+  const isRing = (args: string) => CLAUDE_SELF_DAEMON_MARKERS.some((m) => args.includes(m));
+  const ringTop = chain.length - 1 - [...chain].reverse().findIndex(isRing); // chain.length when none
+  if (ringTop < chain.length) {
+    // The ring's owner is the process right above its outermost marker: an interactive claude claims it.
+    const owner = chain[ringTop + 1]?.trim().split(/\s+/) ?? [];
+    if (basename(owner[0] ?? "") !== "claude" || owner.some((tok) => CLAUDE_HEADLESS_ARG_TOKENS.has(tok))) return true;
+  }
   const tokens = typeof selfArgs === "string" ? selfArgs.trim().split(/\s+/) : [];
   // The replay daemon carries neither -p nor --print. The pair is load-bearing: --fork-session alone
   // is a legitimate interactive feature, while --reply-on-resume is the daemon's auto-reply mode.
