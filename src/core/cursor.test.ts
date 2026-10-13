@@ -729,6 +729,21 @@ describe("Cursor's own chat title", () => {
     expect(cursorChatTitle("long", db)!.length).toBeLessThanOrEqual(81); // the cap every generated title gets
   });
 
+  test("the user's sqlite rc (`.headers on`, `.mode box`) cannot reach the title", async () => {
+    const db = await fixtureDb({ [CONV]: JSON.stringify({ name: "Flaky retry test fix" }) });
+    // Both places the CLI looks: ~/.sqliterc and $XDG_CONFIG_HOME/sqlite3/sqliterc (macOS resolves ~
+    // from the passwd entry, not $HOME, so the XDG one is what actually redirects it there).
+    const home = join(db, "..", "home");
+    await mkdir(join(home, "sqlite3"), { recursive: true });
+    const rc = ".headers on\n.mode box\n";
+    await writeFile(join(home, ".sqliterc"), rc);
+    await writeFile(join(home, "sqlite3", "sqliterc"), rc);
+    const env = { ...process.env, HOME: home, XDG_CONFIG_HOME: home };
+    // The fixture is real: the same child environment, without the lookup's flags, IS reshaped.
+    expect(execFileSync("sqlite3", ["-readonly", db, "select 1"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], env }).trim()).not.toBe("1");
+    expect(cursorChatTitle(CONV, db, env)).toBe("Flaky retry test fix");
+  });
+
   test("absent, blank, non-string, malformed, hostile id, missing database → undefined (and nothing is created)", async () => {
     const db = await fixtureDb({
       unnamed: JSON.stringify({ composerId: "unnamed" }),
@@ -799,6 +814,29 @@ describe("Cursor's own chat title", () => {
 
     expect(await sweep("Flaky retry test fix")).toBe("uncorrected"); // the next sweep finds nothing new
     expect(sent).toHaveLength(1);
+  });
+
+  test("the watchdog: a record a hook moved is never answered with the sweep's stale snapshot", async () => {
+    const h = await harness();
+    await h.fire(FIXTURES.beforeSubmitPrompt);
+    await h.fire(FIXTURES.stop);
+    const path = join(h.sessionsDir, `${CONV}.json`);
+    const snapshot = (await h.record())!;
+    const sent: object[] = [];
+    // A new prompt lands DURING the POST: the frame is already out, but the working record stays.
+    const racing = async (body: object) => { sent.push(body); await h.fire(FIXTURES.beforeSubmitPrompt); return "delivered" as const; };
+    await repairTitle(CONFIG, path, CONV, snapshot, { post: racing, resolve: () => "Flaky retry test fix" });
+    expect(sent).toHaveLength(1);
+    const moved = (await h.record())!;
+    expect(moved).toMatchObject({ lastEvent: "working" });
+    expect(moved.title).not.toBe("Flaky retry test fix");
+    expect(moved.blob).not.toBe((sent[0] as { blob: string }).blob);
+
+    // Moved BEFORE the POST (the sweep's snapshot is still the done one): no frame at all.
+    const post = async (body: object) => { sent.push(body); return "delivered" as const; };
+    expect(await repairTitle(CONFIG, path, CONV, snapshot, { post, resolve: () => "Flaky retry test fix" })).toBe("uncorrected");
+    expect(sent).toHaveLength(1);
+    expect(await h.record()).toEqual(moved);
   });
 
   test("the watchdog only looks at a row that finished moments ago", () => {

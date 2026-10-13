@@ -3899,6 +3899,16 @@ describe("interrupt: what the status hook tells Claude Code when the phone asked
     expect(clearsInterruptFlag("SessionEnd")).toBe(true);
   });
 
+  test("a Stop that is not a turn end (a background subagent still in flight) keeps the flag", () => {
+    const stop = (status: string) => clearsInterruptFlag("Stop", { background_tasks: [{ type: "subagent", status }] });
+    expect(stop("running")).toBe(false);
+    expect(stop("pending")).toBe(false);
+    expect(stop("completed")).toBe(true);
+    expect(clearsInterruptFlag("Stop", { background_tasks: [] })).toBe(true);
+    // StopFailure is always the end of the turn, whatever is listed.
+    expect(clearsInterruptFlag("StopFailure", { background_tasks: [{ type: "subagent", status: "running" }] })).toBe(true);
+  });
+
   test("a tool event never clears it (the remaining tool calls in the message must be denied too)", () => {
     expect(clearsInterruptFlag("PreToolUse")).toBe(false);
     expect(clearsInterruptFlag("PostToolUse")).toBe(false);
@@ -3965,7 +3975,17 @@ describe("interrupt: what the status hook tells Claude Code when the phone asked
       expect(await stdoutFor("PreToolUse", { turn_id: "turn-1" })).toBe("");
       expect(await readdir(sessions)).toContain(interruptFlagFileName("int-1"));
 
+      // A Stop with a background subagent still running plans `working`, not a turn end: the interrupt
+      // is still owed, so the flag survives it. A plain Stop and a StopFailure both retire it.
+      expect(await stdoutFor("Stop", { background_tasks: [{ type: "subagent", status: "running" }] })).toBe("");
+      expect(posts.at(-1)?.op).toBe("update");
+      expect(await readdir(sessions)).toContain(interruptFlagFileName("int-1"));
+
       expect(await stdoutFor("Stop")).toBe("");
+      expect(await readdir(sessions)).not.toContain(interruptFlagFileName("int-1"));
+
+      await writeInterruptFlagAt(sessions, "int-1", Date.now());
+      expect(await stdoutFor("StopFailure", { background_tasks: [{ type: "subagent", status: "running" }] })).toBe("");
       expect(await readdir(sessions)).not.toContain(interruptFlagFileName("int-1"));
     } finally {
       server.stop(true);

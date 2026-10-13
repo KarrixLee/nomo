@@ -211,8 +211,11 @@ export function interruptHookOutput(hookName: string): string | null {
 /** Events that end or begin a turn. Any of them retires a pending interrupt: the turn it was aimed at
  *  is over, and it must never reach the next one. StopFailure is Stop's stand-in when the turn dies on
  *  an API error. (Codex's Interrupt never gets here: Codex is not a hook-flag agent.) */
-export function clearsInterruptFlag(hookName: string): boolean {
-  return hookName === "UserPromptSubmit" || hookName === "Stop" || hookName === "StopFailure" || hookName === "SessionEnd";
+export function clearsInterruptFlag(hookName: string, input: Record<string, unknown> = {}): boolean {
+  // Not every Stop is a turn end: with a background subagent still in flight planOp keeps the row
+  // working, so the interrupt is still owed — clearing it there would silently drop it.
+  if (hookName === "Stop") return !hasRunningBackgroundAgent(input);
+  return hookName === "UserPromptSubmit" || hookName === "StopFailure" || hookName === "SessionEnd";
 }
 
 /** The event an interrupted tool hook is reported AS. Claude Code fires no Stop after a hook-stopped
@@ -902,7 +905,7 @@ export async function runHook(agent: AgentKind): Promise<void> {
     // the stop itself can still lag by the event POST's 2-second timeout plus the full-text upload await.
     let interrupted = false;
     if (adapter.interrupt === "hook-flag") {
-      if (clearsInterruptFlag(hookName)) {
+      if (clearsInterruptFlag(hookName, input)) {
         await clearInterruptFlagAt(SESSIONS_DIR, reportedSessionId);
       } else {
         const line = interruptHookOutput(hookName);

@@ -8,7 +8,9 @@ import { readdir as readdir3, stat as stat4, unlink as unlink3 } from "node:fs/p
 
 // src/core/adapter.ts
 import { execFile as execFile2, execFileSync as execFileSync2 } from "node:child_process";
+import { existsSync as existsSync2 } from "node:fs";
 import { readdir, readFile as readFile2, stat as stat2 } from "node:fs/promises";
+import { devNull } from "node:os";
 import { promisify as promisify2 } from "node:util";
 import { basename as basename2, join as join2 } from "node:path";
 
@@ -105,7 +107,7 @@ async function sha256Hex(s) {
 }
 
 // src/core/shared.ts
-var PLUGIN_VERSION = "2.3.4";
+var PLUGIN_VERSION = "2.3.5";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -2824,15 +2826,21 @@ function cursorStateDb() {
 }
 var CURSOR_TITLE_REPAIR_MS = 120000;
 var CURSOR_TITLE_TIMEOUT_MS = 300;
-function cursorChatTitle(sessionId, db = cursorStateDb()) {
+function cursorChatTitle(sessionId, db = cursorStateDb(), env = process.env) {
   if (!/^[A-Za-z0-9_-]{1,128}$/.test(sessionId))
     return;
   try {
-    const out = execFileSync2("sqlite3", [
+    const bin = process.platform === "darwin" && existsSync2("/usr/bin/sqlite3") ? "/usr/bin/sqlite3" : "sqlite3";
+    const out = execFileSync2(bin, [
+      "-init",
+      devNull,
+      "-batch",
+      "-noheader",
+      "-list",
       "-readonly",
       db,
       "select case when json_type(cast(value as text),'$.name')='text' then json_extract(cast(value as text),'$.name') end" + ` from cursorDiskKV where key='composerData:${sessionId}'`
-    ], { timeout: CURSOR_TITLE_TIMEOUT_MS, encoding: "utf8", maxBuffer: 65536, stdio: ["ignore", "pipe", "ignore"] });
+    ], { timeout: CURSOR_TITLE_TIMEOUT_MS, encoding: "utf8", maxBuffer: 65536, stdio: ["ignore", "pipe", "ignore"], env });
     const cleaned = out.replace(/\s+/g, " ").trim();
     return cleaned ? truncateOnWord(cleaned) : undefined;
   } catch {
@@ -3289,8 +3297,10 @@ function interruptHookOutput(hookName) {
   }
   return null;
 }
-function clearsInterruptFlag(hookName) {
-  return hookName === "UserPromptSubmit" || hookName === "Stop" || hookName === "StopFailure" || hookName === "SessionEnd";
+function clearsInterruptFlag(hookName, input = {}) {
+  if (hookName === "Stop")
+    return !hasRunningBackgroundAgent(input);
+  return hookName === "UserPromptSubmit" || hookName === "StopFailure" || hookName === "SessionEnd";
 }
 function interruptedEventInput(input) {
   return { ...input, hook_event_name: "Stop" };
@@ -3607,7 +3617,7 @@ async function runHook(agent) {
     const hookName = typeof input.hook_event_name === "string" ? input.hook_event_name : "";
     let interrupted = false;
     if (adapter2.interrupt === "hook-flag") {
-      if (clearsInterruptFlag(hookName)) {
+      if (clearsInterruptFlag(hookName, input)) {
         await clearInterruptFlagAt(SESSIONS_DIR, reportedSessionId);
       } else {
         const line = interruptHookOutput(hookName);

@@ -13,7 +13,9 @@
 // PORTABILITY: bun AND node >= 18 — no `Bun.*` APIs; file IO via node:fs/promises (shared helpers).
 
 import { execFile, execFileSync } from "node:child_process";
+import { existsSync } from "node:fs";
 import { readdir, readFile, stat } from "node:fs/promises";
+import { devNull } from "node:os";
 import { promisify } from "node:util";
 import { basename, join } from "node:path";
 import { AgentKind, AgentKindWire, CC_DIR, codexHome, cursorHome, folderKeyFromCwd, isRealTty, lastHookPath, pidAlive, pidAncestors, pidCommand, readPrefix, readSuffix, SessionRecord } from "./shared";
@@ -2552,14 +2554,20 @@ const CURSOR_TITLE_TIMEOUT_MS = 300;
  *  the lookup is one unique-index probe — never a scan of that table. Only `name` is extracted, inside
  *  SQLite: the rest of the record (chat content) never enters this process.
  *  Synchronous on purpose — the hook has nothing else to do meanwhile, and the timeout is the bound. */
-export function cursorChatTitle(sessionId: string, db: string = cursorStateDb()): string | undefined {
+export function cursorChatTitle(sessionId: string, db: string = cursorStateDb(), env: NodeJS.ProcessEnv = process.env): string | undefined {
   // The id is spliced into the SQL text (the sqlite3 CLI takes no bound parameters).
   if (!/^[A-Za-z0-9_-]{1,128}$/.test(sessionId)) return undefined;
   try {
-    const out = execFileSync("sqlite3", ["-readonly", db,
+    // `-init <null device>`: the CLI otherwise loads the user's rc (~/.sqliterc, or
+    // $XDG_CONFIG_HOME/sqlite3/sqliterc), where `.headers on` / `.mode box` put the column header (the
+    // SQL text) or box-drawing characters INTO the title. -batch/-noheader/-list pin the rest of the
+    // output shape. macOS ships sqlite3 at a fixed absolute path, which a `.`/empty PATH entry (the cwd
+    // is the workspace) cannot shadow with a repo-planted binary; elsewhere it is a PATH lookup.
+    const bin = process.platform === "darwin" && existsSync("/usr/bin/sqlite3") ? "/usr/bin/sqlite3" : "sqlite3";
+    const out = execFileSync(bin, ["-init", devNull, "-batch", "-noheader", "-list", "-readonly", db,
       "select case when json_type(cast(value as text),'$.name')='text' then json_extract(cast(value as text),'$.name') end" +
       ` from cursorDiskKV where key='composerData:${sessionId}'`,
-    ], { timeout: CURSOR_TITLE_TIMEOUT_MS, encoding: "utf8", maxBuffer: 65_536, stdio: ["ignore", "pipe", "ignore"] });
+    ], { timeout: CURSOR_TITLE_TIMEOUT_MS, encoding: "utf8", maxBuffer: 65_536, stdio: ["ignore", "pipe", "ignore"], env });
     const cleaned = out.replace(/\s+/g, " ").trim();
     return cleaned ? truncateOnWord(cleaned) : undefined; // capped like every other generated title
   } catch {

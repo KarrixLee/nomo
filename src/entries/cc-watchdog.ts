@@ -3048,6 +3048,10 @@ export async function repairTitle(
     };
     if (!await unmoved()) return "uncorrected";
     // Re-POSTing the CURRENT state with the title fixed → `at` is the OBSERVED now (epoch seconds).
+    // The envelope `ts` is now too, NOT record.ts + 1: the worker's lastTs is advanced past record.ts by
+    // a watchdog-reported finish (the interrupt / idle / pending-done nets post their done at "now" and
+    // leave record.ts on the last real event), so a record-derived stamp is strictly older there and the
+    // title frame of a watchdog-finished row is dropped as stale — on a 2xx, so it is never retried.
     const repairNow = Date.now();
     const envelope = await buildTitleRepairEnvelope(sessionId, record, title, repairNow, config.e2eKey, adapter.kind, Math.floor(repairNow / 1000));
     const outcome = await (deps.post ?? ((body: object) => postEvent(config, body)))(envelope);
