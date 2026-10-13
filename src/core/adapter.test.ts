@@ -11,7 +11,7 @@ import {
   codexNewestRolloutForCwd, codexPidPlanPickerEvidence, codexPidPlanPickerState, codexPidTurnActive, codexPlanPickerStateFromTail, codexProposedPlanMarkdown, codexRolloutExistsForSession, codexSentinelSessionId, codexSessionModel,
   codexRolloutCreationEvidence, codexSessionCreationSuppression, codexTailPendingApproval, codexTailPendingAttentionKind, codexTailPendingUserInputDetail, codexTurnActiveFromTail, filterCodexTuis, findProvisionalForPid,
   firstAssistantModel, firstUserPrompt, lastAssistantModel, parseCodexProcs, rolloutMetaCwd,
-  hasInterruptMarker, requestUserInputDetail, rolloutPathFromLsof, sessionTitle, TrackedSessionLite,
+  hasInterruptMarker, requestUserInputDetail, rolloutPathFromLsof, sessionTitle, TrackedSessionLite, unknownAgentAdapter,
 } from "./adapter";
 import type { AgentAdapter, LocateTuiReason } from "./adapter";
 import { folderKeyFromCwd } from "./shared";
@@ -2166,5 +2166,18 @@ describe("hasInterruptMarker (parsed, never inside a tool block)", () => {
       line("user", [{ type: "tool_result", tool_use_id: "toolu_1", content: "…[Request interrupted by user]…" }]),
     ].join("\n");
     expect(claudeAdapter.detectInterrupt(tail)).toBe(false);
+  });
+});
+
+describe("interrupt capability is stated per agent", () => {
+  test("claude stops at the next tool call via the hook flag", () => {
+    expect(claudeAdapter.interrupt).toBe("hook-flag");
+  });
+  test("codex interrupts through the app-server bridge", () => {
+    expect(codexAdapter.interrupt).toBe("app-server");
+  });
+  test("opencode and unknown agents have none", () => {
+    expect(opencodeAdapter.interrupt).toBeUndefined();
+    expect(unknownAgentAdapter("some-future-agent").interrupt).toBeUndefined();
   });
 });

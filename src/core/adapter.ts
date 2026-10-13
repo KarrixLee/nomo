@@ -2240,6 +2240,12 @@ export interface AgentAdapter {
    *  carry its own id (the filename stem is the id) and the codex discovery sentinel encodes the pid
    *  in it. Must never throw. */
   locateTuiPid?(ctx: { sessionId: string; record: SessionRecord }, deps?: LocateTuiDeps): Promise<number | undefined>;
+  /** How a phone "Interrupt" stops this agent's running turn, or absent when it cannot be done.
+   *   "hook-flag"  — the watchdog stamps a per-session flag; the agent's own status hook returns
+   *                  continue:false at the next tool call (Claude Code).
+   *   "app-server" — the watchdog sends turn/interrupt through the Codex app-server bridge.
+   *  The phone mirrors this as CCInterrupt.canInterrupt. */
+  interrupt?: "hook-flag" | "app-server";
 }
 
 export const claudeAdapter: AgentAdapter = {
@@ -2316,6 +2322,7 @@ export const claudeAdapter: AgentAdapter = {
   // session — there is nothing for the watchdog to discover ahead of them.
   // The recorded pid IS the TUI (process.ppid at hook time); it only has to still own a real tty.
   locateTuiPid: (ctx, deps) => claudeLocateTuiPid(ctx, deps),
+  interrupt: "hook-flag",
 };
 
 export const codexAdapter = {
@@ -2403,6 +2410,7 @@ export const codexAdapter = {
   // A codex record's pid may be an app-server host or a discovery sentinel, so locating the TUI is an
   // ordered correlation heuristic that refuses to guess (see codexLocateTuiPid).
   locateTuiPid: (ctx, deps) => codexLocateTuiPid(ctx, deps),
+  interrupt: "app-server",
 } satisfies AgentAdapter;
 
 /** Which live process the phone's `focus-terminal` should raise for an OpenCode session — the DESKTOP
@@ -2505,7 +2513,7 @@ export const opencodeAdapter: AgentAdapter = {
  *
  *  Never registered in `allAdapters` and never reachable from the hook (which resolves its own agent
  *  from its own event) — only from the REBUILD paths, which is exactly where the coercion bug lived. */
-function unknownAgentAdapter(kind: string): AgentAdapter {
+export function unknownAgentAdapter(kind: string): AgentAdapter {
   return {
     kind,
     title: async () => undefined,

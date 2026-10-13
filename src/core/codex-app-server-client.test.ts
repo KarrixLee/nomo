@@ -493,3 +493,43 @@ describe("CodexAppServerClient", () => {
     ]);
   });
 });
+
+describe("interruptTurn (phone asked to stop a running Codex turn)", () => {
+  test("sends turn/interrupt with the thread and turn ids and resolves 'sent' on the reply", async () => {
+    const h = harness();
+    await initialize(h);
+    const transport = h.transports[0];
+
+    const result = h.client.interruptTurn("thread-1", "turn-9");
+    await Promise.resolve();
+    expect(transport.sent[2]).toEqual({
+      method: "turn/interrupt", id: 2, params: { threadId: "thread-1", turnId: "turn-9" },
+    });
+    transport.receive({ id: 2, result: {} });
+    expect(await result).toBe("sent");
+  });
+
+  test("a server error (e.g. -32600 wrong active turn) is 'failed', never a throw", async () => {
+    const h = harness();
+    await initialize(h);
+    const transport = h.transports[0];
+
+    const result = h.client.interruptTurn("thread-1", "stale-turn");
+    await Promise.resolve();
+    transport.receive({ id: 2, error: { code: -32600, message: "expected active turn id" } });
+    expect(await result).toBe("failed");
+    expect(h.errors.map((error) => error.message)).toEqual(["Codex RPC -32600: expected active turn id"]);
+  });
+
+  test("a client that is not ready is 'unavailable' and sends nothing", async () => {
+    const h = harness();
+    await initialize(h);
+    const transport = h.transports[0];
+    await h.client.stop();
+    const before = transport.sent.length;
+
+    expect(await h.client.interruptTurn("thread-1", "turn-9")).toBe("unavailable");
+    expect(transport.sent.length).toBe(before);
+    expect(h.transports).toHaveLength(1);
+  });
+});

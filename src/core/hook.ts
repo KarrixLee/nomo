@@ -8,9 +8,10 @@
 // entries" split; codex-status.ts imports THIS, not cc-status.ts).
 //
 // Reads the hook JSON from stdin, plans a v2 envelope (op + prio + an E2E-encrypted blob), and POSTs
-// it to the Worker, which is a BLIND relay: it never sees plaintext. Contract with the agent: NOTHING
-// on stdout, exit 0 no matter what, give up after 2 seconds — a dead network must never stall or
-// derail a session. cc-status.ts re-exports this module's whole surface, so existing importers/tests
+// it to the Worker, which is a BLIND relay: it never sees plaintext. Contract with the agent: exit 0 no
+// matter what, give up on the network after 2 seconds, and print NOTHING on stdout with ONE exception —
+// a phone interrupt (see interruptHookOutput), which is a single JSON line. A dead network must never
+// stall or derail a session. cc-status.ts re-exports this module's whole surface, so existing importers/tests
 // that reference "./cc-status" are unaffected.
 //
 // PORTABILITY: runs unmodified under bun AND node >= 18. No `Bun.*` APIs — stdin is read via the
@@ -26,8 +27,8 @@ import {
   SessionCreationSuppression, TrackedSessionLite,
 } from "./adapter";
 import {
-  AgentKind, appendFittedPlanAndDebug, atomicWrite, CCOp, CCStatus, codexCompanionBrokerEvidence, Config, decisionHoldFileName, ensureWatchdog, FolderIdentity, folderIdentity, formatPlanPickerDebug, fullTextForRecord, GONE_STRIKE_LIMIT,
-  LAST_SEND_PATH, lastHookPath, loadConfig, loadPendingConfig, localApprovalsState, PENDING_STASH_PATH, PendingEventStash, pidAlive, pidAncestors, pidCommand, PLUGIN_VERSION, postFullText, readDecisionHoldAt, readPrefix,
+  AgentKind, appendFittedPlanAndDebug, atomicWrite, CCOp, CCStatus, clearInterruptFlagAt, codexCompanionBrokerEvidence, Config, decisionHoldFileName, ensureWatchdog, FolderIdentity, folderIdentity, formatPlanPickerDebug, fullTextForRecord, GONE_STRIKE_LIMIT,
+  interruptFlagFileName, interruptFlagSetAt, LAST_SEND_PATH, lastHookPath, loadConfig, loadPendingConfig, localApprovalsState, PENDING_STASH_PATH, PendingEventStash, pidAlive, pidAncestors, pidCommand, PLUGIN_VERSION, postFullText, readDecisionHoldAt, readPrefix,
   readRecord, recordGoneStrike, removeRevokedConfig, resetGoneStrikes, SessionOrigin, SessionRecord, SESSIONS_DIR, sessionBranch, tracePlanPickerDecision, traceSession,
 } from "./shared";
 import { repairNotifyWiring } from "./notify-wire";
@@ -175,6 +176,51 @@ export async function sessionHoldIsLive(
 /// PostToolUse (user answered) falls through to the normal working path. Mirrored by each adapter's
 /// watchdog backstop for the case where this very PreToolUse hook is dropped.
 const USER_BLOCKING_TOOLS = new Set(["AskUserQuestion", "ExitPlanMode", "request_user_input"]);
+
+/** What the Claude Code TUI shows, and what stays in the conversation, when the phone interrupts. */
+export const INTERRUPT_STOP_REASON = "Interrupted from Nomo";
+
+/** The stdout line that stops a Claude Code turn from a tool hook, or null for an event that cannot.
+ *  Verified on Claude Code 2.1.296 (2026-10-12):
+ *   - `continue:false` ends the turn and leaves the session alive at the prompt;
+ *   - from PreToolUse it does NOT block the tool it fired on, hence the explicit deny;
+ *   - no Stop hook fires afterwards (see the planOp remap in runHook).
+ *  PostToolUseFailure is PostToolUse's twin for a tool that errored (a failed tool fires no PostToolUse),
+ *  so it is a tool boundary too: without it a parallel tool failing after the stop would plan `working`
+ *  and flip the interrupted row back, with no Stop left to correct it. It sends the same common-field
+ *  line; NOT device-verified on this event — if a Claude Code ignores it there, the next PreToolUse
+ *  still stops the turn (the flag is not consumed). */
+export function interruptHookOutput(hookName: string): string | null {
+  if (hookName === "PreToolUse") {
+    return JSON.stringify({
+      continue: false,
+      stopReason: INTERRUPT_STOP_REASON,
+      hookSpecificOutput: {
+        hookEventName: "PreToolUse",
+        permissionDecision: "deny",
+        permissionDecisionReason: INTERRUPT_STOP_REASON,
+      },
+    });
+  }
+  if (hookName === "PostToolUse" || hookName === "PostToolUseFailure") {
+    return JSON.stringify({ continue: false, stopReason: INTERRUPT_STOP_REASON });
+  }
+  return null;
+}
+
+/** Events that end or begin a turn. Any of them retires a pending interrupt: the turn it was aimed at
+ *  is over, and it must never reach the next one. StopFailure is Stop's stand-in when the turn dies on
+ *  an API error. (Codex's Interrupt never gets here: Codex is not a hook-flag agent.) */
+export function clearsInterruptFlag(hookName: string): boolean {
+  return hookName === "UserPromptSubmit" || hookName === "Stop" || hookName === "StopFailure" || hookName === "SessionEnd";
+}
+
+/** The event an interrupted tool hook is reported AS. Claude Code fires no Stop after a hook-stopped
+ *  turn, so the event that stopped it stands in for one — for the plan AND for the blob, which reads
+ *  the event name itself (detailForHook) and would otherwise seal a done still labelled with the tool. */
+export function interruptedEventInput(input: Record<string, unknown>): Record<string, unknown> {
+  return { ...input, hook_event_name: "Stop" };
+}
 
 /// The LOCAL op planner (the worker is now blind — lifecycle semantics live here). Maps a hook to a
 /// v2 op, its delivery prio, and the semantic status carried in the blob:
@@ -493,6 +539,7 @@ export async function trackSessionAt(
       // liveness/TTL guards only make such a marker INERT — they do not remove the file. This is the
       // chokepoint where "the session is over" is known, so nothing of it is left behind.
       await unlink(`${sessionsDir}/${decisionHoldFileName(sessionId)}`).catch(() => {});
+      await unlink(`${sessionsDir}/${interruptFlagFileName(sessionId)}`).catch(() => {});
       return;
     }
     // lastEvent is the watchdog interrupt-net's gate key: a fresh `start` is a quiet "sessionStart",
@@ -846,6 +893,30 @@ export async function runHook(agent: AgentKind): Promise<void> {
     const machine = config.machineName ?? hostname().replace(/\.local$/, "");
     const reportedSessionId = input.session_id as string;
     const hookName = typeof input.hook_event_name === "string" ? input.hook_event_name : "";
+    // PHONE INTERRUPT. Placed before every suppression return and before any network call, so a slow or
+    // failed POST can never cost the user their interrupt. Keyed on the REPORTED id: that is the record
+    // file's stem (tool events never take the fork-alias path, which rewrites the id on SessionStart
+    // only), which is what the phone sealed into the command.
+    // This is the one place the status hook writes stdout; the write is awaited so the line is flushed
+    // before the entry's process.exit(0). Claude Code only ACTS on the line once this process exits, so
+    // the stop itself can still lag by the event POST's 2-second timeout plus the full-text upload await.
+    let interrupted = false;
+    if (adapter.interrupt === "hook-flag") {
+      if (clearsInterruptFlag(hookName)) {
+        await clearInterruptFlagAt(SESSIONS_DIR, reportedSessionId);
+      } else {
+        const line = interruptHookOutput(hookName);
+        if (line !== null && await interruptFlagSetAt(SESSIONS_DIR, reportedSessionId, Date.now())) {
+          interrupted = true;
+          // With the reader gone, node raises EPIPE as an unhandled stream 'error' (bun does not), which
+          // would exit 1 before the done is recorded. The listener stays on: resolve either way and carry on.
+          await new Promise<void>((resolve) => {
+            process.stdout.on("error", () => resolve());
+            try { process.stdout.write(`${line}\n`, () => resolve()); } catch { resolve(); }
+          });
+        }
+      }
+    }
     const sessionStartSource = typeof input.source === "string" ? input.source : "";
     const hookPid = process.ppid;
     const hookCommand = pidCommand(hookPid);
@@ -1077,11 +1148,18 @@ export async function runHook(agent: AgentKind): Promise<void> {
     // The Codex turn id (Claude payloads carry none → undefined). Cached on the record so the notify
     // backstop's stale-turn guard can compare it against a delayed notify's payload turn-id.
     const turnId = typeof input.turn_id === "string" && input.turn_id.length > 0 ? input.turn_id : undefined;
-    let plan = planOp(hookName, input, sentDone);
+    // A hook-stopped turn fires NO Stop hook, and its transcript carries no "interrupted by user" line
+    // for the watchdog's net to find — so the event that stops the turn must report the done itself.
+    // The flag is not consumed, so the PostToolUse events of tool calls already in the same message
+    // take this path too and cannot flip the row back to working.
+    // `eventInput` is what buildEnvelope seals; `hookName` keeps the TRUE event for the traces below.
+    if (interrupted) eventInput = interruptedEventInput(eventInput);
+    let plan = planOp(interrupted ? "Stop" : hookName, input, sentDone);
     if (!plan) return;
     // A live approval hold outranks the NOM-67 events — drop the event whole (no record write, no POST)
     // so neither the LAN feed nor the worker's decision overlay loses the card. See yieldsToLiveHold.
-    if (yieldsToLiveHold(hookName, input) && await sessionHoldIsLive(SESSIONS_DIR, sessionId)) {
+    // Not a phone-interrupted event: that one is a turn end, and turn ends land over a hold like Stop.
+    if (!interrupted && yieldsToLiveHold(hookName, input) && await sessionHoldIsLive(SESSIONS_DIR, sessionId)) {
       traceSession({ event: "hold-yield", sessionId, agent, hook_event_name: hookName });
       return;
     }
