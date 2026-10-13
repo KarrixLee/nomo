@@ -5,7 +5,8 @@
 <p align="center">
 <img src="assets/claude.png" height="26" alt="Claude Code">&nbsp;&nbsp;
 <img src="assets/codex.png" height="26" alt="OpenAI Codex">&nbsp;&nbsp;
-<img src="https://img.shields.io/badge/OpenCode-000000" alt="OpenCode">&nbsp;&nbsp;
+<picture><source media="(prefers-color-scheme: dark)" srcset="assets/opencode-dark.png"><img src="assets/opencode-light.png" height="26" alt="OpenCode"></picture>&nbsp;&nbsp;
+<picture><source media="(prefers-color-scheme: dark)" srcset="assets/cursor-dark.png"><img src="assets/cursor-light.png" height="26" alt="Cursor"></picture>&nbsp;&nbsp;
 <img src="https://img.shields.io/badge/License-MIT-blue" alt="License: MIT">
 </p>
 
@@ -235,7 +236,7 @@ encrypted blob is tagged `agent: "codex"`, so the phone can brand it.
 Codex `request_user_input` questions additionally need the Codex task and the Nomo watchdog to share
 one app-server process — see [docs.nomo.gg/sessions/codex](https://docs.nomo.gg/sessions/codex).
 
-## Install — OpenCode
+## <picture><source media="(prefers-color-scheme: dark)" srcset="assets/opencode-dark.png"><img src="assets/opencode-light.png" height="22" align="center" alt=""></picture> Install — OpenCode
 
 OpenCode has no marketplace and no hooks: it loads **one resident plugin module** inside its own
 server process, auto-discovering `{plugin,plugins}/*.{ts,js}` in its config directories. So the
@@ -326,7 +327,7 @@ in something.
 - A session's liveness is the **OpenCode server process**, not the terminal — quit OpenCode to retire
   a row that looks stale.
 
-## Install — Cursor
+## <picture><source media="(prefers-color-scheme: dark)" srcset="assets/cursor-dark.png"><img src="assets/cursor-light.png" height="22" align="center" alt=""></picture> Install — Cursor
 
 One install covers **both** the Cursor desktop app's agent and the `cursor-agent` CLI — they read the
 same user-level hooks file, and Nomo runs one hook binary for both.
