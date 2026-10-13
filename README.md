@@ -205,7 +205,9 @@ Five commands, all namespaced `nomo-cc:` — `pair`, `status`, `approvals`, `res
 The lifecycle hooks (`SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`,
 `Notification`, `PermissionRequest`, `Stop`, `SessionEnd`) are wired automatically by the plugin —
 no `settings.json` edits. The hook is deliberately silent: no pairing → no-op; network down → 2 s
-timeout, exit 0. It cannot affect a Claude Code session.
+timeout, exit 0. It cannot affect a Claude Code session. A send that the timeout cuts off is
+not lost: the hook records the debt and the watchdog re-sends that session's current state a few
+seconds later, so a running session never stays stale on the phone because of one bad request.
 
 ## <img src="assets/codex.png" height="22" align="center" alt=""> Install — OpenAI Codex
 
@@ -334,55 +336,61 @@ bunx nomo-ai --cursor     # or: npx nomo-ai --cursor
 ```
 
 That clones this repo to `~/.nomo` (the same checkout the OpenCode leg uses) and runs
-`plugin/scripts/cursor-install.mjs` from it. To do it by hand from a checkout you already have:
+`plugin/scripts/cursor-install.mjs` from it. From a checkout you already have:
 
 ```sh
 bun build.ts                                  # only if plugin/dist/ is not built
 node plugin/scripts/cursor-install.mjs
 ```
 
-**Restart Cursor** (and any open `cursor-agent`) so it re-reads its hooks, then pair from inside it:
+**Restart Cursor** (and any open `cursor-agent`) so it re-reads its hooks, then `/nomo-pair` from
+inside it. `/nomo-status`, `/nomo-reset` and `/nomo-unpair` are installed next to it as Cursor
+**skills** (`~/.cursor/skills/nomo-*/SKILL.md`) — the one format Cursor documents for the app and
+lists in the CLI's `/` menu. Pairing is shared with the other agents, and needs no restart.
 
-```
-/nomo-pair
-```
+**What the installer writes.** Cursor's plugin format is documented for the desktop app only, so Nomo
+uses the hook source both surfaces read: `~/.cursor/hooks.json` (or `$CURSOR_CONFIG_DIR/hooks.json`).
+That file is yours and may carry other tools' hooks, so the installer **merges**:
 
-`/nomo-status`, `/nomo-reset` and `/nomo-unpair` are installed next to it. They are Cursor **skills**
-(`~/.cursor/skills/nomo-*/SKILL.md`) rather than legacy command files — that is the one format
-Cursor documents for the app and lists in the CLI's `/` menu. Pairing is shared: if this computer is
-already paired from Claude Code, Codex or OpenCode there is nothing to pair, and no restart is needed
-after pairing.
+- it checks first and **refuses before writing anything** if the file is not valid JSON of the
+  expected shape, is a dangling symlink or has more than one hard link, or if it or the skills
+  directory is not writable. A live symlink is written through, not replaced;
+- it appends one entry per event only if that exact entry is absent, adds `"version": 1` only if the
+  key is missing, and never edits, reorders or removes an entry it did not write. An entry is Nomo's
+  only if it sits on one of the eight events below, its command is exactly Nomo's two quoted paths
+  under one checkout, and it has no keys besides `command` and `timeout`;
+- when something does change, the file is re-serialised as 2-space JSON — every entry, its key order
+  and its position kept, hand formatting not. A file that already has the entries is not rewritten;
+- it writes atomically (temp file + rename) with the file's existing permissions, re-reading the file
+  just before the rename so another tool's write in between is merged rather than lost.
 
-**What the installer writes, and what it will not touch.** Cursor has a plugin format, but its docs
-describe it for the desktop app only, so Nomo uses the hook source both surfaces are documented to
-read: `~/.cursor/hooks.json` (or `$CURSOR_CONFIG_DIR/hooks.json`). That file is yours and may already
-carry other tools' hooks, so the installer **merges**:
+The checkout path is written into the hook command and the skills, so a path containing `'`, `"`,
+`$`, `\` or a backtick is refused.
 
-- it checks everything first and **refuses before writing anything** if the file is not valid JSON or
-  not the expected shape, is a dangling symlink or has more than one hard link, or if it (or the
-  skills directory) is not writable. A live symlink is written through, not replaced;
-- it appends one entry per event, only if that exact entry is absent, and adds `"version": 1` only if
-  the key is missing;
-- it never edits, reorders or removes an entry it did not write. An entry counts as Nomo's only if it
-  sits on one of the eight events below, its command is exactly Nomo's two quoted paths under one
-  checkout, and it has no keys besides `command` and `timeout` — anything else, however similar, is
-  yours and survives install and uninstall;
-- when something does change, the file is **re-serialised as 2-space JSON**: every entry, its key
-  order and its position are kept, hand formatting is not. A file that already has the entries is not
-  rewritten at all;
-- it writes atomically (temp file + rename) with the file's existing permissions, and re-reads the
-  file just before the rename so another tool's write in between is merged rather than lost.
+**Events, and what the hook cannot do.** It registers eight — `sessionStart`, `beforeSubmitPrompt`,
+`postToolUse`, `postToolUseFailure`, `afterShellExecution`, `afterFileEdit`, `stop`, `sessionEnd` —
+and **no permission hook** (`preToolUse`, `beforeShellExecution`, …). The hook prints nothing and
+always exits 0, so it cannot allow, deny or redirect anything Cursor does. `beforeSubmitPrompt` is an
+event Cursor waits on, so the hook can **delay** a prompt by one small HTTPS request — up to about
+2 seconds when the relay is unreachable (the send is awaited with a 2-second timeout).
 
-The checkout path is written into the hook command and the skills, so the installer refuses a path
-containing `'`, `"`, `$`, `\` or a backtick.
+### How the Cursor leg works
 
-It registers eight events — `sessionStart`, `beforeSubmitPrompt`, `postToolUse`,
-`postToolUseFailure`, `afterShellExecution`, `afterFileEdit`, `stop`, `sessionEnd` — and no tool,
-shell, MCP or file **permission hook** (`preToolUse`, `beforeShellExecution`, …). The hook prints
-nothing and always exits 0, so it cannot allow, deny or redirect anything Cursor does.
-`beforeSubmitPrompt` is an event Cursor lets a hook block; Nomo's never answers it, but Cursor does
-wait for it, so the hook can **delay** a prompt: by the time one small HTTPS request takes, and up to about
-2 seconds when the Nomo relay cannot be reached (the send is awaited, with a 2-second timeout).
+- **Read-only by construction.** With no permission hook there is nothing to hold and nothing to
+  answer, so a Cursor session is only ever *working* or *done*; the `cursorAdapter` has no
+  `locateTuiPid` seam either, so nothing can point at the window that owns a session.
+- **A row starts at `beforeSubmitPrompt`**, not `sessionStart`, and only a new prompt reopens a
+  stopped turn — subagent activity or a follow-up Cursor starts by itself does not.
+- **The title is Cursor's own chat name**, read as one field from the desktop app's local state
+  database with the system `sqlite3`, read-only, as soon as Cursor has generated it; until then, and
+  for `cursor-agent` chats (which that database does not hold), the row is named after the first prompt.
+- **Liveness is the `stop`/`sessionEnd` pair.** A turn whose `stop` never arrives is marked done after
+  30 quiet minutes; a finished row retires after a little over an hour, and goes back to working if the
+  turn shows activity again.
+- The account email in Cursor's hook payloads is never read and is in no frame, record or log.
+
+What the phone shows for a Cursor session, and the v1 limits, are at
+[docs.nomo.gg/sessions/cursor](https://docs.nomo.gg/sessions/cursor).
 
 To update, run `bunx nomo-ai --cursor` again (it pulls `~/.nomo`; the hook entries point at that
 checkout, so a pull is the whole update). To remove it:
@@ -393,29 +401,6 @@ node ~/.nomo/plugin/scripts/cursor-install.mjs --uninstall
 
 which removes exactly Nomo's hook entries and skills and leaves everything else in `hooks.json` as it
 was. Pairing is untouched — it belongs to every agent on the computer.
-
-### What Cursor does and doesn't do
-
-- **Read-only.** A Cursor session shows on the phone and the Dynamic Island as **working** or
-  **done**, with its folder, branch and model, and it ends when the chat or the CLI does.
-- **No remote approvals.** Cursor's approval prompts stay in Cursor; a Cursor session never shows a
-  "needs you" state on the phone, because nothing in v1 would let you answer it from there.
-- **The title is Cursor's own chat name** — the one on the chat tab — as soon as Cursor has
-  generated it; until then, and whenever it can't be read, the row is named after your first prompt.
-  Nomo reads that one field from the desktop app's local state database (read-only, using the
-  system `sqlite3`) and nothing else from it. `cursor-agent` CLI chats are not stored there, so they
-  keep the first-prompt title.
-- **A row appears at your first prompt**, not when a chat window opens — an empty chat is not a
-  session worth a notification.
-- **Cloud / background agents are not mirrored.**
-- **"Open on Mac" is not available** for Cursor sessions.
-- Your Cursor account email is present in Cursor's hook payloads; Nomo never reads it, and it is in no
-  frame, record or log.
-- If a turn's `stop` hook never arrives, the row is marked done after 30 quiet minutes; a finished row
-  retires on its own after a little over an hour. If that turn then shows activity again, the row goes
-  back to working.
-- **Only your prompt starts a turn.** Once a turn has stopped, the row stays done until you send the
-  next message — activity from subagents, or a follow-up Cursor starts by itself, does not bring it back.
 
 ## Answering from your phone
 
@@ -445,8 +430,10 @@ reappears in the terminal. Nomo can delay a decision; it can never make one for 
 - **Liveness watchdog.** Closing a terminal kills the agent without a clean end event, so a session
   could otherwise show "working" forever. Each event records `sessions/<id>.json` with the agent's
   pid; a single detached `cc-watchdog.mjs` polls every 5 s and POSTs a corrective `end` once that
-  pid is dead (Codex interrupts are detected from the rollout transcript). When no sessions remain
-  it exits; the next hook re-spawns it.
+  pid is dead (Codex interrupts are detected from the rollout transcript). It also settles the
+  hook's undelivered-update debt: a `start`/`update` whose POST was cut off is re-sent within a few
+  seconds, with a 5 s limit so it can't pile up. When no sessions remain it exits; the next hook
+  re-spawns it.
 - **LAN fast path.** When the phone is on the same network, the watchdog hosts a tiny local HTTP
   listener so commands and answers travel direct (<200 ms) instead of waiting to be piggybacked on
   the next relay response (~5–12 s). It is strictly additive: the relay leg runs in parallel and
