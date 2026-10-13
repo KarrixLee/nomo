@@ -28,7 +28,7 @@ import {
 } from "./adapter";
 import {
   AgentKind, appendFittedPlanAndDebug, atomicWrite, CCOp, CCStatus, clearInterruptFlagAt, codexCompanionBrokerEvidence, Config, decisionHoldFileName, ensureWatchdog, FolderIdentity, folderIdentity, formatPlanPickerDebug, fullTextForRecord, GONE_STRIKE_LIMIT,
-  interruptFlagFileName, interruptFlagSetAt, LAST_SEND_PATH, lastHookPath, loadConfig, loadPendingConfig, localApprovalsState, PENDING_STASH_PATH, PendingEventStash, pidAlive, pidAncestors, pidCommand, PLUGIN_VERSION, postFullText, readDecisionHoldAt, readPrefix,
+  interruptFlagFileName, interruptFlagSetAt, LAST_SEND_PATH, lastHookPath, loadConfig, loadPendingConfig, localApprovalsState, PENDING_STASH_PATH, PendingEventStash, pidAlive, pidAncestors, pidCommand, PLUGIN_VERSION, postFullText, readDecisionHoldAt, readPrefix, SEND_FAIL_PATH,
   readRecord, recordGoneStrike, removeRevokedConfig, resetGoneStrikes, SessionOrigin, SessionRecord, SESSIONS_DIR, sessionBranch, tracePlanPickerDecision, traceSession,
 } from "./shared";
 import { repairNotifyWiring } from "./notify-wire";
@@ -678,6 +678,45 @@ export async function markDoneDelivered(sessionId: string): Promise<void> {
   return markDoneDeliveredAt(SESSIONS_DIR, sessionId);
 }
 
+/** Record that the relay's copy of this session is behind: called ONLY when a non-terminal event's POST
+ *  threw (timeout / network), so the watchdog's correctPendingUpdate re-sends the record's current state
+ *  with a longer budget than a hook can afford. Read-modify-write like markDoneDeliveredAt, and keyed on
+ *  `blob` — the one this hook just sealed and wrote — so a NEWER hook's record (whose own POST is still
+ *  deciding) is never stamped with this hook's failure. A done record is left to `donePending`.
+ *  Best-effort: a missed stamp costs what every failed POST cost before this existed. */
+export async function markUpdatePendingAt(sessionsDir: string, sessionId: string, blob: string | undefined): Promise<void> {
+  try {
+    const record = await readRecord(sessionId, sessionsDir);
+    if (!record || !blob || record.blob !== blob || record.op === "done" || record.updatePending === true) return;
+    await atomicWrite(`${sessionsDir}/${sessionId}.json`, JSON.stringify({ ...record, updatePending: true }), 0o600);
+  } catch {
+    // Bookkeeping is best-effort, exactly like trackSession's own write.
+  }
+}
+
+/** Trace a hook's own /cc/event POST failure — `error` (timeout / network) or `status`, plus `ms` —
+ *  ONCE PER FAILURE STREAK, not per event: hooks fire every few seconds and the trace is a 256 KB file.
+ *  A streak is "failures since the last delivered hook POST": it opens when SEND_FAIL_PATH is absent or
+ *  older than LAST_SEND_PATH, which the success path already writes — so a healthy hook does nothing new.
+ *  Returns whether it traced. Never throws. */
+export async function traceSendFailure(
+  event: object, failPath: string = SEND_FAIL_PATH, lastSendPath: string = LAST_SEND_PATH,
+  trace: (event: object) => void = traceSession,
+): Promise<boolean> {
+  try {
+    const stamp = async (path: string): Promise<number> => {
+      try { return Number.parseInt((await readFile(path, "utf8")).trim(), 10) || 0; } catch { return 0; }
+    };
+    const streakStart = await stamp(failPath);
+    if (streakStart > 0 && streakStart > await stamp(lastSendPath)) return false; // streak already traced
+    await atomicWrite(failPath, String(Date.now()));
+    trace({ event: "post-failed", ...event });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /** Reconcile a provisional discovery (see cc-watchdog's discovery step): a real hook has now fired for
  *  this codex TUI, so end + delete any PROVISIONAL session the watchdog surfaced ahead of it. Matches by
  *  pid — the hook's process.ppid is the codex TUI process, which is the provisional's pid (with an
@@ -1293,21 +1332,38 @@ export async function runHook(agent: AgentKind): Promise<void> {
     // REMOVABLE once openai/codex#15269 ships.
     if (agent === "codex") await reconcileProvisional(config, hookPid);
 
-    const res = await fetch(`${config.url}/v1/cc/event`, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "x-cc-pairing": config.pairingId,
-        "x-cc-auth": config.pcSecret,
-        "x-cc-version": PLUGIN_VERSION,
-        // Whether remote approvals are paused ON THIS COMPUTER (`/nomo-cc:approvals off`), so the phone
-        // can stop claiming approvals are on while nothing will ever arrive. Plaintext, never in the
-        // blob; the worker literal-matches "on"/"off" — see localApprovalsState's contract note.
-        "x-cc-approvals": await localApprovalsState(),
-      },
-      body: JSON.stringify(envelope),
-      signal: AbortSignal.timeout(2000),
-    });
+    const failure = { sessionId, agent, hook_event_name: hookName, op: plan.op };
+    const postStarted = Date.now();
+    let res: Response;
+    try {
+      res = await fetch(`${config.url}/v1/cc/event`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-cc-pairing": config.pairingId,
+          "x-cc-auth": config.pcSecret,
+          "x-cc-version": PLUGIN_VERSION,
+          // Whether remote approvals are paused ON THIS COMPUTER (`/nomo-cc:approvals off`), so the phone
+          // can stop claiming approvals are on while nothing will ever arrive. Plaintext, never in the
+          // blob; the worker literal-matches "on"/"off" — see localApprovalsState's contract note.
+          "x-cc-approvals": await localApprovalsState(),
+        },
+        body: JSON.stringify(envelope),
+        signal: AbortSignal.timeout(2000),
+      });
+    } catch (e) {
+      // The POST never got an answer (the 2 s budget, DNS, offline). A done already carries its own
+      // `donePending` debt and an end has no record; anything else would simply be LOST — a running
+      // session's relay copy goes stale and the phone shows "Disconnected?" — so leave the debt for the
+      // watchdog, which can afford a longer timeout than a hook the agent is waiting on.
+      if (plan.op !== "done" && plan.op !== "end") await markUpdatePendingAt(SESSIONS_DIR, sessionId, envelope.blob as string | undefined);
+      await traceSendFailure({
+        ...failure, ms: Date.now() - postStarted,
+        error: (e as { name?: string } | null)?.name === "TimeoutError" ? "timeout" : "network",
+      });
+      return;
+    }
+    if (!res.ok) await traceSendFailure({ ...failure, status: res.status, ms: Date.now() - postStarted });
     if (res.ok) {
       // Success marker for Task 2.2's `status` command: the epoch-ms of the last delivered event. A
       // delivered event also breaks any gone streak (the pairing is plainly alive again).

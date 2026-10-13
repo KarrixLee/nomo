@@ -14,7 +14,7 @@ import {
   claudeTailPendingApproval, codexLastTurnEvent, codexTailPendingApproval, correctIdleClaude, correctInterrupt,
   CODEX_TUI_SESSION_START_SKEW_MS, correlateCodexTuiPid, resolveCodexTuiOwner,
   COMMAND_FUTURE_SKEW_MS, COMMAND_TTL_MS, commandIsFresh,
-  codexBridgeIsDown, correctPendingApproval, correctPendingDone, correctPlanPickerVerification, correctResolvedPlanPicker, createBridgeSupervisor, discoverLiveSessions, drainCommands, effectiveDoneAttempts, extractCommands, goneStrikeShouldTeardown,
+  codexBridgeIsDown, correctPendingApproval, correctPendingDone, correctPendingUpdate, noteResend, resendAllowed, resendBackoffMs, resetResendBackoff, RESEND_BACKOFF_MAX_MS, correctPlanPickerVerification, correctResolvedPlanPicker, createBridgeSupervisor, discoverLiveSessions, drainCommands, effectiveDoneAttempts, extractCommands, goneStrikeShouldTeardown,
   enforceWatchdogOwnership, hasInterruptMarker, IDLE_GRACE_MS, isClaudeIdleReapEligible, isRetireEligible, isRightfulWatchdogOwner, lastTurnLine, PAIRING_TTL_MS, pendingDoneRetryWrite,
   pendingDoneSettleWrite, pendingPairingExpired, planPickerPendingExpired, PLAN_PICKER_PENDING_MAX_MS, pruneStaleDecisionHolds,
   PLAN_PICKER_RECENT_DONE_MS, PLAN_PICKER_VERIFY_MAX_MS, RETIRE_AFTER_MS,
@@ -24,7 +24,7 @@ import {
   shouldInterruptCheck, shouldPendingApprovalCheck, shouldPendingDoneCheck, PENDING_DONE_GRACE_MS, PENDING_DONE_POST_TIMEOUT_MS, shouldPlanPickerVerificationCheck, shouldRepairTitle, tailShowsInterrupt, titleRepairedRecord,
   watchdogEventHeaders, WAITING_HEARTBEAT_AFTER_MS, withDeadline,
 } from "./cc-watchdog";
-import type { CommandPayload, DrainCommandsDeps, PostOutcome, RecordEntry } from "./cc-watchdog";
+import type { CommandPayload, DrainCommandsDeps, PostDetail, PostOutcome, RecordEntry } from "./cc-watchdog";
 import { resolveOnRelay } from "../core/codex-remote-input";
 import { CODEX_PROXY_STDOUT_ENDED } from "../core/codex-proxy-transport";
 import { buildStatePlaintext, STATE_HOLD_MAX_AGE_MS } from "../core/session-state";
@@ -4570,5 +4570,116 @@ describe("heartbeatKind (both cadences at once)", () => {
     }
     expect(beats).toBeLessThanOrEqual(12);
     expect(beats).toBeGreaterThan(0);
+  });
+});
+
+// A running session whose hook POST threw (timeout / network) leaves `updatePending` on its record; this
+// net re-sends the record's CURRENT blob and clears the debt on a 2xx.
+describe("correctPendingUpdate (re-send a running session's state the relay never received)", () => {
+  const NOW = 9_000_000;
+  const TS = NOW - 3_000;
+  const owed = (over: Partial<SessionRecord> = {}): SessionRecord =>
+    rec({ lastEvent: "working", op: "update", prio: 0, blob: "CURRENT", pairingId: "p", updatePending: true, ts: TS, ...over });
+  /** A one-record "disk" plus a recording poster. */
+  const world = (disk: SessionRecord | null, outcome: PostOutcome = "delivered", detail: PostDetail = { status: 200, ms: 2837 }) => {
+    const w = {
+      disk, posts: [] as Record<string, unknown>[], traces: [] as Record<string, unknown>[],
+      seams: {
+        readRecord: async () => w.disk,
+        writeRecord: async (_p: string, r: SessionRecord) => { w.disk = JSON.parse(JSON.stringify(r)); },
+        post: async (b: object, d: PostDetail) => { w.posts.push(b as Record<string, unknown>); Object.assign(d, detail); return outcome; },
+        trace: (e: object) => { w.traces.push(e as Record<string, unknown>); },
+        readDecisionHoldFn: async () => null,
+      },
+    };
+    return w;
+  };
+  beforeEach(() => resetResendBackoff());
+  afterEach(() => resetResendBackoff());
+
+  test("delivered → re-sends the CURRENT blob under the record's op/prio/ts, clears only the marker, traces why", async () => {
+    const w = world(owed());
+    expect(await correctPendingUpdate(cfg(), "/tmp/s.json", "s", owed(), NOW, { ...w.seams, now: () => NOW + 7 })).toBe("corrected");
+    expect(w.posts).toEqual([{ v: 2, sessionId: "s", op: "update", prio: 0, ts: NOW + 7, blob: "CURRENT" }]);
+    expect(w.disk).toEqual(JSON.parse(JSON.stringify(owed({ updatePending: undefined }))));
+    expect(w.traces).toEqual([expect.objectContaining({ event: "pending-update", outcome: "delivered", delivered: true, status: 200, ms: 2837, backoffMs: 0 })]);
+  });
+
+  test("the resend is stamped NOW, strictly later than the record's ts, so the relay cannot drop it as stale", async () => {
+    // The relay drops a non-terminal frame with ts <= lastTs, and it may already hold the original event
+    // (stored, then cancelled before the push) — a record-stamped resend would be a silent no-op.
+    const w = world(owed());
+    const before = Date.now();
+    await correctPendingUpdate(cfg(), "/tmp/s.json", "s", owed(), NOW, w.seams); // default clock
+    expect(w.posts[0].ts as number).toBeGreaterThan(TS);
+    expect(w.posts[0].ts as number).toBeGreaterThanOrEqual(before);
+    expect(w.disk!.ts).toBe(TS); // the record's own event clock is never rewritten by a resend
+  });
+
+  test("healthy path: no marker, or a terminal record → nothing read, posted or written", async () => {
+    for (const r of [owed({ updatePending: undefined }), owed({ op: "done", lastEvent: "done" })]) {
+      const w = world(r);
+      expect(await correctPendingUpdate(cfg(), "/tmp/s.json", "s", r, NOW, w.seams)).toBe("uncorrected");
+      expect(w.posts).toHaveLength(0);
+      expect(w.disk).toBe(r);
+    }
+  });
+
+  test("a newer hook write BEFORE the POST wins: nothing is sent from the stale snapshot", async () => {
+    const newer = owed({ ts: TS + 1_000, blob: "NEWER", updatePending: undefined });
+    const w = world(newer);
+    expect(await correctPendingUpdate(cfg(), "/tmp/s.json", "s", owed(), NOW, w.seams)).toBe("uncorrected");
+    expect(w.posts).toHaveLength(0);
+    expect(w.disk).toBe(newer);
+  });
+
+  test("a newer hook write DURING the POST wins: its record — and its own debt — are left untouched", async () => {
+    const newer = owed({ ts: TS + 1_000, blob: "NEWER" }); // that hook's POST failed too → its own marker
+    const w = world(owed());
+    w.seams.post = async (b) => { w.posts.push(b as Record<string, unknown>); w.disk = newer; return "delivered"; };
+    expect(await correctPendingUpdate(cfg(), "/tmp/s.json", "s", owed(), NOW, w.seams)).toBe("corrected");
+    expect(w.disk).toBe(newer);
+    expect(newer.updatePending).toBe(true);
+  });
+
+  test("a live approval hold defers the resend: nothing posted, debt kept", async () => {
+    const w = world(owed({ lastEvent: "needsAttention", prio: 1 }));
+    const v = await correctPendingUpdate(cfg(), "/tmp/s.json", "s", w.disk!, NOW, {
+      ...w.seams,
+      readDecisionHoldFn: async () => ({ blob: "CARD", pid: 77, at: NOW - 1_000 }),
+      holdPidAliveFn: () => true,
+    });
+    expect(v).toBe("uncorrected");
+    expect(w.posts).toHaveLength(0);
+    expect(w.disk!.updatePending).toBe(true);
+  });
+
+  test("a failed resend keeps the debt and backs the whole pairing off, doubling to a cap; a delivery resets it", async () => {
+    const w = world(owed(), "failed", { error: "timeout", ms: 5000 });
+    expect(await correctPendingUpdate(cfg(), "/tmp/s.json", "s", owed(), NOW, w.seams)).toBe("pending");
+    expect(w.disk!.updatePending).toBe(true);
+    expect(w.traces[0]).toMatchObject({ outcome: "failed", delivered: false, error: "timeout", ms: 5000, backoffMs: 5_000 });
+    // Inside the window NO session of the pairing is tried — an offline Mac pays for one send, not N.
+    expect(await correctPendingUpdate(cfg(), "/tmp/other.json", "other", owed(), NOW + 4_999, w.seams)).toBe("uncorrected");
+    expect(w.posts).toHaveLength(1);
+    expect(await correctPendingUpdate(cfg(), "/tmp/s.json", "s", owed(), NOW + 5_000, w.seams)).toBe("pending");
+    expect(w.traces[1]).toMatchObject({ backoffMs: 10_000 });
+    expect([1, 2, 3, 4, 5, 6, 60].map(resendBackoffMs)).toEqual([5_000, 10_000, 20_000, 40_000, RESEND_BACKOFF_MAX_MS, RESEND_BACKOFF_MAX_MS, RESEND_BACKOFF_MAX_MS]);
+    expect(resendAllowed(NOW + 14_999)).toBe(false);
+    expect(noteResend(true, NOW + 15_000)).toBe(0);
+    expect(resendAllowed(NOW + 15_000)).toBe(true);
+  });
+
+  test("a blob sealed under a pairing that is gone can never be sent → the debt is dropped, nothing posted", async () => {
+    const w = world(owed({ pairingId: "old" }));
+    expect(await correctPendingUpdate(cfg(), "/tmp/s.json", "s", w.disk!, NOW, w.seams)).toBe("uncorrected");
+    expect(w.posts).toHaveLength(0);
+    expect(w.disk).not.toHaveProperty("updatePending");
+  });
+
+  test("revoked bubbles up without arming the back-off", async () => {
+    const w = world(owed(), "revoked", { status: 404 });
+    expect(await correctPendingUpdate(cfg(), "/tmp/s.json", "s", owed(), NOW, w.seams)).toBe("revoked");
+    expect(resendAllowed(NOW)).toBe(true);
   });
 });
