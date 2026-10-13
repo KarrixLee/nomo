@@ -11,7 +11,7 @@ import {
 import {
   aiTitle, buildBlob, buildEnvelope, buildPendingStash, cleanPromptTitle, clearsInterruptFlag, codexIndexTitle, codexSessionTitle,
   codexThreadName, detailForHook, firstUserPrompt, INTERRUPT_STOP_REASON, interruptedEventInput, interruptHookOutput, isPermissionNotification, planOp, sessionTitle,
-  markDoneDeliveredAt, SESSION_TRACE_PATH, sessionHoldIsLive, stashPendingEvent, trackSessionAt, transcriptStartMs, yieldsToLiveHold,
+  markDoneDeliveredAt, markUpdatePendingAt, SESSION_TRACE_PATH, traceSendFailure, sessionHoldIsLive, stashPendingEvent, trackSessionAt, transcriptStartMs, yieldsToLiveHold,
 } from "./cc-status";
 import { provisionalsCoveredByReal, reconcileProvisionalsSweep } from "./cc-watchdog";
 import { hooksAppearStale, parseCodexPluginState, parseLanTrace, renderLanTrace, statusCmd } from "./status-cmd";
@@ -1316,6 +1316,40 @@ describe("trackSession + readRecord file glue (sentDone survives a fresh disk re
   // "a done was RECORDED"; `donePending` is the separate, pessimistic "…and nobody has confirmed the
   // worker got it". The two must not be conflated: sentDone keeps driving planOp's re-arm and
   // codex-notify's dedupe, while only the marker drives the watchdog's re-POST.
+  test("markUpdatePendingAt stamps the debt only on this hook's own non-terminal record; the next event drops it", async () => {
+    const sessionId = `test-debt-${randomUUID()}`;
+    await trackSessionAt(glueSessions, sessionId, "update", 0, "working", "MINE", "mac", "proj", "/tmp/t.jsonl");
+    await markUpdatePendingAt(glueSessions, sessionId, "OLDER"); // a newer hook already rewrote the record
+    expect((await readRecord(sessionId, glueSessions))?.updatePending).toBeUndefined();
+    await markUpdatePendingAt(glueSessions, sessionId, "MINE");
+    expect(await readRecord(sessionId, glueSessions)).toMatchObject({ updatePending: true, blob: "MINE", op: "update" });
+    // trackSession rebuilds the record whole → the next event starts with no debt.
+    await trackSessionAt(glueSessions, sessionId, "update", 0, "working", "NEXT", "mac", "proj", "/tmp/t.jsonl");
+    expect((await readRecord(sessionId, glueSessions))?.updatePending).toBeUndefined();
+    // A done owes `donePending` instead; a missing record is a no-op.
+    await trackSessionAt(glueSessions, sessionId, "done", 0, "done", "DONE", "mac", "proj", "/tmp/t.jsonl");
+    await markUpdatePendingAt(glueSessions, sessionId, "DONE");
+    expect((await readRecord(sessionId, glueSessions))?.updatePending).toBeUndefined();
+    await markUpdatePendingAt(glueSessions, "absent", "X");
+    expect(await readRecord("absent", glueSessions)).toBeNull();
+  });
+
+  test("traceSendFailure traces once per failure streak; a delivered send (last-send) opens the next one", async () => {
+    const failPath = join(glueHome, "last-send-fail");
+    const lastSend = join(glueHome, "last-send");
+    const traced: object[] = [];
+    const fail = () => traceSendFailure({ error: "timeout", ms: 2001 }, failPath, lastSend, (e) => { traced.push(e); });
+    expect(await fail()).toBe(true);
+    expect(await fail()).toBe(false);
+    expect(traced).toEqual([{ event: "post-failed", error: "timeout", ms: 2001 }]);
+    await Bun.sleep(5);
+    await writeFile(lastSend, String(Date.now())); // the hook's success path writes this
+    await Bun.sleep(5);
+    expect(await fail()).toBe(true);
+    expect(await fail()).toBe(false);
+    expect(traced).toHaveLength(2);
+  });
+
   test("a done write stamps donePending alongside sentDone; markDoneDelivered clears ONLY the marker", async () => {
     const sessionId = `test-ack-${randomUUID()}`;
     try {
@@ -1664,6 +1698,46 @@ await child.exited;
       return null;
     }
   }
+
+  test("a hook POST that never gets an answer leaves updatePending + ONE post-failed trace; a healthy POST leaves neither", async () => {
+    const closed = Bun.serve({ port: 0, fetch: () => new Response("{}") });
+    const deadUrl = `http://127.0.0.1:${closed.port}`;
+    await closed.stop(true);
+    const sessionId = "0d0d0d0d-1111-4222-8333-444444444444";
+    const event = (hook_event_name: string) => ({ session_id: sessionId, hook_event_name, cwd: "/x/api-status", prompt: "hi", tool_name: "Bash" });
+    const traces = async (ccDir: string) => (await readFile(join(ccDir, "session-trace.log"), "utf8").catch(() => ""))
+      .split("\n").filter(Boolean).map((l) => JSON.parse(l) as Record<string, unknown>).filter((e) => e.event === "post-failed");
+
+    const dead = await setupHookHome(deadUrl);
+    const server = Bun.serve({ port: 0, fetch: () => new Response("{}", { status: 200 }) });
+    const live = await setupHookHome(`http://127.0.0.1:${server.port}`);
+    try {
+      await spawnHook(claudeEntry, dead.home, event("UserPromptSubmit"));
+      await spawnHook(claudeEntry, dead.home, event("PostToolUse"));
+      expect(await readLocalRecord(dead.sessionsDir, sessionId)).toMatchObject({ updatePending: true, op: "update", lastEvent: "working" });
+      const failed = await traces(dead.ccDir);
+      expect(failed).toHaveLength(1); // once per streak, not per event
+      expect(failed[0]).toMatchObject({ sessionId, hook_event_name: "UserPromptSubmit", op: "update", error: "network" });
+      expect(typeof failed[0].ms).toBe("number");
+      // A failed Stop is the pending-done net's debt, never this one.
+      await spawnHook(claudeEntry, dead.home, event("Stop"));
+      const done = await readLocalRecord(dead.sessionsDir, sessionId);
+      expect(done).toMatchObject({ op: "done", donePending: true });
+      expect(done?.updatePending).toBeUndefined();
+
+      await spawnHook(claudeEntry, live.home, event("UserPromptSubmit"));
+      const healthy = await readLocalRecord(live.sessionsDir, sessionId);
+      expect(healthy).toMatchObject({ op: "update", lastEvent: "working" });
+      expect(healthy?.updatePending).toBeUndefined();
+      expect(await traces(live.ccDir)).toHaveLength(0);
+      expect(await readdir(live.ccDir)).not.toContain("last-send-fail");
+      expect(await readdir(live.ccDir)).toContain("last-send");
+    } finally {
+      await server.stop(true);
+      await rm(dead.home, { recursive: true, force: true });
+      await rm(live.home, { recursive: true, force: true });
+    }
+  });
 
   test("SessionStart source:clear retires the same-pid predecessor and stamps full create origin", async () => {
     const bodies: Array<Record<string, unknown>> = [];

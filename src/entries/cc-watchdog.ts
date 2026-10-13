@@ -2758,6 +2758,125 @@ export async function correctPendingDone(
   }
 }
 
+// --- Undelivered-update reconcile (a RUNNING session's hook POST never got an answer) -----------
+//
+// The pending-done debt above, generalised to the non-terminal events. A hook gives its POST 2 s; on a
+// slow path to the relay (0.4–1.1 s to connect + 2.0–2.8 s to answer, observed 2026-10-13) nearly every
+// one of them times out, and a `working` update has no other courier: the staleness heartbeat is gated on
+// 5 min of hook SILENCE and a busy session is never silent. The relay then hears nothing for 600 s and the
+// island reads "Disconnected?" over a session that is running fine. The hook now stamps `updatePending`
+// when its POST throws (hook.ts markUpdatePendingAt) and this net pays the debt.
+//
+// WHAT IS SENT — the record's CURRENT blob, verbatim, under its current op/prio (buildHeartbeatEnvelope:
+// same bytes the heartbeat and the LAN feed already relay, so it can never invent a state), never the
+// original event. `ts` is NOW, exactly like the staleness heartbeat, and NOT the record's ts: the relay
+// drops a non-terminal frame whose ts is <= its stored lastTs, and the likeliest failure on a slow path
+// is that the relay STORED the original event and was cancelled by the client abort before it pushed —
+// a record-stamped resend would then be dropped as stale and the island would stay "Disconnected?".
+//
+// ACCEPTED RACE — a now-stamped frame outranks anything older, so the record is re-read immediately
+// before the POST and a moved record is never sent. What remains is the few milliseconds in which a newer
+// hook has stamped its envelope but not yet written the record: this resend can then outrank it and the
+// relay keeps the older state until that session's next hook event or beat. No record-side guard narrows
+// it (the newer hook has left nothing on disk yet), and it self-corrects, so it is left as is.
+//
+// BACK-OFF, NOT A CAP — the debt is only worth paying while the session lives, the record is rewritten by
+// the next hook anyway, and an offline Mac must not spend 5 s per indebted session per sweep. So the
+// long-timeout sends (this net and the staleness heartbeat) share ONE pairing-wide clock: a failure
+// doubles the wait (5 s … 60 s), a delivery resets it, and at most one of them is attempted per window.
+
+/** Budget for a debt resend / staleness heartbeat — the corrective-done budget, for the same reason. */
+export const PENDING_UPDATE_POST_TIMEOUT_MS = PENDING_DONE_POST_TIMEOUT_MS;
+
+/** Ceiling on the shared back-off. Well inside the island's 600 s stale-date, so a network that comes
+ *  back is noticed long before the row would read disconnected. */
+export const RESEND_BACKOFF_MAX_MS = 60_000;
+
+/** How long to stand down after `failures` consecutive failed long-timeout sends. Pure. */
+export function resendBackoffMs(failures: number): number {
+  return failures <= 0 ? 0 : Math.min(POLL_MS * 2 ** (failures - 1), RESEND_BACKOFF_MAX_MS);
+}
+
+/** The pairing-wide back-off clock (in-memory, like waitingBeatAt: it throttles this process's sends). */
+const resendBackoff = { failures: 0, nextAt: 0 };
+
+/** May a long-timeout send go out at `now`? */
+export function resendAllowed(now: number): boolean {
+  return now >= resendBackoff.nextAt;
+}
+
+/** Feed one long-timeout send's result into the back-off. Returns the wait it armed (0 on delivery). */
+export function noteResend(delivered: boolean, now: number): number {
+  resendBackoff.failures = delivered ? 0 : resendBackoff.failures + 1;
+  const wait = resendBackoffMs(resendBackoff.failures);
+  resendBackoff.nextAt = delivered ? 0 : now + wait;
+  return wait;
+}
+
+/** Test-only reset of the back-off (mirrors what a fresh daemon starts with). */
+export function resetResendBackoff(): void {
+  resendBackoff.failures = 0;
+  resendBackoff.nextAt = 0;
+}
+
+/** Gate: does this record owe the relay an update? A terminal row is the pending-done net's business
+ *  (a corrective that pinned `done` over a marked record leaves an inert marker the next hook drops). */
+export function shouldPendingUpdateCheck(record: SessionRecord): boolean {
+  return record.updatePending === true && record.op !== "done" && record.lastEvent !== "done"
+    && typeof record.ts === "number" && Number.isFinite(record.ts);
+}
+
+/** The undelivered-update reconcile for one tracked session. Returns "corrected" (a 2xx — the relay is
+ *  current, debt cleared) / "pending" (sent, not delivered: back-off armed, debt kept) / "uncorrected"
+ *  (nothing sent this sweep) / "revoked".
+ *
+ *  NEVER OVER A LIVE APPROVAL: while a decision hold is live the relay's truth is the hold's own card,
+ *  not this record, so the resend is deferred (the debt is durable) exactly as the done nets defer.
+ *  NEVER A STALE SNAPSHOT: the record is re-read immediately before the POST and again before the clear,
+ *  and a record a hook has moved since is left alone — that hook's own POST (or its own debt) owns it. */
+export async function correctPendingUpdate(
+  config: Config, path: string, sessionId: string, record: SessionRecord, now: number, deps: PendingDoneDeps = {},
+): Promise<"corrected" | "pending" | "uncorrected" | "revoked"> {
+  const post = deps.post ?? ((body: object, detail: PostDetail) =>
+    postEvent(config, body, { timeoutMs: PENDING_UPDATE_POST_TIMEOUT_MS, detail }));
+  const writeRecord = deps.writeRecord
+    ?? ((p: string, rec: SessionRecord) => atomicWrite(p, JSON.stringify(rec), 0o600));
+  const reread = deps.readRecord ?? readRecordAt;
+  try {
+    if (!shouldPendingUpdateCheck(record) || !resendAllowed(now)) return "uncorrected";
+    // Untraced, unlike pending-done's hold line: a hold can stay open for an hour of 5 s sweeps.
+    if (await decisionHoldIsLive(sessionId, now, deps)) return "uncorrected";
+    const fresh = await reread(path);
+    if (!fresh || recordMovedSince(record, fresh) || !shouldPendingUpdateCheck(fresh)) return "uncorrected";
+    const envelope = buildHeartbeatEnvelope(sessionId, fresh, (deps.now ?? Date.now)(), config.pairingId);
+    if (!envelope) {
+      // No blob, or one sealed under a pairing that is gone: unsendable forever → drop the debt.
+      await writeRecord(path, { ...fresh, updatePending: undefined });
+      return "uncorrected";
+    }
+    const detail: PostDetail = {};
+    const outcome = await post(envelope, detail);
+    const delivered = outcome === "delivered";
+    const backoffMs = outcome === "revoked" ? undefined : noteResend(delivered, now);
+    traceFocus(deps, {
+      event: "pending-update", sessionId, outcome, delivered, op: fresh.op, lastEvent: fresh.lastEvent,
+      status: detail.status, error: detail.error, ms: detail.ms, backoffMs,
+    });
+    if (outcome === "revoked") return "revoked";
+    if (!delivered) return "pending";
+    // Clear ONLY the marker, on the record as it is NOW — and only if no hook moved it during the POST.
+    const after = await reread(path);
+    if (after && !recordMovedSince(fresh, after) && after.updatePending === true) {
+      try { await writeRecord(path, { ...after, updatePending: undefined }); } catch {
+        // Clear didn't land → one redundant resend of the same blob next sweep.
+      }
+    }
+    return "corrected";
+  } catch {
+    return "uncorrected";
+  }
+}
+
 // --- Idle-done retire (free the worker cap slot a long-idle done row still occupies) -----------
 //
 // v1.1.6 froze the reap's blob `at` so a resumed-but-idle session AGES OUT of the phone's
@@ -3448,18 +3567,35 @@ async function sweep(config: Config | null, deps: SweepDeps = {}): Promise<Sweep
           if (titleFix === "revoked") return { revoked: true };
           if (titleFix === "corrected") { delivered = true; repairedTitle = true; }
         }
-        const beatKind = heartbeatKind(
-          record, now, heartbeatAt.get(sessionId), waitingBeatAt,
-          idleFix === "corrected" || planResolutionHandled || interruptHandled || flaggedAttention || reapedIdle || repairedTitle,
-          pairingIsNew,
-        );
-        if (beatKind !== "none") {
+        const netOwned = idleFix === "corrected" || planResolutionHandled || interruptHandled || flaggedAttention || reapedIdle || repairedTitle;
+        // Undelivered-update debt (see correctPendingUpdate): only for a session no net above took this
+        // sweep. A resend IS this sweep's beat — it carries the same blob — so the heartbeat stands down.
+        let resent = false;
+        if (!netOwned) {
+          const pendingUpdate = await correctPendingUpdate(config, path, sessionId, record, now);
+          if (pendingUpdate === "revoked") return { revoked: true };
+          if (pendingUpdate === "corrected") delivered = true;
+          resent = pendingUpdate === "corrected" || pendingUpdate === "pending";
+        }
+        const beatKind = heartbeatKind(record, now, heartbeatAt.get(sessionId), waitingBeatAt, netOwned || resent, pairingIsNew);
+        // The staleness beat is the ONLY thing keeping a hook-quiet session's stale-date armed, so it gets
+        // the long budget (the default 2 s loses to a relay that answers in 2–3 s) and, in exchange,
+        // shares the debt net's back-off so an offline Mac is not charged 5 s per quiet session per sweep.
+        const slow = beatKind === "stale";
+        if (beatKind !== "none" && !(slow && !resendAllowed(now))) {
           const beat = buildHeartbeatEnvelope(sessionId, record, Date.now(), config.pairingId);
           // delivered only: a failed heartbeat mutates NOTHING (not the record, not even the throttle),
           // so quietness stays true and it's retried next sweep. A record with no stored blob yields
           // a null envelope — nothing to send, so it simply isn't heartbeated.
           if (beat) {
-            const outcome = await postEvent(config, beat);
+            const detail: PostDetail = {};
+            const outcome = await postEvent(config, beat, slow ? { timeoutMs: PENDING_UPDATE_POST_TIMEOUT_MS, detail } : {});
+            if (slow && outcome !== "revoked") {
+              const backoffMs = noteResend(outcome === "delivered", now);
+              if (outcome !== "delivered") {
+                traceFocus({}, { event: "heartbeat", sessionId, outcome, status: detail.status, error: detail.error, ms: detail.ms, backoffMs });
+              }
+            }
             if (outcome === "revoked") return { revoked: true };
             if (outcome === "delivered") {
               heartbeatAt.set(sessionId, now); // a fast beat IS a heartbeat — it advances both clocks

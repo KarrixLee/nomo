@@ -174,6 +174,9 @@ export const SESSIONS_DIR = `${CC_DIR}/sessions`;
 export const WATCHDOG_PID_PATH = `${CC_DIR}/watchdog.pid`;
 /** The hook touches this (epoch-ms text) after a successful POST; Task 2.2's status command reads it. */
 export const LAST_SEND_PATH = `${CC_DIR}/last-send`;
+/** Epoch-ms of the hook POST failure that OPENED the current failure streak (see hook.ts
+ *  traceSendFailure). A streak ends when LAST_SEND_PATH is next written, so nothing ever clears this. */
+export const SEND_FAIL_PATH = `${CC_DIR}/last-send-fail`;
 /** Consecutive "pairing is gone" strike counter (small integer text), sitting next to LAST_SEND_PATH.
  *  The hook's POST path increments this on a 404/410 response and tears the pairing down at
  *  GONE_STRIKE_LIMIT, so a revoked pairing stops POSTing forever instead of 404ing on every tool use.
@@ -1051,6 +1054,13 @@ export interface SessionRecord {
    *  this session was a done") because planOp's re-arm (SessionStart + sentDone → op:update) and
    *  codex-notify's double-send dedupe both key on it. Absent → nothing owed. */
   donePending?: boolean;
+  /** True while the relay's copy of this (non-terminal) session is BEHIND this record: the hook wrote
+   *  the record, then its own POST threw (timeout / network — never an HTTP response). Unlike
+   *  `donePending` it is stamped only ON that failure (hook.ts markUpdatePending), so a healthy hook
+   *  writes nothing extra; trackSession rebuilds the record whole, so the next hook event drops it and
+   *  its own POST decides afresh. The watchdog's correctPendingUpdate re-sends the record's current
+   *  blob and clears it on a 2xx. Absent → nothing owed. */
+  updatePending?: boolean;
   /** True only when a Codex turn completion was reclassified as the client-side Plan picker. The
    *  watchdog uses this explicit provenance marker to clear needsAttention on later rollout progress
    *  without touching an ordinary permission/question attention episode. */

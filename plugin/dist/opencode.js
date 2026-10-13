@@ -81,7 +81,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "2.3.5";
+var PLUGIN_VERSION = "2.3.6";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -131,6 +131,7 @@ function tracePlanPickerDecision(sessionId, decision, path) {
 var SESSIONS_DIR = `${CC_DIR}/sessions`;
 var WATCHDOG_PID_PATH = `${CC_DIR}/watchdog.pid`;
 var LAST_SEND_PATH = `${CC_DIR}/last-send`;
+var SEND_FAIL_PATH = `${CC_DIR}/last-send-fail`;
 var GONE_STRIKES_PATH = `${CC_DIR}/gone-strikes`;
 var GONE_STRIKE_LIMIT = 2;
 var NO_HOLD_PATH = `${CC_DIR}/no-hold`;
@@ -2742,6 +2743,33 @@ async function markDoneDeliveredAt(sessionsDir, sessionId) {
 async function markDoneDelivered(sessionId) {
   return markDoneDeliveredAt(SESSIONS_DIR, sessionId);
 }
+async function markUpdatePendingAt(sessionsDir, sessionId, blob) {
+  try {
+    const record = await readRecord(sessionId, sessionsDir);
+    if (!record || !blob || record.blob !== blob || record.op === "done" || record.updatePending === true)
+      return;
+    await atomicWrite(`${sessionsDir}/${sessionId}.json`, JSON.stringify({ ...record, updatePending: true }), 384);
+  } catch {}
+}
+async function traceSendFailure(event, failPath = SEND_FAIL_PATH, lastSendPath = LAST_SEND_PATH, trace = traceSession) {
+  try {
+    const stamp = async (path) => {
+      try {
+        return Number.parseInt((await readFile4(path, "utf8")).trim(), 10) || 0;
+      } catch {
+        return 0;
+      }
+    };
+    const streakStart = await stamp(failPath);
+    if (streakStart > 0 && streakStart > await stamp(lastSendPath))
+      return false;
+    await atomicWrite(failPath, String(Date.now()));
+    trace({ event: "post-failed", ...event });
+    return true;
+  } catch {
+    return false;
+  }
+}
 async function reconcileProvisional(config, hookPid) {
   try {
     const files = await readdir2(SESSIONS_DIR).catch(() => []);
@@ -3101,18 +3129,34 @@ async function runHook(agent) {
     ensureWatchdog();
     if (agent === "codex")
       await reconcileProvisional(config, hookPid);
-    const res = await fetch(`${config.url}/v1/cc/event`, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "x-cc-pairing": config.pairingId,
-        "x-cc-auth": config.pcSecret,
-        "x-cc-version": PLUGIN_VERSION,
-        "x-cc-approvals": await localApprovalsState()
-      },
-      body: JSON.stringify(envelope),
-      signal: AbortSignal.timeout(2000)
-    });
+    const failure = { sessionId, agent, hook_event_name: hookName, op: plan.op };
+    const postStarted = Date.now();
+    let res;
+    try {
+      res = await fetch(`${config.url}/v1/cc/event`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-cc-pairing": config.pairingId,
+          "x-cc-auth": config.pcSecret,
+          "x-cc-version": PLUGIN_VERSION,
+          "x-cc-approvals": await localApprovalsState()
+        },
+        body: JSON.stringify(envelope),
+        signal: AbortSignal.timeout(2000)
+      });
+    } catch (e) {
+      if (plan.op !== "done" && plan.op !== "end")
+        await markUpdatePendingAt(SESSIONS_DIR, sessionId, envelope.blob);
+      await traceSendFailure({
+        ...failure,
+        ms: Date.now() - postStarted,
+        error: e?.name === "TimeoutError" ? "timeout" : "network"
+      });
+      return;
+    }
+    if (!res.ok)
+      await traceSendFailure({ ...failure, status: res.status, ms: Date.now() - postStarted });
     if (res.ok) {
       await atomicWrite(LAST_SEND_PATH, String(Date.now()));
       await resetGoneStrikes();

@@ -106,7 +106,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "2.3.5";
+var PLUGIN_VERSION = "2.3.6";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -166,6 +166,7 @@ function tracePlanPickerDecision(sessionId, decision, path) {
 var SESSIONS_DIR = `${CC_DIR}/sessions`;
 var WATCHDOG_PID_PATH = `${CC_DIR}/watchdog.pid`;
 var LAST_SEND_PATH = `${CC_DIR}/last-send`;
+var SEND_FAIL_PATH = `${CC_DIR}/last-send-fail`;
 var GONE_STRIKES_PATH = `${CC_DIR}/gone-strikes`;
 var GONE_STRIKE_LIMIT = 2;
 var NO_HOLD_PATH = `${CC_DIR}/no-hold`;
@@ -5621,6 +5622,33 @@ async function markDoneDeliveredAt(sessionsDir, sessionId) {
 async function markDoneDelivered(sessionId) {
   return markDoneDeliveredAt(SESSIONS_DIR, sessionId);
 }
+async function markUpdatePendingAt(sessionsDir, sessionId, blob) {
+  try {
+    const record = await readRecord(sessionId, sessionsDir);
+    if (!record || !blob || record.blob !== blob || record.op === "done" || record.updatePending === true)
+      return;
+    await atomicWrite(`${sessionsDir}/${sessionId}.json`, JSON.stringify({ ...record, updatePending: true }), 384);
+  } catch {}
+}
+async function traceSendFailure(event, failPath = SEND_FAIL_PATH, lastSendPath = LAST_SEND_PATH, trace = traceSession) {
+  try {
+    const stamp = async (path) => {
+      try {
+        return Number.parseInt((await readFile6(path, "utf8")).trim(), 10) || 0;
+      } catch {
+        return 0;
+      }
+    };
+    const streakStart = await stamp(failPath);
+    if (streakStart > 0 && streakStart > await stamp(lastSendPath))
+      return false;
+    await atomicWrite(failPath, String(Date.now()));
+    trace({ event: "post-failed", ...event });
+    return true;
+  } catch {
+    return false;
+  }
+}
 async function reconcileProvisional(config, hookPid) {
   try {
     const files = await readdir3(SESSIONS_DIR).catch(() => []);
@@ -5980,18 +6008,34 @@ async function runHook(agent) {
     ensureWatchdog();
     if (agent === "codex")
       await reconcileProvisional(config, hookPid);
-    const res = await fetch(`${config.url}/v1/cc/event`, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "x-cc-pairing": config.pairingId,
-        "x-cc-auth": config.pcSecret,
-        "x-cc-version": PLUGIN_VERSION,
-        "x-cc-approvals": await localApprovalsState()
-      },
-      body: JSON.stringify(envelope),
-      signal: AbortSignal.timeout(2000)
-    });
+    const failure = { sessionId, agent, hook_event_name: hookName, op: plan.op };
+    const postStarted = Date.now();
+    let res;
+    try {
+      res = await fetch(`${config.url}/v1/cc/event`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-cc-pairing": config.pairingId,
+          "x-cc-auth": config.pcSecret,
+          "x-cc-version": PLUGIN_VERSION,
+          "x-cc-approvals": await localApprovalsState()
+        },
+        body: JSON.stringify(envelope),
+        signal: AbortSignal.timeout(2000)
+      });
+    } catch (e) {
+      if (plan.op !== "done" && plan.op !== "end")
+        await markUpdatePendingAt(SESSIONS_DIR, sessionId, envelope.blob);
+      await traceSendFailure({
+        ...failure,
+        ms: Date.now() - postStarted,
+        error: e?.name === "TimeoutError" ? "timeout" : "network"
+      });
+      return;
+    }
+    if (!res.ok)
+      await traceSendFailure({ ...failure, status: res.status, ms: Date.now() - postStarted });
     if (res.ok) {
       await atomicWrite(LAST_SEND_PATH, String(Date.now()));
       await resetGoneStrikes();
@@ -9206,6 +9250,76 @@ async function correctPendingDone(config, path, sessionId, record, now, deps = {
     return "uncorrected";
   }
 }
+var PENDING_UPDATE_POST_TIMEOUT_MS = PENDING_DONE_POST_TIMEOUT_MS;
+var RESEND_BACKOFF_MAX_MS = 60000;
+function resendBackoffMs(failures) {
+  return failures <= 0 ? 0 : Math.min(POLL_MS * 2 ** (failures - 1), RESEND_BACKOFF_MAX_MS);
+}
+var resendBackoff = { failures: 0, nextAt: 0 };
+function resendAllowed(now) {
+  return now >= resendBackoff.nextAt;
+}
+function noteResend(delivered, now) {
+  resendBackoff.failures = delivered ? 0 : resendBackoff.failures + 1;
+  const wait = resendBackoffMs(resendBackoff.failures);
+  resendBackoff.nextAt = delivered ? 0 : now + wait;
+  return wait;
+}
+function resetResendBackoff() {
+  resendBackoff.failures = 0;
+  resendBackoff.nextAt = 0;
+}
+function shouldPendingUpdateCheck(record) {
+  return record.updatePending === true && record.op !== "done" && record.lastEvent !== "done" && typeof record.ts === "number" && Number.isFinite(record.ts);
+}
+async function correctPendingUpdate(config, path, sessionId, record, now, deps = {}) {
+  const post = deps.post ?? ((body, detail) => postEvent(config, body, { timeoutMs: PENDING_UPDATE_POST_TIMEOUT_MS, detail }));
+  const writeRecord = deps.writeRecord ?? ((p, rec) => atomicWrite(p, JSON.stringify(rec), 384));
+  const reread = deps.readRecord ?? readRecordAt;
+  try {
+    if (!shouldPendingUpdateCheck(record) || !resendAllowed(now))
+      return "uncorrected";
+    if (await decisionHoldIsLive(sessionId, now, deps))
+      return "uncorrected";
+    const fresh = await reread(path);
+    if (!fresh || recordMovedSince(record, fresh) || !shouldPendingUpdateCheck(fresh))
+      return "uncorrected";
+    const envelope = buildHeartbeatEnvelope(sessionId, fresh, (deps.now ?? Date.now)(), config.pairingId);
+    if (!envelope) {
+      await writeRecord(path, { ...fresh, updatePending: undefined });
+      return "uncorrected";
+    }
+    const detail = {};
+    const outcome = await post(envelope, detail);
+    const delivered = outcome === "delivered";
+    const backoffMs = outcome === "revoked" ? undefined : noteResend(delivered, now);
+    traceFocus(deps, {
+      event: "pending-update",
+      sessionId,
+      outcome,
+      delivered,
+      op: fresh.op,
+      lastEvent: fresh.lastEvent,
+      status: detail.status,
+      error: detail.error,
+      ms: detail.ms,
+      backoffMs
+    });
+    if (outcome === "revoked")
+      return "revoked";
+    if (!delivered)
+      return "pending";
+    const after = await reread(path);
+    if (after && !recordMovedSince(fresh, after) && after.updatePending === true) {
+      try {
+        await writeRecord(path, { ...after, updatePending: undefined });
+      } catch {}
+    }
+    return "corrected";
+  } catch {
+    return "uncorrected";
+  }
+}
 var RETIRE_AFTER_MS = PLAN_PICKER_PENDING_MAX_MS + 15 * 60000;
 function isRetireEligible(record, now) {
   if (typeof record.retiredAt === "number" && Number.isFinite(record.retiredAt))
@@ -9603,11 +9717,29 @@ async function sweep(config, deps = {}) {
             repairedTitle = true;
           }
         }
-        const beatKind = heartbeatKind(record, now, heartbeatAt.get(sessionId), waitingBeatAt, idleFix === "corrected" || planResolutionHandled || interruptHandled || flaggedAttention || reapedIdle || repairedTitle, pairingIsNew);
-        if (beatKind !== "none") {
+        const netOwned = idleFix === "corrected" || planResolutionHandled || interruptHandled || flaggedAttention || reapedIdle || repairedTitle;
+        let resent = false;
+        if (!netOwned) {
+          const pendingUpdate = await correctPendingUpdate(config, path, sessionId, record, now);
+          if (pendingUpdate === "revoked")
+            return { revoked: true };
+          if (pendingUpdate === "corrected")
+            delivered = true;
+          resent = pendingUpdate === "corrected" || pendingUpdate === "pending";
+        }
+        const beatKind = heartbeatKind(record, now, heartbeatAt.get(sessionId), waitingBeatAt, netOwned || resent, pairingIsNew);
+        const slow = beatKind === "stale";
+        if (beatKind !== "none" && !(slow && !resendAllowed(now))) {
           const beat = buildHeartbeatEnvelope(sessionId, record, Date.now(), config.pairingId);
           if (beat) {
-            const outcome = await postEvent(config, beat);
+            const detail = {};
+            const outcome = await postEvent(config, beat, slow ? { timeoutMs: PENDING_UPDATE_POST_TIMEOUT_MS, detail } : {});
+            if (slow && outcome !== "revoked") {
+              const backoffMs = noteResend(outcome === "delivered", now);
+              if (outcome !== "delivered") {
+                traceFocus({}, { event: "heartbeat", sessionId, outcome, status: detail.status, error: detail.error, ms: detail.ms, backoffMs });
+              }
+            }
             if (outcome === "revoked")
               return { revoked: true };
             if (outcome === "delivered") {
@@ -10020,6 +10152,7 @@ export {
   shouldWaitingHeartbeat,
   shouldRepairTitle,
   shouldPlanPickerVerificationCheck,
+  shouldPendingUpdateCheck,
   shouldPendingDoneCheck,
   shouldPendingApprovalCheck,
   shouldInterruptCheck,
@@ -10029,8 +10162,11 @@ export {
   setCodexBridgeDown,
   retireDoneStale,
   resolveCodexTuiOwner,
+  resetResendBackoff,
   resetDoneAttemptMemory,
   resetCommandState,
+  resendBackoffMs,
+  resendAllowed,
   repairTitle,
   recordMovedSince,
   reconcileProvisionalsSweep,
@@ -10042,6 +10178,7 @@ export {
   pendingDoneSettleWrite,
   pendingDoneRetryWrite,
   parseCommandPayload,
+  noteResend,
   noteDoneAttempt,
   lastTurnLine,
   isWaitingSession,
@@ -10062,6 +10199,7 @@ export {
   correlateCodexTuiPid,
   correctResolvedPlanPicker,
   correctPlanPickerVerification,
+  correctPendingUpdate,
   correctPendingDone,
   correctPendingApproval,
   correctInterrupt,
@@ -10087,10 +10225,12 @@ export {
   acceptLanAnswer,
   WAITING_HEARTBEAT_AFTER_MS,
   RETIRE_AFTER_MS,
+  RESEND_BACKOFF_MAX_MS,
   POLL_MS,
   PLAN_PICKER_VERIFY_MAX_MS,
   PLAN_PICKER_RECENT_DONE_MS,
   PLAN_PICKER_PENDING_MAX_MS,
+  PENDING_UPDATE_POST_TIMEOUT_MS,
   PENDING_DONE_POST_TIMEOUT_MS,
   PENDING_DONE_GRACE_MS,
   PAIRING_TTL_MS,
