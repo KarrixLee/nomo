@@ -292,7 +292,7 @@ async function unixSocketAccepts(socketPath, timeoutMs) {
   } catch {
     return false;
   }
-  return await new Promise((resolve2) => {
+  return await new Promise((resolve) => {
     let settled = false;
     let socket;
     const timer = setTimeout(() => done(false), timeoutMs);
@@ -305,7 +305,7 @@ async function unixSocketAccepts(socketPath, timeoutMs) {
       try {
         socket?.destroy();
       } catch {}
-      resolve2(accepted);
+      resolve(accepted);
     }
     try {
       socket = createConnection({ path: socketPath });
@@ -338,20 +338,20 @@ var CODEX_DAEMON_SOCKET_POLL_MS = 250;
 async function startCodexAppServerDaemon(deps = {}) {
   const trace = deps.trace ?? ((event) => traceSession(event));
   const probe = deps.probe ?? (() => codexAppServerSocketAvailable());
-  const sleep = deps.sleep ?? ((ms) => new Promise((resolve2) => setTimeout(resolve2, ms)));
+  const sleep = deps.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
   const command = deps.codexPath ?? "codex";
   const timeoutMs = deps.timeoutMs ?? CODEX_DAEMON_START_TIMEOUT_MS;
   const socketWaitMs = deps.socketWaitMs ?? CODEX_DAEMON_SOCKET_WAIT_MS;
   const spawnFn = deps.spawnFn ?? ((cmd, args) => spawn(cmd, [...args], { stdio: "ignore" }));
   let exit;
   try {
-    exit = await new Promise((resolve2) => {
+    exit = await new Promise((resolve) => {
       let settled = false;
       const done = (value) => {
         if (settled)
           return;
         settled = true;
-        resolve2(value);
+        resolve(value);
       };
       let child;
       try {
@@ -1862,11 +1862,11 @@ function codexProposedPlanMarkdown(text) {
   if (typeof text !== "string")
     return;
   const trimmed = text.trim();
-  const open2 = "<proposed_plan>";
+  const open = "<proposed_plan>";
   const close = "</proposed_plan>";
-  if (!trimmed.startsWith(open2) || !trimmed.endsWith(close))
+  if (!trimmed.startsWith(open) || !trimmed.endsWith(close))
     return;
-  return trimmed.slice(open2.length, -close.length).trim();
+  return trimmed.slice(open.length, -close.length).trim();
 }
 function codexFinalProposedPlan(row) {
   const payload = row.payload;
@@ -3228,12 +3228,12 @@ class CodexAppServerClient {
     }
     const id = this.nextRpcId++;
     const key = rpcIdKey(id);
-    return new Promise((resolve2, reject) => {
+    return new Promise((resolve, reject) => {
       const timer = this.options.setTimer(() => {
         this.pendingRpc.delete(key);
         reject(new Error(`${method} timed out`));
       }, this.options.requestTimeoutMs);
-      this.pendingRpc.set(key, { resolve: resolve2, reject, timer });
+      this.pendingRpc.set(key, { resolve, reject, timer });
       this.transport.send({ method, id, params }).catch((error) => {
         const pending = this.pendingRpc.get(key);
         if (!pending)
@@ -3561,8 +3561,8 @@ class CodexProxyTransport {
       ""
     ].join(`\r
 `);
-    return new Promise((resolve2, reject) => {
-      this.openResolve = resolve2;
+    return new Promise((resolve, reject) => {
+      this.openResolve = resolve;
       this.openReject = reject;
       this.writeRaw(request).catch((error) => this.finish(error));
     });
@@ -3636,10 +3636,10 @@ class CodexProxyTransport {
     parseUpgradeResponse(this.buffer.subarray(0, end), this.handshakeKey);
     this.buffer = this.buffer.subarray(end);
     this.upgraded = true;
-    const resolve2 = this.openResolve;
+    const resolve = this.openResolve;
     this.openResolve = undefined;
     this.openReject = undefined;
-    resolve2?.();
+    resolve?.();
     return true;
   }
   consumeFrames() {
@@ -3761,9 +3761,9 @@ class CodexProxyTransport {
     const child = this.child;
     if (!child || this.ended)
       return Promise.reject(new Error("Codex proxy transport is closed"));
-    return new Promise((resolve2, reject) => {
+    return new Promise((resolve, reject) => {
       try {
-        child.stdin.write(chunk, (error) => error ? reject(error) : resolve2());
+        child.stdin.write(chunk, (error) => error ? reject(error) : resolve());
       } catch (error) {
         reject(asError(error, "Could not write to Codex app-server proxy"));
       }
@@ -3958,14 +3958,14 @@ function parseCcSessionFile(raw) {
     ...num("statusUpdatedAt") !== undefined ? { statusUpdatedAt: num("statusUpdatedAt") } : {}
   };
 }
-function ccOpinion(file, join3, now) {
+function ccOpinion(file, join, now) {
   if (!file)
     return null;
-  if (typeof join3.pid !== "number" || !Number.isFinite(join3.pid) || file.pid !== join3.pid)
+  if (typeof join.pid !== "number" || !Number.isFinite(join.pid) || file.pid !== join.pid)
     return null;
-  if (file.sessionId !== join3.sessionId)
+  if (file.sessionId !== join.sessionId)
     return null;
-  const probed = join3.procStartedAt;
+  const probed = join.procStartedAt;
   if (typeof probed !== "number" || !Number.isFinite(probed))
     return null;
   const claimed = typeof file.startedAt === "number" && Number.isFinite(file.startedAt) ? file.startedAt : parseCcProcStart(file.procStart);
@@ -4025,7 +4025,7 @@ function stateHoldLive(hold, holdPidAlive, now) {
   return true;
 }
 function computeSessionState(input) {
-  const { sessionId, record, pairingId, hold, pidAlive: pidAlive2, holdPidAlive, cc, ccProcStartedAt, correctives, now } = input;
+  const { sessionId, record, pairingId, hold, pidAlive, holdPidAlive, cc, ccProcStartedAt, correctives, now } = input;
   if (record === null) {
     return { state: "ended", terminal: true, ts: now, why: "reap", blob: { kind: "last" }, agent: "claude" };
   }
@@ -4045,7 +4045,7 @@ function computeSessionState(input) {
     return of("ended", "end", sealed, ts, true);
   if (finite(record.ts) && now - record.ts > SESSION_STATE_STALE_MS)
     return of("ended", "stale", sealed, ts, true);
-  if (!pidAlive2)
+  if (!pidAlive)
     return of("ended", "reap", sealed, ts, true);
   const ccUsable = agent === "claude" && record.provisional !== true;
   const opinion = ccUsable ? ccOpinion(cc, { pid: record.pid, sessionId, procStartedAt: ccProcStartedAt }, now) : null;
@@ -4221,8 +4221,8 @@ function createLanFrameStore(deps = {}) {
   };
   const park = async (set, waitMs) => {
     let settle;
-    const promise = new Promise((resolve2) => {
-      settle = resolve2;
+    const promise = new Promise((resolve) => {
+      settle = resolve;
     });
     const waiter = { resolve: settle };
     set.add(waiter);
@@ -4671,8 +4671,8 @@ function createLanAnswerStore(options = {}) {
       if (this.peek(requestId, now))
         return { promise: Promise.resolve(), cancel: () => {} };
       let settle;
-      const promise = new Promise((resolve2) => {
-        settle = resolve2;
+      const promise = new Promise((resolve) => {
+        settle = resolve;
       });
       const set = waiters.get(requestId) ?? new Set;
       set.add(settle);
@@ -4721,13 +4721,13 @@ function requestIdOf(payload) {
   return typeof requestId === "string" && LAN_REQUEST_ID_RE.test(requestId) ? requestId : null;
 }
 function readBody(req, max) {
-  return new Promise((resolve2) => {
+  return new Promise((resolve) => {
     const declared = Number(req.headers["content-length"]);
     if (Number.isFinite(declared) && declared > max) {
       try {
         req.pause();
       } catch {}
-      resolve2(null);
+      resolve(null);
       return;
     }
     const chunks = [];
@@ -4737,7 +4737,7 @@ function readBody(req, max) {
       if (settled)
         return;
       settled = true;
-      resolve2(value);
+      resolve(value);
     };
     req.on("data", (chunk) => {
       const bytes = chunk;
@@ -4905,7 +4905,7 @@ function createLanListener(deps = {}) {
       } catch {}
     }
   };
-  const tryListen = (port) => new Promise((resolve2) => {
+  const tryListen = (port) => new Promise((resolve) => {
     let settled = false;
     let candidate;
     try {
@@ -4913,14 +4913,14 @@ function createLanListener(deps = {}) {
         handle(req, res);
       });
     } catch {
-      resolve2(null);
+      resolve(null);
       return;
     }
     const finish = (value) => {
       if (settled)
         return;
       settled = true;
-      resolve2(value);
+      resolve(value);
     };
     try {
       candidate.keepAliveTimeout = LAN_KEEPALIVE_MS;
@@ -5445,6 +5445,8 @@ function interruptedEventInput(input) {
 function planOp(hookName, input, sentDone) {
   switch (hookName) {
     case "SessionStart":
+      if (sentDone && input.source === "compact")
+        return null;
       return sentDone ? { op: "update", prio: 0, status: "working" } : { op: "start", prio: 0, status: "working" };
     case "PreToolUse": {
       const tool = typeof input.tool_name === "string" ? input.tool_name : "";
@@ -5466,7 +5468,7 @@ function planOp(hookName, input, sentDone) {
       return { op: "update", prio: 0, status: "working" };
     case "PreCompact":
     case "PostCompact":
-      return input.trigger === "manual" ? null : { op: "update", prio: 0, status: "working" };
+      return input.trigger === "manual" || sentDone ? null : { op: "update", prio: 0, status: "working" };
     case "Stop":
       return hasRunningBackgroundAgent(input) ? { op: "update", prio: 0, status: "working" } : { op: "done", prio: 0, status: "done" };
     case "StopFailure":
@@ -5771,8 +5773,8 @@ async function runHook(agent) {
     if (!config) {
       const pending = await loadPendingConfig();
       if (pending) {
-        const machine2 = pending.machineName ?? hostname().replace(/\.local$/, "");
-        await stashPendingEvent(input, machine2, await readTitle(), Date.now(), PENDING_STASH_PATH, process.ppid, agent, await readModel());
+        const machine = pending.machineName ?? hostname().replace(/\.local$/, "");
+        await stashPendingEvent(input, machine, await readTitle(), Date.now(), PENDING_STASH_PATH, process.ppid, agent, await readModel());
       }
       return;
     }
@@ -5787,13 +5789,13 @@ async function runHook(agent) {
         const line = interruptHookOutput(hookName);
         if (line !== null && await interruptFlagSetAt(SESSIONS_DIR, reportedSessionId, Date.now())) {
           interrupted = true;
-          await new Promise((resolve2) => {
-            process.stdout.on("error", () => resolve2());
+          await new Promise((resolve) => {
+            process.stdout.on("error", () => resolve());
             try {
               process.stdout.write(`${line}
-`, () => resolve2());
+`, () => resolve());
             } catch {
-              resolve2();
+              resolve();
             }
           });
         }
@@ -6637,8 +6639,8 @@ var LOOPBACK_MAX_CONSECUTIVE_ERRORS = 5;
 function createLoopbackAnswerPoller(config, requestId, deps) {
   const interval = deps.intervalMs ?? LOOPBACK_POLL_INTERVAL_MS;
   const discoverInterval = deps.discoverIntervalMs ?? POLL_INTERVAL_MS;
-  const tick = deps.sleep ?? ((ms) => new Promise((resolve3) => {
-    const timer = setTimeout(resolve3, ms);
+  const tick = deps.sleep ?? ((ms) => new Promise((resolve) => {
+    const timer = setTimeout(resolve, ms);
     timer.unref?.();
   }));
   let live = deps.statePath !== undefined;
@@ -6649,11 +6651,11 @@ function createLoopbackAnswerPoller(config, requestId, deps) {
   let traced = false;
   let pending;
   let wakeResolve = () => {};
-  let wake = new Promise((resolve3) => {
-    wakeResolve = resolve3;
+  let wake = new Promise((resolve) => {
+    wakeResolve = resolve;
   });
   let keyPromise;
-  const note2 = (result) => {
+  const note = (result) => {
     if (traced)
       return;
     traced = true;
@@ -6738,7 +6740,7 @@ function createLoopbackAnswerPoller(config, requestId, deps) {
         return;
       }
       if (errors >= LOOPBACK_MAX_CONSECUTIVE_ERRORS) {
-        note2("give-up");
+        note("give-up");
         live = false;
         return;
       }
@@ -6754,7 +6756,7 @@ function createLoopbackAnswerPoller(config, requestId, deps) {
         started = true;
         ticker().catch(() => {
           live = false;
-          note2("error");
+          note("error");
         });
       }
       await Promise.race([sleeping, wake]);
@@ -6910,8 +6912,8 @@ async function runPermissionHook(deps = {}, agent = "claude") {
     const sleep = deps.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
     let lastPostTs = 0;
     const postDecision = async (round, maxAttempts) => {
-      let hold2 = false;
-      let posted2 = false;
+      let hold = false;
+      let posted = false;
       let reason;
       for (let attempt = 1;attempt <= maxAttempts; attempt += 1) {
         const ts = Math.max((deps.now ?? Date.now)(), lastPostTs + 1);
@@ -6934,7 +6936,7 @@ async function runPermissionHook(deps = {}, agent = "claude") {
           });
           if (res.ok) {
             const body = await res.json().catch(() => ({}));
-            hold2 = body.hold === true;
+            hold = body.hold === true;
             if (typeof body.reason === "string")
               reason = body.reason;
           }
@@ -6945,10 +6947,10 @@ async function runPermissionHook(deps = {}, agent = "claude") {
             attempt,
             status: res.status,
             ts,
-            ...res.ok ? { hold: hold2 } : {},
+            ...res.ok ? { hold } : {},
             ...reason !== undefined ? { reason } : {}
           });
-          posted2 = true;
+          posted = true;
           break;
         } catch (e) {
           const name = e?.name ?? "Error";
@@ -6961,13 +6963,13 @@ async function runPermissionHook(deps = {}, agent = "claude") {
           }
         }
       }
-      return { posted: posted2, hold: hold2, reason };
+      return { posted, hold, reason };
     };
     const clock = deps.now ?? Date.now;
     const pollBudget = createPollBudget();
-    const pollDecision = async (seq2) => {
-      const budgetMs = pollBudget.next(seq2);
-      trace({ event: "poll-begin", seq: seq2, budgetMs });
+    const pollDecision = async (seq) => {
+      const budgetMs = pollBudget.next(seq);
+      trace({ event: "poll-begin", seq, budgetMs });
       const startedAt = clock();
       const measure = () => {
         const ms = clock() - startedAt;
@@ -6980,29 +6982,29 @@ async function runPermissionHook(deps = {}, agent = "claude") {
           signal: AbortSignal.timeout(budgetMs)
         });
         if (!res.ok) {
-          trace({ event: "poll-end", seq: seq2, outcome: "status", status: res.status, ms: measure() });
+          trace({ event: "poll-end", seq, outcome: "status", status: res.status, ms: measure() });
           return { status: res.status };
         }
         const data = await res.json();
-        trace({ event: "poll-end", seq: seq2, outcome: "ok", ms: measure() });
+        trace({ event: "poll-end", seq, outcome: "ok", ms: measure() });
         return { data, status: res.status };
       } catch (e) {
-        trace({ event: "poll-end", seq: seq2, outcome: "error", ...errorTag(e) });
+        trace({ event: "poll-end", seq, outcome: "error", ...errorTag(e) });
         return { status: 0 };
       }
     };
     let attentionStalled = false;
-    const stalledPatch = async (at2) => {
+    const stalledPatch = async (at) => {
       let stalledBlob = fallbackBlob;
       try {
-        stalledBlob = await encryptBlob(config.e2eKey, { ...base, reconnecting: Math.floor(at2 / 1000) });
+        stalledBlob = await encryptBlob(config.e2eKey, { ...base, reconnecting: Math.floor(at / 1000) });
       } catch {}
-      return { ts: at2, blob: stalledBlob, attentionStalledAt: at2 };
+      return { ts: at, blob: stalledBlob, attentionStalledAt: at };
     };
     const markAttentionStalled = async () => {
-      const at2 = (deps.now ?? Date.now)();
+      const at = (deps.now ?? Date.now)();
       try {
-        await (deps.settleHoldRecordFn ?? defaultSettleHoldRecord())(sessionId, await stalledPatch(at2));
+        await (deps.settleHoldRecordFn ?? defaultSettleHoldRecord())(sessionId, await stalledPatch(at));
       } catch {}
     };
     let { posted, hold, reason: holdReason } = await postDecision(1, POST_MAX_ATTEMPTS);
@@ -7274,9 +7276,9 @@ function codexAnswersFromPhone(request, positional, other, notes) {
       return;
     if (!question.options?.length)
       return;
-    const note2 = typed.length > 0 ? [`${CODEX_NOTE_PREFIX}${typed}`] : [];
-    if (answer.length === 0 && note2.length > 0) {
-      mapped[question.id] = [CODEX_OTHER_LABEL, ...note2];
+    const note = typed.length > 0 ? [`${CODEX_NOTE_PREFIX}${typed}`] : [];
+    if (answer.length === 0 && note.length > 0) {
+      mapped[question.id] = [CODEX_OTHER_LABEL, ...note];
       continue;
     }
     if (answer.length === 0 || answer.length > ANSWER_MAX3)
@@ -7285,7 +7287,7 @@ function codexAnswersFromPhone(request, positional, other, notes) {
     const unique = Array.from(new Set(hits));
     if (unique.length !== 1)
       return;
-    mapped[question.id] = [unique[0], ...note2];
+    mapped[question.id] = [unique[0], ...note];
   }
   if (Object.keys(mapped).length !== request.questions.length)
     return;
@@ -7326,14 +7328,14 @@ function requestSignal(ms, signal) {
 function abortableSleep(ms, signal, sleep) {
   if (signal.aborted)
     return Promise.resolve();
-  return new Promise((resolve3) => {
+  return new Promise((resolve) => {
     let done = false;
     const finish = () => {
       if (done)
         return;
       done = true;
       signal.removeEventListener("abort", finish);
-      resolve3();
+      resolve();
     };
     signal.addEventListener("abort", finish, { once: true });
     sleep(ms).then(finish, finish);
@@ -7412,8 +7414,8 @@ async function runRemoteInput(request, requestId, signal, deps, onHoldCreated) {
       "x-cc-auth": deps.config.pcSecret,
       "x-cc-version": PLUGIN_VERSION
     };
-    const sleep = deps.sleep ?? ((ms) => new Promise((resolve3) => {
-      const timer = setTimeout(resolve3, ms);
+    const sleep = deps.sleep ?? ((ms) => new Promise((resolve) => {
+      const timer = setTimeout(resolve, ms);
       timer.unref?.();
     }));
     let attentionStalled = false;
@@ -7504,9 +7506,9 @@ async function runRemoteInput(request, requestId, signal, deps, onHoldCreated) {
       await resolveOnRelay(deps.config, requestId, fetchFn);
     };
     const applyAnswerBlob = async (answerBlob) => {
-      const reject = (why, result2) => {
+      const reject = (why, result) => {
         report(deps, new Error(`Codex phone answer rejected (${why})`), "Codex remote input answer");
-        return result2;
+        return result;
       };
       let answer;
       try {
@@ -7517,12 +7519,12 @@ async function runRemoteInput(request, requestId, signal, deps, onHoldCreated) {
       if (answer.requestId !== requestId)
         return reject("request-id mismatch", "unsupported");
       if (answer.decision === "deny") {
-        const result2 = await deps.interruptAppServer();
-        if (result2 === "sent" || result2 === "already-sent") {
+        const result = await deps.interruptAppServer();
+        if (result === "sent" || result === "already-sent") {
           resumed = true;
           return "denied";
         }
-        await reportUndelivered("deny", result2);
+        await reportUndelivered("deny", result);
         return "transport-error";
       }
       if (answer.decision !== "answer")
@@ -7553,17 +7555,17 @@ async function runRemoteInput(request, requestId, signal, deps, onHoldCreated) {
       const budgetMs = pollBudget.next(polls);
       const startedAt = clock();
       try {
-        const response2 = await fetchFn(`${deps.config.url}/v1/cc/decision/${requestId}`, {
+        const response = await fetchFn(`${deps.config.url}/v1/cc/decision/${requestId}`, {
           headers,
           signal: requestSignal(budgetMs, signal)
         });
-        const data = response2.ok ? await parseJson(response2) : undefined;
+        const data = response.ok ? await parseJson(response) : undefined;
         pollBudget.observe(clock() - startedAt);
         if (!data) {
           misses += 1;
-          if (response2.ok)
+          if (response.ok)
             report(deps, new Error("Unparseable relay poll response"), "Relay poll");
-          if (!response2.ok && DEFINITIVE_POLL_STATUSES.has(response2.status)) {
+          if (!response.ok && DEFINITIVE_POLL_STATUSES.has(response.status)) {
             definitiveFailures += 1;
             if (definitiveFailures >= MAX_DEFINITIVE_POLL_FAILURES)
               return "transport-error";
@@ -7618,8 +7620,8 @@ function startCodexRemoteInput(request, deps) {
   const controller = new AbortController;
   const fetchFn = deps.fetchFn ?? fetch;
   let settleHold;
-  const holdCreated = new Promise((resolve3) => {
-    settleHold = resolve3;
+  const holdCreated = new Promise((resolve) => {
+    settleHold = resolve;
   });
   let resolvePromise;
   const completion = runRemoteInput(request, requestId, controller.signal, deps, settleHold).catch((error) => {
@@ -8142,10 +8144,10 @@ async function correctResolvedPlanPicker(config, path, sessionId, record, deps =
       return await settlePendingPlanPickerDone(config, path, sessionId, snapshot, now, deps, "exit");
     }
     const agent = recordAgent(snapshot);
-    const adapter2 = adapterFor(agent);
-    if (!adapter2.completedTurnWaitState)
+    const adapter = adapterFor(agent);
+    if (!adapter.completedTurnWaitState)
       return "uncorrected";
-    const state = await (deps.state ?? (() => adapter2.completedTurnWaitState({
+    const state = await (deps.state ?? (() => adapter.completedTurnWaitState({
       pid: snapshot.pid,
       transcriptPath: typeof snapshot.transcript === "string" ? snapshot.transcript : undefined
     })))();
@@ -8579,15 +8581,15 @@ async function releaseFocusedTuiUserInputHold(config, sessionId, now, deps) {
   } catch {}
   return true;
 }
-async function interruptSession(adapter2, sessionId, record, now, deps) {
+async function interruptSession(adapter, sessionId, record, now, deps) {
   if (isDoneState(record))
     return "not-running";
-  if (adapter2.interrupt === "hook-flag") {
+  if (adapter.interrupt === "hook-flag") {
     const write = deps.writeInterruptFlagFn ?? (lanRunningUnderTest() ? async () => {} : (id, at) => writeInterruptFlagAt(SESSIONS_DIR, id, at));
     await write(sessionId, now);
     return "interrupt-flagged";
   }
-  if (adapter2.interrupt === "app-server") {
+  if (adapter.interrupt === "app-server") {
     const turnId = typeof record.turnId === "string" ? record.turnId : "";
     if (turnId.length === 0)
       return "no-turn";
@@ -8659,23 +8661,23 @@ async function drainCommands(config, deps = {}) {
         }
         batchTargets.add(target);
         const agent = recordAgent(entry.rec);
-        const adapter2 = deps.adapters ? deps.adapters.find((a) => a.kind === agent) ?? adapterFor(agent) : adapterFor(agent);
+        const adapter = deps.adapters ? deps.adapters.find((a) => a.kind === agent) ?? adapterFor(agent) : adapterFor(agent);
         if (payload.kind === INTERRUPT_COMMAND_KIND) {
-          const result2 = await interruptSession(adapter2, payload.sessionId, entry.rec, now, deps);
-          traceFocus(deps, { ...base, agent, result: result2 });
+          const result = await interruptSession(adapter, payload.sessionId, entry.rec, now, deps);
+          traceFocus(deps, { ...base, agent, result });
           continue;
         }
-        if (!adapter2.locateTuiPid) {
+        if (!adapter.locateTuiPid) {
           traceFocus(deps, { ...base, agent, result: "unsupported" });
           continue;
         }
         let reason;
-        const pid = await adapter2.locateTuiPid({ sessionId: payload.sessionId, record: entry.rec }, { note: (r) => {
+        const pid = await adapter.locateTuiPid({ sessionId: payload.sessionId, record: entry.rec }, { note: (r) => {
           reason = r;
         } });
         if (typeof pid !== "number" || !Number.isFinite(pid)) {
-          const result2 = reason === "ambiguous" ? "ambiguous" : "no-candidate";
-          traceFocus(deps, { ...base, agent, result: result2, reason: reason ?? "no-candidate" });
+          const result = reason === "ambiguous" ? "ambiguous" : "no-candidate";
+          traceFocus(deps, { ...base, agent, result, reason: reason ?? "no-candidate" });
           continue;
         }
         const outcome = await focus(pid, { agent, record: entry.rec, sessionId: payload.sessionId });
@@ -8726,13 +8728,13 @@ function acceptLanCommand(command, deps = {}) {
 var LAN_ANSWER_ECHO_DELAY_MS = 5000;
 function acceptLanAnswer(answer, deps = {}) {
   try {
-    const resolve3 = deps.resolveFn ?? ((config, requestId) => resolveOnRelay(config, requestId, fetch));
+    const resolve = deps.resolveFn ?? ((config, requestId) => resolveOnRelay(config, requestId, fetch));
     const delayMs = deps.delayMs ?? LAN_ANSWER_ECHO_DELAY_MS;
     const sleep = deps.sleep ?? ((ms) => new Promise((done) => {
       const timer = setTimeout(done, ms);
       timer.unref?.();
     }));
-    return (delayMs > 0 ? sleep(delayMs) : Promise.resolve()).then(() => resolve3(answer.config, answer.requestId)).catch(() => {
+    return (delayMs > 0 ? sleep(delayMs) : Promise.resolve()).then(() => resolve(answer.config, answer.requestId)).catch(() => {
       traceFocus(deps, { event: "lan", result: "echo-failed", requestId: answer.requestId });
     });
   } catch {
@@ -8824,23 +8826,23 @@ async function discoverLiveSessions(config, deps = {}) {
   const now = deps.now ?? Date.now;
   const machine = machineName(config);
   const known = await readRecords();
-  for (const adapter2 of adapters) {
-    if (!adapter2.discoverLive)
+  for (const adapter of adapters) {
+    if (!adapter.discoverLive)
       continue;
     let discovered;
     try {
-      discovered = await adapter2.discoverLive(known);
+      discovered = await adapter.discoverLive(known);
     } catch {
       continue;
     }
     for (const d of discovered) {
       const ts = now();
       const idle = d.idle === true;
-      const blob = await buildProvisionalBlob(d, machine, adapter2.blobAgentFields, config.e2eKey, Math.floor(ts / 1000));
+      const blob = await buildProvisionalBlob(d, machine, adapter.blobAgentFields, config.e2eKey, Math.floor(ts / 1000));
       const outcome = await post(buildProvisionalEnvelope(d.sessionId, blob, ts, idle));
       if (outcome !== "delivered")
         continue;
-      await writeRecord(d.sessionId, buildProvisionalRecord(d, machine, blob, adapter2.blobAgentFields, ts, config.pairingId, idle));
+      await writeRecord(d.sessionId, buildProvisionalRecord(d, machine, blob, adapter.blobAgentFields, ts, config.pairingId, idle));
     }
   }
 }
@@ -8951,8 +8953,8 @@ async function correctInterrupt(config, path, sessionId, record, now, deps = {})
     return "uncorrected";
   }
 }
-function shouldPendingApprovalCheck(record, adapter2) {
-  if (!adapter2.tailShowsPendingApproval)
+function shouldPendingApprovalCheck(record, adapter) {
+  if (!adapter.tailShowsPendingApproval)
     return false;
   if (typeof record.transcript !== "string" || record.transcript.length === 0)
     return false;
@@ -8969,8 +8971,8 @@ async function correctPendingApproval(config, path, sessionId, record, now, deps
   const clock = deps.now ?? Date.now;
   try {
     const agent = recordAgent(record);
-    const adapter2 = adapterFor(agent);
-    if (!shouldPendingApprovalCheck(record, adapter2))
+    const adapter = adapterFor(agent);
+    if (!shouldPendingApprovalCheck(record, adapter))
       return "uncorrected";
     let tail;
     try {
@@ -8978,10 +8980,10 @@ async function correctPendingApproval(config, path, sessionId, record, now, deps
     } catch {
       return "uncorrected";
     }
-    if (!adapter2.tailShowsPendingApproval(tail))
+    if (!adapter.tailShowsPendingApproval(tail))
       return "uncorrected";
-    const detail = adapter2.tailPendingAttentionDetail?.(tail);
-    const attentionKind = adapter2.tailPendingAttentionKind?.(tail);
+    const detail = adapter.tailPendingAttentionDetail?.(tail);
+    const attentionKind = adapter.tailPendingAttentionKind?.(tail);
     const attnNow = clock();
     const envelope = await buildNeedsAttentionEnvelope(sessionId, record, attnNow, config.e2eKey, agent, Math.floor(attnNow / 1000), detail, attentionKind);
     const outcome = await post(envelope);
@@ -9006,8 +9008,8 @@ async function correctPendingApproval(config, path, sessionId, record, now, deps
     return "uncorrected";
   }
 }
-function shouldIdleProvisionalCheck(record, adapter2) {
-  if (!adapter2.pidTurnActive)
+function shouldIdleProvisionalCheck(record, adapter) {
+  if (!adapter.pidTurnActive)
     return false;
   if (record.provisional !== true)
     return false;
@@ -9020,12 +9022,12 @@ function shouldIdleProvisionalCheck(record, adapter2) {
 async function correctIdleProvisional(config, path, sessionId, record) {
   try {
     const agent = recordAgent(record);
-    const adapter2 = adapterFor(agent);
-    if (!shouldIdleProvisionalCheck(record, adapter2))
+    const adapter = adapterFor(agent);
+    if (!shouldIdleProvisionalCheck(record, adapter))
       return "uncorrected";
     let active = false;
     try {
-      active = await adapter2.pidTurnActive(record.pid);
+      active = await adapter.pidTurnActive(record.pid);
     } catch {}
     if (active)
       return "uncorrected";
@@ -9110,9 +9112,9 @@ async function correctIdleClaude(config, path, sessionId, record, now, deps = {}
         return "uncorrected";
       }
       const transcript = record.transcript;
-      const active = deps.codexTurnActive ?? (async (_pid, path2) => {
-        const tail = await readSuffix(path2, 8 * 1024);
-        return codexTurnActiveFromTail(tail, Date.now() - statSync3(path2).mtimeMs);
+      const active = deps.codexTurnActive ?? (async (_pid, path) => {
+        const tail = await readSuffix(path, 8 * 1024);
+        return codexTurnActiveFromTail(tail, Date.now() - statSync3(path).mtimeMs);
       });
       try {
         if (await active(tuiPid, transcript))
@@ -9456,11 +9458,11 @@ async function repairTitle(config, path, sessionId, record, deps = {}) {
   try {
     if (!shouldRepairTitle(record))
       return "uncorrected";
-    const adapter2 = adapterFor(recordAgent(record));
-    const resolve3 = deps.resolve ?? adapter2.titleRepair?.resolve;
+    const adapter = adapterFor(recordAgent(record));
+    const resolve = deps.resolve ?? adapter.titleRepair?.resolve;
     let title;
-    if (resolve3) {
-      title = resolve3(sessionId);
+    if (resolve) {
+      title = resolve(sessionId);
     } else {
       let prefix = "";
       if (typeof record.transcript === "string" && record.transcript.length > 0) {
@@ -9468,7 +9470,7 @@ async function repairTitle(config, path, sessionId, record, deps = {}) {
           prefix = await readPrefix(record.transcript, TITLE_REPAIR_HEAD_BYTES);
         } catch {}
       }
-      title = await adapter2.title({ sessionId, prefix, input: {}, transcriptPath: record.transcript });
+      title = await adapter.title({ sessionId, prefix, input: {}, transcriptPath: record.transcript });
     }
     if (!title || title === record.title)
       return "uncorrected";
@@ -9483,7 +9485,7 @@ async function repairTitle(config, path, sessionId, record, deps = {}) {
     if (!await unmoved())
       return "uncorrected";
     const repairNow = Date.now();
-    const envelope = await buildTitleRepairEnvelope(sessionId, record, title, repairNow, config.e2eKey, adapter2.kind, Math.floor(repairNow / 1000));
+    const envelope = await buildTitleRepairEnvelope(sessionId, record, title, repairNow, config.e2eKey, adapter.kind, Math.floor(repairNow / 1000));
     const outcome = await (deps.post ?? ((body) => postEvent(config, body)))(envelope);
     if (outcome === "revoked")
       return "revoked";
@@ -9797,8 +9799,8 @@ var BRIDGE_OP_DEADLINE_MS = 15000;
 var PLAN_PICKER_STATUS_QUERY_DEADLINE_MS = 2000;
 function withDeadline(work, ms) {
   let timer;
-  const deadline = new Promise((resolve3) => {
-    timer = setTimeout(() => resolve3(undefined), ms);
+  const deadline = new Promise((resolve) => {
+    timer = setTimeout(() => resolve(undefined), ms);
     timer.unref?.();
   });
   return Promise.race([work, deadline]).finally(() => {
@@ -10150,101 +10152,101 @@ if (__require.main == __require.module) {
   process.exit(0);
 }
 export {
-  withDeadline,
-  watchdogEventHeaders,
-  titleRepairedRecord,
-  tailShowsInterrupt,
-  shouldWaitingHeartbeat,
-  shouldRepairTitle,
-  shouldPlanPickerVerificationCheck,
-  shouldPendingUpdateCheck,
-  shouldPendingDoneCheck,
-  shouldPendingApprovalCheck,
-  shouldInterruptCheck,
-  shouldIdleProvisionalCheck,
-  shouldHeartbeat,
-  shouldGreetHeartbeat,
-  setCodexBridgeDown,
-  retireDoneStale,
-  resolveCodexTuiOwner,
-  resetResendBackoff,
-  resetDoneAttemptMemory,
-  resetCommandState,
-  resendBackoffMs,
-  resendAllowed,
-  repairTitle,
-  recordMovedSince,
-  reconcileProvisionalsSweep,
-  pruneStaleDecisionHolds,
-  provisionalsCoveredByReal,
-  postOutcomeForStatus,
-  planPickerPendingExpired,
-  pendingPairingExpired,
-  pendingDoneSettleWrite,
-  pendingDoneRetryWrite,
-  parseCommandPayload,
-  noteResend,
-  noteDoneAttempt,
-  lastTurnLine,
-  isWaitingSession,
-  isRightfulWatchdogOwner,
-  isRetireEligible,
-  isClaudeIdleReapEligible,
-  heartbeatKind,
-  hasInterruptMarker,
-  goneStrikeShouldTeardown,
-  extractCommands,
-  enqueueDrainCommands,
-  enforceWatchdogOwnership,
-  effectiveDoneAttempts,
-  drainCommands,
-  discoverLiveSessions,
-  decisionHoldIsLive,
-  createBridgeSupervisor,
-  correlateCodexTuiPid,
-  correctResolvedPlanPicker,
-  correctPlanPickerVerification,
-  correctPendingUpdate,
-  correctPendingDone,
-  correctPendingApproval,
-  correctInterrupt,
-  correctIdleClaude,
-  commandIsFresh,
-  codexTailPendingApproval,
-  codexLastTurnEvent,
-  codexBridgeIsDown,
-  clearDoneAttempts,
-  claudeTailPendingApproval,
-  classifySession,
-  buildWorkingEnvelope,
-  buildTitleRepairEnvelope,
-  buildStartEnvelope,
-  buildProvisionalRecord,
-  buildProvisionalEnvelope,
-  buildProvisionalBlob,
-  buildNeedsAttentionEnvelope,
-  buildHeartbeatEnvelope,
-  buildEndEnvelope,
-  buildDoneEnvelope,
-  acceptLanCommand,
-  acceptLanAnswer,
-  WAITING_HEARTBEAT_AFTER_MS,
-  RETIRE_AFTER_MS,
-  RESEND_BACKOFF_MAX_MS,
-  POLL_MS,
-  PLAN_PICKER_VERIFY_MAX_MS,
-  PLAN_PICKER_RECENT_DONE_MS,
-  PLAN_PICKER_PENDING_MAX_MS,
-  PENDING_UPDATE_POST_TIMEOUT_MS,
-  PENDING_DONE_POST_TIMEOUT_MS,
-  PENDING_DONE_GRACE_MS,
-  PAIRING_TTL_MS,
-  LAN_COMMAND_ID_PREFIX,
-  LAN_ANSWER_ECHO_DELAY_MS,
-  IDLE_GRACE_MS,
-  COMMAND_TTL_MS,
-  COMMAND_FUTURE_SKEW_MS,
-  CODEX_TUI_SESSION_START_SKEW_MS,
+  CLAUDE_AWAITING_PROMPT_REAP_MS,
   CLAUDE_IDLE_REAP_MAX_ATTEMPTS,
-  CLAUDE_AWAITING_PROMPT_REAP_MS
+  CODEX_TUI_SESSION_START_SKEW_MS,
+  COMMAND_FUTURE_SKEW_MS,
+  COMMAND_TTL_MS,
+  IDLE_GRACE_MS,
+  LAN_ANSWER_ECHO_DELAY_MS,
+  LAN_COMMAND_ID_PREFIX,
+  PAIRING_TTL_MS,
+  PENDING_DONE_GRACE_MS,
+  PENDING_DONE_POST_TIMEOUT_MS,
+  PENDING_UPDATE_POST_TIMEOUT_MS,
+  PLAN_PICKER_PENDING_MAX_MS,
+  PLAN_PICKER_RECENT_DONE_MS,
+  PLAN_PICKER_VERIFY_MAX_MS,
+  POLL_MS,
+  RESEND_BACKOFF_MAX_MS,
+  RETIRE_AFTER_MS,
+  WAITING_HEARTBEAT_AFTER_MS,
+  acceptLanAnswer,
+  acceptLanCommand,
+  buildDoneEnvelope,
+  buildEndEnvelope,
+  buildHeartbeatEnvelope,
+  buildNeedsAttentionEnvelope,
+  buildProvisionalBlob,
+  buildProvisionalEnvelope,
+  buildProvisionalRecord,
+  buildStartEnvelope,
+  buildTitleRepairEnvelope,
+  buildWorkingEnvelope,
+  classifySession,
+  claudeTailPendingApproval,
+  clearDoneAttempts,
+  codexBridgeIsDown,
+  codexLastTurnEvent,
+  codexTailPendingApproval,
+  commandIsFresh,
+  correctIdleClaude,
+  correctInterrupt,
+  correctPendingApproval,
+  correctPendingDone,
+  correctPendingUpdate,
+  correctPlanPickerVerification,
+  correctResolvedPlanPicker,
+  correlateCodexTuiPid,
+  createBridgeSupervisor,
+  decisionHoldIsLive,
+  discoverLiveSessions,
+  drainCommands,
+  effectiveDoneAttempts,
+  enforceWatchdogOwnership,
+  enqueueDrainCommands,
+  extractCommands,
+  goneStrikeShouldTeardown,
+  hasInterruptMarker,
+  heartbeatKind,
+  isClaudeIdleReapEligible,
+  isRetireEligible,
+  isRightfulWatchdogOwner,
+  isWaitingSession,
+  lastTurnLine,
+  noteDoneAttempt,
+  noteResend,
+  parseCommandPayload,
+  pendingDoneRetryWrite,
+  pendingDoneSettleWrite,
+  pendingPairingExpired,
+  planPickerPendingExpired,
+  postOutcomeForStatus,
+  provisionalsCoveredByReal,
+  pruneStaleDecisionHolds,
+  reconcileProvisionalsSweep,
+  recordMovedSince,
+  repairTitle,
+  resendAllowed,
+  resendBackoffMs,
+  resetCommandState,
+  resetDoneAttemptMemory,
+  resetResendBackoff,
+  resolveCodexTuiOwner,
+  retireDoneStale,
+  setCodexBridgeDown,
+  shouldGreetHeartbeat,
+  shouldHeartbeat,
+  shouldIdleProvisionalCheck,
+  shouldInterruptCheck,
+  shouldPendingApprovalCheck,
+  shouldPendingDoneCheck,
+  shouldPendingUpdateCheck,
+  shouldPlanPickerVerificationCheck,
+  shouldRepairTitle,
+  shouldWaitingHeartbeat,
+  tailShowsInterrupt,
+  titleRepairedRecord,
+  watchdogEventHeaders,
+  withDeadline
 };

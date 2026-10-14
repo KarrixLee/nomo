@@ -1285,11 +1285,11 @@ function codexProposedPlanMarkdown(text) {
   if (typeof text !== "string")
     return;
   const trimmed = text.trim();
-  const open2 = "<proposed_plan>";
+  const open = "<proposed_plan>";
   const close = "</proposed_plan>";
-  if (!trimmed.startsWith(open2) || !trimmed.endsWith(close))
+  if (!trimmed.startsWith(open) || !trimmed.endsWith(close))
     return;
-  return trimmed.slice(open2.length, -close.length).trim();
+  return trimmed.slice(open.length, -close.length).trim();
 }
 function codexFinalProposedPlan(row) {
   const payload = row.payload;
@@ -2566,6 +2566,8 @@ function interruptedEventInput(input) {
 function planOp(hookName, input, sentDone) {
   switch (hookName) {
     case "SessionStart":
+      if (sentDone && input.source === "compact")
+        return null;
       return sentDone ? { op: "update", prio: 0, status: "working" } : { op: "start", prio: 0, status: "working" };
     case "PreToolUse": {
       const tool = typeof input.tool_name === "string" ? input.tool_name : "";
@@ -2587,7 +2589,7 @@ function planOp(hookName, input, sentDone) {
       return { op: "update", prio: 0, status: "working" };
     case "PreCompact":
     case "PostCompact":
-      return input.trigger === "manual" ? null : { op: "update", prio: 0, status: "working" };
+      return input.trigger === "manual" || sentDone ? null : { op: "update", prio: 0, status: "working" };
     case "Stop":
       return hasRunningBackgroundAgent(input) ? { op: "update", prio: 0, status: "working" } : { op: "done", prio: 0, status: "done" };
     case "StopFailure":
@@ -2892,8 +2894,8 @@ async function runHook(agent) {
     if (!config) {
       const pending = await loadPendingConfig();
       if (pending) {
-        const machine2 = pending.machineName ?? hostname().replace(/\.local$/, "");
-        await stashPendingEvent(input, machine2, await readTitle(), Date.now(), PENDING_STASH_PATH, process.ppid, agent, await readModel());
+        const machine = pending.machineName ?? hostname().replace(/\.local$/, "");
+        await stashPendingEvent(input, machine, await readTitle(), Date.now(), PENDING_STASH_PATH, process.ppid, agent, await readModel());
       }
       return;
     }
@@ -2908,13 +2910,13 @@ async function runHook(agent) {
         const line = interruptHookOutput(hookName);
         if (line !== null && await interruptFlagSetAt(SESSIONS_DIR, reportedSessionId, Date.now())) {
           interrupted = true;
-          await new Promise((resolve2) => {
-            process.stdout.on("error", () => resolve2());
+          await new Promise((resolve) => {
+            process.stdout.on("error", () => resolve());
             try {
               process.stdout.write(`${line}
-`, () => resolve2());
+`, () => resolve());
             } catch {
-              resolve2();
+              resolve();
             }
           });
         }
@@ -3825,8 +3827,8 @@ var LOOPBACK_MAX_CONSECUTIVE_ERRORS = 5;
 function createLoopbackAnswerPoller(config, requestId, deps) {
   const interval = deps.intervalMs ?? LOOPBACK_POLL_INTERVAL_MS;
   const discoverInterval = deps.discoverIntervalMs ?? POLL_INTERVAL_MS;
-  const tick = deps.sleep ?? ((ms) => new Promise((resolve3) => {
-    const timer = setTimeout(resolve3, ms);
+  const tick = deps.sleep ?? ((ms) => new Promise((resolve) => {
+    const timer = setTimeout(resolve, ms);
     timer.unref?.();
   }));
   let live = deps.statePath !== undefined;
@@ -3837,8 +3839,8 @@ function createLoopbackAnswerPoller(config, requestId, deps) {
   let traced = false;
   let pending;
   let wakeResolve = () => {};
-  let wake = new Promise((resolve3) => {
-    wakeResolve = resolve3;
+  let wake = new Promise((resolve) => {
+    wakeResolve = resolve;
   });
   let keyPromise;
   const note = (result) => {
@@ -4098,8 +4100,8 @@ async function runPermissionHook(deps = {}, agent = "claude") {
     const sleep = deps.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
     let lastPostTs = 0;
     const postDecision = async (round, maxAttempts) => {
-      let hold2 = false;
-      let posted2 = false;
+      let hold = false;
+      let posted = false;
       let reason;
       for (let attempt = 1;attempt <= maxAttempts; attempt += 1) {
         const ts = Math.max((deps.now ?? Date.now)(), lastPostTs + 1);
@@ -4122,7 +4124,7 @@ async function runPermissionHook(deps = {}, agent = "claude") {
           });
           if (res.ok) {
             const body = await res.json().catch(() => ({}));
-            hold2 = body.hold === true;
+            hold = body.hold === true;
             if (typeof body.reason === "string")
               reason = body.reason;
           }
@@ -4133,10 +4135,10 @@ async function runPermissionHook(deps = {}, agent = "claude") {
             attempt,
             status: res.status,
             ts,
-            ...res.ok ? { hold: hold2 } : {},
+            ...res.ok ? { hold } : {},
             ...reason !== undefined ? { reason } : {}
           });
-          posted2 = true;
+          posted = true;
           break;
         } catch (e) {
           const name = e?.name ?? "Error";
@@ -4149,13 +4151,13 @@ async function runPermissionHook(deps = {}, agent = "claude") {
           }
         }
       }
-      return { posted: posted2, hold: hold2, reason };
+      return { posted, hold, reason };
     };
     const clock = deps.now ?? Date.now;
     const pollBudget = createPollBudget();
-    const pollDecision = async (seq2) => {
-      const budgetMs = pollBudget.next(seq2);
-      trace({ event: "poll-begin", seq: seq2, budgetMs });
+    const pollDecision = async (seq) => {
+      const budgetMs = pollBudget.next(seq);
+      trace({ event: "poll-begin", seq, budgetMs });
       const startedAt = clock();
       const measure = () => {
         const ms = clock() - startedAt;
@@ -4168,29 +4170,29 @@ async function runPermissionHook(deps = {}, agent = "claude") {
           signal: AbortSignal.timeout(budgetMs)
         });
         if (!res.ok) {
-          trace({ event: "poll-end", seq: seq2, outcome: "status", status: res.status, ms: measure() });
+          trace({ event: "poll-end", seq, outcome: "status", status: res.status, ms: measure() });
           return { status: res.status };
         }
         const data = await res.json();
-        trace({ event: "poll-end", seq: seq2, outcome: "ok", ms: measure() });
+        trace({ event: "poll-end", seq, outcome: "ok", ms: measure() });
         return { data, status: res.status };
       } catch (e) {
-        trace({ event: "poll-end", seq: seq2, outcome: "error", ...errorTag(e) });
+        trace({ event: "poll-end", seq, outcome: "error", ...errorTag(e) });
         return { status: 0 };
       }
     };
     let attentionStalled = false;
-    const stalledPatch = async (at2) => {
+    const stalledPatch = async (at) => {
       let stalledBlob = fallbackBlob;
       try {
-        stalledBlob = await encryptBlob(config.e2eKey, { ...base, reconnecting: Math.floor(at2 / 1000) });
+        stalledBlob = await encryptBlob(config.e2eKey, { ...base, reconnecting: Math.floor(at / 1000) });
       } catch {}
-      return { ts: at2, blob: stalledBlob, attentionStalledAt: at2 };
+      return { ts: at, blob: stalledBlob, attentionStalledAt: at };
     };
     const markAttentionStalled = async () => {
-      const at2 = (deps.now ?? Date.now)();
+      const at = (deps.now ?? Date.now)();
       try {
-        await (deps.settleHoldRecordFn ?? defaultSettleHoldRecord())(sessionId, await stalledPatch(at2));
+        await (deps.settleHoldRecordFn ?? defaultSettleHoldRecord())(sessionId, await stalledPatch(at));
       } catch {}
     };
     let { posted, hold, reason: holdReason } = await postDecision(1, POST_MAX_ATTEMPTS);
@@ -4816,10 +4818,10 @@ function ocPromptsEndedBy(state, event) {
     const callID = asString2(part?.callID);
     if (part?.type !== "tool" || !callID || partStatus !== "completed" && partStatus !== "error")
       return [];
-    const sessionID2 = asString2(part.sessionID) ?? asString2(properties.sessionID);
+    const sessionID = asString2(part.sessionID) ?? asString2(properties.sessionID);
     const messageID = asString2(part.messageID);
     for (const [id, prompt] of state.prompts) {
-      if (prompt.sessionID !== sessionID2 || prompt.callID !== callID)
+      if (prompt.sessionID !== sessionID || prompt.callID !== callID)
         continue;
       if (prompt.messageID && messageID && prompt.messageID !== messageID)
         continue;
@@ -4949,27 +4951,27 @@ function ensureWatchdogCached(now) {
     return;
   watchdogTrustedUntil = ensureWatchdog({ spawnWatchdog }) ? now + WATCHDOG_TRUST_MS : 0;
 }
-async function send(ctx, frame2) {
+async function send(ctx, frame) {
   const now = Date.now();
-  const input = { session_id: frame2.sessionId, cwd: ctx.folder.cwd };
+  const input = { session_id: frame.sessionId, cwd: ctx.folder.cwd };
   let fittedPlan;
-  const envelope = await buildEnvelope(input, ctx.machine, now, frame2.title, ctx.config.e2eKey, false, "opencode", frame2.startedAt, frame2.turnStartedAt, ctx.folder, frame2.model, { op: frame2.op, prio: frame2.prio, status: frame2.status }, undefined, frame2.plan, undefined, (plain) => {
+  const envelope = await buildEnvelope(input, ctx.machine, now, frame.title, ctx.config.e2eKey, false, "opencode", frame.startedAt, frame.turnStartedAt, ctx.folder, frame.model, { op: frame.op, prio: frame.prio, status: frame.status }, undefined, frame.plan, undefined, (plain) => {
     fittedPlan = plain.plan;
-  }, frame2.detail);
+  }, frame.detail);
   if (!envelope) {
-    ocForgetStatusFrame(ctx.state, frame2.sessionId);
+    ocForgetStatusFrame(ctx.state, frame.sessionId);
     return;
   }
-  const planFull = fullTextForRecord(frame2.plan, undefined);
-  const fullUpload = postFullText(ctx.config, frame2.sessionId, "plan", fullTextForRecord(frame2.plan, fittedPlan));
-  await trackSession(frame2.sessionId, frame2.op, frame2.prio, frame2.status, envelope.blob, ctx.machine, ctx.folder, "", "opencode", frame2.startedAt, frame2.turnStartedAt, undefined, frame2.title, ctx.config.pairingId, frame2.model, false, process.pid, ctx.origin, false, undefined, undefined, planFull);
+  const planFull = fullTextForRecord(frame.plan, undefined);
+  const fullUpload = postFullText(ctx.config, frame.sessionId, "plan", fullTextForRecord(frame.plan, fittedPlan));
+  await trackSession(frame.sessionId, frame.op, frame.prio, frame.status, envelope.blob, ctx.machine, ctx.folder, "", "opencode", frame.startedAt, frame.turnStartedAt, undefined, frame.title, ctx.config.pairingId, frame.model, false, process.pid, ctx.origin, false, undefined, undefined, planFull);
   ensureWatchdogCached(now);
   await atomicWrite(lastHookPath("opencode"), String(now)).catch(() => {});
   const delivered = await postOcEvent(ctx.config, envelope);
-  if (delivered && frame2.op === "done")
-    await markDoneDelivered(frame2.sessionId);
+  if (delivered && frame.op === "done")
+    await markDoneDelivered(frame.sessionId);
   if (!delivered)
-    ocForgetStatusFrame(ctx.state, frame2.sessionId);
+    ocForgetStatusFrame(ctx.state, frame.sessionId);
   await fullUpload;
 }
 var server = async (input) => {
@@ -4994,16 +4996,16 @@ var server = async (input) => {
     const canReply = ocPost(input?.client, serverUrl) !== undefined;
     const holds = new Map;
     const repaint = (sessionID, workingOnly = false) => enqueue(async () => {
-      const frame2 = ocPromptFrame(ctx.state, sessionID);
-      if (frame2 && !(workingOnly && frame2.status !== "working"))
-        await send(ctx, frame2);
+      const frame = ocPromptFrame(ctx.state, sessionID);
+      if (frame && !(workingOnly && frame.status !== "working"))
+        await send(ctx, frame);
     });
-    const sendPlanned = async (frame2) => {
-      if (frame2.op === "update" && frame2.status === "working" && ocRowHeld(ctx.state, frame2.sessionId)) {
-        ocForgetStatusFrame(ctx.state, frame2.sessionId);
+    const sendPlanned = async (frame) => {
+      if (frame.op === "update" && frame.status === "working" && ocRowHeld(ctx.state, frame.sessionId)) {
+        ocForgetStatusFrame(ctx.state, frame.sessionId);
         return;
       }
-      await send(ctx, frame2);
+      await send(ctx, frame);
     };
     const hold = (request) => {
       if (holds.has(request.id))
@@ -5062,8 +5064,8 @@ var server = async (input) => {
             settle(resolved);
             return;
           }
-          const frame2 = reduceOcEvent(ctx.state, event);
-          const sent = frame2 ? enqueue(() => sendPlanned(frame2)) : undefined;
+          const frame = reduceOcEvent(ctx.state, event);
+          const sent = frame ? enqueue(() => sendPlanned(frame)) : undefined;
           for (const ended of ocPromptsEndedBy(ctx.state, event)) {
             if (ended.byTool)
               retire(ended.id);
@@ -5078,8 +5080,8 @@ var server = async (input) => {
             retire(opencodeId);
           const frames = ocEndFrames(ctx.state);
           await enqueue(async () => {
-            for (const frame2 of frames)
-              await send(ctx, frame2);
+            for (const frame of frames)
+              await send(ctx, frame);
           });
         } catch {}
       }

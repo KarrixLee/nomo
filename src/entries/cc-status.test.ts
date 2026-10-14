@@ -179,6 +179,16 @@ describe("planOp (op mapping table)", () => {
     // No trigger at all (a payload shape we have not seen) keeps the mid-turn reading.
     expect(planOp("PreCompact", i(), false)).toEqual(working);
   });
+  test("an AUTO compaction over a DONE record (Claude Code compacting at the idle prompt) plans no frame", () => {
+    expect(planOp("PreCompact", i({ trigger: "auto" }), true)).toBeNull();
+    expect(planOp("PostCompact", i({ trigger: "auto", compact_summary: "…" }), true)).toBeNull();
+    expect(planOp("SessionStart", i({ source: "compact" }), true)).toBeNull();
+    // Mid-turn (no done sent yet) and every other SessionStart source are unchanged.
+    expect(planOp("SessionStart", i({ source: "compact" }), false)).toEqual({ op: "start", prio: 0, status: "working" });
+    for (const source of ["startup", "resume", "clear", undefined]) {
+      expect(planOp("SessionStart", i({ source }), true)).toEqual(working);
+    }
+  });
   test("Codex Interrupt → done", () => {
     expect(planOp("Interrupt", i({ turn_id: "t1", permission_mode: "default" }), false)).toEqual(done);
   });
@@ -1928,6 +1938,19 @@ await child.exited;
     });
   }, 30000);
 
+  test("an auto compact at the idle prompt (over a done row) touches nothing and posts nothing", async () => {
+    await withEventServer(async ({ home, sessionsDir, bodies }) => {
+      const doneRecord = workingRecord({ lastEvent: "done", sentDone: true, op: "done" });
+      await writeFile(join(sessionsDir, "cmp.json"), doneRecord);
+      const compact = (event: string, trigger: string) => ({ session_id: "cmp", hook_event_name: event, cwd: "/x/api-status", trigger });
+      await spawnHook(claudeEntry, home, compact("PreCompact", "auto"));
+      await spawnHook(claudeEntry, home, compact("PostCompact", "auto"));
+      await spawnHook(claudeEntry, home, { session_id: "cmp", hook_event_name: "SessionStart", cwd: "/x/api-status", source: "compact" });
+      expect(await readFile(join(sessionsDir, "cmp.json"), "utf8")).toBe(doneRecord);
+      expect(bodies).toEqual([]);
+    });
+  }, 30000);
+
   // Claude Code reads a hook's exit code 2 as a DECISION on these two: it declines the MCP elicitation and
   // blocks the compaction. The status entry is an observer, so whatever it is fed it must exit 0 and
   // print nothing — a paired machine, a dead worker and unparseable stdin alike.
@@ -3244,9 +3267,10 @@ describe("runHook awaitingPrompt (set by SessionStart, cleared by any other hook
     expect("awaitingPrompt" in rec).toBe(false);
   }, 20000);
 
-  test("a compact SessionStart over a DONE record (manual /compact at the idle prompt) sets it", async () => {
+  test("a compact SessionStart over a DONE record (a /compact at the idle prompt) leaves the done row as it was", async () => {
     const [rec] = await runHooks([compact], { lastEvent: "done", op: "done", sentDone: true });
-    expect(rec).toMatchObject({ lastEvent: "working", awaitingPrompt: true });
+    expect(rec).toMatchObject({ lastEvent: "done", op: "done", sentDone: true });
+    expect("awaitingPrompt" in rec).toBe(false);
   }, 20000);
 
   test("a compact SessionStart on a still-unprompted session (marker set) keeps it set", async () => {

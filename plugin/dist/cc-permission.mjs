@@ -297,7 +297,7 @@ async function unixSocketAccepts(socketPath, timeoutMs) {
   } catch {
     return false;
   }
-  return await new Promise((resolve2) => {
+  return await new Promise((resolve) => {
     let settled = false;
     let socket;
     const timer = setTimeout(() => done(false), timeoutMs);
@@ -310,7 +310,7 @@ async function unixSocketAccepts(socketPath, timeoutMs) {
       try {
         socket?.destroy();
       } catch {}
-      resolve2(accepted);
+      resolve(accepted);
     }
     try {
       socket = createConnection({ path: socketPath });
@@ -343,20 +343,20 @@ var CODEX_DAEMON_SOCKET_POLL_MS = 250;
 async function startCodexAppServerDaemon(deps = {}) {
   const trace = deps.trace ?? ((event) => traceSession(event));
   const probe = deps.probe ?? (() => codexAppServerSocketAvailable());
-  const sleep = deps.sleep ?? ((ms) => new Promise((resolve2) => setTimeout(resolve2, ms)));
+  const sleep = deps.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
   const command = deps.codexPath ?? "codex";
   const timeoutMs = deps.timeoutMs ?? CODEX_DAEMON_START_TIMEOUT_MS;
   const socketWaitMs = deps.socketWaitMs ?? CODEX_DAEMON_SOCKET_WAIT_MS;
   const spawnFn = deps.spawnFn ?? ((cmd, args) => spawn(cmd, [...args], { stdio: "ignore" }));
   let exit;
   try {
-    exit = await new Promise((resolve2) => {
+    exit = await new Promise((resolve) => {
       let settled = false;
       const done = (value) => {
         if (settled)
           return;
         settled = true;
-        resolve2(value);
+        resolve(value);
       };
       let child;
       try {
@@ -1867,11 +1867,11 @@ function codexProposedPlanMarkdown(text) {
   if (typeof text !== "string")
     return;
   const trimmed = text.trim();
-  const open2 = "<proposed_plan>";
+  const open = "<proposed_plan>";
   const close = "</proposed_plan>";
-  if (!trimmed.startsWith(open2) || !trimmed.endsWith(close))
+  if (!trimmed.startsWith(open) || !trimmed.endsWith(close))
     return;
-  return trimmed.slice(open2.length, -close.length).trim();
+  return trimmed.slice(open.length, -close.length).trim();
 }
 function codexFinalProposedPlan(row) {
   const payload = row.payload;
@@ -3102,14 +3102,14 @@ function parseCcSessionFile(raw) {
     ...num("statusUpdatedAt") !== undefined ? { statusUpdatedAt: num("statusUpdatedAt") } : {}
   };
 }
-function ccOpinion(file, join3, now) {
+function ccOpinion(file, join, now) {
   if (!file)
     return null;
-  if (typeof join3.pid !== "number" || !Number.isFinite(join3.pid) || file.pid !== join3.pid)
+  if (typeof join.pid !== "number" || !Number.isFinite(join.pid) || file.pid !== join.pid)
     return null;
-  if (file.sessionId !== join3.sessionId)
+  if (file.sessionId !== join.sessionId)
     return null;
-  const probed = join3.procStartedAt;
+  const probed = join.procStartedAt;
   if (typeof probed !== "number" || !Number.isFinite(probed))
     return null;
   const claimed = typeof file.startedAt === "number" && Number.isFinite(file.startedAt) ? file.startedAt : parseCcProcStart(file.procStart);
@@ -3169,7 +3169,7 @@ function stateHoldLive(hold, holdPidAlive, now) {
   return true;
 }
 function computeSessionState(input) {
-  const { sessionId, record, pairingId, hold, pidAlive: pidAlive2, holdPidAlive, cc, ccProcStartedAt, correctives, now } = input;
+  const { sessionId, record, pairingId, hold, pidAlive, holdPidAlive, cc, ccProcStartedAt, correctives, now } = input;
   if (record === null) {
     return { state: "ended", terminal: true, ts: now, why: "reap", blob: { kind: "last" }, agent: "claude" };
   }
@@ -3189,7 +3189,7 @@ function computeSessionState(input) {
     return of("ended", "end", sealed, ts, true);
   if (finite(record.ts) && now - record.ts > SESSION_STATE_STALE_MS)
     return of("ended", "stale", sealed, ts, true);
-  if (!pidAlive2)
+  if (!pidAlive)
     return of("ended", "reap", sealed, ts, true);
   const ccUsable = agent === "claude" && record.provisional !== true;
   const opinion = ccUsable ? ccOpinion(cc, { pid: record.pid, sessionId, procStartedAt: ccProcStartedAt }, now) : null;
@@ -3313,6 +3313,8 @@ function interruptedEventInput(input) {
 function planOp(hookName, input, sentDone) {
   switch (hookName) {
     case "SessionStart":
+      if (sentDone && input.source === "compact")
+        return null;
       return sentDone ? { op: "update", prio: 0, status: "working" } : { op: "start", prio: 0, status: "working" };
     case "PreToolUse": {
       const tool = typeof input.tool_name === "string" ? input.tool_name : "";
@@ -3334,7 +3336,7 @@ function planOp(hookName, input, sentDone) {
       return { op: "update", prio: 0, status: "working" };
     case "PreCompact":
     case "PostCompact":
-      return input.trigger === "manual" ? null : { op: "update", prio: 0, status: "working" };
+      return input.trigger === "manual" || sentDone ? null : { op: "update", prio: 0, status: "working" };
     case "Stop":
       return hasRunningBackgroundAgent(input) ? { op: "update", prio: 0, status: "working" } : { op: "done", prio: 0, status: "done" };
     case "StopFailure":
@@ -3639,8 +3641,8 @@ async function runHook(agent) {
     if (!config) {
       const pending = await loadPendingConfig();
       if (pending) {
-        const machine2 = pending.machineName ?? hostname().replace(/\.local$/, "");
-        await stashPendingEvent(input, machine2, await readTitle(), Date.now(), PENDING_STASH_PATH, process.ppid, agent, await readModel());
+        const machine = pending.machineName ?? hostname().replace(/\.local$/, "");
+        await stashPendingEvent(input, machine, await readTitle(), Date.now(), PENDING_STASH_PATH, process.ppid, agent, await readModel());
       }
       return;
     }
@@ -3655,13 +3657,13 @@ async function runHook(agent) {
         const line = interruptHookOutput(hookName);
         if (line !== null && await interruptFlagSetAt(SESSIONS_DIR, reportedSessionId, Date.now())) {
           interrupted = true;
-          await new Promise((resolve2) => {
-            process.stdout.on("error", () => resolve2());
+          await new Promise((resolve) => {
+            process.stdout.on("error", () => resolve());
             try {
               process.stdout.write(`${line}
-`, () => resolve2());
+`, () => resolve());
             } catch {
-              resolve2();
+              resolve();
             }
           });
         }
@@ -4620,8 +4622,8 @@ var LOOPBACK_MAX_CONSECUTIVE_ERRORS = 5;
 function createLoopbackAnswerPoller(config, requestId, deps) {
   const interval = deps.intervalMs ?? LOOPBACK_POLL_INTERVAL_MS;
   const discoverInterval = deps.discoverIntervalMs ?? POLL_INTERVAL_MS;
-  const tick = deps.sleep ?? ((ms) => new Promise((resolve3) => {
-    const timer = setTimeout(resolve3, ms);
+  const tick = deps.sleep ?? ((ms) => new Promise((resolve) => {
+    const timer = setTimeout(resolve, ms);
     timer.unref?.();
   }));
   let live = deps.statePath !== undefined;
@@ -4632,11 +4634,11 @@ function createLoopbackAnswerPoller(config, requestId, deps) {
   let traced = false;
   let pending;
   let wakeResolve = () => {};
-  let wake = new Promise((resolve3) => {
-    wakeResolve = resolve3;
+  let wake = new Promise((resolve) => {
+    wakeResolve = resolve;
   });
   let keyPromise;
-  const note2 = (result) => {
+  const note = (result) => {
     if (traced)
       return;
     traced = true;
@@ -4721,7 +4723,7 @@ function createLoopbackAnswerPoller(config, requestId, deps) {
         return;
       }
       if (errors >= LOOPBACK_MAX_CONSECUTIVE_ERRORS) {
-        note2("give-up");
+        note("give-up");
         live = false;
         return;
       }
@@ -4737,7 +4739,7 @@ function createLoopbackAnswerPoller(config, requestId, deps) {
         started = true;
         ticker().catch(() => {
           live = false;
-          note2("error");
+          note("error");
         });
       }
       await Promise.race([sleeping, wake]);
@@ -4893,8 +4895,8 @@ async function runPermissionHook(deps = {}, agent = "claude") {
     const sleep = deps.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
     let lastPostTs = 0;
     const postDecision = async (round, maxAttempts) => {
-      let hold2 = false;
-      let posted2 = false;
+      let hold = false;
+      let posted = false;
       let reason;
       for (let attempt = 1;attempt <= maxAttempts; attempt += 1) {
         const ts = Math.max((deps.now ?? Date.now)(), lastPostTs + 1);
@@ -4917,7 +4919,7 @@ async function runPermissionHook(deps = {}, agent = "claude") {
           });
           if (res.ok) {
             const body = await res.json().catch(() => ({}));
-            hold2 = body.hold === true;
+            hold = body.hold === true;
             if (typeof body.reason === "string")
               reason = body.reason;
           }
@@ -4928,10 +4930,10 @@ async function runPermissionHook(deps = {}, agent = "claude") {
             attempt,
             status: res.status,
             ts,
-            ...res.ok ? { hold: hold2 } : {},
+            ...res.ok ? { hold } : {},
             ...reason !== undefined ? { reason } : {}
           });
-          posted2 = true;
+          posted = true;
           break;
         } catch (e) {
           const name = e?.name ?? "Error";
@@ -4944,13 +4946,13 @@ async function runPermissionHook(deps = {}, agent = "claude") {
           }
         }
       }
-      return { posted: posted2, hold: hold2, reason };
+      return { posted, hold, reason };
     };
     const clock = deps.now ?? Date.now;
     const pollBudget = createPollBudget();
-    const pollDecision = async (seq2) => {
-      const budgetMs = pollBudget.next(seq2);
-      trace({ event: "poll-begin", seq: seq2, budgetMs });
+    const pollDecision = async (seq) => {
+      const budgetMs = pollBudget.next(seq);
+      trace({ event: "poll-begin", seq, budgetMs });
       const startedAt = clock();
       const measure = () => {
         const ms = clock() - startedAt;
@@ -4963,29 +4965,29 @@ async function runPermissionHook(deps = {}, agent = "claude") {
           signal: AbortSignal.timeout(budgetMs)
         });
         if (!res.ok) {
-          trace({ event: "poll-end", seq: seq2, outcome: "status", status: res.status, ms: measure() });
+          trace({ event: "poll-end", seq, outcome: "status", status: res.status, ms: measure() });
           return { status: res.status };
         }
         const data = await res.json();
-        trace({ event: "poll-end", seq: seq2, outcome: "ok", ms: measure() });
+        trace({ event: "poll-end", seq, outcome: "ok", ms: measure() });
         return { data, status: res.status };
       } catch (e) {
-        trace({ event: "poll-end", seq: seq2, outcome: "error", ...errorTag(e) });
+        trace({ event: "poll-end", seq, outcome: "error", ...errorTag(e) });
         return { status: 0 };
       }
     };
     let attentionStalled = false;
-    const stalledPatch = async (at2) => {
+    const stalledPatch = async (at) => {
       let stalledBlob = fallbackBlob;
       try {
-        stalledBlob = await encryptBlob(config.e2eKey, { ...base, reconnecting: Math.floor(at2 / 1000) });
+        stalledBlob = await encryptBlob(config.e2eKey, { ...base, reconnecting: Math.floor(at / 1000) });
       } catch {}
-      return { ts: at2, blob: stalledBlob, attentionStalledAt: at2 };
+      return { ts: at, blob: stalledBlob, attentionStalledAt: at };
     };
     const markAttentionStalled = async () => {
-      const at2 = (deps.now ?? Date.now)();
+      const at = (deps.now ?? Date.now)();
       try {
-        await (deps.settleHoldRecordFn ?? defaultSettleHoldRecord())(sessionId, await stalledPatch(at2));
+        await (deps.settleHoldRecordFn ?? defaultSettleHoldRecord())(sessionId, await stalledPatch(at));
       } catch {}
     };
     let { posted, hold, reason: holdReason } = await postDecision(1, POST_MAX_ATTEMPTS);
@@ -5178,13 +5180,13 @@ if (__require.main == __require.module) {
   let flushed = Promise.resolve();
   await runPermissionHook({
     emit: (line) => {
-      flushed = new Promise((resolve3) => {
-        const timer = setTimeout(resolve3, 1000);
+      flushed = new Promise((resolve) => {
+        const timer = setTimeout(resolve, 1000);
         timer.unref?.();
         process.stdout.write(`${line}
 `, () => {
           clearTimeout(timer);
-          resolve3();
+          resolve();
         });
       });
     }

@@ -228,6 +228,7 @@ export function interruptedEventInput(input: Record<string, unknown>): Record<st
 /// The LOCAL op planner (the worker is now blind — lifecycle semantics live here). Maps a hook to a
 /// v2 op, its delivery prio, and the semantic status carried in the blob:
 ///   SessionStart                                → start,  prio 0, working
+///   SessionStart (source compact, over a done)  → (no frame)
 ///   UserPromptSubmit / PostToolUse              → update, prio 0, working
 ///   PreToolUse (ordinary tool)                  → update, prio 0, working
 ///   PreToolUse (AskUserQuestion / ExitPlanMode) → update, prio 1, needsAttention  (blocked on the user)
@@ -238,8 +239,8 @@ export function interruptedEventInput(input: Record<string, unknown>): Record<st
 ///   PostToolUseFailure                          → update, prio 0, working   (dropped on is_interrupt)
 ///   Elicitation (+ its Notification twins)      → update, prio 1, needsAttention
 ///   ElicitationResult                           → update, prio 0, working
-///   PreCompact / PostCompact (auto)             → update, prio 0, working
-///   PreCompact / PostCompact (manual)           → (no frame)
+///   PreCompact / PostCompact (auto, mid-turn)   → update, prio 0, working
+///   PreCompact / PostCompact (manual, or auto over a done) → (no frame)
 ///   SessionEnd                                  → end,    prio 0, done
 /// Re-arm: a SessionStart AFTER an op:done was sent for this session (sentDone) restarts as a fresh
 /// `update`/working — the session already exists in the worker, so it's an update, not a new start.
@@ -247,6 +248,9 @@ export function interruptedEventInput(input: Record<string, unknown>): Record<st
 export function planOp(hookName: string, input: Record<string, unknown>, sentDone: boolean): OpPlan | null {
   switch (hookName) {
     case "SessionStart":
+      // A compaction never opens a turn: over a done record it is the idle-prompt compact the
+      // PreCompact case below already silenced, so it must not re-arm the row either.
+      if (sentDone && input.source === "compact") return null;
       return sentDone
         ? { op: "update", prio: 0, status: "working" }
         : { op: "start", prio: 0, status: "working" };
@@ -286,8 +290,11 @@ export function planOp(hookName: string, input: Record<string, unknown>, sentDon
       // cancelled or failed it fires no PostCompact, so a working raised here would sit on a finished row
       // until the 30-minute idle reap; completed, a working-then-done pair is indistinguishable to the
       // worker from a real turn and buzzes "Task finished" for a compact. The SessionStart source:"compact"
-      // that follows a completed one already settles the idle-prompt row (see awaitingPrompt in runHook).
-      return input.trigger === "manual" ? null : { op: "update", prio: 0, status: "working" };
+      // that follows a completed one is silenced too (see the SessionStart case above).
+      // An AUTO compaction over a DONE record is the idle-prompt case too: Claude Code (seen 2026-10)
+      // auto-compacts a session sitting idle at the prompt, ~an hour after its last Stop. A working
+      // here would clear sentDone and leave the finished row "running" until the 30-minute idle reap.
+      return input.trigger === "manual" || sentDone ? null : { op: "update", prio: 0, status: "working" };
     case "Stop":
       // The main agent stopped but a background subagent it launched has not: still working. That
       // subagent's report-back fires UserPromptSubmit and then another Stop, which lands the done.
@@ -1177,8 +1184,8 @@ export async function runHook(agent: AgentKind): Promise<void> {
     // set only over a record that says so:
     //   - no record yet → a fresh open. (Not for source:"compact": compaction of a session we have
     //     never tracked — the plugin enabled mid-turn — is a live turn, the anchor's exception above.)
-    //   - a DONE record → reopened at the idle prompt: a resume, or a manual `/compact` there, which
-    //     re-arms "working" with nothing left to retract it either.
+    //   - a DONE record → reopened at the idle prompt: a resume, which re-arms "working" with nothing
+    //     left to retract it either. (A compact over a done plans no frame — planOp — so never gets here.)
     //   - a record ALREADY awaiting → still unprompted; the value rides through.
     // Over a live working/needsAttention record it stays unset — a second `claude --resume <same id>`
     // or a mid-turn auto-compact must not expose a real turn to the reap during a hook-quiet stretch.

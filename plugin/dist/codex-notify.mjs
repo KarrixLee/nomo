@@ -291,7 +291,7 @@ async function unixSocketAccepts(socketPath, timeoutMs) {
   } catch {
     return false;
   }
-  return await new Promise((resolve2) => {
+  return await new Promise((resolve) => {
     let settled = false;
     let socket;
     const timer = setTimeout(() => done(false), timeoutMs);
@@ -304,7 +304,7 @@ async function unixSocketAccepts(socketPath, timeoutMs) {
       try {
         socket?.destroy();
       } catch {}
-      resolve2(accepted);
+      resolve(accepted);
     }
     try {
       socket = createConnection({ path: socketPath });
@@ -337,20 +337,20 @@ var CODEX_DAEMON_SOCKET_POLL_MS = 250;
 async function startCodexAppServerDaemon(deps = {}) {
   const trace = deps.trace ?? ((event) => traceSession(event));
   const probe = deps.probe ?? (() => codexAppServerSocketAvailable());
-  const sleep = deps.sleep ?? ((ms) => new Promise((resolve2) => setTimeout(resolve2, ms)));
+  const sleep = deps.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
   const command = deps.codexPath ?? "codex";
   const timeoutMs = deps.timeoutMs ?? CODEX_DAEMON_START_TIMEOUT_MS;
   const socketWaitMs = deps.socketWaitMs ?? CODEX_DAEMON_SOCKET_WAIT_MS;
   const spawnFn = deps.spawnFn ?? ((cmd, args) => spawn(cmd, [...args], { stdio: "ignore" }));
   let exit;
   try {
-    exit = await new Promise((resolve2) => {
+    exit = await new Promise((resolve) => {
       let settled = false;
       const done = (value) => {
         if (settled)
           return;
         settled = true;
-        resolve2(value);
+        resolve(value);
       };
       let child;
       try {
@@ -1861,11 +1861,11 @@ function codexProposedPlanMarkdown(text) {
   if (typeof text !== "string")
     return;
   const trimmed = text.trim();
-  const open2 = "<proposed_plan>";
+  const open = "<proposed_plan>";
   const close = "</proposed_plan>";
-  if (!trimmed.startsWith(open2) || !trimmed.endsWith(close))
+  if (!trimmed.startsWith(open) || !trimmed.endsWith(close))
     return;
-  return trimmed.slice(open2.length, -close.length).trim();
+  return trimmed.slice(open.length, -close.length).trim();
 }
 function codexFinalProposedPlan(row) {
   const payload = row.payload;
@@ -3101,14 +3101,14 @@ function parseCcSessionFile(raw) {
     ...num("statusUpdatedAt") !== undefined ? { statusUpdatedAt: num("statusUpdatedAt") } : {}
   };
 }
-function ccOpinion(file, join3, now) {
+function ccOpinion(file, join, now) {
   if (!file)
     return null;
-  if (typeof join3.pid !== "number" || !Number.isFinite(join3.pid) || file.pid !== join3.pid)
+  if (typeof join.pid !== "number" || !Number.isFinite(join.pid) || file.pid !== join.pid)
     return null;
-  if (file.sessionId !== join3.sessionId)
+  if (file.sessionId !== join.sessionId)
     return null;
-  const probed = join3.procStartedAt;
+  const probed = join.procStartedAt;
   if (typeof probed !== "number" || !Number.isFinite(probed))
     return null;
   const claimed = typeof file.startedAt === "number" && Number.isFinite(file.startedAt) ? file.startedAt : parseCcProcStart(file.procStart);
@@ -3168,7 +3168,7 @@ function stateHoldLive(hold, holdPidAlive, now) {
   return true;
 }
 function computeSessionState(input) {
-  const { sessionId, record, pairingId, hold, pidAlive: pidAlive2, holdPidAlive, cc, ccProcStartedAt, correctives, now } = input;
+  const { sessionId, record, pairingId, hold, pidAlive, holdPidAlive, cc, ccProcStartedAt, correctives, now } = input;
   if (record === null) {
     return { state: "ended", terminal: true, ts: now, why: "reap", blob: { kind: "last" }, agent: "claude" };
   }
@@ -3188,7 +3188,7 @@ function computeSessionState(input) {
     return of("ended", "end", sealed, ts, true);
   if (finite(record.ts) && now - record.ts > SESSION_STATE_STALE_MS)
     return of("ended", "stale", sealed, ts, true);
-  if (!pidAlive2)
+  if (!pidAlive)
     return of("ended", "reap", sealed, ts, true);
   const ccUsable = agent === "claude" && record.provisional !== true;
   const opinion = ccUsable ? ccOpinion(cc, { pid: record.pid, sessionId, procStartedAt: ccProcStartedAt }, now) : null;
@@ -3312,6 +3312,8 @@ function interruptedEventInput(input) {
 function planOp(hookName, input, sentDone) {
   switch (hookName) {
     case "SessionStart":
+      if (sentDone && input.source === "compact")
+        return null;
       return sentDone ? { op: "update", prio: 0, status: "working" } : { op: "start", prio: 0, status: "working" };
     case "PreToolUse": {
       const tool = typeof input.tool_name === "string" ? input.tool_name : "";
@@ -3333,7 +3335,7 @@ function planOp(hookName, input, sentDone) {
       return { op: "update", prio: 0, status: "working" };
     case "PreCompact":
     case "PostCompact":
-      return input.trigger === "manual" ? null : { op: "update", prio: 0, status: "working" };
+      return input.trigger === "manual" || sentDone ? null : { op: "update", prio: 0, status: "working" };
     case "Stop":
       return hasRunningBackgroundAgent(input) ? { op: "update", prio: 0, status: "working" } : { op: "done", prio: 0, status: "done" };
     case "StopFailure":
@@ -3638,8 +3640,8 @@ async function runHook(agent) {
     if (!config) {
       const pending = await loadPendingConfig();
       if (pending) {
-        const machine2 = pending.machineName ?? hostname().replace(/\.local$/, "");
-        await stashPendingEvent(input, machine2, await readTitle(), Date.now(), PENDING_STASH_PATH, process.ppid, agent, await readModel());
+        const machine = pending.machineName ?? hostname().replace(/\.local$/, "");
+        await stashPendingEvent(input, machine, await readTitle(), Date.now(), PENDING_STASH_PATH, process.ppid, agent, await readModel());
       }
       return;
     }
@@ -3654,13 +3656,13 @@ async function runHook(agent) {
         const line = interruptHookOutput(hookName);
         if (line !== null && await interruptFlagSetAt(SESSIONS_DIR, reportedSessionId, Date.now())) {
           interrupted = true;
-          await new Promise((resolve2) => {
-            process.stdout.on("error", () => resolve2());
+          await new Promise((resolve) => {
+            process.stdout.on("error", () => resolve());
             try {
               process.stdout.write(`${line}
-`, () => resolve2());
+`, () => resolve());
             } catch {
-              resolve2();
+              resolve();
             }
           });
         }
@@ -4063,7 +4065,7 @@ if (__require.main == __require.module) {
   process.exit(0);
 }
 export {
-  synthStopInput,
+  notifyFallbackTitle,
   runNotify,
-  notifyFallbackTitle
+  synthStopInput
 };
