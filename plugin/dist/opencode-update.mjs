@@ -286,7 +286,7 @@ async function unixSocketAccepts(socketPath, timeoutMs) {
   } catch {
     return false;
   }
-  return await new Promise((resolve2) => {
+  return await new Promise((resolve) => {
     let settled = false;
     let socket;
     const timer = setTimeout(() => done(false), timeoutMs);
@@ -299,7 +299,7 @@ async function unixSocketAccepts(socketPath, timeoutMs) {
       try {
         socket?.destroy();
       } catch {}
-      resolve2(accepted);
+      resolve(accepted);
     }
     try {
       socket = createConnection({ path: socketPath });
@@ -332,20 +332,20 @@ var CODEX_DAEMON_SOCKET_POLL_MS = 250;
 async function startCodexAppServerDaemon(deps = {}) {
   const trace = deps.trace ?? ((event) => traceSession(event));
   const probe = deps.probe ?? (() => codexAppServerSocketAvailable());
-  const sleep = deps.sleep ?? ((ms) => new Promise((resolve2) => setTimeout(resolve2, ms)));
+  const sleep = deps.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
   const command = deps.codexPath ?? "codex";
   const timeoutMs = deps.timeoutMs ?? CODEX_DAEMON_START_TIMEOUT_MS;
   const socketWaitMs = deps.socketWaitMs ?? CODEX_DAEMON_SOCKET_WAIT_MS;
   const spawnFn = deps.spawnFn ?? ((cmd, args) => spawn(cmd, [...args], { stdio: "ignore" }));
   let exit;
   try {
-    exit = await new Promise((resolve2) => {
+    exit = await new Promise((resolve) => {
       let settled = false;
       const done = (value) => {
         if (settled)
           return;
         settled = true;
-        resolve2(value);
+        resolve(value);
       };
       let child;
       try {
@@ -1284,6 +1284,6 @@ if (__require.main == __require.module) {
   process.exit(opencodeUpdate());
 }
 export {
-  opencodeUpdate,
-  checkUpdate
+  checkUpdate,
+  opencodeUpdate
 };
