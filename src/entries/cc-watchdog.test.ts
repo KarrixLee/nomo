@@ -14,17 +14,17 @@ import {
   claudeTailPendingApproval, codexLastTurnEvent, codexTailPendingApproval, correctIdleClaude, correctInterrupt,
   CODEX_TUI_SESSION_START_SKEW_MS, correlateCodexTuiPid, resolveCodexTuiOwner,
   COMMAND_FUTURE_SKEW_MS, COMMAND_TTL_MS, commandIsFresh,
-  codexBridgeIsDown, correctPendingApproval, correctPendingDone, correctPlanPickerVerification, correctResolvedPlanPicker, createBridgeSupervisor, discoverLiveSessions, drainCommands, effectiveDoneAttempts, extractCommands, goneStrikeShouldTeardown,
+  codexBridgeIsDown, correctPendingApproval, correctPendingDone, correctPendingUpdate, noteResend, resendAllowed, resendBackoffMs, resetResendBackoff, RESEND_BACKOFF_MAX_MS, correctPlanPickerVerification, correctResolvedPlanPicker, createBridgeSupervisor, discoverLiveSessions, drainCommands, effectiveDoneAttempts, extractCommands, goneStrikeShouldTeardown,
   enforceWatchdogOwnership, hasInterruptMarker, IDLE_GRACE_MS, isClaudeIdleReapEligible, isRetireEligible, isRightfulWatchdogOwner, lastTurnLine, PAIRING_TTL_MS, pendingDoneRetryWrite,
   pendingDoneSettleWrite, pendingPairingExpired, planPickerPendingExpired, PLAN_PICKER_PENDING_MAX_MS, pruneStaleDecisionHolds,
   PLAN_PICKER_RECENT_DONE_MS, PLAN_PICKER_VERIFY_MAX_MS, RETIRE_AFTER_MS,
   buildWorkingEnvelope, postOutcomeForStatus, provisionalsCoveredByReal, reconcileProvisionalsSweep, recordMovedSince, resetCommandState, resetDoneAttemptMemory, retireDoneStale,
   setCodexBridgeDown, shouldHeartbeat, shouldIdleProvisionalCheck,
   heartbeatKind, isWaitingSession, CLAUDE_AWAITING_PROMPT_REAP_MS, CLAUDE_IDLE_REAP_MAX_ATTEMPTS, POLL_MS,
-  shouldInterruptCheck, shouldPendingApprovalCheck, shouldPendingDoneCheck, shouldPlanPickerVerificationCheck, shouldRepairTitle, tailShowsInterrupt, titleRepairedRecord,
+  shouldInterruptCheck, shouldPendingApprovalCheck, shouldPendingDoneCheck, PENDING_DONE_GRACE_MS, PENDING_DONE_POST_TIMEOUT_MS, shouldPlanPickerVerificationCheck, shouldRepairTitle, tailShowsInterrupt, titleRepairedRecord,
   watchdogEventHeaders, WAITING_HEARTBEAT_AFTER_MS, withDeadline,
 } from "./cc-watchdog";
-import type { CommandPayload, DrainCommandsDeps, PostOutcome, RecordEntry } from "./cc-watchdog";
+import type { CommandPayload, DrainCommandsDeps, PostDetail, PostOutcome, RecordEntry } from "./cc-watchdog";
 import { resolveOnRelay } from "../core/codex-remote-input";
 import { CODEX_PROXY_STDOUT_ENDED } from "../core/codex-proxy-transport";
 import { buildStatePlaintext, STATE_HOLD_MAX_AGE_MS } from "../core/session-state";
@@ -551,6 +551,52 @@ describe("correctPendingDone (re-POST a done whose delivery was never confirmed)
     expect(traces).toEqual([expect.objectContaining({
       event: "pending-done", sessionId: "s2", outcome: "delivered", delivered: true,
     })]);
+  });
+
+  // A 2.00 s "failed" used to be only a guess at a timeout; the line now says which it was.
+  test("the breadcrumb says WHY a send failed: HTTP status, or timeout/network, and how long it took", async () => {
+    const traces: Record<string, unknown>[] = [];
+    const seams = { writeRecord: async () => {}, trace: (e: object) => { traces.push(e as Record<string, unknown>); } };
+    await correctPendingDone(cfg(), "/tmp/s.json", "why-1", owed(), NOW, {
+      ...seams, post: async (_b, d) => { d.error = "timeout"; d.ms = 5001; return "failed" as PostOutcome; },
+    });
+    await correctPendingDone(cfg(), "/tmp/s.json", "why-2", owed(), NOW, {
+      ...seams, post: async (_b, d) => { d.status = 503; d.ms = 120; return "failed" as PostOutcome; },
+    });
+    expect(traces[0]).toMatchObject({ event: "pending-done", outcome: "failed", error: "timeout", ms: 5001 });
+    expect(traces[0].status).toBeUndefined();
+    expect(traces[1]).toMatchObject({ event: "pending-done", outcome: "failed", status: 503, ms: 120 });
+    // Diagnostics only: nothing of the envelope (blob, secrets) may ride along.
+    expect(Object.keys(traces[0]).sort()).toEqual(
+      ["at", "attempts", "delivered", "error", "event", "ms", "outcome", "sessionId", "status"]);
+  });
+
+  // The hook writes the record BEFORE its own 2 s POST; a sweep landing in that window used to re-send
+  // the very done that was still in flight (observed 0.36 s after the Stop) and burn an attempt on it.
+  test("a debt younger than the grace is left alone — the hook's own send may still be in flight", async () => {
+    let posts = 0;
+    const writes: SessionRecord[] = [];
+    const traces: object[] = [];
+    const seams = {
+      post: async () => { posts++; return "delivered" as PostOutcome; },
+      writeRecord: async (_p: string, r: SessionRecord) => { writes.push(r); },
+      trace: (e: object) => { traces.push(e); },
+    };
+    const young = owed({ ts: NOW - 360 });
+    // "pending": the net still OWNS the session this sweep, and the debt stays on the record.
+    expect(await correctPendingDone(cfg(), "/tmp/s.json", "g", young, NOW, seams)).toBe("pending");
+    expect(await correctPendingDone(cfg(), "/tmp/s.json", "g", young, NOW - 360 + PENDING_DONE_GRACE_MS - 1, seams)).toBe("pending");
+    expect([posts, writes.length, traces.length]).toEqual([0, 0, 0]);
+    expect(young.donePending).toBe(true);
+    // Once the hook's 2 s budget is safely past, the same record is paid.
+    expect(await correctPendingDone(cfg(), "/tmp/s.json", "g", young, NOW - 360 + PENDING_DONE_GRACE_MS, seams)).toBe("corrected");
+    expect(posts).toBe(1);
+  });
+
+  test("the corrective send gets more room than a hook's 2 s, and the grace outlasts that 2 s", () => {
+    expect(PENDING_DONE_POST_TIMEOUT_MS).toBe(5000);
+    expect(PENDING_DONE_GRACE_MS).toBeGreaterThan(2000);
+    expect(PENDING_DONE_GRACE_MS).toBeLessThan(POLL_MS); // at most ONE sweep is ever skipped
   });
 
   test("a revoke bubbles up so the loop can tear the pairing down", async () => {
@@ -1363,7 +1409,7 @@ describe("codexLastTurnEvent + tailShowsInterrupt (agent-parametrized marker)", 
     expect(tailShowsInterrupt(ev("task_complete"), "codex")).toBe(false);
     expect(tailShowsInterrupt([ev("turn_aborted"), ev("task_started")].join("\n"), "codex")).toBe(false);
     // Claude path is unchanged: its assistant line carrying the marker still triggers.
-    const claudeTail = asstTurn("[Request interrupted by user]");
+    const claudeTail = userTurn("[Request interrupted by user]");
     expect(tailShowsInterrupt(claudeTail, "claude")).toBe(true);
     expect(tailShowsInterrupt(asstTurn("still working"), "claude")).toBe(false);
     // Cross-agent guard: a codex tail read with the claude marker (no user/assistant line) → false.
@@ -2526,7 +2572,7 @@ describe("buildProvisionalRecord stamps the sealing pairing", () => {
 //   * past the cap   → pin done LOCALLY so the every-sweep flap ends (the worker's eviction resolves it).
 
 describe("correctInterrupt (settle an interrupted session — the done pin sticks, retry is bounded)", () => {
-  const interruptTail = asstTurn("[Request interrupted by user]");
+  const interruptTail = userTurn("[Request interrupted by user]");
   const attn = (over: Partial<SessionRecord> = {}): SessionRecord =>
     irec({ lastEvent: "needsAttention", op: "update", prio: 1, blob: "ATTN", transcript: "/tmp/t.jsonl", ...over });
   const NOW = 9_000_000;
@@ -2635,7 +2681,7 @@ describe("live-decision-hold gate: no op:done corrective may land while an appro
   const cleared = { readDecisionHoldFn: async () => null, holdPidAliveFn: () => true };
 
   describe("correctInterrupt (the prime producer: a needsAttention record + an interrupt marker)", () => {
-    const interruptTail = asstTurn("[Request interrupted by user]");
+    const interruptTail = userTurn("[Request interrupted by user]");
     const attn = (over: Partial<SessionRecord> = {}): SessionRecord =>
       irec({ lastEvent: "needsAttention", op: "update", prio: 1, blob: "ATTN", transcript: "/tmp/t.jsonl", ...over });
     const seams = (extra: object) => ({
@@ -3532,7 +3578,7 @@ describe("retireDoneStale re-reads before it deletes (a woken session is never r
 // bound at zero forever — one doomed done POST every 5 s, indefinitely.
 describe("corrective-done retries stay bounded even when EVERY record write fails", () => {
   const NOW = 9_000_000;
-  const interruptTail = asstTurn("[Request interrupted by user]");
+  const interruptTail = userTurn("[Request interrupted by user]");
 
   test("correctInterrupt: a never-persisting counter still hits the cap (memory-backed bound)", async () => {
     let posts = 0;
@@ -4050,6 +4096,150 @@ describe("drainCommands (authenticate, validate, then execute)", () => {
   test("a throwing take() cannot derail the sweep", async () => {
     expect(await drainCommands(cfg(), { take: () => { throw new Error("boom"); } })).toBe(0);
   });
+
+  describe("interrupt-session", () => {
+    /** A mid-turn record: the interrupt is refused outright once the record reads done. */
+    const running = (over: Partial<SessionRecord>): RecordEntry => entry("sess-a", { lastEvent: "working", ...over });
+
+    test("a Claude session gets its interrupt flag stamped, and nothing is focused", async () => {
+      const { focused, traces, deps } = harness();
+      const flagged: Array<[string, number]> = [];
+      const cmd = await sealed({ kind: "interrupt-session" });
+      const count = await drainCommands(cfg(), {
+        ...deps,
+        take: () => [cmd],
+        readRecords: async () => [running({ agent: "claude" })],
+        writeInterruptFlagFn: async (sessionId, now) => { flagged.push([sessionId, now]); },
+      });
+      expect(count).toBe(0);                       // the return value counts focused windows only
+      expect(focused).toEqual([]);
+      expect(flagged).toEqual([["sess-a", NOW]]);
+      expect(traces[0]).toMatchObject({ kind: "interrupt-session", agent: "claude", result: "interrupt-flagged" });
+    });
+
+    test("a Codex session is interrupted through the bridge with the record's own turn id", async () => {
+      const { traces, deps } = harness();
+      const calls: Array<[string, string]> = [];
+      const cmd = await sealed({ kind: "interrupt-session" });
+      await drainCommands(cfg(), {
+        ...deps,
+        take: () => [cmd],
+        readRecords: async () => [running({ agent: "codex", turnId: "turn-9" })],
+        interruptCodexTurnFn: async (threadId, turnId) => { calls.push([threadId, turnId]); return "sent"; },
+      });
+      expect(calls).toEqual([["sess-a", "turn-9"]]);
+      expect(traces[0]).toMatchObject({ agent: "codex", result: "interrupt-sent" });
+    });
+
+    test("a Codex record with no turn id is refused — an empty turnId means 'startup interrupt' to the app-server", async () => {
+      const { traces, deps } = harness();
+      let called = false;
+      const cmd = await sealed({ kind: "interrupt-session" });
+      await drainCommands(cfg(), {
+        ...deps,
+        take: () => [cmd],
+        readRecords: async () => [running({ agent: "codex" })],
+        interruptCodexTurnFn: async () => { called = true; return "sent"; },
+      });
+      expect(called).toBe(false);
+      expect(traces[0]).toMatchObject({ result: "no-turn" });
+    });
+
+    test("Codex with the bridge down is traced, not thrown", async () => {
+      const { traces, deps } = harness();
+      const cmd = await sealed({ kind: "interrupt-session" });
+      await drainCommands(cfg(), {
+        ...deps,
+        take: () => [cmd],
+        readRecords: async () => [running({ agent: "codex", turnId: "turn-9" })],
+        interruptCodexTurnFn: async () => "unavailable",
+      });
+      expect(traces[0]).toMatchObject({ result: "bridge-unavailable" });
+    });
+
+    test("a Codex interrupt the app-server refuses, or that throws, is interrupt-failed", async () => {
+      for (const interruptCodexTurnFn of [async () => "failed" as const, async () => { throw new Error("boom"); }]) {
+        resetCommandState();
+        const { traces, deps } = harness();
+        const cmd = await sealed({ kind: "interrupt-session" });
+        await drainCommands(cfg(), {
+          ...deps,
+          take: () => [cmd],
+          readRecords: async () => [running({ agent: "codex", turnId: "turn-9" })],
+          interruptCodexTurnFn,
+        });
+        expect(traces[0]).toMatchObject({ result: "interrupt-failed" });
+      }
+    });
+
+    test("an agent with no interrupt seam is unsupported", async () => {
+      const { traces, deps } = harness();
+      const cmd = await sealed({ kind: "interrupt-session" });
+      await drainCommands(cfg(), {
+        ...deps,
+        take: () => [cmd],
+        readRecords: async () => [running({ agent: "opencode" })],
+      });
+      expect(traces[0]).toMatchObject({ result: "unsupported" });
+    });
+
+    test("a Cursor session is read-only: no flag is stamped and no bridge is asked", async () => {
+      const { focused, traces, deps } = harness();
+      const touched: string[] = [];
+      const cmd = await sealed({ kind: "interrupt-session" });
+      const count = await drainCommands(cfg(), {
+        ...deps,
+        take: () => [cmd],
+        readRecords: async () => [running({ agent: "cursor", turnId: "turn-9" })],
+        writeInterruptFlagFn: async () => { touched.push("flag"); },
+        interruptCodexTurnFn: async () => { touched.push("bridge"); return "sent"; },
+      });
+      expect(count).toBe(0);
+      expect(focused).toEqual([]);
+      expect(touched).toEqual([]);
+      expect(traces[0]).toMatchObject({ kind: "interrupt-session", agent: "cursor", result: "unsupported" });
+    });
+
+    test("a session whose turn is already over is not flagged — the flag would sit until the NEXT turn", async () => {
+      const { traces, deps } = harness();
+      const flagged: string[] = [];
+      const cmd = await sealed({ kind: "interrupt-session" });
+      await drainCommands(cfg(), {
+        ...deps,
+        take: () => [cmd],
+        readRecords: async () => [entry("sess-a", { agent: "claude", lastEvent: "done" })],
+        writeInterruptFlagFn: async (sessionId) => { flagged.push(sessionId); },
+      });
+      expect(flagged).toEqual([]);
+      expect(traces[0]).toMatchObject({ agent: "claude", result: "not-running" });
+    });
+
+    test("a done Codex session never reaches the bridge", async () => {
+      const { traces, deps } = harness();
+      let called = false;
+      const cmd = await sealed({ kind: "interrupt-session" });
+      await drainCommands(cfg(), {
+        ...deps,
+        take: () => [cmd],
+        readRecords: async () => [entry("sess-a", { agent: "codex", turnId: "turn-9", lastEvent: "done" })],
+        interruptCodexTurnFn: async () => { called = true; return "sent"; },
+      });
+      expect(called).toBe(false);
+      expect(traces[0]).toMatchObject({ agent: "codex", result: "not-running" });
+    });
+
+    test("it passes the same gates as focus: an unknown session is refused before anything is stamped", async () => {
+      const { traces, deps } = harness();
+      const flagged: string[] = [];
+      const cmd = await sealed({ kind: "interrupt-session", sessionId: "nope" });
+      await drainCommands(cfg(), {
+        ...deps, take: () => [cmd],
+        writeInterruptFlagFn: async (sessionId) => { flagged.push(sessionId); },
+      });
+      expect(flagged).toEqual([]);
+      expect(traces[0]).toMatchObject({ result: "unknown-session" });
+    });
+  });
 });
 
 // --- the LAN channel's glue into the SAME command chain (NOM-44 phase 1) -----------------------
@@ -4380,5 +4570,116 @@ describe("heartbeatKind (both cadences at once)", () => {
     }
     expect(beats).toBeLessThanOrEqual(12);
     expect(beats).toBeGreaterThan(0);
+  });
+});
+
+// A running session whose hook POST threw (timeout / network) leaves `updatePending` on its record; this
+// net re-sends the record's CURRENT blob and clears the debt on a 2xx.
+describe("correctPendingUpdate (re-send a running session's state the relay never received)", () => {
+  const NOW = 9_000_000;
+  const TS = NOW - 3_000;
+  const owed = (over: Partial<SessionRecord> = {}): SessionRecord =>
+    rec({ lastEvent: "working", op: "update", prio: 0, blob: "CURRENT", pairingId: "p", updatePending: true, ts: TS, ...over });
+  /** A one-record "disk" plus a recording poster. */
+  const world = (disk: SessionRecord | null, outcome: PostOutcome = "delivered", detail: PostDetail = { status: 200, ms: 2837 }) => {
+    const w = {
+      disk, posts: [] as Record<string, unknown>[], traces: [] as Record<string, unknown>[],
+      seams: {
+        readRecord: async () => w.disk,
+        writeRecord: async (_p: string, r: SessionRecord) => { w.disk = JSON.parse(JSON.stringify(r)); },
+        post: async (b: object, d: PostDetail) => { w.posts.push(b as Record<string, unknown>); Object.assign(d, detail); return outcome; },
+        trace: (e: object) => { w.traces.push(e as Record<string, unknown>); },
+        readDecisionHoldFn: async () => null,
+      },
+    };
+    return w;
+  };
+  beforeEach(() => resetResendBackoff());
+  afterEach(() => resetResendBackoff());
+
+  test("delivered → re-sends the CURRENT blob under the record's op/prio/ts, clears only the marker, traces why", async () => {
+    const w = world(owed());
+    expect(await correctPendingUpdate(cfg(), "/tmp/s.json", "s", owed(), NOW, { ...w.seams, now: () => NOW + 7 })).toBe("corrected");
+    expect(w.posts).toEqual([{ v: 2, sessionId: "s", op: "update", prio: 0, ts: NOW + 7, blob: "CURRENT" }]);
+    expect(w.disk).toEqual(JSON.parse(JSON.stringify(owed({ updatePending: undefined }))));
+    expect(w.traces).toEqual([expect.objectContaining({ event: "pending-update", outcome: "delivered", delivered: true, status: 200, ms: 2837, backoffMs: 0 })]);
+  });
+
+  test("the resend is stamped NOW, strictly later than the record's ts, so the relay cannot drop it as stale", async () => {
+    // The relay drops a non-terminal frame with ts <= lastTs, and it may already hold the original event
+    // (stored, then cancelled before the push) — a record-stamped resend would be a silent no-op.
+    const w = world(owed());
+    const before = Date.now();
+    await correctPendingUpdate(cfg(), "/tmp/s.json", "s", owed(), NOW, w.seams); // default clock
+    expect(w.posts[0].ts as number).toBeGreaterThan(TS);
+    expect(w.posts[0].ts as number).toBeGreaterThanOrEqual(before);
+    expect(w.disk!.ts).toBe(TS); // the record's own event clock is never rewritten by a resend
+  });
+
+  test("healthy path: no marker, or a terminal record → nothing read, posted or written", async () => {
+    for (const r of [owed({ updatePending: undefined }), owed({ op: "done", lastEvent: "done" })]) {
+      const w = world(r);
+      expect(await correctPendingUpdate(cfg(), "/tmp/s.json", "s", r, NOW, w.seams)).toBe("uncorrected");
+      expect(w.posts).toHaveLength(0);
+      expect(w.disk).toBe(r);
+    }
+  });
+
+  test("a newer hook write BEFORE the POST wins: nothing is sent from the stale snapshot", async () => {
+    const newer = owed({ ts: TS + 1_000, blob: "NEWER", updatePending: undefined });
+    const w = world(newer);
+    expect(await correctPendingUpdate(cfg(), "/tmp/s.json", "s", owed(), NOW, w.seams)).toBe("uncorrected");
+    expect(w.posts).toHaveLength(0);
+    expect(w.disk).toBe(newer);
+  });
+
+  test("a newer hook write DURING the POST wins: its record — and its own debt — are left untouched", async () => {
+    const newer = owed({ ts: TS + 1_000, blob: "NEWER" }); // that hook's POST failed too → its own marker
+    const w = world(owed());
+    w.seams.post = async (b) => { w.posts.push(b as Record<string, unknown>); w.disk = newer; return "delivered"; };
+    expect(await correctPendingUpdate(cfg(), "/tmp/s.json", "s", owed(), NOW, w.seams)).toBe("corrected");
+    expect(w.disk).toBe(newer);
+    expect(newer.updatePending).toBe(true);
+  });
+
+  test("a live approval hold defers the resend: nothing posted, debt kept", async () => {
+    const w = world(owed({ lastEvent: "needsAttention", prio: 1 }));
+    const v = await correctPendingUpdate(cfg(), "/tmp/s.json", "s", w.disk!, NOW, {
+      ...w.seams,
+      readDecisionHoldFn: async () => ({ blob: "CARD", pid: 77, at: NOW - 1_000 }),
+      holdPidAliveFn: () => true,
+    });
+    expect(v).toBe("uncorrected");
+    expect(w.posts).toHaveLength(0);
+    expect(w.disk!.updatePending).toBe(true);
+  });
+
+  test("a failed resend keeps the debt and backs the whole pairing off, doubling to a cap; a delivery resets it", async () => {
+    const w = world(owed(), "failed", { error: "timeout", ms: 5000 });
+    expect(await correctPendingUpdate(cfg(), "/tmp/s.json", "s", owed(), NOW, w.seams)).toBe("pending");
+    expect(w.disk!.updatePending).toBe(true);
+    expect(w.traces[0]).toMatchObject({ outcome: "failed", delivered: false, error: "timeout", ms: 5000, backoffMs: 5_000 });
+    // Inside the window NO session of the pairing is tried — an offline Mac pays for one send, not N.
+    expect(await correctPendingUpdate(cfg(), "/tmp/other.json", "other", owed(), NOW + 4_999, w.seams)).toBe("uncorrected");
+    expect(w.posts).toHaveLength(1);
+    expect(await correctPendingUpdate(cfg(), "/tmp/s.json", "s", owed(), NOW + 5_000, w.seams)).toBe("pending");
+    expect(w.traces[1]).toMatchObject({ backoffMs: 10_000 });
+    expect([1, 2, 3, 4, 5, 6, 60].map(resendBackoffMs)).toEqual([5_000, 10_000, 20_000, 40_000, RESEND_BACKOFF_MAX_MS, RESEND_BACKOFF_MAX_MS, RESEND_BACKOFF_MAX_MS]);
+    expect(resendAllowed(NOW + 14_999)).toBe(false);
+    expect(noteResend(true, NOW + 15_000)).toBe(0);
+    expect(resendAllowed(NOW + 15_000)).toBe(true);
+  });
+
+  test("a blob sealed under a pairing that is gone can never be sent → the debt is dropped, nothing posted", async () => {
+    const w = world(owed({ pairingId: "old" }));
+    expect(await correctPendingUpdate(cfg(), "/tmp/s.json", "s", w.disk!, NOW, w.seams)).toBe("uncorrected");
+    expect(w.posts).toHaveLength(0);
+    expect(w.disk).not.toHaveProperty("updatePending");
+  });
+
+  test("revoked bubbles up without arming the back-off", async () => {
+    const w = world(owed(), "revoked", { status: 404 });
+    expect(await correctPendingUpdate(cfg(), "/tmp/s.json", "s", owed(), NOW, w.seams)).toBe("revoked");
+    expect(resendAllowed(NOW)).toBe(true);
   });
 });

@@ -92,8 +92,10 @@ async function sha256Hex(s) {
 }
 
 // src/core/adapter.ts
-import { execFile as execFile2 } from "node:child_process";
+import { execFile as execFile2, execFileSync as execFileSync2 } from "node:child_process";
+import { existsSync as existsSync2 } from "node:fs";
 import { readdir, readFile as readFile2, stat as stat2 } from "node:fs/promises";
+import { devNull } from "node:os";
 import { promisify as promisify2 } from "node:util";
 import { basename as basename2, join as join2 } from "node:path";
 
@@ -104,7 +106,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "2.2.2";
+var PLUGIN_VERSION = "2.3.0";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -164,6 +166,7 @@ function tracePlanPickerDecision(sessionId, decision, path) {
 var SESSIONS_DIR = `${CC_DIR}/sessions`;
 var WATCHDOG_PID_PATH = `${CC_DIR}/watchdog.pid`;
 var LAST_SEND_PATH = `${CC_DIR}/last-send`;
+var SEND_FAIL_PATH = `${CC_DIR}/last-send-fail`;
 var GONE_STRIKES_PATH = `${CC_DIR}/gone-strikes`;
 var GONE_STRIKE_LIMIT = 2;
 var NO_HOLD_PATH = `${CC_DIR}/no-hold`;
@@ -272,6 +275,11 @@ function codexHome() {
   const env = process.env.CODEX_HOME;
   return env && env.length > 0 ? env : `${process.env.HOME}/.codex`;
 }
+function cursorHome() {
+  const env = process.env.CURSOR_CONFIG_DIR;
+  return env && env.length > 0 ? env : `${process.env.HOME}/.cursor`;
+}
+var CURSOR_HOOK_MARKER = "cursor-status.mjs";
 var CODEX_HOOK_MARKER = "codex-status.mjs";
 function codexAppServerSocketPath() {
   return `${codexHome()}/app-server-control/app-server-control.sock`;
@@ -284,7 +292,7 @@ async function unixSocketAccepts(socketPath, timeoutMs) {
   } catch {
     return false;
   }
-  return await new Promise((resolve2) => {
+  return await new Promise((resolve) => {
     let settled = false;
     let socket;
     const timer = setTimeout(() => done(false), timeoutMs);
@@ -297,7 +305,7 @@ async function unixSocketAccepts(socketPath, timeoutMs) {
       try {
         socket?.destroy();
       } catch {}
-      resolve2(accepted);
+      resolve(accepted);
     }
     try {
       socket = createConnection({ path: socketPath });
@@ -330,20 +338,20 @@ var CODEX_DAEMON_SOCKET_POLL_MS = 250;
 async function startCodexAppServerDaemon(deps = {}) {
   const trace = deps.trace ?? ((event) => traceSession(event));
   const probe = deps.probe ?? (() => codexAppServerSocketAvailable());
-  const sleep = deps.sleep ?? ((ms) => new Promise((resolve2) => setTimeout(resolve2, ms)));
+  const sleep = deps.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
   const command = deps.codexPath ?? "codex";
   const timeoutMs = deps.timeoutMs ?? CODEX_DAEMON_START_TIMEOUT_MS;
   const socketWaitMs = deps.socketWaitMs ?? CODEX_DAEMON_SOCKET_WAIT_MS;
   const spawnFn = deps.spawnFn ?? ((cmd, args) => spawn(cmd, [...args], { stdio: "ignore" }));
   let exit;
   try {
-    exit = await new Promise((resolve2) => {
+    exit = await new Promise((resolve) => {
       let settled = false;
       const done = (value) => {
         if (settled)
           return;
         settled = true;
-        resolve2(value);
+        resolve(value);
       };
       let child;
       try {
@@ -917,6 +925,27 @@ async function writeDecisionHold(sessionId, hold) {
 }
 async function clearDecisionHold(sessionId, pid, beforeUnlink, holdId) {
   return clearDecisionHoldAt(SESSIONS_DIR, sessionId, pid, beforeUnlink, holdId);
+}
+var INTERRUPT_FLAG_SUFFIX = ".interrupt";
+var INTERRUPT_FLAG_MAX_AGE_MS = 3600000;
+function interruptFlagFileName(sessionId) {
+  return `${sessionId}${INTERRUPT_FLAG_SUFFIX}`;
+}
+async function writeInterruptFlagAt(sessionsDir, sessionId, now) {
+  try {
+    await atomicWrite(`${sessionsDir}/${interruptFlagFileName(sessionId)}`, JSON.stringify({ at: now }), 384);
+  } catch {}
+}
+async function interruptFlagSetAt(sessionsDir, sessionId, now) {
+  try {
+    const flag = JSON.parse(await readFile(`${sessionsDir}/${interruptFlagFileName(sessionId)}`, "utf8"));
+    return typeof flag.at === "number" && now - flag.at <= INTERRUPT_FLAG_MAX_AGE_MS;
+  } catch {
+    return false;
+  }
+}
+async function clearInterruptFlagAt(sessionsDir, sessionId) {
+  await unlink(`${sessionsDir}/${interruptFlagFileName(sessionId)}`).catch(() => {});
 }
 async function settleDecisionHoldRecord(sessionId, patch) {
   return settleDecisionHoldRecordAt(SESSIONS_DIR, sessionId, patch);
@@ -1714,7 +1743,7 @@ async function codexSessionModel(input, prefix, transcriptPath, home = codexHome
     return;
   }
 }
-var INTERRUPT_MARKER = "interrupted by user";
+var INTERRUPT_MARKER = "[Request interrupted by user";
 var CODEX_TURN_EVENTS = new Set(["task_started", "task_complete", "turn_aborted"]);
 var CODEX_ABORT_EVENT = "turn_aborted";
 function lastTurnLine(text) {
@@ -1739,7 +1768,23 @@ function lastTurnLine(text) {
   return null;
 }
 function hasInterruptMarker(line) {
-  return line.includes(INTERRUPT_MARKER);
+  let row;
+  try {
+    row = JSON.parse(line);
+  } catch {
+    return false;
+  }
+  if (typeof row !== "object" || row === null)
+    return false;
+  if (row.type !== "user")
+    return false;
+  const message = row.message;
+  const content = typeof message === "object" && message !== null ? message.content : message;
+  const texts = Array.isArray(content) ? content.map((part) => {
+    const p = part;
+    return p !== null && typeof p === "object" && p.type === "text" ? p.text : undefined;
+  }) : [content];
+  return texts.some((t) => typeof t === "string" && t.trimStart().startsWith(INTERRUPT_MARKER));
 }
 function codexLastTurnEvent(text) {
   const lines = text.split(`
@@ -1817,11 +1862,11 @@ function codexProposedPlanMarkdown(text) {
   if (typeof text !== "string")
     return;
   const trimmed = text.trim();
-  const open2 = "<proposed_plan>";
+  const open = "<proposed_plan>";
   const close = "</proposed_plan>";
-  if (!trimmed.startsWith(open2) || !trimmed.endsWith(close))
+  if (!trimmed.startsWith(open) || !trimmed.endsWith(close))
     return;
-  return trimmed.slice(open2.length, -close.length).trim();
+  return trimmed.slice(open.length, -close.length).trim();
 }
 function codexFinalProposedPlan(row) {
   const payload = row.payload;
@@ -2013,6 +2058,9 @@ var CLAUDE_DESKTOP_BUNDLED_PATH_PARTS = [
   "/claude.app/Contents/MacOS/claude"
 ];
 var CLAUDE_DESKTOP_LAUNCHER = "Claude.app/Contents/Helpers/disclaimer";
+function cursorHostInvocation(input, env = process.env) {
+  return env.CURSOR_VERSION !== undefined || typeof input === "object" && input !== null && "cursor_version" in input;
+}
 function claudeDesktopInvocation(selfArgs, ancestorArgs, entrypoint) {
   if (entrypoint === CLAUDE_DESKTOP_ENTRYPOINT)
     return true;
@@ -2037,8 +2085,13 @@ function claudeForkResumePredecessor(command) {
 }
 function claudeHeadlessInvocation(selfArgs, ancestorArgs, entrypoint) {
   const chain = [selfArgs, ...ancestorArgs].filter((s) => typeof s === "string" && s.length > 0);
-  if (chain.some((args) => CLAUDE_SELF_DAEMON_MARKERS.some((m) => args.includes(m))))
-    return true;
+  const isRing = (args) => CLAUDE_SELF_DAEMON_MARKERS.some((m) => args.includes(m));
+  const ringTop = chain.length - 1 - [...chain].reverse().findIndex(isRing);
+  if (ringTop < chain.length) {
+    const owner = chain[ringTop + 1]?.trim().split(/\s+/) ?? [];
+    if (basename2(owner[0] ?? "") !== "claude" || owner.some((tok) => CLAUDE_HEADLESS_ARG_TOKENS.has(tok)))
+      return true;
+  }
   const tokens = typeof selfArgs === "string" ? selfArgs.trim().split(/\s+/) : [];
   if (tokens.includes("--fork-session") && tokens.includes("--reply-on-resume"))
     return true;
@@ -2652,11 +2705,13 @@ var claudeAdapter = {
   hooksNotFiringHint: "  run /plugin in Claude Code, check the nomo plugin is enabled, then restart Claude Code",
   toolDetail: claudeToolDetail,
   blobAgentFields: {},
-  locateTuiPid: (ctx, deps) => claudeLocateTuiPid(ctx, deps)
+  locateTuiPid: (ctx, deps) => claudeLocateTuiPid(ctx, deps),
+  interrupt: "hook-flag"
 };
 var codexAdapter = {
   kind: "codex",
   answerExtras: "other",
+  titleRepair: { due: (record) => typeof record.title !== "string" || record.title.length === 0 },
   async title({ sessionId, prefix, input }) {
     const indexTitle = await codexIndexTitle(sessionId);
     if (indexTitle)
@@ -2709,7 +2764,8 @@ var codexAdapter = {
   blobAgentFields: { agent: "codex" },
   discoverLive: (known) => codexDiscoverLive(known),
   pidTurnActive: (pid) => codexPidTurnActive(pid),
-  locateTuiPid: (ctx, deps) => codexLocateTuiPid(ctx, deps)
+  locateTuiPid: (ctx, deps) => codexLocateTuiPid(ctx, deps),
+  interrupt: "app-server"
 };
 async function opencodeLocateTuiPid(ctx, deps = {}) {
   try {
@@ -2760,6 +2816,58 @@ var opencodeAdapter = {
   ambientPlan: true,
   locateTuiPid: (ctx, deps) => opencodeLocateTuiPid(ctx, deps)
 };
+function cursorModel(input) {
+  for (const key of ["model", "model_id"]) {
+    const v = input[key];
+    if (typeof v === "string" && v.trim().length > 0)
+      return v.trim().slice(0, 80);
+  }
+  return;
+}
+function cursorStateDb() {
+  const home = process.env.HOME ?? "";
+  const data = process.platform === "darwin" ? `${home}/Library/Application Support` : process.platform === "win32" ? process.env.APPDATA ?? "" : process.env.XDG_CONFIG_HOME || `${home}/.config`;
+  return `${data}/Cursor/User/globalStorage/state.vscdb`;
+}
+var CURSOR_TITLE_REPAIR_MS = 120000;
+var CURSOR_TITLE_TIMEOUT_MS = 300;
+function cursorChatTitle(sessionId, db = cursorStateDb(), env = process.env) {
+  if (!/^[A-Za-z0-9_-]{1,128}$/.test(sessionId))
+    return;
+  try {
+    const bin = process.platform === "darwin" && existsSync2("/usr/bin/sqlite3") ? "/usr/bin/sqlite3" : "sqlite3";
+    const out = execFileSync2(bin, [
+      "-init",
+      devNull,
+      "-batch",
+      "-noheader",
+      "-list",
+      "-readonly",
+      db,
+      "select case when json_type(cast(value as text),'$.name')='text' then json_extract(cast(value as text),'$.name') end" + ` from cursorDiskKV where key='composerData:${sessionId}'`
+    ], { timeout: CURSOR_TITLE_TIMEOUT_MS, encoding: "utf8", maxBuffer: 65536, stdio: ["ignore", "pipe", "ignore"], env });
+    const cleaned = out.replace(/\s+/g, " ").trim();
+    return cleaned ? truncateOnWord(cleaned) : undefined;
+  } catch {
+    return;
+  }
+}
+var cursorAdapter = {
+  kind: "cursor",
+  title: async ({ input }) => typeof input.prompt === "string" ? displayTitleFromUserText(input.prompt) : undefined,
+  model: async ({ input }) => cursorModel(input),
+  detectInterrupt: () => false,
+  sessionsDir: () => `${cursorHome()}/projects`,
+  sessionMatch: (name) => name.endsWith(".jsonl"),
+  hookStampPath: () => lastHookPath("cursor"),
+  hooksNotFiringHint: "  run `bunx nomo-ai --cursor` again, then restart Cursor (Settings → Hooks shows what it loaded)",
+  titleRepair: {
+    due: (record, now) => record.lastEvent === "done" && typeof record.ts === "number" && now - record.ts < CURSOR_TITLE_REPAIR_MS,
+    resolve: (sessionId) => cursorChatTitle(sessionId)
+  },
+  toolDetail: {},
+  blobAgentFields: { agent: "cursor" }
+};
 function unknownAgentAdapter(kind) {
   return {
     kind,
@@ -2781,6 +2889,8 @@ function adapterFor(agent) {
       return codexAdapter;
     case "opencode":
       return opencodeAdapter;
+    case "cursor":
+      return cursorAdapter;
     case "claude":
       return claudeAdapter;
     default:
@@ -3044,6 +3154,17 @@ class CodexAppServerClient {
       return "transport-error";
     }
   }
+  async interruptTurn(threadId, turnId) {
+    if (this.stateValue !== "ready" || !this.transport)
+      return "unavailable";
+    try {
+      await this.request("turn/interrupt", { threadId, turnId });
+      return "sent";
+    } catch (error) {
+      this.reportError(error, "Failed to interrupt Codex turn");
+      return "failed";
+    }
+  }
   connect() {
     if (!this.shouldRun)
       return Promise.resolve(false);
@@ -3107,12 +3228,12 @@ class CodexAppServerClient {
     }
     const id = this.nextRpcId++;
     const key = rpcIdKey(id);
-    return new Promise((resolve2, reject) => {
+    return new Promise((resolve, reject) => {
       const timer = this.options.setTimer(() => {
         this.pendingRpc.delete(key);
         reject(new Error(`${method} timed out`));
       }, this.options.requestTimeoutMs);
-      this.pendingRpc.set(key, { resolve: resolve2, reject, timer });
+      this.pendingRpc.set(key, { resolve, reject, timer });
       this.transport.send({ method, id, params }).catch((error) => {
         const pending = this.pendingRpc.get(key);
         if (!pending)
@@ -3440,8 +3561,8 @@ class CodexProxyTransport {
       ""
     ].join(`\r
 `);
-    return new Promise((resolve2, reject) => {
-      this.openResolve = resolve2;
+    return new Promise((resolve, reject) => {
+      this.openResolve = resolve;
       this.openReject = reject;
       this.writeRaw(request).catch((error) => this.finish(error));
     });
@@ -3515,10 +3636,10 @@ class CodexProxyTransport {
     parseUpgradeResponse(this.buffer.subarray(0, end), this.handshakeKey);
     this.buffer = this.buffer.subarray(end);
     this.upgraded = true;
-    const resolve2 = this.openResolve;
+    const resolve = this.openResolve;
     this.openResolve = undefined;
     this.openReject = undefined;
-    resolve2?.();
+    resolve?.();
     return true;
   }
   consumeFrames() {
@@ -3640,9 +3761,9 @@ class CodexProxyTransport {
     const child = this.child;
     if (!child || this.ended)
       return Promise.reject(new Error("Codex proxy transport is closed"));
-    return new Promise((resolve2, reject) => {
+    return new Promise((resolve, reject) => {
       try {
-        child.stdin.write(chunk, (error) => error ? reject(error) : resolve2());
+        child.stdin.write(chunk, (error) => error ? reject(error) : resolve());
       } catch (error) {
         reject(asError(error, "Could not write to Codex app-server proxy"));
       }
@@ -3837,14 +3958,14 @@ function parseCcSessionFile(raw) {
     ...num("statusUpdatedAt") !== undefined ? { statusUpdatedAt: num("statusUpdatedAt") } : {}
   };
 }
-function ccOpinion(file, join3, now) {
+function ccOpinion(file, join, now) {
   if (!file)
     return null;
-  if (typeof join3.pid !== "number" || !Number.isFinite(join3.pid) || file.pid !== join3.pid)
+  if (typeof join.pid !== "number" || !Number.isFinite(join.pid) || file.pid !== join.pid)
     return null;
-  if (file.sessionId !== join3.sessionId)
+  if (file.sessionId !== join.sessionId)
     return null;
-  const probed = join3.procStartedAt;
+  const probed = join.procStartedAt;
   if (typeof probed !== "number" || !Number.isFinite(probed))
     return null;
   const claimed = typeof file.startedAt === "number" && Number.isFinite(file.startedAt) ? file.startedAt : parseCcProcStart(file.procStart);
@@ -3904,7 +4025,7 @@ function stateHoldLive(hold, holdPidAlive, now) {
   return true;
 }
 function computeSessionState(input) {
-  const { sessionId, record, pairingId, hold, pidAlive: pidAlive2, holdPidAlive, cc, ccProcStartedAt, correctives, now } = input;
+  const { sessionId, record, pairingId, hold, pidAlive, holdPidAlive, cc, ccProcStartedAt, correctives, now } = input;
   if (record === null) {
     return { state: "ended", terminal: true, ts: now, why: "reap", blob: { kind: "last" }, agent: "claude" };
   }
@@ -3924,7 +4045,7 @@ function computeSessionState(input) {
     return of("ended", "end", sealed, ts, true);
   if (finite(record.ts) && now - record.ts > SESSION_STATE_STALE_MS)
     return of("ended", "stale", sealed, ts, true);
-  if (!pidAlive2)
+  if (!pidAlive)
     return of("ended", "reap", sealed, ts, true);
   const ccUsable = agent === "claude" && record.provisional !== true;
   const opinion = ccUsable ? ccOpinion(cc, { pid: record.pid, sessionId, procStartedAt: ccProcStartedAt }, now) : null;
@@ -4100,8 +4221,8 @@ function createLanFrameStore(deps = {}) {
   };
   const park = async (set, waitMs) => {
     let settle;
-    const promise = new Promise((resolve2) => {
-      settle = resolve2;
+    const promise = new Promise((resolve) => {
+      settle = resolve;
     });
     const waiter = { resolve: settle };
     set.add(waiter);
@@ -4550,8 +4671,8 @@ function createLanAnswerStore(options = {}) {
       if (this.peek(requestId, now))
         return { promise: Promise.resolve(), cancel: () => {} };
       let settle;
-      const promise = new Promise((resolve2) => {
-        settle = resolve2;
+      const promise = new Promise((resolve) => {
+        settle = resolve;
       });
       const set = waiters.get(requestId) ?? new Set;
       set.add(settle);
@@ -4600,13 +4721,13 @@ function requestIdOf(payload) {
   return typeof requestId === "string" && LAN_REQUEST_ID_RE.test(requestId) ? requestId : null;
 }
 function readBody(req, max) {
-  return new Promise((resolve2) => {
+  return new Promise((resolve) => {
     const declared = Number(req.headers["content-length"]);
     if (Number.isFinite(declared) && declared > max) {
       try {
         req.pause();
       } catch {}
-      resolve2(null);
+      resolve(null);
       return;
     }
     const chunks = [];
@@ -4616,7 +4737,7 @@ function readBody(req, max) {
       if (settled)
         return;
       settled = true;
-      resolve2(value);
+      resolve(value);
     };
     req.on("data", (chunk) => {
       const bytes = chunk;
@@ -4784,7 +4905,7 @@ function createLanListener(deps = {}) {
       } catch {}
     }
   };
-  const tryListen = (port) => new Promise((resolve2) => {
+  const tryListen = (port) => new Promise((resolve) => {
     let settled = false;
     let candidate;
     try {
@@ -4792,14 +4913,14 @@ function createLanListener(deps = {}) {
         handle(req, res);
       });
     } catch {
-      resolve2(null);
+      resolve(null);
       return;
     }
     const finish = (value) => {
       if (settled)
         return;
       settled = true;
-      resolve2(value);
+      resolve(value);
     };
     try {
       candidate.keepAliveTimeout = LAN_KEEPALIVE_MS;
@@ -5255,19 +5376,77 @@ function detailForHook(hookName, toolName, toolInput) {
   }
   if (hookName === "PreToolUse")
     return toolName ? TOOL_DETAIL[toolName] : undefined;
-  if (hookName === "PostToolUse")
+  if (hookName === "PostToolUse" || hookName === "PostToolUseFailure")
     return "thinking";
   return;
 }
 function isPermissionNotification(i) {
   const type = typeof i.notification_type === "string" ? i.notification_type : "";
+  if (type.length > 0)
+    return type === "permission_prompt" || type === "worker_permission_prompt";
   const msg = (typeof i.message === "string" ? i.message : "").toLowerCase();
-  return type === "permission_prompt" || msg.includes("permission") || msg.includes("approve") || msg.includes("allow");
+  return msg.includes("permission") || msg.includes("approve") || msg.includes("allow");
+}
+var ATTENTION_NOTIFICATIONS = new Set(["elicitation_dialog", "elicitation_url_dialog", "agent_needs_input"]);
+function hasRunningBackgroundAgent(input) {
+  const tasks = input.background_tasks;
+  return Array.isArray(tasks) && tasks.some((t) => {
+    const task = t;
+    return typeof task === "object" && task !== null && task.type === "subagent" && (task.status === "running" || task.status === "pending");
+  });
+}
+var HOLD_YIELDING_EVENTS = new Set([
+  "PostToolUseFailure",
+  "PreCompact",
+  "PostCompact",
+  "Elicitation",
+  "ElicitationResult"
+]);
+function yieldsToLiveHold(hookName, input) {
+  if (HOLD_YIELDING_EVENTS.has(hookName))
+    return true;
+  if (hookName === "Stop")
+    return hasRunningBackgroundAgent(input);
+  if (hookName === "Notification")
+    return !isPermissionNotification(input);
+  return false;
+}
+async function sessionHoldIsLive(sessionsDir, sessionId, now = Date.now(), alive = pidAlive) {
+  const hold = await readDecisionHoldAt(sessionsDir, sessionId);
+  return stateHoldLive(hold, hold !== null && typeof hold.pid === "number" ? alive(hold.pid) : false, now);
 }
 var USER_BLOCKING_TOOLS = new Set(["AskUserQuestion", "ExitPlanMode", "request_user_input"]);
+var INTERRUPT_STOP_REASON = "Interrupted from Nomo";
+function interruptHookOutput(hookName) {
+  if (hookName === "PreToolUse") {
+    return JSON.stringify({
+      continue: false,
+      stopReason: INTERRUPT_STOP_REASON,
+      hookSpecificOutput: {
+        hookEventName: "PreToolUse",
+        permissionDecision: "deny",
+        permissionDecisionReason: INTERRUPT_STOP_REASON
+      }
+    });
+  }
+  if (hookName === "PostToolUse" || hookName === "PostToolUseFailure") {
+    return JSON.stringify({ continue: false, stopReason: INTERRUPT_STOP_REASON });
+  }
+  return null;
+}
+function clearsInterruptFlag(hookName, input = {}) {
+  if (hookName === "Stop")
+    return !hasRunningBackgroundAgent(input);
+  return hookName === "UserPromptSubmit" || hookName === "StopFailure" || hookName === "SessionEnd";
+}
+function interruptedEventInput(input) {
+  return { ...input, hook_event_name: "Stop" };
+}
 function planOp(hookName, input, sentDone) {
   switch (hookName) {
     case "SessionStart":
+      if (sentDone && input.source === "compact")
+        return null;
       return sentDone ? { op: "update", prio: 0, status: "working" } : { op: "start", prio: 0, status: "working" };
     case "PreToolUse": {
       const tool = typeof input.tool_name === "string" ? input.tool_name : "";
@@ -5276,13 +5455,24 @@ function planOp(hookName, input, sentDone) {
     case "UserPromptSubmit":
     case "PostToolUse":
       return { op: "update", prio: 0, status: "working" };
+    case "PostToolUseFailure":
+      return input.is_interrupt === true ? null : { op: "update", prio: 0, status: "working" };
     case "Notification":
-      if (!isPermissionNotification(input))
+      if (!isPermissionNotification(input) && !(typeof input.notification_type === "string" && ATTENTION_NOTIFICATIONS.has(input.notification_type)))
         return null;
       return { op: "update", prio: 1, status: "needsAttention" };
     case "PermissionRequest":
+    case "Elicitation":
       return { op: "update", prio: 1, status: "needsAttention" };
+    case "ElicitationResult":
+      return { op: "update", prio: 0, status: "working" };
+    case "PreCompact":
+    case "PostCompact":
+      return input.trigger === "manual" || sentDone ? null : { op: "update", prio: 0, status: "working" };
     case "Stop":
+      return hasRunningBackgroundAgent(input) ? { op: "update", prio: 0, status: "working" } : { op: "done", prio: 0, status: "done" };
+    case "StopFailure":
+    case "Interrupt":
       return { op: "done", prio: 0, status: "done" };
     case "SessionEnd":
       return { op: "end", prio: 0, status: "done" };
@@ -5318,7 +5508,7 @@ function buildBlob(input, machine, title, plan, agent = "claude", turnStartedAt,
   const { label, folderKey } = folder;
   const branch = sessionBranch(folder);
   const hookName = typeof input.hook_event_name === "string" ? input.hook_event_name : "";
-  const detail = detailOverride ?? detailForHook(hookName, typeof input.tool_name === "string" ? input.tool_name : undefined, input.tool_input);
+  const detail = detailOverride ?? (hookName === "Stop" && hasRunningBackgroundAgent(input) ? TOOL_DETAIL.Task : detailForHook(hookName, typeof input.tool_name === "string" ? input.tool_name : undefined, input.tool_input));
   const base = {
     status: plan.status,
     title: title ?? "",
@@ -5386,6 +5576,7 @@ async function trackSessionAt(sessionsDir, sessionId, op, prio, status, blob, ma
     if (op === "end") {
       await unlink2(path).catch(() => {});
       await unlink2(`${sessionsDir}/${decisionHoldFileName(sessionId)}`).catch(() => {});
+      await unlink2(`${sessionsDir}/${interruptFlagFileName(sessionId)}`).catch(() => {});
       return;
     }
     const recordedAt = Date.now();
@@ -5437,6 +5628,33 @@ async function markDoneDeliveredAt(sessionsDir, sessionId) {
 }
 async function markDoneDelivered(sessionId) {
   return markDoneDeliveredAt(SESSIONS_DIR, sessionId);
+}
+async function markUpdatePendingAt(sessionsDir, sessionId, blob) {
+  try {
+    const record = await readRecord(sessionId, sessionsDir);
+    if (!record || !blob || record.blob !== blob || record.op === "done" || record.updatePending === true)
+      return;
+    await atomicWrite(`${sessionsDir}/${sessionId}.json`, JSON.stringify({ ...record, updatePending: true }), 384);
+  } catch {}
+}
+async function traceSendFailure(event, failPath = SEND_FAIL_PATH, lastSendPath = LAST_SEND_PATH, trace = traceSession) {
+  try {
+    const stamp = async (path) => {
+      try {
+        return Number.parseInt((await readFile6(path, "utf8")).trim(), 10) || 0;
+      } catch {
+        return 0;
+      }
+    };
+    const streakStart = await stamp(failPath);
+    if (streakStart > 0 && streakStart > await stamp(lastSendPath))
+      return false;
+    await atomicWrite(failPath, String(Date.now()));
+    trace({ event: "post-failed", ...event });
+    return true;
+  } catch {
+    return false;
+  }
 }
 async function reconcileProvisional(config, hookPid) {
   try {
@@ -5525,6 +5743,8 @@ async function runHook(agent) {
   try {
     const [config, raw] = await Promise.all([loadConfig(), readStdin()]);
     const input = JSON.parse(raw);
+    if (agent === "claude" && cursorHostInvocation(input))
+      return;
     if (typeof input.session_id !== "string" || input.session_id.length === 0)
       return;
     if (agent === "claude" && (typeof input.turn_id === "string" && input.turn_id.length > 0 || typeof input.transcript_path === "string" && input.transcript_path.includes("/.codex/"))) {
@@ -5553,14 +5773,34 @@ async function runHook(agent) {
     if (!config) {
       const pending = await loadPendingConfig();
       if (pending) {
-        const machine2 = pending.machineName ?? hostname().replace(/\.local$/, "");
-        await stashPendingEvent(input, machine2, await readTitle(), Date.now(), PENDING_STASH_PATH, process.ppid, agent, await readModel());
+        const machine = pending.machineName ?? hostname().replace(/\.local$/, "");
+        await stashPendingEvent(input, machine, await readTitle(), Date.now(), PENDING_STASH_PATH, process.ppid, agent, await readModel());
       }
       return;
     }
     const machine = config.machineName ?? hostname().replace(/\.local$/, "");
     const reportedSessionId = input.session_id;
     const hookName = typeof input.hook_event_name === "string" ? input.hook_event_name : "";
+    let interrupted = false;
+    if (adapter2.interrupt === "hook-flag") {
+      if (clearsInterruptFlag(hookName, input)) {
+        await clearInterruptFlagAt(SESSIONS_DIR, reportedSessionId);
+      } else {
+        const line = interruptHookOutput(hookName);
+        if (line !== null && await interruptFlagSetAt(SESSIONS_DIR, reportedSessionId, Date.now())) {
+          interrupted = true;
+          await new Promise((resolve) => {
+            process.stdout.on("error", () => resolve());
+            try {
+              process.stdout.write(`${line}
+`, () => resolve());
+            } catch {
+              resolve();
+            }
+          });
+        }
+      }
+    }
     const sessionStartSource = typeof input.source === "string" ? input.source : "";
     const hookPid = process.ppid;
     const hookCommand = pidCommand(hookPid);
@@ -5694,15 +5934,21 @@ async function runHook(agent) {
     const turnStartedAt = isTurnOpener ? Math.floor(Date.now() / 1000) : cachedTurn;
     const awaitingPrompt = hookName === "SessionStart" && !reusedForkPredecessor && (existingRecord ? sentDone || existingRecord.awaitingPrompt === true : sessionStartSource !== "compact");
     const turnId = typeof input.turn_id === "string" && input.turn_id.length > 0 ? input.turn_id : undefined;
-    let plan = planOp(hookName, input, sentDone);
+    if (interrupted)
+      eventInput = interruptedEventInput(eventInput);
+    let plan = planOp(interrupted ? "Stop" : hookName, input, sentDone);
     if (!plan)
       return;
+    if (!interrupted && yieldsToLiveHold(hookName, input) && await sessionHoldIsLive(SESSIONS_DIR, sessionId)) {
+      traceSession({ event: "hold-yield", sessionId, agent, hook_event_name: hookName });
+      return;
+    }
     let pendingPlanPicker = false;
     let planPickerVerificationPending = false;
     let attentionKind;
     let proposedPlan;
     let pickerClassifier = plan.op === "done" ? "none" : plan.status;
-    if (plan.op === "done" && adapter2.completedTurnWaitState) {
+    if (hookName === "Stop" && plan.op === "done" && adapter2.completedTurnWaitState) {
       const evidence = adapter2.completedTurnWaitEvidence ? await adapter2.completedTurnWaitEvidence({ pid: hookPid, transcriptPath }) : { state: await adapter2.completedTurnWaitState({ pid: hookPid, transcriptPath }) };
       const wait = evidence.state;
       pickerClassifier = wait;
@@ -5769,18 +6015,34 @@ async function runHook(agent) {
     ensureWatchdog();
     if (agent === "codex")
       await reconcileProvisional(config, hookPid);
-    const res = await fetch(`${config.url}/v1/cc/event`, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "x-cc-pairing": config.pairingId,
-        "x-cc-auth": config.pcSecret,
-        "x-cc-version": PLUGIN_VERSION,
-        "x-cc-approvals": await localApprovalsState()
-      },
-      body: JSON.stringify(envelope),
-      signal: AbortSignal.timeout(2000)
-    });
+    const failure = { sessionId, agent, hook_event_name: hookName, op: plan.op };
+    const postStarted = Date.now();
+    let res;
+    try {
+      res = await fetch(`${config.url}/v1/cc/event`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-cc-pairing": config.pairingId,
+          "x-cc-auth": config.pcSecret,
+          "x-cc-version": PLUGIN_VERSION,
+          "x-cc-approvals": await localApprovalsState()
+        },
+        body: JSON.stringify(envelope),
+        signal: AbortSignal.timeout(2000)
+      });
+    } catch (e) {
+      if (plan.op !== "done" && plan.op !== "end")
+        await markUpdatePendingAt(SESSIONS_DIR, sessionId, envelope.blob);
+      await traceSendFailure({
+        ...failure,
+        ms: Date.now() - postStarted,
+        error: e?.name === "TimeoutError" ? "timeout" : "network"
+      });
+      return;
+    }
+    if (!res.ok)
+      await traceSendFailure({ ...failure, status: res.status, ms: Date.now() - postStarted });
     if (res.ok) {
       await atomicWrite(LAST_SEND_PATH, String(Date.now()));
       await resetGoneStrikes();
@@ -5806,7 +6068,8 @@ var POST_FIRST_CONTACT_TIMEOUT_MS = 6000;
 var HOLD_BLOCKS_DIALOG = {
   claude: true,
   codex: true,
-  opencode: false
+  opencode: false,
+  cursor: false
 };
 var LOCAL_ANSWER_TOOLS = new Set(["AskUserQuestion", "ExitPlanMode"]);
 var LOCAL_ANSWER_TAIL_BYTES = 64000;
@@ -6376,8 +6639,8 @@ var LOOPBACK_MAX_CONSECUTIVE_ERRORS = 5;
 function createLoopbackAnswerPoller(config, requestId, deps) {
   const interval = deps.intervalMs ?? LOOPBACK_POLL_INTERVAL_MS;
   const discoverInterval = deps.discoverIntervalMs ?? POLL_INTERVAL_MS;
-  const tick = deps.sleep ?? ((ms) => new Promise((resolve3) => {
-    const timer = setTimeout(resolve3, ms);
+  const tick = deps.sleep ?? ((ms) => new Promise((resolve) => {
+    const timer = setTimeout(resolve, ms);
     timer.unref?.();
   }));
   let live = deps.statePath !== undefined;
@@ -6388,11 +6651,11 @@ function createLoopbackAnswerPoller(config, requestId, deps) {
   let traced = false;
   let pending;
   let wakeResolve = () => {};
-  let wake = new Promise((resolve3) => {
-    wakeResolve = resolve3;
+  let wake = new Promise((resolve) => {
+    wakeResolve = resolve;
   });
   let keyPromise;
-  const note2 = (result) => {
+  const note = (result) => {
     if (traced)
       return;
     traced = true;
@@ -6477,7 +6740,7 @@ function createLoopbackAnswerPoller(config, requestId, deps) {
         return;
       }
       if (errors >= LOOPBACK_MAX_CONSECUTIVE_ERRORS) {
-        note2("give-up");
+        note("give-up");
         live = false;
         return;
       }
@@ -6493,7 +6756,7 @@ function createLoopbackAnswerPoller(config, requestId, deps) {
         started = true;
         ticker().catch(() => {
           live = false;
-          note2("error");
+          note("error");
         });
       }
       await Promise.race([sleeping, wake]);
@@ -6558,6 +6821,8 @@ async function runPermissionHook(deps = {}, agent = "claude") {
   let settleAsWorking = false;
   let settleHeldRecord;
   try {
+    if (agent === "claude" && cursorHostInvocation(undefined))
+      return;
     if (await flagExists(noHoldPath)) {
       await (deps.delegate ?? (() => runHook(agent)))();
       return;
@@ -6578,6 +6843,8 @@ async function runPermissionHook(deps = {}, agent = "claude") {
       trace({ event: "exit", reason: "bad-stdin", ...errorTag(e), pos: parseErrorPosition(e) });
       return;
     }
+    if (agent === "claude" && cursorHostInvocation(input))
+      return;
     const sessionId = typeof input.session_id === "string" ? input.session_id : "";
     if (sessionId.length === 0) {
       trace({ event: "exit", reason: "no-session-id" });
@@ -6645,8 +6912,8 @@ async function runPermissionHook(deps = {}, agent = "claude") {
     const sleep = deps.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
     let lastPostTs = 0;
     const postDecision = async (round, maxAttempts) => {
-      let hold2 = false;
-      let posted2 = false;
+      let hold = false;
+      let posted = false;
       let reason;
       for (let attempt = 1;attempt <= maxAttempts; attempt += 1) {
         const ts = Math.max((deps.now ?? Date.now)(), lastPostTs + 1);
@@ -6669,7 +6936,7 @@ async function runPermissionHook(deps = {}, agent = "claude") {
           });
           if (res.ok) {
             const body = await res.json().catch(() => ({}));
-            hold2 = body.hold === true;
+            hold = body.hold === true;
             if (typeof body.reason === "string")
               reason = body.reason;
           }
@@ -6680,10 +6947,10 @@ async function runPermissionHook(deps = {}, agent = "claude") {
             attempt,
             status: res.status,
             ts,
-            ...res.ok ? { hold: hold2 } : {},
+            ...res.ok ? { hold } : {},
             ...reason !== undefined ? { reason } : {}
           });
-          posted2 = true;
+          posted = true;
           break;
         } catch (e) {
           const name = e?.name ?? "Error";
@@ -6696,13 +6963,13 @@ async function runPermissionHook(deps = {}, agent = "claude") {
           }
         }
       }
-      return { posted: posted2, hold: hold2, reason };
+      return { posted, hold, reason };
     };
     const clock = deps.now ?? Date.now;
     const pollBudget = createPollBudget();
-    const pollDecision = async (seq2) => {
-      const budgetMs = pollBudget.next(seq2);
-      trace({ event: "poll-begin", seq: seq2, budgetMs });
+    const pollDecision = async (seq) => {
+      const budgetMs = pollBudget.next(seq);
+      trace({ event: "poll-begin", seq, budgetMs });
       const startedAt = clock();
       const measure = () => {
         const ms = clock() - startedAt;
@@ -6715,29 +6982,29 @@ async function runPermissionHook(deps = {}, agent = "claude") {
           signal: AbortSignal.timeout(budgetMs)
         });
         if (!res.ok) {
-          trace({ event: "poll-end", seq: seq2, outcome: "status", status: res.status, ms: measure() });
+          trace({ event: "poll-end", seq, outcome: "status", status: res.status, ms: measure() });
           return { status: res.status };
         }
         const data = await res.json();
-        trace({ event: "poll-end", seq: seq2, outcome: "ok", ms: measure() });
+        trace({ event: "poll-end", seq, outcome: "ok", ms: measure() });
         return { data, status: res.status };
       } catch (e) {
-        trace({ event: "poll-end", seq: seq2, outcome: "error", ...errorTag(e) });
+        trace({ event: "poll-end", seq, outcome: "error", ...errorTag(e) });
         return { status: 0 };
       }
     };
     let attentionStalled = false;
-    const stalledPatch = async (at2) => {
+    const stalledPatch = async (at) => {
       let stalledBlob = fallbackBlob;
       try {
-        stalledBlob = await encryptBlob(config.e2eKey, { ...base, reconnecting: Math.floor(at2 / 1000) });
+        stalledBlob = await encryptBlob(config.e2eKey, { ...base, reconnecting: Math.floor(at / 1000) });
       } catch {}
-      return { ts: at2, blob: stalledBlob, attentionStalledAt: at2 };
+      return { ts: at, blob: stalledBlob, attentionStalledAt: at };
     };
     const markAttentionStalled = async () => {
-      const at2 = (deps.now ?? Date.now)();
+      const at = (deps.now ?? Date.now)();
       try {
-        await (deps.settleHoldRecordFn ?? defaultSettleHoldRecord())(sessionId, await stalledPatch(at2));
+        await (deps.settleHoldRecordFn ?? defaultSettleHoldRecord())(sessionId, await stalledPatch(at));
       } catch {}
     };
     let { posted, hold, reason: holdReason } = await postDecision(1, POST_MAX_ATTEMPTS);
@@ -7009,9 +7276,9 @@ function codexAnswersFromPhone(request, positional, other, notes) {
       return;
     if (!question.options?.length)
       return;
-    const note2 = typed.length > 0 ? [`${CODEX_NOTE_PREFIX}${typed}`] : [];
-    if (answer.length === 0 && note2.length > 0) {
-      mapped[question.id] = [CODEX_OTHER_LABEL, ...note2];
+    const note = typed.length > 0 ? [`${CODEX_NOTE_PREFIX}${typed}`] : [];
+    if (answer.length === 0 && note.length > 0) {
+      mapped[question.id] = [CODEX_OTHER_LABEL, ...note];
       continue;
     }
     if (answer.length === 0 || answer.length > ANSWER_MAX3)
@@ -7020,7 +7287,7 @@ function codexAnswersFromPhone(request, positional, other, notes) {
     const unique = Array.from(new Set(hits));
     if (unique.length !== 1)
       return;
-    mapped[question.id] = [unique[0], ...note2];
+    mapped[question.id] = [unique[0], ...note];
   }
   if (Object.keys(mapped).length !== request.questions.length)
     return;
@@ -7061,14 +7328,14 @@ function requestSignal(ms, signal) {
 function abortableSleep(ms, signal, sleep) {
   if (signal.aborted)
     return Promise.resolve();
-  return new Promise((resolve3) => {
+  return new Promise((resolve) => {
     let done = false;
     const finish = () => {
       if (done)
         return;
       done = true;
       signal.removeEventListener("abort", finish);
-      resolve3();
+      resolve();
     };
     signal.addEventListener("abort", finish, { once: true });
     sleep(ms).then(finish, finish);
@@ -7147,8 +7414,8 @@ async function runRemoteInput(request, requestId, signal, deps, onHoldCreated) {
       "x-cc-auth": deps.config.pcSecret,
       "x-cc-version": PLUGIN_VERSION
     };
-    const sleep = deps.sleep ?? ((ms) => new Promise((resolve3) => {
-      const timer = setTimeout(resolve3, ms);
+    const sleep = deps.sleep ?? ((ms) => new Promise((resolve) => {
+      const timer = setTimeout(resolve, ms);
       timer.unref?.();
     }));
     let attentionStalled = false;
@@ -7239,9 +7506,9 @@ async function runRemoteInput(request, requestId, signal, deps, onHoldCreated) {
       await resolveOnRelay(deps.config, requestId, fetchFn);
     };
     const applyAnswerBlob = async (answerBlob) => {
-      const reject = (why, result2) => {
+      const reject = (why, result) => {
         report(deps, new Error(`Codex phone answer rejected (${why})`), "Codex remote input answer");
-        return result2;
+        return result;
       };
       let answer;
       try {
@@ -7252,12 +7519,12 @@ async function runRemoteInput(request, requestId, signal, deps, onHoldCreated) {
       if (answer.requestId !== requestId)
         return reject("request-id mismatch", "unsupported");
       if (answer.decision === "deny") {
-        const result2 = await deps.interruptAppServer();
-        if (result2 === "sent" || result2 === "already-sent") {
+        const result = await deps.interruptAppServer();
+        if (result === "sent" || result === "already-sent") {
           resumed = true;
           return "denied";
         }
-        await reportUndelivered("deny", result2);
+        await reportUndelivered("deny", result);
         return "transport-error";
       }
       if (answer.decision !== "answer")
@@ -7288,17 +7555,17 @@ async function runRemoteInput(request, requestId, signal, deps, onHoldCreated) {
       const budgetMs = pollBudget.next(polls);
       const startedAt = clock();
       try {
-        const response2 = await fetchFn(`${deps.config.url}/v1/cc/decision/${requestId}`, {
+        const response = await fetchFn(`${deps.config.url}/v1/cc/decision/${requestId}`, {
           headers,
           signal: requestSignal(budgetMs, signal)
         });
-        const data = response2.ok ? await parseJson(response2) : undefined;
+        const data = response.ok ? await parseJson(response) : undefined;
         pollBudget.observe(clock() - startedAt);
         if (!data) {
           misses += 1;
-          if (response2.ok)
+          if (response.ok)
             report(deps, new Error("Unparseable relay poll response"), "Relay poll");
-          if (!response2.ok && DEFINITIVE_POLL_STATUSES.has(response2.status)) {
+          if (!response.ok && DEFINITIVE_POLL_STATUSES.has(response.status)) {
             definitiveFailures += 1;
             if (definitiveFailures >= MAX_DEFINITIVE_POLL_FAILURES)
               return "transport-error";
@@ -7353,8 +7620,8 @@ function startCodexRemoteInput(request, deps) {
   const controller = new AbortController;
   const fetchFn = deps.fetchFn ?? fetch;
   let settleHold;
-  const holdCreated = new Promise((resolve3) => {
-    settleHold = resolve3;
+  const holdCreated = new Promise((resolve) => {
+    settleHold = resolve;
   });
   let resolvePromise;
   const completion = runRemoteInput(request, requestId, controller.signal, deps, settleHold).catch((error) => {
@@ -7457,6 +7724,11 @@ class CodexRemoteInputBridge {
     } catch {
       return "unavailable";
     }
+  }
+  async interruptTurn(threadId, turnId) {
+    if (this.client.state !== "ready" || this.stopping)
+      return "unavailable";
+    return this.client.interruptTurn(threadId, turnId);
   }
   retire(handle, fallback) {
     const retirement = handle.resolvedElsewhere().catch((error) => this.reportError(error, fallback));
@@ -7872,10 +8144,10 @@ async function correctResolvedPlanPicker(config, path, sessionId, record, deps =
       return await settlePendingPlanPickerDone(config, path, sessionId, snapshot, now, deps, "exit");
     }
     const agent = recordAgent(snapshot);
-    const adapter2 = adapterFor(agent);
-    if (!adapter2.completedTurnWaitState)
+    const adapter = adapterFor(agent);
+    if (!adapter.completedTurnWaitState)
       return "uncorrected";
-    const state = await (deps.state ?? (() => adapter2.completedTurnWaitState({
+    const state = await (deps.state ?? (() => adapter.completedTurnWaitState({
       pid: snapshot.pid,
       transcriptPath: typeof snapshot.transcript === "string" ? snapshot.transcript : undefined
     })))();
@@ -8164,7 +8436,10 @@ function watchdogEventHeaders(config, approvals) {
 }
 var activeLanListener;
 var lanHintPublisher = createLanHintPublisher({ address: () => activeLanListener?.address() ?? null });
-async function postEvent(config, body) {
+var POST_TIMEOUT_MS2 = 2000;
+async function postEvent(config, body, opts = {}) {
+  const started = Date.now();
+  const detail = opts.detail;
   const lanHint = await lanHintPublisher.take(config);
   try {
     const payload = lanHint ? { ...body, lanHint } : body;
@@ -8172,8 +8447,12 @@ async function postEvent(config, body) {
       method: "POST",
       headers: watchdogEventHeaders(config, await localApprovalsState()),
       body: JSON.stringify(payload),
-      signal: AbortSignal.timeout(2000)
+      signal: AbortSignal.timeout(opts.timeoutMs ?? POST_TIMEOUT_MS2)
     });
+    if (detail) {
+      detail.status = res.status;
+      detail.ms = Date.now() - started;
+    }
     const outcome = postOutcomeForStatus(res.status);
     if (lanHint)
       lanHintPublisher.settle(outcome === "delivered");
@@ -8183,13 +8462,18 @@ async function postEvent(config, body) {
       } catch {}
     }
     return outcome;
-  } catch {
+  } catch (e) {
+    if (detail) {
+      detail.error = e?.name === "TimeoutError" ? "timeout" : "network";
+      detail.ms = Date.now() - started;
+    }
     if (lanHint)
       lanHintPublisher.settle(false);
     return "failed";
   }
 }
-var COMMAND_KINDS_ALLOWED = new Set(["focus-terminal"]);
+var INTERRUPT_COMMAND_KIND = "interrupt-session";
+var COMMAND_KINDS_ALLOWED = new Set(["focus-terminal", INTERRUPT_COMMAND_KIND]);
 var COMMANDS_PER_RESPONSE_MAX = 8;
 var COMMAND_BUFFER_MAX = 32;
 var EXECUTED_COMMAND_IDS_MAX = 64;
@@ -8297,6 +8581,26 @@ async function releaseFocusedTuiUserInputHold(config, sessionId, now, deps) {
   } catch {}
   return true;
 }
+async function interruptSession(adapter, sessionId, record, now, deps) {
+  if (isDoneState(record))
+    return "not-running";
+  if (adapter.interrupt === "hook-flag") {
+    const write = deps.writeInterruptFlagFn ?? (lanRunningUnderTest() ? async () => {} : (id, at) => writeInterruptFlagAt(SESSIONS_DIR, id, at));
+    await write(sessionId, now);
+    return "interrupt-flagged";
+  }
+  if (adapter.interrupt === "app-server") {
+    const turnId = typeof record.turnId === "string" ? record.turnId : "";
+    if (turnId.length === 0)
+      return "no-turn";
+    const interrupt = deps.interruptCodexTurnFn ?? activeCodexInterrupt;
+    if (!interrupt)
+      return "bridge-unavailable";
+    const result = await interrupt(sessionId, turnId).catch(() => "failed");
+    return result === "sent" ? "interrupt-sent" : result === "unavailable" ? "bridge-unavailable" : "interrupt-failed";
+  }
+  return "unsupported";
+}
 async function drainCommands(config, deps = {}) {
   try {
     const pending = (deps.take ?? (() => commandBuffer.splice(0, commandBuffer.length)))();
@@ -8357,18 +8661,23 @@ async function drainCommands(config, deps = {}) {
         }
         batchTargets.add(target);
         const agent = recordAgent(entry.rec);
-        const adapter2 = deps.adapters ? deps.adapters.find((a) => a.kind === agent) ?? adapterFor(agent) : adapterFor(agent);
-        if (!adapter2.locateTuiPid) {
+        const adapter = deps.adapters ? deps.adapters.find((a) => a.kind === agent) ?? adapterFor(agent) : adapterFor(agent);
+        if (payload.kind === INTERRUPT_COMMAND_KIND) {
+          const result = await interruptSession(adapter, payload.sessionId, entry.rec, now, deps);
+          traceFocus(deps, { ...base, agent, result });
+          continue;
+        }
+        if (!adapter.locateTuiPid) {
           traceFocus(deps, { ...base, agent, result: "unsupported" });
           continue;
         }
         let reason;
-        const pid = await adapter2.locateTuiPid({ sessionId: payload.sessionId, record: entry.rec }, { note: (r) => {
+        const pid = await adapter.locateTuiPid({ sessionId: payload.sessionId, record: entry.rec }, { note: (r) => {
           reason = r;
         } });
         if (typeof pid !== "number" || !Number.isFinite(pid)) {
-          const result2 = reason === "ambiguous" ? "ambiguous" : "no-candidate";
-          traceFocus(deps, { ...base, agent, result: result2, reason: reason ?? "no-candidate" });
+          const result = reason === "ambiguous" ? "ambiguous" : "no-candidate";
+          traceFocus(deps, { ...base, agent, result, reason: reason ?? "no-candidate" });
           continue;
         }
         const outcome = await focus(pid, { agent, record: entry.rec, sessionId: payload.sessionId });
@@ -8419,13 +8728,13 @@ function acceptLanCommand(command, deps = {}) {
 var LAN_ANSWER_ECHO_DELAY_MS = 5000;
 function acceptLanAnswer(answer, deps = {}) {
   try {
-    const resolve3 = deps.resolveFn ?? ((config, requestId) => resolveOnRelay(config, requestId, fetch));
+    const resolve = deps.resolveFn ?? ((config, requestId) => resolveOnRelay(config, requestId, fetch));
     const delayMs = deps.delayMs ?? LAN_ANSWER_ECHO_DELAY_MS;
     const sleep = deps.sleep ?? ((ms) => new Promise((done) => {
       const timer = setTimeout(done, ms);
       timer.unref?.();
     }));
-    return (delayMs > 0 ? sleep(delayMs) : Promise.resolve()).then(() => resolve3(answer.config, answer.requestId)).catch(() => {
+    return (delayMs > 0 ? sleep(delayMs) : Promise.resolve()).then(() => resolve(answer.config, answer.requestId)).catch(() => {
       traceFocus(deps, { event: "lan", result: "echo-failed", requestId: answer.requestId });
     });
   } catch {
@@ -8517,23 +8826,23 @@ async function discoverLiveSessions(config, deps = {}) {
   const now = deps.now ?? Date.now;
   const machine = machineName(config);
   const known = await readRecords();
-  for (const adapter2 of adapters) {
-    if (!adapter2.discoverLive)
+  for (const adapter of adapters) {
+    if (!adapter.discoverLive)
       continue;
     let discovered;
     try {
-      discovered = await adapter2.discoverLive(known);
+      discovered = await adapter.discoverLive(known);
     } catch {
       continue;
     }
     for (const d of discovered) {
       const ts = now();
       const idle = d.idle === true;
-      const blob = await buildProvisionalBlob(d, machine, adapter2.blobAgentFields, config.e2eKey, Math.floor(ts / 1000));
+      const blob = await buildProvisionalBlob(d, machine, adapter.blobAgentFields, config.e2eKey, Math.floor(ts / 1000));
       const outcome = await post(buildProvisionalEnvelope(d.sessionId, blob, ts, idle));
       if (outcome !== "delivered")
         continue;
-      await writeRecord(d.sessionId, buildProvisionalRecord(d, machine, blob, adapter2.blobAgentFields, ts, config.pairingId, idle));
+      await writeRecord(d.sessionId, buildProvisionalRecord(d, machine, blob, adapter.blobAgentFields, ts, config.pairingId, idle));
     }
   }
 }
@@ -8644,8 +8953,8 @@ async function correctInterrupt(config, path, sessionId, record, now, deps = {})
     return "uncorrected";
   }
 }
-function shouldPendingApprovalCheck(record, adapter2) {
-  if (!adapter2.tailShowsPendingApproval)
+function shouldPendingApprovalCheck(record, adapter) {
+  if (!adapter.tailShowsPendingApproval)
     return false;
   if (typeof record.transcript !== "string" || record.transcript.length === 0)
     return false;
@@ -8662,8 +8971,8 @@ async function correctPendingApproval(config, path, sessionId, record, now, deps
   const clock = deps.now ?? Date.now;
   try {
     const agent = recordAgent(record);
-    const adapter2 = adapterFor(agent);
-    if (!shouldPendingApprovalCheck(record, adapter2))
+    const adapter = adapterFor(agent);
+    if (!shouldPendingApprovalCheck(record, adapter))
       return "uncorrected";
     let tail;
     try {
@@ -8671,10 +8980,10 @@ async function correctPendingApproval(config, path, sessionId, record, now, deps
     } catch {
       return "uncorrected";
     }
-    if (!adapter2.tailShowsPendingApproval(tail))
+    if (!adapter.tailShowsPendingApproval(tail))
       return "uncorrected";
-    const detail = adapter2.tailPendingAttentionDetail?.(tail);
-    const attentionKind = adapter2.tailPendingAttentionKind?.(tail);
+    const detail = adapter.tailPendingAttentionDetail?.(tail);
+    const attentionKind = adapter.tailPendingAttentionKind?.(tail);
     const attnNow = clock();
     const envelope = await buildNeedsAttentionEnvelope(sessionId, record, attnNow, config.e2eKey, agent, Math.floor(attnNow / 1000), detail, attentionKind);
     const outcome = await post(envelope);
@@ -8699,8 +9008,8 @@ async function correctPendingApproval(config, path, sessionId, record, now, deps
     return "uncorrected";
   }
 }
-function shouldIdleProvisionalCheck(record, adapter2) {
-  if (!adapter2.pidTurnActive)
+function shouldIdleProvisionalCheck(record, adapter) {
+  if (!adapter.pidTurnActive)
     return false;
   if (record.provisional !== true)
     return false;
@@ -8713,12 +9022,12 @@ function shouldIdleProvisionalCheck(record, adapter2) {
 async function correctIdleProvisional(config, path, sessionId, record) {
   try {
     const agent = recordAgent(record);
-    const adapter2 = adapterFor(agent);
-    if (!shouldIdleProvisionalCheck(record, adapter2))
+    const adapter = adapterFor(agent);
+    if (!shouldIdleProvisionalCheck(record, adapter))
       return "uncorrected";
     let active = false;
     try {
-      active = await adapter2.pidTurnActive(record.pid);
+      active = await adapter.pidTurnActive(record.pid);
     } catch {}
     if (active)
       return "uncorrected";
@@ -8748,7 +9057,8 @@ function transcriptMtimeMsDefault(path) {
   }
 }
 function isClaudeIdleReapEligible(record, now, transcriptMtimeMs = transcriptMtimeMsDefault) {
-  if (recordAgent(record) !== "claude")
+  const agent = recordAgent(record);
+  if (agent !== "claude" && agent !== "cursor")
     return false;
   if (record.provisional === true)
     return false;
@@ -8802,9 +9112,9 @@ async function correctIdleClaude(config, path, sessionId, record, now, deps = {}
         return "uncorrected";
       }
       const transcript = record.transcript;
-      const active = deps.codexTurnActive ?? (async (_pid, path2) => {
-        const tail = await readSuffix(path2, 8 * 1024);
-        return codexTurnActiveFromTail(tail, Date.now() - statSync3(path2).mtimeMs);
+      const active = deps.codexTurnActive ?? (async (_pid, path) => {
+        const tail = await readSuffix(path, 8 * 1024);
+        return codexTurnActiveFromTail(tail, Date.now() - statSync3(path).mtimeMs);
       });
       try {
         if (await active(tuiPid, transcript))
@@ -8855,6 +9165,8 @@ async function correctIdleClaude(config, path, sessionId, record, now, deps = {}
   }
 }
 var PENDING_DONE_MAX_ATTEMPTS = 5;
+var PENDING_DONE_GRACE_MS = 4000;
+var PENDING_DONE_POST_TIMEOUT_MS = 5000;
 function shouldPendingDoneCheck(record) {
   if (record.donePending !== true)
     return false;
@@ -8863,7 +9175,7 @@ function shouldPendingDoneCheck(record) {
   return true;
 }
 async function correctPendingDone(config, path, sessionId, record, now, deps = {}) {
-  const post = deps.post ?? ((body) => postEvent(config, body));
+  const post = deps.post ?? ((body, detail) => postEvent(config, body, { timeoutMs: PENDING_DONE_POST_TIMEOUT_MS, detail }));
   const writeRecord = deps.writeRecord ?? ((p, rec) => atomicWrite(p, JSON.stringify(rec), 384));
   const reread = deps.readRecord ?? readRecordAt;
   const freshRecord = async () => {
@@ -8877,6 +9189,9 @@ async function correctPendingDone(config, path, sessionId, record, now, deps = {
   try {
     if (!shouldPendingDoneCheck(record))
       return "uncorrected";
+    const age = now - record.ts;
+    if (age >= 0 && age < PENDING_DONE_GRACE_MS)
+      return "pending";
     if (await decisionHoldIsLive(sessionId, now, deps)) {
       traceFocus(deps, { event: "pending-done", sessionId, outcome: "held", delivered: false, held: true });
       return "pending";
@@ -8905,14 +9220,18 @@ async function correctPendingDone(config, path, sessionId, record, now, deps = {
       return "pending";
     }
     const at = typeof record.ts === "number" && Number.isFinite(record.ts) ? Math.floor(record.ts / 1000) : undefined;
-    const outcome = await post(await buildDoneEnvelope(sessionId, record, clock(), config.e2eKey, agent, at));
+    const detail = {};
+    const outcome = await post(await buildDoneEnvelope(sessionId, record, clock(), config.e2eKey, agent, at), detail);
     traceFocus(deps, {
       event: "pending-done",
       sessionId,
       outcome,
       attempts,
       delivered: outcome === "delivered",
-      at
+      at,
+      status: detail.status,
+      error: detail.error,
+      ms: detail.ms
     });
     if (outcome === "revoked")
       return "revoked";
@@ -8934,6 +9253,76 @@ async function correctPendingDone(config, path, sessionId, record, now, deps = {
       } catch {}
     }
     return "pending";
+  } catch {
+    return "uncorrected";
+  }
+}
+var PENDING_UPDATE_POST_TIMEOUT_MS = PENDING_DONE_POST_TIMEOUT_MS;
+var RESEND_BACKOFF_MAX_MS = 60000;
+function resendBackoffMs(failures) {
+  return failures <= 0 ? 0 : Math.min(POLL_MS * 2 ** (failures - 1), RESEND_BACKOFF_MAX_MS);
+}
+var resendBackoff = { failures: 0, nextAt: 0 };
+function resendAllowed(now) {
+  return now >= resendBackoff.nextAt;
+}
+function noteResend(delivered, now) {
+  resendBackoff.failures = delivered ? 0 : resendBackoff.failures + 1;
+  const wait = resendBackoffMs(resendBackoff.failures);
+  resendBackoff.nextAt = delivered ? 0 : now + wait;
+  return wait;
+}
+function resetResendBackoff() {
+  resendBackoff.failures = 0;
+  resendBackoff.nextAt = 0;
+}
+function shouldPendingUpdateCheck(record) {
+  return record.updatePending === true && record.op !== "done" && record.lastEvent !== "done" && typeof record.ts === "number" && Number.isFinite(record.ts);
+}
+async function correctPendingUpdate(config, path, sessionId, record, now, deps = {}) {
+  const post = deps.post ?? ((body, detail) => postEvent(config, body, { timeoutMs: PENDING_UPDATE_POST_TIMEOUT_MS, detail }));
+  const writeRecord = deps.writeRecord ?? ((p, rec) => atomicWrite(p, JSON.stringify(rec), 384));
+  const reread = deps.readRecord ?? readRecordAt;
+  try {
+    if (!shouldPendingUpdateCheck(record) || !resendAllowed(now))
+      return "uncorrected";
+    if (await decisionHoldIsLive(sessionId, now, deps))
+      return "uncorrected";
+    const fresh = await reread(path);
+    if (!fresh || recordMovedSince(record, fresh) || !shouldPendingUpdateCheck(fresh))
+      return "uncorrected";
+    const envelope = buildHeartbeatEnvelope(sessionId, fresh, (deps.now ?? Date.now)(), config.pairingId);
+    if (!envelope) {
+      await writeRecord(path, { ...fresh, updatePending: undefined });
+      return "uncorrected";
+    }
+    const detail = {};
+    const outcome = await post(envelope, detail);
+    const delivered = outcome === "delivered";
+    const backoffMs = outcome === "revoked" ? undefined : noteResend(delivered, now);
+    traceFocus(deps, {
+      event: "pending-update",
+      sessionId,
+      outcome,
+      delivered,
+      op: fresh.op,
+      lastEvent: fresh.lastEvent,
+      status: detail.status,
+      error: detail.error,
+      ms: detail.ms,
+      backoffMs
+    });
+    if (outcome === "revoked")
+      return "revoked";
+    if (!delivered)
+      return "pending";
+    const after = await reread(path);
+    if (after && !recordMovedSince(fresh, after) && after.updatePending === true) {
+      try {
+        await writeRecord(path, { ...after, updatePending: undefined });
+      } catch {}
+    }
+    return "corrected";
   } catch {
     return "uncorrected";
   }
@@ -9057,39 +9446,54 @@ async function buildTitleRepairEnvelope(sessionId, record, title, now, e2eKey, a
   const blob = await encryptBlob(e2eKey, appendFittedPlanAndDebug(base, undefined, dbg));
   return { v: 2, sessionId, op: record.op ?? "update", prio: record.prio ?? 0, ts: now, blob, ...startedAtField(record) };
 }
-function shouldRepairTitle(record) {
-  if (record.agent !== "codex")
-    return false;
+function shouldRepairTitle(record, now = Date.now()) {
   if (record.provisional === true)
     return false;
-  return typeof record.title !== "string" || record.title.length === 0;
+  return adapterFor(recordAgent(record)).titleRepair?.due(record, now) === true;
 }
 function titleRepairedRecord(record, title, blob, pairingId) {
   return { ...record, title, blob, ...pairingId.length > 0 ? { pairingId } : {} };
 }
-async function repairTitle(config, path, sessionId, record) {
+async function repairTitle(config, path, sessionId, record, deps = {}) {
   try {
     if (!shouldRepairTitle(record))
       return "uncorrected";
-    let prefix = "";
-    if (typeof record.transcript === "string" && record.transcript.length > 0) {
-      try {
-        prefix = await readPrefix(record.transcript, TITLE_REPAIR_HEAD_BYTES);
-      } catch {}
+    const adapter = adapterFor(recordAgent(record));
+    const resolve = deps.resolve ?? adapter.titleRepair?.resolve;
+    let title;
+    if (resolve) {
+      title = resolve(sessionId);
+    } else {
+      let prefix = "";
+      if (typeof record.transcript === "string" && record.transcript.length > 0) {
+        try {
+          prefix = await readPrefix(record.transcript, TITLE_REPAIR_HEAD_BYTES);
+        } catch {}
+      }
+      title = await adapter.title({ sessionId, prefix, input: {}, transcriptPath: record.transcript });
     }
-    const title = await codexAdapter.title({ sessionId, prefix, input: {}, transcriptPath: record.transcript });
-    if (!title)
+    if (!title || title === record.title)
+      return "uncorrected";
+    const unmoved = async () => {
+      try {
+        const fresh = await readRecordAt(path);
+        return fresh !== null && !recordMovedSince(record, fresh);
+      } catch {
+        return false;
+      }
+    };
+    if (!await unmoved())
       return "uncorrected";
     const repairNow = Date.now();
-    const envelope = await buildTitleRepairEnvelope(sessionId, record, title, repairNow, config.e2eKey, "codex", Math.floor(repairNow / 1000));
-    const outcome = await postEvent(config, envelope);
+    const envelope = await buildTitleRepairEnvelope(sessionId, record, title, repairNow, config.e2eKey, adapter.kind, Math.floor(repairNow / 1000));
+    const outcome = await (deps.post ?? ((body) => postEvent(config, body)))(envelope);
     if (outcome === "revoked")
       return "revoked";
     if (outcome !== "delivered")
       return "uncorrected";
     try {
-      const next = titleRepairedRecord(record, title, envelope.blob, config.pairingId);
-      await atomicWrite(path, JSON.stringify(next), 384);
+      if (await unmoved())
+        await atomicWrite(path, JSON.stringify(titleRepairedRecord(record, title, envelope.blob, config.pairingId)), 384);
     } catch {}
     return "corrected";
   } catch {
@@ -9320,11 +9724,29 @@ async function sweep(config, deps = {}) {
             repairedTitle = true;
           }
         }
-        const beatKind = heartbeatKind(record, now, heartbeatAt.get(sessionId), waitingBeatAt, idleFix === "corrected" || planResolutionHandled || interruptHandled || flaggedAttention || reapedIdle || repairedTitle, pairingIsNew);
-        if (beatKind !== "none") {
+        const netOwned = idleFix === "corrected" || planResolutionHandled || interruptHandled || flaggedAttention || reapedIdle || repairedTitle;
+        let resent = false;
+        if (!netOwned) {
+          const pendingUpdate = await correctPendingUpdate(config, path, sessionId, record, now);
+          if (pendingUpdate === "revoked")
+            return { revoked: true };
+          if (pendingUpdate === "corrected")
+            delivered = true;
+          resent = pendingUpdate === "corrected" || pendingUpdate === "pending";
+        }
+        const beatKind = heartbeatKind(record, now, heartbeatAt.get(sessionId), waitingBeatAt, netOwned || resent, pairingIsNew);
+        const slow = beatKind === "stale";
+        if (beatKind !== "none" && !(slow && !resendAllowed(now))) {
           const beat = buildHeartbeatEnvelope(sessionId, record, Date.now(), config.pairingId);
           if (beat) {
-            const outcome = await postEvent(config, beat);
+            const detail = {};
+            const outcome = await postEvent(config, beat, slow ? { timeoutMs: PENDING_UPDATE_POST_TIMEOUT_MS, detail } : {});
+            if (slow && outcome !== "revoked") {
+              const backoffMs = noteResend(outcome === "delivered", now);
+              if (outcome !== "delivered") {
+                traceFocus({}, { event: "heartbeat", sessionId, outcome, status: detail.status, error: detail.error, ms: detail.ms, backoffMs });
+              }
+            }
             if (outcome === "revoked")
               return { revoked: true };
             if (outcome === "delivered") {
@@ -9371,13 +9793,14 @@ async function goneStrikeShouldTeardown(goneStrikesPath) {
   return await recordGoneStrike(goneStrikesPath) >= GONE_STRIKE_LIMIT;
 }
 var activeBridgeShutdown;
+var activeCodexInterrupt;
 var activeLanShutdown;
 var BRIDGE_OP_DEADLINE_MS = 15000;
 var PLAN_PICKER_STATUS_QUERY_DEADLINE_MS = 2000;
 function withDeadline(work, ms) {
   let timer;
-  const deadline = new Promise((resolve3) => {
-    timer = setTimeout(() => resolve3(undefined), ms);
+  const deadline = new Promise((resolve) => {
+    timer = setTimeout(() => resolve(undefined), ms);
     timer.unref?.();
   });
   return Promise.race([work, deadline]).finally(() => {
@@ -9534,6 +9957,15 @@ function createBridgeSupervisor(deps = {}) {
         return "unavailable";
       }
     },
+    async interruptTurn(threadId, turnId) {
+      if (!bridge?.interruptTurn)
+        return "unavailable";
+      try {
+        return await withDeadline(bridge.interruptTurn(threadId, turnId), BRIDGE_OP_DEADLINE_MS) ?? "failed";
+      } catch {
+        return "failed";
+      }
+    },
     get active() {
       return bridge !== undefined;
     },
@@ -9614,6 +10046,7 @@ async function run() {
     })
   });
   activeBridgeShutdown = () => bridges.shutdown();
+  activeCodexInterrupt = (threadId, turnId) => bridges.interruptTurn(threadId, turnId);
   const lan = createLanListener({
     onCommand: acceptLanCommand,
     onAnswer: (answer) => {
@@ -9690,6 +10123,7 @@ async function run() {
   } finally {
     shutdown();
     activeBridgeShutdown = undefined;
+    activeCodexInterrupt = undefined;
     activeLanShutdown = undefined;
     activeLanListener = undefined;
     releaseSingleInstance();
@@ -9718,90 +10152,101 @@ if (__require.main == __require.module) {
   process.exit(0);
 }
 export {
-  withDeadline,
-  watchdogEventHeaders,
-  titleRepairedRecord,
-  tailShowsInterrupt,
-  shouldWaitingHeartbeat,
-  shouldRepairTitle,
-  shouldPlanPickerVerificationCheck,
-  shouldPendingDoneCheck,
-  shouldPendingApprovalCheck,
-  shouldInterruptCheck,
-  shouldIdleProvisionalCheck,
-  shouldHeartbeat,
-  shouldGreetHeartbeat,
-  setCodexBridgeDown,
-  retireDoneStale,
-  resolveCodexTuiOwner,
-  resetDoneAttemptMemory,
-  resetCommandState,
-  recordMovedSince,
-  reconcileProvisionalsSweep,
-  pruneStaleDecisionHolds,
-  provisionalsCoveredByReal,
-  postOutcomeForStatus,
-  planPickerPendingExpired,
-  pendingPairingExpired,
-  pendingDoneSettleWrite,
-  pendingDoneRetryWrite,
-  parseCommandPayload,
-  noteDoneAttempt,
-  lastTurnLine,
-  isWaitingSession,
-  isRightfulWatchdogOwner,
-  isRetireEligible,
-  isClaudeIdleReapEligible,
-  heartbeatKind,
-  hasInterruptMarker,
-  goneStrikeShouldTeardown,
-  extractCommands,
-  enqueueDrainCommands,
-  enforceWatchdogOwnership,
-  effectiveDoneAttempts,
-  drainCommands,
-  discoverLiveSessions,
-  decisionHoldIsLive,
-  createBridgeSupervisor,
-  correlateCodexTuiPid,
-  correctResolvedPlanPicker,
-  correctPlanPickerVerification,
-  correctPendingDone,
-  correctPendingApproval,
-  correctInterrupt,
-  correctIdleClaude,
-  commandIsFresh,
-  codexTailPendingApproval,
-  codexLastTurnEvent,
-  codexBridgeIsDown,
-  clearDoneAttempts,
-  claudeTailPendingApproval,
-  classifySession,
-  buildWorkingEnvelope,
-  buildTitleRepairEnvelope,
-  buildStartEnvelope,
-  buildProvisionalRecord,
-  buildProvisionalEnvelope,
-  buildProvisionalBlob,
-  buildNeedsAttentionEnvelope,
-  buildHeartbeatEnvelope,
-  buildEndEnvelope,
-  buildDoneEnvelope,
-  acceptLanCommand,
-  acceptLanAnswer,
-  WAITING_HEARTBEAT_AFTER_MS,
-  RETIRE_AFTER_MS,
-  POLL_MS,
-  PLAN_PICKER_VERIFY_MAX_MS,
-  PLAN_PICKER_RECENT_DONE_MS,
-  PLAN_PICKER_PENDING_MAX_MS,
-  PAIRING_TTL_MS,
-  LAN_COMMAND_ID_PREFIX,
-  LAN_ANSWER_ECHO_DELAY_MS,
-  IDLE_GRACE_MS,
-  COMMAND_TTL_MS,
-  COMMAND_FUTURE_SKEW_MS,
-  CODEX_TUI_SESSION_START_SKEW_MS,
+  CLAUDE_AWAITING_PROMPT_REAP_MS,
   CLAUDE_IDLE_REAP_MAX_ATTEMPTS,
-  CLAUDE_AWAITING_PROMPT_REAP_MS
+  CODEX_TUI_SESSION_START_SKEW_MS,
+  COMMAND_FUTURE_SKEW_MS,
+  COMMAND_TTL_MS,
+  IDLE_GRACE_MS,
+  LAN_ANSWER_ECHO_DELAY_MS,
+  LAN_COMMAND_ID_PREFIX,
+  PAIRING_TTL_MS,
+  PENDING_DONE_GRACE_MS,
+  PENDING_DONE_POST_TIMEOUT_MS,
+  PENDING_UPDATE_POST_TIMEOUT_MS,
+  PLAN_PICKER_PENDING_MAX_MS,
+  PLAN_PICKER_RECENT_DONE_MS,
+  PLAN_PICKER_VERIFY_MAX_MS,
+  POLL_MS,
+  RESEND_BACKOFF_MAX_MS,
+  RETIRE_AFTER_MS,
+  WAITING_HEARTBEAT_AFTER_MS,
+  acceptLanAnswer,
+  acceptLanCommand,
+  buildDoneEnvelope,
+  buildEndEnvelope,
+  buildHeartbeatEnvelope,
+  buildNeedsAttentionEnvelope,
+  buildProvisionalBlob,
+  buildProvisionalEnvelope,
+  buildProvisionalRecord,
+  buildStartEnvelope,
+  buildTitleRepairEnvelope,
+  buildWorkingEnvelope,
+  classifySession,
+  claudeTailPendingApproval,
+  clearDoneAttempts,
+  codexBridgeIsDown,
+  codexLastTurnEvent,
+  codexTailPendingApproval,
+  commandIsFresh,
+  correctIdleClaude,
+  correctInterrupt,
+  correctPendingApproval,
+  correctPendingDone,
+  correctPendingUpdate,
+  correctPlanPickerVerification,
+  correctResolvedPlanPicker,
+  correlateCodexTuiPid,
+  createBridgeSupervisor,
+  decisionHoldIsLive,
+  discoverLiveSessions,
+  drainCommands,
+  effectiveDoneAttempts,
+  enforceWatchdogOwnership,
+  enqueueDrainCommands,
+  extractCommands,
+  goneStrikeShouldTeardown,
+  hasInterruptMarker,
+  heartbeatKind,
+  isClaudeIdleReapEligible,
+  isRetireEligible,
+  isRightfulWatchdogOwner,
+  isWaitingSession,
+  lastTurnLine,
+  noteDoneAttempt,
+  noteResend,
+  parseCommandPayload,
+  pendingDoneRetryWrite,
+  pendingDoneSettleWrite,
+  pendingPairingExpired,
+  planPickerPendingExpired,
+  postOutcomeForStatus,
+  provisionalsCoveredByReal,
+  pruneStaleDecisionHolds,
+  reconcileProvisionalsSweep,
+  recordMovedSince,
+  repairTitle,
+  resendAllowed,
+  resendBackoffMs,
+  resetCommandState,
+  resetDoneAttemptMemory,
+  resetResendBackoff,
+  resolveCodexTuiOwner,
+  retireDoneStale,
+  setCodexBridgeDown,
+  shouldGreetHeartbeat,
+  shouldHeartbeat,
+  shouldIdleProvisionalCheck,
+  shouldInterruptCheck,
+  shouldPendingApprovalCheck,
+  shouldPendingDoneCheck,
+  shouldPendingUpdateCheck,
+  shouldPlanPickerVerificationCheck,
+  shouldRepairTitle,
+  shouldWaitingHeartbeat,
+  tailShowsInterrupt,
+  titleRepairedRecord,
+  watchdogEventHeaders,
+  withDeadline
 };

@@ -15,6 +15,7 @@ import {
   RECORD_FULL_TEXT_TRUNCATION_MARKER, recordFullTextIsComplete, settleDecisionHoldRecordAt,
   stampPermissionDetailFullAt, watchdogBuildStamp,
   watchdogHolderIsLive,
+  INTERRUPT_FLAG_MAX_AGE_MS, clearInterruptFlagAt, interruptFlagFileName, interruptFlagSetAt, writeInterruptFlagAt,
 } from "./shared";
 
 describe("codexCompanionBrokerEvidence (structural companion-session proof)", () => {
@@ -1060,5 +1061,41 @@ describe("resolveGitDir / branchFromHead / sessionBranch (the folder's live git 
     expect(sessionBranch(legacy)).toBeUndefined();
     // …as does a bare-string pin (every positional caller predating the folder key).
     expect(sessionBranch(folderIdentity(other, "api-status"))).toBeUndefined();
+  });
+});
+
+describe("interrupt flag (phone asked this session's turn to stop)", () => {
+  const dir = () => mkdtemp(join(tmpdir(), "nomo-int-"));
+
+  test("absent → not set", async () => {
+    expect(await interruptFlagSetAt(await dir(), "s1", 1_000)).toBe(false);
+  });
+
+  test("written → set, and reading does NOT consume it (later tools in the same message must be denied too)", async () => {
+    const d = await dir();
+    await writeInterruptFlagAt(d, "s1", 1_000);
+    expect(await interruptFlagSetAt(d, "s1", 2_000)).toBe(true);
+    expect(await interruptFlagSetAt(d, "s1", 3_000)).toBe(true);
+  });
+
+  test("older than the max age → ignored (a leaked flag can never stop a turn hours later)", async () => {
+    const d = await dir();
+    await writeInterruptFlagAt(d, "s1", 1_000);
+    expect(await interruptFlagSetAt(d, "s1", 1_000 + INTERRUPT_FLAG_MAX_AGE_MS + 1)).toBe(false);
+  });
+
+  test("cleared → not set; clearing a missing flag does not throw", async () => {
+    const d = await dir();
+    await writeInterruptFlagAt(d, "s1", 1_000);
+    await clearInterruptFlagAt(d, "s1");
+    await clearInterruptFlagAt(d, "s1");
+    expect(await interruptFlagSetAt(d, "s1", 2_000)).toBe(false);
+  });
+
+  test("the file is not a .json (session-record readers must never see it)", async () => {
+    const d = await dir();
+    await writeInterruptFlagAt(d, "s1", 1_000);
+    expect(await readdir(d)).toEqual([interruptFlagFileName("s1")]);
+    expect(interruptFlagFileName("s1").endsWith(".json")).toBe(false);
   });
 });

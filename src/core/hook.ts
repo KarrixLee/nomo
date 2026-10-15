@@ -8,9 +8,10 @@
 // entries" split; codex-status.ts imports THIS, not cc-status.ts).
 //
 // Reads the hook JSON from stdin, plans a v2 envelope (op + prio + an E2E-encrypted blob), and POSTs
-// it to the Worker, which is a BLIND relay: it never sees plaintext. Contract with the agent: NOTHING
-// on stdout, exit 0 no matter what, give up after 2 seconds — a dead network must never stall or
-// derail a session. cc-status.ts re-exports this module's whole surface, so existing importers/tests
+// it to the Worker, which is a BLIND relay: it never sees plaintext. Contract with the agent: exit 0 no
+// matter what, give up on the network after 2 seconds, and print NOTHING on stdout with ONE exception —
+// a phone interrupt (see interruptHookOutput), which is a single JSON line. A dead network must never
+// stall or derail a session. cc-status.ts re-exports this module's whole surface, so existing importers/tests
 // that reference "./cc-status" are unaffected.
 //
 // PORTABILITY: runs unmodified under bun AND node >= 18. No `Bun.*` APIs — stdin is read via the
@@ -22,15 +23,16 @@ import { hostname } from "node:os";
 import { basename } from "node:path";
 import { Bytes, encryptBlob } from "./crypto";
 import {
-  adapterFor, claudeToolDetail, codexToolDetail, findProvisionalForPid, requestUserInputDetail,
+  adapterFor, claudeToolDetail, codexToolDetail, cursorHostInvocation, findProvisionalForPid, requestUserInputDetail,
   SessionCreationSuppression, TrackedSessionLite,
 } from "./adapter";
 import {
-  AgentKind, appendFittedPlanAndDebug, atomicWrite, CCOp, CCStatus, codexCompanionBrokerEvidence, Config, decisionHoldFileName, ensureWatchdog, FolderIdentity, folderIdentity, formatPlanPickerDebug, fullTextForRecord, GONE_STRIKE_LIMIT,
-  LAST_SEND_PATH, lastHookPath, loadConfig, loadPendingConfig, localApprovalsState, PENDING_STASH_PATH, PendingEventStash, pidAncestors, pidCommand, PLUGIN_VERSION, postFullText, readPrefix,
+  AgentKind, appendFittedPlanAndDebug, atomicWrite, CCOp, CCStatus, clearInterruptFlagAt, codexCompanionBrokerEvidence, Config, decisionHoldFileName, ensureWatchdog, FolderIdentity, folderIdentity, formatPlanPickerDebug, fullTextForRecord, GONE_STRIKE_LIMIT,
+  interruptFlagFileName, interruptFlagSetAt, LAST_SEND_PATH, lastHookPath, loadConfig, loadPendingConfig, localApprovalsState, PENDING_STASH_PATH, PendingEventStash, pidAlive, pidAncestors, pidCommand, PLUGIN_VERSION, postFullText, readDecisionHoldAt, readPrefix, SEND_FAIL_PATH,
   readRecord, recordGoneStrike, removeRevokedConfig, resetGoneStrikes, SessionOrigin, SessionRecord, SESSIONS_DIR, sessionBranch, tracePlanPickerDecision, traceSession,
 } from "./shared";
 import { repairNotifyWiring } from "./notify-wire";
+import { stateHoldLive } from "./session-state";
 
 export { SESSION_TRACE_PATH } from "./shared";
 
@@ -79,17 +81,89 @@ export function detailForHook(hookName: string, toolName?: string, toolInput?: u
     return requestUserInputDetail(toolInput);
   }
   if (hookName === "PreToolUse") return toolName ? TOOL_DETAIL[toolName] : undefined;
-  if (hookName === "PostToolUse") return "thinking";
+  // A FAILED tool hands control back to the model exactly like a finished one.
+  if (hookName === "PostToolUse" || hookName === "PostToolUseFailure") return "thinking";
   return undefined;
 }
 
 /// Notification fires for BOTH a real permission prompt and the ~60s idle "Claude is waiting
 /// for your input" nudge. Only the permission case actually needs the user — the idle nudge must
 /// not flip a finished/working session to "needs help". Mirrors the reference app's `isPerm` gate.
+///
+/// `notification_type` is AUTHORITATIVE when present: the type list has grown (auth_success,
+/// agent_completed, the quota_auto_resume_* family, …) and their free-text messages can say "allow" or
+/// "permission" without anyone being asked anything. The message sniff survives ONLY as the fallback
+/// for a payload with no type at all (a Claude Code predating the field).
+///
+/// `worker_permission_prompt` is the same prompt raised on behalf of a teammate/worker agent ("<name>
+/// needs permission for <tool>", "<name> needs network access to <host>") — the lead session is the one
+/// blocked on the user, so it counts.
 export function isPermissionNotification(i: Record<string, unknown>): boolean {
   const type = typeof i.notification_type === "string" ? i.notification_type : "";
+  if (type.length > 0) return type === "permission_prompt" || type === "worker_permission_prompt";
   const msg = (typeof i.message === "string" ? i.message : "").toLowerCase();
-  return type === "permission_prompt" || msg.includes("permission") || msg.includes("approve") || msg.includes("allow");
+  return msg.includes("permission") || msg.includes("approve") || msg.includes("allow");
+}
+
+/// The Notification types that mean "blocked on the user" WITHOUT being a permission prompt — the
+/// notify-only needsAttention, never an answerable approval:
+///   - the twins of the `Elicitation` hook: an MCP server's form / browser-URL request has sat
+///     unanswered ~6 s (a backstop for a dropped Elicitation hook);
+///   - `agent_needs_input`: a dialog only the user can dismiss (teammate setup, the auto-mode billing
+///     notice) or a background agent of this session that is blocked on input.
+const ATTENTION_NOTIFICATIONS = new Set(["elicitation_dialog", "elicitation_url_dialog", "agent_needs_input"]);
+
+/// Does a `Stop` payload say a background SUBAGENT is still running? Claude Code's Stop carries
+/// `background_tasks` ("in-flight" tasks, each with a `type` label and a `status`) precisely so a hook
+/// can tell "done" from "paused waiting for background work to wake it back up". ONLY `subagent`
+/// counts: a background `shell` (a dev server, `tail -f`) or a `monitor` can outlive the session's
+/// usefulness forever and would pin the row working, whereas a subagent ends and REPORTS BACK — which
+/// fires UserPromptSubmit and then a fresh Stop with the list re-evaluated, so the row still reaches
+/// done. Strict on `status` too: Claude Code lists a task while its status is `running` or `pending`
+/// (registered, not started yet — it will run and report back just the same; read off the 2.1.296
+/// binary's own in-flight filter), and anything else reads as "not in flight" and keeps the old done.
+function hasRunningBackgroundAgent(input: Record<string, unknown>): boolean {
+  const tasks = input.background_tasks;
+  return Array.isArray(tasks) && tasks.some((t) => {
+    const task = t as Record<string, unknown> | null;
+    return typeof task === "object" && task !== null && task.type === "subagent"
+      && (task.status === "running" || task.status === "pending");
+  });
+}
+
+/// The MID-TURN NOM-67 events — every one of them added long after the approval hold existed — YIELD to
+/// a live hold instead of writing over it. While a PermissionRequest hook is blocked on the phone, that
+/// card is the truth about the session (see stateHoldLive); a compaction notice, a failed parallel tool
+/// or an MCP form from elsewhere in the same session must not take the row back, because the worker
+/// clears its decision overlay on any prio:0 frame and the answerable card is then gone for good. Same
+/// rule, same three inputs, as the watchdog's corrective gate (decisionHoldIsLive). The pre-existing
+/// events are deliberately NOT in here — their behaviour under a hold is unchanged.
+///
+/// THE TURN ENDS ARE NOT IN HERE EITHER: StopFailure and Interrupt behave exactly like plain Stop. The
+/// main thread cannot end its turn while its own permission prompt is genuinely open, so a turn end
+/// arriving under a "live" hold means the hold is an orphan and done is the truth. Yielding there left a
+/// dead card up (Codex Esc with a card on the phone — and the watchdog's interrupt net is hold-gated too,
+/// so nothing else would say so) or a row stuck working until the idle reap. Their done takes the card
+/// down the same way Stop's does: the worker supersedes a pending decision on a hook `done`, and the LAN
+/// state ranks a done record above a live hold.
+const HOLD_YIELDING_EVENTS = new Set([
+  "PostToolUseFailure", "PreCompact", "PostCompact", "Elicitation", "ElicitationResult",
+]);
+export function yieldsToLiveHold(hookName: string, input: Record<string, unknown>): boolean {
+  if (HOLD_YIELDING_EVENTS.has(hookName)) return true;
+  if (hookName === "Stop") return hasRunningBackgroundAgent(input);       // the new working-not-done Stop
+  if (hookName === "Notification") return !isPermissionNotification(input); // the notify-only attention types
+  return false;
+}
+
+/** Is a remote-approval hold LIVE on this session right now (marker + holder pid alive + inside the
+ *  TTL)? The hook-side twin of cc-watchdog's decisionHoldIsLive, built from the same parts. Never
+ *  throws; no marker (the overwhelmingly common case) is one failed read. */
+export async function sessionHoldIsLive(
+  sessionsDir: string, sessionId: string, now: number = Date.now(), alive: (pid: number) => boolean = pidAlive,
+): Promise<boolean> {
+  const hold = await readDecisionHoldAt(sessionsDir, sessionId);
+  return stateHoldLive(hold, hold !== null && typeof hold.pid === "number" ? alive(hold.pid) : false, now);
 }
 
 /// Tools that block on the USER (not on the machine): Claude presents them and then WAITS for a human
@@ -103,14 +177,70 @@ export function isPermissionNotification(i: Record<string, unknown>): boolean {
 /// watchdog backstop for the case where this very PreToolUse hook is dropped.
 const USER_BLOCKING_TOOLS = new Set(["AskUserQuestion", "ExitPlanMode", "request_user_input"]);
 
+/** What the Claude Code TUI shows, and what stays in the conversation, when the phone interrupts. */
+export const INTERRUPT_STOP_REASON = "Interrupted from Nomo";
+
+/** The stdout line that stops a Claude Code turn from a tool hook, or null for an event that cannot.
+ *  Verified on Claude Code 2.1.296 (2026-10-12):
+ *   - `continue:false` ends the turn and leaves the session alive at the prompt;
+ *   - from PreToolUse it does NOT block the tool it fired on, hence the explicit deny;
+ *   - no Stop hook fires afterwards (see the planOp remap in runHook).
+ *  PostToolUseFailure is PostToolUse's twin for a tool that errored (a failed tool fires no PostToolUse),
+ *  so it is a tool boundary too: without it a parallel tool failing after the stop would plan `working`
+ *  and flip the interrupted row back, with no Stop left to correct it. It sends the same common-field
+ *  line; NOT device-verified on this event — if a Claude Code ignores it there, the next PreToolUse
+ *  still stops the turn (the flag is not consumed). */
+export function interruptHookOutput(hookName: string): string | null {
+  if (hookName === "PreToolUse") {
+    return JSON.stringify({
+      continue: false,
+      stopReason: INTERRUPT_STOP_REASON,
+      hookSpecificOutput: {
+        hookEventName: "PreToolUse",
+        permissionDecision: "deny",
+        permissionDecisionReason: INTERRUPT_STOP_REASON,
+      },
+    });
+  }
+  if (hookName === "PostToolUse" || hookName === "PostToolUseFailure") {
+    return JSON.stringify({ continue: false, stopReason: INTERRUPT_STOP_REASON });
+  }
+  return null;
+}
+
+/** Events that end or begin a turn. Any of them retires a pending interrupt: the turn it was aimed at
+ *  is over, and it must never reach the next one. StopFailure is Stop's stand-in when the turn dies on
+ *  an API error. (Codex's Interrupt never gets here: Codex is not a hook-flag agent.) */
+export function clearsInterruptFlag(hookName: string, input: Record<string, unknown> = {}): boolean {
+  // Not every Stop is a turn end: with a background subagent still in flight planOp keeps the row
+  // working, so the interrupt is still owed — clearing it there would silently drop it.
+  if (hookName === "Stop") return !hasRunningBackgroundAgent(input);
+  return hookName === "UserPromptSubmit" || hookName === "StopFailure" || hookName === "SessionEnd";
+}
+
+/** The event an interrupted tool hook is reported AS. Claude Code fires no Stop after a hook-stopped
+ *  turn, so the event that stopped it stands in for one — for the plan AND for the blob, which reads
+ *  the event name itself (detailForHook) and would otherwise seal a done still labelled with the tool. */
+export function interruptedEventInput(input: Record<string, unknown>): Record<string, unknown> {
+  return { ...input, hook_event_name: "Stop" };
+}
+
 /// The LOCAL op planner (the worker is now blind — lifecycle semantics live here). Maps a hook to a
 /// v2 op, its delivery prio, and the semantic status carried in the blob:
 ///   SessionStart                                → start,  prio 0, working
+///   SessionStart (source compact, over a done)  → (no frame)
 ///   UserPromptSubmit / PostToolUse              → update, prio 0, working
 ///   PreToolUse (ordinary tool)                  → update, prio 0, working
 ///   PreToolUse (AskUserQuestion / ExitPlanMode) → update, prio 1, needsAttention  (blocked on the user)
 ///   Notification (permission only) / PermissionRequest → update, prio 1, needsAttention
 ///   Stop                                        → done,   prio 0, done
+///   Stop (a background subagent still running)  → update, prio 0, working
+///   StopFailure (API error) / Interrupt (Codex) → done,   prio 0, done
+///   PostToolUseFailure                          → update, prio 0, working   (dropped on is_interrupt)
+///   Elicitation (+ its Notification twins)      → update, prio 1, needsAttention
+///   ElicitationResult                           → update, prio 0, working
+///   PreCompact / PostCompact (auto, mid-turn)   → update, prio 0, working
+///   PreCompact / PostCompact (manual, or auto over a done) → (no frame)
 ///   SessionEnd                                  → end,    prio 0, done
 /// Re-arm: a SessionStart AFTER an op:done was sent for this session (sentDone) restarts as a fresh
 /// `update`/working — the session already exists in the worker, so it's an update, not a new start.
@@ -118,6 +248,9 @@ const USER_BLOCKING_TOOLS = new Set(["AskUserQuestion", "ExitPlanMode", "request
 export function planOp(hookName: string, input: Record<string, unknown>, sentDone: boolean): OpPlan | null {
   switch (hookName) {
     case "SessionStart":
+      // A compaction never opens a turn: over a done record it is the idle-prompt compact the
+      // PreCompact case below already silenced, so it must not re-arm the row either.
+      if (sentDone && input.source === "compact") return null;
       return sentDone
         ? { op: "update", prio: 0, status: "working" }
         : { op: "start", prio: 0, status: "working" };
@@ -133,13 +266,45 @@ export function planOp(hookName: string, input: Record<string, unknown>, sentDon
     case "UserPromptSubmit":
     case "PostToolUse":
       return { op: "update", prio: 0, status: "working" };
+    case "PostToolUseFailure":
+      // A failed tool fires NO PostToolUse, so without this a needsAttention raised for it (a permission
+      // prompt answered at the terminal, then the tool erroring) stays up until the next tool. An abort
+      // is the exception: the turn is ending, and asserting "working" would be the stale state.
+      return input.is_interrupt === true ? null : { op: "update", prio: 0, status: "working" };
     case "Notification":
       // Drop the idle-waiting Notification so it can't masquerade as "needs help".
-      if (!isPermissionNotification(input)) return null;
+      if (!isPermissionNotification(input) &&
+          !(typeof input.notification_type === "string" && ATTENTION_NOTIFICATIONS.has(input.notification_type))) return null;
       return { op: "update", prio: 1, status: "needsAttention" };
     case "PermissionRequest":
+    // An MCP server asking the user for input mid-tool: blocked on the user, like a permission prompt —
+    // but only ever the notify-only needsAttention. Nothing here mints a decision card.
+    case "Elicitation":
       return { op: "update", prio: 1, status: "needsAttention" };
+    case "ElicitationResult":
+      return { op: "update", prio: 0, status: "working" };
+    case "PreCompact":
+    case "PostCompact":
+      // An AUTO compaction is mid-turn: a minute of hook silence that otherwise reads as a stalled row,
+      // and the turn carries on after it. A MANUAL `/compact` runs at the idle prompt and says NOTHING:
+      // cancelled or failed it fires no PostCompact, so a working raised here would sit on a finished row
+      // until the 30-minute idle reap; completed, a working-then-done pair is indistinguishable to the
+      // worker from a real turn and buzzes "Task finished" for a compact. The SessionStart source:"compact"
+      // that follows a completed one is silenced too (see the SessionStart case above).
+      // An AUTO compaction over a DONE record is the idle-prompt case too: Claude Code (seen 2026-10)
+      // auto-compacts a session sitting idle at the prompt, ~an hour after its last Stop. A working
+      // here would clear sentDone and leave the finished row "running" until the 30-minute idle reap.
+      return input.trigger === "manual" || sentDone ? null : { op: "update", prio: 0, status: "working" };
     case "Stop":
+      // The main agent stopped but a background subagent it launched has not: still working. That
+      // subagent's report-back fires UserPromptSubmit and then another Stop, which lands the done.
+      return hasRunningBackgroundAgent(input)
+        ? { op: "update", prio: 0, status: "working" }
+        : { op: "done", prio: 0, status: "done" };
+    // StopFailure: Claude Code fires it INSTEAD of Stop when the turn dies on an API error. Interrupt:
+    // Codex fires it when the user interrupts an active turn. Either way the turn is over.
+    case "StopFailure":
+    case "Interrupt":
       return { op: "done", prio: 0, status: "done" };
     case "SessionEnd":
       return { op: "end", prio: 0, status: "done" };
@@ -204,11 +369,12 @@ export function buildBlob(input: Record<string, unknown>, machine: string, title
   // not — a mid-session `git checkout` must reach the phone). Omitted when the folder is not a repo.
   const branch = sessionBranch(folder);
   const hookName = typeof input.hook_event_name === "string" ? input.hook_event_name : "";
-  const detail = detailOverride ?? detailForHook(
+  // A Stop that stays working (see planOp) is waiting on a background subagent — the Task tool's label.
+  const detail = detailOverride ?? (hookName === "Stop" && hasRunningBackgroundAgent(input) ? TOOL_DETAIL.Task : detailForHook(
     hookName,
     typeof input.tool_name === "string" ? input.tool_name : undefined,
     input.tool_input,
-  );
+  ));
   // The `agent` key is OMITTED for claude (byte-identical to the pre-codex blob so old Swift builds and
   // the existing snapshots are unaffected) and the agent's OWN literal for every other kind ("codex",
   // "opencode", …) — the rule is stated once, so a new AgentKind carries through here for free and can
@@ -383,6 +549,7 @@ export async function trackSessionAt(
       // liveness/TTL guards only make such a marker INERT — they do not remove the file. This is the
       // chokepoint where "the session is over" is known, so nothing of it is left behind.
       await unlink(`${sessionsDir}/${decisionHoldFileName(sessionId)}`).catch(() => {});
+      await unlink(`${sessionsDir}/${interruptFlagFileName(sessionId)}`).catch(() => {});
       return;
     }
     // lastEvent is the watchdog interrupt-net's gate key: a fresh `start` is a quiet "sessionStart",
@@ -518,6 +685,45 @@ export async function markDoneDelivered(sessionId: string): Promise<void> {
   return markDoneDeliveredAt(SESSIONS_DIR, sessionId);
 }
 
+/** Record that the relay's copy of this session is behind: called ONLY when a non-terminal event's POST
+ *  threw (timeout / network), so the watchdog's correctPendingUpdate re-sends the record's current state
+ *  with a longer budget than a hook can afford. Read-modify-write like markDoneDeliveredAt, and keyed on
+ *  `blob` — the one this hook just sealed and wrote — so a NEWER hook's record (whose own POST is still
+ *  deciding) is never stamped with this hook's failure. A done record is left to `donePending`.
+ *  Best-effort: a missed stamp costs what every failed POST cost before this existed. */
+export async function markUpdatePendingAt(sessionsDir: string, sessionId: string, blob: string | undefined): Promise<void> {
+  try {
+    const record = await readRecord(sessionId, sessionsDir);
+    if (!record || !blob || record.blob !== blob || record.op === "done" || record.updatePending === true) return;
+    await atomicWrite(`${sessionsDir}/${sessionId}.json`, JSON.stringify({ ...record, updatePending: true }), 0o600);
+  } catch {
+    // Bookkeeping is best-effort, exactly like trackSession's own write.
+  }
+}
+
+/** Trace a hook's own /cc/event POST failure — `error` (timeout / network) or `status`, plus `ms` —
+ *  ONCE PER FAILURE STREAK, not per event: hooks fire every few seconds and the trace is a 256 KB file.
+ *  A streak is "failures since the last delivered hook POST": it opens when SEND_FAIL_PATH is absent or
+ *  older than LAST_SEND_PATH, which the success path already writes — so a healthy hook does nothing new.
+ *  Returns whether it traced. Never throws. */
+export async function traceSendFailure(
+  event: object, failPath: string = SEND_FAIL_PATH, lastSendPath: string = LAST_SEND_PATH,
+  trace: (event: object) => void = traceSession,
+): Promise<boolean> {
+  try {
+    const stamp = async (path: string): Promise<number> => {
+      try { return Number.parseInt((await readFile(path, "utf8")).trim(), 10) || 0; } catch { return 0; }
+    };
+    const streakStart = await stamp(failPath);
+    if (streakStart > 0 && streakStart > await stamp(lastSendPath)) return false; // streak already traced
+    await atomicWrite(failPath, String(Date.now()));
+    trace({ event: "post-failed", ...event });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /** Reconcile a provisional discovery (see cc-watchdog's discovery step): a real hook has now fired for
  *  this codex TUI, so end + delete any PROVISIONAL session the watchdog surfaced ahead of it. Matches by
  *  pid — the hook's process.ppid is the codex TUI process, which is the provisional's pid (with an
@@ -638,6 +844,10 @@ export async function runHook(agent: AgentKind): Promise<void> {
   try {
     const [config, raw] = await Promise.all([loadConfig(), readStdin()]);
     const input = JSON.parse(raw) as Record<string, unknown>;
+    // Cursor import guard — FIRST, before the liveness stamp, any record or any POST. Cursor runs the
+    // Claude plugin's hooks itself, with Cursor-shaped payloads; mirroring those would report a Cursor
+    // chat as a Claude Code session. Only the CLAUDE entry is imported that way. See cursorHostInvocation.
+    if (agent === "claude" && cursorHostInvocation(input)) return;
     if (typeof input.session_id !== "string" || input.session_id.length === 0) return;
 
     // Codex compat-layer guard: Codex ≥0.142 auto-discovers installed Claude Code plugins as hook
@@ -732,6 +942,30 @@ export async function runHook(agent: AgentKind): Promise<void> {
     const machine = config.machineName ?? hostname().replace(/\.local$/, "");
     const reportedSessionId = input.session_id as string;
     const hookName = typeof input.hook_event_name === "string" ? input.hook_event_name : "";
+    // PHONE INTERRUPT. Placed before every suppression return and before any network call, so a slow or
+    // failed POST can never cost the user their interrupt. Keyed on the REPORTED id: that is the record
+    // file's stem (tool events never take the fork-alias path, which rewrites the id on SessionStart
+    // only), which is what the phone sealed into the command.
+    // This is the one place the status hook writes stdout; the write is awaited so the line is flushed
+    // before the entry's process.exit(0). Claude Code only ACTS on the line once this process exits, so
+    // the stop itself can still lag by the event POST's 2-second timeout plus the full-text upload await.
+    let interrupted = false;
+    if (adapter.interrupt === "hook-flag") {
+      if (clearsInterruptFlag(hookName, input)) {
+        await clearInterruptFlagAt(SESSIONS_DIR, reportedSessionId);
+      } else {
+        const line = interruptHookOutput(hookName);
+        if (line !== null && await interruptFlagSetAt(SESSIONS_DIR, reportedSessionId, Date.now())) {
+          interrupted = true;
+          // With the reader gone, node raises EPIPE as an unhandled stream 'error' (bun does not), which
+          // would exit 1 before the done is recorded. The listener stays on: resolve either way and carry on.
+          await new Promise<void>((resolve) => {
+            process.stdout.on("error", () => resolve());
+            try { process.stdout.write(`${line}\n`, () => resolve()); } catch { resolve(); }
+          });
+        }
+      }
+    }
     const sessionStartSource = typeof input.source === "string" ? input.source : "";
     const hookPid = process.ppid;
     const hookCommand = pidCommand(hookPid);
@@ -950,8 +1184,8 @@ export async function runHook(agent: AgentKind): Promise<void> {
     // set only over a record that says so:
     //   - no record yet → a fresh open. (Not for source:"compact": compaction of a session we have
     //     never tracked — the plugin enabled mid-turn — is a live turn, the anchor's exception above.)
-    //   - a DONE record → reopened at the idle prompt: a resume, or a manual `/compact` there, which
-    //     re-arms "working" with nothing left to retract it either.
+    //   - a DONE record → reopened at the idle prompt: a resume, which re-arms "working" with nothing
+    //     left to retract it either. (A compact over a done plans no frame — planOp — so never gets here.)
     //   - a record ALREADY awaiting → still unprompted; the value rides through.
     // Over a live working/needsAttention record it stays unset — a second `claude --resume <same id>`
     // or a mid-turn auto-compact must not expose a real turn to the reap during a hook-quiet stretch.
@@ -963,8 +1197,21 @@ export async function runHook(agent: AgentKind): Promise<void> {
     // The Codex turn id (Claude payloads carry none → undefined). Cached on the record so the notify
     // backstop's stale-turn guard can compare it against a delayed notify's payload turn-id.
     const turnId = typeof input.turn_id === "string" && input.turn_id.length > 0 ? input.turn_id : undefined;
-    let plan = planOp(hookName, input, sentDone);
+    // A hook-stopped turn fires NO Stop hook, and its transcript carries no "interrupted by user" line
+    // for the watchdog's net to find — so the event that stops the turn must report the done itself.
+    // The flag is not consumed, so the PostToolUse events of tool calls already in the same message
+    // take this path too and cannot flip the row back to working.
+    // `eventInput` is what buildEnvelope seals; `hookName` keeps the TRUE event for the traces below.
+    if (interrupted) eventInput = interruptedEventInput(eventInput);
+    let plan = planOp(interrupted ? "Stop" : hookName, input, sentDone);
     if (!plan) return;
+    // A live approval hold outranks the NOM-67 events — drop the event whole (no record write, no POST)
+    // so neither the LAN feed nor the worker's decision overlay loses the card. See yieldsToLiveHold.
+    // Not a phone-interrupted event: that one is a turn end, and turn ends land over a hold like Stop.
+    if (!interrupted && yieldsToLiveHold(hookName, input) && await sessionHoldIsLive(SESSIONS_DIR, sessionId)) {
+      traceSession({ event: "hold-yield", sessionId, agent, hook_event_name: hookName });
+      return;
+    }
     // Some clients can remain blocked on USER input after the model turn itself completes. The
     // adapter owns that agent-specific proof. Today Codex uses it for the hookless TUI Plan picker:
     // keep the session in the attention queue instead of letting a Stop lie that it is done.
@@ -973,7 +1220,8 @@ export async function runHook(agent: AgentKind): Promise<void> {
     let attentionKind: "userInput" | undefined;
     let proposedPlan: string | undefined;
     let pickerClassifier = plan.op === "done" ? "none" : plan.status;
-    if (plan.op === "done" && adapter.completedTurnWaitState) {
+    // Stop ONLY: an interrupted turn (Interrupt) never ends on a Plan picker.
+    if (hookName === "Stop" && plan.op === "done" && adapter.completedTurnWaitState) {
       const evidence = adapter.completedTurnWaitEvidence
         ? await adapter.completedTurnWaitEvidence({ pid: hookPid, transcriptPath })
         : { state: await adapter.completedTurnWaitState({ pid: hookPid, transcriptPath }) };
@@ -1091,21 +1339,38 @@ export async function runHook(agent: AgentKind): Promise<void> {
     // REMOVABLE once openai/codex#15269 ships.
     if (agent === "codex") await reconcileProvisional(config, hookPid);
 
-    const res = await fetch(`${config.url}/v1/cc/event`, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "x-cc-pairing": config.pairingId,
-        "x-cc-auth": config.pcSecret,
-        "x-cc-version": PLUGIN_VERSION,
-        // Whether remote approvals are paused ON THIS COMPUTER (`/nomo-cc:approvals off`), so the phone
-        // can stop claiming approvals are on while nothing will ever arrive. Plaintext, never in the
-        // blob; the worker literal-matches "on"/"off" — see localApprovalsState's contract note.
-        "x-cc-approvals": await localApprovalsState(),
-      },
-      body: JSON.stringify(envelope),
-      signal: AbortSignal.timeout(2000),
-    });
+    const failure = { sessionId, agent, hook_event_name: hookName, op: plan.op };
+    const postStarted = Date.now();
+    let res: Response;
+    try {
+      res = await fetch(`${config.url}/v1/cc/event`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-cc-pairing": config.pairingId,
+          "x-cc-auth": config.pcSecret,
+          "x-cc-version": PLUGIN_VERSION,
+          // Whether remote approvals are paused ON THIS COMPUTER (`/nomo-cc:approvals off`), so the phone
+          // can stop claiming approvals are on while nothing will ever arrive. Plaintext, never in the
+          // blob; the worker literal-matches "on"/"off" — see localApprovalsState's contract note.
+          "x-cc-approvals": await localApprovalsState(),
+        },
+        body: JSON.stringify(envelope),
+        signal: AbortSignal.timeout(2000),
+      });
+    } catch (e) {
+      // The POST never got an answer (the 2 s budget, DNS, offline). A done already carries its own
+      // `donePending` debt and an end has no record; anything else would simply be LOST — a running
+      // session's relay copy goes stale and the phone shows "Disconnected?" — so leave the debt for the
+      // watchdog, which can afford a longer timeout than a hook the agent is waiting on.
+      if (plan.op !== "done" && plan.op !== "end") await markUpdatePendingAt(SESSIONS_DIR, sessionId, envelope.blob as string | undefined);
+      await traceSendFailure({
+        ...failure, ms: Date.now() - postStarted,
+        error: (e as { name?: string } | null)?.name === "TimeoutError" ? "timeout" : "network",
+      });
+      return;
+    }
+    if (!res.ok) await traceSendFailure({ ...failure, status: res.status, ms: Date.now() - postStarted });
     if (res.ok) {
       // Success marker for Task 2.2's `status` command: the epoch-ms of the last delivered event. A
       // delivered event also breaks any gone streak (the pairing is plainly alive again).

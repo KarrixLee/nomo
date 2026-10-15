@@ -39,6 +39,7 @@ import { focusTerminalForPid } from "../core/terminal-focus";
 import type { FocusContext, FocusResult } from "../core/terminal-focus";
 import { CodexRemoteInputBridge } from "../core/codex-remote-input-bridge";
 import type { CodexThreadWaitState } from "../core/codex-remote-input-bridge";
+import type { CodexTurnInterruptResult } from "../core/codex-app-server-client";
 import { createLanHintPublisher, createLanListener, lanAnswerStore } from "../core/lan-listener";
 import type { LanAnswerDelivery, LanAnswerStore, LanCommand, LanListener } from "../core/lan-listener";
 import { lanRunningUnderTest } from "../core/lan-wire";
@@ -52,7 +53,7 @@ import {
   GONE_STRIKE_LIMIT, loadConfig, loadPendingConfig, localApprovalsState,
   PAIR_HTML_FILE, PairPollResult, parseWatchdogPidfile, PendingConfig, pidAlive, PLUGIN_VERSION, readDecisionHoldAt, readPrefix, readSuffix, recordGoneStrike, removeRevokedConfig,
   resetGoneStrikes, resolveGitDir, SessionRecord, sessionBranch, SESSIONS_DIR, traceSession, tracePlanPickerDecision, watchdogBuildDiffers,
-  watchdogBuildStamp, watchdogHolderIsLive, WATCHDOG_PID_PATH,
+  watchdogBuildStamp, watchdogHolderIsLive, WATCHDOG_PID_PATH, writeInterruptFlagAt,
 } from "../core/shared";
 import { rememberBounded } from "../core/bounded-set";
 
@@ -1005,12 +1006,29 @@ let activeLanListener: LanListener | undefined;
  *  a module singleton for the same reason the buffers above are: postEvent has no place to hang state. */
 const lanHintPublisher = createLanHintPublisher({ address: () => activeLanListener?.address() ?? null });
 
+/** Default budget for every watchdog POST — the same 2 s the hooks use, because the sweep awaits its
+ *  POSTs one after another and an unreachable relay must not stretch a tick by more than this per send. */
+const POST_TIMEOUT_MS = 2000;
+
+/** WHY a POST ended the way it did, filled in by postEvent when the caller hands one over. PostOutcome
+ *  folds a timeout, a network error and a 5xx into one "failed"; this keeps them apart for the trace.
+ *  Status code, error class and elapsed time ONLY — never a header, body or blob. */
+export interface PostDetail {
+  status?: number;
+  error?: "timeout" | "network";
+  ms?: number;
+}
+
 /** POST a v2 envelope to the Worker with the per-pairing auth headers. `delivered` ONLY on a 2xx:
  *  a 401/500 is a FAILURE, not success — otherwise a bad secret or a Worker error would count as
  *  delivered and the caller would delete/rewrite the session file, losing the session. A 404 is
  *  `revoked` (the definitive pairing-is-gone signal, keyed on the server's own not-found response).
  *  Any network error / timeout is a transient `failed`. Best-effort: never throws across its boundary. */
-async function postEvent(config: Config, body: object): Promise<PostOutcome> {
+async function postEvent(
+  config: Config, body: object, opts: { timeoutMs?: number; detail?: PostDetail } = {},
+): Promise<PostOutcome> {
+  const started = Date.now();
+  const detail = opts.detail;
   // The LAN listener's sealed host hint rides along on the POSTs this daemon already makes — no new
   // request is ever issued for discovery, and `take` returns undefined unless the hint actually
   // changed or its 5-minute refresh came due (so the overwhelming majority of POSTs are untouched).
@@ -1023,8 +1041,9 @@ async function postEvent(config: Config, body: object): Promise<PostOutcome> {
       method: "POST",
       headers: watchdogEventHeaders(config, await localApprovalsState()),
       body: JSON.stringify(payload),
-      signal: AbortSignal.timeout(2000),
+      signal: AbortSignal.timeout(opts.timeoutMs ?? POST_TIMEOUT_MS),
     });
+    if (detail) { detail.status = res.status; detail.ms = Date.now() - started; }
     const outcome = postOutcomeForStatus(res.status);
     // Tell the hint publisher what became of the hint this POST carried. A hint handed to a POST that
     // failed must NOT count as published — see LanHintPublisher.settle. `revoked` settles as undelivered
@@ -1039,8 +1058,12 @@ async function postEvent(config: Config, body: object): Promise<PostOutcome> {
       try { bufferCommands(extractCommands(await res.json())); } catch { /* not JSON → no commands */ }
     }
     return outcome;
-  } catch {
+  } catch (e) {
     // fetch threw (timeout, DNS, offline) — the hint never reached the wire.
+    if (detail) {
+      detail.error = (e as { name?: string } | null)?.name === "TimeoutError" ? "timeout" : "network";
+      detail.ms = Date.now() - started;
+    }
     if (lanHint) lanHintPublisher.settle(false);
     return "failed";
   }
@@ -1094,7 +1117,8 @@ export interface CommandPayload {
 /** The kinds this plugin will act on. The allow-list lives HERE, not on the worker, because the
  *  plugin is now the ONLY party that can read the blob — a blind relay cannot filter what it can't
  *  see. Anything else decrypts fine and is then rejected as bad-kind. */
-const COMMAND_KINDS_ALLOWED = new Set(["focus-terminal"]);
+const INTERRUPT_COMMAND_KIND = "interrupt-session";
+const COMMAND_KINDS_ALLOWED = new Set(["focus-terminal", INTERRUPT_COMMAND_KIND]);
 
 /** Cap on commands accepted from ONE response. A compromised/buggy worker must not be able to hand
  *  this daemon an unbounded work list; 8 is far above the real ceiling (a user taps one row). */
@@ -1204,7 +1228,15 @@ export type FocusTraceResult =
   | "no-candidate"      // no live TUI process could be identified for it
   | "ambiguous"         // several equally-plausible TUIs — deliberately no guess
   | "osascript-failed"  // AppleScript refused (TCC denial / timeout / app error)
-  | "unsupported";      // not macOS, unknown terminal app, or an agent with no locate seam
+  | "unsupported"       // not macOS, unknown terminal app, or an agent with no locate / interrupt seam
+  | "not-running"        // interrupt-session: the record already reads done — there is no turn to stop
+  | "interrupt-flagged"  // interrupt-session: the hook flag was stamped (Claude stops at its next tool call)
+  | "interrupt-sent"     // interrupt-session: the Codex app-server confirmed the turn aborted
+  | "interrupt-failed"   // interrupt-session: the app-server refused (stale turn id) or timed out — after
+                         // a timeout the interrupt may still land. Also what a thread NOT hosted by the
+                         // shared daemon returns when the daemon is up (the server refuses an unknown thread)
+  | "bridge-unavailable" // interrupt-session: no ready Codex bridge (daemon down, bridge parked or stopping)
+  | "no-turn";           // interrupt-session: the Codex record carries no active turn id
 
 /** The module's generic best-effort trace, with the same argv guard tracePicker uses: pure unit calls run
  *  inside `bun test` with the production HOME visible and must never pollute the user's live trace. Named
@@ -1240,6 +1272,11 @@ export interface DrainCommandsDeps {
   holdPidAliveFn?: (pid: number) => boolean;
   answerStore?: LanAnswerStore;
   resolveDecisionFn?: typeof resolveOnRelay;
+  /** Stamp a hook-flag agent's interrupt flag. Test defaults never write the developer's real
+   *  session directory. */
+  writeInterruptFlagFn?: (sessionId: string, now: number) => Promise<void>;
+  /** Send turn/interrupt for an app-server agent. Defaults to the running loop's bridge supervisor. */
+  interruptCodexTurnFn?: (threadId: string, turnId: string) => Promise<CodexTurnInterruptResult>;
   now?: () => number;
   trace?: (event: object) => void;
 }
@@ -1292,6 +1329,36 @@ async function releaseFocusedTuiUserInputHold(
   return true;
 }
 
+/** Execute a validated interrupt-session command. The adapter says HOW this agent's turn is stopped;
+ *  an agent without the seam is a deliberate no-op. Never throws. */
+async function interruptSession(
+  adapter: AgentAdapter, sessionId: string, record: SessionRecord, now: number, deps: DrainCommandsDeps,
+): Promise<FocusTraceResult> {
+  // The turn is already over: a flag stamped now would sit until the NEXT turn and stop that instead.
+  if (isDoneState(record)) return "not-running";
+  if (adapter.interrupt === "hook-flag") {
+    const write = deps.writeInterruptFlagFn ?? (
+      lanRunningUnderTest() ? async () => {} : (id: string, at: number) => writeInterruptFlagAt(SESSIONS_DIR, id, at)
+    );
+    await write(sessionId, now);
+    return "interrupt-flagged";
+  }
+  if (adapter.interrupt === "app-server") {
+    // The Nomo session id IS the Codex thread id, and the hook stamps the active turn id on the record.
+    const turnId = typeof record.turnId === "string" ? record.turnId : "";
+    if (turnId.length === 0) return "no-turn";
+    const interrupt = deps.interruptCodexTurnFn ?? activeCodexInterrupt;
+    if (!interrupt) return "bridge-unavailable";
+    // ponytail: no re-read + retry on a stale turn id (-32600). The hook stamps turnId only when the
+    // event carries `turn_id` and the record drops the field otherwise, so a turn-id-less Codex event
+    // mid-turn yields `no-turn` until the next tool event; a mismatch is a turn that just ended. Add
+    // thread/read includeTurns if traces show it.
+    const result = await interrupt(sessionId, turnId).catch(() => "failed" as const);
+    return result === "sent" ? "interrupt-sent" : result === "unavailable" ? "bridge-unavailable" : "interrupt-failed";
+  }
+  return "unsupported";
+}
+
 /** Decrypt, VALIDATE, then execute every buffered command; returns how many actually focused
  *  something. Nothing is acted on until the blob authenticates, because the relay is blind and a
  *  compromised worker must not be able to author a control message this daemon obeys.
@@ -1316,6 +1383,8 @@ async function releaseFocusedTuiUserInputHold(
  *  recordAgent/adapterFor dispatch every other net uses, and ask the adapter's optional locate seam
  *  WHICH live process is that session's interactive TUI. Undefined — no candidate, or several equally
  *  plausible ones — is a deliberate NO-OP: focusing the wrong window is worse than doing nothing.
+ *  An interrupt-session command passes the same eight gates and is then handed to interruptSession
+ *  instead of the locate + focus path.
  *  Every outcome is traced. The whole drain is wrapped: a command must never derail the sweep. */
 export async function drainCommands(config: Config, deps: DrainCommandsDeps = {}): Promise<number> {
   try {
@@ -1380,12 +1449,15 @@ export async function drainCommands(config: Config, deps: DrainCommandsDeps = {}
         //       <SESSIONS_DIR>/<d.sessionId>.json, where d.sessionId is codexSentinelSessionId(pid),
         //       i.e. "codex-pid-<n>" — so a command naming the sentinel resolves here, it does not
         //       fall through to unknown-session;
-        //   (b) a provisional row can never be in the state the phone's button is offered for anyway:
+        //   (b) for focus-terminal (offered on waiting states), a provisional row can never be in the
+        //       state the phone's button is offered for anyway:
         //       buildProvisionalRecord only ever writes lastEvent sessionStart/done (op start/done,
         //       prio 0), and no net can flip one to needsAttention — correctPendingApproval requires a
         //       non-empty `transcript` (a provisional has none), shouldPlanPickerVerificationCheck
         //       excludes `provisional === true` outright, and correctResolvedPlanPicker needs a
         //       pendingPlanPicker marker a provisional never carries.
+        //       An interrupt-session (offered on working) naming a provisional row is refused later as
+        //       `no-turn` (it has no turn id), and the phone does not offer the button for `codex-pid-` rows.
         // So the sentinel is accepted if it ever arrives, and it realistically never will.
         if (entries === null) entries = await readRecords(); // one dir read per drain, not per command
         const entry = entries.find((e) => e.sessionId === payload.sessionId);
@@ -1405,6 +1477,11 @@ export async function drainCommands(config: Config, deps: DrainCommandsDeps = {}
         const adapter = deps.adapters
           ? deps.adapters.find((a) => a.kind === agent) ?? adapterFor(agent)
           : adapterFor(agent);
+        if (payload.kind === INTERRUPT_COMMAND_KIND) {
+          const result = await interruptSession(adapter, payload.sessionId, entry.rec, now, deps);
+          traceFocus(deps, { ...base, agent, result });
+          continue;
+        }
         if (!adapter.locateTuiPid) {
           traceFocus(deps, { ...base, agent, result: "unsupported" as FocusTraceResult });
           continue;
@@ -2307,7 +2384,12 @@ export function isClaudeIdleReapEligible(
   record: SessionRecord, now: number,
   transcriptMtimeMs: (path: string) => number | undefined = transcriptMtimeMsDefault,
 ): boolean {
-  if (recordAgent(record) !== "claude") return false;
+  // Cursor joins Claude here, and ONLY here: like Claude its hooks are its sole signal (no discovery,
+  // no notify, no resident plugin), so a dropped `stop` — or a row whose owner pid could not be found
+  // (CURSOR_UNKNOWN_OWNER_PID) — has nothing else to finish it. It never sets `awaitingPrompt`, so it
+  // only ever gets the 30-min clock.
+  const agent = recordAgent(record);
+  if (agent !== "claude" && agent !== "cursor") return false;
   if (record.provisional === true) return false;
   return idleReapAgeEligible(record, now, transcriptMtimeMs,
     record.awaitingPrompt === true ? CLAUDE_AWAITING_PROMPT_REAP_MS : CLAUDE_IDLE_REAP_MS);
@@ -2526,6 +2608,14 @@ export async function correctIdleClaude(
  *  re-POSTing a doomed done every 5 s forever. */
 const PENDING_DONE_MAX_ATTEMPTS = 5;
 
+/** Age grace: the hook writes the record BEFORE its own 2 s done POST, so a debt younger than this may
+ *  simply be that send still in flight — re-POSTing then only duplicates it (and burns an attempt). */
+export const PENDING_DONE_GRACE_MS = 4000;
+
+/** Budget for the corrective re-POST. A background daemon, not a hook an agent waits on, so it can
+ *  afford more than the hook's 2 s — which a ~1.8 s relay round trip was missing by a hair, five times. */
+export const PENDING_DONE_POST_TIMEOUT_MS = 5000;
+
 /** Gate: does this record owe the worker a done? Only the pessimistic marker matters — the record is
  *  already in its terminal done state, so there is no status to re-derive and nothing to disambiguate
  *  from a transcript. Provisional discovery rows are excluded: their op:done is POSTed by discovery
@@ -2540,7 +2630,8 @@ export function shouldPendingDoneCheck(record: SessionRecord): boolean {
 /** Injectable seams for the undelivered-done net, mirroring IdleReapDeps. `now` clocks the re-POSTed
  *  envelope's ts (its blob `at` stays FROZEN at the record's real done time — see below). */
 export interface PendingDoneDeps extends DecisionHoldGateDeps {
-  post?: (body: object) => Promise<PostOutcome>;
+  /** `detail` is an out-param the poster may fill with why the send ended as it did (see PostDetail). */
+  post?: (body: object, detail: PostDetail) => Promise<PostOutcome>;
   writeRecord?: (path: string, rec: SessionRecord) => Promise<void>;
   /** Re-reads the record from disk immediately before a write, so a hook that landed DURING the POST is
    *  never clobbered back to the pre-POST snapshot (see pendingDoneSettleWrite). Defaults to a real read;
@@ -2570,7 +2661,8 @@ export interface PendingDoneDeps extends DecisionHoldGateDeps {
 export async function correctPendingDone(
   config: Config, path: string, sessionId: string, record: SessionRecord, now: number, deps: PendingDoneDeps = {},
 ): Promise<"corrected" | "pending" | "uncorrected" | "revoked"> {
-  const post = deps.post ?? ((body: object) => postEvent(config, body));
+  const post = deps.post ?? ((body: object, detail: PostDetail) =>
+    postEvent(config, body, { timeoutMs: PENDING_DONE_POST_TIMEOUT_MS, detail }));
   const writeRecord = deps.writeRecord
     // Owner-only (0600), same as the hook's trackSession / every other record rewrite in this file.
     ?? ((p: string, rec: SessionRecord) => atomicWrite(p, JSON.stringify(rec), 0o600));
@@ -2583,6 +2675,11 @@ export async function correctPendingDone(
   const clock = deps.now ?? Date.now;
   try {
     if (!shouldPendingDoneCheck(record)) return "uncorrected";
+    // THE AGE GRACE (see PENDING_DONE_GRACE_MS): the hook's own POST may still be in flight. "pending",
+    // like the hold gate below — the debt is durable, and owning the sweep keeps every other net off a
+    // record whose delivery is still undecided. Untraced: it is not an attempt.
+    const age = now - record.ts;
+    if (age >= 0 && age < PENDING_DONE_GRACE_MS) return "pending";
     // THE LIVE-HOLD GATE (see decisionHoldIsLive). Re-paying the done debt over an open Allow/Deny card
     // costs the user the only frame they can answer, and the debt is DURABLE — `donePending` stays on the
     // record — so deferring costs one sweep and loses nothing. Checked before anything else: this net's
@@ -2624,15 +2721,18 @@ export async function correctPendingDone(
     // record.ts is the Stop's own write time; a corrupt record with no numeric ts simply omits `at`
     // (the phone then falls back to its own receipt time, as it does for every pre-`at` frame).
     const at = typeof record.ts === "number" && Number.isFinite(record.ts) ? Math.floor(record.ts / 1000) : undefined;
-    const outcome = await post(await buildDoneEnvelope(sessionId, record, clock(), config.e2eKey, agent, at));
+    const detail: PostDetail = {};
+    const outcome = await post(await buildDoneEnvelope(sessionId, record, clock(), config.e2eKey, agent, at), detail);
     // One line per attempt, whatever happens: the retry ladder is otherwise invisible, and "did this done
-    // ever reach the worker" is exactly the question a vanished row raises.
+    // ever reach the worker" is exactly the question a vanished row raises. `status` / `error` / `ms`
+    // say WHY — a 2.00 s "failed" used to be only a guess at a timeout.
     traceFocus(deps, {
       event: "pending-done", sessionId, outcome, attempts, delivered: outcome === "delivered", at,
+      status: detail.status, error: detail.error, ms: detail.ms,
     });
     if (outcome === "revoked") return "revoked"; // pairing gone → bubble up so the loop can tear down
     if (outcome === "delivered") {
-      // RE-READ before writing: the POST above took up to 2 s, and a user prompt landing in that window
+      // RE-READ before writing: the POST above took up to 5 s, and a user prompt landing in that window
       // already flipped this record to `working`. Stamping the pre-POST snapshot back would resurrect
       // `done` on a live session and silence every net that gates off a done record (see
       // pendingDoneSettleWrite for the full matrix).
@@ -2653,6 +2753,125 @@ export async function correctPendingDone(
       }
     }
     return "pending";
+  } catch {
+    return "uncorrected";
+  }
+}
+
+// --- Undelivered-update reconcile (a RUNNING session's hook POST never got an answer) -----------
+//
+// The pending-done debt above, generalised to the non-terminal events. A hook gives its POST 2 s; on a
+// slow path to the relay (0.4–1.1 s to connect + 2.0–2.8 s to answer, observed 2026-10-13) nearly every
+// one of them times out, and a `working` update has no other courier: the staleness heartbeat is gated on
+// 5 min of hook SILENCE and a busy session is never silent. The relay then hears nothing for 600 s and the
+// island reads "Disconnected?" over a session that is running fine. The hook now stamps `updatePending`
+// when its POST throws (hook.ts markUpdatePendingAt) and this net pays the debt.
+//
+// WHAT IS SENT — the record's CURRENT blob, verbatim, under its current op/prio (buildHeartbeatEnvelope:
+// same bytes the heartbeat and the LAN feed already relay, so it can never invent a state), never the
+// original event. `ts` is NOW, exactly like the staleness heartbeat, and NOT the record's ts: the relay
+// drops a non-terminal frame whose ts is <= its stored lastTs, and the likeliest failure on a slow path
+// is that the relay STORED the original event and was cancelled by the client abort before it pushed —
+// a record-stamped resend would then be dropped as stale and the island would stay "Disconnected?".
+//
+// ACCEPTED RACE — a now-stamped frame outranks anything older, so the record is re-read immediately
+// before the POST and a moved record is never sent. What remains is the few milliseconds in which a newer
+// hook has stamped its envelope but not yet written the record: this resend can then outrank it and the
+// relay keeps the older state until that session's next hook event or beat. No record-side guard narrows
+// it (the newer hook has left nothing on disk yet), and it self-corrects, so it is left as is.
+//
+// BACK-OFF, NOT A CAP — the debt is only worth paying while the session lives, the record is rewritten by
+// the next hook anyway, and an offline Mac must not spend 5 s per indebted session per sweep. So the
+// long-timeout sends (this net and the staleness heartbeat) share ONE pairing-wide clock: a failure
+// doubles the wait (5 s … 60 s), a delivery resets it, and at most one of them is attempted per window.
+
+/** Budget for a debt resend / staleness heartbeat — the corrective-done budget, for the same reason. */
+export const PENDING_UPDATE_POST_TIMEOUT_MS = PENDING_DONE_POST_TIMEOUT_MS;
+
+/** Ceiling on the shared back-off. Well inside the island's 600 s stale-date, so a network that comes
+ *  back is noticed long before the row would read disconnected. */
+export const RESEND_BACKOFF_MAX_MS = 60_000;
+
+/** How long to stand down after `failures` consecutive failed long-timeout sends. Pure. */
+export function resendBackoffMs(failures: number): number {
+  return failures <= 0 ? 0 : Math.min(POLL_MS * 2 ** (failures - 1), RESEND_BACKOFF_MAX_MS);
+}
+
+/** The pairing-wide back-off clock (in-memory, like waitingBeatAt: it throttles this process's sends). */
+const resendBackoff = { failures: 0, nextAt: 0 };
+
+/** May a long-timeout send go out at `now`? */
+export function resendAllowed(now: number): boolean {
+  return now >= resendBackoff.nextAt;
+}
+
+/** Feed one long-timeout send's result into the back-off. Returns the wait it armed (0 on delivery). */
+export function noteResend(delivered: boolean, now: number): number {
+  resendBackoff.failures = delivered ? 0 : resendBackoff.failures + 1;
+  const wait = resendBackoffMs(resendBackoff.failures);
+  resendBackoff.nextAt = delivered ? 0 : now + wait;
+  return wait;
+}
+
+/** Test-only reset of the back-off (mirrors what a fresh daemon starts with). */
+export function resetResendBackoff(): void {
+  resendBackoff.failures = 0;
+  resendBackoff.nextAt = 0;
+}
+
+/** Gate: does this record owe the relay an update? A terminal row is the pending-done net's business
+ *  (a corrective that pinned `done` over a marked record leaves an inert marker the next hook drops). */
+export function shouldPendingUpdateCheck(record: SessionRecord): boolean {
+  return record.updatePending === true && record.op !== "done" && record.lastEvent !== "done"
+    && typeof record.ts === "number" && Number.isFinite(record.ts);
+}
+
+/** The undelivered-update reconcile for one tracked session. Returns "corrected" (a 2xx — the relay is
+ *  current, debt cleared) / "pending" (sent, not delivered: back-off armed, debt kept) / "uncorrected"
+ *  (nothing sent this sweep) / "revoked".
+ *
+ *  NEVER OVER A LIVE APPROVAL: while a decision hold is live the relay's truth is the hold's own card,
+ *  not this record, so the resend is deferred (the debt is durable) exactly as the done nets defer.
+ *  NEVER A STALE SNAPSHOT: the record is re-read immediately before the POST and again before the clear,
+ *  and a record a hook has moved since is left alone — that hook's own POST (or its own debt) owns it. */
+export async function correctPendingUpdate(
+  config: Config, path: string, sessionId: string, record: SessionRecord, now: number, deps: PendingDoneDeps = {},
+): Promise<"corrected" | "pending" | "uncorrected" | "revoked"> {
+  const post = deps.post ?? ((body: object, detail: PostDetail) =>
+    postEvent(config, body, { timeoutMs: PENDING_UPDATE_POST_TIMEOUT_MS, detail }));
+  const writeRecord = deps.writeRecord
+    ?? ((p: string, rec: SessionRecord) => atomicWrite(p, JSON.stringify(rec), 0o600));
+  const reread = deps.readRecord ?? readRecordAt;
+  try {
+    if (!shouldPendingUpdateCheck(record) || !resendAllowed(now)) return "uncorrected";
+    // Untraced, unlike pending-done's hold line: a hold can stay open for an hour of 5 s sweeps.
+    if (await decisionHoldIsLive(sessionId, now, deps)) return "uncorrected";
+    const fresh = await reread(path);
+    if (!fresh || recordMovedSince(record, fresh) || !shouldPendingUpdateCheck(fresh)) return "uncorrected";
+    const envelope = buildHeartbeatEnvelope(sessionId, fresh, (deps.now ?? Date.now)(), config.pairingId);
+    if (!envelope) {
+      // No blob, or one sealed under a pairing that is gone: unsendable forever → drop the debt.
+      await writeRecord(path, { ...fresh, updatePending: undefined });
+      return "uncorrected";
+    }
+    const detail: PostDetail = {};
+    const outcome = await post(envelope, detail);
+    const delivered = outcome === "delivered";
+    const backoffMs = outcome === "revoked" ? undefined : noteResend(delivered, now);
+    traceFocus(deps, {
+      event: "pending-update", sessionId, outcome, delivered, op: fresh.op, lastEvent: fresh.lastEvent,
+      status: detail.status, error: detail.error, ms: detail.ms, backoffMs,
+    });
+    if (outcome === "revoked") return "revoked";
+    if (!delivered) return "pending";
+    // Clear ONLY the marker, on the record as it is NOW — and only if no hook moved it during the POST.
+    const after = await reread(path);
+    if (after && !recordMovedSince(fresh, after) && after.updatePending === true) {
+      try { await writeRecord(path, { ...after, updatePending: undefined }); } catch {
+        // Clear didn't land → one redundant resend of the same blob next sweep.
+      }
+    }
+    return "corrected";
   } catch {
     return "uncorrected";
   }
@@ -2839,6 +3058,10 @@ export async function retireDoneStale(
 // rollout — and, once a title resolves, caches it on the record and POSTs a corrective blob carrying the
 // SAME op/status with only the title fixed. Idempotent: a record that already holds a non-empty title is
 // skipped, so this fires at most until the first title lands.
+//
+// Which records are due, and where the title comes from, is the adapter's `titleRepair` seam. Cursor is
+// the second user: its chat name can land in Cursor's own store after a short chat's stop, so a DONE
+// Cursor row is looked up for a short window and re-POSTed only when the name differs from the record's.
 
 /** How much of the codex rollout HEAD the title-repair fallback scans (the first user_message rides the
  *  opening lines). Matches the hook's TITLE_SCAN_BYTES. */
@@ -2885,14 +3108,13 @@ export async function buildTitleRepairEnvelope(
   return { v: 2, sessionId, op: record.op ?? "update", prio: record.prio ?? 0, ts: now, blob, ...startedAtField(record) };
 }
 
-/** Gate: should this sweep try to repair a still-tracked session's blank title? Only CODEX sessions (Claude
- *  names its session from the transcript on the very first hook, so a claude blank is a transient read-miss
- *  the next hook fixes, not the structural SessionStart gap), not a provisional discovery row (those carry a
- *  cwd-basename title), whose record holds no non-empty title yet. Pure. */
-export function shouldRepairTitle(record: SessionRecord): boolean {
-  if (record.agent !== "codex") return false;
+/** Gate: should this sweep try to repair a still-tracked session's title? The agent's own rule
+ *  (adapter `titleRepair.due` — Codex: no non-empty title yet; Cursor: done moments ago; Claude names
+ *  its session from the transcript on the very first hook, so it has no seam), and never a provisional
+ *  discovery row (those carry a cwd-basename title). Pure. */
+export function shouldRepairTitle(record: SessionRecord, now: number = Date.now()): boolean {
   if (record.provisional === true) return false;
-  return typeof record.title !== "string" || record.title.length === 0;
+  return adapterFor(recordAgent(record)).titleRepair?.due(record, now) === true;
 }
 
 /** The rewritten record after a delivered title repair: the resolved title, the freshly-sealed blob, AND
@@ -2913,27 +3135,50 @@ export function titleRepairedRecord(record: SessionRecord, title: string, blob: 
  *  titleRepairedRecord) and POSTs the corrective at the session's CURRENT op/status. No title yet (still
  *  pre-thread_name / empty rollout) → nothing to do, retried next sweep. Returns the same verdict triple
  *  as the other nets. */
-async function repairTitle(config: Config, path: string, sessionId: string, record: SessionRecord): Promise<"corrected" | "uncorrected" | "revoked"> {
+export async function repairTitle(
+  config: Config, path: string, sessionId: string, record: SessionRecord,
+  deps: { post?: (body: object) => Promise<PostOutcome>; resolve?: (sessionId: string) => string | undefined } = {},
+): Promise<"corrected" | "uncorrected" | "revoked"> {
   try {
     if (!shouldRepairTitle(record)) return "uncorrected";
-    let prefix = "";
-    if (typeof record.transcript === "string" && record.transcript.length > 0) {
-      try { prefix = await readPrefix(record.transcript, TITLE_REPAIR_HEAD_BYTES); } catch { /* rollout gone / unreadable → index-only */ }
+    const adapter = adapterFor(recordAgent(record));
+    const resolve = deps.resolve ?? adapter.titleRepair?.resolve;
+    let title: string | undefined;
+    if (resolve) {
+      title = resolve(sessionId);
+    } else {
+      let prefix = "";
+      if (typeof record.transcript === "string" && record.transcript.length > 0) {
+        try { prefix = await readPrefix(record.transcript, TITLE_REPAIR_HEAD_BYTES); } catch { /* rollout gone / unreadable → index-only */ }
+      }
+      // input:{} — the watchdog has no hook payload, so this reduces to the PRIMARY session_index lookup plus
+      // the rollout-prefix fallback (the UserPromptSubmit input.prompt path is inert without an input).
+      title = await adapter.title({ sessionId, prefix, input: {}, transcriptPath: record.transcript });
     }
-    // input:{} — the watchdog has no hook payload, so this reduces to the PRIMARY session_index lookup plus
-    // the rollout-prefix fallback (the UserPromptSubmit input.prompt path is inert without an input).
-    const title = await codexAdapter.title({ sessionId, prefix, input: {}, transcriptPath: record.transcript });
-    if (!title) return "uncorrected"; // still no title (pre-thread_name, empty rollout) → retry next sweep
+    // No title yet (pre-thread_name, empty rollout, no chat name) or nothing new → retry next sweep.
+    if (!title || title === record.title) return "uncorrected";
+    // The stale-snapshot guard (see correctIdleClaude): this re-POSTs the snapshot's op/status, so a
+    // record a hook has moved since the sweep read it must not be answered with its old state.
+    const unmoved = async (): Promise<boolean> => {
+      try {
+        const fresh = await readRecordAt(path);
+        return fresh !== null && !recordMovedSince(record, fresh);
+      } catch { return false; }
+    };
+    if (!await unmoved()) return "uncorrected";
     // Re-POSTing the CURRENT state with the title fixed → `at` is the OBSERVED now (epoch seconds).
+    // The envelope `ts` is now too, NOT record.ts + 1: the worker's lastTs is advanced past record.ts by
+    // a watchdog-reported finish (the interrupt / idle / pending-done nets post their done at "now" and
+    // leave record.ts on the last real event), so a record-derived stamp is strictly older there and the
+    // title frame of a watchdog-finished row is dropped as stale — on a 2xx, so it is never retried.
     const repairNow = Date.now();
-    const envelope = await buildTitleRepairEnvelope(sessionId, record, title, repairNow, config.e2eKey, "codex", Math.floor(repairNow / 1000));
-    const outcome = await postEvent(config, envelope);
+    const envelope = await buildTitleRepairEnvelope(sessionId, record, title, repairNow, config.e2eKey, adapter.kind, Math.floor(repairNow / 1000));
+    const outcome = await (deps.post ?? ((body: object) => postEvent(config, body)))(envelope);
     if (outcome === "revoked") return "revoked"; // pairing gone → bubble up so the loop can tear down
     if (outcome !== "delivered") return "uncorrected"; // failed POST → keep the old record, retry next sweep
     try {
-      const next = titleRepairedRecord(record, title, envelope.blob, config.pairingId);
       // Owner-only (0600), same as every other record rewrite in this file.
-      await atomicWrite(path, JSON.stringify(next), 0o600);
+      if (await unmoved()) await atomicWrite(path, JSON.stringify(titleRepairedRecord(record, title, envelope.blob, config.pairingId)), 0o600);
     } catch {
       // Rewrite failed — worst case we re-resolve + re-POST next sweep (the worker dedupes the frame).
     }
@@ -3322,18 +3567,35 @@ async function sweep(config: Config | null, deps: SweepDeps = {}): Promise<Sweep
           if (titleFix === "revoked") return { revoked: true };
           if (titleFix === "corrected") { delivered = true; repairedTitle = true; }
         }
-        const beatKind = heartbeatKind(
-          record, now, heartbeatAt.get(sessionId), waitingBeatAt,
-          idleFix === "corrected" || planResolutionHandled || interruptHandled || flaggedAttention || reapedIdle || repairedTitle,
-          pairingIsNew,
-        );
-        if (beatKind !== "none") {
+        const netOwned = idleFix === "corrected" || planResolutionHandled || interruptHandled || flaggedAttention || reapedIdle || repairedTitle;
+        // Undelivered-update debt (see correctPendingUpdate): only for a session no net above took this
+        // sweep. A resend IS this sweep's beat — it carries the same blob — so the heartbeat stands down.
+        let resent = false;
+        if (!netOwned) {
+          const pendingUpdate = await correctPendingUpdate(config, path, sessionId, record, now);
+          if (pendingUpdate === "revoked") return { revoked: true };
+          if (pendingUpdate === "corrected") delivered = true;
+          resent = pendingUpdate === "corrected" || pendingUpdate === "pending";
+        }
+        const beatKind = heartbeatKind(record, now, heartbeatAt.get(sessionId), waitingBeatAt, netOwned || resent, pairingIsNew);
+        // The staleness beat is the ONLY thing keeping a hook-quiet session's stale-date armed, so it gets
+        // the long budget (the default 2 s loses to a relay that answers in 2–3 s) and, in exchange,
+        // shares the debt net's back-off so an offline Mac is not charged 5 s per quiet session per sweep.
+        const slow = beatKind === "stale";
+        if (beatKind !== "none" && !(slow && !resendAllowed(now))) {
           const beat = buildHeartbeatEnvelope(sessionId, record, Date.now(), config.pairingId);
           // delivered only: a failed heartbeat mutates NOTHING (not the record, not even the throttle),
           // so quietness stays true and it's retried next sweep. A record with no stored blob yields
           // a null envelope — nothing to send, so it simply isn't heartbeated.
           if (beat) {
-            const outcome = await postEvent(config, beat);
+            const detail: PostDetail = {};
+            const outcome = await postEvent(config, beat, slow ? { timeoutMs: PENDING_UPDATE_POST_TIMEOUT_MS, detail } : {});
+            if (slow && outcome !== "revoked") {
+              const backoffMs = noteResend(outcome === "delivered", now);
+              if (outcome !== "delivered") {
+                traceFocus({}, { event: "heartbeat", sessionId, outcome, status: detail.status, error: detail.error, ms: detail.ms, backoffMs });
+              }
+            }
             if (outcome === "revoked") return { revoked: true };
             if (outcome === "delivered") {
               heartbeatAt.set(sessionId, now); // a fast beat IS a heartbeat — it advances both clocks
@@ -3439,6 +3701,11 @@ export async function goneStrikeShouldTeardown(goneStrikesPath?: string): Promis
  *  through the same path run()'s `finally` uses. Undefined outside a live run(). */
 let activeBridgeShutdown: (() => void) | undefined;
 
+/** The running loop's Codex interrupt, published for drainCommands the same way activeBridgeShutdown is
+ *  published for the signal handler: the LAN listener's sink is a module function with no handle on
+ *  run()'s supervisor. Undefined outside a live run(). */
+let activeCodexInterrupt: ((threadId: string, turnId: string) => Promise<CodexTurnInterruptResult>) | undefined;
+
 /** The running loop's LAN listener teardown, published for the SIGTERM/SIGINT handler for the same
  *  reason activeBridgeShutdown is: default signal handling skips run()'s `finally`, and a leaked
  *  listening socket would keep the successor watchdog from re-binding the persisted port. */
@@ -3523,6 +3790,7 @@ export interface RemoteInputBridgeLike {
   stop(): Promise<void>;
   refreshSubscriptions(): Promise<void>;
   readThreadWaitState?(threadId: string): Promise<CodexThreadWaitState>;
+  interruptTurn?(threadId: string, turnId: string): Promise<CodexTurnInterruptResult>;
 }
 
 /** How the supervisor learned the daemon is gone: the sweep's own probe, or the bridge reporting that
@@ -3724,6 +3992,16 @@ export function createBridgeSupervisor(deps: BridgeSupervisorDeps = {}) {
         return "unavailable";
       }
     },
+    /** The phone's "Interrupt" for a Codex turn. No probe here: a bridge that is not ready answers
+     *  "unavailable" itself, and the deadline keeps a wedged proxy from pinning the command drain. */
+    async interruptTurn(threadId: string, turnId: string): Promise<CodexTurnInterruptResult> {
+      if (!bridge?.interruptTurn) return "unavailable";
+      try {
+        return await withDeadline(bridge.interruptTurn(threadId, turnId), BRIDGE_OP_DEADLINE_MS) ?? "failed";
+      } catch {
+        return "failed";
+      }
+    },
     /** Whether a bridge is currently constructed (test/diagnostic seam). */
     get active(): boolean {
       return bridge !== undefined;
@@ -3876,6 +4154,7 @@ async function run(): Promise<void> {
     }),
   });
   activeBridgeShutdown = () => bridges.shutdown();
+  activeCodexInterrupt = (threadId, turnId) => bridges.interruptTurn(threadId, turnId);
   // The LAN listener starts only AFTER the single-instance claim: exactly one watchdog per machine may
   // own the socket (and the persisted port in lan.json), and a losing instance returned above without
   // ever reaching here. createLanListener returns immediately — the bind runs off this stack, so a
@@ -3995,6 +4274,7 @@ async function run(): Promise<void> {
   } finally {
     shutdown(); // bridge child AND the LAN socket — a retired daemon must leave no listener behind
     activeBridgeShutdown = undefined;
+    activeCodexInterrupt = undefined;
     activeLanShutdown = undefined;
     activeLanListener = undefined;
     releaseSingleInstance(); // auto-quit on empty: drop our pidfile so the next hook re-spawns

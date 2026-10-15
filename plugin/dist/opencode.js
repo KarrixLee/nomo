@@ -67,8 +67,10 @@ async function decryptBlob(key, blob) {
 }
 
 // src/core/adapter.ts
-import { execFile as execFile2 } from "node:child_process";
+import { execFile as execFile2, execFileSync as execFileSync2 } from "node:child_process";
+import { existsSync as existsSync2 } from "node:fs";
 import { readdir, readFile as readFile2, stat as stat2 } from "node:fs/promises";
+import { devNull } from "node:os";
 import { promisify as promisify2 } from "node:util";
 import { basename as basename2, join as join2 } from "node:path";
 
@@ -79,7 +81,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "2.2.2";
+var PLUGIN_VERSION = "2.3.0";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -129,6 +131,7 @@ function tracePlanPickerDecision(sessionId, decision, path) {
 var SESSIONS_DIR = `${CC_DIR}/sessions`;
 var WATCHDOG_PID_PATH = `${CC_DIR}/watchdog.pid`;
 var LAST_SEND_PATH = `${CC_DIR}/last-send`;
+var SEND_FAIL_PATH = `${CC_DIR}/last-send-fail`;
 var GONE_STRIKES_PATH = `${CC_DIR}/gone-strikes`;
 var GONE_STRIKE_LIMIT = 2;
 var NO_HOLD_PATH = `${CC_DIR}/no-hold`;
@@ -236,6 +239,10 @@ var WATCHDOG_PATH = existsSync(`${HERE}/cc-watchdog.mjs`) ? `${HERE}/cc-watchdog
 function codexHome() {
   const env = process.env.CODEX_HOME;
   return env && env.length > 0 ? env : `${process.env.HOME}/.codex`;
+}
+function cursorHome() {
+  const env = process.env.CURSOR_CONFIG_DIR;
+  return env && env.length > 0 ? env : `${process.env.HOME}/.cursor`;
 }
 function lastHookPath(agent) {
   return `${CC_DIR}/last-hook-${agent}`;
@@ -592,11 +599,34 @@ async function settleDecisionHoldRecordAt(sessionsDir, sessionId, patch) {
     await atomicWrite(`${sessionsDir}/${sessionId}.json`, JSON.stringify({ ...record, ...patch }), 384);
   } catch {}
 }
+async function readDecisionHoldAt(sessionsDir, sessionId) {
+  try {
+    return JSON.parse(await readFile(`${sessionsDir}/${decisionHoldFileName(sessionId)}`, "utf8"));
+  } catch {
+    return null;
+  }
+}
 async function writeDecisionHold(sessionId, hold) {
   return writeDecisionHoldAt(SESSIONS_DIR, sessionId, hold);
 }
 async function clearDecisionHold(sessionId, pid, beforeUnlink, holdId) {
   return clearDecisionHoldAt(SESSIONS_DIR, sessionId, pid, beforeUnlink, holdId);
+}
+var INTERRUPT_FLAG_SUFFIX = ".interrupt";
+var INTERRUPT_FLAG_MAX_AGE_MS = 3600000;
+function interruptFlagFileName(sessionId) {
+  return `${sessionId}${INTERRUPT_FLAG_SUFFIX}`;
+}
+async function interruptFlagSetAt(sessionsDir, sessionId, now) {
+  try {
+    const flag = JSON.parse(await readFile(`${sessionsDir}/${interruptFlagFileName(sessionId)}`, "utf8"));
+    return typeof flag.at === "number" && now - flag.at <= INTERRUPT_FLAG_MAX_AGE_MS;
+  } catch {
+    return false;
+  }
+}
+async function clearInterruptFlagAt(sessionsDir, sessionId) {
+  await unlink(`${sessionsDir}/${interruptFlagFileName(sessionId)}`).catch(() => {});
 }
 async function settleDecisionHoldRecord(sessionId, patch) {
   return settleDecisionHoldRecordAt(SESSIONS_DIR, sessionId, patch);
@@ -1139,7 +1169,7 @@ async function codexSessionModel(input, prefix, transcriptPath, home = codexHome
     return;
   }
 }
-var INTERRUPT_MARKER = "interrupted by user";
+var INTERRUPT_MARKER = "[Request interrupted by user";
 var CODEX_TURN_EVENTS = new Set(["task_started", "task_complete", "turn_aborted"]);
 var CODEX_ABORT_EVENT = "turn_aborted";
 function lastTurnLine(text) {
@@ -1164,7 +1194,23 @@ function lastTurnLine(text) {
   return null;
 }
 function hasInterruptMarker(line) {
-  return line.includes(INTERRUPT_MARKER);
+  let row;
+  try {
+    row = JSON.parse(line);
+  } catch {
+    return false;
+  }
+  if (typeof row !== "object" || row === null)
+    return false;
+  if (row.type !== "user")
+    return false;
+  const message = row.message;
+  const content = typeof message === "object" && message !== null ? message.content : message;
+  const texts = Array.isArray(content) ? content.map((part) => {
+    const p = part;
+    return p !== null && typeof p === "object" && p.type === "text" ? p.text : undefined;
+  }) : [content];
+  return texts.some((t) => typeof t === "string" && t.trimStart().startsWith(INTERRUPT_MARKER));
 }
 function codexLastTurnEvent(text) {
   const lines = text.split(`
@@ -1239,11 +1285,11 @@ function codexProposedPlanMarkdown(text) {
   if (typeof text !== "string")
     return;
   const trimmed = text.trim();
-  const open2 = "<proposed_plan>";
+  const open = "<proposed_plan>";
   const close = "</proposed_plan>";
-  if (!trimmed.startsWith(open2) || !trimmed.endsWith(close))
+  if (!trimmed.startsWith(open) || !trimmed.endsWith(close))
     return;
-  return trimmed.slice(open2.length, -close.length).trim();
+  return trimmed.slice(open.length, -close.length).trim();
 }
 function codexFinalProposedPlan(row) {
   const payload = row.payload;
@@ -1432,6 +1478,9 @@ var CLAUDE_DESKTOP_BUNDLED_PATH_PARTS = [
   "/claude.app/Contents/MacOS/claude"
 ];
 var CLAUDE_DESKTOP_LAUNCHER = "Claude.app/Contents/Helpers/disclaimer";
+function cursorHostInvocation(input, env = process.env) {
+  return env.CURSOR_VERSION !== undefined || typeof input === "object" && input !== null && "cursor_version" in input;
+}
 function claudeDesktopInvocation(selfArgs, ancestorArgs, entrypoint) {
   if (entrypoint === CLAUDE_DESKTOP_ENTRYPOINT)
     return true;
@@ -1456,8 +1505,13 @@ function claudeForkResumePredecessor(command) {
 }
 function claudeHeadlessInvocation(selfArgs, ancestorArgs, entrypoint) {
   const chain = [selfArgs, ...ancestorArgs].filter((s) => typeof s === "string" && s.length > 0);
-  if (chain.some((args) => CLAUDE_SELF_DAEMON_MARKERS.some((m) => args.includes(m))))
-    return true;
+  const isRing = (args) => CLAUDE_SELF_DAEMON_MARKERS.some((m) => args.includes(m));
+  const ringTop = chain.length - 1 - [...chain].reverse().findIndex(isRing);
+  if (ringTop < chain.length) {
+    const owner = chain[ringTop + 1]?.trim().split(/\s+/) ?? [];
+    if (basename2(owner[0] ?? "") !== "claude" || owner.some((tok) => CLAUDE_HEADLESS_ARG_TOKENS.has(tok)))
+      return true;
+  }
   const tokens = typeof selfArgs === "string" ? selfArgs.trim().split(/\s+/) : [];
   if (tokens.includes("--fork-session") && tokens.includes("--reply-on-resume"))
     return true;
@@ -2071,11 +2125,13 @@ var claudeAdapter = {
   hooksNotFiringHint: "  run /plugin in Claude Code, check the nomo plugin is enabled, then restart Claude Code",
   toolDetail: claudeToolDetail,
   blobAgentFields: {},
-  locateTuiPid: (ctx, deps) => claudeLocateTuiPid(ctx, deps)
+  locateTuiPid: (ctx, deps) => claudeLocateTuiPid(ctx, deps),
+  interrupt: "hook-flag"
 };
 var codexAdapter = {
   kind: "codex",
   answerExtras: "other",
+  titleRepair: { due: (record) => typeof record.title !== "string" || record.title.length === 0 },
   async title({ sessionId, prefix, input }) {
     const indexTitle = await codexIndexTitle(sessionId);
     if (indexTitle)
@@ -2128,7 +2184,8 @@ var codexAdapter = {
   blobAgentFields: { agent: "codex" },
   discoverLive: (known) => codexDiscoverLive(known),
   pidTurnActive: (pid) => codexPidTurnActive(pid),
-  locateTuiPid: (ctx, deps) => codexLocateTuiPid(ctx, deps)
+  locateTuiPid: (ctx, deps) => codexLocateTuiPid(ctx, deps),
+  interrupt: "app-server"
 };
 async function opencodeLocateTuiPid(ctx, deps = {}) {
   try {
@@ -2179,6 +2236,58 @@ var opencodeAdapter = {
   ambientPlan: true,
   locateTuiPid: (ctx, deps) => opencodeLocateTuiPid(ctx, deps)
 };
+function cursorModel(input) {
+  for (const key of ["model", "model_id"]) {
+    const v = input[key];
+    if (typeof v === "string" && v.trim().length > 0)
+      return v.trim().slice(0, 80);
+  }
+  return;
+}
+function cursorStateDb() {
+  const home = process.env.HOME ?? "";
+  const data = process.platform === "darwin" ? `${home}/Library/Application Support` : process.platform === "win32" ? process.env.APPDATA ?? "" : process.env.XDG_CONFIG_HOME || `${home}/.config`;
+  return `${data}/Cursor/User/globalStorage/state.vscdb`;
+}
+var CURSOR_TITLE_REPAIR_MS = 120000;
+var CURSOR_TITLE_TIMEOUT_MS = 300;
+function cursorChatTitle(sessionId, db = cursorStateDb(), env = process.env) {
+  if (!/^[A-Za-z0-9_-]{1,128}$/.test(sessionId))
+    return;
+  try {
+    const bin = process.platform === "darwin" && existsSync2("/usr/bin/sqlite3") ? "/usr/bin/sqlite3" : "sqlite3";
+    const out = execFileSync2(bin, [
+      "-init",
+      devNull,
+      "-batch",
+      "-noheader",
+      "-list",
+      "-readonly",
+      db,
+      "select case when json_type(cast(value as text),'$.name')='text' then json_extract(cast(value as text),'$.name') end" + ` from cursorDiskKV where key='composerData:${sessionId}'`
+    ], { timeout: CURSOR_TITLE_TIMEOUT_MS, encoding: "utf8", maxBuffer: 65536, stdio: ["ignore", "pipe", "ignore"], env });
+    const cleaned = out.replace(/\s+/g, " ").trim();
+    return cleaned ? truncateOnWord(cleaned) : undefined;
+  } catch {
+    return;
+  }
+}
+var cursorAdapter = {
+  kind: "cursor",
+  title: async ({ input }) => typeof input.prompt === "string" ? displayTitleFromUserText(input.prompt) : undefined,
+  model: async ({ input }) => cursorModel(input),
+  detectInterrupt: () => false,
+  sessionsDir: () => `${cursorHome()}/projects`,
+  sessionMatch: (name) => name.endsWith(".jsonl"),
+  hookStampPath: () => lastHookPath("cursor"),
+  hooksNotFiringHint: "  run `bunx nomo-ai --cursor` again, then restart Cursor (Settings → Hooks shows what it loaded)",
+  titleRepair: {
+    due: (record, now) => record.lastEvent === "done" && typeof record.ts === "number" && now - record.ts < CURSOR_TITLE_REPAIR_MS,
+    resolve: (sessionId) => cursorChatTitle(sessionId)
+  },
+  toolDetail: {},
+  blobAgentFields: { agent: "cursor" }
+};
 function unknownAgentAdapter(kind) {
   return {
     kind,
@@ -2200,6 +2309,8 @@ function adapterFor(agent) {
       return codexAdapter;
     case "opencode":
       return opencodeAdapter;
+    case "cursor":
+      return cursorAdapter;
     case "claude":
       return claudeAdapter;
     default:
@@ -2350,6 +2461,22 @@ async function repairNotifyWiring(deps = {}) {
   }
 }
 
+// src/core/session-state.ts
+var STATE_HOLD_MAX_AGE_MS = 600000;
+var finite = (value) => typeof value === "number" && Number.isFinite(value);
+var filled = (value) => typeof value === "string" && value.length > 0;
+function stateHoldLive(hold, holdPidAlive, now) {
+  if (!hold || !filled(hold.blob))
+    return false;
+  if (!finite(hold.at))
+    return false;
+  if (now - hold.at > STATE_HOLD_MAX_AGE_MS)
+    return false;
+  if (!finite(hold.pid) || holdPidAlive !== true)
+    return false;
+  return true;
+}
+
 // src/core/hook.ts
 var TOOL_DETAIL = { ...claudeToolDetail, ...codexToolDetail };
 function sessionOrigin(input, ppid = process.ppid, command = pidCommand(ppid)) {
@@ -2370,19 +2497,77 @@ function detailForHook(hookName, toolName, toolInput) {
   }
   if (hookName === "PreToolUse")
     return toolName ? TOOL_DETAIL[toolName] : undefined;
-  if (hookName === "PostToolUse")
+  if (hookName === "PostToolUse" || hookName === "PostToolUseFailure")
     return "thinking";
   return;
 }
 function isPermissionNotification(i) {
   const type = typeof i.notification_type === "string" ? i.notification_type : "";
+  if (type.length > 0)
+    return type === "permission_prompt" || type === "worker_permission_prompt";
   const msg = (typeof i.message === "string" ? i.message : "").toLowerCase();
-  return type === "permission_prompt" || msg.includes("permission") || msg.includes("approve") || msg.includes("allow");
+  return msg.includes("permission") || msg.includes("approve") || msg.includes("allow");
+}
+var ATTENTION_NOTIFICATIONS = new Set(["elicitation_dialog", "elicitation_url_dialog", "agent_needs_input"]);
+function hasRunningBackgroundAgent(input) {
+  const tasks = input.background_tasks;
+  return Array.isArray(tasks) && tasks.some((t) => {
+    const task = t;
+    return typeof task === "object" && task !== null && task.type === "subagent" && (task.status === "running" || task.status === "pending");
+  });
+}
+var HOLD_YIELDING_EVENTS = new Set([
+  "PostToolUseFailure",
+  "PreCompact",
+  "PostCompact",
+  "Elicitation",
+  "ElicitationResult"
+]);
+function yieldsToLiveHold(hookName, input) {
+  if (HOLD_YIELDING_EVENTS.has(hookName))
+    return true;
+  if (hookName === "Stop")
+    return hasRunningBackgroundAgent(input);
+  if (hookName === "Notification")
+    return !isPermissionNotification(input);
+  return false;
+}
+async function sessionHoldIsLive(sessionsDir, sessionId, now = Date.now(), alive = pidAlive) {
+  const hold = await readDecisionHoldAt(sessionsDir, sessionId);
+  return stateHoldLive(hold, hold !== null && typeof hold.pid === "number" ? alive(hold.pid) : false, now);
 }
 var USER_BLOCKING_TOOLS = new Set(["AskUserQuestion", "ExitPlanMode", "request_user_input"]);
+var INTERRUPT_STOP_REASON = "Interrupted from Nomo";
+function interruptHookOutput(hookName) {
+  if (hookName === "PreToolUse") {
+    return JSON.stringify({
+      continue: false,
+      stopReason: INTERRUPT_STOP_REASON,
+      hookSpecificOutput: {
+        hookEventName: "PreToolUse",
+        permissionDecision: "deny",
+        permissionDecisionReason: INTERRUPT_STOP_REASON
+      }
+    });
+  }
+  if (hookName === "PostToolUse" || hookName === "PostToolUseFailure") {
+    return JSON.stringify({ continue: false, stopReason: INTERRUPT_STOP_REASON });
+  }
+  return null;
+}
+function clearsInterruptFlag(hookName, input = {}) {
+  if (hookName === "Stop")
+    return !hasRunningBackgroundAgent(input);
+  return hookName === "UserPromptSubmit" || hookName === "StopFailure" || hookName === "SessionEnd";
+}
+function interruptedEventInput(input) {
+  return { ...input, hook_event_name: "Stop" };
+}
 function planOp(hookName, input, sentDone) {
   switch (hookName) {
     case "SessionStart":
+      if (sentDone && input.source === "compact")
+        return null;
       return sentDone ? { op: "update", prio: 0, status: "working" } : { op: "start", prio: 0, status: "working" };
     case "PreToolUse": {
       const tool = typeof input.tool_name === "string" ? input.tool_name : "";
@@ -2391,13 +2576,24 @@ function planOp(hookName, input, sentDone) {
     case "UserPromptSubmit":
     case "PostToolUse":
       return { op: "update", prio: 0, status: "working" };
+    case "PostToolUseFailure":
+      return input.is_interrupt === true ? null : { op: "update", prio: 0, status: "working" };
     case "Notification":
-      if (!isPermissionNotification(input))
+      if (!isPermissionNotification(input) && !(typeof input.notification_type === "string" && ATTENTION_NOTIFICATIONS.has(input.notification_type)))
         return null;
       return { op: "update", prio: 1, status: "needsAttention" };
     case "PermissionRequest":
+    case "Elicitation":
       return { op: "update", prio: 1, status: "needsAttention" };
+    case "ElicitationResult":
+      return { op: "update", prio: 0, status: "working" };
+    case "PreCompact":
+    case "PostCompact":
+      return input.trigger === "manual" || sentDone ? null : { op: "update", prio: 0, status: "working" };
     case "Stop":
+      return hasRunningBackgroundAgent(input) ? { op: "update", prio: 0, status: "working" } : { op: "done", prio: 0, status: "done" };
+    case "StopFailure":
+    case "Interrupt":
       return { op: "done", prio: 0, status: "done" };
     case "SessionEnd":
       return { op: "end", prio: 0, status: "done" };
@@ -2433,7 +2629,7 @@ function buildBlob(input, machine, title, plan, agent = "claude", turnStartedAt,
   const { label, folderKey } = folder;
   const branch = sessionBranch(folder);
   const hookName = typeof input.hook_event_name === "string" ? input.hook_event_name : "";
-  const detail = detailOverride ?? detailForHook(hookName, typeof input.tool_name === "string" ? input.tool_name : undefined, input.tool_input);
+  const detail = detailOverride ?? (hookName === "Stop" && hasRunningBackgroundAgent(input) ? TOOL_DETAIL.Task : detailForHook(hookName, typeof input.tool_name === "string" ? input.tool_name : undefined, input.tool_input));
   const base = {
     status: plan.status,
     title: title ?? "",
@@ -2501,6 +2697,7 @@ async function trackSessionAt(sessionsDir, sessionId, op, prio, status, blob, ma
     if (op === "end") {
       await unlink2(path).catch(() => {});
       await unlink2(`${sessionsDir}/${decisionHoldFileName(sessionId)}`).catch(() => {});
+      await unlink2(`${sessionsDir}/${interruptFlagFileName(sessionId)}`).catch(() => {});
       return;
     }
     const recordedAt = Date.now();
@@ -2552,6 +2749,33 @@ async function markDoneDeliveredAt(sessionsDir, sessionId) {
 }
 async function markDoneDelivered(sessionId) {
   return markDoneDeliveredAt(SESSIONS_DIR, sessionId);
+}
+async function markUpdatePendingAt(sessionsDir, sessionId, blob) {
+  try {
+    const record = await readRecord(sessionId, sessionsDir);
+    if (!record || !blob || record.blob !== blob || record.op === "done" || record.updatePending === true)
+      return;
+    await atomicWrite(`${sessionsDir}/${sessionId}.json`, JSON.stringify({ ...record, updatePending: true }), 384);
+  } catch {}
+}
+async function traceSendFailure(event, failPath = SEND_FAIL_PATH, lastSendPath = LAST_SEND_PATH, trace = traceSession) {
+  try {
+    const stamp = async (path) => {
+      try {
+        return Number.parseInt((await readFile4(path, "utf8")).trim(), 10) || 0;
+      } catch {
+        return 0;
+      }
+    };
+    const streakStart = await stamp(failPath);
+    if (streakStart > 0 && streakStart > await stamp(lastSendPath))
+      return false;
+    await atomicWrite(failPath, String(Date.now()));
+    trace({ event: "post-failed", ...event });
+    return true;
+  } catch {
+    return false;
+  }
 }
 async function reconcileProvisional(config, hookPid) {
   try {
@@ -2640,6 +2864,8 @@ async function runHook(agent) {
   try {
     const [config, raw] = await Promise.all([loadConfig(), readStdin()]);
     const input = JSON.parse(raw);
+    if (agent === "claude" && cursorHostInvocation(input))
+      return;
     if (typeof input.session_id !== "string" || input.session_id.length === 0)
       return;
     if (agent === "claude" && (typeof input.turn_id === "string" && input.turn_id.length > 0 || typeof input.transcript_path === "string" && input.transcript_path.includes("/.codex/"))) {
@@ -2668,14 +2894,34 @@ async function runHook(agent) {
     if (!config) {
       const pending = await loadPendingConfig();
       if (pending) {
-        const machine2 = pending.machineName ?? hostname().replace(/\.local$/, "");
-        await stashPendingEvent(input, machine2, await readTitle(), Date.now(), PENDING_STASH_PATH, process.ppid, agent, await readModel());
+        const machine = pending.machineName ?? hostname().replace(/\.local$/, "");
+        await stashPendingEvent(input, machine, await readTitle(), Date.now(), PENDING_STASH_PATH, process.ppid, agent, await readModel());
       }
       return;
     }
     const machine = config.machineName ?? hostname().replace(/\.local$/, "");
     const reportedSessionId = input.session_id;
     const hookName = typeof input.hook_event_name === "string" ? input.hook_event_name : "";
+    let interrupted = false;
+    if (adapter2.interrupt === "hook-flag") {
+      if (clearsInterruptFlag(hookName, input)) {
+        await clearInterruptFlagAt(SESSIONS_DIR, reportedSessionId);
+      } else {
+        const line = interruptHookOutput(hookName);
+        if (line !== null && await interruptFlagSetAt(SESSIONS_DIR, reportedSessionId, Date.now())) {
+          interrupted = true;
+          await new Promise((resolve) => {
+            process.stdout.on("error", () => resolve());
+            try {
+              process.stdout.write(`${line}
+`, () => resolve());
+            } catch {
+              resolve();
+            }
+          });
+        }
+      }
+    }
     const sessionStartSource = typeof input.source === "string" ? input.source : "";
     const hookPid = process.ppid;
     const hookCommand = pidCommand(hookPid);
@@ -2809,15 +3055,21 @@ async function runHook(agent) {
     const turnStartedAt = isTurnOpener ? Math.floor(Date.now() / 1000) : cachedTurn;
     const awaitingPrompt = hookName === "SessionStart" && !reusedForkPredecessor && (existingRecord ? sentDone || existingRecord.awaitingPrompt === true : sessionStartSource !== "compact");
     const turnId = typeof input.turn_id === "string" && input.turn_id.length > 0 ? input.turn_id : undefined;
-    let plan = planOp(hookName, input, sentDone);
+    if (interrupted)
+      eventInput = interruptedEventInput(eventInput);
+    let plan = planOp(interrupted ? "Stop" : hookName, input, sentDone);
     if (!plan)
       return;
+    if (!interrupted && yieldsToLiveHold(hookName, input) && await sessionHoldIsLive(SESSIONS_DIR, sessionId)) {
+      traceSession({ event: "hold-yield", sessionId, agent, hook_event_name: hookName });
+      return;
+    }
     let pendingPlanPicker = false;
     let planPickerVerificationPending = false;
     let attentionKind;
     let proposedPlan;
     let pickerClassifier = plan.op === "done" ? "none" : plan.status;
-    if (plan.op === "done" && adapter2.completedTurnWaitState) {
+    if (hookName === "Stop" && plan.op === "done" && adapter2.completedTurnWaitState) {
       const evidence = adapter2.completedTurnWaitEvidence ? await adapter2.completedTurnWaitEvidence({ pid: hookPid, transcriptPath }) : { state: await adapter2.completedTurnWaitState({ pid: hookPid, transcriptPath }) };
       const wait = evidence.state;
       pickerClassifier = wait;
@@ -2884,18 +3136,34 @@ async function runHook(agent) {
     ensureWatchdog();
     if (agent === "codex")
       await reconcileProvisional(config, hookPid);
-    const res = await fetch(`${config.url}/v1/cc/event`, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "x-cc-pairing": config.pairingId,
-        "x-cc-auth": config.pcSecret,
-        "x-cc-version": PLUGIN_VERSION,
-        "x-cc-approvals": await localApprovalsState()
-      },
-      body: JSON.stringify(envelope),
-      signal: AbortSignal.timeout(2000)
-    });
+    const failure = { sessionId, agent, hook_event_name: hookName, op: plan.op };
+    const postStarted = Date.now();
+    let res;
+    try {
+      res = await fetch(`${config.url}/v1/cc/event`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-cc-pairing": config.pairingId,
+          "x-cc-auth": config.pcSecret,
+          "x-cc-version": PLUGIN_VERSION,
+          "x-cc-approvals": await localApprovalsState()
+        },
+        body: JSON.stringify(envelope),
+        signal: AbortSignal.timeout(2000)
+      });
+    } catch (e) {
+      if (plan.op !== "done" && plan.op !== "end")
+        await markUpdatePendingAt(SESSIONS_DIR, sessionId, envelope.blob);
+      await traceSendFailure({
+        ...failure,
+        ms: Date.now() - postStarted,
+        error: e?.name === "TimeoutError" ? "timeout" : "network"
+      });
+      return;
+    }
+    if (!res.ok)
+      await traceSendFailure({ ...failure, status: res.status, ms: Date.now() - postStarted });
     if (res.ok) {
       await atomicWrite(LAST_SEND_PATH, String(Date.now()));
       await resetGoneStrikes();
@@ -2988,7 +3256,8 @@ var POST_FIRST_CONTACT_TIMEOUT_MS = 6000;
 var HOLD_BLOCKS_DIALOG = {
   claude: true,
   codex: true,
-  opencode: false
+  opencode: false,
+  cursor: false
 };
 var LOCAL_ANSWER_TOOLS = new Set(["AskUserQuestion", "ExitPlanMode"]);
 var LOCAL_ANSWER_TAIL_BYTES = 64000;
@@ -3558,8 +3827,8 @@ var LOOPBACK_MAX_CONSECUTIVE_ERRORS = 5;
 function createLoopbackAnswerPoller(config, requestId, deps) {
   const interval = deps.intervalMs ?? LOOPBACK_POLL_INTERVAL_MS;
   const discoverInterval = deps.discoverIntervalMs ?? POLL_INTERVAL_MS;
-  const tick = deps.sleep ?? ((ms) => new Promise((resolve3) => {
-    const timer = setTimeout(resolve3, ms);
+  const tick = deps.sleep ?? ((ms) => new Promise((resolve) => {
+    const timer = setTimeout(resolve, ms);
     timer.unref?.();
   }));
   let live = deps.statePath !== undefined;
@@ -3570,8 +3839,8 @@ function createLoopbackAnswerPoller(config, requestId, deps) {
   let traced = false;
   let pending;
   let wakeResolve = () => {};
-  let wake = new Promise((resolve3) => {
-    wakeResolve = resolve3;
+  let wake = new Promise((resolve) => {
+    wakeResolve = resolve;
   });
   let keyPromise;
   const note = (result) => {
@@ -3740,6 +4009,8 @@ async function runPermissionHook(deps = {}, agent = "claude") {
   let settleAsWorking = false;
   let settleHeldRecord;
   try {
+    if (agent === "claude" && cursorHostInvocation(undefined))
+      return;
     if (await flagExists(noHoldPath)) {
       await (deps.delegate ?? (() => runHook(agent)))();
       return;
@@ -3760,6 +4031,8 @@ async function runPermissionHook(deps = {}, agent = "claude") {
       trace({ event: "exit", reason: "bad-stdin", ...errorTag(e), pos: parseErrorPosition(e) });
       return;
     }
+    if (agent === "claude" && cursorHostInvocation(input))
+      return;
     const sessionId = typeof input.session_id === "string" ? input.session_id : "";
     if (sessionId.length === 0) {
       trace({ event: "exit", reason: "no-session-id" });
@@ -3827,8 +4100,8 @@ async function runPermissionHook(deps = {}, agent = "claude") {
     const sleep = deps.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
     let lastPostTs = 0;
     const postDecision = async (round, maxAttempts) => {
-      let hold2 = false;
-      let posted2 = false;
+      let hold = false;
+      let posted = false;
       let reason;
       for (let attempt = 1;attempt <= maxAttempts; attempt += 1) {
         const ts = Math.max((deps.now ?? Date.now)(), lastPostTs + 1);
@@ -3851,7 +4124,7 @@ async function runPermissionHook(deps = {}, agent = "claude") {
           });
           if (res.ok) {
             const body = await res.json().catch(() => ({}));
-            hold2 = body.hold === true;
+            hold = body.hold === true;
             if (typeof body.reason === "string")
               reason = body.reason;
           }
@@ -3862,10 +4135,10 @@ async function runPermissionHook(deps = {}, agent = "claude") {
             attempt,
             status: res.status,
             ts,
-            ...res.ok ? { hold: hold2 } : {},
+            ...res.ok ? { hold } : {},
             ...reason !== undefined ? { reason } : {}
           });
-          posted2 = true;
+          posted = true;
           break;
         } catch (e) {
           const name = e?.name ?? "Error";
@@ -3878,13 +4151,13 @@ async function runPermissionHook(deps = {}, agent = "claude") {
           }
         }
       }
-      return { posted: posted2, hold: hold2, reason };
+      return { posted, hold, reason };
     };
     const clock = deps.now ?? Date.now;
     const pollBudget = createPollBudget();
-    const pollDecision = async (seq2) => {
-      const budgetMs = pollBudget.next(seq2);
-      trace({ event: "poll-begin", seq: seq2, budgetMs });
+    const pollDecision = async (seq) => {
+      const budgetMs = pollBudget.next(seq);
+      trace({ event: "poll-begin", seq, budgetMs });
       const startedAt = clock();
       const measure = () => {
         const ms = clock() - startedAt;
@@ -3897,29 +4170,29 @@ async function runPermissionHook(deps = {}, agent = "claude") {
           signal: AbortSignal.timeout(budgetMs)
         });
         if (!res.ok) {
-          trace({ event: "poll-end", seq: seq2, outcome: "status", status: res.status, ms: measure() });
+          trace({ event: "poll-end", seq, outcome: "status", status: res.status, ms: measure() });
           return { status: res.status };
         }
         const data = await res.json();
-        trace({ event: "poll-end", seq: seq2, outcome: "ok", ms: measure() });
+        trace({ event: "poll-end", seq, outcome: "ok", ms: measure() });
         return { data, status: res.status };
       } catch (e) {
-        trace({ event: "poll-end", seq: seq2, outcome: "error", ...errorTag(e) });
+        trace({ event: "poll-end", seq, outcome: "error", ...errorTag(e) });
         return { status: 0 };
       }
     };
     let attentionStalled = false;
-    const stalledPatch = async (at2) => {
+    const stalledPatch = async (at) => {
       let stalledBlob = fallbackBlob;
       try {
-        stalledBlob = await encryptBlob(config.e2eKey, { ...base, reconnecting: Math.floor(at2 / 1000) });
+        stalledBlob = await encryptBlob(config.e2eKey, { ...base, reconnecting: Math.floor(at / 1000) });
       } catch {}
-      return { ts: at2, blob: stalledBlob, attentionStalledAt: at2 };
+      return { ts: at, blob: stalledBlob, attentionStalledAt: at };
     };
     const markAttentionStalled = async () => {
-      const at2 = (deps.now ?? Date.now)();
+      const at = (deps.now ?? Date.now)();
       try {
-        await (deps.settleHoldRecordFn ?? defaultSettleHoldRecord())(sessionId, await stalledPatch(at2));
+        await (deps.settleHoldRecordFn ?? defaultSettleHoldRecord())(sessionId, await stalledPatch(at));
       } catch {}
     };
     let { posted, hold, reason: holdReason } = await postDecision(1, POST_MAX_ATTEMPTS);
@@ -4231,6 +4504,7 @@ function ocTrace(event) {
 }
 async function runOcApproval(request, o) {
   const trace = o.trace ?? ocTrace;
+  let granted = false;
   const stdin = JSON.stringify({
     session_id: request.sessionID,
     ...o.cwd ? { cwd: o.cwd } : {},
@@ -4248,6 +4522,10 @@ async function runOcApproval(request, o) {
       },
       randomUUID: () => o.requestId,
       holdId: o.requestId,
+      writeHoldFn: async (sessionId, hold) => {
+        granted = true;
+        await defaultWriteHold()(sessionId, hold);
+      },
       detail: request.detail,
       trace,
       fetchFn: o.fetchFn,
@@ -4256,17 +4534,17 @@ async function runOcApproval(request, o) {
     }, "opencode");
   } catch (e) {
     trace({ event: "oc-hold-threw", kind: request.kind, error: e?.name ?? "Error" });
-    return;
+    return { answered: false, granted };
   }
   const reply = ocReplyFor(request, line);
   if (!reply) {
     trace({ event: "oc-no-reply", kind: request.kind, id: request.id });
-    return;
+    return { answered: line !== undefined, granted };
   }
   const post = ocPost(o.client, o.serverUrl, o.fetchFn);
   if (!post) {
     trace({ event: "oc-replied", kind: request.kind, id: request.id, path: reply.path, status: 0, via: "none", error: "NoTransport" });
-    return;
+    return { answered: true, granted };
   }
   try {
     const { status } = await post(reply);
@@ -4283,6 +4561,7 @@ async function runOcApproval(request, o) {
       message: String(e?.message ?? "").slice(0, 200)
     });
   }
+  return { answered: true, granted };
 }
 async function ocResolveOnRelay(config, requestId, fetchFn = fetch) {
   try {
@@ -4302,7 +4581,23 @@ async function ocResolveOnRelay(config, requestId, fetchFn = fetch) {
 
 // src/opencode/state.ts
 function newOcState() {
-  return { sessions: new Map, children: new Set };
+  return { sessions: new Map, children: new Map, prompts: new Map };
+}
+function ocRootSession(state, sessionId) {
+  let id = sessionId;
+  for (let hops = state.children.size;hops > 0; hops -= 1) {
+    const parent = state.children.get(id);
+    if (parent === undefined)
+      break;
+    id = parent;
+  }
+  return id;
+}
+function hasPrompt(state, rootId) {
+  for (const prompt of state.prompts.values())
+    if (ocRootSession(state, prompt.sessionID) === rootId)
+      return true;
+  return false;
 }
 function isDefaultOcTitle(title) {
   return /^(New|Child) session - /.test(title);
@@ -4365,8 +4660,9 @@ function reduceOcEvent(state, event, now = Date.now()) {
   const info = asRecord2(properties.info);
   if (info && type.startsWith("session.")) {
     const id = asString2(info.id);
-    if (id && asString2(info.parentID))
-      state.children.add(id);
+    const parentID = asString2(info.parentID);
+    if (id && parentID && parentID !== id)
+      state.children.set(id, parentID);
   }
   const sessionId = asString2(properties.sessionID) ?? (type.startsWith("session.") ? asString2(info?.id) : undefined);
   if (!sessionId || state.children.has(sessionId))
@@ -4403,14 +4699,18 @@ function reduceOcEvent(state, event, now = Date.now()) {
       return null;
     }
     case "session.status": {
-      const live = entry ?? adopt(state, sessionId, now);
       const status = statusType(properties.status);
+      if (status === "idle")
+        return finishTurn(sessionId, entry, now);
       if (status !== "busy" && status !== "retry")
+        return null;
+      const live = entry ?? adopt(state, sessionId, now);
+      if (live.announced && hasPrompt(state, sessionId))
         return null;
       const detail = status === "retry" ? "retrying" : undefined;
       const planned = frame(sessionId, live, live.announced ? "update" : "start", "working", now, detail);
       live.announced = true;
-      const key = JSON.stringify([planned.status, planned.detail, planned.title, planned.model, planned.plan]);
+      const key = statusKey(planned);
       if (live.lastStatusFrame === key)
         return null;
       live.lastStatusFrame = key;
@@ -4425,17 +4725,12 @@ function reduceOcEvent(state, event, now = Date.now()) {
       entry.plan = plan;
       if (!entry.announced)
         return null;
+      if (hasPrompt(state, sessionId))
+        return null;
       return frame(sessionId, entry, "update", "working", now);
     }
-    case "session.idle": {
-      if (!entry?.announced)
-        return null;
-      entry.working = false;
-      entry.lastStatusFrame = undefined;
-      const done = frame(sessionId, entry, "done", "done", now);
-      entry.turnStartedAt = undefined;
-      return done;
-    }
+    case "session.idle":
+      return finishTurn(sessionId, entry, now);
     case "session.deleted": {
       if (!entry)
         return null;
@@ -4445,6 +4740,21 @@ function reduceOcEvent(state, event, now = Date.now()) {
     default:
       return null;
   }
+}
+function finishTurn(sessionId, entry, now) {
+  if (!entry?.announced)
+    return null;
+  if (entry.lastStatusFrame === DONE_KEY && !entry.working)
+    return null;
+  entry.working = false;
+  entry.lastStatusFrame = DONE_KEY;
+  const done = frame(sessionId, entry, "done", "done", now);
+  entry.turnStartedAt = undefined;
+  return done;
+}
+var DONE_KEY = "done";
+function statusKey(planned) {
+  return JSON.stringify([planned.status, planned.detail, planned.title, planned.model, planned.plan]);
 }
 function ocEndFrames(state, now = Date.now()) {
   const frames = [...state.sessions].filter(([, entry]) => entry.announced).map(([sessionId, entry]) => frame(sessionId, entry, "end", "done", now));
@@ -4457,11 +4767,95 @@ function ocForgetStatusFrame(state, sessionId) {
     entry.lastStatusFrame = undefined;
 }
 function ocAttentionFrame(state, sessionId, detail, now = Date.now()) {
-  const entry = state.sessions.get(sessionId);
-  if (!entry || state.children.has(sessionId))
+  const rootId = ocRootSession(state, sessionId);
+  const entry = state.sessions.get(rootId);
+  if (!entry)
     return null;
   entry.announced = true;
-  return frame(sessionId, entry, "update", "needsAttention", now, detail, 1);
+  entry.lastStatusFrame = undefined;
+  return frame(rootId, entry, "update", "needsAttention", now, detail, 1);
+}
+function ocPromptAsked(state, event) {
+  const properties = asRecord2(asRecord2(event)?.properties);
+  const id = asString2(properties?.id);
+  const sessionID = asString2(properties?.sessionID);
+  if (!id || !sessionID || state.prompts.has(id))
+    return;
+  const tool = asRecord2(properties?.tool);
+  const messageID = asString2(tool?.messageID);
+  const callID = asString2(tool?.callID);
+  state.prompts.set(id, { sessionID, ...messageID ? { messageID } : {}, ...callID ? { callID } : {} });
+}
+function ocPromptHeld(state, id, held) {
+  const prompt = state.prompts.get(id);
+  if (prompt)
+    prompt.held = held;
+}
+function ocRowHeld(state, rootId) {
+  for (const prompt of state.prompts.values()) {
+    if (prompt.held && ocRootSession(state, prompt.sessionID) === rootId)
+      return true;
+  }
+  return false;
+}
+function ocPromptResolved(state, id) {
+  const prompt = state.prompts.get(id);
+  if (!prompt)
+    return;
+  state.prompts.delete(id);
+  return ocRootSession(state, prompt.sessionID);
+}
+function ocPromptsEndedBy(state, event) {
+  const e = asRecord2(event);
+  const type = asString2(e?.type);
+  const properties = asRecord2(e?.properties);
+  if (!type || !properties || state.prompts.size === 0)
+    return [];
+  const ended = [];
+  if (type === "message.part.updated") {
+    const part = asRecord2(properties.part);
+    const partStatus = asRecord2(part?.state)?.status;
+    const callID = asString2(part?.callID);
+    if (part?.type !== "tool" || !callID || partStatus !== "completed" && partStatus !== "error")
+      return [];
+    const sessionID = asString2(part.sessionID) ?? asString2(properties.sessionID);
+    const messageID = asString2(part.messageID);
+    for (const [id, prompt] of state.prompts) {
+      if (prompt.sessionID !== sessionID || prompt.callID !== callID)
+        continue;
+      if (prompt.messageID && messageID && prompt.messageID !== messageID)
+        continue;
+      ended.push({ id, byTool: true });
+    }
+    return ended;
+  }
+  const over = type === "session.idle" || type === "session.deleted" || type === "session.status" && statusType(properties.status) === "idle";
+  const sessionID = asString2(properties.sessionID) ?? asString2(asRecord2(properties.info)?.id);
+  if (!over || !sessionID)
+    return [];
+  for (const [id, prompt] of state.prompts) {
+    for (let at = prompt.sessionID, hops = state.children.size + 1;at !== undefined && hops > 0; hops -= 1) {
+      if (at === sessionID) {
+        ended.push({ id, byTool: false });
+        break;
+      }
+      at = state.children.get(at);
+    }
+  }
+  return ended;
+}
+function ocPromptFrame(state, sessionId, now = Date.now()) {
+  const rootId = ocRootSession(state, sessionId);
+  if (ocRowHeld(state, rootId))
+    return null;
+  if (hasPrompt(state, rootId))
+    return ocAttentionFrame(state, rootId, undefined, now);
+  const entry = state.sessions.get(rootId);
+  if (!entry?.announced || !entry.working)
+    return null;
+  const planned = frame(rootId, entry, "update", "working", now);
+  entry.lastStatusFrame = statusKey(planned);
+  return planned;
 }
 function adopt(state, sessionId, now) {
   const entry = { startedAt: now, announced: true, working: false };
@@ -4557,27 +4951,27 @@ function ensureWatchdogCached(now) {
     return;
   watchdogTrustedUntil = ensureWatchdog({ spawnWatchdog }) ? now + WATCHDOG_TRUST_MS : 0;
 }
-async function send(ctx, frame2) {
+async function send(ctx, frame) {
   const now = Date.now();
-  const input = { session_id: frame2.sessionId, cwd: ctx.folder.cwd };
+  const input = { session_id: frame.sessionId, cwd: ctx.folder.cwd };
   let fittedPlan;
-  const envelope = await buildEnvelope(input, ctx.machine, now, frame2.title, ctx.config.e2eKey, false, "opencode", frame2.startedAt, frame2.turnStartedAt, ctx.folder, frame2.model, { op: frame2.op, prio: frame2.prio, status: frame2.status }, undefined, frame2.plan, undefined, (plain) => {
+  const envelope = await buildEnvelope(input, ctx.machine, now, frame.title, ctx.config.e2eKey, false, "opencode", frame.startedAt, frame.turnStartedAt, ctx.folder, frame.model, { op: frame.op, prio: frame.prio, status: frame.status }, undefined, frame.plan, undefined, (plain) => {
     fittedPlan = plain.plan;
-  }, frame2.detail);
+  }, frame.detail);
   if (!envelope) {
-    ocForgetStatusFrame(ctx.state, frame2.sessionId);
+    ocForgetStatusFrame(ctx.state, frame.sessionId);
     return;
   }
-  const planFull = fullTextForRecord(frame2.plan, undefined);
-  const fullUpload = postFullText(ctx.config, frame2.sessionId, "plan", fullTextForRecord(frame2.plan, fittedPlan));
-  await trackSession(frame2.sessionId, frame2.op, frame2.prio, frame2.status, envelope.blob, ctx.machine, ctx.folder, "", "opencode", frame2.startedAt, frame2.turnStartedAt, undefined, frame2.title, ctx.config.pairingId, frame2.model, false, process.pid, ctx.origin, false, undefined, undefined, planFull);
+  const planFull = fullTextForRecord(frame.plan, undefined);
+  const fullUpload = postFullText(ctx.config, frame.sessionId, "plan", fullTextForRecord(frame.plan, fittedPlan));
+  await trackSession(frame.sessionId, frame.op, frame.prio, frame.status, envelope.blob, ctx.machine, ctx.folder, "", "opencode", frame.startedAt, frame.turnStartedAt, undefined, frame.title, ctx.config.pairingId, frame.model, false, process.pid, ctx.origin, false, undefined, undefined, planFull);
   ensureWatchdogCached(now);
   await atomicWrite(lastHookPath("opencode"), String(now)).catch(() => {});
   const delivered = await postOcEvent(ctx.config, envelope);
-  if (delivered && frame2.op === "done")
-    await markDoneDelivered(frame2.sessionId);
+  if (delivered && frame.op === "done")
+    await markDoneDelivered(frame.sessionId);
   if (!delivered)
-    ocForgetStatusFrame(ctx.state, frame2.sessionId);
+    ocForgetStatusFrame(ctx.state, frame.sessionId);
   await fullUpload;
 }
 var server = async (input) => {
@@ -4601,11 +4995,29 @@ var server = async (input) => {
     const serverUrl = input?.serverUrl === undefined || input.serverUrl === null ? undefined : String(input.serverUrl);
     const canReply = ocPost(input?.client, serverUrl) !== undefined;
     const holds = new Map;
-    const hold = (request) => {
-      if (!canReply || ctx.state.children.has(request.sessionID) || holds.has(request.id))
+    const repaint = (sessionID, workingOnly = false) => enqueue(async () => {
+      const frame = ocPromptFrame(ctx.state, sessionID);
+      if (frame && !(workingOnly && frame.status !== "working"))
+        await send(ctx, frame);
+    });
+    const sendPlanned = async (frame) => {
+      if (frame.op === "update" && frame.status === "working" && ocRowHeld(ctx.state, frame.sessionId)) {
+        ocForgetStatusFrame(ctx.state, frame.sessionId);
         return;
+      }
+      await send(ctx, frame);
+    };
+    const hold = (request) => {
+      if (holds.has(request.id))
+        return;
+      if (!canReply || ctx.state.children.has(request.sessionID)) {
+        repaint(request.sessionID);
+        return;
+      }
       const requestId = crypto.randomUUID();
       holds.set(request.id, requestId);
+      ocPromptHeld(ctx.state, request.id, true);
+      let delegated = false;
       runOcApproval(request, {
         config: ctx.config,
         client: input?.client,
@@ -4613,13 +5025,22 @@ var server = async (input) => {
         cwd: ctx.folder.cwd,
         requestId,
         delegate: async () => {
-          const attention = ocAttentionFrame(ctx.state, request.sessionID, undefined);
-          if (attention)
-            await enqueue(() => send(ctx, attention));
+          delegated = true;
+          ocPromptHeld(ctx.state, request.id, false);
+          await repaint(request.sessionID);
         }
-      }).catch(() => {}).finally(() => {
+      }).catch(() => ({ answered: false, granted: false })).then(({ answered, granted }) => {
         holds.delete(request.id);
+        ocPromptHeld(ctx.state, request.id, false);
+        if (answered)
+          return;
+        repaint(request.sessionID, granted || delegated);
       });
+    };
+    const settle = (opencodeId) => {
+      const root = ocPromptResolved(ctx.state, opencodeId);
+      if (root !== undefined)
+        repaint(root);
     };
     const retire = (opencodeId) => {
       const requestId = holds.get(opencodeId);
@@ -4633,17 +5054,24 @@ var server = async (input) => {
         try {
           const request = ocDecisionRequest(event);
           if (request) {
+            ocPromptAsked(ctx.state, event);
             hold(request);
             return;
           }
           const resolved = ocResolvedRequestId(event);
           if (resolved) {
             retire(resolved);
+            settle(resolved);
             return;
           }
-          const frame2 = reduceOcEvent(ctx.state, event);
-          if (frame2)
-            await enqueue(() => send(ctx, frame2));
+          const frame = reduceOcEvent(ctx.state, event);
+          const sent = frame ? enqueue(() => sendPlanned(frame)) : undefined;
+          for (const ended of ocPromptsEndedBy(ctx.state, event)) {
+            if (ended.byTool)
+              retire(ended.id);
+            settle(ended.id);
+          }
+          await sent;
         } catch {}
       },
       dispose: async () => {
@@ -4652,8 +5080,8 @@ var server = async (input) => {
             retire(opencodeId);
           const frames = ocEndFrames(ctx.state);
           await enqueue(async () => {
-            for (const frame2 of frames)
-              await send(ctx, frame2);
+            for (const frame of frames)
+              await send(ctx, frame);
           });
         } catch {}
       }

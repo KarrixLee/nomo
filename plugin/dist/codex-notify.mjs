@@ -5,8 +5,10 @@ var __require = /* @__PURE__ */ createRequire(import.meta.url);
 import { hostname as hostname2 } from "node:os";
 
 // src/core/adapter.ts
-import { execFile as execFile2 } from "node:child_process";
+import { execFile as execFile2, execFileSync as execFileSync2 } from "node:child_process";
+import { existsSync as existsSync2 } from "node:fs";
 import { readdir, readFile as readFile2, stat as stat2 } from "node:fs/promises";
+import { devNull } from "node:os";
 import { promisify as promisify2 } from "node:util";
 import { basename as basename2, join as join2 } from "node:path";
 
@@ -103,7 +105,7 @@ async function sha256Hex(s) {
 }
 
 // src/core/shared.ts
-var PLUGIN_VERSION = "2.2.2";
+var PLUGIN_VERSION = "2.3.0";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -163,6 +165,7 @@ function tracePlanPickerDecision(sessionId, decision, path) {
 var SESSIONS_DIR = `${CC_DIR}/sessions`;
 var WATCHDOG_PID_PATH = `${CC_DIR}/watchdog.pid`;
 var LAST_SEND_PATH = `${CC_DIR}/last-send`;
+var SEND_FAIL_PATH = `${CC_DIR}/last-send-fail`;
 var GONE_STRIKES_PATH = `${CC_DIR}/gone-strikes`;
 var GONE_STRIKE_LIMIT = 2;
 var NO_HOLD_PATH = `${CC_DIR}/no-hold`;
@@ -271,6 +274,11 @@ function codexHome() {
   const env = process.env.CODEX_HOME;
   return env && env.length > 0 ? env : `${process.env.HOME}/.codex`;
 }
+function cursorHome() {
+  const env = process.env.CURSOR_CONFIG_DIR;
+  return env && env.length > 0 ? env : `${process.env.HOME}/.cursor`;
+}
+var CURSOR_HOOK_MARKER = "cursor-status.mjs";
 var CODEX_HOOK_MARKER = "codex-status.mjs";
 function codexAppServerSocketPath() {
   return `${codexHome()}/app-server-control/app-server-control.sock`;
@@ -283,7 +291,7 @@ async function unixSocketAccepts(socketPath, timeoutMs) {
   } catch {
     return false;
   }
-  return await new Promise((resolve2) => {
+  return await new Promise((resolve) => {
     let settled = false;
     let socket;
     const timer = setTimeout(() => done(false), timeoutMs);
@@ -296,7 +304,7 @@ async function unixSocketAccepts(socketPath, timeoutMs) {
       try {
         socket?.destroy();
       } catch {}
-      resolve2(accepted);
+      resolve(accepted);
     }
     try {
       socket = createConnection({ path: socketPath });
@@ -329,20 +337,20 @@ var CODEX_DAEMON_SOCKET_POLL_MS = 250;
 async function startCodexAppServerDaemon(deps = {}) {
   const trace = deps.trace ?? ((event) => traceSession(event));
   const probe = deps.probe ?? (() => codexAppServerSocketAvailable());
-  const sleep = deps.sleep ?? ((ms) => new Promise((resolve2) => setTimeout(resolve2, ms)));
+  const sleep = deps.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
   const command = deps.codexPath ?? "codex";
   const timeoutMs = deps.timeoutMs ?? CODEX_DAEMON_START_TIMEOUT_MS;
   const socketWaitMs = deps.socketWaitMs ?? CODEX_DAEMON_SOCKET_WAIT_MS;
   const spawnFn = deps.spawnFn ?? ((cmd, args) => spawn(cmd, [...args], { stdio: "ignore" }));
   let exit;
   try {
-    exit = await new Promise((resolve2) => {
+    exit = await new Promise((resolve) => {
       let settled = false;
       const done = (value) => {
         if (settled)
           return;
         settled = true;
-        resolve2(value);
+        resolve(value);
       };
       let child;
       try {
@@ -916,6 +924,27 @@ async function writeDecisionHold(sessionId, hold) {
 }
 async function clearDecisionHold(sessionId, pid, beforeUnlink, holdId) {
   return clearDecisionHoldAt(SESSIONS_DIR, sessionId, pid, beforeUnlink, holdId);
+}
+var INTERRUPT_FLAG_SUFFIX = ".interrupt";
+var INTERRUPT_FLAG_MAX_AGE_MS = 3600000;
+function interruptFlagFileName(sessionId) {
+  return `${sessionId}${INTERRUPT_FLAG_SUFFIX}`;
+}
+async function writeInterruptFlagAt(sessionsDir, sessionId, now) {
+  try {
+    await atomicWrite(`${sessionsDir}/${interruptFlagFileName(sessionId)}`, JSON.stringify({ at: now }), 384);
+  } catch {}
+}
+async function interruptFlagSetAt(sessionsDir, sessionId, now) {
+  try {
+    const flag = JSON.parse(await readFile(`${sessionsDir}/${interruptFlagFileName(sessionId)}`, "utf8"));
+    return typeof flag.at === "number" && now - flag.at <= INTERRUPT_FLAG_MAX_AGE_MS;
+  } catch {
+    return false;
+  }
+}
+async function clearInterruptFlagAt(sessionsDir, sessionId) {
+  await unlink(`${sessionsDir}/${interruptFlagFileName(sessionId)}`).catch(() => {});
 }
 async function settleDecisionHoldRecord(sessionId, patch) {
   return settleDecisionHoldRecordAt(SESSIONS_DIR, sessionId, patch);
@@ -1713,7 +1742,7 @@ async function codexSessionModel(input, prefix, transcriptPath, home = codexHome
     return;
   }
 }
-var INTERRUPT_MARKER = "interrupted by user";
+var INTERRUPT_MARKER = "[Request interrupted by user";
 var CODEX_TURN_EVENTS = new Set(["task_started", "task_complete", "turn_aborted"]);
 var CODEX_ABORT_EVENT = "turn_aborted";
 function lastTurnLine(text) {
@@ -1738,7 +1767,23 @@ function lastTurnLine(text) {
   return null;
 }
 function hasInterruptMarker(line) {
-  return line.includes(INTERRUPT_MARKER);
+  let row;
+  try {
+    row = JSON.parse(line);
+  } catch {
+    return false;
+  }
+  if (typeof row !== "object" || row === null)
+    return false;
+  if (row.type !== "user")
+    return false;
+  const message = row.message;
+  const content = typeof message === "object" && message !== null ? message.content : message;
+  const texts = Array.isArray(content) ? content.map((part) => {
+    const p = part;
+    return p !== null && typeof p === "object" && p.type === "text" ? p.text : undefined;
+  }) : [content];
+  return texts.some((t) => typeof t === "string" && t.trimStart().startsWith(INTERRUPT_MARKER));
 }
 function codexLastTurnEvent(text) {
   const lines = text.split(`
@@ -1816,11 +1861,11 @@ function codexProposedPlanMarkdown(text) {
   if (typeof text !== "string")
     return;
   const trimmed = text.trim();
-  const open2 = "<proposed_plan>";
+  const open = "<proposed_plan>";
   const close = "</proposed_plan>";
-  if (!trimmed.startsWith(open2) || !trimmed.endsWith(close))
+  if (!trimmed.startsWith(open) || !trimmed.endsWith(close))
     return;
-  return trimmed.slice(open2.length, -close.length).trim();
+  return trimmed.slice(open.length, -close.length).trim();
 }
 function codexFinalProposedPlan(row) {
   const payload = row.payload;
@@ -2012,6 +2057,9 @@ var CLAUDE_DESKTOP_BUNDLED_PATH_PARTS = [
   "/claude.app/Contents/MacOS/claude"
 ];
 var CLAUDE_DESKTOP_LAUNCHER = "Claude.app/Contents/Helpers/disclaimer";
+function cursorHostInvocation(input, env = process.env) {
+  return env.CURSOR_VERSION !== undefined || typeof input === "object" && input !== null && "cursor_version" in input;
+}
 function claudeDesktopInvocation(selfArgs, ancestorArgs, entrypoint) {
   if (entrypoint === CLAUDE_DESKTOP_ENTRYPOINT)
     return true;
@@ -2036,8 +2084,13 @@ function claudeForkResumePredecessor(command) {
 }
 function claudeHeadlessInvocation(selfArgs, ancestorArgs, entrypoint) {
   const chain = [selfArgs, ...ancestorArgs].filter((s) => typeof s === "string" && s.length > 0);
-  if (chain.some((args) => CLAUDE_SELF_DAEMON_MARKERS.some((m) => args.includes(m))))
-    return true;
+  const isRing = (args) => CLAUDE_SELF_DAEMON_MARKERS.some((m) => args.includes(m));
+  const ringTop = chain.length - 1 - [...chain].reverse().findIndex(isRing);
+  if (ringTop < chain.length) {
+    const owner = chain[ringTop + 1]?.trim().split(/\s+/) ?? [];
+    if (basename2(owner[0] ?? "") !== "claude" || owner.some((tok) => CLAUDE_HEADLESS_ARG_TOKENS.has(tok)))
+      return true;
+  }
   const tokens = typeof selfArgs === "string" ? selfArgs.trim().split(/\s+/) : [];
   if (tokens.includes("--fork-session") && tokens.includes("--reply-on-resume"))
     return true;
@@ -2651,11 +2704,13 @@ var claudeAdapter = {
   hooksNotFiringHint: "  run /plugin in Claude Code, check the nomo plugin is enabled, then restart Claude Code",
   toolDetail: claudeToolDetail,
   blobAgentFields: {},
-  locateTuiPid: (ctx, deps) => claudeLocateTuiPid(ctx, deps)
+  locateTuiPid: (ctx, deps) => claudeLocateTuiPid(ctx, deps),
+  interrupt: "hook-flag"
 };
 var codexAdapter = {
   kind: "codex",
   answerExtras: "other",
+  titleRepair: { due: (record) => typeof record.title !== "string" || record.title.length === 0 },
   async title({ sessionId, prefix, input }) {
     const indexTitle = await codexIndexTitle(sessionId);
     if (indexTitle)
@@ -2708,7 +2763,8 @@ var codexAdapter = {
   blobAgentFields: { agent: "codex" },
   discoverLive: (known) => codexDiscoverLive(known),
   pidTurnActive: (pid) => codexPidTurnActive(pid),
-  locateTuiPid: (ctx, deps) => codexLocateTuiPid(ctx, deps)
+  locateTuiPid: (ctx, deps) => codexLocateTuiPid(ctx, deps),
+  interrupt: "app-server"
 };
 async function opencodeLocateTuiPid(ctx, deps = {}) {
   try {
@@ -2759,6 +2815,58 @@ var opencodeAdapter = {
   ambientPlan: true,
   locateTuiPid: (ctx, deps) => opencodeLocateTuiPid(ctx, deps)
 };
+function cursorModel(input) {
+  for (const key of ["model", "model_id"]) {
+    const v = input[key];
+    if (typeof v === "string" && v.trim().length > 0)
+      return v.trim().slice(0, 80);
+  }
+  return;
+}
+function cursorStateDb() {
+  const home = process.env.HOME ?? "";
+  const data = process.platform === "darwin" ? `${home}/Library/Application Support` : process.platform === "win32" ? process.env.APPDATA ?? "" : process.env.XDG_CONFIG_HOME || `${home}/.config`;
+  return `${data}/Cursor/User/globalStorage/state.vscdb`;
+}
+var CURSOR_TITLE_REPAIR_MS = 120000;
+var CURSOR_TITLE_TIMEOUT_MS = 300;
+function cursorChatTitle(sessionId, db = cursorStateDb(), env = process.env) {
+  if (!/^[A-Za-z0-9_-]{1,128}$/.test(sessionId))
+    return;
+  try {
+    const bin = process.platform === "darwin" && existsSync2("/usr/bin/sqlite3") ? "/usr/bin/sqlite3" : "sqlite3";
+    const out = execFileSync2(bin, [
+      "-init",
+      devNull,
+      "-batch",
+      "-noheader",
+      "-list",
+      "-readonly",
+      db,
+      "select case when json_type(cast(value as text),'$.name')='text' then json_extract(cast(value as text),'$.name') end" + ` from cursorDiskKV where key='composerData:${sessionId}'`
+    ], { timeout: CURSOR_TITLE_TIMEOUT_MS, encoding: "utf8", maxBuffer: 65536, stdio: ["ignore", "pipe", "ignore"], env });
+    const cleaned = out.replace(/\s+/g, " ").trim();
+    return cleaned ? truncateOnWord(cleaned) : undefined;
+  } catch {
+    return;
+  }
+}
+var cursorAdapter = {
+  kind: "cursor",
+  title: async ({ input }) => typeof input.prompt === "string" ? displayTitleFromUserText(input.prompt) : undefined,
+  model: async ({ input }) => cursorModel(input),
+  detectInterrupt: () => false,
+  sessionsDir: () => `${cursorHome()}/projects`,
+  sessionMatch: (name) => name.endsWith(".jsonl"),
+  hookStampPath: () => lastHookPath("cursor"),
+  hooksNotFiringHint: "  run `bunx nomo-ai --cursor` again, then restart Cursor (Settings → Hooks shows what it loaded)",
+  titleRepair: {
+    due: (record, now) => record.lastEvent === "done" && typeof record.ts === "number" && now - record.ts < CURSOR_TITLE_REPAIR_MS,
+    resolve: (sessionId) => cursorChatTitle(sessionId)
+  },
+  toolDetail: {},
+  blobAgentFields: { agent: "cursor" }
+};
 function unknownAgentAdapter(kind) {
   return {
     kind,
@@ -2780,6 +2888,8 @@ function adapterFor(agent) {
       return codexAdapter;
     case "opencode":
       return opencodeAdapter;
+    case "cursor":
+      return cursorAdapter;
     case "claude":
       return claudeAdapter;
     default:
@@ -2936,6 +3046,183 @@ async function repairNotifyWiring(deps = {}) {
   }
 }
 
+// src/core/session-state.ts
+var SESSION_STATE_STALE_MS = 86400000;
+var STATE_HOLD_MAX_AGE_MS = 600000;
+var CC_STATUS_MAX_AGE_MS = 600000;
+var CC_STATUS_FUTURE_SKEW_MS = 5000;
+var CC_PROC_START_TOLERANCE_MS = 5000;
+var CC_IDLE_DONE_GRACE_MS = 3000;
+var MONTHS = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
+function parseCcProcStart(value) {
+  if (typeof value !== "string")
+    return;
+  const m = /^\s*[A-Za-z]{3}\s+([A-Za-z]{3})\s+(\d{1,2})\s+(\d{2}):(\d{2}):(\d{2})\s+(\d{4})\s*$/.exec(value);
+  if (!m)
+    return;
+  const month = MONTHS.indexOf(m[1].toLowerCase());
+  if (month < 0)
+    return;
+  const day = Number(m[2]);
+  const utc = Date.UTC(Number(m[6]), month, day, Number(m[3]), Number(m[4]), Number(m[5]));
+  if (!Number.isFinite(utc))
+    return;
+  return new Date(utc).getUTCDate() === day ? utc : undefined;
+}
+function parseCcSessionFile(raw) {
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed))
+    return null;
+  const f = parsed;
+  if (typeof f.pid !== "number" || !Number.isFinite(f.pid))
+    return null;
+  if (typeof f.sessionId !== "string" || f.sessionId.length === 0)
+    return null;
+  const str = (key) => typeof f[key] === "string" && f[key].length > 0 ? f[key] : undefined;
+  const num = (key) => typeof f[key] === "number" && Number.isFinite(f[key]) ? f[key] : undefined;
+  return {
+    pid: f.pid,
+    sessionId: f.sessionId,
+    ...str("cwd") ? { cwd: str("cwd") } : {},
+    ...num("startedAt") !== undefined ? { startedAt: num("startedAt") } : {},
+    ...str("procStart") ? { procStart: str("procStart") } : {},
+    ...str("version") ? { version: str("version") } : {},
+    ...str("kind") ? { kind: str("kind") } : {},
+    ...str("entrypoint") ? { entrypoint: str("entrypoint") } : {},
+    ...str("name") ? { name: str("name") } : {},
+    ...str("nameSource") ? { nameSource: str("nameSource") } : {},
+    ...str("status") ? { status: str("status") } : {},
+    ...num("updatedAt") !== undefined ? { updatedAt: num("updatedAt") } : {},
+    ...num("statusUpdatedAt") !== undefined ? { statusUpdatedAt: num("statusUpdatedAt") } : {}
+  };
+}
+function ccOpinion(file, join, now) {
+  if (!file)
+    return null;
+  if (typeof join.pid !== "number" || !Number.isFinite(join.pid) || file.pid !== join.pid)
+    return null;
+  if (file.sessionId !== join.sessionId)
+    return null;
+  const probed = join.procStartedAt;
+  if (typeof probed !== "number" || !Number.isFinite(probed))
+    return null;
+  const claimed = typeof file.startedAt === "number" && Number.isFinite(file.startedAt) ? file.startedAt : parseCcProcStart(file.procStart);
+  if (typeof claimed !== "number")
+    return null;
+  if (Math.abs(claimed - probed) > CC_PROC_START_TOLERANCE_MS)
+    return null;
+  if (file.status !== "busy" && file.status !== "idle")
+    return null;
+  const at = file.statusUpdatedAt;
+  if (typeof at !== "number" || !Number.isFinite(at))
+    return null;
+  if (now - at >= CC_STATUS_MAX_AGE_MS)
+    return null;
+  if (at - now > CC_STATUS_FUTURE_SKEW_MS)
+    return null;
+  return {
+    status: file.status,
+    statusUpdatedAt: at,
+    ...file.name && file.nameSource === "derived" ? { name: file.name } : {}
+  };
+}
+var finite = (value) => typeof value === "number" && Number.isFinite(value);
+var filled = (value) => typeof value === "string" && value.length > 0;
+function buildStatePlaintext(record, status, at, titleFallback) {
+  const agent = record.agent ?? "claude";
+  const branch = sessionBranch(record);
+  const base = {
+    status,
+    title: filled(record.title) ? record.title : filled(titleFallback) ? titleFallback : "",
+    machine: typeof record.machine === "string" ? record.machine : "",
+    label: typeof record.label === "string" ? record.label : "",
+    ...adapterFor(agent).blobAgentFields,
+    ...finite(record.turnStartedAt) ? { turnStartedAt: record.turnStartedAt } : {},
+    ...filled(record.model) ? { model: record.model } : {},
+    at: Math.floor(at / 1000),
+    ...filled(record.folderKey) ? { folderKey: record.folderKey } : {},
+    ...branch ? { branch } : {}
+  };
+  const dbg = agent === "codex" ? formatPlanPickerDebug({
+    event: status === "done" ? "done" : "working",
+    classifier: status === "done" ? "done" : "resolved",
+    marker: "0",
+    by: "wd"
+  }) : undefined;
+  return appendFittedPlanAndDebug(base, adapterFor(agent).ambientPlan ? record.planFull : undefined, dbg);
+}
+function stateHoldLive(hold, holdPidAlive, now) {
+  if (!hold || !filled(hold.blob))
+    return false;
+  if (!finite(hold.at))
+    return false;
+  if (now - hold.at > STATE_HOLD_MAX_AGE_MS)
+    return false;
+  if (!finite(hold.pid) || holdPidAlive !== true)
+    return false;
+  return true;
+}
+function computeSessionState(input) {
+  const { sessionId, record, pairingId, hold, pidAlive, holdPidAlive, cc, ccProcStartedAt, correctives, now } = input;
+  if (record === null) {
+    return { state: "ended", terminal: true, ts: now, why: "reap", blob: { kind: "last" }, agent: "claude" };
+  }
+  if (!filled(record.blob))
+    return null;
+  if (pairingId === undefined || record.pairingId !== pairingId)
+    return null;
+  const agent = record.agent ?? "claude";
+  const ts = finite(record.ts) ? record.ts : now;
+  const startedAt = finite(record.sessionStartedAt) ? { startedAt: record.sessionStartedAt } : {};
+  const sealed = { kind: "sealed", value: record.blob };
+  const asking = record.attentionKind === "userInput" ? { attentionKind: "userInput" } : {};
+  const of = (state, why, blob, at, terminal = false) => ({ state, terminal, ts: at, why, blob, agent, ...startedAt });
+  if (correctives?.ended === true)
+    return of("ended", "end", sealed, ts, true);
+  if (record.op === "end")
+    return of("ended", "end", sealed, ts, true);
+  if (finite(record.ts) && now - record.ts > SESSION_STATE_STALE_MS)
+    return of("ended", "stale", sealed, ts, true);
+  if (!pidAlive)
+    return of("ended", "reap", sealed, ts, true);
+  const ccUsable = agent === "claude" && record.provisional !== true;
+  const opinion = ccUsable ? ccOpinion(cc, { pid: record.pid, sessionId, procStartedAt: ccProcStartedAt }, now) : null;
+  const suffix = (base) => agent === "codex" ? `${base}/cx` : base;
+  const recordDone = correctives?.done === true || record.op === "done" || record.lastEvent === "done";
+  if (recordDone) {
+    const heldBack = opinion?.status === "busy" && opinion.statusUpdatedAt > ts;
+    if (!heldBack) {
+      return of("done", opinion?.status === "idle" ? "done+cc" : suffix("done"), { kind: "plain", value: buildStatePlaintext(record, "done", ts, opinion?.name) }, ts, false);
+    }
+  }
+  if (stateHoldLive(hold, holdPidAlive, now)) {
+    return {
+      state: "decisionPending",
+      terminal: false,
+      ts,
+      why: "hold",
+      blob: { kind: "sealed", value: hold.blob },
+      agent,
+      ...startedAt,
+      ...asking
+    };
+  }
+  if (!recordDone && opinion?.status === "idle" && record.prio !== 1 && record.lastEvent !== "needsAttention" && opinion.statusUpdatedAt > ts + CC_IDLE_DONE_GRACE_MS) {
+    return of("done", "done+cc", { kind: "plain", value: buildStatePlaintext(record, "done", opinion.statusUpdatedAt, opinion.name) }, ts, false);
+  }
+  if (record.prio === 1) {
+    const why = finite(record.attentionStalledAt) ? "attn/net" : "attn";
+    return { ...of("needsAttention", why, sealed, ts, false), ...asking };
+  }
+  const busy = opinion?.status === "busy" && opinion.statusUpdatedAt > ts;
+  return of("working", busy ? "work+cc" : suffix("work"), recordDone ? { kind: "plain", value: buildStatePlaintext(record, "working", opinion?.statusUpdatedAt ?? ts, opinion?.name) } : sealed, ts, false);
+}
+
 // src/core/hook.ts
 var TOOL_DETAIL = { ...claudeToolDetail, ...codexToolDetail };
 function sessionOrigin(input, ppid = process.ppid, command = pidCommand(ppid)) {
@@ -2956,19 +3243,77 @@ function detailForHook(hookName, toolName, toolInput) {
   }
   if (hookName === "PreToolUse")
     return toolName ? TOOL_DETAIL[toolName] : undefined;
-  if (hookName === "PostToolUse")
+  if (hookName === "PostToolUse" || hookName === "PostToolUseFailure")
     return "thinking";
   return;
 }
 function isPermissionNotification(i) {
   const type = typeof i.notification_type === "string" ? i.notification_type : "";
+  if (type.length > 0)
+    return type === "permission_prompt" || type === "worker_permission_prompt";
   const msg = (typeof i.message === "string" ? i.message : "").toLowerCase();
-  return type === "permission_prompt" || msg.includes("permission") || msg.includes("approve") || msg.includes("allow");
+  return msg.includes("permission") || msg.includes("approve") || msg.includes("allow");
+}
+var ATTENTION_NOTIFICATIONS = new Set(["elicitation_dialog", "elicitation_url_dialog", "agent_needs_input"]);
+function hasRunningBackgroundAgent(input) {
+  const tasks = input.background_tasks;
+  return Array.isArray(tasks) && tasks.some((t) => {
+    const task = t;
+    return typeof task === "object" && task !== null && task.type === "subagent" && (task.status === "running" || task.status === "pending");
+  });
+}
+var HOLD_YIELDING_EVENTS = new Set([
+  "PostToolUseFailure",
+  "PreCompact",
+  "PostCompact",
+  "Elicitation",
+  "ElicitationResult"
+]);
+function yieldsToLiveHold(hookName, input) {
+  if (HOLD_YIELDING_EVENTS.has(hookName))
+    return true;
+  if (hookName === "Stop")
+    return hasRunningBackgroundAgent(input);
+  if (hookName === "Notification")
+    return !isPermissionNotification(input);
+  return false;
+}
+async function sessionHoldIsLive(sessionsDir, sessionId, now = Date.now(), alive = pidAlive) {
+  const hold = await readDecisionHoldAt(sessionsDir, sessionId);
+  return stateHoldLive(hold, hold !== null && typeof hold.pid === "number" ? alive(hold.pid) : false, now);
 }
 var USER_BLOCKING_TOOLS = new Set(["AskUserQuestion", "ExitPlanMode", "request_user_input"]);
+var INTERRUPT_STOP_REASON = "Interrupted from Nomo";
+function interruptHookOutput(hookName) {
+  if (hookName === "PreToolUse") {
+    return JSON.stringify({
+      continue: false,
+      stopReason: INTERRUPT_STOP_REASON,
+      hookSpecificOutput: {
+        hookEventName: "PreToolUse",
+        permissionDecision: "deny",
+        permissionDecisionReason: INTERRUPT_STOP_REASON
+      }
+    });
+  }
+  if (hookName === "PostToolUse" || hookName === "PostToolUseFailure") {
+    return JSON.stringify({ continue: false, stopReason: INTERRUPT_STOP_REASON });
+  }
+  return null;
+}
+function clearsInterruptFlag(hookName, input = {}) {
+  if (hookName === "Stop")
+    return !hasRunningBackgroundAgent(input);
+  return hookName === "UserPromptSubmit" || hookName === "StopFailure" || hookName === "SessionEnd";
+}
+function interruptedEventInput(input) {
+  return { ...input, hook_event_name: "Stop" };
+}
 function planOp(hookName, input, sentDone) {
   switch (hookName) {
     case "SessionStart":
+      if (sentDone && input.source === "compact")
+        return null;
       return sentDone ? { op: "update", prio: 0, status: "working" } : { op: "start", prio: 0, status: "working" };
     case "PreToolUse": {
       const tool = typeof input.tool_name === "string" ? input.tool_name : "";
@@ -2977,13 +3322,24 @@ function planOp(hookName, input, sentDone) {
     case "UserPromptSubmit":
     case "PostToolUse":
       return { op: "update", prio: 0, status: "working" };
+    case "PostToolUseFailure":
+      return input.is_interrupt === true ? null : { op: "update", prio: 0, status: "working" };
     case "Notification":
-      if (!isPermissionNotification(input))
+      if (!isPermissionNotification(input) && !(typeof input.notification_type === "string" && ATTENTION_NOTIFICATIONS.has(input.notification_type)))
         return null;
       return { op: "update", prio: 1, status: "needsAttention" };
     case "PermissionRequest":
+    case "Elicitation":
       return { op: "update", prio: 1, status: "needsAttention" };
+    case "ElicitationResult":
+      return { op: "update", prio: 0, status: "working" };
+    case "PreCompact":
+    case "PostCompact":
+      return input.trigger === "manual" || sentDone ? null : { op: "update", prio: 0, status: "working" };
     case "Stop":
+      return hasRunningBackgroundAgent(input) ? { op: "update", prio: 0, status: "working" } : { op: "done", prio: 0, status: "done" };
+    case "StopFailure":
+    case "Interrupt":
       return { op: "done", prio: 0, status: "done" };
     case "SessionEnd":
       return { op: "end", prio: 0, status: "done" };
@@ -3019,7 +3375,7 @@ function buildBlob(input, machine, title, plan, agent = "claude", turnStartedAt,
   const { label, folderKey } = folder;
   const branch = sessionBranch(folder);
   const hookName = typeof input.hook_event_name === "string" ? input.hook_event_name : "";
-  const detail = detailOverride ?? detailForHook(hookName, typeof input.tool_name === "string" ? input.tool_name : undefined, input.tool_input);
+  const detail = detailOverride ?? (hookName === "Stop" && hasRunningBackgroundAgent(input) ? TOOL_DETAIL.Task : detailForHook(hookName, typeof input.tool_name === "string" ? input.tool_name : undefined, input.tool_input));
   const base = {
     status: plan.status,
     title: title ?? "",
@@ -3087,6 +3443,7 @@ async function trackSessionAt(sessionsDir, sessionId, op, prio, status, blob, ma
     if (op === "end") {
       await unlink2(path).catch(() => {});
       await unlink2(`${sessionsDir}/${decisionHoldFileName(sessionId)}`).catch(() => {});
+      await unlink2(`${sessionsDir}/${interruptFlagFileName(sessionId)}`).catch(() => {});
       return;
     }
     const recordedAt = Date.now();
@@ -3138,6 +3495,33 @@ async function markDoneDeliveredAt(sessionsDir, sessionId) {
 }
 async function markDoneDelivered(sessionId) {
   return markDoneDeliveredAt(SESSIONS_DIR, sessionId);
+}
+async function markUpdatePendingAt(sessionsDir, sessionId, blob) {
+  try {
+    const record = await readRecord(sessionId, sessionsDir);
+    if (!record || !blob || record.blob !== blob || record.op === "done" || record.updatePending === true)
+      return;
+    await atomicWrite(`${sessionsDir}/${sessionId}.json`, JSON.stringify({ ...record, updatePending: true }), 384);
+  } catch {}
+}
+async function traceSendFailure(event, failPath = SEND_FAIL_PATH, lastSendPath = LAST_SEND_PATH, trace = traceSession) {
+  try {
+    const stamp = async (path) => {
+      try {
+        return Number.parseInt((await readFile4(path, "utf8")).trim(), 10) || 0;
+      } catch {
+        return 0;
+      }
+    };
+    const streakStart = await stamp(failPath);
+    if (streakStart > 0 && streakStart > await stamp(lastSendPath))
+      return false;
+    await atomicWrite(failPath, String(Date.now()));
+    trace({ event: "post-failed", ...event });
+    return true;
+  } catch {
+    return false;
+  }
 }
 async function reconcileProvisional(config, hookPid) {
   try {
@@ -3226,6 +3610,8 @@ async function runHook(agent) {
   try {
     const [config, raw] = await Promise.all([loadConfig(), readStdin()]);
     const input = JSON.parse(raw);
+    if (agent === "claude" && cursorHostInvocation(input))
+      return;
     if (typeof input.session_id !== "string" || input.session_id.length === 0)
       return;
     if (agent === "claude" && (typeof input.turn_id === "string" && input.turn_id.length > 0 || typeof input.transcript_path === "string" && input.transcript_path.includes("/.codex/"))) {
@@ -3254,14 +3640,34 @@ async function runHook(agent) {
     if (!config) {
       const pending = await loadPendingConfig();
       if (pending) {
-        const machine2 = pending.machineName ?? hostname().replace(/\.local$/, "");
-        await stashPendingEvent(input, machine2, await readTitle(), Date.now(), PENDING_STASH_PATH, process.ppid, agent, await readModel());
+        const machine = pending.machineName ?? hostname().replace(/\.local$/, "");
+        await stashPendingEvent(input, machine, await readTitle(), Date.now(), PENDING_STASH_PATH, process.ppid, agent, await readModel());
       }
       return;
     }
     const machine = config.machineName ?? hostname().replace(/\.local$/, "");
     const reportedSessionId = input.session_id;
     const hookName = typeof input.hook_event_name === "string" ? input.hook_event_name : "";
+    let interrupted = false;
+    if (adapter2.interrupt === "hook-flag") {
+      if (clearsInterruptFlag(hookName, input)) {
+        await clearInterruptFlagAt(SESSIONS_DIR, reportedSessionId);
+      } else {
+        const line = interruptHookOutput(hookName);
+        if (line !== null && await interruptFlagSetAt(SESSIONS_DIR, reportedSessionId, Date.now())) {
+          interrupted = true;
+          await new Promise((resolve) => {
+            process.stdout.on("error", () => resolve());
+            try {
+              process.stdout.write(`${line}
+`, () => resolve());
+            } catch {
+              resolve();
+            }
+          });
+        }
+      }
+    }
     const sessionStartSource = typeof input.source === "string" ? input.source : "";
     const hookPid = process.ppid;
     const hookCommand = pidCommand(hookPid);
@@ -3395,15 +3801,21 @@ async function runHook(agent) {
     const turnStartedAt = isTurnOpener ? Math.floor(Date.now() / 1000) : cachedTurn;
     const awaitingPrompt = hookName === "SessionStart" && !reusedForkPredecessor && (existingRecord ? sentDone || existingRecord.awaitingPrompt === true : sessionStartSource !== "compact");
     const turnId = typeof input.turn_id === "string" && input.turn_id.length > 0 ? input.turn_id : undefined;
-    let plan = planOp(hookName, input, sentDone);
+    if (interrupted)
+      eventInput = interruptedEventInput(eventInput);
+    let plan = planOp(interrupted ? "Stop" : hookName, input, sentDone);
     if (!plan)
       return;
+    if (!interrupted && yieldsToLiveHold(hookName, input) && await sessionHoldIsLive(SESSIONS_DIR, sessionId)) {
+      traceSession({ event: "hold-yield", sessionId, agent, hook_event_name: hookName });
+      return;
+    }
     let pendingPlanPicker = false;
     let planPickerVerificationPending = false;
     let attentionKind;
     let proposedPlan;
     let pickerClassifier = plan.op === "done" ? "none" : plan.status;
-    if (plan.op === "done" && adapter2.completedTurnWaitState) {
+    if (hookName === "Stop" && plan.op === "done" && adapter2.completedTurnWaitState) {
       const evidence = adapter2.completedTurnWaitEvidence ? await adapter2.completedTurnWaitEvidence({ pid: hookPid, transcriptPath }) : { state: await adapter2.completedTurnWaitState({ pid: hookPid, transcriptPath }) };
       const wait = evidence.state;
       pickerClassifier = wait;
@@ -3470,18 +3882,34 @@ async function runHook(agent) {
     ensureWatchdog();
     if (agent === "codex")
       await reconcileProvisional(config, hookPid);
-    const res = await fetch(`${config.url}/v1/cc/event`, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "x-cc-pairing": config.pairingId,
-        "x-cc-auth": config.pcSecret,
-        "x-cc-version": PLUGIN_VERSION,
-        "x-cc-approvals": await localApprovalsState()
-      },
-      body: JSON.stringify(envelope),
-      signal: AbortSignal.timeout(2000)
-    });
+    const failure = { sessionId, agent, hook_event_name: hookName, op: plan.op };
+    const postStarted = Date.now();
+    let res;
+    try {
+      res = await fetch(`${config.url}/v1/cc/event`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-cc-pairing": config.pairingId,
+          "x-cc-auth": config.pcSecret,
+          "x-cc-version": PLUGIN_VERSION,
+          "x-cc-approvals": await localApprovalsState()
+        },
+        body: JSON.stringify(envelope),
+        signal: AbortSignal.timeout(2000)
+      });
+    } catch (e) {
+      if (plan.op !== "done" && plan.op !== "end")
+        await markUpdatePendingAt(SESSIONS_DIR, sessionId, envelope.blob);
+      await traceSendFailure({
+        ...failure,
+        ms: Date.now() - postStarted,
+        error: e?.name === "TimeoutError" ? "timeout" : "network"
+      });
+      return;
+    }
+    if (!res.ok)
+      await traceSendFailure({ ...failure, status: res.status, ms: Date.now() - postStarted });
     if (res.ok) {
       await atomicWrite(LAST_SEND_PATH, String(Date.now()));
       await resetGoneStrikes();
@@ -3637,7 +4065,7 @@ if (__require.main == __require.module) {
   process.exit(0);
 }
 export {
-  synthStopInput,
+  notifyFallbackTitle,
   runNotify,
-  notifyFallbackTitle
+  synthStopInput
 };

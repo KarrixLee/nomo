@@ -6,8 +6,10 @@ import { readdir as readdir2, readFile as readFile3, stat as stat3 } from "node:
 import { join as join3 } from "node:path";
 
 // src/core/adapter.ts
-import { execFile as execFile2 } from "node:child_process";
+import { execFile as execFile2, execFileSync as execFileSync2 } from "node:child_process";
+import { existsSync as existsSync2 } from "node:fs";
 import { readdir, readFile as readFile2, stat as stat2 } from "node:fs/promises";
+import { devNull } from "node:os";
 import { promisify as promisify2 } from "node:util";
 import { basename as basename2, join as join2 } from "node:path";
 
@@ -104,7 +106,7 @@ async function sha256Hex(s) {
 }
 
 // src/core/shared.ts
-var PLUGIN_VERSION = "2.2.2";
+var PLUGIN_VERSION = "2.3.0";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -164,6 +166,7 @@ function tracePlanPickerDecision(sessionId, decision, path) {
 var SESSIONS_DIR = `${CC_DIR}/sessions`;
 var WATCHDOG_PID_PATH = `${CC_DIR}/watchdog.pid`;
 var LAST_SEND_PATH = `${CC_DIR}/last-send`;
+var SEND_FAIL_PATH = `${CC_DIR}/last-send-fail`;
 var GONE_STRIKES_PATH = `${CC_DIR}/gone-strikes`;
 var GONE_STRIKE_LIMIT = 2;
 var NO_HOLD_PATH = `${CC_DIR}/no-hold`;
@@ -272,6 +275,11 @@ function codexHome() {
   const env = process.env.CODEX_HOME;
   return env && env.length > 0 ? env : `${process.env.HOME}/.codex`;
 }
+function cursorHome() {
+  const env = process.env.CURSOR_CONFIG_DIR;
+  return env && env.length > 0 ? env : `${process.env.HOME}/.cursor`;
+}
+var CURSOR_HOOK_MARKER = "cursor-status.mjs";
 var CODEX_HOOK_MARKER = "codex-status.mjs";
 function codexAppServerSocketPath() {
   return `${codexHome()}/app-server-control/app-server-control.sock`;
@@ -284,7 +292,7 @@ async function unixSocketAccepts(socketPath, timeoutMs) {
   } catch {
     return false;
   }
-  return await new Promise((resolve2) => {
+  return await new Promise((resolve) => {
     let settled = false;
     let socket;
     const timer = setTimeout(() => done(false), timeoutMs);
@@ -297,7 +305,7 @@ async function unixSocketAccepts(socketPath, timeoutMs) {
       try {
         socket?.destroy();
       } catch {}
-      resolve2(accepted);
+      resolve(accepted);
     }
     try {
       socket = createConnection({ path: socketPath });
@@ -330,20 +338,20 @@ var CODEX_DAEMON_SOCKET_POLL_MS = 250;
 async function startCodexAppServerDaemon(deps = {}) {
   const trace = deps.trace ?? ((event) => traceSession(event));
   const probe = deps.probe ?? (() => codexAppServerSocketAvailable());
-  const sleep = deps.sleep ?? ((ms) => new Promise((resolve2) => setTimeout(resolve2, ms)));
+  const sleep = deps.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
   const command = deps.codexPath ?? "codex";
   const timeoutMs = deps.timeoutMs ?? CODEX_DAEMON_START_TIMEOUT_MS;
   const socketWaitMs = deps.socketWaitMs ?? CODEX_DAEMON_SOCKET_WAIT_MS;
   const spawnFn = deps.spawnFn ?? ((cmd, args) => spawn(cmd, [...args], { stdio: "ignore" }));
   let exit;
   try {
-    exit = await new Promise((resolve2) => {
+    exit = await new Promise((resolve) => {
       let settled = false;
       const done = (value) => {
         if (settled)
           return;
         settled = true;
-        resolve2(value);
+        resolve(value);
       };
       let child;
       try {
@@ -917,6 +925,27 @@ async function writeDecisionHold(sessionId, hold) {
 }
 async function clearDecisionHold(sessionId, pid, beforeUnlink, holdId) {
   return clearDecisionHoldAt(SESSIONS_DIR, sessionId, pid, beforeUnlink, holdId);
+}
+var INTERRUPT_FLAG_SUFFIX = ".interrupt";
+var INTERRUPT_FLAG_MAX_AGE_MS = 3600000;
+function interruptFlagFileName(sessionId) {
+  return `${sessionId}${INTERRUPT_FLAG_SUFFIX}`;
+}
+async function writeInterruptFlagAt(sessionsDir, sessionId, now) {
+  try {
+    await atomicWrite(`${sessionsDir}/${interruptFlagFileName(sessionId)}`, JSON.stringify({ at: now }), 384);
+  } catch {}
+}
+async function interruptFlagSetAt(sessionsDir, sessionId, now) {
+  try {
+    const flag = JSON.parse(await readFile(`${sessionsDir}/${interruptFlagFileName(sessionId)}`, "utf8"));
+    return typeof flag.at === "number" && now - flag.at <= INTERRUPT_FLAG_MAX_AGE_MS;
+  } catch {
+    return false;
+  }
+}
+async function clearInterruptFlagAt(sessionsDir, sessionId) {
+  await unlink(`${sessionsDir}/${interruptFlagFileName(sessionId)}`).catch(() => {});
 }
 async function settleDecisionHoldRecord(sessionId, patch) {
   return settleDecisionHoldRecordAt(SESSIONS_DIR, sessionId, patch);
@@ -1714,7 +1743,7 @@ async function codexSessionModel(input, prefix, transcriptPath, home = codexHome
     return;
   }
 }
-var INTERRUPT_MARKER = "interrupted by user";
+var INTERRUPT_MARKER = "[Request interrupted by user";
 var CODEX_TURN_EVENTS = new Set(["task_started", "task_complete", "turn_aborted"]);
 var CODEX_ABORT_EVENT = "turn_aborted";
 function lastTurnLine(text) {
@@ -1739,7 +1768,23 @@ function lastTurnLine(text) {
   return null;
 }
 function hasInterruptMarker(line) {
-  return line.includes(INTERRUPT_MARKER);
+  let row;
+  try {
+    row = JSON.parse(line);
+  } catch {
+    return false;
+  }
+  if (typeof row !== "object" || row === null)
+    return false;
+  if (row.type !== "user")
+    return false;
+  const message = row.message;
+  const content = typeof message === "object" && message !== null ? message.content : message;
+  const texts = Array.isArray(content) ? content.map((part) => {
+    const p = part;
+    return p !== null && typeof p === "object" && p.type === "text" ? p.text : undefined;
+  }) : [content];
+  return texts.some((t) => typeof t === "string" && t.trimStart().startsWith(INTERRUPT_MARKER));
 }
 function codexLastTurnEvent(text) {
   const lines = text.split(`
@@ -1817,11 +1862,11 @@ function codexProposedPlanMarkdown(text) {
   if (typeof text !== "string")
     return;
   const trimmed = text.trim();
-  const open2 = "<proposed_plan>";
+  const open = "<proposed_plan>";
   const close = "</proposed_plan>";
-  if (!trimmed.startsWith(open2) || !trimmed.endsWith(close))
+  if (!trimmed.startsWith(open) || !trimmed.endsWith(close))
     return;
-  return trimmed.slice(open2.length, -close.length).trim();
+  return trimmed.slice(open.length, -close.length).trim();
 }
 function codexFinalProposedPlan(row) {
   const payload = row.payload;
@@ -2013,6 +2058,9 @@ var CLAUDE_DESKTOP_BUNDLED_PATH_PARTS = [
   "/claude.app/Contents/MacOS/claude"
 ];
 var CLAUDE_DESKTOP_LAUNCHER = "Claude.app/Contents/Helpers/disclaimer";
+function cursorHostInvocation(input, env = process.env) {
+  return env.CURSOR_VERSION !== undefined || typeof input === "object" && input !== null && "cursor_version" in input;
+}
 function claudeDesktopInvocation(selfArgs, ancestorArgs, entrypoint) {
   if (entrypoint === CLAUDE_DESKTOP_ENTRYPOINT)
     return true;
@@ -2037,8 +2085,13 @@ function claudeForkResumePredecessor(command) {
 }
 function claudeHeadlessInvocation(selfArgs, ancestorArgs, entrypoint) {
   const chain = [selfArgs, ...ancestorArgs].filter((s) => typeof s === "string" && s.length > 0);
-  if (chain.some((args) => CLAUDE_SELF_DAEMON_MARKERS.some((m) => args.includes(m))))
-    return true;
+  const isRing = (args) => CLAUDE_SELF_DAEMON_MARKERS.some((m) => args.includes(m));
+  const ringTop = chain.length - 1 - [...chain].reverse().findIndex(isRing);
+  if (ringTop < chain.length) {
+    const owner = chain[ringTop + 1]?.trim().split(/\s+/) ?? [];
+    if (basename2(owner[0] ?? "") !== "claude" || owner.some((tok) => CLAUDE_HEADLESS_ARG_TOKENS.has(tok)))
+      return true;
+  }
   const tokens = typeof selfArgs === "string" ? selfArgs.trim().split(/\s+/) : [];
   if (tokens.includes("--fork-session") && tokens.includes("--reply-on-resume"))
     return true;
@@ -2652,11 +2705,13 @@ var claudeAdapter = {
   hooksNotFiringHint: "  run /plugin in Claude Code, check the nomo plugin is enabled, then restart Claude Code",
   toolDetail: claudeToolDetail,
   blobAgentFields: {},
-  locateTuiPid: (ctx, deps) => claudeLocateTuiPid(ctx, deps)
+  locateTuiPid: (ctx, deps) => claudeLocateTuiPid(ctx, deps),
+  interrupt: "hook-flag"
 };
 var codexAdapter = {
   kind: "codex",
   answerExtras: "other",
+  titleRepair: { due: (record) => typeof record.title !== "string" || record.title.length === 0 },
   async title({ sessionId, prefix, input }) {
     const indexTitle = await codexIndexTitle(sessionId);
     if (indexTitle)
@@ -2709,7 +2764,8 @@ var codexAdapter = {
   blobAgentFields: { agent: "codex" },
   discoverLive: (known) => codexDiscoverLive(known),
   pidTurnActive: (pid) => codexPidTurnActive(pid),
-  locateTuiPid: (ctx, deps) => codexLocateTuiPid(ctx, deps)
+  locateTuiPid: (ctx, deps) => codexLocateTuiPid(ctx, deps),
+  interrupt: "app-server"
 };
 async function opencodeLocateTuiPid(ctx, deps = {}) {
   try {
@@ -2760,6 +2816,58 @@ var opencodeAdapter = {
   ambientPlan: true,
   locateTuiPid: (ctx, deps) => opencodeLocateTuiPid(ctx, deps)
 };
+function cursorModel(input) {
+  for (const key of ["model", "model_id"]) {
+    const v = input[key];
+    if (typeof v === "string" && v.trim().length > 0)
+      return v.trim().slice(0, 80);
+  }
+  return;
+}
+function cursorStateDb() {
+  const home = process.env.HOME ?? "";
+  const data = process.platform === "darwin" ? `${home}/Library/Application Support` : process.platform === "win32" ? process.env.APPDATA ?? "" : process.env.XDG_CONFIG_HOME || `${home}/.config`;
+  return `${data}/Cursor/User/globalStorage/state.vscdb`;
+}
+var CURSOR_TITLE_REPAIR_MS = 120000;
+var CURSOR_TITLE_TIMEOUT_MS = 300;
+function cursorChatTitle(sessionId, db = cursorStateDb(), env = process.env) {
+  if (!/^[A-Za-z0-9_-]{1,128}$/.test(sessionId))
+    return;
+  try {
+    const bin = process.platform === "darwin" && existsSync2("/usr/bin/sqlite3") ? "/usr/bin/sqlite3" : "sqlite3";
+    const out = execFileSync2(bin, [
+      "-init",
+      devNull,
+      "-batch",
+      "-noheader",
+      "-list",
+      "-readonly",
+      db,
+      "select case when json_type(cast(value as text),'$.name')='text' then json_extract(cast(value as text),'$.name') end" + ` from cursorDiskKV where key='composerData:${sessionId}'`
+    ], { timeout: CURSOR_TITLE_TIMEOUT_MS, encoding: "utf8", maxBuffer: 65536, stdio: ["ignore", "pipe", "ignore"], env });
+    const cleaned = out.replace(/\s+/g, " ").trim();
+    return cleaned ? truncateOnWord(cleaned) : undefined;
+  } catch {
+    return;
+  }
+}
+var cursorAdapter = {
+  kind: "cursor",
+  title: async ({ input }) => typeof input.prompt === "string" ? displayTitleFromUserText(input.prompt) : undefined,
+  model: async ({ input }) => cursorModel(input),
+  detectInterrupt: () => false,
+  sessionsDir: () => `${cursorHome()}/projects`,
+  sessionMatch: (name) => name.endsWith(".jsonl"),
+  hookStampPath: () => lastHookPath("cursor"),
+  hooksNotFiringHint: "  run `bunx nomo-ai --cursor` again, then restart Cursor (Settings → Hooks shows what it loaded)",
+  titleRepair: {
+    due: (record, now) => record.lastEvent === "done" && typeof record.ts === "number" && now - record.ts < CURSOR_TITLE_REPAIR_MS,
+    resolve: (sessionId) => cursorChatTitle(sessionId)
+  },
+  toolDetail: {},
+  blobAgentFields: { agent: "cursor" }
+};
 function unknownAgentAdapter(kind) {
   return {
     kind,
@@ -2781,6 +2889,8 @@ function adapterFor(agent) {
       return codexAdapter;
     case "opencode":
       return opencodeAdapter;
+    case "cursor":
+      return cursorAdapter;
     case "claude":
       return claudeAdapter;
     default:
@@ -2790,13 +2900,14 @@ function adapterFor(agent) {
 var allAdapters = [claudeAdapter, codexAdapter];
 
 // src/entries/status-cmd.ts
-var CODEX_PLUGIN_HOOK_COUNT = 7;
+var CODEX_PLUGIN_HOOK_COUNT = 10;
 var AGENT_UI = {
   claude: { name: "Claude Code", pair: "/nomo-cc:pair", approvalsOn: "/nomo-cc:approvals on", status: "/nomo-cc:status" },
   codex: { name: "Codex", pair: "$nomo-pair", approvalsOn: "$nomo-approvals on", status: "$nomo-status" },
-  opencode: { name: "OpenCode", pair: "/nomo-pair", approvalsOn: "/nomo-approvals on", status: "/nomo-status" }
+  opencode: { name: "OpenCode", pair: "/nomo-pair", approvalsOn: "/nomo-approvals on", status: "/nomo-status" },
+  cursor: { name: "Cursor", pair: "/nomo-pair", approvalsOn: "/nomo-cc:approvals on (in Claude Code — Cursor sessions are read-only)", status: "/nomo-status" }
 };
-var AGENT_ORDER = ["claude", "codex", "opencode"];
+var AGENT_ORDER = ["claude", "codex", "opencode", "cursor"];
 var VALUE_COL = 14;
 var row = (label, value) => `${label.padEnd(VALUE_COL)}${value}`;
 var subRow = (label, value) => `  ${label.padEnd(VALUE_COL - 2)}${value}`;
@@ -3012,6 +3123,9 @@ async function statusCmd(deps = {}) {
   const lastHookClaudePath = deps.lastHookClaudePath ?? claudeAdapter.hookStampPath();
   const lastHookOpencodePath = deps.lastHookOpencodePath ?? opencodeAdapter.hookStampPath();
   const opencodeStubs = deps.opencodeStubPaths ?? opencodeStubPaths();
+  const cursorHooksPath = deps.cursorHooksPath ?? `${cursorHome()}/hooks.json`;
+  const cursorProjectsDir = deps.cursorProjectsDir ?? cursorAdapter.sessionsDir();
+  const lastHookCursorPath = deps.lastHookCursorPath ?? cursorAdapter.hookStampPath();
   const noHoldPath = deps.noHoldPath ?? NO_HOLD_PATH;
   const isAlive = deps.isAlive ?? pidAlive;
   const now = deps.now ?? Date.now;
@@ -3066,7 +3180,7 @@ async function statusCmd(deps = {}) {
       print(cont(`→ run ${ui.approvalsOn}`));
     }
   }
-  const perAgent = { claude: 0, codex: 0, opencode: 0 };
+  const perAgent = { claude: 0, codex: 0, opencode: 0, cursor: 0 };
   let totalSessions = 0;
   try {
     for (const name of await readdir2(sessionsDir)) {
@@ -3228,7 +3342,25 @@ async function statusCmd(deps = {}) {
     detail: quiet ? [["", "plugins load once at OpenCode start — restart it if sessions aren't reaching your phone"]] : [],
     problems: opencodeProblems
   };
-  const reports = { claude: claudeReport, codex: codexReport, opencode: opencodeReport };
+  const cursorInstalled = (await readFile3(cursorHooksPath, "utf8").catch(() => "")).includes(CURSOR_HOOK_MARKER);
+  const cursorHooks = await hooksRow("cursor", {
+    installed: cursorInstalled,
+    sessionsDir: cursorProjectsDir,
+    match: cursorAdapter.sessionMatch,
+    stampPath: lastHookCursorPath,
+    hint: cursorAdapter.hooksNotFiringHint
+  });
+  const cursorReport = {
+    kind: "cursor",
+    present: cursorInstalled || perAgent.cursor > 0 || cursorHooks.stamp > 0,
+    hooksLabel: "Hooks",
+    hooks: cursorHooks.value,
+    sessions: sessionText(perAgent.cursor),
+    sessionCount: perAgent.cursor,
+    detail: [["Mode", "read-only — sessions show on your phone; approvals stay in Cursor"]],
+    problems: cursorHooks.problem ? [cursorHooks.problem] : []
+  };
+  const reports = { claude: claudeReport, codex: codexReport, opencode: opencodeReport, cursor: cursorReport };
   if (audience) {
     renderOwn(reports[audience], `${AGENT_UI[audience].name} — you are here`, print);
     const others = AGENT_ORDER.filter((k) => k !== audience && reports[k].present);
@@ -3246,25 +3378,25 @@ async function statusCmd(deps = {}) {
 }
 function parseAudience(argv) {
   for (const arg of argv) {
-    if (arg === "claude" || arg === "codex" || arg === "opencode")
+    if (arg === "claude" || arg === "codex" || arg === "opencode" || arg === "cursor")
       return arg;
   }
   return;
 }
 if (__require.main == __require.module) {
   if (process.argv.includes("--check")) {
-    console.log("usage: status [claude|codex|opencode] [--check]  — show pairing, delivery and per-agent health");
+    console.log("usage: status [claude|codex|opencode|cursor] [--check]  — show pairing, delivery and per-agent health");
     process.exit(0);
   }
   process.exit(await statusCmd({ audience: parseAudience(process.argv.slice(2)) }));
 }
 export {
-  statusCmd,
-  renderLanTrace,
-  parseLanTrace,
-  parseCodexPluginState,
-  parseAudience,
-  humanAge,
+  countCodexHookEvents,
   hooksAppearStale,
-  countCodexHookEvents
+  humanAge,
+  parseAudience,
+  parseCodexPluginState,
+  parseLanTrace,
+  renderLanTrace,
+  statusCmd
 };

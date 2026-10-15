@@ -80,20 +80,25 @@ Agents (naming any one of these skips the prompt):
   --claude                Claude Code
   --codex                 OpenAI Codex
   --opencode              OpenCode
-  --all                   all three
+  --cursor                Cursor (desktop app + cursor-agent CLI)
+  --all                   all four (Cursor only if it is on this machine)
 
 Options:
   -y, --yes               no prompt; install every agent detected on this machine
   -n, --dry-run           print the commands that would run, run nothing
-      --ref <branch|tag>  OpenCode only: install from this ref of the repo
-                          instead of its default branch. Claude Code and Codex
+      --ref <branch|tag>  OpenCode and Cursor only: install from this ref of the
+                          repo instead of its default branch. Claude Code and Codex
                           install through their own marketplaces, which read the
                           default branch and take no ref — --ref cannot pin them.
   -h, --help              this
   -v, --version           print the version
 
 Nothing here pairs your phone — that stays a deliberate step you run from inside the
-agent afterwards (/nomo-cc:pair, $nomo-pair, /nomo-pair).`;
+agent afterwards (/nomo-cc:pair, $nomo-pair, /nomo-pair).
+
+Cursor is the one agent whose config file this writes into directly (hooks.json, merged —
+other tools' entries are left alone). Undo it with:
+  node ~/.nomo/plugin/scripts/cursor-install.mjs --uninstall`;
 
 // ── plumbing ─────────────────────────────────────────────────────────────────────────────────────
 
@@ -167,6 +172,11 @@ const interactive = () => Boolean(process.stdin.isTTY && process.stdout.isTTY);
  *  ~/.nomo simply takes the install path below — which pulls, and thereby installs this file for next
  *  time. Nothing to migrate. */
 const UPDATE_ENTRY = join(CHECKOUT, "plugin", "dist", "opencode-update.mjs");
+
+/** Cursor's installer inside the checkout, and Cursor's config dir (`$CURSOR_CONFIG_DIR` is the CLI's
+ *  own documented override — the installer honours the same variable). */
+const CURSOR_SCRIPT = join(CHECKOUT, "plugin", "scripts", "cursor-install.mjs");
+const cursorDir = () => process.env.CURSOR_CONFIG_DIR || join(homedir(), ".cursor");
 
 /** Is Nomo already installed for this host? Answered from the host's OWN plugin cache
  *  (`<cache>/<marketplace>/<plugin>/`): the MARKETPLACE directory name is whatever the user called it,
@@ -249,7 +259,91 @@ function showUpdate(lines) {
   return null;
 }
 
-// ── the three agents ─────────────────────────────────────────────────────────────────────────────
+/** Clone ~/.nomo, or bring an existing one up to date (or onto --ref). Shared by the two agents that
+ *  install from a checkout we own rather than through a host marketplace — OpenCode and Cursor — so
+ *  selecting both pulls twice, and the second pull is a no-op. Returns a failure, or null.
+ *  @param {string} label @param {string} script the installer under plugin/scripts/, for the hints */
+function ensureCheckout(label, script) {
+  if (!onPath("git")) {
+    return { error: "`git` is not on PATH", hint: `${label} installs from a checkout; install git and re-run.` };
+  }
+  if (existsSync(join(CHECKOUT, ".git"))) {
+    // Somebody else's ~/.nomo would get a `git pull` aimed at it. Prove it is ours first.
+    const remote = git("remote", "get-url", "origin");
+    if (!isOurCheckout(remote)) {
+      return {
+        error: `${CHECKOUT} is a git checkout of something else (origin: ${remote || "?"})`,
+        hint: `Move it aside, then re-run. Or install from a checkout you already have:\n    <checkout>/plugin/scripts/${script}`,
+      };
+    }
+    // Which ref is it on? A branch checkout fast-forwards; a --ref checkout is deliberately
+    // DETACHED and cannot. Confusing the two is how `git pull --ff-only` on a tag produces the
+    // unreadable git error this flag exists to avoid.
+    const branch = git("symbolic-ref", "--short", "-q", "HEAD");
+    const at = branch || `detached at ${git("describe", "--tags", "--always") || "?"}`;
+    if (REF) {
+      // Pinning is one path for a branch AND a tag: fetch exactly that ref, detach onto it. No
+      // local branch to fast-forward means no --ff-only, so the tag case cannot fail weirdly, and
+      // a re-run is idempotent — it lands on whatever origin says that ref is right now.
+      say(`  ${dim(`${CHECKOUT} already exists (${at}) — pinning to ${REF}`)}`);
+      const fail =
+        run("git", ["-C", CHECKOUT, "fetch", "--depth", "1", "origin", REF]) ||
+        run("git", ["-C", CHECKOUT, "checkout", "--detach", "FETCH_HEAD"]);
+      if (fail) {
+        return {
+          error: fail,
+          hint: `Does \`${REF}\` exist in ${REPO}? Otherwise it is local changes in ${CHECKOUT} —\n` +
+            `check \`git -C ${CHECKOUT} status\`, or move it aside and re-run.`,
+        };
+      }
+    } else if (!branch) {
+      // Refusing beats guessing: silently fast-forwarding a pin back onto the default branch
+      // would undo a deliberate --ref with no way to notice.
+      return {
+        error: `${CHECKOUT} is ${at} — pinned by an earlier --ref run`,
+        hint: "`git pull --ff-only` cannot update a detached HEAD. Re-run with --ref <branch-or-tag>\n" +
+          `to move the pin, or delete ${CHECKOUT} to go back to the default branch.`,
+      };
+    } else {
+      say(`  ${dim(`${CHECKOUT} already exists (${at}) — updating`)}`);
+      const fail = run("git", ["-C", CHECKOUT, "pull", "--ff-only"]);
+      if (fail) {
+        return {
+          error: fail,
+          hint: `Local commits or a dirty tree in ${CHECKOUT}? Sort it out there, then re-run.`,
+        };
+      }
+    }
+  } else if (existsSync(CHECKOUT)) {
+    return {
+      error: `${CHECKOUT} exists but is not a git checkout`,
+      hint: `Move it aside and re-run, or run the installer from a checkout you already have:\n    <checkout>/plugin/scripts/${script}`,
+    };
+  } else {
+    // `--branch` takes a tag as happily as a branch. A clone that fails removes the directory it
+    // made, so a bad ref leaves nothing half-written behind.
+    //
+    // The detach afterwards is load-bearing, not cosmetic: DETACHED IS HOW A PIN IS RECOGNISED
+    // on a later run. A tag clone detaches on its own but a branch clone does not, and an
+    // attached feature branch is indistinguishable from the default branch — a plain `bunx
+    // nomo-ai` months later would fast-forward it and silently keep installing from a branch
+    // nobody asked for. Detaching both makes the refusal above catch every pin.
+    const fail =
+      run("git", ["clone", "--depth", "1", ...(REF ? ["--branch", REF] : []), CLONE_URL, CHECKOUT]) ||
+      (REF ? run("git", ["-C", CHECKOUT, "checkout", "--detach", "HEAD"]) : null);
+    if (fail) {
+      return {
+        error: fail,
+        hint: REF
+          ? `Check network access to github.com, and that \`${REF}\` exists in ${REPO}.`
+          : "Check network access to github.com and re-run.",
+      };
+    }
+  }
+  return null;
+}
+
+// ── the four agents ───────────────────────────────────────────────────────────────────────────────
 //
 // `detect` is "is this agent on this machine at all" (binary or config dir — a user who has run the
 // agent once has the dir even if the binary lives behind a shell alias). `install` is what actually
@@ -352,83 +446,9 @@ const AGENTS = [
           ? { error: fail, hint: `The updater prints what it refused to do and the command to run by hand.\n    git -C ${CHECKOUT} status` }
           : null;
       }
-      if (!onPath("git")) {
-        return { error: "`git` is not on PATH", hint: "OpenCode installs from a checkout; install git and re-run." };
-      }
       const script = join(CHECKOUT, "plugin", "scripts", "opencode-install.sh");
-      if (existsSync(join(CHECKOUT, ".git"))) {
-        // Somebody else's ~/.nomo would get a `git pull` aimed at it. Prove it is ours first.
-        const remote = git("remote", "get-url", "origin");
-        if (!isOurCheckout(remote)) {
-          return {
-            error: `${CHECKOUT} is a git checkout of something else (origin: ${remote || "?"})`,
-            hint: `Move it aside, then re-run. Or install from a checkout you already have:\n    <checkout>/plugin/scripts/opencode-install.sh`,
-          };
-        }
-        // Which ref is it on? A branch checkout fast-forwards; a --ref checkout is deliberately
-        // DETACHED and cannot. Confusing the two is how `git pull --ff-only` on a tag produces the
-        // unreadable git error this flag exists to avoid.
-        const branch = git("symbolic-ref", "--short", "-q", "HEAD");
-        const at = branch || `detached at ${git("describe", "--tags", "--always") || "?"}`;
-        if (REF) {
-          // Pinning is one path for a branch AND a tag: fetch exactly that ref, detach onto it. No
-          // local branch to fast-forward means no --ff-only, so the tag case cannot fail weirdly, and
-          // a re-run is idempotent — it lands on whatever origin says that ref is right now.
-          say(`  ${dim(`${CHECKOUT} already exists (${at}) — pinning to ${REF}`)}`);
-          const fail =
-            run("git", ["-C", CHECKOUT, "fetch", "--depth", "1", "origin", REF]) ||
-            run("git", ["-C", CHECKOUT, "checkout", "--detach", "FETCH_HEAD"]);
-          if (fail) {
-            return {
-              error: fail,
-              hint: `Does \`${REF}\` exist in ${REPO}? Otherwise it is local changes in ${CHECKOUT} —\n` +
-                `check \`git -C ${CHECKOUT} status\`, or move it aside and re-run.`,
-            };
-          }
-        } else if (!branch) {
-          // Refusing beats guessing: silently fast-forwarding a pin back onto the default branch
-          // would undo a deliberate --ref with no way to notice.
-          return {
-            error: `${CHECKOUT} is ${at} — pinned by an earlier --ref run`,
-            hint: "`git pull --ff-only` cannot update a detached HEAD. Re-run with --ref <branch-or-tag>\n" +
-              `to move the pin, or delete ${CHECKOUT} to go back to the default branch.`,
-          };
-        } else {
-          say(`  ${dim(`${CHECKOUT} already exists (${at}) — updating`)}`);
-          const fail = run("git", ["-C", CHECKOUT, "pull", "--ff-only"]);
-          if (fail) {
-            return {
-              error: fail,
-              hint: `Local commits or a dirty tree in ${CHECKOUT}? Sort it out there, then re-run.`,
-            };
-          }
-        }
-      } else if (existsSync(CHECKOUT)) {
-        return {
-          error: `${CHECKOUT} exists but is not a git checkout`,
-          hint: `Move it aside and re-run, or run the installer from a checkout you already have:\n    <checkout>/plugin/scripts/opencode-install.sh`,
-        };
-      } else {
-        // `--branch` takes a tag as happily as a branch. A clone that fails removes the directory it
-        // made, so a bad ref leaves nothing half-written behind.
-        //
-        // The detach afterwards is load-bearing, not cosmetic: DETACHED IS HOW A PIN IS RECOGNISED
-        // on a later run. A tag clone detaches on its own but a branch clone does not, and an
-        // attached feature branch is indistinguishable from the default branch — a plain `bunx
-        // nomo-ai` months later would fast-forward it and silently keep installing from a branch
-        // nobody asked for. Detaching both makes the refusal above catch every pin.
-        const fail =
-          run("git", ["clone", "--depth", "1", ...(REF ? ["--branch", REF] : []), CLONE_URL, CHECKOUT]) ||
-          (REF ? run("git", ["-C", CHECKOUT, "checkout", "--detach", "HEAD"]) : null);
-        if (fail) {
-          return {
-            error: fail,
-            hint: REF
-              ? `Check network access to github.com, and that \`${REF}\` exists in ${REPO}.`
-              : "Check network access to github.com and re-run.",
-          };
-        }
-      }
+      const checkout = ensureCheckout("OpenCode", "opencode-install.sh");
+      if (checkout) return checkout;
       if (!DRY && !existsSync(script)) {
         return {
           error: `${script} is missing from the checkout`,
@@ -443,6 +463,60 @@ const AGENTS = [
             error: fail,
             hint: "The script prints what it refused to do. A same-named file it did not write?\n" +
               `    ${script} --force`,
+          }
+        : null;
+    },
+  },
+  {
+    // No marketplace leg: Cursor's plugin docs cover the desktop app only, and one hook binary has to
+    // serve the app AND the `cursor-agent` CLI. So, like OpenCode, it installs from the ~/.nomo
+    // checkout — plugin/scripts/cursor-install.mjs merges Nomo's entries into Cursor's user-level
+    // hooks.json (leaving every other tool's entries alone) and writes the /nomo-* skills.
+    id: "cursor",
+    label: "Cursor",
+    plan: () =>
+      STATUS.get("cursor")?.installed
+        ? [`already installed — updates ${CHECKOUT}, then refreshes hooks.json and the /nomo-* skills`]
+        : [
+            `git clone --depth 1 ${REF ? `--branch ${REF} ` : ""}${CLONE_URL} ${CHECKOUT}`,
+            `node ${CURSOR_SCRIPT}`,
+          ],
+    next: () =>
+      STATUS.get("cursor")?.installed
+        ? ["restart Cursor (and any open cursor-agent) so it re-reads hooks.json"]
+        : ["restart Cursor (and any open cursor-agent) so it re-reads hooks.json", "run /nomo-pair"],
+    detect: () => onPath("cursor-agent") || onPath("cursor") || existsSync(cursorDir()),
+    // The one agent whose installer NEEDS the host's own directory to exist (it merges into a file
+    // there). Claude and Codex go through their CLI and say so when it is missing; OpenCode's script
+    // creates what it needs. So `--all` on a machine without Cursor would fail the whole run on an
+    // agent nobody there uses — it is skipped instead. Naming `--cursor` still tries, and fails clearly.
+    skipUndetectedUnderAll: true,
+    // Our own command sitting in Cursor's hooks.json — the bundle name is one only Nomo ships.
+    installed: () => {
+      try {
+        return readFileSync(join(cursorDir(), "hooks.json"), "utf8").includes("cursor-status.mjs");
+      } catch {
+        return false;
+      }
+    },
+    install() {
+      const checkout = ensureCheckout("Cursor", "cursor-install.mjs");
+      if (checkout) return checkout;
+      if (!DRY && !existsSync(CURSOR_SCRIPT)) {
+        return {
+          error: `${CURSOR_SCRIPT} is missing from the checkout`,
+          hint: REF
+            ? `Does \`${REF}\` have Cursor support? Older refs do not ship that script.`
+            : `Delete ${CHECKOUT} and re-run.`,
+        };
+      }
+      // process.execPath, not `node`: whatever is running this script can run that one.
+      const fail = run(process.execPath, [CURSOR_SCRIPT]);
+      return fail
+        ? {
+            error: fail,
+            hint: "The script's own line above says what it refused and why. Fix that and re-run;\n" +
+              `    ${process.execPath} ${CURSOR_SCRIPT}`,
           }
         : null;
     },
@@ -502,6 +576,9 @@ function preflight(selected, explicit) {
 
 function parseArgs(argv) {
   const picked = new Set();
+  /** The agents spelled out by flag — as opposed to swept in by --all. */
+  const named = new Set();
+  let all = false;
   let yes = false;
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -509,28 +586,35 @@ function parseArgs(argv) {
     else if (a === "-v" || a === "--version") return { showVersion: true };
     else if (a === "-y" || a === "--yes") yes = true;
     else if (a === "-n" || a === "--dry-run") DRY = true;
-    else if (a === "--all") for (const ag of AGENTS) picked.add(ag.id);
+    else if (a === "--all") {
+      all = true;
+      for (const ag of AGENTS) picked.add(ag.id);
+    }
     else if (a === "--ref" || a.startsWith("--ref=")) {
       // A missing value would otherwise swallow the next flag and pin the checkout to "--opencode".
       REF = a === "--ref" ? argv[++i] : a.slice("--ref=".length);
       if (!REF || REF.startsWith("-")) return { needsValue: "--ref" };
-    } else if (a.startsWith("--") && AGENTS.some((ag) => ag.id === a.slice(2))) picked.add(a.slice(2));
-    else return { bad: a };
+    } else if (a.startsWith("--") && AGENTS.some((ag) => ag.id === a.slice(2))) {
+      picked.add(a.slice(2));
+      named.add(a.slice(2));
+    } else return { bad: a };
   }
-  return { picked, yes };
+  return { picked, yes, all, named };
 }
 
 /** --ref reaches exactly one leg. Saying so out loud is the whole point: a flag that reads as
  *  "install this version" while two of three legs quietly ignore it is worse than no flag. */
 function refCaveat(selected) {
-  const ignoring = AGENTS.filter((a) => a.id !== "opencode" && selected.has(a.id)).map((a) => a.label);
-  say(`${bold("Note:")} --ref ${REF} pins the OpenCode checkout only.`);
+  /** The two that install from ~/.nomo. @param {{id: string}} a */
+  const pinned = (a) => a.id === "opencode" || a.id === "cursor";
+  const ignoring = AGENTS.filter((a) => !pinned(a) && selected.has(a.id)).map((a) => a.label);
+  say(`${bold("Note:")} --ref ${REF} pins the ${CHECKOUT} checkout (OpenCode, Cursor) only.`);
   if (ignoring.length > 0) {
     say(dim(`  ${ignoring.join(" and ")} install through their own marketplace, which takes an`));
     say(dim(`  owner/repo and reads ${REPO}'s default branch. There is no ref to pass it, so`));
     say(dim(`  ${ignoring.length > 1 ? "those legs" : "that leg"} will install from the default branch regardless.`));
   }
-  if (!selected.has("opencode")) say(dim("  OpenCode is not selected, so --ref changes nothing in this run."));
+  if (!AGENTS.some((a) => pinned(a) && selected.has(a.id))) say(dim("  Neither is selected, so --ref changes nothing in this run."));
   say();
 }
 
@@ -872,11 +956,19 @@ async function main() {
   const selected = explicit ? args.picked : new Set(args.yes ? found : []);
 
   if (!explicit && found.length === 0) {
-    err("\nnomo-ai: found no Claude Code, Codex or OpenCode install on this machine.");
-    err("  Looked for `claude`, `codex`, `opencode` on PATH and ~/.claude, ~/.codex, ~/.config/opencode.");
-    err("  Name one anyway with --claude / --codex / --opencode, or --all.");
+    err("\nnomo-ai: found no Claude Code, Codex, OpenCode or Cursor install on this machine.");
+    err("  Looked for `claude`, `codex`, `opencode`, `cursor-agent` on PATH and ~/.claude, ~/.codex, ~/.config/opencode, ~/.cursor.");
+    err("  Name one anyway with --claude / --codex / --opencode / --cursor, or --all.");
     return 1;
   }
+
+  // --all is "everything", but an agent that cannot be installed without its host (see
+  // skipUndetectedUnderAll) and is not on this machine is left out rather than failed — unless the
+  // caller also named it.
+  const skipped = args.all
+    ? AGENTS.filter((a) => a.skipUndetectedUnderAll && !args.named.has(a.id) && !a.detect())
+    : [];
+  for (const a of skipped) selected.delete(a.id);
 
   preflight(selected, explicit);
 
@@ -886,7 +978,7 @@ async function main() {
   if (!explicit && !args.yes) {
     if (!interactive()) {
       err("\nnomo-ai: not a terminal, so there is nobody to ask.");
-      err("  Pass --yes to install everything detected, or name agents: --claude --codex --opencode / --all.");
+      err("  Pass --yes to install everything detected, or name agents: --claude --codex --opencode --cursor / --all.");
       return 2;
     }
     const answer = await choose(selected);
@@ -903,6 +995,10 @@ async function main() {
     }
   } else {
     render(selected);
+  }
+
+  for (const a of skipped) {
+    say(`${a.label} was not found on this machine — skipped. Name it with --${a.id} to install it anyway.\n`);
   }
 
   if (REF) refCaveat(selected);

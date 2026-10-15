@@ -174,6 +174,9 @@ export const SESSIONS_DIR = `${CC_DIR}/sessions`;
 export const WATCHDOG_PID_PATH = `${CC_DIR}/watchdog.pid`;
 /** The hook touches this (epoch-ms text) after a successful POST; Task 2.2's status command reads it. */
 export const LAST_SEND_PATH = `${CC_DIR}/last-send`;
+/** Epoch-ms of the hook POST failure that OPENED the current failure streak (see hook.ts
+ *  traceSendFailure). A streak ends when LAST_SEND_PATH is next written, so nothing ever clears this. */
+export const SEND_FAIL_PATH = `${CC_DIR}/last-send-fail`;
 /** Consecutive "pairing is gone" strike counter (small integer text), sitting next to LAST_SEND_PATH.
  *  The hook's POST path increments this on a 404/410 response and tears the pairing down at
  *  GONE_STRIKE_LIMIT, so a revoked pairing stops POSTing forever instead of 404ing on every tool use.
@@ -426,8 +429,11 @@ export type CCStatus = "working" | "needsAttention" | "done";
  *  A third kind is NOT free: the dominant coercion idiom in this repo is
  *  `record.agent === "codex" ? "codex" : "claude"`, which silently reads opencode as CLAUDE. The ones
  *  that matter are the blob/record agent literals and anything that would join an OpenCode session
- *  against a Claude transcript or CC file. */
-export type AgentKind = "claude" | "codex" | "opencode";
+ *  against a Claude transcript or CC file.
+ *
+ *  `"cursor"` (the fourth) covers BOTH the Cursor desktop app's agent and the `cursor-agent` CLI — one
+ *  kind, one hook binary (entries/cursor-status.ts → core/cursor.ts). Read-only in v1. */
+export type AgentKind = "claude" | "codex" | "opencode" | "cursor";
 
 /** An agent literal AS IT ARRIVES — off a session record, out of a blob a peer install wrote. It is
  *  `AgentKind` plus "some string this build has never heard of", because that case is now REAL: two
@@ -449,6 +455,18 @@ export function codexHome(): string {
   const env = process.env.CODEX_HOME;
   return env && env.length > 0 ? env : `${process.env.HOME}/.codex`;
 }
+
+/** Cursor's config home — `$CURSOR_CONFIG_DIR` when set & non-empty (the CLI's documented override),
+ *  else `~/.cursor`. Holds the user-level `hooks.json` the installer merges Nomo's entries into, and
+ *  the desktop app's `projects/<slug>/agent-transcripts/`. */
+export function cursorHome(): string {
+  const env = process.env.CURSOR_CONFIG_DIR;
+  return env && env.length > 0 ? env : `${process.env.HOME}/.cursor`;
+}
+
+/** The substring that identifies OUR hook command inside Cursor's `hooks.json` (the bundled hook's
+ *  basename) — what status-cmd greps for to tell "installed" from "not set up here". */
+export const CURSOR_HOOK_MARKER = "cursor-status.mjs";
 
 /** The substring that identifies OUR hook command inside a codex `hooks.json` entry (the bundled
  *  hook's basename). status-cmd greps for it to flag leftover legacy (pre-native-plugin) installs. */
@@ -1036,6 +1054,13 @@ export interface SessionRecord {
    *  this session was a done") because planOp's re-arm (SessionStart + sentDone → op:update) and
    *  codex-notify's double-send dedupe both key on it. Absent → nothing owed. */
   donePending?: boolean;
+  /** True while the relay's copy of this (non-terminal) session is BEHIND this record: the hook wrote
+   *  the record, then its own POST threw (timeout / network — never an HTTP response). Unlike
+   *  `donePending` it is stamped only ON that failure (hook.ts markUpdatePending), so a healthy hook
+   *  writes nothing extra; trackSession rebuilds the record whole, so the next hook event drops it and
+   *  its own POST decides afresh. The watchdog's correctPendingUpdate re-sends the record's current
+   *  blob and clears it on a 2xx. Absent → nothing owed. */
+  updatePending?: boolean;
   /** True only when a Codex turn completion was reclassified as the client-side Plan picker. The
    *  watchdog uses this explicit provenance marker to clear needsAttention on later rollout progress
    *  without touching an ordinary permission/question attention episode. */
@@ -1128,6 +1153,17 @@ export interface SessionRecord {
    *  re-arms as an `update` and writes lastEvent:"working", while a source:"compact" SessionStart fires
    *  MID-turn on a session with no record yet and writes lastEvent:"sessionStart" over a live turn. */
   awaitingPrompt?: boolean;
+  /** CURSOR ONLY (core/cursor.ts; patched onto the record after trackSessionAt, which rebuilds it
+   *  whole). The `generation_id` whose `stop` hook ended the current turn — "" when neither the stop
+   *  nor the prompt carried one. PRESENT means "a real stop was seen since the last prompt", which is
+   *  what tells a finished turn (late tool events are dropped) from one the watchdog's idle reap only
+   *  GUESSED finished (the turn's next tool event re-arms it). A prompt clears it. The watchdog never
+   *  reads it and its rewrites spread `...record`, so it survives them. Absent on every other agent. */
+  stoppedGeneration?: string;
+  /** CURSOR ONLY. Epoch ms of the last owner-pid lookup that found NO Cursor process (the record's
+   *  `pid` is then CURSOR_UNKNOWN_OWNER_PID). A negative cache: a prompt re-walks the process ancestry
+   *  only once this is CURSOR_OWNER_RETRY_MS old. Absent once an owner is known. */
+  ownerCheckedAt?: number;
 }
 
 /** The plaintext a pending-pairing flush needs to POST the pairing session the instant the shared key
@@ -2052,6 +2088,52 @@ export async function clearDecisionHold(
   sessionId: string, pid: number, beforeUnlink?: () => Promise<void>, holdId?: string,
 ): Promise<boolean> {
   return clearDecisionHoldAt(SESSIONS_DIR, sessionId, pid, beforeUnlink, holdId);
+}
+
+// --- Interrupt flag (phone → "stop this session's turn") ----------------------------------------
+//
+// Written by the watchdog when a validated `interrupt-session` command names a hook-flag agent, read by
+// that session's status hook on its next tool event. A sibling FILE for the same reason the `.hold`
+// marker is one: trackSessionAt rebuilds the record whole on every hook, so a record field would be
+// erased by the very event that should act on it.
+
+/** Not `.json`, so no SESSIONS_DIR reader mistakes it for a session row. */
+export const INTERRUPT_FLAG_SUFFIX = ".interrupt";
+
+/** A flag older than this is ignored. An hour covers the longest tool a turn can be sitting in; the
+ *  hook clears the flag itself at every turn boundary, so only a crashed session leaves one behind.
+ *  ponytail: leaked flags are never swept (tiny, inert after this age); add a prune beside
+ *  pruneStaleDecisionHolds if the sessions dir ever needs to be tidy. */
+export const INTERRUPT_FLAG_MAX_AGE_MS = 3_600_000;
+
+export function interruptFlagFileName(sessionId: string): string {
+  return `${sessionId}${INTERRUPT_FLAG_SUFFIX}`;
+}
+
+/** Best-effort, like every other write in this file. */
+export async function writeInterruptFlagAt(sessionsDir: string, sessionId: string, now: number): Promise<void> {
+  try {
+    await atomicWrite(`${sessionsDir}/${interruptFlagFileName(sessionId)}`, JSON.stringify({ at: now }), 0o600);
+  } catch {
+    // A flag that failed to land is an interrupt that did not happen; the phone's row stays Running.
+  }
+}
+
+/** Is a fresh flag present? Deliberately does NOT consume it: Claude Code still runs every other tool
+ *  call already in the same assistant message, and each of those must be denied too. */
+export async function interruptFlagSetAt(sessionsDir: string, sessionId: string, now: number): Promise<boolean> {
+  try {
+    const flag = JSON.parse(
+      await readFile(`${sessionsDir}/${interruptFlagFileName(sessionId)}`, "utf8"),
+    ) as { at?: unknown };
+    return typeof flag.at === "number" && now - flag.at <= INTERRUPT_FLAG_MAX_AGE_MS;
+  } catch {
+    return false;
+  }
+}
+
+export async function clearInterruptFlagAt(sessionsDir: string, sessionId: string): Promise<void> {
+  await unlink(`${sessionsDir}/${interruptFlagFileName(sessionId)}`).catch(() => {});
 }
 
 export async function settleDecisionHoldRecord(
