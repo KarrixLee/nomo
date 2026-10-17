@@ -106,7 +106,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "2.3.0";
+var PLUGIN_VERSION = "2.3.9";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -1617,6 +1617,11 @@ function firstUserPrompt(transcript) {
 `));
 }
 var MODEL_TAIL_BYTES = 64 * 1024;
+var MODEL_TAIL_WIDE_BYTES = 2 * 1024 * 1024;
+function normalizeModelId(id) {
+  const bare = id.slice(id.lastIndexOf("/") + 1);
+  return bare.startsWith("claude-") ? bare.replace(/(\d)\.(\d)/g, "$1-$2") : bare;
+}
 function assistantModelFromLine(line) {
   if (!line.includes('"assistant"') || !line.includes('"model"'))
     return;
@@ -1639,7 +1644,7 @@ function assistantModelFromLine(line) {
   const cleaned = model.trim();
   if (!cleaned || cleaned.startsWith("<"))
     return;
-  return cleaned;
+  return normalizeModelId(cleaned);
 }
 function lastAssistantModel(text) {
   const lines = text.split(`
@@ -1663,9 +1668,11 @@ function firstAssistantModel(text) {
 async function claudeSessionModel(prefix, transcriptPath) {
   if (transcriptPath.length > 0) {
     try {
-      const m = lastAssistantModel(await readSuffix(transcriptPath, MODEL_TAIL_BYTES));
-      if (m)
-        return m;
+      for (const bytes of [MODEL_TAIL_BYTES, MODEL_TAIL_WIDE_BYTES]) {
+        const m = lastAssistantModel(await readSuffix(transcriptPath, bytes));
+        if (m)
+          return m;
+      }
     } catch {}
   }
   return prefix.length > 0 ? firstAssistantModel(prefix) : undefined;
@@ -8473,7 +8480,34 @@ async function postEvent(config, body, opts = {}) {
   }
 }
 var INTERRUPT_COMMAND_KIND = "interrupt-session";
-var COMMAND_KINDS_ALLOWED = new Set(["focus-terminal", INTERRUPT_COMMAND_KIND]);
+var PING_COMMAND_KIND = "ping";
+var COMMAND_KINDS_ALLOWED = new Set(["focus-terminal", INTERRUPT_COMMAND_KIND, PING_COMMAND_KIND]);
+var PING_NONCE_MAX = 64;
+function parsePingPayload(plain) {
+  if (typeof plain !== "object" || plain === null)
+    return;
+  const p = plain;
+  if (p.kind !== PING_COMMAND_KIND)
+    return;
+  if (typeof p.nonce !== "string" || p.nonce.length === 0 || p.nonce.length > PING_NONCE_MAX)
+    return;
+  if (typeof p.sentAt !== "number" || !Number.isFinite(p.sentAt))
+    return;
+  return { nonce: p.nonce, sentAt: p.sentAt };
+}
+async function postPong(config, blob) {
+  try {
+    const res = await fetch(`${config.url}/v1/cc/pong`, {
+      method: "POST",
+      headers: watchdogEventHeaders(config, await localApprovalsState()),
+      body: JSON.stringify({ blob }),
+      signal: AbortSignal.timeout(POST_TIMEOUT_MS2)
+    });
+    return res.status;
+  } catch {
+    return "failed";
+  }
+}
 var COMMANDS_PER_RESPONSE_MAX = 8;
 var COMMAND_BUFFER_MAX = 32;
 var EXECUTED_COMMAND_IDS_MAX = 64;
@@ -8627,6 +8661,27 @@ async function drainCommands(config, deps = {}) {
           traceFocus(deps, { ...base, result: "decrypt-failed" });
           continue;
         }
+        if (plain?.kind === PING_COMMAND_KIND) {
+          const ping = parsePingPayload(plain);
+          if (!ping) {
+            traceFocus(deps, { ...base, kind: "ping", result: "malformed" });
+            continue;
+          }
+          if (!commandIsFresh(ping.sentAt, now)) {
+            traceFocus(deps, { ...base, kind: "ping", result: "stale" });
+            continue;
+          }
+          if (seenCommandNonces.has(ping.nonce)) {
+            traceFocus(deps, { ...base, kind: "ping", result: "replay" });
+            continue;
+          }
+          rememberBounded(seenCommandNonces, ping.nonce, SEEN_NONCES_MAX);
+          const via = cmd.id.startsWith(LAN_COMMAND_ID_PREFIX) ? "lan" : "relay";
+          const blob = await encryptBlob(config.e2eKey, { nonce: ping.nonce, recvAt: (deps.now ?? Date.now)(), via });
+          const send = deps.postPongFn ?? postPong;
+          send(config, blob).then((status) => traceFocus(deps, { ...base, kind: "ping", result: "pong", status }), () => {});
+          continue;
+        }
         const payload = parseCommandPayload(plain);
         if (!payload) {
           traceFocus(deps, { ...base, result: "malformed" });
@@ -8723,6 +8778,69 @@ function acceptLanCommand(command, deps = {}) {
     return enqueueDrainCommands(command.config, deps).catch(() => 0);
   } catch {
     return Promise.resolve(0);
+  }
+}
+var COMMAND_WAIT_TIMEOUT_MS = 35000;
+var COMMAND_WAIT_BACKOFF_MIN_MS = 1000;
+var COMMAND_WAIT_BACKOFF_MAX_MS = 60000;
+var abortableSleep2 = (ms, signal) => new Promise((resolve) => {
+  if (signal.aborted)
+    return resolve();
+  const done = () => {
+    clearTimeout(timer);
+    signal.removeEventListener("abort", done);
+    resolve();
+  };
+  const timer = setTimeout(done, ms);
+  signal.addEventListener("abort", done);
+});
+async function commandWaitLoop(getConfig, signal, deps = {}) {
+  const doFetch = deps.fetch ?? fetch;
+  const sleep = deps.sleep ?? abortableSleep2;
+  const random = deps.random ?? Math.random;
+  let cursor = 0;
+  let pairingId;
+  let failures = 0;
+  while (!signal.aborted) {
+    const config = getConfig();
+    if (!config) {
+      await sleep(POLL_MS, signal);
+      continue;
+    }
+    if (config.pairingId !== pairingId) {
+      pairingId = config.pairingId;
+      cursor = 0;
+    }
+    const request = new AbortController;
+    const abortRequest = () => request.abort();
+    signal.addEventListener("abort", abortRequest);
+    const timer = setTimeout(abortRequest, COMMAND_WAIT_TIMEOUT_MS);
+    try {
+      const res = await doFetch(`${config.url}/v1/cc/commands/wait?after=${cursor}`, {
+        headers: { "x-cc-pairing": config.pairingId, "x-cc-auth": config.pcSecret, "x-cc-version": PLUGIN_VERSION },
+        signal: request.signal
+      });
+      if (!res.ok)
+        throw new Error(`status ${res.status}`);
+      const body = await res.json();
+      const seqs = Array.isArray(body.commands) ? body.commands.map((c) => Number(c?.seq)).filter(Number.isFinite) : [];
+      const next = typeof body.cursor === "number" && Number.isFinite(body.cursor) ? body.cursor : Math.max(cursor, ...seqs);
+      const commands = extractCommands(body);
+      cursor = next;
+      failures = 0;
+      if (commands.length > 0) {
+        bufferCommands(commands);
+        enqueueDrainCommands(config, deps.drainDeps).catch(() => 0);
+      }
+    } catch {
+      if (signal.aborted)
+        return;
+      const ceiling = Math.min(COMMAND_WAIT_BACKOFF_MAX_MS, COMMAND_WAIT_BACKOFF_MIN_MS * 2 ** failures++);
+      await sleep(Math.max(COMMAND_WAIT_BACKOFF_MIN_MS, ceiling * (0.5 + random() / 2)), signal);
+    } finally {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", abortRequest);
+    }
   }
 }
 var LAN_ANSWER_ECHO_DELAY_MS = 5000;
@@ -10059,7 +10177,11 @@ async function run() {
       lan.stop();
     } catch {}
   };
+  let currentConfig = null;
+  const commandWait = new AbortController;
+  commandWaitLoop(() => currentConfig, commandWait.signal);
   const shutdown = () => {
+    commandWait.abort();
     bridges.shutdown();
     stopLan();
   };
@@ -10072,6 +10194,7 @@ async function run() {
       await bridges.sync(config);
       setCodexBridgeDown(bridges.daemonDown);
       lan.sync(config);
+      currentConfig = config;
       if (config) {
         await reconcileProvisionalsSweep(config);
         await discoverLiveSessions(config);
@@ -10157,6 +10280,9 @@ export {
   CODEX_TUI_SESSION_START_SKEW_MS,
   COMMAND_FUTURE_SKEW_MS,
   COMMAND_TTL_MS,
+  COMMAND_WAIT_BACKOFF_MAX_MS,
+  COMMAND_WAIT_BACKOFF_MIN_MS,
+  COMMAND_WAIT_TIMEOUT_MS,
   IDLE_GRACE_MS,
   LAN_ANSWER_ECHO_DELAY_MS,
   LAN_COMMAND_ID_PREFIX,
@@ -10190,6 +10316,7 @@ export {
   codexLastTurnEvent,
   codexTailPendingApproval,
   commandIsFresh,
+  commandWaitLoop,
   correctIdleClaude,
   correctInterrupt,
   correctPendingApproval,
@@ -10217,6 +10344,7 @@ export {
   noteDoneAttempt,
   noteResend,
   parseCommandPayload,
+  parsePingPayload,
   pendingDoneRetryWrite,
   pendingDoneSettleWrite,
   pendingPairingExpired,

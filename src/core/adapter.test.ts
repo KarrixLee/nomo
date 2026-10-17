@@ -10,7 +10,7 @@ import {
   CODEX_ROLLOUT_IDLE_SILENCE_MS,
   codexNewestRolloutForCwd, codexPidPlanPickerEvidence, codexPidPlanPickerState, codexPidTurnActive, codexPlanPickerStateFromTail, codexProposedPlanMarkdown, codexRolloutExistsForSession, codexSentinelSessionId, codexSessionModel,
   codexRolloutCreationEvidence, codexSessionCreationSuppression, codexTailPendingApproval, codexTailPendingAttentionKind, codexTailPendingUserInputDetail, codexTurnActiveFromTail, filterCodexTuis, findProvisionalForPid,
-  firstAssistantModel, firstUserPrompt, lastAssistantModel, parseCodexProcs, rolloutMetaCwd,
+  firstAssistantModel, firstUserPrompt, lastAssistantModel, normalizeModelId, parseCodexProcs, rolloutMetaCwd,
   hasInterruptMarker, requestUserInputDetail, rolloutPathFromLsof, sessionTitle, TrackedSessionLite, unknownAgentAdapter,
 } from "./adapter";
 import type { AgentAdapter, LocateTuiReason } from "./adapter";
@@ -280,6 +280,29 @@ describe("claude session model (assistant message.model — last wins; subagent 
       expect(await claudeSessionModel(asst("claude-opus-4-5"), j(dir, "missing.jsonl"))).toBe("claude-opus-4-5");
       // Nothing anywhere → undefined (the blob then omits the key).
       expect(await claudeSessionModel("", j(dir, "missing.jsonl"))).toBeUndefined();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("OpenRouter's provider-prefixed, dotted ids normalize to the first-party spelling", () => {
+    expect(normalizeModelId("anthropic/claude-haiku-5.5")).toBe("claude-haiku-5-5");
+    expect(normalizeModelId("claude-opus-4-8")).toBe("claude-opus-4-8");
+    expect(normalizeModelId("openai/gpt-5.5-codex")).toBe("gpt-5.5-codex");
+    expect(lastAssistantModel([asst("claude-opus-4-8"), asst("anthropic/claude-haiku-5.5")].join("\n"))).toBe("claude-haiku-5-5");
+  });
+
+  test("claudeSessionModel: a >64 KB non-assistant line after the last turn doesn't revert to the head's model", async () => {
+    // The P1b box: home turns on opus, resumed turns on haiku, then a 145 KB attachment line at EOF.
+    const { mkdtemp, writeFile, rm } = await import("node:fs/promises");
+    const { tmpdir } = await import("node:os");
+    const { join: j } = await import("node:path");
+    const dir = await mkdtemp(j(tmpdir(), "cc-model-"));
+    try {
+      const path = j(dir, "t.jsonl");
+      const big = JSON.stringify({ type: "attachment", attachment: { content: "x".repeat(145_000) } });
+      await writeFile(path, [asst("claude-opus-4-8"), asst("anthropic/claude-haiku-5.5"), big].join("\n"));
+      expect(await claudeSessionModel(asst("claude-opus-4-8"), path)).toBe("claude-haiku-5-5");
     } finally {
       await rm(dir, { recursive: true, force: true });
     }

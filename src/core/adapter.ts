@@ -360,6 +360,19 @@ export function firstUserPrompt(transcript: string): string | undefined {
  *  a single assistant line (large code block) or a burst of response items can exceed a few KB, and
  *  the freshest assistant/turn_context line must land inside the window. Still one bounded read. */
 const MODEL_TAIL_BYTES = 64 * 1024;
+/** Second, wider tail read when the first finds no assistant line. CC writes single attachment /
+ *  api-request-shape lines of 100 KB+ AFTER the last assistant turn (observed: a 145 KB attachment
+ *  line pushed the last turn out of the 64 KB window, so the head's opening model — Opus on a session
+ *  resumed on Haiku — reached the phone). Only paid when the cheap read comes up empty. */
+const MODEL_TAIL_WIDE_BYTES = 2 * 1024 * 1024;
+
+/** One stable spelling for a Claude model id: drop a provider prefix ("anthropic/claude-haiku-5.5",
+ *  OpenRouter's form) and dash the version ("claude-haiku-5.5" → "claude-haiku-5-5"), so the app's
+ *  marketing table matches it like a first-party id. Non-Claude ids keep their dots ("gpt-5.5-codex"). */
+export function normalizeModelId(id: string): string {
+  const bare = id.slice(id.lastIndexOf("/") + 1);
+  return bare.startsWith("claude-") ? bare.replace(/(\d)\.(\d)/g, "$1-$2") : bare;
+}
 
 /** The `message.model` of ONE Claude transcript line, or undefined when the line isn't a real
  *  assistant turn. CRITICAL: only a `"type":"assistant"` row's TOP-LEVEL `message.model` counts —
@@ -379,7 +392,7 @@ function assistantModelFromLine(line: string): string | undefined {
   if (typeof model !== "string") return undefined;
   const cleaned = model.trim();
   if (!cleaned || cleaned.startsWith("<")) return undefined; // "" / "<synthetic>" → not a real model id
-  return cleaned;
+  return normalizeModelId(cleaned);
 }
 
 /** The LAST assistant line's `message.model` in the given text (scanned bottom-up, early-exit) — the
@@ -410,8 +423,10 @@ export function firstAssistantModel(text: string): string | undefined {
 export async function claudeSessionModel(prefix: string, transcriptPath: string): Promise<string | undefined> {
   if (transcriptPath.length > 0) {
     try {
-      const m = lastAssistantModel(await readSuffix(transcriptPath, MODEL_TAIL_BYTES));
-      if (m) return m;
+      for (const bytes of [MODEL_TAIL_BYTES, MODEL_TAIL_WIDE_BYTES]) {
+        const m = lastAssistantModel(await readSuffix(transcriptPath, bytes));
+        if (m) return m;
+      }
     } catch { /* no transcript yet / unreadable — fall through to the head prefix */ }
   }
   return prefix.length > 0 ? firstAssistantModel(prefix) : undefined;

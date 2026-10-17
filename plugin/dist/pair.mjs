@@ -101,7 +101,7 @@ async function sha256Hex(s) {
 }
 
 // src/core/shared.ts
-var PLUGIN_VERSION = "2.3.0";
+var PLUGIN_VERSION = "2.3.9";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -4024,6 +4024,29 @@ function qrGrid(text, forceMask, level = "L") {
 function qrMatrix(text, level = "L") {
   return qrGrid(text, undefined, level).modules;
 }
+function renderQR(text, quiet = 4) {
+  const g = qrGrid(text);
+  const size = g.size;
+  const full = size + quiet * 2;
+  const dark = (r, c) => {
+    const rr = r - quiet, cc = c - quiet;
+    if (rr < 0 || cc < 0 || rr >= size || cc >= size)
+      return false;
+    return g.modules[rr][cc] === 1;
+  };
+  const lines = [];
+  for (let r = 0;r < full; r += 2) {
+    let line = "";
+    for (let c = 0;c < full; c++) {
+      const top = dark(r, c);
+      const bottom = r + 1 < full ? dark(r + 1, c) : false;
+      line += top && bottom ? "█" : top ? "▀" : bottom ? "▄" : " ";
+    }
+    lines.push(line);
+  }
+  return lines.join(`
+`);
+}
 
 // src/qr/qr-svg.ts
 function renderQRSVG(text, opts = {}) {
@@ -4048,15 +4071,21 @@ function renderQRSVG(text, opts = {}) {
   }
   return `<svg xmlns="http://www.w3.org/2000/svg" width="${pixelSize}" height="${pixelSize}" ` + `viewBox="0 0 ${full} ${full}" shape-rendering="crispEdges">` + `<rect width="${full}" height="${full}" fill="#ffffff"/>` + `<g fill="#000000">${rects.join("")}</g>` + `</svg>`;
 }
-// src/entries/pair.ts
+
+// src/core/pair-url.ts
+var textEncoder2 = new TextEncoder;
 var DEFAULT_WORKER_URL = "https://api.nomo.gg";
+function buildPairURL(workerUrl, pairingId, qrSecret, pcEphPub) {
+  const u = workerUrl === DEFAULT_WORKER_URL ? "" : `&u=${b64url(textEncoder2.encode(workerUrl))}`;
+  return `nomo://pair?v=1${u}&p=${pairingId}&s=${b64url(qrSecret)}&e=${b64url(pcEphPub)}`;
+}
+// src/entries/pair.ts
 var POLL_INTERVAL_MS = 3000;
 var MAX_WAIT_MS = 600000;
 var FETCH_TIMEOUT_MS = 1e4;
 var CONFIG_MODE2 = 384;
 var ACK_ATTEMPTS = 3;
 var ACK_RETRY_DELAY_MS = 1000;
-var textEncoder2 = new TextEncoder;
 function openInBrowser(path) {
   if (process.env.NOMO_NO_OPEN === "1")
     return false;
@@ -4078,10 +4107,6 @@ async function removePendingConfig(configPath) {
 }
 function bytesToHex(bytes) {
   return Array.from(bytes).map((b) => b.toString(16).padStart(2, "0")).join("");
-}
-function buildPairURL(workerUrl, pairingId, qrSecret, pcEphPub) {
-  const u = workerUrl === DEFAULT_WORKER_URL ? "" : `&u=${b64url(textEncoder2.encode(workerUrl))}`;
-  return `nomo://pair?v=1${u}&p=${pairingId}&s=${b64url(qrSecret)}&e=${b64url(pcEphPub)}`;
 }
 function revokeCreds(raw) {
   const completed = parseConfig(raw);

@@ -8,7 +8,7 @@ import { createLanAnswerStore } from "../core/lan-listener";
 import type { DecisionHold, PlanPickerTraceDecision, SessionRecord } from "../core/shared";
 import { GONE_STRIKE_LIMIT, readGoneStrikes, recordGoneStrike, resetGoneStrikes, tracePlanPickerDecision } from "../core/shared";
 import {
-  acceptLanAnswer, acceptLanCommand, enqueueDrainCommands, LAN_ANSWER_ECHO_DELAY_MS, LAN_COMMAND_ID_PREFIX,
+  acceptLanAnswer, acceptLanCommand, commandWaitLoop, enqueueDrainCommands, LAN_ANSWER_ECHO_DELAY_MS, LAN_COMMAND_ID_PREFIX,
   buildDoneEnvelope, buildEndEnvelope, buildHeartbeatEnvelope, buildNeedsAttentionEnvelope, buildProvisionalBlob,
   buildProvisionalEnvelope, buildProvisionalRecord, buildStartEnvelope, buildTitleRepairEnvelope, classifySession,
   claudeTailPendingApproval, codexLastTurnEvent, codexTailPendingApproval, correctIdleClaude, correctInterrupt,
@@ -4097,6 +4097,50 @@ describe("drainCommands (authenticate, validate, then execute)", () => {
     expect(await drainCommands(cfg(), { take: () => { throw new Error("boom"); } })).toBe(0);
   });
 
+  describe("ping (Delivery latency)", () => {
+    const sealedPing = async (body: Record<string, unknown>, id = `ping-${++nonceSeq}`) =>
+      ({ id, blob: await encryptBlob(KEY, body) });
+
+    test("one pong POST per ping, sealed with the matching nonce, recvAt >= sentAt; no session read", async () => {
+      const pongs: string[] = [];
+      let reads = 0;
+      const { deps } = harness({
+        readRecords: async () => { reads++; return []; },
+        postPongFn: async (_c, blob) => { pongs.push(blob); return 200; },
+      });
+      const ping = await sealedPing({ kind: "ping", sessionId: "-", nonce: "uuid-1", sentAt: NOW - 50 });
+      expect(await drainCommands(cfg(), { ...deps, take: () => [ping] })).toBe(0);
+      expect(pongs).toHaveLength(1);
+      expect(pongs[0].length).toBeLessThanOrEqual(1024);
+      const plain = await decryptBlob(KEY, pongs[0]) as { nonce: string; recvAt: number; via: string };
+      expect(plain).toEqual({ nonce: "uuid-1", recvAt: NOW, via: "relay" });
+      expect(plain.recvAt).toBeGreaterThanOrEqual(NOW - 50);
+      expect(reads).toBe(0);
+      // A replay of the same sealed nonce under a fresh id is not answered twice.
+      expect(await drainCommands(cfg(), { ...deps, take: () => [{ ...ping, id: "other-id" }] })).toBe(0);
+      expect(pongs).toHaveLength(1);
+    });
+
+    test("malformed pings are ignored (no pong, no session read)", async () => {
+      const pongs: string[] = [];
+      let reads = 0;
+      const { traces, deps } = harness({
+        readRecords: async () => { reads++; return []; },
+        postPongFn: async (_c, blob) => { pongs.push(blob); return 200; },
+      });
+      const bad = await Promise.all([
+        sealedPing({ kind: "ping", sessionId: "-", sentAt: NOW }),                          // no nonce
+        sealedPing({ kind: "ping", sessionId: "-", nonce: "x".repeat(65), sentAt: NOW }),   // oversized nonce
+        sealedPing({ kind: "ping", sessionId: "-", nonce: "n", sentAt: "now" }),            // bad sentAt
+        sealedPing({ kind: "ping", sessionId: "-", nonce: "n2", sentAt: NOW - 10 * 60_000 }), // stale
+      ]);
+      expect(await drainCommands(cfg(), { ...deps, take: () => bad })).toBe(0);
+      expect(pongs).toHaveLength(0);
+      expect(reads).toBe(0);
+      expect(traces.map((t) => t.result)).toEqual(["malformed", "malformed", "malformed", "stale"]);
+    });
+  });
+
   describe("interrupt-session", () => {
     /** A mid-turn record: the interrupt is refused outright once the record reads done. */
     const running = (over: Partial<SessionRecord>): RecordEntry => entry("sess-a", { lastEvent: "working", ...over });
@@ -4681,5 +4725,129 @@ describe("correctPendingUpdate (re-send a running session's state the relay neve
     const w = world(owed(), "revoked", { status: 404 });
     expect(await correctPendingUpdate(cfg(), "/tmp/s.json", "s", owed(), NOW, w.seams)).toBe("revoked");
     expect(resendAllowed(NOW)).toBe(true);
+  });
+});
+
+// --- the worker long-poll leg (P1.6 / NOM-83) ---------------------------------------------------
+describe("commandWaitLoop (GET /v1/cc/commands/wait long-poll)", () => {
+  beforeEach(() => { resetCommandState(); });
+
+  const NOW = 1_800_000_000_000;
+  const sealedBlob = (nonce: string): Promise<string> => encryptBlob(KEY, { kind: "focus-terminal", sessionId: "sess-a", ts: NOW, nonce });
+  const harness = () => {
+    const focused: number[] = [];
+    const traces: Record<string, unknown>[] = [];
+    const drainDeps: DrainCommandsDeps = {
+      readRecords: async () => [{ sessionId: "sess-a", rec: rec({ pid: 11 }) }],
+      adapters: [{ ...claudeAdapter, locateTuiPid: (async ({ record }) => record.pid) as AgentAdapter["locateTuiPid"] }],
+      focus: async (pid) => { focused.push(pid); return { ok: true, via: "terminal-app" }; },
+      now: () => NOW,
+      trace: (e) => traces.push(e as Record<string, unknown>),
+    };
+    return { focused, traces, drainDeps };
+  };
+  /** A scripted fetch: each call takes the next response (or aborts the loop when the script runs out). */
+  const scripted = (ctl: AbortController, script: Array<() => Response | Promise<Response>>) => {
+    const calls: { url: string; headers: Record<string, string> }[] = [];
+    const fetchStub = (async (url: string, init: RequestInit) => {
+      calls.push({ url, headers: init.headers as Record<string, string> });
+      const next = script.shift();
+      if (!next) { ctl.abort(); throw new Error("aborted"); }
+      return next();
+    }) as unknown as typeof fetch;
+    return { calls, fetchStub };
+  };
+  const flushDrains = () => enqueueDrainCommands(cfg(), { take: () => [] });
+
+  test("buffers + drains a pushed command, advances the cursor and sends it (the re-poll is the ack)", async () => {
+    const { focused, drainDeps } = harness();
+    const ctl = new AbortController();
+    const blob = await sealedBlob("w-1");
+    const { calls, fetchStub } = scripted(ctl, [
+      () => Response.json({ commands: [{ id: "do-1", seq: 7, blob }], cursor: 7 }),
+      () => Response.json({ commands: [], cursor: 7 }),
+    ]);
+    await commandWaitLoop(cfg, ctl.signal, { fetch: fetchStub, sleep: async () => {}, drainDeps });
+    await flushDrains();
+    expect(focused).toEqual([11]);
+    expect(calls.map((c) => c.url)).toEqual([
+      "https://w.test/v1/cc/commands/wait?after=0",
+      "https://w.test/v1/cc/commands/wait?after=7",
+      "https://w.test/v1/cc/commands/wait?after=7",
+    ]);
+    expect(calls[0].headers).toMatchObject({ "x-cc-pairing": "p", "x-cc-auth": "s" });
+  });
+
+  test("the same DO id via the /cc/event piggyback AND the long-poll executes exactly once", async () => {
+    const { focused, traces, drainDeps } = harness();
+    const blob = await sealedBlob("w-2");
+    // Piggyback wins first...
+    expect(await drainCommands(cfg(), { ...drainDeps, take: () => extractCommands({ commands: [{ id: "do-9", blob }] }) })).toBe(1);
+    // ...then the long-poll hands over the same row.
+    const ctl = new AbortController();
+    const { fetchStub } = scripted(ctl, [() => Response.json({ commands: [{ id: "do-9", seq: 1, blob }], cursor: 1 })]);
+    await commandWaitLoop(cfg, ctl.signal, { fetch: fetchStub, sleep: async () => {}, drainDeps });
+    await flushDrains();
+    expect(focused).toEqual([11]);
+    expect(traces.at(-1)).toMatchObject({ id: "do-9", result: "duplicate", why: "id" });
+  });
+
+  test("404 (old worker) and 5xx back off with growing jittered delays, keep polling, and never strike", async () => {
+    const strikesBefore = await readGoneStrikes();
+    const ctl = new AbortController();
+    const sleeps: number[] = [];
+    const { calls, fetchStub } = scripted(ctl, [
+      () => new Response(null, { status: 404 }),
+      () => new Response(null, { status: 503 }),
+      () => new Response(null, { status: 500 }),
+      () => { throw new TypeError("network"); },
+    ]);
+    await commandWaitLoop(cfg, ctl.signal, { fetch: fetchStub, sleep: async (ms) => { sleeps.push(ms); }, random: () => 1 });
+    expect(calls).toHaveLength(5); // kept polling through every failure
+    expect(sleeps).toEqual([1000, 2000, 4000, 8000]);
+    expect(await readGoneStrikes()).toBe(strikesBefore);
+  });
+
+  test("backoff caps at 60 s and resets after a success", async () => {
+    const ctl = new AbortController();
+    const sleeps: number[] = [];
+    const fail = () => new Response(null, { status: 404 });
+    const { fetchStub } = scripted(ctl, [...Array(8).fill(fail), () => Response.json({ commands: [], cursor: 0 }), fail]);
+    await commandWaitLoop(cfg, ctl.signal, { fetch: fetchStub, sleep: async (ms) => { sleeps.push(ms); }, random: () => 1 });
+    expect(sleeps).toEqual([1000, 2000, 4000, 8000, 16000, 32000, 60000, 60000, 1000]);
+  });
+
+  test("shutdown aborts an in-flight long-poll promptly", async () => {
+    const ctl = new AbortController();
+    const fetchStub = ((_url: string, init: RequestInit) => new Promise<Response>((_, reject) => {
+      init.signal?.addEventListener("abort", () => reject(new Error("aborted")));
+    })) as unknown as typeof fetch;
+    const loop = commandWaitLoop(cfg, ctl.signal, { fetch: fetchStub });
+    const t0 = Date.now();
+    setTimeout(() => ctl.abort(), 10);
+    await loop;
+    expect(Date.now() - t0).toBeLessThan(500);
+  });
+
+  test("a backoff sleep is also cut short by shutdown (the real abortable sleep)", async () => {
+    const ctl = new AbortController();
+    const fetchStub = (async () => new Response(null, { status: 404 })) as unknown as typeof fetch;
+    const loop = commandWaitLoop(cfg, ctl.signal, { fetch: fetchStub, random: () => 1 });
+    const t0 = Date.now();
+    setTimeout(() => ctl.abort(), 20);
+    await loop;
+    expect(Date.now() - t0).toBeLessThan(500);
+  });
+
+  test("a new pairing restarts the cursor at 0", async () => {
+    const ctl = new AbortController();
+    let current: Config = cfg();
+    const { calls, fetchStub } = scripted(ctl, [
+      () => Response.json({ commands: [], cursor: 5 }),
+      () => { current = { ...cfg(), pairingId: "p2" }; return Response.json({ commands: [], cursor: 5 }); },
+    ]);
+    await commandWaitLoop(() => current, ctl.signal, { fetch: fetchStub, sleep: async () => {} });
+    expect(calls.map((c) => c.url.split("after=")[1])).toEqual(["0", "5", "0"]);
+    expect(calls[2].headers["x-cc-pairing"]).toBe("p2");
   });
 });

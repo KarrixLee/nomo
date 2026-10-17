@@ -82,6 +82,10 @@ const ENTRYPOINTS = [
   // user-level hooks.json (see plugin/scripts/cursor-install.mjs), never through hook-shim.sh — so it
   // needs no shim whitelist entry and no NOMO_SHIM_REV bump.
   "cursor-status.ts",
+  // NOM-72 P1a cloud handoff. Run by hand from a terminal (`bun plugin/dist/handoff.mjs`), not a hook.
+  "handoff.ts",
+  // NOM-82: the box-side loopback relay to OpenRouter (strips `tool_addition` blocks). Started by handoff in tmux.
+  "or-relay.ts",
 ].map((f) => join(HERE, "src", "entries", f));
 
 /** The OpenCode plugin — a SECOND build pass, not another ENTRYPOINTS row, because it needs a
