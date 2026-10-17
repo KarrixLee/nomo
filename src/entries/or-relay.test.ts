@@ -1,7 +1,7 @@
 import { afterAll, describe, expect, test } from "bun:test";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
-import { rewriteBody, startRelay, stripToolAdditions } from "./or-relay";
+import { rewriteBody, startRelay, stripHopByHop, stripToolAdditions } from "./or-relay";
 
 describe("or-relay strip", () => {
   test("drops tool_addition blocks, drops a message they emptied, keeps everything else", () => {
@@ -65,5 +65,63 @@ describe("or-relay end to end", () => {
     expect(seen.path).toBe("/api/v1/messages?beta=true");
     expect(seen.auth).toBe("Bearer test-token");
     expect(seen.body).toEqual({ messages: [{ role: "user", content: [{ type: "text", text: "q" }] }] });
+  });
+});
+
+describe("or-relay aborts and resets", () => {
+  /** A stub upstream that sends headers + one SSE chunk and then either hangs or resets the socket. */
+  function stubUpstream(mode: "hang" | "reset") {
+    const state = { upstreamClosed: false };
+    const server = createServer((req, res) => {
+      req.resume();
+      req.on("end", () => {
+        res.writeHead(200, { "content-type": "text/event-stream" });
+        res.write("event: a\ndata: 1\n\n");
+        res.on("close", () => { state.upstreamClosed = true; });
+        if (mode === "reset") setTimeout(() => req.socket.destroy(), 20);
+      });
+    }).listen(0, "127.0.0.1");
+    return { server, state };
+  }
+  async function relayFor(server: Server): Promise<{ relay: Server; port: number }> {
+    if (!server.listening) await new Promise((r) => server.once("listening", r));
+    const relay = startRelay(0, `http://127.0.0.1:${(server.address() as AddressInfo).port}`);
+    await new Promise((r) => relay.once("listening", r));
+    return { relay, port: (relay.address() as AddressInfo).port };
+  }
+  const until = async (cond: () => boolean, ms = 2000) => {
+    for (const end = Date.now() + ms; !cond() && Date.now() < end;) await new Promise((r) => setTimeout(r, 10));
+    return cond();
+  };
+
+  test("client abort mid-stream aborts the upstream request", async () => {
+    const { server, state } = stubUpstream("hang");
+    const { relay, port } = await relayFor(server);
+    try {
+      const ctl = new AbortController();
+      const res = await fetch(`http://127.0.0.1:${port}/v1/messages`, { method: "POST", body: "{}", signal: ctl.signal });
+      await res.body!.getReader().read(); // first SSE chunk arrived
+      ctl.abort();
+      expect(await until(() => state.upstreamClosed)).toBe(true);
+    } finally { relay.close(); server.close(); }
+  });
+
+  test("upstream reset after headers ends the client response with an error, never a hang", async () => {
+    const { server } = stubUpstream("reset");
+    const { relay, port } = await relayFor(server);
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/v1/messages`, { method: "POST", body: "{}" });
+      expect(res.status).toBe(200);
+      const outcome = await Promise.race([
+        res.text().then((t) => `ended cleanly: ${t}`, () => "errored"),
+        new Promise((r) => setTimeout(() => r("hung"), 3000)),
+      ]);
+      expect(outcome).toBe("errored");
+    } finally { relay.close(); server.close(); }
+  });
+
+  test("hop-by-hop headers, including ones Connection names, are stripped", () => {
+    expect(stripHopByHop({ connection: "close, x-foo", "x-foo": "1", te: "trailers", upgrade: "h2c", "proxy-authorization": "p", authorization: "a", "keep-alive": "5" }))
+      .toEqual({ authorization: "a" });
   });
 });

@@ -8,7 +8,7 @@ import { createLanAnswerStore } from "../core/lan-listener";
 import type { DecisionHold, PlanPickerTraceDecision, SessionRecord } from "../core/shared";
 import { GONE_STRIKE_LIMIT, readGoneStrikes, recordGoneStrike, resetGoneStrikes, tracePlanPickerDecision } from "../core/shared";
 import {
-  acceptLanAnswer, acceptLanCommand, commandWaitLoop, enqueueDrainCommands, LAN_ANSWER_ECHO_DELAY_MS, LAN_COMMAND_ID_PREFIX,
+  acceptLanAnswer, acceptLanCommand, commandWaitLoop, createWake, fileCursorStore, isCommandActiveSession, enqueueDrainCommands, LAN_ANSWER_ECHO_DELAY_MS, LAN_COMMAND_ID_PREFIX,
   buildDoneEnvelope, buildEndEnvelope, buildHeartbeatEnvelope, buildNeedsAttentionEnvelope, buildProvisionalBlob,
   buildProvisionalEnvelope, buildProvisionalRecord, buildStartEnvelope, buildTitleRepairEnvelope, classifySession,
   claudeTailPendingApproval, codexLastTurnEvent, codexTailPendingApproval, correctIdleClaude, correctInterrupt,
@@ -4813,8 +4813,9 @@ describe("commandWaitLoop (GET /v1/cc/commands/wait long-poll)", () => {
     const sleeps: number[] = [];
     const fail = () => new Response(null, { status: 404 });
     const { fetchStub } = scripted(ctl, [...Array(8).fill(fail), () => Response.json({ commands: [], cursor: 0 }), fail]);
-    await commandWaitLoop(cfg, ctl.signal, { fetch: fetchStub, sleep: async (ms) => { sleeps.push(ms); }, random: () => 1 });
-    expect(sleeps).toEqual([1000, 2000, 4000, 8000, 16000, 32000, 60000, 60000, 1000]);
+    await commandWaitLoop(cfg, ctl.signal, { fetch: fetchStub, sleep: async (ms) => { sleeps.push(ms); }, random: () => 1, now: () => 0 });
+    // …60 s cap, then the success's 1 s empty-200 floor, then the backoff restarts at 1 s.
+    expect(sleeps).toEqual([1000, 2000, 4000, 8000, 16000, 32000, 60000, 60000, 1000, 1000]);
   });
 
   test("shutdown aborts an in-flight long-poll promptly", async () => {
@@ -4849,5 +4850,104 @@ describe("commandWaitLoop (GET /v1/cc/commands/wait long-poll)", () => {
     await commandWaitLoop(() => current, ctl.signal, { fetch: fetchStub, sleep: async () => {} });
     expect(calls.map((c) => c.url.split("after=")[1])).toEqual(["0", "5", "0"]);
     expect(calls[2].headers["x-cc-pairing"]).toBe("p2");
+  });
+
+  const hanging = (calls: { aborted: boolean }[]) => ((_url: string, init: RequestInit) => new Promise<Response>((_, reject) => {
+    const call = { aborted: false };
+    calls.push(call);
+    init.signal?.addEventListener("abort", () => { call.aborted = true; reject(new Error("aborted")); });
+  })) as unknown as typeof fetch;
+  const until = async (cond: () => boolean, ms = 1000) => {
+    for (const end = Date.now() + ms; !cond() && Date.now() < end;) await new Promise((r) => setTimeout(r, 5));
+    return cond();
+  };
+
+  test("idle (no active session) → no requests at all", async () => {
+    const ctl = new AbortController();
+    const { calls, fetchStub } = scripted(ctl, []);
+    let naps = 0;
+    await commandWaitLoop(cfg, ctl.signal, {
+      fetch: fetchStub, isActive: () => false, sleep: async () => { if (++naps === 5) ctl.abort(); },
+    });
+    expect(calls).toHaveLength(0);
+  });
+
+  test("going idle aborts the parked poll; going active again wakes the idle wait at once", async () => {
+    const ctl = new AbortController();
+    const wake = createWake();
+    let active = true;
+    const calls: { aborted: boolean }[] = [];
+    const loop = commandWaitLoop(cfg, ctl.signal, { fetch: hanging(calls), isActive: () => active, wake });
+    expect(await until(() => calls.length === 1)).toBe(true); // active → polls
+    active = false; wake.kick();
+    expect(await until(() => calls[0].aborted)).toBe(true);
+    await new Promise((r) => setTimeout(r, 50));
+    expect(calls).toHaveLength(1); // idle: no new poll
+    active = true; wake.kick(); // the idle wait is POLL_MS (5 s); the kick must cut it short
+    expect(await until(() => calls.length === 2, 500)).toBe(true);
+    ctl.abort();
+    await loop;
+  });
+
+  test("the cursor survives a restart per pairing, and resets for a new one", async () => {
+    const saved = new Map<string, number>();
+    const cursorStore = { load: (p: string) => saved.get(p) ?? 0, save: async (p: string, c: number) => { saved.set(p, c); } };
+    const ctl1 = new AbortController();
+    const first = scripted(ctl1, [() => Response.json({ commands: [], cursor: 7 })]);
+    await commandWaitLoop(cfg, ctl1.signal, { fetch: first.fetchStub, sleep: async () => {}, cursorStore });
+    expect(saved.get("p")).toBe(7);
+    const ctl2 = new AbortController(); // "restart"
+    const second = scripted(ctl2, []);
+    await commandWaitLoop(cfg, ctl2.signal, { fetch: second.fetchStub, sleep: async () => {}, cursorStore });
+    expect(second.calls[0].url).toEndWith("after=7");
+    const ctl3 = new AbortController();
+    const third = scripted(ctl3, []);
+    await commandWaitLoop(() => ({ ...cfg(), pairingId: "p2" }), ctl3.signal, { fetch: third.fetchStub, sleep: async () => {}, cursorStore });
+    expect(third.calls[0].url).toEndWith("after=0");
+  });
+
+  test("the file cursor store is per pairing and atomic-written", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "nomo-cursor-"));
+    const store = fileCursorStore(join(dir, "command-cursor.json"));
+    expect(store.load("p")).toBe(0);
+    await store.save("p", 12);
+    expect(store.load("p")).toBe(12);
+    expect(store.load("other")).toBe(0);
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  test("an immediate empty 200 is floored to ~1 s before the next poll", async () => {
+    const ctl = new AbortController();
+    const sleeps: number[] = [];
+    let t = 0;
+    const { fetchStub } = scripted(ctl, [() => { t += 200; return Response.json({ commands: [], cursor: 0 }); }]);
+    await commandWaitLoop(cfg, ctl.signal, { fetch: fetchStub, sleep: async (ms) => { sleeps.push(ms); }, now: () => t });
+    expect(sleeps).toEqual([800]);
+  });
+
+  test("a re-pair kick wakes a backoff sleep", async () => {
+    const ctl = new AbortController();
+    const wake = createWake();
+    let current: Config = cfg();
+    const pairings: string[] = [];
+    const fetchStub = (async (_url: string, init: RequestInit) => {
+      pairings.push((init.headers as Record<string, string>)["x-cc-pairing"]);
+      return new Response(null, { status: 503 });
+    }) as unknown as typeof fetch;
+    const loop = commandWaitLoop(() => current, ctl.signal, { fetch: fetchStub, wake, random: () => 1 });
+    expect(await until(() => pairings.length === 1)).toBe(true);
+    current = { ...cfg(), pairingId: "p2" }; wake.kick(); // backoff is 1 s; the kick skips it
+    expect(await until(() => pairings.length === 2, 300)).toBe(true);
+    expect(pairings[1]).toBe("p2");
+    ctl.abort();
+    await loop;
+  });
+
+  test("only a working or user-parked session keeps the long-poll up", () => {
+    expect(isCommandActiveSession(rec({ lastEvent: "working" }))).toBe(true);
+    expect(isCommandActiveSession(rec({ lastEvent: "needsAttention" }))).toBe(true);
+    expect(isCommandActiveSession(rec({ lastEvent: "done" }))).toBe(false);
+    expect(isCommandActiveSession(rec({ lastEvent: "working", op: "done" }))).toBe(false);
+    expect(isCommandActiveSession(rec({ lastEvent: "sessionStart" }))).toBe(false);
   });
 });

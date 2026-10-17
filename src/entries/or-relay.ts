@@ -15,6 +15,7 @@
 
 import { createServer, request as httpRequest, type IncomingHttpHeaders, type Server } from "node:http";
 import { request as httpsRequest } from "node:https";
+import { pipeline } from "node:stream";
 import { PLUGIN_VERSION } from "../core/shared";
 
 export const RELAY_PORT = 47181;
@@ -47,6 +48,15 @@ export function rewriteBody(method: string, path: string, raw: Buffer): Buffer {
   }
 }
 
+/** RFC 9110 §7.6.1 hop-by-hop headers, plus any the Connection header names: never forwarded. */
+const HOP_BY_HOP = ["connection", "keep-alive", "proxy-connection", "proxy-authenticate", "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade"];
+export function stripHopByHop(h: IncomingHttpHeaders): IncomingHttpHeaders {
+  const out = { ...h };
+  for (const n of String(h.connection ?? "").split(",")) delete out[n.trim().toLowerCase()];
+  for (const n of HOP_BY_HOP) delete out[n];
+  return out;
+}
+
 /** Start the relay. `upstream` is overridable for tests (a local stub); default OpenRouter. */
 export function startRelay(port = RELAY_PORT, upstream = OPENROUTER_UPSTREAM): Server {
   const up = new URL(upstream);
@@ -57,20 +67,23 @@ export function startRelay(port = RELAY_PORT, upstream = OPENROUTER_UPSTREAM): S
     req.on("data", (c) => chunks.push(c));
     req.on("end", () => {
       const body = rewriteBody(req.method ?? "GET", req.url ?? "/", Buffer.concat(chunks));
-      const headers: IncomingHttpHeaders = { ...req.headers, host: up.host };
-      delete headers.connection;
+      const headers: IncomingHttpHeaders = { ...stripHopByHop(req.headers), host: up.host };
       if (body.length || req.headers["content-length"] !== undefined) headers["content-length"] = String(body.length);
-      delete headers["transfer-encoding"];
       const out = send({
         protocol: up.protocol, hostname: up.hostname, port: up.port || undefined,
         method: req.method, path: base + (req.url ?? "/"), headers,
       }, (r) => {
-        res.writeHead(r.statusCode ?? 502, r.headers);
-        r.pipe(res); // SSE passes through chunk by chunk
+        res.writeHead(r.statusCode ?? 502, stripHopByHop(r.headers));
+        // SSE passes through chunk by chunk; an upstream reset mid-stream destroys res, so CC sees the
+        // connection drop instead of a request that hangs forever.
+        pipeline(r, res, () => {});
       });
+      // CC gave up (Esc, timeout, exit): abort upstream so OpenRouter stops generating — and billing.
+      res.on("close", () => { if (!res.writableFinished) out.destroy(); });
       out.on("error", (e) => {
         console.error(`or-relay: upstream error: ${e.message}`);
-        if (!res.headersSent) res.writeHead(502, { "content-type": "application/json" });
+        if (res.headersSent || res.destroyed) { res.destroy(); return; } // never a JSON error inside an SSE stream
+        res.writeHead(502, { "content-type": "application/json" });
         res.end(JSON.stringify({ type: "error", error: { type: "api_error", message: "nomo relay: upstream unreachable" } }));
       });
       out.end(body);

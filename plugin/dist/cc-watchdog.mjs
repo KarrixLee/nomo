@@ -106,7 +106,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "2.3.9";
+var PLUGIN_VERSION = "2.3.10";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -8783,6 +8783,49 @@ function acceptLanCommand(command, deps = {}) {
 var COMMAND_WAIT_TIMEOUT_MS = 35000;
 var COMMAND_WAIT_BACKOFF_MIN_MS = 1000;
 var COMMAND_WAIT_BACKOFF_MAX_MS = 60000;
+var COMMAND_WAIT_EMPTY_FLOOR_MS = 1000;
+var COMMAND_CURSOR_PATH = `${CC_DIR}/command-cursor.json`;
+function fileCursorStore(path = COMMAND_CURSOR_PATH) {
+  return {
+    load: (pairingId) => {
+      try {
+        const c = JSON.parse(readFileSync2(path, "utf8"));
+        return c.pairingId === pairingId && typeof c.cursor === "number" && Number.isFinite(c.cursor) ? c.cursor : 0;
+      } catch {
+        return 0;
+      }
+    },
+    save: (pairingId, cursor) => atomicWrite(path, JSON.stringify({ pairingId, cursor }), 384)
+  };
+}
+function createWake() {
+  let c = new AbortController;
+  return { get signal() {
+    return c.signal;
+  }, kick() {
+    c.abort();
+    c = new AbortController;
+  } };
+}
+function isCommandActiveSession(record) {
+  if (record.op === "done" || record.lastEvent === "done")
+    return false;
+  return record.lastEvent === "working" || isWaitingSession(record);
+}
+function anyAbort(...signals) {
+  const c = new AbortController;
+  const abort = () => c.abort();
+  for (const s of signals) {
+    if (s.aborted)
+      c.abort();
+    else
+      s.addEventListener("abort", abort);
+  }
+  return { signal: c.signal, release: () => {
+    for (const s of signals)
+      s.removeEventListener("abort", abort);
+  } };
+}
 var abortableSleep2 = (ms, signal) => new Promise((resolve) => {
   if (signal.aborted)
     return resolve();
@@ -8798,23 +8841,35 @@ async function commandWaitLoop(getConfig, signal, deps = {}) {
   const doFetch = deps.fetch ?? fetch;
   const sleep = deps.sleep ?? abortableSleep2;
   const random = deps.random ?? Math.random;
+  const isActive = deps.isActive ?? (() => true);
+  const wake = deps.wake ?? createWake();
+  const now = deps.now ?? Date.now;
+  const nap = async (ms, kicked) => {
+    const s = anyAbort(signal, kicked);
+    try {
+      await sleep(ms, s.signal);
+    } finally {
+      s.release();
+    }
+  };
   let cursor = 0;
   let pairingId;
   let failures = 0;
   while (!signal.aborted) {
+    const kicked = wake.signal;
     const config = getConfig();
-    if (!config) {
-      await sleep(POLL_MS, signal);
+    if (!config || !isActive()) {
+      await nap(POLL_MS, kicked);
       continue;
     }
     if (config.pairingId !== pairingId) {
       pairingId = config.pairingId;
-      cursor = 0;
+      cursor = deps.cursorStore?.load(pairingId) ?? 0;
     }
-    const request = new AbortController;
-    const abortRequest = () => request.abort();
-    signal.addEventListener("abort", abortRequest);
-    const timer = setTimeout(abortRequest, COMMAND_WAIT_TIMEOUT_MS);
+    const timeout = new AbortController;
+    const timer = setTimeout(() => timeout.abort(), COMMAND_WAIT_TIMEOUT_MS);
+    const request = anyAbort(signal, kicked, timeout.signal);
+    const started = now();
     try {
       const res = await doFetch(`${config.url}/v1/cc/commands/wait?after=${cursor}`, {
         headers: { "x-cc-pairing": config.pairingId, "x-cc-auth": config.pcSecret, "x-cc-version": PLUGIN_VERSION },
@@ -8826,20 +8881,29 @@ async function commandWaitLoop(getConfig, signal, deps = {}) {
       const seqs = Array.isArray(body.commands) ? body.commands.map((c) => Number(c?.seq)).filter(Number.isFinite) : [];
       const next = typeof body.cursor === "number" && Number.isFinite(body.cursor) ? body.cursor : Math.max(cursor, ...seqs);
       const commands = extractCommands(body);
-      cursor = next;
+      if (next !== cursor) {
+        cursor = next;
+        await deps.cursorStore?.save(pairingId, cursor).catch(() => {});
+      }
       failures = 0;
       if (commands.length > 0) {
         bufferCommands(commands);
         enqueueDrainCommands(config, deps.drainDeps).catch(() => 0);
+      } else {
+        const elapsed = now() - started;
+        if (elapsed < COMMAND_WAIT_EMPTY_FLOOR_MS)
+          await nap(COMMAND_WAIT_EMPTY_FLOOR_MS - elapsed, kicked);
       }
     } catch {
       if (signal.aborted)
         return;
+      if (kicked.aborted)
+        continue;
       const ceiling = Math.min(COMMAND_WAIT_BACKOFF_MAX_MS, COMMAND_WAIT_BACKOFF_MIN_MS * 2 ** failures++);
-      await sleep(Math.max(COMMAND_WAIT_BACKOFF_MIN_MS, ceiling * (0.5 + random() / 2)), signal);
+      await nap(Math.max(COMMAND_WAIT_BACKOFF_MIN_MS, ceiling * (0.5 + random() / 2)), kicked);
     } finally {
       clearTimeout(timer);
-      signal.removeEventListener("abort", abortRequest);
+      request.release();
     }
   }
 }
@@ -9730,11 +9794,12 @@ async function sweep(config, deps = {}) {
   try {
     files = await readdir4(SESSIONS_DIR);
   } catch {
-    return { revoked: false, remaining: 0, delivered: false };
+    return { revoked: false, remaining: 0, delivered: false, active: 0 };
   }
   const now = Date.now();
   await pruneStaleDecisionHolds(files);
   let remaining = 0;
+  let active = 0;
   let delivered = false;
   const pairingIsNew = config !== null && config.pairingId !== greetedPairingId;
   let greetDelivered = false;
@@ -9755,6 +9820,8 @@ async function sweep(config, deps = {}) {
       continue;
     }
     if (verdict === "keep") {
+      if (record && isCommandActiveSession(record))
+        active++;
       let planVerificationHandled = false;
       if (config && record) {
         const verification = await correctPlanPickerVerification(config, path, sessionId, record, {
@@ -9905,7 +9972,7 @@ async function sweep(config, deps = {}) {
   }
   if (config !== null && greetDelivered)
     greetedPairingId = config.pairingId;
-  return { revoked: false, remaining, delivered };
+  return { revoked: false, remaining, delivered, active };
 }
 async function goneStrikeShouldTeardown(goneStrikesPath) {
   return await recordGoneStrike(goneStrikesPath) >= GONE_STRIKE_LIMIT;
@@ -10178,8 +10245,15 @@ async function run() {
     } catch {}
   };
   let currentConfig = null;
+  let commandActive = false;
+  let commandPairingId;
+  const commandWake = createWake();
   const commandWait = new AbortController;
-  commandWaitLoop(() => currentConfig, commandWait.signal);
+  commandWaitLoop(() => currentConfig, commandWait.signal, {
+    isActive: () => commandActive,
+    wake: commandWake,
+    cursorStore: fileCursorStore()
+  });
   const shutdown = () => {
     commandWait.abort();
     bridges.shutdown();
@@ -10194,6 +10268,10 @@ async function run() {
       await bridges.sync(config);
       setCodexBridgeDown(bridges.daemonDown);
       lan.sync(config);
+      if (config?.pairingId !== commandPairingId) {
+        commandPairingId = config?.pairingId;
+        commandWake.kick();
+      }
       currentConfig = config;
       if (config) {
         await reconcileProvisionalsSweep(config);
@@ -10202,6 +10280,10 @@ async function run() {
       const result = await sweep(config, {
         threadWaitState: (threadId) => bridges.threadWaitState(threadId)
       });
+      if (!result.revoked && result.active > 0 !== commandActive) {
+        commandActive = result.active > 0;
+        commandWake.kick();
+      }
       if (config)
         await enqueueDrainCommands(config);
       if (result.revoked) {
@@ -10278,10 +10360,12 @@ export {
   CLAUDE_AWAITING_PROMPT_REAP_MS,
   CLAUDE_IDLE_REAP_MAX_ATTEMPTS,
   CODEX_TUI_SESSION_START_SKEW_MS,
+  COMMAND_CURSOR_PATH,
   COMMAND_FUTURE_SKEW_MS,
   COMMAND_TTL_MS,
   COMMAND_WAIT_BACKOFF_MAX_MS,
   COMMAND_WAIT_BACKOFF_MIN_MS,
+  COMMAND_WAIT_EMPTY_FLOOR_MS,
   COMMAND_WAIT_TIMEOUT_MS,
   IDLE_GRACE_MS,
   LAN_ANSWER_ECHO_DELAY_MS,
@@ -10326,6 +10410,7 @@ export {
   correctResolvedPlanPicker,
   correlateCodexTuiPid,
   createBridgeSupervisor,
+  createWake,
   decisionHoldIsLive,
   discoverLiveSessions,
   drainCommands,
@@ -10333,10 +10418,12 @@ export {
   enforceWatchdogOwnership,
   enqueueDrainCommands,
   extractCommands,
+  fileCursorStore,
   goneStrikeShouldTeardown,
   hasInterruptMarker,
   heartbeatKind,
   isClaudeIdleReapEligible,
+  isCommandActiveSession,
   isRetireEligible,
   isRightfulWatchdogOwner,
   isWaitingSession,

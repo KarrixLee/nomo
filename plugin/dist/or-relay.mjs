@@ -4,6 +4,7 @@ var __require = /* @__PURE__ */ createRequire(import.meta.url);
 // src/entries/or-relay.ts
 import { createServer, request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
+import { pipeline } from "node:stream";
 
 // src/core/shared.ts
 import { access, chmod, open, readFile, rename, stat, mkdir, unlink, writeFile } from "node:fs/promises";
@@ -98,7 +99,7 @@ async function sha256Hex(s) {
 }
 
 // src/core/shared.ts
-var PLUGIN_VERSION = "2.3.9";
+var PLUGIN_VERSION = "2.3.10";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -1096,6 +1097,15 @@ function rewriteBody(method, path, raw) {
     return raw;
   }
 }
+var HOP_BY_HOP = ["connection", "keep-alive", "proxy-connection", "proxy-authenticate", "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade"];
+function stripHopByHop(h) {
+  const out = { ...h };
+  for (const n of String(h.connection ?? "").split(","))
+    delete out[n.trim().toLowerCase()];
+  for (const n of HOP_BY_HOP)
+    delete out[n];
+  return out;
+}
 function startRelay(port = RELAY_PORT, upstream = OPENROUTER_UPSTREAM) {
   const up = new URL(upstream);
   const send = up.protocol === "https:" ? httpsRequest : httpRequest;
@@ -1105,11 +1115,9 @@ function startRelay(port = RELAY_PORT, upstream = OPENROUTER_UPSTREAM) {
     req.on("data", (c) => chunks.push(c));
     req.on("end", () => {
       const body = rewriteBody(req.method ?? "GET", req.url ?? "/", Buffer.concat(chunks));
-      const headers = { ...req.headers, host: up.host };
-      delete headers.connection;
+      const headers = { ...stripHopByHop(req.headers), host: up.host };
       if (body.length || req.headers["content-length"] !== undefined)
         headers["content-length"] = String(body.length);
-      delete headers["transfer-encoding"];
       const out = send({
         protocol: up.protocol,
         hostname: up.hostname,
@@ -1118,13 +1126,20 @@ function startRelay(port = RELAY_PORT, upstream = OPENROUTER_UPSTREAM) {
         path: base + (req.url ?? "/"),
         headers
       }, (r) => {
-        res.writeHead(r.statusCode ?? 502, r.headers);
-        r.pipe(res);
+        res.writeHead(r.statusCode ?? 502, stripHopByHop(r.headers));
+        pipeline(r, res, () => {});
+      });
+      res.on("close", () => {
+        if (!res.writableFinished)
+          out.destroy();
       });
       out.on("error", (e) => {
         console.error(`or-relay: upstream error: ${e.message}`);
-        if (!res.headersSent)
-          res.writeHead(502, { "content-type": "application/json" });
+        if (res.headersSent || res.destroyed) {
+          res.destroy();
+          return;
+        }
+        res.writeHead(502, { "content-type": "application/json" });
         res.end(JSON.stringify({ type: "error", error: { type: "api_error", message: "nomo relay: upstream unreachable" } }));
       });
       out.end(body);
@@ -1143,5 +1158,6 @@ export {
   RELAY_PORT,
   rewriteBody,
   startRelay,
+  stripHopByHop,
   stripToolAdditions
 };

@@ -3,10 +3,10 @@ var __require = /* @__PURE__ */ createRequire(import.meta.url);
 
 // src/entries/handoff.ts
 import { execFileSync as execFileSync3, spawn as spawn2 } from "node:child_process";
-import { existsSync as existsSync3, mkdirSync, mkdtempSync, readdirSync, readFileSync as readFileSync2, rmSync, statSync as statSync2, writeFileSync } from "node:fs";
+import { existsSync as existsSync3, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync as readFileSync2, realpathSync, rmSync, statSync as statSync2, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
-import { dirname as dirname2, join as join3 } from "node:path";
+import { dirname as dirname2, join as join3, relative, sep } from "node:path";
 import { fileURLToPath as fileURLToPath2 } from "node:url";
 
 // src/core/crypto.ts
@@ -384,7 +384,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "2.3.9";
+var PLUGIN_VERSION = "2.3.10";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -3695,6 +3695,7 @@ var BOX_CC = "/root/.config/cc-status";
 var BOX_PLUGIN = `R=$(ls -d /root/.claude/plugins/cache/nomo/nomo-cc/*/ 2>/dev/null | tail -1)`;
 var RELAY_PORT = 47181;
 var BASE_TEMPLATE = "nomo-base";
+var SHM_SWEEP = `find /dev/shm -maxdepth 1 -name nomo-env -mmin +1 -delete 2>/dev/null || true`;
 var BOX_SIZE = "pro";
 var PAIR_FN = `nomo_pair() {
   ${BOX_PLUGIN}
@@ -3711,7 +3712,8 @@ var PAIR_FN = `nomo_pair() {
   tmux kill-session -t nomo-pair 2>/dev/null || true
   tmux new-session -d -s nomo-pair "bun $R/dist/pair.mjs wait > ${BOX_CC}/cloud-pair.log 2>&1"
 }`;
-var PAIR_POLL = `grep -q '"e2eKeyB64"' ${BOX_CC}/config.json 2>/dev/null && echo PAIRED && exit 0
+var PAIR_POLL = `${SHM_SWEEP}
+grep -q '"e2eKeyB64"' ${BOX_CC}/config.json 2>/dev/null && echo PAIRED && exit 0
 tmux has-session -t nomo-pair 2>/dev/null && echo WAITING && exit 0
 grep -q '"e2eKeyB64"' ${BOX_CC}/config.json 2>/dev/null && echo PAIRED || { echo ENDED; tail -1 ${BOX_CC}/cloud-pair.log 2>/dev/null; }`;
 function projectDirName(cwd) {
@@ -3814,9 +3816,73 @@ echo NOMO_BAKED`;
 }
 function targetWorker(flag, env) {
   const w = (typeof flag === "string" && flag ? flag : env || DEFAULT_WORKER_URL).replace(/\/$/, "");
-  if (!/^https?:\/\/[^/\s]+$/.test(w))
-    throw new Error(`worker URL must be an http(s) origin, got ${JSON.stringify(w)}`);
+  const bad = () => new Error(`worker URL must be an https origin (http only for localhost), got ${JSON.stringify(w)}`);
+  if (!/^https?:\/\/[^/\s@]+$/.test(w))
+    throw bad();
+  const u = new URL(w);
+  if (u.protocol !== "https:" && !["localhost", "127.0.0.1", "[::1]"].includes(u.hostname))
+    throw bad();
   return w;
+}
+var SENSITIVE = [".claude", ".config/cc-status", ".ssh", ".gnupg", ".aws", "Library/Keychains"];
+var EXCLUDE_SENSITIVE = SENSITIVE.flatMap((p) => ["--exclude", p]);
+function packRefusal(dir, home, has = existsSync3) {
+  const rel = relative(dir, home);
+  if (rel !== ".." && !rel.startsWith(".." + sep))
+    return `${dir} is your home folder or contains it`;
+  const hit = SENSITIVE.find((p) => has(join3(dir, p)));
+  return hit ? `${dir} contains ${hit}` : undefined;
+}
+var UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+var MODEL_RE = /^[A-Za-z0-9._:/\[\]-]+$/;
+function checkLaunchIds(uuid, model) {
+  if (!UUID_RE.test(uuid))
+    throw new Error(`session id must be a UUID, got ${JSON.stringify(uuid)}`);
+  if (!MODEL_RE.test(model))
+    throw new Error(`model id may only contain letters, digits and . _ : / [ ] -, got ${JSON.stringify(model)}`);
+}
+function userLayerFiles(claudeHome, entries) {
+  const files = [], skipped = [];
+  for (const top of entries) {
+    const abs = join3(claudeHome, top);
+    if (!statSync2(abs, { throwIfNoEntry: false })) {
+      if (lstatSync(abs, { throwIfNoEntry: false }))
+        skipped.push(top);
+      continue;
+    }
+    if (statSync2(abs).isFile()) {
+      files.push(top);
+      continue;
+    }
+    const root = realpathSync(abs);
+    const walk = (rel, ancestors) => {
+      const p = join3(claudeHome, rel);
+      let real;
+      try {
+        real = realpathSync(p);
+      } catch {
+        skipped.push(rel);
+        return;
+      }
+      if (real !== root && !real.startsWith(root + sep)) {
+        skipped.push(rel);
+        return;
+      }
+      const st = statSync2(real);
+      if (st.isFile()) {
+        files.push(rel);
+        return;
+      }
+      if (!st.isDirectory() || ancestors.has(real))
+        return;
+      const next = new Set(ancestors).add(real);
+      for (const name of readdirSync(p))
+        if (name !== ".DS_Store")
+          walk(join3(rel, name), next);
+    };
+    walk(top, new Set);
+  }
+  return { files, skipped };
 }
 function packPlugin(out) {
   const plugin = pluginRoot();
@@ -3839,10 +3905,13 @@ function build(args, outDir) {
   if (!existsSync3(projDir))
     throw new Error(`no Claude Code transcripts for ${cwd} (looked in ${projDir})`);
   const uuid = typeof args.get("--session") === "string" ? args.get("--session") : latestSession(readdirSync(projDir).map((name) => ({ name, mtimeMs: statSync2(join3(projDir, name)).mtimeMs })));
+  if (uuid && !UUID_RE.test(uuid))
+    throw new Error(`session id must be a UUID, got ${JSON.stringify(uuid)}`);
   if (!uuid || !existsSync3(join3(projDir, `${uuid}.jsonl`)))
     throw new Error(`session ${uuid ?? "(none)"} not found in ${projDir}`);
   const transcript = readFileSync2(join3(projDir, `${uuid}.jsonl`), "utf8");
   const model = typeof args.get("--model") === "string" ? toOpenRouterModel(args.get("--model")) : toOpenRouterModel(lastModel(transcript) ?? "claude-opus-5-5");
+  checkLaunchIds(uuid, model);
   const art = {};
   const put = (name) => {
     art[`${STAGE}-${name}`] = join3(outDir, name);
@@ -3850,10 +3919,12 @@ function build(args, outDir) {
   };
   tar(put("project.tgz"), projDir, [`${uuid}.jsonl`, ...[uuid, "memory"].filter((p) => existsSync3(join3(projDir, p)))]);
   const claudeHome = join3(process.env.HOME, ".claude");
-  const layer = ["skills", "agents", "commands", "CLAUDE.md"].filter((p) => existsSync3(join3(claudeHome, p)));
-  const hasLayer = layer.length > 0;
+  const layer = userLayerFiles(claudeHome, ["skills", "agents", "commands", "CLAUDE.md"]);
+  if (layer.skipped.length)
+    console.log(`Not shipping ${layer.skipped.length} user-layer link(s) that point outside their folder: ${layer.skipped.join(", ")}`);
+  const hasLayer = layer.files.length > 0;
   if (hasLayer)
-    tar(put("userlayer.tgz"), claudeHome, ["-h", ...layer]);
+    tar(put("userlayer.tgz"), claudeHome, ["-h", "--null", "-T", "-"], Buffer.from(layer.files.join("\x00")));
   const marketplace = packPlugin(put("plugin.tgz"));
   let git = true, root = cwd, branch;
   try {
@@ -3861,14 +3932,18 @@ function build(args, outDir) {
   } catch {
     git = false;
   }
+  const home = process.env.HOME;
+  const refusal = git ? packRefusal(root, home, () => false) : packRefusal(cwd, home);
+  if (refusal)
+    throw new Error(`refusing to hand off: ${refusal}. Run it from a project folder.`);
   if (git) {
     branch = sh("git", ["rev-parse", "--abbrev-ref", "HEAD"], root).trim();
     sh("git", ["bundle", "create", "-q", put("repo.bundle"), "HEAD"], root);
     writeFileSync(put("wip.patch"), execFileSync3("git", ["diff", "--binary", "HEAD"], { cwd: root, maxBuffer: 1 << 30 }));
     const untracked = execFileSync3("git", ["ls-files", "--others", "--exclude-standard", "-z"], { cwd: root, maxBuffer: 1 << 30 });
-    tar(put("untracked.tgz"), root, ["--null", "-T", "-"], untracked);
+    tar(put("untracked.tgz"), root, [...EXCLUDE_SENSITIVE, "--null", "-T", "-"], untracked);
   } else {
-    tar(put("folder.tgz"), cwd, ["--exclude", "node_modules", "--exclude", ".git", "."]);
+    tar(put("folder.tgz"), cwd, ["--exclude", "node_modules", "--exclude", ".git", ...EXCLUDE_SENSITIVE, "."]);
   }
   for (const [box, local] of Object.entries(art)) {
     const size = statSync2(local).size;
@@ -3878,7 +3953,7 @@ function build(args, outDir) {
   }
   const enc = projectDirName(cwd);
   const runEnv = ["ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"];
-  const launch = `. /dev/shm/nomo-env; rm -f /dev/shm/nomo-env; export PATH="/root/.local/bin:$PATH"; exec claude --resume ${uuid} --model ${model}`;
+  const launch = `. /dev/shm/nomo-env; rm -f /dev/shm/nomo-env; export PATH="/root/.local/bin:$PATH"; exec claude --resume ${uuid} --model ${q(model)}`;
   const keepalive = `while tmux has-session -t nomo 2>/dev/null; do curl -s -X POST http://169.254.0.1:9090/v1/sandbox/keepalive -H 'Content-Type: application/json' -d '{"seconds":${KEEPALIVE_S}}' >/dev/null; sleep 600; done`;
   const script = `set -euo pipefail
 if command -v tmux >/dev/null && tmux has-session -t nomo 2>/dev/null; then
@@ -3888,6 +3963,7 @@ fi
 # Keys reach claude via RAM, never argv: the file is gone the moment the launcher has read it. Taken
 # FIRST and the key unset, so no tmux server (pair wait, relay, keepalive) ever inherits it in its env;
 # a run that dies before claude starts removes the file on the way out.
+rm -f /dev/shm/nomo-env
 ( umask 077; export -p | grep -E '^declare -x (${runEnv.join("|")})=' > /dev/shm/nomo-env )
 unset ANTHROPIC_AUTH_TOKEN
 trap 'tmux has-session -t nomo 2>/dev/null || rm -f /dev/shm/nomo-env' EXIT
@@ -4014,7 +4090,8 @@ function attachHelp() {
 `);
 }
 function paneScript(mode) {
-  const guard = `tmux has-session -t nomo 2>/dev/null || { echo 'tmux nomo: not running'; exit 2; }`;
+  const guard = `${SHM_SWEEP}
+tmux has-session -t nomo 2>/dev/null || { echo 'tmux nomo: not running'; exit 2; }`;
   if (mode === "send")
     return `${guard}
 tmux send-keys -t nomo -l -- "$NOMO_TEXT" && tmux send-keys -t nomo Enter`;
@@ -4079,6 +4156,15 @@ async function showPairing(omg, id, url) {
     console.log(`Pairing page opened in your browser (${page}). Scan it with Nomo on your iPhone to add this cloud box. Expires in 10 minutes.`);
   }
   console.log(`Waiting for the scan… (Ctrl-C is safe: the box keeps waiting on its own)`);
+  const onSignal = () => {
+    if (!process.stdout.isTTY)
+      try {
+        writeFileSync(page, result, { mode: 384 });
+      } catch {}
+    process.exit(130);
+  };
+  process.once("SIGINT", onSignal);
+  process.once("SIGTERM", onSignal);
   try {
     for (const end = Date.now() + PAIR_WAIT_MS;Date.now() < end; ) {
       await new Promise((r) => setTimeout(r, 5000));
@@ -4094,6 +4180,8 @@ async function showPairing(omg, id, url) {
       }
     }
   } finally {
+    process.off("SIGINT", onSignal);
+    process.off("SIGTERM", onSignal);
     if (!process.stdout.isTTY)
       writeFileSync(page, result, { mode: 384 });
   }
@@ -4130,12 +4218,20 @@ async function main() {
     console.log(PAIR_URL_MARKER + url);
     return;
   }
+  if (args.has("--send") && !String(args.get("--send")).trim())
+    throw new Error('usage: --send "<text>" (use --send-key Enter for a bare Enter)');
   const keys = readKeys();
   const worker = targetWorker(args.get("--worker"), process.env.NOMO_WORKER_URL);
   if (args.has("--dry-run")) {
     const out = mkdtempSync(join3(tmpdir(), "nomo-handoff-"));
-    const plan = build(args, out);
-    console.log(`DRY RUN: nothing was sent. Artifacts in ${out}`);
+    let plan;
+    try {
+      plan = build(args, out);
+    } catch (e) {
+      rmSync(out, { recursive: true, force: true });
+      throw e;
+    }
+    console.log(`DRY RUN: nothing was sent. Artifacts kept in ${out} (delete it when done)`);
     console.log(`session ${plan.uuid}  cwd ${plan.cwd}  repo ${plan.git ? `${plan.root} (${plan.branch})` : "(not git)"}  model ${plan.model}`);
     for (const [box, local] of Object.entries(plan.artifacts))
       console.log(`  ${local} -> ${box}  (${statSync2(local).size} B)`);
@@ -4159,8 +4255,10 @@ async function main() {
       return;
     }
     if (args.has("--stop")) {
-      if (sb.status === "running")
+      if (sb.status === "running") {
+        await exec(omg, sb.id, SHM_SWEEP).catch(() => {});
         await api(omg, "POST", `/sandboxes/${sb.id}/hibernate`);
+      }
       console.log(`Box ${sb.id} is asleep (hibernated; files and memory kept, deleted after 14 days asleep).`);
       return;
     }
@@ -4182,7 +4280,8 @@ async function main() {
       return;
     }
     if (args.has("--pair")) {
-      const r = await exec(omg, sb.id, `${PAIR_FN}
+      const r = await exec(omg, sb.id, `${SHM_SWEEP}
+${PAIR_FN}
 nomo_pair`, { NOMO_WORKER_URL: worker });
       if (/^NOMO_PAIRED$/m.test(r.stdout ?? ""))
         console.log(`Box ${sb.id} is already paired ✓`);
@@ -4191,7 +4290,8 @@ nomo_pair`, { NOMO_WORKER_URL: worker });
     }
     console.log(`Target worker: ${worker}`);
     console.log(`Box ${sb.id}: ${sb.status}${sb.keepAwakeUntil ? `, keep-awake until ${sb.keepAwakeUntil}` : ""}`);
-    const r = await exec(omg, sb.id, `tmux has-session -t nomo 2>/dev/null && { echo 'tmux nomo: alive'; tmux capture-pane -p -t nomo | sed -e :a -e '/^\\n*$/{$d;N;ba' -e '}' | tail -20; } || echo 'tmux nomo: not running'
+    const r = await exec(omg, sb.id, `${SHM_SWEEP}
+tmux has-session -t nomo 2>/dev/null && { echo 'tmux nomo: alive'; tmux capture-pane -p -t nomo | sed -e :a -e '/^\\n*$/{$d;N;ba' -e '}' | tail -20; } || echo 'tmux nomo: not running'
 echo; echo '--- Nomo on the box ---'
 ${BOX_PLUGIN}
 [ -n "$R" ] && bun "$R/dist/status-cmd.mjs" claude || echo 'Nomo plugin: not installed on the box'`);
@@ -4202,11 +4302,16 @@ ${BOX_PLUGIN}
   if (!keys.openrouter)
     throw new Error("OPENROUTER_API_KEY not set (env or ~/.nomo-spike.env)");
   const out = mkdtempSync(join3(tmpdir(), "nomo-handoff-"));
-  const plan = build(args, out);
-  console.log(`Handing off session ${plan.uuid} (${plan.model}) from ${plan.cwd} · Nomo worker ${worker}`);
-  const id = await ensureBox(omg);
-  for (const [box, local] of Object.entries(plan.artifacts)) {
-    await api(omg, "POST", `/sandboxes/${id}/files`, [{ path: box, content: readFileSync2(local).toString("base64"), mode: 384 }]);
+  let plan, id;
+  try {
+    plan = build(args, out);
+    console.log(`Handing off session ${plan.uuid} (${plan.model}) from ${plan.cwd} · Nomo worker ${worker}`);
+    id = await ensureBox(omg);
+    for (const [box, local] of Object.entries(plan.artifacts)) {
+      await api(omg, "POST", `/sandboxes/${id}/files`, [{ path: box, content: readFileSync2(local).toString("base64"), mode: 384 }]);
+    }
+  } finally {
+    rmSync(out, { recursive: true, force: true });
   }
   const r = await exec(omg, id, plan.script, {
     ANTHROPIC_BASE_URL: `http://127.0.0.1:${RELAY_PORT}`,
@@ -4250,12 +4355,16 @@ export {
   PAIR_FN,
   PAIR_POLL,
   RELAY_PORT,
+  SENSITIVE,
+  SHM_SWEEP,
   bakeScript,
   boxPairPayload,
   boxSetup,
+  checkLaunchIds,
   createBody,
   lastModel,
   latestSession,
+  packRefusal,
   paneScript,
   projectDirName,
   pubRawFromPkcs8,
@@ -4264,5 +4373,6 @@ export {
   takePairUrl,
   targetWorker,
   toOpenRouterModel,
+  userLayerFiles,
   withReload
 };
