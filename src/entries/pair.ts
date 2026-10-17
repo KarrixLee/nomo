@@ -38,16 +38,15 @@ import { b64url, Bytes, generateEphemeralKeyPair, sha256Hex } from "../core/cryp
 import { deriveCodeIkm, formatCodeString, randomCodeWords } from "../core/pair-code";
 import { renderPairPage } from "../core/pair-page";
 import { renderQRSVG } from "../qr/qr-svg";
+import { buildPairURL, DEFAULT_WORKER_URL } from "../core/pair-url";
+
+// Moved to core/pair-url so handoff can import them without bundling this entry's main block.
+export { buildPairURL, DEFAULT_WORKER_URL };
 
 // decryptDeviceName lived here historically; it now backs both this CLI and the watchdog self-heal,
 // so it moved to shared. Re-export it so its public name/import path stays stable.
 export { decryptDeviceName } from "../core/shared";
 
-// The custom domain on the same worker that still answers on
-// api-status-push.karrixlee1231.workers.dev. Both hostnames share one KV, so a plugin and an app
-// on opposite hosts still resolve the same pairing record — this can flip independently of the
-// app's PushServer.baseURL. Override with NOMO_WORKER_URL for wrangler dev / staging.
-export const DEFAULT_WORKER_URL = "https://api.nomo.gg";
 const POLL_INTERVAL_MS = 3_000;
 const MAX_WAIT_MS = 600_000; // == the worker's 10-minute pending-pairing TTL
 /** Every network call gets its own ceiling so a hung socket can't stall the 10-minute pairing
@@ -59,8 +58,6 @@ const CONFIG_MODE = 0o600;
  *  route self-heals a lost ack, so this is only ever a KV-tidiness concern, never a lost pairing. */
 const ACK_ATTEMPTS = 3;
 const ACK_RETRY_DELAY_MS = 1_000;
-
-const textEncoder = new TextEncoder();
 
 /** Injectable seams so pair.test.ts can run each phase with a scripted fetch, an instant sleep (no
  *  real 3 s waits), deterministic randomness, a temp config path, and a no-op watchdog spawn.
@@ -137,23 +134,6 @@ async function removePendingConfig(configPath: string): Promise<void> {
 
 export function bytesToHex(bytes: Bytes): string {
   return Array.from(bytes).map((b) => b.toString(16).padStart(2, "0")).join("");
-}
-
-/** The `nomo://pair` deep link the phone scans: worker URL (b64url of UTF-8), pairing id (hex),
- *  QR secret (b64url of 16 raw bytes — the HKDF input that never touches the worker), and the PC's
- *  ephemeral ratchet public key `QPC` (`e=`, b64url of the 65-byte SEC1 point — a PUBLIC key, safe to
- *  relay; the phone needs it to compute the ratchet's ECDH before it claims).
- *
- *  `u` is OMITTED when the worker URL is the production default (DEFAULT_WORKER_URL): the app fills
- *  in the same constant for a `u`-less link. This is the single biggest QR-shrink lever — the b64url
- *  worker URL is ~66 chars, over half the payload, so dropping it keeps the production QR small even
- *  with the added `e=` key. The 65-byte `e=` (~87 chars) can push the default payload past level-Q's
- *  v10 capacity; renderQRSVG already falls back to level L (larger capacity) so it always renders. */
-export function buildPairURL(
-  workerUrl: string, pairingId: string, qrSecret: Bytes, pcEphPub: Bytes,
-): string {
-  const u = workerUrl === DEFAULT_WORKER_URL ? "" : `&u=${b64url(textEncoder.encode(workerUrl))}`;
-  return `nomo://pair?v=1${u}&p=${pairingId}&s=${b64url(qrSecret)}&e=${b64url(pcEphPub)}`;
 }
 
 /** Extract the auth material a revoke needs from EITHER a COMPLETED ({...e2eKeyB64}) or a still-PENDING

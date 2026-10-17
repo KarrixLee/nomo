@@ -1118,7 +1118,36 @@ export interface CommandPayload {
  *  plugin is now the ONLY party that can read the blob — a blind relay cannot filter what it can't
  *  see. Anything else decrypts fine and is then rejected as bad-kind. */
 const INTERRUPT_COMMAND_KIND = "interrupt-session";
-const COMMAND_KINDS_ALLOWED = new Set(["focus-terminal", INTERRUPT_COMMAND_KIND]);
+const PING_COMMAND_KIND = "ping";
+const COMMAND_KINDS_ALLOWED = new Set(["focus-terminal", INTERRUPT_COMMAND_KIND, PING_COMMAND_KIND]);
+
+/** A "Delivery" latency ping: {"kind":"ping","sessionId":"-","nonce":"<uuid>","sentAt":<ms>}. It names
+ *  no session and carries `sentAt` instead of `ts`, so drainCommands answers it right after the tag
+ *  check and before the command shape/session gates. Nonce is capped so the sealed pong stays tiny. */
+const PING_NONCE_MAX = 64;
+export function parsePingPayload(plain: unknown): { nonce: string; sentAt: number } | undefined {
+  if (typeof plain !== "object" || plain === null) return undefined;
+  const p = plain as Record<string, unknown>;
+  if (p.kind !== PING_COMMAND_KIND) return undefined;
+  if (typeof p.nonce !== "string" || p.nonce.length === 0 || p.nonce.length > PING_NONCE_MAX) return undefined;
+  if (typeof p.sentAt !== "number" || !Number.isFinite(p.sentAt)) return undefined;
+  return { nonce: p.nonce, sentAt: p.sentAt };
+}
+
+/** POST the sealed pong to /v1/cc/pong with the watchdog's machine headers. Best-effort, never throws. */
+async function postPong(config: Config, blob: string): Promise<number | "failed"> {
+  try {
+    const res = await fetch(`${config.url}/v1/cc/pong`, {
+      method: "POST",
+      headers: watchdogEventHeaders(config, await localApprovalsState()),
+      body: JSON.stringify({ blob }),
+      signal: AbortSignal.timeout(POST_TIMEOUT_MS),
+    });
+    return res.status;
+  } catch {
+    return "failed";
+  }
+}
 
 /** Cap on commands accepted from ONE response. A compromised/buggy worker must not be able to hand
  *  this daemon an unbounded work list; 8 is far above the real ceiling (a user taps one row). */
@@ -1236,7 +1265,8 @@ export type FocusTraceResult =
                          // a timeout the interrupt may still land. Also what a thread NOT hosted by the
                          // shared daemon returns when the daemon is up (the server refuses an unknown thread)
   | "bridge-unavailable" // interrupt-session: no ready Codex bridge (daemon down, bridge parked or stopping)
-  | "no-turn";           // interrupt-session: the Codex record carries no active turn id
+  | "no-turn"            // interrupt-session: the Codex record carries no active turn id
+  | "pong";              // ping: a sealed pong was POSTed to /v1/cc/pong (status in the trace)
 
 /** The module's generic best-effort trace, with the same argv guard tracePicker uses: pure unit calls run
  *  inside `bun test` with the production HOME visible and must never pollute the user's live trace. Named
@@ -1277,6 +1307,8 @@ export interface DrainCommandsDeps {
   writeInterruptFlagFn?: (sessionId: string, now: number) => Promise<void>;
   /** Send turn/interrupt for an app-server agent. Defaults to the running loop's bridge supervisor. */
   interruptCodexTurnFn?: (threadId: string, turnId: string) => Promise<CodexTurnInterruptResult>;
+  /** POST a sealed pong body to /v1/cc/pong. Defaults to the real fetch. */
+  postPongFn?: (config: Config, blob: string) => Promise<number | "failed">;
   now?: () => number;
   trace?: (event: object) => void;
 }
@@ -1415,6 +1447,24 @@ export async function drainCommands(config: Config, deps: DrainCommandsDeps = {}
           plain = await decryptBlob(config.e2eKey, cmd.blob);
         } catch {
           traceFocus(deps, { ...base, result: "decrypt-failed" as FocusTraceResult });
+          continue;
+        }
+        // 2b. A latency ping: answered here, before the shape/session gates (it names no session).
+        // Freshness and replay still apply, on its sealed sentAt + nonce.
+        if ((plain as { kind?: unknown } | null)?.kind === PING_COMMAND_KIND) {
+          const ping = parsePingPayload(plain);
+          if (!ping) { traceFocus(deps, { ...base, kind: "ping", result: "malformed" as FocusTraceResult }); continue; }
+          if (!commandIsFresh(ping.sentAt, now)) { traceFocus(deps, { ...base, kind: "ping", result: "stale" as FocusTraceResult }); continue; }
+          if (seenCommandNonces.has(ping.nonce)) { traceFocus(deps, { ...base, kind: "ping", result: "replay" as FocusTraceResult }); continue; }
+          rememberBounded(seenCommandNonces, ping.nonce, SEEN_NONCES_MAX);
+          const via = cmd.id.startsWith(LAN_COMMAND_ID_PREFIX) ? "lan" : "relay";
+          const blob = await encryptBlob(config.e2eKey, { nonce: ping.nonce, recvAt: (deps.now ?? Date.now)(), via });
+          const send = deps.postPongFn ?? postPong;
+          // Fire-and-forget: a slow relay must not hold up the rest of the batch.
+          void send(config, blob).then(
+            (status) => traceFocus(deps, { ...base, kind: "ping", result: "pong" as FocusTraceResult, status }),
+            () => {},
+          );
           continue;
         }
         // 3. Authentic, but is it a command?
@@ -1575,6 +1625,155 @@ export function acceptLanCommand(command: LanCommand, deps: DrainCommandsDeps = 
     return enqueueDrainCommands(command.config, deps).catch(() => 0);
   } catch {
     return Promise.resolve(0); // a malformed sink call must never surface anywhere
+  }
+}
+
+// --- Command push (phone → Mac, worker long-poll, P1.6 / NOM-83) -------------------------------
+//
+// A THIRD intake for the same sealed commands: GET /v1/cc/commands/wait?after=<cursor> parks up to 25 s
+// on the pairing's Durable Object and returns the moment the phone enqueues, so an off-LAN command no
+// longer waits for the next /cc/event POST. Rows carry the SAME DO-minted id the /cc/event piggyback
+// would deliver, so a row both paths hand us is dropped by executedCommandIds (and the sealed nonce +
+// 120 s TTL bound any re-delivery). The cursor is persisted per pairing (command-cursor.json), so a
+// restart resumes where it left off instead of re-acking from 0 and re-running a command whose ack
+// never landed. The re-poll IS the ack (after=N deletes rows ≤ N).
+// COST: a parked poll bills the worker's Durable Object for wall-clock time, so the loop only polls
+// while a session is ACTIVE (mid-turn or parked on the user — run() feeds that from each sweep);
+// otherwise it idles and the /cc/event piggyback is the only intake. A change in activity or pairing
+// kicks the loop (aborting an in-flight poll / waking any sleep) so it reacts at once. Every failure — a 404 from a pre-P1.6 worker, 401,
+// 403 suspended, 429, 503, a network error — only backs off: this route is never a gone-strike signal;
+// /cc/event stays the sole revoke authority. The piggyback stays on as the fallback.
+
+export const COMMAND_WAIT_TIMEOUT_MS = 35_000;
+export const COMMAND_WAIT_BACKOFF_MIN_MS = 1_000;
+export const COMMAND_WAIT_BACKOFF_MAX_MS = 60_000;
+/** Minimum spacing after an empty 200 that came back early (a proxy that never parks the poll). */
+export const COMMAND_WAIT_EMPTY_FLOOR_MS = 1_000;
+export const COMMAND_CURSOR_PATH = `${CC_DIR}/command-cursor.json`;
+
+/** Where the loop keeps its cursor across restarts. Absent → in-memory only (tests). */
+export interface CommandCursorStore {
+  load(pairingId: string): number;
+  save(pairingId: string, cursor: number): Promise<void>;
+}
+export function fileCursorStore(path = COMMAND_CURSOR_PATH): CommandCursorStore {
+  return {
+    load: (pairingId) => {
+      try {
+        const c = JSON.parse(readFileSync(path, "utf8")) as { pairingId?: unknown; cursor?: unknown };
+        return c.pairingId === pairingId && typeof c.cursor === "number" && Number.isFinite(c.cursor) ? c.cursor : 0;
+      } catch { return 0; } // none yet, or another pairing's → start at 0
+    },
+    save: (pairingId, cursor) => atomicWrite(path, JSON.stringify({ pairingId, cursor }), 0o600),
+  };
+}
+
+/** A re-armable kick: `kick()` aborts the loop's current poll or sleep so it re-reads config + activity. */
+export function createWake(): { readonly signal: AbortSignal; kick(): void } {
+  let c = new AbortController();
+  return { get signal() { return c.signal; }, kick() { c.abort(); c = new AbortController(); } };
+}
+export type CommandWake = ReturnType<typeof createWake>;
+
+/** Is the phone plausibly steering this session right now: mid-turn, or parked on the user (question,
+ *  approval, plan picker)? Gates the command long-poll. Pure. */
+export function isCommandActiveSession(record: SessionRecord): boolean {
+  if (record.op === "done" || record.lastEvent === "done") return false;
+  return record.lastEvent === "working" || isWaitingSession(record);
+}
+
+export interface CommandWaitDeps {
+  fetch?: typeof fetch;
+  /** Abortable sleep; resolves early on abort. */
+  sleep?: (ms: number, signal: AbortSignal) => Promise<void>;
+  random?: () => number;
+  drainDeps?: DrainCommandsDeps;
+  /** Poll only while this holds (default: always). */
+  isActive?: () => boolean;
+  wake?: CommandWake;
+  cursorStore?: CommandCursorStore;
+  now?: () => number;
+}
+
+/** One signal that aborts when any of `signals` does (manual: AbortSignal.any is Node ≥ 20.3). */
+function anyAbort(...signals: AbortSignal[]): { signal: AbortSignal; release: () => void } {
+  const c = new AbortController();
+  const abort = (): void => c.abort();
+  for (const s of signals) { if (s.aborted) c.abort(); else s.addEventListener("abort", abort); }
+  return { signal: c.signal, release: () => { for (const s of signals) s.removeEventListener("abort", abort); } };
+}
+
+const abortableSleep = (ms: number, signal: AbortSignal): Promise<void> => new Promise((resolve) => {
+  if (signal.aborted) return resolve();
+  const done = (): void => { clearTimeout(timer); signal.removeEventListener("abort", done); resolve(); };
+  const timer = setTimeout(done, ms);
+  signal.addEventListener("abort", done);
+});
+
+/** Long-poll the worker for commands until `signal` aborts. Reads the CURRENT config every iteration
+ *  (a re-pair rotates the credentials; the cursor reloads for a new pairing). Idles while !isActive().
+ *  Never throws. */
+export async function commandWaitLoop(
+  getConfig: () => Config | null | undefined, signal: AbortSignal, deps: CommandWaitDeps = {},
+): Promise<void> {
+  const doFetch = deps.fetch ?? fetch;
+  const sleep = deps.sleep ?? abortableSleep;
+  const random = deps.random ?? Math.random;
+  const isActive = deps.isActive ?? (() => true);
+  const wake = deps.wake ?? createWake();
+  const now = deps.now ?? Date.now;
+  const nap = async (ms: number, kicked: AbortSignal): Promise<void> => {
+    const s = anyAbort(signal, kicked);
+    try { await sleep(ms, s.signal); } finally { s.release(); }
+  };
+  let cursor = 0;
+  let pairingId: string | undefined;
+  let failures = 0;
+  while (!signal.aborted) {
+    const kicked = wake.signal; // this iteration's: a kick from here on cuts the poll or sleep short
+    const config = getConfig();
+    if (!config || !isActive()) { await nap(POLL_MS, kicked); continue; }
+    if (config.pairingId !== pairingId) {
+      pairingId = config.pairingId;
+      cursor = deps.cursorStore?.load(pairingId) ?? 0;
+    }
+    // Shutdown, a kick, OR the per-request timeout aborts the fetch.
+    const timeout = new AbortController();
+    const timer = setTimeout(() => timeout.abort(), COMMAND_WAIT_TIMEOUT_MS);
+    const request = anyAbort(signal, kicked, timeout.signal);
+    const started = now();
+    try {
+      const res = await doFetch(`${config.url}/v1/cc/commands/wait?after=${cursor}`, {
+        headers: { "x-cc-pairing": config.pairingId, "x-cc-auth": config.pcSecret, "x-cc-version": PLUGIN_VERSION },
+        signal: request.signal,
+      });
+      if (!res.ok) throw new Error(`status ${res.status}`);
+      const body = (await res.json()) as { cursor?: unknown; commands?: unknown };
+      const seqs = Array.isArray(body.commands) ? body.commands.map((c) => Number((c as { seq?: unknown })?.seq)).filter(Number.isFinite) : [];
+      const next = typeof body.cursor === "number" && Number.isFinite(body.cursor) ? body.cursor : Math.max(cursor, ...seqs);
+      const commands = extractCommands(body);
+      if (next !== cursor) {
+        cursor = next;
+        await deps.cursorStore?.save(pairingId, cursor).catch(() => {});
+      }
+      failures = 0;
+      if (commands.length > 0) {
+        bufferCommands(commands);
+        void enqueueDrainCommands(config, deps.drainDeps).catch(() => 0);
+      } else {
+        const elapsed = now() - started;
+        if (elapsed < COMMAND_WAIT_EMPTY_FLOOR_MS) await nap(COMMAND_WAIT_EMPTY_FLOOR_MS - elapsed, kicked);
+      }
+    } catch {
+      if (signal.aborted) return;
+      if (kicked.aborted) continue; // went idle / re-paired: not a failure, re-evaluate now
+      // Jittered exponential backoff, 1 s → 60 s. Deliberately no gone-strike (see the header above).
+      const ceiling = Math.min(COMMAND_WAIT_BACKOFF_MAX_MS, COMMAND_WAIT_BACKOFF_MIN_MS * 2 ** failures++);
+      await nap(Math.max(COMMAND_WAIT_BACKOFF_MIN_MS, ceiling * (0.5 + random() / 2)), kicked);
+    } finally {
+      clearTimeout(timer);
+      request.release();
+    }
   }
 }
 
@@ -3412,7 +3611,7 @@ let waitingBeatAt: number | undefined;
  *  single transient gone never tears down). Otherwise `remaining` is how many session files are left
  *  (so the loop can auto-exit at zero) and `delivered` is true iff at least one POST landed 2xx this
  *  sweep — proof the pairing is alive, so the loop resets any accumulated gone-strike streak. */
-export type SweepResult = { revoked: true } | { revoked: false; remaining: number; delivered: boolean };
+export type SweepResult = { revoked: true } | { revoked: false; remaining: number; delivered: boolean; active: number };
 
 /** One pass over the sessions dir. A POST that fails (transient) leaves its file in place for the
  *  next sweep (bounded by the 24 h staleness rule); a dead session with no config is still cleaned up
@@ -3428,7 +3627,7 @@ async function sweep(config: Config | null, deps: SweepDeps = {}): Promise<Sweep
   try {
     files = await readdir(SESSIONS_DIR);
   } catch {
-    return { revoked: false, remaining: 0, delivered: false }; // no sessions dir yet → nothing to reap
+    return { revoked: false, remaining: 0, delivered: false, active: 0 }; // no sessions dir yet → nothing to reap
   }
   const now = Date.now();
   // Housekeeping FIRST, off the listing we already have: retire the `.hold` markers of hooks that were
@@ -3436,6 +3635,7 @@ async function sweep(config: Config | null, deps: SweepDeps = {}): Promise<Sweep
   // hold gate probes the holder pid), but the directory must not grow one per killed hook forever.
   await pruneStaleDecisionHolds(files);
   let remaining = 0;
+  let active = 0; // sessions the command long-poll should stay up for (isCommandActiveSession)
   // Any 2xx POST this sweep proves the pairing is alive → the loop resets the gone-strike streak, so a
   // real success from EITHER the watchdog or the hook clears a stray transient strike.
   let delivered = false;
@@ -3464,6 +3664,7 @@ async function sweep(config: Config | null, deps: SweepDeps = {}): Promise<Sweep
       continue;
     }
     if (verdict === "keep") {
+      if (record && isCommandActiveSession(record)) active++;
       // Long-lived Plan verification runs before the done-debt net: a killed/old Stop may have left a
       // donePending record whose terminal state is precisely what still needs classification.
       let planVerificationHandled = false;
@@ -3641,7 +3842,7 @@ async function sweep(config: Config | null, deps: SweepDeps = {}): Promise<Sweep
   // Claim the greet only once an envelope actually landed. With no sessions on disk there is nothing
   // to greet WITH, so the flag stays unclaimed and the very first session to appear gets the beat.
   if (config !== null && greetDelivered) greetedPairingId = config.pairingId;
-  return { revoked: false, remaining, delivered };
+  return { revoked: false, remaining, delivered, active };
 }
 
 /** Apply one watchdog-observed gone (404/410) sweep against the SHARED strike counter and decide
@@ -4173,7 +4374,17 @@ async function run(): Promise<void> {
   const stopLan = (): void => {
     try { lan.stop(); } catch { /* best-effort socket teardown */ }
   };
+  // The command long-poll (P1.6). Off the sweep's await path; reads the config this loop last loaded.
+  let currentConfig: Config | null = null;
+  let commandActive = false;
+  let commandPairingId: string | undefined;
+  const commandWake = createWake();
+  const commandWait = new AbortController();
+  void commandWaitLoop(() => currentConfig, commandWait.signal, {
+    isActive: () => commandActive, wake: commandWake, cursorStore: fileCursorStore(),
+  });
   const shutdown = (): void => {
+    commandWait.abort();
     bridges.shutdown();
     stopLan();
   };
@@ -4199,6 +4410,8 @@ async function run(): Promise<void> {
       // from it). Deliberately NOT awaited-on-IO: sync() only swaps a promise and returns, so the LAN
       // channel can never sit on the sweep path — the design's non-negotiable.
       lan.sync(config);
+      if (config?.pairingId !== commandPairingId) { commandPairingId = config?.pairingId; commandWake.kick(); } // re-pair: wake any backoff
+      currentConfig = config;
       // Discovery + reconcile run BEFORE the sweep (only when paired). Backstop-reconcile first (retire
       // any provisional whose real session already reported), then discover new TUIs — so a just-
       // surfaced provisional is counted in `remaining` this same cycle, keeping the daemon alive
@@ -4210,6 +4423,12 @@ async function run(): Promise<void> {
       const result = await sweep(config, {
         threadWaitState: (threadId) => bridges.threadWaitState(threadId),
       });
+      // Long-poll only while a session is active; flipping either way kicks the loop (going idle aborts
+      // the parked poll, going active wakes the idle wait).
+      if (!result.revoked && (result.active > 0) !== commandActive) {
+        commandActive = result.active > 0;
+        commandWake.kick();
+      }
       // Commands the worker piggybacked on THIS cycle's POST responses (discovery/reconcile/sweep).
       // Drained once per tick, off the POST path, so a slow osascript can never delay a status event.
       // Best-effort by construction — drainCommands swallows everything and returns a count.

@@ -111,7 +111,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "2.3.0";
+var PLUGIN_VERSION = "2.3.10";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -1622,6 +1622,11 @@ function firstUserPrompt(transcript) {
 `));
 }
 var MODEL_TAIL_BYTES = 64 * 1024;
+var MODEL_TAIL_WIDE_BYTES = 2 * 1024 * 1024;
+function normalizeModelId(id) {
+  const bare = id.slice(id.lastIndexOf("/") + 1);
+  return bare.startsWith("claude-") ? bare.replace(/(\d)\.(\d)/g, "$1-$2") : bare;
+}
 function assistantModelFromLine(line) {
   if (!line.includes('"assistant"') || !line.includes('"model"'))
     return;
@@ -1644,7 +1649,7 @@ function assistantModelFromLine(line) {
   const cleaned = model.trim();
   if (!cleaned || cleaned.startsWith("<"))
     return;
-  return cleaned;
+  return normalizeModelId(cleaned);
 }
 function lastAssistantModel(text) {
   const lines = text.split(`
@@ -1668,9 +1673,11 @@ function firstAssistantModel(text) {
 async function claudeSessionModel(prefix, transcriptPath) {
   if (transcriptPath.length > 0) {
     try {
-      const m = lastAssistantModel(await readSuffix(transcriptPath, MODEL_TAIL_BYTES));
-      if (m)
-        return m;
+      for (const bytes of [MODEL_TAIL_BYTES, MODEL_TAIL_WIDE_BYTES]) {
+        const m = lastAssistantModel(await readSuffix(transcriptPath, bytes));
+        if (m)
+          return m;
+      }
     } catch {}
   }
   return prefix.length > 0 ? firstAssistantModel(prefix) : undefined;
