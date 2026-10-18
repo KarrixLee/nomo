@@ -776,7 +776,8 @@ async function back(omg: string, args: Map<string, string | true>): Promise<void
   if (!uuid) throw new Error("no handed-off session on record; pass --session <uuid>");
   if (!UUID_RE.test(uuid)) throw new Error(`session id must be a UUID, got ${JSON.stringify(uuid)}`);
   const force = args.has("--force");
-  const waitMin = Number(args.get("--wait") ?? 15);
+  const waitArg = args.get("--wait");
+  const waitMin = typeof waitArg === "string" ? Number(waitArg) : 15;
   if (!(waitMin >= 0)) throw new Error("--wait takes minutes, e.g. --wait 30");
   const snap = cloud.sessions?.[uuid];
   const uuid8 = uuid.slice(0, 8);
@@ -1000,7 +1001,8 @@ async function main(): Promise<void> {
   const args = new Map<string, string | true>();
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
-    if (a === "--session" || a === "--model" || a === "--send" || a === "--send-key" || a === "--worker" || a === "--wait") args.set(a, argv[++i] ?? "");
+    if (a === "--session" || a === "--model" || a === "--send" || a === "--send-key" || a === "--worker") args.set(a, argv[++i] ?? "");
+    else if (a === "--wait" && /^\d+(\.\d+)?$/.test(argv[i + 1] ?? "")) args.set(a, argv[++i]);
     else args.set(a, true);
   }
 

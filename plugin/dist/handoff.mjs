@@ -384,7 +384,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "2.3.12";
+var PLUGIN_VERSION = "2.3.13";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -4682,7 +4682,8 @@ async function back(omg, args) {
   if (!UUID_RE.test(uuid))
     throw new Error(`session id must be a UUID, got ${JSON.stringify(uuid)}`);
   const force = args.has("--force");
-  const waitMin = Number(args.get("--wait") ?? 15);
+  const waitArg = args.get("--wait");
+  const waitMin = typeof waitArg === "string" ? Number(waitArg) : 15;
   if (!(waitMin >= 0))
     throw new Error("--wait takes minutes, e.g. --wait 30");
   const snap = cloud.sessions?.[uuid];
@@ -4938,8 +4939,10 @@ async function main() {
   const args = new Map;
   for (let i = 0;i < argv.length; i++) {
     const a = argv[i];
-    if (a === "--session" || a === "--model" || a === "--send" || a === "--send-key" || a === "--worker" || a === "--wait")
+    if (a === "--session" || a === "--model" || a === "--send" || a === "--send-key" || a === "--worker")
       args.set(a, argv[++i] ?? "");
+    else if (a === "--wait" && /^\d+(\.\d+)?$/.test(argv[i + 1] ?? ""))
+      args.set(a, argv[++i]);
     else
       args.set(a, true);
   }
