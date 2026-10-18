@@ -49,8 +49,11 @@
 // the Mac (core/cloud-back.ts: transcript, memory, code). What changed is judged against the snapshot
 // handoff saved in cloud.json `sessions[uuid]` (HEAD, branch, worktree fingerprint, transcript size +
 // sha, memory hashes): a Mac untouched since handoff fast-forwards in place, anything else lands on
-// branch `nomo/cloud-<id8>`; a Mac transcript appended after handoff forks to a new session id. Ends
-// by opening Terminal on `claude --resume` (--no-open just prints it).
+// branch `nomo/cloud-<id8>`; a Mac transcript appended after handoff forks to a new session id. Box work
+// that touches agent/editor/git config (.claude/, .mcp.json, CLAUDE.md, .envrc, .vscode/, …) never lands
+// in place: it goes to the branch and Terminal is not opened. It refuses to stop a box claude running a
+// different session (/root/.nomo-current) unless --force. Ends by opening Terminal on `claude --resume`
+// (--no-open just prints it).
 //
 // PORTABILITY: bun or node >= 18 (global fetch). Under node, an exec longer than ~300s trips undici's
 // headers timeout — the box script is kept short, so prefer bun.
@@ -67,9 +70,9 @@ import { buildPairURL, DEFAULT_WORKER_URL } from "../core/pair-url";
 import { normalizeModelId } from "../core/adapter";
 import { atomicWrite, CC_DIR, pidAlive, readRecord } from "../core/shared";
 import {
-  applyInPlace, atomicWriteBytes, type BoxArtifacts, boxIdle, copyContained, decideCode, extractTgz, landFolder, landOnBranch, listFiles,
-  MAX_ARTIFACT_BYTES, MAX_EXTRACTED_BYTES, macGitState, mergeMemory, mkdirp, parseMarkers, type Snapshot, takeSnapshot,
-  transcriptAction, validateTree,
+  agentConfigPaths, applyInPlace, atomicWriteBytes, type BoxArtifacts, boxChangedPaths, boxIdle, copyContained, decideCode, extractTgz,
+  landFolder, landOnBranch, listFiles, MAX_ARTIFACT_BYTES, MAX_EXTRACTED_BYTES, macGitState, mergeMemory, mkdirp, parseMarkers, printable,
+  type Snapshot, takeSnapshot, transcriptAction, validateTree,
 } from "../core/cloud-back";
 import { renderQR } from "../qr/qr";
 import { renderQRSVG } from "../qr/qr-svg";
@@ -457,6 +460,8 @@ tmux new-session -d -s nomo-relay "$(command -v bun || command -v node) $R/dist/
 for _ in $(seq 20); do (exec 3<>/dev/tcp/127.0.0.1/${RELAY_PORT}) 2>/dev/null && break; sleep 0.5; done
 (exec 3<>/dev/tcp/127.0.0.1/${RELAY_PORT}) 2>/dev/null || { echo "NOMO_RELAY_FAILED"; tmux capture-pane -p -t nomo-relay 2>/dev/null; exit 4; }
 
+# Which session tmux session nomo runs, so --back --session X never stops a different one (an id, no secret).
+printf %s ${q(uuid)} > ${BOX_CURRENT}
 tmux new-session -d -s nomo -x 200 -y 50 -c ${q(cwd)} ${q(`bash -c ${q(launch)}`)}
 tmux has-session -t nomo-keepalive 2>/dev/null || tmux new-session -d -s nomo-keepalive ${q(keepalive)}
 sleep 8
@@ -675,12 +680,21 @@ const BACK = "/tmp/nomo-back";
 /** The ONLY files --back ever pulls (BACK-<name>): never .claude.json, credentials, cc-status or /dev/shm. */
 export const BACK_FILES = ["repo.bundle", "wip.patch", "untracked.tgz", "project.tgz", "folder.tgz"] as const;
 const BACK_POLL_MS = 10_000;
+/** The session uuid tmux `nomo` was launched with (written by the handoff box script). */
+const BOX_CURRENT = "/root/.nomo-current";
+
+/** Box shell: unless NOMO_FORCE=1, stop here (NOMO_OTHER=<recorded id>) when tmux `nomo` is not running
+ *  `uuid` (a box handed off before 2.3.12 records none). */
+export function currentGuard(uuid: string, file = BOX_CURRENT): string {
+  return `if [ "$(head -c 64 ${q(file)} 2>/dev/null)" != ${q(uuid)} ] && [ "\${NOMO_FORCE:-}" != 1 ]; then echo "NOMO_OTHER=$(head -c 64 ${q(file)} 2>/dev/null | tr -cd '0-9a-f-')"; exit 0; fi`;
+}
 
 /** Box: is the session at a turn boundary? NOMO_GONE when claude already exited; else the Nomo record's
  *  lastEvent (when there is one), the transcript's age in seconds, and its last 64 KiB after NOMO_TAIL. */
 export function backWaitScript(uuid: string, enc: string): string {
   return `${SHM_SWEEP}
 tmux has-session -t nomo 2>/dev/null || { echo NOMO_GONE; exit 0; }
+${currentGuard(uuid)}
 F=${BOX_CC}/sessions/${uuid}.json
 [ -f "$F" ] && echo "NOMO_EVENT=$(grep -o '"lastEvent": *"[^"]*"' "$F" | head -1 | cut -d'"' -f4)"
 T=/root/.claude/projects/${enc}/${uuid}.jsonl
@@ -691,12 +705,14 @@ tail -c 65536 "$T"`;
 }
 
 /** Box: exit claude — /exit, then C-c ×2, then kill-session (prints NOMO_HARD_STOP) — then the box's own
- *  reset.mjs, which ends the now-dead session's phone row and stops the box watchdog. NOMO_ESC=1 (--force)
+ *  reset.mjs, which ends the now-dead session's phone row and stops the box watchdog. Refuses
+ *  (NOMO_OTHER) when tmux runs another session; NOMO_FORCE=1 (--force) stops it anyway, and NOMO_ESC=1
  *  interrupts a running turn first. */
-export function backStopScript(): string {
+export function backStopScript(uuid: string): string {
   return `${SHM_SWEEP}
 gone() { ! tmux has-session -t nomo 2>/dev/null; }
 if ! gone; then
+  ${currentGuard(uuid)}
   if [ "\${NOMO_ESC:-}" = 1 ]; then tmux send-keys -t nomo Escape; sleep 2; fi
   tmux send-keys -t nomo -l /exit; sleep 0.5; tmux send-keys -t nomo Enter
   for _ in $(seq 30); do gone && break; sleep 1; done
@@ -706,6 +722,7 @@ if ! gone; then
   fi
   if ! gone; then tmux kill-session -t nomo; echo NOMO_HARD_STOP; fi
 fi
+rm -f ${BOX_CURRENT}
 ${BOX_PLUGIN}
 if [ -n "$R" ]; then bun "$R/dist/reset.mjs" >/dev/null 2>&1 || true; fi
 echo NOMO_STOPPED`;
@@ -781,18 +798,30 @@ async function back(omg: string, args: Map<string, string | true>): Promise<void
 
   // 1. A turn boundary (or --force, which interrupts instead of waiting).
   let gone = false;
+  const other = (out: string) => {
+    const o = out.match(/^NOMO_OTHER=(.*)$/m);
+    if (o) {
+      throw new Error(`the box's Claude Code is running session ${o[1] || "(not recorded: handed off before 2.3.12)"}, not ${uuid}; nothing was stopped.\n` +
+        `Bring that one back with --back --session <its id>, or rerun with --force to stop it anyway.`);
+    }
+  };
   if (!force) {
-    let told = "";
+    let told = "", state = "";
     for (const end = Date.now() + waitMin * 60_000; ;) {
       const out = (await exec(omg, id, backWaitScript(uuid, enc))).stdout ?? "";
       if (/^NOMO_GONE$/m.test(out)) { gone = true; break; }
+      other(out);
       if (/^NOMO_NOTRANSCRIPT$/m.test(out)) throw new Error(`session ${uuid} has no transcript on box ${id}`);
       const at = out.search(/^NOMO_TAIL$/m);
       const head = at < 0 ? out : out.slice(0, at), tail = at < 0 ? "" : out.slice(at + "NOMO_TAIL\n".length);
       const { m } = parseMarkers(head);
-      const state = boxIdle({ lastEvent: m.EVENT || undefined, tail, quietS: Number(m.AGE ?? 0) });
+      state = boxIdle({ lastEvent: m.EVENT || undefined, tail, quietS: Number(m.AGE ?? 0) });
       if (state === "idle") break;
-      if (Date.now() > end) throw new Error(`the box session is still mid-turn after ${waitMin} min. Watch it with --screen; rerun --back later, or --back --force to interrupt it.`);
+      if (Date.now() > end) {
+        throw new Error(state === "attention"
+          ? `the box session was still waiting on your answer after ${waitMin} min. Answer it on your phone or with --send-key, then rerun --back (or --back --force to interrupt it).`
+          : `the box session is still mid-turn after ${waitMin} min. Watch it with --screen; rerun --back later, or --back --force to interrupt it.`);
+      }
       const msg = state === "attention"
         ? "The box session is waiting on you: answer it on your phone, or with --send-key (e.g. Enter, Escape). Still waiting…"
         : "The box session is mid-turn; waiting for it to finish (checks every 10s)…";
@@ -803,18 +832,29 @@ async function back(omg: string, args: Map<string, string | true>): Promise<void
 
   // 2. Stop claude there (and clear its phone row).
   if (!gone) console.log("Exiting Claude Code on the box…");
-  const stop = await exec(omg, id, backStopScript(), force ? { NOMO_ESC: "1" } : {});
+  const stop = await exec(omg, id, backStopScript(uuid), force ? { NOMO_ESC: "1", NOMO_FORCE: "1" } : {});
+  other(stop.stdout ?? "");
   if (/^NOMO_HARD_STOP$/m.test(stop.stdout ?? "")) console.log("Claude Code did not exit on its own: hard stop (its last turn may be cut short).");
 
   // 3. Pack on the box, pull the fixed file list BEFORE touching anything here, then let the box sleep.
   const pack = await exec(omg, id, backPackScript(uuid, enc, root, isGit), snap?.head ? { NOMO_BASE: snap.head } : {});
-  if (pack.exitCode !== 0) throw new Error(`packing on box ${id} failed (exit ${pack.exitCode}):\n${(pack.stdout ?? "").slice(-1500)}\n${(pack.stderr ?? "").slice(-1500)}`);
+  if (pack.exitCode !== 0) throw new Error(`packing on box ${id} failed (exit ${pack.exitCode}):\n${printable((pack.stdout ?? "").slice(-1500))}\n${printable((pack.stderr ?? "").slice(-1500))}`);
   const { m, sizes } = parseMarkers(pack.stdout ?? "");
   for (const [name, size] of Object.entries(sizes)) {
     if (size > MAX_ARTIFACT_BYTES) throw new Error(`${name} on the box is ${(size / 1e6).toFixed(0)} MB (cap ${MAX_ARTIFACT_BYTES / 1e6} MB). The box is still awake: trim it via --screen/--send, rerun --back, or --stop.`);
   }
   const backup = join(CC_DIR, "cloud-back", `${uuid8}-${Date.now()}`);
   mkdirSync(backup, { recursive: true, mode: 0o700 });
+  // An interrupt from here on says where everything is (sync git steps finish or fail on their own).
+  let phase = "pulling the box's work";
+  const onSignal = (sig: string) => {
+    console.error(`\nInterrupted (${sig}) while ${phase}.\n  Everything pulled from the box is in ${backup}.` +
+      (isGit ? `\n  Nothing was reset or cleaned. Check: git -C ${q(root)} status && git -C ${q(root)} stash list` +
+        `\n  Your uncommitted Mac changes, if they were stashed, are under "nomo: before cloud return ${uuid8}".` : "") +
+      `\n  Rerun --back to finish: the box still holds the work, and what already landed here is detected.`);
+    process.exit(130);
+  };
+  process.on("SIGINT", onSignal).on("SIGTERM", onSignal);
   for (const name of BACK_FILES) {
     if (!(name in sizes)) continue;
     const r = await api(omg, "GET", `/sandboxes/${id}/files?path=${encodeURIComponent(`${BACK}-${name}`)}`);
@@ -827,14 +867,24 @@ async function back(omg: string, args: Map<string, string | true>): Promise<void
   await sleepBox(omg, { id, status: "running" });
 
   // 4. Apply: transcript, memory, code. Every tar is untrusted (core/cloud-back.ts).
+  phase = "landing the box's work on this Mac";
   const problems: string[] = [];
   const budget = { left: MAX_EXTRACTED_BYTES };
+  const paths = (ps: string[]) => ps.map((p) => printable(p, true)).join(", ");
+  /** One artifact that will not unpack (a bad entry, a cap) is reported and skipped; the rest still land. */
+  const unpack = (name: string): string | undefined => {
+    try { return extractTgz(join(backup, name), backup); } catch (e: any) {
+      problems.push(`${name} could not be unpacked, so it was NOT applied (${printable((e.stderr?.toString() || e.message || String(e)).trim(), true).slice(0, 300)}); it is kept in ${backup}`);
+    }
+  };
   const projDir = mkdirp(join(process.env.HOME!, ".claude", "projects", enc));
-  const pdir = extractTgz(join(backup, "project.tgz"), backup);
-  const pt = validateTree(pdir, (r) => r === `${uuid}.jsonl` || r === uuid || r.startsWith(`${uuid}/`) || r === "memory" || r.startsWith("memory/"), budget);
-  if (pt.skipped.length) console.log(`Skipped ${pt.skipped.length} unexpected path(s) in the box's project files: ${pt.skipped.join(", ")}`);
+  const pdir = unpack("project.tgz");
+  const pt = pdir
+    ? validateTree(pdir, (r) => r === `${uuid}.jsonl` || r === uuid || r.startsWith(`${uuid}/`) || r === "memory" || r.startsWith("memory/"), budget)
+    : { files: [], skipped: [] };
+  if (pt.skipped.length) console.log(`Skipped ${pt.skipped.length} unexpected path(s) in the box's project files: ${paths(pt.skipped)}`);
   let resumeId = uuid;
-  if (!pt.files.includes(`${uuid}.jsonl`)) problems.push("the box sent no transcript");
+  if (!pdir) { /* reported by unpack */ } else if (!pt.files.includes(`${uuid}.jsonl`)) problems.push("the box sent no transcript");
   else {
     const boxT = readFileSync(join(pdir, `${uuid}.jsonl`));
     const macPath = join(projDir, `${uuid}.jsonl`);
@@ -854,13 +904,14 @@ async function back(omg: string, args: Map<string, string | true>): Promise<void
       resumeId = randomUUID();
       atomicWriteBytes(join(projDir, `${resumeId}.jsonl`), boxT);
       for (const r of sub) copyContained(join(pdir, r), projDir, resumeId + r.slice(uuid.length), false, true);
-      console.log(`Transcript: this Mac also continued ${uuid} after the handoff, so the box's copy is a NEW session ${resumeId}. Both are kept.`);
+      console.log(`Transcript: this Mac also continued ${uuid} after the handoff, so the box's copy was saved as a new file ${resumeId}.jsonl; ` +
+        `the Mac's copy is untouched. The new file still carries the original session id inside: check that \`claude --resume ${resumeId}\` opens the box's conversation.`);
     }
     if (act === "same") console.log("Transcript: the box added nothing.");
   }
-  const mem = mergeMemory(snap?.memory, join(pdir, "memory"), pt.files.filter((r) => r.startsWith("memory/")).map((r) => r.slice(7)), join(projDir, "memory"), backup);
+  const mem = pdir ? mergeMemory(snap?.memory, join(pdir, "memory"), pt.files.filter((r) => r.startsWith("memory/")).map((r) => r.slice(7)), join(projDir, "memory"), backup) : { added: [], updated: [], conflicts: [] };
   if (mem.added.length + mem.updated.length) console.log(`Memory: ${mem.added.length} added, ${mem.updated.length} updated.`);
-  if (mem.conflicts.length) console.log(`Memory: kept this Mac's ${mem.conflicts.join(", ")} (both sides changed); the box's versions are in ${backup}/memory-conflicts`);
+  if (mem.conflicts.length) console.log(`Memory: kept this Mac's ${paths(mem.conflicts)} (both sides changed); the box's versions are in ${backup}/memory-conflicts`);
 
   if (isGit) {
     const boxHead = m.HEAD ?? "";
@@ -868,11 +919,10 @@ async function back(omg: string, args: Map<string, string | true>): Promise<void
     const commits = Number(m.COMMITS ?? 0);
     const has = (n: string) => existsSync(join(backup, n));
     let untrackedDir: string | undefined, untracked: string[] = [];
-    if (has("untracked.tgz")) {
-      untrackedDir = extractTgz(join(backup, "untracked.tgz"), backup);
+    if (has("untracked.tgz") && (untrackedDir = unpack("untracked.tgz"))) {
       const ut = validateTree(untrackedDir, undefined, budget);
       untracked = ut.files;
-      if (ut.skipped.length) console.log(`Skipped ${ut.skipped.length} untracked path(s) from the box (links or unsafe paths): ${ut.skipped.join(", ")}`);
+      if (ut.skipped.length) console.log(`Skipped ${ut.skipped.length} untracked path(s) from the box (links or unsafe paths): ${paths(ut.skipped)}`);
     }
     const a: BoxArtifacts = {
       bundle: commits > 0 && has("repo.bundle") ? join(backup, "repo.bundle") : undefined,
@@ -880,27 +930,45 @@ async function back(omg: string, args: Map<string, string | true>): Promise<void
       untrackedDir, untracked, boxHead,
     };
     const mac = macGitState(root);
+    if (snap?.head && commits === 0 && boxHead !== snap.head) {
+      problems.push(`the box's HEAD (${boxHead.slice(0, 12)}) is not the handed-off ${snap.head.slice(0, 12)} and has no new commits: the box dropped or rewound commits. Nothing of that was applied here; look with git -C ${q(root)} log ${boxHead.slice(0, 12)}`);
+    }
     const action = decideCode(snap, mac, { commits, patchBytes: sizes["wip.patch"] ?? 0, untracked: untracked.length, ff: m.FF === "1" });
+    // Agent/editor/git config from the box must never be live in this checkout unreviewed.
+    let flagged: string[] = [];
+    if (action !== "noop") {
+      try { flagged = agentConfigPaths(boxChangedPaths(root, a, mac.head!, backup)); } catch (e: any) {
+        throw new Error(`${printable((e.stderr?.toString() || e.message || String(e)).trim())}\nNothing in ${root} was changed; everything the box sent is in ${backup}.\n` +
+          `The conversation itself is back: cd ${q(cwd)} && claude --resume ${resumeId}`);
+      }
+    }
+    if (flagged.length) {
+      problems.push(`the box changed agent/editor config: ${paths(flagged)}. Review these before checking out the branch.`);
+    }
     if (action === "noop") console.log("Code: the box changed nothing.");
-    if (action === "apply") {
+    if (action === "apply" && !flagged.length) {
       let r: ReturnType<typeof applyInPlace>;
       try { r = applyInPlace(root, a, mac.branch === "HEAD", uuid8, backup); } catch (e: any) {
         throw new Error(`${e.message}\nThe conversation itself is back: cd ${q(cwd)} && claude --resume ${resumeId}`);
       }
       console.log(`Code: landed in ${root} (${commits} commit(s)${a.patch && sizes["wip.patch"] ? " + uncommitted edits" : ""}${untracked.length ? ` + ${untracked.length} new file(s)` : ""}).`);
       if (r.stash) console.log(`  Your Mac edits from before the handoff are kept in stash ${r.stash} ("nomo: before cloud return ${uuid8}").`);
-      if (r.skipped.length) console.log(`  Not overwritten (already on the Mac): ${r.skipped.join(", ")}`);
+      if (r.skipped.length) console.log(`  Not overwritten (already on the Mac): ${paths(r.skipped)}`);
     }
-    if (action === "branch") {
-      const why = !snap ? "no handoff snapshot" : m.FF !== "1" ? "the box rewrote history" : "this Mac changed since the handoff";
+    if (action === "branch" || (action === "apply" && flagged.length)) {
+      const why = action === "apply" ? "the box changed agent/editor config" : !snap ? "no handoff snapshot" : m.FF !== "1" ? "the box rewrote history" : "this Mac changed since the handoff";
       const name = landOnBranch(root, a, uuid8, backup);
       console.log(`Code: ${why}, so the box's work is on branch ${name}; your checkout was not touched.\n  Review: git -C ${q(root)} log -p HEAD..${name}`);
     }
   } else if (existsSync(join(backup, "folder.tgz"))) {
-    const dir = extractTgz(join(backup, "folder.tgz"), backup);
-    const t = validateTree(dir, undefined, budget);
-    console.log(`Code: the box's copy of the folder is at ${landFolder(cwd, dir, t.files, uuid8)} (yours was not touched).`);
+    const dir = unpack("folder.tgz");
+    if (dir) {
+      const t = validateTree(dir, undefined, budget);
+      console.log(`Code: the box's copy of the folder is at ${landFolder(cwd, dir, t.files, uuid8)} (yours was not touched).`);
+      if (t.skipped.length) console.log(`  Skipped ${t.skipped.length} path(s) (links or unsafe paths): ${paths(t.skipped)}`);
+    }
   }
+  process.off("SIGINT", onSignal).off("SIGTERM", onSignal);
 
   const c = loadCloud();
   const { [uuid]: _done, ...sessions } = c.sessions ?? {};

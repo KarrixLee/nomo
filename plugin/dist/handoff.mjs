@@ -384,7 +384,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "2.3.11";
+var PLUGIN_VERSION = "2.3.12";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -3205,12 +3205,23 @@ var MAX_ARTIFACT_BYTES = 100 * 1024 * 1024;
 var MAX_EXTRACTED_BYTES = 1024 * 1024 * 1024;
 var SENSITIVE = [".claude", ".config/cc-status", ".ssh", ".gnupg", ".aws", "Library/Keychains"];
 var sha256 = (b) => createHash2("sha256").update(b).digest("hex");
-var git = (root, args, env) => execFileSync3("git", ["-c", "core.hooksPath=/dev/null", ...args], {
+var git = (root, args, env) => execFileSync3("git", [
+  "-c",
+  "core.hooksPath=/dev/null",
+  "-c",
+  "filter.lfs.smudge=",
+  "-c",
+  "filter.lfs.process=",
+  "-c",
+  "filter.lfs.required=false",
+  ...args
+], {
   cwd: root,
-  env: env ?? process.env,
+  env: { ...env ?? process.env, GIT_LFS_SKIP_SMUDGE: "1" },
   maxBuffer: 1 << 30,
   stdio: ["ignore", "pipe", "pipe"]
 }).toString();
+var printable = (s, oneLine = false) => s.replace(/\x1b\[[0-?]*[ -/]*[@-~]|\x1b[\]P^_X][^\x07\x1b]*(?:\x07|\x1b\\)?/g, "").replace(oneLine ? /[\x00-\x1f\x7f-\x9f]/g : /[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, "");
 function wipFingerprint(root) {
   const ro = ["--no-optional-locks"];
   const h = createHash2("sha256");
@@ -3264,6 +3275,8 @@ function decideCode(snap, mac, box) {
 }
 function transcriptAction(snap, mac, box) {
   if (snap) {
+    if (mac?.equals(box))
+      return "same";
     if (box.length < snap.tBytes || sha256(box.subarray(0, snap.tBytes)) !== snap.tSha)
       return "corrupt";
     if (box.length === snap.tBytes)
@@ -3279,11 +3292,11 @@ function transcriptAction(snap, mac, box) {
   return box.length > mac.length && box.subarray(0, mac.length).equals(mac) ? "replace" : "fork";
 }
 function boxIdle(o) {
-  if (o.lastEvent === "done" || o.lastEvent === "sessionStart")
+  if (o.lastEvent === "done")
     return "idle";
   if (o.lastEvent === "needsAttention")
     return "attention";
-  if (o.lastEvent)
+  if (o.lastEvent && o.lastEvent !== "sessionStart")
     return "busy";
   const rows = [];
   for (const line of o.tail.split(`
@@ -3361,7 +3374,7 @@ function extractTgz(tgz, parent) {
   if (!(n <= MAX_EXTRACTED_BYTES))
     throw new Error(`${tgz} inflates past ${MAX_EXTRACTED_BYTES / 2 ** 30} GB`);
   const out = mkdtempSync(join3(parent, "x-"));
-  execFileSync3("tar", ["-xzf", tgz, "-C", out, "--no-same-owner", "--no-same-permissions"], { stdio: ["ignore", "ignore", "pipe"] });
+  execFileSync3("/usr/bin/tar", ["-xzf", tgz, "-C", out, "--no-same-owner", "--no-same-permissions"], { stdio: ["ignore", "ignore", "pipe"] });
   return out;
 }
 function copyContained(src, dstRoot, rel, overwrite, priv = false) {
@@ -3384,14 +3397,47 @@ function copyContained(src, dstRoot, rel, overwrite, priv = false) {
   chmodSync(dst, priv ? 384 : exec ? 493 : 420);
   return true;
 }
-function patchPathsSafe(patch) {
-  for (const m of patch.matchAll(/^diff --git a\/(.+?) b\/(.+)$/gm))
-    if (!safeRel(m[1]) || !safeRel(m[2]))
-      return false;
-  for (const m of patch.matchAll(/^(?:rename|copy) (?:from|to) (.+)$/gm))
-    if (!safeRel(m[1]))
-      return false;
-  return true;
+function patchPaths(root, patch, base, tmpParent) {
+  if (!lstatSync(patch).size)
+    return [];
+  const env = { ...process.env, GIT_INDEX_FILE: join3(mkdtempSync(join3(tmpParent, "pidx-")), "index") };
+  git(root, ["read-tree", base], env);
+  git(root, ["apply", "--cached", "--binary", patch], env);
+  const raw = git(root, ["diff-index", "--cached", "--raw", "-z", "--no-renames", base], env).split("\x00");
+  const paths = [];
+  for (let i = 0;i + 1 < raw.length; i += 2) {
+    const newMode = raw[i].split(" ")[1], p = raw[i + 1];
+    if (newMode === "120000")
+      throw new Error(`the box patch makes ${printable(p, true)} a symlink`);
+    if (!safeRel(p))
+      throw new Error(`the box patch touches an unsafe path (${printable(p, true)}: .git, .., absolute or sensitive)`);
+    paths.push(p);
+  }
+  return paths;
+}
+var AGENT_DIRS = [".claude", ".vscode", ".idea", ".githooks", ".husky", ".devcontainer", ".cursor"];
+var AGENT_FILES = [".mcp.json", "claude.md", "claude.local.md", ".claude.json", ".envrc", ".gitattributes", ".lfsconfig", ".gitmodules"];
+function agentConfigPaths(paths) {
+  return [...new Set(paths)].filter((p) => {
+    const segs = p.toLowerCase().split("/").filter(Boolean);
+    return segs.some((s) => AGENT_DIRS.includes(s)) || AGENT_FILES.includes(segs[segs.length - 1] ?? "");
+  });
+}
+function fetchBox(root, a) {
+  if (!a.bundle) {
+    git(root, ["cat-file", "-e", `${a.boxHead}^{commit}`]);
+    return;
+  }
+  git(root, ["bundle", "verify", "-q", a.bundle]);
+  git(root, ["fetch", "-q", a.bundle, "HEAD"]);
+  const got = git(root, ["rev-parse", "FETCH_HEAD"]).trim();
+  if (got !== a.boxHead)
+    throw new Error(`the bundle's HEAD is ${got}, the box reported ${a.boxHead}`);
+}
+function boxChangedPaths(root, a, macHead, tmpParent) {
+  fetchBox(root, a);
+  const commits = a.boxHead === macHead ? [] : git(root, ["diff", "--name-only", "--no-renames", "-z", macHead, a.boxHead]).split("\x00").filter(Boolean);
+  return [...commits, ...a.patch ? patchPaths(root, a.patch, a.boxHead, tmpParent) : [], ...a.untracked];
 }
 function mergeMemory(snapMem, boxDir, boxFiles, macDir, backup) {
   const r = { added: [], updated: [], conflicts: [] };
@@ -3434,35 +3480,28 @@ var recovery = (root, stash, backup) => [
   `Everything the box sent is in ${backup} (repo.bundle, wip.patch, untracked.tgz).`
 ].filter(Boolean).join(`
 `);
-function checkPatch(patch) {
-  if (patch && !patchPathsSafe(readFileSync2(patch, "utf8")))
-    throw new Error("the box patch touches an unsafe path (.git, .., absolute or sensitive)");
-}
 function applyInPlace(root, a, detached, uuid8, backup) {
   let stash;
   const skipped = [];
   try {
-    checkPatch(a.patch);
-    if (a.bundle)
-      git(root, ["bundle", "verify", "-q", a.bundle]);
+    fetchBox(root, a);
+    if (a.patch)
+      patchPaths(root, a.patch, a.boxHead, backup);
     if (git(root, ["status", "--porcelain"]).trim()) {
-      git(root, ["stash", "push", "-u", "-m", `nomo: before cloud return ${uuid8}`]);
+      const msg = `nomo: before cloud return ${uuid8}`;
+      console.log(`Stashing your uncommitted Mac changes as "${msg}"…`);
+      git(root, ["stash", "push", "-u", "-m", msg]);
       stash = git(root, ["rev-parse", "stash@{0}"]).trim();
     }
-    if (a.bundle) {
-      git(root, ["fetch", "-q", a.bundle, "HEAD"]);
-      const got = git(root, ["rev-parse", "FETCH_HEAD"]).trim();
-      if (got !== a.boxHead)
-        throw new Error(`the bundle's HEAD is ${got}, the box reported ${a.boxHead}`);
+    if (a.bundle)
       git(root, detached ? ["checkout", "-q", "--detach", a.boxHead] : ["merge", "-q", "--ff-only", a.boxHead]);
-    }
     if (a.patch && lstatSync(a.patch).size > 0)
       git(root, ["apply", "--binary", a.patch]);
     for (const rel of a.untracked)
       if (!copyContained(join3(a.untrackedDir, rel), root, rel, false))
         skipped.push(rel);
   } catch (e) {
-    const why = (e.stderr?.toString() || e.message || String(e)).trim();
+    const why = printable((e.stderr?.toString() || e.message || String(e)).trim());
     throw new Error(`landing the box's code in ${root} failed: ${why}
 ${recovery(root, stash, backup)}`);
   }
@@ -3479,16 +3518,12 @@ function freeBranch(root, uuid8) {
   }
 }
 function landOnBranch(root, a, uuid8, backup) {
-  checkPatch(a.patch);
+  fetchBox(root, a);
+  if (a.patch)
+    patchPaths(root, a.patch, a.boxHead, backup);
   const name = freeBranch(root, uuid8);
   const ref = `refs/heads/${name}`;
-  if (a.bundle) {
-    git(root, ["bundle", "verify", "-q", a.bundle]);
-    git(root, ["fetch", "-q", a.bundle, `+HEAD:${ref}`]);
-  } else {
-    git(root, ["cat-file", "-e", `${a.boxHead}^{commit}`]);
-    git(root, ["update-ref", ref, a.boxHead, ""]);
-  }
+  git(root, ["update-ref", ref, a.boxHead, ""]);
   const hasPatch = !!a.patch && lstatSync(a.patch).size > 0;
   if (!hasPatch && !a.untracked.length)
     return name;
@@ -3500,11 +3535,9 @@ function landOnBranch(root, a, uuid8, backup) {
   if (hasPatch)
     git(root, ["apply", "--cached", "--binary", a.patch], env);
   if (a.untracked.length) {
-    execFileSync3("git", ["-c", "core.hooksPath=/dev/null", `--git-dir=${gitDir}`, `--work-tree=${a.untrackedDir}`, "add", "-f", "--", ...a.untracked], {
-      cwd: a.untrackedDir,
-      env,
-      stdio: ["ignore", "pipe", "pipe"]
-    });
+    const list = join3(tmp, "paths");
+    writeFileSync(list, a.untracked.join("\x00"));
+    git(a.untrackedDir, ["--literal-pathspecs", `--git-dir=${gitDir}`, `--work-tree=${a.untrackedDir}`, "add", "-f", `--pathspec-from-file=${list}`, "--pathspec-file-nul"], env);
   }
   const tree = git(root, ["write-tree"], env).trim();
   const commit = git(root, ["commit-tree", tree, "-p", tip, "-m", `nomo: uncommitted work from the cloud session ${uuid8}`]).trim();
@@ -4352,6 +4385,8 @@ tmux new-session -d -s nomo-relay "$(command -v bun || command -v node) $R/dist/
 for _ in $(seq 20); do (exec 3<>/dev/tcp/127.0.0.1/${RELAY_PORT}) 2>/dev/null && break; sleep 0.5; done
 (exec 3<>/dev/tcp/127.0.0.1/${RELAY_PORT}) 2>/dev/null || { echo "NOMO_RELAY_FAILED"; tmux capture-pane -p -t nomo-relay 2>/dev/null; exit 4; }
 
+# Which session tmux session nomo runs, so --back --session X never stops a different one (an id, no secret).
+printf %s ${q(uuid)} > ${BOX_CURRENT}
 tmux new-session -d -s nomo -x 200 -y 50 -c ${q(cwd)} ${q(`bash -c ${q(launch)}`)}
 tmux has-session -t nomo-keepalive 2>/dev/null || tmux new-session -d -s nomo-keepalive ${q(keepalive)}
 sleep 8
@@ -4570,9 +4605,14 @@ Retry with: bun plugin/dist/handoff.mjs --pair`);
 var BACK = "/tmp/nomo-back";
 var BACK_FILES = ["repo.bundle", "wip.patch", "untracked.tgz", "project.tgz", "folder.tgz"];
 var BACK_POLL_MS = 1e4;
+var BOX_CURRENT = "/root/.nomo-current";
+function currentGuard(uuid, file = BOX_CURRENT) {
+  return `if [ "$(head -c 64 ${q(file)} 2>/dev/null)" != ${q(uuid)} ] && [ "\${NOMO_FORCE:-}" != 1 ]; then echo "NOMO_OTHER=$(head -c 64 ${q(file)} 2>/dev/null | tr -cd '0-9a-f-')"; exit 0; fi`;
+}
 function backWaitScript(uuid, enc) {
   return `${SHM_SWEEP}
 tmux has-session -t nomo 2>/dev/null || { echo NOMO_GONE; exit 0; }
+${currentGuard(uuid)}
 F=${BOX_CC}/sessions/${uuid}.json
 [ -f "$F" ] && echo "NOMO_EVENT=$(grep -o '"lastEvent": *"[^"]*"' "$F" | head -1 | cut -d'"' -f4)"
 T=/root/.claude/projects/${enc}/${uuid}.jsonl
@@ -4581,10 +4621,11 @@ echo "NOMO_AGE=$(( $(date +%s) - $(stat -c %Y "$T") ))"
 echo NOMO_TAIL
 tail -c 65536 "$T"`;
 }
-function backStopScript() {
+function backStopScript(uuid) {
   return `${SHM_SWEEP}
 gone() { ! tmux has-session -t nomo 2>/dev/null; }
 if ! gone; then
+  ${currentGuard(uuid)}
   if [ "\${NOMO_ESC:-}" = 1 ]; then tmux send-keys -t nomo Escape; sleep 2; fi
   tmux send-keys -t nomo -l /exit; sleep 0.5; tmux send-keys -t nomo Enter
   for _ in $(seq 30); do gone && break; sleep 1; done
@@ -4594,6 +4635,7 @@ if ! gone; then
   fi
   if ! gone; then tmux kill-session -t nomo; echo NOMO_HARD_STOP; fi
 fi
+rm -f ${BOX_CURRENT}
 ${BOX_PLUGIN}
 if [ -n "$R" ]; then bun "$R/dist/reset.mjs" >/dev/null 2>&1 || true; fi
 echo NOMO_STOPPED`;
@@ -4665,25 +4707,34 @@ async function back(omg, args) {
     throw new Error("no cloud box on record (nothing to bring back)");
   const id = await wakeBox(omg, sb);
   let gone = false;
+  const other = (out) => {
+    const o = out.match(/^NOMO_OTHER=(.*)$/m);
+    if (o) {
+      throw new Error(`the box's Claude Code is running session ${o[1] || "(not recorded: handed off before 2.3.12)"}, not ${uuid}; nothing was stopped.
+` + `Bring that one back with --back --session <its id>, or rerun with --force to stop it anyway.`);
+    }
+  };
   if (!force) {
-    let told = "";
+    let told = "", state = "";
     for (const end = Date.now() + waitMin * 60000;; ) {
       const out = (await exec(omg, id, backWaitScript(uuid, enc))).stdout ?? "";
       if (/^NOMO_GONE$/m.test(out)) {
         gone = true;
         break;
       }
+      other(out);
       if (/^NOMO_NOTRANSCRIPT$/m.test(out))
         throw new Error(`session ${uuid} has no transcript on box ${id}`);
       const at = out.search(/^NOMO_TAIL$/m);
       const head = at < 0 ? out : out.slice(0, at), tail = at < 0 ? "" : out.slice(at + `NOMO_TAIL
 `.length);
       const { m } = parseMarkers(head);
-      const state = boxIdle({ lastEvent: m.EVENT || undefined, tail, quietS: Number(m.AGE ?? 0) });
+      state = boxIdle({ lastEvent: m.EVENT || undefined, tail, quietS: Number(m.AGE ?? 0) });
       if (state === "idle")
         break;
-      if (Date.now() > end)
-        throw new Error(`the box session is still mid-turn after ${waitMin} min. Watch it with --screen; rerun --back later, or --back --force to interrupt it.`);
+      if (Date.now() > end) {
+        throw new Error(state === "attention" ? `the box session was still waiting on your answer after ${waitMin} min. Answer it on your phone or with --send-key, then rerun --back (or --back --force to interrupt it).` : `the box session is still mid-turn after ${waitMin} min. Watch it with --screen; rerun --back later, or --back --force to interrupt it.`);
+      }
       const msg = state === "attention" ? "The box session is waiting on you: answer it on your phone, or with --send-key (e.g. Enter, Escape). Still waiting…" : "The box session is mid-turn; waiting for it to finish (checks every 10s)…";
       if (msg !== told)
         console.log(told = msg);
@@ -4692,14 +4743,15 @@ async function back(omg, args) {
   }
   if (!gone)
     console.log("Exiting Claude Code on the box…");
-  const stop = await exec(omg, id, backStopScript(), force ? { NOMO_ESC: "1" } : {});
+  const stop = await exec(omg, id, backStopScript(uuid), force ? { NOMO_ESC: "1", NOMO_FORCE: "1" } : {});
+  other(stop.stdout ?? "");
   if (/^NOMO_HARD_STOP$/m.test(stop.stdout ?? ""))
     console.log("Claude Code did not exit on its own: hard stop (its last turn may be cut short).");
   const pack = await exec(omg, id, backPackScript(uuid, enc, root, isGit), snap?.head ? { NOMO_BASE: snap.head } : {});
   if (pack.exitCode !== 0)
     throw new Error(`packing on box ${id} failed (exit ${pack.exitCode}):
-${(pack.stdout ?? "").slice(-1500)}
-${(pack.stderr ?? "").slice(-1500)}`);
+${printable((pack.stdout ?? "").slice(-1500))}
+${printable((pack.stderr ?? "").slice(-1500))}`);
   const { m, sizes } = parseMarkers(pack.stdout ?? "");
   for (const [name, size] of Object.entries(sizes)) {
     if (size > MAX_ARTIFACT_BYTES)
@@ -4707,6 +4759,17 @@ ${(pack.stderr ?? "").slice(-1500)}`);
   }
   const backup = join4(CC_DIR, "cloud-back", `${uuid8}-${Date.now()}`);
   mkdirSync2(backup, { recursive: true, mode: 448 });
+  let phase = "pulling the box's work";
+  const onSignal = (sig) => {
+    console.error(`
+Interrupted (${sig}) while ${phase}.
+  Everything pulled from the box is in ${backup}.` + (isGit ? `
+  Nothing was reset or cleaned. Check: git -C ${q(root)} status && git -C ${q(root)} stash list` + `
+  Your uncommitted Mac changes, if they were stashed, are under "nomo: before cloud return ${uuid8}".` : "") + `
+  Rerun --back to finish: the box still holds the work, and what already landed here is detected.`);
+    process.exit(130);
+  };
+  process.on("SIGINT", onSignal).on("SIGTERM", onSignal);
   for (const name of BACK_FILES) {
     if (!(name in sizes))
       continue;
@@ -4719,15 +4782,24 @@ ${(pack.stderr ?? "").slice(-1500)}`);
   console.log(`Pulled the box's work into ${backup}`);
   await exec(omg, id, `rm -f ${BACK}-*`).catch(() => {});
   await sleepBox(omg, { id, status: "running" });
+  phase = "landing the box's work on this Mac";
   const problems = [];
   const budget = { left: MAX_EXTRACTED_BYTES };
+  const paths = (ps) => ps.map((p) => printable(p, true)).join(", ");
+  const unpack = (name) => {
+    try {
+      return extractTgz(join4(backup, name), backup);
+    } catch (e) {
+      problems.push(`${name} could not be unpacked, so it was NOT applied (${printable((e.stderr?.toString() || e.message || String(e)).trim(), true).slice(0, 300)}); it is kept in ${backup}`);
+    }
+  };
   const projDir = mkdirp(join4(process.env.HOME, ".claude", "projects", enc));
-  const pdir = extractTgz(join4(backup, "project.tgz"), backup);
-  const pt = validateTree(pdir, (r) => r === `${uuid}.jsonl` || r === uuid || r.startsWith(`${uuid}/`) || r === "memory" || r.startsWith("memory/"), budget);
+  const pdir = unpack("project.tgz");
+  const pt = pdir ? validateTree(pdir, (r) => r === `${uuid}.jsonl` || r === uuid || r.startsWith(`${uuid}/`) || r === "memory" || r.startsWith("memory/"), budget) : { files: [], skipped: [] };
   if (pt.skipped.length)
-    console.log(`Skipped ${pt.skipped.length} unexpected path(s) in the box's project files: ${pt.skipped.join(", ")}`);
+    console.log(`Skipped ${pt.skipped.length} unexpected path(s) in the box's project files: ${paths(pt.skipped)}`);
   let resumeId = uuid;
-  if (!pt.files.includes(`${uuid}.jsonl`))
+  if (!pdir) {} else if (!pt.files.includes(`${uuid}.jsonl`))
     problems.push("the box sent no transcript");
   else {
     const boxT = readFileSync3(join4(pdir, `${uuid}.jsonl`));
@@ -4753,16 +4825,16 @@ ${(pack.stderr ?? "").slice(-1500)}`);
       atomicWriteBytes(join4(projDir, `${resumeId}.jsonl`), boxT);
       for (const r of sub)
         copyContained(join4(pdir, r), projDir, resumeId + r.slice(uuid.length), false, true);
-      console.log(`Transcript: this Mac also continued ${uuid} after the handoff, so the box's copy is a NEW session ${resumeId}. Both are kept.`);
+      console.log(`Transcript: this Mac also continued ${uuid} after the handoff, so the box's copy was saved as a new file ${resumeId}.jsonl; ` + `the Mac's copy is untouched. The new file still carries the original session id inside: check that \`claude --resume ${resumeId}\` opens the box's conversation.`);
     }
     if (act === "same")
       console.log("Transcript: the box added nothing.");
   }
-  const mem = mergeMemory(snap?.memory, join4(pdir, "memory"), pt.files.filter((r) => r.startsWith("memory/")).map((r) => r.slice(7)), join4(projDir, "memory"), backup);
+  const mem = pdir ? mergeMemory(snap?.memory, join4(pdir, "memory"), pt.files.filter((r) => r.startsWith("memory/")).map((r) => r.slice(7)), join4(projDir, "memory"), backup) : { added: [], updated: [], conflicts: [] };
   if (mem.added.length + mem.updated.length)
     console.log(`Memory: ${mem.added.length} added, ${mem.updated.length} updated.`);
   if (mem.conflicts.length)
-    console.log(`Memory: kept this Mac's ${mem.conflicts.join(", ")} (both sides changed); the box's versions are in ${backup}/memory-conflicts`);
+    console.log(`Memory: kept this Mac's ${paths(mem.conflicts)} (both sides changed); the box's versions are in ${backup}/memory-conflicts`);
   if (isGit) {
     const boxHead = m.HEAD ?? "";
     if (!/^[0-9a-f]{40}$/.test(boxHead))
@@ -4770,12 +4842,11 @@ ${(pack.stderr ?? "").slice(-1500)}`);
     const commits = Number(m.COMMITS ?? 0);
     const has = (n) => existsSync4(join4(backup, n));
     let untrackedDir, untracked = [];
-    if (has("untracked.tgz")) {
-      untrackedDir = extractTgz(join4(backup, "untracked.tgz"), backup);
+    if (has("untracked.tgz") && (untrackedDir = unpack("untracked.tgz"))) {
       const ut = validateTree(untrackedDir, undefined, budget);
       untracked = ut.files;
       if (ut.skipped.length)
-        console.log(`Skipped ${ut.skipped.length} untracked path(s) from the box (links or unsafe paths): ${ut.skipped.join(", ")}`);
+        console.log(`Skipped ${ut.skipped.length} untracked path(s) from the box (links or unsafe paths): ${paths(ut.skipped)}`);
     }
     const a = {
       bundle: commits > 0 && has("repo.bundle") ? join4(backup, "repo.bundle") : undefined,
@@ -4785,10 +4856,26 @@ ${(pack.stderr ?? "").slice(-1500)}`);
       boxHead
     };
     const mac = macGitState(root);
+    if (snap?.head && commits === 0 && boxHead !== snap.head) {
+      problems.push(`the box's HEAD (${boxHead.slice(0, 12)}) is not the handed-off ${snap.head.slice(0, 12)} and has no new commits: the box dropped or rewound commits. Nothing of that was applied here; look with git -C ${q(root)} log ${boxHead.slice(0, 12)}`);
+    }
     const action = decideCode(snap, mac, { commits, patchBytes: sizes["wip.patch"] ?? 0, untracked: untracked.length, ff: m.FF === "1" });
+    let flagged = [];
+    if (action !== "noop") {
+      try {
+        flagged = agentConfigPaths(boxChangedPaths(root, a, mac.head, backup));
+      } catch (e) {
+        throw new Error(`${printable((e.stderr?.toString() || e.message || String(e)).trim())}
+Nothing in ${root} was changed; everything the box sent is in ${backup}.
+` + `The conversation itself is back: cd ${q(cwd)} && claude --resume ${resumeId}`);
+      }
+    }
+    if (flagged.length) {
+      problems.push(`the box changed agent/editor config: ${paths(flagged)}. Review these before checking out the branch.`);
+    }
     if (action === "noop")
       console.log("Code: the box changed nothing.");
-    if (action === "apply") {
+    if (action === "apply" && !flagged.length) {
       let r;
       try {
         r = applyInPlace(root, a, mac.branch === "HEAD", uuid8, backup);
@@ -4800,19 +4887,24 @@ The conversation itself is back: cd ${q(cwd)} && claude --resume ${resumeId}`);
       if (r.stash)
         console.log(`  Your Mac edits from before the handoff are kept in stash ${r.stash} ("nomo: before cloud return ${uuid8}").`);
       if (r.skipped.length)
-        console.log(`  Not overwritten (already on the Mac): ${r.skipped.join(", ")}`);
+        console.log(`  Not overwritten (already on the Mac): ${paths(r.skipped)}`);
     }
-    if (action === "branch") {
-      const why = !snap ? "no handoff snapshot" : m.FF !== "1" ? "the box rewrote history" : "this Mac changed since the handoff";
+    if (action === "branch" || action === "apply" && flagged.length) {
+      const why = action === "apply" ? "the box changed agent/editor config" : !snap ? "no handoff snapshot" : m.FF !== "1" ? "the box rewrote history" : "this Mac changed since the handoff";
       const name = landOnBranch(root, a, uuid8, backup);
       console.log(`Code: ${why}, so the box's work is on branch ${name}; your checkout was not touched.
   Review: git -C ${q(root)} log -p HEAD..${name}`);
     }
   } else if (existsSync4(join4(backup, "folder.tgz"))) {
-    const dir = extractTgz(join4(backup, "folder.tgz"), backup);
-    const t = validateTree(dir, undefined, budget);
-    console.log(`Code: the box's copy of the folder is at ${landFolder(cwd, dir, t.files, uuid8)} (yours was not touched).`);
+    const dir = unpack("folder.tgz");
+    if (dir) {
+      const t = validateTree(dir, undefined, budget);
+      console.log(`Code: the box's copy of the folder is at ${landFolder(cwd, dir, t.files, uuid8)} (yours was not touched).`);
+      if (t.skipped.length)
+        console.log(`  Skipped ${t.skipped.length} path(s) (links or unsafe paths): ${paths(t.skipped)}`);
+    }
   }
+  process.off("SIGINT", onSignal).off("SIGTERM", onSignal);
   const c = loadCloud();
   const { [uuid]: _done, ...sessions } = c.sessions ?? {};
   saveCloud({ ...c, sessions, current: c.current === uuid ? undefined : c.current });
@@ -5009,6 +5101,7 @@ export {
   boxSetup,
   checkLaunchIds,
   createBody,
+  currentGuard,
   lastModel,
   latestSession,
   packRefusal,

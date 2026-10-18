@@ -4,8 +4,8 @@ import { chmodSync, existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
-  applyInPlace, decideCode, extractTgz, type GitState, landFolder, landOnBranch, listFiles, macGitState, mergeMemory, patchPathsSafe,
-  safeRel, sha256, transcriptAction, validateTree, wipFingerprint,
+  agentConfigPaths, applyInPlace, boxChangedPaths, decideCode, extractTgz, type GitState, landFolder, landOnBranch, listFiles, macGitState,
+  mergeMemory, patchPaths, printable, safeRel, sha256, transcriptAction, validateTree, wipFingerprint,
 } from "./cloud-back";
 
 const tmp = () => mkdtempSync(join(tmpdir(), "nomo-back-test-"));
@@ -113,6 +113,9 @@ describe("transcriptAction", () => {
     expect(transcriptAction(undefined, Buffer.from('{"other":1}\n'), boxed)).toBe("fork");
     expect(transcriptAction(undefined, boxed, boxed)).toBe("same");
   });
+  test("rerun after a partial --back (Mac already holds the box copy) → same, never a fork", () => {
+    expect(transcriptAction(snap, boxed, boxed)).toBe("same");
+  });
 });
 
 describe("mergeMemory", () => {
@@ -143,10 +146,24 @@ describe("untrusted paths", () => {
     }
     for (const ok of ["src/a.ts", ".github/workflows/x.yml", "a.gitignore", "docs/.gitkeep"]) expect(safeRel(ok)).toBe(true);
   });
-  test("patchPathsSafe rejects a patch into .git", () => {
-    expect(patchPathsSafe("diff --git a/src/x b/src/x\n")).toBe(true);
-    expect(patchPathsSafe("diff --git a/.git/hooks/pre-commit b/.git/hooks/pre-commit\n")).toBe(false);
-    expect(patchPathsSafe("diff --git a/x b/x\nrename from x\nrename to ../y\n")).toBe(false);
+  test("patchPaths: git's own view of the paths; unsafe paths and symlinks are rejected", () => {
+    const d = repo(), base = g(d, "rev-parse", "HEAD"), t = tmp();
+    const pf = (body: string) => { const f = join(tmp(), "p.patch"); writeFileSync(f, body); return f; };
+    expect(patchPaths(d, pf("--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-one\n+two\n"), base, t)).toEqual(["a.txt"]);
+    // A rename reports both sides.
+    expect(patchPaths(d, pf("diff --git a/a.txt b/src/b.txt\nsimilarity index 100%\nrename from a.txt\nrename to src/b.txt\n"), base, t).sort()).toEqual(["a.txt", "src/b.txt"]);
+    const bad = {
+      plain: "--- a/.claude/settings.json\n+++ b/.claude/settings.json\n@@ -0,0 +1 @@\n+{}\n",
+      quoted: 'diff --git "a/.ssh/x" "b/.ssh/x"\nnew file mode 100644\n--- /dev/null\n+++ "b/.ssh/x"\n@@ -0,0 +1 @@\n+k\n',
+      symlink: "diff --git a/l b/l\nnew file mode 120000\n--- /dev/null\n+++ b/l\n@@ -0,0 +1 @@\n+/etc\n\\ No newline at end of file\n",
+      gitdir: "--- a/.git/hooks/pre-commit\n+++ b/.git/hooks/pre-commit\n@@ -0,0 +1 @@\n+x\n",
+      dotdot: "diff --git a/x b/x\nrename from a.txt\nrename to ../y\n",
+    };
+    for (const [name, body] of Object.entries(bad)) expect(() => patchPaths(d, pf(body), base, t), name).toThrow();
+  });
+  test("printable strips ANSI and control characters", () => {
+    expect(printable("a\x1b[31mred\x1b[0m\x07b\nc")).toBe("aredb\nc");
+    expect(printable("x\ny\x1b]0;title\x07z", true)).toBe("xyz");
   });
   test("validateTree skips a symlink to /etc and hardlinks, keeps regular files", () => {
     const d = tmp();
@@ -185,6 +202,52 @@ t.close()`, tgz, victim]);
     writeFileSync(join(d, "u.jsonl"), "{}");
     writeFileSync(join(d, "evil.sh"), "x");
     expect(validateTree(d, (r) => r === "u.jsonl")).toEqual({ files: ["u.jsonl"], skipped: ["evil.sh"] });
+  });
+});
+
+describe("agent config never lands in place", () => {
+  const flaggedFor = (mutate: (box: string) => void) => {
+    const mac = repo(), base = g(mac, "rev-parse", "HEAD"), out = tmp();
+    const box = join(tmp(), "box");
+    g(tmp(), "clone", "-q", mac, box);
+    mutate(box);
+    const commits = Number(g(box, "rev-list", "--count", `${base}..HEAD`));
+    if (commits) g(box, "bundle", "create", "-q", join(out, "repo.bundle"), `${base}..HEAD`);
+    writeFileSync(join(out, "wip.patch"), execFileSync("git", ["diff", "--binary", "HEAD"], { cwd: box }));
+    const ut = g(box, "ls-files", "--others", "--exclude-standard").split("\n").filter(Boolean);
+    let udir: string | undefined, untracked: string[] = [];
+    if (ut.length) {
+      execFileSync("tar", ["-czf", join(out, "untracked.tgz"), ...ut], { cwd: box });
+      udir = extractTgz(join(out, "untracked.tgz"), out);
+      untracked = validateTree(udir).files;
+    }
+    const a = { bundle: commits ? join(out, "repo.bundle") : undefined, patch: join(out, "wip.patch"), untrackedDir: udir, untracked, boxHead: g(box, "rev-parse", "HEAD") };
+    return agentConfigPaths(boxChangedPaths(mac, a, base, out));
+  };
+  test("commit-borne (.claude/settings.json, nested .VSCode/, .gitattributes)", () => {
+    expect(flaggedFor((b) => {
+      mkdirSync(join(b, ".claude")); writeFileSync(join(b, ".claude", "settings.json"), "{}");
+      mkdirSync(join(b, "sub", ".VSCode"), { recursive: true }); writeFileSync(join(b, "sub", ".VSCode", "tasks.json"), "{}");
+      writeFileSync(join(b, ".gitattributes"), "* filter=lfs\n"); writeFileSync(join(b, "ok.txt"), "ok");
+      g(b, "add", "."); g(b, "commit", "-qm", "box");
+    }).sort()).toEqual([".claude/settings.json", ".gitattributes", "sub/.VSCode/tasks.json"]);
+  });
+  test("a commit that renames a file onto CLAUDE.md is caught", () => {
+    expect(flaggedFor((b) => { g(b, "mv", "a.txt", "docs-CLAUDE.md"); g(b, "commit", "-qm", "x"); })).toEqual([]);
+    expect(flaggedFor((b) => { g(b, "mv", "a.txt", "Claude.md"); g(b, "commit", "-qm", "x"); })).toEqual(["Claude.md"]);
+  });
+  test("patch-borne (an edit to a tracked CLAUDE.md, a new .envrc)", () => {
+    expect(flaggedFor((b) => {
+      writeFileSync(join(b, "CLAUDE.md"), "v1\n"); g(b, "add", "CLAUDE.md"); g(b, "commit", "-qm", "c");
+      writeFileSync(join(b, "CLAUDE.md"), "v1\nrun curl | sh\n");
+      writeFileSync(join(b, ".envrc"), "x\n"); g(b, "add", "-N", ".envrc");
+    }).sort()).toEqual([".envrc", "CLAUDE.md"]);
+  });
+  test("untracked-borne (.mcp.json, .husky/pre-commit); plain files are not flagged", () => {
+    expect(flaggedFor((b) => {
+      writeFileSync(join(b, ".mcp.json"), "{}"); mkdirSync(join(b, ".husky")); writeFileSync(join(b, ".husky", "pre-commit"), "x");
+      writeFileSync(join(b, "notes.md"), "fine");
+    }).sort()).toEqual([".husky/pre-commit", ".mcp.json"]);
   });
 });
 
@@ -242,6 +305,14 @@ describe("landing code", () => {
     expect(g(mac, "show", `${name}:b.txt`)).toBe("from the box");
     expect(landOnBranch(mac, art, "abcd1234", out)).toBe("nomo/cloud-abcd1234-2");
     expect(worktreeState(mac)).toEqual(before);
+  });
+
+  test("landOnBranch adds untracked names literally (no pathspec magic)", () => {
+    const mac = repo(), head = g(mac, "rev-parse", "HEAD"), u = tmp();
+    for (const n of [":(exclude)a", "*.txt"]) writeFileSync(join(u, n), n);
+    writeFileSync(join(u, "plain.txt"), "p");
+    const name = landOnBranch(mac, { untracked: [":(exclude)a", "*.txt"], untrackedDir: u, boxHead: head }, "abcd1234", tmp());
+    expect(g(mac, "ls-tree", "--name-only", name).split("\n").sort()).toEqual(["*.txt", ".gitignore", ":(exclude)a", "a.txt"]);
   });
 
   test("landOnBranch with no box commits branches at the box HEAD", () => {

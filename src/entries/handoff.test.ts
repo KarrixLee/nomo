@@ -10,7 +10,7 @@ import {
   pubRawFromPkcs8, q, RELAY_PORT, resultPage, takePairUrl, toOpenRouterModel, withReload,
 } from "./handoff";
 import { RELAY_PORT as RELAY_LISTEN_PORT } from "./or-relay";
-import { BACK_FILES, backPackScript, backStopScript, backWaitScript, resumeCommand } from "./handoff";
+import { BACK_FILES, backPackScript, backStopScript, backWaitScript, currentGuard, resumeCommand } from "./handoff";
 import { boxIdle } from "../core/cloud-back";
 
 describe("handoff pure logic", () => {
@@ -217,12 +217,33 @@ describe("bring back (--back)", () => {
   });
 
   test("every box script is valid bash", () => {
-    for (const s of [...scripts, backStopScript(), backWaitScript(U, "-tmp-proj")]) execFileSync("bash", ["-n", "-c", s]);
+    for (const s of [...scripts, backStopScript(U), backWaitScript(U, "-tmp-proj")]) execFileSync("bash", ["-n", "-c", s]);
   });
 
-  test("boxIdle: Nomo's record wins; needsAttention asks the user", () => {
+  test("--back --session X never stops a different session (unless --force)", () => {
+    for (const s of [backStopScript(U), backWaitScript(U, "-tmp-proj")]) expect(s).toContain(currentGuard(U));
+    const f = join(mkdtempSync(join(tmpdir(), "nomo-cur-")), "cur");
+    const run = (env: Record<string, string> = {}) =>
+      execFileSync("bash", ["-c", `${currentGuard(U, f)}\necho NOMO_SAME`], { env: { PATH: process.env.PATH!, ...env } }).toString().trim();
+    expect(run()).toBe("NOMO_OTHER="); // nothing recorded (a pre-2.3.12 box)
+    writeFileSync(f, "99999999-2222-3333-4444-555555555555");
+    expect(run()).toBe("NOMO_OTHER=99999999-2222-3333-4444-555555555555");
+    expect(run({ NOMO_FORCE: "1" })).toBe("NOMO_SAME");
+    writeFileSync(f, U);
+    expect(run()).toBe("NOMO_SAME");
+    writeFileSync(f, "\x1b[2Jevil;rm -rf /");
+    expect(run()).toBe("NOMO_OTHER=2e-f");
+  });
+
+  test("boxIdle: Nomo's record wins; needsAttention asks the user; sessionStart asks the transcript", () => {
+    const end = JSON.stringify({ type: "assistant", message: { stop_reason: "end_turn" } });
+    const tool = JSON.stringify({ type: "assistant", message: { stop_reason: "tool_use" } });
     expect(boxIdle({ lastEvent: "done", tail: "", quietS: 0 })).toBe("idle");
-    expect(boxIdle({ lastEvent: "sessionStart", tail: "", quietS: 0 })).toBe("idle");
+    // A compact's SessionStart fires mid-turn: not idle on its own.
+    expect(boxIdle({ lastEvent: "sessionStart", tail: "", quietS: 99 })).toBe("busy");
+    expect(boxIdle({ lastEvent: "sessionStart", tail: tool, quietS: 99 })).toBe("busy");
+    expect(boxIdle({ lastEvent: "sessionStart", tail: end, quietS: 5 })).toBe("busy");
+    expect(boxIdle({ lastEvent: "sessionStart", tail: end, quietS: 20 })).toBe("idle");
     expect(boxIdle({ lastEvent: "needsAttention", tail: "", quietS: 99 })).toBe("attention");
     expect(boxIdle({ lastEvent: "working", tail: "", quietS: 99 })).toBe("busy");
   });

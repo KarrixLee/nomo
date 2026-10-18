@@ -40,11 +40,20 @@ export interface Snapshot {
 
 export const sha256 = (b: Buffer | string) => createHash("sha256").update(b).digest("hex");
 
-/** Every git call on the Mac: the user's hooks never run on box-made content. */
+/** Every git call on the Mac: the user's hooks never run on box-made content, and no LFS filter (a
+ *  box-planted .gitattributes) ever runs a smudge/process command. */
 export const git = (root: string, args: string[], env?: NodeJS.ProcessEnv) =>
-  execFileSync("git", ["-c", "core.hooksPath=/dev/null", ...args], {
-    cwd: root, env: env ?? process.env, maxBuffer: 1 << 30, stdio: ["ignore", "pipe", "pipe"],
+  execFileSync("git", [
+    "-c", "core.hooksPath=/dev/null", "-c", "filter.lfs.smudge=", "-c", "filter.lfs.process=", "-c", "filter.lfs.required=false", ...args,
+  ], {
+    cwd: root, env: { ...(env ?? process.env), GIT_LFS_SKIP_SMUDGE: "1" }, maxBuffer: 1 << 30, stdio: ["ignore", "pipe", "pipe"],
   }).toString();
+
+/** Box-derived text made safe to print: ANSI escapes and control characters gone (newlines and tabs
+ *  kept unless `oneLine`). */
+export const printable = (s: string, oneLine = false) =>
+  s.replace(/\x1b\[[0-?]*[ -/]*[@-~]|\x1b[\]P^_X][^\x07\x1b]*(?:\x07|\x1b\\)?/g, "")
+    .replace(oneLine ? /[\x00-\x1f\x7f-\x9f]/g : /[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, "");
 
 /** A fingerprint of the working tree vs HEAD, READ-ONLY: `git diff --binary HEAD` (worktree), the
  *  staged diff (so a staging-only change shows), and each untracked non-ignored file's content hash. */
@@ -115,6 +124,8 @@ export type TranscriptAction = "corrupt" | "same" | "replace" | "fork";
  *  fork: the Mac appended after the handoff → install the box copy under a NEW id, Mac copy untouched. */
 export function transcriptAction(snap: { tBytes: number; tSha: string } | undefined, mac: Buffer | undefined, box: Buffer): TranscriptAction {
   if (snap) {
+    // A rerun after a partial --back already installed this exact copy: nothing to do, never a fork.
+    if (mac?.equals(box)) return "same";
     if (box.length < snap.tBytes || sha256(box.subarray(0, snap.tBytes)) !== snap.tSha) return "corrupt";
     if (box.length === snap.tBytes) return "same";
     if (!mac || (mac.length === snap.tBytes && sha256(mac) === snap.tSha)) return "replace";
@@ -127,14 +138,15 @@ export function transcriptAction(snap: { tBytes: number; tSha: string } | undefi
 
 export type Idle = "idle" | "attention" | "busy";
 
-/** Is the box session at a turn boundary? Nomo's own record wins (done/sessionStart idle, needsAttention
+/** Is the box session at a turn boundary? Nomo's own record wins (done idle, needsAttention
  *  is a question only the user can answer); without one, the transcript must end in an `end_turn`
  *  assistant line followed only by non-conversation meta, and have been quiet for 15s. `tail` is the
  *  file's last 64 KiB, so its first line may be torn. */
 export function boxIdle(o: { lastEvent?: string; tail: string; quietS: number }): Idle {
-  if (o.lastEvent === "done" || o.lastEvent === "sessionStart") return "idle";
+  if (o.lastEvent === "done") return "idle";
   if (o.lastEvent === "needsAttention") return "attention";
-  if (o.lastEvent) return "busy";
+  // sessionStart alone proves nothing: a compact's SessionStart fires mid-turn. Ask the transcript.
+  if (o.lastEvent && o.lastEvent !== "sessionStart") return "busy";
   const rows: any[] = [];
   for (const line of o.tail.split("\n")) {
     if (!line.trim()) continue;
@@ -202,7 +214,8 @@ export function extractTgz(tgz: string, parent: string): string {
   const n = Number(execFileSync("sh", ["-c", `gzip -dc < "$1" | head -c ${MAX_EXTRACTED_BYTES + 1} | wc -c`, "sh", tgz]).toString().trim());
   if (!(n <= MAX_EXTRACTED_BYTES)) throw new Error(`${tgz} inflates past ${MAX_EXTRACTED_BYTES / 2 ** 30} GB`);
   const out = mkdtempSync(join(parent, "x-"));
-  execFileSync("tar", ["-xzf", tgz, "-C", out, "--no-same-owner", "--no-same-permissions"], { stdio: ["ignore", "ignore", "pipe"] });
+  // /usr/bin/tar (bsdtar): its own refusal of ../ and through-symlink entries, whatever is on PATH.
+  execFileSync("/usr/bin/tar", ["-xzf", tgz, "-C", out, "--no-same-owner", "--no-same-permissions"], { stdio: ["ignore", "ignore", "pipe"] });
   return out;
 }
 
@@ -225,11 +238,54 @@ export function copyContained(src: string, dstRoot: string, rel: string, overwri
   return true;
 }
 
-/** Every `diff --git` path in a patch must be safe: `git apply` is a second fence, not the only one. */
-export function patchPathsSafe(patch: string): boolean {
-  for (const m of patch.matchAll(/^diff --git a\/(.+?) b\/(.+)$/gm)) if (!safeRel(m[1]) || !safeRel(m[2])) return false;
-  for (const m of patch.matchAll(/^(?:rename|copy) (?:from|to) (.+)$/gm)) if (!safeRel(m[1])) return false;
-  return true;
+/** Every path a box patch changes, as git ITSELF applies it (no parsing of our own): applied to a
+ *  throwaway index of `base`, then a raw, rename-free diff of that index (both sides of a rename, every
+ *  new mode). Throws when a path is unsafe (safeRel) or the patch creates or edits a symlink. */
+export function patchPaths(root: string, patch: string, base: string, tmpParent: string): string[] {
+  if (!lstatSync(patch).size) return [];
+  const env = { ...process.env, GIT_INDEX_FILE: join(mkdtempSync(join(tmpParent, "pidx-")), "index") };
+  git(root, ["read-tree", base], env);
+  git(root, ["apply", "--cached", "--binary", patch], env);
+  const raw = git(root, ["diff-index", "--cached", "--raw", "-z", "--no-renames", base], env).split("\0");
+  const paths: string[] = [];
+  for (let i = 0; i + 1 < raw.length; i += 2) { // ":<old mode> <new mode> <old> <new> <status>" \0 <path> \0
+    const newMode = raw[i].split(" ")[1], p = raw[i + 1];
+    if (newMode === "120000") throw new Error(`the box patch makes ${printable(p, true)} a symlink`);
+    if (!safeRel(p)) throw new Error(`the box patch touches an unsafe path (${printable(p, true)}: .git, .., absolute or sensitive)`);
+    paths.push(p);
+  }
+  return paths;
+}
+
+/** Files that make an agent, editor, direnv or git run something on this Mac (or change what it runs)
+ *  the moment the checkout holds them. Box work touching any of them never lands in place. */
+const AGENT_DIRS = [".claude", ".vscode", ".idea", ".githooks", ".husky", ".devcontainer", ".cursor"];
+const AGENT_FILES = [".mcp.json", "claude.md", "claude.local.md", ".claude.json", ".envrc", ".gitattributes", ".lfsconfig", ".gitmodules"];
+
+/** The paths (at any depth, any case) that are agent/editor/git config. */
+export function agentConfigPaths(paths: string[]): string[] {
+  return [...new Set(paths)].filter((p) => {
+    const segs = p.toLowerCase().split("/").filter(Boolean);
+    return segs.some((s) => AGENT_DIRS.includes(s)) || AGENT_FILES.includes(segs[segs.length - 1] ?? "");
+  });
+}
+
+/** Make the box's HEAD present here: verify + fetch the bundle (objects and FETCH_HEAD only, nothing
+ *  checked out) and prove it is the HEAD the box reported; without a bundle it must already exist. */
+export function fetchBox(root: string, a: BoxArtifacts): void {
+  if (!a.bundle) { git(root, ["cat-file", "-e", `${a.boxHead}^{commit}`]); return; }
+  git(root, ["bundle", "verify", "-q", a.bundle]);
+  git(root, ["fetch", "-q", a.bundle, "HEAD"]);
+  const got = git(root, ["rev-parse", "FETCH_HEAD"]).trim();
+  if (got !== a.boxHead) throw new Error(`the bundle's HEAD is ${got}, the box reported ${a.boxHead}`);
+}
+
+/** Every path landing the box's work would change relative to `macHead`: its commits (rename-free, so
+ *  both sides), its patch (patchPaths: throws on an unsafe one), its untracked files. */
+export function boxChangedPaths(root: string, a: BoxArtifacts, macHead: string, tmpParent: string): string[] {
+  fetchBox(root, a);
+  const commits = a.boxHead === macHead ? [] : git(root, ["diff", "--name-only", "--no-renames", "-z", macHead, a.boxHead]).split("\0").filter(Boolean);
+  return [...commits, ...(a.patch ? patchPaths(root, a.patch, a.boxHead, tmpParent) : []), ...a.untracked];
 }
 
 // ----------------------------------------------------------------------------------------- memory
@@ -285,10 +341,6 @@ const recovery = (root: string, stash: string | undefined, backup: string) => [
   `Everything the box sent is in ${backup} (repo.bundle, wip.patch, untracked.tgz).`,
 ].filter(Boolean).join("\n");
 
-function checkPatch(patch: string | undefined): void {
-  if (patch && !patchPathsSafe(readFileSync(patch, "utf8"))) throw new Error("the box patch touches an unsafe path (.git, .., absolute or sensitive)");
-}
-
 /** The Mac is exactly as handed off: stash (only if dirty, kept), fast-forward to the box's commits (or
  *  detach there when the Mac was detached), apply the box's WIP, copy its untracked files (never over an
  *  existing one). Returns the stash sha, if any. Throws with the exact recovery on any failure. */
@@ -296,22 +348,19 @@ export function applyInPlace(root: string, a: BoxArtifacts, detached: boolean, u
   let stash: string | undefined;
   const skipped: string[] = [];
   try {
-    checkPatch(a.patch);
-    if (a.bundle) git(root, ["bundle", "verify", "-q", a.bundle]);
+    fetchBox(root, a);
+    if (a.patch) patchPaths(root, a.patch, a.boxHead, backup);
     if (git(root, ["status", "--porcelain"]).trim()) {
-      git(root, ["stash", "push", "-u", "-m", `nomo: before cloud return ${uuid8}`]);
+      const msg = `nomo: before cloud return ${uuid8}`;
+      console.log(`Stashing your uncommitted Mac changes as "${msg}"…`);
+      git(root, ["stash", "push", "-u", "-m", msg]);
       stash = git(root, ["rev-parse", "stash@{0}"]).trim();
     }
-    if (a.bundle) {
-      git(root, ["fetch", "-q", a.bundle, "HEAD"]);
-      const got = git(root, ["rev-parse", "FETCH_HEAD"]).trim();
-      if (got !== a.boxHead) throw new Error(`the bundle's HEAD is ${got}, the box reported ${a.boxHead}`);
-      git(root, detached ? ["checkout", "-q", "--detach", a.boxHead] : ["merge", "-q", "--ff-only", a.boxHead]);
-    }
+    if (a.bundle) git(root, detached ? ["checkout", "-q", "--detach", a.boxHead] : ["merge", "-q", "--ff-only", a.boxHead]);
     if (a.patch && lstatSync(a.patch).size > 0) git(root, ["apply", "--binary", a.patch]);
     for (const rel of a.untracked) if (!copyContained(join(a.untrackedDir!, rel), root, rel, false)) skipped.push(rel);
   } catch (e: any) {
-    const why = (e.stderr?.toString() || e.message || String(e)).trim();
+    const why = printable((e.stderr?.toString() || e.message || String(e)).trim());
     throw new Error(`landing the box's code in ${root} failed: ${why}\n${recovery(root, stash, backup)}`);
   }
   return { stash, skipped };
@@ -329,16 +378,11 @@ export function freeBranch(root: string, uuid8: string): string {
  *  (or the box HEAD when it made none), then its WIP + untracked files as one commit built in a temp
  *  index. Returns the branch name. */
 export function landOnBranch(root: string, a: BoxArtifacts, uuid8: string, backup: string): string {
-  checkPatch(a.patch);
+  fetchBox(root, a);
+  if (a.patch) patchPaths(root, a.patch, a.boxHead, backup);
   const name = freeBranch(root, uuid8);
   const ref = `refs/heads/${name}`;
-  if (a.bundle) {
-    git(root, ["bundle", "verify", "-q", a.bundle]);
-    git(root, ["fetch", "-q", a.bundle, `+HEAD:${ref}`]);
-  } else {
-    git(root, ["cat-file", "-e", `${a.boxHead}^{commit}`]);
-    git(root, ["update-ref", ref, a.boxHead, ""]);
-  }
+  git(root, ["update-ref", ref, a.boxHead, ""]);
   const hasPatch = !!a.patch && lstatSync(a.patch).size > 0;
   if (!hasPatch && !a.untracked.length) return name;
 
@@ -349,9 +393,10 @@ export function landOnBranch(root: string, a: BoxArtifacts, uuid8: string, backu
   git(root, ["read-tree", tip], env);
   if (hasPatch) git(root, ["apply", "--cached", "--binary", a.patch!], env);
   if (a.untracked.length) {
-    execFileSync("git", ["-c", "core.hooksPath=/dev/null", `--git-dir=${gitDir}`, `--work-tree=${a.untrackedDir}`, "add", "-f", "--", ...a.untracked], {
-      cwd: a.untrackedDir, env, stdio: ["ignore", "pipe", "pipe"],
-    });
+    // From a NUL list, literal: no argv explosion, no pathspec magic in a box-chosen name.
+    const list = join(tmp, "paths");
+    writeFileSync(list, a.untracked.join("\0"));
+    git(a.untrackedDir!, ["--literal-pathspecs", `--git-dir=${gitDir}`, `--work-tree=${a.untrackedDir}`, "add", "-f", `--pathspec-from-file=${list}`, "--pathspec-file-nul"], env);
   }
   const tree = git(root, ["write-tree"], env).trim();
   const commit = git(root, ["commit-tree", tree, "-p", tip, "-m", `nomo: uncommitted work from the cloud session ${uuid8}`]).trim();
