@@ -2,11 +2,11 @@ import { createRequire } from "node:module";
 var __require = /* @__PURE__ */ createRequire(import.meta.url);
 
 // src/entries/handoff.ts
-import { execFileSync as execFileSync3, spawn as spawn2 } from "node:child_process";
-import { existsSync as existsSync3, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync as readFileSync2, realpathSync, rmSync, statSync as statSync2, writeFileSync } from "node:fs";
+import { execFileSync as execFileSync4, spawn as spawn2 } from "node:child_process";
+import { existsSync as existsSync4, lstatSync as lstatSync2, mkdirSync as mkdirSync2, mkdtempSync as mkdtempSync2, readdirSync as readdirSync2, readFileSync as readFileSync3, realpathSync as realpathSync2, rmSync, statSync as statSync2, writeFileSync as writeFileSync2 } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
-import { dirname as dirname2, join as join3, relative, sep } from "node:path";
+import { dirname as dirname3, join as join4, relative, sep as sep2 } from "node:path";
 import { fileURLToPath as fileURLToPath2 } from "node:url";
 
 // src/core/crypto.ts
@@ -384,7 +384,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "2.3.10";
+var PLUGIN_VERSION = "2.3.11";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -3184,6 +3184,343 @@ function adapterFor(agent) {
 }
 var allAdapters = [claudeAdapter, codexAdapter];
 
+// src/core/cloud-back.ts
+import { execFileSync as execFileSync3 } from "node:child_process";
+import { createHash as createHash2 } from "node:crypto";
+import {
+  chmodSync,
+  copyFileSync,
+  existsSync as existsSync3,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync as readFileSync2,
+  realpathSync,
+  renameSync,
+  writeFileSync
+} from "node:fs";
+import { dirname as dirname2, isAbsolute as isAbsolute2, join as join3, sep } from "node:path";
+var MAX_ARTIFACT_BYTES = 100 * 1024 * 1024;
+var MAX_EXTRACTED_BYTES = 1024 * 1024 * 1024;
+var SENSITIVE = [".claude", ".config/cc-status", ".ssh", ".gnupg", ".aws", "Library/Keychains"];
+var sha256 = (b) => createHash2("sha256").update(b).digest("hex");
+var git = (root, args, env) => execFileSync3("git", ["-c", "core.hooksPath=/dev/null", ...args], {
+  cwd: root,
+  env: env ?? process.env,
+  maxBuffer: 1 << 30,
+  stdio: ["ignore", "pipe", "pipe"]
+}).toString();
+function wipFingerprint(root) {
+  const ro = ["--no-optional-locks"];
+  const h = createHash2("sha256");
+  h.update(git(root, [...ro, "diff", "--binary", "HEAD"]));
+  h.update("\x00staged\x00");
+  h.update(git(root, [...ro, "diff", "--cached", "--binary", "HEAD"]));
+  const untracked = git(root, [...ro, "ls-files", "--others", "--exclude-standard", "-z"]).split("\x00").filter(Boolean).sort();
+  for (const p of untracked) {
+    let c;
+    try {
+      c = sha256(readFileSync2(join3(root, p)));
+    } catch {
+      c = "unreadable";
+    }
+    h.update(`\x00${p}\x00${c}`);
+  }
+  return h.digest("hex");
+}
+function listFiles(dir, rel = "") {
+  const abs = join3(dir, rel);
+  if (!lstatSync(abs, { throwIfNoEntry: false })?.isDirectory())
+    return [];
+  return readdirSync(abs).flatMap((n) => {
+    const r = rel ? join3(rel, n) : n;
+    const st = lstatSync(join3(dir, r));
+    return st.isDirectory() ? listFiles(dir, r) : st.isFile() ? [r] : [];
+  });
+}
+function takeSnapshot(cwd, root, isGit, projDir, transcript) {
+  const memDir = join3(projDir, "memory");
+  const memory = Object.fromEntries(listFiles(memDir).map((r) => [r, sha256(readFileSync2(join3(memDir, r)))]));
+  const snap = { cwd, root, git: isGit, tBytes: transcript.length, tSha: sha256(transcript), memory, at: Date.now() };
+  if (isGit)
+    Object.assign(snap, macGitState(root));
+  return snap;
+}
+function macGitState(root) {
+  return {
+    branch: git(root, ["rev-parse", "--abbrev-ref", "HEAD"]).trim(),
+    head: git(root, ["rev-parse", "HEAD"]).trim(),
+    wipFp: wipFingerprint(root)
+  };
+}
+function decideCode(snap, mac, box) {
+  if (box.commits === 0 && box.patchBytes === 0 && box.untracked === 0)
+    return "noop";
+  if (!snap || !box.ff)
+    return "branch";
+  const same = snap.branch === mac.branch && snap.head === mac.head && snap.wipFp === mac.wipFp;
+  return same ? "apply" : "branch";
+}
+function transcriptAction(snap, mac, box) {
+  if (snap) {
+    if (box.length < snap.tBytes || sha256(box.subarray(0, snap.tBytes)) !== snap.tSha)
+      return "corrupt";
+    if (box.length === snap.tBytes)
+      return "same";
+    if (!mac || mac.length === snap.tBytes && sha256(mac) === snap.tSha)
+      return "replace";
+    return "fork";
+  }
+  if (!mac)
+    return "replace";
+  if (box.equals(mac))
+    return "same";
+  return box.length > mac.length && box.subarray(0, mac.length).equals(mac) ? "replace" : "fork";
+}
+function boxIdle(o) {
+  if (o.lastEvent === "done" || o.lastEvent === "sessionStart")
+    return "idle";
+  if (o.lastEvent === "needsAttention")
+    return "attention";
+  if (o.lastEvent)
+    return "busy";
+  const rows = [];
+  for (const line of o.tail.split(`
+`)) {
+    if (!line.trim())
+      continue;
+    try {
+      rows.push(JSON.parse(line));
+    } catch {}
+  }
+  for (let i = rows.length - 1;i >= 0; i--) {
+    const t = rows[i]?.type;
+    if (t === "user")
+      return "busy";
+    if (t !== "assistant")
+      continue;
+    return rows[i]?.message?.stop_reason === "end_turn" && o.quietS >= 15 ? "idle" : "busy";
+  }
+  return "busy";
+}
+function parseMarkers(stdout) {
+  const m = {}, sizes = {};
+  for (const line of stdout.split(`
+`)) {
+    const kv = line.match(/^NOMO_([A-Z]+)=(.*)$/);
+    if (kv)
+      m[kv[1]] = kv[2].trim();
+    const sz = line.match(/^NOMO_SIZE (\S+) (\d+)$/);
+    if (sz)
+      sizes[sz[1]] = Number(sz[2]);
+  }
+  return { m, sizes };
+}
+function safeRel(rel) {
+  if (!rel || isAbsolute2(rel) || rel.includes("\x00") || rel.includes("\\"))
+    return false;
+  const segs = rel.split("/").filter((s) => s !== "" && s !== ".");
+  if (!segs.length || segs.some((s) => s === ".." || s.toLowerCase() === ".git"))
+    return false;
+  return !segs.some((_, i) => {
+    const sub = segs.slice(i).join("/").toLowerCase();
+    return SENSITIVE.some((p) => sub === p.toLowerCase() || sub.startsWith(p.toLowerCase() + "/"));
+  });
+}
+function validateTree(dir, allow = () => true, budget = { left: MAX_EXTRACTED_BYTES }) {
+  const files = [], skipped = [];
+  const walk = (rel) => {
+    for (const n of readdirSync(join3(dir, rel))) {
+      const r = rel ? `${rel}/${n}` : n;
+      const st = lstatSync(join3(dir, r));
+      if (!safeRel(r) || !allow(r)) {
+        skipped.push(r);
+        continue;
+      }
+      if (st.isDirectory()) {
+        walk(r);
+        continue;
+      }
+      if (!st.isFile() || st.nlink > 1) {
+        skipped.push(r);
+        continue;
+      }
+      if ((budget.left -= st.size) < 0)
+        throw new Error(`box artifacts exceed ${MAX_EXTRACTED_BYTES / 2 ** 30} GB extracted`);
+      files.push(r);
+    }
+  };
+  walk("");
+  return { files, skipped };
+}
+function extractTgz(tgz, parent) {
+  if (lstatSync(tgz).size > MAX_ARTIFACT_BYTES)
+    throw new Error(`${tgz} is over ${MAX_ARTIFACT_BYTES / 1e6} MB`);
+  const n = Number(execFileSync3("sh", ["-c", `gzip -dc < "$1" | head -c ${MAX_EXTRACTED_BYTES + 1} | wc -c`, "sh", tgz]).toString().trim());
+  if (!(n <= MAX_EXTRACTED_BYTES))
+    throw new Error(`${tgz} inflates past ${MAX_EXTRACTED_BYTES / 2 ** 30} GB`);
+  const out = mkdtempSync(join3(parent, "x-"));
+  execFileSync3("tar", ["-xzf", tgz, "-C", out, "--no-same-owner", "--no-same-permissions"], { stdio: ["ignore", "ignore", "pipe"] });
+  return out;
+}
+function copyContained(src, dstRoot, rel, overwrite, priv = false) {
+  if (!safeRel(rel))
+    return false;
+  const dst = join3(dstRoot, rel);
+  let anc = dirname2(dst);
+  while (!existsSync3(anc))
+    anc = dirname2(anc);
+  const realRoot = realpathSync(dstRoot);
+  const realAnc = realpathSync(anc);
+  if (realAnc !== realRoot && !realAnc.startsWith(realRoot + sep))
+    throw new Error(`refusing to write ${rel}: it resolves outside ${dstRoot}`);
+  const there = lstatSync(dst, { throwIfNoEntry: false });
+  if (there && (!overwrite || !there.isFile()))
+    return false;
+  mkdirSync(dirname2(dst), { recursive: true });
+  const exec = (lstatSync(src).mode & 73) !== 0;
+  copyFileSync(src, dst);
+  chmodSync(dst, priv ? 384 : exec ? 493 : 420);
+  return true;
+}
+function patchPathsSafe(patch) {
+  for (const m of patch.matchAll(/^diff --git a\/(.+?) b\/(.+)$/gm))
+    if (!safeRel(m[1]) || !safeRel(m[2]))
+      return false;
+  for (const m of patch.matchAll(/^(?:rename|copy) (?:from|to) (.+)$/gm))
+    if (!safeRel(m[1]))
+      return false;
+  return true;
+}
+function mergeMemory(snapMem, boxDir, boxFiles, macDir, backup) {
+  const r = { added: [], updated: [], conflicts: [] };
+  mkdirSync(macDir, { recursive: true });
+  for (const rel of boxFiles) {
+    const src = join3(boxDir, rel);
+    const mac = join3(macDir, rel);
+    if (!existsSync3(mac)) {
+      if (copyContained(src, macDir, rel, false, true))
+        r.added.push(rel);
+      continue;
+    }
+    const macSha = sha256(readFileSync2(mac));
+    if (macSha === sha256(readFileSync2(src)))
+      continue;
+    if (snapMem?.[rel] === macSha) {
+      copyContained(mac, mkdirp(join3(backup, "memory-before")), rel, true, true);
+      if (copyContained(src, macDir, rel, true, true))
+        r.updated.push(rel);
+    } else {
+      copyContained(src, mkdirp(join3(backup, "memory-conflicts")), rel, true, true);
+      r.conflicts.push(rel);
+    }
+  }
+  return r;
+}
+var mkdirp = (d) => {
+  mkdirSync(d, { recursive: true, mode: 448 });
+  return d;
+};
+function atomicWriteBytes(path, bytes) {
+  mkdirSync(dirname2(path), { recursive: true });
+  const tmp = `${path}.${process.pid}.tmp`;
+  writeFileSync(tmp, bytes, { mode: 384 });
+  renameSync(tmp, path);
+}
+var recovery = (root, stash, backup) => [
+  `Nothing was reset or cleaned. Inspect with: git -C '${root}' status`,
+  stash ? `Your Mac changes from before are in stash ${stash}: git -C '${root}' stash apply ${stash}` : "",
+  `Everything the box sent is in ${backup} (repo.bundle, wip.patch, untracked.tgz).`
+].filter(Boolean).join(`
+`);
+function checkPatch(patch) {
+  if (patch && !patchPathsSafe(readFileSync2(patch, "utf8")))
+    throw new Error("the box patch touches an unsafe path (.git, .., absolute or sensitive)");
+}
+function applyInPlace(root, a, detached, uuid8, backup) {
+  let stash;
+  const skipped = [];
+  try {
+    checkPatch(a.patch);
+    if (a.bundle)
+      git(root, ["bundle", "verify", "-q", a.bundle]);
+    if (git(root, ["status", "--porcelain"]).trim()) {
+      git(root, ["stash", "push", "-u", "-m", `nomo: before cloud return ${uuid8}`]);
+      stash = git(root, ["rev-parse", "stash@{0}"]).trim();
+    }
+    if (a.bundle) {
+      git(root, ["fetch", "-q", a.bundle, "HEAD"]);
+      const got = git(root, ["rev-parse", "FETCH_HEAD"]).trim();
+      if (got !== a.boxHead)
+        throw new Error(`the bundle's HEAD is ${got}, the box reported ${a.boxHead}`);
+      git(root, detached ? ["checkout", "-q", "--detach", a.boxHead] : ["merge", "-q", "--ff-only", a.boxHead]);
+    }
+    if (a.patch && lstatSync(a.patch).size > 0)
+      git(root, ["apply", "--binary", a.patch]);
+    for (const rel of a.untracked)
+      if (!copyContained(join3(a.untrackedDir, rel), root, rel, false))
+        skipped.push(rel);
+  } catch (e) {
+    const why = (e.stderr?.toString() || e.message || String(e)).trim();
+    throw new Error(`landing the box's code in ${root} failed: ${why}
+${recovery(root, stash, backup)}`);
+  }
+  return { stash, skipped };
+}
+function freeBranch(root, uuid8) {
+  for (let i = 1;; i++) {
+    const name = `nomo/cloud-${uuid8}${i > 1 ? `-${i}` : ""}`;
+    try {
+      git(root, ["show-ref", "--verify", "-q", `refs/heads/${name}`]);
+    } catch {
+      return name;
+    }
+  }
+}
+function landOnBranch(root, a, uuid8, backup) {
+  checkPatch(a.patch);
+  const name = freeBranch(root, uuid8);
+  const ref = `refs/heads/${name}`;
+  if (a.bundle) {
+    git(root, ["bundle", "verify", "-q", a.bundle]);
+    git(root, ["fetch", "-q", a.bundle, `+HEAD:${ref}`]);
+  } else {
+    git(root, ["cat-file", "-e", `${a.boxHead}^{commit}`]);
+    git(root, ["update-ref", ref, a.boxHead, ""]);
+  }
+  const hasPatch = !!a.patch && lstatSync(a.patch).size > 0;
+  if (!hasPatch && !a.untracked.length)
+    return name;
+  const tip = git(root, ["rev-parse", ref]).trim();
+  const gitDir = git(root, ["rev-parse", "--absolute-git-dir"]).trim();
+  const tmp = mkdtempSync(join3(backup, "index-"));
+  const env = { ...process.env, GIT_INDEX_FILE: join3(tmp, "index") };
+  git(root, ["read-tree", tip], env);
+  if (hasPatch)
+    git(root, ["apply", "--cached", "--binary", a.patch], env);
+  if (a.untracked.length) {
+    execFileSync3("git", ["-c", "core.hooksPath=/dev/null", `--git-dir=${gitDir}`, `--work-tree=${a.untrackedDir}`, "add", "-f", "--", ...a.untracked], {
+      cwd: a.untrackedDir,
+      env,
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+  }
+  const tree = git(root, ["write-tree"], env).trim();
+  const commit = git(root, ["commit-tree", tree, "-p", tip, "-m", `nomo: uncommitted work from the cloud session ${uuid8}`]).trim();
+  git(root, ["update-ref", ref, commit, tip]);
+  return name;
+}
+function landFolder(cwd, extracted, files, uuid8) {
+  let dst = `${cwd}.nomo-cloud-${uuid8}`;
+  for (let i = 2;existsSync3(dst); i++)
+    dst = `${cwd}.nomo-cloud-${uuid8}-${i}`;
+  mkdirSync(dst, { recursive: true });
+  for (const rel of files)
+    copyContained(join3(extracted, rel), dst, rel, false);
+  return dst;
+}
+
 // src/qr/qr.ts
 var encoder = new TextEncoder;
 var GF_EXP = new Uint8Array(512);
@@ -3686,7 +4023,6 @@ function renderQRSVG(text, opts = {}) {
 var API = "https://infra.omg.dev/v1";
 var CLOUD_PATH = `${CC_DIR}/cloud.json`;
 var STAGE = "/tmp/nomo-handoff";
-var MAX_ARTIFACT_BYTES = 100 * 1024 * 1024;
 var KEEPALIVE_S = 1800;
 var BOX_MACHINE_NAME = "Nomo Cloud";
 var PAIR_URL_MARKER = "NOMO_PAIR_URL=";
@@ -3773,13 +4109,13 @@ function takePairUrl(stdout) {
   return { url, rest };
 }
 function pluginRoot() {
-  const up2 = dirname2(dirname2(fileURLToPath2(import.meta.url)));
-  return existsSync3(join3(up2, ".claude-plugin", "plugin.json")) ? up2 : join3(dirname2(up2), "plugin");
+  const up2 = dirname3(dirname3(fileURLToPath2(import.meta.url)));
+  return existsSync4(join4(up2, ".claude-plugin", "plugin.json")) ? up2 : join4(dirname3(up2), "plugin");
 }
 function readKeys() {
   const file = {};
   try {
-    for (const line of readFileSync2(`${process.env.HOME}/.nomo-spike.env`, "utf8").split(`
+    for (const line of readFileSync3(`${process.env.HOME}/.nomo-spike.env`, "utf8").split(`
 `)) {
       const m = line.match(/^\s*(?:export\s+)?([A-Z_]+)=(.*)$/);
       if (m)
@@ -3824,13 +4160,13 @@ function targetWorker(flag, env) {
     throw bad();
   return w;
 }
-var SENSITIVE = [".claude", ".config/cc-status", ".ssh", ".gnupg", ".aws", "Library/Keychains"];
-var EXCLUDE_SENSITIVE = SENSITIVE.flatMap((p) => ["--exclude", p]);
-function packRefusal(dir, home, has = existsSync3) {
+var SENSITIVE2 = [".claude", ".config/cc-status", ".ssh", ".gnupg", ".aws", "Library/Keychains"];
+var EXCLUDE_SENSITIVE = SENSITIVE2.flatMap((p) => ["--exclude", p]);
+function packRefusal(dir, home, has = existsSync4) {
   const rel = relative(dir, home);
-  if (rel !== ".." && !rel.startsWith(".." + sep))
+  if (rel !== ".." && !rel.startsWith(".." + sep2))
     return `${dir} is your home folder or contains it`;
-  const hit = SENSITIVE.find((p) => has(join3(dir, p)));
+  const hit = SENSITIVE2.find((p) => has(join4(dir, p)));
   return hit ? `${dir} contains ${hit}` : undefined;
 }
 var UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -3844,9 +4180,9 @@ function checkLaunchIds(uuid, model) {
 function userLayerFiles(claudeHome, entries) {
   const files = [], skipped = [];
   for (const top of entries) {
-    const abs = join3(claudeHome, top);
+    const abs = join4(claudeHome, top);
     if (!statSync2(abs, { throwIfNoEntry: false })) {
-      if (lstatSync(abs, { throwIfNoEntry: false }))
+      if (lstatSync2(abs, { throwIfNoEntry: false }))
         skipped.push(top);
       continue;
     }
@@ -3854,17 +4190,17 @@ function userLayerFiles(claudeHome, entries) {
       files.push(top);
       continue;
     }
-    const root = realpathSync(abs);
+    const root = realpathSync2(abs);
     const walk = (rel, ancestors) => {
-      const p = join3(claudeHome, rel);
+      const p = join4(claudeHome, rel);
       let real;
       try {
-        real = realpathSync(p);
+        real = realpathSync2(p);
       } catch {
         skipped.push(rel);
         return;
       }
-      if (real !== root && !real.startsWith(root + sep)) {
+      if (real !== root && !real.startsWith(root + sep2)) {
         skipped.push(rel);
         return;
       }
@@ -3876,9 +4212,9 @@ function userLayerFiles(claudeHome, entries) {
       if (!st.isDirectory() || ancestors.has(real))
         return;
       const next = new Set(ancestors).add(real);
-      for (const name of readdirSync(p))
+      for (const name of readdirSync2(p))
         if (name !== ".DS_Store")
-          walk(join3(rel, name), next);
+          walk(join4(rel, name), next);
     };
     walk(top, new Set);
   }
@@ -3886,13 +4222,13 @@ function userLayerFiles(claudeHome, entries) {
 }
 function packPlugin(out) {
   const plugin = pluginRoot();
-  const version = JSON.parse(readFileSync2(join3(plugin, ".claude-plugin", "plugin.json"), "utf8")).version;
+  const version = JSON.parse(readFileSync3(join4(plugin, ".claude-plugin", "plugin.json"), "utf8")).version;
   tar(out, plugin, ["--exclude", ".DS_Store", "."]);
   return JSON.stringify({ name: "nomo", owner: { name: "Nomo" }, plugins: [{ name: "nomo-cc", source: "./plugin", version }] });
 }
-var sh = (cmd, args, cwd, env) => execFileSync3(cmd, args, { cwd, env: env ?? process.env, maxBuffer: 1 << 30 }).toString();
+var sh = (cmd, args, cwd, env) => execFileSync4(cmd, args, { cwd, env: env ?? process.env, maxBuffer: 1 << 30 }).toString();
 function tar(out, cwd, args, input) {
-  execFileSync3("tar", ["--no-xattrs", "-czf", out, ...args], {
+  execFileSync4("tar", ["--no-xattrs", "-czf", out, ...args], {
     cwd,
     input,
     env: { ...process.env, COPYFILE_DISABLE: "1" },
@@ -3901,24 +4237,25 @@ function tar(out, cwd, args, input) {
 }
 function build(args, outDir) {
   const cwd = process.cwd();
-  const projDir = join3(process.env.HOME, ".claude", "projects", projectDirName(cwd));
-  if (!existsSync3(projDir))
+  const projDir = join4(process.env.HOME, ".claude", "projects", projectDirName(cwd));
+  if (!existsSync4(projDir))
     throw new Error(`no Claude Code transcripts for ${cwd} (looked in ${projDir})`);
-  const uuid = typeof args.get("--session") === "string" ? args.get("--session") : latestSession(readdirSync(projDir).map((name) => ({ name, mtimeMs: statSync2(join3(projDir, name)).mtimeMs })));
+  const uuid = typeof args.get("--session") === "string" ? args.get("--session") : latestSession(readdirSync2(projDir).map((name) => ({ name, mtimeMs: statSync2(join4(projDir, name)).mtimeMs })));
   if (uuid && !UUID_RE.test(uuid))
     throw new Error(`session id must be a UUID, got ${JSON.stringify(uuid)}`);
-  if (!uuid || !existsSync3(join3(projDir, `${uuid}.jsonl`)))
+  if (!uuid || !existsSync4(join4(projDir, `${uuid}.jsonl`)))
     throw new Error(`session ${uuid ?? "(none)"} not found in ${projDir}`);
-  const transcript = readFileSync2(join3(projDir, `${uuid}.jsonl`), "utf8");
+  const transcriptBytes = readFileSync3(join4(projDir, `${uuid}.jsonl`));
+  const transcript = transcriptBytes.toString("utf8");
   const model = typeof args.get("--model") === "string" ? toOpenRouterModel(args.get("--model")) : toOpenRouterModel(lastModel(transcript) ?? "claude-opus-5-5");
   checkLaunchIds(uuid, model);
   const art = {};
   const put = (name) => {
-    art[`${STAGE}-${name}`] = join3(outDir, name);
-    return join3(outDir, name);
+    art[`${STAGE}-${name}`] = join4(outDir, name);
+    return join4(outDir, name);
   };
-  tar(put("project.tgz"), projDir, [`${uuid}.jsonl`, ...[uuid, "memory"].filter((p) => existsSync3(join3(projDir, p)))]);
-  const claudeHome = join3(process.env.HOME, ".claude");
+  tar(put("project.tgz"), projDir, [`${uuid}.jsonl`, ...[uuid, "memory"].filter((p) => existsSync4(join4(projDir, p)))]);
+  const claudeHome = join4(process.env.HOME, ".claude");
   const layer = userLayerFiles(claudeHome, ["skills", "agents", "commands", "CLAUDE.md"]);
   if (layer.skipped.length)
     console.log(`Not shipping ${layer.skipped.length} user-layer link(s) that point outside their folder: ${layer.skipped.join(", ")}`);
@@ -3928,7 +4265,7 @@ function build(args, outDir) {
   const marketplace = packPlugin(put("plugin.tgz"));
   let git = true, root = cwd, branch;
   try {
-    root = execFileSync3("git", ["rev-parse", "--show-toplevel"], { cwd, stdio: ["ignore", "pipe", "ignore"] }).toString().trim();
+    root = execFileSync4("git", ["rev-parse", "--show-toplevel"], { cwd, stdio: ["ignore", "pipe", "ignore"] }).toString().trim();
   } catch {
     git = false;
   }
@@ -3936,11 +4273,18 @@ function build(args, outDir) {
   const refusal = git ? packRefusal(root, home, () => false) : packRefusal(cwd, home);
   if (refusal)
     throw new Error(`refusing to hand off: ${refusal}. Run it from a project folder.`);
+  const snap = takeSnapshot(cwd, root, git, projDir, transcriptBytes);
+  const gitUser = {};
   if (git) {
+    for (const [k, env] of [["user.name", "NOMO_GIT_NAME"], ["user.email", "NOMO_GIT_EMAIL"]]) {
+      try {
+        gitUser[env] = execFileSync4("git", ["config", k], { cwd: root, stdio: ["ignore", "pipe", "ignore"] }).toString().trim();
+      } catch {}
+    }
     branch = sh("git", ["rev-parse", "--abbrev-ref", "HEAD"], root).trim();
     sh("git", ["bundle", "create", "-q", put("repo.bundle"), "HEAD"], root);
-    writeFileSync(put("wip.patch"), execFileSync3("git", ["diff", "--binary", "HEAD"], { cwd: root, maxBuffer: 1 << 30 }));
-    const untracked = execFileSync3("git", ["ls-files", "--others", "--exclude-standard", "-z"], { cwd: root, maxBuffer: 1 << 30 });
+    writeFileSync2(put("wip.patch"), execFileSync4("git", ["diff", "--binary", "HEAD"], { cwd: root, maxBuffer: 1 << 30 }));
+    const untracked = execFileSync4("git", ["ls-files", "--others", "--exclude-standard", "-z"], { cwd: root, maxBuffer: 1 << 30 });
     tar(put("untracked.tgz"), root, [...EXCLUDE_SENSITIVE, "--null", "-T", "-"], untracked);
   } else {
     tar(put("folder.tgz"), cwd, ["--exclude", "node_modules", "--exclude", ".git", ...EXCLUDE_SENSITIVE, "."]);
@@ -3972,6 +4316,10 @@ ${boxSetup(marketplace)}
 P=/root/.claude/projects/${enc}
 mkdir -p "$P" && tar xzf ${STAGE}-project.tgz -C "$P"
 ${hasLayer ? `tar xzf ${STAGE}-userlayer.tgz -C /root/.claude` : "# no user layer"}
+
+# The user's git identity arrives as exec env (never argv), so the box's commits are authored as them.
+if [ -n "\${NOMO_GIT_NAME:-}" ]; then git config --global user.name "$NOMO_GIT_NAME"; fi
+if [ -n "\${NOMO_GIT_EMAIL:-}" ]; then git config --global user.email "$NOMO_GIT_EMAIL"; fi
 
 ROOT=${q(root)}
 [ -e "$ROOT" ] && mv "$ROOT" "$ROOT.nomo-bak-$(date +%s)"
@@ -4010,7 +4358,7 @@ sleep 8
 tmux has-session -t nomo
 tmux capture-pane -p -t nomo
 `;
-  return { uuid, cwd, root, git, branch, model, artifacts: art, script };
+  return { uuid, cwd, root, git, branch, model, artifacts: art, script, snap, gitUser };
 }
 async function api(key, method, path, body) {
   const res = await fetch(API + path, {
@@ -4024,18 +4372,26 @@ async function api(key, method, path, body) {
   return text ? JSON.parse(text) : null;
 }
 async function exec(key, id, script, env = {}) {
-  return await api(key, "POST", `/sandboxes/${id}/exec`, { cmd: "bash", args: ["-lc", script], env, timeoutMs: 600000 });
+  for (let i = 0;; i++) {
+    try {
+      return await api(key, "POST", `/sandboxes/${id}/exec`, { cmd: "bash", args: ["-lc", script], env, timeoutMs: 600000 });
+    } catch (e) {
+      if (e.status !== 409 || i >= 5)
+        throw e;
+      await new Promise((r) => setTimeout(r, 2000));
+    }
+  }
 }
 var loadCloud = () => {
   try {
-    return JSON.parse(readFileSync2(CLOUD_PATH, "utf8"));
+    return JSON.parse(readFileSync3(CLOUD_PATH, "utf8"));
   } catch {
     return {};
   }
 };
 function saveCloud(c) {
-  mkdirSync(dirname2(CLOUD_PATH), { recursive: true });
-  writeFileSync(CLOUD_PATH, JSON.stringify(c) + `
+  mkdirSync2(dirname3(CLOUD_PATH), { recursive: true });
+  writeFileSync2(CLOUD_PATH, JSON.stringify(c) + `
 `, { mode: 384 });
 }
 function macId() {
@@ -4061,17 +4417,27 @@ async function getBox(key, id) {
 }
 async function ensureBox(key) {
   let sb = await getBox(key, loadCloud().sandboxId);
-  if (sb?.status === "hibernated") {
-    console.log(`Waking box ${sb.id}…`);
-    sb = await api(key, "POST", `/sandboxes/${sb.id}/wake`);
-  }
   if (!sb) {
     const hasBase = await api(key, "GET", `/templates/${BASE_TEMPLATE}/latest`).then(() => true, () => false);
     console.log(`Creating your cloud box (${hasBase ? `template ${BASE_TEMPLATE}` : "omg preset"})…`);
     sb = await api(key, "POST", "/sandboxes", createBody(hasBase, macId()));
     saveCloud({ ...loadCloud(), sandboxId: sb.id });
   }
+  return wakeBox(key, sb);
+}
+async function wakeBox(key, sb) {
+  if (sb.status === "hibernated") {
+    console.log(`Waking box ${sb.id}…`);
+    sb = await api(key, "POST", `/sandboxes/${sb.id}/wake`);
+  }
   return waitRunning(key, sb);
+}
+async function sleepBox(key, sb) {
+  if (sb.status === "running") {
+    await exec(key, sb.id, SHM_SWEEP).catch(() => {});
+    await api(key, "POST", `/sandboxes/${sb.id}/hibernate`);
+  }
+  console.log(`Box ${sb.id} is asleep (hibernated; files and memory kept, deleted after 14 days asleep).`);
 }
 async function waitRunning(key, sb) {
   for (let i = 0;sb.status !== "running"; i++) {
@@ -4102,12 +4468,12 @@ tmux send-keys -t nomo -- "$NOMO_KEY"`;
 tmux capture-pane -p -t nomo | sed -e :a -e '/^\\n*$/{$d;N;ba' -e '}' | tail -40`;
 }
 async function bake(key) {
-  const out = mkdtempSync(join3(tmpdir(), "nomo-bake-"));
-  const marketplace = packPlugin(join3(out, "plugin.tgz"));
+  const out = mkdtempSync2(join4(tmpdir(), "nomo-bake-"));
+  const marketplace = packPlugin(join4(out, "plugin.tgz"));
   console.log(`Creating a bake box (omg preset, ${BOX_SIZE})…`);
   const id = await waitRunning(key, await api(key, "POST", "/sandboxes", { template: "omg", size: BOX_SIZE }));
   try {
-    await api(key, "POST", `/sandboxes/${id}/files`, [{ path: `${STAGE}-plugin.tgz`, content: readFileSync2(join3(out, "plugin.tgz")).toString("base64"), mode: 384 }]);
+    await api(key, "POST", `/sandboxes/${id}/files`, [{ path: `${STAGE}-plugin.tgz`, content: readFileSync3(join4(out, "plugin.tgz")).toString("base64"), mode: 384 }]);
     const r = await exec(key, id, bakeScript(marketplace));
     if (r.exitCode !== 0 || !/NOMO_BAKED/.test(r.stdout ?? ""))
       throw new Error(`bake script failed (exit ${r.exitCode}):
@@ -4140,7 +4506,7 @@ main{text-align:center;padding:16px}h1{font-size:24px;margin:8px 0}p{opacity:.7}
 <body><main><h1>${title}</h1><p>${sub}</p></main></body></html>`;
 }
 async function showPairing(omg, id, url) {
-  const page = join3(CC_DIR, "cloud-pair.html");
+  const page = join4(CC_DIR, "cloud-pair.html");
   let result = resultPage("Not paired", "Retry with: bun plugin/dist/handoff.mjs --pair");
   if (process.stdout.isTTY) {
     console.log(`
@@ -4148,8 +4514,8 @@ async function showPairing(omg, id, url) {
 `);
     console.log("Scan with Nomo on your iPhone to add this cloud box (Sessions → Pair a Computer). Expires in 10 minutes.");
   } else {
-    mkdirSync(CC_DIR, { recursive: true, mode: 448 });
-    writeFileSync(page, withReload(renderPairPage({ svg: renderQRSVG(url, { ecLevel: "Q" }), code: null, expiresAt: Date.now() + PAIR_WAIT_MS })), { mode: 384 });
+    mkdirSync2(CC_DIR, { recursive: true, mode: 448 });
+    writeFileSync2(page, withReload(renderPairPage({ svg: renderQRSVG(url, { ecLevel: "Q" }), code: null, expiresAt: Date.now() + PAIR_WAIT_MS })), { mode: 384 });
     try {
       spawn2("open", [page], { detached: true, stdio: "ignore" }).unref();
     } catch {}
@@ -4159,7 +4525,7 @@ async function showPairing(omg, id, url) {
   const onSignal = () => {
     if (!process.stdout.isTTY)
       try {
-        writeFileSync(page, result, { mode: 384 });
+        writeFileSync2(page, result, { mode: 384 });
       } catch {}
     process.exit(130);
   };
@@ -4183,7 +4549,7 @@ async function showPairing(omg, id, url) {
     process.off("SIGINT", onSignal);
     process.off("SIGTERM", onSignal);
     if (!process.stdout.isTTY)
-      writeFileSync(page, result, { mode: 384 });
+      writeFileSync2(page, result, { mode: 384 });
   }
   console.log("Not paired. Retry with: bun plugin/dist/handoff.mjs --pair");
 }
@@ -4201,19 +4567,293 @@ Retry with: bun plugin/dist/handoff.mjs --pair`);
   if (url)
     await showPairing(omg, id, url);
 }
+var BACK = "/tmp/nomo-back";
+var BACK_FILES = ["repo.bundle", "wip.patch", "untracked.tgz", "project.tgz", "folder.tgz"];
+var BACK_POLL_MS = 1e4;
+function backWaitScript(uuid, enc) {
+  return `${SHM_SWEEP}
+tmux has-session -t nomo 2>/dev/null || { echo NOMO_GONE; exit 0; }
+F=${BOX_CC}/sessions/${uuid}.json
+[ -f "$F" ] && echo "NOMO_EVENT=$(grep -o '"lastEvent": *"[^"]*"' "$F" | head -1 | cut -d'"' -f4)"
+T=/root/.claude/projects/${enc}/${uuid}.jsonl
+[ -f "$T" ] || { echo NOMO_NOTRANSCRIPT; exit 0; }
+echo "NOMO_AGE=$(( $(date +%s) - $(stat -c %Y "$T") ))"
+echo NOMO_TAIL
+tail -c 65536 "$T"`;
+}
+function backStopScript() {
+  return `${SHM_SWEEP}
+gone() { ! tmux has-session -t nomo 2>/dev/null; }
+if ! gone; then
+  if [ "\${NOMO_ESC:-}" = 1 ]; then tmux send-keys -t nomo Escape; sleep 2; fi
+  tmux send-keys -t nomo -l /exit; sleep 0.5; tmux send-keys -t nomo Enter
+  for _ in $(seq 30); do gone && break; sleep 1; done
+  if ! gone; then
+    tmux send-keys -t nomo C-c; sleep 1; tmux send-keys -t nomo C-c
+    for _ in $(seq 10); do gone && break; sleep 1; done
+  fi
+  if ! gone; then tmux kill-session -t nomo; echo NOMO_HARD_STOP; fi
+fi
+${BOX_PLUGIN}
+if [ -n "$R" ]; then bun "$R/dist/reset.mjs" >/dev/null 2>&1 || true; fi
+echo NOMO_STOPPED`;
+}
+function backPackScript(uuid, enc, root, isGit) {
+  const ex = EXCLUDE_SENSITIVE.map((a) => a === "--exclude" ? a : q(a)).join(" ");
+  return `${SHM_SWEEP}
+set -euo pipefail
+rm -f ${BACK}-*
+P=/root/.claude/projects/${enc}
+[ -f "$P/${uuid}.jsonl" ] || { echo NOMO_NOTRANSCRIPT; exit 5; }
+( cd "$P"; set -- ${uuid}.jsonl; if [ -d ${uuid} ]; then set -- "$@" ${uuid}; fi; if [ -d memory ]; then set -- "$@" memory; fi
+  tar czf ${BACK}-project.tgz "$@" )
+cd ${q(root)}
+${isGit ? `H=$(git rev-parse HEAD)
+echo "NOMO_HEAD=$H"
+echo "NOMO_BRANCH=$(git rev-parse --abbrev-ref HEAD)"
+B="\${NOMO_BASE:-}"
+if [ -n "$B" ] && git cat-file -e "$B^{commit}" 2>/dev/null; then
+  N=$(git rev-list --count "$B..HEAD")
+  if git merge-base --is-ancestor "$B" HEAD; then FF=1; else FF=0; fi
+  if [ "$N" -gt 0 ]; then git bundle create -q ${BACK}-repo.bundle "$B..HEAD"; fi
+else
+  N=$(git rev-list --count HEAD); FF=0
+  git bundle create -q ${BACK}-repo.bundle HEAD
+fi
+echo "NOMO_COMMITS=$N"
+echo "NOMO_FF=$FF"
+git diff --binary HEAD > ${BACK}-wip.patch
+git ls-files --others --exclude-standard -z > ${BACK}-ut.list
+tar czf ${BACK}-untracked.tgz ${ex} --null -T ${BACK}-ut.list
+rm -f ${BACK}-ut.list` : `tar czf ${BACK}-folder.tgz --exclude node_modules --exclude .git ${ex} .`}
+for f in ${BACK}-*; do echo "NOMO_SIZE \${f#${BACK}-} $(stat -c %s "$f")"; done`;
+}
+function resumeCommand(cwd, id) {
+  return `cd ${q(cwd)} && exec claude --resume ${id}`;
+}
+async function back(omg, args) {
+  const cloud = loadCloud();
+  const flag = args.get("--session");
+  const uuid = typeof flag === "string" ? flag : cloud.current;
+  if (!uuid)
+    throw new Error("no handed-off session on record; pass --session <uuid>");
+  if (!UUID_RE.test(uuid))
+    throw new Error(`session id must be a UUID, got ${JSON.stringify(uuid)}`);
+  const force = args.has("--force");
+  const waitMin = Number(args.get("--wait") ?? 15);
+  if (!(waitMin >= 0))
+    throw new Error("--wait takes minutes, e.g. --wait 30");
+  const snap = cloud.sessions?.[uuid];
+  const uuid8 = uuid.slice(0, 8);
+  let cwd = snap?.cwd ?? process.cwd(), root = snap?.root ?? cwd, isGit = snap?.git ?? true;
+  if (!snap) {
+    console.log(`No handoff snapshot for ${uuid}: assuming it belongs to ${cwd}; the box's work lands on a branch.`);
+    try {
+      root = sh("git", ["rev-parse", "--show-toplevel"], cwd).trim();
+    } catch {
+      isGit = false;
+      root = cwd;
+    }
+  }
+  const rec = await readRecord(uuid);
+  if (rec && typeof rec.pid === "number" && pidAlive(rec.pid) && !force) {
+    throw new Error(`session ${uuid} is running on this Mac (pid ${rec.pid}). Quit it first, or rerun with --force.`);
+  }
+  const enc = projectDirName(cwd);
+  const sb = await getBox(omg, cloud.sandboxId);
+  if (!sb)
+    throw new Error("no cloud box on record (nothing to bring back)");
+  const id = await wakeBox(omg, sb);
+  let gone = false;
+  if (!force) {
+    let told = "";
+    for (const end = Date.now() + waitMin * 60000;; ) {
+      const out = (await exec(omg, id, backWaitScript(uuid, enc))).stdout ?? "";
+      if (/^NOMO_GONE$/m.test(out)) {
+        gone = true;
+        break;
+      }
+      if (/^NOMO_NOTRANSCRIPT$/m.test(out))
+        throw new Error(`session ${uuid} has no transcript on box ${id}`);
+      const at = out.search(/^NOMO_TAIL$/m);
+      const head = at < 0 ? out : out.slice(0, at), tail = at < 0 ? "" : out.slice(at + `NOMO_TAIL
+`.length);
+      const { m } = parseMarkers(head);
+      const state = boxIdle({ lastEvent: m.EVENT || undefined, tail, quietS: Number(m.AGE ?? 0) });
+      if (state === "idle")
+        break;
+      if (Date.now() > end)
+        throw new Error(`the box session is still mid-turn after ${waitMin} min. Watch it with --screen; rerun --back later, or --back --force to interrupt it.`);
+      const msg = state === "attention" ? "The box session is waiting on you: answer it on your phone, or with --send-key (e.g. Enter, Escape). Still waiting…" : "The box session is mid-turn; waiting for it to finish (checks every 10s)…";
+      if (msg !== told)
+        console.log(told = msg);
+      await new Promise((r) => setTimeout(r, BACK_POLL_MS));
+    }
+  }
+  if (!gone)
+    console.log("Exiting Claude Code on the box…");
+  const stop = await exec(omg, id, backStopScript(), force ? { NOMO_ESC: "1" } : {});
+  if (/^NOMO_HARD_STOP$/m.test(stop.stdout ?? ""))
+    console.log("Claude Code did not exit on its own: hard stop (its last turn may be cut short).");
+  const pack = await exec(omg, id, backPackScript(uuid, enc, root, isGit), snap?.head ? { NOMO_BASE: snap.head } : {});
+  if (pack.exitCode !== 0)
+    throw new Error(`packing on box ${id} failed (exit ${pack.exitCode}):
+${(pack.stdout ?? "").slice(-1500)}
+${(pack.stderr ?? "").slice(-1500)}`);
+  const { m, sizes } = parseMarkers(pack.stdout ?? "");
+  for (const [name, size] of Object.entries(sizes)) {
+    if (size > MAX_ARTIFACT_BYTES)
+      throw new Error(`${name} on the box is ${(size / 1e6).toFixed(0)} MB (cap ${MAX_ARTIFACT_BYTES / 1e6} MB). The box is still awake: trim it via --screen/--send, rerun --back, or --stop.`);
+  }
+  const backup = join4(CC_DIR, "cloud-back", `${uuid8}-${Date.now()}`);
+  mkdirSync2(backup, { recursive: true, mode: 448 });
+  for (const name of BACK_FILES) {
+    if (!(name in sizes))
+      continue;
+    const r = await api(omg, "GET", `/sandboxes/${id}/files?path=${encodeURIComponent(`${BACK}-${name}`)}`);
+    const bytes = Buffer.from(r?.content ?? "", "base64");
+    if (bytes.length !== sizes[name])
+      throw new Error(`pulled ${name}: ${bytes.length} B, the box reported ${sizes[name]} B`);
+    writeFileSync2(join4(backup, name), bytes, { mode: 384 });
+  }
+  console.log(`Pulled the box's work into ${backup}`);
+  await exec(omg, id, `rm -f ${BACK}-*`).catch(() => {});
+  await sleepBox(omg, { id, status: "running" });
+  const problems = [];
+  const budget = { left: MAX_EXTRACTED_BYTES };
+  const projDir = mkdirp(join4(process.env.HOME, ".claude", "projects", enc));
+  const pdir = extractTgz(join4(backup, "project.tgz"), backup);
+  const pt = validateTree(pdir, (r) => r === `${uuid}.jsonl` || r === uuid || r.startsWith(`${uuid}/`) || r === "memory" || r.startsWith("memory/"), budget);
+  if (pt.skipped.length)
+    console.log(`Skipped ${pt.skipped.length} unexpected path(s) in the box's project files: ${pt.skipped.join(", ")}`);
+  let resumeId = uuid;
+  if (!pt.files.includes(`${uuid}.jsonl`))
+    problems.push("the box sent no transcript");
+  else {
+    const boxT = readFileSync3(join4(pdir, `${uuid}.jsonl`));
+    const macPath = join4(projDir, `${uuid}.jsonl`);
+    const macT = existsSync4(macPath) ? readFileSync3(macPath) : undefined;
+    const sub = pt.files.filter((r) => r.startsWith(`${uuid}/`));
+    const act = transcriptAction(snap, macT, boxT);
+    if (act === "corrupt")
+      problems.push(`the box transcript does not continue the one handed off; NOT installed (it is in ${backup}/project.tgz)`);
+    if (act === "replace") {
+      const before = mkdirp(join4(backup, "mac-before"));
+      if (macT)
+        copyContained(macPath, before, `${uuid}.jsonl`, true, true);
+      for (const r of listUnder(projDir, uuid))
+        copyContained(join4(projDir, r), before, r, true, true);
+      atomicWriteBytes(macPath, boxT);
+      for (const r of sub)
+        copyContained(join4(pdir, r), projDir, r, true, true);
+      console.log(`Transcript: installed the box's copy (+${boxT.length - (macT?.length ?? 0)} B); the Mac's previous copy is in ${before}`);
+    }
+    if (act === "fork") {
+      resumeId = randomUUID();
+      atomicWriteBytes(join4(projDir, `${resumeId}.jsonl`), boxT);
+      for (const r of sub)
+        copyContained(join4(pdir, r), projDir, resumeId + r.slice(uuid.length), false, true);
+      console.log(`Transcript: this Mac also continued ${uuid} after the handoff, so the box's copy is a NEW session ${resumeId}. Both are kept.`);
+    }
+    if (act === "same")
+      console.log("Transcript: the box added nothing.");
+  }
+  const mem = mergeMemory(snap?.memory, join4(pdir, "memory"), pt.files.filter((r) => r.startsWith("memory/")).map((r) => r.slice(7)), join4(projDir, "memory"), backup);
+  if (mem.added.length + mem.updated.length)
+    console.log(`Memory: ${mem.added.length} added, ${mem.updated.length} updated.`);
+  if (mem.conflicts.length)
+    console.log(`Memory: kept this Mac's ${mem.conflicts.join(", ")} (both sides changed); the box's versions are in ${backup}/memory-conflicts`);
+  if (isGit) {
+    const boxHead = m.HEAD ?? "";
+    if (!/^[0-9a-f]{40}$/.test(boxHead))
+      throw new Error(`the box reported no HEAD (${JSON.stringify(boxHead)})`);
+    const commits = Number(m.COMMITS ?? 0);
+    const has = (n) => existsSync4(join4(backup, n));
+    let untrackedDir, untracked = [];
+    if (has("untracked.tgz")) {
+      untrackedDir = extractTgz(join4(backup, "untracked.tgz"), backup);
+      const ut = validateTree(untrackedDir, undefined, budget);
+      untracked = ut.files;
+      if (ut.skipped.length)
+        console.log(`Skipped ${ut.skipped.length} untracked path(s) from the box (links or unsafe paths): ${ut.skipped.join(", ")}`);
+    }
+    const a = {
+      bundle: commits > 0 && has("repo.bundle") ? join4(backup, "repo.bundle") : undefined,
+      patch: has("wip.patch") ? join4(backup, "wip.patch") : undefined,
+      untrackedDir,
+      untracked,
+      boxHead
+    };
+    const mac = macGitState(root);
+    const action = decideCode(snap, mac, { commits, patchBytes: sizes["wip.patch"] ?? 0, untracked: untracked.length, ff: m.FF === "1" });
+    if (action === "noop")
+      console.log("Code: the box changed nothing.");
+    if (action === "apply") {
+      let r;
+      try {
+        r = applyInPlace(root, a, mac.branch === "HEAD", uuid8, backup);
+      } catch (e) {
+        throw new Error(`${e.message}
+The conversation itself is back: cd ${q(cwd)} && claude --resume ${resumeId}`);
+      }
+      console.log(`Code: landed in ${root} (${commits} commit(s)${a.patch && sizes["wip.patch"] ? " + uncommitted edits" : ""}${untracked.length ? ` + ${untracked.length} new file(s)` : ""}).`);
+      if (r.stash)
+        console.log(`  Your Mac edits from before the handoff are kept in stash ${r.stash} ("nomo: before cloud return ${uuid8}").`);
+      if (r.skipped.length)
+        console.log(`  Not overwritten (already on the Mac): ${r.skipped.join(", ")}`);
+    }
+    if (action === "branch") {
+      const why = !snap ? "no handoff snapshot" : m.FF !== "1" ? "the box rewrote history" : "this Mac changed since the handoff";
+      const name = landOnBranch(root, a, uuid8, backup);
+      console.log(`Code: ${why}, so the box's work is on branch ${name}; your checkout was not touched.
+  Review: git -C ${q(root)} log -p HEAD..${name}`);
+    }
+  } else if (existsSync4(join4(backup, "folder.tgz"))) {
+    const dir = extractTgz(join4(backup, "folder.tgz"), backup);
+    const t = validateTree(dir, undefined, budget);
+    console.log(`Code: the box's copy of the folder is at ${landFolder(cwd, dir, t.files, uuid8)} (yours was not touched).`);
+  }
+  const c = loadCloud();
+  const { [uuid]: _done, ...sessions } = c.sessions ?? {};
+  saveCloud({ ...c, sessions, current: c.current === uuid ? undefined : c.current });
+  const line = resumeCommand(cwd, resumeId);
+  console.log(`
+Resume on this Mac:
+  cd ${q(cwd)} && claude --resume ${resumeId}`);
+  if (!args.has("--no-open") && !problems.length) {
+    const file = join4(backup, "resume.command");
+    writeFileSync2(file, `#!/bin/sh
+${line}
+`, { mode: 448 });
+    try {
+      execFileSync4("open", ["-a", "Terminal", file], { stdio: "ignore" });
+      console.log("Opened it in Terminal.");
+    } catch {}
+  }
+  if (problems.length) {
+    console.log(`
+Needs a look:
+  ${problems.join(`
+  `)}`);
+    process.exitCode = 1;
+  }
+}
+function listUnder(projDir, dir) {
+  return listFiles(join4(projDir, dir)).map((r) => join4(dir, r));
+}
 async function main() {
   const argv = process.argv.slice(2).filter((a) => a !== "handoff");
   const args = new Map;
   for (let i = 0;i < argv.length; i++) {
     const a = argv[i];
-    if (a === "--session" || a === "--model" || a === "--send" || a === "--send-key" || a === "--worker")
+    if (a === "--session" || a === "--model" || a === "--send" || a === "--send-key" || a === "--worker" || a === "--wait")
       args.set(a, argv[++i] ?? "");
     else
       args.set(a, true);
   }
   if (args.has("--box-pair")) {
     const cfg = `${CC_DIR}/config.json`;
-    const { config, url } = await boxPairPayload(readFileSync2(cfg, "utf8"), BOX_MACHINE_NAME, buildPairURL);
+    const { config, url } = await boxPairPayload(readFileSync3(cfg, "utf8"), BOX_MACHINE_NAME, buildPairURL);
     await atomicWrite(cfg, config, 384);
     console.log(PAIR_URL_MARKER + url);
     return;
@@ -4223,7 +4863,7 @@ async function main() {
   const keys = readKeys();
   const worker = targetWorker(args.get("--worker"), process.env.NOMO_WORKER_URL);
   if (args.has("--dry-run")) {
-    const out = mkdtempSync(join3(tmpdir(), "nomo-handoff-"));
+    const out = mkdtempSync2(join4(tmpdir(), "nomo-handoff-"));
     let plan;
     try {
       plan = build(args, out);
@@ -4248,6 +4888,10 @@ async function main() {
     await bake(omg);
     return;
   }
+  if (args.has("--back")) {
+    await back(omg, args);
+    return;
+  }
   if (["--status", "--stop", "--pair", "--screen", "--send", "--send-key"].some((f) => args.has(f))) {
     const sb = await getBox(omg, loadCloud().sandboxId);
     if (!sb) {
@@ -4255,11 +4899,7 @@ async function main() {
       return;
     }
     if (args.has("--stop")) {
-      if (sb.status === "running") {
-        await exec(omg, sb.id, SHM_SWEEP).catch(() => {});
-        await api(omg, "POST", `/sandboxes/${sb.id}/hibernate`);
-      }
-      console.log(`Box ${sb.id} is asleep (hibernated; files and memory kept, deleted after 14 days asleep).`);
+      await sleepBox(omg, sb);
       return;
     }
     if (sb.status !== "running") {
@@ -4301,14 +4941,14 @@ ${BOX_PLUGIN}
   }
   if (!keys.openrouter)
     throw new Error("OPENROUTER_API_KEY not set (env or ~/.nomo-spike.env)");
-  const out = mkdtempSync(join3(tmpdir(), "nomo-handoff-"));
+  const out = mkdtempSync2(join4(tmpdir(), "nomo-handoff-"));
   let plan, id;
   try {
     plan = build(args, out);
     console.log(`Handing off session ${plan.uuid} (${plan.model}) from ${plan.cwd} · Nomo worker ${worker}`);
     id = await ensureBox(omg);
     for (const [box, local] of Object.entries(plan.artifacts)) {
-      await api(omg, "POST", `/sandboxes/${id}/files`, [{ path: box, content: readFileSync2(local).toString("base64"), mode: 384 }]);
+      await api(omg, "POST", `/sandboxes/${id}/files`, [{ path: box, content: readFileSync3(local).toString("base64"), mode: 384 }]);
     }
   } finally {
     rmSync(out, { recursive: true, force: true });
@@ -4319,6 +4959,7 @@ ${BOX_PLUGIN}
     ANTHROPIC_API_KEY: "",
     CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1",
     NOMO_WORKER_URL: worker,
+    ...plan.gitUser,
     ...args.has("--force") ? { NOMO_FORCE: "1" } : {}
   });
   const pane = takePairUrl(r.stdout ?? "").rest.replace(/^NOMO_(PAIRED|PAIR_FAILED: .*|REPAIR: .*)$\n?/gm, "");
@@ -4333,13 +4974,15 @@ ${pane.slice(-2000)}
 ${(r.stderr ?? "").slice(-2000)}`);
   }
   await api(omg, "POST", `/sandboxes/${id}/extend`, { seconds: KEEPALIVE_S }).catch(() => {});
+  const c = loadCloud();
+  saveCloud({ ...c, current: plan.uuid, sessions: { ...c.sessions, [plan.uuid]: plan.snap } });
   console.log(pane.trimEnd().split(`
 `).slice(-15).join(`
 `));
   console.log(`
 Session ${plan.uuid} is running on cloud box ${id} (tmux session "nomo").`);
   console.log(attachHelp());
-  console.log(`  Status: --status   Sleep the box: --stop`);
+  console.log(`  Status: --status   Sleep the box: --stop   Bring it back to this Mac: --back`);
   console.log(`
 !! Quit your local Claude Code session for ${plan.uuid} now, so the two copies don't diverge.`);
   await afterPair(omg, id, r.stdout ?? "");
@@ -4351,12 +4994,16 @@ if (__require.main == __require.module) {
   });
 }
 export {
+  BACK_FILES,
   BOX_MACHINE_NAME,
   PAIR_FN,
   PAIR_POLL,
   RELAY_PORT,
-  SENSITIVE,
+  SENSITIVE2 as SENSITIVE,
   SHM_SWEEP,
+  backPackScript,
+  backStopScript,
+  backWaitScript,
   bakeScript,
   boxPairPayload,
   boxSetup,
@@ -4370,6 +5017,7 @@ export {
   pubRawFromPkcs8,
   q,
   resultPage,
+  resumeCommand,
   takePairUrl,
   targetWorker,
   toOpenRouterModel,
