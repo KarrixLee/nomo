@@ -221,7 +221,11 @@ describe("bring back (--back)", () => {
   });
 
   test("--back --session X never stops a different session (unless --force)", () => {
-    for (const s of [backStopScript(U), backWaitScript(U, "-tmp-proj")]) expect(s).toContain(currentGuard(U));
+    // Checked first, whether or not tmux still runs: an exited A must not pack a later B at the same root.
+    for (const s of [backStopScript(U), backWaitScript(U, "-tmp-proj"), ...scripts]) {
+      expect(s.slice(SHM_SWEEP.length).trimStart().startsWith(currentGuard(U))).toBe(true);
+    }
+    expect(backStopScript(U)).not.toContain("rm -f /root/.nomo-current");
     const f = join(mkdtempSync(join(tmpdir(), "nomo-cur-")), "cur");
     const run = (env: Record<string, string> = {}) =>
       execFileSync("bash", ["-c", `${currentGuard(U, f)}\necho NOMO_SAME`], { env: { PATH: process.env.PATH!, ...env } }).toString().trim();

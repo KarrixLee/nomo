@@ -384,7 +384,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "2.3.13";
+var PLUGIN_VERSION = "2.3.14";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -3324,23 +3324,26 @@ function parseMarkers(stdout) {
     const kv = line.match(/^NOMO_([A-Z]+)=(.*)$/);
     if (kv)
       m[kv[1]] = kv[2].trim();
-    const sz = line.match(/^NOMO_SIZE (\S+) (\d+)$/);
+    const sz = line.match(/^NOMO_SIZE ([a-z.]+) (\d+)$/);
     if (sz)
       sizes[sz[1]] = Number(sz[2]);
   }
   return { m, sizes };
 }
-function safeRel(rel) {
+function plainRel(rel) {
   if (!rel || isAbsolute2(rel) || rel.includes("\x00") || rel.includes("\\"))
     return false;
   const segs = rel.split("/").filter((s) => s !== "" && s !== ".");
-  if (!segs.length || segs.some((s) => s === ".." || s.toLowerCase() === ".git"))
-    return false;
-  return !segs.some((_, i) => {
-    const sub = segs.slice(i).join("/").toLowerCase();
+  return segs.length > 0 && !segs.some((s) => s === ".." || s.toLowerCase() === ".git");
+}
+function sensitive(rel) {
+  const segs = rel.toLowerCase().split("/").filter((s) => s !== "" && s !== ".");
+  return segs.some((_, i) => {
+    const sub = segs.slice(i).join("/");
     return SENSITIVE.some((p) => sub === p.toLowerCase() || sub.startsWith(p.toLowerCase() + "/"));
   });
 }
+var safeRel = (rel) => plainRel(rel) && !sensitive(rel);
 function validateTree(dir, allow = () => true, budget = { left: MAX_EXTRACTED_BYTES }) {
   const files = [], skipped = [];
   const walk = (rel) => {
@@ -3409,18 +3412,30 @@ function patchPaths(root, patch, base, tmpParent) {
     const newMode = raw[i].split(" ")[1], p = raw[i + 1];
     if (newMode === "120000")
       throw new Error(`the box patch makes ${printable(p, true)} a symlink`);
-    if (!safeRel(p))
-      throw new Error(`the box patch touches an unsafe path (${printable(p, true)}: .git, .., absolute or sensitive)`);
+    if (!plainRel(p))
+      throw new Error(`the box patch touches an unsafe path (${printable(p, true)}: .git, .. or absolute)`);
     paths.push(p);
   }
   return paths;
 }
-var AGENT_DIRS = [".claude", ".vscode", ".idea", ".githooks", ".husky", ".devcontainer", ".cursor"];
-var AGENT_FILES = [".mcp.json", "claude.md", "claude.local.md", ".claude.json", ".envrc", ".gitattributes", ".lfsconfig", ".gitmodules"];
+var AGENT_DIRS = [".claude", ".codex", ".opencode", ".vscode", ".idea", ".githooks", ".husky", ".devcontainer", ".cursor"];
+var AGENT_FILES = [
+  ".mcp.json",
+  "claude.md",
+  "claude.local.md",
+  ".claude.json",
+  "agents.md",
+  "opencode.json",
+  "opencode.jsonc",
+  ".envrc",
+  ".gitattributes",
+  ".lfsconfig",
+  ".gitmodules"
+];
 function agentConfigPaths(paths) {
   return [...new Set(paths)].filter((p) => {
     const segs = p.toLowerCase().split("/").filter(Boolean);
-    return segs.some((s) => AGENT_DIRS.includes(s)) || AGENT_FILES.includes(segs[segs.length - 1] ?? "");
+    return segs.some((s) => AGENT_DIRS.includes(s)) || AGENT_FILES.includes(segs[segs.length - 1] ?? "") || sensitive(p);
   });
 }
 function fetchBox(root, a) {
@@ -3436,7 +3451,11 @@ function fetchBox(root, a) {
 }
 function boxChangedPaths(root, a, macHead, tmpParent) {
   fetchBox(root, a);
-  const commits = a.boxHead === macHead ? [] : git(root, ["diff", "--name-only", "--no-renames", "-z", macHead, a.boxHead]).split("\x00").filter(Boolean);
+  let base = macHead;
+  try {
+    base = git(root, ["merge-base", macHead, a.boxHead]).trim();
+  } catch {}
+  const commits = a.boxHead === base ? [] : git(root, ["diff", "--name-only", "--no-renames", "-z", base, a.boxHead]).split("\x00").filter(Boolean);
   return [...commits, ...a.patch ? patchPaths(root, a.patch, a.boxHead, tmpParent) : [], ...a.untracked];
 }
 function mergeMemory(snapMem, boxDir, boxFiles, macDir, backup) {
@@ -3485,12 +3504,14 @@ function applyInPlace(root, a, detached, uuid8, backup) {
   const skipped = [];
   try {
     fetchBox(root, a);
-    if (a.patch)
-      patchPaths(root, a.patch, a.boxHead, backup);
-    if (git(root, ["status", "--porcelain"]).trim()) {
+    const flagged = a.patch ? agentConfigPaths(patchPaths(root, a.patch, a.boxHead, backup)) : [];
+    if (flagged.length)
+      throw new Error(`the box patch changes agent config (${printable(flagged.join(", "), true)}): not landing it in place`);
+    const keep = ["--", ".", ...SENSITIVE.flatMap((p) => [`:(exclude,glob,icase)**/${p}`, `:(exclude,glob,icase)**/${p}/**`])];
+    if (git(root, ["status", "--porcelain", ...keep]).trim()) {
       const msg = `nomo: before cloud return ${uuid8}`;
       console.log(`Stashing your uncommitted Mac changes as "${msg}"…`);
-      git(root, ["stash", "push", "-u", "-m", msg]);
+      git(root, ["stash", "push", "-u", "-m", msg, ...keep]);
       stash = git(root, ["rev-parse", "stash@{0}"]).trim();
     }
     if (a.bundle)
@@ -4611,8 +4632,8 @@ function currentGuard(uuid, file = BOX_CURRENT) {
 }
 function backWaitScript(uuid, enc) {
   return `${SHM_SWEEP}
-tmux has-session -t nomo 2>/dev/null || { echo NOMO_GONE; exit 0; }
 ${currentGuard(uuid)}
+tmux has-session -t nomo 2>/dev/null || { echo NOMO_GONE; exit 0; }
 F=${BOX_CC}/sessions/${uuid}.json
 [ -f "$F" ] && echo "NOMO_EVENT=$(grep -o '"lastEvent": *"[^"]*"' "$F" | head -1 | cut -d'"' -f4)"
 T=/root/.claude/projects/${enc}/${uuid}.jsonl
@@ -4623,9 +4644,9 @@ tail -c 65536 "$T"`;
 }
 function backStopScript(uuid) {
   return `${SHM_SWEEP}
+${currentGuard(uuid)}
 gone() { ! tmux has-session -t nomo 2>/dev/null; }
 if ! gone; then
-  ${currentGuard(uuid)}
   if [ "\${NOMO_ESC:-}" = 1 ]; then tmux send-keys -t nomo Escape; sleep 2; fi
   tmux send-keys -t nomo -l /exit; sleep 0.5; tmux send-keys -t nomo Enter
   for _ in $(seq 30); do gone && break; sleep 1; done
@@ -4635,7 +4656,6 @@ if ! gone; then
   fi
   if ! gone; then tmux kill-session -t nomo; echo NOMO_HARD_STOP; fi
 fi
-rm -f ${BOX_CURRENT}
 ${BOX_PLUGIN}
 if [ -n "$R" ]; then bun "$R/dist/reset.mjs" >/dev/null 2>&1 || true; fi
 echo NOMO_STOPPED`;
@@ -4643,6 +4663,7 @@ echo NOMO_STOPPED`;
 function backPackScript(uuid, enc, root, isGit) {
   const ex = EXCLUDE_SENSITIVE.map((a) => a === "--exclude" ? a : q(a)).join(" ");
   return `${SHM_SWEEP}
+${currentGuard(uuid)}
 set -euo pipefail
 rm -f ${BACK}-*
 P=/root/.claude/projects/${enc}
@@ -4699,8 +4720,8 @@ async function back(omg, args) {
     }
   }
   const rec = await readRecord(uuid);
-  if (rec && typeof rec.pid === "number" && pidAlive(rec.pid) && !force) {
-    throw new Error(`session ${uuid} is running on this Mac (pid ${rec.pid}). Quit it first, or rerun with --force.`);
+  if (rec && typeof rec.pid === "number" && pidAlive(rec.pid)) {
+    throw new Error(`session ${uuid} is running on this Mac (pid ${rec.pid}). Quit it there first, then rerun --back.`);
   }
   const enc = projectDirName(cwd);
   const sb = await getBox(omg, cloud.sandboxId);
@@ -4709,7 +4730,7 @@ async function back(omg, args) {
   const id = await wakeBox(omg, sb);
   let gone = false;
   const other = (out) => {
-    const o = out.match(/^NOMO_OTHER=(.*)$/m);
+    const o = out.match(/^NOMO_OTHER=([0-9a-f-]*)/m);
     if (o) {
       throw new Error(`the box's Claude Code is running session ${o[1] || "(not recorded: handed off before 2.3.12)"}, not ${uuid}; nothing was stopped.
 ` + `Bring that one back with --back --session <its id>, or rerun with --force to stop it anyway.`);
@@ -4748,7 +4769,8 @@ async function back(omg, args) {
   other(stop.stdout ?? "");
   if (/^NOMO_HARD_STOP$/m.test(stop.stdout ?? ""))
     console.log("Claude Code did not exit on its own: hard stop (its last turn may be cut short).");
-  const pack = await exec(omg, id, backPackScript(uuid, enc, root, isGit), snap?.head ? { NOMO_BASE: snap.head } : {});
+  const pack = await exec(omg, id, backPackScript(uuid, enc, root, isGit), { ...snap?.head ? { NOMO_BASE: snap.head } : {}, ...force ? { NOMO_FORCE: "1" } : {} });
+  other(pack.stdout ?? "");
   if (pack.exitCode !== 0)
     throw new Error(`packing on box ${id} failed (exit ${pack.exitCode}):
 ${printable((pack.stdout ?? "").slice(-1500))}
@@ -4872,7 +4894,7 @@ Nothing in ${root} was changed; everything the box sent is in ${backup}.
       }
     }
     if (flagged.length) {
-      problems.push(`the box changed agent/editor config: ${paths(flagged)}. Review these before checking out the branch.`);
+      problems.push(`the box changed agent/editor config or credential files: ${paths(flagged)}. Review these before checking out the branch.`);
     }
     if (action === "noop")
       console.log("Code: the box changed nothing.");

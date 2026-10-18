@@ -167,7 +167,7 @@ export function parseMarkers(stdout: string): { m: Record<string, string>; sizes
   for (const line of stdout.split("\n")) {
     const kv = line.match(/^NOMO_([A-Z]+)=(.*)$/);
     if (kv) m[kv[1]] = kv[2].trim();
-    const sz = line.match(/^NOMO_SIZE (\S+) (\d+)$/);
+    const sz = line.match(/^NOMO_SIZE ([a-z.]+) (\d+)$/);
     if (sz) sizes[sz[1]] = Number(sz[2]);
   }
   return { m, sizes };
@@ -175,18 +175,24 @@ export function parseMarkers(stdout: string): { m: Record<string, string>; sizes
 
 // -------------------------------------------------------------------------------------- untrusted
 
-/** A box-supplied relative path we may write: not absolute, no `..`, no `.git` segment (any case — the
- *  Mac's filesystem folds it), nothing under SENSITIVE. */
-export function safeRel(rel: string): boolean {
+/** Not absolute, no `..`, no `.git` segment (any case — the Mac's filesystem folds it). */
+function plainRel(rel: string): boolean {
   if (!rel || isAbsolute(rel) || rel.includes("\0") || rel.includes("\\")) return false;
   const segs = rel.split("/").filter((s) => s !== "" && s !== ".");
-  if (!segs.length || segs.some((s) => s === ".." || s.toLowerCase() === ".git")) return false;
-  // Under SENSITIVE at ANY depth, as the handoff tar's `--exclude` matched it (a/.ssh/id too).
-  return !segs.some((_, i) => {
-    const sub = segs.slice(i).join("/").toLowerCase();
+  return segs.length > 0 && !segs.some((s) => s === ".." || s.toLowerCase() === ".git");
+}
+
+/** Under SENSITIVE at ANY depth, as the handoff tar's `--exclude` matched it (a/.ssh/id too). */
+function sensitive(rel: string): boolean {
+  const segs = rel.toLowerCase().split("/").filter((s) => s !== "" && s !== ".");
+  return segs.some((_, i) => {
+    const sub = segs.slice(i).join("/");
     return SENSITIVE.some((p) => sub === p.toLowerCase() || sub.startsWith(p.toLowerCase() + "/"));
   });
 }
+
+/** A box-supplied relative path we may write: plainRel and nothing under SENSITIVE. */
+export const safeRel = (rel: string) => plainRel(rel) && !sensitive(rel);
 
 /** Walk an extracted tree with lstat: regular files (single link) and dirs only. Anything else, an
  *  unsafe path, or a path the allow-list rejects is skipped and reported. Throws past the size cap. */
@@ -240,7 +246,8 @@ export function copyContained(src: string, dstRoot: string, rel: string, overwri
 
 /** Every path a box patch changes, as git ITSELF applies it (no parsing of our own): applied to a
  *  throwaway index of `base`, then a raw, rename-free diff of that index (both sides of a rename, every
- *  new mode). Throws when a path is unsafe (safeRel) or the patch creates or edits a symlink. */
+ *  new mode). Throws when a path is unsafe (absolute, `..`, `.git`) or the patch creates or edits a
+ *  symlink. Agent-config and SENSITIVE paths come back like any other: agentConfigPaths fences them. */
 export function patchPaths(root: string, patch: string, base: string, tmpParent: string): string[] {
   if (!lstatSync(patch).size) return [];
   const env = { ...process.env, GIT_INDEX_FILE: join(mkdtempSync(join(tmpParent, "pidx-")), "index") };
@@ -251,7 +258,7 @@ export function patchPaths(root: string, patch: string, base: string, tmpParent:
   for (let i = 0; i + 1 < raw.length; i += 2) { // ":<old mode> <new mode> <old> <new> <status>" \0 <path> \0
     const newMode = raw[i].split(" ")[1], p = raw[i + 1];
     if (newMode === "120000") throw new Error(`the box patch makes ${printable(p, true)} a symlink`);
-    if (!safeRel(p)) throw new Error(`the box patch touches an unsafe path (${printable(p, true)}: .git, .., absolute or sensitive)`);
+    if (!plainRel(p)) throw new Error(`the box patch touches an unsafe path (${printable(p, true)}: .git, .. or absolute)`);
     paths.push(p);
   }
   return paths;
@@ -259,14 +266,18 @@ export function patchPaths(root: string, patch: string, base: string, tmpParent:
 
 /** Files that make an agent, editor, direnv or git run something on this Mac (or change what it runs)
  *  the moment the checkout holds them. Box work touching any of them never lands in place. */
-const AGENT_DIRS = [".claude", ".vscode", ".idea", ".githooks", ".husky", ".devcontainer", ".cursor"];
-const AGENT_FILES = [".mcp.json", "claude.md", "claude.local.md", ".claude.json", ".envrc", ".gitattributes", ".lfsconfig", ".gitmodules"];
+const AGENT_DIRS = [".claude", ".codex", ".opencode", ".vscode", ".idea", ".githooks", ".husky", ".devcontainer", ".cursor"];
+const AGENT_FILES = [
+  ".mcp.json", "claude.md", "claude.local.md", ".claude.json", "agents.md", "opencode.json", "opencode.jsonc",
+  ".envrc", ".gitattributes", ".lfsconfig", ".gitmodules",
+];
 
-/** The paths (at any depth, any case) that are agent/editor/git config. */
+/** The paths (at any depth, any case) that are agent/editor/git config, or SENSITIVE (credentials are
+ *  never written into the Mac checkout in place either). */
 export function agentConfigPaths(paths: string[]): string[] {
   return [...new Set(paths)].filter((p) => {
     const segs = p.toLowerCase().split("/").filter(Boolean);
-    return segs.some((s) => AGENT_DIRS.includes(s)) || AGENT_FILES.includes(segs[segs.length - 1] ?? "");
+    return segs.some((s) => AGENT_DIRS.includes(s)) || AGENT_FILES.includes(segs[segs.length - 1] ?? "") || sensitive(p);
   });
 }
 
@@ -280,11 +291,14 @@ export function fetchBox(root: string, a: BoxArtifacts): void {
   if (got !== a.boxHead) throw new Error(`the bundle's HEAD is ${got}, the box reported ${a.boxHead}`);
 }
 
-/** Every path landing the box's work would change relative to `macHead`: its commits (rename-free, so
- *  both sides), its patch (patchPaths: throws on an unsafe one), its untracked files. */
+/** Every path the box's work changed: its commits since the merge-base with `macHead` (rename-free, so
+ *  both sides; Mac-only commits are not the box's), its patch (patchPaths: throws on an unsafe one), its
+ *  untracked files. */
 export function boxChangedPaths(root: string, a: BoxArtifacts, macHead: string, tmpParent: string): string[] {
   fetchBox(root, a);
-  const commits = a.boxHead === macHead ? [] : git(root, ["diff", "--name-only", "--no-renames", "-z", macHead, a.boxHead]).split("\0").filter(Boolean);
+  let base = macHead;
+  try { base = git(root, ["merge-base", macHead, a.boxHead]).trim(); } catch { /* unrelated histories: vs the Mac */ }
+  const commits = a.boxHead === base ? [] : git(root, ["diff", "--name-only", "--no-renames", "-z", base, a.boxHead]).split("\0").filter(Boolean);
   return [...commits, ...(a.patch ? patchPaths(root, a.patch, a.boxHead, tmpParent) : []), ...a.untracked];
 }
 
@@ -349,11 +363,14 @@ export function applyInPlace(root: string, a: BoxArtifacts, detached: boolean, u
   const skipped: string[] = [];
   try {
     fetchBox(root, a);
-    if (a.patch) patchPaths(root, a.patch, a.boxHead, backup);
-    if (git(root, ["status", "--porcelain"]).trim()) {
+    const flagged = a.patch ? agentConfigPaths(patchPaths(root, a.patch, a.boxHead, backup)) : [];
+    if (flagged.length) throw new Error(`the box patch changes agent config (${printable(flagged.join(", "), true)}): not landing it in place`);
+    // SENSITIVE files never went to the box (the handoff tar excludes them): they stay put, unstashed.
+    const keep = ["--", ".", ...SENSITIVE.flatMap((p) => [`:(exclude,glob,icase)**/${p}`, `:(exclude,glob,icase)**/${p}/**`])];
+    if (git(root, ["status", "--porcelain", ...keep]).trim()) {
       const msg = `nomo: before cloud return ${uuid8}`;
       console.log(`Stashing your uncommitted Mac changes as "${msg}"…`);
-      git(root, ["stash", "push", "-u", "-m", msg]);
+      git(root, ["stash", "push", "-u", "-m", msg, ...keep]);
       stash = git(root, ["rev-parse", "stash@{0}"]).trim();
     }
     if (a.bundle) git(root, detached ? ["checkout", "-q", "--detach", a.boxHead] : ["merge", "-q", "--ff-only", a.boxHead]);

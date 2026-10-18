@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   agentConfigPaths, applyInPlace, boxChangedPaths, decideCode, extractTgz, type GitState, landFolder, landOnBranch, listFiles, macGitState,
-  mergeMemory, patchPaths, printable, safeRel, sha256, transcriptAction, validateTree, wipFingerprint,
+  mergeMemory, parseMarkers, patchPaths, printable, safeRel, sha256, transcriptAction, validateTree, wipFingerprint,
 } from "./cloud-back";
 
 const tmp = () => mkdtempSync(join(tmpdir(), "nomo-back-test-"));
@@ -146,20 +146,25 @@ describe("untrusted paths", () => {
     }
     for (const ok of ["src/a.ts", ".github/workflows/x.yml", "a.gitignore", "docs/.gitkeep"]) expect(safeRel(ok)).toBe(true);
   });
-  test("patchPaths: git's own view of the paths; unsafe paths and symlinks are rejected", () => {
+  test("patchPaths: git's own view of the paths; unsafe paths and symlinks are rejected, sensitive ones fenced", () => {
     const d = repo(), base = g(d, "rev-parse", "HEAD"), t = tmp();
     const pf = (body: string) => { const f = join(tmp(), "p.patch"); writeFileSync(f, body); return f; };
     expect(patchPaths(d, pf("--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-one\n+two\n"), base, t)).toEqual(["a.txt"]);
     // A rename reports both sides.
     expect(patchPaths(d, pf("diff --git a/a.txt b/src/b.txt\nsimilarity index 100%\nrename from a.txt\nrename to src/b.txt\n"), base, t).sort()).toEqual(["a.txt", "src/b.txt"]);
+    // Agent config and SENSITIVE paths are returned, for agentConfigPaths to send to the branch.
+    const claude = patchPaths(d, pf("--- a/.claude/settings.json\n+++ b/.claude/settings.json\n@@ -0,0 +1 @@\n+{}\n"), base, t);
+    const ssh = patchPaths(d, pf('diff --git "a/.ssh/x" "b/.ssh/x"\nnew file mode 100644\n--- /dev/null\n+++ "b/.ssh/x"\n@@ -0,0 +1 @@\n+k\n'), base, t);
+    expect(agentConfigPaths([...claude, ...ssh])).toEqual([".claude/settings.json", ".ssh/x"]);
     const bad = {
-      plain: "--- a/.claude/settings.json\n+++ b/.claude/settings.json\n@@ -0,0 +1 @@\n+{}\n",
-      quoted: 'diff --git "a/.ssh/x" "b/.ssh/x"\nnew file mode 100644\n--- /dev/null\n+++ "b/.ssh/x"\n@@ -0,0 +1 @@\n+k\n',
       symlink: "diff --git a/l b/l\nnew file mode 120000\n--- /dev/null\n+++ b/l\n@@ -0,0 +1 @@\n+/etc\n\\ No newline at end of file\n",
       gitdir: "--- a/.git/hooks/pre-commit\n+++ b/.git/hooks/pre-commit\n@@ -0,0 +1 @@\n+x\n",
       dotdot: "diff --git a/x b/x\nrename from a.txt\nrename to ../y\n",
     };
     for (const [name, body] of Object.entries(bad)) expect(() => patchPaths(d, pf(body), base, t), name).toThrow();
+  });
+  test("parseMarkers: a NOMO_SIZE name is a plain artifact name or nothing", () => {
+    expect(parseMarkers("NOMO_SIZE wip.patch 12\nNOMO_SIZE \x1b[2Jx 5\nNOMO_SIZE a/b 3\n").sizes).toEqual({ "wip.patch": 12 });
   });
   test("printable strips ANSI and control characters", () => {
     expect(printable("a\x1b[31mred\x1b[0m\x07b\nc")).toBe("aredb\nc");
@@ -243,6 +248,35 @@ describe("agent config never lands in place", () => {
       writeFileSync(join(b, ".envrc"), "x\n"); g(b, "add", "-N", ".envrc");
     }).sort()).toEqual([".envrc", "CLAUDE.md"]);
   });
+  test("Codex/OpenCode config, AGENTS.md and credential dirs are fenced too", () => {
+    const ps = ["AGENTS.md", "x/.codex/config.toml", ".opencode/plugin.ts", "opencode.json", "sub/opencode.jsonc", "CLAUDE.md", "a/.ssh/id", ".aws/credentials", ".gnupg/k"];
+    expect(agentConfigPaths([...ps, "src/agents.ts", "docs/codex.md"])).toEqual(ps);
+  });
+  test("a Mac-only commit after the handoff is not the box's change", () => {
+    const mac = repo(), base = g(mac, "rev-parse", "HEAD"), out = tmp();
+    const box = boxWork(mac, base, out);
+    mkdirSync(join(mac, ".vscode")); writeFileSync(join(mac, ".vscode", "tasks.json"), "{}");
+    g(mac, "add", "."); g(mac, "commit", "-qm", "mac");
+    const a = { bundle: join(out, "repo.bundle"), patch: join(out, "wip.patch"), untrackedDir: box.udir, untracked: box.untracked, boxHead: box.boxHead };
+    expect(boxChangedPaths(mac, a, g(mac, "rev-parse", "HEAD"), out).sort()).toEqual(["a.txt", "b.txt", "n.txt"]);
+  });
+  test("a tracked .claude edit in the box WIP goes to the branch with the rest, never in place", () => {
+    const mac = repo();
+    mkdirSync(join(mac, ".claude")); writeFileSync(join(mac, ".claude", "settings.json"), "{}\n");
+    g(mac, "add", "."); g(mac, "commit", "-qm", "cfg");
+    const head = g(mac, "rev-parse", "HEAD"), out = tmp(), box = join(tmp(), "box");
+    g(tmp(), "clone", "-q", mac, box);
+    writeFileSync(join(box, ".claude", "settings.json"), '{"hooks":1}\n'); writeFileSync(join(box, "a.txt"), "two\n");
+    writeFileSync(join(out, "wip.patch"), execFileSync("git", ["diff", "--binary", "HEAD"], { cwd: box }));
+    const a = { patch: join(out, "wip.patch"), untracked: [], boxHead: head };
+    expect(agentConfigPaths(boxChangedPaths(mac, a, head, out))).toEqual([".claude/settings.json"]);
+    expect(() => applyInPlace(mac, a, false, "abcd1234", out)).toThrow(/agent config/);
+    const before = worktreeState(mac);
+    const name = landOnBranch(mac, a, "abcd1234", out);
+    expect(worktreeState(mac)).toEqual(before);
+    expect(g(mac, "show", `${name}:.claude/settings.json`)).toBe('{"hooks":1}');
+    expect(g(mac, "show", `${name}:a.txt`)).toBe("two");
+  });
   test("untracked-borne (.mcp.json, .husky/pre-commit); plain files are not flagged", () => {
     expect(flaggedFor((b) => {
       writeFileSync(join(b, ".mcp.json"), "{}"); mkdirSync(join(b, ".husky")); writeFileSync(join(b, ".husky", "pre-commit"), "x");
@@ -273,6 +307,26 @@ describe("landing code", () => {
     expect(r.stash).toMatch(/^[0-9a-f]{40}$/);
     expect(g(mac, "stash", "list")).toContain("nomo: before cloud return abcd1234");
     expect(existsSync(marker)).toBe(false);
+  });
+
+  test("applyInPlace leaves Mac-only SENSITIVE untracked files (never sent to the box) in the worktree", () => {
+    const mac = repo();
+    const base = g(mac, "rev-parse", "HEAD");
+    mkdirSync(join(mac, ".claude", "commands"), { recursive: true });
+    writeFileSync(join(mac, ".claude", "commands", "mine.md"), "mine\n");
+    writeFileSync(join(mac, "u.txt"), "mac untracked\n");
+    const out = tmp();
+    const box = boxWork(mac, base, out);
+    const r = applyInPlace(mac, { bundle: join(out, "repo.bundle"), patch: join(out, "wip.patch"), untrackedDir: box.udir, untracked: box.untracked, boxHead: box.boxHead }, false, "abcd1234", out);
+    expect(r.stash).toMatch(/^[0-9a-f]{40}$/);
+    expect(readFileSync(join(mac, ".claude", "commands", "mine.md"), "utf8")).toBe("mine\n");
+    expect(existsSync(join(mac, "u.txt"))).toBe(false); // stashed as before
+    // Only the SENSITIVE file left: nothing to stash.
+    const mac2 = repo(), out2 = tmp(), box2 = boxWork(mac2, g(mac2, "rev-parse", "HEAD"), out2);
+    mkdirSync(join(mac2, ".claude")); writeFileSync(join(mac2, ".claude", "x.md"), "x\n");
+    const r2 = applyInPlace(mac2, { bundle: join(out2, "repo.bundle"), patch: join(out2, "wip.patch"), untrackedDir: box2.udir, untracked: box2.untracked, boxHead: box2.boxHead }, false, "abcd1234", out2);
+    expect(r2.stash).toBeUndefined();
+    expect(existsSync(join(mac2, ".claude", "x.md"))).toBe(true);
   });
 
   test("applyInPlace on a clean Mac makes no stash", () => {

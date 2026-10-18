@@ -51,8 +51,8 @@
 // sha, memory hashes): a Mac untouched since handoff fast-forwards in place, anything else lands on
 // branch `nomo/cloud-<id8>`; a Mac transcript appended after handoff forks to a new session id. Box work
 // that touches agent/editor/git config (.claude/, .mcp.json, CLAUDE.md, .envrc, .vscode/, …) never lands
-// in place: it goes to the branch and Terminal is not opened. It refuses to stop a box claude running a
-// different session (/root/.nomo-current) unless --force. Ends by opening Terminal on `claude --resume`
+// in place: it goes to the branch and Terminal is not opened. It refuses to stop or pack a session the box
+// did not last run (/root/.nomo-current) unless --force. Ends by opening Terminal on `claude --resume`
 // (--no-open just prints it).
 //
 // PORTABILITY: bun or node >= 18 (global fetch). Under node, an exec longer than ~300s trips undici's
@@ -689,12 +689,13 @@ export function currentGuard(uuid: string, file = BOX_CURRENT): string {
   return `if [ "$(head -c 64 ${q(file)} 2>/dev/null)" != ${q(uuid)} ] && [ "\${NOMO_FORCE:-}" != 1 ]; then echo "NOMO_OTHER=$(head -c 64 ${q(file)} 2>/dev/null | tr -cd '0-9a-f-')"; exit 0; fi`;
 }
 
-/** Box: is the session at a turn boundary? NOMO_GONE when claude already exited; else the Nomo record's
- *  lastEvent (when there is one), the transcript's age in seconds, and its last 64 KiB after NOMO_TAIL. */
+/** Box: is the session at a turn boundary? NOMO_OTHER when the box last ran another session; NOMO_GONE
+ *  when claude already exited; else the Nomo record's lastEvent (when there is one), the transcript's
+ *  age in seconds, and its last 64 KiB after NOMO_TAIL. */
 export function backWaitScript(uuid: string, enc: string): string {
   return `${SHM_SWEEP}
-tmux has-session -t nomo 2>/dev/null || { echo NOMO_GONE; exit 0; }
 ${currentGuard(uuid)}
+tmux has-session -t nomo 2>/dev/null || { echo NOMO_GONE; exit 0; }
 F=${BOX_CC}/sessions/${uuid}.json
 [ -f "$F" ] && echo "NOMO_EVENT=$(grep -o '"lastEvent": *"[^"]*"' "$F" | head -1 | cut -d'"' -f4)"
 T=/root/.claude/projects/${enc}/${uuid}.jsonl
@@ -706,13 +707,13 @@ tail -c 65536 "$T"`;
 
 /** Box: exit claude — /exit, then C-c ×2, then kill-session (prints NOMO_HARD_STOP) — then the box's own
  *  reset.mjs, which ends the now-dead session's phone row and stops the box watchdog. Refuses
- *  (NOMO_OTHER) when tmux runs another session; NOMO_FORCE=1 (--force) stops it anyway, and NOMO_ESC=1
- *  interrupts a running turn first. */
+ *  (NOMO_OTHER) when the box last ran another session, running or not; NOMO_FORCE=1 (--force) stops it
+ *  anyway, and NOMO_ESC=1 interrupts a running turn first. The current-session file stays: the pack checks it too. */
 export function backStopScript(uuid: string): string {
   return `${SHM_SWEEP}
+${currentGuard(uuid)}
 gone() { ! tmux has-session -t nomo 2>/dev/null; }
 if ! gone; then
-  ${currentGuard(uuid)}
   if [ "\${NOMO_ESC:-}" = 1 ]; then tmux send-keys -t nomo Escape; sleep 2; fi
   tmux send-keys -t nomo -l /exit; sleep 0.5; tmux send-keys -t nomo Enter
   for _ in $(seq 30); do gone && break; sleep 1; done
@@ -722,18 +723,19 @@ if ! gone; then
   fi
   if ! gone; then tmux kill-session -t nomo; echo NOMO_HARD_STOP; fi
 fi
-rm -f ${BOX_CURRENT}
 ${BOX_PLUGIN}
 if [ -n "$R" ]; then bun "$R/dist/reset.mjs" >/dev/null 2>&1 || true; fi
 echo NOMO_STOPPED`;
 }
 
-/** Box: pack the session's work as ${BACK}-* (BACK_FILES) and report NOMO_HEAD / NOMO_BRANCH /
+/** Box: unless the box last ran `uuid` (currentGuard: another session's repo may sit at the same root),
+ *  pack the session's work as ${BACK}-* (BACK_FILES) and report NOMO_HEAD / NOMO_BRANCH /
  *  NOMO_COMMITS / NOMO_FF (the handoff HEAD, NOMO_BASE in exec env, is an ancestor of the box HEAD) and
  *  NOMO_SIZE <name> <bytes>. Without a base the bundle carries all of HEAD and FF is 0. */
 export function backPackScript(uuid: string, enc: string, root: string, isGit: boolean): string {
   const ex = EXCLUDE_SENSITIVE.map((a) => (a === "--exclude" ? a : q(a))).join(" ");
   return `${SHM_SWEEP}
+${currentGuard(uuid)}
 set -euo pipefail
 rm -f ${BACK}-*
 P=/root/.claude/projects/${enc}
@@ -789,8 +791,8 @@ async function back(omg: string, args: Map<string, string | true>): Promise<void
     try { root = sh("git", ["rev-parse", "--show-toplevel"], cwd).trim(); } catch { isGit = false; root = cwd; }
   }
   const rec = await readRecord(uuid);
-  if (rec && typeof rec.pid === "number" && pidAlive(rec.pid) && !force) {
-    throw new Error(`session ${uuid} is running on this Mac (pid ${rec.pid}). Quit it first, or rerun with --force.`);
+  if (rec && typeof rec.pid === "number" && pidAlive(rec.pid)) {
+    throw new Error(`session ${uuid} is running on this Mac (pid ${rec.pid}). Quit it there first, then rerun --back.`);
   }
   const enc = projectDirName(cwd);
   const sb = await getBox(omg, cloud.sandboxId);
@@ -800,7 +802,7 @@ async function back(omg: string, args: Map<string, string | true>): Promise<void
   // 1. A turn boundary (or --force, which interrupts instead of waiting).
   let gone = false;
   const other = (out: string) => {
-    const o = out.match(/^NOMO_OTHER=(.*)$/m);
+    const o = out.match(/^NOMO_OTHER=([0-9a-f-]*)/m);
     if (o) {
       throw new Error(`the box's Claude Code is running session ${o[1] || "(not recorded: handed off before 2.3.12)"}, not ${uuid}; nothing was stopped.\n` +
         `Bring that one back with --back --session <its id>, or rerun with --force to stop it anyway.`);
@@ -838,7 +840,8 @@ async function back(omg: string, args: Map<string, string | true>): Promise<void
   if (/^NOMO_HARD_STOP$/m.test(stop.stdout ?? "")) console.log("Claude Code did not exit on its own: hard stop (its last turn may be cut short).");
 
   // 3. Pack on the box, pull the fixed file list BEFORE touching anything here, then let the box sleep.
-  const pack = await exec(omg, id, backPackScript(uuid, enc, root, isGit), snap?.head ? { NOMO_BASE: snap.head } : {});
+  const pack = await exec(omg, id, backPackScript(uuid, enc, root, isGit), { ...(snap?.head ? { NOMO_BASE: snap.head } : {}), ...(force ? { NOMO_FORCE: "1" } : {}) });
+  other(pack.stdout ?? "");
   if (pack.exitCode !== 0) throw new Error(`packing on box ${id} failed (exit ${pack.exitCode}):\n${printable((pack.stdout ?? "").slice(-1500))}\n${printable((pack.stderr ?? "").slice(-1500))}`);
   const { m, sizes } = parseMarkers(pack.stdout ?? "");
   for (const [name, size] of Object.entries(sizes)) {
@@ -944,7 +947,7 @@ async function back(omg: string, args: Map<string, string | true>): Promise<void
       }
     }
     if (flagged.length) {
-      problems.push(`the box changed agent/editor config: ${paths(flagged)}. Review these before checking out the branch.`);
+      problems.push(`the box changed agent/editor config or credential files: ${paths(flagged)}. Review these before checking out the branch.`);
     }
     if (action === "noop") console.log("Code: the box changed nothing.");
     if (action === "apply" && !flagged.length) {
