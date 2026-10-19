@@ -384,7 +384,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "2.3.19";
+var PLUGIN_VERSION = "2.3.20";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -4738,12 +4738,27 @@ function attachHelp() {
   ].join(`
 `);
 }
+var TYPE_FN = `nomo_type() {
+  if [ -n "$NOMO_TEXT" ]; then
+    printf '%s' "$NOMO_TEXT" | tmux load-buffer -b nomo-first - && tmux paste-buffer -p -r -d -b nomo-first -t nomo || { echo NOMO_UNCONFIRMED; return 1; }
+    sleep 0.5
+  fi
+  tmux send-keys -t nomo Enter
+  for n in 1 2 3; do
+    sleep 1
+    l=$(tmux capture-pane -p -t nomo | grep -E '^[│ ]*(>|❯)' | tail -1)
+    if [ -z "$l" ] || printf '%s\\n' "$l" | grep -Eq '^[│ ]*(>|❯)( | )*$|^[│ ]*(>|❯).{0,3}[0-9]+\\.'; then echo NOMO_SENT; return 0; fi
+    [ "$n" = 1 ] && tmux send-keys -t nomo Enter
+  done
+  echo NOMO_UNCONFIRMED
+}`;
 function paneScript(mode) {
   const guard = `${SHM_SWEEP}
 tmux has-session -t nomo 2>/dev/null || { echo 'tmux nomo: not running'; exit 2; }`;
   if (mode === "send")
     return `${guard}
-tmux send-keys -t nomo -l -- "$NOMO_TEXT" && tmux send-keys -t nomo Enter`;
+${TYPE_FN}
+nomo_type`;
   if (mode === "key")
     return `${guard}
 tmux send-keys -t nomo -- "$NOMO_KEY"`;
@@ -4752,26 +4767,28 @@ tmux capture-pane -p -t nomo | sed -e :a -e '/^\\n*$/{$d;N;ba' -e '}' | tail -40
 }
 function firstMessageScript(tries = 45) {
   return `${SHM_SWEEP}
+${TYPE_FN}
 prev=
 for _ in $(seq ${tries}); do
   tmux has-session -t nomo 2>/dev/null || break
   cur=$(tmux capture-pane -p -t nomo | grep -v '^[[:space:]]*$' | tail -8)
-  if [ -n "$cur" ] && [ "$cur" = "$prev" ] && printf '%s
-' "$cur" | grep -q '─'     && printf '%s
-' "$cur" | grep -Eq '^[│ ]*(>|❯)' && ! printf '%s
-' "$cur" | grep -Eq '(>|❯).{0,3}[0-9]+\\.'; then
-    tmux send-keys -t nomo -l -- "$NOMO_TEXT" && sleep 0.5 && tmux send-keys -t nomo Enter && { echo NOMO_SENT; exit 0; }
+  if [ -n "$cur" ] && [ "$cur" = "$prev" ] && printf '%s\\n' "$cur" | grep -q '─'     && printf '%s\\n' "$cur" | grep -Eq '^[│ ]*(>|❯)'     && ! printf '%s\\n' "$cur" | grep -E '^[│ ]*(>|❯)' | tail -1 | grep -Eq '^[│ ]*(>|❯).{0,3}[0-9]+\\.'; then
+    nomo_type; exit 0
   fi
   prev=$cur
   sleep 2
 done
 echo NOMO_NOT_READY`;
 }
-var FIRST_SKIPPED = "Session is in the cloud but the first message wasn't sent; send it with --send";
+var FIRST_SKIPPED = "Session is in the cloud but the first message wasn't sent yet; the box may still type it, so check --screen first and only then --send it";
+var FIRST_UNCONFIRMED = "First message typed in the cloud session, but its submit wasn't confirmed; check --screen (if it's still in the input, --send-key Enter)";
 async function sendFirstMessage(run, text) {
   try {
-    if (/^NOMO_SENT$/m.test((await run(firstMessageScript(), { NOMO_TEXT: text })).stdout ?? ""))
+    const out = (await run(firstMessageScript(), { NOMO_TEXT: text })).stdout ?? "";
+    if (/^NOMO_SENT$/m.test(out))
       return "First message sent to the cloud session.";
+    if (/^NOMO_UNCONFIRMED$/m.test(out))
+      return FIRST_UNCONFIRMED;
   } catch {}
   return FIRST_SKIPPED;
 }
@@ -5420,9 +5437,13 @@ async function main() {
         throw new Error("--send-key takes one tmux key name, e.g. Escape, BTab, C-c, Enter");
       const mode = args.has("--send") ? "send" : args.has("--send-key") ? "key" : "screen";
       const r = await exec(omg, sb.id, paneScript(mode), { NOMO_TEXT: String(args.get("--send") ?? ""), NOMO_KEY: key });
-      process.stdout.write(r.stdout ?? "");
-      if (mode !== "screen" && r.exitCode === 0)
+      process.stdout.write((r.stdout ?? "").replace(/^NOMO_(SENT|UNCONFIRMED)\n?/m, ""));
+      if (mode === "key" && r.exitCode === 0)
         console.log("Sent. Check with --screen.");
+      if (mode === "send" && /^NOMO_SENT$/m.test(r.stdout ?? ""))
+        console.log("Sent.");
+      else if (mode === "send" && r.exitCode === 0)
+        console.log("Typed, but the submit wasn't confirmed; check --screen (if it's still in the input, --send-key Enter).");
       if (r.exitCode !== 0)
         process.exitCode = 1;
       return;
@@ -5510,11 +5531,13 @@ export {
   BACK_FILES,
   BOX_MACHINE_NAME,
   FIRST_SKIPPED,
+  FIRST_UNCONFIRMED,
   PAIR_FN,
   PAIR_POLL,
   RELAY_PORT,
   SENSITIVE2 as SENSITIVE,
   SHM_SWEEP,
+  TYPE_FN,
   backPackScript,
   backStopScript,
   backWaitScript,

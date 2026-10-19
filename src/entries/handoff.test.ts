@@ -11,7 +11,7 @@ import {
 } from "./handoff";
 import { RELAY_PORT as RELAY_LISTEN_PORT } from "./or-relay";
 import { readCapped } from "./handoff";
-import { FIRST_SKIPPED, firstMessageScript, sendFirstMessage } from "./handoff";
+import { FIRST_SKIPPED, FIRST_UNCONFIRMED, firstMessageScript, sendFirstMessage, TYPE_FN } from "./handoff";
 import { BACK_FILES, backPackScript, backStopScript, backWaitScript, currentGuard, resumeCommand } from "./handoff";
 import { boxIdle } from "../core/cloud-back";
 
@@ -99,7 +99,8 @@ describe("handoff pure logic", () => {
   });
 
   test("user text reaches tmux only through env, never the script", () => {
-    expect(paneScript("send")).toContain(`send-keys -t nomo -l -- "$NOMO_TEXT"`);
+    expect(paneScript("send")).toContain(TYPE_FN);
+    expect(paneScript("send")).not.toContain("send-keys -t nomo -l");
     expect(paneScript("key")).toContain(`send-keys -t nomo -- "$NOMO_KEY"`);
     expect(paneScript("screen")).toContain("capture-pane -p -t nomo");
   });
@@ -308,21 +309,25 @@ describe("first message (--then, /nomo-cc:handoff)", () => {
   const READY_NBSP = "● done.\n────────────────\n❯\u00a0\n────────────────\n  ⏵⏵ auto mode on (shift+tab to cycle)\n";
   const MENU_NBSP = "────────────────\n Resume this session?\n❯\u00a01. Yes\n  2. No\n";
 
-  /** Run firstMessageScript against a fake tmux showing `screen`; returns stdout, the typed text, the keys. */
-  function runBox(screen: string, tries = 3): { out: string; typed?: string; keys: string } {
+  /** Run firstMessageScript against a fake tmux showing `screen` (`after[n]` once n Enters went in);
+   *  returns stdout, the pasted text, the keys. */
+  function runBox(screen: string, { tries = 3, text = NASTY, after = [] as string[], locale = "C" } = {}): { out: string; typed?: string; keys: string } {
     const d = mkdtempSync(join(tmpdir(), "nomo-then-")), bin = join(d, "bin");
     mkdirSync(bin);
     writeFileSync(join(d, "screen"), screen);
+    after.forEach((a, i) => writeFileSync(join(d, `screen.${i + 1}`), a));
     writeFileSync(join(bin, "tmux"), `#!/bin/bash
 case "$1" in
   has-session) exit 0 ;;
-  capture-pane) cat ${d}/screen ;;
-  send-keys) if [ "$4" = -l ]; then printf %s "$6" > ${d}/typed; else echo "$4" >> ${d}/keys; fi ;;
+  capture-pane) n=$(cat ${d}/keys 2>/dev/null | grep -c Enter); [ -f ${d}/screen.$n ] && cat ${d}/screen.$n || cat ${d}/screen ;;
+  load-buffer) cat > ${d}/buf ;;
+  paste-buffer) mv ${d}/buf ${d}/typed; echo paste >> ${d}/keys ;;
+  send-keys) echo "$4" >> ${d}/keys ;;
 esac
 `);
     writeFileSync(join(bin, "sleep"), "#!/bin/sh\nexit 0\n");
     chmodSync(join(bin, "tmux"), 0o755); chmodSync(join(bin, "sleep"), 0o755);
-    const out = execFileSync("bash", ["-c", firstMessageScript(tries)], { cwd: d, env: { PATH: `${bin}:/usr/bin:/bin`, NOMO_TEXT: NASTY, LC_ALL: "C" } }).toString();
+    const out = execFileSync("bash", ["-c", firstMessageScript(tries)], { cwd: d, env: { PATH: `${bin}:/usr/bin:/bin`, NOMO_TEXT: text, LC_ALL: locale } }).toString();
     const read = (f: string) => (existsSync(join(d, f)) ? readFileSync(join(d, f), "utf8") : undefined);
     return { out, typed: read("typed"), keys: read("keys") ?? "", };
   }
@@ -331,20 +336,39 @@ esac
     const r = runBox(READY);
     expect(r.out.trim()).toBe("NOMO_SENT");
     expect(r.typed).toBe(NASTY);
-    expect(r.keys).toBe("Enter\n");
+    expect(r.keys).toBe("paste\nEnter\n");
     expect(firstMessageScript()).not.toContain("it's");
   });
 
-  test("the real CC prompt (❯ + NBSP) counts as ready", () => {
-    expect(runBox(READY_NBSP).out.trim()).toBe("NOMO_SENT");
+  for (const locale of ["C", "C.UTF-8"]) {
+    test(`readiness under LC_ALL=${locale}: the real prompt (❯ + NBSP) is ready, real menus never typed into`, () => {
+      expect(runBox(READY_NBSP, { locale }).out.trim()).toBe("NOMO_SENT");
+      for (const screen of [MENU, MENU_NBSP, "", "Resuming conversation…\n"]) {
+        const r = runBox(screen, { locale });
+        expect(r.out.trim()).toBe("NOMO_NOT_READY");
+        expect(r.typed).toBeUndefined();
+      }
+    });
+
+    test(`numbered text that is not a menu no longer blocks readiness (LC_ALL=${locale})`, () => {
+      for (const hist of ["⏺ arrow => 2. next", "⏺ when x > 3.5 it fails", "❯\u00a02. fix the parser"]) {
+        expect(runBox(READY_NBSP.replace("● done.", hist), { locale }).out.trim()).toBe("NOMO_SENT");
+      }
+    });
+  }
+
+  test("a trailing ; or \\; reaches tmux intact (no send-keys command separator)", () => {
+    for (const text of ["run tests;", "a\\;", "x ; y;"]) expect(runBox(READY, { text }).typed).toBe(text);
   });
 
-  test("a menu or a still-starting screen is never typed into", () => {
-    for (const screen of [MENU, MENU_NBSP, "", "Resuming conversation…\n"]) {
-      const r = runBox(screen);
-      expect(r.out.trim()).toBe("NOMO_NOT_READY");
-      expect(r.typed).toBeUndefined();
-    }
+  test("Enter swallowed into the paste → one more Enter; still there → NOMO_UNCONFIRMED, never NOMO_SENT", () => {
+    const stuck = "────────────────\n❯\u00a0it's still here\n────────────────\n";
+    const r = runBox(READY_NBSP, { after: [stuck] });
+    expect(r.out.trim()).toBe("NOMO_SENT");
+    expect(r.keys).toBe("paste\nEnter\nEnter\n");
+    const s = runBox(READY_NBSP, { after: [stuck, stuck] });
+    expect(s.out.trim()).toBe("NOMO_UNCONFIRMED");
+    expect(s.keys).toBe("paste\nEnter\nEnter\n");
   });
 
   test("not ready / box error → a skip line, never a throw (the handoff already succeeded)", async () => {
@@ -352,6 +376,8 @@ esac
     expect(await sendFirstMessage(async (_s, e) => { env = e; return { stdout: "NOMO_SENT\n" }; }, NASTY)).toContain("sent");
     expect(env).toEqual({ NOMO_TEXT: NASTY });
     expect(await sendFirstMessage(async () => ({ stdout: "NOMO_NOT_READY\n" }), "x")).toBe(FIRST_SKIPPED);
+    expect(FIRST_SKIPPED).toContain("--screen");
+    expect(await sendFirstMessage(async () => ({ stdout: "NOMO_UNCONFIRMED\n" }), "x")).toBe(FIRST_UNCONFIRMED);
     expect(await sendFirstMessage(async () => { throw new Error("502"); }, "x")).toBe(FIRST_SKIPPED);
   });
 

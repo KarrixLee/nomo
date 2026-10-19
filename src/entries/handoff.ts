@@ -597,29 +597,51 @@ function attachHelp(): string {
   ].join("\n");
 }
 
+/** Box-side `nomo_type`, shared by --send and --then: paste NOMO_TEXT (exec env only) into tmux `nomo` as
+ *  one bracketed paste (load-buffer from stdin, so a trailing `;` is never a tmux command separator and
+ *  LF stays a newline, not a submit), press Enter, then confirm the input box emptied. Text still sitting
+ *  there (CC swallowed the Enter into the paste) gets ONE more Enter. Prints NOMO_SENT only when the
+ *  box is seen empty (or a numbered menu took over), else NOMO_UNCONFIRMED. */
+export const TYPE_FN = `nomo_type() {
+  if [ -n "$NOMO_TEXT" ]; then
+    printf '%s' "$NOMO_TEXT" | tmux load-buffer -b nomo-first - && tmux paste-buffer -p -r -d -b nomo-first -t nomo || { echo NOMO_UNCONFIRMED; return 1; }
+    sleep 0.5
+  fi
+  tmux send-keys -t nomo Enter
+  for n in 1 2 3; do
+    sleep 1
+    l=$(tmux capture-pane -p -t nomo | grep -E '^[│ ]*(>|❯)' | tail -1)
+    if [ -z "$l" ] || printf '%s\\n' "$l" | grep -Eq '^[│ ]*(>|❯)( |\u00a0)*$|^[│ ]*(>|❯).{0,3}[0-9]+\\.'; then echo NOMO_SENT; return 0; fi
+    [ "$n" = 1 ] && tmux send-keys -t nomo Enter
+  done
+  echo NOMO_UNCONFIRMED
+}`;
+
 /** Box script for --screen / --send / --send-key. User text arrives ONLY as exec env (NOMO_TEXT /
  *  NOMO_KEY), never interpolated into the script. */
 export function paneScript(mode: "screen" | "send" | "key"): string {
   const guard = `${SHM_SWEEP}
 tmux has-session -t nomo 2>/dev/null || { echo 'tmux nomo: not running'; exit 2; }`;
-  if (mode === "send") return `${guard}\ntmux send-keys -t nomo -l -- "$NOMO_TEXT" && tmux send-keys -t nomo Enter`;
+  if (mode === "send") return `${guard}\n${TYPE_FN}\nnomo_type`;
   if (mode === "key") return `${guard}\ntmux send-keys -t nomo -- "$NOMO_KEY"`;
   return `${guard}\ntmux capture-pane -p -t nomo | sed -e :a -e '/^\\n*$/{$d;N;ba' -e '}' | tail -40`;
 }
 
 /** Box script for --then: wait until claude in tmux `nomo` is idle at its input box (the screen's last
- *  lines hold a `>`/`❯` prompt line and a ─ rule, no numbered menu, unchanged for one poll), then type
- *  NOMO_TEXT (exec env only, never in the script) literally and press Enter: NOMO_SENT. NOMO_NOT_READY
- *  after `tries` polls 2s apart. A newline in the text goes as LF (Ctrl+J): a newline, not a submit. */
+ *  lines hold a `>`/`❯` prompt line and a ─ rule, the LAST prompt line is not a numbered menu item, and
+ *  the screen is unchanged for one poll), then nomo_type: NOMO_SENT / NOMO_UNCONFIRMED. NOMO_NOT_READY
+ *  after `tries` polls 2s apart. Only the last prompt line is menu-checked: chat history may hold `❯ 2.`. */
 export function firstMessageScript(tries = 45): string {
   return `${SHM_SWEEP}
+${TYPE_FN}
 prev=
 for _ in $(seq ${tries}); do
   tmux has-session -t nomo 2>/dev/null || break
   cur=$(tmux capture-pane -p -t nomo | grep -v '^[[:space:]]*$' | tail -8)
-  if [ -n "$cur" ] && [ "$cur" = "$prev" ] && printf '%s\n' "$cur" | grep -q '─' \
-    && printf '%s\n' "$cur" | grep -Eq '^[│ ]*(>|❯)' && ! printf '%s\n' "$cur" | grep -Eq '(>|❯).{0,3}[0-9]+\\.'; then
-    tmux send-keys -t nomo -l -- "$NOMO_TEXT" && sleep 0.5 && tmux send-keys -t nomo Enter && { echo NOMO_SENT; exit 0; }
+  if [ -n "$cur" ] && [ "$cur" = "$prev" ] && printf '%s\\n' "$cur" | grep -q '─' \
+    && printf '%s\\n' "$cur" | grep -Eq '^[│ ]*(>|❯)' \
+    && ! printf '%s\\n' "$cur" | grep -E '^[│ ]*(>|❯)' | tail -1 | grep -Eq '^[│ ]*(>|❯).{0,3}[0-9]+\\.'; then
+    nomo_type; exit 0
   fi
   prev=$cur
   sleep 2
@@ -627,12 +649,15 @@ done
 echo NOMO_NOT_READY`;
 }
 
-export const FIRST_SKIPPED = "Session is in the cloud but the first message wasn't sent; send it with --send";
+export const FIRST_SKIPPED = "Session is in the cloud but the first message wasn't sent yet; the box may still type it, so check --screen first and only then --send it";
+export const FIRST_UNCONFIRMED = "First message typed in the cloud session, but its submit wasn't confirmed; check --screen (if it's still in the input, --send-key Enter)";
 
 /** --then after a successful handoff. Never throws: the session is already in the cloud. */
 export async function sendFirstMessage(run: (script: string, env: Record<string, string>) => Promise<{ stdout?: string }>, text: string): Promise<string> {
   try {
-    if (/^NOMO_SENT$/m.test((await run(firstMessageScript(), { NOMO_TEXT: text })).stdout ?? "")) return "First message sent to the cloud session.";
+    const out = (await run(firstMessageScript(), { NOMO_TEXT: text })).stdout ?? "";
+    if (/^NOMO_SENT$/m.test(out)) return "First message sent to the cloud session.";
+    if (/^NOMO_UNCONFIRMED$/m.test(out)) return FIRST_UNCONFIRMED;
   } catch { /* box unreachable: same answer */ }
   return FIRST_SKIPPED;
 }
@@ -1218,8 +1243,10 @@ async function main(): Promise<void> {
       if (args.has("--send-key") && !/^[A-Za-z0-9-]+$/.test(key)) throw new Error("--send-key takes one tmux key name, e.g. Escape, BTab, C-c, Enter");
       const mode = args.has("--send") ? "send" : args.has("--send-key") ? "key" : "screen";
       const r = await exec(omg, sb.id, paneScript(mode), { NOMO_TEXT: String(args.get("--send") ?? ""), NOMO_KEY: key });
-      process.stdout.write(r.stdout ?? "");
-      if (mode !== "screen" && r.exitCode === 0) console.log("Sent. Check with --screen.");
+      process.stdout.write((r.stdout ?? "").replace(/^NOMO_(SENT|UNCONFIRMED)\n?/m, ""));
+      if (mode === "key" && r.exitCode === 0) console.log("Sent. Check with --screen.");
+      if (mode === "send" && /^NOMO_SENT$/m.test(r.stdout ?? "")) console.log("Sent.");
+      else if (mode === "send" && r.exitCode === 0) console.log("Typed, but the submit wasn't confirmed; check --screen (if it's still in the input, --send-key Enter).");
       if (r.exitCode !== 0) process.exitCode = 1;
       return;
     }

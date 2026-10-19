@@ -13,7 +13,8 @@ cancel, /nomo-cc:handoff status".
 
 **Empty, `quiet`, or `then <message>`** — get this session ready to move. Empty sends the box session a
 default "continue" message once it starts there, `then <message>` sends that message instead, `quiet`
-sends nothing. The argument is user text, so it reaches the command ONLY as the body of a quoted
+sends nothing. The message is typed into the box session as if the user typed it, so one starting
+with `/` or `!` runs there as a slash command or a bash command. The argument is user text, so it reaches the command ONLY as the body of a quoted
 heredoc, which the shell never expands:
 
 ```
