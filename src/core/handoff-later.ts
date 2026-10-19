@@ -48,13 +48,18 @@ export function resolveSession(o: {
 }
 
 /** The session's live context in tokens: the last real assistant turn's usage (input + cache read + cache
- *  creation = what was actually sent), else transcript bytes / 4. `jsonl` may be just the file's tail. */
+ *  creation = what was actually sent); a /compact boundary after it gives its postTokens (else the bytes
+ *  after it / 4); with neither, transcript bytes / 4. `jsonl` may be just the file's tail (TAIL_BYTES). */
 export function contextTokens(jsonl: string, fileBytes: number): number {
   const lines = jsonl.split("\n");
   for (let i = lines.length - 1; i >= 0; i--) {
-    if (!lines[i].includes('"usage"')) continue;
+    if (!lines[i].includes('"usage"') && !lines[i].includes("compact_boundary")) continue;
     try {
       const row = JSON.parse(lines[i]);
+      if (row?.type === "system" && row.subtype === "compact_boundary") {
+        const post = row.compactMetadata?.postTokens;
+        return typeof post === "number" && post > 0 ? post : Math.round(lines.slice(i + 1).join("\n").length / 4);
+      }
       if (row?.type !== "assistant" || row.isSidechain) continue;
       const u = row.message?.usage ?? {};
       const n = (u.input_tokens ?? 0) + (u.cache_read_input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0);
@@ -64,11 +69,14 @@ export function contextTokens(jsonl: string, fileBytes: number): number {
   return Math.round(fileBytes / 4);
 }
 
-/** contextTokens over the last 4 MB of a transcript file (a 1M-token one is tens of MB). */
+/** How much of a transcript's end contextTokens reads (a 1M-token one is tens of MB). */
+export const TAIL_BYTES = 4 * 1024 * 1024;
+
+/** contextTokens over the last TAIL_BYTES of a transcript file. */
 export function contextTokensOf(path: string): number {
   const fd = openSync(path, "r");
   try {
-    const size = fstatSync(fd).size, len = Math.min(size, 4 * 1024 * 1024);
+    const size = fstatSync(fd).size, len = Math.min(size, TAIL_BYTES);
     const buf = Buffer.alloc(len);
     readSync(fd, buf, 0, len, size - len);
     return contextTokens(buf.toString("utf8"), size);

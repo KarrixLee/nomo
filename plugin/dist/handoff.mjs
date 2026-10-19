@@ -384,7 +384,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "2.3.17";
+var PLUGIN_VERSION = "2.3.18";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -3204,10 +3204,15 @@ function contextTokens(jsonl, fileBytes) {
   const lines = jsonl.split(`
 `);
   for (let i = lines.length - 1;i >= 0; i--) {
-    if (!lines[i].includes('"usage"'))
+    if (!lines[i].includes('"usage"') && !lines[i].includes("compact_boundary"))
       continue;
     try {
       const row = JSON.parse(lines[i]);
+      if (row?.type === "system" && row.subtype === "compact_boundary") {
+        const post = row.compactMetadata?.postTokens;
+        return typeof post === "number" && post > 0 ? post : Math.round(lines.slice(i + 1).join(`
+`).length / 4);
+      }
       if (row?.type !== "assistant" || row.isSidechain)
         continue;
       const u = row.message?.usage ?? {};
@@ -3218,10 +3223,11 @@ function contextTokens(jsonl, fileBytes) {
   }
   return Math.round(fileBytes / 4);
 }
+var TAIL_BYTES = 4 * 1024 * 1024;
 function contextTokensOf(path) {
   const fd = openSync(path, "r");
   try {
-    const size = fstatSync(fd).size, len = Math.min(size, 4 * 1024 * 1024);
+    const size = fstatSync(fd).size, len = Math.min(size, TAIL_BYTES);
     const buf = Buffer.alloc(len);
     readSync(fd, buf, 0, len, size - len);
     return contextTokens(buf.toString("utf8"), size);
@@ -3383,7 +3389,7 @@ import {
 import { dirname as dirname2, isAbsolute as isAbsolute2, join as join3, sep } from "node:path";
 var MAX_ARTIFACT_BYTES = 100 * 1024 * 1024;
 var MAX_EXTRACTED_BYTES = 1024 * 1024 * 1024;
-var MAX_TRANSCRIPT_BYTES = 2 * 1024 * 1024 * 1024;
+var MAX_TRANSCRIPT_BYTES = 512 * 1024 * 1024;
 function backCaps(sentTranscriptBytes = 0) {
   const project = Math.min(MAX_TRANSCRIPT_BYTES, Math.max(MAX_ARTIFACT_BYTES, 4 * sentTranscriptBytes));
   return { project, artifact: MAX_ARTIFACT_BYTES, extracted: MAX_EXTRACTED_BYTES + project - MAX_ARTIFACT_BYTES };
@@ -4599,15 +4605,36 @@ sleep 8
 tmux has-session -t nomo
 tmux capture-pane -p -t nomo
 `;
-  return { uuid, cwd, root, git, branch, model, artifacts: art, script, snap, gitUser, warn: sizeWarning(contextTokens(transcript, transcriptBytes.length)) };
+  return { uuid, cwd, root, git, branch, model, artifacts: art, script, snap, gitUser, warn: sizeWarning(contextTokens(transcriptBytes.subarray(Math.max(0, transcriptBytes.length - TAIL_BYTES)).toString("utf8"), transcriptBytes.length)) };
 }
-async function api(key, method, path, body) {
+async function readCapped(res, max = Infinity) {
+  const tooBig = () => new Error(`response over ${(max / 1e6).toFixed(0)} MB; refusing it`);
+  if (Number(res.headers.get("content-length") ?? 0) > max) {
+    await res.body?.cancel();
+    throw tooBig();
+  }
+  if (!res.body || max === Infinity)
+    return res.text();
+  const reader = res.body.getReader(), dec = new TextDecoder;
+  let n = 0, text = "";
+  for (;; ) {
+    const { done, value } = await reader.read();
+    if (done)
+      return text + dec.decode();
+    if ((n += value.byteLength) > max) {
+      await reader.cancel();
+      throw tooBig();
+    }
+    text += dec.decode(value, { stream: true });
+  }
+}
+async function api(key, method, path, body, maxBytes) {
   const res = await fetch(API + path, {
     method,
     headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
     body: body === undefined ? undefined : JSON.stringify(body)
   });
-  const text = await res.text();
+  const text = await readCapped(res, maxBytes);
   if (!res.ok)
     throw Object.assign(new Error(`${method} ${path} -> ${res.status}: ${text.slice(0, 300)}`), { status: res.status });
   return text ? JSON.parse(text) : null;
@@ -4977,7 +5004,7 @@ ${printable((pack.stderr ?? "").slice(-1500))}`);
   const capOf = (name) => name === "project.tgz" ? caps.project : caps.artifact;
   for (const [name, size] of Object.entries(sizes)) {
     if (size > capOf(name)) {
-      throw new Error(`${name} on the box is ${(size / 1e6).toFixed(0)} MB, over this session's ${(capOf(name) / 1e6).toFixed(0)} MB cap. ` + `Nothing was pulled or changed on this Mac: the session and all its work are still on box ${id}, which is awake. ` + `Look with --screen (e.g. commit and push the code from there with --send), then --stop to let it sleep (files kept 14 days).`);
+      throw new Error(`${name} on the box is ${(size / 1e6).toFixed(0)} MB, over this session's ${(capOf(name) / 1e6).toFixed(0)} MB cap. ` + `Nothing was pulled and nothing changed on this Mac. Claude Code on the box was stopped; the session and all its work ` + `stay on box ${id} (it sleeps on its own; files are kept 14 days asleep).`);
     }
   }
   const backup = join4(CC_DIR, "cloud-back", `${uuid8}-${Date.now()}`);
@@ -4996,7 +5023,7 @@ Interrupted (${sig}) while ${phase}.
   for (const name of BACK_FILES) {
     if (!(name in sizes))
       continue;
-    const r = await api(omg, "GET", `/sandboxes/${id}/files?path=${encodeURIComponent(`${BACK}-${name}`)}`);
+    const r = await api(omg, "GET", `/sandboxes/${id}/files?path=${encodeURIComponent(`${BACK}-${name}`)}`, undefined, Math.ceil(capOf(name) * 4 / 3) + 65536);
     const bytes = Buffer.from(r?.content ?? "", "base64");
     if (bytes.length !== sizes[name])
       throw new Error(`pulled ${name}: ${bytes.length} B, the box reported ${sizes[name]} B`);
@@ -5446,6 +5473,7 @@ export {
   projectDirName,
   pubRawFromPkcs8,
   q,
+  readCapped,
   resultPage,
   resumeCommand,
   takePairUrl,

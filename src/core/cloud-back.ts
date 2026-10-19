@@ -21,8 +21,10 @@ import { dirname, isAbsolute, join, sep } from "node:path";
 /** Per-artifact compressed cap (== handoff's MAX_ARTIFACT_BYTES) and the extracted total across all tars. */
 export const MAX_ARTIFACT_BYTES = 100 * 1024 * 1024;
 export const MAX_EXTRACTED_BYTES = 1024 * 1024 * 1024;
-/** The transcript cap's hard ceiling, however big the session was: a hostile box still can't fill the Mac. */
-export const MAX_TRANSCRIPT_BYTES = 2 * 1024 * 1024 * 1024;
+/** The transcript cap's hard ceiling, however big the session was: a hostile box still can't fill the Mac.
+ *  ponytail: 512 MB because --back pulls each artifact as ONE base64 JSON string held in memory (~5x RSS;
+ *  a 1.7 GB one overflows bun's max string). Raise it only with a streaming download to disk. */
+export const MAX_TRANSCRIPT_BYTES = 512 * 1024 * 1024;
 
 /** --back's caps for one session. project.tgz (transcript + memory) may grow to 4x the transcript handoff
  *  sent (never under the default cap, never over the ceiling), so a big session that kept going on the box

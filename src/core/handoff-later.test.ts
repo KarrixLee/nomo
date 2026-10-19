@@ -196,6 +196,17 @@ describe("context size", () => {
     expect(contextTokens(jsonl, 1e9)).toBe(820_003);
   });
 
+  test("a /compact after the last turn: its postTokens, else the bytes after it / 4", () => {
+    const big = asst({ input_tokens: 2, cache_read_input_tokens: 900_000 });
+    const boundary = (meta: object) => JSON.stringify({ type: "system", subtype: "compact_boundary", content: "Conversation compacted", compactMetadata: meta });
+    const summary = JSON.stringify({ type: "user", isCompactSummary: true, message: { content: "s".repeat(4000) } });
+    expect(contextTokens([big, boundary({ trigger: "manual", preTokens: 900_002, postTokens: 31_000 }), summary].join("\n"), 1e9)).toBe(31_000);
+    expect(contextTokens([big, boundary({ trigger: "manual" }), summary].join("\n"), 1e9)).toBeGreaterThan(1000);
+    expect(contextTokens([big, boundary({ trigger: "manual" }), summary].join("\n"), 1e9)).toBeLessThan(2000);
+    // A turn after the compact is the live size again.
+    expect(contextTokens([big, boundary({ postTokens: 31_000 }), summary, asst({ input_tokens: 5, cache_read_input_tokens: 40_000 })].join("\n"), 1e9)).toBe(40_005);
+  });
+
   test("no usage at all: file bytes / 4", () => {
     expect(contextTokens([user, user].join("\n"), 4_000_000)).toBe(1_000_000);
   });

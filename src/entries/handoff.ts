@@ -71,7 +71,7 @@ import { buildPairURL, DEFAULT_WORKER_URL } from "../core/pair-url";
 import { normalizeModelId } from "../core/adapter";
 import { atomicWrite, CC_DIR, pidAlive, pidAncestors, pidCommand, readRecord, SESSIONS_DIR } from "../core/shared";
 import {
-  cancelPending, claimPending, contextTokens, contextTokensOf, GONE_MSG, sizeWarning, handoffArgv, LATER_LOG, laterStatus, needsPairing, type Pending, PENDING_PATH, readPending, resolveSession, waitThenHandoff,
+  cancelPending, claimPending, contextTokens, contextTokensOf, GONE_MSG, sizeWarning, TAIL_BYTES, handoffArgv, LATER_LOG, laterStatus, needsPairing, type Pending, PENDING_PATH, readPending, resolveSession, waitThenHandoff,
 } from "../core/handoff-later";
 import {
   agentConfigPaths, applyInPlace, atomicWriteBytes, type BoxArtifacts, boxChangedPaths, boxIdle, copyContained, decideCode, extractTgz,
@@ -473,18 +473,34 @@ sleep 8
 tmux has-session -t nomo
 tmux capture-pane -p -t nomo
 `;
-  return { uuid, cwd, root, git, branch, model, artifacts: art, script, snap, gitUser, warn: sizeWarning(contextTokens(transcript, transcriptBytes.length)) };
+  return { uuid, cwd, root, git, branch, model, artifacts: art, script, snap, gitUser, warn: sizeWarning(contextTokens(transcriptBytes.subarray(Math.max(0, transcriptBytes.length - TAIL_BYTES)).toString("utf8"), transcriptBytes.length)) };
 }
 
 // --------------------------------------------------------------------------------------------- omg
 
-async function api(key: string, method: string, path: string, body?: unknown): Promise<any> {
+/** A response body as text, aborting past `max` bytes: by Content-Length before reading, else by counting
+ *  (a box-reported size is not a limit on what the download actually sends). */
+export async function readCapped(res: Response, max = Infinity): Promise<string> {
+  const tooBig = () => new Error(`response over ${(max / 1e6).toFixed(0)} MB; refusing it`);
+  if (Number(res.headers.get("content-length") ?? 0) > max) { await res.body?.cancel(); throw tooBig(); }
+  if (!res.body || max === Infinity) return res.text();
+  const reader = res.body.getReader(), dec = new TextDecoder();
+  let n = 0, text = "";
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) return text + dec.decode();
+    if ((n += value.byteLength) > max) { await reader.cancel(); throw tooBig(); }
+    text += dec.decode(value, { stream: true });
+  }
+}
+
+async function api(key: string, method: string, path: string, body?: unknown, maxBytes?: number): Promise<any> {
   const res = await fetch(API + path, {
     method,
     headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
     body: body === undefined ? undefined : JSON.stringify(body),
   });
-  const text = await res.text();
+  const text = await readCapped(res, maxBytes);
   if (!res.ok) throw Object.assign(new Error(`${method} ${path} -> ${res.status}: ${text.slice(0, 300)}`), { status: res.status });
   return text ? JSON.parse(text) : null;
 }
@@ -869,8 +885,8 @@ async function back(omg: string, args: Map<string, string | true>): Promise<void
   for (const [name, size] of Object.entries(sizes)) {
     if (size > capOf(name)) {
       throw new Error(`${name} on the box is ${(size / 1e6).toFixed(0)} MB, over this session's ${(capOf(name) / 1e6).toFixed(0)} MB cap. ` +
-        `Nothing was pulled or changed on this Mac: the session and all its work are still on box ${id}, which is awake. ` +
-        `Look with --screen (e.g. commit and push the code from there with --send), then --stop to let it sleep (files kept 14 days).`);
+        `Nothing was pulled and nothing changed on this Mac. Claude Code on the box was stopped; the session and all its work ` +
+        `stay on box ${id} (it sleeps on its own; files are kept 14 days asleep).`);
     }
   }
   const backup = join(CC_DIR, "cloud-back", `${uuid8}-${Date.now()}`);
@@ -887,7 +903,8 @@ async function back(omg: string, args: Map<string, string | true>): Promise<void
   process.on("SIGINT", onSignal).on("SIGTERM", onSignal);
   for (const name of BACK_FILES) {
     if (!(name in sizes)) continue;
-    const r = await api(omg, "GET", `/sandboxes/${id}/files?path=${encodeURIComponent(`${BACK}-${name}`)}`);
+    // base64 is 4/3 of the cap, plus slack for the JSON around it.
+    const r = await api(omg, "GET", `/sandboxes/${id}/files?path=${encodeURIComponent(`${BACK}-${name}`)}`, undefined, Math.ceil(capOf(name) * 4 / 3) + 65_536);
     const bytes = Buffer.from(r?.content ?? "", "base64");
     if (bytes.length !== sizes[name]) throw new Error(`pulled ${name}: ${bytes.length} B, the box reported ${sizes[name]} B`);
     writeFileSync(join(backup, name), bytes, { mode: 0o600 });
