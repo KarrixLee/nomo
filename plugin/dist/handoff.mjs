@@ -384,7 +384,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "2.3.18";
+var PLUGIN_VERSION = "2.3.19";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -3191,6 +3191,18 @@ var LATER_LOG = `${CC_DIR}/handoff.log`;
 var LATER_CAP_MS = 30 * 60000;
 var POLL_MS = 2000;
 var UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+var DEFAULT_THEN = "You're now running on the cloud box. Continue the task you were working on before the handoff. If it was already finished, say so and wait.";
+var LATER_USAGE = "Usage: /nomo-cc:handoff (move this session; it continues on its own), /nomo-cc:handoff then <message>, /nomo-cc:handoff quiet, /nomo-cc:handoff cancel, /nomo-cc:handoff status";
+function parseLaterArg(raw) {
+  const s = raw.replace(/\r\n?/g, `
+`).trim();
+  if (!s)
+    return { message: DEFAULT_THEN };
+  if (/^quiet$/i.test(s))
+    return {};
+  const text = /^then(?:\s+([\s\S]*))?$/i.exec(s)?.[1]?.trim();
+  return text ? { message: text } : undefined;
+}
 function resolveSession(o) {
   const ids = [o.substituted, o.env.CLAUDE_CODE_SESSION_ID].map((s) => s?.trim());
   const byPid = o.records.find((r) => o.ancestors.includes(r.pid));
@@ -4738,6 +4750,31 @@ tmux send-keys -t nomo -- "$NOMO_KEY"`;
   return `${guard}
 tmux capture-pane -p -t nomo | sed -e :a -e '/^\\n*$/{$d;N;ba' -e '}' | tail -40`;
 }
+function firstMessageScript(tries = 45) {
+  return `${SHM_SWEEP}
+prev=
+for _ in $(seq ${tries}); do
+  tmux has-session -t nomo 2>/dev/null || break
+  cur=$(tmux capture-pane -p -t nomo | grep -v '^[[:space:]]*$' | tail -8)
+  if [ -n "$cur" ] && [ "$cur" = "$prev" ] && printf '%s
+' "$cur" | grep -q '─'     && printf '%s
+' "$cur" | grep -Eq '^[│ ]*(>|❯)( |$)' && ! printf '%s
+' "$cur" | grep -Eq '(>|❯) *[0-9]+\\.'; then
+    tmux send-keys -t nomo -l -- "$NOMO_TEXT" && sleep 0.5 && tmux send-keys -t nomo Enter && { echo NOMO_SENT; exit 0; }
+  fi
+  prev=$cur
+  sleep 2
+done
+echo NOMO_NOT_READY`;
+}
+var FIRST_SKIPPED = "Session is in the cloud but the first message wasn't sent; send it with --send";
+async function sendFirstMessage(run, text) {
+  try {
+    if (/^NOMO_SENT$/m.test((await run(firstMessageScript(), { NOMO_TEXT: text })).stdout ?? ""))
+      return "First message sent to the cloud session.";
+  } catch {}
+  return FIRST_SKIPPED;
+}
 async function bake(key) {
   const out = mkdtempSync2(join4(tmpdir(), "nomo-bake-"));
   const marketplace = packPlugin(join4(out, "plugin.tgz"));
@@ -5201,6 +5238,12 @@ async function later(args, keys, worker) {
     ancestors: pidAncestors(process.pid),
     records
   });
+  const arg = parseLaterArg(args.has("--args-stdin") ? readFileSync4(0, "utf8") : "");
+  if (!arg) {
+    console.log(LATER_USAGE);
+    process.exitCode = 1;
+    return;
+  }
   if (!session || !claudePid)
     throw new Error("could not tell which Claude Code session this is. Run /nomo-cc:handoff inside the session you want to move.");
   if (!keys.omg || !keys.openrouter)
@@ -5225,7 +5268,7 @@ After that, /nomo-cc:handoff works from inside Claude Code.`);
     return;
   }
   mkdirSync2(CC_DIR, { recursive: true, mode: 448 });
-  const p = { helperPid: process.pid, session, claudePid, state: "waiting", startedAt: Date.now() };
+  const p = { helperPid: process.pid, session, claudePid, state: "waiting", startedAt: Date.now(), message: arg.message };
   if (!claimPending(PENDING, p)) {
     const cur = readPending(PENDING_PATH);
     console.log(`A handoff is already waiting (session ${cur?.session ?? "?"}). See /nomo-cc:handoff status, or /nomo-cc:handoff cancel.`);
@@ -5237,7 +5280,8 @@ After that, /nomo-cc:handoff works from inside Claude Code.`);
   writeFileSync3(PENDING_PATH, JSON.stringify({ ...p, helperPid: child.pid }) + `
 `, { mode: 384 });
   console.log(`Ready. Quit Claude Code now (/exit). Session ${session} moves to the cloud as soon as it closes; watch it on your phone.
-` + `Log: ${LATER_LOG}
+` + (p.message ? `First message on the box: "${p.message}"` : "No first message (quiet).") + `
+Log: ${LATER_LOG}
 To cancel before quitting: /nomo-cc:handoff cancel`);
   let warn;
   try {
@@ -5250,7 +5294,13 @@ async function afterExit(args, worker) {
   const session = String(args.get("--session")), claudePid = Number(args.get("--claude-pid"));
   if (!UUID_RE2.test(session) || !(claudePid > 1))
     throw new Error("--after-exit needs --session <uuid> --claude-pid <pid>");
-  process.exitCode = await waitThenHandoff({ helperPid: process.pid, session, claudePid, state: "waiting", startedAt: Date.now() }, {
+  let pending = readPending(PENDING_PATH);
+  for (let i = 0;i < 30 && pending?.helperPid !== process.pid; i++) {
+    await new Promise((r) => setTimeout(r, 100));
+    pending = readPending(PENDING_PATH);
+  }
+  const message = pending?.session === session ? pending.message : undefined;
+  process.exitCode = await waitThenHandoff({ helperPid: process.pid, session, claudePid, state: "waiting", startedAt: Date.now(), message }, {
     pending: PENDING_PATH,
     alive: pidAlive,
     now: Date.now,
@@ -5266,7 +5316,7 @@ async function afterExit(args, worker) {
       });
       if (!argv)
         return rej(new Error(GONE_MSG));
-      spawn2(argv[0], argv.slice(1), { stdio: "inherit", env: { ...process.env, NOMO_HANDOFF_HELPER: "1" } }).on("exit", (c) => res(c ?? 1)).on("error", () => res(1));
+      spawn2(argv[0], argv.slice(1), { stdio: "inherit", env: { ...process.env, NOMO_HANDOFF_HELPER: "1", ...message ? { NOMO_THEN: message } : {} } }).on("exit", (c) => res(c ?? 1)).on("error", () => res(1));
     }),
     log: (line) => console.log(`[${new Date().toISOString()}] ${line}`),
     notify: (text) => {
@@ -5281,7 +5331,7 @@ async function main() {
   const args = new Map;
   for (let i = 0;i < argv.length; i++) {
     const a = argv[i];
-    if (["--session", "--model", "--send", "--send-key", "--worker", "--claude-pid", "--from-session"].includes(a))
+    if (["--session", "--model", "--send", "--send-key", "--then", "--worker", "--claude-pid", "--from-session"].includes(a))
       args.set(a, argv[++i] ?? "");
     else if (a === "--wait" && /^\d+(\.\d+)?$/.test(argv[i + 1] ?? ""))
       args.set(a, argv[++i]);
@@ -5295,6 +5345,11 @@ async function main() {
     console.log(PAIR_URL_MARKER + url);
     return;
   }
+  const then = (typeof args.get("--then") === "string" ? String(args.get("--then")) : process.env.NOMO_THEN ?? "").replace(/\r\n?/g, `
+`);
+  delete process.env.NOMO_THEN;
+  if (args.has("--then") && !then.trim())
+    throw new Error('usage: --then "<first message for the cloud session>"');
   if (args.has("--send") && !String(args.get("--send")).trim())
     throw new Error('usage: --send "<text>" (use --send-key Enter for a bare Enter)');
   const keys = readKeys();
@@ -5436,6 +5491,8 @@ ${(r.stderr ?? "").slice(-2000)}`);
 `));
   console.log(`
 Session ${plan.uuid} is running on cloud box ${id} (tmux session "nomo").`);
+  if (then.trim())
+    console.log(await sendFirstMessage((script, env) => exec(omg, id, script, env), then));
   console.log(attachHelp());
   console.log(`  Status: --status   Sleep the box: --stop   Bring it back to this Mac: --back`);
   if (!process.env.NOMO_HANDOFF_HELPER)
@@ -5452,6 +5509,7 @@ if (__require.main == __require.module) {
 export {
   BACK_FILES,
   BOX_MACHINE_NAME,
+  FIRST_SKIPPED,
   PAIR_FN,
   PAIR_POLL,
   RELAY_PORT,
@@ -5466,6 +5524,7 @@ export {
   checkLaunchIds,
   createBody,
   currentGuard,
+  firstMessageScript,
   lastModel,
   latestSession,
   packRefusal,
@@ -5476,6 +5535,7 @@ export {
   readCapped,
   resultPage,
   resumeCommand,
+  sendFirstMessage,
   takePairUrl,
   targetWorker,
   toOpenRouterModel,

@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
-import { chmodSync, mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { b64url, generateEphemeralKeyPair } from "../core/crypto";
@@ -11,6 +11,7 @@ import {
 } from "./handoff";
 import { RELAY_PORT as RELAY_LISTEN_PORT } from "./or-relay";
 import { readCapped } from "./handoff";
+import { FIRST_SKIPPED, firstMessageScript, sendFirstMessage } from "./handoff";
 import { BACK_FILES, backPackScript, backStopScript, backWaitScript, currentGuard, resumeCommand } from "./handoff";
 import { boxIdle } from "../core/cloud-back";
 
@@ -296,5 +297,73 @@ describe("readCapped (a /files download never exceeds its cap)", () => {
     expect(await readCapped(new Response(stream(3, 1000)), 10_000)).toHaveLength(3000);
     expect(await readCapped(new Response(JSON.stringify({ content: "héllo ✓" })), 1000)).toBe('{"content":"héllo ✓"}');
     expect(await readCapped(new Response("x".repeat(50)))).toHaveLength(50); // no cap
+  });
+});
+
+describe("first message (--then, /nomo-cc:handoff)", () => {
+  const NASTY = `it's "$HOME" \`id\` $(touch PWNED) \\n ; rm -rf x\nsecond line`;
+  const READY = "> earlier prompt\n⏺ done.\n\n────────────────\n> \n────────────────\n  ? for shortcuts\n";
+  const MENU = "────────────────\n Resume this session?\n❯ 1. Yes\n  2. No\n";
+
+  /** Run firstMessageScript against a fake tmux showing `screen`; returns stdout, the typed text, the keys. */
+  function runBox(screen: string, tries = 3): { out: string; typed?: string; keys: string } {
+    const d = mkdtempSync(join(tmpdir(), "nomo-then-")), bin = join(d, "bin");
+    mkdirSync(bin);
+    writeFileSync(join(d, "screen"), screen);
+    writeFileSync(join(bin, "tmux"), `#!/bin/bash
+case "$1" in
+  has-session) exit 0 ;;
+  capture-pane) cat ${d}/screen ;;
+  send-keys) if [ "$4" = -l ]; then printf %s "$6" > ${d}/typed; else echo "$4" >> ${d}/keys; fi ;;
+esac
+`);
+    writeFileSync(join(bin, "sleep"), "#!/bin/sh\nexit 0\n");
+    chmodSync(join(bin, "tmux"), 0o755); chmodSync(join(bin, "sleep"), 0o755);
+    const out = execFileSync("bash", ["-c", firstMessageScript(tries)], { cwd: d, env: { PATH: `${bin}:/usr/bin:/bin`, NOMO_TEXT: NASTY, LC_ALL: "C" } }).toString();
+    const read = (f: string) => (existsSync(join(d, f)) ? readFileSync(join(d, f), "utf8") : undefined);
+    return { out, typed: read("typed"), keys: read("keys") ?? "", };
+  }
+
+  test("idle at the input box → the text arrives literally (quotes, $, backticks, newlines), then Enter", () => {
+    const r = runBox(READY);
+    expect(r.out.trim()).toBe("NOMO_SENT");
+    expect(r.typed).toBe(NASTY);
+    expect(r.keys).toBe("Enter\n");
+    expect(firstMessageScript()).not.toContain("it's");
+  });
+
+  test("a menu or a still-starting screen is never typed into", () => {
+    for (const screen of [MENU, "", "Resuming conversation…\n"]) {
+      const r = runBox(screen);
+      expect(r.out.trim()).toBe("NOMO_NOT_READY");
+      expect(r.typed).toBeUndefined();
+    }
+  });
+
+  test("not ready / box error → a skip line, never a throw (the handoff already succeeded)", async () => {
+    let env: Record<string, string> = {};
+    expect(await sendFirstMessage(async (_s, e) => { env = e; return { stdout: "NOMO_SENT\n" }; }, NASTY)).toContain("sent");
+    expect(env).toEqual({ NOMO_TEXT: NASTY });
+    expect(await sendFirstMessage(async () => ({ stdout: "NOMO_NOT_READY\n" }), "x")).toBe(FIRST_SKIPPED);
+    expect(await sendFirstMessage(async () => { throw new Error("502"); }, "x")).toBe(FIRST_SKIPPED);
+  });
+
+  test("the command passes its argument only as a quoted-heredoc body: never argv, never expanded", () => {
+    const md = readFileSync(join(import.meta.dir, "../../plugin/commands/handoff.md"), "utf8");
+    const blocks = [...md.matchAll(/```\n([\s\S]*?)```/g)].map((m) => m[1]);
+    for (const b of blocks) expect(b).not.toContain("$ARGUMENTS");
+    const arm = blocks.find((b) => b.includes("--args-stdin"))!;
+    const d = mkdtempSync(join(tmpdir(), "nomo-cmd-"));
+    mkdirSync(join(d, "scripts"));
+    writeFileSync(join(d, "scripts", "run.sh"), `#!/bin/sh\nprintf '%s\\n' "$@" > ${d}/argv\ncat > ${d}/stdin\n`);
+    chmodSync(join(d, "scripts", "run.sh"), 0o755);
+    const arg = `then ${NASTY}`;
+    const filled = arm.replaceAll("XXXXXXXXXXXX", "q7Zp2Kx9Lm4T").replace("\nARGUMENT\n", `\n${arg}\n`);
+    execFileSync("bash", ["-c", filled], { cwd: d, env: { PATH: "/usr/bin:/bin", HOME: d, CLAUDE_PLUGIN_ROOT: d, CLAUDE_SESSION_ID: "0a1b2c3d-1111-4222-8333-444455556666" } });
+    expect(readFileSync(join(d, "stdin"), "utf8")).toBe(`${arg}\n`);
+    const argv = readFileSync(join(d, "argv"), "utf8");
+    expect(argv).toContain("--args-stdin");
+    expect(argv).not.toContain("touch");
+    expect(existsSync(join(d, "PWNED"))).toBe(false);
   });
 });

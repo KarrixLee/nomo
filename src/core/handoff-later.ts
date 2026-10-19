@@ -26,6 +26,22 @@ export interface Pending {
   claudePid: number;
   state: "waiting" | "handing-off";
   startedAt: number;
+  /** The first message for the box session (`--then`); absent = quiet. User text: this 0600 file and
+   *  the handoff's env only, never argv or the log. */
+  message?: string;
+}
+
+export const DEFAULT_THEN = "You're now running on the cloud box. Continue the task you were working on before the handoff. If it was already finished, say so and wait.";
+export const LATER_USAGE = "Usage: /nomo-cc:handoff (move this session; it continues on its own), /nomo-cc:handoff then <message>, /nomo-cc:handoff quiet, /nomo-cc:handoff cancel, /nomo-cc:handoff status";
+
+/** `/nomo-cc:handoff`'s argument (cancel/status are routed by the command itself): empty → DEFAULT_THEN,
+ *  `then <text>` → text, `quiet` → no message. Anything else (a typo, a bare `then`) → undefined: usage. */
+export function parseLaterArg(raw: string): { message?: string } | undefined {
+  const s = raw.replace(/\r\n?/g, "\n").trim();
+  if (!s) return { message: DEFAULT_THEN };
+  if (/^quiet$/i.test(s)) return {};
+  const text = /^then(?:\s+([\s\S]*))?$/i.exec(s)?.[1]?.trim();
+  return text ? { message: text } : undefined;
 }
 
 /** This session and its `claude` process. The id: Claude Code's `${CLAUDE_SESSION_ID}` command
