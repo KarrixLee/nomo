@@ -895,13 +895,30 @@ export const sameWindowBackLine = (id: string): string => `Back. Type /resume ${
 async function back(omg: string, args: Map<string, string | true>): Promise<void> {
   const cloud = loadCloud();
   const flag = args.get("--session");
-  const uuid = typeof flag === "string" ? flag : cloud.current;
+  const here = args.get("--from-session") || process.env.CLAUDE_CODE_SESSION_ID;
+  // A rerun in a window whose back was interrupted after staging: cloud.json no longer names it.
+  const hereLanding = typeof here === "string" && readPark(here)?.state === "landing" ? here : undefined;
+  const uuid = typeof flag === "string" ? flag : cloud.current ?? hereLanding;
   if (!uuid) throw new Error("no handed-off session on record; pass --session <uuid>");
   if (!UUID_RE.test(uuid)) throw new Error(`session id must be a UUID, got ${JSON.stringify(uuid)}`);
   // /nomo-cc:back from the parked window itself (NOM-90) lands the box copy under it: the user then types
-  // /resume <id> there. From anywhere else it opens a new Terminal, as before.
-  const here = args.get("--from-session") || process.env.CLAUDE_CODE_SESSION_ID;
+  // /resume <id> there. Only a window parked as "cloud" (gated since the move, so it cannot have diverged
+  // except through Nomo's own commands) qualifies. From anywhere else it opens a new Terminal, as before.
+  const parkedAtStart = readPark(uuid);
   const sameWindow = here === uuid;
+  if (sameWindow && parkedAtStart?.state === "landing") {
+    // The box copy is already pulled and staged; only the install (at this turn's end) is left.
+    if (!parkedAtStart.staged || !existsSync(parkedAtStart.staged)) {
+      clearPark(uuid);
+      throw new Error(`the staged box copy is gone; unparked this window. The pulled copy is under ${join(CC_DIR, "cloud-back")}.`);
+    }
+    writePark(uuid, { ...parkedAtStart, since: Date.now() });
+    console.log(`The box's copy is staged; it goes in as this turn ends.\n\n${sameWindowBackLine(parkedAtStart.resume ?? uuid)}`);
+    return;
+  }
+  if (sameWindow && parkedAtStart?.state !== "cloud") {
+    throw new Error(`this Claude Code session is ${uuid} itself and is not parked. Run /nomo-cc:back from another session; it resumes in a new Terminal window.`);
+  }
   const force = args.has("--force");
   const waitArg = args.get("--wait");
   const waitMin = typeof waitArg === "string" ? Number(waitArg) : 15;
@@ -916,7 +933,8 @@ async function back(omg: string, args: Map<string, string | true>): Promise<void
     try { root = sh("git", ["rev-parse", "--show-toplevel"], cwd).trim(); } catch { isGit = false; root = cwd; }
   }
   const rec = await readRecord(uuid);
-  if (!sameWindow && rec && typeof rec.pid === "number" && pidAlive(rec.pid)) {
+  // A window parked as "cloud" is gated, so it can stay open (it is told to close once this lands).
+  if (parkedAtStart?.state !== "cloud" && rec && typeof rec.pid === "number" && pidAlive(rec.pid)) {
     throw new Error(`session ${uuid} is running on this Mac (pid ${rec.pid}). Quit it there first, then rerun --back.`);
   }
   const enc = projectDirName(cwd);
@@ -1026,7 +1044,7 @@ async function back(omg: string, args: Map<string, string | true>): Promise<void
     const macPath = join(projDir, `${uuid}.jsonl`);
     const macT = existsSync(macPath) ? readFileSync(macPath) : undefined;
     const sub = pt.files.filter((r) => r.startsWith(`${uuid}/`));
-    const act = transcriptAction(snap, macT, boxT, sameWindow);
+    const act = transcriptAction(snap, macT, boxT);
     if (act === "corrupt") problems.push(`the box transcript does not continue the one handed off; NOT installed (it is in ${backup}/project.tgz)`);
     if (act === "replace") {
       const before = mkdirp(join(backup, "mac-before"));
@@ -1121,10 +1139,14 @@ async function back(omg: string, args: Map<string, string | true>): Promise<void
 
   // 5. Resume here.
   const parked = readPark(uuid);
-  if (!sameWindow || parked?.state !== "landing") {
-    if (sameWindow && resumeId !== uuid) writePark(uuid, { state: "back", resume: resumeId });
-    else clearPark(uuid);
-  }
+  if (sameWindow) {
+    if (parked?.state !== "landing") {
+      if (resumeId !== uuid) writePark(uuid, { state: "back", resume: resumeId });
+      else clearPark(uuid);
+    }
+  } else if (parkedAtStart?.state === "cloud" && typeof parkedAtStart.pid === "number" && pidAlive(parkedAtStart.pid)) {
+    writePark(uuid, { state: "elsewhere", pid: parkedAtStart.pid });
+  } else clearPark(uuid);
   if (sameWindow) {
     console.log(`\n${sameWindowBackLine(resumeId)}`);
     if (problems.length) {
@@ -1197,7 +1219,7 @@ async function later(args: Map<string, string | true>, keys: { omg?: string; ope
     console.log(`A handoff is already waiting (session ${cur?.session ?? "?"}). See /nomo-cc:handoff status, or /nomo-cc:handoff cancel.`);
     return;
   }
-  writePark(session, { state: "moving" });
+  writePark(session, { state: "moving", pid: claudePid });
   const fd = openSync(LATER_LOG, "w", 0o600);
   const child = spawn(process.execPath, [SELF, "--after-exit", "--session", session, "--claude-pid", String(claudePid), "--worker", worker],
     { cwd, detached: true, stdio: ["ignore", fd, fd] });
@@ -1270,7 +1292,15 @@ async function main(): Promise<void> {
   const keys = readKeys();
   const worker = targetWorker(args.get("--worker"), process.env.NOMO_WORKER_URL);
 
-  if (args.has("--later-cancel")) { console.log(cancelPending({ ...PENDING, kill: (p) => process.kill(p, "SIGTERM"), log: LATER_LOG, parkDir: PARK_DIR })); return; }
+  if (args.has("--later-cancel")) {
+    // The helper is a detached group leader: -pid also stops a handoff child it raced into starting.
+    const session = args.get("--session");
+    console.log(cancelPending({
+      ...PENDING, kill: (p) => { try { process.kill(-p, "SIGTERM"); } catch { process.kill(p, "SIGTERM"); } }, log: LATER_LOG, parkDir: PARK_DIR,
+      session: typeof session === "string" && UUID_RE.test(session) ? session : undefined,
+    }));
+    return;
+  }
   if (args.has("--later-status")) { console.log(laterStatus({ ...PENDING, log: LATER_LOG })); return; }
   if (args.has("--later")) { await later(args, keys, worker); return; }
   if (args.has("--after-exit")) { await afterExit(args, worker); return; }

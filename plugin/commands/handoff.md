@@ -32,10 +32,11 @@ Fill it in exactly like this, changing nothing else:
 - Keep the quotes around the first `'NOMO_END_…'`: they are what stops `$`, backticks and `\` in the
   argument from being expanded.
 
-**`cancel`** — stop a handoff that is still waiting for this turn to end:
+**`cancel`** — stop a handoff that is still waiting for this turn to end, or unpark this window when
+nothing is waiting (the cloud copy is left as it is):
 
 ```
-NOMOR="${CLAUDE_PLUGIN_ROOT}"; NOMOS="$HOME/.config/cc-status/hook-shim.sh"; [ -n "$NOMOR" ] && [ -x "$NOMOR/scripts/run.sh" ] && exec "$NOMOR/scripts/run.sh" "$NOMOR/dist/handoff.mjs" --later-cancel; [ -x "$NOMOS" ] && exec "$NOMOS" handoff --later-cancel; echo "Nomo could not find its installed files - reinstall the nomo plugin."; exit 1
+NOMOR="${CLAUDE_PLUGIN_ROOT}"; NOMOS="$HOME/.config/cc-status/hook-shim.sh"; [ -n "$NOMOR" ] && [ -x "$NOMOR/scripts/run.sh" ] && exec "$NOMOR/scripts/run.sh" "$NOMOR/dist/handoff.mjs" --later-cancel --session "${CLAUDE_SESSION_ID}"; [ -x "$NOMOS" ] && exec "$NOMOS" handoff --later-cancel --session "${CLAUDE_SESSION_ID}"; echo "Nomo could not find its installed files - reinstall the nomo plugin."; exit 1
 ```
 
 **`status`** — is a handoff waiting, and how did the last one end:
@@ -48,6 +49,6 @@ The session does NOT move mid-turn: the command only checks things locally, park
 starts a background helper that moves the session as soon as this turn ends (so the copy in the cloud
 starts from a finished turn and the two never run at once). After `Ready. Session … moves to the cloud
 as soon as this turn ends…`, tell the user in one line that it moves when this reply ends and that this
-window stays open but parked (new prompts are blocked; `/nomo-cc:back` here brings it home), then end
+window stays open but parked (new prompts are blocked; `/nomo-cc:back` here brings it home, `/nomo-cc:handoff cancel` unparks it), then end
 your turn without running anything else. If the output says the box needs pairing, relay the terminal
 command it printed and stop; nothing was started.

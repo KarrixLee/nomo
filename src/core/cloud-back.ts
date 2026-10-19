@@ -131,24 +131,38 @@ export function decideCode(snap: GitState | undefined, mac: GitState, box: BoxCo
 
 export type TranscriptAction = "corrupt" | "same" | "replace" | "fork";
 
-/** Lines a parked Mac window appends after the handoff without the conversation moving on: block notices
- *  (system/informational), turn bookkeeping, titles. Anything unparseable, untyped, or a user/assistant/
- *  attachment line is a real Mac turn. */
-export function onlyMeta(appended: string): boolean {
-  return appended.split("\n").filter((l) => l.trim()).every((l) => {
-    try {
-      const t = JSON.parse(l)?.type;
-      return typeof t === "string" && t !== "user" && t !== "assistant" && t !== "attachment";
-    } catch { return false; }
-  });
+/** Did the Mac's conversation move on in what it appended after the handoff? A parked window appends
+ *  meta (block notices = system/informational, turn bookkeeping, titles) and Nomo's own command turns
+ *  (`/nomo-cc:back` itself, `/nomo-cc:status`): none of that is the user's work. Any user/assistant/
+ *  attachment line in a turn NOT opened by a `/nomo-cc:` command, or an unparseable/untyped line, is.
+ *  ponytail: a command turn is recognised by its opening user line's text (`/nomo-cc:…`, or Claude Code's
+ *  `<command-name>/nomo-cc:…` wrapper); a shape Claude Code changes makes it count as a real turn (fork,
+ *  never a silent replace). */
+export function macDiverged(appended: string): boolean {
+  let nomoTurn = false;
+  for (const l of appended.split("\n")) {
+    if (!l.trim()) continue;
+    let row: any;
+    try { row = JSON.parse(l); } catch { return true; }
+    const t = row?.type;
+    if (typeof t !== "string") return true;
+    if (t !== "user" && t !== "assistant" && t !== "attachment") continue;
+    const c = row.message?.content;
+    const opens = t === "user" && !row.isMeta && !(Array.isArray(c) && c.some((b: any) => b?.type === "tool_result"));
+    if (opens) {
+      const text = typeof c === "string" ? c : Array.isArray(c) ? c.map((b: any) => (b?.type === "text" ? b.text : "")).join("") : "";
+      nomoTurn = text.trimStart().startsWith("/nomo-cc:") || text.includes("<command-name>/nomo-cc:");
+    }
+    if (!nomoTurn) return true;
+  }
+  return false;
 }
 
 /** corrupt: the box copy does not extend what was handed off (keep it in the backup only). same: the
- *  box added nothing. replace: the Mac copy is the handed-off one (or missing, or only meta was appended;
- *  or `sameWindow`: the back runs in the parked window itself, whose own turns are its back command) →
- *  install the box copy. fork: the Mac appended a real turn after the handoff → install the box copy
- *  under a NEW id, Mac copy untouched. */
-export function transcriptAction(snap: { tBytes: number; tSha: string } | undefined, mac: Buffer | undefined, box: Buffer, sameWindow = false): TranscriptAction {
+ *  box added nothing. replace: the Mac copy is the handed-off one (or missing), plus nothing macDiverged
+ *  counts → install the box copy. fork: the Mac appended a real turn after the handoff → install the box
+ *  copy under a NEW id, Mac copy untouched. */
+export function transcriptAction(snap: { tBytes: number; tSha: string } | undefined, mac: Buffer | undefined, box: Buffer): TranscriptAction {
   if (snap) {
     // A rerun after a partial --back already installed this exact copy: nothing to do, never a fork.
     if (mac?.equals(box)) return "same";
@@ -156,8 +170,7 @@ export function transcriptAction(snap: { tBytes: number; tSha: string } | undefi
     if (box.length === snap.tBytes) return "same";
     if (!mac) return "replace";
     const macHanded = mac.length >= snap.tBytes && sha256(mac.subarray(0, snap.tBytes)) === snap.tSha;
-    if (macHanded && (sameWindow || onlyMeta(mac.subarray(snap.tBytes).toString("utf8")))) return "replace";
-    return "fork";
+    return macHanded && !macDiverged(mac.subarray(snap.tBytes).toString("utf8")) ? "replace" : "fork";
   }
   if (!mac) return "replace";
   if (box.equals(mac)) return "same";

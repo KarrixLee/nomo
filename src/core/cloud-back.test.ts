@@ -124,10 +124,23 @@ describe("transcriptAction", () => {
     expect(transcriptAction(snap, Buffer.concat([handed, Buffer.from('{"type":"system","subtype":"informational"}\n{"type":"user"}\n')]), boxed)).toBe("fork");
     expect(transcriptAction(snap, Buffer.concat([handed, Buffer.from("{torn")]), boxed)).toBe("fork");
   });
-  test("same window: its own back turn does not count, but a rewritten prefix still forks", () => {
-    const mine = Buffer.concat([handed, Buffer.from('{"type":"user"}\n{"type":"assistant"}\n')]);
-    expect(transcriptAction(snap, mine, boxed, true)).toBe("replace");
-    expect(transcriptAction(snap, Buffer.from('{"z":9}\n{"type":"user"}\n'), boxed, true)).toBe("fork");
+  test("Nomo's own command turns (the back turn itself) do not count → replace", () => {
+    const backTurn = [
+      { type: "user", message: { role: "user", content: "<command-message>nomo-cc:back</command-message>\n<command-name>/nomo-cc:back</command-name>" } },
+      { type: "user", isMeta: true, message: { role: "user", content: [{ type: "text", text: "Bring the session running on the Nomo cloud box back…" }] } },
+      { type: "assistant", message: { role: "assistant", content: [{ type: "tool_use", id: "t1", name: "Bash", input: {} }] } },
+      { type: "user", message: { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: "Back." }] } },
+      { type: "system", subtype: "informational", content: "blocked" },
+    ].map((r) => JSON.stringify(r)).join("\n") + "\n";
+    expect(transcriptAction(snap, Buffer.concat([handed, Buffer.from(backTurn)]), boxed)).toBe("replace");
+    expect(transcriptAction(snap, Buffer.concat([handed, Buffer.from('{"type":"user","message":{"content":"/nomo-cc:status"}}\n{"type":"assistant"}\n')]), boxed)).toBe("replace");
+  });
+  test("a Mac turn after parking (a user skill, a path prompt) forks, even next to a back turn", () => {
+    const skill = '{"type":"user","message":{"content":"<command-name>/my-skill</command-name>"}}\n{"type":"assistant"}\n';
+    const back = '{"type":"user","message":{"content":"<command-name>/nomo-cc:back</command-name>"}}\n{"type":"assistant"}\n';
+    expect(transcriptAction(snap, Buffer.concat([handed, Buffer.from(skill + back)]), boxed)).toBe("fork");
+    expect(transcriptAction(snap, Buffer.concat([handed, Buffer.from('{"type":"user","message":{"content":"/Users/x/a.ts is broken"}}\n')]), boxed)).toBe("fork");
+    expect(transcriptAction(snap, Buffer.concat([handed, Buffer.from('{"type":"assistant"}\n')]), boxed)).toBe("fork"); // no opening command
   });
 });
 

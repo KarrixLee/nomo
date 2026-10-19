@@ -384,7 +384,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "2.3.22";
+var PLUGIN_VERSION = "2.3.23";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -3220,13 +3220,15 @@ function clearPark(id, dir = PARK_DIR) {
 var reasonFor = (p, id) => {
   switch (p.state) {
     case "moving":
-      return "Moving to the cloud after this turn… (/nomo-cc:handoff cancel to stop)";
+      return "Moving to the cloud after this turn…";
     case "cloud":
-      return "This session is in the cloud — /nomo-cc:back to bring it home";
+      return "This session is in the cloud — /nomo-cc:back to bring it home, or /nomo-cc:handoff cancel to unpark here";
     case "landing":
-      return `Coming back from the cloud… type /resume ${p.resume ?? id} once it says Back.`;
+      return "Bringing back was interrupted — run /nomo-cc:back again";
     case "back":
       return `Back. Type /resume ${p.resume ?? id} to continue here.`;
+    case "elsewhere":
+      return "This session was brought back in another window — close this one (/exit)";
   }
 };
 function land(id, p, dir) {
@@ -3242,6 +3244,8 @@ function land(id, p, dir) {
   return back;
 }
 var MOVING_STALE_MS = 35 * 60000;
+var NOMO_COMMAND = "/nomo-cc:";
+var underPid = (pid) => typeof pid === "number" && pidAncestors(process.pid).includes(pid);
 function parkHook(input, dir = PARK_DIR) {
   try {
     const { session_id: id, hook_event_name: event } = input;
@@ -3254,8 +3258,20 @@ function parkHook(input, dir = PARK_DIR) {
     }
     if (!p)
       return;
+    if (p.state === "elsewhere") {
+      if (!(typeof p.pid === "number" && pidAlive(p.pid))) {
+        clearPark(id, dir);
+        return;
+      }
+      if (!underPid(p.pid))
+        return;
+      if (event === "SessionEnd") {
+        clearPark(id, dir);
+        return;
+      }
+    }
     if (event === "UserPromptSubmit") {
-      if (typeof input.prompt === "string" && input.prompt.trimStart().startsWith("/"))
+      if (typeof input.prompt === "string" && input.prompt.trimStart().startsWith(NOMO_COMMAND))
         return;
       if (p.state === "back")
         clearPark(id, dir);
@@ -3264,7 +3280,7 @@ function parkHook(input, dir = PARK_DIR) {
     const turnEnd = event === "Stop" || event === "StopFailure" || event === "SessionEnd";
     if (p.state === "moving" && turnEnd && !p.turnEndedAt)
       writePark(id, { ...p, turnEndedAt: Date.now() }, dir);
-    if (p.state === "landing" && (turnEnd || event === "SessionStart"))
+    if (p.state === "landing" && turnEnd)
       p = land(id, p, dir);
     if (p?.state === "back" && event === "SessionStart" && input.source === "resume")
       clearPark(id, dir);
@@ -3382,8 +3398,13 @@ function claimPending(d, p) {
 }
 function cancelPending(d) {
   const p = livePending(d);
-  if (!p)
+  if (!p) {
+    if (d.parkDir && d.session && readPark(d.session, d.parkDir)) {
+      clearPark(d.session, d.parkDir);
+      return "Unparked; the box copy is untouched. This window is yours again (a later /nomo-cc:back keeps both copies).";
+    }
     return "No handoff is waiting. Nothing to cancel.";
+  }
   if (p.state === "handing-off")
     return `Too late to cancel: session ${p.session} is already moving to the cloud. Bring it back with /nomo-cc:back.`;
   d.kill(p.helperPid);
@@ -3463,7 +3484,7 @@ async function waitThenHandoff(p, d) {
   if (code === 0) {
     if (d.parkDir)
       try {
-        writePark(p.session, { state: "cloud" }, d.parkDir);
+        writePark(p.session, { state: "cloud", pid: p.claudePid }, d.parkDir);
       } catch {}
     d.log(`DONE: session ${p.session} is running in the cloud.`);
     d.notify("Your session is now running in the cloud.");
@@ -3582,18 +3603,35 @@ function decideCode(snap, mac, box) {
   const same = snap.branch === mac.branch && snap.head === mac.head && snap.wipFp === mac.wipFp;
   return same ? "apply" : "branch";
 }
-function onlyMeta(appended) {
-  return appended.split(`
-`).filter((l) => l.trim()).every((l) => {
+function macDiverged(appended) {
+  let nomoTurn = false;
+  for (const l of appended.split(`
+`)) {
+    if (!l.trim())
+      continue;
+    let row;
     try {
-      const t = JSON.parse(l)?.type;
-      return typeof t === "string" && t !== "user" && t !== "assistant" && t !== "attachment";
+      row = JSON.parse(l);
     } catch {
-      return false;
+      return true;
     }
-  });
+    const t = row?.type;
+    if (typeof t !== "string")
+      return true;
+    if (t !== "user" && t !== "assistant" && t !== "attachment")
+      continue;
+    const c = row.message?.content;
+    const opens = t === "user" && !row.isMeta && !(Array.isArray(c) && c.some((b) => b?.type === "tool_result"));
+    if (opens) {
+      const text = typeof c === "string" ? c : Array.isArray(c) ? c.map((b) => b?.type === "text" ? b.text : "").join("") : "";
+      nomoTurn = text.trimStart().startsWith("/nomo-cc:") || text.includes("<command-name>/nomo-cc:");
+    }
+    if (!nomoTurn)
+      return true;
+  }
+  return false;
 }
-function transcriptAction(snap, mac, box, sameWindow = false) {
+function transcriptAction(snap, mac, box) {
   if (snap) {
     if (mac?.equals(box))
       return "same";
@@ -3604,9 +3642,7 @@ function transcriptAction(snap, mac, box, sameWindow = false) {
     if (!mac)
       return "replace";
     const macHanded = mac.length >= snap.tBytes && sha256(mac.subarray(0, snap.tBytes)) === snap.tSha;
-    if (macHanded && (sameWindow || onlyMeta(mac.subarray(snap.tBytes).toString("utf8"))))
-      return "replace";
-    return "fork";
+    return macHanded && !macDiverged(mac.subarray(snap.tBytes).toString("utf8")) ? "replace" : "fork";
   }
   if (!mac)
     return "replace";
@@ -5118,13 +5154,29 @@ var sameWindowBackLine = (id) => `Back. Type /resume ${id} to continue here.`;
 async function back(omg, args) {
   const cloud = loadCloud();
   const flag = args.get("--session");
-  const uuid = typeof flag === "string" ? flag : cloud.current;
+  const here = args.get("--from-session") || process.env.CLAUDE_CODE_SESSION_ID;
+  const hereLanding = typeof here === "string" && readPark(here)?.state === "landing" ? here : undefined;
+  const uuid = typeof flag === "string" ? flag : cloud.current ?? hereLanding;
   if (!uuid)
     throw new Error("no handed-off session on record; pass --session <uuid>");
   if (!UUID_RE3.test(uuid))
     throw new Error(`session id must be a UUID, got ${JSON.stringify(uuid)}`);
-  const here = args.get("--from-session") || process.env.CLAUDE_CODE_SESSION_ID;
+  const parkedAtStart = readPark(uuid);
   const sameWindow = here === uuid;
+  if (sameWindow && parkedAtStart?.state === "landing") {
+    if (!parkedAtStart.staged || !existsSync4(parkedAtStart.staged)) {
+      clearPark(uuid);
+      throw new Error(`the staged box copy is gone; unparked this window. The pulled copy is under ${join5(CC_DIR, "cloud-back")}.`);
+    }
+    writePark(uuid, { ...parkedAtStart, since: Date.now() });
+    console.log(`The box's copy is staged; it goes in as this turn ends.
+
+${sameWindowBackLine(parkedAtStart.resume ?? uuid)}`);
+    return;
+  }
+  if (sameWindow && parkedAtStart?.state !== "cloud") {
+    throw new Error(`this Claude Code session is ${uuid} itself and is not parked. Run /nomo-cc:back from another session; it resumes in a new Terminal window.`);
+  }
   const force = args.has("--force");
   const waitArg = args.get("--wait");
   const waitMin = typeof waitArg === "string" ? Number(waitArg) : 15;
@@ -5143,7 +5195,7 @@ async function back(omg, args) {
     }
   }
   const rec = await readRecord(uuid);
-  if (!sameWindow && rec && typeof rec.pid === "number" && pidAlive(rec.pid)) {
+  if (parkedAtStart?.state !== "cloud" && rec && typeof rec.pid === "number" && pidAlive(rec.pid)) {
     throw new Error(`session ${uuid} is running on this Mac (pid ${rec.pid}). Quit it there first, then rerun --back.`);
   }
   const enc = projectDirName(cwd);
@@ -5255,7 +5307,7 @@ Interrupted (${sig}) while ${phase}.
     const macPath = join5(projDir, `${uuid}.jsonl`);
     const macT = existsSync4(macPath) ? readFileSync5(macPath) : undefined;
     const sub = pt.files.filter((r) => r.startsWith(`${uuid}/`));
-    const act = transcriptAction(snap, macT, boxT, sameWindow);
+    const act = transcriptAction(snap, macT, boxT);
     if (act === "corrupt")
       problems.push(`the box transcript does not continue the one handed off; NOT installed (it is in ${backup}/project.tgz)`);
     if (act === "replace") {
@@ -5365,12 +5417,17 @@ The conversation itself is back: cd ${q(cwd)} && claude --resume ${resumeId}`);
   const { [uuid]: _done, ...sessions } = c.sessions ?? {};
   saveCloud({ ...c, sessions, current: c.current === uuid ? undefined : c.current });
   const parked = readPark(uuid);
-  if (!sameWindow || parked?.state !== "landing") {
-    if (sameWindow && resumeId !== uuid)
-      writePark(uuid, { state: "back", resume: resumeId });
-    else
-      clearPark(uuid);
-  }
+  if (sameWindow) {
+    if (parked?.state !== "landing") {
+      if (resumeId !== uuid)
+        writePark(uuid, { state: "back", resume: resumeId });
+      else
+        clearPark(uuid);
+    }
+  } else if (parkedAtStart?.state === "cloud" && typeof parkedAtStart.pid === "number" && pidAlive(parkedAtStart.pid)) {
+    writePark(uuid, { state: "elsewhere", pid: parkedAtStart.pid });
+  } else
+    clearPark(uuid);
   if (sameWindow) {
     console.log(`
 ${sameWindowBackLine(resumeId)}`);
@@ -5466,7 +5523,7 @@ After that, /nomo-cc:handoff works from inside Claude Code.`);
     console.log(`A handoff is already waiting (session ${cur?.session ?? "?"}). See /nomo-cc:handoff status, or /nomo-cc:handoff cancel.`);
     return;
   }
-  writePark(session, { state: "moving" });
+  writePark(session, { state: "moving", pid: claudePid });
   const fd = openSync2(LATER_LOG, "w", 384);
   const child = spawn2(process.execPath, [SELF, "--after-exit", "--session", session, "--claude-pid", String(claudePid), "--worker", worker], { cwd, detached: true, stdio: ["ignore", fd, fd] });
   child.unref();
@@ -5550,7 +5607,20 @@ async function main() {
   const keys = readKeys();
   const worker = targetWorker(args.get("--worker"), process.env.NOMO_WORKER_URL);
   if (args.has("--later-cancel")) {
-    console.log(cancelPending({ ...PENDING, kill: (p) => process.kill(p, "SIGTERM"), log: LATER_LOG, parkDir: PARK_DIR }));
+    const session = args.get("--session");
+    console.log(cancelPending({
+      ...PENDING,
+      kill: (p) => {
+        try {
+          process.kill(-p, "SIGTERM");
+        } catch {
+          process.kill(p, "SIGTERM");
+        }
+      },
+      log: LATER_LOG,
+      parkDir: PARK_DIR,
+      session: typeof session === "string" && UUID_RE3.test(session) ? session : undefined
+    }));
     return;
   }
   if (args.has("--later-status")) {

@@ -20,17 +20,20 @@ describe("park gate", () => {
   test("moving and cloud block plain prompts with their reason", () => {
     const dir = tmp();
     writePark(A, { state: "moving" }, dir);
-    expect(reason(parkHook(prompt("hello"), dir))).toEqual({ decision: "block", reason: "Moving to the cloud after this turn… (/nomo-cc:handoff cancel to stop)" });
+    expect(reason(parkHook(prompt("hello"), dir))).toEqual({ decision: "block", reason: "Moving to the cloud after this turn…" });
     writePark(A, { state: "cloud" }, dir);
-    expect(reason(parkHook(prompt("hello"), dir))).toEqual({ decision: "block", reason: "This session is in the cloud — /nomo-cc:back to bring it home" });
+    expect(reason(parkHook(prompt("hello"), dir))?.reason).toContain("/nomo-cc:handoff cancel to unpark here");
     expect(statSync(join(dir, A)).mode & 0o777).toBe(0o600);
   });
 
-  test("slash commands pass through", () => {
+  test("only Nomo's own commands pass; other slash commands, skills and path prompts are blocked", () => {
     const dir = tmp();
     writePark(A, { state: "cloud" }, dir);
     expect(parkHook(prompt("/nomo-cc:back"), dir)).toBeUndefined();
     expect(parkHook(prompt("  /nomo-cc:handoff cancel"), dir)).toBeUndefined();
+    expect(reason(parkHook(prompt("/my-skill do things"), dir))?.decision).toBe("block");
+    expect(reason(parkHook(prompt("/Users/x/a.ts is broken"), dir))?.decision).toBe("block");
+    expect(reason(parkHook(prompt("/nomo-ccx"), dir))?.decision).toBe("block");
   });
 
   test("fails open: a torn marker, a bad id, a missing prompt", () => {
@@ -67,8 +70,9 @@ describe("park gate", () => {
     writeFileSync(target, "mac\n");
     writeFileSync(staged, "box\n");
     writePark(A, { state: "landing", staged, target, resume: A }, dir);
-    expect(reason(parkHook(prompt("hi"), dir))?.reason).toContain(`/resume ${A}`);
-    expect(readFileSync(target, "utf8")).toBe("mac\n"); // never mid-turn
+    parkHook({ session_id: A, hook_event_name: "PostToolUse" }, dir);
+    parkHook({ session_id: A, hook_event_name: "SessionStart", source: "resume" }, dir);
+    expect(readFileSync(target, "utf8")).toBe("mac\n"); // never mid-turn, never under a (re)starting session
     parkHook({ session_id: A, hook_event_name: "Stop" }, dir);
     expect(readFileSync(target, "utf8")).toBe("box\n");
     expect(existsSync(staged)).toBe(false);
@@ -101,7 +105,35 @@ describe("park gate in the real hook entry", () => {
     writeFileSync(join(home, ".config", "cc-status", "parked", A), JSON.stringify({ state: "cloud", since: Date.now() }));
     const r = run(home, prompt("hello"));
     expect(r.status).toBe(0);
-    expect(JSON.parse(r.stdout.trim())).toEqual({ decision: "block", reason: "This session is in the cloud — /nomo-cc:back to bring it home" });
+    expect(JSON.parse(r.stdout.trim())).toEqual({ decision: "block", reason: "This session is in the cloud — /nomo-cc:back to bring it home, or /nomo-cc:handoff cancel to unpark here" });
     expect(run(home, prompt("/nomo-cc:back")).stdout).toBe("");
+  });
+});
+
+describe("interrupted back and the other window", () => {
+  test("landing at a prompt (the back turn was interrupted): blocked, nothing installed", () => {
+    const dir = tmp(), target = join(dir, "t.jsonl"), staged = `${target}.nomo-back`;
+    writeFileSync(target, "mac\n");
+    writeFileSync(staged, "box\n");
+    writePark(A, { state: "landing", staged, target, resume: A }, dir);
+    expect(reason(parkHook(prompt("hi"), dir))?.reason).toBe("Bringing back was interrupted — run /nomo-cc:back again");
+    expect(parkHook(prompt("/nomo-cc:back"), dir)).toBeUndefined();
+    expect(readFileSync(target, "utf8")).toBe("mac\n");
+    expect(readPark(A, dir)?.state).toBe("landing");
+  });
+
+  test("elsewhere blocks only the window it names, and unparks once that window is gone", () => {
+    const dir = tmp();
+    writePark(A, { state: "elsewhere", pid: process.ppid }, dir); // this test runs under that pid
+    expect(reason(parkHook(prompt("hi"), dir))?.reason).toBe("This session was brought back in another window — close this one (/exit)");
+    writePark(A, { state: "elsewhere", pid: process.pid }, dir); // alive, but not an ancestor: the new window
+    expect(parkHook(prompt("hi"), dir)).toBeUndefined();
+    expect(readPark(A, dir)?.state).toBe("elsewhere");
+    writePark(A, { state: "elsewhere", pid: 2 ** 22 + 12345 }, dir); // dead
+    expect(parkHook(prompt("hi"), dir)).toBeUndefined();
+    expect(readPark(A, dir)).toBeUndefined();
+    writePark(A, { state: "elsewhere", pid: process.ppid }, dir);
+    parkHook({ session_id: A, hook_event_name: "SessionEnd" }, dir);
+    expect(readPark(A, dir)).toBeUndefined();
   });
 });

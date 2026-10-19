@@ -279,7 +279,7 @@ describe("park marker lifecycle (NOM-90)", () => {
     expect(d.runs).toBe(1);
     expect(d.t).toBeLessThan(60_000);
     expect(d.lines).toContain(`The turn ended. Handing off session ${A}…`);
-    expect(readPark(A, parkDir)?.state).toBe("cloud");
+    expect(readPark(A, parkDir)).toMatchObject({ state: "cloud", pid: 400 });
   });
 
   test("a failed move removes the marker", async () => {
@@ -297,6 +297,14 @@ describe("park marker lifecycle (NOM-90)", () => {
     expect(await waitThenHandoff(pending(), d)).toBe(1);
     expect(d.runs).toBe(0);
     expect(readPark(A, parkDir)).toBeUndefined();
+  });
+
+  test("cancel with nothing waiting unparks this window (box gone, back failing)", () => {
+    const dir = tmp(), path = join(dir, "p.json"), parkDir = join(dir, "parked");
+    writePark(A, { state: "cloud" }, parkDir);
+    expect(cancelPending({ path, isHelper: () => false, kill: () => {}, parkDir, session: A })).toBe("Unparked; the box copy is untouched. This window is yours again (a later /nomo-cc:back keeps both copies).");
+    expect(readPark(A, parkDir)).toBeUndefined();
+    expect(cancelPending({ path, isHelper: () => false, kill: () => {}, parkDir, session: A })).toContain("Nothing to cancel");
   });
 
   test("cancel removes the marker", () => {

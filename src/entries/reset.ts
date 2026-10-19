@@ -15,8 +15,9 @@
 // PORTABILITY: bun AND node >= 18 (bundled by build.ts) — no Bun.* APIs.
 
 import { execFileSync } from "node:child_process";
-import { readdir, readFile, unlink } from "node:fs/promises";
+import { readdir, readFile, rm, unlink } from "node:fs/promises";
 import { basename } from "node:path";
+import { PARK_DIR } from "../core/park";
 import { Config, isWatchdogCommand, loadConfig, localApprovalsState, pidAlive, PLUGIN_VERSION, SessionRecord, SESSIONS_DIR, WATCHDOG_PID_PATH } from "../core/shared";
 
 export type ResetVerdict = "clear" | "keep";
@@ -48,6 +49,7 @@ export interface ResetDeps {
   /** `ps -o command= -p <pid>` — the safety check before killing the pidfile's pid. */
   commandOf?: (pid: number) => string | undefined;
   killPid?: (pid: number) => void;
+  parkDir?: string;
 }
 
 /** The `ps -o command= -p <pid>` line for a pid, or undefined when the pid is gone / ps fails. */
@@ -145,6 +147,14 @@ export async function reset(deps: ResetDeps = {}): Promise<number> {
     print("No stale sessions to clear.");
   }
   if (kept > 0) print(`Left ${kept} live session${kept === 1 ? "" : "s"} untouched.`);
+  // 3. Parked windows (NOM-90): a marker whose box is gone would block that window for good.
+  const parkDir = deps.parkDir; // the entry passes PARK_DIR; omitted (tests) = leave parked/ alone
+  let parked = 0;
+  if (parkDir) try { parked = (await readdir(parkDir)).length; } catch { /* none */ }
+  if (parked > 0) {
+    await rm(parkDir!, { recursive: true, force: true }).catch(() => {});
+    print(`Unparked ${parked} window${parked === 1 ? "" : "s"} (cloud copies are untouched).`);
+  }
   print("Pairing and keys were not touched — use the unpair command if you want that.");
   return 0;
 }
@@ -156,5 +166,5 @@ if (import.meta.main) {
     console.log("usage: reset  — stop the watchdog and clear dead/phantom session rows (keeps the pairing; watchdog restarts on the next session)");
     process.exit(0);
   }
-  process.exit(await reset());
+  process.exit(await reset({ parkDir: PARK_DIR }));
 }

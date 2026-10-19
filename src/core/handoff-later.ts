@@ -151,9 +151,17 @@ export function claimPending(d: PendingDeps, p: Pending): boolean {
   }
 }
 
-export function cancelPending(d: PendingDeps & { kill: (pid: number) => void; log?: string; parkDir?: string }): string {
+/** `/nomo-cc:handoff cancel`: stop a waiting helper; with nothing waiting, unpark `session` (this window)
+ *  if it is parked: the escape hatch for a box that is gone or a --back that keeps failing. */
+export function cancelPending(d: PendingDeps & { kill: (pid: number) => void; log?: string; parkDir?: string; session?: string }): string {
   const p = livePending(d);
-  if (!p) return "No handoff is waiting. Nothing to cancel.";
+  if (!p) {
+    if (d.parkDir && d.session && readPark(d.session, d.parkDir)) {
+      clearPark(d.session, d.parkDir);
+      return "Unparked; the box copy is untouched. This window is yours again (a later /nomo-cc:back keeps both copies).";
+    }
+    return "No handoff is waiting. Nothing to cancel.";
+  }
   if (p.state === "handing-off") return `Too late to cancel: session ${p.session} is already moving to the cloud. Bring it back with /nomo-cc:back.`;
   d.kill(p.helperPid);
   try { unlinkSync(d.path); } catch { /* gone */ }
@@ -231,7 +239,7 @@ export async function waitThenHandoff(p: Pending, d: WaitDeps): Promise<number> 
   if (code === 0 && !handoffLanded(before, d.readCloud(), p.session)) { why = NOTHING_RAN_MSG; code = 1; }
   release();
   if (code === 0) {
-    if (d.parkDir) try { writePark(p.session, { state: "cloud" }, d.parkDir); } catch { /* the gate fails open */ }
+    if (d.parkDir) try { writePark(p.session, { state: "cloud", pid: p.claudePid }, d.parkDir); } catch { /* the gate fails open */ }
     d.log(`DONE: session ${p.session} is running in the cloud.`);
     d.notify("Your session is now running in the cloud.");
   } else {

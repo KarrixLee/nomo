@@ -3,8 +3,12 @@ var __require = /* @__PURE__ */ createRequire(import.meta.url);
 
 // src/entries/reset.ts
 import { execFileSync as execFileSync2 } from "node:child_process";
-import { readdir, readFile as readFile2, unlink as unlink2 } from "node:fs/promises";
+import { readdir, readFile as readFile2, rm, unlink as unlink2 } from "node:fs/promises";
 import { basename as basename2 } from "node:path";
+
+// src/core/park.ts
+import { mkdirSync, readFileSync as readFileSync2, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { join as join2 } from "node:path";
 
 // src/core/shared.ts
 import { access, chmod, open, readFile, rename, stat, mkdir, unlink, writeFile } from "node:fs/promises";
@@ -99,7 +103,7 @@ async function sha256Hex(s) {
 }
 
 // src/core/shared.ts
-var PLUGIN_VERSION = "2.3.22";
+var PLUGIN_VERSION = "2.3.23";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -1068,6 +1072,108 @@ function codexCompanionBrokerEvidence(pid, ancestorsOf = pidAncestors, commandOf
   return null;
 }
 
+// src/core/park.ts
+var PARK_DIR = `${CC_DIR}/parked`;
+var UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+var file = (dir, id) => UUID_RE.test(id) ? join2(dir, id) : undefined;
+function readPark(id, dir = PARK_DIR) {
+  const f = file(dir, id);
+  if (!f)
+    return;
+  try {
+    return JSON.parse(readFileSync2(f, "utf8"));
+  } catch {
+    return;
+  }
+}
+function writePark(id, p, dir = PARK_DIR) {
+  const f = file(dir, id);
+  if (!f)
+    return;
+  mkdirSync(dir, { recursive: true, mode: 448 });
+  const tmp = `${f}.${process.pid}.tmp`;
+  writeFileSync(tmp, JSON.stringify({ since: Date.now(), ...p }) + `
+`, { mode: 384 });
+  renameSync(tmp, f);
+}
+function clearPark(id, dir = PARK_DIR) {
+  const f = file(dir, id);
+  if (f)
+    try {
+      unlinkSync(f);
+    } catch {}
+}
+var reasonFor = (p, id) => {
+  switch (p.state) {
+    case "moving":
+      return "Moving to the cloud after this turn…";
+    case "cloud":
+      return "This session is in the cloud — /nomo-cc:back to bring it home, or /nomo-cc:handoff cancel to unpark here";
+    case "landing":
+      return "Bringing back was interrupted — run /nomo-cc:back again";
+    case "back":
+      return `Back. Type /resume ${p.resume ?? id} to continue here.`;
+    case "elsewhere":
+      return "This session was brought back in another window — close this one (/exit)";
+  }
+};
+function land(id, p, dir) {
+  try {
+    if (p.staged && p.target)
+      renameSync(p.staged, p.target);
+  } catch {
+    clearPark(id, dir);
+    return;
+  }
+  const back = { state: "back", since: Date.now(), resume: p.resume };
+  writePark(id, back, dir);
+  return back;
+}
+var MOVING_STALE_MS = 35 * 60000;
+var NOMO_COMMAND = "/nomo-cc:";
+var underPid = (pid) => typeof pid === "number" && pidAncestors(process.pid).includes(pid);
+function parkHook(input, dir = PARK_DIR) {
+  try {
+    const { session_id: id, hook_event_name: event } = input;
+    if (typeof id !== "string")
+      return;
+    let p = readPark(id, dir);
+    if (p?.state === "moving" && Date.now() - p.since > MOVING_STALE_MS) {
+      clearPark(id, dir);
+      return;
+    }
+    if (!p)
+      return;
+    if (p.state === "elsewhere") {
+      if (!(typeof p.pid === "number" && pidAlive(p.pid))) {
+        clearPark(id, dir);
+        return;
+      }
+      if (!underPid(p.pid))
+        return;
+      if (event === "SessionEnd") {
+        clearPark(id, dir);
+        return;
+      }
+    }
+    if (event === "UserPromptSubmit") {
+      if (typeof input.prompt === "string" && input.prompt.trimStart().startsWith(NOMO_COMMAND))
+        return;
+      if (p.state === "back")
+        clearPark(id, dir);
+      return JSON.stringify({ decision: "block", reason: reasonFor(p, id) });
+    }
+    const turnEnd = event === "Stop" || event === "StopFailure" || event === "SessionEnd";
+    if (p.state === "moving" && turnEnd && !p.turnEndedAt)
+      writePark(id, { ...p, turnEndedAt: Date.now() }, dir);
+    if (p.state === "landing" && turnEnd)
+      p = land(id, p, dir);
+    if (p?.state === "back" && event === "SessionStart" && input.source === "resume")
+      clearPark(id, dir);
+  } catch {}
+  return;
+}
+
 // src/entries/reset.ts
 function classifyResetSession(record, isAlive) {
   if (!record || typeof record.pid !== "number" || !Number.isFinite(record.pid))
@@ -1168,6 +1274,16 @@ async function reset(deps = {}) {
   }
   if (kept > 0)
     print(`Left ${kept} live session${kept === 1 ? "" : "s"} untouched.`);
+  const parkDir = deps.parkDir;
+  let parked = 0;
+  if (parkDir)
+    try {
+      parked = (await readdir(parkDir)).length;
+    } catch {}
+  if (parked > 0) {
+    await rm(parkDir, { recursive: true, force: true }).catch(() => {});
+    print(`Unparked ${parked} window${parked === 1 ? "" : "s"} (cloud copies are untouched).`);
+  }
   print("Pairing and keys were not touched — use the unpair command if you want that.");
   return 0;
 }
@@ -1176,7 +1292,7 @@ if (__require.main == __require.module) {
     console.log("usage: reset  — stop the watchdog and clear dead/phantom session rows (keeps the pairing; watchdog restarts on the next session)");
     process.exit(0);
   }
-  process.exit(await reset());
+  process.exit(await reset({ parkDir: PARK_DIR }));
 }
 export {
   classifyResetSession,

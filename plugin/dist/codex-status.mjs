@@ -105,7 +105,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "2.3.22";
+var PLUGIN_VERSION = "2.3.23";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -3084,13 +3084,15 @@ function clearPark(id, dir = PARK_DIR) {
 var reasonFor = (p, id) => {
   switch (p.state) {
     case "moving":
-      return "Moving to the cloud after this turn… (/nomo-cc:handoff cancel to stop)";
+      return "Moving to the cloud after this turn…";
     case "cloud":
-      return "This session is in the cloud — /nomo-cc:back to bring it home";
+      return "This session is in the cloud — /nomo-cc:back to bring it home, or /nomo-cc:handoff cancel to unpark here";
     case "landing":
-      return `Coming back from the cloud… type /resume ${p.resume ?? id} once it says Back.`;
+      return "Bringing back was interrupted — run /nomo-cc:back again";
     case "back":
       return `Back. Type /resume ${p.resume ?? id} to continue here.`;
+    case "elsewhere":
+      return "This session was brought back in another window — close this one (/exit)";
   }
 };
 function land(id, p, dir) {
@@ -3106,6 +3108,8 @@ function land(id, p, dir) {
   return back;
 }
 var MOVING_STALE_MS = 35 * 60000;
+var NOMO_COMMAND = "/nomo-cc:";
+var underPid = (pid) => typeof pid === "number" && pidAncestors(process.pid).includes(pid);
 function parkHook(input, dir = PARK_DIR) {
   try {
     const { session_id: id, hook_event_name: event } = input;
@@ -3118,8 +3122,20 @@ function parkHook(input, dir = PARK_DIR) {
     }
     if (!p)
       return;
+    if (p.state === "elsewhere") {
+      if (!(typeof p.pid === "number" && pidAlive(p.pid))) {
+        clearPark(id, dir);
+        return;
+      }
+      if (!underPid(p.pid))
+        return;
+      if (event === "SessionEnd") {
+        clearPark(id, dir);
+        return;
+      }
+    }
     if (event === "UserPromptSubmit") {
-      if (typeof input.prompt === "string" && input.prompt.trimStart().startsWith("/"))
+      if (typeof input.prompt === "string" && input.prompt.trimStart().startsWith(NOMO_COMMAND))
         return;
       if (p.state === "back")
         clearPark(id, dir);
@@ -3128,7 +3144,7 @@ function parkHook(input, dir = PARK_DIR) {
     const turnEnd = event === "Stop" || event === "StopFailure" || event === "SessionEnd";
     if (p.state === "moving" && turnEnd && !p.turnEndedAt)
       writePark(id, { ...p, turnEndedAt: Date.now() }, dir);
-    if (p.state === "landing" && (turnEnd || event === "SessionStart"))
+    if (p.state === "landing" && turnEnd)
       p = land(id, p, dir);
     if (p?.state === "back" && event === "SessionStart" && input.source === "resume")
       clearPark(id, dir);

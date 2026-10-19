@@ -1,29 +1,38 @@
 // park — NOM-90: a Claude Code window whose session was handed off to the cloud stays open but PARKED.
 //
 // A prompt typed in the stale window would fork the transcript (a sibling branch the box never sees,
-// later silently dropped), so while a marker exists the UserPromptSubmit hook blocks every plain prompt.
-// Slash commands pass (/nomo-cc:back, /nomo-cc:handoff cancel); built-ins (/exit, /resume) never reach
-// the hook. Everything here is local file I/O and FAILS OPEN: a broken marker must never brick a session.
+// later silently dropped), so while a marker exists the UserPromptSubmit hook blocks every prompt except
+// Nomo's own commands (`/nomo-cc:…`). Any other slash command or skill runs a real turn, so it is blocked
+// too; built-ins (/exit, /resume) never reach the hook. Everything here is local file I/O and FAILS OPEN:
+// a broken marker must never brick a session. Escape hatches: /nomo-cc:handoff cancel, /nomo-cc:reset.
+// ponytail: turns that start without a UserPromptSubmit (a background task's re-entry, a scheduled task)
+// are not gated; --back's divergence check catches what they write (cloud-back.ts macDiverged).
 //
 // Marker: <CC_DIR>/parked/<session_id>, 0600 JSON. States:
 //   moving  — /nomo-cc:handoff armed; the helper moves the session once this turn ends (turnEndedAt).
 //   cloud   — the move succeeded.
 //   landing — /nomo-cc:back from this very window pulled the box copy and staged it next to the
-//             transcript; the next turn end installs it (installing mid-turn would let the rest of the
-//             back turn append lines chained to the replaced conversation).
+//             transcript; the next Stop/StopFailure/SessionEnd installs it (installing mid-turn would let
+//             the rest of the back turn append lines chained to the replaced conversation; installing on
+//             a SessionStart would swap the file under a session that already loaded it). A prompt
+//             while landing means the back turn was interrupted: blocked, and a rerun of back finishes.
 //   back    — installed; the next plain prompt is blocked ONCE with the /resume reminder (a prompt before
 //             /resume would chain onto the stale in-memory conversation), and a /resume clears it.
+//   elsewhere — brought back from ANOTHER session while this window was still open (pid): only that
+//             window is blocked (by process ancestry; the new window resumes the same id), until it ends.
 
 import { mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { CC_DIR } from "./shared";
+import { CC_DIR, pidAlive, pidAncestors } from "./shared";
 
 export const PARK_DIR = `${CC_DIR}/parked`;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 export interface Park {
-  state: "moving" | "cloud" | "landing" | "back";
+  state: "moving" | "cloud" | "landing" | "back" | "elsewhere";
   since: number;
+  /** The parked window's `claude` pid (moving/cloud/elsewhere). */
+  pid?: number;
   /** moving: the Stop that ended the arming turn. */
   turnEndedAt?: number;
   /** landing: the staged box transcript and where it goes. */
@@ -57,10 +66,11 @@ export function clearPark(id: string, dir = PARK_DIR): void {
 
 export const reasonFor = (p: Park, id: string): string => {
   switch (p.state) {
-    case "moving": return "Moving to the cloud after this turn… (/nomo-cc:handoff cancel to stop)";
-    case "cloud": return "This session is in the cloud — /nomo-cc:back to bring it home";
-    case "landing": return `Coming back from the cloud… type /resume ${p.resume ?? id} once it says Back.`;
+    case "moving": return "Moving to the cloud after this turn…";
+    case "cloud": return "This session is in the cloud — /nomo-cc:back to bring it home, or /nomo-cc:handoff cancel to unpark here";
+    case "landing": return "Bringing back was interrupted — run /nomo-cc:back again";
     case "back": return `Back. Type /resume ${p.resume ?? id} to continue here.`;
+    case "elsewhere": return "This session was brought back in another window — close this one (/exit)";
   }
 };
 
@@ -76,6 +86,11 @@ function land(id: string, p: Park, dir: string): Park | undefined {
 /** A "moving" marker outlives its helper only if the helper was killed; it gives up by itself at 30 min. */
 export const MOVING_STALE_MS = 35 * 60_000;
 
+export const NOMO_COMMAND = "/nomo-cc:";
+
+/** Is this hook running under the window `pid`? (ps walk: only for the rare "elsewhere" marker.) */
+const underPid = (pid: number | undefined): boolean => typeof pid === "number" && pidAncestors(process.pid).includes(pid);
+
 /** Called first thing by the Claude hook. Returns the stdout line that blocks the prompt, or undefined.
  *  Also drives the turn-end transitions. Never throws. */
 export function parkHook(input: Record<string, unknown>, dir = PARK_DIR): string | undefined {
@@ -85,14 +100,19 @@ export function parkHook(input: Record<string, unknown>, dir = PARK_DIR): string
     let p = readPark(id, dir);
     if (p?.state === "moving" && Date.now() - p.since > MOVING_STALE_MS) { clearPark(id, dir); return undefined; }
     if (!p) return undefined;
+    if (p.state === "elsewhere") {
+      if (!(typeof p.pid === "number" && pidAlive(p.pid))) { clearPark(id, dir); return undefined; }
+      if (!underPid(p.pid)) return undefined; // the window it came back to
+      if (event === "SessionEnd") { clearPark(id, dir); return undefined; }
+    }
     if (event === "UserPromptSubmit") {
-      if (typeof input.prompt === "string" && input.prompt.trimStart().startsWith("/")) return undefined;
+      if (typeof input.prompt === "string" && input.prompt.trimStart().startsWith(NOMO_COMMAND)) return undefined;
       if (p.state === "back") clearPark(id, dir); // one reminder, then the window is the user's again
       return JSON.stringify({ decision: "block", reason: reasonFor(p, id) });
     }
     const turnEnd = event === "Stop" || event === "StopFailure" || event === "SessionEnd";
     if (p.state === "moving" && turnEnd && !p.turnEndedAt) writePark(id, { ...p, turnEndedAt: Date.now() }, dir);
-    if (p.state === "landing" && (turnEnd || event === "SessionStart")) p = land(id, p, dir);
+    if (p.state === "landing" && turnEnd) p = land(id, p, dir);
     if (p?.state === "back" && event === "SessionStart" && input.source === "resume") clearPark(id, dir);
   } catch { /* fail open */ }
   return undefined;
