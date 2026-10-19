@@ -10,6 +10,7 @@ import {
   pubRawFromPkcs8, q, RELAY_PORT, resultPage, takePairUrl, toOpenRouterModel, withReload,
 } from "./handoff";
 import { RELAY_PORT as RELAY_LISTEN_PORT } from "./or-relay";
+import { readCapped } from "./handoff";
 import { BACK_FILES, backPackScript, backStopScript, backWaitScript, currentGuard, resumeCommand } from "./handoff";
 import { boxIdle } from "../core/cloud-back";
 
@@ -268,5 +269,32 @@ describe("bring back (--back)", () => {
 
   test("the resume line is one quoted exec", () => {
     expect(resumeCommand("/tmp/it's here", U)).toBe(`cd '/tmp/it'\\''s here' && exec claude --resume ${U}`);
+  });
+});
+
+describe("readCapped (a /files download never exceeds its cap)", () => {
+  const stream = (chunks: number, size: number) => new ReadableStream<Uint8Array>({
+    start(c) { for (let i = 0; i < chunks; i++) c.enqueue(new Uint8Array(size).fill(97)); c.close(); },
+  });
+
+  test("a Content-Length over the cap is refused before the body is read", async () => {
+    let pulled = 0;
+    const body = new ReadableStream<Uint8Array>({ pull(c) { pulled++; c.enqueue(new Uint8Array(10)); } });
+    const res = new Response(body, { headers: { "content-length": "5000" } });
+    await expect(readCapped(res, 1000)).rejects.toThrow("refusing");
+    expect(pulled).toBeLessThanOrEqual(1); // at most the stream's initial pull
+  });
+
+  test("no Content-Length: counted while streaming, aborted past the cap", async () => {
+    const fakeFetch = async () => new Response(stream(100, 1000)); // 100 KB, no length header
+    const res = await fakeFetch();
+    expect(res.headers.get("content-length")).toBeNull();
+    await expect(readCapped(res, 10_000)).rejects.toThrow("refusing");
+  });
+
+  test("under the cap: the whole body, multi-byte text intact", async () => {
+    expect(await readCapped(new Response(stream(3, 1000)), 10_000)).toHaveLength(3000);
+    expect(await readCapped(new Response(JSON.stringify({ content: "héllo ✓" })), 1000)).toBe('{"content":"héllo ✓"}');
+    expect(await readCapped(new Response("x".repeat(50)))).toHaveLength(50); // no cap
   });
 });

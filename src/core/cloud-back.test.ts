@@ -4,7 +4,7 @@ import { chmodSync, existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
-  agentConfigPaths, applyInPlace, boxChangedPaths, decideCode, extractTgz, type GitState, landFolder, landOnBranch, listFiles, macGitState,
+  agentConfigPaths, applyInPlace, backCaps, MAX_ARTIFACT_BYTES, MAX_EXTRACTED_BYTES, MAX_TRANSCRIPT_BYTES, boxChangedPaths, decideCode, extractTgz, type GitState, landFolder, landOnBranch, listFiles, macGitState,
   mergeMemory, parseMarkers, patchPaths, printable, safeRel, sha256, transcriptAction, validateTree, wipFingerprint,
 } from "./cloud-back";
 
@@ -387,4 +387,25 @@ describe("landing code", () => {
     expect(readFileSync(join(cwd, "x"), "utf8")).toBe("mine");
     expect(landFolder(cwd, src, ["x"], "abcd1234")).toBe(`${cwd}.nomo-cloud-abcd1234-2`);
   });
+});
+
+test("backCaps: the transcript cap scales with what was sent, under a hard ceiling", () => {
+  expect(backCaps()).toEqual({ project: MAX_ARTIFACT_BYTES, artifact: MAX_ARTIFACT_BYTES, extracted: MAX_EXTRACTED_BYTES });
+  expect(backCaps(10e6).project).toBe(MAX_ARTIFACT_BYTES); // small sessions keep the default
+  const big = backCaps(69e6); // a 1M-token transcript
+  expect(big.project).toBe(276e6);
+  expect(big.artifact).toBe(MAX_ARTIFACT_BYTES); // code artifacts don't grow
+  expect(big.extracted).toBeGreaterThanOrEqual(big.project + MAX_EXTRACTED_BYTES - MAX_ARTIFACT_BYTES);
+  const huge = backCaps(5e9);
+  expect(huge.project).toBe(MAX_TRANSCRIPT_BYTES);
+  expect(huge.extracted).toBeGreaterThan(huge.project);
+});
+
+test("extractTgz honors the caps it is given", () => {
+  const d = mkdtempSync(join(tmpdir(), "nomo-caps-"));
+  writeFileSync(join(d, "t.jsonl"), "x".repeat(10_000));
+  execFileSync("/usr/bin/tar", ["-czf", join(d, "p.tgz"), "-C", d, "t.jsonl"]);
+  expect(() => extractTgz(join(d, "p.tgz"), d, 10)).toThrow("over");
+  expect(() => extractTgz(join(d, "p.tgz"), d, MAX_ARTIFACT_BYTES, 5_000)).toThrow("inflates past");
+  expect(readFileSync(join(extractTgz(join(d, "p.tgz"), d, MAX_ARTIFACT_BYTES, 20_000), "t.jsonl"), "utf8")).toHaveLength(10_000);
 });

@@ -84,7 +84,8 @@ nomo_atomic_copy() {
 # root baked into the command file has gone stale. A rev-2 shim silently exits 0 on that name, which
 # for an interactive command reads as "did nothing" — the one outcome this project treats as worse
 # than an error.
-NOMO_SHIM_REV=3
+# rev 4 (v2.3.15): `handoff` joins the whitelist for /nomo-cc:handoff and /nomo-cc:back.
+NOMO_SHIM_REV=4
 
 # Numeric semver compare: true when $1 sorts strictly AFTER $2. A DELIBERATE TWIN of the function in
 # hook-shim.sh — run.sh has to stay a standalone file that works when nothing else on disk does, so it

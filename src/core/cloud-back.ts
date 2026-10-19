@@ -21,6 +21,18 @@ import { dirname, isAbsolute, join, sep } from "node:path";
 /** Per-artifact compressed cap (== handoff's MAX_ARTIFACT_BYTES) and the extracted total across all tars. */
 export const MAX_ARTIFACT_BYTES = 100 * 1024 * 1024;
 export const MAX_EXTRACTED_BYTES = 1024 * 1024 * 1024;
+/** The transcript cap's hard ceiling, however big the session was: a hostile box still can't fill the Mac.
+ *  ponytail: 512 MB because --back pulls each artifact as ONE base64 JSON string held in memory (~5x RSS;
+ *  a 1.7 GB one overflows bun's max string). Raise it only with a streaming download to disk. */
+export const MAX_TRANSCRIPT_BYTES = 512 * 1024 * 1024;
+
+/** --back's caps for one session. project.tgz (transcript + memory) may grow to 4x the transcript handoff
+ *  sent (never under the default cap, never over the ceiling), so a big session that kept going on the box
+ *  can always come back; the extracted total grows with it. Code artifacts keep the default cap. */
+export function backCaps(sentTranscriptBytes = 0): { project: number; artifact: number; extracted: number } {
+  const project = Math.min(MAX_TRANSCRIPT_BYTES, Math.max(MAX_ARTIFACT_BYTES, 4 * sentTranscriptBytes));
+  return { project, artifact: MAX_ARTIFACT_BYTES, extracted: MAX_EXTRACTED_BYTES + project - MAX_ARTIFACT_BYTES };
+}
 /** == handoff.ts SENSITIVE (not imported: entries must not be imported by core). */
 const SENSITIVE = [".claude", ".config/cc-status", ".ssh", ".gnupg", ".aws", "Library/Keychains"];
 
@@ -205,7 +217,7 @@ export function validateTree(dir: string, allow: (rel: string) => boolean = () =
       if (!safeRel(r) || !allow(r)) { skipped.push(r); continue; }
       if (st.isDirectory()) { walk(r); continue; }
       if (!st.isFile() || st.nlink > 1) { skipped.push(r); continue; }
-      if ((budget.left -= st.size) < 0) throw new Error(`box artifacts exceed ${MAX_EXTRACTED_BYTES / 2 ** 30} GB extracted`);
+      if ((budget.left -= st.size) < 0) throw new Error("box artifacts exceed the extracted-size cap");
       files.push(r);
     }
   };
@@ -215,10 +227,10 @@ export function validateTree(dir: string, allow: (rel: string) => boolean = () =
 
 /** Extract a box .tgz into a FRESH empty dir under `parent`, after proving it inflates under the cap
  *  (streamed, so a gzip bomb never touches the disk). Returns the dir. */
-export function extractTgz(tgz: string, parent: string): string {
-  if (lstatSync(tgz).size > MAX_ARTIFACT_BYTES) throw new Error(`${tgz} is over ${MAX_ARTIFACT_BYTES / 1e6} MB`);
-  const n = Number(execFileSync("sh", ["-c", `gzip -dc < "$1" | head -c ${MAX_EXTRACTED_BYTES + 1} | wc -c`, "sh", tgz]).toString().trim());
-  if (!(n <= MAX_EXTRACTED_BYTES)) throw new Error(`${tgz} inflates past ${MAX_EXTRACTED_BYTES / 2 ** 30} GB`);
+export function extractTgz(tgz: string, parent: string, maxBytes = MAX_ARTIFACT_BYTES, maxInflated = MAX_EXTRACTED_BYTES): string {
+  if (lstatSync(tgz).size > maxBytes) throw new Error(`${tgz} is over ${(maxBytes / 1e6).toFixed(0)} MB`);
+  const n = Number(execFileSync("sh", ["-c", `gzip -dc < "$1" | head -c ${maxInflated + 1} | wc -c`, "sh", tgz]).toString().trim());
+  if (!(n <= maxInflated)) throw new Error(`${tgz} inflates past ${(maxInflated / 2 ** 30).toFixed(1)} GB`);
   const out = mkdtempSync(join(parent, "x-"));
   // /usr/bin/tar (bsdtar): its own refusal of ../ and through-symlink entries, whatever is on PATH.
   execFileSync("/usr/bin/tar", ["-xzf", tgz, "-C", out, "--no-same-owner", "--no-same-permissions"], { stdio: ["ignore", "ignore", "pipe"] });
