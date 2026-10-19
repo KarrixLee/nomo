@@ -14,7 +14,8 @@
 // memory into /root/.claude/projects/<same dir>/, and the user layer (~/.claude/{skills,agents,commands,
 // CLAUDE.md}). The repo is recreated at the SAME absolute path because the transcript embeds its cwd.
 //
-// WHAT NEVER TRAVELS: the Mac's ~/.claude.json, .credentials.json or settings env. The model runs on
+// WHAT NEVER TRAVELS: the Mac's ~/.claude.json, .credentials.json or settings env, and any untracked
+// secret-named file (.env, .dev.vars, *.pem… core/readiness.ts isSecretName; packList drops them). The model runs on
 // OpenRouter (ANTHROPIC_AUTH_TOKEN), never the user's Claude subscription. Keys are sent ONLY
 // as exec env and handed to claude through a 0600 file on /dev/shm (RAM) that the launcher deletes as it
 // reads it — NOT `tmux -e`, which leaves them in the tmux server's argv for `ps` to show forever.
@@ -70,7 +71,7 @@ import { b64url, type Bytes, fromB64url } from "../core/crypto";
 import { renderPairPage } from "../core/pair-page";
 import { buildPairURL, DEFAULT_WORKER_URL } from "../core/pair-url";
 import { normalizeModelId } from "../core/adapter";
-import { cloudReadiness, gitProbe } from "../core/readiness";
+import { cloudReadiness, gitProbe, isSecretName } from "../core/readiness";
 import { clearPark, PARK_DIR, readPark, stageLanding, writePark } from "../core/park";
 import { atomicWrite, CC_DIR, pidAlive, pidAncestors, pidCommand, readRecord, SESSIONS_DIR } from "../core/shared";
 import {
@@ -269,6 +270,24 @@ export function targetWorker(flag: string | true | undefined, env: string | unde
 export const SENSITIVE = [".claude", ".config/cc-status", ".ssh", ".gnupg", ".aws", "Library/Keychains"]; // == cloud-back.ts
 const EXCLUDE_SENSITIVE = SENSITIVE.flatMap((p) => ["--exclude", p]);
 
+/** The NUL list (for `tar --no-recursion -T -`) of the user's files to send from `root`: each of `entries`
+ *  (a dir is walked; links are listed, never followed), minus every file isSecretName matches and any dir
+ *  `skipDir` names. An un-ignored .env never leaves the Mac; a git-TRACKED one is in the bundle anyway. */
+export function packList(root: string, entries: string[], skipDir: (name: string) => boolean = () => false): Buffer {
+  const out: string[] = [];
+  const add = (rel: string): void => {
+    const name = rel.split("/").pop()!;
+    const st = lstatSync(join(root, rel), { throwIfNoEntry: false });
+    if (!st) return;
+    if (!st.isDirectory()) { if (!isSecretName(name)) out.push(rel); return; }
+    if (skipDir(name)) return;
+    out.push(rel);
+    for (const n of readdirSync(join(root, rel))) add(`${rel}/${n}`);
+  };
+  for (const e of entries) add(e.replace(/\/$/, ""));
+  return Buffer.from(out.map((p) => p + "\0").join(""));
+}
+
 /** Why `dir` must not be packed whole, or undefined when it may. */
 export function packRefusal(dir: string, home: string, has: (p: string) => boolean = existsSync): string | undefined {
   const rel = relative(dir, home);
@@ -395,9 +414,12 @@ function build(args: Map<string, string | true>, outDir: string): Plan {
     // READ-ONLY on the user's tree: diff vs HEAD covers staged + unstaged; untracked ride in a tar.
     writeFileSync(put("wip.patch"), execFileSync("git", ["diff", "--binary", "HEAD"], { cwd: root, maxBuffer: 1 << 30 }));
     const untracked = execFileSync("git", ["ls-files", "--others", "--exclude-standard", "-z"], { cwd: root, maxBuffer: 1 << 30 });
-    tar(put("untracked.tgz"), root, [...EXCLUDE_SENSITIVE, "--null", "-T", "-"], untracked);
+    const list = packList(root, untracked.toString().split("\0").filter(Boolean));
+    tar(put("untracked.tgz"), root, [...EXCLUDE_SENSITIVE, "--no-recursion", "--null", "-T", "-"], list);
   } else {
-    tar(put("folder.tgz"), cwd, ["--exclude", "node_modules", "--exclude", ".git", ...EXCLUDE_SENSITIVE, "."]);
+    const skip = (n: string) => n === "node_modules" || n === ".git";
+    const list = packList(cwd, readdirSync(cwd).filter((n) => !skip(n)), skip);
+    tar(put("folder.tgz"), cwd, [...EXCLUDE_SENSITIVE, "--no-recursion", "--null", "-T", "-"], list);
   }
 
   for (const [box, local] of Object.entries(art)) {

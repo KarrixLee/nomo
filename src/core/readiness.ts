@@ -2,9 +2,10 @@
 // WON'T have. Local only: no box contact, and no secret VALUE is ever read — secret files are matched by
 // name, and the JSON configs below are parsed only for their key names. Never blocks a handoff.
 //
-// What ships is decided by handoff.ts build(): in a git repo, HEAD + the diff + untracked NON-ignored files
-// (so an ignored file never travels, an untracked unignored one does); a non-git folder is tarred whole
-// minus node_modules and .git. Submodule contents never travel (the bundle holds only the gitlink).
+// What ships is decided by handoff.ts build(): in a git repo, HEAD + the diff + untracked NON-ignored files;
+// a non-git folder is tarred whole minus node_modules and .git. Both tars drop every isSecretName file, so a
+// secret travels only when git TRACKS it (it is in the bundle). Submodule contents never travel (the bundle
+// holds only the gitlink); an untracked, unignored nested repo rides in the untracked tar.
 
 import { execFileSync } from "node:child_process";
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
@@ -52,7 +53,7 @@ const isCompose = (n: string) => /^(docker-)?compose([.-].*)?\.ya?ml$/.test(n);
 const isLocalhostCandidate = (n: string) => !LOCK_NAMES.has(n) && /\.(toml|ya?ml)$/.test(n);
 
 const defaultRead = (p: string, max: number): string | undefined => {
-  try { return statSync(p).size <= max ? readFileSync(p, "utf8") : undefined; } catch { return undefined; }
+  try { const st = statSync(p); return st.isFile() && st.size <= max ? readFileSync(p, "utf8") : undefined; } catch { return undefined; } // a link to /dev/zero or a FIFO never hangs
 };
 /** The key names of a JSON object member, or [] when it isn't one. */
 const keysOf = (v: unknown): string[] => (v && typeof v === "object" && !Array.isArray(v) ? Object.keys(v) : []);
@@ -81,8 +82,8 @@ function walk(root: string, budget: number): Walk {
         if (e.name.startsWith(".") || NO_DESCEND.has(e.name) || depth + 1 > MAX_DEPTH) continue;
         queue.push([p, depth + 1]);
       } else if (e.isFile() || e.isSymbolicLink()) {
-        if (isSecretName(e.name)) w.secrets.push(p);
-        else if (isCompose(e.name)) w.compose.push(p);
+        if (isSecretName(e.name)) { w.secrets.push(p); continue; } // never opened: no localhost grep on a secret
+        if (isCompose(e.name)) w.compose.push(p);
         if (LOCK_NAMES.has(e.name)) w.locks.set(rel, [...(w.locks.get(rel) ?? []), e.name]);
         if (isLocalhostCandidate(e.name) && !e.name.startsWith(".")) w.config.push(p);
       }
@@ -97,20 +98,20 @@ export function cloudReadiness(root: string, deps: ReadinessDeps): string {
   const w = walk(root, deps.maxEntries ?? 4000);
   const safe = <T>(f: () => T, d: T): T => { try { return f(); } catch { return d; } };
   const git = deps.git;
-  const trackedFiles = git ? safe(() => git.tracked([...w.secrets, ...w.deps]), new Set<string>()) : new Set<string>();
+  const probe = [...w.secrets, ...w.deps, ...w.nested];
+  const trackedFiles = git ? safe(() => git.tracked(probe), new Set<string>()) : new Set<string>();
   // ls-files names a tracked DIR by its files: a path counts as tracked when it or anything under it is.
-  const tracked = new Set([...w.secrets, ...w.deps].filter((p) => trackedFiles.has(p) || [...trackedFiles].some((f) => f.startsWith(p + "/"))));
-  const ignored = git ? safe(() => git.ignored([...w.secrets, ...w.deps]), new Set<string>()) : new Set<string>();
+  const trackedDirs = new Set([...trackedFiles].flatMap((f) => f.split("/").slice(0, -1).map((_, i, a) => a.slice(0, i + 1).join("/"))));
+  const tracked = new Set(probe.filter((p) => trackedFiles.has(p) || trackedDirs.has(p)));
+  const ignored = git ? safe(() => git.ignored(probe), new Set<string>()) : new Set<string>();
   const missing: string[] = [];
   const warnings: string[] = [];
 
-  // Secrets: git ships tracked + untracked-unignored files; a non-git folder ships everything.
-  const shipped = w.secrets.filter((s) => !git || tracked.has(s) || !ignored.has(s));
-  const kept = w.secrets.filter((s) => !shipped.includes(s));
+  // Secrets: the handoff tars drop them all (handoff.ts packList); only a git-TRACKED one is in the bundle.
+  const shipped = w.secrets.filter((s) => tracked.has(s));
+  const kept = w.secrets.filter((s) => !tracked.has(s));
   if (kept.length) missing.push(`${listNames(kept)} (${kept.length} file${kept.length > 1 ? "s" : ""}, never sent)`);
-  for (const s of shipped) {
-    warnings.push(`Heads-up: ${s} looks like a secret and ${git ? (tracked.has(s) ? "is tracked in git" : "isn't git-ignored") : "this folder is sent whole"}: it WILL be on the box.`);
-  }
+  for (const s of shipped) warnings.push(`Heads-up: ${s} looks like a secret and is tracked in git: it WILL be on the box.`);
 
   // Deps/builds the box must reinstall: git-ignored ones (git), node_modules (non-git: the folder tar skips it).
   const gone = w.deps.filter((d) => git ? ignored.has(d) && !tracked.has(d) : d === "node_modules" || d.endsWith("/node_modules"));
@@ -120,7 +121,8 @@ export function cloudReadiness(root: string, deps: ReadinessDeps): string {
       .map((l) => LOCKS.find(([n]) => n === l)![1])))];
     missing.push(`${names.join(", ")} (box must reinstall${cmds.length ? `: ${cmds.join(", ")}` : ""})`);
   }
-  if (git && w.nested.length) missing.push(`${listNames(w.nested)} (nested repo/submodule, not in the bundle)`);
+  const nested = w.nested.filter((n) => tracked.has(n) || ignored.has(n)); // an untracked unignored one IS sent
+  if (git && nested.length) missing.push(`${listNames(nested)} (nested repo/submodule, not in the bundle)`);
 
   // MCP servers + other plugins: key names only, never env/headers/args. A big or broken file is skipped.
   const json = (p: string, max: number): any => { const t = read(p, max); return t === undefined ? undefined : safe(() => JSON.parse(t), undefined); };
@@ -159,7 +161,7 @@ export function gitProbe(root: string): GitProbe | undefined {
   const split = (s: string) => new Set(s.split("\0").filter(Boolean).map((p) => p.replace(/\/$/, "")));
   try { if (run(["rev-parse", "--show-toplevel"]).trim() === "") return undefined; } catch { return undefined; }
   return {
-    tracked: (paths) => (paths.length ? split(run(["ls-files", "-z", "--", ...paths])) : new Set()),
+    tracked: (paths) => (paths.length ? split(run(["--literal-pathspecs", "ls-files", "-z", "--", ...paths])) : new Set()),
     // check-ignore exits 1 when nothing matches; that is "none ignored", not a failure.
     ignored: (paths) => {
       if (!paths.length) return new Set();

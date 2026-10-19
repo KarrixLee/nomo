@@ -16,7 +16,8 @@ import { createHash } from "node:crypto";
 import {
   chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, writeFileSync,
 } from "node:fs";
-import { dirname, isAbsolute, join, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, sep } from "node:path";
+import { isSecretName } from "./readiness";
 
 /** Per-artifact compressed cap (== handoff's MAX_ARTIFACT_BYTES) and the extracted total across all tars. */
 export const MAX_ARTIFACT_BYTES = 100 * 1024 * 1024;
@@ -421,8 +422,11 @@ export function applyInPlace(root: string, a: BoxArtifacts, detached: boolean, u
     fetchBox(root, a);
     const flagged = a.patch ? agentConfigPaths(patchPaths(root, a.patch, a.boxHead, backup)) : [];
     if (flagged.length) throw new Error(`the box patch changes agent config (${printable(flagged.join(", "), true)}): not landing it in place`);
-    // SENSITIVE files never went to the box (the handoff tar excludes them): they stay put, unstashed.
-    const keep = ["--", ".", ...SENSITIVE.flatMap((p) => [`:(exclude,glob,icase)**/${p}`, `:(exclude,glob,icase)**/${p}/**`])];
+    // SENSITIVE files and untracked secrets (handoff.ts packList) never went to the box: they stay put,
+    // unstashed — stashing them would make the Mac's .env vanish with nothing from the box to replace it.
+    const secrets = git(root, ["ls-files", "--others", "--exclude-standard", "-z"]).split("\0").filter((p) => p && isSecretName(basename(p)));
+    const keep = ["--", ".", ...SENSITIVE.flatMap((p) => [`:(exclude,glob,icase)**/${p}`, `:(exclude,glob,icase)**/${p}/**`]),
+      ...secrets.map((p) => `:(exclude,literal)${p}`)];
     if (git(root, ["status", "--porcelain", ...keep]).trim()) {
       const msg = `nomo: before cloud return ${uuid8}`;
       console.log(`Stashing your uncommitted Mac changes as "${msg}"…`);

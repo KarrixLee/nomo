@@ -43,21 +43,22 @@ describe("cloudReadiness", () => {
     expect(out).not.toContain("WILL");
   });
 
-  test("a tracked secret warns it WILL be on the box; an untracked unignored one too", () => {
+  test("a tracked secret warns it WILL be on the box; an untracked unignored one is never sent (the tar drops it)", () => {
     const r = repo({ "credentials.json": "{}", "key.pem": "x" }, ["credentials.json"]);
     const out = check(r);
     expect(out).toContain("credentials.json looks like a secret and is tracked in git: it WILL be on the box.");
-    expect(out).toContain("key.pem looks like a secret and isn't git-ignored: it WILL be on the box.");
-    expect(out.split("\n")[0]).toBe("Cloud check: fine for code edits and tests.");
+    expect(out).toContain("key.pem (1 file, never sent)");
+    expect(out).not.toContain("key.pem looks like");
   });
 
-  test("non-git folder: secrets ship, only node_modules stays behind", () => {
+  test("non-git folder: secrets and node_modules stay behind", () => {
     const d = tmp();
     put(d, { ".env": "A=1", "node_modules/x/index.js": "", "build/out.js": "", "bun.lock": "" });
     const out = cloudReadiness(d, { home: tmp() });
     expect(out).toContain("node_modules (box must reinstall: bun install)");
     expect(out).not.toContain("build");
-    expect(out).toContain(".env looks like a secret and this folder is sent whole: it WILL be on the box.");
+    expect(out).toContain(".env (1 file, never sent)");
+    expect(out).not.toContain("WILL");
   });
 
   test("ignored deps/builds with their setup command; tracked vendor/ is not listed", () => {
@@ -70,11 +71,12 @@ describe("cloudReadiness", () => {
     expect(out).not.toContain("vendor");
   });
 
-  test("submodules / nested repos are not in the bundle", () => {
-    const r = repo({ "README.md": "" }, ["README.md"]);
-    mkdirSync(join(r, "nomo"));
-    git(join(r, "nomo"), "init", "-q");
-    expect(check(r)).toContain("nomo (nested repo/submodule, not in the bundle)");
+  test("ignored nested repos are not in the bundle; an untracked unignored one rides in the tar", () => {
+    const r = repo({ ".gitignore": "nomo/\n", "README.md": "" }, [".gitignore", "README.md"]);
+    for (const n of ["nomo", "loose"]) { mkdirSync(join(r, n)); git(join(r, n), "init", "-q"); }
+    const out = check(r);
+    expect(out).toContain("nomo (nested repo/submodule, not in the bundle)");
+    expect(out).not.toContain("loose");
   });
 
   test("MCP servers by name only (project .mcp.json, user + project scope), other plugins, never values", () => {
@@ -106,13 +108,13 @@ describe("cloudReadiness", () => {
     const r = repo({
       "App.xcodeproj/project.pbxproj": "", "Package.swift": "platforms: [.iOS(.v18)]",
       "docker-compose.yml": "services:\n  db:\n    image: postgres\n", "wrangler.toml": 'url = "http://localhost:8787"',
-      ".env": "API=http://127.0.0.1", ".github/workflows/ci.yml": "url: localhost", "pnpm-lock.yaml": "localhost",
+      ".env": "API=http://127.0.0.1", "secrets.yaml": "db: localhost", ".github/workflows/ci.yml": "url: localhost", "pnpm-lock.yaml": "localhost",
     });
     const out = check(r);
     expect(out).toContain("Xcode project");
     expect(out).toContain("iOS Swift package");
     expect(out).toContain("Docker Compose (docker-compose.yml)");
-    expect(out).toContain("localhost services (wrangler.toml)");
+    expect(out).toContain("localhost services (wrangler.toml)"); // not secrets.yaml: a secret is never opened
   });
 
   test("GitHub remote: gh isn't logged in on the box", () => {

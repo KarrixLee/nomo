@@ -393,6 +393,16 @@ describe("landing code", () => {
     expect(existsSync(join(mac2, ".claude", "x.md"))).toBe(true);
   });
 
+  test("applyInPlace never takes away an untracked .env the handoff deliberately didn't send", () => {
+    const mac = repo(), out = tmp(), box = boxWork(mac, g(mac, "rev-parse", "HEAD"), out);
+    mkdirSync(join(mac, "api")); writeFileSync(join(mac, ".env"), "A=1\n"); writeFileSync(join(mac, "api", ".dev.vars"), "B=2\n");
+    const r = applyInPlace(mac, { bundle: join(out, "repo.bundle"), patch: join(out, "wip.patch"), untrackedDir: box.udir, untracked: box.untracked, boxHead: box.boxHead }, false, "abcd1234", out);
+    expect(r.stash).toBeUndefined(); // only the secrets were dirty: nothing stashed
+    expect(readFileSync(join(mac, ".env"), "utf8")).toBe("A=1\n");
+    expect(readFileSync(join(mac, "api", ".dev.vars"), "utf8")).toBe("B=2\n");
+    expect(g(mac, "rev-parse", "HEAD")).toBe(box.boxHead);
+  });
+
   test("applyInPlace on a clean Mac makes no stash", () => {
     const mac = repo();
     const base = g(mac, "rev-parse", "HEAD");

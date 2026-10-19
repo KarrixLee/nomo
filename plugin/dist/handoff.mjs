@@ -384,7 +384,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "2.3.27";
+var PLUGIN_VERSION = "2.3.28";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -3214,7 +3214,8 @@ var isCompose = (n) => /^(docker-)?compose([.-].*)?\.ya?ml$/.test(n);
 var isLocalhostCandidate = (n) => !LOCK_NAMES.has(n) && /\.(toml|ya?ml)$/.test(n);
 var defaultRead = (p, max) => {
   try {
-    return statSync2(p).size <= max ? readFileSync2(p, "utf8") : undefined;
+    const st = statSync2(p);
+    return st.isFile() && st.size <= max ? readFileSync2(p, "utf8") : undefined;
   } catch {
     return;
   }
@@ -3254,9 +3255,11 @@ function walk(root, budget) {
           continue;
         queue.push([p, depth + 1]);
       } else if (e.isFile() || e.isSymbolicLink()) {
-        if (isSecretName(e.name))
+        if (isSecretName(e.name)) {
           w.secrets.push(p);
-        else if (isCompose(e.name))
+          continue;
+        }
+        if (isCompose(e.name))
           w.compose.push(p);
         if (LOCK_NAMES.has(e.name))
           w.locks.set(rel, [...w.locks.get(rel) ?? [], e.name]);
@@ -3284,26 +3287,28 @@ function cloudReadiness(root, deps) {
     }
   };
   const git = deps.git;
-  const trackedFiles = git ? safe(() => git.tracked([...w.secrets, ...w.deps]), new Set) : new Set;
-  const tracked = new Set([...w.secrets, ...w.deps].filter((p) => trackedFiles.has(p) || [...trackedFiles].some((f) => f.startsWith(p + "/"))));
-  const ignored = git ? safe(() => git.ignored([...w.secrets, ...w.deps]), new Set) : new Set;
+  const probe = [...w.secrets, ...w.deps, ...w.nested];
+  const trackedFiles = git ? safe(() => git.tracked(probe), new Set) : new Set;
+  const trackedDirs = new Set([...trackedFiles].flatMap((f) => f.split("/").slice(0, -1).map((_, i, a) => a.slice(0, i + 1).join("/"))));
+  const tracked = new Set(probe.filter((p) => trackedFiles.has(p) || trackedDirs.has(p)));
+  const ignored = git ? safe(() => git.ignored(probe), new Set) : new Set;
   const missing = [];
   const warnings = [];
-  const shipped = w.secrets.filter((s) => !git || tracked.has(s) || !ignored.has(s));
-  const kept = w.secrets.filter((s) => !shipped.includes(s));
+  const shipped = w.secrets.filter((s) => tracked.has(s));
+  const kept = w.secrets.filter((s) => !tracked.has(s));
   if (kept.length)
     missing.push(`${listNames(kept)} (${kept.length} file${kept.length > 1 ? "s" : ""}, never sent)`);
-  for (const s of shipped) {
-    warnings.push(`Heads-up: ${s} looks like a secret and ${git ? tracked.has(s) ? "is tracked in git" : "isn't git-ignored" : "this folder is sent whole"}: it WILL be on the box.`);
-  }
+  for (const s of shipped)
+    warnings.push(`Heads-up: ${s} looks like a secret and is tracked in git: it WILL be on the box.`);
   const gone = w.deps.filter((d) => git ? ignored.has(d) && !tracked.has(d) : d === "node_modules" || d.endsWith("/node_modules"));
   if (gone.length) {
     const names = [...new Set(gone.map((d) => d.split("/").pop()))];
     const cmds = [...new Set(gone.flatMap((d) => (w.locks.get(d.split("/").slice(0, -1).join("/")) ?? []).map((l) => LOCKS.find(([n]) => n === l)[1])))];
     missing.push(`${names.join(", ")} (box must reinstall${cmds.length ? `: ${cmds.join(", ")}` : ""})`);
   }
-  if (git && w.nested.length)
-    missing.push(`${listNames(w.nested)} (nested repo/submodule, not in the bundle)`);
+  const nested = w.nested.filter((n) => tracked.has(n) || ignored.has(n));
+  if (git && nested.length)
+    missing.push(`${listNames(nested)} (nested repo/submodule, not in the bundle)`);
   const json = (p, max) => {
     const t = read(p, max);
     return t === undefined ? undefined : safe(() => JSON.parse(t), undefined);
@@ -3345,7 +3350,7 @@ function gitProbe(root) {
     return;
   }
   return {
-    tracked: (paths) => paths.length ? split(run(["ls-files", "-z", "--", ...paths])) : new Set,
+    tracked: (paths) => paths.length ? split(run(["--literal-pathspecs", "ls-files", "-z", "--", ...paths])) : new Set,
     ignored: (paths) => {
       if (!paths.length)
         return new Set;
@@ -3724,7 +3729,7 @@ import {
   renameSync as renameSync2,
   writeFileSync as writeFileSync3
 } from "node:fs";
-import { dirname as dirname2, isAbsolute as isAbsolute2, join as join5, sep } from "node:path";
+import { basename as basename3, dirname as dirname2, isAbsolute as isAbsolute2, join as join5, sep } from "node:path";
 var MAX_ARTIFACT_BYTES = 100 * 1024 * 1024;
 var MAX_EXTRACTED_BYTES = 1024 * 1024 * 1024;
 var MAX_TRANSCRIPT_BYTES = 512 * 1024 * 1024;
@@ -4085,7 +4090,13 @@ function applyInPlace(root, a, detached, uuid8, backup) {
     const flagged = a.patch ? agentConfigPaths(patchPaths(root, a.patch, a.boxHead, backup)) : [];
     if (flagged.length)
       throw new Error(`the box patch changes agent config (${printable(flagged.join(", "), true)}): not landing it in place`);
-    const keep = ["--", ".", ...SENSITIVE.flatMap((p) => [`:(exclude,glob,icase)**/${p}`, `:(exclude,glob,icase)**/${p}/**`])];
+    const secrets = git(root, ["ls-files", "--others", "--exclude-standard", "-z"]).split("\x00").filter((p) => p && isSecretName(basename3(p)));
+    const keep = [
+      "--",
+      ".",
+      ...SENSITIVE.flatMap((p) => [`:(exclude,glob,icase)**/${p}`, `:(exclude,glob,icase)**/${p}/**`]),
+      ...secrets.map((p) => `:(exclude,literal)${p}`)
+    ];
     if (git(root, ["status", "--porcelain", ...keep]).trim()) {
       const msg = `nomo: before cloud return ${uuid8}`;
       console.log(`Stashing your uncommitted Mac changes as "${msg}"…`);
@@ -4794,6 +4805,28 @@ function targetWorker(flag, env) {
 }
 var SENSITIVE2 = [".claude", ".config/cc-status", ".ssh", ".gnupg", ".aws", "Library/Keychains"];
 var EXCLUDE_SENSITIVE = SENSITIVE2.flatMap((p) => ["--exclude", p]);
+function packList(root, entries, skipDir = () => false) {
+  const out = [];
+  const add = (rel) => {
+    const name = rel.split("/").pop();
+    const st = lstatSync2(join6(root, rel), { throwIfNoEntry: false });
+    if (!st)
+      return;
+    if (!st.isDirectory()) {
+      if (!isSecretName(name))
+        out.push(rel);
+      return;
+    }
+    if (skipDir(name))
+      return;
+    out.push(rel);
+    for (const n of readdirSync3(join6(root, rel)))
+      add(`${rel}/${n}`);
+  };
+  for (const e of entries)
+    add(e.replace(/\/$/, ""));
+  return Buffer.from(out.map((p) => p + "\x00").join(""));
+}
 function packRefusal(dir, home, has = existsSync5) {
   const rel = relative(dir, home);
   if (rel !== ".." && !rel.startsWith(".." + sep2))
@@ -4917,9 +4950,12 @@ function build(args, outDir) {
     sh("git", ["bundle", "create", "-q", put("repo.bundle"), "HEAD"], root);
     writeFileSync4(put("wip.patch"), execFileSync5("git", ["diff", "--binary", "HEAD"], { cwd: root, maxBuffer: 1 << 30 }));
     const untracked = execFileSync5("git", ["ls-files", "--others", "--exclude-standard", "-z"], { cwd: root, maxBuffer: 1 << 30 });
-    tar(put("untracked.tgz"), root, [...EXCLUDE_SENSITIVE, "--null", "-T", "-"], untracked);
+    const list = packList(root, untracked.toString().split("\x00").filter(Boolean));
+    tar(put("untracked.tgz"), root, [...EXCLUDE_SENSITIVE, "--no-recursion", "--null", "-T", "-"], list);
   } else {
-    tar(put("folder.tgz"), cwd, ["--exclude", "node_modules", "--exclude", ".git", ...EXCLUDE_SENSITIVE, "."]);
+    const skip = (n) => n === "node_modules" || n === ".git";
+    const list = packList(cwd, readdirSync3(cwd).filter((n) => !skip(n)), skip);
+    tar(put("folder.tgz"), cwd, [...EXCLUDE_SENSITIVE, "--no-recursion", "--null", "-T", "-"], list);
   }
   for (const [box, local] of Object.entries(art)) {
     const size = statSync3(local).size;
@@ -6044,6 +6080,7 @@ export {
   firstMessageScript,
   lastModel,
   latestSession,
+  packList,
   packRefusal,
   paneScript,
   projectDirName,

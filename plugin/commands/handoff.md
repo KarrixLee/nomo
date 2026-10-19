@@ -54,4 +54,4 @@ window stays open but parked (new prompts are blocked; `/nomo-cc:back` here brin
 your turn without running anything else. If the output says the box needs pairing, relay the terminal
 command it printed and stop; nothing was started.
 
-The output may include a `Cloud check:` line naming what the box won't have (git-ignored secrets, deps to reinstall, MCP servers, Mac-only tools); relay it verbatim, it never blocks the move (`handoff.mjs --check` prints only that block, moving nothing).
+The output may include a `Cloud check:` line naming what the box won't have (secrets never sent, deps to reinstall, MCP servers, Mac-only tools); relay it verbatim, it never blocks the move (`handoff.mjs --check` prints only that block, moving nothing).
