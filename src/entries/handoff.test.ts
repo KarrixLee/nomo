@@ -14,6 +14,7 @@ import { readCapped, sameWindowBackLine } from "./handoff";
 import { FIRST_SKIPPED, FIRST_UNCONFIRMED, firstMessageScript, sendFirstMessage, sendResult, TYPE_FN } from "./handoff";
 import { BACK_FILES, backPackScript, backStopScript, backWaitScript, currentGuard, resumeCommand } from "./handoff";
 import { boxIdle } from "../core/cloud-back";
+import { packList } from "./handoff";
 
 describe("handoff pure logic", () => {
   test("cwd → Claude Code project dir name (every non-alphanumeric → -)", () => {
@@ -446,4 +447,29 @@ esac
 
 test("/nomo-cc:back from the parked window ends with the /resume line", () => {
   expect(sameWindowBackLine("0a1b2c3d-1111-4222-8333-444455556666")).toBe("Back. Type /resume 0a1b2c3d-1111-4222-8333-444455556666 to continue here.");
+});
+
+describe("packList (secrets never leave the Mac in the user-file tars)", () => {
+  const tarOf = (root: string, list: Buffer): string[] => {
+    const out = join(mkdtempSync(join(tmpdir(), "nomo-pack-")), "t.tgz");
+    execFileSync("tar", ["-czf", out, "--no-recursion", "--null", "-T", "-"], { cwd: root, input: list });
+    return execFileSync("tar", ["-tzf", out]).toString().split("\n").filter(Boolean).map((p) => p.replace(/\/$/, "")).sort();
+  };
+  test("git: an un-ignored .env is not in the untracked tar", () => {
+    const r = mkdtempSync(join(tmpdir(), "nomo-pack-"));
+    execFileSync("git", ["init", "-q"], { cwd: r });
+    mkdirSync(join(r, "src"));
+    for (const f of [".env", "src/new.ts", "src/key.pem", ".env.example"]) writeFileSync(join(r, f), "x");
+    const ut = execFileSync("git", ["ls-files", "--others", "--exclude-standard", "-z"], { cwd: r }).toString().split("\0").filter(Boolean);
+    expect(ut).toContain(".env");
+    expect(tarOf(r, packList(r, ut))).toEqual([".env.example", "src/new.ts"]);
+  });
+  test("non-git: .env anywhere, node_modules and .git are not in the folder tar; links are not followed", () => {
+    const d = mkdtempSync(join(tmpdir(), "nomo-pack-"));
+    for (const p of ["a/b", "node_modules/x", "a/node_modules", ".git", "empty"]) mkdirSync(join(d, p), { recursive: true });
+    for (const f of [".env", "a/b/.env.local", "a/b/c.txt", "node_modules/x/i.js", "a/node_modules/j.js", ".git/HEAD", "main.py"]) writeFileSync(join(d, f), "x");
+    symlinkSync(d, join(d, "a", "loop"));
+    const skip = (n: string) => n === "node_modules" || n === ".git";
+    expect(tarOf(d, packList(d, ["a", "empty", "main.py", ".env"], skip))).toEqual(["a", "a/b", "a/b/c.txt", "a/loop", "empty", "main.py"]);
+  });
 });

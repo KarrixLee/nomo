@@ -53,3 +53,5 @@ as soon as this turn ends…`, tell the user in one line that it moves when this
 window stays open but parked (new prompts are blocked; `/nomo-cc:back` here brings it home, `/nomo-cc:handoff cancel` unparks it), then end
 your turn without running anything else. If the output says the box needs pairing, relay the terminal
 command it printed and stop; nothing was started.
+
+The output may include a `Cloud check:` line naming what the box won't have (secrets never sent, deps to reinstall, MCP servers, Mac-only tools); relay it verbatim, it never blocks the move (`handoff.mjs --check` prints only that block, moving nothing).
