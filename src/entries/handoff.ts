@@ -913,7 +913,7 @@ async function back(omg: string, args: Map<string, string | true>): Promise<void
       clearPark(uuid);
       throw new Error(`the staged box copy is gone; unparked this window. The pulled copy is under ${join(CC_DIR, "cloud-back")}.`);
     }
-    writePark(uuid, { ...parkedAtStart, since: Date.now() });
+    // No marker write here: the hook may have just installed it ("back"), which must not go back to landing.
     console.log(`The box's copy is staged; it goes in as this turn ends.\n\n${sameWindowBackLine(parkedAtStart.resume ?? uuid)}`);
     return;
   }
@@ -1038,7 +1038,7 @@ async function back(omg: string, args: Map<string, string | true>): Promise<void
     ? validateTree(pdir, (r) => r === `${uuid}.jsonl` || r === uuid || r.startsWith(`${uuid}/`) || r === "memory" || r.startsWith("memory/"), budget)
     : { files: [], skipped: [] };
   if (pt.skipped.length) console.log(`Skipped ${pt.skipped.length} unexpected path(s) in the box's project files: ${paths(pt.skipped)}`);
-  let resumeId = uuid;
+  let resumeId = uuid, stagedThisRun: string | undefined;
   if (!pdir) { /* reported by unpack */ } else if (!pt.files.includes(`${uuid}.jsonl`)) problems.push("the box sent no transcript");
   else {
     const boxT = readFileSync(join(pdir, `${uuid}.jsonl`));
@@ -1057,6 +1057,7 @@ async function back(omg: string, args: Map<string, string | true>): Promise<void
         // The park hook installs it at the turn's end (core/park.ts).
         const staged = `${macPath}.nomo-back`;
         atomicWriteBytes(staged, boxT);
+        stagedThisRun = staged;
         const now = stageLanding(uuid, { staged, target: macPath, resume: uuid }, startedAt);
         console.log(`Transcript: the box's copy (+${boxT.length - (macT?.length ?? 0)} B) ${now ? "is installed" : "goes in as this turn ends"}; the Mac's previous copy is in ${before}`);
       } else {
@@ -1139,7 +1140,13 @@ async function back(omg: string, args: Map<string, string | true>): Promise<void
   saveCloud({ ...c, sessions, current: c.current === uuid ? undefined : c.current });
 
   // 5. Resume here.
-  const parked = readPark(uuid);
+  let parked = readPark(uuid);
+  if (sameWindow && stagedThisRun && parked?.state !== "landing" && parked?.state !== "back" && existsSync(stagedThisRun)) {
+    // A hook's stamp raced the "landing" write: stage again (installs now if the window is idle), never
+    // report Back with the box copy orphaned next to the transcript.
+    stageLanding(uuid, { staged: stagedThisRun, target: join(projDir, `${uuid}.jsonl`), resume: uuid }, startedAt);
+    parked = readPark(uuid);
+  }
   if (sameWindow) {
     if (parked?.state !== "landing" && parked?.state !== "back") {
       if (resumeId !== uuid) writePark(uuid, { state: "back", resume: resumeId });

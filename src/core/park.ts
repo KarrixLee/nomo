@@ -5,8 +5,9 @@
 // Nomo's own commands (`/nomo-cc:…`). Any other slash command or skill runs a real turn, so it is blocked
 // too; built-ins (/exit, /resume) never reach the hook. Everything here is local file I/O and FAILS OPEN:
 // a broken marker must never brick a session. Escape hatches: /nomo-cc:handoff cancel, /nomo-cc:reset.
-// ponytail: turns that start without a UserPromptSubmit (a background task's re-entry, a scheduled task)
-// are not gated; --back's divergence check catches what they write (cloud-back.ts macDiverged).
+// A background task's `<task-notification>` re-entry goes through UserPromptSubmit too, so it is gated.
+// ponytail: a turn that starts with no UserPromptSubmit at all (if Claude Code has one) is not gated;
+// --back's divergence check catches what it writes (cloud-back.ts macDiverged).
 //
 // Marker: <CC_DIR>/parked/<session_id>, 0600 JSON. States:
 //   moving  — /nomo-cc:handoff armed; the helper moves the session once this turn ends (turnEndedAt).
@@ -16,8 +17,10 @@
 //             the rest of the back turn append lines chained to the replaced conversation; installing on
 //             a SessionStart would swap the file under a session that already loaded it). A prompt
 //             while landing means the back turn was interrupted: blocked, and a rerun of back finishes.
-//   back    — installed; the next plain prompt is blocked ONCE with the /resume reminder (a prompt before
-//             /resume would chain onto the stale in-memory conversation), and a /resume clears it.
+//   back    — installed; plain prompts stay blocked with the /resume reminder (a prompt before /resume
+//             would chain onto the stale in-memory conversation and land in the box transcript; the
+//             background back's own re-entry is one of them) until a /resume (SessionStart "resume"),
+//             the window's SessionEnd, or its pid dying clears it.
 //   elsewhere — brought back from ANOTHER session while this window was still open (pid): only that
 //             window is blocked (by process ancestry; the new window resumes the same id), until it ends.
 
@@ -80,7 +83,7 @@ export const reasonFor = (p: Park, id: string): string => {
  *  the back's backup folder, and a stuck marker would block the window for good. */
 function land(id: string, p: Park, dir: string): Park | undefined {
   try { if (p.staged && p.target) renameSync(p.staged, p.target); } catch { clearPark(id, dir); return undefined; }
-  const back: Park = { state: "back", since: Date.now(), resume: p.resume };
+  const back: Park = { state: "back", since: Date.now(), resume: p.resume, ...(p.pid ? { pid: p.pid } : {}) };
   writePark(id, back, dir);
   return back;
 }
@@ -106,6 +109,13 @@ export const MOVING_STALE_MS = 35 * 60_000;
 
 export const NOMO_COMMAND = "/nomo-cc:";
 
+/** Merge stamp fields into the CURRENT marker (re-read, so a state written meanwhile, e.g. "landing" by
+ *  --back, is never downgraded by a hook holding an older copy). */
+function stamp(id: string, fields: Partial<Park>, dir: string): void {
+  const cur = readPark(id, dir);
+  if (cur) writePark(id, { ...cur, ...fields }, dir);
+}
+
 /** Is this hook running under the window `pid`? (ps walk: only for the rare "elsewhere" marker.) */
 const underPid = (pid: number | undefined): boolean => typeof pid === "number" && pidAncestors(process.pid).includes(pid);
 
@@ -123,18 +133,19 @@ export function parkHook(input: Record<string, unknown>, dir = PARK_DIR): string
       if (!underPid(p.pid)) return undefined; // the window it came back to
       if (event === "SessionEnd") { clearPark(id, dir); return undefined; }
     }
+    if (p.state === "back" && typeof p.pid === "number" && !pidAlive(p.pid)) { clearPark(id, dir); return undefined; }
     if (event === "UserPromptSubmit") {
       if (typeof input.prompt === "string" && input.prompt.trimStart().startsWith(NOMO_COMMAND)) {
-        if (p.state !== "moving") writePark(id, { ...p, turnStartedAt: Date.now() }, dir);
+        if (p.state !== "moving") stamp(id, { turnStartedAt: Date.now() }, dir);
         return undefined;
       }
-      if (p.state === "back") clearPark(id, dir); // one reminder, then the window is the user's again
       return JSON.stringify({ decision: "block", reason: reasonFor(p, id) });
     }
     const turnEnd = event === "Stop" || event === "StopFailure" || event === "SessionEnd";
-    if (p.state === "moving" && turnEnd && !p.turnEndedAt) writePark(id, { ...p, turnEndedAt: Date.now() }, dir);
+    if (p.state === "moving" && turnEnd && !p.turnEndedAt) stamp(id, { turnEndedAt: Date.now() }, dir);
     if (p.state === "landing" && turnEnd) p = land(id, p, dir);
-    else if (p.state !== "moving" && turnEnd) writePark(id, { ...p, turnEndedAt: Date.now() }, dir);
+    else if (p.state === "back" && event === "SessionEnd") { clearPark(id, dir); return undefined; }
+    else if (p.state !== "moving" && turnEnd) stamp(id, { turnEndedAt: Date.now() }, dir);
     if (p?.state === "back" && event === "SessionStart" && input.source === "resume") clearPark(id, dir);
   } catch { /* fail open */ }
   return undefined;

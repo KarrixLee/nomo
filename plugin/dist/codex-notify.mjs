@@ -105,7 +105,7 @@ async function sha256Hex(s) {
 }
 
 // src/core/shared.ts
-var PLUGIN_VERSION = "2.3.25";
+var PLUGIN_VERSION = "2.3.26";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -3108,7 +3108,7 @@ function land(id, p, dir) {
     clearPark(id, dir);
     return;
   }
-  const back = { state: "back", since: Date.now(), resume: p.resume };
+  const back = { state: "back", since: Date.now(), resume: p.resume, ...p.pid ? { pid: p.pid } : {} };
   writePark(id, back, dir);
   return back;
 }
@@ -3123,6 +3123,11 @@ function stageLanding(id, l, runStartedAt, dir = PARK_DIR, alive = pidAlive) {
 }
 var MOVING_STALE_MS = 35 * 60000;
 var NOMO_COMMAND = "/nomo-cc:";
+function stamp(id, fields, dir) {
+  const cur = readPark(id, dir);
+  if (cur)
+    writePark(id, { ...cur, ...fields }, dir);
+}
 var underPid = (pid) => typeof pid === "number" && pidAncestors(process.pid).includes(pid);
 function parkHook(input, dir = PARK_DIR) {
   try {
@@ -3148,23 +3153,28 @@ function parkHook(input, dir = PARK_DIR) {
         return;
       }
     }
+    if (p.state === "back" && typeof p.pid === "number" && !pidAlive(p.pid)) {
+      clearPark(id, dir);
+      return;
+    }
     if (event === "UserPromptSubmit") {
       if (typeof input.prompt === "string" && input.prompt.trimStart().startsWith(NOMO_COMMAND)) {
         if (p.state !== "moving")
-          writePark(id, { ...p, turnStartedAt: Date.now() }, dir);
+          stamp(id, { turnStartedAt: Date.now() }, dir);
         return;
       }
-      if (p.state === "back")
-        clearPark(id, dir);
       return JSON.stringify({ decision: "block", reason: reasonFor(p, id) });
     }
     const turnEnd = event === "Stop" || event === "StopFailure" || event === "SessionEnd";
     if (p.state === "moving" && turnEnd && !p.turnEndedAt)
-      writePark(id, { ...p, turnEndedAt: Date.now() }, dir);
+      stamp(id, { turnEndedAt: Date.now() }, dir);
     if (p.state === "landing" && turnEnd)
       p = land(id, p, dir);
-    else if (p.state !== "moving" && turnEnd)
-      writePark(id, { ...p, turnEndedAt: Date.now() }, dir);
+    else if (p.state === "back" && event === "SessionEnd") {
+      clearPark(id, dir);
+      return;
+    } else if (p.state !== "moving" && turnEnd)
+      stamp(id, { turnEndedAt: Date.now() }, dir);
     if (p?.state === "back" && event === "SessionStart" && input.source === "resume")
       clearPark(id, dir);
   } catch {}

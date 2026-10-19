@@ -65,7 +65,7 @@ describe("park gate", () => {
     expect(readPark(A, dir)?.state).toBe("moving");
   });
 
-  test("landing installs the staged box copy at turn end; one reminder, then the window is free", () => {
+  test("landing installs the staged box copy at turn end; Back blocks until /resume", () => {
     const dir = tmp(), proj = tmp(), target = join(proj, `${A}.jsonl`), staged = `${target}.nomo-back`;
     writeFileSync(target, "mac\n");
     writeFileSync(staged, "box\n");
@@ -78,6 +78,8 @@ describe("park gate", () => {
     expect(existsSync(staged)).toBe(false);
     expect(readPark(A, dir)?.state).toBe("back");
     expect(reason(parkHook(prompt("hi"), dir))?.reason).toBe(`Back. Type /resume ${A} to continue here.`);
+    expect(reason(parkHook(prompt("hi"), dir))?.decision).toBe("block");
+    parkHook({ session_id: A, hook_event_name: "SessionStart", source: "resume" }, dir);
     expect(parkHook(prompt("hi"), dir)).toBeUndefined();
   });
 
@@ -85,6 +87,12 @@ describe("park gate", () => {
     const dir = tmp();
     writePark(A, { state: "back" }, dir);
     parkHook({ session_id: A, hook_event_name: "SessionStart", source: "resume" }, dir);
+    expect(readPark(A, dir)).toBeUndefined();
+    writePark(A, { state: "back" }, dir);
+    parkHook({ session_id: A, hook_event_name: "SessionEnd" }, dir);
+    expect(readPark(A, dir)).toBeUndefined();
+    writePark(A, { state: "back", pid: 2 ** 22 + 12345 }, dir); // its window died
+    expect(parkHook(prompt("hi"), dir)).toBeUndefined();
     expect(readPark(A, dir)).toBeUndefined();
     writePark(A, { state: "landing", staged: join(dir, "gone"), target: join(dir, "t") }, dir);
     parkHook({ session_id: A, hook_event_name: "Stop" }, dir);
@@ -143,7 +151,7 @@ describe("background --back finishing in the parked window", () => {
     const dir = tmp(), target = join(dir, "t.jsonl"), staged = `${target}.nomo-back`;
     writeFileSync(target, "mac\n");
     writeFileSync(staged, "box\n");
-    writePark(A, { state: "cloud", pid: 400 }, dir);
+    writePark(A, { state: "cloud", pid: process.pid }, dir);
     return { dir, target, staged, l: { staged, target, resume: A } };
   };
   const wait = () => Bun.sleep(3);
@@ -159,6 +167,16 @@ describe("background --back finishing in the parked window", () => {
     expect(readFileSync(target, "utf8")).toBe("box\n");
     expect(readPark(A, dir)?.state).toBe("back");
     expect(reason(parkHook(prompt("<task-notification>done</task-notification>"), dir))?.reason).toBe(`Back. Type /resume ${A} to continue here.`);
+    expect(reason(parkHook(prompt("fix the bug"), dir))?.decision).toBe("block"); // the re-entry did not use it up
+    expect(readPark(A, dir)).toMatchObject({ state: "back", pid: process.pid });
+  });
+
+  test("a hook stamp never downgrades a state written meanwhile", () => {
+    const { dir, l } = setup();
+    stageLanding(A, l, Date.now() + 60_000, dir, () => true); // not idle: stays landing
+    parkHook(prompt("/nomo-cc:status"), dir);
+    expect(readPark(A, dir)?.state).toBe("landing");
+    expect(readPark(A, dir)?.turnStartedAt).toBeNumber();
   });
 
   test("a turn still running (foreground, or a later /nomo-cc: command): deferred to its Stop", async () => {
