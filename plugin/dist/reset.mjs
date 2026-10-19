@@ -103,7 +103,7 @@ async function sha256Hex(s) {
 }
 
 // src/core/shared.ts
-var PLUGIN_VERSION = "2.3.31";
+var PLUGIN_VERSION = "2.3.32";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -1197,6 +1197,28 @@ function parkHook(input, dir = PARK_DIR) {
   } catch {}
   return;
 }
+function cloudActive(id, path = `${CC_DIR}/cloud.json`) {
+  try {
+    const c = JSON.parse(readFileSync2(path, "utf8"));
+    return (Array.isArray(c.active) ? c.active : [c.current]).includes(id);
+  } catch {
+    return false;
+  }
+}
+function cloudState(p, run) {
+  switch (p?.state) {
+    case "moving":
+      return "moving";
+    case "landing":
+      return "returning";
+    case "back":
+      return "back";
+    case "cloud":
+      return run?.running ? "returning" : run && run.code !== 0 ? "failed" : "cloud";
+  }
+  return;
+}
+var parkWantsCommands = (p) => p?.state === "moving" || p?.state === "cloud" || p?.state === "landing";
 
 // src/entries/reset.ts
 function classifyResetSession(record, isAlive) {

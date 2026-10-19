@@ -1158,7 +1158,9 @@ export function resumeCommand(cwd: string, id: string, model?: string): string {
 export const sameWindowBackLine = (id: string): string => `Back. Type /resume ${id} to continue here.`;
 
 async function back(omg: string, args: Map<string, string | true>): Promise<void> {
-  const startedAt = Date.now();
+  // --phone (NOM-93: the watchdog runs this for the phone's Bring back): no turn of the window launched
+  // this run, so "idle" is just "no open turn" (stageLanding with -1), not "a turn ended since".
+  const startedAt = args.has("--phone") ? -1 : Date.now();
   const cloud = loadCloud();
   const here = args.get("--from-session") || process.env.CLAUDE_CODE_SESSION_ID;
   // From a parked window: that window's session (a rerun whose back was interrupted after staging is

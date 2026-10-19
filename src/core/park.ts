@@ -91,7 +91,8 @@ function land(id: string, p: Park, dir: string): Park | undefined {
 /** Same-window --back has staged the box copy. --back runs as a BACKGROUND Bash, so its turn usually
  *  ended long ago: if the window is idle (a turn end newer than both this run's start and the last turn
  *  opened) or gone, install now; otherwise leave it "landing" for the running turn's Stop. True =
- *  installed (state "back"). ponytail: a /nomo-cc: command typed between the check and the rename races
+ *  installed (state "back"). runStartedAt -1 (a phone-started back, no window turn behind it) makes
+ *  idle simply "no open turn". ponytail: a /nomo-cc: command typed between the check and the rename races
  *  it (ms); a per-window lock if that ever shows up. */
 export function stageLanding(id: string, l: { staged: string; target: string; resume: string }, runStartedAt: number,
   dir = PARK_DIR, alive: (pid: number) => boolean = pidAlive): boolean {
@@ -150,3 +151,34 @@ export function parkHook(input: Record<string, unknown>, dir = PARK_DIR): string
   } catch { /* fail open */ }
   return undefined;
 }
+
+// --- NOM-93: the phone's "Bring back" -------------------------------------------------------------
+
+/** Is `id` in cloud.json `active` (pre-2.3.29 files: `current`)? A plain read: every cloud.json writer
+ *  (handoff's updateCloudAt) renames a complete tmp file into place, so a reader never sees a torn one;
+ *  the lock only serializes writers, and taking it here could stall the watchdog for its 15 s wait. */
+export function cloudActive(id: string, path = `${CC_DIR}/cloud.json`): boolean {
+  try {
+    const c = JSON.parse(readFileSync(path, "utf8"));
+    return (Array.isArray(c.active) ? c.active : [c.current]).includes(id);
+  } catch { return false; }
+}
+
+/** A phone-started `--back` for one session, as the watchdog tracks it (in memory). */
+export interface BackRun { running: boolean; code?: number | null }
+
+/** The blob's `cloud` key: what the phone shows for a parked session. Undefined → no key. */
+export type CloudState = "moving" | "cloud" | "returning" | "failed" | "back";
+export function cloudState(p: Park | undefined, run?: BackRun): CloudState | undefined {
+  switch (p?.state) {
+    case "moving": return "moving";
+    case "landing": return "returning";
+    case "back": return "back";
+    case "cloud": return run?.running ? "returning" : run && run.code !== 0 ? "failed" : "cloud";
+  }
+  return undefined;
+}
+
+/** A parked session the phone may act on keeps the command long-poll up. */
+export const parkWantsCommands = (p: Park | undefined): boolean =>
+  p?.state === "moving" || p?.state === "cloud" || p?.state === "landing";

@@ -3,7 +3,7 @@ import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { clearPark, MOVING_STALE_MS, parkHook, readPark, stageLanding, writePark } from "./park";
+import { clearPark, cloudActive, cloudState, MOVING_STALE_MS, parkHook, parkWantsCommands, readPark, stageLanding, writePark } from "./park";
 
 const A = "0a1b2c3d-1111-4222-8333-444455556666";
 const dirs: string[] = [];
@@ -200,9 +200,61 @@ describe("background --back finishing in the parked window", () => {
     expect(stageLanding(A, b.l, t0, b.dir, () => true)).toBe(false);
   });
 
+  test("a phone-started back (-1): an idle window installs now, even with no turn stamped (handoff-later's marker)", () => {
+    const { dir, target, l } = setup();
+    writePark(A, { state: "cloud", pid: process.pid }, dir); // no turnEndedAt/turnStartedAt at all
+    expect(stageLanding(A, l, -1, dir, () => true)).toBe(true);
+    expect(readFileSync(target, "utf8")).toBe("box\n");
+    expect(reason(parkHook(prompt("hi"), dir))?.reason).toBe(`Back. Type /resume ${A} to continue here.`);
+  });
+
+  test("a phone-started back (-1) defers while a /nomo-cc: turn is open, then lands at its Stop", async () => {
+    const { dir, target, l } = setup();
+    parkHook({ session_id: A, hook_event_name: "Stop" }, dir);
+    await wait();
+    parkHook(prompt("/nomo-cc:status"), dir); // open turn
+    expect(stageLanding(A, l, -1, dir, () => true)).toBe(false);
+    expect(readFileSync(target, "utf8")).toBe("mac\n");
+    parkHook({ session_id: A, hook_event_name: "Stop" }, dir);
+    expect(readPark(A, dir)?.state).toBe("back");
+    expect(readFileSync(target, "utf8")).toBe("box\n");
+  });
+
   test("the window is gone: installed now", () => {
     const { dir, target, l } = setup();
     expect(stageLanding(A, l, Date.now(), dir, () => false)).toBe(true);
     expect(readFileSync(target, "utf8")).toBe("box\n");
+  });
+});
+
+describe("bring back state (NOM-93)", () => {
+  test("cloudState covers every marker and back outcome", () => {
+    expect(cloudState(undefined)).toBeUndefined();
+    expect(cloudState({ state: "moving", since: 0 })).toBe("moving");
+    expect(cloudState({ state: "cloud", since: 0 })).toBe("cloud");
+    expect(cloudState({ state: "cloud", since: 0 }, { running: true })).toBe("returning");
+    expect(cloudState({ state: "cloud", since: 0 }, { running: false, code: 1 })).toBe("failed");
+    expect(cloudState({ state: "cloud", since: 0 }, { running: false, code: null })).toBe("failed");
+    expect(cloudState({ state: "cloud", since: 0 }, { running: false, code: 0 })).toBe("cloud");
+    expect(cloudState({ state: "landing", since: 0 })).toBe("returning");
+    expect(cloudState({ state: "back", since: 0 })).toBe("back");
+    expect(cloudState({ state: "elsewhere", since: 0 })).toBeUndefined();
+  });
+
+  test("the long-poll stays up for moving/cloud/landing only", () => {
+    expect(["moving", "cloud", "landing", "back", "elsewhere"].map((state) => parkWantsCommands({ state, since: 0 } as any)))
+      .toEqual([true, true, true, false, false]);
+    expect(parkWantsCommands(undefined)).toBe(false);
+  });
+
+  test("cloudActive reads active, and a legacy current", () => {
+    const f = join(tmp(), "cloud.json");
+    expect(cloudActive(A, f)).toBe(false);
+    writeFileSync(f, JSON.stringify({ active: [A] }));
+    expect(cloudActive(A, f)).toBe(true);
+    writeFileSync(f, JSON.stringify({ current: A }));
+    expect(cloudActive(A, f)).toBe(true);
+    writeFileSync(f, JSON.stringify({ active: [] }));
+    expect(cloudActive(A, f)).toBe(false);
   });
 });

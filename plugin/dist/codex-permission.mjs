@@ -111,7 +111,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "2.3.31";
+var PLUGIN_VERSION = "2.3.32";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -3181,6 +3181,28 @@ function parkHook(input, dir = PARK_DIR) {
   } catch {}
   return;
 }
+function cloudActive(id, path = `${CC_DIR}/cloud.json`) {
+  try {
+    const c = JSON.parse(readFileSync2(path, "utf8"));
+    return (Array.isArray(c.active) ? c.active : [c.current]).includes(id);
+  } catch {
+    return false;
+  }
+}
+function cloudState(p, run) {
+  switch (p?.state) {
+    case "moving":
+      return "moving";
+    case "landing":
+      return "returning";
+    case "back":
+      return "back";
+    case "cloud":
+      return run?.running ? "returning" : run && run.code !== 0 ? "failed" : "cloud";
+  }
+  return;
+}
+var parkWantsCommands = (p) => p?.state === "moving" || p?.state === "cloud" || p?.state === "landing";
 
 // src/core/session-state.ts
 var SESSION_STATE_STALE_MS = 86400000;

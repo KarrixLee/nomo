@@ -25,6 +25,8 @@ import {
   watchdogEventHeaders, WAITING_HEARTBEAT_AFTER_MS, withDeadline,
 } from "./cc-watchdog";
 import type { CommandPayload, DrainCommandsDeps, PostDetail, PostOutcome, RecordEntry } from "./cc-watchdog";
+import { backRuns, BRING_BACK_COMMAND_KIND, correctCloudState, withCloudKey } from "./cc-watchdog";
+import type { Park } from "../core/park";
 import { resolveOnRelay } from "../core/codex-remote-input";
 import { CODEX_PROXY_STDOUT_ENDED } from "../core/codex-proxy-transport";
 import { buildStatePlaintext, STATE_HOLD_MAX_AGE_MS } from "../core/session-state";
@@ -4949,5 +4951,122 @@ describe("commandWaitLoop (GET /v1/cc/commands/wait long-poll)", () => {
     expect(isCommandActiveSession(rec({ lastEvent: "done" }))).toBe(false);
     expect(isCommandActiveSession(rec({ lastEvent: "working", op: "done" }))).toBe(false);
     expect(isCommandActiveSession(rec({ lastEvent: "sessionStart" }))).toBe(false);
+  });
+});
+
+describe("bring back from the phone (NOM-93)", () => {
+  const NOW = 50_000_000;
+  const S = "0a1b2c3d-1111-4222-8333-444455556666";
+  let seq = 0;
+  beforeEach(() => resetCommandState());
+  const cmd = async (over: Partial<CommandPayload> = {}) => ({
+    id: `bb-${++seq}`,
+    blob: await encryptBlob(KEY, { kind: BRING_BACK_COMMAND_KIND, sessionId: S, ts: NOW, nonce: `bbn-${++seq}`, ...over }),
+  });
+  const harness = (state: Park["state"] | undefined, active = true) => {
+    const spawned: string[] = [];
+    const exits: Array<(code: number | null) => void> = [];
+    const traces: Record<string, unknown>[] = [];
+    const deps: DrainCommandsDeps = {
+      now: () => NOW,
+      readRecords: async () => [], // no session record: bring-back must not need one
+      trace: (e) => traces.push(e as Record<string, unknown>),
+      bringBack: {
+        readPark: () => (state ? { state, since: 0 } : undefined),
+        cloudActive: () => active,
+        spawn: (id, onExit) => { spawned.push(id); exits.push(onExit); },
+      },
+    };
+    return { spawned, exits, traces, deps };
+  };
+
+  test("a cloud-parked, active session spawns exactly once; a second tap while it runs does not", async () => {
+    const { spawned, exits, traces, deps } = harness("cloud");
+    const [a, b] = [await cmd(), await cmd()];
+    await drainCommands(cfg(), { ...deps, take: () => [a] });
+    await drainCommands(cfg(), { ...deps, take: () => [b] });
+    expect(spawned).toEqual([S]);
+    expect(traces.map((t) => t.result)).toEqual(["back-started", "back-running"]);
+    exits[0](2);
+    expect(backRuns.get(S)).toEqual({ running: false, code: 2 });
+    const retry = await cmd();
+    await drainCommands(cfg(), { ...deps, take: () => [retry] }); // a retry after a failure runs
+    expect(spawned).toEqual([S, S]);
+  });
+
+  test("moving, back, landing, no marker, or not in cloud.json: never spawns (not-parked)", async () => {
+    for (const [state, active] of [["moving", true], ["back", true], ["landing", true], [undefined, true], ["cloud", false]] as const) {
+      const { spawned, traces, deps } = harness(state, active);
+      const c = await cmd();
+      await drainCommands(cfg(), { ...deps, take: () => [c] });
+      expect(spawned).toEqual([]);
+      expect(traces.map((t) => t.result)).toEqual(["not-parked"]);
+    }
+  });
+
+  test("stale ts and a replayed nonce never spawn", async () => {
+    const { spawned, traces, deps } = harness("cloud");
+    const stale = await cmd({ ts: NOW - 10 * 60_000 });
+    await drainCommands(cfg(), { ...deps, take: () => [stale] });
+    const first = await cmd();
+    await drainCommands(cfg(), { ...deps, take: () => [first] });
+    backRuns.get(S)!.running = false; // finished, so only the nonce can refuse the replay
+    await drainCommands(cfg(), { ...deps, take: () => [{ id: "fresh-id", blob: first.blob }] });
+    expect(spawned).toEqual([S]);
+    expect(traces.map((t) => t.result)).toEqual(["stale", "back-started", "replay"]);
+  });
+
+  test("blob round-trip: `cloud` is added LAST (after plan/dbg), replaced, and removed", async () => {
+    const plain = { status: "done", title: "t", at: 5, plan: "p", dbg: "d" };
+    const set = withCloudKey(plain, "returning");
+    expect(Object.keys(set)).toEqual(["status", "title", "at", "plan", "dbg", "cloud"]);
+    expect(set.cloud).toBe("returning");
+    const swapped = withCloudKey(set, "back");
+    expect(Object.keys(swapped).at(-1)).toBe("cloud");
+    expect(swapped.cloud).toBe("back");
+    expect(withCloudKey(swapped, undefined)).toEqual(plain);
+    // Over budget: dbg/plan give way, never `cloud`.
+    const huge = withCloudKey({ status: "done", plan: "x".repeat(5000), dbg: "y".repeat(150) }, "failed");
+    expect(huge.cloud).toBe("failed");
+    expect(Object.keys(huge).at(-1)).toBe("cloud");
+    expect((huge.plan as string).length).toBeLessThan(5000);
+    expect((await encryptBlob(KEY, huge)).length).toBeLessThanOrEqual(3072); // the worker's sealed-blob ceiling
+  });
+
+  test("correctCloudState POSTs only on change (status/op unchanged) and stores the re-sealed blob", async () => {
+    const id = "cloud-corr-1";
+    const blob = await encryptBlob(KEY, { status: "done", title: "t" });
+    const record = rec({ op: "done", lastEvent: "done", prio: 0, blob, pairingId: "p" });
+    const posts: any[] = [];
+    let written: SessionRecord | undefined;
+    const deps = {
+      post: async (b: object) => { posts.push(b); return "delivered" as PostOutcome; },
+      now: () => NOW,
+      readRecord: async () => record,
+      writeRecord: async (_p: string, r: SessionRecord) => { written = r; },
+    };
+    expect(await correctCloudState(cfg(), "/x", id, record, undefined, deps)).toBe("uncorrected");
+    expect(await correctCloudState(cfg(), "/x", id, record, "cloud", deps)).toBe("corrected");
+    expect(posts).toHaveLength(1);
+    expect(posts[0]).toMatchObject({ v: 2, sessionId: id, op: "done", prio: 0, ts: NOW });
+    expect(await decryptBlob(KEY, posts[0].blob)).toEqual({ status: "done", title: "t", cloud: "cloud" });
+    expect(written!.blob).toBe(posts[0].blob);
+    // Same state again: nothing (inside the keep-alive window).
+    expect(await correctCloudState(cfg(), "/x", id, written!, "cloud", deps)).toBe("uncorrected");
+    expect(posts).toHaveLength(1);
+    // Marker gone: the key is removed.
+    expect(await correctCloudState(cfg(), "/x", id, written!, undefined, { ...deps, readRecord: async () => written! })).toBe("corrected");
+    expect(await decryptBlob(KEY, posts[1].blob)).toEqual({ status: "done", title: "t" });
+  });
+
+  test("a parked row is never retired (the marker, not the record, decides)", async () => {
+    const posts: object[] = [];
+    const old = rec({ op: "done", lastEvent: "done", blob: "B", ts: NOW - RETIRE_AFTER_MS - 1 });
+    expect(await retireDoneStale(cfg(), "/x", S, old, NOW, {
+      post: async (b) => { posts.push(b); return "delivered"; }, readPark: () => ({ state: "cloud", since: 0 }),
+      deleteRecord: async () => { throw new Error("must not delete"); },
+    })).toBe("skip");
+    expect(posts).toEqual([]);
+    expect(isCommandActiveSession(old)).toBe(false); // the record alone would idle the poll…
   });
 });
