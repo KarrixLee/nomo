@@ -6,6 +6,7 @@
 //   bun plugin/dist/handoff.mjs --screen | --send "<text>" | --send-key <tmux key, e.g. Escape, BTab, C-c>
 //   bun plugin/dist/handoff.mjs --bake      (one-off: publish the credential-free `nomo-base` template)
 //   bun plugin/dist/handoff.mjs --back [--session <uuid>] [--force] [--no-open] [--wait <min>]
+//   bun plugin/dist/handoff.mjs --check     (only print the cloud-readiness block, core/readiness.ts; moves nothing)
 //   bun plugin/dist/handoff.mjs --later [--session <uuid>] | --later-cancel | --later-status   (/nomo-cc:handoff, see core/handoff-later.ts)
 //
 // WHAT TRAVELS: a git bundle of HEAD + `git diff --binary HEAD` + a tar of untracked non-ignored files
@@ -69,6 +70,7 @@ import { b64url, type Bytes, fromB64url } from "../core/crypto";
 import { renderPairPage } from "../core/pair-page";
 import { buildPairURL, DEFAULT_WORKER_URL } from "../core/pair-url";
 import { normalizeModelId } from "../core/adapter";
+import { cloudReadiness, gitProbe } from "../core/readiness";
 import { clearPark, PARK_DIR, readPark, stageLanding, writePark } from "../core/park";
 import { atomicWrite, CC_DIR, pidAlive, pidAncestors, pidCommand, readRecord, SESSIONS_DIR } from "../core/shared";
 import {
@@ -1178,6 +1180,15 @@ async function back(omg: string, args: Map<string, string | true>): Promise<void
   }
 }
 
+/** The "Cloud check:" block for the project at `cwd` (its repo root when git). Never throws, never blocks. */
+function readiness(cwd: string): string | undefined {
+  try {
+    let root = cwd;
+    try { root = execFileSync("git", ["rev-parse", "--show-toplevel"], { cwd, stdio: ["ignore", "pipe", "ignore"] }).toString().trim(); } catch { /* not git */ }
+    return cloudReadiness(root, { home: process.env.HOME!, cwd, git: gitProbe(root) });
+  } catch { return undefined; }
+}
+
 /** Mac files under <projDir>/<dir>/ as paths relative to projDir. */
 function listUnder(projDir: string, dir: string): string[] {
   return listFiles(join(projDir, dir)).map((r) => join(dir, r));
@@ -1240,6 +1251,8 @@ async function later(args: Map<string, string | true>, keys: { omg?: string; ope
   let warn: string | undefined;
   try { warn = sizeWarning(contextTokensOf(join(home, ".claude", "projects", projectDirName(cwd), `${session}.jsonl`))); } catch { /* estimate only */ }
   if (warn) console.log(warn);
+  const ready = readiness(cwd);
+  if (ready) console.log(ready);
 }
 
 /** The detached helper spawned by later(). */
@@ -1291,6 +1304,8 @@ async function main(): Promise<void> {
     console.log(PAIR_URL_MARKER + url);
     return;
   }
+
+  if (args.has("--check")) { console.log(readiness(process.cwd()) ?? "Cloud check: couldn't run here."); return; }
 
   // --then: argv from a terminal, NOMO_THEN env from the /nomo-cc:handoff helper; unset so no child inherits it.
   const then = (typeof args.get("--then") === "string" ? String(args.get("--then")) : process.env.NOMO_THEN ?? "").replace(/\r\n?/g, "\n");
@@ -1374,6 +1389,8 @@ ${BOX_PLUGIN}
     plan = build(args, out);
     console.log(`Handing off session ${plan.uuid} (${plan.model}) from ${plan.cwd} · Nomo worker ${worker}`);
     if (plan.warn) console.log(plan.warn);
+    const ready = readiness(plan.cwd);
+    if (ready) console.log(ready);
     id = await ensureBox(omg);
     for (const [box, local] of Object.entries(plan.artifacts)) {
       await api(omg, "POST", `/sandboxes/${id}/files`, [{ path: box, content: readFileSync(local).toString("base64"), mode: 0o600 }]);
