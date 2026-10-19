@@ -25,7 +25,7 @@ import {
   watchdogEventHeaders, WAITING_HEARTBEAT_AFTER_MS, withDeadline,
 } from "./cc-watchdog";
 import type { CommandPayload, DrainCommandsDeps, PostDetail, PostOutcome, RecordEntry } from "./cc-watchdog";
-import { backRuns, BRING_BACK_COMMAND_KIND, correctCloudState, withCloudKey } from "./cc-watchdog";
+import { backRuns, BRING_BACK_COMMAND_KIND, correctCloudState, handoffCommand, withCloudKey } from "./cc-watchdog";
 import type { Park } from "../core/park";
 import { resolveOnRelay } from "../core/codex-remote-input";
 import { CODEX_PROXY_STDOUT_ENDED } from "../core/codex-proxy-transport";
@@ -4963,7 +4963,7 @@ describe("bring back from the phone (NOM-93)", () => {
     id: `bb-${++seq}`,
     blob: await encryptBlob(KEY, { kind: BRING_BACK_COMMAND_KIND, sessionId: S, ts: NOW, nonce: `bbn-${++seq}`, ...over }),
   });
-  const harness = (state: Park["state"] | undefined, active = true) => {
+  const harness = (state: Park["state"] | undefined, active = true, locked = false) => {
     const spawned: string[] = [];
     const exits: Array<(code: number | null) => void> = [];
     const traces: Record<string, unknown>[] = [];
@@ -4974,6 +4974,7 @@ describe("bring back from the phone (NOM-93)", () => {
       bringBack: {
         readPark: () => (state ? { state, since: 0 } : undefined),
         cloudActive: () => active,
+        lockHeld: () => locked,
         spawn: (id, onExit) => { spawned.push(id); exits.push(onExit); },
       },
     };
@@ -5002,6 +5003,22 @@ describe("bring back from the phone (NOM-93)", () => {
       expect(spawned).toEqual([]);
       expect(traces.map((t) => t.result)).toEqual(["not-parked"]);
     }
+  });
+
+  test("a --back already running elsewhere (its lock is held) is not started again", async () => {
+    const { spawned, traces, deps } = harness("cloud", true, true);
+    const c = await cmd();
+    await drainCommands(cfg(), { ...deps, take: () => [c] });
+    expect(spawned).toEqual([]);
+    expect(traces.map((t) => t.result)).toEqual(["back-running"]);
+  });
+
+  test("handoff is resolved at spawn time: the sibling entry, else the version-stable shim, else nothing", () => {
+    const wd = "/p/1.0/dist/cc-watchdog.mjs";
+    expect(handoffCommand((f) => f === "/p/1.0/dist/handoff.mjs", wd, "/s")).toEqual([process.execPath, "/p/1.0/dist/handoff.mjs"]);
+    expect(handoffCommand((f) => f === "/s/hook-shim.sh", wd, "/s")).toEqual(["/s/hook-shim.sh", "handoff"]);
+    expect(handoffCommand(() => false, wd, "/s")).toBeUndefined();
+    expect(handoffCommand((f) => f.endsWith("entries/handoff.ts"), "/r/entries/cc-watchdog.ts", "/s")).toEqual([process.execPath, "/r/entries/handoff.ts"]);
   });
 
   test("stale ts and a replayed nonce never spawn", async () => {

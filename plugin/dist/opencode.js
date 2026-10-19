@@ -81,7 +81,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "2.3.32";
+var PLUGIN_VERSION = "2.3.33";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -2586,6 +2586,12 @@ function parkHook(input, dir = PARK_DIR) {
   } catch {}
   return;
 }
+function withParked(body, dir = PARK_DIR) {
+  const id = body.sessionId;
+  const s = typeof id === "string" ? readPark(id, dir)?.state : undefined;
+  return s && s !== "elsewhere" ? { ...body, parked: true } : body;
+}
+var BACK_LOCK_DIR = `${CC_DIR}/cloud-back`;
 
 // src/core/session-state.ts
 var STATE_HOLD_MAX_AGE_MS = 600000;
@@ -3288,7 +3294,7 @@ async function runHook(agent) {
           "x-cc-version": PLUGIN_VERSION,
           "x-cc-approvals": await localApprovalsState()
         },
-        body: JSON.stringify(envelope),
+        body: JSON.stringify(withParked(envelope)),
         signal: AbortSignal.timeout(2000)
       });
     } catch (e) {

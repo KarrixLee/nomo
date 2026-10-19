@@ -4,7 +4,7 @@ var __require = /* @__PURE__ */ createRequire(import.meta.url);
 // src/entries/cc-watchdog.ts
 import { readdir as readdir4, readFile as readFile8, unlink as unlink4 } from "node:fs/promises";
 import { spawn as spawn3 } from "node:child_process";
-import { closeSync, mkdirSync as mkdirSync2, openSync, readFileSync as readFileSync3, statSync as statSync3, unlinkSync as unlinkSync2 } from "node:fs";
+import { closeSync, existsSync as existsSync3, mkdirSync as mkdirSync2, openSync, readFileSync as readFileSync3, statSync as statSync3, unlinkSync as unlinkSync2, writeSync } from "node:fs";
 import { homedir, hostname as hostname4 } from "node:os";
 import { basename as basename6 } from "node:path";
 
@@ -107,7 +107,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "2.3.32";
+var PLUGIN_VERSION = "2.3.33";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -5499,7 +5499,7 @@ function cloudActive(id, path = `${CC_DIR}/cloud.json`) {
     return false;
   }
 }
-function cloudState(p, run) {
+function cloudState(p, run, locked = false) {
   switch (p?.state) {
     case "moving":
       return "moving";
@@ -5508,11 +5508,50 @@ function cloudState(p, run) {
     case "back":
       return "back";
     case "cloud":
-      return run?.running ? "returning" : run && run.code !== 0 ? "failed" : "cloud";
+      return run?.running || locked ? "returning" : run && run.code !== 0 ? "failed" : "cloud";
   }
   return;
 }
 var parkWantsCommands = (p) => p?.state === "moving" || p?.state === "cloud" || p?.state === "landing";
+function withParked(body, dir = PARK_DIR) {
+  const id = body.sessionId;
+  const s = typeof id === "string" ? readPark(id, dir)?.state : undefined;
+  return s && s !== "elsewhere" ? { ...body, parked: true } : body;
+}
+var BACK_LOCK_DIR = `${CC_DIR}/cloud-back`;
+var backLockFile = (id, dir) => join3(dir, `${id.slice(0, 12)}.lock`);
+function backLockHolder(id, dir = BACK_LOCK_DIR, alive = pidAlive) {
+  try {
+    const pid = Number(readFileSync2(backLockFile(id, dir), "utf8"));
+    return Number.isInteger(pid) && pid > 0 && alive(pid) ? pid : undefined;
+  } catch {
+    return;
+  }
+}
+function takeBackLock(id, dir = BACK_LOCK_DIR, alive = pidAlive) {
+  mkdirSync(dir, { recursive: true, mode: 448 });
+  for (let i = 0;i < 2; i++) {
+    try {
+      writeFileSync(backLockFile(id, dir), String(process.pid), { flag: "wx", mode: 384 });
+      return true;
+    } catch (e) {
+      if (e?.code !== "EEXIST")
+        throw e;
+    }
+    if (backLockHolder(id, dir, alive) !== undefined)
+      return false;
+    try {
+      unlinkSync(backLockFile(id, dir));
+    } catch {}
+  }
+  return false;
+}
+function releaseBackLock(id, dir = BACK_LOCK_DIR) {
+  try {
+    if (readFileSync2(backLockFile(id, dir), "utf8") === String(process.pid))
+      unlinkSync(backLockFile(id, dir));
+  } catch {}
+}
 
 // src/core/hook.ts
 var TOOL_DETAIL = { ...claudeToolDetail, ...codexToolDetail };
@@ -6199,7 +6238,7 @@ async function runHook(agent) {
           "x-cc-version": PLUGIN_VERSION,
           "x-cc-approvals": await localApprovalsState()
         },
-        body: JSON.stringify(envelope),
+        body: JSON.stringify(withParked(envelope)),
         signal: AbortSignal.timeout(2000)
       });
     } catch (e) {
@@ -8613,7 +8652,8 @@ async function postEvent(config, body, opts = {}) {
   const detail = opts.detail;
   const lanHint = await lanHintPublisher.take(config);
   try {
-    const payload = lanHint ? { ...body, lanHint } : body;
+    const parked = withParked(body);
+    const payload = lanHint ? { ...parked, lanHint } : parked;
     const res = await fetch(`${config.url}/v1/cc/event`, {
       method: "POST",
       headers: watchdogEventHeaders(config, await localApprovalsState()),
@@ -8933,16 +8973,44 @@ async function drainCommands(config, deps = {}) {
   }
 }
 var backRuns = new Map;
-var HANDOFF_PATH = WATCHDOG_PATH.replace(/cc-watchdog\.(mjs|ts)$/, "handoff.$1");
+function handoffCommand(exists = existsSync3, watchdogPath = WATCHDOG_PATH, ccDir = CC_DIR) {
+  const sibling = watchdogPath.replace(/cc-watchdog\.(mjs|ts)$/, "handoff.$1");
+  if (exists(sibling))
+    return [process.execPath, sibling];
+  const shim = `${ccDir}/hook-shim.sh`;
+  return exists(shim) ? [shim, "handoff"] : undefined;
+}
 function spawnBack(id, onExit) {
-  const dir = `${CC_DIR}/cloud-back`;
-  mkdirSync2(dir, { recursive: true, mode: 448 });
-  const fd = openSync(`${dir}/${id.slice(0, 12)}.log`, "a", 384);
+  mkdirSync2(BACK_LOCK_DIR, { recursive: true, mode: 448 });
+  const log = `${BACK_LOCK_DIR}/${id.slice(0, 12)}.log`;
+  const note = (why) => {
+    try {
+      const f = openSync(log, "a", 384);
+      try {
+        writeSync(f, `[${new Date().toISOString()}] bring-back from the phone: ${why}
+`);
+      } finally {
+        closeSync(f);
+      }
+    } catch {}
+  };
+  const cmd = handoffCommand();
+  if (!cmd) {
+    note("Nomo's installed files were not found (plugin updated or removed?); reinstall or run /nomo-cc:back.");
+    throw new Error("no handoff entry");
+  }
+  const fd = openSync(log, "a", 384);
   try {
     const { CLAUDE_CODE_SESSION_ID: _drop, ...env } = process.env;
-    const child = spawn3(process.execPath, [HANDOFF_PATH, "--back", "--session", id, "--from-session", id, "--phone"], { detached: true, stdio: ["ignore", fd, fd], env, cwd: homedir() });
-    child.on("error", () => onExit(1)).on("exit", (code) => onExit(code));
+    const child = spawn3(cmd[0], [...cmd.slice(1), "--back", "--session", id, "--from-session", id, "--phone"], { detached: true, stdio: ["ignore", fd, fd], env, cwd: homedir() });
+    child.on("error", (e) => {
+      note(`could not start ${cmd[0]}: ${e.message}`);
+      onExit(1);
+    }).on("exit", (code) => onExit(code));
     child.unref();
+  } catch (e) {
+    note(`could not start ${cmd[0]}: ${e?.message ?? e}`);
+    throw e;
   } finally {
     closeSync(fd);
   }
@@ -8950,7 +9018,7 @@ function spawnBack(id, onExit) {
 function bringBack(id, deps = {}) {
   if ((deps.readPark ?? readPark)(id)?.state !== "cloud" || !(deps.cloudActive ?? cloudActive)(id))
     return "not-parked";
-  if (backRuns.get(id)?.running)
+  if (backRuns.get(id)?.running || (deps.lockHeld ?? ((s) => backLockHolder(s) !== undefined))(id))
     return "back-running";
   const run = { running: true };
   backRuns.set(id, run);
@@ -10108,7 +10176,7 @@ async function sweep(config, deps = {}) {
       }
       remaining++;
       if (config && record && !pendingDoneHandled) {
-        const cloudFix = await correctCloudState(config, path, sessionId, record, cloudState(park, backRuns.get(sessionId)));
+        const cloudFix = await correctCloudState(config, path, sessionId, record, cloudState(park, backRuns.get(sessionId), park?.state === "cloud" && backLockHolder(sessionId) !== undefined));
         if (cloudFix === "revoked")
           return { revoked: true };
         if (cloudFix === "corrected") {
@@ -10683,6 +10751,7 @@ export {
   extractCommands,
   fileCursorStore,
   goneStrikeShouldTeardown,
+  handoffCommand,
   hasInterruptMarker,
   heartbeatKind,
   isClaudeIdleReapEligible,

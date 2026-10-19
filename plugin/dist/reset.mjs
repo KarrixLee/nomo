@@ -103,7 +103,7 @@ async function sha256Hex(s) {
 }
 
 // src/core/shared.ts
-var PLUGIN_VERSION = "2.3.32";
+var PLUGIN_VERSION = "2.3.33";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -1205,7 +1205,7 @@ function cloudActive(id, path = `${CC_DIR}/cloud.json`) {
     return false;
   }
 }
-function cloudState(p, run) {
+function cloudState(p, run, locked = false) {
   switch (p?.state) {
     case "moving":
       return "moving";
@@ -1214,11 +1214,50 @@ function cloudState(p, run) {
     case "back":
       return "back";
     case "cloud":
-      return run?.running ? "returning" : run && run.code !== 0 ? "failed" : "cloud";
+      return run?.running || locked ? "returning" : run && run.code !== 0 ? "failed" : "cloud";
   }
   return;
 }
 var parkWantsCommands = (p) => p?.state === "moving" || p?.state === "cloud" || p?.state === "landing";
+function withParked(body, dir = PARK_DIR) {
+  const id = body.sessionId;
+  const s = typeof id === "string" ? readPark(id, dir)?.state : undefined;
+  return s && s !== "elsewhere" ? { ...body, parked: true } : body;
+}
+var BACK_LOCK_DIR = `${CC_DIR}/cloud-back`;
+var backLockFile = (id, dir) => join2(dir, `${id.slice(0, 12)}.lock`);
+function backLockHolder(id, dir = BACK_LOCK_DIR, alive = pidAlive) {
+  try {
+    const pid = Number(readFileSync2(backLockFile(id, dir), "utf8"));
+    return Number.isInteger(pid) && pid > 0 && alive(pid) ? pid : undefined;
+  } catch {
+    return;
+  }
+}
+function takeBackLock(id, dir = BACK_LOCK_DIR, alive = pidAlive) {
+  mkdirSync(dir, { recursive: true, mode: 448 });
+  for (let i = 0;i < 2; i++) {
+    try {
+      writeFileSync(backLockFile(id, dir), String(process.pid), { flag: "wx", mode: 384 });
+      return true;
+    } catch (e) {
+      if (e?.code !== "EEXIST")
+        throw e;
+    }
+    if (backLockHolder(id, dir, alive) !== undefined)
+      return false;
+    try {
+      unlinkSync(backLockFile(id, dir));
+    } catch {}
+  }
+  return false;
+}
+function releaseBackLock(id, dir = BACK_LOCK_DIR) {
+  try {
+    if (readFileSync2(backLockFile(id, dir), "utf8") === String(process.pid))
+      unlinkSync(backLockFile(id, dir));
+  } catch {}
+}
 
 // src/entries/reset.ts
 function classifyResetSession(record, isAlive) {

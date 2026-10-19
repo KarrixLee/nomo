@@ -169,12 +169,12 @@ export interface BackRun { running: boolean; code?: number | null }
 
 /** The blob's `cloud` key: what the phone shows for a parked session. Undefined → no key. */
 export type CloudState = "moving" | "cloud" | "returning" | "failed" | "back";
-export function cloudState(p: Park | undefined, run?: BackRun): CloudState | undefined {
+export function cloudState(p: Park | undefined, run?: BackRun, locked = false): CloudState | undefined {
   switch (p?.state) {
     case "moving": return "moving";
     case "landing": return "returning";
     case "back": return "back";
-    case "cloud": return run?.running ? "returning" : run && run.code !== 0 ? "failed" : "cloud";
+    case "cloud": return run?.running || locked ? "returning" : run && run.code !== 0 ? "failed" : "cloud";
   }
   return undefined;
 }
@@ -182,3 +182,39 @@ export function cloudState(p: Park | undefined, run?: BackRun): CloudState | und
 /** A parked session the phone may act on keeps the command long-poll up. */
 export const parkWantsCommands = (p: Park | undefined): boolean =>
   p?.state === "moving" || p?.state === "cloud" || p?.state === "landing";
+
+/** The `parked` flag on an event body (a blind boolean, like op): set while the session has a park
+ *  marker the phone acts on (moving/cloud/landing/back), so the worker keeps the row but out of the
+ *  island. Omitted otherwise. */
+export function withParked<T extends object>(body: T, dir = PARK_DIR): T | (T & { parked: true }) {
+  const id = (body as { sessionId?: unknown }).sessionId;
+  const s = typeof id === "string" ? readPark(id, dir)?.state : undefined;
+  return s && s !== "elsewhere" ? { ...body, parked: true } : body;
+}
+
+/** One --back per session, whoever starts it (phone, /nomo-cc:back, CLI): an O_EXCL lockfile holding
+ *  the runner's pid; a dead pid's lock is taken over. ponytail: two takers of the same STALE lock can
+ *  race the unlink (both need a crashed runner first); a reader that catches the file between create
+ *  and write sees no pid and treats it as stale. */
+export const BACK_LOCK_DIR = `${CC_DIR}/cloud-back`;
+const backLockFile = (id: string, dir: string): string => join(dir, `${id.slice(0, 12)}.lock`);
+export function backLockHolder(id: string, dir = BACK_LOCK_DIR, alive: (pid: number) => boolean = pidAlive): number | undefined {
+  try {
+    const pid = Number(readFileSync(backLockFile(id, dir), "utf8"));
+    return Number.isInteger(pid) && pid > 0 && alive(pid) ? pid : undefined;
+  } catch { return undefined; }
+}
+export function takeBackLock(id: string, dir = BACK_LOCK_DIR, alive: (pid: number) => boolean = pidAlive): boolean {
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  for (let i = 0; i < 2; i++) {
+    try { writeFileSync(backLockFile(id, dir), String(process.pid), { flag: "wx", mode: 0o600 }); return true; } catch (e: any) {
+      if (e?.code !== "EEXIST") throw e;
+    }
+    if (backLockHolder(id, dir, alive) !== undefined) return false;
+    try { unlinkSync(backLockFile(id, dir)); } catch { /* raced */ }
+  }
+  return false;
+}
+export function releaseBackLock(id: string, dir = BACK_LOCK_DIR): void {
+  try { if (readFileSync(backLockFile(id, dir), "utf8") === String(process.pid)) unlinkSync(backLockFile(id, dir)); } catch { /* gone */ }
+}

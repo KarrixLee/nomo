@@ -3,7 +3,7 @@ import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { clearPark, cloudActive, cloudState, MOVING_STALE_MS, parkHook, parkWantsCommands, readPark, stageLanding, writePark } from "./park";
+import { backLockHolder, clearPark, cloudActive, cloudState, MOVING_STALE_MS, parkHook, parkWantsCommands, readPark, releaseBackLock, stageLanding, takeBackLock, withParked, writePark } from "./park";
 
 const A = "0a1b2c3d-1111-4222-8333-444455556666";
 const dirs: string[] = [];
@@ -256,5 +256,36 @@ describe("bring back state (NOM-93)", () => {
     expect(cloudActive(A, f)).toBe(true);
     writeFileSync(f, JSON.stringify({ active: [] }));
     expect(cloudActive(A, f)).toBe(false);
+  });
+});
+
+describe("one back at a time + the parked flag (NOM-93)", () => {
+  test("a held lock blocks a second back; a dead holder's lock is taken over; release frees it", () => {
+    const dir = tmp();
+    expect(takeBackLock(A, dir, () => true)).toBe(true);
+    expect(backLockHolder(A, dir, () => true)).toBe(process.pid);
+    expect(takeBackLock(A, dir, () => true)).toBe(false); // concurrent back refused
+    expect(cloudState({ state: "cloud", since: 0 }, undefined, true)).toBe("returning");
+    expect(takeBackLock(A, dir, () => false)).toBe(true); // holder dead → taken over
+    releaseBackLock(A, dir);
+    expect(backLockHolder(A, dir, () => true)).toBeUndefined();
+    writeFileSync(join(dir, `${A.slice(0, 12)}.lock`), "999999");
+    releaseBackLock(A, dir); // never releases someone else's
+    expect(backLockHolder(A, dir, () => true)).toBe(999999);
+  });
+
+  test("`parked` is on the body iff a moving/cloud/landing/back marker exists", () => {
+    const dir = tmp();
+    const body = { v: 2, sessionId: A, op: "done" };
+    expect(withParked(body, dir)).toEqual(body);
+    for (const state of ["moving", "cloud", "landing", "back"] as const) {
+      writePark(A, { state }, dir);
+      expect(withParked(body, dir)).toEqual({ ...body, parked: true });
+    }
+    writePark(A, { state: "elsewhere" }, dir);
+    expect(withParked(body, dir)).toEqual(body);
+    clearPark(A, dir);
+    expect(withParked(body, dir)).toEqual(body);
+    expect(withParked({ v: 2, sessionId: "codex-pid-1" }, dir)).toEqual({ v: 2, sessionId: "codex-pid-1" });
   });
 });

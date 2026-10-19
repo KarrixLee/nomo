@@ -30,7 +30,7 @@
 
 import { readdir, readFile, unlink } from "node:fs/promises";
 import { spawn } from "node:child_process";
-import { closeSync, mkdirSync, openSync, readFileSync, statSync, unlinkSync } from "node:fs";
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, statSync, unlinkSync, writeSync } from "node:fs";
 import { homedir, hostname } from "node:os";
 import { basename } from "node:path";
 import { Bytes, decryptBlob, encryptBlob } from "../core/crypto";
@@ -57,7 +57,7 @@ import {
   watchdogBuildStamp, watchdogHolderIsLive, WATCHDOG_PATH, WATCHDOG_PID_PATH, writeInterruptFlagAt,
 } from "../core/shared";
 import { rememberBounded } from "../core/bounded-set";
-import { BackRun, cloudActive, cloudState, CloudState, Park, parkWantsCommands, readPark } from "../core/park";
+import { BackRun, backLockHolder, BACK_LOCK_DIR, cloudActive, cloudState, CloudState, Park, parkWantsCommands, readPark, withParked } from "../core/park";
 
 // The transcript-tail interrupt PARSERS live in the agent adapters now (the two detections are
 // structurally different). Re-export them so existing importers/tests that reference "./cc-watchdog"
@@ -1038,7 +1038,8 @@ async function postEvent(
   // published, and must be re-attached to the next one.
   const lanHint = await lanHintPublisher.take(config);
   try {
-    const payload = lanHint ? { ...body, lanHint } : body;
+    const parked = withParked(body); // NOM-93: blind flag, keeps a parked row out of the island
+    const payload = lanHint ? { ...parked, lanHint } : parked;
     const res = await fetch(`${config.url}/v1/cc/event`, {
       method: "POST",
       headers: watchdogEventHeaders(config, await localApprovalsState()),
@@ -1599,37 +1600,51 @@ export async function drainCommands(config: Config, deps: DrainCommandsDeps = {}
 /** Phone-started backs, by session id. In memory: a daemon restart forgets a failure (the row then
  *  reads cloud:"cloud" again, which is still true and retryable). */
 export const backRuns = new Map<string, BackRun>();
-/** The handoff entry next to this bundle (dist/handoff.mjs; entries/handoff.ts in raw runs). */
-const HANDOFF_PATH = WATCHDOG_PATH.replace(/cc-watchdog\.(mjs|ts)$/, "handoff.$1");
+/** How to run handoff, resolved at SPAWN time: the entry next to this bundle (dist/handoff.mjs;
+ *  entries/handoff.ts raw) while it exists, else the version-stable hook shim (a plugin update deletes
+ *  the old version dir out from under a long-lived daemon). Undefined → neither is there. */
+export function handoffCommand(exists: (p: string) => boolean = existsSync, watchdogPath = WATCHDOG_PATH, ccDir = CC_DIR): string[] | undefined {
+  const sibling = watchdogPath.replace(/cc-watchdog\.(mjs|ts)$/, "handoff.$1");
+  if (exists(sibling)) return [process.execPath, sibling];
+  const shim = `${ccDir}/hook-shim.sh`;
+  return exists(shim) ? [shim, "handoff"] : undefined;
+}
 
 export interface BringBackDeps {
   readPark?: (id: string) => Park | undefined;
   cloudActive?: (id: string) => boolean;
   /** Start the back; call `onExit` once with its exit code. */
   spawn?: (id: string, onExit: (code: number | null) => void) => void;
+  /** A --back for this session already running anywhere (its lockfile's pid is alive). */
+  lockHeld?: (id: string) => boolean;
 }
 
 /** Detached `handoff --back --phone`, output to cloud-back/<id12>.log. The child loads its own keys
  *  (~/.nomo-spike.env) exactly as a terminal run does; nothing secret goes on argv. */
 function spawnBack(id: string, onExit: (code: number | null) => void): void {
-  const dir = `${CC_DIR}/cloud-back`;
-  mkdirSync(dir, { recursive: true, mode: 0o700 });
-  const fd = openSync(`${dir}/${id.slice(0, 12)}.log`, "a", 0o600);
+  mkdirSync(BACK_LOCK_DIR, { recursive: true, mode: 0o700 });
+  const log = `${BACK_LOCK_DIR}/${id.slice(0, 12)}.log`;
+  const note = (why: string): void => {
+    try { const f = openSync(log, "a", 0o600); try { writeSync(f, `[${new Date().toISOString()}] bring-back from the phone: ${why}\n`); } finally { closeSync(f); } } catch { /* best effort */ }
+  };
+  const cmd = handoffCommand();
+  if (!cmd) { note("Nomo's installed files were not found (plugin updated or removed?); reinstall or run /nomo-cc:back."); throw new Error("no handoff entry"); }
+  const fd = openSync(log, "a", 0o600);
   try {
     // The daemon may have inherited the session id of whichever Claude Code hook started it.
     const { CLAUDE_CODE_SESSION_ID: _drop, ...env } = process.env;
-    const child = spawn(process.execPath, [HANDOFF_PATH, "--back", "--session", id, "--from-session", id, "--phone"],
+    const child = spawn(cmd[0], [...cmd.slice(1), "--back", "--session", id, "--from-session", id, "--phone"],
       { detached: true, stdio: ["ignore", fd, fd], env, cwd: homedir() });
-    child.on("error", () => onExit(1)).on("exit", (code) => onExit(code));
+    child.on("error", (e) => { note(`could not start ${cmd[0]}: ${e.message}`); onExit(1); }).on("exit", (code) => onExit(code));
     child.unref();
-  } finally { closeSync(fd); }
+  } catch (e: any) { note(`could not start ${cmd[0]}: ${e?.message ?? e}`); throw e; } finally { closeSync(fd); }
 }
 
 /** Act on an authenticated, fresh, unreplayed bring-back. Only a session parked "cloud" AND listed
  *  active in cloud.json qualifies; one back per session at a time. */
 export function bringBack(id: string, deps: BringBackDeps = {}): FocusTraceResult {
   if ((deps.readPark ?? readPark)(id)?.state !== "cloud" || !(deps.cloudActive ?? cloudActive)(id)) return "not-parked";
-  if (backRuns.get(id)?.running) return "back-running";
+  if (backRuns.get(id)?.running || (deps.lockHeld ?? ((s: string) => backLockHolder(s) !== undefined))(id)) return "back-running";
   const run: BackRun = { running: true };
   backRuns.set(id, run);
   const done = (code: number | null): void => { if (run.running) { run.running = false; run.code = code; } };
@@ -3828,7 +3843,7 @@ async function sweep(config: Config | null, deps: SweepDeps = {}): Promise<Sweep
       if (config && record && !pendingDoneHandled) {
         // NOM-93: a parked session's blob carries `cloud` (what the phone's Bring back shows). A
         // corrective owns the session this sweep (the snapshot is stale after its rewrite).
-        const cloudFix = await correctCloudState(config, path, sessionId, record, cloudState(park, backRuns.get(sessionId)));
+        const cloudFix = await correctCloudState(config, path, sessionId, record, cloudState(park, backRuns.get(sessionId), park?.state === "cloud" && backLockHolder(sessionId) !== undefined));
         if (cloudFix === "revoked") return { revoked: true };
         if (cloudFix === "corrected") { delivered = true; continue; }
         // Idle-provisional corrective FIRST: a discovery row advertised "working" whose TUI has gone
