@@ -11,7 +11,7 @@ import {
 } from "./handoff";
 import { RELAY_PORT as RELAY_LISTEN_PORT } from "./or-relay";
 import { readCapped } from "./handoff";
-import { FIRST_SKIPPED, FIRST_UNCONFIRMED, firstMessageScript, sendFirstMessage, TYPE_FN } from "./handoff";
+import { FIRST_SKIPPED, FIRST_UNCONFIRMED, firstMessageScript, sendFirstMessage, sendResult, TYPE_FN } from "./handoff";
 import { BACK_FILES, backPackScript, backStopScript, backWaitScript, currentGuard, resumeCommand } from "./handoff";
 import { boxIdle } from "../core/cloud-back";
 
@@ -308,6 +308,8 @@ describe("first message (--then, /nomo-cc:handoff)", () => {
   // What CC 2.1.303 really draws: "❯" + NBSP (captured live from a box pane), for the prompt and menus alike.
   const READY_NBSP = "● done.\n────────────────\n❯\u00a0\n────────────────\n  ⏵⏵ auto mode on (shift+tab to cycle)\n";
   const MENU_NBSP = "────────────────\n Resume this session?\n❯\u00a01. Yes\n  2. No\n";
+  /** The idle screen after CC accepted `text`: its first line shows in the history above the empty input. */
+  const submitted = (text: string) => `❯\u00a0${text.split("\n")[0]}\n${READY_NBSP}`;
 
   /** Run firstMessageScript against a fake tmux showing `screen` (`after[n]` once n Enters went in);
    *  returns stdout, the pasted text, the keys. */
@@ -333,7 +335,7 @@ esac
   }
 
   test("idle at the input box → the text arrives literally (quotes, $, backticks, newlines), then Enter", () => {
-    const r = runBox(READY);
+    const r = runBox(READY, { after: [submitted(NASTY)] });
     expect(r.out.trim()).toBe("NOMO_SENT");
     expect(r.typed).toBe(NASTY);
     expect(r.keys).toBe("paste\nEnter\n");
@@ -342,7 +344,7 @@ esac
 
   for (const locale of ["C", "C.UTF-8"]) {
     test(`readiness under LC_ALL=${locale}: the real prompt (❯ + NBSP) is ready, real menus never typed into`, () => {
-      expect(runBox(READY_NBSP, { locale }).out.trim()).toBe("NOMO_SENT");
+      expect(runBox(READY_NBSP, { locale, after: [submitted(NASTY)] }).out.trim()).toBe("NOMO_SENT");
       for (const screen of [MENU, MENU_NBSP, "", "Resuming conversation…\n"]) {
         const r = runBox(screen, { locale });
         expect(r.out.trim()).toBe("NOMO_NOT_READY");
@@ -352,7 +354,7 @@ esac
 
     test(`numbered text that is not a menu no longer blocks readiness (LC_ALL=${locale})`, () => {
       for (const hist of ["⏺ arrow => 2. next", "⏺ when x > 3.5 it fails", "❯\u00a02. fix the parser"]) {
-        expect(runBox(READY_NBSP.replace("● done.", hist), { locale }).out.trim()).toBe("NOMO_SENT");
+        expect(runBox(READY_NBSP.replace("● done.", hist), { locale, after: [submitted(NASTY)] }).out.trim()).toBe("NOMO_SENT");
       }
     });
   }
@@ -363,12 +365,45 @@ esac
 
   test("Enter swallowed into the paste → one more Enter; still there → NOMO_UNCONFIRMED, never NOMO_SENT", () => {
     const stuck = "────────────────\n❯\u00a0it's still here\n────────────────\n";
-    const r = runBox(READY_NBSP, { after: [stuck] });
+    const r = runBox(READY_NBSP, { after: [stuck, submitted(NASTY)] });
     expect(r.out.trim()).toBe("NOMO_SENT");
     expect(r.keys).toBe("paste\nEnter\nEnter\n");
     const s = runBox(READY_NBSP, { after: [stuck, stuck] });
     expect(s.out.trim()).toBe("NOMO_UNCONFIRMED");
     expect(s.keys).toBe("paste\nEnter\nEnter\n");
+  });
+
+  test("busy (CC still working on the last message) → nothing pasted, NOMO_BUSY, reported as not sent", () => {
+    // --send runs TYPE_FN alone; a live spinner changes the screen every capture, so it never goes idle
+    const d = mkdtempSync(join(tmpdir(), "nomo-busy-")), bin = join(d, "bin");
+    mkdirSync(bin);
+    writeFileSync(join(bin, "tmux"), `#!/bin/bash
+case "$1" in
+  has-session) exit 0 ;;
+  capture-pane) echo "✻ Thinking $RANDOM"; printf '────\\n❯ \\n────\\n' ;;
+  *) echo "$1" >> ${d}/keys ;;
+esac
+`);
+    writeFileSync(join(bin, "sleep"), "#!/bin/sh\nexit 0\n");
+    chmodSync(join(bin, "tmux"), 0o755); chmodSync(join(bin, "sleep"), 0o755);
+    let out = "", code = 0;
+    try { out = execFileSync("bash", ["-c", `${TYPE_FN}\nnomo_type`], { cwd: d, env: { PATH: `${bin}:/usr/bin:/bin`, NOMO_TEXT: "hi" } }).toString(); }
+    catch (e) { const x = e as { stdout: Buffer; status: number }; out = x.stdout.toString(); code = x.status; }
+    expect(out.trim()).toBe("NOMO_BUSY");
+    expect(code).toBe(1);
+    expect(existsSync(join(d, "keys"))).toBe(false); // no load-buffer, paste or Enter
+    expect(sendResult("NOMO_BUSY\n")).toMatch(/^Not sent/);
+    expect(sendResult("NOMO_UNCONFIRMED\n")).toMatch(/^Not confirmed.*--screen/);
+    expect(sendResult("NOMO_SENT\n")).toBe("Sent.");
+  });
+
+  test("paste dropped (input empty but the text never reached the history) → NOMO_UNCONFIRMED, never sent", () => {
+    const r = runBox(READY_NBSP, { text: "/model x" , after: [READY_NBSP, READY_NBSP, READY_NBSP] });
+    expect(r.out.trim()).toBe("NOMO_UNCONFIRMED");
+    // the bug's second message, sent idle and accepted: multi-line, trailing ; and a cut mid-UTF-8 char
+    const two = "日本語のテキストはここで四十バイトを超えます、本当に\nsecond line;";
+    expect(runBox(READY_NBSP, { text: two, after: [submitted(two)], locale: "C.UTF-8" }).out.trim()).toBe("NOMO_SENT");
+    expect(runBox(READY_NBSP, { text: two, after: [submitted(two)] }).out.trim()).toBe("NOMO_SENT");
   });
 
   test("not ready / box error → a skip line, never a throw (the handoff already succeeded)", async () => {

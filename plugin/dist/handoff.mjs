@@ -384,7 +384,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "2.3.20";
+var PLUGIN_VERSION = "2.3.21";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -4738,16 +4738,40 @@ function attachHelp() {
   ].join(`
 `);
 }
-var TYPE_FN = `nomo_type() {
+var IDLE_FN = `nomo_wait_idle() {
+  prev=
+  for _ in $(seq "$1"); do
+    tmux has-session -t nomo 2>/dev/null || return 1
+    cur=$(tmux capture-pane -p -t nomo | grep -v '^[[:space:]]*$' | tail -8)
+    if [ -n "$cur" ] && [ "$cur" = "$prev" ] && printf '%s\\n' "$cur" | grep -q '─' \\
+      && printf '%s\\n' "$cur" | grep -Eq '^[│ ]*(>|❯)' \\
+      && ! printf '%s\\n' "$cur" | grep -E '^[│ ]*(>|❯)' | tail -1 | grep -Eq '^[│ ]*(>|❯).{0,3}[0-9]+\\.'; then
+      return 0
+    fi
+    prev=$cur
+    sleep 2
+  done
+  return 1
+}`;
+var TYPE_FN = `${IDLE_FN}
+nomo_type() {
+  want=
   if [ -n "$NOMO_TEXT" ]; then
+    nomo_wait_idle 10 || { echo NOMO_BUSY; return 1; }
+    want=$(printf '%s\\n' "$NOMO_TEXT" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' | grep -m1 . | LC_ALL=C cut -b1-40 \\
+      | LC_ALL=C sed "s/[$(printf '\\300-\\377')][$(printf '\\200-\\277')]*\\$//")
     printf '%s' "$NOMO_TEXT" | tmux load-buffer -b nomo-first - && tmux paste-buffer -p -r -d -b nomo-first -t nomo || { echo NOMO_UNCONFIRMED; return 1; }
     sleep 0.5
   fi
   tmux send-keys -t nomo Enter
   for n in 1 2 3; do
     sleep 1
-    l=$(tmux capture-pane -p -t nomo | grep -E '^[│ ]*(>|❯)' | tail -1)
-    if [ -z "$l" ] || printf '%s\\n' "$l" | grep -Eq '^[│ ]*(>|❯)( | )*$|^[│ ]*(>|❯).{0,3}[0-9]+\\.'; then echo NOMO_SENT; return 0; fi
+    p=$(tmux capture-pane -p -t nomo)
+    k=$(printf '%s\\n' "$p" | grep -nE '^[│ ]*(>|❯)' | tail -1 | cut -d: -f1)
+    l=$(printf '%s\\n' "$p" | sed -n "\${k:-0}p")
+    if printf '%s\\n' "$l" | grep -Eq '^[│ ]*(>|❯).{0,3}[0-9]+\\.'; then echo NOMO_SENT; return 0; fi
+    if { [ -z "$l" ] || printf '%s\\n' "$l" | grep -Eq '^[│ ]*(>|❯)( | )*$'; } \\
+      && printf '%s\\n' "$p" | head -n "$(( \${k:-99999} - 1 ))" | grep -qF -- "$want"; then echo NOMO_SENT; return 0; fi
     [ "$n" = 1 ] && tmux send-keys -t nomo Enter
   done
   echo NOMO_UNCONFIRMED
@@ -4765,19 +4789,19 @@ tmux send-keys -t nomo -- "$NOMO_KEY"`;
   return `${guard}
 tmux capture-pane -p -t nomo | sed -e :a -e '/^\\n*$/{$d;N;ba' -e '}' | tail -40`;
 }
+function sendResult(stdout) {
+  if (/^NOMO_SENT$/m.test(stdout))
+    return "Sent.";
+  if (/^NOMO_BUSY$/m.test(stdout))
+    return "Not sent: the cloud session is still busy (no idle prompt after ~20s). Check --screen, then --send again.";
+  if (/^NOMO_UNCONFIRMED$/m.test(stdout))
+    return "Not confirmed: the message wasn't seen submitted. Check --screen before resending (if it's still in the input, --send-key Enter).";
+  return "";
+}
 function firstMessageScript(tries = 45) {
   return `${SHM_SWEEP}
 ${TYPE_FN}
-prev=
-for _ in $(seq ${tries}); do
-  tmux has-session -t nomo 2>/dev/null || break
-  cur=$(tmux capture-pane -p -t nomo | grep -v '^[[:space:]]*$' | tail -8)
-  if [ -n "$cur" ] && [ "$cur" = "$prev" ] && printf '%s\\n' "$cur" | grep -q '─'     && printf '%s\\n' "$cur" | grep -Eq '^[│ ]*(>|❯)'     && ! printf '%s\\n' "$cur" | grep -E '^[│ ]*(>|❯)' | tail -1 | grep -Eq '^[│ ]*(>|❯).{0,3}[0-9]+\\.'; then
-    nomo_type; exit 0
-  fi
-  prev=$cur
-  sleep 2
-done
+if nomo_wait_idle ${tries}; then nomo_type; exit 0; fi
 echo NOMO_NOT_READY`;
 }
 var FIRST_SKIPPED = "Session is in the cloud but the first message wasn't sent yet; the box may still type it, so check --screen first and only then --send it";
@@ -5437,13 +5461,14 @@ async function main() {
         throw new Error("--send-key takes one tmux key name, e.g. Escape, BTab, C-c, Enter");
       const mode = args.has("--send") ? "send" : args.has("--send-key") ? "key" : "screen";
       const r = await exec(omg, sb.id, paneScript(mode), { NOMO_TEXT: String(args.get("--send") ?? ""), NOMO_KEY: key });
-      process.stdout.write((r.stdout ?? "").replace(/^NOMO_(SENT|UNCONFIRMED)\n?/m, ""));
+      process.stdout.write((r.stdout ?? "").replace(/^NOMO_(SENT|UNCONFIRMED|BUSY)\n?/m, ""));
       if (mode === "key" && r.exitCode === 0)
         console.log("Sent. Check with --screen.");
-      if (mode === "send" && /^NOMO_SENT$/m.test(r.stdout ?? ""))
-        console.log("Sent.");
-      else if (mode === "send" && r.exitCode === 0)
-        console.log("Typed, but the submit wasn't confirmed; check --screen (if it's still in the input, --send-key Enter).");
+      if (mode === "send") {
+        const m = sendResult(r.stdout ?? "");
+        if (m)
+          console.log(m);
+      }
       if (r.exitCode !== 0)
         process.exitCode = 1;
       return;
@@ -5559,6 +5584,7 @@ export {
   resultPage,
   resumeCommand,
   sendFirstMessage,
+  sendResult,
   takePairUrl,
   targetWorker,
   toOpenRouterModel,
