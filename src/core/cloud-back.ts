@@ -131,17 +131,61 @@ export function decideCode(snap: GitState | undefined, mac: GitState, box: BoxCo
 
 export type TranscriptAction = "corrupt" | "same" | "replace" | "fork";
 
+/** Did the Mac's conversation move on in what it appended after the handoff? A parked window appends
+ *  meta (block notices = system/informational, turn bookkeeping, titles) and Nomo's own command turns
+ *  (`/nomo-cc:back` itself, `/nomo-cc:status`): none of that is the user's work. Any user/assistant/
+ *  attachment line in a turn NOT opened by a `/nomo-cc:` command, or an unparseable/untyped line, is.
+ *  ponytail: a command turn is recognised by its opening user line's text (`/nomo-cc:…`, or Claude Code's
+ *  `<command-name>/nomo-cc:…` wrapper); a shape Claude Code changes makes it count as a real turn (fork,
+ *  never a silent replace). */
+export function macDiverged(appended: string): boolean {
+  let nomoTurn = false, bodyNext = false, localNext = false;
+  for (const l of appended.split("\n")) {
+    if (!l.trim()) continue;
+    let row: any;
+    try { row = JSON.parse(l); } catch { return true; }
+    const t = row?.type;
+    if (typeof t !== "string") return true;
+    if (t !== "user" && t !== "assistant" && t !== "attachment") continue;
+    const c = row.message?.content;
+    const text = typeof c === "string" ? c : Array.isArray(c) ? c.map((b: any) => (b?.type === "text" ? b.text : "")).join("") : "";
+    // A built-in local command (/model, …) the user ran between turns: a caveat meta line, the
+    // `<command-name>` line, its stdout/stderr, and no model reply. None of it is a turn; a reply after it is.
+    if (t === "user") {
+      const lead = text.trimStart();
+      if (row.isMeta && lead.startsWith("<local-command-caveat>")) { localNext = true; continue; }
+      if (lead.startsWith("<local-command-stdout>") || lead.startsWith("<local-command-stderr>")) { nomoTurn = false; continue; }
+      if (localNext && !row.isMeta && text.includes("<command-name>")) { localNext = false; nomoTurn = false; continue; }
+    }
+    localNext = false;
+    // A turn opener is a real prompt only: not a tool_result, not an interrupt marker (both belong to the
+    // turn they end), not isMeta, not the expanded command body Claude Code writes right after a
+    // `<command-name>` line.
+    const opens = t === "user" && !row.isMeta && !bodyNext && !(Array.isArray(c) && c.some((b: any) => b?.type === "tool_result")) &&
+      !text.trimStart().startsWith("[Request interrupted by user");
+    if (t === "user" && bodyNext && !(Array.isArray(c) && c.some((b: any) => b?.type === "tool_result"))) bodyNext = false;
+    if (opens) {
+      nomoTurn = text.trimStart().startsWith("/nomo-cc:") || text.includes("<command-name>/nomo-cc:");
+      bodyNext = text.includes("<command-name>");
+    }
+    if (!nomoTurn) return true;
+  }
+  return false;
+}
+
 /** corrupt: the box copy does not extend what was handed off (keep it in the backup only). same: the
- *  box added nothing. replace: the Mac copy is the handed-off one (or missing) → install the box copy.
- *  fork: the Mac appended after the handoff → install the box copy under a NEW id, Mac copy untouched. */
+ *  box added nothing. replace: the Mac copy is the handed-off one (or missing), plus nothing macDiverged
+ *  counts → install the box copy. fork: the Mac appended a real turn after the handoff → install the box
+ *  copy under a NEW id, Mac copy untouched. */
 export function transcriptAction(snap: { tBytes: number; tSha: string } | undefined, mac: Buffer | undefined, box: Buffer): TranscriptAction {
   if (snap) {
     // A rerun after a partial --back already installed this exact copy: nothing to do, never a fork.
     if (mac?.equals(box)) return "same";
     if (box.length < snap.tBytes || sha256(box.subarray(0, snap.tBytes)) !== snap.tSha) return "corrupt";
     if (box.length === snap.tBytes) return "same";
-    if (!mac || (mac.length === snap.tBytes && sha256(mac) === snap.tSha)) return "replace";
-    return "fork";
+    if (!mac) return "replace";
+    const macHanded = mac.length >= snap.tBytes && sha256(mac.subarray(0, snap.tBytes)) === snap.tSha;
+    return macHanded && !macDiverged(mac.subarray(snap.tBytes).toString("utf8")) ? "replace" : "fork";
   }
   if (!mac) return "replace";
   if (box.equals(mac)) return "same";

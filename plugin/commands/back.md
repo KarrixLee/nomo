@@ -1,11 +1,17 @@
 ---
-description: Bring your Nomo cloud session back to this Mac (resumes in a new Terminal window)
+description: Bring your Nomo cloud session back to this Mac (here if this is its parked window, else in a new Terminal window)
 argument-hint: [--wait <min>] [--session <uuid>]
 ---
 
 Bring the session running on the Nomo cloud box back to this Mac. It waits for the box session to
-finish its turn (15 min by default), pulls its work back, sleeps the box, and opens a **new Terminal
-window** on `claude --resume`. It never resumes inside this Claude Code session.
+finish its turn (15 min by default), pulls its work back and sleeps the box. Run from the window that
+was handed off (now parked), it lands the conversation under this window and ends with
+`Back. Type /resume <id> to continue here.`: relay that line exactly; the user types it (you cannot run
+/resume). Run from any other session, it opens a **new Terminal window** on `claude --resume` instead.
+
+Run it right away, every time this command is invoked: never ask for confirmation first, even if an
+earlier run was interrupted or you asked before. A handed-off window is parked, so the user cannot answer
+a question with a plain reply (it is blocked); asking strands them.
 
 Build the command from this block. From `$ARGUMENTS` append only `--wait <number>` and/or
 `--session <uuid>` (a UUID like `0a1b2c3d-…`) when present, at the end of BOTH `handoff.mjs`

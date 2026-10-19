@@ -116,6 +116,70 @@ describe("transcriptAction", () => {
   test("rerun after a partial --back (Mac already holds the box copy) → same, never a fork", () => {
     expect(transcriptAction(snap, boxed, boxed)).toBe("same");
   });
+  test("a parked window's block notices and turn bookkeeping are not a Mac turn → replace", () => {
+    const meta = ['{"type":"system","subtype":"informational","content":"This session is in the cloud"}', '{"type":"last-prompt"}', '{"type":"system","subtype":"turn_duration"}', ""].join("\n");
+    expect(transcriptAction(snap, Buffer.concat([handed, Buffer.from(meta)]), boxed)).toBe("replace");
+  });
+  test("a real Mac turn (or an unreadable line) after the handoff still forks", () => {
+    expect(transcriptAction(snap, Buffer.concat([handed, Buffer.from('{"type":"system","subtype":"informational"}\n{"type":"user"}\n')]), boxed)).toBe("fork");
+    expect(transcriptAction(snap, Buffer.concat([handed, Buffer.from("{torn")]), boxed)).toBe("fork");
+  });
+  test("Nomo's own command turns (the back turn itself) do not count → replace", () => {
+    const backTurn = [
+      { type: "user", message: { role: "user", content: "<command-message>nomo-cc:back</command-message>\n<command-name>/nomo-cc:back</command-name>" } },
+      { type: "user", isMeta: true, message: { role: "user", content: [{ type: "text", text: "Bring the session running on the Nomo cloud box back…" }] } },
+      { type: "assistant", message: { role: "assistant", content: [{ type: "tool_use", id: "t1", name: "Bash", input: {} }] } },
+      { type: "user", message: { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: "Back." }] } },
+      { type: "system", subtype: "informational", content: "blocked" },
+    ].map((r) => JSON.stringify(r)).join("\n") + "\n";
+    expect(transcriptAction(snap, Buffer.concat([handed, Buffer.from(backTurn)]), boxed)).toBe("replace");
+    expect(transcriptAction(snap, Buffer.concat([handed, Buffer.from('{"type":"user","message":{"content":"/nomo-cc:status"}}\n{"type":"assistant"}\n')]), boxed)).toBe("replace");
+  });
+  test("the live 2.3.23 back sequence (interrupted, asked, rerun in background) → replace", () => {
+    const cmd = { type: "user", message: { role: "user", content: "<command-message>nomo-cc:back</command-message>\n<command-name>/nomo-cc:back</command-name>" } };
+    const body = { type: "user", message: { role: "user", content: [{ type: "text", text: "Bring the session running on the Nomo cloud box back to this Mac." }] } };
+    const toolUse = { type: "assistant", message: { role: "assistant", content: [{ type: "tool_use", id: "t", name: "Bash", input: {} }] } };
+    const result = (text: string) => ({ type: "user", message: { role: "user", content: [{ type: "tool_result", tool_use_id: "t", content: text }] } });
+    const rows = [
+      cmd, body, { type: "attachment" }, { type: "assistant", message: { content: [{ type: "thinking", thinking: "" }] } }, toolUse,
+      result("The user doesn't want to proceed with this tool use. The tool use was rejected."),
+      { type: "user", message: { role: "user", content: [{ type: "text", text: "[Request interrupted by user for tool use]" }] } },
+      cmd, body, { type: "assistant", message: { content: [{ type: "text", text: "Do you want me to run it now?" }] } },
+      { type: "system", subtype: "stop_hook_summary" }, { type: "system", subtype: "turn_duration" }, { type: "file-history-snapshot" },
+      cmd, body, { type: "attachment" }, { type: "api-request" }, toolUse, result("Command running in background with ID: b1"),
+      { type: "api-request-blob" }, { type: "last-prompt" }, { type: "ai-title" }, { type: "mode" }, { type: "permission-mode" }, { type: "atis-latch" },
+      { type: "attachment" }, { type: "assistant", message: { content: [{ type: "text", text: "Running." }] } },
+      { type: "system", subtype: "stop_hook_summary" }, { type: "system", subtype: "turn_duration" },
+      { type: "queue-operation", content: "<task-notification>done</task-notification>" }, { type: "queue-operation" },
+      { type: "system", subtype: "informational", content: "UserPromptSubmit operation blocked by hook: Back. Type /resume" },
+    ].map((r) => JSON.stringify(r)).join("\n") + "\n";
+    expect(transcriptAction(snap, Buffer.concat([handed, Buffer.from(rows)]), boxed)).toBe("replace");
+    // …but a plain prompt typed after it is a Mac turn.
+    const plain = JSON.stringify({ type: "user", message: { role: "user", content: "fix the bug" } }) + "\n";
+    expect(transcriptAction(snap, Buffer.concat([handed, Buffer.from(rows + plain)]), boxed)).toBe("fork");
+    // A plain prompt right after an interrupt marker is still a turn opener.
+    const intr = JSON.stringify({ type: "user", message: { content: [{ type: "text", text: "[Request interrupted by user]" }] } }) + "\n";
+    expect(transcriptAction(snap, Buffer.concat([handed, Buffer.from(rows + intr + plain)]), boxed)).toBe("fork");
+  });
+  test("a built-in local command (/model) in the parked window is not a Mac turn → replace", () => {
+    const model = [
+      { type: "user", isMeta: true, message: { role: "user", content: "<local-command-caveat>The command below was run directly in Claude Code, not sent to you as a request.</local-command-caveat>" } },
+      { type: "user", message: { role: "user", content: "<command-name>/model</command-name>\n<command-message>model</command-message>\n<command-args>claude-haiku-5-5</command-args>" } },
+      { type: "user", message: { role: "user", content: "<local-command-stdout>Set model to `Haiku 5.5` and saved as your default for new sessions</local-command-stdout>" } },
+    ].map((r) => JSON.stringify(r)).join("\n") + "\n";
+    expect(transcriptAction(snap, Buffer.concat([handed, Buffer.from(model)]), boxed)).toBe("replace");
+    // A model reply after it, or a custom command the model answers, is still a Mac turn.
+    expect(transcriptAction(snap, Buffer.concat([handed, Buffer.from(model + '{"type":"assistant"}\n')]), boxed)).toBe("fork");
+    const custom = '{"type":"user","message":{"content":"<command-name>/my-cmd</command-name>"}}\n{"type":"assistant"}\n';
+    expect(transcriptAction(snap, Buffer.concat([handed, Buffer.from(model + custom)]), boxed)).toBe("fork");
+  });
+  test("a Mac turn after parking (a user skill, a path prompt) forks, even next to a back turn", () => {
+    const skill = '{"type":"user","message":{"content":"<command-name>/my-skill</command-name>"}}\n{"type":"assistant"}\n';
+    const back = '{"type":"user","message":{"content":"<command-name>/nomo-cc:back</command-name>"}}\n{"type":"assistant"}\n';
+    expect(transcriptAction(snap, Buffer.concat([handed, Buffer.from(skill + back)]), boxed)).toBe("fork");
+    expect(transcriptAction(snap, Buffer.concat([handed, Buffer.from('{"type":"user","message":{"content":"/Users/x/a.ts is broken"}}\n')]), boxed)).toBe("fork");
+    expect(transcriptAction(snap, Buffer.concat([handed, Buffer.from('{"type":"assistant"}\n')]), boxed)).toBe("fork"); // no opening command
+  });
 });
 
 describe("mergeMemory", () => {

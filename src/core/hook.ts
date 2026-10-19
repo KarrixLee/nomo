@@ -32,6 +32,7 @@ import {
   readRecord, recordGoneStrike, removeRevokedConfig, resetGoneStrikes, SessionOrigin, SessionRecord, SESSIONS_DIR, sessionBranch, tracePlanPickerDecision, traceSession,
 } from "./shared";
 import { repairNotifyWiring } from "./notify-wire";
+import { parkHook } from "./park";
 import { stateHoldLive } from "./session-state";
 
 export { SESSION_TRACE_PATH } from "./shared";
@@ -849,6 +850,16 @@ export async function runHook(agent: AgentKind): Promise<void> {
     // chat as a Claude Code session. Only the CLAUDE entry is imported that way. See cursorHostInvocation.
     if (agent === "claude" && cursorHostInvocation(input)) return;
     if (typeof input.session_id !== "string" || input.session_id.length === 0) return;
+    // NOM-90 park gate: a session handed off to the cloud keeps its window open but parked. Local file
+    // reads only, fails open (core/park.ts); a blocked prompt starts no turn, so nothing below runs.
+    const parkBlock = parkHook(input);
+    if (parkBlock) {
+      await new Promise<void>((resolve) => {
+        process.stdout.on("error", () => resolve());
+        try { process.stdout.write(`${parkBlock}\n`, () => resolve()); } catch { resolve(); }
+      });
+      return;
+    }
 
     // Codex compat-layer guard: Codex ≥0.142 auto-discovers installed Claude Code plugins as hook
     // sources, so it can invoke cc-status.mjs — the CLAUDE entry (runHook("claude")) — inside a Codex

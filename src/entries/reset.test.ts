@@ -1,4 +1,5 @@
 import { mkdtemp, readdir, readFile, writeFile } from "node:fs/promises";
+import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "bun:test";
@@ -144,5 +145,16 @@ describe("reset (end-to-end with injected seams)", () => {
     const all = lines.join("\n");
     expect(all).toContain("No watchdog running.");
     expect(all).toContain("No stale sessions to clear.");
+  });
+
+  test("unparks every parked window (a gone box must not block one for good)", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "nomo-reset-"));
+    const parkDir = join(dir, "parked");
+    mkdirSync(parkDir);
+    writeFileSync(join(parkDir, "0a1b2c3d-1111-4222-8333-444455556666"), '{"state":"cloud"}');
+    const lines: string[] = [];
+    await reset({ print: (l) => lines.push(l), loadConfigFn: async () => null, sessionsDir: join(dir, "s"), watchdogPidPath: join(dir, "w.pid"), parkDir });
+    expect(existsSync(parkDir)).toBe(false);
+    expect(lines.join("\n")).toContain("Unparked 1 window");
   });
 });

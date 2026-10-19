@@ -69,6 +69,7 @@ import { b64url, type Bytes, fromB64url } from "../core/crypto";
 import { renderPairPage } from "../core/pair-page";
 import { buildPairURL, DEFAULT_WORKER_URL } from "../core/pair-url";
 import { normalizeModelId } from "../core/adapter";
+import { clearPark, PARK_DIR, readPark, stageLanding, writePark } from "../core/park";
 import { atomicWrite, CC_DIR, pidAlive, pidAncestors, pidCommand, readRecord, SESSIONS_DIR } from "../core/shared";
 import {
   cancelPending, claimPending, contextTokens, contextTokensOf, GONE_MSG, sizeWarning, TAIL_BYTES, handoffArgv, LATER_LOG, LATER_USAGE, laterStatus, needsPairing, parseLaterArg, type Pending, PENDING_PATH, readPending, resolveSession, waitThenHandoff,
@@ -888,15 +889,37 @@ export function resumeCommand(cwd: string, id: string, model?: string): string {
   return `cd ${q(cwd)} && exec claude --resume ${id}${m}`;
 }
 
+/** The last line of a /nomo-cc:back run from the parked window itself. */
+export const sameWindowBackLine = (id: string): string => `Back. Type /resume ${id} to continue here.`;
+
 async function back(omg: string, args: Map<string, string | true>): Promise<void> {
+  const startedAt = Date.now();
   const cloud = loadCloud();
   const flag = args.get("--session");
-  const uuid = typeof flag === "string" ? flag : cloud.current;
+  const here = args.get("--from-session") || process.env.CLAUDE_CODE_SESSION_ID;
+  // A rerun in a window whose back was interrupted after staging: cloud.json no longer names it.
+  const hereLanding = typeof here === "string" && readPark(here)?.state === "landing" ? here : undefined;
+  const uuid = typeof flag === "string" ? flag : cloud.current ?? hereLanding;
   if (!uuid) throw new Error("no handed-off session on record; pass --session <uuid>");
   if (!UUID_RE.test(uuid)) throw new Error(`session id must be a UUID, got ${JSON.stringify(uuid)}`);
-  // /nomo-cc:back runs inside some Claude Code session: never the one being brought back.
-  const here = args.get("--from-session") || process.env.CLAUDE_CODE_SESSION_ID;
-  if (here === uuid) throw new Error(`this Claude Code session is ${uuid} itself. Run /nomo-cc:back from another session; it resumes in a new Terminal window.`);
+  // /nomo-cc:back from the parked window itself (NOM-90) lands the box copy under it: the user then types
+  // /resume <id> there. Only a window parked as "cloud" (gated since the move, so it cannot have diverged
+  // except through Nomo's own commands) qualifies. From anywhere else it opens a new Terminal, as before.
+  const parkedAtStart = readPark(uuid);
+  const sameWindow = here === uuid;
+  if (sameWindow && parkedAtStart?.state === "landing") {
+    // The box copy is already pulled and staged; only the install (at this turn's end) is left.
+    if (!parkedAtStart.staged || !existsSync(parkedAtStart.staged)) {
+      clearPark(uuid);
+      throw new Error(`the staged box copy is gone; unparked this window. The pulled copy is under ${join(CC_DIR, "cloud-back")}.`);
+    }
+    // No marker write here: the hook may have just installed it ("back"), which must not go back to landing.
+    console.log(`The box's copy is staged; it goes in as this turn ends.\n\n${sameWindowBackLine(parkedAtStart.resume ?? uuid)}`);
+    return;
+  }
+  if (sameWindow && parkedAtStart?.state !== "cloud") {
+    throw new Error(`this Claude Code session is ${uuid} itself and is not parked. Run /nomo-cc:back from another session; it resumes in a new Terminal window.`);
+  }
   const force = args.has("--force");
   const waitArg = args.get("--wait");
   const waitMin = typeof waitArg === "string" ? Number(waitArg) : 15;
@@ -911,7 +934,8 @@ async function back(omg: string, args: Map<string, string | true>): Promise<void
     try { root = sh("git", ["rev-parse", "--show-toplevel"], cwd).trim(); } catch { isGit = false; root = cwd; }
   }
   const rec = await readRecord(uuid);
-  if (rec && typeof rec.pid === "number" && pidAlive(rec.pid)) {
+  // A window parked as "cloud" is gated, so it can stay open (it is told to close once this lands).
+  if (parkedAtStart?.state !== "cloud" && rec && typeof rec.pid === "number" && pidAlive(rec.pid)) {
     throw new Error(`session ${uuid} is running on this Mac (pid ${rec.pid}). Quit it there first, then rerun --back.`);
   }
   const enc = projectDirName(cwd);
@@ -1014,7 +1038,7 @@ async function back(omg: string, args: Map<string, string | true>): Promise<void
     ? validateTree(pdir, (r) => r === `${uuid}.jsonl` || r === uuid || r.startsWith(`${uuid}/`) || r === "memory" || r.startsWith("memory/"), budget)
     : { files: [], skipped: [] };
   if (pt.skipped.length) console.log(`Skipped ${pt.skipped.length} unexpected path(s) in the box's project files: ${paths(pt.skipped)}`);
-  let resumeId = uuid;
+  let resumeId = uuid, stagedThisRun: string | undefined;
   if (!pdir) { /* reported by unpack */ } else if (!pt.files.includes(`${uuid}.jsonl`)) problems.push("the box sent no transcript");
   else {
     const boxT = readFileSync(join(pdir, `${uuid}.jsonl`));
@@ -1027,9 +1051,19 @@ async function back(omg: string, args: Map<string, string | true>): Promise<void
       const before = mkdirp(join(backup, "mac-before"));
       if (macT) copyContained(macPath, before, `${uuid}.jsonl`, true, true);
       for (const r of listUnder(projDir, uuid)) copyContained(join(projDir, r), before, r, true, true);
-      atomicWriteBytes(macPath, boxT);
       for (const r of sub) copyContained(join(pdir, r), projDir, r, true, true);
-      console.log(`Transcript: installed the box's copy (+${boxT.length - (macT?.length ?? 0)} B); the Mac's previous copy is in ${before}`);
+      if (sameWindow) {
+        // This window is mid-turn (this command): the rest of the turn would append onto the box copy.
+        // The park hook installs it at the turn's end (core/park.ts).
+        const staged = `${macPath}.nomo-back`;
+        atomicWriteBytes(staged, boxT);
+        stagedThisRun = staged;
+        const now = stageLanding(uuid, { staged, target: macPath, resume: uuid }, startedAt);
+        console.log(`Transcript: the box's copy (+${boxT.length - (macT?.length ?? 0)} B) ${now ? "is installed" : "goes in as this turn ends"}; the Mac's previous copy is in ${before}`);
+      } else {
+        atomicWriteBytes(macPath, boxT);
+        console.log(`Transcript: installed the box's copy (+${boxT.length - (macT?.length ?? 0)} B); the Mac's previous copy is in ${before}`);
+      }
     }
     if (act === "fork") {
       resumeId = randomUUID();
@@ -1106,6 +1140,29 @@ async function back(omg: string, args: Map<string, string | true>): Promise<void
   saveCloud({ ...c, sessions, current: c.current === uuid ? undefined : c.current });
 
   // 5. Resume here.
+  let parked = readPark(uuid);
+  if (sameWindow && stagedThisRun && parked?.state !== "landing" && parked?.state !== "back" && existsSync(stagedThisRun)) {
+    // A hook's stamp raced the "landing" write: stage again (installs now if the window is idle), never
+    // report Back with the box copy orphaned next to the transcript.
+    stageLanding(uuid, { staged: stagedThisRun, target: join(projDir, `${uuid}.jsonl`), resume: uuid }, startedAt);
+    parked = readPark(uuid);
+  }
+  if (sameWindow) {
+    if (parked?.state !== "landing" && parked?.state !== "back") {
+      if (resumeId !== uuid) writePark(uuid, { state: "back", resume: resumeId });
+      else clearPark(uuid);
+    }
+  } else if (parkedAtStart?.state === "cloud" && typeof parkedAtStart.pid === "number" && pidAlive(parkedAtStart.pid)) {
+    writePark(uuid, { state: "elsewhere", pid: parkedAtStart.pid });
+  } else clearPark(uuid);
+  if (sameWindow) {
+    console.log(`\n${sameWindowBackLine(resumeId)}`);
+    if (problems.length) {
+      console.log(`\nNeeds a look:\n  ${problems.join("\n  ")}`);
+      process.exitCode = 1;
+    }
+    return;
+  }
   let model: string | undefined;
   try { model = lastModel(readFileSync(join(projDir, `${resumeId}.jsonl`), "utf8")); } catch { /* no transcript: CC picks */ }
   const line = resumeCommand(cwd, resumeId, model);
@@ -1170,14 +1227,16 @@ async function later(args: Map<string, string | true>, keys: { omg?: string; ope
     console.log(`A handoff is already waiting (session ${cur?.session ?? "?"}). See /nomo-cc:handoff status, or /nomo-cc:handoff cancel.`);
     return;
   }
+  writePark(session, { state: "moving", pid: claudePid });
   const fd = openSync(LATER_LOG, "w", 0o600);
   const child = spawn(process.execPath, [SELF, "--after-exit", "--session", session, "--claude-pid", String(claudePid), "--worker", worker],
     { cwd, detached: true, stdio: ["ignore", fd, fd] });
   child.unref();
   writeFileSync(PENDING_PATH, JSON.stringify({ ...p, helperPid: child.pid }) + "\n", { mode: 0o600 });
-  console.log(`Ready. Quit Claude Code now (/exit). Session ${session} moves to the cloud as soon as it closes; watch it on your phone.\n` +
+  console.log(`Ready. Session ${session} moves to the cloud as soon as this turn ends; watch it on your phone.\n` +
+    `This window stays open but parked: new prompts are blocked until you run /nomo-cc:back here.\n` +
     (p.message ? `First message on the box: "${p.message}"` : "No first message (quiet).") +
-    `\nLog: ${LATER_LOG}\nTo cancel before quitting: /nomo-cc:handoff cancel`);
+    `\nLog: ${LATER_LOG}\nTo stop it: /nomo-cc:handoff cancel`);
   let warn: string | undefined;
   try { warn = sizeWarning(contextTokensOf(join(home, ".claude", "projects", projectDirName(cwd), `${session}.jsonl`))); } catch { /* estimate only */ }
   if (warn) console.log(warn);
@@ -1192,6 +1251,7 @@ async function afterExit(args: Map<string, string | true>, worker: string): Prom
   const message = pending?.session === session ? pending.message : undefined; // from the 0600 record, never argv
   process.exitCode = await waitThenHandoff({ helperPid: process.pid, session, claudePid, state: "waiting", startedAt: Date.now(), message }, {
     pending: PENDING_PATH,
+    parkDir: PARK_DIR,
     alive: pidAlive,
     now: Date.now,
     sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
@@ -1240,7 +1300,15 @@ async function main(): Promise<void> {
   const keys = readKeys();
   const worker = targetWorker(args.get("--worker"), process.env.NOMO_WORKER_URL);
 
-  if (args.has("--later-cancel")) { console.log(cancelPending({ ...PENDING, kill: (p) => process.kill(p, "SIGTERM"), log: LATER_LOG })); return; }
+  if (args.has("--later-cancel")) {
+    // The helper is a detached group leader: -pid also stops a handoff child it raced into starting.
+    const session = args.get("--session");
+    console.log(cancelPending({
+      ...PENDING, kill: (p) => { try { process.kill(-p, "SIGTERM"); } catch { process.kill(p, "SIGTERM"); } }, log: LATER_LOG, parkDir: PARK_DIR,
+      session: typeof session === "string" && UUID_RE.test(session) ? session : undefined,
+    }));
+    return;
+  }
   if (args.has("--later-status")) { console.log(laterStatus({ ...PENDING, log: LATER_LOG })); return; }
   if (args.has("--later")) { await later(args, keys, worker); return; }
   if (args.has("--after-exit")) { await afterExit(args, worker); return; }
