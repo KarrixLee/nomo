@@ -384,7 +384,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "2.3.23";
+var PLUGIN_VERSION = "2.3.24";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -3604,7 +3604,7 @@ function decideCode(snap, mac, box) {
   return same ? "apply" : "branch";
 }
 function macDiverged(appended) {
-  let nomoTurn = false;
+  let nomoTurn = false, bodyNext = false;
   for (const l of appended.split(`
 `)) {
     if (!l.trim())
@@ -3621,10 +3621,13 @@ function macDiverged(appended) {
     if (t !== "user" && t !== "assistant" && t !== "attachment")
       continue;
     const c = row.message?.content;
-    const opens = t === "user" && !row.isMeta && !(Array.isArray(c) && c.some((b) => b?.type === "tool_result"));
+    const text = typeof c === "string" ? c : Array.isArray(c) ? c.map((b) => b?.type === "text" ? b.text : "").join("") : "";
+    const opens = t === "user" && !row.isMeta && !bodyNext && !(Array.isArray(c) && c.some((b) => b?.type === "tool_result")) && !text.trimStart().startsWith("[Request interrupted by user");
+    if (t === "user" && bodyNext && !(Array.isArray(c) && c.some((b) => b?.type === "tool_result")))
+      bodyNext = false;
     if (opens) {
-      const text = typeof c === "string" ? c : Array.isArray(c) ? c.map((b) => b?.type === "text" ? b.text : "").join("") : "";
       nomoTurn = text.trimStart().startsWith("/nomo-cc:") || text.includes("<command-name>/nomo-cc:");
+      bodyNext = text.includes("<command-name>");
     }
     if (!nomoTurn)
       return true;

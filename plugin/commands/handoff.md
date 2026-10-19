@@ -4,7 +4,8 @@ argument-hint: [then <message>|quiet|cancel|status]
 ---
 
 Read `$ARGUMENTS` (trimmed; keywords case-insensitive) and run **at most one** of these commands in the
-foreground. Show its output to the user verbatim.
+foreground. Show its output to the user verbatim. Run it right away without asking for confirmation: once the
+window is parked, plain replies are blocked, so a question would strand the user.
 
 **Anything other than empty, `quiet`, `then <message>`, `cancel` or `status`** (a typo like `cancle`, or
 `then` with no message, included): run nothing. Reply only: "Usage: /nomo-cc:handoff (move this session;

@@ -9,6 +9,10 @@ was handed off (now parked), it lands the conversation under this window and end
 `Back. Type /resume <id> to continue here.`: relay that line exactly; the user types it (you cannot run
 /resume). Run from any other session, it opens a **new Terminal window** on `claude --resume` instead.
 
+Run it right away, every time this command is invoked: never ask for confirmation first, even if an
+earlier run was interrupted or you asked before. A handed-off window is parked, so the user cannot answer
+a question with a plain reply (it is blocked); asking strands them.
+
 Build the command from this block. From `$ARGUMENTS` append only `--wait <number>` and/or
 `--session <uuid>` (a UUID like `0a1b2c3d-…`) when present, at the end of BOTH `handoff.mjs`
 invocations (the `run.sh` one and the `$NOMOS` one) before their `;`. Drop anything else.
