@@ -3,7 +3,7 @@ var __require = /* @__PURE__ */ createRequire(import.meta.url);
 
 // src/entries/handoff.ts
 import { execFileSync as execFileSync4, spawn as spawn2 } from "node:child_process";
-import { existsSync as existsSync4, lstatSync as lstatSync2, mkdirSync as mkdirSync2, mkdtempSync as mkdtempSync2, openSync, readdirSync as readdirSync2, readFileSync as readFileSync4, realpathSync as realpathSync2, rmSync, statSync as statSync2, writeFileSync as writeFileSync3 } from "node:fs";
+import { existsSync as existsSync4, lstatSync as lstatSync2, mkdirSync as mkdirSync2, mkdtempSync as mkdtempSync2, openSync as openSync2, readdirSync as readdirSync2, readFileSync as readFileSync4, realpathSync as realpathSync2, rmSync, statSync as statSync2, writeFileSync as writeFileSync3 } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { dirname as dirname3, join as join4, relative, sep as sep2 } from "node:path";
@@ -384,7 +384,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "2.3.16";
+var PLUGIN_VERSION = "2.3.17";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -3185,7 +3185,7 @@ function adapterFor(agent) {
 var allAdapters = [claudeAdapter, codexAdapter];
 
 // src/core/handoff-later.ts
-import { appendFileSync as appendFileSync2, linkSync, readFileSync as readFileSync2, unlinkSync, writeFileSync } from "node:fs";
+import { appendFileSync as appendFileSync2, closeSync, fstatSync, linkSync, openSync, readFileSync as readFileSync2, readSync, unlinkSync, writeFileSync } from "node:fs";
 var PENDING_PATH = `${CC_DIR}/handoff-pending.json`;
 var LATER_LOG = `${CC_DIR}/handoff.log`;
 var LATER_CAP_MS = 30 * 60000;
@@ -3199,6 +3199,43 @@ function resolveSession(o) {
   const recPid = o.records.find((r) => r.id === session)?.pid;
   const claudePid = [envPid, recPid].find((p) => typeof p === "number" && o.ancestors.includes(p));
   return { session, claudePid };
+}
+function contextTokens(jsonl, fileBytes) {
+  const lines = jsonl.split(`
+`);
+  for (let i = lines.length - 1;i >= 0; i--) {
+    if (!lines[i].includes('"usage"'))
+      continue;
+    try {
+      const row = JSON.parse(lines[i]);
+      if (row?.type !== "assistant" || row.isSidechain)
+        continue;
+      const u = row.message?.usage ?? {};
+      const n = (u.input_tokens ?? 0) + (u.cache_read_input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0);
+      if (n > 0)
+        return n;
+    } catch {}
+  }
+  return Math.round(fileBytes / 4);
+}
+function contextTokensOf(path) {
+  const fd = openSync(path, "r");
+  try {
+    const size = fstatSync(fd).size, len = Math.min(size, 4 * 1024 * 1024);
+    const buf = Buffer.alloc(len);
+    readSync(fd, buf, 0, len, size - len);
+    return contextTokens(buf.toString("utf8"), size);
+  } finally {
+    closeSync(fd);
+  }
+}
+function sizeWarning(tokens) {
+  const k = `~${Math.round(tokens / 1000)}k tokens`;
+  if (tokens > 900000)
+    return `Heads-up: this session is very large (${k}). It may exceed the cloud model's context window, and the first cloud turn resends all of it at API price. Run /compact first.`;
+  if (tokens > 200000)
+    return `Heads-up: this session is large (${k}). The first cloud turn resends all of it at API price (no cache on the box yet). Run /compact first to make it cheaper.`;
+  return;
 }
 function needsPairing(cloud, worker) {
   return !cloud.sandboxId || cloud.pairedTo !== `${cloud.sandboxId} ${worker}`;
@@ -3346,6 +3383,11 @@ import {
 import { dirname as dirname2, isAbsolute as isAbsolute2, join as join3, sep } from "node:path";
 var MAX_ARTIFACT_BYTES = 100 * 1024 * 1024;
 var MAX_EXTRACTED_BYTES = 1024 * 1024 * 1024;
+var MAX_TRANSCRIPT_BYTES = 2 * 1024 * 1024 * 1024;
+function backCaps(sentTranscriptBytes = 0) {
+  const project = Math.min(MAX_TRANSCRIPT_BYTES, Math.max(MAX_ARTIFACT_BYTES, 4 * sentTranscriptBytes));
+  return { project, artifact: MAX_ARTIFACT_BYTES, extracted: MAX_EXTRACTED_BYTES + project - MAX_ARTIFACT_BYTES };
+}
 var SENSITIVE = [".claude", ".config/cc-status", ".ssh", ".gnupg", ".aws", "Library/Keychains"];
 var sha256 = (b) => createHash2("sha256").update(b).digest("hex");
 var git = (root, args, env) => execFileSync3("git", [
@@ -3506,19 +3548,19 @@ function validateTree(dir, allow = () => true, budget = { left: MAX_EXTRACTED_BY
         continue;
       }
       if ((budget.left -= st.size) < 0)
-        throw new Error(`box artifacts exceed ${MAX_EXTRACTED_BYTES / 2 ** 30} GB extracted`);
+        throw new Error("box artifacts exceed the extracted-size cap");
       files.push(r);
     }
   };
   walk("");
   return { files, skipped };
 }
-function extractTgz(tgz, parent) {
-  if (lstatSync(tgz).size > MAX_ARTIFACT_BYTES)
-    throw new Error(`${tgz} is over ${MAX_ARTIFACT_BYTES / 1e6} MB`);
-  const n = Number(execFileSync3("sh", ["-c", `gzip -dc < "$1" | head -c ${MAX_EXTRACTED_BYTES + 1} | wc -c`, "sh", tgz]).toString().trim());
-  if (!(n <= MAX_EXTRACTED_BYTES))
-    throw new Error(`${tgz} inflates past ${MAX_EXTRACTED_BYTES / 2 ** 30} GB`);
+function extractTgz(tgz, parent, maxBytes = MAX_ARTIFACT_BYTES, maxInflated = MAX_EXTRACTED_BYTES) {
+  if (lstatSync(tgz).size > maxBytes)
+    throw new Error(`${tgz} is over ${(maxBytes / 1e6).toFixed(0)} MB`);
+  const n = Number(execFileSync3("sh", ["-c", `gzip -dc < "$1" | head -c ${maxInflated + 1} | wc -c`, "sh", tgz]).toString().trim());
+  if (!(n <= maxInflated))
+    throw new Error(`${tgz} inflates past ${(maxInflated / 2 ** 30).toFixed(1)} GB`);
   const out = mkdtempSync(join3(parent, "x-"));
   execFileSync3("/usr/bin/tar", ["-xzf", tgz, "-C", out, "--no-same-owner", "--no-same-permissions"], { stdio: ["ignore", "ignore", "pipe"] });
   return out;
@@ -4557,7 +4599,7 @@ sleep 8
 tmux has-session -t nomo
 tmux capture-pane -p -t nomo
 `;
-  return { uuid, cwd, root, git, branch, model, artifacts: art, script, snap, gitUser };
+  return { uuid, cwd, root, git, branch, model, artifacts: art, script, snap, gitUser, warn: sizeWarning(contextTokens(transcript, transcriptBytes.length)) };
 }
 async function api(key, method, path, body) {
   const res = await fetch(API + path, {
@@ -4931,9 +4973,12 @@ async function back(omg, args) {
 ${printable((pack.stdout ?? "").slice(-1500))}
 ${printable((pack.stderr ?? "").slice(-1500))}`);
   const { m, sizes } = parseMarkers(pack.stdout ?? "");
+  const caps = backCaps(snap?.tBytes);
+  const capOf = (name) => name === "project.tgz" ? caps.project : caps.artifact;
   for (const [name, size] of Object.entries(sizes)) {
-    if (size > MAX_ARTIFACT_BYTES)
-      throw new Error(`${name} on the box is ${(size / 1e6).toFixed(0)} MB (cap ${MAX_ARTIFACT_BYTES / 1e6} MB). The box is still awake: trim it via --screen/--send, rerun --back, or --stop.`);
+    if (size > capOf(name)) {
+      throw new Error(`${name} on the box is ${(size / 1e6).toFixed(0)} MB, over this session's ${(capOf(name) / 1e6).toFixed(0)} MB cap. ` + `Nothing was pulled or changed on this Mac: the session and all its work are still on box ${id}, which is awake. ` + `Look with --screen (e.g. commit and push the code from there with --send), then --stop to let it sleep (files kept 14 days).`);
+    }
   }
   const backup = join4(CC_DIR, "cloud-back", `${uuid8}-${Date.now()}`);
   mkdirSync2(backup, { recursive: true, mode: 448 });
@@ -4962,11 +5007,11 @@ Interrupted (${sig}) while ${phase}.
   await sleepBox(omg, { id, status: "running" });
   phase = "landing the box's work on this Mac";
   const problems = [];
-  const budget = { left: MAX_EXTRACTED_BYTES };
+  const budget = { left: caps.extracted };
   const paths = (ps) => ps.map((p) => printable(p, true)).join(", ");
   const unpack = (name) => {
     try {
-      return extractTgz(join4(backup, name), backup);
+      return extractTgz(join4(backup, name), backup, capOf(name), name === "project.tgz" ? caps.extracted : undefined);
     } catch (e) {
       problems.push(`${name} could not be unpacked, so it was NOT applied (${printable((e.stderr?.toString() || e.message || String(e)).trim(), true).slice(0, 300)}); it is kept in ${backup}`);
     }
@@ -5159,7 +5204,7 @@ After that, /nomo-cc:handoff works from inside Claude Code.`);
     console.log(`A handoff is already waiting (session ${cur?.session ?? "?"}). See /nomo-cc:handoff status, or /nomo-cc:handoff cancel.`);
     return;
   }
-  const fd = openSync(LATER_LOG, "w", 384);
+  const fd = openSync2(LATER_LOG, "w", 384);
   const child = spawn2(process.execPath, [SELF, "--after-exit", "--session", session, "--claude-pid", String(claudePid), "--worker", worker], { cwd, detached: true, stdio: ["ignore", fd, fd] });
   child.unref();
   writeFileSync3(PENDING_PATH, JSON.stringify({ ...p, helperPid: child.pid }) + `
@@ -5167,6 +5212,12 @@ After that, /nomo-cc:handoff works from inside Claude Code.`);
   console.log(`Ready. Quit Claude Code now (/exit). Session ${session} moves to the cloud as soon as it closes; watch it on your phone.
 ` + `Log: ${LATER_LOG}
 To cancel before quitting: /nomo-cc:handoff cancel`);
+  let warn;
+  try {
+    warn = sizeWarning(contextTokensOf(join4(home, ".claude", "projects", projectDirName(cwd), `${session}.jsonl`)));
+  } catch {}
+  if (warn)
+    console.log(warn);
 }
 async function afterExit(args, worker) {
   const session = String(args.get("--session")), claudePid = Number(args.get("--claude-pid"));
@@ -5321,6 +5372,8 @@ ${BOX_PLUGIN}
   try {
     plan = build(args, out);
     console.log(`Handing off session ${plan.uuid} (${plan.model}) from ${plan.cwd} · Nomo worker ${worker}`);
+    if (plan.warn)
+      console.log(plan.warn);
     id = await ensureBox(omg);
     for (const [box, local] of Object.entries(plan.artifacts)) {
       await api(omg, "POST", `/sandboxes/${id}/files`, [{ path: box, content: readFileSync4(local).toString("base64"), mode: 384 }]);

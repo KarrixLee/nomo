@@ -10,7 +10,7 @@
 // target worker (cloud.json `pairedTo`, written by handoff.ts on every pairing it sees succeed) is
 // refused up front with the terminal command instead.
 
-import { appendFileSync, linkSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { appendFileSync, closeSync, fstatSync, linkSync, openSync, readFileSync, readSync, unlinkSync, writeFileSync } from "node:fs";
 import { CC_DIR } from "./shared";
 
 export const PENDING_PATH = `${CC_DIR}/handoff-pending.json`;
@@ -45,6 +45,44 @@ export function resolveSession(o: {
   const recPid = o.records.find((r) => r.id === session)?.pid;
   const claudePid = [envPid, recPid].find((p): p is number => typeof p === "number" && o.ancestors.includes(p));
   return { session, claudePid };
+}
+
+/** The session's live context in tokens: the last real assistant turn's usage (input + cache read + cache
+ *  creation = what was actually sent), else transcript bytes / 4. `jsonl` may be just the file's tail. */
+export function contextTokens(jsonl: string, fileBytes: number): number {
+  const lines = jsonl.split("\n");
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (!lines[i].includes('"usage"')) continue;
+    try {
+      const row = JSON.parse(lines[i]);
+      if (row?.type !== "assistant" || row.isSidechain) continue;
+      const u = row.message?.usage ?? {};
+      const n = (u.input_tokens ?? 0) + (u.cache_read_input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0);
+      if (n > 0) return n; // a synthetic/error row reports zeros
+    } catch { /* torn line */ }
+  }
+  return Math.round(fileBytes / 4);
+}
+
+/** contextTokens over the last 4 MB of a transcript file (a 1M-token one is tens of MB). */
+export function contextTokensOf(path: string): number {
+  const fd = openSync(path, "r");
+  try {
+    const size = fstatSync(fd).size, len = Math.min(size, 4 * 1024 * 1024);
+    const buf = Buffer.alloc(len);
+    readSync(fd, buf, 0, len, size - len);
+    return contextTokens(buf.toString("utf8"), size);
+  } finally {
+    closeSync(fd);
+  }
+}
+
+/** One heads-up line for a big session (never blocks the move), or undefined. No prices: they change. */
+export function sizeWarning(tokens: number): string | undefined {
+  const k = `~${Math.round(tokens / 1000)}k tokens`;
+  if (tokens > 900_000) return `Heads-up: this session is very large (${k}). It may exceed the cloud model's context window, and the first cloud turn resends all of it at API price. Run /compact first.`;
+  if (tokens > 200_000) return `Heads-up: this session is large (${k}). The first cloud turn resends all of it at API price (no cache on the box yet). Run /compact first to make it cheaper.`;
+  return undefined;
 }
 
 /** True unless cloud.json records the user's box as paired to `worker`. */

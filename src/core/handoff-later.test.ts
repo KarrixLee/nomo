@@ -3,7 +3,7 @@ import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
-  cancelPending, claimPending, GONE_MSG, handoffArgv, handoffLanded, laterStatus, NOTHING_RAN_MSG, needsPairing, type Pending, readPending, resolveSession, waitThenHandoff, type WaitDeps,
+  cancelPending, claimPending, contextTokens, contextTokensOf, GONE_MSG, sizeWarning, handoffArgv, handoffLanded, laterStatus, NOTHING_RAN_MSG, needsPairing, type Pending, readPending, resolveSession, waitThenHandoff, type WaitDeps,
 } from "./handoff-later";
 
 const A = "0a1b2c3d-1111-4222-8333-444455556666";
@@ -176,5 +176,41 @@ describe("waitThenHandoff", () => {
     expect(laterStatus({ path, isHelper: () => true, log })).toContain(`Waiting for Claude Code (pid 400) to quit, then moving session ${A}`);
     writeFileSync(log, "x\n[t] DONE: session moved\n");
     expect(laterStatus({ path, isHelper: () => false, log })).toContain("Last: [t] DONE: session moved");
+  });
+});
+
+describe("context size", () => {
+  const asst = (u: object, extra: object = {}) => JSON.stringify({ type: "assistant", message: { model: "claude-opus-5-5", usage: u }, ...extra });
+  const user = JSON.stringify({ type: "user", message: { content: "hi" } });
+
+  test("the last real assistant turn's input + cache read + cache creation", () => {
+    const jsonl = [
+      asst({ input_tokens: 10, cache_read_input_tokens: 100, cache_creation_input_tokens: 5, output_tokens: 50 }),
+      user,
+      asst({ input_tokens: 3, cache_read_input_tokens: 800_000, cache_creation_input_tokens: 20_000, output_tokens: 900 }),
+      asst({ input_tokens: 0, output_tokens: 0 }, { message: { model: "<synthetic>", usage: { input_tokens: 0, output_tokens: 0 } } }),
+      asst({ input_tokens: 999_999 }, { isSidechain: true }),
+      user,
+      '{"type":"assistant","message":{"usage":{"input_tok', // torn last line
+    ].join("\n");
+    expect(contextTokens(jsonl, 1e9)).toBe(820_003);
+  });
+
+  test("no usage at all: file bytes / 4", () => {
+    expect(contextTokens([user, user].join("\n"), 4_000_000)).toBe(1_000_000);
+  });
+
+  test("reads only the file's tail", () => {
+    const path = join(tmp(), "t.jsonl");
+    writeFileSync(path, "x".repeat(5 * 1024 * 1024) + "\n" + asst({ input_tokens: 1, cache_read_input_tokens: 250_000 }) + "\n");
+    expect(contextTokensOf(path)).toBe(250_001);
+  });
+
+  test("heads-up: none small, cost over 200k, context window over 900k; never a price", () => {
+    expect(sizeWarning(150_000)).toBeUndefined();
+    expect(sizeWarning(820_003)).toBe("Heads-up: this session is large (~820k tokens). The first cloud turn resends all of it at API price (no cache on the box yet). Run /compact first to make it cheaper.");
+    expect(sizeWarning(950_000)).toContain("context window");
+    expect(sizeWarning(950_000)).toContain("/compact");
+    expect(sizeWarning(950_000)).not.toMatch(/\$/);
   });
 });

@@ -71,11 +71,11 @@ import { buildPairURL, DEFAULT_WORKER_URL } from "../core/pair-url";
 import { normalizeModelId } from "../core/adapter";
 import { atomicWrite, CC_DIR, pidAlive, pidAncestors, pidCommand, readRecord, SESSIONS_DIR } from "../core/shared";
 import {
-  cancelPending, claimPending, GONE_MSG, handoffArgv, LATER_LOG, laterStatus, needsPairing, type Pending, PENDING_PATH, readPending, resolveSession, waitThenHandoff,
+  cancelPending, claimPending, contextTokens, contextTokensOf, GONE_MSG, sizeWarning, handoffArgv, LATER_LOG, laterStatus, needsPairing, type Pending, PENDING_PATH, readPending, resolveSession, waitThenHandoff,
 } from "../core/handoff-later";
 import {
   agentConfigPaths, applyInPlace, atomicWriteBytes, type BoxArtifacts, boxChangedPaths, boxIdle, copyContained, decideCode, extractTgz,
-  landFolder, landOnBranch, listFiles, MAX_ARTIFACT_BYTES, MAX_EXTRACTED_BYTES, macGitState, mergeMemory, mkdirp, parseMarkers, printable,
+  backCaps, landFolder, landOnBranch, listFiles, MAX_ARTIFACT_BYTES, macGitState, mergeMemory, mkdirp, parseMarkers, printable,
   type Snapshot, takeSnapshot, transcriptAction, validateTree,
 } from "../core/cloud-back";
 import { renderQR } from "../qr/qr";
@@ -329,6 +329,7 @@ function tar(out: string, cwd: string, args: string[], input?: Buffer): void {
 
 interface Plan {
   uuid: string;
+  warn?: string; // a big-session heads-up (sizeWarning)
   cwd: string;
   root: string; // repo toplevel (or cwd for a non-git folder)
   git: boolean;
@@ -472,7 +473,7 @@ sleep 8
 tmux has-session -t nomo
 tmux capture-pane -p -t nomo
 `;
-  return { uuid, cwd, root, git, branch, model, artifacts: art, script, snap, gitUser };
+  return { uuid, cwd, root, git, branch, model, artifacts: art, script, snap, gitUser, warn: sizeWarning(contextTokens(transcript, transcriptBytes.length)) };
 }
 
 // --------------------------------------------------------------------------------------------- omg
@@ -863,8 +864,14 @@ async function back(omg: string, args: Map<string, string | true>): Promise<void
   other(pack.stdout ?? "");
   if (pack.exitCode !== 0) throw new Error(`packing on box ${id} failed (exit ${pack.exitCode}):\n${printable((pack.stdout ?? "").slice(-1500))}\n${printable((pack.stderr ?? "").slice(-1500))}`);
   const { m, sizes } = parseMarkers(pack.stdout ?? "");
+  const caps = backCaps(snap?.tBytes);
+  const capOf = (name: string) => (name === "project.tgz" ? caps.project : caps.artifact);
   for (const [name, size] of Object.entries(sizes)) {
-    if (size > MAX_ARTIFACT_BYTES) throw new Error(`${name} on the box is ${(size / 1e6).toFixed(0)} MB (cap ${MAX_ARTIFACT_BYTES / 1e6} MB). The box is still awake: trim it via --screen/--send, rerun --back, or --stop.`);
+    if (size > capOf(name)) {
+      throw new Error(`${name} on the box is ${(size / 1e6).toFixed(0)} MB, over this session's ${(capOf(name) / 1e6).toFixed(0)} MB cap. ` +
+        `Nothing was pulled or changed on this Mac: the session and all its work are still on box ${id}, which is awake. ` +
+        `Look with --screen (e.g. commit and push the code from there with --send), then --stop to let it sleep (files kept 14 days).`);
+    }
   }
   const backup = join(CC_DIR, "cloud-back", `${uuid8}-${Date.now()}`);
   mkdirSync(backup, { recursive: true, mode: 0o700 });
@@ -892,11 +899,11 @@ async function back(omg: string, args: Map<string, string | true>): Promise<void
   // 4. Apply: transcript, memory, code. Every tar is untrusted (core/cloud-back.ts).
   phase = "landing the box's work on this Mac";
   const problems: string[] = [];
-  const budget = { left: MAX_EXTRACTED_BYTES };
+  const budget = { left: caps.extracted };
   const paths = (ps: string[]) => ps.map((p) => printable(p, true)).join(", ");
   /** One artifact that will not unpack (a bad entry, a cap) is reported and skipped; the rest still land. */
   const unpack = (name: string): string | undefined => {
-    try { return extractTgz(join(backup, name), backup); } catch (e: any) {
+    try { return extractTgz(join(backup, name), backup, capOf(name), name === "project.tgz" ? caps.extracted : undefined); } catch (e: any) {
       problems.push(`${name} could not be unpacked, so it was NOT applied (${printable((e.stderr?.toString() || e.message || String(e)).trim(), true).slice(0, 300)}); it is kept in ${backup}`);
     }
   };
@@ -1065,6 +1072,9 @@ async function later(args: Map<string, string | true>, keys: { omg?: string; ope
   writeFileSync(PENDING_PATH, JSON.stringify({ ...p, helperPid: child.pid }) + "\n", { mode: 0o600 });
   console.log(`Ready. Quit Claude Code now (/exit). Session ${session} moves to the cloud as soon as it closes; watch it on your phone.\n` +
     `Log: ${LATER_LOG}\nTo cancel before quitting: /nomo-cc:handoff cancel`);
+  let warn: string | undefined;
+  try { warn = sizeWarning(contextTokensOf(join(home, ".claude", "projects", projectDirName(cwd), `${session}.jsonl`))); } catch { /* estimate only */ }
+  if (warn) console.log(warn);
 }
 
 /** The detached helper spawned by later(). */
@@ -1181,6 +1191,7 @@ ${BOX_PLUGIN}
   try {
     plan = build(args, out);
     console.log(`Handing off session ${plan.uuid} (${plan.model}) from ${plan.cwd} · Nomo worker ${worker}`);
+    if (plan.warn) console.log(plan.warn);
     id = await ensureBox(omg);
     for (const [box, local] of Object.entries(plan.artifacts)) {
       await api(omg, "POST", `/sandboxes/${id}/files`, [{ path: box, content: readFileSync(local).toString("base64"), mode: 0o600 }]);
