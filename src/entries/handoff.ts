@@ -618,7 +618,7 @@ for _ in $(seq ${tries}); do
   tmux has-session -t nomo 2>/dev/null || break
   cur=$(tmux capture-pane -p -t nomo | grep -v '^[[:space:]]*$' | tail -8)
   if [ -n "$cur" ] && [ "$cur" = "$prev" ] && printf '%s\n' "$cur" | grep -q '─' \
-    && printf '%s\n' "$cur" | grep -Eq '^[│ ]*(>|❯)( |$)' && ! printf '%s\n' "$cur" | grep -Eq '(>|❯) *[0-9]+\\.'; then
+    && printf '%s\n' "$cur" | grep -Eq '^[│ ]*(>|❯)' && ! printf '%s\n' "$cur" | grep -Eq '(>|❯).{0,3}[0-9]+\\.'; then
     tmux send-keys -t nomo -l -- "$NOMO_TEXT" && sleep 0.5 && tmux send-keys -t nomo Enter && { echo NOMO_SENT; exit 0; }
   fi
   prev=$cur

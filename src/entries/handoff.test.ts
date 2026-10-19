@@ -304,6 +304,9 @@ describe("first message (--then, /nomo-cc:handoff)", () => {
   const NASTY = `it's "$HOME" \`id\` $(touch PWNED) \\n ; rm -rf x\nsecond line`;
   const READY = "> earlier prompt\n⏺ done.\n\n────────────────\n> \n────────────────\n  ? for shortcuts\n";
   const MENU = "────────────────\n Resume this session?\n❯ 1. Yes\n  2. No\n";
+  // What CC 2.1.303 really draws: "❯" + NBSP (captured live from a box pane), for the prompt and menus alike.
+  const READY_NBSP = "● done.\n────────────────\n❯\u00a0\n────────────────\n  ⏵⏵ auto mode on (shift+tab to cycle)\n";
+  const MENU_NBSP = "────────────────\n Resume this session?\n❯\u00a01. Yes\n  2. No\n";
 
   /** Run firstMessageScript against a fake tmux showing `screen`; returns stdout, the typed text, the keys. */
   function runBox(screen: string, tries = 3): { out: string; typed?: string; keys: string } {
@@ -332,8 +335,12 @@ esac
     expect(firstMessageScript()).not.toContain("it's");
   });
 
+  test("the real CC prompt (❯ + NBSP) counts as ready", () => {
+    expect(runBox(READY_NBSP).out.trim()).toBe("NOMO_SENT");
+  });
+
   test("a menu or a still-starting screen is never typed into", () => {
-    for (const screen of [MENU, "", "Resuming conversation…\n"]) {
+    for (const screen of [MENU, MENU_NBSP, "", "Resuming conversation…\n"]) {
       const r = runBox(screen);
       expect(r.out.trim()).toBe("NOMO_NOT_READY");
       expect(r.typed).toBeUndefined();
