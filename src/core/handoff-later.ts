@@ -180,13 +180,13 @@ export function handoffArgv(o: { runtime: string; self: string; shim: string; ar
 export const GONE_MSG = "the Nomo plugin was updated or removed while waiting; rerun /nomo-cc:handoff";
 export const NOTHING_RAN_MSG = "the handoff exited without moving the session (the Nomo plugin or its runtime was not found); rerun /nomo-cc:handoff";
 
-type CloudLike = { current?: string; sessions?: Record<string, unknown> };
-/** Positive proof a handoff ran: cloud.json names `session` current with a snapshot that changed during
+type CloudLike = { active?: string[]; current?: string; sessions?: Record<string, unknown> };
+/** Positive proof a handoff ran: cloud.json lists `session` active (pre-2.3.29: `current`) with a snapshot that changed during
  *  the run (the shim and run.sh exit 0 having run nothing). A re-handoff of the same session always
  *  changes it: the transcript grew by at least this command's own turn. */
 export function handoffLanded(before: CloudLike, after: CloudLike, session: string): boolean {
   const snap = after.sessions?.[session];
-  return after.current === session && snap !== undefined && JSON.stringify(snap) !== JSON.stringify(before.sessions?.[session]);
+  return (after.active ?? (after.current ? [after.current] : [])).includes(session) && snap !== undefined && JSON.stringify(snap) !== JSON.stringify(before.sessions?.[session]);
 }
 
 export interface WaitDeps {

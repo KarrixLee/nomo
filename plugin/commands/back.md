@@ -8,6 +8,9 @@ finish its turn (15 min by default), pulls its work back and sleeps the box. Run
 was handed off (now parked), it lands the conversation under this window and ends with
 `Back. Type /resume <id> to continue here.`: relay that line exactly; the user types it (you cannot run
 /resume). Run from any other session, it opens a **new Terminal window** on `claude --resume` instead.
+The box can hold several sessions: from another session with more than one in the cloud and no
+`--session`, it lists them and stops; relay the list and ask the user which one (then rerun with
+`--session <uuid>`). Other sessions on the box keep running; it sleeps only when none is left.
 
 Run it right away, every time this command is invoked: never ask for confirmation first, even if an
 earlier run was interrupted or you asked before. A handed-off window is parked, so the user cannot answer

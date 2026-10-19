@@ -384,7 +384,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "2.3.28";
+var PLUGIN_VERSION = "2.3.29";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -3635,7 +3635,7 @@ var GONE_MSG = "the Nomo plugin was updated or removed while waiting; rerun /nom
 var NOTHING_RAN_MSG = "the handoff exited without moving the session (the Nomo plugin or its runtime was not found); rerun /nomo-cc:handoff";
 function handoffLanded(before, after, session) {
   const snap = after.sessions?.[session];
-  return after.current === session && snap !== undefined && JSON.stringify(snap) !== JSON.stringify(before.sessions?.[session]);
+  return (after.active ?? (after.current ? [after.current] : [])).includes(session) && snap !== undefined && JSON.stringify(snap) !== JSON.stringify(before.sessions?.[session]);
 }
 async function waitThenHandoff(p, d) {
   const self = d.selfPid ?? process.pid;
@@ -4674,7 +4674,52 @@ var BOX_CC = "/root/.config/cc-status";
 var BOX_PLUGIN = `R=$(ls -d /root/.claude/plugins/cache/nomo/nomo-cc/*/ 2>/dev/null | tail -1)`;
 var RELAY_PORT = 47181;
 var BASE_TEMPLATE = "nomo-base";
-var SHM_SWEEP = `find /dev/shm -maxdepth 1 -name nomo-env -mmin +1 -delete 2>/dev/null || true`;
+var SHM_SWEEP = `find /dev/shm -maxdepth 1 -name 'nomo-env*' -mmin +1 -delete 2>/dev/null || true`;
+var BOX_MAX_SESSIONS = 4;
+var BOX_SESSIONS = "/root/.nomo-sessions";
+var BOX_CURRENT = "/root/.nomo-current";
+var BOX_LIB = `SD=${BOX_SESSIONS}
+nomo_t() { T=$(sed -n 2p "$SD/$1" 2>/dev/null) || true; [ -n "$T" ] || T="nomo-$(printf %s "$1" | cut -c1-8)"; return 0; }
+nomo_alive() { tmux has-session -t "=$1" 2>/dev/null; }
+nomo_migrate() {
+  local L t d r
+  L=$(head -c 64 ${BOX_CURRENT} 2>/dev/null | tr -cd '0-9a-f-') || true
+  [ -n "$L" ] || return 0
+  if [ ! -f "$SD/$L" ]; then
+    t=$(ls /root/.claude/projects/*/"$L".jsonl 2>/dev/null | head -1) || true
+    d=; [ -z "$t" ] || d=$(grep -o '"cwd":"[^"]*"' "$t" | tail -1 | cut -d'"' -f4) || true
+    r=$d; [ -z "$d" ] || r=$(git -C "$d" rev-parse --show-toplevel 2>/dev/null) || r=$d
+    mkdir -p "$SD" && printf '%s\\nnomo\\n' "$r" > "$SD/$L"
+  fi
+  rm -f ${BOX_CURRENT}
+  return 0
+}
+nomo_live() { local f; for f in "$SD"/*; do [ -f "$f" ] || continue; nomo_t "\${f##*/}"; if nomo_alive "$T"; then printf '%s\\n' "\${f##*/}"; fi; done; return 0; }`;
+var boxPrelude = (uuid) => `${SHM_SWEEP}
+${BOX_LIB}
+nomo_migrate
+nomo_t ${q(uuid)}`;
+var writeMarker = (uuid, root) => `mkdir -p "$SD" && printf '%s\\n%s\\n' ${q(root)} ${q(tmuxName(uuid))} > "$SD/"${q(uuid)}`;
+var tmuxName = (uuid) => `nomo-${uuid.slice(0, 8)}`;
+var shmEnvFile = (uuid) => `/dev/shm/nomo-env-${uuid.slice(0, 8)}`;
+var launchLine = (uuid, model) => `. ${shmEnvFile(uuid)}; rm -f ${shmEnvFile(uuid)}; export PATH="/root/.local/bin:$PATH"; exec claude --resume ${uuid} --model ${q(model)}`;
+var keepaliveLoop = () => `while ${ANY_SESSION}; do curl -s -X POST http://169.254.0.1:9090/v1/sandbox/keepalive -H 'Content-Type: application/json' -d '{"seconds":${KEEPALIVE_S}}' >/dev/null; sleep 600; done`;
+var ANY_SESSION = `tmux ls -F '#{session_name}' 2>/dev/null | grep -qxE 'nomo(-[0-9a-f]{8})?'`;
+function admitScript(uuid, root) {
+  return `N=0
+if command -v tmux >/dev/null; then
+  if nomo_alive "$T"; then
+    if [ "\${NOMO_FORCE:-}" != 1 ]; then echo "NOMO_BUSY: session ${uuid} is already running on this box"; exit 3; fi
+    tmux kill-session -t "=$T"
+  fi
+  for f in "$SD"/*; do
+    [ -f "$f" ] && [ "\${f##*/}" != ${q(uuid)} ] || continue
+    if [ "$(head -1 "$f")" = ${q(root)} ]; then echo "NOMO_SAME_ROOT=\${f##*/}"; exit 3; fi
+  done
+  N=$(( $(nomo_live | wc -l) ))
+  if [ "$N" -ge ${BOX_MAX_SESSIONS} ]; then echo "NOMO_FULL=$N"; exit 3; fi
+fi`;
+}
 var BOX_SIZE = "pro";
 var PAIR_FN = `nomo_pair() {
   ${BOX_PLUGIN}
@@ -4770,7 +4815,8 @@ function readKeys() {
     openrouter: process.env.OPENROUTER_API_KEY || file.OPENROUTER_API_KEY
   };
 }
-function boxSetup(marketplace) {
+function boxSetup(marketplace, stage = STAGE) {
+  const version = JSON.parse(marketplace).plugins?.[0]?.version ?? "";
   return `export PATH="/root/.local/bin:/root/.bun/bin:$PATH"
 command -v claude >/dev/null || curl -fsSL https://claude.ai/install.sh | bash >/dev/null 2>&1
 command -v tmux >/dev/null || { apt-get update -qq >/dev/null && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq tmux >/dev/null; }
@@ -4778,19 +4824,23 @@ command -v bun >/dev/null || curl -fsSL https://bun.sh/install | bash >/dev/null
 command -v bun >/dev/null || echo "WARN: no bun on the box, Nomo hooks stay silent"
 claude --version
 
+if [ "\${N:-0}" -gt 0 ] && [ -n ${q(version)} ] && [ -d /root/.claude/plugins/cache/nomo/nomo-cc/${q(version)} ]; then
+  echo "Nomo plugin ${version} already installed; kept for the $N running session(s)."
+else
 M=/root/.nomo/marketplace
-rm -rf "$M" && mkdir -p "$M/plugin" "$M/.claude-plugin" && tar xzf ${STAGE}-plugin.tgz -C "$M/plugin"
+rm -rf "$M" && mkdir -p "$M/plugin" "$M/.claude-plugin" && tar xzf ${stage}-plugin.tgz -C "$M/plugin"
 printf '%s
 ' ${q(marketplace)} > "$M/.claude-plugin/marketplace.json"
 claude plugin marketplace add "$M" </dev/null >/dev/null 2>&1 || true
 claude plugin uninstall nomo-cc@nomo </dev/null >/dev/null 2>&1 || true
 rm -rf /root/.claude/plugins/cache/nomo
-claude plugin install nomo-cc@nomo </dev/null >/dev/null`;
+claude plugin install nomo-cc@nomo </dev/null >/dev/null
+fi`;
 }
 function bakeScript(marketplace) {
   return `set -euo pipefail
 ${boxSetup(marketplace)}
-rm -rf ${STAGE}-* ${BOX_CC} /root/.claude/projects /dev/shm/nomo-env
+rm -rf ${STAGE}-* ${BOX_CC} /root/.claude/projects /dev/shm/nomo-env* ${BOX_SESSIONS} ${BOX_CURRENT}
 echo NOMO_BAKED`;
 }
 function targetWorker(flag, env) {
@@ -4915,8 +4965,9 @@ function build(args, outDir) {
   const model = typeof args.get("--model") === "string" ? toOpenRouterModel(args.get("--model")) : toOpenRouterModel(lastModel(transcript) ?? "claude-opus-5-5");
   checkLaunchIds(uuid, model);
   const art = {};
+  const stage = `${STAGE}-${uuid.slice(0, 8)}`;
   const put = (name) => {
-    art[`${STAGE}-${name}`] = join6(outDir, name);
+    art[`${stage}-${name}`] = join6(outDir, name);
     return join6(outDir, name);
   };
   tar(put("project.tgz"), projDir, [`${uuid}.jsonl`, ...[uuid, "memory"].filter((p) => existsSync5(join6(projDir, p)))]);
@@ -4965,25 +5016,24 @@ function build(args, outDir) {
   }
   const enc = projectDirName(cwd);
   const runEnv = ["ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"];
-  const launch = `. /dev/shm/nomo-env; rm -f /dev/shm/nomo-env; export PATH="/root/.local/bin:$PATH"; exec claude --resume ${uuid} --model ${q(model)}`;
-  const keepalive = `while tmux has-session -t nomo 2>/dev/null; do curl -s -X POST http://169.254.0.1:9090/v1/sandbox/keepalive -H 'Content-Type: application/json' -d '{"seconds":${KEEPALIVE_S}}' >/dev/null; sleep 600; done`;
-  const script = `set -euo pipefail
-if command -v tmux >/dev/null && tmux has-session -t nomo 2>/dev/null; then
-  if [ "\${NOMO_FORCE:-}" != 1 ]; then echo "NOMO_BUSY: a handed-off session is still running on this box"; exit 3; fi
-  tmux kill-server # not just the session: a pre-2.3.2 server still carries the API key in its argv
-fi
-# Keys reach claude via RAM, never argv: the file is gone the moment the launcher has read it. Taken
-# FIRST and the key unset, so no tmux server (pair wait, relay, keepalive) ever inherits it in its env;
-# a run that dies before claude starts removes the file on the way out.
-rm -f /dev/shm/nomo-env
-( umask 077; export -p | grep -E '^declare -x (${runEnv.join("|")})=' > /dev/shm/nomo-env )
+  const envFile = shmEnvFile(uuid);
+  const keepalive = keepaliveLoop();
+  const script = `${boxPrelude(uuid)}
+set -euo pipefail
+${admitScript(uuid, root)}
+T=${tmuxName(uuid)}
+# Keys reach claude via RAM, never argv: the file (this session's own, so two handoffs never race on it)
+# is gone the moment the launcher has read it. Taken FIRST and the key unset, so no tmux server (pair
+# wait, relay, keepalive) ever inherits it in its env; a run that dies before claude starts removes it.
+rm -f ${envFile}
+( umask 077; export -p | grep -E '^declare -x (${runEnv.join("|")})=' > ${envFile} )
 unset ANTHROPIC_AUTH_TOKEN
-trap 'tmux has-session -t nomo 2>/dev/null || rm -f /dev/shm/nomo-env' EXIT
-${boxSetup(marketplace)}
+trap 'nomo_alive "$T" || rm -f ${envFile}' EXIT
+${boxSetup(marketplace, stage)}
 
 P=/root/.claude/projects/${enc}
-mkdir -p "$P" && tar xzf ${STAGE}-project.tgz -C "$P"
-${hasLayer ? `tar xzf ${STAGE}-userlayer.tgz -C /root/.claude` : "# no user layer"}
+mkdir -p "$P" && tar xzf ${stage}-project.tgz -C "$P"
+${hasLayer ? `tar xzf ${stage}-userlayer.tgz -C /root/.claude` : "# no user layer"}
 
 # The user's git identity arrives as exec env (never argv), so the box's commits are authored as them.
 if [ -n "\${NOMO_GIT_NAME:-}" ]; then git config --global user.name "$NOMO_GIT_NAME"; fi
@@ -4992,11 +5042,11 @@ if [ -n "\${NOMO_GIT_EMAIL:-}" ]; then git config --global user.email "$NOMO_GIT
 ROOT=${q(root)}
 [ -e "$ROOT" ] && mv "$ROOT" "$ROOT.nomo-bak-$(date +%s)"
 mkdir -p "$(dirname "$ROOT")"
-${git ? `git -c advice.detachedHead=false clone -q ${STAGE}-repo.bundle "$ROOT"
+${git ? `git -c advice.detachedHead=false clone -q ${stage}-repo.bundle "$ROOT"
 cd "$ROOT"
 ${branch && branch !== "HEAD" ? `git checkout -q -B ${q(branch)}` : "# detached HEAD"}
-[ -s ${STAGE}-wip.patch ] && git apply --binary ${STAGE}-wip.patch
-tar xzf ${STAGE}-untracked.tgz -C "$ROOT"` : `mkdir -p "$ROOT" && tar xzf ${STAGE}-folder.tgz -C "$ROOT"`}
+[ -s ${stage}-wip.patch ] && git apply --binary ${stage}-wip.patch
+tar xzf ${stage}-untracked.tgz -C "$ROOT"` : `mkdir -p "$ROOT" && tar xzf ${stage}-folder.tgz -C "$ROOT"`}
 
 # First-run onboarding + trust live in the BOX's own /root/.claude.json (never the Mac's).
 python3 - ${q(cwd)} <<'PY'
@@ -5013,20 +5063,24 @@ PY
 ${PAIR_FN}
 nomo_pair
 
-# The OpenRouter relay, fresh from this install (a re-handoff replaces the old one).
+# The OpenRouter relay, fresh from this install, unless other sessions are talking through it right now.
 ${BOX_PLUGIN}
-tmux kill-session -t nomo-relay 2>/dev/null || true
-tmux new-session -d -s nomo-relay "$(command -v bun || command -v node) $R/dist/or-relay.mjs"
-for _ in $(seq 20); do (exec 3<>/dev/tcp/127.0.0.1/${RELAY_PORT}) 2>/dev/null && break; sleep 0.5; done
-(exec 3<>/dev/tcp/127.0.0.1/${RELAY_PORT}) 2>/dev/null || { echo "NOMO_RELAY_FAILED"; tmux capture-pane -p -t nomo-relay 2>/dev/null; exit 4; }
+if [ "$N" -gt 0 ] && (exec 3<>/dev/tcp/127.0.0.1/${RELAY_PORT}) 2>/dev/null; then :; else
+  tmux kill-session -t =nomo-relay 2>/dev/null || true
+  tmux new-session -d -s nomo-relay "$(command -v bun || command -v node) $R/dist/or-relay.mjs"
+  for _ in $(seq 20); do (exec 3<>/dev/tcp/127.0.0.1/${RELAY_PORT}) 2>/dev/null && break; sleep 0.5; done
+fi
+(exec 3<>/dev/tcp/127.0.0.1/${RELAY_PORT}) 2>/dev/null || { echo "NOMO_RELAY_FAILED"; tmux capture-pane -p -t =nomo-relay: 2>/dev/null; exit 4; }
 
-# Which session tmux session nomo runs, so --back --session X never stops a different one (an id, no secret).
-printf %s ${q(uuid)} > ${BOX_CURRENT}
-tmux new-session -d -s nomo -x 200 -y 50 -c ${q(cwd)} ${q(`bash -c ${q(launch)}`)}
-tmux has-session -t nomo-keepalive 2>/dev/null || tmux new-session -d -s nomo-keepalive ${q(keepalive)}
+# Which session this tmux runs and at which root, so --back/--stop --session X never touch another one.
+${writeMarker(uuid, root)}
+tmux new-session -d -s "$T" -x 200 -y 50 -c ${q(cwd)} ${q(`bash -c ${q(launchLine(uuid, model))}`)}
+# Restarted every time: a pre-2.3.29 loop watches the legacy name only.
+tmux kill-session -t =nomo-keepalive 2>/dev/null || true
+tmux new-session -d -s nomo-keepalive ${q(keepalive)}
 sleep 8
-tmux has-session -t nomo
-tmux capture-pane -p -t nomo
+tmux has-session -t "=$T"
+tmux capture-pane -p -t "=$T:"
 `;
   return { uuid, cwd, root, git, branch, model, artifacts: art, script, snap, gitUser, warn: sizeWarning(contextTokens(transcriptBytes.subarray(Math.max(0, transcriptBytes.length - TAIL_BYTES)).toString("utf8"), transcriptBytes.length)) };
 }
@@ -5073,9 +5127,60 @@ async function exec(key, id, script, env = {}) {
     }
   }
 }
+function normalizeCloud(raw) {
+  const { current, ...c } = raw;
+  const active = Array.isArray(c.active) ? c.active.filter((s) => typeof s === "string" && UUID_RE3.test(s)) : current && UUID_RE3.test(current) ? [current] : [];
+  return { ...c, active };
+}
+function hereSession(here, c, park = readPark) {
+  if (typeof here !== "string" || !UUID_RE3.test(here))
+    return;
+  return c.active?.includes(here) || ["cloud", "landing"].includes(park(here)?.state ?? "") ? here : undefined;
+}
+function pickSession(flag, here, c) {
+  if (typeof flag === "string") {
+    if (!UUID_RE3.test(flag))
+      throw new Error(`session id must be a UUID, got ${JSON.stringify(flag)}`);
+    return flag;
+  }
+  const active = c.active ?? [];
+  if (here)
+    return here;
+  if (active.length === 1)
+    return active[0];
+  if (!active.length)
+    throw new Error("no handed-off session on record; pass --session <uuid>");
+  throw new Error(`${active.length} sessions are in the cloud; say which with --session <id>:
+${listActive(c)}`);
+}
+var listActive = (c) => (c.active ?? []).map((s) => `  ${s}  ${c.sessions?.[s]?.root ?? "(no snapshot)"}`).join(`
+`);
+function busyMessage(stdout, box, uuid, root) {
+  const same = stdout.match(/^NOMO_SAME_ROOT=([0-9a-f-]+)$/m);
+  if (same) {
+    return `session ${same[1]} is already on box ${box} for ${root}, and one project folder holds one session (two would share the working tree). ` + `Bring it back first: --back --session ${same[1]}`;
+  }
+  const full = stdout.match(/^NOMO_FULL=(\d+)$/m);
+  if (full) {
+    return `box ${box} already runs ${full[1]} sessions (the cap is ${BOX_MAX_SESSIONS}). Bring one back (--back --session <id>) or stop one (--stop --session <id>) first; --status lists them.`;
+  }
+  return `session ${uuid} is already running on box ${box}. Check it with --status; rerun with --force to replace it (only that session is stopped).`;
+}
+async function stopOne(uuid, run, hibernate, force = false) {
+  const out = (await run(backStopScript(uuid), force ? { NOMO_FORCE: "1" } : {})).stdout ?? "";
+  if (/^NOMO_OTHER$/m.test(out))
+    return `The box has no session ${uuid} (already brought back?); nothing was stopped. --status lists the box's sessions.`;
+  const left = parseLeft(out);
+  const hard = /^NOMO_HARD_STOP$/m.test(out) ? " (hard stop: its last turn may be cut short)" : "";
+  if (left === 0) {
+    await hibernate();
+    return `Stopped session ${uuid}${hard}. No session left running, so the box is asleep.`;
+  }
+  return `Stopped session ${uuid}${hard}; its work stays on the box for --back. The box stays awake for ${left ?? "the other"} running session(s).`;
+}
 var loadCloud = () => {
   try {
-    return JSON.parse(readFileSync6(CLOUD_PATH, "utf8"));
+    return normalizeCloud(JSON.parse(readFileSync6(CLOUD_PATH, "utf8")));
   } catch {
     return {};
   }
@@ -5115,7 +5220,7 @@ async function ensureBox(key) {
     const hasBase = await api(key, "GET", `/templates/${BASE_TEMPLATE}/latest`).then(() => true, () => false);
     console.log(`Creating your cloud box (${hasBase ? `template ${BASE_TEMPLATE}` : "omg preset"})…`);
     sb = await api(key, "POST", "/sandboxes", createBody(hasBase, macId()));
-    saveCloud({ ...loadCloud(), sandboxId: sb.id });
+    saveCloud({ ...loadCloud(), sandboxId: sb.id, active: [] });
   }
   return wakeBox(key, sb);
 }
@@ -5142,18 +5247,35 @@ async function waitRunning(key, sb) {
   }
   return sb.id;
 }
-function attachHelp() {
+function attachHelp(several = false) {
+  const s = several ? " --session <id>" : "";
   return [
-    `  Watch:  bun plugin/dist/handoff.mjs --screen`,
-    `  Type:   bun plugin/dist/handoff.mjs --send "your message"     (keys: --send-key Escape | BTab | C-c | Enter)`
+    `  Watch:  bun plugin/dist/handoff.mjs --screen${s}`,
+    `  Type:   bun plugin/dist/handoff.mjs --send "your message"${s}     (keys: --send-key Escape | BTab | C-c | Enter)`
   ].join(`
 `);
+}
+function statusScript() {
+  return `${SHM_SWEEP}
+${BOX_LIB}
+nomo_migrate
+n=0; echo "Sessions on the box:"
+for f in "$SD"/*; do
+  [ -f "$f" ] || continue
+  u=\${f##*/}; nomo_t "$u"
+  if nomo_alive "$T"; then s=running; n=$((n+1)); else s=stopped; fi
+  printf '  %s  %-8s %s  (tmux %s)\\n' "$u" "$s" "$(head -1 "$f")" "$T"
+done
+echo "  $n of ${BOX_MAX_SESSIONS} running"
+echo; echo '--- Nomo on the box ---'
+${BOX_PLUGIN}
+[ -n "$R" ] && bun "$R/dist/status-cmd.mjs" claude || echo 'Nomo plugin: not installed on the box'`;
 }
 var IDLE_FN = `nomo_wait_idle() {
   prev=
   for _ in $(seq "$1"); do
-    tmux has-session -t nomo 2>/dev/null || return 1
-    cur=$(tmux capture-pane -p -t nomo | grep -v '^[[:space:]]*$' | tail -8)
+    tmux has-session -t "=$T" 2>/dev/null || return 1
+    cur=$(tmux capture-pane -p -t "=$T:" | grep -v '^[[:space:]]*$' | tail -8)
     if [ -n "$cur" ] && [ "$cur" = "$prev" ] && printf '%s\\n' "$cur" | grep -q '─' \\
       && printf '%s\\n' "$cur" | grep -Eq '^[│ ]*(>|❯)' \\
       && ! printf '%s\\n' "$cur" | grep -E '^[│ ]*(>|❯)' | tail -1 | grep -Eq '^[│ ]*(>|❯).{0,3}[0-9]+\\.'; then
@@ -5171,34 +5293,34 @@ nomo_type() {
     nomo_wait_idle 10 || { echo NOMO_BUSY; return 1; }
     want=$(printf '%s\\n' "$NOMO_TEXT" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' | grep -m1 . | LC_ALL=C cut -b1-40 \\
       | LC_ALL=C sed "s/[$(printf '\\300-\\377')][$(printf '\\200-\\277')]*\\$//")
-    printf '%s' "$NOMO_TEXT" | tmux load-buffer -b nomo-first - && tmux paste-buffer -p -r -d -b nomo-first -t nomo || { echo NOMO_UNCONFIRMED; return 1; }
+    printf '%s' "$NOMO_TEXT" | tmux load-buffer -b nomo-first - && tmux paste-buffer -p -r -d -b nomo-first -t "=$T:" || { echo NOMO_UNCONFIRMED; return 1; }
     sleep 0.5
   fi
-  tmux send-keys -t nomo Enter
+  tmux send-keys -t "=$T:" Enter
   for n in 1 2 3; do
     sleep 1
-    p=$(tmux capture-pane -p -t nomo)
+    p=$(tmux capture-pane -p -t "=$T:")
     k=$(printf '%s\\n' "$p" | grep -nE '^[│ ]*(>|❯)' | tail -1 | cut -d: -f1)
     l=$(printf '%s\\n' "$p" | sed -n "\${k:-0}p")
     if printf '%s\\n' "$l" | grep -Eq '^[│ ]*(>|❯).{0,3}[0-9]+\\.'; then echo NOMO_SENT; return 0; fi
     if { [ -z "$l" ] || printf '%s\\n' "$l" | grep -Eq '^[│ ]*(>|❯)( | )*$'; } \\
       && printf '%s\\n' "$p" | head -n "$(( \${k:-99999} - 1 ))" | grep -qF -- "$want"; then echo NOMO_SENT; return 0; fi
-    [ "$n" = 1 ] && tmux send-keys -t nomo Enter
+    [ "$n" = 1 ] && tmux send-keys -t "=$T:" Enter
   done
   echo NOMO_UNCONFIRMED
 }`;
-function paneScript(mode) {
-  const guard = `${SHM_SWEEP}
-tmux has-session -t nomo 2>/dev/null || { echo 'tmux nomo: not running'; exit 2; }`;
+function paneScript(mode, uuid) {
+  const guard = `${boxPrelude(uuid)}
+tmux has-session -t "=$T" 2>/dev/null || { echo "session ${uuid} is not running on the box (tmux $T)"; exit 2; }`;
   if (mode === "send")
     return `${guard}
 ${TYPE_FN}
 nomo_type`;
   if (mode === "key")
     return `${guard}
-tmux send-keys -t nomo -- "$NOMO_KEY"`;
+tmux send-keys -t "=$T:" -- "$NOMO_KEY"`;
   return `${guard}
-tmux capture-pane -p -t nomo | sed -e :a -e '/^\\n*$/{$d;N;ba' -e '}' | tail -40`;
+tmux capture-pane -p -t "=$T:" | sed -e :a -e '/^\\n*$/{$d;N;ba' -e '}' | tail -40`;
 }
 function sendResult(stdout) {
   if (/^NOMO_SENT$/m.test(stdout))
@@ -5209,17 +5331,17 @@ function sendResult(stdout) {
     return "Not confirmed: the message wasn't seen submitted. Check --screen before resending (if it's still in the input, --send-key Enter).";
   return "";
 }
-function firstMessageScript(tries = 45) {
-  return `${SHM_SWEEP}
+function firstMessageScript(uuid, tries = 45) {
+  return `${boxPrelude(uuid)}
 ${TYPE_FN}
 if nomo_wait_idle ${tries}; then nomo_type; exit 0; fi
 echo NOMO_NOT_READY`;
 }
 var FIRST_SKIPPED = "Session is in the cloud but the first message wasn't sent yet; the box may still type it, so check --screen first and only then --send it";
 var FIRST_UNCONFIRMED = "First message typed in the cloud session, but its submit wasn't confirmed; check --screen (if it's still in the input, --send-key Enter)";
-async function sendFirstMessage(run, text) {
+async function sendFirstMessage(run, text, uuid) {
   try {
-    const out = (await run(firstMessageScript(), { NOMO_TEXT: text })).stdout ?? "";
+    const out = (await run(firstMessageScript(uuid), { NOMO_TEXT: text })).stdout ?? "";
     if (/^NOMO_SENT$/m.test(out))
       return "First message sent to the cloud session.";
     if (/^NOMO_UNCONFIRMED$/m.test(out))
@@ -5336,14 +5458,19 @@ Retry with: bun plugin/dist/handoff.mjs --pair`);
 var BACK = "/tmp/nomo-back";
 var BACK_FILES = ["repo.bundle", "wip.patch", "untracked.tgz", "project.tgz", "folder.tgz"];
 var BACK_POLL_MS = 1e4;
-var BOX_CURRENT = "/root/.nomo-current";
-function currentGuard(uuid, file = BOX_CURRENT) {
-  return `if [ "$(head -c 64 ${q(file)} 2>/dev/null)" != ${q(uuid)} ] && [ "\${NOMO_FORCE:-}" != 1 ]; then echo "NOMO_OTHER=$(head -c 64 ${q(file)} 2>/dev/null | tr -cd '0-9a-f-')"; exit 0; fi`;
+var backPrefix = (uuid) => `${BACK}-${uuid.slice(0, 8)}`;
+function sessionGuard(uuid) {
+  return `if [ ! -f "$SD/"${q(uuid)} ] && [ "\${NOMO_FORCE:-}" != 1 ]; then echo NOMO_OTHER; exit 0; fi`;
+}
+var LEFT_LINE = `echo "NOMO_LEFT=$(( $(nomo_live | wc -l) ))"`;
+function parseLeft(stdout) {
+  const m = stdout.match(/^NOMO_LEFT=(\d+)$/m);
+  return m ? Number(m[1]) : undefined;
 }
 function backWaitScript(uuid, enc) {
-  return `${SHM_SWEEP}
-${currentGuard(uuid)}
-tmux has-session -t nomo 2>/dev/null || { echo NOMO_GONE; exit 0; }
+  return `${boxPrelude(uuid)}
+${sessionGuard(uuid)}
+tmux has-session -t "=$T" 2>/dev/null || { echo NOMO_GONE; exit 0; }
 F=${BOX_CC}/sessions/${uuid}.json
 [ -f "$F" ] && echo "NOMO_EVENT=$(grep -o '"lastEvent": *"[^"]*"' "$F" | head -1 | cut -d'"' -f4)"
 T=/root/.claude/projects/${enc}/${uuid}.jsonl
@@ -5353,27 +5480,29 @@ echo NOMO_TAIL
 tail -c 65536 "$T"`;
 }
 function backStopScript(uuid) {
-  return `${SHM_SWEEP}
-${currentGuard(uuid)}
-gone() { ! tmux has-session -t nomo 2>/dev/null; }
+  return `${boxPrelude(uuid)}
+${sessionGuard(uuid)}
+gone() { ! tmux has-session -t "=$T" 2>/dev/null; }
 if ! gone; then
-  if [ "\${NOMO_ESC:-}" = 1 ]; then tmux send-keys -t nomo Escape; sleep 2; fi
-  tmux send-keys -t nomo -l /exit; sleep 0.5; tmux send-keys -t nomo Enter
+  if [ "\${NOMO_ESC:-}" = 1 ]; then tmux send-keys -t "=$T:" Escape; sleep 2; fi
+  tmux send-keys -t "=$T:" -l /exit; sleep 0.5; tmux send-keys -t "=$T:" Enter
   for _ in $(seq 30); do gone && break; sleep 1; done
   if ! gone; then
-    tmux send-keys -t nomo C-c; sleep 1; tmux send-keys -t nomo C-c
+    tmux send-keys -t "=$T:" C-c; sleep 1; tmux send-keys -t "=$T:" C-c
     for _ in $(seq 10); do gone && break; sleep 1; done
   fi
-  if ! gone; then tmux kill-session -t nomo; echo NOMO_HARD_STOP; fi
+  if ! gone; then tmux kill-session -t "=$T"; echo NOMO_HARD_STOP; fi
 fi
 ${BOX_PLUGIN}
 if [ -n "$R" ]; then bun "$R/dist/reset.mjs" >/dev/null 2>&1 || true; fi
-echo NOMO_STOPPED`;
+echo NOMO_STOPPED
+${LEFT_LINE}`;
 }
 function backPackScript(uuid, enc, root, isGit) {
   const ex = EXCLUDE_SENSITIVE.map((a) => a === "--exclude" ? a : q(a)).join(" ");
-  return `${SHM_SWEEP}
-${currentGuard(uuid)}
+  const BACK = backPrefix(uuid);
+  return `${boxPrelude(uuid)}
+${sessionGuard(uuid)}
 set -euo pipefail
 rm -f ${BACK}-*
 P=/root/.claude/projects/${enc}
@@ -5409,14 +5538,8 @@ var sameWindowBackLine = (id) => `Back. Type /resume ${id} to continue here.`;
 async function back(omg, args) {
   const startedAt = Date.now();
   const cloud = loadCloud();
-  const flag = args.get("--session");
   const here = args.get("--from-session") || process.env.CLAUDE_CODE_SESSION_ID;
-  const hereLanding = typeof here === "string" && readPark(here)?.state === "landing" ? here : undefined;
-  const uuid = typeof flag === "string" ? flag : cloud.current ?? hereLanding;
-  if (!uuid)
-    throw new Error("no handed-off session on record; pass --session <uuid>");
-  if (!UUID_RE3.test(uuid))
-    throw new Error(`session id must be a UUID, got ${JSON.stringify(uuid)}`);
+  const uuid = pickSession(args.get("--session"), hereSession(here, cloud), cloud);
   const parkedAtStart = readPark(uuid);
   const sameWindow = here === uuid;
   if (sameWindow && parkedAtStart?.state === "landing") {
@@ -5460,10 +5583,9 @@ ${sameWindowBackLine(parkedAtStart.resume ?? uuid)}`);
   const id = await wakeBox(omg, sb);
   let gone = false;
   const other = (out) => {
-    const o = out.match(/^NOMO_OTHER=([0-9a-f-]*)/m);
-    if (o) {
-      throw new Error(`the box's Claude Code is running session ${o[1] || "(not recorded: handed off before 2.3.12)"}, not ${uuid}; nothing was stopped.
-` + `Bring that one back with --back --session <its id>, or rerun with --force to stop it anyway.`);
+    if (/^NOMO_OTHER$/m.test(out)) {
+      throw new Error(`the box holds no session ${uuid} (already brought back, or handed off before 2.3.12 and since replaced); nothing was stopped.
+` + `--status lists the box's sessions; rerun with --force to stop and pack whatever is at its folder anyway.`);
     }
   };
   if (!force) {
@@ -5529,15 +5651,23 @@ Interrupted (${sig}) while ${phase}.
   for (const name of BACK_FILES) {
     if (!(name in sizes))
       continue;
-    const r = await api(omg, "GET", `/sandboxes/${id}/files?path=${encodeURIComponent(`${BACK}-${name}`)}`, undefined, Math.ceil(capOf(name) * 4 / 3) + 65536);
+    const r = await api(omg, "GET", `/sandboxes/${id}/files?path=${encodeURIComponent(`${backPrefix(uuid)}-${name}`)}`, undefined, Math.ceil(capOf(name) * 4 / 3) + 65536);
     const bytes = Buffer.from(r?.content ?? "", "base64");
     if (bytes.length !== sizes[name])
       throw new Error(`pulled ${name}: ${bytes.length} B, the box reported ${sizes[name]} B`);
     writeFileSync4(join6(backup, name), bytes, { mode: 384 });
   }
   console.log(`Pulled the box's work into ${backup}`);
-  await exec(omg, id, `rm -f ${BACK}-*`).catch(() => {});
-  await sleepBox(omg, { id, status: "running" });
+  const done = await exec(omg, id, `${boxPrelude(uuid)}
+rm -f ${backPrefix(uuid)}-* "$SD/"${q(uuid)}
+${LEFT_LINE}`).catch(() => {
+    return;
+  });
+  const left = parseLeft(done?.stdout ?? "");
+  if (left === 0)
+    await sleepBox(omg, { id, status: "running" });
+  else
+    console.log(left ? `The box stays awake for ${left} other running session(s).` : "The box sleeps once no session runs on it.");
   phase = "landing the box's work on this Mac";
   const problems = [];
   const budget = { left: caps.extracted };
@@ -5671,7 +5801,7 @@ The conversation itself is back: cd ${q(cwd)} && claude --resume ${resumeId}`);
   process.off("SIGINT", onSignal).off("SIGTERM", onSignal);
   const c = loadCloud();
   const { [uuid]: _done, ...sessions } = c.sessions ?? {};
-  saveCloud({ ...c, sessions, current: c.current === uuid ? undefined : c.current });
+  saveCloud({ ...c, sessions, active: (c.active ?? []).filter((s) => s !== uuid) });
   let parked = readPark(uuid);
   if (sameWindow && stagedThisRun && parked?.state !== "landing" && parked?.state !== "back" && existsSync5(stagedThisRun)) {
     stageLanding(uuid, { staged: stagedThisRun, target: join6(projDir, `${uuid}.jsonl`), resume: uuid }, startedAt);
@@ -5944,13 +6074,24 @@ async function main() {
     return;
   }
   if (["--status", "--stop", "--pair", "--screen", "--send", "--send-key"].some((f) => args.has(f))) {
-    const sb = await getBox(omg, loadCloud().sandboxId);
+    const cloud = loadCloud();
+    const sb = await getBox(omg, cloud.sandboxId);
     if (!sb) {
       console.log("No cloud box. Run `handoff` to create one.");
       return;
     }
+    const here = hereSession(args.get("--from-session") || process.env.CLAUDE_CODE_SESSION_ID, cloud);
     if (args.has("--stop")) {
-      await sleepBox(omg, sb);
+      if (args.has("--all") || !args.has("--session") && !here && (cloud.active ?? []).length <= 1) {
+        await sleepBox(omg, sb);
+        return;
+      }
+      const uuid = pickSession(args.get("--session"), here, cloud);
+      if (sb.status !== "running") {
+        console.log(`Box ${sb.id} is ${sb.status}: session ${uuid} is not running.`);
+        return;
+      }
+      console.log(await stopOne(uuid, (script, env) => exec(omg, sb.id, script, env), () => sleepBox(omg, sb), args.has("--force")));
       return;
     }
     if (sb.status !== "running") {
@@ -5962,7 +6103,8 @@ async function main() {
       if (args.has("--send-key") && !/^[A-Za-z0-9-]+$/.test(key))
         throw new Error("--send-key takes one tmux key name, e.g. Escape, BTab, C-c, Enter");
       const mode = args.has("--send") ? "send" : args.has("--send-key") ? "key" : "screen";
-      const r = await exec(omg, sb.id, paneScript(mode), { NOMO_TEXT: String(args.get("--send") ?? ""), NOMO_KEY: key });
+      const uuid = pickSession(args.get("--session"), here, cloud);
+      const r = await exec(omg, sb.id, paneScript(mode, uuid), { NOMO_TEXT: String(args.get("--send") ?? ""), NOMO_KEY: key });
       process.stdout.write((r.stdout ?? "").replace(/^NOMO_(SENT|UNCONFIRMED|BUSY)\n?/m, ""));
       if (mode === "key" && r.exitCode === 0)
         console.log("Sent. Check with --screen.");
@@ -5986,13 +6128,11 @@ nomo_pair`, { NOMO_WORKER_URL: worker });
     }
     console.log(`Target worker: ${worker}`);
     console.log(`Box ${sb.id}: ${sb.status}${sb.keepAwakeUntil ? `, keep-awake until ${sb.keepAwakeUntil}` : ""}`);
-    const r = await exec(omg, sb.id, `${SHM_SWEEP}
-tmux has-session -t nomo 2>/dev/null && { echo 'tmux nomo: alive'; tmux capture-pane -p -t nomo | sed -e :a -e '/^\\n*$/{$d;N;ba' -e '}' | tail -20; } || echo 'tmux nomo: not running'
-echo; echo '--- Nomo on the box ---'
-${BOX_PLUGIN}
-[ -n "$R" ] && bun "$R/dist/status-cmd.mjs" claude || echo 'Nomo plugin: not installed on the box'`);
+    console.log((cloud.active ?? []).length ? `Handed off from this Mac (not brought back yet):
+${listActive(cloud)}` : "Handed off from this Mac: none on record.");
+    const r = await exec(omg, sb.id, statusScript());
     process.stdout.write(r.stdout ?? "");
-    console.log(attachHelp());
+    console.log(attachHelp((cloud.active ?? []).length > 1));
     return;
   }
   if (!keys.openrouter)
@@ -6028,7 +6168,7 @@ ${BOX_PLUGIN}
     throw new Error(`the OpenRouter relay did not start on box ${id}:
 ${pane.slice(-1000)}`);
   if (r.exitCode === 3)
-    throw new Error(`box ${id} is still running an earlier handoff. Check it with --status; rerun with --force to replace it.`);
+    throw new Error(busyMessage(r.stdout ?? "", id, plan.uuid, plan.root));
   if (r.exitCode !== 0 || /No conversation found|API Error|Invalid API key|command not found/i.test(pane)) {
     throw new Error(`box start failed (exit ${r.exitCode}):
 ${pane.slice(-2000)}
@@ -6036,16 +6176,17 @@ ${(r.stderr ?? "").slice(-2000)}`);
   }
   await api(omg, "POST", `/sandboxes/${id}/extend`, { seconds: KEEPALIVE_S }).catch(() => {});
   const c = loadCloud();
-  saveCloud({ ...c, current: plan.uuid, sessions: { ...c.sessions, [plan.uuid]: plan.snap } });
+  const active = [...(c.active ?? []).filter((s) => s !== plan.uuid), plan.uuid];
+  saveCloud({ ...c, active, sessions: { ...c.sessions, [plan.uuid]: plan.snap } });
   console.log(pane.trimEnd().split(`
 `).slice(-15).join(`
 `));
   console.log(`
-Session ${plan.uuid} is running on cloud box ${id} (tmux session "nomo").`);
+Session ${plan.uuid} is running on cloud box ${id} (tmux session "${tmuxName(plan.uuid)}"${active.length > 1 ? `; ${active.length} sessions on record` : ""}).`);
   if (then.trim())
-    console.log(await sendFirstMessage((script, env) => exec(omg, id, script, env), then));
-  console.log(attachHelp());
-  console.log(`  Status: --status   Sleep the box: --stop   Bring it back to this Mac: --back`);
+    console.log(await sendFirstMessage((script, env) => exec(omg, id, script, env), then, plan.uuid));
+  console.log(attachHelp(active.length > 1));
+  console.log(`  Status: --status   Stop it: --stop${active.length > 1 ? " --session <id> (or --all)" : ""}   Bring it back to this Mac: --back${active.length > 1 ? " --session <id>" : ""}`);
   if (!process.env.NOMO_HANDOFF_HELPER)
     console.log(`
 !! Quit your local Claude Code session for ${plan.uuid} now, so the two copies don't diverge.`);
@@ -6058,31 +6199,45 @@ if (__require.main == __require.module) {
   });
 }
 export {
+  ANY_SESSION,
   BACK_FILES,
+  BOX_LIB,
   BOX_MACHINE_NAME,
+  BOX_MAX_SESSIONS,
   FIRST_SKIPPED,
   FIRST_UNCONFIRMED,
+  LEFT_LINE,
   PAIR_FN,
   PAIR_POLL,
   RELAY_PORT,
   SENSITIVE2 as SENSITIVE,
   SHM_SWEEP,
   TYPE_FN,
+  admitScript,
   backPackScript,
+  backPrefix,
   backStopScript,
   backWaitScript,
   bakeScript,
   boxPairPayload,
+  boxPrelude,
   boxSetup,
+  busyMessage,
   checkLaunchIds,
   createBody,
-  currentGuard,
   firstMessageScript,
+  hereSession,
+  keepaliveLoop,
   lastModel,
   latestSession,
+  launchLine,
+  listActive,
+  normalizeCloud,
   packList,
   packRefusal,
   paneScript,
+  parseLeft,
+  pickSession,
   projectDirName,
   pubRawFromPkcs8,
   q,
@@ -6092,9 +6247,15 @@ export {
   sameWindowBackLine,
   sendFirstMessage,
   sendResult,
+  sessionGuard,
+  shmEnvFile,
+  statusScript,
+  stopOne,
   takePairUrl,
   targetWorker,
+  tmuxName,
   toOpenRouterModel,
   userLayerFiles,
-  withReload
+  withReload,
+  writeMarker
 };

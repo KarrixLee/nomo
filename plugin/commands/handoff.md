@@ -54,4 +54,8 @@ window stays open but parked (new prompts are blocked; `/nomo-cc:back` here brin
 your turn without running anything else. If the output says the box needs pairing, relay the terminal
 command it printed and stop; nothing was started.
 
+The box runs up to 4 handed-off sessions at once, one per project folder (two from the same folder
+would share its files). A handoff over that limit, or from a folder another cloud session still holds,
+fails with a message naming what to bring back first; `/nomo-cc:handoff status` shows it, relay it verbatim.
+
 The output may include a `Cloud check:` line naming what the box won't have (secrets never sent, deps to reinstall, MCP servers, Mac-only tools); relay it verbatim, it never blocks the move (`handoff.mjs --check` prints only that block, moving nothing).

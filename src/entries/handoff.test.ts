@@ -12,9 +12,13 @@ import {
 import { RELAY_PORT as RELAY_LISTEN_PORT } from "./or-relay";
 import { readCapped, sameWindowBackLine } from "./handoff";
 import { FIRST_SKIPPED, FIRST_UNCONFIRMED, firstMessageScript, sendFirstMessage, sendResult, TYPE_FN } from "./handoff";
-import { BACK_FILES, backPackScript, backStopScript, backWaitScript, currentGuard, resumeCommand } from "./handoff";
+import { BACK_FILES, backPackScript, backStopScript, backWaitScript, sessionGuard, resumeCommand } from "./handoff";
 import { boxIdle } from "../core/cloud-back";
 import { packList } from "./handoff";
+import {
+  admitScript, ANY_SESSION, BOX_MAX_SESSIONS, backPrefix, boxPrelude, busyMessage, hereSession, keepaliveLoop, launchLine, normalizeCloud,
+  pickSession, shmEnvFile, statusScript, stopOne, tmuxName, writeMarker,
+} from "./handoff";
 
 describe("handoff pure logic", () => {
   test("cwd → Claude Code project dir name (every non-alphanumeric → -)", () => {
@@ -100,10 +104,12 @@ describe("handoff pure logic", () => {
   });
 
   test("user text reaches tmux only through env, never the script", () => {
-    expect(paneScript("send")).toContain(TYPE_FN);
-    expect(paneScript("send")).not.toContain("send-keys -t nomo -l");
-    expect(paneScript("key")).toContain(`send-keys -t nomo -- "$NOMO_KEY"`);
-    expect(paneScript("screen")).toContain("capture-pane -p -t nomo");
+    const U = "0b5c3d1e-2f4a-4b6c-8d9e-0f1a2b3c4d5e";
+    expect(paneScript("send", U)).toContain(TYPE_FN);
+    expect(paneScript("send", U)).not.toContain("send-keys -t \"=$T:\" -l");
+    expect(paneScript("key", U)).toContain(`send-keys -t "=$T:" -- "$NOMO_KEY"`);
+    expect(paneScript("screen", U)).toContain(`capture-pane -p -t "=$T:"`);
+    expect(paneScript("screen", U)).toContain(`nomo_t '${U}'`);
   });
 
   test("the pending pair page reloads itself; the result page carries no QR", () => {
@@ -175,7 +181,9 @@ describe("handoff pure logic", () => {
   });
 
   test("every non-handoff box script first drops a stale /dev/shm/nomo-env", () => {
-    for (const s of [paneScript("send"), paneScript("key"), paneScript("screen"), PAIR_POLL]) expect(s.startsWith(SHM_SWEEP)).toBe(true);
+    const U = "0b5c3d1e-2f4a-4b6c-8d9e-0f1a2b3c4d5e";
+    for (const s of [paneScript("send", U), paneScript("key", U), paneScript("screen", U), PAIR_POLL]) expect(s.startsWith(SHM_SWEEP)).toBe(true);
+    expect(SHM_SWEEP).toContain("-name 'nomo-env*'"); // the per-session files too
     expect(SHM_SWEEP).toContain("-mmin +1"); // never one a handoff in flight just wrote
   });
 
@@ -225,22 +233,12 @@ describe("bring back (--back)", () => {
   });
 
   test("--back --session X never stops a different session (unless --force)", () => {
-    // Checked first, whether or not tmux still runs: an exited A must not pack a later B at the same root.
+    // Checked first, whether or not tmux still runs: a brought-back A must not pack a later B at the same root.
     for (const s of [backStopScript(U), backWaitScript(U, "-tmp-proj"), ...scripts]) {
-      expect(s.slice(SHM_SWEEP.length).trimStart().startsWith(currentGuard(U))).toBe(true);
+      expect(s.startsWith(boxPrelude(U))).toBe(true);
+      expect(s.slice(boxPrelude(U).length).trimStart().startsWith(sessionGuard(U))).toBe(true);
     }
-    expect(backStopScript(U)).not.toContain("rm -f /root/.nomo-current");
-    const f = join(mkdtempSync(join(tmpdir(), "nomo-cur-")), "cur");
-    const run = (env: Record<string, string> = {}) =>
-      execFileSync("bash", ["-c", `${currentGuard(U, f)}\necho NOMO_SAME`], { env: { PATH: process.env.PATH!, ...env } }).toString().trim();
-    expect(run()).toBe("NOMO_OTHER="); // nothing recorded (a pre-2.3.12 box)
-    writeFileSync(f, "99999999-2222-3333-4444-555555555555");
-    expect(run()).toBe("NOMO_OTHER=99999999-2222-3333-4444-555555555555");
-    expect(run({ NOMO_FORCE: "1" })).toBe("NOMO_SAME");
-    writeFileSync(f, U);
-    expect(run()).toBe("NOMO_SAME");
-    writeFileSync(f, "\x1b[2Jevil;rm -rf /");
-    expect(run()).toBe("NOMO_OTHER=2e-f");
+    expect(backStopScript(U)).not.toContain(`rm -f "$SD/"`); // the marker stays: the pack checks it too
   });
 
   test("boxIdle: Nomo's record wins; needsAttention asks the user; sessionStart asks the transcript", () => {
@@ -338,7 +336,7 @@ esac
 `);
     writeFileSync(join(bin, "sleep"), "#!/bin/sh\nexit 0\n");
     chmodSync(join(bin, "tmux"), 0o755); chmodSync(join(bin, "sleep"), 0o755);
-    const out = execFileSync("bash", ["-c", firstMessageScript(tries)], { cwd: d, env: { PATH: `${bin}:/usr/bin:/bin`, NOMO_TEXT: text, LC_ALL: locale } }).toString();
+    const out = execFileSync("bash", ["-c", firstMessageScript("0b5c3d1e-2f4a-4b6c-8d9e-0f1a2b3c4d5e", tries)], { cwd: d, env: { PATH: `${bin}:/usr/bin:/bin`, NOMO_TEXT: text, LC_ALL: locale } }).toString();
     const read = (f: string) => (existsSync(join(d, f)) ? readFileSync(join(d, f), "utf8") : undefined);
     return { out, typed: read("typed"), keys: read("keys") ?? "", };
   }
@@ -348,7 +346,7 @@ esac
     expect(r.out.trim()).toBe("NOMO_SENT");
     expect(r.typed).toBe(NASTY);
     expect(r.keys).toBe("paste\nEnter\n");
-    expect(firstMessageScript()).not.toContain("it's");
+    expect(firstMessageScript("0b5c3d1e-2f4a-4b6c-8d9e-0f1a2b3c4d5e")).not.toContain("it's");
   });
 
   for (const locale of ["C", "C.UTF-8"]) {
@@ -416,13 +414,14 @@ esac
   });
 
   test("not ready / box error → a skip line, never a throw (the handoff already succeeded)", async () => {
+    const U1 = "0b5c3d1e-2f4a-4b6c-8d9e-0f1a2b3c4d5e";
     let env: Record<string, string> = {};
-    expect(await sendFirstMessage(async (_s, e) => { env = e; return { stdout: "NOMO_SENT\n" }; }, NASTY)).toContain("sent");
+    expect(await sendFirstMessage(async (_s, e) => { env = e; return { stdout: "NOMO_SENT\n" }; }, NASTY, U1)).toContain("sent");
     expect(env).toEqual({ NOMO_TEXT: NASTY });
-    expect(await sendFirstMessage(async () => ({ stdout: "NOMO_NOT_READY\n" }), "x")).toBe(FIRST_SKIPPED);
+    expect(await sendFirstMessage(async () => ({ stdout: "NOMO_NOT_READY\n" }), "x", U1)).toBe(FIRST_SKIPPED);
     expect(FIRST_SKIPPED).toContain("--screen");
-    expect(await sendFirstMessage(async () => ({ stdout: "NOMO_UNCONFIRMED\n" }), "x")).toBe(FIRST_UNCONFIRMED);
-    expect(await sendFirstMessage(async () => { throw new Error("502"); }, "x")).toBe(FIRST_SKIPPED);
+    expect(await sendFirstMessage(async () => ({ stdout: "NOMO_UNCONFIRMED\n" }), "x", U1)).toBe(FIRST_UNCONFIRMED);
+    expect(await sendFirstMessage(async () => { throw new Error("502"); }, "x", U1)).toBe(FIRST_SKIPPED);
   });
 
   test("the command passes its argument only as a quoted-heredoc body: never argv, never expanded", () => {
@@ -471,5 +470,179 @@ describe("packList (secrets never leave the Mac in the user-file tars)", () => {
     symlinkSync(d, join(d, "a", "loop"));
     const skip = (n: string) => n === "node_modules" || n === ".git";
     expect(tarOf(d, packList(d, ["a", "empty", "main.py", ".env"], skip))).toEqual(["a", "a/b", "a/b/c.txt", "a/loop", "empty", "main.py"]);
+  });
+});
+
+describe("several sessions on one box (NOM-92)", () => {
+  const A = "aaaaaaaa-1111-4222-8333-444455556666", B = "bbbbbbbb-1111-4222-8333-444455556666";
+  const C = "cccccccc-1111-4222-8333-444455556666", D = "dddddddd-1111-4222-8333-444455556666";
+  const E = "eeeeeeee-1111-4222-8333-444455556666", L = "11111111-1111-4222-8333-444455556666";
+
+  /** A fake box: /root/ mapped into a temp dir, a stateful fake tmux (sessions file; every call logged;
+   *  an Enter makes the target's claude exit), sleep stubbed. */
+  function fakeBox(sessions: string[] = []) {
+    const d = mkdtempSync(join(tmpdir(), "nomo-box-")), bin = join(d, "bin");
+    mkdirSync(bin);
+    writeFileSync(join(d, "sessions"), sessions.map((x) => x + "\n").join(""));
+    writeFileSync(join(bin, "tmux"), `#!/bin/bash
+S=${d}/sessions
+echo "$*" >> ${d}/calls
+t=; n=; prev=; for a in "$@"; do [ "$prev" = -t ] && t=$a; [ "$prev" = -s ] && n=$a; prev=$a; done
+t=\${t#=}; t=\${t%:}
+case "$1" in
+  has-session) grep -qxF -- "$t" $S ;;
+  kill-session) grep -vxF -- "$t" $S > $S.n; mv $S.n $S ;;
+  ls) [ -s $S ] && cat $S || exit 1 ;;
+  new-session) echo "$n" >> $S ;;
+  send-keys) [ "\${@: -1}" = Enter ] && { grep -vxF -- "$t" $S > $S.n; mv $S.n $S; } ; true ;;
+  capture-pane) echo "screen of $t" ;;
+  kill-server) : > $S ;;
+esac
+`);
+    writeFileSync(join(bin, "sleep"), "#!/bin/sh\nexit 0\n");
+    chmodSync(join(bin, "tmux"), 0o755); chmodSync(join(bin, "sleep"), 0o755);
+    const run = (script: string, env: Record<string, string> = {}) => {
+      try {
+        return { stdout: execFileSync("bash", ["-c", script.replaceAll("/root/", `${d}/root/`)], { env: { PATH: `${bin}:/usr/bin:/bin`, ...env } }).toString(), code: 0 };
+      } catch (e) { const x = e as { stdout: Buffer; status: number }; return { stdout: x.stdout.toString(), code: x.status }; }
+    };
+    /** The handoff script's admission + marker + launch (the rest of it needs a real box). */
+    const handOff = (u: string, root: string, env: Record<string, string> = {}) =>
+      run(`${boxPrelude(u)}\nset -euo pipefail\n${admitScript(u, root)}\nT=${tmuxName(u)}\n${writeMarker(u, root)}\ntmux new-session -d -s "$T" -x 200 -y 50 bash`, env);
+    const tmux = () => readFileSync(join(d, "sessions"), "utf8").split("\n").filter(Boolean);
+    const calls = () => (existsSync(join(d, "calls")) ? readFileSync(join(d, "calls"), "utf8") : "");
+    return { d, run, handOff, tmux, calls };
+  }
+
+  test("two handoffs from different projects coexist, each in its own tmux and marker", () => {
+    const b = fakeBox(["nomo-relay", "nomo-keepalive"]);
+    expect(b.handOff(A, "/p/one").code).toBe(0);
+    expect(b.handOff(B, "/p/two").code).toBe(0);
+    expect(b.tmux()).toEqual(["nomo-relay", "nomo-keepalive", "nomo-aaaaaaaa", "nomo-bbbbbbbb"]);
+    expect(readFileSync(join(b.d, "root/.nomo-sessions", A), "utf8")).toBe("/p/one\nnomo-aaaaaaaa\n");
+    expect(b.run(statusScript()).stdout).toMatch(new RegExp(`${A}  running +/p/one[\\s\\S]*${B}  running +/p/two[\\s\\S]*2 of 4 running`));
+  });
+
+  test("the same project twice is refused, even with --force (they would share the working tree)", () => {
+    const b = fakeBox();
+    b.handOff(A, "/p/one");
+    for (const env of [{}, { NOMO_FORCE: "1" }] as Record<string, string>[]) {
+      const r = b.handOff(B, "/p/one", env);
+      expect(r.code).toBe(3);
+      expect(r.stdout).toContain(`NOMO_SAME_ROOT=${A}`);
+      expect(busyMessage(r.stdout, "box1", B, "/p/one")).toContain(`--back --session ${A}`);
+    }
+    // a STOPPED session still holds its root (its work waits for --back); brought back, the root is free
+    b.run(backStopScript(A));
+    expect(b.handOff(B, "/p/one").code).toBe(3);
+    b.run(`${boxPrelude(A)}\nrm -f "$SD/"'${A}'`); // what --back does once the work is home
+    expect(b.handOff(B, "/p/one").code).toBe(0);
+  });
+
+  test(`a ${BOX_MAX_SESSIONS + 1}th running session is refused with the cap message`, () => {
+    const b = fakeBox();
+    for (const [u, r] of [[A, "/a"], [B, "/b"], [C, "/c"], [D, "/d"]]) expect(b.handOff(u, r).code).toBe(0);
+    const r = b.handOff(E, "/e");
+    expect(r.code).toBe(3);
+    expect(r.stdout).toContain("NOMO_FULL=4");
+    expect(busyMessage(r.stdout, "box1", E, "/e")).toContain("the cap is 4");
+    // a stopped one frees a slot
+    b.run(backStopScript(D));
+    expect(b.handOff(E, "/e").code).toBe(0);
+  });
+
+  test("--force replaces only its own session's tmux, never the server", () => {
+    const b = fakeBox(["nomo-relay"]);
+    b.handOff(A, "/a"); b.handOff(B, "/b");
+    const busy = b.handOff(A, "/a");
+    expect(busy.code).toBe(3);
+    expect(busy.stdout).toContain("NOMO_BUSY");
+    expect(busyMessage(busy.stdout, "box1", A, "/a")).toContain("--force");
+    expect(b.handOff(A, "/a", { NOMO_FORCE: "1" }).code).toBe(0);
+    expect(b.calls()).toContain("kill-session -t =nomo-aaaaaaaa");
+    expect(b.calls()).not.toContain("kill-server");
+    expect(b.calls()).not.toContain("kill-session -t =nomo-bbbbbbbb");
+    expect(b.tmux().sort()).toEqual(["nomo-aaaaaaaa", "nomo-bbbbbbbb", "nomo-relay"]);
+  });
+
+  test("stopping one leaves the other running and the box awake; stopping the last hibernates", async () => {
+    const b = fakeBox(["nomo-relay", "nomo-keepalive"]);
+    b.handOff(A, "/a"); b.handOff(B, "/b");
+    let slept = 0;
+    const run = async (s: string, env: Record<string, string>) => b.run(s, env);
+    const hibernate = async () => { slept++; };
+    expect(await stopOne(A, run, hibernate)).toMatch(/Stopped session .*stays awake for 1 running/);
+    expect(slept).toBe(0);
+    expect(b.tmux()).toEqual(["nomo-relay", "nomo-keepalive", "nomo-bbbbbbbb"]);
+    expect(existsSync(join(b.d, "root/.nomo-sessions", A))).toBe(true); // its work waits for --back
+    expect(await stopOne(B, run, hibernate)).toMatch(/No session left running, so the box is asleep/);
+    expect(slept).toBe(1);
+    expect(await stopOne(E, run, hibernate)).toMatch(/no session/); // never handed off here
+    expect(slept).toBe(1);
+  });
+
+  test("the keep-awake loop runs while ANY session's tmux does (never for relay/keepalive/pair alone)", () => {
+    const has = (s: string[]) => fakeBox(s).run(`${ANY_SESSION} && echo yes || echo no`).stdout.trim();
+    expect(has([])).toBe("no");
+    expect(has(["nomo-relay", "nomo-keepalive", "nomo-pair"])).toBe("no");
+    expect(has(["nomo-relay", "nomo-bbbbbbbb"])).toBe("yes");
+    expect(has(["nomo"])).toBe("yes"); // a pre-2.3.29 session
+    expect(keepaliveLoop()).toContain(`while ${ANY_SESSION}; do`);
+  });
+
+  test("keys go through a per-session /dev/shm file (two handoffs never race on one)", () => {
+    expect(shmEnvFile(A)).toBe("/dev/shm/nomo-env-aaaaaaaa");
+    expect(launchLine(A, "m")).toContain(`. /dev/shm/nomo-env-aaaaaaaa; rm -f /dev/shm/nomo-env-aaaaaaaa;`);
+    expect(launchLine(B, "m")).toContain("/dev/shm/nomo-env-bbbbbbbb");
+    expect(backPrefix(A)).not.toBe(backPrefix(B));
+    expect(backPackScript(A, "-a", "/a", true)).toContain(`rm -f ${backPrefix(A)}-*`);
+  });
+
+  test("a pre-2.3.29 box (tmux `nomo`, /root/.nomo-current) is migrated: --screen, --back and the root check find it", () => {
+    const b = fakeBox(["nomo-relay", "nomo"]);
+    mkdirSync(join(b.d, "root/.claude/projects/-p-legacy"), { recursive: true });
+    writeFileSync(join(b.d, "root/.nomo-current"), L);
+    writeFileSync(join(b.d, "root/.claude/projects/-p-legacy", `${L}.jsonl`), JSON.stringify({ type: "user", cwd: "/p/legacy" }) + "\n");
+    const screen = b.run(paneScript("screen", L));
+    expect(screen.code).toBe(0);
+    expect(screen.stdout).toContain("screen of nomo");
+    expect(b.calls()).toContain("capture-pane -p -t =nomo:");
+    expect(existsSync(join(b.d, "root/.nomo-current"))).toBe(false);
+    expect(readFileSync(join(b.d, "root/.nomo-sessions", L), "utf8")).toBe("/p/legacy\nnomo\n");
+    const wait = b.run(backWaitScript(L, "-p-legacy")).stdout;
+    expect(wait).not.toMatch(/NOMO_OTHER|NOMO_GONE/);
+    expect(b.handOff(A, "/p/legacy").stdout).toContain(`NOMO_SAME_ROOT=${L}`);
+    expect(b.handOff(A, "/p/other").code).toBe(0);
+    // and --back's stop reaches the legacy tmux, leaving the new one running
+    expect(b.run(backStopScript(L)).stdout).toContain("NOMO_LEFT=1");
+    expect(b.tmux()).toEqual(["nomo-relay", "nomo-aaaaaaaa"]);
+  });
+
+  test("cloud.json: a legacy `current` migrates to `active`; garbage ids are dropped", () => {
+    const snap = { [A]: { root: "/a" } } as never;
+    expect(normalizeCloud({ sandboxId: "s", current: A, sessions: snap } as never)).toEqual({ sandboxId: "s", active: [A], sessions: snap });
+    expect(normalizeCloud({ current: A, active: [B, "x; rm"] } as never)).toEqual({ active: [B] });
+    expect(normalizeCloud({})).toEqual({ active: [] });
+  });
+
+  test("which session: --session, else the parked window's own, else the only active one, else a list", () => {
+    const c = { active: [A, B], sessions: { [A]: { root: "/p/one" }, [B]: { root: "/p/two" } } } as never;
+    expect(pickSession(C, undefined, c)).toBe(C);
+    expect(() => pickSession("nope", undefined, c)).toThrow(/UUID/);
+    expect(pickSession(true, B, c)).toBe(B);
+    expect(pickSession(undefined, undefined, { active: [A] })).toBe(A);
+    expect(() => pickSession(undefined, undefined, { active: [] })).toThrow(/no handed-off session/);
+    expect(() => pickSession(undefined, undefined, c)).toThrow(new RegExp(`2 sessions .*--session[\\s\\S]*${A}  /p/one[\\s\\S]*${B}  /p/two`));
+    const park = (id: string) => (id === C ? { state: "cloud" } : undefined);
+    expect(hereSession(B, c, park)).toBe(B);          // active
+    expect(hereSession(C, c, park)).toBe(C);          // a parked window (cloud.json no longer names it)
+    expect(hereSession(D, c, park)).toBeUndefined();  // some other Claude Code session
+    expect(hereSession(undefined, c, park)).toBeUndefined();
+  });
+
+  test("every new box script is valid bash", () => {
+    for (const s of [statusScript(), `${boxPrelude(A)}\n${admitScript(A, "/it's")}`, paneScript("send", A), paneScript("key", A)]) {
+      execFileSync("bash", ["-n", "-c", s]);
+    }
   });
 });

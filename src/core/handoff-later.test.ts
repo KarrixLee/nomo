@@ -143,6 +143,9 @@ describe("waitThenHandoff", () => {
     expect(handoffLanded({ sessions: { [A]: 1 } }, { current: A, sessions: { [A]: 2 } }, A)).toBe(true);
     expect(handoffLanded({ sessions: { [A]: 1 } }, { current: A, sessions: { [A]: 1 } }, A)).toBe(false);
     expect(handoffLanded({}, { current: B, sessions: { [A]: 1 } }, A)).toBe(false);
+    // 2.3.29: several sessions in `active`, A among them
+    expect(handoffLanded({ sessions: { [A]: 1 } }, { active: [B, A], sessions: { [A]: 2 } }, A)).toBe(true);
+    expect(handoffLanded({}, { active: [B], sessions: { [A]: 1 } }, A)).toBe(false);
   });
 
   test("a plugin removed during the wait: shim fallback, else a clear FAILED", async () => {
