@@ -3,7 +3,7 @@ import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { clearPark, MOVING_STALE_MS, parkHook, readPark, writePark } from "./park";
+import { clearPark, MOVING_STALE_MS, parkHook, readPark, stageLanding, writePark } from "./park";
 
 const A = "0a1b2c3d-1111-4222-8333-444455556666";
 const dirs: string[] = [];
@@ -135,5 +135,56 @@ describe("interrupted back and the other window", () => {
     writePark(A, { state: "elsewhere", pid: process.ppid }, dir);
     parkHook({ session_id: A, hook_event_name: "SessionEnd" }, dir);
     expect(readPark(A, dir)).toBeUndefined();
+  });
+});
+
+describe("background --back finishing in the parked window", () => {
+  const setup = () => {
+    const dir = tmp(), target = join(dir, "t.jsonl"), staged = `${target}.nomo-back`;
+    writeFileSync(target, "mac\n");
+    writeFileSync(staged, "box\n");
+    writePark(A, { state: "cloud", pid: 400 }, dir);
+    return { dir, target, staged, l: { staged, target, resume: A } };
+  };
+  const wait = () => Bun.sleep(3);
+
+  test("its turn already ended (background Bash): installed now, and the re-entry sees Back", async () => {
+    const { dir, target, l } = setup();
+    parkHook(prompt("/nomo-cc:back"), dir);
+    await wait();
+    const runStartedAt = Date.now();
+    await wait();
+    parkHook({ session_id: A, hook_event_name: "Stop" }, dir); // seconds after launch
+    expect(stageLanding(A, l, runStartedAt, dir, () => true)).toBe(true);
+    expect(readFileSync(target, "utf8")).toBe("box\n");
+    expect(readPark(A, dir)?.state).toBe("back");
+    expect(reason(parkHook(prompt("<task-notification>done</task-notification>"), dir))?.reason).toBe(`Back. Type /resume ${A} to continue here.`);
+  });
+
+  test("a turn still running (foreground, or a later /nomo-cc: command): deferred to its Stop", async () => {
+    const { dir, target, l } = setup();
+    parkHook({ session_id: A, hook_event_name: "Stop" }, dir); // an older turn
+    await wait();
+    const runStartedAt = Date.now();
+    expect(stageLanding(A, l, runStartedAt, dir, () => true)).toBe(false);
+    expect(readFileSync(target, "utf8")).toBe("mac\n");
+    expect(readPark(A, dir)?.state).toBe("landing");
+    parkHook({ session_id: A, hook_event_name: "Stop" }, dir);
+    expect(readFileSync(target, "utf8")).toBe("box\n");
+    expect(readPark(A, dir)?.state).toBe("back");
+
+    const b = setup();
+    const t0 = Date.now();
+    await wait();
+    parkHook({ session_id: A, hook_event_name: "Stop" }, b.dir);
+    await wait();
+    parkHook(prompt("/nomo-cc:status"), b.dir); // a newer turn is open
+    expect(stageLanding(A, b.l, t0, b.dir, () => true)).toBe(false);
+  });
+
+  test("the window is gone: installed now", () => {
+    const { dir, target, l } = setup();
+    expect(stageLanding(A, l, Date.now(), dir, () => false)).toBe(true);
+    expect(readFileSync(target, "utf8")).toBe("box\n");
   });
 });

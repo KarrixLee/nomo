@@ -33,8 +33,10 @@ export interface Park {
   since: number;
   /** The parked window's `claude` pid (moving/cloud/elsewhere). */
   pid?: number;
-  /** moving: the Stop that ended the arming turn. */
+  /** The last Stop/StopFailure/SessionEnd (moving: the arming turn's, stamped once) and the last turn
+   *  opened since parking (only /nomo-cc: commands get through): together they say "this window is idle". */
   turnEndedAt?: number;
+  turnStartedAt?: number;
   /** landing: the staged box transcript and where it goes. */
   staged?: string;
   target?: string;
@@ -83,6 +85,22 @@ function land(id: string, p: Park, dir: string): Park | undefined {
   return back;
 }
 
+/** Same-window --back has staged the box copy. --back runs as a BACKGROUND Bash, so its turn usually
+ *  ended long ago: if the window is idle (a turn end newer than both this run's start and the last turn
+ *  opened) or gone, install now; otherwise leave it "landing" for the running turn's Stop. True =
+ *  installed (state "back"). ponytail: a /nomo-cc: command typed between the check and the rename races
+ *  it (ms); a per-window lock if that ever shows up. */
+export function stageLanding(id: string, l: { staged: string; target: string; resume: string }, runStartedAt: number,
+  dir = PARK_DIR, alive: (pid: number) => boolean = pidAlive): boolean {
+  const cur = readPark(id, dir);
+  const p: Park = { ...cur, ...l, state: "landing", since: Date.now() };
+  writePark(id, p, dir);
+  const ended = cur?.turnEndedAt ?? 0;
+  const idle = ended > runStartedAt && ended >= (cur?.turnStartedAt ?? 0);
+  const gone = typeof cur?.pid === "number" && !alive(cur.pid);
+  return (idle || gone) && land(id, p, dir)?.state === "back";
+}
+
 /** A "moving" marker outlives its helper only if the helper was killed; it gives up by itself at 30 min. */
 export const MOVING_STALE_MS = 35 * 60_000;
 
@@ -106,13 +124,17 @@ export function parkHook(input: Record<string, unknown>, dir = PARK_DIR): string
       if (event === "SessionEnd") { clearPark(id, dir); return undefined; }
     }
     if (event === "UserPromptSubmit") {
-      if (typeof input.prompt === "string" && input.prompt.trimStart().startsWith(NOMO_COMMAND)) return undefined;
+      if (typeof input.prompt === "string" && input.prompt.trimStart().startsWith(NOMO_COMMAND)) {
+        if (p.state !== "moving") writePark(id, { ...p, turnStartedAt: Date.now() }, dir);
+        return undefined;
+      }
       if (p.state === "back") clearPark(id, dir); // one reminder, then the window is the user's again
       return JSON.stringify({ decision: "block", reason: reasonFor(p, id) });
     }
     const turnEnd = event === "Stop" || event === "StopFailure" || event === "SessionEnd";
     if (p.state === "moving" && turnEnd && !p.turnEndedAt) writePark(id, { ...p, turnEndedAt: Date.now() }, dir);
     if (p.state === "landing" && turnEnd) p = land(id, p, dir);
+    else if (p.state !== "moving" && turnEnd) writePark(id, { ...p, turnEndedAt: Date.now() }, dir);
     if (p?.state === "back" && event === "SessionStart" && input.source === "resume") clearPark(id, dir);
   } catch { /* fail open */ }
   return undefined;

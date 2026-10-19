@@ -69,7 +69,7 @@ import { b64url, type Bytes, fromB64url } from "../core/crypto";
 import { renderPairPage } from "../core/pair-page";
 import { buildPairURL, DEFAULT_WORKER_URL } from "../core/pair-url";
 import { normalizeModelId } from "../core/adapter";
-import { clearPark, PARK_DIR, readPark, writePark } from "../core/park";
+import { clearPark, PARK_DIR, readPark, stageLanding, writePark } from "../core/park";
 import { atomicWrite, CC_DIR, pidAlive, pidAncestors, pidCommand, readRecord, SESSIONS_DIR } from "../core/shared";
 import {
   cancelPending, claimPending, contextTokens, contextTokensOf, GONE_MSG, sizeWarning, TAIL_BYTES, handoffArgv, LATER_LOG, LATER_USAGE, laterStatus, needsPairing, parseLaterArg, type Pending, PENDING_PATH, readPending, resolveSession, waitThenHandoff,
@@ -893,6 +893,7 @@ export function resumeCommand(cwd: string, id: string, model?: string): string {
 export const sameWindowBackLine = (id: string): string => `Back. Type /resume ${id} to continue here.`;
 
 async function back(omg: string, args: Map<string, string | true>): Promise<void> {
+  const startedAt = Date.now();
   const cloud = loadCloud();
   const flag = args.get("--session");
   const here = args.get("--from-session") || process.env.CLAUDE_CODE_SESSION_ID;
@@ -1056,8 +1057,8 @@ async function back(omg: string, args: Map<string, string | true>): Promise<void
         // The park hook installs it at the turn's end (core/park.ts).
         const staged = `${macPath}.nomo-back`;
         atomicWriteBytes(staged, boxT);
-        writePark(uuid, { state: "landing", staged, target: macPath, resume: uuid });
-        console.log(`Transcript: the box's copy (+${boxT.length - (macT?.length ?? 0)} B) goes in as this turn ends; the Mac's previous copy is in ${before}`);
+        const now = stageLanding(uuid, { staged, target: macPath, resume: uuid }, startedAt);
+        console.log(`Transcript: the box's copy (+${boxT.length - (macT?.length ?? 0)} B) ${now ? "is installed" : "goes in as this turn ends"}; the Mac's previous copy is in ${before}`);
       } else {
         atomicWriteBytes(macPath, boxT);
         console.log(`Transcript: installed the box's copy (+${boxT.length - (macT?.length ?? 0)} B); the Mac's previous copy is in ${before}`);
@@ -1140,7 +1141,7 @@ async function back(omg: string, args: Map<string, string | true>): Promise<void
   // 5. Resume here.
   const parked = readPark(uuid);
   if (sameWindow) {
-    if (parked?.state !== "landing") {
+    if (parked?.state !== "landing" && parked?.state !== "back") {
       if (resumeId !== uuid) writePark(uuid, { state: "back", resume: resumeId });
       else clearPark(uuid);
     }

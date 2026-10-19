@@ -81,7 +81,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "2.3.24";
+var PLUGIN_VERSION = "2.3.25";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -2555,8 +2555,11 @@ function parkHook(input, dir = PARK_DIR) {
       }
     }
     if (event === "UserPromptSubmit") {
-      if (typeof input.prompt === "string" && input.prompt.trimStart().startsWith(NOMO_COMMAND))
+      if (typeof input.prompt === "string" && input.prompt.trimStart().startsWith(NOMO_COMMAND)) {
+        if (p.state !== "moving")
+          writePark(id, { ...p, turnStartedAt: Date.now() }, dir);
         return;
+      }
       if (p.state === "back")
         clearPark(id, dir);
       return JSON.stringify({ decision: "block", reason: reasonFor(p, id) });
@@ -2566,6 +2569,8 @@ function parkHook(input, dir = PARK_DIR) {
       writePark(id, { ...p, turnEndedAt: Date.now() }, dir);
     if (p.state === "landing" && turnEnd)
       p = land(id, p, dir);
+    else if (p.state !== "moving" && turnEnd)
+      writePark(id, { ...p, turnEndedAt: Date.now() }, dir);
     if (p?.state === "back" && event === "SessionStart" && input.source === "resume")
       clearPark(id, dir);
   } catch {}

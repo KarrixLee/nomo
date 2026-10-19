@@ -384,7 +384,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "2.3.24";
+var PLUGIN_VERSION = "2.3.25";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -3243,6 +3243,15 @@ function land(id, p, dir) {
   writePark(id, back, dir);
   return back;
 }
+function stageLanding(id, l, runStartedAt, dir = PARK_DIR, alive = pidAlive) {
+  const cur = readPark(id, dir);
+  const p = { ...cur, ...l, state: "landing", since: Date.now() };
+  writePark(id, p, dir);
+  const ended = cur?.turnEndedAt ?? 0;
+  const idle = ended > runStartedAt && ended >= (cur?.turnStartedAt ?? 0);
+  const gone = typeof cur?.pid === "number" && !alive(cur.pid);
+  return (idle || gone) && land(id, p, dir)?.state === "back";
+}
 var MOVING_STALE_MS = 35 * 60000;
 var NOMO_COMMAND = "/nomo-cc:";
 var underPid = (pid) => typeof pid === "number" && pidAncestors(process.pid).includes(pid);
@@ -3271,8 +3280,11 @@ function parkHook(input, dir = PARK_DIR) {
       }
     }
     if (event === "UserPromptSubmit") {
-      if (typeof input.prompt === "string" && input.prompt.trimStart().startsWith(NOMO_COMMAND))
+      if (typeof input.prompt === "string" && input.prompt.trimStart().startsWith(NOMO_COMMAND)) {
+        if (p.state !== "moving")
+          writePark(id, { ...p, turnStartedAt: Date.now() }, dir);
         return;
+      }
       if (p.state === "back")
         clearPark(id, dir);
       return JSON.stringify({ decision: "block", reason: reasonFor(p, id) });
@@ -3282,6 +3294,8 @@ function parkHook(input, dir = PARK_DIR) {
       writePark(id, { ...p, turnEndedAt: Date.now() }, dir);
     if (p.state === "landing" && turnEnd)
       p = land(id, p, dir);
+    else if (p.state !== "moving" && turnEnd)
+      writePark(id, { ...p, turnEndedAt: Date.now() }, dir);
     if (p?.state === "back" && event === "SessionStart" && input.source === "resume")
       clearPark(id, dir);
   } catch {}
@@ -5155,6 +5169,7 @@ function resumeCommand(cwd, id, model) {
 }
 var sameWindowBackLine = (id) => `Back. Type /resume ${id} to continue here.`;
 async function back(omg, args) {
+  const startedAt = Date.now();
   const cloud = loadCloud();
   const flag = args.get("--session");
   const here = args.get("--from-session") || process.env.CLAUDE_CODE_SESSION_ID;
@@ -5324,8 +5339,8 @@ Interrupted (${sig}) while ${phase}.
       if (sameWindow) {
         const staged = `${macPath}.nomo-back`;
         atomicWriteBytes(staged, boxT);
-        writePark(uuid, { state: "landing", staged, target: macPath, resume: uuid });
-        console.log(`Transcript: the box's copy (+${boxT.length - (macT?.length ?? 0)} B) goes in as this turn ends; the Mac's previous copy is in ${before}`);
+        const now = stageLanding(uuid, { staged, target: macPath, resume: uuid }, startedAt);
+        console.log(`Transcript: the box's copy (+${boxT.length - (macT?.length ?? 0)} B) ${now ? "is installed" : "goes in as this turn ends"}; the Mac's previous copy is in ${before}`);
       } else {
         atomicWriteBytes(macPath, boxT);
         console.log(`Transcript: installed the box's copy (+${boxT.length - (macT?.length ?? 0)} B); the Mac's previous copy is in ${before}`);
@@ -5421,7 +5436,7 @@ The conversation itself is back: cd ${q(cwd)} && claude --resume ${resumeId}`);
   saveCloud({ ...c, sessions, current: c.current === uuid ? undefined : c.current });
   const parked = readPark(uuid);
   if (sameWindow) {
-    if (parked?.state !== "landing") {
+    if (parked?.state !== "landing" && parked?.state !== "back") {
       if (resumeId !== uuid)
         writePark(uuid, { state: "back", resume: resumeId });
       else

@@ -103,7 +103,7 @@ async function sha256Hex(s) {
 }
 
 // src/core/shared.ts
-var PLUGIN_VERSION = "2.3.24";
+var PLUGIN_VERSION = "2.3.25";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -1129,6 +1129,15 @@ function land(id, p, dir) {
   writePark(id, back, dir);
   return back;
 }
+function stageLanding(id, l, runStartedAt, dir = PARK_DIR, alive = pidAlive) {
+  const cur = readPark(id, dir);
+  const p = { ...cur, ...l, state: "landing", since: Date.now() };
+  writePark(id, p, dir);
+  const ended = cur?.turnEndedAt ?? 0;
+  const idle = ended > runStartedAt && ended >= (cur?.turnStartedAt ?? 0);
+  const gone = typeof cur?.pid === "number" && !alive(cur.pid);
+  return (idle || gone) && land(id, p, dir)?.state === "back";
+}
 var MOVING_STALE_MS = 35 * 60000;
 var NOMO_COMMAND = "/nomo-cc:";
 var underPid = (pid) => typeof pid === "number" && pidAncestors(process.pid).includes(pid);
@@ -1157,8 +1166,11 @@ function parkHook(input, dir = PARK_DIR) {
       }
     }
     if (event === "UserPromptSubmit") {
-      if (typeof input.prompt === "string" && input.prompt.trimStart().startsWith(NOMO_COMMAND))
+      if (typeof input.prompt === "string" && input.prompt.trimStart().startsWith(NOMO_COMMAND)) {
+        if (p.state !== "moving")
+          writePark(id, { ...p, turnStartedAt: Date.now() }, dir);
         return;
+      }
       if (p.state === "back")
         clearPark(id, dir);
       return JSON.stringify({ decision: "block", reason: reasonFor(p, id) });
@@ -1168,6 +1180,8 @@ function parkHook(input, dir = PARK_DIR) {
       writePark(id, { ...p, turnEndedAt: Date.now() }, dir);
     if (p.state === "landing" && turnEnd)
       p = land(id, p, dir);
+    else if (p.state !== "moving" && turnEnd)
+      writePark(id, { ...p, turnEndedAt: Date.now() }, dir);
     if (p?.state === "back" && event === "SessionStart" && input.source === "resume")
       clearPark(id, dir);
   } catch {}
