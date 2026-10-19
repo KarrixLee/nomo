@@ -3248,6 +3248,14 @@ function cancelPending(d) {
     } catch {}
   return `Cancelled. Session ${p.session} stays on this Mac.`;
 }
+function handoffArgv(o) {
+  if (o.exists(o.self))
+    return [o.runtime, o.self, ...o.args];
+  if (o.exists(o.shim))
+    return [o.shim, "handoff", ...o.args];
+  return;
+}
+var GONE_MSG = "the Nomo plugin was updated or removed while waiting; rerun /nomo-cc:handoff";
 async function waitThenHandoff(p, d) {
   const self = d.selfPid ?? process.pid;
   const release = () => {
@@ -3272,11 +3280,11 @@ async function waitThenHandoff(p, d) {
 `, { mode: 384 });
   } catch {}
   d.log(`Claude Code closed. Handing off session ${p.session}…`);
-  let code;
+  let code, why;
   try {
     code = await d.runHandoff();
   } catch (e) {
-    d.log(String(e));
+    why = e instanceof Error ? e.message : String(e);
     code = 1;
   }
   release();
@@ -3284,7 +3292,7 @@ async function waitThenHandoff(p, d) {
     d.log(`DONE: session ${p.session} is running in the cloud.`);
     d.notify("Your session is now running in the cloud.");
   } else {
-    d.log(`FAILED: the handoff exited ${code}; see the lines above. Your session is still on this Mac.`);
+    d.log(`FAILED: ${why ?? `the handoff exited ${code}; see the lines above`}. Your session is still on this Mac.`);
     d.notify("Handoff failed. Your session is still on this Mac. Check /nomo-cc:handoff status.");
   }
   return code;
@@ -5147,8 +5155,17 @@ async function afterExit(args, worker) {
     alive: pidAlive,
     now: Date.now,
     sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
-    runHandoff: () => new Promise((res) => {
-      spawn2(process.execPath, [SELF, "--session", session, "--worker", worker], { stdio: "inherit" }).on("exit", (c) => res(c ?? 1)).on("error", () => res(1));
+    runHandoff: () => new Promise((res, rej) => {
+      const argv = handoffArgv({
+        runtime: process.execPath,
+        self: SELF,
+        shim: `${CC_DIR}/hook-shim.sh`,
+        args: ["--session", session, "--worker", worker],
+        exists: existsSync5
+      });
+      if (!argv)
+        return rej(new Error(GONE_MSG));
+      spawn2(argv[0], argv.slice(1), { stdio: "inherit", env: { ...process.env, NOMO_HANDOFF_HELPER: "1" } }).on("exit", (c) => res(c ?? 1)).on("error", () => res(1));
     }),
     log: (line) => console.log(`[${new Date().toISOString()}] ${line}`),
     notify: (text) => {
@@ -5318,7 +5335,8 @@ ${(r.stderr ?? "").slice(-2000)}`);
 Session ${plan.uuid} is running on cloud box ${id} (tmux session "nomo").`);
   console.log(attachHelp());
   console.log(`  Status: --status   Sleep the box: --stop   Bring it back to this Mac: --back`);
-  console.log(`
+  if (!process.env.NOMO_HANDOFF_HELPER)
+    console.log(`
 !! Quit your local Claude Code session for ${plan.uuid} now, so the two copies don't diverge.`);
   await afterPair(omg, id, r.stdout ?? "", worker);
 }

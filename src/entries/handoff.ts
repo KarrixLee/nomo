@@ -71,7 +71,7 @@ import { buildPairURL, DEFAULT_WORKER_URL } from "../core/pair-url";
 import { normalizeModelId } from "../core/adapter";
 import { atomicWrite, CC_DIR, pidAlive, pidAncestors, pidCommand, readRecord, SESSIONS_DIR } from "../core/shared";
 import {
-  cancelPending, claimPending, LATER_LOG, laterStatus, needsPairing, type Pending, PENDING_PATH, readPending, resolveSession, waitThenHandoff,
+  cancelPending, claimPending, GONE_MSG, handoffArgv, LATER_LOG, laterStatus, needsPairing, type Pending, PENDING_PATH, readPending, resolveSession, waitThenHandoff,
 } from "../core/handoff-later";
 import {
   agentConfigPaths, applyInPlace, atomicWriteBytes, type BoxArtifacts, boxChangedPaths, boxIdle, copyContained, decideCode, extractTgz,
@@ -1067,8 +1067,12 @@ async function afterExit(args: Map<string, string | true>, worker: string): Prom
     alive: pidAlive,
     now: Date.now,
     sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
-    runHandoff: () => new Promise((res) => {
-      spawn(process.execPath, [SELF, "--session", session, "--worker", worker], { stdio: "inherit" })
+    runHandoff: () => new Promise((res, rej) => {
+      const argv = handoffArgv({
+        runtime: process.execPath, self: SELF, shim: `${CC_DIR}/hook-shim.sh`, args: ["--session", session, "--worker", worker], exists: existsSync,
+      });
+      if (!argv) return rej(new Error(GONE_MSG));
+      spawn(argv[0], argv.slice(1), { stdio: "inherit", env: { ...process.env, NOMO_HANDOFF_HELPER: "1" } })
         .on("exit", (c) => res(c ?? 1)).on("error", () => res(1));
     }),
     log: (line) => console.log(`[${new Date().toISOString()}] ${line}`),
@@ -1197,7 +1201,7 @@ ${BOX_PLUGIN}
   console.log(`\nSession ${plan.uuid} is running on cloud box ${id} (tmux session "nomo").`);
   console.log(attachHelp());
   console.log(`  Status: --status   Sleep the box: --stop   Bring it back to this Mac: --back`);
-  console.log(`\n!! Quit your local Claude Code session for ${plan.uuid} now, so the two copies don't diverge.`);
+  if (!process.env.NOMO_HANDOFF_HELPER) console.log(`\n!! Quit your local Claude Code session for ${plan.uuid} now, so the two copies don't diverge.`);
   await afterPair(omg, id, r.stdout ?? "", worker);
 }
 

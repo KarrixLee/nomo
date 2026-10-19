@@ -3,7 +3,7 @@ import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
-  cancelPending, claimPending, laterStatus, needsPairing, type Pending, readPending, resolveSession, waitThenHandoff, type WaitDeps,
+  cancelPending, claimPending, GONE_MSG, handoffArgv, laterStatus, needsPairing, type Pending, readPending, resolveSession, waitThenHandoff, type WaitDeps,
 } from "./handoff-later";
 
 const A = "0a1b2c3d-1111-4222-8333-444455556666";
@@ -110,6 +110,21 @@ describe("waitThenHandoff", () => {
     expect(await waitThenHandoff(pending(), d)).toBe(1);
     expect(d.lines.at(-1)).toStartWith("FAILED:");
     expect(d.notes[0]).toContain("still on this Mac");
+  });
+
+  test("a plugin removed during the wait: shim fallback, else a clear FAILED", async () => {
+    const o = { runtime: "/bin/bun", self: "/old/dist/handoff.mjs", shim: "/cc/hook-shim.sh", args: ["--session", A] };
+    expect(handoffArgv({ ...o, exists: () => true })).toEqual(["/bin/bun", o.self, "--session", A]);
+    expect(handoffArgv({ ...o, exists: (p) => p === o.shim })).toEqual([o.shim, "handoff", "--session", A]);
+    expect(handoffArgv({ ...o, exists: () => false })).toBeUndefined();
+
+    const path = join(tmp(), "p.json");
+    writeFileSync(path, JSON.stringify(pending()));
+    const d = deps(path, 0);
+    d.runHandoff = async () => { const argv = handoffArgv({ ...o, exists: () => false }); if (!argv) throw new Error(GONE_MSG); return 0; };
+    expect(await waitThenHandoff(pending(), d)).toBe(1);
+    expect(d.lines.at(-1)).toBe(`FAILED: ${GONE_MSG}. Your session is still on this Mac.`);
+    expect(existsSync(path)).toBe(false);
   });
 
   test("gives up at the cap without handing off", async () => {

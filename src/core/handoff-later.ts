@@ -92,12 +92,21 @@ export function cancelPending(d: PendingDeps & { kill: (pid: number) => void; lo
   return `Cancelled. Session ${p.session} stays on this Mac.`;
 }
 
+/** How the helper launches the handoff: its own pinned bundle, else the version-stable hook shim (a plugin
+ *  update during the wait deletes the old version folder), else nothing (the caller fails clearly). */
+export function handoffArgv(o: { runtime: string; self: string; shim: string; args: string[]; exists: (p: string) => boolean }): string[] | undefined {
+  if (o.exists(o.self)) return [o.runtime, o.self, ...o.args];
+  if (o.exists(o.shim)) return [o.shim, "handoff", ...o.args];
+  return undefined;
+}
+export const GONE_MSG = "the Nomo plugin was updated or removed while waiting; rerun /nomo-cc:handoff";
+
 export interface WaitDeps {
   pending: string;
   alive: (pid: number) => boolean;
   now: () => number;
   sleep: (ms: number) => Promise<void>;
-  /** The normal handoff for this session; resolves to its exit code. */
+  /** The normal handoff for this session; resolves to its exit code. A throw is logged as FAILED: <message>. */
   runHandoff: () => Promise<number>;
   log: (line: string) => void;
   notify: (text: string) => void;
@@ -125,14 +134,14 @@ export async function waitThenHandoff(p: Pending, d: WaitDeps): Promise<number> 
   }
   try { writeFileSync(d.pending, JSON.stringify({ ...p, state: "handing-off" }) + "\n", { mode: 0o600 }); } catch { /* status only */ }
   d.log(`Claude Code closed. Handing off session ${p.session}…`);
-  let code: number;
-  try { code = await d.runHandoff(); } catch (e) { d.log(String(e)); code = 1; }
+  let code: number, why: string | undefined;
+  try { code = await d.runHandoff(); } catch (e) { why = e instanceof Error ? e.message : String(e); code = 1; }
   release();
   if (code === 0) {
     d.log(`DONE: session ${p.session} is running in the cloud.`);
     d.notify("Your session is now running in the cloud.");
   } else {
-    d.log(`FAILED: the handoff exited ${code}; see the lines above. Your session is still on this Mac.`);
+    d.log(`FAILED: ${why ?? `the handoff exited ${code}; see the lines above`}. Your session is still on this Mac.`);
     d.notify("Handoff failed. Your session is still on this Mac. Check /nomo-cc:handoff status.");
   }
   return code;
