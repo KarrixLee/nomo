@@ -1,9 +1,9 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
-  cancelPending, claimPending, contextTokens, contextTokensOf, GONE_MSG, sizeWarning, handoffArgv, handoffLanded, laterStatus, NOTHING_RAN_MSG, needsPairing, type Pending, readPending, resolveSession, waitThenHandoff, type WaitDeps,
+  cancelPending, claimPending, contextTokens, contextTokensOf, DEFAULT_THEN, GONE_MSG, parseLaterArg, sizeWarning, handoffArgv, handoffLanded, laterStatus, NOTHING_RAN_MSG, needsPairing, type Pending, readPending, resolveSession, waitThenHandoff, type WaitDeps,
 } from "./handoff-later";
 
 const A = "0a1b2c3d-1111-4222-8333-444455556666";
@@ -223,5 +223,24 @@ describe("context size", () => {
     expect(sizeWarning(950_000)).toContain("context window");
     expect(sizeWarning(950_000)).toContain("/compact");
     expect(sizeWarning(950_000)).not.toMatch(/\$/);
+  });
+});
+
+describe("/nomo-cc:handoff grammar", () => {
+  test("empty → default message; then <text> → text; quiet → none; anything else → usage", () => {
+    expect(parseLaterArg("")).toEqual({ message: DEFAULT_THEN });
+    expect(parseLaterArg("  \n")).toEqual({ message: DEFAULT_THEN });
+    expect(parseLaterArg("then run the tests")).toEqual({ message: "run the tests" });
+    expect(parseLaterArg("Then  it's \"$HOME\" `id`\r\nline 2\n")).toEqual({ message: "it's \"$HOME\" `id`\nline 2" });
+    expect(parseLaterArg("quiet")).toEqual({});
+    expect(parseLaterArg("QUIET\n")).toEqual({});
+    for (const bad of ["then", "then   ", "thenx", "quiet please", "cancle", "status", "cancel", "go"]) expect(parseLaterArg(bad)).toBeUndefined();
+  });
+
+  test("the message lives in the 0600 pending record", () => {
+    const f = join(tmp(), "p.json");
+    expect(claimPending({ path: f, isHelper: () => false }, pending({ message: "go on" }))).toBe(true);
+    expect(readPending(f)?.message).toBe("go on");
+    expect(statSync(f).mode & 0o777).toBe(0o600);
   });
 });

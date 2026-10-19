@@ -384,7 +384,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "2.3.18";
+var PLUGIN_VERSION = "2.3.21";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -3191,6 +3191,18 @@ var LATER_LOG = `${CC_DIR}/handoff.log`;
 var LATER_CAP_MS = 30 * 60000;
 var POLL_MS = 2000;
 var UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+var DEFAULT_THEN = "You're now running on the cloud box. Continue the task you were working on before the handoff. If it was already finished, say so and wait.";
+var LATER_USAGE = "Usage: /nomo-cc:handoff (move this session; it continues on its own), /nomo-cc:handoff then <message>, /nomo-cc:handoff quiet, /nomo-cc:handoff cancel, /nomo-cc:handoff status";
+function parseLaterArg(raw) {
+  const s = raw.replace(/\r\n?/g, `
+`).trim();
+  if (!s)
+    return { message: DEFAULT_THEN };
+  if (/^quiet$/i.test(s))
+    return {};
+  const text = /^then(?:\s+([\s\S]*))?$/i.exec(s)?.[1]?.trim();
+  return text ? { message: text } : undefined;
+}
 function resolveSession(o) {
   const ids = [o.substituted, o.env.CLAUDE_CODE_SESSION_ID].map((s) => s?.trim());
   const byPid = o.records.find((r) => o.ancestors.includes(r.pid));
@@ -4726,17 +4738,83 @@ function attachHelp() {
   ].join(`
 `);
 }
+var IDLE_FN = `nomo_wait_idle() {
+  prev=
+  for _ in $(seq "$1"); do
+    tmux has-session -t nomo 2>/dev/null || return 1
+    cur=$(tmux capture-pane -p -t nomo | grep -v '^[[:space:]]*$' | tail -8)
+    if [ -n "$cur" ] && [ "$cur" = "$prev" ] && printf '%s\\n' "$cur" | grep -q '─' \\
+      && printf '%s\\n' "$cur" | grep -Eq '^[│ ]*(>|❯)' \\
+      && ! printf '%s\\n' "$cur" | grep -E '^[│ ]*(>|❯)' | tail -1 | grep -Eq '^[│ ]*(>|❯).{0,3}[0-9]+\\.'; then
+      return 0
+    fi
+    prev=$cur
+    sleep 2
+  done
+  return 1
+}`;
+var TYPE_FN = `${IDLE_FN}
+nomo_type() {
+  want=
+  if [ -n "$NOMO_TEXT" ]; then
+    nomo_wait_idle 10 || { echo NOMO_BUSY; return 1; }
+    want=$(printf '%s\\n' "$NOMO_TEXT" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' | grep -m1 . | LC_ALL=C cut -b1-40 \\
+      | LC_ALL=C sed "s/[$(printf '\\300-\\377')][$(printf '\\200-\\277')]*\\$//")
+    printf '%s' "$NOMO_TEXT" | tmux load-buffer -b nomo-first - && tmux paste-buffer -p -r -d -b nomo-first -t nomo || { echo NOMO_UNCONFIRMED; return 1; }
+    sleep 0.5
+  fi
+  tmux send-keys -t nomo Enter
+  for n in 1 2 3; do
+    sleep 1
+    p=$(tmux capture-pane -p -t nomo)
+    k=$(printf '%s\\n' "$p" | grep -nE '^[│ ]*(>|❯)' | tail -1 | cut -d: -f1)
+    l=$(printf '%s\\n' "$p" | sed -n "\${k:-0}p")
+    if printf '%s\\n' "$l" | grep -Eq '^[│ ]*(>|❯).{0,3}[0-9]+\\.'; then echo NOMO_SENT; return 0; fi
+    if { [ -z "$l" ] || printf '%s\\n' "$l" | grep -Eq '^[│ ]*(>|❯)( | )*$'; } \\
+      && printf '%s\\n' "$p" | head -n "$(( \${k:-99999} - 1 ))" | grep -qF -- "$want"; then echo NOMO_SENT; return 0; fi
+    [ "$n" = 1 ] && tmux send-keys -t nomo Enter
+  done
+  echo NOMO_UNCONFIRMED
+}`;
 function paneScript(mode) {
   const guard = `${SHM_SWEEP}
 tmux has-session -t nomo 2>/dev/null || { echo 'tmux nomo: not running'; exit 2; }`;
   if (mode === "send")
     return `${guard}
-tmux send-keys -t nomo -l -- "$NOMO_TEXT" && tmux send-keys -t nomo Enter`;
+${TYPE_FN}
+nomo_type`;
   if (mode === "key")
     return `${guard}
 tmux send-keys -t nomo -- "$NOMO_KEY"`;
   return `${guard}
 tmux capture-pane -p -t nomo | sed -e :a -e '/^\\n*$/{$d;N;ba' -e '}' | tail -40`;
+}
+function sendResult(stdout) {
+  if (/^NOMO_SENT$/m.test(stdout))
+    return "Sent.";
+  if (/^NOMO_BUSY$/m.test(stdout))
+    return "Not sent: the cloud session is still busy (no idle prompt after ~20s). Check --screen, then --send again.";
+  if (/^NOMO_UNCONFIRMED$/m.test(stdout))
+    return "Not confirmed: the message wasn't seen submitted. Check --screen before resending (if it's still in the input, --send-key Enter).";
+  return "";
+}
+function firstMessageScript(tries = 45) {
+  return `${SHM_SWEEP}
+${TYPE_FN}
+if nomo_wait_idle ${tries}; then nomo_type; exit 0; fi
+echo NOMO_NOT_READY`;
+}
+var FIRST_SKIPPED = "Session is in the cloud but the first message wasn't sent yet; the box may still type it, so check --screen first and only then --send it";
+var FIRST_UNCONFIRMED = "First message typed in the cloud session, but its submit wasn't confirmed; check --screen (if it's still in the input, --send-key Enter)";
+async function sendFirstMessage(run, text) {
+  try {
+    const out = (await run(firstMessageScript(), { NOMO_TEXT: text })).stdout ?? "";
+    if (/^NOMO_SENT$/m.test(out))
+      return "First message sent to the cloud session.";
+    if (/^NOMO_UNCONFIRMED$/m.test(out))
+      return FIRST_UNCONFIRMED;
+  } catch {}
+  return FIRST_SKIPPED;
 }
 async function bake(key) {
   const out = mkdtempSync2(join4(tmpdir(), "nomo-bake-"));
@@ -4912,8 +4990,9 @@ tar czf ${BACK}-untracked.tgz ${ex} --null -T ${BACK}-ut.list
 rm -f ${BACK}-ut.list` : `tar czf ${BACK}-folder.tgz --exclude node_modules --exclude .git ${ex} .`}
 for f in ${BACK}-*; do echo "NOMO_SIZE \${f#${BACK}-} $(stat -c %s "$f")"; done`;
 }
-function resumeCommand(cwd, id) {
-  return `cd ${q(cwd)} && exec claude --resume ${id}`;
+function resumeCommand(cwd, id, model) {
+  const m = model && /^claude-[a-z0-9.-]+$/.test(model) ? ` --model ${q(model)}` : "";
+  return `cd ${q(cwd)} && exec claude --resume ${id}${m}`;
 }
 async function back(omg, args) {
   const cloud = loadCloud();
@@ -5158,10 +5237,14 @@ The conversation itself is back: cd ${q(cwd)} && claude --resume ${resumeId}`);
   const c = loadCloud();
   const { [uuid]: _done, ...sessions } = c.sessions ?? {};
   saveCloud({ ...c, sessions, current: c.current === uuid ? undefined : c.current });
-  const line = resumeCommand(cwd, resumeId);
+  let model;
+  try {
+    model = lastModel(readFileSync4(join4(projDir, `${resumeId}.jsonl`), "utf8"));
+  } catch {}
+  const line = resumeCommand(cwd, resumeId, model);
   console.log(`
 Resume on this Mac:
-  cd ${q(cwd)} && claude --resume ${resumeId}`);
+  ${line.replace(" && exec ", " && ")}`);
   if (!args.has("--no-open") && !problems.length) {
     const file = join4(backup, "resume.command");
     writeFileSync3(file, `#!/bin/sh
@@ -5201,6 +5284,12 @@ async function later(args, keys, worker) {
     ancestors: pidAncestors(process.pid),
     records
   });
+  const arg = parseLaterArg(args.has("--args-stdin") ? readFileSync4(0, "utf8") : "");
+  if (!arg) {
+    console.log(LATER_USAGE);
+    process.exitCode = 1;
+    return;
+  }
   if (!session || !claudePid)
     throw new Error("could not tell which Claude Code session this is. Run /nomo-cc:handoff inside the session you want to move.");
   if (!keys.omg || !keys.openrouter)
@@ -5225,7 +5314,7 @@ After that, /nomo-cc:handoff works from inside Claude Code.`);
     return;
   }
   mkdirSync2(CC_DIR, { recursive: true, mode: 448 });
-  const p = { helperPid: process.pid, session, claudePid, state: "waiting", startedAt: Date.now() };
+  const p = { helperPid: process.pid, session, claudePid, state: "waiting", startedAt: Date.now(), message: arg.message };
   if (!claimPending(PENDING, p)) {
     const cur = readPending(PENDING_PATH);
     console.log(`A handoff is already waiting (session ${cur?.session ?? "?"}). See /nomo-cc:handoff status, or /nomo-cc:handoff cancel.`);
@@ -5237,7 +5326,8 @@ After that, /nomo-cc:handoff works from inside Claude Code.`);
   writeFileSync3(PENDING_PATH, JSON.stringify({ ...p, helperPid: child.pid }) + `
 `, { mode: 384 });
   console.log(`Ready. Quit Claude Code now (/exit). Session ${session} moves to the cloud as soon as it closes; watch it on your phone.
-` + `Log: ${LATER_LOG}
+` + (p.message ? `First message on the box: "${p.message}"` : "No first message (quiet).") + `
+Log: ${LATER_LOG}
 To cancel before quitting: /nomo-cc:handoff cancel`);
   let warn;
   try {
@@ -5250,7 +5340,13 @@ async function afterExit(args, worker) {
   const session = String(args.get("--session")), claudePid = Number(args.get("--claude-pid"));
   if (!UUID_RE2.test(session) || !(claudePid > 1))
     throw new Error("--after-exit needs --session <uuid> --claude-pid <pid>");
-  process.exitCode = await waitThenHandoff({ helperPid: process.pid, session, claudePid, state: "waiting", startedAt: Date.now() }, {
+  let pending = readPending(PENDING_PATH);
+  for (let i = 0;i < 30 && pending?.helperPid !== process.pid; i++) {
+    await new Promise((r) => setTimeout(r, 100));
+    pending = readPending(PENDING_PATH);
+  }
+  const message = pending?.session === session ? pending.message : undefined;
+  process.exitCode = await waitThenHandoff({ helperPid: process.pid, session, claudePid, state: "waiting", startedAt: Date.now(), message }, {
     pending: PENDING_PATH,
     alive: pidAlive,
     now: Date.now,
@@ -5266,7 +5362,7 @@ async function afterExit(args, worker) {
       });
       if (!argv)
         return rej(new Error(GONE_MSG));
-      spawn2(argv[0], argv.slice(1), { stdio: "inherit", env: { ...process.env, NOMO_HANDOFF_HELPER: "1" } }).on("exit", (c) => res(c ?? 1)).on("error", () => res(1));
+      spawn2(argv[0], argv.slice(1), { stdio: "inherit", env: { ...process.env, NOMO_HANDOFF_HELPER: "1", ...message ? { NOMO_THEN: message } : {} } }).on("exit", (c) => res(c ?? 1)).on("error", () => res(1));
     }),
     log: (line) => console.log(`[${new Date().toISOString()}] ${line}`),
     notify: (text) => {
@@ -5281,7 +5377,7 @@ async function main() {
   const args = new Map;
   for (let i = 0;i < argv.length; i++) {
     const a = argv[i];
-    if (["--session", "--model", "--send", "--send-key", "--worker", "--claude-pid", "--from-session"].includes(a))
+    if (["--session", "--model", "--send", "--send-key", "--then", "--worker", "--claude-pid", "--from-session"].includes(a))
       args.set(a, argv[++i] ?? "");
     else if (a === "--wait" && /^\d+(\.\d+)?$/.test(argv[i + 1] ?? ""))
       args.set(a, argv[++i]);
@@ -5295,6 +5391,11 @@ async function main() {
     console.log(PAIR_URL_MARKER + url);
     return;
   }
+  const then = (typeof args.get("--then") === "string" ? String(args.get("--then")) : process.env.NOMO_THEN ?? "").replace(/\r\n?/g, `
+`);
+  delete process.env.NOMO_THEN;
+  if (args.has("--then") && !then.trim())
+    throw new Error('usage: --then "<first message for the cloud session>"');
   if (args.has("--send") && !String(args.get("--send")).trim())
     throw new Error('usage: --send "<text>" (use --send-key Enter for a bare Enter)');
   const keys = readKeys();
@@ -5365,9 +5466,14 @@ async function main() {
         throw new Error("--send-key takes one tmux key name, e.g. Escape, BTab, C-c, Enter");
       const mode = args.has("--send") ? "send" : args.has("--send-key") ? "key" : "screen";
       const r = await exec(omg, sb.id, paneScript(mode), { NOMO_TEXT: String(args.get("--send") ?? ""), NOMO_KEY: key });
-      process.stdout.write(r.stdout ?? "");
-      if (mode !== "screen" && r.exitCode === 0)
+      process.stdout.write((r.stdout ?? "").replace(/^NOMO_(SENT|UNCONFIRMED|BUSY)\n?/m, ""));
+      if (mode === "key" && r.exitCode === 0)
         console.log("Sent. Check with --screen.");
+      if (mode === "send") {
+        const m = sendResult(r.stdout ?? "");
+        if (m)
+          console.log(m);
+      }
       if (r.exitCode !== 0)
         process.exitCode = 1;
       return;
@@ -5436,6 +5542,8 @@ ${(r.stderr ?? "").slice(-2000)}`);
 `));
   console.log(`
 Session ${plan.uuid} is running on cloud box ${id} (tmux session "nomo").`);
+  if (then.trim())
+    console.log(await sendFirstMessage((script, env) => exec(omg, id, script, env), then));
   console.log(attachHelp());
   console.log(`  Status: --status   Sleep the box: --stop   Bring it back to this Mac: --back`);
   if (!process.env.NOMO_HANDOFF_HELPER)
@@ -5452,11 +5560,14 @@ if (__require.main == __require.module) {
 export {
   BACK_FILES,
   BOX_MACHINE_NAME,
+  FIRST_SKIPPED,
+  FIRST_UNCONFIRMED,
   PAIR_FN,
   PAIR_POLL,
   RELAY_PORT,
   SENSITIVE2 as SENSITIVE,
   SHM_SWEEP,
+  TYPE_FN,
   backPackScript,
   backStopScript,
   backWaitScript,
@@ -5466,6 +5577,7 @@ export {
   checkLaunchIds,
   createBody,
   currentGuard,
+  firstMessageScript,
   lastModel,
   latestSession,
   packRefusal,
@@ -5476,6 +5588,8 @@ export {
   readCapped,
   resultPage,
   resumeCommand,
+  sendFirstMessage,
+  sendResult,
   takePairUrl,
   targetWorker,
   toOpenRouterModel,

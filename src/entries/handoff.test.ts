@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
-import { chmodSync, mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { b64url, generateEphemeralKeyPair } from "../core/crypto";
@@ -11,6 +11,7 @@ import {
 } from "./handoff";
 import { RELAY_PORT as RELAY_LISTEN_PORT } from "./or-relay";
 import { readCapped } from "./handoff";
+import { FIRST_SKIPPED, FIRST_UNCONFIRMED, firstMessageScript, sendFirstMessage, sendResult, TYPE_FN } from "./handoff";
 import { BACK_FILES, backPackScript, backStopScript, backWaitScript, currentGuard, resumeCommand } from "./handoff";
 import { boxIdle } from "../core/cloud-back";
 
@@ -98,7 +99,8 @@ describe("handoff pure logic", () => {
   });
 
   test("user text reaches tmux only through env, never the script", () => {
-    expect(paneScript("send")).toContain(`send-keys -t nomo -l -- "$NOMO_TEXT"`);
+    expect(paneScript("send")).toContain(TYPE_FN);
+    expect(paneScript("send")).not.toContain("send-keys -t nomo -l");
     expect(paneScript("key")).toContain(`send-keys -t nomo -- "$NOMO_KEY"`);
     expect(paneScript("screen")).toContain("capture-pane -p -t nomo");
   });
@@ -270,6 +272,14 @@ describe("bring back (--back)", () => {
   test("the resume line is one quoted exec", () => {
     expect(resumeCommand("/tmp/it's here", U)).toBe(`cd '/tmp/it'\\''s here' && exec claude --resume ${U}`);
   });
+
+  test("--back resumes on the box's model as a bare CC id (an OpenRouter id can't be restored on the Mac)", () => {
+    const jsonl = JSON.stringify({ type: "assistant", message: { model: "anthropic/claude-haiku-5.5" } });
+    expect(resumeCommand("/w", U, lastModel(jsonl))).toBe(`cd '/w' && exec claude --resume ${U} --model 'claude-haiku-5-5'`);
+    for (const bad of [undefined, "", "gpt-5", "claude-x; rm -rf /", "anthropic/claude-haiku-5.5"]) {
+      expect(resumeCommand("/w", U, bad)).toBe(`cd '/w' && exec claude --resume ${U}`);
+    }
+  });
 });
 
 describe("readCapped (a /files download never exceeds its cap)", () => {
@@ -296,5 +306,140 @@ describe("readCapped (a /files download never exceeds its cap)", () => {
     expect(await readCapped(new Response(stream(3, 1000)), 10_000)).toHaveLength(3000);
     expect(await readCapped(new Response(JSON.stringify({ content: "héllo ✓" })), 1000)).toBe('{"content":"héllo ✓"}');
     expect(await readCapped(new Response("x".repeat(50)))).toHaveLength(50); // no cap
+  });
+});
+
+describe("first message (--then, /nomo-cc:handoff)", () => {
+  const NASTY = `it's "$HOME" \`id\` $(touch PWNED) \\n ; rm -rf x\nsecond line`;
+  const READY = "> earlier prompt\n⏺ done.\n\n────────────────\n> \n────────────────\n  ? for shortcuts\n";
+  const MENU = "────────────────\n Resume this session?\n❯ 1. Yes\n  2. No\n";
+  // What CC 2.1.303 really draws: "❯" + NBSP (captured live from a box pane), for the prompt and menus alike.
+  const READY_NBSP = "● done.\n────────────────\n❯\u00a0\n────────────────\n  ⏵⏵ auto mode on (shift+tab to cycle)\n";
+  const MENU_NBSP = "────────────────\n Resume this session?\n❯\u00a01. Yes\n  2. No\n";
+  /** The idle screen after CC accepted `text`: its first line shows in the history above the empty input. */
+  const submitted = (text: string) => `❯\u00a0${text.split("\n")[0]}\n${READY_NBSP}`;
+
+  /** Run firstMessageScript against a fake tmux showing `screen` (`after[n]` once n Enters went in);
+   *  returns stdout, the pasted text, the keys. */
+  function runBox(screen: string, { tries = 3, text = NASTY, after = [] as string[], locale = "C" } = {}): { out: string; typed?: string; keys: string } {
+    const d = mkdtempSync(join(tmpdir(), "nomo-then-")), bin = join(d, "bin");
+    mkdirSync(bin);
+    writeFileSync(join(d, "screen"), screen);
+    after.forEach((a, i) => writeFileSync(join(d, `screen.${i + 1}`), a));
+    writeFileSync(join(bin, "tmux"), `#!/bin/bash
+case "$1" in
+  has-session) exit 0 ;;
+  capture-pane) n=$(cat ${d}/keys 2>/dev/null | grep -c Enter); [ -f ${d}/screen.$n ] && cat ${d}/screen.$n || cat ${d}/screen ;;
+  load-buffer) cat > ${d}/buf ;;
+  paste-buffer) mv ${d}/buf ${d}/typed; echo paste >> ${d}/keys ;;
+  send-keys) echo "$4" >> ${d}/keys ;;
+esac
+`);
+    writeFileSync(join(bin, "sleep"), "#!/bin/sh\nexit 0\n");
+    chmodSync(join(bin, "tmux"), 0o755); chmodSync(join(bin, "sleep"), 0o755);
+    const out = execFileSync("bash", ["-c", firstMessageScript(tries)], { cwd: d, env: { PATH: `${bin}:/usr/bin:/bin`, NOMO_TEXT: text, LC_ALL: locale } }).toString();
+    const read = (f: string) => (existsSync(join(d, f)) ? readFileSync(join(d, f), "utf8") : undefined);
+    return { out, typed: read("typed"), keys: read("keys") ?? "", };
+  }
+
+  test("idle at the input box → the text arrives literally (quotes, $, backticks, newlines), then Enter", () => {
+    const r = runBox(READY, { after: [submitted(NASTY)] });
+    expect(r.out.trim()).toBe("NOMO_SENT");
+    expect(r.typed).toBe(NASTY);
+    expect(r.keys).toBe("paste\nEnter\n");
+    expect(firstMessageScript()).not.toContain("it's");
+  });
+
+  for (const locale of ["C", "C.UTF-8"]) {
+    test(`readiness under LC_ALL=${locale}: the real prompt (❯ + NBSP) is ready, real menus never typed into`, () => {
+      expect(runBox(READY_NBSP, { locale, after: [submitted(NASTY)] }).out.trim()).toBe("NOMO_SENT");
+      for (const screen of [MENU, MENU_NBSP, "", "Resuming conversation…\n"]) {
+        const r = runBox(screen, { locale });
+        expect(r.out.trim()).toBe("NOMO_NOT_READY");
+        expect(r.typed).toBeUndefined();
+      }
+    });
+
+    test(`numbered text that is not a menu no longer blocks readiness (LC_ALL=${locale})`, () => {
+      for (const hist of ["⏺ arrow => 2. next", "⏺ when x > 3.5 it fails", "❯\u00a02. fix the parser"]) {
+        expect(runBox(READY_NBSP.replace("● done.", hist), { locale, after: [submitted(NASTY)] }).out.trim()).toBe("NOMO_SENT");
+      }
+    });
+  }
+
+  test("a trailing ; or \\; reaches tmux intact (no send-keys command separator)", () => {
+    for (const text of ["run tests;", "a\\;", "x ; y;"]) expect(runBox(READY, { text }).typed).toBe(text);
+  });
+
+  test("Enter swallowed into the paste → one more Enter; still there → NOMO_UNCONFIRMED, never NOMO_SENT", () => {
+    const stuck = "────────────────\n❯\u00a0it's still here\n────────────────\n";
+    const r = runBox(READY_NBSP, { after: [stuck, submitted(NASTY)] });
+    expect(r.out.trim()).toBe("NOMO_SENT");
+    expect(r.keys).toBe("paste\nEnter\nEnter\n");
+    const s = runBox(READY_NBSP, { after: [stuck, stuck] });
+    expect(s.out.trim()).toBe("NOMO_UNCONFIRMED");
+    expect(s.keys).toBe("paste\nEnter\nEnter\n");
+  });
+
+  test("busy (CC still working on the last message) → nothing pasted, NOMO_BUSY, reported as not sent", () => {
+    // --send runs TYPE_FN alone; a live spinner changes the screen every capture, so it never goes idle
+    const d = mkdtempSync(join(tmpdir(), "nomo-busy-")), bin = join(d, "bin");
+    mkdirSync(bin);
+    writeFileSync(join(bin, "tmux"), `#!/bin/bash
+case "$1" in
+  has-session) exit 0 ;;
+  capture-pane) echo "✻ Thinking $RANDOM"; printf '────\\n❯ \\n────\\n' ;;
+  *) echo "$1" >> ${d}/keys ;;
+esac
+`);
+    writeFileSync(join(bin, "sleep"), "#!/bin/sh\nexit 0\n");
+    chmodSync(join(bin, "tmux"), 0o755); chmodSync(join(bin, "sleep"), 0o755);
+    let out = "", code = 0;
+    try { out = execFileSync("bash", ["-c", `${TYPE_FN}\nnomo_type`], { cwd: d, env: { PATH: `${bin}:/usr/bin:/bin`, NOMO_TEXT: "hi" } }).toString(); }
+    catch (e) { const x = e as { stdout: Buffer; status: number }; out = x.stdout.toString(); code = x.status; }
+    expect(out.trim()).toBe("NOMO_BUSY");
+    expect(code).toBe(1);
+    expect(existsSync(join(d, "keys"))).toBe(false); // no load-buffer, paste or Enter
+    expect(sendResult("NOMO_BUSY\n")).toMatch(/^Not sent/);
+    expect(sendResult("NOMO_UNCONFIRMED\n")).toMatch(/^Not confirmed.*--screen/);
+    expect(sendResult("NOMO_SENT\n")).toBe("Sent.");
+  });
+
+  test("paste dropped (input empty but the text never reached the history) → NOMO_UNCONFIRMED, never sent", () => {
+    const r = runBox(READY_NBSP, { text: "/model x" , after: [READY_NBSP, READY_NBSP, READY_NBSP] });
+    expect(r.out.trim()).toBe("NOMO_UNCONFIRMED");
+    // the bug's second message, sent idle and accepted: multi-line, trailing ; and a cut mid-UTF-8 char
+    const two = "日本語のテキストはここで四十バイトを超えます、本当に\nsecond line;";
+    expect(runBox(READY_NBSP, { text: two, after: [submitted(two)], locale: "C.UTF-8" }).out.trim()).toBe("NOMO_SENT");
+    expect(runBox(READY_NBSP, { text: two, after: [submitted(two)] }).out.trim()).toBe("NOMO_SENT");
+  });
+
+  test("not ready / box error → a skip line, never a throw (the handoff already succeeded)", async () => {
+    let env: Record<string, string> = {};
+    expect(await sendFirstMessage(async (_s, e) => { env = e; return { stdout: "NOMO_SENT\n" }; }, NASTY)).toContain("sent");
+    expect(env).toEqual({ NOMO_TEXT: NASTY });
+    expect(await sendFirstMessage(async () => ({ stdout: "NOMO_NOT_READY\n" }), "x")).toBe(FIRST_SKIPPED);
+    expect(FIRST_SKIPPED).toContain("--screen");
+    expect(await sendFirstMessage(async () => ({ stdout: "NOMO_UNCONFIRMED\n" }), "x")).toBe(FIRST_UNCONFIRMED);
+    expect(await sendFirstMessage(async () => { throw new Error("502"); }, "x")).toBe(FIRST_SKIPPED);
+  });
+
+  test("the command passes its argument only as a quoted-heredoc body: never argv, never expanded", () => {
+    const md = readFileSync(join(import.meta.dir, "../../plugin/commands/handoff.md"), "utf8");
+    const blocks = [...md.matchAll(/```\n([\s\S]*?)```/g)].map((m) => m[1]);
+    for (const b of blocks) expect(b).not.toContain("$ARGUMENTS");
+    const arm = blocks.find((b) => b.includes("--args-stdin"))!;
+    const d = mkdtempSync(join(tmpdir(), "nomo-cmd-"));
+    mkdirSync(join(d, "scripts"));
+    writeFileSync(join(d, "scripts", "run.sh"), `#!/bin/sh\nprintf '%s\\n' "$@" > ${d}/argv\ncat > ${d}/stdin\n`);
+    chmodSync(join(d, "scripts", "run.sh"), 0o755);
+    const arg = `then ${NASTY}`;
+    const filled = arm.replaceAll("XXXXXXXXXXXX", "q7Zp2Kx9Lm4T").replace("\nARGUMENT\n", `\n${arg}\n`);
+    execFileSync("bash", ["-c", filled], { cwd: d, env: { PATH: "/usr/bin:/bin", HOME: d, CLAUDE_PLUGIN_ROOT: d, CLAUDE_SESSION_ID: "0a1b2c3d-1111-4222-8333-444455556666" } });
+    expect(readFileSync(join(d, "stdin"), "utf8")).toBe(`${arg}\n`);
+    const argv = readFileSync(join(d, "argv"), "utf8");
+    expect(argv).toContain("--args-stdin");
+    expect(argv).not.toContain("touch");
+    expect(existsSync(join(d, "PWNED"))).toBe(false);
   });
 });

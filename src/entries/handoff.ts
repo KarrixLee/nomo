@@ -1,7 +1,7 @@
 // handoff — NOM-72 P1a: move the current Claude Code session to a cloud box (omg sandbox) and keep it
 // running there in tmux. One box per user, remembered in ~/.config/cc-status/cloud.json.
 //
-//   bun plugin/dist/handoff.mjs [--session <uuid>] [--model <id>] [--force] [--dry-run]
+//   bun plugin/dist/handoff.mjs [--session <uuid>] [--model <id>] [--force] [--dry-run] [--then "<first message>"]
 //   bun plugin/dist/handoff.mjs --status | --stop | --pair
 //   bun plugin/dist/handoff.mjs --screen | --send "<text>" | --send-key <tmux key, e.g. Escape, BTab, C-c>
 //   bun plugin/dist/handoff.mjs --bake      (one-off: publish the credential-free `nomo-base` template)
@@ -71,7 +71,7 @@ import { buildPairURL, DEFAULT_WORKER_URL } from "../core/pair-url";
 import { normalizeModelId } from "../core/adapter";
 import { atomicWrite, CC_DIR, pidAlive, pidAncestors, pidCommand, readRecord, SESSIONS_DIR } from "../core/shared";
 import {
-  cancelPending, claimPending, contextTokens, contextTokensOf, GONE_MSG, sizeWarning, TAIL_BYTES, handoffArgv, LATER_LOG, laterStatus, needsPairing, type Pending, PENDING_PATH, readPending, resolveSession, waitThenHandoff,
+  cancelPending, claimPending, contextTokens, contextTokensOf, GONE_MSG, sizeWarning, TAIL_BYTES, handoffArgv, LATER_LOG, LATER_USAGE, laterStatus, needsPairing, parseLaterArg, type Pending, PENDING_PATH, readPending, resolveSession, waitThenHandoff,
 } from "../core/handoff-later";
 import {
   agentConfigPaths, applyInPlace, atomicWriteBytes, type BoxArtifacts, boxChangedPaths, boxIdle, copyContained, decideCode, extractTgz,
@@ -597,14 +597,95 @@ function attachHelp(): string {
   ].join("\n");
 }
 
+/** Box-side `nomo_wait_idle N`: poll up to N times, 2s apart, until claude in tmux `nomo` is idle at its
+ *  input box (the screen's last lines hold a `>`/`❯` prompt line and a ─ rule, the LAST prompt line is
+ *  not a numbered menu item, and the screen is unchanged for one poll). Only the last prompt line is
+ *  menu-checked: chat history may hold `❯ 2.`. */
+const IDLE_FN = `nomo_wait_idle() {
+  prev=
+  for _ in $(seq "$1"); do
+    tmux has-session -t nomo 2>/dev/null || return 1
+    cur=$(tmux capture-pane -p -t nomo | grep -v '^[[:space:]]*$' | tail -8)
+    if [ -n "$cur" ] && [ "$cur" = "$prev" ] && printf '%s\\n' "$cur" | grep -q '─' \\
+      && printf '%s\\n' "$cur" | grep -Eq '^[│ ]*(>|❯)' \\
+      && ! printf '%s\\n' "$cur" | grep -E '^[│ ]*(>|❯)' | tail -1 | grep -Eq '^[│ ]*(>|❯).{0,3}[0-9]+\\.'; then
+      return 0
+    fi
+    prev=$cur
+    sleep 2
+  done
+  return 1
+}`;
+
+/** Box-side `nomo_type`, shared by --send and --then: wait (~20s) for the idle prompt — a paste into a
+ *  busy CC is silently dropped — else NOMO_BUSY, nothing typed. Then paste NOMO_TEXT (exec env only) into
+ *  tmux `nomo` as one bracketed paste (load-buffer from stdin, so a trailing `;` is never a tmux command
+ *  separator and LF stays a newline, not a submit) and press Enter. NOMO_SENT needs positive evidence:
+ *  the input box empty AND the text's first line (its first 40 bytes, cut back to a whole UTF-8 char)
+ *  visible above the input; or a numbered menu took over. Text still in the box gets ONE more Enter.
+ *  Else NOMO_UNCONFIRMED. */
+export const TYPE_FN = `${IDLE_FN}
+nomo_type() {
+  want=
+  if [ -n "$NOMO_TEXT" ]; then
+    nomo_wait_idle 10 || { echo NOMO_BUSY; return 1; }
+    want=$(printf '%s\\n' "$NOMO_TEXT" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' | grep -m1 . | LC_ALL=C cut -b1-40 \\
+      | LC_ALL=C sed "s/[$(printf '\\300-\\377')][$(printf '\\200-\\277')]*\\$//")
+    printf '%s' "$NOMO_TEXT" | tmux load-buffer -b nomo-first - && tmux paste-buffer -p -r -d -b nomo-first -t nomo || { echo NOMO_UNCONFIRMED; return 1; }
+    sleep 0.5
+  fi
+  tmux send-keys -t nomo Enter
+  for n in 1 2 3; do
+    sleep 1
+    p=$(tmux capture-pane -p -t nomo)
+    k=$(printf '%s\\n' "$p" | grep -nE '^[│ ]*(>|❯)' | tail -1 | cut -d: -f1)
+    l=$(printf '%s\\n' "$p" | sed -n "\${k:-0}p")
+    if printf '%s\\n' "$l" | grep -Eq '^[│ ]*(>|❯).{0,3}[0-9]+\\.'; then echo NOMO_SENT; return 0; fi
+    if { [ -z "$l" ] || printf '%s\\n' "$l" | grep -Eq '^[│ ]*(>|❯)( | )*$'; } \\
+      && printf '%s\\n' "$p" | head -n "$(( \${k:-99999} - 1 ))" | grep -qF -- "$want"; then echo NOMO_SENT; return 0; fi
+    [ "$n" = 1 ] && tmux send-keys -t nomo Enter
+  done
+  echo NOMO_UNCONFIRMED
+}`;
+
 /** Box script for --screen / --send / --send-key. User text arrives ONLY as exec env (NOMO_TEXT /
  *  NOMO_KEY), never interpolated into the script. */
 export function paneScript(mode: "screen" | "send" | "key"): string {
   const guard = `${SHM_SWEEP}
 tmux has-session -t nomo 2>/dev/null || { echo 'tmux nomo: not running'; exit 2; }`;
-  if (mode === "send") return `${guard}\ntmux send-keys -t nomo -l -- "$NOMO_TEXT" && tmux send-keys -t nomo Enter`;
+  if (mode === "send") return `${guard}\n${TYPE_FN}\nnomo_type`;
   if (mode === "key") return `${guard}\ntmux send-keys -t nomo -- "$NOMO_KEY"`;
   return `${guard}\ntmux capture-pane -p -t nomo | sed -e :a -e '/^\\n*$/{$d;N;ba' -e '}' | tail -40`;
+}
+
+/** Mac-side line for a --send result; "" when the box printed something else (e.g. tmux not running). */
+export function sendResult(stdout: string): string {
+  if (/^NOMO_SENT$/m.test(stdout)) return "Sent.";
+  if (/^NOMO_BUSY$/m.test(stdout)) return "Not sent: the cloud session is still busy (no idle prompt after ~20s). Check --screen, then --send again.";
+  if (/^NOMO_UNCONFIRMED$/m.test(stdout)) return "Not confirmed: the message wasn't seen submitted. Check --screen before resending (if it's still in the input, --send-key Enter).";
+  return "";
+}
+
+/** Box script for --then: nomo_wait_idle up to `tries` polls, then nomo_type: NOMO_SENT / NOMO_UNCONFIRMED,
+ *  or NOMO_NOT_READY. */
+export function firstMessageScript(tries = 45): string {
+  return `${SHM_SWEEP}
+${TYPE_FN}
+if nomo_wait_idle ${tries}; then nomo_type; exit 0; fi
+echo NOMO_NOT_READY`;
+}
+
+export const FIRST_SKIPPED = "Session is in the cloud but the first message wasn't sent yet; the box may still type it, so check --screen first and only then --send it";
+export const FIRST_UNCONFIRMED = "First message typed in the cloud session, but its submit wasn't confirmed; check --screen (if it's still in the input, --send-key Enter)";
+
+/** --then after a successful handoff. Never throws: the session is already in the cloud. */
+export async function sendFirstMessage(run: (script: string, env: Record<string, string>) => Promise<{ stdout?: string }>, text: string): Promise<string> {
+  try {
+    const out = (await run(firstMessageScript(), { NOMO_TEXT: text })).stdout ?? "";
+    if (/^NOMO_SENT$/m.test(out)) return "First message sent to the cloud session.";
+    if (/^NOMO_UNCONFIRMED$/m.test(out)) return FIRST_UNCONFIRMED;
+  } catch { /* box unreachable: same answer */ }
+  return FIRST_SKIPPED;
 }
 
 /** --bake: a fresh preset box at BOX_SIZE gets tools + this plugin (nothing else), is snapshotted and
@@ -799,9 +880,12 @@ rm -f ${BACK}-ut.list`
 for f in ${BACK}-*; do echo "NOMO_SIZE \${f#${BACK}-} $(stat -c %s "$f")"; done`;
 }
 
-/** The Terminal launcher --back opens: one `exec` line, nothing from the box in it. */
-export function resumeCommand(cwd: string, id: string): string {
-  return `cd ${q(cwd)} && exec claude --resume ${id}`;
+/** The Terminal launcher --back opens: one `exec` line. `model` (lastModel of the returned transcript) is
+ *  passed as --model because box turns record OpenRouter ids that first-party CC can't restore; anything
+ *  not shaped like a bare CC id is dropped. */
+export function resumeCommand(cwd: string, id: string, model?: string): string {
+  const m = model && /^claude-[a-z0-9.-]+$/.test(model) ? ` --model ${q(model)}` : "";
+  return `cd ${q(cwd)} && exec claude --resume ${id}${m}`;
 }
 
 async function back(omg: string, args: Map<string, string | true>): Promise<void> {
@@ -1022,8 +1106,10 @@ async function back(omg: string, args: Map<string, string | true>): Promise<void
   saveCloud({ ...c, sessions, current: c.current === uuid ? undefined : c.current });
 
   // 5. Resume here.
-  const line = resumeCommand(cwd, resumeId);
-  console.log(`\nResume on this Mac:\n  cd ${q(cwd)} && claude --resume ${resumeId}`);
+  let model: string | undefined;
+  try { model = lastModel(readFileSync(join(projDir, `${resumeId}.jsonl`), "utf8")); } catch { /* no transcript: CC picks */ }
+  const line = resumeCommand(cwd, resumeId, model);
+  console.log(`\nResume on this Mac:\n  ${line.replace(" && exec ", " && ")}`);
   if (!args.has("--no-open") && !problems.length) {
     const file = join(backup, "resume.command");
     writeFileSync(file, `#!/bin/sh\n${line}\n`, { mode: 0o700 });
@@ -1058,6 +1144,8 @@ async function later(args: Map<string, string | true>, keys: { omg?: string; ope
   const { session, claudePid } = resolveSession({
     substituted: typeof flag === "string" ? flag : undefined, env: process.env, ancestors: pidAncestors(process.pid), records,
   });
+  const arg = parseLaterArg(args.has("--args-stdin") ? readFileSync(0, "utf8") : "");
+  if (!arg) { console.log(LATER_USAGE); process.exitCode = 1; return; }
   if (!session || !claudePid) throw new Error("could not tell which Claude Code session this is. Run /nomo-cc:handoff inside the session you want to move.");
   if (!keys.omg || !keys.openrouter) throw new Error("OMG_API_KEY and OPENROUTER_API_KEY must be set (env or ~/.nomo-spike.env)");
   const home = process.env.HOME!;
@@ -1076,7 +1164,7 @@ async function later(args: Map<string, string | true>, keys: { omg?: string; ope
     return;
   }
   mkdirSync(CC_DIR, { recursive: true, mode: 0o700 });
-  const p: Pending = { helperPid: process.pid, session, claudePid, state: "waiting", startedAt: Date.now() };
+  const p: Pending = { helperPid: process.pid, session, claudePid, state: "waiting", startedAt: Date.now(), message: arg.message };
   if (!claimPending(PENDING, p)) {
     const cur = readPending(PENDING_PATH);
     console.log(`A handoff is already waiting (session ${cur?.session ?? "?"}). See /nomo-cc:handoff status, or /nomo-cc:handoff cancel.`);
@@ -1088,7 +1176,8 @@ async function later(args: Map<string, string | true>, keys: { omg?: string; ope
   child.unref();
   writeFileSync(PENDING_PATH, JSON.stringify({ ...p, helperPid: child.pid }) + "\n", { mode: 0o600 });
   console.log(`Ready. Quit Claude Code now (/exit). Session ${session} moves to the cloud as soon as it closes; watch it on your phone.\n` +
-    `Log: ${LATER_LOG}\nTo cancel before quitting: /nomo-cc:handoff cancel`);
+    (p.message ? `First message on the box: "${p.message}"` : "No first message (quiet).") +
+    `\nLog: ${LATER_LOG}\nTo cancel before quitting: /nomo-cc:handoff cancel`);
   let warn: string | undefined;
   try { warn = sizeWarning(contextTokensOf(join(home, ".claude", "projects", projectDirName(cwd), `${session}.jsonl`))); } catch { /* estimate only */ }
   if (warn) console.log(warn);
@@ -1098,7 +1187,10 @@ async function later(args: Map<string, string | true>, keys: { omg?: string; ope
 async function afterExit(args: Map<string, string | true>, worker: string): Promise<void> {
   const session = String(args.get("--session")), claudePid = Number(args.get("--claude-pid"));
   if (!UUID_RE.test(session) || !(claudePid > 1)) throw new Error("--after-exit needs --session <uuid> --claude-pid <pid>");
-  process.exitCode = await waitThenHandoff({ helperPid: process.pid, session, claudePid, state: "waiting", startedAt: Date.now() }, {
+  let pending = readPending(PENDING_PATH); // wait out later()'s rewrite naming this helper (a torn read is undefined)
+  for (let i = 0; i < 30 && pending?.helperPid !== process.pid; i++) { await new Promise((r) => setTimeout(r, 100)); pending = readPending(PENDING_PATH); }
+  const message = pending?.session === session ? pending.message : undefined; // from the 0600 record, never argv
+  process.exitCode = await waitThenHandoff({ helperPid: process.pid, session, claudePid, state: "waiting", startedAt: Date.now(), message }, {
     pending: PENDING_PATH,
     alive: pidAlive,
     now: Date.now,
@@ -1109,7 +1201,7 @@ async function afterExit(args: Map<string, string | true>, worker: string): Prom
         runtime: process.execPath, self: SELF, shim: `${CC_DIR}/hook-shim.sh`, args: ["--session", session, "--worker", worker], exists: existsSync,
       });
       if (!argv) return rej(new Error(GONE_MSG));
-      spawn(argv[0], argv.slice(1), { stdio: "inherit", env: { ...process.env, NOMO_HANDOFF_HELPER: "1" } })
+      spawn(argv[0], argv.slice(1), { stdio: "inherit", env: { ...process.env, NOMO_HANDOFF_HELPER: "1", ...(message ? { NOMO_THEN: message } : {}) } })
         .on("exit", (c) => res(c ?? 1)).on("error", () => res(1));
     }),
     log: (line) => console.log(`[${new Date().toISOString()}] ${line}`),
@@ -1126,7 +1218,7 @@ async function main(): Promise<void> {
   const args = new Map<string, string | true>();
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
-    if (["--session", "--model", "--send", "--send-key", "--worker", "--claude-pid", "--from-session"].includes(a)) args.set(a, argv[++i] ?? "");
+    if (["--session", "--model", "--send", "--send-key", "--then", "--worker", "--claude-pid", "--from-session"].includes(a)) args.set(a, argv[++i] ?? "");
     else if (a === "--wait" && /^\d+(\.\d+)?$/.test(argv[i + 1] ?? "")) args.set(a, argv[++i]);
     else args.set(a, true);
   }
@@ -1140,6 +1232,10 @@ async function main(): Promise<void> {
     return;
   }
 
+  // --then: argv from a terminal, NOMO_THEN env from the /nomo-cc:handoff helper; unset so no child inherits it.
+  const then = (typeof args.get("--then") === "string" ? String(args.get("--then")) : process.env.NOMO_THEN ?? "").replace(/\r\n?/g, "\n");
+  delete process.env.NOMO_THEN;
+  if (args.has("--then") && !then.trim()) throw new Error('usage: --then "<first message for the cloud session>"');
   if (args.has("--send") && !String(args.get("--send")).trim()) throw new Error('usage: --send "<text>" (use --send-key Enter for a bare Enter)');
   const keys = readKeys();
   const worker = targetWorker(args.get("--worker"), process.env.NOMO_WORKER_URL);
@@ -1178,8 +1274,9 @@ async function main(): Promise<void> {
       if (args.has("--send-key") && !/^[A-Za-z0-9-]+$/.test(key)) throw new Error("--send-key takes one tmux key name, e.g. Escape, BTab, C-c, Enter");
       const mode = args.has("--send") ? "send" : args.has("--send-key") ? "key" : "screen";
       const r = await exec(omg, sb.id, paneScript(mode), { NOMO_TEXT: String(args.get("--send") ?? ""), NOMO_KEY: key });
-      process.stdout.write(r.stdout ?? "");
-      if (mode !== "screen" && r.exitCode === 0) console.log("Sent. Check with --screen.");
+      process.stdout.write((r.stdout ?? "").replace(/^NOMO_(SENT|UNCONFIRMED|BUSY)\n?/m, ""));
+      if (mode === "key" && r.exitCode === 0) console.log("Sent. Check with --screen.");
+      if (mode === "send") { const m = sendResult(r.stdout ?? ""); if (m) console.log(m); }
       if (r.exitCode !== 0) process.exitCode = 1;
       return;
     }
@@ -1237,6 +1334,7 @@ ${BOX_PLUGIN}
 
   console.log(pane.trimEnd().split("\n").slice(-15).join("\n"));
   console.log(`\nSession ${plan.uuid} is running on cloud box ${id} (tmux session "nomo").`);
+  if (then.trim()) console.log(await sendFirstMessage((script, env) => exec(omg, id, script, env), then));
   console.log(attachHelp());
   console.log(`  Status: --status   Sleep the box: --stop   Bring it back to this Mac: --back`);
   if (!process.env.NOMO_HANDOFF_HELPER) console.log(`\n!! Quit your local Claude Code session for ${plan.uuid} now, so the two copies don't diverge.`);
