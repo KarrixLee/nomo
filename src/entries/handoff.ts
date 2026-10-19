@@ -880,9 +880,12 @@ rm -f ${BACK}-ut.list`
 for f in ${BACK}-*; do echo "NOMO_SIZE \${f#${BACK}-} $(stat -c %s "$f")"; done`;
 }
 
-/** The Terminal launcher --back opens: one `exec` line, nothing from the box in it. */
-export function resumeCommand(cwd: string, id: string): string {
-  return `cd ${q(cwd)} && exec claude --resume ${id}`;
+/** The Terminal launcher --back opens: one `exec` line. `model` (lastModel of the returned transcript) is
+ *  passed as --model because box turns record OpenRouter ids that first-party CC can't restore; anything
+ *  not shaped like a bare CC id is dropped. */
+export function resumeCommand(cwd: string, id: string, model?: string): string {
+  const m = model && /^claude-[a-z0-9.-]+$/.test(model) ? ` --model ${q(model)}` : "";
+  return `cd ${q(cwd)} && exec claude --resume ${id}${m}`;
 }
 
 async function back(omg: string, args: Map<string, string | true>): Promise<void> {
@@ -1103,8 +1106,10 @@ async function back(omg: string, args: Map<string, string | true>): Promise<void
   saveCloud({ ...c, sessions, current: c.current === uuid ? undefined : c.current });
 
   // 5. Resume here.
-  const line = resumeCommand(cwd, resumeId);
-  console.log(`\nResume on this Mac:\n  cd ${q(cwd)} && claude --resume ${resumeId}`);
+  let model: string | undefined;
+  try { model = lastModel(readFileSync(join(projDir, `${resumeId}.jsonl`), "utf8")); } catch { /* no transcript: CC picks */ }
+  const line = resumeCommand(cwd, resumeId, model);
+  console.log(`\nResume on this Mac:\n  ${line.replace(" && exec ", " && ")}`);
   if (!args.has("--no-open") && !problems.length) {
     const file = join(backup, "resume.command");
     writeFileSync(file, `#!/bin/sh\n${line}\n`, { mode: 0o700 });

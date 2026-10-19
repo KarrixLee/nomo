@@ -4990,8 +4990,9 @@ tar czf ${BACK}-untracked.tgz ${ex} --null -T ${BACK}-ut.list
 rm -f ${BACK}-ut.list` : `tar czf ${BACK}-folder.tgz --exclude node_modules --exclude .git ${ex} .`}
 for f in ${BACK}-*; do echo "NOMO_SIZE \${f#${BACK}-} $(stat -c %s "$f")"; done`;
 }
-function resumeCommand(cwd, id) {
-  return `cd ${q(cwd)} && exec claude --resume ${id}`;
+function resumeCommand(cwd, id, model) {
+  const m = model && /^claude-[a-z0-9.-]+$/.test(model) ? ` --model ${q(model)}` : "";
+  return `cd ${q(cwd)} && exec claude --resume ${id}${m}`;
 }
 async function back(omg, args) {
   const cloud = loadCloud();
@@ -5236,10 +5237,14 @@ The conversation itself is back: cd ${q(cwd)} && claude --resume ${resumeId}`);
   const c = loadCloud();
   const { [uuid]: _done, ...sessions } = c.sessions ?? {};
   saveCloud({ ...c, sessions, current: c.current === uuid ? undefined : c.current });
-  const line = resumeCommand(cwd, resumeId);
+  let model;
+  try {
+    model = lastModel(readFileSync4(join4(projDir, `${resumeId}.jsonl`), "utf8"));
+  } catch {}
+  const line = resumeCommand(cwd, resumeId, model);
   console.log(`
 Resume on this Mac:
-  cd ${q(cwd)} && claude --resume ${resumeId}`);
+  ${line.replace(" && exec ", " && ")}`);
   if (!args.has("--no-open") && !problems.length) {
     const file = join4(backup, "resume.command");
     writeFileSync3(file, `#!/bin/sh

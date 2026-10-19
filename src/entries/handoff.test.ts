@@ -272,6 +272,14 @@ describe("bring back (--back)", () => {
   test("the resume line is one quoted exec", () => {
     expect(resumeCommand("/tmp/it's here", U)).toBe(`cd '/tmp/it'\\''s here' && exec claude --resume ${U}`);
   });
+
+  test("--back resumes on the box's model as a bare CC id (an OpenRouter id can't be restored on the Mac)", () => {
+    const jsonl = JSON.stringify({ type: "assistant", message: { model: "anthropic/claude-haiku-5.5" } });
+    expect(resumeCommand("/w", U, lastModel(jsonl))).toBe(`cd '/w' && exec claude --resume ${U} --model 'claude-haiku-5-5'`);
+    for (const bad of [undefined, "", "gpt-5", "claude-x; rm -rf /", "anthropic/claude-haiku-5.5"]) {
+      expect(resumeCommand("/w", U, bad)).toBe(`cd '/w' && exec claude --resume ${U}`);
+    }
+  });
 });
 
 describe("readCapped (a /files download never exceeds its cap)", () => {
