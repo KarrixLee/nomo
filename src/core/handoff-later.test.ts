@@ -3,7 +3,7 @@ import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
-  cancelPending, claimPending, GONE_MSG, handoffArgv, laterStatus, needsPairing, type Pending, readPending, resolveSession, waitThenHandoff, type WaitDeps,
+  cancelPending, claimPending, GONE_MSG, handoffArgv, handoffLanded, laterStatus, NOTHING_RAN_MSG, needsPairing, type Pending, readPending, resolveSession, waitThenHandoff, type WaitDeps,
 } from "./handoff-later";
 
 const A = "0a1b2c3d-1111-4222-8333-444455556666";
@@ -52,6 +52,15 @@ describe("single-flight", () => {
     expect(claimPending(d, pending({ session: B }))).toBe(true);
     expect(readPending(path)?.session).toBe(B);
   });
+
+  test("clearing a dead helper's file never removes a claim that replaced it meanwhile", () => {
+    const path = join(tmp(), "p.json");
+    writeFileSync(path, JSON.stringify(pending({ helperPid: 1 })));
+    // A concurrent claim lands between our read of the dead file and the unlink.
+    const d = { path, isHelper: (pid: number) => { if (pid === 1) writeFileSync(path, JSON.stringify(pending({ helperPid: 2 }))); return pid === 2; } };
+    expect(claimPending(d, pending({ helperPid: 3, session: B }))).toBe(false);
+    expect(readPending(path)?.helperPid).toBe(2);
+  });
 });
 
 describe("cancel", () => {
@@ -77,14 +86,21 @@ describe("cancel", () => {
 });
 
 describe("waitThenHandoff", () => {
-  function deps(path: string, aliveFor: number, code = 0): WaitDeps & { lines: string[]; notes: string[]; runs: number; t: number } {
+  function deps(path: string, aliveFor: number, code = 0): WaitDeps & { lines: string[]; notes: string[]; runs: number; t: number; cloud: { current?: string; sessions?: Record<string, unknown> } } {
     const d = {
       lines: [] as string[], notes: [] as string[], runs: 0, t: 0,
+      cloud: {} as { current?: string; sessions?: Record<string, unknown> },
       pending: path, selfPid: 500, capMs: 60_000,
+      readCloud: () => d.cloud,
       alive: () => d.t < aliveFor,
       now: () => d.t,
       sleep: async (ms: number) => { d.t += ms; },
-      runHandoff: async () => { d.runs++; expect(readPending(path)?.state).toBe("handing-off"); return code; },
+      runHandoff: async () => {
+        d.runs++;
+        expect(readPending(path)?.state).toBe("handing-off");
+        if (code === 0) d.cloud = { current: A, sessions: { [A]: { sha: `run${d.runs}` } } }; // what a real handoff saves
+        return code;
+      },
       log: (l: string) => d.lines.push(l),
       notify: (n: string) => d.notes.push(n),
     };
@@ -109,7 +125,23 @@ describe("waitThenHandoff", () => {
     const d = deps(path, 0, 1);
     expect(await waitThenHandoff(pending(), d)).toBe(1);
     expect(d.lines.at(-1)).toStartWith("FAILED:");
-    expect(d.notes[0]).toContain("still on this Mac");
+    expect(d.notes[0]).toContain("Mac copy is untouched");
+  });
+
+  test("exit 0 with nothing done (shim/run.sh found no plugin or runtime) is FAILED, not DONE", async () => {
+    const path = join(tmp(), "p.json");
+    const d = deps(path, 0);
+    d.cloud = { current: A, sessions: { [A]: { sha: "old" } } }; // an earlier handoff of this same session
+    d.runHandoff = async () => 0;
+    expect(await waitThenHandoff(pending(), d)).toBe(1);
+    expect(d.lines.at(-1)).toBe(`FAILED: ${NOTHING_RAN_MSG}. Your Mac copy is untouched.`);
+  });
+
+  test("handoffLanded: current is this session and its snapshot changed", () => {
+    expect(handoffLanded({}, { current: A, sessions: { [A]: 1 } }, A)).toBe(true);
+    expect(handoffLanded({ sessions: { [A]: 1 } }, { current: A, sessions: { [A]: 2 } }, A)).toBe(true);
+    expect(handoffLanded({ sessions: { [A]: 1 } }, { current: A, sessions: { [A]: 1 } }, A)).toBe(false);
+    expect(handoffLanded({}, { current: B, sessions: { [A]: 1 } }, A)).toBe(false);
   });
 
   test("a plugin removed during the wait: shim fallback, else a clear FAILED", async () => {
@@ -123,7 +155,7 @@ describe("waitThenHandoff", () => {
     const d = deps(path, 0);
     d.runHandoff = async () => { const argv = handoffArgv({ ...o, exists: () => false }); if (!argv) throw new Error(GONE_MSG); return 0; };
     expect(await waitThenHandoff(pending(), d)).toBe(1);
-    expect(d.lines.at(-1)).toBe(`FAILED: ${GONE_MSG}. Your session is still on this Mac.`);
+    expect(d.lines.at(-1)).toBe(`FAILED: ${GONE_MSG}. Your Mac copy is untouched.`);
     expect(existsSync(path)).toBe(false);
   });
 

@@ -536,6 +536,10 @@ async function getBox(key: string, id: string | undefined): Promise<any | undefi
 /** The user's one box, running: reuse (waking it if asleep) or create. */
 async function ensureBox(key: string): Promise<string> {
   let sb = await getBox(key, loadCloud().sandboxId);
+  if (!sb && process.env.NOMO_HANDOFF_HELPER) {
+    // Unattended (/nomo-cc:handoff's helper): a new box needs a QR scan nobody is there to do.
+    throw new Error(`your cloud box is gone (deleted after 14 days asleep, or stopped). Create and pair a new one from a terminal: cd ${q(process.cwd())} && ${q(process.execPath)} ${q(SELF)} --session <id>`);
+  }
   if (!sb) {
     const hasBase = await api(key, "GET", `/templates/${BASE_TEMPLATE}/latest`).then(() => true, () => false);
     console.log(`Creating your cloud box (${hasBase ? `template ${BASE_TEMPLATE}` : "omg preset"})…`);
@@ -675,6 +679,10 @@ async function afterPair(omg: string, id: string, stdout: string, worker: string
   const { url, rest } = takePairUrl(stdout);
   const paired = /^NOMO_PAIRED$/m.test(rest);
   saveCloud({ ...loadCloud(), pairedTo: paired ? `${id} ${worker}` : undefined });
+  if (!paired && process.env.NOMO_HANDOFF_HELPER) {
+    // Never a QR on an unattended Mac: the box runs the session, but the phone can't see it until paired.
+    throw new Error(`the session started on box ${id}, but the box needs pairing, so your phone can't see it. Pair it from a terminal: ${q(process.execPath)} ${q(SELF)} --pair`);
+  }
   const failed = rest.match(/^NOMO_PAIR_FAILED: (.*)$/m);
   const old = rest.match(/^NOMO_REPAIR: (.*)$/m);
   if (old) console.log(`\nThe box was paired to ${old[1] || "another worker"}; pairing it again to the target worker.`);
@@ -1011,7 +1019,8 @@ function listUnder(projDir: string, dir: string): string[] {
 // ------------------------------------------------------------------- /nomo-cc:handoff (core/handoff-later.ts)
 
 const SELF = fileURLToPath(import.meta.url);
-const PENDING = { path: PENDING_PATH, isHelper: (pid: number) => pidAlive(pid) && /handoff/.test(pidCommand(pid) ?? "") };
+// --later: the foreground's placeholder claim; --after-exit: the helper. A reused pid matches neither.
+const PENDING = { path: PENDING_PATH, isHelper: (pid: number) => pidAlive(pid) && /handoff.*--(after-exit|later)(\s|$)/.test(pidCommand(pid) ?? "") };
 
 /** Foreground preflight (local only), then the detached helper that hands off once this session exits. */
 async function later(args: Map<string, string | true>, keys: { omg?: string; openrouter?: string }, worker: string): Promise<void> {
@@ -1067,6 +1076,7 @@ async function afterExit(args: Map<string, string | true>, worker: string): Prom
     alive: pidAlive,
     now: Date.now,
     sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
+    readCloud: loadCloud,
     runHandoff: () => new Promise((res, rej) => {
       const argv = handoffArgv({
         runtime: process.execPath, self: SELF, shim: `${CC_DIR}/hook-shim.sh`, args: ["--session", session, "--worker", worker], exists: existsSync,

@@ -10,7 +10,7 @@
 // target worker (cloud.json `pairedTo`, written by handoff.ts on every pairing it sees succeed) is
 // refused up front with the terminal command instead.
 
-import { appendFileSync, existsSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { appendFileSync, linkSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { CC_DIR } from "./shared";
 
 export const PENDING_PATH = `${CC_DIR}/handoff-pending.json`;
@@ -62,23 +62,28 @@ export function readPending(path: string): Pending | undefined {
   try { return JSON.parse(readFileSync(path, "utf8")); } catch { return undefined; }
 }
 
-/** The pending handoff whose helper still runs; a dead helper's file is dropped. */
+/** The pending handoff whose helper still runs. A dead helper's file is dropped, but only if it still
+ *  holds that same dead helper: a concurrent claim may have just replaced it. */
 export function livePending(d: PendingDeps): Pending | undefined {
   const p = readPending(d.path);
   if (p && d.isHelper(p.helperPid)) return p;
-  if (existsSync(d.path)) try { unlinkSync(d.path); } catch { /* raced */ }
+  if (p && readPending(d.path)?.helperPid === p.helperPid) try { unlinkSync(d.path); } catch { /* raced */ }
   return undefined;
 }
 
-/** Single-flight claim: create the file exclusively, after clearing a dead helper's. False when a live
- *  helper (or a concurrent claim) already holds it. */
+/** Single-flight claim: link a complete temp file into place (exclusive and never half-written), after
+ *  clearing a dead helper's. False when a live helper (or a concurrent claim) already holds it. */
 export function claimPending(d: PendingDeps, p: Pending): boolean {
   if (livePending(d)) return false;
+  const tmp = `${d.path}.${process.pid}.tmp`;
   try {
-    writeFileSync(d.path, JSON.stringify(p) + "\n", { flag: "wx", mode: 0o600 });
+    writeFileSync(tmp, JSON.stringify(p) + "\n", { mode: 0o600 });
+    linkSync(tmp, d.path);
     return true;
   } catch {
     return false;
+  } finally {
+    try { unlinkSync(tmp); } catch { /* gone */ }
   }
 }
 
@@ -100,6 +105,16 @@ export function handoffArgv(o: { runtime: string; self: string; shim: string; ar
   return undefined;
 }
 export const GONE_MSG = "the Nomo plugin was updated or removed while waiting; rerun /nomo-cc:handoff";
+export const NOTHING_RAN_MSG = "the handoff exited without moving the session (the Nomo plugin or its runtime was not found); rerun /nomo-cc:handoff";
+
+type CloudLike = { current?: string; sessions?: Record<string, unknown> };
+/** Positive proof a handoff ran: cloud.json names `session` current with a snapshot that changed during
+ *  the run (the shim and run.sh exit 0 having run nothing). A re-handoff of the same session always
+ *  changes it: the transcript grew by at least this command's own turn. */
+export function handoffLanded(before: CloudLike, after: CloudLike, session: string): boolean {
+  const snap = after.sessions?.[session];
+  return after.current === session && snap !== undefined && JSON.stringify(snap) !== JSON.stringify(before.sessions?.[session]);
+}
 
 export interface WaitDeps {
   pending: string;
@@ -108,6 +123,8 @@ export interface WaitDeps {
   sleep: (ms: number) => Promise<void>;
   /** The normal handoff for this session; resolves to its exit code. A throw is logged as FAILED: <message>. */
   runHandoff: () => Promise<number>;
+  /** cloud.json, read before and after the run for handoffLanded. */
+  readCloud: () => CloudLike;
   log: (line: string) => void;
   notify: (text: string) => void;
   capMs?: number;
@@ -134,15 +151,17 @@ export async function waitThenHandoff(p: Pending, d: WaitDeps): Promise<number> 
   }
   try { writeFileSync(d.pending, JSON.stringify({ ...p, state: "handing-off" }) + "\n", { mode: 0o600 }); } catch { /* status only */ }
   d.log(`Claude Code closed. Handing off session ${p.session}…`);
+  const before = d.readCloud();
   let code: number, why: string | undefined;
   try { code = await d.runHandoff(); } catch (e) { why = e instanceof Error ? e.message : String(e); code = 1; }
+  if (code === 0 && !handoffLanded(before, d.readCloud(), p.session)) { why = NOTHING_RAN_MSG; code = 1; }
   release();
   if (code === 0) {
     d.log(`DONE: session ${p.session} is running in the cloud.`);
     d.notify("Your session is now running in the cloud.");
   } else {
-    d.log(`FAILED: ${why ?? `the handoff exited ${code}; see the lines above`}. Your session is still on this Mac.`);
-    d.notify("Handoff failed. Your session is still on this Mac. Check /nomo-cc:handoff status.");
+    d.log(`FAILED: ${why ?? `the handoff exited ${code}; see the lines above`}. Your Mac copy is untouched.`);
+    d.notify("Handoff failed. Your Mac copy is untouched. Check /nomo-cc:handoff status.");
   }
   return code;
 }

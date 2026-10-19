@@ -3,10 +3,13 @@ description: Move this Claude Code session to your Nomo cloud box (it moves the 
 argument-hint: [cancel|status]
 ---
 
-Read `$ARGUMENTS` (trimmed, case-insensitive) and run **exactly one** of these commands in the
+Read `$ARGUMENTS` (trimmed, case-insensitive) and run **at most one** of these commands in the
 foreground. Show its output to the user verbatim.
 
-**No argument** (or anything other than `cancel` / `status`) — get this session ready to move:
+**Anything other than empty, `cancel` or `status`** (a typo like `cancle` included): run nothing. Reply
+only: "Usage: /nomo-cc:handoff (move this session), /nomo-cc:handoff cancel, /nomo-cc:handoff status".
+
+**No argument** (empty) — get this session ready to move:
 
 ```
 NOMOR="${CLAUDE_PLUGIN_ROOT}"; NOMOS="$HOME/.config/cc-status/hook-shim.sh"; [ -n "$NOMOR" ] && [ -x "$NOMOR/scripts/run.sh" ] && exec "$NOMOR/scripts/run.sh" "$NOMOR/dist/handoff.mjs" --later --session "${CLAUDE_SESSION_ID}"; [ -x "$NOMOS" ] && exec "$NOMOS" handoff --later --session "${CLAUDE_SESSION_ID}"; echo "Nomo could not find its installed files - reinstall the nomo plugin."; exit 1

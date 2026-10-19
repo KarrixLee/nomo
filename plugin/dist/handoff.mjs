@@ -3,7 +3,7 @@ var __require = /* @__PURE__ */ createRequire(import.meta.url);
 
 // src/entries/handoff.ts
 import { execFileSync as execFileSync4, spawn as spawn2 } from "node:child_process";
-import { existsSync as existsSync5, lstatSync as lstatSync2, mkdirSync as mkdirSync2, mkdtempSync as mkdtempSync2, openSync, readdirSync as readdirSync2, readFileSync as readFileSync4, realpathSync as realpathSync2, rmSync, statSync as statSync2, writeFileSync as writeFileSync3 } from "node:fs";
+import { existsSync as existsSync4, lstatSync as lstatSync2, mkdirSync as mkdirSync2, mkdtempSync as mkdtempSync2, openSync, readdirSync as readdirSync2, readFileSync as readFileSync4, realpathSync as realpathSync2, rmSync, statSync as statSync2, writeFileSync as writeFileSync3 } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { dirname as dirname3, join as join4, relative, sep as sep2 } from "node:path";
@@ -384,7 +384,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "2.3.15";
+var PLUGIN_VERSION = "2.3.16";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -3185,7 +3185,7 @@ function adapterFor(agent) {
 var allAdapters = [claudeAdapter, codexAdapter];
 
 // src/core/handoff-later.ts
-import { appendFileSync as appendFileSync2, existsSync as existsSync3, readFileSync as readFileSync2, unlinkSync, writeFileSync } from "node:fs";
+import { appendFileSync as appendFileSync2, linkSync, readFileSync as readFileSync2, unlinkSync, writeFileSync } from "node:fs";
 var PENDING_PATH = `${CC_DIR}/handoff-pending.json`;
 var LATER_LOG = `${CC_DIR}/handoff.log`;
 var LATER_CAP_MS = 30 * 60000;
@@ -3214,7 +3214,7 @@ function livePending(d) {
   const p = readPending(d.path);
   if (p && d.isHelper(p.helperPid))
     return p;
-  if (existsSync3(d.path))
+  if (p && readPending(d.path)?.helperPid === p.helperPid)
     try {
       unlinkSync(d.path);
     } catch {}
@@ -3223,12 +3223,18 @@ function livePending(d) {
 function claimPending(d, p) {
   if (livePending(d))
     return false;
+  const tmp = `${d.path}.${process.pid}.tmp`;
   try {
-    writeFileSync(d.path, JSON.stringify(p) + `
-`, { flag: "wx", mode: 384 });
+    writeFileSync(tmp, JSON.stringify(p) + `
+`, { mode: 384 });
+    linkSync(tmp, d.path);
     return true;
   } catch {
     return false;
+  } finally {
+    try {
+      unlinkSync(tmp);
+    } catch {}
   }
 }
 function cancelPending(d) {
@@ -3256,6 +3262,11 @@ function handoffArgv(o) {
   return;
 }
 var GONE_MSG = "the Nomo plugin was updated or removed while waiting; rerun /nomo-cc:handoff";
+var NOTHING_RAN_MSG = "the handoff exited without moving the session (the Nomo plugin or its runtime was not found); rerun /nomo-cc:handoff";
+function handoffLanded(before, after, session) {
+  const snap = after.sessions?.[session];
+  return after.current === session && snap !== undefined && JSON.stringify(snap) !== JSON.stringify(before.sessions?.[session]);
+}
 async function waitThenHandoff(p, d) {
   const self = d.selfPid ?? process.pid;
   const release = () => {
@@ -3280,6 +3291,7 @@ async function waitThenHandoff(p, d) {
 `, { mode: 384 });
   } catch {}
   d.log(`Claude Code closed. Handing off session ${p.session}…`);
+  const before = d.readCloud();
   let code, why;
   try {
     code = await d.runHandoff();
@@ -3287,13 +3299,17 @@ async function waitThenHandoff(p, d) {
     why = e instanceof Error ? e.message : String(e);
     code = 1;
   }
+  if (code === 0 && !handoffLanded(before, d.readCloud(), p.session)) {
+    why = NOTHING_RAN_MSG;
+    code = 1;
+  }
   release();
   if (code === 0) {
     d.log(`DONE: session ${p.session} is running in the cloud.`);
     d.notify("Your session is now running in the cloud.");
   } else {
-    d.log(`FAILED: ${why ?? `the handoff exited ${code}; see the lines above`}. Your session is still on this Mac.`);
-    d.notify("Handoff failed. Your session is still on this Mac. Check /nomo-cc:handoff status.");
+    d.log(`FAILED: ${why ?? `the handoff exited ${code}; see the lines above`}. Your Mac copy is untouched.`);
+    d.notify("Handoff failed. Your Mac copy is untouched. Check /nomo-cc:handoff status.");
   }
   return code;
 }
@@ -3317,7 +3333,7 @@ import { createHash as createHash2 } from "node:crypto";
 import {
   chmodSync,
   copyFileSync,
-  existsSync as existsSync4,
+  existsSync as existsSync3,
   lstatSync,
   mkdirSync,
   mkdtempSync,
@@ -3512,7 +3528,7 @@ function copyContained(src, dstRoot, rel, overwrite, priv = false) {
     return false;
   const dst = join3(dstRoot, rel);
   let anc = dirname2(dst);
-  while (!existsSync4(anc))
+  while (!existsSync3(anc))
     anc = dirname2(anc);
   const realRoot = realpathSync(dstRoot);
   const realAnc = realpathSync(anc);
@@ -3591,7 +3607,7 @@ function mergeMemory(snapMem, boxDir, boxFiles, macDir, backup) {
   for (const rel of boxFiles) {
     const src = join3(boxDir, rel);
     const mac = join3(macDir, rel);
-    if (!existsSync4(mac)) {
+    if (!existsSync3(mac)) {
       if (copyContained(src, macDir, rel, false, true))
         r.added.push(rel);
       continue;
@@ -3694,7 +3710,7 @@ function landOnBranch(root, a, uuid8, backup) {
 }
 function landFolder(cwd, extracted, files, uuid8) {
   let dst = `${cwd}.nomo-cloud-${uuid8}`;
-  for (let i = 2;existsSync4(dst); i++)
+  for (let i = 2;existsSync3(dst); i++)
     dst = `${cwd}.nomo-cloud-${uuid8}-${i}`;
   mkdirSync(dst, { recursive: true });
   for (const rel of files)
@@ -4291,7 +4307,7 @@ function takePairUrl(stdout) {
 }
 function pluginRoot() {
   const up2 = dirname3(dirname3(fileURLToPath2(import.meta.url)));
-  return existsSync5(join4(up2, ".claude-plugin", "plugin.json")) ? up2 : join4(dirname3(up2), "plugin");
+  return existsSync4(join4(up2, ".claude-plugin", "plugin.json")) ? up2 : join4(dirname3(up2), "plugin");
 }
 function readKeys() {
   const file = {};
@@ -4343,7 +4359,7 @@ function targetWorker(flag, env) {
 }
 var SENSITIVE2 = [".claude", ".config/cc-status", ".ssh", ".gnupg", ".aws", "Library/Keychains"];
 var EXCLUDE_SENSITIVE = SENSITIVE2.flatMap((p) => ["--exclude", p]);
-function packRefusal(dir, home, has = existsSync5) {
+function packRefusal(dir, home, has = existsSync4) {
   const rel = relative(dir, home);
   if (rel !== ".." && !rel.startsWith(".." + sep2))
     return `${dir} is your home folder or contains it`;
@@ -4419,12 +4435,12 @@ function tar(out, cwd, args, input) {
 function build(args, outDir) {
   const cwd = process.cwd();
   const projDir = join4(process.env.HOME, ".claude", "projects", projectDirName(cwd));
-  if (!existsSync5(projDir))
+  if (!existsSync4(projDir))
     throw new Error(`no Claude Code transcripts for ${cwd} (looked in ${projDir})`);
   const uuid = typeof args.get("--session") === "string" ? args.get("--session") : latestSession(readdirSync2(projDir).map((name) => ({ name, mtimeMs: statSync2(join4(projDir, name)).mtimeMs })));
   if (uuid && !UUID_RE2.test(uuid))
     throw new Error(`session id must be a UUID, got ${JSON.stringify(uuid)}`);
-  if (!uuid || !existsSync5(join4(projDir, `${uuid}.jsonl`)))
+  if (!uuid || !existsSync4(join4(projDir, `${uuid}.jsonl`)))
     throw new Error(`session ${uuid ?? "(none)"} not found in ${projDir}`);
   const transcriptBytes = readFileSync4(join4(projDir, `${uuid}.jsonl`));
   const transcript = transcriptBytes.toString("utf8");
@@ -4435,7 +4451,7 @@ function build(args, outDir) {
     art[`${STAGE}-${name}`] = join4(outDir, name);
     return join4(outDir, name);
   };
-  tar(put("project.tgz"), projDir, [`${uuid}.jsonl`, ...[uuid, "memory"].filter((p) => existsSync5(join4(projDir, p)))]);
+  tar(put("project.tgz"), projDir, [`${uuid}.jsonl`, ...[uuid, "memory"].filter((p) => existsSync4(join4(projDir, p)))]);
   const claudeHome = join4(process.env.HOME, ".claude");
   const layer = userLayerFiles(claudeHome, ["skills", "agents", "commands", "CLAUDE.md"]);
   if (layer.skipped.length)
@@ -4600,6 +4616,9 @@ async function getBox(key, id) {
 }
 async function ensureBox(key) {
   let sb = await getBox(key, loadCloud().sandboxId);
+  if (!sb && process.env.NOMO_HANDOFF_HELPER) {
+    throw new Error(`your cloud box is gone (deleted after 14 days asleep, or stopped). Create and pair a new one from a terminal: cd ${q(process.cwd())} && ${q(process.execPath)} ${q(SELF)} --session <id>`);
+  }
   if (!sb) {
     const hasBase = await api(key, "GET", `/templates/${BASE_TEMPLATE}/latest`).then(() => true, () => false);
     console.log(`Creating your cloud box (${hasBase ? `template ${BASE_TEMPLATE}` : "omg preset"})…`);
@@ -4741,6 +4760,9 @@ async function afterPair(omg, id, stdout, worker) {
   const { url, rest } = takePairUrl(stdout);
   const paired = /^NOMO_PAIRED$/m.test(rest);
   saveCloud({ ...loadCloud(), pairedTo: paired ? `${id} ${worker}` : undefined });
+  if (!paired && process.env.NOMO_HANDOFF_HELPER) {
+    throw new Error(`the session started on box ${id}, but the box needs pairing, so your phone can't see it. Pair it from a terminal: ${q(process.execPath)} ${q(SELF)} --pair`);
+  }
   const failed = rest.match(/^NOMO_PAIR_FAILED: (.*)$/m);
   const old = rest.match(/^NOMO_REPAIR: (.*)$/m);
   if (old)
@@ -4960,7 +4982,7 @@ Interrupted (${sig}) while ${phase}.
   else {
     const boxT = readFileSync4(join4(pdir, `${uuid}.jsonl`));
     const macPath = join4(projDir, `${uuid}.jsonl`);
-    const macT = existsSync5(macPath) ? readFileSync4(macPath) : undefined;
+    const macT = existsSync4(macPath) ? readFileSync4(macPath) : undefined;
     const sub = pt.files.filter((r) => r.startsWith(`${uuid}/`));
     const act = transcriptAction(snap, macT, boxT);
     if (act === "corrupt")
@@ -4996,7 +5018,7 @@ Interrupted (${sig}) while ${phase}.
     if (!/^[0-9a-f]{40}$/.test(boxHead))
       throw new Error(`the box reported no HEAD (${JSON.stringify(boxHead)})`);
     const commits = Number(m.COMMITS ?? 0);
-    const has = (n) => existsSync5(join4(backup, n));
+    const has = (n) => existsSync4(join4(backup, n));
     let untrackedDir, untracked = [];
     if (has("untracked.tgz") && (untrackedDir = unpack("untracked.tgz"))) {
       const ut = validateTree(untrackedDir, undefined, budget);
@@ -5051,7 +5073,7 @@ The conversation itself is back: cd ${q(cwd)} && claude --resume ${resumeId}`);
       console.log(`Code: ${why}, so the box's work is on branch ${name}; your checkout was not touched.
   Review: git -C ${q(root)} log -p HEAD..${name}`);
     }
-  } else if (existsSync5(join4(backup, "folder.tgz"))) {
+  } else if (existsSync4(join4(backup, "folder.tgz"))) {
     const dir = unpack("folder.tgz");
     if (dir) {
       const t = validateTree(dir, undefined, budget);
@@ -5090,7 +5112,7 @@ function listUnder(projDir, dir) {
   return listFiles(join4(projDir, dir)).map((r) => join4(dir, r));
 }
 var SELF = fileURLToPath2(import.meta.url);
-var PENDING = { path: PENDING_PATH, isHelper: (pid) => pidAlive(pid) && /handoff/.test(pidCommand(pid) ?? "") };
+var PENDING = { path: PENDING_PATH, isHelper: (pid) => pidAlive(pid) && /handoff.*--(after-exit|later)(\s|$)/.test(pidCommand(pid) ?? "") };
 async function later(args, keys, worker) {
   const records = [];
   try {
@@ -5112,7 +5134,7 @@ async function later(args, keys, worker) {
   if (!keys.omg || !keys.openrouter)
     throw new Error("OMG_API_KEY and OPENROUTER_API_KEY must be set (env or ~/.nomo-spike.env)");
   const home = process.env.HOME;
-  const cwd = [process.cwd(), (await readRecord(session))?.cwd].find((c) => !!c && existsSync5(join4(home, ".claude", "projects", projectDirName(c), `${session}.jsonl`)));
+  const cwd = [process.cwd(), (await readRecord(session))?.cwd].find((c) => !!c && existsSync4(join4(home, ".claude", "projects", projectDirName(c), `${session}.jsonl`)));
   if (!cwd)
     throw new Error(`no transcript for session ${session} under ${process.cwd()}. cd to the session's project folder and retry.`);
   let root;
@@ -5155,13 +5177,14 @@ async function afterExit(args, worker) {
     alive: pidAlive,
     now: Date.now,
     sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
+    readCloud: loadCloud,
     runHandoff: () => new Promise((res, rej) => {
       const argv = handoffArgv({
         runtime: process.execPath,
         self: SELF,
         shim: `${CC_DIR}/hook-shim.sh`,
         args: ["--session", session, "--worker", worker],
-        exists: existsSync5
+        exists: existsSync4
       });
       if (!argv)
         return rej(new Error(GONE_MSG));
