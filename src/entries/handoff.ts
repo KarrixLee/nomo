@@ -58,8 +58,8 @@
 // holds no marker for unless --force. Ends by opening Terminal on `claude --resume` (--no-open just prints it).
 //
 // SEVERAL SESSIONS (NOM-92): a box runs up to BOX_MAX_SESSIONS at once, each in its own tmux
-// `nomo-<id8>` with its own marker /root/.nomo-sessions/<uuid> (project root + tmux name) and key file
-// /dev/shm/nomo-env-<id8>; one per project root (two would share the working tree). cloud.json `active`
+// `nomo-<id12>` with its own marker /root/.nomo-sessions/<uuid> (project root + tmux name) and key file
+// /dev/shm/nomo-env-<id12>; one per project root (two would share the working tree). cloud.json `active`
 // lists them on the Mac. --force, --stop --session, --back act on ONE session; the box sleeps only when
 // none is left running. --screen/--send/--send-key/--stop/--back take --session; without it the parked
 // window's own session, else the only active one, else the list. A pre-2.3.29 box (tmux `nomo`,
@@ -101,13 +101,14 @@ export const BOX_MACHINE_NAME = "Nomo Cloud";
 const PAIR_URL_MARKER = "NOMO_PAIR_URL=";
 const PAIR_WAIT_MS = 600_000; // == the worker's pending-pairing TTL
 const BOX_CC = "/root/.config/cc-status";
-const BOX_PLUGIN = `R=$(ls -d /root/.claude/plugins/cache/nomo/nomo-cc/*/ 2>/dev/null | tail -1)`;
+const BOX_PLUGIN = `R=$(ls -d /root/.claude/plugins/cache/nomo/nomo-cc/*/ 2>/dev/null | tail -1) || true`; // none: callers say so
 /** == or-relay.ts RELAY_PORT (not imported: bundling an entry inlines its main block into this one). */
 export const RELAY_PORT = 47181;
 const BASE_TEMPLATE = "nomo-base";
-/** First line of every non-handoff box script: drop a /dev/shm/nomo-env a dead launch left behind. Only
- *  one older than a minute — a handoff in flight right now writes it and its launcher reads it in seconds. */
-export const SHM_SWEEP = `find /dev/shm -maxdepth 1 -name 'nomo-env*' -mmin +1 -delete 2>/dev/null || true`;
+/** First line of every box script: drop a /dev/shm/nomo-env* a dead launch left behind. Only one older
+ *  than 15 min: a handoff in flight (a fresh box installs for minutes) writes its own and touches it again
+ *  right before launch; the box exec itself times out at 10 min. */
+export const SHM_SWEEP = `find /dev/shm -maxdepth 1 -name 'nomo-env*' -mmin +15 -delete 2>/dev/null || true`;
 /** Sessions one box runs at once (NOM-92). Measured on a Pro box (4 vCPU, 8 GB): idle CC ≈ 250 MB.
  *  ponytail: one cap for every size; per-size caps when boxes come in more than one size. */
 export const BOX_MAX_SESSIONS = 4;
@@ -118,21 +119,22 @@ const BOX_SESSIONS = "/root/.nomo-sessions";
 const BOX_CURRENT = "/root/.nomo-current";
 /** Box shell helpers shared by every per-session script. tmux targets are always exact (`=name`): a bare
  *  `-t nomo` prefix-matches nomo-relay once `nomo` is gone.
- *  - nomo_t <uuid>: T = that session's tmux name (the marker's, else nomo-<id8>).
+ *  - nomo_t <uuid>: T = that session's tmux name (the marker's — 2.3.29 wrote nomo-<id8> — else nomo-<id12>).
  *  - nomo_migrate: a pre-2.3.29 box's /root/.nomo-current becomes a marker (root from the transcript's
- *    cwd), keeping its legacy tmux name `nomo`.
+ *    cwd), keeping its legacy tmux name `nomo` — only while that tmux runs: older --back never removed
+ *    the file, so without a live `nomo` it names a session that already came home and is just dropped.
  *  - nomo_live: the uuids whose tmux runs. Functions always return 0 (callers run under set -e). */
 export const BOX_LIB = `SD=${BOX_SESSIONS}
-nomo_t() { T=$(sed -n 2p "$SD/$1" 2>/dev/null) || true; [ -n "$T" ] || T="nomo-$(printf %s "$1" | cut -c1-8)"; return 0; }
+nomo_t() { T=$(sed -n 2p "$SD/$1" 2>/dev/null) || true; [ -n "$T" ] || T="nomo-$(printf %s "$1" | tr -d - | cut -c1-12)"; return 0; }
 nomo_alive() { tmux has-session -t "=$1" 2>/dev/null; }
 nomo_migrate() {
   local L t d r
   L=$(head -c 64 ${BOX_CURRENT} 2>/dev/null | tr -cd '0-9a-f-') || true
   [ -n "$L" ] || return 0
-  if [ ! -f "$SD/$L" ]; then
+  if [ ! -f "$SD/$L" ] && nomo_alive nomo; then
     t=$(ls /root/.claude/projects/*/"$L".jsonl 2>/dev/null | head -1) || true
     d=; [ -z "$t" ] || d=$(grep -o '"cwd":"[^"]*"' "$t" | tail -1 | cut -d'"' -f4) || true
-    r=$d; [ -z "$d" ] || r=$(git -C "$d" rev-parse --show-toplevel 2>/dev/null) || r=$d
+    r=; [ -z "$d" ] || r=$(git -C "$d" rev-parse --show-toplevel 2>/dev/null) || true; [ -n "$r" ] || r=$d
     mkdir -p "$SD" && printf '%s\\nnomo\\n' "$r" > "$SD/$L"
   fi
   rm -f ${BOX_CURRENT}
@@ -141,38 +143,65 @@ nomo_migrate() {
 nomo_live() { local f; for f in "$SD"/*; do [ -f "$f" ] || continue; nomo_t "\${f##*/}"; if nomo_alive "$T"; then printf '%s\\n' "\${f##*/}"; fi; done; return 0; }`;
 /** Prelude of every per-session box script: sweep, helpers, migrate, T for `uuid`. */
 export const boxPrelude = (uuid: string): string => `${SHM_SWEEP}\n${BOX_LIB}\nnomo_migrate\nnomo_t ${q(uuid)}`;
-/** The marker line the handoff writes right before it launches claude. */
+/** The marker line (the session's claim on its root + slot), written inside the admission lock. */
 export const writeMarker = (uuid: string, root: string): string =>
   `mkdir -p "$SD" && printf '%s\\n%s\\n' ${q(root)} ${q(tmuxName(uuid))} > "$SD/"${q(uuid)}`;
-export const tmuxName = (uuid: string): string => `nomo-${uuid.slice(0, 8)}`;
+/** The short id in box names (tmux, key file, stage, pack): 12 hex chars of the uuid. */
+export const id12 = (uuid: string): string => uuid.replace(/-/g, "").slice(0, 12);
+export const tmuxName = (uuid: string): string => `nomo-${id12(uuid)}`;
 /** This session's own key file on /dev/shm (RAM, 0600, deleted by the launcher as it reads it). */
-export const shmEnvFile = (uuid: string): string => `/dev/shm/nomo-env-${uuid.slice(0, 8)}`;
-/** The tmux command that runs claude for `uuid` (ids checked by checkLaunchIds). */
+export const shmEnvFile = (uuid: string): string => `/dev/shm/nomo-env-${id12(uuid)}`;
+/** The tmux command that runs claude for `uuid` (ids checked by checkLaunchIds). No key file (swept, or
+ *  a rerun) → it stops there, never a claude without its keys. */
 export const launchLine = (uuid: string, model: string): string =>
-  `. ${shmEnvFile(uuid)}; rm -f ${shmEnvFile(uuid)}; export PATH="/root/.local/bin:$PATH"; exec claude --resume ${uuid} --model ${q(model)}`;
+  `[ -f ${shmEnvFile(uuid)} ] || { echo 'Nomo: the key file is gone; rerun the handoff.'; sleep 30; exit 1; }; . ${shmEnvFile(uuid)}; rm -f ${shmEnvFile(uuid)}; export PATH="/root/.local/bin:$PATH"; exec claude --resume ${uuid} --model ${q(model)}`;
 /** The in-VM keep-awake loop: renews the lease while ANY handed-off session's tmux runs. */
 export const keepaliveLoop = (): string =>
   `while ${ANY_SESSION}; do curl -s -X POST http://169.254.0.1:9090/v1/sandbox/keepalive -H 'Content-Type: application/json' -d '{"seconds":${KEEPALIVE_S}}' >/dev/null; sleep 600; done`;
-/** True while any handed-off session's tmux runs (nomo-<id8>, or the legacy `nomo`); never relay/keepalive/pair. */
-export const ANY_SESSION = `tmux ls -F '#{session_name}' 2>/dev/null | grep -qxE 'nomo(-[0-9a-f]{8})?'`;
+/** True while any handed-off session's tmux runs (nomo-<id12>, 2.3.29's nomo-<id8>, or the legacy
+ *  `nomo`); never relay/keepalive/pair. */
+export const ANY_SESSION = `tmux ls -F '#{session_name}' 2>/dev/null | grep -qxE 'nomo(-[0-9a-f]{8}|-[0-9a-f]{12})?'`;
 /** Box (after boxPrelude, under set -e): may `uuid` start at `root`? Exit 3 with NOMO_BUSY (its own tmux
  *  runs; --force kills THAT session only, never the server), NOMO_SAME_ROOT=<id> (another session that
- *  was not brought back holds the root: they would share the tree; --force does not override it) or
- *  NOMO_FULL=<n> (BOX_MAX_SESSIONS running). Leaves N = the other running sessions. */
+ *  was not brought back holds the root: they would share the tree; --force does not override it),
+ *  NOMO_FULL=<n> (BOX_MAX_SESSIONS running or being handed off) or NOMO_LOCKED (another handoff held the
+ *  lock past 5 min). Under flock: the check and this session's claim (its marker + $SD/.claim-<uuid>)
+ *  are one step, so two concurrent handoffs can't both pass. Only tmux has-session/kill-session run
+ *  inside the lock (neither starts a tmux server, which would inherit fd 9 and hold it forever). The
+ *  EXIT trap drops the claim, and a marker this run created when no session got launched. Leaves N =
+ *  the other sessions running or being handed off. */
 export function admitScript(uuid: string, root: string): string {
-  return `N=0
-if command -v tmux >/dev/null; then
-  if nomo_alive "$T"; then
-    if [ "\${NOMO_FORCE:-}" != 1 ]; then echo "NOMO_BUSY: session ${uuid} is already running on this box"; exit 3; fi
-    tmux kill-session -t "=$T"
-  fi
-  for f in "$SD"/*; do
-    [ -f "$f" ] && [ "\${f##*/}" != ${q(uuid)} ] || continue
-    if [ "$(head -1 "$f")" = ${q(root)} ]; then echo "NOMO_SAME_ROOT=\${f##*/}"; exit 3; fi
-  done
-  N=$(( $(nomo_live | wc -l) ))
-  if [ "$N" -ge ${BOX_MAX_SESSIONS} ]; then echo "NOMO_FULL=$N"; exit 3; fi
-fi`;
+  const u = q(uuid);
+  return `N=0; OWN=; mkdir -p "$SD"
+nomo_exit() {
+  rm -f "$SD/.claim-"${u}
+  if ! nomo_alive ${q(tmuxName(uuid))}; then rm -f ${shmEnvFile(uuid)}; [ "$OWN" != 1 ] || rm -f "$SD/"${u}; fi
+  return 0
+}
+exec 9>${BOX_SESSIONS}.lock
+if command -v flock >/dev/null; then flock -w 300 9 || { echo NOMO_LOCKED; exit 3; }; fi
+if command -v tmux >/dev/null && nomo_alive "$T"; then
+  if [ "\${NOMO_FORCE:-}" != 1 ]; then echo "NOMO_BUSY: session ${uuid} is already running on this box"; exit 3; fi
+  tmux kill-session -t "=$T"
+fi
+for f in "$SD"/*; do
+  [ -f "$f" ] && [ "\${f##*/}" != ${u} ] || continue
+  if [ "$(head -1 "$f")" = ${q(root)} ]; then echo "NOMO_SAME_ROOT=\${f##*/}"; exit 3; fi
+done
+find "$SD" -maxdepth 1 -name '.claim-*' -mmin +15 -delete 2>/dev/null || true
+C=0
+for c in "$SD"/.claim-*; do
+  [ -f "$c" ] && [ "\${c##*/.claim-}" != ${u} ] || continue
+  nomo_t "\${c##*/.claim-}"; command -v tmux >/dev/null && nomo_alive "$T" || C=$((C+1))
+done
+if command -v tmux >/dev/null; then N=$(( $(nomo_live | wc -l) + C )); else N=$C; fi
+if [ "$N" -ge ${BOX_MAX_SESSIONS} ]; then echo "NOMO_FULL=$N"; exit 3; fi
+[ -f "$SD/"${u} ] || OWN=1
+${writeMarker(uuid, root)}
+: > "$SD/.claim-"${u}
+trap nomo_exit EXIT
+flock -u 9 2>/dev/null || true
+exec 9>&-`;
 }
 const BOX_SIZE = "pro"; // the bake and every create must match, or the template cold-boots
 
@@ -302,9 +331,9 @@ function readKeys(): { omg?: string; openrouter?: string } {
 
 /** Box-side tools + this plugin for root (as a directory marketplace), idempotent: shared by every
  *  handoff and by --bake. Uninstall + cache wipe first: a same-version reinstall otherwise silently keeps
- *  the old cached dist. Needs <stage>-plugin.tgz uploaded. With other sessions running ($N > 0) the same
- *  version already installed is kept: the wipe would pull the hooks out from under them.
- *  ponytail: a DIFFERENT version still reinstalls under them (their hooks fail until they restart). */
+ *  the old cached dist. Needs <stage>-plugin.tgz uploaded. With other sessions running or being handed
+ *  off ($N > 0) and a plugin installed, nothing is reinstalled: the wipe would pull the hooks out from
+ *  under them (exit 127). The box then keeps its version until those sessions are back. */
 export function boxSetup(marketplace: string, stage = STAGE): string {
   const version = (JSON.parse(marketplace).plugins?.[0]?.version ?? "") as string;
   return `export PATH="/root/.local/bin:/root/.bun/bin:$PATH"
@@ -314,8 +343,9 @@ command -v bun >/dev/null || curl -fsSL https://bun.sh/install | bash >/dev/null
 command -v bun >/dev/null || echo "WARN: no bun on the box, Nomo hooks stay silent"
 claude --version
 
-if [ "\${N:-0}" -gt 0 ] && [ -n ${q(version)} ] && [ -d /root/.claude/plugins/cache/nomo/nomo-cc/${q(version)} ]; then
-  echo "Nomo plugin ${version} already installed; kept for the $N running session(s)."
+I=$(ls /root/.claude/plugins/cache/nomo/nomo-cc/ 2>/dev/null | tail -1) || true
+if [ "\${N:-0}" -gt 0 ] && [ -n "$I" ]; then
+  [ "$I" = ${q(version)} ] || echo "The box keeps Nomo plugin $I (not ${version}) until its $N other session(s) are back."
 else
 M=/root/.nomo/marketplace
 rm -rf "$M" && mkdir -p "$M/plugin" "$M/.claude-plugin" && tar xzf ${stage}-plugin.tgz -C "$M/plugin"
@@ -429,7 +459,7 @@ function tar(out: string, cwd: string, args: string[], input?: Buffer): void {
   });
 }
 
-interface Plan {
+export interface Plan {
   uuid: string;
   warn?: string; // a big-session heads-up (sizeWarning)
   cwd: string;
@@ -443,7 +473,7 @@ interface Plan {
   gitUser: Record<string, string>; // NOMO_GIT_NAME / NOMO_GIT_EMAIL: box commits are authored as the user
 }
 
-function build(args: Map<string, string | true>, outDir: string): Plan {
+export function build(args: Map<string, string | true>, outDir: string): Plan {
   const cwd = process.cwd();
   const projDir = join(process.env.HOME!, ".claude", "projects", projectDirName(cwd));
   if (!existsSync(projDir)) throw new Error(`no Claude Code transcripts for ${cwd} (looked in ${projDir})`);
@@ -461,7 +491,7 @@ function build(args: Map<string, string | true>, outDir: string): Plan {
   checkLaunchIds(uuid, model);
 
   const art: Record<string, string> = {};
-  const stage = `${STAGE}-${uuid.slice(0, 8)}`; // per session: two handoffs never share an upload
+  const stage = `${STAGE}-${id12(uuid)}`; // per session: two handoffs never share an upload
   const put = (name: string) => { art[`${stage}-${name}`] = join(outDir, name); return join(outDir, name); };
 
   // Transcript + its subagent dir + project memory.
@@ -526,7 +556,6 @@ T=${tmuxName(uuid)}
 rm -f ${envFile}
 ( umask 077; export -p | grep -E '^declare -x (${runEnv.join("|")})=' > ${envFile} )
 unset ANTHROPIC_AUTH_TOKEN
-trap 'nomo_alive "$T" || rm -f ${envFile}' EXIT
 ${boxSetup(marketplace, stage)}
 
 P=/root/.claude/projects/${enc}
@@ -565,15 +594,18 @@ nomo_pair
 
 # The OpenRouter relay, fresh from this install, unless other sessions are talking through it right now.
 ${BOX_PLUGIN}
+# (A concurrent handoff may be starting it too: start only when none runs, never kill one in use.)
 if [ "$N" -gt 0 ] && (exec 3<>/dev/tcp/127.0.0.1/${RELAY_PORT}) 2>/dev/null; then :; else
-  tmux kill-session -t =nomo-relay 2>/dev/null || true
-  tmux new-session -d -s nomo-relay "$(command -v bun || command -v node) $R/dist/or-relay.mjs"
+  [ "$N" -gt 0 ] || tmux kill-session -t =nomo-relay 2>/dev/null || true
+  tmux has-session -t =nomo-relay 2>/dev/null || tmux new-session -d -s nomo-relay "$(command -v bun || command -v node) $R/dist/or-relay.mjs" || true
   for _ in $(seq 20); do (exec 3<>/dev/tcp/127.0.0.1/${RELAY_PORT}) 2>/dev/null && break; sleep 0.5; done
 fi
 (exec 3<>/dev/tcp/127.0.0.1/${RELAY_PORT}) 2>/dev/null || { echo "NOMO_RELAY_FAILED"; tmux capture-pane -p -t =nomo-relay: 2>/dev/null; exit 4; }
 
-# Which session this tmux runs and at which root, so --back/--stop --session X never touch another one.
-${writeMarker(uuid, root)}
+# The marker (written at admission) says which session this tmux runs and at which root. The key file
+# must still be there (a stuck run past the sweep age lost it): touched so no sweep takes it before launch.
+[ -f ${envFile} ] || { echo "NOMO_KEYS_GONE"; exit 5; }
+touch ${envFile}
 tmux new-session -d -s "$T" -x 200 -y 50 -c ${q(cwd)} ${q(`bash -c ${q(launchLine(uuid, model))}`)}
 # Restarted every time: a pre-2.3.29 loop watches the legacy name only.
 tmux kill-session -t =nomo-keepalive 2>/dev/null || true
@@ -665,6 +697,7 @@ export function busyMessage(stdout: string, box: string, uuid: string, root: str
     return `session ${same[1]} is already on box ${box} for ${root}, and one project folder holds one session (two would share the working tree). ` +
       `Bring it back first: --back --session ${same[1]}`;
   }
+  if (/^NOMO_LOCKED$/m.test(stdout)) return `another handoff to box ${box} is still in progress; rerun this one in a minute.`;
   const full = stdout.match(/^NOMO_FULL=(\d+)$/m);
   if (full) {
     return `box ${box} already runs ${full[1]} sessions (the cap is ${BOX_MAX_SESSIONS}). Bring one back (--back --session <id>) or stop one (--stop --session <id>) first; --status lists them.`;
@@ -774,7 +807,8 @@ for f in "$SD"/*; do
   printf '  %s  %-8s %s  (tmux %s)\\n' "$u" "$s" "$(head -1 "$f")" "$T"
 done
 echo "  $n of ${BOX_MAX_SESSIONS} running"
-echo; echo '--- Nomo on the box ---'
+echo NOMO_STATUS_SPLIT
+echo '--- Nomo on the box ---'
 ${BOX_PLUGIN}
 [ -n "$R" ] && bun "$R/dist/status-cmd.mjs" claude || echo 'Nomo plugin: not installed on the box'`;
 }
@@ -977,7 +1011,7 @@ const BACK = "/tmp/nomo-back";
 export const BACK_FILES = ["repo.bundle", "wip.patch", "untracked.tgz", "project.tgz", "folder.tgz"] as const;
 const BACK_POLL_MS = 10_000;
 /** Where --back packs `uuid`'s work on the box: per session, so two backs never share files. */
-export const backPrefix = (uuid: string): string => `${BACK}-${uuid.slice(0, 8)}`;
+export const backPrefix = (uuid: string): string => `${BACK}-${id12(uuid)}`;
 
 /** Box shell (after boxPrelude): unless NOMO_FORCE=1, stop here (NOMO_OTHER) when the box holds no marker
  *  for `uuid`: already brought back, or never handed off to this box. Its root may hold another session. */
@@ -1566,12 +1600,14 @@ async function main(): Promise<void> {
       await afterPair(omg, sb.id, r.stdout ?? "", worker);
       return;
     }
-    console.log(`Target worker: ${worker}`);
     console.log(`Box ${sb.id}: ${sb.status}${sb.keepAwakeUntil ? `, keep-awake until ${sb.keepAwakeUntil}` : ""}`);
-    console.log((cloud.active ?? []).length ? `Handed off from this Mac (not brought back yet):\n${listActive(cloud)}` : "Handed off from this Mac: none on record.");
     const r = await exec(omg, sb.id, statusScript());
-    process.stdout.write(r.stdout ?? "");
+    const [sessions, nomo = ""] = (r.stdout ?? "").split(/^NOMO_STATUS_SPLIT$\n?/m);
+    process.stdout.write(sessions); // the box's sessions first: id, running/stopped, root
+    console.log((cloud.active ?? []).length ? `On record on this Mac (not brought back yet):\n${listActive(cloud)}` : "On record on this Mac: none.");
     console.log(attachHelp((cloud.active ?? []).length > 1));
+    console.log(`\nTarget worker: ${worker}`);
+    process.stdout.write(nomo);
     return;
   }
 
@@ -1604,6 +1640,7 @@ async function main(): Promise<void> {
   const pane = takePairUrl(r.stdout ?? "").rest.replace(/^NOMO_(PAIRED|PAIR_FAILED: .*|REPAIR: .*)$\n?/gm, ""); // never echo the QR URL
   if (r.exitCode === 4) throw new Error(`the OpenRouter relay did not start on box ${id}:\n${pane.slice(-1000)}`);
   if (r.exitCode === 3) throw new Error(busyMessage(r.stdout ?? "", id, plan.uuid, plan.root));
+  if (r.exitCode === 5) throw new Error(`the box run took so long its key file was swept before launch; nothing was started. Rerun the handoff.`);
   if (r.exitCode !== 0 || /No conversation found|API Error|Invalid API key|command not found/i.test(pane)) {
     throw new Error(`box start failed (exit ${r.exitCode}):\n${pane.slice(-2000)}\n${(r.stderr ?? "").slice(-2000)}`);
   }
