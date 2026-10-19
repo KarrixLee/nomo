@@ -69,7 +69,7 @@
 // headers timeout — the box script is kept short, so prefer bun.
 
 import { execFileSync, spawn } from "node:child_process";
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, lstatSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { dirname, join, relative, sep } from "node:path";
@@ -123,7 +123,12 @@ const BOX_CURRENT = "/root/.nomo-current";
  *  - nomo_migrate: a pre-2.3.29 box's /root/.nomo-current becomes a marker (root from the transcript's
  *    cwd), keeping its legacy tmux name `nomo` — only while that tmux runs: older --back never removed
  *    the file, so without a live `nomo` it names a session that already came home and is just dropped.
- *  - nomo_live: the uuids whose tmux runs. Functions always return 0 (callers run under set -e). */
+ *  - nomo_live: the uuids whose tmux runs.
+ *  - nomo_prune [self]: with NOMO_KNOWN set (exec env: the Mac's cloud.json `active`, space-separated),
+ *    drop every marker that is neither running, nor being handed off (.claim-), nor on the Mac's record:
+ *    a session already brought back (by a plugin that left its marker), which would otherwise block
+ *    its folder forever. Unset NOMO_KNOWN = prune nothing.
+ *  Functions always return 0 (callers run under set -e). */
 export const BOX_LIB = `SD=${BOX_SESSIONS}
 nomo_t() { T=$(sed -n 2p "$SD/$1" 2>/dev/null) || true; [ -n "$T" ] || T="nomo-$(printf %s "$1" | tr -d - | cut -c1-12)"; return 0; }
 nomo_alive() { tmux has-session -t "=$1" 2>/dev/null; }
@@ -140,7 +145,19 @@ nomo_migrate() {
   rm -f ${BOX_CURRENT}
   return 0
 }
-nomo_live() { local f; for f in "$SD"/*; do [ -f "$f" ] || continue; nomo_t "\${f##*/}"; if nomo_alive "$T"; then printf '%s\\n' "\${f##*/}"; fi; done; return 0; }`;
+nomo_live() { local f; for f in "$SD"/*; do [ -f "$f" ] || continue; nomo_t "\${f##*/}"; if nomo_alive "$T"; then printf '%s\\n' "\${f##*/}"; fi; done; return 0; }
+nomo_prune() {
+  [ -n "\${NOMO_KNOWN+x}" ] || return 0
+  local f u T
+  for f in "$SD"/*; do
+    [ -f "$f" ] || continue; u=\${f##*/}
+    [ "$u" != "\${1:-}" ] && [ ! -f "$SD/.claim-$u" ] || continue
+    case " $NOMO_KNOWN " in *" $u "*) continue ;; esac
+    nomo_t "$u"; if command -v tmux >/dev/null && nomo_alive "$T"; then continue; fi
+    rm -f "$f"; echo "Dropped the box's stale record of session $u (not running, not on this Mac's record: brought back already)."
+  done
+  return 0
+}`;
 /** Prelude of every per-session box script: sweep, helpers, migrate, T for `uuid`. */
 export const boxPrelude = (uuid: string): string => `${SHM_SWEEP}\n${BOX_LIB}\nnomo_migrate\nnomo_t ${q(uuid)}`;
 /** The marker line (the session's claim on its root + slot), written inside the admission lock. */
@@ -184,11 +201,12 @@ if command -v tmux >/dev/null && nomo_alive "$T"; then
   if [ "\${NOMO_FORCE:-}" != 1 ]; then echo "NOMO_BUSY: session ${uuid} is already running on this box"; exit 3; fi
   tmux kill-session -t "=$T"
 fi
+find "$SD" -maxdepth 1 -name '.claim-*' -mmin +15 -delete 2>/dev/null || true
+nomo_prune ${u}
 for f in "$SD"/*; do
   [ -f "$f" ] && [ "\${f##*/}" != ${u} ] || continue
   if [ "$(head -1 "$f")" = ${q(root)} ]; then echo "NOMO_SAME_ROOT=\${f##*/}"; exit 3; fi
 done
-find "$SD" -maxdepth 1 -name '.claim-*' -mmin +15 -delete 2>/dev/null || true
 C=0
 for c in "$SD"/.claim-*; do
   [ -f "$c" ] && [ "\${c##*/.claim-}" != ${u} ] || continue
@@ -718,15 +736,37 @@ export async function stopOne(uuid: string, run: (script: string, env: Record<st
 }
 
 const loadCloud = (): Cloud => { try { return normalizeCloud(JSON.parse(readFileSync(CLOUD_PATH, "utf8"))); } catch { return {}; } };
-function saveCloud(c: Cloud): void {
-  mkdirSync(dirname(CLOUD_PATH), { recursive: true });
-  writeFileSync(CLOUD_PATH, JSON.stringify(c) + "\n", { mode: 0o600 });
+const SLEEP = new Int32Array(new SharedArrayBuffer(4));
+/** The ONLY way cloud.json is written: under an exclusive lockfile (O_EXCL; one older than 10s is a dead
+ *  writer's and is broken), `fn` applied to a FRESH read, then tmp + rename. Two handoffs finishing at
+ *  once each add their own session instead of one overwriting the other.
+ *  ponytail: two waiters breaking the same stale lock at once can both proceed; that needs a writer dead
+ *  mid-write AND two racing ones. */
+export function updateCloudAt(path: string, fn: (c: Cloud) => Cloud): Cloud {
+  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+  const lock = `${path}.lock`;
+  for (const end = Date.now() + 15_000; ;) {
+    try { closeSync(openSync(lock, "wx", 0o600)); break; } catch (e: any) {
+      if (e.code !== "EEXIST") throw e;
+      try { if (Date.now() - statSync(lock).mtimeMs > 10_000) { unlinkSync(lock); continue; } } catch { continue; }
+      if (Date.now() > end) throw new Error(`${path} is locked by another Nomo command (delete ${lock} if none is running)`);
+      Atomics.wait(SLEEP, 0, 0, 20);
+    }
+  }
+  try {
+    let raw: Cloud = {};
+    try { raw = JSON.parse(readFileSync(path, "utf8")); } catch { /* none yet */ }
+    const next = fn(normalizeCloud(raw));
+    const tmp = `${path}.${process.pid}.tmp`;
+    writeFileSync(tmp, JSON.stringify(next) + "\n", { mode: 0o600 });
+    renameSync(tmp, path);
+    return next;
+  } finally { try { unlinkSync(lock); } catch { /* gone */ } }
 }
+const updateCloud = (fn: (c: Cloud) => Cloud): Cloud => updateCloudAt(CLOUD_PATH, fn);
 /** A random per-Mac id for omg's externalUserId (lists a user's boxes); no PII, minted once. */
 function macId(): string {
-  const c = loadCloud();
-  if (!c.macId) saveCloud({ ...c, macId: randomUUID() });
-  return loadCloud().macId!;
+  return updateCloud((c) => (c.macId ? c : { ...c, macId: randomUUID() })).macId!;
 }
 
 /** The create body: the baked template when the account has one, else the omg preset. The two are
@@ -757,7 +797,7 @@ async function ensureBox(key: string): Promise<string> {
     const hasBase = await api(key, "GET", `/templates/${BASE_TEMPLATE}/latest`).then(() => true, () => false);
     console.log(`Creating your cloud box (${hasBase ? `template ${BASE_TEMPLATE}` : "omg preset"})…`);
     sb = await api(key, "POST", "/sandboxes", createBody(hasBase, macId()));
-    saveCloud({ ...loadCloud(), sandboxId: sb.id, active: [] }); // the old box's sessions went with it
+    updateCloud((c) => ({ ...c, sandboxId: sb.id, active: [] })); // the old box's sessions went with it
   }
   return wakeBox(key, sb);
 }
@@ -799,6 +839,7 @@ export function statusScript(): string {
   return `${SHM_SWEEP}
 ${BOX_LIB}
 nomo_migrate
+nomo_prune
 n=0; echo "Sessions on the box:"
 for f in "$SD"/*; do
   [ -f "$f" ] || continue
@@ -974,7 +1015,7 @@ async function showPairing(omg: string, id: string, url: string, worker: string)
       if (out === "PAIRED") {
         result = resultPage("Paired ✓", `The box shows in Nomo as “${BOX_MACHINE_NAME}”. You can close this window.`);
         console.log(`Paired ✓ The box shows in Nomo as "${BOX_MACHINE_NAME}".`);
-        saveCloud({ ...loadCloud(), pairedTo: `${id} ${worker}` });
+        updateCloud((c) => ({ ...c, pairedTo: `${id} ${worker}` }));
         return;
       }
       if (out.startsWith("ENDED")) { console.log(`Pairing ended without a scan: ${out.slice(5).trim() || "(no detail)"}`); break; }
@@ -992,7 +1033,7 @@ async function showPairing(omg: string, id: string, url: string, worker: string)
 async function afterPair(omg: string, id: string, stdout: string, worker: string): Promise<void> {
   const { url, rest } = takePairUrl(stdout);
   const paired = /^NOMO_PAIRED$/m.test(rest);
-  saveCloud({ ...loadCloud(), pairedTo: paired ? `${id} ${worker}` : undefined });
+  updateCloud((c) => ({ ...c, pairedTo: paired ? `${id} ${worker}` : undefined }));
   if (!paired && process.env.NOMO_HANDOFF_HELPER) {
     // Never a QR on an unattended Mac: the box runs the session, but the phone can't see it until paired.
     throw new Error(`the session started on box ${id}, but the box needs pairing, so your phone can't see it. Pair it from a terminal: ${q(process.execPath)} ${q(SELF)} --pair`);
@@ -1239,7 +1280,7 @@ async function back(omg: string, args: Map<string, string | true>): Promise<void
   }
   console.log(`Pulled the box's work into ${backup}`);
   // Its work is home: drop the pack and the marker; the box sleeps only when no other session runs.
-  const done = await exec(omg, id, `${boxPrelude(uuid)}\nrm -f ${backPrefix(uuid)}-* "$SD/"${q(uuid)}\n${LEFT_LINE}`).catch(() => undefined);
+  const done = await exec(omg, id, `${boxPrelude(uuid)}\nrm -f ${backPrefix(uuid)}-* "$SD/"${q(uuid)}\n[ "$(head -c 64 ${BOX_CURRENT} 2>/dev/null)" != ${q(uuid)} ] || rm -f ${BOX_CURRENT}\n${LEFT_LINE}`).catch(() => undefined);
   const left = parseLeft(done?.stdout ?? "");
   if (left === 0) await sleepBox(omg, { id, status: "running" });
   else console.log(left ? `The box stays awake for ${left} other running session(s).` : "The box sleeps once no session runs on it.");
@@ -1358,9 +1399,10 @@ async function back(omg: string, args: Map<string, string | true>): Promise<void
   }
   process.off("SIGINT", onSignal).off("SIGTERM", onSignal);
 
-  const c = loadCloud();
-  const { [uuid]: _done, ...sessions } = c.sessions ?? {};
-  saveCloud({ ...c, sessions, active: (c.active ?? []).filter((s) => s !== uuid) });
+  updateCloud((c) => {
+    const { [uuid]: _done, ...sessions } = c.sessions ?? {};
+    return { ...c, sessions, active: (c.active ?? []).filter((s) => s !== uuid) };
+  });
 
   // 5. Resume here.
   let parked = readPark(uuid);
@@ -1601,7 +1643,7 @@ async function main(): Promise<void> {
       return;
     }
     console.log(`Box ${sb.id}: ${sb.status}${sb.keepAwakeUntil ? `, keep-awake until ${sb.keepAwakeUntil}` : ""}`);
-    const r = await exec(omg, sb.id, statusScript());
+    const r = await exec(omg, sb.id, statusScript(), { NOMO_KNOWN: (cloud.active ?? []).join(" ") });
     const [sessions, nomo = ""] = (r.stdout ?? "").split(/^NOMO_STATUS_SPLIT$\n?/m);
     process.stdout.write(sessions); // the box's sessions first: id, running/stopped, root
     console.log((cloud.active ?? []).length ? `On record on this Mac (not brought back yet):\n${listActive(cloud)}` : "On record on this Mac: none.");
@@ -1634,6 +1676,7 @@ async function main(): Promise<void> {
     ANTHROPIC_API_KEY: "",
     CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1",
     NOMO_WORKER_URL: worker,
+    NOMO_KNOWN: (loadCloud().active ?? []).join(" "), // nomo_prune: what this Mac has not brought back yet
     ...plan.gitUser,
     ...(args.has("--force") ? { NOMO_FORCE: "1" } : {}),
   });
@@ -1645,9 +1688,9 @@ async function main(): Promise<void> {
     throw new Error(`box start failed (exit ${r.exitCode}):\n${pane.slice(-2000)}\n${(r.stderr ?? "").slice(-2000)}`);
   }
   await api(omg, "POST", `/sandboxes/${id}/extend`, { seconds: KEEPALIVE_S }).catch(() => {}); // the in-VM loop renews after this
-  const c = loadCloud();
-  const active = [...(c.active ?? []).filter((s) => s !== plan.uuid), plan.uuid];
-  saveCloud({ ...c, active, sessions: { ...c.sessions, [plan.uuid]: plan.snap } });
+  const { active = [] } = updateCloud((c) => ({
+    ...c, active: [...(c.active ?? []).filter((s) => s !== plan.uuid), plan.uuid], sessions: { ...c.sessions, [plan.uuid]: plan.snap },
+  }));
 
   console.log(pane.trimEnd().split("\n").slice(-15).join("\n"));
   console.log(`\nSession ${plan.uuid} is running on cloud box ${id} (tmux session "${tmuxName(plan.uuid)}"${active.length > 1 ? `; ${active.length} sessions on record` : ""}).`);

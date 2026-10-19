@@ -20,7 +20,7 @@ import { BACK_FILES, backPackScript, backStopScript, backWaitScript, sessionGuar
 import { boxIdle } from "../core/cloud-back";
 import { packList } from "./handoff";
 import {
-  build, id12, admitScript, ANY_SESSION, BOX_MAX_SESSIONS, backPrefix, boxPrelude, busyMessage, hereSession, keepaliveLoop, launchLine, normalizeCloud,
+  build, id12, updateCloudAt, admitScript, ANY_SESSION, BOX_MAX_SESSIONS, backPrefix, boxPrelude, busyMessage, hereSession, keepaliveLoop, launchLine, normalizeCloud,
   pickSession, shmEnvFile, statusScript, stopOne, tmuxName, writeMarker,
 } from "./handoff";
 
@@ -734,6 +734,42 @@ exec perl -MFcntl=:flock -e 'open(my $f, ">&=", $ARGV[0]) or die "fd"; flock($f,
     expect(existsSync(join(b.d, "root/.nomo-current"))).toBe(false);
     expect(existsSync(join(b.d, "root/.nomo-sessions", L))).toBe(false);
     expect(b.run(backWaitScript(L, "-p-legacy")).stdout).toContain("NOMO_OTHER");
+  });
+
+  test("a stale box marker (not running, not on the Mac's record) is dropped instead of blocking its folder", () => {
+    const b = fakeBox();
+    mkdirSync(join(b.d, "root/.nomo-sessions"), { recursive: true });
+    writeFileSync(join(b.d, "root/.nomo-sessions", L), `${b.boxRoot("ghost")}\nnomo\n`);
+    expect(b.handOff(A, "ghost").stdout).toContain(`NOMO_SAME_ROOT=${L}`);                // no record given: kept
+    expect(b.handOff(A, "ghost", { NOMO_KNOWN: L }).stdout).toContain(`NOMO_SAME_ROOT=${L}`); // still on the Mac's record
+    expect(b.run(statusScript(), { NOMO_KNOWN: B }).stdout).toContain(`Dropped the box's stale record of session ${L}`);
+    writeFileSync(join(b.d, "root/.nomo-sessions", L), `${b.boxRoot("ghost")}\nnomo\n`);
+    const r = b.handOff(A, "ghost", { NOMO_KNOWN: "" });
+    expect(r.code).toBe(0);
+    expect(r.stdout).toContain(`Dropped the box's stale record of session ${L}`);
+    // a running session or one mid-handoff is never pruned
+    writeFileSync(join(b.d, "root/.nomo-sessions", C), "/c\nnomo-c\n");
+    writeFileSync(join(b.d, "root/.nomo-sessions", ".claim-" + C), "");
+    expect(b.run(statusScript(), { NOMO_KNOWN: "" }).stdout).not.toContain("Dropped");
+    expect(existsSync(join(b.d, "root/.nomo-sessions", A))).toBe(true);
+  });
+
+  test("cloud.json writes are locked read-modify-writes: two concurrent writers both persist", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "nomo-cloud-")), path = join(dir, "cloud.json");
+    const writer = (tag: string) => new Promise<number>((res) => {
+      const code = `import { updateCloudAt } from ${JSON.stringify(join(import.meta.dir, "handoff.ts"))};
+for (let i = 0; i < 25; i++) {
+  const id = "${tag}" + String(i).padStart(4, "0") + "-1111-4222-8333-444455556666";
+  updateCloudAt(${JSON.stringify(path)}, (c) => ({ ...c, active: [...(c.active ?? []), id], sessions: { ...c.sessions, [id]: { root: "/" + id } } }));
+}`;
+      spawn(process.execPath, ["-e", code], { stdio: "ignore" }).on("exit", (c) => res(c ?? 1));
+    });
+    expect(await Promise.all([writer("aaaa"), writer("bbbb")])).toEqual([0, 0]);
+    const c = JSON.parse(readFileSync(path, "utf8"));
+    expect(c.active.length).toBe(50);
+    expect(Object.keys(c.sessions).length).toBe(50);
+    expect(existsSync(`${path}.lock`)).toBe(false);
+    expect(updateCloudAt(path, (x) => x).active?.length).toBe(50);
   });
 
   test("cloud.json: a legacy `current` migrates to `active`; garbage ids are dropped", () => {

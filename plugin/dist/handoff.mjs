@@ -3,7 +3,7 @@ var __require = /* @__PURE__ */ createRequire(import.meta.url);
 
 // src/entries/handoff.ts
 import { execFileSync as execFileSync5, spawn as spawn2 } from "node:child_process";
-import { existsSync as existsSync5, lstatSync as lstatSync2, mkdirSync as mkdirSync3, mkdtempSync as mkdtempSync2, openSync as openSync2, readdirSync as readdirSync3, readFileSync as readFileSync6, realpathSync as realpathSync2, rmSync, statSync as statSync3, writeFileSync as writeFileSync4 } from "node:fs";
+import { closeSync as closeSync2, existsSync as existsSync5, lstatSync as lstatSync2, mkdirSync as mkdirSync3, mkdtempSync as mkdtempSync2, openSync as openSync2, readdirSync as readdirSync3, readFileSync as readFileSync6, realpathSync as realpathSync2, renameSync as renameSync3, rmSync, statSync as statSync3, unlinkSync as unlinkSync3, writeFileSync as writeFileSync4 } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { dirname as dirname3, join as join6, relative, sep as sep2 } from "node:path";
@@ -384,7 +384,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "2.3.30";
+var PLUGIN_VERSION = "2.3.31";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -4694,7 +4694,19 @@ nomo_migrate() {
   rm -f ${BOX_CURRENT}
   return 0
 }
-nomo_live() { local f; for f in "$SD"/*; do [ -f "$f" ] || continue; nomo_t "\${f##*/}"; if nomo_alive "$T"; then printf '%s\\n' "\${f##*/}"; fi; done; return 0; }`;
+nomo_live() { local f; for f in "$SD"/*; do [ -f "$f" ] || continue; nomo_t "\${f##*/}"; if nomo_alive "$T"; then printf '%s\\n' "\${f##*/}"; fi; done; return 0; }
+nomo_prune() {
+  [ -n "\${NOMO_KNOWN+x}" ] || return 0
+  local f u T
+  for f in "$SD"/*; do
+    [ -f "$f" ] || continue; u=\${f##*/}
+    [ "$u" != "\${1:-}" ] && [ ! -f "$SD/.claim-$u" ] || continue
+    case " $NOMO_KNOWN " in *" $u "*) continue ;; esac
+    nomo_t "$u"; if command -v tmux >/dev/null && nomo_alive "$T"; then continue; fi
+    rm -f "$f"; echo "Dropped the box's stale record of session $u (not running, not on this Mac's record: brought back already)."
+  done
+  return 0
+}`;
 var boxPrelude = (uuid) => `${SHM_SWEEP}
 ${BOX_LIB}
 nomo_migrate
@@ -4720,11 +4732,12 @@ if command -v tmux >/dev/null && nomo_alive "$T"; then
   if [ "\${NOMO_FORCE:-}" != 1 ]; then echo "NOMO_BUSY: session ${uuid} is already running on this box"; exit 3; fi
   tmux kill-session -t "=$T"
 fi
+find "$SD" -maxdepth 1 -name '.claim-*' -mmin +15 -delete 2>/dev/null || true
+nomo_prune ${u}
 for f in "$SD"/*; do
   [ -f "$f" ] && [ "\${f##*/}" != ${u} ] || continue
   if [ "$(head -1 "$f")" = ${q(root)} ]; then echo "NOMO_SAME_ROOT=\${f##*/}"; exit 3; fi
 done
-find "$SD" -maxdepth 1 -name '.claim-*' -mmin +15 -delete 2>/dev/null || true
 C=0
 for c in "$SD"/.claim-*; do
   [ -f "$c" ] && [ "\${c##*/.claim-}" != ${u} ] || continue
@@ -5209,16 +5222,50 @@ var loadCloud = () => {
     return {};
   }
 };
-function saveCloud(c) {
-  mkdirSync3(dirname3(CLOUD_PATH), { recursive: true });
-  writeFileSync4(CLOUD_PATH, JSON.stringify(c) + `
+var SLEEP = new Int32Array(new SharedArrayBuffer(4));
+function updateCloudAt(path, fn) {
+  mkdirSync3(dirname3(path), { recursive: true, mode: 448 });
+  const lock = `${path}.lock`;
+  for (const end = Date.now() + 15000;; ) {
+    try {
+      closeSync2(openSync2(lock, "wx", 384));
+      break;
+    } catch (e) {
+      if (e.code !== "EEXIST")
+        throw e;
+      try {
+        if (Date.now() - statSync3(lock).mtimeMs > 1e4) {
+          unlinkSync3(lock);
+          continue;
+        }
+      } catch {
+        continue;
+      }
+      if (Date.now() > end)
+        throw new Error(`${path} is locked by another Nomo command (delete ${lock} if none is running)`);
+      Atomics.wait(SLEEP, 0, 0, 20);
+    }
+  }
+  try {
+    let raw = {};
+    try {
+      raw = JSON.parse(readFileSync6(path, "utf8"));
+    } catch {}
+    const next = fn(normalizeCloud(raw));
+    const tmp = `${path}.${process.pid}.tmp`;
+    writeFileSync4(tmp, JSON.stringify(next) + `
 `, { mode: 384 });
+    renameSync3(tmp, path);
+    return next;
+  } finally {
+    try {
+      unlinkSync3(lock);
+    } catch {}
+  }
 }
+var updateCloud = (fn) => updateCloudAt(CLOUD_PATH, fn);
 function macId() {
-  const c = loadCloud();
-  if (!c.macId)
-    saveCloud({ ...c, macId: randomUUID() });
-  return loadCloud().macId;
+  return updateCloud((c) => c.macId ? c : { ...c, macId: randomUUID() }).macId;
 }
 function createBody(hasBase, externalUserId) {
   return { ...hasBase ? { templateId: BASE_TEMPLATE } : { template: "omg" }, size: BOX_SIZE, externalUserId };
@@ -5244,7 +5291,7 @@ async function ensureBox(key) {
     const hasBase = await api(key, "GET", `/templates/${BASE_TEMPLATE}/latest`).then(() => true, () => false);
     console.log(`Creating your cloud box (${hasBase ? `template ${BASE_TEMPLATE}` : "omg preset"})…`);
     sb = await api(key, "POST", "/sandboxes", createBody(hasBase, macId()));
-    saveCloud({ ...loadCloud(), sandboxId: sb.id, active: [] });
+    updateCloud((c) => ({ ...c, sandboxId: sb.id, active: [] }));
   }
   return wakeBox(key, sb);
 }
@@ -5283,6 +5330,7 @@ function statusScript() {
   return `${SHM_SWEEP}
 ${BOX_LIB}
 nomo_migrate
+nomo_prune
 n=0; echo "Sessions on the box:"
 for f in "$SD"/*; do
   [ -f "$f" ] || continue
@@ -5445,7 +5493,7 @@ async function showPairing(omg, id, url, worker) {
       if (out === "PAIRED") {
         result = resultPage("Paired ✓", `The box shows in Nomo as “${BOX_MACHINE_NAME}”. You can close this window.`);
         console.log(`Paired ✓ The box shows in Nomo as "${BOX_MACHINE_NAME}".`);
-        saveCloud({ ...loadCloud(), pairedTo: `${id} ${worker}` });
+        updateCloud((c) => ({ ...c, pairedTo: `${id} ${worker}` }));
         return;
       }
       if (out.startsWith("ENDED")) {
@@ -5464,7 +5512,7 @@ async function showPairing(omg, id, url, worker) {
 async function afterPair(omg, id, stdout, worker) {
   const { url, rest } = takePairUrl(stdout);
   const paired = /^NOMO_PAIRED$/m.test(rest);
-  saveCloud({ ...loadCloud(), pairedTo: paired ? `${id} ${worker}` : undefined });
+  updateCloud((c) => ({ ...c, pairedTo: paired ? `${id} ${worker}` : undefined }));
   if (!paired && process.env.NOMO_HANDOFF_HELPER) {
     throw new Error(`the session started on box ${id}, but the box needs pairing, so your phone can't see it. Pair it from a terminal: ${q(process.execPath)} ${q(SELF)} --pair`);
   }
@@ -5685,6 +5733,7 @@ Interrupted (${sig}) while ${phase}.
   console.log(`Pulled the box's work into ${backup}`);
   const done = await exec(omg, id, `${boxPrelude(uuid)}
 rm -f ${backPrefix(uuid)}-* "$SD/"${q(uuid)}
+[ "$(head -c 64 ${BOX_CURRENT} 2>/dev/null)" != ${q(uuid)} ] || rm -f ${BOX_CURRENT}
 ${LEFT_LINE}`).catch(() => {
     return;
   });
@@ -5824,9 +5873,10 @@ The conversation itself is back: cd ${q(cwd)} && claude --resume ${resumeId}`);
     }
   }
   process.off("SIGINT", onSignal).off("SIGTERM", onSignal);
-  const c = loadCloud();
-  const { [uuid]: _done, ...sessions } = c.sessions ?? {};
-  saveCloud({ ...c, sessions, active: (c.active ?? []).filter((s) => s !== uuid) });
+  updateCloud((c) => {
+    const { [uuid]: _done, ...sessions } = c.sessions ?? {};
+    return { ...c, sessions, active: (c.active ?? []).filter((s) => s !== uuid) };
+  });
   let parked = readPark(uuid);
   if (sameWindow && stagedThisRun && parked?.state !== "landing" && parked?.state !== "back" && existsSync5(stagedThisRun)) {
     stageLanding(uuid, { staged: stagedThisRun, target: join6(projDir, `${uuid}.jsonl`), resume: uuid }, startedAt);
@@ -6152,7 +6202,7 @@ nomo_pair`, { NOMO_WORKER_URL: worker });
       return;
     }
     console.log(`Box ${sb.id}: ${sb.status}${sb.keepAwakeUntil ? `, keep-awake until ${sb.keepAwakeUntil}` : ""}`);
-    const r = await exec(omg, sb.id, statusScript());
+    const r = await exec(omg, sb.id, statusScript(), { NOMO_KNOWN: (cloud.active ?? []).join(" ") });
     const [sessions, nomo = ""] = (r.stdout ?? "").split(/^NOMO_STATUS_SPLIT$\n?/m);
     process.stdout.write(sessions);
     console.log((cloud.active ?? []).length ? `On record on this Mac (not brought back yet):
@@ -6188,6 +6238,7 @@ Target worker: ${worker}`);
     ANTHROPIC_API_KEY: "",
     CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1",
     NOMO_WORKER_URL: worker,
+    NOMO_KNOWN: (loadCloud().active ?? []).join(" "),
     ...plan.gitUser,
     ...args.has("--force") ? { NOMO_FORCE: "1" } : {}
   });
@@ -6205,9 +6256,11 @@ ${pane.slice(-2000)}
 ${(r.stderr ?? "").slice(-2000)}`);
   }
   await api(omg, "POST", `/sandboxes/${id}/extend`, { seconds: KEEPALIVE_S }).catch(() => {});
-  const c = loadCloud();
-  const active = [...(c.active ?? []).filter((s) => s !== plan.uuid), plan.uuid];
-  saveCloud({ ...c, active, sessions: { ...c.sessions, [plan.uuid]: plan.snap } });
+  const { active = [] } = updateCloud((c) => ({
+    ...c,
+    active: [...(c.active ?? []).filter((s) => s !== plan.uuid), plan.uuid],
+    sessions: { ...c.sessions, [plan.uuid]: plan.snap }
+  }));
   console.log(pane.trimEnd().split(`
 `).slice(-15).join(`
 `));
@@ -6287,6 +6340,7 @@ export {
   targetWorker,
   tmuxName,
   toOpenRouterModel,
+  updateCloudAt,
   userLayerFiles,
   withReload,
   writeMarker
