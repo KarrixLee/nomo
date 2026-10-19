@@ -274,11 +274,13 @@ describe("one back at a time + the parked flag (NOM-93)", () => {
     expect(backLockHolder(A, dir, () => true)).toBe(999999);
   });
 
-  test("`parked` is on the body iff a moving/cloud/landing/back marker exists", () => {
+  test("`parked` is on the body iff a cloud/landing/back marker exists (never moving)", () => {
     const dir = tmp();
     const body = { v: 2, sessionId: A, op: "done" };
     expect(withParked(body, dir)).toEqual(body);
-    for (const state of ["moving", "cloud", "landing", "back"] as const) {
+    writePark(A, { state: "moving" }, dir);
+    expect(withParked(body, dir)).toEqual(body); // the last turn is still running on the Mac
+    for (const state of ["cloud", "landing", "back"] as const) {
       writePark(A, { state }, dir);
       expect(withParked(body, dir)).toEqual({ ...body, parked: true });
     }

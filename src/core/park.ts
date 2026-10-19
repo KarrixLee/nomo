@@ -184,12 +184,13 @@ export const parkWantsCommands = (p: Park | undefined): boolean =>
   p?.state === "moving" || p?.state === "cloud" || p?.state === "landing";
 
 /** The `parked` flag on an event body (a blind boolean, like op): set while the session has a park
- *  marker the phone acts on (moving/cloud/landing/back), so the worker keeps the row but out of the
+ *  marker in cloud/landing/back (never moving or elsewhere), so the worker keeps the row but out of the
  *  island. Omitted otherwise. */
 export function withParked<T extends object>(body: T, dir = PARK_DIR): T | (T & { parked: true }) {
   const id = (body as { sessionId?: unknown }).sessionId;
   const s = typeof id === "string" ? readPark(id, dir)?.state : undefined;
-  return s && s !== "elsewhere" ? { ...body, parked: true } : body;
+  // Never "moving": that window's last turn is still running here and must stay on the island.
+  return s === "cloud" || s === "landing" || s === "back" ? { ...body, parked: true } : body;
 }
 
 /** One --back per session, whoever starts it (phone, /nomo-cc:back, CLI): an O_EXCL lockfile holding

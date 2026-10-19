@@ -111,7 +111,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "2.3.33";
+var PLUGIN_VERSION = "2.3.34";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -3206,7 +3206,7 @@ var parkWantsCommands = (p) => p?.state === "moving" || p?.state === "cloud" || 
 function withParked(body, dir = PARK_DIR) {
   const id = body.sessionId;
   const s = typeof id === "string" ? readPark(id, dir)?.state : undefined;
-  return s && s !== "elsewhere" ? { ...body, parked: true } : body;
+  return s === "cloud" || s === "landing" || s === "back" ? { ...body, parked: true } : body;
 }
 var BACK_LOCK_DIR = `${CC_DIR}/cloud-back`;
 var backLockFile = (id, dir) => join3(dir, `${id.slice(0, 12)}.lock`);
