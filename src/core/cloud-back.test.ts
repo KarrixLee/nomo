@@ -161,6 +161,18 @@ describe("transcriptAction", () => {
     const intr = JSON.stringify({ type: "user", message: { content: [{ type: "text", text: "[Request interrupted by user]" }] } }) + "\n";
     expect(transcriptAction(snap, Buffer.concat([handed, Buffer.from(rows + intr + plain)]), boxed)).toBe("fork");
   });
+  test("a built-in local command (/model) in the parked window is not a Mac turn → replace", () => {
+    const model = [
+      { type: "user", isMeta: true, message: { role: "user", content: "<local-command-caveat>The command below was run directly in Claude Code, not sent to you as a request.</local-command-caveat>" } },
+      { type: "user", message: { role: "user", content: "<command-name>/model</command-name>\n<command-message>model</command-message>\n<command-args>claude-haiku-5-5</command-args>" } },
+      { type: "user", message: { role: "user", content: "<local-command-stdout>Set model to `Haiku 5.5` and saved as your default for new sessions</local-command-stdout>" } },
+    ].map((r) => JSON.stringify(r)).join("\n") + "\n";
+    expect(transcriptAction(snap, Buffer.concat([handed, Buffer.from(model)]), boxed)).toBe("replace");
+    // A model reply after it, or a custom command the model answers, is still a Mac turn.
+    expect(transcriptAction(snap, Buffer.concat([handed, Buffer.from(model + '{"type":"assistant"}\n')]), boxed)).toBe("fork");
+    const custom = '{"type":"user","message":{"content":"<command-name>/my-cmd</command-name>"}}\n{"type":"assistant"}\n';
+    expect(transcriptAction(snap, Buffer.concat([handed, Buffer.from(model + custom)]), boxed)).toBe("fork");
+  });
   test("a Mac turn after parking (a user skill, a path prompt) forks, even next to a back turn", () => {
     const skill = '{"type":"user","message":{"content":"<command-name>/my-skill</command-name>"}}\n{"type":"assistant"}\n';
     const back = '{"type":"user","message":{"content":"<command-name>/nomo-cc:back</command-name>"}}\n{"type":"assistant"}\n';

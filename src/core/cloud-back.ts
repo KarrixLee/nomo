@@ -139,7 +139,7 @@ export type TranscriptAction = "corrupt" | "same" | "replace" | "fork";
  *  `<command-name>/nomo-cc:…` wrapper); a shape Claude Code changes makes it count as a real turn (fork,
  *  never a silent replace). */
 export function macDiverged(appended: string): boolean {
-  let nomoTurn = false, bodyNext = false;
+  let nomoTurn = false, bodyNext = false, localNext = false;
   for (const l of appended.split("\n")) {
     if (!l.trim()) continue;
     let row: any;
@@ -149,6 +149,15 @@ export function macDiverged(appended: string): boolean {
     if (t !== "user" && t !== "assistant" && t !== "attachment") continue;
     const c = row.message?.content;
     const text = typeof c === "string" ? c : Array.isArray(c) ? c.map((b: any) => (b?.type === "text" ? b.text : "")).join("") : "";
+    // A built-in local command (/model, …) the user ran between turns: a caveat meta line, the
+    // `<command-name>` line, its stdout/stderr, and no model reply. None of it is a turn; a reply after it is.
+    if (t === "user") {
+      const lead = text.trimStart();
+      if (row.isMeta && lead.startsWith("<local-command-caveat>")) { localNext = true; continue; }
+      if (lead.startsWith("<local-command-stdout>") || lead.startsWith("<local-command-stderr>")) { nomoTurn = false; continue; }
+      if (localNext && !row.isMeta && text.includes("<command-name>")) { localNext = false; nomoTurn = false; continue; }
+    }
+    localNext = false;
     // A turn opener is a real prompt only: not a tool_result, not an interrupt marker (both belong to the
     // turn they end), not isMeta, not the expanded command body Claude Code writes right after a
     // `<command-name>` line.

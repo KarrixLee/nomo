@@ -3628,7 +3628,7 @@ function decideCode(snap, mac, box) {
   return same ? "apply" : "branch";
 }
 function macDiverged(appended) {
-  let nomoTurn = false, bodyNext = false;
+  let nomoTurn = false, bodyNext = false, localNext = false;
   for (const l of appended.split(`
 `)) {
     if (!l.trim())
@@ -3646,6 +3646,23 @@ function macDiverged(appended) {
       continue;
     const c = row.message?.content;
     const text = typeof c === "string" ? c : Array.isArray(c) ? c.map((b) => b?.type === "text" ? b.text : "").join("") : "";
+    if (t === "user") {
+      const lead = text.trimStart();
+      if (row.isMeta && lead.startsWith("<local-command-caveat>")) {
+        localNext = true;
+        continue;
+      }
+      if (lead.startsWith("<local-command-stdout>") || lead.startsWith("<local-command-stderr>")) {
+        nomoTurn = false;
+        continue;
+      }
+      if (localNext && !row.isMeta && text.includes("<command-name>")) {
+        localNext = false;
+        nomoTurn = false;
+        continue;
+      }
+    }
+    localNext = false;
     const opens = t === "user" && !row.isMeta && !bodyNext && !(Array.isArray(c) && c.some((b) => b?.type === "tool_result")) && !text.trimStart().startsWith("[Request interrupted by user");
     if (t === "user" && bodyNext && !(Array.isArray(c) && c.some((b) => b?.type === "tool_result")))
       bodyNext = false;
