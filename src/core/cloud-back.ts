@@ -131,16 +131,32 @@ export function decideCode(snap: GitState | undefined, mac: GitState, box: BoxCo
 
 export type TranscriptAction = "corrupt" | "same" | "replace" | "fork";
 
+/** Lines a parked Mac window appends after the handoff without the conversation moving on: block notices
+ *  (system/informational), turn bookkeeping, titles. Anything unparseable, untyped, or a user/assistant/
+ *  attachment line is a real Mac turn. */
+export function onlyMeta(appended: string): boolean {
+  return appended.split("\n").filter((l) => l.trim()).every((l) => {
+    try {
+      const t = JSON.parse(l)?.type;
+      return typeof t === "string" && t !== "user" && t !== "assistant" && t !== "attachment";
+    } catch { return false; }
+  });
+}
+
 /** corrupt: the box copy does not extend what was handed off (keep it in the backup only). same: the
- *  box added nothing. replace: the Mac copy is the handed-off one (or missing) → install the box copy.
- *  fork: the Mac appended after the handoff → install the box copy under a NEW id, Mac copy untouched. */
-export function transcriptAction(snap: { tBytes: number; tSha: string } | undefined, mac: Buffer | undefined, box: Buffer): TranscriptAction {
+ *  box added nothing. replace: the Mac copy is the handed-off one (or missing, or only meta was appended;
+ *  or `sameWindow`: the back runs in the parked window itself, whose own turns are its back command) →
+ *  install the box copy. fork: the Mac appended a real turn after the handoff → install the box copy
+ *  under a NEW id, Mac copy untouched. */
+export function transcriptAction(snap: { tBytes: number; tSha: string } | undefined, mac: Buffer | undefined, box: Buffer, sameWindow = false): TranscriptAction {
   if (snap) {
     // A rerun after a partial --back already installed this exact copy: nothing to do, never a fork.
     if (mac?.equals(box)) return "same";
     if (box.length < snap.tBytes || sha256(box.subarray(0, snap.tBytes)) !== snap.tSha) return "corrupt";
     if (box.length === snap.tBytes) return "same";
-    if (!mac || (mac.length === snap.tBytes && sha256(mac) === snap.tSha)) return "replace";
+    if (!mac) return "replace";
+    const macHanded = mac.length >= snap.tBytes && sha256(mac.subarray(0, snap.tBytes)) === snap.tSha;
+    if (macHanded && (sameWindow || onlyMeta(mac.subarray(snap.tBytes).toString("utf8")))) return "replace";
     return "fork";
   }
   if (!mac) return "replace";

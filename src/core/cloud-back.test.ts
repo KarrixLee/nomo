@@ -116,6 +116,19 @@ describe("transcriptAction", () => {
   test("rerun after a partial --back (Mac already holds the box copy) → same, never a fork", () => {
     expect(transcriptAction(snap, boxed, boxed)).toBe("same");
   });
+  test("a parked window's block notices and turn bookkeeping are not a Mac turn → replace", () => {
+    const meta = ['{"type":"system","subtype":"informational","content":"This session is in the cloud"}', '{"type":"last-prompt"}', '{"type":"system","subtype":"turn_duration"}', ""].join("\n");
+    expect(transcriptAction(snap, Buffer.concat([handed, Buffer.from(meta)]), boxed)).toBe("replace");
+  });
+  test("a real Mac turn (or an unreadable line) after the handoff still forks", () => {
+    expect(transcriptAction(snap, Buffer.concat([handed, Buffer.from('{"type":"system","subtype":"informational"}\n{"type":"user"}\n')]), boxed)).toBe("fork");
+    expect(transcriptAction(snap, Buffer.concat([handed, Buffer.from("{torn")]), boxed)).toBe("fork");
+  });
+  test("same window: its own back turn does not count, but a rewritten prefix still forks", () => {
+    const mine = Buffer.concat([handed, Buffer.from('{"type":"user"}\n{"type":"assistant"}\n')]);
+    expect(transcriptAction(snap, mine, boxed, true)).toBe("replace");
+    expect(transcriptAction(snap, Buffer.from('{"z":9}\n{"type":"user"}\n'), boxed, true)).toBe("fork");
+  });
 });
 
 describe("mergeMemory", () => {

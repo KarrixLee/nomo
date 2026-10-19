@@ -2,20 +2,22 @@
 //
 // Copying the transcript right away would cut it mid-turn (the Bash tool_use running this has no result
 // yet), and the Mac copy would keep growing (a later --back then forks) and keep running next to the
-// box's. So the command only does a fast local preflight (no box contact) and starts a DETACHED helper
-// that waits for this session's `claude` process to exit, then runs the normal handoff for that one
-// session id. One helper at a time (handoff-pending.json); `cancel` kills it while it is still waiting.
+// box's. So the command only does a fast local preflight (no box contact), parks the window (core/park.ts:
+// plain prompts are blocked from here on) and starts a DETACHED helper that waits for this turn to end
+// (the park marker's turnEndedAt, stamped by the Stop hook) or the `claude` process to exit, then runs the
+// normal handoff for that one session id. One helper at a time (handoff-pending.json); `cancel` kills it while it is still waiting.
 //
 // Box pairing shows a QR, which a detached helper must not do: a box not recorded as paired to the
 // target worker (cloud.json `pairedTo`, written by handoff.ts on every pairing it sees succeed) is
 // refused up front with the terminal command instead.
 
 import { appendFileSync, closeSync, fstatSync, linkSync, openSync, readFileSync, readSync, unlinkSync, writeFileSync } from "node:fs";
+import { clearPark, readPark, writePark } from "./park";
 import { CC_DIR } from "./shared";
 
 export const PENDING_PATH = `${CC_DIR}/handoff-pending.json`;
 export const LATER_LOG = `${CC_DIR}/handoff.log`;
-/** Give up if the Mac session is still open after this long. */
+/** Give up if this turn has not ended (nor the session quit) after this long. */
 export const LATER_CAP_MS = 30 * 60_000;
 const POLL_MS = 2000;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -149,12 +151,13 @@ export function claimPending(d: PendingDeps, p: Pending): boolean {
   }
 }
 
-export function cancelPending(d: PendingDeps & { kill: (pid: number) => void; log?: string }): string {
+export function cancelPending(d: PendingDeps & { kill: (pid: number) => void; log?: string; parkDir?: string }): string {
   const p = livePending(d);
   if (!p) return "No handoff is waiting. Nothing to cancel.";
   if (p.state === "handing-off") return `Too late to cancel: session ${p.session} is already moving to the cloud. Bring it back with /nomo-cc:back.`;
   d.kill(p.helperPid);
   try { unlinkSync(d.path); } catch { /* gone */ }
+  if (d.parkDir) clearPark(p.session, d.parkDir);
   if (d.log) try { appendFileSync(d.log, `[${new Date().toISOString()}] CANCELLED: session ${p.session} stays on this Mac.\n`); } catch { /* status only */ }
   return `Cancelled. Session ${p.session} stays on this Mac.`;
 }
@@ -191,37 +194,48 @@ export interface WaitDeps {
   notify: (text: string) => void;
   capMs?: number;
   selfPid?: number;
+  /** The park marker folder (core/park.ts): turn-end trigger in, cloud/cleared out. Omitted = no park. */
+  parkDir?: string;
 }
 
-/** The detached helper: wait for the Mac session to exit (capped), then hand it off. Its last log line
+/** The detached helper: wait for this turn to end or the Mac session to exit (capped), then hand it off. Its last log line
  *  starts DONE: or FAILED: (what `/nomo-cc:handoff status` shows once the helper is gone). */
 export async function waitThenHandoff(p: Pending, d: WaitDeps): Promise<number> {
   const self = d.selfPid ?? process.pid;
   const release = (): void => {
     if (readPending(d.pending)?.helperPid === self) try { unlinkSync(d.pending); } catch { /* gone */ }
   };
+  const unpark = (): void => { if (d.parkDir) try { clearPark(p.session, d.parkDir); } catch { /* fail open */ } };
+  const turnEnded = (): boolean => !!d.parkDir && !!readPark(p.session, d.parkDir)?.turnEndedAt;
   const end = d.now() + (d.capMs ?? LATER_CAP_MS);
-  d.log(`Waiting for Claude Code (pid ${p.claudePid}) to quit, then moving session ${p.session}.`);
-  while (d.alive(p.claudePid)) {
+  d.log(`Waiting for this turn to end (or Claude Code, pid ${p.claudePid}, to quit), then moving session ${p.session}.`);
+  let ended = false;
+  while (d.alive(p.claudePid) && !(ended = turnEnded())) {
     if (d.now() >= end) {
       release();
-      d.log(`FAILED: Claude Code was still open after ${Math.round((d.capMs ?? LATER_CAP_MS) / 60_000)} min; nothing was moved. Run /nomo-cc:handoff again.`);
-      d.notify("Handoff gave up: Claude Code was not quit in time. Nothing was moved.");
+      unpark();
+      d.log(`FAILED: the turn was still running after ${Math.round((d.capMs ?? LATER_CAP_MS) / 60_000)} min; nothing was moved. Run /nomo-cc:handoff again.`);
+      d.notify("Handoff gave up: the turn did not end in time. Nothing was moved.");
       return 1;
     }
     await d.sleep(POLL_MS);
   }
+  // ponytail: one poll's settle for the lines Claude Code writes right after Stop (turn_duration…); they
+  // are meta, so a late one only lands on the Mac copy, where --back ignores it (transcriptAction).
+  if (ended) await d.sleep(POLL_MS);
   try { writeFileSync(d.pending, JSON.stringify({ ...p, state: "handing-off" }) + "\n", { mode: 0o600 }); } catch { /* status only */ }
-  d.log(`Claude Code closed. Handing off session ${p.session}…`);
+  d.log(`${ended ? "The turn ended" : "Claude Code closed"}. Handing off session ${p.session}…`);
   const before = d.readCloud();
   let code: number, why: string | undefined;
   try { code = await d.runHandoff(); } catch (e) { why = e instanceof Error ? e.message : String(e); code = 1; }
   if (code === 0 && !handoffLanded(before, d.readCloud(), p.session)) { why = NOTHING_RAN_MSG; code = 1; }
   release();
   if (code === 0) {
+    if (d.parkDir) try { writePark(p.session, { state: "cloud" }, d.parkDir); } catch { /* the gate fails open */ }
     d.log(`DONE: session ${p.session} is running in the cloud.`);
     d.notify("Your session is now running in the cloud.");
   } else {
+    unpark();
     d.log(`FAILED: ${why ?? `the handoff exited ${code}; see the lines above`}. Your Mac copy is untouched.`);
     d.notify("Handoff failed. Your Mac copy is untouched. Check /nomo-cc:handoff status.");
   }
@@ -233,7 +247,7 @@ export function laterStatus(d: PendingDeps & { log: string }): string {
   const p = livePending(d);
   if (p) {
     return p.state === "waiting"
-      ? `Waiting for Claude Code (pid ${p.claudePid}) to quit, then moving session ${p.session}. Log: ${d.log}`
+      ? `Waiting for this turn to end, then moving session ${p.session}. Log: ${d.log}`
       : `Moving session ${p.session} to the cloud now. Log: ${d.log}`;
   }
   let last = "";

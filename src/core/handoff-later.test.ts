@@ -5,6 +5,7 @@ import { join } from "node:path";
 import {
   cancelPending, claimPending, contextTokens, contextTokensOf, DEFAULT_THEN, GONE_MSG, parseLaterArg, sizeWarning, handoffArgv, handoffLanded, laterStatus, NOTHING_RAN_MSG, needsPairing, type Pending, readPending, resolveSession, waitThenHandoff, type WaitDeps,
 } from "./handoff-later";
+import { parkHook, readPark, writePark } from "./park";
 
 const A = "0a1b2c3d-1111-4222-8333-444455556666";
 const B = "9f8e7d6c-1111-4222-8333-444455556666";
@@ -173,7 +174,7 @@ describe("waitThenHandoff", () => {
   test("status shows the waiting helper, then the log's last line once it is gone", () => {
     const dir = tmp(), path = join(dir, "p.json"), log = join(dir, "h.log");
     writeFileSync(path, JSON.stringify(pending()));
-    expect(laterStatus({ path, isHelper: () => true, log })).toContain(`Waiting for Claude Code (pid 400) to quit, then moving session ${A}`);
+    expect(laterStatus({ path, isHelper: () => true, log })).toContain(`Waiting for this turn to end, then moving session ${A}`);
     writeFileSync(log, "x\n[t] DONE: session moved\n");
     expect(laterStatus({ path, isHelper: () => false, log })).toContain("Last: [t] DONE: session moved");
   });
@@ -242,5 +243,67 @@ describe("/nomo-cc:handoff grammar", () => {
     expect(claimPending({ path: f, isHelper: () => false }, pending({ message: "go on" }))).toBe(true);
     expect(readPending(f)?.message).toBe("go on");
     expect(statSync(f).mode & 0o777).toBe(0o600);
+  });
+});
+
+describe("park marker lifecycle (NOM-90)", () => {
+  function deps(path: string, parkDir: string, code = 0) {
+    const d = {
+      runs: 0, t: 0, lines: [] as string[],
+      cloud: {} as { current?: string; sessions?: Record<string, unknown> },
+      pending: path, selfPid: 500, capMs: 60_000, parkDir,
+      readCloud: () => d.cloud,
+      alive: () => true, // the window stays open: only the turn end can trigger
+      now: () => d.t,
+      sleep: async (ms: number) => {
+        d.t += ms;
+        if (d.t === 6000) parkHook({ session_id: A, hook_event_name: "Stop" }, parkDir); // the turn ends
+      },
+      runHandoff: async () => {
+        d.runs++;
+        expect(readPark(A, parkDir)?.state).toBe("moving");
+        if (code === 0) d.cloud = { current: A, sessions: { [A]: { sha: "x" } } };
+        return code;
+      },
+      log: (l: string) => d.lines.push(l),
+      notify: () => {},
+    };
+    return d;
+  }
+
+  test("armed (moving) → the turn ends → handed off → cloud", async () => {
+    const dir = tmp(), path = join(dir, "p.json"), parkDir = join(dir, "parked");
+    writePark(A, { state: "moving" }, parkDir);
+    const d = deps(path, parkDir);
+    expect(await waitThenHandoff(pending(), d)).toBe(0);
+    expect(d.runs).toBe(1);
+    expect(d.t).toBeLessThan(60_000);
+    expect(d.lines).toContain(`The turn ended. Handing off session ${A}…`);
+    expect(readPark(A, parkDir)?.state).toBe("cloud");
+  });
+
+  test("a failed move removes the marker", async () => {
+    const dir = tmp(), parkDir = join(dir, "parked");
+    writePark(A, { state: "moving" }, parkDir);
+    expect(await waitThenHandoff(pending(), deps(join(dir, "p.json"), parkDir, 1))).toBe(1);
+    expect(readPark(A, parkDir)).toBeUndefined();
+  });
+
+  test("giving up at the cap removes the marker", async () => {
+    const dir = tmp(), parkDir = join(dir, "parked");
+    writePark(A, { state: "moving" }, parkDir);
+    const d = deps(join(dir, "p.json"), parkDir);
+    d.sleep = async (ms: number) => { d.t += ms; }; // the turn never ends
+    expect(await waitThenHandoff(pending(), d)).toBe(1);
+    expect(d.runs).toBe(0);
+    expect(readPark(A, parkDir)).toBeUndefined();
+  });
+
+  test("cancel removes the marker", () => {
+    const dir = tmp(), path = join(dir, "p.json"), parkDir = join(dir, "parked");
+    writeFileSync(path, JSON.stringify(pending()));
+    writePark(A, { state: "moving" }, parkDir);
+    expect(cancelPending({ path, isHelper: () => true, kill: () => {}, parkDir })).toContain("Cancelled");
+    expect(readPark(A, parkDir)).toBeUndefined();
   });
 });

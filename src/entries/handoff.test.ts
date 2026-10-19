@@ -10,7 +10,7 @@ import {
   pubRawFromPkcs8, q, RELAY_PORT, resultPage, takePairUrl, toOpenRouterModel, withReload,
 } from "./handoff";
 import { RELAY_PORT as RELAY_LISTEN_PORT } from "./or-relay";
-import { readCapped } from "./handoff";
+import { readCapped, sameWindowBackLine } from "./handoff";
 import { FIRST_SKIPPED, FIRST_UNCONFIRMED, firstMessageScript, sendFirstMessage, sendResult, TYPE_FN } from "./handoff";
 import { BACK_FILES, backPackScript, backStopScript, backWaitScript, currentGuard, resumeCommand } from "./handoff";
 import { boxIdle } from "../core/cloud-back";
@@ -442,4 +442,8 @@ esac
     expect(argv).not.toContain("touch");
     expect(existsSync(join(d, "PWNED"))).toBe(false);
   });
+});
+
+test("/nomo-cc:back from the parked window ends with the /resume line", () => {
+  expect(sameWindowBackLine("0a1b2c3d-1111-4222-8333-444455556666")).toBe("Back. Type /resume 0a1b2c3d-1111-4222-8333-444455556666 to continue here.");
 });

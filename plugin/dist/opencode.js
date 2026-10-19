@@ -1,6 +1,6 @@
 // src/opencode/plugin.ts
 import { spawn as spawn2 } from "node:child_process";
-import { accessSync, constants, readFileSync as readFileSync2 } from "node:fs";
+import { accessSync, constants, readFileSync as readFileSync3 } from "node:fs";
 import { hostname as hostname3 } from "node:os";
 
 // src/core/hook.ts
@@ -81,7 +81,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "2.3.21";
+var PLUGIN_VERSION = "2.3.22";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -2468,6 +2468,94 @@ async function repairNotifyWiring(deps = {}) {
   }
 }
 
+// src/core/park.ts
+import { mkdirSync, readFileSync as readFileSync2, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { join as join3 } from "node:path";
+var PARK_DIR = `${CC_DIR}/parked`;
+var UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+var file = (dir, id) => UUID_RE.test(id) ? join3(dir, id) : undefined;
+function readPark(id, dir = PARK_DIR) {
+  const f = file(dir, id);
+  if (!f)
+    return;
+  try {
+    return JSON.parse(readFileSync2(f, "utf8"));
+  } catch {
+    return;
+  }
+}
+function writePark(id, p, dir = PARK_DIR) {
+  const f = file(dir, id);
+  if (!f)
+    return;
+  mkdirSync(dir, { recursive: true, mode: 448 });
+  const tmp = `${f}.${process.pid}.tmp`;
+  writeFileSync(tmp, JSON.stringify({ since: Date.now(), ...p }) + `
+`, { mode: 384 });
+  renameSync(tmp, f);
+}
+function clearPark(id, dir = PARK_DIR) {
+  const f = file(dir, id);
+  if (f)
+    try {
+      unlinkSync(f);
+    } catch {}
+}
+var reasonFor = (p, id) => {
+  switch (p.state) {
+    case "moving":
+      return "Moving to the cloud after this turn… (/nomo-cc:handoff cancel to stop)";
+    case "cloud":
+      return "This session is in the cloud — /nomo-cc:back to bring it home";
+    case "landing":
+      return `Coming back from the cloud… type /resume ${p.resume ?? id} once it says Back.`;
+    case "back":
+      return `Back. Type /resume ${p.resume ?? id} to continue here.`;
+  }
+};
+function land(id, p, dir) {
+  try {
+    if (p.staged && p.target)
+      renameSync(p.staged, p.target);
+  } catch {
+    clearPark(id, dir);
+    return;
+  }
+  const back = { state: "back", since: Date.now(), resume: p.resume };
+  writePark(id, back, dir);
+  return back;
+}
+var MOVING_STALE_MS = 35 * 60000;
+function parkHook(input, dir = PARK_DIR) {
+  try {
+    const { session_id: id, hook_event_name: event } = input;
+    if (typeof id !== "string")
+      return;
+    let p = readPark(id, dir);
+    if (p?.state === "moving" && Date.now() - p.since > MOVING_STALE_MS) {
+      clearPark(id, dir);
+      return;
+    }
+    if (!p)
+      return;
+    if (event === "UserPromptSubmit") {
+      if (typeof input.prompt === "string" && input.prompt.trimStart().startsWith("/"))
+        return;
+      if (p.state === "back")
+        clearPark(id, dir);
+      return JSON.stringify({ decision: "block", reason: reasonFor(p, id) });
+    }
+    const turnEnd = event === "Stop" || event === "StopFailure" || event === "SessionEnd";
+    if (p.state === "moving" && turnEnd && !p.turnEndedAt)
+      writePark(id, { ...p, turnEndedAt: Date.now() }, dir);
+    if (p.state === "landing" && (turnEnd || event === "SessionStart"))
+      p = land(id, p, dir);
+    if (p?.state === "back" && event === "SessionStart" && input.source === "resume")
+      clearPark(id, dir);
+  } catch {}
+  return;
+}
+
 // src/core/session-state.ts
 var STATE_HOLD_MAX_AGE_MS = 600000;
 var finite = (value) => typeof value === "number" && Number.isFinite(value);
@@ -2875,6 +2963,19 @@ async function runHook(agent) {
       return;
     if (typeof input.session_id !== "string" || input.session_id.length === 0)
       return;
+    const parkBlock = parkHook(input);
+    if (parkBlock) {
+      await new Promise((resolve) => {
+        process.stdout.on("error", () => resolve());
+        try {
+          process.stdout.write(`${parkBlock}
+`, () => resolve());
+        } catch {
+          resolve();
+        }
+      });
+      return;
+    }
     if (agent === "claude" && (typeof input.turn_id === "string" && input.turn_id.length > 0 || typeof input.transcript_path === "string" && input.transcript_path.includes("/.codex/"))) {
       agent = "codex";
     }
@@ -4931,7 +5032,7 @@ function resolveRuntime() {
   if (env && env.length > 0 && isExecutable(env))
     return env;
   try {
-    const cached = readFileSync2(`${CC_DIR}/runtime`, "utf8").trim();
+    const cached = readFileSync3(`${CC_DIR}/runtime`, "utf8").trim();
     if (cached.length > 0 && !cached.startsWith("NONE:") && isExecutable(cached))
       return cached;
   } catch {}

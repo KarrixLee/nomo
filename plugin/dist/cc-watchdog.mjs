@@ -3,7 +3,7 @@ var __require = /* @__PURE__ */ createRequire(import.meta.url);
 
 // src/entries/cc-watchdog.ts
 import { readdir as readdir4, readFile as readFile8, unlink as unlink4 } from "node:fs/promises";
-import { readFileSync as readFileSync2, statSync as statSync3, unlinkSync } from "node:fs";
+import { readFileSync as readFileSync3, statSync as statSync3, unlinkSync as unlinkSync2 } from "node:fs";
 import { hostname as hostname4 } from "node:os";
 import { basename as basename6 } from "node:path";
 
@@ -106,7 +106,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "2.3.21";
+var PLUGIN_VERSION = "2.3.22";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -5363,6 +5363,94 @@ async function repairNotifyWiring(deps = {}) {
   }
 }
 
+// src/core/park.ts
+import { mkdirSync, readFileSync as readFileSync2, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { join as join3 } from "node:path";
+var PARK_DIR = `${CC_DIR}/parked`;
+var UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+var file = (dir, id) => UUID_RE.test(id) ? join3(dir, id) : undefined;
+function readPark(id, dir = PARK_DIR) {
+  const f = file(dir, id);
+  if (!f)
+    return;
+  try {
+    return JSON.parse(readFileSync2(f, "utf8"));
+  } catch {
+    return;
+  }
+}
+function writePark(id, p, dir = PARK_DIR) {
+  const f = file(dir, id);
+  if (!f)
+    return;
+  mkdirSync(dir, { recursive: true, mode: 448 });
+  const tmp = `${f}.${process.pid}.tmp`;
+  writeFileSync(tmp, JSON.stringify({ since: Date.now(), ...p }) + `
+`, { mode: 384 });
+  renameSync(tmp, f);
+}
+function clearPark(id, dir = PARK_DIR) {
+  const f = file(dir, id);
+  if (f)
+    try {
+      unlinkSync(f);
+    } catch {}
+}
+var reasonFor = (p, id) => {
+  switch (p.state) {
+    case "moving":
+      return "Moving to the cloud after this turn… (/nomo-cc:handoff cancel to stop)";
+    case "cloud":
+      return "This session is in the cloud — /nomo-cc:back to bring it home";
+    case "landing":
+      return `Coming back from the cloud… type /resume ${p.resume ?? id} once it says Back.`;
+    case "back":
+      return `Back. Type /resume ${p.resume ?? id} to continue here.`;
+  }
+};
+function land(id, p, dir) {
+  try {
+    if (p.staged && p.target)
+      renameSync(p.staged, p.target);
+  } catch {
+    clearPark(id, dir);
+    return;
+  }
+  const back = { state: "back", since: Date.now(), resume: p.resume };
+  writePark(id, back, dir);
+  return back;
+}
+var MOVING_STALE_MS = 35 * 60000;
+function parkHook(input, dir = PARK_DIR) {
+  try {
+    const { session_id: id, hook_event_name: event } = input;
+    if (typeof id !== "string")
+      return;
+    let p = readPark(id, dir);
+    if (p?.state === "moving" && Date.now() - p.since > MOVING_STALE_MS) {
+      clearPark(id, dir);
+      return;
+    }
+    if (!p)
+      return;
+    if (event === "UserPromptSubmit") {
+      if (typeof input.prompt === "string" && input.prompt.trimStart().startsWith("/"))
+        return;
+      if (p.state === "back")
+        clearPark(id, dir);
+      return JSON.stringify({ decision: "block", reason: reasonFor(p, id) });
+    }
+    const turnEnd = event === "Stop" || event === "StopFailure" || event === "SessionEnd";
+    if (p.state === "moving" && turnEnd && !p.turnEndedAt)
+      writePark(id, { ...p, turnEndedAt: Date.now() }, dir);
+    if (p.state === "landing" && (turnEnd || event === "SessionStart"))
+      p = land(id, p, dir);
+    if (p?.state === "back" && event === "SessionStart" && input.source === "resume")
+      clearPark(id, dir);
+  } catch {}
+  return;
+}
+
 // src/core/hook.ts
 var TOOL_DETAIL = { ...claudeToolDetail, ...codexToolDetail };
 function sessionOrigin(input, ppid = process.ppid, command = pidCommand(ppid)) {
@@ -5754,6 +5842,19 @@ async function runHook(agent) {
       return;
     if (typeof input.session_id !== "string" || input.session_id.length === 0)
       return;
+    const parkBlock = parkHook(input);
+    if (parkBlock) {
+      await new Promise((resolve) => {
+        process.stdout.on("error", () => resolve());
+        try {
+          process.stdout.write(`${parkBlock}
+`, () => resolve());
+        } catch {
+          resolve();
+        }
+      });
+      return;
+    }
     if (agent === "claude" && (typeof input.turn_id === "string" && input.turn_id.length > 0 || typeof input.transcript_path === "string" && input.transcript_path.includes("/.codex/"))) {
       agent = "codex";
     }
@@ -8789,7 +8890,7 @@ function fileCursorStore(path = COMMAND_CURSOR_PATH) {
   return {
     load: (pairingId) => {
       try {
-        const c = JSON.parse(readFileSync2(path, "utf8"));
+        const c = JSON.parse(readFileSync3(path, "utf8"));
         return c.pairingId === pairingId && typeof c.cursor === "number" && Number.isFinite(c.cursor) ? c.cursor : 0;
       } catch {
         return 0;
@@ -10162,7 +10263,7 @@ function createBridgeSupervisor(deps = {}) {
 async function claimSingleInstance() {
   const build = watchdogBuildStamp();
   try {
-    const holder = parseWatchdogPidfile(readFileSync2(WATCHDOG_PID_PATH, "utf8"));
+    const holder = parseWatchdogPidfile(readFileSync3(WATCHDOG_PID_PATH, "utf8"));
     if (holder && holder.pid !== process.pid && watchdogHolderIsLive(holder.pid) && holder.version === PLUGIN_VERSION && !watchdogBuildDiffers(holder.build, build)) {
       return false;
     }
@@ -10173,7 +10274,7 @@ async function claimSingleInstance() {
 function isRightfulWatchdogOwner(deps = {}) {
   try {
     const pidPath = deps.pidPath ?? WATCHDOG_PID_PATH;
-    const holder = parseWatchdogPidfile((deps.readPidfile ?? (() => readFileSync2(pidPath, "utf8")))());
+    const holder = parseWatchdogPidfile((deps.readPidfile ?? (() => readFileSync3(pidPath, "utf8")))());
     return holder?.pid === (deps.pid ?? process.pid) && holder.version === (deps.version ?? PLUGIN_VERSION);
   } catch {
     return false;
@@ -10189,9 +10290,9 @@ function enforceWatchdogOwnership(shutdown, deps = {}) {
 }
 function releaseSingleInstance() {
   try {
-    const holder = parseWatchdogPidfile(readFileSync2(WATCHDOG_PID_PATH, "utf8"));
+    const holder = parseWatchdogPidfile(readFileSync3(WATCHDOG_PID_PATH, "utf8"));
     if (holder && holder.pid === process.pid)
-      unlinkSync(WATCHDOG_PID_PATH);
+      unlinkSync2(WATCHDOG_PID_PATH);
   } catch {}
 }
 function pendingPairingExpired(pending, now, fallbackDeadline) {
