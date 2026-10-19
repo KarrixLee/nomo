@@ -10,6 +10,8 @@ import {
   pubRawFromPkcs8, q, RELAY_PORT, resultPage, takePairUrl, toOpenRouterModel, withReload,
 } from "./handoff";
 import { RELAY_PORT as RELAY_LISTEN_PORT } from "./or-relay";
+import { BACK_FILES, backPackScript, backStopScript, backWaitScript, currentGuard, resumeCommand } from "./handoff";
+import { boxIdle } from "../core/cloud-back";
 
 describe("handoff pure logic", () => {
   test("cwd → Claude Code project dir name (every non-alphanumeric → -)", () => {
@@ -197,5 +199,74 @@ describe("handoff pure logic", () => {
     expect(re).toContain("NOMO_REPAIR: https://api.nomo.gg");
     expect(re).toContain(`dist/pair.mjs W=${stg}`);
     expect(runPair(null)).toContain("dist/pair.mjs W=https://api.nomo.gg");
+  });
+});
+
+describe("bring back (--back)", () => {
+  const U = "11111111-2222-3333-4444-555555555555";
+  const scripts = [backPackScript(U, "-tmp-proj", "/tmp/proj", true), backPackScript(U, "-tmp-proj", "/tmp/proj", false)];
+
+  test("the pack never reaches .claude.json, /dev/shm or cc-status (beyond the sweep and the excludes)", () => {
+    for (const s of scripts) {
+      expect(s.startsWith(SHM_SWEEP)).toBe(true);
+      const body = s.slice(SHM_SWEEP.length).replace(/--exclude '[^']*'/g, "");
+      for (const bad of [".claude.json", "/dev/shm", "cc-status", ".credentials"]) expect(body).not.toContain(bad);
+      expect(s).toContain("--exclude '.config/cc-status'");
+    }
+    expect([...BACK_FILES]).toEqual(["repo.bundle", "wip.patch", "untracked.tgz", "project.tgz", "folder.tgz"]);
+  });
+
+  test("every box script is valid bash", () => {
+    for (const s of [...scripts, backStopScript(U), backWaitScript(U, "-tmp-proj")]) execFileSync("bash", ["-n", "-c", s]);
+  });
+
+  test("--back --session X never stops a different session (unless --force)", () => {
+    // Checked first, whether or not tmux still runs: an exited A must not pack a later B at the same root.
+    for (const s of [backStopScript(U), backWaitScript(U, "-tmp-proj"), ...scripts]) {
+      expect(s.slice(SHM_SWEEP.length).trimStart().startsWith(currentGuard(U))).toBe(true);
+    }
+    expect(backStopScript(U)).not.toContain("rm -f /root/.nomo-current");
+    const f = join(mkdtempSync(join(tmpdir(), "nomo-cur-")), "cur");
+    const run = (env: Record<string, string> = {}) =>
+      execFileSync("bash", ["-c", `${currentGuard(U, f)}\necho NOMO_SAME`], { env: { PATH: process.env.PATH!, ...env } }).toString().trim();
+    expect(run()).toBe("NOMO_OTHER="); // nothing recorded (a pre-2.3.12 box)
+    writeFileSync(f, "99999999-2222-3333-4444-555555555555");
+    expect(run()).toBe("NOMO_OTHER=99999999-2222-3333-4444-555555555555");
+    expect(run({ NOMO_FORCE: "1" })).toBe("NOMO_SAME");
+    writeFileSync(f, U);
+    expect(run()).toBe("NOMO_SAME");
+    writeFileSync(f, "\x1b[2Jevil;rm -rf /");
+    expect(run()).toBe("NOMO_OTHER=2e-f");
+  });
+
+  test("boxIdle: Nomo's record wins; needsAttention asks the user; sessionStart asks the transcript", () => {
+    const end = JSON.stringify({ type: "assistant", message: { stop_reason: "end_turn" } });
+    const tool = JSON.stringify({ type: "assistant", message: { stop_reason: "tool_use" } });
+    expect(boxIdle({ lastEvent: "done", tail: "", quietS: 0 })).toBe("idle");
+    // A compact's SessionStart fires mid-turn: not idle on its own.
+    expect(boxIdle({ lastEvent: "sessionStart", tail: "", quietS: 99 })).toBe("busy");
+    expect(boxIdle({ lastEvent: "sessionStart", tail: tool, quietS: 99 })).toBe("busy");
+    expect(boxIdle({ lastEvent: "sessionStart", tail: end, quietS: 5 })).toBe("busy");
+    expect(boxIdle({ lastEvent: "sessionStart", tail: end, quietS: 20 })).toBe("idle");
+    expect(boxIdle({ lastEvent: "needsAttention", tail: "", quietS: 99 })).toBe("attention");
+    expect(boxIdle({ lastEvent: "working", tail: "", quietS: 99 })).toBe("busy");
+  });
+
+  test("boxIdle without a record: end_turn + meta only + 15s quiet; a torn tail is fine", () => {
+    const end = JSON.stringify({ type: "assistant", message: { stop_reason: "end_turn" } });
+    const tool = JSON.stringify({ type: "assistant", message: { stop_reason: "tool_use" } });
+    const meta = JSON.stringify({ type: "system", subtype: "stop_hook_summary" });
+    const user = JSON.stringify({ type: "user", message: { content: "next" } });
+    const torn = 'ant","message":{"stop_reason":"tool_use"}}';
+    expect(boxIdle({ tail: [torn, end, meta, ""].join("\n"), quietS: 20 })).toBe("idle");
+    expect(boxIdle({ tail: [torn, end].join("\n"), quietS: 5 })).toBe("busy");
+    expect(boxIdle({ tail: [end, user].join("\n"), quietS: 60 })).toBe("busy");
+    expect(boxIdle({ tail: [end, tool].join("\n"), quietS: 60 })).toBe("busy");
+    expect(boxIdle({ tail: [end, '{"type":"assis'].join("\n"), quietS: 60 })).toBe("idle");
+    expect(boxIdle({ tail: torn, quietS: 60 })).toBe("busy");
+  });
+
+  test("the resume line is one quoted exec", () => {
+    expect(resumeCommand("/tmp/it's here", U)).toBe(`cd '/tmp/it'\\''s here' && exec claude --resume ${U}`);
   });
 });
