@@ -80,12 +80,12 @@ import { b64url, type Bytes, fromB64url } from "../core/crypto";
 import { renderPairPage } from "../core/pair-page";
 import { buildPairURL, DEFAULT_WORKER_URL } from "../core/pair-url";
 import { normalizeModelId } from "../core/adapter";
-import { cloudReadiness, gitProbe, isSecretName, trackedSecretFiles } from "../core/readiness";
+import { cloudReadiness, gitProbe, isSecretName, setupSteps, trackedSecretFiles } from "../core/readiness";
 import { scanHandoff, secretSummary } from "../core/transcript-scan";
 import { backLockHolder, clearPark, cloudActive, moveResultFile, type MoveWhy, PARK_DIR, writeBackResult, writeMoveResult, readPark, releaseBackLock, stageLanding, takeBackLock, writePark } from "../core/park";
 import { atomicWrite, CC_DIR, macWorkerUrl, pidAlive, pidAncestors, pidCommand, readRecord, SESSIONS_DIR } from "../core/shared";
 import {
-  BOX_MAX_SESSIONS, cancelPending, claimPending, DEFAULT_THEN, EXIT_BOX_GONE, phoneMoveCheck, settleThenStamp, contextTokens, contextTokensOf, GONE_MSG, sizeWarning, TAIL_BYTES, handoffArgv, LATER_LOG, LATER_USAGE, laterStatus, transcriptSecretWarning, needsPairing, parseLaterArg, type Pending, PENDING_PATH, readPending, resolveSession, waitThenHandoff,
+  BOX_MAX_SESSIONS, cancelPending, claimPending, DEFAULT_THEN, EXIT_BOX_GONE, phoneMoveCheck, settleThenStamp, contextTokens, contextTokensOf, GONE_MSG, sizeWarning, TAIL_BYTES, handoffArgv, LATER_LOG, LATER_USAGE, laterStatus, manifestLine, manifestMessage, manifestPath, takeManifest, transcriptSecretWarning, needsPairing, parseLaterArg, type Pending, PENDING_PATH, readPending, resolveSession, waitThenHandoff,
 } from "../core/handoff-later";
 import {
   agentConfigPaths, applyInPlace, atomicWriteBytes, type BoxArtifacts, boxChangedPaths, boxIdle, sessionBusy, copyContained, decideCode, extractTgz,
@@ -1615,6 +1615,7 @@ async function later(args: Map<string, string | true>, keys: { omg?: string; ope
   const arg = parseLaterArg(args.has("--args-stdin") ? readFileSync(0, "utf8") : "");
   if (!arg) { console.log(LATER_USAGE); process.exitCode = 1; return; }
   if (!session || !claudePid) throw new Error("could not tell which Claude Code session this is. Run /nomo-cc:handoff inside the session you want to move.");
+  const manifest = takeManifest(manifestPath(session)); // NOM-106: read + deleted now, whatever happens next
   if (!keys.omg || !keys.openrouter) throw new Error("OMG_API_KEY and OPENROUTER_API_KEY must be set (env or ~/.nomo-spike.env)");
   const home = process.env.HOME!;
   const cwd = [process.cwd(), (await readRecord(session))?.cwd]
@@ -1634,16 +1635,25 @@ async function later(args: Map<string, string | true>, keys: { omg?: string; ope
     process.exitCode = 1;
     return;
   }
-  if (!arm(session, claudePid, cwd, arg.message, worker, arg.anyway)) return;
+  // NOM-106: only the default first message takes the manifest; `then <text>` and `quiet` are the user's.
+  let message = arg.message, manifestNote: string | undefined;
+  if (manifest && message === DEFAULT_THEN) {
+    let steps: string[] = [];
+    try { if ("manifest" in manifest) steps = setupSteps(root ?? cwd); } catch { /* none */ }
+    if ("manifest" in manifest) message = manifestMessage(manifest.manifest, steps);
+    manifestNote = manifestLine(manifest, steps);
+  }
+  if (!arm(session, claudePid, cwd, message, worker, arg.anyway)) return;
   console.log(`Ready. Session ${session} moves to the cloud as soon as this turn ends; watch it on your phone.\n` +
     `This window stays open but parked: new prompts are blocked until you run /nomo-cc:back here.\n` +
-    (arg.message ? `First message on the box: "${arg.message}"` : "No first message (quiet).") +
+    (message ? `First message on the box: "${message}"` : "No first message (quiet).") +
     `\nLog: ${LATER_LOG}\nTo stop it: /nomo-cc:handoff cancel`);
   let warn: string | undefined;
   try { warn = sizeWarning(contextTokensOf(join(home, ".claude", "projects", projectDirName(cwd), `${session}.jsonl`))); } catch { /* estimate only */ }
   if (warn) console.log(warn);
   const ready = readiness(cwd);
   if (ready) console.log(ready);
+  if (manifestNote) console.log(manifestNote);
   if (inTranscript) console.log(transcriptSecretWarning(inTranscript, true));
 }
 

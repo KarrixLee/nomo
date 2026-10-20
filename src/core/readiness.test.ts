@@ -3,7 +3,7 @@ import { execFileSync } from "node:child_process";
 import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { cloudReadiness, gitProbe, isSecretName } from "./readiness";
+import { cloudReadiness, gitProbe, isSecretName, setupSteps } from "./readiness";
 
 const dirs: string[] = [];
 afterEach(() => { for (const d of dirs.splice(0)) { try { chmodSync(d, 0o700); } catch { /* */ } rmSync(d, { recursive: true, force: true }); } });
@@ -131,5 +131,23 @@ describe("cloudReadiness", () => {
     const out = cloudReadiness(d, { home: tmp(), maxEntries: 500 });
     expect(performance.now() - t).toBeLessThan(200);
     expect(out).toBe("Cloud check: nothing Mac-only spotted.");
+  });
+});
+
+describe("setupSteps (NOM-106: from lockfiles + compose only)", () => {
+  test("one install per lockfile dir, one JS manager per dir, compose up last, quoted dirs", () => {
+    const r = tmp();
+    put(r, {
+      "bun.lock": "", "package-lock.json": "", "uv.lock": "", "docker-compose.yml": "services: {}",
+      "web app/yarn.lock": "", "node_modules/x/pnpm-lock.yaml": "", ".env": "SECRET=1",
+    });
+    expect(setupSteps(r)).toEqual(["bun install", "uv sync", "cd 'web app' && yarn install", "docker compose -f 'docker-compose.yml' up -d"]);
+  });
+
+  test("nothing detected → []; capped", () => {
+    expect(setupSteps(tmp())).toEqual([]);
+    const r = tmp();
+    put(r, Object.fromEntries(Array.from({ length: 12 }, (_, i) => [`p${String(i).padStart(2, "0")}/bun.lock`, ""])));
+    expect(setupSteps(r)).toHaveLength(8);
   });
 });

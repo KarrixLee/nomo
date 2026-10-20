@@ -148,6 +148,23 @@ home. What that does and doesn't expose:
   low-entropy values, secrets split across lines or encoded, and the user-layer files that also
   travel (`~/.claude/{skills,agents,commands,CLAUDE.md}`), which are not scanned. It can also flag a
   test, example or revoked key.
+- **The handoff manifest carries names, never values.** `/nomo-cc:handoff` (terminal only; *Move to
+  cloud* from the phone never asks for one) has the session's own model write a one-line JSON file to
+  `~/.config/cc-status/handoff-manifest-<session>.json` (0600) with exactly two keys: `note`, a short
+  "where I was / next step", and `env`, the NAMES of environment variables the project needs. The model
+  is told not to read `.env` or any secret file for it. The plugin reads it once and deletes it, then
+  checks it strictly (`validateManifest` in `src/core/handoff-later.ts`): a regular file no older than
+  10 min and at most 4 KB; JSON with no other keys; at most 20 env names, each matching
+  `^[A-Z_][A-Z0-9_]*$` and at most 64 characters, so a `NAME=value` can't get in; a note of at most 300
+  characters with no line breaks or control characters, no absolute or home path (`/a/b…`, `~/`,
+  `$HOME`, `C:\`) and no secret-looking file name (`isSecretName`); and the whole file must pass the
+  transcript secret scanner above. One failure and the whole manifest is ignored, with one
+  `Handoff manifest ignored (…)` line that never echoes its content; the box then gets the usual first
+  message. Setup commands never come from the model: they are derived from lockfiles and compose files
+  (`setupSteps` in `src/core/readiness.ts`, e.g. `bun install`, `docker compose -f … up -d`). The box's
+  first message lists those commands, the env names (saying their values were not sent) and the note,
+  and asks Claude there to run the commands with its usual approval prompts. No permission flag is
+  added and nothing is bypassed. No env value is read, sent or stored at any step.
 - **The box is its own paired computer.** It pairs with your phone under its own keys ("Nomo Cloud"),
   so phone ↔ box traffic is end-to-end sealed exactly like your Mac's, and the relay stays blind:
   it sees ids and flags (op, priority, a `parked` boolean), never titles or content.

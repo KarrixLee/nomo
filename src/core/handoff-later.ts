@@ -11,10 +11,12 @@
 // target worker (cloud.json `pairedTo`, written by handoff.ts on every pairing it sees succeed) is
 // refused up front with the terminal command instead.
 
-import { appendFileSync, closeSync, fstatSync, linkSync, openSync, readFileSync, readSync, unlinkSync, writeFileSync } from "node:fs";
+import { appendFileSync, closeSync, fstatSync, linkSync, lstatSync, openSync, readFileSync, readSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { basename } from "node:path";
 import { claudeDesktopInvocation, claudeHeadlessInvocation } from "./adapter";
 import { clearPark, type MoveWhy, readPark, stamp, writePark } from "./park";
+import { isSecretName } from "./readiness";
+import { textHasSecret } from "./transcript-scan";
 import { CC_DIR } from "./shared";
 export { boxPaired, needsPairing } from "./shared";
 
@@ -48,6 +50,84 @@ export function transcriptSecretWarning(summary: string, confirmed: boolean): st
   return confirmed
     ? `Cloud check: ${head} Moving anyway, as you confirmed.`
     : `Cloud check: ${head}\nNothing was started. To move it anyway, run /nomo-cc:handoff anyway (or: anyway quiet, anyway then <message>).`;
+}
+
+// ---------------------------------------------------------------------------------- NOM-106 manifest
+// The /nomo-cc:handoff turn has the session's own model write `{note, env}` to manifestPath(session): a
+// short "where I was / next step" and the env var NAMES the project needs. Setup commands never come from
+// it (readiness.ts setupSteps derives them from lockfiles). Anything off → the whole file is ignored.
+
+export const MANIFEST_MAX_BYTES = 4096;
+export const MANIFEST_MAX_AGE_MS = 10 * 60_000;
+export const NOTE_MAX = 300;
+export const ENV_MAX = 20;
+const ENV_NAME = /^[A-Z_][A-Z0-9_]*$/;
+const ENV_NAME_MAX = 64;
+// An absolute (`/a/b`, `C:\`) or home-relative (`~/`, `~user/`, `$HOME`) path, at the start or after a
+// space/quote/bracket. Relative paths (`src/x.ts`) and URLs (`https://…/…`) are fine.
+const PATHISH = /(?:^|[\s"'`(\[<=,])(?:~[\w.-]*(?:\/|\s|$)|\$\{?HOME\b|\/[^\s/]+\/|[A-Za-z]:[\\/])/;
+
+export interface Manifest { note?: string; env: string[] }
+export type ManifestResult = { manifest: Manifest } | { invalid: string };
+
+export const manifestPath = (session: string): string => `${CC_DIR}/handoff-manifest-${session}.json`;
+
+/** Strict check of a manifest file's text. Never echoes any of it in a reason. */
+export function validateManifest(text: string): ManifestResult {
+  if (Buffer.byteLength(text) > MANIFEST_MAX_BYTES) return { invalid: "over 4 KB" };
+  if (textHasSecret(text)) return { invalid: "looks like it holds a secret" };
+  let v: any;
+  try { v = JSON.parse(text); } catch { return { invalid: "not JSON" }; }
+  if (!v || typeof v !== "object" || Array.isArray(v)) return { invalid: "not a JSON object" };
+  if (Object.keys(v).some((k) => k !== "note" && k !== "env")) return { invalid: "fields other than note and env" };
+  const m: Manifest = { env: [] };
+  if (v.note !== undefined) {
+    if (typeof v.note !== "string") return { invalid: "note is not text" };
+    const note: string = v.note.trim();
+    if (note.length > NOTE_MAX) return { invalid: `note over ${NOTE_MAX} characters` };
+    if (/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/.test(note)) return { invalid: "note has control characters or line breaks" };
+    if (PATHISH.test(note)) return { invalid: "note names an absolute or home path" };
+    if (note.split(/[\s"'`(),;:[\]<>]+/).some((w) => isSecretName(w.replace(/[.!?]+$/, "").split("/").pop()!))) return { invalid: "note names a secret file" };
+    if (note) m.note = note;
+  }
+  if (v.env !== undefined) {
+    if (!Array.isArray(v.env) || v.env.length > ENV_MAX) return { invalid: `env is not a list of at most ${ENV_MAX} names` };
+    if (v.env.some((n: unknown) => typeof n !== "string" || n.length > ENV_NAME_MAX || !ENV_NAME.test(n))) return { invalid: "env has something that isn't an UPPER_CASE variable name" };
+    m.env = [...new Set<string>(v.env)];
+  }
+  return { manifest: m };
+}
+
+/** Read, then delete (always: it is single-use), this session's manifest. undefined when there is none. */
+export function takeManifest(path: string, now = Date.now()): ManifestResult | undefined {
+  let st;
+  try { st = lstatSync(path); } catch { return undefined; }
+  try {
+    if (!st.isFile()) return { invalid: "not a regular file" };
+    if (st.size > MANIFEST_MAX_BYTES) return { invalid: "over 4 KB" };
+    if (now - st.mtimeMs > MANIFEST_MAX_AGE_MS) return { invalid: "stale, from an earlier handoff" };
+    return validateManifest(readFileSync(path, "utf8"));
+  } catch { return { invalid: "unreadable" }; } finally { rmSync(path, { force: true }); }
+}
+
+/** The default first message with the manifest folded in: setup steps (detected, never the model's),
+ *  env NAMES, the note. Run under the box's normal approval prompts; nothing here bypasses them. */
+export function manifestMessage(m: Manifest, steps: string[]): string {
+  if (!m.note && !m.env.length && !steps.length) return DEFAULT_THEN;
+  const parts = ["You're now running on the cloud box."];
+  if (m.note) parts.push(`Where I was: ${m.note}`);
+  if (steps.length) parts.push(`First set this box up by running ${steps.map((c) => `\`${c}\``).join(", ")} (one at a time, with the usual approval prompts; if one fails, say why and go on).`);
+  if (m.env.length) parts.push(`The project needs these environment variables, whose values were not sent: ${m.env.join(", ")}. Never guess values; tell me which are missing when the work needs them.`);
+  parts.push("Then continue the task you were working on before the handoff. If it was already finished, say so and wait.");
+  return parts.join(" ");
+}
+
+/** The one line printed next to the Cloud check. */
+export function manifestLine(r: ManifestResult, steps: string[]): string {
+  if ("invalid" in r) return `Handoff manifest ignored (${r.invalid}); the box gets the usual first message.`;
+  const m = r.manifest;
+  return `Handoff manifest: setup ${steps.length ? steps.join(" · ") : "none detected"}; env names ${m.env.length ? m.env.join(", ") : "none"} (values never sent)` +
+    `${m.note ? `; note: "${m.note}"` : ""}.`;
 }
 
 /** `/nomo-cc:handoff`'s argument (cancel/status are routed by the command itself): empty → DEFAULT_THEN,

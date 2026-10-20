@@ -154,6 +154,27 @@ export function cloudReadiness(root: string, deps: ReadinessDeps): string {
   return [head, ...warnings].join("\n");
 }
 
+/** NOM-106: the setup commands the box should run, derived ONLY from lockfiles and compose files (never
+ *  from the model): one install per lockfile dir (one JS package manager per dir, LOCKS order), then
+ *  `docker compose up -d` per compose file. Prefixed `cd <dir> && ` outside the root. At most `max`. */
+export function setupSteps(root: string, maxEntries = 4000, max = 8): string[] {
+  const w = walk(root, maxEntries);
+  const JS = new Set(LOCKS.slice(0, 5).map(([n]) => n));
+  const sq = (p: string) => `'${p.replace(/'/g, `'\\''`)}'`;
+  const cd = (dir: string, cmd: string) => (dir ? `cd ${sq(dir)} && ${cmd}` : cmd);
+  const steps: string[] = [];
+  for (const dir of [...w.locks.keys()].sort()) {
+    let js = false;
+    for (const [name, cmd] of LOCKS) {
+      if (!w.locks.get(dir)!.includes(name) || (JS.has(name) && js)) continue;
+      js ||= JS.has(name);
+      steps.push(cd(dir, cmd));
+    }
+  }
+  for (const f of w.compose) steps.push(`docker compose -f ${sq(f)} up -d`);
+  return [...new Set(steps)].slice(0, max);
+}
+
 /** The real git probe for the repo at `root`, or undefined when it isn't one. */
 export function gitProbe(root: string): GitProbe | undefined {
   const run = (args: string[], input?: string): string =>

@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
-import { chmodSync, utimesSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, utimesSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { spawn } from "node:child_process";
@@ -438,13 +438,19 @@ esac
     writeFileSync(join(d, "scripts", "run.sh"), `#!/bin/sh\nprintf '%s\\n' "$@" > ${d}/argv\ncat > ${d}/stdin\n`);
     chmodSync(join(d, "scripts", "run.sh"), 0o755);
     const arg = `then ${NASTY}`;
-    const filled = arm.replaceAll("XXXXXXXXXXXX", "q7Zp2Kx9Lm4T").replace("\nARGUMENT\n", `\n${arg}\n`);
+    const man = `{"note":"fix the $(touch PWNED) \`test\`","env":["DATABASE_URL"]}`;
+    const filled = arm.replaceAll("XXXXXXXXXXXX", "q7Zp2Kx9Lm4T").replaceAll("YYYYYYYYYYYY", "w3Rt8Yb1Nc6V")
+      .replace("\nARGUMENT\n", `\n${arg}\n`).replace("\nMANIFEST\n", `\n${man}\n`);
     execFileSync("bash", ["-c", filled], { cwd: d, env: { PATH: "/usr/bin:/bin", HOME: d, CLAUDE_PLUGIN_ROOT: d, CLAUDE_SESSION_ID: "0a1b2c3d-1111-4222-8333-444455556666" } });
     expect(readFileSync(join(d, "stdin"), "utf8")).toBe(`${arg}\n`);
     const argv = readFileSync(join(d, "argv"), "utf8");
     expect(argv).toContain("--args-stdin");
     expect(argv).not.toContain("touch");
     expect(existsSync(join(d, "PWNED"))).toBe(false);
+    // NOM-106: the manifest lands verbatim, 0600, in the plugin's state dir under this session's id.
+    const mf = join(d, ".config", "cc-status", "handoff-manifest-0a1b2c3d-1111-4222-8333-444455556666.json");
+    expect(readFileSync(mf, "utf8")).toBe(`${man}\n`);
+    expect(statSync(mf).mode & 0o777).toBe(0o600);
   });
 });
 

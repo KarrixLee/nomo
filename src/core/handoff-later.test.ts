@@ -1,12 +1,12 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { trackedSecretFiles } from "./readiness";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   cancelPending, claimPending, contextTokens, contextTokensOf, DEFAULT_THEN, GONE_MSG, parseLaterArg, sizeWarning, handoffArgv, handoffLanded, laterStatus, NOTHING_RAN_MSG, needsPairing, type Pending, readPending, resolveSession, waitThenHandoff, type WaitDeps,
-  BOX_MAX_SESSIONS, boxPaired, phoneMoveCheck, type PhoneMoveFacts, settleThenStamp,
+  BOX_MAX_SESSIONS, boxPaired, phoneMoveCheck, ENV_MAX, MANIFEST_MAX_AGE_MS, manifestLine, manifestMessage, NOTE_MAX, takeManifest, validateManifest, type PhoneMoveFacts, settleThenStamp,
 } from "./handoff-later";
 import { parkHook, readPark, writePark } from "./park";
 import { macWorkerUrl } from "./shared";
@@ -513,4 +513,87 @@ test("the helper reports this session's outcome: moved or failed", async () => {
   };
   expect(await run({ code: 0 })).toEqual([true]);
   expect(await run({ code: 1 })).toEqual([false]);
+});
+
+describe("handoff manifest (NOM-106)", () => {
+  const ok = (o: unknown) => validateManifest(JSON.stringify(o));
+  const fakeKey = (): string => "sk-" + Array.from({ length: 40 }, (_, i) => "aZ3kQ9mP2xW7vB5nC8".charAt((i * 7) % 18)).join("");
+
+  test("a good manifest validates, trimmed and de-duplicated", () => {
+    expect(ok({ note: "  Wiring the retry into src/core/x.ts; next: run its tests. See https://github.com/a/b  ", env: ["DATABASE_URL", "_X1", "DATABASE_URL"] }))
+      .toEqual({ manifest: { note: "Wiring the retry into src/core/x.ts; next: run its tests. See https://github.com/a/b", env: ["DATABASE_URL", "_X1"] } });
+    expect(ok({})).toEqual({ manifest: { env: [] } });
+    expect(ok({ note: "", env: [] })).toEqual({ manifest: { env: [] } });
+  });
+
+  test.each([
+    ["not JSON", "{note:"],
+    ["not a JSON object", "[1]"],
+    ["fields other than note and env", JSON.stringify({ note: "x", setup: "rm -rf /" })],
+    ["note is not text", JSON.stringify({ note: 5 })],
+    ["note over", JSON.stringify({ note: "a".repeat(NOTE_MAX + 1) })],
+    ["control characters", JSON.stringify({ note: "line\nbreak" })],
+    ["absolute or home path", JSON.stringify({ note: "edit /Users/me/app/x.ts" })],
+    ["absolute or home path", JSON.stringify({ note: "see ~/notes.md" })],
+    ["absolute or home path", JSON.stringify({ note: "in $HOME" })],
+    ["absolute or home path", JSON.stringify({ note: "on C:\\dev" })],
+    ["secret file", JSON.stringify({ note: "copy the .env first." })],
+    ["secret file", JSON.stringify({ note: "uses config/id_rsa" })],
+    ["at most", JSON.stringify({ env: Array.from({ length: ENV_MAX + 1 }, (_, i) => `V${i}`) })],
+    ["at most", JSON.stringify({ env: "DATABASE_URL" })],
+    ["UPPER_CASE", JSON.stringify({ env: ["database_url"] })],
+    ["UPPER_CASE", JSON.stringify({ env: ["API_KEY=abc"] })],
+    ["UPPER_CASE", JSON.stringify({ env: ["1ABC"] })],
+    ["UPPER_CASE", JSON.stringify({ env: ["A".repeat(65)] })],
+    ["over 4 KB", JSON.stringify({ note: "x", env: [], pad: " ".repeat(5000) })],
+  ])("rejected: %s", (reason, text) => {
+    const r = validateManifest(text);
+    expect("invalid" in r && r.invalid).toContain(reason);
+  });
+
+  test("a secret-looking value anywhere rejects the whole file, and the reason never echoes it", () => {
+    const key = fakeKey();
+    for (const text of [JSON.stringify({ note: `use ${key} for the API` }), JSON.stringify({ note: "x", env: [] }).replace("}", `,"k":"${key}"}`),
+      JSON.stringify({ note: "set API_KEY=Zq8vL3mT9wR2xK7pN4bH6" })]) {
+      const r = validateManifest(text);
+      expect(r).toEqual({ invalid: "looks like it holds a secret" });
+      expect(manifestLine(r, [])).not.toContain(key);
+    }
+  });
+
+  test("takeManifest: single use, stale and non-regular files ignored", () => {
+    const d = tmp(), p = join(d, "m.json");
+    expect(takeManifest(p)).toBeUndefined();
+    writeFileSync(p, JSON.stringify({ env: ["A"] }));
+    expect(takeManifest(p)).toEqual({ manifest: { env: ["A"] } });
+    expect(existsSync(p)).toBe(false);
+    writeFileSync(p, "{}");
+    expect(takeManifest(p, Date.now() + MANIFEST_MAX_AGE_MS + 5000)).toEqual({ invalid: "stale, from an earlier handoff" });
+    expect(existsSync(p)).toBe(false);
+    writeFileSync(join(d, "real"), "{}");
+    symlinkSync(join(d, "real"), p);
+    expect(takeManifest(p)).toEqual({ invalid: "not a regular file" });
+    expect(existsSync(join(d, "real"))).toBe(true);
+  });
+
+  test("first message: setup steps, env names and note; normal approvals, nothing bypassed", () => {
+    const msg = manifestMessage({ note: "Halfway through the login form; next: tests.", env: ["DATABASE_URL", "STRIPE_KEY"] }, ["bun install", "docker compose -f 'compose.yml' up -d"]);
+    expect(msg).toContain("Where I was: Halfway through the login form; next: tests.");
+    expect(msg).toContain("`bun install`, `docker compose -f 'compose.yml' up -d`");
+    expect(msg).toContain("usual approval prompts");
+    expect(msg).toContain("DATABASE_URL, STRIPE_KEY");
+    expect(msg).toContain("values were not sent");
+    expect(msg).not.toMatch(/\n|bypass|dangerously|--permission/i);
+    expect(msg.startsWith("You're now running on the cloud box.")).toBe(true);
+    expect(manifestMessage({ env: [] }, [])).toBe(DEFAULT_THEN);
+    expect(manifestLine({ manifest: { env: ["A"], note: "n" } }, ["bun install"])).toBe('Handoff manifest: setup bun install; env names A (values never sent); note: "n".');
+    expect(manifestLine({ invalid: "not JSON" }, ["bun install"])).toBe("Handoff manifest ignored (not JSON); the box gets the usual first message.");
+  });
+
+  test("the phone path never takes a manifest: it arms with the plain default message", () => {
+    const src = readFileSync(join(import.meta.dir, "../entries/handoff.ts"), "utf8");
+    const phone = src.slice(src.indexOf("async function phoneLater("), src.indexOf("async function afterExit("));
+    expect(phone).not.toMatch(/manifest/i);
+    expect(phone).toContain("arm(session, ok.claudePid, ok.cwd, DEFAULT_THEN, worker)");
+  });
 });
