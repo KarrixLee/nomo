@@ -9173,8 +9173,13 @@ function bringBack(id, deps = {}) {
 var moveRuns = new Map;
 var UUID_RE2 = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 function moveToCloud(id, rec, deps = {}) {
-  if (!UUID_RE2.test(id) || typeof rec.cwd !== "string" || !rec.cwd || (rec.agent ?? "claude") !== "claude" || rec.provisional === true || (deps.readPark ?? readPark)(id) || (deps.cloudActive ?? cloudActive)(id))
+  if (!UUID_RE2.test(id) || typeof rec.cwd !== "string" || !rec.cwd || (rec.agent ?? "claude") !== "claude" || rec.provisional === true || (deps.readPark ?? readPark)(id) || (deps.cloudActive ?? cloudActive)(id)) {
+    if (UUID_RE2.test(id) && !moveRuns.get(id)?.running) {
+      const at = (deps.now ?? Date.now)();
+      moveRuns.set(id, { running: false, startedAt: at, code: 1, failedAt: at });
+    }
     return "move-refused";
+  }
   if (moveRuns.get(id)?.running)
     return "move-running";
   const run = { running: true, startedAt: (deps.now ?? Date.now)() };

@@ -1697,7 +1697,15 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
  *  here (the rest, with the live process checks, run in handoff --phone); one run per session. */
 export function moveToCloud(id: string, rec: SessionRecord, deps: MoveToCloudDeps = {}): FocusTraceResult {
   if (!UUID_RE.test(id) || typeof rec.cwd !== "string" || !rec.cwd || (rec.agent ?? "claude") !== "claude" || rec.provisional === true ||
-    (deps.readPark ?? readPark)(id) || (deps.cloudActive ?? cloudActive)(id)) return "move-refused";
+    (deps.readPark ?? readPark)(id) || (deps.cloudActive ?? cloudActive)(id)) {
+    // Tell the phone: a failed run makes the sweep post cloud:"move-failed" with cloudWhy "other" (what
+    // handoff's phoneMoveCheck says for these same refusals). A parked row keeps showing its park state.
+    if (UUID_RE.test(id) && !moveRuns.get(id)?.running) {
+      const at = (deps.now ?? Date.now)();
+      moveRuns.set(id, { running: false, startedAt: at, code: 1, failedAt: at });
+    }
+    return "move-refused";
+  }
   if (moveRuns.get(id)?.running) return "move-running";
   const run: MoveRun = { running: true, startedAt: (deps.now ?? Date.now)() };
   moveRuns.set(id, run);
