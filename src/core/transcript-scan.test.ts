@@ -11,13 +11,14 @@ const U = "0a1b2c3d-1111-4222-8333-444455556666";
 let seed = 7;
 const rnd = (n: number, abc = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"): string => {
   let s = "";
-  for (let i = 0; i < n; i++) { seed = (seed * 1103515245 + 12345) % 2147483648; s += abc[seed % abc.length]; }
+  for (let i = 0; i < n; i++) { seed = (Math.imul(seed, 1103515245) + 12345) >>> 0; s += abc[(seed >>> 16) % abc.length]; }
   return s;
 };
 const b64u = (o: object) => Buffer.from(JSON.stringify(o)).toString("base64url");
 const UPPER = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
 const KEYS: Record<SecretKind, string> = {
   openai: ["sk", "proj", rnd(48)].join("-"),
+  openrouter: ["sk", "or", "v1", rnd(64, "0123456789abcdef")].join("-"),
   anthropic: ["sk", "ant", "api03", rnd(90)].join("-"),
   github: ["gh", "p_", rnd(36)].join(""),
   aws: ["AK", "IA", rnd(16, UPPER)].join(""),
@@ -30,6 +31,7 @@ const KEYS: Record<SecretKind, string> = {
 };
 const LINE: Record<SecretKind, string> = {
   openai: `OPENAI_API_KEY=${KEYS.openai}`,
+  openrouter: `or key ${KEYS.openrouter}`,
   anthropic: `export ANTHROPIC_API_KEY="${KEYS.anthropic}"`,
   github: `token: ${KEYS.github}`,
   aws: `AWS_ACCESS_KEY_ID=${KEYS.aws}`,
@@ -83,7 +85,7 @@ describe("transcript-scan (NOM-103)", () => {
 
   test("no value, nor any 8-char slice of one, ever appears in what it returns or prints", () => {
     const s = scanText((Object.values(LINE)).map(row).join("\n"));
-    expect(Object.keys(s.counts).length).toBe(10);
+    expect(Object.keys(s.counts).length).toBe(11);
     const out = JSON.stringify(s) + secretSummary(s, U)! + transcriptSecretWarning(secretSummary(s, U)!, false) + transcriptSecretWarning(secretSummary(s, U)!, true);
     for (const v of Object.values(KEYS)) {
       const body = v.replace(/^-----BEGIN [A-Z ]+-----$/, ""); // the PEM header is a label, not the secret
@@ -112,6 +114,19 @@ describe("transcript-scan (NOM-103)", () => {
     const s = scanHandoff(p, U);
     expect(s.counts).toEqual({ github: 1, stripe: 1 });
     expect(s.places).toEqual([{ file: `${U}/subagents/agent-a.jsonl`, line: 2 }, { file: "memory/MEMORY.md", line: 2 }]);
+  });
+
+  test("a vendor key that happens to contain a placeholder word is still found", () => {
+    const k1 = ["gh", "p_", rnd(10), "here", rnd(22)].join(""), k2 = ["sk", "proj", rnd(20) + "xxx" + rnd(25)].join("-");
+    expect(scanText([row(k1), row(k2)].join("\n")).counts).toEqual({ github: 1, openai: 1 });
+  });
+
+  test("no quadratic blow-up: 1 MB runs of one character scan in well under a second", () => {
+    for (const c of ["A", "A_", "KEY", "sk-", "eyJ", "\\n"]) {
+      const t = performance.now();
+      scanText(c.repeat(Math.ceil((1 << 20) / c.length)));
+      expect(performance.now() - t).toBeLessThan(1000);
+    }
   });
 
   test("entropy", () => {

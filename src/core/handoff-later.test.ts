@@ -290,6 +290,39 @@ describe("park marker lifecycle (NOM-90)", () => {
     return d;
   }
 
+  test("NOM-103: a post-turn rescan with findings stops the move (phone, or terminal without anyway) and unparks", async () => {
+    const dir = tmp(), path = join(dir, "p.json"), parkDir = join(dir, "parked");
+    writePark(A, { state: "moving" }, parkDir);
+    writeFileSync(path, JSON.stringify(pending()));
+    const results: unknown[][] = [];
+    const d = Object.assign(deps(path, parkDir), { rescan: () => "1 secret (AWS key ×1; transcript line 9)", result: (...a: unknown[]) => { results.push(a); } });
+    expect(await waitThenHandoff(pending(), d)).toBe(1);
+    expect(d.runs).toBe(0);
+    expect(results).toEqual([[false, "transcriptSecret"]]);
+    expect(readPark(A, parkDir)).toBeUndefined();
+    expect(existsSync(path)).toBe(false);
+    expect(d.lines.at(-1)).toMatch(/^FAILED: the conversation contains what look like 1 secret \(AWS key ×1; transcript line 9\).*\/nomo-cc:handoff anyway/);
+  });
+
+  test("NOM-103: after the user's `anyway`, the rescan is skipped and the move proceeds", async () => {
+    const dir = tmp(), path = join(dir, "p.json"), parkDir = join(dir, "parked");
+    writePark(A, { state: "moving" }, parkDir);
+    let scans = 0;
+    const d = Object.assign(deps(path, parkDir), { rescan: () => { scans++; return "1 secret (AWS key ×1; transcript line 9)"; } });
+    expect(await waitThenHandoff(pending({ anyway: true }), d)).toBe(0);
+    expect(d.runs).toBe(1);
+    expect(scans).toBe(0);
+    expect(readPark(A, parkDir)?.state).toBe("cloud");
+  });
+
+  test("NOM-103: a clean rescan moves", async () => {
+    const dir = tmp(), path = join(dir, "p.json"), parkDir = join(dir, "parked");
+    writePark(A, { state: "moving" }, parkDir);
+    const d = Object.assign(deps(path, parkDir), { rescan: () => undefined });
+    expect(await waitThenHandoff(pending(), d)).toBe(0);
+    expect(d.runs).toBe(1);
+  });
+
   test("armed (moving) → the turn ends → handed off → cloud", async () => {
     const dir = tmp(), path = join(dir, "p.json"), parkDir = join(dir, "parked");
     writePark(A, { state: "moving" }, parkDir);

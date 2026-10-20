@@ -10,10 +10,10 @@ import { createHash } from "node:crypto";
 import { closeSync, existsSync, openSync, readdirSync, readSync, statSync } from "node:fs";
 import { join, relative } from "node:path";
 
-export type SecretKind = "openai" | "anthropic" | "github" | "aws" | "slack" | "google" | "stripe" | "privateKey" | "jwt" | "assignment";
+export type SecretKind = "openai" | "openrouter" | "anthropic" | "github" | "aws" | "slack" | "google" | "stripe" | "privateKey" | "jwt" | "assignment";
 
 export const KIND_LABEL: Record<SecretKind, string> = {
-  openai: "OpenAI key", anthropic: "Anthropic key", github: "GitHub token", aws: "AWS key", slack: "Slack token",
+  openai: "OpenAI key", openrouter: "OpenRouter key", anthropic: "Anthropic key", github: "GitHub token", aws: "AWS key", slack: "Slack token",
   google: "Google API key", stripe: "Stripe key", privateKey: "private key", jwt: "JWT", assignment: "KEY=/TOKEN= value",
 };
 
@@ -33,7 +33,8 @@ const E = "(?![A-Za-z0-9+/_-])";
 const VENDOR: [SecretKind, RegExp][] = [
   ["stripe", new RegExp(`${B}[rs]k_live_[A-Za-z0-9]{20,}${E}`, "g")],
   ["anthropic", new RegExp(`${B}sk-ant-[A-Za-z0-9_-]{32,}${E}`, "g")],
-  ["openai", new RegExp(`${B}sk-(?!ant-)[A-Za-z0-9_-]{32,}${E}`, "g")],
+  ["openrouter", new RegExp(`${B}sk-or-v1-[A-Za-z0-9]{32,}${E}`, "g")],
+  ["openai", new RegExp(`${B}sk-(?!ant-|or-v1-)[A-Za-z0-9_-]{32,}${E}`, "g")],
   ["github", new RegExp(`${B}(?:gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{50,})${E}`, "g")],
   ["aws", new RegExp(`${B}(?:AKIA|ASIA)[0-9A-Z]{16}${E}`, "g")],
   ["slack", new RegExp(`${B}xox[bpas]-[A-Za-z0-9-]{10,}${E}`, "g")],
@@ -43,7 +44,9 @@ const VENDOR: [SecretKind, RegExp][] = [
 const PEM = /-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----/g;
 // An env-style NAME (upper case, ends in KEY/SECRET/TOKEN/PASSWORD) `=` a value, optionally quoted (and
 // JSON-escaped: \"…\"). The value stops at whitespace, quotes, `\` (an escaped newline), `$`, `<`…
-const ASSIGN = /[A-Z][A-Z0-9_]*(?:KEY|SECRET|TOKEN|PASSWORD|PASSWD)\s*=\s*(?:\\?["'])?([A-Za-z0-9+/=_.~-]+)/g;
+// The left boundary keeps it linear: without it every position of a long [A-Z0-9_] run is a new start
+// that backtracks to its end (quadratic: 1 MB of `A` took minutes).
+const ASSIGN = /(?<![A-Z0-9_])[A-Z][A-Z0-9_]*(?:KEY|SECRET|TOKEN|PASSWORD|PASSWD)\s*=\s*(?:\\?["'])?([A-Za-z0-9+/=_.~-]+)/g;
 const MIN_ASSIGN_LEN = 16;
 const MIN_ENTROPY = 3.5; // bits/char: random alnum of 16+ chars sits ~3.7-4, words and repeats well below
 const PLACEHOLDER = /x{3,}|your[-_]?|here|example|placeholder|changeme|redacted|dummy|sample|test[-_]?key|\*{3}|\.{3}|0{8}|1234567/i;
@@ -65,7 +68,8 @@ function* matches(text: string): Generator<[SecretKind, number, string]> {
   for (const [kind, re] of VENDOR) {
     for (const m of text.matchAll(re)) {
       const v = m[0];
-      if (PLACEHOLDER.test(v) || (kind === "jwt" ? !isJwt(v) : entropy(v) < 3)) continue;
+      // No PLACEHOLDER check here: a real vendor key can contain "here" or "xxx"; entropy rules out `sk-xxxx…`.
+      if (kind === "jwt" ? !isJwt(v) : entropy(v) < 3) continue;
       yield [kind, m.index!, v];
     }
   }

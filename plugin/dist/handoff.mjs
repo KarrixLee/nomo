@@ -3420,6 +3420,7 @@ import { closeSync, existsSync as existsSync4, openSync, readdirSync as readdirS
 import { join as join4, relative } from "node:path";
 var KIND_LABEL = {
   openai: "OpenAI key",
+  openrouter: "OpenRouter key",
   anthropic: "Anthropic key",
   github: "GitHub token",
   aws: "AWS key",
@@ -3436,7 +3437,8 @@ var E = "(?![A-Za-z0-9+/_-])";
 var VENDOR = [
   ["stripe", new RegExp(`${B}[rs]k_live_[A-Za-z0-9]{20,}${E}`, "g")],
   ["anthropic", new RegExp(`${B}sk-ant-[A-Za-z0-9_-]{32,}${E}`, "g")],
-  ["openai", new RegExp(`${B}sk-(?!ant-)[A-Za-z0-9_-]{32,}${E}`, "g")],
+  ["openrouter", new RegExp(`${B}sk-or-v1-[A-Za-z0-9]{32,}${E}`, "g")],
+  ["openai", new RegExp(`${B}sk-(?!ant-|or-v1-)[A-Za-z0-9_-]{32,}${E}`, "g")],
   ["github", new RegExp(`${B}(?:gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{50,})${E}`, "g")],
   ["aws", new RegExp(`${B}(?:AKIA|ASIA)[0-9A-Z]{16}${E}`, "g")],
   ["slack", new RegExp(`${B}xox[bpas]-[A-Za-z0-9-]{10,}${E}`, "g")],
@@ -3444,7 +3446,7 @@ var VENDOR = [
   ["jwt", new RegExp(`${B}eyJ[A-Za-z0-9_-]{8,}\\.eyJ[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{16,}${E}`, "g")]
 ];
 var PEM = /-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----/g;
-var ASSIGN = /[A-Z][A-Z0-9_]*(?:KEY|SECRET|TOKEN|PASSWORD|PASSWD)\s*=\s*(?:\\?["'])?([A-Za-z0-9+/=_.~-]+)/g;
+var ASSIGN = /(?<![A-Z0-9_])[A-Z][A-Z0-9_]*(?:KEY|SECRET|TOKEN|PASSWORD|PASSWD)\s*=\s*(?:\\?["'])?([A-Za-z0-9+/=_.~-]+)/g;
 var MIN_ASSIGN_LEN = 16;
 var MIN_ENTROPY = 3.5;
 var PLACEHOLDER = /x{3,}|your[-_]?|here|example|placeholder|changeme|redacted|dummy|sample|test[-_]?key|\*{3}|\.{3}|0{8}|1234567/i;
@@ -3470,7 +3472,7 @@ function* matches(text) {
   for (const [kind, re] of VENDOR) {
     for (const m of text.matchAll(re)) {
       const v = m[0];
-      if (PLACEHOLDER.test(v) || (kind === "jwt" ? !isJwt(v) : entropy(v) < 3))
+      if (kind === "jwt" ? !isJwt(v) : entropy(v) < 3)
         continue;
       yield [kind, m.index, v];
     }
@@ -4011,6 +4013,15 @@ async function waitThenHandoff(p, d) {
   }
   if (ended)
     await d.sleep(POLL_MS);
+  const found = p.anyway ? undefined : d.rescan?.();
+  if (found) {
+    release();
+    unpark();
+    d.result?.(false, "transcriptSecret");
+    d.log(`FAILED: the conversation contains what look like ${found}. They would travel to the cloud box with the transcript, so nothing was moved. To move it anyway, run /nomo-cc:handoff anyway.`);
+    d.notify("Handoff stopped: the conversation looks like it holds secrets. Nothing was moved.");
+    return 1;
+  }
   try {
     writeFileSync2(d.pending, JSON.stringify({ ...p, state: "handing-off" }) + `
 `, { mode: 384 });
@@ -6450,7 +6461,7 @@ After that, /nomo-cc:handoff works from inside Claude Code.`);
     process.exitCode = 1;
     return;
   }
-  if (!arm(session, claudePid, cwd, arg.message, worker))
+  if (!arm(session, claudePid, cwd, arg.message, worker, arg.anyway))
     return;
   console.log(`Ready. Session ${session} moves to the cloud as soon as this turn ends; watch it on your phone.
 ` + `This window stays open but parked: new prompts are blocked until you run /nomo-cc:back here.
@@ -6469,9 +6480,9 @@ To stop it: /nomo-cc:handoff cancel`);
   if (inTranscript)
     console.log(transcriptSecretWarning(inTranscript, true));
 }
-function arm(session, claudePid, cwd, message, worker) {
+function arm(session, claudePid, cwd, message, worker, anyway) {
   mkdirSync3(CC_DIR, { recursive: true, mode: 448 });
-  const p = { helperPid: process.pid, session, claudePid, state: "waiting", startedAt: Date.now(), message };
+  const p = { helperPid: process.pid, session, claudePid, state: "waiting", startedAt: Date.now(), message, ...anyway ? { anyway } : {} };
   if (!claimPending(PENDING, p)) {
     const cur = readPending(PENDING_PATH);
     console.log(`A handoff is already waiting (session ${cur?.session ?? "?"}). See /nomo-cc:handoff status, or /nomo-cc:handoff cancel.`);
@@ -6537,7 +6548,10 @@ async function afterExit(args, worker) {
     pending = readPending(PENDING_PATH);
   }
   const message = pending?.session === session ? pending.message : undefined;
-  process.exitCode = await waitThenHandoff({ helperPid: process.pid, session, claudePid, state: "waiting", startedAt: Date.now(), message }, {
+  const anyway = pending?.session === session && pending.anyway ? { anyway: true } : {};
+  const projDir = join7(process.env.HOME, ".claude", "projects", projectDirName(process.cwd()));
+  process.exitCode = await waitThenHandoff({ helperPid: process.pid, session, claudePid, state: "waiting", startedAt: Date.now(), message, ...anyway }, {
+    rescan: () => secretSummary(scanHandoff(projDir, session), session),
     pending: PENDING_PATH,
     parkDir: PARK_DIR,
     result: (ok, why) => writeMoveResult(session, ok, undefined, why),

@@ -1561,7 +1561,7 @@ async function later(args: Map<string, string | true>, keys: { omg?: string; ope
     process.exitCode = 1;
     return;
   }
-  if (!arm(session, claudePid, cwd, arg.message, worker)) return;
+  if (!arm(session, claudePid, cwd, arg.message, worker, arg.anyway)) return;
   console.log(`Ready. Session ${session} moves to the cloud as soon as this turn ends; watch it on your phone.\n` +
     `This window stays open but parked: new prompts are blocked until you run /nomo-cc:back here.\n` +
     (arg.message ? `First message on the box: "${arg.message}"` : "No first message (quiet).") +
@@ -1576,9 +1576,9 @@ async function later(args: Map<string, string | true>, keys: { omg?: string; ope
 
 /** Claim the pending slot, park the window "moving" and start the detached helper. False (message
  *  printed) when another handoff already holds the slot. */
-function arm(session: string, claudePid: number, cwd: string, message: string | undefined, worker: string): boolean {
+function arm(session: string, claudePid: number, cwd: string, message: string | undefined, worker: string, anyway?: true): boolean {
   mkdirSync(CC_DIR, { recursive: true, mode: 0o700 });
-  const p: Pending = { helperPid: process.pid, session, claudePid, state: "waiting", startedAt: Date.now(), message };
+  const p: Pending = { helperPid: process.pid, session, claudePid, state: "waiting", startedAt: Date.now(), message, ...(anyway ? { anyway } : {}) };
   if (!claimPending(PENDING, p)) {
     const cur = readPending(PENDING_PATH);
     console.log(`A handoff is already waiting (session ${cur?.session ?? "?"}). See /nomo-cc:handoff status, or /nomo-cc:handoff cancel.`);
@@ -1633,7 +1633,10 @@ async function afterExit(args: Map<string, string | true>, worker: string): Prom
   let pending = readPending(PENDING_PATH); // wait out later()'s rewrite naming this helper (a torn read is undefined)
   for (let i = 0; i < 30 && pending?.helperPid !== process.pid; i++) { await new Promise((r) => setTimeout(r, 100)); pending = readPending(PENDING_PATH); }
   const message = pending?.session === session ? pending.message : undefined; // from the 0600 record, never argv
-  process.exitCode = await waitThenHandoff({ helperPid: process.pid, session, claudePid, state: "waiting", startedAt: Date.now(), message }, {
+  const anyway = pending?.session === session && pending.anyway ? { anyway: true as const } : {};
+  const projDir = join(process.env.HOME!, ".claude", "projects", projectDirName(process.cwd())); // build() packs from here
+  process.exitCode = await waitThenHandoff({ helperPid: process.pid, session, claudePid, state: "waiting", startedAt: Date.now(), message, ...anyway }, {
+    rescan: () => secretSummary(scanHandoff(projDir, session), session),
     pending: PENDING_PATH,
     parkDir: PARK_DIR,
     result: (ok, why) => writeMoveResult(session, ok, undefined, why),

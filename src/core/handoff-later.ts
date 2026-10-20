@@ -34,6 +34,8 @@ export interface Pending {
   /** The first message for the box session (`--then`); absent = quiet. User text: this 0600 file and
    *  the handoff's env only, never argv or the log. */
   message?: string;
+  /** NOM-103: the user typed `anyway`, so a post-turn rescan that finds secrets does not stop the move. */
+  anyway?: true;
 }
 
 export const DEFAULT_THEN = "You're now running on the cloud box. Continue the task you were working on before the handoff. If it was already finished, say so and wait.";
@@ -221,6 +223,9 @@ export interface WaitDeps {
   parkDir?: string;
   /** This session's outcome (park.ts writeMoveResult): true moved, false failed. */
   result?: (ok: boolean, why?: MoveWhy) => void;
+  /** NOM-103: rescan what the handoff will upload (transcript-scan secretSummary), right before it runs:
+   *  the rest of the turn may have printed a secret after the command's own scan. */
+  rescan?: () => string | undefined;
 }
 
 /** The detached helper: wait for this turn to end or the Mac session to exit (capped), then hand it off. Its last log line
@@ -249,6 +254,15 @@ export async function waitThenHandoff(p: Pending, d: WaitDeps): Promise<number> 
   // ponytail: one poll's settle for the lines Claude Code writes right after Stop (turn_duration…); they
   // are meta, so a late one only lands on the Mac copy, where --back ignores it (transcriptAction).
   if (ended) await d.sleep(POLL_MS);
+  const found = p.anyway ? undefined : d.rescan?.();
+  if (found) {
+    release();
+    unpark();
+    d.result?.(false, "transcriptSecret");
+    d.log(`FAILED: the conversation contains what look like ${found}. They would travel to the cloud box with the transcript, so nothing was moved. To move it anyway, run /nomo-cc:handoff anyway.`);
+    d.notify("Handoff stopped: the conversation looks like it holds secrets. Nothing was moved.");
+    return 1;
+  }
   try { writeFileSync(d.pending, JSON.stringify({ ...p, state: "handing-off" }) + "\n", { mode: 0o600 }); } catch { /* status only */ }
   d.log(`${ended ? "The turn ended" : "Claude Code closed"}. Handing off session ${p.session}…`);
   const before = d.readCloud();

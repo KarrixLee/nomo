@@ -9092,7 +9092,8 @@ function handoffCommand(exists = existsSync3, watchdogPath = WATCHDOG_PATH, ccDi
   const shim = `${ccDir}/hook-shim.sh`;
   return exists(shim) ? [shim, "handoff"] : undefined;
 }
-function spawnHandoff(id, what, args, cwd, onExit) {
+var MOVE_SPAWN_TIMEOUT_MS = 2 * 60000;
+function spawnHandoff(id, what, args, cwd, onExit, timeoutMs) {
   mkdirSync2(BACK_LOCK_DIR, { recursive: true, mode: 448 });
   const log = `${BACK_LOCK_DIR}/${id.slice(0, 12)}.log`;
   const note = (why) => {
@@ -9115,10 +9116,22 @@ function spawnHandoff(id, what, args, cwd, onExit) {
   try {
     const { CLAUDE_CODE_SESSION_ID: _drop, ...env } = process.env;
     const child = spawn3(cmd[0], [...cmd.slice(1), ...args], { detached: true, stdio: ["ignore", fd, fd], env, cwd });
+    const timer = timeoutMs ? setTimeout(() => {
+      note(`still running after ${Math.round(timeoutMs / 1000)} s; stopped it`);
+      try {
+        child.kill("SIGKILL");
+      } catch {}
+      onExit(1);
+    }, timeoutMs) : undefined;
+    timer?.unref();
     child.on("error", (e) => {
+      clearTimeout(timer);
       note(`could not start ${cmd[0]}: ${e.message}`);
       onExit(1);
-    }).on("exit", (code) => onExit(code));
+    }).on("exit", (code) => {
+      clearTimeout(timer);
+      onExit(code);
+    });
     child.unref();
   } catch (e) {
     note(`could not start ${cmd[0]}: ${e?.message ?? e}`);
@@ -9168,7 +9181,7 @@ function moveToCloud(id, rec, deps = {}) {
   };
   const cwd = rec.cwd;
   try {
-    (deps.spawn ?? ((s, c, e) => spawnHandoff(s, "move-to-cloud", ["--later", "--phone", "--session", s], c, e)))(id, cwd, done);
+    (deps.spawn ?? ((s, c, e) => spawnHandoff(s, "move-to-cloud", ["--later", "--phone", "--session", s], c, e, MOVE_SPAWN_TIMEOUT_MS)))(id, cwd, done);
   } catch {
     done(1);
     return "move-spawn-failed";
@@ -10903,6 +10916,7 @@ export {
   IDLE_GRACE_MS,
   LAN_ANSWER_ECHO_DELAY_MS,
   LAN_COMMAND_ID_PREFIX,
+  MOVE_SPAWN_TIMEOUT_MS,
   MOVE_TO_CLOUD_COMMAND_KIND,
   PAIRING_TTL_MS,
   PENDING_DONE_GRACE_MS,
