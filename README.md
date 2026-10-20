@@ -125,6 +125,16 @@ home. What that does and doesn't expose:
   `credentials.json`, `secrets.*`…) is dropped from that tar. A secret git *tracks* is in the bundle
   and does travel: the `Cloud check:` block warns about it by name. That check only lists file
   names; it never opens a secret file.
+- **The box may clone a PUBLIC repo itself, and never gets a git credential.** To send less, a
+  move first asks the box for the HEAD of its existing copy of the repo; when this Mac has that
+  commit, only the newer commits travel. Otherwise, when the branch's upstream is a plain
+  `https://` URL on github.com, gitlab.com, bitbucket.org or codeberg.org (no user, token, port or
+  query in it; never ssh) and an anonymous `git ls-remote` from this Mac (no credential helper, no
+  git config, no `~/.netrc`, no prompt: it runs with an empty temporary HOME) can read it, the box
+  clones that URL anonymously (that branch only, capped at 5 minutes) and only the unpushed
+  commits travel. A private repo fails that check and goes as a full bundle, as before. No token,
+  SSH key or credential helper is ever given to the box, and the box's previous checkout (with any
+  uncommitted work) is moved aside to `<root>.nomo-bak-<time>`, never overwritten.
 - **Secrets already in the conversation are flagged before they travel.** The transcript, its
   subagent transcripts and project memory go to the box unedited, so a `.env` a session read or a key
   it printed would go too. Before anything is parked, `/nomo-cc:handoff` scans exactly those files

@@ -13,6 +13,11 @@
 // (the user's working tree and index are only READ), the transcript (+ its subagent dir) and project
 // memory into /root/.claude/projects/<same dir>/, and the user layer (~/.claude/{skills,agents,commands,
 // CLAUDE.md}). The repo is recreated at the SAME absolute path because the transcript embeds its cwd.
+// INCREMENTAL (NOM-110): when the box already has a checkout at that root whose HEAD this Mac has, only
+// boxHead..HEAD travels (pickRepoShip/seedScript); else, when the branch's upstream is a plain https URL on a
+// public forge that an ANONYMOUS ls-remote can read, the box clones it (no credential, ever) and only the
+// unpushed commits travel. The box builds the new tree beside ROOT and checks it first; any failure exits
+// SEED_FAILED with ROOT untouched and the Mac resends the full bundle in the same handoff.
 //
 // WHAT NEVER TRAVELS: the Mac's ~/.claude.json, .credentials.json or settings env, and any untracked
 // secret-named file (.env, .dev.vars, *.pem… core/readiness.ts isSecretName; packList drops them). The model runs on
@@ -510,8 +515,118 @@ function tar(out: string, cwd: string, args: string[], input?: Buffer): void {
   });
 }
 
+// ----------------------------------------------------------------- incremental move (NOM-110)
+
+/** How the repo reaches the box. `full`: a bundle of all of HEAD (the box clones it, as always).
+ *  `box`: the box's own checkout at ROOT already holds `base`. `clone`: the box anonymously clones the
+ *  public `url`, which holds `base`. Both seeded modes ship only base..head (none when head is already
+ *  in base) and the box verifies that before it touches ROOT; any failure → exit 7 → the full bundle. */
+export type RepoShip = { mode: "full" } | { mode: "box"; base: string; head: string } | { mode: "clone"; url: string; branch: string; base: string; head: string };
+export const SEED_FAILED = 7;
+const SHA_RE = /^[0-9a-f]{40}([0-9a-f]{24})?$/;
+const PUBLIC_HOSTS = new Set(["github.com", "gitlab.com", "bitbucket.org", "codeberg.org"]);
+
+/** `raw` if it is a plain `https://<public forge>/<owner>/<repo>` URL, else undefined: never ssh or
+ *  scp-style, never userinfo (a token in the URL), a port, a query/fragment, %-escapes or `.`/`..` parts. */
+export function publicCloneUrl(raw: string): string | undefined {
+  const m = /^https:\/\/([a-z0-9.-]+)((?:\/[A-Za-z0-9._-]+){2,})$/.exec(raw);
+  if (!m || !PUBLIC_HOSTS.has(m[1]) || m[2].split("/").some((p) => p === "." || p === "..")) return undefined;
+  return raw;
+}
+
+/** Git's env minus every GIT_* (no injected config such as an http.extraHeader token) and no prompts. */
+function anonGitEnv(): NodeJS.ProcessEnv {
+  const env = Object.fromEntries(Object.entries(process.env).filter(([k]) => !k.startsWith("GIT_")));
+  return { ...env, GIT_TERMINAL_PROMPT: "0", GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null", GIT_ASKPASS: "", SSH_ASKPASS: "" };
+}
+
+/** Does an ANONYMOUS ls-remote of `url` list `ref`? No config, no credential helper, no prompt, 20s.
+ *  HOME (and XDG_CONFIG_HOME) is an empty temp dir, so no ~/.netrc or ~/.gitconfig is read, and cwd is
+ *  "/", so no repo's .git/config is either. */
+export function anonLsRemote(url: string, ref: string): boolean {
+  const home = mkdtempSync(join(tmpdir(), "nomo-anon-"));
+  try {
+    execFileSync("git", ["-c", "credential.helper=", "ls-remote", "--exit-code", url, ref],
+      { cwd: "/", env: { ...anonGitEnv(), HOME: home, XDG_CONFIG_HOME: home }, stdio: "ignore", timeout: 20_000 });
+    return true;
+  } catch { return false; } finally { rmSync(home, { recursive: true, force: true }); }
+}
+
+/** A branch name safe to hand the box's clone: git check-ref-format --branch semantics, never an option. */
+export function safeBranch(name: string): string | undefined {
+  if (!name || name.startsWith("-") || !/^[A-Za-z0-9._/-]+$/.test(name)) return undefined;
+  try { execFileSync("git", ["check-ref-format", "--branch", name], { cwd: "/", stdio: "ignore" }); return name; } catch { return undefined; }
+}
+
+/** Box: print NOMO_BOX_HEAD=<sha> when ROOT is itself a git checkout with a HEAD commit. Read-only. */
+export const boxHeadScript = (root: string): string =>
+  `D=${q(root)}; if [ -d "$D/.git" ]; then H=$(git -C "$D" rev-parse -q --verify 'HEAD^{commit}' 2>/dev/null) && echo "NOMO_BOX_HEAD=$H"; fi; true`;
+export const parseBoxHead = (stdout: string): string | undefined =>
+  /^NOMO_BOX_HEAD=([0-9a-f]+)$/m.exec(stdout)?.[1]?.match(SHA_RE)?.[0];
+
+/** Path selection: the box's own HEAD when this Mac has that commit, else a public upstream the box can
+ *  clone anonymously, else the full bundle. Read-only on the user's repo. */
+export function pickRepoShip(root: string, boxHead: string | undefined, ls: (url: string, ref: string) => boolean = anonLsRemote): RepoShip {
+  const g = (...a: string[]) => execFileSync("git", a, { cwd: root, stdio: ["ignore", "pipe", "ignore"] }).toString().trim();
+  try {
+    const head = g("rev-parse", "--verify", "HEAD^{commit}");
+    if (boxHead && SHA_RE.test(boxHead)) {
+      try { g("cat-file", "-e", `${boxHead}^{commit}`); return { mode: "box", base: boxHead, head }; } catch { /* rewritten or unknown */ }
+    }
+    const branch = g("symbolic-ref", "-q", "--short", "HEAD");
+    const url = publicCloneUrl(g("remote", "get-url", g("config", `branch.${branch}.remote`)));
+    const ref = g("config", `branch.${branch}.merge`);
+    const up = ref.startsWith("refs/heads/") ? safeBranch(ref.slice("refs/heads/".length)) : undefined;
+    if (url && up && ls(url, ref)) return { mode: "clone", url, branch: up, base: g("merge-base", "HEAD", "@{u}"), head };
+  } catch { /* detached, no upstream, no remote: full */ }
+  return { mode: "full" };
+}
+
+export const fmtBytes = (n: number): string =>
+  n < 1e3 ? `${n} B` : n < 1e6 ? `${(n / 1e3).toFixed(1)} KB` : `${(n / 1e6).toFixed(1)} MB`;
+
+/** base..HEAD commit count (0: the box already has HEAD). */
+export const newCommits = (root: string, base: string): number =>
+  Number(execFileSync("git", ["rev-list", "--count", `${base}..HEAD`], { cwd: root }).toString().trim());
+
+/** Box: build ROOT from a seed (the box's own checkout, or the public clone) plus `bundle` (or none).
+ *  The seed (ROOT.nomo-seed: same filesystem, so a local clone hardlinks) is made and checked BEFORE ROOT is touched: on any failure ROOT is untouched and it exits
+ *  SEED_FAILED, so the Mac resends the full bundle. Then ROOT is moved aside exactly like the full
+ *  path does (the box's own uncommitted work stays in ROOT.nomo-bak-*), the seed takes its place and
+ *  HEAD is checked out detached at `head` (the branch, wip and untracked follow as always). */
+/** After a box start: the "resend the full bundle" message when the seed step failed, else undefined.
+ *  Exit 7 alone is ambiguous under set -e (curl's "couldn't connect" is 7 too), so it also takes a
+ *  seeded plan and the seed step's own NOMO_SEED_FAILED line. */
+export function seedFallback(ship: RepoShip, exitCode: number | undefined, stdout: string): string | undefined {
+  if (ship.mode === "full" || exitCode !== SEED_FAILED || !/^NOMO_SEED_FAILED$/m.test(stdout)) return undefined;
+  return ship.mode === "box"
+    ? "The box's own copy of the repo didn't hold what we sent; sending the full bundle instead."
+    : `The box couldn't clone ${ship.url} (or it lacked what we sent); sending the full bundle instead.`;
+}
+
+export function seedScript(ship: Exclude<RepoShip, { mode: "full" }>, bundle: string | undefined): string {
+  const check = bundle ? `git -C "$S" bundle verify -q ${bundle} >/dev/null 2>&1` : `git -C "$S" cat-file -e ${ship.head}^{commit}`;
+  // clone: only the upstream branch, no tags, and capped at 300s so a slow or huge repo falls back to
+  // the full bundle (SEED_FAILED) well inside the exec timeout. (`timeout` is coreutils on the box.)
+  const src = ship.mode === "box" ? `"$ROOT"` : `--single-branch --branch ${q(ship.branch)} --no-tags ${q(ship.url)}`;
+  return `S="$ROOT.nomo-seed"; rm -rf "$S"; mkdir -p "$(dirname "$ROOT")"
+${ship.mode === "box" ? `O=$(git -C "$ROOT" remote get-url origin 2>/dev/null) || O=` : "# public clone: origin is that URL"}
+${ship.mode === "clone" ? `TO=; command -v timeout >/dev/null && TO="timeout 300"` : "TO="}
+if ! { GIT_TERMINAL_PROMPT=0 $TO git -c credential.helper= -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=60 clone -q --no-checkout ${src} "$S" && ${check}; }; then
+  rm -rf "$S"; echo "NOMO_SEED_FAILED"; exit ${SEED_FAILED}
+fi
+[ -e "$ROOT" ] && mv "$ROOT" "$ROOT.nomo-bak-$(date +%s)"
+mv "$S" "$ROOT"
+cd "$ROOT"
+${ship.mode === "box" ? `if [ -n "$O" ]; then git remote set-url origin "$O"; else git remote remove origin; fi` : ""}
+${bundle ? `git fetch -q ${bundle}` : "# nothing new: the seed already has HEAD"}
+git -c advice.detachedHead=false checkout -q --detach ${ship.head}`;
+}
+
 export interface Plan {
   uuid: string;
+  repoLine?: string; // which repo path was used and its size (printed before the upload)
+  ship: RepoShip; // which repo path (main: a SEED_FAILED retry only makes sense for a seeded one)
   warn?: string; // a big-session heads-up (sizeWarning)
   cwd: string;
   root: string; // repo toplevel (or cwd for a non-git folder)
@@ -524,7 +639,26 @@ export interface Plan {
   gitUser: Record<string, string>; // NOMO_GIT_NAME / NOMO_GIT_EMAIL: box commits are authored as the user
 }
 
-export function build(args: Map<string, string | true>, outDir: string): Plan {
+/** Everything a move ships that does not depend on the box. stageLocal() runs BEFORE the box is woken or
+ *  created, so a bad invocation (no transcripts, a bad --session, run from HOME or /, an artifact over
+ *  the cap) fails without billing a box; finishPlan() then adds the repo bundle for the box's state. */
+export interface Staged {
+  uuid: string; cwd: string; root: string; git: boolean; branch?: string; model: string; outDir: string;
+  stage: string; art: Record<string, string>; hasLayer: boolean; marketplace: string; snap: Snapshot;
+  gitUser: Record<string, string>; warn?: string;
+}
+
+function capCheck(art: Record<string, string>, git: boolean): void {
+  for (const [box, local] of Object.entries(art)) {
+    const size = statSync(local).size;
+    if (size > MAX_ARTIFACT_BYTES) {
+      throw new Error(`${box.split("/").pop()} is ${(size / 1e6).toFixed(0)} MB (cap ${MAX_ARTIFACT_BYTES / 1e6} MB). ` +
+        (git ? "Commit or .gitignore large untracked files." : "Run handoff from a git repo, or trim the folder."));
+    }
+  }
+}
+
+export function stageLocal(args: Map<string, string | true>, outDir: string): Staged {
   const cwd = process.cwd();
   const projDir = join(process.env.HOME!, ".claude", "projects", projectDirName(cwd));
   if (!existsSync(projDir)) throw new Error(`no Claude Code transcripts for ${cwd} (looked in ${projDir})`);
@@ -533,6 +667,14 @@ export function build(args: Map<string, string | true>, outDir: string): Plan {
     : latestSession(readdirSync(projDir).map((name) => ({ name, mtimeMs: statSync(join(projDir, name)).mtimeMs })));
   if (uuid && !UUID_RE.test(uuid)) throw new Error(`session id must be a UUID, got ${JSON.stringify(uuid)}`);
   if (!uuid || !existsSync(join(projDir, `${uuid}.jsonl`))) throw new Error(`session ${uuid ?? "(none)"} not found in ${projDir}`);
+
+  let git = true, root = cwd, branch: string | undefined;
+  try {
+    root = execFileSync("git", ["rev-parse", "--show-toplevel"], { cwd, stdio: ["ignore", "pipe", "ignore"] }).toString().trim();
+  } catch { git = false; }
+  const home = process.env.HOME!;
+  const refusal = git ? (packRefusal(root, home, () => false)) : packRefusal(cwd, home);
+  if (refusal) throw new Error(`refusing to hand off: ${refusal}. Run it from a project folder.`);
 
   const transcriptBytes = readFileSync(join(projDir, `${uuid}.jsonl`));
   const transcript = transcriptBytes.toString("utf8");
@@ -558,13 +700,6 @@ export function build(args: Map<string, string | true>, outDir: string): Plan {
   // This plugin, to install for root on the box (hooks live from SessionStart).
   const marketplace = packPlugin(put("plugin.tgz"));
 
-  let git = true, root = cwd, branch: string | undefined;
-  try {
-    root = execFileSync("git", ["rev-parse", "--show-toplevel"], { cwd, stdio: ["ignore", "pipe", "ignore"] }).toString().trim();
-  } catch { git = false; }
-  const home = process.env.HOME!;
-  const refusal = git ? (packRefusal(root, home, () => false)) : packRefusal(cwd, home);
-  if (refusal) throw new Error(`refusing to hand off: ${refusal}. Run it from a project folder.`);
   const snap = takeSnapshot(cwd, root, git, projDir, transcriptBytes);
   const gitUser: Record<string, string> = {};
   if (git) {
@@ -572,7 +707,6 @@ export function build(args: Map<string, string | true>, outDir: string): Plan {
       try { gitUser[env] = execFileSync("git", ["config", k], { cwd: root, stdio: ["ignore", "pipe", "ignore"] }).toString().trim(); } catch { /* unset */ }
     }
     branch = sh("git", ["rev-parse", "--abbrev-ref", "HEAD"], root).trim();
-    sh("git", ["bundle", "create", "-q", put("repo.bundle"), "HEAD"], root);
     // READ-ONLY on the user's tree: diff vs HEAD covers staged + unstaged; untracked ride in a tar.
     writeFileSync(put("wip.patch"), execFileSync("git", ["diff", "--binary", "HEAD"], { cwd: root, maxBuffer: 1 << 30 }));
     const untracked = execFileSync("git", ["ls-files", "--others", "--exclude-standard", "-z"], { cwd: root, maxBuffer: 1 << 30 });
@@ -583,15 +717,41 @@ export function build(args: Map<string, string | true>, outDir: string): Plan {
     const list = packList(cwd, readdirSync(cwd).filter((n) => !skip(n)), skip);
     tar(put("folder.tgz"), cwd, [...EXCLUDE_SENSITIVE, "--no-recursion", "--null", "-T", "-"], list);
   }
+  capCheck(art, git);
+  const warn = sizeWarning(contextTokens(transcriptBytes.subarray(Math.max(0, transcriptBytes.length - TAIL_BYTES)).toString("utf8"), transcriptBytes.length));
+  return { uuid, cwd, root, git, branch, model, outDir, stage, art, hasLayer, marketplace, snap, gitUser, warn };
+}
 
-  for (const [box, local] of Object.entries(art)) {
-    const size = statSync(local).size;
-    if (size > MAX_ARTIFACT_BYTES) {
-      throw new Error(`${box.split("/").pop()} is ${(size / 1e6).toFixed(0)} MB (cap ${MAX_ARTIFACT_BYTES / 1e6} MB). ` +
-        (git ? "Commit or .gitignore large untracked files." : "Run handoff from a git repo, or trim the folder."));
+/** Local staging, then the box (main: ensureBox). A bad invocation throws before `box` is ever called. */
+export async function stageThenBox(args: Map<string, string | true>, outDir: string, box: () => Promise<string>): Promise<{ staged: Staged; id: string }> {
+  const staged = stageLocal(args, outDir);
+  return { staged, id: await box() };
+}
+
+type ShipOpts = { boxHead?: string; full?: boolean; ls?: (url: string, ref: string) => boolean };
+/** stageLocal + finishPlan in one go (dry run, tests). */
+export const build = (args: Map<string, string | true>, outDir: string, opts: ShipOpts = {}): Plan => finishPlan(stageLocal(args, outDir), opts);
+
+/** `boxHead`: the box's HEAD at this root (boxHeadScript), when it has one. `full`: skip the seeded
+ *  paths (the box could not use them: SEED_FAILED). Callable again on the same Staged (the retry). */
+export function finishPlan(s: Staged, opts: ShipOpts = {}): Plan {
+  const { uuid, cwd, root, git, branch, model, stage, hasLayer, marketplace } = s;
+  const art = { ...s.art };
+  let ship: RepoShip = { mode: "full" }, repoLine: string | undefined, bundle: string | undefined;
+  if (git) {
+    if (!opts.full) ship = pickRepoShip(root, opts.boxHead, opts.ls);
+    const n = ship.mode === "full" ? -1 : newCommits(root, ship.base);
+    if (n !== 0) {
+      bundle = `${stage}-repo.bundle`;
+      art[bundle] = join(s.outDir, "repo.bundle");
+      sh("git", ["bundle", "create", "-q", art[bundle], ship.mode === "full" ? "HEAD" : `${ship.base}..HEAD`], root);
+      capCheck({ [bundle]: art[bundle] }, git);
     }
+    const size = bundle ? fmtBytes(statSync(art[bundle]).size) : "nothing to send";
+    repoLine = ship.mode === "full" ? `Repo: full bundle of HEAD (${size}).`
+      : ship.mode === "box" ? `Repo: the box already has ${ship.base.slice(0, 8)}; sending ${n} new commit(s) (${size}).`
+      : `Repo: the box clones ${ship.url} anonymously; sending ${n} unpushed commit(s) (${size}).`;
   }
-
   const enc = projectDirName(cwd);
   const runEnv = ["ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"];
   const envFile = shmEnvFile(uuid);
@@ -618,11 +778,13 @@ if [ -n "\${NOMO_GIT_NAME:-}" ]; then git config --global user.name "$NOMO_GIT_N
 if [ -n "\${NOMO_GIT_EMAIL:-}" ]; then git config --global user.email "$NOMO_GIT_EMAIL"; fi
 
 ROOT=${q(root)}
-[ -e "$ROOT" ] && mv "$ROOT" "$ROOT.nomo-bak-$(date +%s)"
-mkdir -p "$(dirname "$ROOT")"
+${git && ship.mode !== "full"
+    ? seedScript(ship, bundle)
+    : `[ -e "$ROOT" ] && mv "$ROOT" "$ROOT.nomo-bak-$(date +%s)"
+mkdir -p "$(dirname "$ROOT")"`}
 ${git
-    ? `git -c advice.detachedHead=false clone -q ${stage}-repo.bundle "$ROOT"
-cd "$ROOT"
+    ? `${ship.mode === "full" ? `git -c advice.detachedHead=false clone -q ${stage}-repo.bundle "$ROOT"
+cd "$ROOT"` : "# seeded above"}
 ${branch && branch !== "HEAD" ? `git checkout -q -B ${q(branch)}` : "# detached HEAD"}
 [ -s ${stage}-wip.patch ] && git apply --binary ${stage}-wip.patch
 tar xzf ${stage}-untracked.tgz -C "$ROOT"`
@@ -665,7 +827,7 @@ sleep 8
 tmux has-session -t "=$T"
 tmux capture-pane -p -t "=$T:"
 `;
-  return { uuid, cwd, root, git, branch, model, artifacts: art, script, snap, gitUser, warn: sizeWarning(contextTokens(transcriptBytes.subarray(Math.max(0, transcriptBytes.length - TAIL_BYTES)).toString("utf8"), transcriptBytes.length)) };
+  return { uuid, repoLine, ship, cwd, root, git, branch, model, artifacts: art, script, snap: s.snap, gitUser: s.gitUser, warn: s.warn };
 }
 
 // --------------------------------------------------------------------------------------------- omg
@@ -1824,8 +1986,10 @@ async function main(): Promise<void> {
   if (args.has("--dry-run")) {
     const out = mkdtempSync(join(tmpdir(), "nomo-handoff-"));
     let plan: Plan;
-    try { plan = build(args, out); } catch (e) { rmSync(out, { recursive: true, force: true }); throw e; }
+    // No network in a dry run: no box head and no ls-remote, so it always shows the full bundle.
+    try { plan = build(args, out, { ls: () => false }); } catch (e) { rmSync(out, { recursive: true, force: true }); throw e; }
     console.log(`DRY RUN: nothing was sent. Artifacts kept in ${out} (delete it when done)`);
+    console.log("(The box-copy and public-clone repo paths need the network and are not evaluated in a dry run: shown as the full bundle.)");
     console.log(`session ${plan.uuid}  cwd ${plan.cwd}  repo ${plan.git ? `${plan.root} (${plan.branch})` : "(not git)"}  model ${plan.model}`);
     for (const [box, local] of Object.entries(plan.artifacts)) console.log(`  ${local} -> ${box}  (${statSync(local).size} B)`);
     console.log(`keys: OMG_API_KEY ${keys.omg ? "found" : "MISSING"}, OPENROUTER_API_KEY ${keys.openrouter ? "found" : "MISSING"}`);
@@ -1893,32 +2057,53 @@ async function main(): Promise<void> {
 
   if (!keys.openrouter) throw new Error("OPENROUTER_API_KEY not set (env or ~/.nomo-spike.env)");
   // The work dir holds the transcript, repo bundle, patch and untracked files: gone once uploaded.
+  // Staged BEFORE the box: a bad invocation fails here without waking or creating (billing) one.
   const out = mkdtempSync(join(tmpdir(), "nomo-handoff-"));
-  let plan: Plan, id: string;
+  let plan: Plan, r: Awaited<ReturnType<typeof exec>>, id: string;
   try {
-    plan = build(args, out);
+    const sb = await stageThenBox(args, out, () => ensureBox(omg));
+    const staged = sb.staged;
+    id = sb.id;
+    // NOM-110: the box's HEAD at this repo root (one cheap read-only exec), so only new commits travel.
+    let boxHead: string | undefined;
+    if (staged.git) {
+      try { boxHead = parseBoxHead((await exec(omg, id, boxHeadScript(staged.root))).stdout ?? ""); } catch { /* the probe failed: no box copy to build on */ }
+    }
+    const ship = async (opts: { boxHead?: string; full?: boolean }): Promise<Plan> => {
+      const p = finishPlan(staged, opts);
+      if (p.repoLine) console.log(p.repoLine);
+      for (const [box, local] of Object.entries(p.artifacts)) {
+        await api(omg, "POST", `/sandboxes/${id}/files`, [{ path: box, content: readFileSync(local).toString("base64"), mode: 0o600 }]);
+      }
+      return p;
+    };
+    plan = await ship({ boxHead });
     console.log(`Handing off session ${plan.uuid} (${plan.model}) from ${plan.cwd} · Nomo worker ${worker}`);
     if (plan.warn) console.log(plan.warn);
     const ready = readiness(plan.cwd);
     if (ready) console.log(ready);
-    id = await ensureBox(omg);
-    for (const [box, local] of Object.entries(plan.artifacts)) {
-      await api(omg, "POST", `/sandboxes/${id}/files`, [{ path: box, content: readFileSync(local).toString("base64"), mode: 0o600 }]);
+    const start = (p: Plan) => exec(omg, id, p.script, {
+      ANTHROPIC_BASE_URL: `http://127.0.0.1:${RELAY_PORT}`, // or-relay, which forwards to OpenRouter
+      ANTHROPIC_AUTH_TOKEN: keys.openrouter!, // checked above
+      ANTHROPIC_API_KEY: "",
+      CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1",
+      NOMO_WORKER_URL: worker,
+      NOMO_KNOWN: (loadCloud().active ?? []).join(" "), // nomo_prune: what this Mac has not brought back yet
+      ...p.gitUser,
+      ...(args.has("--force") ? { NOMO_FORCE: "1" } : {}),
+      ...(process.env.NOMO_HANDOFF_HELPER ? { NOMO_PAIR_REQUIRED: "1" } : {}),
+    });
+    r = await start(plan);
+    const fallback = seedFallback(plan.ship, r.exitCode, r.stdout ?? "");
+    if (fallback) {
+      // The seed step failed before anything at the root was touched.
+      console.log(fallback);
+      plan = await ship({ full: true });
+      r = await start(plan);
     }
   } finally {
     rmSync(out, { recursive: true, force: true });
   }
-  const r = await exec(omg, id, plan.script, {
-    ANTHROPIC_BASE_URL: `http://127.0.0.1:${RELAY_PORT}`, // or-relay, which forwards to OpenRouter
-    ANTHROPIC_AUTH_TOKEN: keys.openrouter,
-    ANTHROPIC_API_KEY: "",
-    CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1",
-    NOMO_WORKER_URL: worker,
-    NOMO_KNOWN: (loadCloud().active ?? []).join(" "), // nomo_prune: what this Mac has not brought back yet
-    ...plan.gitUser,
-    ...(args.has("--force") ? { NOMO_FORCE: "1" } : {}),
-    ...(process.env.NOMO_HANDOFF_HELPER ? { NOMO_PAIR_REQUIRED: "1" } : {}),
-  });
   const pane = takePairUrl(r.stdout ?? "").rest.replace(/^NOMO_(PAIRED|PAIR_FAILED: .*|REPAIR: .*)$\n?/gm, ""); // never echo the QR URL
   if (r.exitCode === 4) throw new Error(`the OpenRouter relay did not start on box ${id}:\n${pane.slice(-1000)}`);
   if (r.exitCode === 3) throw new Error(busyMessage(r.stdout ?? "", id, plan.uuid, plan.root));
