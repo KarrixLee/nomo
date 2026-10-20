@@ -384,7 +384,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "2.3.36";
+var PLUGIN_VERSION = "2.3.37";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -3673,6 +3673,14 @@ function sizeWarning(tokens) {
 function needsPairing(cloud, worker) {
   return !cloud.sandboxId || cloud.pairedTo !== `${cloud.sandboxId} ${worker}`;
 }
+var BOX_MAX_SESSIONS = 4;
+function boxPaired(path = `${CC_DIR}/cloud.json`, worker = (process.env.NOMO_WORKER_URL || DEFAULT_WORKER_URL).replace(/\/$/, "")) {
+  try {
+    return !needsPairing(JSON.parse(readFileSync4(path, "utf8")), worker);
+  } catch {
+    return false;
+  }
+}
 function readPending(path) {
   try {
     return JSON.parse(readFileSync4(path, "utf8"));
@@ -3842,6 +3850,8 @@ function phoneMoveCheck(f) {
     return { refuse: "it is already running in the cloud" };
   if (f.needsPairing)
     return { refuse: "the cloud box needs a one-time pairing; run /nomo-cc:handoff in that session first" };
+  if (f.cloudCount >= BOX_MAX_SESSIONS)
+    return { refuse: `the cloud box already runs ${f.cloudCount} sessions (the cap is ${BOX_MAX_SESSIONS}); bring one back first` };
   if (!r.cwd || !f.transcriptExists(r.cwd))
     return { refuse: "its transcript was not found" };
   const secrets = f.trackedSecrets(r.cwd);
@@ -4829,7 +4839,6 @@ var BOX_PLUGIN = `R=$(ls -d /root/.claude/plugins/cache/nomo/nomo-cc/*/ 2>/dev/n
 var RELAY_PORT = 47181;
 var BASE_TEMPLATE = "nomo-base";
 var SHM_SWEEP = `find /dev/shm -maxdepth 1 -name 'nomo-env*' -mmin +15 -delete 2>/dev/null || true`;
-var BOX_MAX_SESSIONS = 4;
 var BOX_SESSIONS = "/root/.nomo-sessions";
 var BOX_CURRENT = "/root/.nomo-current";
 var BOX_LIB = `SD=${BOX_SESSIONS}
@@ -6192,13 +6201,15 @@ async function phoneLater(args, keys, worker) {
   if (!keys.omg || !keys.openrouter)
     throw new Error("OMG_API_KEY and OPENROUTER_API_KEY must be set (env or ~/.nomo-spike.env)");
   const home = process.env.HOME;
+  const cloud = loadCloud();
   const ok = phoneMoveCheck({
     record: await readRecord(session),
     command: (pid) => pidAlive(pid) ? pidCommand(pid) : undefined,
     ancestorsOf: pidAncestors,
     parked: readPark(session) !== undefined,
     active: cloudActive(session),
-    needsPairing: needsPairing(loadCloud(), worker),
+    needsPairing: needsPairing(cloud, worker),
+    cloudCount: cloud.active?.length ?? 0,
     transcriptExists: (cwd) => existsSync5(join6(home, ".claude", "projects", projectDirName(cwd), `${session}.jsonl`)),
     trackedSecrets: trackedSecretFiles
   });

@@ -82,13 +82,14 @@ import { cloudReadiness, gitProbe, isSecretName, trackedSecretFiles } from "../c
 import { backLockHolder, clearPark, cloudActive, PARK_DIR, writeMoveResult, readPark, releaseBackLock, stageLanding, takeBackLock, writePark } from "../core/park";
 import { atomicWrite, CC_DIR, pidAlive, pidAncestors, pidCommand, readRecord, SESSIONS_DIR } from "../core/shared";
 import {
-  cancelPending, claimPending, DEFAULT_THEN, phoneMoveCheck, settleThenStamp, contextTokens, contextTokensOf, GONE_MSG, sizeWarning, TAIL_BYTES, handoffArgv, LATER_LOG, LATER_USAGE, laterStatus, needsPairing, parseLaterArg, type Pending, PENDING_PATH, readPending, resolveSession, waitThenHandoff,
+  BOX_MAX_SESSIONS, cancelPending, claimPending, DEFAULT_THEN, phoneMoveCheck, settleThenStamp, contextTokens, contextTokensOf, GONE_MSG, sizeWarning, TAIL_BYTES, handoffArgv, LATER_LOG, LATER_USAGE, laterStatus, needsPairing, parseLaterArg, type Pending, PENDING_PATH, readPending, resolveSession, waitThenHandoff,
 } from "../core/handoff-later";
 import {
   agentConfigPaths, applyInPlace, atomicWriteBytes, type BoxArtifacts, boxChangedPaths, boxIdle, copyContained, decideCode, extractTgz,
   backCaps, landFolder, landOnBranch, listFiles, MAX_ARTIFACT_BYTES, macGitState, mergeMemory, mkdirp, parseMarkers, printable,
   type Snapshot, takeSnapshot, transcriptAction, validateTree,
 } from "../core/cloud-back";
+export { BOX_MAX_SESSIONS };
 import { renderQR } from "../qr/qr";
 import { renderQRSVG } from "../qr/qr-svg";
 
@@ -109,9 +110,6 @@ const BASE_TEMPLATE = "nomo-base";
  *  than 15 min: a handoff in flight (a fresh box installs for minutes) writes its own and touches it again
  *  right before launch; the box exec itself times out at 10 min. */
 export const SHM_SWEEP = `find /dev/shm -maxdepth 1 -name 'nomo-env*' -mmin +15 -delete 2>/dev/null || true`;
-/** Sessions one box runs at once (NOM-92). Measured on a Pro box (4 vCPU, 8 GB): idle CC ≈ 250 MB.
- *  ponytail: one cap for every size; per-size caps when boxes come in more than one size. */
-export const BOX_MAX_SESSIONS = 4;
 /** Per handed-off session: /root/.nomo-sessions/<uuid> = "<project root>\n<tmux session>\n". It lives
  *  from the handoff until --back pulls the work (a stopped session keeps it: its work is still there). */
 const BOX_SESSIONS = "/root/.nomo-sessions";
@@ -1541,13 +1539,15 @@ async function phoneLater(args: Map<string, string | true>, keys: { omg?: string
   if (typeof session !== "string" || !UUID_RE.test(session)) throw new Error("--phone needs --session <uuid>");
   if (!keys.omg || !keys.openrouter) throw new Error("OMG_API_KEY and OPENROUTER_API_KEY must be set (env or ~/.nomo-spike.env)");
   const home = process.env.HOME!;
+  const cloud = loadCloud();
   const ok = phoneMoveCheck({
     record: await readRecord(session),
     command: (pid) => (pidAlive(pid) ? pidCommand(pid) : undefined),
     ancestorsOf: pidAncestors,
     parked: readPark(session) !== undefined,
     active: cloudActive(session),
-    needsPairing: needsPairing(loadCloud(), worker),
+    needsPairing: needsPairing(cloud, worker),
+    cloudCount: cloud.active?.length ?? 0,
     transcriptExists: (cwd) => existsSync(join(home, ".claude", "projects", projectDirName(cwd), `${session}.jsonl`)),
     trackedSecrets: trackedSecretFiles,
   });

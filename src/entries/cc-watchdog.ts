@@ -58,6 +58,7 @@ import {
 } from "../core/shared";
 import { rememberBounded } from "../core/bounded-set";
 import { BackRun, backLockHolder, BACK_LOCK_DIR, cloudActive, cloudState, CloudState, endMovingTurn, Park, parkWantsCommands, readMoveResult, readPark, withParked } from "../core/park";
+import { boxPaired } from "../core/handoff-later";
 
 // The transcript-tail interrupt PARSERS live in the agent adapters now (the two detections are
 // structurally different). Re-export them so existing importers/tests that reference "./cc-watchdog"
@@ -1880,6 +1881,16 @@ export type CommandWake = ReturnType<typeof createWake>;
 export function isCommandActiveSession(record: SessionRecord): boolean {
   if (record.op === "done" || record.lastEvent === "done") return false;
   return record.lastEvent === "working" || isWaitingSession(record);
+}
+
+/** NOM-95: on a Mac with a paired box, any live, unparked Claude Code session (idle or done included)
+ *  also keeps the poll up, so the phone's Move to cloud reaches an idle session off-LAN (a done row
+ *  sends no heartbeat, so the piggyback never carries it). Parked sessions keep parkWantsCommands.
+ *  Without a box nothing changes: the DO poll cost stays limited to box users. Still ONE poll per Mac. */
+export function wantsCommands(record: SessionRecord, park: Park | undefined, box: boolean, alive: (pid: number) => boolean = pidAlive): boolean {
+  if (isCommandActiveSession(record) || parkWantsCommands(park)) return true;
+  return box && !park && (record.agent ?? "claude") === "claude" && record.provisional !== true &&
+    typeof record.pid === "number" && record.pid > 1 && alive(record.pid);
 }
 
 export interface CommandWaitDeps {
@@ -3844,7 +3855,8 @@ async function sweep(config: Config | null, deps: SweepDeps = {}): Promise<Sweep
   // hold gate probes the holder pid), but the directory must not grow one per killed hook forever.
   await pruneStaleDecisionHolds(files);
   let remaining = 0;
-  let active = 0; // sessions the command long-poll should stay up for (isCommandActiveSession)
+  let active = 0; // sessions the command long-poll should stay up for (wantsCommands)
+  let box: boolean | undefined; // boxPaired(), read at most once per sweep
   // Any 2xx POST this sweep proves the pairing is alive → the loop resets the gone-strike streak, so a
   // real success from EITHER the watchdog or the hook clears a stray transient strike.
   let delivered = false;
@@ -3874,7 +3886,7 @@ async function sweep(config: Config | null, deps: SweepDeps = {}): Promise<Sweep
     }
     if (verdict === "keep") {
       const park = record ? readPark(sessionId) : undefined;
-      if (record && (isCommandActiveSession(record) || parkWantsCommands(park))) active++;
+      if (record && wantsCommands(record, park, box ??= boxPaired())) active++;
       // Long-lived Plan verification runs before the done-debt net: a killed/old Stop may have left a
       // donePending record whose terminal state is precisely what still needs classification.
       let planVerificationHandled = false;

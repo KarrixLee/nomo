@@ -8,7 +8,7 @@ import { createLanAnswerStore } from "../core/lan-listener";
 import type { DecisionHold, PlanPickerTraceDecision, SessionRecord } from "../core/shared";
 import { GONE_STRIKE_LIMIT, readGoneStrikes, recordGoneStrike, resetGoneStrikes, tracePlanPickerDecision } from "../core/shared";
 import {
-  acceptLanAnswer, acceptLanCommand, commandWaitLoop, createWake, fileCursorStore, isCommandActiveSession, enqueueDrainCommands, LAN_ANSWER_ECHO_DELAY_MS, LAN_COMMAND_ID_PREFIX,
+  acceptLanAnswer, acceptLanCommand, commandWaitLoop, createWake, fileCursorStore, isCommandActiveSession, wantsCommands, enqueueDrainCommands, LAN_ANSWER_ECHO_DELAY_MS, LAN_COMMAND_ID_PREFIX,
   buildDoneEnvelope, buildEndEnvelope, buildHeartbeatEnvelope, buildNeedsAttentionEnvelope, buildProvisionalBlob,
   buildProvisionalEnvelope, buildProvisionalRecord, buildStartEnvelope, buildTitleRepairEnvelope, classifySession,
   claudeTailPendingApproval, codexLastTurnEvent, codexTailPendingApproval, correctIdleClaude, correctInterrupt,
@@ -4974,6 +4974,22 @@ describe("commandWaitLoop (GET /v1/cc/commands/wait long-poll)", () => {
     expect(isCommandActiveSession(rec({ lastEvent: "done" }))).toBe(false);
     expect(isCommandActiveSession(rec({ lastEvent: "working", op: "done" }))).toBe(false);
     expect(isCommandActiveSession(rec({ lastEvent: "sessionStart" }))).toBe(false);
+  });
+
+  test("NOM-95: with a paired box, a live unparked idle Claude Code session keeps it up", () => {
+    const idle = rec({ lastEvent: "done", op: "done", pid: 400 });
+    const live = (p: number) => p === 400;
+    expect(wantsCommands(idle, undefined, true, live)).toBe(true);
+    expect(wantsCommands(rec({ lastEvent: "sessionStart", pid: 400 }), undefined, true, live)).toBe(true);
+    expect(wantsCommands(idle, undefined, false, live)).toBe(false);                          // no box: today's rule
+    expect(wantsCommands(idle, undefined, true, () => false)).toBe(false);                    // dead pid
+    expect(wantsCommands(rec({ lastEvent: "done", op: "done" }), undefined, true, live)).toBe(false); // no pid
+    expect(wantsCommands({ ...idle, agent: "codex" }, undefined, true, live)).toBe(false);
+    expect(wantsCommands({ ...idle, provisional: true }, undefined, true, live)).toBe(false);
+    // parked: parkWantsCommands decides, box or not
+    expect(wantsCommands(idle, { state: "back" } as never, true, live)).toBe(false);
+    expect(wantsCommands(idle, { state: "cloud" } as never, false, live)).toBe(true);
+    expect(wantsCommands(rec({ lastEvent: "working" }), undefined, false, () => false)).toBe(true);
   });
 });
 

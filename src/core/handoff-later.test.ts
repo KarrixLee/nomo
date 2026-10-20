@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   cancelPending, claimPending, contextTokens, contextTokensOf, DEFAULT_THEN, GONE_MSG, parseLaterArg, sizeWarning, handoffArgv, handoffLanded, laterStatus, NOTHING_RAN_MSG, needsPairing, type Pending, readPending, resolveSession, waitThenHandoff, type WaitDeps,
-  phoneMoveCheck, type PhoneMoveFacts, settleThenStamp,
+  BOX_MAX_SESSIONS, boxPaired, phoneMoveCheck, type PhoneMoveFacts, settleThenStamp,
 } from "./handoff-later";
 import { parkHook, readPark, writePark } from "./park";
 
@@ -34,6 +34,14 @@ describe("resolveSession", () => {
     expect(resolveSession({ env: {}, ancestors: [300, 400, 1], records })).toEqual({ session: A, claudePid: 400 });
     expect(resolveSession({ env: {}, ancestors: [300], records })).toEqual({ session: undefined, claudePid: undefined });
   });
+});
+
+test("boxPaired (NOM-95): cloud.json paired to the worker; missing or other worker fails closed", () => {
+  const f = join(tmp(), "cloud.json");
+  expect(boxPaired(f, "https://w")).toBe(false);
+  writeFileSync(f, JSON.stringify({ sandboxId: "sb", pairedTo: "sb https://w" }));
+  expect(boxPaired(f, "https://w")).toBe(true);
+  expect(boxPaired(f, "https://other")).toBe(false);
 });
 
 test("needsPairing: only a box recorded as paired to THIS worker passes", () => {
@@ -328,7 +336,7 @@ describe("phone move-to-cloud (NOM-94)", () => {
     record: { pid: 400, cwd: "/p/app" },
     command: (pid) => (pid === 400 ? CLAUDE : pid === 300 ? "-zsh" : undefined),
     ancestorsOf: () => [300],
-    parked: false, active: false, needsPairing: false,
+    parked: false, active: false, needsPairing: false, cloudCount: 0,
     transcriptExists: () => true,
     trackedSecrets: () => [],
     ...o,
@@ -358,6 +366,8 @@ describe("phone move-to-cloud (NOM-94)", () => {
     expect(refuse({ parked: true })).toMatch(/already moving/);
     expect(refuse({ active: true })).toMatch(/already running in the cloud/);
     expect(refuse({ needsPairing: true })).toMatch(/pairing/);
+    expect(refuse({ cloudCount: BOX_MAX_SESSIONS })).toMatch(/cap is 4/);
+    expect(phoneMoveCheck(facts({ cloudCount: BOX_MAX_SESSIONS - 1 }))).toEqual({ claudePid: 400, cwd: "/p/app" });
     expect(refuse({ transcriptExists: () => false })).toMatch(/transcript/);
     expect(refuse({ record: { pid: 400 } })).toMatch(/transcript/);
   });

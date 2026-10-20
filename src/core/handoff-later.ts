@@ -15,6 +15,7 @@ import { appendFileSync, closeSync, fstatSync, linkSync, openSync, readFileSync,
 import { basename } from "node:path";
 import { claudeDesktopInvocation, claudeHeadlessInvocation } from "./adapter";
 import { clearPark, readPark, stamp, writePark } from "./park";
+import { DEFAULT_WORKER_URL } from "./pair-url";
 import { CC_DIR } from "./shared";
 
 export const PENDING_PATH = `${CC_DIR}/handoff-pending.json`;
@@ -116,6 +117,16 @@ export function sizeWarning(tokens: number): string | undefined {
 /** True unless cloud.json records the user's box as paired to `worker`. */
 export function needsPairing(cloud: { sandboxId?: string; pairedTo?: string }, worker: string): boolean {
   return !cloud.sandboxId || cloud.pairedTo !== `${cloud.sandboxId} ${worker}`;
+}
+
+/** Sessions one box runs at once (NOM-92). Measured on a Pro box (4 vCPU, 8 GB): idle CC ≈ 250 MB.
+ *  ponytail: one cap for every size; per-size caps when boxes come in more than one size. */
+export const BOX_MAX_SESSIONS = 4;
+
+/** NOM-95: does this Mac have a box paired to the worker a phone-started move would use (the same
+ *  needsPairing gate, against the same NOMO_WORKER_URL the spawned handoff inherits)? Fails closed. */
+export function boxPaired(path = `${CC_DIR}/cloud.json`, worker = (process.env.NOMO_WORKER_URL || DEFAULT_WORKER_URL).replace(/\/$/, "")): boolean {
+  try { return !needsPairing(JSON.parse(readFileSync(path, "utf8")), worker); } catch { return false; }
 }
 
 export interface PendingDeps {
@@ -282,6 +293,8 @@ export interface PhoneMoveFacts {
   parked: boolean;
   active: boolean;
   needsPairing: boolean;
+  /** cloud.json `active.length`: sessions already on the box. */
+  cloudCount: number;
   transcriptExists: (cwd: string) => boolean;
   /** Git-tracked files under cwd's repo whose name looks like a secret ([] outside git); undefined
    *  when git failed (readiness.ts trackedSecretFiles). */
@@ -304,6 +317,7 @@ export function phoneMoveCheck(f: PhoneMoveFacts): { claudePid: number; cwd: str
   if (f.parked) return { refuse: "it is already moving, in the cloud, or parked" };
   if (f.active) return { refuse: "it is already running in the cloud" };
   if (f.needsPairing) return { refuse: "the cloud box needs a one-time pairing; run /nomo-cc:handoff in that session first" };
+  if (f.cloudCount >= BOX_MAX_SESSIONS) return { refuse: `the cloud box already runs ${f.cloudCount} sessions (the cap is ${BOX_MAX_SESSIONS}); bring one back first` };
   if (!r.cwd || !f.transcriptExists(r.cwd)) return { refuse: "its transcript was not found" };
   const secrets = f.trackedSecrets(r.cwd);
   if (!secrets) return { refuse: "git could not list the project's tracked files" };
