@@ -125,6 +125,29 @@ home. What that does and doesn't expose:
   `credentials.json`, `secrets.*`…) is dropped from that tar. A secret git *tracks* is in the bundle
   and does travel: the `Cloud check:` block warns about it by name. That check only lists file
   names; it never opens a secret file.
+- **Secrets already in the conversation are flagged before they travel.** The transcript, its
+  subagent transcripts and project memory go to the box unedited, so a `.env` a session read or a key
+  it printed would go too. Before anything is parked, `/nomo-cc:handoff` scans exactly those files
+  (`src/core/transcript-scan.ts`) for key-shaped strings: OpenAI `sk-…`, Anthropic `sk-ant-…`,
+  OpenRouter `sk-or-v1-…`, GitHub
+  `ghp_`/`gho_`/`ghu_`/`ghs_`/`ghr_`/`github_pat_`, AWS `AKIA`/`ASIA`, Slack `xox[bpas]-`, Google
+  `AIza…`, Stripe `sk_live_`/`rk_live_`, PEM private-key headers, JWTs (the header must decode to JSON
+  with `alg`), and upper-case `…KEY=`/`…SECRET=`/`…TOKEN=`/`…PASSWORD=` assignments whose value is
+  16+ characters, mixes letters and digits and has high Shannon entropy. On a hit it prints the kinds,
+  counts and line numbers in the `Cloud check:` block and starts nothing; `/nomo-cc:handoff anyway`
+  is the user's explicit confirmation (a confirmation step, not enforcement: whoever can type in the
+  session can type it). The helper scans again right before the upload, since the rest of the turn may
+  print more: without `anyway` a new finding stops the move and unparks the window. *Move to cloud*
+  from the phone refuses instead (`cloudWhy: "transcriptSecret"`), at preflight and at that rescan. The
+  scan never returns, logs or prints a matched value, not even part of one. It skips obvious
+  placeholders (`xxx`, `your-key-here`, `<…>`, `example`…) and anything embedded in a longer base64
+  run (Nomo's own sealed blobs, images). **It is pattern-based, so it is a seatbelt, not a
+  guarantee.** It misses: keys without a known prefix unless they sit in an upper-case `NAME=value`
+  line (so lower-case or JSON-style `api_key=…` / `"apiKey": "…"` are missed), passwords inside
+  connection URLs (`postgres://user:pass@…`), opaque `Bearer` tokens that aren't JWTs, short or
+  low-entropy values, secrets split across lines or encoded, and the user-layer files that also
+  travel (`~/.claude/{skills,agents,commands,CLAUDE.md}`), which are not scanned. It can also flag a
+  test, example or revoked key.
 - **The box is its own paired computer.** It pairs with your phone under its own keys ("Nomo Cloud"),
   so phone ↔ box traffic is end-to-end sealed exactly like your Mac's, and the relay stays blind:
   it sees ids and flags (op, priority, a `parked` boolean), never titles or content.

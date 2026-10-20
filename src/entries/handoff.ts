@@ -79,10 +79,11 @@ import { renderPairPage } from "../core/pair-page";
 import { buildPairURL, DEFAULT_WORKER_URL } from "../core/pair-url";
 import { normalizeModelId } from "../core/adapter";
 import { cloudReadiness, gitProbe, isSecretName, trackedSecretFiles } from "../core/readiness";
+import { scanHandoff, secretSummary } from "../core/transcript-scan";
 import { backLockHolder, clearPark, cloudActive, moveResultFile, type MoveWhy, PARK_DIR, writeBackResult, writeMoveResult, readPark, releaseBackLock, stageLanding, takeBackLock, writePark } from "../core/park";
-import { atomicWrite, CC_DIR, pidAlive, pidAncestors, pidCommand, readRecord, SESSIONS_DIR } from "../core/shared";
+import { atomicWrite, CC_DIR, macWorkerUrl, pidAlive, pidAncestors, pidCommand, readRecord, SESSIONS_DIR } from "../core/shared";
 import {
-  BOX_MAX_SESSIONS, cancelPending, claimPending, DEFAULT_THEN, EXIT_BOX_GONE, phoneMoveCheck, settleThenStamp, contextTokens, contextTokensOf, GONE_MSG, sizeWarning, TAIL_BYTES, handoffArgv, LATER_LOG, LATER_USAGE, laterStatus, needsPairing, parseLaterArg, type Pending, PENDING_PATH, readPending, resolveSession, waitThenHandoff,
+  BOX_MAX_SESSIONS, cancelPending, claimPending, DEFAULT_THEN, EXIT_BOX_GONE, phoneMoveCheck, settleThenStamp, contextTokens, contextTokensOf, GONE_MSG, sizeWarning, TAIL_BYTES, handoffArgv, LATER_LOG, LATER_USAGE, laterStatus, transcriptSecretWarning, needsPairing, parseLaterArg, type Pending, PENDING_PATH, readPending, resolveSession, waitThenHandoff,
 } from "../core/handoff-later";
 import {
   agentConfigPaths, applyInPlace, atomicWriteBytes, type BoxArtifacts, boxChangedPaths, boxIdle, copyContained, decideCode, extractTgz,
@@ -243,6 +244,10 @@ export const PAIR_FN = `nomo_pair() {
   tmux kill-session -t nomo-pair 2>/dev/null || true
   tmux new-session -d -s nomo-pair "bun $R/dist/pair.mjs wait > ${BOX_CC}/cloud-pair.log 2>&1"
 }`;
+/** An unattended (helper) handoff can't show a QR: unless the box is already paired TO the target
+ *  worker, stop before anything is admitted, unpacked or started (exit 6), so the Mac copy really is
+ *  untouched and nomo_pair never replaces the box's existing pairing behind the user's back. */
+export const PAIR_GATE = `[ -z "\${NOMO_PAIR_REQUIRED:-}" ] || { grep -q '"e2eKeyB64"' ${BOX_CC}/config.json 2>/dev/null && grep -qF '"url":"'"\${NOMO_WORKER_URL:-${DEFAULT_WORKER_URL}}"'"' ${BOX_CC}/config.json; } || { echo NOMO_NEEDS_PAIRING; exit 6; }`;
 export const PAIR_POLL = `${SHM_SWEEP}
 grep -q '"e2eKeyB64"' ${BOX_CC}/config.json 2>/dev/null && echo PAIRED && exit 0
 tmux has-session -t nomo-pair 2>/dev/null && echo WAITING && exit 0
@@ -381,9 +386,9 @@ rm -rf ${STAGE}-* ${BOX_CC} /root/.claude/projects /dev/shm/nomo-env* ${BOX_SESS
 echo NOMO_BAKED`;
 }
 
-/** The worker the box pairs with: --worker, else the Mac's NOMO_WORKER_URL, else production. */
-export function targetWorker(flag: string | true | undefined, env: string | undefined): string {
-  const w = (typeof flag === "string" && flag ? flag : env || DEFAULT_WORKER_URL).replace(/\/$/, "");
+/** The worker the box pairs with: --worker, else the Mac's own (macWorkerUrl), else production. */
+export function targetWorker(flag: string | true | undefined, mac: string | undefined): string {
+  const w = (typeof flag === "string" && flag ? flag : mac || DEFAULT_WORKER_URL).replace(/\/$/, "");
   const bad = () => new Error(`worker URL must be an https origin (http only for localhost), got ${JSON.stringify(w)}`);
   if (!/^https?:\/\/[^/\s@]+$/.test(w)) throw bad(); // no path, no userinfo
   const u = new URL(w);
@@ -564,6 +569,7 @@ export function build(args: Map<string, string | true>, outDir: string): Plan {
 
   const script = `${boxPrelude(uuid)}
 set -euo pipefail
+${PAIR_GATE}
 ${admitScript(uuid, root)}
 T=${tmuxName(uuid)}
 # Keys reach claude via RAM, never argv: the file (this session's own, so two handoffs never race on it)
@@ -1080,8 +1086,10 @@ async function afterPair(omg: string, id: string, stdout: string, worker: string
   const paired = /^NOMO_PAIRED$/m.test(rest);
   updateCloud((c) => ({ ...c, pairedTo: paired ? `${id} ${worker}` : undefined }));
   if (!paired && process.env.NOMO_HANDOFF_HELPER) {
-    // Never a QR on an unattended Mac: the box runs the session, but the phone can't see it until paired.
-    throw new Error(`the session started on box ${id}, but the box needs pairing, so your phone can't see it. Pair it from a terminal: ${q(process.execPath)} ${q(SELF)} --pair`);
+    // Never a QR on an unattended Mac. PAIR_GATE refuses an unpaired box before the start, so this is a
+    // race only: the session IS running and on record, so a failure here would leave two live copies.
+    console.log(`\nThe session runs on box ${id}, but the box needs pairing, so your phone can't see it. Pair it from a terminal: ${q(process.execPath)} ${q(SELF)} --pair`);
+    return;
   }
   const failed = rest.match(/^NOMO_PAIR_FAILED: (.*)$/m);
   const old = rest.match(/^NOMO_REPAIR: (.*)$/m);
@@ -1550,6 +1558,9 @@ async function later(args: Map<string, string | true>, keys: { omg?: string; ope
   try { root = execFileSync("git", ["rev-parse", "--show-toplevel"], { cwd, stdio: ["ignore", "pipe", "ignore"] }).toString().trim(); } catch { /* not git */ }
   const refusal = root ? packRefusal(root, home, () => false) : packRefusal(cwd, home);
   if (refusal) throw new Error(`refusing to hand off: ${refusal}. Run it from a project folder.`);
+  // NOM-103: before anything is parked or started, so a refusal leaves the window as it was.
+  const inTranscript = secretSummary(scanHandoff(join(home, ".claude", "projects", projectDirName(cwd)), session), session);
+  if (inTranscript && !arg.anyway) { console.log(transcriptSecretWarning(inTranscript, false)); process.exitCode = 1; return; }
   if (needsPairing(loadCloud(), worker)) {
     console.log(`Your cloud box needs a one-time pairing (a QR scan), which can't happen in the background. Nothing was started.\n` +
       `Quit Claude Code (/exit), then run this in a terminal:\n  cd ${q(cwd)} && ${q(process.execPath)} ${q(SELF)} --session ${session}` +
@@ -1557,7 +1568,7 @@ async function later(args: Map<string, string | true>, keys: { omg?: string; ope
     process.exitCode = 1;
     return;
   }
-  if (!arm(session, claudePid, cwd, arg.message, worker)) return;
+  if (!arm(session, claudePid, cwd, arg.message, worker, arg.anyway)) return;
   console.log(`Ready. Session ${session} moves to the cloud as soon as this turn ends; watch it on your phone.\n` +
     `This window stays open but parked: new prompts are blocked until you run /nomo-cc:back here.\n` +
     (arg.message ? `First message on the box: "${arg.message}"` : "No first message (quiet).") +
@@ -1567,13 +1578,14 @@ async function later(args: Map<string, string | true>, keys: { omg?: string; ope
   if (warn) console.log(warn);
   const ready = readiness(cwd);
   if (ready) console.log(ready);
+  if (inTranscript) console.log(transcriptSecretWarning(inTranscript, true));
 }
 
 /** Claim the pending slot, park the window "moving" and start the detached helper. False (message
  *  printed) when another handoff already holds the slot. */
-function arm(session: string, claudePid: number, cwd: string, message: string | undefined, worker: string): boolean {
+function arm(session: string, claudePid: number, cwd: string, message: string | undefined, worker: string, anyway?: true): boolean {
   mkdirSync(CC_DIR, { recursive: true, mode: 0o700 });
-  const p: Pending = { helperPid: process.pid, session, claudePid, state: "waiting", startedAt: Date.now(), message };
+  const p: Pending = { helperPid: process.pid, session, claudePid, state: "waiting", startedAt: Date.now(), message, ...(anyway ? { anyway } : {}) };
   if (!claimPending(PENDING, p)) {
     const cur = readPending(PENDING_PATH);
     console.log(`A handoff is already waiting (session ${cur?.session ?? "?"}). See /nomo-cc:handoff status, or /nomo-cc:handoff cancel.`);
@@ -1609,6 +1621,7 @@ async function phoneLater(args: Map<string, string | true>, keys: { omg?: string
     cloudCount: cloud.active?.length ?? 0,
     transcriptExists: (cwd) => existsSync(join(home, ".claude", "projects", projectDirName(cwd), `${session}.jsonl`)),
     trackedSecrets: trackedSecretFiles,
+    transcriptSecrets: (cwd) => secretSummary(scanHandoff(join(home, ".claude", "projects", projectDirName(cwd)), session), session),
   });
   if ("refuse" in ok) return refuse(ok.why, ok.refuse);
   let root: string | undefined;
@@ -1627,7 +1640,10 @@ async function afterExit(args: Map<string, string | true>, worker: string): Prom
   let pending = readPending(PENDING_PATH); // wait out later()'s rewrite naming this helper (a torn read is undefined)
   for (let i = 0; i < 30 && pending?.helperPid !== process.pid; i++) { await new Promise((r) => setTimeout(r, 100)); pending = readPending(PENDING_PATH); }
   const message = pending?.session === session ? pending.message : undefined; // from the 0600 record, never argv
-  process.exitCode = await waitThenHandoff({ helperPid: process.pid, session, claudePid, state: "waiting", startedAt: Date.now(), message }, {
+  const anyway = pending?.session === session && pending.anyway ? { anyway: true as const } : {};
+  const projDir = join(process.env.HOME!, ".claude", "projects", projectDirName(process.cwd())); // build() packs from here
+  process.exitCode = await waitThenHandoff({ helperPid: process.pid, session, claudePid, state: "waiting", startedAt: Date.now(), message, ...anyway }, {
+    rescan: () => secretSummary(scanHandoff(projDir, session), session),
     pending: PENDING_PATH,
     parkDir: PARK_DIR,
     result: (ok, why) => writeMoveResult(session, ok, undefined, why),
@@ -1652,15 +1668,39 @@ async function afterExit(args: Map<string, string | true>, worker: string): Prom
 
 // -------------------------------------------------------------------------------------------- main
 
-async function main(): Promise<void> {
-  const argv = process.argv.slice(2).filter((a) => a !== "handoff");
+export const USAGE = `usage:
+  handoff.mjs [--session <uuid>] [--model <id>] [--force] [--dry-run] [--then "<first message>"] [--worker <url>]
+  handoff.mjs --status | --stop [--session <uuid> | --all] | --pair
+  handoff.mjs --screen | --send "<text>" | --send-key <tmux key, e.g. Escape, BTab, C-c>   [--session <uuid>]
+  handoff.mjs --bake | --check | --help
+  handoff.mjs --back [--session <uuid>] [--force] [--no-open] [--wait <min>]
+  handoff.mjs --later [--session <uuid>] | --later-cancel | --later-status`;
+const VALUE_FLAGS = ["--session", "--model", "--send", "--send-key", "--then", "--worker", "--claude-pid", "--from-session"];
+/** Every flag main and its sub-commands read; --wait takes an optional <min>. */
+export const KNOWN_FLAGS = [...VALUE_FLAGS, "--wait", "--after-exit", "--all", "--args-stdin", "--back", "--bake", "--box-health",
+  "--box-pair", "--check", "--dry-run", "--force", "--help", "--later", "--later-cancel", "--later-status", "--no-open", "--pair",
+  "--phone", "--screen", "--status", "--stop"];
+
+/** An unknown --flag throws BEFORE anything runs: it used to fall through to a full handoff of the cwd's session. */
+export function parseArgs(argv: string[]): Map<string, string | true> {
   const args = new Map<string, string | true>();
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
-    if (["--session", "--model", "--send", "--send-key", "--then", "--worker", "--claude-pid", "--from-session"].includes(a)) args.set(a, argv[++i] ?? "");
+    if (VALUE_FLAGS.includes(a)) args.set(a, argv[++i] ?? "");
     else if (a === "--wait" && /^\d+(\.\d+)?$/.test(argv[i + 1] ?? "")) args.set(a, argv[++i]);
+    else if (a.startsWith("--") && !KNOWN_FLAGS.includes(a)) throw new Error(`unknown flag ${a}. Known flags: ${KNOWN_FLAGS.join(" ")}\n${USAGE}`);
     else args.set(a, true);
   }
+  return args;
+}
+
+/** --pair (alone, not under --stop/--screen/--send*) wakes a sleeping box first; the others stay read-only. */
+export const pairWakes = (args: Map<string, unknown>) =>
+  args.has("--pair") && !["--stop", "--screen", "--send", "--send-key"].some((f) => args.has(f));
+
+async function main(): Promise<void> {
+  const args = parseArgs(process.argv.slice(2).filter((a) => a !== "handoff"));
+  if (args.has("--help")) { console.log(USAGE); return; }
 
   if (args.has("--box-pair")) {
     // Runs ON THE BOX (from nomo_pair), never on the Mac: prints only the URL marker.
@@ -1679,7 +1719,7 @@ async function main(): Promise<void> {
   if (args.has("--then") && !then.trim()) throw new Error('usage: --then "<first message for the cloud session>"');
   if (args.has("--send") && !String(args.get("--send")).trim()) throw new Error('usage: --send "<text>" (use --send-key Enter for a bare Enter)');
   const keys = readKeys();
-  const worker = targetWorker(args.get("--worker"), process.env.NOMO_WORKER_URL);
+  const worker = targetWorker(args.get("--worker"), macWorkerUrl());
 
   if (args.has("--later-cancel")) {
     // The helper is a detached group leader: -pid also stops a handoff child it raced into starting.
@@ -1716,8 +1756,10 @@ async function main(): Promise<void> {
 
   if (["--status", "--stop", "--pair", "--screen", "--send", "--send-key"].some((f) => args.has(f))) {
     const cloud = loadCloud();
-    const sb = await getBox(omg, cloud.sandboxId, api, { wake: false }); // read-only: a stopped box stays stopped
+    // read-only (a stopped box stays stopped), except --pair, which wakes it first
+    let sb = await getBox(omg, cloud.sandboxId, api, { wake: pairWakes(args) });
     if (!sb) { console.log("No cloud box. Run `handoff` to create one."); return; }
+    if (pairWakes(args) && sb.status !== "running") sb = { ...sb, id: await wakeBox(omg, sb), status: "running" };
     const here = hereSession(args.get("--from-session") || process.env.CLAUDE_CODE_SESSION_ID, cloud);
     if (args.has("--stop")) {
       // --all, or bare with at most one session on record: sleep the whole box (sessions resume on wake).
@@ -1783,10 +1825,15 @@ async function main(): Promise<void> {
     NOMO_KNOWN: (loadCloud().active ?? []).join(" "), // nomo_prune: what this Mac has not brought back yet
     ...plan.gitUser,
     ...(args.has("--force") ? { NOMO_FORCE: "1" } : {}),
+    ...(process.env.NOMO_HANDOFF_HELPER ? { NOMO_PAIR_REQUIRED: "1" } : {}),
   });
   const pane = takePairUrl(r.stdout ?? "").rest.replace(/^NOMO_(PAIRED|PAIR_FAILED: .*|REPAIR: .*)$\n?/gm, ""); // never echo the QR URL
   if (r.exitCode === 4) throw new Error(`the OpenRouter relay did not start on box ${id}:\n${pane.slice(-1000)}`);
   if (r.exitCode === 3) throw new Error(busyMessage(r.stdout ?? "", id, plan.uuid, plan.root));
+  if (r.exitCode === 6) {
+    updateCloud((c) => ({ ...c, pairedTo: undefined })); // the record was stale: gates now say "needs pairing"
+    throw new Error(`box ${id} is not paired to ${worker}, so your phone couldn't see the session; nothing was started. Pair it from a terminal: ${q(process.execPath)} ${q(SELF)} --pair`);
+  }
   if (r.exitCode === 5) throw new Error(`the box run took so long its key file was swept before launch; nothing was started. Rerun the handoff.`);
   if (r.exitCode !== 0 || /No conversation found|API Error|Invalid API key|command not found/i.test(pane)) {
     throw new Error(`box start failed (exit ${r.exitCode}):\n${pane.slice(-2000)}\n${(r.stderr ?? "").slice(-2000)}`);

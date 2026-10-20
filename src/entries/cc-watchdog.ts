@@ -1636,7 +1636,11 @@ export interface BringBackDeps {
 
 /** Detached `handoff <args>` for a phone command, output to cloud-back/<id12>.log. The child loads its
  *  own keys (~/.nomo-spike.env) exactly as a terminal run does; nothing secret goes on argv. */
-function spawnHandoff(id: string, what: string, args: string[], cwd: string, onExit: (code: number | null) => void): void {
+/** How long a phone move's `handoff --later --phone` may run (it only preflights, arms the helper and
+ *  settles, ~5 s): past this it is killed and the move reads failed, so nothing hangs it forever. */
+export const MOVE_SPAWN_TIMEOUT_MS = 2 * 60_000;
+
+function spawnHandoff(id: string, what: string, args: string[], cwd: string, onExit: (code: number | null) => void, timeoutMs?: number): void {
   mkdirSync(BACK_LOCK_DIR, { recursive: true, mode: 0o700 });
   const log = `${BACK_LOCK_DIR}/${id.slice(0, 12)}.log`;
   const note = (why: string): void => {
@@ -1650,7 +1654,9 @@ function spawnHandoff(id: string, what: string, args: string[], cwd: string, onE
     const { CLAUDE_CODE_SESSION_ID: _drop, ...env } = process.env;
     const child = spawn(cmd[0], [...cmd.slice(1), ...args],
       { detached: true, stdio: ["ignore", fd, fd], env, cwd });
-    child.on("error", (e) => { note(`could not start ${cmd[0]}: ${e.message}`); onExit(1); }).on("exit", (code) => onExit(code));
+    const timer = timeoutMs ? setTimeout(() => { note(`still running after ${Math.round(timeoutMs / 1000)} s; stopped it`); try { child.kill("SIGKILL"); } catch { /* gone */ } onExit(1); }, timeoutMs) : undefined;
+    timer?.unref();
+    child.on("error", (e) => { clearTimeout(timer); note(`could not start ${cmd[0]}: ${e.message}`); onExit(1); }).on("exit", (code) => { clearTimeout(timer); onExit(code); });
     child.unref();
   } catch (e: any) { note(`could not start ${cmd[0]}: ${e?.message ?? e}`); throw e; } finally { closeSync(fd); }
 }
@@ -1691,7 +1697,15 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
  *  here (the rest, with the live process checks, run in handoff --phone); one run per session. */
 export function moveToCloud(id: string, rec: SessionRecord, deps: MoveToCloudDeps = {}): FocusTraceResult {
   if (!UUID_RE.test(id) || typeof rec.cwd !== "string" || !rec.cwd || (rec.agent ?? "claude") !== "claude" || rec.provisional === true ||
-    (deps.readPark ?? readPark)(id) || (deps.cloudActive ?? cloudActive)(id)) return "move-refused";
+    (deps.readPark ?? readPark)(id) || (deps.cloudActive ?? cloudActive)(id)) {
+    // Tell the phone: a failed run makes the sweep post cloud:"move-failed" with cloudWhy "other" (what
+    // handoff's phoneMoveCheck says for these same refusals). A parked row keeps showing its park state.
+    if (UUID_RE.test(id) && !moveRuns.get(id)?.running) {
+      const at = (deps.now ?? Date.now)();
+      moveRuns.set(id, { running: false, startedAt: at, code: 1, failedAt: at });
+    }
+    return "move-refused";
+  }
   if (moveRuns.get(id)?.running) return "move-running";
   const run: MoveRun = { running: true, startedAt: (deps.now ?? Date.now)() };
   moveRuns.set(id, run);
@@ -1703,7 +1717,7 @@ export function moveToCloud(id: string, rec: SessionRecord, deps: MoveToCloudDep
   const cwd = rec.cwd;
   try {
     (deps.spawn ?? ((s: string, c: string, e: (code: number | null) => void) =>
-      spawnHandoff(s, "move-to-cloud", ["--later", "--phone", "--session", s], c, e)))(id, cwd, done);
+      spawnHandoff(s, "move-to-cloud", ["--later", "--phone", "--session", s], c, e, MOVE_SPAWN_TIMEOUT_MS)))(id, cwd, done);
   } catch { done(1); return "move-spawn-failed"; }
   return "move-started";
 }

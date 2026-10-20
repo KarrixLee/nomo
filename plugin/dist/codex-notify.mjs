@@ -113,7 +113,7 @@ function buildPairURL(workerUrl, pairingId, qrSecret, pcEphPub) {
 }
 
 // src/core/shared.ts
-var PLUGIN_VERSION = "2.3.41";
+var PLUGIN_VERSION = "2.3.44";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -210,7 +210,15 @@ function appendFittedPlan(base, plan) {
 function needsPairing(cloud, worker) {
   return !cloud.sandboxId || cloud.pairedTo !== `${cloud.sandboxId} ${worker}`;
 }
-function boxPaired(path = `${CC_DIR}/cloud.json`, worker = (process.env.NOMO_WORKER_URL || DEFAULT_WORKER_URL).replace(/\/$/, "")) {
+function macWorkerUrl(env = process.env.NOMO_WORKER_URL, configPath = `${CC_DIR}/config.json`) {
+  let url = env;
+  if (!url)
+    try {
+      url = JSON.parse(readFileSync(configPath, "utf8")).url;
+    } catch {}
+  return (typeof url === "string" && url ? url : DEFAULT_WORKER_URL).replace(/\/$/, "");
+}
+function boxPaired(path = `${CC_DIR}/cloud.json`, worker = macWorkerUrl()) {
   try {
     return !needsPairing(JSON.parse(readFileSync(path, "utf8")), worker);
   } catch {
@@ -3292,7 +3300,7 @@ function releaseBackLock(id, dir = BACK_LOCK_DIR) {
   } catch {}
 }
 var moveResultFile = (id, dir = BACK_LOCK_DIR) => join3(dir, `${id.slice(0, 12)}.move`);
-var MOVE_WHYS = ["secret", "cap", "notPaired", "busy", "gone", "other"];
+var MOVE_WHYS = ["secret", "transcriptSecret", "cap", "notPaired", "busy", "gone", "other"];
 function writeMoveResult(id, ok, dir = BACK_LOCK_DIR, why) {
   try {
     mkdirSync(dir, { recursive: true, mode: 448 });

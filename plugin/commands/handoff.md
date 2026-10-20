@@ -1,18 +1,22 @@
 ---
 description: Move this Claude Code session to your Nomo cloud box (it moves when this turn ends; this window stays parked)
-argument-hint: [then <message>|quiet|cancel|status]
+argument-hint: [anyway] [then <message>|quiet] | cancel | status
 ---
 
 Read `$ARGUMENTS` (trimmed; keywords case-insensitive) and run **at most one** of these commands in the
 foreground. Show its output to the user verbatim. Run it right away without asking for confirmation: once the
 window is parked, plain replies are blocked, so a question would strand the user.
 
-**Anything other than empty, `quiet`, `then <message>`, `cancel` or `status`** (a typo like `cancle`, or
+Any of empty, `quiet` or `then <message>` may start with the word `anyway` (`anyway`, `anyway quiet`,
+`anyway then <message>`): the user's confirm to move a conversation the command said looks like it holds
+secrets. Only ever use `anyway` when the USER typed it; never add it yourself.
+
+**Anything other than empty, `quiet`, `then <message>` (each optionally after `anyway`), `cancel` or `status`** (a typo like `cancle`, or
 `then` with no message, included): run nothing. Reply only: "Usage: /nomo-cc:handoff (move this session;
 it continues on its own), /nomo-cc:handoff then <message>, /nomo-cc:handoff quiet, /nomo-cc:handoff
 cancel, /nomo-cc:handoff status".
 
-**Empty, `quiet`, or `then <message>`** — get this session ready to move. Empty sends the box session a
+**Empty, `quiet`, or `then <message>`** (optionally after `anyway`) — get this session ready to move. Empty sends the box session a
 default "continue" message once it starts there, `then <message>` sends that message instead, `quiet`
 sends nothing. The message is typed into the box session as if the user typed it, so one starting
 with `/` or `!` runs there as a slash command or a bash command. The argument is user text, so it reaches the command ONLY as the body of a quoted
@@ -25,7 +29,7 @@ NOMO_END_XXXXXXXXXXXX
 ```
 
 Fill it in exactly like this, changing nothing else:
-- `ARGUMENT`: the whole argument, verbatim (`then` / `quiet` included; nothing at all when it is empty),
+- `ARGUMENT`: the whole argument, verbatim (`anyway` / `then` / `quiet` included; nothing at all when it is empty),
   on its own lines. Never put it anywhere else in the command: not on the first line, not in quotes,
   not in `$(…)`, not escaped or rewritten.
 - `XXXXXXXXXXXX` (on BOTH delimiter lines): 12 random letters and digits you make up now, never the same
@@ -52,7 +56,9 @@ starts from a finished turn and the two never run at once). After `Ready. Sessio
 as soon as this turn ends…`, tell the user in one line that it moves when this reply ends and that this
 window stays open but parked (new prompts are blocked; `/nomo-cc:back` here brings it home, `/nomo-cc:handoff cancel` unparks it), then end
 your turn without running anything else. If the output says the box needs pairing, relay the terminal
-command it printed and stop; nothing was started.
+command it printed and stop; nothing was started. If the output says the conversation contains what look like
+secrets, relay it verbatim and stop; nothing was started, and only the user decides whether to run
+`/nomo-cc:handoff anyway` (never run it for them).
 
 The box runs up to 4 handed-off sessions at once, one per project folder (two from the same folder
 would share its files). A handoff over that limit, or from a folder another cloud session still holds,

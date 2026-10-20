@@ -9,6 +9,7 @@ import {
   BOX_MAX_SESSIONS, boxPaired, phoneMoveCheck, type PhoneMoveFacts, settleThenStamp,
 } from "./handoff-later";
 import { parkHook, readPark, writePark } from "./park";
+import { macWorkerUrl } from "./shared";
 
 const A = "0a1b2c3d-1111-4222-8333-444455556666";
 const B = "9f8e7d6c-1111-4222-8333-444455556666";
@@ -42,6 +43,17 @@ test("boxPaired (NOM-95): cloud.json paired to the worker; missing or other work
   writeFileSync(f, JSON.stringify({ sandboxId: "sb", pairedTo: "sb https://w" }));
   expect(boxPaired(f, "https://w")).toBe(true);
   expect(boxPaired(f, "https://other")).toBe(false);
+});
+
+test("macWorkerUrl: env, else the Mac's config.json url (a watchdog spawn has no env), else production", () => {
+  const cfg = join(tmp(), "config.json");
+  expect(macWorkerUrl(undefined, cfg)).toBe("https://api.nomo.gg");
+  writeFileSync(cfg, JSON.stringify({ url: "https://stg.example.dev/", pairingId: "p" }));
+  expect(macWorkerUrl(undefined, cfg)).toBe("https://stg.example.dev");
+  expect(macWorkerUrl("https://env.example", cfg)).toBe("https://env.example");
+  const cloud = join(tmp(), "cloud.json");
+  writeFileSync(cloud, JSON.stringify({ sandboxId: "sb", pairedTo: "sb https://stg.example.dev" }));
+  expect(boxPaired(cloud, macWorkerUrl(undefined, cfg))).toBe(true);
 });
 
 test("needsPairing: only a box recorded as paired to THIS worker passes", () => {
@@ -248,6 +260,11 @@ describe("/nomo-cc:handoff grammar", () => {
     expect(parseLaterArg("then run the tests")).toEqual({ message: "run the tests" });
     expect(parseLaterArg("Then  it's \"$HOME\" `id`\r\nline 2\n")).toEqual({ message: "it's \"$HOME\" `id`\nline 2" });
     expect(parseLaterArg("quiet")).toEqual({});
+    expect(parseLaterArg("anyway")).toEqual({ message: DEFAULT_THEN, anyway: true });
+    expect(parseLaterArg("Anyway quiet")).toEqual({ anyway: true });
+    expect(parseLaterArg("anyway then go on")).toEqual({ message: "go on", anyway: true });
+    expect(parseLaterArg("then anyway")).toEqual({ message: "anyway" });
+    expect(parseLaterArg("anywayz")).toBeUndefined();
     expect(parseLaterArg("QUIET\n")).toEqual({});
     for (const bad of ["then", "then   ", "thenx", "quiet please", "cancle", "status", "cancel", "go"]) expect(parseLaterArg(bad)).toBeUndefined();
   });
@@ -284,6 +301,39 @@ describe("park marker lifecycle (NOM-90)", () => {
     };
     return d;
   }
+
+  test("NOM-103: a post-turn rescan with findings stops the move (phone, or terminal without anyway) and unparks", async () => {
+    const dir = tmp(), path = join(dir, "p.json"), parkDir = join(dir, "parked");
+    writePark(A, { state: "moving" }, parkDir);
+    writeFileSync(path, JSON.stringify(pending()));
+    const results: unknown[][] = [];
+    const d = Object.assign(deps(path, parkDir), { rescan: () => "1 secret (AWS key ×1; transcript line 9)", result: (...a: unknown[]) => { results.push(a); } });
+    expect(await waitThenHandoff(pending(), d)).toBe(1);
+    expect(d.runs).toBe(0);
+    expect(results).toEqual([[false, "transcriptSecret"]]);
+    expect(readPark(A, parkDir)).toBeUndefined();
+    expect(existsSync(path)).toBe(false);
+    expect(d.lines.at(-1)).toMatch(/^FAILED: the conversation contains what look like 1 secret \(AWS key ×1; transcript line 9\).*\/nomo-cc:handoff anyway/);
+  });
+
+  test("NOM-103: after the user's `anyway`, the rescan is skipped and the move proceeds", async () => {
+    const dir = tmp(), path = join(dir, "p.json"), parkDir = join(dir, "parked");
+    writePark(A, { state: "moving" }, parkDir);
+    let scans = 0;
+    const d = Object.assign(deps(path, parkDir), { rescan: () => { scans++; return "1 secret (AWS key ×1; transcript line 9)"; } });
+    expect(await waitThenHandoff(pending({ anyway: true }), d)).toBe(0);
+    expect(d.runs).toBe(1);
+    expect(scans).toBe(0);
+    expect(readPark(A, parkDir)?.state).toBe("cloud");
+  });
+
+  test("NOM-103: a clean rescan moves", async () => {
+    const dir = tmp(), path = join(dir, "p.json"), parkDir = join(dir, "parked");
+    writePark(A, { state: "moving" }, parkDir);
+    const d = Object.assign(deps(path, parkDir), { rescan: () => undefined });
+    expect(await waitThenHandoff(pending(), d)).toBe(0);
+    expect(d.runs).toBe(1);
+  });
 
   test("armed (moving) → the turn ends → handed off → cloud", async () => {
     const dir = tmp(), path = join(dir, "p.json"), parkDir = join(dir, "parked");
@@ -339,6 +389,7 @@ describe("phone move-to-cloud (NOM-94)", () => {
     parked: false, active: false, needsPairing: false, cloudCount: 0,
     transcriptExists: () => true,
     trackedSecrets: () => [],
+    transcriptSecrets: () => undefined,
     ...o,
   });
   const refuse = (o: Partial<PhoneMoveFacts>): string => {
@@ -375,6 +426,12 @@ describe("phone move-to-cloud (NOM-94)", () => {
     expect(phoneMoveCheck(facts({ cloudCount: BOX_MAX_SESSIONS - 1 }))).toEqual({ claudePid: 400, cwd: "/p/app" });
     expect(refuse({ transcriptExists: () => false })).toMatch(/transcript/);
     expect(refuse({ record: { pid: 400 } })).toMatch(/transcript/);
+  });
+
+  test("NOM-103: a transcript that looks like it holds secrets refuses with why transcriptSecret", () => {
+    const o = { transcriptSecrets: () => "1 secret (AWS key ×1; transcript line 3)" };
+    expect(refuse(o)).toMatch(/conversation contains what look like 1 secret \(AWS key ×1; transcript line 3\).*\/nomo-cc:handoff anyway/);
+    expect((phoneMoveCheck(facts(o)) as { why: string }).why).toBe("transcriptSecret");
   });
 
   test("a git-tracked secret refuses; a git error refuses; none (or no git) passes", () => {

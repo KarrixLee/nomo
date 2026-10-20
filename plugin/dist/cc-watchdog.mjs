@@ -117,7 +117,7 @@ function buildPairURL(workerUrl, pairingId, qrSecret, pcEphPub) {
 }
 
 // src/core/shared.ts
-var PLUGIN_VERSION = "2.3.41";
+var PLUGIN_VERSION = "2.3.44";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -214,7 +214,15 @@ function appendFittedPlan(base, plan) {
 function needsPairing(cloud, worker) {
   return !cloud.sandboxId || cloud.pairedTo !== `${cloud.sandboxId} ${worker}`;
 }
-function boxPaired(path = `${CC_DIR}/cloud.json`, worker = (process.env.NOMO_WORKER_URL || DEFAULT_WORKER_URL).replace(/\/$/, "")) {
+function macWorkerUrl(env = process.env.NOMO_WORKER_URL, configPath = `${CC_DIR}/config.json`) {
+  let url = env;
+  if (!url)
+    try {
+      url = JSON.parse(readFileSync(configPath, "utf8")).url;
+    } catch {}
+  return (typeof url === "string" && url ? url : DEFAULT_WORKER_URL).replace(/\/$/, "");
+}
+function boxPaired(path = `${CC_DIR}/cloud.json`, worker = macWorkerUrl()) {
   try {
     return !needsPairing(JSON.parse(readFileSync(path, "utf8")), worker);
   } catch {
@@ -5606,7 +5614,7 @@ function releaseBackLock(id, dir = BACK_LOCK_DIR) {
   } catch {}
 }
 var moveResultFile = (id, dir = BACK_LOCK_DIR) => join3(dir, `${id.slice(0, 12)}.move`);
-var MOVE_WHYS = ["secret", "cap", "notPaired", "busy", "gone", "other"];
+var MOVE_WHYS = ["secret", "transcriptSecret", "cap", "notPaired", "busy", "gone", "other"];
 function writeMoveResult(id, ok, dir = BACK_LOCK_DIR, why) {
   try {
     mkdirSync(dir, { recursive: true, mode: 448 });
@@ -9092,7 +9100,8 @@ function handoffCommand(exists = existsSync3, watchdogPath = WATCHDOG_PATH, ccDi
   const shim = `${ccDir}/hook-shim.sh`;
   return exists(shim) ? [shim, "handoff"] : undefined;
 }
-function spawnHandoff(id, what, args, cwd, onExit) {
+var MOVE_SPAWN_TIMEOUT_MS = 2 * 60000;
+function spawnHandoff(id, what, args, cwd, onExit, timeoutMs) {
   mkdirSync2(BACK_LOCK_DIR, { recursive: true, mode: 448 });
   const log = `${BACK_LOCK_DIR}/${id.slice(0, 12)}.log`;
   const note = (why) => {
@@ -9115,10 +9124,22 @@ function spawnHandoff(id, what, args, cwd, onExit) {
   try {
     const { CLAUDE_CODE_SESSION_ID: _drop, ...env } = process.env;
     const child = spawn3(cmd[0], [...cmd.slice(1), ...args], { detached: true, stdio: ["ignore", fd, fd], env, cwd });
+    const timer = timeoutMs ? setTimeout(() => {
+      note(`still running after ${Math.round(timeoutMs / 1000)} s; stopped it`);
+      try {
+        child.kill("SIGKILL");
+      } catch {}
+      onExit(1);
+    }, timeoutMs) : undefined;
+    timer?.unref();
     child.on("error", (e) => {
+      clearTimeout(timer);
       note(`could not start ${cmd[0]}: ${e.message}`);
       onExit(1);
-    }).on("exit", (code) => onExit(code));
+    }).on("exit", (code) => {
+      clearTimeout(timer);
+      onExit(code);
+    });
     child.unref();
   } catch (e) {
     note(`could not start ${cmd[0]}: ${e?.message ?? e}`);
@@ -9152,8 +9173,13 @@ function bringBack(id, deps = {}) {
 var moveRuns = new Map;
 var UUID_RE2 = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 function moveToCloud(id, rec, deps = {}) {
-  if (!UUID_RE2.test(id) || typeof rec.cwd !== "string" || !rec.cwd || (rec.agent ?? "claude") !== "claude" || rec.provisional === true || (deps.readPark ?? readPark)(id) || (deps.cloudActive ?? cloudActive)(id))
+  if (!UUID_RE2.test(id) || typeof rec.cwd !== "string" || !rec.cwd || (rec.agent ?? "claude") !== "claude" || rec.provisional === true || (deps.readPark ?? readPark)(id) || (deps.cloudActive ?? cloudActive)(id)) {
+    if (UUID_RE2.test(id) && !moveRuns.get(id)?.running) {
+      const at = (deps.now ?? Date.now)();
+      moveRuns.set(id, { running: false, startedAt: at, code: 1, failedAt: at });
+    }
     return "move-refused";
+  }
   if (moveRuns.get(id)?.running)
     return "move-running";
   const run = { running: true, startedAt: (deps.now ?? Date.now)() };
@@ -9168,7 +9194,7 @@ function moveToCloud(id, rec, deps = {}) {
   };
   const cwd = rec.cwd;
   try {
-    (deps.spawn ?? ((s, c, e) => spawnHandoff(s, "move-to-cloud", ["--later", "--phone", "--session", s], c, e)))(id, cwd, done);
+    (deps.spawn ?? ((s, c, e) => spawnHandoff(s, "move-to-cloud", ["--later", "--phone", "--session", s], c, e, MOVE_SPAWN_TIMEOUT_MS)))(id, cwd, done);
   } catch {
     done(1);
     return "move-spawn-failed";
@@ -10903,6 +10929,7 @@ export {
   IDLE_GRACE_MS,
   LAN_ANSWER_ECHO_DELAY_MS,
   LAN_COMMAND_ID_PREFIX,
+  MOVE_SPAWN_TIMEOUT_MS,
   MOVE_TO_CLOUD_COMMAND_KIND,
   PAIRING_TTL_MS,
   PENDING_DONE_GRACE_MS,

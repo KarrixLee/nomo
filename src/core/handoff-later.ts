@@ -34,19 +34,33 @@ export interface Pending {
   /** The first message for the box session (`--then`); absent = quiet. User text: this 0600 file and
    *  the handoff's env only, never argv or the log. */
   message?: string;
+  /** NOM-103: the user typed `anyway`, so a post-turn rescan that finds secrets does not stop the move. */
+  anyway?: true;
 }
 
 export const DEFAULT_THEN = "You're now running on the cloud box. Continue the task you were working on before the handoff. If it was already finished, say so and wait.";
-export const LATER_USAGE = "Usage: /nomo-cc:handoff (move this session; it continues on its own), /nomo-cc:handoff then <message>, /nomo-cc:handoff quiet, /nomo-cc:handoff cancel, /nomo-cc:handoff status";
+export const LATER_USAGE = "Usage: /nomo-cc:handoff (move this session; it continues on its own), /nomo-cc:handoff then <message>, /nomo-cc:handoff quiet, /nomo-cc:handoff cancel, /nomo-cc:handoff status (prefix `anyway` to move a conversation that looks like it holds secrets)";
+
+/** NOM-103: the Cloud-check lines for a transcript that looks like it holds secrets (`summary` from
+ *  transcript-scan secretSummary). Not confirmed: nothing starts, and only the user may type `anyway`. */
+export function transcriptSecretWarning(summary: string, confirmed: boolean): string {
+  const head = `The conversation contains what look like ${summary}. They would travel to the cloud box with the transcript.`;
+  return confirmed
+    ? `Cloud check: ${head} Moving anyway, as you confirmed.`
+    : `Cloud check: ${head}\nNothing was started. To move it anyway, run /nomo-cc:handoff anyway (or: anyway quiet, anyway then <message>).`;
+}
 
 /** `/nomo-cc:handoff`'s argument (cancel/status are routed by the command itself): empty → DEFAULT_THEN,
  *  `then <text>` → text, `quiet` → no message. Anything else (a typo, a bare `then`) → undefined: usage. */
-export function parseLaterArg(raw: string): { message?: string } | undefined {
-  const s = raw.replace(/\r\n?/g, "\n").trim();
-  if (!s) return { message: DEFAULT_THEN };
-  if (/^quiet$/i.test(s)) return {};
+export function parseLaterArg(raw: string): { message?: string; anyway?: true } | undefined {
+  let s = raw.replace(/\r\n?/g, "\n").trim();
+  // NOM-103: a leading `anyway` is the user's confirm to move a transcript that looks like it holds secrets.
+  const anyway = /^anyway(?:\s|$)/i.test(s) ? { anyway: true as const } : {};
+  if (anyway.anyway) s = s.slice(6).trim();
+  if (!s) return { message: DEFAULT_THEN, ...anyway };
+  if (/^quiet$/i.test(s)) return { ...anyway };
   const text = /^then(?:\s+([\s\S]*))?$/i.exec(s)?.[1]?.trim();
-  return text ? { message: text } : undefined;
+  return text ? { message: text, ...anyway } : undefined;
 }
 
 /** This session and its `claude` process. The id: Claude Code's `${CLAUDE_SESSION_ID}` command
@@ -209,6 +223,9 @@ export interface WaitDeps {
   parkDir?: string;
   /** This session's outcome (park.ts writeMoveResult): true moved, false failed. */
   result?: (ok: boolean, why?: MoveWhy) => void;
+  /** NOM-103: rescan what the handoff will upload (transcript-scan secretSummary), right before it runs:
+   *  the rest of the turn may have printed a secret after the command's own scan. */
+  rescan?: () => string | undefined;
 }
 
 /** The detached helper: wait for this turn to end or the Mac session to exit (capped), then hand it off. Its last log line
@@ -237,6 +254,15 @@ export async function waitThenHandoff(p: Pending, d: WaitDeps): Promise<number> 
   // ponytail: one poll's settle for the lines Claude Code writes right after Stop (turn_duration…); they
   // are meta, so a late one only lands on the Mac copy, where --back ignores it (transcriptAction).
   if (ended) await d.sleep(POLL_MS);
+  const found = p.anyway ? undefined : d.rescan?.();
+  if (found) {
+    release();
+    unpark();
+    d.result?.(false, "transcriptSecret");
+    d.log(`FAILED: the conversation contains what look like ${found}. They would travel to the cloud box with the transcript, so nothing was moved. To move it anyway, run /nomo-cc:handoff anyway.`);
+    d.notify("Handoff stopped: the conversation looks like it holds secrets. Nothing was moved.");
+    return 1;
+  }
   try { writeFileSync(d.pending, JSON.stringify({ ...p, state: "handing-off" }) + "\n", { mode: 0o600 }); } catch { /* status only */ }
   d.log(`${ended ? "The turn ended" : "Claude Code closed"}. Handing off session ${p.session}…`);
   const before = d.readCloud();
@@ -289,6 +315,8 @@ export interface PhoneMoveFacts {
   /** Git-tracked files under cwd's repo whose name looks like a secret ([] outside git); undefined
    *  when git failed (readiness.ts trackedSecretFiles). */
   trackedSecrets: (cwd: string) => string[] | undefined;
+  /** NOM-103: transcript-scan secretSummary of what the move would upload, undefined when clean. */
+  transcriptSecrets: (cwd: string) => string | undefined;
 }
 
 /** Every gate a phone-started move passes before anything is written. Either the session's claude pid
@@ -309,6 +337,8 @@ export function phoneMoveCheck(f: PhoneMoveFacts): { claudePid: number; cwd: str
   if (f.needsPairing) return { refuse: "the cloud box needs a one-time pairing; run /nomo-cc:handoff in that session first", why: "notPaired" };
   if (f.cloudCount >= BOX_MAX_SESSIONS) return { refuse: `the cloud box already runs ${f.cloudCount} sessions (the cap is ${BOX_MAX_SESSIONS}); bring one back first`, why: "cap" };
   if (!r.cwd || !f.transcriptExists(r.cwd)) return { refuse: "its transcript was not found", why: "other" };
+  const inTranscript = f.transcriptSecrets(r.cwd);
+  if (inTranscript) return { refuse: `the conversation contains what look like ${inTranscript}, which would travel with the transcript; move it from the terminal (/nomo-cc:handoff anyway) if that is fine`, why: "transcriptSecret" };
   const secrets = f.trackedSecrets(r.cwd);
   if (!secrets) return { refuse: "git could not list the project's tracked files", why: "other" };
   if (secrets.length) return { refuse: `${secrets.slice(0, 3).join(", ")} looks like a secret and is tracked in git, so it would travel; move it from the terminal (/nomo-cc:handoff) if that is fine`, why: "secret" };
