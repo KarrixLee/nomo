@@ -28,7 +28,7 @@ import type { CommandPayload, DrainCommandsDeps, PostDetail, PostOutcome, Record
 import { backRuns, BRING_BACK_COMMAND_KIND, correctCloudState, handoffCommand, withCloudKey } from "./cc-watchdog";
 import { MOVE_TO_CLOUD_COMMAND_KIND, moveFailed, moveRuns, parseCommandPayload } from "./cc-watchdog";
 import type { Park } from "../core/park";
-import { cloudState, endMovingTurn, readPark, writePark } from "../core/park";
+import { cloudState, endMovingTurn, readMoveResult, readPark, writeMoveResult, writePark } from "../core/park";
 import { resolveOnRelay } from "../core/codex-remote-input";
 import { CODEX_PROXY_STDOUT_ENDED } from "../core/codex-proxy-transport";
 import { buildStatePlaintext, STATE_HOLD_MAX_AGE_MS } from "../core/session-state";
@@ -5221,6 +5221,27 @@ describe("move to cloud from the phone (NOM-94)", () => {
     expect(moveFailed(S, undefined, rec({ lastEvent: "working", turnStartedAt: NOW / 1000 - 5 }))).toBe(true); // an older turn
     expect(moveFailed(S, undefined, rec({ lastEvent: "working", turnStartedAt: NOW / 1000 + 5 }))).toBe(false); // works normally again
     expect(moveRuns.has(S)).toBe(false);
+  });
+
+  test("NOM-95 field case: a refused phone move with an older DONE result file reaches the worker AND the LAN as move-failed", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "nomo-move-"));
+    writeMoveResult(S, true, dir); // the previous successful move's DONE, written before this run
+    const { exits, deps } = harness();
+    const c = await cmd();
+    await drainCommands(cfg(), { ...deps, take: () => [c] });
+    exits[0](1); // the helper's preflight refused (a tracked .env), exit 1, nothing written
+    const record = rec({ op: "done", lastEvent: "done", prio: 0, pairingId: "p", turnStartedAt: NOW / 1000 - 30,
+      blob: await encryptBlob(KEY, { status: "done", title: "t" }) });
+    const want = cloudState(undefined, undefined, false, moveFailed(S, undefined, record, (since) => readMoveResult(S, since, dir)));
+    expect(want).toBe("move-failed");
+    const posts: any[] = [];
+    let written: SessionRecord | undefined;
+    expect(await correctCloudState(cfg(), "/x", S, record, want, {
+      post: async (b: object) => { posts.push(b); return "delivered" as PostOutcome; },
+      now: () => NOW, readRecord: async () => record, writeRecord: async (_p: string, r: SessionRecord) => { written = r; },
+    })).toBe("corrected");
+    expect((await decryptBlob(KEY, posts[0].blob) as Record<string, unknown>).cloud).toBe("move-failed"); // worker leg
+    expect(buildStatePlaintext(written!, "done", NOW).cloud).toBe("move-failed");                       // LAN leg
   });
 
   test("move-failed: the marker vanished without reaching cloud and THIS session's helper reported FAILED", async () => {
