@@ -240,9 +240,18 @@ export function needsPairing(cloud: { sandboxId?: string; pairedTo?: string }, w
   return !cloud.sandboxId || cloud.pairedTo !== `${cloud.sandboxId} ${worker}`;
 }
 
+/** The Nomo worker this Mac talks to: $NOMO_WORKER_URL, else its own config.json `url` (the worker it
+ *  paired with), else production. The ONE resolver for handoff, its box pairing and the phone gate: a
+ *  watchdog-spawned handoff has no NOMO_WORKER_URL, and guessing production there re-pairs the box. */
+export function macWorkerUrl(env = process.env.NOMO_WORKER_URL, configPath = `${CC_DIR}/config.json`): string {
+  let url = env;
+  if (!url) try { url = JSON.parse(readFileSync(configPath, "utf8")).url; } catch { /* unpaired */ }
+  return (typeof url === "string" && url ? url : DEFAULT_WORKER_URL).replace(/\/$/, "");
+}
+
 /** NOM-95: does this Mac have a box paired to the worker a phone-started move would use (the same
- *  needsPairing gate, against the same NOMO_WORKER_URL the spawned handoff inherits)? Fails closed. */
-export function boxPaired(path = `${CC_DIR}/cloud.json`, worker = (process.env.NOMO_WORKER_URL || DEFAULT_WORKER_URL).replace(/\/$/, "")): boolean {
+ *  needsPairing gate, against the same macWorkerUrl the spawned handoff resolves)? Fails closed. */
+export function boxPaired(path = `${CC_DIR}/cloud.json`, worker = macWorkerUrl()): boolean {
   try { return !needsPairing(JSON.parse(readFileSync(path, "utf8")), worker); } catch { return false; }
 }
 

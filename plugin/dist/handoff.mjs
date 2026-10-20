@@ -384,7 +384,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "2.3.43";
+var PLUGIN_VERSION = "2.3.44";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -481,7 +481,15 @@ function appendFittedPlan(base, plan) {
 function needsPairing(cloud, worker) {
   return !cloud.sandboxId || cloud.pairedTo !== `${cloud.sandboxId} ${worker}`;
 }
-function boxPaired(path = `${CC_DIR}/cloud.json`, worker = (process.env.NOMO_WORKER_URL || DEFAULT_WORKER_URL).replace(/\/$/, "")) {
+function macWorkerUrl(env = process.env.NOMO_WORKER_URL, configPath = `${CC_DIR}/config.json`) {
+  let url = env;
+  if (!url)
+    try {
+      url = JSON.parse(readFileSync(configPath, "utf8")).url;
+    } catch {}
+  return (typeof url === "string" && url ? url : DEFAULT_WORKER_URL).replace(/\/$/, "");
+}
+function boxPaired(path = `${CC_DIR}/cloud.json`, worker = macWorkerUrl()) {
   try {
     return !needsPairing(JSON.parse(readFileSync(path, "utf8")), worker);
   } catch {
@@ -5174,6 +5182,7 @@ var PAIR_FN = `nomo_pair() {
   tmux kill-session -t nomo-pair 2>/dev/null || true
   tmux new-session -d -s nomo-pair "bun $R/dist/pair.mjs wait > ${BOX_CC}/cloud-pair.log 2>&1"
 }`;
+var PAIR_GATE = `[ -z "\${NOMO_PAIR_REQUIRED:-}" ] || { grep -q '"e2eKeyB64"' ${BOX_CC}/config.json 2>/dev/null && grep -qF '"url":"'"\${NOMO_WORKER_URL:-${DEFAULT_WORKER_URL}}"'"' ${BOX_CC}/config.json; } || { echo NOMO_NEEDS_PAIRING; exit 6; }`;
 var PAIR_POLL = `${SHM_SWEEP}
 grep -q '"e2eKeyB64"' ${BOX_CC}/config.json 2>/dev/null && echo PAIRED && exit 0
 tmux has-session -t nomo-pair 2>/dev/null && echo WAITING && exit 0
@@ -5282,8 +5291,8 @@ ${boxSetup(marketplace)}
 rm -rf ${STAGE}-* ${BOX_CC} /root/.claude/projects /dev/shm/nomo-env* ${BOX_SESSIONS} ${BOX_CURRENT}
 echo NOMO_BAKED`;
 }
-function targetWorker(flag, env) {
-  const w = (typeof flag === "string" && flag ? flag : env || DEFAULT_WORKER_URL).replace(/\/$/, "");
+function targetWorker(flag, mac) {
+  const w = (typeof flag === "string" && flag ? flag : mac || DEFAULT_WORKER_URL).replace(/\/$/, "");
   const bad = () => new Error(`worker URL must be an https origin (http only for localhost), got ${JSON.stringify(w)}`);
   if (!/^https?:\/\/[^/\s@]+$/.test(w))
     throw bad();
@@ -5459,6 +5468,7 @@ function build(args, outDir) {
   const keepalive = keepaliveLoop();
   const script = `${boxPrelude(uuid)}
 set -euo pipefail
+${PAIR_GATE}
 ${admitScript(uuid, root)}
 T=${tmuxName(uuid)}
 # Keys reach claude via RAM, never argv: the file (this session's own, so two handoffs never race on it)
@@ -5960,7 +5970,9 @@ async function afterPair(omg, id, stdout, worker) {
   const paired = /^NOMO_PAIRED$/m.test(rest);
   updateCloud((c) => ({ ...c, pairedTo: paired ? `${id} ${worker}` : undefined }));
   if (!paired && process.env.NOMO_HANDOFF_HELPER) {
-    throw new Error(`the session started on box ${id}, but the box needs pairing, so your phone can't see it. Pair it from a terminal: ${q(process.execPath)} ${q(SELF)} --pair`);
+    console.log(`
+The session runs on box ${id}, but the box needs pairing, so your phone can't see it. Pair it from a terminal: ${q(process.execPath)} ${q(SELF)} --pair`);
+    return;
   }
   const failed = rest.match(/^NOMO_PAIR_FAILED: (.*)$/m);
   const old = rest.match(/^NOMO_REPAIR: (.*)$/m);
@@ -6610,7 +6622,7 @@ async function main() {
   if (args.has("--send") && !String(args.get("--send")).trim())
     throw new Error('usage: --send "<text>" (use --send-key Enter for a bare Enter)');
   const keys = readKeys();
-  const worker = targetWorker(args.get("--worker"), process.env.NOMO_WORKER_URL);
+  const worker = targetWorker(args.get("--worker"), macWorkerUrl());
   if (args.has("--later-cancel")) {
     const session = args.get("--session");
     console.log(cancelPending({
@@ -6766,7 +6778,8 @@ Target worker: ${worker}`);
     NOMO_WORKER_URL: worker,
     NOMO_KNOWN: (loadCloud().active ?? []).join(" "),
     ...plan.gitUser,
-    ...args.has("--force") ? { NOMO_FORCE: "1" } : {}
+    ...args.has("--force") ? { NOMO_FORCE: "1" } : {},
+    ...process.env.NOMO_HANDOFF_HELPER ? { NOMO_PAIR_REQUIRED: "1" } : {}
   });
   const pane = takePairUrl(r.stdout ?? "").rest.replace(/^NOMO_(PAIRED|PAIR_FAILED: .*|REPAIR: .*)$\n?/gm, "");
   if (r.exitCode === 4)
@@ -6774,6 +6787,10 @@ Target worker: ${worker}`);
 ${pane.slice(-1000)}`);
   if (r.exitCode === 3)
     throw new Error(busyMessage(r.stdout ?? "", id, plan.uuid, plan.root));
+  if (r.exitCode === 6) {
+    updateCloud((c) => ({ ...c, pairedTo: undefined }));
+    throw new Error(`box ${id} is not paired to ${worker}, so your phone couldn't see the session; nothing was started. Pair it from a terminal: ${q(process.execPath)} ${q(SELF)} --pair`);
+  }
   if (r.exitCode === 5)
     throw new Error(`the box run took so long its key file was swept before launch; nothing was started. Rerun the handoff.`);
   if (r.exitCode !== 0 || /No conversation found|API Error|Invalid API key|command not found/i.test(pane)) {
@@ -6817,6 +6834,7 @@ export {
   FIRST_UNCONFIRMED,
   LEFT_LINE,
   PAIR_FN,
+  PAIR_GATE,
   PAIR_POLL,
   RELAY_PORT,
   SENSITIVE2 as SENSITIVE,

@@ -81,7 +81,7 @@ import { normalizeModelId } from "../core/adapter";
 import { cloudReadiness, gitProbe, isSecretName, trackedSecretFiles } from "../core/readiness";
 import { scanHandoff, secretSummary } from "../core/transcript-scan";
 import { backLockHolder, clearPark, cloudActive, moveResultFile, type MoveWhy, PARK_DIR, writeBackResult, writeMoveResult, readPark, releaseBackLock, stageLanding, takeBackLock, writePark } from "../core/park";
-import { atomicWrite, CC_DIR, pidAlive, pidAncestors, pidCommand, readRecord, SESSIONS_DIR } from "../core/shared";
+import { atomicWrite, CC_DIR, macWorkerUrl, pidAlive, pidAncestors, pidCommand, readRecord, SESSIONS_DIR } from "../core/shared";
 import {
   BOX_MAX_SESSIONS, cancelPending, claimPending, DEFAULT_THEN, EXIT_BOX_GONE, phoneMoveCheck, settleThenStamp, contextTokens, contextTokensOf, GONE_MSG, sizeWarning, TAIL_BYTES, handoffArgv, LATER_LOG, LATER_USAGE, laterStatus, transcriptSecretWarning, needsPairing, parseLaterArg, type Pending, PENDING_PATH, readPending, resolveSession, waitThenHandoff,
 } from "../core/handoff-later";
@@ -244,6 +244,10 @@ export const PAIR_FN = `nomo_pair() {
   tmux kill-session -t nomo-pair 2>/dev/null || true
   tmux new-session -d -s nomo-pair "bun $R/dist/pair.mjs wait > ${BOX_CC}/cloud-pair.log 2>&1"
 }`;
+/** An unattended (helper) handoff can't show a QR: unless the box is already paired TO the target
+ *  worker, stop before anything is admitted, unpacked or started (exit 6), so the Mac copy really is
+ *  untouched and nomo_pair never replaces the box's existing pairing behind the user's back. */
+export const PAIR_GATE = `[ -z "\${NOMO_PAIR_REQUIRED:-}" ] || { grep -q '"e2eKeyB64"' ${BOX_CC}/config.json 2>/dev/null && grep -qF '"url":"'"\${NOMO_WORKER_URL:-${DEFAULT_WORKER_URL}}"'"' ${BOX_CC}/config.json; } || { echo NOMO_NEEDS_PAIRING; exit 6; }`;
 export const PAIR_POLL = `${SHM_SWEEP}
 grep -q '"e2eKeyB64"' ${BOX_CC}/config.json 2>/dev/null && echo PAIRED && exit 0
 tmux has-session -t nomo-pair 2>/dev/null && echo WAITING && exit 0
@@ -382,9 +386,9 @@ rm -rf ${STAGE}-* ${BOX_CC} /root/.claude/projects /dev/shm/nomo-env* ${BOX_SESS
 echo NOMO_BAKED`;
 }
 
-/** The worker the box pairs with: --worker, else the Mac's NOMO_WORKER_URL, else production. */
-export function targetWorker(flag: string | true | undefined, env: string | undefined): string {
-  const w = (typeof flag === "string" && flag ? flag : env || DEFAULT_WORKER_URL).replace(/\/$/, "");
+/** The worker the box pairs with: --worker, else the Mac's own (macWorkerUrl), else production. */
+export function targetWorker(flag: string | true | undefined, mac: string | undefined): string {
+  const w = (typeof flag === "string" && flag ? flag : mac || DEFAULT_WORKER_URL).replace(/\/$/, "");
   const bad = () => new Error(`worker URL must be an https origin (http only for localhost), got ${JSON.stringify(w)}`);
   if (!/^https?:\/\/[^/\s@]+$/.test(w)) throw bad(); // no path, no userinfo
   const u = new URL(w);
@@ -565,6 +569,7 @@ export function build(args: Map<string, string | true>, outDir: string): Plan {
 
   const script = `${boxPrelude(uuid)}
 set -euo pipefail
+${PAIR_GATE}
 ${admitScript(uuid, root)}
 T=${tmuxName(uuid)}
 # Keys reach claude via RAM, never argv: the file (this session's own, so two handoffs never race on it)
@@ -1081,8 +1086,10 @@ async function afterPair(omg: string, id: string, stdout: string, worker: string
   const paired = /^NOMO_PAIRED$/m.test(rest);
   updateCloud((c) => ({ ...c, pairedTo: paired ? `${id} ${worker}` : undefined }));
   if (!paired && process.env.NOMO_HANDOFF_HELPER) {
-    // Never a QR on an unattended Mac: the box runs the session, but the phone can't see it until paired.
-    throw new Error(`the session started on box ${id}, but the box needs pairing, so your phone can't see it. Pair it from a terminal: ${q(process.execPath)} ${q(SELF)} --pair`);
+    // Never a QR on an unattended Mac. PAIR_GATE refuses an unpaired box before the start, so this is a
+    // race only: the session IS running and on record, so a failure here would leave two live copies.
+    console.log(`\nThe session runs on box ${id}, but the box needs pairing, so your phone can't see it. Pair it from a terminal: ${q(process.execPath)} ${q(SELF)} --pair`);
+    return;
   }
   const failed = rest.match(/^NOMO_PAIR_FAILED: (.*)$/m);
   const old = rest.match(/^NOMO_REPAIR: (.*)$/m);
@@ -1688,7 +1695,7 @@ async function main(): Promise<void> {
   if (args.has("--then") && !then.trim()) throw new Error('usage: --then "<first message for the cloud session>"');
   if (args.has("--send") && !String(args.get("--send")).trim()) throw new Error('usage: --send "<text>" (use --send-key Enter for a bare Enter)');
   const keys = readKeys();
-  const worker = targetWorker(args.get("--worker"), process.env.NOMO_WORKER_URL);
+  const worker = targetWorker(args.get("--worker"), macWorkerUrl());
 
   if (args.has("--later-cancel")) {
     // The helper is a detached group leader: -pid also stops a handoff child it raced into starting.
@@ -1792,10 +1799,15 @@ async function main(): Promise<void> {
     NOMO_KNOWN: (loadCloud().active ?? []).join(" "), // nomo_prune: what this Mac has not brought back yet
     ...plan.gitUser,
     ...(args.has("--force") ? { NOMO_FORCE: "1" } : {}),
+    ...(process.env.NOMO_HANDOFF_HELPER ? { NOMO_PAIR_REQUIRED: "1" } : {}),
   });
   const pane = takePairUrl(r.stdout ?? "").rest.replace(/^NOMO_(PAIRED|PAIR_FAILED: .*|REPAIR: .*)$\n?/gm, ""); // never echo the QR URL
   if (r.exitCode === 4) throw new Error(`the OpenRouter relay did not start on box ${id}:\n${pane.slice(-1000)}`);
   if (r.exitCode === 3) throw new Error(busyMessage(r.stdout ?? "", id, plan.uuid, plan.root));
+  if (r.exitCode === 6) {
+    updateCloud((c) => ({ ...c, pairedTo: undefined })); // the record was stale: gates now say "needs pairing"
+    throw new Error(`box ${id} is not paired to ${worker}, so your phone couldn't see the session; nothing was started. Pair it from a terminal: ${q(process.execPath)} ${q(SELF)} --pair`);
+  }
   if (r.exitCode === 5) throw new Error(`the box run took so long its key file was swept before launch; nothing was started. Rerun the handoff.`);
   if (r.exitCode !== 0 || /No conversation found|API Error|Invalid API key|command not found/i.test(pane)) {
     throw new Error(`box start failed (exit ${r.exitCode}):\n${pane.slice(-2000)}\n${(r.stderr ?? "").slice(-2000)}`);

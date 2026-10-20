@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { spawn } from "node:child_process";
 import { realpathSync } from "node:fs";
 import { createServer } from "node:net";
@@ -574,6 +574,21 @@ exec perl -MFcntl=:flock -e 'open(my $f, ">&=", $ARGV[0]) or die "fd"; flock($f,
     expect(b.calls()).not.toContain("kill-server");
     expect(b.calls().split("kill-session -t =nomo-relay").length - 1).toBe(1); // A's fresh start only: B never restarted it
     expect(b.run(statusScript()).stdout).toMatch(new RegExp(`^Sessions on the box:\\n  ${A}  running +${b.boxRoot("one")}[\\s\\S]*${B}  running +${b.boxRoot("two")}[\\s\\S]*2 of 4 running\\nNOMO_STATUS_SPLIT`));
+  });
+
+  test("an unattended handoff to a box not paired to the target stops before anything starts (exit 6)", () => {
+    const stg = "https://stg.example.dev", cfg = (b: { d: string }) => join(b.d, "root/.config/cc-status/config.json");
+    const b = fakeBox();
+    const r = b.handOff(A, "one", { NOMO_PAIR_REQUIRED: "1", NOMO_WORKER_URL: stg });
+    expect([r.code, r.stdout.trim()]).toEqual([6, "NOMO_NEEDS_PAIRING"]);
+    expect(b.tmux()).toEqual([]);
+    expect(existsSync(join(b.d, "root/.nomo-sessions", A))).toBe(false);
+    // paired to staging, target production: refused, and the staging pairing is left alone
+    mkdirSync(dirname(cfg(b)), { recursive: true });
+    writeFileSync(cfg(b), JSON.stringify({ url: stg, e2eKeyB64: "k" }));
+    expect(b.handOff(A, "one", { NOMO_PAIR_REQUIRED: "1" }).code).toBe(6);
+    expect(readFileSync(cfg(b), "utf8")).toContain(stg);
+    expect(b.handOff(A, "one", { NOMO_PAIR_REQUIRED: "1", NOMO_WORKER_URL: stg }).code).toBe(0);
   });
 
   test("the same project twice is refused, even with --force (they would share the working tree)", () => {
