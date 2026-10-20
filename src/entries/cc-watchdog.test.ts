@@ -5197,7 +5197,7 @@ describe("move to cloud from the phone (NOM-94)", () => {
       expect(spawned).toEqual([]);
       expect(traces.map((t) => t.result)).toEqual(["move-refused"]);
       // The phone hears it: an unparked row reads cloud:"move-failed" + cloudWhy "other".
-      const state = (o as { state?: Park["state"] }).state;
+      const state = (o as { state?: "moving" | "cloud" }).state;
       const park = state ? { state, since: 0 } : undefined;
       expect(cloudWant(S, park, null, NOW, { backResult: () => undefined, locked: false, why: () => undefined }))
         .toEqual({ cloud: state ?? "move-failed", extra: state ? {} : { cloudWhy: "other" } });
