@@ -800,3 +800,39 @@ for (let i = 0; i < 25; i++) {
     }
   });
 });
+
+describe("phone move-to-cloud (--later --phone, NOM-94)", () => {
+  const S = "0a1b2c3d-1111-4222-8333-444455556666";
+  // A sandboxed HOME, a live process named `claude` reparented away from this test (no ancestors to
+  // classify), and a pending slot held by a live "handoff --later": every gate passes, the claim fails.
+  test("a busy pending slot exits 1 and parks nothing", async () => {
+    const base = realpathSync(mkdtempSync(join(tmpdir(), "nomo-phone-")));
+    const home = join(base, "home"), proj = join(base, "proj"), bin = join(base, "bin"), cc = join(home, ".config/cc-status");
+    for (const d of [home, proj, bin, join(cc, "sessions"), join(home, ".claude/projects", projectDirName(proj))]) mkdirSync(d, { recursive: true });
+    symlinkSync("/bin/sleep", join(bin, "claude"));
+    symlinkSync("/bin/sh", join(bin, "handoff"));
+    const orphan = (cmd: string) => Number(execFileSync("/bin/sh", ["-c", `${cmd} >/dev/null 2>&1 & echo $!`]).toString().trim());
+    const claudePid = orphan(`${join(bin, "claude")} 30`);
+    const helperPid = orphan(`${join(bin, "handoff")} -c 'sleep 30; :' --later`);
+    try {
+      writeFileSync(join(cc, "sessions", `${S}.json`), JSON.stringify({ pid: claudePid, machine: "m", label: "l", ts: 1, cwd: proj, lastEvent: "done", op: "done" }));
+      writeFileSync(join(home, ".claude/projects", projectDirName(proj), `${S}.jsonl`), "{}\n");
+      const { DEFAULT_WORKER_URL } = await import("../core/pair-url");
+      writeFileSync(join(cc, "cloud.json"), JSON.stringify({ sandboxId: "sb", pairedTo: `sb ${DEFAULT_WORKER_URL}`, active: [] }));
+      writeFileSync(join(cc, "handoff-pending.json"), JSON.stringify({ helperPid, session: "9f8e7d6c-1111-4222-8333-444455556666", claudePid: 1, state: "waiting", startedAt: 1 }));
+      const { NOMO_WORKER_URL: _w, CLAUDE_CODE_SESSION_ID: _s, ...env } = process.env;
+      const r = await new Promise<{ code: number | null; out: string }>((res) => {
+        let out = "";
+        const c = spawn(process.execPath, [join(import.meta.dir, "handoff.ts"), "--later", "--phone", "--session", S],
+          { cwd: proj, env: { ...env, HOME: home, OMG_API_KEY: "test", OPENROUTER_API_KEY: "test" } });
+        c.stdout.on("data", (d) => (out += d)); c.stderr.on("data", (d) => (out += d));
+        c.on("exit", (code) => res({ code, out }));
+      });
+      expect(r.out).toContain("A handoff is already waiting");
+      expect(r.code).toBe(1);
+      expect(existsSync(join(cc, "parked", S))).toBe(false);
+    } finally {
+      for (const p of [claudePid, helperPid]) try { process.kill(p); } catch { /* gone */ }
+    }
+  });
+});

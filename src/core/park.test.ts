@@ -3,6 +3,7 @@ import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { endMovingTurn, readMoveResult, writeMoveResult } from "./park";
 import { backLockHolder, clearPark, cloudActive, cloudState, MOVING_STALE_MS, parkHook, parkWantsCommands, readPark, releaseBackLock, stageLanding, takeBackLock, withParked, writePark } from "./park";
 
 const A = "0a1b2c3d-1111-4222-8333-444455556666";
@@ -289,5 +290,45 @@ describe("one back at a time + the parked flag (NOM-93)", () => {
     clearPark(A, dir);
     expect(withParked(body, dir)).toEqual(body);
     expect(withParked({ v: 2, sessionId: "codex-pid-1" }, dir)).toEqual({ v: 2, sessionId: "codex-pid-1" });
+  });
+});
+
+describe("move-failed (NOM-94)", () => {
+  test("only with no marker; any marker wins; never sets `parked`", () => {
+    expect(cloudState(undefined, undefined, false, true)).toBe("move-failed");
+    expect(cloudState(undefined, undefined, false, false)).toBeUndefined();
+    expect(cloudState({ state: "moving", since: 0 }, undefined, false, true)).toBe("moving");
+    expect(cloudState({ state: "cloud", since: 0 }, undefined, false, true)).toBe("cloud");
+    const dir = tmp();
+    const body = { v: 2, sessionId: A, op: "done" };
+    expect(withParked(body, dir)).toEqual(body); // a failed move leaves no marker → no parked flag
+  });
+});
+
+describe("turn end without a Stop + per-session move outcome (NOM-94)", () => {
+  test("endMovingTurn stamps only a moving marker, once", () => {
+    const dir = tmp();
+    endMovingTurn(A, dir);
+    expect(readPark(A, dir)).toBeUndefined(); // never creates one
+    writePark(A, { state: "cloud" }, dir);
+    endMovingTurn(A, dir);
+    expect(readPark(A, dir)?.turnEndedAt).toBeUndefined();
+    writePark(A, { state: "moving", turnEndedAt: 5 }, dir);
+    endMovingTurn(A, dir);
+    expect(readPark(A, dir)?.turnEndedAt).toBe(5);
+    writePark(A, { state: "moving" }, dir);
+    endMovingTurn(A, dir);
+    expect(readPark(A, dir)?.turnEndedAt).toBeGreaterThan(5);
+  });
+
+  test("a move outcome counts only for its session and only if written since the run started", () => {
+    const dir = tmp();
+    expect(readMoveResult(A, 0, dir)).toBeUndefined();
+    writeMoveResult(A, false, dir);
+    expect(readMoveResult(A, 0, dir)).toBe("failed");
+    expect(readMoveResult("9f8e7d6c-1111-4222-8333-444455556666", 0, dir)).toBeUndefined();
+    expect(readMoveResult(A, Date.now() + 60_000, dir)).toBeUndefined(); // an older run's
+    writeMoveResult(A, true, dir);
+    expect(readMoveResult(A, 0, dir)).toBe("done");
   });
 });

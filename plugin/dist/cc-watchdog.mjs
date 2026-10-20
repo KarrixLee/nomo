@@ -4,7 +4,7 @@ var __require = /* @__PURE__ */ createRequire(import.meta.url);
 // src/entries/cc-watchdog.ts
 import { readdir as readdir4, readFile as readFile8, unlink as unlink4 } from "node:fs/promises";
 import { spawn as spawn3 } from "node:child_process";
-import { closeSync, existsSync as existsSync3, mkdirSync as mkdirSync2, openSync, readFileSync as readFileSync3, statSync as statSync3, unlinkSync as unlinkSync2, writeSync } from "node:fs";
+import { closeSync, existsSync as existsSync3, mkdirSync as mkdirSync2, openSync, readFileSync as readFileSync3, statSync as statSync4, unlinkSync as unlinkSync2, writeSync } from "node:fs";
 import { homedir, hostname as hostname4 } from "node:os";
 import { basename as basename6 } from "node:path";
 
@@ -107,7 +107,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "2.3.34";
+var PLUGIN_VERSION = "2.3.36";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -5212,7 +5212,7 @@ var MAX_DEFINITIVE_POLL_FAILURES = 2;
 
 // src/core/permission.ts
 import { readFile as readFile7, realpath, unlink as unlink3 } from "node:fs/promises";
-import { appendFileSync as appendFileSync2, statSync as statSync2, truncateSync as truncateSync2 } from "node:fs";
+import { appendFileSync as appendFileSync2, statSync as statSync3, truncateSync as truncateSync2 } from "node:fs";
 import { hostname as hostname2 } from "node:os";
 import { basename as basename5, isAbsolute as isAbsolute2, relative, resolve as resolve2 } from "node:path";
 
@@ -5365,7 +5365,7 @@ async function repairNotifyWiring(deps = {}) {
 }
 
 // src/core/park.ts
-import { mkdirSync, readFileSync as readFileSync2, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync as readFileSync2, renameSync, statSync as statSync2, unlinkSync, writeFileSync } from "node:fs";
 import { join as join3 } from "node:path";
 var PARK_DIR = `${CC_DIR}/parked`;
 var UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -5434,10 +5434,17 @@ function stageLanding(id, l, runStartedAt, dir = PARK_DIR, alive = pidAlive) {
 }
 var MOVING_STALE_MS = 35 * 60000;
 var NOMO_COMMAND = "/nomo-cc:";
-function stamp(id, fields, dir) {
+function stamp(id, fields, dir = PARK_DIR) {
   const cur = readPark(id, dir);
   if (cur)
     writePark(id, { ...cur, ...fields }, dir);
+}
+function endMovingTurn(id, dir = PARK_DIR) {
+  try {
+    const p = readPark(id, dir);
+    if (p?.state === "moving" && !p.turnEndedAt)
+      stamp(id, { turnEndedAt: Date.now() }, dir);
+  } catch {}
 }
 var underPid = (pid) => typeof pid === "number" && pidAncestors(process.pid).includes(pid);
 function parkHook(input, dir = PARK_DIR) {
@@ -5499,7 +5506,7 @@ function cloudActive(id, path = `${CC_DIR}/cloud.json`) {
     return false;
   }
 }
-function cloudState(p, run, locked = false) {
+function cloudState(p, run, locked = false, moveFailed = false) {
   switch (p?.state) {
     case "moving":
       return "moving";
@@ -5510,7 +5517,7 @@ function cloudState(p, run, locked = false) {
     case "cloud":
       return run?.running || locked ? "returning" : run && run.code !== 0 ? "failed" : "cloud";
   }
-  return;
+  return !p && moveFailed ? "move-failed" : undefined;
 }
 var parkWantsCommands = (p) => p?.state === "moving" || p?.state === "cloud" || p?.state === "landing";
 function withParked(body, dir = PARK_DIR) {
@@ -5551,6 +5558,25 @@ function releaseBackLock(id, dir = BACK_LOCK_DIR) {
     if (readFileSync2(backLockFile(id, dir), "utf8") === String(process.pid))
       unlinkSync(backLockFile(id, dir));
   } catch {}
+}
+var moveResultFile = (id, dir = BACK_LOCK_DIR) => join3(dir, `${id.slice(0, 12)}.move`);
+function writeMoveResult(id, ok, dir = BACK_LOCK_DIR) {
+  try {
+    mkdirSync(dir, { recursive: true, mode: 448 });
+    writeFileSync(moveResultFile(id, dir), ok ? `DONE
+` : `FAILED
+`, { mode: 384 });
+  } catch {}
+}
+function readMoveResult(id, since, dir = BACK_LOCK_DIR) {
+  try {
+    const f = moveResultFile(id, dir);
+    if (statSync2(f).mtimeMs < since)
+      return;
+    return readFileSync2(f, "utf8").startsWith("FAILED") ? "failed" : "done";
+  } catch {
+    return;
+  }
 }
 
 // src/core/hook.ts
@@ -6550,7 +6576,7 @@ function rotateTraceOnce(path) {
     return;
   traceRotated = true;
   try {
-    if (statSync2(path).size > TRACE_MAX_BYTES)
+    if (statSync3(path).size > TRACE_MAX_BYTES)
       truncateSync2(path, 0);
   } catch {}
 }
@@ -8686,7 +8712,8 @@ async function postEvent(config, body, opts = {}) {
 var INTERRUPT_COMMAND_KIND = "interrupt-session";
 var PING_COMMAND_KIND = "ping";
 var BRING_BACK_COMMAND_KIND = "bring-back";
-var COMMAND_KINDS_ALLOWED = new Set(["focus-terminal", INTERRUPT_COMMAND_KIND, PING_COMMAND_KIND, BRING_BACK_COMMAND_KIND]);
+var MOVE_TO_CLOUD_COMMAND_KIND = "move-to-cloud";
+var COMMAND_KINDS_ALLOWED = new Set(["focus-terminal", INTERRUPT_COMMAND_KIND, PING_COMMAND_KIND, BRING_BACK_COMMAND_KIND, MOVE_TO_CLOUD_COMMAND_KIND]);
 var PING_NONCE_MAX = 64;
 function parsePingPayload(plain) {
   if (typeof plain !== "object" || plain === null)
@@ -8778,6 +8805,7 @@ function resetCommandState() {
   executedCommandIds.clear();
   seenCommandNonces.clear();
   backRuns.clear();
+  moveRuns.clear();
 }
 function traceFocus(deps, event) {
   if (deps.trace) {
@@ -8919,6 +8947,10 @@ async function drainCommands(config, deps = {}) {
           traceFocus(deps, { ...base, result: "unknown-session" });
           continue;
         }
+        if (payload.kind === MOVE_TO_CLOUD_COMMAND_KIND) {
+          traceFocus(deps, { ...base, result: moveToCloud(payload.sessionId, entry.rec, deps.moveToCloud) });
+          continue;
+        }
         const target = `${payload.kind}|${payload.sessionId}`;
         if (batchTargets.has(target)) {
           traceFocus(deps, { ...base, result: "duplicate", why: "batch" });
@@ -8980,14 +9012,14 @@ function handoffCommand(exists = existsSync3, watchdogPath = WATCHDOG_PATH, ccDi
   const shim = `${ccDir}/hook-shim.sh`;
   return exists(shim) ? [shim, "handoff"] : undefined;
 }
-function spawnBack(id, onExit) {
+function spawnHandoff(id, what, args, cwd, onExit) {
   mkdirSync2(BACK_LOCK_DIR, { recursive: true, mode: 448 });
   const log = `${BACK_LOCK_DIR}/${id.slice(0, 12)}.log`;
   const note = (why) => {
     try {
       const f = openSync(log, "a", 384);
       try {
-        writeSync(f, `[${new Date().toISOString()}] bring-back from the phone: ${why}
+        writeSync(f, `[${new Date().toISOString()}] ${what} from the phone: ${why}
 `);
       } finally {
         closeSync(f);
@@ -8996,13 +9028,13 @@ function spawnBack(id, onExit) {
   };
   const cmd = handoffCommand();
   if (!cmd) {
-    note("Nomo's installed files were not found (plugin updated or removed?); reinstall or run /nomo-cc:back.");
+    note("Nomo's installed files were not found (plugin updated or removed?); reinstall the nomo plugin.");
     throw new Error("no handoff entry");
   }
   const fd = openSync(log, "a", 384);
   try {
     const { CLAUDE_CODE_SESSION_ID: _drop, ...env } = process.env;
-    const child = spawn3(cmd[0], [...cmd.slice(1), "--back", "--session", id, "--from-session", id, "--phone"], { detached: true, stdio: ["ignore", fd, fd], env, cwd: homedir() });
+    const child = spawn3(cmd[0], [...cmd.slice(1), ...args], { detached: true, stdio: ["ignore", fd, fd], env, cwd });
     child.on("error", (e) => {
       note(`could not start ${cmd[0]}: ${e.message}`);
       onExit(1);
@@ -9015,6 +9047,7 @@ function spawnBack(id, onExit) {
     closeSync(fd);
   }
 }
+var spawnBack = (id, onExit) => spawnHandoff(id, "bring-back", ["--back", "--session", id, "--from-session", id, "--phone"], homedir(), onExit);
 function bringBack(id, deps = {}) {
   if ((deps.readPark ?? readPark)(id)?.state !== "cloud" || !(deps.cloudActive ?? cloudActive)(id))
     return "not-parked";
@@ -9035,6 +9068,54 @@ function bringBack(id, deps = {}) {
     return "back-spawn-failed";
   }
   return "back-started";
+}
+var moveRuns = new Map;
+var UUID_RE2 = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+function moveToCloud(id, rec, deps = {}) {
+  if (!UUID_RE2.test(id) || typeof rec.cwd !== "string" || !rec.cwd || (rec.agent ?? "claude") !== "claude" || rec.provisional === true || (deps.readPark ?? readPark)(id) || (deps.cloudActive ?? cloudActive)(id))
+    return "move-refused";
+  if (moveRuns.get(id)?.running)
+    return "move-running";
+  const run = { running: true, startedAt: (deps.now ?? Date.now)() };
+  moveRuns.set(id, run);
+  const done = (code) => {
+    if (!run.running)
+      return;
+    run.running = false;
+    run.code = code;
+    if (code !== 0)
+      run.failedAt = (deps.now ?? Date.now)();
+  };
+  const cwd = rec.cwd;
+  try {
+    (deps.spawn ?? ((s, c, e) => spawnHandoff(s, "move-to-cloud", ["--later", "--phone", "--session", s], c, e)))(id, cwd, done);
+  } catch {
+    done(1);
+    return "move-spawn-failed";
+  }
+  return "move-started";
+}
+function moveFailed(id, park, rec, outcome = (since) => readMoveResult(id, since)) {
+  const m = moveRuns.get(id);
+  if (!m)
+    return false;
+  if (park && park.state !== "moving") {
+    moveRuns.delete(id);
+    return false;
+  }
+  if (!m.failedAt && !m.running && m.code === 0 && !park) {
+    if (outcome(m.startedAt) === "failed")
+      m.failedAt = Date.now();
+    else {
+      moveRuns.delete(id);
+      return false;
+    }
+  }
+  if (m.failedAt && typeof rec?.turnStartedAt === "number" && rec.turnStartedAt * 1000 > m.failedAt) {
+    moveRuns.delete(id);
+    return false;
+  }
+  return !!m.failedAt && !park;
 }
 function withCloudKey(plain, cloud) {
   const { cloud: _old, plan, dbg, ...base } = plain;
@@ -9413,6 +9494,7 @@ async function correctInterrupt(config, path, sessionId, record, now, deps = {})
       traceFocus(deps, { event: "interrupt", sessionId, outcome: "held", delivered: false, held: true });
       return "uncorrected";
     }
+    (deps.endMovingTurn ?? endMovingTurn)(sessionId);
     const attempts = effectiveDoneAttempts(record, sessionId);
     if (attempts >= INTERRUPT_DONE_MAX_ATTEMPTS) {
       try {
@@ -9548,7 +9630,7 @@ var CLAUDE_AWAITING_PROMPT_REAP_MS = 20000;
 var CLAUDE_IDLE_REAP_MAX_ATTEMPTS = 5;
 function transcriptMtimeMsDefault(path) {
   try {
-    return statSync3(path).mtimeMs;
+    return statSync4(path).mtimeMs;
   } catch {
     return;
   }
@@ -9611,7 +9693,7 @@ async function correctIdleClaude(config, path, sessionId, record, now, deps = {}
       const transcript = record.transcript;
       const active = deps.codexTurnActive ?? (async (_pid, path) => {
         const tail = await readSuffix(path, 8 * 1024);
-        return codexTurnActiveFromTail(tail, Date.now() - statSync3(path).mtimeMs);
+        return codexTurnActiveFromTail(tail, Date.now() - statSync4(path).mtimeMs);
       });
       try {
         if (await active(tuiPid, transcript))
@@ -10176,7 +10258,7 @@ async function sweep(config, deps = {}) {
       }
       remaining++;
       if (config && record && !pendingDoneHandled) {
-        const cloudFix = await correctCloudState(config, path, sessionId, record, cloudState(park, backRuns.get(sessionId), park?.state === "cloud" && backLockHolder(sessionId) !== undefined));
+        const cloudFix = await correctCloudState(config, path, sessionId, record, cloudState(park, backRuns.get(sessionId), park?.state === "cloud" && backLockHolder(sessionId) !== undefined, moveFailed(sessionId, park, record)));
         if (cloudFix === "revoked")
           return { revoked: true };
         if (cloudFix === "corrected") {
@@ -10698,6 +10780,7 @@ export {
   IDLE_GRACE_MS,
   LAN_ANSWER_ECHO_DELAY_MS,
   LAN_COMMAND_ID_PREFIX,
+  MOVE_TO_CLOUD_COMMAND_KIND,
   PAIRING_TTL_MS,
   PENDING_DONE_GRACE_MS,
   PENDING_DONE_POST_TIMEOUT_MS,
@@ -10760,6 +10843,9 @@ export {
   isRightfulWatchdogOwner,
   isWaitingSession,
   lastTurnLine,
+  moveFailed,
+  moveRuns,
+  moveToCloud,
   noteDoneAttempt,
   noteResend,
   parseCommandPayload,

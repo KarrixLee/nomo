@@ -7,7 +7,7 @@ import { readdir, readFile as readFile2, rm, unlink as unlink2 } from "node:fs/p
 import { basename as basename2 } from "node:path";
 
 // src/core/park.ts
-import { mkdirSync, readFileSync as readFileSync2, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync as readFileSync2, renameSync, statSync as statSync2, unlinkSync, writeFileSync } from "node:fs";
 import { join as join2 } from "node:path";
 
 // src/core/shared.ts
@@ -103,7 +103,7 @@ async function sha256Hex(s) {
 }
 
 // src/core/shared.ts
-var PLUGIN_VERSION = "2.3.34";
+var PLUGIN_VERSION = "2.3.36";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -1140,10 +1140,17 @@ function stageLanding(id, l, runStartedAt, dir = PARK_DIR, alive = pidAlive) {
 }
 var MOVING_STALE_MS = 35 * 60000;
 var NOMO_COMMAND = "/nomo-cc:";
-function stamp(id, fields, dir) {
+function stamp(id, fields, dir = PARK_DIR) {
   const cur = readPark(id, dir);
   if (cur)
     writePark(id, { ...cur, ...fields }, dir);
+}
+function endMovingTurn(id, dir = PARK_DIR) {
+  try {
+    const p = readPark(id, dir);
+    if (p?.state === "moving" && !p.turnEndedAt)
+      stamp(id, { turnEndedAt: Date.now() }, dir);
+  } catch {}
 }
 var underPid = (pid) => typeof pid === "number" && pidAncestors(process.pid).includes(pid);
 function parkHook(input, dir = PARK_DIR) {
@@ -1205,7 +1212,7 @@ function cloudActive(id, path = `${CC_DIR}/cloud.json`) {
     return false;
   }
 }
-function cloudState(p, run, locked = false) {
+function cloudState(p, run, locked = false, moveFailed = false) {
   switch (p?.state) {
     case "moving":
       return "moving";
@@ -1216,7 +1223,7 @@ function cloudState(p, run, locked = false) {
     case "cloud":
       return run?.running || locked ? "returning" : run && run.code !== 0 ? "failed" : "cloud";
   }
-  return;
+  return !p && moveFailed ? "move-failed" : undefined;
 }
 var parkWantsCommands = (p) => p?.state === "moving" || p?.state === "cloud" || p?.state === "landing";
 function withParked(body, dir = PARK_DIR) {
@@ -1257,6 +1264,25 @@ function releaseBackLock(id, dir = BACK_LOCK_DIR) {
     if (readFileSync2(backLockFile(id, dir), "utf8") === String(process.pid))
       unlinkSync(backLockFile(id, dir));
   } catch {}
+}
+var moveResultFile = (id, dir = BACK_LOCK_DIR) => join2(dir, `${id.slice(0, 12)}.move`);
+function writeMoveResult(id, ok, dir = BACK_LOCK_DIR) {
+  try {
+    mkdirSync(dir, { recursive: true, mode: 448 });
+    writeFileSync(moveResultFile(id, dir), ok ? `DONE
+` : `FAILED
+`, { mode: 384 });
+  } catch {}
+}
+function readMoveResult(id, since, dir = BACK_LOCK_DIR) {
+  try {
+    const f = moveResultFile(id, dir);
+    if (statSync2(f).mtimeMs < since)
+      return;
+    return readFileSync2(f, "utf8").startsWith("FAILED") ? "failed" : "done";
+  } catch {
+    return;
+  }
 }
 
 // src/entries/reset.ts

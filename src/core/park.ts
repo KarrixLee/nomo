@@ -24,7 +24,7 @@
 //   elsewhere — brought back from ANOTHER session while this window was still open (pid): only that
 //             window is blocked (by process ancestry; the new window resumes the same id), until it ends.
 
-import { mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { CC_DIR, pidAlive, pidAncestors } from "./shared";
 
@@ -112,9 +112,18 @@ export const NOMO_COMMAND = "/nomo-cc:";
 
 /** Merge stamp fields into the CURRENT marker (re-read, so a state written meanwhile, e.g. "landing" by
  *  --back, is never downgraded by a hook holding an older copy). */
-function stamp(id: string, fields: Partial<Park>, dir: string): void {
+export function stamp(id: string, fields: Partial<Park>, dir = PARK_DIR): void {
   const cur = readPark(id, dir);
   if (cur) writePark(id, { ...cur, ...fields }, dir);
+}
+
+/** A turn ended with no Stop hook (Esc fires none; the watchdog's interrupt net saw it): a "moving"
+ *  marker gets its turnEndedAt so the helper proceeds instead of waiting out its 30 min cap. */
+export function endMovingTurn(id: string, dir = PARK_DIR): void {
+  try {
+    const p = readPark(id, dir);
+    if (p?.state === "moving" && !p.turnEndedAt) stamp(id, { turnEndedAt: Date.now() }, dir);
+  } catch { /* fail open */ }
 }
 
 /** Is this hook running under the window `pid`? (ps walk: only for the rare "elsewhere" marker.) */
@@ -167,16 +176,17 @@ export function cloudActive(id: string, path = `${CC_DIR}/cloud.json`): boolean 
 /** A phone-started `--back` for one session, as the watchdog tracks it (in memory). */
 export interface BackRun { running: boolean; code?: number | null }
 
-/** The blob's `cloud` key: what the phone shows for a parked session. Undefined → no key. */
-export type CloudState = "moving" | "cloud" | "returning" | "failed" | "back";
-export function cloudState(p: Park | undefined, run?: BackRun, locked = false): CloudState | undefined {
+/** The blob's `cloud` key: what the phone shows for a parked session. Undefined → no key.
+ *  "move-failed" (NOM-94, appended): a phone-started move-to-cloud did not happen; no marker is left. */
+export type CloudState = "moving" | "cloud" | "returning" | "failed" | "back" | "move-failed";
+export function cloudState(p: Park | undefined, run?: BackRun, locked = false, moveFailed = false): CloudState | undefined {
   switch (p?.state) {
     case "moving": return "moving";
     case "landing": return "returning";
     case "back": return "back";
     case "cloud": return run?.running || locked ? "returning" : run && run.code !== 0 ? "failed" : "cloud";
   }
-  return undefined;
+  return !p && moveFailed ? "move-failed" : undefined;
 }
 
 /** A parked session the phone may act on keeps the command long-poll up. */
@@ -218,4 +228,20 @@ export function takeBackLock(id: string, dir = BACK_LOCK_DIR, alive: (pid: numbe
 }
 export function releaseBackLock(id: string, dir = BACK_LOCK_DIR): void {
   try { if (readFileSync(backLockFile(id, dir), "utf8") === String(process.pid)) unlinkSync(backLockFile(id, dir)); } catch { /* gone */ }
+}
+
+/** NOM-94: the /nomo-cc:handoff helper's outcome for ONE session (cloud-back/<id12>.move: "DONE" or
+ *  "FAILED"), so the watchdog never reads another session's run off the shared handoff.log. A cancel
+ *  writes nothing: it is a clean unpark. */
+export const moveResultFile = (id: string, dir = BACK_LOCK_DIR): string => join(dir, `${id.slice(0, 12)}.move`);
+export function writeMoveResult(id: string, ok: boolean, dir = BACK_LOCK_DIR): void {
+  try { mkdirSync(dir, { recursive: true, mode: 0o700 }); writeFileSync(moveResultFile(id, dir), ok ? "DONE\n" : "FAILED\n", { mode: 0o600 }); } catch { /* status only */ }
+}
+/** "failed" when the result file says FAILED and was written at or after `since` (epoch ms). */
+export function readMoveResult(id: string, since: number, dir = BACK_LOCK_DIR): "failed" | "done" | undefined {
+  try {
+    const f = moveResultFile(id, dir);
+    if (statSync(f).mtimeMs < since) return undefined;
+    return readFileSync(f, "utf8").startsWith("FAILED") ? "failed" : "done";
+  } catch { return undefined; }
 }
