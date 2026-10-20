@@ -557,7 +557,7 @@ describe("handoff manifest (NOM-106)", () => {
       JSON.stringify({ note: "set API_KEY=Zq8vL3mT9wR2xK7pN4bH6" })]) {
       const r = validateManifest(text);
       expect(r).toEqual({ invalid: "looks like it holds a secret" });
-      expect(manifestLine(r, [])).not.toContain(key);
+      expect(manifestLine(r, { install: [], compose: [] })).not.toContain(key);
     }
   });
 
@@ -576,18 +576,30 @@ describe("handoff manifest (NOM-106)", () => {
     expect(existsSync(join(d, "real"))).toBe(true);
   });
 
-  test("first message: setup steps, env names and note; normal approvals, nothing bypassed", () => {
-    const msg = manifestMessage({ note: "Halfway through the login form; next: tests.", env: ["DATABASE_URL", "STRIPE_KEY"] }, ["bun install", "docker compose -f 'compose.yml' up -d"]);
+  test("first message: setup steps, compose listed not started, env names and note; no promise of prompts", () => {
+    const msg = manifestMessage({ note: "Halfway through the login form; next: tests.", env: ["DATABASE_URL", "STRIPE_KEY"] }, { install: ["bun install"], compose: ["compose.yml"] });
     expect(msg).toContain("Where I was: Halfway through the login form; next: tests.");
-    expect(msg).toContain("`bun install`, `docker compose -f 'compose.yml' up -d`");
-    expect(msg).toContain("usual approval prompts");
+    expect(msg).toContain("First run these setup steps: `bun install`");
+    expect(msg).toContain("Services this project uses (not started; start them only if the task needs it): compose.yml.");
+    expect(msg).not.toMatch(/docker compose|up -d|approval prompts/);
     expect(msg).toContain("DATABASE_URL, STRIPE_KEY");
     expect(msg).toContain("values were not sent");
     expect(msg).not.toMatch(/\n|bypass|dangerously|--permission/i);
     expect(msg.startsWith("You're now running on the cloud box.")).toBe(true);
-    expect(manifestMessage({ env: [] }, [])).toBe(DEFAULT_THEN);
-    expect(manifestLine({ manifest: { env: ["A"], note: "n" } }, ["bun install"])).toBe('Handoff manifest: setup bun install; env names A (values never sent); note: "n".');
-    expect(manifestLine({ invalid: "not JSON" }, ["bun install"])).toBe("Handoff manifest ignored (not JSON); the box gets the usual first message.");
+    expect(manifestMessage({ env: [] }, { install: [], compose: [] })).toBe(DEFAULT_THEN);
+    expect(manifestMessage({ env: [] }, { install: [], compose: ["compose.yml"] })).not.toBe(DEFAULT_THEN);
+    expect(manifestLine({ manifest: { env: ["A"], note: "n" } }, { install: ["bun install"], compose: [] })).toBe('Handoff manifest: setup bun install; env names A (values never sent); note: "n".');
+    expect(manifestLine({ manifest: { env: [] } }, { install: [], compose: ["compose.yml"] })).toBe("Handoff manifest: setup none detected; services listed, not started: compose.yml; env names none (values never sent).");
+    expect(manifestLine({ invalid: "not JSON" }, { install: ["bun install"], compose: [] })).toBe("Handoff manifest ignored (not JSON); the box gets the usual first message.");
+  });
+
+  test("later() takes the manifest (and drops an empty-id one) before any check can bail", () => {
+    const src = readFileSync(join(import.meta.dir, "../entries/handoff.ts"), "utf8");
+    const fn = src.slice(src.indexOf("async function later("), src.indexOf("function arm("));
+    const take = fn.indexOf("takeManifest(manifestPath(session))");
+    expect(fn.indexOf('rmSync(manifestPath(""), { force: true })')).toBeGreaterThan(-1);
+    expect(take).toBeGreaterThan(-1);
+    for (const bail of ["LATER_USAGE", "could not tell which", "OMG_API_KEY"]) expect(take).toBeLessThan(fn.indexOf(bail));
   });
 
   test("the phone path never takes a manifest: it arms with the plain default message", () => {

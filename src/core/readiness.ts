@@ -8,8 +8,8 @@
 // holds only the gitlink); an untracked, unignored nested repo rides in the untracked tar.
 
 import { execFileSync } from "node:child_process";
-import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { join, relative, sep } from "node:path";
 
 export interface GitProbe {
   /** Tracked files among / under `paths` (relative to the repo root). */
@@ -154,25 +154,33 @@ export function cloudReadiness(root: string, deps: ReadinessDeps): string {
   return [head, ...warnings].join("\n");
 }
 
-/** NOM-106: the setup commands the box should run, derived ONLY from lockfiles and compose files (never
- *  from the model): one install per lockfile dir (one JS package manager per dir, LOCKS order), then
- *  `docker compose up -d` per compose file. Prefixed `cd <dir> && ` outside the root. At most `max`. */
-export function setupSteps(root: string, maxEntries = 4000, max = 8): string[] {
+/** A cwd-relative path safe to put in the box's first message (typed into tmux): plain characters only,
+ *  no segment that `cd` would read as an option (`-`, `-x`). Anything else is dropped, never escaped. */
+const plainPath = (p: string) => /^[A-Za-z0-9._@+/ -]+$/.test(p) && !p.split("/").some((s) => s.startsWith("-"));
+
+/** NOM-106: what the box should set up, derived ONLY from lockfiles and compose files (never from the
+ *  model). `install`: one per lockfile dir (one JS package manager per dir, LOCKS order), as
+ *  `(cd <dir> && <cmd>)` relative to `cwd` (where the box session runs; may be below `root`). `compose`:
+ *  compose files relative to `cwd`, listed for the model, never started. Hostile names are skipped. */
+export function setupSteps(root: string, cwd = root, maxEntries = 4000, max = 8): { install: string[]; compose: string[] } {
   const w = walk(root, maxEntries);
+  const real = (p: string) => { try { return realpathSync(p); } catch { return p; } };
+  const [r, c] = [real(root), real(cwd)];
+  const rel = (p: string) => relative(c, join(r, p)).split(sep).join("/");
   const JS = new Set(LOCKS.slice(0, 5).map(([n]) => n));
-  const sq = (p: string) => `'${p.replace(/'/g, `'\\''`)}'`;
-  const cd = (dir: string, cmd: string) => (dir ? `cd ${sq(dir)} && ${cmd}` : cmd);
-  const steps: string[] = [];
+  const install: string[] = [];
   for (const dir of [...w.locks.keys()].sort()) {
+    const d = rel(dir);
+    if (d && !plainPath(d)) continue;
     let js = false;
     for (const [name, cmd] of LOCKS) {
       if (!w.locks.get(dir)!.includes(name) || (JS.has(name) && js)) continue;
       js ||= JS.has(name);
-      steps.push(cd(dir, cmd));
+      install.push(d ? `(cd '${d}' && ${cmd})` : cmd); // plainPath: no quote to escape
     }
   }
-  for (const f of w.compose) steps.push(`docker compose -f ${sq(f)} up -d`);
-  return [...new Set(steps)].slice(0, max);
+  const compose = w.compose.map(rel).filter(plainPath);
+  return { install: [...new Set(install)].slice(0, max), compose: compose.slice(0, max) };
 }
 
 /** The real git probe for the repo at `root`, or undefined when it isn't one. */

@@ -85,7 +85,7 @@ import { scanHandoff, secretSummary } from "../core/transcript-scan";
 import { backLockHolder, clearPark, cloudActive, moveResultFile, type MoveWhy, PARK_DIR, writeBackResult, writeMoveResult, readPark, releaseBackLock, stageLanding, takeBackLock, writePark } from "../core/park";
 import { atomicWrite, CC_DIR, macWorkerUrl, pidAlive, pidAncestors, pidCommand, readRecord, SESSIONS_DIR } from "../core/shared";
 import {
-  BOX_MAX_SESSIONS, cancelPending, claimPending, DEFAULT_THEN, EXIT_BOX_GONE, phoneMoveCheck, settleThenStamp, contextTokens, contextTokensOf, GONE_MSG, sizeWarning, TAIL_BYTES, handoffArgv, LATER_LOG, LATER_USAGE, laterStatus, manifestLine, manifestMessage, manifestPath, takeManifest, transcriptSecretWarning, needsPairing, parseLaterArg, type Pending, PENDING_PATH, readPending, resolveSession, waitThenHandoff,
+  BOX_MAX_SESSIONS, cancelPending, claimPending, DEFAULT_THEN, EXIT_BOX_GONE, phoneMoveCheck, settleThenStamp, contextTokens, contextTokensOf, GONE_MSG, sizeWarning, TAIL_BYTES, handoffArgv, LATER_LOG, LATER_USAGE, laterStatus, manifestLine, manifestMessage, manifestPath, type Setup, takeManifest, transcriptSecretWarning, needsPairing, parseLaterArg, type Pending, PENDING_PATH, readPending, resolveSession, waitThenHandoff,
 } from "../core/handoff-later";
 import {
   agentConfigPaths, applyInPlace, atomicWriteBytes, type BoxArtifacts, boxChangedPaths, boxIdle, sessionBusy, copyContained, decideCode, extractTgz,
@@ -1612,10 +1612,13 @@ async function later(args: Map<string, string | true>, keys: { omg?: string; ope
   const { session, claudePid } = resolveSession({
     substituted: typeof flag === "string" ? flag : undefined, env: process.env, ancestors: pidAncestors(process.pid), records,
   });
+  // NOM-106: read + deleted before any check can bail, so it never lingers. An empty-id one (written with
+  // CLAUDE_SESSION_ID unset) belongs to no session: just deleted.
+  rmSync(manifestPath(""), { force: true });
+  const manifest = session ? takeManifest(manifestPath(session)) : undefined;
   const arg = parseLaterArg(args.has("--args-stdin") ? readFileSync(0, "utf8") : "");
   if (!arg) { console.log(LATER_USAGE); process.exitCode = 1; return; }
   if (!session || !claudePid) throw new Error("could not tell which Claude Code session this is. Run /nomo-cc:handoff inside the session you want to move.");
-  const manifest = takeManifest(manifestPath(session)); // NOM-106: read + deleted now, whatever happens next
   if (!keys.omg || !keys.openrouter) throw new Error("OMG_API_KEY and OPENROUTER_API_KEY must be set (env or ~/.nomo-spike.env)");
   const home = process.env.HOME!;
   const cwd = [process.cwd(), (await readRecord(session))?.cwd]
@@ -1638,10 +1641,10 @@ async function later(args: Map<string, string | true>, keys: { omg?: string; ope
   // NOM-106: only the default first message takes the manifest; `then <text>` and `quiet` are the user's.
   let message = arg.message, manifestNote: string | undefined;
   if (manifest && message === DEFAULT_THEN) {
-    let steps: string[] = [];
-    try { if ("manifest" in manifest) steps = setupSteps(root ?? cwd); } catch { /* none */ }
-    if ("manifest" in manifest) message = manifestMessage(manifest.manifest, steps);
-    manifestNote = manifestLine(manifest, steps);
+    let setup: Setup = { install: [], compose: [] };
+    try { if ("manifest" in manifest) setup = setupSteps(root ?? cwd, cwd); } catch { /* none */ } // relative to cwd: the box's tmux -c
+    if ("manifest" in manifest) message = manifestMessage(manifest.manifest, setup);
+    manifestNote = manifestLine(manifest, setup);
   }
   if (!arm(session, claudePid, cwd, message, worker, arg.anyway)) return;
   console.log(`Ready. Session ${session} moves to the cloud as soon as this turn ends; watch it on your phone.\n` +

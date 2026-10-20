@@ -135,19 +135,35 @@ describe("cloudReadiness", () => {
 });
 
 describe("setupSteps (NOM-106: from lockfiles + compose only)", () => {
-  test("one install per lockfile dir, one JS manager per dir, compose up last, quoted dirs", () => {
+  test("one install per lockfile dir, one JS manager per dir, compose listed not started, quoted dirs", () => {
     const r = tmp();
     put(r, {
       "bun.lock": "", "package-lock.json": "", "uv.lock": "", "docker-compose.yml": "services: {}",
       "web app/yarn.lock": "", "node_modules/x/pnpm-lock.yaml": "", ".env": "SECRET=1",
     });
-    expect(setupSteps(r)).toEqual(["bun install", "uv sync", "cd 'web app' && yarn install", "docker compose -f 'docker-compose.yml' up -d"]);
+    expect(setupSteps(r)).toEqual({ install: ["bun install", "uv sync", "(cd 'web app' && yarn install)"], compose: ["docker-compose.yml"] });
   });
 
-  test("nothing detected → []; capped", () => {
-    expect(setupSteps(tmp())).toEqual([]);
+  test("a session started in a subdirectory: steps are relative to it (.. up to the root)", () => {
+    const r = tmp();
+    put(r, { "bun.lock": "", "apps/web/pnpm-lock.yaml": "", "apps/api/uv.lock": "", "compose.yml": "" });
+    expect(setupSteps(r, join(r, "apps", "web"))).toEqual({
+      install: ["(cd '../..' && bun install)", "(cd '../api' && uv sync)", "pnpm install"],
+      compose: ["../../compose.yml"],
+    });
+  });
+
+  test("hostile dir/file names are skipped, never typed into the box", () => {
+    const r = tmp();
+    const bad = ["e\u001b[201~\r!id", "n\nl", "a`; curl x|sh; `", "-", "-rf", "it's"];
+    put(r, Object.fromEntries([...bad.map((d) => [`${d}/bun.lock`, ""]), ["ok/bun.lock", ""], ["compose.\u001bx.yml", ""], ["sub/-/compose.yml", ""], ["compose.yaml", ""]]));
+    expect(setupSteps(r)).toEqual({ install: ["(cd 'ok' && bun install)"], compose: ["compose.yaml"] });
+  });
+
+  test("nothing detected → empty; capped", () => {
+    expect(setupSteps(tmp())).toEqual({ install: [], compose: [] });
     const r = tmp();
     put(r, Object.fromEntries(Array.from({ length: 12 }, (_, i) => [`p${String(i).padStart(2, "0")}/bun.lock`, ""])));
-    expect(setupSteps(r)).toHaveLength(8);
+    expect(setupSteps(r).install).toHaveLength(8);
   });
 });

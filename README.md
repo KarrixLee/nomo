@@ -160,11 +160,19 @@ home. What that does and doesn't expose:
   `$HOME`, `C:\`) and no secret-looking file name (`isSecretName`); and the whole file must pass the
   transcript secret scanner above. One failure and the whole manifest is ignored, with one
   `Handoff manifest ignored (…)` line that never echoes its content; the box then gets the usual first
-  message. Setup commands never come from the model: they are derived from lockfiles and compose files
-  (`setupSteps` in `src/core/readiness.ts`, e.g. `bun install`, `docker compose -f … up -d`). The box's
-  first message lists those commands, the env names (saying their values were not sent) and the note,
-  and asks Claude there to run the commands with its usual approval prompts. No permission flag is
-  added and nothing is bypassed. No env value is read, sent or stored at any step.
+  message. Setup commands never come from the model: they are derived from lockfiles only
+  (`setupSteps` in `src/core/readiness.ts`, e.g. `bun install`, `(cd 'web' && pnpm install)`, relative
+  to the session's folder), and any directory or file whose path has anything beyond plain letters,
+  digits, spaces and `._@+/-`, or a part starting with `-`, is skipped rather than escaped. Compose files
+  are only listed as services the project uses; the box is told not to start them unless the task needs
+  it. The box's first message asks Claude there to run those setup steps, then lists the compose files,
+  the env names (saying their values were not sent) and the note. No permission flag is added, but the
+  box session runs in your usual permission mode: **in auto or bypass mode the box runs the project's
+  install steps, and the lifecycle scripts they trigger (`postinstall`, build scripts), without
+  prompting, with the box's model key in their environment.** Only hand off repos you would run
+  yourself. No env value is read, sent or stored at any step. Env *names* are written by the model, so
+  in principle they could carry a little of what it chose to put there; the transcript already
+  travels, so this adds nothing new.
 - **The box is its own paired computer.** It pairs with your phone under its own keys ("Nomo Cloud"),
   so phone ↔ box traffic is end-to-end sealed exactly like your Mac's, and the relay stays blind:
   it sees ids and flags (op, priority, a `parked` boolean), never titles or content.

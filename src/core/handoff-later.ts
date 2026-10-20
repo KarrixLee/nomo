@@ -110,24 +110,28 @@ export function takeManifest(path: string, now = Date.now()): ManifestResult | u
   } catch { return { invalid: "unreadable" }; } finally { rmSync(path, { force: true }); }
 }
 
-/** The default first message with the manifest folded in: setup steps (detected, never the model's),
- *  env NAMES, the note. Run under the box's normal approval prompts; nothing here bypasses them. */
-export function manifestMessage(m: Manifest, steps: string[]): string {
-  if (!m.note && !m.env.length && !steps.length) return DEFAULT_THEN;
+export interface Setup { install: string[]; compose: string[] }
+
+/** The default first message with the manifest folded in: install steps and compose files (detected,
+ *  never the model's), env NAMES, the note. No promise of approval prompts: in auto mode there are none. */
+export function manifestMessage(m: Manifest, setup: Setup): string {
+  if (!m.note && !m.env.length && !setup.install.length && !setup.compose.length) return DEFAULT_THEN;
   const parts = ["You're now running on the cloud box."];
   if (m.note) parts.push(`Where I was: ${m.note}`);
-  if (steps.length) parts.push(`First set this box up by running ${steps.map((c) => `\`${c}\``).join(", ")} (one at a time, with the usual approval prompts; if one fails, say why and go on).`);
+  if (setup.install.length) parts.push(`First run these setup steps: ${setup.install.map((c) => `\`${c}\``).join(", ")} (one at a time; if one fails, say why and go on).`);
+  if (setup.compose.length) parts.push(`Services this project uses (not started; start them only if the task needs it): ${setup.compose.join(", ")}.`);
   if (m.env.length) parts.push(`The project needs these environment variables, whose values were not sent: ${m.env.join(", ")}. Never guess values; tell me which are missing when the work needs them.`);
   parts.push("Then continue the task you were working on before the handoff. If it was already finished, say so and wait.");
   return parts.join(" ");
 }
 
 /** The one line printed next to the Cloud check. */
-export function manifestLine(r: ManifestResult, steps: string[]): string {
+export function manifestLine(r: ManifestResult, setup: Setup): string {
   if ("invalid" in r) return `Handoff manifest ignored (${r.invalid}); the box gets the usual first message.`;
   const m = r.manifest;
-  return `Handoff manifest: setup ${steps.length ? steps.join(" · ") : "none detected"}; env names ${m.env.length ? m.env.join(", ") : "none"} (values never sent)` +
-    `${m.note ? `; note: "${m.note}"` : ""}.`;
+  return `Handoff manifest: setup ${setup.install.length ? setup.install.join(" · ") : "none detected"}` +
+    `${setup.compose.length ? `; services listed, not started: ${setup.compose.join(", ")}` : ""}` +
+    `; env names ${m.env.length ? m.env.join(", ") : "none"} (values never sent)${m.note ? `; note: "${m.note}"` : ""}.`;
 }
 
 /** `/nomo-cc:handoff`'s argument (cancel/status are routed by the command itself): empty → DEFAULT_THEN,
