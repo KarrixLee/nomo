@@ -9,6 +9,7 @@ import {
   BOX_MAX_SESSIONS, boxPaired, phoneMoveCheck, type PhoneMoveFacts, settleThenStamp,
 } from "./handoff-later";
 import { parkHook, readPark, writePark } from "./park";
+import { macWorkerUrl } from "./shared";
 
 const A = "0a1b2c3d-1111-4222-8333-444455556666";
 const B = "9f8e7d6c-1111-4222-8333-444455556666";
@@ -42,6 +43,17 @@ test("boxPaired (NOM-95): cloud.json paired to the worker; missing or other work
   writeFileSync(f, JSON.stringify({ sandboxId: "sb", pairedTo: "sb https://w" }));
   expect(boxPaired(f, "https://w")).toBe(true);
   expect(boxPaired(f, "https://other")).toBe(false);
+});
+
+test("macWorkerUrl: env, else the Mac's config.json url (a watchdog spawn has no env), else production", () => {
+  const cfg = join(tmp(), "config.json");
+  expect(macWorkerUrl(undefined, cfg)).toBe("https://api.nomo.gg");
+  writeFileSync(cfg, JSON.stringify({ url: "https://stg.example.dev/", pairingId: "p" }));
+  expect(macWorkerUrl(undefined, cfg)).toBe("https://stg.example.dev");
+  expect(macWorkerUrl("https://env.example", cfg)).toBe("https://env.example");
+  const cloud = join(tmp(), "cloud.json");
+  writeFileSync(cloud, JSON.stringify({ sandboxId: "sb", pairedTo: "sb https://stg.example.dev" }));
+  expect(boxPaired(cloud, macWorkerUrl(undefined, cfg))).toBe(true);
 });
 
 test("needsPairing: only a box recorded as paired to THIS worker passes", () => {

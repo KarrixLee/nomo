@@ -5196,6 +5196,12 @@ describe("move to cloud from the phone (NOM-94)", () => {
       await drainCommands(cfg(), { ...deps, take: () => [c] });
       expect(spawned).toEqual([]);
       expect(traces.map((t) => t.result)).toEqual(["move-refused"]);
+      // The phone hears it: an unparked row reads cloud:"move-failed" + cloudWhy "other".
+      const state = (o as { state?: Park["state"] }).state;
+      const park = state ? { state, since: 0 } : undefined;
+      expect(cloudWant(S, park, null, NOW, { backResult: () => undefined, locked: false, why: () => undefined }))
+        .toEqual({ cloud: state ?? "move-failed", extra: state ? {} : { cloudWhy: "other" } });
+      resetCommandState();
     }
     const { spawned, traces, deps } = harness({ record: null });
     const unknown = await cmd();

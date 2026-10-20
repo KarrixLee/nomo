@@ -117,7 +117,7 @@ function buildPairURL(workerUrl, pairingId, qrSecret, pcEphPub) {
 }
 
 // src/core/shared.ts
-var PLUGIN_VERSION = "2.3.43";
+var PLUGIN_VERSION = "2.3.44";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -214,7 +214,15 @@ function appendFittedPlan(base, plan) {
 function needsPairing(cloud, worker) {
   return !cloud.sandboxId || cloud.pairedTo !== `${cloud.sandboxId} ${worker}`;
 }
-function boxPaired(path = `${CC_DIR}/cloud.json`, worker = (process.env.NOMO_WORKER_URL || DEFAULT_WORKER_URL).replace(/\/$/, "")) {
+function macWorkerUrl(env = process.env.NOMO_WORKER_URL, configPath = `${CC_DIR}/config.json`) {
+  let url = env;
+  if (!url)
+    try {
+      url = JSON.parse(readFileSync(configPath, "utf8")).url;
+    } catch {}
+  return (typeof url === "string" && url ? url : DEFAULT_WORKER_URL).replace(/\/$/, "");
+}
+function boxPaired(path = `${CC_DIR}/cloud.json`, worker = macWorkerUrl()) {
   try {
     return !needsPairing(JSON.parse(readFileSync(path, "utf8")), worker);
   } catch {
@@ -9165,8 +9173,13 @@ function bringBack(id, deps = {}) {
 var moveRuns = new Map;
 var UUID_RE2 = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 function moveToCloud(id, rec, deps = {}) {
-  if (!UUID_RE2.test(id) || typeof rec.cwd !== "string" || !rec.cwd || (rec.agent ?? "claude") !== "claude" || rec.provisional === true || (deps.readPark ?? readPark)(id) || (deps.cloudActive ?? cloudActive)(id))
+  if (!UUID_RE2.test(id) || typeof rec.cwd !== "string" || !rec.cwd || (rec.agent ?? "claude") !== "claude" || rec.provisional === true || (deps.readPark ?? readPark)(id) || (deps.cloudActive ?? cloudActive)(id)) {
+    if (UUID_RE2.test(id) && !moveRuns.get(id)?.running) {
+      const at = (deps.now ?? Date.now)();
+      moveRuns.set(id, { running: false, startedAt: at, code: 1, failedAt: at });
+    }
     return "move-refused";
+  }
   if (moveRuns.get(id)?.running)
     return "move-running";
   const run = { running: true, startedAt: (deps.now ?? Date.now)() };
