@@ -489,3 +489,28 @@ export function landFolder(cwd: string, extracted: string, files: string[], uuid
   for (const rel of files) copyContained(join(extracted, rel), dst, rel, false);
   return dst;
 }
+
+/** NOM-101 keep-awake rules: an attention wait keeps the box awake this long, a finished turn this long
+ *  (grace for a quick follow-up). */
+export const ATTENTION_AWAKE_S = 2 * 3600;
+export const DONE_GRACE_S = 10 * 60;
+
+/** Should this box session keep the box awake? Working: yes. Waiting on the user: for ATTENTION_AWAKE_S.
+ *  Done: for DONE_GRACE_S. The clock is the record's `ts` (the hook event that set lastEvent) when the
+ *  record decided, else the transcript's quiet time. Returns why, for the box handoff log. */
+export function sessionBusy(o: { lastEvent?: string; ts?: number; tail: string; quietS: number }, now: number): { busy: boolean; why: string } {
+  // A done/needsAttention record older than the transcript's last write (60s slack: meta lines land after
+  // the Stop hook) is stale, e.g. a hook that never fired for the next turn: the transcript decides.
+  const stale = typeof o.ts === "number" && now - o.quietS * 1000 > o.ts + 60_000;
+  const state = boxIdle(stale ? { ...o, lastEvent: undefined } : o);
+  if (state === "busy") return { busy: true, why: "working" };
+  // A transcript written in the last DONE_GRACE_S is busy whatever the record says.
+  if (o.quietS < DONE_GRACE_S) return { busy: true, why: `active ${Math.floor(Math.max(0, o.quietS) / 60)} min ago` };
+  // ponytail: a pending approval (needsAttention) keeps the box awake ATTENTION_AWAKE_S, then it sleeps and
+  // the phone can't answer it; open question whether it should stay awake until answered.
+  const fromRecord = !stale && (o.lastEvent === "done" || o.lastEvent === "needsAttention") && typeof o.ts === "number";
+  const age = Math.max(0, fromRecord ? (now - o.ts!) / 1000 : o.quietS);
+  const min = Math.floor(age / 60);
+  if (state === "attention") return { busy: age < ATTENTION_AWAKE_S, why: `waiting on you for ${min} min` };
+  return { busy: age < DONE_GRACE_S, why: `done ${min} min ago` };
+}

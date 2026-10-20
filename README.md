@@ -166,6 +166,11 @@ home. What that does and doesn't expose:
   the background). It refuses outright when any file git tracks in the project's repo (`git ls-files`,
   dot-folders included) has a secret-looking name, and when git can't list them; a folder that is
   not a git repo has nothing tracked and may move.
+- **The box sleeps when its sessions are idle.** It stays awake while a session works, waits on you
+  (up to 2 h) or finished under 10 min ago; after that it stops renewing its 30-min lease and
+  hibernates (files and memory kept, deleted after 14 days asleep). `handoff` and `--back` wake it;
+  on an awake box they, `--stop` and `--send` renew the lease first. A sleeping box can't receive
+  phone approvals yet: an approval still pending after 2 h waits until you wake the box.
 
 **Not covered:** whoever holds your unlocked phone, or this computer's pairing key, can move a
 session to *your own* box or bring one back, just as they could answer its remote approvals.
