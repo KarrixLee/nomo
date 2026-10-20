@@ -6830,7 +6830,7 @@ async function main() {
       console.log("No cloud box. Run `handoff` to create one.");
       return;
     }
-    if (pairWakes(args) && sb.status !== "running")
+    if (pairWakes(args))
       sb = { ...sb, id: await wakeBox(omg, sb), status: "running" };
     const here = hereSession(args.get("--from-session") || process.env.CLAUDE_CODE_SESSION_ID, cloud);
     if (args.has("--stop")) {

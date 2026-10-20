@@ -188,8 +188,8 @@ export const BOX_HANDOFF_LOG = "/root/.config/cc-status/handoff.log";
  *  box). Busy: renew the lease, at most every 10 min, and at once after a release. Idle: stop renewing
  *  (logged once); the lease lapses and omg hibernates the box. `$B` is bun's (else node's) absolute path,
  *  resolved by the launching box script (keepaliveStart): tmux's shell may not have bun on PATH.
- *  ponytail: an idle box sleeps, and omg's 14-day deletion clock for a sleeping box starts then; open
- *  question whether to warn before it (today: --status says asleep, nothing more). */
+ *  An idle box sleeps, and omg's 14-day deletion clock for a sleeping box starts then; the phone is
+ *  warned near the end via `cloudAge: "expiring"` (NOM-99, park.ts). */
 export const keepaliveLoop = (): string => `L=0; S=
 log() { echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) keep-awake: $*" >> ${BOX_HANDOFF_LOG}; }
 while ${ANY_SESSION}; do
@@ -1833,7 +1833,8 @@ async function main(): Promise<void> {
     // read-only (a stopped box stays stopped), except --pair, which wakes it first
     let sb = await getBox(omg, cloud.sandboxId, api, { wake: pairWakes(args) });
     if (!sb) { console.log("No cloud box. Run `handoff` to create one."); return; }
-    if (pairWakes(args) && sb.status !== "running") sb = { ...sb, id: await wakeBox(omg, sb), status: "running" };
+    // always: a running idle box needs a fresh lease too, or it can hibernate during the 10-min pair wait
+    if (pairWakes(args)) sb = { ...sb, id: await wakeBox(omg, sb), status: "running" };
     const here = hereSession(args.get("--from-session") || process.env.CLAUDE_CODE_SESSION_ID, cloud);
     if (args.has("--stop")) {
       // --all, or bare with at most one session on record: sleep the whole box (sessions resume on wake).

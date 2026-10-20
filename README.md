@@ -169,8 +169,11 @@ home. What that does and doesn't expose:
 - **The box sleeps when its sessions are idle.** It stays awake while a session works, waits on you
   (up to 2 h) or finished under 10 min ago; after that it stops renewing its 30-min lease and
   hibernates (files and memory kept, deleted after 14 days asleep). `handoff` and `--back` wake it;
-  on an awake box they, `--stop` and `--send` renew the lease first. A sleeping box can't receive
-  phone approvals yet: an approval still pending after 2 h waits until you wake the box.
+  on an awake box they, `--pair`, `--stop` and `--send` renew the lease first. Background shell jobs
+  (`run_in_background` builds, dev servers) do not keep it awake once the turn has ended: about
+  10 min after the session finishes the box may sleep and freeze them. An approval still pending
+  after 2 h lets the box sleep; wake it with `--pair` or `--back` and answer at the terminal
+  (`--screen` / `--send-key`) — the phone prompt may have expired.
 
 **Not covered:** whoever holds your unlocked phone, or this computer's pairing key, can move a
 session to *your own* box or bring one back, just as they could answer its remote approvals.

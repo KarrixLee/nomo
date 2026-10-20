@@ -1042,6 +1042,11 @@ describe("NOM-101: the box sleeps when its sessions are idle", () => {
     expect(calls).toEqual([["POST", "/sandboxes/sb/wake", undefined]]);
   });
 
+  test("review fix: --pair goes through wakeBox even on a running box (fresh lease for the pair wait)", () => {
+    const src = readFileSync(join(import.meta.dir, "handoff.ts"), "utf8");
+    expect(src).toContain('if (pairWakes(args)) sb = { ...sb, id: await wakeBox(omg, sb), status: "running" };');
+  });
+
   test("--status line: asleep / idle with its sleep time / running", () => {
     const fmt = () => "12:30";
     expect(keepAwakeLine("hibernated", undefined, undefined, "")).toBe("asleep");
