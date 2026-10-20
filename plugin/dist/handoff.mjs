@@ -384,7 +384,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "2.3.40";
+var PLUGIN_VERSION = "2.3.41";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -5492,24 +5492,31 @@ function macId() {
 function createBody(hasBase, externalUserId) {
   return { ...hasBase ? { templateId: BASE_TEMPLATE } : { template: "omg" }, size: BOX_SIZE, externalUserId };
 }
-async function getBox(key, id, call = api) {
+var isGone = (e) => e?.status === 404 || e?.status === 410;
+async function getBox(key, id, call = api, opts = {}) {
   if (!id)
     return;
   let sb;
   try {
     sb = await call(key, "GET", `/sandboxes/${id}`);
   } catch (e) {
-    if (e.status === 404)
+    if (isGone(e))
       return;
     throw e;
   }
-  if (sb?.status !== "stopped")
+  if (sb?.status !== "stopped" || opts.wake === false)
     return sb;
   console.log(`Box ${id} is stopped; trying to wake it…`);
-  try {
-    return await call(key, "POST", `/sandboxes/${id}/wake`);
-  } catch {
-    return;
+  for (let i = 0;; i++) {
+    try {
+      return await call(key, "POST", `/sandboxes/${id}/wake`);
+    } catch (e) {
+      if (isGone(e))
+        return;
+      if (e?.status !== 409 || i >= 5)
+        throw e;
+      await (opts.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms))))(2000);
+    }
   }
 }
 function boxGone(uuid, deps = {}) {
@@ -5522,13 +5529,20 @@ function boxGone(uuid, deps = {}) {
   return `Your cloud box is gone (deleted or stopped for good), so the work session ${uuid} did there is lost. ` + `The session continues on this Mac from where it was before the move; this window is unparked.`;
 }
 async function ensureBox(key) {
-  let sb = await getBox(key, loadCloud().sandboxId);
+  let sb;
+  try {
+    sb = await getBox(key, loadCloud().sandboxId);
+  } catch (e) {
+    throw new Error(`couldn't reach your cloud box (${e?.message ?? e}); nothing was changed. Try again in a minute.`);
+  }
   if (!sb && process.env.NOMO_HANDOFF_HELPER) {
     throw Object.assign(new Error(`your cloud box is gone (deleted after 14 days asleep, or stopped). Create and pair a new one from a terminal: cd ${q(process.cwd())} && ${q(process.execPath)} ${q(SELF)} --session <id>`), { exitCode: EXIT_BOX_GONE });
   }
   if (!sb) {
     const hasBase = await api(key, "GET", `/templates/${BASE_TEMPLATE}/latest`).then(() => true, () => false);
     console.log(`Creating your cloud box (${hasBase ? `template ${BASE_TEMPLATE}` : "omg preset"})…`);
+    for (const id of loadCloud().active ?? [])
+      console.log(boxGone(id));
     sb = await api(key, "POST", "/sandboxes", createBody(hasBase, macId()));
     updateCloud((c) => ({ ...c, sandboxId: sb.id, active: [] }));
   }
@@ -5536,7 +5550,7 @@ async function ensureBox(key) {
 }
 async function boxHealth(omg, deps = {}) {
   const cloud = deps.cloud ?? loadCloud();
-  const parked = (cloud.active ?? []).filter((id) => (deps.park ?? readPark)(id)?.state === "cloud");
+  const parked = (cloud.active ?? []).filter((id) => (deps.park ?? readPark)(id)?.state === "cloud" && !(deps.locked ?? ((s) => backLockHolder(s) !== undefined))(id));
   if (!parked.length || await (deps.get ?? getBox)(omg, cloud.sandboxId))
     return [];
   for (const id of parked)
@@ -6466,7 +6480,7 @@ async function main() {
   }
   if (["--status", "--stop", "--pair", "--screen", "--send", "--send-key"].some((f) => args.has(f))) {
     const cloud = loadCloud();
-    const sb = await getBox(omg, cloud.sandboxId);
+    const sb = await getBox(omg, cloud.sandboxId, api, { wake: false });
     if (!sb) {
       console.log("No cloud box. Run `handoff` to create one.");
       return;

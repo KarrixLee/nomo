@@ -773,20 +773,32 @@ export function createBody(hasBase: boolean, externalUserId: string): Record<str
   return { ...(hasBase ? { templateId: BASE_TEMPLATE } : { template: "omg" }), size: BOX_SIZE, externalUserId };
 }
 
-/** The box, or undefined when it is DEFINITIVELY gone: none on record, a 404, or stopped and a wake
- *  attempt failed (NOM-99). A network error or 5xx on the GET throws: never read as gone. */
-export async function getBox(key: string, id: string | undefined, call: typeof api = api): Promise<any | undefined> {
+/** A definitive "this box does not exist" answer from the box API. Nothing else (network, timeout,
+ *  401/403, 409, 5xx) ever means gone. */
+const isGone = (e: any): boolean => e?.status === 404 || e?.status === 410;
+
+/** The box, or undefined when it is DEFINITIVELY gone: none on record, or a 404/410 from the GET or
+ *  from waking a stopped box. Every other error throws. A wake 409 (already waking) is retried like
+ *  exec's. `wake: false` (the read-only commands) returns a stopped box as it is. */
+export async function getBox(key: string, id: string | undefined, call: typeof api = api,
+  opts: { wake?: boolean; sleep?: (ms: number) => Promise<void> } = {}): Promise<any | undefined> {
   if (!id) return undefined;
   let sb: any;
   try {
     sb = await call(key, "GET", `/sandboxes/${id}`);
   } catch (e: any) {
-    if (e.status === 404) return undefined;
+    if (isGone(e)) return undefined;
     throw e;
   }
-  if (sb?.status !== "stopped") return sb;
+  if (sb?.status !== "stopped" || opts.wake === false) return sb;
   console.log(`Box ${id} is stopped; trying to wake it…`);
-  try { return await call(key, "POST", `/sandboxes/${id}/wake`); } catch { return undefined; }
+  for (let i = 0; ; i++) {
+    try { return await call(key, "POST", `/sandboxes/${id}/wake`); } catch (e: any) {
+      if (isGone(e)) return undefined;
+      if (e?.status !== 409 || i >= 5) throw e;
+      await (opts.sleep ?? ((ms: number) => new Promise((r) => setTimeout(r, ms))))(2000);
+    }
+  }
 }
 
 /** The box is gone (NOM-99): unpark the session, drop it from cloud.json, and say so plainly. The
@@ -804,7 +816,10 @@ export function boxGone(uuid: string, deps: { clear?: (id: string) => void; upda
 
 /** The user's one box, running: reuse (waking it if asleep) or create. */
 async function ensureBox(key: string): Promise<string> {
-  let sb = await getBox(key, loadCloud().sandboxId);
+  let sb: any;
+  try { sb = await getBox(key, loadCloud().sandboxId); } catch (e: any) {
+    throw new Error(`couldn't reach your cloud box (${e?.message ?? e}); nothing was changed. Try again in a minute.`);
+  }
   if (!sb && process.env.NOMO_HANDOFF_HELPER) {
     // Unattended (/nomo-cc:handoff's helper): a new box needs a QR scan nobody is there to do.
     throw Object.assign(new Error(`your cloud box is gone (deleted after 14 days asleep, or stopped). Create and pair a new one from a terminal: cd ${q(process.cwd())} && ${q(process.execPath)} ${q(SELF)} --session <id>`), { exitCode: EXIT_BOX_GONE });
@@ -812,17 +827,21 @@ async function ensureBox(key: string): Promise<string> {
   if (!sb) {
     const hasBase = await api(key, "GET", `/templates/${BASE_TEMPLATE}/latest`).then(() => true, () => false);
     console.log(`Creating your cloud box (${hasBase ? `template ${BASE_TEMPLATE}` : "omg preset"})…`);
+    // The old box is confirmed gone (or none was on record): its sessions are box-gone, said out loud.
+    for (const id of loadCloud().active ?? []) console.log(boxGone(id));
     sb = await api(key, "POST", "/sandboxes", createBody(hasBase, macId()));
-    updateCloud((c) => ({ ...c, sandboxId: sb.id, active: [] })); // the old box's sessions went with it
+    updateCloud((c) => ({ ...c, sandboxId: sb.id, active: [] }));
   }
   return wakeBox(key, sb);
 }
 
 /** NOM-99: the watchdog's ~30 min probe while a session is parked "cloud": a DEFINITIVELY gone box
  *  (getBox) unparks every one of its parked sessions. Any error (network, 5xx) changes nothing. */
-export async function boxHealth(omg: string, deps: { cloud?: Cloud; park?: (id: string) => { state: string } | undefined; get?: typeof getBox; gone?: (id: string) => string } = {}): Promise<string[]> {
+export async function boxHealth(omg: string, deps: { cloud?: Cloud; park?: (id: string) => { state: string } | undefined; get?: typeof getBox; gone?: (id: string) => string; locked?: (id: string) => boolean } = {}): Promise<string[]> {
   const cloud = deps.cloud ?? loadCloud();
-  const parked = (cloud.active ?? []).filter((id) => (deps.park ?? readPark)(id)?.state === "cloud");
+  // A session with a back running is that run's to settle (it reports gone itself), never the probe's.
+  const parked = (cloud.active ?? []).filter((id) => (deps.park ?? readPark)(id)?.state === "cloud" &&
+    !(deps.locked ?? ((s: string) => backLockHolder(s) !== undefined))(id));
   if (!parked.length || await (deps.get ?? getBox)(omg, cloud.sandboxId)) return [];
   for (const id of parked) console.log((deps.gone ?? boxGone)(id));
   return parked;
@@ -1697,7 +1716,7 @@ async function main(): Promise<void> {
 
   if (["--status", "--stop", "--pair", "--screen", "--send", "--send-key"].some((f) => args.has(f))) {
     const cloud = loadCloud();
-    const sb = await getBox(omg, cloud.sandboxId);
+    const sb = await getBox(omg, cloud.sandboxId, api, { wake: false }); // read-only: a stopped box stays stopped
     if (!sb) { console.log("No cloud box. Run `handoff` to create one."); return; }
     const here = hereSession(args.get("--from-session") || process.env.CLAUDE_CODE_SESSION_ID, cloud);
     if (args.has("--stop")) {

@@ -1748,8 +1748,13 @@ export function cloudWant(id: string, park: Park | undefined, record: SessionRec
  *  still exists, at most once per CLOUD_KEEPALIVE_MS. It unparks every session of a gone box; the next
  *  sweep then posts "box-gone". Nothing parked → no probe. */
 let boxProbeAt = 0;
-export function maybeProbeBox(now: number, deps: { parked?: () => string[]; spawn?: (id: string) => void } = {}): boolean {
-  if (now - boxProbeAt < CLOUD_KEEPALIVE_MS) return false;
+/** Is a box API key configured (handoff's readKeys: env, else ~/.nomo-spike.env)? No key → no probe. */
+export function hasBoxKey(env = process.env, file = `${homedir()}/.nomo-spike.env`): boolean {
+  if (env.OMG_API_KEY) return true;
+  try { return /^\s*(?:export\s+)?OMG_API_KEY=\s*\S/m.test(readFileSync(file, "utf8")); } catch { return false; }
+}
+export function maybeProbeBox(now: number, deps: { parked?: () => string[]; spawn?: (id: string) => void; hasKey?: () => boolean } = {}): boolean {
+  if (now - boxProbeAt < CLOUD_KEEPALIVE_MS || !(deps.hasKey ?? hasBoxKey)()) return false;
   let parked: string[] = [];
   try {
     parked = (deps.parked ?? (() => readdirSync(PARK_DIR).filter((id) => readPark(id)?.state === "cloud")))();

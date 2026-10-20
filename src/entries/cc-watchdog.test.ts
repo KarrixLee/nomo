@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -25,7 +25,7 @@ import {
   watchdogEventHeaders, WAITING_HEARTBEAT_AFTER_MS, withDeadline,
 } from "./cc-watchdog";
 import type { CommandPayload, DrainCommandsDeps, PostDetail, PostOutcome, RecordEntry } from "./cc-watchdog";
-import { backRuns, BRING_BACK_COMMAND_KIND, CLOUD_KEEPALIVE_MS, cloudWant, correctCloudState, handoffCommand, maybeProbeBox, resetBoxProbe, withCloudKey } from "./cc-watchdog";
+import { backRuns, BRING_BACK_COMMAND_KIND, CLOUD_KEEPALIVE_MS, cloudWant, correctCloudState, handoffCommand, hasBoxKey, maybeProbeBox, resetBoxProbe, withCloudKey } from "./cc-watchdog";
 import { MOVE_TO_CLOUD_COMMAND_KIND, moveFailed, moveRuns, parseCommandPayload } from "./cc-watchdog";
 import type { Park } from "../core/park";
 import { cloudState, endMovingTurn, readMoveResult, readPark, writeMoveResult, writePark } from "../core/park";
@@ -5295,11 +5295,24 @@ describe("move to cloud from the phone (NOM-94)", () => {
     resetBoxProbe();
     const spawned: string[] = [];
     const spawn = (id: string) => { spawned.push(id); };
-    expect(maybeProbeBox(NOW, { parked: () => [], spawn })).toBe(false);
-    expect(maybeProbeBox(NOW, { parked: () => [S], spawn })).toBe(true);
-    expect(maybeProbeBox(NOW + 60_000, { parked: () => [S], spawn })).toBe(false);
-    expect(maybeProbeBox(NOW + CLOUD_KEEPALIVE_MS, { parked: () => [S], spawn })).toBe(true);
+    const hasKey = () => true;
+    expect(maybeProbeBox(NOW, { parked: () => [S], spawn, hasKey: () => false })).toBe(false); // no box key: never
+    expect(maybeProbeBox(NOW, { parked: () => [], spawn, hasKey })).toBe(false);
+    expect(maybeProbeBox(NOW, { parked: () => [S], spawn, hasKey })).toBe(true);
+    expect(maybeProbeBox(NOW + 60_000, { parked: () => [S], spawn, hasKey })).toBe(false);
+    expect(maybeProbeBox(NOW + CLOUD_KEEPALIVE_MS, { parked: () => [S], spawn, hasKey })).toBe(true);
     expect(spawned).toEqual([S, S]);
+  });
+
+  test("hasBoxKey: env, else an OMG_API_KEY line in the spike env file", () => {
+    const dir = mkdtempSync(join(tmpdir(), "nomo-key-"));
+    const f = join(dir, "env");
+    expect(hasBoxKey({ OMG_API_KEY: "x" }, f)).toBe(true);
+    expect(hasBoxKey({}, f)).toBe(false);
+    writeFileSync(f, "OPENROUTER_API_KEY=a\nexport OMG_API_KEY=b\n");
+    expect(hasBoxKey({}, f)).toBe(true);
+    writeFileSync(f, "OMG_API_KEY=\n");
+    expect(hasBoxKey({}, f)).toBe(false);
   });
 
   test("move-failed: the marker vanished without reaching cloud and THIS session's helper reported FAILED", async () => {

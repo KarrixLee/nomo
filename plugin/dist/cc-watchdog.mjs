@@ -117,7 +117,7 @@ function buildPairURL(workerUrl, pairingId, qrSecret, pcEphPub) {
 }
 
 // src/core/shared.ts
-var PLUGIN_VERSION = "2.3.40";
+var PLUGIN_VERSION = "2.3.41";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -9208,8 +9208,17 @@ function cloudWant(id, park, record, now, deps = {}) {
   return { cloud, extra: { ...why ? { cloudWhy: why } : {}, ...age ? { cloudAge: age } : {} } };
 }
 var boxProbeAt = 0;
+function hasBoxKey(env = process.env, file = `${homedir()}/.nomo-spike.env`) {
+  if (env.OMG_API_KEY)
+    return true;
+  try {
+    return /^\s*(?:export\s+)?OMG_API_KEY=\s*\S/m.test(readFileSync3(file, "utf8"));
+  } catch {
+    return false;
+  }
+}
 function maybeProbeBox(now, deps = {}) {
-  if (now - boxProbeAt < CLOUD_KEEPALIVE_MS)
+  if (now - boxProbeAt < CLOUD_KEEPALIVE_MS || !(deps.hasKey ?? hasBoxKey)())
     return false;
   let parked = [];
   try {
@@ -10950,6 +10959,7 @@ export {
   fileCursorStore,
   goneStrikeShouldTeardown,
   handoffCommand,
+  hasBoxKey,
   hasInterruptMarker,
   heartbeatKind,
   isClaudeIdleReapEligible,
