@@ -3,10 +3,10 @@ var __require = /* @__PURE__ */ createRequire(import.meta.url);
 
 // src/entries/handoff.ts
 import { execFileSync as execFileSync5, spawn as spawn2 } from "node:child_process";
-import { closeSync as closeSync2, existsSync as existsSync5, lstatSync as lstatSync2, mkdirSync as mkdirSync3, mkdtempSync as mkdtempSync2, openSync as openSync2, readdirSync as readdirSync3, readFileSync as readFileSync6, realpathSync as realpathSync2, renameSync as renameSync3, rmSync, statSync as statSync4, unlinkSync as unlinkSync3, writeFileSync as writeFileSync4 } from "node:fs";
+import { closeSync as closeSync3, existsSync as existsSync6, lstatSync as lstatSync2, mkdirSync as mkdirSync3, mkdtempSync as mkdtempSync2, openSync as openSync3, readdirSync as readdirSync4, readFileSync as readFileSync6, realpathSync as realpathSync2, renameSync as renameSync3, rmSync, statSync as statSync5, unlinkSync as unlinkSync3, writeFileSync as writeFileSync4 } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
-import { dirname as dirname3, join as join6, relative, sep as sep2 } from "node:path";
+import { dirname as dirname3, join as join7, relative as relative2, sep as sep2 } from "node:path";
 import { fileURLToPath as fileURLToPath2 } from "node:url";
 
 // src/core/crypto.ts
@@ -384,7 +384,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "2.3.41";
+var PLUGIN_VERSION = "2.3.43";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -3414,12 +3414,174 @@ function trackedSecretFiles(cwd) {
   }
 }
 
+// src/core/transcript-scan.ts
+import { createHash as createHash2 } from "node:crypto";
+import { closeSync, existsSync as existsSync4, openSync, readdirSync as readdirSync2, readSync, statSync as statSync3 } from "node:fs";
+import { join as join4, relative } from "node:path";
+var KIND_LABEL = {
+  openai: "OpenAI key",
+  anthropic: "Anthropic key",
+  github: "GitHub token",
+  aws: "AWS key",
+  slack: "Slack token",
+  google: "Google API key",
+  stripe: "Stripe key",
+  privateKey: "private key",
+  jwt: "JWT",
+  assignment: "KEY=/TOKEN= value"
+};
+var MAX_PLACES = 20;
+var B = "(?:(?<=\\\\[nrt])|(?<![A-Za-z0-9+/_-]))";
+var E = "(?![A-Za-z0-9+/_-])";
+var VENDOR = [
+  ["stripe", new RegExp(`${B}[rs]k_live_[A-Za-z0-9]{20,}${E}`, "g")],
+  ["anthropic", new RegExp(`${B}sk-ant-[A-Za-z0-9_-]{32,}${E}`, "g")],
+  ["openai", new RegExp(`${B}sk-(?!ant-)[A-Za-z0-9_-]{32,}${E}`, "g")],
+  ["github", new RegExp(`${B}(?:gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{50,})${E}`, "g")],
+  ["aws", new RegExp(`${B}(?:AKIA|ASIA)[0-9A-Z]{16}${E}`, "g")],
+  ["slack", new RegExp(`${B}xox[bpas]-[A-Za-z0-9-]{10,}${E}`, "g")],
+  ["google", new RegExp(`${B}AIza[0-9A-Za-z_-]{35}${E}`, "g")],
+  ["jwt", new RegExp(`${B}eyJ[A-Za-z0-9_-]{8,}\\.eyJ[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{16,}${E}`, "g")]
+];
+var PEM = /-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----/g;
+var ASSIGN = /[A-Z][A-Z0-9_]*(?:KEY|SECRET|TOKEN|PASSWORD|PASSWD)\s*=\s*(?:\\?["'])?([A-Za-z0-9+/=_.~-]+)/g;
+var MIN_ASSIGN_LEN = 16;
+var MIN_ENTROPY = 3.5;
+var PLACEHOLDER = /x{3,}|your[-_]?|here|example|placeholder|changeme|redacted|dummy|sample|test[-_]?key|\*{3}|\.{3}|0{8}|1234567/i;
+function entropy(s) {
+  const n = new Map;
+  for (const c of s)
+    n.set(c, (n.get(c) ?? 0) + 1);
+  let h = 0;
+  for (const k of n.values()) {
+    const p = k / s.length;
+    h -= p * Math.log2(p);
+  }
+  return h;
+}
+function isJwt(v) {
+  try {
+    return typeof JSON.parse(Buffer.from(v.split(".")[0], "base64url").toString("utf8"))?.alg === "string";
+  } catch {
+    return false;
+  }
+}
+function* matches(text) {
+  for (const [kind, re] of VENDOR) {
+    for (const m of text.matchAll(re)) {
+      const v = m[0];
+      if (PLACEHOLDER.test(v) || (kind === "jwt" ? !isJwt(v) : entropy(v) < 3))
+        continue;
+      yield [kind, m.index, v];
+    }
+  }
+  for (const m of text.matchAll(PEM))
+    yield ["privateKey", m.index, m[0]];
+  for (const m of text.matchAll(ASSIGN)) {
+    const v = m[1];
+    if (v.length < MIN_ASSIGN_LEN || !/[0-9]/.test(v) || !/[A-Za-z]/.test(v) || PLACEHOLDER.test(v) || entropy(v) < MIN_ENTROPY)
+      continue;
+    if (VENDOR.some(([, re]) => {
+      re.lastIndex = 0;
+      return re.test(v);
+    }))
+      continue;
+    yield ["assignment", m.index + m[0].length - v.length, v];
+  }
+  for (const [, re] of VENDOR)
+    re.lastIndex = 0;
+}
+function scanFiles(files, root) {
+  const seen = new Map;
+  const places = [];
+  const buf = Buffer.alloc(1 << 20);
+  for (const file of files) {
+    let fd;
+    try {
+      fd = openSync(file, "r");
+    } catch {
+      continue;
+    }
+    try {
+      let carry = Buffer.alloc(0), line = 1, n;
+      const block = (b) => {
+        const text = b.toString("utf8");
+        let nl;
+        for (const [kind, at, v] of matches(text)) {
+          const set = seen.get(kind) ?? new Set;
+          seen.set(kind, set);
+          set.add(createHash2("sha256").update(v).digest("hex"));
+          if (places.length >= MAX_PLACES)
+            continue;
+          nl ??= [...text.matchAll(/\n/g)].map((x) => x.index);
+          let lo = 0, hi = nl.length;
+          while (lo < hi) {
+            const mid = lo + hi >> 1;
+            if (nl[mid] < at)
+              lo = mid + 1;
+            else
+              hi = mid;
+          }
+          places.push({ file: relative(root, file), line: line + lo });
+        }
+        for (let i = 0;i < b.length; i++)
+          if (b[i] === 10)
+            line++;
+      };
+      while ((n = readSync(fd, buf, 0, buf.length, null)) > 0) {
+        const chunk = Buffer.concat([carry, buf.subarray(0, n)]);
+        const cut = chunk.lastIndexOf(10) + 1;
+        if (cut === 0) {
+          carry = chunk;
+          continue;
+        }
+        block(chunk.subarray(0, cut));
+        carry = Buffer.from(chunk.subarray(cut));
+      }
+      if (carry.length)
+        block(carry);
+    } finally {
+      closeSync(fd);
+    }
+  }
+  places.sort((a, b) => a.file === b.file ? a.line - b.line : a.file < b.file ? -1 : 1);
+  return { counts: Object.fromEntries([...seen].map(([k, s]) => [k, s.size])), places };
+}
+function filesUnder(dir) {
+  try {
+    return readdirSync2(dir, { withFileTypes: true }).flatMap((e) => {
+      const p = join4(dir, e.name);
+      return e.isDirectory() ? filesUnder(p) : e.isFile() ? [p] : [];
+    });
+  } catch {
+    return [];
+  }
+}
+function handoffTranscriptFiles(projDir, uuid) {
+  const main = join4(projDir, `${uuid}.jsonl`);
+  return [...existsSync4(main) && statSync3(main).isFile() ? [main] : [], ...filesUnder(join4(projDir, uuid)), ...filesUnder(join4(projDir, "memory"))];
+}
+function scanHandoff(projDir, uuid) {
+  return scanFiles(handoffTranscriptFiles(projDir, uuid), projDir);
+}
+function secretTotal(s) {
+  return Object.values(s.counts).reduce((a, b) => a + (b ?? 0), 0);
+}
+function secretSummary(s, uuid) {
+  const total = secretTotal(s);
+  if (!total)
+    return;
+  const kinds = Object.entries(s.counts).map(([k, n]) => `${KIND_LABEL[k]} ×${n}`).join(", ");
+  const where = s.places.slice(0, 5).map((p) => p.file === `${uuid}.jsonl` ? `transcript line ${p.line}` : `${p.file} line ${p.line}`).join(", ");
+  return `${total} secret${total > 1 ? "s" : ""} (${kinds}; ${where}${s.places.length > 5 ? ", …" : ""})`;
+}
+
 // src/core/park.ts
-import { mkdirSync, readFileSync as readFileSync3, renameSync, statSync as statSync3, unlinkSync, writeFileSync } from "node:fs";
-import { join as join4 } from "node:path";
+import { mkdirSync, readFileSync as readFileSync3, renameSync, statSync as statSync4, unlinkSync, writeFileSync } from "node:fs";
+import { join as join5 } from "node:path";
 var PARK_DIR = `${CC_DIR}/parked`;
 var UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-var file = (dir, id) => UUID_RE.test(id) ? join4(dir, id) : undefined;
+var file = (dir, id) => UUID_RE.test(id) ? join5(dir, id) : undefined;
 function readPark(id, dir = PARK_DIR) {
   const f = file(dir, id);
   if (!f)
@@ -3580,7 +3742,7 @@ function withParked(body, dir = PARK_DIR) {
   return s === "cloud" || s === "landing" || s === "back" ? { ...body, parked: true } : body;
 }
 var BACK_LOCK_DIR = `${CC_DIR}/cloud-back`;
-var backLockFile = (id, dir) => join4(dir, `${id.slice(0, 12)}.lock`);
+var backLockFile = (id, dir) => join5(dir, `${id.slice(0, 12)}.lock`);
 function backLockHolder(id, dir = BACK_LOCK_DIR, alive = pidAlive) {
   try {
     const pid = Number(readFileSync3(backLockFile(id, dir), "utf8"));
@@ -3613,7 +3775,7 @@ function releaseBackLock(id, dir = BACK_LOCK_DIR) {
       unlinkSync(backLockFile(id, dir));
   } catch {}
 }
-var moveResultFile = (id, dir = BACK_LOCK_DIR) => join4(dir, `${id.slice(0, 12)}.move`);
+var moveResultFile = (id, dir = BACK_LOCK_DIR) => join5(dir, `${id.slice(0, 12)}.move`);
 var MOVE_WHYS = ["secret", "cap", "notPaired", "busy", "gone", "other"];
 function writeMoveResult(id, ok, dir = BACK_LOCK_DIR, why) {
   try {
@@ -3626,7 +3788,7 @@ function writeMoveResult(id, ok, dir = BACK_LOCK_DIR, why) {
 function readMoveWhy(id, since, dir = BACK_LOCK_DIR) {
   try {
     const f = moveResultFile(id, dir);
-    if (statSync3(f).mtimeMs < since)
+    if (statSync4(f).mtimeMs < since)
       return;
     const [state, why] = readFileSync3(f, "utf8").trim().split(/\s+/);
     if (state !== "FAILED")
@@ -3636,7 +3798,7 @@ function readMoveWhy(id, since, dir = BACK_LOCK_DIR) {
     return;
   }
 }
-var backResultFile = (id, dir = BACK_LOCK_DIR) => join4(dir, `${id.slice(0, 12)}.back`);
+var backResultFile = (id, dir = BACK_LOCK_DIR) => join5(dir, `${id.slice(0, 12)}.back`);
 function writeBackResult(id, r, dir = BACK_LOCK_DIR) {
   try {
     mkdirSync(dir, { recursive: true, mode: 448 });
@@ -3647,7 +3809,7 @@ function writeBackResult(id, r, dir = BACK_LOCK_DIR) {
 function readBackResult(id, since, dir = BACK_LOCK_DIR) {
   try {
     const f = backResultFile(id, dir);
-    if (statSync3(f).mtimeMs < since)
+    if (statSync4(f).mtimeMs < since)
       return;
     const r = readFileSync3(f, "utf8").trim().toLowerCase();
     return r === "done" || r === "failed" || r === "gone" ? r : undefined;
@@ -3658,7 +3820,7 @@ function readBackResult(id, since, dir = BACK_LOCK_DIR) {
 function readMoveResult(id, since, dir = BACK_LOCK_DIR) {
   try {
     const f = moveResultFile(id, dir);
-    if (statSync3(f).mtimeMs < since)
+    if (statSync4(f).mtimeMs < since)
       return;
     return readFileSync3(f, "utf8").startsWith("FAILED") ? "failed" : "done";
   } catch {
@@ -3667,7 +3829,7 @@ function readMoveResult(id, since, dir = BACK_LOCK_DIR) {
 }
 
 // src/core/handoff-later.ts
-import { appendFileSync as appendFileSync2, closeSync, fstatSync, linkSync, openSync, readFileSync as readFileSync4, readSync, unlinkSync as unlinkSync2, writeFileSync as writeFileSync2 } from "node:fs";
+import { appendFileSync as appendFileSync2, closeSync as closeSync2, fstatSync, linkSync, openSync as openSync2, readFileSync as readFileSync4, readSync as readSync2, unlinkSync as unlinkSync2, writeFileSync as writeFileSync2 } from "node:fs";
 import { basename as basename3 } from "node:path";
 var PENDING_PATH = `${CC_DIR}/handoff-pending.json`;
 var LATER_LOG = `${CC_DIR}/handoff.log`;
@@ -3675,16 +3837,24 @@ var LATER_CAP_MS = 30 * 60000;
 var POLL_MS = 2000;
 var UUID_RE2 = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 var DEFAULT_THEN = "You're now running on the cloud box. Continue the task you were working on before the handoff. If it was already finished, say so and wait.";
-var LATER_USAGE = "Usage: /nomo-cc:handoff (move this session; it continues on its own), /nomo-cc:handoff then <message>, /nomo-cc:handoff quiet, /nomo-cc:handoff cancel, /nomo-cc:handoff status";
+var LATER_USAGE = "Usage: /nomo-cc:handoff (move this session; it continues on its own), /nomo-cc:handoff then <message>, /nomo-cc:handoff quiet, /nomo-cc:handoff cancel, /nomo-cc:handoff status (prefix `anyway` to move a conversation that looks like it holds secrets)";
+function transcriptSecretWarning(summary, confirmed) {
+  const head = `The conversation contains what look like ${summary}. They would travel to the cloud box with the transcript.`;
+  return confirmed ? `Cloud check: ${head} Moving anyway, as you confirmed.` : `Cloud check: ${head}
+Nothing was started. To move it anyway, run /nomo-cc:handoff anyway (or: anyway quiet, anyway then <message>).`;
+}
 function parseLaterArg(raw) {
-  const s = raw.replace(/\r\n?/g, `
+  let s = raw.replace(/\r\n?/g, `
 `).trim();
+  const anyway = /^anyway(?:\s|$)/i.test(s) ? { anyway: true } : {};
+  if (anyway.anyway)
+    s = s.slice(6).trim();
   if (!s)
-    return { message: DEFAULT_THEN };
+    return { message: DEFAULT_THEN, ...anyway };
   if (/^quiet$/i.test(s))
-    return {};
+    return { ...anyway };
   const text = /^then(?:\s+([\s\S]*))?$/i.exec(s)?.[1]?.trim();
-  return text ? { message: text } : undefined;
+  return text ? { message: text, ...anyway } : undefined;
 }
 function resolveSession(o) {
   const ids = [o.substituted, o.env.CLAUDE_CODE_SESSION_ID].map((s) => s?.trim());
@@ -3720,14 +3890,14 @@ function contextTokens(jsonl, fileBytes) {
 }
 var TAIL_BYTES = 4 * 1024 * 1024;
 function contextTokensOf(path) {
-  const fd = openSync(path, "r");
+  const fd = openSync2(path, "r");
   try {
     const size = fstatSync(fd).size, len = Math.min(size, TAIL_BYTES);
     const buf = Buffer.alloc(len);
-    readSync(fd, buf, 0, len, size - len);
+    readSync2(fd, buf, 0, len, size - len);
     return contextTokens(buf.toString("utf8"), size);
   } finally {
-    closeSync(fd);
+    closeSync2(fd);
   }
 }
 function sizeWarning(tokens) {
@@ -3912,6 +4082,9 @@ function phoneMoveCheck(f) {
     return { refuse: `the cloud box already runs ${f.cloudCount} sessions (the cap is ${BOX_MAX_SESSIONS}); bring one back first`, why: "cap" };
   if (!r.cwd || !f.transcriptExists(r.cwd))
     return { refuse: "its transcript was not found", why: "other" };
+  const inTranscript = f.transcriptSecrets(r.cwd);
+  if (inTranscript)
+    return { refuse: `the conversation contains what look like ${inTranscript}, which would travel with the transcript; move it from the terminal (/nomo-cc:handoff anyway) if that is fine`, why: "secret" };
   const secrets = f.trackedSecrets(r.cwd);
   if (!secrets)
     return { refuse: "git could not list the project's tracked files", why: "other" };
@@ -3938,21 +4111,21 @@ async function settleThenStamp(session, d) {
 
 // src/core/cloud-back.ts
 import { execFileSync as execFileSync4 } from "node:child_process";
-import { createHash as createHash2 } from "node:crypto";
+import { createHash as createHash3 } from "node:crypto";
 import {
   chmodSync,
   copyFileSync,
-  existsSync as existsSync4,
+  existsSync as existsSync5,
   lstatSync,
   mkdirSync as mkdirSync2,
   mkdtempSync,
-  readdirSync as readdirSync2,
+  readdirSync as readdirSync3,
   readFileSync as readFileSync5,
   realpathSync,
   renameSync as renameSync2,
   writeFileSync as writeFileSync3
 } from "node:fs";
-import { basename as basename4, dirname as dirname2, isAbsolute as isAbsolute2, join as join5, sep } from "node:path";
+import { basename as basename4, dirname as dirname2, isAbsolute as isAbsolute2, join as join6, sep } from "node:path";
 var MAX_ARTIFACT_BYTES = 100 * 1024 * 1024;
 var MAX_EXTRACTED_BYTES = 1024 * 1024 * 1024;
 var MAX_TRANSCRIPT_BYTES = 512 * 1024 * 1024;
@@ -3961,7 +4134,7 @@ function backCaps(sentTranscriptBytes = 0) {
   return { project, artifact: MAX_ARTIFACT_BYTES, extracted: MAX_EXTRACTED_BYTES + project - MAX_ARTIFACT_BYTES };
 }
 var SENSITIVE = [".claude", ".config/cc-status", ".ssh", ".gnupg", ".aws", "Library/Keychains"];
-var sha256 = (b) => createHash2("sha256").update(b).digest("hex");
+var sha256 = (b) => createHash3("sha256").update(b).digest("hex");
 var git = (root, args, env) => execFileSync4("git", [
   "-c",
   "core.hooksPath=/dev/null",
@@ -3981,7 +4154,7 @@ var git = (root, args, env) => execFileSync4("git", [
 var printable = (s, oneLine = false) => s.replace(/\x1b\[[0-?]*[ -/]*[@-~]|\x1b[\]P^_X][^\x07\x1b]*(?:\x07|\x1b\\)?/g, "").replace(oneLine ? /[\x00-\x1f\x7f-\x9f]/g : /[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, "");
 function wipFingerprint(root) {
   const ro = ["--no-optional-locks"];
-  const h = createHash2("sha256");
+  const h = createHash3("sha256");
   h.update(git(root, [...ro, "diff", "--binary", "HEAD"]));
   h.update("\x00staged\x00");
   h.update(git(root, [...ro, "diff", "--cached", "--binary", "HEAD"]));
@@ -3989,7 +4162,7 @@ function wipFingerprint(root) {
   for (const p of untracked) {
     let c;
     try {
-      c = sha256(readFileSync5(join5(root, p)));
+      c = sha256(readFileSync5(join6(root, p)));
     } catch {
       c = "unreadable";
     }
@@ -3998,18 +4171,18 @@ function wipFingerprint(root) {
   return h.digest("hex");
 }
 function listFiles(dir, rel = "") {
-  const abs = join5(dir, rel);
+  const abs = join6(dir, rel);
   if (!lstatSync(abs, { throwIfNoEntry: false })?.isDirectory())
     return [];
-  return readdirSync2(abs).flatMap((n) => {
-    const r = rel ? join5(rel, n) : n;
-    const st = lstatSync(join5(dir, r));
+  return readdirSync3(abs).flatMap((n) => {
+    const r = rel ? join6(rel, n) : n;
+    const st = lstatSync(join6(dir, r));
     return st.isDirectory() ? listFiles(dir, r) : st.isFile() ? [r] : [];
   });
 }
 function takeSnapshot(cwd, root, isGit, projDir, transcript) {
-  const memDir = join5(projDir, "memory");
-  const memory = Object.fromEntries(listFiles(memDir).map((r) => [r, sha256(readFileSync5(join5(memDir, r)))]));
+  const memDir = join6(projDir, "memory");
+  const memory = Object.fromEntries(listFiles(memDir).map((r) => [r, sha256(readFileSync5(join6(memDir, r)))]));
   const snap = { cwd, root, git: isGit, tBytes: transcript.length, tSha: sha256(transcript), memory, at: Date.now() };
   if (isGit)
     Object.assign(snap, macGitState(root));
@@ -4153,9 +4326,9 @@ var safeRel = (rel) => plainRel(rel) && !sensitive(rel);
 function validateTree(dir, allow = () => true, budget = { left: MAX_EXTRACTED_BYTES }) {
   const files = [], skipped = [];
   const walk = (rel) => {
-    for (const n of readdirSync2(join5(dir, rel))) {
+    for (const n of readdirSync3(join6(dir, rel))) {
       const r = rel ? `${rel}/${n}` : n;
-      const st = lstatSync(join5(dir, r));
+      const st = lstatSync(join6(dir, r));
       if (!safeRel(r) || !allow(r)) {
         skipped.push(r);
         continue;
@@ -4182,16 +4355,16 @@ function extractTgz(tgz, parent, maxBytes = MAX_ARTIFACT_BYTES, maxInflated = MA
   const n = Number(execFileSync4("sh", ["-c", `gzip -dc < "$1" | head -c ${maxInflated + 1} | wc -c`, "sh", tgz]).toString().trim());
   if (!(n <= maxInflated))
     throw new Error(`${tgz} inflates past ${(maxInflated / 2 ** 30).toFixed(1)} GB`);
-  const out = mkdtempSync(join5(parent, "x-"));
+  const out = mkdtempSync(join6(parent, "x-"));
   execFileSync4("/usr/bin/tar", ["-xzf", tgz, "-C", out, "--no-same-owner", "--no-same-permissions"], { stdio: ["ignore", "ignore", "pipe"] });
   return out;
 }
 function copyContained(src, dstRoot, rel, overwrite, priv = false) {
   if (!safeRel(rel))
     return false;
-  const dst = join5(dstRoot, rel);
+  const dst = join6(dstRoot, rel);
   let anc = dirname2(dst);
-  while (!existsSync4(anc))
+  while (!existsSync5(anc))
     anc = dirname2(anc);
   const realRoot = realpathSync(dstRoot);
   const realAnc = realpathSync(anc);
@@ -4209,7 +4382,7 @@ function copyContained(src, dstRoot, rel, overwrite, priv = false) {
 function patchPaths(root, patch, base, tmpParent) {
   if (!lstatSync(patch).size)
     return [];
-  const env = { ...process.env, GIT_INDEX_FILE: join5(mkdtempSync(join5(tmpParent, "pidx-")), "index") };
+  const env = { ...process.env, GIT_INDEX_FILE: join6(mkdtempSync(join6(tmpParent, "pidx-")), "index") };
   git(root, ["read-tree", base], env);
   git(root, ["apply", "--cached", "--binary", patch], env);
   const raw = git(root, ["diff-index", "--cached", "--raw", "-z", "--no-renames", base], env).split("\x00");
@@ -4268,9 +4441,9 @@ function mergeMemory(snapMem, boxDir, boxFiles, macDir, backup) {
   const r = { added: [], updated: [], conflicts: [] };
   mkdirSync2(macDir, { recursive: true });
   for (const rel of boxFiles) {
-    const src = join5(boxDir, rel);
-    const mac = join5(macDir, rel);
-    if (!existsSync4(mac)) {
+    const src = join6(boxDir, rel);
+    const mac = join6(macDir, rel);
+    if (!existsSync5(mac)) {
       if (copyContained(src, macDir, rel, false, true))
         r.added.push(rel);
       continue;
@@ -4279,11 +4452,11 @@ function mergeMemory(snapMem, boxDir, boxFiles, macDir, backup) {
     if (macSha === sha256(readFileSync5(src)))
       continue;
     if (snapMem?.[rel] === macSha) {
-      copyContained(mac, mkdirp(join5(backup, "memory-before")), rel, true, true);
+      copyContained(mac, mkdirp(join6(backup, "memory-before")), rel, true, true);
       if (copyContained(src, macDir, rel, true, true))
         r.updated.push(rel);
     } else {
-      copyContained(src, mkdirp(join5(backup, "memory-conflicts")), rel, true, true);
+      copyContained(src, mkdirp(join6(backup, "memory-conflicts")), rel, true, true);
       r.conflicts.push(rel);
     }
   }
@@ -4331,7 +4504,7 @@ function applyInPlace(root, a, detached, uuid8, backup) {
     if (a.patch && lstatSync(a.patch).size > 0)
       git(root, ["apply", "--binary", a.patch]);
     for (const rel of a.untracked)
-      if (!copyContained(join5(a.untrackedDir, rel), root, rel, false))
+      if (!copyContained(join6(a.untrackedDir, rel), root, rel, false))
         skipped.push(rel);
   } catch (e) {
     const why = printable((e.stderr?.toString() || e.message || String(e)).trim());
@@ -4362,13 +4535,13 @@ function landOnBranch(root, a, uuid8, backup) {
     return name;
   const tip = git(root, ["rev-parse", ref]).trim();
   const gitDir = git(root, ["rev-parse", "--absolute-git-dir"]).trim();
-  const tmp = mkdtempSync(join5(backup, "index-"));
-  const env = { ...process.env, GIT_INDEX_FILE: join5(tmp, "index") };
+  const tmp = mkdtempSync(join6(backup, "index-"));
+  const env = { ...process.env, GIT_INDEX_FILE: join6(tmp, "index") };
   git(root, ["read-tree", tip], env);
   if (hasPatch)
     git(root, ["apply", "--cached", "--binary", a.patch], env);
   if (a.untracked.length) {
-    const list = join5(tmp, "paths");
+    const list = join6(tmp, "paths");
     writeFileSync3(list, a.untracked.join("\x00"));
     git(a.untrackedDir, ["--literal-pathspecs", `--git-dir=${gitDir}`, `--work-tree=${a.untrackedDir}`, "add", "-f", `--pathspec-from-file=${list}`, "--pathspec-file-nul"], env);
   }
@@ -4379,11 +4552,11 @@ function landOnBranch(root, a, uuid8, backup) {
 }
 function landFolder(cwd, extracted, files, uuid8) {
   let dst = `${cwd}.nomo-cloud-${uuid8}`;
-  for (let i = 2;existsSync4(dst); i++)
+  for (let i = 2;existsSync5(dst); i++)
     dst = `${cwd}.nomo-cloud-${uuid8}-${i}`;
   mkdirSync2(dst, { recursive: true });
   for (const rel of files)
-    copyContained(join5(extracted, rel), dst, rel, false);
+    copyContained(join6(extracted, rel), dst, rel, false);
   return dst;
 }
 
@@ -5052,7 +5225,7 @@ function takePairUrl(stdout) {
 }
 function pluginRoot() {
   const up2 = dirname3(dirname3(fileURLToPath2(import.meta.url)));
-  return existsSync5(join6(up2, ".claude-plugin", "plugin.json")) ? up2 : join6(dirname3(up2), "plugin");
+  return existsSync6(join7(up2, ".claude-plugin", "plugin.json")) ? up2 : join7(dirname3(up2), "plugin");
 }
 function readKeys() {
   const file = {};
@@ -5114,7 +5287,7 @@ function packList(root, entries, skipDir = () => false) {
   const out = [];
   const add = (rel) => {
     const name = rel.split("/").pop();
-    const st = lstatSync2(join6(root, rel), { throwIfNoEntry: false });
+    const st = lstatSync2(join7(root, rel), { throwIfNoEntry: false });
     if (!st)
       return;
     if (!st.isDirectory()) {
@@ -5125,18 +5298,18 @@ function packList(root, entries, skipDir = () => false) {
     if (skipDir(name))
       return;
     out.push(rel);
-    for (const n of readdirSync3(join6(root, rel)))
+    for (const n of readdirSync4(join7(root, rel)))
       add(`${rel}/${n}`);
   };
   for (const e of entries)
     add(e.replace(/\/$/, ""));
   return Buffer.from(out.map((p) => p + "\x00").join(""));
 }
-function packRefusal(dir, home, has = existsSync5) {
-  const rel = relative(dir, home);
+function packRefusal(dir, home, has = existsSync6) {
+  const rel = relative2(dir, home);
   if (rel !== ".." && !rel.startsWith(".." + sep2))
     return `${dir} is your home folder or contains it`;
-  const hit = SENSITIVE2.find((p) => has(join6(dir, p)));
+  const hit = SENSITIVE2.find((p) => has(join7(dir, p)));
   return hit ? `${dir} contains ${hit}` : undefined;
 }
 var UUID_RE3 = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -5150,19 +5323,19 @@ function checkLaunchIds(uuid, model) {
 function userLayerFiles(claudeHome, entries) {
   const files = [], skipped = [];
   for (const top of entries) {
-    const abs = join6(claudeHome, top);
-    if (!statSync4(abs, { throwIfNoEntry: false })) {
+    const abs = join7(claudeHome, top);
+    if (!statSync5(abs, { throwIfNoEntry: false })) {
       if (lstatSync2(abs, { throwIfNoEntry: false }))
         skipped.push(top);
       continue;
     }
-    if (statSync4(abs).isFile()) {
+    if (statSync5(abs).isFile()) {
       files.push(top);
       continue;
     }
     const root = realpathSync2(abs);
     const walk = (rel, ancestors) => {
-      const p = join6(claudeHome, rel);
+      const p = join7(claudeHome, rel);
       let real;
       try {
         real = realpathSync2(p);
@@ -5174,7 +5347,7 @@ function userLayerFiles(claudeHome, entries) {
         skipped.push(rel);
         return;
       }
-      const st = statSync4(real);
+      const st = statSync5(real);
       if (st.isFile()) {
         files.push(rel);
         return;
@@ -5182,9 +5355,9 @@ function userLayerFiles(claudeHome, entries) {
       if (!st.isDirectory() || ancestors.has(real))
         return;
       const next = new Set(ancestors).add(real);
-      for (const name of readdirSync3(p))
+      for (const name of readdirSync4(p))
         if (name !== ".DS_Store")
-          walk(join6(rel, name), next);
+          walk(join7(rel, name), next);
     };
     walk(top, new Set);
   }
@@ -5192,7 +5365,7 @@ function userLayerFiles(claudeHome, entries) {
 }
 function packPlugin(out) {
   const plugin = pluginRoot();
-  const version = JSON.parse(readFileSync6(join6(plugin, ".claude-plugin", "plugin.json"), "utf8")).version;
+  const version = JSON.parse(readFileSync6(join7(plugin, ".claude-plugin", "plugin.json"), "utf8")).version;
   tar(out, plugin, ["--exclude", ".DS_Store", "."]);
   return JSON.stringify({ name: "nomo", owner: { name: "Nomo" }, plugins: [{ name: "nomo-cc", source: "./plugin", version }] });
 }
@@ -5207,26 +5380,26 @@ function tar(out, cwd, args, input) {
 }
 function build(args, outDir) {
   const cwd = process.cwd();
-  const projDir = join6(process.env.HOME, ".claude", "projects", projectDirName(cwd));
-  if (!existsSync5(projDir))
+  const projDir = join7(process.env.HOME, ".claude", "projects", projectDirName(cwd));
+  if (!existsSync6(projDir))
     throw new Error(`no Claude Code transcripts for ${cwd} (looked in ${projDir})`);
-  const uuid = typeof args.get("--session") === "string" ? args.get("--session") : latestSession(readdirSync3(projDir).map((name) => ({ name, mtimeMs: statSync4(join6(projDir, name)).mtimeMs })));
+  const uuid = typeof args.get("--session") === "string" ? args.get("--session") : latestSession(readdirSync4(projDir).map((name) => ({ name, mtimeMs: statSync5(join7(projDir, name)).mtimeMs })));
   if (uuid && !UUID_RE3.test(uuid))
     throw new Error(`session id must be a UUID, got ${JSON.stringify(uuid)}`);
-  if (!uuid || !existsSync5(join6(projDir, `${uuid}.jsonl`)))
+  if (!uuid || !existsSync6(join7(projDir, `${uuid}.jsonl`)))
     throw new Error(`session ${uuid ?? "(none)"} not found in ${projDir}`);
-  const transcriptBytes = readFileSync6(join6(projDir, `${uuid}.jsonl`));
+  const transcriptBytes = readFileSync6(join7(projDir, `${uuid}.jsonl`));
   const transcript = transcriptBytes.toString("utf8");
   const model = typeof args.get("--model") === "string" ? toOpenRouterModel(args.get("--model")) : toOpenRouterModel(lastModel(transcript) ?? "claude-opus-5-5");
   checkLaunchIds(uuid, model);
   const art = {};
   const stage = `${STAGE}-${id12(uuid)}`;
   const put = (name) => {
-    art[`${stage}-${name}`] = join6(outDir, name);
-    return join6(outDir, name);
+    art[`${stage}-${name}`] = join7(outDir, name);
+    return join7(outDir, name);
   };
-  tar(put("project.tgz"), projDir, [`${uuid}.jsonl`, ...[uuid, "memory"].filter((p) => existsSync5(join6(projDir, p)))]);
-  const claudeHome = join6(process.env.HOME, ".claude");
+  tar(put("project.tgz"), projDir, [`${uuid}.jsonl`, ...[uuid, "memory"].filter((p) => existsSync6(join7(projDir, p)))]);
+  const claudeHome = join7(process.env.HOME, ".claude");
   const layer = userLayerFiles(claudeHome, ["skills", "agents", "commands", "CLAUDE.md"]);
   if (layer.skipped.length)
     console.log(`Not shipping ${layer.skipped.length} user-layer link(s) that point outside their folder: ${layer.skipped.join(", ")}`);
@@ -5260,11 +5433,11 @@ function build(args, outDir) {
     tar(put("untracked.tgz"), root, [...EXCLUDE_SENSITIVE, "--no-recursion", "--null", "-T", "-"], list);
   } else {
     const skip = (n) => n === "node_modules" || n === ".git";
-    const list = packList(cwd, readdirSync3(cwd).filter((n) => !skip(n)), skip);
+    const list = packList(cwd, readdirSync4(cwd).filter((n) => !skip(n)), skip);
     tar(put("folder.tgz"), cwd, [...EXCLUDE_SENSITIVE, "--no-recursion", "--null", "-T", "-"], list);
   }
   for (const [box, local] of Object.entries(art)) {
-    const size = statSync4(local).size;
+    const size = statSync5(local).size;
     if (size > MAX_ARTIFACT_BYTES) {
       throw new Error(`${box.split("/").pop()} is ${(size / 1e6).toFixed(0)} MB (cap ${MAX_ARTIFACT_BYTES / 1e6} MB). ` + (git ? "Commit or .gitignore large untracked files." : "Run handoff from a git repo, or trim the folder."));
     }
@@ -5450,13 +5623,13 @@ function updateCloudAt(path, fn) {
   const lock = `${path}.lock`;
   for (const end = Date.now() + 15000;; ) {
     try {
-      closeSync2(openSync2(lock, "wx", 384));
+      closeSync3(openSync3(lock, "wx", 384));
       break;
     } catch (e) {
       if (e.code !== "EEXIST")
         throw e;
       try {
-        if (Date.now() - statSync4(lock).mtimeMs > 1e4) {
+        if (Date.now() - statSync5(lock).mtimeMs > 1e4) {
           unlinkSync3(lock);
           continue;
         }
@@ -5685,12 +5858,12 @@ async function sendFirstMessage(run, text, uuid) {
   return FIRST_SKIPPED;
 }
 async function bake(key) {
-  const out = mkdtempSync2(join6(tmpdir(), "nomo-bake-"));
-  const marketplace = packPlugin(join6(out, "plugin.tgz"));
+  const out = mkdtempSync2(join7(tmpdir(), "nomo-bake-"));
+  const marketplace = packPlugin(join7(out, "plugin.tgz"));
   console.log(`Creating a bake box (omg preset, ${BOX_SIZE})…`);
   const id = await waitRunning(key, await api(key, "POST", "/sandboxes", { template: "omg", size: BOX_SIZE }));
   try {
-    await api(key, "POST", `/sandboxes/${id}/files`, [{ path: `${STAGE}-plugin.tgz`, content: readFileSync6(join6(out, "plugin.tgz")).toString("base64"), mode: 384 }]);
+    await api(key, "POST", `/sandboxes/${id}/files`, [{ path: `${STAGE}-plugin.tgz`, content: readFileSync6(join7(out, "plugin.tgz")).toString("base64"), mode: 384 }]);
     const r = await exec(key, id, bakeScript(marketplace));
     if (r.exitCode !== 0 || !/NOMO_BAKED/.test(r.stdout ?? ""))
       throw new Error(`bake script failed (exit ${r.exitCode}):
@@ -5723,7 +5896,7 @@ main{text-align:center;padding:16px}h1{font-size:24px;margin:8px 0}p{opacity:.7}
 <body><main><h1>${title}</h1><p>${sub}</p></main></body></html>`;
 }
 async function showPairing(omg, id, url, worker) {
-  const page = join6(CC_DIR, "cloud-pair.html");
+  const page = join7(CC_DIR, "cloud-pair.html");
   let result = resultPage("Not paired", "Retry with: bun plugin/dist/handoff.mjs --pair");
   if (process.stdout.isTTY) {
     console.log(`
@@ -5887,9 +6060,9 @@ async function back(omg, args) {
   const parkedAtStart = readPark(uuid);
   const sameWindow = here === uuid;
   if (sameWindow && parkedAtStart?.state === "landing") {
-    if (!parkedAtStart.staged || !existsSync5(parkedAtStart.staged)) {
+    if (!parkedAtStart.staged || !existsSync6(parkedAtStart.staged)) {
       clearPark(uuid);
-      throw new Error(`the staged box copy is gone; unparked this window. The pulled copy is under ${join6(CC_DIR, "cloud-back")}.`);
+      throw new Error(`the staged box copy is gone; unparked this window. The pulled copy is under ${join7(CC_DIR, "cloud-back")}.`);
     }
     console.log(`The box's copy is staged; it goes in as this turn ends.
 
@@ -5984,7 +6157,7 @@ ${printable((pack.stderr ?? "").slice(-1500))}`);
       throw new Error(`${name} on the box is ${(size / 1e6).toFixed(0)} MB, over this session's ${(capOf(name) / 1e6).toFixed(0)} MB cap. ` + `Nothing was pulled and nothing changed on this Mac. Claude Code on the box was stopped; the session and all its work ` + `stay on box ${id} (it sleeps on its own; files are kept 14 days asleep).`);
     }
   }
-  const backup = join6(CC_DIR, "cloud-back", `${uuid8}-${Date.now()}`);
+  const backup = join7(CC_DIR, "cloud-back", `${uuid8}-${Date.now()}`);
   mkdirSync3(backup, { recursive: true, mode: 448 });
   let phase = "pulling the box's work";
   const onSignal = (sig) => {
@@ -6004,7 +6177,7 @@ Interrupted (${sig}) while ${phase}.
     const bytes = Buffer.from(r?.content ?? "", "base64");
     if (bytes.length !== sizes[name])
       throw new Error(`pulled ${name}: ${bytes.length} B, the box reported ${sizes[name]} B`);
-    writeFileSync4(join6(backup, name), bytes, { mode: 384 });
+    writeFileSync4(join7(backup, name), bytes, { mode: 384 });
   }
   console.log(`Pulled the box's work into ${backup}`);
   const done = await exec(omg, id, `${boxPrelude(uuid)}
@@ -6024,12 +6197,12 @@ ${LEFT_LINE}`).catch(() => {
   const paths = (ps) => ps.map((p) => printable(p, true)).join(", ");
   const unpack = (name) => {
     try {
-      return extractTgz(join6(backup, name), backup, capOf(name), name === "project.tgz" ? caps.extracted : undefined);
+      return extractTgz(join7(backup, name), backup, capOf(name), name === "project.tgz" ? caps.extracted : undefined);
     } catch (e) {
       problems.push(`${name} could not be unpacked, so it was NOT applied (${printable((e.stderr?.toString() || e.message || String(e)).trim(), true).slice(0, 300)}); it is kept in ${backup}`);
     }
   };
-  const projDir = mkdirp(join6(process.env.HOME, ".claude", "projects", enc));
+  const projDir = mkdirp(join7(process.env.HOME, ".claude", "projects", enc));
   const pdir = unpack("project.tgz");
   const pt = pdir ? validateTree(pdir, (r) => r === `${uuid}.jsonl` || r === uuid || r.startsWith(`${uuid}/`) || r === "memory" || r.startsWith("memory/"), budget) : { files: [], skipped: [] };
   if (pt.skipped.length)
@@ -6038,21 +6211,21 @@ ${LEFT_LINE}`).catch(() => {
   if (!pdir) {} else if (!pt.files.includes(`${uuid}.jsonl`))
     problems.push("the box sent no transcript");
   else {
-    const boxT = readFileSync6(join6(pdir, `${uuid}.jsonl`));
-    const macPath = join6(projDir, `${uuid}.jsonl`);
-    const macT = existsSync5(macPath) ? readFileSync6(macPath) : undefined;
+    const boxT = readFileSync6(join7(pdir, `${uuid}.jsonl`));
+    const macPath = join7(projDir, `${uuid}.jsonl`);
+    const macT = existsSync6(macPath) ? readFileSync6(macPath) : undefined;
     const sub = pt.files.filter((r) => r.startsWith(`${uuid}/`));
     const act = transcriptAction(snap, macT, boxT);
     if (act === "corrupt")
       problems.push(`the box transcript does not continue the one handed off; NOT installed (it is in ${backup}/project.tgz)`);
     if (act === "replace") {
-      const before = mkdirp(join6(backup, "mac-before"));
+      const before = mkdirp(join7(backup, "mac-before"));
       if (macT)
         copyContained(macPath, before, `${uuid}.jsonl`, true, true);
       for (const r of listUnder(projDir, uuid))
-        copyContained(join6(projDir, r), before, r, true, true);
+        copyContained(join7(projDir, r), before, r, true, true);
       for (const r of sub)
-        copyContained(join6(pdir, r), projDir, r, true, true);
+        copyContained(join7(pdir, r), projDir, r, true, true);
       if (sameWindow) {
         const staged = `${macPath}.nomo-back`;
         atomicWriteBytes(staged, boxT);
@@ -6066,15 +6239,15 @@ ${LEFT_LINE}`).catch(() => {
     }
     if (act === "fork") {
       resumeId = randomUUID();
-      atomicWriteBytes(join6(projDir, `${resumeId}.jsonl`), boxT);
+      atomicWriteBytes(join7(projDir, `${resumeId}.jsonl`), boxT);
       for (const r of sub)
-        copyContained(join6(pdir, r), projDir, resumeId + r.slice(uuid.length), false, true);
+        copyContained(join7(pdir, r), projDir, resumeId + r.slice(uuid.length), false, true);
       console.log(`Transcript: this Mac also continued ${uuid} after the handoff, so the box's copy was saved as a new file ${resumeId}.jsonl; ` + `the Mac's copy is untouched. The new file still carries the original session id inside: check that \`claude --resume ${resumeId}\` opens the box's conversation.`);
     }
     if (act === "same")
       console.log("Transcript: the box added nothing.");
   }
-  const mem = pdir ? mergeMemory(snap?.memory, join6(pdir, "memory"), pt.files.filter((r) => r.startsWith("memory/")).map((r) => r.slice(7)), join6(projDir, "memory"), backup) : { added: [], updated: [], conflicts: [] };
+  const mem = pdir ? mergeMemory(snap?.memory, join7(pdir, "memory"), pt.files.filter((r) => r.startsWith("memory/")).map((r) => r.slice(7)), join7(projDir, "memory"), backup) : { added: [], updated: [], conflicts: [] };
   if (mem.added.length + mem.updated.length)
     console.log(`Memory: ${mem.added.length} added, ${mem.updated.length} updated.`);
   if (mem.conflicts.length)
@@ -6084,7 +6257,7 @@ ${LEFT_LINE}`).catch(() => {
     if (!/^[0-9a-f]{40}$/.test(boxHead))
       throw new Error(`the box reported no HEAD (${JSON.stringify(boxHead)})`);
     const commits = Number(m.COMMITS ?? 0);
-    const has = (n) => existsSync5(join6(backup, n));
+    const has = (n) => existsSync6(join7(backup, n));
     let untrackedDir, untracked = [];
     if (has("untracked.tgz") && (untrackedDir = unpack("untracked.tgz"))) {
       const ut = validateTree(untrackedDir, undefined, budget);
@@ -6093,8 +6266,8 @@ ${LEFT_LINE}`).catch(() => {
         console.log(`Skipped ${ut.skipped.length} untracked path(s) from the box (links or unsafe paths): ${paths(ut.skipped)}`);
     }
     const a = {
-      bundle: commits > 0 && has("repo.bundle") ? join6(backup, "repo.bundle") : undefined,
-      patch: has("wip.patch") ? join6(backup, "wip.patch") : undefined,
+      bundle: commits > 0 && has("repo.bundle") ? join7(backup, "repo.bundle") : undefined,
+      patch: has("wip.patch") ? join7(backup, "wip.patch") : undefined,
       untrackedDir,
       untracked,
       boxHead
@@ -6139,7 +6312,7 @@ The conversation itself is back: cd ${q(cwd)} && claude --resume ${resumeId}`);
       console.log(`Code: ${why}, so the box's work is on branch ${name}; your checkout was not touched.
   Review: git -C ${q(root)} log -p HEAD..${name}`);
     }
-  } else if (existsSync5(join6(backup, "folder.tgz"))) {
+  } else if (existsSync6(join7(backup, "folder.tgz"))) {
     const dir = unpack("folder.tgz");
     if (dir) {
       const t = validateTree(dir, undefined, budget);
@@ -6154,8 +6327,8 @@ The conversation itself is back: cd ${q(cwd)} && claude --resume ${resumeId}`);
     return { ...c, sessions, active: (c.active ?? []).filter((s) => s !== uuid) };
   });
   let parked = readPark(uuid);
-  if (sameWindow && stagedThisRun && parked?.state !== "landing" && parked?.state !== "back" && existsSync5(stagedThisRun)) {
-    stageLanding(uuid, { staged: stagedThisRun, target: join6(projDir, `${uuid}.jsonl`), resume: uuid }, startedAt);
+  if (sameWindow && stagedThisRun && parked?.state !== "landing" && parked?.state !== "back" && existsSync6(stagedThisRun)) {
+    stageLanding(uuid, { staged: stagedThisRun, target: join7(projDir, `${uuid}.jsonl`), resume: uuid }, startedAt);
     parked = readPark(uuid);
   }
   if (sameWindow) {
@@ -6184,14 +6357,14 @@ Needs a look:
   }
   let model;
   try {
-    model = lastModel(readFileSync6(join6(projDir, `${resumeId}.jsonl`), "utf8"));
+    model = lastModel(readFileSync6(join7(projDir, `${resumeId}.jsonl`), "utf8"));
   } catch {}
   const line = resumeCommand(cwd, resumeId, model);
   console.log(`
 Resume on this Mac:
   ${line.replace(" && exec ", " && ")}`);
   if (!args.has("--no-open") && !problems.length) {
-    const file = join6(backup, "resume.command");
+    const file = join7(backup, "resume.command");
     writeFileSync4(file, `#!/bin/sh
 ${line}
 `, { mode: 448 });
@@ -6220,7 +6393,7 @@ function readiness(cwd) {
   }
 }
 function listUnder(projDir, dir) {
-  return listFiles(join6(projDir, dir)).map((r) => join6(dir, r));
+  return listFiles(join7(projDir, dir)).map((r) => join7(dir, r));
 }
 var SELF = fileURLToPath2(import.meta.url);
 var PENDING = { path: PENDING_PATH, isHelper: (pid) => pidAlive(pid) && /handoff.*--(after-exit|later)(\s|$)/.test(pidCommand(pid) ?? "") };
@@ -6229,9 +6402,9 @@ async function later(args, keys, worker) {
     return phoneLater(args, keys, worker);
   const records = [];
   try {
-    for (const f of readdirSync3(SESSIONS_DIR).filter((n) => n.endsWith(".json"))) {
+    for (const f of readdirSync4(SESSIONS_DIR).filter((n) => n.endsWith(".json"))) {
       try {
-        records.push({ id: f.slice(0, -5), pid: JSON.parse(readFileSync6(join6(SESSIONS_DIR, f), "utf8")).pid });
+        records.push({ id: f.slice(0, -5), pid: JSON.parse(readFileSync6(join7(SESSIONS_DIR, f), "utf8")).pid });
       } catch {}
     }
   } catch {}
@@ -6253,7 +6426,7 @@ async function later(args, keys, worker) {
   if (!keys.omg || !keys.openrouter)
     throw new Error("OMG_API_KEY and OPENROUTER_API_KEY must be set (env or ~/.nomo-spike.env)");
   const home = process.env.HOME;
-  const cwd = [process.cwd(), (await readRecord(session))?.cwd].find((c) => !!c && existsSync5(join6(home, ".claude", "projects", projectDirName(c), `${session}.jsonl`)));
+  const cwd = [process.cwd(), (await readRecord(session))?.cwd].find((c) => !!c && existsSync6(join7(home, ".claude", "projects", projectDirName(c), `${session}.jsonl`)));
   if (!cwd)
     throw new Error(`no transcript for session ${session} under ${process.cwd()}. cd to the session's project folder and retry.`);
   let root;
@@ -6263,6 +6436,12 @@ async function later(args, keys, worker) {
   const refusal = root ? packRefusal(root, home, () => false) : packRefusal(cwd, home);
   if (refusal)
     throw new Error(`refusing to hand off: ${refusal}. Run it from a project folder.`);
+  const inTranscript = secretSummary(scanHandoff(join7(home, ".claude", "projects", projectDirName(cwd)), session), session);
+  if (inTranscript && !arg.anyway) {
+    console.log(transcriptSecretWarning(inTranscript, false));
+    process.exitCode = 1;
+    return;
+  }
   if (needsPairing(loadCloud(), worker)) {
     console.log(`Your cloud box needs a one-time pairing (a QR scan), which can't happen in the background. Nothing was started.
 ` + `Quit Claude Code (/exit), then run this in a terminal:
@@ -6280,13 +6459,15 @@ Log: ${LATER_LOG}
 To stop it: /nomo-cc:handoff cancel`);
   let warn;
   try {
-    warn = sizeWarning(contextTokensOf(join6(home, ".claude", "projects", projectDirName(cwd), `${session}.jsonl`)));
+    warn = sizeWarning(contextTokensOf(join7(home, ".claude", "projects", projectDirName(cwd), `${session}.jsonl`)));
   } catch {}
   if (warn)
     console.log(warn);
   const ready = readiness(cwd);
   if (ready)
     console.log(ready);
+  if (inTranscript)
+    console.log(transcriptSecretWarning(inTranscript, true));
 }
 function arm(session, claudePid, cwd, message, worker) {
   mkdirSync3(CC_DIR, { recursive: true, mode: 448 });
@@ -6297,7 +6478,7 @@ function arm(session, claudePid, cwd, message, worker) {
     return false;
   }
   writePark(session, { state: "moving", pid: claudePid });
-  const fd = openSync2(LATER_LOG, "w", 384);
+  const fd = openSync3(LATER_LOG, "w", 384);
   const child = spawn2(process.execPath, [SELF, "--after-exit", "--session", session, "--claude-pid", String(claudePid), "--worker", worker], { cwd, detached: true, stdio: ["ignore", fd, fd] });
   child.unref();
   writeFileSync4(PENDING_PATH, JSON.stringify({ ...p, helperPid: child.pid }) + `
@@ -6325,8 +6506,9 @@ async function phoneLater(args, keys, worker) {
     active: cloudActive(session),
     needsPairing: needsPairing(cloud, worker),
     cloudCount: cloud.active?.length ?? 0,
-    transcriptExists: (cwd) => existsSync5(join6(home, ".claude", "projects", projectDirName(cwd), `${session}.jsonl`)),
-    trackedSecrets: trackedSecretFiles
+    transcriptExists: (cwd) => existsSync6(join7(home, ".claude", "projects", projectDirName(cwd), `${session}.jsonl`)),
+    trackedSecrets: trackedSecretFiles,
+    transcriptSecrets: (cwd) => secretSummary(scanHandoff(join7(home, ".claude", "projects", projectDirName(cwd)), session), session)
   });
   if ("refuse" in ok)
     return refuse(ok.why, ok.refuse);
@@ -6369,7 +6551,7 @@ async function afterExit(args, worker) {
         self: SELF,
         shim: `${CC_DIR}/hook-shim.sh`,
         args: ["--session", session, "--worker", worker],
-        exists: existsSync5
+        exists: existsSync6
       });
       if (!argv)
         return rej(new Error(GONE_MSG));
@@ -6445,7 +6627,7 @@ async function main() {
     return;
   }
   if (args.has("--dry-run")) {
-    const out = mkdtempSync2(join6(tmpdir(), "nomo-handoff-"));
+    const out = mkdtempSync2(join7(tmpdir(), "nomo-handoff-"));
     let plan;
     try {
       plan = build(args, out);
@@ -6456,7 +6638,7 @@ async function main() {
     console.log(`DRY RUN: nothing was sent. Artifacts kept in ${out} (delete it when done)`);
     console.log(`session ${plan.uuid}  cwd ${plan.cwd}  repo ${plan.git ? `${plan.root} (${plan.branch})` : "(not git)"}  model ${plan.model}`);
     for (const [box, local] of Object.entries(plan.artifacts))
-      console.log(`  ${local} -> ${box}  (${statSync4(local).size} B)`);
+      console.log(`  ${local} -> ${box}  (${statSync5(local).size} B)`);
     console.log(`keys: OMG_API_KEY ${keys.omg ? "found" : "MISSING"}, OPENROUTER_API_KEY ${keys.openrouter ? "found" : "MISSING"}`);
     console.log(`exec env: ANTHROPIC_BASE_URL=http://127.0.0.1:${RELAY_PORT} (or-relay -> OpenRouter) ANTHROPIC_AUTH_TOKEN=<openrouter key> ANTHROPIC_API_KEY= CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 NOMO_WORKER_URL=${worker}${args.has("--force") ? " NOMO_FORCE=1" : ""}`);
     console.log(`----- box script -----
@@ -6545,7 +6727,7 @@ Target worker: ${worker}`);
   }
   if (!keys.openrouter)
     throw new Error("OPENROUTER_API_KEY not set (env or ~/.nomo-spike.env)");
-  const out = mkdtempSync2(join6(tmpdir(), "nomo-handoff-"));
+  const out = mkdtempSync2(join7(tmpdir(), "nomo-handoff-"));
   let plan, id;
   try {
     plan = build(args, out);

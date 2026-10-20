@@ -87,7 +87,7 @@ var textEncoder2 = new TextEncoder;
 var DEFAULT_WORKER_URL = "https://api.nomo.gg";
 
 // src/core/shared.ts
-var PLUGIN_VERSION = "2.3.41";
+var PLUGIN_VERSION = "2.3.43";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")

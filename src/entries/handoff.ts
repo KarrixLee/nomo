@@ -79,10 +79,11 @@ import { renderPairPage } from "../core/pair-page";
 import { buildPairURL, DEFAULT_WORKER_URL } from "../core/pair-url";
 import { normalizeModelId } from "../core/adapter";
 import { cloudReadiness, gitProbe, isSecretName, trackedSecretFiles } from "../core/readiness";
+import { scanHandoff, secretSummary } from "../core/transcript-scan";
 import { backLockHolder, clearPark, cloudActive, moveResultFile, type MoveWhy, PARK_DIR, writeBackResult, writeMoveResult, readPark, releaseBackLock, stageLanding, takeBackLock, writePark } from "../core/park";
 import { atomicWrite, CC_DIR, pidAlive, pidAncestors, pidCommand, readRecord, SESSIONS_DIR } from "../core/shared";
 import {
-  BOX_MAX_SESSIONS, cancelPending, claimPending, DEFAULT_THEN, EXIT_BOX_GONE, phoneMoveCheck, settleThenStamp, contextTokens, contextTokensOf, GONE_MSG, sizeWarning, TAIL_BYTES, handoffArgv, LATER_LOG, LATER_USAGE, laterStatus, needsPairing, parseLaterArg, type Pending, PENDING_PATH, readPending, resolveSession, waitThenHandoff,
+  BOX_MAX_SESSIONS, cancelPending, claimPending, DEFAULT_THEN, EXIT_BOX_GONE, phoneMoveCheck, settleThenStamp, contextTokens, contextTokensOf, GONE_MSG, sizeWarning, TAIL_BYTES, handoffArgv, LATER_LOG, LATER_USAGE, laterStatus, transcriptSecretWarning, needsPairing, parseLaterArg, type Pending, PENDING_PATH, readPending, resolveSession, waitThenHandoff,
 } from "../core/handoff-later";
 import {
   agentConfigPaths, applyInPlace, atomicWriteBytes, type BoxArtifacts, boxChangedPaths, boxIdle, copyContained, decideCode, extractTgz,
@@ -1550,6 +1551,9 @@ async function later(args: Map<string, string | true>, keys: { omg?: string; ope
   try { root = execFileSync("git", ["rev-parse", "--show-toplevel"], { cwd, stdio: ["ignore", "pipe", "ignore"] }).toString().trim(); } catch { /* not git */ }
   const refusal = root ? packRefusal(root, home, () => false) : packRefusal(cwd, home);
   if (refusal) throw new Error(`refusing to hand off: ${refusal}. Run it from a project folder.`);
+  // NOM-103: before anything is parked or started, so a refusal leaves the window as it was.
+  const inTranscript = secretSummary(scanHandoff(join(home, ".claude", "projects", projectDirName(cwd)), session), session);
+  if (inTranscript && !arg.anyway) { console.log(transcriptSecretWarning(inTranscript, false)); process.exitCode = 1; return; }
   if (needsPairing(loadCloud(), worker)) {
     console.log(`Your cloud box needs a one-time pairing (a QR scan), which can't happen in the background. Nothing was started.\n` +
       `Quit Claude Code (/exit), then run this in a terminal:\n  cd ${q(cwd)} && ${q(process.execPath)} ${q(SELF)} --session ${session}` +
@@ -1567,6 +1571,7 @@ async function later(args: Map<string, string | true>, keys: { omg?: string; ope
   if (warn) console.log(warn);
   const ready = readiness(cwd);
   if (ready) console.log(ready);
+  if (inTranscript) console.log(transcriptSecretWarning(inTranscript, true));
 }
 
 /** Claim the pending slot, park the window "moving" and start the detached helper. False (message
@@ -1609,6 +1614,7 @@ async function phoneLater(args: Map<string, string | true>, keys: { omg?: string
     cloudCount: cloud.active?.length ?? 0,
     transcriptExists: (cwd) => existsSync(join(home, ".claude", "projects", projectDirName(cwd), `${session}.jsonl`)),
     trackedSecrets: trackedSecretFiles,
+    transcriptSecrets: (cwd) => secretSummary(scanHandoff(join(home, ".claude", "projects", projectDirName(cwd)), session), session),
   });
   if ("refuse" in ok) return refuse(ok.why, ok.refuse);
   let root: string | undefined;

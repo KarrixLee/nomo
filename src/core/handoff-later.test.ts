@@ -248,6 +248,11 @@ describe("/nomo-cc:handoff grammar", () => {
     expect(parseLaterArg("then run the tests")).toEqual({ message: "run the tests" });
     expect(parseLaterArg("Then  it's \"$HOME\" `id`\r\nline 2\n")).toEqual({ message: "it's \"$HOME\" `id`\nline 2" });
     expect(parseLaterArg("quiet")).toEqual({});
+    expect(parseLaterArg("anyway")).toEqual({ message: DEFAULT_THEN, anyway: true });
+    expect(parseLaterArg("Anyway quiet")).toEqual({ anyway: true });
+    expect(parseLaterArg("anyway then go on")).toEqual({ message: "go on", anyway: true });
+    expect(parseLaterArg("then anyway")).toEqual({ message: "anyway" });
+    expect(parseLaterArg("anywayz")).toBeUndefined();
     expect(parseLaterArg("QUIET\n")).toEqual({});
     for (const bad of ["then", "then   ", "thenx", "quiet please", "cancle", "status", "cancel", "go"]) expect(parseLaterArg(bad)).toBeUndefined();
   });
@@ -339,6 +344,7 @@ describe("phone move-to-cloud (NOM-94)", () => {
     parked: false, active: false, needsPairing: false, cloudCount: 0,
     transcriptExists: () => true,
     trackedSecrets: () => [],
+    transcriptSecrets: () => undefined,
     ...o,
   });
   const refuse = (o: Partial<PhoneMoveFacts>): string => {
@@ -375,6 +381,12 @@ describe("phone move-to-cloud (NOM-94)", () => {
     expect(phoneMoveCheck(facts({ cloudCount: BOX_MAX_SESSIONS - 1 }))).toEqual({ claudePid: 400, cwd: "/p/app" });
     expect(refuse({ transcriptExists: () => false })).toMatch(/transcript/);
     expect(refuse({ record: { pid: 400 } })).toMatch(/transcript/);
+  });
+
+  test("NOM-103: a transcript that looks like it holds secrets refuses with why secret", () => {
+    const o = { transcriptSecrets: () => "1 secret (AWS key ×1; transcript line 3)" };
+    expect(refuse(o)).toMatch(/conversation contains what look like 1 secret \(AWS key ×1; transcript line 3\).*\/nomo-cc:handoff anyway/);
+    expect((phoneMoveCheck(facts(o)) as { why: string }).why).toBe("secret");
   });
 
   test("a git-tracked secret refuses; a git error refuses; none (or no git) passes", () => {
