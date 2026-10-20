@@ -130,7 +130,8 @@ home. What that does and doesn't expose:
   commit, only the newer commits travel. Otherwise, when the branch's upstream is a plain
   `https://` URL on github.com, gitlab.com, bitbucket.org or codeberg.org (no user, token, port or
   query in it; never ssh) and an anonymous `git ls-remote` from this Mac (no credential helper, no
-  git config, no prompt) can read it, the box clones that URL anonymously and only the unpushed
+  git config, no `~/.netrc`, no prompt: it runs with an empty temporary HOME) can read it, the box
+  clones that URL anonymously (that branch only, capped at 5 minutes) and only the unpushed
   commits travel. A private repo fails that check and goes as a full bundle, as before. No token,
   SSH key or credential helper is ever given to the box, and the box's previous checkout (with any
   uncommitted work) is moved aside to `<root>.nomo-bak-<time>`, never overwritten.

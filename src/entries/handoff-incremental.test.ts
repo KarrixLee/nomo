@@ -5,7 +5,7 @@ import { execFileSync, spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { build, boxHeadScript, newCommits, parseBoxHead, pickRepoShip, projectDirName, publicCloneUrl, type RepoShip, SEED_FAILED, seedScript } from "./handoff";
+import { build, boxHeadScript, safeBranch, seedFallback, stageThenBox, newCommits, parseBoxHead, pickRepoShip, projectDirName, publicCloneUrl, type RepoShip, SEED_FAILED, seedScript } from "./handoff";
 
 const tmp = (p: string) => realpathSync(mkdtempSync(join(tmpdir(), `nomo-incr-${p}-`)));
 const git = (cwd: string, ...a: string[]) =>
@@ -72,7 +72,7 @@ describe("pickRepoShip", () => {
     upstream(dir, "https://github.com/o/r.git", a);
     const calls: string[] = [];
     expect(pickRepoShip(dir, undefined, (u, r) => { calls.push(`${u} ${r}`); return true; }))
-      .toEqual({ mode: "clone", url: "https://github.com/o/r.git", base: a, head: b });
+      .toEqual({ mode: "clone", url: "https://github.com/o/r.git", branch: "main", base: a, head: b });
     expect(calls).toEqual(["https://github.com/o/r.git refs/heads/main"]);
     expect(pickRepoShip(dir, "0".repeat(40), () => true)).toMatchObject({ mode: "clone" }); // unknown box head → clone
   });
@@ -175,7 +175,7 @@ describe("box seed script (real git)", () => {
     execFileSync("git", ["clone", "-q", "--bare", dir, remote]);
     const c = commit(dir, "c.txt", "c\n"); // unpushed
     const root = join(tmp("box"), "deep", "proj"); // a new box: ROOT and its parent don't exist
-    const r = runBox(root, seedScript({ mode: "clone", url: remote, base: b, head: c }, bundle(dir, b)));
+    const r = runBox(root, seedScript({ mode: "clone", url: remote, branch: "main", base: b, head: c }, bundle(dir, b)));
     expect(r.status).toBe(0);
     expect(git(root, "rev-parse", "HEAD")).toBe(c);
     expect(git(root, "remote", "get-url", "origin")).toBe(remote);
@@ -183,16 +183,17 @@ describe("box seed script (real git)", () => {
     const root2 = join(tmp("box"), "proj");
     mkdirSync(root2);
     writeFileSync(join(root2, "keep.txt"), "k\n");
-    const bad = runBox(root2, seedScript({ mode: "clone", url: join(tmp("gone"), "nope.git"), base: b, head: c }, bundle(dir, b)));
+    const bad = runBox(root2, seedScript({ mode: "clone", url: join(tmp("gone"), "nope.git"), branch: "main", base: b, head: c }, bundle(dir, b)));
     expect(bad.status).toBe(SEED_FAILED);
     expect(readFileSync(join(root2, "keep.txt"), "utf8")).toBe("k\n");
     expect(existsSync(`${root2}.nomo-seed`)).toBe(false);
   });
 
   test("clone script never carries a credential and disables prompts", () => {
-    const s = seedScript({ mode: "clone", url: "https://github.com/o/r.git", base: "a".repeat(40), head: "b".repeat(40) }, undefined);
-    expect(s).toContain("GIT_TERMINAL_PROMPT=0 git -c credential.helper=");
-    expect(s).toContain("clone -q --no-checkout 'https://github.com/o/r.git'");
+    const s = seedScript({ mode: "clone", url: "https://github.com/o/r.git", branch: "main", base: "a".repeat(40), head: "b".repeat(40) }, undefined);
+    expect(s).toContain("GIT_TERMINAL_PROMPT=0 $TO git -c credential.helper=");
+    expect(s).toContain(`TO="timeout 300"`);
+    expect(s).toContain("clone -q --no-checkout --single-branch --branch 'main' --no-tags 'https://github.com/o/r.git'");
   });
 });
 
@@ -241,8 +242,46 @@ describe("build() picks the path", () => {
   test("public upstream → clone mode; full:true forces the full bundle", () => {
     const pub = plan(({ dir, a }) => { upstream(dir, "https://github.com/o/r.git", a); return { ls: () => true }; });
     expect(pub.p.repoLine).toMatch(/^Repo: the box clones https:\/\/github.com\/o\/r.git anonymously; sending 1 unpushed/);
-    expect(pub.p.script).toContain("clone -q --no-checkout 'https://github.com/o/r.git'");
+    expect(pub.p.script).toContain("--single-branch --branch 'main' --no-tags 'https://github.com/o/r.git'");
     const full = plan(({ dir, a }) => { upstream(dir, "https://github.com/o/r.git", a); return { boxHead: a, full: true, ls: never }; });
     expect(full.p.repoLine).toMatch(/^Repo: full bundle/);
+  });
+});
+
+describe("review fixes", () => {
+  test("SEED_FAILED retry only for a seeded plan whose seed step printed the marker", () => {
+    const box: RepoShip = { mode: "box", base: "a".repeat(40), head: "b".repeat(40) };
+    const clone: RepoShip = { mode: "clone", url: "https://github.com/o/r.git", branch: "main", base: "a".repeat(40), head: "b".repeat(40) };
+    expect(seedFallback(box, SEED_FAILED, "x\nNOMO_SEED_FAILED\n")).toMatch(/own copy/);
+    expect(seedFallback(clone, SEED_FAILED, "NOMO_SEED_FAILED")).toMatch(/couldn't clone https:\/\/github.com\/o\/r.git/);
+    expect(seedFallback(box, SEED_FAILED, "curl: (7) Failed to connect")).toBeUndefined(); // a bare 7 (curl)
+    expect(seedFallback({ mode: "full" }, SEED_FAILED, "NOMO_SEED_FAILED")).toBeUndefined();
+    expect(seedFallback(box, 0, "NOMO_SEED_FAILED")).toBeUndefined();
+  });
+
+  test("a bad invocation never reaches the box", async () => {
+    const home = tmp("home"), prev = { home: process.env.HOME, cwd: process.cwd() };
+    const { dir } = macRepo();
+    let calls = 0;
+    const box = async () => { calls++; return "id"; };
+    process.env.HOME = home; process.chdir(dir);
+    try {
+      await expect(stageThenBox(new Map(), tmp("out"), box)).rejects.toThrow(/no Claude Code transcripts/);
+      mkdirSync(join(home, ".claude", "projects", projectDirName(dir)), { recursive: true });
+      await expect(stageThenBox(new Map([["--session", "nope"]]), tmp("out"), box)).rejects.toThrow(/must be a UUID/);
+      await expect(stageThenBox(new Map([["--session", "00000000-0000-4000-8000-0000000000bb"]]), tmp("out"), box)).rejects.toThrow(/not found/);
+      const u = "00000000-0000-4000-8000-0000000000cc";
+      mkdirSync(join(home, ".claude", "projects", projectDirName(home)), { recursive: true });
+      writeFileSync(join(home, ".claude", "projects", projectDirName(home), `${u}.jsonl`), "{}\n");
+      process.chdir(home);
+      await expect(stageThenBox(new Map([["--session", u]]), tmp("out"), box)).rejects.toThrow(/refusing to hand off/);
+    } finally { process.env.HOME = prev.home; process.chdir(prev.cwd); }
+    expect(calls).toBe(0);
+  });
+
+  test("safeBranch: check-ref-format semantics, never an option", () => {
+    expect(safeBranch("main")).toBe("main");
+    expect(safeBranch("feat/x-1.2")).toBe("feat/x-1.2");
+    for (const b of ["", "-x", "--upload-pack=x", "a..b", "a b", "a.lock", "a/", "x;rm", "a~1", "@"]) expect(safeBranch(b)).toBeUndefined();
   });
 });
