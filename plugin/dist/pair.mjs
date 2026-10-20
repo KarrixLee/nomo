@@ -109,7 +109,7 @@ function buildPairURL(workerUrl, pairingId, qrSecret, pcEphPub) {
 }
 
 // src/core/shared.ts
-var PLUGIN_VERSION = "2.3.38";
+var PLUGIN_VERSION = "2.3.39";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -232,6 +232,14 @@ function appendFittedPlanAndDebug(base, plan, dbg) {
   const encoder = new TextEncoder;
   const withDebug = { ...withPlan, dbg: capped };
   return sealedBlobChars(encoder.encode(JSON.stringify(withDebug)).length) <= BLOB_FIT_CHARS ? withDebug : withPlan;
+}
+function withCloudKey(plain, cloud) {
+  const { cloud: _old, plan, dbg, ...base } = plain;
+  const fitted = appendFittedPlanAndDebug(cloud ? { ...base, cloud } : base, typeof plan === "string" ? plan : undefined, typeof dbg === "string" ? dbg : undefined);
+  if (!cloud)
+    return fitted;
+  const { cloud: c, ...rest } = fitted;
+  return { ...rest, cloud: c };
 }
 var RECORD_FULL_TEXT_MAX_CHARS = 262144;
 var RECORD_FULL_TEXT_TRUNCATION_MARKER = `

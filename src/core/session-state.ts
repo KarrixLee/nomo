@@ -22,7 +22,7 @@
 // the decay, i.e. two numbers about the transport and nothing about the status.
 
 import { adapterFor } from "./adapter";
-import { appendFittedPlanAndDebug, formatPlanPickerDebug, sessionBranch } from "./shared";
+import { appendFittedPlanAndDebug, formatPlanPickerDebug, sessionBranch, withCloudKey } from "./shared";
 import type { AgentKindWire, CCStatus, DecisionHold, SessionRecord } from "./shared";
 
 /** The 24 h abandonment cap — cc-watchdog's SESSION_STALE_MS, mirrored (an entry module must not be
@@ -370,7 +370,10 @@ export function buildStatePlaintext(
   // live todo list). A Claude/Codex `planFull` belongs to one attention episode, so restating it here
   // would put a stale proposal on a working/done row — every non-ambient agent keeps the
   // byte-identical `undefined` this has always passed. See AgentAdapter.ambientPlan.
-  return appendFittedPlanAndDebug(base, adapterFor(agent).ambientPlan ? record.planFull : undefined, dbg);
+  const fitted = appendFittedPlanAndDebug(base, adapterFor(agent).ambientPlan ? record.planFull : undefined, dbg);
+  // NOM-95: the cloud handoff state, as buildDoneEnvelope carries it. The phone takes `cloud` from this
+  // LAN frame while the link is up, so leaving it out froze a done row on its last LAN-served value.
+  return filled(record.cloud) ? withCloudKey(fitted, record.cloud) : fitted;
 }
 
 /** Is this `.hold` marker LIVE? Marker present with a blob, holder pid alive, inside the TTL.

@@ -117,7 +117,7 @@ function buildPairURL(workerUrl, pairingId, qrSecret, pcEphPub) {
 }
 
 // src/core/shared.ts
-var PLUGIN_VERSION = "2.3.38";
+var PLUGIN_VERSION = "2.3.39";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -240,6 +240,14 @@ function appendFittedPlanAndDebug(base, plan, dbg) {
   const encoder = new TextEncoder;
   const withDebug = { ...withPlan, dbg: capped };
   return sealedBlobChars(encoder.encode(JSON.stringify(withDebug)).length) <= BLOB_FIT_CHARS ? withDebug : withPlan;
+}
+function withCloudKey(plain, cloud) {
+  const { cloud: _old, plan, dbg, ...base } = plain;
+  const fitted = appendFittedPlanAndDebug(cloud ? { ...base, cloud } : base, typeof plan === "string" ? plan : undefined, typeof dbg === "string" ? dbg : undefined);
+  if (!cloud)
+    return fitted;
+  const { cloud: c, ...rest } = fitted;
+  return { ...rest, cloud: c };
 }
 var RECORD_FULL_TEXT_MAX_CHARS = 262144;
 var RECORD_FULL_TEXT_TRUNCATION_MARKER = `
@@ -4050,7 +4058,8 @@ function buildStatePlaintext(record, status, at, titleFallback) {
     marker: "0",
     by: "wd"
   }) : undefined;
-  return appendFittedPlanAndDebug(base, adapterFor(agent).ambientPlan ? record.planFull : undefined, dbg);
+  const fitted = appendFittedPlanAndDebug(base, adapterFor(agent).ambientPlan ? record.planFull : undefined, dbg);
+  return filled(record.cloud) ? withCloudKey(fitted, record.cloud) : fitted;
 }
 function stateHoldLive(hold, holdPidAlive, now) {
   if (!hold || !filled(hold.blob))
@@ -8215,7 +8224,8 @@ async function buildDoneEnvelope(sessionId, record, now, e2eKey, agent = "claude
     ...branch ? { branch } : {}
   };
   const debug = appendCodexBridgeMarker(agent === "codex" ? dbg ?? formatPlanPickerDebug({ event: "done", classifier: "done", marker: "0", by: "wd" }) : undefined, codexBridgeIsDown());
-  const blob = await encryptBlob(e2eKey, appendFittedPlanAndDebug(base, ambientPlan(agent, record), debug));
+  const fitted = appendFittedPlanAndDebug(base, ambientPlan(agent, record), debug);
+  const blob = await encryptBlob(e2eKey, record.cloud ? withCloudKey(fitted, record.cloud) : fitted);
   return { v: 2, sessionId, op: "done", prio: 0, ts: now, blob, ...startedAtField(record) };
 }
 async function buildNeedsAttentionEnvelope(sessionId, record, now, e2eKey, agent = "claude", at, detail, attentionKind, proposedPlan, dbg) {
@@ -9148,14 +9158,6 @@ function moveFailed(id, park, rec, outcome = (since) => readMoveResult(id, since
   }
   return !!m.failedAt && !park;
 }
-function withCloudKey(plain, cloud) {
-  const { cloud: _old, plan, dbg, ...base } = plain;
-  const fitted = appendFittedPlanAndDebug(cloud ? { ...base, cloud } : base, typeof plan === "string" ? plan : undefined, typeof dbg === "string" ? dbg : undefined);
-  if (!cloud)
-    return fitted;
-  const { cloud: c, ...rest } = fitted;
-  return { ...rest, cloud: c };
-}
 var cloudPosts = new Map;
 var CLOUD_RETRY_MS = 30000;
 var CLOUD_KEEPALIVE_MS = 30 * 60000;
@@ -9178,10 +9180,10 @@ async function correctCloudState(config, path, sessionId, record, want, deps = {
       return "revoked";
     if (outcome !== "delivered")
       return "uncorrected";
-    if (changed) {
+    if (changed || record.cloud !== want) {
       const fresh = await (deps.readRecord ?? readRecordAt)(path);
       if (fresh && fresh.blob === record.blob) {
-        await (deps.writeRecord ?? ((p, r) => atomicWrite(p, JSON.stringify(r), 384)))(path, { ...fresh, blob });
+        await (deps.writeRecord ?? ((p, r) => atomicWrite(p, JSON.stringify(r), 384)))(path, { ...fresh, blob, cloud: want });
       }
     }
     return "corrected";

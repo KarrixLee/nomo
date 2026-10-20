@@ -28,7 +28,7 @@ import type { CommandPayload, DrainCommandsDeps, PostDetail, PostOutcome, Record
 import { backRuns, BRING_BACK_COMMAND_KIND, correctCloudState, handoffCommand, withCloudKey } from "./cc-watchdog";
 import { MOVE_TO_CLOUD_COMMAND_KIND, moveFailed, moveRuns, parseCommandPayload } from "./cc-watchdog";
 import type { Park } from "../core/park";
-import { endMovingTurn, readPark, writePark } from "../core/park";
+import { cloudState, endMovingTurn, readPark, writePark } from "../core/park";
 import { resolveOnRelay } from "../core/codex-remote-input";
 import { CODEX_PROXY_STDOUT_ENDED } from "../core/codex-proxy-transport";
 import { buildStatePlaintext, STATE_HOLD_MAX_AGE_MS } from "../core/session-state";
@@ -5113,6 +5113,24 @@ describe("bring back from the phone (NOM-93)", () => {
     // Marker gone: the key is removed.
     expect(await correctCloudState(cfg(), "/x", id, written!, undefined, { ...deps, readRecord: async () => written! })).toBe("corrected");
     expect(await decryptBlob(KEY, posts[1].blob)).toEqual({ status: "done", title: "t" });
+  });
+
+  test("NOM-95 field case: a done row sealed `moving`, marker now cloud → resealed `cloud`, posted and recorded", async () => {
+    const id = "cloud-corr-fg";
+    const blob = await encryptBlob(KEY, { status: "done", title: "t", cloud: "moving" });
+    const record = rec({ op: "done", lastEvent: "done", prio: 0, blob, pairingId: "p", cloud: "moving" });
+    const posts: any[] = [];
+    let written: SessionRecord | undefined;
+    const want = cloudState({ state: "cloud", since: 0 }); // a terminal- or phone-armed move: same marker
+    expect(want).toBe("cloud");
+    expect(await correctCloudState(cfg(), "/x", id, record, want, {
+      post: async (b: object) => { posts.push(b); return "delivered" as PostOutcome; },
+      now: () => NOW + 60_000, readRecord: async () => record, writeRecord: async (_p: string, r: SessionRecord) => { written = r; },
+    })).toBe("corrected");
+    expect(posts).toHaveLength(1);
+    expect(posts[0]).toMatchObject({ sessionId: id, op: "done" });
+    expect(await decryptBlob(KEY, posts[0].blob)).toEqual({ status: "done", title: "t", cloud: "cloud" });
+    expect(written).toMatchObject({ blob: posts[0].blob, cloud: "cloud" }); // the LAN feed reads this
   });
 
   test("a parked row is never retired (the marker, not the record, decides)", async () => {

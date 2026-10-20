@@ -279,6 +279,17 @@ export function appendFittedPlanAndDebug<T extends Record<string, unknown>>(
     : withPlan;
 }
 
+/** The blob with `cloud` set (or removed), the key LAST, after plan/dbg. Budgeted like every blob,
+ *  but `cloud` is part of the base: dbg, then plan, give way first, never `cloud`. Pure. */
+export function withCloudKey(plain: Record<string, unknown>, cloud: string | undefined): Record<string, unknown> {
+  const { cloud: _old, plan, dbg, ...base } = plain;
+  const fitted = appendFittedPlanAndDebug(cloud ? { ...base, cloud } : base,
+    typeof plan === "string" ? plan : undefined, typeof dbg === "string" ? dbg : undefined);
+  if (!cloud) return fitted;
+  const { cloud: c, ...rest } = fitted as Record<string, unknown>;
+  return { ...rest, cloud: c };
+}
+
 // --- unabridged copies for the LAN read op (NOM-44 phase 4) -------------------------------------
 //
 // Everything above fits text into the WORKER's 3072-char sealed-blob ceiling: a long plan keeps a
@@ -1040,6 +1051,9 @@ export interface SessionRecord {
    *  the phone's model badge on those frames instead of silently dropping it. Absent → unknown; the
    *  rebuilt blob then OMITS the optional `model` key (never an empty string). */
   model?: string;
+  /** NOM-93/95: the blob's `cloud` value as the watchdog last sealed it (correctCloudState), kept in the
+   *  clear so blobs rebuilt from record fields (LAN state, corrective done) carry it too. */
+  cloud?: string;
   /** The pairingId whose key SEALED this record's `blob`. A re-pair rotates both the pairing and the
    *  E2E key, but session records survive it — so the watchdog's staleness heartbeat (which re-sends
    *  `blob` verbatim) must check this against the CURRENT config.pairingId and skip on mismatch;

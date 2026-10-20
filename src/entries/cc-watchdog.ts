@@ -49,7 +49,7 @@ import { resolveOnRelay } from "../core/codex-remote-input";
 import { CODEX_PROXY_STDOUT_ENDED } from "../core/codex-proxy-transport";
 import type { CodexAppServerSocketState, DecisionHold, PlanPickerTraceDecision } from "../core/shared";
 import {
-  AgentKind, AgentKindWire, appendCodexBridgeMarker, boxPairedCached, appendFittedPlanAndDebug, atomicWrite, CC_DIR, CCOp, CCStatus, codexAppServerSocketAvailable, codexAppServerSocketState, Config, completePendingPairing, DECISION_HOLD_SUFFIX, decisionHoldFileName, formatPlanPickerDebug, formatWatchdogPidfile,
+  AgentKind, AgentKindWire, appendCodexBridgeMarker, boxPairedCached, withCloudKey, appendFittedPlanAndDebug, atomicWrite, CC_DIR, CCOp, CCStatus, codexAppServerSocketAvailable, codexAppServerSocketState, Config, completePendingPairing, DECISION_HOLD_SUFFIX, decisionHoldFileName, formatPlanPickerDebug, formatWatchdogPidfile,
   startCodexAppServerDaemon,
   GONE_STRIKE_LIMIT, loadConfig, loadPendingConfig, localApprovalsState,
   PAIR_HTML_FILE, PairPollResult, parseWatchdogPidfile, PendingConfig, pidAlive, PLUGIN_VERSION, readDecisionHoldAt, readPrefix, readSuffix, recordGoneStrike, removeRevokedConfig,
@@ -324,7 +324,8 @@ export async function buildDoneEnvelope(sessionId: string, record: SessionRecord
   // AgentAdapter.ambientPlan — OpenCode's live todo list). Claude/Codex plans are one-shot proposals
   // tied to an attention episode, so their correctives keep passing the `undefined` they always have
   // and stay byte-identical.
-  const blob = await encryptBlob(e2eKey, appendFittedPlanAndDebug(base, ambientPlan(agent, record), debug));
+  const fitted = appendFittedPlanAndDebug(base, ambientPlan(agent, record), debug);
+  const blob = await encryptBlob(e2eKey, record.cloud ? withCloudKey(fitted, record.cloud) : fitted);
   return { v: 2, sessionId, op: "done", prio: 0, ts: now, blob, ...startedAtField(record) };
 }
 
@@ -1725,16 +1726,7 @@ export function moveFailed(id: string, park: Park | undefined, rec: SessionRecor
   return !!m.failedAt && !park;
 }
 
-/** The blob with `cloud` set (or removed), the key LAST, after plan/dbg. Budgeted like every blob,
- *  but `cloud` is part of the base: dbg, then plan, give way first, never `cloud`. Pure. */
-export function withCloudKey(plain: Record<string, unknown>, cloud: CloudState | undefined): Record<string, unknown> {
-  const { cloud: _old, plan, dbg, ...base } = plain;
-  const fitted = appendFittedPlanAndDebug(cloud ? { ...base, cloud } : base,
-    typeof plan === "string" ? plan : undefined, typeof dbg === "string" ? dbg : undefined);
-  if (!cloud) return fitted;
-  const { cloud: c, ...rest } = fitted as Record<string, unknown>;
-  return { ...rest, cloud: c };
-}
+export { withCloudKey };
 
 /** Last cloud POST per session. A changed state posts at once; a failure waits CLOUD_RETRY_MS; a set
  *  key is re-posted every CLOUD_KEEPALIVE_MS so the done row outlives the worker's 1 h eviction while
@@ -1764,11 +1756,14 @@ export async function correctCloudState(
     cloudPosts.set(sessionId, { at: now, ok: outcome === "delivered" });
     if (outcome === "revoked") return "revoked";
     if (outcome !== "delivered") return "uncorrected";
-    if (changed) {
+    // `cloud` is also kept in the clear on the (0600, never-sent) record: the LAN feed and the corrective
+    // done author their own blobs from record fields and must carry it too, or a phone on this network
+    // keeps the old value (it takes `cloud` from the Mac's LAN frame, not the worker's).
+    if (changed || record.cloud !== want) {
       const fresh = await (deps.readRecord ?? readRecordAt)(path);
       // A hook that rewrote the record meanwhile wins; the next sweep re-applies the key to its blob.
       if (fresh && fresh.blob === record.blob) {
-        await (deps.writeRecord ?? ((p: string, r: SessionRecord) => atomicWrite(p, JSON.stringify(r), 0o600)))(path, { ...fresh, blob });
+        await (deps.writeRecord ?? ((p: string, r: SessionRecord) => atomicWrite(p, JSON.stringify(r), 0o600)))(path, { ...fresh, blob, cloud: want });
       }
     }
     return "corrected";
