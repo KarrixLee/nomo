@@ -32,7 +32,7 @@ import {
   readRecord, recordGoneStrike, removeRevokedConfig, resetGoneStrikes, SessionOrigin, SessionRecord, SESSIONS_DIR, sessionBranch, tracePlanPickerDecision, traceSession,
 } from "./shared";
 import { repairNotifyWiring } from "./notify-wire";
-import { parkHook } from "./park";
+import { parkHook, withParked } from "./park";
 import { stateHoldLive } from "./session-state";
 
 export { SESSION_TRACE_PATH } from "./shared";
@@ -1366,7 +1366,7 @@ export async function runHook(agent: AgentKind): Promise<void> {
           // blob; the worker literal-matches "on"/"off" — see localApprovalsState's contract note.
           "x-cc-approvals": await localApprovalsState(),
         },
-        body: JSON.stringify(envelope),
+        body: JSON.stringify(withParked(envelope)),
         signal: AbortSignal.timeout(2000),
       });
     } catch (e) {

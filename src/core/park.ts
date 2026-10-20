@@ -91,7 +91,8 @@ function land(id: string, p: Park, dir: string): Park | undefined {
 /** Same-window --back has staged the box copy. --back runs as a BACKGROUND Bash, so its turn usually
  *  ended long ago: if the window is idle (a turn end newer than both this run's start and the last turn
  *  opened) or gone, install now; otherwise leave it "landing" for the running turn's Stop. True =
- *  installed (state "back"). ponytail: a /nomo-cc: command typed between the check and the rename races
+ *  installed (state "back"). runStartedAt -1 (a phone-started back, no window turn behind it) makes
+ *  idle simply "no open turn". ponytail: a /nomo-cc: command typed between the check and the rename races
  *  it (ms); a per-window lock if that ever shows up. */
 export function stageLanding(id: string, l: { staged: string; target: string; resume: string }, runStartedAt: number,
   dir = PARK_DIR, alive: (pid: number) => boolean = pidAlive): boolean {
@@ -149,4 +150,72 @@ export function parkHook(input: Record<string, unknown>, dir = PARK_DIR): string
     if (p?.state === "back" && event === "SessionStart" && input.source === "resume") clearPark(id, dir);
   } catch { /* fail open */ }
   return undefined;
+}
+
+// --- NOM-93: the phone's "Bring back" -------------------------------------------------------------
+
+/** Is `id` in cloud.json `active` (pre-2.3.29 files: `current`)? A plain read: every cloud.json writer
+ *  (handoff's updateCloudAt) renames a complete tmp file into place, so a reader never sees a torn one;
+ *  the lock only serializes writers, and taking it here could stall the watchdog for its 15 s wait. */
+export function cloudActive(id: string, path = `${CC_DIR}/cloud.json`): boolean {
+  try {
+    const c = JSON.parse(readFileSync(path, "utf8"));
+    return (Array.isArray(c.active) ? c.active : [c.current]).includes(id);
+  } catch { return false; }
+}
+
+/** A phone-started `--back` for one session, as the watchdog tracks it (in memory). */
+export interface BackRun { running: boolean; code?: number | null }
+
+/** The blob's `cloud` key: what the phone shows for a parked session. Undefined → no key. */
+export type CloudState = "moving" | "cloud" | "returning" | "failed" | "back";
+export function cloudState(p: Park | undefined, run?: BackRun, locked = false): CloudState | undefined {
+  switch (p?.state) {
+    case "moving": return "moving";
+    case "landing": return "returning";
+    case "back": return "back";
+    case "cloud": return run?.running || locked ? "returning" : run && run.code !== 0 ? "failed" : "cloud";
+  }
+  return undefined;
+}
+
+/** A parked session the phone may act on keeps the command long-poll up. */
+export const parkWantsCommands = (p: Park | undefined): boolean =>
+  p?.state === "moving" || p?.state === "cloud" || p?.state === "landing";
+
+/** The `parked` flag on an event body (a blind boolean, like op): set while the session has a park
+ *  marker in cloud/landing/back (never moving or elsewhere), so the worker keeps the row but out of the
+ *  island. Omitted otherwise. */
+export function withParked<T extends object>(body: T, dir = PARK_DIR): T | (T & { parked: true }) {
+  const id = (body as { sessionId?: unknown }).sessionId;
+  const s = typeof id === "string" ? readPark(id, dir)?.state : undefined;
+  // Never "moving": that window's last turn is still running here and must stay on the island.
+  return s === "cloud" || s === "landing" || s === "back" ? { ...body, parked: true } : body;
+}
+
+/** One --back per session, whoever starts it (phone, /nomo-cc:back, CLI): an O_EXCL lockfile holding
+ *  the runner's pid; a dead pid's lock is taken over. ponytail: two takers of the same STALE lock can
+ *  race the unlink (both need a crashed runner first); a reader that catches the file between create
+ *  and write sees no pid and treats it as stale. */
+export const BACK_LOCK_DIR = `${CC_DIR}/cloud-back`;
+const backLockFile = (id: string, dir: string): string => join(dir, `${id.slice(0, 12)}.lock`);
+export function backLockHolder(id: string, dir = BACK_LOCK_DIR, alive: (pid: number) => boolean = pidAlive): number | undefined {
+  try {
+    const pid = Number(readFileSync(backLockFile(id, dir), "utf8"));
+    return Number.isInteger(pid) && pid > 0 && alive(pid) ? pid : undefined;
+  } catch { return undefined; }
+}
+export function takeBackLock(id: string, dir = BACK_LOCK_DIR, alive: (pid: number) => boolean = pidAlive): boolean {
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  for (let i = 0; i < 2; i++) {
+    try { writeFileSync(backLockFile(id, dir), String(process.pid), { flag: "wx", mode: 0o600 }); return true; } catch (e: any) {
+      if (e?.code !== "EEXIST") throw e;
+    }
+    if (backLockHolder(id, dir, alive) !== undefined) return false;
+    try { unlinkSync(backLockFile(id, dir)); } catch { /* raced */ }
+  }
+  return false;
+}
+export function releaseBackLock(id: string, dir = BACK_LOCK_DIR): void {
+  try { if (readFileSync(backLockFile(id, dir), "utf8") === String(process.pid)) unlinkSync(backLockFile(id, dir)); } catch { /* gone */ }
 }

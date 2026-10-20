@@ -79,7 +79,7 @@ import { renderPairPage } from "../core/pair-page";
 import { buildPairURL, DEFAULT_WORKER_URL } from "../core/pair-url";
 import { normalizeModelId } from "../core/adapter";
 import { cloudReadiness, gitProbe, isSecretName } from "../core/readiness";
-import { clearPark, PARK_DIR, readPark, stageLanding, writePark } from "../core/park";
+import { backLockHolder, clearPark, PARK_DIR, readPark, releaseBackLock, stageLanding, takeBackLock, writePark } from "../core/park";
 import { atomicWrite, CC_DIR, pidAlive, pidAncestors, pidCommand, readRecord, SESSIONS_DIR } from "../core/shared";
 import {
   cancelPending, claimPending, contextTokens, contextTokensOf, GONE_MSG, sizeWarning, TAIL_BYTES, handoffArgv, LATER_LOG, LATER_USAGE, laterStatus, needsPairing, parseLaterArg, type Pending, PENDING_PATH, readPending, resolveSession, waitThenHandoff,
@@ -1158,12 +1158,19 @@ export function resumeCommand(cwd: string, id: string, model?: string): string {
 export const sameWindowBackLine = (id: string): string => `Back. Type /resume ${id} to continue here.`;
 
 async function back(omg: string, args: Map<string, string | true>): Promise<void> {
-  const startedAt = Date.now();
+  // --phone (NOM-93: the watchdog runs this for the phone's Bring back): no turn of the window launched
+  // this run, so "idle" is just "no open turn" (stageLanding with -1), not "a turn ended since".
+  const startedAt = args.has("--phone") ? -1 : Date.now();
   const cloud = loadCloud();
   const here = args.get("--from-session") || process.env.CLAUDE_CODE_SESSION_ID;
   // From a parked window: that window's session (a rerun whose back was interrupted after staging is
   // "landing", and cloud.json no longer names it). From anywhere else: the only active one, else ask.
   const uuid = pickSession(args.get("--session"), hereSession(here, cloud), cloud);
+  // One back per session at a time, however it was started (phone, /nomo-cc:back, a terminal).
+  if (!takeBackLock(uuid)) {
+    throw new Error(`session ${uuid} is already being brought back (pid ${backLockHolder(uuid) ?? "?"}); let that finish.`);
+  }
+  process.once("exit", () => releaseBackLock(uuid)); // every exit path, incl. the SIGINT handler's
   // /nomo-cc:back from the parked window itself (NOM-90) lands the box copy under it: the user then types
   // /resume <id> there. Only a window parked as "cloud" (gated since the move, so it cannot have diverged
   // except through Nomo's own commands) qualifies. From anywhere else it opens a new Terminal, as before.

@@ -3,8 +3,9 @@ var __require = /* @__PURE__ */ createRequire(import.meta.url);
 
 // src/entries/cc-watchdog.ts
 import { readdir as readdir4, readFile as readFile8, unlink as unlink4 } from "node:fs/promises";
-import { readFileSync as readFileSync3, statSync as statSync3, unlinkSync as unlinkSync2 } from "node:fs";
-import { hostname as hostname4 } from "node:os";
+import { spawn as spawn3 } from "node:child_process";
+import { closeSync, existsSync as existsSync3, mkdirSync as mkdirSync2, openSync, readFileSync as readFileSync3, statSync as statSync3, unlinkSync as unlinkSync2, writeSync } from "node:fs";
+import { homedir, hostname as hostname4 } from "node:os";
 import { basename as basename6 } from "node:path";
 
 // src/core/crypto.ts
@@ -106,7 +107,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "2.3.31";
+var PLUGIN_VERSION = "2.3.34";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -5490,6 +5491,67 @@ function parkHook(input, dir = PARK_DIR) {
   } catch {}
   return;
 }
+function cloudActive(id, path = `${CC_DIR}/cloud.json`) {
+  try {
+    const c = JSON.parse(readFileSync2(path, "utf8"));
+    return (Array.isArray(c.active) ? c.active : [c.current]).includes(id);
+  } catch {
+    return false;
+  }
+}
+function cloudState(p, run, locked = false) {
+  switch (p?.state) {
+    case "moving":
+      return "moving";
+    case "landing":
+      return "returning";
+    case "back":
+      return "back";
+    case "cloud":
+      return run?.running || locked ? "returning" : run && run.code !== 0 ? "failed" : "cloud";
+  }
+  return;
+}
+var parkWantsCommands = (p) => p?.state === "moving" || p?.state === "cloud" || p?.state === "landing";
+function withParked(body, dir = PARK_DIR) {
+  const id = body.sessionId;
+  const s = typeof id === "string" ? readPark(id, dir)?.state : undefined;
+  return s === "cloud" || s === "landing" || s === "back" ? { ...body, parked: true } : body;
+}
+var BACK_LOCK_DIR = `${CC_DIR}/cloud-back`;
+var backLockFile = (id, dir) => join3(dir, `${id.slice(0, 12)}.lock`);
+function backLockHolder(id, dir = BACK_LOCK_DIR, alive = pidAlive) {
+  try {
+    const pid = Number(readFileSync2(backLockFile(id, dir), "utf8"));
+    return Number.isInteger(pid) && pid > 0 && alive(pid) ? pid : undefined;
+  } catch {
+    return;
+  }
+}
+function takeBackLock(id, dir = BACK_LOCK_DIR, alive = pidAlive) {
+  mkdirSync(dir, { recursive: true, mode: 448 });
+  for (let i = 0;i < 2; i++) {
+    try {
+      writeFileSync(backLockFile(id, dir), String(process.pid), { flag: "wx", mode: 384 });
+      return true;
+    } catch (e) {
+      if (e?.code !== "EEXIST")
+        throw e;
+    }
+    if (backLockHolder(id, dir, alive) !== undefined)
+      return false;
+    try {
+      unlinkSync(backLockFile(id, dir));
+    } catch {}
+  }
+  return false;
+}
+function releaseBackLock(id, dir = BACK_LOCK_DIR) {
+  try {
+    if (readFileSync2(backLockFile(id, dir), "utf8") === String(process.pid))
+      unlinkSync(backLockFile(id, dir));
+  } catch {}
+}
 
 // src/core/hook.ts
 var TOOL_DETAIL = { ...claudeToolDetail, ...codexToolDetail };
@@ -6176,7 +6238,7 @@ async function runHook(agent) {
           "x-cc-version": PLUGIN_VERSION,
           "x-cc-approvals": await localApprovalsState()
         },
-        body: JSON.stringify(envelope),
+        body: JSON.stringify(withParked(envelope)),
         signal: AbortSignal.timeout(2000)
       });
     } catch (e) {
@@ -8590,7 +8652,8 @@ async function postEvent(config, body, opts = {}) {
   const detail = opts.detail;
   const lanHint = await lanHintPublisher.take(config);
   try {
-    const payload = lanHint ? { ...body, lanHint } : body;
+    const parked = withParked(body);
+    const payload = lanHint ? { ...parked, lanHint } : parked;
     const res = await fetch(`${config.url}/v1/cc/event`, {
       method: "POST",
       headers: watchdogEventHeaders(config, await localApprovalsState()),
@@ -8622,7 +8685,8 @@ async function postEvent(config, body, opts = {}) {
 }
 var INTERRUPT_COMMAND_KIND = "interrupt-session";
 var PING_COMMAND_KIND = "ping";
-var COMMAND_KINDS_ALLOWED = new Set(["focus-terminal", INTERRUPT_COMMAND_KIND, PING_COMMAND_KIND]);
+var BRING_BACK_COMMAND_KIND = "bring-back";
+var COMMAND_KINDS_ALLOWED = new Set(["focus-terminal", INTERRUPT_COMMAND_KIND, PING_COMMAND_KIND, BRING_BACK_COMMAND_KIND]);
 var PING_NONCE_MAX = 64;
 function parsePingPayload(plain) {
   if (typeof plain !== "object" || plain === null)
@@ -8713,6 +8777,7 @@ function resetCommandState() {
   commandBuffer.length = 0;
   executedCommandIds.clear();
   seenCommandNonces.clear();
+  backRuns.clear();
 }
 function traceFocus(deps, event) {
   if (deps.trace) {
@@ -8843,6 +8908,10 @@ async function drainCommands(config, deps = {}) {
           continue;
         }
         rememberBounded(seenCommandNonces, payload.nonce, SEEN_NONCES_MAX);
+        if (payload.kind === BRING_BACK_COMMAND_KIND) {
+          traceFocus(deps, { ...base, result: bringBack(payload.sessionId, deps.bringBack) });
+          continue;
+        }
         if (entries === null)
           entries = await readRecords();
         const entry = entries.find((e) => e.sessionId === payload.sessionId);
@@ -8901,6 +8970,111 @@ async function drainCommands(config, deps = {}) {
     return focused;
   } catch {
     return 0;
+  }
+}
+var backRuns = new Map;
+function handoffCommand(exists = existsSync3, watchdogPath = WATCHDOG_PATH, ccDir = CC_DIR) {
+  const sibling = watchdogPath.replace(/cc-watchdog\.(mjs|ts)$/, "handoff.$1");
+  if (exists(sibling))
+    return [process.execPath, sibling];
+  const shim = `${ccDir}/hook-shim.sh`;
+  return exists(shim) ? [shim, "handoff"] : undefined;
+}
+function spawnBack(id, onExit) {
+  mkdirSync2(BACK_LOCK_DIR, { recursive: true, mode: 448 });
+  const log = `${BACK_LOCK_DIR}/${id.slice(0, 12)}.log`;
+  const note = (why) => {
+    try {
+      const f = openSync(log, "a", 384);
+      try {
+        writeSync(f, `[${new Date().toISOString()}] bring-back from the phone: ${why}
+`);
+      } finally {
+        closeSync(f);
+      }
+    } catch {}
+  };
+  const cmd = handoffCommand();
+  if (!cmd) {
+    note("Nomo's installed files were not found (plugin updated or removed?); reinstall or run /nomo-cc:back.");
+    throw new Error("no handoff entry");
+  }
+  const fd = openSync(log, "a", 384);
+  try {
+    const { CLAUDE_CODE_SESSION_ID: _drop, ...env } = process.env;
+    const child = spawn3(cmd[0], [...cmd.slice(1), "--back", "--session", id, "--from-session", id, "--phone"], { detached: true, stdio: ["ignore", fd, fd], env, cwd: homedir() });
+    child.on("error", (e) => {
+      note(`could not start ${cmd[0]}: ${e.message}`);
+      onExit(1);
+    }).on("exit", (code) => onExit(code));
+    child.unref();
+  } catch (e) {
+    note(`could not start ${cmd[0]}: ${e?.message ?? e}`);
+    throw e;
+  } finally {
+    closeSync(fd);
+  }
+}
+function bringBack(id, deps = {}) {
+  if ((deps.readPark ?? readPark)(id)?.state !== "cloud" || !(deps.cloudActive ?? cloudActive)(id))
+    return "not-parked";
+  if (backRuns.get(id)?.running || (deps.lockHeld ?? ((s) => backLockHolder(s) !== undefined))(id))
+    return "back-running";
+  const run = { running: true };
+  backRuns.set(id, run);
+  const done = (code) => {
+    if (run.running) {
+      run.running = false;
+      run.code = code;
+    }
+  };
+  try {
+    (deps.spawn ?? spawnBack)(id, done);
+  } catch {
+    done(1);
+    return "back-spawn-failed";
+  }
+  return "back-started";
+}
+function withCloudKey(plain, cloud) {
+  const { cloud: _old, plan, dbg, ...base } = plain;
+  const fitted = appendFittedPlanAndDebug(cloud ? { ...base, cloud } : base, typeof plan === "string" ? plan : undefined, typeof dbg === "string" ? dbg : undefined);
+  if (!cloud)
+    return fitted;
+  const { cloud: c, ...rest } = fitted;
+  return { ...rest, cloud: c };
+}
+var cloudPosts = new Map;
+var CLOUD_RETRY_MS = 30000;
+var CLOUD_KEEPALIVE_MS = 30 * 60000;
+async function correctCloudState(config, path, sessionId, record, want, deps = {}) {
+  try {
+    if (typeof record.blob !== "string" || record.blob.length === 0 || record.pairingId !== config.pairingId)
+      return "uncorrected";
+    const now = (deps.now ?? Date.now)();
+    const plain = await decryptBlob(config.e2eKey, record.blob);
+    const changed = plain.cloud !== want;
+    const prev = cloudPosts.get(sessionId);
+    if (prev && !prev.ok && now - prev.at < CLOUD_RETRY_MS)
+      return "uncorrected";
+    if (!changed && (want === undefined || prev?.ok && now - prev.at < CLOUD_KEEPALIVE_MS))
+      return "uncorrected";
+    const blob = changed ? await encryptBlob(config.e2eKey, withCloudKey(plain, want)) : record.blob;
+    const outcome = await (deps.post ?? ((body) => postEvent(config, body)))({ v: 2, sessionId, op: record.op ?? "update", prio: record.prio ?? 0, ts: now, blob, ...startedAtField(record) });
+    cloudPosts.set(sessionId, { at: now, ok: outcome === "delivered" });
+    if (outcome === "revoked")
+      return "revoked";
+    if (outcome !== "delivered")
+      return "uncorrected";
+    if (changed) {
+      const fresh = await (deps.readRecord ?? readRecordAt)(path);
+      if (fresh && fresh.blob === record.blob) {
+        await (deps.writeRecord ?? ((p, r) => atomicWrite(p, JSON.stringify(r), 384)))(path, { ...fresh, blob });
+      }
+    }
+    return "corrected";
+  } catch {
+    return "uncorrected";
   }
 }
 var drainChain = Promise.resolve();
@@ -9688,6 +9862,8 @@ async function retireDoneStale(config, path, sessionId, record, now, deps = {}) 
   try {
     if (!isRetireEligible(record, now))
       return "skip";
+    if ((deps.readPark ?? readPark)(sessionId))
+      return "skip";
     let tuiPid;
     if (record.agent === "codex") {
       const cached = typeof record.tuiPid === "number" && Number.isFinite(record.tuiPid) ? record.tuiPid : undefined;
@@ -9961,7 +10137,8 @@ async function sweep(config, deps = {}) {
       continue;
     }
     if (verdict === "keep") {
-      if (record && isCommandActiveSession(record))
+      const park = record ? readPark(sessionId) : undefined;
+      if (record && (isCommandActiveSession(record) || parkWantsCommands(park)))
         active++;
       let planVerificationHandled = false;
       if (config && record) {
@@ -9988,7 +10165,7 @@ async function sweep(config, deps = {}) {
         pendingDoneHandled = pendingDone === "corrected" || pendingDone === "pending";
       }
       if (config && record && !pendingDoneHandled) {
-        const retire = await retireDoneStale(config, path, sessionId, record, now);
+        const retire = await retireDoneStale(config, path, sessionId, record, now, { readPark: () => park });
         if (retire === "revoked")
           return { revoked: true };
         if (retire !== "skip") {
@@ -9999,6 +10176,13 @@ async function sweep(config, deps = {}) {
       }
       remaining++;
       if (config && record && !pendingDoneHandled) {
+        const cloudFix = await correctCloudState(config, path, sessionId, record, cloudState(park, backRuns.get(sessionId), park?.state === "cloud" && backLockHolder(sessionId) !== undefined));
+        if (cloudFix === "revoked")
+          return { revoked: true };
+        if (cloudFix === "corrected") {
+          delivered = true;
+          continue;
+        }
         const idleFix = await correctIdleProvisional(config, path, sessionId, record);
         if (idleFix === "revoked")
           return { revoked: true };
@@ -10498,8 +10682,11 @@ if (__require.main == __require.module) {
   process.exit(0);
 }
 export {
+  BRING_BACK_COMMAND_KIND,
   CLAUDE_AWAITING_PROMPT_REAP_MS,
   CLAUDE_IDLE_REAP_MAX_ATTEMPTS,
+  CLOUD_KEEPALIVE_MS,
+  CLOUD_RETRY_MS,
   CODEX_TUI_SESSION_START_SKEW_MS,
   COMMAND_CURSOR_PATH,
   COMMAND_FUTURE_SKEW_MS,
@@ -10524,6 +10711,8 @@ export {
   WAITING_HEARTBEAT_AFTER_MS,
   acceptLanAnswer,
   acceptLanCommand,
+  backRuns,
+  bringBack,
   buildDoneEnvelope,
   buildEndEnvelope,
   buildHeartbeatEnvelope,
@@ -10542,6 +10731,7 @@ export {
   codexTailPendingApproval,
   commandIsFresh,
   commandWaitLoop,
+  correctCloudState,
   correctIdleClaude,
   correctInterrupt,
   correctPendingApproval,
@@ -10561,6 +10751,7 @@ export {
   extractCommands,
   fileCursorStore,
   goneStrikeShouldTeardown,
+  handoffCommand,
   hasInterruptMarker,
   heartbeatKind,
   isClaudeIdleReapEligible,
@@ -10604,5 +10795,6 @@ export {
   tailShowsInterrupt,
   titleRepairedRecord,
   watchdogEventHeaders,
+  withCloudKey,
   withDeadline
 };

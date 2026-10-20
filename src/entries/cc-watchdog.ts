@@ -29,8 +29,9 @@
 // PORTABLE: no `Bun.*` — file IO via node:fs/promises helpers.
 
 import { readdir, readFile, unlink } from "node:fs/promises";
-import { readFileSync, statSync, unlinkSync } from "node:fs";
-import { hostname } from "node:os";
+import { spawn } from "node:child_process";
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, statSync, unlinkSync, writeSync } from "node:fs";
+import { homedir, hostname } from "node:os";
 import { basename } from "node:path";
 import { Bytes, decryptBlob, encryptBlob } from "../core/crypto";
 import { adapterFor, AgentAdapter, allAdapters, codexAdapter, codexTurnActiveFromTail, CodexPlanPickerEvidence, DiscoveredSession } from "../core/adapter";
@@ -53,9 +54,10 @@ import {
   GONE_STRIKE_LIMIT, loadConfig, loadPendingConfig, localApprovalsState,
   PAIR_HTML_FILE, PairPollResult, parseWatchdogPidfile, PendingConfig, pidAlive, PLUGIN_VERSION, readDecisionHoldAt, readPrefix, readSuffix, recordGoneStrike, removeRevokedConfig,
   resetGoneStrikes, resolveGitDir, SessionRecord, sessionBranch, SESSIONS_DIR, traceSession, tracePlanPickerDecision, watchdogBuildDiffers,
-  watchdogBuildStamp, watchdogHolderIsLive, WATCHDOG_PID_PATH, writeInterruptFlagAt,
+  watchdogBuildStamp, watchdogHolderIsLive, WATCHDOG_PATH, WATCHDOG_PID_PATH, writeInterruptFlagAt,
 } from "../core/shared";
 import { rememberBounded } from "../core/bounded-set";
+import { BackRun, backLockHolder, BACK_LOCK_DIR, cloudActive, cloudState, CloudState, Park, parkWantsCommands, readPark, withParked } from "../core/park";
 
 // The transcript-tail interrupt PARSERS live in the agent adapters now (the two detections are
 // structurally different). Re-export them so existing importers/tests that reference "./cc-watchdog"
@@ -1036,7 +1038,8 @@ async function postEvent(
   // published, and must be re-attached to the next one.
   const lanHint = await lanHintPublisher.take(config);
   try {
-    const payload = lanHint ? { ...body, lanHint } : body;
+    const parked = withParked(body); // NOM-93: blind flag, keeps a parked row out of the island
+    const payload = lanHint ? { ...parked, lanHint } : parked;
     const res = await fetch(`${config.url}/v1/cc/event`, {
       method: "POST",
       headers: watchdogEventHeaders(config, await localApprovalsState()),
@@ -1119,7 +1122,9 @@ export interface CommandPayload {
  *  see. Anything else decrypts fine and is then rejected as bad-kind. */
 const INTERRUPT_COMMAND_KIND = "interrupt-session";
 const PING_COMMAND_KIND = "ping";
-const COMMAND_KINDS_ALLOWED = new Set(["focus-terminal", INTERRUPT_COMMAND_KIND, PING_COMMAND_KIND]);
+/** NOM-93: run `/nomo-cc:back` for a session parked in the cloud, from the phone. */
+export const BRING_BACK_COMMAND_KIND = "bring-back";
+const COMMAND_KINDS_ALLOWED = new Set(["focus-terminal", INTERRUPT_COMMAND_KIND, PING_COMMAND_KIND, BRING_BACK_COMMAND_KIND]);
 
 /** A "Delivery" latency ping: {"kind":"ping","sessionId":"-","nonce":"<uuid>","sentAt":<ms>}. It names
  *  no session and carries `sentAt` instead of `ts`, so drainCommands answers it right after the tag
@@ -1239,6 +1244,7 @@ export function resetCommandState(): void {
   commandBuffer.length = 0;
   executedCommandIds.clear();
   seenCommandNonces.clear();
+  backRuns.clear();
 }
 
 /** What a command ended up doing — the ONLY debugging channel a user has for this feature, so every
@@ -1266,7 +1272,11 @@ export type FocusTraceResult =
                          // shared daemon returns when the daemon is up (the server refuses an unknown thread)
   | "bridge-unavailable" // interrupt-session: no ready Codex bridge (daemon down, bridge parked or stopping)
   | "no-turn"            // interrupt-session: the Codex record carries no active turn id
-  | "pong";              // ping: a sealed pong was POSTed to /v1/cc/pong (status in the trace)
+  | "pong"               // ping: a sealed pong was POSTed to /v1/cc/pong (status in the trace)
+  | "not-parked"         // bring-back: no "cloud" park marker, or cloud.json does not list it active
+  | "back-running"       // bring-back: a phone-started back for this session is still running
+  | "back-started"       // bring-back: handoff --back --phone spawned
+  | "back-spawn-failed"; // bring-back: the spawn threw (the row reports cloud:"failed")
 
 /** The module's generic best-effort trace, with the same argv guard tracePicker uses: pure unit calls run
  *  inside `bun test` with the production HOME visible and must never pollute the user's live trace. Named
@@ -1285,6 +1295,8 @@ function traceFocus(deps: { trace?: (event: object) => void }, event: object): v
  *  Decryption is deliberately NOT a seam: tests seal real blobs with the repo's own crypto helpers,
  *  so they prove interop with the phone's envelope rather than a mock's. */
 export interface DrainCommandsDeps {
+  /** Bring-back seams (marker read, cloud.json, the spawn). */
+  bringBack?: BringBackDeps;
   /** Take (and clear) the pending sealed commands. Defaults to draining the module buffer. */
   take?: () => SealedCommand[];
   /** Every session record on disk, id + record. Defaults to the sweep's own reader. */
@@ -1491,6 +1503,12 @@ export async function drainCommands(config: Config, deps: DrainCommandsDeps = {}
           continue;
         }
         rememberBounded(seenCommandNonces, payload.nonce, SEEN_NONCES_MAX);
+        // 6b. Bring back: gated on the park marker + cloud.json, not on a session record (a parked
+        // window's row may be the only trace of it, and the marker is the authority here).
+        if (payload.kind === BRING_BACK_COMMAND_KIND) {
+          traceFocus(deps, { ...base, result: bringBack(payload.sessionId, deps.bringBack) });
+          continue;
+        }
         // 7. A command may only ever name a session THIS machine tracks. The phone seals
         // CCSessionBrief.sessionId verbatim, and BOTH halves of the id-form question check out
         // (verified 2026-07-31, belt and braces):
@@ -1574,6 +1592,115 @@ export async function drainCommands(config: Config, deps: DrainCommandsDeps = {}
     return focused;
   } catch {
     return 0; // a command must never derail the sweep
+  }
+}
+
+// --- Bring back (NOM-93) -------------------------------------------------------------------------
+
+/** Phone-started backs, by session id. In memory: a daemon restart forgets a failure (the row then
+ *  reads cloud:"cloud" again, which is still true and retryable). */
+export const backRuns = new Map<string, BackRun>();
+/** How to run handoff, resolved at SPAWN time: the entry next to this bundle (dist/handoff.mjs;
+ *  entries/handoff.ts raw) while it exists, else the version-stable hook shim (a plugin update deletes
+ *  the old version dir out from under a long-lived daemon). Undefined → neither is there. */
+export function handoffCommand(exists: (p: string) => boolean = existsSync, watchdogPath = WATCHDOG_PATH, ccDir = CC_DIR): string[] | undefined {
+  const sibling = watchdogPath.replace(/cc-watchdog\.(mjs|ts)$/, "handoff.$1");
+  if (exists(sibling)) return [process.execPath, sibling];
+  const shim = `${ccDir}/hook-shim.sh`;
+  return exists(shim) ? [shim, "handoff"] : undefined;
+}
+
+export interface BringBackDeps {
+  readPark?: (id: string) => Park | undefined;
+  cloudActive?: (id: string) => boolean;
+  /** Start the back; call `onExit` once with its exit code. */
+  spawn?: (id: string, onExit: (code: number | null) => void) => void;
+  /** A --back for this session already running anywhere (its lockfile's pid is alive). */
+  lockHeld?: (id: string) => boolean;
+}
+
+/** Detached `handoff --back --phone`, output to cloud-back/<id12>.log. The child loads its own keys
+ *  (~/.nomo-spike.env) exactly as a terminal run does; nothing secret goes on argv. */
+function spawnBack(id: string, onExit: (code: number | null) => void): void {
+  mkdirSync(BACK_LOCK_DIR, { recursive: true, mode: 0o700 });
+  const log = `${BACK_LOCK_DIR}/${id.slice(0, 12)}.log`;
+  const note = (why: string): void => {
+    try { const f = openSync(log, "a", 0o600); try { writeSync(f, `[${new Date().toISOString()}] bring-back from the phone: ${why}\n`); } finally { closeSync(f); } } catch { /* best effort */ }
+  };
+  const cmd = handoffCommand();
+  if (!cmd) { note("Nomo's installed files were not found (plugin updated or removed?); reinstall or run /nomo-cc:back."); throw new Error("no handoff entry"); }
+  const fd = openSync(log, "a", 0o600);
+  try {
+    // The daemon may have inherited the session id of whichever Claude Code hook started it.
+    const { CLAUDE_CODE_SESSION_ID: _drop, ...env } = process.env;
+    const child = spawn(cmd[0], [...cmd.slice(1), "--back", "--session", id, "--from-session", id, "--phone"],
+      { detached: true, stdio: ["ignore", fd, fd], env, cwd: homedir() });
+    child.on("error", (e) => { note(`could not start ${cmd[0]}: ${e.message}`); onExit(1); }).on("exit", (code) => onExit(code));
+    child.unref();
+  } catch (e: any) { note(`could not start ${cmd[0]}: ${e?.message ?? e}`); throw e; } finally { closeSync(fd); }
+}
+
+/** Act on an authenticated, fresh, unreplayed bring-back. Only a session parked "cloud" AND listed
+ *  active in cloud.json qualifies; one back per session at a time. */
+export function bringBack(id: string, deps: BringBackDeps = {}): FocusTraceResult {
+  if ((deps.readPark ?? readPark)(id)?.state !== "cloud" || !(deps.cloudActive ?? cloudActive)(id)) return "not-parked";
+  if (backRuns.get(id)?.running || (deps.lockHeld ?? ((s: string) => backLockHolder(s) !== undefined))(id)) return "back-running";
+  const run: BackRun = { running: true };
+  backRuns.set(id, run);
+  const done = (code: number | null): void => { if (run.running) { run.running = false; run.code = code; } };
+  try { (deps.spawn ?? spawnBack)(id, done); } catch { done(1); return "back-spawn-failed"; }
+  return "back-started";
+}
+
+/** The blob with `cloud` set (or removed), the key LAST, after plan/dbg. Budgeted like every blob,
+ *  but `cloud` is part of the base: dbg, then plan, give way first, never `cloud`. Pure. */
+export function withCloudKey(plain: Record<string, unknown>, cloud: CloudState | undefined): Record<string, unknown> {
+  const { cloud: _old, plan, dbg, ...base } = plain;
+  const fitted = appendFittedPlanAndDebug(cloud ? { ...base, cloud } : base,
+    typeof plan === "string" ? plan : undefined, typeof dbg === "string" ? dbg : undefined);
+  if (!cloud) return fitted;
+  const { cloud: c, ...rest } = fitted as Record<string, unknown>;
+  return { ...rest, cloud: c };
+}
+
+/** Last cloud POST per session. A changed state posts at once; a failure waits CLOUD_RETRY_MS; a set
+ *  key is re-posted every CLOUD_KEEPALIVE_MS so the done row outlives the worker's 1 h eviction while
+ *  the session is parked (a parked session can sit in the cloud for hours). */
+const cloudPosts = new Map<string, { at: number; ok: boolean }>();
+export const CLOUD_RETRY_MS = 30_000;
+export const CLOUD_KEEPALIVE_MS = 30 * 60_000;
+
+/** Bring record.blob's `cloud` key in line with `want`: re-seal, POST at the record's own op/prio/status
+ *  (a done row stays done, so the island is not disturbed), store as record.blob (the heartbeat and LAN
+ *  frames read it). The worker sees one more sealed blob, nothing else. */
+export async function correctCloudState(
+  config: Config, path: string, sessionId: string, record: SessionRecord, want: CloudState | undefined,
+  deps: { post?: (body: object) => Promise<PostOutcome>; now?: () => number; readRecord?: (path: string) => Promise<SessionRecord | null>; writeRecord?: (path: string, rec: SessionRecord) => Promise<void> } = {},
+): Promise<"corrected" | "uncorrected" | "revoked"> {
+  try {
+    if (typeof record.blob !== "string" || record.blob.length === 0 || record.pairingId !== config.pairingId) return "uncorrected";
+    const now = (deps.now ?? Date.now)();
+    const plain = await decryptBlob(config.e2eKey, record.blob) as Record<string, unknown>;
+    const changed = plain.cloud !== want;
+    const prev = cloudPosts.get(sessionId);
+    if (prev && !prev.ok && now - prev.at < CLOUD_RETRY_MS) return "uncorrected";
+    if (!changed && (want === undefined || (prev?.ok && now - prev.at < CLOUD_KEEPALIVE_MS))) return "uncorrected";
+    const blob = changed ? await encryptBlob(config.e2eKey, withCloudKey(plain, want)) : record.blob;
+    const outcome = await (deps.post ?? ((body: object) => postEvent(config, body)))(
+      { v: 2, sessionId, op: record.op ?? "update", prio: record.prio ?? 0, ts: now, blob, ...startedAtField(record) });
+    cloudPosts.set(sessionId, { at: now, ok: outcome === "delivered" });
+    if (outcome === "revoked") return "revoked";
+    if (outcome !== "delivered") return "uncorrected";
+    if (changed) {
+      const fresh = await (deps.readRecord ?? readRecordAt)(path);
+      // A hook that rewrote the record meanwhile wins; the next sweep re-applies the key to its blob.
+      if (fresh && fresh.blob === record.blob) {
+        await (deps.writeRecord ?? ((p: string, r: SessionRecord) => atomicWrite(p, JSON.stringify(r), 0o600)))(path, { ...fresh, blob });
+      }
+    }
+    return "corrected";
+  } catch {
+    return "uncorrected";
   }
 }
 
@@ -3144,6 +3271,8 @@ export interface RetireDeps {
   /** Diagnostics seam. Defaults to the session trace (argv-guarded). Retirement DELETES the row on both
    *  sides, so without a breadcrumb a vanished session is indistinguishable from one that was never sent. */
   trace?: (event: object) => void;
+  /** The session's park marker (NOM-93). */
+  readPark?: (id: string) => Park | undefined;
 }
 
 /** The idle-done retire net for one kept session. Gated by isRetireEligible, then it POSTs a
@@ -3184,6 +3313,9 @@ export async function retireDoneStale(
   });
   try {
     if (!isRetireEligible(record, now)) return "skip";
+    // A parked window's row is the phone's handle on its cloud session (NOM-93): never retired while
+    // the marker exists. The marker clears on /resume, SessionEnd, or the window's pid dying.
+    if ((deps.readPark ?? readPark)(sessionId)) return "skip";
     let tuiPid: number | undefined;
     if (record.agent === "codex") {
       const cached = typeof record.tuiPid === "number" && Number.isFinite(record.tuiPid)
@@ -3664,7 +3796,8 @@ async function sweep(config: Config | null, deps: SweepDeps = {}): Promise<Sweep
       continue;
     }
     if (verdict === "keep") {
-      if (record && isCommandActiveSession(record)) active++;
+      const park = record ? readPark(sessionId) : undefined;
+      if (record && (isCommandActiveSession(record) || parkWantsCommands(park))) active++;
       // Long-lived Plan verification runs before the done-debt net: a killed/old Stop may have left a
       // donePending record whose terminal state is precisely what still needs classification.
       let planVerificationHandled = false;
@@ -3697,7 +3830,7 @@ async function sweep(config: Config | null, deps: SweepDeps = {}): Promise<Sweep
       // op:end. Codex retains only an invisible real-TUI owner marker, preventing discoverLive from
       // undoing the retirement; other rows delete normally. Working / needsAttention never qualify.
       if (config && record && !pendingDoneHandled) {
-        const retire = await retireDoneStale(config, path, sessionId, record, now);
+        const retire = await retireDoneStale(config, path, sessionId, record, now, { readPark: () => park });
         if (retire === "revoked") return { revoked: true };
         if (retire !== "skip") {
           if (retire === "retired") delivered = true; // its op:end 2xx'd → the pairing is alive
@@ -3708,6 +3841,11 @@ async function sweep(config: Config | null, deps: SweepDeps = {}): Promise<Sweep
       // `!pendingDoneHandled`: the undelivered-done net took this session this sweep, so nothing below
       // may POST for it (the in-memory `record` is also stale w.r.t. that net's rewrite).
       if (config && record && !pendingDoneHandled) {
+        // NOM-93: a parked session's blob carries `cloud` (what the phone's Bring back shows). A
+        // corrective owns the session this sweep (the snapshot is stale after its rewrite).
+        const cloudFix = await correctCloudState(config, path, sessionId, record, cloudState(park, backRuns.get(sessionId), park?.state === "cloud" && backLockHolder(sessionId) !== undefined));
+        if (cloudFix === "revoked") return { revoked: true };
+        if (cloudFix === "corrected") { delivered = true; continue; }
         // Idle-provisional corrective FIRST: a discovery row advertised "working" whose TUI has gone
         // idle gets its one op:done before anything else could heartbeat the stale working blob.
         // Gated to provisional records of a probe-capable agent (codex); everything else no-ops.

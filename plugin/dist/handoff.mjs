@@ -384,7 +384,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "2.3.31";
+var PLUGIN_VERSION = "2.3.34";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -3491,6 +3491,67 @@ function parkHook(input, dir = PARK_DIR) {
   } catch {}
   return;
 }
+function cloudActive(id, path = `${CC_DIR}/cloud.json`) {
+  try {
+    const c = JSON.parse(readFileSync3(path, "utf8"));
+    return (Array.isArray(c.active) ? c.active : [c.current]).includes(id);
+  } catch {
+    return false;
+  }
+}
+function cloudState(p, run, locked = false) {
+  switch (p?.state) {
+    case "moving":
+      return "moving";
+    case "landing":
+      return "returning";
+    case "back":
+      return "back";
+    case "cloud":
+      return run?.running || locked ? "returning" : run && run.code !== 0 ? "failed" : "cloud";
+  }
+  return;
+}
+var parkWantsCommands = (p) => p?.state === "moving" || p?.state === "cloud" || p?.state === "landing";
+function withParked(body, dir = PARK_DIR) {
+  const id = body.sessionId;
+  const s = typeof id === "string" ? readPark(id, dir)?.state : undefined;
+  return s === "cloud" || s === "landing" || s === "back" ? { ...body, parked: true } : body;
+}
+var BACK_LOCK_DIR = `${CC_DIR}/cloud-back`;
+var backLockFile = (id, dir) => join4(dir, `${id.slice(0, 12)}.lock`);
+function backLockHolder(id, dir = BACK_LOCK_DIR, alive = pidAlive) {
+  try {
+    const pid = Number(readFileSync3(backLockFile(id, dir), "utf8"));
+    return Number.isInteger(pid) && pid > 0 && alive(pid) ? pid : undefined;
+  } catch {
+    return;
+  }
+}
+function takeBackLock(id, dir = BACK_LOCK_DIR, alive = pidAlive) {
+  mkdirSync(dir, { recursive: true, mode: 448 });
+  for (let i = 0;i < 2; i++) {
+    try {
+      writeFileSync(backLockFile(id, dir), String(process.pid), { flag: "wx", mode: 384 });
+      return true;
+    } catch (e) {
+      if (e?.code !== "EEXIST")
+        throw e;
+    }
+    if (backLockHolder(id, dir, alive) !== undefined)
+      return false;
+    try {
+      unlinkSync(backLockFile(id, dir));
+    } catch {}
+  }
+  return false;
+}
+function releaseBackLock(id, dir = BACK_LOCK_DIR) {
+  try {
+    if (readFileSync3(backLockFile(id, dir), "utf8") === String(process.pid))
+      unlinkSync(backLockFile(id, dir));
+  } catch {}
+}
 
 // src/core/handoff-later.ts
 import { appendFileSync as appendFileSync2, closeSync, fstatSync, linkSync, openSync, readFileSync as readFileSync4, readSync, unlinkSync as unlinkSync2, writeFileSync as writeFileSync2 } from "node:fs";
@@ -5609,10 +5670,14 @@ function resumeCommand(cwd, id, model) {
 }
 var sameWindowBackLine = (id) => `Back. Type /resume ${id} to continue here.`;
 async function back(omg, args) {
-  const startedAt = Date.now();
+  const startedAt = args.has("--phone") ? -1 : Date.now();
   const cloud = loadCloud();
   const here = args.get("--from-session") || process.env.CLAUDE_CODE_SESSION_ID;
   const uuid = pickSession(args.get("--session"), hereSession(here, cloud), cloud);
+  if (!takeBackLock(uuid)) {
+    throw new Error(`session ${uuid} is already being brought back (pid ${backLockHolder(uuid) ?? "?"}); let that finish.`);
+  }
+  process.once("exit", () => releaseBackLock(uuid));
   const parkedAtStart = readPark(uuid);
   const sameWindow = here === uuid;
   if (sameWindow && parkedAtStart?.state === "landing") {
