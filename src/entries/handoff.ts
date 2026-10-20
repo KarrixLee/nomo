@@ -78,8 +78,8 @@ import { b64url, type Bytes, fromB64url } from "../core/crypto";
 import { renderPairPage } from "../core/pair-page";
 import { buildPairURL, DEFAULT_WORKER_URL } from "../core/pair-url";
 import { normalizeModelId } from "../core/adapter";
-import { cloudReadiness, gitProbe, isSecretName } from "../core/readiness";
-import { backLockHolder, clearPark, cloudActive, PARK_DIR, readPark, releaseBackLock, stageLanding, takeBackLock, writePark } from "../core/park";
+import { cloudReadiness, gitProbe, isSecretName, trackedSecretFiles } from "../core/readiness";
+import { backLockHolder, clearPark, cloudActive, PARK_DIR, writeMoveResult, readPark, releaseBackLock, stageLanding, takeBackLock, writePark } from "../core/park";
 import { atomicWrite, CC_DIR, pidAlive, pidAncestors, pidCommand, readRecord, SESSIONS_DIR } from "../core/shared";
 import {
   cancelPending, claimPending, DEFAULT_THEN, phoneMoveCheck, settleThenStamp, contextTokens, contextTokensOf, GONE_MSG, sizeWarning, TAIL_BYTES, handoffArgv, LATER_LOG, LATER_USAGE, laterStatus, needsPairing, parseLaterArg, type Pending, PENDING_PATH, readPending, resolveSession, waitThenHandoff,
@@ -1549,7 +1549,7 @@ async function phoneLater(args: Map<string, string | true>, keys: { omg?: string
     active: cloudActive(session),
     needsPairing: needsPairing(loadCloud(), worker),
     transcriptExists: (cwd) => existsSync(join(home, ".claude", "projects", projectDirName(cwd), `${session}.jsonl`)),
-    readiness,
+    trackedSecrets: trackedSecretFiles,
   });
   if ("refuse" in ok) throw new Error(`not moving ${session}: ${ok.refuse}.`);
   let root: string | undefined;
@@ -1571,6 +1571,7 @@ async function afterExit(args: Map<string, string | true>, worker: string): Prom
   process.exitCode = await waitThenHandoff({ helperPid: process.pid, session, claudePid, state: "waiting", startedAt: Date.now(), message }, {
     pending: PENDING_PATH,
     parkDir: PARK_DIR,
+    result: (ok) => writeMoveResult(session, ok),
     alive: pidAlive,
     now: Date.now,
     sleep: (ms) => new Promise((r) => setTimeout(r, ms)),

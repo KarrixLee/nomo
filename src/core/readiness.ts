@@ -42,9 +42,6 @@ const LOCKS: [string, string][] = [
 ];
 const LOCK_NAMES = new Set(LOCKS.map(([n]) => n));
 
-/** The phrase every tracked-secret warning carries: the phone's move-to-cloud refuses on it (NOM-94). */
-export const TRACKED_SECRET = "looks like a secret and is tracked in git";
-
 /** A file whose name says it likely holds a secret. Example/template env files are not secrets. */
 export function isSecretName(name: string): boolean {
   if (/^\.env(\..+)?$/.test(name)) return !/\.(example|sample|template|dist|defaults?)$/i.test(name);
@@ -114,7 +111,7 @@ export function cloudReadiness(root: string, deps: ReadinessDeps): string {
   const shipped = w.secrets.filter((s) => tracked.has(s));
   const kept = w.secrets.filter((s) => !tracked.has(s));
   if (kept.length) missing.push(`${listNames(kept)} (${kept.length} file${kept.length > 1 ? "s" : ""}, never sent)`);
-  for (const s of shipped) warnings.push(`Heads-up: ${s} ${TRACKED_SECRET}: it WILL be on the box.`);
+  for (const s of shipped) warnings.push(`Heads-up: ${s} looks like a secret and is tracked in git: it WILL be on the box.`);
 
   // Deps/builds the box must reinstall: git-ignored ones (git), node_modules (non-git: the folder tar skips it).
   const gone = w.deps.filter((d) => git ? ignored.has(d) && !tracked.has(d) : d === "node_modules" || d.endsWith("/node_modules"));
@@ -172,4 +169,21 @@ export function gitProbe(root: string): GitProbe | undefined {
     },
     remotes: () => run(["remote", "-v"]),
   };
+}
+
+/** NOM-94: the phone's move-to-cloud gate. Every file git TRACKS in cwd's repo (they all travel in the
+ *  bundle) whose name isSecretName matches: no walk caps, dot-dirs included. [] outside a git repo
+ *  (nothing is tracked); undefined when git itself fails, which the caller must treat as a refusal. */
+export function trackedSecretFiles(cwd: string): string[] | undefined {
+  const git = (args: string[]): string => execFileSync("git", ["-C", cwd, ...args], {
+    encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, LC_ALL: "C" }, maxBuffer: 256 * 1024 * 1024,
+  });
+  let top: string;
+  try { top = git(["rev-parse", "--show-toplevel"]).trim(); } catch (e: any) {
+    return /not a git repository/.test(String(e?.stderr ?? "")) ? [] : undefined;
+  }
+  try {
+    return execFileSync("git", ["-C", top, "ls-files", "-z"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], maxBuffer: 256 * 1024 * 1024 })
+      .split("\0").filter((f) => f && isSecretName(f.split("/").pop()!));
+  } catch { return undefined; }
 }

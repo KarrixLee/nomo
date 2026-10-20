@@ -1,5 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { trackedSecretFiles } from "./readiness";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -328,7 +330,7 @@ describe("phone move-to-cloud (NOM-94)", () => {
     ancestorsOf: () => [300],
     parked: false, active: false, needsPairing: false,
     transcriptExists: () => true,
-    readiness: () => "Cloud check: Heads-up: node_modules is not sent.",
+    trackedSecrets: () => [],
     ...o,
   });
   const refuse = (o: Partial<PhoneMoveFacts>): string => {
@@ -360,21 +362,37 @@ describe("phone move-to-cloud (NOM-94)", () => {
     expect(refuse({ record: { pid: 400 } })).toMatch(/transcript/);
   });
 
-  test("a git-tracked secret refuses; an untracked one does not", () => {
-    expect(refuse({ readiness: () => "Cloud check: Heads-up: .env looks like a secret and is tracked in git: it WILL be on the box." })).toMatch(/secret/);
-    expect(phoneMoveCheck(facts({ readiness: () => "Cloud check: .env stays on this Mac." }))).toEqual({ claudePid: 400, cwd: "/p/app" });
+  test("a git-tracked secret refuses; a git error refuses; none (or no git) passes", () => {
+    expect(refuse({ trackedSecrets: () => [".vscode/.env"] })).toMatch(/\.vscode\/\.env looks like a secret/);
+    expect(refuse({ trackedSecrets: () => undefined })).toMatch(/git could not list/);
+    expect(phoneMoveCheck(facts({ trackedSecrets: () => [] }))).toEqual({ claudePid: 400, cwd: "/p/app" });
+  });
+
+  test("trackedSecretFiles: real git, dot-dirs included; non-git = none; a git error = undefined", () => {
+    const git = (cwd: string, ...a: string[]) => execFileSync("git", ["-C", cwd, ...a], { stdio: "ignore" });
+    const repo = tmp();
+    git(repo, "init", "-q");
+    for (const [f, body] of [[".secrets/credentials.json", "{}"], [".vscode/.env", "K=1"], ["src/a.ts", ""], [".env.example", ""], ["untracked/.env", "K=2"]]) {
+      mkdirSync(join(repo, f, ".."), { recursive: true });
+      writeFileSync(join(repo, f), body);
+    }
+    git(repo, "add", ".secrets/credentials.json", ".vscode/.env", "src/a.ts", ".env.example");
+    expect(trackedSecretFiles(join(repo, "src"))?.sort()).toEqual([".secrets/credentials.json", ".vscode/.env"]);
+    expect(trackedSecretFiles(tmp())).toEqual([]); // no repo: nothing is tracked
+    writeFileSync(join(repo, ".git", "index"), "garbage"); // a corrupt index: ls-files fails
+    expect(trackedSecretFiles(repo)).toBeUndefined();
   });
 
   const sleeps: number[] = [];
   const sleep = async (ms: number) => { sleeps.push(ms); };
 
-  test("idle after the settle → turnEndedAt is stamped (the helper moves now)", async () => {
+  test("idle at both settle reads → turnEndedAt is stamped (the helper moves now)", async () => {
     for (const rec of [{ op: "done" }, { lastEvent: "done" }, { lastEvent: "sessionStart", awaitingPrompt: true }]) {
       const dir = tmp();
       writePark(A, { state: "moving", pid: 400 }, dir);
       sleeps.length = 0;
       expect(await settleThenStamp(A, { readRecord: async () => rec, sleep, parkDir: dir })).toBe(true);
-      expect(sleeps).toEqual([2000]);
+      expect(sleeps).toEqual([2000, 2000]);
       expect(readPark(A, dir)?.turnEndedAt).toBeGreaterThan(0);
       expect(readPark(A, dir)?.state).toBe("moving");
     }
@@ -389,6 +407,14 @@ describe("phone move-to-cloud (NOM-94)", () => {
     }
   });
 
+  test("idle at 2 s but working at 4 s → not stamped", async () => {
+    const dir = tmp();
+    writePark(A, { state: "moving", pid: 400 }, dir);
+    const reads = [{ op: "done" }, { op: "update", lastEvent: "working" }];
+    expect(await settleThenStamp(A, { readRecord: async () => reads.shift()!, sleep, parkDir: dir, settleMs: 0 })).toBe(false);
+    expect(readPark(A, dir)?.turnEndedAt).toBeUndefined();
+  });
+
   test("a Stop that already stamped is kept; a marker gone meanwhile is not recreated", async () => {
     const dir = tmp();
     writePark(A, { state: "moving", pid: 400, turnEndedAt: 7 }, dir);
@@ -398,4 +424,21 @@ describe("phone move-to-cloud (NOM-94)", () => {
     expect(await settleThenStamp(A, { readRecord: async () => ({ op: "done" }), sleep, parkDir: gone })).toBe(false);
     expect(readPark(A, gone)).toBeUndefined();
   });
+});
+
+test("the helper reports this session's outcome: moved or failed", async () => {
+  const run = async (o: { code: number }) => {
+    const out: boolean[] = [];
+    const dir = tmp();
+    writePark(A, { state: "moving", pid: 400, turnEndedAt: 1 }, dir);
+    let t = 0, reads = 0;
+    await waitThenHandoff(pending(), {
+      pending: join(dir, "p.json"), parkDir: dir, alive: () => true, now: () => (t += 1000), sleep: async () => {},
+      runHandoff: async () => o.code, readCloud: () => ({ active: [A], sessions: { [A]: { n: ++reads } } }), log: () => {}, notify: () => {},
+      result: (ok) => out.push(ok),
+    });
+    return out;
+  };
+  expect(await run({ code: 0 })).toEqual([true]);
+  expect(await run({ code: 1 })).toEqual([false]);
 });

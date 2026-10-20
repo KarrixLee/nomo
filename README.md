@@ -129,16 +129,20 @@ home. What that does and doesn't expose:
   so phone ↔ box traffic is end-to-end sealed exactly like your Mac's, and the relay stays blind:
   it sees ids and flags (op, priority, a `parked` boolean), never titles or content.
 - **Phone commands** (*Bring back*, *Move to cloud*) are sealed by the phone with the pairing key
-  (AES-256-GCM): the relay carries an opaque blob and cannot forge, read or alter one. The plugin
-  checks each one itself: an allow-listed kind, a sealed timestamp no older than 120 s, and a
-  never-seen nonce (no replay). They are delivered only to this computer's watchdog (the
-  `x-cc-role` header), and act only on a session in the right state: *Bring back* needs a session
-  parked in the cloud, *Move to cloud* one that is not parked and not already in the cloud.
+  (AES-256-GCM). That seal is what makes them phone-only: the relay carries an opaque blob and
+  cannot forge, read or alter one. The plugin checks each one itself: an allow-listed kind and a
+  sealed timestamp no older than 120 s. Its nonce is single-use while the watchdog runs; the list
+  of seen nonces is kept in memory and resets when the watchdog restarts, so after a restart only
+  the 120 s expiry bounds a replay. A command acts only on a session in the right state: *Bring
+  back* needs a session parked in the cloud, *Move to cloud* one that is not parked and not already
+  in the cloud.
 - **Move to cloud** carries no text at all: `{kind, sessionId, ts, nonce}`, anything else dropped;
   the box gets the default "continue" message. It runs only for a live, interactive Claude Code
   session (not Codex, OpenCode, a headless run or the desktop app), only once this Mac has paired
   its box from an interactive terminal handoff (cloud.json `pairedTo`; the QR is never shown from
-  the background), and it refuses outright when the `Cloud check:` finds a git-tracked secret.
+  the background). It refuses outright when any file git tracks in the project's repo (`git ls-files`,
+  dot-folders included) has a secret-looking name, and when git can't list them; a folder that is
+  not a git repo has nothing tracked and may move.
 
 **Not covered:** whoever holds your unlocked phone, or this computer's pairing key, can move a
 session to *your own* box or bring one back, just as they could answer its remote approvals.

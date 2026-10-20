@@ -3,7 +3,7 @@ var __require = /* @__PURE__ */ createRequire(import.meta.url);
 
 // src/entries/handoff.ts
 import { execFileSync as execFileSync5, spawn as spawn2 } from "node:child_process";
-import { closeSync as closeSync2, existsSync as existsSync5, lstatSync as lstatSync2, mkdirSync as mkdirSync3, mkdtempSync as mkdtempSync2, openSync as openSync2, readdirSync as readdirSync3, readFileSync as readFileSync6, realpathSync as realpathSync2, renameSync as renameSync3, rmSync, statSync as statSync3, unlinkSync as unlinkSync3, writeFileSync as writeFileSync4 } from "node:fs";
+import { closeSync as closeSync2, existsSync as existsSync5, lstatSync as lstatSync2, mkdirSync as mkdirSync3, mkdtempSync as mkdtempSync2, openSync as openSync2, readdirSync as readdirSync3, readFileSync as readFileSync6, realpathSync as realpathSync2, renameSync as renameSync3, rmSync, statSync as statSync4, unlinkSync as unlinkSync3, writeFileSync as writeFileSync4 } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { dirname as dirname3, join as join6, relative, sep as sep2 } from "node:path";
@@ -384,7 +384,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "2.3.35";
+var PLUGIN_VERSION = "2.3.36";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -3205,7 +3205,6 @@ var LOCKS = [
   ["composer.lock", "composer install"]
 ];
 var LOCK_NAMES = new Set(LOCKS.map(([n]) => n));
-var TRACKED_SECRET = "looks like a secret and is tracked in git";
 function isSecretName(name) {
   if (/^\.env(\..+)?$/.test(name))
     return !/\.(example|sample|template|dist|defaults?)$/i.test(name);
@@ -3300,7 +3299,7 @@ function cloudReadiness(root, deps) {
   if (kept.length)
     missing.push(`${listNames(kept)} (${kept.length} file${kept.length > 1 ? "s" : ""}, never sent)`);
   for (const s of shipped)
-    warnings.push(`Heads-up: ${s} ${TRACKED_SECRET}: it WILL be on the box.`);
+    warnings.push(`Heads-up: ${s} looks like a secret and is tracked in git: it WILL be on the box.`);
   const gone = w.deps.filter((d) => git ? ignored.has(d) && !tracked.has(d) : d === "node_modules" || d.endsWith("/node_modules"));
   if (gone.length) {
     const names = [...new Set(gone.map((d) => d.split("/").pop()))];
@@ -3364,9 +3363,28 @@ function gitProbe(root) {
     remotes: () => run(["remote", "-v"])
   };
 }
+function trackedSecretFiles(cwd) {
+  const git = (args) => execFileSync3("git", ["-C", cwd, ...args], {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+    env: { ...process.env, LC_ALL: "C" },
+    maxBuffer: 256 * 1024 * 1024
+  });
+  let top;
+  try {
+    top = git(["rev-parse", "--show-toplevel"]).trim();
+  } catch (e) {
+    return /not a git repository/.test(String(e?.stderr ?? "")) ? [] : undefined;
+  }
+  try {
+    return execFileSync3("git", ["-C", top, "ls-files", "-z"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], maxBuffer: 256 * 1024 * 1024 }).split("\x00").filter((f) => f && isSecretName(f.split("/").pop()));
+  } catch {
+    return;
+  }
+}
 
 // src/core/park.ts
-import { mkdirSync, readFileSync as readFileSync3, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync as readFileSync3, renameSync, statSync as statSync3, unlinkSync, writeFileSync } from "node:fs";
 import { join as join4 } from "node:path";
 var PARK_DIR = `${CC_DIR}/parked`;
 var UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -3439,6 +3457,13 @@ function stamp(id, fields, dir = PARK_DIR) {
   const cur = readPark(id, dir);
   if (cur)
     writePark(id, { ...cur, ...fields }, dir);
+}
+function endMovingTurn(id, dir = PARK_DIR) {
+  try {
+    const p = readPark(id, dir);
+    if (p?.state === "moving" && !p.turnEndedAt)
+      stamp(id, { turnEndedAt: Date.now() }, dir);
+  } catch {}
 }
 var underPid = (pid) => typeof pid === "number" && pidAncestors(process.pid).includes(pid);
 function parkHook(input, dir = PARK_DIR) {
@@ -3552,6 +3577,25 @@ function releaseBackLock(id, dir = BACK_LOCK_DIR) {
     if (readFileSync3(backLockFile(id, dir), "utf8") === String(process.pid))
       unlinkSync(backLockFile(id, dir));
   } catch {}
+}
+var moveResultFile = (id, dir = BACK_LOCK_DIR) => join4(dir, `${id.slice(0, 12)}.move`);
+function writeMoveResult(id, ok, dir = BACK_LOCK_DIR) {
+  try {
+    mkdirSync(dir, { recursive: true, mode: 448 });
+    writeFileSync(moveResultFile(id, dir), ok ? `DONE
+` : `FAILED
+`, { mode: 384 });
+  } catch {}
+}
+function readMoveResult(id, since, dir = BACK_LOCK_DIR) {
+  try {
+    const f = moveResultFile(id, dir);
+    if (statSync3(f).mtimeMs < since)
+      return;
+    return readFileSync3(f, "utf8").startsWith("FAILED") ? "failed" : "done";
+  } catch {
+    return;
+  }
 }
 
 // src/core/handoff-later.ts
@@ -3722,6 +3766,7 @@ async function waitThenHandoff(p, d) {
     if (d.now() >= end) {
       release();
       unpark();
+      d.result?.(false);
       d.log(`FAILED: the turn was still running after ${Math.round((d.capMs ?? LATER_CAP_MS) / 60000)} min; nothing was moved. Run /nomo-cc:handoff again.`);
       d.notify("Handoff gave up: the turn did not end in time. Nothing was moved.");
       return 1;
@@ -3753,10 +3798,12 @@ async function waitThenHandoff(p, d) {
       try {
         writePark(p.session, { state: "cloud", pid: p.claudePid }, d.parkDir);
       } catch {}
+    d.result?.(true);
     d.log(`DONE: session ${p.session} is running in the cloud.`);
     d.notify("Your session is now running in the cloud.");
   } else {
     unpark();
+    d.result?.(false);
     d.log(`FAILED: ${why ?? `the handoff exited ${code}; see the lines above`}. Your Mac copy is untouched.`);
     d.notify("Handoff failed. Your Mac copy is untouched. Check /nomo-cc:handoff status.");
   }
@@ -3797,16 +3844,21 @@ function phoneMoveCheck(f) {
     return { refuse: "the cloud box needs a one-time pairing; run /nomo-cc:handoff in that session first" };
   if (!r.cwd || !f.transcriptExists(r.cwd))
     return { refuse: "its transcript was not found" };
-  if (f.readiness(r.cwd)?.includes(TRACKED_SECRET))
-    return { refuse: "a file that looks like a secret is tracked in git and would travel; move it from the terminal (/nomo-cc:handoff) if that is fine" };
+  const secrets = f.trackedSecrets(r.cwd);
+  if (!secrets)
+    return { refuse: "git could not list the project's tracked files" };
+  if (secrets.length)
+    return { refuse: `${secrets.slice(0, 3).join(", ")} looks like a secret and is tracked in git, so it would travel; move it from the terminal (/nomo-cc:handoff) if that is fine` };
   return { claudePid: pid, cwd: r.cwd };
 }
 var PHONE_SETTLE_MS = 2000;
 async function settleThenStamp(session, d) {
-  await d.sleep(d.settleMs ?? PHONE_SETTLE_MS);
-  const r = await d.readRecord();
-  if (!r || !(r.op === "done" || r.lastEvent === "done" || r.awaitingPrompt === true))
-    return false;
+  for (let i = 0;i < 2; i++) {
+    await d.sleep(d.settleMs ?? PHONE_SETTLE_MS);
+    const r = await d.readRecord();
+    if (!r || !(r.op === "done" || r.lastEvent === "done" || r.awaitingPrompt === true))
+      return false;
+  }
   const p = readPark(session, d.parkDir);
   if (p?.state !== "moving")
     return false;
@@ -5031,12 +5083,12 @@ function userLayerFiles(claudeHome, entries) {
   const files = [], skipped = [];
   for (const top of entries) {
     const abs = join6(claudeHome, top);
-    if (!statSync3(abs, { throwIfNoEntry: false })) {
+    if (!statSync4(abs, { throwIfNoEntry: false })) {
       if (lstatSync2(abs, { throwIfNoEntry: false }))
         skipped.push(top);
       continue;
     }
-    if (statSync3(abs).isFile()) {
+    if (statSync4(abs).isFile()) {
       files.push(top);
       continue;
     }
@@ -5054,7 +5106,7 @@ function userLayerFiles(claudeHome, entries) {
         skipped.push(rel);
         return;
       }
-      const st = statSync3(real);
+      const st = statSync4(real);
       if (st.isFile()) {
         files.push(rel);
         return;
@@ -5090,7 +5142,7 @@ function build(args, outDir) {
   const projDir = join6(process.env.HOME, ".claude", "projects", projectDirName(cwd));
   if (!existsSync5(projDir))
     throw new Error(`no Claude Code transcripts for ${cwd} (looked in ${projDir})`);
-  const uuid = typeof args.get("--session") === "string" ? args.get("--session") : latestSession(readdirSync3(projDir).map((name) => ({ name, mtimeMs: statSync3(join6(projDir, name)).mtimeMs })));
+  const uuid = typeof args.get("--session") === "string" ? args.get("--session") : latestSession(readdirSync3(projDir).map((name) => ({ name, mtimeMs: statSync4(join6(projDir, name)).mtimeMs })));
   if (uuid && !UUID_RE3.test(uuid))
     throw new Error(`session id must be a UUID, got ${JSON.stringify(uuid)}`);
   if (!uuid || !existsSync5(join6(projDir, `${uuid}.jsonl`)))
@@ -5144,7 +5196,7 @@ function build(args, outDir) {
     tar(put("folder.tgz"), cwd, [...EXCLUDE_SENSITIVE, "--no-recursion", "--null", "-T", "-"], list);
   }
   for (const [box, local] of Object.entries(art)) {
-    const size = statSync3(local).size;
+    const size = statSync4(local).size;
     if (size > MAX_ARTIFACT_BYTES) {
       throw new Error(`${box.split("/").pop()} is ${(size / 1e6).toFixed(0)} MB (cap ${MAX_ARTIFACT_BYTES / 1e6} MB). ` + (git ? "Commit or .gitignore large untracked files." : "Run handoff from a git repo, or trim the folder."));
     }
@@ -5336,7 +5388,7 @@ function updateCloudAt(path, fn) {
       if (e.code !== "EEXIST")
         throw e;
       try {
-        if (Date.now() - statSync3(lock).mtimeMs > 1e4) {
+        if (Date.now() - statSync4(lock).mtimeMs > 1e4) {
           unlinkSync3(lock);
           continue;
         }
@@ -6148,7 +6200,7 @@ async function phoneLater(args, keys, worker) {
     active: cloudActive(session),
     needsPairing: needsPairing(loadCloud(), worker),
     transcriptExists: (cwd) => existsSync5(join6(home, ".claude", "projects", projectDirName(cwd), `${session}.jsonl`)),
-    readiness
+    trackedSecrets: trackedSecretFiles
   });
   if ("refuse" in ok)
     throw new Error(`not moving ${session}: ${ok.refuse}.`);
@@ -6179,6 +6231,7 @@ async function afterExit(args, worker) {
   process.exitCode = await waitThenHandoff({ helperPid: process.pid, session, claudePid, state: "waiting", startedAt: Date.now(), message }, {
     pending: PENDING_PATH,
     parkDir: PARK_DIR,
+    result: (ok) => writeMoveResult(session, ok),
     alive: pidAlive,
     now: Date.now,
     sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
@@ -6276,7 +6329,7 @@ async function main() {
     console.log(`DRY RUN: nothing was sent. Artifacts kept in ${out} (delete it when done)`);
     console.log(`session ${plan.uuid}  cwd ${plan.cwd}  repo ${plan.git ? `${plan.root} (${plan.branch})` : "(not git)"}  model ${plan.model}`);
     for (const [box, local] of Object.entries(plan.artifacts))
-      console.log(`  ${local} -> ${box}  (${statSync3(local).size} B)`);
+      console.log(`  ${local} -> ${box}  (${statSync4(local).size} B)`);
     console.log(`keys: OMG_API_KEY ${keys.omg ? "found" : "MISSING"}, OPENROUTER_API_KEY ${keys.openrouter ? "found" : "MISSING"}`);
     console.log(`exec env: ANTHROPIC_BASE_URL=http://127.0.0.1:${RELAY_PORT} (or-relay -> OpenRouter) ANTHROPIC_AUTH_TOKEN=<openrouter key> ANTHROPIC_API_KEY= CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 NOMO_WORKER_URL=${worker}${args.has("--force") ? " NOMO_FORCE=1" : ""}`);
     console.log(`----- box script -----

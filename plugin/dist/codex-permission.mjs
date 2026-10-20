@@ -3,7 +3,7 @@ var __require = /* @__PURE__ */ createRequire(import.meta.url);
 
 // src/core/permission.ts
 import { readFile as readFile5, realpath, unlink as unlink3 } from "node:fs/promises";
-import { appendFileSync as appendFileSync2, statSync as statSync2, truncateSync as truncateSync2 } from "node:fs";
+import { appendFileSync as appendFileSync2, statSync as statSync3, truncateSync as truncateSync2 } from "node:fs";
 import { hostname as hostname2 } from "node:os";
 import { basename as basename4, isAbsolute as isAbsolute2, relative, resolve as resolve2 } from "node:path";
 
@@ -111,7 +111,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "2.3.35";
+var PLUGIN_VERSION = "2.3.36";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -3055,7 +3055,7 @@ async function repairNotifyWiring(deps = {}) {
 }
 
 // src/core/park.ts
-import { mkdirSync, readFileSync as readFileSync2, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync as readFileSync2, renameSync, statSync as statSync2, unlinkSync, writeFileSync } from "node:fs";
 import { join as join3 } from "node:path";
 var PARK_DIR = `${CC_DIR}/parked`;
 var UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -3128,6 +3128,13 @@ function stamp(id, fields, dir = PARK_DIR) {
   const cur = readPark(id, dir);
   if (cur)
     writePark(id, { ...cur, ...fields }, dir);
+}
+function endMovingTurn(id, dir = PARK_DIR) {
+  try {
+    const p = readPark(id, dir);
+    if (p?.state === "moving" && !p.turnEndedAt)
+      stamp(id, { turnEndedAt: Date.now() }, dir);
+  } catch {}
 }
 var underPid = (pid) => typeof pid === "number" && pidAncestors(process.pid).includes(pid);
 function parkHook(input, dir = PARK_DIR) {
@@ -3241,6 +3248,25 @@ function releaseBackLock(id, dir = BACK_LOCK_DIR) {
     if (readFileSync2(backLockFile(id, dir), "utf8") === String(process.pid))
       unlinkSync(backLockFile(id, dir));
   } catch {}
+}
+var moveResultFile = (id, dir = BACK_LOCK_DIR) => join3(dir, `${id.slice(0, 12)}.move`);
+function writeMoveResult(id, ok, dir = BACK_LOCK_DIR) {
+  try {
+    mkdirSync(dir, { recursive: true, mode: 448 });
+    writeFileSync(moveResultFile(id, dir), ok ? `DONE
+` : `FAILED
+`, { mode: 384 });
+  } catch {}
+}
+function readMoveResult(id, since, dir = BACK_LOCK_DIR) {
+  try {
+    const f = moveResultFile(id, dir);
+    if (statSync2(f).mtimeMs < since)
+      return;
+    return readFileSync2(f, "utf8").startsWith("FAILED") ? "failed" : "done";
+  } catch {
+    return;
+  }
 }
 
 // src/core/session-state.ts
@@ -4532,7 +4558,7 @@ function rotateTraceOnce(path) {
     return;
   traceRotated = true;
   try {
-    if (statSync2(path).size > TRACE_MAX_BYTES)
+    if (statSync3(path).size > TRACE_MAX_BYTES)
       truncateSync2(path, 0);
   } catch {}
 }

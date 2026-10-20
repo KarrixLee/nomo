@@ -81,7 +81,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "2.3.35";
+var PLUGIN_VERSION = "2.3.36";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -2469,7 +2469,7 @@ async function repairNotifyWiring(deps = {}) {
 }
 
 // src/core/park.ts
-import { mkdirSync, readFileSync as readFileSync2, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync as readFileSync2, renameSync, statSync as statSync2, unlinkSync, writeFileSync } from "node:fs";
 import { join as join3 } from "node:path";
 var PARK_DIR = `${CC_DIR}/parked`;
 var UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -3330,11 +3330,11 @@ async function runHook(agent) {
 }
 
 // src/opencode/approvals.ts
-import { appendFileSync as appendFileSync3, statSync as statSync3, truncateSync as truncateSync3 } from "node:fs";
+import { appendFileSync as appendFileSync3, statSync as statSync4, truncateSync as truncateSync3 } from "node:fs";
 
 // src/core/permission.ts
 import { readFile as readFile5, realpath, unlink as unlink3 } from "node:fs/promises";
-import { appendFileSync as appendFileSync2, statSync as statSync2, truncateSync as truncateSync2 } from "node:fs";
+import { appendFileSync as appendFileSync2, statSync as statSync3, truncateSync as truncateSync2 } from "node:fs";
 import { hostname as hostname2 } from "node:os";
 import { basename as basename4, isAbsolute as isAbsolute2, relative, resolve as resolve2 } from "node:path";
 
@@ -3673,7 +3673,7 @@ function rotateTraceOnce(path) {
     return;
   traceRotated = true;
   try {
-    if (statSync2(path).size > TRACE_MAX_BYTES)
+    if (statSync3(path).size > TRACE_MAX_BYTES)
       truncateSync2(path, 0);
   } catch {}
 }
@@ -4639,7 +4639,7 @@ function ocTrace(event) {
     if (!rotated) {
       rotated = true;
       try {
-        if (statSync3(TRACE_PATH).size > TRACE_MAX_BYTES2)
+        if (statSync4(TRACE_PATH).size > TRACE_MAX_BYTES2)
           truncateSync3(TRACE_PATH, 0);
       } catch {}
     }

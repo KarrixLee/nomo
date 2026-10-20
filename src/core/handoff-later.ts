@@ -15,7 +15,6 @@ import { appendFileSync, closeSync, fstatSync, linkSync, openSync, readFileSync,
 import { basename } from "node:path";
 import { claudeDesktopInvocation, claudeHeadlessInvocation } from "./adapter";
 import { clearPark, readPark, stamp, writePark } from "./park";
-import { TRACKED_SECRET } from "./readiness";
 import { CC_DIR } from "./shared";
 
 export const PENDING_PATH = `${CC_DIR}/handoff-pending.json`;
@@ -207,6 +206,8 @@ export interface WaitDeps {
   selfPid?: number;
   /** The park marker folder (core/park.ts): turn-end trigger in, cloud/cleared out. Omitted = no park. */
   parkDir?: string;
+  /** This session's outcome (park.ts writeMoveResult): true moved, false failed. */
+  result?: (ok: boolean) => void;
 }
 
 /** The detached helper: wait for this turn to end or the Mac session to exit (capped), then hand it off. Its last log line
@@ -225,6 +226,7 @@ export async function waitThenHandoff(p: Pending, d: WaitDeps): Promise<number> 
     if (d.now() >= end) {
       release();
       unpark();
+      d.result?.(false);
       d.log(`FAILED: the turn was still running after ${Math.round((d.capMs ?? LATER_CAP_MS) / 60_000)} min; nothing was moved. Run /nomo-cc:handoff again.`);
       d.notify("Handoff gave up: the turn did not end in time. Nothing was moved.");
       return 1;
@@ -243,10 +245,12 @@ export async function waitThenHandoff(p: Pending, d: WaitDeps): Promise<number> 
   release();
   if (code === 0) {
     if (d.parkDir) try { writePark(p.session, { state: "cloud", pid: p.claudePid }, d.parkDir); } catch { /* the gate fails open */ }
+    d.result?.(true);
     d.log(`DONE: session ${p.session} is running in the cloud.`);
     d.notify("Your session is now running in the cloud.");
   } else {
     unpark();
+    d.result?.(false);
     d.log(`FAILED: ${why ?? `the handoff exited ${code}; see the lines above`}. Your Mac copy is untouched.`);
     d.notify("Handoff failed. Your Mac copy is untouched. Check /nomo-cc:handoff status.");
   }
@@ -279,8 +283,9 @@ export interface PhoneMoveFacts {
   active: boolean;
   needsPairing: boolean;
   transcriptExists: (cwd: string) => boolean;
-  /** The "Cloud check:" block for cwd (handoff.ts readiness). */
-  readiness: (cwd: string) => string | undefined;
+  /** Git-tracked files under cwd's repo whose name looks like a secret ([] outside git); undefined
+   *  when git failed (readiness.ts trackedSecretFiles). */
+  trackedSecrets: (cwd: string) => string[] | undefined;
 }
 
 /** Every gate a phone-started move passes before anything is written. Either the session's claude pid
@@ -300,7 +305,9 @@ export function phoneMoveCheck(f: PhoneMoveFacts): { claudePid: number; cwd: str
   if (f.active) return { refuse: "it is already running in the cloud" };
   if (f.needsPairing) return { refuse: "the cloud box needs a one-time pairing; run /nomo-cc:handoff in that session first" };
   if (!r.cwd || !f.transcriptExists(r.cwd)) return { refuse: "its transcript was not found" };
-  if (f.readiness(r.cwd)?.includes(TRACKED_SECRET)) return { refuse: "a file that looks like a secret is tracked in git and would travel; move it from the terminal (/nomo-cc:handoff) if that is fine" };
+  const secrets = f.trackedSecrets(r.cwd);
+  if (!secrets) return { refuse: "git could not list the project's tracked files" };
+  if (secrets.length) return { refuse: `${secrets.slice(0, 3).join(", ")} looks like a secret and is tracked in git, so it would travel; move it from the terminal (/nomo-cc:handoff) if that is fine` };
   return { claudePid: pid, cwd: r.cwd };
 }
 
@@ -309,7 +316,7 @@ export const PHONE_SETTLE_MS = 2000;
 
 /** The phone path's race-safe arming, AFTER the "moving" marker is written: a Stop from here on stamps
  *  turnEndedAt itself (park.ts); one that fired before the marker existed is caught by re-reading the
- *  record after a settle. Idle (done / opened, never prompted) → stamp turnEndedAt now so the helper
+ *  record after a settle, twice. Idle both times (done / opened, never prompted) → stamp turnEndedAt now so the helper
  *  moves at once; working or needs-attention → leave it for that turn's Stop. True = stamped. */
 export async function settleThenStamp(session: string, d: {
   readRecord: () => Promise<{ op?: string; lastEvent?: string; awaitingPrompt?: boolean } | null>;
@@ -317,9 +324,11 @@ export async function settleThenStamp(session: string, d: {
   parkDir?: string;
   settleMs?: number;
 }): Promise<boolean> {
-  await d.sleep(d.settleMs ?? PHONE_SETTLE_MS);
-  const r = await d.readRecord();
-  if (!r || !(r.op === "done" || r.lastEvent === "done" || r.awaitingPrompt === true)) return false;
+  for (let i = 0; i < 2; i++) { // idle at two reads (~2 s and ~4 s), not one
+    await d.sleep(d.settleMs ?? PHONE_SETTLE_MS);
+    const r = await d.readRecord();
+    if (!r || !(r.op === "done" || r.lastEvent === "done" || r.awaitingPrompt === true)) return false;
+  }
   const p = readPark(session, d.parkDir);
   if (p?.state !== "moving") return false;
   if (!p.turnEndedAt) stamp(session, { turnEndedAt: Date.now() }, d.parkDir);

@@ -57,7 +57,7 @@ import {
   watchdogBuildStamp, watchdogHolderIsLive, WATCHDOG_PATH, WATCHDOG_PID_PATH, writeInterruptFlagAt,
 } from "../core/shared";
 import { rememberBounded } from "../core/bounded-set";
-import { BackRun, backLockHolder, BACK_LOCK_DIR, cloudActive, cloudState, CloudState, Park, parkWantsCommands, readPark, withParked } from "../core/park";
+import { BackRun, backLockHolder, BACK_LOCK_DIR, cloudActive, cloudState, CloudState, endMovingTurn, Park, parkWantsCommands, readMoveResult, readPark, withParked } from "../core/park";
 
 // The transcript-tail interrupt PARSERS live in the agent adapters now (the two detections are
 // structurally different). Re-export them so existing importers/tests that reference "./cc-watchdog"
@@ -1673,7 +1673,7 @@ export function bringBack(id: string, deps: BringBackDeps = {}): FocusTraceResul
 
 /** Phone-started moves, by session id. `failedAt` set = the row reads cloud:"move-failed" until the
  *  session's next turn. In memory, like backRuns: a daemon restart forgets a failure. */
-export interface MoveRun { running: boolean; code?: number | null; failedAt?: number }
+export interface MoveRun { running: boolean; startedAt: number; code?: number | null; failedAt?: number }
 export const moveRuns = new Map<string, MoveRun>();
 
 export interface MoveToCloudDeps {
@@ -1692,7 +1692,7 @@ export function moveToCloud(id: string, rec: SessionRecord, deps: MoveToCloudDep
   if (!UUID_RE.test(id) || typeof rec.cwd !== "string" || !rec.cwd || (rec.agent ?? "claude") !== "claude" || rec.provisional === true ||
     (deps.readPark ?? readPark)(id) || (deps.cloudActive ?? cloudActive)(id)) return "move-refused";
   if (moveRuns.get(id)?.running) return "move-running";
-  const run: MoveRun = { running: true };
+  const run: MoveRun = { running: true, startedAt: (deps.now ?? Date.now)() };
   moveRuns.set(id, run);
   const done = (code: number | null): void => {
     if (!run.running) return;
@@ -1707,22 +1707,18 @@ export function moveToCloud(id: string, rec: SessionRecord, deps: MoveToCloudDep
   return "move-started";
 }
 
-/** The last line of the /nomo-cc:handoff helper's log (handoff-later.ts LATER_LOG). */
-function laterLogLastLine(): string {
-  // == handoff-later.ts LATER_LOG (not imported: the bundle would inline all of that module).
-  try { return readFileSync(`${CC_DIR}/handoff.log`, "utf8").trimEnd().split("\n").pop() ?? ""; } catch { return ""; }
-}
-
 /** Per sweep: is this session's phone-started move a failure the row should show? A successful
- *  preflight left a "moving" marker; that marker gone without reaching any other state, with the
- *  helper's last log line FAILED:/CANCELLED, is a failure. Any later park state, or a turn started
- *  after the failure, forgets the run. */
-export function moveFailed(id: string, park: Park | undefined, rec: SessionRecord | null, lastLine: () => string = laterLogLastLine): boolean {
+ *  preflight left a "moving" marker; that marker gone without reaching any other state, with THIS
+ *  session's helper outcome (park.ts readMoveResult, written since the run started) FAILED, is a
+ *  failure. No outcome (a /nomo-cc:handoff cancel) is a clean unpark. Any later park state, or a turn
+ *  started after the failure, forgets the run. */
+export function moveFailed(id: string, park: Park | undefined, rec: SessionRecord | null,
+  outcome: (since: number) => "failed" | "done" | undefined = (since) => readMoveResult(id, since)): boolean {
   const m = moveRuns.get(id);
   if (!m) return false;
   if (park && park.state !== "moving") { moveRuns.delete(id); return false; }
   if (!m.failedAt && !m.running && m.code === 0 && !park) {
-    if (/^(\[[^\]]*\]\s*)?(FAILED|CANCELLED)\b/.test(lastLine())) m.failedAt = Date.now();
+    if (outcome(m.startedAt) === "failed") m.failedAt = Date.now();
     else { moveRuns.delete(id); return false; }
   }
   if (m.failedAt && typeof rec?.turnStartedAt === "number" && rec.turnStartedAt * 1000 > m.failedAt) { moveRuns.delete(id); return false; }
@@ -2408,6 +2404,8 @@ export interface InterruptDeps extends DecisionHoldGateDeps {
    *  net emitted NOTHING for its whole life, which is why attributing the 2026-08-09 P0 to it needed
    *  inference from the record's shape rather than a log line. */
   trace?: (event: object) => void;
+  /** park.ts endMovingTurn seam (tests pass a park dir). */
+  endMovingTurn?: (sessionId: string) => void;
 }
 
 /** The record the interrupt net pins when its corrective done is settled (delivered, or capped locally).
@@ -2480,6 +2478,8 @@ export async function correctInterrupt(
       return "uncorrected";
     }
     // The interrupt is CONFIRMED from here — the session is decided done regardless of this POST's fate.
+    // Esc fires no Stop: a handoff armed for this turn's end ("moving" marker) gets its turnEndedAt here.
+    (deps.endMovingTurn ?? endMovingTurn)(sessionId);
     // Bounded against disk AND this process's memory, so a record rewrite that keeps failing (full disk /
     // read-only home) can't reset the counter to zero every sweep and re-POST a doomed done forever.
     const attempts = effectiveDoneAttempts(record, sessionId);

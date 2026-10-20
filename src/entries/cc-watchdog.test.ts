@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -28,6 +28,7 @@ import type { CommandPayload, DrainCommandsDeps, PostDetail, PostOutcome, Record
 import { backRuns, BRING_BACK_COMMAND_KIND, correctCloudState, handoffCommand, withCloudKey } from "./cc-watchdog";
 import { MOVE_TO_CLOUD_COMMAND_KIND, moveFailed, moveRuns, parseCommandPayload } from "./cc-watchdog";
 import type { Park } from "../core/park";
+import { endMovingTurn, readPark, writePark } from "../core/park";
 import { resolveOnRelay } from "../core/codex-remote-input";
 import { CODEX_PROXY_STDOUT_ENDED } from "../core/codex-proxy-transport";
 import { buildStatePlaintext, STATE_HOLD_MAX_AGE_MS } from "../core/session-state";
@@ -2596,6 +2597,27 @@ describe("correctInterrupt (settle an interrupted session — the done pin stick
     expect(writes[0].doneAttempts).toBeUndefined(); // a delivered done CLEARS any retry counter (JSON drops it)
   });
 
+  test("Esc on a turn armed to move (no Stop will come): the confirmed interrupt stamps the moving marker", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "nomo-esc-"));
+    const id = "0a1b2c3d-1111-4222-8333-444455556666";
+    writePark(id, { state: "moving", pid: 1 }, dir);
+    const v = await correctInterrupt(cfg(), "/tmp/s.json", id, attn({ lastEvent: "working", prio: 0 }), NOW, {
+      post: async () => "delivered" as PostOutcome,
+      readTail: async () => interruptTail,
+      writeRecord: async () => {},
+      endMovingTurn: (s) => endMovingTurn(s, dir),
+    });
+    expect(v).toBe("corrected");
+    expect(readPark(id, dir)?.turnEndedAt).toBeGreaterThan(0);
+    // No interrupt in the tail (a live turn): untouched.
+    writePark(id, { state: "moving", pid: 1 }, dir);
+    await correctInterrupt(cfg(), "/tmp/s.json", id, attn({ lastEvent: "working", prio: 0 }), NOW, {
+      post: async () => "delivered" as PostOutcome, readTail: async () => userTurn("hi"), writeRecord: async () => {},
+      endMovingTurn: (s) => endMovingTurn(s, dir),
+    });
+    expect(readPark(id, dir)?.turnEndedAt).toBeUndefined();
+  });
+
   test("the pinned done record CLOSES the gate — a subsequent sweep posts NOTHING", async () => {
     const pinned = attn({ lastEvent: "done", op: "done", sentDone: true });
     expect(shouldInterruptCheck(pinned, NOW)).toBe(false); // gate short-circuits before any POST
@@ -5130,7 +5152,7 @@ describe("move to cloud from the phone (NOM-94)", () => {
     expect(spawned).toEqual([{ id: S, cwd: "/p/app" }]);
     expect(traces.map((t) => t.result)).toEqual(["move-started", "move-running"]);
     exits[0](0);
-    expect(moveRuns.get(S)).toEqual({ running: false, code: 0 });
+    expect(moveRuns.get(S)).toEqual({ running: false, startedAt: NOW, code: 0 });
   });
 
   test("refused: parked, in cloud.json, codex, provisional, no cwd, unknown session; stale and replay never spawn", async () => {
@@ -5167,19 +5189,19 @@ describe("move to cloud from the phone (NOM-94)", () => {
     expect(moveRuns.has(S)).toBe(false);
   });
 
-  test("move-failed: the marker vanished without reaching cloud and the helper logged FAILED/CANCELLED", async () => {
-    for (const [line, failed] of [
-      ["[2026-01-01T00:00:00.000Z] FAILED: the handoff exited 1; see the lines above. Your Mac copy is untouched.", true],
-      ["[2026-01-01T00:00:00.000Z] CANCELLED: session x stays on this Mac.", true],
-      ["[2026-01-01T00:00:00.000Z] DONE: session x is running in the cloud.", false],
-    ] as const) {
+  test("move-failed: the marker vanished without reaching cloud and THIS session's helper reported FAILED", async () => {
+    for (const [result, failed] of [["failed", true], ["done", false], [undefined, false]] as const) { // undefined: a cancel
       resetCommandState();
       const { exits, deps } = harness();
       const c = await cmd();
       await drainCommands(cfg(), { ...deps, take: () => [c] });
       exits[0](0);
-      expect(moveFailed(S, { state: "moving", since: 0 }, null, () => line)).toBe(false); // armed, waiting
-      expect(moveFailed(S, undefined, null, () => line)).toBe(failed);
+      const since: number[] = [];
+      const outcome = (t: number) => { since.push(t); return result; };
+      expect(moveFailed(S, { state: "moving", since: 0 }, null, outcome)).toBe(false); // armed, waiting
+      expect(moveFailed(S, undefined, null, outcome)).toBe(failed);
+      expect(since).toEqual([NOW]); // only outcomes written since this run started count
+      expect(moveRuns.has(S)).toBe(failed); // a cancel or a move is forgotten
     }
     // Reaching cloud forgets the run.
     resetCommandState();
@@ -5187,7 +5209,7 @@ describe("move to cloud from the phone (NOM-94)", () => {
     const c = await cmd();
     await drainCommands(cfg(), { ...deps, take: () => [c] });
     exits[0](0);
-    expect(moveFailed(S, { state: "cloud", since: 0 }, null, () => "FAILED: x")).toBe(false);
+    expect(moveFailed(S, { state: "cloud", since: 0 }, null, () => "failed")).toBe(false);
     expect(moveRuns.has(S)).toBe(false);
   });
 
