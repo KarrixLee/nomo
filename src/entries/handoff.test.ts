@@ -836,3 +836,52 @@ describe("phone move-to-cloud (--later --phone, NOM-94)", () => {
     }
   });
 });
+
+import { boxGone, boxHealth, getBox } from "./handoff";
+
+describe("box gone (NOM-99)", () => {
+  const U = "0a1b2c3d-1111-4222-8333-444455556666";
+  const call = (get: () => any, wake?: () => any) => (async (_k: string, method: string) => {
+    if (method === "GET") return get();
+    if (!wake) throw Object.assign(new Error("wake failed"), { status: 409 });
+    return wake();
+  }) as any;
+  const http = (status: number) => () => { throw Object.assign(new Error(`-> ${status}`), { status }); };
+
+  test("getBox: only a 404, or stopped plus a failed wake, is gone; 5xx and network errors throw", async () => {
+    expect(await getBox("k", undefined, call(() => ({})))).toBeUndefined();
+    expect(await getBox("k", "sb", call(http(404)))).toBeUndefined();
+    expect(await getBox("k", "sb", call(() => ({ id: "sb", status: "stopped" })))).toBeUndefined();
+    expect(await getBox("k", "sb", call(() => ({ id: "sb", status: "stopped" }), () => ({ id: "sb", status: "starting" }))))
+      .toEqual({ id: "sb", status: "starting" });
+    expect(await getBox("k", "sb", call(() => ({ id: "sb", status: "hibernated" })))).toEqual({ id: "sb", status: "hibernated" });
+    await expect(getBox("k", "sb", call(http(503)))).rejects.toThrow("503");
+    await expect(getBox("k", "sb", call(() => { throw new TypeError("fetch failed"); }))).rejects.toThrow("fetch failed");
+  });
+
+  test("boxGone unparks, drops the id from cloud.json and records `gone`, saying so plainly", () => {
+    const calls: string[] = [];
+    let cloud: any = { sandboxId: "sb", active: [U, "x"], sessions: { [U]: {}, x: {} } };
+    const msg = boxGone(U, {
+      clear: (id) => calls.push(`clear ${id}`),
+      update: (fn) => { cloud = fn(cloud); },
+      result: (id) => calls.push(`gone ${id}`),
+    });
+    expect(calls).toEqual([`clear ${U}`, `gone ${U}`]);
+    expect(cloud).toEqual({ sandboxId: "sb", active: ["x"], sessions: { x: {} } });
+    expect(msg).toMatch(/box is gone.*work .* is lost.*continues on this Mac from where it was before the move/);
+  });
+
+  test("boxHealth: no probe with nothing parked; a gone box unparks every parked session; an error changes nothing", async () => {
+    const cloud = { sandboxId: "sb", active: [U, "x"] };
+    let gets = 0;
+    const gone: string[] = [];
+    const base = { cloud, gone: (id: string) => { gone.push(id); return ""; } };
+    expect(await boxHealth("k", { ...base, park: () => undefined, get: async () => { gets++; return undefined; } })).toEqual([]);
+    expect(gets).toBe(0);
+    expect(await boxHealth("k", { ...base, park: () => ({ state: "cloud" }), get: async () => ({ id: "sb" }) })).toEqual([]);
+    expect(await boxHealth("k", { ...base, park: () => ({ state: "cloud" }), get: async () => undefined })).toEqual([U, "x"]);
+    expect(gone).toEqual([U, "x"]);
+    await expect(boxHealth("k", { ...base, park: () => ({ state: "cloud" }), get: async () => { throw new Error("503"); } })).rejects.toThrow();
+  });
+});

@@ -279,15 +279,23 @@ export function appendFittedPlanAndDebug<T extends Record<string, unknown>>(
     : withPlan;
 }
 
-/** The blob with `cloud` set (or removed), the key LAST, after plan/dbg. Budgeted like every blob,
- *  but `cloud` is part of the base: dbg, then plan, give way first, never `cloud`. Pure. */
-export function withCloudKey(plain: Record<string, unknown>, cloud: string | undefined): Record<string, unknown> {
-  const { cloud: _old, plan, dbg, ...base } = plain;
-  const fitted = appendFittedPlanAndDebug(cloud ? { ...base, cloud } : base,
-    typeof plan === "string" ? plan : undefined, typeof dbg === "string" ? dbg : undefined);
+/** Optional companions of `cloud` (NOM-99), each present only when set:
+ *  `cloudWhy`: why a move failed ("secret" | "cap" | "notPaired" | "busy" | "gone" | "other");
+ *  `cloudAge`: "expiring" once a box session has been in the cloud for 13+ days. */
+export interface CloudExtra { cloudWhy?: string; cloudAge?: string }
+/** The record's cloud keys, as correctCloudState last sealed them. */
+export const recordCloudExtra = (r: { cloudWhy?: string; cloudAge?: string }): CloudExtra =>
+  ({ ...(r.cloudWhy ? { cloudWhy: r.cloudWhy } : {}), ...(r.cloudAge ? { cloudAge: r.cloudAge } : {}) });
+
+/** The blob with `cloud` (then cloudWhy, cloudAge) set or removed, LAST, after plan/dbg. Budgeted like
+ *  every blob, but they are part of the base: dbg, then plan, give way first, never these. Pure. */
+export function withCloudKey(plain: Record<string, unknown>, cloud: string | undefined, extra: CloudExtra = {}): Record<string, unknown> {
+  const { cloud: _old, cloudWhy: _w, cloudAge: _a, plan, dbg, ...base } = plain;
+  const keys = cloud ? { cloud, ...(extra.cloudWhy ? { cloudWhy: extra.cloudWhy } : {}), ...(extra.cloudAge ? { cloudAge: extra.cloudAge } : {}) } : {};
+  const fitted = appendFittedPlanAndDebug({ ...base, ...keys }, typeof plan === "string" ? plan : undefined, typeof dbg === "string" ? dbg : undefined) as Record<string, unknown>;
   if (!cloud) return fitted;
-  const { cloud: c, ...rest } = fitted as Record<string, unknown>;
-  return { ...rest, cloud: c };
+  const rest = Object.fromEntries(Object.entries(fitted).filter(([k]) => !(k in keys)));
+  return { ...rest, ...keys };
 }
 
 // --- unabridged copies for the LAN read op (NOM-44 phase 4) -------------------------------------
@@ -1054,6 +1062,9 @@ export interface SessionRecord {
   /** NOM-93/95: the blob's `cloud` value as the watchdog last sealed it (correctCloudState), kept in the
    *  clear so blobs rebuilt from record fields (LAN state, corrective done) carry it too. */
   cloud?: string;
+  /** NOM-99: the blob's `cloudWhy` / `cloudAge` alongside `cloud` (see CloudExtra). */
+  cloudWhy?: string;
+  cloudAge?: string;
   /** The pairingId whose key SEALED this record's `blob`. A re-pair rotates both the pairing and the
    *  E2E key, but session records survive it — so the watchdog's staleness heartbeat (which re-sends
    *  `blob` verbatim) must check this against the CURRENT config.pairingId and skip on mismatch;

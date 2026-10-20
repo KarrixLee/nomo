@@ -87,7 +87,7 @@ var textEncoder2 = new TextEncoder;
 var DEFAULT_WORKER_URL = "https://api.nomo.gg";
 
 // src/core/shared.ts
-var PLUGIN_VERSION = "2.3.39";
+var PLUGIN_VERSION = "2.3.40";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -2613,6 +2613,7 @@ function parkHook(input, dir = PARK_DIR) {
   } catch {}
   return;
 }
+var CLOUD_EXPIRING_MS = 13 * 24 * 3600000;
 function withParked(body, dir = PARK_DIR) {
   const id = body.sessionId;
   const s = typeof id === "string" ? readPark(id, dir)?.state : undefined;

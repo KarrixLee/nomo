@@ -178,16 +178,26 @@ export interface BackRun { running: boolean; code?: number | null }
 
 /** The blob's `cloud` key: what the phone shows for a parked session. Undefined → no key.
  *  "move-failed" (NOM-94, appended): a phone-started move-to-cloud did not happen; no marker is left. */
-export type CloudState = "moving" | "cloud" | "returning" | "failed" | "back" | "move-failed";
-export function cloudState(p: Park | undefined, run?: BackRun, locked = false, moveFailed = false): CloudState | undefined {
+export type CloudState = "moving" | "cloud" | "returning" | "failed" | "back" | "move-failed" | "box-gone";
+/** `back`: this session's persisted --back outcome (readBackResult), from whichever runner. "failed"
+ *  counts while parked "cloud" (written since the marker); "gone" (NOM-99: the box was deleted, the
+ *  marker cleared) reads "box-gone" once unparked, until the caller's next-turn bound drops it. */
+export function cloudState(p: Park | undefined, run?: BackRun, locked = false, moveFailed = false, back?: BackResult): CloudState | undefined {
   switch (p?.state) {
     case "moving": return "moving";
     case "landing": return "returning";
     case "back": return "back";
-    case "cloud": return run?.running || locked ? "returning" : run && run.code !== 0 ? "failed" : "cloud";
+    case "cloud": return run?.running || locked ? "returning" : (run && run.code !== 0) || back === "failed" ? "failed" : "cloud";
   }
-  return !p && moveFailed ? "move-failed" : undefined;
+  if (p) return undefined;
+  return moveFailed ? "move-failed" : back === "gone" ? "box-gone" : undefined;
 }
+
+/** NOM-99: a box session this old (from the "cloud" marker's `since`) gets `cloudAge: "expiring"`; the
+ *  provider deletes a box after 14 days asleep. */
+export const CLOUD_EXPIRING_MS = 13 * 24 * 3600_000;
+export const cloudAge = (p: Park | undefined, now: number): "expiring" | undefined =>
+  p?.state === "cloud" && now - p.since >= CLOUD_EXPIRING_MS ? "expiring" : undefined;
 
 /** A parked session the phone may act on keeps the command long-poll up. */
 export const parkWantsCommands = (p: Park | undefined): boolean =>
@@ -234,8 +244,38 @@ export function releaseBackLock(id: string, dir = BACK_LOCK_DIR): void {
  *  "FAILED"), so the watchdog never reads another session's run off the shared handoff.log. A cancel
  *  writes nothing: it is a clean unpark. */
 export const moveResultFile = (id: string, dir = BACK_LOCK_DIR): string => join(dir, `${id.slice(0, 12)}.move`);
-export function writeMoveResult(id: string, ok: boolean, dir = BACK_LOCK_DIR): void {
-  try { mkdirSync(dir, { recursive: true, mode: 0o700 }); writeFileSync(moveResultFile(id, dir), ok ? "DONE\n" : "FAILED\n", { mode: 0o600 }); } catch { /* status only */ }
+/** NOM-99: why a move failed, sealed as `cloudWhy`. Codes only, never paths or file names. */
+export type MoveWhy = "secret" | "cap" | "notPaired" | "busy" | "gone" | "other";
+const MOVE_WHYS: readonly string[] = ["secret", "cap", "notPaired", "busy", "gone", "other"];
+export function writeMoveResult(id: string, ok: boolean, dir = BACK_LOCK_DIR, why?: MoveWhy): void {
+  try { mkdirSync(dir, { recursive: true, mode: 0o700 }); writeFileSync(moveResultFile(id, dir), ok ? "DONE\n" : `FAILED${why ? ` ${why}` : ""}\n`, { mode: 0o600 }); } catch { /* status only */ }
+}
+/** The reason of a FAILED result written at or after `since`; "other" when it named none. */
+export function readMoveWhy(id: string, since: number, dir = BACK_LOCK_DIR): MoveWhy | undefined {
+  try {
+    const f = moveResultFile(id, dir);
+    if (statSync(f).mtimeMs < since) return undefined;
+    const [state, why] = readFileSync(f, "utf8").trim().split(/\s+/);
+    if (state !== "FAILED") return undefined;
+    return MOVE_WHYS.includes(why) ? why as MoveWhy : "other";
+  } catch { return undefined; }
+}
+
+/** NOM-99: the last --back outcome for ONE session (cloud-back/<id12>.back), from any runner (phone,
+ *  /nomo-cc:back, CLI), so "failed" survives a watchdog restart. "gone": the box was deleted and the
+ *  session unparked. Read with a `since` like the .move file, so an older run's file never counts. */
+export type BackResult = "done" | "failed" | "gone";
+export const backResultFile = (id: string, dir = BACK_LOCK_DIR): string => join(dir, `${id.slice(0, 12)}.back`);
+export function writeBackResult(id: string, r: BackResult, dir = BACK_LOCK_DIR): void {
+  try { mkdirSync(dir, { recursive: true, mode: 0o700 }); writeFileSync(backResultFile(id, dir), `${r.toUpperCase()}\n`, { mode: 0o600 }); } catch { /* status only */ }
+}
+export function readBackResult(id: string, since: number, dir = BACK_LOCK_DIR): BackResult | undefined {
+  try {
+    const f = backResultFile(id, dir);
+    if (statSync(f).mtimeMs < since) return undefined;
+    const r = readFileSync(f, "utf8").trim().toLowerCase();
+    return r === "done" || r === "failed" || r === "gone" ? r : undefined;
+  } catch { return undefined; }
 }
 /** "failed" when the result file says FAILED and was written at or after `since` (epoch ms). */
 export function readMoveResult(id: string, since: number, dir = BACK_LOCK_DIR): "failed" | "done" | undefined {

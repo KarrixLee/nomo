@@ -4,7 +4,7 @@ var __require = /* @__PURE__ */ createRequire(import.meta.url);
 // src/entries/cc-watchdog.ts
 import { readdir as readdir4, readFile as readFile8, unlink as unlink4 } from "node:fs/promises";
 import { spawn as spawn3 } from "node:child_process";
-import { closeSync, existsSync as existsSync3, mkdirSync as mkdirSync2, openSync, readFileSync as readFileSync3, statSync as statSync4, unlinkSync as unlinkSync2, writeSync } from "node:fs";
+import { closeSync, existsSync as existsSync3, mkdirSync as mkdirSync2, openSync, readdirSync, readFileSync as readFileSync3, statSync as statSync4, unlinkSync as unlinkSync2, writeSync } from "node:fs";
 import { homedir, hostname as hostname4 } from "node:os";
 import { basename as basename6 } from "node:path";
 
@@ -117,7 +117,7 @@ function buildPairURL(workerUrl, pairingId, qrSecret, pcEphPub) {
 }
 
 // src/core/shared.ts
-var PLUGIN_VERSION = "2.3.39";
+var PLUGIN_VERSION = "2.3.40";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -241,13 +241,15 @@ function appendFittedPlanAndDebug(base, plan, dbg) {
   const withDebug = { ...withPlan, dbg: capped };
   return sealedBlobChars(encoder.encode(JSON.stringify(withDebug)).length) <= BLOB_FIT_CHARS ? withDebug : withPlan;
 }
-function withCloudKey(plain, cloud) {
-  const { cloud: _old, plan, dbg, ...base } = plain;
-  const fitted = appendFittedPlanAndDebug(cloud ? { ...base, cloud } : base, typeof plan === "string" ? plan : undefined, typeof dbg === "string" ? dbg : undefined);
+var recordCloudExtra = (r) => ({ ...r.cloudWhy ? { cloudWhy: r.cloudWhy } : {}, ...r.cloudAge ? { cloudAge: r.cloudAge } : {} });
+function withCloudKey(plain, cloud, extra = {}) {
+  const { cloud: _old, cloudWhy: _w, cloudAge: _a, plan, dbg, ...base } = plain;
+  const keys = cloud ? { cloud, ...extra.cloudWhy ? { cloudWhy: extra.cloudWhy } : {}, ...extra.cloudAge ? { cloudAge: extra.cloudAge } : {} } : {};
+  const fitted = appendFittedPlanAndDebug({ ...base, ...keys }, typeof plan === "string" ? plan : undefined, typeof dbg === "string" ? dbg : undefined);
   if (!cloud)
     return fitted;
-  const { cloud: c, ...rest } = fitted;
-  return { ...rest, cloud: c };
+  const rest = Object.fromEntries(Object.entries(fitted).filter(([k]) => !(k in keys)));
+  return { ...rest, ...keys };
 }
 var RECORD_FULL_TEXT_MAX_CHARS = 262144;
 var RECORD_FULL_TEXT_TRUNCATION_MARKER = `
@@ -4059,7 +4061,7 @@ function buildStatePlaintext(record, status, at, titleFallback) {
     by: "wd"
   }) : undefined;
   const fitted = appendFittedPlanAndDebug(base, adapterFor(agent).ambientPlan ? record.planFull : undefined, dbg);
-  return filled(record.cloud) ? withCloudKey(fitted, record.cloud) : fitted;
+  return filled(record.cloud) ? withCloudKey(fitted, record.cloud, recordCloudExtra(record)) : fitted;
 }
 function stateHoldLive(hold, holdPidAlive, now) {
   if (!hold || !filled(hold.blob))
@@ -5546,7 +5548,7 @@ function cloudActive(id, path = `${CC_DIR}/cloud.json`) {
     return false;
   }
 }
-function cloudState(p, run, locked = false, moveFailed = false) {
+function cloudState(p, run, locked = false, moveFailed = false, back) {
   switch (p?.state) {
     case "moving":
       return "moving";
@@ -5555,10 +5557,14 @@ function cloudState(p, run, locked = false, moveFailed = false) {
     case "back":
       return "back";
     case "cloud":
-      return run?.running || locked ? "returning" : run && run.code !== 0 ? "failed" : "cloud";
+      return run?.running || locked ? "returning" : run && run.code !== 0 || back === "failed" ? "failed" : "cloud";
   }
-  return !p && moveFailed ? "move-failed" : undefined;
+  if (p)
+    return;
+  return moveFailed ? "move-failed" : back === "gone" ? "box-gone" : undefined;
 }
+var CLOUD_EXPIRING_MS = 13 * 24 * 3600000;
+var cloudAge = (p, now) => p?.state === "cloud" && now - p.since >= CLOUD_EXPIRING_MS ? "expiring" : undefined;
 var parkWantsCommands = (p) => p?.state === "moving" || p?.state === "cloud" || p?.state === "landing";
 function withParked(body, dir = PARK_DIR) {
   const id = body.sessionId;
@@ -5600,13 +5606,46 @@ function releaseBackLock(id, dir = BACK_LOCK_DIR) {
   } catch {}
 }
 var moveResultFile = (id, dir = BACK_LOCK_DIR) => join3(dir, `${id.slice(0, 12)}.move`);
-function writeMoveResult(id, ok, dir = BACK_LOCK_DIR) {
+var MOVE_WHYS = ["secret", "cap", "notPaired", "busy", "gone", "other"];
+function writeMoveResult(id, ok, dir = BACK_LOCK_DIR, why) {
   try {
     mkdirSync(dir, { recursive: true, mode: 448 });
     writeFileSync(moveResultFile(id, dir), ok ? `DONE
-` : `FAILED
+` : `FAILED${why ? ` ${why}` : ""}
 `, { mode: 384 });
   } catch {}
+}
+function readMoveWhy(id, since, dir = BACK_LOCK_DIR) {
+  try {
+    const f = moveResultFile(id, dir);
+    if (statSync2(f).mtimeMs < since)
+      return;
+    const [state, why] = readFileSync2(f, "utf8").trim().split(/\s+/);
+    if (state !== "FAILED")
+      return;
+    return MOVE_WHYS.includes(why) ? why : "other";
+  } catch {
+    return;
+  }
+}
+var backResultFile = (id, dir = BACK_LOCK_DIR) => join3(dir, `${id.slice(0, 12)}.back`);
+function writeBackResult(id, r, dir = BACK_LOCK_DIR) {
+  try {
+    mkdirSync(dir, { recursive: true, mode: 448 });
+    writeFileSync(backResultFile(id, dir), `${r.toUpperCase()}
+`, { mode: 384 });
+  } catch {}
+}
+function readBackResult(id, since, dir = BACK_LOCK_DIR) {
+  try {
+    const f = backResultFile(id, dir);
+    if (statSync2(f).mtimeMs < since)
+      return;
+    const r = readFileSync2(f, "utf8").trim().toLowerCase();
+    return r === "done" || r === "failed" || r === "gone" ? r : undefined;
+  } catch {
+    return;
+  }
 }
 function readMoveResult(id, since, dir = BACK_LOCK_DIR) {
   try {
@@ -8225,7 +8264,7 @@ async function buildDoneEnvelope(sessionId, record, now, e2eKey, agent = "claude
   };
   const debug = appendCodexBridgeMarker(agent === "codex" ? dbg ?? formatPlanPickerDebug({ event: "done", classifier: "done", marker: "0", by: "wd" }) : undefined, codexBridgeIsDown());
   const fitted = appendFittedPlanAndDebug(base, ambientPlan(agent, record), debug);
-  const blob = await encryptBlob(e2eKey, record.cloud ? withCloudKey(fitted, record.cloud) : fitted);
+  const blob = await encryptBlob(e2eKey, record.cloud ? withCloudKey(fitted, record.cloud, recordCloudExtra(record)) : fitted);
   return { v: 2, sessionId, op: "done", prio: 0, ts: now, blob, ...startedAtField(record) };
 }
 async function buildNeedsAttentionEnvelope(sessionId, record, now, e2eKey, agent = "claude", at, detail, attentionKind, proposedPlan, dbg) {
@@ -9158,32 +9197,65 @@ function moveFailed(id, park, rec, outcome = (since) => readMoveResult(id, since
   }
   return !!m.failedAt && !park;
 }
+function cloudWant(id, park, record, now, deps = {}) {
+  const since = park ? park.since : typeof record?.turnStartedAt === "number" ? record.turnStartedAt * 1000 : 0;
+  const back = (deps.backResult ?? ((t) => readBackResult(id, t)))(since);
+  const locked = deps.locked ?? (park?.state === "cloud" && backLockHolder(id) !== undefined);
+  const cloud = cloudState(park, backRuns.get(id), locked, deps.moveFailed ?? moveFailed(id, park, record), back);
+  const run = moveRuns.get(id);
+  const why = cloud === "move-failed" ? (deps.why ?? ((t) => readMoveWhy(id, t)))(run?.startedAt ?? 0) ?? "other" : undefined;
+  const age = cloudAge(park, now);
+  return { cloud, extra: { ...why ? { cloudWhy: why } : {}, ...age ? { cloudAge: age } : {} } };
+}
+var boxProbeAt = 0;
+function maybeProbeBox(now, deps = {}) {
+  if (now - boxProbeAt < CLOUD_KEEPALIVE_MS)
+    return false;
+  let parked = [];
+  try {
+    parked = (deps.parked ?? (() => readdirSync(PARK_DIR).filter((id) => readPark(id)?.state === "cloud")))();
+  } catch {}
+  if (!parked.length)
+    return false;
+  boxProbeAt = now;
+  try {
+    (deps.spawn ?? ((id) => spawnHandoff(id, "box check", ["--box-health"], homedir(), () => {})))(parked[0]);
+  } catch {}
+  return true;
+}
+var resetBoxProbe = () => {
+  boxProbeAt = 0;
+};
 var cloudPosts = new Map;
 var CLOUD_RETRY_MS = 30000;
 var CLOUD_KEEPALIVE_MS = 30 * 60000;
-async function correctCloudState(config, path, sessionId, record, want, deps = {}) {
+async function correctCloudState(config, path, sessionId, record, want, deps = {}, extra = {}) {
   try {
     if (typeof record.blob !== "string" || record.blob.length === 0 || record.pairingId !== config.pairingId)
       return "uncorrected";
     const now = (deps.now ?? Date.now)();
     const plain = await decryptBlob(config.e2eKey, record.blob);
-    const changed = plain.cloud !== want;
+    if (!want)
+      extra = {};
+    const changed = plain.cloud !== want || plain.cloudWhy !== extra.cloudWhy || plain.cloudAge !== extra.cloudAge;
+    const done = record.op === "done" || record.lastEvent === "done";
     const prev = cloudPosts.get(sessionId);
     if (prev && !prev.ok && now - prev.at < CLOUD_RETRY_MS)
       return "uncorrected";
     if (!changed && (want === undefined || prev?.ok && now - prev.at < CLOUD_KEEPALIVE_MS))
       return "uncorrected";
-    const blob = changed ? await encryptBlob(config.e2eKey, withCloudKey(plain, want)) : record.blob;
-    const outcome = await (deps.post ?? ((body) => postEvent(config, body)))({ v: 2, sessionId, op: record.op ?? "update", prio: record.prio ?? 0, ts: now, blob, ...startedAtField(record) });
+    const base = done && changed ? buildStatePlaintext(record, "done", typeof record.ts === "number" ? record.ts : now) : plain;
+    const blob = changed ? await encryptBlob(config.e2eKey, withCloudKey(base, want, extra)) : record.blob;
+    const outcome = await (deps.post ?? ((body) => postEvent(config, body)))({ v: 2, sessionId, op: done ? "done" : record.op ?? "update", prio: done ? 0 : record.prio ?? 0, ts: now, blob, ...startedAtField(record) });
     cloudPosts.set(sessionId, { at: now, ok: outcome === "delivered" });
     if (outcome === "revoked")
       return "revoked";
     if (outcome !== "delivered")
       return "uncorrected";
-    if (changed || record.cloud !== want) {
+    if (changed || record.cloud !== want || record.cloudWhy !== extra.cloudWhy || record.cloudAge !== extra.cloudAge) {
       const fresh = await (deps.readRecord ?? readRecordAt)(path);
       if (fresh && fresh.blob === record.blob) {
-        await (deps.writeRecord ?? ((p, r) => atomicWrite(p, JSON.stringify(r), 384)))(path, { ...fresh, blob, cloud: want });
+        await (deps.writeRecord ?? ((p, r) => atomicWrite(p, JSON.stringify(r), 384)))(path, { ...fresh, blob, cloud: want, cloudWhy: extra.cloudWhy, cloudAge: extra.cloudAge });
       }
     }
     return "corrected";
@@ -10297,7 +10369,8 @@ async function sweep(config, deps = {}) {
       }
       remaining++;
       if (config && record && !pendingDoneHandled) {
-        const cloudFix = await correctCloudState(config, path, sessionId, record, cloudState(park, backRuns.get(sessionId), park?.state === "cloud" && backLockHolder(sessionId) !== undefined, moveFailed(sessionId, park, record)));
+        const want = cloudWant(sessionId, park, record, now);
+        const cloudFix = await correctCloudState(config, path, sessionId, record, want.cloud, {}, want.extra);
         if (cloudFix === "revoked")
           return { revoked: true };
         if (cloudFix === "corrected") {
@@ -10726,6 +10799,8 @@ async function run() {
       const result = await sweep(config, {
         threadWaitState: (threadId) => bridges.threadWaitState(threadId)
       });
+      if (config)
+        maybeProbeBox(Date.now());
       if (!result.revoked && result.active > 0 !== commandActive) {
         commandActive = result.active > 0;
         commandWake.kick();
@@ -10848,6 +10923,7 @@ export {
   classifySession,
   claudeTailPendingApproval,
   clearDoneAttempts,
+  cloudWant,
   codexBridgeIsDown,
   codexLastTurnEvent,
   codexTailPendingApproval,
@@ -10882,6 +10958,7 @@ export {
   isRightfulWatchdogOwner,
   isWaitingSession,
   lastTurnLine,
+  maybeProbeBox,
   moveFailed,
   moveRuns,
   moveToCloud,
@@ -10901,6 +10978,7 @@ export {
   repairTitle,
   resendAllowed,
   resendBackoffMs,
+  resetBoxProbe,
   resetCommandState,
   resetDoneAttemptMemory,
   resetResendBackoff,

@@ -384,7 +384,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "2.3.39";
+var PLUGIN_VERSION = "2.3.40";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -508,13 +508,15 @@ function appendFittedPlanAndDebug(base, plan, dbg) {
   const withDebug = { ...withPlan, dbg: capped };
   return sealedBlobChars(encoder.encode(JSON.stringify(withDebug)).length) <= BLOB_FIT_CHARS ? withDebug : withPlan;
 }
-function withCloudKey(plain, cloud) {
-  const { cloud: _old, plan, dbg, ...base } = plain;
-  const fitted = appendFittedPlanAndDebug(cloud ? { ...base, cloud } : base, typeof plan === "string" ? plan : undefined, typeof dbg === "string" ? dbg : undefined);
+var recordCloudExtra = (r) => ({ ...r.cloudWhy ? { cloudWhy: r.cloudWhy } : {}, ...r.cloudAge ? { cloudAge: r.cloudAge } : {} });
+function withCloudKey(plain, cloud, extra = {}) {
+  const { cloud: _old, cloudWhy: _w, cloudAge: _a, plan, dbg, ...base } = plain;
+  const keys = cloud ? { cloud, ...extra.cloudWhy ? { cloudWhy: extra.cloudWhy } : {}, ...extra.cloudAge ? { cloudAge: extra.cloudAge } : {} } : {};
+  const fitted = appendFittedPlanAndDebug({ ...base, ...keys }, typeof plan === "string" ? plan : undefined, typeof dbg === "string" ? dbg : undefined);
   if (!cloud)
     return fitted;
-  const { cloud: c, ...rest } = fitted;
-  return { ...rest, cloud: c };
+  const rest = Object.fromEntries(Object.entries(fitted).filter(([k]) => !(k in keys)));
+  return { ...rest, ...keys };
 }
 var RECORD_FULL_TEXT_MAX_CHARS = 262144;
 var RECORD_FULL_TEXT_TRUNCATION_MARKER = `
@@ -3554,7 +3556,7 @@ function cloudActive(id, path = `${CC_DIR}/cloud.json`) {
     return false;
   }
 }
-function cloudState(p, run, locked = false, moveFailed = false) {
+function cloudState(p, run, locked = false, moveFailed = false, back) {
   switch (p?.state) {
     case "moving":
       return "moving";
@@ -3563,10 +3565,14 @@ function cloudState(p, run, locked = false, moveFailed = false) {
     case "back":
       return "back";
     case "cloud":
-      return run?.running || locked ? "returning" : run && run.code !== 0 ? "failed" : "cloud";
+      return run?.running || locked ? "returning" : run && run.code !== 0 || back === "failed" ? "failed" : "cloud";
   }
-  return !p && moveFailed ? "move-failed" : undefined;
+  if (p)
+    return;
+  return moveFailed ? "move-failed" : back === "gone" ? "box-gone" : undefined;
 }
+var CLOUD_EXPIRING_MS = 13 * 24 * 3600000;
+var cloudAge = (p, now) => p?.state === "cloud" && now - p.since >= CLOUD_EXPIRING_MS ? "expiring" : undefined;
 var parkWantsCommands = (p) => p?.state === "moving" || p?.state === "cloud" || p?.state === "landing";
 function withParked(body, dir = PARK_DIR) {
   const id = body.sessionId;
@@ -3608,13 +3614,46 @@ function releaseBackLock(id, dir = BACK_LOCK_DIR) {
   } catch {}
 }
 var moveResultFile = (id, dir = BACK_LOCK_DIR) => join4(dir, `${id.slice(0, 12)}.move`);
-function writeMoveResult(id, ok, dir = BACK_LOCK_DIR) {
+var MOVE_WHYS = ["secret", "cap", "notPaired", "busy", "gone", "other"];
+function writeMoveResult(id, ok, dir = BACK_LOCK_DIR, why) {
   try {
     mkdirSync(dir, { recursive: true, mode: 448 });
     writeFileSync(moveResultFile(id, dir), ok ? `DONE
-` : `FAILED
+` : `FAILED${why ? ` ${why}` : ""}
 `, { mode: 384 });
   } catch {}
+}
+function readMoveWhy(id, since, dir = BACK_LOCK_DIR) {
+  try {
+    const f = moveResultFile(id, dir);
+    if (statSync3(f).mtimeMs < since)
+      return;
+    const [state, why] = readFileSync3(f, "utf8").trim().split(/\s+/);
+    if (state !== "FAILED")
+      return;
+    return MOVE_WHYS.includes(why) ? why : "other";
+  } catch {
+    return;
+  }
+}
+var backResultFile = (id, dir = BACK_LOCK_DIR) => join4(dir, `${id.slice(0, 12)}.back`);
+function writeBackResult(id, r, dir = BACK_LOCK_DIR) {
+  try {
+    mkdirSync(dir, { recursive: true, mode: 448 });
+    writeFileSync(backResultFile(id, dir), `${r.toUpperCase()}
+`, { mode: 384 });
+  } catch {}
+}
+function readBackResult(id, since, dir = BACK_LOCK_DIR) {
+  try {
+    const f = backResultFile(id, dir);
+    if (statSync3(f).mtimeMs < since)
+      return;
+    const r = readFileSync3(f, "utf8").trim().toLowerCase();
+    return r === "done" || r === "failed" || r === "gone" ? r : undefined;
+  } catch {
+    return;
+  }
 }
 function readMoveResult(id, since, dir = BACK_LOCK_DIR) {
   try {
@@ -3793,7 +3832,7 @@ async function waitThenHandoff(p, d) {
     if (d.now() >= end) {
       release();
       unpark();
-      d.result?.(false);
+      d.result?.(false, "other");
       d.log(`FAILED: the turn was still running after ${Math.round((d.capMs ?? LATER_CAP_MS) / 60000)} min; nothing was moved. Run /nomo-cc:handoff again.`);
       d.notify("Handoff gave up: the turn did not end in time. Nothing was moved.");
       return 1;
@@ -3830,7 +3869,7 @@ async function waitThenHandoff(p, d) {
     d.notify("Your session is now running in the cloud.");
   } else {
     unpark();
-    d.result?.(false);
+    d.result?.(false, code === EXIT_BOX_GONE ? "gone" : "other");
     d.log(`FAILED: ${why ?? `the handoff exited ${code}; see the lines above`}. Your Mac copy is untouched.`);
     d.notify("Handoff failed. Your Mac copy is untouched. Check /nomo-cc:handoff status.");
   }
@@ -3852,34 +3891,35 @@ Log: ${d.log}` : "No handoff waiting.";
 function phoneMoveCheck(f) {
   const r = f.record;
   if (!r)
-    return { refuse: "no Nomo record for this session" };
+    return { refuse: "no Nomo record for this session", why: "other" };
   if ((r.agent ?? "claude") !== "claude" || r.provisional === true)
-    return { refuse: "only a Claude Code session can move to the cloud" };
+    return { refuse: "only a Claude Code session can move to the cloud", why: "other" };
   const pid = r.pid, cmd = typeof pid === "number" && pid > 1 ? f.command(pid) : undefined;
   if (!pid || !cmd)
-    return { refuse: "its Claude Code process is not running" };
+    return { refuse: "its Claude Code process is not running", why: "other" };
   const up = f.ancestorsOf(pid).map((p) => f.command(p));
   if (claudeHeadlessInvocation(cmd, up) || claudeDesktopInvocation(cmd, up))
-    return { refuse: "a headless or desktop-app session can't move to the cloud" };
+    return { refuse: "a headless or desktop-app session can't move to the cloud", why: "other" };
   if (basename3(cmd.trim().split(/\s+/)[0]) !== "claude")
-    return { refuse: "its Claude Code process is not running" };
+    return { refuse: "its Claude Code process is not running", why: "other" };
   if (f.parked)
-    return { refuse: "it is already moving, in the cloud, or parked" };
+    return { refuse: "it is already moving, in the cloud, or parked", why: "other" };
   if (f.active)
-    return { refuse: "it is already running in the cloud" };
+    return { refuse: "it is already running in the cloud", why: "other" };
   if (f.needsPairing)
-    return { refuse: "the cloud box needs a one-time pairing; run /nomo-cc:handoff in that session first" };
+    return { refuse: "the cloud box needs a one-time pairing; run /nomo-cc:handoff in that session first", why: "notPaired" };
   if (f.cloudCount >= BOX_MAX_SESSIONS)
-    return { refuse: `the cloud box already runs ${f.cloudCount} sessions (the cap is ${BOX_MAX_SESSIONS}); bring one back first` };
+    return { refuse: `the cloud box already runs ${f.cloudCount} sessions (the cap is ${BOX_MAX_SESSIONS}); bring one back first`, why: "cap" };
   if (!r.cwd || !f.transcriptExists(r.cwd))
-    return { refuse: "its transcript was not found" };
+    return { refuse: "its transcript was not found", why: "other" };
   const secrets = f.trackedSecrets(r.cwd);
   if (!secrets)
-    return { refuse: "git could not list the project's tracked files" };
+    return { refuse: "git could not list the project's tracked files", why: "other" };
   if (secrets.length)
-    return { refuse: `${secrets.slice(0, 3).join(", ")} looks like a secret and is tracked in git, so it would travel; move it from the terminal (/nomo-cc:handoff) if that is fine` };
+    return { refuse: `${secrets.slice(0, 3).join(", ")} looks like a secret and is tracked in git, so it would travel; move it from the terminal (/nomo-cc:handoff) if that is fine`, why: "secret" };
   return { claudePid: pid, cwd: r.cwd };
 }
+var EXIT_BOX_GONE = 3;
 var PHONE_SETTLE_MS = 2000;
 async function settleThenStamp(session, d) {
   for (let i = 0;i < 2; i++) {
@@ -5452,22 +5492,39 @@ function macId() {
 function createBody(hasBase, externalUserId) {
   return { ...hasBase ? { templateId: BASE_TEMPLATE } : { template: "omg" }, size: BOX_SIZE, externalUserId };
 }
-async function getBox(key, id) {
+async function getBox(key, id, call = api) {
   if (!id)
     return;
+  let sb;
   try {
-    const sb = await api(key, "GET", `/sandboxes/${id}`);
-    return sb.status === "stopped" ? undefined : sb;
+    sb = await call(key, "GET", `/sandboxes/${id}`);
   } catch (e) {
     if (e.status === 404)
       return;
     throw e;
   }
+  if (sb?.status !== "stopped")
+    return sb;
+  console.log(`Box ${id} is stopped; trying to wake it…`);
+  try {
+    return await call(key, "POST", `/sandboxes/${id}/wake`);
+  } catch {
+    return;
+  }
+}
+function boxGone(uuid, deps = {}) {
+  (deps.clear ?? clearPark)(uuid);
+  (deps.update ?? updateCloud)((c) => {
+    const { [uuid]: _gone, ...sessions } = c.sessions ?? {};
+    return { ...c, sessions, active: (c.active ?? []).filter((s) => s !== uuid) };
+  });
+  (deps.result ?? ((id) => writeBackResult(id, "gone")))(uuid);
+  return `Your cloud box is gone (deleted or stopped for good), so the work session ${uuid} did there is lost. ` + `The session continues on this Mac from where it was before the move; this window is unparked.`;
 }
 async function ensureBox(key) {
   let sb = await getBox(key, loadCloud().sandboxId);
   if (!sb && process.env.NOMO_HANDOFF_HELPER) {
-    throw new Error(`your cloud box is gone (deleted after 14 days asleep, or stopped). Create and pair a new one from a terminal: cd ${q(process.cwd())} && ${q(process.execPath)} ${q(SELF)} --session <id>`);
+    throw Object.assign(new Error(`your cloud box is gone (deleted after 14 days asleep, or stopped). Create and pair a new one from a terminal: cd ${q(process.cwd())} && ${q(process.execPath)} ${q(SELF)} --session <id>`), { exitCode: EXIT_BOX_GONE });
   }
   if (!sb) {
     const hasBase = await api(key, "GET", `/templates/${BASE_TEMPLATE}/latest`).then(() => true, () => false);
@@ -5476,6 +5533,15 @@ async function ensureBox(key) {
     updateCloud((c) => ({ ...c, sandboxId: sb.id, active: [] }));
   }
   return wakeBox(key, sb);
+}
+async function boxHealth(omg, deps = {}) {
+  const cloud = deps.cloud ?? loadCloud();
+  const parked = (cloud.active ?? []).filter((id) => (deps.park ?? readPark)(id)?.state === "cloud");
+  if (!parked.length || await (deps.get ?? getBox)(omg, cloud.sandboxId))
+    return [];
+  for (const id of parked)
+    console.log((deps.gone ?? boxGone)(id));
+  return parked;
 }
 async function wakeBox(key, sb) {
   if (sb.status === "hibernated") {
@@ -5799,6 +5865,11 @@ async function back(omg, args) {
     throw new Error(`session ${uuid} is already being brought back (pid ${backLockHolder(uuid) ?? "?"}); let that finish.`);
   }
   process.once("exit", () => releaseBackLock(uuid));
+  let outcome = "failed";
+  process.once("exit", () => {
+    if (outcome !== "gone")
+      writeBackResult(uuid, outcome);
+  });
   const parkedAtStart = readPark(uuid);
   const sameWindow = here === uuid;
   if (sameWindow && parkedAtStart?.state === "landing") {
@@ -5809,6 +5880,7 @@ async function back(omg, args) {
     console.log(`The box's copy is staged; it goes in as this turn ends.
 
 ${sameWindowBackLine(parkedAtStart.resume ?? uuid)}`);
+    outcome = "done";
     return;
   }
   if (sameWindow && parkedAtStart?.state !== "cloud") {
@@ -5837,8 +5909,12 @@ ${sameWindowBackLine(parkedAtStart.resume ?? uuid)}`);
   }
   const enc = projectDirName(cwd);
   const sb = await getBox(omg, cloud.sandboxId);
-  if (!sb)
-    throw new Error("no cloud box on record (nothing to bring back)");
+  if (!sb) {
+    outcome = "gone";
+    console.log(boxGone(uuid));
+    process.exitCode = 1;
+    return;
+  }
   const id = await wakeBox(omg, sb);
   let gone = false;
   const other = (out) => {
@@ -6079,6 +6155,7 @@ The conversation itself is back: cd ${q(cwd)} && claude --resume ${resumeId}`);
     writePark(uuid, { state: "elsewhere", pid: parkedAtStart.pid });
   } else
     clearPark(uuid);
+  outcome = "done";
   if (sameWindow) {
     console.log(`
 ${sameWindowBackLine(resumeId)}`);
@@ -6220,6 +6297,11 @@ async function phoneLater(args, keys, worker) {
   if (!keys.omg || !keys.openrouter)
     throw new Error("OMG_API_KEY and OPENROUTER_API_KEY must be set (env or ~/.nomo-spike.env)");
   const home = process.env.HOME;
+  rmSync(moveResultFile(session), { force: true });
+  const refuse = (why, msg) => {
+    writeMoveResult(session, false, undefined, why);
+    throw new Error(`not moving ${session}: ${msg}.`);
+  };
   const cloud = loadCloud();
   const ok = phoneMoveCheck({
     record: await readRecord(session),
@@ -6233,15 +6315,16 @@ async function phoneLater(args, keys, worker) {
     trackedSecrets: trackedSecretFiles
   });
   if ("refuse" in ok)
-    throw new Error(`not moving ${session}: ${ok.refuse}.`);
+    return refuse(ok.why, ok.refuse);
   let root;
   try {
     root = execFileSync5("git", ["rev-parse", "--show-toplevel"], { cwd: ok.cwd, stdio: ["ignore", "pipe", "ignore"] }).toString().trim();
   } catch {}
   const refusal = root ? packRefusal(root, home, () => false) : packRefusal(ok.cwd, home);
   if (refusal)
-    throw new Error(`not moving ${session}: ${refusal}.`);
+    return refuse("secret", refusal);
   if (!arm(session, ok.claudePid, ok.cwd, DEFAULT_THEN, worker)) {
+    writeMoveResult(session, false, undefined, "busy");
     process.exitCode = 1;
     return;
   }
@@ -6261,7 +6344,7 @@ async function afterExit(args, worker) {
   process.exitCode = await waitThenHandoff({ helperPid: process.pid, session, claudePid, state: "waiting", startedAt: Date.now(), message }, {
     pending: PENDING_PATH,
     parkDir: PARK_DIR,
-    result: (ok) => writeMoveResult(session, ok),
+    result: (ok, why) => writeMoveResult(session, ok, undefined, why),
     alive: pidAlive,
     now: Date.now,
     sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
@@ -6375,6 +6458,10 @@ async function main() {
   }
   if (args.has("--back")) {
     await back(omg, args);
+    return;
+  }
+  if (args.has("--box-health")) {
+    await boxHealth(omg);
     return;
   }
   if (["--status", "--stop", "--pair", "--screen", "--send", "--send-key"].some((f) => args.has(f))) {
@@ -6507,7 +6594,7 @@ Session ${plan.uuid} is running on cloud box ${id} (tmux session "${tmuxName(pla
 if (__require.main == __require.module) {
   main().catch((e) => {
     console.error(`handoff: ${e.message ?? e}`);
-    process.exit(1);
+    process.exit(e?.exitCode === EXIT_BOX_GONE ? EXIT_BOX_GONE : 1);
   });
 }
 export {
@@ -6531,6 +6618,8 @@ export {
   backStopScript,
   backWaitScript,
   bakeScript,
+  boxGone,
+  boxHealth,
   boxPairPayload,
   boxPrelude,
   boxSetup,
@@ -6539,6 +6628,7 @@ export {
   checkLaunchIds,
   createBody,
   firstMessageScript,
+  getBox,
   hereSession,
   id12,
   keepaliveLoop,

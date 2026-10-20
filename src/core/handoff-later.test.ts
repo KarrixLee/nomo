@@ -367,6 +367,11 @@ describe("phone move-to-cloud (NOM-94)", () => {
     expect(refuse({ active: true })).toMatch(/already running in the cloud/);
     expect(refuse({ needsPairing: true })).toMatch(/pairing/);
     expect(refuse({ cloudCount: BOX_MAX_SESSIONS })).toMatch(/cap is 4/);
+    const why = (o: Partial<PhoneMoveFacts>) => (phoneMoveCheck(facts(o)) as { why: string }).why;
+    expect(why({ cloudCount: BOX_MAX_SESSIONS })).toBe("cap");
+    expect(why({ needsPairing: true })).toBe("notPaired");
+    expect(why({ trackedSecrets: () => [".env"] })).toBe("secret");
+    expect(why({ parked: true })).toBe("other");
     expect(phoneMoveCheck(facts({ cloudCount: BOX_MAX_SESSIONS - 1 }))).toEqual({ claudePid: 400, cwd: "/p/app" });
     expect(refuse({ transcriptExists: () => false })).toMatch(/transcript/);
     expect(refuse({ record: { pid: 400 } })).toMatch(/transcript/);

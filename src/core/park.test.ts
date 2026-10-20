@@ -332,3 +332,48 @@ describe("turn end without a Stop + per-session move outcome (NOM-94)", () => {
     expect(readMoveResult(A, 0, dir)).toBe("done");
   });
 });
+
+import { cloudAge, CLOUD_EXPIRING_MS, readBackResult, readMoveWhy, writeBackResult } from "./park";
+
+describe("NOM-99 result files and states", () => {
+  const A = "0a1b2c3d-1111-4222-8333-444455556666";
+  const dir = () => mkdtempSync(join(tmpdir(), "nomo-res-"));
+
+  test(".back: persisted, and an older run's file never counts", () => {
+    const d = dir();
+    expect(readBackResult(A, 0, d)).toBeUndefined();
+    writeBackResult(A, "failed", d);
+    expect(readBackResult(A, 0, d)).toBe("failed");
+    expect(readBackResult(A, Date.now() + 60_000, d)).toBeUndefined();
+    writeBackResult(A, "gone", d);
+    expect(readBackResult(A, 0, d)).toBe("gone");
+  });
+
+  test(".move carries a reason code; DONE or a stale file has none", () => {
+    const d = dir();
+    writeMoveResult(A, false, d, "secret");
+    expect(readMoveResult(A, 0, d)).toBe("failed");
+    expect(readMoveWhy(A, 0, d)).toBe("secret");
+    expect(readMoveWhy(A, Date.now() + 60_000, d)).toBeUndefined();
+    writeMoveResult(A, false, d);
+    expect(readMoveWhy(A, 0, d)).toBe("other");
+    writeMoveResult(A, true, d);
+    expect(readMoveWhy(A, 0, d)).toBeUndefined();
+  });
+
+  test("cloudState: a persisted failed back reads failed while parked; gone reads box-gone unparked", () => {
+    expect(cloudState({ state: "cloud", since: 0 }, undefined, false, false, "failed")).toBe("failed");
+    expect(cloudState({ state: "cloud", since: 0 }, { running: true }, false, false, "failed")).toBe("returning");
+    expect(cloudState(undefined, undefined, false, false, "gone")).toBe("box-gone");
+    expect(cloudState(undefined, undefined, false, true, "gone")).toBe("move-failed");
+    expect(cloudState(undefined, undefined, false, false, "done")).toBeUndefined();
+  });
+
+  test("cloudAge: expiring from 13 days in the cloud, only for a cloud marker", () => {
+    const now = 100 * CLOUD_EXPIRING_MS;
+    expect(cloudAge({ state: "cloud", since: now - CLOUD_EXPIRING_MS }, now)).toBe("expiring");
+    expect(cloudAge({ state: "cloud", since: now - CLOUD_EXPIRING_MS + 1 }, now)).toBeUndefined();
+    expect(cloudAge({ state: "moving", since: 0 }, now)).toBeUndefined();
+    expect(cloudAge(undefined, now)).toBeUndefined();
+  });
+});

@@ -30,7 +30,7 @@
 
 import { readdir, readFile, unlink } from "node:fs/promises";
 import { spawn } from "node:child_process";
-import { closeSync, existsSync, mkdirSync, openSync, readFileSync, statSync, unlinkSync, writeSync } from "node:fs";
+import { closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, statSync, unlinkSync, writeSync } from "node:fs";
 import { homedir, hostname } from "node:os";
 import { basename } from "node:path";
 import { Bytes, decryptBlob, encryptBlob } from "../core/crypto";
@@ -44,12 +44,12 @@ import type { CodexTurnInterruptResult } from "../core/codex-app-server-client";
 import { createLanHintPublisher, createLanListener, lanAnswerStore } from "../core/lan-listener";
 import type { LanAnswerDelivery, LanAnswerStore, LanCommand, LanListener } from "../core/lan-listener";
 import { lanRunningUnderTest } from "../core/lan-wire";
-import { stateHoldLive } from "../core/session-state";
+import { buildStatePlaintext, stateHoldLive } from "../core/session-state";
 import { resolveOnRelay } from "../core/codex-remote-input";
 import { CODEX_PROXY_STDOUT_ENDED } from "../core/codex-proxy-transport";
 import type { CodexAppServerSocketState, DecisionHold, PlanPickerTraceDecision } from "../core/shared";
 import {
-  AgentKind, AgentKindWire, appendCodexBridgeMarker, boxPairedCached, withCloudKey, appendFittedPlanAndDebug, atomicWrite, CC_DIR, CCOp, CCStatus, codexAppServerSocketAvailable, codexAppServerSocketState, Config, completePendingPairing, DECISION_HOLD_SUFFIX, decisionHoldFileName, formatPlanPickerDebug, formatWatchdogPidfile,
+  AgentKind, AgentKindWire, appendCodexBridgeMarker, boxPairedCached, type CloudExtra, recordCloudExtra, withCloudKey, appendFittedPlanAndDebug, atomicWrite, CC_DIR, CCOp, CCStatus, codexAppServerSocketAvailable, codexAppServerSocketState, Config, completePendingPairing, DECISION_HOLD_SUFFIX, decisionHoldFileName, formatPlanPickerDebug, formatWatchdogPidfile,
   startCodexAppServerDaemon,
   GONE_STRIKE_LIMIT, loadConfig, loadPendingConfig, localApprovalsState,
   PAIR_HTML_FILE, PairPollResult, parseWatchdogPidfile, PendingConfig, pidAlive, PLUGIN_VERSION, readDecisionHoldAt, readPrefix, readSuffix, recordGoneStrike, removeRevokedConfig,
@@ -57,7 +57,7 @@ import {
   watchdogBuildStamp, watchdogHolderIsLive, WATCHDOG_PATH, WATCHDOG_PID_PATH, writeInterruptFlagAt,
 } from "../core/shared";
 import { rememberBounded } from "../core/bounded-set";
-import { BackRun, backLockHolder, BACK_LOCK_DIR, cloudActive, cloudState, CloudState, endMovingTurn, Park, parkWantsCommands, readMoveResult, readPark, withParked } from "../core/park";
+import { BackRun, backLockHolder, BACK_LOCK_DIR, cloudActive, cloudAge, cloudState, CloudState, endMovingTurn, Park, PARK_DIR, parkWantsCommands, readBackResult, readMoveResult, readMoveWhy, readPark, withParked } from "../core/park";
 
 // The transcript-tail interrupt PARSERS live in the agent adapters now (the two detections are
 // structurally different). Re-export them so existing importers/tests that reference "./cc-watchdog"
@@ -325,7 +325,7 @@ export async function buildDoneEnvelope(sessionId: string, record: SessionRecord
   // tied to an attention episode, so their correctives keep passing the `undefined` they always have
   // and stay byte-identical.
   const fitted = appendFittedPlanAndDebug(base, ambientPlan(agent, record), debug);
-  const blob = await encryptBlob(e2eKey, record.cloud ? withCloudKey(fitted, record.cloud) : fitted);
+  const blob = await encryptBlob(e2eKey, record.cloud ? withCloudKey(fitted, record.cloud, recordCloudExtra(record)) : fitted);
   return { v: 2, sessionId, op: "done", prio: 0, ts: now, blob, ...startedAtField(record) };
 }
 
@@ -1728,6 +1728,41 @@ export function moveFailed(id: string, park: Park | undefined, rec: SessionRecor
 
 export { withCloudKey };
 
+/** What this session's blob should say about the cloud, per sweep: the state (park marker, back runs,
+ *  persisted back result, phone-move failure) plus its NOM-99 companions. A "gone" back result counts
+ *  until the session's next turn starts; a "failed" one while the "cloud" marker it followed stands. */
+export function cloudWant(id: string, park: Park | undefined, record: SessionRecord | null, now: number,
+  deps: { moveFailed?: boolean; backResult?: (since: number) => "done" | "failed" | "gone" | undefined; locked?: boolean; why?: (since: number) => string | undefined } = {},
+): { cloud: CloudState | undefined; extra: CloudExtra } {
+  const since = park ? park.since : typeof record?.turnStartedAt === "number" ? record.turnStartedAt * 1000 : 0;
+  const back = (deps.backResult ?? ((t: number) => readBackResult(id, t)))(since);
+  const locked = deps.locked ?? (park?.state === "cloud" && backLockHolder(id) !== undefined);
+  const cloud = cloudState(park, backRuns.get(id), locked, deps.moveFailed ?? moveFailed(id, park, record), back);
+  const run = moveRuns.get(id);
+  const why = cloud === "move-failed" ? (deps.why ?? ((t: number) => readMoveWhy(id, t)))(run?.startedAt ?? 0) ?? "other" : undefined;
+  const age = cloudAge(park, now);
+  return { cloud, extra: { ...(why ? { cloudWhy: why } : {}), ...(age ? { cloudAge: age } : {}) } };
+}
+
+/** NOM-99: while any session is parked "cloud", ask handoff (which holds the box API key) whether the box
+ *  still exists, at most once per CLOUD_KEEPALIVE_MS. It unparks every session of a gone box; the next
+ *  sweep then posts "box-gone". Nothing parked → no probe. */
+let boxProbeAt = 0;
+export function maybeProbeBox(now: number, deps: { parked?: () => string[]; spawn?: (id: string) => void } = {}): boolean {
+  if (now - boxProbeAt < CLOUD_KEEPALIVE_MS) return false;
+  let parked: string[] = [];
+  try {
+    parked = (deps.parked ?? (() => readdirSync(PARK_DIR).filter((id) => readPark(id)?.state === "cloud")))();
+  } catch { /* no marker dir */ }
+  if (!parked.length) return false;
+  boxProbeAt = now;
+  try {
+    (deps.spawn ?? ((id: string) => spawnHandoff(id, "box check", ["--box-health"], homedir(), () => {})))(parked[0]);
+  } catch { /* logged by spawnHandoff; retried next window */ }
+  return true;
+}
+export const resetBoxProbe = (): void => { boxProbeAt = 0; };
+
 /** Last cloud POST per session. A changed state posts at once; a failure waits CLOUD_RETRY_MS; a set
  *  key is re-posted every CLOUD_KEEPALIVE_MS so the done row outlives the worker's 1 h eviction while
  *  the session is parked (a parked session can sit in the cloud for hours). */
@@ -1741,29 +1776,37 @@ export const CLOUD_KEEPALIVE_MS = 30 * 60_000;
 export async function correctCloudState(
   config: Config, path: string, sessionId: string, record: SessionRecord, want: CloudState | undefined,
   deps: { post?: (body: object) => Promise<PostOutcome>; now?: () => number; readRecord?: (path: string) => Promise<SessionRecord | null>; writeRecord?: (path: string, rec: SessionRecord) => Promise<void> } = {},
+  extra: CloudExtra = {},
 ): Promise<"corrected" | "uncorrected" | "revoked"> {
   try {
     if (typeof record.blob !== "string" || record.blob.length === 0 || record.pairingId !== config.pairingId) return "uncorrected";
     const now = (deps.now ?? Date.now)();
     const plain = await decryptBlob(config.e2eKey, record.blob) as Record<string, unknown>;
-    const changed = plain.cloud !== want;
+    if (!want) extra = {};
+    const changed = plain.cloud !== want || plain.cloudWhy !== extra.cloudWhy || plain.cloudAge !== extra.cloudAge;
+    // A done record can still hold an earlier hook's blob (a watchdog corrective pins op/lastEvent and
+    // POSTs its own done, but leaves record.blob alone). Resealing THAT put a stale "working" back on the
+    // row (NOM-99: "Running" after a refused move), so a done record's reseal starts from the done
+    // plaintext the LAN feed and buildDoneEnvelope author.
+    const done = record.op === "done" || record.lastEvent === "done";
     const prev = cloudPosts.get(sessionId);
     if (prev && !prev.ok && now - prev.at < CLOUD_RETRY_MS) return "uncorrected";
     if (!changed && (want === undefined || (prev?.ok && now - prev.at < CLOUD_KEEPALIVE_MS))) return "uncorrected";
-    const blob = changed ? await encryptBlob(config.e2eKey, withCloudKey(plain, want)) : record.blob;
+    const base = done && changed ? buildStatePlaintext(record, "done", typeof record.ts === "number" ? record.ts : now) : plain;
+    const blob = changed ? await encryptBlob(config.e2eKey, withCloudKey(base, want, extra)) : record.blob;
     const outcome = await (deps.post ?? ((body: object) => postEvent(config, body)))(
-      { v: 2, sessionId, op: record.op ?? "update", prio: record.prio ?? 0, ts: now, blob, ...startedAtField(record) });
+      { v: 2, sessionId, op: done ? "done" : record.op ?? "update", prio: done ? 0 : record.prio ?? 0, ts: now, blob, ...startedAtField(record) });
     cloudPosts.set(sessionId, { at: now, ok: outcome === "delivered" });
     if (outcome === "revoked") return "revoked";
     if (outcome !== "delivered") return "uncorrected";
     // `cloud` is also kept in the clear on the (0600, never-sent) record: the LAN feed and the corrective
     // done author their own blobs from record fields and must carry it too, or a phone on this network
     // keeps the old value (it takes `cloud` from the Mac's LAN frame, not the worker's).
-    if (changed || record.cloud !== want) {
+    if (changed || record.cloud !== want || record.cloudWhy !== extra.cloudWhy || record.cloudAge !== extra.cloudAge) {
       const fresh = await (deps.readRecord ?? readRecordAt)(path);
       // A hook that rewrote the record meanwhile wins; the next sweep re-applies the key to its blob.
       if (fresh && fresh.blob === record.blob) {
-        await (deps.writeRecord ?? ((p: string, r: SessionRecord) => atomicWrite(p, JSON.stringify(r), 0o600)))(path, { ...fresh, blob, cloud: want });
+        await (deps.writeRecord ?? ((p: string, r: SessionRecord) => atomicWrite(p, JSON.stringify(r), 0o600)))(path, { ...fresh, blob, cloud: want, cloudWhy: extra.cloudWhy, cloudAge: extra.cloudAge });
       }
     }
     return "corrected";
@@ -3926,7 +3969,8 @@ async function sweep(config: Config | null, deps: SweepDeps = {}): Promise<Sweep
       if (config && record && !pendingDoneHandled) {
         // NOM-93: a parked session's blob carries `cloud` (what the phone's Bring back shows). A
         // corrective owns the session this sweep (the snapshot is stale after its rewrite).
-        const cloudFix = await correctCloudState(config, path, sessionId, record, cloudState(park, backRuns.get(sessionId), park?.state === "cloud" && backLockHolder(sessionId) !== undefined, moveFailed(sessionId, park, record)));
+        const want = cloudWant(sessionId, park, record, now);
+        const cloudFix = await correctCloudState(config, path, sessionId, record, want.cloud, {}, want.extra);
         if (cloudFix === "revoked") return { revoked: true };
         if (cloudFix === "corrected") { delivered = true; continue; }
         // Idle-provisional corrective FIRST: a discovery row advertised "working" whose TUI has gone
@@ -4644,6 +4688,7 @@ async function run(): Promise<void> {
       const result = await sweep(config, {
         threadWaitState: (threadId) => bridges.threadWaitState(threadId),
       });
+      if (config) maybeProbeBox(Date.now());
       // Long-poll only while a session is active; flipping either way kicks the loop (going idle aborts
       // the parked poll, going active wakes the idle wait).
       if (!result.revoked && (result.active > 0) !== commandActive) {

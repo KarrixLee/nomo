@@ -113,7 +113,7 @@ function buildPairURL(workerUrl, pairingId, qrSecret, pcEphPub) {
 }
 
 // src/core/shared.ts
-var PLUGIN_VERSION = "2.3.39";
+var PLUGIN_VERSION = "2.3.40";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -237,13 +237,15 @@ function appendFittedPlanAndDebug(base, plan, dbg) {
   const withDebug = { ...withPlan, dbg: capped };
   return sealedBlobChars(encoder.encode(JSON.stringify(withDebug)).length) <= BLOB_FIT_CHARS ? withDebug : withPlan;
 }
-function withCloudKey(plain, cloud) {
-  const { cloud: _old, plan, dbg, ...base } = plain;
-  const fitted = appendFittedPlanAndDebug(cloud ? { ...base, cloud } : base, typeof plan === "string" ? plan : undefined, typeof dbg === "string" ? dbg : undefined);
+var recordCloudExtra = (r) => ({ ...r.cloudWhy ? { cloudWhy: r.cloudWhy } : {}, ...r.cloudAge ? { cloudAge: r.cloudAge } : {} });
+function withCloudKey(plain, cloud, extra = {}) {
+  const { cloud: _old, cloudWhy: _w, cloudAge: _a, plan, dbg, ...base } = plain;
+  const keys = cloud ? { cloud, ...extra.cloudWhy ? { cloudWhy: extra.cloudWhy } : {}, ...extra.cloudAge ? { cloudAge: extra.cloudAge } : {} } : {};
+  const fitted = appendFittedPlanAndDebug({ ...base, ...keys }, typeof plan === "string" ? plan : undefined, typeof dbg === "string" ? dbg : undefined);
   if (!cloud)
     return fitted;
-  const { cloud: c, ...rest } = fitted;
-  return { ...rest, cloud: c };
+  const rest = Object.fromEntries(Object.entries(fitted).filter(([k]) => !(k in keys)));
+  return { ...rest, ...keys };
 }
 var RECORD_FULL_TEXT_MAX_CHARS = 262144;
 var RECORD_FULL_TEXT_TRUNCATION_MARKER = `
@@ -3232,7 +3234,7 @@ function cloudActive(id, path = `${CC_DIR}/cloud.json`) {
     return false;
   }
 }
-function cloudState(p, run, locked = false, moveFailed = false) {
+function cloudState(p, run, locked = false, moveFailed = false, back) {
   switch (p?.state) {
     case "moving":
       return "moving";
@@ -3241,10 +3243,14 @@ function cloudState(p, run, locked = false, moveFailed = false) {
     case "back":
       return "back";
     case "cloud":
-      return run?.running || locked ? "returning" : run && run.code !== 0 ? "failed" : "cloud";
+      return run?.running || locked ? "returning" : run && run.code !== 0 || back === "failed" ? "failed" : "cloud";
   }
-  return !p && moveFailed ? "move-failed" : undefined;
+  if (p)
+    return;
+  return moveFailed ? "move-failed" : back === "gone" ? "box-gone" : undefined;
 }
+var CLOUD_EXPIRING_MS = 13 * 24 * 3600000;
+var cloudAge = (p, now) => p?.state === "cloud" && now - p.since >= CLOUD_EXPIRING_MS ? "expiring" : undefined;
 var parkWantsCommands = (p) => p?.state === "moving" || p?.state === "cloud" || p?.state === "landing";
 function withParked(body, dir = PARK_DIR) {
   const id = body.sessionId;
@@ -3286,13 +3292,46 @@ function releaseBackLock(id, dir = BACK_LOCK_DIR) {
   } catch {}
 }
 var moveResultFile = (id, dir = BACK_LOCK_DIR) => join3(dir, `${id.slice(0, 12)}.move`);
-function writeMoveResult(id, ok, dir = BACK_LOCK_DIR) {
+var MOVE_WHYS = ["secret", "cap", "notPaired", "busy", "gone", "other"];
+function writeMoveResult(id, ok, dir = BACK_LOCK_DIR, why) {
   try {
     mkdirSync(dir, { recursive: true, mode: 448 });
     writeFileSync(moveResultFile(id, dir), ok ? `DONE
-` : `FAILED
+` : `FAILED${why ? ` ${why}` : ""}
 `, { mode: 384 });
   } catch {}
+}
+function readMoveWhy(id, since, dir = BACK_LOCK_DIR) {
+  try {
+    const f = moveResultFile(id, dir);
+    if (statSync2(f).mtimeMs < since)
+      return;
+    const [state, why] = readFileSync2(f, "utf8").trim().split(/\s+/);
+    if (state !== "FAILED")
+      return;
+    return MOVE_WHYS.includes(why) ? why : "other";
+  } catch {
+    return;
+  }
+}
+var backResultFile = (id, dir = BACK_LOCK_DIR) => join3(dir, `${id.slice(0, 12)}.back`);
+function writeBackResult(id, r, dir = BACK_LOCK_DIR) {
+  try {
+    mkdirSync(dir, { recursive: true, mode: 448 });
+    writeFileSync(backResultFile(id, dir), `${r.toUpperCase()}
+`, { mode: 384 });
+  } catch {}
+}
+function readBackResult(id, since, dir = BACK_LOCK_DIR) {
+  try {
+    const f = backResultFile(id, dir);
+    if (statSync2(f).mtimeMs < since)
+      return;
+    const r = readFileSync2(f, "utf8").trim().toLowerCase();
+    return r === "done" || r === "failed" || r === "gone" ? r : undefined;
+  } catch {
+    return;
+  }
 }
 function readMoveResult(id, since, dir = BACK_LOCK_DIR) {
   try {
@@ -3414,7 +3453,7 @@ function buildStatePlaintext(record, status, at, titleFallback) {
     by: "wd"
   }) : undefined;
   const fitted = appendFittedPlanAndDebug(base, adapterFor(agent).ambientPlan ? record.planFull : undefined, dbg);
-  return filled(record.cloud) ? withCloudKey(fitted, record.cloud) : fitted;
+  return filled(record.cloud) ? withCloudKey(fitted, record.cloud, recordCloudExtra(record)) : fitted;
 }
 function stateHoldLive(hold, holdPidAlive, now) {
   if (!hold || !filled(hold.blob))

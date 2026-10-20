@@ -79,10 +79,10 @@ import { renderPairPage } from "../core/pair-page";
 import { buildPairURL, DEFAULT_WORKER_URL } from "../core/pair-url";
 import { normalizeModelId } from "../core/adapter";
 import { cloudReadiness, gitProbe, isSecretName, trackedSecretFiles } from "../core/readiness";
-import { backLockHolder, clearPark, cloudActive, PARK_DIR, writeMoveResult, readPark, releaseBackLock, stageLanding, takeBackLock, writePark } from "../core/park";
+import { backLockHolder, clearPark, cloudActive, moveResultFile, type MoveWhy, PARK_DIR, writeBackResult, writeMoveResult, readPark, releaseBackLock, stageLanding, takeBackLock, writePark } from "../core/park";
 import { atomicWrite, CC_DIR, pidAlive, pidAncestors, pidCommand, readRecord, SESSIONS_DIR } from "../core/shared";
 import {
-  BOX_MAX_SESSIONS, cancelPending, claimPending, DEFAULT_THEN, phoneMoveCheck, settleThenStamp, contextTokens, contextTokensOf, GONE_MSG, sizeWarning, TAIL_BYTES, handoffArgv, LATER_LOG, LATER_USAGE, laterStatus, needsPairing, parseLaterArg, type Pending, PENDING_PATH, readPending, resolveSession, waitThenHandoff,
+  BOX_MAX_SESSIONS, cancelPending, claimPending, DEFAULT_THEN, EXIT_BOX_GONE, phoneMoveCheck, settleThenStamp, contextTokens, contextTokensOf, GONE_MSG, sizeWarning, TAIL_BYTES, handoffArgv, LATER_LOG, LATER_USAGE, laterStatus, needsPairing, parseLaterArg, type Pending, PENDING_PATH, readPending, resolveSession, waitThenHandoff,
 } from "../core/handoff-later";
 import {
   agentConfigPaths, applyInPlace, atomicWriteBytes, type BoxArtifacts, boxChangedPaths, boxIdle, copyContained, decideCode, extractTgz,
@@ -773,15 +773,33 @@ export function createBody(hasBase: boolean, externalUserId: string): Record<str
   return { ...(hasBase ? { templateId: BASE_TEMPLATE } : { template: "omg" }), size: BOX_SIZE, externalUserId };
 }
 
-async function getBox(key: string, id: string | undefined): Promise<any | undefined> {
+/** The box, or undefined when it is DEFINITIVELY gone: none on record, a 404, or stopped and a wake
+ *  attempt failed (NOM-99). A network error or 5xx on the GET throws: never read as gone. */
+export async function getBox(key: string, id: string | undefined, call: typeof api = api): Promise<any | undefined> {
   if (!id) return undefined;
+  let sb: any;
   try {
-    const sb = await api(key, "GET", `/sandboxes/${id}`);
-    return sb.status === "stopped" ? undefined : sb;
+    sb = await call(key, "GET", `/sandboxes/${id}`);
   } catch (e: any) {
     if (e.status === 404) return undefined;
     throw e;
   }
+  if (sb?.status !== "stopped") return sb;
+  console.log(`Box ${id} is stopped; trying to wake it…`);
+  try { return await call(key, "POST", `/sandboxes/${id}/wake`); } catch { return undefined; }
+}
+
+/** The box is gone (NOM-99): unpark the session, drop it from cloud.json, and say so plainly. The
+ *  session continues on this Mac from where it was before the move; the phone row reads "box-gone". */
+export function boxGone(uuid: string, deps: { clear?: (id: string) => void; update?: (fn: (c: Cloud) => Cloud) => unknown; result?: (id: string) => void } = {}): string {
+  (deps.clear ?? clearPark)(uuid);
+  (deps.update ?? updateCloud)((c) => {
+    const { [uuid]: _gone, ...sessions } = c.sessions ?? {};
+    return { ...c, sessions, active: (c.active ?? []).filter((s) => s !== uuid) };
+  });
+  (deps.result ?? ((id: string) => writeBackResult(id, "gone")))(uuid);
+  return `Your cloud box is gone (deleted or stopped for good), so the work session ${uuid} did there is lost. ` +
+    `The session continues on this Mac from where it was before the move; this window is unparked.`;
 }
 
 /** The user's one box, running: reuse (waking it if asleep) or create. */
@@ -789,7 +807,7 @@ async function ensureBox(key: string): Promise<string> {
   let sb = await getBox(key, loadCloud().sandboxId);
   if (!sb && process.env.NOMO_HANDOFF_HELPER) {
     // Unattended (/nomo-cc:handoff's helper): a new box needs a QR scan nobody is there to do.
-    throw new Error(`your cloud box is gone (deleted after 14 days asleep, or stopped). Create and pair a new one from a terminal: cd ${q(process.cwd())} && ${q(process.execPath)} ${q(SELF)} --session <id>`);
+    throw Object.assign(new Error(`your cloud box is gone (deleted after 14 days asleep, or stopped). Create and pair a new one from a terminal: cd ${q(process.cwd())} && ${q(process.execPath)} ${q(SELF)} --session <id>`), { exitCode: EXIT_BOX_GONE });
   }
   if (!sb) {
     const hasBase = await api(key, "GET", `/templates/${BASE_TEMPLATE}/latest`).then(() => true, () => false);
@@ -798,6 +816,16 @@ async function ensureBox(key: string): Promise<string> {
     updateCloud((c) => ({ ...c, sandboxId: sb.id, active: [] })); // the old box's sessions went with it
   }
   return wakeBox(key, sb);
+}
+
+/** NOM-99: the watchdog's ~30 min probe while a session is parked "cloud": a DEFINITIVELY gone box
+ *  (getBox) unparks every one of its parked sessions. Any error (network, 5xx) changes nothing. */
+export async function boxHealth(omg: string, deps: { cloud?: Cloud; park?: (id: string) => { state: string } | undefined; get?: typeof getBox; gone?: (id: string) => string } = {}): Promise<string[]> {
+  const cloud = deps.cloud ?? loadCloud();
+  const parked = (cloud.active ?? []).filter((id) => (deps.park ?? readPark)(id)?.state === "cloud");
+  if (!parked.length || await (deps.get ?? getBox)(omg, cloud.sandboxId)) return [];
+  for (const id of parked) console.log((deps.gone ?? boxGone)(id));
+  return parked;
 }
 
 /** An existing box, running (never creates one). */
@@ -1169,6 +1197,9 @@ async function back(omg: string, args: Map<string, string | true>): Promise<void
     throw new Error(`session ${uuid} is already being brought back (pid ${backLockHolder(uuid) ?? "?"}); let that finish.`);
   }
   process.once("exit", () => releaseBackLock(uuid)); // every exit path, incl. the SIGINT handler's
+  // NOM-99: this run's outcome for the phone row, whoever started it; anything but a finish is FAILED.
+  let outcome: "done" | "failed" | "gone" = "failed";
+  process.once("exit", () => { if (outcome !== "gone") writeBackResult(uuid, outcome); });
   // /nomo-cc:back from the parked window itself (NOM-90) lands the box copy under it: the user then types
   // /resume <id> there. Only a window parked as "cloud" (gated since the move, so it cannot have diverged
   // except through Nomo's own commands) qualifies. From anywhere else it opens a new Terminal, as before.
@@ -1182,6 +1213,7 @@ async function back(omg: string, args: Map<string, string | true>): Promise<void
     }
     // No marker write here: the hook may have just installed it ("back"), which must not go back to landing.
     console.log(`The box's copy is staged; it goes in as this turn ends.\n\n${sameWindowBackLine(parkedAtStart.resume ?? uuid)}`);
+    outcome = "done";
     return;
   }
   if (sameWindow && parkedAtStart?.state !== "cloud") {
@@ -1207,7 +1239,12 @@ async function back(omg: string, args: Map<string, string | true>): Promise<void
   }
   const enc = projectDirName(cwd);
   const sb = await getBox(omg, cloud.sandboxId);
-  if (!sb) throw new Error("no cloud box on record (nothing to bring back)");
+  if (!sb) {
+    outcome = "gone";
+    console.log(boxGone(uuid));
+    process.exitCode = 1;
+    return;
+  }
   const id = await wakeBox(omg, sb);
 
   // 1. A turn boundary (or --force, which interrupts instead of waiting).
@@ -1425,6 +1462,7 @@ async function back(omg: string, args: Map<string, string | true>): Promise<void
   } else if (parkedAtStart?.state === "cloud" && typeof parkedAtStart.pid === "number" && pidAlive(parkedAtStart.pid)) {
     writePark(uuid, { state: "elsewhere", pid: parkedAtStart.pid });
   } else clearPark(uuid);
+  outcome = "done"; // the work landed; anything below is reporting
   if (sameWindow) {
     console.log(`\n${sameWindowBackLine(resumeId)}`);
     if (problems.length) {
@@ -1539,6 +1577,8 @@ async function phoneLater(args: Map<string, string | true>, keys: { omg?: string
   if (typeof session !== "string" || !UUID_RE.test(session)) throw new Error("--phone needs --session <uuid>");
   if (!keys.omg || !keys.openrouter) throw new Error("OMG_API_KEY and OPENROUTER_API_KEY must be set (env or ~/.nomo-spike.env)");
   const home = process.env.HOME!;
+  rmSync(moveResultFile(session), { force: true }); // this run's outcome only (NOM-99)
+  const refuse = (why: MoveWhy, msg: string): never => { writeMoveResult(session, false, undefined, why); throw new Error(`not moving ${session}: ${msg}.`); };
   const cloud = loadCloud();
   const ok = phoneMoveCheck({
     record: await readRecord(session),
@@ -1551,12 +1591,12 @@ async function phoneLater(args: Map<string, string | true>, keys: { omg?: string
     transcriptExists: (cwd) => existsSync(join(home, ".claude", "projects", projectDirName(cwd), `${session}.jsonl`)),
     trackedSecrets: trackedSecretFiles,
   });
-  if ("refuse" in ok) throw new Error(`not moving ${session}: ${ok.refuse}.`);
+  if ("refuse" in ok) return refuse(ok.why, ok.refuse);
   let root: string | undefined;
   try { root = execFileSync("git", ["rev-parse", "--show-toplevel"], { cwd: ok.cwd, stdio: ["ignore", "pipe", "ignore"] }).toString().trim(); } catch { /* not git */ }
   const refusal = root ? packRefusal(root, home, () => false) : packRefusal(ok.cwd, home);
-  if (refusal) throw new Error(`not moving ${session}: ${refusal}.`);
-  if (!arm(session, ok.claudePid, ok.cwd, DEFAULT_THEN, worker)) { process.exitCode = 1; return; }
+  if (refusal) return refuse("secret", refusal);
+  if (!arm(session, ok.claudePid, ok.cwd, DEFAULT_THEN, worker)) { writeMoveResult(session, false, undefined, "busy"); process.exitCode = 1; return; }
   const now = await settleThenStamp(session, { readRecord: () => readRecord(session), sleep: (ms) => new Promise((r) => setTimeout(r, ms)) });
   console.log(`Armed. Session ${session} moves to the cloud ${now ? "now (it was idle)" : "when its current turn ends"}. Log: ${LATER_LOG}`);
 }
@@ -1571,7 +1611,7 @@ async function afterExit(args: Map<string, string | true>, worker: string): Prom
   process.exitCode = await waitThenHandoff({ helperPid: process.pid, session, claudePid, state: "waiting", startedAt: Date.now(), message }, {
     pending: PENDING_PATH,
     parkDir: PARK_DIR,
-    result: (ok) => writeMoveResult(session, ok),
+    result: (ok, why) => writeMoveResult(session, ok, undefined, why),
     alive: pidAlive,
     now: Date.now,
     sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
@@ -1653,6 +1693,7 @@ async function main(): Promise<void> {
 
   if (args.has("--bake")) { await bake(omg); return; }
   if (args.has("--back")) { await back(omg, args); return; }
+  if (args.has("--box-health")) { await boxHealth(omg); return; }
 
   if (["--status", "--stop", "--pair", "--screen", "--send", "--send-key"].some((f) => args.has(f))) {
     const cloud = loadCloud();
@@ -1746,5 +1787,5 @@ async function main(): Promise<void> {
 }
 
 if (import.meta.main) {
-  main().catch((e) => { console.error(`handoff: ${e.message ?? e}`); process.exit(1); });
+  main().catch((e) => { console.error(`handoff: ${e.message ?? e}`); process.exit(e?.exitCode === EXIT_BOX_GONE ? EXIT_BOX_GONE : 1); });
 }
