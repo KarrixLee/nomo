@@ -41,8 +41,10 @@
 //
 // KEEP-AWAKE: omg sleeps a box 2h after start regardless of activity. We take a 30-min lease from here
 // and start an in-VM loop (tmux session `nomo-keepalive`) that renews it every 10 min via the keyless
-// 169.254.0.1:9090 endpoint for as long as any session's tmux lives. When the last CC exits, the lease
-// lapses and the box sleeps on its own.
+// 169.254.0.1:9090 endpoint, but only while some session is busy (NOM-101, `--box-busy`: working,
+// waiting on the user < 2h, or done < 10 min ago, read from the box's own Nomo records). Otherwise it
+// stops renewing, the lease lapses and the box sleeps on its own; it checks every minute, so a turn that
+// starts (an approval answered, a message sent) renews before the lease can lapse under it.
 //
 // BRING BACK (P2, NOM-77): `--back` waits for a turn boundary on the box (Nomo's record, else an
 // `end_turn` transcript + 15s quiet; --force interrupts instead), exits claude there (/exit, then C-c,
@@ -69,7 +71,7 @@
 // headers timeout — the box script is kept short, so prefer bun.
 
 import { execFileSync, spawn } from "node:child_process";
-import { closeSync, existsSync, lstatSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, lstatSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, readSync, realpathSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { dirname, join, relative, sep } from "node:path";
@@ -86,7 +88,7 @@ import {
   BOX_MAX_SESSIONS, cancelPending, claimPending, DEFAULT_THEN, EXIT_BOX_GONE, phoneMoveCheck, settleThenStamp, contextTokens, contextTokensOf, GONE_MSG, sizeWarning, TAIL_BYTES, handoffArgv, LATER_LOG, LATER_USAGE, laterStatus, transcriptSecretWarning, needsPairing, parseLaterArg, type Pending, PENDING_PATH, readPending, resolveSession, waitThenHandoff,
 } from "../core/handoff-later";
 import {
-  agentConfigPaths, applyInPlace, atomicWriteBytes, type BoxArtifacts, boxChangedPaths, boxIdle, copyContained, decideCode, extractTgz,
+  agentConfigPaths, applyInPlace, atomicWriteBytes, type BoxArtifacts, boxChangedPaths, boxIdle, sessionBusy, copyContained, decideCode, extractTgz,
   backCaps, landFolder, landOnBranch, listFiles, MAX_ARTIFACT_BYTES, macGitState, mergeMemory, mkdirp, parseMarkers, printable,
   type Snapshot, takeSnapshot, transcriptAction, validateTree,
 } from "../core/cloud-back";
@@ -171,9 +173,37 @@ export const shmEnvFile = (uuid: string): string => `/dev/shm/nomo-env-${id12(uu
  *  a rerun) → it stops there, never a claude without its keys. */
 export const launchLine = (uuid: string, model: string): string =>
   `[ -f ${shmEnvFile(uuid)} ] || { echo 'Nomo: the key file is gone; rerun the handoff.'; sleep 30; exit 1; }; . ${shmEnvFile(uuid)}; rm -f ${shmEnvFile(uuid)}; export PATH="/root/.local/bin:$PATH"; exec claude --resume ${uuid} --model ${q(model)}`;
-/** The in-VM keep-awake loop: renews the lease while ANY handed-off session's tmux runs. */
-export const keepaliveLoop = (): string =>
-  `while ${ANY_SESSION}; do curl -s -X POST http://169.254.0.1:9090/v1/sandbox/keepalive -H 'Content-Type: application/json' -d '{"seconds":${KEEPALIVE_S}}' >/dev/null; sleep 600; done`;
+/** Sets W (why) and rc from the box plugin's `--box-busy` (needs $B). R is re-read each call: a plugin
+ *  update moves the versioned dir. A plugin without the flag is never asked (before #30 an unknown flag
+ *  fell through to a full handoff; since, it refuses non-zero): rc=1, i.e. busy, the safe default. */
+const BUSY_PROBE = `${BOX_PLUGIN}
+if [ -n "$R" ] && grep -qs -- --box-busy "$R/dist/handoff.mjs"; then W=$("$B" "$R/dist/handoff.mjs" --box-busy 2>/dev/null); rc=$?; else W="box plugin can't tell"; rc=1; fi`;
+/** Box-script line that (re)starts the keep-awake loop with $B resolved here, like the relay's launch. */
+export const keepaliveStart = (): string =>
+  `tmux new-session -d -s nomo-keepalive "B=$(command -v bun || command -v node); "${q(keepaliveLoop())}`;
+/** The box's handoff log (== handoff-later LATER_LOG on the box): keep-awake renew/release lines. */
+export const BOX_HANDOFF_LOG = "/root/.config/cc-status/handoff.log";
+/** The in-VM keep-awake loop (NOM-101). Every minute while ANY handed-off session's tmux runs, it asks
+ *  `--box-busy` (exit 10 = every session idle; any other exit counts as busy so a failure never sleeps the
+ *  box). Busy: renew the lease, at most every 10 min, and at once after a release. Idle: stop renewing
+ *  (logged once); the lease lapses and omg hibernates the box. `$B` is bun's (else node's) absolute path,
+ *  resolved by the launching box script (keepaliveStart): tmux's shell may not have bun on PATH.
+ *  An idle box sleeps, and omg's 14-day deletion clock for a sleeping box starts then; the phone is
+ *  warned near the end via `cloudAge: "expiring"` (NOM-99, park.ts). */
+export const keepaliveLoop = (): string => `L=0; S=
+log() { echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) keep-awake: $*" >> ${BOX_HANDOFF_LOG}; }
+while ${ANY_SESSION}; do
+  ${BUSY_PROBE.replaceAll("\n", "\n  ")}; N=$(date +%s)
+  if [ "$rc" = 10 ]; then
+    if [ "$S" != idle ]; then S=idle; log "released ($W); the box sleeps when the lease ends$([ "$L" = 0 ] || echo " in ~$(( (L + ${KEEPALIVE_S} - N) / 60 )) min")"; fi
+  elif [ "$S" != busy ] || [ $((N - L)) -ge 600 ]; then
+    if curl -s -X POST http://169.254.0.1:9090/v1/sandbox/keepalive -H 'Content-Type: application/json' -d '{"seconds":${KEEPALIVE_S}}' >/dev/null; then
+      L=$N; S=busy; log "renewed ${KEEPALIVE_S / 60} min (\${W:-busy})"
+    fi
+  fi
+  sleep 60
+done
+log "no session running; stopped renewing"`;
 /** True while any handed-off session's tmux runs (nomo-<id12>, 2.3.29's nomo-<id8>, or the legacy
  *  `nomo`); never relay/keepalive/pair. */
 export const ANY_SESSION = `tmux ls -F '#{session_name}' 2>/dev/null | grep -qxE 'nomo(-[0-9a-f]{8}|-[0-9a-f]{12})?'`;
@@ -565,7 +595,6 @@ export function build(args: Map<string, string | true>, outDir: string): Plan {
   const enc = projectDirName(cwd);
   const runEnv = ["ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"];
   const envFile = shmEnvFile(uuid);
-  const keepalive = keepaliveLoop();
 
   const script = `${boxPrelude(uuid)}
 set -euo pipefail
@@ -631,7 +660,7 @@ touch ${envFile}
 tmux new-session -d -s "$T" -x 200 -y 50 -c ${q(cwd)} ${q(`bash -c ${q(launchLine(uuid, model))}`)}
 # Restarted every time: a pre-2.3.29 loop watches the legacy name only.
 tmux kill-session -t =nomo-keepalive 2>/dev/null || true
-tmux new-session -d -s nomo-keepalive ${q(keepalive)}
+${keepaliveStart()}
 sleep 8
 tmux has-session -t "=$T"
 tmux capture-pane -p -t "=$T:"
@@ -853,9 +882,12 @@ export async function boxHealth(omg: string, deps: { cloud?: Cloud; park?: (id: 
   return parked;
 }
 
-/** An existing box, running (never creates one). */
-async function wakeBox(key: string, sb: any): Promise<string> {
-  if (sb.status === "hibernated") { console.log(`Waking box ${sb.id}…`); sb = await api(key, "POST", `/sandboxes/${sb.id}/wake`); }
+/** An existing box, running (never creates one). An already-running box gets a fresh KEEPALIVE_S lease
+ *  (NOM-101): an idle box's lease may have a minute left, and the caller (back, handoff, stop, send) is
+ *  about to work on it; the in-VM loop takes over once a turn runs. */
+export async function wakeBox(key: string, sb: any, call: typeof api = api): Promise<string> {
+  if (sb.status === "hibernated") { console.log(`Waking box ${sb.id}…`); sb = await call(key, "POST", `/sandboxes/${sb.id}/wake`); }
+  else if (sb.status === "running") await call(key, "POST", `/sandboxes/${sb.id}/extend`, { seconds: KEEPALIVE_S }).catch(() => {});
   return waitRunning(key, sb);
 }
 
@@ -885,6 +917,38 @@ function attachHelp(several = false): string {
   ].join("\n");
 }
 
+/** Box-side (NOM-101): is any running handed-off session busy (sessionBusy over its Nomo record, else
+ *  its transcript)? A session with no transcript found counts as busy. */
+export async function boxBusyNow({ now = Date.now(), dir = BOX_SESSIONS, projects = "/root/.claude/projects", read = readRecord,
+  alive = (t: string) => { try { execFileSync("tmux", ["has-session", "-t", `=${t}`], { stdio: "ignore" }); return true; } catch { return false; } },
+} = {}): Promise<{ busy: boolean; why: string }> {
+  const idle: string[] = [];
+  for (const u of existsSync(dir) ? readdirSync(dir) : []) {
+    if (!UUID_RE.test(u)) continue;
+    if (!alive(readFileSync(join(dir, u), "utf8").split("\n")[1] || tmuxName(u))) continue;
+    const rec = await read(u);
+    let t = rec?.transcript || "";
+    if (!t || !existsSync(t)) t = (existsSync(projects) ? readdirSync(projects) : []).map((p) => join(projects, p, `${u}.jsonl`)).find((p) => existsSync(p)) ?? "";
+    if (!t) return { busy: true, why: `${u.slice(0, 8)} has no transcript yet` };
+    const st = statSync(t), fd = openSync(t, "r"), buf = Buffer.alloc(Math.min(65536, st.size));
+    try { readSync(fd, buf, 0, buf.length, st.size - buf.length); } finally { closeSync(fd); }
+    const r = sessionBusy({ lastEvent: rec?.lastEvent, ts: rec?.ts, tail: buf.toString("utf8"), quietS: (now - st.mtimeMs) / 1000 }, now);
+    if (r.busy) return { busy: true, why: `${u.slice(0, 8)} ${r.why}` };
+    idle.push(`${u.slice(0, 8)} ${r.why}`);
+  }
+  return { busy: false, why: idle.join(", ") || "no session running" };
+}
+
+/** --status's box line (NOM-101): `--box-busy` exit `rc` (10 = all idle; undefined = an older box). */
+export function keepAwakeLine(status: string, until: string | undefined, rc: number | undefined, why: string,
+  fmt = (iso: string) => new Date(iso).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })): string {
+  if (status === "hibernated") return "asleep";
+  if (status !== "running") return status;
+  const at = until && !Number.isNaN(Date.parse(until)) ? fmt(until) : undefined;
+  if (rc === 10) return `idle (${why}) — sleeps at ${at ?? "the end of its lease"}`;
+  return `running${why ? ` (${why})` : ""}${at ? `, keep-awake until ${at}` : ""}`;
+}
+
 /** Box script for --status: every session the box holds (running or stopped, with its root), then Nomo's own status. */
 export function statusScript(): string {
   return `${SHM_SWEEP}
@@ -900,8 +964,10 @@ for f in "$SD"/*; do
 done
 echo "  $n of ${BOX_MAX_SESSIONS} running"
 echo NOMO_STATUS_SPLIT
+B=$(command -v bun || command -v node)
+${BUSY_PROBE}
+echo "NOMO_KA=$rc:$W"
 echo '--- Nomo on the box ---'
-${BOX_PLUGIN}
 [ -n "$R" ] && bun "$R/dist/status-cmd.mjs" claude || echo 'Nomo plugin: not installed on the box'`;
 }
 
@@ -1678,7 +1744,7 @@ export const USAGE = `usage:
 const VALUE_FLAGS = ["--session", "--model", "--send", "--send-key", "--then", "--worker", "--claude-pid", "--from-session"];
 /** Every flag main and its sub-commands read; --wait takes an optional <min>. */
 export const KNOWN_FLAGS = [...VALUE_FLAGS, "--wait", "--after-exit", "--all", "--args-stdin", "--back", "--bake", "--box-health",
-  "--box-pair", "--check", "--dry-run", "--force", "--help", "--later", "--later-cancel", "--later-status", "--no-open", "--pair",
+  "--box-busy", "--box-pair", "--check", "--dry-run", "--force", "--help", "--later", "--later-cancel", "--later-status", "--no-open", "--pair",
   "--phone", "--screen", "--status", "--stop"];
 
 /** An unknown --flag throws BEFORE anything runs: it used to fall through to a full handoff of the cwd's session. */
@@ -1708,6 +1774,14 @@ async function main(): Promise<void> {
     const { config, url } = await boxPairPayload(readFileSync(cfg, "utf8"), BOX_MACHINE_NAME, buildPairURL);
     await atomicWrite(cfg, config, 0o600);
     console.log(PAIR_URL_MARKER + url);
+    return;
+  }
+
+  if (args.has("--box-busy")) {
+    // Runs ON THE BOX (the keep-awake loop, --status): exit 10 when no running session is busy.
+    const r = await boxBusyNow();
+    console.log(r.why);
+    process.exitCode = r.busy ? 0 : 10;
     return;
   }
 
@@ -1759,21 +1833,25 @@ async function main(): Promise<void> {
     // read-only (a stopped box stays stopped), except --pair, which wakes it first
     let sb = await getBox(omg, cloud.sandboxId, api, { wake: pairWakes(args) });
     if (!sb) { console.log("No cloud box. Run `handoff` to create one."); return; }
-    if (pairWakes(args) && sb.status !== "running") sb = { ...sb, id: await wakeBox(omg, sb), status: "running" };
+    // always: a running idle box needs a fresh lease too, or it can hibernate during the 10-min pair wait
+    if (pairWakes(args)) sb = { ...sb, id: await wakeBox(omg, sb), status: "running" };
     const here = hereSession(args.get("--from-session") || process.env.CLAUDE_CODE_SESSION_ID, cloud);
     if (args.has("--stop")) {
       // --all, or bare with at most one session on record: sleep the whole box (sessions resume on wake).
       if (args.has("--all") || (!args.has("--session") && !here && (cloud.active ?? []).length <= 1)) { await sleepBox(omg, sb); return; }
       const uuid = pickSession(args.get("--session"), here, cloud);
       if (sb.status !== "running") { console.log(`Box ${sb.id} is ${sb.status}: session ${uuid} is not running.`); return; }
+      await wakeBox(omg, sb); // a fresh lease: an idle box must not fall asleep mid-stop
       console.log(await stopOne(uuid, (script, env) => exec(omg, sb.id, script, env), () => sleepBox(omg, sb), args.has("--force")));
       return;
     }
+    if (sb.status === "hibernated") { console.log(`Box ${sb.id} is asleep (hibernated). Run handoff or --back to wake it.`); return; }
     if (sb.status !== "running") { console.log(`Box ${sb.id} is ${sb.status}. Run handoff to wake it.`); return; }
     if (args.has("--screen") || args.has("--send") || args.has("--send-key")) {
       const key = String(args.get("--send-key") ?? "");
       if (args.has("--send-key") && !/^[A-Za-z0-9-]+$/.test(key)) throw new Error("--send-key takes one tmux key name, e.g. Escape, BTab, C-c, Enter");
       const mode = args.has("--send") ? "send" : args.has("--send-key") ? "key" : "screen";
+      if (mode !== "screen") await wakeBox(omg, sb); // a fresh lease: a sent message starts a turn
       const uuid = pickSession(args.get("--session"), here, cloud);
       const r = await exec(omg, sb.id, paneScript(mode, uuid), { NOMO_TEXT: String(args.get("--send") ?? ""), NOMO_KEY: key });
       process.stdout.write((r.stdout ?? "").replace(/^NOMO_(SENT|UNCONFIRMED|BUSY)\n?/m, ""));
@@ -1788,9 +1866,10 @@ async function main(): Promise<void> {
       await afterPair(omg, sb.id, r.stdout ?? "", worker);
       return;
     }
-    console.log(`Box ${sb.id}: ${sb.status}${sb.keepAwakeUntil ? `, keep-awake until ${sb.keepAwakeUntil}` : ""}`);
     const r = await exec(omg, sb.id, statusScript(), { NOMO_KNOWN: (cloud.active ?? []).join(" ") });
-    const [sessions, nomo = ""] = (r.stdout ?? "").split(/^NOMO_STATUS_SPLIT$\n?/m);
+    const [sessions, rest = ""] = (r.stdout ?? "").split(/^NOMO_STATUS_SPLIT$\n?/m);
+    const ka = rest.match(/^NOMO_KA=(\d+):(.*)$/m), nomo = rest.replace(/^NOMO_KA=.*$\n?/m, "");
+    console.log(`Box ${sb.id}: ${keepAwakeLine(sb.status, sb.keepAwakeUntil, ka ? Number(ka[1]) : undefined, ka?.[2] ?? "")}`);
     process.stdout.write(sessions); // the box's sessions first: id, running/stopped, root
     console.log((cloud.active ?? []).length ? `On record on this Mac (not brought back yet):\n${listActive(cloud)}` : "On record on this Mac: none.");
     console.log(attachHelp((cloud.active ?? []).length > 1));

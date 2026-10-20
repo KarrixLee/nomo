@@ -3,7 +3,7 @@ var __require = /* @__PURE__ */ createRequire(import.meta.url);
 
 // src/entries/handoff.ts
 import { execFileSync as execFileSync5, spawn as spawn2 } from "node:child_process";
-import { closeSync as closeSync3, existsSync as existsSync6, lstatSync as lstatSync2, mkdirSync as mkdirSync3, mkdtempSync as mkdtempSync2, openSync as openSync3, readdirSync as readdirSync4, readFileSync as readFileSync6, realpathSync as realpathSync2, renameSync as renameSync3, rmSync, statSync as statSync5, unlinkSync as unlinkSync3, writeFileSync as writeFileSync4 } from "node:fs";
+import { closeSync as closeSync3, existsSync as existsSync6, lstatSync as lstatSync2, mkdirSync as mkdirSync3, mkdtempSync as mkdtempSync2, openSync as openSync3, readdirSync as readdirSync4, readFileSync as readFileSync6, readSync as readSync3, realpathSync as realpathSync2, renameSync as renameSync3, rmSync, statSync as statSync5, unlinkSync as unlinkSync3, writeFileSync as writeFileSync4 } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { dirname as dirname3, join as join7, relative as relative2, sep as sep2 } from "node:path";
@@ -384,7 +384,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "2.3.44";
+var PLUGIN_VERSION = "2.3.45";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -4578,6 +4578,22 @@ function landFolder(cwd, extracted, files, uuid8) {
     copyContained(join6(extracted, rel), dst, rel, false);
   return dst;
 }
+var ATTENTION_AWAKE_S = 2 * 3600;
+var DONE_GRACE_S = 10 * 60;
+function sessionBusy(o, now) {
+  const stale = typeof o.ts === "number" && now - o.quietS * 1000 > o.ts + 60000;
+  const state = boxIdle(stale ? { ...o, lastEvent: undefined } : o);
+  if (state === "busy")
+    return { busy: true, why: "working" };
+  if (o.quietS < DONE_GRACE_S)
+    return { busy: true, why: `active ${Math.floor(Math.max(0, o.quietS) / 60)} min ago` };
+  const fromRecord = !stale && (o.lastEvent === "done" || o.lastEvent === "needsAttention") && typeof o.ts === "number";
+  const age = Math.max(0, fromRecord ? (now - o.ts) / 1000 : o.quietS);
+  const min = Math.floor(age / 60);
+  if (state === "attention")
+    return { busy: age < ATTENTION_AWAKE_S, why: `waiting on you for ${min} min` };
+  return { busy: age < DONE_GRACE_S, why: `done ${min} min ago` };
+}
 
 // src/qr/qr.ts
 var encoder = new TextEncoder;
@@ -5130,7 +5146,26 @@ var id12 = (uuid) => uuid.replace(/-/g, "").slice(0, 12);
 var tmuxName = (uuid) => `nomo-${id12(uuid)}`;
 var shmEnvFile = (uuid) => `/dev/shm/nomo-env-${id12(uuid)}`;
 var launchLine = (uuid, model) => `[ -f ${shmEnvFile(uuid)} ] || { echo 'Nomo: the key file is gone; rerun the handoff.'; sleep 30; exit 1; }; . ${shmEnvFile(uuid)}; rm -f ${shmEnvFile(uuid)}; export PATH="/root/.local/bin:$PATH"; exec claude --resume ${uuid} --model ${q(model)}`;
-var keepaliveLoop = () => `while ${ANY_SESSION}; do curl -s -X POST http://169.254.0.1:9090/v1/sandbox/keepalive -H 'Content-Type: application/json' -d '{"seconds":${KEEPALIVE_S}}' >/dev/null; sleep 600; done`;
+var BUSY_PROBE = `${BOX_PLUGIN}
+if [ -n "$R" ] && grep -qs -- --box-busy "$R/dist/handoff.mjs"; then W=$("$B" "$R/dist/handoff.mjs" --box-busy 2>/dev/null); rc=$?; else W="box plugin can't tell"; rc=1; fi`;
+var keepaliveStart = () => `tmux new-session -d -s nomo-keepalive "B=$(command -v bun || command -v node); "${q(keepaliveLoop())}`;
+var BOX_HANDOFF_LOG = "/root/.config/cc-status/handoff.log";
+var keepaliveLoop = () => `L=0; S=
+log() { echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) keep-awake: $*" >> ${BOX_HANDOFF_LOG}; }
+while ${ANY_SESSION}; do
+  ${BUSY_PROBE.replaceAll(`
+`, `
+  `)}; N=$(date +%s)
+  if [ "$rc" = 10 ]; then
+    if [ "$S" != idle ]; then S=idle; log "released ($W); the box sleeps when the lease ends$([ "$L" = 0 ] || echo " in ~$(( (L + ${KEEPALIVE_S} - N) / 60 )) min")"; fi
+  elif [ "$S" != busy ] || [ $((N - L)) -ge 600 ]; then
+    if curl -s -X POST http://169.254.0.1:9090/v1/sandbox/keepalive -H 'Content-Type: application/json' -d '{"seconds":${KEEPALIVE_S}}' >/dev/null; then
+      L=$N; S=busy; log "renewed ${KEEPALIVE_S / 60} min (\${W:-busy})"
+    fi
+  fi
+  sleep 60
+done
+log "no session running; stopped renewing"`;
 var ANY_SESSION = `tmux ls -F '#{session_name}' 2>/dev/null | grep -qxE 'nomo(-[0-9a-f]{8}|-[0-9a-f]{12})?'`;
 function admitScript(uuid, root) {
   const u = q(uuid);
@@ -5465,7 +5500,6 @@ function build(args, outDir) {
   const enc = projectDirName(cwd);
   const runEnv = ["ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"];
   const envFile = shmEnvFile(uuid);
-  const keepalive = keepaliveLoop();
   const script = `${boxPrelude(uuid)}
 set -euo pipefail
 ${PAIR_GATE}
@@ -5528,7 +5562,7 @@ touch ${envFile}
 tmux new-session -d -s "$T" -x 200 -y 50 -c ${q(cwd)} ${q(`bash -c ${q(launchLine(uuid, model))}`)}
 # Restarted every time: a pre-2.3.29 loop watches the legacy name only.
 tmux kill-session -t =nomo-keepalive 2>/dev/null || true
-tmux new-session -d -s nomo-keepalive ${q(keepalive)}
+${keepaliveStart()}
 sleep 8
 tmux has-session -t "=$T"
 tmux capture-pane -p -t "=$T:"
@@ -5751,11 +5785,12 @@ async function boxHealth(omg, deps = {}) {
     console.log((deps.gone ?? boxGone)(id));
   return parked;
 }
-async function wakeBox(key, sb) {
+async function wakeBox(key, sb, call = api) {
   if (sb.status === "hibernated") {
     console.log(`Waking box ${sb.id}…`);
-    sb = await api(key, "POST", `/sandboxes/${sb.id}/wake`);
-  }
+    sb = await call(key, "POST", `/sandboxes/${sb.id}/wake`);
+  } else if (sb.status === "running")
+    await call(key, "POST", `/sandboxes/${sb.id}/extend`, { seconds: KEEPALIVE_S }).catch(() => {});
   return waitRunning(key, sb);
 }
 async function sleepBox(key, sb) {
@@ -5782,6 +5817,56 @@ function attachHelp(several = false) {
   ].join(`
 `);
 }
+async function boxBusyNow({
+  now = Date.now(),
+  dir = BOX_SESSIONS,
+  projects = "/root/.claude/projects",
+  read = readRecord,
+  alive = (t) => {
+    try {
+      execFileSync5("tmux", ["has-session", "-t", `=${t}`], { stdio: "ignore" });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+} = {}) {
+  const idle = [];
+  for (const u of existsSync6(dir) ? readdirSync4(dir) : []) {
+    if (!UUID_RE3.test(u))
+      continue;
+    if (!alive(readFileSync6(join7(dir, u), "utf8").split(`
+`)[1] || tmuxName(u)))
+      continue;
+    const rec = await read(u);
+    let t = rec?.transcript || "";
+    if (!t || !existsSync6(t))
+      t = (existsSync6(projects) ? readdirSync4(projects) : []).map((p) => join7(projects, p, `${u}.jsonl`)).find((p) => existsSync6(p)) ?? "";
+    if (!t)
+      return { busy: true, why: `${u.slice(0, 8)} has no transcript yet` };
+    const st = statSync5(t), fd = openSync3(t, "r"), buf = Buffer.alloc(Math.min(65536, st.size));
+    try {
+      readSync3(fd, buf, 0, buf.length, st.size - buf.length);
+    } finally {
+      closeSync3(fd);
+    }
+    const r = sessionBusy({ lastEvent: rec?.lastEvent, ts: rec?.ts, tail: buf.toString("utf8"), quietS: (now - st.mtimeMs) / 1000 }, now);
+    if (r.busy)
+      return { busy: true, why: `${u.slice(0, 8)} ${r.why}` };
+    idle.push(`${u.slice(0, 8)} ${r.why}`);
+  }
+  return { busy: false, why: idle.join(", ") || "no session running" };
+}
+function keepAwakeLine(status, until, rc, why, fmt = (iso) => new Date(iso).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })) {
+  if (status === "hibernated")
+    return "asleep";
+  if (status !== "running")
+    return status;
+  const at = until && !Number.isNaN(Date.parse(until)) ? fmt(until) : undefined;
+  if (rc === 10)
+    return `idle (${why}) — sleeps at ${at ?? "the end of its lease"}`;
+  return `running${why ? ` (${why})` : ""}${at ? `, keep-awake until ${at}` : ""}`;
+}
 function statusScript() {
   return `${SHM_SWEEP}
 ${BOX_LIB}
@@ -5796,8 +5881,10 @@ for f in "$SD"/*; do
 done
 echo "  $n of ${BOX_MAX_SESSIONS} running"
 echo NOMO_STATUS_SPLIT
+B=$(command -v bun || command -v node)
+${BUSY_PROBE}
+echo "NOMO_KA=$rc:$W"
 echo '--- Nomo on the box ---'
-${BOX_PLUGIN}
 [ -n "$R" ] && bun "$R/dist/status-cmd.mjs" claude || echo 'Nomo plugin: not installed on the box'`;
 }
 var IDLE_FN = `nomo_wait_idle() {
@@ -6608,6 +6695,7 @@ var KNOWN_FLAGS = [
   "--back",
   "--bake",
   "--box-health",
+  "--box-busy",
   "--box-pair",
   "--check",
   "--dry-run",
@@ -6651,6 +6739,12 @@ async function main() {
     const { config, url } = await boxPairPayload(readFileSync6(cfg, "utf8"), BOX_MACHINE_NAME, buildPairURL);
     await atomicWrite(cfg, config, 384);
     console.log(PAIR_URL_MARKER + url);
+    return;
+  }
+  if (args.has("--box-busy")) {
+    const r = await boxBusyNow();
+    console.log(r.why);
+    process.exitCode = r.busy ? 0 : 10;
     return;
   }
   if (args.has("--check")) {
@@ -6736,7 +6830,7 @@ async function main() {
       console.log("No cloud box. Run `handoff` to create one.");
       return;
     }
-    if (pairWakes(args) && sb.status !== "running")
+    if (pairWakes(args))
       sb = { ...sb, id: await wakeBox(omg, sb), status: "running" };
     const here = hereSession(args.get("--from-session") || process.env.CLAUDE_CODE_SESSION_ID, cloud);
     if (args.has("--stop")) {
@@ -6749,7 +6843,12 @@ async function main() {
         console.log(`Box ${sb.id} is ${sb.status}: session ${uuid} is not running.`);
         return;
       }
+      await wakeBox(omg, sb);
       console.log(await stopOne(uuid, (script, env) => exec(omg, sb.id, script, env), () => sleepBox(omg, sb), args.has("--force")));
+      return;
+    }
+    if (sb.status === "hibernated") {
+      console.log(`Box ${sb.id} is asleep (hibernated). Run handoff or --back to wake it.`);
       return;
     }
     if (sb.status !== "running") {
@@ -6761,6 +6860,8 @@ async function main() {
       if (args.has("--send-key") && !/^[A-Za-z0-9-]+$/.test(key))
         throw new Error("--send-key takes one tmux key name, e.g. Escape, BTab, C-c, Enter");
       const mode = args.has("--send") ? "send" : args.has("--send-key") ? "key" : "screen";
+      if (mode !== "screen")
+        await wakeBox(omg, sb);
       const uuid = pickSession(args.get("--session"), here, cloud);
       const r = await exec(omg, sb.id, paneScript(mode, uuid), { NOMO_TEXT: String(args.get("--send") ?? ""), NOMO_KEY: key });
       process.stdout.write((r.stdout ?? "").replace(/^NOMO_(SENT|UNCONFIRMED|BUSY)\n?/m, ""));
@@ -6784,9 +6885,10 @@ nomo_pair`, { NOMO_WORKER_URL: worker });
       await afterPair(omg, sb.id, r.stdout ?? "", worker);
       return;
     }
-    console.log(`Box ${sb.id}: ${sb.status}${sb.keepAwakeUntil ? `, keep-awake until ${sb.keepAwakeUntil}` : ""}`);
     const r = await exec(omg, sb.id, statusScript(), { NOMO_KNOWN: (cloud.active ?? []).join(" ") });
-    const [sessions, nomo = ""] = (r.stdout ?? "").split(/^NOMO_STATUS_SPLIT$\n?/m);
+    const [sessions, rest = ""] = (r.stdout ?? "").split(/^NOMO_STATUS_SPLIT$\n?/m);
+    const ka = rest.match(/^NOMO_KA=(\d+):(.*)$/m), nomo = rest.replace(/^NOMO_KA=.*$\n?/m, "");
+    console.log(`Box ${sb.id}: ${keepAwakeLine(sb.status, sb.keepAwakeUntil, ka ? Number(ka[1]) : undefined, ka?.[2] ?? "")}`);
     process.stdout.write(sessions);
     console.log((cloud.active ?? []).length ? `On record on this Mac (not brought back yet):
 ${listActive(cloud)}` : "On record on this Mac: none.");
@@ -6872,6 +6974,7 @@ if (__require.main == __require.module) {
 export {
   ANY_SESSION,
   BACK_FILES,
+  BOX_HANDOFF_LOG,
   BOX_LIB,
   BOX_MACHINE_NAME,
   BOX_MAX_SESSIONS,
@@ -6893,6 +6996,7 @@ export {
   backStopScript,
   backWaitScript,
   bakeScript,
+  boxBusyNow,
   boxGone,
   boxHealth,
   boxPairPayload,
@@ -6906,7 +7010,9 @@ export {
   getBox,
   hereSession,
   id12,
+  keepAwakeLine,
   keepaliveLoop,
+  keepaliveStart,
   lastModel,
   latestSession,
   launchLine,
@@ -6938,6 +7044,7 @@ export {
   toOpenRouterModel,
   updateCloudAt,
   userLayerFiles,
+  wakeBox,
   withReload,
   writeMarker
 };

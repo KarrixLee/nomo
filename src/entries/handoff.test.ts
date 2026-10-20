@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, utimesSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { spawn } from "node:child_process";
@@ -946,5 +946,112 @@ describe("handoff argv", () => {
     expect(pairWakes(parseArgs(["--pair"]))).toBe(true);
     for (const f of ["--status", "--screen"]) expect(pairWakes(parseArgs([f]))).toBe(false);
     expect(pairWakes(parseArgs(["--pair", "--screen"]))).toBe(false);
+  });
+});
+
+describe("NOM-101: the box sleeps when its sessions are idle", () => {
+  const { sessionBusy } = require("../core/cloud-back") as typeof import("../core/cloud-back");
+  const { boxBusyNow, keepaliveLoop, keepAwakeLine, BOX_HANDOFF_LOG } = require("./handoff") as typeof import("./handoff");
+  const end = JSON.stringify({ type: "assistant", message: { stop_reason: "end_turn" } });
+  const now = 10_000_000_000;
+  const min = 60_000;
+
+  test("busy rules: working; waiting on you < 2h; done < 10 min", () => {
+    expect(sessionBusy({ lastEvent: "working", ts: now - 600 * min, tail: "", quietS: 1e6 }, now).busy).toBe(true);
+    expect(sessionBusy({ lastEvent: "needsAttention", ts: now - 119 * min, tail: "", quietS: 0 }, now).busy).toBe(true);
+    expect(sessionBusy({ lastEvent: "needsAttention", ts: now - 121 * min, tail: "", quietS: 122 * 60 }, now)).toEqual({ busy: false, why: "waiting on you for 121 min" });
+    expect(sessionBusy({ lastEvent: "done", ts: now - 9 * min, tail: "", quietS: 1e6 }, now).busy).toBe(true);
+    expect(sessionBusy({ lastEvent: "done", ts: now - 11 * min, tail: "", quietS: 12 * 60 }, now)).toEqual({ busy: false, why: "done 11 min ago" });
+    // No record (or sessionStart): the transcript decides, its quiet time is the clock.
+    expect(sessionBusy({ tail: end, quietS: 5 }, now).busy).toBe(true); // < 15s quiet: maybe mid-turn
+    expect(sessionBusy({ tail: end, quietS: 300 }, now).busy).toBe(true);
+    expect(sessionBusy({ lastEvent: "sessionStart", ts: now - 999 * min, tail: end, quietS: 601 }, now).busy).toBe(false);
+    expect(sessionBusy({ tail: JSON.stringify({ type: "user" }), quietS: 1e6 }, now).busy).toBe(true);
+  });
+
+  test("review fix: a live transcript beats a stale done/needsAttention record", () => {
+    // Written < 10 min ago: busy whatever the record says.
+    expect(sessionBusy({ lastEvent: "done", ts: now - 60 * min, tail: end, quietS: 5 * 60 }, now).busy).toBe(true);
+    // The record predates the transcript's last write: the transcript (mid-turn) decides.
+    const midTurn = JSON.stringify({ type: "user" });
+    expect(sessionBusy({ lastEvent: "done", ts: now - 60 * min, tail: midTurn, quietS: 20 * 60 }, now)).toEqual({ busy: true, why: "working" });
+    expect(sessionBusy({ lastEvent: "needsAttention", ts: now - 300 * min, tail: midTurn, quietS: 20 * 60 }, now).busy).toBe(true);
+  });
+
+  test("boxBusyNow: any running session busy keeps it awake; stopped sessions don't count", async () => {
+    const d = mkdtempSync(join(tmpdir(), "nomo-busy-")), dir = join(d, "s"), projects = join(d, "p");
+    mkdirSync(dir); mkdirSync(join(projects, "-x"), { recursive: true });
+    const A = "aaaaaaaa-1111-4111-8111-111111111111", B = "bbbbbbbb-2222-4222-8222-222222222222";
+    for (const u of [A, B]) { writeFileSync(join(dir, u), `/x\nnomo-${u.slice(0, 8)}\n`); writeFileSync(join(projects, "-x", `${u}.jsonl`), end + "\n"); }
+    const touch = (u: string, ms: number) => utimesSync(join(projects, "-x", `${u}.jsonl`), ms / 1000, ms / 1000);
+    touch(A, now - 31 * min); touch(B, now);
+    writeFileSync(join(dir, ".claim-x"), "");
+    const recs: Record<string, any> = { [A]: { lastEvent: "done", ts: now - 30 * min }, [B]: { lastEvent: "working", ts: now } };
+    const run = (live: string[]) => boxBusyNow({ now, dir, projects, read: async (u) => recs[u] ?? null, alive: (t) => live.includes(t) });
+    expect(await run(["nomo-aaaaaaaa", "nomo-bbbbbbbb"])).toEqual({ busy: true, why: "bbbbbbbb working" });
+    expect(await run(["nomo-aaaaaaaa"])).toEqual({ busy: false, why: "aaaaaaaa done 30 min ago" });
+    expect(await run([])).toEqual({ busy: false, why: "no session running" });
+    recs[A] = undefined; touch(A, now); // record reaped: the transcript (just written) is the clock
+    expect((await run(["nomo-aaaaaaaa"])).busy).toBe(true);
+  });
+
+  // Runs the real loop with fake tmux/sleep/curl on PATH; bun lives OFF PATH and is reached only via $B.
+  const runLoop = (rcs: string[], dist: string) => {
+    const d = mkdtempSync(join(tmpdir(), "nomo-ka-")), bin = join(d, "bin"), off = join(d, "off"), plug = join(d, "plug", "2.3.45");
+    for (const x of [bin, off, join(plug, "dist")]) mkdirSync(x, { recursive: true });
+    writeFileSync(join(plug, "dist", "handoff.mjs"), dist);
+    const exe = (dir: string, n: string, body: string) => { writeFileSync(join(dir, n), `#!/bin/bash\n${body}\n`); chmodSync(join(dir, n), 0o755); };
+    // One tick per `sleep`; bun answers from the rc list (10 = idle), and the session ends after the list.
+    writeFileSync(join(d, "rcs"), [...rcs, "x"].join("\n"));
+    exe(off, "bun", `echo bun >> ${d}/calls; rc=$(head -1 ${d}/rcs); [ "$rc" = x ] && exit 0; echo why; exit $rc`);
+    exe(bin, "sleep", `tail -n +2 ${d}/rcs > ${d}/r2; mv ${d}/r2 ${d}/rcs; [ "$(head -1 ${d}/rcs)" = x ] && : > ${d}/tmux-gone; exit 0`);
+    exe(bin, "tmux", `[ -f ${d}/tmux-gone ] && exit 1; echo nomo-aaaaaaaa1111`);
+    exe(bin, "curl", `echo curl >> ${d}/log`);
+    const log = join(d, "log");
+    const script = keepaliveLoop().replaceAll(BOX_HANDOFF_LOG, log).replaceAll("/root/.claude/plugins/cache/nomo/nomo-cc", join(d, "plug"));
+    execFileSync("bash", ["-c", script], { env: { PATH: `${bin}:/usr/bin:/bin`, B: join(off, "bun") } });
+    return { lines: readFileSync(log, "utf8").split("\n").filter(Boolean).map((l) => l.replace(/^\S+Z keep-awake: /, "")), bunCalls: existsSync(join(d, "calls")) };
+  };
+
+  test("the loop renews while busy, releases once when idle, renews at once when a turn starts", () => {
+    const { lines } = runLoop(["0", "0", "10", "10", "0"], 'args.has("--box-busy")');
+    // tick 1 renews; tick 2 busy but < 10 min: nothing; tick 3 releases; tick 4 stays released; tick 5 renews at once.
+    expect(lines).toEqual(["curl", "renewed 30 min (why)", expect.stringMatching(/^released \(why\); the box sleeps when the lease ends in ~(29|30) min$/), "curl", "renewed 30 min (why)", "no session running; stopped renewing"]);
+  });
+
+  test("review fix: a box plugin without --box-busy is never asked and counts as busy", () => {
+    const { lines, bunCalls } = runLoop(["10", "10"], "// an older handoff.mjs");
+    expect(bunCalls).toBe(false);
+    expect(lines).toEqual(["curl", "renewed 30 min (box plugin can't tell)", "no session running; stopped renewing"]);
+  });
+
+  test("review fix: bun's path is resolved by the launching script, not looked up inside tmux", () => {
+    const { keepaliveStart } = require("./handoff") as typeof import("./handoff");
+    expect(keepaliveStart()).toStartWith(`tmux new-session -d -s nomo-keepalive "B=$(command -v bun || command -v node); "'`);
+    expect(keepaliveLoop()).not.toMatch(/(^|[\s(])bun /m);
+  });
+
+  test("review fix: wakeBox gives a running box a fresh lease; a hibernated one is woken", async () => {
+    const { wakeBox } = require("./handoff") as typeof import("./handoff");
+    const calls: any[] = [];
+    const call = (async (_k: string, m: string, p: string, b?: unknown) => { calls.push([m, p, b]); return { id: "sb", status: "running" }; }) as any;
+    expect(await wakeBox("k", { id: "sb", status: "running" }, call)).toBe("sb");
+    expect(calls).toEqual([["POST", "/sandboxes/sb/extend", { seconds: 1800 }]]);
+    calls.length = 0;
+    await wakeBox("k", { id: "sb", status: "hibernated" }, call);
+    expect(calls).toEqual([["POST", "/sandboxes/sb/wake", undefined]]);
+  });
+
+  test("review fix: --pair goes through wakeBox even on a running box (fresh lease for the pair wait)", () => {
+    const src = readFileSync(join(import.meta.dir, "handoff.ts"), "utf8");
+    expect(src).toContain('if (pairWakes(args)) sb = { ...sb, id: await wakeBox(omg, sb), status: "running" };');
+  });
+
+  test("--status line: asleep / idle with its sleep time / running", () => {
+    const fmt = () => "12:30";
+    expect(keepAwakeLine("hibernated", undefined, undefined, "")).toBe("asleep");
+    expect(keepAwakeLine("running", "2026-01-01T12:30:00Z", 10, "a done 12 min ago", fmt)).toBe("idle (a done 12 min ago) — sleeps at 12:30");
+    expect(keepAwakeLine("running", "2026-01-01T12:30:00Z", 0, "a working", fmt)).toBe("running (a working), keep-awake until 12:30");
+    expect(keepAwakeLine("running", undefined, undefined, "")).toBe("running");
   });
 });
