@@ -81,7 +81,13 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "2.3.36";
+
+// src/core/pair-url.ts
+var textEncoder2 = new TextEncoder;
+var DEFAULT_WORKER_URL = "https://api.nomo.gg";
+
+// src/core/shared.ts
+var PLUGIN_VERSION = "2.3.41";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -165,8 +171,29 @@ function appendFittedPlan(base, plan) {
   }
   return { ...base, plan: chars.slice(0, lo).join("") + marker };
 }
+function needsPairing(cloud, worker) {
+  return !cloud.sandboxId || cloud.pairedTo !== `${cloud.sandboxId} ${worker}`;
+}
+function boxPaired(path = `${CC_DIR}/cloud.json`, worker = (process.env.NOMO_WORKER_URL || DEFAULT_WORKER_URL).replace(/\/$/, "")) {
+  try {
+    return !needsPairing(JSON.parse(readFileSync(path, "utf8")), worker);
+  } catch {
+    return false;
+  }
+}
+var BOX_PAIRED_TTL_MS = 30000;
+var boxMemo;
+var boxOverride = undefined;
+function boxPairedCached(now = Date.now()) {
+  if (boxOverride !== undefined)
+    return boxOverride;
+  if (!boxMemo || now - boxMemo.at > BOX_PAIRED_TTL_MS)
+    boxMemo = { at: now, v: boxPaired() };
+  return boxMemo.v;
+}
 function appendFittedPlanAndDebug(base, plan, dbg) {
-  const withPlan = appendFittedPlan(base, plan);
+  const withBox = base.agent === undefined && boxPairedCached() ? { ...base, box: true } : base;
+  const withPlan = appendFittedPlan(withBox, plan);
   if (typeof dbg !== "string" || dbg.length === 0)
     return withPlan;
   const capped = Array.from(dbg).slice(0, DBG_BLOB_TEXT_MAX_CHARS).join("");
@@ -2586,6 +2613,7 @@ function parkHook(input, dir = PARK_DIR) {
   } catch {}
   return;
 }
+var CLOUD_EXPIRING_MS = 13 * 24 * 3600000;
 function withParked(body, dir = PARK_DIR) {
   const id = body.sessionId;
   const s = typeof id === "string" ? readPark(id, dir)?.state : undefined;

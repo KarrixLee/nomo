@@ -14,8 +14,9 @@
 import { appendFileSync, closeSync, fstatSync, linkSync, openSync, readFileSync, readSync, unlinkSync, writeFileSync } from "node:fs";
 import { basename } from "node:path";
 import { claudeDesktopInvocation, claudeHeadlessInvocation } from "./adapter";
-import { clearPark, readPark, stamp, writePark } from "./park";
+import { clearPark, type MoveWhy, readPark, stamp, writePark } from "./park";
 import { CC_DIR } from "./shared";
+export { boxPaired, needsPairing } from "./shared";
 
 export const PENDING_PATH = `${CC_DIR}/handoff-pending.json`;
 export const LATER_LOG = `${CC_DIR}/handoff.log`;
@@ -113,10 +114,10 @@ export function sizeWarning(tokens: number): string | undefined {
   return undefined;
 }
 
-/** True unless cloud.json records the user's box as paired to `worker`. */
-export function needsPairing(cloud: { sandboxId?: string; pairedTo?: string }, worker: string): boolean {
-  return !cloud.sandboxId || cloud.pairedTo !== `${cloud.sandboxId} ${worker}`;
-}
+
+/** Sessions one box runs at once (NOM-92). Measured on a Pro box (4 vCPU, 8 GB): idle CC ≈ 250 MB.
+ *  ponytail: one cap for every size; per-size caps when boxes come in more than one size. */
+export const BOX_MAX_SESSIONS = 4;
 
 export interface PendingDeps {
   path: string;
@@ -207,7 +208,7 @@ export interface WaitDeps {
   /** The park marker folder (core/park.ts): turn-end trigger in, cloud/cleared out. Omitted = no park. */
   parkDir?: string;
   /** This session's outcome (park.ts writeMoveResult): true moved, false failed. */
-  result?: (ok: boolean) => void;
+  result?: (ok: boolean, why?: MoveWhy) => void;
 }
 
 /** The detached helper: wait for this turn to end or the Mac session to exit (capped), then hand it off. Its last log line
@@ -226,7 +227,7 @@ export async function waitThenHandoff(p: Pending, d: WaitDeps): Promise<number> 
     if (d.now() >= end) {
       release();
       unpark();
-      d.result?.(false);
+      d.result?.(false, "other");
       d.log(`FAILED: the turn was still running after ${Math.round((d.capMs ?? LATER_CAP_MS) / 60_000)} min; nothing was moved. Run /nomo-cc:handoff again.`);
       d.notify("Handoff gave up: the turn did not end in time. Nothing was moved.");
       return 1;
@@ -250,7 +251,7 @@ export async function waitThenHandoff(p: Pending, d: WaitDeps): Promise<number> 
     d.notify("Your session is now running in the cloud.");
   } else {
     unpark();
-    d.result?.(false);
+    d.result?.(false, code === EXIT_BOX_GONE ? "gone" : "other");
     d.log(`FAILED: ${why ?? `the handoff exited ${code}; see the lines above`}. Your Mac copy is untouched.`);
     d.notify("Handoff failed. Your Mac copy is untouched. Check /nomo-cc:handoff status.");
   }
@@ -282,6 +283,8 @@ export interface PhoneMoveFacts {
   parked: boolean;
   active: boolean;
   needsPairing: boolean;
+  /** cloud.json `active.length`: sessions already on the box. */
+  cloudCount: number;
   transcriptExists: (cwd: string) => boolean;
   /** Git-tracked files under cwd's repo whose name looks like a secret ([] outside git); undefined
    *  when git failed (readiness.ts trackedSecretFiles). */
@@ -290,26 +293,30 @@ export interface PhoneMoveFacts {
 
 /** Every gate a phone-started move passes before anything is written. Either the session's claude pid
  *  and cwd, or why not (one line, for the log). */
-export function phoneMoveCheck(f: PhoneMoveFacts): { claudePid: number; cwd: string } | { refuse: string } {
+export function phoneMoveCheck(f: PhoneMoveFacts): { claudePid: number; cwd: string } | { refuse: string; why: MoveWhy } {
   const r = f.record;
-  if (!r) return { refuse: "no Nomo record for this session" };
-  if ((r.agent ?? "claude") !== "claude" || r.provisional === true) return { refuse: "only a Claude Code session can move to the cloud" };
+  if (!r) return { refuse: "no Nomo record for this session", why: "other" };
+  if ((r.agent ?? "claude") !== "claude" || r.provisional === true) return { refuse: "only a Claude Code session can move to the cloud", why: "other" };
   const pid = r.pid, cmd = typeof pid === "number" && pid > 1 ? f.command(pid) : undefined;
-  if (!pid || !cmd) return { refuse: "its Claude Code process is not running" };
+  if (!pid || !cmd) return { refuse: "its Claude Code process is not running", why: "other" };
   const up = f.ancestorsOf(pid).map((p) => f.command(p));
   // ponytail: no CLAUDE_CODE_ENTRYPOINT here (another process's env); the argv anchors decide desktop.
   // Before the name check: the desktop binary's path has a space in it.
-  if (claudeHeadlessInvocation(cmd, up) || claudeDesktopInvocation(cmd, up)) return { refuse: "a headless or desktop-app session can't move to the cloud" };
-  if (basename(cmd.trim().split(/\s+/)[0]) !== "claude") return { refuse: "its Claude Code process is not running" };
-  if (f.parked) return { refuse: "it is already moving, in the cloud, or parked" };
-  if (f.active) return { refuse: "it is already running in the cloud" };
-  if (f.needsPairing) return { refuse: "the cloud box needs a one-time pairing; run /nomo-cc:handoff in that session first" };
-  if (!r.cwd || !f.transcriptExists(r.cwd)) return { refuse: "its transcript was not found" };
+  if (claudeHeadlessInvocation(cmd, up) || claudeDesktopInvocation(cmd, up)) return { refuse: "a headless or desktop-app session can't move to the cloud", why: "other" };
+  if (basename(cmd.trim().split(/\s+/)[0]) !== "claude") return { refuse: "its Claude Code process is not running", why: "other" };
+  if (f.parked) return { refuse: "it is already moving, in the cloud, or parked", why: "other" };
+  if (f.active) return { refuse: "it is already running in the cloud", why: "other" };
+  if (f.needsPairing) return { refuse: "the cloud box needs a one-time pairing; run /nomo-cc:handoff in that session first", why: "notPaired" };
+  if (f.cloudCount >= BOX_MAX_SESSIONS) return { refuse: `the cloud box already runs ${f.cloudCount} sessions (the cap is ${BOX_MAX_SESSIONS}); bring one back first`, why: "cap" };
+  if (!r.cwd || !f.transcriptExists(r.cwd)) return { refuse: "its transcript was not found", why: "other" };
   const secrets = f.trackedSecrets(r.cwd);
-  if (!secrets) return { refuse: "git could not list the project's tracked files" };
-  if (secrets.length) return { refuse: `${secrets.slice(0, 3).join(", ")} looks like a secret and is tracked in git, so it would travel; move it from the terminal (/nomo-cc:handoff) if that is fine` };
+  if (!secrets) return { refuse: "git could not list the project's tracked files", why: "other" };
+  if (secrets.length) return { refuse: `${secrets.slice(0, 3).join(", ")} looks like a secret and is tracked in git, so it would travel; move it from the terminal (/nomo-cc:handoff) if that is fine`, why: "secret" };
   return { claudePid: pid, cwd: r.cwd };
 }
+
+/** The exit code of a handoff that found the user's box gone (NOM-99), so the helper can say why. */
+export const EXIT_BOX_GONE = 3;
 
 /** How long the phone path waits after writing the "moving" marker before reading the session state. */
 export const PHONE_SETTLE_MS = 2000;

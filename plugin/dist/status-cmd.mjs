@@ -105,8 +105,16 @@ async function sha256Hex(s) {
   return Array.from(new Uint8Array(digest)).map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
+// src/core/pair-url.ts
+var textEncoder2 = new TextEncoder;
+var DEFAULT_WORKER_URL = "https://api.nomo.gg";
+function buildPairURL(workerUrl, pairingId, qrSecret, pcEphPub) {
+  const u = workerUrl === DEFAULT_WORKER_URL ? "" : `&u=${b64url(textEncoder2.encode(workerUrl))}`;
+  return `nomo://pair?v=1${u}&p=${pairingId}&s=${b64url(qrSecret)}&e=${b64url(pcEphPub)}`;
+}
+
 // src/core/shared.ts
-var PLUGIN_VERSION = "2.3.36";
+var PLUGIN_VERSION = "2.3.41";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -200,14 +208,45 @@ function appendFittedPlan(base, plan) {
   }
   return { ...base, plan: chars.slice(0, lo).join("") + marker };
 }
+function needsPairing(cloud, worker) {
+  return !cloud.sandboxId || cloud.pairedTo !== `${cloud.sandboxId} ${worker}`;
+}
+function boxPaired(path = `${CC_DIR}/cloud.json`, worker = (process.env.NOMO_WORKER_URL || DEFAULT_WORKER_URL).replace(/\/$/, "")) {
+  try {
+    return !needsPairing(JSON.parse(readFileSync(path, "utf8")), worker);
+  } catch {
+    return false;
+  }
+}
+var BOX_PAIRED_TTL_MS = 30000;
+var boxMemo;
+var boxOverride = undefined;
+function boxPairedCached(now = Date.now()) {
+  if (boxOverride !== undefined)
+    return boxOverride;
+  if (!boxMemo || now - boxMemo.at > BOX_PAIRED_TTL_MS)
+    boxMemo = { at: now, v: boxPaired() };
+  return boxMemo.v;
+}
 function appendFittedPlanAndDebug(base, plan, dbg) {
-  const withPlan = appendFittedPlan(base, plan);
+  const withBox = base.agent === undefined && boxPairedCached() ? { ...base, box: true } : base;
+  const withPlan = appendFittedPlan(withBox, plan);
   if (typeof dbg !== "string" || dbg.length === 0)
     return withPlan;
   const capped = Array.from(dbg).slice(0, DBG_BLOB_TEXT_MAX_CHARS).join("");
   const encoder = new TextEncoder;
   const withDebug = { ...withPlan, dbg: capped };
   return sealedBlobChars(encoder.encode(JSON.stringify(withDebug)).length) <= BLOB_FIT_CHARS ? withDebug : withPlan;
+}
+var recordCloudExtra = (r) => ({ ...r.cloudWhy ? { cloudWhy: r.cloudWhy } : {}, ...r.cloudAge ? { cloudAge: r.cloudAge } : {} });
+function withCloudKey(plain, cloud, extra = {}) {
+  const { cloud: _old, cloudWhy: _w, cloudAge: _a, plan, dbg, ...base } = plain;
+  const keys = cloud ? { cloud, ...extra.cloudWhy ? { cloudWhy: extra.cloudWhy } : {}, ...extra.cloudAge ? { cloudAge: extra.cloudAge } : {} } : {};
+  const fitted = appendFittedPlanAndDebug({ ...base, ...keys }, typeof plan === "string" ? plan : undefined, typeof dbg === "string" ? dbg : undefined);
+  if (!cloud)
+    return fitted;
+  const rest = Object.fromEntries(Object.entries(fitted).filter(([k]) => !(k in keys)));
+  return { ...rest, ...keys };
 }
 var RECORD_FULL_TEXT_MAX_CHARS = 262144;
 var RECORD_FULL_TEXT_TRUNCATION_MARKER = `

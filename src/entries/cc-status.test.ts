@@ -5,7 +5,7 @@ import { basename, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { b64url, decryptBlob } from "../core/crypto";
 import {
-  BLOB_FIT_CHARS, DBG_BLOB_TEXT_MAX_CHARS, folderIdentity, folderKeyFromCwd, formatPlanPickerDebug, fullTextForRecord, parseConfig, PendingEventStash, PLAN_BLOB_TEXT_MAX_CHARS, PLAN_BLOB_TRUNCATION_MARKER, postFullText,
+  BLOB_FIT_CHARS, DBG_BLOB_TEXT_MAX_CHARS, setBoxPairedForTest, folderIdentity, folderKeyFromCwd, formatPlanPickerDebug, fullTextForRecord, parseConfig, PendingEventStash, PLAN_BLOB_TEXT_MAX_CHARS, PLAN_BLOB_TRUNCATION_MARKER, postFullText,
   decisionHoldFileName, interruptFlagFileName, readDecisionHoldAt, readRecord, sealedBlobChars, SessionRecord, sessionBranch, writeDecisionHoldAt, writeInterruptFlagAt,
 } from "../core/shared";
 import {
@@ -4118,5 +4118,26 @@ describe("interrupt: what the status hook tells Claude Code when the phone asked
     const input = { session_id: "s", cwd: "/x", hook_event_name: "PreToolUse", tool_name: "Bash" };
     expect(interruptedEventInput(input)).toEqual({ ...input, hook_event_name: "Stop" });
     expect(input.hook_event_name).toBe("PreToolUse");
+  });
+});
+
+describe("box key (NOM-95)", () => {
+  afterEach(() => setBoxPairedForTest(false));
+  const stopIn = { hook_event_name: "Stop", cwd: "/x" };
+  const blob = (agent?: "codex" | "opencode", plan?: string) =>
+    buildBlob(stopIn, "Mac", "t", planOp("Stop", stopIn, false)!, agent, undefined, undefined, undefined, undefined, plan) as Record<string, unknown>;
+
+  test("box:true on a Claude blob only while a box is paired; never box:false", () => {
+    expect("box" in blob()).toBe(false);
+    setBoxPairedForTest(true);
+    expect(blob().box).toBe(true);
+    const keys = Object.keys(blob(undefined, "a plan"));
+    expect(keys.indexOf("box")).toBeLessThan(keys.indexOf("plan")); // before the fitted tail
+  });
+
+  test("never on a Codex or OpenCode blob", () => {
+    setBoxPairedForTest(true);
+    expect("box" in blob("codex")).toBe(false);
+    expect("box" in blob("opencode")).toBe(false);
   });
 });

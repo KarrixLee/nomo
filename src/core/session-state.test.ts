@@ -724,3 +724,13 @@ describe("buildStatePlaintext — the Mac-authored blob (invariants 22 and 23)",
     expect(sealedBlobChars(bytes(crowded))).toBeLessThanOrEqual(BLOB_FIT_CHARS);
   });
 });
+
+test("NOM-95: a live done row's LAN blob carries the record's cloud key, last, and follows it", () => {
+  const done = (cloud?: string) => state({ record: rec({ op: "done", lastEvent: "done", ...(cloud ? { cloud } : {}) }) });
+  const moving = done("moving")!, cloud = done("cloud")!;
+  expect(moving.blob).toMatchObject({ kind: "plain", value: { status: "done", cloud: "moving" } });
+  const v = (cloud.blob as { value: Record<string, unknown> }).value;
+  expect(v.cloud).toBe("cloud");
+  expect(Object.keys(v).at(-1)).toBe("cloud");
+  expect("cloud" in (done()!.blob as { value: object }).value).toBe(false);
+});

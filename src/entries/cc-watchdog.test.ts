@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -8,7 +8,7 @@ import { createLanAnswerStore } from "../core/lan-listener";
 import type { DecisionHold, PlanPickerTraceDecision, SessionRecord } from "../core/shared";
 import { GONE_STRIKE_LIMIT, readGoneStrikes, recordGoneStrike, resetGoneStrikes, tracePlanPickerDecision } from "../core/shared";
 import {
-  acceptLanAnswer, acceptLanCommand, commandWaitLoop, createWake, fileCursorStore, isCommandActiveSession, enqueueDrainCommands, LAN_ANSWER_ECHO_DELAY_MS, LAN_COMMAND_ID_PREFIX,
+  acceptLanAnswer, acceptLanCommand, commandWaitLoop, createWake, fileCursorStore, isCommandActiveSession, wantsCommands, enqueueDrainCommands, LAN_ANSWER_ECHO_DELAY_MS, LAN_COMMAND_ID_PREFIX,
   buildDoneEnvelope, buildEndEnvelope, buildHeartbeatEnvelope, buildNeedsAttentionEnvelope, buildProvisionalBlob,
   buildProvisionalEnvelope, buildProvisionalRecord, buildStartEnvelope, buildTitleRepairEnvelope, classifySession,
   claudeTailPendingApproval, codexLastTurnEvent, codexTailPendingApproval, correctIdleClaude, correctInterrupt,
@@ -25,10 +25,10 @@ import {
   watchdogEventHeaders, WAITING_HEARTBEAT_AFTER_MS, withDeadline,
 } from "./cc-watchdog";
 import type { CommandPayload, DrainCommandsDeps, PostDetail, PostOutcome, RecordEntry } from "./cc-watchdog";
-import { backRuns, BRING_BACK_COMMAND_KIND, correctCloudState, handoffCommand, withCloudKey } from "./cc-watchdog";
+import { backRuns, BRING_BACK_COMMAND_KIND, CLOUD_KEEPALIVE_MS, cloudWant, correctCloudState, handoffCommand, hasBoxKey, maybeProbeBox, resetBoxProbe, withCloudKey } from "./cc-watchdog";
 import { MOVE_TO_CLOUD_COMMAND_KIND, moveFailed, moveRuns, parseCommandPayload } from "./cc-watchdog";
 import type { Park } from "../core/park";
-import { endMovingTurn, readPark, writePark } from "../core/park";
+import { cloudState, endMovingTurn, readMoveResult, readPark, writeMoveResult, writePark } from "../core/park";
 import { resolveOnRelay } from "../core/codex-remote-input";
 import { CODEX_PROXY_STDOUT_ENDED } from "../core/codex-proxy-transport";
 import { buildStatePlaintext, STATE_HOLD_MAX_AGE_MS } from "../core/session-state";
@@ -4975,6 +4975,22 @@ describe("commandWaitLoop (GET /v1/cc/commands/wait long-poll)", () => {
     expect(isCommandActiveSession(rec({ lastEvent: "working", op: "done" }))).toBe(false);
     expect(isCommandActiveSession(rec({ lastEvent: "sessionStart" }))).toBe(false);
   });
+
+  test("NOM-95: with a paired box, a live unparked idle Claude Code session keeps it up", () => {
+    const idle = rec({ lastEvent: "done", op: "done", pid: 400 });
+    const live = (p: number) => p === 400;
+    expect(wantsCommands(idle, undefined, true, live)).toBe(true);
+    expect(wantsCommands(rec({ lastEvent: "sessionStart", pid: 400 }), undefined, true, live)).toBe(true);
+    expect(wantsCommands(idle, undefined, false, live)).toBe(false);                          // no box: today's rule
+    expect(wantsCommands(idle, undefined, true, () => false)).toBe(false);                    // dead pid
+    expect(wantsCommands(rec({ lastEvent: "done", op: "done" }), undefined, true, live)).toBe(false); // no pid
+    expect(wantsCommands({ ...idle, agent: "codex" }, undefined, true, live)).toBe(false);
+    expect(wantsCommands({ ...idle, provisional: true }, undefined, true, live)).toBe(false);
+    // parked: parkWantsCommands decides, box or not
+    expect(wantsCommands(idle, { state: "back" } as never, true, live)).toBe(false);
+    expect(wantsCommands(idle, { state: "cloud" } as never, false, live)).toBe(true);
+    expect(wantsCommands(rec({ lastEvent: "working" }), undefined, false, () => false)).toBe(true);
+  });
 });
 
 describe("bring back from the phone (NOM-93)", () => {
@@ -5089,14 +5105,32 @@ describe("bring back from the phone (NOM-93)", () => {
     expect(await correctCloudState(cfg(), "/x", id, record, "cloud", deps)).toBe("corrected");
     expect(posts).toHaveLength(1);
     expect(posts[0]).toMatchObject({ v: 2, sessionId: id, op: "done", prio: 0, ts: NOW });
-    expect(await decryptBlob(KEY, posts[0].blob)).toEqual({ status: "done", title: "t", cloud: "cloud" });
+    expect(await decryptBlob(KEY, posts[0].blob)).toMatchObject({ status: "done", cloud: "cloud" });
     expect(written!.blob).toBe(posts[0].blob);
     // Same state again: nothing (inside the keep-alive window).
     expect(await correctCloudState(cfg(), "/x", id, written!, "cloud", deps)).toBe("uncorrected");
     expect(posts).toHaveLength(1);
     // Marker gone: the key is removed.
     expect(await correctCloudState(cfg(), "/x", id, written!, undefined, { ...deps, readRecord: async () => written! })).toBe("corrected");
-    expect(await decryptBlob(KEY, posts[1].blob)).toEqual({ status: "done", title: "t" });
+    expect(await decryptBlob(KEY, posts[1].blob)).not.toHaveProperty("cloud");
+  });
+
+  test("NOM-95 field case: a done row sealed `moving`, marker now cloud → resealed `cloud`, posted and recorded", async () => {
+    const id = "cloud-corr-fg";
+    const blob = await encryptBlob(KEY, { status: "done", title: "t", cloud: "moving" });
+    const record = rec({ op: "done", lastEvent: "done", prio: 0, blob, pairingId: "p", cloud: "moving" });
+    const posts: any[] = [];
+    let written: SessionRecord | undefined;
+    const want = cloudState({ state: "cloud", since: 0 }); // a terminal- or phone-armed move: same marker
+    expect(want).toBe("cloud");
+    expect(await correctCloudState(cfg(), "/x", id, record, want, {
+      post: async (b: object) => { posts.push(b); return "delivered" as PostOutcome; },
+      now: () => NOW + 60_000, readRecord: async () => record, writeRecord: async (_p: string, r: SessionRecord) => { written = r; },
+    })).toBe("corrected");
+    expect(posts).toHaveLength(1);
+    expect(posts[0]).toMatchObject({ sessionId: id, op: "done" });
+    expect(await decryptBlob(KEY, posts[0].blob)).toMatchObject({ status: "done", cloud: "cloud" });
+    expect(written).toMatchObject({ blob: posts[0].blob, cloud: "cloud" }); // the LAN feed reads this
   });
 
   test("a parked row is never retired (the marker, not the record, decides)", async () => {
@@ -5187,6 +5221,98 @@ describe("move to cloud from the phone (NOM-94)", () => {
     expect(moveFailed(S, undefined, rec({ lastEvent: "working", turnStartedAt: NOW / 1000 - 5 }))).toBe(true); // an older turn
     expect(moveFailed(S, undefined, rec({ lastEvent: "working", turnStartedAt: NOW / 1000 + 5 }))).toBe(false); // works normally again
     expect(moveRuns.has(S)).toBe(false);
+  });
+
+  test("NOM-95 field case: a refused phone move with an older DONE result file reaches the worker AND the LAN as move-failed", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "nomo-move-"));
+    writeMoveResult(S, true, dir); // the previous successful move's DONE, written before this run
+    const { exits, deps } = harness();
+    const c = await cmd();
+    await drainCommands(cfg(), { ...deps, take: () => [c] });
+    exits[0](1); // the helper's preflight refused (a tracked .env), exit 1, nothing written
+    const record = rec({ op: "done", lastEvent: "done", prio: 0, pairingId: "p", turnStartedAt: NOW / 1000 - 30,
+      blob: await encryptBlob(KEY, { status: "done", title: "t" }) });
+    const want = cloudState(undefined, undefined, false, moveFailed(S, undefined, record, (since) => readMoveResult(S, since, dir)));
+    expect(want).toBe("move-failed");
+    const posts: any[] = [];
+    let written: SessionRecord | undefined;
+    expect(await correctCloudState(cfg(), "/x", S, record, want, {
+      post: async (b: object) => { posts.push(b); return "delivered" as PostOutcome; },
+      now: () => NOW, readRecord: async () => record, writeRecord: async (_p: string, r: SessionRecord) => { written = r; },
+    })).toBe("corrected");
+    expect((await decryptBlob(KEY, posts[0].blob) as Record<string, unknown>).cloud).toBe("move-failed"); // worker leg
+    expect(buildStatePlaintext(written!, "done", NOW).cloud).toBe("move-failed");                       // LAN leg
+  });
+
+  test("NOM-99: a done record holding an older working blob reseals as DONE, never Running", async () => {
+    const id = "cloud-status-1";
+    const blob = await encryptBlob(KEY, { status: "working", title: "t", machine: "m", label: "l" });
+    const record = rec({ op: "done", lastEvent: "done", prio: 0, blob, pairingId: "p", title: "t", machine: "m", label: "l" });
+    const posts: any[] = [];
+    expect(await correctCloudState(cfg(), "/x", id, record, "move-failed", {
+      post: async (b: object) => { posts.push(b); return "delivered" as PostOutcome; },
+      now: () => NOW, readRecord: async () => record, writeRecord: async () => {},
+    }, { cloudWhy: "secret" })).toBe("corrected");
+    expect(posts[0]).toMatchObject({ op: "done", prio: 0 });
+    const plain = await decryptBlob(KEY, posts[0].blob) as Record<string, unknown>;
+    expect(plain).toMatchObject({ status: "done", cloud: "move-failed", cloudWhy: "secret" });
+    expect(Object.keys(plain).slice(-2)).toEqual(["cloud", "cloudWhy"]);
+  });
+
+  test("NOM-99: cloudAge rides along with cloud, and the record keeps both for the LAN feed", async () => {
+    const id = "cloud-age-1";
+    const blob = await encryptBlob(KEY, { status: "done", title: "t", cloud: "cloud" });
+    const record = rec({ op: "done", lastEvent: "done", prio: 0, blob, pairingId: "p", cloud: "cloud" });
+    const posts: any[] = [];
+    let written: SessionRecord | undefined;
+    expect(await correctCloudState(cfg(), "/x", id, record, "cloud", {
+      post: async (b: object) => { posts.push(b); return "delivered" as PostOutcome; },
+      now: () => NOW, readRecord: async () => record, writeRecord: async (_p: string, r: SessionRecord) => { written = r; },
+    }, { cloudAge: "expiring" })).toBe("corrected");
+    expect((await decryptBlob(KEY, posts[0].blob) as Record<string, unknown>).cloudAge).toBe("expiring");
+    expect(written).toMatchObject({ cloud: "cloud", cloudAge: "expiring" });
+    expect(buildStatePlaintext(written!, "done", NOW)).toMatchObject({ cloud: "cloud", cloudAge: "expiring" });
+  });
+
+  test("NOM-99 cloudWant: box-gone until the next turn; failed from the persisted back result; move-failed names why", () => {
+    const T = 1_800_000_000; // the record's last turn (seconds)
+    const record = rec({ turnStartedAt: T });
+    const sinces: number[] = [];
+    const gone = (since: number) => { sinces.push(since); return since <= T * 1000 ? "gone" as const : undefined; };
+    expect(cloudWant(S, undefined, record, NOW, { moveFailed: false, backResult: gone })).toEqual({ cloud: "box-gone", extra: {} });
+    expect(sinces).toEqual([T * 1000]);
+    expect(cloudWant(S, undefined, rec({ turnStartedAt: T + 60 }), NOW, { moveFailed: false, backResult: gone }).cloud).toBeUndefined();
+    const park = { state: "cloud" as const, since: NOW - 14 * 24 * 3600_000 };
+    expect(cloudWant(S, park, record, NOW, { moveFailed: false, locked: false, backResult: () => "failed" }))
+      .toEqual({ cloud: "failed", extra: { cloudAge: "expiring" } });
+    expect(cloudWant(S, undefined, record, NOW, { moveFailed: true, backResult: () => undefined, why: () => "cap" }))
+      .toEqual({ cloud: "move-failed", extra: { cloudWhy: "cap" } });
+    expect(cloudWant(S, undefined, record, NOW, { moveFailed: true, backResult: () => undefined, why: () => undefined }).extra)
+      .toEqual({ cloudWhy: "other" });
+  });
+
+  test("NOM-99 box probe: none with nothing parked, at most once per window otherwise", () => {
+    resetBoxProbe();
+    const spawned: string[] = [];
+    const spawn = (id: string) => { spawned.push(id); };
+    const hasKey = () => true;
+    expect(maybeProbeBox(NOW, { parked: () => [S], spawn, hasKey: () => false })).toBe(false); // no box key: never
+    expect(maybeProbeBox(NOW, { parked: () => [], spawn, hasKey })).toBe(false);
+    expect(maybeProbeBox(NOW, { parked: () => [S], spawn, hasKey })).toBe(true);
+    expect(maybeProbeBox(NOW + 60_000, { parked: () => [S], spawn, hasKey })).toBe(false);
+    expect(maybeProbeBox(NOW + CLOUD_KEEPALIVE_MS, { parked: () => [S], spawn, hasKey })).toBe(true);
+    expect(spawned).toEqual([S, S]);
+  });
+
+  test("hasBoxKey: env, else an OMG_API_KEY line in the spike env file", () => {
+    const dir = mkdtempSync(join(tmpdir(), "nomo-key-"));
+    const f = join(dir, "env");
+    expect(hasBoxKey({ OMG_API_KEY: "x" }, f)).toBe(true);
+    expect(hasBoxKey({}, f)).toBe(false);
+    writeFileSync(f, "OPENROUTER_API_KEY=a\nexport OMG_API_KEY=b\n");
+    expect(hasBoxKey({}, f)).toBe(true);
+    writeFileSync(f, "OMG_API_KEY=\n");
+    expect(hasBoxKey({}, f)).toBe(false);
   });
 
   test("move-failed: the marker vanished without reaching cloud and THIS session's helper reported FAILED", async () => {
