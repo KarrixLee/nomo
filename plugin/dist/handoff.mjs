@@ -384,7 +384,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "2.3.46";
+var PLUGIN_VERSION = "2.3.47";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -5555,7 +5555,65 @@ function tar(out, cwd, args, input) {
     stdio: [input ? "pipe" : "ignore", "ignore", "inherit"]
   });
 }
-function build(args, outDir) {
+var SEED_FAILED = 7;
+var SHA_RE = /^[0-9a-f]{40}([0-9a-f]{24})?$/;
+var PUBLIC_HOSTS = new Set(["github.com", "gitlab.com", "bitbucket.org", "codeberg.org"]);
+function publicCloneUrl(raw) {
+  const m = /^https:\/\/([a-z0-9.-]+)((?:\/[A-Za-z0-9._-]+){2,})$/.exec(raw);
+  if (!m || !PUBLIC_HOSTS.has(m[1]) || m[2].split("/").some((p) => p === "." || p === ".."))
+    return;
+  return raw;
+}
+function anonGitEnv() {
+  const env = Object.fromEntries(Object.entries(process.env).filter(([k]) => !k.startsWith("GIT_")));
+  return { ...env, GIT_TERMINAL_PROMPT: "0", GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null", GIT_ASKPASS: "", SSH_ASKPASS: "" };
+}
+function anonLsRemote(url, ref) {
+  try {
+    execFileSync5("git", ["-c", "credential.helper=", "ls-remote", "--exit-code", url, ref], { cwd: tmpdir(), env: anonGitEnv(), stdio: "ignore", timeout: 20000 });
+    return true;
+  } catch {
+    return false;
+  }
+}
+var boxHeadScript = (root) => `D=${q(root)}; if [ -d "$D/.git" ]; then H=$(git -C "$D" rev-parse -q --verify 'HEAD^{commit}' 2>/dev/null) && echo "NOMO_BOX_HEAD=$H"; fi; true`;
+var parseBoxHead = (stdout) => /^NOMO_BOX_HEAD=([0-9a-f]+)$/m.exec(stdout)?.[1]?.match(SHA_RE)?.[0];
+function pickRepoShip(root, boxHead, ls = anonLsRemote) {
+  const g = (...a) => execFileSync5("git", a, { cwd: root, stdio: ["ignore", "pipe", "ignore"] }).toString().trim();
+  try {
+    const head = g("rev-parse", "--verify", "HEAD^{commit}");
+    if (boxHead && SHA_RE.test(boxHead)) {
+      try {
+        g("cat-file", "-e", `${boxHead}^{commit}`);
+        return { mode: "box", base: boxHead, head };
+      } catch {}
+    }
+    const branch = g("symbolic-ref", "-q", "--short", "HEAD");
+    const url = publicCloneUrl(g("remote", "get-url", g("config", `branch.${branch}.remote`)));
+    const ref = g("config", `branch.${branch}.merge`);
+    if (url && ref.startsWith("refs/heads/") && ls(url, ref))
+      return { mode: "clone", url, base: g("merge-base", "HEAD", "@{u}"), head };
+  } catch {}
+  return { mode: "full" };
+}
+var fmtBytes = (n) => n < 1000 ? `${n} B` : n < 1e6 ? `${(n / 1000).toFixed(1)} KB` : `${(n / 1e6).toFixed(1)} MB`;
+var newCommits = (root, base) => Number(execFileSync5("git", ["rev-list", "--count", `${base}..HEAD`], { cwd: root }).toString().trim());
+function seedScript(ship, bundle) {
+  const check = bundle ? `git -C "$S" bundle verify -q ${bundle} >/dev/null 2>&1` : `git -C "$S" cat-file -e ${ship.head}^{commit}`;
+  const src = ship.mode === "box" ? `"$ROOT"` : q(ship.url);
+  return `S="$ROOT.nomo-seed"; rm -rf "$S"; mkdir -p "$(dirname "$ROOT")"
+${ship.mode === "box" ? `O=$(git -C "$ROOT" remote get-url origin 2>/dev/null) || O=` : "# public clone: origin is that URL"}
+if ! { GIT_TERMINAL_PROMPT=0 git -c credential.helper= -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=60 clone -q --no-checkout ${src} "$S" && ${check}; }; then
+  rm -rf "$S"; echo "NOMO_SEED_FAILED"; exit ${SEED_FAILED}
+fi
+[ -e "$ROOT" ] && mv "$ROOT" "$ROOT.nomo-bak-$(date +%s)"
+mv "$S" "$ROOT"
+cd "$ROOT"
+${ship.mode === "box" ? `if [ -n "$O" ]; then git remote set-url origin "$O"; else git remote remove origin; fi` : ""}
+${bundle ? `git fetch -q ${bundle}` : "# nothing new: the seed already has HEAD"}
+git -c advice.detachedHead=false checkout -q --detach ${ship.head}`;
+}
+function build(args, outDir, opts = {}) {
   const cwd = process.cwd();
   const projDir = join7(process.env.HOME, ".claude", "projects", projectDirName(cwd));
   if (!existsSync6(projDir))
@@ -5584,7 +5642,7 @@ function build(args, outDir) {
   if (hasLayer)
     tar(put("userlayer.tgz"), claudeHome, ["-h", "--null", "-T", "-"], Buffer.from(layer.files.join("\x00")));
   const marketplace = packPlugin(put("plugin.tgz"));
-  let git = true, root = cwd, branch;
+  let git = true, root = cwd, branch, ship = { mode: "full" }, repoLine, bundle;
   try {
     root = execFileSync5("git", ["rev-parse", "--show-toplevel"], { cwd, stdio: ["ignore", "pipe", "ignore"] }).toString().trim();
   } catch {
@@ -5603,7 +5661,15 @@ function build(args, outDir) {
       } catch {}
     }
     branch = sh("git", ["rev-parse", "--abbrev-ref", "HEAD"], root).trim();
-    sh("git", ["bundle", "create", "-q", put("repo.bundle"), "HEAD"], root);
+    if (!opts.full)
+      ship = pickRepoShip(root, opts.boxHead, opts.ls);
+    const n = ship.mode === "full" ? -1 : newCommits(root, ship.base);
+    if (n !== 0) {
+      bundle = `${stage}-repo.bundle`;
+      sh("git", ["bundle", "create", "-q", put("repo.bundle"), ship.mode === "full" ? "HEAD" : `${ship.base}..HEAD`], root);
+    }
+    const size = bundle ? fmtBytes(statSync5(art[bundle]).size) : "nothing to send";
+    repoLine = ship.mode === "full" ? `Repo: full bundle of HEAD (${size}).` : ship.mode === "box" ? `Repo: the box already has ${ship.base.slice(0, 8)}; sending ${n} new commit(s) (${size}).` : `Repo: the box clones ${ship.url} anonymously; sending ${n} unpushed commit(s) (${size}).`;
     writeFileSync4(put("wip.patch"), execFileSync5("git", ["diff", "--binary", "HEAD"], { cwd: root, maxBuffer: 1 << 30 }));
     const untracked = execFileSync5("git", ["ls-files", "--others", "--exclude-standard", "-z"], { cwd: root, maxBuffer: 1 << 30 });
     const list = packList(root, untracked.toString().split("\x00").filter(Boolean));
@@ -5644,10 +5710,10 @@ if [ -n "\${NOMO_GIT_NAME:-}" ]; then git config --global user.name "$NOMO_GIT_N
 if [ -n "\${NOMO_GIT_EMAIL:-}" ]; then git config --global user.email "$NOMO_GIT_EMAIL"; fi
 
 ROOT=${q(root)}
-[ -e "$ROOT" ] && mv "$ROOT" "$ROOT.nomo-bak-$(date +%s)"
-mkdir -p "$(dirname "$ROOT")"
-${git ? `git -c advice.detachedHead=false clone -q ${stage}-repo.bundle "$ROOT"
-cd "$ROOT"
+${git && ship.mode !== "full" ? seedScript(ship, bundle) : `[ -e "$ROOT" ] && mv "$ROOT" "$ROOT.nomo-bak-$(date +%s)"
+mkdir -p "$(dirname "$ROOT")"`}
+${git ? `${ship.mode === "full" ? `git -c advice.detachedHead=false clone -q ${stage}-repo.bundle "$ROOT"
+cd "$ROOT"` : "# seeded above"}
 ${branch && branch !== "HEAD" ? `git checkout -q -B ${q(branch)}` : "# detached HEAD"}
 [ -s ${stage}-wip.patch ] && git apply --binary ${stage}-wip.patch
 tar xzf ${stage}-untracked.tgz -C "$ROOT"` : `mkdir -p "$ROOT" && tar xzf ${stage}-folder.tgz -C "$ROOT"`}
@@ -5689,7 +5755,7 @@ sleep 8
 tmux has-session -t "=$T"
 tmux capture-pane -p -t "=$T:"
 `;
-  return { uuid, cwd, root, git, branch, model, artifacts: art, script, snap, gitUser, warn: sizeWarning(contextTokens(transcriptBytes.subarray(Math.max(0, transcriptBytes.length - TAIL_BYTES)).toString("utf8"), transcriptBytes.length)) };
+  return { uuid, repoLine, cwd, root, git, branch, model, artifacts: art, script, snap, gitUser, warn: sizeWarning(contextTokens(transcriptBytes.subarray(Math.max(0, transcriptBytes.length - TAIL_BYTES)).toString("utf8"), transcriptBytes.length)) };
 }
 async function readCapped(res, max = Infinity) {
   const tooBig = () => new Error(`response over ${(max / 1e6).toFixed(0)} MB; refusing it`);
@@ -7037,34 +7103,50 @@ Target worker: ${worker}`);
   }
   if (!keys.openrouter)
     throw new Error("OPENROUTER_API_KEY not set (env or ~/.nomo-spike.env)");
-  const out = mkdtempSync2(join7(tmpdir(), "nomo-handoff-"));
-  let plan, id;
+  const id = await ensureBox(omg);
+  let boxHead;
   try {
-    plan = build(args, out);
-    console.log(`Handing off session ${plan.uuid} (${plan.model}) from ${plan.cwd} · Nomo worker ${worker}`);
-    if (plan.warn)
-      console.log(plan.warn);
-    const ready = readiness(plan.cwd);
-    if (ready)
-      console.log(ready);
-    id = await ensureBox(omg);
-    for (const [box, local] of Object.entries(plan.artifacts)) {
-      await api(omg, "POST", `/sandboxes/${id}/files`, [{ path: box, content: readFileSync6(local).toString("base64"), mode: 384 }]);
+    const root = execFileSync5("git", ["rev-parse", "--show-toplevel"], { stdio: ["ignore", "pipe", "ignore"] }).toString().trim();
+    boxHead = parseBoxHead((await exec(omg, id, boxHeadScript(root))).stdout ?? "");
+  } catch {}
+  const ship = async (opts) => {
+    const out = mkdtempSync2(join7(tmpdir(), "nomo-handoff-"));
+    try {
+      const p = build(args, out, opts);
+      if (p.repoLine)
+        console.log(p.repoLine);
+      for (const [box, local] of Object.entries(p.artifacts)) {
+        await api(omg, "POST", `/sandboxes/${id}/files`, [{ path: box, content: readFileSync6(local).toString("base64"), mode: 384 }]);
+      }
+      return p;
+    } finally {
+      rmSync2(out, { recursive: true, force: true });
     }
-  } finally {
-    rmSync2(out, { recursive: true, force: true });
-  }
-  const r = await exec(omg, id, plan.script, {
+  };
+  let plan = await ship({ boxHead });
+  console.log(`Handing off session ${plan.uuid} (${plan.model}) from ${plan.cwd} · Nomo worker ${worker}`);
+  if (plan.warn)
+    console.log(plan.warn);
+  const ready = readiness(plan.cwd);
+  if (ready)
+    console.log(ready);
+  const start = (p) => exec(omg, id, p.script, {
     ANTHROPIC_BASE_URL: `http://127.0.0.1:${RELAY_PORT}`,
     ANTHROPIC_AUTH_TOKEN: keys.openrouter,
     ANTHROPIC_API_KEY: "",
     CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1",
     NOMO_WORKER_URL: worker,
     NOMO_KNOWN: (loadCloud().active ?? []).join(" "),
-    ...plan.gitUser,
+    ...p.gitUser,
     ...args.has("--force") ? { NOMO_FORCE: "1" } : {},
     ...process.env.NOMO_HANDOFF_HELPER ? { NOMO_PAIR_REQUIRED: "1" } : {}
   });
+  let r = await start(plan);
+  if (r.exitCode === SEED_FAILED) {
+    console.log("The box couldn't build the repo from its own copy; sending the full bundle instead.");
+    plan = await ship({ full: true });
+    r = await start(plan);
+  }
   const pane = takePairUrl(r.stdout ?? "").rest.replace(/^NOMO_(PAIRED|PAIR_FAILED: .*|REPAIR: .*)$\n?/gm, "");
   if (r.exitCode === 4)
     throw new Error(`the OpenRouter relay did not start on box ${id}:
@@ -7123,11 +7205,13 @@ export {
   PAIR_GATE,
   PAIR_POLL,
   RELAY_PORT,
+  SEED_FAILED,
   SENSITIVE2 as SENSITIVE,
   SHM_SWEEP,
   TYPE_FN,
   USAGE,
   admitScript,
+  anonLsRemote,
   backPackScript,
   backPrefix,
   backStopScript,
@@ -7135,6 +7219,7 @@ export {
   bakeScript,
   boxBusyNow,
   boxGone,
+  boxHeadScript,
   boxHealth,
   boxPairPayload,
   boxPrelude,
@@ -7144,6 +7229,7 @@ export {
   checkLaunchIds,
   createBody,
   firstMessageScript,
+  fmtBytes,
   getBox,
   hereSession,
   id12,
@@ -7154,21 +7240,26 @@ export {
   latestSession,
   launchLine,
   listActive,
+  newCommits,
   normalizeCloud,
   packList,
   packRefusal,
   pairWakes,
   paneScript,
   parseArgs,
+  parseBoxHead,
   parseLeft,
+  pickRepoShip,
   pickSession,
   projectDirName,
   pubRawFromPkcs8,
+  publicCloneUrl,
   q,
   readCapped,
   resultPage,
   resumeCommand,
   sameWindowBackLine,
+  seedScript,
   sendFirstMessage,
   sendResult,
   sessionGuard,
