@@ -324,7 +324,7 @@ export function phoneMoveCheck(f: PhoneMoveFacts): { claudePid: number; cwd: str
   if (f.cloudCount >= BOX_MAX_SESSIONS) return { refuse: `the cloud box already runs ${f.cloudCount} sessions (the cap is ${BOX_MAX_SESSIONS}); bring one back first`, why: "cap" };
   if (!r.cwd || !f.transcriptExists(r.cwd)) return { refuse: "its transcript was not found", why: "other" };
   const inTranscript = f.transcriptSecrets(r.cwd);
-  if (inTranscript) return { refuse: `the conversation contains what look like ${inTranscript}, which would travel with the transcript; move it from the terminal (/nomo-cc:handoff anyway) if that is fine`, why: "secret" };
+  if (inTranscript) return { refuse: `the conversation contains what look like ${inTranscript}, which would travel with the transcript; move it from the terminal (/nomo-cc:handoff anyway) if that is fine`, why: "transcriptSecret" };
   const secrets = f.trackedSecrets(r.cwd);
   if (!secrets) return { refuse: "git could not list the project's tracked files", why: "other" };
   if (secrets.length) return { refuse: `${secrets.slice(0, 3).join(", ")} looks like a secret and is tracked in git, so it would travel; move it from the terminal (/nomo-cc:handoff) if that is fine`, why: "secret" };

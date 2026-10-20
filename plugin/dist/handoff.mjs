@@ -3776,7 +3776,7 @@ function releaseBackLock(id, dir = BACK_LOCK_DIR) {
   } catch {}
 }
 var moveResultFile = (id, dir = BACK_LOCK_DIR) => join5(dir, `${id.slice(0, 12)}.move`);
-var MOVE_WHYS = ["secret", "cap", "notPaired", "busy", "gone", "other"];
+var MOVE_WHYS = ["secret", "transcriptSecret", "cap", "notPaired", "busy", "gone", "other"];
 function writeMoveResult(id, ok, dir = BACK_LOCK_DIR, why) {
   try {
     mkdirSync(dir, { recursive: true, mode: 448 });
@@ -4084,7 +4084,7 @@ function phoneMoveCheck(f) {
     return { refuse: "its transcript was not found", why: "other" };
   const inTranscript = f.transcriptSecrets(r.cwd);
   if (inTranscript)
-    return { refuse: `the conversation contains what look like ${inTranscript}, which would travel with the transcript; move it from the terminal (/nomo-cc:handoff anyway) if that is fine`, why: "secret" };
+    return { refuse: `the conversation contains what look like ${inTranscript}, which would travel with the transcript; move it from the terminal (/nomo-cc:handoff anyway) if that is fine`, why: "transcriptSecret" };
   const secrets = f.trackedSecrets(r.cwd);
   if (!secrets)
     return { refuse: "git could not list the project's tracked files", why: "other" };

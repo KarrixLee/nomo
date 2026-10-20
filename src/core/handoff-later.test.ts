@@ -383,10 +383,10 @@ describe("phone move-to-cloud (NOM-94)", () => {
     expect(refuse({ record: { pid: 400 } })).toMatch(/transcript/);
   });
 
-  test("NOM-103: a transcript that looks like it holds secrets refuses with why secret", () => {
+  test("NOM-103: a transcript that looks like it holds secrets refuses with why transcriptSecret", () => {
     const o = { transcriptSecrets: () => "1 secret (AWS key ×1; transcript line 3)" };
     expect(refuse(o)).toMatch(/conversation contains what look like 1 secret \(AWS key ×1; transcript line 3\).*\/nomo-cc:handoff anyway/);
-    expect((phoneMoveCheck(facts(o)) as { why: string }).why).toBe("secret");
+    expect((phoneMoveCheck(facts(o)) as { why: string }).why).toBe("transcriptSecret");
   });
 
   test("a git-tracked secret refuses; a git error refuses; none (or no git) passes", () => {

@@ -134,7 +134,7 @@ home. What that does and doesn't expose:
   with `alg`), and upper-case `…KEY=`/`…SECRET=`/`…TOKEN=`/`…PASSWORD=` assignments whose value is
   16+ characters, mixes letters and digits and has high Shannon entropy. On a hit it prints the kinds,
   counts and line numbers in the `Cloud check:` block and starts nothing; `/nomo-cc:handoff anyway`
-  is the explicit confirm. *Move to cloud* from the phone refuses instead (`cloudWhy: "secret"`). The
+  is the explicit confirm. *Move to cloud* from the phone refuses instead (`cloudWhy: "transcriptSecret"`). The
   scan never returns, logs or prints a matched value, not even part of one. It skips obvious
   placeholders (`xxx`, `your-key-here`, `<…>`, `example`…) and anything embedded in a longer base64
   run (Nomo's own sealed blobs, images). **It is pattern-based, so it is a seatbelt, not a

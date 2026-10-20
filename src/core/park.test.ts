@@ -354,6 +354,8 @@ describe("NOM-99 result files and states", () => {
     writeMoveResult(A, false, d, "secret");
     expect(readMoveResult(A, 0, d)).toBe("failed");
     expect(readMoveWhy(A, 0, d)).toBe("secret");
+    writeMoveResult(A, false, d, "transcriptSecret"); // NOM-103: its own code, round-trips
+    expect(readMoveWhy(A, 0, d)).toBe("transcriptSecret");
     expect(readMoveWhy(A, Date.now() + 60_000, d)).toBeUndefined();
     writeMoveResult(A, false, d);
     expect(readMoveWhy(A, 0, d)).toBe("other");

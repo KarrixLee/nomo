@@ -245,8 +245,8 @@ export function releaseBackLock(id: string, dir = BACK_LOCK_DIR): void {
  *  writes nothing: it is a clean unpark. */
 export const moveResultFile = (id: string, dir = BACK_LOCK_DIR): string => join(dir, `${id.slice(0, 12)}.move`);
 /** NOM-99: why a move failed, sealed as `cloudWhy`. Codes only, never paths or file names. */
-export type MoveWhy = "secret" | "cap" | "notPaired" | "busy" | "gone" | "other";
-const MOVE_WHYS: readonly string[] = ["secret", "cap", "notPaired", "busy", "gone", "other"];
+export type MoveWhy = "secret" | "transcriptSecret" | "cap" | "notPaired" | "busy" | "gone" | "other";
+const MOVE_WHYS: readonly string[] = ["secret", "transcriptSecret", "cap", "notPaired", "busy", "gone", "other"];
 export function writeMoveResult(id: string, ok: boolean, dir = BACK_LOCK_DIR, why?: MoveWhy): void {
   try { mkdirSync(dir, { recursive: true, mode: 0o700 }); writeFileSync(moveResultFile(id, dir), ok ? "DONE\n" : `FAILED${why ? ` ${why}` : ""}\n`, { mode: 0o600 }); } catch { /* status only */ }
 }
