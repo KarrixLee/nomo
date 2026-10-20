@@ -934,3 +934,17 @@ describe("box gone (NOM-99)", () => {
     await expect(boxHealth("k", { ...base, locked: () => false, park: () => ({ state: "cloud" }), get: async () => { throw new Error("503"); } })).rejects.toThrow();
   });
 });
+
+import { KNOWN_FLAGS, pairWakes, parseArgs } from "./handoff";
+describe("handoff argv", () => {
+  test("an unknown --flag throws (never a silent full handoff); values and known flags parse", () => {
+    expect(() => parseArgs(["--hepl"])).toThrow(/unknown flag --hepl\. Known flags: .*--pair/);
+    expect(parseArgs(["--send", "--not-a-flag", "--wait", "5", "--help"])).toEqual(new Map<string, string | true>([["--send", "--not-a-flag"], ["--wait", "5"], ["--help", true]]));
+    expect(KNOWN_FLAGS).toContain("--from-session");
+  });
+  test("only a bare --pair wakes the box", () => {
+    expect(pairWakes(parseArgs(["--pair"]))).toBe(true);
+    for (const f of ["--status", "--screen"]) expect(pairWakes(parseArgs([f]))).toBe(false);
+    expect(pairWakes(parseArgs(["--pair", "--screen"]))).toBe(false);
+  });
+});

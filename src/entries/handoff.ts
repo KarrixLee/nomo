@@ -1668,15 +1668,39 @@ async function afterExit(args: Map<string, string | true>, worker: string): Prom
 
 // -------------------------------------------------------------------------------------------- main
 
-async function main(): Promise<void> {
-  const argv = process.argv.slice(2).filter((a) => a !== "handoff");
+export const USAGE = `usage:
+  handoff.mjs [--session <uuid>] [--model <id>] [--force] [--dry-run] [--then "<first message>"] [--worker <url>]
+  handoff.mjs --status | --stop [--session <uuid> | --all] | --pair
+  handoff.mjs --screen | --send "<text>" | --send-key <tmux key, e.g. Escape, BTab, C-c>   [--session <uuid>]
+  handoff.mjs --bake | --check | --help
+  handoff.mjs --back [--session <uuid>] [--force] [--no-open] [--wait <min>]
+  handoff.mjs --later [--session <uuid>] | --later-cancel | --later-status`;
+const VALUE_FLAGS = ["--session", "--model", "--send", "--send-key", "--then", "--worker", "--claude-pid", "--from-session"];
+/** Every flag main and its sub-commands read; --wait takes an optional <min>. */
+export const KNOWN_FLAGS = [...VALUE_FLAGS, "--wait", "--after-exit", "--all", "--args-stdin", "--back", "--bake", "--box-health",
+  "--box-pair", "--check", "--dry-run", "--force", "--help", "--later", "--later-cancel", "--later-status", "--no-open", "--pair",
+  "--phone", "--screen", "--status", "--stop"];
+
+/** An unknown --flag throws BEFORE anything runs: it used to fall through to a full handoff of the cwd's session. */
+export function parseArgs(argv: string[]): Map<string, string | true> {
   const args = new Map<string, string | true>();
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
-    if (["--session", "--model", "--send", "--send-key", "--then", "--worker", "--claude-pid", "--from-session"].includes(a)) args.set(a, argv[++i] ?? "");
+    if (VALUE_FLAGS.includes(a)) args.set(a, argv[++i] ?? "");
     else if (a === "--wait" && /^\d+(\.\d+)?$/.test(argv[i + 1] ?? "")) args.set(a, argv[++i]);
+    else if (a.startsWith("--") && !KNOWN_FLAGS.includes(a)) throw new Error(`unknown flag ${a}. Known flags: ${KNOWN_FLAGS.join(" ")}\n${USAGE}`);
     else args.set(a, true);
   }
+  return args;
+}
+
+/** --pair (alone, not under --stop/--screen/--send*) wakes a sleeping box first; the others stay read-only. */
+export const pairWakes = (args: Map<string, unknown>) =>
+  args.has("--pair") && !["--stop", "--screen", "--send", "--send-key"].some((f) => args.has(f));
+
+async function main(): Promise<void> {
+  const args = parseArgs(process.argv.slice(2).filter((a) => a !== "handoff"));
+  if (args.has("--help")) { console.log(USAGE); return; }
 
   if (args.has("--box-pair")) {
     // Runs ON THE BOX (from nomo_pair), never on the Mac: prints only the URL marker.
@@ -1732,8 +1756,10 @@ async function main(): Promise<void> {
 
   if (["--status", "--stop", "--pair", "--screen", "--send", "--send-key"].some((f) => args.has(f))) {
     const cloud = loadCloud();
-    const sb = await getBox(omg, cloud.sandboxId, api, { wake: false }); // read-only: a stopped box stays stopped
+    // read-only (a stopped box stays stopped), except --pair, which wakes it first
+    let sb = await getBox(omg, cloud.sandboxId, api, { wake: pairWakes(args) });
     if (!sb) { console.log("No cloud box. Run `handoff` to create one."); return; }
+    if (pairWakes(args) && sb.status !== "running") sb = { ...sb, id: await wakeBox(omg, sb), status: "running" };
     const here = hereSession(args.get("--from-session") || process.env.CLAUDE_CODE_SESSION_ID, cloud);
     if (args.has("--stop")) {
       // --all, or bare with at most one session on record: sleep the whole box (sessions resume on wake).

@@ -6591,17 +6591,60 @@ async function afterExit(args, worker) {
     }
   });
 }
-async function main() {
-  const argv = process.argv.slice(2).filter((a) => a !== "handoff");
+var USAGE = `usage:
+  handoff.mjs [--session <uuid>] [--model <id>] [--force] [--dry-run] [--then "<first message>"] [--worker <url>]
+  handoff.mjs --status | --stop [--session <uuid> | --all] | --pair
+  handoff.mjs --screen | --send "<text>" | --send-key <tmux key, e.g. Escape, BTab, C-c>   [--session <uuid>]
+  handoff.mjs --bake | --check | --help
+  handoff.mjs --back [--session <uuid>] [--force] [--no-open] [--wait <min>]
+  handoff.mjs --later [--session <uuid>] | --later-cancel | --later-status`;
+var VALUE_FLAGS = ["--session", "--model", "--send", "--send-key", "--then", "--worker", "--claude-pid", "--from-session"];
+var KNOWN_FLAGS = [
+  ...VALUE_FLAGS,
+  "--wait",
+  "--after-exit",
+  "--all",
+  "--args-stdin",
+  "--back",
+  "--bake",
+  "--box-health",
+  "--box-pair",
+  "--check",
+  "--dry-run",
+  "--force",
+  "--help",
+  "--later",
+  "--later-cancel",
+  "--later-status",
+  "--no-open",
+  "--pair",
+  "--phone",
+  "--screen",
+  "--status",
+  "--stop"
+];
+function parseArgs(argv) {
   const args = new Map;
   for (let i = 0;i < argv.length; i++) {
     const a = argv[i];
-    if (["--session", "--model", "--send", "--send-key", "--then", "--worker", "--claude-pid", "--from-session"].includes(a))
+    if (VALUE_FLAGS.includes(a))
       args.set(a, argv[++i] ?? "");
     else if (a === "--wait" && /^\d+(\.\d+)?$/.test(argv[i + 1] ?? ""))
       args.set(a, argv[++i]);
+    else if (a.startsWith("--") && !KNOWN_FLAGS.includes(a))
+      throw new Error(`unknown flag ${a}. Known flags: ${KNOWN_FLAGS.join(" ")}
+${USAGE}`);
     else
       args.set(a, true);
+  }
+  return args;
+}
+var pairWakes = (args) => args.has("--pair") && !["--stop", "--screen", "--send", "--send-key"].some((f) => args.has(f));
+async function main() {
+  const args = parseArgs(process.argv.slice(2).filter((a) => a !== "handoff"));
+  if (args.has("--help")) {
+    console.log(USAGE);
+    return;
   }
   if (args.has("--box-pair")) {
     const cfg = `${CC_DIR}/config.json`;
@@ -6688,11 +6731,13 @@ async function main() {
   }
   if (["--status", "--stop", "--pair", "--screen", "--send", "--send-key"].some((f) => args.has(f))) {
     const cloud = loadCloud();
-    const sb = await getBox(omg, cloud.sandboxId, api, { wake: false });
+    let sb = await getBox(omg, cloud.sandboxId, api, { wake: pairWakes(args) });
     if (!sb) {
       console.log("No cloud box. Run `handoff` to create one.");
       return;
     }
+    if (pairWakes(args) && sb.status !== "running")
+      sb = { ...sb, id: await wakeBox(omg, sb), status: "running" };
     const here = hereSession(args.get("--from-session") || process.env.CLAUDE_CODE_SESSION_ID, cloud);
     if (args.has("--stop")) {
       if (args.has("--all") || !args.has("--session") && !here && (cloud.active ?? []).length <= 1) {
@@ -6832,6 +6877,7 @@ export {
   BOX_MAX_SESSIONS,
   FIRST_SKIPPED,
   FIRST_UNCONFIRMED,
+  KNOWN_FLAGS,
   LEFT_LINE,
   PAIR_FN,
   PAIR_GATE,
@@ -6840,6 +6886,7 @@ export {
   SENSITIVE2 as SENSITIVE,
   SHM_SWEEP,
   TYPE_FN,
+  USAGE,
   admitScript,
   backPackScript,
   backPrefix,
@@ -6867,7 +6914,9 @@ export {
   normalizeCloud,
   packList,
   packRefusal,
+  pairWakes,
   paneScript,
+  parseArgs,
   parseLeft,
   pickSession,
   projectDirName,
