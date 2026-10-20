@@ -4,9 +4,9 @@ var __require = /* @__PURE__ */ createRequire(import.meta.url);
 // src/entries/cc-watchdog.ts
 import { readdir as readdir4, readFile as readFile8, unlink as unlink4 } from "node:fs/promises";
 import { spawn as spawn3 } from "node:child_process";
-import { closeSync as closeSync2, existsSync as existsSync3, mkdirSync as mkdirSync2, openSync as openSync2, readFileSync as readFileSync4, statSync as statSync4, unlinkSync as unlinkSync3, writeSync } from "node:fs";
+import { closeSync, existsSync as existsSync3, mkdirSync as mkdirSync2, openSync, readFileSync as readFileSync3, statSync as statSync4, unlinkSync as unlinkSync2, writeSync } from "node:fs";
 import { homedir, hostname as hostname4 } from "node:os";
-import { basename as basename7 } from "node:path";
+import { basename as basename6 } from "node:path";
 
 // src/core/crypto.ts
 var textEncoder = new TextEncoder;
@@ -107,7 +107,17 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "2.3.37";
+
+// src/core/pair-url.ts
+var textEncoder2 = new TextEncoder;
+var DEFAULT_WORKER_URL = "https://api.nomo.gg";
+function buildPairURL(workerUrl, pairingId, qrSecret, pcEphPub) {
+  const u = workerUrl === DEFAULT_WORKER_URL ? "" : `&u=${b64url(textEncoder2.encode(workerUrl))}`;
+  return `nomo://pair?v=1${u}&p=${pairingId}&s=${b64url(qrSecret)}&e=${b64url(pcEphPub)}`;
+}
+
+// src/core/shared.ts
+var PLUGIN_VERSION = "2.3.38";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -201,8 +211,29 @@ function appendFittedPlan(base, plan) {
   }
   return { ...base, plan: chars.slice(0, lo).join("") + marker };
 }
+function needsPairing(cloud, worker) {
+  return !cloud.sandboxId || cloud.pairedTo !== `${cloud.sandboxId} ${worker}`;
+}
+function boxPaired(path = `${CC_DIR}/cloud.json`, worker = (process.env.NOMO_WORKER_URL || DEFAULT_WORKER_URL).replace(/\/$/, "")) {
+  try {
+    return !needsPairing(JSON.parse(readFileSync(path, "utf8")), worker);
+  } catch {
+    return false;
+  }
+}
+var BOX_PAIRED_TTL_MS = 30000;
+var boxMemo;
+var boxOverride = undefined;
+function boxPairedCached(now = Date.now()) {
+  if (boxOverride !== undefined)
+    return boxOverride;
+  if (!boxMemo || now - boxMemo.at > BOX_PAIRED_TTL_MS)
+    boxMemo = { at: now, v: boxPaired() };
+  return boxMemo.v;
+}
 function appendFittedPlanAndDebug(base, plan, dbg) {
-  const withPlan = appendFittedPlan(base, plan);
+  const withBox = base.agent === undefined && boxPairedCached() ? { ...base, box: true } : base;
+  const withPlan = appendFittedPlan(withBox, plan);
   if (typeof dbg !== "string" || dbg.length === 0)
     return withPlan;
   const capped = Array.from(dbg).slice(0, DBG_BLOB_TEXT_MAX_CHARS).join("");
@@ -8070,297 +8101,8 @@ class CodexRemoteInputBridge {
     }
   }
 }
-
-// src/core/handoff-later.ts
-import { appendFileSync as appendFileSync3, closeSync, fstatSync, linkSync, openSync, readFileSync as readFileSync3, readSync, unlinkSync as unlinkSync2, writeFileSync as writeFileSync2 } from "node:fs";
-import { basename as basename6 } from "node:path";
-
-// src/core/pair-url.ts
-var textEncoder2 = new TextEncoder;
-var DEFAULT_WORKER_URL = "https://api.nomo.gg";
-function buildPairURL(workerUrl, pairingId, qrSecret, pcEphPub) {
-  const u = workerUrl === DEFAULT_WORKER_URL ? "" : `&u=${b64url(textEncoder2.encode(workerUrl))}`;
-  return `nomo://pair?v=1${u}&p=${pairingId}&s=${b64url(qrSecret)}&e=${b64url(pcEphPub)}`;
-}
-
-// src/core/handoff-later.ts
-var PENDING_PATH = `${CC_DIR}/handoff-pending.json`;
-var LATER_LOG = `${CC_DIR}/handoff.log`;
-var LATER_CAP_MS = 30 * 60000;
-var POLL_MS = 2000;
-var UUID_RE2 = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-var DEFAULT_THEN = "You're now running on the cloud box. Continue the task you were working on before the handoff. If it was already finished, say so and wait.";
-var LATER_USAGE = "Usage: /nomo-cc:handoff (move this session; it continues on its own), /nomo-cc:handoff then <message>, /nomo-cc:handoff quiet, /nomo-cc:handoff cancel, /nomo-cc:handoff status";
-function parseLaterArg(raw) {
-  const s = raw.replace(/\r\n?/g, `
-`).trim();
-  if (!s)
-    return { message: DEFAULT_THEN };
-  if (/^quiet$/i.test(s))
-    return {};
-  const text = /^then(?:\s+([\s\S]*))?$/i.exec(s)?.[1]?.trim();
-  return text ? { message: text } : undefined;
-}
-function resolveSession(o) {
-  const ids = [o.substituted, o.env.CLAUDE_CODE_SESSION_ID].map((s) => s?.trim());
-  const byPid = o.records.find((r) => o.ancestors.includes(r.pid));
-  const session = ids.find((s) => !!s && UUID_RE2.test(s)) ?? byPid?.id;
-  const envPid = Number(o.env.CLAUDE_PID);
-  const recPid = o.records.find((r) => r.id === session)?.pid;
-  const claudePid = [envPid, recPid].find((p) => typeof p === "number" && o.ancestors.includes(p));
-  return { session, claudePid };
-}
-function contextTokens(jsonl, fileBytes) {
-  const lines = jsonl.split(`
-`);
-  for (let i = lines.length - 1;i >= 0; i--) {
-    if (!lines[i].includes('"usage"') && !lines[i].includes("compact_boundary"))
-      continue;
-    try {
-      const row = JSON.parse(lines[i]);
-      if (row?.type === "system" && row.subtype === "compact_boundary") {
-        const post = row.compactMetadata?.postTokens;
-        return typeof post === "number" && post > 0 ? post : Math.round(lines.slice(i + 1).join(`
-`).length / 4);
-      }
-      if (row?.type !== "assistant" || row.isSidechain)
-        continue;
-      const u = row.message?.usage ?? {};
-      const n = (u.input_tokens ?? 0) + (u.cache_read_input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0);
-      if (n > 0)
-        return n;
-    } catch {}
-  }
-  return Math.round(fileBytes / 4);
-}
-var TAIL_BYTES = 4 * 1024 * 1024;
-function contextTokensOf(path) {
-  const fd = openSync(path, "r");
-  try {
-    const size = fstatSync(fd).size, len = Math.min(size, TAIL_BYTES);
-    const buf = Buffer.alloc(len);
-    readSync(fd, buf, 0, len, size - len);
-    return contextTokens(buf.toString("utf8"), size);
-  } finally {
-    closeSync(fd);
-  }
-}
-function sizeWarning(tokens) {
-  const k = `~${Math.round(tokens / 1000)}k tokens`;
-  if (tokens > 900000)
-    return `Heads-up: this session is very large (${k}). It may exceed the cloud model's context window, and the first cloud turn resends all of it at API price. Run /compact first.`;
-  if (tokens > 200000)
-    return `Heads-up: this session is large (${k}). The first cloud turn resends all of it at API price (no cache on the box yet). Run /compact first to make it cheaper.`;
-  return;
-}
-function needsPairing(cloud, worker) {
-  return !cloud.sandboxId || cloud.pairedTo !== `${cloud.sandboxId} ${worker}`;
-}
-var BOX_MAX_SESSIONS = 4;
-function boxPaired(path = `${CC_DIR}/cloud.json`, worker = (process.env.NOMO_WORKER_URL || DEFAULT_WORKER_URL).replace(/\/$/, "")) {
-  try {
-    return !needsPairing(JSON.parse(readFileSync3(path, "utf8")), worker);
-  } catch {
-    return false;
-  }
-}
-function readPending(path) {
-  try {
-    return JSON.parse(readFileSync3(path, "utf8"));
-  } catch {
-    return;
-  }
-}
-function livePending(d) {
-  const p = readPending(d.path);
-  if (p && d.isHelper(p.helperPid))
-    return p;
-  if (p && readPending(d.path)?.helperPid === p.helperPid)
-    try {
-      unlinkSync2(d.path);
-    } catch {}
-  return;
-}
-function claimPending(d, p) {
-  if (livePending(d))
-    return false;
-  const tmp = `${d.path}.${process.pid}.tmp`;
-  try {
-    writeFileSync2(tmp, JSON.stringify(p) + `
-`, { mode: 384 });
-    linkSync(tmp, d.path);
-    return true;
-  } catch {
-    return false;
-  } finally {
-    try {
-      unlinkSync2(tmp);
-    } catch {}
-  }
-}
-function cancelPending(d) {
-  const p = livePending(d);
-  if (!p) {
-    if (d.parkDir && d.session && readPark(d.session, d.parkDir)) {
-      clearPark(d.session, d.parkDir);
-      return "Unparked; the box copy is untouched. This window is yours again (a later /nomo-cc:back keeps both copies).";
-    }
-    return "No handoff is waiting. Nothing to cancel.";
-  }
-  if (p.state === "handing-off")
-    return `Too late to cancel: session ${p.session} is already moving to the cloud. Bring it back with /nomo-cc:back.`;
-  d.kill(p.helperPid);
-  try {
-    unlinkSync2(d.path);
-  } catch {}
-  if (d.parkDir)
-    clearPark(p.session, d.parkDir);
-  if (d.log)
-    try {
-      appendFileSync3(d.log, `[${new Date().toISOString()}] CANCELLED: session ${p.session} stays on this Mac.
-`);
-    } catch {}
-  return `Cancelled. Session ${p.session} stays on this Mac.`;
-}
-function handoffArgv(o) {
-  if (o.exists(o.self))
-    return [o.runtime, o.self, ...o.args];
-  if (o.exists(o.shim))
-    return [o.shim, "handoff", ...o.args];
-  return;
-}
-var GONE_MSG = "the Nomo plugin was updated or removed while waiting; rerun /nomo-cc:handoff";
-var NOTHING_RAN_MSG = "the handoff exited without moving the session (the Nomo plugin or its runtime was not found); rerun /nomo-cc:handoff";
-function handoffLanded(before, after, session) {
-  const snap = after.sessions?.[session];
-  return (after.active ?? (after.current ? [after.current] : [])).includes(session) && snap !== undefined && JSON.stringify(snap) !== JSON.stringify(before.sessions?.[session]);
-}
-async function waitThenHandoff(p, d) {
-  const self = d.selfPid ?? process.pid;
-  const release = () => {
-    if (readPending(d.pending)?.helperPid === self)
-      try {
-        unlinkSync2(d.pending);
-      } catch {}
-  };
-  const unpark = () => {
-    if (d.parkDir)
-      try {
-        clearPark(p.session, d.parkDir);
-      } catch {}
-  };
-  const turnEnded = () => !!d.parkDir && !!readPark(p.session, d.parkDir)?.turnEndedAt;
-  const end = d.now() + (d.capMs ?? LATER_CAP_MS);
-  d.log(`Waiting for this turn to end (or Claude Code, pid ${p.claudePid}, to quit), then moving session ${p.session}.`);
-  let ended = false;
-  while (d.alive(p.claudePid) && !(ended = turnEnded())) {
-    if (d.now() >= end) {
-      release();
-      unpark();
-      d.result?.(false);
-      d.log(`FAILED: the turn was still running after ${Math.round((d.capMs ?? LATER_CAP_MS) / 60000)} min; nothing was moved. Run /nomo-cc:handoff again.`);
-      d.notify("Handoff gave up: the turn did not end in time. Nothing was moved.");
-      return 1;
-    }
-    await d.sleep(POLL_MS);
-  }
-  if (ended)
-    await d.sleep(POLL_MS);
-  try {
-    writeFileSync2(d.pending, JSON.stringify({ ...p, state: "handing-off" }) + `
-`, { mode: 384 });
-  } catch {}
-  d.log(`${ended ? "The turn ended" : "Claude Code closed"}. Handing off session ${p.session}…`);
-  const before = d.readCloud();
-  let code, why;
-  try {
-    code = await d.runHandoff();
-  } catch (e) {
-    why = e instanceof Error ? e.message : String(e);
-    code = 1;
-  }
-  if (code === 0 && !handoffLanded(before, d.readCloud(), p.session)) {
-    why = NOTHING_RAN_MSG;
-    code = 1;
-  }
-  release();
-  if (code === 0) {
-    if (d.parkDir)
-      try {
-        writePark(p.session, { state: "cloud", pid: p.claudePid }, d.parkDir);
-      } catch {}
-    d.result?.(true);
-    d.log(`DONE: session ${p.session} is running in the cloud.`);
-    d.notify("Your session is now running in the cloud.");
-  } else {
-    unpark();
-    d.result?.(false);
-    d.log(`FAILED: ${why ?? `the handoff exited ${code}; see the lines above`}. Your Mac copy is untouched.`);
-    d.notify("Handoff failed. Your Mac copy is untouched. Check /nomo-cc:handoff status.");
-  }
-  return code;
-}
-function laterStatus(d) {
-  const p = livePending(d);
-  if (p) {
-    return p.state === "waiting" ? `Waiting for this turn to end, then moving session ${p.session}. Log: ${d.log}` : `Moving session ${p.session} to the cloud now. Log: ${d.log}`;
-  }
-  let last = "";
-  try {
-    last = readFileSync3(d.log, "utf8").trimEnd().split(`
-`).pop() ?? "";
-  } catch {}
-  return last ? `No handoff waiting. Last: ${last}
-Log: ${d.log}` : "No handoff waiting.";
-}
-function phoneMoveCheck(f) {
-  const r = f.record;
-  if (!r)
-    return { refuse: "no Nomo record for this session" };
-  if ((r.agent ?? "claude") !== "claude" || r.provisional === true)
-    return { refuse: "only a Claude Code session can move to the cloud" };
-  const pid = r.pid, cmd = typeof pid === "number" && pid > 1 ? f.command(pid) : undefined;
-  if (!pid || !cmd)
-    return { refuse: "its Claude Code process is not running" };
-  const up = f.ancestorsOf(pid).map((p) => f.command(p));
-  if (claudeHeadlessInvocation(cmd, up) || claudeDesktopInvocation(cmd, up))
-    return { refuse: "a headless or desktop-app session can't move to the cloud" };
-  if (basename6(cmd.trim().split(/\s+/)[0]) !== "claude")
-    return { refuse: "its Claude Code process is not running" };
-  if (f.parked)
-    return { refuse: "it is already moving, in the cloud, or parked" };
-  if (f.active)
-    return { refuse: "it is already running in the cloud" };
-  if (f.needsPairing)
-    return { refuse: "the cloud box needs a one-time pairing; run /nomo-cc:handoff in that session first" };
-  if (f.cloudCount >= BOX_MAX_SESSIONS)
-    return { refuse: `the cloud box already runs ${f.cloudCount} sessions (the cap is ${BOX_MAX_SESSIONS}); bring one back first` };
-  if (!r.cwd || !f.transcriptExists(r.cwd))
-    return { refuse: "its transcript was not found" };
-  const secrets = f.trackedSecrets(r.cwd);
-  if (!secrets)
-    return { refuse: "git could not list the project's tracked files" };
-  if (secrets.length)
-    return { refuse: `${secrets.slice(0, 3).join(", ")} looks like a secret and is tracked in git, so it would travel; move it from the terminal (/nomo-cc:handoff) if that is fine` };
-  return { claudePid: pid, cwd: r.cwd };
-}
-var PHONE_SETTLE_MS = 2000;
-async function settleThenStamp(session, d) {
-  for (let i = 0;i < 2; i++) {
-    await d.sleep(d.settleMs ?? PHONE_SETTLE_MS);
-    const r = await d.readRecord();
-    if (!r || !(r.op === "done" || r.lastEvent === "done" || r.awaitingPrompt === true))
-      return false;
-  }
-  const p = readPark(session, d.parkDir);
-  if (p?.state !== "moving")
-    return false;
-  if (!p.turnEndedAt)
-    stamp(session, { turnEndedAt: Date.now() }, d.parkDir);
-  return true;
-}
 // src/entries/cc-watchdog.ts
-var POLL_MS2 = 5000;
+var POLL_MS = 5000;
 var PAIRING_TTL_MS = 600000;
 var SESSION_STALE_MS = 86400000;
 var IDLE_GRACE_MS = 1800000;
@@ -8637,7 +8379,7 @@ function resolveCodexTuiOwner(record, candidates, alive = pidAlive) {
   const command = record.origin?.ppid_command;
   if (typeof command === "string") {
     const tokens = command.trim().split(/\s+/);
-    if (basename7(tokens[0] ?? "") === "codex" && tokens[1] !== "app-server" && !tokens.slice(1).includes("exec") && typeof record.pid === "number" && alive(record.pid)) {
+    if (basename6(tokens[0] ?? "") === "codex" && tokens[1] !== "app-server" && !tokens.slice(1).includes("exec") && typeof record.pid === "number" && alive(record.pid)) {
       return record.pid;
     }
   }
@@ -9306,12 +9048,12 @@ function spawnHandoff(id, what, args, cwd, onExit) {
   const log = `${BACK_LOCK_DIR}/${id.slice(0, 12)}.log`;
   const note = (why) => {
     try {
-      const f = openSync2(log, "a", 384);
+      const f = openSync(log, "a", 384);
       try {
         writeSync(f, `[${new Date().toISOString()}] ${what} from the phone: ${why}
 `);
       } finally {
-        closeSync2(f);
+        closeSync(f);
       }
     } catch {}
   };
@@ -9320,7 +9062,7 @@ function spawnHandoff(id, what, args, cwd, onExit) {
     note("Nomo's installed files were not found (plugin updated or removed?); reinstall the nomo plugin.");
     throw new Error("no handoff entry");
   }
-  const fd = openSync2(log, "a", 384);
+  const fd = openSync(log, "a", 384);
   try {
     const { CLAUDE_CODE_SESSION_ID: _drop, ...env } = process.env;
     const child = spawn3(cmd[0], [...cmd.slice(1), ...args], { detached: true, stdio: ["ignore", fd, fd], env, cwd });
@@ -9333,7 +9075,7 @@ function spawnHandoff(id, what, args, cwd, onExit) {
     note(`could not start ${cmd[0]}: ${e?.message ?? e}`);
     throw e;
   } finally {
-    closeSync2(fd);
+    closeSync(fd);
   }
 }
 var spawnBack = (id, onExit) => spawnHandoff(id, "bring-back", ["--back", "--session", id, "--from-session", id, "--phone"], homedir(), onExit);
@@ -9359,9 +9101,9 @@ function bringBack(id, deps = {}) {
   return "back-started";
 }
 var moveRuns = new Map;
-var UUID_RE3 = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+var UUID_RE2 = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 function moveToCloud(id, rec, deps = {}) {
-  if (!UUID_RE3.test(id) || typeof rec.cwd !== "string" || !rec.cwd || (rec.agent ?? "claude") !== "claude" || rec.provisional === true || (deps.readPark ?? readPark)(id) || (deps.cloudActive ?? cloudActive)(id))
+  if (!UUID_RE2.test(id) || typeof rec.cwd !== "string" || !rec.cwd || (rec.agent ?? "claude") !== "claude" || rec.provisional === true || (deps.readPark ?? readPark)(id) || (deps.cloudActive ?? cloudActive)(id))
     return "move-refused";
   if (moveRuns.get(id)?.running)
     return "move-running";
@@ -9474,7 +9216,7 @@ function fileCursorStore(path = COMMAND_CURSOR_PATH) {
   return {
     load: (pairingId) => {
       try {
-        const c = JSON.parse(readFileSync4(path, "utf8"));
+        const c = JSON.parse(readFileSync3(path, "utf8"));
         return c.pairingId === pairingId && typeof c.cursor === "number" && Number.isFinite(c.cursor) ? c.cursor : 0;
       } catch {
         return 0;
@@ -9549,7 +9291,7 @@ async function commandWaitLoop(getConfig, signal, deps = {}) {
     const kicked = wake.signal;
     const config = getConfig();
     if (!config || !isActive()) {
-      await nap(POLL_MS2, kicked);
+      await nap(POLL_MS, kicked);
       continue;
     }
     if (config.pairingId !== pairingId) {
@@ -9624,7 +9366,7 @@ async function readAllRecordEntries() {
       if (!f.endsWith(".json"))
         continue;
       try {
-        out.push({ sessionId: basename7(f, ".json"), rec: JSON.parse(await readFile8(`${SESSIONS_DIR}/${f}`, "utf8")) });
+        out.push({ sessionId: basename6(f, ".json"), rec: JSON.parse(await readFile8(`${SESSIONS_DIR}/${f}`, "utf8")) });
       } catch {}
     }
     return out;
@@ -10133,7 +9875,7 @@ async function correctPendingDone(config, path, sessionId, record, now, deps = {
 var PENDING_UPDATE_POST_TIMEOUT_MS = PENDING_DONE_POST_TIMEOUT_MS;
 var RESEND_BACKOFF_MAX_MS = 60000;
 function resendBackoffMs(failures) {
-  return failures <= 0 ? 0 : Math.min(POLL_MS2 * 2 ** (failures - 1), RESEND_BACKOFF_MAX_MS);
+  return failures <= 0 ? 0 : Math.min(POLL_MS * 2 ** (failures - 1), RESEND_BACKOFF_MAX_MS);
 }
 var resendBackoff = { failures: 0, nextAt: 0 };
 function resendAllowed(now) {
@@ -10453,7 +10195,7 @@ async function pruneStaleDecisionHolds(files, deps = {}) {
   for (const file of files) {
     if (!file.endsWith(DECISION_HOLD_SUFFIX))
       continue;
-    const sessionId = basename7(file, DECISION_HOLD_SUFFIX);
+    const sessionId = basename6(file, DECISION_HOLD_SUFFIX);
     if (sessionId.length === 0)
       continue;
     let hold = null;
@@ -10501,7 +10243,7 @@ async function sweep(config, deps = {}) {
     if (!file.endsWith(".json"))
       continue;
     const path = `${SESSIONS_DIR}/${file}`;
-    const sessionId = basename7(file, ".json");
+    const sessionId = basename6(file, ".json");
     let record = null;
     try {
       record = JSON.parse(await readFile8(path, "utf8"));
@@ -10515,7 +10257,7 @@ async function sweep(config, deps = {}) {
     }
     if (verdict === "keep") {
       const park = record ? readPark(sessionId) : undefined;
-      if (record && wantsCommands(record, park, box ??= boxPaired()))
+      if (record && wantsCommands(record, park, box ??= boxPairedCached()))
         active++;
       let planVerificationHandled = false;
       if (config && record) {
@@ -10864,7 +10606,7 @@ function createBridgeSupervisor(deps = {}) {
 async function claimSingleInstance() {
   const build = watchdogBuildStamp();
   try {
-    const holder = parseWatchdogPidfile(readFileSync4(WATCHDOG_PID_PATH, "utf8"));
+    const holder = parseWatchdogPidfile(readFileSync3(WATCHDOG_PID_PATH, "utf8"));
     if (holder && holder.pid !== process.pid && watchdogHolderIsLive(holder.pid) && holder.version === PLUGIN_VERSION && !watchdogBuildDiffers(holder.build, build)) {
       return false;
     }
@@ -10875,7 +10617,7 @@ async function claimSingleInstance() {
 function isRightfulWatchdogOwner(deps = {}) {
   try {
     const pidPath = deps.pidPath ?? WATCHDOG_PID_PATH;
-    const holder = parseWatchdogPidfile((deps.readPidfile ?? (() => readFileSync4(pidPath, "utf8")))());
+    const holder = parseWatchdogPidfile((deps.readPidfile ?? (() => readFileSync3(pidPath, "utf8")))());
     return holder?.pid === (deps.pid ?? process.pid) && holder.version === (deps.version ?? PLUGIN_VERSION);
   } catch {
     return false;
@@ -10891,9 +10633,9 @@ function enforceWatchdogOwnership(shutdown, deps = {}) {
 }
 function releaseSingleInstance() {
   try {
-    const holder = parseWatchdogPidfile(readFileSync4(WATCHDOG_PID_PATH, "utf8"));
+    const holder = parseWatchdogPidfile(readFileSync3(WATCHDOG_PID_PATH, "utf8"));
     if (holder && holder.pid === process.pid)
-      unlinkSync3(WATCHDOG_PID_PATH);
+      unlinkSync2(WATCHDOG_PID_PATH);
   } catch {}
 }
 function pendingPairingExpired(pending, now, fallbackDeadline) {
@@ -10993,7 +10735,7 @@ async function run() {
           await removeRevokedConfig();
           return;
         }
-        await new Promise((r) => setTimeout(r, POLL_MS2));
+        await new Promise((r) => setTimeout(r, POLL_MS));
         continue;
       }
       if (result.delivered)
@@ -11015,7 +10757,7 @@ async function run() {
           await removePendingConfig();
           return;
         }
-        await new Promise((r) => setTimeout(r, POLL_MS2));
+        await new Promise((r) => setTimeout(r, POLL_MS));
         continue;
       }
       const nowMs = Date.now();
@@ -11025,7 +10767,7 @@ async function run() {
         if (!config || nowMs - lastActiveMs >= IDLE_GRACE_MS)
           return;
       }
-      await new Promise((r) => setTimeout(r, POLL_MS2));
+      await new Promise((r) => setTimeout(r, POLL_MS));
     }
   } finally {
     shutdown();
@@ -11083,7 +10825,7 @@ export {
   PLAN_PICKER_PENDING_MAX_MS,
   PLAN_PICKER_RECENT_DONE_MS,
   PLAN_PICKER_VERIFY_MAX_MS,
-  POLL_MS2 as POLL_MS,
+  POLL_MS,
   RESEND_BACKOFF_MAX_MS,
   RETIRE_AFTER_MS,
   WAITING_HEARTBEAT_AFTER_MS,

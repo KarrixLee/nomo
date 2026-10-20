@@ -49,7 +49,7 @@ import { resolveOnRelay } from "../core/codex-remote-input";
 import { CODEX_PROXY_STDOUT_ENDED } from "../core/codex-proxy-transport";
 import type { CodexAppServerSocketState, DecisionHold, PlanPickerTraceDecision } from "../core/shared";
 import {
-  AgentKind, AgentKindWire, appendCodexBridgeMarker, appendFittedPlanAndDebug, atomicWrite, CC_DIR, CCOp, CCStatus, codexAppServerSocketAvailable, codexAppServerSocketState, Config, completePendingPairing, DECISION_HOLD_SUFFIX, decisionHoldFileName, formatPlanPickerDebug, formatWatchdogPidfile,
+  AgentKind, AgentKindWire, appendCodexBridgeMarker, boxPairedCached, appendFittedPlanAndDebug, atomicWrite, CC_DIR, CCOp, CCStatus, codexAppServerSocketAvailable, codexAppServerSocketState, Config, completePendingPairing, DECISION_HOLD_SUFFIX, decisionHoldFileName, formatPlanPickerDebug, formatWatchdogPidfile,
   startCodexAppServerDaemon,
   GONE_STRIKE_LIMIT, loadConfig, loadPendingConfig, localApprovalsState,
   PAIR_HTML_FILE, PairPollResult, parseWatchdogPidfile, PendingConfig, pidAlive, PLUGIN_VERSION, readDecisionHoldAt, readPrefix, readSuffix, recordGoneStrike, removeRevokedConfig,
@@ -58,7 +58,6 @@ import {
 } from "../core/shared";
 import { rememberBounded } from "../core/bounded-set";
 import { BackRun, backLockHolder, BACK_LOCK_DIR, cloudActive, cloudState, CloudState, endMovingTurn, Park, parkWantsCommands, readMoveResult, readPark, withParked } from "../core/park";
-import { boxPaired } from "../core/handoff-later";
 
 // The transcript-tail interrupt PARSERS live in the agent adapters now (the two detections are
 // structurally different). Re-export them so existing importers/tests that reference "./cc-watchdog"
@@ -3856,7 +3855,7 @@ async function sweep(config: Config | null, deps: SweepDeps = {}): Promise<Sweep
   await pruneStaleDecisionHolds(files);
   let remaining = 0;
   let active = 0; // sessions the command long-poll should stay up for (wantsCommands)
-  let box: boolean | undefined; // boxPaired(), read at most once per sweep
+  let box: boolean | undefined; // boxPairedCached(), once per sweep
   // Any 2xx POST this sweep proves the pairing is alive → the loop resets the gone-strike streak, so a
   // real success from EITHER the watchdog or the hook clears a stray transient strike.
   let delivered = false;
@@ -3886,7 +3885,7 @@ async function sweep(config: Config | null, deps: SweepDeps = {}): Promise<Sweep
     }
     if (verdict === "keep") {
       const park = record ? readPark(sessionId) : undefined;
-      if (record && wantsCommands(record, park, box ??= boxPaired())) active++;
+      if (record && wantsCommands(record, park, box ??= boxPairedCached())) active++;
       // Long-lived Plan verification runs before the done-debt net: a killed/old Stop may have left a
       // donePending record whose terminal state is precisely what still needs classification.
       let planVerificationHandled = false;

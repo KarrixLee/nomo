@@ -15,8 +15,8 @@ import { appendFileSync, closeSync, fstatSync, linkSync, openSync, readFileSync,
 import { basename } from "node:path";
 import { claudeDesktopInvocation, claudeHeadlessInvocation } from "./adapter";
 import { clearPark, readPark, stamp, writePark } from "./park";
-import { DEFAULT_WORKER_URL } from "./pair-url";
 import { CC_DIR } from "./shared";
+export { boxPaired, needsPairing } from "./shared";
 
 export const PENDING_PATH = `${CC_DIR}/handoff-pending.json`;
 export const LATER_LOG = `${CC_DIR}/handoff.log`;
@@ -114,20 +114,10 @@ export function sizeWarning(tokens: number): string | undefined {
   return undefined;
 }
 
-/** True unless cloud.json records the user's box as paired to `worker`. */
-export function needsPairing(cloud: { sandboxId?: string; pairedTo?: string }, worker: string): boolean {
-  return !cloud.sandboxId || cloud.pairedTo !== `${cloud.sandboxId} ${worker}`;
-}
 
 /** Sessions one box runs at once (NOM-92). Measured on a Pro box (4 vCPU, 8 GB): idle CC ≈ 250 MB.
  *  ponytail: one cap for every size; per-size caps when boxes come in more than one size. */
 export const BOX_MAX_SESSIONS = 4;
-
-/** NOM-95: does this Mac have a box paired to the worker a phone-started move would use (the same
- *  needsPairing gate, against the same NOMO_WORKER_URL the spawned handoff inherits)? Fails closed. */
-export function boxPaired(path = `${CC_DIR}/cloud.json`, worker = (process.env.NOMO_WORKER_URL || DEFAULT_WORKER_URL).replace(/\/$/, "")): boolean {
-  try { return !needsPairing(JSON.parse(readFileSync(path, "utf8")), worker); } catch { return false; }
-}
 
 export interface PendingDeps {
   path: string;

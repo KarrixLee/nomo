@@ -17,6 +17,7 @@ import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { b64url, Bytes, deriveE2EKey, deriveRatchetKey, encryptBlob, fromB64url } from "./crypto";
+import { DEFAULT_WORKER_URL } from "./pair-url";
 // TYPE-ONLY (erased at build): PendingEventStash.blob IS buildBlob's return type, and duplicating it
 // here is what let the two drift apart.
 import type { buildBlob } from "./hook";
@@ -234,6 +235,29 @@ export function appendFittedPlan<T extends Record<string, unknown>>(base: T, pla
   return { ...base, plan: chars.slice(0, lo).join("") + marker };
 }
 
+/** True unless cloud.json records the user's box as paired to `worker`. */
+export function needsPairing(cloud: { sandboxId?: string; pairedTo?: string }, worker: string): boolean {
+  return !cloud.sandboxId || cloud.pairedTo !== `${cloud.sandboxId} ${worker}`;
+}
+
+/** NOM-95: does this Mac have a box paired to the worker a phone-started move would use (the same
+ *  needsPairing gate, against the same NOMO_WORKER_URL the spawned handoff inherits)? Fails closed. */
+export function boxPaired(path = `${CC_DIR}/cloud.json`, worker = (process.env.NOMO_WORKER_URL || DEFAULT_WORKER_URL).replace(/\/$/, "")): boolean {
+  try { return !needsPairing(JSON.parse(readFileSync(path, "utf8")), worker); } catch { return false; }
+}
+
+/** boxPaired, re-read at most every 30 s: one small local read per hook process, and per 30 s in the
+ *  watchdog. Under `bun test` it is off unless a test sets it, so no test reads the real cloud.json. */
+const BOX_PAIRED_TTL_MS = 30_000;
+let boxMemo: { at: number; v: boolean } | undefined;
+let boxOverride: boolean | undefined = process.env.NODE_ENV === "test" ? false : undefined;
+export function setBoxPairedForTest(v: boolean): void { boxOverride = v; }
+export function boxPairedCached(now = Date.now()): boolean {
+  if (boxOverride !== undefined) return boxOverride;
+  if (!boxMemo || now - boxMemo.at > BOX_PAIRED_TTL_MS) boxMemo = { at: now, v: boxPaired() };
+  return boxMemo.v;
+}
+
 /** Append optional `plan`, then optional `dbg` LAST. Budget precedence is intentional: build the
  *  best-fitting plan first, try the capped debug string on that complete shape, and drop `dbg` whole
  *  if it would overflow. Thus `dbg` is always the FIRST sacrifice; only then may plan be truncated or
@@ -241,7 +265,11 @@ export function appendFittedPlan<T extends Record<string, unknown>>(base: T, pla
 export function appendFittedPlanAndDebug<T extends Record<string, unknown>>(
   base: T, plan: string | undefined, dbg: string | undefined,
 ): T & { plan?: string; dbg?: string } {
-  const withPlan = appendFittedPlan(base, plan);
+  // NOM-95: `box: true` (never false) on a CLAUDE session blob (the only kind with no `agent` key)
+  // while this Mac has a paired box, so the phone offers Move to cloud. Inside the seal; after every
+  // base key, before plan/dbg (never a budget sacrifice). Every session-blob producer passes here.
+  const withBox: T = base.agent === undefined && boxPairedCached() ? { ...base, box: true } : base;
+  const withPlan = appendFittedPlan(withBox, plan);
   if (typeof dbg !== "string" || dbg.length === 0) return withPlan;
   const capped = Array.from(dbg).slice(0, DBG_BLOB_TEXT_MAX_CHARS).join("");
   const encoder = new TextEncoder();
