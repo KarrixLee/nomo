@@ -3,10 +3,10 @@ var __require = /* @__PURE__ */ createRequire(import.meta.url);
 
 // src/entries/handoff.ts
 import { execFileSync as execFileSync5, spawn as spawn2 } from "node:child_process";
-import { closeSync as closeSync3, existsSync as existsSync6, lstatSync as lstatSync2, mkdirSync as mkdirSync3, mkdtempSync as mkdtempSync2, openSync as openSync3, readdirSync as readdirSync4, readFileSync as readFileSync6, readSync as readSync3, realpathSync as realpathSync2, renameSync as renameSync3, rmSync, statSync as statSync5, unlinkSync as unlinkSync3, writeFileSync as writeFileSync4 } from "node:fs";
+import { closeSync as closeSync3, existsSync as existsSync6, lstatSync as lstatSync3, mkdirSync as mkdirSync3, mkdtempSync as mkdtempSync2, openSync as openSync3, readdirSync as readdirSync4, readFileSync as readFileSync6, readSync as readSync3, realpathSync as realpathSync3, renameSync as renameSync3, rmSync as rmSync2, statSync as statSync5, unlinkSync as unlinkSync3, writeFileSync as writeFileSync4 } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
-import { dirname as dirname3, join as join7, relative as relative2, sep as sep2 } from "node:path";
+import { dirname as dirname3, join as join7, relative as relative3, sep as sep3 } from "node:path";
 import { fileURLToPath as fileURLToPath2 } from "node:url";
 
 // src/core/crypto.ts
@@ -384,7 +384,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "2.3.45";
+var PLUGIN_VERSION = "2.3.46";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -3225,8 +3225,8 @@ var allAdapters = [claudeAdapter, codexAdapter];
 
 // src/core/readiness.ts
 import { execFileSync as execFileSync3 } from "node:child_process";
-import { existsSync as existsSync3, readdirSync, readFileSync as readFileSync2, statSync as statSync2 } from "node:fs";
-import { join as join3 } from "node:path";
+import { existsSync as existsSync3, readdirSync, readFileSync as readFileSync2, realpathSync, statSync as statSync2 } from "node:fs";
+import { join as join3, relative, sep } from "node:path";
 var MAX_DEPTH = 4;
 var DEP_DIRS = { node_modules: true, ".venv": true, venv: true, target: true, build: true, dist: true, ".build": true, Pods: true, vendor: true };
 var NO_DESCEND = new Set(["DerivedData", "__pycache__", ".git"]);
@@ -3379,6 +3379,35 @@ function cloudReadiness(root, deps) {
   return [head, ...warnings].join(`
 `);
 }
+var plainPath = (p) => /^[A-Za-z0-9._@+/ -]+$/.test(p) && !p.split("/").some((s) => s.startsWith("-"));
+function setupSteps(root, cwd = root, maxEntries = 4000, max = 8) {
+  const w = walk(root, maxEntries);
+  const real = (p) => {
+    try {
+      return realpathSync(p);
+    } catch {
+      return p;
+    }
+  };
+  const [r, c] = [real(root), real(cwd)];
+  const rel = (p) => relative(c, join3(r, p)).split(sep).join("/");
+  const JS = new Set(LOCKS.slice(0, 5).map(([n]) => n));
+  const install = [];
+  for (const dir of [...w.locks.keys()].sort()) {
+    const d = rel(dir);
+    if (d && !plainPath(d))
+      continue;
+    let js = false;
+    for (const [name, cmd] of LOCKS) {
+      if (!w.locks.get(dir).includes(name) || JS.has(name) && js)
+        continue;
+      js ||= JS.has(name);
+      install.push(d ? `(cd '${d}' && ${cmd})` : cmd);
+    }
+  }
+  const compose = w.compose.map(rel).filter(plainPath);
+  return { install: [...new Set(install)].slice(0, max), compose: compose.slice(0, max) };
+}
 function gitProbe(root) {
   const run = (args, input) => execFileSync3("git", args, { cwd: root, input, stdio: [input === undefined ? "ignore" : "pipe", "pipe", "ignore"], maxBuffer: 1 << 24 }).toString();
   const split = (s) => new Set(s.split("\x00").filter(Boolean).map((p) => p.replace(/\/$/, "")));
@@ -3425,7 +3454,7 @@ function trackedSecretFiles(cwd) {
 // src/core/transcript-scan.ts
 import { createHash as createHash2 } from "node:crypto";
 import { closeSync, existsSync as existsSync4, openSync, readdirSync as readdirSync2, readSync, statSync as statSync3 } from "node:fs";
-import { join as join4, relative } from "node:path";
+import { join as join4, relative as relative2 } from "node:path";
 var KIND_LABEL = {
   openai: "OpenAI key",
   openrouter: "OpenRouter key",
@@ -3501,6 +3530,9 @@ function* matches(text) {
   for (const [, re] of VENDOR)
     re.lastIndex = 0;
 }
+function textHasSecret(text) {
+  return [...matches(text)].length > 0;
+}
 function scanFiles(files, root) {
   const seen = new Map;
   const places = [];
@@ -3532,7 +3564,7 @@ function scanFiles(files, root) {
             else
               hi = mid;
           }
-          places.push({ file: relative(root, file), line: line + lo });
+          places.push({ file: relative2(root, file), line: line + lo });
         }
         for (let i = 0;i < b.length; i++)
           if (b[i] === 10)
@@ -3839,7 +3871,7 @@ function readMoveResult(id, since, dir = BACK_LOCK_DIR) {
 }
 
 // src/core/handoff-later.ts
-import { appendFileSync as appendFileSync2, closeSync as closeSync2, fstatSync, linkSync, openSync as openSync2, readFileSync as readFileSync4, readSync as readSync2, unlinkSync as unlinkSync2, writeFileSync as writeFileSync2 } from "node:fs";
+import { appendFileSync as appendFileSync2, closeSync as closeSync2, fstatSync, linkSync, lstatSync, openSync as openSync2, readFileSync as readFileSync4, readSync as readSync2, rmSync, unlinkSync as unlinkSync2, writeFileSync as writeFileSync2 } from "node:fs";
 import { basename as basename3 } from "node:path";
 var PENDING_PATH = `${CC_DIR}/handoff-pending.json`;
 var LATER_LOG = `${CC_DIR}/handoff.log`;
@@ -3852,6 +3884,96 @@ function transcriptSecretWarning(summary, confirmed) {
   const head = `The conversation contains what look like ${summary}. They would travel to the cloud box with the transcript.`;
   return confirmed ? `Cloud check: ${head} Moving anyway, as you confirmed.` : `Cloud check: ${head}
 Nothing was started. To move it anyway, run /nomo-cc:handoff anyway (or: anyway quiet, anyway then <message>).`;
+}
+var MANIFEST_MAX_BYTES = 4096;
+var MANIFEST_MAX_AGE_MS = 10 * 60000;
+var NOTE_MAX = 300;
+var ENV_MAX = 20;
+var ENV_NAME = /^[A-Z_][A-Z0-9_]*$/;
+var ENV_NAME_MAX = 64;
+var PATHISH = /(?:^|[\s"'`(\[<=,])(?:~[\w.-]*(?:\/|\s|$)|\$\{?HOME\b|\/[^\s/]+\/|[A-Za-z]:[\\/])/;
+var manifestPath = (session) => `${CC_DIR}/handoff-manifest-${session}.json`;
+function validateManifest(text) {
+  if (Buffer.byteLength(text) > MANIFEST_MAX_BYTES)
+    return { invalid: "over 4 KB" };
+  if (textHasSecret(text))
+    return { invalid: "looks like it holds a secret" };
+  let v;
+  try {
+    v = JSON.parse(text);
+  } catch {
+    return { invalid: "not JSON" };
+  }
+  if (!v || typeof v !== "object" || Array.isArray(v))
+    return { invalid: "not a JSON object" };
+  if (Object.keys(v).some((k) => k !== "note" && k !== "env"))
+    return { invalid: "fields other than note and env" };
+  const m = { env: [] };
+  if (v.note !== undefined) {
+    if (typeof v.note !== "string")
+      return { invalid: "note is not text" };
+    const note = v.note.trim();
+    if (note.length > NOTE_MAX)
+      return { invalid: `note over ${NOTE_MAX} characters` };
+    if (/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/.test(note))
+      return { invalid: "note has control characters or line breaks" };
+    if (PATHISH.test(note))
+      return { invalid: "note names an absolute or home path" };
+    if (note.split(/[\s"'`(),;:[\]<>]+/).some((w) => isSecretName(w.replace(/[.!?]+$/, "").split("/").pop())))
+      return { invalid: "note names a secret file" };
+    if (note)
+      m.note = note;
+  }
+  if (v.env !== undefined) {
+    if (!Array.isArray(v.env) || v.env.length > ENV_MAX)
+      return { invalid: `env is not a list of at most ${ENV_MAX} names` };
+    if (v.env.some((n) => typeof n !== "string" || n.length > ENV_NAME_MAX || !ENV_NAME.test(n)))
+      return { invalid: "env has something that isn't an UPPER_CASE variable name" };
+    m.env = [...new Set(v.env)];
+  }
+  return { manifest: m };
+}
+function takeManifest(path, now = Date.now()) {
+  let st;
+  try {
+    st = lstatSync(path);
+  } catch {
+    return;
+  }
+  try {
+    if (!st.isFile())
+      return { invalid: "not a regular file" };
+    if (st.size > MANIFEST_MAX_BYTES)
+      return { invalid: "over 4 KB" };
+    if (now - st.mtimeMs > MANIFEST_MAX_AGE_MS)
+      return { invalid: "stale, from an earlier handoff" };
+    return validateManifest(readFileSync4(path, "utf8"));
+  } catch {
+    return { invalid: "unreadable" };
+  } finally {
+    rmSync(path, { force: true });
+  }
+}
+function manifestMessage(m, setup) {
+  if (!m.note && !m.env.length && !setup.install.length && !setup.compose.length)
+    return DEFAULT_THEN;
+  const parts = ["You're now running on the cloud box."];
+  if (m.note)
+    parts.push(`Where I was: ${m.note}`);
+  if (setup.install.length)
+    parts.push(`First run these setup steps: ${setup.install.map((c) => `\`${c}\``).join(", ")} (one at a time; if one fails, say why and go on).`);
+  if (setup.compose.length)
+    parts.push(`Services this project uses (not started; start them only if the task needs it): ${setup.compose.join(", ")}.`);
+  if (m.env.length)
+    parts.push(`The project needs these environment variables, whose values were not sent: ${m.env.join(", ")}. Never guess values; tell me which are missing when the work needs them.`);
+  parts.push("Then continue the task you were working on before the handoff. If it was already finished, say so and wait.");
+  return parts.join(" ");
+}
+function manifestLine(r, setup) {
+  if ("invalid" in r)
+    return `Handoff manifest ignored (${r.invalid}); the box gets the usual first message.`;
+  const m = r.manifest;
+  return `Handoff manifest: setup ${setup.install.length ? setup.install.join(" · ") : "none detected"}` + `${setup.compose.length ? `; services listed, not started: ${setup.compose.join(", ")}` : ""}` + `; env names ${m.env.length ? m.env.join(", ") : "none"} (values never sent)${m.note ? `; note: "${m.note}"` : ""}.`;
 }
 function parseLaterArg(raw) {
   let s = raw.replace(/\r\n?/g, `
@@ -4135,16 +4257,16 @@ import {
   chmodSync,
   copyFileSync,
   existsSync as existsSync5,
-  lstatSync,
+  lstatSync as lstatSync2,
   mkdirSync as mkdirSync2,
   mkdtempSync,
   readdirSync as readdirSync3,
   readFileSync as readFileSync5,
-  realpathSync,
+  realpathSync as realpathSync2,
   renameSync as renameSync2,
   writeFileSync as writeFileSync3
 } from "node:fs";
-import { basename as basename4, dirname as dirname2, isAbsolute as isAbsolute2, join as join6, sep } from "node:path";
+import { basename as basename4, dirname as dirname2, isAbsolute as isAbsolute2, join as join6, sep as sep2 } from "node:path";
 var MAX_ARTIFACT_BYTES = 100 * 1024 * 1024;
 var MAX_EXTRACTED_BYTES = 1024 * 1024 * 1024;
 var MAX_TRANSCRIPT_BYTES = 512 * 1024 * 1024;
@@ -4191,11 +4313,11 @@ function wipFingerprint(root) {
 }
 function listFiles(dir, rel = "") {
   const abs = join6(dir, rel);
-  if (!lstatSync(abs, { throwIfNoEntry: false })?.isDirectory())
+  if (!lstatSync2(abs, { throwIfNoEntry: false })?.isDirectory())
     return [];
   return readdirSync3(abs).flatMap((n) => {
     const r = rel ? join6(rel, n) : n;
-    const st = lstatSync(join6(dir, r));
+    const st = lstatSync2(join6(dir, r));
     return st.isDirectory() ? listFiles(dir, r) : st.isFile() ? [r] : [];
   });
 }
@@ -4347,7 +4469,7 @@ function validateTree(dir, allow = () => true, budget = { left: MAX_EXTRACTED_BY
   const walk = (rel) => {
     for (const n of readdirSync3(join6(dir, rel))) {
       const r = rel ? `${rel}/${n}` : n;
-      const st = lstatSync(join6(dir, r));
+      const st = lstatSync2(join6(dir, r));
       if (!safeRel(r) || !allow(r)) {
         skipped.push(r);
         continue;
@@ -4369,7 +4491,7 @@ function validateTree(dir, allow = () => true, budget = { left: MAX_EXTRACTED_BY
   return { files, skipped };
 }
 function extractTgz(tgz, parent, maxBytes = MAX_ARTIFACT_BYTES, maxInflated = MAX_EXTRACTED_BYTES) {
-  if (lstatSync(tgz).size > maxBytes)
+  if (lstatSync2(tgz).size > maxBytes)
     throw new Error(`${tgz} is over ${(maxBytes / 1e6).toFixed(0)} MB`);
   const n = Number(execFileSync4("sh", ["-c", `gzip -dc < "$1" | head -c ${maxInflated + 1} | wc -c`, "sh", tgz]).toString().trim());
   if (!(n <= maxInflated))
@@ -4385,21 +4507,21 @@ function copyContained(src, dstRoot, rel, overwrite, priv = false) {
   let anc = dirname2(dst);
   while (!existsSync5(anc))
     anc = dirname2(anc);
-  const realRoot = realpathSync(dstRoot);
-  const realAnc = realpathSync(anc);
-  if (realAnc !== realRoot && !realAnc.startsWith(realRoot + sep))
+  const realRoot = realpathSync2(dstRoot);
+  const realAnc = realpathSync2(anc);
+  if (realAnc !== realRoot && !realAnc.startsWith(realRoot + sep2))
     throw new Error(`refusing to write ${rel}: it resolves outside ${dstRoot}`);
-  const there = lstatSync(dst, { throwIfNoEntry: false });
+  const there = lstatSync2(dst, { throwIfNoEntry: false });
   if (there && (!overwrite || !there.isFile()))
     return false;
   mkdirSync2(dirname2(dst), { recursive: true });
-  const exec = (lstatSync(src).mode & 73) !== 0;
+  const exec = (lstatSync2(src).mode & 73) !== 0;
   copyFileSync(src, dst);
   chmodSync(dst, priv ? 384 : exec ? 493 : 420);
   return true;
 }
 function patchPaths(root, patch, base, tmpParent) {
-  if (!lstatSync(patch).size)
+  if (!lstatSync2(patch).size)
     return [];
   const env = { ...process.env, GIT_INDEX_FILE: join6(mkdtempSync(join6(tmpParent, "pidx-")), "index") };
   git(root, ["read-tree", base], env);
@@ -4520,7 +4642,7 @@ function applyInPlace(root, a, detached, uuid8, backup) {
     }
     if (a.bundle)
       git(root, detached ? ["checkout", "-q", "--detach", a.boxHead] : ["merge", "-q", "--ff-only", a.boxHead]);
-    if (a.patch && lstatSync(a.patch).size > 0)
+    if (a.patch && lstatSync2(a.patch).size > 0)
       git(root, ["apply", "--binary", a.patch]);
     for (const rel of a.untracked)
       if (!copyContained(join6(a.untrackedDir, rel), root, rel, false))
@@ -4549,7 +4671,7 @@ function landOnBranch(root, a, uuid8, backup) {
   const name = freeBranch(root, uuid8);
   const ref = `refs/heads/${name}`;
   git(root, ["update-ref", ref, a.boxHead, ""]);
-  const hasPatch = !!a.patch && lstatSync(a.patch).size > 0;
+  const hasPatch = !!a.patch && lstatSync2(a.patch).size > 0;
   if (!hasPatch && !a.untracked.length)
     return name;
   const tip = git(root, ["rev-parse", ref]).trim();
@@ -5342,7 +5464,7 @@ function packList(root, entries, skipDir = () => false) {
   const out = [];
   const add = (rel) => {
     const name = rel.split("/").pop();
-    const st = lstatSync2(join7(root, rel), { throwIfNoEntry: false });
+    const st = lstatSync3(join7(root, rel), { throwIfNoEntry: false });
     if (!st)
       return;
     if (!st.isDirectory()) {
@@ -5361,8 +5483,8 @@ function packList(root, entries, skipDir = () => false) {
   return Buffer.from(out.map((p) => p + "\x00").join(""));
 }
 function packRefusal(dir, home, has = existsSync6) {
-  const rel = relative2(dir, home);
-  if (rel !== ".." && !rel.startsWith(".." + sep2))
+  const rel = relative3(dir, home);
+  if (rel !== ".." && !rel.startsWith(".." + sep3))
     return `${dir} is your home folder or contains it`;
   const hit = SENSITIVE2.find((p) => has(join7(dir, p)));
   return hit ? `${dir} contains ${hit}` : undefined;
@@ -5380,7 +5502,7 @@ function userLayerFiles(claudeHome, entries) {
   for (const top of entries) {
     const abs = join7(claudeHome, top);
     if (!statSync5(abs, { throwIfNoEntry: false })) {
-      if (lstatSync2(abs, { throwIfNoEntry: false }))
+      if (lstatSync3(abs, { throwIfNoEntry: false }))
         skipped.push(top);
       continue;
     }
@@ -5388,17 +5510,17 @@ function userLayerFiles(claudeHome, entries) {
       files.push(top);
       continue;
     }
-    const root = realpathSync2(abs);
+    const root = realpathSync3(abs);
     const walk = (rel, ancestors) => {
       const p = join7(claudeHome, rel);
       let real;
       try {
-        real = realpathSync2(p);
+        real = realpathSync3(p);
       } catch {
         skipped.push(rel);
         return;
       }
-      if (real !== root && !real.startsWith(root + sep2)) {
+      if (real !== root && !real.startsWith(root + sep3)) {
         skipped.push(rel);
         return;
       }
@@ -5989,7 +6111,7 @@ ${(r.stderr ?? "").slice(-1500)}`);
     console.log(`Published template "${BASE_TEMPLATE}" from snapshot ${snap.id}. New boxes start from it (size ${BOX_SIZE}).`);
   } finally {
     await api(key, "DELETE", `/sandboxes/${id}`).then(() => console.log(`Deleted bake box ${id}.`), (e) => console.log(`Bake box ${id} left behind: ${e.message}`));
-    rmSync(out, { recursive: true, force: true });
+    rmSync2(out, { recursive: true, force: true });
   }
 }
 function withReload(html) {
@@ -6525,6 +6647,8 @@ async function later(args, keys, worker) {
     ancestors: pidAncestors(process.pid),
     records
   });
+  rmSync2(manifestPath(""), { force: true });
+  const manifest = session ? takeManifest(manifestPath(session)) : undefined;
   const arg = parseLaterArg(args.has("--args-stdin") ? readFileSync6(0, "utf8") : "");
   if (!arg) {
     console.log(LATER_USAGE);
@@ -6560,11 +6684,22 @@ After that, /nomo-cc:handoff works from inside Claude Code.`);
     process.exitCode = 1;
     return;
   }
-  if (!arm(session, claudePid, cwd, arg.message, worker, arg.anyway))
+  let message = arg.message, manifestNote;
+  if (manifest && message === DEFAULT_THEN) {
+    let setup = { install: [], compose: [] };
+    try {
+      if ("manifest" in manifest)
+        setup = setupSteps(root ?? cwd, cwd);
+    } catch {}
+    if ("manifest" in manifest)
+      message = manifestMessage(manifest.manifest, setup);
+    manifestNote = manifestLine(manifest, setup);
+  }
+  if (!arm(session, claudePid, cwd, message, worker, arg.anyway))
     return;
   console.log(`Ready. Session ${session} moves to the cloud as soon as this turn ends; watch it on your phone.
 ` + `This window stays open but parked: new prompts are blocked until you run /nomo-cc:back here.
-` + (arg.message ? `First message on the box: "${arg.message}"` : "No first message (quiet).") + `
+` + (message ? `First message on the box: "${message}"` : "No first message (quiet).") + `
 Log: ${LATER_LOG}
 To stop it: /nomo-cc:handoff cancel`);
   let warn;
@@ -6576,6 +6711,8 @@ To stop it: /nomo-cc:handoff cancel`);
   const ready = readiness(cwd);
   if (ready)
     console.log(ready);
+  if (manifestNote)
+    console.log(manifestNote);
   if (inTranscript)
     console.log(transcriptSecretWarning(inTranscript, true));
 }
@@ -6602,7 +6739,7 @@ async function phoneLater(args, keys, worker) {
   if (!keys.omg || !keys.openrouter)
     throw new Error("OMG_API_KEY and OPENROUTER_API_KEY must be set (env or ~/.nomo-spike.env)");
   const home = process.env.HOME;
-  rmSync(moveResultFile(session), { force: true });
+  rmSync2(moveResultFile(session), { force: true });
   const refuse = (why, msg) => {
     writeMoveResult(session, false, undefined, why);
     throw new Error(`not moving ${session}: ${msg}.`);
@@ -6795,7 +6932,7 @@ async function main() {
     try {
       plan = build(args, out);
     } catch (e) {
-      rmSync(out, { recursive: true, force: true });
+      rmSync2(out, { recursive: true, force: true });
       throw e;
     }
     console.log(`DRY RUN: nothing was sent. Artifacts kept in ${out} (delete it when done)`);
@@ -6915,7 +7052,7 @@ Target worker: ${worker}`);
       await api(omg, "POST", `/sandboxes/${id}/files`, [{ path: box, content: readFileSync6(local).toString("base64"), mode: 384 }]);
     }
   } finally {
-    rmSync(out, { recursive: true, force: true });
+    rmSync2(out, { recursive: true, force: true });
   }
   const r = await exec(omg, id, plan.script, {
     ANTHROPIC_BASE_URL: `http://127.0.0.1:${RELAY_PORT}`,

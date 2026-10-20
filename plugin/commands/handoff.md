@@ -23,6 +23,9 @@ with `/` or `!` runs there as a slash command or a bash command. The argument is
 heredoc, which the shell never expands:
 
 ```
+( umask 077; mkdir -p "$HOME/.config/cc-status" && cat > "$HOME/.config/cc-status/handoff-manifest-${CLAUDE_SESSION_ID}.json" ) <<'NOMO_MAN_YYYYYYYYYYYY'
+MANIFEST
+NOMO_MAN_YYYYYYYYYYYY
 { NOMOR="${CLAUDE_PLUGIN_ROOT}"; NOMOS="$HOME/.config/cc-status/hook-shim.sh"; [ -n "$NOMOR" ] && [ -x "$NOMOR/scripts/run.sh" ] && exec "$NOMOR/scripts/run.sh" "$NOMOR/dist/handoff.mjs" --later --args-stdin --session "${CLAUDE_SESSION_ID}"; [ -x "$NOMOS" ] && exec "$NOMOS" handoff --later --args-stdin --session "${CLAUDE_SESSION_ID}"; echo "Nomo could not find its installed files - reinstall the nomo plugin."; exit 1; } <<'NOMO_END_XXXXXXXXXXXX'
 ARGUMENT
 NOMO_END_XXXXXXXXXXXX
@@ -36,6 +39,14 @@ Fill it in exactly like this, changing nothing else:
   as an earlier run. If the argument contains your delimiter line anywhere, pick another one.
 - Keep the quotes around the first `'NOMO_END_…'`: they are what stops `$`, backticks and `\` in the
   argument from being expanded.
+- `MANIFEST`: one line of JSON you write now from this conversation, with ONLY these two keys:
+  `{"note": "<where you were and the next step, one line, at most 300 characters>", "env": ["<NAME>", …]}`.
+  `env` lists the names (never values) of environment variables this project needs to run, at most 20,
+  each UPPER_CASE like `DATABASE_URL`; `[]` when none. Write it from what you already know: do NOT read
+  `.env` or any other secret file for it, and never put a key, token, password, absolute path, `~/` path or
+  secret file name in it. No setup commands: Nomo works those out from the lockfiles itself.
+- `YYYYYYYYYYYY` (on BOTH `NOMO_MAN_` lines): 12 more random letters and digits, different from the other
+  delimiter. Keep the quotes around the first `'NOMO_MAN_…'`.
 
 **`cancel`** — stop a handoff that is still waiting for this turn to end, or unpark this window when
 nothing is waiting (the cloud copy is left as it is):
@@ -64,4 +75,5 @@ The box runs up to 4 handed-off sessions at once, one per project folder (two fr
 would share its files). A handoff over that limit, or from a folder another cloud session still holds,
 fails with a message naming what to bring back first; `/nomo-cc:handoff status` shows it, relay it verbatim.
 
-The output may include a `Cloud check:` line naming what the box won't have (secrets never sent, deps to reinstall, MCP servers, Mac-only tools); relay it verbatim, it never blocks the move (`handoff.mjs --check` prints only that block, moving nothing).
+The output may include a `Handoff manifest:` line (what the box will be asked to set up first, and
+the env var names it needs) or `Handoff manifest ignored (…)`; relay it verbatim. The output may include a `Cloud check:` line naming what the box won't have (secrets never sent, deps to reinstall, MCP servers, Mac-only tools); relay it verbatim, it never blocks the move (`handoff.mjs --check` prints only that block, moving nothing).

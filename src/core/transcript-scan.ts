@@ -85,6 +85,11 @@ function* matches(text: string): Generator<[SecretKind, number, string]> {
   for (const [, re] of VENDOR) re.lastIndex = 0;
 }
 
+/** NOM-106: true when `text` holds anything scanFiles would count (the handoff manifest's check). */
+export function textHasSecret(text: string): boolean {
+  return [...matches(text)].length > 0; // run to the end: matches() resets the shared regexes last
+}
+
 /** Scan files (streamed in 1 MB chunks, split on whole lines). `root` makes the reported paths relative. */
 export function scanFiles(files: string[], root: string): SecretScan {
   const seen = new Map<SecretKind, Set<string>>();

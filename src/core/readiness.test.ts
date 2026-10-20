@@ -3,7 +3,7 @@ import { execFileSync } from "node:child_process";
 import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { cloudReadiness, gitProbe, isSecretName } from "./readiness";
+import { cloudReadiness, gitProbe, isSecretName, setupSteps } from "./readiness";
 
 const dirs: string[] = [];
 afterEach(() => { for (const d of dirs.splice(0)) { try { chmodSync(d, 0o700); } catch { /* */ } rmSync(d, { recursive: true, force: true }); } });
@@ -131,5 +131,39 @@ describe("cloudReadiness", () => {
     const out = cloudReadiness(d, { home: tmp(), maxEntries: 500 });
     expect(performance.now() - t).toBeLessThan(200);
     expect(out).toBe("Cloud check: nothing Mac-only spotted.");
+  });
+});
+
+describe("setupSteps (NOM-106: from lockfiles + compose only)", () => {
+  test("one install per lockfile dir, one JS manager per dir, compose listed not started, quoted dirs", () => {
+    const r = tmp();
+    put(r, {
+      "bun.lock": "", "package-lock.json": "", "uv.lock": "", "docker-compose.yml": "services: {}",
+      "web app/yarn.lock": "", "node_modules/x/pnpm-lock.yaml": "", ".env": "SECRET=1",
+    });
+    expect(setupSteps(r)).toEqual({ install: ["bun install", "uv sync", "(cd 'web app' && yarn install)"], compose: ["docker-compose.yml"] });
+  });
+
+  test("a session started in a subdirectory: steps are relative to it (.. up to the root)", () => {
+    const r = tmp();
+    put(r, { "bun.lock": "", "apps/web/pnpm-lock.yaml": "", "apps/api/uv.lock": "", "compose.yml": "" });
+    expect(setupSteps(r, join(r, "apps", "web"))).toEqual({
+      install: ["(cd '../..' && bun install)", "(cd '../api' && uv sync)", "pnpm install"],
+      compose: ["../../compose.yml"],
+    });
+  });
+
+  test("hostile dir/file names are skipped, never typed into the box", () => {
+    const r = tmp();
+    const bad = ["e\u001b[201~\r!id", "n\nl", "a`; curl x|sh; `", "-", "-rf", "it's"];
+    put(r, Object.fromEntries([...bad.map((d) => [`${d}/bun.lock`, ""]), ["ok/bun.lock", ""], ["compose.\u001bx.yml", ""], ["sub/-/compose.yml", ""], ["compose.yaml", ""]]));
+    expect(setupSteps(r)).toEqual({ install: ["(cd 'ok' && bun install)"], compose: ["compose.yaml"] });
+  });
+
+  test("nothing detected → empty; capped", () => {
+    expect(setupSteps(tmp())).toEqual({ install: [], compose: [] });
+    const r = tmp();
+    put(r, Object.fromEntries(Array.from({ length: 12 }, (_, i) => [`p${String(i).padStart(2, "0")}/bun.lock`, ""])));
+    expect(setupSteps(r).install).toHaveLength(8);
   });
 });
