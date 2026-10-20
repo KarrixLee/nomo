@@ -107,7 +107,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "2.3.34";
+var PLUGIN_VERSION = "2.3.35";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -5434,7 +5434,7 @@ function stageLanding(id, l, runStartedAt, dir = PARK_DIR, alive = pidAlive) {
 }
 var MOVING_STALE_MS = 35 * 60000;
 var NOMO_COMMAND = "/nomo-cc:";
-function stamp(id, fields, dir) {
+function stamp(id, fields, dir = PARK_DIR) {
   const cur = readPark(id, dir);
   if (cur)
     writePark(id, { ...cur, ...fields }, dir);
@@ -5499,7 +5499,7 @@ function cloudActive(id, path = `${CC_DIR}/cloud.json`) {
     return false;
   }
 }
-function cloudState(p, run, locked = false) {
+function cloudState(p, run, locked = false, moveFailed = false) {
   switch (p?.state) {
     case "moving":
       return "moving";
@@ -5510,7 +5510,7 @@ function cloudState(p, run, locked = false) {
     case "cloud":
       return run?.running || locked ? "returning" : run && run.code !== 0 ? "failed" : "cloud";
   }
-  return;
+  return !p && moveFailed ? "move-failed" : undefined;
 }
 var parkWantsCommands = (p) => p?.state === "moving" || p?.state === "cloud" || p?.state === "landing";
 function withParked(body, dir = PARK_DIR) {
@@ -8686,7 +8686,8 @@ async function postEvent(config, body, opts = {}) {
 var INTERRUPT_COMMAND_KIND = "interrupt-session";
 var PING_COMMAND_KIND = "ping";
 var BRING_BACK_COMMAND_KIND = "bring-back";
-var COMMAND_KINDS_ALLOWED = new Set(["focus-terminal", INTERRUPT_COMMAND_KIND, PING_COMMAND_KIND, BRING_BACK_COMMAND_KIND]);
+var MOVE_TO_CLOUD_COMMAND_KIND = "move-to-cloud";
+var COMMAND_KINDS_ALLOWED = new Set(["focus-terminal", INTERRUPT_COMMAND_KIND, PING_COMMAND_KIND, BRING_BACK_COMMAND_KIND, MOVE_TO_CLOUD_COMMAND_KIND]);
 var PING_NONCE_MAX = 64;
 function parsePingPayload(plain) {
   if (typeof plain !== "object" || plain === null)
@@ -8778,6 +8779,7 @@ function resetCommandState() {
   executedCommandIds.clear();
   seenCommandNonces.clear();
   backRuns.clear();
+  moveRuns.clear();
 }
 function traceFocus(deps, event) {
   if (deps.trace) {
@@ -8919,6 +8921,10 @@ async function drainCommands(config, deps = {}) {
           traceFocus(deps, { ...base, result: "unknown-session" });
           continue;
         }
+        if (payload.kind === MOVE_TO_CLOUD_COMMAND_KIND) {
+          traceFocus(deps, { ...base, result: moveToCloud(payload.sessionId, entry.rec, deps.moveToCloud) });
+          continue;
+        }
         const target = `${payload.kind}|${payload.sessionId}`;
         if (batchTargets.has(target)) {
           traceFocus(deps, { ...base, result: "duplicate", why: "batch" });
@@ -8980,14 +8986,14 @@ function handoffCommand(exists = existsSync3, watchdogPath = WATCHDOG_PATH, ccDi
   const shim = `${ccDir}/hook-shim.sh`;
   return exists(shim) ? [shim, "handoff"] : undefined;
 }
-function spawnBack(id, onExit) {
+function spawnHandoff(id, what, args, cwd, onExit) {
   mkdirSync2(BACK_LOCK_DIR, { recursive: true, mode: 448 });
   const log = `${BACK_LOCK_DIR}/${id.slice(0, 12)}.log`;
   const note = (why) => {
     try {
       const f = openSync(log, "a", 384);
       try {
-        writeSync(f, `[${new Date().toISOString()}] bring-back from the phone: ${why}
+        writeSync(f, `[${new Date().toISOString()}] ${what} from the phone: ${why}
 `);
       } finally {
         closeSync(f);
@@ -8996,13 +9002,13 @@ function spawnBack(id, onExit) {
   };
   const cmd = handoffCommand();
   if (!cmd) {
-    note("Nomo's installed files were not found (plugin updated or removed?); reinstall or run /nomo-cc:back.");
+    note("Nomo's installed files were not found (plugin updated or removed?); reinstall the nomo plugin.");
     throw new Error("no handoff entry");
   }
   const fd = openSync(log, "a", 384);
   try {
     const { CLAUDE_CODE_SESSION_ID: _drop, ...env } = process.env;
-    const child = spawn3(cmd[0], [...cmd.slice(1), "--back", "--session", id, "--from-session", id, "--phone"], { detached: true, stdio: ["ignore", fd, fd], env, cwd: homedir() });
+    const child = spawn3(cmd[0], [...cmd.slice(1), ...args], { detached: true, stdio: ["ignore", fd, fd], env, cwd });
     child.on("error", (e) => {
       note(`could not start ${cmd[0]}: ${e.message}`);
       onExit(1);
@@ -9015,6 +9021,7 @@ function spawnBack(id, onExit) {
     closeSync(fd);
   }
 }
+var spawnBack = (id, onExit) => spawnHandoff(id, "bring-back", ["--back", "--session", id, "--from-session", id, "--phone"], homedir(), onExit);
 function bringBack(id, deps = {}) {
   if ((deps.readPark ?? readPark)(id)?.state !== "cloud" || !(deps.cloudActive ?? cloudActive)(id))
     return "not-parked";
@@ -9035,6 +9042,62 @@ function bringBack(id, deps = {}) {
     return "back-spawn-failed";
   }
   return "back-started";
+}
+var moveRuns = new Map;
+var UUID_RE2 = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+function moveToCloud(id, rec, deps = {}) {
+  if (!UUID_RE2.test(id) || typeof rec.cwd !== "string" || !rec.cwd || (rec.agent ?? "claude") !== "claude" || rec.provisional === true || (deps.readPark ?? readPark)(id) || (deps.cloudActive ?? cloudActive)(id))
+    return "move-refused";
+  if (moveRuns.get(id)?.running)
+    return "move-running";
+  const run = { running: true };
+  moveRuns.set(id, run);
+  const done = (code) => {
+    if (!run.running)
+      return;
+    run.running = false;
+    run.code = code;
+    if (code !== 0)
+      run.failedAt = (deps.now ?? Date.now)();
+  };
+  const cwd = rec.cwd;
+  try {
+    (deps.spawn ?? ((s, c, e) => spawnHandoff(s, "move-to-cloud", ["--later", "--phone", "--session", s], c, e)))(id, cwd, done);
+  } catch {
+    done(1);
+    return "move-spawn-failed";
+  }
+  return "move-started";
+}
+function laterLogLastLine() {
+  try {
+    return readFileSync3(`${CC_DIR}/handoff.log`, "utf8").trimEnd().split(`
+`).pop() ?? "";
+  } catch {
+    return "";
+  }
+}
+function moveFailed(id, park, rec, lastLine = laterLogLastLine) {
+  const m = moveRuns.get(id);
+  if (!m)
+    return false;
+  if (park && park.state !== "moving") {
+    moveRuns.delete(id);
+    return false;
+  }
+  if (!m.failedAt && !m.running && m.code === 0 && !park) {
+    if (/^(\[[^\]]*\]\s*)?(FAILED|CANCELLED)\b/.test(lastLine()))
+      m.failedAt = Date.now();
+    else {
+      moveRuns.delete(id);
+      return false;
+    }
+  }
+  if (m.failedAt && typeof rec?.turnStartedAt === "number" && rec.turnStartedAt * 1000 > m.failedAt) {
+    moveRuns.delete(id);
+    return false;
+  }
+  return !!m.failedAt && !park;
 }
 function withCloudKey(plain, cloud) {
   const { cloud: _old, plan, dbg, ...base } = plain;
@@ -10176,7 +10239,7 @@ async function sweep(config, deps = {}) {
       }
       remaining++;
       if (config && record && !pendingDoneHandled) {
-        const cloudFix = await correctCloudState(config, path, sessionId, record, cloudState(park, backRuns.get(sessionId), park?.state === "cloud" && backLockHolder(sessionId) !== undefined));
+        const cloudFix = await correctCloudState(config, path, sessionId, record, cloudState(park, backRuns.get(sessionId), park?.state === "cloud" && backLockHolder(sessionId) !== undefined, moveFailed(sessionId, park, record)));
         if (cloudFix === "revoked")
           return { revoked: true };
         if (cloudFix === "corrected") {
@@ -10698,6 +10761,7 @@ export {
   IDLE_GRACE_MS,
   LAN_ANSWER_ECHO_DELAY_MS,
   LAN_COMMAND_ID_PREFIX,
+  MOVE_TO_CLOUD_COMMAND_KIND,
   PAIRING_TTL_MS,
   PENDING_DONE_GRACE_MS,
   PENDING_DONE_POST_TIMEOUT_MS,
@@ -10760,6 +10824,9 @@ export {
   isRightfulWatchdogOwner,
   isWaitingSession,
   lastTurnLine,
+  moveFailed,
+  moveRuns,
+  moveToCloud,
   noteDoneAttempt,
   noteResend,
   parseCommandPayload,

@@ -384,7 +384,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "2.3.34";
+var PLUGIN_VERSION = "2.3.35";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -3205,6 +3205,7 @@ var LOCKS = [
   ["composer.lock", "composer install"]
 ];
 var LOCK_NAMES = new Set(LOCKS.map(([n]) => n));
+var TRACKED_SECRET = "looks like a secret and is tracked in git";
 function isSecretName(name) {
   if (/^\.env(\..+)?$/.test(name))
     return !/\.(example|sample|template|dist|defaults?)$/i.test(name);
@@ -3299,7 +3300,7 @@ function cloudReadiness(root, deps) {
   if (kept.length)
     missing.push(`${listNames(kept)} (${kept.length} file${kept.length > 1 ? "s" : ""}, never sent)`);
   for (const s of shipped)
-    warnings.push(`Heads-up: ${s} looks like a secret and is tracked in git: it WILL be on the box.`);
+    warnings.push(`Heads-up: ${s} ${TRACKED_SECRET}: it WILL be on the box.`);
   const gone = w.deps.filter((d) => git ? ignored.has(d) && !tracked.has(d) : d === "node_modules" || d.endsWith("/node_modules"));
   if (gone.length) {
     const names = [...new Set(gone.map((d) => d.split("/").pop()))];
@@ -3434,7 +3435,7 @@ function stageLanding(id, l, runStartedAt, dir = PARK_DIR, alive = pidAlive) {
 }
 var MOVING_STALE_MS = 35 * 60000;
 var NOMO_COMMAND = "/nomo-cc:";
-function stamp(id, fields, dir) {
+function stamp(id, fields, dir = PARK_DIR) {
   const cur = readPark(id, dir);
   if (cur)
     writePark(id, { ...cur, ...fields }, dir);
@@ -3499,7 +3500,7 @@ function cloudActive(id, path = `${CC_DIR}/cloud.json`) {
     return false;
   }
 }
-function cloudState(p, run, locked = false) {
+function cloudState(p, run, locked = false, moveFailed = false) {
   switch (p?.state) {
     case "moving":
       return "moving";
@@ -3510,7 +3511,7 @@ function cloudState(p, run, locked = false) {
     case "cloud":
       return run?.running || locked ? "returning" : run && run.code !== 0 ? "failed" : "cloud";
   }
-  return;
+  return !p && moveFailed ? "move-failed" : undefined;
 }
 var parkWantsCommands = (p) => p?.state === "moving" || p?.state === "cloud" || p?.state === "landing";
 function withParked(body, dir = PARK_DIR) {
@@ -3555,6 +3556,7 @@ function releaseBackLock(id, dir = BACK_LOCK_DIR) {
 
 // src/core/handoff-later.ts
 import { appendFileSync as appendFileSync2, closeSync, fstatSync, linkSync, openSync, readFileSync as readFileSync4, readSync, unlinkSync as unlinkSync2, writeFileSync as writeFileSync2 } from "node:fs";
+import { basename as basename3 } from "node:path";
 var PENDING_PATH = `${CC_DIR}/handoff-pending.json`;
 var LATER_LOG = `${CC_DIR}/handoff.log`;
 var LATER_CAP_MS = 30 * 60000;
@@ -3773,6 +3775,45 @@ function laterStatus(d) {
   return last ? `No handoff waiting. Last: ${last}
 Log: ${d.log}` : "No handoff waiting.";
 }
+function phoneMoveCheck(f) {
+  const r = f.record;
+  if (!r)
+    return { refuse: "no Nomo record for this session" };
+  if ((r.agent ?? "claude") !== "claude" || r.provisional === true)
+    return { refuse: "only a Claude Code session can move to the cloud" };
+  const pid = r.pid, cmd = typeof pid === "number" && pid > 1 ? f.command(pid) : undefined;
+  if (!pid || !cmd)
+    return { refuse: "its Claude Code process is not running" };
+  const up = f.ancestorsOf(pid).map((p) => f.command(p));
+  if (claudeHeadlessInvocation(cmd, up) || claudeDesktopInvocation(cmd, up))
+    return { refuse: "a headless or desktop-app session can't move to the cloud" };
+  if (basename3(cmd.trim().split(/\s+/)[0]) !== "claude")
+    return { refuse: "its Claude Code process is not running" };
+  if (f.parked)
+    return { refuse: "it is already moving, in the cloud, or parked" };
+  if (f.active)
+    return { refuse: "it is already running in the cloud" };
+  if (f.needsPairing)
+    return { refuse: "the cloud box needs a one-time pairing; run /nomo-cc:handoff in that session first" };
+  if (!r.cwd || !f.transcriptExists(r.cwd))
+    return { refuse: "its transcript was not found" };
+  if (f.readiness(r.cwd)?.includes(TRACKED_SECRET))
+    return { refuse: "a file that looks like a secret is tracked in git and would travel; move it from the terminal (/nomo-cc:handoff) if that is fine" };
+  return { claudePid: pid, cwd: r.cwd };
+}
+var PHONE_SETTLE_MS = 2000;
+async function settleThenStamp(session, d) {
+  await d.sleep(d.settleMs ?? PHONE_SETTLE_MS);
+  const r = await d.readRecord();
+  if (!r || !(r.op === "done" || r.lastEvent === "done" || r.awaitingPrompt === true))
+    return false;
+  const p = readPark(session, d.parkDir);
+  if (p?.state !== "moving")
+    return false;
+  if (!p.turnEndedAt)
+    stamp(session, { turnEndedAt: Date.now() }, d.parkDir);
+  return true;
+}
 
 // src/core/cloud-back.ts
 import { execFileSync as execFileSync4 } from "node:child_process";
@@ -3790,7 +3831,7 @@ import {
   renameSync as renameSync2,
   writeFileSync as writeFileSync3
 } from "node:fs";
-import { basename as basename3, dirname as dirname2, isAbsolute as isAbsolute2, join as join5, sep } from "node:path";
+import { basename as basename4, dirname as dirname2, isAbsolute as isAbsolute2, join as join5, sep } from "node:path";
 var MAX_ARTIFACT_BYTES = 100 * 1024 * 1024;
 var MAX_EXTRACTED_BYTES = 1024 * 1024 * 1024;
 var MAX_TRANSCRIPT_BYTES = 512 * 1024 * 1024;
@@ -4151,7 +4192,7 @@ function applyInPlace(root, a, detached, uuid8, backup) {
     const flagged = a.patch ? agentConfigPaths(patchPaths(root, a.patch, a.boxHead, backup)) : [];
     if (flagged.length)
       throw new Error(`the box patch changes agent config (${printable(flagged.join(", "), true)}): not landing it in place`);
-    const secrets = git(root, ["ls-files", "--others", "--exclude-standard", "-z"]).split("\x00").filter((p) => p && isSecretName(basename3(p)));
+    const secrets = git(root, ["ls-files", "--others", "--exclude-standard", "-z"]).split("\x00").filter((p) => p && isSecretName(basename4(p)));
     const keep = [
       "--",
       ".",
@@ -6013,6 +6054,8 @@ function listUnder(projDir, dir) {
 var SELF = fileURLToPath2(import.meta.url);
 var PENDING = { path: PENDING_PATH, isHelper: (pid) => pidAlive(pid) && /handoff.*--(after-exit|later)(\s|$)/.test(pidCommand(pid) ?? "") };
 async function later(args, keys, worker) {
+  if (args.has("--phone"))
+    return phoneLater(args, keys, worker);
   const records = [];
   try {
     for (const f of readdirSync3(SESSIONS_DIR).filter((n) => n.endsWith(".json"))) {
@@ -6057,22 +6100,11 @@ After that, /nomo-cc:handoff works from inside Claude Code.`);
     process.exitCode = 1;
     return;
   }
-  mkdirSync3(CC_DIR, { recursive: true, mode: 448 });
-  const p = { helperPid: process.pid, session, claudePid, state: "waiting", startedAt: Date.now(), message: arg.message };
-  if (!claimPending(PENDING, p)) {
-    const cur = readPending(PENDING_PATH);
-    console.log(`A handoff is already waiting (session ${cur?.session ?? "?"}). See /nomo-cc:handoff status, or /nomo-cc:handoff cancel.`);
+  if (!arm(session, claudePid, cwd, arg.message, worker))
     return;
-  }
-  writePark(session, { state: "moving", pid: claudePid });
-  const fd = openSync2(LATER_LOG, "w", 384);
-  const child = spawn2(process.execPath, [SELF, "--after-exit", "--session", session, "--claude-pid", String(claudePid), "--worker", worker], { cwd, detached: true, stdio: ["ignore", fd, fd] });
-  child.unref();
-  writeFileSync4(PENDING_PATH, JSON.stringify({ ...p, helperPid: child.pid }) + `
-`, { mode: 384 });
   console.log(`Ready. Session ${session} moves to the cloud as soon as this turn ends; watch it on your phone.
 ` + `This window stays open but parked: new prompts are blocked until you run /nomo-cc:back here.
-` + (p.message ? `First message on the box: "${p.message}"` : "No first message (quiet).") + `
+` + (arg.message ? `First message on the box: "${arg.message}"` : "No first message (quiet).") + `
 Log: ${LATER_LOG}
 To stop it: /nomo-cc:handoff cancel`);
   let warn;
@@ -6084,6 +6116,55 @@ To stop it: /nomo-cc:handoff cancel`);
   const ready = readiness(cwd);
   if (ready)
     console.log(ready);
+}
+function arm(session, claudePid, cwd, message, worker) {
+  mkdirSync3(CC_DIR, { recursive: true, mode: 448 });
+  const p = { helperPid: process.pid, session, claudePid, state: "waiting", startedAt: Date.now(), message };
+  if (!claimPending(PENDING, p)) {
+    const cur = readPending(PENDING_PATH);
+    console.log(`A handoff is already waiting (session ${cur?.session ?? "?"}). See /nomo-cc:handoff status, or /nomo-cc:handoff cancel.`);
+    return false;
+  }
+  writePark(session, { state: "moving", pid: claudePid });
+  const fd = openSync2(LATER_LOG, "w", 384);
+  const child = spawn2(process.execPath, [SELF, "--after-exit", "--session", session, "--claude-pid", String(claudePid), "--worker", worker], { cwd, detached: true, stdio: ["ignore", fd, fd] });
+  child.unref();
+  writeFileSync4(PENDING_PATH, JSON.stringify({ ...p, helperPid: child.pid }) + `
+`, { mode: 384 });
+  return true;
+}
+async function phoneLater(args, keys, worker) {
+  const session = args.get("--session");
+  if (typeof session !== "string" || !UUID_RE3.test(session))
+    throw new Error("--phone needs --session <uuid>");
+  if (!keys.omg || !keys.openrouter)
+    throw new Error("OMG_API_KEY and OPENROUTER_API_KEY must be set (env or ~/.nomo-spike.env)");
+  const home = process.env.HOME;
+  const ok = phoneMoveCheck({
+    record: await readRecord(session),
+    command: (pid) => pidAlive(pid) ? pidCommand(pid) : undefined,
+    ancestorsOf: pidAncestors,
+    parked: readPark(session) !== undefined,
+    active: cloudActive(session),
+    needsPairing: needsPairing(loadCloud(), worker),
+    transcriptExists: (cwd) => existsSync5(join6(home, ".claude", "projects", projectDirName(cwd), `${session}.jsonl`)),
+    readiness
+  });
+  if ("refuse" in ok)
+    throw new Error(`not moving ${session}: ${ok.refuse}.`);
+  let root;
+  try {
+    root = execFileSync5("git", ["rev-parse", "--show-toplevel"], { cwd: ok.cwd, stdio: ["ignore", "pipe", "ignore"] }).toString().trim();
+  } catch {}
+  const refusal = root ? packRefusal(root, home, () => false) : packRefusal(ok.cwd, home);
+  if (refusal)
+    throw new Error(`not moving ${session}: ${refusal}.`);
+  if (!arm(session, ok.claudePid, ok.cwd, DEFAULT_THEN, worker)) {
+    process.exitCode = 1;
+    return;
+  }
+  const now = await settleThenStamp(session, { readRecord: () => readRecord(session), sleep: (ms) => new Promise((r) => setTimeout(r, ms)) });
+  console.log(`Armed. Session ${session} moves to the cloud ${now ? "now (it was idle)" : "when its current turn ends"}. Log: ${LATER_LOG}`);
 }
 async function afterExit(args, worker) {
   const session = String(args.get("--session")), claudePid = Number(args.get("--claude-pid"));

@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   cancelPending, claimPending, contextTokens, contextTokensOf, DEFAULT_THEN, GONE_MSG, parseLaterArg, sizeWarning, handoffArgv, handoffLanded, laterStatus, NOTHING_RAN_MSG, needsPairing, type Pending, readPending, resolveSession, waitThenHandoff, type WaitDeps,
+  phoneMoveCheck, type PhoneMoveFacts, settleThenStamp,
 } from "./handoff-later";
 import { parkHook, readPark, writePark } from "./park";
 
@@ -316,5 +317,85 @@ describe("park marker lifecycle (NOM-90)", () => {
     writePark(A, { state: "moving" }, parkDir);
     expect(cancelPending({ path, isHelper: () => true, kill: () => {}, parkDir })).toContain("Cancelled");
     expect(readPark(A, parkDir)).toBeUndefined();
+  });
+});
+
+describe("phone move-to-cloud (NOM-94)", () => {
+  const CLAUDE = "/usr/local/bin/claude --resume x";
+  const facts = (o: Partial<PhoneMoveFacts> = {}): PhoneMoveFacts => ({
+    record: { pid: 400, cwd: "/p/app" },
+    command: (pid) => (pid === 400 ? CLAUDE : pid === 300 ? "-zsh" : undefined),
+    ancestorsOf: () => [300],
+    parked: false, active: false, needsPairing: false,
+    transcriptExists: () => true,
+    readiness: () => "Cloud check: Heads-up: node_modules is not sent.",
+    ...o,
+  });
+  const refuse = (o: Partial<PhoneMoveFacts>): string => {
+    const r = phoneMoveCheck(facts(o));
+    expect("refuse" in r).toBe(true);
+    return (r as { refuse: string }).refuse;
+  };
+
+  test("a live, idle-or-busy Claude Code session passes with the record's pid and cwd", () => {
+    expect(phoneMoveCheck(facts())).toEqual({ claudePid: 400, cwd: "/p/app" });
+  });
+
+  test("every gate refuses", () => {
+    expect(refuse({ record: null })).toMatch(/no Nomo record/);
+    expect(refuse({ record: { pid: 400, cwd: "/p", agent: "codex" } })).toMatch(/only a Claude Code/);
+    expect(refuse({ record: { pid: 400, cwd: "/p", agent: "opencode" } })).toMatch(/only a Claude Code/);
+    expect(refuse({ record: { pid: 400, cwd: "/p", provisional: true } })).toMatch(/only a Claude Code/);
+    expect(refuse({ command: () => undefined })).toMatch(/not running/);                // dead pid
+    expect(refuse({ command: () => "/bin/zsh -l" })).toMatch(/not running/);            // a reused pid
+    expect(refuse({ record: { cwd: "/p" } })).toMatch(/not running/);
+    expect(refuse({ command: (p) => (p === 400 ? "claude -p hi --output-format stream-json" : undefined) })).toMatch(/headless or desktop/);
+    expect(refuse({
+      command: (p) => (p === 400 ? "/Users/u/Library/Application Support/Claude/claude-code/2.1.0/claude.app/Contents/MacOS/claude --resume x" : "/Applications/Claude.app/Contents/Helpers/disclaimer"),
+    })).toMatch(/headless or desktop/);
+    expect(refuse({ parked: true })).toMatch(/already moving/);
+    expect(refuse({ active: true })).toMatch(/already running in the cloud/);
+    expect(refuse({ needsPairing: true })).toMatch(/pairing/);
+    expect(refuse({ transcriptExists: () => false })).toMatch(/transcript/);
+    expect(refuse({ record: { pid: 400 } })).toMatch(/transcript/);
+  });
+
+  test("a git-tracked secret refuses; an untracked one does not", () => {
+    expect(refuse({ readiness: () => "Cloud check: Heads-up: .env looks like a secret and is tracked in git: it WILL be on the box." })).toMatch(/secret/);
+    expect(phoneMoveCheck(facts({ readiness: () => "Cloud check: .env stays on this Mac." }))).toEqual({ claudePid: 400, cwd: "/p/app" });
+  });
+
+  const sleeps: number[] = [];
+  const sleep = async (ms: number) => { sleeps.push(ms); };
+
+  test("idle after the settle → turnEndedAt is stamped (the helper moves now)", async () => {
+    for (const rec of [{ op: "done" }, { lastEvent: "done" }, { lastEvent: "sessionStart", awaitingPrompt: true }]) {
+      const dir = tmp();
+      writePark(A, { state: "moving", pid: 400 }, dir);
+      sleeps.length = 0;
+      expect(await settleThenStamp(A, { readRecord: async () => rec, sleep, parkDir: dir })).toBe(true);
+      expect(sleeps).toEqual([2000]);
+      expect(readPark(A, dir)?.turnEndedAt).toBeGreaterThan(0);
+      expect(readPark(A, dir)?.state).toBe("moving");
+    }
+  });
+
+  test("working or needs-attention → not stamped (that turn's Stop does it)", async () => {
+    for (const rec of [{ op: "update", lastEvent: "working" }, { op: "update", lastEvent: "needsAttention" }, null]) {
+      const dir = tmp();
+      writePark(A, { state: "moving", pid: 400 }, dir);
+      expect(await settleThenStamp(A, { readRecord: async () => rec, sleep, parkDir: dir, settleMs: 0 })).toBe(false);
+      expect(readPark(A, dir)?.turnEndedAt).toBeUndefined();
+    }
+  });
+
+  test("a Stop that already stamped is kept; a marker gone meanwhile is not recreated", async () => {
+    const dir = tmp();
+    writePark(A, { state: "moving", pid: 400, turnEndedAt: 7 }, dir);
+    await settleThenStamp(A, { readRecord: async () => ({ op: "done" }), sleep, parkDir: dir });
+    expect(readPark(A, dir)?.turnEndedAt).toBe(7);
+    const gone = tmp();
+    expect(await settleThenStamp(A, { readRecord: async () => ({ op: "done" }), sleep, parkDir: gone })).toBe(false);
+    expect(readPark(A, gone)).toBeUndefined();
   });
 });

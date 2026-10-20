@@ -291,3 +291,15 @@ describe("one back at a time + the parked flag (NOM-93)", () => {
     expect(withParked({ v: 2, sessionId: "codex-pid-1" }, dir)).toEqual({ v: 2, sessionId: "codex-pid-1" });
   });
 });
+
+describe("move-failed (NOM-94)", () => {
+  test("only with no marker; any marker wins; never sets `parked`", () => {
+    expect(cloudState(undefined, undefined, false, true)).toBe("move-failed");
+    expect(cloudState(undefined, undefined, false, false)).toBeUndefined();
+    expect(cloudState({ state: "moving", since: 0 }, undefined, false, true)).toBe("moving");
+    expect(cloudState({ state: "cloud", since: 0 }, undefined, false, true)).toBe("cloud");
+    const dir = tmp();
+    const body = { v: 2, sessionId: A, op: "done" };
+    expect(withParked(body, dir)).toEqual(body); // a failed move leaves no marker → no parked flag
+  });
+});

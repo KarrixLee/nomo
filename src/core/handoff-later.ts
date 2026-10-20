@@ -12,7 +12,10 @@
 // refused up front with the terminal command instead.
 
 import { appendFileSync, closeSync, fstatSync, linkSync, openSync, readFileSync, readSync, unlinkSync, writeFileSync } from "node:fs";
-import { clearPark, readPark, writePark } from "./park";
+import { basename } from "node:path";
+import { claudeDesktopInvocation, claudeHeadlessInvocation } from "./adapter";
+import { clearPark, readPark, stamp, writePark } from "./park";
+import { TRACKED_SECRET } from "./readiness";
 import { CC_DIR } from "./shared";
 
 export const PENDING_PATH = `${CC_DIR}/handoff-pending.json`;
@@ -261,4 +264,64 @@ export function laterStatus(d: PendingDeps & { log: string }): string {
   let last = "";
   try { last = readFileSync(d.log, "utf8").trimEnd().split("\n").pop() ?? ""; } catch { /* no log */ }
   return last ? `No handoff waiting. Last: ${last}\nLog: ${d.log}` : "No handoff waiting.";
+}
+
+// --- NOM-94: the phone's "Move to cloud" (`--later --phone --session <uuid>`, run by the watchdog) -------
+
+/** What phoneMoveCheck needs, injected. The watchdog is no ancestor of the session's `claude`, so the
+ *  pid comes from the session record and is checked to be a live `claude` instead. */
+export interface PhoneMoveFacts {
+  record: { pid?: number; cwd?: string; agent?: string; provisional?: boolean } | null;
+  /** A pid's argv (ps), undefined when it is not running. */
+  command: (pid: number) => string | undefined;
+  ancestorsOf: (pid: number) => number[];
+  parked: boolean;
+  active: boolean;
+  needsPairing: boolean;
+  transcriptExists: (cwd: string) => boolean;
+  /** The "Cloud check:" block for cwd (handoff.ts readiness). */
+  readiness: (cwd: string) => string | undefined;
+}
+
+/** Every gate a phone-started move passes before anything is written. Either the session's claude pid
+ *  and cwd, or why not (one line, for the log). */
+export function phoneMoveCheck(f: PhoneMoveFacts): { claudePid: number; cwd: string } | { refuse: string } {
+  const r = f.record;
+  if (!r) return { refuse: "no Nomo record for this session" };
+  if ((r.agent ?? "claude") !== "claude" || r.provisional === true) return { refuse: "only a Claude Code session can move to the cloud" };
+  const pid = r.pid, cmd = typeof pid === "number" && pid > 1 ? f.command(pid) : undefined;
+  if (!pid || !cmd) return { refuse: "its Claude Code process is not running" };
+  const up = f.ancestorsOf(pid).map((p) => f.command(p));
+  // ponytail: no CLAUDE_CODE_ENTRYPOINT here (another process's env); the argv anchors decide desktop.
+  // Before the name check: the desktop binary's path has a space in it.
+  if (claudeHeadlessInvocation(cmd, up) || claudeDesktopInvocation(cmd, up)) return { refuse: "a headless or desktop-app session can't move to the cloud" };
+  if (basename(cmd.trim().split(/\s+/)[0]) !== "claude") return { refuse: "its Claude Code process is not running" };
+  if (f.parked) return { refuse: "it is already moving, in the cloud, or parked" };
+  if (f.active) return { refuse: "it is already running in the cloud" };
+  if (f.needsPairing) return { refuse: "the cloud box needs a one-time pairing; run /nomo-cc:handoff in that session first" };
+  if (!r.cwd || !f.transcriptExists(r.cwd)) return { refuse: "its transcript was not found" };
+  if (f.readiness(r.cwd)?.includes(TRACKED_SECRET)) return { refuse: "a file that looks like a secret is tracked in git and would travel; move it from the terminal (/nomo-cc:handoff) if that is fine" };
+  return { claudePid: pid, cwd: r.cwd };
+}
+
+/** How long the phone path waits after writing the "moving" marker before reading the session state. */
+export const PHONE_SETTLE_MS = 2000;
+
+/** The phone path's race-safe arming, AFTER the "moving" marker is written: a Stop from here on stamps
+ *  turnEndedAt itself (park.ts); one that fired before the marker existed is caught by re-reading the
+ *  record after a settle. Idle (done / opened, never prompted) → stamp turnEndedAt now so the helper
+ *  moves at once; working or needs-attention → leave it for that turn's Stop. True = stamped. */
+export async function settleThenStamp(session: string, d: {
+  readRecord: () => Promise<{ op?: string; lastEvent?: string; awaitingPrompt?: boolean } | null>;
+  sleep: (ms: number) => Promise<void>;
+  parkDir?: string;
+  settleMs?: number;
+}): Promise<boolean> {
+  await d.sleep(d.settleMs ?? PHONE_SETTLE_MS);
+  const r = await d.readRecord();
+  if (!r || !(r.op === "done" || r.lastEvent === "done" || r.awaitingPrompt === true)) return false;
+  const p = readPark(session, d.parkDir);
+  if (p?.state !== "moving") return false;
+  if (!p.turnEndedAt) stamp(session, { turnEndedAt: Date.now() }, d.parkDir);
+  return true;
 }

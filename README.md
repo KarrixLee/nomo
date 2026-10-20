@@ -106,6 +106,43 @@ In plain English:
   quietly swapping the public keys (a man-in-the-middle): if it tampers, pairing fails instead of
   silently succeeding under the attacker's key.
 
+## Cloud handoff — security
+
+`/nomo-cc:handoff` moves a Claude Code session to your own cloud box, and `/nomo-cc:back` brings it
+home. What that does and doesn't expose:
+
+- **Your Claude login never leaves the Mac.** The box gets none of your Claude subscription
+  credentials: `~/.claude.json`, `.credentials.json`, your settings `env`, `~/.ssh`, `~/.aws`,
+  `~/.gnupg` and the Keychain are never packed (`SENSITIVE` in `src/entries/handoff.ts`). The box
+  runs Claude Code on API billing through its own OpenRouter key, never your subscription.
+- **Keys never touch argv, tmux or the box's disk.** The API keys reach the box only as the
+  environment of the setup command, which writes them to a 0600 file on `/dev/shm` (RAM); the
+  launcher deletes that file as it reads it. They are never passed on a command line or with
+  `tmux -e`, so `ps` on the box never shows them. Your Nomo pairing never travels either.
+- **Secret-looking files stay home — unless git tracks them.** The working tree travels as a git
+  bundle of `HEAD`, the uncommitted diff, and a tar of untracked files. Every file whose name looks
+  like a secret (`isSecretName`: `.env*`, `.dev.vars`, `.npmrc`, `.netrc`, private keys,
+  `credentials.json`, `secrets.*`…) is dropped from that tar. A secret git *tracks* is in the bundle
+  and does travel: the `Cloud check:` block warns about it by name. That check only lists file
+  names; it never opens a secret file.
+- **The box is its own paired computer.** It pairs with your phone under its own keys ("Nomo Cloud"),
+  so phone ↔ box traffic is end-to-end sealed exactly like your Mac's, and the relay stays blind:
+  it sees ids and flags (op, priority, a `parked` boolean), never titles or content.
+- **Phone commands** (*Bring back*, *Move to cloud*) are sealed by the phone with the pairing key
+  (AES-256-GCM): the relay carries an opaque blob and cannot forge, read or alter one. The plugin
+  checks each one itself: an allow-listed kind, a sealed timestamp no older than 120 s, and a
+  never-seen nonce (no replay). They are delivered only to this computer's watchdog (the
+  `x-cc-role` header), and act only on a session in the right state: *Bring back* needs a session
+  parked in the cloud, *Move to cloud* one that is not parked and not already in the cloud.
+- **Move to cloud** carries no text at all: `{kind, sessionId, ts, nonce}`, anything else dropped;
+  the box gets the default "continue" message. It runs only for a live, interactive Claude Code
+  session (not Codex, OpenCode, a headless run or the desktop app), only once this Mac has paired
+  its box from an interactive terminal handoff (cloud.json `pairedTo`; the QR is never shown from
+  the background), and it refuses outright when the `Cloud check:` finds a git-tracked secret.
+
+**Not covered:** whoever holds your unlocked phone, or this computer's pairing key, can move a
+session to *your own* box or bring one back, just as they could answer its remote approvals.
+
 ## Install — one command
 
 ```sh
@@ -472,6 +509,8 @@ entrypoints), `core/` (shared leaf modules — paths/config, E2E crypto, the hoo
 agent adapters), `opencode/` (the resident OpenCode module), and `qr/` (the vendored QR encoder). All
 are written to run unmodified under **bun and node ≥ 18** — no `Bun.*` runtime APIs, no npm
 dependencies.
+
+When adding a security-relevant behavior, update the README security sections in the same PR.
 
 ### Tests
 

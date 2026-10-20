@@ -81,7 +81,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "2.3.34";
+var PLUGIN_VERSION = "2.3.35";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -2529,7 +2529,7 @@ function land(id, p, dir) {
 }
 var MOVING_STALE_MS = 35 * 60000;
 var NOMO_COMMAND = "/nomo-cc:";
-function stamp(id, fields, dir) {
+function stamp(id, fields, dir = PARK_DIR) {
   const cur = readPark(id, dir);
   if (cur)
     writePark(id, { ...cur, ...fields }, dir);

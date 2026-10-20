@@ -105,7 +105,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "2.3.34";
+var PLUGIN_VERSION = "2.3.35";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -3118,7 +3118,7 @@ function stageLanding(id, l, runStartedAt, dir = PARK_DIR, alive = pidAlive) {
 }
 var MOVING_STALE_MS = 35 * 60000;
 var NOMO_COMMAND = "/nomo-cc:";
-function stamp(id, fields, dir) {
+function stamp(id, fields, dir = PARK_DIR) {
   const cur = readPark(id, dir);
   if (cur)
     writePark(id, { ...cur, ...fields }, dir);
@@ -3183,7 +3183,7 @@ function cloudActive(id, path = `${CC_DIR}/cloud.json`) {
     return false;
   }
 }
-function cloudState(p, run, locked = false) {
+function cloudState(p, run, locked = false, moveFailed = false) {
   switch (p?.state) {
     case "moving":
       return "moving";
@@ -3194,7 +3194,7 @@ function cloudState(p, run, locked = false) {
     case "cloud":
       return run?.running || locked ? "returning" : run && run.code !== 0 ? "failed" : "cloud";
   }
-  return;
+  return !p && moveFailed ? "move-failed" : undefined;
 }
 var parkWantsCommands = (p) => p?.state === "moving" || p?.state === "cloud" || p?.state === "landing";
 function withParked(body, dir = PARK_DIR) {

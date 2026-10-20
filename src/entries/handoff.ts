@@ -79,10 +79,10 @@ import { renderPairPage } from "../core/pair-page";
 import { buildPairURL, DEFAULT_WORKER_URL } from "../core/pair-url";
 import { normalizeModelId } from "../core/adapter";
 import { cloudReadiness, gitProbe, isSecretName } from "../core/readiness";
-import { backLockHolder, clearPark, PARK_DIR, readPark, releaseBackLock, stageLanding, takeBackLock, writePark } from "../core/park";
+import { backLockHolder, clearPark, cloudActive, PARK_DIR, readPark, releaseBackLock, stageLanding, takeBackLock, writePark } from "../core/park";
 import { atomicWrite, CC_DIR, pidAlive, pidAncestors, pidCommand, readRecord, SESSIONS_DIR } from "../core/shared";
 import {
-  cancelPending, claimPending, contextTokens, contextTokensOf, GONE_MSG, sizeWarning, TAIL_BYTES, handoffArgv, LATER_LOG, LATER_USAGE, laterStatus, needsPairing, parseLaterArg, type Pending, PENDING_PATH, readPending, resolveSession, waitThenHandoff,
+  cancelPending, claimPending, DEFAULT_THEN, phoneMoveCheck, settleThenStamp, contextTokens, contextTokensOf, GONE_MSG, sizeWarning, TAIL_BYTES, handoffArgv, LATER_LOG, LATER_USAGE, laterStatus, needsPairing, parseLaterArg, type Pending, PENDING_PATH, readPending, resolveSession, waitThenHandoff,
 } from "../core/handoff-later";
 import {
   agentConfigPaths, applyInPlace, atomicWriteBytes, type BoxArtifacts, boxChangedPaths, boxIdle, copyContained, decideCode, extractTgz,
@@ -1472,6 +1472,7 @@ const PENDING = { path: PENDING_PATH, isHelper: (pid: number) => pidAlive(pid) &
 
 /** Foreground preflight (local only), then the detached helper that hands off once this session exits. */
 async function later(args: Map<string, string | true>, keys: { omg?: string; openrouter?: string }, worker: string): Promise<void> {
+  if (args.has("--phone")) return phoneLater(args, keys, worker);
   const records: { id: string; pid: number }[] = [];
   try {
     for (const f of readdirSync(SESSIONS_DIR).filter((n) => n.endsWith(".json"))) {
@@ -1501,12 +1502,27 @@ async function later(args: Map<string, string | true>, keys: { omg?: string; ope
     process.exitCode = 1;
     return;
   }
+  if (!arm(session, claudePid, cwd, arg.message, worker)) return;
+  console.log(`Ready. Session ${session} moves to the cloud as soon as this turn ends; watch it on your phone.\n` +
+    `This window stays open but parked: new prompts are blocked until you run /nomo-cc:back here.\n` +
+    (arg.message ? `First message on the box: "${arg.message}"` : "No first message (quiet).") +
+    `\nLog: ${LATER_LOG}\nTo stop it: /nomo-cc:handoff cancel`);
+  let warn: string | undefined;
+  try { warn = sizeWarning(contextTokensOf(join(home, ".claude", "projects", projectDirName(cwd), `${session}.jsonl`))); } catch { /* estimate only */ }
+  if (warn) console.log(warn);
+  const ready = readiness(cwd);
+  if (ready) console.log(ready);
+}
+
+/** Claim the pending slot, park the window "moving" and start the detached helper. False (message
+ *  printed) when another handoff already holds the slot. */
+function arm(session: string, claudePid: number, cwd: string, message: string | undefined, worker: string): boolean {
   mkdirSync(CC_DIR, { recursive: true, mode: 0o700 });
-  const p: Pending = { helperPid: process.pid, session, claudePid, state: "waiting", startedAt: Date.now(), message: arg.message };
+  const p: Pending = { helperPid: process.pid, session, claudePid, state: "waiting", startedAt: Date.now(), message };
   if (!claimPending(PENDING, p)) {
     const cur = readPending(PENDING_PATH);
     console.log(`A handoff is already waiting (session ${cur?.session ?? "?"}). See /nomo-cc:handoff status, or /nomo-cc:handoff cancel.`);
-    return;
+    return false;
   }
   writePark(session, { state: "moving", pid: claudePid });
   const fd = openSync(LATER_LOG, "w", 0o600);
@@ -1514,15 +1530,35 @@ async function later(args: Map<string, string | true>, keys: { omg?: string; ope
     { cwd, detached: true, stdio: ["ignore", fd, fd] });
   child.unref();
   writeFileSync(PENDING_PATH, JSON.stringify({ ...p, helperPid: child.pid }) + "\n", { mode: 0o600 });
-  console.log(`Ready. Session ${session} moves to the cloud as soon as this turn ends; watch it on your phone.\n` +
-    `This window stays open but parked: new prompts are blocked until you run /nomo-cc:back here.\n` +
-    (p.message ? `First message on the box: "${p.message}"` : "No first message (quiet).") +
-    `\nLog: ${LATER_LOG}\nTo stop it: /nomo-cc:handoff cancel`);
-  let warn: string | undefined;
-  try { warn = sizeWarning(contextTokensOf(join(home, ".claude", "projects", projectDirName(cwd), `${session}.jsonl`))); } catch { /* estimate only */ }
-  if (warn) console.log(warn);
-  const ready = readiness(cwd);
-  if (ready) console.log(ready);
+  return true;
+}
+
+/** NOM-94: the phone's "Move to cloud", run by the watchdog (no turn of the window behind it). Every
+ *  refusal exits non-zero (the row then reads cloud:"move-failed"); a busy slot too. The first message
+ *  is always the default one: the phone sends no text. */
+async function phoneLater(args: Map<string, string | true>, keys: { omg?: string; openrouter?: string }, worker: string): Promise<void> {
+  const session = args.get("--session");
+  if (typeof session !== "string" || !UUID_RE.test(session)) throw new Error("--phone needs --session <uuid>");
+  if (!keys.omg || !keys.openrouter) throw new Error("OMG_API_KEY and OPENROUTER_API_KEY must be set (env or ~/.nomo-spike.env)");
+  const home = process.env.HOME!;
+  const ok = phoneMoveCheck({
+    record: await readRecord(session),
+    command: (pid) => (pidAlive(pid) ? pidCommand(pid) : undefined),
+    ancestorsOf: pidAncestors,
+    parked: readPark(session) !== undefined,
+    active: cloudActive(session),
+    needsPairing: needsPairing(loadCloud(), worker),
+    transcriptExists: (cwd) => existsSync(join(home, ".claude", "projects", projectDirName(cwd), `${session}.jsonl`)),
+    readiness,
+  });
+  if ("refuse" in ok) throw new Error(`not moving ${session}: ${ok.refuse}.`);
+  let root: string | undefined;
+  try { root = execFileSync("git", ["rev-parse", "--show-toplevel"], { cwd: ok.cwd, stdio: ["ignore", "pipe", "ignore"] }).toString().trim(); } catch { /* not git */ }
+  const refusal = root ? packRefusal(root, home, () => false) : packRefusal(ok.cwd, home);
+  if (refusal) throw new Error(`not moving ${session}: ${refusal}.`);
+  if (!arm(session, ok.claudePid, ok.cwd, DEFAULT_THEN, worker)) { process.exitCode = 1; return; }
+  const now = await settleThenStamp(session, { readRecord: () => readRecord(session), sleep: (ms) => new Promise((r) => setTimeout(r, ms)) });
+  console.log(`Armed. Session ${session} moves to the cloud ${now ? "now (it was idle)" : "when its current turn ends"}. Log: ${LATER_LOG}`);
 }
 
 /** The detached helper spawned by later(). */

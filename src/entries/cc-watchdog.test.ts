@@ -26,6 +26,7 @@ import {
 } from "./cc-watchdog";
 import type { CommandPayload, DrainCommandsDeps, PostDetail, PostOutcome, RecordEntry } from "./cc-watchdog";
 import { backRuns, BRING_BACK_COMMAND_KIND, correctCloudState, handoffCommand, withCloudKey } from "./cc-watchdog";
+import { MOVE_TO_CLOUD_COMMAND_KIND, moveFailed, moveRuns, parseCommandPayload } from "./cc-watchdog";
 import type { Park } from "../core/park";
 import { resolveOnRelay } from "../core/codex-remote-input";
 import { CODEX_PROXY_STDOUT_ENDED } from "../core/codex-proxy-transport";
@@ -5085,5 +5086,112 @@ describe("bring back from the phone (NOM-93)", () => {
     })).toBe("skip");
     expect(posts).toEqual([]);
     expect(isCommandActiveSession(old)).toBe(false); // the record alone would idle the poll…
+  });
+});
+
+describe("move to cloud from the phone (NOM-94)", () => {
+  const NOW = 50_000_000;
+  const S = "0a1b2c3d-1111-4222-8333-444455556666";
+  let seq = 0;
+  beforeEach(() => resetCommandState());
+  const cmd = async (over: Record<string, unknown> = {}) => ({
+    id: `mc-${++seq}`,
+    blob: await encryptBlob(KEY, { kind: MOVE_TO_CLOUD_COMMAND_KIND, sessionId: S, ts: NOW, nonce: `mcn-${++seq}`, ...over }),
+  });
+  const harness = (o: { state?: Park["state"]; active?: boolean; record?: Partial<SessionRecord> | null } = {}) => {
+    const spawned: Array<{ id: string; cwd: string }> = [];
+    const exits: Array<(code: number | null) => void> = [];
+    const traces: Record<string, unknown>[] = [];
+    const record = o.record === null ? [] : [{ sessionId: S, rec: rec({ cwd: "/p/app", ...o.record }) }];
+    const deps: DrainCommandsDeps = {
+      now: () => NOW,
+      readRecords: async () => record as RecordEntry[],
+      trace: (e) => traces.push(e as Record<string, unknown>),
+      moveToCloud: {
+        readPark: () => (o.state ? { state: o.state, since: 0 } : undefined),
+        cloudActive: () => o.active ?? false,
+        spawn: (id, cwd, onExit) => { spawned.push({ id, cwd }); exits.push(onExit); },
+        now: () => NOW,
+      },
+    };
+    return { spawned, exits, traces, deps };
+  };
+
+  test("the payload is {kind, sessionId, ts, nonce} only: extra fields (any user text) are dropped", () => {
+    expect(parseCommandPayload({ kind: MOVE_TO_CLOUD_COMMAND_KIND, sessionId: S, ts: 1, nonce: "n", text: "rm -rf /", then: "x" }))
+      .toEqual({ kind: MOVE_TO_CLOUD_COMMAND_KIND, sessionId: S, ts: 1, nonce: "n" });
+  });
+
+  test("allow-listed: an idle Claude Code session spawns once in its own cwd; a second tap while it runs does not", async () => {
+    const { spawned, exits, traces, deps } = harness();
+    const [a, b] = [await cmd({ text: "ignored" }), await cmd()];
+    await drainCommands(cfg(), { ...deps, take: () => [a] });
+    await drainCommands(cfg(), { ...deps, take: () => [b] });
+    expect(spawned).toEqual([{ id: S, cwd: "/p/app" }]);
+    expect(traces.map((t) => t.result)).toEqual(["move-started", "move-running"]);
+    exits[0](0);
+    expect(moveRuns.get(S)).toEqual({ running: false, code: 0 });
+  });
+
+  test("refused: parked, in cloud.json, codex, provisional, no cwd, unknown session; stale and replay never spawn", async () => {
+    for (const o of [{ state: "moving" }, { state: "cloud" }, { active: true }, { record: { agent: "codex" } }, { record: { provisional: true } }, { record: { cwd: undefined } }] as const) {
+      const { spawned, traces, deps } = harness(o as never);
+      const c = await cmd();
+      await drainCommands(cfg(), { ...deps, take: () => [c] });
+      expect(spawned).toEqual([]);
+      expect(traces.map((t) => t.result)).toEqual(["move-refused"]);
+    }
+    const { spawned, traces, deps } = harness({ record: null });
+    const unknown = await cmd();
+    const stale = await cmd({ ts: NOW - 10 * 60_000 });
+    await drainCommands(cfg(), { ...deps, take: () => [unknown, stale] });
+    expect(spawned).toEqual([]);
+    expect(traces.map((t) => t.result)).toEqual(["unknown-session", "stale"]);
+    const h = harness();
+    const first = await cmd();
+    await drainCommands(cfg(), { ...h.deps, take: () => [first] });
+    h.exits[0](0);
+    await drainCommands(cfg(), { ...h.deps, take: () => [{ id: "fresh-id", blob: first.blob }] });
+    expect(h.traces.map((t) => t.result)).toEqual(["move-started", "replay"]);
+  });
+
+  test("move-failed: a preflight that exits non-zero, until the session's next turn", async () => {
+    const { exits, deps } = harness();
+    const c = await cmd();
+    await drainCommands(cfg(), { ...deps, take: () => [c] });
+    expect(moveFailed(S, undefined, null)).toBe(false); // still running
+    exits[0](1);
+    expect(moveFailed(S, undefined, rec({ lastEvent: "done" }))).toBe(true);
+    expect(moveFailed(S, undefined, rec({ lastEvent: "working", turnStartedAt: NOW / 1000 - 5 }))).toBe(true); // an older turn
+    expect(moveFailed(S, undefined, rec({ lastEvent: "working", turnStartedAt: NOW / 1000 + 5 }))).toBe(false); // works normally again
+    expect(moveRuns.has(S)).toBe(false);
+  });
+
+  test("move-failed: the marker vanished without reaching cloud and the helper logged FAILED/CANCELLED", async () => {
+    for (const [line, failed] of [
+      ["[2026-01-01T00:00:00.000Z] FAILED: the handoff exited 1; see the lines above. Your Mac copy is untouched.", true],
+      ["[2026-01-01T00:00:00.000Z] CANCELLED: session x stays on this Mac.", true],
+      ["[2026-01-01T00:00:00.000Z] DONE: session x is running in the cloud.", false],
+    ] as const) {
+      resetCommandState();
+      const { exits, deps } = harness();
+      const c = await cmd();
+      await drainCommands(cfg(), { ...deps, take: () => [c] });
+      exits[0](0);
+      expect(moveFailed(S, { state: "moving", since: 0 }, null, () => line)).toBe(false); // armed, waiting
+      expect(moveFailed(S, undefined, null, () => line)).toBe(failed);
+    }
+    // Reaching cloud forgets the run.
+    resetCommandState();
+    const { exits, deps } = harness();
+    const c = await cmd();
+    await drainCommands(cfg(), { ...deps, take: () => [c] });
+    exits[0](0);
+    expect(moveFailed(S, { state: "cloud", since: 0 }, null, () => "FAILED: x")).toBe(false);
+    expect(moveRuns.has(S)).toBe(false);
+  });
+
+  test("move-failed rides the blob's `cloud` key like any other state", () => {
+    expect(withCloudKey({ status: "done", title: "t" }, "move-failed")).toEqual({ status: "done", title: "t", cloud: "move-failed" });
   });
 });

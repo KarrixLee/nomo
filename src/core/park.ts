@@ -112,7 +112,7 @@ export const NOMO_COMMAND = "/nomo-cc:";
 
 /** Merge stamp fields into the CURRENT marker (re-read, so a state written meanwhile, e.g. "landing" by
  *  --back, is never downgraded by a hook holding an older copy). */
-function stamp(id: string, fields: Partial<Park>, dir: string): void {
+export function stamp(id: string, fields: Partial<Park>, dir = PARK_DIR): void {
   const cur = readPark(id, dir);
   if (cur) writePark(id, { ...cur, ...fields }, dir);
 }
@@ -167,16 +167,17 @@ export function cloudActive(id: string, path = `${CC_DIR}/cloud.json`): boolean 
 /** A phone-started `--back` for one session, as the watchdog tracks it (in memory). */
 export interface BackRun { running: boolean; code?: number | null }
 
-/** The blob's `cloud` key: what the phone shows for a parked session. Undefined → no key. */
-export type CloudState = "moving" | "cloud" | "returning" | "failed" | "back";
-export function cloudState(p: Park | undefined, run?: BackRun, locked = false): CloudState | undefined {
+/** The blob's `cloud` key: what the phone shows for a parked session. Undefined → no key.
+ *  "move-failed" (NOM-94, appended): a phone-started move-to-cloud did not happen; no marker is left. */
+export type CloudState = "moving" | "cloud" | "returning" | "failed" | "back" | "move-failed";
+export function cloudState(p: Park | undefined, run?: BackRun, locked = false, moveFailed = false): CloudState | undefined {
   switch (p?.state) {
     case "moving": return "moving";
     case "landing": return "returning";
     case "back": return "back";
     case "cloud": return run?.running || locked ? "returning" : run && run.code !== 0 ? "failed" : "cloud";
   }
-  return undefined;
+  return !p && moveFailed ? "move-failed" : undefined;
 }
 
 /** A parked session the phone may act on keeps the command long-poll up. */

@@ -1124,7 +1124,10 @@ const INTERRUPT_COMMAND_KIND = "interrupt-session";
 const PING_COMMAND_KIND = "ping";
 /** NOM-93: run `/nomo-cc:back` for a session parked in the cloud, from the phone. */
 export const BRING_BACK_COMMAND_KIND = "bring-back";
-const COMMAND_KINDS_ALLOWED = new Set(["focus-terminal", INTERRUPT_COMMAND_KIND, PING_COMMAND_KIND, BRING_BACK_COMMAND_KIND]);
+/** NOM-94: run `/nomo-cc:handoff` for a Claude Code session on this Mac, from the phone. No user text:
+ *  the payload is the usual {kind, sessionId, ts, nonce} (parseCommandPayload drops anything else). */
+export const MOVE_TO_CLOUD_COMMAND_KIND = "move-to-cloud";
+const COMMAND_KINDS_ALLOWED = new Set(["focus-terminal", INTERRUPT_COMMAND_KIND, PING_COMMAND_KIND, BRING_BACK_COMMAND_KIND, MOVE_TO_CLOUD_COMMAND_KIND]);
 
 /** A "Delivery" latency ping: {"kind":"ping","sessionId":"-","nonce":"<uuid>","sentAt":<ms>}. It names
  *  no session and carries `sentAt` instead of `ts`, so drainCommands answers it right after the tag
@@ -1245,6 +1248,7 @@ export function resetCommandState(): void {
   executedCommandIds.clear();
   seenCommandNonces.clear();
   backRuns.clear();
+  moveRuns.clear();
 }
 
 /** What a command ended up doing — the ONLY debugging channel a user has for this feature, so every
@@ -1276,7 +1280,11 @@ export type FocusTraceResult =
   | "not-parked"         // bring-back: no "cloud" park marker, or cloud.json does not list it active
   | "back-running"       // bring-back: a phone-started back for this session is still running
   | "back-started"       // bring-back: handoff --back --phone spawned
-  | "back-spawn-failed"; // bring-back: the spawn threw (the row reports cloud:"failed")
+  | "back-spawn-failed"  // bring-back: the spawn threw (the row reports cloud:"failed")
+  | "move-refused"       // move-to-cloud: parked, already in the cloud, no cwd, or not a Claude Code session
+  | "move-running"       // move-to-cloud: a phone-started preflight for this session is still running
+  | "move-started"       // move-to-cloud: handoff --later --phone spawned
+  | "move-spawn-failed"; // move-to-cloud: the spawn threw (the row reports cloud:"move-failed")
 
 /** The module's generic best-effort trace, with the same argv guard tracePicker uses: pure unit calls run
  *  inside `bun test` with the production HOME visible and must never pollute the user's live trace. Named
@@ -1297,6 +1305,7 @@ function traceFocus(deps: { trace?: (event: object) => void }, event: object): v
 export interface DrainCommandsDeps {
   /** Bring-back seams (marker read, cloud.json, the spawn). */
   bringBack?: BringBackDeps;
+  moveToCloud?: MoveToCloudDeps;
   /** Take (and clear) the pending sealed commands. Defaults to draining the module buffer. */
   take?: () => SealedCommand[];
   /** Every session record on disk, id + record. Defaults to the sweep's own reader. */
@@ -1533,6 +1542,11 @@ export async function drainCommands(config: Config, deps: DrainCommandsDeps = {}
           traceFocus(deps, { ...base, result: "unknown-session" as FocusTraceResult });
           continue;
         }
+        // 7b. Move to cloud: needs the record (its cwd); handoff --phone runs every other gate.
+        if (payload.kind === MOVE_TO_CLOUD_COMMAND_KIND) {
+          traceFocus(deps, { ...base, result: moveToCloud(payload.sessionId, entry.rec, deps.moveToCloud) });
+          continue;
+        }
         // 8. Two taps for the same target in one batch raise the window once.
         const target = `${payload.kind}|${payload.sessionId}`;
         if (batchTargets.has(target)) {
@@ -1619,26 +1633,29 @@ export interface BringBackDeps {
   lockHeld?: (id: string) => boolean;
 }
 
-/** Detached `handoff --back --phone`, output to cloud-back/<id12>.log. The child loads its own keys
- *  (~/.nomo-spike.env) exactly as a terminal run does; nothing secret goes on argv. */
-function spawnBack(id: string, onExit: (code: number | null) => void): void {
+/** Detached `handoff <args>` for a phone command, output to cloud-back/<id12>.log. The child loads its
+ *  own keys (~/.nomo-spike.env) exactly as a terminal run does; nothing secret goes on argv. */
+function spawnHandoff(id: string, what: string, args: string[], cwd: string, onExit: (code: number | null) => void): void {
   mkdirSync(BACK_LOCK_DIR, { recursive: true, mode: 0o700 });
   const log = `${BACK_LOCK_DIR}/${id.slice(0, 12)}.log`;
   const note = (why: string): void => {
-    try { const f = openSync(log, "a", 0o600); try { writeSync(f, `[${new Date().toISOString()}] bring-back from the phone: ${why}\n`); } finally { closeSync(f); } } catch { /* best effort */ }
+    try { const f = openSync(log, "a", 0o600); try { writeSync(f, `[${new Date().toISOString()}] ${what} from the phone: ${why}\n`); } finally { closeSync(f); } } catch { /* best effort */ }
   };
   const cmd = handoffCommand();
-  if (!cmd) { note("Nomo's installed files were not found (plugin updated or removed?); reinstall or run /nomo-cc:back."); throw new Error("no handoff entry"); }
+  if (!cmd) { note("Nomo's installed files were not found (plugin updated or removed?); reinstall the nomo plugin."); throw new Error("no handoff entry"); }
   const fd = openSync(log, "a", 0o600);
   try {
     // The daemon may have inherited the session id of whichever Claude Code hook started it.
     const { CLAUDE_CODE_SESSION_ID: _drop, ...env } = process.env;
-    const child = spawn(cmd[0], [...cmd.slice(1), "--back", "--session", id, "--from-session", id, "--phone"],
-      { detached: true, stdio: ["ignore", fd, fd], env, cwd: homedir() });
+    const child = spawn(cmd[0], [...cmd.slice(1), ...args],
+      { detached: true, stdio: ["ignore", fd, fd], env, cwd });
     child.on("error", (e) => { note(`could not start ${cmd[0]}: ${e.message}`); onExit(1); }).on("exit", (code) => onExit(code));
     child.unref();
   } catch (e: any) { note(`could not start ${cmd[0]}: ${e?.message ?? e}`); throw e; } finally { closeSync(fd); }
 }
+
+const spawnBack = (id: string, onExit: (code: number | null) => void): void =>
+  spawnHandoff(id, "bring-back", ["--back", "--session", id, "--from-session", id, "--phone"], homedir(), onExit);
 
 /** Act on an authenticated, fresh, unreplayed bring-back. Only a session parked "cloud" AND listed
  *  active in cloud.json qualifies; one back per session at a time. */
@@ -1650,6 +1667,66 @@ export function bringBack(id: string, deps: BringBackDeps = {}): FocusTraceResul
   const done = (code: number | null): void => { if (run.running) { run.running = false; run.code = code; } };
   try { (deps.spawn ?? spawnBack)(id, done); } catch { done(1); return "back-spawn-failed"; }
   return "back-started";
+}
+
+// --- Move to cloud (NOM-94) ----------------------------------------------------------------------
+
+/** Phone-started moves, by session id. `failedAt` set = the row reads cloud:"move-failed" until the
+ *  session's next turn. In memory, like backRuns: a daemon restart forgets a failure. */
+export interface MoveRun { running: boolean; code?: number | null; failedAt?: number }
+export const moveRuns = new Map<string, MoveRun>();
+
+export interface MoveToCloudDeps {
+  readPark?: (id: string) => Park | undefined;
+  cloudActive?: (id: string) => boolean;
+  /** Start `handoff --later --phone` in `cwd`; call `onExit` once with its exit code. */
+  spawn?: (id: string, cwd: string, onExit: (code: number | null) => void) => void;
+  now?: () => number;
+}
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** Act on an authenticated, fresh, unreplayed move-to-cloud for a session this Mac tracks. Cheap gates
+ *  here (the rest, with the live process checks, run in handoff --phone); one run per session. */
+export function moveToCloud(id: string, rec: SessionRecord, deps: MoveToCloudDeps = {}): FocusTraceResult {
+  if (!UUID_RE.test(id) || typeof rec.cwd !== "string" || !rec.cwd || (rec.agent ?? "claude") !== "claude" || rec.provisional === true ||
+    (deps.readPark ?? readPark)(id) || (deps.cloudActive ?? cloudActive)(id)) return "move-refused";
+  if (moveRuns.get(id)?.running) return "move-running";
+  const run: MoveRun = { running: true };
+  moveRuns.set(id, run);
+  const done = (code: number | null): void => {
+    if (!run.running) return;
+    run.running = false; run.code = code;
+    if (code !== 0) run.failedAt = (deps.now ?? Date.now)();
+  };
+  const cwd = rec.cwd;
+  try {
+    (deps.spawn ?? ((s: string, c: string, e: (code: number | null) => void) =>
+      spawnHandoff(s, "move-to-cloud", ["--later", "--phone", "--session", s], c, e)))(id, cwd, done);
+  } catch { done(1); return "move-spawn-failed"; }
+  return "move-started";
+}
+
+/** The last line of the /nomo-cc:handoff helper's log (handoff-later.ts LATER_LOG). */
+function laterLogLastLine(): string {
+  // == handoff-later.ts LATER_LOG (not imported: the bundle would inline all of that module).
+  try { return readFileSync(`${CC_DIR}/handoff.log`, "utf8").trimEnd().split("\n").pop() ?? ""; } catch { return ""; }
+}
+
+/** Per sweep: is this session's phone-started move a failure the row should show? A successful
+ *  preflight left a "moving" marker; that marker gone without reaching any other state, with the
+ *  helper's last log line FAILED:/CANCELLED, is a failure. Any later park state, or a turn started
+ *  after the failure, forgets the run. */
+export function moveFailed(id: string, park: Park | undefined, rec: SessionRecord | null, lastLine: () => string = laterLogLastLine): boolean {
+  const m = moveRuns.get(id);
+  if (!m) return false;
+  if (park && park.state !== "moving") { moveRuns.delete(id); return false; }
+  if (!m.failedAt && !m.running && m.code === 0 && !park) {
+    if (/^(\[[^\]]*\]\s*)?(FAILED|CANCELLED)\b/.test(lastLine())) m.failedAt = Date.now();
+    else { moveRuns.delete(id); return false; }
+  }
+  if (m.failedAt && typeof rec?.turnStartedAt === "number" && rec.turnStartedAt * 1000 > m.failedAt) { moveRuns.delete(id); return false; }
+  return !!m.failedAt && !park;
 }
 
 /** The blob with `cloud` set (or removed), the key LAST, after plan/dbg. Budgeted like every blob,
@@ -3843,7 +3920,7 @@ async function sweep(config: Config | null, deps: SweepDeps = {}): Promise<Sweep
       if (config && record && !pendingDoneHandled) {
         // NOM-93: a parked session's blob carries `cloud` (what the phone's Bring back shows). A
         // corrective owns the session this sweep (the snapshot is stale after its rewrite).
-        const cloudFix = await correctCloudState(config, path, sessionId, record, cloudState(park, backRuns.get(sessionId), park?.state === "cloud" && backLockHolder(sessionId) !== undefined));
+        const cloudFix = await correctCloudState(config, path, sessionId, record, cloudState(park, backRuns.get(sessionId), park?.state === "cloud" && backLockHolder(sessionId) !== undefined, moveFailed(sessionId, park, record)));
         if (cloudFix === "revoked") return { revoked: true };
         if (cloudFix === "corrected") { delivered = true; continue; }
         // Idle-provisional corrective FIRST: a discovery row advertised "working" whose TUI has gone
