@@ -364,10 +364,14 @@ function denyLine(agent: AgentKind, message?: unknown): string {
   return decisionLine(agent, { hookEventName: "PermissionRequest", decision: { behavior: "deny", message: m } });
 }
 
-/** Allow + a session-scoped always-allow rule. CC's own `permission_suggestions` (already narrowly
- *  scoped — e.g. `Bash(bun test:*)`) are applied VERBATIM when present; otherwise a whole-tool session
- *  rule. `destination: "session"` ONLY — an over-broad grant dies with the session, never persisted to
- *  disk.
+/** Allow + a session-scoped always-allow grant. CC's own `permission_suggestions` (already narrowly
+ *  scoped — e.g. `Bash(bun test:*)`, or "allow this directory" for a Read outside the workspace) are used
+ *  when present, each FORCED to `destination: "session"` (NOM-124): CC builds Bash-prefix suggestions with
+ *  `localSettings`, which would persist the rule to `<project>/.claude/settings.local.json` beyond the
+ *  "(this session)" grant the phone shows. Kept: allow `addRules`, `addDirectories`, and `setMode` except
+ *  `bypassPermissions`/`dontAsk`; everything else is dropped. The whole-tool session rule is used ONLY when
+ *  CC offered no suggestions at all (HEAD behaviour) — NEVER after filtering removed something, because
+ *  bare `Read` is broader than the directory CC asked about; if nothing survives it is a plain allow.
  *
  *  CODEX COMPATIBILITY: Codex currently reserves `updatedPermissions` and rejects the ENTIRE hook
  *  decision when that field is present. A stale phone build may still offer "Always allow" for a Codex
@@ -376,10 +380,27 @@ function denyLine(agent: AgentKind, message?: unknown): string {
  *  the encrypted `agent:"codex"` blob field and hides the unsupported persistent option. */
 function allowAlwaysLine(agent: AgentKind, toolName: string, toolInput: Record<string, unknown>, suggestions: unknown): string {
   if (agent === "codex") return allowLine(agent, toolName, toolInput);
-  const updatedPermissions = Array.isArray(suggestions) && suggestions.length > 0
-    ? suggestions
-    : [{ type: "addRules", rules: [{ toolName }], behavior: "allow", destination: "session" }];
-  return allowWithPermissionsLine(agent, toolName, toolInput, updatedPermissions);
+  if (!Array.isArray(suggestions) || suggestions.length === 0) {
+    return allowWithPermissionsLine(agent, toolName, toolInput,
+      [{ type: "addRules", rules: [{ toolName }], behavior: "allow", destination: "session" }]);
+  }
+  const scoped = sessionScopedSuggestions(suggestions);
+  return scoped.length > 0 ? allowWithPermissionsLine(agent, toolName, toolInput, scoped) : allowLine(agent, toolName, toolInput);
+}
+
+/** CC's suggestions narrowed (see allowAlwaysLine) and re-scoped to the session (NOM-124). Exported for tests. */
+export function sessionScopedSuggestions(suggestions: unknown): Record<string, unknown>[] {
+  if (!Array.isArray(suggestions)) return [];
+  const nonEmpty = (v: unknown): boolean => Array.isArray(v) && v.length > 0;
+  return suggestions
+    .filter((s): s is Record<string, unknown> => {
+      if (!s || typeof s !== "object") return false;
+      if (s.type === "addRules") return s.behavior === "allow" && nonEmpty(s.rules);
+      if (s.type === "addDirectories") return nonEmpty(s.directories);
+      if (s.type === "setMode") return typeof s.mode === "string" && s.mode !== "bypassPermissions" && s.mode !== "dontAsk";
+      return false;
+    })
+    .map((s) => ({ ...s, destination: "session" }));
 }
 
 /** Allow carrying `updatedPermissions`. ExitPlanMode needs the same updatedInput echo as the plain
@@ -1572,7 +1593,7 @@ export async function runPermissionHook(
       ? (input.tool_input as Record<string, unknown>)
       : {};
     // CC's own narrowly-scoped rule suggestions (present on the PermissionRequest when it has them);
-    // passed through VERBATIM by allowAlwaysLine on an always-allow answer. Absent → whole-tool rule.
+    // narrowed + forced to destination:session by allowAlwaysLine on an always-allow answer. Absent → whole-tool rule.
     const suggestions = input.permission_suggestions;
     const requestId = (deps.randomUUID ?? (() => crypto.randomUUID()))();
     const summary = buildPermissionSummary(toolName, toolInput);

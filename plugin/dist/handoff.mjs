@@ -506,6 +506,12 @@ function boxPairedCached(now = Date.now()) {
     boxMemo = { at: now, v: boxPaired() };
   return boxMemo.v;
 }
+function runtimeArgs(runtime, args) {
+  return /^bun/.test(runtime.slice(runtime.lastIndexOf("/") + 1)) ? ["--config=/dev/null", "--env-file=/dev/null", ...args] : args;
+}
+function sidField(sessionId) {
+  return typeof sessionId === "string" && sessionId.length > 0 ? { sid: sessionId } : {};
+}
 function appendFittedPlanAndDebug(base, plan, dbg) {
   const withBox = base.agent === undefined && boxPairedCached() ? { ...base, box: true } : base;
   const withPlan = appendFittedPlan(withBox, plan);
@@ -733,6 +739,7 @@ function opencodeStubPaths() {
 function opencodeStubTarget(text) {
   return /^export \{ default \} from "(.+)";$/m.exec(text)?.[1];
 }
+var REMOTE_IS_OURS = /^(https:\/\/github\.com\/|ssh:\/\/git@github\.com\/|git@github\.com:)KarrixLee\/nomo(\.git)?\/?$/i;
 var FOLDER_KEY_HEX_CHARS = 12;
 var BRANCH_MAX_CHARS = 60;
 var GIT_DIR_WALK_MAX_DEPTH = 64;
@@ -1140,7 +1147,7 @@ function ensureWatchdog(deps = {}) {
     const killPid = deps.killPid ?? ((pid, signal) => process.kill(pid, signal));
     const spawnWatchdog = deps.spawnWatchdog ?? (() => {
       const runtime = process.env.NOMO_RUNTIME && process.env.NOMO_RUNTIME.length > 0 ? process.env.NOMO_RUNTIME : process.execPath;
-      spawn(runtime, [WATCHDOG_PATH], { detached: true, stdio: "ignore" }).unref();
+      spawn(runtime, runtimeArgs(runtime, [WATCHDOG_PATH]), { detached: true, stdio: "ignore" }).unref();
     });
     const raw = readPidfile();
     const holder = typeof raw === "string" ? parseWatchdogPidfile(raw) : null;
@@ -5400,6 +5407,42 @@ function takePairUrl(stdout) {
 `);
   return { url, rest };
 }
+function boxPairUrlProblem(url, worker) {
+  let u;
+  try {
+    u = new URL(url);
+  } catch {
+    return "it is not a valid link";
+  }
+  if (u.protocol !== "nomo:" || u.host !== "pair" || u.pathname !== "")
+    return "it is not a nomo://pair link";
+  const q = u.searchParams;
+  const keys = [...q.keys()];
+  if (new Set(keys).size !== keys.length || keys.some((k) => !["v", "u", "p", "s", "e"].includes(k)))
+    return "it carries unexpected fields";
+  const b64 = (v, bytes) => {
+    if (!v || !/^[A-Za-z0-9_-]+$/.test(v))
+      return false;
+    try {
+      return fromB64url(v).length === bytes;
+    } catch {
+      return false;
+    }
+  };
+  if (q.get("v") !== "1" || !/^[0-9a-f]{32}$/.test(q.get("p") ?? "") || !b64(q.get("s"), 16) || !b64(q.get("e"), 65)) {
+    return "it is malformed";
+  }
+  let target = DEFAULT_WORKER_URL;
+  const raw = q.get("u");
+  if (raw !== null) {
+    try {
+      target = new TextDecoder("utf-8", { fatal: true }).decode(fromB64url(raw));
+    } catch {
+      return "its worker is unreadable";
+    }
+  }
+  return target === worker ? null : `it points at ${JSON.stringify(target)}, not your worker ${worker}`;
+}
 function pluginRoot() {
   const up2 = dirname3(dirname3(fileURLToPath2(import.meta.url)));
   return existsSync6(join7(up2, ".claude-plugin", "plugin.json")) ? up2 : join7(dirname3(up2), "plugin");
@@ -6297,8 +6340,15 @@ The box was paired to ${old[1] || "another worker"}; pairing it again to the tar
     console.log(`
 Nomo pairing on the box failed: ${failed[1]}
 Retry with: bun plugin/dist/handoff.mjs --pair`);
-  if (url)
-    await showPairing(omg, id, url, worker);
+  if (!url || paired)
+    return;
+  const problem = boxPairUrlProblem(url, worker);
+  if (problem) {
+    console.log(`
+Refusing the box's pairing link: ${problem}. Not showing a QR. If the box is not yours or was tampered with, delete it; otherwise retry with: bun plugin/dist/handoff.mjs --pair`);
+    return;
+  }
+  await showPairing(omg, id, url, worker);
 }
 var BACK = "/tmp/nomo-back";
 var BACK_FILES = ["repo.bundle", "wip.patch", "untracked.tgz", "project.tgz", "folder.tgz"];
@@ -6831,7 +6881,7 @@ function arm(session, claudePid, cwd, message, worker, anyway) {
   }
   writePark(session, { state: "moving", pid: claudePid });
   const fd = openSync3(LATER_LOG, "w", 384);
-  const child = spawn2(process.execPath, [SELF, "--after-exit", "--session", session, "--claude-pid", String(claudePid), "--worker", worker], { cwd, detached: true, stdio: ["ignore", fd, fd] });
+  const child = spawn2(process.execPath, runtimeArgs(process.execPath, [SELF, "--after-exit", "--session", session, "--claude-pid", String(claudePid), "--worker", worker]), { cwd, detached: true, stdio: ["ignore", fd, fd] });
   child.unref();
   writeFileSync4(PENDING_PATH, JSON.stringify({ ...p, helperPid: child.pid }) + `
 `, { mode: 384 });
@@ -6910,7 +6960,7 @@ async function afterExit(args, worker) {
       });
       if (!argv)
         return rej(new Error(GONE_MSG));
-      spawn2(argv[0], argv.slice(1), { stdio: "inherit", env: { ...process.env, NOMO_HANDOFF_HELPER: "1", ...message ? { NOMO_THEN: message } : {} } }).on("exit", (c) => res(c ?? 1)).on("error", () => res(1));
+      spawn2(argv[0], runtimeArgs(argv[0], argv.slice(1)), { stdio: "inherit", env: { ...process.env, NOMO_HANDOFF_HELPER: "1", ...message ? { NOMO_THEN: message } : {} } }).on("exit", (c) => res(c ?? 1)).on("error", () => res(1));
     }),
     log: (line) => console.log(`[${new Date().toISOString()}] ${line}`),
     notify: (text) => {
@@ -7267,6 +7317,7 @@ export {
   boxHeadScript,
   boxHealth,
   boxPairPayload,
+  boxPairUrlProblem,
   boxPrelude,
   boxSetup,
   build,

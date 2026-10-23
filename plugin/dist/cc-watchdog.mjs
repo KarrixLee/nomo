@@ -239,6 +239,12 @@ function boxPairedCached(now = Date.now()) {
     boxMemo = { at: now, v: boxPaired() };
   return boxMemo.v;
 }
+function runtimeArgs(runtime, args) {
+  return /^bun/.test(runtime.slice(runtime.lastIndexOf("/") + 1)) ? ["--config=/dev/null", "--env-file=/dev/null", ...args] : args;
+}
+function sidField(sessionId) {
+  return typeof sessionId === "string" && sessionId.length > 0 ? { sid: sessionId } : {};
+}
 function appendFittedPlanAndDebug(base, plan, dbg) {
   const withBox = base.agent === undefined && boxPairedCached() ? { ...base, box: true } : base;
   const withPlan = appendFittedPlan(withBox, plan);
@@ -466,6 +472,7 @@ function opencodeStubPaths() {
 function opencodeStubTarget(text) {
   return /^export \{ default \} from "(.+)";$/m.exec(text)?.[1];
 }
+var REMOTE_IS_OURS = /^(https:\/\/github\.com\/|ssh:\/\/git@github\.com\/|git@github\.com:)KarrixLee\/nomo(\.git)?\/?$/i;
 var FOLDER_KEY_HEX_CHARS = 12;
 var BRANCH_MAX_CHARS = 60;
 var GIT_DIR_WALK_MAX_DEPTH = 64;
@@ -873,7 +880,7 @@ function ensureWatchdog(deps = {}) {
     const killPid = deps.killPid ?? ((pid, signal) => process.kill(pid, signal));
     const spawnWatchdog = deps.spawnWatchdog ?? (() => {
       const runtime = process.env.NOMO_RUNTIME && process.env.NOMO_RUNTIME.length > 0 ? process.env.NOMO_RUNTIME : process.execPath;
-      spawn(runtime, [WATCHDOG_PATH], { detached: true, stdio: "ignore" }).unref();
+      spawn(runtime, runtimeArgs(runtime, [WATCHDOG_PATH]), { detached: true, stdio: "ignore" }).unref();
     });
     const raw = readPidfile();
     const holder = typeof raw === "string" ? parseWatchdogPidfile(raw) : null;
@@ -4047,7 +4054,7 @@ function ccOpinion(file, join, now) {
 }
 var finite = (value) => typeof value === "number" && Number.isFinite(value);
 var filled = (value) => typeof value === "string" && value.length > 0;
-function buildStatePlaintext(record, status, at, titleFallback) {
+function buildStatePlaintext(record, status, at, titleFallback, sessionId) {
   const agent = record.agent ?? "claude";
   const branch = sessionBranch(record);
   const base = {
@@ -4060,7 +4067,8 @@ function buildStatePlaintext(record, status, at, titleFallback) {
     ...filled(record.model) ? { model: record.model } : {},
     at: Math.floor(at / 1000),
     ...filled(record.folderKey) ? { folderKey: record.folderKey } : {},
-    ...branch ? { branch } : {}
+    ...branch ? { branch } : {},
+    ...sidField(sessionId)
   };
   const dbg = agent === "codex" ? formatPlanPickerDebug({
     event: status === "done" ? "done" : "working",
@@ -4112,7 +4120,7 @@ function computeSessionState(input) {
   if (recordDone) {
     const heldBack = opinion?.status === "busy" && opinion.statusUpdatedAt > ts;
     if (!heldBack) {
-      return of("done", opinion?.status === "idle" ? "done+cc" : suffix("done"), { kind: "plain", value: buildStatePlaintext(record, "done", ts, opinion?.name) }, ts, false);
+      return of("done", opinion?.status === "idle" ? "done+cc" : suffix("done"), { kind: "plain", value: buildStatePlaintext(record, "done", ts, opinion?.name, sessionId) }, ts, false);
     }
   }
   if (stateHoldLive(hold, holdPidAlive, now)) {
@@ -4128,14 +4136,14 @@ function computeSessionState(input) {
     };
   }
   if (!recordDone && opinion?.status === "idle" && record.prio !== 1 && record.lastEvent !== "needsAttention" && opinion.statusUpdatedAt > ts + CC_IDLE_DONE_GRACE_MS) {
-    return of("done", "done+cc", { kind: "plain", value: buildStatePlaintext(record, "done", opinion.statusUpdatedAt, opinion.name) }, ts, false);
+    return of("done", "done+cc", { kind: "plain", value: buildStatePlaintext(record, "done", opinion.statusUpdatedAt, opinion.name, sessionId) }, ts, false);
   }
   if (record.prio === 1) {
     const why = finite(record.attentionStalledAt) ? "attn/net" : "attn";
     return { ...of("needsAttention", why, sealed, ts, false), ...asking };
   }
   const busy = opinion?.status === "busy" && opinion.statusUpdatedAt > ts;
-  return of("working", busy ? "work+cc" : suffix("work"), recordDone ? { kind: "plain", value: buildStatePlaintext(record, "working", opinion?.statusUpdatedAt ?? ts, opinion?.name) } : sealed, ts, false);
+  return of("working", busy ? "work+cc" : suffix("work"), recordDone ? { kind: "plain", value: buildStatePlaintext(record, "working", opinion?.statusUpdatedAt ?? ts, opinion?.name, sessionId) } : sealed, ts, false);
 }
 
 // src/core/lan-frames.ts
@@ -5830,7 +5838,8 @@ function buildBlob(input, machine, title, plan, agent = "claude", turnStartedAt,
     ...typeof model === "string" && model.length > 0 ? { model } : {},
     ...typeof at === "number" && Number.isFinite(at) ? { at } : {},
     ...folderKey ? { folderKey } : {},
-    ...branch ? { branch } : {}
+    ...branch ? { branch } : {},
+    ...sidField(input.session_id)
   };
   const dbg = agent === "codex" ? dbgOverride ?? formatPlanPickerDebug({
     event: hookName || "event",
@@ -6530,8 +6539,27 @@ function denyLine(agent, message) {
 function allowAlwaysLine(agent, toolName, toolInput, suggestions) {
   if (agent === "codex")
     return allowLine(agent, toolName, toolInput);
-  const updatedPermissions = Array.isArray(suggestions) && suggestions.length > 0 ? suggestions : [{ type: "addRules", rules: [{ toolName }], behavior: "allow", destination: "session" }];
-  return allowWithPermissionsLine(agent, toolName, toolInput, updatedPermissions);
+  if (!Array.isArray(suggestions) || suggestions.length === 0) {
+    return allowWithPermissionsLine(agent, toolName, toolInput, [{ type: "addRules", rules: [{ toolName }], behavior: "allow", destination: "session" }]);
+  }
+  const scoped = sessionScopedSuggestions(suggestions);
+  return scoped.length > 0 ? allowWithPermissionsLine(agent, toolName, toolInput, scoped) : allowLine(agent, toolName, toolInput);
+}
+function sessionScopedSuggestions(suggestions) {
+  if (!Array.isArray(suggestions))
+    return [];
+  const nonEmpty = (v) => Array.isArray(v) && v.length > 0;
+  return suggestions.filter((s) => {
+    if (!s || typeof s !== "object")
+      return false;
+    if (s.type === "addRules")
+      return s.behavior === "allow" && nonEmpty(s.rules);
+    if (s.type === "addDirectories")
+      return nonEmpty(s.directories);
+    if (s.type === "setMode")
+      return typeof s.mode === "string" && s.mode !== "bypassPermissions" && s.mode !== "dontAsk";
+    return false;
+  }).map((s) => ({ ...s, destination: "session" }));
 }
 function allowWithPermissionsLine(agent, toolName, toolInput, updatedPermissions) {
   const decision = toolName === "ExitPlanMode" ? { behavior: "allow", updatedInput: toolInput, updatedPermissions } : { behavior: "allow", updatedPermissions };
@@ -7630,7 +7658,8 @@ function baseBlob(request, record, config, now) {
     ...typeof record.model === "string" && record.model.length > 0 ? { model: record.model } : {},
     at: Math.floor(now / 1000),
     ...typeof record.folderKey === "string" && record.folderKey.length > 0 ? { folderKey: record.folderKey } : {},
-    ...branch ? { branch } : {}
+    ...branch ? { branch } : {},
+    ...sidField(request.identity.threadId)
   };
 }
 function requestSignal(ms, signal) {
@@ -8268,7 +8297,8 @@ async function buildDoneEnvelope(sessionId, record, now, e2eKey, agent = "claude
     ...typeof record.model === "string" && record.model.length > 0 ? { model: record.model } : {},
     ...typeof at === "number" && Number.isFinite(at) ? { at } : {},
     ...typeof record.folderKey === "string" && record.folderKey.length > 0 ? { folderKey: record.folderKey } : {},
-    ...branch ? { branch } : {}
+    ...branch ? { branch } : {},
+    ...sidField(sessionId)
   };
   const debug = appendCodexBridgeMarker(agent === "codex" ? dbg ?? formatPlanPickerDebug({ event: "done", classifier: "done", marker: "0", by: "wd" }) : undefined, codexBridgeIsDown());
   const fitted = appendFittedPlanAndDebug(base, ambientPlan(agent, record), debug);
@@ -8288,7 +8318,8 @@ async function buildNeedsAttentionEnvelope(sessionId, record, now, e2eKey, agent
     ...typeof record.model === "string" && record.model.length > 0 ? { model: record.model } : {},
     ...typeof at === "number" && Number.isFinite(at) ? { at } : {},
     ...typeof record.folderKey === "string" && record.folderKey.length > 0 ? { folderKey: record.folderKey } : {},
-    ...branch ? { branch } : {}
+    ...branch ? { branch } : {},
+    ...sidField(sessionId)
   };
   const debug = appendCodexBridgeMarker(agent === "codex" ? dbg ?? formatPlanPickerDebug({ event: "attention", classifier: "pending", marker: "0", by: "wd" }) : undefined, codexBridgeIsDown());
   const blob = await encryptBlob(e2eKey, appendFittedPlanAndDebug(base, proposedPlan, debug));
@@ -8315,7 +8346,8 @@ async function buildWorkingEnvelope(sessionId, record, now, e2eKey, agent = "cla
     ...typeof record.model === "string" && record.model.length > 0 ? { model: record.model } : {},
     at: Math.floor(now / 1000),
     ...typeof record.folderKey === "string" && record.folderKey.length > 0 ? { folderKey: record.folderKey } : {},
-    ...branch ? { branch } : {}
+    ...branch ? { branch } : {},
+    ...sidField(sessionId)
   };
   const debug = appendCodexBridgeMarker(agent === "codex" ? dbg ?? formatPlanPickerDebug({ event: "working", classifier: "resolved", marker: "0", by: "wd" }) : undefined, codexBridgeIsDown());
   const blob = await encryptBlob(e2eKey, appendFittedPlanAndDebug(base, ambientPlan(agent, record), debug));
@@ -9123,7 +9155,7 @@ function spawnHandoff(id, what, args, cwd, onExit, timeoutMs) {
   const fd = openSync(log, "a", 384);
   try {
     const { CLAUDE_CODE_SESSION_ID: _drop, ...env } = process.env;
-    const child = spawn3(cmd[0], [...cmd.slice(1), ...args], { detached: true, stdio: ["ignore", fd, fd], env, cwd });
+    const child = spawn3(cmd[0], runtimeArgs(cmd[0], [...cmd.slice(1), ...args]), { detached: true, stdio: ["ignore", fd, fd], env, cwd });
     const timer = timeoutMs ? setTimeout(() => {
       note(`still running after ${Math.round(timeoutMs / 1000)} s; stopped it`);
       try {
@@ -9279,7 +9311,7 @@ async function correctCloudState(config, path, sessionId, record, want, deps = {
       return "uncorrected";
     if (!changed && (want === undefined || prev?.ok && now - prev.at < CLOUD_KEEPALIVE_MS))
       return "uncorrected";
-    const base = done && changed ? buildStatePlaintext(record, "done", typeof record.ts === "number" ? record.ts : now) : plain;
+    const base = done && changed ? buildStatePlaintext(record, "done", typeof record.ts === "number" ? record.ts : now, undefined, sessionId) : plain;
     const blob = changed ? await encryptBlob(config.e2eKey, withCloudKey(base, want, extra)) : record.blob;
     const outcome = await (deps.post ?? ((body) => postEvent(config, body)))({ v: 2, sessionId, op: done ? "done" : record.op ?? "update", prio: done ? 0 : record.prio ?? 0, ts: now, blob, ...startedAtField(record) });
     cloudPosts.set(sessionId, { at: now, ok: outcome === "delivered" });
@@ -9496,7 +9528,8 @@ async function buildProvisionalBlob(d, machine, blobAgentFields, e2eKey, at) {
     ...blobAgentFields,
     ...typeof at === "number" && Number.isFinite(at) ? { at } : {},
     ...typeof d.folderKey === "string" && d.folderKey.length > 0 ? { folderKey: d.folderKey } : {},
-    ...branch ? { branch } : {}
+    ...branch ? { branch } : {},
+    ...sidField(d.sessionId)
   };
   const dbg = appendCodexBridgeMarker(blobAgentFields.agent === "codex" ? formatPlanPickerDebug({
     event: "discover",
@@ -10161,7 +10194,8 @@ async function buildTitleRepairEnvelope(sessionId, record, title, now, e2eKey, a
     ...typeof record.model === "string" && record.model.length > 0 ? { model: record.model } : {},
     ...typeof at === "number" && Number.isFinite(at) ? { at } : {},
     ...typeof record.folderKey === "string" && record.folderKey.length > 0 ? { folderKey: record.folderKey } : {},
-    ...branch ? { branch } : {}
+    ...branch ? { branch } : {},
+    ...sidField(sessionId)
   };
   const dbg = appendCodexBridgeMarker(agent === "codex" ? record.dbg ?? formatPlanPickerDebug({
     event: "title",

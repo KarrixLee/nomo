@@ -797,7 +797,7 @@ describe("buildDoneEnvelope (interrupt corrective → v2 op:done + encrypted blo
   test("is a v2 done envelope whose blob decrypts to a done status carrying the record's machine/label", async () => {
     const e = await buildDoneEnvelope("sess-9", rec({ machine: "Mac", label: "api-status" }), 1_700_000_000_000, KEY) as Record<string, unknown>;
     expect(e).toMatchObject({ v: 2, sessionId: "sess-9", op: "done", prio: 0, ts: 1_700_000_000_000 });
-    expect(await decryptBlob(KEY, e.blob as string)).toEqual({ status: "done", title: "", machine: "Mac", label: "api-status" });
+    expect(await decryptBlob(KEY, e.blob as string)).toEqual({ status: "done", title: "", machine: "Mac", label: "api-status", sid: "sess-9" });
   });
   test("coerces a corrupt-but-parsed record's missing machine/label to empty strings", async () => {
     const bad = { pid: 1, ts: 1 } as unknown as SessionRecord;
@@ -970,7 +970,7 @@ describe("branch in the watchdog's rebuilt blobs", () => {
     ];
     for (const blob of frames) {
       expect(blob.branch).toBe("feat/hybrid-lan");
-      expect(Object.keys(blob).slice(-2)).toEqual(["folderKey", "branch"]);
+      expect(Object.keys(blob).slice(-3)).toEqual(["folderKey", "branch", "sid"]);
       expect(JSON.stringify(blob)).not.toContain(cwd); // the path itself never rides
     }
   });
@@ -980,7 +980,7 @@ describe("branch in the watchdog's rebuilt blobs", () => {
     const env = await buildDoneEnvelope("s", r, 5_000, KEY, "claude", 5);
     const blob = await decryptBlob(KEY, (env as { blob: string }).blob) as Record<string, unknown>;
     expect(blob).not.toHaveProperty("branch");
-    expect(Object.keys(blob).at(-1)).toBe("folderKey");
+    expect(Object.keys(blob).slice(-2)).toEqual(["folderKey", "sid"]);
   });
 
   test("RE-READ, not restamped: a checkout since the last hook shows up in the next corrective", async () => {
@@ -998,7 +998,7 @@ describe("branch in the watchdog's rebuilt blobs", () => {
     const d = disc({ cwd });
     const blob = await decryptBlob(KEY, await buildProvisionalBlob(d, "Mac", {}, KEY, 5)) as Record<string, unknown>;
     expect(blob.branch).toBe("dev");
-    expect(Object.keys(blob).at(-1)).toBe("branch"); // after `at`/`folderKey`, both absent for this fixture
+    expect(Object.keys(blob).slice(-2)).toEqual(["branch", "sid"]); // after `at`/`folderKey`, both absent for this fixture
     // The record pins cwd + the resolved git dir, so every later corrective rebuilt from it re-reads
     // HEAD directly instead of walking the tree again.
     const r = buildProvisionalRecord(d, "Mac", "BLOB", {}, 4242);
@@ -1723,7 +1723,7 @@ describe("buildNeedsAttentionEnvelope (dropped-hook corrective → same envelope
     const e = await buildNeedsAttentionEnvelope("sess-7", rec({ machine: "Mac", label: "api-status" }), 1_700_000_000_000, KEY) as Record<string, unknown>;
     // op/prio/status EXACTLY mirror hook.ts planOp("PermissionRequest") + buildBlob.
     expect(e).toMatchObject({ v: 2, sessionId: "sess-7", op: "update", prio: 1, ts: 1_700_000_000_000 });
-    expect(await decryptBlob(KEY, e.blob as string)).toEqual({ status: "needsAttention", title: "", machine: "Mac", label: "api-status" });
+    expect(await decryptBlob(KEY, e.blob as string)).toEqual({ status: "needsAttention", title: "", machine: "Mac", label: "api-status", sid: "sess-7" });
   });
   test("coerces a corrupt-but-parsed record's missing machine/label to empty strings", async () => {
     const bad = { pid: 1, ts: 1 } as unknown as SessionRecord;

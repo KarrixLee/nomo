@@ -402,7 +402,7 @@ describe("startCodexRemoteInput", () => {
       expect(prompt.branch).toBe("feat/hybrid-lan");
       const keys = Object.keys(prompt);
       const firstPermission = keys.findIndex((k) => k.startsWith("permission"));
-      expect(keys.slice(firstPermission - 2, firstPermission)).toEqual(["folderKey", "branch"]);
+      expect(keys.slice(firstPermission - 3, firstPermission)).toEqual(["folderKey", "branch", "sid"]);
       // The pinned ABSOLUTE cwd stays local — only the digest and the branch name cross the wire.
       expect(JSON.stringify(prompt)).not.toContain(cwd);
     } finally {

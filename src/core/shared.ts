@@ -267,6 +267,25 @@ export function boxPairedCached(now = Date.now()): boolean {
   return boxMemo.v;
 }
 
+/** NOM-133: argv for launching OUR runtime on a bundle. bun auto-loads <cwd>/bunfig.toml (`preload` =
+ *  code exec) and <cwd>/.env*, and our cwd is often the user's repo, so a bun runtime gets flags that
+ *  turn both off (verified bun 1.1.0–1.4.4). The cwd is never changed — version-manager shims pick the
+ *  runtime from it — and anything not named bun* (node, the hook shim, which reaches run.sh) is left
+ *  untouched. A DELIBERATE TWIN of run.sh's nomo_exec. */
+export function runtimeArgs(runtime: string, args: string[]): string[] {
+  return /^bun/.test(runtime.slice(runtime.lastIndexOf("/") + 1)) ? ["--config=/dev/null", "--env-file=/dev/null", ...args] : args;
+}
+
+/** NOM-125: the session's own id, sealed INSIDE its blob as `sid` so a blind relay cannot list one
+ *  session's authentic blob under another session's clear `sessionId` (the phone treats a blob whose
+ *  `sid` differs from its envelope's sessionId as unreadable; a blob WITHOUT `sid` — an older plugin —
+ *  stays readable). APPEND-LAST, OPTIONAL: every session-blob producer spreads this as the LAST base
+ *  key, right after `branch` (so it is inside the budgeted base, before box/plan/dbg/permission/cloud
+ *  tails), and omits it when the id is unknown — never empty. */
+export function sidField(sessionId: unknown): { sid?: string } {
+  return typeof sessionId === "string" && sessionId.length > 0 ? { sid: sessionId } : {};
+}
+
 /** Append optional `plan`, then optional `dbg` LAST. Budget precedence is intentional: build the
  *  best-fitting plan first, try the capped debug string on that complete shape, and drop `dbg` whole
  *  if it would overflow. Thus `dbg` is always the FIRST sacrifice; only then may plan be truncated or
@@ -762,6 +781,14 @@ export function opencodeStubPaths(): string[] {
 export function opencodeStubTarget(text: string): string | undefined {
   return /^export \{ default \} from "(.+)";$/m.exec(text)?.[1];
 }
+
+/** Does a `git remote get-url origin` output name EXACTLY our repo? Anchored at BOTH ends: the host must be
+ *  github.com (a substring/segment test also accepts `evil.example/KarrixLee/nomo`, a GitLab-style
+ *  `group/KarrixLee/nomo` subgroup, or `KarrixLee/nomo-evil`). The three spellings git writes are accepted —
+ *  `https://github.com/…`, `ssh://git@github.com/…` and scp-style `git@github.com:…` — each with an optional
+ *  `.git` and trailing slash. Case-insensitive, because GitHub owner/repo names are. bin/nomo-ai.mjs carries
+ *  the same pattern (it ships alone on npm and cannot import this); a test pins the two together. */
+export const REMOTE_IS_OURS = /^(https:\/\/github\.com\/|ssh:\/\/git@github\.com\/|git@github\.com:)KarrixLee\/nomo(\.git)?\/?$/i;
 
 // --- project-folder identity (the phone's session grouping) -------------------------------------
 
@@ -1911,7 +1938,7 @@ export function ensureWatchdog(deps: EnsureWatchdogDeps = {}): boolean {
       const runtime = process.env.NOMO_RUNTIME && process.env.NOMO_RUNTIME.length > 0
         ? process.env.NOMO_RUNTIME
         : process.execPath;
-      spawn(runtime, [WATCHDOG_PATH], { detached: true, stdio: "ignore" }).unref();
+      spawn(runtime, runtimeArgs(runtime, [WATCHDOG_PATH]), { detached: true, stdio: "ignore" }).unref(); // NOM-133
     });
     const raw = readPidfile();
     const holder = typeof raw === "string" ? parseWatchdogPidfile(raw) : null;
