@@ -564,6 +564,10 @@ grant ends with the session. It never widens CC's suggestion: the whole-tool rul
 `Read`) is used only when CC suggested nothing at all; if everything CC suggested was dropped, the
 tap is a one-time allow.
 
+**Shell cards keep the command.** The one-line description on a shell approval is written by the
+model, so Nomo treats it as a caption: it is kept short, and when the card runs out of room the
+description is dropped before the command is.
+
 ## Hooks on your computer — security
 
 - **Your project's runtime config is never loaded into Nomo's hooks.** Hooks run with your project as

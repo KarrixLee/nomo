@@ -3779,7 +3779,7 @@ function buildPermissionSummary(toolName, toolInput) {
     case "local_shell": {
       const desc = str(toolInput.description);
       if (desc)
-        return truncate(desc);
+        return capPermissionWireText(desc, 80);
       const cmd = str(toolInput.command);
       return cmd ? truncate(cmd.split(`
 `)[0]) : toolName;
@@ -4295,7 +4295,11 @@ async function runPermissionHook(deps = {}, agent = "claude") {
       permissionToolName: toolName
     };
     const rawDetail = deps.detail ?? buildPermissionDetail(toolName, toolInput);
-    const fitted = fitPermissionDetail(permissionBase, rawDetail, BLOB_FIT_CHARS, buildPermissionQuestions(toolInput));
+    let fitted = fitPermissionDetail(permissionBase, rawDetail, BLOB_FIT_CHARS, buildPermissionQuestions(toolInput));
+    if (fitted.detail === "" && rawDetail !== "" && summary !== toolName && (toolName === "Bash" || toolName === "shell" || toolName === "local_shell")) {
+      permissionBase.permissionSummary = toolName;
+      fitted = fitPermissionDetail(permissionBase, rawDetail);
+    }
     const detailFull = fullTextForRecord(rawDetail, fitted.detail);
     if (record && record.permissionDetailFull !== detailFull) {
       await (deps.stampDetailFullFn ?? defaultStampDetailFull())(sessionId, detailFull);
