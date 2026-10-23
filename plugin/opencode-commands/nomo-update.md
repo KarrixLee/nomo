@@ -23,7 +23,8 @@ there is something to pull.
 If it refuses, relay the message and the `→` fix line exactly — every refusal names the command to run
 by hand. It refuses rather than guessing when the checkout is pinned to a branch or tag (a detached
 HEAD from `bunx nomo-ai --ref`), has uncommitted changes, tracks no upstream, has diverged, is
-unreachable over the network, or has been moved or deleted out from under the stub.
+unreachable over the network, has been moved or deleted out from under the stub, or is not Nomo's own
+checkout (its `origin` is some other repository).
 
 This only ever touches OpenCode's own checkout. Claude Code and Codex install Nomo through their own
 marketplaces and update with their own commands — this command never writes into `~/.claude` or

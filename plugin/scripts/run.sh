@@ -84,7 +84,8 @@ nomo_atomic_copy() {
 # root baked into the command file has gone stale. A rev-2 shim silently exits 0 on that name, which
 # for an interactive command reads as "did nothing" — the one outcome this project treats as worse
 # than an error.
-NOMO_SHIM_REV=3
+# rev 4 (v2.3.1): the marketplace-checkout fallback scan is gone (NOM-134), so installed shims must refresh.
+NOMO_SHIM_REV=4
 
 # Numeric semver compare: true when $1 sorts strictly AFTER $2. A DELIBERATE TWIN of the function in
 # hook-shim.sh — run.sh has to stay a standalone file that works when nothing else on disk does, so it
@@ -160,8 +161,23 @@ if [ -n "$HOME" ] && [ -n "$nomo_root" ]; then
   fi
 fi
 
-if command -v bun >/dev/null 2>&1; then exec bun "$@"; fi
-if command -v node >/dev/null 2>&1; then exec node "$@"; fi
+# NEVER LET BUN READ THE USER'S REPO (NOM-133). bun auto-loads <cwd>/bunfig.toml at startup — whose
+# `preload` runs arbitrary code — and <cwd>/.env* (NOMO_WORKER_URL, OMG_API_KEY, NOMO_SKIP_WATCHDOG…), and
+# a hook's cwd is whatever project the agent is in. `--config=/dev/null --env-file=/dev/null` turns both
+# off (verified on bun 1.1.0, 1.1.30, 1.2.0, 1.2.10, 1.3.0, 1.4.4; `--no-env-file` is NOT enough on 1.3).
+# The cwd itself is KEPT: version-manager shims (asdf, mise, proto, nodenv) pick the runtime from it, and
+# an earlier `cd /` made them exit non-zero for users with no global version. node loads neither file, so
+# it is exec'd untouched. Matched on the basename, so a shim or a versioned path named bun* gets the flags
+# too. Fork-free: a case and an exec. shared.ts runtimeArgs is the TypeScript twin.
+nomo_exec() {
+  case "${1##*/}" in
+    bun*) _rt=$1; shift; exec "$_rt" --config=/dev/null --env-file=/dev/null "$@" ;;
+    *) exec "$@" ;;
+  esac
+}
+
+if command -v bun >/dev/null 2>&1; then nomo_exec bun "$@"; fi
+if command -v node >/dev/null 2>&1; then nomo_exec node "$@"; fi
 
 for rt in \
   "$HOME/.bun/bin/bun" \
@@ -171,7 +187,7 @@ for rt in \
   "/usr/local/bin/node" \
   "/usr/bin/node"
 do
-  if [ -x "$rt" ]; then exec "$rt" "$@"; fi
+  if [ -x "$rt" ]; then nomo_exec "$rt" "$@"; fi
 done
 
 # CACHED RESULT of the login-shell probe below. Checked before the probe, never before PATH or the
@@ -214,7 +230,7 @@ if [ -r "$cache" ]; then
       esac
       ;;
     *)
-      if [ -n "$rt" ] && [ -x "$rt" ]; then exec "$rt" "$@"; fi
+      if [ -n "$rt" ] && [ -x "$rt" ]; then nomo_exec "$rt" "$@"; fi
       ;;
   esac
 fi
@@ -254,7 +270,7 @@ if [ -n "$SHELL" ] && [ -x "$SHELL" ]; then
   fi
   if [ -n "$rt" ] && [ -x "$rt" ]; then
     write_cache "$rt"
-    exec "$rt" "$@"
+    nomo_exec "$rt" "$@"
   fi
 fi
 

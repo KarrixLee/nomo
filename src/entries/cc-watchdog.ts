@@ -52,7 +52,7 @@ import {
   startCodexAppServerDaemon,
   GONE_STRIKE_LIMIT, loadConfig, loadPendingConfig, localApprovalsState,
   PAIR_HTML_FILE, PairPollResult, parseWatchdogPidfile, PendingConfig, pidAlive, PLUGIN_VERSION, readDecisionHoldAt, readPrefix, readSuffix, recordGoneStrike, removeRevokedConfig,
-  resetGoneStrikes, resolveGitDir, SessionRecord, sessionBranch, SESSIONS_DIR, traceSession, tracePlanPickerDecision, watchdogBuildDiffers,
+  resetGoneStrikes, resolveGitDir, SessionRecord, sessionBranch, sidField, SESSIONS_DIR, traceSession, tracePlanPickerDecision, watchdogBuildDiffers,
   watchdogBuildStamp, watchdogHolderIsLive, WATCHDOG_PID_PATH, writeInterruptFlagAt,
 } from "../core/shared";
 import { rememberBounded } from "../core/bounded-set";
@@ -313,6 +313,7 @@ export async function buildDoneEnvelope(sessionId: string, record: SessionRecord
     // card for the same folder. OMITTED when the record has none (a pre-key session).
     ...(typeof record.folderKey === "string" && record.folderKey.length > 0 ? { folderKey: record.folderKey } : {}),
     ...(branch ? { branch } : {}),
+    ...sidField(sessionId),
   };
   const debug = appendCodexBridgeMarker(
     agent === "codex" ? dbg ?? formatPlanPickerDebug({ event: "done", classifier: "done", marker: "0", by: "wd" }) : undefined,
@@ -365,6 +366,7 @@ export async function buildNeedsAttentionEnvelope(
     ...(typeof at === "number" && Number.isFinite(at) ? { at } : {}),
     ...(typeof record.folderKey === "string" && record.folderKey.length > 0 ? { folderKey: record.folderKey } : {}),
     ...(branch ? { branch } : {}),
+    ...sidField(sessionId),
   };
   const debug = appendCodexBridgeMarker(
     agent === "codex" ? dbg ?? formatPlanPickerDebug({ event: "attention", classifier: "pending", marker: "0", by: "wd" }) : undefined,
@@ -401,6 +403,7 @@ export async function buildWorkingEnvelope(
     // The record's pinned folder key, in the same slot as buildDoneEnvelope's (see there).
     ...(typeof record.folderKey === "string" && record.folderKey.length > 0 ? { folderKey: record.folderKey } : {}),
     ...(branch ? { branch } : {}),
+    ...sidField(sessionId),
   };
   const debug = appendCodexBridgeMarker(
     agent === "codex" ? dbg ?? formatPlanPickerDebug({ event: "working", classifier: "resolved", marker: "0", by: "wd" }) : undefined,
@@ -1712,6 +1715,7 @@ export async function buildProvisionalBlob(
     // key — so the row never jumps cards on reconcile. Omitted when the cwd could not be read.
     ...(typeof d.folderKey === "string" && d.folderKey.length > 0 ? { folderKey: d.folderKey } : {}),
     ...(branch ? { branch } : {}),
+    ...sidField(d.sessionId),
   };
   const dbg = appendCodexBridgeMarker(blobAgentFields.agent === "codex" ? formatPlanPickerDebug({
     event: "discover", classifier: d.idle === true ? "done" : "work", marker: "0", by: "wd",
@@ -3100,6 +3104,7 @@ export async function buildTitleRepairEnvelope(
     // repair must not cost the row its folder card.
     ...(typeof record.folderKey === "string" && record.folderKey.length > 0 ? { folderKey: record.folderKey } : {}),
     ...(branch ? { branch } : {}),
+    ...sidField(sessionId),
   };
   const dbg = appendCodexBridgeMarker(agent === "codex" ? record.dbg ?? formatPlanPickerDebug({
     event: "title", classifier: statusFromRecord(record), marker: record.pendingPlanPicker ? "p" : record.planPickerVerificationPending ? "v" : record.planPickerSettled ? "s" : "0", by: "wd",

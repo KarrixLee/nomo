@@ -20,7 +20,7 @@ import {
 } from "./permission";
 import {
   clearDecisionHold, Config, DecisionHold, localApprovalsState, PLUGIN_VERSION, readRecord, SessionRecord,
-  sessionBranch, settleDecisionHoldRecord, writeDecisionHold,
+  sessionBranch, settleDecisionHoldRecord, sidField, writeDecisionHold,
 } from "./shared";
 import { lanRunningUnderTest } from "./lan-wire";
 import type {
@@ -202,6 +202,7 @@ function baseBlob(
     // the folder's LIVE branch — re-read from the record's pinned paths, never restamped.
     ...(typeof record.folderKey === "string" && record.folderKey.length > 0 ? { folderKey: record.folderKey } : {}),
     ...(branch ? { branch } : {}),
+    ...sidField(request.identity.threadId),
   };
 }
 

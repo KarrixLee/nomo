@@ -10,7 +10,7 @@ import {
   codexAppServerSocketAvailable, codexAppServerSocketPath, codexAppServerSocketState, codexCompanionBrokerEvidence,
   DBG_BLOB_TEXT_MAX_CHARS, startCodexAppServerDaemon,
   decisionHoldFileName, ensureWatchdog, formatWatchdogPidfile, fullTextForRecord, isWatchdogCommand, watchdogVersionOutranks,
-  readDecisionHoldAt, writeDecisionHoldAt,
+  readDecisionHoldAt, runtimeArgs, writeDecisionHoldAt,
   localApprovalsState, parseWatchdogPidfile, PLUGIN_VERSION, postFullText, RECORD_FULL_TEXT_MAX_CHARS,
   RECORD_FULL_TEXT_TRUNCATION_MARKER, recordFullTextIsComplete, settleDecisionHoldRecordAt,
   stampPermissionDetailFullAt, watchdogBuildStamp,
@@ -1097,5 +1097,20 @@ describe("interrupt flag (phone asked this session's turn to stop)", () => {
     await writeInterruptFlagAt(d, "s1", 1_000);
     expect(await readdir(d)).toEqual([interruptFlagFileName("s1")]);
     expect(interruptFlagFileName("s1").endsWith(".json")).toBe(false);
+  });
+});
+
+// NOM-133: the TypeScript twin of run.sh's nomo_exec — bun gets the bunfig/.env fence, node and the
+// hook shim (which reaches run.sh) are launched untouched.
+describe("runtimeArgs", () => {
+  test("bun (bare, absolute, versioned name) gets the fence flags first", () => {
+    for (const rt of ["bun", "/Users/me/.bun/bin/bun", "/opt/bun-1.4.4"]) {
+      expect(runtimeArgs(rt, ["/p/x.mjs", "a"])).toEqual(["--config=/dev/null", "--env-file=/dev/null", "/p/x.mjs", "a"]);
+    }
+  });
+  test("node and the hook shim are left alone", () => {
+    for (const rt of ["node", "/opt/homebrew/bin/node", "/Users/me/.config/cc-status/hook-shim.sh", "/bun/dir/node"]) {
+      expect(runtimeArgs(rt, ["/p/x.mjs"])).toEqual(["/p/x.mjs"]);
+    }
   });
 });

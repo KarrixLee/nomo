@@ -81,7 +81,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "2.3.0";
+var PLUGIN_VERSION = "2.3.1";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -164,6 +164,12 @@ function appendFittedPlan(base, plan) {
       hi = mid - 1;
   }
   return { ...base, plan: chars.slice(0, lo).join("") + marker };
+}
+function runtimeArgs(runtime, args) {
+  return /^bun/.test(runtime.slice(runtime.lastIndexOf("/") + 1)) ? ["--config=/dev/null", "--env-file=/dev/null", ...args] : args;
+}
+function sidField(sessionId) {
+  return typeof sessionId === "string" && sessionId.length > 0 ? { sid: sessionId } : {};
 }
 function appendFittedPlanAndDebug(base, plan, dbg) {
   const withPlan = appendFittedPlan(base, plan);
@@ -509,7 +515,7 @@ function ensureWatchdog(deps = {}) {
     const killPid = deps.killPid ?? ((pid, signal) => process.kill(pid, signal));
     const spawnWatchdog = deps.spawnWatchdog ?? (() => {
       const runtime = process.env.NOMO_RUNTIME && process.env.NOMO_RUNTIME.length > 0 ? process.env.NOMO_RUNTIME : process.execPath;
-      spawn(runtime, [WATCHDOG_PATH], { detached: true, stdio: "ignore" }).unref();
+      spawn(runtime, runtimeArgs(runtime, [WATCHDOG_PATH]), { detached: true, stdio: "ignore" }).unref();
     });
     const raw = readPidfile();
     const holder = typeof raw === "string" ? parseWatchdogPidfile(raw) : null;
@@ -2641,7 +2647,8 @@ function buildBlob(input, machine, title, plan, agent = "claude", turnStartedAt,
     ...typeof model === "string" && model.length > 0 ? { model } : {},
     ...typeof at === "number" && Number.isFinite(at) ? { at } : {},
     ...folderKey ? { folderKey } : {},
-    ...branch ? { branch } : {}
+    ...branch ? { branch } : {},
+    ...sidField(input.session_id)
   };
   const dbg = agent === "codex" ? dbgOverride ?? formatPlanPickerDebug({
     event: hookName || "event",
@@ -3395,8 +3402,27 @@ function denyLine(agent, message) {
 function allowAlwaysLine(agent, toolName, toolInput, suggestions) {
   if (agent === "codex")
     return allowLine(agent, toolName, toolInput);
-  const updatedPermissions = Array.isArray(suggestions) && suggestions.length > 0 ? suggestions : [{ type: "addRules", rules: [{ toolName }], behavior: "allow", destination: "session" }];
-  return allowWithPermissionsLine(agent, toolName, toolInput, updatedPermissions);
+  if (!Array.isArray(suggestions) || suggestions.length === 0) {
+    return allowWithPermissionsLine(agent, toolName, toolInput, [{ type: "addRules", rules: [{ toolName }], behavior: "allow", destination: "session" }]);
+  }
+  const scoped = sessionScopedSuggestions(suggestions);
+  return scoped.length > 0 ? allowWithPermissionsLine(agent, toolName, toolInput, scoped) : allowLine(agent, toolName, toolInput);
+}
+function sessionScopedSuggestions(suggestions) {
+  if (!Array.isArray(suggestions))
+    return [];
+  const nonEmpty = (v) => Array.isArray(v) && v.length > 0;
+  return suggestions.filter((s) => {
+    if (!s || typeof s !== "object")
+      return false;
+    if (s.type === "addRules")
+      return s.behavior === "allow" && nonEmpty(s.rules);
+    if (s.type === "addDirectories")
+      return nonEmpty(s.directories);
+    if (s.type === "setMode")
+      return typeof s.mode === "string" && s.mode !== "bypassPermissions" && s.mode !== "dontAsk";
+    return false;
+  }).map((s) => ({ ...s, destination: "session" }));
 }
 function allowWithPermissionsLine(agent, toolName, toolInput, updatedPermissions) {
   const decision = toolName === "ExitPlanMode" ? { behavior: "allow", updatedInput: toolInput, updatedPermissions } : { behavior: "allow", updatedPermissions };
@@ -4942,7 +4968,7 @@ function spawnWatchdog() {
   const runtime = resolveRuntime();
   if (!runtime)
     return;
-  spawn2(runtime, [WATCHDOG_PATH], { detached: true, stdio: "ignore" }).unref();
+  spawn2(runtime, runtimeArgs(runtime, [WATCHDOG_PATH]), { detached: true, stdio: "ignore" }).unref();
 }
 var WATCHDOG_TRUST_MS = 60000;
 var watchdogTrustedUntil = 0;

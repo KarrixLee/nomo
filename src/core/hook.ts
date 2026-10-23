@@ -29,7 +29,7 @@ import {
 import {
   AgentKind, appendFittedPlanAndDebug, atomicWrite, CCOp, CCStatus, clearInterruptFlagAt, codexCompanionBrokerEvidence, Config, decisionHoldFileName, ensureWatchdog, FolderIdentity, folderIdentity, formatPlanPickerDebug, fullTextForRecord, GONE_STRIKE_LIMIT,
   interruptFlagFileName, interruptFlagSetAt, LAST_SEND_PATH, lastHookPath, loadConfig, loadPendingConfig, localApprovalsState, PENDING_STASH_PATH, PendingEventStash, pidAlive, pidAncestors, pidCommand, PLUGIN_VERSION, postFullText, readDecisionHoldAt, readPrefix, SEND_FAIL_PATH,
-  readRecord, recordGoneStrike, removeRevokedConfig, resetGoneStrikes, SessionOrigin, SessionRecord, SESSIONS_DIR, sessionBranch, tracePlanPickerDecision, traceSession,
+  readRecord, recordGoneStrike, removeRevokedConfig, resetGoneStrikes, SessionOrigin, SessionRecord, SESSIONS_DIR, sessionBranch, sidField, tracePlanPickerDecision, traceSession,
 } from "./shared";
 import { repairNotifyWiring } from "./notify-wire";
 import { stateHoldLive } from "./session-state";
@@ -361,7 +361,7 @@ export function buildBlob(input: Record<string, unknown>, machine: string, title
    *  text no tool name can encode. Undefined for EVERY Claude/Codex caller, which leaves detailForHook
    *  as the only source and keeps their blobs byte-identical. */
   detailOverride?: string): {
-  status: CCStatus; detail?: string; title: string; machine: string; label: string; agent?: AgentKind; turnStartedAt?: number; model?: string; at?: number; folderKey?: string; branch?: string; plan?: string; dbg?: string;
+  status: CCStatus; detail?: string; title: string; machine: string; label: string; agent?: AgentKind; turnStartedAt?: number; model?: string; at?: number; folderKey?: string; branch?: string; sid?: string; plan?: string; dbg?: string;
 } {
   const folder = folderIdentity(input.cwd, pinnedFolder);
   const { label, folderKey } = folder;
@@ -416,6 +416,7 @@ export function buildBlob(input: Record<string, unknown>, machine: string, title
     ...(typeof at === "number" && Number.isFinite(at) ? { at } : {}),
     ...(folderKey ? { folderKey } : {}),
     ...(branch ? { branch } : {}),
+    ...sidField(input.session_id), // NOM-125, the last base key in EVERY producer (see sidField)
   };
   const dbg = agent === "codex"
     ? dbgOverride ?? formatPlanPickerDebug({
