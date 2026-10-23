@@ -27,9 +27,9 @@
 
 import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { opencodeStubPaths, opencodeStubTarget } from "../core/shared";
+import { opencodeStubPaths, opencodeStubTarget, REMOTE_IS_OURS } from "../core/shared";
 
 /** The manifest build.ts injects PLUGIN_VERSION from, relative to the repo root. Reading the SAME file
  *  the build reads is what makes this number agree with the `x-cc-version` the worker sees — and so
@@ -44,6 +44,12 @@ export interface UpdateDeps {
   stubPaths?: string[];
   /** The project OpenCode would also load from (`<cwd>/.opencode`). */
   cwd?: string;
+  /** Global scope ONLY — never read `<cwd>/.opencode`. bin/nomo-ai.mjs passes `--global`: it only ever
+   *  installs globally, and the directory somebody happened to run `bunx nomo-ai` from must not get to
+   *  name the checkout that gets pulled and whose installer gets executed. `/nomo-update` (run by
+   *  OpenCode inside the project it serves) leaves this off, which is what keeps `--project` installs
+   *  updatable. */
+  global?: boolean;
   /** This bundle's own directory — `<plugin-root>/dist`. The fallback checkout when no stub exists at
    *  all, which is the shape `bunx nomo-ai` hits on a machine whose install was never completed. */
   self?: string;
@@ -101,8 +107,12 @@ export function checkUpdate(deps: UpdateDeps = {}): UpdateCheck {
   // the user's actual install untouched and quietly create a second one.
   const candidates: { path: string; project: boolean }[] = [
     ...(deps.stubPaths ?? opencodeStubPaths()).map((path) => ({ path, project: false })),
-    { path: join(cwd, ".opencode", "plugins", "nomo.js"), project: true },
-    { path: join(cwd, ".opencode", "plugin", "nomo.js"), project: true },
+    ...(deps.global
+      ? []
+      : [
+          { path: join(cwd, ".opencode", "plugins", "nomo.js"), project: true },
+          { path: join(cwd, ".opencode", "plugin", "nomo.js"), project: true },
+        ]),
   ];
 
   let stub: string | undefined;
@@ -118,6 +128,10 @@ export function checkUpdate(deps: UpdateDeps = {}): UpdateCheck {
     stub = c.path;
     project = c.project;
     target = opencodeStubTarget(text);
+    // The installer only ever writes an ABSOLUTE `<checkout>/plugin/dist/opencode.js` (its root comes
+    // from `pwd -P`). Anything else — a relative path that would resolve against whatever cwd this
+    // runs in, or a file somewhere else entirely — is not a stub we wrote, so it names no checkout.
+    if (target !== undefined && !(isAbsolute(target) && target.endsWith("/plugin/dist/opencode.js"))) target = undefined;
     break;
   }
 
@@ -128,7 +142,10 @@ export function checkUpdate(deps: UpdateDeps = {}): UpdateCheck {
   if (stub === undefined) {
     return {
       state: "blocked",
-      line: "OpenCode has no Nomo plugin stub — nothing here is installed, so there is nothing to update.",
+      // --global (bunx nomo-ai) never looks at the cwd, so "nothing here" would mislead a --project user.
+      line: deps.global
+        ? "OpenCode has no global Nomo plugin stub, so there is nothing to update globally. If you installed Nomo into a project, run /nomo-update inside OpenCode there."
+        : "OpenCode has no Nomo plugin stub — nothing here is installed, so there is nothing to update.",
       hint: `install it: ${installer}`,
     };
   }
@@ -161,6 +178,19 @@ export function checkUpdate(deps: UpdateDeps = {}): UpdateCheck {
     };
   }
   const root = top.stdout;
+
+  // ONLY NOMO'S OWN CHECKOUT. Everything after this runs git in `root` and, on a real update, executes
+  // `<root>/plugin/scripts/opencode-install.sh` — so a stub naming some other repository must stop
+  // here, before any of that, and before `status` (which can run configured hooks) in particular.
+  const origin = git(root, ["remote", "get-url", "origin"]);
+  if (origin.status !== 0 || !REMOTE_IS_OURS.test(origin.stdout.trim())) {
+    return {
+      state: "blocked",
+      root,
+      line: `${root} is not a Nomo checkout (its origin is ${origin.stdout.trim() || "unset"}) — it is left alone.`,
+      hint: `re-install from Nomo's own checkout:\n  bunx nomo-ai --opencode`,
+    };
+  }
 
   let from: string | undefined;
   try {
@@ -315,16 +345,16 @@ export function opencodeUpdate(deps: UpdateDeps = {}): number {
 // for older nodes.
 if (import.meta.main) {
   if (process.argv.includes("--check")) {
-    console.log("usage: opencode-update [--dry-run] [--check]  — pull the checkout OpenCode loads Nomo from, then re-run its installer (--dry-run reports the verdict and changes nothing)");
+    console.log("usage: opencode-update [--dry-run] [--global] [--check]  — pull the checkout OpenCode loads Nomo from, then re-run its installer (--dry-run reports the verdict and changes nothing)");
     process.exit(0);
   }
   if (process.argv.includes("--dry-run") || process.argv.includes("-n")) {
     // The READ-ONLY half, for a caller that wants the verdict without the pull — bin/nomo-ai.mjs shows
     // it in the plan preview, before the user has agreed to anything.
-    const found = checkUpdate();
+    const found = checkUpdate({ global: process.argv.includes("--global") });
     console.log(found.line);
     if (found.hint) for (const l of found.hint.split("\n")) console.log(`→ ${l}`);
     process.exit(found.state === "blocked" ? 1 : 0);
   }
-  process.exit(opencodeUpdate());
+  process.exit(opencodeUpdate({ global: process.argv.includes("--global") }));
 }

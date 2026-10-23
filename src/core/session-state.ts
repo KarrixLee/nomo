@@ -22,7 +22,7 @@
 // the decay, i.e. two numbers about the transport and nothing about the status.
 
 import { adapterFor } from "./adapter";
-import { appendFittedPlanAndDebug, formatPlanPickerDebug, sessionBranch } from "./shared";
+import { appendFittedPlanAndDebug, formatPlanPickerDebug, sessionBranch, sidField } from "./shared";
 import type { AgentKindWire, CCStatus, DecisionHold, SessionRecord } from "./shared";
 
 /** The 24 h abandonment cap — cc-watchdog's SESSION_STALE_MS, mirrored (an entry module must not be
@@ -336,6 +336,8 @@ const filled = (value: unknown): value is string => typeof value === "string" &&
  *  to BLOB_FIT_CHARS comes along with them, which is why it still applies on a leg with no worker in it. */
 export function buildStatePlaintext(
   record: SessionRecord, status: CCStatus, at: number, titleFallback?: string,
+  /** APPEND-LAST. The session's id, sealed as `sid` (NOM-125). */
+  sessionId?: string,
 ): Record<string, unknown> {
   const agent: AgentKindWire = record.agent ?? "claude";
   // The folder's LIVE branch, re-read from the record's pinned paths — the same thing the watchdog's
@@ -357,6 +359,7 @@ export function buildStatePlaintext(
     // a worker row for one state must stay textually identical, so it is restamped here too.
     ...(filled(record.folderKey) ? { folderKey: record.folderKey } : {}),
     ...(branch ? { branch } : {}),
+    ...sidField(sessionId),
   };
   const dbg = agent === "codex"
     ? formatPlanPickerDebug({
@@ -490,7 +493,7 @@ export function computeSessionState(input: SessionStateInput): SessionState | nu
       // stamp that moved every sweep would re-seal and wake every long poll on a session that is over.
       return of(
         "done", opinion?.status === "idle" ? "done+cc" : suffix("done"),
-        { kind: "plain", value: buildStatePlaintext(record, "done", ts, opinion?.name) }, ts, false,
+        { kind: "plain", value: buildStatePlaintext(record, "done", ts, opinion?.name, sessionId) }, ts, false,
       );
     }
   }
@@ -514,7 +517,7 @@ export function computeSessionState(input: SessionStateInput): SessionState | nu
     !recordDone && opinion?.status === "idle" && record.prio !== 1 &&
     record.lastEvent !== "needsAttention" && opinion.statusUpdatedAt > ts + CC_IDLE_DONE_GRACE_MS
   ) {
-    return of("done", "done+cc", { kind: "plain", value: buildStatePlaintext(record, "done", opinion.statusUpdatedAt, opinion.name) }, ts, false);
+    return of("done", "done+cc", { kind: "plain", value: buildStatePlaintext(record, "done", opinion.statusUpdatedAt, opinion.name, sessionId) }, ts, false);
   }
 
   // --- rank 4: needsAttention ---------------------------------------------------------------------
@@ -545,7 +548,7 @@ export function computeSessionState(input: SessionStateInput): SessionState | nu
     // record is the held-back branch above, whose condition is this same expression, and neither the hold
     // nor the attention rung in between can fall through. `?? ts` is the free belt-and-braces.
     recordDone
-      ? { kind: "plain", value: buildStatePlaintext(record, "working", opinion?.statusUpdatedAt ?? ts, opinion?.name) }
+      ? { kind: "plain", value: buildStatePlaintext(record, "working", opinion?.statusUpdatedAt ?? ts, opinion?.name, sessionId) }
       : sealed,
     ts,
     false,

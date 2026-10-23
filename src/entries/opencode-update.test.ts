@@ -5,11 +5,13 @@
 // this command exists for is a git state that a real repository would take a network round-trip and a
 // commit graph to produce, and none of them are about git itself.
 
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test } from "bun:test";
-import { checkUpdate, type UpdateDeps } from "./opencode-update";
+import { REMOTE_IS_OURS } from "../core/shared";
+import { checkUpdate, opencodeUpdate, type UpdateDeps } from "./opencode-update";
 
 const dirs: string[] = [];
 afterEach(async () => {
@@ -50,6 +52,7 @@ function fakeGit(answers: Record<string, { status?: number; stdout?: string; std
 function healthyGit(root: string, extra: Record<string, { status?: number; stdout?: string; stderr?: string }> = {}) {
   return fakeGit({
     "rev-parse --show-toplevel": { stdout: root },
+    "remote get-url origin": { stdout: "https://github.com/KarrixLee/nomo.git" },
     "symbolic-ref --short -q HEAD": { stdout: "main" },
     "status --porcelain": { stdout: "" },
     "rev-parse --abbrev-ref --symbolic-full-name @{u}": { stdout: "origin/main" },
@@ -262,5 +265,141 @@ describe("checkUpdate refuses loudly, and always names the by-hand command", () 
     expect(found.state).toBe("blocked");
     expect(found.line).toContain("not a git checkout");
     expect(found.hint).toContain("git clone");
+  });
+});
+
+// NOM-121. The updater pulls a checkout and then EXECUTES its plugin/scripts/opencode-install.sh, so the
+// checkout it picks is a trust decision: a repo the user merely cd'd into must not get to name it.
+describe("checkUpdate only ever acts on Nomo's own checkout", () => {
+  /** A stand-in installer that proves whether it ran (and with what) by writing a marker file. */
+  async function installer(root: string): Promise<string> {
+    const marker = join(root, "installer-ran");
+    const script = join(root, "plugin", "scripts", "opencode-install.sh");
+    await mkdir(join(root, "plugin", "scripts"), { recursive: true });
+    await writeFile(script, `#!/bin/sh\necho "ran $*" > "${marker}"\n`);
+    await chmod(script, 0o755);
+    return marker;
+  }
+
+  /** git that says "behind", records every call, and reports `origin` as the given URL. */
+  function behindGit(root: string, origin: string, calls: string[]) {
+    const inner = healthyGit(root, {
+      "remote get-url origin": { stdout: origin },
+      "merge-base --is-ancestor origin/main HEAD": { status: 1 },
+      "merge-base --is-ancestor HEAD origin/main": { status: 0 },
+      "show origin/main:plugin/.claude-plugin/plugin.json": { stdout: JSON.stringify({ version: "2.1.23" }) },
+    });
+    return (dir: string, args: string[]) => {
+      calls.push(args.join(" "));
+      return inner(dir, args);
+    };
+  }
+
+  test("a cwd stub into a FOREIGN repo is blocked, and its installer never runs", async () => {
+    const home = await scratch();
+    const evil = join(home, "evil-repo");
+    const target = await checkout(evil, "9.9.9");
+    const marker = await installer(evil);
+    await stub(join(evil, ".opencode", "plugins", "nomo.js"), target);
+    const calls: string[] = [];
+    const deps: UpdateDeps = {
+      stubPaths: [join(home, ".config", "opencode", "plugins", "nomo.js")],
+      cwd: evil,
+      self: join(home, "x", "dist"),
+      print: () => {},
+      git: behindGit(evil, "https://github.com/attacker/KarrixLee-nomo.git", calls),
+    };
+    const found = checkUpdate(deps);
+    expect(found.state).toBe("blocked");
+    expect(found.line).toContain("is not a Nomo checkout");
+    expect(opencodeUpdate(deps)).toBe(1);
+    expect(existsSync(marker)).toBe(false);
+    // Nothing past the identity check: no status (which can run configured hooks), no fetch, no merge.
+    expect(calls.some((c) => /^(status|fetch|merge)/.test(c))).toBe(false);
+  });
+
+  test("REMOTE_IS_OURS: only github.com, exactly KarrixLee/nomo, any case, optional .git and slash", () => {
+    for (const ok of [
+      "https://github.com/KarrixLee/nomo", "https://github.com/KarrixLee/nomo.git", "https://github.com/KarrixLee/nomo/",
+      "https://github.com/KarrixLee/nomo.git/", "ssh://git@github.com/KarrixLee/nomo.git", "git@github.com:KarrixLee/nomo.git",
+      "git@github.com:KarrixLee/nomo", "https://github.com/karrixlee/nomo.git", "git@github.com:karrixlee/NOMO",
+    ]) expect([ok, REMOTE_IS_OURS.test(ok)]).toEqual([ok, true]);
+    for (const bad of [
+      "https://github.com/KarrixLee/nomo-evil.git", // look-alike name
+      "https://evil.example/KarrixLee/nomo.git", "git@evil.example:KarrixLee/nomo.git", "ssh://git@evil.example/KarrixLee/nomo",
+      "https://github.com.evil.example/KarrixLee/nomo", "https://evil.example/github.com/KarrixLee/nomo", // host look-alikes
+      "https://gitlab.com/group/KarrixLee/nomo.git", "https://github.com/group/KarrixLee/nomo", "git@github.com:group/KarrixLee/nomo", // subgroup paths
+      "/Users/me/KarrixLee/nomo", "KarrixLee/nomo", "",
+    ]) expect([bad, REMOTE_IS_OURS.test(bad)]).toEqual([bad, false]);
+  });
+
+  test("a RELATIVE stub target is rejected, not resolved against the cwd", async () => {
+    const home = await scratch();
+    const project = join(home, "project");
+    await checkout(project, "2.1.21");
+    await stub(join(project, ".opencode", "plugins", "nomo.js"), "./plugin/dist/opencode.js");
+    const found = checkUpdate({ stubPaths: [], cwd: project, self: join(home, "x", "dist"), git: healthyGit(project) });
+    expect(found.state).toBe("blocked");
+    expect(found.line).toContain("is not a Nomo stub");
+  });
+
+  test("a target that is not <checkout>/plugin/dist/opencode.js is rejected", async () => {
+    const home = await scratch();
+    await writeFile(join(home, "x.js"), "export default {};\n");
+    const path = await stub(join(home, "plugins", "nomo.js"), join(home, "x.js"));
+    const found = checkUpdate({ stubPaths: [path], cwd: home, self: join(home, "x", "dist"), git: healthyGit(home) });
+    expect(found.state).toBe("blocked");
+    expect(found.line).toContain("is not a Nomo stub");
+  });
+
+  test("--global never reads the cwd stub (what bin/nomo-ai.mjs runs)", async () => {
+    const home = await scratch();
+    const project = join(home, "project");
+    const root = join(home, "nomo");
+    await stub(join(project, ".opencode", "plugins", "nomo.js"), await checkout(root, "2.1.21"));
+    const found = checkUpdate({ stubPaths: [], cwd: project, global: true, self: join(root, "plugin", "dist"), git: healthyGit(root) });
+    expect(found.state).toBe("blocked");
+    expect(found.line).toContain("no global Nomo plugin stub");
+    // A --project user must be pointed at the project, not told nothing is installed.
+    expect(found.line).toContain("If you installed Nomo into a project, run /nomo-update inside OpenCode there.");
+    expect(found.line).not.toContain("nothing here is installed");
+  });
+
+  test("without --global, a missing stub keeps the plain message (no project hint)", async () => {
+    const home = await scratch();
+    const found = checkUpdate({ stubPaths: [], cwd: home, self: join(home, "x", "dist"), git: healthyGit(home) });
+    expect(found.state).toBe("blocked");
+    expect(found.line).toContain("nothing here is installed");
+    expect(found.line).not.toContain("/nomo-update inside OpenCode");
+  });
+
+  test("a legit --project install into Nomo's own checkout still updates, re-installing with --project", async () => {
+    const home = await scratch();
+    const project = join(home, "project");
+    const root = join(home, "nomo");
+    const target = await checkout(root, "2.1.21");
+    const marker = await installer(root);
+    await stub(join(project, ".opencode", "plugins", "nomo.js"), target);
+    const calls: string[] = [];
+    const code = opencodeUpdate({
+      stubPaths: [join(home, ".config", "opencode", "plugins", "nomo.js")],
+      cwd: project,
+      self: join(root, "plugin", "dist"),
+      print: () => {},
+      git: behindGit(root, "git@github.com:KarrixLee/nomo.git", calls),
+    });
+    expect(code).toBe(0);
+    expect(calls).toContain("merge --ff-only origin/main");
+    expect((await readFile(marker, "utf8")).trim()).toBe("ran --project");
+  });
+
+  test("bin/nomo-ai.mjs and src/core/shared.ts agree on REMOTE_IS_OURS", async () => {
+    const bin = await readFile(join(import.meta.dir, "../../bin/nomo-ai.mjs"), "utf8");
+    const repo = /const REPO = "([^"]+)";/.exec(bin)?.[1];
+    const m = /const REMOTE_IS_OURS = new RegExp\(`([^`]+)`, "([a-z]*)"\);/.exec(bin);
+    expect(repo).toBe("KarrixLee/nomo");
+    const twin = new RegExp(m![1]!.replace("${REPO}", repo!).replaceAll("\\\\", "\\"), m![2]);
+    expect(twin.source).toBe(REMOTE_IS_OURS.source);
+    expect(twin.flags).toBe(REMOTE_IS_OURS.flags);
   });
 });

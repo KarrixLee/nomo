@@ -1086,9 +1086,9 @@ describe("runPermissionHook — hold state machine", () => {
     // the permission keys is untouched. `folderKey` (the phone's folder-grouping identity) closes the
     // base after `at`, the same slot every other producer of this shape puts it in.
     const keys = Object.keys(blob);
-    expect(keys.slice(keys.indexOf("permissionSummary") - 2, keys.indexOf("permissionSummary")))
-      .toEqual(["at", "folderKey"]);
-    expect(Object.keys(fb).slice(-2)).toEqual(["at", "folderKey"]);
+    expect(keys.slice(keys.indexOf("permissionSummary") - 3, keys.indexOf("permissionSummary")))
+      .toEqual(["at", "folderKey", "sid"]);
+    expect(Object.keys(fb).slice(-3)).toEqual(["at", "folderKey", "sid"]);
   });
 
   // The held frames get `branch` for free: runPermissionHook hands buildBlob the WHOLE record, so the
@@ -1109,9 +1109,9 @@ describe("runPermissionHook — hold state machine", () => {
       expect(blob.branch).toBe("feat/hybrid-lan");
       expect(fb.branch).toBe("feat/hybrid-lan");
       const keys = Object.keys(blob);
-      expect(keys.slice(keys.indexOf("permissionSummary") - 3, keys.indexOf("permissionSummary")))
-        .toEqual(["at", "folderKey", "branch"]);
-      expect(Object.keys(fb).slice(-3)).toEqual(["at", "folderKey", "branch"]);
+      expect(keys.slice(keys.indexOf("permissionSummary") - 4, keys.indexOf("permissionSummary")))
+        .toEqual(["at", "folderKey", "branch", "sid"]);
+      expect(Object.keys(fb).slice(-4)).toEqual(["at", "folderKey", "branch", "sid"]);
       // The absolute path itself never crosses the wire — only the digest and the branch name.
       expect(JSON.stringify(blob)).not.toContain(repo);
     } finally {
@@ -1837,7 +1837,7 @@ describe("runPermissionHook — always-allow / deny-message / unknown decision",
     return { emitted, calls };
   };
 
-  test("allow_always WITH permission_suggestions → behavior allow + updatedPermissions === the suggestions VERBATIM", async () => {
+  test("allow_always WITH session permission_suggestions → behavior allow + updatedPermissions === the suggestions", async () => {
     const SUGG = [{ type: "addRules", rules: [{ toolName: "Bash", ruleContent: "bun test:*" }], behavior: "allow", destination: "session" }];
     const { emitted } = await answerWith(
       { decision: "allow_always" },
@@ -1846,7 +1846,57 @@ describe("runPermissionHook — always-allow / deny-message / unknown decision",
     expect(emitted.length).toBe(1);
     const decision = JSON.parse(emitted[0]).hookSpecificOutput.decision;
     expect(decision.behavior).toBe("allow");
-    expect(decision.updatedPermissions).toEqual(SUGG); // passed through byte-for-byte
+    expect(decision.updatedPermissions).toEqual(SUGG); // already session-scoped → unchanged
+  });
+
+  const alwaysWith = async (suggestions: unknown) => {
+    const { emitted } = await answerWith(
+      { decision: "allow_always" },
+      { readInput: async () => inputWith({ permission_suggestions: suggestions }) },
+    );
+    expect(emitted.length).toBe(1);
+    return JSON.parse(emitted[0]).hookSpecificOutput.decision;
+  };
+
+  test("NOM-124: every kept entry is re-scoped to session; deny rules and bypass/dontAsk modes are dropped", async () => {
+    const decision = await alwaysWith([
+      { type: "addRules", rules: [{ toolName: "Bash", ruleContent: "curl:*" }], behavior: "allow", destination: "localSettings" },
+      { type: "addRules", rules: [{ toolName: "Bash", ruleContent: "rm:*" }], behavior: "allow", destination: "userSettings" },
+      { type: "addDirectories", directories: ["/tmp/out"], destination: "projectSettings" },
+      { type: "setMode", mode: "bypassPermissions", destination: "localSettings" },
+      { type: "setMode", mode: "dontAsk", destination: "localSettings" },
+      { type: "setMode", mode: "acceptEdits", destination: "localSettings" },
+      { type: "addRules", rules: [{ toolName: "Bash" }], behavior: "deny", destination: "localSettings" },
+    ]);
+    expect(decision.behavior).toBe("allow");
+    expect(decision.updatedPermissions).toEqual([
+      { type: "addRules", rules: [{ toolName: "Bash", ruleContent: "curl:*" }], behavior: "allow", destination: "session" },
+      { type: "addRules", rules: [{ toolName: "Bash", ruleContent: "rm:*" }], behavior: "allow", destination: "session" },
+      { type: "addDirectories", directories: ["/tmp/out"], destination: "session" },
+      { type: "setMode", mode: "acceptEdits", destination: "session" },
+    ]);
+  });
+
+  test("NOM-124: an addDirectories-only suggestion (Read outside the workspace) is kept — NOT broadened to bare Read", async () => {
+    const decision = await alwaysWith([{ type: "addDirectories", directories: ["/Users/me/other"], destination: "localSettings" }]);
+    expect(decision.updatedPermissions).toEqual([{ type: "addDirectories", directories: ["/Users/me/other"], destination: "session" }]);
+  });
+
+  test("NOM-124: a setMode-only suggestion (acceptEdits) is kept, session-scoped, with no whole-tool rule", async () => {
+    const decision = await alwaysWith([{ type: "setMode", mode: "acceptEdits", destination: "localSettings" }]);
+    expect(decision.updatedPermissions).toEqual([{ type: "setMode", mode: "acceptEdits", destination: "session" }]);
+  });
+
+  test("NOM-124: when filtering removed EVERYTHING → a plain allow, never the whole-tool fallback", async () => {
+    for (const sugg of [
+      [{ type: "setMode", mode: "bypassPermissions", destination: "localSettings" }],
+      [{ type: "setMode", mode: "dontAsk", destination: "session" }],
+      [{ type: "addRules", rules: [{ toolName: "Bash" }], behavior: "deny", destination: "session" }, { type: "removeDirectories", directories: ["/x"], destination: "session" }],
+    ]) {
+      const decision = await alwaysWith(sugg);
+      expect(decision.behavior).toBe("allow");
+      expect(decision.updatedPermissions).toBeUndefined();
+    }
   });
 
   test("allow_always with NO suggestions → a whole-tool, session-scoped addRules for the tool_name", async () => {
@@ -1979,7 +2029,7 @@ describe("runPermissionHook — ExitPlanMode allow carries updatedInput (NOM-36)
     ]);
   });
 
-  test("allow_always WITH permission_suggestions → suggestions VERBATIM + updatedInput still echoed", async () => {
+  test("allow_always WITH permission_suggestions → session-scoped suggestions + updatedInput still echoed", async () => {
     const SUGG = [{ type: "addRules", rules: [{ toolName: "ExitPlanMode" }], behavior: "allow", destination: "session" }];
     const emitted = await answerExitPlan(
       { decision: "allow_always" },
@@ -2079,7 +2129,9 @@ describe("runPermissionHook — decision blob detail fields", () => {
   test("SWEEP: across a range of base sizes the emitted blob is ALWAYS <= the worker's 3072-char cap", async () => {
     let sawDroppedDetail = false;
     let sawKeptDetail = false;
-    for (let n = 1500; n <= 1980; n += 1) {
+    // Upper bound = the fattest BASE that still fits on its own (base keys are never shed; real titles
+    // cap at 80 chars). 1965, not 1980, since the base carries its 15-byte `sid` (NOM-125).
+    for (let n = 1500; n <= 1965; n += 1) {
       const { body, blob } = await postedBlob({
         readRecordFn: async () => ({ pid: 1, machine: "m", label: "api-status", title: "y".repeat(n), ts: 1000, model: "claude-opus-5" }),
         readInput: async () => inputWith({ tool_input: { command: "c".repeat(8000) } }),
@@ -2091,6 +2143,27 @@ describe("runPermissionHook — decision blob detail fields", () => {
     expect(sawKeptDetail).toBe(true);
     expect(sawDroppedDetail).toBe(true);
   }, 30_000);
+
+  // The model-written description is the least important text on a shell card. A ~2000-char one
+  // (control characters escape 6x in JSON) on a fat base used to crowd the command out through the floor
+  // guard; the summary now falls back to the tool name first, so the command still rides.
+  test("Bash: a long description never crowds out the command", async () => {
+    for (const description of ["d".repeat(2000), "\u0001".repeat(2000)]) {
+      const { body, blob } = await postedBlob({
+        readRecordFn: async () => ({ pid: 1, machine: "m", label: "api-status", title: "y".repeat(1950), ts: 1000, model: "claude-opus-5" }),
+        readInput: async () => inputWith({ tool_input: { command: "rm -rf build", description } }),
+      });
+      expect(body.blob.length).toBeLessThanOrEqual(BLOB_FIT_CHARS);
+      expect(blob.permissionDetail).toBe("rm -rf build");
+      expect(blob.permissionSummary).toBe("Bash");
+    }
+  });
+
+  test("Bash: the description summary is capped in code points, never splitting a surrogate pair", () => {
+    const out = buildPermissionSummary("Bash", { command: "ls", description: "😀".repeat(200) });
+    expect(Array.from(out)).toHaveLength(80);
+    expect(out).toBe(`${"😀".repeat(79)}…`);
+  });
 
   test("ExitPlanMode → the plan rides as permissionDetail; a short plan omits the truncation count", async () => {
     const plan = "# Plan\n\n1. Do the thing\n2. Do the other thing\n\n**Risk:** low";

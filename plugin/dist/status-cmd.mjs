@@ -106,7 +106,7 @@ async function sha256Hex(s) {
 }
 
 // src/core/shared.ts
-var PLUGIN_VERSION = "2.3.0";
+var PLUGIN_VERSION = "2.3.4";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -199,6 +199,12 @@ function appendFittedPlan(base, plan) {
       hi = mid - 1;
   }
   return { ...base, plan: chars.slice(0, lo).join("") + marker };
+}
+function runtimeArgs(runtime, args) {
+  return /^bun/.test(runtime.slice(runtime.lastIndexOf("/") + 1)) ? ["--config=/dev/null", "--env-file=/dev/null", ...args] : args;
+}
+function sidField(sessionId) {
+  return typeof sessionId === "string" && sessionId.length > 0 ? { sid: sessionId } : {};
 }
 function appendFittedPlanAndDebug(base, plan, dbg) {
   const withPlan = appendFittedPlan(base, plan);
@@ -416,6 +422,7 @@ function opencodeStubPaths() {
 function opencodeStubTarget(text) {
   return /^export \{ default \} from "(.+)";$/m.exec(text)?.[1];
 }
+var REMOTE_IS_OURS = /^(https:\/\/github\.com\/|ssh:\/\/git@github\.com\/|git@github\.com:)KarrixLee\/nomo(\.git)?\/?$/i;
 var FOLDER_KEY_HEX_CHARS = 12;
 var BRANCH_MAX_CHARS = 60;
 var GIT_DIR_WALK_MAX_DEPTH = 64;
@@ -823,7 +830,7 @@ function ensureWatchdog(deps = {}) {
     const killPid = deps.killPid ?? ((pid, signal) => process.kill(pid, signal));
     const spawnWatchdog = deps.spawnWatchdog ?? (() => {
       const runtime = process.env.NOMO_RUNTIME && process.env.NOMO_RUNTIME.length > 0 ? process.env.NOMO_RUNTIME : process.execPath;
-      spawn(runtime, [WATCHDOG_PATH], { detached: true, stdio: "ignore" }).unref();
+      spawn(runtime, runtimeArgs(runtime, [WATCHDOG_PATH]), { detached: true, stdio: "ignore" }).unref();
     });
     const raw = readPidfile();
     const holder = typeof raw === "string" ? parseWatchdogPidfile(raw) : null;
@@ -3108,6 +3115,18 @@ async function readMsMarker(path) {
     return 0;
   }
 }
+function runtimeFloorWarning(name, version) {
+  const v = version.replace(/^v/, "").split(/[.+-]/).slice(0, 3).map(Number);
+  if (v.length < 3 || v.some((n) => !Number.isInteger(n)))
+    return;
+  const below = (f) => v[0] !== f[0] ? v[0] < f[0] : v[1] !== f[1] ? v[1] < f[1] : v[2] < f[2];
+  const what = `${name} ${version} is affected by CVE-2026-111497 (brotli decompression)`;
+  if (name === "bun" && below([1, 4, 4]))
+    return { what, fix: "upgrade to bun 1.4.4 or newer: bun upgrade" };
+  if (name === "node" && v[0] === 22 && below([22, 23, 4]))
+    return { what, fix: "upgrade Node.js to 22.23.4 or newer" };
+  return;
+}
 async function statusCmd(deps = {}) {
   const print = deps.print ?? ((line) => console.log(line));
   const configPath = deps.configPath ?? `${CC_DIR}/config.json`;
@@ -3148,6 +3167,12 @@ async function statusCmd(deps = {}) {
   } else {
     print(row("Phone", "NOT PAIRED — nothing from this computer reaches the app"));
     print(cont(`→ run ${ui.pair}`));
+  }
+  const [rtName, rtVersion] = deps.runtime ?? (process.versions.bun ? ["bun", process.versions.bun] : ["node", process.versions.node]);
+  const floor = runtimeFloorWarning(rtName, rtVersion);
+  if (floor) {
+    print(row("Runtime", floor.what));
+    print(cont(`→ ${floor.fix}`));
   }
   if (config) {
     let watchdog = "watchdog idle (the next turn starts it)";
@@ -3398,5 +3423,6 @@ export {
   parseCodexPluginState,
   parseLanTrace,
   renderLanTrace,
+  runtimeFloorWarning,
   statusCmd
 };

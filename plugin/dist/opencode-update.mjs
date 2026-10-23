@@ -4,7 +4,7 @@ var __require = /* @__PURE__ */ createRequire(import.meta.url);
 // src/entries/opencode-update.ts
 import { spawnSync } from "node:child_process";
 import { existsSync as existsSync2, readFileSync as readFileSync2 } from "node:fs";
-import { dirname as dirname2, join as join2 } from "node:path";
+import { dirname as dirname2, isAbsolute as isAbsolute2, join as join2 } from "node:path";
 import { fileURLToPath as fileURLToPath2 } from "node:url";
 
 // src/core/shared.ts
@@ -100,7 +100,7 @@ async function sha256Hex(s) {
 }
 
 // src/core/shared.ts
-var PLUGIN_VERSION = "2.3.0";
+var PLUGIN_VERSION = "2.3.4";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -193,6 +193,12 @@ function appendFittedPlan(base, plan) {
       hi = mid - 1;
   }
   return { ...base, plan: chars.slice(0, lo).join("") + marker };
+}
+function runtimeArgs(runtime, args) {
+  return /^bun/.test(runtime.slice(runtime.lastIndexOf("/") + 1)) ? ["--config=/dev/null", "--env-file=/dev/null", ...args] : args;
+}
+function sidField(sessionId) {
+  return typeof sessionId === "string" && sessionId.length > 0 ? { sid: sessionId } : {};
 }
 function appendFittedPlanAndDebug(base, plan, dbg) {
   const withPlan = appendFittedPlan(base, plan);
@@ -410,6 +416,7 @@ function opencodeStubPaths() {
 function opencodeStubTarget(text) {
   return /^export \{ default \} from "(.+)";$/m.exec(text)?.[1];
 }
+var REMOTE_IS_OURS = /^(https:\/\/github\.com\/|ssh:\/\/git@github\.com\/|git@github\.com:)KarrixLee\/nomo(\.git)?\/?$/i;
 var FOLDER_KEY_HEX_CHARS = 12;
 var BRANCH_MAX_CHARS = 60;
 var GIT_DIR_WALK_MAX_DEPTH = 64;
@@ -817,7 +824,7 @@ function ensureWatchdog(deps = {}) {
     const killPid = deps.killPid ?? ((pid, signal) => process.kill(pid, signal));
     const spawnWatchdog = deps.spawnWatchdog ?? (() => {
       const runtime = process.env.NOMO_RUNTIME && process.env.NOMO_RUNTIME.length > 0 ? process.env.NOMO_RUNTIME : process.execPath;
-      spawn(runtime, [WATCHDOG_PATH], { detached: true, stdio: "ignore" }).unref();
+      spawn(runtime, runtimeArgs(runtime, [WATCHDOG_PATH]), { detached: true, stdio: "ignore" }).unref();
     });
     const raw = readPidfile();
     const holder = typeof raw === "string" ? parseWatchdogPidfile(raw) : null;
@@ -1093,8 +1100,10 @@ function checkUpdate(deps = {}) {
   const self = deps.self ?? dirname2(fileURLToPath2(import.meta.url));
   const candidates = [
     ...(deps.stubPaths ?? opencodeStubPaths()).map((path) => ({ path, project: false })),
-    { path: join2(cwd, ".opencode", "plugins", "nomo.js"), project: true },
-    { path: join2(cwd, ".opencode", "plugin", "nomo.js"), project: true }
+    ...deps.global ? [] : [
+      { path: join2(cwd, ".opencode", "plugins", "nomo.js"), project: true },
+      { path: join2(cwd, ".opencode", "plugin", "nomo.js"), project: true }
+    ]
   ];
   let stub;
   let target;
@@ -1109,13 +1118,15 @@ function checkUpdate(deps = {}) {
     stub = c.path;
     project = c.project;
     target = opencodeStubTarget(text);
+    if (target !== undefined && !(isAbsolute2(target) && target.endsWith("/plugin/dist/opencode.js")))
+      target = undefined;
     break;
   }
   const installer = join2(dirname2(self), "scripts", "opencode-install.sh");
   if (stub === undefined) {
     return {
       state: "blocked",
-      line: "OpenCode has no Nomo plugin stub — nothing here is installed, so there is nothing to update.",
+      line: deps.global ? "OpenCode has no global Nomo plugin stub, so there is nothing to update globally. If you installed Nomo into a project, run /nomo-update inside OpenCode there." : "OpenCode has no Nomo plugin stub — nothing here is installed, so there is nothing to update.",
       hint: `install it: ${installer}`
     };
   }
@@ -1146,6 +1157,16 @@ function checkUpdate(deps = {}) {
     };
   }
   const root = top.stdout;
+  const origin = git(root, ["remote", "get-url", "origin"]);
+  if (origin.status !== 0 || !REMOTE_IS_OURS.test(origin.stdout.trim())) {
+    return {
+      state: "blocked",
+      root,
+      line: `${root} is not a Nomo checkout (its origin is ${origin.stdout.trim() || "unset"}) — it is left alone.`,
+      hint: `re-install from Nomo's own checkout:
+  bunx nomo-ai --opencode`
+    };
+  }
   let from;
   try {
     from = manifestVersion(readFileSync2(join2(root, VERSION_MANIFEST), "utf8"));
@@ -1269,11 +1290,11 @@ function opencodeUpdate(deps = {}) {
 }
 if (__require.main == __require.module) {
   if (process.argv.includes("--check")) {
-    console.log("usage: opencode-update [--dry-run] [--check]  — pull the checkout OpenCode loads Nomo from, then re-run its installer (--dry-run reports the verdict and changes nothing)");
+    console.log("usage: opencode-update [--dry-run] [--global] [--check]  — pull the checkout OpenCode loads Nomo from, then re-run its installer (--dry-run reports the verdict and changes nothing)");
     process.exit(0);
   }
   if (process.argv.includes("--dry-run") || process.argv.includes("-n")) {
-    const found = checkUpdate();
+    const found = checkUpdate({ global: process.argv.includes("--global") });
     console.log(found.line);
     if (found.hint)
       for (const l of found.hint.split(`
@@ -1281,7 +1302,7 @@ if (__require.main == __require.module) {
         console.log(`→ ${l}`);
     process.exit(found.state === "blocked" ? 1 : 0);
   }
-  process.exit(opencodeUpdate());
+  process.exit(opencodeUpdate({ global: process.argv.includes("--global") }));
 }
 export {
   checkUpdate,
