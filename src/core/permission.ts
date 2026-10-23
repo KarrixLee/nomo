@@ -736,7 +736,10 @@ export function buildPermissionSummary(toolName: string, toolInput: Record<strin
       // long pipeline, and it still rides in buildPermissionDetail below. Codex's shell/local_shell send
       // no description, so they keep the first command line exactly as before.
       const desc = str(toolInput.description);
-      if (desc) return truncate(desc);
+      // Capped in code points so an astral character is never split into a lone surrogate. The cap
+      // alone does not protect the command (80 control characters escape to ~480 JSON chars), so
+      // runPermissionHook also sheds this description entirely before it lets the command go.
+      if (desc) return capPermissionWireText(desc, 80);
       const cmd = str(toolInput.command);
       return cmd ? truncate(cmd.split("\n")[0]) : toolName;
     }
@@ -1640,9 +1643,17 @@ export async function runPermissionHook(
       permissionToolName: toolName,
     };
     const rawDetail = deps.detail ?? buildPermissionDetail(toolName, toolInput);
-    const fitted = fitPermissionDetail(
+    let fitted = fitPermissionDetail(
       permissionBase, rawDetail, BLOB_FIT_CHARS, buildPermissionQuestions(toolInput),
     );
+    // Shell cards: the command outranks the model-written description. If the description crowded the
+    // command out entirely (the floor guard dropped the detail), give the summary back to the bare tool
+    // name, the same fallback a summary uses when it has nothing to say, and fit again.
+    if (fitted.detail === "" && rawDetail !== "" && summary !== toolName
+      && (toolName === "Bash" || toolName === "shell" || toolName === "local_shell")) {
+      permissionBase.permissionSummary = toolName;
+      fitted = fitPermissionDetail(permissionBase, rawDetail);
+    }
     // NOM-44 phase 4: the fit above is the WORKER's ceiling and stays exactly as it is, but a phone on
     // this network can pull from the Mac directly, where there is none — so tee the UNABRIDGED detail
     // (the whole ExitPlanMode plan, the whole multi-line Bash command) onto the 0600 session record for

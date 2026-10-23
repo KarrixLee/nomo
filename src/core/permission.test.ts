@@ -2144,6 +2144,27 @@ describe("runPermissionHook — decision blob detail fields", () => {
     expect(sawDroppedDetail).toBe(true);
   }, 30_000);
 
+  // The model-written description is the least important text on a shell card. A ~2000-char one
+  // (control characters escape 6x in JSON) on a fat base used to crowd the command out through the floor
+  // guard; the summary now falls back to the tool name first, so the command still rides.
+  test("Bash: a long description never crowds out the command", async () => {
+    for (const description of ["d".repeat(2000), "\u0001".repeat(2000)]) {
+      const { body, blob } = await postedBlob({
+        readRecordFn: async () => ({ pid: 1, machine: "m", label: "api-status", title: "y".repeat(1950), ts: 1000, model: "claude-opus-5" }),
+        readInput: async () => inputWith({ tool_input: { command: "rm -rf build", description } }),
+      });
+      expect(body.blob.length).toBeLessThanOrEqual(BLOB_FIT_CHARS);
+      expect(blob.permissionDetail).toBe("rm -rf build");
+      expect(blob.permissionSummary).toBe("Bash");
+    }
+  });
+
+  test("Bash: the description summary is capped in code points, never splitting a surrogate pair", () => {
+    const out = buildPermissionSummary("Bash", { command: "ls", description: "😀".repeat(200) });
+    expect(Array.from(out)).toHaveLength(80);
+    expect(out).toBe(`${"😀".repeat(79)}…`);
+  });
+
   test("ExitPlanMode → the plan rides as permissionDetail; a short plan omits the truncation count", async () => {
     const plan = "# Plan\n\n1. Do the thing\n2. Do the other thing\n\n**Risk:** low";
     const { blob } = await postedBlob({
