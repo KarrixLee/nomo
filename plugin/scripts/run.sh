@@ -84,7 +84,7 @@ nomo_atomic_copy() {
 # root baked into the command file has gone stale. A rev-2 shim silently exits 0 on that name, which
 # for an interactive command reads as "did nothing" — the one outcome this project treats as worse
 # than an error.
-# rev 4 (v2.3.1): the marketplace-checkout fallback scan is gone (NOM-134), so installed shims must refresh.
+# rev 4 (v2.3.4): the marketplace-checkout fallback scan is gone (NOM-134), so installed shims must refresh.
 NOMO_SHIM_REV=4
 
 # Numeric semver compare: true when $1 sorts strictly AFTER $2. A DELIBERATE TWIN of the function in
