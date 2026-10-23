@@ -24,7 +24,7 @@ import { hostname } from "node:os";
 import { buildEnvelope, markDoneDelivered, trackSession } from "../core/hook";
 import {
   atomicWrite, CC_DIR, Config, ensureWatchdog, folderIdentity, FolderIdentity, fullTextForRecord,
-  lastHookPath, loadConfig, postFullText, SessionOrigin, WATCHDOG_PATH,
+  lastHookPath, loadConfig, postFullText, runtimeArgs, SessionOrigin, WATCHDOG_PATH,
 } from "../core/shared";
 import {
   ocDecisionRequest, OcDecisionRequest, ocPost, ocResolvedRequestId, ocResolveOnRelay, runOcApproval,
@@ -85,7 +85,7 @@ function isExecutable(path: string): boolean {
 function spawnWatchdog(): void {
   const runtime = resolveRuntime();
   if (!runtime) return; // silence is the contract; the worker's eviction is the remaining backstop
-  spawn(runtime, [WATCHDOG_PATH], { detached: true, stdio: "ignore" }).unref();
+  spawn(runtime, runtimeArgs(runtime, [WATCHDOG_PATH]), { detached: true, stdio: "ignore" }).unref(); // NOM-133
 }
 
 /** How long a CONFIRMED-live watchdog is taken on trust before we look again. A hook pays the check

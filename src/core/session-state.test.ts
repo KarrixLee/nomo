@@ -280,12 +280,18 @@ describe("computeSessionState — the ranking table", () => {
   // CARRY A STATE THE RECORD ITSELF DID NOT WRITE, and the state machine cannot read its own sealed blob
   // to find out. Authoring also restores invariant 22 (textual identity with the worker's own corrective,
   // buildDoneEnvelope), which the sealed passthrough was quietly breaking on every corrective done.
+  test("NOM-125: a LAN-authored plaintext carries `sid` = the frame's sessionId", () => {
+    const s = state({ record: rec({ op: "done", lastEvent: "done", prio: 1, blob: "sealed" }) })!;
+    expect((s.blob as { value: Record<string, unknown> }).value.sid).toBe(SESSION);
+    expect(Object.keys(buildStatePlaintext(rec({}), "working", NOW))).not.toContain("sid"); // unknown id → omitted
+  });
+
   test("RANK 3 · done AUTHORS its blob — a corrective done never re-serves the record's stale blob", () => {
     // The field record, verbatim: op:done + the prio:1 needsAttention blob the Notification hook left.
     const corrected = rec({ op: "done", lastEvent: "done", prio: 1, blob: "sealed-needs-attention" });
     expect(state({ record: corrected })).toEqual({
       state: "done", terminal: false, ts: NOW, why: "done", agent: "claude",
-      blob: { kind: "plain", value: buildStatePlaintext(corrected, "done", NOW) },
+      blob: { kind: "plain", value: buildStatePlaintext(corrected, "done", NOW, undefined, SESSION) },
     });
     // …and the authored plaintext SAYS done, which is the whole point: it is what the phone renders.
     expect(buildStatePlaintext(corrected, "done", NOW).status).toBe("done");
@@ -541,7 +547,7 @@ describe("computeSessionState — what CC's file may and may not do (invariant 1
     const record = older({ op: "done" });
     const s = withCc({ status: "idle", statusUpdatedAt: CC_AT }, { record })!;
     expect(s).toMatchObject({ state: "done", why: "done+cc" });
-    expect(s.blob).toEqual({ kind: "plain", value: buildStatePlaintext(record, "done", RECORD_AT, "api-status-53") });
+    expect(s.blob).toEqual({ kind: "plain", value: buildStatePlaintext(record, "done", RECORD_AT, "api-status-53", SESSION) });
     // Identical blob with and without CC's corroboration — only `why` moves, which is the invariant.
     const bare = state({ record })!;
     expect(bare.why).toBe("done");

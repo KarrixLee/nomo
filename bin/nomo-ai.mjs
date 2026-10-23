@@ -135,16 +135,42 @@ function onPath(name) {
   return false;
 }
 
+/** CVE-2026-111497 (brotli decompression) runtime floor — a DELIBERATE TWIN of runtimeFloorWarning in
+ *  src/entries/status-cmd.ts (this file ships alone, so it cannot import it). Any bun below 1.4.4, and
+ *  node 22.x below 22.23.4; other node lines have no verified fix version and are not flagged. */
+/** @param {string} name @param {string} version @returns {{ what: string, fix: string } | undefined} */
+function runtimeFloorWarning(name, version) {
+  const v = String(version).replace(/^v/, "").split(/[.+-]/).slice(0, 3).map(Number);
+  if (v.length < 3 || v.some((n) => !Number.isInteger(n))) return undefined;
+  const below = (/** @type {number[]} */ f) => (v[0] !== f[0] ? v[0] < f[0] : v[1] !== f[1] ? v[1] < f[1] : v[2] < f[2]);
+  const what = `${name} ${version} is affected by CVE-2026-111497 (brotli decompression)`;
+  if (name === "bun" && below([1, 4, 4])) return { what, fix: "upgrade to bun 1.4.4 or newer: bun upgrade" };
+  if (name === "node" && v[0] === 22 && below([22, 23, 4])) return { what, fix: "upgrade Node.js to 22.23.4 or newer" };
+  return undefined;
+}
+
+/** The runtime the plugin's hooks will run on: bun when there is one (run.sh prefers it), else node.
+ *  A WARNING only — the install goes ahead either way. */
+function hookRuntimeFloor() {
+  if (process.versions.bun) return runtimeFloorWarning("bun", process.versions.bun);
+  if (onPath("bun")) {
+    const r = spawnSync("bun", ["--version"], { encoding: "utf8", timeout: 5000 });
+    const v = (r.stdout || "").trim();
+    return v ? runtimeFloorWarning("bun", v) : undefined;
+  }
+  return runtimeFloorWarning("node", process.versions.node);
+}
+
 /** A step failed if it returns a message. stdio is inherited so the host's own output — which is
  *  usually the real explanation — reaches the user unfiltered. */
-function run(cmd, args) {
+function run(cmd, args, opts = {}) {
   const line = [cmd, ...args].join(" ");
   if (DRY) {
     say(`  ${dim("would run:")} ${line}`);
     return null;
   }
   say(`  ${dim("$")} ${line}`);
-  const r = spawnSync(cmd, args, { stdio: "inherit" });
+  const r = spawnSync(cmd, args, { stdio: "inherit", ...opts });
   if (r.error) return `${line}\n  ${r.error.message}`;
   if (r.status !== 0) return `${line}\n  exited ${r.status ?? `on signal ${r.signal}`}`;
   return null;
@@ -155,11 +181,13 @@ function run(cmd, args) {
 const git = (...args) =>
   (spawnSync("git", ["-C", CHECKOUT, ...args], { encoding: "utf8" }).stdout || "").trim();
 
-/** Does this `git remote get-url origin` output name EXACTLY our repo? Anchored on the owner/name
- *  SEGMENT, because a substring test also accepts `KarrixLee/nomo-evil` (or any URL that merely
- *  contains the name) — and what follows this check is a `git pull` aimed at that checkout. Both
- *  spellings git writes are accepted: `https://host/owner/name[.git][/]` and `git@host:owner/name…`. */
-const REMOTE_IS_OURS = new RegExp(`(^|[/:])${REPO}(\\.git)?/?$`);
+/** Does this `git remote get-url origin` output name EXACTLY our repo? Anchored at BOTH ends on a
+ *  github.com host — what follows this check is a `git pull` aimed at that checkout, so another host,
+ *  a GitLab-style subgroup path, or `KarrixLee/nomo-evil` must all fail. The three spellings git writes
+ *  are accepted (`https://github.com/…`, `ssh://git@github.com/…`, `git@github.com:…`), each with an
+ *  optional `.git` and trailing slash, case-insensitively (GitHub names are).
+ *  src/core/shared.ts carries the same pattern for opencode-update (a test pins the two together). */
+const REMOTE_IS_OURS = new RegExp(`^(https://github\\.com/|ssh://git@github\\.com/|git@github\\.com:)${REPO}(\\.git)?/?$`, "i");
 /** @param {string} remote */
 const isOurCheckout = (remote) => REMOTE_IS_OURS.test(remote.trim());
 
@@ -172,6 +200,12 @@ const interactive = () => Boolean(process.stdin.isTTY && process.stdout.isTTY);
  *  ~/.nomo simply takes the install path below — which pulls, and thereby installs this file for next
  *  time. Nothing to migrate. */
 const UPDATE_ENTRY = join(CHECKOUT, "plugin", "dist", "opencode-update.mjs");
+/** How this installer runs that updater: GLOBAL scope (`--global`), from $HOME. It only ever installs
+ *  globally, so the directory somebody ran `bunx nomo-ai` from must not steer which checkout gets pulled
+ *  and whose installer gets executed — the cwd stub is `/nomo-update`'s business, inside OpenCode. The
+ *  cwd also covers an older updater that predates `--global` and ignores it. */
+const UPDATE_ARGS = [UPDATE_ENTRY, "--global"];
+const UPDATE_OPTS = { cwd: homedir() };
 
 /** Cursor's installer inside the checkout, and Cursor's config dir (`$CURSOR_CONFIG_DIR` is the CLI's
  *  own documented override — the installer honours the same variable). */
@@ -441,7 +475,7 @@ const AGENTS = [
       // path refuses a detached checkout precisely so it can never undo one. So the flag keeps the
       // clone/pin leg below, and only a plain run hands off to the updater.
       if (!REF && STATUS.get("opencode")?.installed) {
-        const fail = run(process.execPath, [UPDATE_ENTRY]);
+        const fail = run(process.execPath, UPDATE_ARGS, UPDATE_OPTS);
         return fail
           ? { error: fail, hint: `The updater prints what it refused to do and the command to run by hand.\n    git -C ${CHECKOUT} status` }
           : null;
@@ -567,7 +601,7 @@ function preflight(selected, explicit) {
   // is already the one line a human should read (plus a `→` fix line when it refuses), so it is shown
   // verbatim rather than re-worded here — the plan preview and /nomo-update must not describe the same
   // state in two different sentences.
-  const r = spawnSync(process.execPath, [UPDATE_ENTRY, "--dry-run"], { encoding: "utf8" });
+  const r = spawnSync(process.execPath, [...UPDATE_ARGS, "--dry-run"], { encoding: "utf8", ...UPDATE_OPTS });
   const out = `${r.stdout || ""}${r.stderr || ""}`.trim();
   oc.lines = out.length > 0 ? out.split("\n") : [`could not check ${CHECKOUT} for updates`];
 }
@@ -946,6 +980,13 @@ async function main() {
   }
 
   banner();
+
+  const floor = hookRuntimeFloor();
+  if (floor) {
+    say(`${bold("Warning:")} ${floor.what}.`);
+    say(`  Nomo still installs and runs; ${floor.fix}`);
+    say();
+  }
 
   const explicit = args.picked.size > 0;
   const found = AGENTS.filter((a) => a.detect()).map((a) => a.id);

@@ -105,6 +105,12 @@ In plain English:
   keys it would need are already gone. Mixing the code into the handshake also stops a relay from
   quietly swapping the public keys (a man-in-the-middle): if it tampers, pairing fails instead of
   silently succeeding under the attacker's key.
+- **Each sealed session update names its own session.** The session id travels in the clear (the
+  relay routes by it), so every sealed session blob also carries the same id inside the seal (`sid`).
+  The app treats a blob whose sealed `sid` differs from the session it is listed under as unreadable,
+  so a relay cannot relabel one session's real update as another's and steer a *Move to cloud* or
+  *Bring back* tap onto the wrong session. Updates from plugins older than this carry no `sid` and are
+  still shown.
 
 ## Cloud handoff — security
 
@@ -186,6 +192,11 @@ home. What that does and doesn't expose:
 - **The box is its own paired computer.** It pairs with your phone under its own keys ("Nomo Cloud"),
   so phone ↔ box traffic is end-to-end sealed exactly like your Mac's, and the relay stays blind:
   it sees ids and flags (op, priority, a `parked` boolean), never titles or content.
+- **The box's pairing QR is checked before it is shown.** Box output is untrusted, so the Mac shows
+  the box's pairing link only when it is the exact `nomo://pair` shape Nomo prints and it points at
+  the same worker this Mac uses (its pairing's worker, or `--worker`). Anything else is refused with
+  a message and no QR, so a tampered box cannot steer your phone to pair with a server you did not
+  choose. A box that reports it is already paired never gets a QR.
 - **Phone commands** (*Bring back*, *Move to cloud*) are sealed by the phone with the pairing key
   (AES-256-GCM). That seal is what makes them phone-only: the relay carries an opaque blob and
   cannot forge, read or alter one. The plugin checks each one itself: an allow-listed kind and a
@@ -406,6 +417,14 @@ It refuses, loudly and specifically, rather than guessing: a checkout pinned to 
 a branch), a dirty tree, no upstream, a diverged history, an unreachable remote, and a stub whose
 checkout has been moved or deleted. Every refusal names the command to run by hand.
 
+**It only ever acts on Nomo's own checkout.** Updating runs git in the checkout and then executes its
+`opencode-install.sh`, so the stub is not taken on faith: its target must be an absolute
+`<checkout>/plugin/dist/opencode.js` (what the installer writes), and the checkout's `origin` must be
+this repo on github.com (`https://`, `ssh://` or `git@github.com:`), or it refuses before running
+anything there. `bunx nomo-ai` updates global scope only, from
+your home directory, so the folder you happen to run it in can never pick the checkout; a project
+`./.opencode` stub is read only by `/nomo-update` inside that project.
+
 **The mechanism, for the curious.** OpenCode has no marketplace and no `plugin update`, so the
 *checkout is the version* — `~/.config/opencode/plugins/nomo.js` is a one-line re-export of an
 absolute `<checkout>/plugin/dist/opencode.js`, and updating means pulling that checkout and re-running
@@ -535,6 +554,36 @@ until the phone answers, the request is expired or superseded server-side, or th
 killed (Esc at the terminal, or the agent's own hook timeout). Nomo can delay a decision; it can
 never make one for you. Details:
 [docs.nomo.gg/sessions/approvals](https://docs.nomo.gg/sessions/approvals).
+
+**"Always allow (this session)" stays in this session.** Claude Code suggests narrow rules for an
+always-allow (for example `Bash(bun test:*)`) and often marks them to be saved to
+`.claude/settings.local.json`. Nomo keeps the allow rules, extra directories and mode switches CC
+suggested and rewrites every one to `destination: "session"`, dropping deny rules and the
+`bypassPermissions` / `dontAsk` modes, so a tap on the phone never writes to a settings file and the
+grant ends with the session. It never widens CC's suggestion: the whole-tool rule (for example plain
+`Read`) is used only when CC suggested nothing at all; if everything CC suggested was dropped, the
+tap is a one-time allow.
+
+**Shell cards keep the command.** The one-line description on a shell approval is written by the
+model, so Nomo treats it as a caption: it is kept short, and when the card runs out of room the
+description is dropped before the command is.
+
+## Hooks on your computer — security
+
+- **Your project's runtime config is never loaded into Nomo's hooks.** Hooks run with your project as
+  their working folder, and bun reads `bunfig.toml` (whose `preload` runs code) and `.env` files from
+  the working folder at startup. Whenever the runtime is bun, Nomo starts it with
+  `--config=/dev/null --env-file=/dev/null`, which turns both off; the same goes for processes Nomo
+  starts itself (the watchdog, a handoff, a phone-started move). Node.js reads neither file and is
+  started as-is. The working folder is left alone, so version managers (asdf, mise, proto, nodenv) that
+  pick the runtime from it keep working.
+- **Only installed copies of Nomo are launched.** The version-stable hook shim runs the copy that last
+  ran, or the newest installed copy in the Claude Code / Codex plugin cache. It never runs code from a
+  marketplace you added but did not install.
+- **Runtime floor.** bun before 1.4.4 and Node.js 22 before 22.23.4 are affected by CVE-2026-111497
+  (brotli decompression). `/nomo-cc:status` (and `$nomo-status`, `/nomo-status`) and the
+  `nomo-ai` installer print a warning naming the runtime and how to upgrade (`bun upgrade`). It is
+  only a warning: hooks keep running.
 
 ## How it works
 

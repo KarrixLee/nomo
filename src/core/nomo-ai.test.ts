@@ -11,7 +11,7 @@
 // with no exports (it runs main() on import) — the same reason hook-shim.test.ts drives the real shell
 // scripts rather than reimplementing them. `--dry-run` guarantees nothing is installed or written.
 
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test } from "bun:test";
@@ -90,5 +90,36 @@ describe("the Codex row is gated on the marketplace's source_type", () => {
     expect(out).toContain("codex plugin marketplace add KarrixLee/nomo");
     expect(out).toContain("codex plugin add nomo@nomo");
     expect(out).not.toContain("already installed");
+  });
+});
+
+describe("runtime floor (CVE-2026-111497): a warning, never a block", () => {
+  const withBun = async (version: string): Promise<string> => {
+    const home = await machine("git");
+    const bin = join(home, "fakebin");
+    await mkdir(bin, { recursive: true });
+    await writeFile(join(bin, "bun"), `#!/bin/sh\necho ${version}\n`);
+    await chmod(join(bin, "bun"), 0o755);
+    const proc = spawnTestProcess({
+      cmd: ["node", NOMO_AI, "--dry-run", "--codex"],
+      cwd: home,
+      env: isolatedTestEnv(home, { NO_COLOR: "1", PATH: `${bin}:${process.env.PATH}` }),
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [out, err] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
+    expect(await proc.exited).toBe(0);
+    return `${out}${err}`;
+  };
+
+  test("bun 1.4.3 on PATH: names the runtime, the version and `bun upgrade`, and still plans the install", async () => {
+    const out = await withBun("1.4.3");
+    expect(out).toContain("bun 1.4.3 is affected by CVE-2026-111497");
+    expect(out).toContain("bun upgrade");
+    expect(out).toContain("codex plugin");
+  });
+
+  test("bun 1.4.4: no warning", async () => {
+    expect(await withBun("1.4.4")).not.toContain("CVE-2026-111497");
   });
 });

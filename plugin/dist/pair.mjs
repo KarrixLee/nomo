@@ -231,6 +231,12 @@ function boxPairedCached(now = Date.now()) {
     boxMemo = { at: now, v: boxPaired() };
   return boxMemo.v;
 }
+function runtimeArgs(runtime, args) {
+  return /^bun/.test(runtime.slice(runtime.lastIndexOf("/") + 1)) ? ["--config=/dev/null", "--env-file=/dev/null", ...args] : args;
+}
+function sidField(sessionId) {
+  return typeof sessionId === "string" && sessionId.length > 0 ? { sid: sessionId } : {};
+}
 function appendFittedPlanAndDebug(base, plan, dbg) {
   const withBox = base.agent === undefined && boxPairedCached() ? { ...base, box: true } : base;
   const withPlan = appendFittedPlan(withBox, plan);
@@ -458,6 +464,7 @@ function opencodeStubPaths() {
 function opencodeStubTarget(text) {
   return /^export \{ default \} from "(.+)";$/m.exec(text)?.[1];
 }
+var REMOTE_IS_OURS = /^(https:\/\/github\.com\/|ssh:\/\/git@github\.com\/|git@github\.com:)KarrixLee\/nomo(\.git)?\/?$/i;
 var FOLDER_KEY_HEX_CHARS = 12;
 var BRANCH_MAX_CHARS = 60;
 var GIT_DIR_WALK_MAX_DEPTH = 64;
@@ -865,7 +872,7 @@ function ensureWatchdog(deps = {}) {
     const killPid = deps.killPid ?? ((pid, signal) => process.kill(pid, signal));
     const spawnWatchdog = deps.spawnWatchdog ?? (() => {
       const runtime = process.env.NOMO_RUNTIME && process.env.NOMO_RUNTIME.length > 0 ? process.env.NOMO_RUNTIME : process.execPath;
-      spawn(runtime, [WATCHDOG_PATH], { detached: true, stdio: "ignore" }).unref();
+      spawn(runtime, runtimeArgs(runtime, [WATCHDOG_PATH]), { detached: true, stdio: "ignore" }).unref();
     });
     const raw = readPidfile();
     const holder = typeof raw === "string" ? parseWatchdogPidfile(raw) : null;

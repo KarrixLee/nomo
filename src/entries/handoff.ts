@@ -88,7 +88,7 @@ import { normalizeModelId } from "../core/adapter";
 import { cloudReadiness, gitProbe, isSecretName, setupSteps, trackedSecretFiles } from "../core/readiness";
 import { scanHandoff, secretSummary } from "../core/transcript-scan";
 import { backLockHolder, clearPark, cloudActive, moveResultFile, type MoveWhy, PARK_DIR, writeBackResult, writeMoveResult, readPark, releaseBackLock, stageLanding, takeBackLock, writePark } from "../core/park";
-import { atomicWrite, CC_DIR, macWorkerUrl, pidAlive, pidAncestors, pidCommand, readRecord, SESSIONS_DIR } from "../core/shared";
+import { atomicWrite, CC_DIR, macWorkerUrl, pidAlive, pidAncestors, pidCommand, readRecord, runtimeArgs, SESSIONS_DIR } from "../core/shared";
 import {
   BOX_MAX_SESSIONS, cancelPending, claimPending, DEFAULT_THEN, EXIT_BOX_GONE, phoneMoveCheck, settleThenStamp, contextTokens, contextTokensOf, GONE_MSG, sizeWarning, TAIL_BYTES, handoffArgv, LATER_LOG, LATER_USAGE, laterStatus, manifestLine, manifestMessage, manifestPath, type Setup, takeManifest, transcriptSecretWarning, needsPairing, parseLaterArg, type Pending, PENDING_PATH, readPending, resolveSession, waitThenHandoff,
 } from "../core/handoff-later";
@@ -359,6 +359,31 @@ export function takePairUrl(stdout: string): { url?: string; rest: string } {
     return false;
   }).join("\n");
   return { url, rest };
+}
+
+/** NOM-123: box stdout is untrusted, so the pairing link it prints is only shown when it is exactly the
+ *  canonical `nomo://pair` shape buildPairURL emits AND points at the worker the Mac chose (`u` absent =
+ *  the production default). Returns why it was refused, or null when it is safe to show. */
+export function boxPairUrlProblem(url: string, worker: string): string | null {
+  let u: URL;
+  try { u = new URL(url); } catch { return "it is not a valid link"; }
+  if (u.protocol !== "nomo:" || u.host !== "pair" || u.pathname !== "") return "it is not a nomo://pair link";
+  const q = u.searchParams;
+  const keys = [...q.keys()];
+  if (new Set(keys).size !== keys.length || keys.some((k) => !["v", "u", "p", "s", "e"].includes(k))) return "it carries unexpected fields";
+  const b64 = (v: string | null, bytes: number): boolean => {
+    if (!v || !/^[A-Za-z0-9_-]+$/.test(v)) return false;
+    try { return fromB64url(v).length === bytes; } catch { return false; }
+  };
+  if (q.get("v") !== "1" || !/^[0-9a-f]{32}$/.test(q.get("p") ?? "") || !b64(q.get("s"), 16) || !b64(q.get("e"), 65)) {
+    return "it is malformed";
+  }
+  let target = DEFAULT_WORKER_URL;
+  const raw = q.get("u");
+  if (raw !== null) {
+    try { target = new TextDecoder("utf-8", { fatal: true }).decode(fromB64url(raw)); } catch { return "its worker is unreadable"; }
+  }
+  return target === worker ? null : `it points at ${JSON.stringify(target)}, not your worker ${worker}`;
 }
 
 /** The plugin dir to ship: <root>/dist/handoff.mjs in a built/installed plugin, <repo>/plugin from src/. */
@@ -1323,7 +1348,13 @@ async function afterPair(omg: string, id: string, stdout: string, worker: string
   const old = rest.match(/^NOMO_REPAIR: (.*)$/m);
   if (old) console.log(`\nThe box was paired to ${old[1] || "another worker"}; pairing it again to the target worker.`);
   if (failed) console.log(`\nNomo pairing on the box failed: ${failed[1]}\nRetry with: bun plugin/dist/handoff.mjs --pair`);
-  if (url) await showPairing(omg, id, url, worker);
+  if (!url || paired) return; // already paired to this worker: never act on a stray link
+  const problem = boxPairUrlProblem(url, worker);
+  if (problem) {
+    console.log(`\nRefusing the box's pairing link: ${problem}. Not showing a QR. If the box is not yours or was tampered with, delete it; otherwise retry with: bun plugin/dist/handoff.mjs --pair`);
+    return;
+  }
+  await showPairing(omg, id, url, worker);
 }
 
 // ------------------------------------------------------------------------------------ bring back
@@ -1834,8 +1865,8 @@ function arm(session: string, claudePid: number, cwd: string, message: string | 
   }
   writePark(session, { state: "moving", pid: claudePid });
   const fd = openSync(LATER_LOG, "w", 0o600);
-  const child = spawn(process.execPath, [SELF, "--after-exit", "--session", session, "--claude-pid", String(claudePid), "--worker", worker],
-    { cwd, detached: true, stdio: ["ignore", fd, fd] });
+  const child = spawn(process.execPath, runtimeArgs(process.execPath, [SELF, "--after-exit", "--session", session, "--claude-pid", String(claudePid), "--worker", worker]),
+    { cwd, detached: true, stdio: ["ignore", fd, fd] }); // NOM-133
   child.unref();
   writeFileSync(PENDING_PATH, JSON.stringify({ ...p, helperPid: child.pid }) + "\n", { mode: 0o600 });
   return true;
@@ -1897,7 +1928,7 @@ async function afterExit(args: Map<string, string | true>, worker: string): Prom
         runtime: process.execPath, self: SELF, shim: `${CC_DIR}/hook-shim.sh`, args: ["--session", session, "--worker", worker], exists: existsSync,
       });
       if (!argv) return rej(new Error(GONE_MSG));
-      spawn(argv[0], argv.slice(1), { stdio: "inherit", env: { ...process.env, NOMO_HANDOFF_HELPER: "1", ...(message ? { NOMO_THEN: message } : {}) } })
+      spawn(argv[0], runtimeArgs(argv[0], argv.slice(1)), { stdio: "inherit", env: { ...process.env, NOMO_HANDOFF_HELPER: "1", ...(message ? { NOMO_THEN: message } : {}) } }) // NOM-133
         .on("exit", (c) => res(c ?? 1)).on("error", () => res(1));
     }),
     log: (line) => console.log(`[${new Date().toISOString()}] ${line}`),

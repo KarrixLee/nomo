@@ -52,6 +52,8 @@ const CODEX_PLUGIN_HOOK_COUNT = 10;
 
 export interface StatusDeps {
   print?: (line: string) => void;
+  /** The hook runtime as [name, version]; defaults to the one running this command. */
+  runtime?: [string, string];
   /** WHICH AGENT ASKED — the whole point of the argument the three launch blocks now pass. That agent
    *  gets its own labelled section directly under the machine-wide facts; the others collapse to one
    *  line each (plus any genuine problem, which is never hidden — see renderOther). Undefined is the
@@ -414,6 +416,21 @@ async function readMsMarker(path: string): Promise<number> {
 }
 
 /** Print the status block. Returns an exit code (always 0). */
+/** CVE-2026-111497 (brotli decompression): bun 1.4.2/1.4.3 are vulnerable and 1.4.4 fixes it, so any
+ *  bun below 1.4.4 is flagged; node is flagged only on the 22.x line below 22.23.4 (the one fix version
+ *  verified — other node lines get no guess). A WARNING, never a block: hooks keep running on any
+ *  runtime, because silently disabled hooks are worse than an old runtime. The installer
+ *  (bin/nomo-ai.mjs) carries a deliberate twin. Pure. */
+export function runtimeFloorWarning(name: string, version: string): { what: string; fix: string } | undefined {
+  const v = version.replace(/^v/, "").split(/[.+-]/).slice(0, 3).map(Number);
+  if (v.length < 3 || v.some((n) => !Number.isInteger(n))) return undefined;
+  const below = (f: number[]): boolean => v[0] !== f[0] ? v[0]! < f[0]! : v[1] !== f[1] ? v[1]! < f[1]! : v[2]! < f[2]!;
+  const what = `${name} ${version} is affected by CVE-2026-111497 (brotli decompression)`;
+  if (name === "bun" && below([1, 4, 4])) return { what, fix: "upgrade to bun 1.4.4 or newer: bun upgrade" };
+  if (name === "node" && v[0] === 22 && below([22, 23, 4])) return { what, fix: "upgrade Node.js to 22.23.4 or newer" };
+  return undefined;
+}
+
 export async function statusCmd(deps: StatusDeps = {}): Promise<number> {
   const print = deps.print ?? ((line: string) => console.log(line));
   const configPath = deps.configPath ?? `${CC_DIR}/config.json`;
@@ -473,6 +490,14 @@ export async function statusCmd(deps: StatusDeps = {}): Promise<number> {
   } else {
     print(row("Phone", "NOT PAIRED — nothing from this computer reaches the app"));
     print(cont(`→ run ${ui.pair}`));
+  }
+
+  // The runtime run.sh picked for every hook (this command runs under the same one).
+  const [rtName, rtVersion] = deps.runtime ?? (process.versions.bun ? ["bun", process.versions.bun] : ["node", process.versions.node]);
+  const floor = runtimeFloorWarning(rtName, rtVersion);
+  if (floor) {
+    print(row("Runtime", floor.what));
+    print(cont(`→ ${floor.fix}`));
   }
 
   if (config) {

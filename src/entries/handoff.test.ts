@@ -11,7 +11,7 @@ import { b64url, generateEphemeralKeyPair } from "../core/crypto";
 import { buildPairURL } from "../core/pair-url";
 import {
   BOX_MACHINE_NAME, bakeScript, checkLaunchIds, PAIR_FN, PAIR_POLL, packRefusal, SHM_SWEEP, targetWorker, userLayerFiles, boxPairPayload, createBody, lastModel, latestSession, paneScript, projectDirName,
-  pubRawFromPkcs8, q, RELAY_PORT, resultPage, takePairUrl, toOpenRouterModel, withReload,
+  boxPairUrlProblem, pubRawFromPkcs8, q, RELAY_PORT, resultPage, takePairUrl, toOpenRouterModel, withReload,
 } from "./handoff";
 import { RELAY_PORT as RELAY_LISTEN_PORT } from "./or-relay";
 import { readCapped, sameWindowBackLine } from "./handoff";
@@ -89,6 +89,26 @@ describe("handoff pure logic", () => {
   test("the pairing URL marker is split out of box stdout, never echoed", () => {
     expect(takePairUrl("pane\nNOMO_PAIR_URL=nomo://pair?v=1&p=x\nmore")).toEqual({ url: "nomo://pair?v=1&p=x", rest: "pane\nmore" });
     expect(takePairUrl("just pane")).toEqual({ url: undefined, rest: "just pane" });
+  });
+
+  test("NOM-123: a box pairing link is shown only when it is canonical and targets the Mac's worker", () => {
+    const pid = "0123456789abcdef0123456789abcdef";
+    const secret = new Uint8Array(16).fill(7);
+    const eph = new Uint8Array(65).fill(4);
+    const prod = buildPairURL("https://api.nomo.gg", pid, secret, eph);
+    const staging = buildPairURL("https://staging.example.dev", pid, secret, eph);
+    expect(boxPairUrlProblem(prod, "https://api.nomo.gg")).toBeNull();
+    expect(boxPairUrlProblem(staging, "https://staging.example.dev")).toBeNull();
+    // a box steering the phone to another worker — or a default-worker link when the Mac uses staging
+    expect(boxPairUrlProblem(buildPairURL("https://evil.example", pid, secret, eph), "https://api.nomo.gg")).toContain("evil.example");
+    expect(boxPairUrlProblem(prod, "https://staging.example.dev")).toContain("api.nomo.gg");
+    // malformed / non-canonical shapes
+    expect(boxPairUrlProblem("not a url", "https://api.nomo.gg")).not.toBeNull();
+    expect(boxPairUrlProblem(prod.replace("nomo://pair", "https://pair"), "https://api.nomo.gg")).not.toBeNull();
+    expect(boxPairUrlProblem(prod + "&u=" + b64url(new TextEncoder().encode("https://evil.example")), "https://api.nomo.gg")).not.toBeNull();
+    expect(boxPairUrlProblem(prod + "&x=1", "https://api.nomo.gg")).not.toBeNull();
+    expect(boxPairUrlProblem(prod.replace(`p=${pid}`, "p=zz"), "https://api.nomo.gg")).not.toBeNull();
+    expect(boxPairUrlProblem(prod.replace("v=1", "v=2"), "https://api.nomo.gg")).not.toBeNull();
   });
 
   test("claude's base URL is the port the relay listens on", () => {

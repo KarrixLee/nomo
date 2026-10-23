@@ -155,12 +155,11 @@ do
 done
 if [ -n "$nomo_best" ]; then nomo_launch "$nomo_best" "$@"; fi
 
-# (c) LAST RESORT — a marketplace installed straight from git keeps an unversioned working copy here.
-# It has no version to rank, so it is only consulted when the versioned caches produced nothing.
-for nomo_d in "$HOME"/.claude/plugins/marketplaces/*/plugin/ "$HOME"/.codex/plugins/marketplaces/*/plugin/; do
-  case "$nomo_d" in *'*'*) continue ;; esac
-  nomo_launch "${nomo_d%/}" "$@"
-done
+# NO MARKETPLACE SCAN (NOM-134). A step (c) used to glob ~/.claude|.codex/plugins/marketplaces/*/plugin/
+# and launch the first checkout with a run.sh — but a marketplace checkout is only something the user
+# ADDED, not a plugin they installed (hosts run installed plugins from the versioned cache above), so any
+# added-but-never-installed marketplace could get its code run by a still-wired Codex notify after nomo
+# was uninstalled. Only the stamped root and installed cache versions are ever launched.
 
 # Nothing anywhere. Silence is the contract.
 exit 0

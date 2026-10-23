@@ -12,7 +12,7 @@
 // Everything runs against a throwaway HOME with a synthetic plugin cache; the shell scripts are the
 // repo's real ones, and the "dist bundles" are one-line scripts that announce which root ran them.
 
-import { chmod, mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readdir, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { afterEach, describe, expect, test } from "bun:test";
@@ -276,6 +276,15 @@ describe("hook-shim resolution", () => {
 
     const res = await runShim(home, "cc-status");
     expect(res.stdout).toContain(`@ ${root}`);
+  });
+
+  test("NOM-134: an added-but-not-installed marketplace checkout is NEVER launched", async () => {
+    const home = await newHome();
+    for (const host of [".claude", ".codex"]) await installRoot(join(home, host, "plugins/marketplaces", "aaa-evil", "plugin"));
+    await placeShim(home);
+    const res = await runShim(home, "codex-notify", '{"type":"agent-turn-complete"}');
+    expect(res.code).toBe(0);
+    expect(await waitForLog(home, "aaa-evil", 500)).not.toContain("aaa-evil");
   });
 
   test("a version dir missing the requested bundle is passed over for one that has it", async () => {
@@ -601,4 +610,61 @@ describe("slash commands, Codex skills and OpenCode commands carry the shim fall
       expect(blocks[0]).toContain(`exec "$NOMOS" status-cmd ${agent};`);
     });
   }
+});
+
+// NOM-133: bun auto-loads <cwd>/bunfig.toml (its `preload` runs code) and <cwd>/.env* at startup, and a
+// hook's cwd is the user's project. run.sh passes bun `--config=/dev/null --env-file=/dev/null` and KEEPS
+// the cwd (a `cd /` broke version-manager shims, which resolve the runtime from it). node gets nothing.
+describe("run.sh never lets bun read the project dir, and never moves the cwd (NOM-133)", () => {
+  async function evilRepo(home: string): Promise<string> {
+    const repo = join(home, "repo");
+    await mkdir(repo, { recursive: true });
+    await writeFile(join(repo, "bunfig.toml"), 'preload = ["./p.js"]\n');
+    await writeFile(join(repo, "p.js"), `require("fs").writeFileSync(${JSON.stringify(join(home, "PRELOADED"))}, "x");\n`);
+    await writeFile(join(repo, ".env"), "NOMO_FROM_DOTENV=leaked\n");
+    await writeFile(join(repo, ".env.local"), "NOMO_FROM_DOTENV_LOCAL=leaked\n");
+    return repo;
+  }
+
+  test("real bun: a repo's bunfig.toml preload and .env files are NOT loaded, and the cwd is the repo", async () => {
+    const home = await newHome();
+    const repo = await evilRepo(home);
+    const entry = join(home, "probe.mjs");
+    await writeFile(entry, `console.log(JSON.stringify({ cwd: process.cwd(), env: process.env.NOMO_FROM_DOTENV ?? null, local: process.env.NOMO_FROM_DOTENV_LOCAL ?? null }));\n`);
+    const proc = spawnTestProcess({ cmd: ["sh", RUN_SH, entry], cwd: repo, env: isolatedTestEnv(home), stdin: "ignore", stdout: "pipe", stderr: "pipe" });
+    const out = JSON.parse((await new Response(proc.stdout).text()).trim());
+    await proc.exited;
+    expect(out).toEqual({ cwd: await realpath(repo), env: null, local: null });
+    expect(await stat(join(home, "PRELOADED")).then(() => true, () => false)).toBe(false);
+  });
+
+  // A stub runtime that reports where it was started and with what argv; PATH holds only it plus the
+  // system dirs, so run.sh's `command -v` picks exactly the one named.
+  async function launchWith(name: "bun" | "node"): Promise<{ cwd: string; repo: string; argv: string[] }> {
+    const home = await newHome();
+    const repo = await evilRepo(home);
+    const bin = join(home, "bin");
+    await mkdir(bin, { recursive: true });
+    await writeFile(join(bin, name), '#!/bin/sh\nprintf \'%s\\n\' "$(pwd -P)" "$@"\n');
+    await chmod(join(bin, name), 0o755);
+    const proc = spawnTestProcess({
+      cmd: ["sh", RUN_SH, "/x/entry.mjs", "arg"], cwd: repo, env: isolatedTestEnv(home, { PATH: `${bin}:/usr/bin:/bin` }),
+      stdin: "ignore", stdout: "pipe", stderr: "pipe",
+    });
+    const [cwd, ...argv] = (await new Response(proc.stdout).text()).trim().split("\n");
+    await proc.exited;
+    return { cwd: cwd!, repo: await realpath(repo), argv };
+  }
+
+  test("a bun runtime gets both fence flags ahead of the entry, in the user's cwd", async () => {
+    const r = await launchWith("bun");
+    expect(r.cwd).toBe(r.repo);
+    expect(r.argv).toEqual(["--config=/dev/null", "--env-file=/dev/null", "/x/entry.mjs", "arg"]);
+  });
+
+  test("a node runtime keeps the user's cwd and gets no extra flags", async () => {
+    const r = await launchWith("node");
+    expect(r.cwd).toBe(r.repo);
+    expect(r.argv).toEqual(["/x/entry.mjs", "arg"]);
+  });
 });

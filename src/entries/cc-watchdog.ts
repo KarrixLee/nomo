@@ -53,7 +53,7 @@ import {
   startCodexAppServerDaemon,
   GONE_STRIKE_LIMIT, loadConfig, loadPendingConfig, localApprovalsState,
   PAIR_HTML_FILE, PairPollResult, parseWatchdogPidfile, PendingConfig, pidAlive, PLUGIN_VERSION, readDecisionHoldAt, readPrefix, readSuffix, recordGoneStrike, removeRevokedConfig,
-  resetGoneStrikes, resolveGitDir, SessionRecord, sessionBranch, SESSIONS_DIR, traceSession, tracePlanPickerDecision, watchdogBuildDiffers,
+  resetGoneStrikes, resolveGitDir, runtimeArgs, SessionRecord, sessionBranch, sidField, SESSIONS_DIR, traceSession, tracePlanPickerDecision, watchdogBuildDiffers,
   watchdogBuildStamp, watchdogHolderIsLive, WATCHDOG_PATH, WATCHDOG_PID_PATH, writeInterruptFlagAt,
 } from "../core/shared";
 import { rememberBounded } from "../core/bounded-set";
@@ -315,6 +315,7 @@ export async function buildDoneEnvelope(sessionId: string, record: SessionRecord
     // card for the same folder. OMITTED when the record has none (a pre-key session).
     ...(typeof record.folderKey === "string" && record.folderKey.length > 0 ? { folderKey: record.folderKey } : {}),
     ...(branch ? { branch } : {}),
+    ...sidField(sessionId),
   };
   const debug = appendCodexBridgeMarker(
     agent === "codex" ? dbg ?? formatPlanPickerDebug({ event: "done", classifier: "done", marker: "0", by: "wd" }) : undefined,
@@ -368,6 +369,7 @@ export async function buildNeedsAttentionEnvelope(
     ...(typeof at === "number" && Number.isFinite(at) ? { at } : {}),
     ...(typeof record.folderKey === "string" && record.folderKey.length > 0 ? { folderKey: record.folderKey } : {}),
     ...(branch ? { branch } : {}),
+    ...sidField(sessionId),
   };
   const debug = appendCodexBridgeMarker(
     agent === "codex" ? dbg ?? formatPlanPickerDebug({ event: "attention", classifier: "pending", marker: "0", by: "wd" }) : undefined,
@@ -404,6 +406,7 @@ export async function buildWorkingEnvelope(
     // The record's pinned folder key, in the same slot as buildDoneEnvelope's (see there).
     ...(typeof record.folderKey === "string" && record.folderKey.length > 0 ? { folderKey: record.folderKey } : {}),
     ...(branch ? { branch } : {}),
+    ...sidField(sessionId),
   };
   const debug = appendCodexBridgeMarker(
     agent === "codex" ? dbg ?? formatPlanPickerDebug({ event: "working", classifier: "resolved", marker: "0", by: "wd" }) : undefined,
@@ -1652,8 +1655,8 @@ function spawnHandoff(id: string, what: string, args: string[], cwd: string, onE
   try {
     // The daemon may have inherited the session id of whichever Claude Code hook started it.
     const { CLAUDE_CODE_SESSION_ID: _drop, ...env } = process.env;
-    const child = spawn(cmd[0], [...cmd.slice(1), ...args],
-      { detached: true, stdio: ["ignore", fd, fd], env, cwd });
+    const child = spawn(cmd[0], runtimeArgs(cmd[0], [...cmd.slice(1), ...args]),
+      { detached: true, stdio: ["ignore", fd, fd], env, cwd }); // NOM-133
     const timer = timeoutMs ? setTimeout(() => { note(`still running after ${Math.round(timeoutMs / 1000)} s; stopped it`); try { child.kill("SIGKILL"); } catch { /* gone */ } onExit(1); }, timeoutMs) : undefined;
     timer?.unref();
     child.on("error", (e) => { clearTimeout(timer); note(`could not start ${cmd[0]}: ${e.message}`); onExit(1); }).on("exit", (code) => { clearTimeout(timer); onExit(code); });
@@ -1811,7 +1814,7 @@ export async function correctCloudState(
     const prev = cloudPosts.get(sessionId);
     if (prev && !prev.ok && now - prev.at < CLOUD_RETRY_MS) return "uncorrected";
     if (!changed && (want === undefined || (prev?.ok && now - prev.at < CLOUD_KEEPALIVE_MS))) return "uncorrected";
-    const base = done && changed ? buildStatePlaintext(record, "done", typeof record.ts === "number" ? record.ts : now) : plain;
+    const base = done && changed ? buildStatePlaintext(record, "done", typeof record.ts === "number" ? record.ts : now, undefined, sessionId) : plain;
     const blob = changed ? await encryptBlob(config.e2eKey, withCloudKey(base, want, extra)) : record.blob;
     const outcome = await (deps.post ?? ((body: object) => postEvent(config, body)))(
       { v: 2, sessionId, op: done ? "done" : record.op ?? "update", prio: done ? 0 : record.prio ?? 0, ts: now, blob, ...startedAtField(record) });
@@ -2178,6 +2181,7 @@ export async function buildProvisionalBlob(
     // key — so the row never jumps cards on reconcile. Omitted when the cwd could not be read.
     ...(typeof d.folderKey === "string" && d.folderKey.length > 0 ? { folderKey: d.folderKey } : {}),
     ...(branch ? { branch } : {}),
+    ...sidField(d.sessionId),
   };
   const dbg = appendCodexBridgeMarker(blobAgentFields.agent === "codex" ? formatPlanPickerDebug({
     event: "discover", classifier: d.idle === true ? "done" : "work", marker: "0", by: "wd",
@@ -3575,6 +3579,7 @@ export async function buildTitleRepairEnvelope(
     // repair must not cost the row its folder card.
     ...(typeof record.folderKey === "string" && record.folderKey.length > 0 ? { folderKey: record.folderKey } : {}),
     ...(branch ? { branch } : {}),
+    ...sidField(sessionId),
   };
   const dbg = appendCodexBridgeMarker(agent === "codex" ? record.dbg ?? formatPlanPickerDebug({
     event: "title", classifier: statusFromRecord(record), marker: record.pendingPlanPicker ? "p" : record.planPickerVerificationPending ? "v" : record.planPickerSettled ? "s" : "0", by: "wd",

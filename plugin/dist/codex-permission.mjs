@@ -243,6 +243,12 @@ function boxPairedCached(now = Date.now()) {
     boxMemo = { at: now, v: boxPaired() };
   return boxMemo.v;
 }
+function runtimeArgs(runtime, args) {
+  return /^bun/.test(runtime.slice(runtime.lastIndexOf("/") + 1)) ? ["--config=/dev/null", "--env-file=/dev/null", ...args] : args;
+}
+function sidField(sessionId) {
+  return typeof sessionId === "string" && sessionId.length > 0 ? { sid: sessionId } : {};
+}
 function appendFittedPlanAndDebug(base, plan, dbg) {
   const withBox = base.agent === undefined && boxPairedCached() ? { ...base, box: true } : base;
   const withPlan = appendFittedPlan(withBox, plan);
@@ -470,6 +476,7 @@ function opencodeStubPaths() {
 function opencodeStubTarget(text) {
   return /^export \{ default \} from "(.+)";$/m.exec(text)?.[1];
 }
+var REMOTE_IS_OURS = /^(https:\/\/github\.com\/|ssh:\/\/git@github\.com\/|git@github\.com:)KarrixLee\/nomo(\.git)?\/?$/i;
 var FOLDER_KEY_HEX_CHARS = 12;
 var BRANCH_MAX_CHARS = 60;
 var GIT_DIR_WALK_MAX_DEPTH = 64;
@@ -877,7 +884,7 @@ function ensureWatchdog(deps = {}) {
     const killPid = deps.killPid ?? ((pid, signal) => process.kill(pid, signal));
     const spawnWatchdog = deps.spawnWatchdog ?? (() => {
       const runtime = process.env.NOMO_RUNTIME && process.env.NOMO_RUNTIME.length > 0 ? process.env.NOMO_RUNTIME : process.execPath;
-      spawn(runtime, [WATCHDOG_PATH], { detached: true, stdio: "ignore" }).unref();
+      spawn(runtime, runtimeArgs(runtime, [WATCHDOG_PATH]), { detached: true, stdio: "ignore" }).unref();
     });
     const raw = readPidfile();
     const holder = typeof raw === "string" ? parseWatchdogPidfile(raw) : null;
@@ -3442,7 +3449,7 @@ function ccOpinion(file, join, now) {
 }
 var finite = (value) => typeof value === "number" && Number.isFinite(value);
 var filled = (value) => typeof value === "string" && value.length > 0;
-function buildStatePlaintext(record, status, at, titleFallback) {
+function buildStatePlaintext(record, status, at, titleFallback, sessionId) {
   const agent = record.agent ?? "claude";
   const branch = sessionBranch(record);
   const base = {
@@ -3455,7 +3462,8 @@ function buildStatePlaintext(record, status, at, titleFallback) {
     ...filled(record.model) ? { model: record.model } : {},
     at: Math.floor(at / 1000),
     ...filled(record.folderKey) ? { folderKey: record.folderKey } : {},
-    ...branch ? { branch } : {}
+    ...branch ? { branch } : {},
+    ...sidField(sessionId)
   };
   const dbg = agent === "codex" ? formatPlanPickerDebug({
     event: status === "done" ? "done" : "working",
@@ -3507,7 +3515,7 @@ function computeSessionState(input) {
   if (recordDone) {
     const heldBack = opinion?.status === "busy" && opinion.statusUpdatedAt > ts;
     if (!heldBack) {
-      return of("done", opinion?.status === "idle" ? "done+cc" : suffix("done"), { kind: "plain", value: buildStatePlaintext(record, "done", ts, opinion?.name) }, ts, false);
+      return of("done", opinion?.status === "idle" ? "done+cc" : suffix("done"), { kind: "plain", value: buildStatePlaintext(record, "done", ts, opinion?.name, sessionId) }, ts, false);
     }
   }
   if (stateHoldLive(hold, holdPidAlive, now)) {
@@ -3523,14 +3531,14 @@ function computeSessionState(input) {
     };
   }
   if (!recordDone && opinion?.status === "idle" && record.prio !== 1 && record.lastEvent !== "needsAttention" && opinion.statusUpdatedAt > ts + CC_IDLE_DONE_GRACE_MS) {
-    return of("done", "done+cc", { kind: "plain", value: buildStatePlaintext(record, "done", opinion.statusUpdatedAt, opinion.name) }, ts, false);
+    return of("done", "done+cc", { kind: "plain", value: buildStatePlaintext(record, "done", opinion.statusUpdatedAt, opinion.name, sessionId) }, ts, false);
   }
   if (record.prio === 1) {
     const why = finite(record.attentionStalledAt) ? "attn/net" : "attn";
     return { ...of("needsAttention", why, sealed, ts, false), ...asking };
   }
   const busy = opinion?.status === "busy" && opinion.statusUpdatedAt > ts;
-  return of("working", busy ? "work+cc" : suffix("work"), recordDone ? { kind: "plain", value: buildStatePlaintext(record, "working", opinion?.statusUpdatedAt ?? ts, opinion?.name) } : sealed, ts, false);
+  return of("working", busy ? "work+cc" : suffix("work"), recordDone ? { kind: "plain", value: buildStatePlaintext(record, "working", opinion?.statusUpdatedAt ?? ts, opinion?.name, sessionId) } : sealed, ts, false);
 }
 
 // src/core/hook.ts
@@ -3697,7 +3705,8 @@ function buildBlob(input, machine, title, plan, agent = "claude", turnStartedAt,
     ...typeof model === "string" && model.length > 0 ? { model } : {},
     ...typeof at === "number" && Number.isFinite(at) ? { at } : {},
     ...folderKey ? { folderKey } : {},
-    ...branch ? { branch } : {}
+    ...branch ? { branch } : {},
+    ...sidField(input.session_id)
   };
   const dbg = agent === "codex" ? dbgOverride ?? formatPlanPickerDebug({
     event: hookName || "event",
@@ -4512,8 +4521,27 @@ function denyLine(agent, message) {
 function allowAlwaysLine(agent, toolName, toolInput, suggestions) {
   if (agent === "codex")
     return allowLine(agent, toolName, toolInput);
-  const updatedPermissions = Array.isArray(suggestions) && suggestions.length > 0 ? suggestions : [{ type: "addRules", rules: [{ toolName }], behavior: "allow", destination: "session" }];
-  return allowWithPermissionsLine(agent, toolName, toolInput, updatedPermissions);
+  if (!Array.isArray(suggestions) || suggestions.length === 0) {
+    return allowWithPermissionsLine(agent, toolName, toolInput, [{ type: "addRules", rules: [{ toolName }], behavior: "allow", destination: "session" }]);
+  }
+  const scoped = sessionScopedSuggestions(suggestions);
+  return scoped.length > 0 ? allowWithPermissionsLine(agent, toolName, toolInput, scoped) : allowLine(agent, toolName, toolInput);
+}
+function sessionScopedSuggestions(suggestions) {
+  if (!Array.isArray(suggestions))
+    return [];
+  const nonEmpty = (v) => Array.isArray(v) && v.length > 0;
+  return suggestions.filter((s) => {
+    if (!s || typeof s !== "object")
+      return false;
+    if (s.type === "addRules")
+      return s.behavior === "allow" && nonEmpty(s.rules);
+    if (s.type === "addDirectories")
+      return nonEmpty(s.directories);
+    if (s.type === "setMode")
+      return typeof s.mode === "string" && s.mode !== "bypassPermissions" && s.mode !== "dontAsk";
+    return false;
+  }).map((s) => ({ ...s, destination: "session" }));
 }
 function allowWithPermissionsLine(agent, toolName, toolInput, updatedPermissions) {
   const decision = toolName === "ExitPlanMode" ? { behavior: "allow", updatedInput: toolInput, updatedPermissions } : { behavior: "allow", updatedPermissions };
@@ -4689,7 +4717,7 @@ function buildPermissionSummary(toolName, toolInput) {
     case "local_shell": {
       const desc = str(toolInput.description);
       if (desc)
-        return truncate(desc);
+        return capPermissionWireText(desc, 80);
       const cmd = str(toolInput.command);
       return cmd ? truncate(cmd.split(`
 `)[0]) : toolName;
@@ -5205,7 +5233,11 @@ async function runPermissionHook(deps = {}, agent = "claude") {
       permissionToolName: toolName
     };
     const rawDetail = deps.detail ?? buildPermissionDetail(toolName, toolInput);
-    const fitted = fitPermissionDetail(permissionBase, rawDetail, BLOB_FIT_CHARS, buildPermissionQuestions(toolInput));
+    let fitted = fitPermissionDetail(permissionBase, rawDetail, BLOB_FIT_CHARS, buildPermissionQuestions(toolInput));
+    if (fitted.detail === "" && rawDetail !== "" && summary !== toolName && (toolName === "Bash" || toolName === "shell" || toolName === "local_shell")) {
+      permissionBase.permissionSummary = toolName;
+      fitted = fitPermissionDetail(permissionBase, rawDetail);
+    }
     const detailFull = fullTextForRecord(rawDetail, fitted.detail);
     if (record && record.permissionDetailFull !== detailFull) {
       await (deps.stampDetailFullFn ?? defaultStampDetailFull())(sessionId, detailFull);
