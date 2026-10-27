@@ -14,19 +14,19 @@
 <a href="https://apps.apple.com/app/nomo-ai-status-usage/id6779366830"><img src="assets/app-store-badge.svg" height="48" alt="Download Nomo on the App Store"></a>
 </p>
 
-Mirror your **Claude Code**, **OpenAI Codex**, **OpenCode** and **Cursor** session milestones to
+Mirror your **Claude Code**, **OpenAI Codex**, **OpenCode**, **Cursor** and **Antigravity** session milestones to
 the **Nomo iPhone app** as a Live Activity (Dynamic Island). A session's status — working,
 needs-your-approval, done — shows up on your phone in real time, so you can step away from the
 terminal and still know when an agent needs you or has finished. When a Claude Code, Codex or
 OpenCode session stops for a permission prompt or a question, you can **answer it from the phone** —
-tap Allow/Deny or pick an option and the session carries on without you at the keyboard (Cursor is
-status-only). Works with **Codex** in the terminal and the **Codex desktop app** alike.
+tap Allow/Deny or pick an option and the session carries on without you at the keyboard (Cursor and
+Antigravity are status-only). Works with **Codex** in the terminal and the **Codex desktop app** alike.
 
 Everything is **end-to-end encrypted**. Pairing is a single QR-code scan (or a short typed code);
 there is no server key to copy. All session content (titles, machine name, status, even *which* agent
 produced an event) rides **inside** an encrypted blob, so the relay Worker that fans out the APNs
 push is a blind relay and never sees plaintext. **One pairing covers every agent** on a machine —
-Claude Code, Codex, OpenCode and Cursor share the same credentials, encryption key, watchdog, and
+Claude Code, Codex, OpenCode, Cursor and Antigravity share the same credentials, encryption key, watchdog, and
 Live Activity.
 
 > [!NOTE]
@@ -118,7 +118,7 @@ In plain English:
 bunx nomo-ai     # or: npx nomo-ai
 ```
 
-It detects which of Claude Code, Codex, OpenCode and Cursor are on this machine, shows exactly what
+It detects which of Claude Code, Codex, OpenCode, Cursor and Antigravity are on this machine, shows exactly what
 it will run for each, and lets you toggle the list before anything happens. Then it drives **each
 host's own install path** — the same four flows spelled out below — and prints the restart-and-pair
 step for each one it installed.
@@ -136,11 +136,11 @@ For scripting and CI:
 
 | Flag | |
 |---|---|
-| `--claude` `--codex` `--opencode` `--cursor` | install exactly these — naming any one of them skips the prompt |
-| `--all` | all four, detected or not — except Cursor, which is skipped with a note when it is not on this machine (name `--cursor` to try anyway) |
+| `--claude` `--codex` `--opencode` `--cursor` `--antigravity` | install exactly these — naming any one of them skips the prompt |
+| `--all` | all of them, detected or not — except Cursor and Antigravity, which are skipped with a note when they are not on this machine (name `--cursor` / `--antigravity` to try anyway) |
 | `-y`, `--yes` | no prompt; install everything detected |
 | `-n`, `--dry-run` | print the commands, run nothing |
-| `--ref <branch\|tag>` | **OpenCode and Cursor only** — install from that ref instead of the default branch |
+| `--ref <branch\|tag>` | **OpenCode, Cursor and Antigravity only** — install from that ref instead of the default branch |
 | `-h`, `--help` / `-v`, `--version` | |
 
 With no flags and no terminal to ask, it refuses rather than guessing. Every failure names the step,
@@ -426,11 +426,54 @@ node ~/.nomo/plugin/scripts/cursor-install.mjs --uninstall
 which removes exactly Nomo's hook entries and skills and leaves everything else in `hooks.json` as it
 was. Pairing is untouched — it belongs to every agent on the computer.
 
+## Install — Antigravity
+
+One install covers the Google **Antigravity** desktop app/IDE and the `agy` CLI — both read
+`~/.gemini/config/hooks.json`.
+
+```sh
+bunx nomo-ai --antigravity     # or, from a checkout: node plugin/scripts/antigravity-install.mjs
+```
+
+**Restart Antigravity** (and any open `agy`) so it re-reads its hooks. There are no Antigravity
+commands in v1: pair from any other agent that has Nomo, or in a terminal run
+`~/.nomo/plugin/scripts/run.sh ~/.nomo/plugin/dist/pair.mjs`. Pairing is shared machine-wide.
+
+**What the installer writes.** Antigravity's `hooks.json` is a set of *named* blocks. Nomo owns
+exactly one, `"nomo"`, rewrites it whole on every install and leaves every other block alone; the
+file is created as `{}` if it does not exist. It refuses — writing nothing — on a file that is not
+valid JSON or not an object, and writes through a symlink rather than over it. The block registers
+`SessionStart`, `PreInvocation`, `PostInvocation`, `Stop` and `PostToolUse`, each running
+`plugin/scripts/antigravity-hook.sh <Event>` with a 10-second timeout — and **never `PreToolUse`**,
+the one event whose hook can block a tool.
+
+### How the Antigravity leg works
+
+- **Read-only and can never block.** The wrapper prints `{}` and exits 0 *before* doing any work, so
+  every path — a crash, no runtime, not paired, no network — returns the empty reply, and Antigravity
+  never sees a `decision` or `terminationBehavior` from Nomo. The work itself is capped at 4 seconds.
+- **A row starts at `PreInvocation`** (before a model call), not `SessionStart`. `PreInvocation`,
+  `PostInvocation` and `PostToolUse` keep it *working* (they fire many times per turn and are
+  throttled); `Stop` marks it *done*. A turn that ends with no event (an interrupt can skip them) is
+  marked done after 30 quiet minutes, unless its transcript is still being written.
+- **The title is Antigravity's own conversation title**, one field read with the system `sqlite3`,
+  read-only, from `~/.gemini/antigravity/conversation_summaries.db`; until it exists the row shows
+  the workspace folder. The model badge is the payload's `modelName`.
+
+To remove it:
+
+```sh
+node ~/.nomo/plugin/scripts/antigravity-install.mjs --uninstall
+```
+
+which deletes only the `"nomo"` block. Pairing is untouched.
+
 ## Answering from your phone
 
 When a session stops for a **permission prompt** or a multiple-choice **question**, the card reaches
 the phone with its options; the answer rides back inside the same E2E-encrypted blob, so the relay
-never learns what you chose. Works for Claude Code, Codex and OpenCode (Cursor is read-only).
+never learns what you chose. Works for Claude Code, Codex and OpenCode (Cursor and Antigravity are
+read-only).
 `/nomo-cc:approvals` (or `$nomo-approvals`, `/nomo-approvals`) is the local off switch when your
 phone is away — one switch, machine-wide.
 
@@ -457,6 +500,14 @@ model, so Nomo treats it as a caption: it is kept short, and when the card runs 
 description is dropped before the command is.
 
 ## Hooks on your computer — security
+
+- **Antigravity: observe-only, cannot block.** Nomo's `"nomo"` block in `~/.gemini/config/hooks.json`
+  never registers `PreToolUse`, and its wrapper answers every event with `{}` before running anything,
+  so it can neither stop a tool nor keep or end a turn. From each event's stdin it reads only
+  `conversationId`, the first `workspacePaths` entry, `transcriptPath` (its modification time, for
+  the idle check) and `modelName` — never tool arguments. It reads one `title` column from
+  Antigravity's `conversation_summaries.db`, read-only. Remove it with
+  `node ~/.nomo/plugin/scripts/antigravity-install.mjs --uninstall` (deletes only that block).
 
 - **Your project's runtime config is never loaded into Nomo's hooks.** Hooks run with your project as
   their working folder, and bun reads `bunfig.toml` (whose `preload` runs code) and `.env` files from
@@ -531,9 +582,9 @@ Runs the full suite (2011 tests across `core/`, `entries/`, `opencode/`, and `qr
 bun build.ts
 ```
 
-`build.ts` bundles the twelve hook/command entrypoints (`cc-status`, `cc-permission`, `codex-status`,
+`build.ts` bundles the thirteen hook/command entrypoints (`cc-status`, `cc-permission`, `codex-status`,
 `codex-permission`, `codex-notify`, `cc-watchdog`, `pair`, `unpair`, `reset`, `status-cmd`,
-`opencode-update`, `cursor-status`) into
+`opencode-update`, `cursor-status`, `antigravity-status`) into
 `plugin/dist/*.mjs`, inlining every local import so each artifact is a single node-runnable file.
 
 A second pass bundles `src/opencode/plugin.ts` into `plugin/dist/opencode.js` — **`.js`, not

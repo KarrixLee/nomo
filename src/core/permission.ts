@@ -130,6 +130,7 @@ export const HOLD_BLOCKS_DIALOG: Record<AgentKind, boolean> = {
   codex: true,     // same blocking-hook contract, same frozen TUI
   opencode: false, // resident plugin, fired detached; OpenCode's own prompt is already on screen
   cursor: false,   // NEVER holds: v1 is read-only and registers no permission-class hook at all
+  antigravity: false, // NEVER holds: v1 is read-only and never registers PreToolUse
 };
 
 /** The Claude tools whose picker Claude Code renders ITSELF, concurrently with this hook — so the user

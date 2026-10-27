@@ -23,9 +23,9 @@
 
 import { readdir, readFile, stat } from "node:fs/promises";
 import { join } from "node:path";
-import { claudeAdapter, codexAdapter, cursorAdapter, opencodeAdapter } from "../core/adapter";
+import { antigravityAdapter, claudeAdapter, codexAdapter, cursorAdapter, opencodeAdapter } from "../core/adapter";
 import {
-  AgentKind, CC_DIR, CODEX_HOOK_MARKER, codexAppServerSocketAvailable, codexHome, CURSOR_HOOK_MARKER, cursorHome, flagExists,
+  AgentKind, ANTIGRAVITY_HOOK_MARKER, antigravityConfigDir, CC_DIR, CODEX_HOOK_MARKER, codexAppServerSocketAvailable, codexHome, CURSOR_HOOK_MARKER, cursorHome, flagExists,
   LAST_SEND_PATH, localApprovalsState, NO_HOLD_PATH, parseConfig, parsePendingConfig, pidAlive,
   opencodeStubPaths, opencodeStubTarget, PLUGIN_VERSION, SESSION_TRACE_PATH, SESSIONS_DIR,
   WATCHDOG_PID_PATH,
@@ -100,6 +100,9 @@ export interface StatusDeps {
   cursorHooksPath?: string;
   cursorProjectsDir?: string;
   lastHookCursorPath?: string;
+  /** Antigravity's global hooks.json and liveness stamp — injected so a test never reads ~/.gemini. */
+  antigravityHooksPath?: string;
+  lastHookAntigravityPath?: string;
   isAlive?: (pid: number) => boolean;
   now?: () => number;
 }
@@ -128,10 +131,17 @@ const AGENT_UI: Record<AgentKind, { name: string; pair: string; approvalsOn: str
   // Cursor has no approvals command (v1 is read-only), but the Approvals row is machine-wide — so a
   // Cursor reader who sees it PAUSED is pointed at an agent that does have the switch.
   cursor: { name: "Cursor", pair: "/nomo-pair", approvalsOn: "/nomo-cc:approvals on (in Claude Code — Cursor sessions are read-only)", status: "/nomo-status" },
+  // No Antigravity commands in v1: pairing and status run from a terminal against the ~/.nomo checkout.
+  antigravity: {
+    name: "Antigravity",
+    pair: "~/.nomo/plugin/scripts/run.sh ~/.nomo/plugin/dist/pair.mjs (in a terminal)",
+    approvalsOn: "/nomo-cc:approvals on (in Claude Code — Antigravity sessions are read-only)",
+    status: "~/.nomo/plugin/scripts/run.sh ~/.nomo/plugin/dist/status-cmd.mjs antigravity",
+  },
 };
 
 /** Fixed order, so two runs on the same machine never disagree about where to look. */
-const AGENT_ORDER: AgentKind[] = ["claude", "codex", "opencode", "cursor"];
+const AGENT_ORDER: AgentKind[] = ["claude", "codex", "opencode", "cursor", "antigravity"];
 
 /** Value column. Top-level rows pad the label to it; an agent's rows indent 2 and pad to it minus 2,
  *  so every value on the screen starts in the same column and the eye can run straight down it. Wide
@@ -449,6 +459,8 @@ export async function statusCmd(deps: StatusDeps = {}): Promise<number> {
   const cursorHooksPath = deps.cursorHooksPath ?? `${cursorHome()}/hooks.json`;
   const cursorProjectsDir = deps.cursorProjectsDir ?? cursorAdapter.sessionsDir();
   const lastHookCursorPath = deps.lastHookCursorPath ?? cursorAdapter.hookStampPath();
+  const antigravityHooksPath = deps.antigravityHooksPath ?? `${antigravityConfigDir()}/hooks.json`;
+  const lastHookAntigravityPath = deps.lastHookAntigravityPath ?? antigravityAdapter.hookStampPath();
   const noHoldPath = deps.noHoldPath ?? NO_HOLD_PATH;
   const isAlive = deps.isAlive ?? pidAlive;
   const now = deps.now ?? Date.now;
@@ -545,7 +557,7 @@ export async function statusCmd(deps: StatusDeps = {}): Promise<number> {
   // Session records, split by the agent that wrote them. "Tracked sessions: 4" was machine-wide and so
   // answered nobody's question; what a reader wants is how many of those are THEIRS. A record with no
   // `agent` key predates the Codex work and is Claude's by definition (same rule the watchdog uses).
-  const perAgent: Record<string, number> = { claude: 0, codex: 0, opencode: 0, cursor: 0 };
+  const perAgent: Record<string, number> = { claude: 0, codex: 0, opencode: 0, cursor: 0, antigravity: 0 };
   let totalSessions = 0;
   try {
     for (const name of await readdir(sessionsDir)) {
@@ -780,8 +792,23 @@ export async function statusCmd(deps: StatusDeps = {}): Promise<number> {
     problems: cursorHooks.problem ? [cursorHooks.problem] : [],
   };
 
+  // Antigravity — Cursor's twin. Installed = our wrapper named in ~/.gemini/config/hooks.json.
+  const antigravityInstalled = (await readFile(antigravityHooksPath, "utf8").catch(() => "")).includes(ANTIGRAVITY_HOOK_MARKER);
+  const antigravityHooks = await hooksRow("antigravity", {
+    installed: antigravityInstalled, sessionsDir: antigravityAdapter.sessionsDir(),
+    match: antigravityAdapter.sessionMatch, stampPath: lastHookAntigravityPath,
+    hint: antigravityAdapter.hooksNotFiringHint,
+  });
+  const antigravityReport: AgentReport = {
+    kind: "antigravity", present: antigravityInstalled || perAgent.antigravity! > 0 || antigravityHooks.stamp > 0,
+    hooksLabel: "Hooks", hooks: antigravityHooks.value, sessions: sessionText(perAgent.antigravity!),
+    sessionCount: perAgent.antigravity!,
+    detail: [["Mode", "read-only — sessions show on your phone; approvals stay in Antigravity"]],
+    problems: antigravityHooks.problem ? [antigravityHooks.problem] : [],
+  };
+
   // ── render ────────────────────────────────────────────────────────────────────────────────────
-  const reports: Record<AgentKind, AgentReport> = { claude: claudeReport, codex: codexReport, opencode: opencodeReport, cursor: cursorReport };
+  const reports: Record<AgentKind, AgentReport> = { claude: claudeReport, codex: codexReport, opencode: opencodeReport, cursor: cursorReport, antigravity: antigravityReport };
   if (audience) {
     // The subject, in full and immediately under the machine facts.
     renderOwn(reports[audience], `${AGENT_UI[audience].name} — you are here`, print);
@@ -808,14 +835,14 @@ export async function statusCmd(deps: StatusDeps = {}): Promise<number> {
  *  hand-run bundle, must keep working exactly as it did. */
 export function parseAudience(argv: readonly string[]): AgentKind | undefined {
   for (const arg of argv) {
-    if (arg === "claude" || arg === "codex" || arg === "opencode" || arg === "cursor") return arg;
+    if (arg === "claude" || arg === "codex" || arg === "opencode" || arg === "cursor" || arg === "antigravity") return arg;
   }
   return undefined;
 }
 
 if (import.meta.main) {
   if (process.argv.includes("--check")) {
-    console.log("usage: status [claude|codex|opencode|cursor] [--check]  — show pairing, delivery and per-agent health");
+    console.log("usage: status [claude|codex|opencode|cursor|antigravity] [--check]  — show pairing, delivery and per-agent health");
     process.exit(0);
   }
   process.exit(await statusCmd({ audience: parseAudience(process.argv.slice(2)) }));

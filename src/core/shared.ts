@@ -451,8 +451,12 @@ export type CCStatus = "working" | "needsAttention" | "done";
  *  against a Claude transcript or CC file.
  *
  *  `"cursor"` (the fourth) covers BOTH the Cursor desktop app's agent and the `cursor-agent` CLI — one
- *  kind, one hook binary (entries/cursor-status.ts → core/cursor.ts). Read-only in v1. */
-export type AgentKind = "claude" | "codex" | "opencode" | "cursor";
+ *  kind, one hook binary (entries/cursor-status.ts → core/cursor.ts). Read-only in v1.
+ *
+ *  `"antigravity"` (the fifth) covers Google Antigravity — the desktop app/IDE and the `agy` CLI, which
+ *  read the same ~/.gemini/config/hooks.json. One hook binary (entries/antigravity-status.ts →
+ *  core/antigravity.ts). Read-only in v1, like Cursor. */
+export type AgentKind = "claude" | "codex" | "opencode" | "cursor" | "antigravity";
 
 /** An agent literal AS IT ARRIVES — off a session record, out of a blob a peer install wrote. It is
  *  `AgentKind` plus "some string this build has never heard of", because that case is now REAL: two
@@ -486,6 +490,15 @@ export function cursorHome(): string {
 /** The substring that identifies OUR hook command inside Cursor's `hooks.json` (the bundled hook's
  *  basename) — what status-cmd greps for to tell "installed" from "not set up here". */
 export const CURSOR_HOOK_MARKER = "cursor-status.mjs";
+
+/** Antigravity's global customization dir — holds the `hooks.json` the installer writes Nomo's one
+ *  named block into. NOT ~/.gemini/antigravity-cli (runtime data, never read for hooks). */
+export function antigravityConfigDir(): string {
+  return `${process.env.HOME}/.gemini/config`;
+}
+
+/** The substring that identifies OUR hook inside Antigravity's `hooks.json` (the wrapper's basename). */
+export const ANTIGRAVITY_HOOK_MARKER = "antigravity-hook.sh";
 
 /** The substring that identifies OUR hook command inside a codex `hooks.json` entry (the bundled
  *  hook's basename). status-cmd greps for it to flag leftover legacy (pre-native-plugin) installs. */

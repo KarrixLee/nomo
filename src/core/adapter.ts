@@ -2567,6 +2567,15 @@ const CURSOR_TITLE_TIMEOUT_MS = 300;
 export function cursorChatTitle(sessionId: string, db: string = cursorStateDb(), env: NodeJS.ProcessEnv = process.env): string | undefined {
   // The id is spliced into the SQL text (the sqlite3 CLI takes no bound parameters).
   if (!/^[A-Za-z0-9_-]{1,128}$/.test(sessionId)) return undefined;
+  return sqliteOneTitle(db,
+    "select case when json_type(cast(value as text),'$.name')='text' then json_extract(cast(value as text),'$.name') end" +
+    ` from cursorDiskKV where key='composerData:${sessionId}'`, env);
+}
+
+/** One read-only, time-boxed `sqlite3` query whose single text cell is a title (cleaned + capped), or
+ *  undefined on ANY failure. Shared by the Cursor and Antigravity title lookups; the caller has already
+ *  validated anything it spliced into `sql`. */
+function sqliteOneTitle(db: string, sql: string, env: NodeJS.ProcessEnv = process.env): string | undefined {
   try {
     // `-init <null device>`: the CLI otherwise loads the user's rc (~/.sqliterc, or
     // $XDG_CONFIG_HOME/sqlite3/sqliterc), where `.headers on` / `.mode box` put the column header (the
@@ -2574,10 +2583,8 @@ export function cursorChatTitle(sessionId: string, db: string = cursorStateDb(),
     // output shape. macOS ships sqlite3 at a fixed absolute path, which a `.`/empty PATH entry (the cwd
     // is the workspace) cannot shadow with a repo-planted binary; elsewhere it is a PATH lookup.
     const bin = process.platform === "darwin" && existsSync("/usr/bin/sqlite3") ? "/usr/bin/sqlite3" : "sqlite3";
-    const out = execFileSync(bin, ["-init", devNull, "-batch", "-noheader", "-list", "-readonly", db,
-      "select case when json_type(cast(value as text),'$.name')='text' then json_extract(cast(value as text),'$.name') end" +
-      ` from cursorDiskKV where key='composerData:${sessionId}'`,
-    ], { timeout: CURSOR_TITLE_TIMEOUT_MS, encoding: "utf8", maxBuffer: 65_536, stdio: ["ignore", "pipe", "ignore"], env });
+    const out = execFileSync(bin, ["-init", devNull, "-batch", "-noheader", "-list", "-readonly", db, sql],
+      { timeout: CURSOR_TITLE_TIMEOUT_MS, encoding: "utf8", maxBuffer: 65_536, stdio: ["ignore", "pipe", "ignore"], env });
     const cleaned = out.replace(/\s+/g, " ").trim();
     return cleaned ? truncateOnWord(cleaned) : undefined; // capped like every other generated title
   } catch {
@@ -2625,6 +2632,49 @@ export const cursorAdapter: AgentAdapter = {
   blobAgentFields: { agent: "cursor" as const },
 };
 
+/** Antigravity's model id off a hook payload (`modelName`, on every event). Capped like cursorModel. */
+export function antigravityModel(input: Record<string, unknown>): string | undefined {
+  const v = input.modelName;
+  return typeof v === "string" && v.trim().length > 0 ? v.trim().slice(0, 80) : undefined;
+}
+
+/** Antigravity's local conversation index (desktop app). */
+export function antigravitySummariesDb(): string {
+  return `${process.env.HOME ?? ""}/.gemini/antigravity/conversation_summaries.db`;
+}
+
+/** The title Antigravity gave a conversation, or undefined. Table `conversation_summaries`, PRIMARY KEY
+ *  `conversation_id`, column `title` (schema read off a real install, 2026-10). ASSUMPTION, unverified
+ *  on a populated database: that key is the hooks' `conversationId`. A miss is just undefined — the
+ *  phone then labels the row by its folder. One read-only PK probe, same 300 ms bound as Cursor. */
+export function antigravityChatTitle(sessionId: string, db: string = antigravitySummariesDb(), env: NodeJS.ProcessEnv = process.env): string | undefined {
+  if (!/^[A-Za-z0-9_-]{1,128}$/.test(sessionId)) return undefined;
+  return sqliteOneTitle(db, `select title from conversation_summaries where conversation_id='${sessionId}'`, env);
+}
+
+/** Antigravity (desktop app/IDE + `agy` CLI) — a READ-ONLY v1 driven by its hooks, Cursor's twin.
+ *  Producer: core/antigravity.ts. Reached here only through `adapterFor()` by the rebuild paths.
+ *  `title` has no prompt to read (no Antigravity event carries the user's text), so the producer and
+ *  `titleRepair` read Antigravity's own conversation title instead. NOT in `allAdapters`. */
+export const antigravityAdapter: AgentAdapter = {
+  kind: "antigravity",
+  title: async ({ sessionId }) => antigravityChatTitle(sessionId),
+  model: async ({ input }) => antigravityModel(input),
+  detectInterrupt: () => false,
+  // ponytail: status-cmd's NOT-FIRING detector is off (matches nothing) until the spike shows which
+  // files Antigravity writes per conversation under ~/.gemini/antigravity/conversations.
+  sessionsDir: () => `${process.env.HOME ?? ""}/.gemini/antigravity/conversations`,
+  sessionMatch: () => false,
+  hookStampPath: () => lastHookPath("antigravity"),
+  hooksNotFiringHint: "  run `bunx nomo-ai --antigravity` again, then restart Antigravity so it re-reads ~/.gemini/config/hooks.json",
+  titleRepair: {
+    due: (record, now) => record.lastEvent === "done" && typeof record.ts === "number" && now - record.ts < CURSOR_TITLE_REPAIR_MS,
+    resolve: (sessionId) => antigravityChatTitle(sessionId),
+  },
+  toolDetail: {},
+  blobAgentFields: { agent: "antigravity" as const },
+};
+
 /** The adapter for an agent kind THIS BUILD DOES NOT KNOW — a record stamped by a newer peer install
  *  (see AgentKindWire). Its whole job is `blobAgentFields`: carry the raw literal back out, so a
  *  rebuild by an older build re-emits the agent it was handed instead of silently dropping the key and
@@ -2662,6 +2712,7 @@ export function adapterFor(agent: AgentKindWire): AgentAdapter {
     case "codex": return codexAdapter;
     case "opencode": return opencodeAdapter;
     case "cursor": return cursorAdapter;
+    case "antigravity": return antigravityAdapter;
     case "claude": return claudeAdapter;
     default: return typeof agent === "string" && agent.length > 0 ? unknownAgentAdapter(agent) : claudeAdapter;
   }

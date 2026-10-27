@@ -105,7 +105,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "2.3.4";
+var PLUGIN_VERSION = "2.3.5";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -285,6 +285,10 @@ function cursorHome() {
   return env && env.length > 0 ? env : `${process.env.HOME}/.cursor`;
 }
 var CURSOR_HOOK_MARKER = "cursor-status.mjs";
+function antigravityConfigDir() {
+  return `${process.env.HOME}/.gemini/config`;
+}
+var ANTIGRAVITY_HOOK_MARKER = "antigravity-hook.sh";
 var CODEX_HOOK_MARKER = "codex-status.mjs";
 function codexAppServerSocketPath() {
   return `${codexHome()}/app-server-control/app-server-control.sock`;
@@ -2840,18 +2844,12 @@ var CURSOR_TITLE_TIMEOUT_MS = 300;
 function cursorChatTitle(sessionId, db = cursorStateDb(), env = process.env) {
   if (!/^[A-Za-z0-9_-]{1,128}$/.test(sessionId))
     return;
+  return sqliteOneTitle(db, "select case when json_type(cast(value as text),'$.name')='text' then json_extract(cast(value as text),'$.name') end" + ` from cursorDiskKV where key='composerData:${sessionId}'`, env);
+}
+function sqliteOneTitle(db, sql, env = process.env) {
   try {
     const bin = process.platform === "darwin" && existsSync2("/usr/bin/sqlite3") ? "/usr/bin/sqlite3" : "sqlite3";
-    const out = execFileSync2(bin, [
-      "-init",
-      devNull,
-      "-batch",
-      "-noheader",
-      "-list",
-      "-readonly",
-      db,
-      "select case when json_type(cast(value as text),'$.name')='text' then json_extract(cast(value as text),'$.name') end" + ` from cursorDiskKV where key='composerData:${sessionId}'`
-    ], { timeout: CURSOR_TITLE_TIMEOUT_MS, encoding: "utf8", maxBuffer: 65536, stdio: ["ignore", "pipe", "ignore"], env });
+    const out = execFileSync2(bin, ["-init", devNull, "-batch", "-noheader", "-list", "-readonly", db, sql], { timeout: CURSOR_TITLE_TIMEOUT_MS, encoding: "utf8", maxBuffer: 65536, stdio: ["ignore", "pipe", "ignore"], env });
     const cleaned = out.replace(/\s+/g, " ").trim();
     return cleaned ? truncateOnWord(cleaned) : undefined;
   } catch {
@@ -2873,6 +2871,34 @@ var cursorAdapter = {
   },
   toolDetail: {},
   blobAgentFields: { agent: "cursor" }
+};
+function antigravityModel(input) {
+  const v = input.modelName;
+  return typeof v === "string" && v.trim().length > 0 ? v.trim().slice(0, 80) : undefined;
+}
+function antigravitySummariesDb() {
+  return `${process.env.HOME ?? ""}/.gemini/antigravity/conversation_summaries.db`;
+}
+function antigravityChatTitle(sessionId, db = antigravitySummariesDb(), env = process.env) {
+  if (!/^[A-Za-z0-9_-]{1,128}$/.test(sessionId))
+    return;
+  return sqliteOneTitle(db, `select title from conversation_summaries where conversation_id='${sessionId}'`, env);
+}
+var antigravityAdapter = {
+  kind: "antigravity",
+  title: async ({ sessionId }) => antigravityChatTitle(sessionId),
+  model: async ({ input }) => antigravityModel(input),
+  detectInterrupt: () => false,
+  sessionsDir: () => `${process.env.HOME ?? ""}/.gemini/antigravity/conversations`,
+  sessionMatch: () => false,
+  hookStampPath: () => lastHookPath("antigravity"),
+  hooksNotFiringHint: "  run `bunx nomo-ai --antigravity` again, then restart Antigravity so it re-reads ~/.gemini/config/hooks.json",
+  titleRepair: {
+    due: (record, now) => record.lastEvent === "done" && typeof record.ts === "number" && now - record.ts < CURSOR_TITLE_REPAIR_MS,
+    resolve: (sessionId) => antigravityChatTitle(sessionId)
+  },
+  toolDetail: {},
+  blobAgentFields: { agent: "antigravity" }
 };
 function unknownAgentAdapter(kind) {
   return {
@@ -2897,6 +2923,8 @@ function adapterFor(agent) {
       return opencodeAdapter;
     case "cursor":
       return cursorAdapter;
+    case "antigravity":
+      return antigravityAdapter;
     case "claude":
       return claudeAdapter;
     default:

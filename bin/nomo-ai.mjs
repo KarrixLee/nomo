@@ -81,12 +81,13 @@ Agents (naming any one of these skips the prompt):
   --codex                 OpenAI Codex
   --opencode              OpenCode
   --cursor                Cursor (desktop app + cursor-agent CLI)
-  --all                   all four (Cursor only if it is on this machine)
+  --antigravity           Google Antigravity (desktop app + agy CLI)
+  --all                   all of them (Cursor/Antigravity only if on this machine)
 
 Options:
   -y, --yes               no prompt; install every agent detected on this machine
   -n, --dry-run           print the commands that would run, run nothing
-      --ref <branch|tag>  OpenCode and Cursor only: install from this ref of the
+      --ref <branch|tag>  OpenCode, Cursor and Antigravity only: install from this ref of the
                           repo instead of its default branch. Claude Code and Codex
                           install through their own marketplaces, which read the
                           default branch and take no ref — --ref cannot pin them.
@@ -98,7 +99,9 @@ agent afterwards (/nomo-cc:pair, $nomo-pair, /nomo-pair).
 
 Cursor is the one agent whose config file this writes into directly (hooks.json, merged —
 other tools' entries are left alone). Undo it with:
-  node ~/.nomo/plugin/scripts/cursor-install.mjs --uninstall`;
+  node ~/.nomo/plugin/scripts/cursor-install.mjs --uninstall
+Antigravity likewise owns one "nomo" block in ~/.gemini/config/hooks.json. Undo it with:
+  node ~/.nomo/plugin/scripts/antigravity-install.mjs --uninstall`;
 
 // ── plumbing ─────────────────────────────────────────────────────────────────────────────────────
 
@@ -211,6 +214,9 @@ const UPDATE_OPTS = { cwd: homedir() };
  *  own documented override — the installer honours the same variable). */
 const CURSOR_SCRIPT = join(CHECKOUT, "plugin", "scripts", "cursor-install.mjs");
 const cursorDir = () => process.env.CURSOR_CONFIG_DIR || join(homedir(), ".cursor");
+/** Antigravity's installer, and its global customization dir (holds hooks.json). */
+const ANTIGRAVITY_SCRIPT = join(CHECKOUT, "plugin", "scripts", "antigravity-install.mjs");
+const antigravityDir = () => join(homedir(), ".gemini", "config");
 
 /** Is Nomo already installed for this host? Answered from the host's OWN plugin cache
  *  (`<cache>/<marketplace>/<plugin>/`): the MARKETPLACE directory name is whatever the user called it,
@@ -555,6 +561,49 @@ const AGENTS = [
         : null;
     },
   },
+  {
+    // Cursor's twin: installs from the ~/.nomo checkout; antigravity-install.mjs writes ONE "nomo"
+    // block into ~/.gemini/config/hooks.json (read by the app/IDE and the `agy` CLI). Read-only v1.
+    id: "antigravity",
+    label: "Antigravity",
+    plan: () =>
+      STATUS.get("antigravity")?.installed
+        ? [`already installed — updates ${CHECKOUT}, then refreshes hooks.json`]
+        : [
+            `git clone --depth 1 ${REF ? `--branch ${REF} ` : ""}${CLONE_URL} ${CHECKOUT}`,
+            `node ${ANTIGRAVITY_SCRIPT}`,
+          ],
+    next: () =>
+      STATUS.get("antigravity")?.installed
+        ? ["restart Antigravity (and any open agy) so it re-reads hooks.json"]
+        : ["restart Antigravity (and any open agy) so it re-reads hooks.json",
+            "pair from another agent, or run ~/.nomo/plugin/scripts/run.sh ~/.nomo/plugin/dist/pair.mjs"],
+    detect: () => onPath("agy") || existsSync(antigravityDir()),
+    skipUndetectedUnderAll: true,
+    installed: () => {
+      try {
+        return readFileSync(join(antigravityDir(), "hooks.json"), "utf8").includes("antigravity-hook.sh");
+      } catch {
+        return false;
+      }
+    },
+    install() {
+      const checkout = ensureCheckout("Antigravity", "antigravity-install.mjs");
+      if (checkout) return checkout;
+      if (!DRY && !existsSync(ANTIGRAVITY_SCRIPT)) {
+        return {
+          error: `${ANTIGRAVITY_SCRIPT} is missing from the checkout`,
+          hint: REF
+            ? `Does \`${REF}\` have Antigravity support? Older refs do not ship that script.`
+            : `Delete ${CHECKOUT} and re-run.`,
+        };
+      }
+      const fail = run(process.execPath, [ANTIGRAVITY_SCRIPT]);
+      return fail
+        ? { error: fail, hint: `The script's own line above says what it refused and why. Fix that and re-run;\n    ${process.execPath} ${ANTIGRAVITY_SCRIPT}` }
+        : null;
+    },
+  },
 ];
 
 /** Fill STATUS, ONCE, before anything is rendered. Everything expensive lives here for one reason:
@@ -640,15 +689,15 @@ function parseArgs(argv) {
  *  "install this version" while two of three legs quietly ignore it is worse than no flag. */
 function refCaveat(selected) {
   /** The two that install from ~/.nomo. @param {{id: string}} a */
-  const pinned = (a) => a.id === "opencode" || a.id === "cursor";
+  const pinned = (a) => a.id === "opencode" || a.id === "cursor" || a.id === "antigravity";
   const ignoring = AGENTS.filter((a) => !pinned(a) && selected.has(a.id)).map((a) => a.label);
-  say(`${bold("Note:")} --ref ${REF} pins the ${CHECKOUT} checkout (OpenCode, Cursor) only.`);
+  say(`${bold("Note:")} --ref ${REF} pins the ${CHECKOUT} checkout (OpenCode, Cursor, Antigravity) only.`);
   if (ignoring.length > 0) {
     say(dim(`  ${ignoring.join(" and ")} install through their own marketplace, which takes an`));
     say(dim(`  owner/repo and reads ${REPO}'s default branch. There is no ref to pass it, so`));
     say(dim(`  ${ignoring.length > 1 ? "those legs" : "that leg"} will install from the default branch regardless.`));
   }
-  if (!AGENTS.some((a) => pinned(a) && selected.has(a.id))) say(dim("  Neither is selected, so --ref changes nothing in this run."));
+  if (!AGENTS.some((a) => pinned(a) && selected.has(a.id))) say(dim("  None of them is selected, so --ref changes nothing in this run."));
   say();
 }
 
@@ -997,9 +1046,9 @@ async function main() {
   const selected = explicit ? args.picked : new Set(args.yes ? found : []);
 
   if (!explicit && found.length === 0) {
-    err("\nnomo-ai: found no Claude Code, Codex, OpenCode or Cursor install on this machine.");
-    err("  Looked for `claude`, `codex`, `opencode`, `cursor-agent` on PATH and ~/.claude, ~/.codex, ~/.config/opencode, ~/.cursor.");
-    err("  Name one anyway with --claude / --codex / --opencode / --cursor, or --all.");
+    err("\nnomo-ai: found no Claude Code, Codex, OpenCode, Cursor or Antigravity install on this machine.");
+    err("  Looked for `claude`, `codex`, `opencode`, `cursor-agent`, `agy` on PATH and ~/.claude, ~/.codex, ~/.config/opencode, ~/.cursor, ~/.gemini/config.");
+    err("  Name one anyway with --claude / --codex / --opencode / --cursor / --antigravity, or --all.");
     return 1;
   }
 
@@ -1019,7 +1068,7 @@ async function main() {
   if (!explicit && !args.yes) {
     if (!interactive()) {
       err("\nnomo-ai: not a terminal, so there is nobody to ask.");
-      err("  Pass --yes to install everything detected, or name agents: --claude --codex --opencode --cursor / --all.");
+      err("  Pass --yes to install everything detected, or name agents: --claude --codex --opencode --cursor --antigravity / --all.");
       return 2;
     }
     const answer = await choose(selected);
