@@ -2,6 +2,7 @@
 // the wrapper's synchronous paths, and the watchdog command gates). Temp dirs only — never the real
 // ~/.config/cc-status or ~/.gemini.
 
+import { readFileSync } from "node:fs";
 import { cp, mkdir, mkdtemp, readdir, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -151,7 +152,8 @@ describe("routing a send-message", () => {
     };
     expect(await handleReplyCommand("send-message", CONV, done(), { mid: "mid-aaaaaaaa", text: "write the notes" }, deps)).toBe("reply-resumed");
     expect(spawned).toEqual([[CONV, "/w/proj", "write the notes"]]);
-    expect(await receiptOf(dir, CONV, "mid-aaaaaaaa")).toBe("q"); // r only once the run is alive
+    expect(await receiptOf(dir, CONV, "mid-aaaaaaaa")).toBe("w"); // waking: no cancel; r once the run is alive
+    expect(await handleReplyCommand("cancel-message", CONV, done(), { mid: "mid-aaaaaaaa" }, deps)).toBe("reply-too-late");
     expect(await confirmResume(dir, CONV)).toBe(true);
     expect(await receiptOf(dir, CONV, "mid-aaaaaaaa")).toBe("r");
     expect(await handleReplyCommand("send-message", CONV, done(), { mid: "mid-aaaaaaaa", text: "write the notes" }, deps)).toBe("reply-duplicate");
@@ -166,6 +168,22 @@ describe("routing a send-message", () => {
     expect(spawned[1]![2]).toBe("left over\n\nnew");
     await confirmResume(dir, CONV);
     expect(await readReceipts(dir, CONV)).toMatchObject({ "mid-cccccccc": "r", "mid-dddddddd": "r" });
+  });
+
+  test("the resumed run's first PreInvocation confirms even if it beats the .agy-resume write", async () => {
+    const dir = await tmp();
+    let atSpawn: string | undefined;
+    const deps = {
+      sessionsDir: dir, now: NOW, pidAlive: () => false,
+      // the child's hook could run the instant it exists: the receipt must already say `w` here
+      resume: () => { atSpawn = readFileSync(join(dir, `${CONV}.mid-aaaaaaaa.agy-reply`), "utf8"); return 777; },
+    };
+    expect(await handleReplyCommand("send-message", CONV, done(), { mid: "mid-aaaaaaaa", text: "hi" }, deps)).toBe("reply-resumed");
+    expect(atSpawn).toBe("w");
+    await rm(join(dir, `${CONV}.agy-resume`)); // as if the hook ran before the file landed
+    expect(await confirmResume(dir, CONV)).toBe(true);
+    expect(await receiptOf(dir, CONV, "mid-aaaaaaaa")).toBe("r");
+    expect(await confirmResume(dir, CONV)).toBe(false); // r is never touched again
   });
 
   test("a resumed agy that dies before its first step: its messages go x, never a false 'Resumed'", async () => {
@@ -197,7 +215,7 @@ describe("routing a send-message", () => {
     expect((await sweepStrandedReplies(dir, CONV, done(), deps)).resumed).toBe(true);
     expect(spawned).toEqual(["later"]);
     expect(await hasQueuedReplies(dir, CONV)).toBe(false);
-    expect(await receiptOf(dir, CONV, "mid-aaaaaaaa")).toBe("q");
+    expect(await receiptOf(dir, CONV, "mid-aaaaaaaa")).toBe("w");
     expect((await sweepStrandedReplies(dir, CONV, done(), deps)).resumed).toBe(false);
     // no inbox at all → nothing spawned
     expect((await sweepStrandedReplies(dir, "other-conv", done(), deps)).resumed).toBe(false);

@@ -3043,7 +3043,7 @@ async function writeReceipt(dir, conv, mid, state) {
 async function receiptOf(dir, conv, mid) {
   try {
     const s = (await readFile3(fileFor(dir, conv, mid, ANTIGRAVITY_RECEIPT_SUFFIX), "utf8")).trim();
-    return /^[qdrcx]$/.test(s) ? s : undefined;
+    return /^[qwdrcx]$/.test(s) ? s : undefined;
   } catch {
     return;
   }
@@ -3059,7 +3059,7 @@ async function readReceipts(dir, conv, now = Date.now()) {
   const evictable = new Set;
   for (const old of rows.slice(0, Math.max(0, rows.length - REPLY_RECEIPTS_MAX))) {
     const s = await receiptOf(dir, conv, old.mid);
-    if (s && s !== "q" && now - old.at > REPLY_PHONE_GIVE_UP_MS) {
+    if (s && s !== "q" && s !== "w" && now - old.at > REPLY_PHONE_GIVE_UP_MS) {
       await unlink2(fileFor(dir, conv, old.mid, ANTIGRAVITY_RECEIPT_SUFFIX)).catch(() => {});
       evictable.add(old.mid);
     }
@@ -3190,21 +3190,24 @@ var ANTIGRAVITY_RESUME_SUFFIX = ".agy-resume";
 var resumeFile = (dir, conv) => join3(dir, `${conv}${ANTIGRAVITY_RESUME_SUFFIX}`);
 async function readResume(dir, conv) {
   try {
-    const [p, ...mids] = (await readFile3(resumeFile(dir, conv), "utf8")).trim().split(/\s+/);
-    const pid = Number(p);
-    return pid > 1 ? { pid, mids: mids.filter((m) => MID.test(m)) } : undefined;
+    const pid = Number((await readFile3(resumeFile(dir, conv), "utf8")).trim());
+    return pid > 1 ? { pid } : undefined;
   } catch {
     return;
   }
 }
+async function moveReceipts(dir, conv, from, to) {
+  const moved = [];
+  for (const mid of await midsOf(dir, conv, ANTIGRAVITY_RECEIPT_SUFFIX)) {
+    if (await receiptOf(dir, conv, mid) === from) {
+      await writeReceipt(dir, conv, mid, to);
+      moved.push(mid);
+    }
+  }
+  return moved;
+}
 async function confirmResume(dir, conv) {
-  const r = await readResume(dir, conv);
-  if (!r || r.mids.length === 0)
-    return false;
-  for (const mid of r.mids)
-    await writeReceipt(dir, conv, mid, "r");
-  await atomicWrite(resumeFile(dir, conv), String(r.pid), 384).catch(() => {});
-  return true;
+  return (await moveReceipts(dir, conv, "w", "r")).length > 0;
 }
 var resumingNow = new Set;
 async function resumeWithQueued(dir, conv, record, extra, resume = spawnAgyResume) {
@@ -3219,12 +3222,12 @@ async function resumeWithQueued(dir, conv, record, extra, resume = spawnAgyResum
     if (all.length === 0)
       return false;
     for (const r of all)
-      await writeReceipt(dir, conv, r.mid, "q");
+      await writeReceipt(dir, conv, r.mid, "w");
     const pid = resume(conv, record.cwd ?? record.origin?.cwd, all.map((r) => r.text).join(`
 
 `));
     if (pid !== undefined) {
-      await atomicWrite(resumeFile(dir, conv), [pid, ...all.map((r) => r.mid)].join(" "), 384).catch(() => {});
+      await atomicWrite(resumeFile(dir, conv), String(pid), 384).catch(() => {});
       return true;
     }
     for (const r of all)
@@ -3244,12 +3247,7 @@ async function sweepStrandedReplies(dir, conv, record, deps = {}) {
     const alive = deps.pidAlive ?? pidAlive;
     const r = await readResume(dir, conv);
     if (r && !alive(r.pid)) {
-      for (const mid of r.mids) {
-        if (await receiptOf(dir, conv, mid) === "q") {
-          await writeReceipt(dir, conv, mid, "x");
-          out.refused.push(mid);
-        }
-      }
+      out.refused = await moveReceipts(dir, conv, "w", "x");
       await unlink2(resumeFile(dir, conv)).catch(() => {});
     }
     if (replyRoute(record, r !== undefined && alive(r.pid), alive) !== "resume")

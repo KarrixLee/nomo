@@ -3565,7 +3565,10 @@ async function sweep(config: Config | null, deps: SweepDeps = {}): Promise<Sweep
       if (stranded.resumed) traceFocus({}, { event: "reply", sessionId, agent: "antigravity", result: "resumed-stranded" });
       if (stranded.refused.length > 0) {
         traceFocus({}, { event: "reply", sessionId, agent: "antigravity", result: "resume-died", reason: "agy exited before its first step", mids: stranded.refused });
-        if (config) await publishReplyReceipts(config, sessionId, SESSIONS_DIR).catch(() => {});
+      }
+      // `w` (waking: no Cancel) or `x` must reach the phone now, not at the resumed run's first hook.
+      if (config && (stranded.resumed || stranded.refused.length > 0)) {
+        await publishReplyReceipts(config, sessionId, SESSIONS_DIR).catch(() => {});
       }
     }
     if (verdict === "keep") {

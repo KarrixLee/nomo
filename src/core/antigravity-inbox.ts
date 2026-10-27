@@ -18,8 +18,10 @@
 // RACE-SAFETY: every message is its own file, so writers never read-modify-write a shared queue. Taking
 // and cancelling both start with an atomic rename of the message file — exactly one of them wins.
 //
-// RECEIPTS: `<conv>.<mid>.agy-reply` holds one letter — q queued · d delivered · r resumed (the resumed
-// run reached its first step) · c cancelled · x refused (or a resumed run died before its first step). The newest REPLY_RECEIPTS_MAX ride in the session blob as an
+// RECEIPTS: `<conv>.<mid>.agy-reply` holds one letter — q queued · w waking (Nomo is starting an agy
+// to resume the conversation; too late to cancel) · d delivered · r resumed (the resumed run reached its
+// first step) · c cancelled · x refused (or a resumed run died before its first step). Forward-only:
+// q < w < d/r; c and x are final. The newest REPLY_RECEIPTS_MAX ride in the session blob as an
 // append-last `replies` map, which is how the phone's bubble moves from "Sending…" to "Delivered". The
 // phone keeps re-sending a message (same mid, fresh nonce) until it sees a receipt for it, and a
 // receipt-holding mid is never queued twice, so a lost relay copy or a double delivery is harmless.
@@ -50,7 +52,7 @@ export const REPLY_NUDGE_WINDOW_MS = 60_000;
  *  real user message on the next model call). */
 export const ANTIGRAVITY_REPLY_NUDGE = "The user just sent a new message from their phone. It follows as the next user message.";
 
-export type ReplyReceipt = "q" | "d" | "r" | "c" | "x";
+export type ReplyReceipt = "q" | "w" | "d" | "r" | "c" | "x";
 export interface QueuedReply { mid: string; text: string; ts: number }
 
 const MID = /^[A-Za-z0-9_-]{8,64}$/;
@@ -88,12 +90,12 @@ export async function writeReceipt(dir: string, conv: string, mid: string, state
 export async function receiptOf(dir: string, conv: string, mid: string): Promise<ReplyReceipt | undefined> {
   try {
     const s = (await readFile(fileFor(dir, conv, mid, ANTIGRAVITY_RECEIPT_SUFFIX), "utf8")).trim();
-    return /^[qdrcx]$/.test(s) ? (s as ReplyReceipt) : undefined;
+    return /^[qwdrcx]$/.test(s) ? (s as ReplyReceipt) : undefined;
   } catch { return undefined; }
 }
 
 /** A conversation's receipts as {mid: state}, oldest first. Beyond the newest REPLY_RECEIPTS_MAX, a
- *  receipt is deleted only once it is final (not `q`) AND older than the phone's give-up window. Never
+ *  receipt is deleted only once it is final (not `q`/`w`) AND older than the phone's give-up window. Never
  *  throws. */
 export async function readReceipts(dir: string, conv: string, now: number = Date.now()): Promise<Record<string, ReplyReceipt>> {
   const rows: { mid: string; at: number }[] = [];
@@ -104,7 +106,7 @@ export async function readReceipts(dir: string, conv: string, now: number = Date
   const evictable = new Set<string>();
   for (const old of rows.slice(0, Math.max(0, rows.length - REPLY_RECEIPTS_MAX))) {
     const s = await receiptOf(dir, conv, old.mid);
-    if (s && s !== "q" && now - old.at > REPLY_PHONE_GIVE_UP_MS) {
+    if (s && s !== "q" && s !== "w" && now - old.at > REPLY_PHONE_GIVE_UP_MS) {
       await unlink(fileFor(dir, conv, old.mid, ANTIGRAVITY_RECEIPT_SUFFIX)).catch(() => {});
       evictable.add(old.mid);
     }
@@ -233,35 +235,40 @@ export function spawnAgyResume(conv: string, cwd: string, text: string): number 
   } catch { return undefined; }
 }
 
-/** `<conv>.agy-resume` holds `<pid> [mid…]`: the agy Nomo resumed the conversation in, so a second
- *  message queues behind it instead of starting a second agy on the same conversation — across watchdog
- *  restarts too (the record's own pid only moves at the resumed run's first hook) — and the messages it
- *  carries, still `q` until that run's first PreInvocation (confirmResume) turns them `r`. */
+/** `<conv>.agy-resume` holds `<pid>`: the agy Nomo resumed the conversation in, so a second message
+ *  queues behind it instead of starting a second agy on the same conversation — across watchdog restarts
+ *  too (the record's own pid only moves at the resumed run's first hook). The messages it carries are the
+ *  conversation's `w` receipts — written BEFORE the spawn, so the run's first PreInvocation
+ *  (confirmResume) always finds them, however fast it gets there; this file can land after that hook. */
 export const ANTIGRAVITY_RESUME_SUFFIX = ".agy-resume";
 const resumeFile = (dir: string, conv: string) => join(dir, `${conv}${ANTIGRAVITY_RESUME_SUFFIX}`);
-async function readResume(dir: string, conv: string): Promise<{ pid: number; mids: string[] } | undefined> {
+async function readResume(dir: string, conv: string): Promise<{ pid: number } | undefined> {
   try {
-    const [p, ...mids] = (await readFile(resumeFile(dir, conv), "utf8")).trim().split(/\s+/);
-    const pid = Number(p);
-    return pid > 1 ? { pid, mids: mids.filter((m) => MID.test(m)) } : undefined;
+    const pid = Number((await readFile(resumeFile(dir, conv), "utf8")).trim());
+    return pid > 1 ? { pid } : undefined;
   } catch { return undefined; }
 }
 
-/** The resumed run is alive (its first PreInvocation fired): its messages go `r`. True if any did. */
+/** Move every `from` receipt of `conv` to `to`; the mids moved. */
+async function moveReceipts(dir: string, conv: string, from: ReplyReceipt, to: ReplyReceipt): Promise<string[]> {
+  const moved: string[] = [];
+  for (const mid of await midsOf(dir, conv, ANTIGRAVITY_RECEIPT_SUFFIX)) {
+    if ((await receiptOf(dir, conv, mid)) === from) { await writeReceipt(dir, conv, mid, to); moved.push(mid); }
+  }
+  return moved;
+}
+
+/** The resumed run is alive (its first PreInvocation fired): its `w` messages go `r`. True if any did. */
 export async function confirmResume(dir: string, conv: string): Promise<boolean> {
-  const r = await readResume(dir, conv);
-  if (!r || r.mids.length === 0) return false;
-  for (const mid of r.mids) await writeReceipt(dir, conv, mid, "r");
-  await atomicWrite(resumeFile(dir, conv), String(r.pid), 0o600).catch(() => {});
-  return true;
+  return (await moveReceipts(dir, conv, "w", "r")).length > 0;
 }
 
 /** Conversations this process is starting an agy for right now (one resume at a time per conversation). */
 const resumingNow = new Set<string>();
 
 /** Resume an idle `agy` CLI conversation with every message still queued for it, plus `extra` (a new
- *  one). Receipts stay `q` until the run's first PreInvocation. If agy cannot be started, everything is
- *  (re)queued for the next turn at the Mac. True = an agy was started. Never throws. */
+ *  one). Receipts go `w` before the spawn, `r` at the run's first PreInvocation. If agy cannot be
+ *  started, everything is (re)queued for the next turn at the Mac. True = an agy was started. Never throws. */
 export async function resumeWithQueued(
   dir: string, conv: string, record: SessionRecord, extra: QueuedReply | undefined,
   resume: (conv: string, cwd: string, text: string) => number | undefined = spawnAgyResume,
@@ -274,12 +281,15 @@ export async function resumeWithQueued(
   try {
     const all = [...await takeReplies(dir, conv), ...(extra ? [extra] : [])];
     if (all.length === 0) return false;
-    for (const r of all) await writeReceipt(dir, conv, r.mid, "q");
+    for (const r of all) await writeReceipt(dir, conv, r.mid, "w"); // before the spawn: see confirmResume
     const pid = resume(conv, (record.cwd ?? record.origin?.cwd)!, all.map((r) => r.text).join("\n\n"));
     if (pid !== undefined) {
-      await atomicWrite(resumeFile(dir, conv), [pid, ...all.map((r) => r.mid)].join(" "), 0o600).catch(() => {});
+      await atomicWrite(resumeFile(dir, conv), String(pid), 0o600).catch(() => {});
       return true;
     }
+    // ponytail: w→q breaks forward-only if a publish caught the `w` in this instant (agy not even
+    // startable); the phone then shows "Waking" until the Mac delivers it (d). Gate the spawn on
+    // existsSync(agyBinary()) before writing `w` if that ever matters.
     for (const r of all) await enqueueReply(dir, conv, r).catch(() => {});
     return false;
   } catch {
@@ -304,9 +314,7 @@ export async function sweepStrandedReplies(
     const alive = deps.pidAlive ?? pidAlive;
     const r = await readResume(dir, conv);
     if (r && !alive(r.pid)) {
-      for (const mid of r.mids) {
-        if ((await receiptOf(dir, conv, mid)) === "q") { await writeReceipt(dir, conv, mid, "x"); out.refused.push(mid); }
-      }
+      out.refused = await moveReceipts(dir, conv, "w", "x");
       await unlink(resumeFile(dir, conv)).catch(() => {});
     }
     if (replyRoute(record, r !== undefined && alive(r.pid), alive) !== "resume") return out;
