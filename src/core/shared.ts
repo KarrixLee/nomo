@@ -2162,12 +2162,14 @@ export async function writeInterruptFlagAt(sessionsDir: string, sessionId: strin
 
 /** Is a fresh flag present? Deliberately does NOT consume it: Claude Code still runs every other tool
  *  call already in the same assistant message, and each of those must be denied too. */
-export async function interruptFlagSetAt(sessionsDir: string, sessionId: string, now: number): Promise<boolean> {
+export async function interruptFlagSetAt(
+  sessionsDir: string, sessionId: string, now: number, maxAgeMs: number = INTERRUPT_FLAG_MAX_AGE_MS,
+): Promise<boolean> {
   try {
     const flag = JSON.parse(
       await readFile(`${sessionsDir}/${interruptFlagFileName(sessionId)}`, "utf8"),
     ) as { at?: unknown };
-    return typeof flag.at === "number" && now - flag.at <= INTERRUPT_FLAG_MAX_AGE_MS;
+    return typeof flag.at === "number" && now - flag.at <= maxAgeMs;
   } catch {
     return false;
   }

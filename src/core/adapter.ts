@@ -2259,7 +2259,8 @@ export interface AgentAdapter {
   locateTuiPid?(ctx: { sessionId: string; record: SessionRecord }, deps?: LocateTuiDeps): Promise<number | undefined>;
   /** How a phone "Interrupt" stops this agent's running turn, or absent when it cannot be done.
    *   "hook-flag"  — the watchdog stamps a per-session flag; the agent's own status hook returns
-   *                  continue:false at the next tool call (Claude Code).
+   *                  continue:false at the next tool call (Claude Code), or terminate at the next
+   *                  PostInvocation (Antigravity).
    *   "app-server" — the watchdog sends turn/interrupt through the Codex app-server bridge.
    *  The phone mirrors this as CCInterrupt.canInterrupt. */
   interrupt?: "hook-flag" | "app-server";
@@ -2743,6 +2744,9 @@ export const antigravityAdapter: AgentAdapter = {
   },
   toolDetail: {},
   blobAgentFields: { agent: "antigravity" as const },
+  // Phone Stop: the watchdog stamps the shared flag; the PostInvocation hook terminates the turn
+  // (core/antigravity.ts) and the approval hook denies a routed/held tool (core/antigravity-approval.ts).
+  interrupt: "hook-flag",
 };
 
 /** The adapter for an agent kind THIS BUILD DOES NOT KNOW — a record stamped by a newer peer install

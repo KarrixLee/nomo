@@ -1456,6 +1456,11 @@ export interface PermissionHookDeps {
    *  like an expiry. Absent = unbounded (Claude/Codex/OpenCode). Antigravity sets it because its hook
    *  timeout BLOCKS the tool when exceeded — see core/antigravity-approval.ts. */
   deadlineAt?: number;
+  /** Polled once per hold round (~3 s): true = the phone pressed Stop on this session. The hold then
+   *  denies with `stopReason`, retires the worker's card, and exits. Absent = never (Antigravity only —
+   *  the other agents stop their turn without touching a held card). */
+  stopRequested?: () => Promise<boolean>;
+  stopReason?: string;
 }
 
 async function readStdin(): Promise<string> {
@@ -2051,6 +2056,19 @@ export async function runPermissionHook(
         settleAsWorking = true;
         trace({ event: "local-answer", seq });
         trace({ event: "exit", reason: "local-answer" });
+        return;
+      }
+      // STOPPED FROM THE PHONE: the turn is being stopped, so the tool it is waiting on must not run.
+      // Deny here (never the fallback: that would open the agent's own prompt and park the turn), then
+      // retire the worker's pending card best-effort so the phone drops its Allow/Deny.
+      if (deps.stopRequested && await deps.stopRequested().catch(() => false)) {
+        emit(denyLine(agent, deps.stopReason));
+        settleAsWorking = true;
+        trace({ event: "exit", reason: "stopped", seq });
+        await fetchFn(`${config.url}/v1/cc/decision/resolve`, {
+          method: "POST", headers: { ...pcHeaders, "content-type": "application/json" },
+          body: JSON.stringify({ requestId }), signal: AbortSignal.timeout(3_000),
+        }).catch(() => {});
         return;
       }
       const { data, status: httpStatus } = await pollDecision(seq);

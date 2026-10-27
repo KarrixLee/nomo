@@ -948,10 +948,10 @@ async function writeInterruptFlagAt(sessionsDir, sessionId, now) {
     await atomicWrite(`${sessionsDir}/${interruptFlagFileName(sessionId)}`, JSON.stringify({ at: now }), 384);
   } catch {}
 }
-async function interruptFlagSetAt(sessionsDir, sessionId, now) {
+async function interruptFlagSetAt(sessionsDir, sessionId, now, maxAgeMs = INTERRUPT_FLAG_MAX_AGE_MS) {
   try {
     const flag = JSON.parse(await readFile(`${sessionsDir}/${interruptFlagFileName(sessionId)}`, "utf8"));
-    return typeof flag.at === "number" && now - flag.at <= INTERRUPT_FLAG_MAX_AGE_MS;
+    return typeof flag.at === "number" && now - flag.at <= maxAgeMs;
   } catch {
     return false;
   }
@@ -2952,7 +2952,8 @@ var antigravityAdapter = {
     resolve: (sessionId) => antigravityChatTitle(sessionId)
   },
   toolDetail: {},
-  blobAgentFields: { agent: "antigravity" }
+  blobAgentFields: { agent: "antigravity" },
+  interrupt: "hook-flag"
 };
 function unknownAgentAdapter(kind) {
   return {

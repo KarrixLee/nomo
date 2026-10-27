@@ -451,9 +451,18 @@ writes/edits (`run_command`, `write_file`, `write_to_file`, `edit_file`, `replac
 
 ### How the Antigravity leg works
 
-- **The status hooks are read-only.** Their wrapper prints `{}` and exits 0 *before* doing any work, so
-  every path — a crash, no runtime, not paired, no network — returns the empty reply, and Antigravity
-  never sees a `decision` or `terminationBehavior` from them. The work itself is capped at 4 seconds.
+- **The status hooks are read-only, except for your phone's Interrupt.** Their wrapper prints `{}` and
+  exits 0 *before* doing any work, so every path — a crash, no runtime, not paired, no network —
+  returns the empty reply, and Antigravity never sees a `decision` from them. The one exception is
+  `PostInvocation` (after each model call): its wrapper waits for the work (capped at 4 seconds) and
+  prints `{"terminationBehavior":"terminate"}` only when the bundle printed exactly that, else `{}`.
+- **Interrupt from the phone.** Tapping Interrupt on a running Antigravity row (same rules as Claude
+  Code: a live local link to this computer) stamps a one-shot flag for that conversation. The next
+  `PostInvocation` consumes it and ends the turn there — so the turn stops when the current model call
+  (or tool) finishes — and the row turns *done*. While the flag is up, a shell command or file write
+  waiting on the phone, or about to, is denied with "Stopped from phone". A flag not acted on within
+  10 minutes, or left when the turn ended on its own, is dropped and never touches a later turn.
+  Nomo never signals the `agy` process (that would exit the CLI).
 - **Phone approvals (`PreToolUse`).** For a shell command or a file write in a session your phone is
   showing, the tool waits while the phone shows Allow / Deny / Deny with note. Allow answers
   `auto_approve`; Deny answers `deny` with your note (or "Denied from phone") as the reason the agent
@@ -517,10 +526,16 @@ description is dropped before the command is.
 
 ## Hooks on your computer — security
 
-- **Antigravity: status hooks observe only; the approval hook can only defer, approve what you
-  approved, or deny what you denied.** Nomo's `"nomo"` block in `~/.gemini/config/hooks.json` answers
-  every status event with `{}` before running anything, so those can neither stop a tool nor keep or
-  end a turn. Its one `PreToolUse` entry is matched only to shell commands and file writes/edits.
+- **Antigravity: status hooks observe only, except to end a turn you interrupted; the approval hook
+  can only defer, approve what you approved, or deny what you denied (or interrupted).** Nomo's
+  `"nomo"` block in `~/.gemini/config/hooks.json` answers every status event with `{}` before running
+  anything, so those can neither stop a tool nor keep or end a turn — except `PostInvocation`, whose
+  wrapper prints `{"terminationBehavior":"terminate"}` only when the bundle printed exactly that line
+  (anything else is `{}`), and the bundle prints it only after consuming a fresh interrupt flag the
+  watchdog wrote for that conversation from an `interrupt-session` command sealed by your paired phone
+  (decrypted, fresh, never replayed, naming a session this computer tracks). The same flag makes the
+  approval hook answer `deny` ("Stopped from phone"). Its one `PreToolUse` entry is matched only to
+  shell commands and file writes/edits.
   Antigravity treats a failing `PreToolUse` hook as a block, so `antigravity-approve.sh` checks the
   hook's output against the only three replies Nomo sends (`allow`, `auto_approve`, `deny` with a
   reason) and answers `{"decision":"allow"}` — Antigravity's own permission settings and prompt — for

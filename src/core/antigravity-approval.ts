@@ -20,14 +20,19 @@
 // writes are NOT exempt: agy 1.4.8 prompted for a write inside its own workspace in the spike, so the
 // docs' "workspace writes are auto-allowed" cannot be relied on.
 //
+// PHONE STOP: while the phone's Stop flag is up (see core/antigravity.ts), a routed tool call is denied
+// with ANTIGRAVITY_STOP_REASON at once, and a hold already waiting on the phone ends the same way — the
+// turn is about to be terminated, and the fallback would park it on Antigravity's own prompt instead.
+//
 // "ALWAYS ALLOW" IS NOT OFFERED: `permissionOverrides` persistence is undocumented and testing it would
 // write to the user's real ~/.gemini. A phone that sends allow_always anyway gets a plain auto_approve.
 
 import { readFileSync } from "node:fs";
 import { isAbsolute, resolve } from "node:path";
 import { antigravityDataDirFor } from "./adapter";
-import { antigravityCwd, antigravitySessionId } from "./antigravity";
+import { ANTIGRAVITY_STOP_REASON, antigravityCwd, antigravitySessionId, antigravityStopRequested } from "./antigravity";
 import { runPermissionHook, type PermissionHookDeps } from "./permission";
+import { SESSIONS_DIR } from "./shared";
 
 /** Printed whenever we have no phone answer: defer to Antigravity's own policy. */
 export const ANTIGRAVITY_FALLBACK = '{"decision":"allow"}';
@@ -158,7 +163,12 @@ export interface AntigravityApprovalDeps {
   hold?: PermissionHookDeps;
   rules?: (transcriptPath: string | undefined) => AntigravityPermissionRules;
   run?: typeof runPermissionHook;
+  /** Stop-flag check (tests). Default: the real flag in SESSIONS_DIR. */
+  stopRequested?: (sessionId: string) => Promise<boolean>;
 }
+
+/** The deny line a phone Stop answers with. */
+export const ANTIGRAVITY_STOP_DENY = JSON.stringify({ decision: "deny", reason: ANTIGRAVITY_STOP_REASON });
 
 /** One PreToolUse invocation → exactly one decision string. Never throws. */
 export async function runAntigravityApproval(raw: string, deps: AntigravityApprovalDeps = {}): Promise<string> {
@@ -168,6 +178,9 @@ export async function runAntigravityApproval(raw: string, deps: AntigravityAppro
     const input = parsed as Record<string, unknown>;
     const req = antigravityApprovalRequest(input, (deps.rules ?? loadAntigravityRules)(str(input.transcriptPath)));
     if (!req) return ANTIGRAVITY_FALLBACK;
+    const stopRequested = () => (deps.stopRequested
+      ?? ((id: string) => antigravityStopRequested(SESSIONS_DIR, id, Date.now())))(req.sessionId);
+    if (await stopRequested()) return ANTIGRAVITY_STOP_DENY;
     // `permission_mode` / `agent_id` absent on purpose: the interactive arm, never the subagent pass-through.
     const stdin = JSON.stringify({
       session_id: req.sessionId,
@@ -182,6 +195,8 @@ export async function runAntigravityApproval(raw: string, deps: AntigravityAppro
       // Paused approvals (the shared no-hold flag): nothing to post — Antigravity's own prompt follows.
       delegate: async () => {},
       deadlineAt: (deps.hold?.now ?? Date.now)() + ANTIGRAVITY_HOLD_DEADLINE_MS,
+      stopRequested,
+      stopReason: ANTIGRAVITY_STOP_REASON,
       ...deps.hold,
       readInput: async () => stdin,
       emit: (l) => { line = l; },

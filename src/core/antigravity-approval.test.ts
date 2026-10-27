@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test } from "bun:test";
 import {
-  ANTIGRAVITY_APPROVAL_MATCHER, ANTIGRAVITY_APPROVAL_TIMEOUT_S, ANTIGRAVITY_ENTRY_CAP_MS, ANTIGRAVITY_FALLBACK,
+  ANTIGRAVITY_STOP_DENY, ANTIGRAVITY_APPROVAL_MATCHER, ANTIGRAVITY_APPROVAL_TIMEOUT_S, ANTIGRAVITY_ENTRY_CAP_MS, ANTIGRAVITY_FALLBACK,
   ANTIGRAVITY_HOLD_DEADLINE_MS, antigravityApprovalRequest, antigravityDecision, runAntigravityApproval,
 } from "./antigravity-approval";
 import { encryptBlob } from "./crypto";
@@ -127,8 +127,24 @@ describe("runAntigravityApproval — through the shared relay", () => {
     trace: () => {}, ...over,
   });
   const answered = async (answer: object) => ({ status: "answered", answerBlob: await encryptBlob(KEY, { requestId: "req-agy", ...answer }) });
-  const run = (deps: Record<string, unknown>, input: object = RUN) =>
-    runAntigravityApproval(JSON.stringify(input), { rules: () => NO_RULES, hold: hold(deps) as never });
+  const run = (deps: Record<string, unknown>, input: object = RUN, stopRequested = async () => false) =>
+    runAntigravityApproval(JSON.stringify(input), { rules: () => NO_RULES, hold: hold(deps) as never, stopRequested });
+
+  test("phone Stop already pressed → deny 'Stopped from phone' at once, zero network", async () => {
+    const { fn, calls } = worker(true, []);
+    expect(await run({ fetchFn: fn }, RUN, async () => true)).toBe(ANTIGRAVITY_STOP_DENY);
+    expect(ANTIGRAVITY_STOP_DENY).toBe('{"decision":"deny","reason":"Stopped from phone"}');
+    expect(calls).toEqual([]);
+  });
+
+  test("phone Stop while the card is HELD → deny, and the worker's card is resolved", async () => {
+    const { fn, calls } = worker(true, [{ status: "pending" }, { status: "pending" }, { status: "pending" }]);
+    let checks = 0;
+    const out = await run({ fetchFn: fn }, RUN, async () => ++checks >= 3); // pressed during the hold
+    expect(out).toBe(ANTIGRAVITY_STOP_DENY);
+    expect(calls).toContain("POST /v1/cc/decision");
+    expect(calls).toContain("POST /v1/cc/decision/resolve");
+  });
 
   test("unpaired → allow, zero network", async () => {
     const { fn, calls } = worker(true, []);

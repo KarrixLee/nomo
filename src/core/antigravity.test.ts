@@ -11,11 +11,11 @@ import {
   adapterFor, antigravityAdapter, antigravityChatTitle, antigravityDataDirFor, antigravityFirstPrompt, antigravityRunStatus,
 } from "./adapter";
 import {
-  ANTIGRAVITY_EVENTS, ANTIGRAVITY_KEEPALIVE_MS, antigravityCwd, antigravityEventKind, antigravityHookParent, antigravityOwnerPid,
+  ANTIGRAVITY_EVENTS, ANTIGRAVITY_INTERRUPT_MAX_AGE_MS, ANTIGRAVITY_KEEPALIVE_MS, ANTIGRAVITY_TERMINATE, antigravityCwd, antigravityEventKind, antigravityHookParent, antigravityOwnerPid,
   planAntigravity, runAntigravityHook,
 } from "./antigravity";
 import { decryptBlob } from "./crypto";
-import { Config, readRecord, SessionRecord } from "./shared";
+import { Config, interruptFlagFileName, readRecord, SessionRecord, writeInterruptFlagAt } from "./shared";
 import {
   ANTIGRAVITY_SETTLE_GRACE_MS, antigravityRunSettled, classifySession, correctIdleClaude, isClaudeIdleReapEligible,
 } from "../entries/cc-watchdog";
@@ -98,16 +98,64 @@ describe("runAntigravityHook", () => {
     const sessionsDir = join(dir, "sessions");
     await mkdir(sessionsDir, { recursive: true });
     const posts: Record<string, unknown>[] = [];
+    const printed: string[] = [];
     let clock = NOW;
     const deps = {
       config: CONFIG, sessionsDir, stampPath: join(dir, "stamp"), now: () => clock,
       ownerPid: () => undefined, chatTitle: () => "Refactor parser", ensureWatchdog: () => {}, trace: () => {},
       post: async (_c: Config, e: Record<string, unknown>) => { posts.push(e); return true; },
+      emit: async (line: string) => { printed.push(line); },
     };
     const fire = (event: string, extra: Record<string, unknown> = {}) =>
       runAntigravityHook(JSON.stringify({ conversationId: CONV, workspacePaths: ["/w/proj"], modelName: "gemini-3-pro", ...extra }), event, deps);
-    return { dir, sessionsDir, posts, deps, fire, tick: (ms: number) => { clock += ms; } };
+    const flagged = () => readFile(join(sessionsDir, interruptFlagFileName(CONV)), "utf8").then(() => true, () => false);
+    return { dir, sessionsDir, posts, printed, deps, fire, flagged, now: () => clock, tick: (ms: number) => { clock += ms; } };
   }
+
+  test("phone Stop: the next PostInvocation prints terminate ONCE, consumes the flag, and the row goes done", async () => {
+    const h = await harness();
+    await h.fire("PreInvocation", { invocationNum: 0 });
+    await h.fire("PostInvocation", { invocationNum: 0 });
+    expect(h.printed).toEqual([]); // no flag → nothing printed (the wrapper prints {})
+    await writeInterruptFlagAt(h.sessionsDir, CONV, h.now());
+    await h.fire("PreInvocation", { invocationNum: 1 }); // PreInvocation never terminates
+    expect(h.printed).toEqual([]);
+    await h.fire("PostInvocation", { invocationNum: 1 });
+    expect(h.printed).toEqual([ANTIGRAVITY_TERMINATE]);
+    expect(await h.flagged()).toBe(false);
+    expect(await decryptBlob(KEY, h.posts.at(-1)!.blob as string)).toMatchObject({ status: "done" });
+    const n = h.posts.length;
+    await h.fire("PostInvocation", { invocationNum: 2 });
+    await h.fire("Stop", { terminationReason: "terminated" }); // Antigravity's own Stop: a no-op now
+    expect(h.printed).toEqual([ANTIGRAVITY_TERMINATE]);
+    expect(h.posts).toHaveLength(n);
+  });
+
+  test("a stale flag, or one left by a finished turn, never stops a later turn", async () => {
+    const h = await harness();
+    await h.fire("PreInvocation", { invocationNum: 0 });
+    await writeInterruptFlagAt(h.sessionsDir, CONV, h.now());
+    h.tick(ANTIGRAVITY_INTERRUPT_MAX_AGE_MS + 1);
+    await h.fire("PostInvocation");
+    expect(h.printed).toEqual([]); // expired
+    await writeInterruptFlagAt(h.sessionsDir, CONV, h.now());
+    await h.fire("Stop");           // the turn ended on its own → flag cleared
+    expect(await h.flagged()).toBe(false);
+    await writeInterruptFlagAt(h.sessionsDir, CONV, h.now());
+    await h.fire("PreInvocation");  // new turn over a done row → flag cleared
+    expect(await h.flagged()).toBe(false);
+    await h.fire("PostInvocation");
+    expect(h.printed).toEqual([]);
+  });
+
+  test("an emit that throws never escapes the hook", async () => {
+    const h = await harness();
+    await writeInterruptFlagAt(h.sessionsDir, CONV, h.now());
+    await runAntigravityHook(JSON.stringify({ conversationId: CONV }), "PostInvocation", {
+      ...h.deps, emit: async () => { throw new Error("EPIPE"); },
+    });
+    expect(h.printed).toEqual([]);
+  });
 
   test("a turn: PreInvocation creates working, Stop sends done — agent/title/model in the blob", async () => {
     const h = await harness();
@@ -153,6 +201,50 @@ describe("antigravity-hook.sh (what hooks.json runs)", () => {
       expect(r.code).toBe(0);
       expect(r.out).toBe("{}\n");
     }
+  });
+
+  test("PostInvocation: passes ONLY the exact terminate line through; anything else → {}", async () => {
+    const home = await tmp();
+    const cases: [string, string][] = [
+      [`printf '%s\\n' '${ANTIGRAVITY_TERMINATE}'`, `${ANTIGRAVITY_TERMINATE}\n`],
+      ["", "{}\n"],
+      ["echo garbage", "{}\n"],
+      [`printf '%s\\n%s\\n' noise '${ANTIGRAVITY_TERMINATE}'`, "{}\n"],
+      ["echo '{\"terminationBehavior\":\"terminate\"}'; exit 3", `${ANTIGRAVITY_TERMINATE}\n`],
+      ["kill -9 $$", "{}\n"],
+    ];
+    for (const [script, want] of cases) {
+      const root = join(await tmp(), "plugin");
+      await mkdir(join(root, "scripts"), { recursive: true });
+      await cp(join(PLUGIN, "scripts", "antigravity-hook.sh"), join(root, "scripts", "antigravity-hook.sh"));
+      await writeFile(join(root, "scripts", "run.sh"), `#!/bin/sh\ncat >/dev/null\n${script}\n`, { mode: 0o755 });
+      const proc = spawnTestProcess({
+        cmd: [join(root, "scripts", "antigravity-hook.sh"), "PostInvocation"],
+        env: isolatedTestEnv(home), stdin: new Blob(["{}"]), stdout: "pipe", stderr: "pipe",
+      });
+      const out = await new Response(proc.stdout).text();
+      expect(await proc.exited).toBe(0);
+      expect(out).toBe(want);
+    }
+  });
+
+  test("the real bundle: PostInvocation with a phone flag terminates; without one prints {}", async () => {
+    const home = await tmp();
+    const sessions = join(home, ".config", "cc-status", "sessions");
+    await mkdir(sessions, { recursive: true });
+    const run = async () => {
+      const proc = spawnTestProcess({
+        cmd: [join(PLUGIN, "scripts", "antigravity-hook.sh"), "PostInvocation"],
+        env: isolatedTestEnv(home), stdin: new Blob([JSON.stringify({ conversationId: CONV, invocationNum: 1 })]), stdout: "pipe", stderr: "pipe",
+      });
+      const out = await new Response(proc.stdout).text();
+      expect(await proc.exited).toBe(0);
+      return out;
+    };
+    expect(await run()).toBe("{}\n");
+    await writeInterruptFlagAt(sessions, CONV, Date.now());
+    expect(await run()).toBe(`${ANTIGRAVITY_TERMINATE}\n`);
+    expect(await run()).toBe("{}\n"); // consumed
   });
 
   test("prints {} and exits 0 even when the bundle crashes", async () => {

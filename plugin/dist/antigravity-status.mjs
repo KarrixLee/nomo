@@ -946,10 +946,10 @@ async function writeInterruptFlagAt(sessionsDir, sessionId, now) {
     await atomicWrite(`${sessionsDir}/${interruptFlagFileName(sessionId)}`, JSON.stringify({ at: now }), 384);
   } catch {}
 }
-async function interruptFlagSetAt(sessionsDir, sessionId, now) {
+async function interruptFlagSetAt(sessionsDir, sessionId, now, maxAgeMs = INTERRUPT_FLAG_MAX_AGE_MS) {
   try {
     const flag = JSON.parse(await readFile(`${sessionsDir}/${interruptFlagFileName(sessionId)}`, "utf8"));
-    return typeof flag.at === "number" && now - flag.at <= INTERRUPT_FLAG_MAX_AGE_MS;
+    return typeof flag.at === "number" && now - flag.at <= maxAgeMs;
   } catch {
     return false;
   }
@@ -2950,7 +2950,8 @@ var antigravityAdapter = {
     resolve: (sessionId) => antigravityChatTitle(sessionId)
   },
   toolDetail: {},
-  blobAgentFields: { agent: "antigravity" }
+  blobAgentFields: { agent: "antigravity" },
+  interrupt: "hook-flag"
 };
 function unknownAgentAdapter(kind) {
   return {
@@ -4336,6 +4337,12 @@ function resolveOwnerPid2() {
   const pids = [process.ppid, ...pidAncestors(process.ppid)];
   return antigravityOwnerPid(pids.map((pid) => ({ pid, command: pidCommand(pid) })));
 }
+var ANTIGRAVITY_TERMINATE = '{"terminationBehavior":"terminate"}';
+var ANTIGRAVITY_STOP_REASON = "Stopped from phone";
+var ANTIGRAVITY_INTERRUPT_MAX_AGE_MS = 10 * 60000;
+function antigravityStopRequested(sessionsDir, sessionId, now) {
+  return interruptFlagSetAt(sessionsDir, sessionId, now, ANTIGRAVITY_INTERRUPT_MAX_AGE_MS);
+}
 var ANTIGRAVITY_KEEPALIVE_MS = 15000;
 function planAntigravity(kind, record, now) {
   const nowSec = Math.floor(now / 1000);
@@ -4359,6 +4366,17 @@ function planAntigravity(kind, record, now) {
       return null;
   }
 }
+function emitStdout(line) {
+  return new Promise((resolve) => {
+    process.stdout.on("error", () => resolve());
+    try {
+      process.stdout.write(`${line}
+`, () => resolve());
+    } catch {
+      resolve();
+    }
+  });
+}
 async function runAntigravityHook(raw, eventName, deps = {}) {
   try {
     const parsed = JSON.parse(raw);
@@ -4370,16 +4388,27 @@ async function runAntigravityHook(raw, eventName, deps = {}) {
       return;
     const now = (deps.now ?? Date.now)();
     await atomicWrite(deps.stampPath ?? lastHookPath("antigravity"), String(now)).catch(() => {});
-    const kind = antigravityEventKind(eventName, input);
+    let kind = antigravityEventKind(eventName, input);
     if (!kind || kind === "start")
       return;
+    const sessionsDir = deps.sessionsDir ?? SESSIONS_DIR;
+    if (eventName === "PostInvocation" && await antigravityStopRequested(sessionsDir, sessionId, now)) {
+      await clearInterruptFlagAt(sessionsDir, sessionId);
+      await (deps.emit ?? emitStdout)(ANTIGRAVITY_TERMINATE);
+      (deps.trace ?? traceSession)({ event: "interrupt", sessionId, agent: "antigravity", result: "terminated" });
+      kind = "stop";
+    } else if (kind === "stop") {
+      await clearInterruptFlagAt(sessionsDir, sessionId);
+    }
     const config = deps.config !== undefined ? deps.config : await loadConfig();
     if (!config)
       return;
-    const sessionsDir = deps.sessionsDir ?? SESSIONS_DIR;
     const record = await readRecord(sessionId, sessionsDir);
     if (record && record.agent !== "antigravity")
       return;
+    if (kind === "turn" && record && (record.op === "done" || record.lastEvent === "done")) {
+      await clearInterruptFlagAt(sessionsDir, sessionId);
+    }
     const plan = planAntigravity(kind, record, now);
     if (!plan)
       return;

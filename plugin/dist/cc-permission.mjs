@@ -952,10 +952,10 @@ async function writeInterruptFlagAt(sessionsDir, sessionId, now) {
     await atomicWrite(`${sessionsDir}/${interruptFlagFileName(sessionId)}`, JSON.stringify({ at: now }), 384);
   } catch {}
 }
-async function interruptFlagSetAt(sessionsDir, sessionId, now) {
+async function interruptFlagSetAt(sessionsDir, sessionId, now, maxAgeMs = INTERRUPT_FLAG_MAX_AGE_MS) {
   try {
     const flag = JSON.parse(await readFile(`${sessionsDir}/${interruptFlagFileName(sessionId)}`, "utf8"));
-    return typeof flag.at === "number" && now - flag.at <= INTERRUPT_FLAG_MAX_AGE_MS;
+    return typeof flag.at === "number" && now - flag.at <= maxAgeMs;
   } catch {
     return false;
   }
@@ -2956,7 +2956,8 @@ var antigravityAdapter = {
     resolve: (sessionId) => antigravityChatTitle(sessionId)
   },
   toolDetail: {},
-  blobAgentFields: { agent: "antigravity" }
+  blobAgentFields: { agent: "antigravity" },
+  interrupt: "hook-flag"
 };
 function unknownAgentAdapter(kind) {
   return {
@@ -5205,6 +5206,18 @@ async function runPermissionHook(deps = {}, agent = "claude") {
         settleAsWorking = true;
         trace({ event: "local-answer", seq });
         trace({ event: "exit", reason: "local-answer" });
+        return;
+      }
+      if (deps.stopRequested && await deps.stopRequested().catch(() => false)) {
+        emit(denyLine(agent, deps.stopReason));
+        settleAsWorking = true;
+        trace({ event: "exit", reason: "stopped", seq });
+        await fetchFn(`${config.url}/v1/cc/decision/resolve`, {
+          method: "POST",
+          headers: { ...pcHeaders, "content-type": "application/json" },
+          body: JSON.stringify({ requestId }),
+          signal: AbortSignal.timeout(3000)
+        }).catch(() => {});
         return;
       }
       const { data, status: httpStatus } = await pollDecision(seq);
