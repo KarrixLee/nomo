@@ -17,7 +17,7 @@ import { existsSync } from "node:fs";
 import { readdir, readFile, stat } from "node:fs/promises";
 import { devNull } from "node:os";
 import { promisify } from "node:util";
-import { basename, join } from "node:path";
+import { basename, isAbsolute, join, resolve } from "node:path";
 import { AgentKind, AgentKindWire, CC_DIR, codexHome, cursorHome, folderKeyFromCwd, isRealTty, lastHookPath, pidAlive, pidAncestors, pidCommand, readPrefix, readSuffix, SessionRecord } from "./shared";
 import { ancestryContainsHerdr, owningTerminalApp } from "./terminal-focus";
 
@@ -2592,8 +2592,16 @@ function sqliteOne(db: string, sql: string, env: NodeJS.ProcessEnv = process.env
     // output shape. macOS ships sqlite3 at a fixed absolute path, which a `.`/empty PATH entry (the cwd
     // is the workspace) cannot shadow with a repo-planted binary; elsewhere it is a PATH lookup.
     const bin = process.platform === "darwin" && existsSync("/usr/bin/sqlite3") ? "/usr/bin/sqlite3" : "sqlite3";
-    const out = execFileSync(bin, ["-init", devNull, "-batch", "-noheader", "-list", "-readonly", db, sql],
+    const run = (target: string) => execFileSync(bin, ["-init", devNull, "-batch", "-noheader", "-list", "-readonly", target, sql],
       { timeout: CURSOR_TITLE_TIMEOUT_MS, encoding: "utf8", maxBuffer: 65_536, stdio: ["ignore", "pipe", "ignore"], env });
+    let out: string;
+    try {
+      out = run(db);
+    } catch {
+      // A WAL database whose -shm is absent cannot be opened read-only ("unable to open database file
+      // (14)" — Antigravity's CLI summaries DB between sessions). `immutable=1` reads the main file as-is.
+      out = run(`file:${db.split("/").map(encodeURIComponent).join("/")}?immutable=1`);
+    }
     const cleaned = out.replace(/\s+/g, " ").trim();
     return cleaned || undefined;
   } catch {
@@ -2659,9 +2667,11 @@ export function antigravityDataDirs(): string[] {
  *  one of the two known dirs, so a stdin-supplied path can never point the lookups anywhere else.
  *  Undefined → the caller tries both. */
 export function antigravityDataDirFor(transcriptPath: string | undefined): string | undefined {
-  if (!transcriptPath) return undefined;
-  const i = transcriptPath.indexOf("/brain/");
-  const dir = i > 0 ? transcriptPath.slice(0, i) : undefined;
+  if (!transcriptPath || !isAbsolute(transcriptPath)) return undefined;
+  // Normalized first: `<dir>/brain/../../../x` must not pass the prefix check and then read `x`.
+  const normalized = resolve(transcriptPath);
+  const i = normalized.indexOf("/brain/");
+  const dir = i > 0 ? normalized.slice(0, i) : undefined;
   return dir !== undefined && antigravityDataDirs().includes(dir) ? dir : undefined;
 }
 

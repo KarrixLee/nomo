@@ -30,6 +30,7 @@
 // (file contents, commands) is never read.
 
 import { hostname } from "node:os";
+import { basename } from "node:path";
 import { antigravityChatTitle, antigravityFirstPrompt, antigravityModel } from "./adapter";
 import { CURSOR_UNKNOWN_OWNER_PID } from "./cursor";
 import { buildEnvelope, markDoneDeliveredAt, OpPlan, trackSessionAt } from "./hook";
@@ -191,6 +192,9 @@ export interface AntigravityHookDeps {
   trace?: (event: object) => void;
   /** Writes the terminate line (awaited, flushed). Default: stdout. */
   emit?: (line: string) => Promise<void>;
+  /** Is anyone reading our stdout? False for the wrapper's DETACHED runs (stdout is /dev/null): those
+   *  must never consume a stop flag that a later, foreground PostInvocation has to act on. Default true. */
+  canTerminate?: boolean;
 }
 
 function emitStdout(line: string): Promise<void> {
@@ -218,7 +222,8 @@ export async function runAntigravityHook(raw: string, eventName: string | undefi
 
     const sessionsDir = deps.sessionsDir ?? SESSIONS_DIR;
     // PHONE STOP, before pairing and the network: consume the flag, end the turn, report it done.
-    if (eventName === "PostInvocation" && await antigravityStopRequested(sessionsDir, sessionId, now)) {
+    if (eventName === "PostInvocation" && deps.canTerminate !== false
+      && await antigravityStopRequested(sessionsDir, sessionId, now)) {
       await clearInterruptFlagAt(sessionsDir, sessionId);
       await (deps.emit ?? emitStdout)(ANTIGRAVITY_TERMINATE);
       (deps.trace ?? traceSession)({ event: "interrupt", sessionId, agent: "antigravity", result: "terminated" });
@@ -245,9 +250,12 @@ export async function runAntigravityHook(raw: string, eventName: string | undefi
     const folder = folderIdentity(cwd, record);
     const transcript = str(input.transcriptPath) ?? record?.transcript ?? "";
     // Antigravity's own conversation title (≤ 300 ms, read-only; it exists only once the first turn
-    // completes), else what the row already had, else the first prompt off the transcript's first line.
-    const title = (deps.chatTitle ?? antigravityChatTitle)(sessionId, transcript || undefined) ?? record?.title
-      ?? await (deps.firstPrompt ?? antigravityFirstPrompt)(transcript || undefined);
+    // completes), else what the row already had, else the first prompt off the transcript's first line,
+    // else the workspace folder's name. A row still titled with the folder keeps looking for the prompt.
+    const folderName = cwd ? basename(cwd) || undefined : undefined;
+    const kept = record?.title && record.title !== folderName ? record.title : undefined;
+    const title = (deps.chatTitle ?? antigravityChatTitle)(sessionId, transcript || undefined) ?? kept
+      ?? await (deps.firstPrompt ?? antigravityFirstPrompt)(transcript || undefined) ?? record?.title ?? folderName;
     const model = antigravityModel(input) ?? record?.model;
     const startedAt = typeof record?.sessionStartedAt === "number" && Number.isFinite(record.sessionStartedAt)
       ? record.sessionStartedAt : now;

@@ -1461,6 +1461,10 @@ export interface PermissionHookDeps {
    *  the other agents stop their turn without touching a held card). */
   stopRequested?: () => Promise<boolean>;
   stopReason?: string;
+  /** Polled once per hold round (~3 s): true = nobody is waiting for this decision any more (the agent
+   *  killed the hook's wrapper — it interrupted the turn or exited). The hold then withdraws the worker's
+   *  card and exits with NO decision line. Absent = never (the other agents' hooks die with their parent). */
+  abandoned?: () => boolean;
 }
 
 async function readStdin(): Promise<string> {
@@ -2061,14 +2065,20 @@ export async function runPermissionHook(
       // STOPPED FROM THE PHONE: the turn is being stopped, so the tool it is waiting on must not run.
       // Deny here (never the fallback: that would open the agent's own prompt and park the turn), then
       // retire the worker's pending card best-effort so the phone drops its Allow/Deny.
+      const withdrawCard = () => fetchFn(`${config.url}/v1/cc/decision/resolve`, {
+        method: "POST", headers: { ...pcHeaders, "content-type": "application/json" },
+        body: JSON.stringify({ requestId }), signal: AbortSignal.timeout(3_000),
+      }).then(() => {}, () => {});
+      if (deps.abandoned?.()) {
+        trace({ event: "exit", reason: "abandoned", seq });
+        await withdrawCard();
+        return; // nobody reads stdout any more; the `finally` retires the hold marker
+      }
       if (deps.stopRequested && await deps.stopRequested().catch(() => false)) {
         emit(denyLine(agent, deps.stopReason));
         settleAsWorking = true;
         trace({ event: "exit", reason: "stopped", seq });
-        await fetchFn(`${config.url}/v1/cc/decision/resolve`, {
-          method: "POST", headers: { ...pcHeaders, "content-type": "application/json" },
-          body: JSON.stringify({ requestId }), signal: AbortSignal.timeout(3_000),
-        }).catch(() => {});
+        await withdrawCard();
         return;
       }
       const { data, status: httpStatus } = await pollDecision(seq);

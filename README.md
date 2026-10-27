@@ -447,15 +447,18 @@ valid JSON or not an object, and writes through a symlink rather than over it. T
 `plugin/scripts/antigravity-hook.sh <Event>` with a 10-second timeout, and one `PreToolUse` entry for
 phone approvals: `plugin/scripts/antigravity-approve.sh`, matched **only** to shell commands and file
 writes/edits (`run_command`, `write_file`, `write_to_file`, `edit_file`, `replace_file_content`,
-`multi_replace_file_content`), with Claude Code's approval timeout of 24 hours.
+`multi_replace_file_content`), with Claude Code's approval timeout of 24 hours. Each command first
+checks that its script still exists and otherwise answers on its own (`{}`, or `{"decision":"allow"}`
+for `PreToolUse`), so moving or deleting `~/.nomo` without uninstalling never blocks a tool.
 
 ### How the Antigravity leg works
 
-- **The status hooks are read-only, except for your phone's Interrupt.** Their wrapper prints `{}` and
-  exits 0 *before* doing any work, so every path — a crash, no runtime, not paired, no network —
-  returns the empty reply, and Antigravity never sees a `decision` from them. The one exception is
-  `PostInvocation` (after each model call): its wrapper waits for the work (capped at 4 seconds) and
-  prints `{"terminationBehavior":"terminate"}` only when the bundle printed exactly that, else `{}`.
+- **The status hooks are read-only, except for your phone's Interrupt.** Their wrapper prints `{}`,
+  hands the event to the work in the background and exits at once, so Antigravity never waits on Nomo
+  and every path — a crash, no runtime, not paired, no network — returns the empty reply, never a
+  `decision`. The one exception is a `PostInvocation` (after each model call) while an Interrupt is
+  pending: then the wrapper waits for the work (capped at 4 seconds) and prints
+  `{"terminationBehavior":"terminate"}` only when the bundle printed exactly that, else `{}`.
 - **Interrupt from the phone.** Tapping Interrupt on a running Antigravity row (same rules as Claude
   Code: a live local link to this computer) stamps a one-shot flag for that conversation. The next
   `PostInvocation` consumes it and ends the turn there — so the turn stops when the current model call
@@ -468,10 +471,14 @@ writes/edits (`run_command`, `write_file`, `write_to_file`, `edit_file`, `replac
   `auto_approve`; Deny answers `deny` with your note (or "Denied from phone") as the reason the agent
   sees. Every other outcome — not paired, approvals paused, the session not on the phone, no network,
   the request expiring — answers `allow`, which means "no opinion": Antigravity applies its own
-  permission settings and shows its own prompt exactly as without Nomo. A command or path your own
-  `permissions.allow` rules already allow by a plain prefix (and no `ask`/`deny` rule touches) is
-  passed straight through. Reads, searches and every other tool never reach Nomo at all. "Always allow"
-  is not offered for Antigravity.
+  permission settings and shows its own prompt exactly as without Nomo. Your own `permissions` rules
+  (the CLI's `~/.gemini/antigravity-cli/settings.json`, read-only) come first, in Antigravity's order
+  Deny > Ask > Allow: anything a `deny` rule may match never reaches the phone — Antigravity denies it
+  itself, and a phone Allow can never override it — and a command or path a plain-prefix `allow` rule
+  covers (and no `ask` rule touches) is passed straight through. Reads, searches and every other tool
+  never reach Nomo at all. "Always allow" is not offered for Antigravity. If Antigravity cancels the hook
+  while it waits (you interrupted the turn at the computer), the card is withdrawn from the phone and
+  the row turns *done* within a few seconds; nothing is left running.
 - **A row starts at `PreInvocation`** (before a model call), not `SessionStart`. `PreInvocation`,
   `PostInvocation` and `PostToolUse` keep it *working* (they fire many times per turn and are
   throttled); `Stop` marks it *done*. A turn that ends with **no** event — an interrupt, or a headless
@@ -482,7 +489,8 @@ writes/edits (`run_command`, `write_file`, `write_to_file`, `edit_file`, `replac
 - **The title is Antigravity's own conversation title**, one field read with the system `sqlite3`,
   read-only, from `conversation_summaries.db` in `~/.gemini/antigravity` (desktop) or
   `~/.gemini/antigravity-cli` (`agy`). It exists only after the first turn completes; until then the
-  row is named after the first prompt, read from the first line of that conversation's transcript.
+  row is named after the first prompt, read from the first line of that conversation's transcript,
+  and failing that after the workspace folder.
   The model badge is the payload's `modelName`.
 
 To remove it:
@@ -539,13 +547,18 @@ description is dropped before the command is.
   Antigravity treats a failing `PreToolUse` hook as a block, so `antigravity-approve.sh` checks the
   hook's output against the only three replies Nomo sends (`allow`, `auto_approve`, `deny` with a
   reason) and answers `{"decision":"allow"}` — Antigravity's own permission settings and prompt — for
-  anything else: a crash, no runtime, empty or malformed output, or a hold still running when its
-  internal kill guard fires, which is before the hook's 24-hour timeout. `auto_approve` is sent only
-  for an Allow sealed by your paired phone for that exact request id, and it still honours your own
-  explicit `deny` rules. Nomo never sends `permissionOverrides`, `overwrite` or a changed tool input. The
+  anything else: a crash, no runtime, empty or malformed output, a missing script (the registered
+  command answers by itself), or a hold still running when its internal kill guard fires, which is
+  before the hook's 24-hour timeout. If Antigravity signals or kills the hook mid-hold, the wrapper's
+  trap and the bundle's own parent check end the hold, withdraw the phone's card and leave no process
+  behind. `auto_approve` is sent only for an Allow sealed by your paired phone for that exact request
+  id, and never for a call one of your own `deny` rules may match: such a call is not sent to the
+  phone at all (Deny > Ask > Allow). Nomo never sends `permissionOverrides`, `overwrite` or a changed
+  tool input. The
   approval hook reads the tool name, the command (`CommandLine`) or file path, and the model's one-line
   `toolSummary`, puts them in the end-to-end encrypted card, and reads your `permissions` rules from
-  `settings.json` in that conversation's Antigravity data dir, read-only. From each status event's stdin
+  `settings.json` in that conversation's Antigravity data dir (both CLI and desktop dirs when the
+  transcript does not say which), read-only. From each status event's stdin
   it reads only
   `conversationId`, the first `workspacePaths` entry, `transcriptPath` (its modification time, for
   the idle check, and its first line for the first prompt) and `modelName` — never tool arguments.

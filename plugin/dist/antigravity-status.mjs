@@ -3,6 +3,7 @@ var __require = /* @__PURE__ */ createRequire(import.meta.url);
 
 // src/core/antigravity.ts
 import { hostname as hostname3 } from "node:os";
+import { basename as basename5 } from "node:path";
 
 // src/core/adapter.ts
 import { execFile as execFile2, execFileSync as execFileSync2 } from "node:child_process";
@@ -10,7 +11,7 @@ import { existsSync as existsSync2 } from "node:fs";
 import { readdir, readFile as readFile2, stat as stat2 } from "node:fs/promises";
 import { devNull } from "node:os";
 import { promisify as promisify2 } from "node:util";
-import { basename as basename2, join as join2 } from "node:path";
+import { basename as basename2, isAbsolute as isAbsolute2, join as join2, resolve as resolve2 } from "node:path";
 
 // src/core/shared.ts
 import { access, chmod, open, readFile, rename, stat, mkdir, unlink, writeFile } from "node:fs/promises";
@@ -2855,7 +2856,13 @@ function sqliteOne(db, sql, env = process.env) {
     return;
   try {
     const bin = process.platform === "darwin" && existsSync2("/usr/bin/sqlite3") ? "/usr/bin/sqlite3" : "sqlite3";
-    const out = execFileSync2(bin, ["-init", devNull, "-batch", "-noheader", "-list", "-readonly", db, sql], { timeout: CURSOR_TITLE_TIMEOUT_MS, encoding: "utf8", maxBuffer: 65536, stdio: ["ignore", "pipe", "ignore"], env });
+    const run = (target) => execFileSync2(bin, ["-init", devNull, "-batch", "-noheader", "-list", "-readonly", target, sql], { timeout: CURSOR_TITLE_TIMEOUT_MS, encoding: "utf8", maxBuffer: 65536, stdio: ["ignore", "pipe", "ignore"], env });
+    let out;
+    try {
+      out = run(db);
+    } catch {
+      out = run(`file:${db.split("/").map(encodeURIComponent).join("/")}?immutable=1`);
+    }
     const cleaned = out.replace(/\s+/g, " ").trim();
     return cleaned || undefined;
   } catch {
@@ -2887,10 +2894,11 @@ function antigravityDataDirs() {
   return [`${home}/.gemini/antigravity`, `${home}/.gemini/antigravity-cli`];
 }
 function antigravityDataDirFor(transcriptPath) {
-  if (!transcriptPath)
+  if (!transcriptPath || !isAbsolute2(transcriptPath))
     return;
-  const i = transcriptPath.indexOf("/brain/");
-  const dir = i > 0 ? transcriptPath.slice(0, i) : undefined;
+  const normalized = resolve2(transcriptPath);
+  const i = normalized.indexOf("/brain/");
+  const dir = i > 0 ? normalized.slice(0, i) : undefined;
   return dir !== undefined && antigravityDataDirs().includes(dir) ? dir : undefined;
 }
 var summariesDbs = (transcriptPath) => {
@@ -4392,7 +4400,7 @@ async function runAntigravityHook(raw, eventName, deps = {}) {
     if (!kind || kind === "start")
       return;
     const sessionsDir = deps.sessionsDir ?? SESSIONS_DIR;
-    if (eventName === "PostInvocation" && await antigravityStopRequested(sessionsDir, sessionId, now)) {
+    if (eventName === "PostInvocation" && deps.canTerminate !== false && await antigravityStopRequested(sessionsDir, sessionId, now)) {
       await clearInterruptFlagAt(sessionsDir, sessionId);
       await (deps.emit ?? emitStdout)(ANTIGRAVITY_TERMINATE);
       (deps.trace ?? traceSession)({ event: "interrupt", sessionId, agent: "antigravity", result: "terminated" });
@@ -4416,7 +4424,9 @@ async function runAntigravityHook(raw, eventName, deps = {}) {
     const cwd = antigravityCwd(input);
     const folder = folderIdentity(cwd, record);
     const transcript = str2(input.transcriptPath) ?? record?.transcript ?? "";
-    const title = (deps.chatTitle ?? antigravityChatTitle)(sessionId, transcript || undefined) ?? record?.title ?? await (deps.firstPrompt ?? antigravityFirstPrompt)(transcript || undefined);
+    const folderName = cwd ? basename5(cwd) || undefined : undefined;
+    const kept = record?.title && record.title !== folderName ? record.title : undefined;
+    const title = (deps.chatTitle ?? antigravityChatTitle)(sessionId, transcript || undefined) ?? kept ?? await (deps.firstPrompt ?? antigravityFirstPrompt)(transcript || undefined) ?? record?.title ?? folderName;
     const model = antigravityModel(input) ?? record?.model;
     const startedAt = typeof record?.sessionStartedAt === "number" && Number.isFinite(record.sessionStartedAt) ? record.sessionStartedAt : now;
     let pid = record?.pid;
@@ -4448,6 +4458,8 @@ if (__require.main == __require.module) {
     for await (const chunk of process.stdin)
       chunks.push(chunk);
   } catch {}
-  await runAntigravityHook(Buffer.concat(chunks).toString("utf8"), process.argv[2]);
+  await runAntigravityHook(Buffer.concat(chunks).toString("utf8"), process.argv[2], {
+    canTerminate: process.env.NOMO_AGY_SYNC === "1"
+  });
   process.exit(0);
 }

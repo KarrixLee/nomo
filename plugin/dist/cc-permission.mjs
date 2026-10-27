@@ -5,7 +5,7 @@ var __require = /* @__PURE__ */ createRequire(import.meta.url);
 import { readFile as readFile5, realpath, unlink as unlink3 } from "node:fs/promises";
 import { appendFileSync as appendFileSync2, statSync as statSync2, truncateSync as truncateSync2 } from "node:fs";
 import { hostname as hostname2 } from "node:os";
-import { basename as basename4, isAbsolute as isAbsolute2, relative, resolve as resolve2 } from "node:path";
+import { basename as basename4, isAbsolute as isAbsolute3, relative, resolve as resolve3 } from "node:path";
 
 // src/core/hook.ts
 import { readdir as readdir2, readFile as readFile4, unlink as unlink2 } from "node:fs/promises";
@@ -102,7 +102,7 @@ import { existsSync as existsSync2 } from "node:fs";
 import { readdir, readFile as readFile2, stat as stat2 } from "node:fs/promises";
 import { devNull } from "node:os";
 import { promisify as promisify2 } from "node:util";
-import { basename as basename2, join as join2 } from "node:path";
+import { basename as basename2, isAbsolute as isAbsolute2, join as join2, resolve as resolve2 } from "node:path";
 
 // src/core/shared.ts
 import { access, chmod, open, readFile, rename, stat, mkdir, unlink, writeFile } from "node:fs/promises";
@@ -2861,7 +2861,13 @@ function sqliteOne(db, sql, env = process.env) {
     return;
   try {
     const bin = process.platform === "darwin" && existsSync2("/usr/bin/sqlite3") ? "/usr/bin/sqlite3" : "sqlite3";
-    const out = execFileSync2(bin, ["-init", devNull, "-batch", "-noheader", "-list", "-readonly", db, sql], { timeout: CURSOR_TITLE_TIMEOUT_MS, encoding: "utf8", maxBuffer: 65536, stdio: ["ignore", "pipe", "ignore"], env });
+    const run = (target) => execFileSync2(bin, ["-init", devNull, "-batch", "-noheader", "-list", "-readonly", target, sql], { timeout: CURSOR_TITLE_TIMEOUT_MS, encoding: "utf8", maxBuffer: 65536, stdio: ["ignore", "pipe", "ignore"], env });
+    let out;
+    try {
+      out = run(db);
+    } catch {
+      out = run(`file:${db.split("/").map(encodeURIComponent).join("/")}?immutable=1`);
+    }
     const cleaned = out.replace(/\s+/g, " ").trim();
     return cleaned || undefined;
   } catch {
@@ -2893,10 +2899,11 @@ function antigravityDataDirs() {
   return [`${home}/.gemini/antigravity`, `${home}/.gemini/antigravity-cli`];
 }
 function antigravityDataDirFor(transcriptPath) {
-  if (!transcriptPath)
+  if (!transcriptPath || !isAbsolute2(transcriptPath))
     return;
-  const i = transcriptPath.indexOf("/brain/");
-  const dir = i > 0 ? transcriptPath.slice(0, i) : undefined;
+  const normalized = resolve2(transcriptPath);
+  const i = normalized.indexOf("/brain/");
+  const dir = i > 0 ? normalized.slice(0, i) : undefined;
   return dir !== undefined && antigravityDataDirs().includes(dir) ? dir : undefined;
 }
 var summariesDbs = (transcriptPath) => {
@@ -4233,10 +4240,10 @@ async function loadCodexTurnPolicy(transcriptPath, turnId, sessionId, home = cod
   if (!transcriptPath || !turnId || !sessionId || !basename4(transcriptPath).match(/^rollout-.*\.jsonl$/))
     return null;
   try {
-    const sessionsRoot = await realpath(resolve2(home, "sessions"));
+    const sessionsRoot = await realpath(resolve3(home, "sessions"));
     const rollout = await realpath(transcriptPath);
     const rel = relative(sessionsRoot, rollout);
-    if (rel === "" || rel.startsWith("..") || isAbsolute2(rel))
+    if (rel === "" || rel.startsWith("..") || isAbsolute3(rel))
       return null;
     const head = await readPrefix(rollout, CODEX_ROLLOUT_HEAD_BYTES);
     if (codexRolloutSessionId(head) !== sessionId)
@@ -5208,16 +5215,22 @@ async function runPermissionHook(deps = {}, agent = "claude") {
         trace({ event: "exit", reason: "local-answer" });
         return;
       }
+      const withdrawCard = () => fetchFn(`${config.url}/v1/cc/decision/resolve`, {
+        method: "POST",
+        headers: { ...pcHeaders, "content-type": "application/json" },
+        body: JSON.stringify({ requestId }),
+        signal: AbortSignal.timeout(3000)
+      }).then(() => {}, () => {});
+      if (deps.abandoned?.()) {
+        trace({ event: "exit", reason: "abandoned", seq });
+        await withdrawCard();
+        return;
+      }
       if (deps.stopRequested && await deps.stopRequested().catch(() => false)) {
         emit(denyLine(agent, deps.stopReason));
         settleAsWorking = true;
         trace({ event: "exit", reason: "stopped", seq });
-        await fetchFn(`${config.url}/v1/cc/decision/resolve`, {
-          method: "POST",
-          headers: { ...pcHeaders, "content-type": "application/json" },
-          body: JSON.stringify({ requestId }),
-          signal: AbortSignal.timeout(3000)
-        }).catch(() => {});
+        await withdrawCard();
         return;
       }
       const { data, status: httpStatus } = await pollDecision(seq);

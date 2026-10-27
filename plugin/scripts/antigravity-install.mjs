@@ -62,12 +62,17 @@ for (const a of args) {
 const CONFIG_DIR = join(homedir(), ".gemini", "config");
 const HOOKS = join(CONFIG_DIR, "hooks.json");
 
-const handler = (event) => ({ type: "command", command: `'${HOOK}' ${event}`, timeout: TIMEOUT });
+/** A command that answers `fallback` itself when the script is gone (the checkout moved or was deleted
+ *  without --uninstall): a missing script would exit 127, and PreToolUse is FAIL-CLOSED — every routed
+ *  tool would be blocked. `exec` keeps the script the hook's direct child. */
+const guarded = (script, args, fallback) =>
+  `[ -x '${script}' ] && exec '${script}'${args} || printf '%s\\n' '${fallback}'`;
+const handler = (event) => ({ type: "command", command: guarded(HOOK, ` ${event}`, "{}"), timeout: TIMEOUT });
 const block = () => ({
   enabled: true,
   ...Object.fromEntries(FLAT_EVENTS.map((e) => [e, [handler(e)]])),
   ...Object.fromEntries(TOOL_EVENTS.map((e) => [e, [{ matcher: "*", hooks: [handler(e)] }]])),
-  PreToolUse: [{ matcher: APPROVAL_MATCHER, hooks: [{ type: "command", command: `'${APPROVE}'`, timeout: APPROVAL_TIMEOUT }] }],
+  PreToolUse: [{ matcher: APPROVAL_MATCHER, hooks: [{ type: "command", command: guarded(APPROVE, "", '{"decision":"allow"}'), timeout: APPROVAL_TIMEOUT }] }],
 });
 
 /** { doc, target, mode } — `doc` is `{}` when there is no file yet. */

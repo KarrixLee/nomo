@@ -3,7 +3,7 @@ var __require = /* @__PURE__ */ createRequire(import.meta.url);
 
 // src/core/antigravity-approval.ts
 import { readFileSync as readFileSync2 } from "node:fs";
-import { isAbsolute as isAbsolute3, resolve as resolve3 } from "node:path";
+import { isAbsolute as isAbsolute4, resolve as resolve4 } from "node:path";
 
 // src/core/adapter.ts
 import { execFile as execFile2, execFileSync as execFileSync2 } from "node:child_process";
@@ -11,7 +11,7 @@ import { existsSync as existsSync2 } from "node:fs";
 import { readdir, readFile as readFile2, stat as stat2 } from "node:fs/promises";
 import { devNull } from "node:os";
 import { promisify as promisify2 } from "node:util";
-import { basename as basename2, join as join2 } from "node:path";
+import { basename as basename2, isAbsolute as isAbsolute2, join as join2, resolve as resolve2 } from "node:path";
 
 // src/core/shared.ts
 import { access, chmod, open, readFile, rename, stat, mkdir, unlink, writeFile } from "node:fs/promises";
@@ -2856,7 +2856,13 @@ function sqliteOne(db, sql, env = process.env) {
     return;
   try {
     const bin = process.platform === "darwin" && existsSync2("/usr/bin/sqlite3") ? "/usr/bin/sqlite3" : "sqlite3";
-    const out = execFileSync2(bin, ["-init", devNull, "-batch", "-noheader", "-list", "-readonly", db, sql], { timeout: CURSOR_TITLE_TIMEOUT_MS, encoding: "utf8", maxBuffer: 65536, stdio: ["ignore", "pipe", "ignore"], env });
+    const run = (target) => execFileSync2(bin, ["-init", devNull, "-batch", "-noheader", "-list", "-readonly", target, sql], { timeout: CURSOR_TITLE_TIMEOUT_MS, encoding: "utf8", maxBuffer: 65536, stdio: ["ignore", "pipe", "ignore"], env });
+    let out;
+    try {
+      out = run(db);
+    } catch {
+      out = run(`file:${db.split("/").map(encodeURIComponent).join("/")}?immutable=1`);
+    }
     const cleaned = out.replace(/\s+/g, " ").trim();
     return cleaned || undefined;
   } catch {
@@ -2888,10 +2894,11 @@ function antigravityDataDirs() {
   return [`${home}/.gemini/antigravity`, `${home}/.gemini/antigravity-cli`];
 }
 function antigravityDataDirFor(transcriptPath) {
-  if (!transcriptPath)
+  if (!transcriptPath || !isAbsolute2(transcriptPath))
     return;
-  const i = transcriptPath.indexOf("/brain/");
-  const dir = i > 0 ? transcriptPath.slice(0, i) : undefined;
+  const normalized = resolve2(transcriptPath);
+  const i = normalized.indexOf("/brain/");
+  const dir = i > 0 ? normalized.slice(0, i) : undefined;
   return dir !== undefined && antigravityDataDirs().includes(dir) ? dir : undefined;
 }
 var summariesDbs = (transcriptPath) => {
@@ -2989,6 +2996,7 @@ var allAdapters = [claudeAdapter, codexAdapter];
 
 // src/core/antigravity.ts
 import { hostname as hostname3 } from "node:os";
+import { basename as basename5 } from "node:path";
 
 // src/core/cursor.ts
 import { hostname as hostname2 } from "node:os";
@@ -4396,7 +4404,7 @@ async function runAntigravityHook(raw, eventName, deps = {}) {
     if (!kind || kind === "start")
       return;
     const sessionsDir = deps.sessionsDir ?? SESSIONS_DIR;
-    if (eventName === "PostInvocation" && await antigravityStopRequested(sessionsDir, sessionId, now)) {
+    if (eventName === "PostInvocation" && deps.canTerminate !== false && await antigravityStopRequested(sessionsDir, sessionId, now)) {
       await clearInterruptFlagAt(sessionsDir, sessionId);
       await (deps.emit ?? emitStdout)(ANTIGRAVITY_TERMINATE);
       (deps.trace ?? traceSession)({ event: "interrupt", sessionId, agent: "antigravity", result: "terminated" });
@@ -4420,7 +4428,9 @@ async function runAntigravityHook(raw, eventName, deps = {}) {
     const cwd = antigravityCwd(input);
     const folder = folderIdentity(cwd, record);
     const transcript = str2(input.transcriptPath) ?? record?.transcript ?? "";
-    const title = (deps.chatTitle ?? antigravityChatTitle)(sessionId, transcript || undefined) ?? record?.title ?? await (deps.firstPrompt ?? antigravityFirstPrompt)(transcript || undefined);
+    const folderName = cwd ? basename5(cwd) || undefined : undefined;
+    const kept = record?.title && record.title !== folderName ? record.title : undefined;
+    const title = (deps.chatTitle ?? antigravityChatTitle)(sessionId, transcript || undefined) ?? kept ?? await (deps.firstPrompt ?? antigravityFirstPrompt)(transcript || undefined) ?? record?.title ?? folderName;
     const model = antigravityModel(input) ?? record?.model;
     const startedAt = typeof record?.sessionStartedAt === "number" && Number.isFinite(record.sessionStartedAt) ? record.sessionStartedAt : now;
     let pid = record?.pid;
@@ -4447,7 +4457,7 @@ async function runAntigravityHook(raw, eventName, deps = {}) {
 import { readFile as readFile5, realpath, unlink as unlink4 } from "node:fs/promises";
 import { appendFileSync as appendFileSync2, statSync as statSync2, truncateSync as truncateSync2 } from "node:fs";
 import { hostname as hostname4 } from "node:os";
-import { basename as basename5, isAbsolute as isAbsolute2, relative, resolve as resolve2 } from "node:path";
+import { basename as basename6, isAbsolute as isAbsolute3, relative, resolve as resolve3 } from "node:path";
 
 // src/core/decision-poll.ts
 var POLL_INTERVAL_MS = 3000;
@@ -4658,13 +4668,13 @@ function codexRolloutSessionId(text) {
   return;
 }
 async function loadCodexTurnPolicy(transcriptPath, turnId, sessionId, home = codexHome()) {
-  if (!transcriptPath || !turnId || !sessionId || !basename5(transcriptPath).match(/^rollout-.*\.jsonl$/))
+  if (!transcriptPath || !turnId || !sessionId || !basename6(transcriptPath).match(/^rollout-.*\.jsonl$/))
     return null;
   try {
-    const sessionsRoot = await realpath(resolve2(home, "sessions"));
+    const sessionsRoot = await realpath(resolve3(home, "sessions"));
     const rollout = await realpath(transcriptPath);
     const rel = relative(sessionsRoot, rollout);
-    if (rel === "" || rel.startsWith("..") || isAbsolute2(rel))
+    if (rel === "" || rel.startsWith("..") || isAbsolute3(rel))
       return null;
     const head = await readPrefix(rollout, CODEX_ROLLOUT_HEAD_BYTES);
     if (codexRolloutSessionId(head) !== sessionId)
@@ -4919,7 +4929,7 @@ function buildPermissionSummary(toolName, toolInput) {
     case "Read":
     case "NotebookEdit": {
       const fp = str(toolInput.file_path);
-      return fp ? basename5(fp) : toolName;
+      return fp ? basename6(fp) : toolName;
     }
     case "WebFetch":
     case "WebSearch": {
@@ -5636,16 +5646,22 @@ async function runPermissionHook(deps = {}, agent = "claude") {
         trace({ event: "exit", reason: "local-answer" });
         return;
       }
+      const withdrawCard = () => fetchFn(`${config.url}/v1/cc/decision/resolve`, {
+        method: "POST",
+        headers: { ...pcHeaders, "content-type": "application/json" },
+        body: JSON.stringify({ requestId }),
+        signal: AbortSignal.timeout(3000)
+      }).then(() => {}, () => {});
+      if (deps.abandoned?.()) {
+        trace({ event: "exit", reason: "abandoned", seq });
+        await withdrawCard();
+        return;
+      }
       if (deps.stopRequested && await deps.stopRequested().catch(() => false)) {
         emit(denyLine(agent, deps.stopReason));
         settleAsWorking = true;
         trace({ event: "exit", reason: "stopped", seq });
-        await fetchFn(`${config.url}/v1/cc/decision/resolve`, {
-          method: "POST",
-          headers: { ...pcHeaders, "content-type": "application/json" },
-          body: JSON.stringify({ requestId }),
-          signal: AbortSignal.timeout(3000)
-        }).catch(() => {});
+        await withdrawCard();
         return;
       }
       const { data, status: httpStatus } = await pollDecision(seq);
@@ -5741,17 +5757,18 @@ var ANTIGRAVITY_HOLD_DEADLINE_MS = (ANTIGRAVITY_APPROVAL_TIMEOUT_S - 600) * 1000
 var ANTIGRAVITY_ENTRY_CAP_MS = (ANTIGRAVITY_APPROVAL_TIMEOUT_S - 300) * 1000;
 var str3 = (v) => typeof v === "string" && v.length > 0 ? v : undefined;
 function loadAntigravityRules(transcriptPath) {
-  const empty = { allow: [], ask: [], deny: [] };
-  const dir = antigravityDataDirFor(transcriptPath);
-  if (!dir)
-    return empty;
-  try {
-    const p = JSON.parse(readFileSync2(`${dir}/settings.json`, "utf8")).permissions ?? {};
-    const list = (v) => Array.isArray(v) ? v.filter((x) => typeof x === "string") : [];
-    return { allow: list(p.allow), ask: list(p.ask), deny: list(p.deny) };
-  } catch {
-    return empty;
+  const out = { allow: [], ask: [], deny: [] };
+  const known = antigravityDataDirFor(transcriptPath);
+  const list = (v) => Array.isArray(v) ? v.filter((x) => typeof x === "string") : [];
+  for (const dir of known ? [known] : antigravityDataDirs()) {
+    try {
+      const p = JSON.parse(readFileSync2(`${dir}/settings.json`, "utf8")).permissions ?? {};
+      out.allow.push(...list(p.allow));
+      out.ask.push(...list(p.ask));
+      out.deny.push(...list(p.deny));
+    } catch {}
   }
+  return out;
 }
 function ruleMatches(rule, action, target, workspace, exact) {
   const m = /^([a-z_]+)\((.*)\)$/s.exec(rule.trim());
@@ -5766,11 +5783,11 @@ function ruleMatches(rule, action, target, workspace, exact) {
     if (want === target.trim())
       return true;
     if (/[;&|$`<>(){}\n]/.test(target))
-      return false;
+      return !exact;
     const a = want.split(/\s+/), b = target.trim().split(/\s+/);
     return a.length <= b.length && a.every((w, i) => w === b[i]);
   }
-  const base = isAbsolute3(want) ? want : workspace ? resolve3(workspace, want) : undefined;
+  const base = isAbsolute4(want) ? want : workspace ? resolve4(workspace, want) : undefined;
   if (!base)
     return false;
   const root = base.replace(/\/+$/, "");
@@ -5801,10 +5818,12 @@ function antigravityApprovalRequest(input, rules = { allow: [], ask: [], deny: [
       return null;
     toolInput = { file_path: path };
     action = "write_file";
-    target = cwd && !isAbsolute3(path) ? resolve3(cwd, path) : path;
+    target = cwd && !isAbsolute4(path) ? resolve4(cwd, path) : path;
   }
   const hit = (list, exact) => list.some((r) => ruleMatches(r, action, target, cwd, exact));
-  if (hit(rules.allow, true) && !hit(rules.ask, false) && !hit(rules.deny, false))
+  if (hit(rules.deny, false))
+    return null;
+  if (!hit(rules.ask, false) && hit(rules.allow, true))
     return null;
   return { sessionId, ...cwd ? { cwd } : {}, transcriptPath: str3(input.transcriptPath), agyTool, toolName, toolInput };
 }
@@ -5821,6 +5840,12 @@ function antigravityDecision(line) {
   } catch {}
   return ANTIGRAVITY_FALLBACK;
 }
+var terminated = false;
+function markAntigravityApprovalTerminated() {
+  terminated = true;
+}
+var parentAtStart = process.ppid;
+var defaultAbandoned = () => terminated || process.ppid !== parentAtStart;
 var ANTIGRAVITY_STOP_DENY = JSON.stringify({ decision: "deny", reason: ANTIGRAVITY_STOP_REASON });
 async function runAntigravityApproval(raw, deps = {}) {
   try {
@@ -5843,17 +5868,23 @@ async function runAntigravityApproval(raw, deps = {}) {
       tool_input: req.toolInput
     });
     let line;
+    let gone = false;
+    const abandoned = () => gone ||= (deps.abandoned ?? defaultAbandoned)();
     await (deps.run ?? runPermissionHook)({
       delegate: async () => {},
       deadlineAt: (deps.hold?.now ?? Date.now)() + ANTIGRAVITY_HOLD_DEADLINE_MS,
       stopRequested,
       stopReason: ANTIGRAVITY_STOP_REASON,
+      abandoned,
       ...deps.hold,
       readInput: async () => stdin,
       emit: (l) => {
         line = l;
       }
     }, "antigravity");
+    if (gone && line === undefined) {
+      await (deps.settleDone ?? ((r) => runAntigravityHook(r, "Stop")))(raw).catch(() => {});
+    }
     return antigravityDecision(line);
   } catch {
     return ANTIGRAVITY_FALLBACK;
@@ -5875,6 +5906,10 @@ if (__require.main == __require.module) {
     }
   };
   setTimeout(() => finish(ANTIGRAVITY_FALLBACK), ANTIGRAVITY_ENTRY_CAP_MS).unref();
+  process.on("SIGTERM", () => {
+    markAntigravityApprovalTerminated();
+    setTimeout(() => process.exit(0), 1e4).unref();
+  });
   const chunks = [];
   try {
     for await (const chunk of process.stdin)

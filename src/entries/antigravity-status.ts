@@ -17,6 +17,9 @@ if (import.meta.main) {
   try {
     for await (const chunk of process.stdin) chunks.push(chunk as Buffer);
   } catch { /* unreadable stdin → nothing to report */ }
-  await runAntigravityHook(Buffer.concat(chunks).toString("utf8"), process.argv[2]);
+  // NOMO_AGY_SYNC=1: the wrapper is waiting for our stdout (a PostInvocation with a stop pending).
+  await runAntigravityHook(Buffer.concat(chunks).toString("utf8"), process.argv[2], {
+    canTerminate: process.env.NOMO_AGY_SYNC === "1",
+  });
   process.exit(0);
 }

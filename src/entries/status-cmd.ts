@@ -131,11 +131,12 @@ const AGENT_UI: Record<AgentKind, { name: string; pair: string; approvalsOn: str
   // Cursor has no approvals command (v1 is read-only), but the Approvals row is machine-wide — so a
   // Cursor reader who sees it PAUSED is pointed at an agent that does have the switch.
   cursor: { name: "Cursor", pair: "/nomo-pair", approvalsOn: "/nomo-cc:approvals on (in Claude Code — Cursor sessions are read-only)", status: "/nomo-status" },
-  // No Antigravity commands in v1: pairing and status run from a terminal against the ~/.nomo checkout.
+  // No Antigravity slash commands: pairing, status and the approvals switch run from a terminal against
+  // the ~/.nomo checkout. The approvals switch is the shared machine-wide one.
   antigravity: {
     name: "Antigravity",
     pair: "~/.nomo/plugin/scripts/run.sh ~/.nomo/plugin/dist/pair.mjs (in a terminal)",
-    approvalsOn: "/nomo-cc:approvals on (in Claude Code — Antigravity sessions are read-only)",
+    approvalsOn: "~/.nomo/plugin/scripts/run.sh ~/.nomo/plugin/dist/cc-permission.mjs on (in a terminal)",
     status: "~/.nomo/plugin/scripts/run.sh ~/.nomo/plugin/dist/status-cmd.mjs antigravity",
   },
 };
@@ -803,7 +804,7 @@ export async function statusCmd(deps: StatusDeps = {}): Promise<number> {
     kind: "antigravity", present: antigravityInstalled || perAgent.antigravity! > 0 || antigravityHooks.stamp > 0,
     hooksLabel: "Hooks", hooks: antigravityHooks.value, sessions: sessionText(perAgent.antigravity!),
     sessionCount: perAgent.antigravity!,
-    detail: [["Mode", "read-only — sessions show on your phone; approvals stay in Antigravity"]],
+    detail: [["Mode", "sessions show on your phone; Allow/Deny for shell commands and file writes, and Interrupt"]],
     problems: antigravityHooks.problem ? [antigravityHooks.problem] : [],
   };
 

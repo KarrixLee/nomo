@@ -6,6 +6,7 @@ import { cp, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/p
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test } from "bun:test";
+import { execFileSync } from "node:child_process";
 import {
   ANTIGRAVITY_STOP_DENY, ANTIGRAVITY_APPROVAL_MATCHER, ANTIGRAVITY_APPROVAL_TIMEOUT_S, ANTIGRAVITY_ENTRY_CAP_MS, ANTIGRAVITY_FALLBACK,
   ANTIGRAVITY_HOLD_DEADLINE_MS, antigravityApprovalRequest, antigravityDecision, runAntigravityApproval,
@@ -70,11 +71,33 @@ describe("antigravityApprovalRequest — what reaches the phone", () => {
     expect(antigravityApprovalRequest(cmd("gitx status"), r(["command(git)"]))).not.toBeNull();
     expect(antigravityApprovalRequest(cmd("git status && rm -rf /"), r(["command(git)"]))).not.toBeNull();
     expect(antigravityApprovalRequest(cmd("git push"), r(["command(git)"], ["command(git push)"]))).not.toBeNull();
-    expect(antigravityApprovalRequest(cmd("git push"), r(["command(git)"], [], ["command(regex:.*)"]))).not.toBeNull();
+    // Deny > Ask > Allow: anything a deny rule may match is never routed (Antigravity denies it itself).
+    expect(antigravityApprovalRequest(cmd("git push"), r(["command(git)"], [], ["command(regex:.*)"]))).toBeNull();
     expect(antigravityApprovalRequest(cmd("git push"), r(["command(regex:git.*)"]))).not.toBeNull();
     const w = (p: string) => payload("write_file", { Path: p });
     expect(antigravityApprovalRequest(w(`${WS}/src/a.ts`), r(["write_file(src/)"]))).toBeNull();
     expect(antigravityApprovalRequest(w(`${WS}/srcx/a.ts`), r(["write_file(src/)"]))).not.toBeNull();
+  });
+
+  test("a local deny rule is never routed to the phone — even with a matching allow or ask", () => {
+    const r = (allow: string[], ask: string[] = [], deny: string[] = []) => ({ allow, ask, deny });
+    const cmd = (c: string) => payload("run_command", { CommandLine: c });
+    expect(antigravityApprovalRequest(cmd("rm -rf build"), r([], [], ["command(rm)"]))).toBeNull();
+    expect(antigravityApprovalRequest(cmd("rm -rf build"), r(["command(rm)"], ["command(rm)"], ["command(rm)"]))).toBeNull();
+    expect(antigravityApprovalRequest(cmd("ls && rm -rf build"), r([], [], ["command(rm)"]))).toBeNull(); // compound: may contain it
+    expect(antigravityApprovalRequest(payload("write_file", { Path: `${WS}/secrets/k` }), r([], [], ["write_file(secrets/)"]))).toBeNull();
+    expect(antigravityApprovalRequest(cmd("ls -la"), r([], [], ["command(rm)"]))).not.toBeNull(); // unrelated → phone
+    expect(antigravityApprovalRequest(cmd("git push"), r(["command(git)"], ["command(git push)"]))).not.toBeNull(); // ask → phone
+  });
+
+  test("end to end: a denied call answers the fallback (no opinion) and never starts the relay", async () => {
+    let started = false;
+    const out = await runAntigravityApproval(JSON.stringify(RUN), {
+      rules: () => ({ allow: [], ask: [], deny: ["command(rm)"] }), run: (async () => { started = true; }) as never,
+      stopRequested: async () => false,
+    });
+    expect(out).toBe(ANTIGRAVITY_FALLBACK);
+    expect(started).toBe(false);
   });
 
   test("the installer's matcher is exactly the routed tool set", async () => {
@@ -202,6 +225,19 @@ describe("runAntigravityApproval — through the shared relay", () => {
     expect(started).toBe(false);
   });
 
+  test("abandoned mid-hold (the agent killed our wrapper) → no decision, card withdrawn, row reported done", async () => {
+    const { fn, calls } = worker(true, [{ status: "pending" }]);
+    let checks = 0;
+    const settled: string[] = [];
+    const out = await runAntigravityApproval(JSON.stringify(RUN), {
+      rules: () => NO_RULES, hold: hold({ fetchFn: fn }) as never, stopRequested: async () => false,
+      abandoned: () => ++checks >= 2, settleDone: async (raw) => { settled.push(raw); },
+    });
+    expect(out).toBe(ANTIGRAVITY_FALLBACK); // printed to nobody; the wrapper is gone
+    expect(calls).toContain("POST /v1/cc/decision/resolve");
+    expect(settled).toEqual([JSON.stringify(RUN)]);
+  });
+
   test("malformed input / a throwing relay → allow", async () => {
     for (const raw of ["", "garbage", "[]", "null"]) expect(await runAntigravityApproval(raw)).toBe(ANTIGRAVITY_FALLBACK);
     const out = await runAntigravityApproval(JSON.stringify(RUN), {
@@ -260,6 +296,77 @@ describe("antigravity-approve.sh — always exactly one valid decision, exit 0",
     expect(r.out).toBe(`${ANTIGRAVITY_FALLBACK}\n`);
     expect(r.ms).toBeLessThan(10_000);
   });
+
+  test("TERM/INT/HUP from Antigravity: one fallback line, exit 0, bundle and guard both gone", async () => {
+    for (const sig of ["SIGTERM", "SIGINT", "SIGHUP"] as const) {
+      const t = await tmp();
+      const root = join(t, "plugin");
+      await mkdir(join(root, "scripts"), { recursive: true });
+      await cp(join(PLUGIN, "scripts", "antigravity-approve.sh"), join(root, "scripts", "antigravity-approve.sh"));
+      await writeFile(join(root, "scripts", "run.sh"), `#!/bin/sh\necho $$ > '${t}/bundle.pid'\nexec sleep 30\n`, { mode: 0o755 });
+      const proc = spawnTestProcess({
+        cmd: [join(root, "scripts", "antigravity-approve.sh")],
+        env: isolatedTestEnv(join(t, "home")), stdin: new Blob([JSON.stringify(RUN)]), stdout: "pipe", stderr: "pipe",
+      });
+      let bundle = 0;
+      for (let i = 0; i < 50 && !bundle; i++) {
+        await Bun.sleep(50);
+        bundle = Number(await readFile(join(t, "bundle.pid"), "utf8").catch(() => "0"));
+      }
+      const children = execFileSync("pgrep", ["-P", String(proc.pid)], { encoding: "utf8" }).trim().split("\n").map(Number);
+      expect(children).toContain(bundle);
+      process.kill(proc.pid, sig);
+      expect(await new Response(proc.stdout).text()).toBe(`${ANTIGRAVITY_FALLBACK}\n`);
+      expect(await proc.exited).toBe(0);
+      await Bun.sleep(300);
+      for (const pid of children) expect(() => process.kill(pid, 0)).toThrow(); // no orphans
+    }
+  });
+
+  test("the wrapper SIGKILLed mid-hold (real bundle): the bundle withdraws the card, reports done, exits within one poll", async () => {
+    const t = await tmp();
+    const home = join(t, "home");
+    const events: string[] = [];
+    const server = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(req) {
+      const u = new URL(req.url);
+      if (u.pathname === "/v1/cc/event") {
+        const b = await req.json() as { op?: string };
+        events.push(`event:${b.op}`);
+        return Response.json({ ok: true });
+      }
+      events.push(`${req.method} ${u.pathname}`);
+      if (u.pathname === "/v1/cc/decision") return Response.json({ hold: true });
+      if (u.pathname.startsWith("/v1/cc/decision/") && req.method === "GET") return Response.json({ status: "pending" });
+      return Response.json({ ok: true });
+    } });
+    try {
+      const cc = join(home, ".config", "cc-status");
+      await mkdir(join(cc, "sessions"), { recursive: true });
+      await writeFile(join(cc, "config.json"), JSON.stringify({
+        url: `http://127.0.0.1:${server.port}`, pairingId: "p", pcSecret: "s", e2eKeyB64: Buffer.from(KEY).toString("base64url"),
+      }), { mode: 0o600 });
+      await writeFile(join(cc, "sessions", `${CONV}.json`), JSON.stringify({
+        op: "update", prio: 0, lastEvent: "working", ts: Date.now(), agent: "antigravity", pid: 1, sentDone: false,
+      }), { mode: 0o600 });
+      const proc = spawnTestProcess({
+        cmd: [join(PLUGIN, "scripts", "antigravity-approve.sh")],
+        env: isolatedTestEnv(home), stdin: new Blob([JSON.stringify(RUN)]), stdout: "pipe", stderr: "pipe",
+      });
+      for (let i = 0; i < 200 && !events.some((e) => e.startsWith("GET /v1/cc/decision/")); i++) await Bun.sleep(50);
+      expect(events).toContain("POST /v1/cc/decision"); // the card is up and polling
+      const kids = execFileSync("pgrep", ["-P", String(proc.pid)], { encoding: "utf8" }).trim().split("\n").map(Number);
+      process.kill(proc.pid, "SIGKILL"); // no trap runs
+      const killedAt = Date.now();
+      for (let i = 0; i < 160 && !events.includes("event:done"); i++) await Bun.sleep(50);
+      expect(events).toContain("POST /v1/cc/decision/resolve");
+      expect(events).toContain("event:done");
+      for (let i = 0; i < 40 && kids.some((k) => { try { process.kill(k, 0); return true; } catch { return false; } }); i++) await Bun.sleep(100);
+      for (const k of kids) expect(() => process.kill(k, 0)).toThrow(); // bundle exited, guard too
+      expect(Date.now() - killedAt).toBeLessThan(8_000); // one ~3 s poll + the withdraw + the done POST
+    } finally {
+      server.stop(true);
+    }
+  }, 20_000);
 
   test("the real bundle, unpaired (temp HOME) → the fallback", async () => {
     const t = await tmp();

@@ -172,6 +172,21 @@ describe("runAntigravityHook", () => {
     expect((await readRecord(CONV, h.sessionsDir))?.agent).toBe("antigravity");
   });
 
+  test("title fallback: chat title > first prompt > workspace folder name (file:// decoded)", async () => {
+    const h = await harness();
+    let prompt: string | undefined;
+    const deps = { ...h.deps, chatTitle: () => undefined, firstPrompt: async () => prompt };
+    const fire = (event: string) => runAntigravityHook(JSON.stringify({
+      conversationId: CONV, workspacePaths: ["file:///Users/x/My%20Proj"], invocationNum: 0,
+    }), event, deps);
+    await fire("PreInvocation");
+    expect(await decryptBlob(KEY, h.posts.at(-1)!.blob as string)).toMatchObject({ title: "My Proj" });
+    prompt = "Sum the parts";
+    h.tick(ANTIGRAVITY_KEEPALIVE_MS + 1);
+    await fire("PostInvocation");
+    expect(await decryptBlob(KEY, h.posts.at(-1)!.blob as string)).toMatchObject({ title: "Sum the parts" });
+  });
+
   test("not paired / malformed / no id / another agent's row → no POST, never throws", async () => {
     const h = await harness();
     await runAntigravityHook(JSON.stringify({ conversationId: CONV }), "PreInvocation", { ...h.deps, config: null });
@@ -213,6 +228,8 @@ describe("antigravity-hook.sh (what hooks.json runs)", () => {
       ["echo '{\"terminationBehavior\":\"terminate\"}'; exit 3", `${ANTIGRAVITY_TERMINATE}\n`],
       ["kill -9 $$", "{}\n"],
     ];
+    await mkdir(join(home, ".config", "cc-status", "sessions"), { recursive: true });
+    await writeFile(join(home, ".config", "cc-status", "sessions", `${CONV}.interrupt`), "{}");
     for (const [script, want] of cases) {
       const root = join(await tmp(), "plugin");
       await mkdir(join(root, "scripts"), { recursive: true });
@@ -245,6 +262,33 @@ describe("antigravity-hook.sh (what hooks.json runs)", () => {
     await writeInterruptFlagAt(sessions, CONV, Date.now());
     expect(await run()).toBe(`${ANTIGRAVITY_TERMINATE}\n`);
     expect(await run()).toBe("{}\n"); // consumed
+    // a DETACHED run (no stop pending when its wrapper looked) never consumes a flag
+    await writeInterruptFlagAt(sessions, CONV, Date.now());
+    await runAntigravityHook(JSON.stringify({ conversationId: CONV }), "PostInvocation", {
+      config: null, sessionsDir: sessions, stampPath: join(home, "stamp"), canTerminate: false, emit: async () => { throw new Error("must not print"); },
+    });
+    expect(await readFile(join(sessions, interruptFlagFileName(CONV)), "utf8")).toContain("at");
+  });
+
+  test("non-blocking: with no stop pending the wrapper answers and exits before the bundle finishes", async () => {
+    const home = await tmp();
+    const root = join(await tmp(), "plugin");
+    const got = join(root, "got");
+    await mkdir(join(root, "scripts"), { recursive: true });
+    await cp(join(PLUGIN, "scripts", "antigravity-hook.sh"), join(root, "scripts", "antigravity-hook.sh"));
+    await writeFile(join(root, "scripts", "run.sh"), `#!/bin/sh\nsleep 2\ncat > '${got}'\n`, { mode: 0o755 });
+    for (const event of ["PreInvocation", "PostInvocation", "PostToolUse", "Stop"]) {
+      const started = Date.now();
+      const proc = spawnTestProcess({
+        cmd: [join(root, "scripts", "antigravity-hook.sh"), event], env: isolatedTestEnv(home),
+        stdin: new Blob([`{"conversationId":"${CONV}"}`]), stdout: "pipe", stderr: "pipe",
+      });
+      expect(await new Response(proc.stdout).text()).toBe("{}\n");
+      expect(await proc.exited).toBe(0);
+      expect(Date.now() - started).toBeLessThan(1_000);
+    }
+    for (let i = 0; i < 80 && !(await readFile(got, "utf8").catch(() => "")); i++) await Bun.sleep(50);
+    expect(await readFile(got, "utf8")).toBe(`{"conversationId":"${CONV}"}`); // the payload still reached the bundle
   });
 
   test("prints {} and exits 0 even when the bundle crashes", async () => {
@@ -289,7 +333,9 @@ describe("antigravity-install.mjs", () => {
     expect((await b.run()).code).toBe(0);
     const doc = await b.read();
     expect(Object.keys(doc)).toEqual(["nomo"]);
-    const cmd = (e: string) => `'${join(b.root, "scripts", "antigravity-hook.sh")}' ${e}`;
+    const hook = join(b.root, "scripts", "antigravity-hook.sh");
+    const cmd = (e: string) => `[ -x '${hook}' ] && exec '${hook}' ${e} || printf '%s\\n' '{}'`;
+    const approve = join(b.root, "scripts", "antigravity-approve.sh");
     expect(doc.nomo).toEqual({
       enabled: true,
       SessionStart: [{ type: "command", command: cmd("SessionStart"), timeout: 10 }],
@@ -299,13 +345,32 @@ describe("antigravity-install.mjs", () => {
       PostToolUse: [{ matcher: "*", hooks: [{ type: "command", command: cmd("PostToolUse"), timeout: 10 }] }],
       PreToolUse: [{
         matcher: "^(run_command|write_file|write_to_file|edit_file|replace_file_content|multi_replace_file_content)$",
-        hooks: [{ type: "command", command: `'${join(b.root, "scripts", "antigravity-approve.sh")}'`, timeout: 86400 }],
+        hooks: [{ type: "command", command: `[ -x '${approve}' ] && exec '${approve}' || printf '%s\\n' '{"decision":"allow"}'`, timeout: 86400 }],
       }],
     });
     for (const e of ["SessionStart", "PreInvocation", "PostInvocation", "Stop"]) {
       expect(doc.nomo[e][0]).not.toHaveProperty("matcher");
       expect(doc.nomo[e][0]).not.toHaveProperty("hooks");
     }
+  });
+
+  test("a plugin dir deleted without --uninstall: every registered command still answers, exit 0", async () => {
+    const b = await box();
+    await b.run();
+    const doc = await b.read();
+    const sh = async (command: string) => {
+      const proc = spawnTestProcess({ cmd: ["sh", "-c", command], env: isolatedTestEnv(b.home), stdin: new Blob(["{}"]), stdout: "pipe", stderr: "pipe" });
+      const out = await new Response(proc.stdout).text();
+      return { code: await proc.exited, out };
+    };
+    // installed: the real wrapper runs (the stub bundle prints nothing → the wrapper's own reply)
+    expect(await sh(doc.nomo.Stop[0].command)).toEqual({ code: 0, out: "{}\n" });
+    await rm(join(b.root, "scripts"), { recursive: true, force: true });
+    for (const e of ["SessionStart", "PreInvocation", "PostInvocation", "Stop"]) {
+      expect(await sh(doc.nomo[e][0].command)).toEqual({ code: 0, out: "{}\n" });
+    }
+    expect(await sh(doc.nomo.PostToolUse[0].hooks[0].command)).toEqual({ code: 0, out: "{}\n" });
+    expect(await sh(doc.nomo.PreToolUse[0].hooks[0].command)).toEqual({ code: 0, out: '{"decision":"allow"}\n' });
   });
 
   test("idempotent: a second install does not rewrite the file", async () => {
@@ -420,6 +485,21 @@ describe("FIX 1 — a turn that ends with no event is settled", () => {
   });
 });
 
+describe("WAL summaries DB with no -shm (the CLI's between sessions)", () => {
+  test("status and title are still read (immutable retry), from a path with a space", async () => {
+    const home = join(await tmp(), "a home");
+    summariesDb(home, "antigravity-cli", [{ id: CONV, title: "Sum the parts", status: "CASCADE_RUN_STATUS_IDLE", mod: "2026-10-27 14:22:27+00:00" }]);
+    const db = join(home, ".gemini", "antigravity-cli", "conversation_summaries.db");
+    execFileSync("sqlite3", [db, "pragma journal_mode=wal;"]);
+    await rm(`${db}-shm`, { force: true });
+    await rm(`${db}-wal`, { force: true });
+    // the precondition the fix exists for: a plain read-only open fails
+    expect(() => execFileSync("/usr/bin/sqlite3", ["-readonly", db, "select 1"], { stdio: "pipe" })).toThrow();
+    expect(await withHome(home, () => antigravityRunStatus(CONV))).toMatchObject({ status: "CASCADE_RUN_STATUS_IDLE" });
+    expect(await withHome(home, () => antigravityChatTitle(CONV))).toBe("Sum the parts");
+  });
+});
+
 describe("FIX 2 — the owner is the process that ran the hook", () => {
   test("NOMO_HOOK_PPID: alive pid > 1 only", () => {
     expect(antigravityHookParent({ NOMO_HOOK_PPID: "62636" }, () => true)).toBe(62636);
@@ -435,6 +515,7 @@ describe("FIX 2 — the owner is the process that ran the hook", () => {
     const proc = spawnTestProcess({ cmd: [join(root, "scripts", "antigravity-hook.sh"), "Stop"], env: isolatedTestEnv(await tmp()), stdin: new Blob(["{}"]), stdout: "pipe" });
     expect(await new Response(proc.stdout).text()).toBe("{}\n");
     await proc.exited;
+    for (let i = 0; i < 40 && !(await readFile(seen, "utf8").catch(() => "")); i++) await Bun.sleep(50); // detached
     expect(Number(await readFile(seen, "utf8"))).toBe(process.pid); // this test process spawned the wrapper
   });
   test("the hook records that parent as the row's pid", async () => {
@@ -456,6 +537,11 @@ describe("FIX 3 — CLI rows use the CLI's own data dir", () => {
       expect(antigravityDataDirFor(`/h/.gemini/antigravity/brain/${CONV}/x.jsonl`)).toBe("/h/.gemini/antigravity");
       expect(antigravityDataDirFor("/tmp/evil/brain/x")).toBeUndefined();
       expect(antigravityDataDirFor(undefined)).toBeUndefined();
+      // `..` traversal out of a known dir, and relative paths, are rejected
+      expect(antigravityDataDirFor("/h/.gemini/antigravity-cli/brain/../../../etc/passwd")).toBeUndefined();
+      expect(antigravityDataDirFor("/tmp/evil/../../h/.gemini/antigravity/brain/x")).toBe("/h/.gemini/antigravity");
+      expect(antigravityDataDirFor("/h/.gemini/antigravity-cli/../antigravity-x/brain/x")).toBeUndefined();
+      expect(antigravityDataDirFor(".gemini/antigravity/brain/x")).toBeUndefined();
     });
   });
   test("title from the CLI database via the transcript, or by trying both", async () => {

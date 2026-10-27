@@ -16,7 +16,8 @@
 // WHAT GOES TO THE PHONE. PreToolUse fires for EVERY tool, reads included; holding those would make
 // Antigravity unusable. The installer's matcher already limits the hook to ANTIGRAVITY_APPROVAL_TOOLS
 // (shell + file writes/edits), and `antigravityApprovalRequest` additionally lets through, untouched, a
-// call the user's own settings.json `permissions.allow` already allows by a plain prefix. Workspace
+// call the user's own settings.json `permissions` decide: anything a `deny` rule may match (Deny > Ask >
+// Allow — the phone can never override a local deny), or a plain-prefix `allow` no `ask` rule touches. Workspace
 // writes are NOT exempt: agy 1.4.8 prompted for a write inside its own workspace in the spike, so the
 // docs' "workspace writes are auto-allowed" cannot be relied on.
 //
@@ -29,8 +30,10 @@
 
 import { readFileSync } from "node:fs";
 import { isAbsolute, resolve } from "node:path";
-import { antigravityDataDirFor } from "./adapter";
-import { ANTIGRAVITY_STOP_REASON, antigravityCwd, antigravitySessionId, antigravityStopRequested } from "./antigravity";
+import { antigravityDataDirFor, antigravityDataDirs } from "./adapter";
+import {
+  ANTIGRAVITY_STOP_REASON, antigravityCwd, antigravitySessionId, antigravityStopRequested, runAntigravityHook,
+} from "./antigravity";
 import { runPermissionHook, type PermissionHookDeps } from "./permission";
 import { SESSIONS_DIR } from "./shared";
 
@@ -64,19 +67,21 @@ const str = (v: unknown): string | undefined => (typeof v === "string" && v.leng
 
 export interface AntigravityPermissionRules { allow: string[]; ask: string[]; deny: string[] }
 
-/** `permissions.{allow,ask,deny}` from the settings.json beside this conversation's data dir; empty when
- *  absent/unreadable. Read-only. */
+/** `permissions.{allow,ask,deny}` from the settings.json beside this conversation's data dir (the CLI's
+ *  ~/.gemini/antigravity-cli/settings.json; the desktop app keeps its rules in its UI), or — when the
+ *  transcript does not say which — the union of both dirs, which is safe: every rule only ever makes us
+ *  answer "no opinion". Empty when absent/unreadable. Read-only. */
 export function loadAntigravityRules(transcriptPath: string | undefined): AntigravityPermissionRules {
-  const empty = { allow: [], ask: [], deny: [] };
-  const dir = antigravityDataDirFor(transcriptPath);
-  if (!dir) return empty;
-  try {
-    const p = (JSON.parse(readFileSync(`${dir}/settings.json`, "utf8")) as { permissions?: Record<string, unknown> }).permissions ?? {};
-    const list = (v: unknown) => (Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : []);
-    return { allow: list(p.allow), ask: list(p.ask), deny: list(p.deny) };
-  } catch {
-    return empty;
+  const out: AntigravityPermissionRules = { allow: [], ask: [], deny: [] };
+  const known = antigravityDataDirFor(transcriptPath);
+  const list = (v: unknown) => (Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : []);
+  for (const dir of known ? [known] : antigravityDataDirs()) {
+    try {
+      const p = (JSON.parse(readFileSync(`${dir}/settings.json`, "utf8")) as { permissions?: Record<string, unknown> }).permissions ?? {};
+      out.allow.push(...list(p.allow)); out.ask.push(...list(p.ask)); out.deny.push(...list(p.deny));
+    } catch { /* absent / unreadable → no rules from this dir */ }
   }
+  return out;
 }
 
 /** Does a rule of `action` possibly match `target`? `exact` (allow side) accepts only a literal word
@@ -90,8 +95,9 @@ function ruleMatches(rule: string, action: string, target: string, workspace: st
   if (want.startsWith("regex:")) return !exact;
   if (action === "command") {
     if (want === target.trim()) return true;
-    // A compound line could smuggle a second command past a prefix rule: never prefix-match one.
-    if (/[;&|$`<>(){}\n]/.test(target)) return false;
+    // A compound line could smuggle a second command past a prefix rule: never prefix-match one on the
+    // allow side; on the deny/ask side it MAY contain the denied command, so it counts as a match.
+    if (/[;&|$`<>(){}\n]/.test(target)) return !exact;
     const a = want.split(/\s+/), b = target.trim().split(/\s+/);
     return a.length <= b.length && a.every((w, i) => w === b[i]);
   }
@@ -139,7 +145,10 @@ export function antigravityApprovalRequest(
     action = "write_file"; target = cwd && !isAbsolute(path) ? resolve(cwd, path) : path;
   }
   const hit = (list: string[], exact: boolean) => list.some((r) => ruleMatches(r, action, target, cwd, exact));
-  if (hit(rules.allow, true) && !hit(rules.ask, false) && !hit(rules.deny, false)) return null;
+  // Antigravity's precedence, Deny > Ask > Allow. A call the user's own rules DENY never reaches the
+  // phone (an Allow there would answer auto_approve and override it): no opinion, Antigravity denies.
+  if (hit(rules.deny, false)) return null;
+  if (!hit(rules.ask, false) && hit(rules.allow, true)) return null;
   return { sessionId, ...(cwd ? { cwd } : {}), transcriptPath: str(input.transcriptPath), agyTool, toolName, toolInput };
 }
 
@@ -165,7 +174,18 @@ export interface AntigravityApprovalDeps {
   run?: typeof runPermissionHook;
   /** Stop-flag check (tests). Default: the real flag in SESSIONS_DIR. */
   stopRequested?: (sessionId: string) => Promise<boolean>;
+  /** Has the hook's wrapper gone away (tests)? Default: our parent pid changed (reparented on its death)
+   *  or we were sent SIGTERM (the wrapper's trap). */
+  abandoned?: () => boolean;
+  /** Reports the row done after an abandoned hold (tests). Default: a synthetic Antigravity Stop. */
+  settleDone?: (raw: string) => Promise<void>;
 }
+
+/** Set by the entry's SIGTERM handler (antigravity-approve.sh's trap on TERM/INT/HUP). */
+let terminated = false;
+export function markAntigravityApprovalTerminated(): void { terminated = true; }
+const parentAtStart = process.ppid;
+const defaultAbandoned = () => terminated || process.ppid !== parentAtStart;
 
 /** The deny line a phone Stop answers with. */
 export const ANTIGRAVITY_STOP_DENY = JSON.stringify({ decision: "deny", reason: ANTIGRAVITY_STOP_REASON });
@@ -191,16 +211,24 @@ export async function runAntigravityApproval(raw: string, deps: AntigravityAppro
       tool_input: req.toolInput,
     });
     let line: string | undefined;
+    let gone = false;
+    const abandoned = () => (gone ||= (deps.abandoned ?? defaultAbandoned)());
     await (deps.run ?? runPermissionHook)({
       // Paused approvals (the shared no-hold flag): nothing to post — Antigravity's own prompt follows.
       delegate: async () => {},
       deadlineAt: (deps.hold?.now ?? Date.now)() + ANTIGRAVITY_HOLD_DEADLINE_MS,
       stopRequested,
       stopReason: ANTIGRAVITY_STOP_REASON,
+      abandoned,
       ...deps.hold,
       readInput: async () => stdin,
       emit: (l) => { line = l; },
     }, "antigravity");
+    // The agent killed our wrapper mid-hold: it interrupted the turn (or exited). The card is withdrawn;
+    // report the turn over, so neither the hold nor a yellow row outlives it.
+    if (gone && line === undefined) {
+      await (deps.settleDone ?? ((r: string) => runAntigravityHook(r, "Stop")))(raw).catch(() => {});
+    }
     return antigravityDecision(line);
   } catch {
     return ANTIGRAVITY_FALLBACK;

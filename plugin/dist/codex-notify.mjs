@@ -10,7 +10,7 @@ import { existsSync as existsSync2 } from "node:fs";
 import { readdir, readFile as readFile2, stat as stat2 } from "node:fs/promises";
 import { devNull } from "node:os";
 import { promisify as promisify2 } from "node:util";
-import { basename as basename2, join as join2 } from "node:path";
+import { basename as basename2, isAbsolute as isAbsolute2, join as join2, resolve as resolve2 } from "node:path";
 
 // src/core/shared.ts
 import { access, chmod, open, readFile, rename, stat, mkdir, unlink, writeFile } from "node:fs/promises";
@@ -2855,7 +2855,13 @@ function sqliteOne(db, sql, env = process.env) {
     return;
   try {
     const bin = process.platform === "darwin" && existsSync2("/usr/bin/sqlite3") ? "/usr/bin/sqlite3" : "sqlite3";
-    const out = execFileSync2(bin, ["-init", devNull, "-batch", "-noheader", "-list", "-readonly", db, sql], { timeout: CURSOR_TITLE_TIMEOUT_MS, encoding: "utf8", maxBuffer: 65536, stdio: ["ignore", "pipe", "ignore"], env });
+    const run = (target) => execFileSync2(bin, ["-init", devNull, "-batch", "-noheader", "-list", "-readonly", target, sql], { timeout: CURSOR_TITLE_TIMEOUT_MS, encoding: "utf8", maxBuffer: 65536, stdio: ["ignore", "pipe", "ignore"], env });
+    let out;
+    try {
+      out = run(db);
+    } catch {
+      out = run(`file:${db.split("/").map(encodeURIComponent).join("/")}?immutable=1`);
+    }
     const cleaned = out.replace(/\s+/g, " ").trim();
     return cleaned || undefined;
   } catch {
@@ -2887,10 +2893,11 @@ function antigravityDataDirs() {
   return [`${home}/.gemini/antigravity`, `${home}/.gemini/antigravity-cli`];
 }
 function antigravityDataDirFor(transcriptPath) {
-  if (!transcriptPath)
+  if (!transcriptPath || !isAbsolute2(transcriptPath))
     return;
-  const i = transcriptPath.indexOf("/brain/");
-  const dir = i > 0 ? transcriptPath.slice(0, i) : undefined;
+  const normalized = resolve2(transcriptPath);
+  const i = normalized.indexOf("/brain/");
+  const dir = i > 0 ? normalized.slice(0, i) : undefined;
   return dir !== undefined && antigravityDataDirs().includes(dir) ? dir : undefined;
 }
 var summariesDbs = (transcriptPath) => {
