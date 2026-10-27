@@ -485,6 +485,17 @@ A `nomo` folder without that marker is someone else's: the installer refuses and
   an hour, or left when the turn ended on its own, is dropped and never touches a later turn.
   Antigravity's flags have their own name, so Claude Code's never slow Antigravity down.
   Nomo never signals the `agy` process (that would exit the CLI).
+- **Reply from the phone.** The Reply button on an Antigravity row sends a message (up to 4,000
+  characters) end-to-end encrypted, over the local link and the relay. The Mac queues it for that
+  conversation; the next `PreInvocation` (before the agent's next model call) hands every queued
+  message to the agent as a user message. A message that arrives during the turn's last step makes
+  that turn's `Stop` continue once, so it still arrives. Your phone shows *Queued* until it is handed
+  over, then *Delivered*, and can cancel it until then. For a finished `agy` CLI conversation whose
+  `agy` has exited, Nomo runs `agy --conversation <id> --print=<message>` in the background in that
+  conversation's folder; its own hooks report the turn, and its tools ask your phone as usual. A
+  finished `agy` that is still open just keeps the message for your next turn there (Nomo never starts
+  a second `agy` on one conversation). A finished desktop-app conversation can only continue on the
+  Mac. An Interrupt always wins: a message is never handed to a turn being stopped.
 - **Phone approvals (`PreToolUse`).** For a shell command or a file write in a session your phone is
   showing, the tool waits while the phone shows Allow / Deny / Deny with note. Allow answers
   `auto_approve`; Deny answers `deny` with your note (or "Denied from phone") as the reason the agent
@@ -558,7 +569,8 @@ description is dropped before the command is.
 
 ## Hooks on your computer — security
 
-- **Antigravity: status hooks observe only, except to end a turn you interrupted; the approval hook
+- **Antigravity: status hooks observe only, except to end a turn you interrupted or to hand over a
+  message you sent; the approval hook
   can only defer, approve what you approved, or deny what you denied (or interrupted).** Nomo's
   `"nomo"` block in `~/.gemini/config/hooks.json` answers every status event with `{}` before running
   anything, so those can neither stop a tool nor keep or end a turn — except `PostInvocation`, whose
@@ -568,6 +580,17 @@ description is dropped before the command is.
   (decrypted, fresh, never replayed, naming a session this computer tracks). The same flag makes the
   approval hook answer `deny` ("Stopped from phone"). Its one `PreToolUse` entry is matched only to
   shell commands and file writes/edits.
+  Phone replies take the same path: a `send-message` command (sealed by your paired phone, passing the
+  same gates, with a message id and a text of at most 4,000 characters with no control characters but
+  line breaks) is written as one owner-only file per message (`<conversation>.<id>.agy-inbox` in Nomo's
+  sessions folder). Only while such a file exists do `PreInvocation` and `Stop` run in the foreground
+  (capped at 4 seconds); the wrapper then prints the bundle's output only if it is exactly
+  `{"injectSteps":[{"userMessage":"…"}…]}` (PreInvocation) or `{"decision":"continue","reason":"…"}`
+  (Stop) on one line, else `{}`. A Stop continues at most once a minute for queued messages, never for
+  a turn your phone is stopping, and messages nobody picked up are deleted after a day. The only
+  process Nomo ever starts for a reply is `agy --conversation <id> --print=<message>` (the message is
+  one argument, never parsed by a shell), for an `agy` CLI conversation this computer tracks whose
+  `agy` has exited, in the folder that conversation ran in.
   Antigravity treats a failing `PreToolUse` hook as a block, so `antigravity-approve.sh` checks the
   hook's output against the only three replies Nomo sends (`allow`, `auto_approve`, `deny` with a
   reason) and answers `{"decision":"allow"}` — Antigravity's own permission settings and prompt — for

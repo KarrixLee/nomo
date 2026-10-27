@@ -2,7 +2,7 @@ import { createRequire } from "node:module";
 var __require = /* @__PURE__ */ createRequire(import.meta.url);
 
 // src/entries/cc-watchdog.ts
-import { readdir as readdir4, readFile as readFile8, unlink as unlink4 } from "node:fs/promises";
+import { readdir as readdir5, readFile as readFile9, unlink as unlink5 } from "node:fs/promises";
 import { readFileSync as readFileSync2, statSync as statSync3, unlinkSync } from "node:fs";
 import { hostname as hostname4 } from "node:os";
 import { basename as basename6 } from "node:path";
@@ -91,13 +91,11 @@ async function sha256Hex(s) {
   return Array.from(new Uint8Array(digest)).map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
-// src/core/adapter.ts
-import { execFile as execFile2, execFileSync as execFileSync2 } from "node:child_process";
+// src/core/antigravity-inbox.ts
+import { spawn as spawn2 } from "node:child_process";
 import { existsSync as existsSync2 } from "node:fs";
-import { readdir, readFile as readFile2, stat as stat2 } from "node:fs/promises";
-import { devNull } from "node:os";
-import { promisify as promisify2 } from "node:util";
-import { basename as basename2, isAbsolute as isAbsolute2, join as join2, resolve as resolve2 } from "node:path";
+import { readdir, readFile as readFile2, rename as rename2, stat as stat2, unlink as unlink2 } from "node:fs/promises";
+import { delimiter, join as join2 } from "node:path";
 
 // src/core/shared.ts
 import { access, chmod, open, readFile, rename, stat, mkdir, unlink, writeFile } from "node:fs/promises";
@@ -1086,6 +1084,242 @@ function codexCompanionBrokerEvidence(pid, ancestorsOf = pidAncestors, commandOf
   return null;
 }
 
+// src/core/antigravity-inbox.ts
+var ANTIGRAVITY_INBOX_SUFFIX = ".agy-inbox";
+var ANTIGRAVITY_RECEIPT_SUFFIX = ".agy-reply";
+var ANTIGRAVITY_NUDGE_SUFFIX = ".agy-nudge";
+var REPLY_TEXT_MAX_CHARS = 4000;
+var REPLY_RECEIPTS_MAX = 16;
+var REPLY_INBOX_MAX_AGE_MS = 24 * 60 * 60000;
+var REPLY_NUDGE_WINDOW_MS = 60000;
+var ANTIGRAVITY_REPLY_NUDGE = "The user just sent a new message from their phone. It follows as the next user message.";
+var MID = /^[A-Za-z0-9_-]{8,64}$/;
+function replyMessageId(v) {
+  return typeof v === "string" && MID.test(v) ? v : undefined;
+}
+function replyText(v) {
+  if (typeof v !== "string" || v.trim().length === 0 || v.length > REPLY_TEXT_MAX_CHARS)
+    return;
+  return /[\u0000-\u0009\u000B-\u001F\u007F]/.test(v) ? undefined : v;
+}
+var fileFor = (dir, conv, mid, suffix) => join2(dir, `${conv}.${mid}${suffix}`);
+async function midsOf(dir, conv, suffix) {
+  let names = [];
+  try {
+    names = await readdir(dir);
+  } catch {
+    return [];
+  }
+  const out = [];
+  for (const n of names) {
+    if (!n.startsWith(`${conv}.`) || !n.endsWith(suffix))
+      continue;
+    const mid = n.slice(conv.length + 1, -suffix.length);
+    if (MID.test(mid))
+      out.push(mid);
+  }
+  return out;
+}
+async function writeReceipt(dir, conv, mid, state) {
+  await atomicWrite(fileFor(dir, conv, mid, ANTIGRAVITY_RECEIPT_SUFFIX), state, 384).catch(() => {});
+}
+async function receiptOf(dir, conv, mid) {
+  try {
+    const s = (await readFile2(fileFor(dir, conv, mid, ANTIGRAVITY_RECEIPT_SUFFIX), "utf8")).trim();
+    return /^[qdrcx]$/.test(s) ? s : undefined;
+  } catch {
+    return;
+  }
+}
+async function readReceipts(dir, conv) {
+  const rows = [];
+  for (const mid of await midsOf(dir, conv, ANTIGRAVITY_RECEIPT_SUFFIX)) {
+    try {
+      rows.push({ mid, at: (await stat2(fileFor(dir, conv, mid, ANTIGRAVITY_RECEIPT_SUFFIX))).mtimeMs });
+    } catch {}
+  }
+  rows.sort((a, b) => a.at - b.at);
+  for (const old of rows.splice(0, Math.max(0, rows.length - REPLY_RECEIPTS_MAX))) {
+    await unlink2(fileFor(dir, conv, old.mid, ANTIGRAVITY_RECEIPT_SUFFIX)).catch(() => {});
+  }
+  const out = {};
+  for (const r of rows) {
+    const s = await receiptOf(dir, conv, r.mid);
+    if (s)
+      out[r.mid] = s;
+  }
+  return out;
+}
+async function enqueueReply(dir, conv, reply) {
+  await writeReceipt(dir, conv, reply.mid, "q");
+  await atomicWrite(fileFor(dir, conv, reply.mid, ANTIGRAVITY_INBOX_SUFFIX), JSON.stringify(reply), 384);
+}
+async function hasQueuedReplies(dir, conv) {
+  return (await midsOf(dir, conv, ANTIGRAVITY_INBOX_SUFFIX)).length > 0;
+}
+async function takeReplies(dir, conv, state = "d") {
+  const out = [];
+  for (const mid of await midsOf(dir, conv, ANTIGRAVITY_INBOX_SUFFIX)) {
+    const path = fileFor(dir, conv, mid, ANTIGRAVITY_INBOX_SUFFIX);
+    const claimed = `${path}.${process.pid}.take`;
+    try {
+      await rename2(path, claimed);
+    } catch {
+      continue;
+    }
+    try {
+      const r = JSON.parse(await readFile2(claimed, "utf8"));
+      const text = replyText(r.text);
+      if (text) {
+        out.push({ mid, text, ts: typeof r.ts === "number" ? r.ts : 0 });
+        await writeReceipt(dir, conv, mid, state);
+      }
+    } catch {}
+    await unlink2(claimed).catch(() => {});
+  }
+  return out.sort((a, b) => a.ts - b.ts || a.mid.localeCompare(b.mid));
+}
+async function cancelReply(dir, conv, mid) {
+  const path = fileFor(dir, conv, mid, ANTIGRAVITY_INBOX_SUFFIX);
+  const claimed = `${path}.${process.pid}.cancel`;
+  try {
+    await rename2(path, claimed);
+  } catch {
+    return false;
+  }
+  await unlink2(claimed).catch(() => {});
+  await writeReceipt(dir, conv, mid, "c");
+  return true;
+}
+async function pruneStaleReplies(dir, now = Date.now()) {
+  let names = [];
+  try {
+    names = await readdir(dir);
+  } catch {
+    return;
+  }
+  for (const n of names) {
+    if (![ANTIGRAVITY_INBOX_SUFFIX, ANTIGRAVITY_RECEIPT_SUFFIX, ANTIGRAVITY_NUDGE_SUFFIX, ANTIGRAVITY_RESUME_SUFFIX].some((x) => n.endsWith(x)))
+      continue;
+    try {
+      if (now - (await stat2(join2(dir, n))).mtimeMs > REPLY_INBOX_MAX_AGE_MS)
+        await unlink2(join2(dir, n));
+    } catch {}
+  }
+}
+async function nudgedRecently(dir, conv, now) {
+  try {
+    return now - Number(await readFile2(join2(dir, `${conv}${ANTIGRAVITY_NUDGE_SUFFIX}`), "utf8")) < REPLY_NUDGE_WINDOW_MS;
+  } catch {
+    return false;
+  }
+}
+var markNudged = (dir, conv, now) => atomicWrite(join2(dir, `${conv}${ANTIGRAVITY_NUDGE_SUFFIX}`), String(now), 384).catch(() => {});
+var clearNudge = (dir, conv) => unlink2(join2(dir, `${conv}${ANTIGRAVITY_NUDGE_SUFFIX}`)).catch(() => {});
+function antigravitySurface(path) {
+  if (typeof path !== "string")
+    return;
+  if (path.includes("/.gemini/antigravity-cli/brain/"))
+    return "cli";
+  if (path.includes("/.gemini/antigravity/brain/"))
+    return "app";
+  return;
+}
+function replyRoute(record, resumeAlive, alive) {
+  const done = record.op === "done" || record.lastEvent === "done";
+  if (!done || resumeAlive)
+    return "queue";
+  const surface = antigravitySurface(record.transcript);
+  if (surface === "app")
+    return "reject";
+  const pid = record.pid;
+  if (typeof pid === "number" && pid > 1 && alive(pid))
+    return "queue";
+  const cwd = record.cwd ?? record.origin?.cwd;
+  return surface === "cli" && typeof cwd === "string" && cwd.startsWith("/") ? "resume" : "reject";
+}
+function agyBinary(env = process.env) {
+  if (env.NOMO_AGY_BIN)
+    return env.NOMO_AGY_BIN;
+  for (const d of (env.PATH ?? "").split(delimiter))
+    if (d && existsSync2(join2(d, "agy")))
+      return join2(d, "agy");
+  return join2(env.HOME ?? "", ".local", "bin", "agy");
+}
+function spawnAgyResume(conv, cwd, text) {
+  try {
+    const child = spawn2(agyBinary(), ["--conversation", conv, `--print=${text}`], {
+      cwd,
+      detached: true,
+      stdio: "ignore",
+      env: process.env
+    });
+    child.on("error", () => {});
+    child.unref();
+    return child.pid;
+  } catch {
+    return;
+  }
+}
+var ANTIGRAVITY_RESUME_SUFFIX = ".agy-resume";
+async function resumePid(dir, conv) {
+  try {
+    const n = Number(await readFile2(join2(dir, `${conv}${ANTIGRAVITY_RESUME_SUFFIX}`), "utf8"));
+    return n > 1 ? n : undefined;
+  } catch {
+    return;
+  }
+}
+async function handleReplyCommand(kind, conv, record, payload, deps) {
+  try {
+    const dir = deps.sessionsDir;
+    const mid = replyMessageId(payload.mid);
+    if (!mid)
+      return "malformed";
+    if (kind === "cancel-message")
+      return await cancelReply(dir, conv, mid) ? "reply-cancelled" : "reply-too-late";
+    const text = replyText(payload.text);
+    if (!text)
+      return "malformed";
+    if (await receiptOf(dir, conv, mid))
+      return "reply-duplicate";
+    const alive = deps.pidAlive ?? pidAlive;
+    const resuming = await resumePid(dir, conv);
+    const route = replyRoute(record, resuming !== undefined && alive(resuming), alive);
+    if (route === "reject") {
+      await writeReceipt(dir, conv, mid, "x");
+      return "reply-rejected";
+    }
+    if (route === "resume") {
+      const earlier = await takeReplies(dir, conv, "r");
+      const prompt = [...earlier.map((r) => r.text), text].join(`
+
+`);
+      const cwd = record.cwd ?? record.origin?.cwd;
+      const pid = (deps.resume ?? spawnAgyResume)(conv, cwd, prompt);
+      if (pid !== undefined) {
+        await atomicWrite(join2(dir, `${conv}${ANTIGRAVITY_RESUME_SUFFIX}`), String(pid), 384).catch(() => {});
+        await writeReceipt(dir, conv, mid, "r");
+        return "reply-resumed";
+      }
+      for (const r of earlier)
+        await enqueueReply(dir, conv, r);
+    }
+    await enqueueReply(dir, conv, { mid, text, ts: deps.now });
+    return "reply-queued";
+  } catch {
+    return "malformed";
+  }
+}
+
+// src/core/adapter.ts
+import { execFile as execFile2, execFileSync as execFileSync2 } from "node:child_process";
+import { existsSync as existsSync3 } from "node:fs";
+import { readdir as readdir2, readFile as readFile3, stat as stat3 } from "node:fs/promises";
+import { devNull } from "node:os";
+import { promisify as promisify2 } from "node:util";
+import { basename as basename2, isAbsolute as isAbsolute2, join as join3, resolve as resolve2 } from "node:path";
+
 // src/core/terminal-focus.ts
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
@@ -1522,7 +1756,7 @@ function codexThreadName(indexContent, sessionId) {
 var INDEX_SCAN_BYTES = 128 * 1024;
 async function codexIndexTitle(sessionId, home = codexHome()) {
   try {
-    const content = await readSuffix(join2(home, "session_index.jsonl"), INDEX_SCAN_BYTES);
+    const content = await readSuffix(join3(home, "session_index.jsonl"), INDEX_SCAN_BYTES);
     return codexThreadName(content, sessionId);
   } catch {
     return;
@@ -1749,7 +1983,7 @@ async function codexSessionModel(input, prefix, transcriptPath, home = codexHome
       return m;
   }
   try {
-    return codexConfigModel(await readFile2(join2(home, "config.toml"), "utf8"));
+    return codexConfigModel(await readFile3(join3(home, "config.toml"), "utf8"));
   } catch {
     return;
   }
@@ -2179,32 +2413,32 @@ var ROLLOUT_SCAN_MAX_HEADS = 40;
 var ROLLOUT_META_HEAD_BYTES = 64 * 1024;
 async function listNumericDirsDesc(path) {
   try {
-    return (await readdir(path)).filter((n) => /^\d+$/.test(n)).sort((a, b) => b.localeCompare(a));
+    return (await readdir2(path)).filter((n) => /^\d+$/.test(n)).sort((a, b) => b.localeCompare(a));
   } catch {
     return [];
   }
 }
 async function codexNewestRolloutForCwd(cwd, home = codexHome()) {
-  const sessions = join2(home, "sessions");
+  const sessions = join3(home, "sessions");
   const candidates = [];
   let days = 0;
   outer:
     for (const y of await listNumericDirsDesc(sessions)) {
-      for (const m of await listNumericDirsDesc(join2(sessions, y))) {
-        for (const d of await listNumericDirsDesc(join2(sessions, y, m))) {
-          const dir = join2(sessions, y, m, d);
+      for (const m of await listNumericDirsDesc(join3(sessions, y))) {
+        for (const d of await listNumericDirsDesc(join3(sessions, y, m))) {
+          const dir = join3(sessions, y, m, d);
           let names;
           try {
-            names = await readdir(dir);
+            names = await readdir2(dir);
           } catch {
             continue;
           }
           for (const n of names) {
             if (!n.startsWith("rollout-") || !n.endsWith(".jsonl"))
               continue;
-            const path = join2(dir, n);
+            const path = join3(dir, n);
             try {
-              candidates.push({ path, mtime: (await stat2(path)).mtimeMs });
+              candidates.push({ path, mtime: (await stat3(path)).mtimeMs });
             } catch {}
           }
           if (++days >= ROLLOUT_SCAN_MAX_DAYS)
@@ -2236,7 +2470,7 @@ async function codexPidTurnActive(pid, deps = {}) {
     if (!rollout)
       return false;
     const tail = await (deps.readTail ?? readSuffix)(rollout, TURN_STATE_TAIL_BYTES);
-    const mtime = await (deps.mtimeOf ?? (async (p) => (await stat2(p)).mtimeMs))(rollout);
+    const mtime = await (deps.mtimeOf ?? (async (p) => (await stat3(p)).mtimeMs))(rollout);
     return codexTurnActiveFromTail(tail, (deps.now ?? Date.now)() - mtime);
   } catch {
     return false;
@@ -2567,14 +2801,14 @@ function codexChildSessionGhost(sessionId, transcriptPrefix, hookPid, tracked) {
 async function codexRolloutExistsForSession(sessionId, home = codexHome()) {
   if (sessionId.length === 0)
     return false;
-  const sessions = join2(home, "sessions");
+  const sessions = join3(home, "sessions");
   let days = 0;
   for (const y of await listNumericDirsDesc(sessions)) {
-    for (const m of await listNumericDirsDesc(join2(sessions, y))) {
-      for (const d of await listNumericDirsDesc(join2(sessions, y, m))) {
+    for (const m of await listNumericDirsDesc(join3(sessions, y))) {
+      for (const d of await listNumericDirsDesc(join3(sessions, y, m))) {
         let names;
         try {
-          names = await readdir(join2(sessions, y, m, d));
+          names = await readdir2(join3(sessions, y, m, d));
         } catch {
           names = [];
         }
@@ -2647,7 +2881,7 @@ async function codexSessionCreationSuppression(sessionId, transcriptPrefix, tran
     return null;
   if (transcriptPath.length > 0) {
     try {
-      await (deps.statOf ?? stat2)(transcriptPath);
+      await (deps.statOf ?? stat3)(transcriptPath);
       return null;
     } catch {}
   }
@@ -2852,10 +3086,10 @@ function sqliteOneTitle(db, sql, env = process.env) {
   return cleaned ? truncateOnWord(cleaned) : undefined;
 }
 function sqliteOne(db, sql, env = process.env) {
-  if (!existsSync2(db))
+  if (!existsSync3(db))
     return;
   try {
-    const bin = process.platform === "darwin" && existsSync2("/usr/bin/sqlite3") ? "/usr/bin/sqlite3" : "sqlite3";
+    const bin = process.platform === "darwin" && existsSync3("/usr/bin/sqlite3") ? "/usr/bin/sqlite3" : "sqlite3";
     const run = (target) => execFileSync2(bin, ["-init", devNull, "-batch", "-noheader", "-list", "-readonly", target, sql], { timeout: CURSOR_TITLE_TIMEOUT_MS, encoding: "utf8", maxBuffer: 65536, stdio: ["ignore", "pipe", "ignore"], env });
     let out;
     try {
@@ -3515,7 +3749,7 @@ class CodexAppServerClient {
 }
 
 // src/core/codex-proxy-transport.ts
-import { spawn as spawn2 } from "node:child_process";
+import { spawn as spawn3 } from "node:child_process";
 import { createHash as createHash2, randomBytes } from "node:crypto";
 var WEBSOCKET_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 var DEFAULT_MAX_BUFFER_BYTES = 1 << 20;
@@ -3523,7 +3757,7 @@ var DEFAULT_MAX_HANDSHAKE_BYTES = 16 << 10;
 var MAX_FRAME_HEADER_BYTES = 10;
 var CODEX_PROXY_STDOUT_ENDED = "Codex app-server proxy stdout ended";
 function defaultSpawnProxy(command, args) {
-  return spawn2(command, [...args], { stdio: ["pipe", "pipe", "pipe"] });
+  return spawn3(command, [...args], { stdio: ["pipe", "pipe", "pipe"] });
 }
 function asError(value, fallback) {
   return value instanceof Error ? value : new Error(value === undefined ? fallback : String(value));
@@ -3908,13 +4142,13 @@ import { hostname as hostname3 } from "node:os";
 
 // src/core/lan-listener.ts
 import { createServer } from "node:http";
-import { readFile as readFile4 } from "node:fs/promises";
+import { readFile as readFile5 } from "node:fs/promises";
 import { networkInterfaces } from "node:os";
 
 // src/core/lan-frames.ts
 import { execFile as execFile3 } from "node:child_process";
 import { watch } from "node:fs";
-import { readdir as readdir2, readFile as readFile3 } from "node:fs/promises";
+import { readdir as readdir3, readFile as readFile4 } from "node:fs/promises";
 import { basename as basename3 } from "node:path";
 import { promisify as promisify3 } from "node:util";
 
@@ -4375,7 +4609,7 @@ function createLanFrameStore(deps = {}) {
     if (typeof pid !== "number" || !Number.isFinite(pid))
       return null;
     try {
-      return parseCcSessionFile(await readFile3(`${ccSessionsDir}/${pid}.json`, "utf8"));
+      return parseCcSessionFile(await readFile4(`${ccSessionsDir}/${pid}.json`, "utf8"));
     } catch {
       return null;
     }
@@ -4430,7 +4664,7 @@ function createLanFrameStore(deps = {}) {
     const at = now();
     let files = [];
     try {
-      files = await readdir2(sessionsDir);
+      files = await readdir3(sessionsDir);
     } catch {
       files = [];
     }
@@ -4464,7 +4698,7 @@ function createLanFrameStore(deps = {}) {
       const v2Retired = stateEntries.get(sessionId)?.retiredAt !== undefined;
       let record = null;
       try {
-        record = JSON.parse(await readFile3(`${sessionsDir}/${file}`, "utf8"));
+        record = JSON.parse(await readFile4(`${sessionsDir}/${file}`, "utf8"));
       } catch {
         continue;
       }
@@ -4475,7 +4709,7 @@ function createLanFrameStore(deps = {}) {
       let hold = null;
       if (held.has(sessionId)) {
         try {
-          hold = JSON.parse(await readFile3(`${sessionsDir}/${decisionHoldFileName(sessionId)}`, "utf8"));
+          hold = JSON.parse(await readFile4(`${sessionsDir}/${decisionHoldFileName(sessionId)}`, "utf8"));
         } catch {
           hold = null;
         }
@@ -4630,7 +4864,7 @@ function createLanFrameStore(deps = {}) {
           return null;
         let record;
         try {
-          record = JSON.parse(await readFile3(`${sessionsDir}/${sessionId}.json`, "utf8"));
+          record = JSON.parse(await readFile4(`${sessionsDir}/${sessionId}.json`, "utf8"));
         } catch {
           return null;
         }
@@ -5047,7 +5281,7 @@ function createLanListener(deps = {}) {
   const bind = async () => {
     let persisted = null;
     try {
-      persisted = parseLanState(await readFile4(statePath, "utf8"));
+      persisted = parseLanState(await readFile5(statePath, "utf8"));
     } catch {
       persisted = null;
     }
@@ -5300,18 +5534,18 @@ var DEFINITIVE_POLL_STATUSES = new Set([401, 403, 404, 410]);
 var MAX_DEFINITIVE_POLL_FAILURES = 2;
 
 // src/core/permission.ts
-import { readFile as readFile7, realpath, unlink as unlink3 } from "node:fs/promises";
+import { readFile as readFile8, realpath, unlink as unlink4 } from "node:fs/promises";
 import { appendFileSync as appendFileSync2, statSync as statSync2, truncateSync as truncateSync2 } from "node:fs";
 import { hostname as hostname2 } from "node:os";
 import { basename as basename5, isAbsolute as isAbsolute3, relative, resolve as resolve3 } from "node:path";
 
 // src/core/hook.ts
-import { readdir as readdir3, readFile as readFile6, unlink as unlink2 } from "node:fs/promises";
+import { readdir as readdir4, readFile as readFile7, unlink as unlink3 } from "node:fs/promises";
 import { hostname } from "node:os";
 import { basename as basename4 } from "node:path";
 
 // src/core/notify-wire.ts
-import { readFile as readFile5, stat as stat3 } from "node:fs/promises";
+import { readFile as readFile6, stat as stat4 } from "node:fs/promises";
 var NOMO_NOTIFY_ENTRY = "codex-notify";
 function nomoNotifyProgram(home) {
   return `${home}/.config/cc-status/hook-shim.sh`;
@@ -5425,7 +5659,7 @@ async function repairNotifyWiring(deps = {}) {
     const tomlPath = deps.tomlPath ?? `${codexHome()}/config.toml`;
     let toml;
     try {
-      toml = await readFile5(tomlPath, "utf8");
+      toml = await readFile6(tomlPath, "utf8");
     } catch {
       return "unchanged";
     }
@@ -5439,10 +5673,10 @@ async function repairNotifyWiring(deps = {}) {
     const next = wireNotifyArray(parsed.value, program);
     if (sameCommand(next, parsed.value))
       return "unchanged";
-    const mode = ((await stat3(tomlPath).catch(() => null))?.mode ?? 384) & 511;
+    const mode = ((await stat4(tomlPath).catch(() => null))?.mode ?? 384) & 511;
     const bak = `${tomlPath}.bak-nomo`;
     try {
-      await readFile5(bak);
+      await readFile6(bak);
     } catch {
       await atomicWrite(bak, toml, mode);
     }
@@ -5627,7 +5861,7 @@ function buildBlob(input, machine, title, plan, agent = "claude", turnStartedAt,
   }) : undefined;
   return appendFittedPlanAndDebug(base, proposedPlan, dbg);
 }
-async function buildEnvelope(input, machine, now, title, e2eKey, sentDone, agent = "claude", startedAt, turnStartedAt, pinnedFolder, model, planOverride, attentionKindOverride, proposedPlan, dbg, onBlobPlaintext, detailOverride) {
+async function buildEnvelope(input, machine, now, title, e2eKey, sentDone, agent = "claude", startedAt, turnStartedAt, pinnedFolder, model, planOverride, attentionKindOverride, proposedPlan, dbg, onBlobPlaintext, detailOverride, extraFields) {
   if (typeof input !== "object" || input === null)
     return null;
   const i = input;
@@ -5641,7 +5875,7 @@ async function buildEnvelope(input, machine, now, title, e2eKey, sentDone, agent
   if (typeof startedAt === "number" && Number.isFinite(startedAt))
     base.startedAt = startedAt;
   const at = Math.floor(now / 1000);
-  const plaintext = buildBlob(i, machine, title, plan, agent, turnStartedAt, pinnedFolder, model, at, proposedPlan, dbg, detailOverride);
+  const plaintext = { ...buildBlob(i, machine, title, plan, agent, turnStartedAt, pinnedFolder, model, at, proposedPlan, dbg, detailOverride), ...extraFields };
   try {
     onBlobPlaintext?.(plaintext);
   } catch {}
@@ -5672,9 +5906,9 @@ async function trackSessionAt(sessionsDir, sessionId, op, prio, status, blob, ma
   try {
     const path = `${sessionsDir}/${sessionId}.json`;
     if (op === "end") {
-      await unlink2(path).catch(() => {});
-      await unlink2(`${sessionsDir}/${decisionHoldFileName(sessionId)}`).catch(() => {});
-      await unlink2(`${sessionsDir}/${interruptFlagFileName(sessionId)}`).catch(() => {});
+      await unlink3(path).catch(() => {});
+      await unlink3(`${sessionsDir}/${decisionHoldFileName(sessionId)}`).catch(() => {});
+      await unlink3(`${sessionsDir}/${interruptFlagFileName(sessionId)}`).catch(() => {});
       return;
     }
     const recordedAt = Date.now();
@@ -5739,7 +5973,7 @@ async function traceSendFailure(event, failPath = SEND_FAIL_PATH, lastSendPath =
   try {
     const stamp = async (path) => {
       try {
-        return Number.parseInt((await readFile6(path, "utf8")).trim(), 10) || 0;
+        return Number.parseInt((await readFile7(path, "utf8")).trim(), 10) || 0;
       } catch {
         return 0;
       }
@@ -5756,14 +5990,14 @@ async function traceSendFailure(event, failPath = SEND_FAIL_PATH, lastSendPath =
 }
 async function reconcileProvisional(config, hookPid) {
   try {
-    const files = await readdir3(SESSIONS_DIR).catch(() => []);
+    const files = await readdir4(SESSIONS_DIR).catch(() => []);
     const provisionals = [];
     for (const f of files) {
       if (!f.endsWith(".json"))
         continue;
       let r;
       try {
-        r = JSON.parse(await readFile6(`${SESSIONS_DIR}/${f}`, "utf8"));
+        r = JSON.parse(await readFile7(`${SESSIONS_DIR}/${f}`, "utf8"));
       } catch {
         continue;
       }
@@ -5786,17 +6020,17 @@ async function reconcileProvisional(config, hookPid) {
       delivered = res.ok;
     } catch {}
     if (delivered)
-      await unlink2(`${SESSIONS_DIR}/${sentinel}.json`).catch(() => {});
+      await unlink3(`${SESSIONS_DIR}/${sentinel}.json`).catch(() => {});
   } catch {}
 }
 async function readTrackedSessions() {
-  const files = await readdir3(SESSIONS_DIR).catch(() => []);
+  const files = await readdir4(SESSIONS_DIR).catch(() => []);
   const out = [];
   for (const f of files) {
     if (!f.endsWith(".json"))
       continue;
     try {
-      const r = JSON.parse(await readFile6(`${SESSIONS_DIR}/${f}`, "utf8"));
+      const r = JSON.parse(await readFile7(`${SESSIONS_DIR}/${f}`, "utf8"));
       out.push({ sessionId: basename4(f, ".json"), pid: r.pid, provisional: r.provisional, agent: r.agent, ts: r.ts });
     } catch {}
   }
@@ -5819,7 +6053,7 @@ async function retireLineageSession(config, sessionId, agent, input, reason) {
     });
     delivered = res.ok;
   } catch {}
-  await unlink2(`${SESSIONS_DIR}/${sessionId}.json`).catch(() => {});
+  await unlink3(`${SESSIONS_DIR}/${sessionId}.json`).catch(() => {});
   traceSession({
     event: "retire",
     sessionId,
@@ -6786,7 +7020,7 @@ function createLoopbackAnswerPoller(config, requestId, deps) {
     if (deps.statePath === undefined)
       return;
     try {
-      return parseLanState(await readFile7(deps.statePath, "utf8"))?.port;
+      return parseLanState(await readFile8(deps.statePath, "utf8"))?.port;
     } catch {
       return;
     }
@@ -7321,7 +7555,7 @@ async function approvalsCommand(sub, deps = {}) {
     return 0;
   }
   if (sub === "on") {
-    await unlink3(path).catch(() => {});
+    await unlink4(path).catch(() => {});
     print("Remote approvals are ON for this computer — when a session is on your phone's Live Activity, its permission prompts are sent to the phone to Allow or Deny.");
     return 0;
   }
@@ -8003,7 +8237,7 @@ function resetDoneAttemptMemory() {
 }
 async function readRecordAt(path) {
   try {
-    return JSON.parse(await readFile8(path, "utf8"));
+    return JSON.parse(await readFile9(path, "utf8"));
   } catch {
     return null;
   }
@@ -8046,6 +8280,8 @@ function classifySession(record, now, isAlive) {
   }
   if (now - record.ts > SESSION_STALE_MS)
     return "stale";
+  if (record.agent === "antigravity" && isDoneState(record) && antigravitySurface(record.transcript) === "cli")
+    return "keep";
   const ownerPid = record.agent === "codex" && typeof record.tuiPid === "number" && Number.isFinite(record.tuiPid) ? record.tuiPid : record.pid;
   return isAlive(ownerPid) ? "keep" : "end";
 }
@@ -8622,7 +8858,8 @@ async function postEvent(config, body, opts = {}) {
   }
 }
 var INTERRUPT_COMMAND_KIND = "interrupt-session";
-var COMMAND_KINDS_ALLOWED = new Set(["focus-terminal", INTERRUPT_COMMAND_KIND]);
+var REPLY_COMMAND_KINDS = new Set(["send-message", "cancel-message"]);
+var COMMAND_KINDS_ALLOWED = new Set(["focus-terminal", INTERRUPT_COMMAND_KIND, ...REPLY_COMMAND_KINDS]);
 var COMMANDS_PER_RESPONSE_MAX = 8;
 var COMMAND_BUFFER_MAX = 32;
 var EXECUTED_COMMAND_IDS_MAX = 64;
@@ -8669,7 +8906,14 @@ function parseCommandPayload(plain) {
     return;
   if (typeof p.nonce !== "string" || p.nonce.length === 0)
     return;
-  return { kind: p.kind, sessionId: p.sessionId, ts: p.ts, nonce: p.nonce };
+  return {
+    kind: p.kind,
+    sessionId: p.sessionId,
+    ts: p.ts,
+    nonce: p.nonce,
+    ...p.mid !== undefined ? { mid: p.mid } : {},
+    ...p.text !== undefined ? { text: p.text } : {}
+  };
 }
 function commandIsFresh(ts, now) {
   if (ts > now + COMMAND_FUTURE_SKEW_MS)
@@ -8750,6 +8994,19 @@ async function interruptSession(adapter, sessionId, record, now, deps) {
   }
   return "unsupported";
 }
+async function publishReplyReceipts(config, sessionId, dir) {
+  const path = `${dir}/${sessionId}.json`;
+  const record = await readRecordAt(path);
+  if (!record || typeof record.blob !== "string" || record.blob.length === 0)
+    return;
+  const plain = await decryptBlob(config.e2eKey, record.blob);
+  const blob = await encryptBlob(config.e2eKey, { ...plain, replies: await readReceipts(dir, sessionId) });
+  const next = { ...record, blob };
+  await atomicWrite(path, JSON.stringify(next), 384);
+  const envelope = buildHeartbeatEnvelope(sessionId, next, Date.now(), config.pairingId);
+  if (envelope)
+    await postEvent(config, envelope);
+}
 async function drainCommands(config, deps = {}) {
   try {
     const pending = (deps.take ?? (() => commandBuffer.splice(0, commandBuffer.length)))();
@@ -8803,7 +9060,7 @@ async function drainCommands(config, deps = {}) {
           traceFocus(deps, { ...base, result: "unknown-session" });
           continue;
         }
-        const target = `${payload.kind}|${payload.sessionId}`;
+        const target = `${payload.kind}|${payload.sessionId}${REPLY_COMMAND_KINDS.has(payload.kind) ? `|${String(payload.mid)}` : ""}`;
         if (batchTargets.has(target)) {
           traceFocus(deps, { ...base, result: "duplicate", why: "batch" });
           continue;
@@ -8814,6 +9071,19 @@ async function drainCommands(config, deps = {}) {
         if (payload.kind === INTERRUPT_COMMAND_KIND) {
           const result = await interruptSession(adapter, payload.sessionId, entry.rec, now, deps);
           traceFocus(deps, { ...base, agent, result });
+          continue;
+        }
+        if (REPLY_COMMAND_KINDS.has(payload.kind)) {
+          const dir = deps.replySessionsDir ?? (lanRunningUnderTest() ? undefined : SESSIONS_DIR);
+          if (agent !== "antigravity" || !dir) {
+            traceFocus(deps, { ...base, agent, result: "unsupported" });
+            continue;
+          }
+          const result = await handleReplyCommand(payload.kind, payload.sessionId, entry.rec, payload, { sessionsDir: dir, now, ...deps.replyDeps });
+          if (result !== "malformed") {
+            await (deps.publishRepliesFn ?? ((id, d) => publishReplyReceipts(config, id, d)))(payload.sessionId, dir).catch(() => {});
+          }
+          traceFocus(deps, { ...base, agent, result, mid: payload.mid });
           continue;
         }
         if (!adapter.locateTuiPid) {
@@ -8895,13 +9165,13 @@ function machineName(config) {
 }
 async function readAllRecordEntries() {
   try {
-    const files = await readdir4(SESSIONS_DIR);
+    const files = await readdir5(SESSIONS_DIR);
     const out = [];
     for (const f of files) {
       if (!f.endsWith(".json"))
         continue;
       try {
-        out.push({ sessionId: basename6(f, ".json"), rec: JSON.parse(await readFile8(`${SESSIONS_DIR}/${f}`, "utf8")) });
+        out.push({ sessionId: basename6(f, ".json"), rec: JSON.parse(await readFile9(`${SESSIONS_DIR}/${f}`, "utf8")) });
       } catch {}
     }
     return out;
@@ -9007,7 +9277,7 @@ function provisionalsCoveredByReal(entries, adapters = allAdapters) {
 async function reconcileProvisionalsSweep(config, deps = {}) {
   const post = deps.post ?? ((body) => postEvent(config, body));
   const readEntries = deps.readEntries ?? readAllRecordEntries;
-  const deleteRecord = deps.deleteRecord ?? ((sessionId) => unlink4(`${SESSIONS_DIR}/${sessionId}.json`).catch(() => {}));
+  const deleteRecord = deps.deleteRecord ?? ((sessionId) => unlink5(`${SESSIONS_DIR}/${sessionId}.json`).catch(() => {}));
   const now = deps.now ?? Date.now;
   const entries = await readEntries();
   for (const sessionId of provisionalsCoveredByReal(entries, deps.adapters ?? allAdapters)) {
@@ -9505,7 +9775,7 @@ function isRetireEligible(record, now) {
 }
 async function retireDoneStale(config, path, sessionId, record, now, deps = {}) {
   const post = deps.post ?? ((body) => postEvent(config, body));
-  const deleteRecord = deps.deleteRecord ?? ((p) => unlink4(p).catch(() => {}));
+  const deleteRecord = deps.deleteRecord ?? ((p) => unlink5(p).catch(() => {}));
   const writeRecord = deps.writeRecord ?? ((p, rec) => atomicWrite(p, JSON.stringify(rec), 384));
   const alive = deps.pidAlive ?? pidAlive;
   const locateTuiPid = deps.locateTuiPid ?? locateCodexOwnedTui;
@@ -9736,7 +10006,7 @@ async function pruneStaleDecisionHolds(files, deps = {}) {
     return 0;
   const readHold = deps.readHold ?? (inert ? async () => null : (id) => readDecisionHoldAt(SESSIONS_DIR, id));
   const removeHold = deps.removeHold ?? (inert ? async () => {} : async (id) => {
-    await unlink4(`${SESSIONS_DIR}/${decisionHoldFileName(id)}`).catch(() => {});
+    await unlink5(`${SESSIONS_DIR}/${decisionHoldFileName(id)}`).catch(() => {});
   });
   const isAlive = deps.isAlive ?? pidAlive;
   let removed = 0;
@@ -9775,7 +10045,7 @@ var waitingBeatAt;
 async function sweep(config, deps = {}) {
   let files;
   try {
-    files = await readdir4(SESSIONS_DIR);
+    files = await readdir5(SESSIONS_DIR);
   } catch {
     return { revoked: false, remaining: 0, delivered: false };
   }
@@ -9792,7 +10062,7 @@ async function sweep(config, deps = {}) {
     const sessionId = basename6(file, ".json");
     let record = null;
     try {
-      record = JSON.parse(await readFile8(path, "utf8"));
+      record = JSON.parse(await readFile9(path, "utf8"));
     } catch {
       record = null;
     }
@@ -9947,7 +10217,7 @@ async function sweep(config, deps = {}) {
     heartbeatAt.delete(sessionId);
     clearDoneAttempts(sessionId);
     try {
-      await unlink4(path);
+      await unlink5(path);
     } catch {}
   }
   if (config !== null && greetDelivered)
@@ -10180,9 +10450,9 @@ function pendingPairingExpired(pending, now, fallbackDeadline) {
 }
 async function removePendingConfig() {
   try {
-    await unlink4(`${CC_DIR}/config.json`);
+    await unlink5(`${CC_DIR}/config.json`);
   } catch {}
-  await unlink4(`${CC_DIR}/${PAIR_HTML_FILE}`).catch(() => {});
+  await unlink5(`${CC_DIR}/${PAIR_HTML_FILE}`).catch(() => {});
 }
 async function selfHealPairing(pending) {
   let result;

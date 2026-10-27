@@ -2,13 +2,13 @@
 // READ-ONLY v1, Cursor's twin (core/cursor.ts): the same shared seal/record/POST pieces, none of
 // hook.ts's Claude-shaped planning.
 //
-// THE CONTRACT WITH ANTIGRAVITY: observe only — with ONE exception, the phone's Stop. Antigravity's hook
-// output CAN steer it (Stop `decision:"continue"`, PostInvocation `terminationBehavior`), so this process
-// writes to stdout exactly once ever: ANTIGRAVITY_TERMINATE, on a PostInvocation that consumed a phone
-// interrupt flag. Every other `{}` is printed by plugin/scripts/antigravity-hook.sh (first, for every
-// event but PostInvocation; for PostInvocation it captures our output and prints `{}` unless it is
-// exactly the terminate line). It always exits 0 and swallows every error. (PreToolUse — phone
-// approvals — is a separate hook: core/antigravity-approval.ts.)
+// THE CONTRACT WITH ANTIGRAVITY: observe only — with TWO exceptions, both the phone's. Antigravity's hook
+// output CAN steer it, so this process writes to stdout at most once per run, and only on the wrapper's
+// synchronous runs: ANTIGRAVITY_TERMINATE on a PostInvocation that consumed a phone Stop flag, and a
+// phone REPLY — {"injectSteps":[…]} on a PreInvocation, {"decision":"continue",…} on a Stop (see
+// antigravity-inbox.ts). Every other `{}` is printed by plugin/scripts/antigravity-hook.sh, which also
+// re-validates whatever we print against exactly those shapes. It always exits 0 and swallows every
+// error. (PreToolUse — phone approvals — is a separate hook: core/antigravity-approval.ts.)
 //
 // PHONE STOP (verified agy 1.4.8): the watchdog stamps `<sessions>/<conversationId>.agy-interrupt` (the
 // shared hook-flag seam, adapter.interrupt). PostInvocation — after EVERY model call — returning
@@ -33,6 +33,10 @@ import { readdir } from "node:fs/promises";
 import { hostname } from "node:os";
 import { basename } from "node:path";
 import { antigravityChatTitle, antigravityFirstPrompt, antigravityModel } from "./adapter";
+import {
+  ANTIGRAVITY_REPLY_NUDGE, antigravitySurface, clearNudge, hasQueuedReplies, markNudged, nudgedRecently, pruneStaleReplies,
+  readReceipts, takeReplies,
+} from "./antigravity-inbox";
 import { CURSOR_UNKNOWN_OWNER_PID } from "./cursor";
 import { buildEnvelope, markDoneDeliveredAt, OpPlan, trackSessionAt } from "./hook";
 import {
@@ -240,7 +244,10 @@ export async function runAntigravityHook(raw: string, eventName: string | undefi
     if (!kind || kind === "start") return;
 
     const sessionsDir = deps.sessionsDir ?? SESSIONS_DIR;
-    if (eventName === "PostInvocation" && deps.canTerminate !== false) await pruneStaleAntigravityStops(sessionsDir, now);
+    const sync = deps.canTerminate !== false;
+    if (eventName === "PostInvocation" && sync) await pruneStaleAntigravityStops(sessionsDir, now);
+    // Read before the Stop branch below clears it: a phone Stop beats a phone reply in the same hook.
+    const stopPendingAtStop = sync && kind === "stop" && await antigravityStopRequested(sessionsDir, sessionId, now);
     // PHONE STOP, before pairing and the network: consume the flag, end the turn, report it done.
     if (eventName === "PostInvocation" && deps.canTerminate !== false
       && await antigravityStopRequested(sessionsDir, sessionId, now)) {
@@ -262,7 +269,37 @@ export async function runAntigravityHook(raw: string, eventName: string | undefi
       await clearStop(sessionsDir, sessionId);
     }
 
-    const plan = planAntigravity(kind, record, now);
+    // PHONE REPLIES (antigravity-inbox.ts) — only on the wrapper's synchronous runs, whose stdout
+    // Antigravity reads; a detached run must never consume a message it cannot hand over.
+    //   PreInvocation: inject every queued message as a user message at this step — unless a phone Stop
+    //     is pending for a running turn (never feed a turn that is being terminated; they wait).
+    //   Stop: a message arrived during the turn's last step → continue, so the next PreInvocation injects
+    //     it (once per REPLY_NUDGE_WINDOW_MS: a PreInvocation that keeps failing cannot loop the agent).
+    let repliesChanged = false;
+    if (sync && eventName === "PreInvocation") {
+      await pruneStaleReplies(sessionsDir); // file mtimes: real time, not the injectable clock
+      if (!(await antigravityStopRequested(sessionsDir, sessionId, now))) {
+        const replies = await takeReplies(sessionsDir, sessionId, "d");
+        if (replies.length > 0) {
+          await (deps.emit ?? emitStdout)(JSON.stringify({ injectSteps: replies.map((r) => ({ userMessage: r.text })) }));
+          await clearNudge(sessionsDir, sessionId);
+          (deps.trace ?? traceSession)({ event: "reply", sessionId, agent: "antigravity", result: "injected", count: replies.length });
+          repliesChanged = true;
+        }
+      }
+    } else if (sync && eventName === "Stop" && kind === "stop" && !stopPendingAtStop
+      // a row already done = a phone Stop just terminated this turn (its PostInvocation consumed the flag)
+      && !(record && (record.op === "done" || record.lastEvent === "done"))
+      && await hasQueuedReplies(sessionsDir, sessionId) && !(await nudgedRecently(sessionsDir, sessionId, now))) {
+      await markNudged(sessionsDir, sessionId, now);
+      await (deps.emit ?? emitStdout)(JSON.stringify({ decision: "continue", reason: ANTIGRAVITY_REPLY_NUDGE }));
+      (deps.trace ?? traceSession)({ event: "reply", sessionId, agent: "antigravity", result: "continued" });
+      kind = "beat"; // the turn goes on
+    }
+
+    const plan = planAntigravity(kind, record, now)
+      // A delivery receipt must reach the phone now, not after the keep-alive throttle.
+      ?? (repliesChanged ? { op: "update" as const, prio: 0 as const, status: "working" as const, turnStartedAt: record?.turnStartedAt } : null);
     if (!plan) return;
 
     const machine = config.machineName ?? hostname().replace(/\.local$/, "");
@@ -284,15 +321,27 @@ export async function runAntigravityHook(raw: string, eventName: string | undefi
     // ponytail: no retry for an unknown owner (Cursor retries every 10 min) — the hook parent is
     // always known through the wrapper, so pid 1 only follows a hand run.
     let pid = record?.pid;
+    // A dead owner is replaced by the live hook parent: the conversation was resumed in a new process
+    // (`agy --conversation`, from the terminal or from a phone reply).
+    if (typeof pid === "number" && pid !== CURSOR_UNKNOWN_OWNER_PID && !pidAlive(pid)) {
+      const parent = antigravityHookParent(process.env);
+      if (parent !== undefined) pid = parent;
+    }
     if (typeof pid !== "number") {
       pid = (deps.ownerPid ?? resolveOwnerPid)() ?? CURSOR_UNKNOWN_OWNER_PID;
       if (pid !== CURSOR_UNKNOWN_OWNER_PID && !pidAlive(pid)) pid = CURSOR_UNKNOWN_OWNER_PID;
     }
 
+    // APPEND-LAST blob keys: where the conversation lives (the phone offers Reply on an idle `agy` CLI
+    // row, not on an idle desktop-app one) and the reply receipts. Both omitted when there is nothing.
+    const surface = antigravitySurface(transcript) ?? antigravitySurface(input.artifactDirectoryPath);
+    const replies = await readReceipts(sessionsDir, sessionId);
     const envelope = await buildEnvelope(
       { session_id: sessionId, ...(cwd ? { cwd } : {}) }, machine, now, title, config.e2eKey, false,
       "antigravity", startedAt, plan.turnStartedAt, folder, model,
       { op: plan.op, prio: plan.prio, status: plan.status },
+      undefined, undefined, undefined, undefined, undefined,
+      { ...(surface ? { surface } : {}), ...(Object.keys(replies).length > 0 ? { replies } : {}) },
     );
     if (!envelope) return;
 

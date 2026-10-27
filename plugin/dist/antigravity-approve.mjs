@@ -3019,22 +3019,254 @@ function adapterFor(agent) {
 var allAdapters = [claudeAdapter, codexAdapter];
 
 // src/core/antigravity.ts
-import { readdir as readdir4 } from "node:fs/promises";
+import { readdir as readdir5 } from "node:fs/promises";
 import { hostname as hostname3 } from "node:os";
 import { basename as basename5 } from "node:path";
+
+// src/core/antigravity-inbox.ts
+import { spawn as spawn2 } from "node:child_process";
+import { existsSync as existsSync3 } from "node:fs";
+import { readdir as readdir2, readFile as readFile3, rename as rename2, stat as stat3, unlink as unlink2 } from "node:fs/promises";
+import { delimiter, join as join3 } from "node:path";
+var ANTIGRAVITY_INBOX_SUFFIX = ".agy-inbox";
+var ANTIGRAVITY_RECEIPT_SUFFIX = ".agy-reply";
+var ANTIGRAVITY_NUDGE_SUFFIX = ".agy-nudge";
+var REPLY_TEXT_MAX_CHARS = 4000;
+var REPLY_RECEIPTS_MAX = 16;
+var REPLY_INBOX_MAX_AGE_MS = 24 * 60 * 60000;
+var REPLY_NUDGE_WINDOW_MS = 60000;
+var ANTIGRAVITY_REPLY_NUDGE = "The user just sent a new message from their phone. It follows as the next user message.";
+var MID = /^[A-Za-z0-9_-]{8,64}$/;
+function replyMessageId(v) {
+  return typeof v === "string" && MID.test(v) ? v : undefined;
+}
+function replyText(v) {
+  if (typeof v !== "string" || v.trim().length === 0 || v.length > REPLY_TEXT_MAX_CHARS)
+    return;
+  return /[\u0000-\u0009\u000B-\u001F\u007F]/.test(v) ? undefined : v;
+}
+var fileFor = (dir, conv, mid, suffix) => join3(dir, `${conv}.${mid}${suffix}`);
+async function midsOf(dir, conv, suffix) {
+  let names = [];
+  try {
+    names = await readdir2(dir);
+  } catch {
+    return [];
+  }
+  const out = [];
+  for (const n of names) {
+    if (!n.startsWith(`${conv}.`) || !n.endsWith(suffix))
+      continue;
+    const mid = n.slice(conv.length + 1, -suffix.length);
+    if (MID.test(mid))
+      out.push(mid);
+  }
+  return out;
+}
+async function writeReceipt(dir, conv, mid, state) {
+  await atomicWrite(fileFor(dir, conv, mid, ANTIGRAVITY_RECEIPT_SUFFIX), state, 384).catch(() => {});
+}
+async function receiptOf(dir, conv, mid) {
+  try {
+    const s = (await readFile3(fileFor(dir, conv, mid, ANTIGRAVITY_RECEIPT_SUFFIX), "utf8")).trim();
+    return /^[qdrcx]$/.test(s) ? s : undefined;
+  } catch {
+    return;
+  }
+}
+async function readReceipts(dir, conv) {
+  const rows = [];
+  for (const mid of await midsOf(dir, conv, ANTIGRAVITY_RECEIPT_SUFFIX)) {
+    try {
+      rows.push({ mid, at: (await stat3(fileFor(dir, conv, mid, ANTIGRAVITY_RECEIPT_SUFFIX))).mtimeMs });
+    } catch {}
+  }
+  rows.sort((a, b) => a.at - b.at);
+  for (const old of rows.splice(0, Math.max(0, rows.length - REPLY_RECEIPTS_MAX))) {
+    await unlink2(fileFor(dir, conv, old.mid, ANTIGRAVITY_RECEIPT_SUFFIX)).catch(() => {});
+  }
+  const out = {};
+  for (const r of rows) {
+    const s = await receiptOf(dir, conv, r.mid);
+    if (s)
+      out[r.mid] = s;
+  }
+  return out;
+}
+async function enqueueReply(dir, conv, reply) {
+  await writeReceipt(dir, conv, reply.mid, "q");
+  await atomicWrite(fileFor(dir, conv, reply.mid, ANTIGRAVITY_INBOX_SUFFIX), JSON.stringify(reply), 384);
+}
+async function hasQueuedReplies(dir, conv) {
+  return (await midsOf(dir, conv, ANTIGRAVITY_INBOX_SUFFIX)).length > 0;
+}
+async function takeReplies(dir, conv, state = "d") {
+  const out = [];
+  for (const mid of await midsOf(dir, conv, ANTIGRAVITY_INBOX_SUFFIX)) {
+    const path = fileFor(dir, conv, mid, ANTIGRAVITY_INBOX_SUFFIX);
+    const claimed = `${path}.${process.pid}.take`;
+    try {
+      await rename2(path, claimed);
+    } catch {
+      continue;
+    }
+    try {
+      const r = JSON.parse(await readFile3(claimed, "utf8"));
+      const text = replyText(r.text);
+      if (text) {
+        out.push({ mid, text, ts: typeof r.ts === "number" ? r.ts : 0 });
+        await writeReceipt(dir, conv, mid, state);
+      }
+    } catch {}
+    await unlink2(claimed).catch(() => {});
+  }
+  return out.sort((a, b) => a.ts - b.ts || a.mid.localeCompare(b.mid));
+}
+async function cancelReply(dir, conv, mid) {
+  const path = fileFor(dir, conv, mid, ANTIGRAVITY_INBOX_SUFFIX);
+  const claimed = `${path}.${process.pid}.cancel`;
+  try {
+    await rename2(path, claimed);
+  } catch {
+    return false;
+  }
+  await unlink2(claimed).catch(() => {});
+  await writeReceipt(dir, conv, mid, "c");
+  return true;
+}
+async function pruneStaleReplies(dir, now = Date.now()) {
+  let names = [];
+  try {
+    names = await readdir2(dir);
+  } catch {
+    return;
+  }
+  for (const n of names) {
+    if (![ANTIGRAVITY_INBOX_SUFFIX, ANTIGRAVITY_RECEIPT_SUFFIX, ANTIGRAVITY_NUDGE_SUFFIX, ANTIGRAVITY_RESUME_SUFFIX].some((x) => n.endsWith(x)))
+      continue;
+    try {
+      if (now - (await stat3(join3(dir, n))).mtimeMs > REPLY_INBOX_MAX_AGE_MS)
+        await unlink2(join3(dir, n));
+    } catch {}
+  }
+}
+async function nudgedRecently(dir, conv, now) {
+  try {
+    return now - Number(await readFile3(join3(dir, `${conv}${ANTIGRAVITY_NUDGE_SUFFIX}`), "utf8")) < REPLY_NUDGE_WINDOW_MS;
+  } catch {
+    return false;
+  }
+}
+var markNudged = (dir, conv, now) => atomicWrite(join3(dir, `${conv}${ANTIGRAVITY_NUDGE_SUFFIX}`), String(now), 384).catch(() => {});
+var clearNudge = (dir, conv) => unlink2(join3(dir, `${conv}${ANTIGRAVITY_NUDGE_SUFFIX}`)).catch(() => {});
+function antigravitySurface(path) {
+  if (typeof path !== "string")
+    return;
+  if (path.includes("/.gemini/antigravity-cli/brain/"))
+    return "cli";
+  if (path.includes("/.gemini/antigravity/brain/"))
+    return "app";
+  return;
+}
+function replyRoute(record, resumeAlive, alive) {
+  const done = record.op === "done" || record.lastEvent === "done";
+  if (!done || resumeAlive)
+    return "queue";
+  const surface = antigravitySurface(record.transcript);
+  if (surface === "app")
+    return "reject";
+  const pid = record.pid;
+  if (typeof pid === "number" && pid > 1 && alive(pid))
+    return "queue";
+  const cwd = record.cwd ?? record.origin?.cwd;
+  return surface === "cli" && typeof cwd === "string" && cwd.startsWith("/") ? "resume" : "reject";
+}
+function agyBinary(env = process.env) {
+  if (env.NOMO_AGY_BIN)
+    return env.NOMO_AGY_BIN;
+  for (const d of (env.PATH ?? "").split(delimiter))
+    if (d && existsSync3(join3(d, "agy")))
+      return join3(d, "agy");
+  return join3(env.HOME ?? "", ".local", "bin", "agy");
+}
+function spawnAgyResume(conv, cwd, text) {
+  try {
+    const child = spawn2(agyBinary(), ["--conversation", conv, `--print=${text}`], {
+      cwd,
+      detached: true,
+      stdio: "ignore",
+      env: process.env
+    });
+    child.on("error", () => {});
+    child.unref();
+    return child.pid;
+  } catch {
+    return;
+  }
+}
+var ANTIGRAVITY_RESUME_SUFFIX = ".agy-resume";
+async function resumePid(dir, conv) {
+  try {
+    const n = Number(await readFile3(join3(dir, `${conv}${ANTIGRAVITY_RESUME_SUFFIX}`), "utf8"));
+    return n > 1 ? n : undefined;
+  } catch {
+    return;
+  }
+}
+async function handleReplyCommand(kind, conv, record, payload, deps) {
+  try {
+    const dir = deps.sessionsDir;
+    const mid = replyMessageId(payload.mid);
+    if (!mid)
+      return "malformed";
+    if (kind === "cancel-message")
+      return await cancelReply(dir, conv, mid) ? "reply-cancelled" : "reply-too-late";
+    const text = replyText(payload.text);
+    if (!text)
+      return "malformed";
+    if (await receiptOf(dir, conv, mid))
+      return "reply-duplicate";
+    const alive = deps.pidAlive ?? pidAlive;
+    const resuming = await resumePid(dir, conv);
+    const route = replyRoute(record, resuming !== undefined && alive(resuming), alive);
+    if (route === "reject") {
+      await writeReceipt(dir, conv, mid, "x");
+      return "reply-rejected";
+    }
+    if (route === "resume") {
+      const earlier = await takeReplies(dir, conv, "r");
+      const prompt = [...earlier.map((r) => r.text), text].join(`
+
+`);
+      const cwd = record.cwd ?? record.origin?.cwd;
+      const pid = (deps.resume ?? spawnAgyResume)(conv, cwd, prompt);
+      if (pid !== undefined) {
+        await atomicWrite(join3(dir, `${conv}${ANTIGRAVITY_RESUME_SUFFIX}`), String(pid), 384).catch(() => {});
+        await writeReceipt(dir, conv, mid, "r");
+        return "reply-resumed";
+      }
+      for (const r of earlier)
+        await enqueueReply(dir, conv, r);
+    }
+    await enqueueReply(dir, conv, { mid, text, ts: deps.now });
+    return "reply-queued";
+  } catch {
+    return "malformed";
+  }
+}
 
 // src/core/cursor.ts
 import { hostname as hostname2 } from "node:os";
 import { realpathSync } from "node:fs";
-import { readdir as readdir3, stat as stat4, unlink as unlink3 } from "node:fs/promises";
+import { readdir as readdir4, stat as stat5, unlink as unlink4 } from "node:fs/promises";
 
 // src/core/hook.ts
-import { readdir as readdir2, readFile as readFile4, unlink as unlink2 } from "node:fs/promises";
+import { readdir as readdir3, readFile as readFile5, unlink as unlink3 } from "node:fs/promises";
 import { hostname } from "node:os";
 import { basename as basename3 } from "node:path";
 
 // src/core/notify-wire.ts
-import { readFile as readFile3, stat as stat3 } from "node:fs/promises";
+import { readFile as readFile4, stat as stat4 } from "node:fs/promises";
 var NOMO_NOTIFY_ENTRY = "codex-notify";
 function nomoNotifyProgram(home) {
   return `${home}/.config/cc-status/hook-shim.sh`;
@@ -3148,7 +3380,7 @@ async function repairNotifyWiring(deps = {}) {
     const tomlPath = deps.tomlPath ?? `${codexHome()}/config.toml`;
     let toml;
     try {
-      toml = await readFile3(tomlPath, "utf8");
+      toml = await readFile4(tomlPath, "utf8");
     } catch {
       return "unchanged";
     }
@@ -3162,10 +3394,10 @@ async function repairNotifyWiring(deps = {}) {
     const next = wireNotifyArray(parsed.value, program);
     if (sameCommand(next, parsed.value))
       return "unchanged";
-    const mode = ((await stat3(tomlPath).catch(() => null))?.mode ?? 384) & 511;
+    const mode = ((await stat4(tomlPath).catch(() => null))?.mode ?? 384) & 511;
     const bak = `${tomlPath}.bak-nomo`;
     try {
-      await readFile3(bak);
+      await readFile4(bak);
     } catch {
       await atomicWrite(bak, toml, mode);
     }
@@ -3528,7 +3760,7 @@ function buildBlob(input, machine, title, plan, agent = "claude", turnStartedAt,
   }) : undefined;
   return appendFittedPlanAndDebug(base, proposedPlan, dbg);
 }
-async function buildEnvelope(input, machine, now, title, e2eKey, sentDone, agent = "claude", startedAt, turnStartedAt, pinnedFolder, model, planOverride, attentionKindOverride, proposedPlan, dbg, onBlobPlaintext, detailOverride) {
+async function buildEnvelope(input, machine, now, title, e2eKey, sentDone, agent = "claude", startedAt, turnStartedAt, pinnedFolder, model, planOverride, attentionKindOverride, proposedPlan, dbg, onBlobPlaintext, detailOverride, extraFields) {
   if (typeof input !== "object" || input === null)
     return null;
   const i = input;
@@ -3542,7 +3774,7 @@ async function buildEnvelope(input, machine, now, title, e2eKey, sentDone, agent
   if (typeof startedAt === "number" && Number.isFinite(startedAt))
     base.startedAt = startedAt;
   const at = Math.floor(now / 1000);
-  const plaintext = buildBlob(i, machine, title, plan, agent, turnStartedAt, pinnedFolder, model, at, proposedPlan, dbg, detailOverride);
+  const plaintext = { ...buildBlob(i, machine, title, plan, agent, turnStartedAt, pinnedFolder, model, at, proposedPlan, dbg, detailOverride), ...extraFields };
   try {
     onBlobPlaintext?.(plaintext);
   } catch {}
@@ -3573,9 +3805,9 @@ async function trackSessionAt(sessionsDir, sessionId, op, prio, status, blob, ma
   try {
     const path = `${sessionsDir}/${sessionId}.json`;
     if (op === "end") {
-      await unlink2(path).catch(() => {});
-      await unlink2(`${sessionsDir}/${decisionHoldFileName(sessionId)}`).catch(() => {});
-      await unlink2(`${sessionsDir}/${interruptFlagFileName(sessionId)}`).catch(() => {});
+      await unlink3(path).catch(() => {});
+      await unlink3(`${sessionsDir}/${decisionHoldFileName(sessionId)}`).catch(() => {});
+      await unlink3(`${sessionsDir}/${interruptFlagFileName(sessionId)}`).catch(() => {});
       return;
     }
     const recordedAt = Date.now();
@@ -3640,7 +3872,7 @@ async function traceSendFailure(event, failPath = SEND_FAIL_PATH, lastSendPath =
   try {
     const stamp = async (path) => {
       try {
-        return Number.parseInt((await readFile4(path, "utf8")).trim(), 10) || 0;
+        return Number.parseInt((await readFile5(path, "utf8")).trim(), 10) || 0;
       } catch {
         return 0;
       }
@@ -3657,14 +3889,14 @@ async function traceSendFailure(event, failPath = SEND_FAIL_PATH, lastSendPath =
 }
 async function reconcileProvisional(config, hookPid) {
   try {
-    const files = await readdir2(SESSIONS_DIR).catch(() => []);
+    const files = await readdir3(SESSIONS_DIR).catch(() => []);
     const provisionals = [];
     for (const f of files) {
       if (!f.endsWith(".json"))
         continue;
       let r;
       try {
-        r = JSON.parse(await readFile4(`${SESSIONS_DIR}/${f}`, "utf8"));
+        r = JSON.parse(await readFile5(`${SESSIONS_DIR}/${f}`, "utf8"));
       } catch {
         continue;
       }
@@ -3687,17 +3919,17 @@ async function reconcileProvisional(config, hookPid) {
       delivered = res.ok;
     } catch {}
     if (delivered)
-      await unlink2(`${SESSIONS_DIR}/${sentinel}.json`).catch(() => {});
+      await unlink3(`${SESSIONS_DIR}/${sentinel}.json`).catch(() => {});
   } catch {}
 }
 async function readTrackedSessions() {
-  const files = await readdir2(SESSIONS_DIR).catch(() => []);
+  const files = await readdir3(SESSIONS_DIR).catch(() => []);
   const out = [];
   for (const f of files) {
     if (!f.endsWith(".json"))
       continue;
     try {
-      const r = JSON.parse(await readFile4(`${SESSIONS_DIR}/${f}`, "utf8"));
+      const r = JSON.parse(await readFile5(`${SESSIONS_DIR}/${f}`, "utf8"));
       out.push({ sessionId: basename3(f, ".json"), pid: r.pid, provisional: r.provisional, agent: r.agent, ts: r.ts });
     } catch {}
   }
@@ -3720,7 +3952,7 @@ async function retireLineageSession(config, sessionId, agent, input, reason) {
     });
     delivered = res.ok;
   } catch {}
-  await unlink2(`${SESSIONS_DIR}/${sessionId}.json`).catch(() => {});
+  await unlink3(`${SESSIONS_DIR}/${sessionId}.json`).catch(() => {});
   traceSession({
     event: "retire",
     sessionId,
@@ -4208,16 +4440,16 @@ var IGNORED_TTL_MS = 86400000;
 async function markIgnored(dir, ids, now) {
   for (const id of ids)
     await atomicWrite(`${dir}/${id}`, "", 384);
-  for (const name of await readdir3(dir).catch(() => [])) {
+  for (const name of await readdir4(dir).catch(() => [])) {
     const path = `${dir}/${name}`;
-    const s = await stat4(path).catch(() => null);
+    const s = await stat5(path).catch(() => null);
     if (s && now - s.mtimeMs > IGNORED_TTL_MS)
-      await unlink3(path).catch(() => {});
+      await unlink4(path).catch(() => {});
   }
 }
 async function isIgnored(dir, ids) {
   for (const id of ids)
-    if (await stat4(`${dir}/${id}`).then(() => true, () => false))
+    if (await stat5(`${dir}/${id}`).then(() => true, () => false))
       return true;
   return false;
 }
@@ -4385,7 +4617,7 @@ var clearStop = (sessionsDir, sessionId) => clearInterruptFlagAt(sessionsDir, se
 async function pruneStaleAntigravityStops(sessionsDir, now) {
   let names = [];
   try {
-    names = await readdir4(sessionsDir);
+    names = await readdir5(sessionsDir);
   } catch {
     return;
   }
@@ -4446,8 +4678,10 @@ async function runAntigravityHook(raw, eventName, deps = {}) {
     if (!kind || kind === "start")
       return;
     const sessionsDir = deps.sessionsDir ?? SESSIONS_DIR;
-    if (eventName === "PostInvocation" && deps.canTerminate !== false)
+    const sync = deps.canTerminate !== false;
+    if (eventName === "PostInvocation" && sync)
       await pruneStaleAntigravityStops(sessionsDir, now);
+    const stopPendingAtStop = sync && kind === "stop" && await antigravityStopRequested(sessionsDir, sessionId, now);
     if (eventName === "PostInvocation" && deps.canTerminate !== false && await antigravityStopRequested(sessionsDir, sessionId, now)) {
       await clearStop(sessionsDir, sessionId);
       await (deps.emit ?? emitStdout)(ANTIGRAVITY_TERMINATE);
@@ -4465,7 +4699,25 @@ async function runAntigravityHook(raw, eventName, deps = {}) {
     if (kind === "turn" && record && (record.op === "done" || record.lastEvent === "done")) {
       await clearStop(sessionsDir, sessionId);
     }
-    const plan = planAntigravity(kind, record, now);
+    let repliesChanged = false;
+    if (sync && eventName === "PreInvocation") {
+      await pruneStaleReplies(sessionsDir);
+      if (!await antigravityStopRequested(sessionsDir, sessionId, now)) {
+        const replies = await takeReplies(sessionsDir, sessionId, "d");
+        if (replies.length > 0) {
+          await (deps.emit ?? emitStdout)(JSON.stringify({ injectSteps: replies.map((r) => ({ userMessage: r.text })) }));
+          await clearNudge(sessionsDir, sessionId);
+          (deps.trace ?? traceSession)({ event: "reply", sessionId, agent: "antigravity", result: "injected", count: replies.length });
+          repliesChanged = true;
+        }
+      }
+    } else if (sync && eventName === "Stop" && kind === "stop" && !stopPendingAtStop && !(record && (record.op === "done" || record.lastEvent === "done")) && await hasQueuedReplies(sessionsDir, sessionId) && !await nudgedRecently(sessionsDir, sessionId, now)) {
+      await markNudged(sessionsDir, sessionId, now);
+      await (deps.emit ?? emitStdout)(JSON.stringify({ decision: "continue", reason: ANTIGRAVITY_REPLY_NUDGE }));
+      (deps.trace ?? traceSession)({ event: "reply", sessionId, agent: "antigravity", result: "continued" });
+      kind = "beat";
+    }
+    const plan = planAntigravity(kind, record, now) ?? (repliesChanged ? { op: "update", prio: 0, status: "working", turnStartedAt: record?.turnStartedAt } : null);
     if (!plan)
       return;
     const machine = config.machineName ?? hostname3().replace(/\.local$/, "");
@@ -4478,12 +4730,19 @@ async function runAntigravityHook(raw, eventName, deps = {}) {
     const model = antigravityModel(input) ?? record?.model;
     const startedAt = typeof record?.sessionStartedAt === "number" && Number.isFinite(record.sessionStartedAt) ? record.sessionStartedAt : now;
     let pid = record?.pid;
+    if (typeof pid === "number" && pid !== CURSOR_UNKNOWN_OWNER_PID && !pidAlive(pid)) {
+      const parent = antigravityHookParent(process.env);
+      if (parent !== undefined)
+        pid = parent;
+    }
     if (typeof pid !== "number") {
       pid = (deps.ownerPid ?? resolveOwnerPid2)() ?? CURSOR_UNKNOWN_OWNER_PID;
       if (pid !== CURSOR_UNKNOWN_OWNER_PID && !pidAlive(pid))
         pid = CURSOR_UNKNOWN_OWNER_PID;
     }
-    const envelope = await buildEnvelope({ session_id: sessionId, ...cwd ? { cwd } : {} }, machine, now, title, config.e2eKey, false, "antigravity", startedAt, plan.turnStartedAt, folder, model, { op: plan.op, prio: plan.prio, status: plan.status });
+    const surface = antigravitySurface(transcript) ?? antigravitySurface(input.artifactDirectoryPath);
+    const replies = await readReceipts(sessionsDir, sessionId);
+    const envelope = await buildEnvelope({ session_id: sessionId, ...cwd ? { cwd } : {} }, machine, now, title, config.e2eKey, false, "antigravity", startedAt, plan.turnStartedAt, folder, model, { op: plan.op, prio: plan.prio, status: plan.status }, undefined, undefined, undefined, undefined, undefined, { ...surface ? { surface } : {}, ...Object.keys(replies).length > 0 ? { replies } : {} });
     if (!envelope)
       return;
     const origin = record?.origin ?? { hook_event_name: eventName ?? kind, ...cwd ? { cwd } : {}, ppid: process.ppid };
@@ -4498,7 +4757,7 @@ async function runAntigravityHook(raw, eventName, deps = {}) {
 }
 
 // src/core/permission.ts
-import { readFile as readFile5, realpath, unlink as unlink4 } from "node:fs/promises";
+import { readFile as readFile6, realpath, unlink as unlink5 } from "node:fs/promises";
 import { appendFileSync as appendFileSync2, statSync as statSync2, truncateSync as truncateSync2 } from "node:fs";
 import { hostname as hostname4 } from "node:os";
 import { basename as basename6, isAbsolute as isAbsolute3, relative, resolve as resolve3 } from "node:path";
@@ -5243,7 +5502,7 @@ function createLoopbackAnswerPoller(config, requestId, deps) {
     if (deps.statePath === undefined)
       return;
     try {
-      return parseLanState(await readFile5(deps.statePath, "utf8"))?.port;
+      return parseLanState(await readFile6(deps.statePath, "utf8"))?.port;
     } catch {
       return;
     }
@@ -5778,7 +6037,7 @@ async function approvalsCommand(sub, deps = {}) {
     return 0;
   }
   if (sub === "on") {
-    await unlink4(path).catch(() => {});
+    await unlink5(path).catch(() => {});
     print("Remote approvals are ON for this computer — when a session is on your phone's Live Activity, its permission prompts are sent to the phone to Allow or Deny.");
     return 0;
   }

@@ -33,6 +33,9 @@ import { readFileSync, statSync, unlinkSync } from "node:fs";
 import { hostname } from "node:os";
 import { basename } from "node:path";
 import { Bytes, decryptBlob, encryptBlob } from "../core/crypto";
+import {
+  antigravitySurface, handleReplyCommand, readReceipts, ReplyCommandDeps, ReplyCommandResult,
+} from "../core/antigravity-inbox";
 import { adapterFor, AgentAdapter, allAdapters, antigravityRunStatus, codexAdapter, codexTurnActiveFromTail, CodexPlanPickerEvidence, DiscoveredSession } from "../core/adapter";
 import type { LocateTuiReason } from "../core/adapter";
 import { focusTerminalForPid } from "../core/terminal-focus";
@@ -219,6 +222,9 @@ export function classifySession(record: SessionRecord | null, now: number, isAli
     return isAlive(record.tuiPid) ? "keep" : "delete";
   }
   if (now - record.ts > SESSION_STALE_MS) return "stale"; // abandoned (24 h): POST a terminal end, then delete
+  // An idle `agy` CLI conversation outlives its process: a phone reply resumes it headless
+  // (core/antigravity-inbox.ts). Kept as a done row until the idle-done RETIRE net retires it.
+  if (record.agent === "antigravity" && isDoneState(record) && antigravitySurface(record.transcript) === "cli") return "keep";
   // A precision-correlated Codex TUI owns the session. Its app-server pid can live for the lifetime of
   // the app and is no evidence that this particular terminal still exists.
   const ownerPid = record.agent === "codex" && typeof record.tuiPid === "number" && Number.isFinite(record.tuiPid)
@@ -1115,13 +1121,19 @@ export interface CommandPayload {
   /** Per-command random string; the replay bound (a compromised worker can re-deliver an old blob
    *  under a fresh id, so the id set alone cannot stop replay). */
   nonce: string;
+  /** send-message / cancel-message only: the phone's message id. Validated by handleReplyCommand. */
+  mid?: unknown;
+  /** send-message only: the message. Validated by handleReplyCommand. */
+  text?: unknown;
 }
 
 /** The kinds this plugin will act on. The allow-list lives HERE, not on the worker, because the
  *  plugin is now the ONLY party that can read the blob — a blind relay cannot filter what it can't
  *  see. Anything else decrypts fine and is then rejected as bad-kind. */
 const INTERRUPT_COMMAND_KIND = "interrupt-session";
-const COMMAND_KINDS_ALLOWED = new Set(["focus-terminal", INTERRUPT_COMMAND_KIND]);
+/** Phone replies to an Antigravity session (core/antigravity-inbox.ts): `mid` + `text` ride sealed too. */
+const REPLY_COMMAND_KINDS = new Set(["send-message", "cancel-message"]);
+const COMMAND_KINDS_ALLOWED = new Set(["focus-terminal", INTERRUPT_COMMAND_KIND, ...REPLY_COMMAND_KINDS]);
 
 /** Cap on commands accepted from ONE response. A compromised/buggy worker must not be able to hand
  *  this daemon an unbounded work list; 8 is far above the real ceiling (a user taps one row). */
@@ -1189,7 +1201,10 @@ export function parseCommandPayload(plain: unknown): CommandPayload | undefined 
   if (typeof p.sessionId !== "string" || p.sessionId.length === 0) return undefined;
   if (typeof p.ts !== "number" || !Number.isFinite(p.ts)) return undefined;
   if (typeof p.nonce !== "string" || p.nonce.length === 0) return undefined;
-  return { kind: p.kind, sessionId: p.sessionId, ts: p.ts, nonce: p.nonce };
+  return {
+    kind: p.kind, sessionId: p.sessionId, ts: p.ts, nonce: p.nonce,
+    ...(p.mid !== undefined ? { mid: p.mid } : {}), ...(p.text !== undefined ? { text: p.text } : {}),
+  };
 }
 
 /** Is this authenticated command still live? False when the tap is older than the queue TTL (stale
@@ -1239,7 +1254,8 @@ export type FocusTraceResult =
                          // a timeout the interrupt may still land. Also what a thread NOT hosted by the
                          // shared daemon returns when the daemon is up (the server refuses an unknown thread)
   | "bridge-unavailable" // interrupt-session: no ready Codex bridge (daemon down, bridge parked or stopping)
-  | "no-turn";           // interrupt-session: the Codex record carries no active turn id
+  | "no-turn"            // interrupt-session: the Codex record carries no active turn id
+  | ReplyCommandResult;  // send-message / cancel-message (see core/antigravity-inbox.ts)
 
 /** The module's generic best-effort trace, with the same argv guard tracePicker uses: pure unit calls run
  *  inside `bun test` with the production HOME visible and must never pollute the user's live trace. Named
@@ -1280,6 +1296,12 @@ export interface DrainCommandsDeps {
   writeInterruptFlagFn?: (sessionId: string, now: number) => Promise<void>;
   /** Send turn/interrupt for an app-server agent. Defaults to the running loop's bridge supervisor. */
   interruptCodexTurnFn?: (threadId: string, turnId: string) => Promise<CodexTurnInterruptResult>;
+  /** Where Antigravity reply queues/receipts live. Test defaults never touch the real sessions dir. */
+  replySessionsDir?: string;
+  /** Overrides for the reply handler (tests: pid liveness, the resume spawn). */
+  replyDeps?: Partial<ReplyCommandDeps>;
+  /** Tell the phone about a session's new reply receipts. Defaults to resealing + posting its blob. */
+  publishRepliesFn?: (sessionId: string, dir: string) => Promise<void>;
   now?: () => number;
   trace?: (event: object) => void;
 }
@@ -1360,6 +1382,21 @@ async function interruptSession(
     return result === "sent" ? "interrupt-sent" : result === "unavailable" ? "bridge-unavailable" : "interrupt-failed";
   }
   return "unsupported";
+}
+
+/** Reseal a session's stored blob with its current reply receipts (the append-last `replies` key the
+ *  phone's reply bubbles read), store it on the record (so heartbeats and the LAN feed carry it too) and
+ *  post it. Best-effort: the next hook frame carries the receipts anyway. */
+async function publishReplyReceipts(config: Config, sessionId: string, dir: string): Promise<void> {
+  const path = `${dir}/${sessionId}.json`;
+  const record = await readRecordAt(path);
+  if (!record || typeof record.blob !== "string" || record.blob.length === 0) return;
+  const plain = await decryptBlob(config.e2eKey, record.blob) as Record<string, unknown>;
+  const blob = await encryptBlob(config.e2eKey, { ...plain, replies: await readReceipts(dir, sessionId) });
+  const next = { ...record, blob };
+  await atomicWrite(path, JSON.stringify(next), 0o600);
+  const envelope = buildHeartbeatEnvelope(sessionId, next, Date.now(), config.pairingId);
+  if (envelope) await postEvent(config, envelope);
 }
 
 /** Decrypt, VALIDATE, then execute every buffered command; returns how many actually focused
@@ -1468,8 +1505,9 @@ export async function drainCommands(config: Config, deps: DrainCommandsDeps = {}
           traceFocus(deps, { ...base, result: "unknown-session" as FocusTraceResult });
           continue;
         }
-        // 8. Two taps for the same target in one batch raise the window once.
-        const target = `${payload.kind}|${payload.sessionId}`;
+        // 8. Two taps for the same target in one batch raise the window once. (Two different MESSAGES
+        // to one session are two targets.)
+        const target = `${payload.kind}|${payload.sessionId}${REPLY_COMMAND_KINDS.has(payload.kind) ? `|${String(payload.mid)}` : ""}`;
         if (batchTargets.has(target)) {
           traceFocus(deps, { ...base, result: "duplicate" as FocusTraceResult, why: "batch" });
           continue;
@@ -1483,6 +1521,23 @@ export async function drainCommands(config: Config, deps: DrainCommandsDeps = {}
         if (payload.kind === INTERRUPT_COMMAND_KIND) {
           const result = await interruptSession(adapter, payload.sessionId, entry.rec, now, deps);
           traceFocus(deps, { ...base, agent, result });
+          continue;
+        }
+        if (REPLY_COMMAND_KINDS.has(payload.kind)) {
+          const dir = deps.replySessionsDir ?? (lanRunningUnderTest() ? undefined : SESSIONS_DIR);
+          if (agent !== "antigravity" || !dir) {
+            traceFocus(deps, { ...base, agent, result: "unsupported" as FocusTraceResult });
+            continue;
+          }
+          const result = await handleReplyCommand(
+            payload.kind as "send-message" | "cancel-message", payload.sessionId, entry.rec,
+            payload, { sessionsDir: dir, now, ...deps.replyDeps },
+          );
+          // Every outcome but a malformed one changed (or re-confirms) a receipt the phone waits on.
+          if (result !== "malformed") {
+            await (deps.publishRepliesFn ?? ((id: string, d: string) => publishReplyReceipts(config, id, d)))(payload.sessionId, dir).catch(() => {});
+          }
+          traceFocus(deps, { ...base, agent, result, mid: payload.mid });
           continue;
         }
         if (!adapter.locateTuiPid) {
