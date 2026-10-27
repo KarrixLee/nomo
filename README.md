@@ -454,11 +454,16 @@ the one event whose hook can block a tool.
   never sees a `decision` or `terminationBehavior` from Nomo. The work itself is capped at 4 seconds.
 - **A row starts at `PreInvocation`** (before a model call), not `SessionStart`. `PreInvocation`,
   `PostInvocation` and `PostToolUse` keep it *working* (they fire many times per turn and are
-  throttled); `Stop` marks it *done*. A turn that ends with no event (an interrupt can skip them) is
-  marked done after 30 quiet minutes, unless its transcript is still being written.
+  throttled); `Stop` marks it *done*. A turn that ends with **no** event — an interrupt, or a headless
+  run that auto-denies a permission and exits — is settled by the watchdog: the row ends as soon as
+  the process that ran the hook (`agy`, or the app's helper) is gone, and is marked done once
+  Antigravity's own conversation index records the run as idle after the row's last event. The
+  30-quiet-minute reap stays as the last resort.
 - **The title is Antigravity's own conversation title**, one field read with the system `sqlite3`,
-  read-only, from `~/.gemini/antigravity/conversation_summaries.db`; until it exists the row shows
-  the workspace folder. The model badge is the payload's `modelName`.
+  read-only, from `conversation_summaries.db` in `~/.gemini/antigravity` (desktop) or
+  `~/.gemini/antigravity-cli` (`agy`). It exists only after the first turn completes; until then the
+  row is named after the first prompt, read from the first line of that conversation's transcript.
+  The model badge is the payload's `modelName`.
 
 To remove it:
 
@@ -505,8 +510,10 @@ description is dropped before the command is.
   never registers `PreToolUse`, and its wrapper answers every event with `{}` before running anything,
   so it can neither stop a tool nor keep or end a turn. From each event's stdin it reads only
   `conversationId`, the first `workspacePaths` entry, `transcriptPath` (its modification time, for
-  the idle check) and `modelName` — never tool arguments. It reads one `title` column from
-  Antigravity's `conversation_summaries.db`, read-only. Remove it with
+  the idle check, and its first line for the first prompt) and `modelName` — never tool arguments.
+  From Antigravity's `conversation_summaries.db` it reads only the `title`, `status` and
+  `last_modified_time` of that one conversation, read-only; the conversation id must be UUID-shaped
+  before it is put into the query, and only the two Antigravity data dirs are ever read. Remove it with
   `node ~/.nomo/plugin/scripts/antigravity-install.mjs --uninstall` (deletes only that block).
 
 - **Your project's runtime config is never loaded into Nomo's hooks.** Hooks run with your project as

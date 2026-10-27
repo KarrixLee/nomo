@@ -22,7 +22,7 @@
 // (file contents, commands) is never read.
 
 import { hostname } from "node:os";
-import { antigravityChatTitle, antigravityModel } from "./adapter";
+import { antigravityChatTitle, antigravityFirstPrompt, antigravityModel } from "./adapter";
 import { CURSOR_UNKNOWN_OWNER_PID } from "./cursor";
 import { buildEnvelope, markDoneDeliveredAt, OpPlan, trackSessionAt } from "./hook";
 import {
@@ -92,7 +92,23 @@ export function antigravityOwnerPid(chain: { pid: number; command: string | unde
   return undefined;
 }
 
+/** The process that RAN the hook — antigravity-hook.sh exports its own $PPID as NOMO_HOOK_PPID before
+ *  run.sh adds layers. Verified 2026-10: under `agy` it IS the agy process; under the desktop app it is
+ *  a helper that dies when the app quits. Either way its death means the conversation's host is gone,
+ *  which is exactly what the watchdog's dead-owner `end` keys on. Undefined when absent, malformed,
+ *  pid ≤ 1, or not alive. */
+export function antigravityHookParent(env: Record<string, string | undefined>, alive: (pid: number) => boolean = pidAlive): number | undefined {
+  const raw = env.NOMO_HOOK_PPID;
+  if (!raw || !/^[0-9]{1,10}$/.test(raw)) return undefined;
+  const pid = Number(raw);
+  return pid > 1 && alive(pid) ? pid : undefined;
+}
+
+/** Owner: the hook's own parent (above); else — a hand run, or an install whose wrapper predates the
+ *  env var — the ancestor walk, which agrees with it for the CLI (the nearest agy). */
 function resolveOwnerPid(): number | undefined {
+  const parent = antigravityHookParent(process.env);
+  if (parent !== undefined) return parent;
   const pids = [process.ppid, ...pidAncestors(process.ppid)];
   return antigravityOwnerPid(pids.map((pid) => ({ pid, command: pidCommand(pid) })));
 }
@@ -145,7 +161,8 @@ export interface AntigravityHookDeps {
   stampPath?: string;
   now?: () => number;
   ownerPid?: () => number | undefined;
-  chatTitle?: (sessionId: string) => string | undefined;
+  chatTitle?: (sessionId: string, transcriptPath?: string) => string | undefined;
+  firstPrompt?: (transcriptPath: string | undefined) => Promise<string | undefined>;
   post?: (config: Config, envelope: Record<string, unknown>) => Promise<boolean>;
   ensureWatchdog?: () => void;
   trace?: (event: object) => void;
@@ -180,17 +197,18 @@ export async function runAntigravityHook(raw: string, eventName: string | undefi
     const machine = config.machineName ?? hostname().replace(/\.local$/, "");
     const cwd = antigravityCwd(input);
     const folder = folderIdentity(cwd, record);
-    // Antigravity's own conversation title (≤ 300 ms, read-only), else what the row already had. No
-    // event carries the user's prompt, so there is no first-prompt fallback; untitled rows show the folder.
-    const title = (deps.chatTitle ?? antigravityChatTitle)(sessionId) ?? record?.title;
+    const transcript = str(input.transcriptPath) ?? record?.transcript ?? "";
+    // Antigravity's own conversation title (≤ 300 ms, read-only; it exists only once the first turn
+    // completes), else what the row already had, else the first prompt off the transcript's first line.
+    const title = (deps.chatTitle ?? antigravityChatTitle)(sessionId, transcript || undefined) ?? record?.title
+      ?? await (deps.firstPrompt ?? antigravityFirstPrompt)(transcript || undefined);
     const model = antigravityModel(input) ?? record?.model;
     const startedAt = typeof record?.sessionStartedAt === "number" && Number.isFinite(record.sessionStartedAt)
       ? record.sessionStartedAt : now;
-    const transcript = str(input.transcriptPath) ?? record?.transcript ?? "";
 
     // The owner is looked up once, when the row is created; every later event reuses it.
-    // ponytail: no retry for an unknown owner (Cursor retries every 10 min) — add if the spike shows
-    // the app's hook ancestry reaches the main executable only sometimes.
+    // ponytail: no retry for an unknown owner (Cursor retries every 10 min) — the hook parent is
+    // always known through the wrapper, so pid 1 only follows a hand run.
     let pid = record?.pid;
     if (typeof pid !== "number") {
       pid = (deps.ownerPid ?? resolveOwnerPid)() ?? CURSOR_UNKNOWN_OWNER_PID;

@@ -2848,11 +2848,17 @@ function cursorChatTitle(sessionId, db = cursorStateDb(), env = process.env) {
   return sqliteOneTitle(db, "select case when json_type(cast(value as text),'$.name')='text' then json_extract(cast(value as text),'$.name') end" + ` from cursorDiskKV where key='composerData:${sessionId}'`, env);
 }
 function sqliteOneTitle(db, sql, env = process.env) {
+  const cleaned = sqliteOne(db, sql, env);
+  return cleaned ? truncateOnWord(cleaned) : undefined;
+}
+function sqliteOne(db, sql, env = process.env) {
+  if (!existsSync2(db))
+    return;
   try {
     const bin = process.platform === "darwin" && existsSync2("/usr/bin/sqlite3") ? "/usr/bin/sqlite3" : "sqlite3";
     const out = execFileSync2(bin, ["-init", devNull, "-batch", "-noheader", "-list", "-readonly", db, sql], { timeout: CURSOR_TITLE_TIMEOUT_MS, encoding: "utf8", maxBuffer: 65536, stdio: ["ignore", "pipe", "ignore"], env });
     const cleaned = out.replace(/\s+/g, " ").trim();
-    return cleaned ? truncateOnWord(cleaned) : undefined;
+    return cleaned || undefined;
   } catch {
     return;
   }
@@ -2877,17 +2883,63 @@ function antigravityModel(input) {
   const v = input.modelName;
   return typeof v === "string" && v.trim().length > 0 ? v.trim().slice(0, 80) : undefined;
 }
-function antigravitySummariesDb() {
-  return `${process.env.HOME ?? ""}/.gemini/antigravity/conversation_summaries.db`;
+function antigravityDataDirs() {
+  const home = process.env.HOME ?? "";
+  return [`${home}/.gemini/antigravity`, `${home}/.gemini/antigravity-cli`];
 }
-function antigravityChatTitle(sessionId, db = antigravitySummariesDb(), env = process.env) {
-  if (!/^[A-Za-z0-9_-]{1,128}$/.test(sessionId))
+function antigravityDataDirFor(transcriptPath) {
+  if (!transcriptPath)
     return;
-  return sqliteOneTitle(db, `select title from conversation_summaries where conversation_id='${sessionId}'`, env);
+  const i = transcriptPath.indexOf("/brain/");
+  const dir = i > 0 ? transcriptPath.slice(0, i) : undefined;
+  return dir !== undefined && antigravityDataDirs().includes(dir) ? dir : undefined;
+}
+var summariesDbs = (transcriptPath) => {
+  const dir = antigravityDataDirFor(transcriptPath);
+  return (dir ? [dir] : antigravityDataDirs()).map((d) => `${d}/conversation_summaries.db`);
+};
+var AG_SQL_SAFE_ID = /^[A-Za-z0-9-]{1,128}$/;
+function antigravityChatTitle(sessionId, transcriptPath, env = process.env) {
+  if (!AG_SQL_SAFE_ID.test(sessionId))
+    return;
+  for (const db of summariesDbs(transcriptPath)) {
+    const t = sqliteOneTitle(db, `select title from conversation_summaries where conversation_id='${sessionId}'`, env);
+    if (t)
+      return t;
+  }
+  return;
+}
+function antigravityRunStatus(sessionId, transcriptPath, env = process.env) {
+  if (!AG_SQL_SAFE_ID.test(sessionId))
+    return;
+  for (const db of summariesDbs(transcriptPath)) {
+    const row = sqliteOne(db, "select status || '|' || coalesce(cast((julianday(last_modified_time) - 2440587.5) * 86400000 as integer), '')" + ` from conversation_summaries where conversation_id='${sessionId}'`, env);
+    if (!row)
+      continue;
+    const [status, ms] = row.split("|");
+    const lastModifiedMs = ms ? Number(ms) : NaN;
+    return { status: status ?? "", ...Number.isFinite(lastModifiedMs) ? { lastModifiedMs } : {} };
+  }
+  return;
+}
+async function antigravityFirstPrompt(transcriptPath) {
+  if (!antigravityDataDirFor(transcriptPath))
+    return;
+  try {
+    const first = (await readPrefix(transcriptPath, 16384)).split(`
+`, 1)[0] ?? "";
+    const line = JSON.parse(first);
+    if (line.type !== "USER_INPUT" || typeof line.content !== "string")
+      return;
+    const m = /<USER_REQUEST>([\s\S]*?)<\/USER_REQUEST>/.exec(line.content);
+    return displayTitleFromUserText(m ? m[1] : line.content);
+  } catch {
+    return;
+  }
 }
 var antigravityAdapter = {
   kind: "antigravity",
-  title: async ({ sessionId }) => antigravityChatTitle(sessionId),
+  title: async ({ sessionId, transcriptPath }) => antigravityChatTitle(sessionId, transcriptPath) ?? await antigravityFirstPrompt(transcriptPath),
   model: async ({ input }) => antigravityModel(input),
   detectInterrupt: () => false,
   sessionsDir: () => `${process.env.HOME ?? ""}/.gemini/antigravity/conversations`,
@@ -9130,6 +9182,17 @@ function isClaudeIdleReapEligible(record, now, transcriptMtimeMs = transcriptMti
     return false;
   return idleReapAgeEligible(record, now, transcriptMtimeMs, record.awaitingPrompt === true ? CLAUDE_AWAITING_PROMPT_REAP_MS : CLAUDE_IDLE_REAP_MS);
 }
+var ANTIGRAVITY_SETTLE_GRACE_MS = 1e4;
+function antigravityRunSettled(sessionId, record, now, probe = antigravityRunStatus) {
+  if (recordAgent(record) !== "antigravity")
+    return false;
+  if (record.lastEvent !== "working" && record.lastEvent !== "sessionStart")
+    return false;
+  if (typeof record.ts !== "number" || now - record.ts < ANTIGRAVITY_SETTLE_GRACE_MS)
+    return false;
+  const run = probe(sessionId, typeof record.transcript === "string" && record.transcript ? record.transcript : undefined);
+  return run?.status === "CASCADE_RUN_STATUS_IDLE" && typeof run.lastModifiedMs === "number" && run.lastModifiedMs >= record.ts;
+}
 function idleReapAgeEligible(record, now, transcriptMtimeMs = transcriptMtimeMsDefault, idleMs = CLAUDE_IDLE_REAP_MS) {
   if (record.lastEvent !== "working" && record.lastEvent !== "sessionStart")
     return false;
@@ -9189,6 +9252,9 @@ async function correctIdleClaude(config, path, sessionId, record, now, deps = {}
         return "uncorrected";
       }
       record = { ...record, tuiPid };
+    } else if (agent === "antigravity") {
+      if (!isClaudeIdleReapEligible(record, now) && !antigravityRunSettled(sessionId, record, now, deps.antigravityRunStatus))
+        return "uncorrected";
     } else if (!isClaudeIdleReapEligible(record, now)) {
       return "uncorrected";
     }
@@ -10219,6 +10285,7 @@ if (__require.main == __require.module) {
   process.exit(0);
 }
 export {
+  ANTIGRAVITY_SETTLE_GRACE_MS,
   CLAUDE_AWAITING_PROMPT_REAP_MS,
   CLAUDE_IDLE_REAP_MAX_ATTEMPTS,
   CODEX_TUI_SESSION_START_SKEW_MS,
@@ -10240,6 +10307,7 @@ export {
   WAITING_HEARTBEAT_AFTER_MS,
   acceptLanAnswer,
   acceptLanCommand,
+  antigravityRunSettled,
   buildDoneEnvelope,
   buildEndEnvelope,
   buildHeartbeatEnvelope,

@@ -33,7 +33,7 @@ import { readFileSync, statSync, unlinkSync } from "node:fs";
 import { hostname } from "node:os";
 import { basename } from "node:path";
 import { Bytes, decryptBlob, encryptBlob } from "../core/crypto";
-import { adapterFor, AgentAdapter, allAdapters, codexAdapter, codexTurnActiveFromTail, CodexPlanPickerEvidence, DiscoveredSession } from "../core/adapter";
+import { adapterFor, AgentAdapter, allAdapters, antigravityRunStatus, codexAdapter, codexTurnActiveFromTail, CodexPlanPickerEvidence, DiscoveredSession } from "../core/adapter";
 import type { LocateTuiReason } from "../core/adapter";
 import { focusTerminalForPid } from "../core/terminal-focus";
 import type { FocusContext, FocusResult } from "../core/terminal-focus";
@@ -2401,6 +2401,27 @@ export function isClaudeIdleReapEligible(
     record.awaitingPrompt === true ? CLAUDE_AWAITING_PROMPT_REAP_MS : CLAUDE_IDLE_REAP_MS);
 }
 
+/** How long a working Antigravity row must be hook-quiet before its database status may settle it —
+ *  room for the turn's own Stop (which Antigravity writes alongside the IDLE status) to land first. */
+export const ANTIGRAVITY_SETTLE_GRACE_MS = 10_000;
+
+/** Has an Antigravity turn ended WITHOUT an event? A user interrupt skips PostInvocation and Stop, and a
+ *  headless auto-deny exits with neither (verified 2026-10, agy 1.4.8) — but Antigravity still records
+ *  the conversation as CASCADE_RUN_STATUS_IDLE. True iff the row is a working antigravity row, quiet for
+ *  ANTIGRAVITY_SETTLE_GRACE_MS, and the database says IDLE with a `last_modified_time` AT OR AFTER the
+ *  row's last event — an IDLE written before the current turn opened (the previous turn's) never
+ *  counts, and an unparseable time never counts either (the 30-min reap remains). A dead OWNER needs
+ *  no help here: classifySession already ends that row on the next sweep. */
+export function antigravityRunSettled(
+  sessionId: string, record: SessionRecord, now: number, probe: typeof antigravityRunStatus = antigravityRunStatus,
+): boolean {
+  if (recordAgent(record) !== "antigravity") return false;
+  if (record.lastEvent !== "working" && record.lastEvent !== "sessionStart") return false;
+  if (typeof record.ts !== "number" || now - record.ts < ANTIGRAVITY_SETTLE_GRACE_MS) return false;
+  const run = probe(sessionId, typeof record.transcript === "string" && record.transcript ? record.transcript : undefined);
+  return run?.status === "CASCADE_RUN_STATUS_IDLE" && typeof run.lastModifiedMs === "number" && run.lastModifiedMs >= record.ts;
+}
+
 /** Shared clock/transcript half of idle reaping. Agent ownership stays outside: Claude's process is
  * authoritative directly; Codex must first correlate a real TUI and prove the exact rollout idle.
  * `idleMs` is the silence both clocks are held to; only the Claude gate above ever shortens it. */
@@ -2434,6 +2455,8 @@ export interface IdleReapDeps extends DecisionHoldGateDeps {
   locateTuiPid?: (sessionId: string, record: SessionRecord) => Promise<number | undefined>;
   pidAlive?: (pid: number) => boolean;
   codexTurnActive?: (pid: number, transcriptPath: string) => Promise<boolean>;
+  /** Antigravity's recorded run state for a conversation (see antigravityRunSettled). */
+  antigravityRunStatus?: typeof antigravityRunStatus;
   /** Re-reads the record from disk immediately before the POST and before every write (see the
    *  stale-snapshot guard at the top of this file). Defaults to a real read. */
   readRecord?: (path: string) => Promise<SessionRecord | null>;
@@ -2524,6 +2547,10 @@ export async function correctIdleClaude(
         return "uncorrected";
       }
       record = { ...record, tuiPid };
+    } else if (agent === "antigravity") {
+      // The 30-min clock stays the last resort; Antigravity's own IDLE run status settles it sooner.
+      if (!isClaudeIdleReapEligible(record, now) &&
+          !antigravityRunSettled(sessionId, record, now, deps.antigravityRunStatus)) return "uncorrected";
     } else if (!isClaudeIdleReapEligible(record, now)) {
       return "uncorrected";
     }

@@ -6,5 +6,7 @@
 # then hands stdin to the bundle, whose output is discarded (it prints nothing anyway). Always exit 0.
 printf '{}\n'
 d=$(dirname "$0")
-"$d/run.sh" "$d/../dist/antigravity-status.mjs" "$1" >/dev/null 2>&1
+# $PPID is the process that ran this hook (agy, or the desktop app's helper) — handed on before run.sh
+# adds layers, so the bundle can record it as the session's owner.
+NOMO_HOOK_PPID=$PPID "$d/run.sh" "$d/../dist/antigravity-status.mjs" "$1" >/dev/null 2>&1
 exit 0

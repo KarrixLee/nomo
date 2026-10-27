@@ -2576,6 +2576,14 @@ export function cursorChatTitle(sessionId: string, db: string = cursorStateDb(),
  *  undefined on ANY failure. Shared by the Cursor and Antigravity title lookups; the caller has already
  *  validated anything it spliced into `sql`. */
 function sqliteOneTitle(db: string, sql: string, env: NodeJS.ProcessEnv = process.env): string | undefined {
+  const cleaned = sqliteOne(db, sql, env);
+  return cleaned ? truncateOnWord(cleaned) : undefined; // capped like every other generated title
+}
+
+/** The single cell of a read-only, time-boxed `sqlite3` query, whitespace-collapsed; undefined on ANY
+ *  failure, an empty result, or a database file that does not exist. */
+function sqliteOne(db: string, sql: string, env: NodeJS.ProcessEnv = process.env): string | undefined {
+  if (!existsSync(db)) return undefined;
   try {
     // `-init <null device>`: the CLI otherwise loads the user's rc (~/.sqliterc, or
     // $XDG_CONFIG_HOME/sqlite3/sqliterc), where `.headers on` / `.mode box` put the column header (the
@@ -2586,7 +2594,7 @@ function sqliteOneTitle(db: string, sql: string, env: NodeJS.ProcessEnv = proces
     const out = execFileSync(bin, ["-init", devNull, "-batch", "-noheader", "-list", "-readonly", db, sql],
       { timeout: CURSOR_TITLE_TIMEOUT_MS, encoding: "utf8", maxBuffer: 65_536, stdio: ["ignore", "pipe", "ignore"], env });
     const cleaned = out.replace(/\s+/g, " ").trim();
-    return cleaned ? truncateOnWord(cleaned) : undefined; // capped like every other generated title
+    return cleaned || undefined;
   } catch {
     return undefined;
   }
@@ -2638,18 +2646,79 @@ export function antigravityModel(input: Record<string, unknown>): string | undef
   return typeof v === "string" && v.trim().length > 0 ? v.trim().slice(0, 80) : undefined;
 }
 
-/** Antigravity's local conversation index (desktop app). */
-export function antigravitySummariesDb(): string {
-  return `${process.env.HOME ?? ""}/.gemini/antigravity/conversation_summaries.db`;
+/** Antigravity's per-surface data dirs: the desktop app/IDE writes ~/.gemini/antigravity, the `agy` CLI
+ *  ~/.gemini/antigravity-cli (verified 2026-10, app 2.25 / agy 1.4.8). Each holds its own
+ *  conversation_summaries.db and brain/<id>/… transcripts. */
+export function antigravityDataDirs(): string[] {
+  const home = process.env.HOME ?? "";
+  return [`${home}/.gemini/antigravity`, `${home}/.gemini/antigravity-cli`];
 }
 
+/** The data dir a session lives in, from its transcriptPath (`<dir>/brain/<id>/…`) — only when that is
+ *  one of the two known dirs, so a stdin-supplied path can never point the lookups anywhere else.
+ *  Undefined → the caller tries both. */
+export function antigravityDataDirFor(transcriptPath: string | undefined): string | undefined {
+  if (!transcriptPath) return undefined;
+  const i = transcriptPath.indexOf("/brain/");
+  const dir = i > 0 ? transcriptPath.slice(0, i) : undefined;
+  return dir !== undefined && antigravityDataDirs().includes(dir) ? dir : undefined;
+}
+
+const summariesDbs = (transcriptPath: string | undefined): string[] => {
+  const dir = antigravityDataDirFor(transcriptPath);
+  return (dir ? [dir] : antigravityDataDirs()).map((d) => `${d}/conversation_summaries.db`);
+};
+
+/** conversationId arrives on stdin and is spliced into SQL text (the sqlite3 CLI binds nothing):
+ *  UUID-shaped characters only. */
+const AG_SQL_SAFE_ID = /^[A-Za-z0-9-]{1,128}$/;
+
 /** The title Antigravity gave a conversation, or undefined. Table `conversation_summaries`, PRIMARY KEY
- *  `conversation_id`, column `title` (schema read off a real install, 2026-10). ASSUMPTION, unverified
- *  on a populated database: that key is the hooks' `conversationId`. A miss is just undefined — the
- *  phone then labels the row by its folder. One read-only PK probe, same 300 ms bound as Cursor. */
-export function antigravityChatTitle(sessionId: string, db: string = antigravitySummariesDb(), env: NodeJS.ProcessEnv = process.env): string | undefined {
-  if (!/^[A-Za-z0-9_-]{1,128}$/.test(sessionId)) return undefined;
-  return sqliteOneTitle(db, `select title from conversation_summaries where conversation_id='${sessionId}'`, env);
+ *  `conversation_id` (== the hooks' conversationId — verified on the desktop app), column `title`,
+ *  which appears only once the first turn completes. One read-only PK probe per database, 300 ms
+ *  bound each; the transcript picks the database, else both are tried. */
+export function antigravityChatTitle(sessionId: string, transcriptPath?: string, env: NodeJS.ProcessEnv = process.env): string | undefined {
+  if (!AG_SQL_SAFE_ID.test(sessionId)) return undefined;
+  for (const db of summariesDbs(transcriptPath)) {
+    const t = sqliteOneTitle(db, `select title from conversation_summaries where conversation_id='${sessionId}'`, env);
+    if (t) return t;
+  }
+  return undefined;
+}
+
+/** The run state Antigravity recorded for a conversation: `status` (e.g. CASCADE_RUN_STATUS_IDLE /
+ *  _RUNNING) and `last_modified_time` as epoch ms (undefined when unparseable). Antigravity writes IDLE
+ *  even when a turn ends with NO hook event (interrupt, headless auto-deny) — which is what the
+ *  watchdog's settle path keys on. Undefined on any failure. */
+export function antigravityRunStatus(
+  sessionId: string, transcriptPath?: string, env: NodeJS.ProcessEnv = process.env,
+): { status: string; lastModifiedMs?: number } | undefined {
+  if (!AG_SQL_SAFE_ID.test(sessionId)) return undefined;
+  for (const db of summariesDbs(transcriptPath)) {
+    const row = sqliteOne(db, "select status || '|' || coalesce(cast((julianday(last_modified_time) - 2440587.5) * 86400000 as integer), '')" +
+      ` from conversation_summaries where conversation_id='${sessionId}'`, env);
+    if (!row) continue;
+    const [status, ms] = row.split("|");
+    const lastModifiedMs = ms ? Number(ms) : NaN;
+    return { status: status ?? "", ...(Number.isFinite(lastModifiedMs) ? { lastModifiedMs } : {}) };
+  }
+  return undefined;
+}
+
+/** First-prompt fallback for a conversation the database has not titled yet: the transcript's first
+ *  line is `{"type":"USER_INPUT","content":"<USER_REQUEST>\n…\n</USER_REQUEST>…"}`. Only a transcript
+ *  inside a known data dir is read, and only its first 16 KB. */
+export async function antigravityFirstPrompt(transcriptPath: string | undefined): Promise<string | undefined> {
+  if (!antigravityDataDirFor(transcriptPath)) return undefined;
+  try {
+    const first = (await readPrefix(transcriptPath!, 16_384)).split("\n", 1)[0] ?? "";
+    const line = JSON.parse(first) as { type?: unknown; content?: unknown };
+    if (line.type !== "USER_INPUT" || typeof line.content !== "string") return undefined;
+    const m = /<USER_REQUEST>([\s\S]*?)<\/USER_REQUEST>/.exec(line.content);
+    return displayTitleFromUserText(m ? m[1]! : line.content);
+  } catch {
+    return undefined;
+  }
 }
 
 /** Antigravity (desktop app/IDE + `agy` CLI) — a READ-ONLY v1 driven by its hooks, Cursor's twin.
@@ -2658,7 +2727,8 @@ export function antigravityChatTitle(sessionId: string, db: string = antigravity
  *  `titleRepair` read Antigravity's own conversation title instead. NOT in `allAdapters`. */
 export const antigravityAdapter: AgentAdapter = {
   kind: "antigravity",
-  title: async ({ sessionId }) => antigravityChatTitle(sessionId),
+  title: async ({ sessionId, transcriptPath }) =>
+    antigravityChatTitle(sessionId, transcriptPath) ?? await antigravityFirstPrompt(transcriptPath),
   model: async ({ input }) => antigravityModel(input),
   detectInterrupt: () => false,
   // ponytail: status-cmd's NOT-FIRING detector is off (matches nothing) until the spike shows which

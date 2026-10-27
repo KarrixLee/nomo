@@ -6,14 +6,19 @@ import { cp, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test } from "bun:test";
-import { adapterFor, antigravityAdapter } from "./adapter";
+import { execFileSync } from "node:child_process";
 import {
-  ANTIGRAVITY_EVENTS, ANTIGRAVITY_KEEPALIVE_MS, antigravityCwd, antigravityEventKind, antigravityOwnerPid,
+  adapterFor, antigravityAdapter, antigravityChatTitle, antigravityDataDirFor, antigravityFirstPrompt, antigravityRunStatus,
+} from "./adapter";
+import {
+  ANTIGRAVITY_EVENTS, ANTIGRAVITY_KEEPALIVE_MS, antigravityCwd, antigravityEventKind, antigravityHookParent, antigravityOwnerPid,
   planAntigravity, runAntigravityHook,
 } from "./antigravity";
 import { decryptBlob } from "./crypto";
 import { Config, readRecord, SessionRecord } from "./shared";
-import { isClaudeIdleReapEligible } from "../entries/cc-watchdog";
+import {
+  ANTIGRAVITY_SETTLE_GRACE_MS, antigravityRunSettled, classifySession, correctIdleClaude, isClaudeIdleReapEligible,
+} from "../entries/cc-watchdog";
 import { createProcessHygiene, isolatedTestEnv } from "../test/process-hygiene";
 
 const { spawnTestProcess } = createProcessHygiene();
@@ -255,3 +260,142 @@ describe("antigravity-install.mjs", () => {
   });
 });
 
+
+// ── spike follow-ups (2026-10, app 2.25 / agy 1.4.8) ─────────────────────────────────────────────
+
+/** Run `fn` with HOME pointed at a temp dir (the adapter derives every Antigravity path from it). */
+async function withHome<T>(home: string, fn: () => Promise<T> | T): Promise<T> {
+  const prev = process.env.HOME;
+  process.env.HOME = home;
+  try { return await fn(); } finally { process.env.HOME = prev; }
+}
+
+/** A conversation_summaries.db in `<home>/.gemini/<dir>` with the columns the lookups read. */
+function summariesDb(home: string, dir: string, rows: { id: string; title: string; status: string; mod: string }[]): void {
+  const path = join(home, ".gemini", dir);
+  execFileSync("mkdir", ["-p", path]);
+  const sql = ["create table conversation_summaries (conversation_id text primary key, title text not null default '', status text not null default '', last_modified_time datetime not null);",
+    ...rows.map((r) => `insert into conversation_summaries values ('${r.id}','${r.title}','${r.status}','${r.mod}');`)].join("\n");
+  execFileSync("sqlite3", [join(path, "conversation_summaries.db"), sql]);
+}
+
+describe("FIX 1 — a turn that ends with no event is settled", () => {
+  const working = (over: Partial<SessionRecord> = {}) => rec({ ts: NOW - ANTIGRAVITY_SETTLE_GRACE_MS, ...over });
+  const idleAt = (ms: number) => () => ({ status: "CASCADE_RUN_STATUS_IDLE", lastModifiedMs: ms });
+
+  test("IDLE written after the row's last event settles it", () => {
+    expect(antigravityRunSettled(CONV, working(), NOW, idleAt(NOW - 5_000))).toBe(true);
+  });
+  test("…but not inside the grace, not RUNNING, not a previous turn's IDLE, not an unparseable time, not another agent", () => {
+    expect(antigravityRunSettled(CONV, working({ ts: NOW - 1_000 }), NOW, idleAt(NOW))).toBe(false);
+    expect(antigravityRunSettled(CONV, working(), NOW, () => ({ status: "CASCADE_RUN_STATUS_RUNNING", lastModifiedMs: NOW }))).toBe(false);
+    expect(antigravityRunSettled(CONV, working(), NOW, idleAt(NOW - ANTIGRAVITY_SETTLE_GRACE_MS - 1))).toBe(false);
+    expect(antigravityRunSettled(CONV, working(), NOW, () => ({ status: "CASCADE_RUN_STATUS_IDLE" }))).toBe(false);
+    expect(antigravityRunSettled(CONV, working(), NOW, () => undefined)).toBe(false);
+    expect(antigravityRunSettled(CONV, working({ agent: "cursor" }), NOW, idleAt(NOW))).toBe(false);
+    expect(antigravityRunSettled(CONV, working({ op: "done", lastEvent: "done" }), NOW, idleAt(NOW))).toBe(false);
+  });
+  test("the watchdog's reap posts done for it within seconds (the 30-min clock is not needed)", async () => {
+    const dir = await tmp();
+    const path = join(dir, `${CONV}.json`);
+    const r = working();
+    await writeFile(path, JSON.stringify(r));
+    const posts: object[] = [];
+    const out = await correctIdleClaude(CONFIG, path, CONV, r, NOW, {
+      post: async (b) => { posts.push(b); return "delivered"; }, antigravityRunStatus: idleAt(NOW - 1_000),
+    });
+    expect(out).toBe("corrected");
+    expect(posts[0]).toMatchObject({ op: "done" });
+    expect(JSON.parse(await readFile(path, "utf8"))).toMatchObject({ op: "done", lastEvent: "done" });
+    expect(await correctIdleClaude(CONFIG, path, CONV, working(), NOW, {
+      post: async () => "delivered", antigravityRunStatus: () => ({ status: "CASCADE_RUN_STATUS_RUNNING", lastModifiedMs: NOW }),
+    })).toBe("uncorrected");
+  });
+  test("a dead owner ends the row on the next sweep", () => {
+    expect(classifySession(rec({ pid: 4242, ts: NOW }), NOW, () => false)).toBe("end");
+    expect(classifySession(rec({ pid: 4242, ts: NOW }), NOW, () => true)).toBe("keep");
+  });
+  test("antigravityRunStatus parses status + last_modified_time from a real database", async () => {
+    const home = await tmp();
+    summariesDb(home, "antigravity-cli", [{ id: CONV, title: "", status: "CASCADE_RUN_STATUS_IDLE", mod: "2026-10-27 14:22:27.14367+00:00" }]);
+    const run = await withHome(home, () => antigravityRunStatus(CONV));
+    expect(run?.status).toBe("CASCADE_RUN_STATUS_IDLE");
+    expect(Math.abs(run!.lastModifiedMs! - Date.parse("2026-10-27T14:22:27.143Z"))).toBeLessThan(5); // julianday float rounding
+  });
+});
+
+describe("FIX 2 — the owner is the process that ran the hook", () => {
+  test("NOMO_HOOK_PPID: alive pid > 1 only", () => {
+    expect(antigravityHookParent({ NOMO_HOOK_PPID: "62636" }, () => true)).toBe(62636);
+    expect(antigravityHookParent({ NOMO_HOOK_PPID: "62636" }, () => false)).toBeUndefined();
+    for (const v of [undefined, "", "1", "0", "12x", "-5"]) expect(antigravityHookParent({ NOMO_HOOK_PPID: v }, () => true)).toBeUndefined();
+  });
+  test("the wrapper hands its own parent pid to the bundle, before run.sh adds layers", async () => {
+    const root = join(await tmp(), "plugin");
+    const seen = join(root, "seen");
+    await mkdir(join(root, "scripts"), { recursive: true });
+    await cp(join(PLUGIN, "scripts", "antigravity-hook.sh"), join(root, "scripts", "antigravity-hook.sh"));
+    await writeFile(join(root, "scripts", "run.sh"), `#!/bin/sh\nprintf '%s' "$NOMO_HOOK_PPID" > '${seen}'\n`, { mode: 0o755 });
+    const proc = spawnTestProcess({ cmd: [join(root, "scripts", "antigravity-hook.sh"), "Stop"], env: isolatedTestEnv(await tmp()), stdin: new Blob(["{}"]), stdout: "pipe" });
+    expect(await new Response(proc.stdout).text()).toBe("{}\n");
+    await proc.exited;
+    expect(Number(await readFile(seen, "utf8"))).toBe(process.pid); // this test process spawned the wrapper
+  });
+  test("the hook records that parent as the row's pid", async () => {
+    const dir = await tmp();
+    const sessionsDir = join(dir, "sessions");
+    await mkdir(sessionsDir, { recursive: true });
+    await runAntigravityHook(JSON.stringify({ conversationId: CONV }), "PreInvocation", {
+      config: CONFIG, sessionsDir, stampPath: join(dir, "s"), now: () => NOW, ownerPid: () => process.pid,
+      chatTitle: () => undefined, firstPrompt: async () => undefined, ensureWatchdog: () => {}, trace: () => {}, post: async () => true,
+    });
+    expect((await readRecord(CONV, sessionsDir))?.pid).toBe(process.pid);
+  });
+});
+
+describe("FIX 3 — CLI rows use the CLI's own data dir", () => {
+  test("data dir from transcriptPath, only for the two known dirs", async () => {
+    await withHome("/h", () => {
+      expect(antigravityDataDirFor(`/h/.gemini/antigravity-cli/brain/${CONV}/.system_generated/logs/transcript_full.jsonl`)).toBe("/h/.gemini/antigravity-cli");
+      expect(antigravityDataDirFor(`/h/.gemini/antigravity/brain/${CONV}/x.jsonl`)).toBe("/h/.gemini/antigravity");
+      expect(antigravityDataDirFor("/tmp/evil/brain/x")).toBeUndefined();
+      expect(antigravityDataDirFor(undefined)).toBeUndefined();
+    });
+  });
+  test("title from the CLI database via the transcript, or by trying both", async () => {
+    const home = await tmp();
+    summariesDb(home, "antigravity", [{ id: "d-1", title: "Create Hello.txt File", status: "CASCADE_RUN_STATUS_IDLE", mod: "2026-10-27 14:16:20+00:00" }]);
+    summariesDb(home, "antigravity-cli", [{ id: CONV, title: "Fix the CLI", status: "CASCADE_RUN_STATUS_IDLE", mod: "2026-10-27 14:16:20+00:00" }]);
+    await withHome(home, () => {
+      const cliTranscript = join(home, ".gemini", "antigravity-cli", "brain", CONV, "t.jsonl");
+      expect(antigravityChatTitle(CONV, cliTranscript)).toBe("Fix the CLI");
+      expect(antigravityChatTitle(CONV)).toBe("Fix the CLI");
+      expect(antigravityChatTitle("d-1")).toBe("Create Hello.txt File");
+      // The transcript pins ONE database: the desktop id is not in the CLI's.
+      expect(antigravityChatTitle("d-1", cliTranscript)).toBeUndefined();
+    });
+  });
+  test("ids that are not UUID-shaped never reach the SQL", async () => {
+    const home = await tmp();
+    summariesDb(home, "antigravity", [{ id: "a", title: "T", status: "CASCADE_RUN_STATUS_IDLE", mod: "2026-10-27 14:16:20+00:00" }]);
+    await withHome(home, () => {
+      for (const id of ["a' or '1'='1", "a;drop", "a.b", "a_b", ""]) {
+        expect(antigravityChatTitle(id)).toBeUndefined();
+        expect(antigravityRunStatus(id)).toBeUndefined();
+      }
+    });
+  });
+  test("first-prompt fallback from transcript_full.jsonl's USER_INPUT line", async () => {
+    const home = await tmp();
+    const dir = join(home, ".gemini", "antigravity-cli", "brain", CONV, ".system_generated", "logs");
+    await mkdir(dir, { recursive: true });
+    const t = join(dir, "transcript_full.jsonl");
+    await writeFile(t, `${JSON.stringify({ type: "USER_INPUT", content: "<USER_REQUEST>\nRename the parser module\n</USER_REQUEST>\n<ADDITIONAL_METADATA>x</ADDITIONAL_METADATA>" })}\n{"type":"PLANNER_RESPONSE"}\n`);
+    await withHome(home, async () => {
+      expect(await antigravityFirstPrompt(t)).toBe("Rename the parser module");
+      expect(await antigravityFirstPrompt("/tmp/elsewhere/brain/x.jsonl")).toBeUndefined();
+      // The adapter's title seam: no database title yet → the first prompt.
+      expect(await antigravityAdapter.title({ sessionId: CONV, prefix: "", input: {}, transcriptPath: t })).toBe("Rename the parser module");
+    });
+  });
+});
