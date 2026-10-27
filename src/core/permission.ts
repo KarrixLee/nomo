@@ -2070,6 +2070,8 @@ export async function runPermissionHook(
         body: JSON.stringify({ requestId }), signal: AbortSignal.timeout(3_000),
       }).then(() => {}, () => {});
       if (deps.abandoned?.()) {
+        // Settled as WORKING (the `finally`): the tool call was cancelled, not necessarily the turn.
+        settleAsWorking = true;
         trace({ event: "exit", reason: "abandoned", seq });
         await withdrawCard();
         return; // nobody reads stdout any more; the `finally` retires the hold marker

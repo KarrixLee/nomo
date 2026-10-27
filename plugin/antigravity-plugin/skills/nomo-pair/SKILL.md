@@ -7,8 +7,10 @@ description: Connect this computer to the Nomo iPhone app with a QR code (end-to
 one next step at a time. Never mention hooks, scripts, file paths, JSON, exit codes or the "watchdog".
 
 **Antigravity may ask before running the command below.** That is expected: tell the user
-"Antigravity will ask to run a Nomo command — please choose Allow." Never retry with extra
-permissions or flags, and never run anything else.
+"Antigravity will ask to run a Nomo command — please choose Allow." Run the command EXACTLY as
+written — one line, nothing added before or after it, no `cd`, no extra flags — and never run
+anything else. If it fails because a file is missing, tell the user: "Nomo's files seem to be
+missing — please run the Nomo installer again: bunx nomo-ai --antigravity" and stop.
 
 Connecting is two steps: **show the code**, then **wait for the phone**. Both reach the internet.
 One connection covers every coding app on this computer — if it is already connected (for example
@@ -27,7 +29,7 @@ Never repeat or make up a `nomo://` link or QR art. Only the short typed code ma
 ## Step 1a — browser way
 
 ```
-NOMOR="__NOMO_ROOT__"; NOMOS="$HOME/.config/cc-status/hook-shim.sh"; [ -x "$NOMOR/scripts/run.sh" ] && exec "$NOMOR/scripts/run.sh" "$NOMOR/dist/pair.mjs"; [ -x "$NOMOS" ] && exec "$NOMOS" pair; echo "Nomo could not find its files. Please run the Nomo installer again: bunx nomo-ai --antigravity"; exit 1
+{{nomo-command pair}}
 ```
 
 Reply, depending on what it printed:
@@ -42,7 +44,7 @@ Reply, depending on what it printed:
 ## Step 1b — typed-code way
 
 ```
-NOMOR="__NOMO_ROOT__"; NOMOS="$HOME/.config/cc-status/hook-shim.sh"; [ -x "$NOMOR/scripts/run.sh" ] && exec "$NOMOR/scripts/run.sh" "$NOMOR/dist/pair.mjs" --show-code; [ -x "$NOMOS" ] && exec "$NOMOS" pair --show-code; echo "Nomo could not find its files. Please run the Nomo installer again: bunx nomo-ai --antigravity"; exit 1
+{{nomo-command pair-code}}
 ```
 
 Reply: "📱 On your iPhone, open Nomo → Sessions → Pair a Computer → Enter code, and type:" followed
@@ -54,7 +56,7 @@ Run this exact command. It waits up to a minute for the scan; if Antigravity mov
 background, check its output until it finishes:
 
 ```
-NOMOR="__NOMO_ROOT__"; NOMOS="$HOME/.config/cc-status/hook-shim.sh"; [ -x "$NOMOR/scripts/run.sh" ] && exec "$NOMOR/scripts/run.sh" "$NOMOR/dist/pair.mjs" wait --timeout 60; [ -x "$NOMOS" ] && exec "$NOMOS" pair wait --timeout 60; echo "Nomo could not find its files. Please run the Nomo installer again: bunx nomo-ai --antigravity"; exit 1
+{{nomo-command pair-wait}}
 ```
 
 - "Paired with … ✓" or "Paired ✓" → "✅ Done! This computer is connected to your phone. Your

@@ -12,6 +12,7 @@ import {
   ANTIGRAVITY_HOLD_DEADLINE_MS, antigravityApprovalRequest, antigravityDecision, runAntigravityApproval,
 } from "./antigravity-approval";
 import { encryptBlob } from "./crypto";
+import { SAFE_SKILL_COMMANDS, skillCommand } from "../../plugin/scripts/antigravity-skill-command.mjs";
 import type { Config } from "./shared";
 import { createProcessHygiene, isolatedTestEnv } from "../test/process-hygiene";
 
@@ -88,6 +89,55 @@ describe("antigravityApprovalRequest — what reaches the phone", () => {
     expect(antigravityApprovalRequest(payload("write_file", { Path: `${WS}/secrets/k` }), r([], [], ["write_file(secrets/)"]))).toBeNull();
     expect(antigravityApprovalRequest(cmd("ls -la"), r([], [], ["command(rm)"]))).not.toBeNull(); // unrelated → phone
     expect(antigravityApprovalRequest(cmd("git push"), r(["command(git)"], ["command(git push)"]))).not.toBeNull(); // ask → phone
+  });
+
+  test("deny/ask is LOOSE: every evasion of `command(rm)` stays local, never reaches the phone", () => {
+    const deny = { allow: [], ask: [], deny: ["command(rm)"] };
+    const cmd = (c: string) => payload("run_command", { CommandLine: c });
+    for (const c of [
+      "rm -rf x", "FOO=1 rm -rf x", "sudo rm x", "sudo -u root rm x", "doas rm x", "env rm x", "env A=1 rm x",
+      "command rm x", "exec rm x", "nice -n 5 rm x", "time rm x", "nohup rm x &", "find . | xargs rm", "builtin rm x",
+      "/bin/rm x", "\\rm x", "'rm' x", "\"rm\" x", "ls && rm x", "ls || rm x", "ls; rm x", "ls | rm", "ls & rm x",
+      "ls\nrm x", "echo $(rm x)", "echo `rm x`", "(rm x)", "{ rm x; }",
+    ]) expect([c, antigravityApprovalRequest(cmd(c), deny)]).toEqual([c, null]);
+    // ask behaves the same way (routes to the phone, which is where ask belongs — never a passthrough)
+    expect(antigravityApprovalRequest(cmd("sudo rm x"), { allow: ["command(sudo)"], ask: ["command(rm)"], deny: [] })).not.toBeNull();
+    // unrelated commands still reach the phone
+    for (const c of ["ls -la", "git rm-cache", "echo removing"]) expect(antigravityApprovalRequest(cmd(c), deny)).not.toBeNull();
+  });
+
+  test("allow is STRICT: a plain prefix only — no separators, subshells, quotes, escapes or line breaks", () => {
+    const allow = { allow: ["command(git status)"], ask: [], deny: [] };
+    const cmd = (c: string) => payload("run_command", { CommandLine: c });
+    expect(antigravityApprovalRequest(cmd("git status -s"), allow)).toBeNull();
+    for (const c of ["git status; rm x", "git status && rm x", "git status | sh", "git status $(rm x)", "git status `x`",
+      "git status\nrm x", "git status\rrm", "git status 'x'", "git status \\x", "FOO=1 git status", "sudo git status"]) {
+      expect([c, antigravityApprovalRequest(cmd(c), allow)]).not.toEqual([c, null]);
+    }
+  });
+
+  test("regex: rules are compiled — only what they match is deferred; an uncompilable one matches everything", () => {
+    const cmd = (c: string) => payload("run_command", { CommandLine: c });
+    const r = (deny: string[]) => ({ allow: [], ask: [], deny });
+    expect(antigravityApprovalRequest(cmd("rm -rf x"), r(["command(regex:^rm\\b)"]))).toBeNull();
+    expect(antigravityApprovalRequest(cmd("ls"), r(["command(regex:^rm\\b)"]))).not.toBeNull(); // one regex no longer disables the phone
+    expect(antigravityApprovalRequest(cmd("ls"), r(["command(regex:([)"]))).toBeNull(); // bad regex → safe reading
+    expect(antigravityApprovalRequest(payload("write_file", { Path: `${WS}/.env` }), r(["write_file(regex:\\.env$)"]))).toBeNull();
+    expect(antigravityApprovalRequest(payload("write_file", { Path: `${WS}/a.ts` }), r(["write_file(regex:\\.env$)"]))).not.toBeNull();
+    // a regex ALLOW rule never passes anything through (the phone still asks)
+    expect(antigravityApprovalRequest(cmd("git status"), { allow: ["command(regex:.*)"], ask: [], deny: [] })).not.toBeNull();
+  });
+
+  test("writes into Nomo's own code or state always reach the phone, even under an allow rule", () => {
+    const allowAll = { allow: ["write_file(*)", "write_file(/)"], ask: [], deny: [] };
+    const dirs = ["/opt/nomo/plugin", "/Users/x/.config/cc-status"];
+    const w = (p: string) => antigravityApprovalRequest(payload("write_file", { Path: p }), allowAll, dirs);
+    expect(w("/opt/nomo/plugin/scripts/run.sh")).not.toBeNull();
+    expect(w("/opt/nomo/plugin/../plugin/dist/x.mjs")).not.toBeNull();
+    expect(w("/Users/x/.config/cc-status/config.json")).not.toBeNull();
+    expect(w(`${WS}/src/a.ts`)).toBeNull(); // ordinary allowed write: untouched
+    // a deny still wins over the protection (no opinion → Antigravity denies)
+    expect(antigravityApprovalRequest(payload("write_file", { Path: "/opt/nomo/plugin/x" }), { allow: [], ask: [], deny: ["write_file(/opt)"] }, dirs)).toBeNull();
   });
 
   test("end to end: a denied call answers the fallback (no opinion) and never starts the relay", async () => {
@@ -225,23 +275,71 @@ describe("runAntigravityApproval — through the shared relay", () => {
     expect(started).toBe(false);
   });
 
-  test("abandoned mid-hold (the agent killed our wrapper) → no decision, card withdrawn, row reported done", async () => {
+  test("abandoned mid-hold (the agent killed our wrapper) → no decision, card withdrawn, row settled WORKING", async () => {
     const { fn, calls } = worker(true, [{ status: "pending" }]);
     let checks = 0;
-    const settled: string[] = [];
+    const patches: Record<string, unknown>[] = [];
     const out = await runAntigravityApproval(JSON.stringify(RUN), {
-      rules: () => NO_RULES, hold: hold({ fetchFn: fn }) as never, stopRequested: async () => false,
-      abandoned: () => ++checks >= 2, settleDone: async (raw) => { settled.push(raw); },
+      rules: () => NO_RULES, stopRequested: async () => false, abandoned: () => ++checks >= 2,
+      hold: hold({
+        fetchFn: fn, writeHoldFn: async () => {},
+        clearHoldFn: async (_id: string, _pid: number, settle?: () => Promise<void>) => { await settle?.(); },
+        settleHoldRecordFn: async (_id: string, patch: Record<string, unknown>) => { patches.push(patch); },
+      }) as never,
     });
     expect(out).toBe(ANTIGRAVITY_FALLBACK); // printed to nobody; the wrapper is gone
     expect(calls).toContain("POST /v1/cc/decision/resolve");
-    expect(settled).toEqual([JSON.stringify(RUN)]);
+    expect(patches.at(-1)).toMatchObject({ lastEvent: "working", op: "update", prio: 0 }); // not done: the turn may go on
   });
 
   test("malformed input / a throwing relay → allow", async () => {
     for (const raw of ["", "garbage", "[]", "null"]) expect(await runAntigravityApproval(raw)).toBe(ANTIGRAVITY_FALLBACK);
     const out = await runAntigravityApproval(JSON.stringify(RUN), {
       rules: () => NO_RULES, run: (async () => { throw new Error("boom"); }) as never,
+    });
+    expect(out).toBe(ANTIGRAVITY_FALLBACK);
+  });
+});
+
+describe("Nomo's own /nomo-* commands never become phone cards", () => {
+  const ROOT = "/opt/nomo/plugin";
+  const shell = (c: string) => JSON.stringify(payload("run_command", { CommandLine: c }));
+  const run = (c: string, paired = true) => {
+    let held = false;
+    return runAntigravityApproval(shell(c), {
+      rules: () => NO_RULES, stopRequested: async () => false, pluginRoot: ROOT,
+      hold: { loadConfigFn: async () => (paired ? CONFIG : null) } as never,
+      run: (async () => { held = true; }) as never,
+    }).then((out) => ({ out, held }));
+  };
+
+  test("the safe set auto-approves byte for byte (one trailing newline forgiven), only when paired", async () => {
+    for (const key of SAFE_SKILL_COMMANDS) {
+      const c = skillCommand(ROOT, key);
+      expect([key, await run(c)]).toEqual([key, { out: '{"decision":"auto_approve"}', held: false }]);
+      expect((await run(`${c}\n`)).out).toBe('{"decision":"auto_approve"}');
+      expect((await run(c, false)).out).toBe(ANTIGRAVITY_FALLBACK); // unpaired: Antigravity's own prompt
+    }
+    expect([...SAFE_SKILL_COMMANDS].sort()).toEqual(["approvals-on", "approvals-status", "pair", "pair-wait", "reset", "status", "status-verbose"]);
+  });
+
+  test("pausing approvals, unpairing and the typed pairing code still ask the phone", async () => {
+    for (const key of ["approvals-off", "unpair", "pair-code"]) expect([key, (await run(skillCommand(ROOT, key))).held]).toEqual([key, true]);
+  });
+
+  test("near misses go to the phone", async () => {
+    const c = skillCommand(ROOT, "status");
+    for (const bad of [
+      ` ${c}`, `${c} `, `${c}  `, c.replace(" ", "  "), `${c} && rm -rf ~`, `${c}; rm x`, `cd /tmp && ${c}`,
+      c.replaceAll("'", '"'), c.replaceAll("'", ""), `${c}\n\n`, `${c}\r\n`, `${c}\nrm x`, `${c} --verbose`,
+      skillCommand("/opt/nomo/plugin2", "status"), skillCommand("/opt/nomo", "status"),
+    ]) expect([bad, (await run(bad)).held]).toEqual([bad, true]);
+  });
+
+  test("a local deny rule still wins over a Nomo command", async () => {
+    const out = await runAntigravityApproval(shell(skillCommand(ROOT, "status")), {
+      rules: () => ({ allow: [], ask: [], deny: ["command(regex:.*)"] }), stopRequested: async () => false, pluginRoot: ROOT,
+      hold: { loadConfigFn: async () => CONFIG } as never,
     });
     expect(out).toBe(ANTIGRAVITY_FALLBACK);
   });
@@ -323,7 +421,7 @@ describe("antigravity-approve.sh — always exactly one valid decision, exit 0",
     }
   });
 
-  test("the wrapper SIGKILLed mid-hold (real bundle): the bundle withdraws the card, reports done, exits within one poll", async () => {
+  test("the wrapper SIGKILLed mid-hold (real bundle): the bundle withdraws the card, settles the row working, exits within one poll", async () => {
     const t = await tmp();
     const home = join(t, "home");
     const events: string[] = [];
@@ -357,9 +455,15 @@ describe("antigravity-approve.sh — always exactly one valid decision, exit 0",
       const kids = execFileSync("pgrep", ["-P", String(proc.pid)], { encoding: "utf8" }).trim().split("\n").map(Number);
       process.kill(proc.pid, "SIGKILL"); // no trap runs
       const killedAt = Date.now();
-      for (let i = 0; i < 160 && !events.includes("event:done"); i++) await Bun.sleep(50);
+      for (let i = 0; i < 160 && !events.includes("POST /v1/cc/decision/resolve"); i++) await Bun.sleep(50);
       expect(events).toContain("POST /v1/cc/decision/resolve");
-      expect(events).toContain("event:done");
+      expect(events).not.toContain("event:done"); // a cancelled tool is not a finished turn
+      for (let i = 0; i < 40; i++) {
+        const r = JSON.parse(await readFile(join(cc, "sessions", `${CONV}.json`), "utf8"));
+        if (r.lastEvent === "working" && r.prio === 0) break;
+        await Bun.sleep(50);
+      }
+      expect(JSON.parse(await readFile(join(cc, "sessions", `${CONV}.json`), "utf8"))).toMatchObject({ lastEvent: "working", prio: 0 });
       for (let i = 0; i < 40 && kids.some((k) => { try { process.kill(k, 0); return true; } catch { return false; } }); i++) await Bun.sleep(100);
       for (const k of kids) expect(() => process.kill(k, 0)).toThrow(); // bundle exited, guard too
       expect(Date.now() - killedAt).toBeLessThan(8_000); // one ~3 s poll + the withdraw + the done POST

@@ -482,7 +482,8 @@ A `nomo` folder without that marker is someone else's: the installer refuses and
   `PostInvocation` consumes it and ends the turn there — so the turn stops when the current model call
   (or tool) finishes — and the row turns *done*. While the flag is up, a shell command or file write
   waiting on the phone, or about to, is denied with "Stopped from phone". A flag not acted on within
-  10 minutes, or left when the turn ended on its own, is dropped and never touches a later turn.
+  an hour, or left when the turn ended on its own, is dropped and never touches a later turn.
+  Antigravity's flags have their own name, so Claude Code's never slow Antigravity down.
   Nomo never signals the `agy` process (that would exit the CLI).
 - **Phone approvals (`PreToolUse`).** For a shell command or a file write in a session your phone is
   showing, the tool waits while the phone shows Allow / Deny / Deny with note. Allow answers
@@ -491,12 +492,17 @@ A `nomo` folder without that marker is someone else's: the installer refuses and
   the request expiring — answers `allow`, which means "no opinion": Antigravity applies its own
   permission settings and shows its own prompt exactly as without Nomo. Your own `permissions` rules
   (the CLI's `~/.gemini/antigravity-cli/settings.json`, read-only) come first, in Antigravity's order
-  Deny > Ask > Allow: anything a `deny` rule may match never reaches the phone — Antigravity denies it
-  itself, and a phone Allow can never override it — and a command or path a plain-prefix `allow` rule
-  covers (and no `ask` rule touches) is passed straight through. Reads, searches and every other tool
-  never reach Nomo at all. "Always allow" is not offered for Antigravity. If Antigravity cancels the hook
-  while it waits (you interrupted the turn at the computer), the card is withdrawn from the phone and
-  the row turns *done* within a few seconds; nothing is left running.
+  Deny > Ask > Allow. Deny and ask rules are read *loosely*: a command rule matches when its command
+  appears anywhere in the line as something that runs — after `sudo`/`env`/`xargs` and the like, as
+  `/bin/rm`, quoted, behind `FOO=1`, after `;`/`&&`/`|`, or inside `$(…)` — and a `regex:` rule is
+  compiled (one that doesn't compile matches everything). Anything a deny rule may match never reaches
+  the phone — Antigravity denies it itself, and a phone Allow can never override it. Allow rules are
+  read *strictly*: only a single plain command (no separators, subshells, quotes or line breaks) whose
+  words start with the rule's is passed straight through, and never a write into Nomo's own checkout or
+  its state folder. Reads, searches and every other tool never reach Nomo at all. "Always allow" is
+  not offered for Antigravity. If Antigravity cancels the hook while it waits (you stopped the tool at
+  the computer), the card is withdrawn from the phone within a few seconds and the row goes back to
+  *working* — the turn's own end (or the idle check) marks it done; nothing is left running.
 - **A row starts at `PreInvocation`** (before a model call), not `SessionStart`. `PreInvocation`,
   `PostInvocation` and `PostToolUse` keep it *working* (they fire many times per turn and are
   throttled); `Stop` marks it *done*. A turn that ends with **no** event — an interrupt, or a headless
@@ -585,8 +591,19 @@ description is dropped before the command is.
   before it is put into the query, and only the two Antigravity data dirs are ever read. Remove it with
   `node ~/.nomo/plugin/scripts/antigravity-install.mjs --uninstall` (deletes only that block and the
   marked plugin folder). The `/nomo-*` skills run only Nomo's own local commands (pair, status, the
-  approvals switch, reset, unpair) from the checkout, each behind Antigravity's own run-command
-  prompt; they never print the pairing link or QR secret.
+  approvals switch, reset, unpair) from the checkout; they never print the pairing link or QR secret.
+  So that `/nomo-status` doesn't put a card on your phone, the approval hook answers `auto_approve`
+  — on a paired computer, after the deny rules and a pending Stop — for exactly seven command lines,
+  rebuilt in code from the same template the installer writes the skills from (never read from the
+  skill files): status (plain and verbose), approvals status, approvals **on**, reset, pair, and the
+  pair wait. The match is byte for byte (one trailing newline forgiven; any other difference, a second
+  line, a `cd`, `&& …` or other quoting goes to the phone). Approvals **off**, unpair and the typed
+  pairing code still ask your phone.
+
+- **`NOMO_CC_DIR` (testing only) moves Nomo's state folder** (`~/.config/cc-status`: pairing, session
+  rows, flags) for every hook and command that inherits it. End-to-end tests use it to run a real agent
+  against a throwaway pairing; real installs never set it, and anything that can set your agent's
+  environment could already change `HOME`.
 
 - **Your project's runtime config is never loaded into Nomo's hooks.** Hooks run with your project as
   their working folder, and bun reads `bunfig.toml` (whose `preload` runs code) and `.env` files from

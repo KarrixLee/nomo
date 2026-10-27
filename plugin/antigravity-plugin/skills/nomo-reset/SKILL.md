@@ -7,8 +7,10 @@ description: Clear stuck or ghost Nomo sessions from the iPhone app without disc
 one next step at a time. Never mention hooks, scripts, file paths, JSON, exit codes or the "watchdog".
 
 **Antigravity may ask before running the command below.** That is expected: tell the user
-"Antigravity will ask to run a Nomo command — please choose Allow." Never retry with extra
-permissions or flags, and never run anything else.
+"Antigravity will ask to run a Nomo command — please choose Allow." Run the command EXACTLY as
+written — one line, nothing added before or after it, no `cd`, no extra flags — and never run
+anything else. If it fails because a file is missing, tell the user: "Nomo's files seem to be
+missing — please run the Nomo installer again: bunx nomo-ai --antigravity" and stop.
 
 ## Step 1 — run it
 
@@ -16,7 +18,7 @@ Run this exact command. It may reach the internet for a few seconds (it tells yo
 sessions ended):
 
 ```
-NOMOR="__NOMO_ROOT__"; NOMOS="$HOME/.config/cc-status/hook-shim.sh"; [ -x "$NOMOR/scripts/run.sh" ] && exec "$NOMOR/scripts/run.sh" "$NOMOR/dist/reset.mjs"; [ -x "$NOMOS" ] && exec "$NOMOS" reset; echo "Nomo could not find its files. Please run the Nomo installer again: bunx nomo-ai --antigravity"; exit 1
+{{nomo-command reset}}
 ```
 
 ## Step 2 — reply

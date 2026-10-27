@@ -2264,6 +2264,9 @@ export interface AgentAdapter {
    *   "app-server" — the watchdog sends turn/interrupt through the Codex app-server bridge.
    *  The phone mirrors this as CCInterrupt.canInterrupt. */
   interrupt?: "hook-flag" | "app-server";
+  /** The hook flag's file suffix, when it is not the shared `.interrupt` (Antigravity's wrapper globs
+   *  for its own flags only). */
+  interruptFlagSuffix?: string;
 }
 
 export const claudeAdapter: AgentAdapter = {
@@ -2757,6 +2760,7 @@ export const antigravityAdapter: AgentAdapter = {
   // Phone Stop: the watchdog stamps the shared flag; the PostInvocation hook terminates the turn
   // (core/antigravity.ts) and the approval hook denies a routed/held tool (core/antigravity-approval.ts).
   interrupt: "hook-flag",
+  interruptFlagSuffix: ".agy-interrupt", // ANTIGRAVITY_INTERRUPT_SUFFIX in core/antigravity.ts
 };
 
 /** The adapter for an agent kind THIS BUILD DOES NOT KNOW — a record stamped by a newer peer install

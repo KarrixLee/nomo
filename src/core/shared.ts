@@ -118,8 +118,10 @@ export function appendCodexBridgeMarker(dbg: string | undefined, down: boolean):
   return Array.from(next).length <= DBG_BLOB_TEXT_MAX_CHARS ? next : bare;
 }
 
-/** Root of the on-disk state: config.json, the per-session pid files, the watchdog pidfile. */
-export const CC_DIR = `${process.env.HOME}/.config/cc-status`;
+/** Root of the on-disk state: config.json, the per-session pid files, the watchdog pidfile.
+ *  `NOMO_CC_DIR` moves ALL of it (end-to-end tests run a real agent against a throwaway state dir; the
+ *  shell scripts honour the same variable). Unset — every real install — it is ~/.config/cc-status. */
+export const CC_DIR = process.env.NOMO_CC_DIR || `${process.env.HOME}/.config/cc-status`;
 /** Append-only, local-only session lifecycle/state-machine trace next to config.json. */
 export const SESSION_TRACE_PATH = `${CC_DIR}/session-trace.log`;
 const SESSION_TRACE_MAX_BYTES = 256 * 1024;
@@ -2147,14 +2149,16 @@ export const INTERRUPT_FLAG_SUFFIX = ".interrupt";
  *  pruneStaleDecisionHolds if the sessions dir ever needs to be tidy. */
 export const INTERRUPT_FLAG_MAX_AGE_MS = 3_600_000;
 
-export function interruptFlagFileName(sessionId: string): string {
-  return `${sessionId}${INTERRUPT_FLAG_SUFFIX}`;
+export function interruptFlagFileName(sessionId: string, suffix: string = INTERRUPT_FLAG_SUFFIX): string {
+  return `${sessionId}${suffix}`;
 }
 
 /** Best-effort, like every other write in this file. */
-export async function writeInterruptFlagAt(sessionsDir: string, sessionId: string, now: number): Promise<void> {
+export async function writeInterruptFlagAt(
+  sessionsDir: string, sessionId: string, now: number, suffix: string = INTERRUPT_FLAG_SUFFIX,
+): Promise<void> {
   try {
-    await atomicWrite(`${sessionsDir}/${interruptFlagFileName(sessionId)}`, JSON.stringify({ at: now }), 0o600);
+    await atomicWrite(`${sessionsDir}/${interruptFlagFileName(sessionId, suffix)}`, JSON.stringify({ at: now }), 0o600);
   } catch {
     // A flag that failed to land is an interrupt that did not happen; the phone's row stays Running.
   }
@@ -2164,10 +2168,11 @@ export async function writeInterruptFlagAt(sessionsDir: string, sessionId: strin
  *  call already in the same assistant message, and each of those must be denied too. */
 export async function interruptFlagSetAt(
   sessionsDir: string, sessionId: string, now: number, maxAgeMs: number = INTERRUPT_FLAG_MAX_AGE_MS,
+  suffix: string = INTERRUPT_FLAG_SUFFIX,
 ): Promise<boolean> {
   try {
     const flag = JSON.parse(
-      await readFile(`${sessionsDir}/${interruptFlagFileName(sessionId)}`, "utf8"),
+      await readFile(`${sessionsDir}/${interruptFlagFileName(sessionId, suffix)}`, "utf8"),
     ) as { at?: unknown };
     return typeof flag.at === "number" && now - flag.at <= maxAgeMs;
   } catch {
@@ -2175,8 +2180,10 @@ export async function interruptFlagSetAt(
   }
 }
 
-export async function clearInterruptFlagAt(sessionsDir: string, sessionId: string): Promise<void> {
-  await unlink(`${sessionsDir}/${interruptFlagFileName(sessionId)}`).catch(() => {});
+export async function clearInterruptFlagAt(
+  sessionsDir: string, sessionId: string, suffix: string = INTERRUPT_FLAG_SUFFIX,
+): Promise<void> {
+  await unlink(`${sessionsDir}/${interruptFlagFileName(sessionId, suffix)}`).catch(() => {});
 }
 
 export async function settleDecisionHoldRecord(

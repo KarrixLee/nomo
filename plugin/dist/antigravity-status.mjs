@@ -2,6 +2,7 @@ import { createRequire } from "node:module";
 var __require = /* @__PURE__ */ createRequire(import.meta.url);
 
 // src/core/antigravity.ts
+import { readdir as readdir4 } from "node:fs/promises";
 import { hostname as hostname3 } from "node:os";
 import { basename as basename5 } from "node:path";
 
@@ -131,7 +132,7 @@ function appendCodexBridgeMarker(dbg, down) {
   const next = `${bare} ${CODEX_BRIDGE_DOWN_MARKER}`;
   return Array.from(next).length <= DBG_BLOB_TEXT_MAX_CHARS ? next : bare;
 }
-var CC_DIR = `${process.env.HOME}/.config/cc-status`;
+var CC_DIR = process.env.NOMO_CC_DIR || `${process.env.HOME}/.config/cc-status`;
 var SESSION_TRACE_PATH = `${CC_DIR}/session-trace.log`;
 var SESSION_TRACE_MAX_BYTES = 256 * 1024;
 var sessionTraceRotated = false;
@@ -939,24 +940,24 @@ async function clearDecisionHold(sessionId, pid, beforeUnlink, holdId) {
 }
 var INTERRUPT_FLAG_SUFFIX = ".interrupt";
 var INTERRUPT_FLAG_MAX_AGE_MS = 3600000;
-function interruptFlagFileName(sessionId) {
-  return `${sessionId}${INTERRUPT_FLAG_SUFFIX}`;
+function interruptFlagFileName(sessionId, suffix = INTERRUPT_FLAG_SUFFIX) {
+  return `${sessionId}${suffix}`;
 }
-async function writeInterruptFlagAt(sessionsDir, sessionId, now) {
+async function writeInterruptFlagAt(sessionsDir, sessionId, now, suffix = INTERRUPT_FLAG_SUFFIX) {
   try {
-    await atomicWrite(`${sessionsDir}/${interruptFlagFileName(sessionId)}`, JSON.stringify({ at: now }), 384);
+    await atomicWrite(`${sessionsDir}/${interruptFlagFileName(sessionId, suffix)}`, JSON.stringify({ at: now }), 384);
   } catch {}
 }
-async function interruptFlagSetAt(sessionsDir, sessionId, now, maxAgeMs = INTERRUPT_FLAG_MAX_AGE_MS) {
+async function interruptFlagSetAt(sessionsDir, sessionId, now, maxAgeMs = INTERRUPT_FLAG_MAX_AGE_MS, suffix = INTERRUPT_FLAG_SUFFIX) {
   try {
-    const flag = JSON.parse(await readFile(`${sessionsDir}/${interruptFlagFileName(sessionId)}`, "utf8"));
+    const flag = JSON.parse(await readFile(`${sessionsDir}/${interruptFlagFileName(sessionId, suffix)}`, "utf8"));
     return typeof flag.at === "number" && now - flag.at <= maxAgeMs;
   } catch {
     return false;
   }
 }
-async function clearInterruptFlagAt(sessionsDir, sessionId) {
-  await unlink(`${sessionsDir}/${interruptFlagFileName(sessionId)}`).catch(() => {});
+async function clearInterruptFlagAt(sessionsDir, sessionId, suffix = INTERRUPT_FLAG_SUFFIX) {
+  await unlink(`${sessionsDir}/${interruptFlagFileName(sessionId, suffix)}`).catch(() => {});
 }
 async function settleDecisionHoldRecord(sessionId, patch) {
   return settleDecisionHoldRecordAt(SESSIONS_DIR, sessionId, patch);
@@ -2959,7 +2960,8 @@ var antigravityAdapter = {
   },
   toolDetail: {},
   blobAgentFields: { agent: "antigravity" },
-  interrupt: "hook-flag"
+  interrupt: "hook-flag",
+  interruptFlagSuffix: ".agy-interrupt"
 };
 function unknownAgentAdapter(kind) {
   return {
@@ -4347,9 +4349,26 @@ function resolveOwnerPid2() {
 }
 var ANTIGRAVITY_TERMINATE = '{"terminationBehavior":"terminate"}';
 var ANTIGRAVITY_STOP_REASON = "Stopped from phone";
-var ANTIGRAVITY_INTERRUPT_MAX_AGE_MS = 10 * 60000;
+var ANTIGRAVITY_INTERRUPT_MAX_AGE_MS = 60 * 60000;
+var ANTIGRAVITY_INTERRUPT_SUFFIX = ".agy-interrupt";
 function antigravityStopRequested(sessionsDir, sessionId, now) {
-  return interruptFlagSetAt(sessionsDir, sessionId, now, ANTIGRAVITY_INTERRUPT_MAX_AGE_MS);
+  return interruptFlagSetAt(sessionsDir, sessionId, now, ANTIGRAVITY_INTERRUPT_MAX_AGE_MS, ANTIGRAVITY_INTERRUPT_SUFFIX);
+}
+var clearStop = (sessionsDir, sessionId) => clearInterruptFlagAt(sessionsDir, sessionId, ANTIGRAVITY_INTERRUPT_SUFFIX);
+async function pruneStaleAntigravityStops(sessionsDir, now) {
+  let names = [];
+  try {
+    names = await readdir4(sessionsDir);
+  } catch {
+    return;
+  }
+  for (const name of names) {
+    if (!name.endsWith(ANTIGRAVITY_INTERRUPT_SUFFIX))
+      continue;
+    const id = name.slice(0, -ANTIGRAVITY_INTERRUPT_SUFFIX.length);
+    if (!await antigravityStopRequested(sessionsDir, id, now))
+      await clearStop(sessionsDir, id);
+  }
 }
 var ANTIGRAVITY_KEEPALIVE_MS = 15000;
 function planAntigravity(kind, record, now) {
@@ -4400,13 +4419,15 @@ async function runAntigravityHook(raw, eventName, deps = {}) {
     if (!kind || kind === "start")
       return;
     const sessionsDir = deps.sessionsDir ?? SESSIONS_DIR;
+    if (eventName === "PostInvocation" && deps.canTerminate !== false)
+      await pruneStaleAntigravityStops(sessionsDir, now);
     if (eventName === "PostInvocation" && deps.canTerminate !== false && await antigravityStopRequested(sessionsDir, sessionId, now)) {
-      await clearInterruptFlagAt(sessionsDir, sessionId);
+      await clearStop(sessionsDir, sessionId);
       await (deps.emit ?? emitStdout)(ANTIGRAVITY_TERMINATE);
       (deps.trace ?? traceSession)({ event: "interrupt", sessionId, agent: "antigravity", result: "terminated" });
       kind = "stop";
     } else if (kind === "stop") {
-      await clearInterruptFlagAt(sessionsDir, sessionId);
+      await clearStop(sessionsDir, sessionId);
     }
     const config = deps.config !== undefined ? deps.config : await loadConfig();
     if (!config)
@@ -4415,7 +4436,7 @@ async function runAntigravityHook(raw, eventName, deps = {}) {
     if (record && record.agent !== "antigravity")
       return;
     if (kind === "turn" && record && (record.op === "done" || record.lastEvent === "done")) {
-      await clearInterruptFlagAt(sessionsDir, sessionId);
+      await clearStop(sessionsDir, sessionId);
     }
     const plan = planAntigravity(kind, record, now);
     if (!plan)

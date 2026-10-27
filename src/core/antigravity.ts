@@ -10,7 +10,7 @@
 // exactly the terminate line). It always exits 0 and swallows every error. (PreToolUse — phone
 // approvals — is a separate hook: core/antigravity-approval.ts.)
 //
-// PHONE STOP (verified agy 1.4.8): the watchdog stamps `<sessions>/<conversationId>.interrupt` (the
+// PHONE STOP (verified agy 1.4.8): the watchdog stamps `<sessions>/<conversationId>.agy-interrupt` (the
 // shared hook-flag seam, adapter.interrupt). PostInvocation — after EVERY model call — returning
 // {"terminationBehavior":"terminate"} ends the turn there; we consume the flag and report the row done
 // at once (Antigravity's own Stop follows and is a no-op on a done row). Signals are never used: SIGINT
@@ -29,6 +29,7 @@
 // PRIVACY: the blob/record are built from an allow-listed object, never the payload. `toolCall.args`
 // (file contents, commands) is never read.
 
+import { readdir } from "node:fs/promises";
 import { hostname } from "node:os";
 import { basename } from "node:path";
 import { antigravityChatTitle, antigravityFirstPrompt, antigravityModel } from "./adapter";
@@ -126,15 +127,33 @@ function resolveOwnerPid(): number | undefined {
 export const ANTIGRAVITY_TERMINATE = '{"terminationBehavior":"terminate"}';
 /** What a tool denied because of the phone's Stop tells the agent. */
 export const ANTIGRAVITY_STOP_REASON = "Stopped from phone";
-/** A Stop not acted on within this long is dropped, so it can never end a LATER turn (the flag is also
- *  cleared by Stop and by the next turn's first PreInvocation). Long enough to outlast a slow tool: the
- *  next PostInvocation only comes after the tool finishes and the model answers.
- *  ponytail: fixed age; key the flag to the turn anchor if a stale stop is ever seen in the field. */
-export const ANTIGRAVITY_INTERRUPT_MAX_AGE_MS = 10 * 60_000;
+/** A Stop not acted on within this long is dropped, so a flag a crashed session left can never end a
+ *  much later turn (the flag is also cleared by Stop and by the next turn's first PreInvocation). An hour,
+ *  like Claude Code's: the next PostInvocation only comes after the running tool finishes, and a Stop
+ *  pressed during a long build must not be dropped silently. */
+export const ANTIGRAVITY_INTERRUPT_MAX_AGE_MS = 60 * 60_000;
+/** Antigravity's own flag name, so the wrapper's glob never matches Claude Code's `.interrupt` flags
+ *  (which would make every PostInvocation wait). Mirrored by antigravityAdapter.interruptFlagSuffix. */
+export const ANTIGRAVITY_INTERRUPT_SUFFIX = ".agy-interrupt";
 
 /** Has the phone asked to stop this conversation's turn (a fresh flag)? Never throws. */
 export function antigravityStopRequested(sessionsDir: string, sessionId: string, now: number): Promise<boolean> {
-  return interruptFlagSetAt(sessionsDir, sessionId, now, ANTIGRAVITY_INTERRUPT_MAX_AGE_MS);
+  return interruptFlagSetAt(sessionsDir, sessionId, now, ANTIGRAVITY_INTERRUPT_MAX_AGE_MS, ANTIGRAVITY_INTERRUPT_SUFFIX);
+}
+
+const clearStop = (sessionsDir: string, sessionId: string) =>
+  clearInterruptFlagAt(sessionsDir, sessionId, ANTIGRAVITY_INTERRUPT_SUFFIX);
+
+/** Delete Antigravity stop flags past their age (any conversation): a stale one would keep every
+ *  PostInvocation on the wrapper's slow path for good. Run on that slow path only. Never throws. */
+export async function pruneStaleAntigravityStops(sessionsDir: string, now: number): Promise<void> {
+  let names: string[] = [];
+  try { names = await readdir(sessionsDir); } catch { return; }
+  for (const name of names) {
+    if (!name.endsWith(ANTIGRAVITY_INTERRUPT_SUFFIX)) continue;
+    const id = name.slice(0, -ANTIGRAVITY_INTERRUPT_SUFFIX.length);
+    if (!(await antigravityStopRequested(sessionsDir, id, now))) await clearStop(sessionsDir, id);
+  }
 }
 
 /** Keep-alive throttle: inside this window a still-working row is not re-sent (PreInvocation,
@@ -221,15 +240,16 @@ export async function runAntigravityHook(raw: string, eventName: string | undefi
     if (!kind || kind === "start") return;
 
     const sessionsDir = deps.sessionsDir ?? SESSIONS_DIR;
+    if (eventName === "PostInvocation" && deps.canTerminate !== false) await pruneStaleAntigravityStops(sessionsDir, now);
     // PHONE STOP, before pairing and the network: consume the flag, end the turn, report it done.
     if (eventName === "PostInvocation" && deps.canTerminate !== false
       && await antigravityStopRequested(sessionsDir, sessionId, now)) {
-      await clearInterruptFlagAt(sessionsDir, sessionId);
+      await clearStop(sessionsDir, sessionId);
       await (deps.emit ?? emitStdout)(ANTIGRAVITY_TERMINATE);
       (deps.trace ?? traceSession)({ event: "interrupt", sessionId, agent: "antigravity", result: "terminated" });
       kind = "stop";
     } else if (kind === "stop") {
-      await clearInterruptFlagAt(sessionsDir, sessionId); // the turn ended on its own: the stop is moot
+      await clearStop(sessionsDir, sessionId); // the turn ended on its own: the stop is moot
     }
 
     const config = deps.config !== undefined ? deps.config : await loadConfig();
@@ -239,7 +259,7 @@ export async function runAntigravityHook(raw: string, eventName: string | undefi
     if (record && record.agent !== "antigravity") return; // another agent's row is not ours to rewrite
     // A new turn (first model call over a finished row) must never be stopped by the last one's flag.
     if (kind === "turn" && record && (record.op === "done" || record.lastEvent === "done")) {
-      await clearInterruptFlagAt(sessionsDir, sessionId);
+      await clearStop(sessionsDir, sessionId);
     }
 
     const plan = planAntigravity(kind, record, now);

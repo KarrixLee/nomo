@@ -29,13 +29,33 @@
 // write to the user's real ~/.gemini. A phone that sends allow_always anyway gets a plain auto_approve.
 
 import { readFileSync } from "node:fs";
-import { isAbsolute, resolve } from "node:path";
+import { dirname, isAbsolute, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import { SAFE_SKILL_COMMANDS, skillCommand } from "../../plugin/scripts/antigravity-skill-command.mjs";
 import { antigravityDataDirFor, antigravityDataDirs } from "./adapter";
 import {
-  ANTIGRAVITY_STOP_REASON, antigravityCwd, antigravitySessionId, antigravityStopRequested, runAntigravityHook,
+  ANTIGRAVITY_STOP_REASON, antigravityCwd, antigravitySessionId, antigravityStopRequested,
 } from "./antigravity";
 import { runPermissionHook, type PermissionHookDeps } from "./permission";
-import { SESSIONS_DIR } from "./shared";
+import { CC_DIR, Config, loadConfig, SESSIONS_DIR } from "./shared";
+
+/** The plugin checkout this bundle runs from (`<root>/dist/antigravity-approve.mjs` → `<root>`). */
+export const ANTIGRAVITY_PLUGIN_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+
+/** Is `command` EXACTLY one of Nomo's own safe /nomo-* skill commands, as the installer wrote them for
+ *  this checkout? Only a single trailing newline is forgiven; any other byte difference — a space, a
+ *  `cd`, `&& …`, other quoting, a CR or LF anywhere — is not ours. Pure. */
+export function isNomoSkillCommand(command: string, root: string = ANTIGRAVITY_PLUGIN_ROOT): boolean {
+  const c = command.endsWith("\n") ? command.slice(0, -1) : command;
+  if (/[\r\n]/.test(c)) return false;
+  return SAFE_SKILL_COMMANDS.some((key) => skillCommand(root, key) === c);
+}
+
+/** Writes here become code Nomo runs (the plugin checkout) or Nomo's own state (pairing, flags): they
+ *  always go to the phone, even when an allow rule covers them. */
+export function nomoProtectedDirs(root: string = ANTIGRAVITY_PLUGIN_ROOT): string[] {
+  return [root, CC_DIR];
+}
 
 /** Printed whenever we have no phone answer: defer to Antigravity's own policy. */
 export const ANTIGRAVITY_FALLBACK = '{"decision":"allow"}';
@@ -84,22 +104,62 @@ export function loadAntigravityRules(transcriptPath: string | undefined): Antigr
   return out;
 }
 
-/** Does a rule of `action` possibly match `target`? `exact` (allow side) accepts only a literal word
- *  prefix / path prefix; otherwise (ask/deny side) a `regex:` rule counts as a match — the safe reading.
- *  ponytail: prefix + `*` only; regex allow rules and modes (auto/accept-edits) still route to the phone. */
+/** Shell words that run the NEXT word as the command (their own `-flags` are skipped too). */
+const WRAPPERS = new Set(["sudo", "doas", "env", "command", "exec", "nice", "time", "nohup", "xargs", "builtin"]);
+
+/** Every word that may RUN as a command somewhere in `line`, basename'd and unquoted — deliberately
+ *  loose (a false hit only makes us say "no opinion"): split on `;` `&` `|` newlines, `$(`, backticks,
+ *  parentheses and braces; drop quotes and backslashes; skip `VAR=…` assignments; after a wrapper
+ *  (sudo, env, command, xargs, …) every later non-flag word counts. Pure. */
+export function commandWords(line: string): string[] {
+  const out: string[] = [];
+  for (const segment of line.split(/[;&|\n\r`(){}]|\$\(/)) {
+    const words = segment.replace(/['"\\]/g, "").trim().split(/\s+/).filter(Boolean);
+    const base = (w: string) => w.slice(w.lastIndexOf("/") + 1);
+    let i = 0;
+    while (i < words.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(words[i]!)) i++;
+    if (i >= words.length) continue;
+    const first = base(words[i]!);
+    if (first) out.push(first);
+    // After a wrapper, its own options (`sudo -u root`, `nice -n 5`) can't be told from the command
+    // without knowing each wrapper's flags, so EVERY later word counts — loose is the safe direction.
+    if (WRAPPERS.has(first)) for (const w of words.slice(i + 1)) if (!w.startsWith("-") && !/^[A-Za-z_][A-Za-z0-9_]*=/.test(w)) out.push(base(w));
+  }
+  return out;
+}
+
+/** A `regex:` rule's pattern: compiled, so a valid regex matches only what it matches; one that does not
+ *  compile counts as matching everything (deny/ask side only — the safe reading). */
+function regexMatches(pattern: string, target: string): boolean {
+  try {
+    return new RegExp(pattern).test(target);
+  } catch {
+    return true;
+  }
+}
+
+/** Does a rule of `action` match `target`?
+ *   - DENY/ASK side (`exact` false): LOOSE — a hit only ever makes us defer to Antigravity, so a command
+ *     rule matches when its first word is ANY command word of the line (commandWords), whatever wraps
+ *     or chains it (`sudo rm`, `/bin/rm`, `FOO=1 rm`, `ls && rm`, `$(rm …)`).
+ *   - ALLOW side (`exact` true): STRICT — a plain single command whose words start with the rule's
+ *     words; anything with separators, subshells, quotes, escapes or line breaks is never passed
+ *     through, and a `regex:` allow rule never passes anything (the phone still asks). */
 function ruleMatches(rule: string, action: string, target: string, workspace: string | undefined, exact: boolean): boolean {
   const m = /^([a-z_]+)\((.*)\)$/s.exec(rule.trim());
   if (!m || m[1] !== action) return false;
   const want = m[2]!.trim();
   if (want === "*") return true;
-  if (want.startsWith("regex:")) return !exact;
+  if (want.startsWith("regex:")) return !exact && regexMatches(want.slice("regex:".length), target);
   if (action === "command") {
-    if (want === target.trim()) return true;
-    // A compound line could smuggle a second command past a prefix rule: never prefix-match one on the
-    // allow side; on the deny/ask side it MAY contain the denied command, so it counts as a match.
-    if (/[;&|$`<>(){}\n]/.test(target)) return !exact;
-    const a = want.split(/\s+/), b = target.trim().split(/\s+/);
-    return a.length <= b.length && a.every((w, i) => w === b[i]);
+    const wantWords = want.split(/\s+/);
+    if (!exact) {
+      const first = wantWords[0]!.slice(wantWords[0]!.lastIndexOf("/") + 1);
+      return want === target.trim() || commandWords(target).includes(first);
+    }
+    if (/[;&|$`<>(){}\n\r\\'"]/.test(target)) return false;
+    const b = target.trim().split(/\s+/);
+    return wantWords.length <= b.length && wantWords.every((w, i) => w === b[i]);
   }
   const base = isAbsolute(want) ? want : workspace ? resolve(workspace, want) : undefined;
   if (!base) return false;
@@ -122,6 +182,7 @@ export interface AntigravityApprovalRequest {
  *  already let run. Pure apart from the injected rules. */
 export function antigravityApprovalRequest(
   input: Record<string, unknown>, rules: AntigravityPermissionRules = { allow: [], ask: [], deny: [] },
+  protectedDirs: string[] = nomoProtectedDirs(),
 ): AntigravityApprovalRequest | null {
   const sessionId = antigravitySessionId(input);
   const call = input.toolCall as { name?: unknown; args?: unknown } | undefined;
@@ -148,7 +209,9 @@ export function antigravityApprovalRequest(
   // Antigravity's precedence, Deny > Ask > Allow. A call the user's own rules DENY never reaches the
   // phone (an Allow there would answer auto_approve and override it): no opinion, Antigravity denies.
   if (hit(rules.deny, false)) return null;
-  if (!hit(rules.ask, false) && hit(rules.allow, true)) return null;
+  const isProtected = action === "write_file"
+    && protectedDirs.some((d) => { const r = resolve(d); return target === r || resolve(target).startsWith(`${r}/`); });
+  if (!isProtected && !hit(rules.ask, false) && hit(rules.allow, true)) return null;
   return { sessionId, ...(cwd ? { cwd } : {}), transcriptPath: str(input.transcriptPath), agyTool, toolName, toolInput };
 }
 
@@ -177,8 +240,8 @@ export interface AntigravityApprovalDeps {
   /** Has the hook's wrapper gone away (tests)? Default: our parent pid changed (reparented on its death)
    *  or we were sent SIGTERM (the wrapper's trap). */
   abandoned?: () => boolean;
-  /** Reports the row done after an abandoned hold (tests). Default: a synthetic Antigravity Stop. */
-  settleDone?: (raw: string) => Promise<void>;
+  /** The plugin root Nomo's own skill commands are rebuilt under (tests). */
+  pluginRoot?: string;
 }
 
 /** Set by the entry's SIGTERM handler (antigravity-approve.sh's trap on TERM/INT/HUP). */
@@ -201,6 +264,13 @@ export async function runAntigravityApproval(raw: string, deps: AntigravityAppro
     const stopRequested = () => (deps.stopRequested
       ?? ((id: string) => antigravityStopRequested(SESSIONS_DIR, id, Date.now())))(req.sessionId);
     if (await stopRequested()) return ANTIGRAVITY_STOP_DENY;
+    // Nomo's OWN /nomo-* commands (status, approvals on, …) never become a phone card — but only when
+    // paired (unpaired, Antigravity's own prompt decides) and only byte-for-byte the installed template.
+    const command = req.toolName === "shell" ? str(req.toolInput.command) : undefined;
+    if (command && isNomoSkillCommand(command, deps.pluginRoot)) {
+      const config: Config | null = await (deps.hold?.loadConfigFn ?? loadConfig)();
+      if (config) return '{"decision":"auto_approve"}';
+    }
     // `permission_mode` / `agent_id` absent on purpose: the interactive arm, never the subagent pass-through.
     const stdin = JSON.stringify({
       session_id: req.sessionId,
@@ -224,11 +294,9 @@ export async function runAntigravityApproval(raw: string, deps: AntigravityAppro
       readInput: async () => stdin,
       emit: (l) => { line = l; },
     }, "antigravity");
-    // The agent killed our wrapper mid-hold: it interrupted the turn (or exited). The card is withdrawn;
-    // report the turn over, so neither the hold nor a yellow row outlives it.
-    if (gone && line === undefined) {
-      await (deps.settleDone ?? ((r: string) => runAntigravityHook(r, "Stop")))(raw).catch(() => {});
-    }
+    // An abandoned hold (the agent killed our wrapper) has already withdrawn the card and settled the row
+    // as WORKING inside runPermissionHook: a cancelled tool call is not necessarily a finished turn. The
+    // real Stop, or the watchdog's idle net, ends it.
     return antigravityDecision(line);
   } catch {
     return ANTIGRAVITY_FALLBACK;

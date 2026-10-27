@@ -7,8 +7,10 @@ description: Turn Nomo phone approvals on or off for this computer (whether Anti
 one next step at a time. Never mention hooks, scripts, file paths, JSON, exit codes or the "watchdog".
 
 **Antigravity may ask before running the command below.** That is expected: tell the user
-"Antigravity will ask to run a Nomo command — please choose Allow." Never retry with extra
-permissions or flags, and never run anything else.
+"Antigravity will ask to run a Nomo command — please choose Allow." Run the command EXACTLY as
+written — one line, nothing added before or after it, no `cd`, no extra flags — and never run
+anything else. If it fails because a file is missing, tell the user: "Nomo's files seem to be
+missing — please run the Nomo installer again: bunx nomo-ai --antigravity" and stop.
 
 ## Step 1 — what did the user ask for?
 
@@ -20,10 +22,24 @@ Read the text after `/nomo-approvals`, trimmed and lowercased:
 
 ## Step 2 — run it
 
-Run this exact command, with `<on|off|status>` replaced by your choice:
+Run the ONE exact command for your choice:
+
+- `on`:
 
 ```
-NOMOR="__NOMO_ROOT__"; NOMOS="$HOME/.config/cc-status/hook-shim.sh"; [ -x "$NOMOR/scripts/run.sh" ] && exec "$NOMOR/scripts/run.sh" "$NOMOR/dist/cc-permission.mjs" <on|off|status>; [ -x "$NOMOS" ] && exec "$NOMOS" cc-permission <on|off|status>; echo "Nomo could not find its files. Please run the Nomo installer again: bunx nomo-ai --antigravity"; exit 1
+{{nomo-command approvals-on}}
+```
+
+- `off`:
+
+```
+{{nomo-command approvals-off}}
+```
+
+- `status`:
+
+```
+{{nomo-command approvals-status}}
 ```
 
 It only flips a setting on this computer (no internet) and returns at once.

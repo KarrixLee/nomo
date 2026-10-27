@@ -1341,7 +1341,7 @@ async function interruptSession(
   if (isDoneState(record)) return "not-running";
   if (adapter.interrupt === "hook-flag") {
     const write = deps.writeInterruptFlagFn ?? (
-      lanRunningUnderTest() ? async () => {} : (id: string, at: number) => writeInterruptFlagAt(SESSIONS_DIR, id, at)
+      lanRunningUnderTest() ? async () => {} : (id: string, at: number) => writeInterruptFlagAt(SESSIONS_DIR, id, at, adapter.interruptFlagSuffix)
     );
     await write(sessionId, now);
     return "interrupt-flagged";

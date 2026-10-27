@@ -96,7 +96,7 @@ function formatDecisionHoldDebug(input) {
   const value = `${debugToken(input.version ?? PLUGIN_VERSION)} ev:hold req:${debugToken(input.requestId.slice(0, 8))} pid:${input.pid}`;
   return Array.from(value).slice(0, DBG_BLOB_TEXT_MAX_CHARS).join("");
 }
-var CC_DIR = `${process.env.HOME}/.config/cc-status`;
+var CC_DIR = process.env.NOMO_CC_DIR || `${process.env.HOME}/.config/cc-status`;
 var SESSION_TRACE_PATH = `${CC_DIR}/session-trace.log`;
 var SESSION_TRACE_MAX_BYTES = 256 * 1024;
 var sessionTraceRotated = false;
@@ -620,19 +620,19 @@ async function clearDecisionHold(sessionId, pid, beforeUnlink, holdId) {
 }
 var INTERRUPT_FLAG_SUFFIX = ".interrupt";
 var INTERRUPT_FLAG_MAX_AGE_MS = 3600000;
-function interruptFlagFileName(sessionId) {
-  return `${sessionId}${INTERRUPT_FLAG_SUFFIX}`;
+function interruptFlagFileName(sessionId, suffix = INTERRUPT_FLAG_SUFFIX) {
+  return `${sessionId}${suffix}`;
 }
-async function interruptFlagSetAt(sessionsDir, sessionId, now, maxAgeMs = INTERRUPT_FLAG_MAX_AGE_MS) {
+async function interruptFlagSetAt(sessionsDir, sessionId, now, maxAgeMs = INTERRUPT_FLAG_MAX_AGE_MS, suffix = INTERRUPT_FLAG_SUFFIX) {
   try {
-    const flag = JSON.parse(await readFile(`${sessionsDir}/${interruptFlagFileName(sessionId)}`, "utf8"));
+    const flag = JSON.parse(await readFile(`${sessionsDir}/${interruptFlagFileName(sessionId, suffix)}`, "utf8"));
     return typeof flag.at === "number" && now - flag.at <= maxAgeMs;
   } catch {
     return false;
   }
 }
-async function clearInterruptFlagAt(sessionsDir, sessionId) {
-  await unlink(`${sessionsDir}/${interruptFlagFileName(sessionId)}`).catch(() => {});
+async function clearInterruptFlagAt(sessionsDir, sessionId, suffix = INTERRUPT_FLAG_SUFFIX) {
+  await unlink(`${sessionsDir}/${interruptFlagFileName(sessionId, suffix)}`).catch(() => {});
 }
 async function settleDecisionHoldRecord(sessionId, patch) {
   return settleDecisionHoldRecordAt(SESSIONS_DIR, sessionId, patch);
@@ -2361,7 +2361,8 @@ var antigravityAdapter = {
   },
   toolDetail: {},
   blobAgentFields: { agent: "antigravity" },
-  interrupt: "hook-flag"
+  interrupt: "hook-flag",
+  interruptFlagSuffix: ".agy-interrupt"
 };
 function unknownAgentAdapter(kind) {
   return {
@@ -4408,6 +4409,7 @@ async function runPermissionHook(deps = {}, agent = "claude") {
         signal: AbortSignal.timeout(3000)
       }).then(() => {}, () => {});
       if (deps.abandoned?.()) {
+        settleAsWorking = true;
         trace({ event: "exit", reason: "abandoned", seq });
         await withdrawCard();
         return;

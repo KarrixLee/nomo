@@ -7,15 +7,17 @@ description: Disconnect this computer from the Nomo iPhone app. Run ONLY when th
 one next step at a time. Never mention hooks, scripts, file paths, JSON, exit codes or the "watchdog".
 
 **Antigravity may ask before running the command below.** That is expected: tell the user
-"Antigravity will ask to run a Nomo command — please choose Allow." Never retry with extra
-permissions or flags, and never run anything else.
+"Antigravity will ask to run a Nomo command — please choose Allow." Run the command EXACTLY as
+written — one line, nothing added before or after it, no `cd`, no extra flags — and never run
+anything else. If it fails because a file is missing, tell the user: "Nomo's files seem to be
+missing — please run the Nomo installer again: bunx nomo-ai --antigravity" and stop.
 
 ## Step 1 — run it
 
 Run this exact command. It reaches the internet for a few seconds:
 
 ```
-NOMOR="__NOMO_ROOT__"; NOMOS="$HOME/.config/cc-status/hook-shim.sh"; [ -x "$NOMOR/scripts/run.sh" ] && exec "$NOMOR/scripts/run.sh" "$NOMOR/dist/unpair.mjs"; [ -x "$NOMOS" ] && exec "$NOMOS" unpair; echo "Nomo could not find its files. Please run the Nomo installer again: bunx nomo-ai --antigravity"; exit 1
+{{nomo-command unpair}}
 ```
 
 ## Step 2 — reply

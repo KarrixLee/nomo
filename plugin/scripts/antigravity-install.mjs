@@ -30,6 +30,7 @@ import {
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { expandSkillTemplate } from "./antigravity-skill-command.mjs";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const HOOK = join(ROOT, "scripts", "antigravity-hook.sh");
@@ -94,12 +95,22 @@ function writePlugin() {
     for (const name of readdirSync(join(tmp, "skills"))) {
       const f = join(tmp, "skills", name, "SKILL.md");
       if (!existsSync(f)) continue;
-      // A function, not a string: a replacement STRING would expand `$&`-style patterns in the path.
-      writeFileSync(f, readFileSync(f, "utf8").replaceAll("__NOMO_ROOT__", () => ROOT));
+      // The same template the approval hook rebuilds Nomo's own commands from (antigravity-skill-command.mjs).
+      writeFileSync(f, expandSkillTemplate(readFileSync(f, "utf8"), ROOT));
     }
     writeFileSync(join(tmp, PLUGIN_MARK), "Installed by Nomo (antigravity-install.mjs). Remove with --uninstall.\n");
-    rmSync(PLUGIN_DEST, { recursive: true, force: true });
-    renameSync(tmp, PLUGIN_DEST);
+    // Swap: the old folder steps aside, the new one moves in, then the old one is deleted — at no
+    // moment is there no plugin, and a failed move-in puts the old one back.
+    const old = `${PLUGIN_DEST}.${process.pid}.old`;
+    const hadOld = existsSync(PLUGIN_DEST);
+    if (hadOld) renameSync(PLUGIN_DEST, old);
+    try {
+      renameSync(tmp, PLUGIN_DEST);
+    } catch (e) {
+      if (hadOld) renameSync(old, PLUGIN_DEST);
+      throw e;
+    }
+    rmSync(old, { recursive: true, force: true });
   } finally {
     rmSync(tmp, { recursive: true, force: true });
   }
@@ -179,7 +190,8 @@ function update(edit) {
 }
 
 const paired = () => {
-  try { return typeof JSON.parse(readFileSync(join(homedir(), ".config", "cc-status", "config.json"), "utf8")).e2eKeyB64 === "string"; } catch { return false; }
+  const dir = process.env.NOMO_CC_DIR || join(homedir(), ".config", "cc-status");
+  try { return typeof JSON.parse(readFileSync(join(dir, "config.json"), "utf8")).e2eKeyB64 === "string"; } catch { return false; }
 };
 
 try {
@@ -193,7 +205,7 @@ try {
       : "Nomo wasn't set up in Antigravity, so there was nothing to remove.");
   } else {
     // The root is written inside single quotes in every hook command (and double quotes in the skills).
-    if (/['"$\\`]/.test(ROOT)) fail(`the plugin path contains one of ' " $ \\ \` and cannot be written into a hook command: ${ROOT}`);
+    if (/['"$\\`\r\n]/.test(ROOT)) fail(`the plugin path contains one of ' " $ \\ \` or a line break and cannot be written into a command: ${ROOT}`);
     for (const f of [BUNDLE, APPROVE_BUNDLE]) if (!existsSync(f)) fail(`${f} is missing — run 'bun build.ts' from the repo root first`);
     if (!existsSync(HOOK) || !existsSync(APPROVE)) fail(`${HOOK} is missing — this does not look like a nomo plugin directory`);
     if (!existsSync(CONFIG_DIR)) fail("Antigravity doesn't seem to be set up on this computer yet — open it once, then run this again.");

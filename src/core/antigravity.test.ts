@@ -5,14 +5,14 @@
 import { cp, mkdir, mkdtemp, readdir, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { afterEach, describe, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
 import {
   adapterFor, antigravityAdapter, antigravityChatTitle, antigravityDataDirFor, antigravityFirstPrompt, antigravityRunStatus,
 } from "./adapter";
 import {
-  ANTIGRAVITY_EVENTS, ANTIGRAVITY_INTERRUPT_MAX_AGE_MS, ANTIGRAVITY_KEEPALIVE_MS, ANTIGRAVITY_TERMINATE, antigravityCwd, antigravityEventKind, antigravityHookParent, antigravityOwnerPid,
+  ANTIGRAVITY_EVENTS, ANTIGRAVITY_INTERRUPT_MAX_AGE_MS, ANTIGRAVITY_INTERRUPT_SUFFIX, pruneStaleAntigravityStops, ANTIGRAVITY_KEEPALIVE_MS, ANTIGRAVITY_TERMINATE, antigravityCwd, antigravityEventKind, antigravityHookParent, antigravityOwnerPid,
   planAntigravity, runAntigravityHook,
 } from "./antigravity";
 import { decryptBlob } from "./crypto";
@@ -110,7 +110,7 @@ describe("runAntigravityHook", () => {
     };
     const fire = (event: string, extra: Record<string, unknown> = {}) =>
       runAntigravityHook(JSON.stringify({ conversationId: CONV, workspacePaths: ["/w/proj"], modelName: "gemini-3-pro", ...extra }), event, deps);
-    const flagged = () => readFile(join(sessionsDir, interruptFlagFileName(CONV)), "utf8").then(() => true, () => false);
+    const flagged = () => readFile(join(sessionsDir, interruptFlagFileName(CONV, ANTIGRAVITY_INTERRUPT_SUFFIX)), "utf8").then(() => true, () => false);
     return { dir, sessionsDir, posts, printed, deps, fire, flagged, now: () => clock, tick: (ms: number) => { clock += ms; } };
   }
 
@@ -119,7 +119,7 @@ describe("runAntigravityHook", () => {
     await h.fire("PreInvocation", { invocationNum: 0 });
     await h.fire("PostInvocation", { invocationNum: 0 });
     expect(h.printed).toEqual([]); // no flag → nothing printed (the wrapper prints {})
-    await writeInterruptFlagAt(h.sessionsDir, CONV, h.now());
+    await writeInterruptFlagAt(h.sessionsDir, CONV, h.now(), ANTIGRAVITY_INTERRUPT_SUFFIX);
     await h.fire("PreInvocation", { invocationNum: 1 }); // PreInvocation never terminates
     expect(h.printed).toEqual([]);
     await h.fire("PostInvocation", { invocationNum: 1 });
@@ -136,23 +136,40 @@ describe("runAntigravityHook", () => {
   test("a stale flag, or one left by a finished turn, never stops a later turn", async () => {
     const h = await harness();
     await h.fire("PreInvocation", { invocationNum: 0 });
-    await writeInterruptFlagAt(h.sessionsDir, CONV, h.now());
+    await writeInterruptFlagAt(h.sessionsDir, CONV, h.now(), ANTIGRAVITY_INTERRUPT_SUFFIX);
     h.tick(ANTIGRAVITY_INTERRUPT_MAX_AGE_MS + 1);
     await h.fire("PostInvocation");
     expect(h.printed).toEqual([]); // expired
-    await writeInterruptFlagAt(h.sessionsDir, CONV, h.now());
+    await writeInterruptFlagAt(h.sessionsDir, CONV, h.now(), ANTIGRAVITY_INTERRUPT_SUFFIX);
     await h.fire("Stop");           // the turn ended on its own → flag cleared
     expect(await h.flagged()).toBe(false);
-    await writeInterruptFlagAt(h.sessionsDir, CONV, h.now());
+    await writeInterruptFlagAt(h.sessionsDir, CONV, h.now(), ANTIGRAVITY_INTERRUPT_SUFFIX);
     await h.fire("PreInvocation");  // new turn over a done row → flag cleared
     expect(await h.flagged()).toBe(false);
     await h.fire("PostInvocation");
     expect(h.printed).toEqual([]);
   });
 
+  test("Antigravity's own flag name (never Claude Code's), an hour of life, and stale ones pruned on the slow path", async () => {
+    expect(ANTIGRAVITY_INTERRUPT_SUFFIX).toBe(".agy-interrupt");
+    expect(antigravityAdapter.interruptFlagSuffix).toBe(ANTIGRAVITY_INTERRUPT_SUFFIX);
+    expect(ANTIGRAVITY_INTERRUPT_MAX_AGE_MS).toBe(60 * 60_000);
+    const h = await harness();
+    await h.fire("PreInvocation", { invocationNum: 0 });
+    await writeInterruptFlagAt(h.sessionsDir, CONV, h.now()); // a CLAUDE flag for the same id: not ours
+    await h.fire("PostInvocation");
+    expect(h.printed).toEqual([]);
+    // stale flags of any conversation are deleted; fresh ones are kept
+    await writeInterruptFlagAt(h.sessionsDir, "old-one", h.now() - ANTIGRAVITY_INTERRUPT_MAX_AGE_MS - 1, ANTIGRAVITY_INTERRUPT_SUFFIX);
+    await writeInterruptFlagAt(h.sessionsDir, "fresh-one", h.now(), ANTIGRAVITY_INTERRUPT_SUFFIX);
+    await pruneStaleAntigravityStops(h.sessionsDir, h.now());
+    const left = (await readdir(h.sessionsDir)).filter((n) => n.includes("interrupt")).sort();
+    expect(left).toEqual([`${CONV}.interrupt`, "fresh-one.agy-interrupt"]);
+  });
+
   test("an emit that throws never escapes the hook", async () => {
     const h = await harness();
-    await writeInterruptFlagAt(h.sessionsDir, CONV, h.now());
+    await writeInterruptFlagAt(h.sessionsDir, CONV, h.now(), ANTIGRAVITY_INTERRUPT_SUFFIX);
     await runAntigravityHook(JSON.stringify({ conversationId: CONV }), "PostInvocation", {
       ...h.deps, emit: async () => { throw new Error("EPIPE"); },
     });
@@ -231,7 +248,7 @@ describe("antigravity-hook.sh (what hooks.json runs)", () => {
       ["kill -9 $$", "{}\n"],
     ];
     await mkdir(join(home, ".config", "cc-status", "sessions"), { recursive: true });
-    await writeFile(join(home, ".config", "cc-status", "sessions", `${CONV}.interrupt`), "{}");
+    await writeFile(join(home, ".config", "cc-status", "sessions", `${CONV}.agy-interrupt`), "{}");
     for (const [script, want] of cases) {
       const root = join(await tmp(), "plugin");
       await mkdir(join(root, "scripts"), { recursive: true });
@@ -261,19 +278,22 @@ describe("antigravity-hook.sh (what hooks.json runs)", () => {
       return out;
     };
     expect(await run()).toBe("{}\n");
-    await writeInterruptFlagAt(sessions, CONV, Date.now());
+    await writeInterruptFlagAt(sessions, CONV, Date.now(), ANTIGRAVITY_INTERRUPT_SUFFIX);
     expect(await run()).toBe(`${ANTIGRAVITY_TERMINATE}\n`);
     expect(await run()).toBe("{}\n"); // consumed
     // a DETACHED run (no stop pending when its wrapper looked) never consumes a flag
-    await writeInterruptFlagAt(sessions, CONV, Date.now());
+    await writeInterruptFlagAt(sessions, CONV, Date.now(), ANTIGRAVITY_INTERRUPT_SUFFIX);
     await runAntigravityHook(JSON.stringify({ conversationId: CONV }), "PostInvocation", {
       config: null, sessionsDir: sessions, stampPath: join(home, "stamp"), canTerminate: false, emit: async () => { throw new Error("must not print"); },
     });
-    expect(await readFile(join(sessions, interruptFlagFileName(CONV)), "utf8")).toContain("at");
+    expect(await readFile(join(sessions, interruptFlagFileName(CONV, ANTIGRAVITY_INTERRUPT_SUFFIX)), "utf8")).toContain("at");
   });
 
   test("non-blocking: with no stop pending the wrapper answers and exits before the bundle finishes", async () => {
     const home = await tmp();
+    // Claude Code's own `.interrupt` flags must not drag Antigravity's PostInvocation onto the slow path
+    await mkdir(join(home, ".config", "cc-status", "sessions"), { recursive: true });
+    await writeFile(join(home, ".config", "cc-status", "sessions", "claude-sess.interrupt"), "{}");
     const root = join(await tmp(), "plugin");
     const got = join(root, "got");
     await mkdir(join(root, "scripts"), { recursive: true });
@@ -313,7 +333,7 @@ describe("antigravity-install.mjs", () => {
     const root = join(t, "nomo", "plugin");
     await mkdir(join(root, "scripts"), { recursive: true });
     await mkdir(join(root, "dist"), { recursive: true });
-    for (const f of ["antigravity-install.mjs", "antigravity-hook.sh", "antigravity-approve.sh"]) await cp(join(PLUGIN, "scripts", f), join(root, "scripts", f));
+    for (const f of ["antigravity-install.mjs", "antigravity-hook.sh", "antigravity-approve.sh", "antigravity-skill-command.mjs"]) await cp(join(PLUGIN, "scripts", f), join(root, "scripts", f));
     for (const f of ["antigravity-status.mjs", "antigravity-approve.mjs"]) await writeFile(join(root, "dist", f), "// stub\n");
     await cp(join(PLUGIN, "antigravity-plugin"), join(root, "antigravity-plugin"), { recursive: true });
     const home = join(t, "home");
@@ -390,8 +410,8 @@ describe("antigravity-install.mjs", () => {
     expect(skills).toEqual(["nomo-approvals", "nomo-pair", "nomo-reset", "nomo-status", "nomo-unpair"]);
     for (const name of skills) {
       const body = await readFile(join(dest, "skills", name, "SKILL.md"), "utf8");
-      expect(body).not.toContain("__NOMO_ROOT__");
-      expect(body).toContain(`NOMOR="${b.root}"`);
+      expect(body).not.toContain("{{nomo-command");
+      expect(body).toContain(`'${b.root}/scripts/run.sh' '${b.root}/dist/`);
     }
     // paired → points at /nomo-status instead; a second install is a no-op refresh
     await mkdir(join(b.home, ".config", "cc-status"), { recursive: true });
@@ -437,6 +457,18 @@ describe("antigravity-install.mjs", () => {
     }
     const clean = await box();
     expect((await clean.run()).out).not.toContain("nomo-cc");
+  });
+
+  test("a checkout path with a line break is refused, nothing written", async () => {
+    const b = await box();
+    const odd = join(dirname(dirname(b.root)), "odd\nname", "plugin");
+    await mkdir(dirname(odd), { recursive: true });
+    await cp(b.root, odd, { recursive: true });
+    const proc = spawnTestProcess({ cmd: ["node", join(odd, "scripts", "antigravity-install.mjs")], env: isolatedTestEnv(b.home), stdout: "pipe", stderr: "pipe" });
+    const out = (await new Response(proc.stdout).text()) + (await new Response(proc.stderr).text());
+    expect(await proc.exited).toBe(1);
+    expect(out).toContain("line break");
+    expect(existsSync(b.hooks)).toBe(false);
   });
 
   test("idempotent: a second install does not rewrite the file", async () => {
@@ -565,7 +597,8 @@ describe("the Antigravity plugin (plugin/antigravity-plugin)", () => {
       const fm = /^---\n([\s\S]*?)\n---\n/.exec(body)?.[1] ?? "";
       expect(fm).toContain(`name: ${name}\n`);
       expect(fm).toMatch(/\ndescription: .*Run ONLY when the user types \/nomo-/);
-      expect(body).toContain("__NOMO_ROOT__");
+      expect(body).toContain("{{nomo-command ");
+      expect(body).not.toContain("hook-shim"); // no fallback a reviewer can't see from the template
       expect(body).toContain("please choose Allow");
       // no Claude Code / Codex command names leak into Antigravity's skills
       expect(body).not.toMatch(/nomo-cc:|\$nomo-|codex plugin list/);

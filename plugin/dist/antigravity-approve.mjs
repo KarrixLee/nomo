@@ -3,7 +3,30 @@ var __require = /* @__PURE__ */ createRequire(import.meta.url);
 
 // src/core/antigravity-approval.ts
 import { readFileSync as readFileSync2 } from "node:fs";
-import { isAbsolute as isAbsolute4, resolve as resolve4 } from "node:path";
+import { dirname as dirname2, isAbsolute as isAbsolute4, resolve as resolve4 } from "node:path";
+import { fileURLToPath as fileURLToPath2 } from "node:url";
+
+// plugin/scripts/antigravity-skill-command.mjs
+var SKILL_COMMANDS = {
+  status: ["status-cmd.mjs", "antigravity --plain"],
+  "status-verbose": ["status-cmd.mjs", "antigravity"],
+  "approvals-status": ["cc-permission.mjs", "status"],
+  "approvals-on": ["cc-permission.mjs", "on"],
+  "approvals-off": ["cc-permission.mjs", "off"],
+  reset: ["reset.mjs", ""],
+  unpair: ["unpair.mjs", ""],
+  pair: ["pair.mjs", ""],
+  "pair-code": ["pair.mjs", "--show-code"],
+  "pair-wait": ["pair.mjs", "wait --timeout 60"]
+};
+var SAFE_SKILL_COMMANDS = ["status", "status-verbose", "approvals-status", "approvals-on", "reset", "pair", "pair-wait"];
+function skillCommand(root, key) {
+  const entry = SKILL_COMMANDS[key];
+  if (!entry)
+    throw new Error(`unknown Nomo skill command: ${key}`);
+  const [script, args] = entry;
+  return `'${root}/scripts/run.sh' '${root}/dist/${script}'${args ? ` ${args}` : ""}`;
+}
 
 // src/core/adapter.ts
 import { execFile as execFile2, execFileSync as execFileSync2 } from "node:child_process";
@@ -131,7 +154,7 @@ function appendCodexBridgeMarker(dbg, down) {
   const next = `${bare} ${CODEX_BRIDGE_DOWN_MARKER}`;
   return Array.from(next).length <= DBG_BLOB_TEXT_MAX_CHARS ? next : bare;
 }
-var CC_DIR = `${process.env.HOME}/.config/cc-status`;
+var CC_DIR = process.env.NOMO_CC_DIR || `${process.env.HOME}/.config/cc-status`;
 var SESSION_TRACE_PATH = `${CC_DIR}/session-trace.log`;
 var SESSION_TRACE_MAX_BYTES = 256 * 1024;
 var sessionTraceRotated = false;
@@ -939,24 +962,24 @@ async function clearDecisionHold(sessionId, pid, beforeUnlink, holdId) {
 }
 var INTERRUPT_FLAG_SUFFIX = ".interrupt";
 var INTERRUPT_FLAG_MAX_AGE_MS = 3600000;
-function interruptFlagFileName(sessionId) {
-  return `${sessionId}${INTERRUPT_FLAG_SUFFIX}`;
+function interruptFlagFileName(sessionId, suffix = INTERRUPT_FLAG_SUFFIX) {
+  return `${sessionId}${suffix}`;
 }
-async function writeInterruptFlagAt(sessionsDir, sessionId, now) {
+async function writeInterruptFlagAt(sessionsDir, sessionId, now, suffix = INTERRUPT_FLAG_SUFFIX) {
   try {
-    await atomicWrite(`${sessionsDir}/${interruptFlagFileName(sessionId)}`, JSON.stringify({ at: now }), 384);
+    await atomicWrite(`${sessionsDir}/${interruptFlagFileName(sessionId, suffix)}`, JSON.stringify({ at: now }), 384);
   } catch {}
 }
-async function interruptFlagSetAt(sessionsDir, sessionId, now, maxAgeMs = INTERRUPT_FLAG_MAX_AGE_MS) {
+async function interruptFlagSetAt(sessionsDir, sessionId, now, maxAgeMs = INTERRUPT_FLAG_MAX_AGE_MS, suffix = INTERRUPT_FLAG_SUFFIX) {
   try {
-    const flag = JSON.parse(await readFile(`${sessionsDir}/${interruptFlagFileName(sessionId)}`, "utf8"));
+    const flag = JSON.parse(await readFile(`${sessionsDir}/${interruptFlagFileName(sessionId, suffix)}`, "utf8"));
     return typeof flag.at === "number" && now - flag.at <= maxAgeMs;
   } catch {
     return false;
   }
 }
-async function clearInterruptFlagAt(sessionsDir, sessionId) {
-  await unlink(`${sessionsDir}/${interruptFlagFileName(sessionId)}`).catch(() => {});
+async function clearInterruptFlagAt(sessionsDir, sessionId, suffix = INTERRUPT_FLAG_SUFFIX) {
+  await unlink(`${sessionsDir}/${interruptFlagFileName(sessionId, suffix)}`).catch(() => {});
 }
 async function settleDecisionHoldRecord(sessionId, patch) {
   return settleDecisionHoldRecordAt(SESSIONS_DIR, sessionId, patch);
@@ -2959,7 +2982,8 @@ var antigravityAdapter = {
   },
   toolDetail: {},
   blobAgentFields: { agent: "antigravity" },
-  interrupt: "hook-flag"
+  interrupt: "hook-flag",
+  interruptFlagSuffix: ".agy-interrupt"
 };
 function unknownAgentAdapter(kind) {
   return {
@@ -2995,6 +3019,7 @@ function adapterFor(agent) {
 var allAdapters = [claudeAdapter, codexAdapter];
 
 // src/core/antigravity.ts
+import { readdir as readdir4 } from "node:fs/promises";
 import { hostname as hostname3 } from "node:os";
 import { basename as basename5 } from "node:path";
 
@@ -4351,9 +4376,26 @@ function resolveOwnerPid2() {
 }
 var ANTIGRAVITY_TERMINATE = '{"terminationBehavior":"terminate"}';
 var ANTIGRAVITY_STOP_REASON = "Stopped from phone";
-var ANTIGRAVITY_INTERRUPT_MAX_AGE_MS = 10 * 60000;
+var ANTIGRAVITY_INTERRUPT_MAX_AGE_MS = 60 * 60000;
+var ANTIGRAVITY_INTERRUPT_SUFFIX = ".agy-interrupt";
 function antigravityStopRequested(sessionsDir, sessionId, now) {
-  return interruptFlagSetAt(sessionsDir, sessionId, now, ANTIGRAVITY_INTERRUPT_MAX_AGE_MS);
+  return interruptFlagSetAt(sessionsDir, sessionId, now, ANTIGRAVITY_INTERRUPT_MAX_AGE_MS, ANTIGRAVITY_INTERRUPT_SUFFIX);
+}
+var clearStop = (sessionsDir, sessionId) => clearInterruptFlagAt(sessionsDir, sessionId, ANTIGRAVITY_INTERRUPT_SUFFIX);
+async function pruneStaleAntigravityStops(sessionsDir, now) {
+  let names = [];
+  try {
+    names = await readdir4(sessionsDir);
+  } catch {
+    return;
+  }
+  for (const name of names) {
+    if (!name.endsWith(ANTIGRAVITY_INTERRUPT_SUFFIX))
+      continue;
+    const id = name.slice(0, -ANTIGRAVITY_INTERRUPT_SUFFIX.length);
+    if (!await antigravityStopRequested(sessionsDir, id, now))
+      await clearStop(sessionsDir, id);
+  }
 }
 var ANTIGRAVITY_KEEPALIVE_MS = 15000;
 function planAntigravity(kind, record, now) {
@@ -4404,13 +4446,15 @@ async function runAntigravityHook(raw, eventName, deps = {}) {
     if (!kind || kind === "start")
       return;
     const sessionsDir = deps.sessionsDir ?? SESSIONS_DIR;
+    if (eventName === "PostInvocation" && deps.canTerminate !== false)
+      await pruneStaleAntigravityStops(sessionsDir, now);
     if (eventName === "PostInvocation" && deps.canTerminate !== false && await antigravityStopRequested(sessionsDir, sessionId, now)) {
-      await clearInterruptFlagAt(sessionsDir, sessionId);
+      await clearStop(sessionsDir, sessionId);
       await (deps.emit ?? emitStdout)(ANTIGRAVITY_TERMINATE);
       (deps.trace ?? traceSession)({ event: "interrupt", sessionId, agent: "antigravity", result: "terminated" });
       kind = "stop";
     } else if (kind === "stop") {
-      await clearInterruptFlagAt(sessionsDir, sessionId);
+      await clearStop(sessionsDir, sessionId);
     }
     const config = deps.config !== undefined ? deps.config : await loadConfig();
     if (!config)
@@ -4419,7 +4463,7 @@ async function runAntigravityHook(raw, eventName, deps = {}) {
     if (record && record.agent !== "antigravity")
       return;
     if (kind === "turn" && record && (record.op === "done" || record.lastEvent === "done")) {
-      await clearInterruptFlagAt(sessionsDir, sessionId);
+      await clearStop(sessionsDir, sessionId);
     }
     const plan = planAntigravity(kind, record, now);
     if (!plan)
@@ -5653,6 +5697,7 @@ async function runPermissionHook(deps = {}, agent = "claude") {
         signal: AbortSignal.timeout(3000)
       }).then(() => {}, () => {});
       if (deps.abandoned?.()) {
+        settleAsWorking = true;
         trace({ event: "exit", reason: "abandoned", seq });
         await withdrawCard();
         return;
@@ -5742,6 +5787,17 @@ async function approvalsCommand(sub, deps = {}) {
 }
 
 // src/core/antigravity-approval.ts
+var ANTIGRAVITY_PLUGIN_ROOT = resolve4(dirname2(fileURLToPath2(import.meta.url)), "..");
+function isNomoSkillCommand(command, root = ANTIGRAVITY_PLUGIN_ROOT) {
+  const c = command.endsWith(`
+`) ? command.slice(0, -1) : command;
+  if (/[\r\n]/.test(c))
+    return false;
+  return SAFE_SKILL_COMMANDS.some((key) => skillCommand(root, key) === c);
+}
+function nomoProtectedDirs(root = ANTIGRAVITY_PLUGIN_ROOT) {
+  return [root, CC_DIR];
+}
 var ANTIGRAVITY_FALLBACK = '{"decision":"allow"}';
 var CARD_TOOL = {
   run_command: "shell",
@@ -5770,6 +5826,35 @@ function loadAntigravityRules(transcriptPath) {
   }
   return out;
 }
+var WRAPPERS = new Set(["sudo", "doas", "env", "command", "exec", "nice", "time", "nohup", "xargs", "builtin"]);
+function commandWords(line) {
+  const out = [];
+  for (const segment of line.split(/[;&|\n\r`(){}]|\$\(/)) {
+    const words = segment.replace(/['"\\]/g, "").trim().split(/\s+/).filter(Boolean);
+    const base = (w) => w.slice(w.lastIndexOf("/") + 1);
+    let i = 0;
+    while (i < words.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(words[i]))
+      i++;
+    if (i >= words.length)
+      continue;
+    const first = base(words[i]);
+    if (first)
+      out.push(first);
+    if (WRAPPERS.has(first)) {
+      for (const w of words.slice(i + 1))
+        if (!w.startsWith("-") && !/^[A-Za-z_][A-Za-z0-9_]*=/.test(w))
+          out.push(base(w));
+    }
+  }
+  return out;
+}
+function regexMatches(pattern, target) {
+  try {
+    return new RegExp(pattern).test(target);
+  } catch {
+    return true;
+  }
+}
 function ruleMatches(rule, action, target, workspace, exact) {
   const m = /^([a-z_]+)\((.*)\)$/s.exec(rule.trim());
   if (!m || m[1] !== action)
@@ -5778,14 +5863,17 @@ function ruleMatches(rule, action, target, workspace, exact) {
   if (want === "*")
     return true;
   if (want.startsWith("regex:"))
-    return !exact;
+    return !exact && regexMatches(want.slice("regex:".length), target);
   if (action === "command") {
-    if (want === target.trim())
-      return true;
-    if (/[;&|$`<>(){}\n]/.test(target))
-      return !exact;
-    const a = want.split(/\s+/), b = target.trim().split(/\s+/);
-    return a.length <= b.length && a.every((w, i) => w === b[i]);
+    const wantWords = want.split(/\s+/);
+    if (!exact) {
+      const first = wantWords[0].slice(wantWords[0].lastIndexOf("/") + 1);
+      return want === target.trim() || commandWords(target).includes(first);
+    }
+    if (/[;&|$`<>(){}\n\r\\'"]/.test(target))
+      return false;
+    const b = target.trim().split(/\s+/);
+    return wantWords.length <= b.length && wantWords.every((w, i) => w === b[i]);
   }
   const base = isAbsolute4(want) ? want : workspace ? resolve4(workspace, want) : undefined;
   if (!base)
@@ -5793,7 +5881,7 @@ function ruleMatches(rule, action, target, workspace, exact) {
   const root = base.replace(/\/+$/, "");
   return target === root || target.startsWith(`${root}/`);
 }
-function antigravityApprovalRequest(input, rules = { allow: [], ask: [], deny: [] }) {
+function antigravityApprovalRequest(input, rules = { allow: [], ask: [], deny: [] }, protectedDirs = nomoProtectedDirs()) {
   const sessionId = antigravitySessionId(input);
   const call = input.toolCall;
   const agyTool = str3(call?.name);
@@ -5823,7 +5911,11 @@ function antigravityApprovalRequest(input, rules = { allow: [], ask: [], deny: [
   const hit = (list, exact) => list.some((r) => ruleMatches(r, action, target, cwd, exact));
   if (hit(rules.deny, false))
     return null;
-  if (!hit(rules.ask, false) && hit(rules.allow, true))
+  const isProtected = action === "write_file" && protectedDirs.some((d) => {
+    const r = resolve4(d);
+    return target === r || resolve4(target).startsWith(`${r}/`);
+  });
+  if (!isProtected && !hit(rules.ask, false) && hit(rules.allow, true))
     return null;
   return { sessionId, ...cwd ? { cwd } : {}, transcriptPath: str3(input.transcriptPath), agyTool, toolName, toolInput };
 }
@@ -5859,6 +5951,12 @@ async function runAntigravityApproval(raw, deps = {}) {
     const stopRequested = () => (deps.stopRequested ?? ((id) => antigravityStopRequested(SESSIONS_DIR, id, Date.now())))(req.sessionId);
     if (await stopRequested())
       return ANTIGRAVITY_STOP_DENY;
+    const command = req.toolName === "shell" ? str3(req.toolInput.command) : undefined;
+    if (command && isNomoSkillCommand(command, deps.pluginRoot)) {
+      const config = await (deps.hold?.loadConfigFn ?? loadConfig)();
+      if (config)
+        return '{"decision":"auto_approve"}';
+    }
     const stdin = JSON.stringify({
       session_id: req.sessionId,
       ...req.cwd ? { cwd: req.cwd } : {},
@@ -5882,9 +5980,6 @@ async function runAntigravityApproval(raw, deps = {}) {
         line = l;
       }
     }, "antigravity");
-    if (gone && line === undefined) {
-      await (deps.settleDone ?? ((r) => runAntigravityHook(r, "Stop")))(raw).catch(() => {});
-    }
     return antigravityDecision(line);
   } catch {
     return ANTIGRAVITY_FALLBACK;
