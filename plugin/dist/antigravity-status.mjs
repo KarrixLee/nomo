@@ -3000,12 +3000,13 @@ var allAdapters = [claudeAdapter, codexAdapter];
 import { spawn as spawn2 } from "node:child_process";
 import { existsSync as existsSync3 } from "node:fs";
 import { readdir as readdir2, readFile as readFile3, rename as rename2, stat as stat3, unlink as unlink2 } from "node:fs/promises";
-import { delimiter, join as join3 } from "node:path";
+import { delimiter, isAbsolute as isAbsolute3, join as join3 } from "node:path";
 var ANTIGRAVITY_INBOX_SUFFIX = ".agy-inbox";
 var ANTIGRAVITY_RECEIPT_SUFFIX = ".agy-reply";
 var ANTIGRAVITY_NUDGE_SUFFIX = ".agy-nudge";
 var REPLY_TEXT_MAX_CHARS = 4000;
 var REPLY_RECEIPTS_MAX = 16;
+var REPLY_PHONE_GIVE_UP_MS = 60 * 60000;
 var REPLY_INBOX_MAX_AGE_MS = 24 * 60 * 60000;
 var REPLY_NUDGE_WINDOW_MS = 60000;
 var ANTIGRAVITY_REPLY_NUDGE = "The user just sent a new message from their phone. It follows as the next user message.";
@@ -3047,7 +3048,7 @@ async function receiptOf(dir, conv, mid) {
     return;
   }
 }
-async function readReceipts(dir, conv) {
+async function readReceipts(dir, conv, now = Date.now()) {
   const rows = [];
   for (const mid of await midsOf(dir, conv, ANTIGRAVITY_RECEIPT_SUFFIX)) {
     try {
@@ -3055,11 +3056,18 @@ async function readReceipts(dir, conv) {
     } catch {}
   }
   rows.sort((a, b) => a.at - b.at);
-  for (const old of rows.splice(0, Math.max(0, rows.length - REPLY_RECEIPTS_MAX))) {
-    await unlink2(fileFor(dir, conv, old.mid, ANTIGRAVITY_RECEIPT_SUFFIX)).catch(() => {});
+  const evictable = new Set;
+  for (const old of rows.slice(0, Math.max(0, rows.length - REPLY_RECEIPTS_MAX))) {
+    const s = await receiptOf(dir, conv, old.mid);
+    if (s && s !== "q" && now - old.at > REPLY_PHONE_GIVE_UP_MS) {
+      await unlink2(fileFor(dir, conv, old.mid, ANTIGRAVITY_RECEIPT_SUFFIX)).catch(() => {});
+      evictable.add(old.mid);
+    }
   }
   const out = {};
   for (const r of rows) {
+    if (evictable.has(r.mid))
+      continue;
     const s = await receiptOf(dir, conv, r.mid);
     if (s)
       out[r.mid] = s;
@@ -3073,7 +3081,7 @@ async function enqueueReply(dir, conv, reply) {
 async function hasQueuedReplies(dir, conv) {
   return (await midsOf(dir, conv, ANTIGRAVITY_INBOX_SUFFIX)).length > 0;
 }
-async function takeReplies(dir, conv, state = "d") {
+async function takeReplies(dir, conv) {
   const out = [];
   for (const mid of await midsOf(dir, conv, ANTIGRAVITY_INBOX_SUFFIX)) {
     const path = fileFor(dir, conv, mid, ANTIGRAVITY_INBOX_SUFFIX);
@@ -3086,11 +3094,12 @@ async function takeReplies(dir, conv, state = "d") {
     try {
       const r = JSON.parse(await readFile3(claimed, "utf8"));
       const text = replyText(r.text);
-      if (text) {
-        out.push({ mid, text, ts: typeof r.ts === "number" ? r.ts : 0 });
-        await writeReceipt(dir, conv, mid, state);
-      }
-    } catch {}
+      if (!text)
+        throw new Error("bad message");
+      out.push({ mid, text, ts: typeof r.ts === "number" ? r.ts : 0 });
+    } catch {
+      await writeReceipt(dir, conv, mid, "x");
+    }
     await unlink2(claimed).catch(() => {});
   }
   return out.sort((a, b) => a.ts - b.ts || a.mid.localeCompare(b.mid));
@@ -3115,7 +3124,7 @@ async function pruneStaleReplies(dir, now = Date.now()) {
     return;
   }
   for (const n of names) {
-    if (![ANTIGRAVITY_INBOX_SUFFIX, ANTIGRAVITY_RECEIPT_SUFFIX, ANTIGRAVITY_NUDGE_SUFFIX, ANTIGRAVITY_RESUME_SUFFIX].some((x) => n.endsWith(x)))
+    if (![ANTIGRAVITY_INBOX_SUFFIX, ANTIGRAVITY_RECEIPT_SUFFIX, ANTIGRAVITY_NUDGE_SUFFIX, ANTIGRAVITY_RESUME_SUFFIX].some((x) => n.endsWith(x)) && !/\.agy-inbox\.\d+\.(take|cancel)$/.test(n))
       continue;
     try {
       if (now - (await stat3(join3(dir, n))).mtimeMs > REPLY_INBOX_MAX_AGE_MS)
@@ -3158,7 +3167,7 @@ function agyBinary(env = process.env) {
   if (env.NOMO_AGY_BIN)
     return env.NOMO_AGY_BIN;
   for (const d of (env.PATH ?? "").split(delimiter))
-    if (d && existsSync3(join3(d, "agy")))
+    if (isAbsolute3(d) && existsSync3(join3(d, "agy")))
       return join3(d, "agy");
   return join3(env.HOME ?? "", ".local", "bin", "agy");
 }
@@ -3178,13 +3187,78 @@ function spawnAgyResume(conv, cwd, text) {
   }
 }
 var ANTIGRAVITY_RESUME_SUFFIX = ".agy-resume";
-async function resumePid(dir, conv) {
+var resumeFile = (dir, conv) => join3(dir, `${conv}${ANTIGRAVITY_RESUME_SUFFIX}`);
+async function readResume(dir, conv) {
   try {
-    const n = Number(await readFile3(join3(dir, `${conv}${ANTIGRAVITY_RESUME_SUFFIX}`), "utf8"));
-    return n > 1 ? n : undefined;
+    const [p, ...mids] = (await readFile3(resumeFile(dir, conv), "utf8")).trim().split(/\s+/);
+    const pid = Number(p);
+    return pid > 1 ? { pid, mids: mids.filter((m) => MID.test(m)) } : undefined;
   } catch {
     return;
   }
+}
+async function confirmResume(dir, conv) {
+  const r = await readResume(dir, conv);
+  if (!r || r.mids.length === 0)
+    return false;
+  for (const mid of r.mids)
+    await writeReceipt(dir, conv, mid, "r");
+  await atomicWrite(resumeFile(dir, conv), String(r.pid), 384).catch(() => {});
+  return true;
+}
+var resumingNow = new Set;
+async function resumeWithQueued(dir, conv, record, extra, resume = spawnAgyResume) {
+  if (resumingNow.has(conv)) {
+    if (extra)
+      await enqueueReply(dir, conv, extra).catch(() => {});
+    return false;
+  }
+  resumingNow.add(conv);
+  try {
+    const all = [...await takeReplies(dir, conv), ...extra ? [extra] : []];
+    if (all.length === 0)
+      return false;
+    for (const r of all)
+      await writeReceipt(dir, conv, r.mid, "q");
+    const pid = resume(conv, record.cwd ?? record.origin?.cwd, all.map((r) => r.text).join(`
+
+`));
+    if (pid !== undefined) {
+      await atomicWrite(resumeFile(dir, conv), [pid, ...all.map((r) => r.mid)].join(" "), 384).catch(() => {});
+      return true;
+    }
+    for (const r of all)
+      await enqueueReply(dir, conv, r).catch(() => {});
+    return false;
+  } catch {
+    return false;
+  } finally {
+    resumingNow.delete(conv);
+  }
+}
+async function sweepStrandedReplies(dir, conv, record, deps = {}) {
+  const out = { refused: [], resumed: false };
+  try {
+    if (record.agent !== "antigravity")
+      return out;
+    const alive = deps.pidAlive ?? pidAlive;
+    const r = await readResume(dir, conv);
+    if (r && !alive(r.pid)) {
+      for (const mid of r.mids) {
+        if (await receiptOf(dir, conv, mid) === "q") {
+          await writeReceipt(dir, conv, mid, "x");
+          out.refused.push(mid);
+        }
+      }
+      await unlink2(resumeFile(dir, conv)).catch(() => {});
+    }
+    if (replyRoute(record, r !== undefined && alive(r.pid), alive) !== "resume")
+      return out;
+    if (!await hasQueuedReplies(dir, conv))
+      return out;
+    out.resumed = await resumeWithQueued(dir, conv, record, undefined, deps.resume);
+  } catch {}
+  return out;
 }
 async function handleReplyCommand(kind, conv, record, payload, deps) {
   try {
@@ -3200,26 +3274,14 @@ async function handleReplyCommand(kind, conv, record, payload, deps) {
     if (await receiptOf(dir, conv, mid))
       return "reply-duplicate";
     const alive = deps.pidAlive ?? pidAlive;
-    const resuming = await resumePid(dir, conv);
+    const resuming = (await readResume(dir, conv))?.pid;
     const route = replyRoute(record, resuming !== undefined && alive(resuming), alive);
     if (route === "reject") {
       await writeReceipt(dir, conv, mid, "x");
       return "reply-rejected";
     }
     if (route === "resume") {
-      const earlier = await takeReplies(dir, conv, "r");
-      const prompt = [...earlier.map((r) => r.text), text].join(`
-
-`);
-      const cwd = record.cwd ?? record.origin?.cwd;
-      const pid = (deps.resume ?? spawnAgyResume)(conv, cwd, prompt);
-      if (pid !== undefined) {
-        await atomicWrite(join3(dir, `${conv}${ANTIGRAVITY_RESUME_SUFFIX}`), String(pid), 384).catch(() => {});
-        await writeReceipt(dir, conv, mid, "r");
-        return "reply-resumed";
-      }
-      for (const r of earlier)
-        await enqueueReply(dir, conv, r);
+      return await resumeWithQueued(dir, conv, record, { mid, text, ts: deps.now }, deps.resume) ? "reply-resumed" : "reply-queued";
     }
     await enqueueReply(dir, conv, { mid, text, ts: deps.now });
     return "reply-queued";
@@ -4652,12 +4714,24 @@ async function runAntigravityHook(raw, eventName, deps = {}) {
       return;
     const sessionsDir = deps.sessionsDir ?? SESSIONS_DIR;
     const sync = deps.canTerminate !== false;
+    let answered = false;
+    const answer = async (line) => {
+      answered = true;
+      await (deps.emit ?? emitStdout)(line);
+    };
+    const release = async () => {
+      if (sync && !answered) {
+        answered = true;
+        if (!deps.emit)
+          await emitStdout("");
+      }
+    };
     if (eventName === "PostInvocation" && sync)
       await pruneStaleAntigravityStops(sessionsDir, now);
     const stopPendingAtStop = sync && kind === "stop" && await antigravityStopRequested(sessionsDir, sessionId, now);
     if (eventName === "PostInvocation" && deps.canTerminate !== false && await antigravityStopRequested(sessionsDir, sessionId, now)) {
       await clearStop(sessionsDir, sessionId);
-      await (deps.emit ?? emitStdout)(ANTIGRAVITY_TERMINATE);
+      await answer(ANTIGRAVITY_TERMINATE);
       (deps.trace ?? traceSession)({ event: "interrupt", sessionId, agent: "antigravity", result: "terminated" });
       kind = "stop";
     } else if (kind === "stop") {
@@ -4676,9 +4750,11 @@ async function runAntigravityHook(raw, eventName, deps = {}) {
     if (sync && eventName === "PreInvocation") {
       await pruneStaleReplies(sessionsDir);
       if (!await antigravityStopRequested(sessionsDir, sessionId, now)) {
-        const replies = await takeReplies(sessionsDir, sessionId, "d");
+        const replies = await takeReplies(sessionsDir, sessionId);
         if (replies.length > 0) {
-          await (deps.emit ?? emitStdout)(JSON.stringify({ injectSteps: replies.map((r) => ({ userMessage: r.text })) }));
+          await answer(JSON.stringify({ injectSteps: replies.map((r) => ({ userMessage: r.text })) }));
+          for (const r of replies)
+            await writeReceipt(sessionsDir, sessionId, r.mid, "d");
           await clearNudge(sessionsDir, sessionId);
           (deps.trace ?? traceSession)({ event: "reply", sessionId, agent: "antigravity", result: "injected", count: replies.length });
           repliesChanged = true;
@@ -4686,10 +4762,13 @@ async function runAntigravityHook(raw, eventName, deps = {}) {
       }
     } else if (sync && eventName === "Stop" && kind === "stop" && !stopPendingAtStop && !(record && (record.op === "done" || record.lastEvent === "done")) && await hasQueuedReplies(sessionsDir, sessionId) && !await nudgedRecently(sessionsDir, sessionId, now)) {
       await markNudged(sessionsDir, sessionId, now);
-      await (deps.emit ?? emitStdout)(JSON.stringify({ decision: "continue", reason: ANTIGRAVITY_REPLY_NUDGE }));
+      await answer(JSON.stringify({ decision: "continue", reason: ANTIGRAVITY_REPLY_NUDGE }));
       (deps.trace ?? traceSession)({ event: "reply", sessionId, agent: "antigravity", result: "continued" });
       kind = "beat";
     }
+    await release();
+    if (eventName === "PreInvocation" && await confirmResume(sessionsDir, sessionId))
+      repliesChanged = true;
     const plan = planAntigravity(kind, record, now) ?? (repliesChanged ? { op: "update", prio: 0, status: "working", turnStartedAt: record?.turnStartedAt } : null);
     if (!plan)
       return;

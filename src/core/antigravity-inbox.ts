@@ -18,8 +18,8 @@
 // RACE-SAFETY: every message is its own file, so writers never read-modify-write a shared queue. Taking
 // and cancelling both start with an atomic rename of the message file — exactly one of them wins.
 //
-// RECEIPTS: `<conv>.<mid>.agy-reply` holds one letter — q queued · d delivered · r resumed (sent as the
-// resume prompt) · c cancelled · x refused. The newest REPLY_RECEIPTS_MAX ride in the session blob as an
+// RECEIPTS: `<conv>.<mid>.agy-reply` holds one letter — q queued · d delivered · r resumed (the resumed
+// run reached its first step) · c cancelled · x refused (or a resumed run died before its first step). The newest REPLY_RECEIPTS_MAX ride in the session blob as an
 // append-last `replies` map, which is how the phone's bubble moves from "Sending…" to "Delivered". The
 // phone keeps re-sending a message (same mid, fresh nonce) until it sees a receipt for it, and a
 // receipt-holding mid is never queued twice, so a lost relay copy or a double delivery is harmless.
@@ -27,7 +27,7 @@
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { readdir, readFile, rename, stat, unlink } from "node:fs/promises";
-import { delimiter, join } from "node:path";
+import { delimiter, isAbsolute, join } from "node:path";
 import { atomicWrite, pidAlive, SessionRecord } from "./shared";
 
 export const ANTIGRAVITY_INBOX_SUFFIX = ".agy-inbox";
@@ -38,6 +38,9 @@ export const ANTIGRAVITY_NUDGE_SUFFIX = ".agy-nudge";
 export const REPLY_TEXT_MAX_CHARS = 4000;
 /** Receipts kept per conversation (and carried in its blob). */
 export const REPLY_RECEIPTS_MAX = 16;
+/** The phone stops re-sending a message after this long; a receipt is never evicted sooner (a re-send
+ *  of an evicted mid would be queued, and delivered, a second time). */
+export const REPLY_PHONE_GIVE_UP_MS = 60 * 60_000;
 /** A message nobody consumed in a day (the conversation was abandoned) is dropped. */
 export const REPLY_INBOX_MAX_AGE_MS = 24 * 60 * 60_000;
 /** Within this long of a Stop's continue, another Stop does NOT continue again (no endless loop if the
@@ -89,19 +92,26 @@ export async function receiptOf(dir: string, conv: string, mid: string): Promise
   } catch { return undefined; }
 }
 
-/** The newest REPLY_RECEIPTS_MAX receipts of a conversation as {mid: state}, oldest first; older ones are
- *  deleted. Never throws. */
-export async function readReceipts(dir: string, conv: string): Promise<Record<string, ReplyReceipt>> {
+/** A conversation's receipts as {mid: state}, oldest first. Beyond the newest REPLY_RECEIPTS_MAX, a
+ *  receipt is deleted only once it is final (not `q`) AND older than the phone's give-up window. Never
+ *  throws. */
+export async function readReceipts(dir: string, conv: string, now: number = Date.now()): Promise<Record<string, ReplyReceipt>> {
   const rows: { mid: string; at: number }[] = [];
   for (const mid of await midsOf(dir, conv, ANTIGRAVITY_RECEIPT_SUFFIX)) {
     try { rows.push({ mid, at: (await stat(fileFor(dir, conv, mid, ANTIGRAVITY_RECEIPT_SUFFIX))).mtimeMs }); } catch { /* raced */ }
   }
   rows.sort((a, b) => a.at - b.at);
-  for (const old of rows.splice(0, Math.max(0, rows.length - REPLY_RECEIPTS_MAX))) {
-    await unlink(fileFor(dir, conv, old.mid, ANTIGRAVITY_RECEIPT_SUFFIX)).catch(() => {});
+  const evictable = new Set<string>();
+  for (const old of rows.slice(0, Math.max(0, rows.length - REPLY_RECEIPTS_MAX))) {
+    const s = await receiptOf(dir, conv, old.mid);
+    if (s && s !== "q" && now - old.at > REPLY_PHONE_GIVE_UP_MS) {
+      await unlink(fileFor(dir, conv, old.mid, ANTIGRAVITY_RECEIPT_SUFFIX)).catch(() => {});
+      evictable.add(old.mid);
+    }
   }
   const out: Record<string, ReplyReceipt> = {};
   for (const r of rows) {
+    if (evictable.has(r.mid)) continue;
     const s = await receiptOf(dir, conv, r.mid);
     if (s) out[r.mid] = s;
   }
@@ -120,8 +130,9 @@ export async function hasQueuedReplies(dir: string, conv: string): Promise<boole
 }
 
 /** Take every queued message of `conv` (rename-claimed, so a racing take or cancel can never get the same
- *  one), stamp each `state`, and return them oldest first. Never throws. */
-export async function takeReplies(dir: string, conv: string, state: ReplyReceipt = "d"): Promise<QueuedReply[]> {
+ *  one) and return them oldest first. Their receipts are the caller's to write (`d` only AFTER the
+ *  message was handed over); an unreadable message is refused (`x`) here. Never throws. */
+export async function takeReplies(dir: string, conv: string): Promise<QueuedReply[]> {
   const out: QueuedReply[] = [];
   for (const mid of await midsOf(dir, conv, ANTIGRAVITY_INBOX_SUFFIX)) {
     const path = fileFor(dir, conv, mid, ANTIGRAVITY_INBOX_SUFFIX);
@@ -130,11 +141,9 @@ export async function takeReplies(dir: string, conv: string, state: ReplyReceipt
     try {
       const r = JSON.parse(await readFile(claimed, "utf8")) as Partial<QueuedReply>;
       const text = replyText(r.text);
-      if (text) {
-        out.push({ mid, text, ts: typeof r.ts === "number" ? r.ts : 0 });
-        await writeReceipt(dir, conv, mid, state);
-      }
-    } catch { /* unreadable → dropped */ }
+      if (!text) throw new Error("bad message");
+      out.push({ mid, text, ts: typeof r.ts === "number" ? r.ts : 0 });
+    } catch { await writeReceipt(dir, conv, mid, "x"); } // unreadable → dropped, and the phone told
     await unlink(claimed).catch(() => {});
   }
   return out.sort((a, b) => a.ts - b.ts || a.mid.localeCompare(b.mid));
@@ -151,13 +160,15 @@ export async function cancelReply(dir: string, conv: string, mid: string): Promi
   return true;
 }
 
-/** Drop messages (and receipts / nudge marks) older than REPLY_INBOX_MAX_AGE_MS, any conversation, so an
- *  abandoned one cannot keep every PreInvocation on the hook wrapper's synchronous path. Never throws. */
+/** Drop messages (and receipts / nudge marks / resume marks / the `.take` and `.cancel` claims a killed
+ *  process left behind) older than REPLY_INBOX_MAX_AGE_MS, any conversation, so an abandoned one cannot
+ *  keep every PreInvocation on the hook wrapper's synchronous path. Never throws. */
 export async function pruneStaleReplies(dir: string, now: number = Date.now()): Promise<void> {
   let names: string[] = [];
   try { names = await readdir(dir); } catch { return; }
   for (const n of names) {
-    if (![ANTIGRAVITY_INBOX_SUFFIX, ANTIGRAVITY_RECEIPT_SUFFIX, ANTIGRAVITY_NUDGE_SUFFIX, ANTIGRAVITY_RESUME_SUFFIX].some((x) => n.endsWith(x))) continue;
+    if (![ANTIGRAVITY_INBOX_SUFFIX, ANTIGRAVITY_RECEIPT_SUFFIX, ANTIGRAVITY_NUDGE_SUFFIX, ANTIGRAVITY_RESUME_SUFFIX].some((x) => n.endsWith(x))
+      && !/\.agy-inbox\.\d+\.(take|cancel)$/.test(n)) continue;
     try { if (now - (await stat(join(dir, n))).mtimeMs > REPLY_INBOX_MAX_AGE_MS) await unlink(join(dir, n)); } catch { /* raced */ }
   }
 }
@@ -200,11 +211,12 @@ export function replyRoute(
   return surface === "cli" && typeof cwd === "string" && cwd.startsWith("/") ? "resume" : "reject";
 }
 
-/** The `agy` to resume with: NOMO_AGY_BIN (tests), else the first `agy` on PATH, else ~/.local/bin/agy
- *  (where its installer puts it). */
+/** The `agy` to resume with: NOMO_AGY_BIN (tests), else the first `agy` on an ABSOLUTE PATH entry (a
+ *  relative or empty one would resolve against whatever directory the watchdog runs in), else
+ *  ~/.local/bin/agy (where its installer puts it). */
 export function agyBinary(env: NodeJS.ProcessEnv = process.env): string {
   if (env.NOMO_AGY_BIN) return env.NOMO_AGY_BIN;
-  for (const d of (env.PATH ?? "").split(delimiter)) if (d && existsSync(join(d, "agy"))) return join(d, "agy");
+  for (const d of (env.PATH ?? "").split(delimiter)) if (isAbsolute(d) && existsSync(join(d, "agy"))) return join(d, "agy");
   return join(env.HOME ?? "", ".local", "bin", "agy");
 }
 
@@ -221,12 +233,87 @@ export function spawnAgyResume(conv: string, cwd: string, text: string): number 
   } catch { return undefined; }
 }
 
-/** `<conv>.agy-resume` holds the pid of the agy Nomo resumed the conversation in, so a second message
- *  queues behind it instead of starting a second agy on the same conversation — across watchdog restarts
- *  too (the record's own pid only moves at the resumed run's first hook). */
+/** `<conv>.agy-resume` holds `<pid> [mid…]`: the agy Nomo resumed the conversation in, so a second
+ *  message queues behind it instead of starting a second agy on the same conversation — across watchdog
+ *  restarts too (the record's own pid only moves at the resumed run's first hook) — and the messages it
+ *  carries, still `q` until that run's first PreInvocation (confirmResume) turns them `r`. */
 export const ANTIGRAVITY_RESUME_SUFFIX = ".agy-resume";
-async function resumePid(dir: string, conv: string): Promise<number | undefined> {
-  try { const n = Number(await readFile(join(dir, `${conv}${ANTIGRAVITY_RESUME_SUFFIX}`), "utf8")); return n > 1 ? n : undefined; } catch { return undefined; }
+const resumeFile = (dir: string, conv: string) => join(dir, `${conv}${ANTIGRAVITY_RESUME_SUFFIX}`);
+async function readResume(dir: string, conv: string): Promise<{ pid: number; mids: string[] } | undefined> {
+  try {
+    const [p, ...mids] = (await readFile(resumeFile(dir, conv), "utf8")).trim().split(/\s+/);
+    const pid = Number(p);
+    return pid > 1 ? { pid, mids: mids.filter((m) => MID.test(m)) } : undefined;
+  } catch { return undefined; }
+}
+
+/** The resumed run is alive (its first PreInvocation fired): its messages go `r`. True if any did. */
+export async function confirmResume(dir: string, conv: string): Promise<boolean> {
+  const r = await readResume(dir, conv);
+  if (!r || r.mids.length === 0) return false;
+  for (const mid of r.mids) await writeReceipt(dir, conv, mid, "r");
+  await atomicWrite(resumeFile(dir, conv), String(r.pid), 0o600).catch(() => {});
+  return true;
+}
+
+/** Conversations this process is starting an agy for right now (one resume at a time per conversation). */
+const resumingNow = new Set<string>();
+
+/** Resume an idle `agy` CLI conversation with every message still queued for it, plus `extra` (a new
+ *  one). Receipts stay `q` until the run's first PreInvocation. If agy cannot be started, everything is
+ *  (re)queued for the next turn at the Mac. True = an agy was started. Never throws. */
+export async function resumeWithQueued(
+  dir: string, conv: string, record: SessionRecord, extra: QueuedReply | undefined,
+  resume: (conv: string, cwd: string, text: string) => number | undefined = spawnAgyResume,
+): Promise<boolean> {
+  if (resumingNow.has(conv)) {
+    if (extra) await enqueueReply(dir, conv, extra).catch(() => {});
+    return false;
+  }
+  resumingNow.add(conv);
+  try {
+    const all = [...await takeReplies(dir, conv), ...(extra ? [extra] : [])];
+    if (all.length === 0) return false;
+    for (const r of all) await writeReceipt(dir, conv, r.mid, "q");
+    const pid = resume(conv, (record.cwd ?? record.origin?.cwd)!, all.map((r) => r.text).join("\n\n"));
+    if (pid !== undefined) {
+      await atomicWrite(resumeFile(dir, conv), [pid, ...all.map((r) => r.mid)].join(" "), 0o600).catch(() => {});
+      return true;
+    }
+    for (const r of all) await enqueueReply(dir, conv, r).catch(() => {});
+    return false;
+  } catch {
+    return false;
+  } finally {
+    resumingNow.delete(conv);
+  }
+}
+
+/** The watchdog's net for a stranded message (queued while the owner agy — or Nomo's resume — was alive,
+ *  or landing between the Stop hook's last look and the row going done): an idle `agy` CLI row whose
+ *  process and resume are both gone, with a non-empty inbox, is resumed exactly as a fresh reply would
+ *  be. First, a resume whose agy died before its first step has its messages refused (`x`) — `refused`
+ *  lists them so the caller can log and publish. Never throws. */
+export async function sweepStrandedReplies(
+  dir: string, conv: string, record: SessionRecord,
+  deps: { pidAlive?: (pid: number) => boolean; resume?: (conv: string, cwd: string, text: string) => number | undefined } = {},
+): Promise<{ refused: string[]; resumed: boolean }> {
+  const out = { refused: [] as string[], resumed: false };
+  try {
+    if (record.agent !== "antigravity") return out;
+    const alive = deps.pidAlive ?? pidAlive;
+    const r = await readResume(dir, conv);
+    if (r && !alive(r.pid)) {
+      for (const mid of r.mids) {
+        if ((await receiptOf(dir, conv, mid)) === "q") { await writeReceipt(dir, conv, mid, "x"); out.refused.push(mid); }
+      }
+      await unlink(resumeFile(dir, conv)).catch(() => {});
+    }
+    if (replyRoute(record, r !== undefined && alive(r.pid), alive) !== "resume") return out;
+    if (!(await hasQueuedReplies(dir, conv))) return out;
+    out.resumed = await resumeWithQueued(dir, conv, record, undefined, deps.resume);
+  } catch { /* best-effort: the next sweep looks again */ }
+  return out;
 }
 
 export type ReplyCommandResult =
@@ -254,25 +341,16 @@ export async function handleReplyCommand(
     if (!text) return "malformed";
     if (await receiptOf(dir, conv, mid)) return "reply-duplicate"; // a re-send: already handled
     const alive = deps.pidAlive ?? pidAlive;
-    const resuming = await resumePid(dir, conv);
+    const resuming = (await readResume(dir, conv))?.pid;
     const route = replyRoute(record, resuming !== undefined && alive(resuming), alive);
     if (route === "reject") {
       await writeReceipt(dir, conv, mid, "x");
       return "reply-rejected";
     }
     if (route === "resume") {
-      // Anything still queued from before (an agy that quit before its next step) goes along, in order.
-      const earlier = await takeReplies(dir, conv, "r");
-      const prompt = [...earlier.map((r) => r.text), text].join("\n\n");
-      const cwd = (record.cwd ?? record.origin?.cwd)!;
-      const pid = (deps.resume ?? spawnAgyResume)(conv, cwd, prompt);
-      if (pid !== undefined) {
-        await atomicWrite(join(dir, `${conv}${ANTIGRAVITY_RESUME_SUFFIX}`), String(pid), 0o600).catch(() => {});
-        await writeReceipt(dir, conv, mid, "r");
-        return "reply-resumed";
-      }
-      // Could not start agy: keep everything queued (the next turn at the Mac takes it).
-      for (const r of earlier) await enqueueReply(dir, conv, r);
+      // Anything still queued from before (an agy that quit before its next step) goes along, in order;
+      // if agy cannot be started, everything stays queued (the next turn at the Mac takes it).
+      return (await resumeWithQueued(dir, conv, record, { mid, text, ts: deps.now }, deps.resume)) ? "reply-resumed" : "reply-queued";
     }
     await enqueueReply(dir, conv, { mid, text, ts: deps.now });
     return "reply-queued";

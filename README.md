@@ -583,14 +583,18 @@ description is dropped before the command is.
   Phone replies take the same path: a `send-message` command (sealed by your paired phone, passing the
   same gates, with a message id and a text of at most 4,000 characters with no control characters but
   line breaks) is written as one owner-only file per message (`<conversation>.<id>.agy-inbox` in Nomo's
-  sessions folder). Only while such a file exists do `PreInvocation` and `Stop` run in the foreground
-  (capped at 4 seconds); the wrapper then prints the bundle's output only if it is exactly
+  sessions folder). Only while such a file exists for the hook's own conversation do `PreInvocation`
+  and `Stop` run in the foreground (capped at 4 seconds, and the wrapper stops waiting at the bundle's
+  first line, before any network call); the wrapper then prints that line only if it is exactly
   `{"injectSteps":[{"userMessage":"…"}…]}` (PreInvocation) or `{"decision":"continue","reason":"…"}`
   (Stop) on one line, else `{}`. A Stop continues at most once a minute for queued messages, never for
   a turn your phone is stopping, and messages nobody picked up are deleted after a day. The only
   process Nomo ever starts for a reply is `agy --conversation <id> --print=<message>` (the message is
   one argument, never parsed by a shell), for an `agy` CLI conversation this computer tracks whose
-  `agy` has exited, in the folder that conversation ran in.
+  `agy` has exited, in the folder that conversation ran in — either when the message arrives or, for
+  a message that was queued behind an `agy` that has since exited, from the watchdog's sweep. That
+  `agy` is found through `NOMO_AGY_BIN`, else the first *absolute* `PATH` entry holding one (a
+  relative entry is ignored), else `~/.local/bin/agy`.
   Antigravity treats a failing `PreToolUse` hook as a block, so `antigravity-approve.sh` checks the
   hook's output against the only three replies Nomo sends (`allow`, `auto_approve`, `deny` with a
   reason) and answers `{"decision":"allow"}` — Antigravity's own permission settings and prompt — for

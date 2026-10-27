@@ -95,7 +95,7 @@ async function sha256Hex(s) {
 import { spawn as spawn2 } from "node:child_process";
 import { existsSync as existsSync2 } from "node:fs";
 import { readdir, readFile as readFile2, rename as rename2, stat as stat2, unlink as unlink2 } from "node:fs/promises";
-import { delimiter, join as join2 } from "node:path";
+import { delimiter, isAbsolute as isAbsolute2, join as join2 } from "node:path";
 
 // src/core/shared.ts
 import { access, chmod, open, readFile, rename, stat, mkdir, unlink, writeFile } from "node:fs/promises";
@@ -1090,6 +1090,7 @@ var ANTIGRAVITY_RECEIPT_SUFFIX = ".agy-reply";
 var ANTIGRAVITY_NUDGE_SUFFIX = ".agy-nudge";
 var REPLY_TEXT_MAX_CHARS = 4000;
 var REPLY_RECEIPTS_MAX = 16;
+var REPLY_PHONE_GIVE_UP_MS = 60 * 60000;
 var REPLY_INBOX_MAX_AGE_MS = 24 * 60 * 60000;
 var REPLY_NUDGE_WINDOW_MS = 60000;
 var ANTIGRAVITY_REPLY_NUDGE = "The user just sent a new message from their phone. It follows as the next user message.";
@@ -1131,7 +1132,7 @@ async function receiptOf(dir, conv, mid) {
     return;
   }
 }
-async function readReceipts(dir, conv) {
+async function readReceipts(dir, conv, now = Date.now()) {
   const rows = [];
   for (const mid of await midsOf(dir, conv, ANTIGRAVITY_RECEIPT_SUFFIX)) {
     try {
@@ -1139,11 +1140,18 @@ async function readReceipts(dir, conv) {
     } catch {}
   }
   rows.sort((a, b) => a.at - b.at);
-  for (const old of rows.splice(0, Math.max(0, rows.length - REPLY_RECEIPTS_MAX))) {
-    await unlink2(fileFor(dir, conv, old.mid, ANTIGRAVITY_RECEIPT_SUFFIX)).catch(() => {});
+  const evictable = new Set;
+  for (const old of rows.slice(0, Math.max(0, rows.length - REPLY_RECEIPTS_MAX))) {
+    const s = await receiptOf(dir, conv, old.mid);
+    if (s && s !== "q" && now - old.at > REPLY_PHONE_GIVE_UP_MS) {
+      await unlink2(fileFor(dir, conv, old.mid, ANTIGRAVITY_RECEIPT_SUFFIX)).catch(() => {});
+      evictable.add(old.mid);
+    }
   }
   const out = {};
   for (const r of rows) {
+    if (evictable.has(r.mid))
+      continue;
     const s = await receiptOf(dir, conv, r.mid);
     if (s)
       out[r.mid] = s;
@@ -1157,7 +1165,7 @@ async function enqueueReply(dir, conv, reply) {
 async function hasQueuedReplies(dir, conv) {
   return (await midsOf(dir, conv, ANTIGRAVITY_INBOX_SUFFIX)).length > 0;
 }
-async function takeReplies(dir, conv, state = "d") {
+async function takeReplies(dir, conv) {
   const out = [];
   for (const mid of await midsOf(dir, conv, ANTIGRAVITY_INBOX_SUFFIX)) {
     const path = fileFor(dir, conv, mid, ANTIGRAVITY_INBOX_SUFFIX);
@@ -1170,11 +1178,12 @@ async function takeReplies(dir, conv, state = "d") {
     try {
       const r = JSON.parse(await readFile2(claimed, "utf8"));
       const text = replyText(r.text);
-      if (text) {
-        out.push({ mid, text, ts: typeof r.ts === "number" ? r.ts : 0 });
-        await writeReceipt(dir, conv, mid, state);
-      }
-    } catch {}
+      if (!text)
+        throw new Error("bad message");
+      out.push({ mid, text, ts: typeof r.ts === "number" ? r.ts : 0 });
+    } catch {
+      await writeReceipt(dir, conv, mid, "x");
+    }
     await unlink2(claimed).catch(() => {});
   }
   return out.sort((a, b) => a.ts - b.ts || a.mid.localeCompare(b.mid));
@@ -1199,7 +1208,7 @@ async function pruneStaleReplies(dir, now = Date.now()) {
     return;
   }
   for (const n of names) {
-    if (![ANTIGRAVITY_INBOX_SUFFIX, ANTIGRAVITY_RECEIPT_SUFFIX, ANTIGRAVITY_NUDGE_SUFFIX, ANTIGRAVITY_RESUME_SUFFIX].some((x) => n.endsWith(x)))
+    if (![ANTIGRAVITY_INBOX_SUFFIX, ANTIGRAVITY_RECEIPT_SUFFIX, ANTIGRAVITY_NUDGE_SUFFIX, ANTIGRAVITY_RESUME_SUFFIX].some((x) => n.endsWith(x)) && !/\.agy-inbox\.\d+\.(take|cancel)$/.test(n))
       continue;
     try {
       if (now - (await stat2(join2(dir, n))).mtimeMs > REPLY_INBOX_MAX_AGE_MS)
@@ -1242,7 +1251,7 @@ function agyBinary(env = process.env) {
   if (env.NOMO_AGY_BIN)
     return env.NOMO_AGY_BIN;
   for (const d of (env.PATH ?? "").split(delimiter))
-    if (d && existsSync2(join2(d, "agy")))
+    if (isAbsolute2(d) && existsSync2(join2(d, "agy")))
       return join2(d, "agy");
   return join2(env.HOME ?? "", ".local", "bin", "agy");
 }
@@ -1262,13 +1271,78 @@ function spawnAgyResume(conv, cwd, text) {
   }
 }
 var ANTIGRAVITY_RESUME_SUFFIX = ".agy-resume";
-async function resumePid(dir, conv) {
+var resumeFile = (dir, conv) => join2(dir, `${conv}${ANTIGRAVITY_RESUME_SUFFIX}`);
+async function readResume(dir, conv) {
   try {
-    const n = Number(await readFile2(join2(dir, `${conv}${ANTIGRAVITY_RESUME_SUFFIX}`), "utf8"));
-    return n > 1 ? n : undefined;
+    const [p, ...mids] = (await readFile2(resumeFile(dir, conv), "utf8")).trim().split(/\s+/);
+    const pid = Number(p);
+    return pid > 1 ? { pid, mids: mids.filter((m) => MID.test(m)) } : undefined;
   } catch {
     return;
   }
+}
+async function confirmResume(dir, conv) {
+  const r = await readResume(dir, conv);
+  if (!r || r.mids.length === 0)
+    return false;
+  for (const mid of r.mids)
+    await writeReceipt(dir, conv, mid, "r");
+  await atomicWrite(resumeFile(dir, conv), String(r.pid), 384).catch(() => {});
+  return true;
+}
+var resumingNow = new Set;
+async function resumeWithQueued(dir, conv, record, extra, resume = spawnAgyResume) {
+  if (resumingNow.has(conv)) {
+    if (extra)
+      await enqueueReply(dir, conv, extra).catch(() => {});
+    return false;
+  }
+  resumingNow.add(conv);
+  try {
+    const all = [...await takeReplies(dir, conv), ...extra ? [extra] : []];
+    if (all.length === 0)
+      return false;
+    for (const r of all)
+      await writeReceipt(dir, conv, r.mid, "q");
+    const pid = resume(conv, record.cwd ?? record.origin?.cwd, all.map((r) => r.text).join(`
+
+`));
+    if (pid !== undefined) {
+      await atomicWrite(resumeFile(dir, conv), [pid, ...all.map((r) => r.mid)].join(" "), 384).catch(() => {});
+      return true;
+    }
+    for (const r of all)
+      await enqueueReply(dir, conv, r).catch(() => {});
+    return false;
+  } catch {
+    return false;
+  } finally {
+    resumingNow.delete(conv);
+  }
+}
+async function sweepStrandedReplies(dir, conv, record, deps = {}) {
+  const out = { refused: [], resumed: false };
+  try {
+    if (record.agent !== "antigravity")
+      return out;
+    const alive = deps.pidAlive ?? pidAlive;
+    const r = await readResume(dir, conv);
+    if (r && !alive(r.pid)) {
+      for (const mid of r.mids) {
+        if (await receiptOf(dir, conv, mid) === "q") {
+          await writeReceipt(dir, conv, mid, "x");
+          out.refused.push(mid);
+        }
+      }
+      await unlink2(resumeFile(dir, conv)).catch(() => {});
+    }
+    if (replyRoute(record, r !== undefined && alive(r.pid), alive) !== "resume")
+      return out;
+    if (!await hasQueuedReplies(dir, conv))
+      return out;
+    out.resumed = await resumeWithQueued(dir, conv, record, undefined, deps.resume);
+  } catch {}
+  return out;
 }
 async function handleReplyCommand(kind, conv, record, payload, deps) {
   try {
@@ -1284,26 +1358,14 @@ async function handleReplyCommand(kind, conv, record, payload, deps) {
     if (await receiptOf(dir, conv, mid))
       return "reply-duplicate";
     const alive = deps.pidAlive ?? pidAlive;
-    const resuming = await resumePid(dir, conv);
+    const resuming = (await readResume(dir, conv))?.pid;
     const route = replyRoute(record, resuming !== undefined && alive(resuming), alive);
     if (route === "reject") {
       await writeReceipt(dir, conv, mid, "x");
       return "reply-rejected";
     }
     if (route === "resume") {
-      const earlier = await takeReplies(dir, conv, "r");
-      const prompt = [...earlier.map((r) => r.text), text].join(`
-
-`);
-      const cwd = record.cwd ?? record.origin?.cwd;
-      const pid = (deps.resume ?? spawnAgyResume)(conv, cwd, prompt);
-      if (pid !== undefined) {
-        await atomicWrite(join2(dir, `${conv}${ANTIGRAVITY_RESUME_SUFFIX}`), String(pid), 384).catch(() => {});
-        await writeReceipt(dir, conv, mid, "r");
-        return "reply-resumed";
-      }
-      for (const r of earlier)
-        await enqueueReply(dir, conv, r);
+      return await resumeWithQueued(dir, conv, record, { mid, text, ts: deps.now }, deps.resume) ? "reply-resumed" : "reply-queued";
     }
     await enqueueReply(dir, conv, { mid, text, ts: deps.now });
     return "reply-queued";
@@ -1318,7 +1380,7 @@ import { existsSync as existsSync3 } from "node:fs";
 import { readdir as readdir2, readFile as readFile3, stat as stat3 } from "node:fs/promises";
 import { devNull } from "node:os";
 import { promisify as promisify2 } from "node:util";
-import { basename as basename2, isAbsolute as isAbsolute2, join as join3, resolve as resolve2 } from "node:path";
+import { basename as basename2, isAbsolute as isAbsolute3, join as join3, resolve as resolve2 } from "node:path";
 
 // src/core/terminal-focus.ts
 import { execFile } from "node:child_process";
@@ -3128,7 +3190,7 @@ function antigravityDataDirs() {
   return [`${home}/.gemini/antigravity`, `${home}/.gemini/antigravity-cli`];
 }
 function antigravityDataDirFor(transcriptPath) {
-  if (!transcriptPath || !isAbsolute2(transcriptPath))
+  if (!transcriptPath || !isAbsolute3(transcriptPath))
     return;
   const normalized = resolve2(transcriptPath);
   const i = normalized.indexOf("/brain/");
@@ -5537,7 +5599,7 @@ var MAX_DEFINITIVE_POLL_FAILURES = 2;
 import { readFile as readFile8, realpath, unlink as unlink4 } from "node:fs/promises";
 import { appendFileSync as appendFileSync2, statSync as statSync2, truncateSync as truncateSync2 } from "node:fs";
 import { hostname as hostname2 } from "node:os";
-import { basename as basename5, isAbsolute as isAbsolute3, relative, resolve as resolve3 } from "node:path";
+import { basename as basename5, isAbsolute as isAbsolute4, relative, resolve as resolve3 } from "node:path";
 
 // src/core/hook.ts
 import { readdir as readdir4, readFile as readFile7, unlink as unlink3 } from "node:fs/promises";
@@ -6495,7 +6557,7 @@ async function loadCodexTurnPolicy(transcriptPath, turnId, sessionId, home = cod
     const sessionsRoot = await realpath(resolve3(home, "sessions"));
     const rollout = await realpath(transcriptPath);
     const rel = relative(sessionsRoot, rollout);
-    if (rel === "" || rel.startsWith("..") || isAbsolute3(rel))
+    if (rel === "" || rel.startsWith("..") || isAbsolute4(rel))
       return null;
     const head = await readPrefix(rollout, CODEX_ROLLOUT_HEAD_BYTES);
     if (codexRolloutSessionId(head) !== sessionId)
@@ -8994,18 +9056,21 @@ async function interruptSession(adapter, sessionId, record, now, deps) {
   }
   return "unsupported";
 }
-async function publishReplyReceipts(config, sessionId, dir) {
+async function publishReplyReceipts(config, sessionId, dir, deps = {}) {
   const path = `${dir}/${sessionId}.json`;
   const record = await readRecordAt(path);
   if (!record || typeof record.blob !== "string" || record.blob.length === 0)
     return;
   const plain = await decryptBlob(config.e2eKey, record.blob);
-  const blob = await encryptBlob(config.e2eKey, { ...plain, replies: await readReceipts(dir, sessionId) });
+  const blob = await encryptBlob(config.e2eKey, { ...plain, replies: await (deps.receipts ?? readReceipts)(dir, sessionId) });
+  const latest = await readRecordAt(path);
+  if (!latest || latest.ts !== record.ts || latest.blob !== record.blob)
+    return;
   const next = { ...record, blob };
   await atomicWrite(path, JSON.stringify(next), 384);
   const envelope = buildHeartbeatEnvelope(sessionId, next, Date.now(), config.pairingId);
   if (envelope)
-    await postEvent(config, envelope);
+    await (deps.post ?? postEvent)(config, envelope);
 }
 async function drainCommands(config, deps = {}) {
   try {
@@ -10071,6 +10136,16 @@ async function sweep(config, deps = {}) {
       remaining++;
       continue;
     }
+    if (verdict === "keep" && record?.agent === "antigravity" && !lanRunningUnderTest()) {
+      const stranded = await sweepStrandedReplies(SESSIONS_DIR, sessionId, record);
+      if (stranded.resumed)
+        traceFocus({}, { event: "reply", sessionId, agent: "antigravity", result: "resumed-stranded" });
+      if (stranded.refused.length > 0) {
+        traceFocus({}, { event: "reply", sessionId, agent: "antigravity", result: "resume-died", reason: "agy exited before its first step", mids: stranded.refused });
+        if (config)
+          await publishReplyReceipts(config, sessionId, SESSIONS_DIR).catch(() => {});
+      }
+    }
     if (verdict === "keep") {
       let planVerificationHandled = false;
       if (config && record) {
@@ -10661,6 +10736,7 @@ export {
   postOutcomeForStatus,
   provisionalsCoveredByReal,
   pruneStaleDecisionHolds,
+  publishReplyReceipts,
   reconcileProvisionalsSweep,
   recordMovedSince,
   repairTitle,

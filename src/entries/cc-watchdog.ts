@@ -34,7 +34,7 @@ import { hostname } from "node:os";
 import { basename } from "node:path";
 import { Bytes, decryptBlob, encryptBlob } from "../core/crypto";
 import {
-  antigravitySurface, handleReplyCommand, readReceipts, ReplyCommandDeps, ReplyCommandResult,
+  antigravitySurface, handleReplyCommand, readReceipts, ReplyCommandDeps, ReplyCommandResult, sweepStrandedReplies,
 } from "../core/antigravity-inbox";
 import { adapterFor, AgentAdapter, allAdapters, antigravityRunStatus, codexAdapter, codexTurnActiveFromTail, CodexPlanPickerEvidence, DiscoveredSession } from "../core/adapter";
 import type { LocateTuiReason } from "../core/adapter";
@@ -1386,17 +1386,24 @@ async function interruptSession(
 
 /** Reseal a session's stored blob with its current reply receipts (the append-last `replies` key the
  *  phone's reply bubbles read), store it on the record (so heartbeats and the LAN feed carry it too) and
- *  post it. Best-effort: the next hook frame carries the receipts anyway. */
-async function publishReplyReceipts(config: Config, sessionId: string, dir: string): Promise<void> {
+ *  post it. Best-effort: the next hook frame carries the receipts anyway. A hook that rewrote the record
+ *  meanwhile wins: its frame already carries the receipts, and this must not clobber it with an older
+ *  blob. (Not a lock — the window left is the one write call; the next hook frame repairs it.) */
+export async function publishReplyReceipts(
+  config: Config, sessionId: string, dir: string,
+  deps: { post?: typeof postEvent; receipts?: typeof readReceipts } = {},
+): Promise<void> {
   const path = `${dir}/${sessionId}.json`;
   const record = await readRecordAt(path);
   if (!record || typeof record.blob !== "string" || record.blob.length === 0) return;
   const plain = await decryptBlob(config.e2eKey, record.blob) as Record<string, unknown>;
-  const blob = await encryptBlob(config.e2eKey, { ...plain, replies: await readReceipts(dir, sessionId) });
+  const blob = await encryptBlob(config.e2eKey, { ...plain, replies: await (deps.receipts ?? readReceipts)(dir, sessionId) });
+  const latest = await readRecordAt(path);
+  if (!latest || latest.ts !== record.ts || latest.blob !== record.blob) return;
   const next = { ...record, blob };
   await atomicWrite(path, JSON.stringify(next), 0o600);
   const envelope = buildHeartbeatEnvelope(sessionId, next, Date.now(), config.pairingId);
-  if (envelope) await postEvent(config, envelope);
+  if (envelope) await (deps.post ?? postEvent)(config, envelope);
 }
 
 /** Decrypt, VALIDATE, then execute every buffered command; returns how many actually focused
@@ -3551,6 +3558,15 @@ async function sweep(config: Config | null, deps: SweepDeps = {}): Promise<Sweep
         typeof record.retiredAt === "number" && Number.isFinite(record.retiredAt)) {
       remaining++;
       continue;
+    }
+    if (verdict === "keep" && record?.agent === "antigravity" && !lanRunningUnderTest()) {
+      // A phone reply stranded behind an agy that has since exited is resumed (core/antigravity-inbox).
+      const stranded = await sweepStrandedReplies(SESSIONS_DIR, sessionId, record);
+      if (stranded.resumed) traceFocus({}, { event: "reply", sessionId, agent: "antigravity", result: "resumed-stranded" });
+      if (stranded.refused.length > 0) {
+        traceFocus({}, { event: "reply", sessionId, agent: "antigravity", result: "resume-died", reason: "agy exited before its first step", mids: stranded.refused });
+        if (config) await publishReplyReceipts(config, sessionId, SESSIONS_DIR).catch(() => {});
+      }
     }
     if (verdict === "keep") {
       // Long-lived Plan verification runs before the done-debt net: a killed/old Stop may have left a

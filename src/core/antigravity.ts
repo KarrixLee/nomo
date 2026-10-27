@@ -7,7 +7,9 @@
 // synchronous runs: ANTIGRAVITY_TERMINATE on a PostInvocation that consumed a phone Stop flag, and a
 // phone REPLY — {"injectSteps":[…]} on a PreInvocation, {"decision":"continue",…} on a Stop (see
 // antigravity-inbox.ts). Every other `{}` is printed by plugin/scripts/antigravity-hook.sh, which also
-// re-validates whatever we print against exactly those shapes. It always exits 0 and swallows every
+// re-validates whatever we print against exactly those shapes. On a synchronous run, a run with nothing to
+// say prints an EMPTY line as soon as it knows (before the title read and the POST): the wrapper reads
+// ONE line and returns, so Antigravity never waits on the network. It always exits 0 and swallows every
 // error. (PreToolUse — phone approvals — is a separate hook: core/antigravity-approval.ts.)
 //
 // PHONE STOP (verified agy 1.4.8): the watchdog stamps `<sessions>/<conversationId>.agy-interrupt` (the
@@ -34,8 +36,8 @@ import { hostname } from "node:os";
 import { basename } from "node:path";
 import { antigravityChatTitle, antigravityFirstPrompt, antigravityModel } from "./adapter";
 import {
-  ANTIGRAVITY_REPLY_NUDGE, antigravitySurface, clearNudge, hasQueuedReplies, markNudged, nudgedRecently, pruneStaleReplies,
-  readReceipts, takeReplies,
+  ANTIGRAVITY_REPLY_NUDGE, antigravitySurface, clearNudge, confirmResume, hasQueuedReplies, markNudged, nudgedRecently,
+  pruneStaleReplies, readReceipts, takeReplies, writeReceipt,
 } from "./antigravity-inbox";
 import { CURSOR_UNKNOWN_OWNER_PID } from "./cursor";
 import { buildEnvelope, markDoneDeliveredAt, OpPlan, trackSessionAt } from "./hook";
@@ -245,6 +247,11 @@ export async function runAntigravityHook(raw: string, eventName: string | undefi
 
     const sessionsDir = deps.sessionsDir ?? SESSIONS_DIR;
     const sync = deps.canTerminate !== false;
+    // A synchronous run's ONE stdout line: the answer, or (release) an empty line once it is known there
+    // is none — the wrapper stops waiting at the first line and the rest of this run goes on detached.
+    let answered = false;
+    const answer = async (line: string) => { answered = true; await (deps.emit ?? emitStdout)(line); };
+    const release = async () => { if (sync && !answered) { answered = true; if (!deps.emit) await emitStdout(""); } };
     if (eventName === "PostInvocation" && sync) await pruneStaleAntigravityStops(sessionsDir, now);
     // Read before the Stop branch below clears it: a phone Stop beats a phone reply in the same hook.
     const stopPendingAtStop = sync && kind === "stop" && await antigravityStopRequested(sessionsDir, sessionId, now);
@@ -252,7 +259,7 @@ export async function runAntigravityHook(raw: string, eventName: string | undefi
     if (eventName === "PostInvocation" && deps.canTerminate !== false
       && await antigravityStopRequested(sessionsDir, sessionId, now)) {
       await clearStop(sessionsDir, sessionId);
-      await (deps.emit ?? emitStdout)(ANTIGRAVITY_TERMINATE);
+      await answer(ANTIGRAVITY_TERMINATE);
       (deps.trace ?? traceSession)({ event: "interrupt", sessionId, agent: "antigravity", result: "terminated" });
       kind = "stop";
     } else if (kind === "stop") {
@@ -279,9 +286,10 @@ export async function runAntigravityHook(raw: string, eventName: string | undefi
     if (sync && eventName === "PreInvocation") {
       await pruneStaleReplies(sessionsDir); // file mtimes: real time, not the injectable clock
       if (!(await antigravityStopRequested(sessionsDir, sessionId, now))) {
-        const replies = await takeReplies(sessionsDir, sessionId, "d");
+        const replies = await takeReplies(sessionsDir, sessionId);
         if (replies.length > 0) {
-          await (deps.emit ?? emitStdout)(JSON.stringify({ injectSteps: replies.map((r) => ({ userMessage: r.text })) }));
+          await answer(JSON.stringify({ injectSteps: replies.map((r) => ({ userMessage: r.text })) }));
+          for (const r of replies) await writeReceipt(sessionsDir, sessionId, r.mid, "d"); // only once handed over
           await clearNudge(sessionsDir, sessionId);
           (deps.trace ?? traceSession)({ event: "reply", sessionId, agent: "antigravity", result: "injected", count: replies.length });
           repliesChanged = true;
@@ -292,10 +300,13 @@ export async function runAntigravityHook(raw: string, eventName: string | undefi
       && !(record && (record.op === "done" || record.lastEvent === "done"))
       && await hasQueuedReplies(sessionsDir, sessionId) && !(await nudgedRecently(sessionsDir, sessionId, now))) {
       await markNudged(sessionsDir, sessionId, now);
-      await (deps.emit ?? emitStdout)(JSON.stringify({ decision: "continue", reason: ANTIGRAVITY_REPLY_NUDGE }));
+      await answer(JSON.stringify({ decision: "continue", reason: ANTIGRAVITY_REPLY_NUDGE }));
       (deps.trace ?? traceSession)({ event: "reply", sessionId, agent: "antigravity", result: "continued" });
       kind = "beat"; // the turn goes on
     }
+    await release();
+    // A run Nomo resumed from a phone reply reached its first model call: its messages are now `r`.
+    if (eventName === "PreInvocation" && await confirmResume(sessionsDir, sessionId)) repliesChanged = true;
 
     const plan = planAntigravity(kind, record, now)
       // A delivery receipt must reach the phone now, not after the keep-alive throttle.

@@ -7,14 +7,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
-  ANTIGRAVITY_REPLY_NUDGE, antigravitySurface, cancelReply, enqueueReply, handleReplyCommand, hasQueuedReplies,
-  readReceipts, receiptOf, REPLY_RECEIPTS_MAX, REPLY_TEXT_MAX_CHARS, replyMessageId, replyRoute, replyText,
-  takeReplies,
+  agyBinary, ANTIGRAVITY_REPLY_NUDGE, antigravitySurface, cancelReply, confirmResume, enqueueReply, handleReplyCommand,
+  hasQueuedReplies, pruneStaleReplies, readReceipts, receiptOf, REPLY_PHONE_GIVE_UP_MS, REPLY_RECEIPTS_MAX,
+  REPLY_TEXT_MAX_CHARS, replyMessageId, replyRoute, replyText, sweepStrandedReplies, takeReplies, writeReceipt,
 } from "./antigravity-inbox";
 import { ANTIGRAVITY_INTERRUPT_SUFFIX, runAntigravityHook } from "./antigravity";
 import { decryptBlob, encryptBlob } from "./crypto";
 import { Config, SessionRecord, writeInterruptFlagAt } from "./shared";
-import { classifySession, drainCommands, resetCommandState } from "../entries/cc-watchdog";
+import { classifySession, drainCommands, publishReplyReceipts, resetCommandState } from "../entries/cc-watchdog";
 import { createProcessHygiene, isolatedTestEnv } from "../test/process-hygiene";
 
 const { spawnTestProcess } = createProcessHygiene();
@@ -67,7 +67,8 @@ describe("inbox: write / consume / cancel", () => {
     expect(await receiptOf(dir, CONV, "mid-aaaaaaaa")).toBe("q");
     expect((await takeReplies(dir, CONV)).map((r) => r.text)).toEqual(["first", "second"]);
     expect(await takeReplies(dir, CONV)).toEqual([]);
-    expect(await readReceipts(dir, CONV)).toEqual({ "mid-bbbbbbbb": "d", "mid-aaaaaaaa": "d" });
+    // a take writes no receipt: `d` is the hook's to write once the message was handed over
+    expect(await readReceipts(dir, CONV)).toEqual({ "mid-bbbbbbbb": "q", "mid-aaaaaaaa": "q" });
     expect(await hasQueuedReplies(dir, "other-conv")).toBe(true);
     // the files are 0600
     const names = await readdir(dir);
@@ -82,7 +83,7 @@ describe("inbox: write / consume / cancel", () => {
     await enqueueReply(dir, CONV, { mid: "mid-bbbbbbbb", text: "yes", ts: 2 });
     await takeReplies(dir, CONV);
     expect(await cancelReply(dir, CONV, "mid-bbbbbbbb")).toBe(false);
-    expect(await receiptOf(dir, CONV, "mid-bbbbbbbb")).toBe("d");
+    expect(await receiptOf(dir, CONV, "mid-bbbbbbbb")).toBe("q"); // the taker writes d next
   });
   test("racing takes and cancels: every message ends up delivered XOR cancelled, exactly once", async () => {
     const dir = await tmp();
@@ -95,15 +96,35 @@ describe("inbox: write / consume / cancel", () => {
     expect(new Set(taken).size).toBe(taken.length); // never twice
     for (const [i, mid] of mids.entries()) expect(taken.includes(mid)).toBe(!cancels[i]);
   });
-  test("receipts are capped to the newest REPLY_RECEIPTS_MAX", async () => {
+  test("receipts beyond REPLY_RECEIPTS_MAX are evicted only when final AND past the phone's 1 h give-up", async () => {
     const dir = await tmp();
     for (let i = 0; i < REPLY_RECEIPTS_MAX + 4; i++) {
       await enqueueReply(dir, CONV, { mid: `mid-${String(i).padStart(8, "0")}`, text: "x", ts: i });
+      if (i !== 1) await writeReceipt(dir, CONV, `mid-${String(i).padStart(8, "0")}`, "d"); // #1 stays q
       await Bun.sleep(2);
     }
-    const r = await readReceipts(dir, CONV);
-    expect(Object.keys(r)).toHaveLength(REPLY_RECEIPTS_MAX);
+    // fresh: the phone may still re-send any of them → nothing evicted
+    expect(Object.keys(await readReceipts(dir, CONV))).toHaveLength(REPLY_RECEIPTS_MAX + 4);
+    // 2 h later: the oldest final ones go; the still-queued #1 never does
+    const r = await readReceipts(dir, CONV, Date.now() + 2 * REPLY_PHONE_GIVE_UP_MS);
+    expect(Object.keys(r)).toHaveLength(REPLY_RECEIPTS_MAX + 1);
     expect(r["mid-00000000"]).toBeUndefined();
+    expect(r["mid-00000001"]).toBe("q");
+  });
+  test("an unreadable queued message is refused (x), never silently dropped", async () => {
+    const dir = await tmp();
+    await writeFile(join(dir, `${CONV}.mid-aaaaaaaa.agy-inbox`), "{not json");
+    expect(await takeReplies(dir, CONV)).toEqual([]);
+    expect(await receiptOf(dir, CONV, "mid-aaaaaaaa")).toBe("x");
+  });
+  test("pruneStaleReplies also removes day-old .take / .cancel claims a killed process left", async () => {
+    const dir = await tmp();
+    const take = join(dir, `${CONV}.mid-aaaaaaaa.agy-inbox.123.take`);
+    const cancel = join(dir, `${CONV}.mid-bbbbbbbb.agy-inbox.456.cancel`);
+    const other = join(dir, `${CONV}.json`);
+    for (const f of [take, cancel, other]) await writeFile(f, "{}");
+    await pruneStaleReplies(dir, Date.now() + 2 * 24 * 60 * 60_000);
+    expect((await readdir(dir)).sort()).toEqual([`${CONV}.json`]);
   });
 });
 
@@ -130,6 +151,8 @@ describe("routing a send-message", () => {
     };
     expect(await handleReplyCommand("send-message", CONV, done(), { mid: "mid-aaaaaaaa", text: "write the notes" }, deps)).toBe("reply-resumed");
     expect(spawned).toEqual([[CONV, "/w/proj", "write the notes"]]);
+    expect(await receiptOf(dir, CONV, "mid-aaaaaaaa")).toBe("q"); // r only once the run is alive
+    expect(await confirmResume(dir, CONV)).toBe(true);
     expect(await receiptOf(dir, CONV, "mid-aaaaaaaa")).toBe("r");
     expect(await handleReplyCommand("send-message", CONV, done(), { mid: "mid-aaaaaaaa", text: "write the notes" }, deps)).toBe("reply-duplicate");
     expect(await handleReplyCommand("send-message", CONV, done(), { mid: "mid-bbbbbbbb", text: "and push" }, deps)).toBe("reply-queued");
@@ -141,7 +164,56 @@ describe("routing a send-message", () => {
     await enqueueReply(dir, CONV, { mid: "mid-cccccccc", text: "left over", ts: 1 });
     expect(await handleReplyCommand("send-message", CONV, done(), { mid: "mid-dddddddd", text: "new" }, deps)).toBe("reply-resumed");
     expect(spawned[1]![2]).toBe("left over\n\nnew");
+    await confirmResume(dir, CONV);
     expect(await readReceipts(dir, CONV)).toMatchObject({ "mid-cccccccc": "r", "mid-dddddddd": "r" });
+  });
+
+  test("a resumed agy that dies before its first step: its messages go x, never a false 'Resumed'", async () => {
+    const dir = await tmp();
+    let alive = true;
+    const deps = { sessionsDir: dir, now: NOW, pidAlive: (p: number) => p === 777 && alive, resume: () => 777 };
+    expect(await handleReplyCommand("send-message", CONV, done(), { mid: "mid-aaaaaaaa", text: "hi" }, deps)).toBe("reply-resumed");
+    expect(await sweepStrandedReplies(dir, CONV, done(), deps)).toEqual({ refused: [], resumed: false }); // still starting
+    alive = false;
+    expect(await sweepStrandedReplies(dir, CONV, done(), deps)).toEqual({ refused: ["mid-aaaaaaaa"], resumed: false });
+    expect(await receiptOf(dir, CONV, "mid-aaaaaaaa")).toBe("x");
+  });
+
+  test("watchdog sweep: a message stranded behind an owner that has since exited is resumed", async () => {
+    const dir = await tmp();
+    const spawned: string[] = [];
+    let ownerAlive = true;
+    const deps = {
+      sessionsDir: dir, now: NOW, pidAlive: (p: number) => p === 4242 && ownerAlive,
+      resume: (_c: string, _cwd: string, t: string) => { spawned.push(t); return 999; },
+    };
+    // the open agy TUI is idle → queued behind it
+    expect(await handleReplyCommand("send-message", CONV, done(), { mid: "mid-aaaaaaaa", text: "later" }, deps)).toBe("reply-queued");
+    expect((await sweepStrandedReplies(dir, CONV, done(), deps)).resumed).toBe(false); // owner still alive
+    // a working row (the Stop-vs-done gap) is never resumed either
+    ownerAlive = false;
+    expect((await sweepStrandedReplies(dir, CONV, rec(), deps)).resumed).toBe(false);
+    // owner gone, row done → resumed with the stranded message; a second sweep finds nothing to do
+    expect((await sweepStrandedReplies(dir, CONV, done(), deps)).resumed).toBe(true);
+    expect(spawned).toEqual(["later"]);
+    expect(await hasQueuedReplies(dir, CONV)).toBe(false);
+    expect(await receiptOf(dir, CONV, "mid-aaaaaaaa")).toBe("q");
+    expect((await sweepStrandedReplies(dir, CONV, done(), deps)).resumed).toBe(false);
+    // no inbox at all → nothing spawned
+    expect((await sweepStrandedReplies(dir, "other-conv", done(), deps)).resumed).toBe(false);
+    expect(spawned).toHaveLength(1);
+  });
+
+  test("agyBinary only trusts absolute PATH entries", async () => {
+    const dir = await tmp();
+    await mkdir(join(dir, "rel"), { recursive: true });
+    await writeFile(join(dir, "rel", "agy"), "", { mode: 0o755 });
+    const cwd = process.cwd();
+    process.chdir(dir);
+    try {
+      expect(agyBinary({ PATH: "rel", HOME: "/h" })).toBe("/h/.local/bin/agy");
+      expect(agyBinary({ PATH: `rel:${join(dir, "rel")}`, HOME: "/h" })).toBe(join(dir, "rel", "agy"));
+    } finally { process.chdir(cwd); }
   });
 
   test("an idle desktop-app session is refused; a failed spawn falls back to queued; bad input is malformed", async () => {
@@ -288,6 +360,52 @@ describe("antigravity-hook.sh: synchronous only while a reply waits, and only we
     for (const [ev, script, want] of cases) expect((await run(await stubRoot(script), home, ev)).out).toBe(want);
   });
 
+  test("a FOREIGN conversation's inbox keeps this one on the fast path", async () => {
+    const home = await tmp();
+    const sessions = join(home, ".config", "cc-status", "sessions");
+    await mkdir(sessions, { recursive: true });
+    await writeFile(join(sessions, "other.conv-1.mid-aaaaaaaa.agy-inbox"), "{}");
+    const root = await stubRoot(`sleep 2; printf '%s\\n' '${inject}'`);
+    for (const ev of ["PreInvocation", "Stop"]) {
+      const r = await run(root, home, ev);
+      expect(r.out).toBe("{}\n");
+      expect(r.ms).toBeLessThan(1000);
+    }
+  });
+
+  test("sync: the wrapper returns at the bundle's FIRST line, not when the bundle exits", async () => {
+    const home = await tmp();
+    const sessions = join(home, ".config", "cc-status", "sessions");
+    await mkdir(sessions, { recursive: true });
+    await writeFile(join(sessions, `${CONV}.mid-aaaaaaaa.agy-inbox`), "{}");
+    let r = await run(await stubRoot(`printf '%s\\n' '${inject}'; sleep 2`), home, "PreInvocation");
+    expect(r.out).toBe(`${inject}\n`);
+    expect(r.ms).toBeLessThan(1000);
+    r = await run(await stubRoot("echo; sleep 2"), home, "Stop"); // "nothing to say" → {} at once
+    expect(r.out).toBe("{}\n");
+    expect(r.ms).toBeLessThan(1000);
+  });
+
+  test("the real bundle answers before its POST finishes (a 3 s worker never delays the hook)", async () => {
+    const home = await tmp();
+    const sessions = join(home, ".config", "cc-status", "sessions");
+    await mkdir(sessions, { recursive: true });
+    let posted = 0;
+    const server = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: async () => { posted++; await Bun.sleep(3000); return Response.json({ ok: true }); } });
+    try {
+      await writeFile(join(home, ".config", "cc-status", "config.json"), JSON.stringify({
+        url: `http://127.0.0.1:${server.port}`, pairingId: "p", pcSecret: "s", e2eKeyB64: Buffer.from(KEY).toString("base64"),
+      }), { mode: 0o600 });
+      await enqueueReply(sessions, CONV, { mid: "mid-aaaaaaaa", text: "fast", ts: 1 });
+      const r = await run(join(PLUGIN), home, "PreInvocation");
+      expect(r.out).toBe(`${JSON.stringify({ injectSteps: [{ userMessage: "fast" }] })}\n`);
+      expect(r.ms).toBeLessThan(2000);
+      for (let i = 0; i < 100 && (posted === 0 || await receiptOf(sessions, CONV, "mid-aaaaaaaa") !== "d"); i++) await Bun.sleep(20);
+      expect(await receiptOf(sessions, CONV, "mid-aaaaaaaa")).toBe("d");
+      expect(posted).toBe(1); // the POST still happens, after the answer
+    } finally { server.stop(true); }
+  });
+
   test("the real bundle end to end: queued message → PreInvocation prints injectSteps once", async () => {
     const home = await tmp();
     const sessions = join(home, ".config", "cc-status", "sessions");
@@ -370,4 +488,24 @@ test("receipts and surface ride the blob only for Antigravity (buildEnvelope ext
   const plainOld = await decryptBlob(KEY, (await buildEnvelope({ session_id: "s", cwd: "/w" }, "m", NOW, "t", KEY, false, "antigravity", NOW, 1, null, "g",
     { op: "update", prio: 0, status: "working" }))!.blob as string);
   expect(plainOld).not.toHaveProperty("replies");
+});
+
+test("publishReplyReceipts never clobbers a record a hook rewrote while it was sealing", async () => {
+  const dir = await tmp();
+  const path = join(dir, `${CONV}.json`);
+  const blob = await encryptBlob(KEY, { status: "working", title: "t" });
+  await writeFile(path, JSON.stringify(rec({ blob, ts: NOW })));
+  const posts: unknown[] = [];
+  const post = async (_c: Config, e: object) => { posts.push(e); return "ok" as never; };
+  // a hook writes a newer frame between the read and the write
+  const newer = JSON.stringify(rec({ blob: await encryptBlob(KEY, { status: "done", title: "t" }), ts: NOW + 5 }));
+  await publishReplyReceipts(CONFIG, CONV, dir, {
+    post, receipts: async () => { await writeFile(path, newer); return { "mid-aaaaaaaa": "d" }; },
+  });
+  expect(await Bun.file(path).text()).toBe(newer);
+  expect(posts).toHaveLength(0);
+  // undisturbed → resealed with the receipts
+  await publishReplyReceipts(CONFIG, CONV, dir, { post, receipts: async () => ({ "mid-aaaaaaaa": "d" }) });
+  const after = JSON.parse(await Bun.file(path).text()) as SessionRecord;
+  expect(await decryptBlob(KEY, after.blob as string)).toMatchObject({ status: "done", replies: { "mid-aaaaaaaa": "d" } });
 });
