@@ -175,8 +175,8 @@ describe("antigravity-install.mjs", () => {
     const root = join(t, "nomo", "plugin");
     await mkdir(join(root, "scripts"), { recursive: true });
     await mkdir(join(root, "dist"), { recursive: true });
-    for (const f of ["antigravity-install.mjs", "antigravity-hook.sh"]) await cp(join(PLUGIN, "scripts", f), join(root, "scripts", f));
-    await writeFile(join(root, "dist", "antigravity-status.mjs"), "// stub\n");
+    for (const f of ["antigravity-install.mjs", "antigravity-hook.sh", "antigravity-approve.sh"]) await cp(join(PLUGIN, "scripts", f), join(root, "scripts", f));
+    for (const f of ["antigravity-status.mjs", "antigravity-approve.mjs"]) await writeFile(join(root, "dist", f), "// stub\n");
     const home = join(t, "home");
     await mkdir(join(home, ".gemini", "config"), { recursive: true });
     const hooks = join(home, ".gemini", "config", "hooks.json");
@@ -192,7 +192,7 @@ describe("antigravity-install.mjs", () => {
   }
   const FOREIGN = { herdr: { PreInvocation: [{ type: "command", command: "bash '/x/herdr.sh' session", timeout: 10 }] }, other: { enabled: false } };
 
-  test("creates the file, writes one flat/matcher-correct 'nomo' block, never PreToolUse", async () => {
+  test("creates the file, writes one flat/matcher-correct 'nomo' block; PreToolUse only for the approval tools", async () => {
     const b = await box();
     expect((await b.run()).code).toBe(0);
     const doc = await b.read();
@@ -205,8 +205,11 @@ describe("antigravity-install.mjs", () => {
       PostInvocation: [{ type: "command", command: cmd("PostInvocation"), timeout: 10 }],
       Stop: [{ type: "command", command: cmd("Stop"), timeout: 10 }],
       PostToolUse: [{ matcher: "*", hooks: [{ type: "command", command: cmd("PostToolUse"), timeout: 10 }] }],
+      PreToolUse: [{
+        matcher: "^(run_command|write_file|write_to_file|edit_file|replace_file_content|multi_replace_file_content)$",
+        hooks: [{ type: "command", command: `'${join(b.root, "scripts", "antigravity-approve.sh")}'`, timeout: 86400 }],
+      }],
     });
-    expect(JSON.stringify(doc)).not.toContain("PreToolUse");
     for (const e of ["SessionStart", "PreInvocation", "PostInvocation", "Stop"]) {
       expect(doc.nomo[e][0]).not.toHaveProperty("matcher");
       expect(doc.nomo[e][0]).not.toHaveProperty("hooks");
@@ -224,12 +227,13 @@ describe("antigravity-install.mjs", () => {
 
   test("preserves foreign blocks; rewrites a stale nomo block wholesale; uninstall removes only nomo", async () => {
     const b = await box();
-    await writeFile(b.hooks, JSON.stringify({ ...FOREIGN, nomo: { PreToolUse: [{ matcher: "*", hooks: [] }] } }));
+    await writeFile(b.hooks, JSON.stringify({ ...FOREIGN, nomo: { PreToolUse: [{ matcher: "*", hooks: [] }], Bogus: [] } }));
     await b.run();
     const doc = await b.read();
     expect(doc.herdr).toEqual(FOREIGN.herdr);
     expect(doc.other).toEqual(FOREIGN.other);
-    expect(doc.nomo.PreToolUse).toBeUndefined();
+    expect(doc.nomo.Bogus).toBeUndefined();
+    expect(doc.nomo.PreToolUse[0].matcher).not.toBe("*");
     expect((await b.run("--uninstall")).code).toBe(0);
     expect(await b.read()).toEqual(FOREIGN);
     expect((await b.run("--uninstall")).out).toContain("no Nomo block found");

@@ -130,7 +130,7 @@ export const HOLD_BLOCKS_DIALOG: Record<AgentKind, boolean> = {
   codex: true,     // same blocking-hook contract, same frozen TUI
   opencode: false, // resident plugin, fired detached; OpenCode's own prompt is already on screen
   cursor: false,   // NEVER holds: v1 is read-only and registers no permission-class hook at all
-  antigravity: false, // NEVER holds: v1 is read-only and never registers PreToolUse
+  antigravity: true, // PreToolUse hook (core/antigravity-approval) — the tool waits until this process prints
 };
 
 /** The Claude tools whose picker Claude Code renders ITSELF, concurrently with this hook — so the user
@@ -1452,6 +1452,10 @@ export interface PermissionHookDeps {
   /** Reads the tail of the session transcript for the local-answer watch (see localAnswerProbe).
    *  Defaults to the real bounded suffix read; tests script it. */
   readTailFn?: (path: string, maxBytes: number) => Promise<string>;
+  /** Epoch ms (on the `now` clock) past which a GRANTED hold stops polling and exits with no decision,
+   *  like an expiry. Absent = unbounded (Claude/Codex/OpenCode). Antigravity sets it because its hook
+   *  timeout BLOCKS the tool when exceeded — see core/antigravity-approval.ts. */
+  deadlineAt?: number;
 }
 
 async function readStdin(): Promise<string> {
@@ -2035,6 +2039,10 @@ export async function runPermissionHook(
     let seq = 0;
     for (;;) {
       seq += 1;
+      if (deps.deadlineAt !== undefined && clock() >= deps.deadlineAt) {
+        trace({ event: "exit", reason: "deadline" });
+        return; // the caller's own fallback (Antigravity: defer to its local prompt) takes over
+      }
       // ANSWERED AT THE MAC. Checked BEFORE the poll so the latch primes on round 1, and before the
       // network so a worker outage can never keep a settled card on the phone. Nothing goes to stdout —
       // CC already took the local answer and moved the turn on — but the record settles as WORKING,

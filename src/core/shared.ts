@@ -455,7 +455,8 @@ export type CCStatus = "working" | "needsAttention" | "done";
  *
  *  `"antigravity"` (the fifth) covers Google Antigravity — the desktop app/IDE and the `agy` CLI, which
  *  read the same ~/.gemini/config/hooks.json. One hook binary (entries/antigravity-status.ts →
- *  core/antigravity.ts). Read-only in v1, like Cursor. */
+ *  core/antigravity.ts), plus a PreToolUse phone-approval hold (entries/antigravity-approve.ts →
+ *  core/antigravity-approval.ts). */
 export type AgentKind = "claude" | "codex" | "opencode" | "cursor" | "antigravity";
 
 /** An agent literal AS IT ARRIVES — off a session record, out of a blob a peer install wrote. It is

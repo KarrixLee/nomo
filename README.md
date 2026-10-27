@@ -17,10 +17,10 @@
 Mirror your **Claude Code**, **OpenAI Codex**, **OpenCode**, **Cursor** and **Antigravity** session milestones to
 the **Nomo iPhone app** as a Live Activity (Dynamic Island). A session's status — working,
 needs-your-approval, done — shows up on your phone in real time, so you can step away from the
-terminal and still know when an agent needs you or has finished. When a Claude Code, Codex or
-OpenCode session stops for a permission prompt or a question, you can **answer it from the phone** —
-tap Allow/Deny or pick an option and the session carries on without you at the keyboard (Cursor and
-Antigravity are status-only). Works with **Codex** in the terminal and the **Codex desktop app** alike.
+terminal and still know when an agent needs you or has finished. When a Claude Code, Codex,
+OpenCode or Antigravity session stops for a permission prompt or a question, you can **answer it from
+the phone** — tap Allow/Deny or pick an option and the session carries on without you at the keyboard
+(Cursor is status-only; Antigravity answers Allow/Deny for shell commands and file writes). Works with **Codex** in the terminal and the **Codex desktop app** alike.
 
 Everything is **end-to-end encrypted**. Pairing is a single QR-code scan (or a short typed code);
 there is no server key to copy. All session content (titles, machine name, status, even *which* agent
@@ -444,14 +444,25 @@ exactly one, `"nomo"`, rewrites it whole on every install and leaves every other
 file is created as `{}` if it does not exist. It refuses — writing nothing — on a file that is not
 valid JSON or not an object, and writes through a symlink rather than over it. The block registers
 `SessionStart`, `PreInvocation`, `PostInvocation`, `Stop` and `PostToolUse`, each running
-`plugin/scripts/antigravity-hook.sh <Event>` with a 10-second timeout — and **never `PreToolUse`**,
-the one event whose hook can block a tool.
+`plugin/scripts/antigravity-hook.sh <Event>` with a 10-second timeout, and one `PreToolUse` entry for
+phone approvals: `plugin/scripts/antigravity-approve.sh`, matched **only** to shell commands and file
+writes/edits (`run_command`, `write_file`, `write_to_file`, `edit_file`, `replace_file_content`,
+`multi_replace_file_content`), with Claude Code's approval timeout of 24 hours.
 
 ### How the Antigravity leg works
 
-- **Read-only and can never block.** The wrapper prints `{}` and exits 0 *before* doing any work, so
+- **The status hooks are read-only.** Their wrapper prints `{}` and exits 0 *before* doing any work, so
   every path — a crash, no runtime, not paired, no network — returns the empty reply, and Antigravity
-  never sees a `decision` or `terminationBehavior` from Nomo. The work itself is capped at 4 seconds.
+  never sees a `decision` or `terminationBehavior` from them. The work itself is capped at 4 seconds.
+- **Phone approvals (`PreToolUse`).** For a shell command or a file write in a session your phone is
+  showing, the tool waits while the phone shows Allow / Deny / Deny with note. Allow answers
+  `auto_approve`; Deny answers `deny` with your note (or "Denied from phone") as the reason the agent
+  sees. Every other outcome — not paired, approvals paused, the session not on the phone, no network,
+  the request expiring — answers `allow`, which means "no opinion": Antigravity applies its own
+  permission settings and shows its own prompt exactly as without Nomo. A command or path your own
+  `permissions.allow` rules already allow by a plain prefix (and no `ask`/`deny` rule touches) is
+  passed straight through. Reads, searches and every other tool never reach Nomo at all. "Always allow"
+  is not offered for Antigravity.
 - **A row starts at `PreInvocation`** (before a model call), not `SessionStart`. `PreInvocation`,
   `PostInvocation` and `PostToolUse` keep it *working* (they fire many times per turn and are
   throttled); `Stop` marks it *done*. A turn that ends with **no** event — an interrupt, or a headless
@@ -477,8 +488,8 @@ which deletes only the `"nomo"` block. Pairing is untouched.
 
 When a session stops for a **permission prompt** or a multiple-choice **question**, the card reaches
 the phone with its options; the answer rides back inside the same E2E-encrypted blob, so the relay
-never learns what you chose. Works for Claude Code, Codex and OpenCode (Cursor and Antigravity are
-read-only).
+never learns what you chose. Works for Claude Code, Codex, OpenCode and Antigravity (Antigravity:
+Allow/Deny on shell commands and file writes; Cursor is read-only).
 `/nomo-cc:approvals` (or `$nomo-approvals`, `/nomo-approvals`) is the local off switch when your
 phone is away — one switch, machine-wide.
 
@@ -506,9 +517,21 @@ description is dropped before the command is.
 
 ## Hooks on your computer — security
 
-- **Antigravity: observe-only, cannot block.** Nomo's `"nomo"` block in `~/.gemini/config/hooks.json`
-  never registers `PreToolUse`, and its wrapper answers every event with `{}` before running anything,
-  so it can neither stop a tool nor keep or end a turn. From each event's stdin it reads only
+- **Antigravity: status hooks observe only; the approval hook can only defer, approve what you
+  approved, or deny what you denied.** Nomo's `"nomo"` block in `~/.gemini/config/hooks.json` answers
+  every status event with `{}` before running anything, so those can neither stop a tool nor keep or
+  end a turn. Its one `PreToolUse` entry is matched only to shell commands and file writes/edits.
+  Antigravity treats a failing `PreToolUse` hook as a block, so `antigravity-approve.sh` checks the
+  hook's output against the only three replies Nomo sends (`allow`, `auto_approve`, `deny` with a
+  reason) and answers `{"decision":"allow"}` — Antigravity's own permission settings and prompt — for
+  anything else: a crash, no runtime, empty or malformed output, or a hold still running when its
+  internal kill guard fires, which is before the hook's 24-hour timeout. `auto_approve` is sent only
+  for an Allow sealed by your paired phone for that exact request id, and it still honours your own
+  explicit `deny` rules. Nomo never sends `permissionOverrides`, `overwrite` or a changed tool input. The
+  approval hook reads the tool name, the command (`CommandLine`) or file path, and the model's one-line
+  `toolSummary`, puts them in the end-to-end encrypted card, and reads your `permissions` rules from
+  `settings.json` in that conversation's Antigravity data dir, read-only. From each status event's stdin
+  it reads only
   `conversationId`, the first `workspacePaths` entry, `transcriptPath` (its modification time, for
   the idle check, and its first line for the first prompt) and `modelName` — never tool arguments.
   From Antigravity's `conversation_summaries.db` it reads only the `title`, `status` and

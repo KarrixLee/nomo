@@ -6159,7 +6159,7 @@ var HOLD_BLOCKS_DIALOG = {
   codex: true,
   opencode: false,
   cursor: false,
-  antigravity: false
+  antigravity: true
 };
 var LOCAL_ANSWER_TOOLS = new Set(["AskUserQuestion", "ExitPlanMode"]);
 var LOCAL_ANSWER_TAIL_BYTES = 64000;
@@ -7214,6 +7214,10 @@ async function runPermissionHook(deps = {}, agent = "claude") {
     let seq = 0;
     for (;; ) {
       seq += 1;
+      if (deps.deadlineAt !== undefined && clock() >= deps.deadlineAt) {
+        trace({ event: "exit", reason: "deadline" });
+        return;
+      }
       if (await answeredAtTheMac()) {
         settleAsWorking = true;
         trace({ event: "local-answer", seq });

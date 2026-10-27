@@ -5,8 +5,8 @@
 // THE CONTRACT WITH ANTIGRAVITY: observe only. Antigravity's hook output CAN steer it (Stop
 // `decision:"continue"`, PostInvocation `terminationBehavior`), so this process never writes to stdout
 // at all — the `{}` every handler must return is printed by plugin/scripts/antigravity-hook.sh, the
-// command hooks.json actually runs, before it even starts this bundle. It is registered on no
-// PreToolUse (the one event that can block a tool), always exits 0 and swallows every error.
+// command hooks.json actually runs, before it even starts this bundle. It always exits 0 and swallows
+// every error. (PreToolUse — phone approvals — is a separate hook: core/antigravity-approval.ts.)
 //
 // THE EVENTS (docs: antigravity.google/docs/hooks). None of them names itself on stdin — there is no
 // `hookEventName` field — so the installer passes the event as argv[2].
@@ -42,7 +42,7 @@ const EVENT_KINDS: Record<string, AntigravityEventKind> = {
   Stop: "stop",
 };
 
-/** The events the installer registers — exactly EVENT_KINDS. Never PreToolUse. */
+/** The status events the installer registers — exactly EVENT_KINDS (PreToolUse is antigravity-approval's). */
 export const ANTIGRAVITY_EVENTS = Object.keys(EVENT_KINDS);
 
 const str = (v: unknown): string | undefined => (typeof v === "string" && v.length > 0 ? v : undefined);

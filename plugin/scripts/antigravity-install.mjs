@@ -9,10 +9,13 @@
 // it, and every other block (and its formatting-independent data) is left as it was. Never
 // ~/.gemini/antigravity-cli/ — that is runtime data and is not read for hooks.
 //
-// READ-ONLY BY CONSTRUCTION: the block registers SessionStart, PreInvocation, PostInvocation, Stop and
-// PostToolUse — NEVER PreToolUse, the one event whose hook can block a tool (and whose behaviour on a
-// failing hook is undocumented). Every handler runs plugin/scripts/antigravity-hook.sh, which prints
-// `{}` before doing anything, so a hook can never steer Antigravity either.
+// The status events (SessionStart, PreInvocation, PostInvocation, Stop, PostToolUse) run
+// plugin/scripts/antigravity-hook.sh, which prints `{}` before doing anything — observe only.
+// PreToolUse (phone approvals, NOM-96 v2) runs plugin/scripts/antigravity-approve.sh, ONLY for the
+// tools in APPROVAL_MATCHER (shell + file writes/edits). PreToolUse is FAIL-CLOSED (`{}`, a crash or a
+// timeout BLOCK the tool), so that wrapper always prints a valid decision — `{"decision":"allow"}`,
+// Antigravity's own policy, whenever the phone has not answered — and its timeout is Claude Code's
+// PermissionRequest one (86400 s), with every internal deadline strictly inside it.
 //
 // SHAPES (a wrong one invalidates the WHOLE file): non-tool events take a FLAT handler list; only the
 // tool events take `[{ matcher, hooks: [...] }]`.
@@ -28,12 +31,18 @@ import { fileURLToPath } from "node:url";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const HOOK = join(ROOT, "scripts", "antigravity-hook.sh");
+const APPROVE = join(ROOT, "scripts", "antigravity-approve.sh");
 const BUNDLE = join(ROOT, "dist", "antigravity-status.mjs");
+const APPROVE_BUNDLE = join(ROOT, "dist", "antigravity-approve.mjs");
 const BLOCK = "nomo";
 /** Seconds. Our own work is hard-capped at 4 s; the slack covers run.sh's first-ever runtime probe. */
 const TIMEOUT = 10;
 const FLAT_EVENTS = ["SessionStart", "PreInvocation", "PostInvocation", "Stop"];
 const TOOL_EVENTS = ["PostToolUse"];
+/** Mirrors ANTIGRAVITY_APPROVAL_MATCHER / ANTIGRAVITY_APPROVAL_TIMEOUT_S in core/antigravity-approval.ts
+ *  (pinned equal by antigravity-approval.test.ts) — this script runs from a clone with no build step. */
+const APPROVAL_MATCHER = "^(run_command|write_file|write_to_file|edit_file|replace_file_content|multi_replace_file_content)$";
+const APPROVAL_TIMEOUT = 86400;
 
 const fail = (msg) => {
   console.error(`antigravity-install: ${msg}`);
@@ -58,6 +67,7 @@ const block = () => ({
   enabled: true,
   ...Object.fromEntries(FLAT_EVENTS.map((e) => [e, [handler(e)]])),
   ...Object.fromEntries(TOOL_EVENTS.map((e) => [e, [{ matcher: "*", hooks: [handler(e)] }]])),
+  PreToolUse: [{ matcher: APPROVAL_MATCHER, hooks: [{ type: "command", command: `'${APPROVE}'`, timeout: APPROVAL_TIMEOUT }] }],
 });
 
 /** { doc, target, mode } — `doc` is `{}` when there is no file yet. */
@@ -104,12 +114,12 @@ try {
   } else {
     // The root is written inside single quotes in every hook command.
     if (/['"$\\`]/.test(ROOT)) fail(`the plugin path contains one of ' " $ \\ \` and cannot be written into a hook command: ${ROOT}`);
-    if (!existsSync(BUNDLE)) fail(`${BUNDLE} is missing — run 'bun build.ts' from the repo root first`);
-    if (!existsSync(HOOK)) fail(`${HOOK} is missing — this does not look like a nomo plugin directory`);
+    for (const f of [BUNDLE, APPROVE_BUNDLE]) if (!existsSync(f)) fail(`${f} is missing — run 'bun build.ts' from the repo root first`);
+    if (!existsSync(HOOK) || !existsSync(APPROVE)) fail(`${HOOK} is missing — this does not look like a nomo plugin directory`);
     if (!existsSync(CONFIG_DIR)) fail(`${CONFIG_DIR} does not exist — open Antigravity once first`);
     const changed = update((doc) => { doc[BLOCK] = block(); });
     console.log(`antigravity-install: hooks -> ${HOOKS}${changed ? "" : " (already up to date)"}`);
-    console.log(`antigravity-install:          block "${BLOCK}": ${[...FLAT_EVENTS, ...TOOL_EVENTS].join(", ")} (never PreToolUse)`);
+    console.log(`antigravity-install:          block "${BLOCK}": ${[...FLAT_EVENTS, ...TOOL_EVENTS].join(", ")}, PreToolUse (phone approvals: shell commands + file writes)`);
     console.log("antigravity-install: restart Antigravity (and any open agy) so it re-reads hooks.json.");
   }
 } catch (e) {
