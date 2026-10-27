@@ -3001,12 +3001,7 @@ var AGENT_UI = {
   codex: { name: "Codex", pair: "$nomo-pair", approvalsOn: "$nomo-approvals on", status: "$nomo-status" },
   opencode: { name: "OpenCode", pair: "/nomo-pair", approvalsOn: "/nomo-approvals on", status: "/nomo-status" },
   cursor: { name: "Cursor", pair: "/nomo-pair", approvalsOn: "/nomo-cc:approvals on (in Claude Code — Cursor sessions are read-only)", status: "/nomo-status" },
-  antigravity: {
-    name: "Antigravity",
-    pair: "~/.nomo/plugin/scripts/run.sh ~/.nomo/plugin/dist/pair.mjs (in a terminal)",
-    approvalsOn: "~/.nomo/plugin/scripts/run.sh ~/.nomo/plugin/dist/cc-permission.mjs on (in a terminal)",
-    status: "~/.nomo/plugin/scripts/run.sh ~/.nomo/plugin/dist/status-cmd.mjs antigravity"
-  }
+  antigravity: { name: "Antigravity", pair: "/nomo-pair", approvalsOn: "/nomo-approvals on", status: "/nomo-status" }
 };
 var AGENT_ORDER = ["claude", "codex", "opencode", "cursor", "antigravity"];
 var VALUE_COL = 14;
@@ -3222,7 +3217,8 @@ function runtimeFloorWarning(name, version) {
   return;
 }
 async function statusCmd(deps = {}) {
-  const print = deps.print ?? ((line) => console.log(line));
+  const out = deps.print ?? ((line) => console.log(line));
+  const print = deps.plain ? () => {} : out;
   const configPath = deps.configPath ?? `${CC_DIR}/config.json`;
   const lastSendPath = deps.lastSendPath ?? LAST_SEND_PATH;
   const sessionsDir = deps.sessionsDir ?? SESSIONS_DIR;
@@ -3499,6 +3495,21 @@ async function statusCmd(deps = {}) {
     detail: [["Mode", "sessions show on your phone; Allow/Deny for shell commands and file writes, and Interrupt"]],
     problems: antigravityHooks.problem ? [antigravityHooks.problem] : []
   };
+  if (deps.plain) {
+    const approvalsOn = await localApprovalsState(noHoldPath) === "on";
+    const lastSendTs = await readMsMarker(lastSendPath);
+    for (const line of plainStatusLines({
+      paired: config !== null,
+      pending: Boolean(pending),
+      machine: config?.machineName,
+      approvalsOn,
+      lastActivityAgo: (antigravityHooks.stamp || lastSendTs) > 0 ? now() - (antigravityHooks.stamp || lastSendTs) : undefined,
+      agentSetUp: antigravityInstalled,
+      agentProblem: antigravityHooks.problem !== undefined
+    }))
+      out(line);
+    return 0;
+  }
   const reports = { claude: claudeReport, codex: codexReport, opencode: opencodeReport, cursor: cursorReport, antigravity: antigravityReport };
   if (audience) {
     renderOwn(reports[audience], `${AGENT_UI[audience].name} — you are here`, print);
@@ -3515,6 +3526,36 @@ async function statusCmd(deps = {}) {
   }
   return 0;
 }
+function plainAge(ms) {
+  const m = Math.floor(Math.max(0, ms) / 60000);
+  if (m < 1)
+    return "just now";
+  if (m < 60)
+    return `${m} min ago`;
+  const h = Math.floor(m / 60);
+  if (h < 24)
+    return `${h} hour${h === 1 ? "" : "s"} ago`;
+  const d = Math.floor(h / 24);
+  return `${d} day${d === 1 ? "" : "s"} ago`;
+}
+function plainStatusLines(s) {
+  const lines = [];
+  if (!s.paired) {
+    lines.push(s.pending ? "⏳ Pairing was started, but your phone hasn't scanned the code yet. Type /nomo-pair to try again." : "❌ This computer isn't connected to your phone yet. Type /nomo-pair to connect it.");
+  } else {
+    const who = s.machine ? ` as “${s.machine}”` : "";
+    const last = s.lastActivityAgo === undefined ? "none yet" : plainAge(s.lastActivityAgo);
+    lines.push(`✅ Connected to your phone${who} · Phone approvals: ${s.approvalsOn ? "on" : "paused"} · Last activity: ${last}`);
+  }
+  if (!s.agentSetUp) {
+    lines.push("⚠️ Antigravity isn't set up to send sessions to Nomo yet. Run the Nomo installer (bunx nomo-ai --antigravity), then restart Antigravity.");
+  } else if (s.agentProblem) {
+    lines.push("⚠️ Nomo hasn't heard from Antigravity lately. Restart Antigravity — if that doesn't help, run the Nomo installer again (bunx nomo-ai --antigravity).");
+  }
+  if (s.paired && !s.approvalsOn)
+    lines.push("⏸️ Phone approvals are paused. Type /nomo-approvals on to turn them back on.");
+  return lines;
+}
 function parseAudience(argv) {
   for (const arg of argv) {
     if (arg === "claude" || arg === "codex" || arg === "opencode" || arg === "cursor" || arg === "antigravity")
@@ -3524,10 +3565,10 @@ function parseAudience(argv) {
 }
 if (__require.main == __require.module) {
   if (process.argv.includes("--check")) {
-    console.log("usage: status [claude|codex|opencode|cursor|antigravity] [--check]  — show pairing, delivery and per-agent health");
+    console.log("usage: status [claude|codex|opencode|cursor|antigravity] [--plain] [--check]  — show pairing, delivery and per-agent health (--plain: a few lines in plain words)");
     process.exit(0);
   }
-  process.exit(await statusCmd({ audience: parseAudience(process.argv.slice(2)) }));
+  process.exit(await statusCmd({ audience: parseAudience(process.argv.slice(2)), plain: process.argv.includes("--plain") }));
 }
 export {
   countCodexHookEvents,
@@ -3536,6 +3577,8 @@ export {
   parseAudience,
   parseCodexPluginState,
   parseLanTrace,
+  plainAge,
+  plainStatusLines,
   renderLanTrace,
   runtimeFloorWarning,
   statusCmd

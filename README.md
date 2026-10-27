@@ -435,9 +435,22 @@ One install covers the Google **Antigravity** desktop app/IDE and the `agy` CLI 
 bunx nomo-ai --antigravity     # or, from a checkout: node plugin/scripts/antigravity-install.mjs
 ```
 
-**Restart Antigravity** (and any open `agy`) so it re-reads its hooks. There are no Antigravity
-commands in v1: pair from any other agent that has Nomo, or in a terminal run
-`~/.nomo/plugin/scripts/run.sh ~/.nomo/plugin/dist/pair.mjs`. Pairing is shared machine-wide.
+**Restart Antigravity** (and any open `agy`), then type **`/nomo-pair`**. The installer also adds a
+small Antigravity plugin, `nomo`, with five commands:
+
+| Command | What it does |
+|---|---|
+| `/nomo-pair` (`/nomo-pair code` without a browser) | connect this computer to the Nomo app |
+| `/nomo-status` (`/nomo-status verbose` for details) | is it connected, are phone approvals on |
+| `/nomo-approvals on` / `off` | phone approvals on or paused (shared by every agent on this computer) |
+| `/nomo-reset` | clear stuck sessions from the phone, keep the connection |
+| `/nomo-unpair` | disconnect this computer |
+
+Pairing is shared machine-wide, so a computer already paired from another agent needs no
+`/nomo-pair`. Antigravity asks before each command runs a shell command — choose Allow. If you once
+imported Nomo's Claude Code plugin into Antigravity (`nomo-cc`), the installer tells you to remove it
+(`agy plugin uninstall nomo-cc`): its Claude hooks would report every session twice. It never removes
+it for you. Add `--verbose` to see the installer's technical detail.
 
 **What the installer writes.** Antigravity's `hooks.json` is a set of *named* blocks. Nomo owns
 exactly one, `"nomo"`, rewrites it whole on every install and leaves every other block alone; the
@@ -450,6 +463,11 @@ writes/edits (`run_command`, `write_file`, `write_to_file`, `edit_file`, `replac
 `multi_replace_file_content`), with Claude Code's approval timeout of 24 hours. Each command first
 checks that its script still exists and otherwise answers on its own (`{}`, or `{"decision":"allow"}`
 for `PreToolUse`), so moving or deleting `~/.nomo` without uninstalling never blocks a tool.
+
+It also copies the `nomo` plugin (a `plugin.json` and five skills, no hooks — plugin-packaged hooks
+reach only the CLI, so the hooks stay in `hooks.json` for the desktop app) to
+`~/.gemini/config/plugins/nomo`, with the checkout path written into each skill, plus a marker file.
+A `nomo` folder without that marker is someone else's: the installer refuses and writes nothing.
 
 ### How the Antigravity leg works
 
@@ -499,7 +517,7 @@ To remove it:
 node ~/.nomo/plugin/scripts/antigravity-install.mjs --uninstall
 ```
 
-which deletes only the `"nomo"` block. Pairing is untouched.
+which deletes only the `"nomo"` block and the `nomo` plugin folder Nomo installed. Pairing is untouched.
 
 ## Answering from your phone
 
@@ -507,7 +525,7 @@ When a session stops for a **permission prompt** or a multiple-choice **question
 the phone with its options; the answer rides back inside the same E2E-encrypted blob, so the relay
 never learns what you chose. Works for Claude Code, Codex, OpenCode and Antigravity (Antigravity:
 Allow/Deny on shell commands and file writes; Cursor is read-only).
-`/nomo-cc:approvals` (or `$nomo-approvals`, `/nomo-approvals`) is the local off switch when your
+`/nomo-cc:approvals` (or `$nomo-approvals`, `/nomo-approvals` in OpenCode and Antigravity) is the local off switch when your
 phone is away — one switch, machine-wide.
 
 Only sessions your phone is actually showing are answerable, and a hold is **fail-open**: a
@@ -565,7 +583,10 @@ description is dropped before the command is.
   From Antigravity's `conversation_summaries.db` it reads only the `title`, `status` and
   `last_modified_time` of that one conversation, read-only; the conversation id must be UUID-shaped
   before it is put into the query, and only the two Antigravity data dirs are ever read. Remove it with
-  `node ~/.nomo/plugin/scripts/antigravity-install.mjs --uninstall` (deletes only that block).
+  `node ~/.nomo/plugin/scripts/antigravity-install.mjs --uninstall` (deletes only that block and the
+  marked plugin folder). The `/nomo-*` skills run only Nomo's own local commands (pair, status, the
+  approvals switch, reset, unpair) from the checkout, each behind Antigravity's own run-command
+  prompt; they never print the pairing link or QR secret.
 
 - **Your project's runtime config is never loaded into Nomo's hooks.** Hooks run with your project as
   their working folder, and bun reads `bunfig.toml` (whose `preload` runs code) and `.env` files from

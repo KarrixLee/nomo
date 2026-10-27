@@ -563,7 +563,8 @@ const AGENTS = [
   },
   {
     // Cursor's twin: installs from the ~/.nomo checkout; antigravity-install.mjs writes ONE "nomo"
-    // block into ~/.gemini/config/hooks.json (read by the app/IDE and the `agy` CLI). Read-only v1.
+    // block into ~/.gemini/config/hooks.json (read by the app/IDE and the `agy` CLI) and the "nomo"
+    // plugin (/nomo-* skills) into ~/.gemini/config/plugins/nomo.
     id: "antigravity",
     label: "Antigravity",
     plan: () =>
@@ -575,9 +576,8 @@ const AGENTS = [
           ],
     next: () =>
       STATUS.get("antigravity")?.installed
-        ? ["restart Antigravity (and any open agy) so it re-reads hooks.json"]
-        : ["restart Antigravity (and any open agy) so it re-reads hooks.json",
-            "pair from another agent, or run ~/.nomo/plugin/scripts/run.sh ~/.nomo/plugin/dist/pair.mjs"],
+        ? ["restart Antigravity (and any open agy)", "type /nomo-status to check"]
+        : ["restart Antigravity (and any open agy)", "type /nomo-pair"],
     detect: () => onPath("agy") || existsSync(antigravityDir()),
     skipUndetectedUnderAll: true,
     installed: () => {

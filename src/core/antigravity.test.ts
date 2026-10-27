@@ -2,7 +2,8 @@
 // the hooks.json installer. Nothing here touches the network, the real ~/.gemini or ~/.config/cc-status:
 // every spawned process gets a temp HOME.
 
-import { cp, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { cp, mkdir, mkdtemp, readdir, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test } from "bun:test";
@@ -20,6 +21,7 @@ import {
   ANTIGRAVITY_SETTLE_GRACE_MS, antigravityRunSettled, classifySession, correctIdleClaude, isClaudeIdleReapEligible,
 } from "../entries/cc-watchdog";
 import { createProcessHygiene, isolatedTestEnv } from "../test/process-hygiene";
+import { plainAge, statusCmd } from "../entries/status-cmd";
 
 const { spawnTestProcess } = createProcessHygiene();
 const PLUGIN = join(import.meta.dir, "../../plugin");
@@ -313,6 +315,7 @@ describe("antigravity-install.mjs", () => {
     await mkdir(join(root, "dist"), { recursive: true });
     for (const f of ["antigravity-install.mjs", "antigravity-hook.sh", "antigravity-approve.sh"]) await cp(join(PLUGIN, "scripts", f), join(root, "scripts", f));
     for (const f of ["antigravity-status.mjs", "antigravity-approve.mjs"]) await writeFile(join(root, "dist", f), "// stub\n");
+    await cp(join(PLUGIN, "antigravity-plugin"), join(root, "antigravity-plugin"), { recursive: true });
     const home = join(t, "home");
     await mkdir(join(home, ".gemini", "config"), { recursive: true });
     const hooks = join(home, ".gemini", "config", "hooks.json");
@@ -373,11 +376,74 @@ describe("antigravity-install.mjs", () => {
     expect(await sh(doc.nomo.PreToolUse[0].hooks[0].command)).toEqual({ code: 0, out: '{"decision":"allow"}\n' });
   });
 
+  test("installs the /nomo-* plugin (checkout path filled in), says so in plain words, and removes only it", async () => {
+    const b = await box();
+    const plugins = join(b.home, ".gemini", "config", "plugins");
+    await mkdir(join(plugins, "someone-else"), { recursive: true });
+    await writeFile(join(plugins, "someone-else", "plugin.json"), '{"name":"someone-else"}');
+    const r = await b.run();
+    expect(r.code).toBe(0);
+    expect(r.out.trim()).toBe("✅ Antigravity is connected to Nomo. Restart Antigravity, then type /nomo-pair.");
+    const dest = join(plugins, "nomo");
+    expect(JSON.parse(await readFile(join(dest, "plugin.json"), "utf8")).name).toBe("nomo");
+    const skills = (await readdir(join(dest, "skills"))).sort();
+    expect(skills).toEqual(["nomo-approvals", "nomo-pair", "nomo-reset", "nomo-status", "nomo-unpair"]);
+    for (const name of skills) {
+      const body = await readFile(join(dest, "skills", name, "SKILL.md"), "utf8");
+      expect(body).not.toContain("__NOMO_ROOT__");
+      expect(body).toContain(`NOMOR="${b.root}"`);
+    }
+    // paired → points at /nomo-status instead; a second install is a no-op refresh
+    await mkdir(join(b.home, ".config", "cc-status"), { recursive: true });
+    await writeFile(join(b.home, ".config", "cc-status", "config.json"), '{"e2eKeyB64":"x"}');
+    const before = await readFile(join(dest, "skills", "nomo-pair", "SKILL.md"), "utf8");
+    expect((await b.run()).out.trim()).toBe("✅ Antigravity is connected to Nomo. Restart Antigravity, then type /nomo-status to check.");
+    expect(await readFile(join(dest, "skills", "nomo-pair", "SKILL.md"), "utf8")).toBe(before);
+    // --verbose adds the technical lines
+    expect((await b.run("--verbose")).out).toContain("antigravity-install: plugin ->");
+    const u = await b.run("--uninstall");
+    expect(u.out.trim()).toBe("✅ Nomo is removed from Antigravity. Restart Antigravity to finish. Your phone stays connected for your other coding apps.");
+    expect(await readdir(plugins)).toEqual(["someone-else"]);
+  });
+
+  test("a 'nomo' plugin folder Nomo did not write → refuses and writes nothing", async () => {
+    const b = await box();
+    const dest = join(b.home, ".gemini", "config", "plugins", "nomo");
+    await mkdir(dest, { recursive: true });
+    await writeFile(join(dest, "plugin.json"), '{"name":"nomo"}');
+    const r = await b.run();
+    expect(r.code).toBe(1);
+    expect(r.out).toContain("was not installed by Nomo");
+    expect(await readdir(dest)).toEqual(["plugin.json"]);
+    expect(await readFile(b.hooks, "utf8").catch(() => "absent")).toBe("absent");
+    expect((await b.run("--uninstall")).code).toBe(0);
+    expect(await readdir(dest)).toEqual(["plugin.json"]); // never removed either
+  });
+
+  test("an imported Claude Code plugin (nomo-cc) → a plain warning to remove it; never deleted", async () => {
+    for (const [dir, manifest] of [
+      [join(".gemini", "antigravity-cli", "plugins", "nomo-cc"), null],
+      [join(".gemini", "config", "plugins", "imported-x"), join(".claude-plugin", "plugin.json")],
+      [join(".gemini", "antigravity-cli", "plugins", "y"), "plugin.json"],
+    ] as const) {
+      const b = await box();
+      const at = join(b.home, dir);
+      await mkdir(join(at, ".claude-plugin"), { recursive: true });
+      if (manifest) await writeFile(join(at, manifest), '{"name":"nomo-cc"}');
+      const r = await b.run();
+      expect(r.code).toBe(0);
+      expect(r.out).toContain("agy plugin uninstall nomo-cc");
+      expect(existsSync(at)).toBe(true);
+    }
+    const clean = await box();
+    expect((await clean.run()).out).not.toContain("nomo-cc");
+  });
+
   test("idempotent: a second install does not rewrite the file", async () => {
     const b = await box();
     await b.run();
     const first = await readFile(b.hooks, "utf8");
-    const r = await b.run();
+    const r = await b.run("--verbose");
     expect(r.out).toContain("already up to date");
     expect(await readFile(b.hooks, "utf8")).toBe(first);
   });
@@ -393,7 +459,7 @@ describe("antigravity-install.mjs", () => {
     expect(doc.nomo.PreToolUse[0].matcher).not.toBe("*");
     expect((await b.run("--uninstall")).code).toBe(0);
     expect(await b.read()).toEqual(FOREIGN);
-    expect((await b.run("--uninstall")).out).toContain("no Nomo block found");
+    expect((await b.run("--uninstall")).out).toContain("nothing to remove");
   });
 
   test("refuses invalid JSON / non-object and writes nothing; writes through a symlink", async () => {
@@ -417,7 +483,7 @@ describe("antigravity-install.mjs", () => {
     await rm(join(b.home, ".gemini"), { recursive: true });
     const r = await b.run();
     expect(r.code).toBe(1);
-    expect(r.out).toContain("open Antigravity once first");
+    expect(r.out).toContain("open it once");
   });
 });
 
@@ -482,6 +548,87 @@ describe("FIX 1 — a turn that ends with no event is settled", () => {
     const run = await withHome(home, () => antigravityRunStatus(CONV));
     expect(run?.status).toBe("CASCADE_RUN_STATUS_IDLE");
     expect(Math.abs(run!.lastModifiedMs! - Date.parse("2026-10-27T14:22:27.143Z"))).toBeLessThan(5); // julianday float rounding
+  });
+});
+
+describe("the Antigravity plugin (plugin/antigravity-plugin)", () => {
+  const SRC = join(PLUGIN, "antigravity-plugin");
+  test("plugin.json + one SKILL.md per /nomo-* command, frontmatter name = folder, no model auto-run", async () => {
+    const manifest = JSON.parse(await readFile(join(SRC, "plugin.json"), "utf8"));
+    expect(manifest.name).toBe("nomo");
+    expect(manifest.name).toMatch(/^[a-zA-Z0-9-_]+$/);
+    expect(manifest.$schema).toBe("https://antigravity.google/schemas/v1/plugin.json");
+    const names = (await readdir(join(SRC, "skills"))).sort();
+    expect(names).toEqual(["nomo-approvals", "nomo-pair", "nomo-reset", "nomo-status", "nomo-unpair"]);
+    for (const name of names) {
+      const body = await readFile(join(SRC, "skills", name, "SKILL.md"), "utf8");
+      const fm = /^---\n([\s\S]*?)\n---\n/.exec(body)?.[1] ?? "";
+      expect(fm).toContain(`name: ${name}\n`);
+      expect(fm).toMatch(/\ndescription: .*Run ONLY when the user types \/nomo-/);
+      expect(body).toContain("__NOMO_ROOT__");
+      expect(body).toContain("please choose Allow");
+      // no Claude Code / Codex command names leak into Antigravity's skills
+      expect(body).not.toMatch(/nomo-cc:|\$nomo-|codex plugin list/);
+    }
+  });
+
+  test("agy's own validator accepts the installed plugin with no findings (skipped without agy)", async () => {
+    const agy = join(process.env.HOME ?? "", ".local", "bin", "agy");
+    if (!existsSync(agy)) return;
+    const home = await tmp();
+    const dest = join(await tmp(), "nomo");
+    await cp(join(SRC), dest, { recursive: true });
+    const out = execFileSync(agy, ["plugin", "validate", dest, "--strict", "--json"], { env: isolatedTestEnv(home), encoding: "utf8", timeout: 30_000 });
+    const report = JSON.parse(out);
+    expect(report.name).toBe("nomo");
+    expect(report.components.skills).toBe(5);
+    expect(report.findings).toEqual([]);
+  }, 40_000);
+});
+
+describe("/nomo-status --plain (Antigravity's beginner readout)", () => {
+  async function plain(opts: { paired?: boolean; pending?: boolean; installed?: boolean; paused?: boolean; stampAgeMs?: number; machine?: string }) {
+    const dir = await tmp();
+    const NOW = Date.now();
+    const configPath = join(dir, "config.json");
+    if (opts.paired) await writeFile(configPath, JSON.stringify({ url: "https://example.invalid", pairingId: "a".repeat(32), pcSecret: "s", e2eKeyB64: Buffer.from(KEY).toString("base64url"), ...(opts.machine ? { machineName: opts.machine } : {}) }));
+    if (opts.pending) await writeFile(configPath, JSON.stringify({ url: "https://example.invalid", pairingId: "a".repeat(32), pcSecret: "s", qrSecretB64: Buffer.alloc(16).toString("base64url") }));
+    const agHooks = join(dir, "ag-hooks.json");
+    if (opts.installed) await writeFile(agHooks, JSON.stringify({ nomo: { Stop: [{ command: "x/antigravity-hook.sh Stop" }] } }));
+    if (opts.paused) await writeFile(join(dir, "no-hold"), "");
+    if (opts.stampAgeMs !== undefined) await writeFile(join(dir, "lh-ag"), String(NOW - opts.stampAgeMs));
+    const lines: string[] = [];
+    await statusCmd({
+      plain: true, audience: "antigravity", print: (l) => lines.push(l), configPath,
+      lastSendPath: join(dir, "last-send"), sessionsDir: join(dir, "sessions"), watchdogPidPath: join(dir, "wd.pid"),
+      sessionTracePath: join(dir, "trace.log"), codexConfigPath: join(dir, "c.toml"), codexHooksPath: join(dir, "c.json"),
+      codexSessionsDir: join(dir, "cs"), claudeProjectsDir: join(dir, "cp"), lastHookCodexPath: join(dir, "lh1"),
+      lastHookClaudePath: join(dir, "lh2"), lastHookOpencodePath: join(dir, "lh3"), opencodeStubPaths: [join(dir, "no.js")],
+      cursorHooksPath: join(dir, "cu.json"), cursorProjectsDir: join(dir, "cup"), lastHookCursorPath: join(dir, "lh4"),
+      antigravityHooksPath: agHooks, lastHookAntigravityPath: join(dir, "lh-ag"), noHoldPath: join(dir, "no-hold"),
+      codexAppServerAvailable: async () => false, isAlive: () => false, now: () => NOW,
+    });
+    return lines;
+  }
+
+  test("every state reads in plain words, one fix per problem, nothing technical", async () => {
+    expect(await plain({ installed: true })).toEqual(["❌ This computer isn't connected to your phone yet. Type /nomo-pair to connect it."]);
+    expect(await plain({ installed: true, pending: true })).toEqual(["⏳ Pairing was started, but your phone hasn't scanned the code yet. Type /nomo-pair to try again."]);
+    expect(await plain({ installed: true, paired: true, machine: "Karrix's MacBook", stampAgeMs: 2 * 60_000 }))
+      .toEqual(["✅ Connected to your phone as “Karrix's MacBook” · Phone approvals: on · Last activity: 2 min ago"]);
+    expect(await plain({ paired: true, paused: true })).toEqual([
+      "✅ Connected to your phone · Phone approvals: paused · Last activity: none yet",
+      "⚠️ Antigravity isn't set up to send sessions to Nomo yet. Run the Nomo installer (bunx nomo-ai --antigravity), then restart Antigravity.",
+      "⏸️ Phone approvals are paused. Type /nomo-approvals on to turn them back on.",
+    ]);
+    for (const l of [...await plain({}), ...await plain({ paired: true, paused: true })]) {
+      expect(l).not.toMatch(/hook|watchdog|pid|json|config|https?:/i);
+    }
+  });
+
+  test("plainAge words", () => {
+    expect([0, 59_000, 120_000, 3_600_000, 7_200_000, 86_400_000 * 3].map(plainAge))
+      .toEqual(["just now", "just now", "2 min ago", "1 hour ago", "2 hours ago", "3 days ago"]);
   });
 });
 

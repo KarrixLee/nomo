@@ -24,7 +24,9 @@
 // symlink. Writes through a live symlink (dotfiles), via temp file + rename, so a crash never leaves
 // half a file. Zero dependencies, plain node >= 18, runs straight out of a fresh clone.
 
-import { chmodSync, existsSync, lstatSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import {
+  chmodSync, cpSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync,
+} from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -51,16 +53,81 @@ const fail = (msg) => {
 
 const args = process.argv.slice(2);
 const UNINSTALL = args.includes("--uninstall");
+const VERBOSE = args.includes("--verbose");
 for (const a of args) {
   if (a === "-h" || a === "--help") {
-    console.log("usage: antigravity-install.mjs [--uninstall]");
+    console.log("usage: antigravity-install.mjs [--uninstall] [--verbose]");
     process.exit(0);
   }
-  if (a !== "--uninstall") fail(`unknown argument: ${a}`);
+  if (a !== "--uninstall" && a !== "--verbose") fail(`unknown argument: ${a}`);
 }
+/** The technical lines, for --verbose. The default output is for people (see the end of this file). */
+const detail = (line) => { if (VERBOSE) console.log(`antigravity-install: ${line}`); };
 
 const CONFIG_DIR = join(homedir(), ".gemini", "config");
 const HOOKS = join(CONFIG_DIR, "hooks.json");
+
+// ── the "nomo" plugin: /nomo-pair, /nomo-status, /nomo-approvals, /nomo-reset, /nomo-unpair ─────────
+//
+// Antigravity's global plugin folder, read by the app, the IDE and the CLI. The plugin carries SKILLS
+// only: plugin-packaged hooks are CLI-only, so the hooks stay in hooks.json (the desktop app needs
+// them). COPIED, like Cursor's skills, with the checkout path written into each SKILL.md; a marker file
+// says the folder is ours, so a same-named folder we did not write is never touched.
+const PLUGIN_SRC = join(ROOT, "antigravity-plugin");
+const PLUGIN_DEST = join(CONFIG_DIR, "plugins", "nomo");
+const PLUGIN_MARK = ".installed-by-nomo";
+
+function claimPlugin() {
+  if (!existsSync(join(PLUGIN_SRC, "plugin.json"))) fail(`${PLUGIN_SRC} is missing — this does not look like a nomo plugin directory`);
+  if (existsSync(PLUGIN_DEST) && !existsSync(join(PLUGIN_DEST, PLUGIN_MARK))) {
+    fail(`${PLUGIN_DEST} already exists and was not installed by Nomo — move it aside and run this again`);
+  }
+}
+
+/** Build the folder beside its final place, then swap it in, so a crash never leaves half a plugin. */
+function writePlugin() {
+  const tmp = `${PLUGIN_DEST}.${process.pid}.tmp`;
+  rmSync(tmp, { recursive: true, force: true });
+  try {
+    mkdirSync(dirname(PLUGIN_DEST), { recursive: true });
+    cpSync(PLUGIN_SRC, tmp, { recursive: true });
+    for (const name of readdirSync(join(tmp, "skills"))) {
+      const f = join(tmp, "skills", name, "SKILL.md");
+      if (!existsSync(f)) continue;
+      // A function, not a string: a replacement STRING would expand `$&`-style patterns in the path.
+      writeFileSync(f, readFileSync(f, "utf8").replaceAll("__NOMO_ROOT__", () => ROOT));
+    }
+    writeFileSync(join(tmp, PLUGIN_MARK), "Installed by Nomo (antigravity-install.mjs). Remove with --uninstall.\n");
+    rmSync(PLUGIN_DEST, { recursive: true, force: true });
+    renameSync(tmp, PLUGIN_DEST);
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
+function removePlugin() {
+  if (!existsSync(join(PLUGIN_DEST, PLUGIN_MARK))) return false;
+  rmSync(PLUGIN_DEST, { recursive: true, force: true });
+  return true;
+}
+
+/** An imported copy of Nomo's CLAUDE CODE plugin ("nomo-cc") would run its Claude hooks inside
+ *  Antigravity and report every session twice. Found, never touched: the user removes it. */
+function findClaudePluginImports(home = homedir()) {
+  const found = [];
+  for (const dir of [join(home, ".gemini", "config", "plugins"), join(home, ".gemini", "antigravity-cli", "plugins"), join(home, ".gemini", "antigravity", "plugins")]) {
+    let names = [];
+    try { names = readdirSync(dir); } catch { continue; }
+    for (const name of names) {
+      const names_ = [name];
+      for (const f of ["plugin.json", join(".claude-plugin", "plugin.json")]) {
+        try { names_.push(JSON.parse(readFileSync(join(dir, name, f), "utf8")).name); } catch { /* not a plugin manifest */ }
+      }
+      if (names_.includes("nomo-cc")) found.push(join(dir, name));
+    }
+  }
+  return found;
+}
 
 /** A command that answers `fallback` itself when the script is gone (the checkout moved or was deleted
  *  without --uninstall): a missing script would exit 127, and PreToolUse is FAIL-CLOSED — every routed
@@ -111,21 +178,39 @@ function update(edit) {
   return true;
 }
 
+const paired = () => {
+  try { return typeof JSON.parse(readFileSync(join(homedir(), ".config", "cc-status", "config.json"), "utf8")).e2eKeyB64 === "string"; } catch { return false; }
+};
+
 try {
   if (UNINSTALL) {
     const changed = existsSync(HOOKS) && update((doc) => { delete doc[BLOCK]; });
-    console.log(`antigravity-install: hooks -> ${changed ? `removed the "${BLOCK}" block from ${HOOKS}` : "no Nomo block found"}`);
-    console.log("antigravity-install: pairing is untouched (it is shared with your other agents).");
+    const plugin = removePlugin();
+    detail(`hooks -> ${changed ? `removed the "${BLOCK}" block from ${HOOKS}` : "no Nomo block found"}`);
+    detail(`plugin -> ${plugin ? `removed ${PLUGIN_DEST}` : "none found"}`);
+    console.log(changed || plugin
+      ? "✅ Nomo is removed from Antigravity. Restart Antigravity to finish. Your phone stays connected for your other coding apps."
+      : "Nomo wasn't set up in Antigravity, so there was nothing to remove.");
   } else {
-    // The root is written inside single quotes in every hook command.
+    // The root is written inside single quotes in every hook command (and double quotes in the skills).
     if (/['"$\\`]/.test(ROOT)) fail(`the plugin path contains one of ' " $ \\ \` and cannot be written into a hook command: ${ROOT}`);
     for (const f of [BUNDLE, APPROVE_BUNDLE]) if (!existsSync(f)) fail(`${f} is missing — run 'bun build.ts' from the repo root first`);
     if (!existsSync(HOOK) || !existsSync(APPROVE)) fail(`${HOOK} is missing — this does not look like a nomo plugin directory`);
-    if (!existsSync(CONFIG_DIR)) fail(`${CONFIG_DIR} does not exist — open Antigravity once first`);
+    if (!existsSync(CONFIG_DIR)) fail("Antigravity doesn't seem to be set up on this computer yet — open it once, then run this again.");
+    claimPlugin(); // every refusal before the first write
     const changed = update((doc) => { doc[BLOCK] = block(); });
-    console.log(`antigravity-install: hooks -> ${HOOKS}${changed ? "" : " (already up to date)"}`);
-    console.log(`antigravity-install:          block "${BLOCK}": ${[...FLAT_EVENTS, ...TOOL_EVENTS].join(", ")}, PreToolUse (phone approvals: shell commands + file writes)`);
-    console.log("antigravity-install: restart Antigravity (and any open agy) so it re-reads hooks.json.");
+    writePlugin();
+    detail(`hooks -> ${HOOKS}${changed ? "" : " (already up to date)"}`);
+    detail(`         block "${BLOCK}": ${[...FLAT_EVENTS, ...TOOL_EVENTS].join(", ")}, PreToolUse (phone approvals: shell commands + file writes)`);
+    detail(`plugin -> ${PLUGIN_DEST} (/nomo-pair /nomo-status /nomo-approvals /nomo-reset /nomo-unpair)`);
+    console.log(paired()
+      ? "✅ Antigravity is connected to Nomo. Restart Antigravity, then type /nomo-status to check."
+      : "✅ Antigravity is connected to Nomo. Restart Antigravity, then type /nomo-pair.");
+  }
+  for (const dir of findClaudePluginImports()) {
+    detail(`found an imported Claude Code plugin: ${dir}`);
+    console.log("⚠️ Antigravity also has the Claude Code version of Nomo (\"nomo-cc\") imported. It would show every session twice — please remove it by running: agy plugin uninstall nomo-cc");
+    break;
   }
 } catch (e) {
   fail(`could not finish — ${e?.message ?? e}`);
