@@ -392,9 +392,21 @@ describe("POST /v1/lan — every rejection is an opaque 400 with an empty body",
     const { port } = await startListener({ statePath: join(dir, "lan.json"), onCommand: (c) => { seen.push(c); }, cfg });
     expectOpaque(await post(port, await sealRequest(cfg, { op: "command", ts: Date.now(), nonce: nonce(), payload: {} })));
     expectOpaque(await post(port, await sealRequest(cfg, {
-      op: "command", ts: Date.now(), nonce: nonce(), payload: { blob: "A".repeat(9_000) },
+      op: "command", ts: Date.now(), nonce: nonce(), payload: { blob: "A".repeat(20_481) },
     })));
     expect(seen.length).toBe(0);
+  });
+
+  test("op:command accepts a blob at the worker's 20480 cap (a 4,000-char CJK reply fits on LAN too)", async () => {
+    const cfg = config();
+    const seen: LanCommand[] = [];
+    const dir = await stateDir();
+    const { port } = await startListener({ statePath: join(dir, "lan.json"), onCommand: (c) => { seen.push(c); }, cfg });
+    const res = await post(port, await sealRequest(cfg, {
+      op: "command", ts: Date.now(), nonce: nonce(), payload: { blob: "A".repeat(20_480) },
+    }));
+    expect(res.status).toBe(200);
+    expect(seen.length).toBe(1);
   });
 
   test("an UNPAIRED listener (sync never called / config null) refuses everything", async () => {

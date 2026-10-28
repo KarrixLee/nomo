@@ -3144,11 +3144,11 @@ function cursorChatTitle(sessionId, db = cursorStateDb(), env = process.env) {
     return;
   return sqliteOneTitle(db, "select case when json_type(cast(value as text),'$.name')='text' then json_extract(cast(value as text),'$.name') end" + ` from cursorDiskKV where key='composerData:${sessionId}'`, env);
 }
-function sqliteOneTitle(db, sql, env = process.env) {
-  const cleaned = sqliteOne(db, sql, env);
+function sqliteOneTitle(db, sql, env = process.env, copyFallback = false) {
+  const cleaned = sqliteOne(db, sql, env, copyFallback);
   return cleaned ? truncateOnWord(cleaned) : undefined;
 }
-function sqliteOne(db, sql, env = process.env) {
+function sqliteOne(db, sql, env = process.env, copyFallback = false) {
   if (!existsSync3(db))
     return;
   try {
@@ -3157,7 +3157,9 @@ function sqliteOne(db, sql, env = process.env) {
     let out;
     try {
       out = run(db);
-    } catch {
+    } catch (e) {
+      if (!copyFallback)
+        throw e;
       const tmp = mkdtempSync(join3(tmpdir(), "nomo-sql-"));
       try {
         for (const ext of ["", "-wal"])
@@ -3217,7 +3219,7 @@ function antigravityChatTitle(sessionId, transcriptPath, env = process.env) {
   if (!AG_SQL_SAFE_ID.test(sessionId))
     return;
   for (const db of summariesDbs(transcriptPath)) {
-    const t = sqliteOneTitle(db, `select title from conversation_summaries where conversation_id='${sessionId}'`, env);
+    const t = sqliteOneTitle(db, `select title from conversation_summaries where conversation_id='${sessionId}'`, env, true);
     if (t)
       return t;
   }
@@ -5815,7 +5817,7 @@ var LAN_FUTURE_SKEW_MS = 30000;
 var LAN_NONCE_MAX_CHARS = 64;
 var LAN_REQUEST_ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
 var LAN_ANSWER_BLOB_MAX_CHARS = 3072;
-var LAN_COMMAND_BLOB_MAX_CHARS = 8192;
+var LAN_COMMAND_BLOB_MAX_CHARS = 20480;
 var LAN_FRAMES_WAIT_MAX_MS = 25000;
 function parseLanFramesRequest(payload) {
   const sinceSeq = payload.sinceSeq;
@@ -8047,7 +8049,7 @@ async function runPermissionHook(deps = {}, agent = "claude") {
         attentionStalledAt: undefined,
         blob: await encryptBlob(config.e2eKey, { ...base, status: "working", at: Math.floor(settledAt / 1000) })
       } : attentionStalled ? await stalledPatch(settledAt) : { ts: settledAt, blob: fallbackBlob, attentionStalledAt: undefined };
-      await (deps.settleHoldRecordFn ?? defaultSettleHoldRecord())(sessionId, patch, settleAsWorking ? holdAt : undefined);
+      await (deps.settleHoldRecordFn ?? defaultSettleHoldRecord())(sessionId, patch, settleAsWorking && agent === "antigravity" ? holdAt : undefined);
     };
     const jitter = deps.jitter ?? (() => Math.floor(Math.random() * POLL_JITTER_MAX_MS));
     const interval = deps.pollIntervalMs ?? POLL_INTERVAL_MS;

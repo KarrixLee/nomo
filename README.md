@@ -483,7 +483,8 @@ A `nomo` folder without that marker is someone else's: the installer refuses and
   (or tool) finishes — and the row turns *done*. While the flag is up, a shell command or file write
   waiting on the phone, or about to, is denied with "Stopped from phone". A flag not acted on within
   an hour, or left when the turn ended on its own, is dropped and never touches a later turn.
-  Antigravity's flags have their own name, so Claude Code's never slow Antigravity down.
+  Antigravity's flags have their own name, so Claude Code's never slow Antigravity down, and a
+  flag only slows the conversation it names.
   Nomo never signals the `agy` process (that would exit the CLI).
 - **Reply from the phone.** The Reply button on an Antigravity row sends a message (up to 4,000
   characters) end-to-end encrypted, over the local link and the relay. The Mac queues it for that
@@ -504,8 +505,10 @@ A `nomo` folder without that marker is someone else's: the installer refuses and
   permission settings and shows its own prompt exactly as without Nomo. Your own `permissions` rules
   (the CLI's `~/.gemini/antigravity-cli/settings.json`, read-only) come first, in Antigravity's order
   Deny > Ask > Allow. Deny and ask rules are read *loosely*: a command rule matches when its command
-  appears anywhere in the line as something that runs — after `sudo`/`env`/`xargs` and the like, as
-  `/bin/rm`, quoted, behind `FOO=1`, after `;`/`&&`/`|`, or inside `$(…)` — and a `regex:` rule is
+  appears anywhere in the line as something that runs — after `sudo`/`env`/`xargs`/`timeout`/`watch`/
+  `stdbuf`/`nice`/`nohup` and the like, inside `sh -c`/`bash -c`/`zsh -c` or `eval`, after
+  `find -exec`, `then` or `!`, as `/bin/rm`, quoted, behind `FOO=1`, after `;`/`&&`/`|`, or inside
+  `$(…)` — and a `regex:` rule is
   compiled (one that doesn't compile matches everything). Anything a deny rule may match never reaches
   the phone — Antigravity denies it itself, and a phone Allow can never override it. Allow rules are
   read *strictly*: only a single plain command (no separators, subshells, quotes or line breaks) whose
@@ -604,10 +607,14 @@ description is dropped before the command is.
   trap and the bundle's own parent check end the hold, withdraw the phone's card and leave no process
   behind. `auto_approve` is sent only for an Allow sealed by your paired phone for that exact request
   id, and never for a call one of your own `deny` rules may match: such a call is not sent to the
-  phone at all (Deny > Ask > Allow). One exception to "that exact request id": after a phone Allow
-  on a shell command, the next byte-identical command in the same conversation within 90 s (the
-  desktop app's retry outside its sandbox) is answered `auto_approve` once, without a new card — never
-  after a Deny, and the one-use ticket is a 0600 file under the sessions dir. Nomo never sends `permissionOverrides`, `overwrite` or a changed
+  phone at all (Deny > Ask > Allow). A file path is normalized (`..`, `.`, repeated `/`) before
+  any rule sees it, so `/tmp/../Users/me/.ssh/x` meets a `.ssh` deny like the plain path does. One
+  exception to "that exact request id": after a phone Allow on a shell command, the next call in the
+  same conversation and workspace within 90 s whose arguments are all identical except the sandbox
+  switch (`BypassSandbox`), the model's one-line summary and the async wait time (the desktop app's
+  retry outside its sandbox) is answered `auto_approve` once, without a new card — any other
+  difference (another working directory, other environment, any extra argument) gets a fresh card;
+  never after a Deny, and the one-use ticket is a 0600 file under the sessions dir. Nomo never sends `permissionOverrides`, `overwrite` or a changed
   tool input. The
   approval hook reads the tool name, the command (`CommandLine`) or file path, and the model's one-line
   `toolSummary`, puts them in the end-to-end encrypted card, and reads your `permissions` rules from

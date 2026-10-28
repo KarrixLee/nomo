@@ -2851,11 +2851,11 @@ function cursorChatTitle(sessionId, db = cursorStateDb(), env = process.env) {
     return;
   return sqliteOneTitle(db, "select case when json_type(cast(value as text),'$.name')='text' then json_extract(cast(value as text),'$.name') end" + ` from cursorDiskKV where key='composerData:${sessionId}'`, env);
 }
-function sqliteOneTitle(db, sql, env = process.env) {
-  const cleaned = sqliteOne(db, sql, env);
+function sqliteOneTitle(db, sql, env = process.env, copyFallback = false) {
+  const cleaned = sqliteOne(db, sql, env, copyFallback);
   return cleaned ? truncateOnWord(cleaned) : undefined;
 }
-function sqliteOne(db, sql, env = process.env) {
+function sqliteOne(db, sql, env = process.env, copyFallback = false) {
   if (!existsSync2(db))
     return;
   try {
@@ -2864,7 +2864,9 @@ function sqliteOne(db, sql, env = process.env) {
     let out;
     try {
       out = run(db);
-    } catch {
+    } catch (e) {
+      if (!copyFallback)
+        throw e;
       const tmp = mkdtempSync(join2(tmpdir(), "nomo-sql-"));
       try {
         for (const ext of ["", "-wal"])
@@ -2924,7 +2926,7 @@ function antigravityChatTitle(sessionId, transcriptPath, env = process.env) {
   if (!AG_SQL_SAFE_ID.test(sessionId))
     return;
   for (const db of summariesDbs(transcriptPath)) {
-    const t = sqliteOneTitle(db, `select title from conversation_summaries where conversation_id='${sessionId}'`, env);
+    const t = sqliteOneTitle(db, `select title from conversation_summaries where conversation_id='${sessionId}'`, env, true);
     if (t)
       return t;
   }

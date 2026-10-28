@@ -7,10 +7,10 @@
 # to the bundle DETACHED (from a private temp file, all output to /dev/null) and exits at once. Always
 # exit 0.
 #
-# EXCEPT while the phone has something for Antigravity: a PostInvocation while a phone Stop is pending
-# (`*.agy-interrupt`, one glob), and a PreInvocation or Stop while a phone reply is queued for THIS
-# conversation (a `<conv>.<mid>.agy-inbox` whose <conv> appears as a quoted string in the payload — one
-# fixed-string grep per queued file; a false match only costs a sync run, a foreign inbox costs nothing).
+# EXCEPT while the phone has something for THIS conversation: a PostInvocation while a phone Stop is
+# pending for it (a `<conv>.agy-interrupt`), and a PreInvocation or Stop while a phone reply is queued for
+# it (a `<conv>.<mid>.agy-inbox`) — <conv> must appear as a quoted string in the payload, one fixed-string
+# grep per pending file; a false match only costs a sync run, a foreign flag or inbox costs nothing.
 # Then the bundle runs with NOMO_AGY_SYNC=1 and may answer — {"terminationBehavior":"terminate"},
 # {"injectSteps":[…]} or {"decision":"continue",…} respectively — or print an empty line once it knows it
 # will not. This reads ONE line from it through a private FIFO and returns at once; the bundle finishes
@@ -50,7 +50,11 @@ foreground() {
   exit 0
 }
 if [ "$1" = PostInvocation ]; then
-  for f in "$dir/"*.agy-interrupt; do [ -e "$f" ] && foreground "$1"; break; done
+  for f in "$dir/"*.agy-interrupt; do
+    [ -e "$f" ] || break
+    c=${f##*/}; c=${c%.agy-interrupt}
+    grep -qF "\"$c\"" "$tmp" 2>/dev/null && foreground "$1"
+  done
 fi
 if [ "$1" = PreInvocation ] || [ "$1" = Stop ]; then
   for f in "$dir/"*.agy-inbox; do

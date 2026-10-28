@@ -258,7 +258,7 @@ describe("antigravity-hook.sh (what hooks.json runs)", () => {
       await writeFile(join(root, "scripts", "run.sh"), `#!/bin/sh\ncat >/dev/null\n${script}\n`, { mode: 0o755 });
       const proc = spawnTestProcess({
         cmd: [join(root, "scripts", "antigravity-hook.sh"), "PostInvocation"],
-        env: isolatedTestEnv(home), stdin: new Blob(["{}"]), stdout: "pipe", stderr: "pipe",
+        env: isolatedTestEnv(home), stdin: new Blob([`{"conversationId":"${CONV}"}`]), stdout: "pipe", stderr: "pipe",
       });
       const out = await new Response(proc.stdout).text();
       expect(await proc.exited).toBe(0);
@@ -296,6 +296,8 @@ describe("antigravity-hook.sh (what hooks.json runs)", () => {
     // Claude Code's own `.interrupt` flags must not drag Antigravity's PostInvocation onto the slow path
     await mkdir(join(home, ".config", "cc-status", "sessions"), { recursive: true });
     await writeFile(join(home, ".config", "cc-status", "sessions", "claude-sess.interrupt"), "{}");
+    // …nor may ANOTHER Antigravity conversation's pending Stop (only the flagged conversation goes sync)
+    await writeFile(join(home, ".config", "cc-status", "sessions", "c0ffee00-0000-4000-8000-0000000000ff.agy-interrupt"), "{}");
     const root = join(await tmp(), "plugin");
     const got = join(root, "got");
     await mkdir(join(root, "scripts"), { recursive: true });

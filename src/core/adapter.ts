@@ -2579,14 +2579,16 @@ export function cursorChatTitle(sessionId: string, db: string = cursorStateDb(),
 /** One read-only, time-boxed `sqlite3` query whose single text cell is a title (cleaned + capped), or
  *  undefined on ANY failure. Shared by the Cursor and Antigravity title lookups; the caller has already
  *  validated anything it spliced into `sql`. */
-function sqliteOneTitle(db: string, sql: string, env: NodeJS.ProcessEnv = process.env): string | undefined {
-  const cleaned = sqliteOne(db, sql, env);
+function sqliteOneTitle(db: string, sql: string, env: NodeJS.ProcessEnv = process.env, copyFallback = false): string | undefined {
+  const cleaned = sqliteOne(db, sql, env, copyFallback);
   return cleaned ? truncateOnWord(cleaned) : undefined; // capped like every other generated title
 }
 
 /** The single cell of a read-only, time-boxed `sqlite3` query, whitespace-collapsed; undefined on ANY
- *  failure, an empty result, or a database file that does not exist. */
-function sqliteOne(db: string, sql: string, env: NodeJS.ProcessEnv = process.env): string | undefined {
+ *  failure, an empty result, or a database file that does not exist. `copyFallback` (Antigravity's small
+ *  summaries DB only) retries a failed read on a private copy; off, a failure is simply undefined —
+ *  Cursor's state.vscdb can be hundreds of MB and must never be copied synchronously in a hook. */
+function sqliteOne(db: string, sql: string, env: NodeJS.ProcessEnv = process.env, copyFallback = false): string | undefined {
   if (!existsSync(db)) return undefined;
   try {
     // `-init <null device>`: the CLI otherwise loads the user's rc (~/.sqliterc, or
@@ -2600,7 +2602,8 @@ function sqliteOne(db: string, sql: string, env: NodeJS.ProcessEnv = process.env
     let out: string;
     try {
       out = run(db);
-    } catch {
+    } catch (e) {
+      if (!copyFallback) throw e;
       // A WAL database whose -shm is absent cannot be opened read-only ("unable to open database file
       // (14)" — Antigravity's CLI summaries DB between sessions). `immutable=1` would read the main file
       // WITHOUT the WAL — where the desktop app's latest run status lives while it holds the DB open, so
@@ -2706,7 +2709,7 @@ const AG_SQL_SAFE_ID = /^[A-Za-z0-9-]{1,128}$/;
 export function antigravityChatTitle(sessionId: string, transcriptPath?: string, env: NodeJS.ProcessEnv = process.env): string | undefined {
   if (!AG_SQL_SAFE_ID.test(sessionId)) return undefined;
   for (const db of summariesDbs(transcriptPath)) {
-    const t = sqliteOneTitle(db, `select title from conversation_summaries where conversation_id='${sessionId}'`, env);
+    const t = sqliteOneTitle(db, `select title from conversation_summaries where conversation_id='${sessionId}'`, env, true);
     if (t) return t;
   }
   return undefined;

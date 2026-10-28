@@ -106,6 +106,26 @@ describe("antigravityApprovalRequest — what reaches the phone", () => {
     for (const c of ["ls -la", "git rm-cache", "echo removing"]) expect(antigravityApprovalRequest(cmd(c), deny)).not.toBeNull();
   });
 
+  test("deny is LOOSE through shells, eval and process wrappers too: `sh -c`, eval, timeout, watch, stdbuf…", () => {
+    const deny = { allow: [], ask: [], deny: ["command(rm)"] };
+    const cmd = (c: string) => payload("run_command", { CommandLine: c });
+    for (const c of [
+      "sh -c 'rm -rf x'", "bash -c \"rm x\"", "zsh -lc 'cd /; rm x'", "/bin/bash -c 'echo hi && rm x'", "eval rm x",
+      "eval 'rm x'", "timeout 5 rm x", "timeout -s KILL 10s rm x", "watch -n 1 rm x", "stdbuf -oL rm x",
+      "nice -n 5 nohup env A=1 rm x", "find . -exec rm {} +", "if true; then rm x; fi", "! rm x", "su -c 'rm x'",
+    ]) expect([c, antigravityApprovalRequest(cmd(c), deny)]).toEqual([c, null]);
+    for (const c of ["timeout 5 ls", "bash -c 'ls -la'"]) expect(antigravityApprovalRequest(cmd(c), deny)).not.toBeNull();
+  });
+
+  test("absolute write paths are normalized before rules: `/tmp/../<deny dir>/x` still hits the deny", () => {
+    const deny = { allow: [], ask: [], deny: ["write_file(/Users/me/.ssh)"] };
+    const w = (p: string) => antigravityApprovalRequest(payload("write_file", { Path: p }), deny);
+    expect(w("/Users/me/.ssh/authorized_keys")).toBeNull();
+    expect(w("/tmp/../Users/me/.ssh/authorized_keys")).toBeNull();
+    expect(w("/Users/me/./proj/../.ssh//x")).toBeNull();
+    expect(w("/Users/me/proj/a.ts")).not.toBeNull();
+  });
+
   test("allow is STRICT: a plain prefix only — no separators, subshells, quotes, escapes or line breaks", () => {
     const allow = { allow: ["command(git status)"], ask: [], deny: [] };
     const cmd = (c: string) => payload("run_command", { CommandLine: c });
@@ -233,6 +253,10 @@ describe("runAntigravityApproval — through the shared relay", () => {
     test("a different command, a different conversation, or an expired entry → a card", async () => {
       const cases: Array<[object, number]> = [
         [payload("run_command", { CommandLine: "rm -rf build2", BypassSandbox: true }), 0],
+        // the same command with ANY other arg changed (where it runs, its env, an unknown arg) is a new call
+        [payload("run_command", { CommandLine: "rm -rf build", BypassSandbox: true, Cwd: "/" }), 0],
+        [payload("run_command", { CommandLine: "rm -rf build", BypassSandbox: true, Env: { HOME: "/" } }), 0],
+        [{ ...RETRY, workspacePaths: ["/Users/x/other"] }, 0],
         [{ ...RETRY, conversationId: "c0ffee00-0000-4000-8000-000000000002" }, 0],
         [RETRY, ANTIGRAVITY_RETRY_PASS_MS + 1],
       ];

@@ -106,8 +106,16 @@ export function loadAntigravityRules(transcriptPath: string | undefined): Antigr
   return out;
 }
 
-/** Shell words that run the NEXT word as the command (their own `-flags` are skipped too). */
-const WRAPPERS = new Set(["sudo", "doas", "env", "command", "exec", "nice", "time", "nohup", "xargs", "builtin"]);
+/** Words that run a LATER word (or a `-c` string / eval argument) as a command: privilege and
+ *  process wrappers, shells and eval (their quoted script's words are already in the segment — quotes
+ *  are dropped), find's -exec, and the compound-command keywords (`then rm`, `! rm`). */
+const WRAPPERS = new Set([
+  "sudo", "doas", "env", "command", "exec", "nice", "time", "nohup", "xargs", "builtin",
+  "sh", "bash", "zsh", "dash", "ksh", "mksh", "fish", "eval", "source", ".",
+  "timeout", "gtimeout", "watch", "stdbuf", "ionice", "chrt", "taskset", "setsid", "flock", "unbuffer",
+  "caffeinate", "script", "parallel", "find", "busybox", "arch", "chroot", "runuser", "su", "nsenter",
+  "if", "then", "else", "elif", "do", "while", "until", "!",
+]);
 
 /** Every word that may RUN as a command somewhere in `line`, basename'd and unquoted — deliberately
  *  loose (a false hit only makes us say "no opinion"): split on `;` `&` `|` newlines, `$(`, backticks,
@@ -205,7 +213,8 @@ export function antigravityApprovalRequest(
     const path = str(args.Path) ?? str(args.TargetFile) ?? str(args.AbsolutePath) ?? str(args.FilePath);
     if (!path) return null;
     toolInput = { file_path: path };
-    action = "write_file"; target = cwd && !isAbsolute(path) ? resolve(cwd, path) : path;
+    // Always normalized: `/tmp/../Users/me/.ssh/x` must hit a `.ssh` deny like the plain path does.
+    action = "write_file"; target = isAbsolute(path) ? resolve(path) : cwd ? resolve(cwd, path) : path;
   }
   const hit = (list: string[], exact: boolean) => list.some((r) => ruleMatches(r, action, target, cwd, exact));
   // Antigravity's precedence, Deny > Ask > Allow. A call the user's own rules DENY never reaches the
@@ -237,15 +246,33 @@ export function antigravityDecision(line: string | undefined): string {
  *  with `BypassSandbox: true` — a second card for what the user already approved. So a phone Allow on a
  *  shell card leaves a one-use ticket for (conversation, exact command string): the next identical
  *  run_command in that conversation within this window is auto_approved without a card. Never after a
- *  Deny, never for another command or conversation, consumed on first use. Other args (BypassSandbox)
- *  are not part of the key. Files are 0600 under SESSIONS_DIR; expired ones are swept on each write. */
+ *  Deny, never for another command or conversation, consumed on first use. The key is EVERY tool
+ *  argument plus the workspace (antigravityRetryKey) except the ones that cannot change what runs or
+ *  where — so a retry in another Cwd, with other env, or any new/unknown arg gets a fresh card.
+ *  Files are 0600 under SESSIONS_DIR; expired ones are swept on each write. */
 export const ANTIGRAVITY_RETRY_PASS_MS = 90_000;
+/** The only args a retry may change and still ride the pass: the sandbox switch the pass exists for,
+ *  the model's prose summary, and the async-wait timing. Everything else is part of the key. */
+const RETRY_IGNORED_ARGS = new Set(["BypassSandbox", "toolSummary", "WaitMsBeforeAsync"]);
+/** Key-sorted JSON, so the same args in another order are the same key. */
+const canonical = (v: unknown): string => Array.isArray(v) ? `[${v.map(canonical).join(",")}]`
+  : v !== null && typeof v === "object"
+    ? `{${Object.keys(v).sort().map((k) => `${JSON.stringify(k)}:${canonical((v as Record<string, unknown>)[k])}`).join(",")}}`
+    : JSON.stringify(v) ?? "null";
+/** The retry-pass key of a run_command PreToolUse payload: workspace + every arg not in
+ *  RETRY_IGNORED_ARGS, canonically serialized. Pure. */
+export function antigravityRetryKey(input: Record<string, unknown>): string {
+  const call = input.toolCall as { args?: unknown } | undefined;
+  const args = typeof call?.args === "object" && call.args !== null ? call.args as Record<string, unknown> : {};
+  const kept = Object.fromEntries(Object.entries(args).filter(([k]) => !RETRY_IGNORED_ARGS.has(k)));
+  return canonical({ workspace: antigravityCwd(input) ?? null, args: kept });
+}
 const RETRY_PREFIX = "agy-retry-";
-const retryFile = (dir: string, sessionId: string, command: string) =>
-  `${dir}/${RETRY_PREFIX}${createHash("sha256").update(`${sessionId}\0${command}`).digest("hex")}`;
+const retryFile = (dir: string, sessionId: string, key: string) =>
+  `${dir}/${RETRY_PREFIX}${createHash("sha256").update(`${sessionId}\0${key}`).digest("hex")}`;
 
-/** Record a phone-allowed command. Never throws. */
-export async function rememberAntigravityAllow(dir: string, sessionId: string, command: string, now: number): Promise<void> {
+/** Record a phone-allowed call (`key` = antigravityRetryKey). Never throws. */
+export async function rememberAntigravityAllow(dir: string, sessionId: string, key: string, now: number): Promise<void> {
   try {
     await mkdir(dir, { recursive: true, mode: 0o700 });
     for (const name of await readdir(dir)) {
@@ -253,13 +280,13 @@ export async function rememberAntigravityAllow(dir: string, sessionId: string, c
       const at = Number(await readFile(`${dir}/${name}`, "utf8").catch(() => "0"));
       if (!(now - at < ANTIGRAVITY_RETRY_PASS_MS)) await unlink(`${dir}/${name}`).catch(() => {});
     }
-    await writeFile(retryFile(dir, sessionId, command), String(now), { mode: 0o600 });
+    await writeFile(retryFile(dir, sessionId, key), String(now), { mode: 0o600 });
   } catch { /* no ticket → the retry just gets its own card */ }
 }
 
-/** Consume a fresh ticket for exactly this (conversation, command). True once; never throws. */
-export async function takeAntigravityAllow(dir: string, sessionId: string, command: string, now: number): Promise<boolean> {
-  const f = retryFile(dir, sessionId, command);
+/** Consume a fresh ticket for exactly this (conversation, key). True once; never throws. */
+export async function takeAntigravityAllow(dir: string, sessionId: string, key: string, now: number): Promise<boolean> {
+  const f = retryFile(dir, sessionId, key);
   try {
     const at = Number(await readFile(f, "utf8"));
     await unlink(f); // the unlink that succeeds owns the one use
@@ -310,7 +337,8 @@ export async function runAntigravityApproval(raw: string, deps: AntigravityAppro
     const command = req.toolName === "shell" ? str(req.toolInput.command) : undefined;
     const retryDir = deps.retryDir ?? SESSIONS_DIR;
     const now = deps.hold?.now ?? Date.now;
-    if (command && await takeAntigravityAllow(retryDir, req.sessionId, command, now())) return '{"decision":"auto_approve"}';
+    const retryKey = command ? antigravityRetryKey(input) : undefined;
+    if (retryKey && await takeAntigravityAllow(retryDir, req.sessionId, retryKey, now())) return '{"decision":"auto_approve"}';
     if (command && isNomoSkillCommand(command, deps.pluginRoot)) {
       const config: Config | null = await (deps.hold?.loadConfigFn ?? loadConfig)();
       if (config) return '{"decision":"auto_approve"}';
@@ -342,7 +370,7 @@ export async function runAntigravityApproval(raw: string, deps: AntigravityAppro
     // as WORKING inside runPermissionHook: a cancelled tool call is not necessarily a finished turn. The
     // real Stop, or the watchdog's idle net, ends it.
     const decision = antigravityDecision(line);
-    if (command && decision === '{"decision":"auto_approve"}') await rememberAntigravityAllow(retryDir, req.sessionId, command, now());
+    if (retryKey && decision === '{"decision":"auto_approve"}') await rememberAntigravityAllow(retryDir, req.sessionId, retryKey, now());
     return decision;
   } catch {
     return ANTIGRAVITY_FALLBACK;

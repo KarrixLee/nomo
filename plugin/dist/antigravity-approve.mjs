@@ -2875,11 +2875,11 @@ function cursorChatTitle(sessionId, db = cursorStateDb(), env = process.env) {
     return;
   return sqliteOneTitle(db, "select case when json_type(cast(value as text),'$.name')='text' then json_extract(cast(value as text),'$.name') end" + ` from cursorDiskKV where key='composerData:${sessionId}'`, env);
 }
-function sqliteOneTitle(db, sql, env = process.env) {
-  const cleaned = sqliteOne(db, sql, env);
+function sqliteOneTitle(db, sql, env = process.env, copyFallback = false) {
+  const cleaned = sqliteOne(db, sql, env, copyFallback);
   return cleaned ? truncateOnWord(cleaned) : undefined;
 }
-function sqliteOne(db, sql, env = process.env) {
+function sqliteOne(db, sql, env = process.env, copyFallback = false) {
   if (!existsSync2(db))
     return;
   try {
@@ -2888,7 +2888,9 @@ function sqliteOne(db, sql, env = process.env) {
     let out;
     try {
       out = run(db);
-    } catch {
+    } catch (e) {
+      if (!copyFallback)
+        throw e;
       const tmp = mkdtempSync(join2(tmpdir(), "nomo-sql-"));
       try {
         for (const ext of ["", "-wal"])
@@ -2948,7 +2950,7 @@ function antigravityChatTitle(sessionId, transcriptPath, env = process.env) {
   if (!AG_SQL_SAFE_ID.test(sessionId))
     return;
   for (const db of summariesDbs(transcriptPath)) {
-    const t = sqliteOneTitle(db, `select title from conversation_summaries where conversation_id='${sessionId}'`, env);
+    const t = sqliteOneTitle(db, `select title from conversation_summaries where conversation_id='${sessionId}'`, env, true);
     if (t)
       return t;
   }
@@ -4955,7 +4957,7 @@ var LAN_FUTURE_SKEW_MS = 30000;
 var LAN_NONCE_MAX_CHARS = 64;
 var LAN_REQUEST_ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
 var LAN_ANSWER_BLOB_MAX_CHARS = 3072;
-var LAN_COMMAND_BLOB_MAX_CHARS = 8192;
+var LAN_COMMAND_BLOB_MAX_CHARS = 20480;
 var LAN_FRAMES_WAIT_MAX_MS = 25000;
 function parseLanFramesRequest(payload) {
   const sinceSeq = payload.sinceSeq;
@@ -6054,7 +6056,7 @@ async function runPermissionHook(deps = {}, agent = "claude") {
         attentionStalledAt: undefined,
         blob: await encryptBlob(config.e2eKey, { ...base, status: "working", at: Math.floor(settledAt / 1000) })
       } : attentionStalled ? await stalledPatch(settledAt) : { ts: settledAt, blob: fallbackBlob, attentionStalledAt: undefined };
-      await (deps.settleHoldRecordFn ?? defaultSettleHoldRecord())(sessionId, patch, settleAsWorking ? holdAt : undefined);
+      await (deps.settleHoldRecordFn ?? defaultSettleHoldRecord())(sessionId, patch, settleAsWorking && agent === "antigravity" ? holdAt : undefined);
     };
     const jitter = deps.jitter ?? (() => Math.floor(Math.random() * POLL_JITTER_MAX_MS));
     const interval = deps.pollIntervalMs ?? POLL_INTERVAL_MS;
@@ -6236,7 +6238,56 @@ function loadAntigravityRules(transcriptPath) {
   }
   return out;
 }
-var WRAPPERS = new Set(["sudo", "doas", "env", "command", "exec", "nice", "time", "nohup", "xargs", "builtin"]);
+var WRAPPERS = new Set([
+  "sudo",
+  "doas",
+  "env",
+  "command",
+  "exec",
+  "nice",
+  "time",
+  "nohup",
+  "xargs",
+  "builtin",
+  "sh",
+  "bash",
+  "zsh",
+  "dash",
+  "ksh",
+  "mksh",
+  "fish",
+  "eval",
+  "source",
+  ".",
+  "timeout",
+  "gtimeout",
+  "watch",
+  "stdbuf",
+  "ionice",
+  "chrt",
+  "taskset",
+  "setsid",
+  "flock",
+  "unbuffer",
+  "caffeinate",
+  "script",
+  "parallel",
+  "find",
+  "busybox",
+  "arch",
+  "chroot",
+  "runuser",
+  "su",
+  "nsenter",
+  "if",
+  "then",
+  "else",
+  "elif",
+  "do",
+  "while",
+  "until",
+  "!"
+]);
 function commandWords(line) {
   const out = [];
   for (const segment of line.split(/[;&|\n\r`(){}]|\$\(/)) {
@@ -6316,7 +6367,7 @@ function antigravityApprovalRequest(input, rules = { allow: [], ask: [], deny: [
       return null;
     toolInput = { file_path: path };
     action = "write_file";
-    target = cwd && !isAbsolute5(path) ? resolve4(cwd, path) : path;
+    target = isAbsolute5(path) ? resolve4(path) : cwd ? resolve4(cwd, path) : path;
   }
   const hit = (list, exact) => list.some((r) => ruleMatches(r, action, target, cwd, exact));
   if (hit(rules.deny, false))
@@ -6343,9 +6394,17 @@ function antigravityDecision(line) {
   return ANTIGRAVITY_FALLBACK;
 }
 var ANTIGRAVITY_RETRY_PASS_MS = 90000;
+var RETRY_IGNORED_ARGS = new Set(["BypassSandbox", "toolSummary", "WaitMsBeforeAsync"]);
+var canonical = (v) => Array.isArray(v) ? `[${v.map(canonical).join(",")}]` : v !== null && typeof v === "object" ? `{${Object.keys(v).sort().map((k) => `${JSON.stringify(k)}:${canonical(v[k])}`).join(",")}}` : JSON.stringify(v) ?? "null";
+function antigravityRetryKey(input) {
+  const call = input.toolCall;
+  const args = typeof call?.args === "object" && call.args !== null ? call.args : {};
+  const kept = Object.fromEntries(Object.entries(args).filter(([k]) => !RETRY_IGNORED_ARGS.has(k)));
+  return canonical({ workspace: antigravityCwd(input) ?? null, args: kept });
+}
 var RETRY_PREFIX = "agy-retry-";
-var retryFile = (dir, sessionId, command) => `${dir}/${RETRY_PREFIX}${createHash2("sha256").update(`${sessionId}\x00${command}`).digest("hex")}`;
-async function rememberAntigravityAllow(dir, sessionId, command, now) {
+var retryFile = (dir, sessionId, key) => `${dir}/${RETRY_PREFIX}${createHash2("sha256").update(`${sessionId}\x00${key}`).digest("hex")}`;
+async function rememberAntigravityAllow(dir, sessionId, key, now) {
   try {
     await mkdir2(dir, { recursive: true, mode: 448 });
     for (const name of await readdir6(dir)) {
@@ -6355,11 +6414,11 @@ async function rememberAntigravityAllow(dir, sessionId, command, now) {
       if (!(now - at < ANTIGRAVITY_RETRY_PASS_MS))
         await unlink6(`${dir}/${name}`).catch(() => {});
     }
-    await writeFile2(retryFile(dir, sessionId, command), String(now), { mode: 384 });
+    await writeFile2(retryFile(dir, sessionId, key), String(now), { mode: 384 });
   } catch {}
 }
-async function takeAntigravityAllow(dir, sessionId, command, now) {
-  const f = retryFile(dir, sessionId, command);
+async function takeAntigravityAllow(dir, sessionId, key, now) {
+  const f = retryFile(dir, sessionId, key);
   try {
     const at = Number(await readFile7(f, "utf8"));
     await unlink6(f);
@@ -6390,7 +6449,8 @@ async function runAntigravityApproval(raw, deps = {}) {
     const command = req.toolName === "shell" ? str3(req.toolInput.command) : undefined;
     const retryDir = deps.retryDir ?? SESSIONS_DIR;
     const now = deps.hold?.now ?? Date.now;
-    if (command && await takeAntigravityAllow(retryDir, req.sessionId, command, now()))
+    const retryKey = command ? antigravityRetryKey(input) : undefined;
+    if (retryKey && await takeAntigravityAllow(retryDir, req.sessionId, retryKey, now()))
       return '{"decision":"auto_approve"}';
     if (command && isNomoSkillCommand(command, deps.pluginRoot)) {
       const config = await (deps.hold?.loadConfigFn ?? loadConfig)();
@@ -6421,8 +6481,8 @@ async function runAntigravityApproval(raw, deps = {}) {
       }
     }, "antigravity");
     const decision = antigravityDecision(line);
-    if (command && decision === '{"decision":"auto_approve"}')
-      await rememberAntigravityAllow(retryDir, req.sessionId, command, now());
+    if (retryKey && decision === '{"decision":"auto_approve"}')
+      await rememberAntigravityAllow(retryDir, req.sessionId, retryKey, now());
     return decision;
   } catch {
     return ANTIGRAVITY_FALLBACK;
