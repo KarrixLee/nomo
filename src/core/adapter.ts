@@ -13,11 +13,11 @@
 // PORTABILITY: bun AND node >= 18 — no `Bun.*` APIs; file IO via node:fs/promises (shared helpers).
 
 import { execFile, execFileSync } from "node:child_process";
-import { copyFileSync, existsSync, mkdtempSync, rmSync, statSync } from "node:fs";
+import { existsSync } from "node:fs";
 import { readdir, readFile, stat } from "node:fs/promises";
-import { devNull, tmpdir } from "node:os";
+import { devNull } from "node:os";
 import { promisify } from "node:util";
-import { basename, isAbsolute, join, resolve } from "node:path";
+import { basename, join } from "node:path";
 import { AgentKind, AgentKindWire, CC_DIR, codexHome, cursorHome, folderKeyFromCwd, isRealTty, lastHookPath, pidAlive, pidAncestors, pidCommand, readPrefix, readSuffix, SessionRecord } from "./shared";
 import { ancestryContainsHerdr, owningTerminalApp } from "./terminal-focus";
 
@@ -2259,14 +2259,10 @@ export interface AgentAdapter {
   locateTuiPid?(ctx: { sessionId: string; record: SessionRecord }, deps?: LocateTuiDeps): Promise<number | undefined>;
   /** How a phone "Interrupt" stops this agent's running turn, or absent when it cannot be done.
    *   "hook-flag"  — the watchdog stamps a per-session flag; the agent's own status hook returns
-   *                  continue:false at the next tool call (Claude Code), or terminate at the next
-   *                  PostInvocation (Antigravity).
+   *                  continue:false at the next tool call (Claude Code).
    *   "app-server" — the watchdog sends turn/interrupt through the Codex app-server bridge.
    *  The phone mirrors this as CCInterrupt.canInterrupt. */
   interrupt?: "hook-flag" | "app-server";
-  /** The hook flag's file suffix, when it is not the shared `.interrupt` (Antigravity's wrapper globs
-   *  for its own flags only). */
-  interruptFlagSuffix?: string;
 }
 
 export const claudeAdapter: AgentAdapter = {
@@ -2571,25 +2567,6 @@ const CURSOR_TITLE_TIMEOUT_MS = 300;
 export function cursorChatTitle(sessionId: string, db: string = cursorStateDb(), env: NodeJS.ProcessEnv = process.env): string | undefined {
   // The id is spliced into the SQL text (the sqlite3 CLI takes no bound parameters).
   if (!/^[A-Za-z0-9_-]{1,128}$/.test(sessionId)) return undefined;
-  return sqliteOneTitle(db,
-    "select case when json_type(cast(value as text),'$.name')='text' then json_extract(cast(value as text),'$.name') end" +
-    ` from cursorDiskKV where key='composerData:${sessionId}'`, env);
-}
-
-/** One read-only, time-boxed `sqlite3` query whose single text cell is a title (cleaned + capped), or
- *  undefined on ANY failure. Shared by the Cursor and Antigravity title lookups; the caller has already
- *  validated anything it spliced into `sql`. */
-function sqliteOneTitle(db: string, sql: string, env: NodeJS.ProcessEnv = process.env, copyFallback = false): string | undefined {
-  const cleaned = sqliteOne(db, sql, env, copyFallback);
-  return cleaned ? truncateOnWord(cleaned) : undefined; // capped like every other generated title
-}
-
-/** The single cell of a read-only, time-boxed `sqlite3` query, whitespace-collapsed; undefined on ANY
- *  failure, an empty result, or a database file that does not exist. `copyFallback` (Antigravity's small
- *  summaries DB only) retries a failed read on a private copy; off, a failure is simply undefined —
- *  Cursor's state.vscdb can be hundreds of MB and must never be copied synchronously in a hook. */
-function sqliteOne(db: string, sql: string, env: NodeJS.ProcessEnv = process.env, copyFallback = false): string | undefined {
-  if (!existsSync(db)) return undefined;
   try {
     // `-init <null device>`: the CLI otherwise loads the user's rc (~/.sqliterc, or
     // $XDG_CONFIG_HOME/sqlite3/sqliterc), where `.headers on` / `.mode box` put the column header (the
@@ -2597,31 +2574,12 @@ function sqliteOne(db: string, sql: string, env: NodeJS.ProcessEnv = process.env
     // output shape. macOS ships sqlite3 at a fixed absolute path, which a `.`/empty PATH entry (the cwd
     // is the workspace) cannot shadow with a repo-planted binary; elsewhere it is a PATH lookup.
     const bin = process.platform === "darwin" && existsSync("/usr/bin/sqlite3") ? "/usr/bin/sqlite3" : "sqlite3";
-    const run = (target: string, readonly = true) => execFileSync(bin, ["-init", devNull, "-batch", "-noheader", "-list", ...(readonly ? ["-readonly"] : []), target, sql],
-      { timeout: CURSOR_TITLE_TIMEOUT_MS, encoding: "utf8", maxBuffer: 65_536, stdio: ["ignore", "pipe", "ignore"], env });
-    let out: string;
-    try {
-      out = run(db);
-    } catch (e) {
-      if (!copyFallback) throw e;
-      // A WAL database whose -shm is absent cannot be opened read-only ("unable to open database file
-      // (14)" — Antigravity's CLI summaries DB between sessions). `immutable=1` would read the main file
-      // WITHOUT the WAL — where the desktop app's latest run status lives while it holds the DB open, so
-      // an app Stop's IDLE was never seen (NOM-96). Read a private COPY of db + wal instead (no -shm: the
-      // copy rebuilds its wal-index from the WAL itself); the original is never opened for writing.
-      // Immutable stays the last resort.
-      const tmp = mkdtempSync(join(tmpdir(), "nomo-sql-"));
-      try {
-        for (const ext of ["", "-wal"]) if (existsSync(db + ext)) copyFileSync(db + ext, join(tmp, `c.db${ext}`));
-        out = run(join(tmp, "c.db"), false);
-      } catch {
-        out = run(`file:${db.split("/").map(encodeURIComponent).join("/")}?immutable=1`);
-      } finally {
-        rmSync(tmp, { recursive: true, force: true });
-      }
-    }
+    const out = execFileSync(bin, ["-init", devNull, "-batch", "-noheader", "-list", "-readonly", db,
+      "select case when json_type(cast(value as text),'$.name')='text' then json_extract(cast(value as text),'$.name') end" +
+      ` from cursorDiskKV where key='composerData:${sessionId}'`,
+    ], { timeout: CURSOR_TITLE_TIMEOUT_MS, encoding: "utf8", maxBuffer: 65_536, stdio: ["ignore", "pipe", "ignore"], env });
     const cleaned = out.replace(/\s+/g, " ").trim();
-    return cleaned || undefined;
+    return cleaned ? truncateOnWord(cleaned) : undefined; // capped like every other generated title
   } catch {
     return undefined;
   }
@@ -2667,169 +2625,6 @@ export const cursorAdapter: AgentAdapter = {
   blobAgentFields: { agent: "cursor" as const },
 };
 
-/** Antigravity's model id off a hook payload (`modelName`, on every event). Capped like cursorModel. */
-export function antigravityModel(input: Record<string, unknown>): string | undefined {
-  const v = input.modelName;
-  return typeof v === "string" && v.trim().length > 0 ? v.trim().slice(0, 80) : undefined;
-}
-
-/** Antigravity's per-surface data dirs: the desktop app/IDE writes ~/.gemini/antigravity, the `agy` CLI
- *  ~/.gemini/antigravity-cli (verified 2026-10, app 2.25 / agy 1.4.8). Each holds its own
- *  conversation_summaries.db and brain/<id>/… transcripts. */
-export function antigravityDataDirs(): string[] {
-  const home = process.env.HOME ?? "";
-  return [`${home}/.gemini/antigravity`, `${home}/.gemini/antigravity-cli`];
-}
-
-/** The data dir a session lives in, from its transcriptPath (`<dir>/brain/<id>/…`) — only when that is
- *  one of the two known dirs, so a stdin-supplied path can never point the lookups anywhere else.
- *  Undefined → the caller tries both. */
-export function antigravityDataDirFor(transcriptPath: string | undefined): string | undefined {
-  if (!transcriptPath || !isAbsolute(transcriptPath)) return undefined;
-  // Normalized first: `<dir>/brain/../../../x` must not pass the prefix check and then read `x`.
-  const normalized = resolve(transcriptPath);
-  const i = normalized.indexOf("/brain/");
-  const dir = i > 0 ? normalized.slice(0, i) : undefined;
-  return dir !== undefined && antigravityDataDirs().includes(dir) ? dir : undefined;
-}
-
-const summariesDbs = (transcriptPath: string | undefined): string[] => {
-  const dir = antigravityDataDirFor(transcriptPath);
-  return (dir ? [dir] : antigravityDataDirs()).map((d) => `${d}/conversation_summaries.db`);
-};
-
-/** conversationId arrives on stdin and is spliced into SQL text (the sqlite3 CLI binds nothing):
- *  UUID-shaped characters only. */
-const AG_SQL_SAFE_ID = /^[A-Za-z0-9-]{1,128}$/;
-
-/** The title Antigravity gave a conversation, or undefined. Table `conversation_summaries`, PRIMARY KEY
- *  `conversation_id` (== the hooks' conversationId — verified on the desktop app), column `title`,
- *  which appears only once the first turn completes. One read-only PK probe per database, 300 ms
- *  bound each; the transcript picks the database, else both are tried. */
-export function antigravityChatTitle(sessionId: string, transcriptPath?: string, env: NodeJS.ProcessEnv = process.env): string | undefined {
-  if (!AG_SQL_SAFE_ID.test(sessionId)) return undefined;
-  for (const db of summariesDbs(transcriptPath)) {
-    const t = sqliteOneTitle(db, `select title from conversation_summaries where conversation_id='${sessionId}'`, env, true);
-    if (t) return t;
-  }
-  return undefined;
-}
-
-/** One conversation's run state as Antigravity recorded it. `status` e.g. CASCADE_RUN_STATUS_IDLE /
- *  _RUNNING; times in epoch ms (absent when unparseable / the column is missing); `notFullyIdle` is the
- *  row's own `not_fully_idle` flag; `readAt` is when the database was last confirmed unchanged since the
- *  copy these values came from — so it is never older than the read itself. */
-export interface AntigravityRunState {
-  status: string; lastModifiedMs?: number; lastUserInputMs?: number; notFullyIdle?: boolean; readAt: number;
-}
-
-/** Per database: the stat key of the copy last read, when it was last confirmed current, and its rows. */
-type RunStateSnapshot = { key: string; readAt: number; rows: Map<string, Omit<AntigravityRunState, "readAt">> };
-const runStateCache = new Map<string, RunStateSnapshot>();
-
-/** Every row of one summaries DB, read from a private temp COPY of db + wal (the desktop app keeps its
- *  latest status in the WAL while it holds the DB open; the original is never opened at all). The copy is
- *  skipped while neither file's mtime/size moved since the last one: one stat pair per call. */
-function antigravityRunStates(db: string, now: number): RunStateSnapshot | undefined {
-  let key: string;
-  try {
-    const main = statSync(db);
-    const wal = existsSync(`${db}-wal`) ? statSync(`${db}-wal`) : undefined;
-    key = `${main.mtimeMs}:${main.size}|${wal?.mtimeMs ?? "-"}:${wal?.size ?? "-"}`;
-  } catch { return undefined; }
-  const cached = runStateCache.get(db);
-  if (cached && cached.key === key) { cached.readAt = now; return cached; }
-  const tmp = mkdtempSync(join(tmpdir(), "nomo-agy-"));
-  try {
-    for (const ext of ["", "-wal"]) if (existsSync(db + ext)) copyFileSync(db + ext, join(tmp, `c.db${ext}`));
-    const bin = process.platform === "darwin" && existsSync("/usr/bin/sqlite3") ? "/usr/bin/sqlite3" : "sqlite3";
-    const ms = (col: string) => `coalesce(cast((julianday(${col}) - 2440587.5) * 86400000 as integer), '')`;
-    const query = (cols: string) => execFileSync(bin, ["-init", devNull, "-batch", "-noheader", "-list", "-separator", "\t",
-      join(tmp, "c.db"), `select conversation_id, status, ${ms("last_modified_time")}, ${cols} from conversation_summaries`],
-      { timeout: CURSOR_TITLE_TIMEOUT_MS, encoding: "utf8", maxBuffer: 1_048_576, stdio: ["ignore", "pipe", "ignore"] });
-    let out: string;
-    // An older schema without the newer columns still yields status + time.
-    try { out = query(`${ms("last_user_input_time")}, not_fully_idle`); } catch { out = query("'', ''"); }
-    const rows = new Map<string, Omit<AntigravityRunState, "readAt">>();
-    for (const line of out.split("\n")) {
-      const [id, status, mod, input, nfi] = line.split("\t");
-      if (!id) continue;
-      const num = (v: string | undefined) => (v ? Number(v) : NaN);
-      rows.set(id, {
-        status: status ?? "",
-        ...(Number.isFinite(num(mod)) ? { lastModifiedMs: num(mod) } : {}),
-        ...(Number.isFinite(num(input)) ? { lastUserInputMs: num(input) } : {}),
-        ...(nfi === "0" || nfi === "1" ? { notFullyIdle: nfi === "1" } : {}),
-      });
-    }
-    const entry = { key, readAt: now, rows };
-    runStateCache.set(db, entry);
-    return entry;
-  } catch {
-    return undefined;
-  } finally {
-    rmSync(tmp, { recursive: true, force: true });
-  }
-}
-
-/** The run state Antigravity recorded for a conversation (see AntigravityRunState). Antigravity writes
- *  IDLE even when a turn ends with NO hook event (interrupt, app Stop, headless auto-deny) — which is what
- *  the watchdog's settle path keys on. Undefined on any failure. */
-export function antigravityRunStatus(
-  sessionId: string, transcriptPath?: string, now: number = Date.now(),
-): AntigravityRunState | undefined {
-  for (const db of summariesDbs(transcriptPath)) {
-    const snap = antigravityRunStates(db, now);
-    const row = snap?.rows.get(sessionId);
-    if (row) return { ...row, readAt: snap!.readAt };
-  }
-  return undefined;
-}
-
-/** First-prompt fallback for a conversation the database has not titled yet: the transcript's first
- *  line is `{"type":"USER_INPUT","content":"<USER_REQUEST>\n…\n</USER_REQUEST>…"}`. Only a transcript
- *  inside a known data dir is read, and only its first 16 KB. */
-export async function antigravityFirstPrompt(transcriptPath: string | undefined): Promise<string | undefined> {
-  if (!antigravityDataDirFor(transcriptPath)) return undefined;
-  try {
-    const first = (await readPrefix(transcriptPath!, 16_384)).split("\n", 1)[0] ?? "";
-    const line = JSON.parse(first) as { type?: unknown; content?: unknown };
-    if (line.type !== "USER_INPUT" || typeof line.content !== "string") return undefined;
-    const m = /<USER_REQUEST>([\s\S]*?)<\/USER_REQUEST>/.exec(line.content);
-    return displayTitleFromUserText(m ? m[1]! : line.content);
-  } catch {
-    return undefined;
-  }
-}
-
-/** Antigravity (desktop app/IDE + `agy` CLI) — a READ-ONLY v1 driven by its hooks, Cursor's twin.
- *  Producer: core/antigravity.ts. Reached here only through `adapterFor()` by the rebuild paths.
- *  `title` has no prompt to read (no Antigravity event carries the user's text), so the producer and
- *  `titleRepair` read Antigravity's own conversation title instead. NOT in `allAdapters`. */
-export const antigravityAdapter: AgentAdapter = {
-  kind: "antigravity",
-  title: async ({ sessionId, transcriptPath }) =>
-    antigravityChatTitle(sessionId, transcriptPath) ?? await antigravityFirstPrompt(transcriptPath),
-  model: async ({ input }) => antigravityModel(input),
-  detectInterrupt: () => false,
-  // ponytail: status-cmd's NOT-FIRING detector is off (matches nothing) until the spike shows which
-  // files Antigravity writes per conversation under ~/.gemini/antigravity/conversations.
-  sessionsDir: () => `${process.env.HOME ?? ""}/.gemini/antigravity/conversations`,
-  sessionMatch: () => false,
-  hookStampPath: () => lastHookPath("antigravity"),
-  hooksNotFiringHint: "  run `bunx nomo-ai --antigravity` again, then restart Antigravity so it re-reads ~/.gemini/config/hooks.json",
-  titleRepair: {
-    due: (record, now) => record.lastEvent === "done" && typeof record.ts === "number" && now - record.ts < CURSOR_TITLE_REPAIR_MS,
-    resolve: (sessionId) => antigravityChatTitle(sessionId),
-  },
-  toolDetail: {},
-  blobAgentFields: { agent: "antigravity" as const },
-  // Phone Stop: the watchdog stamps the shared flag; the PostInvocation hook terminates the turn
-  // (core/antigravity.ts) and the approval hook denies a routed/held tool (core/antigravity-approval.ts).
-  interrupt: "hook-flag",
-  interruptFlagSuffix: ".agy-interrupt", // ANTIGRAVITY_INTERRUPT_SUFFIX in core/antigravity.ts
-};
-
 /** The adapter for an agent kind THIS BUILD DOES NOT KNOW — a record stamped by a newer peer install
  *  (see AgentKindWire). Its whole job is `blobAgentFields`: carry the raw literal back out, so a
  *  rebuild by an older build re-emits the agent it was handed instead of silently dropping the key and
@@ -2867,7 +2662,6 @@ export function adapterFor(agent: AgentKindWire): AgentAdapter {
     case "codex": return codexAdapter;
     case "opencode": return opencodeAdapter;
     case "cursor": return cursorAdapter;
-    case "antigravity": return antigravityAdapter;
     case "claude": return claudeAdapter;
     default: return typeof agent === "string" && agent.length > 0 ? unknownAgentAdapter(agent) : claudeAdapter;
   }

@@ -118,10 +118,8 @@ export function appendCodexBridgeMarker(dbg: string | undefined, down: boolean):
   return Array.from(next).length <= DBG_BLOB_TEXT_MAX_CHARS ? next : bare;
 }
 
-/** Root of the on-disk state: config.json, the per-session pid files, the watchdog pidfile.
- *  `NOMO_CC_DIR` moves ALL of it (end-to-end tests run a real agent against a throwaway state dir; the
- *  shell scripts honour the same variable). Unset — every real install — it is ~/.config/cc-status. */
-export const CC_DIR = process.env.NOMO_CC_DIR || `${process.env.HOME}/.config/cc-status`;
+/** Root of the on-disk state: config.json, the per-session pid files, the watchdog pidfile. */
+export const CC_DIR = `${process.env.HOME}/.config/cc-status`;
 /** Append-only, local-only session lifecycle/state-machine trace next to config.json. */
 export const SESSION_TRACE_PATH = `${CC_DIR}/session-trace.log`;
 const SESSION_TRACE_MAX_BYTES = 256 * 1024;
@@ -453,13 +451,8 @@ export type CCStatus = "working" | "needsAttention" | "done";
  *  against a Claude transcript or CC file.
  *
  *  `"cursor"` (the fourth) covers BOTH the Cursor desktop app's agent and the `cursor-agent` CLI — one
- *  kind, one hook binary (entries/cursor-status.ts → core/cursor.ts). Read-only in v1.
- *
- *  `"antigravity"` (the fifth) covers Google Antigravity — the desktop app/IDE and the `agy` CLI, which
- *  read the same ~/.gemini/config/hooks.json. One hook binary (entries/antigravity-status.ts →
- *  core/antigravity.ts), plus a PreToolUse phone-approval hold (entries/antigravity-approve.ts →
- *  core/antigravity-approval.ts). */
-export type AgentKind = "claude" | "codex" | "opencode" | "cursor" | "antigravity";
+ *  kind, one hook binary (entries/cursor-status.ts → core/cursor.ts). Read-only in v1. */
+export type AgentKind = "claude" | "codex" | "opencode" | "cursor";
 
 /** An agent literal AS IT ARRIVES — off a session record, out of a blob a peer install wrote. It is
  *  `AgentKind` plus "some string this build has never heard of", because that case is now REAL: two
@@ -493,15 +486,6 @@ export function cursorHome(): string {
 /** The substring that identifies OUR hook command inside Cursor's `hooks.json` (the bundled hook's
  *  basename) — what status-cmd greps for to tell "installed" from "not set up here". */
 export const CURSOR_HOOK_MARKER = "cursor-status.mjs";
-
-/** Antigravity's global customization dir — holds the `hooks.json` the installer writes Nomo's one
- *  named block into. NOT ~/.gemini/antigravity-cli (runtime data, never read for hooks). */
-export function antigravityConfigDir(): string {
-  return `${process.env.HOME}/.gemini/config`;
-}
-
-/** The substring that identifies OUR hook inside Antigravity's `hooks.json` (the wrapper's basename). */
-export const ANTIGRAVITY_HOOK_MARKER = "antigravity-hook.sh";
 
 /** The substring that identifies OUR hook command inside a codex `hooks.json` entry (the bundled
  *  hook's basename). status-cmd greps for it to flag leftover legacy (pre-native-plugin) installs. */
@@ -2097,16 +2081,11 @@ export async function clearDecisionHoldAt(
  *  than anything this exiting hook knows and must never be walked back. Best-effort throughout. */
 export async function settleDecisionHoldRecordAt(
   sessionsDir: string, sessionId: string, patch: Partial<SessionRecord>,
-  /** When the hold began — passed only by a WORKING settle. A plain `update` record older than this is
-   *  the pre-hold state no hook has touched since, so it is still ours even at prio:0. */
-  heldSince?: number,
 ): Promise<void> {
   try {
     const record = await readRecord(sessionId, sessionsDir);
     if (!record) return;                                        // reaped / never tracked → nothing to settle
-    if (record.op !== "update") return;                          // a done/end is newer than anything we know
-    const untouched = heldSince !== undefined && typeof record.ts === "number" && record.ts <= heldSince;
-    if (record.prio !== 1 && !untouched) return;                 // a later hook already moved it on
+    if (record.op !== "update" || record.prio !== 1) return;     // a later hook already moved it on
     await atomicWrite(`${sessionsDir}/${sessionId}.json`, JSON.stringify({ ...record, ...patch }), 0o600);
   } catch {
     // Bookkeeping is best-effort, exactly like trackSession's own write.
@@ -2154,16 +2133,14 @@ export const INTERRUPT_FLAG_SUFFIX = ".interrupt";
  *  pruneStaleDecisionHolds if the sessions dir ever needs to be tidy. */
 export const INTERRUPT_FLAG_MAX_AGE_MS = 3_600_000;
 
-export function interruptFlagFileName(sessionId: string, suffix: string = INTERRUPT_FLAG_SUFFIX): string {
-  return `${sessionId}${suffix}`;
+export function interruptFlagFileName(sessionId: string): string {
+  return `${sessionId}${INTERRUPT_FLAG_SUFFIX}`;
 }
 
 /** Best-effort, like every other write in this file. */
-export async function writeInterruptFlagAt(
-  sessionsDir: string, sessionId: string, now: number, suffix: string = INTERRUPT_FLAG_SUFFIX,
-): Promise<void> {
+export async function writeInterruptFlagAt(sessionsDir: string, sessionId: string, now: number): Promise<void> {
   try {
-    await atomicWrite(`${sessionsDir}/${interruptFlagFileName(sessionId, suffix)}`, JSON.stringify({ at: now }), 0o600);
+    await atomicWrite(`${sessionsDir}/${interruptFlagFileName(sessionId)}`, JSON.stringify({ at: now }), 0o600);
   } catch {
     // A flag that failed to land is an interrupt that did not happen; the phone's row stays Running.
   }
@@ -2171,30 +2148,25 @@ export async function writeInterruptFlagAt(
 
 /** Is a fresh flag present? Deliberately does NOT consume it: Claude Code still runs every other tool
  *  call already in the same assistant message, and each of those must be denied too. */
-export async function interruptFlagSetAt(
-  sessionsDir: string, sessionId: string, now: number, maxAgeMs: number = INTERRUPT_FLAG_MAX_AGE_MS,
-  suffix: string = INTERRUPT_FLAG_SUFFIX,
-): Promise<boolean> {
+export async function interruptFlagSetAt(sessionsDir: string, sessionId: string, now: number): Promise<boolean> {
   try {
     const flag = JSON.parse(
-      await readFile(`${sessionsDir}/${interruptFlagFileName(sessionId, suffix)}`, "utf8"),
+      await readFile(`${sessionsDir}/${interruptFlagFileName(sessionId)}`, "utf8"),
     ) as { at?: unknown };
-    return typeof flag.at === "number" && now - flag.at <= maxAgeMs;
+    return typeof flag.at === "number" && now - flag.at <= INTERRUPT_FLAG_MAX_AGE_MS;
   } catch {
     return false;
   }
 }
 
-export async function clearInterruptFlagAt(
-  sessionsDir: string, sessionId: string, suffix: string = INTERRUPT_FLAG_SUFFIX,
-): Promise<void> {
-  await unlink(`${sessionsDir}/${interruptFlagFileName(sessionId, suffix)}`).catch(() => {});
+export async function clearInterruptFlagAt(sessionsDir: string, sessionId: string): Promise<void> {
+  await unlink(`${sessionsDir}/${interruptFlagFileName(sessionId)}`).catch(() => {});
 }
 
 export async function settleDecisionHoldRecord(
-  sessionId: string, patch: Partial<SessionRecord>, heldSince?: number,
+  sessionId: string, patch: Partial<SessionRecord>,
 ): Promise<void> {
-  return settleDecisionHoldRecordAt(SESSIONS_DIR, sessionId, patch, heldSince);
+  return settleDecisionHoldRecordAt(SESSIONS_DIR, sessionId, patch);
 }
 
 /** Read up to `maxBytes` from the START of a file (the transcript's ai-title / first prompt sit near
