@@ -2097,11 +2097,16 @@ export async function clearDecisionHoldAt(
  *  than anything this exiting hook knows and must never be walked back. Best-effort throughout. */
 export async function settleDecisionHoldRecordAt(
   sessionsDir: string, sessionId: string, patch: Partial<SessionRecord>,
+  /** When the hold began — passed only by a WORKING settle. A plain `update` record older than this is
+   *  the pre-hold state no hook has touched since, so it is still ours even at prio:0. */
+  heldSince?: number,
 ): Promise<void> {
   try {
     const record = await readRecord(sessionId, sessionsDir);
     if (!record) return;                                        // reaped / never tracked → nothing to settle
-    if (record.op !== "update" || record.prio !== 1) return;     // a later hook already moved it on
+    if (record.op !== "update") return;                          // a done/end is newer than anything we know
+    const untouched = heldSince !== undefined && typeof record.ts === "number" && record.ts <= heldSince;
+    if (record.prio !== 1 && !untouched) return;                 // a later hook already moved it on
     await atomicWrite(`${sessionsDir}/${sessionId}.json`, JSON.stringify({ ...record, ...patch }), 0o600);
   } catch {
     // Bookkeeping is best-effort, exactly like trackSession's own write.
@@ -2187,9 +2192,9 @@ export async function clearInterruptFlagAt(
 }
 
 export async function settleDecisionHoldRecord(
-  sessionId: string, patch: Partial<SessionRecord>,
+  sessionId: string, patch: Partial<SessionRecord>, heldSince?: number,
 ): Promise<void> {
-  return settleDecisionHoldRecordAt(SESSIONS_DIR, sessionId, patch);
+  return settleDecisionHoldRecordAt(SESSIONS_DIR, sessionId, patch, heldSince);
 }
 
 /** Read up to `maxBytes` from the START of a file (the transcript's ai-title / first prompt sit near

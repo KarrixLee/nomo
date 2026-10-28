@@ -2319,6 +2319,22 @@ describe("state — the snapshot store", () => {
         .toEqual({ case: i, ...expected, seq: undefined, sessionId: undefined });
     }
   });
+
+  test("an Antigravity done row carries the record blob's reply receipts (NOM-96: `q` stuck on Sending…)", async () => {
+    // The done rung serves a Mac-AUTHORED plaintext, but the receipts publishReplyReceipts reseals live
+    // only in the record's blob — an idle, done, owner-alive agy row never showed its `q`.
+    const dir = await snapDir();
+    const store = snapStore(dir);
+    const done = { agent: "antigravity" as const, op: "done" as const, lastEvent: "done", transcript: "/x/.gemini/antigravity-cli/conv.jsonl" };
+    await write(dir, "s1", { ...done, blob: await encryptBlob(KEY, { status: "done", surface: "cli" }) });
+    await store.reconcile();
+    // Same record ts, only the blob gained `replies` — exactly what publishReplyReceipts writes.
+    await write(dir, "s1", { ...done, blob: await encryptBlob(KEY, { status: "done", surface: "cli", replies: { "mid-1": "q" } }) });
+    await store.reconcile();
+    const [row] = store.states(0).sessions;
+    expect(row.why).toBe("done");
+    expect(await decryptBlob(KEY, row.blob)).toMatchObject({ status: "done", surface: "cli", replies: { "mid-1": "q" } });
+  });
 });
 
 describe("POST /v1/lan — op:state", () => {

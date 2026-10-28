@@ -98,9 +98,9 @@ async function sha256Hex(s) {
 
 // src/core/adapter.ts
 import { execFile as execFile2, execFileSync as execFileSync2 } from "node:child_process";
-import { existsSync as existsSync2 } from "node:fs";
+import { copyFileSync, existsSync as existsSync2, mkdtempSync, rmSync } from "node:fs";
 import { readdir, readFile as readFile2, stat as stat2 } from "node:fs/promises";
-import { devNull } from "node:os";
+import { devNull, tmpdir } from "node:os";
 import { promisify as promisify2 } from "node:util";
 import { basename as basename2, isAbsolute as isAbsolute2, join as join2, resolve as resolve2 } from "node:path";
 
@@ -919,12 +919,15 @@ async function clearDecisionHoldAt(sessionsDir, sessionId, pid, beforeUnlink, ho
     return false;
   }
 }
-async function settleDecisionHoldRecordAt(sessionsDir, sessionId, patch) {
+async function settleDecisionHoldRecordAt(sessionsDir, sessionId, patch, heldSince) {
   try {
     const record = await readRecord(sessionId, sessionsDir);
     if (!record)
       return;
-    if (record.op !== "update" || record.prio !== 1)
+    if (record.op !== "update")
+      return;
+    const untouched = heldSince !== undefined && typeof record.ts === "number" && record.ts <= heldSince;
+    if (record.prio !== 1 && !untouched)
       return;
     await atomicWrite(`${sessionsDir}/${sessionId}.json`, JSON.stringify({ ...record, ...patch }), 384);
   } catch {}
@@ -963,8 +966,8 @@ async function interruptFlagSetAt(sessionsDir, sessionId, now, maxAgeMs = INTERR
 async function clearInterruptFlagAt(sessionsDir, sessionId, suffix = INTERRUPT_FLAG_SUFFIX) {
   await unlink(`${sessionsDir}/${interruptFlagFileName(sessionId, suffix)}`).catch(() => {});
 }
-async function settleDecisionHoldRecord(sessionId, patch) {
-  return settleDecisionHoldRecordAt(SESSIONS_DIR, sessionId, patch);
+async function settleDecisionHoldRecord(sessionId, patch, heldSince) {
+  return settleDecisionHoldRecordAt(SESSIONS_DIR, sessionId, patch, heldSince);
 }
 async function readPrefix(path, maxBytes) {
   const fh = await open(path, "r");
@@ -2861,12 +2864,22 @@ function sqliteOne(db, sql, env = process.env) {
     return;
   try {
     const bin = process.platform === "darwin" && existsSync2("/usr/bin/sqlite3") ? "/usr/bin/sqlite3" : "sqlite3";
-    const run = (target) => execFileSync2(bin, ["-init", devNull, "-batch", "-noheader", "-list", "-readonly", target, sql], { timeout: CURSOR_TITLE_TIMEOUT_MS, encoding: "utf8", maxBuffer: 65536, stdio: ["ignore", "pipe", "ignore"], env });
+    const run = (target, readonly = true) => execFileSync2(bin, ["-init", devNull, "-batch", "-noheader", "-list", ...readonly ? ["-readonly"] : [], target, sql], { timeout: CURSOR_TITLE_TIMEOUT_MS, encoding: "utf8", maxBuffer: 65536, stdio: ["ignore", "pipe", "ignore"], env });
     let out;
     try {
       out = run(db);
     } catch {
-      out = run(`file:${db.split("/").map(encodeURIComponent).join("/")}?immutable=1`);
+      const tmp = mkdtempSync(join2(tmpdir(), "nomo-sql-"));
+      try {
+        for (const ext of ["", "-wal"])
+          if (existsSync2(db + ext))
+            copyFileSync(db + ext, join2(tmp, `c.db${ext}`));
+        out = run(join2(tmp, "c.db"), false);
+      } catch {
+        out = run(`file:${db.split("/").map(encodeURIComponent).join("/")}?immutable=1`);
+      } finally {
+        rmSync(tmp, { recursive: true, force: true });
+      }
     }
     const cleaned = out.replace(/\s+/g, " ").trim();
     return cleaned || undefined;
@@ -3279,6 +3292,7 @@ function computeSessionState(input) {
   const startedAt = finite(record.sessionStartedAt) ? { startedAt: record.sessionStartedAt } : {};
   const sealed = { kind: "sealed", value: record.blob };
   const asking = record.attentionKind === "userInput" ? { attentionKind: "userInput" } : {};
+  const authored = (value) => ({ kind: "plain", value, ...agent === "antigravity" ? { carry: record.blob } : {} });
   const of = (state, why, blob, at, terminal = false) => ({ state, terminal, ts: at, why, blob, agent, ...startedAt });
   if (correctives?.ended === true)
     return of("ended", "end", sealed, ts, true);
@@ -3295,7 +3309,7 @@ function computeSessionState(input) {
   if (recordDone) {
     const heldBack = opinion?.status === "busy" && opinion.statusUpdatedAt > ts;
     if (!heldBack) {
-      return of("done", opinion?.status === "idle" ? "done+cc" : suffix("done"), { kind: "plain", value: buildStatePlaintext(record, "done", ts, opinion?.name, sessionId) }, ts, false);
+      return of("done", opinion?.status === "idle" ? "done+cc" : suffix("done"), authored(buildStatePlaintext(record, "done", ts, opinion?.name, sessionId)), ts, false);
     }
   }
   if (stateHoldLive(hold, holdPidAlive, now)) {
@@ -3311,14 +3325,14 @@ function computeSessionState(input) {
     };
   }
   if (!recordDone && opinion?.status === "idle" && record.prio !== 1 && record.lastEvent !== "needsAttention" && opinion.statusUpdatedAt > ts + CC_IDLE_DONE_GRACE_MS) {
-    return of("done", "done+cc", { kind: "plain", value: buildStatePlaintext(record, "done", opinion.statusUpdatedAt, opinion.name, sessionId) }, ts, false);
+    return of("done", "done+cc", authored(buildStatePlaintext(record, "done", opinion.statusUpdatedAt, opinion.name, sessionId)), ts, false);
   }
   if (record.prio === 1) {
     const why = finite(record.attentionStalledAt) ? "attn/net" : "attn";
     return { ...of("needsAttention", why, sealed, ts, false), ...asking };
   }
   const busy = opinion?.status === "busy" && opinion.statusUpdatedAt > ts;
-  return of("working", busy ? "work+cc" : suffix("work"), recordDone ? { kind: "plain", value: buildStatePlaintext(record, "working", opinion?.statusUpdatedAt ?? ts, opinion?.name, sessionId) } : sealed, ts, false);
+  return of("working", busy ? "work+cc" : suffix("work"), recordDone ? authored(buildStatePlaintext(record, "working", opinion?.statusUpdatedAt ?? ts, opinion?.name, sessionId)) : sealed, ts, false);
 }
 
 // src/core/hook.ts
@@ -5170,7 +5184,7 @@ async function runPermissionHook(deps = {}, agent = "claude") {
         attentionStalledAt: undefined,
         blob: await encryptBlob(config.e2eKey, { ...base, status: "working", at: Math.floor(settledAt / 1000) })
       } : attentionStalled ? await stalledPatch(settledAt) : { ts: settledAt, blob: fallbackBlob, attentionStalledAt: undefined };
-      await (deps.settleHoldRecordFn ?? defaultSettleHoldRecord())(sessionId, patch);
+      await (deps.settleHoldRecordFn ?? defaultSettleHoldRecord())(sessionId, patch, settleAsWorking ? holdAt : undefined);
     };
     const jitter = deps.jitter ?? (() => Math.floor(Math.random() * POLL_JITTER_MAX_MS));
     const interval = deps.pollIntervalMs ?? POLL_INTERVAL_MS;

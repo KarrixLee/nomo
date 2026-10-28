@@ -2,7 +2,7 @@
 // the hooks.json installer. Nothing here touches the network, the real ~/.gemini or ~/.config/cc-status:
 // every spawned process gets a temp HOME.
 
-import { cp, mkdir, mkdtemp, readdir, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, cp, mkdir, mkdtemp, readdir, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -580,6 +580,33 @@ describe("FIX 1 — a turn that ends with no event is settled", () => {
     const run = await withHome(home, () => antigravityRunStatus(CONV));
     expect(run?.status).toBe("CASCADE_RUN_STATUS_IDLE");
     expect(Math.abs(run!.lastModifiedMs! - Date.parse("2026-10-27T14:22:27.143Z"))).toBeLessThan(5); // julianday float rounding
+  });
+  test("antigravityRunStatus sees a status that lives only in the WAL (desktop app holds the DB open; NOM-96)", async () => {
+    // The app's Stop writes IDLE into -wal; the main file still says RUNNING. Without a -shm a read-only
+    // open fails, and the old `immutable=1` fallback read the main file only — the row never settled.
+    const { Database } = await import("bun:sqlite");
+    const src = await tmp();
+    const w = new Database(join(src, "s.db"));
+    w.exec("pragma journal_mode=wal; pragma wal_autocheckpoint=0;");
+    w.exec("create table conversation_summaries (conversation_id text primary key, title text not null default '', status text not null default '', last_modified_time datetime not null)");
+    w.exec(`insert into conversation_summaries values ('${CONV}','','CASCADE_RUN_STATUS_RUNNING','2026-10-27 14:22:27+00:00')`);
+    w.exec("pragma wal_checkpoint(truncate)");
+    w.exec(`update conversation_summaries set status='CASCADE_RUN_STATUS_IDLE' where conversation_id='${CONV}'`);
+    const home = await tmp();
+    const dir = join(home, ".gemini", "antigravity");
+    await mkdir(dir, { recursive: true });
+    await cp(join(src, "s.db"), join(dir, "conversation_summaries.db"));
+    await cp(join(src, "s.db-wal"), join(dir, "conversation_summaries.db-wal")); // no -shm
+    w.close();
+    const before = await readFile(join(dir, "conversation_summaries.db-wal"));
+    await chmod(dir, 0o555); // the direct read-only open now fails, as it does on the live app's DB
+    try {
+      expect((await withHome(home, () => antigravityRunStatus(CONV)))?.status).toBe("CASCADE_RUN_STATUS_IDLE");
+    } finally {
+      await chmod(dir, 0o755);
+    }
+    expect(await readFile(join(dir, "conversation_summaries.db-wal"))).toEqual(before); // never written
+    expect(existsSync(join(dir, "conversation_summaries.db-shm"))).toBe(false);
   });
 });
 

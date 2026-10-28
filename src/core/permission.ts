@@ -1374,7 +1374,7 @@ function defaultClearHold(): (
  *  settleDecisionHoldRecordAt). Same test guard, same reason, as defaultWriteHold above: a unit test sees
  *  the developer's REAL home directory and must never rewrite their live session records. Tests that
  *  exercise the settle inject `settleHoldRecordFn`. */
-function defaultSettleHoldRecord(): (sessionId: string, patch: Partial<SessionRecord>) => Promise<void> {
+function defaultSettleHoldRecord(): (sessionId: string, patch: Partial<SessionRecord>, heldSince?: number) => Promise<void> {
   return lanRunningUnderTest() ? async () => { /* never touch real records from a test */ } : settleDecisionHoldRecord;
 }
 
@@ -1404,7 +1404,7 @@ export interface PermissionHookDeps {
    *  see settleDecisionHoldRecordAt). Defaults to the real record patcher in production and to a NO-OP
    *  under `bun test` — see defaultSettleHoldRecord. Called at most once per granted hold, and only when
    *  the compare-and-clear accepts. */
-  settleHoldRecordFn?: (sessionId: string, patch: Partial<SessionRecord>) => Promise<void>;
+  settleHoldRecordFn?: (sessionId: string, patch: Partial<SessionRecord>, heldSince?: number) => Promise<void>;
   /** The pid stamped as the hold's OWNER (defaults to this process). Injected so a test can drive the
    *  compare-and-clear rule without spawning processes. */
   holdPid?: number;
@@ -1987,7 +1987,10 @@ export async function runPermissionHook(
         : attentionStalled
           ? await stalledPatch(settledAt)
           : { ts: settledAt, blob: fallbackBlob, attentionStalledAt: undefined };
-      await (deps.settleHoldRecordFn ?? defaultSettleHoldRecord())(sessionId, patch);
+      // A WORKING settle also claims a prio:0 record no hook has written since the hold began: an agent
+      // whose hold never flipped the record to needsAttention (Antigravity) otherwise keeps a pre-hold
+      // stamp the phone's held card outranks — the purple hand outlived an app Stop (NOM-96).
+      await (deps.settleHoldRecordFn ?? defaultSettleHoldRecord())(sessionId, patch, settleAsWorking ? holdAt : undefined);
     };
 
     // HOLD: poll until the phone answers, the request leaves "pending", sustained failure trips the
