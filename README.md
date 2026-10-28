@@ -14,19 +14,19 @@
 <a href="https://apps.apple.com/app/nomo-ai-status-usage/id6779366830"><img src="assets/app-store-badge.svg" height="48" alt="Download Nomo on the App Store"></a>
 </p>
 
-Mirror your **Claude Code**, **OpenAI Codex**, **OpenCode** and **Cursor** session milestones to
+Mirror your **Claude Code**, **OpenAI Codex**, **OpenCode**, **Cursor** and **Antigravity** session milestones to
 the **Nomo iPhone app** as a Live Activity (Dynamic Island). A session's status — working,
 needs-your-approval, done — shows up on your phone in real time, so you can step away from the
-terminal and still know when an agent needs you or has finished. When a Claude Code, Codex or
-OpenCode session stops for a permission prompt or a question, you can **answer it from the phone** —
-tap Allow/Deny or pick an option and the session carries on without you at the keyboard (Cursor is
-status-only). Works with **Codex** in the terminal and the **Codex desktop app** alike.
+terminal and still know when an agent needs you or has finished. When a Claude Code, Codex,
+OpenCode or Antigravity session stops for a permission prompt or a question, you can **answer it from
+the phone** — tap Allow/Deny or pick an option and the session carries on without you at the keyboard
+(Cursor is status-only; Antigravity answers Allow/Deny for shell commands and file writes). Works with **Codex** in the terminal and the **Codex desktop app** alike.
 
 Everything is **end-to-end encrypted**. Pairing is a single QR-code scan (or a short typed code);
 there is no server key to copy. All session content (titles, machine name, status, even *which* agent
 produced an event) rides **inside** an encrypted blob, so the relay Worker that fans out the APNs
 push is a blind relay and never sees plaintext. **One pairing covers every agent** on a machine —
-Claude Code, Codex, OpenCode and Cursor share the same credentials, encryption key, watchdog, and
+Claude Code, Codex, OpenCode, Cursor and Antigravity share the same credentials, encryption key, watchdog, and
 Live Activity.
 
 > [!NOTE]
@@ -118,7 +118,7 @@ In plain English:
 bunx nomo-ai     # or: npx nomo-ai
 ```
 
-It detects which of Claude Code, Codex, OpenCode and Cursor are on this machine, shows exactly what
+It detects which of Claude Code, Codex, OpenCode, Cursor and Antigravity are on this machine, shows exactly what
 it will run for each, and lets you toggle the list before anything happens. Then it drives **each
 host's own install path** — the same four flows spelled out below — and prints the restart-and-pair
 step for each one it installed.
@@ -136,11 +136,11 @@ For scripting and CI:
 
 | Flag | |
 |---|---|
-| `--claude` `--codex` `--opencode` `--cursor` | install exactly these — naming any one of them skips the prompt |
-| `--all` | all four, detected or not — except Cursor, which is skipped with a note when it is not on this machine (name `--cursor` to try anyway) |
+| `--claude` `--codex` `--opencode` `--cursor` `--antigravity` | install exactly these — naming any one of them skips the prompt |
+| `--all` | all of them, detected or not — except Cursor and Antigravity, which are skipped with a note when they are not on this machine (name `--cursor` / `--antigravity` to try anyway) |
 | `-y`, `--yes` | no prompt; install everything detected |
 | `-n`, `--dry-run` | print the commands, run nothing |
-| `--ref <branch\|tag>` | **OpenCode and Cursor only** — install from that ref instead of the default branch |
+| `--ref <branch\|tag>` | **OpenCode, Cursor and Antigravity only** — install from that ref instead of the default branch |
 | `-h`, `--help` / `-v`, `--version` | |
 
 With no flags and no terminal to ask, it refuses rather than guessing. Every failure names the step,
@@ -426,12 +426,126 @@ node ~/.nomo/plugin/scripts/cursor-install.mjs --uninstall
 which removes exactly Nomo's hook entries and skills and leaves everything else in `hooks.json` as it
 was. Pairing is untouched — it belongs to every agent on the computer.
 
+## Install — Antigravity
+
+One install covers the Google **Antigravity** desktop app/IDE and the `agy` CLI — both read
+`~/.gemini/config/hooks.json`.
+
+```sh
+bunx nomo-ai --antigravity     # or, from a checkout: node plugin/scripts/antigravity-install.mjs
+```
+
+**Restart Antigravity** (and any open `agy`), then type **`/nomo-pair`**. The installer also adds a
+small Antigravity plugin, `nomo`, with five commands:
+
+| Command | What it does |
+|---|---|
+| `/nomo-pair` (`/nomo-pair code` without a browser) | connect this computer to the Nomo app |
+| `/nomo-status` (`/nomo-status verbose` for details) | is it connected, are phone approvals on |
+| `/nomo-approvals on` / `off` | phone approvals on or paused (shared by every agent on this computer) |
+| `/nomo-reset` | clear stuck sessions from the phone, keep the connection |
+| `/nomo-unpair` | disconnect this computer |
+
+Pairing is shared machine-wide, so a computer already paired from another agent needs no
+`/nomo-pair`. Antigravity asks before each command runs a shell command — choose Allow. If you once
+imported Nomo's Claude Code plugin into Antigravity (`nomo-cc`), the installer tells you to remove it
+(`agy plugin uninstall nomo-cc`): its Claude hooks would report every session twice. It never removes
+it for you. Add `--verbose` to see the installer's technical detail.
+
+**What the installer writes.** Antigravity's `hooks.json` is a set of *named* blocks. Nomo owns
+exactly one, `"nomo"`, rewrites it whole on every install and leaves every other block alone; the
+file is created as `{}` if it does not exist. It refuses — writing nothing — on a file that is not
+valid JSON or not an object, and writes through a symlink rather than over it. The block registers
+`SessionStart`, `PreInvocation`, `PostInvocation`, `Stop` and `PostToolUse`, each running
+`plugin/scripts/antigravity-hook.sh <Event>` with a 10-second timeout, and one `PreToolUse` entry for
+phone approvals: `plugin/scripts/antigravity-approve.sh`, matched **only** to shell commands and file
+writes/edits (`run_command`, `write_file`, `write_to_file`, `edit_file`, `replace_file_content`,
+`multi_replace_file_content`), with Claude Code's approval timeout of 24 hours. Each command first
+checks that its script still exists and otherwise answers on its own (`{}`, or `{"decision":"allow"}`
+for `PreToolUse`), so moving or deleting `~/.nomo` without uninstalling never blocks a tool.
+
+It also copies the `nomo` plugin (a `plugin.json` and five skills, no hooks — plugin-packaged hooks
+reach only the CLI, so the hooks stay in `hooks.json` for the desktop app) to
+`~/.gemini/config/plugins/nomo`, with the checkout path written into each skill, plus a marker file.
+A `nomo` folder without that marker is someone else's: the installer refuses and writes nothing.
+
+### How the Antigravity leg works
+
+- **The status hooks are read-only, except for your phone's Interrupt.** Their wrapper prints `{}`,
+  hands the event to the work in the background and exits at once, so Antigravity never waits on Nomo
+  and every path — a crash, no runtime, not paired, no network — returns the empty reply, never a
+  `decision`. The one exception is a `PostInvocation` (after each model call) while an Interrupt is
+  pending: then the wrapper waits for the work (capped at 4 seconds) and prints
+  `{"terminationBehavior":"terminate"}` only when the bundle printed exactly that, else `{}`.
+- **Interrupt from the phone.** Tapping Interrupt on a running Antigravity row (same rules as Claude
+  Code: a live local link to this computer) stamps a one-shot flag for that conversation. The next
+  `PostInvocation` consumes it and ends the turn there — so the turn stops when the current model call
+  (or tool) finishes — and the row turns *done*. While the flag is up, a shell command or file write
+  waiting on the phone, or about to, is denied with "Stopped from phone". A flag not acted on within
+  an hour, or left when the turn ended on its own, is dropped and never touches a later turn.
+  Antigravity's flags have their own name, so Claude Code's never slow Antigravity down, and a
+  flag only slows the conversation it names.
+  Nomo never signals the `agy` process (that would exit the CLI).
+- **Reply from the phone.** The Reply button on an Antigravity row sends a message (up to 4,000
+  characters) end-to-end encrypted, over the local link and the relay. The Mac queues it for that
+  conversation; the next `PreInvocation` (before the agent's next model call) hands every queued
+  message to the agent as a user message. A message that arrives during the turn's last step makes
+  that turn's `Stop` continue once, so it still arrives. Your phone shows *Queued* until it is handed
+  over, then *Delivered*, and can cancel it until then. For a finished `agy` CLI conversation whose
+  `agy` has exited, Nomo runs `agy --conversation <id> --print=<message>` in the background in that
+  conversation's folder; its own hooks report the turn, and its tools ask your phone as usual. A
+  finished `agy` that is still open just keeps the message for your next turn there (Nomo never starts
+  a second `agy` on one conversation). A finished desktop-app conversation can only continue on the
+  Mac. An Interrupt always wins: a message is never handed to a turn being stopped.
+- **Phone approvals (`PreToolUse`).** For a shell command or a file write in a session your phone is
+  showing, the tool waits while the phone shows Allow / Deny / Deny with note. Allow answers
+  `auto_approve`; Deny answers `deny` with your note (or "Denied from phone") as the reason the agent
+  sees. Every other outcome — not paired, approvals paused, the session not on the phone, no network,
+  the request expiring — answers `allow`, which means "no opinion": Antigravity applies its own
+  permission settings and shows its own prompt exactly as without Nomo. Your own `permissions` rules
+  (the CLI's `~/.gemini/antigravity-cli/settings.json`, read-only) come first, in Antigravity's order
+  Deny > Ask > Allow. Deny and ask rules are read *loosely*: a command rule matches when its command
+  appears anywhere in the line as something that runs — after `sudo`/`env`/`xargs`/`timeout`/`watch`/
+  `stdbuf`/`nice`/`nohup` and the like, inside `sh -c`/`bash -c`/`zsh -c` or `eval`, after
+  `find -exec`, `then` or `!`, as `/bin/rm`, quoted, behind `FOO=1`, after `;`/`&&`/`|`, or inside
+  `$(…)` — and a `regex:` rule is
+  compiled (one that doesn't compile matches everything). Anything a deny rule may match never reaches
+  the phone — Antigravity denies it itself, and a phone Allow can never override it. Allow rules are
+  read *strictly*: only a single plain command (no separators, subshells, quotes or line breaks) whose
+  words start with the rule's is passed straight through, and never a write into Nomo's own checkout or
+  its state folder. Reads, searches and every other tool never reach Nomo at all. "Always allow" is
+  not offered for Antigravity. If Antigravity cancels the hook while it waits (you stopped the tool at
+  the computer), the card is withdrawn from the phone within a few seconds and the row goes back to
+  *working* — the turn's own end (or the idle check) marks it done; nothing is left running.
+- **A row starts at `PreInvocation`** (before a model call), not `SessionStart`. `PreInvocation`,
+  `PostInvocation` and `PostToolUse` keep it *working* (they fire many times per turn and are
+  throttled); `Stop` marks it *done*. A turn that ends with **no** event — an interrupt, or a headless
+  run that auto-denies a permission and exits — is settled by the watchdog: the row ends as soon as
+  the process that ran the hook (`agy`, or the app's helper) is gone, and is marked done once
+  Antigravity's own conversation index records the run as idle after the row's last event. The
+  30-quiet-minute reap stays as the last resort.
+- **The title is Antigravity's own conversation title**, one field read with the system `sqlite3`,
+  read-only, from `conversation_summaries.db` in `~/.gemini/antigravity` (desktop) or
+  `~/.gemini/antigravity-cli` (`agy`). It exists only after the first turn completes; until then the
+  row is named after the first prompt, read from the first line of that conversation's transcript,
+  and failing that after the workspace folder.
+  The model badge is the payload's `modelName`.
+
+To remove it:
+
+```sh
+node ~/.nomo/plugin/scripts/antigravity-install.mjs --uninstall
+```
+
+which deletes only the `"nomo"` block and the `nomo` plugin folder Nomo installed. Pairing is untouched.
+
 ## Answering from your phone
 
 When a session stops for a **permission prompt** or a multiple-choice **question**, the card reaches
 the phone with its options; the answer rides back inside the same E2E-encrypted blob, so the relay
-never learns what you chose. Works for Claude Code, Codex and OpenCode (Cursor is read-only).
-`/nomo-cc:approvals` (or `$nomo-approvals`, `/nomo-approvals`) is the local off switch when your
+never learns what you chose. Works for Claude Code, Codex, OpenCode and Antigravity (Antigravity:
+Allow/Deny on shell commands and file writes; Cursor is read-only).
+`/nomo-cc:approvals` (or `$nomo-approvals`, `/nomo-approvals` in OpenCode and Antigravity) is the local off switch when your
 phone is away — one switch, machine-wide.
 
 Only sessions your phone is actually showing are answerable, and a hold is **fail-open**: a
@@ -457,6 +571,76 @@ model, so Nomo treats it as a caption: it is kept short, and when the card runs 
 description is dropped before the command is.
 
 ## Hooks on your computer — security
+
+- **Antigravity: status hooks observe only, except to end a turn you interrupted or to hand over a
+  message you sent; the approval hook
+  can only defer, approve what you approved, or deny what you denied (or interrupted).** Nomo's
+  `"nomo"` block in `~/.gemini/config/hooks.json` answers every status event with `{}` before running
+  anything, so those can neither stop a tool nor keep or end a turn — except `PostInvocation`, whose
+  wrapper prints `{"terminationBehavior":"terminate"}` only when the bundle printed exactly that line
+  (anything else is `{}`), and the bundle prints it only after consuming a fresh interrupt flag the
+  watchdog wrote for that conversation from an `interrupt-session` command sealed by your paired phone
+  (decrypted, fresh, never replayed, naming a session this computer tracks). The same flag makes the
+  approval hook answer `deny` ("Stopped from phone"). Its one `PreToolUse` entry is matched only to
+  shell commands and file writes/edits.
+  Phone replies take the same path: a `send-message` command (sealed by your paired phone, passing the
+  same gates, with a message id and a text of at most 4,000 characters with no control characters but
+  line breaks) is written as one owner-only file per message (`<conversation>.<id>.agy-inbox` in Nomo's
+  sessions folder). Only while such a file exists for the hook's own conversation do `PreInvocation`
+  and `Stop` run in the foreground (capped at 4 seconds, and the wrapper stops waiting at the bundle's
+  first line, before any network call); the wrapper then prints that line only if it is exactly
+  `{"injectSteps":[{"userMessage":"…"}…]}` (PreInvocation) or `{"decision":"continue","reason":"…"}`
+  (Stop) on one line, else `{}`. A Stop continues at most once a minute for queued messages, never for
+  a turn your phone is stopping, and messages nobody picked up are deleted after a day. The only
+  process Nomo ever starts for a reply is `agy --conversation <id> --print=<message>` (the message is
+  one argument, never parsed by a shell), for an `agy` CLI conversation this computer tracks whose
+  `agy` has exited, in the folder that conversation ran in — either when the message arrives or, for
+  a message that was queued behind an `agy` that has since exited, from the watchdog's sweep. That
+  `agy` is found through `NOMO_AGY_BIN`, else the first *absolute* `PATH` entry holding one (a
+  relative entry is ignored), else `~/.local/bin/agy`.
+  Antigravity treats a failing `PreToolUse` hook as a block, so `antigravity-approve.sh` checks the
+  hook's output against the only three replies Nomo sends (`allow`, `auto_approve`, `deny` with a
+  reason) and answers `{"decision":"allow"}` — Antigravity's own permission settings and prompt — for
+  anything else: a crash, no runtime, empty or malformed output, a missing script (the registered
+  command answers by itself), or a hold still running when its internal kill guard fires, which is
+  before the hook's 24-hour timeout. If Antigravity signals or kills the hook mid-hold, the wrapper's
+  trap and the bundle's own parent check end the hold, withdraw the phone's card and leave no process
+  behind. `auto_approve` is sent only for an Allow sealed by your paired phone for that exact request
+  id, and never for a call one of your own `deny` rules may match: such a call is not sent to the
+  phone at all (Deny > Ask > Allow). A file path is normalized (`..`, `.`, repeated `/`) before
+  any rule sees it, so `/tmp/../Users/me/.ssh/x` meets a `.ssh` deny like the plain path does. One
+  exception to "that exact request id": after a phone Allow on a shell command, the next call in the
+  same conversation and workspace within 90 s whose arguments are all identical except the sandbox
+  switch (`BypassSandbox`), the model's one-line summary and the async wait time (the desktop app's
+  retry outside its sandbox) is answered `auto_approve` once, without a new card — any other
+  difference (another working directory, other environment, any extra argument) gets a fresh card;
+  never after a Deny, and the one-use ticket is a 0600 file under the sessions dir. Nomo never sends `permissionOverrides`, `overwrite` or a changed
+  tool input. The
+  approval hook reads the tool name, the command (`CommandLine`) or file path, and the model's one-line
+  `toolSummary`, puts them in the end-to-end encrypted card, and reads your `permissions` rules from
+  `settings.json` in that conversation's Antigravity data dir (both CLI and desktop dirs when the
+  transcript does not say which), read-only. From each status event's stdin
+  it reads only
+  `conversationId`, the first `workspacePaths` entry, `transcriptPath` (its modification time, for
+  the idle check, and its first line for the first prompt) and `modelName` — never tool arguments.
+  From Antigravity's `conversation_summaries.db` it reads only the `title`, `status` and
+  `last_modified_time` of that one conversation, read-only; the conversation id must be UUID-shaped
+  before it is put into the query, and only the two Antigravity data dirs are ever read. Remove it with
+  `node ~/.nomo/plugin/scripts/antigravity-install.mjs --uninstall` (deletes only that block and the
+  marked plugin folder). The `/nomo-*` skills run only Nomo's own local commands (pair, status, the
+  approvals switch, reset, unpair) from the checkout; they never print the pairing link or QR secret.
+  So that `/nomo-status` doesn't put a card on your phone, the approval hook answers `auto_approve`
+  — on a paired computer, after the deny rules and a pending Stop — for exactly seven command lines,
+  rebuilt in code from the same template the installer writes the skills from (never read from the
+  skill files): status (plain and verbose), approvals status, approvals **on**, reset, pair, and the
+  pair wait. The match is byte for byte (one trailing newline forgiven; any other difference, a second
+  line, a `cd`, `&& …` or other quoting goes to the phone). Approvals **off**, unpair and the typed
+  pairing code still ask your phone.
+
+- **`NOMO_CC_DIR` (testing only) moves Nomo's state folder** (`~/.config/cc-status`: pairing, session
+  rows, flags) for every hook and command that inherits it. End-to-end tests use it to run a real agent
+  against a throwaway pairing; real installs never set it, and anything that can set your agent's
+  environment could already change `HOME`.
 
 - **Your project's runtime config is never loaded into Nomo's hooks.** Hooks run with your project as
   their working folder, and bun reads `bunfig.toml` (whose `preload` runs code) and `.env` files from
@@ -531,9 +715,9 @@ Runs the full suite (2011 tests across `core/`, `entries/`, `opencode/`, and `qr
 bun build.ts
 ```
 
-`build.ts` bundles the twelve hook/command entrypoints (`cc-status`, `cc-permission`, `codex-status`,
+`build.ts` bundles the thirteen hook/command entrypoints (`cc-status`, `cc-permission`, `codex-status`,
 `codex-permission`, `codex-notify`, `cc-watchdog`, `pair`, `unpair`, `reset`, `status-cmd`,
-`opencode-update`, `cursor-status`) into
+`opencode-update`, `cursor-status`, `antigravity-status`) into
 `plugin/dist/*.mjs`, inlining every local import so each artifact is a single node-runnable file.
 
 A second pass bundles `src/opencode/plugin.ts` into `plugin/dist/opencode.js` — **`.js`, not

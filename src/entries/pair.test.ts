@@ -12,7 +12,7 @@ import { parseNotifyFromToml } from "../core/notify-wire";
 import { completePendingPairing, PAIR_HTML_FILE, parsePendingConfig, PENDING_STASH_FILE, PLUGIN_VERSION } from "../core/shared";
 import { deriveCodeIkm } from "../core/pair-code";
 import { unpair } from "./unpair";
-import { humanAge, statusCmd } from "./status-cmd";
+import { humanAge, statusCmd as realStatusCmd } from "./status-cmd";
 
 // ---------- shared test plumbing -----------------------------------------------------------------
 
@@ -1169,6 +1169,19 @@ describe("humanAge", () => {
 });
 
 describe("statusCmd", () => {
+  // HERMETIC: every machine path defaults into the temp dir, so a real Antigravity/Cursor/Codex/Claude
+  // install on the developer's Mac can never leak into these assertions ("Also on this computer").
+  const statusCmd = (deps: Parameters<typeof realStatusCmd>[0] = {}) => realStatusCmd({
+    sessionTracePath: join(dir, "session-trace.log"),
+    codexHooksPath: join(dir, "hooks.json"), codexConfigPath: join(dir, "config.toml"),
+    codexSessionsDir: join(dir, "codex-sessions"), claudeProjectsDir: join(dir, "claude-projects"),
+    lastHookCodexPath: join(dir, "lh-codex"), lastHookClaudePath: join(dir, "lh-claude"),
+    lastHookOpencodePath: join(dir, "lh-opencode"), opencodeStubPaths: [join(dir, "absent-stub.js")],
+    noHoldPath: join(dir, "no-hold"), cursorHooksPath: join(dir, "cursor-hooks.json"),
+    cursorProjectsDir: join(dir, "cursor-projects"), lastHookCursorPath: join(dir, "lh-cursor"),
+    antigravityHooksPath: join(dir, "agy-hooks.json"), lastHookAntigravityPath: join(dir, "lh-agy"),
+    ...deps,
+  });
   // The machine-wide block: pairing, delivery, approvals. True regardless of which agent asked, which
   // is exactly why it prints FIRST and carries no agent label.
   test("unpaired → the phone row says so and names the fix; nothing else is claimed", async () => {
