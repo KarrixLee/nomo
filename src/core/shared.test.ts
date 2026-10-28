@@ -874,28 +874,6 @@ describe("settleDecisionHoldRecordAt", () => {
       await rm(d, { recursive: true, force: true });
     }
   });
-
-  test("a WORKING settle also claims a prio:0 record untouched since the hold began (NOM-96 app Stop)", async () => {
-    // Antigravity's hold never flips the record to needsAttention, so an abandoned hold left the pre-hold
-    // working frame at a stamp the phone's purple card outranked — the card never cleared.
-    const d = await dir();
-    try {
-      const working = { ...held, prio: 0, lastEvent: "working", ts: 1_000 };
-      const patch = { ts: 3_000, lastEvent: "working", prio: 0 as const, blob: "sealed-working" };
-      await writeFile(join(d, "s1.json"), JSON.stringify(working));
-      await settleDecisionHoldRecordAt(d, "s1", patch, 1_500);
-      expect(JSON.parse(await readFile(join(d, "s1.json"), "utf8"))).toMatchObject({ ts: 3_000, blob: "sealed-working" });
-      // …but never one a hook wrote AFTER the hold began, nor a done.
-      for (const over of [{ ts: 2_000 }, { op: "done", lastEvent: "done" }]) {
-        const moved = { ...working, ...over };
-        await writeFile(join(d, "s1.json"), JSON.stringify(moved));
-        await settleDecisionHoldRecordAt(d, "s1", patch, 1_500);
-        expect(JSON.parse(await readFile(join(d, "s1.json"), "utf8"))).toEqual(moved);
-      }
-    } finally {
-      await rm(d, { recursive: true, force: true });
-    }
-  });
 });
 
 // --- the session folder's LIVE git branch --------------------------------------------------------

@@ -854,23 +854,6 @@ describe("runPermissionHook — hold state machine", () => {
     expect(probe.order).toEqual(["settle", "clear"]);
   });
 
-  test("only an Antigravity WORKING settle claims a pre-hold prio:0 record; a Claude settle passes no heldSince", async () => {
-    const seen: Array<[string, number | undefined]> = [];
-    for (const agent of ["claude", "antigravity"] as const) {
-      const answerBlob = await encryptBlob(KEY, { requestId: "req-fixed", decision: "allow", ts: 5 });
-      const { fn } = scriptFetch(true, [{ status: "answered", answerBlob }]);
-      const probe = settleProbe();
-      await runPermissionHook(baseDeps({
-        fetchFn: fn, emit: () => {}, holdPid: 9_001, readRecordFn: async () => HELD_RECORD, ...probe.deps,
-        settleHoldRecordFn: async (_id: string, _patch: unknown, heldSince?: number) => { seen.push([agent, heldSince]); },
-      }) as never, agent);
-    }
-    expect(seen).toHaveLength(2);
-    expect(seen[0]).toEqual(["claude", undefined]);
-    expect(seen[1]![0]).toBe("antigravity");
-    expect(typeof seen[1]![1]).toBe("number");
-  });
-
   test("a SUPERSEDED hold re-stamps needsAttention with the fallback blob instead of freezing the record", async () => {
     const { fn } = scriptFetch(true, [{ status: "superseded" }]);
     const probe = settleProbe();

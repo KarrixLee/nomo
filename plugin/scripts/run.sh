@@ -119,8 +119,8 @@ case "$nomo_root" in
 esac
 
 if [ -n "$HOME" ] && [ -n "$nomo_root" ]; then
-  nomo_shim="${NOMO_CC_DIR:-$HOME/.config/cc-status}/hook-shim.sh"
-  nomo_stamp="${NOMO_CC_DIR:-$HOME/.config/cc-status}/hook-shim.stamp"
+  nomo_shim="$HOME/.config/cc-status/hook-shim.sh"
+  nomo_stamp="$HOME/.config/cc-status/hook-shim.stamp"
   nomo_rev=
   nomo_recorded=
   # Fields: "<shim-rev> <plugin-root>"; the root is last so a path with spaces survives IFS splitting.
@@ -197,7 +197,7 @@ done
 #
 # The location deliberately MIRRORS CC_DIR in src/core/shared.ts ("$HOME/.config/cc-status", with no
 # XDG_CONFIG_HOME branch) so every piece of this plugin's state lives in exactly one tree.
-cache="${NOMO_CC_DIR:-$HOME/.config/cc-status}/runtime"
+cache="$HOME/.config/cc-status/runtime"
 NEGATIVE_CACHE_TTL=3600
 
 # Owner-only and atomic, via the shared helper defined at the top of this file (see the comment there

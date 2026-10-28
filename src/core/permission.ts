@@ -130,7 +130,6 @@ export const HOLD_BLOCKS_DIALOG: Record<AgentKind, boolean> = {
   codex: true,     // same blocking-hook contract, same frozen TUI
   opencode: false, // resident plugin, fired detached; OpenCode's own prompt is already on screen
   cursor: false,   // NEVER holds: v1 is read-only and registers no permission-class hook at all
-  antigravity: true, // PreToolUse hook (core/antigravity-approval) — the tool waits until this process prints
 };
 
 /** The Claude tools whose picker Claude Code renders ITSELF, concurrently with this hook — so the user
@@ -1374,7 +1373,7 @@ function defaultClearHold(): (
  *  settleDecisionHoldRecordAt). Same test guard, same reason, as defaultWriteHold above: a unit test sees
  *  the developer's REAL home directory and must never rewrite their live session records. Tests that
  *  exercise the settle inject `settleHoldRecordFn`. */
-function defaultSettleHoldRecord(): (sessionId: string, patch: Partial<SessionRecord>, heldSince?: number) => Promise<void> {
+function defaultSettleHoldRecord(): (sessionId: string, patch: Partial<SessionRecord>) => Promise<void> {
   return lanRunningUnderTest() ? async () => { /* never touch real records from a test */ } : settleDecisionHoldRecord;
 }
 
@@ -1404,7 +1403,7 @@ export interface PermissionHookDeps {
    *  see settleDecisionHoldRecordAt). Defaults to the real record patcher in production and to a NO-OP
    *  under `bun test` — see defaultSettleHoldRecord. Called at most once per granted hold, and only when
    *  the compare-and-clear accepts. */
-  settleHoldRecordFn?: (sessionId: string, patch: Partial<SessionRecord>, heldSince?: number) => Promise<void>;
+  settleHoldRecordFn?: (sessionId: string, patch: Partial<SessionRecord>) => Promise<void>;
   /** The pid stamped as the hold's OWNER (defaults to this process). Injected so a test can drive the
    *  compare-and-clear rule without spawning processes. */
   holdPid?: number;
@@ -1452,19 +1451,6 @@ export interface PermissionHookDeps {
   /** Reads the tail of the session transcript for the local-answer watch (see localAnswerProbe).
    *  Defaults to the real bounded suffix read; tests script it. */
   readTailFn?: (path: string, maxBytes: number) => Promise<string>;
-  /** Epoch ms (on the `now` clock) past which a GRANTED hold stops polling and exits with no decision,
-   *  like an expiry. Absent = unbounded (Claude/Codex/OpenCode). Antigravity sets it because its hook
-   *  timeout BLOCKS the tool when exceeded — see core/antigravity-approval.ts. */
-  deadlineAt?: number;
-  /** Polled once per hold round (~3 s): true = the phone pressed Stop on this session. The hold then
-   *  denies with `stopReason`, retires the worker's card, and exits. Absent = never (Antigravity only —
-   *  the other agents stop their turn without touching a held card). */
-  stopRequested?: () => Promise<boolean>;
-  stopReason?: string;
-  /** Polled once per hold round (~3 s): true = nobody is waiting for this decision any more (the agent
-   *  killed the hook's wrapper — it interrupted the turn or exited). The hold then withdraws the worker's
-   *  card and exits with NO decision line. Absent = never (the other agents' hooks die with their parent). */
-  abandoned?: () => boolean;
 }
 
 async function readStdin(): Promise<string> {
@@ -1987,12 +1973,7 @@ export async function runPermissionHook(
         : attentionStalled
           ? await stalledPatch(settledAt)
           : { ts: settledAt, blob: fallbackBlob, attentionStalledAt: undefined };
-      // A WORKING settle also claims a prio:0 record no hook has written since the hold began: an agent
-      // whose hold never flipped the record to needsAttention (Antigravity) otherwise keeps a pre-hold
-      // stamp the phone's held card outranks — the purple hand outlived an app Stop (NOM-96). Antigravity
-      // ONLY: Claude/Codex holds do flip the record, and their settle stays exactly as it was.
-      await (deps.settleHoldRecordFn ?? defaultSettleHoldRecord())(
-        sessionId, patch, settleAsWorking && agent === "antigravity" ? holdAt : undefined);
+      await (deps.settleHoldRecordFn ?? defaultSettleHoldRecord())(sessionId, patch);
     };
 
     // HOLD: poll until the phone answers, the request leaves "pending", sustained failure trips the
@@ -2053,10 +2034,6 @@ export async function runPermissionHook(
     let seq = 0;
     for (;;) {
       seq += 1;
-      if (deps.deadlineAt !== undefined && clock() >= deps.deadlineAt) {
-        trace({ event: "exit", reason: "deadline" });
-        return; // the caller's own fallback (Antigravity: defer to its local prompt) takes over
-      }
       // ANSWERED AT THE MAC. Checked BEFORE the poll so the latch primes on round 1, and before the
       // network so a worker outage can never keep a settled card on the phone. Nothing goes to stdout —
       // CC already took the local answer and moved the turn on — but the record settles as WORKING,
@@ -2065,27 +2042,6 @@ export async function runPermissionHook(
         settleAsWorking = true;
         trace({ event: "local-answer", seq });
         trace({ event: "exit", reason: "local-answer" });
-        return;
-      }
-      // STOPPED FROM THE PHONE: the turn is being stopped, so the tool it is waiting on must not run.
-      // Deny here (never the fallback: that would open the agent's own prompt and park the turn), then
-      // retire the worker's pending card best-effort so the phone drops its Allow/Deny.
-      const withdrawCard = () => fetchFn(`${config.url}/v1/cc/decision/resolve`, {
-        method: "POST", headers: { ...pcHeaders, "content-type": "application/json" },
-        body: JSON.stringify({ requestId }), signal: AbortSignal.timeout(3_000),
-      }).then(() => {}, () => {});
-      if (deps.abandoned?.()) {
-        // Settled as WORKING (the `finally`): the tool call was cancelled, not necessarily the turn.
-        settleAsWorking = true;
-        trace({ event: "exit", reason: "abandoned", seq });
-        await withdrawCard();
-        return; // nobody reads stdout any more; the `finally` retires the hold marker
-      }
-      if (deps.stopRequested && await deps.stopRequested().catch(() => false)) {
-        emit(denyLine(agent, deps.stopReason));
-        settleAsWorking = true;
-        trace({ event: "exit", reason: "stopped", seq });
-        await withdrawCard();
         return;
       }
       const { data, status: httpStatus } = await pollDecision(seq);

@@ -82,11 +82,6 @@ const ENTRYPOINTS = [
   // user-level hooks.json (see plugin/scripts/cursor-install.mjs), never through hook-shim.sh — so it
   // needs no shim whitelist entry and no NOMO_SHIM_REV bump.
   "cursor-status.ts",
-  // The Antigravity hook (desktop app/IDE + `agy` CLI). Run by plugin/scripts/antigravity-hook.sh,
-  // which ~/.gemini/config/hooks.json names by absolute path (see antigravity-install.mjs) — no shim.
-  "antigravity-status.ts",
-  // Its PreToolUse twin: the phone-approval hold, run by plugin/scripts/antigravity-approve.sh.
-  "antigravity-approve.ts",
 ].map((f) => join(HERE, "src", "entries", f));
 
 /** The OpenCode plugin — a SECOND build pass, not another ENTRYPOINTS row, because it needs a
