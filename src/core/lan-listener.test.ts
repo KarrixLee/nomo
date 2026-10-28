@@ -392,9 +392,21 @@ describe("POST /v1/lan — every rejection is an opaque 400 with an empty body",
     const { port } = await startListener({ statePath: join(dir, "lan.json"), onCommand: (c) => { seen.push(c); }, cfg });
     expectOpaque(await post(port, await sealRequest(cfg, { op: "command", ts: Date.now(), nonce: nonce(), payload: {} })));
     expectOpaque(await post(port, await sealRequest(cfg, {
-      op: "command", ts: Date.now(), nonce: nonce(), payload: { blob: "A".repeat(9_000) },
+      op: "command", ts: Date.now(), nonce: nonce(), payload: { blob: "A".repeat(20_481) },
     })));
     expect(seen.length).toBe(0);
+  });
+
+  test("op:command accepts a blob at the worker's 20480 cap (a 4,000-char CJK reply fits on LAN too)", async () => {
+    const cfg = config();
+    const seen: LanCommand[] = [];
+    const dir = await stateDir();
+    const { port } = await startListener({ statePath: join(dir, "lan.json"), onCommand: (c) => { seen.push(c); }, cfg });
+    const res = await post(port, await sealRequest(cfg, {
+      op: "command", ts: Date.now(), nonce: nonce(), payload: { blob: "A".repeat(20_480) },
+    }));
+    expect(res.status).toBe(200);
+    expect(seen.length).toBe(1);
   });
 
   test("an UNPAIRED listener (sync never called / config null) refuses everything", async () => {
@@ -2318,6 +2330,22 @@ describe("state — the snapshot store", () => {
       expect({ case: i, ...served, seq: undefined, sessionId: undefined } as Record<string, unknown>)
         .toEqual({ case: i, ...expected, seq: undefined, sessionId: undefined });
     }
+  });
+
+  test("an Antigravity done row carries the record blob's reply receipts (NOM-96: `q` stuck on Sending…)", async () => {
+    // The done rung serves a Mac-AUTHORED plaintext, but the receipts publishReplyReceipts reseals live
+    // only in the record's blob — an idle, done, owner-alive agy row never showed its `q`.
+    const dir = await snapDir();
+    const store = snapStore(dir);
+    const done = { agent: "antigravity" as const, op: "done" as const, lastEvent: "done", transcript: "/x/.gemini/antigravity-cli/conv.jsonl" };
+    await write(dir, "s1", { ...done, blob: await encryptBlob(KEY, { status: "done", surface: "cli" }) });
+    await store.reconcile();
+    // Same record ts, only the blob gained `replies` — exactly what publishReplyReceipts writes.
+    await write(dir, "s1", { ...done, blob: await encryptBlob(KEY, { status: "done", surface: "cli", replies: { "mid-1": "q" } }) });
+    await store.reconcile();
+    const [row] = store.states(0).sessions;
+    expect(row.why).toBe("done");
+    expect(await decryptBlob(KEY, row.blob)).toMatchObject({ status: "done", surface: "cli", replies: { "mid-1": "q" } });
   });
 });
 

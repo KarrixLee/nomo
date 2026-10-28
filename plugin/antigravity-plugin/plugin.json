@@ -1,0 +1,5 @@
+{
+  "$schema": "https://antigravity.google/schemas/v1/plugin.json",
+  "name": "nomo",
+  "description": "Nomo: see your Antigravity sessions on your iPhone, answer approvals and stop a turn from your phone. Commands: /nomo-pair, /nomo-status, /nomo-approvals, /nomo-reset, /nomo-unpair."
+}
