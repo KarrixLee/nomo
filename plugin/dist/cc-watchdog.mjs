@@ -9060,15 +9060,30 @@ async function interruptSession(adapter, sessionId, record, now, deps) {
 async function publishReplyReceipts(config, sessionId, dir, deps = {}) {
   const path = `${dir}/${sessionId}.json`;
   const record = await readRecordAt(path);
+  const replies = await (deps.receipts ?? readReceipts)(dir, sessionId);
+  const hold = await readDecisionHoldAt(dir, sessionId);
+  const held = !!hold && stateHoldLive(hold, typeof hold.pid === "number" && pidAlive(hold.pid), (deps.now ?? Date.now)());
+  if (held) {
+    try {
+      const card = await decryptBlob(config.e2eKey, hold.blob);
+      const blob = await encryptBlob(config.e2eKey, { ...card, replies });
+      const latest = await readDecisionHoldAt(dir, sessionId);
+      if (latest && latest.blob === hold.blob && latest.at === hold.at && latest.pid === hold.pid) {
+        await atomicWrite(`${dir}/${decisionHoldFileName(sessionId)}`, JSON.stringify({ ...latest, blob }), 384);
+      }
+    } catch {}
+  }
   if (!record || typeof record.blob !== "string" || record.blob.length === 0)
     return;
   const plain = await decryptBlob(config.e2eKey, record.blob);
-  const blob = await encryptBlob(config.e2eKey, { ...plain, replies: await (deps.receipts ?? readReceipts)(dir, sessionId) });
+  const blob = await encryptBlob(config.e2eKey, { ...plain, replies });
   const latest = await readRecordAt(path);
   if (!latest || latest.ts !== record.ts || latest.blob !== record.blob)
     return;
   const next = { ...record, blob };
   await atomicWrite(path, JSON.stringify(next), 384);
+  if (held)
+    return;
   const envelope = buildHeartbeatEnvelope(sessionId, next, Date.now(), config.pairingId);
   if (envelope)
     await (deps.post ?? postEvent)(config, envelope);

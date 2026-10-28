@@ -554,3 +554,23 @@ test("publishReplyReceipts never clobbers a record a hook rewrote while it was s
   const after = JSON.parse(await Bun.file(path).text()) as SessionRecord;
   expect(await decryptBlob(KEY, after.blob as string)).toMatchObject({ status: "done", replies: { "mid-aaaaaaaa": "d" } });
 });
+
+test("held approval + queued reply: the LAN card carries the receipt AND stays decisionPending; nothing posted to the worker", async () => {
+  const { lanFrameContent } = await import("./lan-frames");
+  const dir = await tmp();
+  const record = rec({ blob: await encryptBlob(KEY, { status: "working", title: "t" }), ts: NOW, prio: 0, pairingId: "pairing-1" });
+  await writeFile(join(dir, `${CONV}.json`), JSON.stringify(record));
+  const card = { status: "decisionPending", title: "t", permissionRequestId: "req-1", permissionToolName: "shell" };
+  const hold = { blob: await encryptBlob(KEY, card), at: NOW + 10, pid: process.pid };
+  await writeFile(join(dir, `${CONV}.hold`), JSON.stringify(hold));
+  const posts: unknown[] = [];
+  const post = async (_c: Config, e: object) => { posts.push(e); return "ok" as never; };
+  await publishReplyReceipts(CONFIG, CONV, dir, { post, receipts: async () => ({ "mid-aaaaaaaa": "q" }), now: () => NOW + 20 });
+  const marker = JSON.parse(await Bun.file(join(dir, `${CONV}.hold`)).text());
+  expect(marker).toMatchObject({ at: hold.at, pid: hold.pid });
+  const onDisk = JSON.parse(await Bun.file(join(dir, `${CONV}.json`)).text()) as SessionRecord;
+  const frame = lanFrameContent(onDisk, "pairing-1", marker, NOW + 20, () => true);
+  expect(await decryptBlob(KEY, frame!.blob as string)).toMatchObject({ ...card, replies: { "mid-aaaaaaaa": "q" } });
+  // a prio:0 working frame would make the worker serve it over the held card — losing the purple hand
+  expect(posts).toHaveLength(0);
+});

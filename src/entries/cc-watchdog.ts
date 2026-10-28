@@ -1400,20 +1400,42 @@ async function interruptSession(
  *  phone's reply bubbles read), store it on the record (so heartbeats and the LAN feed carry it too) and
  *  post it. Best-effort: the next hook frame carries the receipts anyway. A hook that rewrote the record
  *  meanwhile wins: its frame already carries the receipts, and this must not clobber it with an older
- *  blob. (Not a lock — the window left is the one write call; the next hook frame repairs it.) */
+ *  blob. (Not a lock — the window left is the one write call; the next hook frame repairs it.)
+ *
+ *  WHILE A PHONE APPROVAL IS HELD (NOM-96 field bug, session db13d6f8): both LAN feeds serve the `.hold`
+ *  marker's decisionPending card VERBATIM, not the record's blob, so receipts written only to the record
+ *  never reached the phone (bubble stuck on "Sending…"). The card itself is resealed with `replies`
+ *  instead — status stays decisionPending. And NOTHING is posted to the worker: the record's frame is a
+ *  prio:0 `working` one, which the worker treats as "left the decision" and serves over the held card,
+ *  i.e. it would cost the purple hand. A worker-only phone sees the receipts at the hold's next frame. */
 export async function publishReplyReceipts(
   config: Config, sessionId: string, dir: string,
-  deps: { post?: typeof postEvent; receipts?: typeof readReceipts } = {},
+  deps: { post?: typeof postEvent; receipts?: typeof readReceipts; now?: () => number } = {},
 ): Promise<void> {
   const path = `${dir}/${sessionId}.json`;
   const record = await readRecordAt(path);
+  const replies = await (deps.receipts ?? readReceipts)(dir, sessionId);
+  const hold = await readDecisionHoldAt(dir, sessionId);
+  const held = !!hold && stateHoldLive(hold, typeof hold.pid === "number" && pidAlive(hold.pid), (deps.now ?? Date.now)());
+  if (held) {
+    try {
+      const card = await decryptBlob(config.e2eKey, hold!.blob) as Record<string, unknown>;
+      const blob = await encryptBlob(config.e2eKey, { ...card, replies });
+      // The holder may have released (or re-stamped) the marker meanwhile — never resurrect or clobber it.
+      const latest = await readDecisionHoldAt(dir, sessionId);
+      if (latest && latest.blob === hold!.blob && latest.at === hold!.at && latest.pid === hold!.pid) {
+        await atomicWrite(`${dir}/${decisionHoldFileName(sessionId)}`, JSON.stringify({ ...latest, blob }), 0o600);
+      }
+    } catch { /* best-effort: the hold's next frame carries the receipts */ }
+  }
   if (!record || typeof record.blob !== "string" || record.blob.length === 0) return;
   const plain = await decryptBlob(config.e2eKey, record.blob) as Record<string, unknown>;
-  const blob = await encryptBlob(config.e2eKey, { ...plain, replies: await (deps.receipts ?? readReceipts)(dir, sessionId) });
+  const blob = await encryptBlob(config.e2eKey, { ...plain, replies });
   const latest = await readRecordAt(path);
   if (!latest || latest.ts !== record.ts || latest.blob !== record.blob) return;
   const next = { ...record, blob };
   await atomicWrite(path, JSON.stringify(next), 0o600);
+  if (held) return;
   const envelope = buildHeartbeatEnvelope(sessionId, next, Date.now(), config.pairingId);
   if (envelope) await (deps.post ?? postEvent)(config, envelope);
 }
