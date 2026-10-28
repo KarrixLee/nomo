@@ -2,7 +2,9 @@ import { createRequire } from "node:module";
 var __require = /* @__PURE__ */ createRequire(import.meta.url);
 
 // src/core/antigravity-approval.ts
+import { createHash as createHash2 } from "node:crypto";
 import { readFileSync as readFileSync2 } from "node:fs";
+import { mkdir as mkdir2, readdir as readdir6, readFile as readFile7, unlink as unlink6, writeFile as writeFile2 } from "node:fs/promises";
 import { dirname as dirname2, isAbsolute as isAbsolute5, resolve as resolve4 } from "node:path";
 import { fileURLToPath as fileURLToPath2 } from "node:url";
 
@@ -6340,6 +6342,32 @@ function antigravityDecision(line) {
   } catch {}
   return ANTIGRAVITY_FALLBACK;
 }
+var ANTIGRAVITY_RETRY_PASS_MS = 90000;
+var RETRY_PREFIX = "agy-retry-";
+var retryFile = (dir, sessionId, command) => `${dir}/${RETRY_PREFIX}${createHash2("sha256").update(`${sessionId}\x00${command}`).digest("hex")}`;
+async function rememberAntigravityAllow(dir, sessionId, command, now) {
+  try {
+    await mkdir2(dir, { recursive: true, mode: 448 });
+    for (const name of await readdir6(dir)) {
+      if (!name.startsWith(RETRY_PREFIX))
+        continue;
+      const at = Number(await readFile7(`${dir}/${name}`, "utf8").catch(() => "0"));
+      if (!(now - at < ANTIGRAVITY_RETRY_PASS_MS))
+        await unlink6(`${dir}/${name}`).catch(() => {});
+    }
+    await writeFile2(retryFile(dir, sessionId, command), String(now), { mode: 384 });
+  } catch {}
+}
+async function takeAntigravityAllow(dir, sessionId, command, now) {
+  const f = retryFile(dir, sessionId, command);
+  try {
+    const at = Number(await readFile7(f, "utf8"));
+    await unlink6(f);
+    return now - at >= 0 && now - at < ANTIGRAVITY_RETRY_PASS_MS;
+  } catch {
+    return false;
+  }
+}
 var terminated = false;
 function markAntigravityApprovalTerminated() {
   terminated = true;
@@ -6360,6 +6388,10 @@ async function runAntigravityApproval(raw, deps = {}) {
     if (await stopRequested())
       return ANTIGRAVITY_STOP_DENY;
     const command = req.toolName === "shell" ? str3(req.toolInput.command) : undefined;
+    const retryDir = deps.retryDir ?? SESSIONS_DIR;
+    const now = deps.hold?.now ?? Date.now;
+    if (command && await takeAntigravityAllow(retryDir, req.sessionId, command, now()))
+      return '{"decision":"auto_approve"}';
     if (command && isNomoSkillCommand(command, deps.pluginRoot)) {
       const config = await (deps.hold?.loadConfigFn ?? loadConfig)();
       if (config)
@@ -6388,7 +6420,10 @@ async function runAntigravityApproval(raw, deps = {}) {
         line = l;
       }
     }, "antigravity");
-    return antigravityDecision(line);
+    const decision = antigravityDecision(line);
+    if (command && decision === '{"decision":"auto_approve"}')
+      await rememberAntigravityAllow(retryDir, req.sessionId, command, now());
+    return decision;
   } catch {
     return ANTIGRAVITY_FALLBACK;
   }

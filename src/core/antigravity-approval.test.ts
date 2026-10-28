@@ -2,14 +2,14 @@
 // antigravity-approve.sh wrapper. No network (scripted fetch), no real ~/.gemini or ~/.config: every
 // spawned process gets a temp HOME.
 
-import { cp, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { cp, mkdir, mkdtemp, readdir, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
 import {
   ANTIGRAVITY_STOP_DENY, ANTIGRAVITY_APPROVAL_MATCHER, ANTIGRAVITY_APPROVAL_TIMEOUT_S, ANTIGRAVITY_ENTRY_CAP_MS, ANTIGRAVITY_FALLBACK,
-  ANTIGRAVITY_HOLD_DEADLINE_MS, antigravityApprovalRequest, antigravityDecision, runAntigravityApproval,
+  ANTIGRAVITY_HOLD_DEADLINE_MS, ANTIGRAVITY_RETRY_PASS_MS, antigravityApprovalRequest, antigravityDecision, runAntigravityApproval,
 } from "./antigravity-approval";
 import { encryptBlob } from "./crypto";
 import { SAFE_SKILL_COMMANDS, skillCommand } from "../../plugin/scripts/antigravity-skill-command.mjs";
@@ -200,8 +200,52 @@ describe("runAntigravityApproval — through the shared relay", () => {
     trace: () => {}, ...over,
   });
   const answered = async (answer: object) => ({ status: "answered", answerBlob: await encryptBlob(KEY, { requestId: "req-agy", ...answer }) });
+  let retryDir = "";
+  beforeEach(async () => { retryDir = await tmp(); });
   const run = (deps: Record<string, unknown>, input: object = RUN, stopRequested = async () => false) =>
-    runAntigravityApproval(JSON.stringify(input), { rules: () => NO_RULES, hold: hold(deps) as never, stopRequested });
+    runAntigravityApproval(JSON.stringify(input), { rules: () => NO_RULES, hold: hold(deps) as never, stopRequested, retryDir });
+
+  describe("exact-retry pass-through (desktop sandbox retry)", () => {
+    const RETRY = payload("run_command", { CommandLine: "rm -rf build", BypassSandbox: true, toolSummary: "Retry" });
+    const allow = async () => worker(true, [await answered({ decision: "allow" })]);
+    const AUTO = '{"decision":"auto_approve"}';
+
+    test("allow → the identical retry within 90 s passes ONCE; the next needs a card; ticket file is 0600", async () => {
+      expect(await run({ fetchFn: (await allow()).fn })).toBe(AUTO);
+      const [name] = await readdir(retryDir);
+      expect((await stat(join(retryDir, name!))).mode & 0o777).toBe(0o600);
+      clock += ANTIGRAVITY_RETRY_PASS_MS - 10_000;
+      const none = worker(true, []);
+      expect(await run({ fetchFn: none.fn }, RETRY)).toBe(AUTO);
+      expect(none.calls).toEqual([]); // no card
+      const again = await allow();
+      expect(await run({ fetchFn: again.fn }, RETRY)).toBe(AUTO);
+      expect(again.calls).toContain("POST /v1/cc/decision"); // a fresh card
+    });
+
+    test("a deny leaves no pass", async () => {
+      expect(await run({ fetchFn: worker(true, [await answered({ decision: "deny" })]).fn })).toContain('"deny"');
+      const w = worker(true, [await answered({ decision: "deny" })]);
+      expect(await run({ fetchFn: w.fn }, RETRY)).toContain('"deny"');
+      expect(w.calls).toContain("POST /v1/cc/decision");
+    });
+
+    test("a different command, a different conversation, or an expired entry → a card", async () => {
+      const cases: Array<[object, number]> = [
+        [payload("run_command", { CommandLine: "rm -rf build2", BypassSandbox: true }), 0],
+        [{ ...RETRY, conversationId: "c0ffee00-0000-4000-8000-000000000002" }, 0],
+        [RETRY, ANTIGRAVITY_RETRY_PASS_MS + 1],
+      ];
+      for (const [input, wait] of cases) {
+        await rm(retryDir, { recursive: true, force: true });
+        expect(await run({ fetchFn: (await allow()).fn })).toBe(AUTO);
+        clock += wait;
+        const w = worker(true, [await answered({ decision: "deny" })]);
+        expect(await run({ fetchFn: w.fn }, input)).toContain('"deny"');
+        expect(w.calls).toContain("POST /v1/cc/decision");
+      }
+    });
+  });
 
   test("phone Stop already pressed → deny 'Stopped from phone' at once, zero network", async () => {
     const { fn, calls } = worker(true, []);

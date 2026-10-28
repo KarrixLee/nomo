@@ -604,7 +604,10 @@ description is dropped before the command is.
   trap and the bundle's own parent check end the hold, withdraw the phone's card and leave no process
   behind. `auto_approve` is sent only for an Allow sealed by your paired phone for that exact request
   id, and never for a call one of your own `deny` rules may match: such a call is not sent to the
-  phone at all (Deny > Ask > Allow). Nomo never sends `permissionOverrides`, `overwrite` or a changed
+  phone at all (Deny > Ask > Allow). One exception to "that exact request id": after a phone Allow
+  on a shell command, the next byte-identical command in the same conversation within 90 s (the
+  desktop app's retry outside its sandbox) is answered `auto_approve` once, without a new card — never
+  after a Deny, and the one-use ticket is a 0600 file under the sessions dir. Nomo never sends `permissionOverrides`, `overwrite` or a changed
   tool input. The
   approval hook reads the tool name, the command (`CommandLine`) or file path, and the model's one-line
   `toolSummary`, puts them in the end-to-end encrypted card, and reads your `permissions` rules from

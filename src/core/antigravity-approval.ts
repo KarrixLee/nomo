@@ -28,7 +28,9 @@
 // "ALWAYS ALLOW" IS NOT OFFERED: `permissionOverrides` persistence is undocumented and testing it would
 // write to the user's real ~/.gemini. A phone that sends allow_always anyway gets a plain auto_approve.
 
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
+import { mkdir, readdir, readFile, unlink, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { SAFE_SKILL_COMMANDS, skillCommand } from "../../plugin/scripts/antigravity-skill-command.mjs";
@@ -230,7 +232,46 @@ export function antigravityDecision(line: string | undefined): string {
   return ANTIGRAVITY_FALLBACK;
 }
 
+/** EXACT-RETRY PASS-THROUGH (desktop app). The app sandboxes run_command; a command the phone just
+ *  ALLOWED can fail there (`operation not permitted`), and the agent retries the identical CommandLine
+ *  with `BypassSandbox: true` — a second card for what the user already approved. So a phone Allow on a
+ *  shell card leaves a one-use ticket for (conversation, exact command string): the next identical
+ *  run_command in that conversation within this window is auto_approved without a card. Never after a
+ *  Deny, never for another command or conversation, consumed on first use. Other args (BypassSandbox)
+ *  are not part of the key. Files are 0600 under SESSIONS_DIR; expired ones are swept on each write. */
+export const ANTIGRAVITY_RETRY_PASS_MS = 90_000;
+const RETRY_PREFIX = "agy-retry-";
+const retryFile = (dir: string, sessionId: string, command: string) =>
+  `${dir}/${RETRY_PREFIX}${createHash("sha256").update(`${sessionId}\0${command}`).digest("hex")}`;
+
+/** Record a phone-allowed command. Never throws. */
+export async function rememberAntigravityAllow(dir: string, sessionId: string, command: string, now: number): Promise<void> {
+  try {
+    await mkdir(dir, { recursive: true, mode: 0o700 });
+    for (const name of await readdir(dir)) {
+      if (!name.startsWith(RETRY_PREFIX)) continue;
+      const at = Number(await readFile(`${dir}/${name}`, "utf8").catch(() => "0"));
+      if (!(now - at < ANTIGRAVITY_RETRY_PASS_MS)) await unlink(`${dir}/${name}`).catch(() => {});
+    }
+    await writeFile(retryFile(dir, sessionId, command), String(now), { mode: 0o600 });
+  } catch { /* no ticket → the retry just gets its own card */ }
+}
+
+/** Consume a fresh ticket for exactly this (conversation, command). True once; never throws. */
+export async function takeAntigravityAllow(dir: string, sessionId: string, command: string, now: number): Promise<boolean> {
+  const f = retryFile(dir, sessionId, command);
+  try {
+    const at = Number(await readFile(f, "utf8"));
+    await unlink(f); // the unlink that succeeds owns the one use
+    return now - at >= 0 && now - at < ANTIGRAVITY_RETRY_PASS_MS;
+  } catch {
+    return false;
+  }
+}
+
 export interface AntigravityApprovalDeps {
+  /** Where exact-retry tickets live (tests). Default SESSIONS_DIR. */
+  retryDir?: string;
   /** Overrides for the shared hold (tests: fetch, config, clock…). */
   hold?: PermissionHookDeps;
   rules?: (transcriptPath: string | undefined) => AntigravityPermissionRules;
@@ -267,6 +308,9 @@ export async function runAntigravityApproval(raw: string, deps: AntigravityAppro
     // Nomo's OWN /nomo-* commands (status, approvals on, …) never become a phone card — but only when
     // paired (unpaired, Antigravity's own prompt decides) and only byte-for-byte the installed template.
     const command = req.toolName === "shell" ? str(req.toolInput.command) : undefined;
+    const retryDir = deps.retryDir ?? SESSIONS_DIR;
+    const now = deps.hold?.now ?? Date.now;
+    if (command && await takeAntigravityAllow(retryDir, req.sessionId, command, now())) return '{"decision":"auto_approve"}';
     if (command && isNomoSkillCommand(command, deps.pluginRoot)) {
       const config: Config | null = await (deps.hold?.loadConfigFn ?? loadConfig)();
       if (config) return '{"decision":"auto_approve"}';
@@ -297,7 +341,9 @@ export async function runAntigravityApproval(raw: string, deps: AntigravityAppro
     // An abandoned hold (the agent killed our wrapper) has already withdrawn the card and settled the row
     // as WORKING inside runPermissionHook: a cancelled tool call is not necessarily a finished turn. The
     // real Stop, or the watchdog's idle net, ends it.
-    return antigravityDecision(line);
+    const decision = antigravityDecision(line);
+    if (command && decision === '{"decision":"auto_approve"}') await rememberAntigravityAllow(retryDir, req.sessionId, command, now());
+    return decision;
   } catch {
     return ANTIGRAVITY_FALLBACK;
   }
