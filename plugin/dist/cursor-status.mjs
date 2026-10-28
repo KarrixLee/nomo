@@ -2933,13 +2933,20 @@ function antigravityChatTitle(sessionId, transcriptPath, env = process.env) {
 function antigravityRunStatus(sessionId, transcriptPath, env = process.env) {
   if (!AG_SQL_SAFE_ID.test(sessionId))
     return;
+  const ms = (col) => `coalesce(cast((julianday(${col}) - 2440587.5) * 86400000 as integer), '')`;
+  const where = ` from conversation_summaries where conversation_id='${sessionId}'`;
   for (const db of summariesDbs(transcriptPath)) {
-    const row = sqliteOne(db, "select status || '|' || coalesce(cast((julianday(last_modified_time) - 2440587.5) * 86400000 as integer), '')" + ` from conversation_summaries where conversation_id='${sessionId}'`, env);
+    const row = sqliteOne(db, `select status || '|' || ${ms("last_modified_time")}${where}`, env);
     if (!row)
       continue;
-    const [status, ms] = row.split("|");
-    const lastModifiedMs = ms ? Number(ms) : NaN;
-    return { status: status ?? "", ...Number.isFinite(lastModifiedMs) ? { lastModifiedMs } : {} };
+    const [status, mod] = row.split("|");
+    const lastModifiedMs = mod ? Number(mod) : NaN;
+    const input = Number(sqliteOne(db, `select ${ms("last_user_input_time")}${where}`, env) ?? NaN);
+    return {
+      status: status ?? "",
+      ...Number.isFinite(lastModifiedMs) ? { lastModifiedMs } : {},
+      ...Number.isFinite(input) ? { lastUserInputMs: input } : {}
+    };
   }
   return;
 }

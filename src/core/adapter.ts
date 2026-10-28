@@ -2713,20 +2713,27 @@ export function antigravityChatTitle(sessionId: string, transcriptPath?: string,
 }
 
 /** The run state Antigravity recorded for a conversation: `status` (e.g. CASCADE_RUN_STATUS_IDLE /
- *  _RUNNING) and `last_modified_time` as epoch ms (undefined when unparseable). Antigravity writes IDLE
+ *  _RUNNING), `last_modified_time` and `last_user_input_time` as epoch ms (undefined when unparseable). Antigravity writes IDLE
  *  even when a turn ends with NO hook event (interrupt, headless auto-deny) — which is what the
  *  watchdog's settle path keys on. Undefined on any failure. */
 export function antigravityRunStatus(
   sessionId: string, transcriptPath?: string, env: NodeJS.ProcessEnv = process.env,
-): { status: string; lastModifiedMs?: number } | undefined {
+): { status: string; lastModifiedMs?: number; lastUserInputMs?: number } | undefined {
   if (!AG_SQL_SAFE_ID.test(sessionId)) return undefined;
+  const ms = (col: string) => `coalesce(cast((julianday(${col}) - 2440587.5) * 86400000 as integer), '')`;
+  const where = ` from conversation_summaries where conversation_id='${sessionId}'`;
   for (const db of summariesDbs(transcriptPath)) {
-    const row = sqliteOne(db, "select status || '|' || coalesce(cast((julianday(last_modified_time) - 2440587.5) * 86400000 as integer), '')" +
-      ` from conversation_summaries where conversation_id='${sessionId}'`, env);
+    const row = sqliteOne(db, `select status || '|' || ${ms("last_modified_time")}${where}`, env);
     if (!row) continue;
-    const [status, ms] = row.split("|");
-    const lastModifiedMs = ms ? Number(ms) : NaN;
-    return { status: status ?? "", ...(Number.isFinite(lastModifiedMs) ? { lastModifiedMs } : {}) };
+    const [status, mod] = row.split("|");
+    const lastModifiedMs = mod ? Number(mod) : NaN;
+    // Its own query: a schema without the column must not cost the status read above.
+    const input = Number(sqliteOne(db, `select ${ms("last_user_input_time")}${where}`, env) ?? NaN);
+    return {
+      status: status ?? "",
+      ...(Number.isFinite(lastModifiedMs) ? { lastModifiedMs } : {}),
+      ...(Number.isFinite(input) ? { lastUserInputMs: input } : {}),
+    };
   }
   return undefined;
 }

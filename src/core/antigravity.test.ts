@@ -545,6 +545,16 @@ describe("FIX 1 — a turn that ends with no event is settled", () => {
   test("IDLE written after the row's last event settles it", () => {
     expect(antigravityRunSettled(CONV, working(), NOW, idleAt(NOW - 5_000))).toBe(true);
   });
+  test("a Stop's IDLE (last_modified_time NOT bumped, before the row's stamp) settles via THIS turn's prompt time (NOM-96)", () => {
+    // Field case 01e48c30: prompt written 594 ms before PreInvocation stamped the row; app Stop then
+    // flipped the status to IDLE and left last_modified_time = last_user_input_time = the prompt.
+    const turn = working({ turnStartedAt: Math.floor((NOW - ANTIGRAVITY_SETTLE_GRACE_MS) / 1000) });
+    const input = turn.ts - 594;
+    expect(antigravityRunSettled(CONV, turn, NOW, () => ({ status: "CASCADE_RUN_STATUS_IDLE", lastModifiedMs: input, lastUserInputMs: input }))).toBe(true);
+    // …but the PREVIOUS turn's prompt never does, and RUNNING never does.
+    expect(antigravityRunSettled(CONV, turn, NOW, () => ({ status: "CASCADE_RUN_STATUS_IDLE", lastModifiedMs: input, lastUserInputMs: input - 60_000 }))).toBe(false);
+    expect(antigravityRunSettled(CONV, turn, NOW, () => ({ status: "CASCADE_RUN_STATUS_RUNNING", lastModifiedMs: input, lastUserInputMs: input }))).toBe(false);
+  });
   test("…but not inside the grace, not RUNNING, not a previous turn's IDLE, not an unparseable time, not another agent", () => {
     expect(antigravityRunSettled(CONV, working({ ts: NOW - 1_000 }), NOW, idleAt(NOW))).toBe(false);
     expect(antigravityRunSettled(CONV, working(), NOW, () => ({ status: "CASCADE_RUN_STATUS_RUNNING", lastModifiedMs: NOW }))).toBe(false);

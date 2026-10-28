@@ -2515,8 +2515,17 @@ export function antigravityRunSettled(
   if (record.lastEvent !== "working" && record.lastEvent !== "sessionStart") return false;
   if (typeof record.ts !== "number" || now - record.ts < ANTIGRAVITY_SETTLE_GRACE_MS) return false;
   const run = probe(sessionId, typeof record.transcript === "string" && record.transcript ? record.transcript : undefined);
-  return run?.status === "CASCADE_RUN_STATUS_IDLE" && typeof run.lastModifiedMs === "number" && run.lastModifiedMs >= record.ts;
+  if (run?.status !== "CASCADE_RUN_STATUS_IDLE") return false;
+  if (typeof run.lastModifiedMs === "number" && run.lastModifiedMs >= record.ts) return true;
+  // A Stop (app or CLI) flips the status to IDLE WITHOUT bumping last_modified_time, which stays at the
+  // prompt's own write — ~0.6 s BEFORE the PreInvocation hook stamped the row (NOM-96 field case
+  // 01e48c30). The prompt that opened THIS turn proves the IDLE is this turn's, not the previous one's.
+  return typeof run.lastUserInputMs === "number" && typeof record.turnStartedAt === "number" &&
+    run.lastUserInputMs >= record.turnStartedAt * 1000 - ANTIGRAVITY_TURN_INPUT_SLACK_MS;
 }
+
+/** How far before the turn's (whole-second) `turnStartedAt` its prompt's `last_user_input_time` may sit. */
+const ANTIGRAVITY_TURN_INPUT_SLACK_MS = 5_000;
 
 /** Has a non-done `agy` CLI row lost its owner? classifySession keeps such a row (see there), so the
  *  idle reap settles it done at once — the same done a Stop would have left. */
