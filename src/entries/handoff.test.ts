@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
-import { chmodSync, utimesSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, utimesSync, existsSync, mkdirSync, mkdtempSync as mkdtemp, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { spawn } from "node:child_process";
@@ -8,6 +8,11 @@ import { realpathSync } from "node:fs";
 import { createServer } from "node:net";
 import { afterAll, beforeAll } from "bun:test";
 import { b64url, generateEphemeralKeyPair } from "../core/crypto";
+
+/** Every temp dir this file makes, removed when it is done. */
+const made: string[] = [];
+const mkdtempSync = (prefix: string) => { const d = mkdtemp(prefix); made.push(d); return d; };
+afterAll(() => { for (const d of made) rmSync(d, { recursive: true, force: true }); });
 import { buildPairURL } from "../core/pair-url";
 import {
   BOX_MACHINE_NAME, bakeScript, checkLaunchIds, PAIR_FN, PAIR_POLL, packRefusal, SHM_SWEEP, targetWorker, userLayerFiles, boxPairPayload, createBody, lastModel, latestSession, paneScript, projectDirName,
@@ -563,14 +568,22 @@ case "$1" in
 esac`);
     exe("flock", `fd=\${@: -1}; op=LOCK_EX; [ "$1" = -u ] && op=LOCK_UN
 exec perl -MFcntl=:flock -e 'open(my $f, ">&=", $ARGV[0]) or die "fd"; flock($f, $ARGV[1] eq "LOCK_UN" ? LOCK_UN : LOCK_EX) or die "lock"' "$fd" "$op"`);
-    exe("claude", `[ "$1" = --version ] && echo "9.9.9 (Claude Code)"; exit 0`);
+    // claude sits where the box puts it (/root/.local/bin, first on the script's own PATH), so it wins over
+    // any claude a startup file prepends; every call is logged, so a test can prove the stub got it.
+    mkdirSync(join(d, "root/.local/bin"), { recursive: true });
+    writeFileSync(join(d, "root/.local/bin/claude"), `#!/bin/bash\necho "$*" >> ${d}/claude-calls\n[ "$1" = --version ] && echo "9.9.9 (Claude Code)"; exit 0\n`);
+    chmodSync(join(d, "root/.local/bin/claude"), 0o755);
+    mkdirSync(join(d, "home"));
     exe("git", `case "$*" in *" clone "*) mkdir -p "\${@: -1}" ;; esac; exit 0`);
     for (const x of ["tar", "bun", "curl", "sleep", "apt-get"]) exe(x, "exit 0");
     const map = (script: string) => {
       for (const p of projects.values()) script = script.replaceAll(p, `${d}/box${p}`);
       return script.replaceAll("/root/", `${d}/root/`).replaceAll("/dev/shm", `${d}/shm`);
     };
-    const env = (e: Record<string, string>) => ({ PATH: `${bin}:/usr/bin:/bin`, ANTHROPIC_AUTH_TOKEN: "test-token", ...e });
+    // HOME is the box's own: unset, bash resolves ~ to the developer's real home, and a bash spawned with a
+    // socket for stdin (Bun's async spawn) sources that ~/.bashrc, which can put the REAL claude first on
+    // PATH and point it at the developer's real ~/.claude (it once re-pointed their nomo marketplace).
+    const env = (e: Record<string, string>) => ({ PATH: `${bin}:/usr/bin:/bin`, HOME: `${d}/home`, ANTHROPIC_AUTH_TOKEN: "test-token", ...e });
     const run = (script: string, e: Record<string, string> = {}) => {
       try { return { stdout: execFileSync("bash", ["-c", map(script)], { env: env(e) }).toString(), code: 0 }; }
       catch (err) { const x = err as { stdout: Buffer; status: number }; return { stdout: x.stdout.toString(), code: x.status }; }
@@ -585,7 +598,8 @@ exec perl -MFcntl=:flock -e 'open(my $f, ">&=", $ARGV[0]) or die "fd"; flock($f,
     const tmux = () => readFileSync(join(d, "sessions"), "utf8").split("\n").filter(Boolean);
     const calls = () => (existsSync(join(d, "calls")) ? readFileSync(join(d, "calls"), "utf8") : "");
     const marker = (u: string) => readFileSync(join(d, "root/.nomo-sessions", u), "utf8");
-    return { d, run, runAsync, handOff, tmux, calls, marker, boxRoot: (name: string) => `${d}/box${proj(name)}` };
+    const claudeCalls = () => (existsSync(join(d, "claude-calls")) ? readFileSync(join(d, "claude-calls"), "utf8") : "");
+    return { d, run, runAsync, handOff, tmux, calls, claudeCalls, marker, boxRoot: (name: string) => `${d}/box${proj(name)}` };
   }
 
   test("two handoffs from different projects coexist, each in its own tmux, marker and key file", () => {
@@ -655,6 +669,13 @@ exec perl -MFcntl=:flock -e 'open(my $f, ">&=", $ARGV[0]) or die "fd"; flock($f,
     expect(cap.map((x) => x.code).sort()).toEqual([0, 3]);
     expect(cap.find((x) => x.code === 3)!.stdout).toContain("NOMO_FULL=4");
     expect(b.tmux().filter((t) => /^nomo-[0-9a-f]{12}$/.test(t)).length).toBe(4);
+    expect(b.claudeCalls()).toContain(`plugin marketplace add ${b.d}/root/.nomo/marketplace`); // the stub, never the real claude
+  });
+
+  test("a fake box never reaches the developer's real claude or HOME, in sync or async runs", async () => {
+    const b = fakeBox();
+    const probe = 'export PATH="/root/.local/bin:/root/.bun/bin:$PATH"; command -v claude; echo ~';
+    for (const r of [b.run(probe), await b.runAsync(probe)]) expect(r.stdout).toBe(`${b.d}/root/.local/bin/claude\n${b.d}/home\n`);
   });
 
   test("a handoff that fails after admission releases its claim (no phantom marker holds the root)", () => {
