@@ -258,8 +258,11 @@ export type SessionStateBlob =
   /** An existing ciphertext (the record's blob, or the hold's card) — passed through untouched. */
   | { kind: "sealed"; value: string }
   /** A plaintext the MAC authored because no existing blob describes the state we computed. The feed
-   *  seals it under the pairing e2eKey. Already fitted to BLOB_FIT_CHARS by buildStatePlaintext. */
-  | { kind: "plain"; value: Record<string, unknown> }
+   *  seals it under the pairing e2eKey. Already fitted to BLOB_FIT_CHARS by buildStatePlaintext.
+   *  `carry` (Antigravity only): the record's sealed blob, whose append-last `surface`/`replies` keys
+   *  the feed copies onto the authored plaintext — the reply receipts live ONLY in the record's blob,
+   *  so without it a done row's "Sending…" bubble never saw its `q` (NOM-96). */
+  | { kind: "plain"; value: Record<string, unknown>; carry?: string }
   /** "Re-serve whatever you last served for this session." The record is gone, so there is no blob to
    *  read — but the phone must still learn the row ended rather than watch it vanish. */
   | { kind: "last" };
@@ -442,6 +445,9 @@ export function computeSessionState(input: SessionStateInput): SessionState | nu
   // The clear question discriminator, carried ONLY onto the two rungs a user can answer — see
   // SessionState.attentionKind. Mirrors lanFrameContent's `prio === 1` gate in v2's vocabulary.
   const asking = record.attentionKind === "userInput" ? { attentionKind: "userInput" as const } : {};
+  /** Mac-authored plaintext; an Antigravity row carries its record blob's reply receipts along. */
+  const authored = (value: Record<string, unknown>): SessionStateBlob =>
+    ({ kind: "plain", value, ...(agent === "antigravity" ? { carry: record.blob } : {}) });
   const of = (
     state: SessionDisplayState, why: SessionStateWhy, blob: SessionStateBlob, at: number, terminal = false,
   ): SessionState => ({ state, terminal, ts: at, why, blob, agent, ...startedAt });
@@ -493,7 +499,7 @@ export function computeSessionState(input: SessionStateInput): SessionState | nu
       // stamp that moved every sweep would re-seal and wake every long poll on a session that is over.
       return of(
         "done", opinion?.status === "idle" ? "done+cc" : suffix("done"),
-        { kind: "plain", value: buildStatePlaintext(record, "done", ts, opinion?.name, sessionId) }, ts, false,
+        authored(buildStatePlaintext(record, "done", ts, opinion?.name, sessionId)), ts, false,
       );
     }
   }
@@ -517,7 +523,7 @@ export function computeSessionState(input: SessionStateInput): SessionState | nu
     !recordDone && opinion?.status === "idle" && record.prio !== 1 &&
     record.lastEvent !== "needsAttention" && opinion.statusUpdatedAt > ts + CC_IDLE_DONE_GRACE_MS
   ) {
-    return of("done", "done+cc", { kind: "plain", value: buildStatePlaintext(record, "done", opinion.statusUpdatedAt, opinion.name, sessionId) }, ts, false);
+    return of("done", "done+cc", authored(buildStatePlaintext(record, "done", opinion.statusUpdatedAt, opinion.name, sessionId)), ts, false);
   }
 
   // --- rank 4: needsAttention ---------------------------------------------------------------------
@@ -548,7 +554,7 @@ export function computeSessionState(input: SessionStateInput): SessionState | nu
     // record is the held-back branch above, whose condition is this same expression, and neither the hold
     // nor the attention rung in between can fall through. `?? ts` is the free belt-and-braces.
     recordDone
-      ? { kind: "plain", value: buildStatePlaintext(record, "working", opinion?.statusUpdatedAt ?? ts, opinion?.name, sessionId) }
+      ? authored(buildStatePlaintext(record, "working", opinion?.statusUpdatedAt ?? ts, opinion?.name, sessionId))
       : sealed,
     ts,
     false,

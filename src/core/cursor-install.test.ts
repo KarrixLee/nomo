@@ -455,7 +455,7 @@ describe("bunx nomo-ai --cursor", () => {
   test("an explicit --cursor is never skipped, with or without --all", async () => {
     for (const flags of [["--cursor"], ["--all", "--cursor"]]) {
       const r = await noCursor(flags);
-      expect(r.out).not.toContain("skipped");
+      expect(r.out).not.toContain("Cursor was not found");
       expect(r.out).toContain("cursor-install.mjs");
     }
   });

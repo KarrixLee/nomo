@@ -35,11 +35,12 @@ export const LAN_REQUEST_ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
  *  sends the identical ciphertext down both legs: a blob this side accepted and the worker refused would
  *  be a silent split brain between the two channels. */
 export const LAN_ANSWER_BLOB_MAX_CHARS = 3072;
-/** Upper bound on a `command` op's inner sealed blob — the sibling of the answer ceiling above, and here
- *  for the same reason: it is a payload-field ceiling the iOS CCLanClient mirrors, not host machinery.
- *  The worker path caps blobs at 3072 base64 chars (BLOB_FIT_CHARS + margin); the LAN path has no worker
- *  in it, so it is allowed more headroom — but a bound is still a bound. */
-export const LAN_COMMAND_BLOB_MAX_CHARS = 8192;
+/** Upper bound on a `command` op's inner sealed blob — the worker's MAX_COMMAND_BLOB_CHARS (20480)
+ *  verbatim, for the same split-brain reason as the answer ceiling above: the phone sends one sealed
+ *  command down both legs, so one leg must not refuse what the other accepts. 20480 fits a 4,000-UTF-16-
+ *  unit Antigravity reply (≈16.4 K base64), CJK included. It is a payload-field ceiling the iOS
+ *  CCLanClient mirrors, not host machinery; the sealed envelope stays far under LAN_BODY_MAX_BYTES. */
+export const LAN_COMMAND_BLOB_MAX_CHARS = 20_480;
 
 /** Longest a `frames` long-poll may be held open (phase 3). The phone asks for at most this; anything
  *  larger is a client bug and is refused rather than clamped, so both ends always agree on the deadline.
