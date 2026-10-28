@@ -15,7 +15,7 @@ import {
 import { ANTIGRAVITY_INTERRUPT_SUFFIX, runAntigravityHook } from "./antigravity";
 import { decryptBlob, encryptBlob } from "./crypto";
 import { Config, SessionRecord, writeInterruptFlagAt } from "./shared";
-import { classifySession, drainCommands, publishReplyReceipts, resetCommandState } from "../entries/cc-watchdog";
+import { classifySession, correctIdleClaude, drainCommands, publishReplyReceipts, resetCommandState } from "../entries/cc-watchdog";
 import { createProcessHygiene, isolatedTestEnv } from "../test/process-hygiene";
 
 const { spawnTestProcess } = createProcessHygiene();
@@ -493,7 +493,34 @@ describe("watchdog: send-message / cancel-message through drainCommands' gates",
     const dead = () => false;
     expect(classifySession(done({ ts: NOW }), NOW, dead)).toBe("keep");
     expect(classifySession(done({ ts: NOW, transcript: APP_TRANSCRIPT }), NOW, dead)).toBe("end");
-    expect(classifySession(rec({ ts: NOW }), NOW, dead)).toBe("end"); // a working row whose agy died
+    expect(classifySession(rec({ ts: NOW }), NOW, dead)).toBe("keep"); // a working row whose agy died: settled, not ended
+  });
+
+  test("a reply queued while agy ran survives agy exiting mid-turn with no Stop (headless auto-deny)", async () => {
+    const dir = await tmp();
+    const spawned: string[] = [];
+    let ownerAlive = true;
+    const pidAlive = (p: number) => p === 4242 && ownerAlive;
+    const deps = { sessionsDir: dir, now: NOW, pidAlive, resume: (_c: string, _cwd: string, t: string) => { spawned.push(t); return 999; } };
+    // 1. the phone's reply lands while the turn runs → queued
+    expect(await handleReplyCommand("send-message", CONV, rec(), { mid: "mid-aaaaaaaa", text: "PINEAPPLE?" }, deps)).toBe("reply-queued");
+    // 2. agy auto-denies and exits: no Stop, so the row still reads working with a dead owner
+    ownerAlive = false;
+    const working = rec({ blob: "B" });
+    expect(classifySession(working, NOW, pidAlive)).toBe("keep"); // never op:end (that deletes the record)
+    // 3. the idle reap settles it done at once
+    const writes: SessionRecord[] = [];
+    const v = await correctIdleClaude(CONFIG, join(dir, `${CONV}.json`), CONV, working, NOW, {
+      pidAlive, readRecord: async () => working, post: async () => "delivered" as const, writeRecord: async (_p, r) => { writes.push(r); },
+      antigravityRunStatus: () => undefined, readDecisionHoldFn: async () => null,
+    });
+    expect(v).toBe("corrected");
+    expect(writes[0]).toMatchObject({ op: "done", lastEvent: "done" });
+    expect(await decryptBlob(KEY, writes[0]!.blob as string)).toMatchObject({ status: "done", surface: "cli" }); // the phone can still offer Reply
+    // 4. the next sweep resumes the stranded message (w)
+    expect((await sweepStrandedReplies(dir, CONV, writes[0]!, deps)).resumed).toBe(true);
+    expect(spawned).toEqual(["PINEAPPLE?"]);
+    expect(await receiptOf(dir, CONV, "mid-aaaaaaaa")).toBe("w");
   });
 });
 

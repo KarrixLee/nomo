@@ -8340,7 +8340,7 @@ function classifySession(record, now, isAlive) {
   }
   if (now - record.ts > SESSION_STALE_MS)
     return "stale";
-  if (record.agent === "antigravity" && isDoneState(record) && antigravitySurface(record.transcript) === "cli")
+  if (record.agent === "antigravity" && antigravitySurface(record.transcript) === "cli")
     return "keep";
   const ownerPid = record.agent === "codex" && typeof record.tuiPid === "number" && Number.isFinite(record.tuiPid) ? record.tuiPid : record.pid;
   return isAlive(ownerPid) ? "keep" : "end";
@@ -8388,7 +8388,8 @@ async function buildDoneEnvelope(sessionId, record, now, e2eKey, agent = "claude
     ...typeof at === "number" && Number.isFinite(at) ? { at } : {},
     ...typeof record.folderKey === "string" && record.folderKey.length > 0 ? { folderKey: record.folderKey } : {},
     ...branch ? { branch } : {},
-    ...sidField(sessionId)
+    ...sidField(sessionId),
+    ...antigravitySurface(record.transcript) ? { surface: antigravitySurface(record.transcript) } : {}
   };
   const debug = appendCodexBridgeMarker(agent === "codex" ? dbg ?? formatPlanPickerDebug({ event: "done", classifier: "done", marker: "0", by: "wd" }) : undefined, codexBridgeIsDown());
   const blob = await encryptBlob(e2eKey, appendFittedPlanAndDebug(base, ambientPlan(agent, record), debug));
@@ -8408,7 +8409,8 @@ async function buildNeedsAttentionEnvelope(sessionId, record, now, e2eKey, agent
     ...typeof at === "number" && Number.isFinite(at) ? { at } : {},
     ...typeof record.folderKey === "string" && record.folderKey.length > 0 ? { folderKey: record.folderKey } : {},
     ...branch ? { branch } : {},
-    ...sidField(sessionId)
+    ...sidField(sessionId),
+    ...antigravitySurface(record.transcript) ? { surface: antigravitySurface(record.transcript) } : {}
   };
   const debug = appendCodexBridgeMarker(agent === "codex" ? dbg ?? formatPlanPickerDebug({ event: "attention", classifier: "pending", marker: "0", by: "wd" }) : undefined, codexBridgeIsDown());
   const blob = await encryptBlob(e2eKey, appendFittedPlanAndDebug(base, proposedPlan, debug));
@@ -8436,7 +8438,8 @@ async function buildWorkingEnvelope(sessionId, record, now, e2eKey, agent = "cla
     at: Math.floor(now / 1000),
     ...typeof record.folderKey === "string" && record.folderKey.length > 0 ? { folderKey: record.folderKey } : {},
     ...branch ? { branch } : {},
-    ...sidField(sessionId)
+    ...sidField(sessionId),
+    ...antigravitySurface(record.transcript) ? { surface: antigravitySurface(record.transcript) } : {}
   };
   const debug = appendCodexBridgeMarker(agent === "codex" ? dbg ?? formatPlanPickerDebug({ event: "working", classifier: "resolved", marker: "0", by: "wd" }) : undefined, codexBridgeIsDown());
   const blob = await encryptBlob(e2eKey, appendFittedPlanAndDebug(base, ambientPlan(agent, record), debug));
@@ -9558,6 +9561,9 @@ function antigravityRunSettled(sessionId, record, now, probe = antigravityRunSta
   const run = probe(sessionId, typeof record.transcript === "string" && record.transcript ? record.transcript : undefined);
   return run?.status === "CASCADE_RUN_STATUS_IDLE" && typeof run.lastModifiedMs === "number" && run.lastModifiedMs >= record.ts;
 }
+function antigravityOwnerGone(record, alive = pidAlive) {
+  return recordAgent(record) === "antigravity" && !isDoneState(record) && antigravitySurface(record.transcript) === "cli" && typeof record.pid === "number" && !alive(record.pid);
+}
 function idleReapAgeEligible(record, now, transcriptMtimeMs = transcriptMtimeMsDefault, idleMs = CLAUDE_IDLE_REAP_MS) {
   if (record.lastEvent !== "working" && record.lastEvent !== "sessionStart")
     return false;
@@ -9618,7 +9624,7 @@ async function correctIdleClaude(config, path, sessionId, record, now, deps = {}
       }
       record = { ...record, tuiPid };
     } else if (agent === "antigravity") {
-      if (!isClaudeIdleReapEligible(record, now) && !antigravityRunSettled(sessionId, record, now, deps.antigravityRunStatus))
+      if (!isClaudeIdleReapEligible(record, now) && !antigravityOwnerGone(record, deps.pidAlive) && !antigravityRunSettled(sessionId, record, now, deps.antigravityRunStatus))
         return "uncorrected";
     } else if (!isClaudeIdleReapEligible(record, now)) {
       return "uncorrected";
@@ -9638,7 +9644,8 @@ async function correctIdleClaude(config, path, sessionId, record, now, deps = {}
     if (!await unmoved())
       return "uncorrected";
     const doneNow = clock();
-    const outcome = await post(await buildDoneEnvelope(sessionId, record, doneNow, config.e2eKey, agent, Math.floor(record.ts / 1000)));
+    const envelope = await buildDoneEnvelope(sessionId, record, doneNow, config.e2eKey, agent, Math.floor(record.ts / 1000));
+    const outcome = await post(envelope);
     if (outcome === "revoked")
       return "revoked";
     if (!await unmoved()) {
@@ -9646,8 +9653,9 @@ async function correctIdleClaude(config, path, sessionId, record, now, deps = {}
       return "uncorrected";
     }
     if (outcome === "delivered") {
+      const blob = agent === "antigravity" ? { blob: envelope.blob } : {};
       try {
-        await writeRecord(path, { ...record, lastEvent: "done", sentDone: true, op: "done", doneAttempts: undefined, awaitingPrompt: undefined });
+        await writeRecord(path, { ...record, ...blob, lastEvent: "done", sentDone: true, op: "done", doneAttempts: undefined, awaitingPrompt: undefined });
       } catch {}
       clearDoneAttempts(sessionId);
       return "corrected";
@@ -10683,6 +10691,7 @@ export {
   WAITING_HEARTBEAT_AFTER_MS,
   acceptLanAnswer,
   acceptLanCommand,
+  antigravityOwnerGone,
   antigravityRunSettled,
   buildDoneEnvelope,
   buildEndEnvelope,

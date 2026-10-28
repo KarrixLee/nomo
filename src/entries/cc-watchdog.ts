@@ -222,9 +222,12 @@ export function classifySession(record: SessionRecord | null, now: number, isAli
     return isAlive(record.tuiPid) ? "keep" : "delete";
   }
   if (now - record.ts > SESSION_STALE_MS) return "stale"; // abandoned (24 h): POST a terminal end, then delete
-  // An idle `agy` CLI conversation outlives its process: a phone reply resumes it headless
-  // (core/antigravity-inbox.ts). Kept as a done row until the idle-done RETIRE net retires it.
-  if (record.agent === "antigravity" && isDoneState(record) && antigravitySurface(record.transcript) === "cli") return "keep";
+  // An `agy` CLI conversation outlives its process: a phone reply resumes it headless
+  // (core/antigravity-inbox.ts). Kept as a done row until the idle-done RETIRE net retires it. A row
+  // whose agy died mid-turn (a headless auto-deny exits with no Stop) is kept TOO — the idle reap
+  // settles it done (antigravityOwnerGone) — never ended: an op:end deletes the record, and with it
+  // every message queued for the conversation (sweepStrandedReplies needs the record to resume).
+  if (record.agent === "antigravity" && antigravitySurface(record.transcript) === "cli") return "keep";
   // A precision-correlated Codex TUI owns the session. Its app-server pid can live for the lifetime of
   // the app and is no evidence that this particular terminal still exists.
   const ownerPid = record.agent === "codex" && typeof record.tuiPid === "number" && Number.isFinite(record.tuiPid)
@@ -320,6 +323,9 @@ export async function buildDoneEnvelope(sessionId: string, record: SessionRecord
     ...(typeof record.folderKey === "string" && record.folderKey.length > 0 ? { folderKey: record.folderKey } : {}),
     ...(branch ? { branch } : {}),
     ...sidField(sessionId),
+    // Antigravity's append-last `surface` (hook.ts extraFields): without it the phone cannot tell a
+    // watchdog-settled idle `agy` CLI row is resumable. Only an Antigravity transcript path yields one.
+    ...(antigravitySurface(record.transcript) ? { surface: antigravitySurface(record.transcript) } : {}),
   };
   const debug = appendCodexBridgeMarker(
     agent === "codex" ? dbg ?? formatPlanPickerDebug({ event: "done", classifier: "done", marker: "0", by: "wd" }) : undefined,
@@ -373,6 +379,9 @@ export async function buildNeedsAttentionEnvelope(
     ...(typeof record.folderKey === "string" && record.folderKey.length > 0 ? { folderKey: record.folderKey } : {}),
     ...(branch ? { branch } : {}),
     ...sidField(sessionId),
+    // Antigravity's append-last `surface` (hook.ts extraFields): without it the phone cannot tell a
+    // watchdog-settled idle `agy` CLI row is resumable. Only an Antigravity transcript path yields one.
+    ...(antigravitySurface(record.transcript) ? { surface: antigravitySurface(record.transcript) } : {}),
   };
   const debug = appendCodexBridgeMarker(
     agent === "codex" ? dbg ?? formatPlanPickerDebug({ event: "attention", classifier: "pending", marker: "0", by: "wd" }) : undefined,
@@ -410,6 +419,9 @@ export async function buildWorkingEnvelope(
     ...(typeof record.folderKey === "string" && record.folderKey.length > 0 ? { folderKey: record.folderKey } : {}),
     ...(branch ? { branch } : {}),
     ...sidField(sessionId),
+    // Antigravity's append-last `surface` (hook.ts extraFields): without it the phone cannot tell a
+    // watchdog-settled idle `agy` CLI row is resumable. Only an Antigravity transcript path yields one.
+    ...(antigravitySurface(record.transcript) ? { surface: antigravitySurface(record.transcript) } : {}),
   };
   const debug = appendCodexBridgeMarker(
     agent === "codex" ? dbg ?? formatPlanPickerDebug({ event: "working", classifier: "resolved", marker: "0", by: "wd" }) : undefined,
@@ -2472,8 +2484,8 @@ export const ANTIGRAVITY_SETTLE_GRACE_MS = 10_000;
  *  the conversation as CASCADE_RUN_STATUS_IDLE. True iff the row is a working antigravity row, quiet for
  *  ANTIGRAVITY_SETTLE_GRACE_MS, and the database says IDLE with a `last_modified_time` AT OR AFTER the
  *  row's last event — an IDLE written before the current turn opened (the previous turn's) never
- *  counts, and an unparseable time never counts either (the 30-min reap remains). A dead OWNER needs
- *  no help here: classifySession already ends that row on the next sweep. */
+ *  counts, and an unparseable time never counts either (the 30-min reap remains). A dead `agy` CLI
+ *  OWNER is antigravityOwnerGone's case. */
 export function antigravityRunSettled(
   sessionId: string, record: SessionRecord, now: number, probe: typeof antigravityRunStatus = antigravityRunStatus,
 ): boolean {
@@ -2482,6 +2494,13 @@ export function antigravityRunSettled(
   if (typeof record.ts !== "number" || now - record.ts < ANTIGRAVITY_SETTLE_GRACE_MS) return false;
   const run = probe(sessionId, typeof record.transcript === "string" && record.transcript ? record.transcript : undefined);
   return run?.status === "CASCADE_RUN_STATUS_IDLE" && typeof run.lastModifiedMs === "number" && run.lastModifiedMs >= record.ts;
+}
+
+/** Has a non-done `agy` CLI row lost its owner? classifySession keeps such a row (see there), so the
+ *  idle reap settles it done at once — the same done a Stop would have left. */
+export function antigravityOwnerGone(record: SessionRecord, alive: (pid: number) => boolean = pidAlive): boolean {
+  return recordAgent(record) === "antigravity" && !isDoneState(record) &&
+    antigravitySurface(record.transcript) === "cli" && typeof record.pid === "number" && !alive(record.pid);
 }
 
 /** Shared clock/transcript half of idle reaping. Agent ownership stays outside: Claude's process is
@@ -2611,7 +2630,7 @@ export async function correctIdleClaude(
       record = { ...record, tuiPid };
     } else if (agent === "antigravity") {
       // The 30-min clock stays the last resort; Antigravity's own IDLE run status settles it sooner.
-      if (!isClaudeIdleReapEligible(record, now) &&
+      if (!isClaudeIdleReapEligible(record, now) && !antigravityOwnerGone(record, deps.pidAlive) &&
           !antigravityRunSettled(sessionId, record, now, deps.antigravityRunStatus)) return "uncorrected";
     } else if (!isClaudeIdleReapEligible(record, now)) {
       return "uncorrected";
@@ -2648,7 +2667,8 @@ export async function correctIdleClaude(
     // a finite number by isClaudeIdleReapEligible. (envelope `ts` stays now so the worker accepts the frame.)
     if (!(await unmoved())) return "uncorrected"; // a hook landed since the sweep read it → not ours to finish
     const doneNow = clock();
-    const outcome = await post(await buildDoneEnvelope(sessionId, record, doneNow, config.e2eKey, agent, Math.floor(record.ts / 1000)));
+    const envelope = await buildDoneEnvelope(sessionId, record, doneNow, config.e2eKey, agent, Math.floor(record.ts / 1000)) as { blob: string };
+    const outcome = await post(envelope);
     if (outcome === "revoked") return "revoked"; // pairing gone → bubble up so the loop can tear down
     // A hook landed DURING the POST: write nothing over it. If the done was delivered the worker may
     // briefly show it, and the session's very next hook re-raises working — the hook's record is the truth.
@@ -2658,7 +2678,10 @@ export async function correctIdleClaude(
       // re-arm "working", and the next real hook re-arms from a done exactly as the interrupt net's rewrite does.
       // `awaitingPrompt` is spent with the reap it triggered (here and in the capped pin above): a done row
       // must not keep claiming a prompt is owed. A later SessionStart sets it afresh.
-      try { await writeRecord(path, { ...record, lastEvent: "done", sentDone: true, op: "done", doneAttempts: undefined, awaitingPrompt: undefined }); } catch {
+      // An Antigravity row keeps the done blob: publishReplyReceipts re-sends the record's blob, and the
+      // old one still says working.
+      const blob = agent === "antigravity" ? { blob: envelope.blob } : {};
+      try { await writeRecord(path, { ...record, ...blob, lastEvent: "done", sentDone: true, op: "done", doneAttempts: undefined, awaitingPrompt: undefined }); } catch {
         // Rewrite failed — worst case the net re-POSTs a done next sweep, which the worker drops.
       }
       clearDoneAttempts(sessionId);
