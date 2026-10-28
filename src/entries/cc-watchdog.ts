@@ -34,8 +34,12 @@ import { closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, 
 import { homedir, hostname } from "node:os";
 import { basename } from "node:path";
 import { Bytes, decryptBlob, encryptBlob } from "../core/crypto";
-import { adapterFor, AgentAdapter, allAdapters, codexAdapter, codexTurnActiveFromTail, CodexPlanPickerEvidence, DiscoveredSession } from "../core/adapter";
-import type { LocateTuiReason } from "../core/adapter";
+import {
+  antigravitySurface, handleReplyCommand, nudgedRecently, readReceipts, ReplyCommandDeps, ReplyCommandResult, sweepStrandedReplies,
+} from "../core/antigravity-inbox";
+import { adapterFor, AgentAdapter, allAdapters, antigravityRunStatus, codexAdapter, codexTurnActiveFromTail, CodexPlanPickerEvidence, DiscoveredSession } from "../core/adapter";
+import type { AntigravityRunState, LocateTuiReason } from "../core/adapter";
+import { antigravityStopRequested } from "../core/antigravity";
 import { focusTerminalForPid } from "../core/terminal-focus";
 import type { FocusContext, FocusResult } from "../core/terminal-focus";
 import { CodexRemoteInputBridge } from "../core/codex-remote-input-bridge";
@@ -221,6 +225,12 @@ export function classifySession(record: SessionRecord | null, now: number, isAli
     return isAlive(record.tuiPid) ? "keep" : "delete";
   }
   if (now - record.ts > SESSION_STALE_MS) return "stale"; // abandoned (24 h): POST a terminal end, then delete
+  // An `agy` CLI conversation outlives its process: a phone reply resumes it headless
+  // (core/antigravity-inbox.ts). Kept as a done row until the idle-done RETIRE net retires it. A row
+  // whose agy died mid-turn (a headless auto-deny exits with no Stop) is kept TOO — the idle reap
+  // settles it done (antigravityOwnerGone) — never ended: an op:end deletes the record, and with it
+  // every message queued for the conversation (sweepStrandedReplies needs the record to resume).
+  if (record.agent === "antigravity" && antigravitySurface(record.transcript) === "cli") return "keep";
   // A precision-correlated Codex TUI owns the session. Its app-server pid can live for the lifetime of
   // the app and is no evidence that this particular terminal still exists.
   const ownerPid = record.agent === "codex" && typeof record.tuiPid === "number" && Number.isFinite(record.tuiPid)
@@ -316,6 +326,9 @@ export async function buildDoneEnvelope(sessionId: string, record: SessionRecord
     ...(typeof record.folderKey === "string" && record.folderKey.length > 0 ? { folderKey: record.folderKey } : {}),
     ...(branch ? { branch } : {}),
     ...sidField(sessionId),
+    // Antigravity's append-last `surface` (hook.ts extraFields): without it the phone cannot tell a
+    // watchdog-settled idle `agy` CLI row is resumable. Only an Antigravity transcript path yields one.
+    ...(antigravitySurface(record.transcript) ? { surface: antigravitySurface(record.transcript) } : {}),
   };
   const debug = appendCodexBridgeMarker(
     agent === "codex" ? dbg ?? formatPlanPickerDebug({ event: "done", classifier: "done", marker: "0", by: "wd" }) : undefined,
@@ -370,6 +383,9 @@ export async function buildNeedsAttentionEnvelope(
     ...(typeof record.folderKey === "string" && record.folderKey.length > 0 ? { folderKey: record.folderKey } : {}),
     ...(branch ? { branch } : {}),
     ...sidField(sessionId),
+    // Antigravity's append-last `surface` (hook.ts extraFields): without it the phone cannot tell a
+    // watchdog-settled idle `agy` CLI row is resumable. Only an Antigravity transcript path yields one.
+    ...(antigravitySurface(record.transcript) ? { surface: antigravitySurface(record.transcript) } : {}),
   };
   const debug = appendCodexBridgeMarker(
     agent === "codex" ? dbg ?? formatPlanPickerDebug({ event: "attention", classifier: "pending", marker: "0", by: "wd" }) : undefined,
@@ -407,6 +423,9 @@ export async function buildWorkingEnvelope(
     ...(typeof record.folderKey === "string" && record.folderKey.length > 0 ? { folderKey: record.folderKey } : {}),
     ...(branch ? { branch } : {}),
     ...sidField(sessionId),
+    // Antigravity's append-last `surface` (hook.ts extraFields): without it the phone cannot tell a
+    // watchdog-settled idle `agy` CLI row is resumable. Only an Antigravity transcript path yields one.
+    ...(antigravitySurface(record.transcript) ? { surface: antigravitySurface(record.transcript) } : {}),
   };
   const debug = appendCodexBridgeMarker(
     agent === "codex" ? dbg ?? formatPlanPickerDebug({ event: "working", classifier: "resolved", marker: "0", by: "wd" }) : undefined,
@@ -1119,6 +1138,10 @@ export interface CommandPayload {
   /** Per-command random string; the replay bound (a compromised worker can re-deliver an old blob
    *  under a fresh id, so the id set alone cannot stop replay). */
   nonce: string;
+  /** send-message / cancel-message only: the phone's message id. Validated by handleReplyCommand. */
+  mid?: unknown;
+  /** send-message only: the message. Validated by handleReplyCommand. */
+  text?: unknown;
 }
 
 /** The kinds this plugin will act on. The allow-list lives HERE, not on the worker, because the
@@ -1131,7 +1154,11 @@ export const BRING_BACK_COMMAND_KIND = "bring-back";
 /** NOM-94: run `/nomo-cc:handoff` for a Claude Code session on this Mac, from the phone. No user text:
  *  the payload is the usual {kind, sessionId, ts, nonce} (parseCommandPayload drops anything else). */
 export const MOVE_TO_CLOUD_COMMAND_KIND = "move-to-cloud";
-const COMMAND_KINDS_ALLOWED = new Set(["focus-terminal", INTERRUPT_COMMAND_KIND, PING_COMMAND_KIND, BRING_BACK_COMMAND_KIND, MOVE_TO_CLOUD_COMMAND_KIND]);
+/** Phone replies to an Antigravity session (core/antigravity-inbox.ts): `mid` + `text` ride sealed too. */
+const REPLY_COMMAND_KINDS = new Set(["send-message", "cancel-message"]);
+const COMMAND_KINDS_ALLOWED = new Set([
+  "focus-terminal", INTERRUPT_COMMAND_KIND, PING_COMMAND_KIND, BRING_BACK_COMMAND_KIND, MOVE_TO_CLOUD_COMMAND_KIND, ...REPLY_COMMAND_KINDS,
+]);
 
 /** A "Delivery" latency ping: {"kind":"ping","sessionId":"-","nonce":"<uuid>","sentAt":<ms>}. It names
  *  no session and carries `sentAt` instead of `ts`, so drainCommands answers it right after the tag
@@ -1227,7 +1254,12 @@ export function parseCommandPayload(plain: unknown): CommandPayload | undefined 
   if (typeof p.sessionId !== "string" || p.sessionId.length === 0) return undefined;
   if (typeof p.ts !== "number" || !Number.isFinite(p.ts)) return undefined;
   if (typeof p.nonce !== "string" || p.nonce.length === 0) return undefined;
-  return { kind: p.kind, sessionId: p.sessionId, ts: p.ts, nonce: p.nonce };
+  // Only a reply carries `mid` + `text`; every other kind keeps the bare shape (NOM-94: no user text).
+  if (!REPLY_COMMAND_KINDS.has(p.kind)) return { kind: p.kind, sessionId: p.sessionId, ts: p.ts, nonce: p.nonce };
+  return {
+    kind: p.kind, sessionId: p.sessionId, ts: p.ts, nonce: p.nonce,
+    ...(p.mid !== undefined ? { mid: p.mid } : {}), ...(p.text !== undefined ? { text: p.text } : {}),
+  };
 }
 
 /** Is this authenticated command still live? False when the tap is older than the queue TTL (stale
@@ -1288,7 +1320,8 @@ export type FocusTraceResult =
   | "move-refused"       // move-to-cloud: parked, already in the cloud, no cwd, or not a Claude Code session
   | "move-running"       // move-to-cloud: a phone-started preflight for this session is still running
   | "move-started"       // move-to-cloud: handoff --later --phone spawned
-  | "move-spawn-failed"; // move-to-cloud: the spawn threw (the row reports cloud:"move-failed")
+  | "move-spawn-failed"  // move-to-cloud: the spawn threw (the row reports cloud:"move-failed")
+  | ReplyCommandResult;  // send-message / cancel-message (see core/antigravity-inbox.ts)
 
 /** The module's generic best-effort trace, with the same argv guard tracePicker uses: pure unit calls run
  *  inside `bun test` with the production HOME visible and must never pollute the user's live trace. Named
@@ -1334,6 +1367,12 @@ export interface DrainCommandsDeps {
   interruptCodexTurnFn?: (threadId: string, turnId: string) => Promise<CodexTurnInterruptResult>;
   /** POST a sealed pong body to /v1/cc/pong. Defaults to the real fetch. */
   postPongFn?: (config: Config, blob: string) => Promise<number | "failed">;
+  /** Where Antigravity reply queues/receipts live. Test defaults never touch the real sessions dir. */
+  replySessionsDir?: string;
+  /** Overrides for the reply handler (tests: pid liveness, the resume spawn). */
+  replyDeps?: Partial<ReplyCommandDeps>;
+  /** Tell the phone about a session's new reply receipts. Defaults to resealing + posting its blob. */
+  publishRepliesFn?: (sessionId: string, dir: string) => Promise<void>;
   now?: () => number;
   trace?: (event: object) => void;
 }
@@ -1395,7 +1434,7 @@ async function interruptSession(
   if (isDoneState(record)) return "not-running";
   if (adapter.interrupt === "hook-flag") {
     const write = deps.writeInterruptFlagFn ?? (
-      lanRunningUnderTest() ? async () => {} : (id: string, at: number) => writeInterruptFlagAt(SESSIONS_DIR, id, at)
+      lanRunningUnderTest() ? async () => {} : (id: string, at: number) => writeInterruptFlagAt(SESSIONS_DIR, id, at, adapter.interruptFlagSuffix)
     );
     await write(sessionId, now);
     return "interrupt-flagged";
@@ -1414,6 +1453,50 @@ async function interruptSession(
     return result === "sent" ? "interrupt-sent" : result === "unavailable" ? "bridge-unavailable" : "interrupt-failed";
   }
   return "unsupported";
+}
+
+/** Reseal a session's stored blob with its current reply receipts (the append-last `replies` key the
+ *  phone's reply bubbles read), store it on the record (so heartbeats and the LAN feed carry it too) and
+ *  post it. Best-effort: the next hook frame carries the receipts anyway. A hook that rewrote the record
+ *  meanwhile wins: its frame already carries the receipts, and this must not clobber it with an older
+ *  blob. (Not a lock — the window left is the one write call; the next hook frame repairs it.)
+ *
+ *  WHILE A PHONE APPROVAL IS HELD (NOM-96 field bug, session db13d6f8): both LAN feeds serve the `.hold`
+ *  marker's decisionPending card VERBATIM, not the record's blob, so receipts written only to the record
+ *  never reached the phone (bubble stuck on "Sending…"). The card itself is resealed with `replies`
+ *  instead — status stays decisionPending. And NOTHING is posted to the worker: the record's frame is a
+ *  prio:0 `working` one, which the worker treats as "left the decision" and serves over the held card,
+ *  i.e. it would cost the purple hand. A worker-only phone sees the receipts at the hold's next frame. */
+export async function publishReplyReceipts(
+  config: Config, sessionId: string, dir: string,
+  deps: { post?: typeof postEvent; receipts?: typeof readReceipts; now?: () => number } = {},
+): Promise<void> {
+  const path = `${dir}/${sessionId}.json`;
+  const record = await readRecordAt(path);
+  const replies = await (deps.receipts ?? readReceipts)(dir, sessionId);
+  const hold = await readDecisionHoldAt(dir, sessionId);
+  const held = !!hold && stateHoldLive(hold, typeof hold.pid === "number" && pidAlive(hold.pid), (deps.now ?? Date.now)());
+  if (held) {
+    try {
+      const card = await decryptBlob(config.e2eKey, hold!.blob) as Record<string, unknown>;
+      const blob = await encryptBlob(config.e2eKey, { ...card, replies });
+      // The holder may have released (or re-stamped) the marker meanwhile — never resurrect or clobber it.
+      const latest = await readDecisionHoldAt(dir, sessionId);
+      if (latest && latest.blob === hold!.blob && latest.at === hold!.at && latest.pid === hold!.pid) {
+        await atomicWrite(`${dir}/${decisionHoldFileName(sessionId)}`, JSON.stringify({ ...latest, blob }), 0o600);
+      }
+    } catch { /* best-effort: the hold's next frame carries the receipts */ }
+  }
+  if (!record || typeof record.blob !== "string" || record.blob.length === 0) return;
+  const plain = await decryptBlob(config.e2eKey, record.blob) as Record<string, unknown>;
+  const blob = await encryptBlob(config.e2eKey, { ...plain, replies });
+  const latest = await readRecordAt(path);
+  if (!latest || latest.ts !== record.ts || latest.blob !== record.blob) return;
+  const next = { ...record, blob };
+  await atomicWrite(path, JSON.stringify(next), 0o600);
+  if (held) return;
+  const envelope = buildHeartbeatEnvelope(sessionId, next, Date.now(), config.pairingId);
+  if (envelope) await (deps.post ?? postEvent)(config, envelope);
 }
 
 /** Decrypt, VALIDATE, then execute every buffered command; returns how many actually focused
@@ -1551,8 +1634,9 @@ export async function drainCommands(config: Config, deps: DrainCommandsDeps = {}
           traceFocus(deps, { ...base, result: moveToCloud(payload.sessionId, entry.rec, deps.moveToCloud) });
           continue;
         }
-        // 8. Two taps for the same target in one batch raise the window once.
-        const target = `${payload.kind}|${payload.sessionId}`;
+        // 8. Two taps for the same target in one batch raise the window once. (Two different MESSAGES
+        // to one session are two targets.)
+        const target = `${payload.kind}|${payload.sessionId}${REPLY_COMMAND_KINDS.has(payload.kind) ? `|${String(payload.mid)}` : ""}`;
         if (batchTargets.has(target)) {
           traceFocus(deps, { ...base, result: "duplicate" as FocusTraceResult, why: "batch" });
           continue;
@@ -1566,6 +1650,23 @@ export async function drainCommands(config: Config, deps: DrainCommandsDeps = {}
         if (payload.kind === INTERRUPT_COMMAND_KIND) {
           const result = await interruptSession(adapter, payload.sessionId, entry.rec, now, deps);
           traceFocus(deps, { ...base, agent, result });
+          continue;
+        }
+        if (REPLY_COMMAND_KINDS.has(payload.kind)) {
+          const dir = deps.replySessionsDir ?? (lanRunningUnderTest() ? undefined : SESSIONS_DIR);
+          if (agent !== "antigravity" || !dir) {
+            traceFocus(deps, { ...base, agent, result: "unsupported" as FocusTraceResult });
+            continue;
+          }
+          const result = await handleReplyCommand(
+            payload.kind as "send-message" | "cancel-message", payload.sessionId, entry.rec,
+            payload, { sessionsDir: dir, now, ...deps.replyDeps },
+          );
+          // Every outcome but a malformed one changed (or re-confirms) a receipt the phone waits on.
+          if (result !== "malformed") {
+            await (deps.publishRepliesFn ?? ((id: string, d: string) => publishReplyReceipts(config, id, d)))(payload.sessionId, dir).catch(() => {});
+          }
+          traceFocus(deps, { ...base, agent, result, mid: payload.mid });
           continue;
         }
         if (!adapter.locateTuiPid) {
@@ -2861,12 +2962,97 @@ export function isClaudeIdleReapEligible(
   // Cursor joins Claude here, and ONLY here: like Claude its hooks are its sole signal (no discovery,
   // no notify, no resident plugin), so a dropped `stop` — or a row whose owner pid could not be found
   // (CURSOR_UNKNOWN_OWNER_PID) — has nothing else to finish it. It never sets `awaitingPrompt`, so it
-  // only ever gets the 30-min clock.
+  // only ever gets the 30-min clock. Antigravity joins for the same reason, and because its turns can
+  // end with NO event (PostInvocation/Stop are skipped on a user interrupt): this clock, with the
+  // transcript-mtime veto below, is what settles such a row.
   const agent = recordAgent(record);
-  if (agent !== "claude" && agent !== "cursor") return false;
+  if (agent !== "claude" && agent !== "cursor" && agent !== "antigravity") return false;
   if (record.provisional === true) return false;
   return idleReapAgeEligible(record, now, transcriptMtimeMs,
     record.awaitingPrompt === true ? CLAUDE_AWAITING_PROMPT_REAP_MS : CLAUDE_IDLE_REAP_MS);
+}
+
+/** How long a working Antigravity row must be hook-quiet before its database status may settle it —
+ *  room for the turn's own Stop (which Antigravity writes alongside the IDLE status) to land first. */
+export const ANTIGRAVITY_SETTLE_GRACE_MS = 10_000;
+
+/** Has an Antigravity turn ended WITHOUT an event? A user interrupt / app Stop skips PostInvocation and
+ *  Stop, and a headless auto-deny exits with neither (verified 2026-10, agy 1.4.8) — but Antigravity still
+ *  records the conversation as CASCADE_RUN_STATUS_IDLE. True iff ALL of:
+ *   - a working antigravity row, hook-quiet for ANTIGRAVITY_SETTLE_GRACE_MS;
+ *   - the database says IDLE and NOT `not_fully_idle` — while Antigravity waits on its OWN permission
+ *     prompt it says RUNNING + not_fully_idle=1 (verified on real agy 1.4.9, NOM-96), so that wait never
+ *     reads as idle;
+ *   - the database state was confirmed current AFTER the row's last event (`readAt` > record.ts): a copy
+ *     taken before a newer hook can never settle that hook's state;
+ *   - the IDLE is THIS turn's: `last_user_input_time` (when known) is this turn's prompt, and either
+ *     `last_modified_time` is at/after the row's last event or that prompt is (a Stop flips the status
+ *     WITHOUT bumping last_modified_time, which stays ~0.6 s BEFORE the PreInvocation stamp — field case
+ *     01e48c30). A previous turn's IDLE never counts; an unparseable time never counts (the 30-min reap
+ *     remains). A dead `agy` CLI OWNER is antigravityOwnerGone's case. */
+export function antigravityRunSettled(
+  sessionId: string, record: SessionRecord, now: number,
+  probe: (sessionId: string, transcriptPath?: string) => AntigravityRunState | undefined = antigravityRunStatus,
+): boolean {
+  if (recordAgent(record) !== "antigravity") return false;
+  if (record.lastEvent !== "working" && record.lastEvent !== "sessionStart") return false;
+  if (typeof record.ts !== "number" || now - record.ts < ANTIGRAVITY_SETTLE_GRACE_MS) return false;
+  const run = probe(sessionId, typeof record.transcript === "string" && record.transcript ? record.transcript : undefined);
+  if (run?.status !== "CASCADE_RUN_STATUS_IDLE" || run.notFullyIdle === true) return false;
+  if (!(run.readAt > record.ts)) return false;
+  const thisTurnInput = typeof run.lastUserInputMs === "number" && typeof record.turnStartedAt === "number" &&
+    run.lastUserInputMs >= record.turnStartedAt * 1000 - ANTIGRAVITY_TURN_INPUT_SLACK_MS;
+  if (typeof run.lastUserInputMs === "number" && typeof record.turnStartedAt === "number" && !thisTurnInput) return false;
+  return (typeof run.lastModifiedMs === "number" && run.lastModifiedMs >= record.ts) || thisTurnInput;
+}
+
+/** How far before the turn's (whole-second) `turnStartedAt` its prompt's `last_user_input_time` may sit. */
+const ANTIGRAVITY_TURN_INPUT_SLACK_MS = 5_000;
+
+/** Is something about to continue this Antigravity turn, so a DB IDLE must not settle it? A phone Stop
+ *  flag is pending (the hook's interrupt path owns that settle — never double-post), a Stop hook just
+ *  answered `continue` for a queued reply (the next invocation is starting), or a resumed run has not
+ *  reached its first step yet (`w` receipts). Never reads the developer's real dir under `bun test`. */
+export async function antigravityTurnContinuing(sessionId: string, now: number, dir: string = SESSIONS_DIR): Promise<boolean> {
+  if (dir === SESSIONS_DIR && lanRunningUnderTest()) return false;
+  try {
+    if (await antigravityStopRequested(dir, sessionId, now)) return true;
+    if (await nudgedRecently(dir, sessionId, now)) return true;
+    return Object.values(await readReceipts(dir, sessionId)).includes("w");
+  } catch { return true; } // unreadable → not provably idle
+}
+
+/** How often working Antigravity rows get their DB-IDLE settle check between sweeps. A sweep that POSTs
+ *  for several sessions can take a minute (each POST ~2 s), so an app Stop otherwise waited that long. */
+export const ANTIGRAVITY_SETTLE_TICK_MS = 10_000;
+
+/** One settle tick: every working Antigravity row runs the SAME idle reap the sweep runs (every guard
+ *  included). No working row → one readdir and nothing else; the run-status read behind it is one stat
+ *  pair per data dir, plus a temp copy only when the database changed. Returns the active row count. */
+export async function antigravitySettleTick(
+  config: Config, deps: { dir?: string; now?: () => number; reap?: typeof correctIdleClaude } = {},
+): Promise<number> {
+  const dir = deps.dir ?? SESSIONS_DIR;
+  let files: string[] = [];
+  try { files = await readdir(dir); } catch { return 0; }
+  let active = 0;
+  for (const file of files) {
+    if (!file.endsWith(".json")) continue;
+    const path = `${dir}/${file}`;
+    const record = await readRecordAt(path);
+    if (!record || recordAgent(record) !== "antigravity" || isDoneState(record)) continue;
+    if (record.lastEvent !== "working" && record.lastEvent !== "sessionStart") continue;
+    active++;
+    await (deps.reap ?? correctIdleClaude)(config, path, basename(file, ".json"), record, (deps.now ?? Date.now)()).catch(() => "uncorrected");
+  }
+  return active;
+}
+
+/** Has a non-done `agy` CLI row lost its owner? classifySession keeps such a row (see there), so the
+ *  idle reap settles it done at once — the same done a Stop would have left. */
+export function antigravityOwnerGone(record: SessionRecord, alive: (pid: number) => boolean = pidAlive): boolean {
+  return recordAgent(record) === "antigravity" && !isDoneState(record) &&
+    antigravitySurface(record.transcript) === "cli" && typeof record.pid === "number" && !alive(record.pid);
 }
 
 /** Shared clock/transcript half of idle reaping. Agent ownership stays outside: Claude's process is
@@ -2902,6 +3088,10 @@ export interface IdleReapDeps extends DecisionHoldGateDeps {
   locateTuiPid?: (sessionId: string, record: SessionRecord) => Promise<number | undefined>;
   pidAlive?: (pid: number) => boolean;
   codexTurnActive?: (pid: number, transcriptPath: string) => Promise<boolean>;
+  /** Antigravity's recorded run state for a conversation (see antigravityRunSettled). */
+  antigravityRunStatus?: (sessionId: string, transcriptPath?: string) => AntigravityRunState | undefined;
+  /** See antigravityTurnContinuing (tests). */
+  antigravityTurnContinuing?: (sessionId: string, now: number) => Promise<boolean>;
   /** Re-reads the record from disk immediately before the POST and before every write (see the
    *  stale-snapshot guard at the top of this file). Defaults to a real read. */
   readRecord?: (path: string) => Promise<SessionRecord | null>;
@@ -2937,6 +3127,21 @@ export interface IdleReapDeps extends DecisionHoldGateDeps {
  *   - "revoked"     → the POST 404'd: the pairing is gone server-side → the caller tears down. */
 export async function correctIdleClaude(
   config: Config, path: string, sessionId: string, record: SessionRecord, now: number, deps: IdleReapDeps = {},
+): Promise<"corrected" | "pending" | "uncorrected" | "revoked"> {
+  // The sweep and the Antigravity settle tick can reach the same session at once: one reap at a time,
+  // so a done is never POSTed twice.
+  if (idleReapInFlight.has(sessionId)) return "uncorrected";
+  idleReapInFlight.add(sessionId);
+  try {
+    return await correctIdleOnce(config, path, sessionId, record, now, deps);
+  } finally {
+    idleReapInFlight.delete(sessionId);
+  }
+}
+const idleReapInFlight = new Set<string>();
+
+async function correctIdleOnce(
+  config: Config, path: string, sessionId: string, record: SessionRecord, now: number, deps: IdleReapDeps,
 ): Promise<"corrected" | "pending" | "uncorrected" | "revoked"> {
   const post = deps.post ?? ((body: object) => postEvent(config, body));
   const writeRecord = deps.writeRecord
@@ -2992,6 +3197,12 @@ export async function correctIdleClaude(
         return "uncorrected";
       }
       record = { ...record, tuiPid };
+    } else if (agent === "antigravity") {
+      // The 30-min clock stays the last resort; Antigravity's own IDLE run status settles it sooner.
+      if (!isClaudeIdleReapEligible(record, now) && !antigravityOwnerGone(record, deps.pidAlive)) {
+        if (!antigravityRunSettled(sessionId, record, now, deps.antigravityRunStatus)) return "uncorrected";
+        if (await (deps.antigravityTurnContinuing ?? antigravityTurnContinuing)(sessionId, now)) return "uncorrected";
+      }
     } else if (!isClaudeIdleReapEligible(record, now)) {
       return "uncorrected";
     }
@@ -3027,7 +3238,8 @@ export async function correctIdleClaude(
     // a finite number by isClaudeIdleReapEligible. (envelope `ts` stays now so the worker accepts the frame.)
     if (!(await unmoved())) return "uncorrected"; // a hook landed since the sweep read it → not ours to finish
     const doneNow = clock();
-    const outcome = await post(await buildDoneEnvelope(sessionId, record, doneNow, config.e2eKey, agent, Math.floor(record.ts / 1000)));
+    const envelope = await buildDoneEnvelope(sessionId, record, doneNow, config.e2eKey, agent, Math.floor(record.ts / 1000)) as { blob: string };
+    const outcome = await post(envelope);
     if (outcome === "revoked") return "revoked"; // pairing gone → bubble up so the loop can tear down
     // A hook landed DURING the POST: write nothing over it. If the done was delivered the worker may
     // briefly show it, and the session's very next hook re-raises working — the hook's record is the truth.
@@ -3037,7 +3249,10 @@ export async function correctIdleClaude(
       // re-arm "working", and the next real hook re-arms from a done exactly as the interrupt net's rewrite does.
       // `awaitingPrompt` is spent with the reap it triggered (here and in the capped pin above): a done row
       // must not keep claiming a prompt is owed. A later SessionStart sets it afresh.
-      try { await writeRecord(path, { ...record, lastEvent: "done", sentDone: true, op: "done", doneAttempts: undefined, awaitingPrompt: undefined }); } catch {
+      // An Antigravity row keeps the done blob: publishReplyReceipts re-sends the record's blob, and the
+      // old one still says working.
+      const blob = agent === "antigravity" ? { blob: envelope.blob } : {};
+      try { await writeRecord(path, { ...record, ...blob, lastEvent: "done", sentDone: true, op: "done", doneAttempts: undefined, awaitingPrompt: undefined }); } catch {
         // Rewrite failed — worst case the net re-POSTs a done next sweep, which the worker drops.
       }
       clearDoneAttempts(sessionId);
@@ -3945,6 +4160,18 @@ async function sweep(config: Config | null, deps: SweepDeps = {}): Promise<Sweep
       remaining++;
       continue;
     }
+    if (verdict === "keep" && record?.agent === "antigravity" && !lanRunningUnderTest()) {
+      // A phone reply stranded behind an agy that has since exited is resumed (core/antigravity-inbox).
+      const stranded = await sweepStrandedReplies(SESSIONS_DIR, sessionId, record);
+      if (stranded.resumed) traceFocus({}, { event: "reply", sessionId, agent: "antigravity", result: "resumed-stranded" });
+      if (stranded.refused.length > 0) {
+        traceFocus({}, { event: "reply", sessionId, agent: "antigravity", result: "resume-died", reason: "agy exited before its first step", mids: stranded.refused });
+      }
+      // `w` (waking: no Cancel) or `x` must reach the phone now, not at the resumed run's first hook.
+      if (config && (stranded.resumed || stranded.refused.length > 0)) {
+        await publishReplyReceipts(config, sessionId, SESSIONS_DIR).catch(() => {});
+      }
+    }
     if (verdict === "keep") {
       const park = record ? readPark(sessionId) : undefined;
       if (record && wantsCommands(record, park, box ??= boxPairedCached())) active++;
@@ -4678,6 +4905,16 @@ async function run(): Promise<void> {
     stopLan();
   };
   activeLanShutdown = stopLan;
+  // The Antigravity settle tick, between sweeps (see ANTIGRAVITY_SETTLE_TICK_MS). Skips a tick while the
+  // previous one is still running; it owns no other agent's cadence.
+  let tickConfig: Config | null = null;
+  let ticking = false;
+  const settleTimer = setInterval(() => {
+    if (ticking || !tickConfig) return;
+    ticking = true;
+    void antigravitySettleTick(tickConfig).catch(() => 0).finally(() => { ticking = false; });
+  }, ANTIGRAVITY_SETTLE_TICK_MS);
+  (settleTimer as unknown as { unref?: () => void }).unref?.();
   try {
     while (true) {
       // A claim can be stolen or removed after startup (upgrade takeover, reset, racing spawn). An
@@ -4685,6 +4922,7 @@ async function run(): Promise<void> {
       // socket, which a successor needs to re-bind — for another tick.
       if (!enforceWatchdogOwnership(shutdown)) return;
       const config = await loadConfig(); // reload each cycle: a mid-pairing config may complete under us
+      tickConfig = config;
       // A real Codex request_user_input response must return on the SAME shared app-server process, so
       // the bridge attaches through `codex app-server proxy` — but ONLY while that control socket exists
       // (re-probed every cycle) and never on the sweep's own await path. Fail-open in both directions: no
@@ -4781,6 +5019,7 @@ async function run(): Promise<void> {
       await new Promise((r) => setTimeout(r, POLL_MS));
     }
   } finally {
+    clearInterval(settleTimer);
     shutdown(); // bridge child AND the LAN socket — a retired daemon must leave no listener behind
     activeBridgeShutdown = undefined;
     activeCodexInterrupt = undefined;

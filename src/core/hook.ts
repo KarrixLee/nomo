@@ -452,6 +452,9 @@ export async function buildEnvelope(
   /** APPEND-LAST. Threaded straight through to buildBlob's own append-last `detailOverride` — see
    *  there. Undefined for every Claude/Codex caller. */
   detailOverride?: string,
+  /** APPEND-LAST. Keys sealed AFTER every buildBlob key (Antigravity's `surface` and reply receipts
+   *  `replies`). Undefined for every other caller, whose blobs stay byte-identical. */
+  extraFields?: Record<string, unknown>,
 ): Promise<Record<string, unknown> | null> {
   if (typeof input !== "object" || input === null) return null;
   const i = input as Record<string, unknown>;
@@ -468,7 +471,7 @@ export async function buildEnvelope(
   // `at` is the real event time (`now`) in epoch SECONDS — the phone's honest sort/age key, frozen here
   // and re-sent verbatim by every watchdog heartbeat so an idle-but-heartbeated session ages out.
   const at = Math.floor(now / 1000);
-  const plaintext = buildBlob(i, machine, title, plan, agent, turnStartedAt, pinnedFolder, model, at, proposedPlan, dbg, detailOverride);
+  const plaintext = { ...buildBlob(i, machine, title, plan, agent, turnStartedAt, pinnedFolder, model, at, proposedPlan, dbg, detailOverride), ...extraFields };
   try { onBlobPlaintext?.(plaintext); } catch { /* a tee must never break an envelope */ }
   const blob = await encryptBlob(e2eKey, plaintext);
   const attentionKind = attentionKindOverride ?? (

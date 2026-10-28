@@ -8,11 +8,11 @@ import { readdir as readdir3, stat as stat4, unlink as unlink3 } from "node:fs/p
 
 // src/core/adapter.ts
 import { execFile as execFile2, execFileSync as execFileSync2 } from "node:child_process";
-import { existsSync as existsSync2 } from "node:fs";
+import { copyFileSync, existsSync as existsSync2, mkdtempSync, rmSync, statSync as statSync2 } from "node:fs";
 import { readdir, readFile as readFile2, stat as stat2 } from "node:fs/promises";
-import { devNull } from "node:os";
+import { devNull, tmpdir } from "node:os";
 import { promisify as promisify2 } from "node:util";
-import { basename as basename2, join as join2 } from "node:path";
+import { basename as basename2, isAbsolute as isAbsolute2, join as join2, resolve as resolve2 } from "node:path";
 
 // src/core/shared.ts
 import { access, chmod, open, readFile, rename, stat, mkdir, unlink, writeFile } from "node:fs/promises";
@@ -140,7 +140,7 @@ function appendCodexBridgeMarker(dbg, down) {
   const next = `${bare} ${CODEX_BRIDGE_DOWN_MARKER}`;
   return Array.from(next).length <= DBG_BLOB_TEXT_MAX_CHARS ? next : bare;
 }
-var CC_DIR = `${process.env.HOME}/.config/cc-status`;
+var CC_DIR = process.env.NOMO_CC_DIR || `${process.env.HOME}/.config/cc-status`;
 var SESSION_TRACE_PATH = `${CC_DIR}/session-trace.log`;
 var SESSION_TRACE_MAX_BYTES = 256 * 1024;
 var sessionTraceRotated = false;
@@ -334,6 +334,10 @@ function cursorHome() {
   return env && env.length > 0 ? env : `${process.env.HOME}/.cursor`;
 }
 var CURSOR_HOOK_MARKER = "cursor-status.mjs";
+function antigravityConfigDir() {
+  return `${process.env.HOME}/.gemini/config`;
+}
+var ANTIGRAVITY_HOOK_MARKER = "antigravity-hook.sh";
 var CODEX_HOOK_MARKER = "codex-status.mjs";
 function codexAppServerSocketPath() {
   return `${codexHome()}/app-server-control/app-server-control.sock`;
@@ -958,12 +962,15 @@ async function clearDecisionHoldAt(sessionsDir, sessionId, pid, beforeUnlink, ho
     return false;
   }
 }
-async function settleDecisionHoldRecordAt(sessionsDir, sessionId, patch) {
+async function settleDecisionHoldRecordAt(sessionsDir, sessionId, patch, heldSince) {
   try {
     const record = await readRecord(sessionId, sessionsDir);
     if (!record)
       return;
-    if (record.op !== "update" || record.prio !== 1)
+    if (record.op !== "update")
+      return;
+    const untouched = heldSince !== undefined && typeof record.ts === "number" && record.ts <= heldSince;
+    if (record.prio !== 1 && !untouched)
       return;
     await atomicWrite(`${sessionsDir}/${sessionId}.json`, JSON.stringify({ ...record, ...patch }), 384);
   } catch {}
@@ -983,27 +990,27 @@ async function clearDecisionHold(sessionId, pid, beforeUnlink, holdId) {
 }
 var INTERRUPT_FLAG_SUFFIX = ".interrupt";
 var INTERRUPT_FLAG_MAX_AGE_MS = 3600000;
-function interruptFlagFileName(sessionId) {
-  return `${sessionId}${INTERRUPT_FLAG_SUFFIX}`;
+function interruptFlagFileName(sessionId, suffix = INTERRUPT_FLAG_SUFFIX) {
+  return `${sessionId}${suffix}`;
 }
-async function writeInterruptFlagAt(sessionsDir, sessionId, now) {
+async function writeInterruptFlagAt(sessionsDir, sessionId, now, suffix = INTERRUPT_FLAG_SUFFIX) {
   try {
-    await atomicWrite(`${sessionsDir}/${interruptFlagFileName(sessionId)}`, JSON.stringify({ at: now }), 384);
+    await atomicWrite(`${sessionsDir}/${interruptFlagFileName(sessionId, suffix)}`, JSON.stringify({ at: now }), 384);
   } catch {}
 }
-async function interruptFlagSetAt(sessionsDir, sessionId, now) {
+async function interruptFlagSetAt(sessionsDir, sessionId, now, maxAgeMs = INTERRUPT_FLAG_MAX_AGE_MS, suffix = INTERRUPT_FLAG_SUFFIX) {
   try {
-    const flag = JSON.parse(await readFile(`${sessionsDir}/${interruptFlagFileName(sessionId)}`, "utf8"));
-    return typeof flag.at === "number" && now - flag.at <= INTERRUPT_FLAG_MAX_AGE_MS;
+    const flag = JSON.parse(await readFile(`${sessionsDir}/${interruptFlagFileName(sessionId, suffix)}`, "utf8"));
+    return typeof flag.at === "number" && now - flag.at <= maxAgeMs;
   } catch {
     return false;
   }
 }
-async function clearInterruptFlagAt(sessionsDir, sessionId) {
-  await unlink(`${sessionsDir}/${interruptFlagFileName(sessionId)}`).catch(() => {});
+async function clearInterruptFlagAt(sessionsDir, sessionId, suffix = INTERRUPT_FLAG_SUFFIX) {
+  await unlink(`${sessionsDir}/${interruptFlagFileName(sessionId, suffix)}`).catch(() => {});
 }
-async function settleDecisionHoldRecord(sessionId, patch) {
-  return settleDecisionHoldRecordAt(SESSIONS_DIR, sessionId, patch);
+async function settleDecisionHoldRecord(sessionId, patch, heldSince) {
+  return settleDecisionHoldRecordAt(SESSIONS_DIR, sessionId, patch, heldSince);
 }
 async function readPrefix(path, maxBytes) {
   const fh = await open(path, "r");
@@ -2896,20 +2903,38 @@ var CURSOR_TITLE_TIMEOUT_MS = 300;
 function cursorChatTitle(sessionId, db = cursorStateDb(), env = process.env) {
   if (!/^[A-Za-z0-9_-]{1,128}$/.test(sessionId))
     return;
+  return sqliteOneTitle(db, "select case when json_type(cast(value as text),'$.name')='text' then json_extract(cast(value as text),'$.name') end" + ` from cursorDiskKV where key='composerData:${sessionId}'`, env);
+}
+function sqliteOneTitle(db, sql, env = process.env, copyFallback = false) {
+  const cleaned = sqliteOne(db, sql, env, copyFallback);
+  return cleaned ? truncateOnWord(cleaned) : undefined;
+}
+function sqliteOne(db, sql, env = process.env, copyFallback = false) {
+  if (!existsSync2(db))
+    return;
   try {
     const bin = process.platform === "darwin" && existsSync2("/usr/bin/sqlite3") ? "/usr/bin/sqlite3" : "sqlite3";
-    const out = execFileSync2(bin, [
-      "-init",
-      devNull,
-      "-batch",
-      "-noheader",
-      "-list",
-      "-readonly",
-      db,
-      "select case when json_type(cast(value as text),'$.name')='text' then json_extract(cast(value as text),'$.name') end" + ` from cursorDiskKV where key='composerData:${sessionId}'`
-    ], { timeout: CURSOR_TITLE_TIMEOUT_MS, encoding: "utf8", maxBuffer: 65536, stdio: ["ignore", "pipe", "ignore"], env });
+    const run = (target, readonly = true) => execFileSync2(bin, ["-init", devNull, "-batch", "-noheader", "-list", ...readonly ? ["-readonly"] : [], target, sql], { timeout: CURSOR_TITLE_TIMEOUT_MS, encoding: "utf8", maxBuffer: 65536, stdio: ["ignore", "pipe", "ignore"], env });
+    let out;
+    try {
+      out = run(db);
+    } catch (e) {
+      if (!copyFallback)
+        throw e;
+      const tmp = mkdtempSync(join2(tmpdir(), "nomo-sql-"));
+      try {
+        for (const ext of ["", "-wal"])
+          if (existsSync2(db + ext))
+            copyFileSync(db + ext, join2(tmp, `c.db${ext}`));
+        out = run(join2(tmp, "c.db"), false);
+      } catch {
+        out = run(`file:${db.split("/").map(encodeURIComponent).join("/")}?immutable=1`);
+      } finally {
+        rmSync(tmp, { recursive: true, force: true });
+      }
+    }
     const cleaned = out.replace(/\s+/g, " ").trim();
-    return cleaned ? truncateOnWord(cleaned) : undefined;
+    return cleaned || undefined;
   } catch {
     return;
   }
@@ -2929,6 +2954,141 @@ var cursorAdapter = {
   },
   toolDetail: {},
   blobAgentFields: { agent: "cursor" }
+};
+function antigravityModel(input) {
+  const v = input.modelName;
+  return typeof v === "string" && v.trim().length > 0 ? v.trim().slice(0, 80) : undefined;
+}
+function antigravityDataDirs() {
+  const home = process.env.HOME ?? "";
+  return [`${home}/.gemini/antigravity`, `${home}/.gemini/antigravity-cli`];
+}
+function antigravityDataDirFor(transcriptPath) {
+  if (!transcriptPath || !isAbsolute2(transcriptPath))
+    return;
+  const normalized = resolve2(transcriptPath);
+  const i = normalized.indexOf("/brain/");
+  const dir = i > 0 ? normalized.slice(0, i) : undefined;
+  return dir !== undefined && antigravityDataDirs().includes(dir) ? dir : undefined;
+}
+var summariesDbs = (transcriptPath) => {
+  const dir = antigravityDataDirFor(transcriptPath);
+  return (dir ? [dir] : antigravityDataDirs()).map((d) => `${d}/conversation_summaries.db`);
+};
+var AG_SQL_SAFE_ID = /^[A-Za-z0-9-]{1,128}$/;
+function antigravityChatTitle(sessionId, transcriptPath, env = process.env) {
+  if (!AG_SQL_SAFE_ID.test(sessionId))
+    return;
+  for (const db of summariesDbs(transcriptPath)) {
+    const t = sqliteOneTitle(db, `select title from conversation_summaries where conversation_id='${sessionId}'`, env, true);
+    if (t)
+      return t;
+  }
+  return;
+}
+var runStateCache = new Map;
+function antigravityRunStates(db, now) {
+  let key;
+  try {
+    const main = statSync2(db);
+    const wal = existsSync2(`${db}-wal`) ? statSync2(`${db}-wal`) : undefined;
+    key = `${main.mtimeMs}:${main.size}|${wal?.mtimeMs ?? "-"}:${wal?.size ?? "-"}`;
+  } catch {
+    return;
+  }
+  const cached = runStateCache.get(db);
+  if (cached && cached.key === key) {
+    cached.readAt = now;
+    return cached;
+  }
+  const tmp = mkdtempSync(join2(tmpdir(), "nomo-agy-"));
+  try {
+    for (const ext of ["", "-wal"])
+      if (existsSync2(db + ext))
+        copyFileSync(db + ext, join2(tmp, `c.db${ext}`));
+    const bin = process.platform === "darwin" && existsSync2("/usr/bin/sqlite3") ? "/usr/bin/sqlite3" : "sqlite3";
+    const ms = (col) => `coalesce(cast((julianday(${col}) - 2440587.5) * 86400000 as integer), '')`;
+    const query = (cols) => execFileSync2(bin, [
+      "-init",
+      devNull,
+      "-batch",
+      "-noheader",
+      "-list",
+      "-separator",
+      "\t",
+      join2(tmp, "c.db"),
+      `select conversation_id, status, ${ms("last_modified_time")}, ${cols} from conversation_summaries`
+    ], { timeout: CURSOR_TITLE_TIMEOUT_MS, encoding: "utf8", maxBuffer: 1048576, stdio: ["ignore", "pipe", "ignore"] });
+    let out;
+    try {
+      out = query(`${ms("last_user_input_time")}, not_fully_idle`);
+    } catch {
+      out = query("'', ''");
+    }
+    const rows = new Map;
+    for (const line of out.split(`
+`)) {
+      const [id, status, mod, input, nfi] = line.split("\t");
+      if (!id)
+        continue;
+      const num = (v) => v ? Number(v) : NaN;
+      rows.set(id, {
+        status: status ?? "",
+        ...Number.isFinite(num(mod)) ? { lastModifiedMs: num(mod) } : {},
+        ...Number.isFinite(num(input)) ? { lastUserInputMs: num(input) } : {},
+        ...nfi === "0" || nfi === "1" ? { notFullyIdle: nfi === "1" } : {}
+      });
+    }
+    const entry = { key, readAt: now, rows };
+    runStateCache.set(db, entry);
+    return entry;
+  } catch {
+    return;
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+}
+function antigravityRunStatus(sessionId, transcriptPath, now = Date.now()) {
+  for (const db of summariesDbs(transcriptPath)) {
+    const snap = antigravityRunStates(db, now);
+    const row = snap?.rows.get(sessionId);
+    if (row)
+      return { ...row, readAt: snap.readAt };
+  }
+  return;
+}
+async function antigravityFirstPrompt(transcriptPath) {
+  if (!antigravityDataDirFor(transcriptPath))
+    return;
+  try {
+    const first = (await readPrefix(transcriptPath, 16384)).split(`
+`, 1)[0] ?? "";
+    const line = JSON.parse(first);
+    if (line.type !== "USER_INPUT" || typeof line.content !== "string")
+      return;
+    const m = /<USER_REQUEST>([\s\S]*?)<\/USER_REQUEST>/.exec(line.content);
+    return displayTitleFromUserText(m ? m[1] : line.content);
+  } catch {
+    return;
+  }
+}
+var antigravityAdapter = {
+  kind: "antigravity",
+  title: async ({ sessionId, transcriptPath }) => antigravityChatTitle(sessionId, transcriptPath) ?? await antigravityFirstPrompt(transcriptPath),
+  model: async ({ input }) => antigravityModel(input),
+  detectInterrupt: () => false,
+  sessionsDir: () => `${process.env.HOME ?? ""}/.gemini/antigravity/conversations`,
+  sessionMatch: () => false,
+  hookStampPath: () => lastHookPath("antigravity"),
+  hooksNotFiringHint: "  run `bunx nomo-ai --antigravity` again, then restart Antigravity so it re-reads ~/.gemini/config/hooks.json",
+  titleRepair: {
+    due: (record, now) => record.lastEvent === "done" && typeof record.ts === "number" && now - record.ts < CURSOR_TITLE_REPAIR_MS,
+    resolve: (sessionId) => antigravityChatTitle(sessionId)
+  },
+  toolDetail: {},
+  blobAgentFields: { agent: "antigravity" },
+  interrupt: "hook-flag",
+  interruptFlagSuffix: ".agy-interrupt"
 };
 function unknownAgentAdapter(kind) {
   return {
@@ -2953,6 +3113,8 @@ function adapterFor(agent) {
       return opencodeAdapter;
     case "cursor":
       return cursorAdapter;
+    case "antigravity":
+      return antigravityAdapter;
     case "claude":
       return claudeAdapter;
     default:
@@ -3110,7 +3272,7 @@ async function repairNotifyWiring(deps = {}) {
 }
 
 // src/core/park.ts
-import { mkdirSync, readFileSync as readFileSync2, renameSync, statSync as statSync2, unlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync as readFileSync2, renameSync, statSync as statSync3, unlinkSync, writeFileSync } from "node:fs";
 import { join as join3 } from "node:path";
 var PARK_DIR = `${CC_DIR}/parked`;
 var UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -3321,7 +3483,7 @@ function writeMoveResult(id, ok, dir = BACK_LOCK_DIR, why) {
 function readMoveWhy(id, since, dir = BACK_LOCK_DIR) {
   try {
     const f = moveResultFile(id, dir);
-    if (statSync2(f).mtimeMs < since)
+    if (statSync3(f).mtimeMs < since)
       return;
     const [state, why] = readFileSync2(f, "utf8").trim().split(/\s+/);
     if (state !== "FAILED")
@@ -3342,7 +3504,7 @@ function writeBackResult(id, r, dir = BACK_LOCK_DIR) {
 function readBackResult(id, since, dir = BACK_LOCK_DIR) {
   try {
     const f = backResultFile(id, dir);
-    if (statSync2(f).mtimeMs < since)
+    if (statSync3(f).mtimeMs < since)
       return;
     const r = readFileSync2(f, "utf8").trim().toLowerCase();
     return r === "done" || r === "failed" || r === "gone" ? r : undefined;
@@ -3353,7 +3515,7 @@ function readBackResult(id, since, dir = BACK_LOCK_DIR) {
 function readMoveResult(id, since, dir = BACK_LOCK_DIR) {
   try {
     const f = moveResultFile(id, dir);
-    if (statSync2(f).mtimeMs < since)
+    if (statSync3(f).mtimeMs < since)
       return;
     return readFileSync2(f, "utf8").startsWith("FAILED") ? "failed" : "done";
   } catch {
@@ -3498,6 +3660,7 @@ function computeSessionState(input) {
   const startedAt = finite(record.sessionStartedAt) ? { startedAt: record.sessionStartedAt } : {};
   const sealed = { kind: "sealed", value: record.blob };
   const asking = record.attentionKind === "userInput" ? { attentionKind: "userInput" } : {};
+  const authored = (value) => ({ kind: "plain", value, ...agent === "antigravity" ? { carry: record.blob } : {} });
   const of = (state, why, blob, at, terminal = false) => ({ state, terminal, ts: at, why, blob, agent, ...startedAt });
   if (correctives?.ended === true)
     return of("ended", "end", sealed, ts, true);
@@ -3514,7 +3677,7 @@ function computeSessionState(input) {
   if (recordDone) {
     const heldBack = opinion?.status === "busy" && opinion.statusUpdatedAt > ts;
     if (!heldBack) {
-      return of("done", opinion?.status === "idle" ? "done+cc" : suffix("done"), { kind: "plain", value: buildStatePlaintext(record, "done", ts, opinion?.name, sessionId) }, ts, false);
+      return of("done", opinion?.status === "idle" ? "done+cc" : suffix("done"), authored(buildStatePlaintext(record, "done", ts, opinion?.name, sessionId)), ts, false);
     }
   }
   if (stateHoldLive(hold, holdPidAlive, now)) {
@@ -3530,14 +3693,14 @@ function computeSessionState(input) {
     };
   }
   if (!recordDone && opinion?.status === "idle" && record.prio !== 1 && record.lastEvent !== "needsAttention" && opinion.statusUpdatedAt > ts + CC_IDLE_DONE_GRACE_MS) {
-    return of("done", "done+cc", { kind: "plain", value: buildStatePlaintext(record, "done", opinion.statusUpdatedAt, opinion.name, sessionId) }, ts, false);
+    return of("done", "done+cc", authored(buildStatePlaintext(record, "done", opinion.statusUpdatedAt, opinion.name, sessionId)), ts, false);
   }
   if (record.prio === 1) {
     const why = finite(record.attentionStalledAt) ? "attn/net" : "attn";
     return { ...of("needsAttention", why, sealed, ts, false), ...asking };
   }
   const busy = opinion?.status === "busy" && opinion.statusUpdatedAt > ts;
-  return of("working", busy ? "work+cc" : suffix("work"), recordDone ? { kind: "plain", value: buildStatePlaintext(record, "working", opinion?.statusUpdatedAt ?? ts, opinion?.name, sessionId) } : sealed, ts, false);
+  return of("working", busy ? "work+cc" : suffix("work"), recordDone ? authored(buildStatePlaintext(record, "working", opinion?.statusUpdatedAt ?? ts, opinion?.name, sessionId)) : sealed, ts, false);
 }
 
 // src/core/hook.ts
@@ -3714,7 +3877,7 @@ function buildBlob(input, machine, title, plan, agent = "claude", turnStartedAt,
   }) : undefined;
   return appendFittedPlanAndDebug(base, proposedPlan, dbg);
 }
-async function buildEnvelope(input, machine, now, title, e2eKey, sentDone, agent = "claude", startedAt, turnStartedAt, pinnedFolder, model, planOverride, attentionKindOverride, proposedPlan, dbg, onBlobPlaintext, detailOverride) {
+async function buildEnvelope(input, machine, now, title, e2eKey, sentDone, agent = "claude", startedAt, turnStartedAt, pinnedFolder, model, planOverride, attentionKindOverride, proposedPlan, dbg, onBlobPlaintext, detailOverride, extraFields) {
   if (typeof input !== "object" || input === null)
     return null;
   const i = input;
@@ -3728,7 +3891,7 @@ async function buildEnvelope(input, machine, now, title, e2eKey, sentDone, agent
   if (typeof startedAt === "number" && Number.isFinite(startedAt))
     base.startedAt = startedAt;
   const at = Math.floor(now / 1000);
-  const plaintext = buildBlob(i, machine, title, plan, agent, turnStartedAt, pinnedFolder, model, at, proposedPlan, dbg, detailOverride);
+  const plaintext = { ...buildBlob(i, machine, title, plan, agent, turnStartedAt, pinnedFolder, model, at, proposedPlan, dbg, detailOverride), ...extraFields };
   try {
     onBlobPlaintext?.(plaintext);
   } catch {}

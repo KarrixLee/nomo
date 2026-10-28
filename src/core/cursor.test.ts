@@ -762,6 +762,15 @@ describe("Cursor's own chat title", () => {
     expect(cursorChatTitle(CONV, missing)).toBeUndefined();
   });
 
+  test("a read-only failure is just undefined — the big state.vscdb is never copied to retry", async () => {
+    const db = await fixtureDb({ [CONV]: JSON.stringify({ name: "Flaky retry test fix" }) });
+    execFileSync("sqlite3", [db, "pragma journal_mode=wal;"]);
+    await rm(`${db}-shm`, { force: true });
+    await rm(`${db}-wal`, { force: true });
+    expect(() => execFileSync("sqlite3", ["-readonly", db, "select 1"], { stdio: "pipe" })).toThrow(); // the precondition
+    expect(cursorChatTitle(CONV, db)).toBeUndefined(); // Antigravity's copy fallback would have read it
+  });
+
   test("the hook: never looked up on a prompt; a keep-alive and the stop carry it; a later prompt keeps it", async () => {
     const h = await harness();
     const asked: string[] = [];

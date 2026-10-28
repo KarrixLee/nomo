@@ -132,7 +132,7 @@ function appendCodexBridgeMarker(dbg, down) {
   const next = `${bare} ${CODEX_BRIDGE_DOWN_MARKER}`;
   return Array.from(next).length <= DBG_BLOB_TEXT_MAX_CHARS ? next : bare;
 }
-var CC_DIR = `${process.env.HOME}/.config/cc-status`;
+var CC_DIR = process.env.NOMO_CC_DIR || `${process.env.HOME}/.config/cc-status`;
 var SESSION_TRACE_PATH = `${CC_DIR}/session-trace.log`;
 var SESSION_TRACE_MAX_BYTES = 256 * 1024;
 var sessionTraceRotated = false;
@@ -326,6 +326,10 @@ function cursorHome() {
   return env && env.length > 0 ? env : `${process.env.HOME}/.cursor`;
 }
 var CURSOR_HOOK_MARKER = "cursor-status.mjs";
+function antigravityConfigDir() {
+  return `${process.env.HOME}/.gemini/config`;
+}
+var ANTIGRAVITY_HOOK_MARKER = "antigravity-hook.sh";
 var CODEX_HOOK_MARKER = "codex-status.mjs";
 function codexAppServerSocketPath() {
   return `${codexHome()}/app-server-control/app-server-control.sock`;
@@ -950,12 +954,15 @@ async function clearDecisionHoldAt(sessionsDir, sessionId, pid, beforeUnlink, ho
     return false;
   }
 }
-async function settleDecisionHoldRecordAt(sessionsDir, sessionId, patch) {
+async function settleDecisionHoldRecordAt(sessionsDir, sessionId, patch, heldSince) {
   try {
     const record = await readRecord(sessionId, sessionsDir);
     if (!record)
       return;
-    if (record.op !== "update" || record.prio !== 1)
+    if (record.op !== "update")
+      return;
+    const untouched = heldSince !== undefined && typeof record.ts === "number" && record.ts <= heldSince;
+    if (record.prio !== 1 && !untouched)
       return;
     await atomicWrite(`${sessionsDir}/${sessionId}.json`, JSON.stringify({ ...record, ...patch }), 384);
   } catch {}
@@ -975,27 +982,27 @@ async function clearDecisionHold(sessionId, pid, beforeUnlink, holdId) {
 }
 var INTERRUPT_FLAG_SUFFIX = ".interrupt";
 var INTERRUPT_FLAG_MAX_AGE_MS = 3600000;
-function interruptFlagFileName(sessionId) {
-  return `${sessionId}${INTERRUPT_FLAG_SUFFIX}`;
+function interruptFlagFileName(sessionId, suffix = INTERRUPT_FLAG_SUFFIX) {
+  return `${sessionId}${suffix}`;
 }
-async function writeInterruptFlagAt(sessionsDir, sessionId, now) {
+async function writeInterruptFlagAt(sessionsDir, sessionId, now, suffix = INTERRUPT_FLAG_SUFFIX) {
   try {
-    await atomicWrite(`${sessionsDir}/${interruptFlagFileName(sessionId)}`, JSON.stringify({ at: now }), 384);
+    await atomicWrite(`${sessionsDir}/${interruptFlagFileName(sessionId, suffix)}`, JSON.stringify({ at: now }), 384);
   } catch {}
 }
-async function interruptFlagSetAt(sessionsDir, sessionId, now) {
+async function interruptFlagSetAt(sessionsDir, sessionId, now, maxAgeMs = INTERRUPT_FLAG_MAX_AGE_MS, suffix = INTERRUPT_FLAG_SUFFIX) {
   try {
-    const flag = JSON.parse(await readFile(`${sessionsDir}/${interruptFlagFileName(sessionId)}`, "utf8"));
-    return typeof flag.at === "number" && now - flag.at <= INTERRUPT_FLAG_MAX_AGE_MS;
+    const flag = JSON.parse(await readFile(`${sessionsDir}/${interruptFlagFileName(sessionId, suffix)}`, "utf8"));
+    return typeof flag.at === "number" && now - flag.at <= maxAgeMs;
   } catch {
     return false;
   }
 }
-async function clearInterruptFlagAt(sessionsDir, sessionId) {
-  await unlink(`${sessionsDir}/${interruptFlagFileName(sessionId)}`).catch(() => {});
+async function clearInterruptFlagAt(sessionsDir, sessionId, suffix = INTERRUPT_FLAG_SUFFIX) {
+  await unlink(`${sessionsDir}/${interruptFlagFileName(sessionId, suffix)}`).catch(() => {});
 }
-async function settleDecisionHoldRecord(sessionId, patch) {
-  return settleDecisionHoldRecordAt(SESSIONS_DIR, sessionId, patch);
+async function settleDecisionHoldRecord(sessionId, patch, heldSince) {
+  return settleDecisionHoldRecordAt(SESSIONS_DIR, sessionId, patch, heldSince);
 }
 async function readPrefix(path, maxBytes) {
   const fh = await open(path, "r");

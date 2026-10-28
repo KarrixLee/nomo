@@ -23,9 +23,9 @@
 
 import { readdir, readFile, stat } from "node:fs/promises";
 import { join } from "node:path";
-import { claudeAdapter, codexAdapter, cursorAdapter, opencodeAdapter } from "../core/adapter";
+import { antigravityAdapter, claudeAdapter, codexAdapter, cursorAdapter, opencodeAdapter } from "../core/adapter";
 import {
-  AgentKind, CC_DIR, CODEX_HOOK_MARKER, codexAppServerSocketAvailable, codexHome, CURSOR_HOOK_MARKER, cursorHome, flagExists,
+  AgentKind, ANTIGRAVITY_HOOK_MARKER, antigravityConfigDir, CC_DIR, CODEX_HOOK_MARKER, codexAppServerSocketAvailable, codexHome, CURSOR_HOOK_MARKER, cursorHome, flagExists,
   LAST_SEND_PATH, localApprovalsState, NO_HOLD_PATH, parseConfig, parsePendingConfig, pidAlive,
   opencodeStubPaths, opencodeStubTarget, PLUGIN_VERSION, SESSION_TRACE_PATH, SESSIONS_DIR,
   WATCHDOG_PID_PATH,
@@ -100,8 +100,14 @@ export interface StatusDeps {
   cursorHooksPath?: string;
   cursorProjectsDir?: string;
   lastHookCursorPath?: string;
+  /** Antigravity's global hooks.json and liveness stamp — injected so a test never reads ~/.gemini. */
+  antigravityHooksPath?: string;
+  lastHookAntigravityPath?: string;
   isAlive?: (pid: number) => boolean;
   now?: () => number;
+  /** Beginner mode (`--plain`, what Antigravity's /nomo-status runs): instead of the readout, a few
+   *  plain-language lines — the state, then at most one next step per problem. */
+  plain?: boolean;
 }
 
 // --- presentation ------------------------------------------------------------------------------
@@ -128,10 +134,12 @@ const AGENT_UI: Record<AgentKind, { name: string; pair: string; approvalsOn: str
   // Cursor has no approvals command (v1 is read-only), but the Approvals row is machine-wide — so a
   // Cursor reader who sees it PAUSED is pointed at an agent that does have the switch.
   cursor: { name: "Cursor", pair: "/nomo-pair", approvalsOn: "/nomo-cc:approvals on (in Claude Code — Cursor sessions are read-only)", status: "/nomo-status" },
+  // Antigravity's own /nomo-* skills (the "nomo" plugin the installer puts in ~/.gemini/config/plugins).
+  antigravity: { name: "Antigravity", pair: "/nomo-pair", approvalsOn: "/nomo-approvals on", status: "/nomo-status" },
 };
 
 /** Fixed order, so two runs on the same machine never disagree about where to look. */
-const AGENT_ORDER: AgentKind[] = ["claude", "codex", "opencode", "cursor"];
+const AGENT_ORDER: AgentKind[] = ["claude", "codex", "opencode", "cursor", "antigravity"];
 
 /** Value column. Top-level rows pad the label to it; an agent's rows indent 2 and pad to it minus 2,
  *  so every value on the screen starts in the same column and the eye can run straight down it. Wide
@@ -432,7 +440,9 @@ export function runtimeFloorWarning(name: string, version: string): { what: stri
 }
 
 export async function statusCmd(deps: StatusDeps = {}): Promise<number> {
-  const print = deps.print ?? ((line: string) => console.log(line));
+  const out = deps.print ?? ((line: string) => console.log(line));
+  // --plain gathers exactly what the readout gathers, prints none of it, and says it in plain words.
+  const print = deps.plain ? () => {} : out;
   const configPath = deps.configPath ?? `${CC_DIR}/config.json`;
   const lastSendPath = deps.lastSendPath ?? LAST_SEND_PATH;
   const sessionsDir = deps.sessionsDir ?? SESSIONS_DIR;
@@ -449,6 +459,8 @@ export async function statusCmd(deps: StatusDeps = {}): Promise<number> {
   const cursorHooksPath = deps.cursorHooksPath ?? `${cursorHome()}/hooks.json`;
   const cursorProjectsDir = deps.cursorProjectsDir ?? cursorAdapter.sessionsDir();
   const lastHookCursorPath = deps.lastHookCursorPath ?? cursorAdapter.hookStampPath();
+  const antigravityHooksPath = deps.antigravityHooksPath ?? `${antigravityConfigDir()}/hooks.json`;
+  const lastHookAntigravityPath = deps.lastHookAntigravityPath ?? antigravityAdapter.hookStampPath();
   const noHoldPath = deps.noHoldPath ?? NO_HOLD_PATH;
   const isAlive = deps.isAlive ?? pidAlive;
   const now = deps.now ?? Date.now;
@@ -545,7 +557,7 @@ export async function statusCmd(deps: StatusDeps = {}): Promise<number> {
   // Session records, split by the agent that wrote them. "Tracked sessions: 4" was machine-wide and so
   // answered nobody's question; what a reader wants is how many of those are THEIRS. A record with no
   // `agent` key predates the Codex work and is Claude's by definition (same rule the watchdog uses).
-  const perAgent: Record<string, number> = { claude: 0, codex: 0, opencode: 0, cursor: 0 };
+  const perAgent: Record<string, number> = { claude: 0, codex: 0, opencode: 0, cursor: 0, antigravity: 0 };
   let totalSessions = 0;
   try {
     for (const name of await readdir(sessionsDir)) {
@@ -780,8 +792,34 @@ export async function statusCmd(deps: StatusDeps = {}): Promise<number> {
     problems: cursorHooks.problem ? [cursorHooks.problem] : [],
   };
 
+  // Antigravity — Cursor's twin. Installed = our wrapper named in ~/.gemini/config/hooks.json.
+  const antigravityInstalled = (await readFile(antigravityHooksPath, "utf8").catch(() => "")).includes(ANTIGRAVITY_HOOK_MARKER);
+  const antigravityHooks = await hooksRow("antigravity", {
+    installed: antigravityInstalled, sessionsDir: antigravityAdapter.sessionsDir(),
+    match: antigravityAdapter.sessionMatch, stampPath: lastHookAntigravityPath,
+    hint: antigravityAdapter.hooksNotFiringHint,
+  });
+  const antigravityReport: AgentReport = {
+    kind: "antigravity", present: antigravityInstalled || perAgent.antigravity! > 0 || antigravityHooks.stamp > 0,
+    hooksLabel: "Hooks", hooks: antigravityHooks.value, sessions: sessionText(perAgent.antigravity!),
+    sessionCount: perAgent.antigravity!,
+    detail: [["Mode", "sessions show on your phone; Allow/Deny for shell commands and file writes, and Interrupt"]],
+    problems: antigravityHooks.problem ? [antigravityHooks.problem] : [],
+  };
+
+  if (deps.plain) {
+    const approvalsOn = await localApprovalsState(noHoldPath) === "on";
+    const lastSendTs = await readMsMarker(lastSendPath);
+    for (const line of plainStatusLines({
+      paired: config !== null, pending: Boolean(pending), machine: config?.machineName, approvalsOn,
+      lastActivityAgo: (antigravityHooks.stamp || lastSendTs) > 0 ? now() - (antigravityHooks.stamp || lastSendTs) : undefined,
+      agentSetUp: antigravityInstalled, agentProblem: antigravityHooks.problem !== undefined,
+    })) out(line);
+    return 0;
+  }
+
   // ── render ────────────────────────────────────────────────────────────────────────────────────
-  const reports: Record<AgentKind, AgentReport> = { claude: claudeReport, codex: codexReport, opencode: opencodeReport, cursor: cursorReport };
+  const reports: Record<AgentKind, AgentReport> = { claude: claudeReport, codex: codexReport, opencode: opencodeReport, cursor: cursorReport, antigravity: antigravityReport };
   if (audience) {
     // The subject, in full and immediately under the machine facts.
     renderOwn(reports[audience], `${AGENT_UI[audience].name} — you are here`, print);
@@ -803,20 +841,56 @@ export async function statusCmd(deps: StatusDeps = {}): Promise<number> {
   return 0;
 }
 
+/** "2 min ago", "3 hours ago" — humanAge's words, for people. */
+export function plainAge(ms: number): string {
+  const m = Math.floor(Math.max(0, ms) / 60_000);
+  if (m < 1) return "just now";
+  if (m < 60) return `${m} min ago`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h} hour${h === 1 ? "" : "s"} ago`;
+  const d = Math.floor(h / 24);
+  return `${d} day${d === 1 ? "" : "s"} ago`;
+}
+
+/** Antigravity's beginner status: one state line, then one line per problem, each with its one fix.
+ *  No jargon, no paths. Pure. */
+export function plainStatusLines(s: {
+  paired: boolean; pending: boolean; machine?: string; approvalsOn: boolean;
+  lastActivityAgo?: number; agentSetUp: boolean; agentProblem: boolean;
+}): string[] {
+  const lines: string[] = [];
+  if (!s.paired) {
+    lines.push(s.pending
+      ? "⏳ Pairing was started, but your phone hasn't scanned the code yet. Type /nomo-pair to try again."
+      : "❌ This computer isn't connected to your phone yet. Type /nomo-pair to connect it.");
+  } else {
+    const who = s.machine ? ` as “${s.machine}”` : "";
+    const last = s.lastActivityAgo === undefined ? "none yet" : plainAge(s.lastActivityAgo);
+    lines.push(`✅ Connected to your phone${who} · Phone approvals: ${s.approvalsOn ? "on" : "paused"} · Last activity: ${last}`);
+  }
+  if (!s.agentSetUp) {
+    lines.push("⚠️ Antigravity isn't set up to send sessions to Nomo yet. Run the Nomo installer (bunx nomo-ai --antigravity), then restart Antigravity.");
+  } else if (s.agentProblem) {
+    lines.push("⚠️ Nomo hasn't heard from Antigravity lately. Restart Antigravity — if that doesn't help, run the Nomo installer again (bunx nomo-ai --antigravity).");
+  }
+  if (s.paired && !s.approvalsOn) lines.push("⏸️ Phone approvals are paused. Type /nomo-approvals on to turn them back on.");
+  return lines;
+}
+
 /** The invoking agent, off argv. Anything unrecognised (including nothing) reads as "no agent asked",
  *  which is the everything-in-full render — an older command file that predates the argument, or a
  *  hand-run bundle, must keep working exactly as it did. */
 export function parseAudience(argv: readonly string[]): AgentKind | undefined {
   for (const arg of argv) {
-    if (arg === "claude" || arg === "codex" || arg === "opencode" || arg === "cursor") return arg;
+    if (arg === "claude" || arg === "codex" || arg === "opencode" || arg === "cursor" || arg === "antigravity") return arg;
   }
   return undefined;
 }
 
 if (import.meta.main) {
   if (process.argv.includes("--check")) {
-    console.log("usage: status [claude|codex|opencode|cursor] [--check]  — show pairing, delivery and per-agent health");
+    console.log("usage: status [claude|codex|opencode|cursor|antigravity] [--plain] [--check]  — show pairing, delivery and per-agent health (--plain: a few lines in plain words)");
     process.exit(0);
   }
-  process.exit(await statusCmd({ audience: parseAudience(process.argv.slice(2)) }));
+  process.exit(await statusCmd({ audience: parseAudience(process.argv.slice(2)), plain: process.argv.includes("--plain") }));
 }

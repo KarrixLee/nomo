@@ -7,11 +7,11 @@ import { join as join3 } from "node:path";
 
 // src/core/adapter.ts
 import { execFile as execFile2, execFileSync as execFileSync2 } from "node:child_process";
-import { existsSync as existsSync2 } from "node:fs";
+import { copyFileSync, existsSync as existsSync2, mkdtempSync, rmSync, statSync as statSync2 } from "node:fs";
 import { readdir, readFile as readFile2, stat as stat2 } from "node:fs/promises";
-import { devNull } from "node:os";
+import { devNull, tmpdir } from "node:os";
 import { promisify as promisify2 } from "node:util";
-import { basename as basename2, join as join2 } from "node:path";
+import { basename as basename2, isAbsolute as isAbsolute2, join as join2, resolve as resolve2 } from "node:path";
 
 // src/core/shared.ts
 import { access, chmod, open, readFile, rename, stat, mkdir, unlink, writeFile } from "node:fs/promises";
@@ -139,7 +139,7 @@ function appendCodexBridgeMarker(dbg, down) {
   const next = `${bare} ${CODEX_BRIDGE_DOWN_MARKER}`;
   return Array.from(next).length <= DBG_BLOB_TEXT_MAX_CHARS ? next : bare;
 }
-var CC_DIR = `${process.env.HOME}/.config/cc-status`;
+var CC_DIR = process.env.NOMO_CC_DIR || `${process.env.HOME}/.config/cc-status`;
 var SESSION_TRACE_PATH = `${CC_DIR}/session-trace.log`;
 var SESSION_TRACE_MAX_BYTES = 256 * 1024;
 var sessionTraceRotated = false;
@@ -333,6 +333,10 @@ function cursorHome() {
   return env && env.length > 0 ? env : `${process.env.HOME}/.cursor`;
 }
 var CURSOR_HOOK_MARKER = "cursor-status.mjs";
+function antigravityConfigDir() {
+  return `${process.env.HOME}/.gemini/config`;
+}
+var ANTIGRAVITY_HOOK_MARKER = "antigravity-hook.sh";
 var CODEX_HOOK_MARKER = "codex-status.mjs";
 function codexAppServerSocketPath() {
   return `${codexHome()}/app-server-control/app-server-control.sock`;
@@ -957,12 +961,15 @@ async function clearDecisionHoldAt(sessionsDir, sessionId, pid, beforeUnlink, ho
     return false;
   }
 }
-async function settleDecisionHoldRecordAt(sessionsDir, sessionId, patch) {
+async function settleDecisionHoldRecordAt(sessionsDir, sessionId, patch, heldSince) {
   try {
     const record = await readRecord(sessionId, sessionsDir);
     if (!record)
       return;
-    if (record.op !== "update" || record.prio !== 1)
+    if (record.op !== "update")
+      return;
+    const untouched = heldSince !== undefined && typeof record.ts === "number" && record.ts <= heldSince;
+    if (record.prio !== 1 && !untouched)
       return;
     await atomicWrite(`${sessionsDir}/${sessionId}.json`, JSON.stringify({ ...record, ...patch }), 384);
   } catch {}
@@ -982,27 +989,27 @@ async function clearDecisionHold(sessionId, pid, beforeUnlink, holdId) {
 }
 var INTERRUPT_FLAG_SUFFIX = ".interrupt";
 var INTERRUPT_FLAG_MAX_AGE_MS = 3600000;
-function interruptFlagFileName(sessionId) {
-  return `${sessionId}${INTERRUPT_FLAG_SUFFIX}`;
+function interruptFlagFileName(sessionId, suffix = INTERRUPT_FLAG_SUFFIX) {
+  return `${sessionId}${suffix}`;
 }
-async function writeInterruptFlagAt(sessionsDir, sessionId, now) {
+async function writeInterruptFlagAt(sessionsDir, sessionId, now, suffix = INTERRUPT_FLAG_SUFFIX) {
   try {
-    await atomicWrite(`${sessionsDir}/${interruptFlagFileName(sessionId)}`, JSON.stringify({ at: now }), 384);
+    await atomicWrite(`${sessionsDir}/${interruptFlagFileName(sessionId, suffix)}`, JSON.stringify({ at: now }), 384);
   } catch {}
 }
-async function interruptFlagSetAt(sessionsDir, sessionId, now) {
+async function interruptFlagSetAt(sessionsDir, sessionId, now, maxAgeMs = INTERRUPT_FLAG_MAX_AGE_MS, suffix = INTERRUPT_FLAG_SUFFIX) {
   try {
-    const flag = JSON.parse(await readFile(`${sessionsDir}/${interruptFlagFileName(sessionId)}`, "utf8"));
-    return typeof flag.at === "number" && now - flag.at <= INTERRUPT_FLAG_MAX_AGE_MS;
+    const flag = JSON.parse(await readFile(`${sessionsDir}/${interruptFlagFileName(sessionId, suffix)}`, "utf8"));
+    return typeof flag.at === "number" && now - flag.at <= maxAgeMs;
   } catch {
     return false;
   }
 }
-async function clearInterruptFlagAt(sessionsDir, sessionId) {
-  await unlink(`${sessionsDir}/${interruptFlagFileName(sessionId)}`).catch(() => {});
+async function clearInterruptFlagAt(sessionsDir, sessionId, suffix = INTERRUPT_FLAG_SUFFIX) {
+  await unlink(`${sessionsDir}/${interruptFlagFileName(sessionId, suffix)}`).catch(() => {});
 }
-async function settleDecisionHoldRecord(sessionId, patch) {
-  return settleDecisionHoldRecordAt(SESSIONS_DIR, sessionId, patch);
+async function settleDecisionHoldRecord(sessionId, patch, heldSince) {
+  return settleDecisionHoldRecordAt(SESSIONS_DIR, sessionId, patch, heldSince);
 }
 async function readPrefix(path, maxBytes) {
   const fh = await open(path, "r");
@@ -2895,20 +2902,38 @@ var CURSOR_TITLE_TIMEOUT_MS = 300;
 function cursorChatTitle(sessionId, db = cursorStateDb(), env = process.env) {
   if (!/^[A-Za-z0-9_-]{1,128}$/.test(sessionId))
     return;
+  return sqliteOneTitle(db, "select case when json_type(cast(value as text),'$.name')='text' then json_extract(cast(value as text),'$.name') end" + ` from cursorDiskKV where key='composerData:${sessionId}'`, env);
+}
+function sqliteOneTitle(db, sql, env = process.env, copyFallback = false) {
+  const cleaned = sqliteOne(db, sql, env, copyFallback);
+  return cleaned ? truncateOnWord(cleaned) : undefined;
+}
+function sqliteOne(db, sql, env = process.env, copyFallback = false) {
+  if (!existsSync2(db))
+    return;
   try {
     const bin = process.platform === "darwin" && existsSync2("/usr/bin/sqlite3") ? "/usr/bin/sqlite3" : "sqlite3";
-    const out = execFileSync2(bin, [
-      "-init",
-      devNull,
-      "-batch",
-      "-noheader",
-      "-list",
-      "-readonly",
-      db,
-      "select case when json_type(cast(value as text),'$.name')='text' then json_extract(cast(value as text),'$.name') end" + ` from cursorDiskKV where key='composerData:${sessionId}'`
-    ], { timeout: CURSOR_TITLE_TIMEOUT_MS, encoding: "utf8", maxBuffer: 65536, stdio: ["ignore", "pipe", "ignore"], env });
+    const run = (target, readonly = true) => execFileSync2(bin, ["-init", devNull, "-batch", "-noheader", "-list", ...readonly ? ["-readonly"] : [], target, sql], { timeout: CURSOR_TITLE_TIMEOUT_MS, encoding: "utf8", maxBuffer: 65536, stdio: ["ignore", "pipe", "ignore"], env });
+    let out;
+    try {
+      out = run(db);
+    } catch (e) {
+      if (!copyFallback)
+        throw e;
+      const tmp = mkdtempSync(join2(tmpdir(), "nomo-sql-"));
+      try {
+        for (const ext of ["", "-wal"])
+          if (existsSync2(db + ext))
+            copyFileSync(db + ext, join2(tmp, `c.db${ext}`));
+        out = run(join2(tmp, "c.db"), false);
+      } catch {
+        out = run(`file:${db.split("/").map(encodeURIComponent).join("/")}?immutable=1`);
+      } finally {
+        rmSync(tmp, { recursive: true, force: true });
+      }
+    }
     const cleaned = out.replace(/\s+/g, " ").trim();
-    return cleaned ? truncateOnWord(cleaned) : undefined;
+    return cleaned || undefined;
   } catch {
     return;
   }
@@ -2928,6 +2953,141 @@ var cursorAdapter = {
   },
   toolDetail: {},
   blobAgentFields: { agent: "cursor" }
+};
+function antigravityModel(input) {
+  const v = input.modelName;
+  return typeof v === "string" && v.trim().length > 0 ? v.trim().slice(0, 80) : undefined;
+}
+function antigravityDataDirs() {
+  const home = process.env.HOME ?? "";
+  return [`${home}/.gemini/antigravity`, `${home}/.gemini/antigravity-cli`];
+}
+function antigravityDataDirFor(transcriptPath) {
+  if (!transcriptPath || !isAbsolute2(transcriptPath))
+    return;
+  const normalized = resolve2(transcriptPath);
+  const i = normalized.indexOf("/brain/");
+  const dir = i > 0 ? normalized.slice(0, i) : undefined;
+  return dir !== undefined && antigravityDataDirs().includes(dir) ? dir : undefined;
+}
+var summariesDbs = (transcriptPath) => {
+  const dir = antigravityDataDirFor(transcriptPath);
+  return (dir ? [dir] : antigravityDataDirs()).map((d) => `${d}/conversation_summaries.db`);
+};
+var AG_SQL_SAFE_ID = /^[A-Za-z0-9-]{1,128}$/;
+function antigravityChatTitle(sessionId, transcriptPath, env = process.env) {
+  if (!AG_SQL_SAFE_ID.test(sessionId))
+    return;
+  for (const db of summariesDbs(transcriptPath)) {
+    const t = sqliteOneTitle(db, `select title from conversation_summaries where conversation_id='${sessionId}'`, env, true);
+    if (t)
+      return t;
+  }
+  return;
+}
+var runStateCache = new Map;
+function antigravityRunStates(db, now) {
+  let key;
+  try {
+    const main = statSync2(db);
+    const wal = existsSync2(`${db}-wal`) ? statSync2(`${db}-wal`) : undefined;
+    key = `${main.mtimeMs}:${main.size}|${wal?.mtimeMs ?? "-"}:${wal?.size ?? "-"}`;
+  } catch {
+    return;
+  }
+  const cached = runStateCache.get(db);
+  if (cached && cached.key === key) {
+    cached.readAt = now;
+    return cached;
+  }
+  const tmp = mkdtempSync(join2(tmpdir(), "nomo-agy-"));
+  try {
+    for (const ext of ["", "-wal"])
+      if (existsSync2(db + ext))
+        copyFileSync(db + ext, join2(tmp, `c.db${ext}`));
+    const bin = process.platform === "darwin" && existsSync2("/usr/bin/sqlite3") ? "/usr/bin/sqlite3" : "sqlite3";
+    const ms = (col) => `coalesce(cast((julianday(${col}) - 2440587.5) * 86400000 as integer), '')`;
+    const query = (cols) => execFileSync2(bin, [
+      "-init",
+      devNull,
+      "-batch",
+      "-noheader",
+      "-list",
+      "-separator",
+      "\t",
+      join2(tmp, "c.db"),
+      `select conversation_id, status, ${ms("last_modified_time")}, ${cols} from conversation_summaries`
+    ], { timeout: CURSOR_TITLE_TIMEOUT_MS, encoding: "utf8", maxBuffer: 1048576, stdio: ["ignore", "pipe", "ignore"] });
+    let out;
+    try {
+      out = query(`${ms("last_user_input_time")}, not_fully_idle`);
+    } catch {
+      out = query("'', ''");
+    }
+    const rows = new Map;
+    for (const line of out.split(`
+`)) {
+      const [id, status, mod, input, nfi] = line.split("\t");
+      if (!id)
+        continue;
+      const num = (v) => v ? Number(v) : NaN;
+      rows.set(id, {
+        status: status ?? "",
+        ...Number.isFinite(num(mod)) ? { lastModifiedMs: num(mod) } : {},
+        ...Number.isFinite(num(input)) ? { lastUserInputMs: num(input) } : {},
+        ...nfi === "0" || nfi === "1" ? { notFullyIdle: nfi === "1" } : {}
+      });
+    }
+    const entry = { key, readAt: now, rows };
+    runStateCache.set(db, entry);
+    return entry;
+  } catch {
+    return;
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+}
+function antigravityRunStatus(sessionId, transcriptPath, now = Date.now()) {
+  for (const db of summariesDbs(transcriptPath)) {
+    const snap = antigravityRunStates(db, now);
+    const row = snap?.rows.get(sessionId);
+    if (row)
+      return { ...row, readAt: snap.readAt };
+  }
+  return;
+}
+async function antigravityFirstPrompt(transcriptPath) {
+  if (!antigravityDataDirFor(transcriptPath))
+    return;
+  try {
+    const first = (await readPrefix(transcriptPath, 16384)).split(`
+`, 1)[0] ?? "";
+    const line = JSON.parse(first);
+    if (line.type !== "USER_INPUT" || typeof line.content !== "string")
+      return;
+    const m = /<USER_REQUEST>([\s\S]*?)<\/USER_REQUEST>/.exec(line.content);
+    return displayTitleFromUserText(m ? m[1] : line.content);
+  } catch {
+    return;
+  }
+}
+var antigravityAdapter = {
+  kind: "antigravity",
+  title: async ({ sessionId, transcriptPath }) => antigravityChatTitle(sessionId, transcriptPath) ?? await antigravityFirstPrompt(transcriptPath),
+  model: async ({ input }) => antigravityModel(input),
+  detectInterrupt: () => false,
+  sessionsDir: () => `${process.env.HOME ?? ""}/.gemini/antigravity/conversations`,
+  sessionMatch: () => false,
+  hookStampPath: () => lastHookPath("antigravity"),
+  hooksNotFiringHint: "  run `bunx nomo-ai --antigravity` again, then restart Antigravity so it re-reads ~/.gemini/config/hooks.json",
+  titleRepair: {
+    due: (record, now) => record.lastEvent === "done" && typeof record.ts === "number" && now - record.ts < CURSOR_TITLE_REPAIR_MS,
+    resolve: (sessionId) => antigravityChatTitle(sessionId)
+  },
+  toolDetail: {},
+  blobAgentFields: { agent: "antigravity" },
+  interrupt: "hook-flag",
+  interruptFlagSuffix: ".agy-interrupt"
 };
 function unknownAgentAdapter(kind) {
   return {
@@ -2952,6 +3112,8 @@ function adapterFor(agent) {
       return opencodeAdapter;
     case "cursor":
       return cursorAdapter;
+    case "antigravity":
+      return antigravityAdapter;
     case "claude":
       return claudeAdapter;
     default:
@@ -2966,9 +3128,10 @@ var AGENT_UI = {
   claude: { name: "Claude Code", pair: "/nomo-cc:pair", approvalsOn: "/nomo-cc:approvals on", status: "/nomo-cc:status" },
   codex: { name: "Codex", pair: "$nomo-pair", approvalsOn: "$nomo-approvals on", status: "$nomo-status" },
   opencode: { name: "OpenCode", pair: "/nomo-pair", approvalsOn: "/nomo-approvals on", status: "/nomo-status" },
-  cursor: { name: "Cursor", pair: "/nomo-pair", approvalsOn: "/nomo-cc:approvals on (in Claude Code — Cursor sessions are read-only)", status: "/nomo-status" }
+  cursor: { name: "Cursor", pair: "/nomo-pair", approvalsOn: "/nomo-cc:approvals on (in Claude Code — Cursor sessions are read-only)", status: "/nomo-status" },
+  antigravity: { name: "Antigravity", pair: "/nomo-pair", approvalsOn: "/nomo-approvals on", status: "/nomo-status" }
 };
-var AGENT_ORDER = ["claude", "codex", "opencode", "cursor"];
+var AGENT_ORDER = ["claude", "codex", "opencode", "cursor", "antigravity"];
 var VALUE_COL = 14;
 var row = (label, value) => `${label.padEnd(VALUE_COL)}${value}`;
 var subRow = (label, value) => `  ${label.padEnd(VALUE_COL - 2)}${value}`;
@@ -3182,7 +3345,8 @@ function runtimeFloorWarning(name, version) {
   return;
 }
 async function statusCmd(deps = {}) {
-  const print = deps.print ?? ((line) => console.log(line));
+  const out = deps.print ?? ((line) => console.log(line));
+  const print = deps.plain ? () => {} : out;
   const configPath = deps.configPath ?? `${CC_DIR}/config.json`;
   const lastSendPath = deps.lastSendPath ?? LAST_SEND_PATH;
   const sessionsDir = deps.sessionsDir ?? SESSIONS_DIR;
@@ -3199,6 +3363,8 @@ async function statusCmd(deps = {}) {
   const cursorHooksPath = deps.cursorHooksPath ?? `${cursorHome()}/hooks.json`;
   const cursorProjectsDir = deps.cursorProjectsDir ?? cursorAdapter.sessionsDir();
   const lastHookCursorPath = deps.lastHookCursorPath ?? cursorAdapter.hookStampPath();
+  const antigravityHooksPath = deps.antigravityHooksPath ?? `${antigravityConfigDir()}/hooks.json`;
+  const lastHookAntigravityPath = deps.lastHookAntigravityPath ?? antigravityAdapter.hookStampPath();
   const noHoldPath = deps.noHoldPath ?? NO_HOLD_PATH;
   const isAlive = deps.isAlive ?? pidAlive;
   const now = deps.now ?? Date.now;
@@ -3259,7 +3425,7 @@ async function statusCmd(deps = {}) {
       print(cont(`→ run ${ui.approvalsOn}`));
     }
   }
-  const perAgent = { claude: 0, codex: 0, opencode: 0, cursor: 0 };
+  const perAgent = { claude: 0, codex: 0, opencode: 0, cursor: 0, antigravity: 0 };
   let totalSessions = 0;
   try {
     for (const name of await readdir2(sessionsDir)) {
@@ -3439,7 +3605,40 @@ async function statusCmd(deps = {}) {
     detail: [["Mode", "read-only — sessions show on your phone; approvals stay in Cursor"]],
     problems: cursorHooks.problem ? [cursorHooks.problem] : []
   };
-  const reports = { claude: claudeReport, codex: codexReport, opencode: opencodeReport, cursor: cursorReport };
+  const antigravityInstalled = (await readFile3(antigravityHooksPath, "utf8").catch(() => "")).includes(ANTIGRAVITY_HOOK_MARKER);
+  const antigravityHooks = await hooksRow("antigravity", {
+    installed: antigravityInstalled,
+    sessionsDir: antigravityAdapter.sessionsDir(),
+    match: antigravityAdapter.sessionMatch,
+    stampPath: lastHookAntigravityPath,
+    hint: antigravityAdapter.hooksNotFiringHint
+  });
+  const antigravityReport = {
+    kind: "antigravity",
+    present: antigravityInstalled || perAgent.antigravity > 0 || antigravityHooks.stamp > 0,
+    hooksLabel: "Hooks",
+    hooks: antigravityHooks.value,
+    sessions: sessionText(perAgent.antigravity),
+    sessionCount: perAgent.antigravity,
+    detail: [["Mode", "sessions show on your phone; Allow/Deny for shell commands and file writes, and Interrupt"]],
+    problems: antigravityHooks.problem ? [antigravityHooks.problem] : []
+  };
+  if (deps.plain) {
+    const approvalsOn = await localApprovalsState(noHoldPath) === "on";
+    const lastSendTs = await readMsMarker(lastSendPath);
+    for (const line of plainStatusLines({
+      paired: config !== null,
+      pending: Boolean(pending),
+      machine: config?.machineName,
+      approvalsOn,
+      lastActivityAgo: (antigravityHooks.stamp || lastSendTs) > 0 ? now() - (antigravityHooks.stamp || lastSendTs) : undefined,
+      agentSetUp: antigravityInstalled,
+      agentProblem: antigravityHooks.problem !== undefined
+    }))
+      out(line);
+    return 0;
+  }
+  const reports = { claude: claudeReport, codex: codexReport, opencode: opencodeReport, cursor: cursorReport, antigravity: antigravityReport };
   if (audience) {
     renderOwn(reports[audience], `${AGENT_UI[audience].name} — you are here`, print);
     const others = AGENT_ORDER.filter((k) => k !== audience && reports[k].present);
@@ -3455,19 +3654,49 @@ async function statusCmd(deps = {}) {
   }
   return 0;
 }
+function plainAge(ms) {
+  const m = Math.floor(Math.max(0, ms) / 60000);
+  if (m < 1)
+    return "just now";
+  if (m < 60)
+    return `${m} min ago`;
+  const h = Math.floor(m / 60);
+  if (h < 24)
+    return `${h} hour${h === 1 ? "" : "s"} ago`;
+  const d = Math.floor(h / 24);
+  return `${d} day${d === 1 ? "" : "s"} ago`;
+}
+function plainStatusLines(s) {
+  const lines = [];
+  if (!s.paired) {
+    lines.push(s.pending ? "⏳ Pairing was started, but your phone hasn't scanned the code yet. Type /nomo-pair to try again." : "❌ This computer isn't connected to your phone yet. Type /nomo-pair to connect it.");
+  } else {
+    const who = s.machine ? ` as “${s.machine}”` : "";
+    const last = s.lastActivityAgo === undefined ? "none yet" : plainAge(s.lastActivityAgo);
+    lines.push(`✅ Connected to your phone${who} · Phone approvals: ${s.approvalsOn ? "on" : "paused"} · Last activity: ${last}`);
+  }
+  if (!s.agentSetUp) {
+    lines.push("⚠️ Antigravity isn't set up to send sessions to Nomo yet. Run the Nomo installer (bunx nomo-ai --antigravity), then restart Antigravity.");
+  } else if (s.agentProblem) {
+    lines.push("⚠️ Nomo hasn't heard from Antigravity lately. Restart Antigravity — if that doesn't help, run the Nomo installer again (bunx nomo-ai --antigravity).");
+  }
+  if (s.paired && !s.approvalsOn)
+    lines.push("⏸️ Phone approvals are paused. Type /nomo-approvals on to turn them back on.");
+  return lines;
+}
 function parseAudience(argv) {
   for (const arg of argv) {
-    if (arg === "claude" || arg === "codex" || arg === "opencode" || arg === "cursor")
+    if (arg === "claude" || arg === "codex" || arg === "opencode" || arg === "cursor" || arg === "antigravity")
       return arg;
   }
   return;
 }
 if (__require.main == __require.module) {
   if (process.argv.includes("--check")) {
-    console.log("usage: status [claude|codex|opencode|cursor] [--check]  — show pairing, delivery and per-agent health");
+    console.log("usage: status [claude|codex|opencode|cursor|antigravity] [--plain] [--check]  — show pairing, delivery and per-agent health (--plain: a few lines in plain words)");
     process.exit(0);
   }
-  process.exit(await statusCmd({ audience: parseAudience(process.argv.slice(2)) }));
+  process.exit(await statusCmd({ audience: parseAudience(process.argv.slice(2)), plain: process.argv.includes("--plain") }));
 }
 export {
   countCodexHookEvents,
@@ -3476,6 +3705,8 @@ export {
   parseAudience,
   parseCodexPluginState,
   parseLanTrace,
+  plainAge,
+  plainStatusLines,
   renderLanTrace,
   runtimeFloorWarning,
   statusCmd

@@ -49,7 +49,7 @@ import { watch } from "node:fs";
 import { readdir, readFile } from "node:fs/promises";
 import { basename } from "node:path";
 import { promisify } from "node:util";
-import { Bytes, encryptBlob } from "./crypto";
+import { Bytes, decryptBlob, encryptBlob } from "./crypto";
 import { LAN_SESSION_ID_RE, lanRunningUnderTest } from "./lan-wire";
 import type { LanReadWhat } from "./lan-wire";
 import { computeSessionState, parseCcSessionFile } from "./session-state";
@@ -601,7 +601,7 @@ export function createLanFrameStore(deps: LanFrameStoreDeps = {}): LanFrameStore
     // rode with it) is all there is. Nothing to say when we never served one.
     if (blob.kind === "last" && !prev) return false;
     const blobSig = blob.kind === "sealed" ? `s:${blob.value}`
-      : blob.kind === "plain" ? `p:${JSON.stringify(blob.value)}`
+      : blob.kind === "plain" ? `p:${JSON.stringify(blob.value)}${blob.carry ? `|c:${blob.carry}` : ""}`
         : `l:${prev!.state.blob}`;
     const agent = blob.kind === "last" ? prev!.state.agent : (computed.agent === "claude" ? undefined : computed.agent);
     const startedAt = blob.kind === "last" ? prev!.state.startedAt : computed.startedAt;
@@ -620,7 +620,16 @@ export function createLanFrameStore(deps: LanFrameStoreDeps = {}): LanFrameStore
       // The ONE thing this store opens its key for: a plaintext the MAC authored because no hook-written
       // blob describes the state we computed. Without a key there is nothing honest to serve.
       if (!e2eKey) return false;
-      try { sealed = await encryptBlob(e2eKey, blob.value); } catch { return false; }
+      // ...and, for an Antigravity row, opens the record's own blob to carry its append-last `surface`
+      // and reply receipts: they exist nowhere else, and a done row is exactly where a phone reply lands.
+      let value = blob.value;
+      if (blob.carry) {
+        try {
+          const { surface, replies } = await decryptBlob(e2eKey, blob.carry) as Record<string, unknown>;
+          value = { ...value, ...(surface !== undefined ? { surface } : {}), ...(replies !== undefined ? { replies } : {}) };
+        } catch { /* unreadable record blob: serve the authored state without receipts */ }
+      }
+      try { sealed = await encryptBlob(e2eKey, value); } catch { return false; }
     }
 
     stateCounter += 1;

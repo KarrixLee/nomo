@@ -3,9 +3,9 @@ var __require = /* @__PURE__ */ createRequire(import.meta.url);
 
 // src/entries/handoff.ts
 import { execFileSync as execFileSync5, spawn as spawn2 } from "node:child_process";
-import { closeSync as closeSync3, existsSync as existsSync6, lstatSync as lstatSync3, mkdirSync as mkdirSync3, mkdtempSync as mkdtempSync2, openSync as openSync3, readdirSync as readdirSync4, readFileSync as readFileSync6, readSync as readSync3, realpathSync as realpathSync3, renameSync as renameSync3, rmSync as rmSync2, statSync as statSync5, unlinkSync as unlinkSync3, writeFileSync as writeFileSync4 } from "node:fs";
+import { closeSync as closeSync3, existsSync as existsSync6, lstatSync as lstatSync3, mkdirSync as mkdirSync3, mkdtempSync as mkdtempSync3, openSync as openSync3, readdirSync as readdirSync4, readFileSync as readFileSync6, readSync as readSync3, realpathSync as realpathSync3, renameSync as renameSync3, rmSync as rmSync3, statSync as statSync6, unlinkSync as unlinkSync3, writeFileSync as writeFileSync4 } from "node:fs";
 import { randomUUID } from "node:crypto";
-import { tmpdir } from "node:os";
+import { tmpdir as tmpdir2 } from "node:os";
 import { dirname as dirname3, join as join7, relative as relative3, sep as sep3 } from "node:path";
 import { fileURLToPath as fileURLToPath2 } from "node:url";
 
@@ -371,11 +371,11 @@ function buildPairURL(workerUrl, pairingId, qrSecret, pcEphPub) {
 
 // src/core/adapter.ts
 import { execFile as execFile2, execFileSync as execFileSync2 } from "node:child_process";
-import { existsSync as existsSync2 } from "node:fs";
+import { copyFileSync, existsSync as existsSync2, mkdtempSync, rmSync, statSync as statSync2 } from "node:fs";
 import { readdir, readFile as readFile2, stat as stat2 } from "node:fs/promises";
-import { devNull } from "node:os";
+import { devNull, tmpdir } from "node:os";
 import { promisify as promisify2 } from "node:util";
-import { basename as basename2, join as join2 } from "node:path";
+import { basename as basename2, isAbsolute as isAbsolute2, join as join2, resolve as resolve2 } from "node:path";
 
 // src/core/shared.ts
 import { access, chmod, open, readFile, rename, stat, mkdir, unlink, writeFile } from "node:fs/promises";
@@ -409,7 +409,7 @@ function appendCodexBridgeMarker(dbg, down) {
   const next = `${bare} ${CODEX_BRIDGE_DOWN_MARKER}`;
   return Array.from(next).length <= DBG_BLOB_TEXT_MAX_CHARS ? next : bare;
 }
-var CC_DIR = `${process.env.HOME}/.config/cc-status`;
+var CC_DIR = process.env.NOMO_CC_DIR || `${process.env.HOME}/.config/cc-status`;
 var SESSION_TRACE_PATH = `${CC_DIR}/session-trace.log`;
 var SESSION_TRACE_MAX_BYTES = 256 * 1024;
 var sessionTraceRotated = false;
@@ -603,6 +603,10 @@ function cursorHome() {
   return env && env.length > 0 ? env : `${process.env.HOME}/.cursor`;
 }
 var CURSOR_HOOK_MARKER = "cursor-status.mjs";
+function antigravityConfigDir() {
+  return `${process.env.HOME}/.gemini/config`;
+}
+var ANTIGRAVITY_HOOK_MARKER = "antigravity-hook.sh";
 var CODEX_HOOK_MARKER = "codex-status.mjs";
 function codexAppServerSocketPath() {
   return `${codexHome()}/app-server-control/app-server-control.sock`;
@@ -1227,12 +1231,15 @@ async function clearDecisionHoldAt(sessionsDir, sessionId, pid, beforeUnlink, ho
     return false;
   }
 }
-async function settleDecisionHoldRecordAt(sessionsDir, sessionId, patch) {
+async function settleDecisionHoldRecordAt(sessionsDir, sessionId, patch, heldSince) {
   try {
     const record = await readRecord(sessionId, sessionsDir);
     if (!record)
       return;
-    if (record.op !== "update" || record.prio !== 1)
+    if (record.op !== "update")
+      return;
+    const untouched = heldSince !== undefined && typeof record.ts === "number" && record.ts <= heldSince;
+    if (record.prio !== 1 && !untouched)
       return;
     await atomicWrite(`${sessionsDir}/${sessionId}.json`, JSON.stringify({ ...record, ...patch }), 384);
   } catch {}
@@ -1252,27 +1259,27 @@ async function clearDecisionHold(sessionId, pid, beforeUnlink, holdId) {
 }
 var INTERRUPT_FLAG_SUFFIX = ".interrupt";
 var INTERRUPT_FLAG_MAX_AGE_MS = 3600000;
-function interruptFlagFileName(sessionId) {
-  return `${sessionId}${INTERRUPT_FLAG_SUFFIX}`;
+function interruptFlagFileName(sessionId, suffix = INTERRUPT_FLAG_SUFFIX) {
+  return `${sessionId}${suffix}`;
 }
-async function writeInterruptFlagAt(sessionsDir, sessionId, now) {
+async function writeInterruptFlagAt(sessionsDir, sessionId, now, suffix = INTERRUPT_FLAG_SUFFIX) {
   try {
-    await atomicWrite(`${sessionsDir}/${interruptFlagFileName(sessionId)}`, JSON.stringify({ at: now }), 384);
+    await atomicWrite(`${sessionsDir}/${interruptFlagFileName(sessionId, suffix)}`, JSON.stringify({ at: now }), 384);
   } catch {}
 }
-async function interruptFlagSetAt(sessionsDir, sessionId, now) {
+async function interruptFlagSetAt(sessionsDir, sessionId, now, maxAgeMs = INTERRUPT_FLAG_MAX_AGE_MS, suffix = INTERRUPT_FLAG_SUFFIX) {
   try {
-    const flag = JSON.parse(await readFile(`${sessionsDir}/${interruptFlagFileName(sessionId)}`, "utf8"));
-    return typeof flag.at === "number" && now - flag.at <= INTERRUPT_FLAG_MAX_AGE_MS;
+    const flag = JSON.parse(await readFile(`${sessionsDir}/${interruptFlagFileName(sessionId, suffix)}`, "utf8"));
+    return typeof flag.at === "number" && now - flag.at <= maxAgeMs;
   } catch {
     return false;
   }
 }
-async function clearInterruptFlagAt(sessionsDir, sessionId) {
-  await unlink(`${sessionsDir}/${interruptFlagFileName(sessionId)}`).catch(() => {});
+async function clearInterruptFlagAt(sessionsDir, sessionId, suffix = INTERRUPT_FLAG_SUFFIX) {
+  await unlink(`${sessionsDir}/${interruptFlagFileName(sessionId, suffix)}`).catch(() => {});
 }
-async function settleDecisionHoldRecord(sessionId, patch) {
-  return settleDecisionHoldRecordAt(SESSIONS_DIR, sessionId, patch);
+async function settleDecisionHoldRecord(sessionId, patch, heldSince) {
+  return settleDecisionHoldRecordAt(SESSIONS_DIR, sessionId, patch, heldSince);
 }
 async function readPrefix(path, maxBytes) {
   const fh = await open(path, "r");
@@ -3165,20 +3172,38 @@ var CURSOR_TITLE_TIMEOUT_MS = 300;
 function cursorChatTitle(sessionId, db = cursorStateDb(), env = process.env) {
   if (!/^[A-Za-z0-9_-]{1,128}$/.test(sessionId))
     return;
+  return sqliteOneTitle(db, "select case when json_type(cast(value as text),'$.name')='text' then json_extract(cast(value as text),'$.name') end" + ` from cursorDiskKV where key='composerData:${sessionId}'`, env);
+}
+function sqliteOneTitle(db, sql, env = process.env, copyFallback = false) {
+  const cleaned = sqliteOne(db, sql, env, copyFallback);
+  return cleaned ? truncateOnWord(cleaned) : undefined;
+}
+function sqliteOne(db, sql, env = process.env, copyFallback = false) {
+  if (!existsSync2(db))
+    return;
   try {
     const bin = process.platform === "darwin" && existsSync2("/usr/bin/sqlite3") ? "/usr/bin/sqlite3" : "sqlite3";
-    const out = execFileSync2(bin, [
-      "-init",
-      devNull,
-      "-batch",
-      "-noheader",
-      "-list",
-      "-readonly",
-      db,
-      "select case when json_type(cast(value as text),'$.name')='text' then json_extract(cast(value as text),'$.name') end" + ` from cursorDiskKV where key='composerData:${sessionId}'`
-    ], { timeout: CURSOR_TITLE_TIMEOUT_MS, encoding: "utf8", maxBuffer: 65536, stdio: ["ignore", "pipe", "ignore"], env });
+    const run = (target, readonly = true) => execFileSync2(bin, ["-init", devNull, "-batch", "-noheader", "-list", ...readonly ? ["-readonly"] : [], target, sql], { timeout: CURSOR_TITLE_TIMEOUT_MS, encoding: "utf8", maxBuffer: 65536, stdio: ["ignore", "pipe", "ignore"], env });
+    let out;
+    try {
+      out = run(db);
+    } catch (e) {
+      if (!copyFallback)
+        throw e;
+      const tmp = mkdtempSync(join2(tmpdir(), "nomo-sql-"));
+      try {
+        for (const ext of ["", "-wal"])
+          if (existsSync2(db + ext))
+            copyFileSync(db + ext, join2(tmp, `c.db${ext}`));
+        out = run(join2(tmp, "c.db"), false);
+      } catch {
+        out = run(`file:${db.split("/").map(encodeURIComponent).join("/")}?immutable=1`);
+      } finally {
+        rmSync(tmp, { recursive: true, force: true });
+      }
+    }
     const cleaned = out.replace(/\s+/g, " ").trim();
-    return cleaned ? truncateOnWord(cleaned) : undefined;
+    return cleaned || undefined;
   } catch {
     return;
   }
@@ -3198,6 +3223,141 @@ var cursorAdapter = {
   },
   toolDetail: {},
   blobAgentFields: { agent: "cursor" }
+};
+function antigravityModel(input) {
+  const v = input.modelName;
+  return typeof v === "string" && v.trim().length > 0 ? v.trim().slice(0, 80) : undefined;
+}
+function antigravityDataDirs() {
+  const home = process.env.HOME ?? "";
+  return [`${home}/.gemini/antigravity`, `${home}/.gemini/antigravity-cli`];
+}
+function antigravityDataDirFor(transcriptPath) {
+  if (!transcriptPath || !isAbsolute2(transcriptPath))
+    return;
+  const normalized = resolve2(transcriptPath);
+  const i = normalized.indexOf("/brain/");
+  const dir = i > 0 ? normalized.slice(0, i) : undefined;
+  return dir !== undefined && antigravityDataDirs().includes(dir) ? dir : undefined;
+}
+var summariesDbs = (transcriptPath) => {
+  const dir = antigravityDataDirFor(transcriptPath);
+  return (dir ? [dir] : antigravityDataDirs()).map((d) => `${d}/conversation_summaries.db`);
+};
+var AG_SQL_SAFE_ID = /^[A-Za-z0-9-]{1,128}$/;
+function antigravityChatTitle(sessionId, transcriptPath, env = process.env) {
+  if (!AG_SQL_SAFE_ID.test(sessionId))
+    return;
+  for (const db of summariesDbs(transcriptPath)) {
+    const t = sqliteOneTitle(db, `select title from conversation_summaries where conversation_id='${sessionId}'`, env, true);
+    if (t)
+      return t;
+  }
+  return;
+}
+var runStateCache = new Map;
+function antigravityRunStates(db, now) {
+  let key;
+  try {
+    const main = statSync2(db);
+    const wal = existsSync2(`${db}-wal`) ? statSync2(`${db}-wal`) : undefined;
+    key = `${main.mtimeMs}:${main.size}|${wal?.mtimeMs ?? "-"}:${wal?.size ?? "-"}`;
+  } catch {
+    return;
+  }
+  const cached = runStateCache.get(db);
+  if (cached && cached.key === key) {
+    cached.readAt = now;
+    return cached;
+  }
+  const tmp = mkdtempSync(join2(tmpdir(), "nomo-agy-"));
+  try {
+    for (const ext of ["", "-wal"])
+      if (existsSync2(db + ext))
+        copyFileSync(db + ext, join2(tmp, `c.db${ext}`));
+    const bin = process.platform === "darwin" && existsSync2("/usr/bin/sqlite3") ? "/usr/bin/sqlite3" : "sqlite3";
+    const ms = (col) => `coalesce(cast((julianday(${col}) - 2440587.5) * 86400000 as integer), '')`;
+    const query = (cols) => execFileSync2(bin, [
+      "-init",
+      devNull,
+      "-batch",
+      "-noheader",
+      "-list",
+      "-separator",
+      "\t",
+      join2(tmp, "c.db"),
+      `select conversation_id, status, ${ms("last_modified_time")}, ${cols} from conversation_summaries`
+    ], { timeout: CURSOR_TITLE_TIMEOUT_MS, encoding: "utf8", maxBuffer: 1048576, stdio: ["ignore", "pipe", "ignore"] });
+    let out;
+    try {
+      out = query(`${ms("last_user_input_time")}, not_fully_idle`);
+    } catch {
+      out = query("'', ''");
+    }
+    const rows = new Map;
+    for (const line of out.split(`
+`)) {
+      const [id, status, mod, input, nfi] = line.split("\t");
+      if (!id)
+        continue;
+      const num = (v) => v ? Number(v) : NaN;
+      rows.set(id, {
+        status: status ?? "",
+        ...Number.isFinite(num(mod)) ? { lastModifiedMs: num(mod) } : {},
+        ...Number.isFinite(num(input)) ? { lastUserInputMs: num(input) } : {},
+        ...nfi === "0" || nfi === "1" ? { notFullyIdle: nfi === "1" } : {}
+      });
+    }
+    const entry = { key, readAt: now, rows };
+    runStateCache.set(db, entry);
+    return entry;
+  } catch {
+    return;
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+}
+function antigravityRunStatus(sessionId, transcriptPath, now = Date.now()) {
+  for (const db of summariesDbs(transcriptPath)) {
+    const snap = antigravityRunStates(db, now);
+    const row = snap?.rows.get(sessionId);
+    if (row)
+      return { ...row, readAt: snap.readAt };
+  }
+  return;
+}
+async function antigravityFirstPrompt(transcriptPath) {
+  if (!antigravityDataDirFor(transcriptPath))
+    return;
+  try {
+    const first = (await readPrefix(transcriptPath, 16384)).split(`
+`, 1)[0] ?? "";
+    const line = JSON.parse(first);
+    if (line.type !== "USER_INPUT" || typeof line.content !== "string")
+      return;
+    const m = /<USER_REQUEST>([\s\S]*?)<\/USER_REQUEST>/.exec(line.content);
+    return displayTitleFromUserText(m ? m[1] : line.content);
+  } catch {
+    return;
+  }
+}
+var antigravityAdapter = {
+  kind: "antigravity",
+  title: async ({ sessionId, transcriptPath }) => antigravityChatTitle(sessionId, transcriptPath) ?? await antigravityFirstPrompt(transcriptPath),
+  model: async ({ input }) => antigravityModel(input),
+  detectInterrupt: () => false,
+  sessionsDir: () => `${process.env.HOME ?? ""}/.gemini/antigravity/conversations`,
+  sessionMatch: () => false,
+  hookStampPath: () => lastHookPath("antigravity"),
+  hooksNotFiringHint: "  run `bunx nomo-ai --antigravity` again, then restart Antigravity so it re-reads ~/.gemini/config/hooks.json",
+  titleRepair: {
+    due: (record, now) => record.lastEvent === "done" && typeof record.ts === "number" && now - record.ts < CURSOR_TITLE_REPAIR_MS,
+    resolve: (sessionId) => antigravityChatTitle(sessionId)
+  },
+  toolDetail: {},
+  blobAgentFields: { agent: "antigravity" },
+  interrupt: "hook-flag",
+  interruptFlagSuffix: ".agy-interrupt"
 };
 function unknownAgentAdapter(kind) {
   return {
@@ -3222,6 +3382,8 @@ function adapterFor(agent) {
       return opencodeAdapter;
     case "cursor":
       return cursorAdapter;
+    case "antigravity":
+      return antigravityAdapter;
     case "claude":
       return claudeAdapter;
     default:
@@ -3232,7 +3394,7 @@ var allAdapters = [claudeAdapter, codexAdapter];
 
 // src/core/readiness.ts
 import { execFileSync as execFileSync3 } from "node:child_process";
-import { existsSync as existsSync3, readdirSync, readFileSync as readFileSync2, realpathSync, statSync as statSync2 } from "node:fs";
+import { existsSync as existsSync3, readdirSync, readFileSync as readFileSync2, realpathSync, statSync as statSync3 } from "node:fs";
 import { join as join3, relative, sep } from "node:path";
 var MAX_DEPTH = 4;
 var DEP_DIRS = { node_modules: true, ".venv": true, venv: true, target: true, build: true, dist: true, ".build": true, Pods: true, vendor: true };
@@ -3260,7 +3422,7 @@ var isCompose = (n) => /^(docker-)?compose([.-].*)?\.ya?ml$/.test(n);
 var isLocalhostCandidate = (n) => !LOCK_NAMES.has(n) && /\.(toml|ya?ml)$/.test(n);
 var defaultRead = (p, max) => {
   try {
-    const st = statSync2(p);
+    const st = statSync3(p);
     return st.isFile() && st.size <= max ? readFileSync2(p, "utf8") : undefined;
   } catch {
     return;
@@ -3460,7 +3622,7 @@ function trackedSecretFiles(cwd) {
 
 // src/core/transcript-scan.ts
 import { createHash as createHash2 } from "node:crypto";
-import { closeSync, existsSync as existsSync4, openSync, readdirSync as readdirSync2, readSync, statSync as statSync3 } from "node:fs";
+import { closeSync, existsSync as existsSync4, openSync, readdirSync as readdirSync2, readSync, statSync as statSync4 } from "node:fs";
 import { join as join4, relative as relative2 } from "node:path";
 var KIND_LABEL = {
   openai: "OpenAI key",
@@ -3608,7 +3770,7 @@ function filesUnder(dir) {
 }
 function handoffTranscriptFiles(projDir, uuid) {
   const main = join4(projDir, `${uuid}.jsonl`);
-  return [...existsSync4(main) && statSync3(main).isFile() ? [main] : [], ...filesUnder(join4(projDir, uuid)), ...filesUnder(join4(projDir, "memory"))];
+  return [...existsSync4(main) && statSync4(main).isFile() ? [main] : [], ...filesUnder(join4(projDir, uuid)), ...filesUnder(join4(projDir, "memory"))];
 }
 function scanHandoff(projDir, uuid) {
   return scanFiles(handoffTranscriptFiles(projDir, uuid), projDir);
@@ -3626,7 +3788,7 @@ function secretSummary(s, uuid) {
 }
 
 // src/core/park.ts
-import { mkdirSync, readFileSync as readFileSync3, renameSync, statSync as statSync4, unlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync as readFileSync3, renameSync, statSync as statSync5, unlinkSync, writeFileSync } from "node:fs";
 import { join as join5 } from "node:path";
 var PARK_DIR = `${CC_DIR}/parked`;
 var UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -3837,7 +3999,7 @@ function writeMoveResult(id, ok, dir = BACK_LOCK_DIR, why) {
 function readMoveWhy(id, since, dir = BACK_LOCK_DIR) {
   try {
     const f = moveResultFile(id, dir);
-    if (statSync4(f).mtimeMs < since)
+    if (statSync5(f).mtimeMs < since)
       return;
     const [state, why] = readFileSync3(f, "utf8").trim().split(/\s+/);
     if (state !== "FAILED")
@@ -3858,7 +4020,7 @@ function writeBackResult(id, r, dir = BACK_LOCK_DIR) {
 function readBackResult(id, since, dir = BACK_LOCK_DIR) {
   try {
     const f = backResultFile(id, dir);
-    if (statSync4(f).mtimeMs < since)
+    if (statSync5(f).mtimeMs < since)
       return;
     const r = readFileSync3(f, "utf8").trim().toLowerCase();
     return r === "done" || r === "failed" || r === "gone" ? r : undefined;
@@ -3869,7 +4031,7 @@ function readBackResult(id, since, dir = BACK_LOCK_DIR) {
 function readMoveResult(id, since, dir = BACK_LOCK_DIR) {
   try {
     const f = moveResultFile(id, dir);
-    if (statSync4(f).mtimeMs < since)
+    if (statSync5(f).mtimeMs < since)
       return;
     return readFileSync3(f, "utf8").startsWith("FAILED") ? "failed" : "done";
   } catch {
@@ -3878,7 +4040,7 @@ function readMoveResult(id, since, dir = BACK_LOCK_DIR) {
 }
 
 // src/core/handoff-later.ts
-import { appendFileSync as appendFileSync2, closeSync as closeSync2, fstatSync, linkSync, lstatSync, openSync as openSync2, readFileSync as readFileSync4, readSync as readSync2, rmSync, unlinkSync as unlinkSync2, writeFileSync as writeFileSync2 } from "node:fs";
+import { appendFileSync as appendFileSync2, closeSync as closeSync2, fstatSync, linkSync, lstatSync, openSync as openSync2, readFileSync as readFileSync4, readSync as readSync2, rmSync as rmSync2, unlinkSync as unlinkSync2, writeFileSync as writeFileSync2 } from "node:fs";
 import { basename as basename3 } from "node:path";
 var PENDING_PATH = `${CC_DIR}/handoff-pending.json`;
 var LATER_LOG = `${CC_DIR}/handoff.log`;
@@ -3958,7 +4120,7 @@ function takeManifest(path, now = Date.now()) {
   } catch {
     return { invalid: "unreadable" };
   } finally {
-    rmSync(path, { force: true });
+    rmSync2(path, { force: true });
   }
 }
 function manifestMessage(m, setup) {
@@ -4262,18 +4424,18 @@ import { execFileSync as execFileSync4 } from "node:child_process";
 import { createHash as createHash3 } from "node:crypto";
 import {
   chmodSync,
-  copyFileSync,
+  copyFileSync as copyFileSync2,
   existsSync as existsSync5,
   lstatSync as lstatSync2,
   mkdirSync as mkdirSync2,
-  mkdtempSync,
+  mkdtempSync as mkdtempSync2,
   readdirSync as readdirSync3,
   readFileSync as readFileSync5,
   realpathSync as realpathSync2,
   renameSync as renameSync2,
   writeFileSync as writeFileSync3
 } from "node:fs";
-import { basename as basename4, dirname as dirname2, isAbsolute as isAbsolute2, join as join6, sep as sep2 } from "node:path";
+import { basename as basename4, dirname as dirname2, isAbsolute as isAbsolute3, join as join6, sep as sep2 } from "node:path";
 var MAX_ARTIFACT_BYTES = 100 * 1024 * 1024;
 var MAX_EXTRACTED_BYTES = 1024 * 1024 * 1024;
 var MAX_TRANSCRIPT_BYTES = 512 * 1024 * 1024;
@@ -4458,7 +4620,7 @@ function parseMarkers(stdout) {
   return { m, sizes };
 }
 function plainRel(rel) {
-  if (!rel || isAbsolute2(rel) || rel.includes("\x00") || rel.includes("\\"))
+  if (!rel || isAbsolute3(rel) || rel.includes("\x00") || rel.includes("\\"))
     return false;
   const segs = rel.split("/").filter((s) => s !== "" && s !== ".");
   return segs.length > 0 && !segs.some((s) => s === ".." || s.toLowerCase() === ".git");
@@ -4503,7 +4665,7 @@ function extractTgz(tgz, parent, maxBytes = MAX_ARTIFACT_BYTES, maxInflated = MA
   const n = Number(execFileSync4("sh", ["-c", `gzip -dc < "$1" | head -c ${maxInflated + 1} | wc -c`, "sh", tgz]).toString().trim());
   if (!(n <= maxInflated))
     throw new Error(`${tgz} inflates past ${(maxInflated / 2 ** 30).toFixed(1)} GB`);
-  const out = mkdtempSync(join6(parent, "x-"));
+  const out = mkdtempSync2(join6(parent, "x-"));
   execFileSync4("/usr/bin/tar", ["-xzf", tgz, "-C", out, "--no-same-owner", "--no-same-permissions"], { stdio: ["ignore", "ignore", "pipe"] });
   return out;
 }
@@ -4523,14 +4685,14 @@ function copyContained(src, dstRoot, rel, overwrite, priv = false) {
     return false;
   mkdirSync2(dirname2(dst), { recursive: true });
   const exec = (lstatSync2(src).mode & 73) !== 0;
-  copyFileSync(src, dst);
+  copyFileSync2(src, dst);
   chmodSync(dst, priv ? 384 : exec ? 493 : 420);
   return true;
 }
 function patchPaths(root, patch, base, tmpParent) {
   if (!lstatSync2(patch).size)
     return [];
-  const env = { ...process.env, GIT_INDEX_FILE: join6(mkdtempSync(join6(tmpParent, "pidx-")), "index") };
+  const env = { ...process.env, GIT_INDEX_FILE: join6(mkdtempSync2(join6(tmpParent, "pidx-")), "index") };
   git(root, ["read-tree", base], env);
   git(root, ["apply", "--cached", "--binary", patch], env);
   const raw = git(root, ["diff-index", "--cached", "--raw", "-z", "--no-renames", base], env).split("\x00");
@@ -4683,7 +4845,7 @@ function landOnBranch(root, a, uuid8, backup) {
     return name;
   const tip = git(root, ["rev-parse", ref]).trim();
   const gitDir = git(root, ["rev-parse", "--absolute-git-dir"]).trim();
-  const tmp = mkdtempSync(join6(backup, "index-"));
+  const tmp = mkdtempSync2(join6(backup, "index-"));
   const env = { ...process.env, GIT_INDEX_FILE: join6(tmp, "index") };
   git(root, ["read-tree", tip], env);
   if (hasPatch)
@@ -5544,12 +5706,12 @@ function userLayerFiles(claudeHome, entries) {
   const files = [], skipped = [];
   for (const top of entries) {
     const abs = join7(claudeHome, top);
-    if (!statSync5(abs, { throwIfNoEntry: false })) {
+    if (!statSync6(abs, { throwIfNoEntry: false })) {
       if (lstatSync3(abs, { throwIfNoEntry: false }))
         skipped.push(top);
       continue;
     }
-    if (statSync5(abs).isFile()) {
+    if (statSync6(abs).isFile()) {
       files.push(top);
       continue;
     }
@@ -5567,7 +5729,7 @@ function userLayerFiles(claudeHome, entries) {
         skipped.push(rel);
         return;
       }
-      const st = statSync5(real);
+      const st = statSync6(real);
       if (st.isFile()) {
         files.push(rel);
         return;
@@ -5612,14 +5774,14 @@ function anonGitEnv() {
   return { ...env, GIT_TERMINAL_PROMPT: "0", GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null", GIT_ASKPASS: "", SSH_ASKPASS: "" };
 }
 function anonLsRemote(url, ref) {
-  const home = mkdtempSync2(join7(tmpdir(), "nomo-anon-"));
+  const home = mkdtempSync3(join7(tmpdir2(), "nomo-anon-"));
   try {
     execFileSync5("git", ["-c", "credential.helper=", "ls-remote", "--exit-code", url, ref], { cwd: "/", env: { ...anonGitEnv(), HOME: home, XDG_CONFIG_HOME: home }, stdio: "ignore", timeout: 20000 });
     return true;
   } catch {
     return false;
   } finally {
-    rmSync2(home, { recursive: true, force: true });
+    rmSync3(home, { recursive: true, force: true });
   }
 }
 function safeBranch(name) {
@@ -5678,7 +5840,7 @@ git -c advice.detachedHead=false checkout -q --detach ${ship.head}`;
 }
 function capCheck(art, git) {
   for (const [box, local] of Object.entries(art)) {
-    const size = statSync5(local).size;
+    const size = statSync6(local).size;
     if (size > MAX_ARTIFACT_BYTES) {
       throw new Error(`${box.split("/").pop()} is ${(size / 1e6).toFixed(0)} MB (cap ${MAX_ARTIFACT_BYTES / 1e6} MB). ` + (git ? "Commit or .gitignore large untracked files." : "Run handoff from a git repo, or trim the folder."));
     }
@@ -5689,7 +5851,7 @@ function stageLocal(args, outDir) {
   const projDir = join7(process.env.HOME, ".claude", "projects", projectDirName(cwd));
   if (!existsSync6(projDir))
     throw new Error(`no Claude Code transcripts for ${cwd} (looked in ${projDir})`);
-  const uuid = typeof args.get("--session") === "string" ? args.get("--session") : latestSession(readdirSync4(projDir).map((name) => ({ name, mtimeMs: statSync5(join7(projDir, name)).mtimeMs })));
+  const uuid = typeof args.get("--session") === "string" ? args.get("--session") : latestSession(readdirSync4(projDir).map((name) => ({ name, mtimeMs: statSync6(join7(projDir, name)).mtimeMs })));
   if (uuid && !UUID_RE3.test(uuid))
     throw new Error(`session id must be a UUID, got ${JSON.stringify(uuid)}`);
   if (!uuid || !existsSync6(join7(projDir, `${uuid}.jsonl`)))
@@ -5764,7 +5926,7 @@ function finishPlan(s, opts = {}) {
       sh("git", ["bundle", "create", "-q", art[bundle], ship.mode === "full" ? "HEAD" : `${ship.base}..HEAD`], root);
       capCheck({ [bundle]: art[bundle] }, git);
     }
-    const size = bundle ? fmtBytes(statSync5(art[bundle]).size) : "nothing to send";
+    const size = bundle ? fmtBytes(statSync6(art[bundle]).size) : "nothing to send";
     repoLine = ship.mode === "full" ? `Repo: full bundle of HEAD (${size}).` : ship.mode === "box" ? `Repo: the box already has ${ship.base.slice(0, 8)}; sending ${n} new commit(s) (${size}).` : `Repo: the box clones ${ship.url} anonymously; sending ${n} unpushed commit(s) (${size}).`;
   }
   const enc = projectDirName(cwd);
@@ -5954,7 +6116,7 @@ function updateCloudAt(path, fn) {
       if (e.code !== "EEXIST")
         throw e;
       try {
-        if (Date.now() - statSync5(lock).mtimeMs > 1e4) {
+        if (Date.now() - statSync6(lock).mtimeMs > 1e4) {
           unlinkSync3(lock);
           continue;
         }
@@ -6114,7 +6276,7 @@ async function boxBusyNow({
       t = (existsSync6(projects) ? readdirSync4(projects) : []).map((p) => join7(projects, p, `${u}.jsonl`)).find((p) => existsSync6(p)) ?? "";
     if (!t)
       return { busy: true, why: `${u.slice(0, 8)} has no transcript yet` };
-    const st = statSync5(t), fd = openSync3(t, "r"), buf = Buffer.alloc(Math.min(65536, st.size));
+    const st = statSync6(t), fd = openSync3(t, "r"), buf = Buffer.alloc(Math.min(65536, st.size));
     try {
       readSync3(fd, buf, 0, buf.length, st.size - buf.length);
     } finally {
@@ -6236,7 +6398,7 @@ async function sendFirstMessage(run, text, uuid) {
   return FIRST_SKIPPED;
 }
 async function bake(key) {
-  const out = mkdtempSync2(join7(tmpdir(), "nomo-bake-"));
+  const out = mkdtempSync3(join7(tmpdir2(), "nomo-bake-"));
   const marketplace = packPlugin(join7(out, "plugin.tgz"));
   console.log(`Creating a bake box (omg preset, ${BOX_SIZE})…`);
   const id = await waitRunning(key, await api(key, "POST", "/sandboxes", { template: "omg", size: BOX_SIZE }));
@@ -6259,7 +6421,7 @@ ${(r.stderr ?? "").slice(-1500)}`);
     console.log(`Published template "${BASE_TEMPLATE}" from snapshot ${snap.id}. New boxes start from it (size ${BOX_SIZE}).`);
   } finally {
     await api(key, "DELETE", `/sandboxes/${id}`).then(() => console.log(`Deleted bake box ${id}.`), (e) => console.log(`Bake box ${id} left behind: ${e.message}`));
-    rmSync2(out, { recursive: true, force: true });
+    rmSync3(out, { recursive: true, force: true });
   }
 }
 function withReload(html) {
@@ -6802,7 +6964,7 @@ async function later(args, keys, worker) {
     ancestors: pidAncestors(process.pid),
     records
   });
-  rmSync2(manifestPath(""), { force: true });
+  rmSync3(manifestPath(""), { force: true });
   const manifest = session ? takeManifest(manifestPath(session)) : undefined;
   const arg = parseLaterArg(args.has("--args-stdin") ? readFileSync6(0, "utf8") : "");
   if (!arg) {
@@ -6894,7 +7056,7 @@ async function phoneLater(args, keys, worker) {
   if (!keys.omg || !keys.openrouter)
     throw new Error("OMG_API_KEY and OPENROUTER_API_KEY must be set (env or ~/.nomo-spike.env)");
   const home = process.env.HOME;
-  rmSync2(moveResultFile(session), { force: true });
+  rmSync3(moveResultFile(session), { force: true });
   const refuse = (why, msg) => {
     writeMoveResult(session, false, undefined, why);
     throw new Error(`not moving ${session}: ${msg}.`);
@@ -7082,19 +7244,19 @@ async function main() {
     return;
   }
   if (args.has("--dry-run")) {
-    const out = mkdtempSync2(join7(tmpdir(), "nomo-handoff-"));
+    const out = mkdtempSync3(join7(tmpdir2(), "nomo-handoff-"));
     let plan;
     try {
       plan = build(args, out, { ls: () => false });
     } catch (e) {
-      rmSync2(out, { recursive: true, force: true });
+      rmSync3(out, { recursive: true, force: true });
       throw e;
     }
     console.log(`DRY RUN: nothing was sent. Artifacts kept in ${out} (delete it when done)`);
     console.log("(The box-copy and public-clone repo paths need the network and are not evaluated in a dry run: shown as the full bundle.)");
     console.log(`session ${plan.uuid}  cwd ${plan.cwd}  repo ${plan.git ? `${plan.root} (${plan.branch})` : "(not git)"}  model ${plan.model}`);
     for (const [box, local] of Object.entries(plan.artifacts))
-      console.log(`  ${local} -> ${box}  (${statSync5(local).size} B)`);
+      console.log(`  ${local} -> ${box}  (${statSync6(local).size} B)`);
     console.log(`keys: OMG_API_KEY ${keys.omg ? "found" : "MISSING"}, OPENROUTER_API_KEY ${keys.openrouter ? "found" : "MISSING"}`);
     console.log(`exec env: ANTHROPIC_BASE_URL=http://127.0.0.1:${RELAY_PORT} (or-relay -> OpenRouter) ANTHROPIC_AUTH_TOKEN=<openrouter key> ANTHROPIC_API_KEY= CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 NOMO_WORKER_URL=${worker}${args.has("--force") ? " NOMO_FORCE=1" : ""}`);
     console.log(`----- box script -----
@@ -7193,7 +7355,7 @@ Target worker: ${worker}`);
   }
   if (!keys.openrouter)
     throw new Error("OPENROUTER_API_KEY not set (env or ~/.nomo-spike.env)");
-  const out = mkdtempSync2(join7(tmpdir(), "nomo-handoff-"));
+  const out = mkdtempSync3(join7(tmpdir2(), "nomo-handoff-"));
   let plan, r, id;
   try {
     const sb = await stageThenBox(args, out, () => ensureBox(omg));
@@ -7240,7 +7402,7 @@ Target worker: ${worker}`);
       r = await start(plan);
     }
   } finally {
-    rmSync2(out, { recursive: true, force: true });
+    rmSync3(out, { recursive: true, force: true });
   }
   const pane = takePairUrl(r.stdout ?? "").rest.replace(/^NOMO_(PAIRED|PAIR_FAILED: .*|REPAIR: .*)$\n?/gm, "");
   if (r.exitCode === 4)
