@@ -8,7 +8,7 @@ import { basename as basename5 } from "node:path";
 
 // src/core/adapter.ts
 import { execFile as execFile2, execFileSync as execFileSync2 } from "node:child_process";
-import { copyFileSync, existsSync as existsSync2, mkdtempSync, rmSync } from "node:fs";
+import { copyFileSync, existsSync as existsSync2, mkdtempSync, rmSync, statSync as statSync2 } from "node:fs";
 import { readdir, readFile as readFile2, stat as stat2 } from "node:fs/promises";
 import { devNull, tmpdir } from "node:os";
 import { promisify as promisify2 } from "node:util";
@@ -2930,23 +2930,74 @@ function antigravityChatTitle(sessionId, transcriptPath, env = process.env) {
   }
   return;
 }
-function antigravityRunStatus(sessionId, transcriptPath, env = process.env) {
-  if (!AG_SQL_SAFE_ID.test(sessionId))
+var runStateCache = new Map;
+function antigravityRunStates(db, now) {
+  let key;
+  try {
+    const main = statSync2(db);
+    const wal = existsSync2(`${db}-wal`) ? statSync2(`${db}-wal`) : undefined;
+    key = `${main.mtimeMs}:${main.size}|${wal?.mtimeMs ?? "-"}:${wal?.size ?? "-"}`;
+  } catch {
     return;
-  const ms = (col) => `coalesce(cast((julianday(${col}) - 2440587.5) * 86400000 as integer), '')`;
-  const where = ` from conversation_summaries where conversation_id='${sessionId}'`;
+  }
+  const cached = runStateCache.get(db);
+  if (cached && cached.key === key) {
+    cached.readAt = now;
+    return cached;
+  }
+  const tmp = mkdtempSync(join2(tmpdir(), "nomo-agy-"));
+  try {
+    for (const ext of ["", "-wal"])
+      if (existsSync2(db + ext))
+        copyFileSync(db + ext, join2(tmp, `c.db${ext}`));
+    const bin = process.platform === "darwin" && existsSync2("/usr/bin/sqlite3") ? "/usr/bin/sqlite3" : "sqlite3";
+    const ms = (col) => `coalesce(cast((julianday(${col}) - 2440587.5) * 86400000 as integer), '')`;
+    const query = (cols) => execFileSync2(bin, [
+      "-init",
+      devNull,
+      "-batch",
+      "-noheader",
+      "-list",
+      "-separator",
+      "\t",
+      join2(tmp, "c.db"),
+      `select conversation_id, status, ${ms("last_modified_time")}, ${cols} from conversation_summaries`
+    ], { timeout: CURSOR_TITLE_TIMEOUT_MS, encoding: "utf8", maxBuffer: 1048576, stdio: ["ignore", "pipe", "ignore"] });
+    let out;
+    try {
+      out = query(`${ms("last_user_input_time")}, not_fully_idle`);
+    } catch {
+      out = query("'', ''");
+    }
+    const rows = new Map;
+    for (const line of out.split(`
+`)) {
+      const [id, status, mod, input, nfi] = line.split("\t");
+      if (!id)
+        continue;
+      const num = (v) => v ? Number(v) : NaN;
+      rows.set(id, {
+        status: status ?? "",
+        ...Number.isFinite(num(mod)) ? { lastModifiedMs: num(mod) } : {},
+        ...Number.isFinite(num(input)) ? { lastUserInputMs: num(input) } : {},
+        ...nfi === "0" || nfi === "1" ? { notFullyIdle: nfi === "1" } : {}
+      });
+    }
+    const entry = { key, readAt: now, rows };
+    runStateCache.set(db, entry);
+    return entry;
+  } catch {
+    return;
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+}
+function antigravityRunStatus(sessionId, transcriptPath, now = Date.now()) {
   for (const db of summariesDbs(transcriptPath)) {
-    const row = sqliteOne(db, `select status || '|' || ${ms("last_modified_time")}${where}`, env);
-    if (!row)
-      continue;
-    const [status, mod] = row.split("|");
-    const lastModifiedMs = mod ? Number(mod) : NaN;
-    const input = Number(sqliteOne(db, `select ${ms("last_user_input_time")}${where}`, env) ?? NaN);
-    return {
-      status: status ?? "",
-      ...Number.isFinite(lastModifiedMs) ? { lastModifiedMs } : {},
-      ...Number.isFinite(input) ? { lastUserInputMs: input } : {}
-    };
+    const snap = antigravityRunStates(db, now);
+    const row = snap?.rows.get(sessionId);
+    if (row)
+      return { ...row, readAt: snap.readAt };
   }
   return;
 }

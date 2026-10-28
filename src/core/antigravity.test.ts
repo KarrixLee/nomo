@@ -18,8 +18,10 @@ import {
 import { decryptBlob } from "./crypto";
 import { Config, interruptFlagFileName, readRecord, SessionRecord, writeInterruptFlagAt } from "./shared";
 import {
-  ANTIGRAVITY_SETTLE_GRACE_MS, antigravityRunSettled, classifySession, correctIdleClaude, isClaudeIdleReapEligible,
+  ANTIGRAVITY_SETTLE_GRACE_MS, antigravityRunSettled, antigravitySettleTick, antigravityTurnContinuing, classifySession,
+  correctIdleClaude, isClaudeIdleReapEligible,
 } from "../entries/cc-watchdog";
+import { markNudged, writeReceipt } from "./antigravity-inbox";
 import { createProcessHygiene, isolatedTestEnv } from "../test/process-hygiene";
 import { plainAge, statusCmd } from "../entries/status-cmd";
 
@@ -540,7 +542,7 @@ function summariesDb(home: string, dir: string, rows: { id: string; title: strin
 
 describe("FIX 1 — a turn that ends with no event is settled", () => {
   const working = (over: Partial<SessionRecord> = {}) => rec({ ts: NOW - ANTIGRAVITY_SETTLE_GRACE_MS, ...over });
-  const idleAt = (ms: number) => () => ({ status: "CASCADE_RUN_STATUS_IDLE", lastModifiedMs: ms });
+  const idleAt = (ms: number) => () => ({ readAt: NOW, status: "CASCADE_RUN_STATUS_IDLE", lastModifiedMs: ms });
 
   test("IDLE written after the row's last event settles it", () => {
     expect(antigravityRunSettled(CONV, working(), NOW, idleAt(NOW - 5_000))).toBe(true);
@@ -550,16 +552,16 @@ describe("FIX 1 — a turn that ends with no event is settled", () => {
     // flipped the status to IDLE and left last_modified_time = last_user_input_time = the prompt.
     const turn = working({ turnStartedAt: Math.floor((NOW - ANTIGRAVITY_SETTLE_GRACE_MS) / 1000) });
     const input = turn.ts - 594;
-    expect(antigravityRunSettled(CONV, turn, NOW, () => ({ status: "CASCADE_RUN_STATUS_IDLE", lastModifiedMs: input, lastUserInputMs: input }))).toBe(true);
+    expect(antigravityRunSettled(CONV, turn, NOW, () => ({ readAt: NOW, status: "CASCADE_RUN_STATUS_IDLE", lastModifiedMs: input, lastUserInputMs: input }))).toBe(true);
     // …but the PREVIOUS turn's prompt never does, and RUNNING never does.
-    expect(antigravityRunSettled(CONV, turn, NOW, () => ({ status: "CASCADE_RUN_STATUS_IDLE", lastModifiedMs: input, lastUserInputMs: input - 60_000 }))).toBe(false);
-    expect(antigravityRunSettled(CONV, turn, NOW, () => ({ status: "CASCADE_RUN_STATUS_RUNNING", lastModifiedMs: input, lastUserInputMs: input }))).toBe(false);
+    expect(antigravityRunSettled(CONV, turn, NOW, () => ({ readAt: NOW, status: "CASCADE_RUN_STATUS_IDLE", lastModifiedMs: input, lastUserInputMs: input - 60_000 }))).toBe(false);
+    expect(antigravityRunSettled(CONV, turn, NOW, () => ({ readAt: NOW, status: "CASCADE_RUN_STATUS_RUNNING", lastModifiedMs: input, lastUserInputMs: input }))).toBe(false);
   });
   test("…but not inside the grace, not RUNNING, not a previous turn's IDLE, not an unparseable time, not another agent", () => {
     expect(antigravityRunSettled(CONV, working({ ts: NOW - 1_000 }), NOW, idleAt(NOW))).toBe(false);
-    expect(antigravityRunSettled(CONV, working(), NOW, () => ({ status: "CASCADE_RUN_STATUS_RUNNING", lastModifiedMs: NOW }))).toBe(false);
+    expect(antigravityRunSettled(CONV, working(), NOW, () => ({ readAt: NOW, status: "CASCADE_RUN_STATUS_RUNNING", lastModifiedMs: NOW }))).toBe(false);
     expect(antigravityRunSettled(CONV, working(), NOW, idleAt(NOW - ANTIGRAVITY_SETTLE_GRACE_MS - 1))).toBe(false);
-    expect(antigravityRunSettled(CONV, working(), NOW, () => ({ status: "CASCADE_RUN_STATUS_IDLE" }))).toBe(false);
+    expect(antigravityRunSettled(CONV, working(), NOW, () => ({ readAt: NOW, status: "CASCADE_RUN_STATUS_IDLE" }))).toBe(false);
     expect(antigravityRunSettled(CONV, working(), NOW, () => undefined)).toBe(false);
     expect(antigravityRunSettled(CONV, working({ agent: "cursor" }), NOW, idleAt(NOW))).toBe(false);
     expect(antigravityRunSettled(CONV, working({ op: "done", lastEvent: "done" }), NOW, idleAt(NOW))).toBe(false);
@@ -577,7 +579,7 @@ describe("FIX 1 — a turn that ends with no event is settled", () => {
     expect(posts[0]).toMatchObject({ op: "done" });
     expect(JSON.parse(await readFile(path, "utf8"))).toMatchObject({ op: "done", lastEvent: "done" });
     expect(await correctIdleClaude(CONFIG, path, CONV, working(), NOW, {
-      post: async () => "delivered", antigravityRunStatus: () => ({ status: "CASCADE_RUN_STATUS_RUNNING", lastModifiedMs: NOW }),
+      post: async () => "delivered", antigravityRunStatus: () => ({ readAt: NOW, status: "CASCADE_RUN_STATUS_RUNNING", lastModifiedMs: NOW }),
     })).toBe("uncorrected");
   });
   test("a dead owner ends the row on the next sweep", () => {
@@ -620,6 +622,96 @@ describe("FIX 1 — a turn that ends with no event is settled", () => {
   });
 });
 
+describe("the 10 s settle tick never overrides a newer or real status (NOM-96)", () => {
+  const TURN = Math.floor((NOW - 30_000) / 1000);
+  const working = (over: Partial<SessionRecord> = {}) => rec({ ts: NOW - 30_000, turnStartedAt: TURN, ...over });
+  const idle = (over: object = {}) => () => ({
+    readAt: NOW, status: "CASCADE_RUN_STATUS_IDLE", lastModifiedMs: NOW - 30_500, lastUserInputMs: NOW - 30_500, notFullyIdle: false, ...over,
+  });
+  const quiet = async () => false;
+  async function reap(r: SessionRecord, deps: Parameters<typeof correctIdleClaude>[5] = {}) {
+    const dir = await tmp();
+    const path = join(dir, `${CONV}.json`);
+    await writeFile(path, JSON.stringify(r));
+    const posts: object[] = [];
+    const out = await correctIdleClaude(CONFIG, path, CONV, r, NOW, {
+      post: async (b) => { posts.push(b); return "delivered"; }, antigravityRunStatus: idle(), antigravityTurnContinuing: quiet,
+      readDecisionHoldFn: async () => null, ...deps,
+    });
+    return { out, posts, after: JSON.parse(await readFile(path, "utf8")) as SessionRecord };
+  }
+
+  test("baseline: a Stop's IDLE settles the row", async () => {
+    expect((await reap(working())).out).toBe("corrected");
+  });
+  test("guard 1 — a new turn that starts mid-tick is never overwritten (re-read before POST/write)", async () => {
+    const newer = working({ ts: NOW - 100, turnStartedAt: Math.floor((NOW - 100) / 1000) });
+    const r = await reap(working(), { readRecord: async () => newer });
+    expect(r.out).toBe("uncorrected");
+    expect(r.posts).toEqual([]);
+    expect(r.after.lastEvent).toBe("working");
+    // …and the DB's prompt must be THIS turn's: the previous turn's IDLE never settles.
+    expect(antigravityRunSettled(CONV, working(), NOW, idle({ lastUserInputMs: NOW - 120_000 }))).toBe(false);
+  });
+  test("guard 2 — a live phone hold (purple hand) is never settled", async () => {
+    const r = await reap(working(), {
+      readDecisionHoldFn: async () => ({ blob: "card", at: NOW - 5_000, pid: 4242 }), holdPidAliveFn: () => true,
+    });
+    expect(r.out).toBe("uncorrected");
+    expect(r.posts).toEqual([]);
+  });
+  test("guard 3 — a Stop-continue nudge or a waking resume keeps the row working", async () => {
+    const dir = await tmp();
+    expect(await antigravityTurnContinuing(CONV, NOW, dir)).toBe(false);
+    await markNudged(dir, CONV, NOW - 5_000);
+    expect(await antigravityTurnContinuing(CONV, NOW, dir)).toBe(true);
+    const dir2 = await tmp();
+    await writeReceipt(dir2, CONV, "mid-wake0001", "w");
+    expect(await antigravityTurnContinuing(CONV, NOW, dir2)).toBe(true);
+    expect((await reap(working(), { antigravityTurnContinuing: async () => true })).out).toBe("uncorrected");
+  });
+  test("guard 4 — a pending phone Stop flag leaves the settle to the interrupt path", async () => {
+    const dir = await tmp();
+    await writeInterruptFlagAt(dir, CONV, NOW - 1_000, ANTIGRAVITY_INTERRUPT_SUFFIX);
+    expect(await antigravityTurnContinuing(CONV, NOW, dir)).toBe(true);
+  });
+  test("guard 5 — a DB copy not confirmed after the row's stamp never settles it", () => {
+    expect(antigravityRunSettled(CONV, working(), NOW, idle({ readAt: NOW - 30_000 }))).toBe(false);
+    expect(antigravityRunSettled(CONV, working(), NOW, idle({ readAt: NOW - 29_999 }))).toBe(true);
+  });
+  test("guard 6 — Antigravity waiting on its OWN permission prompt (RUNNING + not_fully_idle) is never idle", () => {
+    // Real agy 1.4.9, prompt open: CASCADE_RUN_STATUS_RUNNING | not_fully_idle=1.
+    expect(antigravityRunSettled(CONV, working(), NOW, idle({ status: "CASCADE_RUN_STATUS_RUNNING", notFullyIdle: true }))).toBe(false);
+    expect(antigravityRunSettled(CONV, working(), NOW, idle({ notFullyIdle: true }))).toBe(false);
+  });
+  test("the tick reaps only working Antigravity rows, and does nothing with none", async () => {
+    const dir = await tmp();
+    const seen: string[] = [];
+    const reapSpy = (async (_c: Config, _p: string, id: string) => { seen.push(id); return "uncorrected"; }) as unknown as typeof correctIdleClaude;
+    expect(await antigravitySettleTick(CONFIG, { dir, reap: reapSpy })).toBe(0);
+    await writeFile(join(dir, "a.json"), JSON.stringify(working()));
+    await writeFile(join(dir, "b.json"), JSON.stringify(working({ op: "done", lastEvent: "done" })));
+    await writeFile(join(dir, "c.json"), JSON.stringify(working({ agent: "codex" })));
+    expect(await antigravitySettleTick(CONFIG, { dir, reap: reapSpy })).toBe(1);
+    expect(seen).toEqual(["a"]);
+  });
+  test("the run-status read skips the copy while the db and wal are unchanged", async () => {
+    const home = await tmp();
+    summariesDb(home, "antigravity-cli", [{ id: CONV, title: "", status: "CASCADE_RUN_STATUS_RUNNING", mod: "2026-10-27 14:22:27+00:00" }]);
+    const db = join(home, ".gemini", "antigravity-cli", "conversation_summaries.db");
+    expect((await withHome(home, () => antigravityRunStatus(CONV, undefined, 1)))?.status).toBe("CASCADE_RUN_STATUS_RUNNING");
+    // Unreadable but UNCHANGED: a re-copy would fail, so only the cache can still answer.
+    await chmod(db, 0o000);
+    try {
+      expect(await withHome(home, () => antigravityRunStatus(CONV, undefined, 2))).toMatchObject({ status: "CASCADE_RUN_STATUS_RUNNING", readAt: 2 });
+    } finally {
+      await chmod(db, 0o644);
+    }
+    execFileSync("sqlite3", [db, `update conversation_summaries set status='CASCADE_RUN_STATUS_IDLE' where conversation_id='${CONV}'`]);
+    expect((await withHome(home, () => antigravityRunStatus(CONV, undefined, 3)))?.status).toBe("CASCADE_RUN_STATUS_IDLE");
+  });
+});
+
 describe("the Antigravity plugin (plugin/antigravity-plugin)", () => {
   const SRC = join(PLUGIN, "antigravity-plugin");
   test("plugin.json + one SKILL.md per /nomo-* command, frontmatter name = folder, no model auto-run", async () => {
@@ -652,7 +744,8 @@ describe("the Antigravity plugin (plugin/antigravity-plugin)", () => {
     const report = JSON.parse(out);
     expect(report.name).toBe("nomo");
     expect(report.components.skills).toBe(5);
-    expect(report.findings).toEqual([]);
+    // agy 1.4.9 added an advisory "no logo" NOTE; notes are not findings against the plugin's validity.
+    expect(report.findings.filter((f: { severity?: string }) => f.severity !== "note")).toEqual([]);
   }, 40_000);
 });
 

@@ -13,7 +13,7 @@
 // PORTABILITY: bun AND node >= 18 — no `Bun.*` APIs; file IO via node:fs/promises (shared helpers).
 
 import { execFile, execFileSync } from "node:child_process";
-import { copyFileSync, existsSync, mkdtempSync, rmSync } from "node:fs";
+import { copyFileSync, existsSync, mkdtempSync, rmSync, statSync } from "node:fs";
 import { readdir, readFile, stat } from "node:fs/promises";
 import { devNull, tmpdir } from "node:os";
 import { promisify } from "node:util";
@@ -2712,28 +2712,73 @@ export function antigravityChatTitle(sessionId: string, transcriptPath?: string,
   return undefined;
 }
 
-/** The run state Antigravity recorded for a conversation: `status` (e.g. CASCADE_RUN_STATUS_IDLE /
- *  _RUNNING), `last_modified_time` and `last_user_input_time` as epoch ms (undefined when unparseable). Antigravity writes IDLE
- *  even when a turn ends with NO hook event (interrupt, headless auto-deny) — which is what the
- *  watchdog's settle path keys on. Undefined on any failure. */
+/** One conversation's run state as Antigravity recorded it. `status` e.g. CASCADE_RUN_STATUS_IDLE /
+ *  _RUNNING; times in epoch ms (absent when unparseable / the column is missing); `notFullyIdle` is the
+ *  row's own `not_fully_idle` flag; `readAt` is when the database was last confirmed unchanged since the
+ *  copy these values came from — so it is never older than the read itself. */
+export interface AntigravityRunState {
+  status: string; lastModifiedMs?: number; lastUserInputMs?: number; notFullyIdle?: boolean; readAt: number;
+}
+
+/** Per database: the stat key of the copy last read, when it was last confirmed current, and its rows. */
+type RunStateSnapshot = { key: string; readAt: number; rows: Map<string, Omit<AntigravityRunState, "readAt">> };
+const runStateCache = new Map<string, RunStateSnapshot>();
+
+/** Every row of one summaries DB, read from a private temp COPY of db + wal (the desktop app keeps its
+ *  latest status in the WAL while it holds the DB open; the original is never opened at all). The copy is
+ *  skipped while neither file's mtime/size moved since the last one: one stat pair per call. */
+function antigravityRunStates(db: string, now: number): RunStateSnapshot | undefined {
+  let key: string;
+  try {
+    const main = statSync(db);
+    const wal = existsSync(`${db}-wal`) ? statSync(`${db}-wal`) : undefined;
+    key = `${main.mtimeMs}:${main.size}|${wal?.mtimeMs ?? "-"}:${wal?.size ?? "-"}`;
+  } catch { return undefined; }
+  const cached = runStateCache.get(db);
+  if (cached && cached.key === key) { cached.readAt = now; return cached; }
+  const tmp = mkdtempSync(join(tmpdir(), "nomo-agy-"));
+  try {
+    for (const ext of ["", "-wal"]) if (existsSync(db + ext)) copyFileSync(db + ext, join(tmp, `c.db${ext}`));
+    const bin = process.platform === "darwin" && existsSync("/usr/bin/sqlite3") ? "/usr/bin/sqlite3" : "sqlite3";
+    const ms = (col: string) => `coalesce(cast((julianday(${col}) - 2440587.5) * 86400000 as integer), '')`;
+    const query = (cols: string) => execFileSync(bin, ["-init", devNull, "-batch", "-noheader", "-list", "-separator", "\t",
+      join(tmp, "c.db"), `select conversation_id, status, ${ms("last_modified_time")}, ${cols} from conversation_summaries`],
+      { timeout: CURSOR_TITLE_TIMEOUT_MS, encoding: "utf8", maxBuffer: 1_048_576, stdio: ["ignore", "pipe", "ignore"] });
+    let out: string;
+    // An older schema without the newer columns still yields status + time.
+    try { out = query(`${ms("last_user_input_time")}, not_fully_idle`); } catch { out = query("'', ''"); }
+    const rows = new Map<string, Omit<AntigravityRunState, "readAt">>();
+    for (const line of out.split("\n")) {
+      const [id, status, mod, input, nfi] = line.split("\t");
+      if (!id) continue;
+      const num = (v: string | undefined) => (v ? Number(v) : NaN);
+      rows.set(id, {
+        status: status ?? "",
+        ...(Number.isFinite(num(mod)) ? { lastModifiedMs: num(mod) } : {}),
+        ...(Number.isFinite(num(input)) ? { lastUserInputMs: num(input) } : {}),
+        ...(nfi === "0" || nfi === "1" ? { notFullyIdle: nfi === "1" } : {}),
+      });
+    }
+    const entry = { key, readAt: now, rows };
+    runStateCache.set(db, entry);
+    return entry;
+  } catch {
+    return undefined;
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
+/** The run state Antigravity recorded for a conversation (see AntigravityRunState). Antigravity writes
+ *  IDLE even when a turn ends with NO hook event (interrupt, app Stop, headless auto-deny) — which is what
+ *  the watchdog's settle path keys on. Undefined on any failure. */
 export function antigravityRunStatus(
-  sessionId: string, transcriptPath?: string, env: NodeJS.ProcessEnv = process.env,
-): { status: string; lastModifiedMs?: number; lastUserInputMs?: number } | undefined {
-  if (!AG_SQL_SAFE_ID.test(sessionId)) return undefined;
-  const ms = (col: string) => `coalesce(cast((julianday(${col}) - 2440587.5) * 86400000 as integer), '')`;
-  const where = ` from conversation_summaries where conversation_id='${sessionId}'`;
+  sessionId: string, transcriptPath?: string, now: number = Date.now(),
+): AntigravityRunState | undefined {
   for (const db of summariesDbs(transcriptPath)) {
-    const row = sqliteOne(db, `select status || '|' || ${ms("last_modified_time")}${where}`, env);
-    if (!row) continue;
-    const [status, mod] = row.split("|");
-    const lastModifiedMs = mod ? Number(mod) : NaN;
-    // Its own query: a schema without the column must not cost the status read above.
-    const input = Number(sqliteOne(db, `select ${ms("last_user_input_time")}${where}`, env) ?? NaN);
-    return {
-      status: status ?? "",
-      ...(Number.isFinite(lastModifiedMs) ? { lastModifiedMs } : {}),
-      ...(Number.isFinite(input) ? { lastUserInputMs: input } : {}),
-    };
+    const snap = antigravityRunStates(db, now);
+    const row = snap?.rows.get(sessionId);
+    if (row) return { ...row, readAt: snap!.readAt };
   }
   return undefined;
 }

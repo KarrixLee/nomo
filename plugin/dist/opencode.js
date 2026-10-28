@@ -68,7 +68,7 @@ async function decryptBlob(key, blob) {
 
 // src/core/adapter.ts
 import { execFile as execFile2, execFileSync as execFileSync2 } from "node:child_process";
-import { copyFileSync, existsSync as existsSync2, mkdtempSync, rmSync } from "node:fs";
+import { copyFileSync, existsSync as existsSync2, mkdtempSync, rmSync, statSync as statSync2 } from "node:fs";
 import { readdir, readFile as readFile2, stat as stat2 } from "node:fs/promises";
 import { devNull, tmpdir } from "node:os";
 import { promisify as promisify2 } from "node:util";
@@ -2344,6 +2344,7 @@ function antigravityChatTitle(sessionId, transcriptPath, env = process.env) {
   }
   return;
 }
+var runStateCache = new Map;
 async function antigravityFirstPrompt(transcriptPath) {
   if (!antigravityDataDirFor(transcriptPath))
     return;
@@ -3277,11 +3278,11 @@ async function runHook(agent) {
 }
 
 // src/opencode/approvals.ts
-import { appendFileSync as appendFileSync3, statSync as statSync3, truncateSync as truncateSync3 } from "node:fs";
+import { appendFileSync as appendFileSync3, statSync as statSync4, truncateSync as truncateSync3 } from "node:fs";
 
 // src/core/permission.ts
 import { readFile as readFile5, realpath, unlink as unlink3 } from "node:fs/promises";
-import { appendFileSync as appendFileSync2, statSync as statSync2, truncateSync as truncateSync2 } from "node:fs";
+import { appendFileSync as appendFileSync2, statSync as statSync3, truncateSync as truncateSync2 } from "node:fs";
 import { hostname as hostname2 } from "node:os";
 import { basename as basename4, isAbsolute as isAbsolute3, relative, resolve as resolve3 } from "node:path";
 
@@ -3640,7 +3641,7 @@ function rotateTraceOnce(path) {
     return;
   traceRotated = true;
   try {
-    if (statSync2(path).size > TRACE_MAX_BYTES)
+    if (statSync3(path).size > TRACE_MAX_BYTES)
       truncateSync2(path, 0);
   } catch {}
 }
@@ -4633,7 +4634,7 @@ function ocTrace(event) {
     if (!rotated) {
       rotated = true;
       try {
-        if (statSync3(TRACE_PATH).size > TRACE_MAX_BYTES2)
+        if (statSync4(TRACE_PATH).size > TRACE_MAX_BYTES2)
           truncateSync3(TRACE_PATH, 0);
       } catch {}
     }

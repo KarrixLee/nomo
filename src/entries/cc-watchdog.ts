@@ -34,10 +34,11 @@ import { hostname } from "node:os";
 import { basename } from "node:path";
 import { Bytes, decryptBlob, encryptBlob } from "../core/crypto";
 import {
-  antigravitySurface, handleReplyCommand, readReceipts, ReplyCommandDeps, ReplyCommandResult, sweepStrandedReplies,
+  antigravitySurface, handleReplyCommand, nudgedRecently, readReceipts, ReplyCommandDeps, ReplyCommandResult, sweepStrandedReplies,
 } from "../core/antigravity-inbox";
 import { adapterFor, AgentAdapter, allAdapters, antigravityRunStatus, codexAdapter, codexTurnActiveFromTail, CodexPlanPickerEvidence, DiscoveredSession } from "../core/adapter";
-import type { LocateTuiReason } from "../core/adapter";
+import type { AntigravityRunState, LocateTuiReason } from "../core/adapter";
+import { antigravityStopRequested } from "../core/antigravity";
 import { focusTerminalForPid } from "../core/terminal-focus";
 import type { FocusContext, FocusResult } from "../core/terminal-focus";
 import { CodexRemoteInputBridge } from "../core/codex-remote-input-bridge";
@@ -2501,31 +2502,77 @@ export function isClaudeIdleReapEligible(
  *  room for the turn's own Stop (which Antigravity writes alongside the IDLE status) to land first. */
 export const ANTIGRAVITY_SETTLE_GRACE_MS = 10_000;
 
-/** Has an Antigravity turn ended WITHOUT an event? A user interrupt skips PostInvocation and Stop, and a
- *  headless auto-deny exits with neither (verified 2026-10, agy 1.4.8) — but Antigravity still records
- *  the conversation as CASCADE_RUN_STATUS_IDLE. True iff the row is a working antigravity row, quiet for
- *  ANTIGRAVITY_SETTLE_GRACE_MS, and the database says IDLE with a `last_modified_time` AT OR AFTER the
- *  row's last event — an IDLE written before the current turn opened (the previous turn's) never
- *  counts, and an unparseable time never counts either (the 30-min reap remains). A dead `agy` CLI
- *  OWNER is antigravityOwnerGone's case. */
+/** Has an Antigravity turn ended WITHOUT an event? A user interrupt / app Stop skips PostInvocation and
+ *  Stop, and a headless auto-deny exits with neither (verified 2026-10, agy 1.4.8) — but Antigravity still
+ *  records the conversation as CASCADE_RUN_STATUS_IDLE. True iff ALL of:
+ *   - a working antigravity row, hook-quiet for ANTIGRAVITY_SETTLE_GRACE_MS;
+ *   - the database says IDLE and NOT `not_fully_idle` — while Antigravity waits on its OWN permission
+ *     prompt it says RUNNING + not_fully_idle=1 (verified on real agy 1.4.9, NOM-96), so that wait never
+ *     reads as idle;
+ *   - the database state was confirmed current AFTER the row's last event (`readAt` > record.ts): a copy
+ *     taken before a newer hook can never settle that hook's state;
+ *   - the IDLE is THIS turn's: `last_user_input_time` (when known) is this turn's prompt, and either
+ *     `last_modified_time` is at/after the row's last event or that prompt is (a Stop flips the status
+ *     WITHOUT bumping last_modified_time, which stays ~0.6 s BEFORE the PreInvocation stamp — field case
+ *     01e48c30). A previous turn's IDLE never counts; an unparseable time never counts (the 30-min reap
+ *     remains). A dead `agy` CLI OWNER is antigravityOwnerGone's case. */
 export function antigravityRunSettled(
-  sessionId: string, record: SessionRecord, now: number, probe: typeof antigravityRunStatus = antigravityRunStatus,
+  sessionId: string, record: SessionRecord, now: number,
+  probe: (sessionId: string, transcriptPath?: string) => AntigravityRunState | undefined = antigravityRunStatus,
 ): boolean {
   if (recordAgent(record) !== "antigravity") return false;
   if (record.lastEvent !== "working" && record.lastEvent !== "sessionStart") return false;
   if (typeof record.ts !== "number" || now - record.ts < ANTIGRAVITY_SETTLE_GRACE_MS) return false;
   const run = probe(sessionId, typeof record.transcript === "string" && record.transcript ? record.transcript : undefined);
-  if (run?.status !== "CASCADE_RUN_STATUS_IDLE") return false;
-  if (typeof run.lastModifiedMs === "number" && run.lastModifiedMs >= record.ts) return true;
-  // A Stop (app or CLI) flips the status to IDLE WITHOUT bumping last_modified_time, which stays at the
-  // prompt's own write — ~0.6 s BEFORE the PreInvocation hook stamped the row (NOM-96 field case
-  // 01e48c30). The prompt that opened THIS turn proves the IDLE is this turn's, not the previous one's.
-  return typeof run.lastUserInputMs === "number" && typeof record.turnStartedAt === "number" &&
+  if (run?.status !== "CASCADE_RUN_STATUS_IDLE" || run.notFullyIdle === true) return false;
+  if (!(run.readAt > record.ts)) return false;
+  const thisTurnInput = typeof run.lastUserInputMs === "number" && typeof record.turnStartedAt === "number" &&
     run.lastUserInputMs >= record.turnStartedAt * 1000 - ANTIGRAVITY_TURN_INPUT_SLACK_MS;
+  if (typeof run.lastUserInputMs === "number" && typeof record.turnStartedAt === "number" && !thisTurnInput) return false;
+  return (typeof run.lastModifiedMs === "number" && run.lastModifiedMs >= record.ts) || thisTurnInput;
 }
 
 /** How far before the turn's (whole-second) `turnStartedAt` its prompt's `last_user_input_time` may sit. */
 const ANTIGRAVITY_TURN_INPUT_SLACK_MS = 5_000;
+
+/** Is something about to continue this Antigravity turn, so a DB IDLE must not settle it? A phone Stop
+ *  flag is pending (the hook's interrupt path owns that settle — never double-post), a Stop hook just
+ *  answered `continue` for a queued reply (the next invocation is starting), or a resumed run has not
+ *  reached its first step yet (`w` receipts). Never reads the developer's real dir under `bun test`. */
+export async function antigravityTurnContinuing(sessionId: string, now: number, dir: string = SESSIONS_DIR): Promise<boolean> {
+  if (dir === SESSIONS_DIR && lanRunningUnderTest()) return false;
+  try {
+    if (await antigravityStopRequested(dir, sessionId, now)) return true;
+    if (await nudgedRecently(dir, sessionId, now)) return true;
+    return Object.values(await readReceipts(dir, sessionId)).includes("w");
+  } catch { return true; } // unreadable → not provably idle
+}
+
+/** How often working Antigravity rows get their DB-IDLE settle check between sweeps. A sweep that POSTs
+ *  for several sessions can take a minute (each POST ~2 s), so an app Stop otherwise waited that long. */
+export const ANTIGRAVITY_SETTLE_TICK_MS = 10_000;
+
+/** One settle tick: every working Antigravity row runs the SAME idle reap the sweep runs (every guard
+ *  included). No working row → one readdir and nothing else; the run-status read behind it is one stat
+ *  pair per data dir, plus a temp copy only when the database changed. Returns the active row count. */
+export async function antigravitySettleTick(
+  config: Config, deps: { dir?: string; now?: () => number; reap?: typeof correctIdleClaude } = {},
+): Promise<number> {
+  const dir = deps.dir ?? SESSIONS_DIR;
+  let files: string[] = [];
+  try { files = await readdir(dir); } catch { return 0; }
+  let active = 0;
+  for (const file of files) {
+    if (!file.endsWith(".json")) continue;
+    const path = `${dir}/${file}`;
+    const record = await readRecordAt(path);
+    if (!record || recordAgent(record) !== "antigravity" || isDoneState(record)) continue;
+    if (record.lastEvent !== "working" && record.lastEvent !== "sessionStart") continue;
+    active++;
+    await (deps.reap ?? correctIdleClaude)(config, path, basename(file, ".json"), record, (deps.now ?? Date.now)()).catch(() => "uncorrected");
+  }
+  return active;
+}
 
 /** Has a non-done `agy` CLI row lost its owner? classifySession keeps such a row (see there), so the
  *  idle reap settles it done at once — the same done a Stop would have left. */
@@ -2568,7 +2615,9 @@ export interface IdleReapDeps extends DecisionHoldGateDeps {
   pidAlive?: (pid: number) => boolean;
   codexTurnActive?: (pid: number, transcriptPath: string) => Promise<boolean>;
   /** Antigravity's recorded run state for a conversation (see antigravityRunSettled). */
-  antigravityRunStatus?: typeof antigravityRunStatus;
+  antigravityRunStatus?: (sessionId: string, transcriptPath?: string) => AntigravityRunState | undefined;
+  /** See antigravityTurnContinuing (tests). */
+  antigravityTurnContinuing?: (sessionId: string, now: number) => Promise<boolean>;
   /** Re-reads the record from disk immediately before the POST and before every write (see the
    *  stale-snapshot guard at the top of this file). Defaults to a real read. */
   readRecord?: (path: string) => Promise<SessionRecord | null>;
@@ -2604,6 +2653,21 @@ export interface IdleReapDeps extends DecisionHoldGateDeps {
  *   - "revoked"     → the POST 404'd: the pairing is gone server-side → the caller tears down. */
 export async function correctIdleClaude(
   config: Config, path: string, sessionId: string, record: SessionRecord, now: number, deps: IdleReapDeps = {},
+): Promise<"corrected" | "pending" | "uncorrected" | "revoked"> {
+  // The sweep and the Antigravity settle tick can reach the same session at once: one reap at a time,
+  // so a done is never POSTed twice.
+  if (idleReapInFlight.has(sessionId)) return "uncorrected";
+  idleReapInFlight.add(sessionId);
+  try {
+    return await correctIdleOnce(config, path, sessionId, record, now, deps);
+  } finally {
+    idleReapInFlight.delete(sessionId);
+  }
+}
+const idleReapInFlight = new Set<string>();
+
+async function correctIdleOnce(
+  config: Config, path: string, sessionId: string, record: SessionRecord, now: number, deps: IdleReapDeps,
 ): Promise<"corrected" | "pending" | "uncorrected" | "revoked"> {
   const post = deps.post ?? ((body: object) => postEvent(config, body));
   const writeRecord = deps.writeRecord
@@ -2661,8 +2725,10 @@ export async function correctIdleClaude(
       record = { ...record, tuiPid };
     } else if (agent === "antigravity") {
       // The 30-min clock stays the last resort; Antigravity's own IDLE run status settles it sooner.
-      if (!isClaudeIdleReapEligible(record, now) && !antigravityOwnerGone(record, deps.pidAlive) &&
-          !antigravityRunSettled(sessionId, record, now, deps.antigravityRunStatus)) return "uncorrected";
+      if (!isClaudeIdleReapEligible(record, now) && !antigravityOwnerGone(record, deps.pidAlive)) {
+        if (!antigravityRunSettled(sessionId, record, now, deps.antigravityRunStatus)) return "uncorrected";
+        if (await (deps.antigravityTurnContinuing ?? antigravityTurnContinuing)(sessionId, now)) return "uncorrected";
+      }
     } else if (!isClaudeIdleReapEligible(record, now)) {
       return "uncorrected";
     }
@@ -4340,6 +4406,16 @@ async function run(): Promise<void> {
     stopLan();
   };
   activeLanShutdown = stopLan;
+  // The Antigravity settle tick, between sweeps (see ANTIGRAVITY_SETTLE_TICK_MS). Skips a tick while the
+  // previous one is still running; it owns no other agent's cadence.
+  let tickConfig: Config | null = null;
+  let ticking = false;
+  const settleTimer = setInterval(() => {
+    if (ticking || !tickConfig) return;
+    ticking = true;
+    void antigravitySettleTick(tickConfig).catch(() => 0).finally(() => { ticking = false; });
+  }, ANTIGRAVITY_SETTLE_TICK_MS);
+  (settleTimer as unknown as { unref?: () => void }).unref?.();
   try {
     while (true) {
       // A claim can be stolen or removed after startup (upgrade takeover, reset, racing spawn). An
@@ -4347,6 +4423,7 @@ async function run(): Promise<void> {
       // socket, which a successor needs to re-bind — for another tick.
       if (!enforceWatchdogOwnership(shutdown)) return;
       const config = await loadConfig(); // reload each cycle: a mid-pairing config may complete under us
+      tickConfig = config;
       // A real Codex request_user_input response must return on the SAME shared app-server process, so
       // the bridge attaches through `codex app-server proxy` — but ONLY while that control socket exists
       // (re-probed every cycle) and never on the sweep's own await path. Fail-open in both directions: no
@@ -4434,6 +4511,7 @@ async function run(): Promise<void> {
       await new Promise((r) => setTimeout(r, POLL_MS));
     }
   } finally {
+    clearInterval(settleTimer);
     shutdown(); // bridge child AND the LAN socket — a retired daemon must leave no listener behind
     activeBridgeShutdown = undefined;
     activeCodexInterrupt = undefined;
