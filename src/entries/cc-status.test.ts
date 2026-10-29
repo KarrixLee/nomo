@@ -2963,6 +2963,59 @@ describe("runHook turn_id sniff (claude entry invoked inside a Codex session)", 
   }, 20000);
 });
 
+// --- Computer-use access heads-up (notify-only) -------------------------------------------------
+//
+// Claude Code's built-in computer-use access dialog cannot be answered by any hook, so the phone only
+// NAMES what is asked. This drives the REAL claude entry through the three hooks that actually fire —
+// PreToolUse, the permission_prompt Notification ~6-10 s later, PostToolUse — against ONE temp HOME,
+// decrypting the record's blob after each, so the Notification's keep-the-detail wiring is exercised.
+describe("computer-use request_access heads-up", () => {
+  const rawKey = new Uint8Array(32).fill(9);
+  const entry = join(import.meta.dir, "cc-status.ts");
+  const access = { apps: ["iPhone Mirroring", "Notes"], reason: "check the phone" };
+
+  test("detail names the apps, encrypted in the blob; no apps → no detail", () => {
+    expect(detailForHook("PreToolUse", "mcp__computer-use__request_access", access)).toBe("Computer Use: iPhone Mirroring, Notes");
+    expect(detailForHook("PreToolUse", "mcp__computer-use__request_access", { apps: [] })).toBeUndefined();
+    expect(detailForHook("PreToolUse", "mcp__computer-use__request_access", undefined)).toBeUndefined();
+    const long = detailForHook("PreToolUse", "mcp__computer-use__request_access", { apps: Array(100).fill("App") })!;
+    expect(Array.from(long)).toHaveLength(240);
+    expect(long.endsWith("…")).toBe(true);
+    expect(planOp("PreToolUse", { tool_name: "mcp__computer-use__request_access" }, false))
+      .toEqual({ op: "update", prio: 1, status: "needsAttention" });
+  });
+
+  test("PreToolUse → needsAttention + apps; the permission Notification keeps them; PostToolUse → working", async () => {
+    const home = await mkdtemp(join(tmpdir(), "cc-hook-cu-"));
+    try {
+      const ccDir = join(home, ".config", "cc-status");
+      await mkdir(join(ccDir, "sessions"), { recursive: true });
+      await writeFile(join(ccDir, "config.json"), JSON.stringify({
+        url: "http://127.0.0.1:9", pairingId: "p", pcSecret: "s", e2eKeyB64: b64url(rawKey),
+      }));
+      const base = { session_id: "cu-access", cwd: "/x/api-status", transcript_path: "" };
+      const run = async (payload: Record<string, unknown>) => {
+        const proc = spawnTestProcess({
+          cmd: ["bun", entry], env: isolatedTestEnv(home),
+          stdin: Buffer.from(JSON.stringify({ ...base, ...payload })), stdout: "ignore", stderr: "ignore",
+        });
+        await proc.exited;
+        const rec = JSON.parse(await readFile(join(ccDir, "sessions", "cu-access.json"), "utf8")) as { blob: string };
+        return await decryptBlob(rawKey, rec.blob) as Record<string, unknown>;
+      };
+      const tool = { tool_name: "mcp__computer-use__request_access", tool_input: access };
+      expect(await run({ hook_event_name: "PreToolUse", ...tool }))
+        .toMatchObject({ status: "needsAttention", detail: "Computer Use: iPhone Mirroring, Notes" });
+      expect(await run({ hook_event_name: "Notification", notification_type: "permission_prompt", message: "Claude needs your permission" }))
+        .toMatchObject({ status: "needsAttention", detail: "Computer Use: iPhone Mirroring, Notes" });
+      expect(await run({ hook_event_name: "PostToolUse", ...tool }))
+        .toMatchObject({ status: "working", detail: "thinking" });
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  }, 30000);
+});
+
 // --- runHook provisional reconcile (a real codex hook ends the watchdog's discovered provisional) --
 //
 // Codex fires no hook at session OPEN (openai/codex#15269), so the watchdog surfaces a live Codex TUI

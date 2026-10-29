@@ -384,7 +384,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "2.3.52";
+var PLUGIN_VERSION = "2.3.53";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -1771,8 +1771,19 @@ function requestUserInputDetail(toolInput) {
     return;
   const header = typeof q.header === "string" ? q.header.replace(/\s+/g, " ").trim() : "";
   const text = header && !question.toLowerCase().startsWith(`${header.toLowerCase()}:`) ? `${header}: ${question}` : question;
+  return clipDetail(text);
+}
+function clipDetail(text) {
   const characters = Array.from(text);
   return characters.length <= USER_INPUT_DETAIL_MAX ? text : `${characters.slice(0, USER_INPUT_DETAIL_MAX - 1).join("")}…`;
+}
+var COMPUTER_USE_ACCESS_TOOL = "mcp__computer-use__request_access";
+function computerUseAccessDetail(toolInput) {
+  const apps = toolInput?.apps;
+  if (!Array.isArray(apps))
+    return;
+  const names = apps.filter((a) => typeof a === "string").map((a) => a.replace(/\s+/g, " ").trim()).filter((a) => a.length > 0);
+  return names.length > 0 ? clipDetail(`Computer Use: ${names.join(", ")}`) : undefined;
 }
 function aiTitleFromLines(lines) {
   for (let i = lines.length - 1;i >= 0; i--) {

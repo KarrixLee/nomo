@@ -90,10 +90,32 @@ export function requestUserInputDetail(toolInput: unknown): string | undefined {
   const text = header && !question.toLowerCase().startsWith(`${header.toLowerCase()}:`)
     ? `${header}: ${question}`
     : question;
+  return clipDetail(text);
+}
+
+/** Cut a free-text detail to USER_INPUT_DETAIL_MAX characters (by code point), ending in "…" when cut. */
+function clipDetail(text: string): string {
   const characters = Array.from(text);
   return characters.length <= USER_INPUT_DETAIL_MAX
     ? text
     : `${characters.slice(0, USER_INPUT_DETAIL_MAX - 1).join("")}…`;
+}
+
+/** Claude Code's computer-use access tool. Its "Computer Use wants to control these apps" dialog is
+ *  built into Claude Code and answers itself in-process: the tool is pre-allowed by a cliArg rule, so
+ *  no PermissionRequest ever fires and no hook can answer it. The phone can only say WHAT is asked. */
+export const COMPUTER_USE_ACCESS_TOOL = "mcp__computer-use__request_access";
+
+/** The phone's one-line heads-up for a computer-use access request, e.g. "Computer Use: iPhone
+ *  Mirroring". App names are user content, so this rides the encrypted blob's `detail` exactly like
+ *  the request_user_input preview above (the worker never sees it). The `reason` is left out: the app
+ *  list is what the user approves, and the row has one line. Undefined when no app name is readable. */
+export function computerUseAccessDetail(toolInput: unknown): string | undefined {
+  const apps = (toolInput as { apps?: unknown } | null)?.apps;
+  if (!Array.isArray(apps)) return undefined;
+  const names = apps.filter((a): a is string => typeof a === "string")
+    .map((a) => a.replace(/\s+/g, " ").trim()).filter((a) => a.length > 0);
+  return names.length > 0 ? clipDetail(`Computer Use: ${names.join(", ")}`) : undefined;
 }
 
 // --- Title resolution ------------------------------------------------------------------------
@@ -856,7 +878,12 @@ export function codexTailPendingAttentionKind(tail: string): "userInput" | undef
 // Sidechain (subagent) rows are ignored — a Task subagent's own turns aren't the session's block state.
 
 /** The Claude tools that block on the USER (mirrors hook.ts USER_BLOCKING_TOOLS — a question / plan
- *  approval only the human can answer). Kept here so this watchdog backstop is self-contained. */
+ *  approval only the human can answer). Kept here so this watchdog backstop is self-contained.
+ *  DELIBERATELY NOT mirrored: COMPUTER_USE_ACCESS_TOOL. Its dropped-PreToolUse backstop is already the
+ *  permission_prompt Notification Claude Code fires ~6-10 s into the dialog (no slower than this 5 s
+ *  poll), and when every app is already granted the tool returns with no dialog at all — a pending
+ *  tool_use there is not a user block. Adding it would also reach permission.ts's local-answer probe,
+ *  which reads claudeTailPendingApproval for its own (narrower) set. */
 const CLAUDE_USER_BLOCKING_TOOLS = new Set(["AskUserQuestion", "ExitPlanMode"]);
 
 /** The id of a USER-BLOCKING `tool_use` in an assistant row's content array, or undefined when the row

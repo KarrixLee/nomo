@@ -21,9 +21,9 @@
 import { readdir, readFile, unlink } from "node:fs/promises";
 import { hostname } from "node:os";
 import { basename } from "node:path";
-import { Bytes, encryptBlob } from "./crypto";
+import { Bytes, decryptBlob, encryptBlob } from "./crypto";
 import {
-  adapterFor, claudeToolDetail, codexToolDetail, cursorHostInvocation, findProvisionalForPid, requestUserInputDetail,
+  adapterFor, claudeToolDetail, codexToolDetail, COMPUTER_USE_ACCESS_TOOL, computerUseAccessDetail, cursorHostInvocation, findProvisionalForPid, requestUserInputDetail,
   SessionCreationSuppression, TrackedSessionLite,
 } from "./adapter";
 import {
@@ -80,6 +80,9 @@ export function sessionOrigin(
 export function detailForHook(hookName: string, toolName?: string, toolInput?: unknown): string | undefined {
   if (hookName === "PreToolUse" && toolName === "request_user_input") {
     return requestUserInputDetail(toolInput);
+  }
+  if (hookName === "PreToolUse" && toolName === COMPUTER_USE_ACCESS_TOOL) {
+    return computerUseAccessDetail(toolInput);
   }
   if (hookName === "PreToolUse") return toolName ? TOOL_DETAIL[toolName] : undefined;
   // A FAILED tool hands control back to the model exactly like a finished one.
@@ -176,7 +179,14 @@ export async function sessionHoldIsLive(
 /// agent parks, not ~5 min later when an idle notification or stale timeout fires. The matching
 /// PostToolUse (user answered) falls through to the normal working path. Mirrored by each adapter's
 /// watchdog backstop for the case where this very PreToolUse hook is dropped.
-const USER_BLOCKING_TOOLS = new Set(["AskUserQuestion", "ExitPlanMode", "request_user_input"]);
+///
+/// COMPUTER_USE_ACCESS_TOOL is NOTIFY-ONLY: Claude Code's own "Computer Use wants to control these apps"
+/// dialog, which no hook can answer (pre-allowed tool, so no PermissionRequest), so the phone just names
+/// the apps (computerUseAccessDetail) and the user approves on the Mac. Known, accepted side effect:
+/// when every app is already granted Claude Code shows no dialog, so the row flashes needsAttention for
+/// the moment until the PostToolUse lands working. Not mirrored by the Claude watchdog backstop (see
+/// adapter.ts CLAUDE_USER_BLOCKING_TOOLS).
+const USER_BLOCKING_TOOLS = new Set(["AskUserQuestion", "ExitPlanMode", "request_user_input", COMPUTER_USE_ACCESS_TOOL]);
 
 /** What the Claude Code TUI shows, and what stays in the conversation, when the phone interrupts. */
 export const INTERRUPT_STOP_REASON = "Interrupted from Nomo";
@@ -480,6 +490,19 @@ export async function buildEnvelope(
       : undefined
   );
   return { ...base, ...(attentionKind ? { attentionKind } : {}), blob };
+}
+
+/** The `detail` of the needsAttention blob a session record last sent, or undefined (not attention,
+ *  no detail, or sealed under another pairing). Read back from the record's own ciphertext, so the
+ *  plaintext never lands on disk a second time. */
+async function attentionDetailOf(record: SessionRecord | null | undefined, e2eKey: Bytes): Promise<string | undefined> {
+  if (record?.lastEvent !== "needsAttention" || typeof record.blob !== "string") return undefined;
+  try {
+    const detail = (await decryptBlob(e2eKey, record.blob) as Record<string, unknown>).detail;
+    return typeof detail === "string" && detail.length > 0 ? detail : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /** The pending-pairing stash for THIS hook, or null when there's nothing to stash. Built from the same
@@ -1272,8 +1295,12 @@ export async function runHook(agent: AgentKind): Promise<void> {
     // ceiling (NOM-44 phase 4). The tee hands back the exact plaintext buildBlob produced, so the
     // comparison is against the real fitted value rather than a re-derivation that could drift.
     let planFull: string | undefined;
+    // A permission Notification says nothing about WHAT is asked; the needsAttention it lands on may
+    // (the computer-use app list, ~6-10 s earlier). Keep that detail instead of blanking the row.
+    const keptDetail = hookName === "Notification" && plan.status === "needsAttention"
+      ? await attentionDetailOf(existingRecord, config.e2eKey) : undefined;
     const envelope = await buildEnvelope(eventInput, machine, Date.now(), title, config.e2eKey, sentDone, agent, startedAt, turnStartedAt, folder, model, plan, attentionKind, proposedPlan, dbg,
-      (plaintext) => { planFull = fullTextForRecord(proposedPlan, plaintext.plan); });
+      (plaintext) => { planFull = fullTextForRecord(proposedPlan, plaintext.plan); }, keptDetail);
     if (!envelope) return;
 
     // The same cut plan, sealed and pushed to the blind worker so a phone that is NOT on this network can
