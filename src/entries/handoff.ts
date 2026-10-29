@@ -90,7 +90,7 @@ import { scanHandoff, secretSummary } from "../core/transcript-scan";
 import { backLockHolder, clearPark, cloudActive, moveResultFile, type MoveWhy, PARK_DIR, writeBackResult, writeMoveResult, readPark, releaseBackLock, stageLanding, takeBackLock, writePark } from "../core/park";
 import { atomicWrite, CC_DIR, macWorkerUrl, pidAlive, pidAncestors, pidCommand, readRecord, runtimeArgs, SESSIONS_DIR } from "../core/shared";
 import {
-  BOX_MAX_SESSIONS, cancelPending, claimPending, DEFAULT_THEN, EXIT_BOX_GONE, phoneMoveCheck, settleThenStamp, contextTokens, contextTokensOf, GONE_MSG, sizeWarning, TAIL_BYTES, handoffArgv, LATER_LOG, LATER_USAGE, laterStatus, manifestLine, manifestMessage, manifestPath, type Setup, takeManifest, transcriptSecretWarning, needsPairing, parseLaterArg, type Pending, PENDING_PATH, readPending, resolveSession, waitThenHandoff,
+  BOX_MAX_SESSIONS, cancelPending, claimPending, DEFAULT_THEN, EXIT_BOX_FULL, EXIT_BOX_GONE, phoneMoveCheck, settleThenStamp, contextTokens, contextTokensOf, GONE_MSG, sizeWarning, TAIL_BYTES, handoffArgv, LATER_LOG, LATER_USAGE, laterStatus, manifestLine, manifestMessage, manifestPath, type Setup, takeManifest, transcriptSecretWarning, needsPairing, parseLaterArg, type Pending, PENDING_PATH, readPending, resolveSession, waitThenHandoff,
 } from "../core/handoff-later";
 import {
   agentConfigPaths, applyInPlace, atomicWriteBytes, type BoxArtifacts, boxChangedPaths, boxIdle, sessionBusy, copyContained, decideCode, extractTgz,
@@ -938,7 +938,7 @@ export function busyMessage(stdout: string, box: string, uuid: string, root: str
   if (/^NOMO_LOCKED$/m.test(stdout)) return `another handoff to box ${box} is still in progress; rerun this one in a minute.`;
   const full = stdout.match(/^NOMO_FULL=(\d+)$/m);
   if (full) {
-    return `box ${box} already runs ${full[1]} sessions (the cap is ${BOX_MAX_SESSIONS}). Bring one back (--back --session <id>) or stop one (--stop --session <id>) first; --status lists them.`;
+    return `box ${box} has ${full[1]} sessions running or starting (the cap is ${BOX_MAX_SESSIONS}; stopped ones don't count). Stop one (--stop --session <id>) or bring one back (--back --session <id>) first; --status lists them.`;
   }
   return `session ${uuid} is already running on box ${box}. Check it with --status; rerun with --force to replace it (only that session is stopped).`;
 }
@@ -1891,7 +1891,6 @@ async function phoneLater(args: Map<string, string | true>, keys: { omg?: string
     parked: readPark(session) !== undefined,
     active: cloudActive(session),
     needsPairing: needsPairing(cloud, worker),
-    cloudCount: cloud.active?.length ?? 0,
     transcriptExists: (cwd) => existsSync(join(home, ".claude", "projects", projectDirName(cwd), `${session}.jsonl`)),
     trackedSecrets: trackedSecretFiles,
     transcriptSecrets: (cwd) => secretSummary(scanHandoff(join(home, ".claude", "projects", projectDirName(cwd)), session), session),
@@ -2138,7 +2137,9 @@ async function main(): Promise<void> {
   }
   const pane = takePairUrl(r.stdout ?? "").rest.replace(/^NOMO_(PAIRED|PAIR_FAILED: .*|REPAIR: .*)$\n?/gm, ""); // never echo the QR URL
   if (r.exitCode === 4) throw new Error(`the OpenRouter relay did not start on box ${id}:\n${pane.slice(-1000)}`);
-  if (r.exitCode === 3) throw new Error(busyMessage(r.stdout ?? "", id, plan.uuid, plan.root));
+  if (r.exitCode === 3) {
+    throw Object.assign(new Error(busyMessage(r.stdout ?? "", id, plan.uuid, plan.root)), /^NOMO_FULL=/m.test(r.stdout ?? "") ? { exitCode: EXIT_BOX_FULL } : {});
+  }
   if (r.exitCode === 6) {
     updateCloud((c) => ({ ...c, pairedTo: undefined })); // the record was stale: gates now say "needs pairing"
     throw new Error(`box ${id} is not paired to ${worker}, so your phone couldn't see the session; nothing was started. Pair it from a terminal: ${q(process.execPath)} ${q(SELF)} --pair`);
@@ -2162,5 +2163,5 @@ async function main(): Promise<void> {
 }
 
 if (import.meta.main) {
-  main().catch((e) => { console.error(`handoff: ${e.message ?? e}`); process.exit(e?.exitCode === EXIT_BOX_GONE ? EXIT_BOX_GONE : 1); });
+  main().catch((e) => { console.error(`handoff: ${e.message ?? e}`); process.exit([EXIT_BOX_GONE, EXIT_BOX_FULL].includes(e?.exitCode) ? e.exitCode : 1); });
 }

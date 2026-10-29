@@ -659,6 +659,21 @@ exec perl -MFcntl=:flock -e 'open(my $f, ">&=", $ARGV[0]) or die "fd"; flock($f,
     expect(b.handOff(E, "e").code).toBe(0);
   });
 
+  test("NOM-112: records of stopped sessions never count toward the cap; only running ones do", () => {
+    const b = fakeBox();
+    const id = (i: number) => `ffffff${i.toString(16).padStart(2, "0")}-1111-4222-8333-444455556666`;
+    const stale = [0, 1, 2, 3, 4, 5, 6].map(id);
+    // seven sessions handed off, then stopped: their markers (and the Mac's cloud.json) still list them, for --back
+    for (const u of stale) { expect(b.handOff(u, `stale${u.slice(6, 8)}`).code).toBe(0); b.run(backStopScript(u)); }
+    const known = { NOMO_KNOWN: stale.join(" ") };
+    for (const i of [7, 8, 9, 10]) expect(b.handOff(id(i), `live${i}`, known).code).toBe(0); // admitted: 0..3 running
+    const full = b.handOff(id(11), "live11", known);
+    expect(full.code).toBe(3);
+    expect(full.stdout).toContain("NOMO_FULL=4"); // the running four, not the eleven on record
+    expect(busyMessage(full.stdout, "box1", id(11), "/l")).toMatch(/4 sessions running or starting \(the cap is 4; stopped ones don't count\)/);
+    for (const u of stale) expect(existsSync(join(b.d, "root/.nomo-sessions", u))).toBe(true); // their work waits for --back
+  }, 30_000); // 12 fake-box handoffs
+
   test("concurrent handoffs are serialized at admission: same root → exactly one wins; the cap holds", async () => {
     const b = fakeBox();
     const same = await Promise.all([b.runAsync(realScript(A, "race")), b.runAsync(realScript(B, "race"))]);
