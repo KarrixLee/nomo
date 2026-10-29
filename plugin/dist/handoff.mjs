@@ -3,7 +3,7 @@ var __require = /* @__PURE__ */ createRequire(import.meta.url);
 
 // src/entries/handoff.ts
 import { execFileSync as execFileSync5, spawn as spawn2 } from "node:child_process";
-import { closeSync as closeSync3, existsSync as existsSync6, lstatSync as lstatSync3, mkdirSync as mkdirSync3, mkdtempSync as mkdtempSync3, openSync as openSync3, readdirSync as readdirSync4, readFileSync as readFileSync6, readSync as readSync3, realpathSync as realpathSync3, renameSync as renameSync3, rmSync as rmSync3, statSync as statSync6, unlinkSync as unlinkSync3, writeFileSync as writeFileSync4 } from "node:fs";
+import { appendFileSync as appendFileSync3, closeSync as closeSync3, existsSync as existsSync6, lstatSync as lstatSync3, mkdirSync as mkdirSync3, mkdtempSync as mkdtempSync3, openSync as openSync3, readdirSync as readdirSync4, readFileSync as readFileSync6, readSync as readSync3, realpathSync as realpathSync3, renameSync as renameSync3, rmSync as rmSync3, statSync as statSync6, unlinkSync as unlinkSync3, writeFileSync as writeFileSync4 } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { tmpdir as tmpdir2 } from "node:os";
 import { dirname as dirname3, join as join7, relative as relative3, sep as sep3 } from "node:path";
@@ -384,7 +384,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "2.3.50";
+var PLUGIN_VERSION = "2.3.51";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -6225,6 +6225,32 @@ async function boxHealth(omg, deps = {}) {
     console.log((deps.gone ?? boxGone)(id));
   return parked;
 }
+var IDLE_PROBE = `B=$(command -v bun || command -v node)
+${BUSY_PROBE}
+[ -z "$(find ${BOX_SESSIONS} -maxdepth 1 -name '.claim-*' -mmin -15 2>/dev/null)" ] || { rc=1; W="a handoff is starting"; }
+echo "NOMO_KA=$rc:$W"`;
+function cloudBusyHere() {
+  const p = readPending(PENDING_PATH);
+  if (p && PENDING.isHelper(p.helperPid))
+    return "a handoff is in progress";
+  if ((loadCloud().active ?? []).some((s) => backLockHolder(s) !== undefined))
+    return "a --back is in progress";
+  return;
+}
+async function sleepIfIdle(sb, d) {
+  const now = d.now ?? Date.now;
+  const lapsed = (b) => b?.status === "running" && !(Date.parse(b.keepAwakeUntil ?? "") > now());
+  if (!sb || !lapsed(sb) || d.busyHere())
+    return;
+  const ka = (await d.probe(sb.id)).match(/^NOMO_KA=(\d+):(.*)$/m);
+  if (ka?.[1] !== "10")
+    return;
+  const fresh = await d.get();
+  if (fresh?.id !== sb.id || !lapsed(fresh) || d.busyHere())
+    return;
+  await d.hibernate(fresh);
+  return `box ${sb.id.slice(0, 8)} hibernated early: every session idle (${ka[2]}) and its keep-awake lease had ended`;
+}
 async function wakeBox(key, sb, call = api) {
   if (sb.status === "hibernated") {
     console.log(`Waking box ${sb.id}…`);
@@ -6308,7 +6334,10 @@ function keepAwakeLine(status, until, rc, why, wokeAt, fmt = (iso) => new Date(i
   if (rc === 10) {
     if (wokeAt === undefined)
       return `idle (${why}) — sleeps 2 h after it woke${at ? `, or at ${at} if later` : ""}`;
-    return `idle (${why}) — sleeps at ${fmt(new Date(Math.max(lease ?? 0, wokeAt + OMG_AWAKE_MS)).toISOString())}`;
+    const floor = wokeAt + OMG_AWAKE_MS;
+    if (lease !== undefined && lease >= floor)
+      return `idle (${why}) — sleeps at ${at}`;
+    return `idle (${why}) — sleeps ${at ? `a few min after ${at}` : "within a few min"} if this Mac's watchdog is running, else at ${fmt(new Date(floor).toISOString())}`;
   }
   return `running${why ? ` (${why})` : ""}${at ? `, keep-awake until ${at}` : ""}`;
 }
@@ -7289,6 +7318,16 @@ async function main() {
   }
   if (args.has("--box-health")) {
     await boxHealth(omg);
+    const get = () => getBox(omg, loadCloud().sandboxId, api, { wake: false });
+    const line = await sleepIfIdle(await get(), {
+      get,
+      busyHere: cloudBusyHere,
+      hibernate: (sb) => sleepBox(omg, sb),
+      probe: async (id) => (await exec(omg, id, IDLE_PROBE)).stdout ?? ""
+    });
+    if (line)
+      appendFileSync3(LATER_LOG, `[${new Date().toISOString()}] ${line}
+`, { mode: 384 });
     return;
   }
   if (["--status", "--stop", "--pair", "--screen", "--send", "--send-key"].some((f) => args.has(f))) {
@@ -7471,6 +7510,7 @@ export {
   BOX_MAX_SESSIONS,
   FIRST_SKIPPED,
   FIRST_UNCONFIRMED,
+  IDLE_PROBE,
   KNOWN_FLAGS,
   LEFT_LINE,
   OMG_AWAKE_MS,
@@ -7541,6 +7581,7 @@ export {
   sendResult,
   sessionGuard,
   shmEnvFile,
+  sleepIfIdle,
   stageLocal,
   stageThenBox,
   statusScript,

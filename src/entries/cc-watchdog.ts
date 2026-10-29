@@ -1863,16 +1863,19 @@ export function cloudWant(id: string, park: Park | undefined, record: SessionRec
 }
 
 /** NOM-99: while any session is parked "cloud", ask handoff (which holds the box API key) whether the box
- *  still exists, at most once per CLOUD_KEEPALIVE_MS. It unparks every session of a gone box; the next
- *  sweep then posts "box-gone". Nothing parked → no probe. */
+ *  still exists, at most once per BOX_PROBE_MS. It unparks every session of a gone box; the next
+ *  sweep then posts "box-gone". The same run hibernates a running box early once its lease has lapsed and
+ *  every session on it is idle (handoff's sleepIfIdle), so an idle box sleeps a few min after its lease
+ *  instead of omg's 2 h after it woke. Nothing parked → no probe. */
 let boxProbeAt = 0;
+export const BOX_PROBE_MS = 5 * 60_000;
 /** Is a box API key configured (handoff's readKeys: env, else ~/.nomo-spike.env)? No key → no probe. */
 export function hasBoxKey(env = process.env, file = `${homedir()}/.nomo-spike.env`): boolean {
   if (env.OMG_API_KEY) return true;
   try { return /^\s*(?:export\s+)?OMG_API_KEY=\s*\S/m.test(readFileSync(file, "utf8")); } catch { return false; }
 }
 export function maybeProbeBox(now: number, deps: { parked?: () => string[]; spawn?: (id: string) => void; hasKey?: () => boolean } = {}): boolean {
-  if (now - boxProbeAt < CLOUD_KEEPALIVE_MS || !(deps.hasKey ?? hasBoxKey)()) return false;
+  if (now - boxProbeAt < BOX_PROBE_MS || !(deps.hasKey ?? hasBoxKey)()) return false;
   let parked: string[] = [];
   try {
     parked = (deps.parked ?? (() => readdirSync(PARK_DIR).filter((id) => readPark(id)?.state === "cloud")))();

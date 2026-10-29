@@ -214,7 +214,14 @@ home. What that does and doesn't expose:
   not a git repo has nothing tracked and may move.
 - **The box sleeps when its sessions are idle.** It stays awake while a session works, waits on you
   (up to 2 h) or finished under 10 min ago; after that it stops renewing its 30-min lease and
-  hibernates (files and memory kept, deleted after 14 days asleep). `handoff` and `--back` wake it;
+  hibernates (files and memory kept, deleted after 14 days asleep). While a session is parked here,
+  this Mac's watchdog checks every 5 min and hibernates the box as soon as the lease has ended and
+  the box reports every session idle, instead of the provider's floor of 2 h after it woke; never
+  while a handoff or `--back` is in progress. It uses the same box API key and path as `--status`
+  (a `handoff --box-health` child reading `OMG_API_KEY` from its environment or `~/.nomo-spike.env`;
+  never on argv, never logged or written anywhere new). Anything the phone sends to a session on an
+  asleep box (a reply, a key) fails until `handoff` or `--back` wakes it; early sleep makes an idle
+  box reach that state sooner. `handoff` and `--back` wake it;
   on an awake box they, `--pair`, `--stop` and `--send` renew the lease first. Background shell jobs
   (`run_in_background` builds, dev servers) do not keep it awake once the turn has ended: about
   10 min after the session finishes the box may sleep and freeze them. An approval still pending

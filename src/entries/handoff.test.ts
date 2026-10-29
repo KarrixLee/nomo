@@ -1145,9 +1145,50 @@ describe("NOM-101: the box sleeps when its sessions are idle", () => {
 
   test("NOM-114: an idle box sleeps at the later of its lease end and 2 h after it woke (omg's 2-hour rule)", () => {
     const iso = (s: string) => s.slice(11, 16);
-    // Woken 11:54, released at once: the lease ends 12:24 but omg keeps the box awake until 13:54.
-    expect(keepAwakeLine("running", "2026-01-01T12:24:00Z", 10, "a done 57 min ago", Date.parse("2026-01-01T11:54:00Z"), iso)).toBe("idle (a done 57 min ago) — sleeps at 13:54");
+    // Woken 11:54, released at once: the lease ends 12:24; omg alone would keep the box awake until 13:54,
+    // but the watchdog's early sleep hibernates it soon after 12:24.
+    expect(keepAwakeLine("running", "2026-01-01T12:24:00Z", 10, "a done 57 min ago", Date.parse("2026-01-01T11:54:00Z"), iso))
+      .toBe("idle (a done 57 min ago) — sleeps a few min after 12:24 if this Mac's watchdog is running, else at 13:54");
+    expect(keepAwakeLine("running", undefined, 10, "a done 57 min ago", Date.parse("2026-01-01T11:54:00Z"), iso))
+      .toBe("idle (a done 57 min ago) — sleeps within a few min if this Mac's watchdog is running, else at 13:54");
     // Busy past the 2 h mark: the lease decides.
     expect(keepAwakeLine("running", "2026-01-01T15:10:00Z", 10, "a done 11 min ago", Date.parse("2026-01-01T11:54:00Z"), iso)).toBe("idle (a done 11 min ago) — sleeps at 15:10");
+  });
+
+  test("early sleep: hibernate once only when the lease has lapsed, every session is idle and nothing is in flight", async () => {
+    const { sleepIfIdle, IDLE_PROBE } = require("./handoff") as typeof import("./handoff");
+    const now = () => Date.parse("2026-01-01T12:30:00Z");
+    const idle = { id: "sb-0123456789", status: "running", keepAwakeUntil: "2026-01-01T12:24:00Z" };
+    const run = async (sb: any, o: { probe?: string; fresh?: any; here?: string[] } = {}) => {
+      const calls: string[] = [];
+      const here = [...(o.here ?? [])];
+      const line = await sleepIfIdle(sb, {
+        now, get: async () => { calls.push("get"); return o.fresh ?? sb; },
+        probe: async (id) => { calls.push(`probe ${id}`); return o.probe ?? "x\nNOMO_KA=10:a done 12 min ago\n"; },
+        hibernate: async (b) => { calls.push(`hibernate ${b.id}`); },
+        busyHere: () => here.shift(),
+      });
+      return { line, calls };
+    };
+    // idle + lease ended (or never set) → hibernated exactly once, after a fresh GET
+    expect(await run(idle)).toEqual({ line: "box sb-01234 hibernated early: every session idle (a done 12 min ago) and its keep-awake lease had ended",
+      calls: ["probe sb-0123456789", "get", "hibernate sb-0123456789"] });
+    expect((await run({ ...idle, keepAwakeUntil: undefined })).calls).toContain("hibernate sb-0123456789");
+    // a busy or waiting-on-you session (--box-busy exit 0), a probe that failed, or a handoff being admitted on the box
+    for (const probe of ["NOMO_KA=0:a working", "NOMO_KA=0:b waiting on you for 3 min", "", "NOMO_KA=1:a handoff is starting"]) {
+      expect(await run(idle, { probe })).toEqual({ line: undefined, calls: ["probe sb-0123456789"] });
+    }
+    // lease still active, box not running: not even probed
+    expect(await run({ ...idle, keepAwakeUntil: "2026-01-01T12:50:00Z" })).toEqual({ line: undefined, calls: [] });
+    expect(await run({ ...idle, status: "hibernated" })).toEqual({ line: undefined, calls: [] });
+    expect(await run(undefined)).toEqual({ line: undefined, calls: [] });
+    // a handoff/--back in flight on this Mac, before the probe or by the time of the decision
+    expect(await run(idle, { here: ["a --back is in progress"] })).toEqual({ line: undefined, calls: [] });
+    expect((await run(idle, { here: [undefined as any, "a handoff is in progress"] })).calls).toEqual(["probe sb-0123456789", "get"]);
+    // the loop renewed the lease meanwhile (a turn started): the fresh GET wins
+    expect((await run(idle, { fresh: { ...idle, keepAwakeUntil: "2026-01-01T13:00:00Z" } })).calls).toEqual(["probe sb-0123456789", "get"]);
+    // the probe reuses the keep-awake loop's own --box-busy verdict and counts a fresh admission claim as busy
+    expect(IDLE_PROBE).toContain('"$R/dist/handoff.mjs" --box-busy');
+    expect(IDLE_PROBE).toContain("-name '.claim-*' -mmin -15");
   });
 });

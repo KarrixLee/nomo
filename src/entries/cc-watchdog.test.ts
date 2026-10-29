@@ -25,7 +25,7 @@ import {
   watchdogEventHeaders, WAITING_HEARTBEAT_AFTER_MS, withDeadline,
 } from "./cc-watchdog";
 import type { CommandPayload, DrainCommandsDeps, PostDetail, PostOutcome, RecordEntry } from "./cc-watchdog";
-import { backRuns, BRING_BACK_COMMAND_KIND, CLOUD_KEEPALIVE_MS, cloudWant, correctCloudState, handoffCommand, hasBoxKey, maybeProbeBox, resetBoxProbe, withCloudKey } from "./cc-watchdog";
+import { backRuns, BOX_PROBE_MS, BRING_BACK_COMMAND_KIND, cloudWant, correctCloudState, handoffCommand, hasBoxKey, maybeProbeBox, resetBoxProbe, withCloudKey } from "./cc-watchdog";
 import { MOVE_TO_CLOUD_COMMAND_KIND, moveFailed, moveRuns, parseCommandPayload } from "./cc-watchdog";
 import type { Park } from "../core/park";
 import { cloudState, endMovingTurn, readMoveResult, readPark, writeMoveResult, writePark } from "../core/park";
@@ -5320,7 +5320,7 @@ describe("move to cloud from the phone (NOM-94)", () => {
     expect(maybeProbeBox(NOW, { parked: () => [], spawn, hasKey })).toBe(false);
     expect(maybeProbeBox(NOW, { parked: () => [S], spawn, hasKey })).toBe(true);
     expect(maybeProbeBox(NOW + 60_000, { parked: () => [S], spawn, hasKey })).toBe(false);
-    expect(maybeProbeBox(NOW + CLOUD_KEEPALIVE_MS, { parked: () => [S], spawn, hasKey })).toBe(true);
+    expect(maybeProbeBox(NOW + BOX_PROBE_MS, { parked: () => [S], spawn, hasKey })).toBe(true);
     expect(spawned).toEqual([S, S]);
   });
 
