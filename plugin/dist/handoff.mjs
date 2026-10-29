@@ -384,7 +384,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "2.3.48";
+var PLUGIN_VERSION = "2.3.49";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -4584,6 +4584,8 @@ function boxIdle(o) {
     return "idle";
   if (o.lastEvent === "needsAttention")
     return "attention";
+  if (o.awaitingPrompt === true)
+    return "idle";
   if (o.lastEvent && o.lastEvent !== "sessionStart")
     return "busy";
   const rows = [];
@@ -4595,13 +4597,16 @@ function boxIdle(o) {
       rows.push(JSON.parse(line));
     } catch {}
   }
+  let closed = false;
   for (let i = rows.length - 1;i >= 0; i--) {
     const t = rows[i]?.type;
+    if (t === "system" && rows[i]?.subtype === "turn_duration")
+      closed = true;
     if (t === "user")
       return "busy";
     if (t !== "assistant")
       continue;
-    return rows[i]?.message?.stop_reason === "end_turn" && o.quietS >= 15 ? "idle" : "busy";
+    return (closed || rows[i]?.message?.stop_reason === "end_turn") && o.quietS >= 15 ? "idle" : "busy";
   }
   return "busy";
 }
@@ -4872,7 +4877,7 @@ var ATTENTION_AWAKE_S = 2 * 3600;
 var DONE_GRACE_S = 10 * 60;
 function sessionBusy(o, now) {
   const stale = typeof o.ts === "number" && now - o.quietS * 1000 > o.ts + 60000;
-  const state = boxIdle(stale ? { ...o, lastEvent: undefined } : o);
+  const state = boxIdle(stale ? { ...o, lastEvent: undefined, awaitingPrompt: undefined } : o);
   if (state === "busy")
     return { busy: true, why: "working" };
   if (o.quietS < DONE_GRACE_S)
@@ -6281,7 +6286,7 @@ async function boxBusyNow({
     } finally {
       closeSync3(fd);
     }
-    const r = sessionBusy({ lastEvent: rec?.lastEvent, ts: rec?.ts, tail: buf.toString("utf8"), quietS: (now - st.mtimeMs) / 1000 }, now);
+    const r = sessionBusy({ lastEvent: rec?.lastEvent, awaitingPrompt: rec?.awaitingPrompt, ts: rec?.ts, tail: buf.toString("utf8"), quietS: (now - st.mtimeMs) / 1000 }, now);
     if (r.busy)
       return { busy: true, why: `${u.slice(0, 8)} ${r.why}` };
     idle.push(`${u.slice(0, 8)} ${r.why}`);
@@ -6529,6 +6534,7 @@ ${sessionGuard(uuid)}
 tmux has-session -t "=$T" 2>/dev/null || { echo NOMO_GONE; exit 0; }
 F=${BOX_CC}/sessions/${uuid}.json
 [ -f "$F" ] && echo "NOMO_EVENT=$(grep -o '"lastEvent": *"[^"]*"' "$F" | head -1 | cut -d'"' -f4)"
+grep -qs '"awaitingPrompt": *true' "$F" && echo NOMO_AWAITING=1
 T=/root/.claude/projects/${enc}/${uuid}.jsonl
 [ -f "$T" ] || { echo NOMO_NOTRANSCRIPT; exit 0; }
 echo "NOMO_AGE=$(( $(date +%s) - $(stat -c %Y "$T") ))"
@@ -6673,7 +6679,7 @@ ${sameWindowBackLine(parkedAtStart.resume ?? uuid)}`);
       const head = at < 0 ? out : out.slice(0, at), tail = at < 0 ? "" : out.slice(at + `NOMO_TAIL
 `.length);
       const { m } = parseMarkers(head);
-      state = boxIdle({ lastEvent: m.EVENT || undefined, tail, quietS: Number(m.AGE ?? 0) });
+      state = boxIdle({ lastEvent: m.EVENT || undefined, awaitingPrompt: m.AWAITING === "1", tail, quietS: Number(m.AGE ?? 0) });
       if (state === "idle")
         break;
       if (Date.now() > end) {

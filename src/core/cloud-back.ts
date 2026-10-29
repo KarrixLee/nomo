@@ -196,12 +196,18 @@ export function transcriptAction(snap: { tBytes: number; tSha: string } | undefi
 export type Idle = "idle" | "attention" | "busy";
 
 /** Is the box session at a turn boundary? Nomo's own record wins (done idle, needsAttention
- *  is a question only the user can answer); without one, the transcript must end in an `end_turn`
- *  assistant line followed only by non-conversation meta, and have been quiet for 15s. `tail` is the
- *  file's last 64 KiB, so its first line may be torn. */
-export function boxIdle(o: { lastEvent?: string; tail: string; quietS: number }): Idle {
+ *  is a question only the user can answer, awaitingPrompt is opened and never prompted); without one,
+ *  the transcript's last conversation line must be an assistant line that closed the turn (`end_turn`,
+ *  or followed by Claude Code's `turn_duration` row), then only non-conversation meta, and quiet for
+ *  15s. `tail` is the file's last 64 KiB, so its first line may be torn. */
+export function boxIdle(o: { lastEvent?: string; awaitingPrompt?: boolean; tail: string; quietS: number }): Idle {
   if (o.lastEvent === "done") return "idle";
   if (o.lastEvent === "needsAttention") return "attention";
+  // NOM-114: `claude --resume` on the box (every handoff) leaves the session at the empty prompt with
+  // lastEvent "sessionStart", or "working" over a done record from an earlier stint. The hook's
+  // awaitingPrompt marker is the one signal that knows no turn is open (any later hook clears it), so
+  // it wins; without it the Mac's old transcript decided, and the box never slept.
+  if (o.awaitingPrompt === true) return "idle";
   // sessionStart alone proves nothing: a compact's SessionStart fires mid-turn. Ask the transcript.
   if (o.lastEvent && o.lastEvent !== "sessionStart") return "busy";
   const rows: any[] = [];
@@ -209,11 +215,13 @@ export function boxIdle(o: { lastEvent?: string; tail: string; quietS: number })
     if (!line.trim()) continue;
     try { rows.push(JSON.parse(line)); } catch { /* the torn first (or last) line */ }
   }
+  let closed = false; // a turn_duration row after the last conversation line: Claude Code ended the turn
   for (let i = rows.length - 1; i >= 0; i--) {
     const t = rows[i]?.type;
+    if (t === "system" && rows[i]?.subtype === "turn_duration") closed = true;
     if (t === "user") return "busy";
     if (t !== "assistant") continue;
-    return rows[i]?.message?.stop_reason === "end_turn" && o.quietS >= 15 ? "idle" : "busy";
+    return (closed || rows[i]?.message?.stop_reason === "end_turn") && o.quietS >= 15 ? "idle" : "busy";
   }
   return "busy";
 }
@@ -498,11 +506,11 @@ export const DONE_GRACE_S = 10 * 60;
 /** Should this box session keep the box awake? Working: yes. Waiting on the user: for ATTENTION_AWAKE_S.
  *  Done: for DONE_GRACE_S. The clock is the record's `ts` (the hook event that set lastEvent) when the
  *  record decided, else the transcript's quiet time. Returns why, for the box handoff log. */
-export function sessionBusy(o: { lastEvent?: string; ts?: number; tail: string; quietS: number }, now: number): { busy: boolean; why: string } {
-  // A done/needsAttention record older than the transcript's last write (60s slack: meta lines land after
-  // the Stop hook) is stale, e.g. a hook that never fired for the next turn: the transcript decides.
+export function sessionBusy(o: { lastEvent?: string; awaitingPrompt?: boolean; ts?: number; tail: string; quietS: number }, now: number): { busy: boolean; why: string } {
+  // A record older than the transcript's last write (60s slack: meta lines land after the Stop hook) is
+  // stale, e.g. a hook that never fired for the next turn: the transcript decides.
   const stale = typeof o.ts === "number" && now - o.quietS * 1000 > o.ts + 60_000;
-  const state = boxIdle(stale ? { ...o, lastEvent: undefined } : o);
+  const state = boxIdle(stale ? { ...o, lastEvent: undefined, awaitingPrompt: undefined } : o);
   if (state === "busy") return { busy: true, why: "working" };
   // A transcript written in the last DONE_GRACE_S is busy whatever the record says.
   if (o.quietS < DONE_GRACE_S) return { busy: true, why: `active ${Math.floor(Math.max(0, o.quietS) / 60)} min ago` };
