@@ -12,7 +12,7 @@
 // refused up front with the terminal command instead.
 
 import { appendFileSync, closeSync, fstatSync, linkSync, lstatSync, openSync, readFileSync, readSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
-import { basename } from "node:path";
+import { basename, relative, resolve } from "node:path";
 import { claudeDesktopInvocation, claudeHeadlessInvocation } from "./adapter";
 import { clearPark, type MoveWhy, readPark, stamp, writePark } from "./park";
 import { isSecretName } from "./readiness";
@@ -67,13 +67,33 @@ const ENV_NAME_MAX = 64;
 // space/quote/bracket. Relative paths (`src/x.ts`) and URLs (`https://…/…`) are fine.
 const PATHISH = /(?:^|[\s"'`(\[<=,])(?:~[\w.-]*(?:\/|\s|$)|\$\{?HOME\b|\/[^\s/]+\/|[A-Za-z]:[\\/])/;
 
+// A path character, and what may follow a path: sentence punctuation, then a delimiter or the end.
+const PATH_CH = String.raw`[^\s"'\`()\[\]<>,;]`;
+const PATH_END = String.raw`(?=[.!?:]*(?:[\s"'\`()\[\]<>,;]|$))`;
+
+/** The project's own absolute paths in a note, rewritten relative to `cwd` (where the box session runs:
+ *  the repo is recreated there at the same absolute path). `root` is the git toplevel, else cwd. Models
+ *  name the project by its absolute path all the time, and that alone used to drop the whole manifest.
+ *  Only paths under root change, so anything outside the project (or home-relative) is still PATHISH. */
+export function relativizeNote(note: string, root: string, cwd: string): string {
+  const r = root.replace(/\/+$/, "");
+  if (!r.startsWith("/") || r.length < 2) return note;
+  const esc = r.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const re = new RegExp(String.raw`(?<![^\s"'\`(\[<=,])${esc}(?:/${PATH_CH}*)?${PATH_END}`, "g");
+  return note.replace(re, (p) => {
+    const abs = resolve(p); // `/root/../x` escapes the project: left as is, so PATHISH rejects it
+    return abs === r || abs.startsWith(`${r}/`) ? relative(cwd, abs) || "the project folder" : p;
+  });
+}
+
 export interface Manifest { note?: string; env: string[] }
 export type ManifestResult = { manifest: Manifest } | { invalid: string };
 
 export const manifestPath = (session: string): string => `${CC_DIR}/handoff-manifest-${session}.json`;
 
-/** Strict check of a manifest file's text. Never echoes any of it in a reason. */
-export function validateManifest(text: string): ManifestResult {
+/** Strict check of a manifest file's text. Never echoes any of it in a reason. `base` (the session's
+ *  project root and cwd) lets the note name project paths absolutely: they are made relative first. */
+export function validateManifest(text: string, base?: { root: string; cwd: string }): ManifestResult {
   if (Buffer.byteLength(text) > MANIFEST_MAX_BYTES) return { invalid: "over 4 KB" };
   if (textHasSecret(text)) return { invalid: "looks like it holds a secret" };
   let v: any;
@@ -83,7 +103,7 @@ export function validateManifest(text: string): ManifestResult {
   const m: Manifest = { env: [] };
   if (v.note !== undefined) {
     if (typeof v.note !== "string") return { invalid: "note is not text" };
-    const note: string = v.note.trim();
+    const note: string = base ? relativizeNote(v.note.trim(), base.root, base.cwd) : v.note.trim();
     if (note.length > NOTE_MAX) return { invalid: `note over ${NOTE_MAX} characters` };
     if (/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/.test(note)) return { invalid: "note has control characters or line breaks" };
     if (PATHISH.test(note)) return { invalid: "note names an absolute or home path" };
@@ -99,14 +119,14 @@ export function validateManifest(text: string): ManifestResult {
 }
 
 /** Read, then delete (always: it is single-use), this session's manifest. undefined when there is none. */
-export function takeManifest(path: string, now = Date.now()): ManifestResult | undefined {
+export function takeManifest(path: string, now = Date.now(), base?: { root: string; cwd: string }): ManifestResult | undefined {
   let st;
   try { st = lstatSync(path); } catch { return undefined; }
   try {
     if (!st.isFile()) return { invalid: "not a regular file" };
     if (st.size > MANIFEST_MAX_BYTES) return { invalid: "over 4 KB" };
     if (now - st.mtimeMs > MANIFEST_MAX_AGE_MS) return { invalid: "stale, from an earlier handoff" };
-    return validateManifest(readFileSync(path, "utf8"));
+    return validateManifest(readFileSync(path, "utf8"), base);
   } catch { return { invalid: "unreadable" }; } finally { rmSync(path, { force: true }); }
 }
 

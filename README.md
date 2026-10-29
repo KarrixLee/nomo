@@ -174,7 +174,10 @@ home. What that does and doesn't expose:
   `^[A-Z_][A-Z0-9_]*$` and at most 64 characters, so a `NAME=value` can't get in; a note of at most 300
   characters with no line breaks or control characters, no absolute or home path (`/a/b…`, `~/`,
   `$HOME`, `C:\`) and no secret-looking file name (`isSecretName`); and the whole file must pass the
-  transcript secret scanner above. One failure and the whole manifest is ignored, with one
+  transcript secret scanner above. Before the path check, paths inside the project folder (the git
+  root, else the session's folder) are rewritten relative to the session's folder (`relativizeNote`),
+  since the box recreates the project at the same place; a path that leaves the project (another
+  folder, a `..` escape, anything under `~/`) still fails it. One failure and the whole manifest is ignored, with one
   `Handoff manifest ignored (…)` line that never echoes its content; the box then gets the usual first
   message. Setup commands never come from the model: they are derived from lockfiles only
   (`setupSteps` in `src/core/readiness.ts`, e.g. `bun install`, `(cd 'web' && pnpm install)`, relative

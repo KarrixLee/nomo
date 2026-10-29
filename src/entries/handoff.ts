@@ -1866,17 +1866,18 @@ async function later(args: Map<string, string | true>, keys: { omg?: string; ope
   // NOM-106: read + deleted before any check can bail, so it never lingers. An empty-id one (written with
   // CLAUDE_SESSION_ID unset) belongs to no session: just deleted.
   rmSync(manifestPath(""), { force: true });
-  const manifest = session ? takeManifest(manifestPath(session)) : undefined;
+  const home = process.env.HOME!;
+  // The project folder comes first (no check bails in it): the manifest's note may name it absolutely.
+  const cwd = session ? [process.cwd(), (await readRecord(session))?.cwd]
+    .find((c): c is string => !!c && existsSync(join(home, ".claude", "projects", projectDirName(c), `${session}.jsonl`))) : undefined;
+  let root: string | undefined;
+  if (cwd) try { root = execFileSync("git", ["rev-parse", "--show-toplevel"], { cwd, stdio: ["ignore", "pipe", "ignore"] }).toString().trim(); } catch { /* not git */ }
+  const manifest = session ? takeManifest(manifestPath(session), Date.now(), cwd ? { root: root ?? cwd, cwd } : undefined) : undefined;
   const arg = parseLaterArg(args.has("--args-stdin") ? readFileSync(0, "utf8") : "");
   if (!arg) { console.log(LATER_USAGE); process.exitCode = 1; return; }
   if (!session || !claudePid) throw new Error("could not tell which Claude Code session this is. Run /nomo-cc:handoff inside the session you want to move.");
   if (!keys.omg || !keys.openrouter) throw new Error("OMG_API_KEY and OPENROUTER_API_KEY must be set (env or ~/.nomo-spike.env)");
-  const home = process.env.HOME!;
-  const cwd = [process.cwd(), (await readRecord(session))?.cwd]
-    .find((c): c is string => !!c && existsSync(join(home, ".claude", "projects", projectDirName(c), `${session}.jsonl`)));
   if (!cwd) throw new Error(`no transcript for session ${session} under ${process.cwd()}. cd to the session's project folder and retry.`);
-  let root: string | undefined;
-  try { root = execFileSync("git", ["rev-parse", "--show-toplevel"], { cwd, stdio: ["ignore", "pipe", "ignore"] }).toString().trim(); } catch { /* not git */ }
   const refusal = root ? packRefusal(root, home, () => false) : packRefusal(cwd, home);
   if (refusal) throw new Error(`refusing to hand off: ${refusal}. Run it from a project folder.`);
   // NOM-103: before anything is parked or started, so a refusal leaves the window as it was.

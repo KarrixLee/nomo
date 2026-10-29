@@ -555,6 +555,20 @@ describe("handoff manifest (NOM-106)", () => {
     expect("invalid" in r && r.invalid).toContain(reason);
   });
 
+  test("the project's own absolute paths in the note are made relative, not a reason to drop the manifest", () => {
+    const base = { root: "/Users/me/app", cwd: "/Users/me/app" };
+    const note = (n: string, b = base) => validateManifest(JSON.stringify({ note: n, env: ["DATABASE_URL"] }), b);
+    expect(note("Editing /Users/me/app/src/x.ts:12 in /Users/me/app. Next: run (/Users/me/app/test).")).toEqual({
+      manifest: { note: "Editing src/x.ts:12 in the project folder. Next: run (test).", env: ["DATABASE_URL"] },
+    });
+    // relative to the session's folder when it sits below the git root
+    expect(note("compare /r/api/a.ts", { root: "/r", cwd: "/r/web" })).toEqual({ manifest: { note: "compare ../api/a.ts", env: ["DATABASE_URL"] } });
+    // still rejected: outside the project, a sibling sharing the prefix, a `..` escape, home paths, and no base
+    for (const n of ["see /Users/me/other/x.ts", "see /Users/me/app2/x.ts", "see /Users/me/app/../other/x", "see ~/app/x"])
+      expect(note(n)).toEqual({ invalid: "note names an absolute or home path" });
+    expect(validateManifest(JSON.stringify({ note: "edit /Users/me/app/x.ts" }))).toEqual({ invalid: "note names an absolute or home path" });
+  });
+
   test("a secret-looking value anywhere rejects the whole file, and the reason never echoes it", () => {
     const key = fakeKey();
     for (const text of [JSON.stringify({ note: `use ${key} for the API` }), JSON.stringify({ note: "x", env: [] }).replace("}", `,"k":"${key}"}`),
@@ -600,7 +614,7 @@ describe("handoff manifest (NOM-106)", () => {
   test("later() takes the manifest (and drops an empty-id one) before any check can bail", () => {
     const src = readFileSync(join(import.meta.dir, "../entries/handoff.ts"), "utf8");
     const fn = src.slice(src.indexOf("async function later("), src.indexOf("function arm("));
-    const take = fn.indexOf("takeManifest(manifestPath(session))");
+    const take = fn.indexOf("takeManifest(manifestPath(session)");
     expect(fn.indexOf('rmSync(manifestPath(""), { force: true })')).toBeGreaterThan(-1);
     expect(take).toBeGreaterThan(-1);
     for (const bail of ["LATER_USAGE", "could not tell which", "OMG_API_KEY"]) expect(take).toBeLessThan(fn.indexOf(bail));

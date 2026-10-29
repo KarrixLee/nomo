@@ -6,7 +6,7 @@ import { execFileSync as execFileSync5, spawn as spawn2 } from "node:child_proce
 import { appendFileSync as appendFileSync3, closeSync as closeSync3, existsSync as existsSync6, lstatSync as lstatSync3, mkdirSync as mkdirSync3, mkdtempSync as mkdtempSync3, openSync as openSync3, readdirSync as readdirSync4, readFileSync as readFileSync6, readSync as readSync3, realpathSync as realpathSync3, renameSync as renameSync3, rmSync as rmSync3, statSync as statSync6, unlinkSync as unlinkSync3, writeFileSync as writeFileSync4 } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { tmpdir as tmpdir2 } from "node:os";
-import { dirname as dirname3, join as join7, relative as relative3, sep as sep3 } from "node:path";
+import { dirname as dirname3, join as join7, relative as relative4, sep as sep3 } from "node:path";
 import { fileURLToPath as fileURLToPath2 } from "node:url";
 
 // src/core/crypto.ts
@@ -384,7 +384,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "2.3.52";
+var PLUGIN_VERSION = "2.3.53";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -4049,7 +4049,7 @@ function readMoveResult(id, since, dir = BACK_LOCK_DIR) {
 
 // src/core/handoff-later.ts
 import { appendFileSync as appendFileSync2, closeSync as closeSync2, fstatSync, linkSync, lstatSync, openSync as openSync2, readFileSync as readFileSync4, readSync as readSync2, rmSync as rmSync2, unlinkSync as unlinkSync2, writeFileSync as writeFileSync2 } from "node:fs";
-import { basename as basename3 } from "node:path";
+import { basename as basename3, relative as relative3, resolve as resolve3 } from "node:path";
 var PENDING_PATH = `${CC_DIR}/handoff-pending.json`;
 var LATER_LOG = `${CC_DIR}/handoff.log`;
 var LATER_CAP_MS = 30 * 60000;
@@ -4069,8 +4069,21 @@ var ENV_MAX = 20;
 var ENV_NAME = /^[A-Z_][A-Z0-9_]*$/;
 var ENV_NAME_MAX = 64;
 var PATHISH = /(?:^|[\s"'`(\[<=,])(?:~[\w.-]*(?:\/|\s|$)|\$\{?HOME\b|\/[^\s/]+\/|[A-Za-z]:[\\/])/;
+var PATH_CH = String.raw`[^\s"'\`()\[\]<>,;]`;
+var PATH_END = String.raw`(?=[.!?:]*(?:[\s"'\`()\[\]<>,;]|$))`;
+function relativizeNote(note, root, cwd) {
+  const r = root.replace(/\/+$/, "");
+  if (!r.startsWith("/") || r.length < 2)
+    return note;
+  const esc = r.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const re = new RegExp(String.raw`(?<![^\s"'\`(\[<=,])${esc}(?:/${PATH_CH}*)?${PATH_END}`, "g");
+  return note.replace(re, (p) => {
+    const abs = resolve3(p);
+    return abs === r || abs.startsWith(`${r}/`) ? relative3(cwd, abs) || "the project folder" : p;
+  });
+}
 var manifestPath = (session) => `${CC_DIR}/handoff-manifest-${session}.json`;
-function validateManifest(text) {
+function validateManifest(text, base) {
   if (Buffer.byteLength(text) > MANIFEST_MAX_BYTES)
     return { invalid: "over 4 KB" };
   if (textHasSecret(text))
@@ -4089,7 +4102,7 @@ function validateManifest(text) {
   if (v.note !== undefined) {
     if (typeof v.note !== "string")
       return { invalid: "note is not text" };
-    const note = v.note.trim();
+    const note = base ? relativizeNote(v.note.trim(), base.root, base.cwd) : v.note.trim();
     if (note.length > NOTE_MAX)
       return { invalid: `note over ${NOTE_MAX} characters` };
     if (/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/.test(note))
@@ -4110,7 +4123,7 @@ function validateManifest(text) {
   }
   return { manifest: m };
 }
-function takeManifest(path, now = Date.now()) {
+function takeManifest(path, now = Date.now(), base) {
   let st;
   try {
     st = lstatSync(path);
@@ -4124,7 +4137,7 @@ function takeManifest(path, now = Date.now()) {
       return { invalid: "over 4 KB" };
     if (now - st.mtimeMs > MANIFEST_MAX_AGE_MS)
       return { invalid: "stale, from an earlier handoff" };
-    return validateManifest(readFileSync4(path, "utf8"));
+    return validateManifest(readFileSync4(path, "utf8"), base);
   } catch {
     return { invalid: "unreadable" };
   } finally {
@@ -5700,7 +5713,7 @@ function packList(root, entries, skipDir = () => false) {
   return Buffer.from(out.map((p) => p + "\x00").join(""));
 }
 function packRefusal(dir, home, has = existsSync6) {
-  const rel = relative3(dir, home);
+  const rel = relative4(dir, home);
   if (rel !== ".." && !rel.startsWith(".." + sep3))
     return `${dir} is your home folder or contains it`;
   const hit = SENSITIVE2.find((p) => has(join7(dir, p)));
@@ -7016,7 +7029,14 @@ async function later(args, keys, worker) {
     records
   });
   rmSync3(manifestPath(""), { force: true });
-  const manifest = session ? takeManifest(manifestPath(session)) : undefined;
+  const home = process.env.HOME;
+  const cwd = session ? [process.cwd(), (await readRecord(session))?.cwd].find((c) => !!c && existsSync6(join7(home, ".claude", "projects", projectDirName(c), `${session}.jsonl`))) : undefined;
+  let root;
+  if (cwd)
+    try {
+      root = execFileSync5("git", ["rev-parse", "--show-toplevel"], { cwd, stdio: ["ignore", "pipe", "ignore"] }).toString().trim();
+    } catch {}
+  const manifest = session ? takeManifest(manifestPath(session), Date.now(), cwd ? { root: root ?? cwd, cwd } : undefined) : undefined;
   const arg = parseLaterArg(args.has("--args-stdin") ? readFileSync6(0, "utf8") : "");
   if (!arg) {
     console.log(LATER_USAGE);
@@ -7027,14 +7047,8 @@ async function later(args, keys, worker) {
     throw new Error("could not tell which Claude Code session this is. Run /nomo-cc:handoff inside the session you want to move.");
   if (!keys.omg || !keys.openrouter)
     throw new Error("OMG_API_KEY and OPENROUTER_API_KEY must be set (env or ~/.nomo-spike.env)");
-  const home = process.env.HOME;
-  const cwd = [process.cwd(), (await readRecord(session))?.cwd].find((c) => !!c && existsSync6(join7(home, ".claude", "projects", projectDirName(c), `${session}.jsonl`)));
   if (!cwd)
     throw new Error(`no transcript for session ${session} under ${process.cwd()}. cd to the session's project folder and retry.`);
-  let root;
-  try {
-    root = execFileSync5("git", ["rev-parse", "--show-toplevel"], { cwd, stdio: ["ignore", "pipe", "ignore"] }).toString().trim();
-  } catch {}
   const refusal = root ? packRefusal(root, home, () => false) : packRefusal(cwd, home);
   if (refusal)
     throw new Error(`refusing to hand off: ${refusal}. Run it from a project folder.`);
