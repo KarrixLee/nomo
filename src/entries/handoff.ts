@@ -51,6 +51,9 @@
 // waiting on the user < 2h, or done < 10 min ago, read from the box's own Nomo records). Otherwise it
 // stops renewing, the lease lapses and the box sleeps on its own (2h after it woke at the earliest); it checks every minute, so a turn that
 // starts (an approval answered, a message sent) renews before the lease can lapse under it.
+// EARLY SLEEP: omg's own clock then keeps an idle box awake until 2h after it woke. The Mac's watchdog
+// runs --box-health every BOX_PROBE_MS while a session is parked "cloud", and that hibernates the box as
+// soon as the lease has lapsed and `--box-busy` says every session is idle (sleepIfIdle).
 //
 // BRING BACK (P2, NOM-77): `--back` waits for a turn boundary on the box (Nomo's record, else an
 // `end_turn` transcript + 15s quiet; --force interrupts instead), exits claude there (/exit, then C-c,
@@ -77,7 +80,7 @@
 // headers timeout — the box script is kept short, so prefer bun.
 
 import { execFileSync, spawn } from "node:child_process";
-import { closeSync, existsSync, lstatSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, readSync, realpathSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { appendFileSync, closeSync, existsSync, lstatSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, readSync, realpathSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { dirname, join, relative, sep } from "node:path";
@@ -1075,6 +1078,43 @@ export async function boxHealth(omg: string, deps: { cloud?: Cloud; park?: (id: 
   return parked;
 }
 
+/** Box script for sleepIfIdle: the `--box-busy` verdict (exit 10 = every session idle), forced busy while a
+ *  handoff is being admitted (a fresh .claim-, see admitScript). Prints NOMO_KA=<rc>:<why>, like statusScript. */
+export const IDLE_PROBE = `B=$(command -v bun || command -v node)
+${BUSY_PROBE}
+[ -z "$(find ${BOX_SESSIONS} -maxdepth 1 -name '.claim-*' -mmin -15 2>/dev/null)" ] || { rc=1; W="a handoff is starting"; }
+echo "NOMO_KA=$rc:$W"`;
+
+/** Mac-side: a handoff (live /nomo-cc:handoff helper) or a --back (its lock) in flight, else undefined. */
+function cloudBusyHere(): string | undefined {
+  const p = readPending(PENDING_PATH);
+  if (p && PENDING.isHelper(p.helperPid)) return "a handoff is in progress";
+  if ((loadCloud().active ?? []).some((s) => backLockHolder(s) !== undefined)) return "a --back is in progress";
+  return undefined;
+}
+
+/** Early sleep (NOM-114 follow-up), run by the watchdog's --box-health: hibernate a running box whose
+ *  keep-awake lease has lapsed (or was never set) once the box's own `--box-busy` says every session is
+ *  idle, instead of waiting for omg's 2-hour floor. The in-VM loop renews the lease within a minute of
+ *  any turn starting and keeps it while a session works or waits on an approval, so a lapsed lease plus
+ *  a fresh idle verdict means nothing needs the box. The gates are re-checked with a fresh GET right
+ *  before the hibernate; any doubt or error leaves it awake (omg then sleeps it on its own, as before).
+ *  Returns the log line when it hibernated. */
+export async function sleepIfIdle(sb: { id: string; status: string; keepAwakeUntil?: string } | undefined, d: {
+  get: () => Promise<any>; probe: (id: string) => Promise<string>; hibernate: (sb: { id: string; status: string }) => Promise<void>;
+  busyHere: () => string | undefined; now?: () => number;
+}): Promise<string | undefined> {
+  const now = d.now ?? Date.now;
+  const lapsed = (b: any): boolean => b?.status === "running" && !(Date.parse(b.keepAwakeUntil ?? "") > now());
+  if (!sb || !lapsed(sb) || d.busyHere()) return undefined;
+  const ka = (await d.probe(sb.id)).match(/^NOMO_KA=(\d+):(.*)$/m);
+  if (ka?.[1] !== "10") return undefined;
+  const fresh = await d.get();
+  if (fresh?.id !== sb.id || !lapsed(fresh) || d.busyHere()) return undefined;
+  await d.hibernate(fresh);
+  return `box ${sb.id.slice(0, 8)} hibernated early: every session idle (${ka[2]}) and its keep-awake lease had ended`;
+}
+
 /** An existing box, running (never creates one). An already-running box gets a fresh KEEPALIVE_S lease
  *  (NOM-101): an idle box's lease may have a minute left, and the caller (back, handoff, stop, send) is
  *  about to work on it; the in-VM loop takes over once a turn runs. */
@@ -1145,7 +1185,10 @@ export function keepAwakeLine(status: string, until: string | undefined, rc: num
   const at = lease ? fmt(until!) : undefined;
   if (rc === 10) {
     if (wokeAt === undefined) return `idle (${why}) — sleeps 2 h after it woke${at ? `, or at ${at} if later` : ""}`;
-    return `idle (${why}) — sleeps at ${fmt(new Date(Math.max(lease ?? 0, wokeAt + OMG_AWAKE_MS)).toISOString())}`;
+    const floor = wokeAt + OMG_AWAKE_MS;
+    if (lease !== undefined && lease >= floor) return `idle (${why}) — sleeps at ${at}`;
+    // Early sleep (sleepIfIdle): while a session is parked here, the watchdog hibernates it once the lease ends.
+    return `idle (${why}) — sleeps ${at ? `a few min after ${at}` : "within a few min"} if this Mac's watchdog is running, else at ${fmt(new Date(floor).toISOString())}`;
   }
   return `running${why ? ` (${why})` : ""}${at ? `, keep-awake until ${at}` : ""}`;
 }
@@ -2048,7 +2091,15 @@ async function main(): Promise<void> {
 
   if (args.has("--bake")) { await bake(omg); return; }
   if (args.has("--back")) { await back(omg, args); return; }
-  if (args.has("--box-health")) { await boxHealth(omg); return; }
+  if (args.has("--box-health")) {
+    await boxHealth(omg);
+    const get = () => getBox(omg, loadCloud().sandboxId, api, { wake: false });
+    const line = await sleepIfIdle(await get(), {
+      get, busyHere: cloudBusyHere, hibernate: (sb) => sleepBox(omg, sb), probe: async (id) => (await exec(omg, id, IDLE_PROBE)).stdout ?? "",
+    });
+    if (line) appendFileSync(LATER_LOG, `[${new Date().toISOString()}] ${line}\n`, { mode: 0o600 });
+    return;
+  }
 
   if (["--status", "--stop", "--pair", "--screen", "--send", "--send-key"].some((f) => args.has(f))) {
     const cloud = loadCloud();

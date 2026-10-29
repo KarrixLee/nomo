@@ -115,7 +115,7 @@ function buildPairURL(workerUrl, pairingId, qrSecret, pcEphPub) {
 }
 
 // src/core/shared.ts
-var PLUGIN_VERSION = "2.3.50";
+var PLUGIN_VERSION = "2.3.51";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -10311,6 +10311,7 @@ function cloudWant(id, park, record, now, deps = {}) {
   return { cloud, extra: { ...why ? { cloudWhy: why } : {}, ...age ? { cloudAge: age } : {} } };
 }
 var boxProbeAt = 0;
+var BOX_PROBE_MS = 5 * 60000;
 function hasBoxKey(env = process.env, file = `${homedir()}/.nomo-spike.env`) {
   if (env.OMG_API_KEY)
     return true;
@@ -10321,7 +10322,7 @@ function hasBoxKey(env = process.env, file = `${homedir()}/.nomo-spike.env`) {
   }
 }
 function maybeProbeBox(now, deps = {}) {
-  if (now - boxProbeAt < CLOUD_KEEPALIVE_MS || !(deps.hasKey ?? hasBoxKey)())
+  if (now - boxProbeAt < BOX_PROBE_MS || !(deps.hasKey ?? hasBoxKey)())
     return false;
   let parked = [];
   try {
@@ -12097,6 +12098,7 @@ if (__require.main == __require.module) {
 export {
   ANTIGRAVITY_SETTLE_GRACE_MS,
   ANTIGRAVITY_SETTLE_TICK_MS,
+  BOX_PROBE_MS,
   BRING_BACK_COMMAND_KIND,
   CLAUDE_AWAITING_PROMPT_REAP_MS,
   CLAUDE_IDLE_REAP_MAX_ATTEMPTS,
