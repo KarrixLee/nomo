@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   cancelPending, claimPending, contextTokens, contextTokensOf, DEFAULT_THEN, GONE_MSG, parseLaterArg, sizeWarning, handoffArgv, handoffLanded, laterStatus, NOTHING_RAN_MSG, needsPairing, type Pending, readPending, resolveSession, waitThenHandoff, type WaitDeps,
-  BOX_MAX_SESSIONS, boxPaired, phoneMoveCheck, ENV_MAX, MANIFEST_MAX_AGE_MS, manifestLine, manifestMessage, NOTE_MAX, takeManifest, validateManifest, type PhoneMoveFacts, settleThenStamp,
+  boxPaired, EXIT_BOX_FULL, phoneMoveCheck, ENV_MAX, MANIFEST_MAX_AGE_MS, manifestLine, manifestMessage, NOTE_MAX, takeManifest, validateManifest, type PhoneMoveFacts, settleThenStamp,
 } from "./handoff-later";
 import { parkHook, readPark, writePark } from "./park";
 import { macWorkerUrl } from "./shared";
@@ -150,6 +150,13 @@ describe("waitThenHandoff", () => {
     expect(await waitThenHandoff(pending(), d)).toBe(1);
     expect(d.lines.at(-1)).toStartWith("FAILED:");
     expect(d.notes[0]).toContain("Mac copy is untouched");
+  });
+
+  test("the box refusing at its cap reports why \"cap\" (NOM-112: the box's live count is the only cap check)", async () => {
+    const whys: (string | undefined)[] = [];
+    const d = { ...deps(join(tmp(), "p.json"), 0, EXIT_BOX_FULL), result: (_ok: boolean, why?: string) => whys.push(why) };
+    expect(await waitThenHandoff(pending(), d)).toBe(EXIT_BOX_FULL);
+    expect(whys).toEqual(["cap"]);
   });
 
   test("exit 0 with nothing done (shim/run.sh found no plugin or runtime) is FAILED, not DONE", async () => {
@@ -386,7 +393,7 @@ describe("phone move-to-cloud (NOM-94)", () => {
     record: { pid: 400, cwd: "/p/app" },
     command: (pid) => (pid === 400 ? CLAUDE : pid === 300 ? "-zsh" : undefined),
     ancestorsOf: () => [300],
-    parked: false, active: false, needsPairing: false, cloudCount: 0,
+    parked: false, active: false, needsPairing: false,
     transcriptExists: () => true,
     trackedSecrets: () => [],
     transcriptSecrets: () => undefined,
@@ -417,13 +424,10 @@ describe("phone move-to-cloud (NOM-94)", () => {
     expect(refuse({ parked: true })).toMatch(/already moving/);
     expect(refuse({ active: true })).toMatch(/already running in the cloud/);
     expect(refuse({ needsPairing: true })).toMatch(/pairing/);
-    expect(refuse({ cloudCount: BOX_MAX_SESSIONS })).toMatch(/cap is 4/);
     const why = (o: Partial<PhoneMoveFacts>) => (phoneMoveCheck(facts(o)) as { why: string }).why;
-    expect(why({ cloudCount: BOX_MAX_SESSIONS })).toBe("cap");
     expect(why({ needsPairing: true })).toBe("notPaired");
     expect(why({ trackedSecrets: () => [".env"] })).toBe("secret");
     expect(why({ parked: true })).toBe("other");
-    expect(phoneMoveCheck(facts({ cloudCount: BOX_MAX_SESSIONS - 1 }))).toEqual({ claudePid: 400, cwd: "/p/app" });
     expect(refuse({ transcriptExists: () => false })).toMatch(/transcript/);
     expect(refuse({ record: { pid: 400 } })).toMatch(/transcript/);
   });
