@@ -1104,7 +1104,7 @@ describe("NOM-101: the box sleeps when its sessions are idle", () => {
   test("the loop renews while busy, releases once when idle, renews at once when a turn starts", () => {
     const { lines } = runLoop(["0", "0", "10", "10", "0"], 'args.has("--box-busy")');
     // tick 1 renews; tick 2 busy but < 10 min: nothing; tick 3 releases; tick 4 stays released; tick 5 renews at once.
-    expect(lines).toEqual(["curl", "renewed 30 min (why)", expect.stringMatching(/^released \(why\); the box sleeps when the lease ends in ~(29|30) min$/), "curl", "renewed 30 min (why)", "no session running; stopped renewing"]);
+    expect(lines).toEqual(["curl", "renewed 30 min (why)", expect.stringMatching(/^released \(why\); the box sleeps 2 h after it woke, or when the lease ends \(in ~(29|30) min\) if later$/), "curl", "renewed 30 min (why)", "no session running; stopped renewing"]);
   });
 
   test("review fix: a box plugin without --box-busy is never asked and counts as busy", () => {
@@ -1138,8 +1138,16 @@ describe("NOM-101: the box sleeps when its sessions are idle", () => {
   test("--status line: asleep / idle with its sleep time / running", () => {
     const fmt = () => "12:30";
     expect(keepAwakeLine("hibernated", undefined, undefined, "")).toBe("asleep");
-    expect(keepAwakeLine("running", "2026-01-01T12:30:00Z", 10, "a done 12 min ago", fmt)).toBe("idle (a done 12 min ago) — sleeps at 12:30");
-    expect(keepAwakeLine("running", "2026-01-01T12:30:00Z", 0, "a working", fmt)).toBe("running (a working), keep-awake until 12:30");
+    expect(keepAwakeLine("running", "2026-01-01T12:30:00Z", 10, "a done 12 min ago", undefined, fmt)).toBe("idle (a done 12 min ago) — sleeps 2 h after it woke, or at 12:30 if later");
+    expect(keepAwakeLine("running", "2026-01-01T12:30:00Z", 0, "a working", undefined, fmt)).toBe("running (a working), keep-awake until 12:30");
     expect(keepAwakeLine("running", undefined, undefined, "")).toBe("running");
+  });
+
+  test("NOM-114: an idle box sleeps at the later of its lease end and 2 h after it woke (omg's 2-hour rule)", () => {
+    const iso = (s: string) => s.slice(11, 16);
+    // Woken 11:54, released at once: the lease ends 12:24 but omg keeps the box awake until 13:54.
+    expect(keepAwakeLine("running", "2026-01-01T12:24:00Z", 10, "a done 57 min ago", Date.parse("2026-01-01T11:54:00Z"), iso)).toBe("idle (a done 57 min ago) — sleeps at 13:54");
+    // Busy past the 2 h mark: the lease decides.
+    expect(keepAwakeLine("running", "2026-01-01T15:10:00Z", 10, "a done 11 min ago", Date.parse("2026-01-01T11:54:00Z"), iso)).toBe("idle (a done 11 min ago) — sleeps at 15:10");
   });
 });

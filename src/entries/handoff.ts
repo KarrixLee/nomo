@@ -44,11 +44,12 @@
 // pairing page in the browser instead, because the QR is a secret that must never land in a transcript.
 // The SessionStart fired while the pairing is still pending is stashed and flushed on completion.
 //
-// KEEP-AWAKE: omg sleeps a box 2h after start regardless of activity. We take a 30-min lease from here
+// KEEP-AWAKE: omg sleeps a box 2h after it started (created or woken) regardless of activity, or when its
+// keep-awake lease ends if that is later; nothing can sleep it sooner except an explicit hibernate. We take a 30-min lease from here
 // and start an in-VM loop (tmux session `nomo-keepalive`) that renews it every 10 min via the keyless
 // 169.254.0.1:9090 endpoint, but only while some session is busy (NOM-101, `--box-busy`: working,
 // waiting on the user < 2h, or done < 10 min ago, read from the box's own Nomo records). Otherwise it
-// stops renewing, the lease lapses and the box sleeps on its own; it checks every minute, so a turn that
+// stops renewing, the lease lapses and the box sleeps on its own (2h after it woke at the earliest); it checks every minute, so a turn that
 // starts (an approval answered, a message sent) renews before the lease can lapse under it.
 //
 // BRING BACK (P2, NOM-77): `--back` waits for a turn boundary on the box (Nomo's record, else an
@@ -191,7 +192,7 @@ export const BOX_HANDOFF_LOG = "/root/.config/cc-status/handoff.log";
 /** The in-VM keep-awake loop (NOM-101). Every minute while ANY handed-off session's tmux runs, it asks
  *  `--box-busy` (exit 10 = every session idle; any other exit counts as busy so a failure never sleeps the
  *  box). Busy: renew the lease, at most every 10 min, and at once after a release. Idle: stop renewing
- *  (logged once); the lease lapses and omg hibernates the box. `$B` is bun's (else node's) absolute path,
+ *  (logged once); the lease lapses and omg hibernates the box (not before 2 h after it woke). `$B` is bun's (else node's) absolute path,
  *  resolved by the launching box script (keepaliveStart): tmux's shell may not have bun on PATH.
  *  An idle box sleeps, and omg's 14-day deletion clock for a sleeping box starts then; the phone is
  *  warned near the end via `cloudAge: "expiring"` (NOM-99, park.ts). */
@@ -200,7 +201,7 @@ log() { echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) keep-awake: $*" >> ${BOX_HANDOFF_LO
 while ${ANY_SESSION}; do
   ${BUSY_PROBE.replaceAll("\n", "\n  ")}; N=$(date +%s)
   if [ "$rc" = 10 ]; then
-    if [ "$S" != idle ]; then S=idle; log "released ($W); the box sleeps when the lease ends$([ "$L" = 0 ] || echo " in ~$(( (L + ${KEEPALIVE_S} - N) / 60 )) min")"; fi
+    if [ "$S" != idle ]; then S=idle; log "released ($W); the box sleeps 2 h after it woke, or when the lease ends$([ "$L" = 0 ] || echo " (in ~$(( (L + ${KEEPALIVE_S} - N) / 60 )) min)") if later"; fi
   elif [ "$S" != busy ] || [ $((N - L)) -ge 600 ]; then
     if curl -s -X POST http://169.254.0.1:9090/v1/sandbox/keepalive -H 'Content-Type: application/json' -d '{"seconds":${KEEPALIVE_S}}' >/dev/null; then
       L=$N; S=busy; log "renewed ${KEEPALIVE_S / 60} min (\${W:-busy})"
@@ -881,7 +882,11 @@ async function api(key: string, method: string, path: string, body?: unknown, ma
   });
   const text = await readCapped(res, maxBytes);
   if (!res.ok) throw Object.assign(new Error(`${method} ${path} -> ${res.status}: ${text.slice(0, 300)}`), { status: res.status });
-  return text ? JSON.parse(text) : null;
+  const out = text ? JSON.parse(text) : null;
+  // NOM-114: every create/wake goes through here; it starts omg's 2-hour sleep clock (--status reads it).
+  const woke = method === "POST" && (path === "/sandboxes" ? out?.id : path.match(/^\/sandboxes\/([^/]+)\/wake$/)?.[1]);
+  if (woke) updateCloud((c) => ({ ...c, woke: { id: String(woke), at: Date.now() } }));
+  return out;
 }
 
 /** One box script. A 409 (the box is still waking) is retried 5× / 2s. */
@@ -899,8 +904,9 @@ async function exec(key: string, id: string, script: string, env: Record<string,
 
 /** `active`: the sessions handed off to the box and not brought back yet (oldest first); `sessions` holds
  *  each one's handoff snapshot for --back; `pairedTo` is "<sandboxId> <worker>" once that box was seen
- *  paired to that worker (/nomo-cc:handoff's gate). Pre-2.3.29 files carry `current` (one id) instead. */
-export interface Cloud { sandboxId?: string; macId?: string; active?: string[]; sessions?: Record<string, Snapshot>; pairedTo?: string }
+ *  paired to that worker (/nomo-cc:handoff's gate); `woke` is when this Mac last created or woke box `id`
+ *  (omg's 2-hour sleep clock starts there). Pre-2.3.29 files carry `current` (one id) instead. */
+export interface Cloud { sandboxId?: string; macId?: string; active?: string[]; sessions?: Record<string, Snapshot>; pairedTo?: string; woke?: { id: string; at: number } }
 /** A cloud.json as read: a legacy `current` becomes `active` (and is dropped on the next write). */
 export function normalizeCloud(raw: Cloud & { current?: string }): Cloud {
   const { current, ...c } = raw;
@@ -1126,13 +1132,21 @@ export async function boxBusyNow({ now = Date.now(), dir = BOX_SESSIONS, project
   return { busy: false, why: idle.join(", ") || "no session running" };
 }
 
-/** --status's box line (NOM-101): `--box-busy` exit `rc` (10 = all idle; undefined = an older box). */
-export function keepAwakeLine(status: string, until: string | undefined, rc: number | undefined, why: string,
+/** omg hibernates a running box 2 h after it started (created or woken), or when its lease ends if later. */
+export const OMG_AWAKE_MS = 2 * 3600_000;
+/** --status's box line (NOM-101): `--box-busy` exit `rc` (10 = all idle; undefined = an older box). `wokeAt`:
+ *  cloud.json `woke` for this box. NOM-114: an idle box sleeps at the LATER of its lease end and wokeAt + 2 h;
+ *  the lease end alone named a time omg's 2-hour rule then overrode, so the box looked stuck awake. */
+export function keepAwakeLine(status: string, until: string | undefined, rc: number | undefined, why: string, wokeAt?: number,
   fmt = (iso: string) => new Date(iso).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })): string {
   if (status === "hibernated") return "asleep";
   if (status !== "running") return status;
-  const at = until && !Number.isNaN(Date.parse(until)) ? fmt(until) : undefined;
-  if (rc === 10) return `idle (${why}) — sleeps at ${at ?? "the end of its lease"}`;
+  const lease = until && !Number.isNaN(Date.parse(until)) ? Date.parse(until) : undefined;
+  const at = lease ? fmt(until!) : undefined;
+  if (rc === 10) {
+    if (wokeAt === undefined) return `idle (${why}) — sleeps 2 h after it woke${at ? `, or at ${at} if later` : ""}`;
+    return `idle (${why}) — sleeps at ${fmt(new Date(Math.max(lease ?? 0, wokeAt + OMG_AWAKE_MS)).toISOString())}`;
+  }
   return `running${why ? ` (${why})` : ""}${at ? `, keep-awake until ${at}` : ""}`;
 }
 
@@ -2077,7 +2091,8 @@ async function main(): Promise<void> {
     const r = await exec(omg, sb.id, statusScript(), { NOMO_KNOWN: (cloud.active ?? []).join(" ") });
     const [sessions, rest = ""] = (r.stdout ?? "").split(/^NOMO_STATUS_SPLIT$\n?/m);
     const ka = rest.match(/^NOMO_KA=(\d+):(.*)$/m), nomo = rest.replace(/^NOMO_KA=.*$\n?/m, "");
-    console.log(`Box ${sb.id}: ${keepAwakeLine(sb.status, sb.keepAwakeUntil, ka ? Number(ka[1]) : undefined, ka?.[2] ?? "")}`);
+    const wokeAt = cloud.woke?.id === sb.id ? cloud.woke?.at : undefined;
+    console.log(`Box ${sb.id}: ${keepAwakeLine(sb.status, sb.keepAwakeUntil, ka ? Number(ka[1]) : undefined, ka?.[2] ?? "", wokeAt)}`);
     process.stdout.write(sessions); // the box's sessions first: id, running/stopped, root
     console.log((cloud.active ?? []).length ? `On record on this Mac (not brought back yet):\n${listActive(cloud)}` : "On record on this Mac: none.");
     console.log(attachHelp((cloud.active ?? []).length > 1));

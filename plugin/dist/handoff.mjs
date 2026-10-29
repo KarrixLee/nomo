@@ -384,7 +384,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "2.3.49";
+var PLUGIN_VERSION = "2.3.50";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -5452,7 +5452,7 @@ while ${ANY_SESSION}; do
 `, `
   `)}; N=$(date +%s)
   if [ "$rc" = 10 ]; then
-    if [ "$S" != idle ]; then S=idle; log "released ($W); the box sleeps when the lease ends$([ "$L" = 0 ] || echo " in ~$(( (L + ${KEEPALIVE_S} - N) / 60 )) min")"; fi
+    if [ "$S" != idle ]; then S=idle; log "released ($W); the box sleeps 2 h after it woke, or when the lease ends$([ "$L" = 0 ] || echo " (in ~$(( (L + ${KEEPALIVE_S} - N) / 60 )) min)") if later"; fi
   elif [ "$S" != busy ] || [ $((N - L)) -ge 600 ]; then
     if curl -s -X POST http://169.254.0.1:9090/v1/sandbox/keepalive -H 'Content-Type: application/json' -d '{"seconds":${KEEPALIVE_S}}' >/dev/null; then
       L=$N; S=busy; log "renewed ${KEEPALIVE_S / 60} min (\${W:-busy})"
@@ -6035,7 +6035,11 @@ async function api(key, method, path, body, maxBytes) {
   const text = await readCapped(res, maxBytes);
   if (!res.ok)
     throw Object.assign(new Error(`${method} ${path} -> ${res.status}: ${text.slice(0, 300)}`), { status: res.status });
-  return text ? JSON.parse(text) : null;
+  const out = text ? JSON.parse(text) : null;
+  const woke = method === "POST" && (path === "/sandboxes" ? out?.id : path.match(/^\/sandboxes\/([^/]+)\/wake$/)?.[1]);
+  if (woke)
+    updateCloud((c) => ({ ...c, woke: { id: String(woke), at: Date.now() } }));
+  return out;
 }
 async function exec(key, id, script, env = {}) {
   for (let i = 0;; i++) {
@@ -6293,14 +6297,19 @@ async function boxBusyNow({
   }
   return { busy: false, why: idle.join(", ") || "no session running" };
 }
-function keepAwakeLine(status, until, rc, why, fmt = (iso) => new Date(iso).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })) {
+var OMG_AWAKE_MS = 2 * 3600000;
+function keepAwakeLine(status, until, rc, why, wokeAt, fmt = (iso) => new Date(iso).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })) {
   if (status === "hibernated")
     return "asleep";
   if (status !== "running")
     return status;
-  const at = until && !Number.isNaN(Date.parse(until)) ? fmt(until) : undefined;
-  if (rc === 10)
-    return `idle (${why}) — sleeps at ${at ?? "the end of its lease"}`;
+  const lease = until && !Number.isNaN(Date.parse(until)) ? Date.parse(until) : undefined;
+  const at = lease ? fmt(until) : undefined;
+  if (rc === 10) {
+    if (wokeAt === undefined)
+      return `idle (${why}) — sleeps 2 h after it woke${at ? `, or at ${at} if later` : ""}`;
+    return `idle (${why}) — sleeps at ${fmt(new Date(Math.max(lease ?? 0, wokeAt + OMG_AWAKE_MS)).toISOString())}`;
+  }
   return `running${why ? ` (${why})` : ""}${at ? `, keep-awake until ${at}` : ""}`;
 }
 function statusScript() {
@@ -7347,7 +7356,8 @@ nomo_pair`, { NOMO_WORKER_URL: worker });
     const r = await exec(omg, sb.id, statusScript(), { NOMO_KNOWN: (cloud.active ?? []).join(" ") });
     const [sessions, rest = ""] = (r.stdout ?? "").split(/^NOMO_STATUS_SPLIT$\n?/m);
     const ka = rest.match(/^NOMO_KA=(\d+):(.*)$/m), nomo = rest.replace(/^NOMO_KA=.*$\n?/m, "");
-    console.log(`Box ${sb.id}: ${keepAwakeLine(sb.status, sb.keepAwakeUntil, ka ? Number(ka[1]) : undefined, ka?.[2] ?? "")}`);
+    const wokeAt = cloud.woke?.id === sb.id ? cloud.woke?.at : undefined;
+    console.log(`Box ${sb.id}: ${keepAwakeLine(sb.status, sb.keepAwakeUntil, ka ? Number(ka[1]) : undefined, ka?.[2] ?? "", wokeAt)}`);
     process.stdout.write(sessions);
     console.log((cloud.active ?? []).length ? `On record on this Mac (not brought back yet):
 ${listActive(cloud)}` : "On record on this Mac: none.");
@@ -7463,6 +7473,7 @@ export {
   FIRST_UNCONFIRMED,
   KNOWN_FLAGS,
   LEFT_LINE,
+  OMG_AWAKE_MS,
   PAIR_FN,
   PAIR_GATE,
   PAIR_POLL,
