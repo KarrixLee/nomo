@@ -1119,7 +1119,7 @@ export async function boxBusyNow({ now = Date.now(), dir = BOX_SESSIONS, project
     if (!t) return { busy: true, why: `${u.slice(0, 8)} has no transcript yet` };
     const st = statSync(t), fd = openSync(t, "r"), buf = Buffer.alloc(Math.min(65536, st.size));
     try { readSync(fd, buf, 0, buf.length, st.size - buf.length); } finally { closeSync(fd); }
-    const r = sessionBusy({ lastEvent: rec?.lastEvent, ts: rec?.ts, tail: buf.toString("utf8"), quietS: (now - st.mtimeMs) / 1000 }, now);
+    const r = sessionBusy({ lastEvent: rec?.lastEvent, awaitingPrompt: rec?.awaitingPrompt, ts: rec?.ts, tail: buf.toString("utf8"), quietS: (now - st.mtimeMs) / 1000 }, now);
     if (r.busy) return { busy: true, why: `${u.slice(0, 8)} ${r.why}` };
     idle.push(`${u.slice(0, 8)} ${r.why}`);
   }
@@ -1387,6 +1387,7 @@ ${sessionGuard(uuid)}
 tmux has-session -t "=$T" 2>/dev/null || { echo NOMO_GONE; exit 0; }
 F=${BOX_CC}/sessions/${uuid}.json
 [ -f "$F" ] && echo "NOMO_EVENT=$(grep -o '"lastEvent": *"[^"]*"' "$F" | head -1 | cut -d'"' -f4)"
+grep -qs '"awaitingPrompt": *true' "$F" && echo NOMO_AWAITING=1
 T=/root/.claude/projects/${enc}/${uuid}.jsonl
 [ -f "$T" ] || { echo NOMO_NOTRANSCRIPT; exit 0; }
 echo "NOMO_AGE=$(( $(date +%s) - $(stat -c %Y "$T") ))"
@@ -1551,7 +1552,7 @@ async function back(omg: string, args: Map<string, string | true>): Promise<void
       const at = out.search(/^NOMO_TAIL$/m);
       const head = at < 0 ? out : out.slice(0, at), tail = at < 0 ? "" : out.slice(at + "NOMO_TAIL\n".length);
       const { m } = parseMarkers(head);
-      state = boxIdle({ lastEvent: m.EVENT || undefined, tail, quietS: Number(m.AGE ?? 0) });
+      state = boxIdle({ lastEvent: m.EVENT || undefined, awaitingPrompt: m.AWAITING === "1", tail, quietS: Number(m.AGE ?? 0) });
       if (state === "idle") break;
       if (Date.now() > end) {
         throw new Error(state === "attention"

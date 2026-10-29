@@ -1042,6 +1042,32 @@ describe("NOM-101: the box sleeps when its sessions are idle", () => {
     expect((await run(["nomo-aaaaaaaa"])).busy).toBe(true);
   });
 
+  test("NOM-114: a resumed session idle at the prompt (awaitingPrompt) reads idle, whatever the Mac's transcript ends in", async () => {
+    const d = mkdtempSync(join(tmpdir(), "nomo-busy-")), dir = join(d, "s"), projects = join(d, "p");
+    mkdirSync(dir); mkdirSync(join(projects, "-x"), { recursive: true });
+    const A = "aaaaaaaa-1111-4111-8111-111111111111", f = join(projects, "-x", `${A}.jsonl`);
+    writeFileSync(join(dir, A), `/x\nnomo-aaaaaaaa\n`);
+    // The handed-off transcript: its last assistant line streamed with stop_reason null.
+    writeFileSync(f, JSON.stringify({ type: "assistant", message: { stop_reason: null } }) + "\n");
+    utimesSync(f, (now - 12 * min) / 1000, (now - 12 * min) / 1000);
+    let rec: any = { lastEvent: "sessionStart", awaitingPrompt: true, ts: now - 11 * min };
+    const run = () => boxBusyNow({ now, dir, projects, read: async () => rec, alive: () => true });
+    expect(await run()).toEqual({ busy: false, why: "aaaaaaaa done 12 min ago" });
+    rec = { lastEvent: "working", awaitingPrompt: true, ts: now - 11 * min }; // resume over an earlier stint's done record
+    expect((await run()).busy).toBe(false);
+    // A real turn or a pending approval clears the marker: still awake.
+    rec = { lastEvent: "working", ts: now - 11 * min };
+    expect(await run()).toEqual({ busy: true, why: "aaaaaaaa working" });
+    rec = { lastEvent: "needsAttention", ts: now - 11 * min };
+    expect((await run()).busy).toBe(true);
+    // No record: Claude Code's turn_duration row closes the turn even when stop_reason is null.
+    rec = null;
+    expect((await run()).busy).toBe(true);
+    writeFileSync(f, [JSON.stringify({ type: "assistant", message: { stop_reason: null } }), JSON.stringify({ type: "system", subtype: "turn_duration" })].join("\n") + "\n");
+    utimesSync(f, (now - 12 * min) / 1000, (now - 12 * min) / 1000);
+    expect((await run()).busy).toBe(false);
+  });
+
   // Runs the real loop with fake tmux/sleep/curl on PATH; bun lives OFF PATH and is reached only via $B.
   const runLoop = (rcs: string[], dist: string) => {
     const d = mkdtempSync(join(tmpdir(), "nomo-ka-")), bin = join(d, "bin"), off = join(d, "off"), plug = join(d, "plug", "2.3.45");
