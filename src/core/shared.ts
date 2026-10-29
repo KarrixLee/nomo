@@ -320,7 +320,8 @@ export const recordCloudExtra = (r: { cloudWhy?: string; cloudAge?: string }): C
 /** The blob with `cloud` (then cloudWhy, cloudAge) set or removed, LAST, after plan/dbg. Budgeted like
  *  every blob, but they are part of the base: dbg, then plan, give way first, never these. Pure. */
 export function withCloudKey(plain: Record<string, unknown>, cloud: string | undefined, extra: CloudExtra = {}): Record<string, unknown> {
-  const { cloud: _old, cloudWhy: _w, cloudAge: _a, plan, dbg, ...base } = plain;
+  // `box` is dropped too: appendFittedPlanAndDebug re-derives it, so a reseal after unpairing loses it.
+  const { cloud: _old, cloudWhy: _w, cloudAge: _a, box: _b, plan, dbg, ...base } = plain;
   const keys = cloud ? { cloud, ...(extra.cloudWhy ? { cloudWhy: extra.cloudWhy } : {}), ...(extra.cloudAge ? { cloudAge: extra.cloudAge } : {}) } : {};
   const fitted = appendFittedPlanAndDebug({ ...base, ...keys }, typeof plan === "string" ? plan : undefined, typeof dbg === "string" ? dbg : undefined) as Record<string, unknown>;
   if (!cloud) return fitted;

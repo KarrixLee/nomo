@@ -61,7 +61,7 @@ import {
   watchdogBuildStamp, watchdogHolderIsLive, WATCHDOG_PATH, WATCHDOG_PID_PATH, writeInterruptFlagAt,
 } from "../core/shared";
 import { rememberBounded } from "../core/bounded-set";
-import { BackRun, backLockHolder, BACK_LOCK_DIR, cloudActive, cloudAge, cloudState, CloudState, endMovingTurn, Park, PARK_DIR, parkWantsCommands, readBackResult, readMoveResult, readMoveWhy, readPark, withParked } from "../core/park";
+import { BackRun, backLockHolder, BACK_LOCK_DIR, cloudActive, cloudAge, cloudFingerprint, cloudState, CloudState, endMovingTurn, Park, PARK_DIR, parkWantsCommands, readBackResult, readMoveResult, readMoveWhy, readPark, withParked } from "../core/park";
 
 // The transcript-tail interrupt PARSERS live in the agent adapters now (the two detections are
 // structurally different). Re-export them so existing importers/tests that reference "./cc-watchdog"
@@ -1784,7 +1784,7 @@ export function bringBack(id: string, deps: BringBackDeps = {}): FocusTraceResul
 
 /** Phone-started moves, by session id. `failedAt` set = the row reads cloud:"move-failed" until the
  *  session's next turn. In memory, like backRuns: a daemon restart forgets a failure. */
-export interface MoveRun { running: boolean; startedAt: number; code?: number | null; failedAt?: number }
+export interface MoveRun { running: boolean; startedAt: number; code?: number | null; failedAt?: number; cloudFp?: string }
 export const moveRuns = new Map<string, MoveRun>();
 
 export interface MoveToCloudDeps {
@@ -1829,10 +1829,12 @@ export function moveToCloud(id: string, rec: SessionRecord, deps: MoveToCloudDep
 /** Per sweep: is this session's phone-started move a failure the row should show? A successful
  *  preflight left a "moving" marker; that marker gone without reaching any other state, with THIS
  *  session's helper outcome (park.ts readMoveResult, written since the run started) FAILED, is a
- *  failure. No outcome (a /nomo-cc:handoff cancel) is a clean unpark. Any later park state, or a turn
- *  started after the failure, forgets the run. */
+ *  failure. No outcome (a /nomo-cc:handoff cancel) is a clean unpark. Any later park state, a turn
+ *  started after the failure, or (NOM-112) a cloud.json change since it (box paired, a slot freed) forgets
+ *  the run, so the row drops move-failed and the phone offers Move to cloud again without a session event. */
 export function moveFailed(id: string, park: Park | undefined, rec: SessionRecord | null,
-  outcome: (since: number) => "failed" | "done" | undefined = (since) => readMoveResult(id, since)): boolean {
+  outcome: (since: number) => "failed" | "done" | undefined = (since) => readMoveResult(id, since),
+  cloudFp: () => string = cloudFingerprint): boolean {
   const m = moveRuns.get(id);
   if (!m) return false;
   if (park && park.state !== "moving") { moveRuns.delete(id); return false; }
@@ -1841,6 +1843,13 @@ export function moveFailed(id: string, park: Park | undefined, rec: SessionRecor
     else { moveRuns.delete(id); return false; }
   }
   if (m.failedAt && typeof rec?.turnStartedAt === "number" && rec.turnStartedAt * 1000 > m.failedAt) { moveRuns.delete(id); return false; }
+  // ponytail: a box session ending or the box sleeping also frees a slot but leaves cloud.json alone; that
+  // row waits for its next turn, as before (seeing it needs a box probe).
+  if (m.failedAt) {
+    const fp = cloudFp();
+    if (m.cloudFp === undefined) m.cloudFp = fp; // the first sweep after the failure: handoff's own writes are done
+    else if (fp !== m.cloudFp) { moveRuns.delete(id); return false; }
+  }
   return !!m.failedAt && !park;
 }
 
@@ -1909,7 +1918,10 @@ export async function correctCloudState(
     const now = (deps.now ?? Date.now)();
     const plain = await decryptBlob(config.e2eKey, record.blob) as Record<string, unknown>;
     if (!want) extra = {};
-    const changed = plain.cloud !== want || plain.cloudWhy !== extra.cloudWhy || plain.cloudAge !== extra.cloudAge;
+    // NOM-112: `box` too (appendFittedPlanAndDebug's rule), so pairing or unpairing the box reseals idle
+    // rows and the phone's Move to cloud appears/goes without waiting for the session's next hook event.
+    const wantBox = plain.agent === undefined && boxPairedCached() ? true : undefined;
+    const changed = plain.cloud !== want || plain.cloudWhy !== extra.cloudWhy || plain.cloudAge !== extra.cloudAge || plain.box !== wantBox;
     // A done record can still hold an earlier hook's blob (a watchdog corrective pins op/lastEvent and
     // POSTs its own done, but leaves record.blob alone). Resealing THAT put a stale "working" back on the
     // row (NOM-99: "Running" after a refused move), so a done record's reseal starts from the done

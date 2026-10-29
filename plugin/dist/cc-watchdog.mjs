@@ -115,7 +115,7 @@ function buildPairURL(workerUrl, pairingId, qrSecret, pcEphPub) {
 }
 
 // src/core/shared.ts
-var PLUGIN_VERSION = "2.3.51";
+var PLUGIN_VERSION = "2.3.52";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -255,7 +255,7 @@ function appendFittedPlanAndDebug(base, plan, dbg) {
 }
 var recordCloudExtra = (r) => ({ ...r.cloudWhy ? { cloudWhy: r.cloudWhy } : {}, ...r.cloudAge ? { cloudAge: r.cloudAge } : {} });
 function withCloudKey(plain, cloud, extra = {}) {
-  const { cloud: _old, cloudWhy: _w, cloudAge: _a, plan, dbg, ...base } = plain;
+  const { cloud: _old, cloudWhy: _w, cloudAge: _a, box: _b, plan, dbg, ...base } = plain;
   const keys = cloud ? { cloud, ...extra.cloudWhy ? { cloudWhy: extra.cloudWhy } : {}, ...extra.cloudAge ? { cloudAge: extra.cloudAge } : {} } : {};
   const fitted = appendFittedPlanAndDebug({ ...base, ...keys }, typeof plan === "string" ? plan : undefined, typeof dbg === "string" ? dbg : undefined);
   if (!cloud)
@@ -3710,6 +3710,14 @@ function parkHook(input, dir = PARK_DIR) {
       clearPark(id, dir);
   } catch {}
   return;
+}
+function cloudFingerprint(path = `${CC_DIR}/cloud.json`) {
+  try {
+    const c = JSON.parse(readFileSync2(path, "utf8"));
+    return JSON.stringify([c.sandboxId, c.pairedTo, Array.isArray(c.active) ? c.active : [c.current]]);
+  } catch {
+    return "";
+  }
 }
 function cloudActive(id, path = `${CC_DIR}/cloud.json`) {
   try {
@@ -10278,7 +10286,7 @@ function moveToCloud(id, rec, deps = {}) {
   }
   return "move-started";
 }
-function moveFailed(id, park, rec, outcome = (since) => readMoveResult(id, since)) {
+function moveFailed(id, park, rec, outcome = (since) => readMoveResult(id, since), cloudFp = cloudFingerprint) {
   const m = moveRuns.get(id);
   if (!m)
     return false;
@@ -10297,6 +10305,15 @@ function moveFailed(id, park, rec, outcome = (since) => readMoveResult(id, since
   if (m.failedAt && typeof rec?.turnStartedAt === "number" && rec.turnStartedAt * 1000 > m.failedAt) {
     moveRuns.delete(id);
     return false;
+  }
+  if (m.failedAt) {
+    const fp = cloudFp();
+    if (m.cloudFp === undefined)
+      m.cloudFp = fp;
+    else if (fp !== m.cloudFp) {
+      moveRuns.delete(id);
+      return false;
+    }
   }
   return !!m.failedAt && !park;
 }
@@ -10350,7 +10367,8 @@ async function correctCloudState(config, path, sessionId, record, want, deps = {
     const plain = await decryptBlob(config.e2eKey, record.blob);
     if (!want)
       extra = {};
-    const changed = plain.cloud !== want || plain.cloudWhy !== extra.cloudWhy || plain.cloudAge !== extra.cloudAge;
+    const wantBox = plain.agent === undefined && boxPairedCached() ? true : undefined;
+    const changed = plain.cloud !== want || plain.cloudWhy !== extra.cloudWhy || plain.cloudAge !== extra.cloudAge || plain.box !== wantBox;
     const done = record.op === "done" || record.lastEvent === "done";
     const prev = cloudPosts.get(sessionId);
     if (prev && !prev.ok && now - prev.at < CLOUD_RETRY_MS)
