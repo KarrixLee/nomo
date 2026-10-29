@@ -163,6 +163,15 @@ export function parkHook(input: Record<string, unknown>, dir = PARK_DIR): string
 
 // --- NOM-93: the phone's "Bring back" -------------------------------------------------------------
 
+/** NOM-112: the cloud.json facts a refused phone move was judged against: the box, its pairing and the
+ *  sessions on it. A change (a pairing, a session brought back) may clear the refusal. "" = none. */
+export function cloudFingerprint(path = `${CC_DIR}/cloud.json`): string {
+  try {
+    const c = JSON.parse(readFileSync(path, "utf8"));
+    return JSON.stringify([c.sandboxId, c.pairedTo, Array.isArray(c.active) ? c.active : [c.current]]);
+  } catch { return ""; }
+}
+
 /** Is `id` in cloud.json `active` (pre-2.3.29 files: `current`)? A plain read: every cloud.json writer
  *  (handoff's updateCloudAt) renames a complete tmp file into place, so a reader never sees a torn one;
  *  the lock only serializes writers, and taking it here could stall the watchdog for its 15 s wait. */

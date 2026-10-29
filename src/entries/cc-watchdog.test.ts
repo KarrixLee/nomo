@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { Bytes, decryptBlob, encryptBlob } from "../core/crypto";
 import { createLanAnswerStore } from "../core/lan-listener";
 import type { DecisionHold, PlanPickerTraceDecision, SessionRecord } from "../core/shared";
-import { GONE_STRIKE_LIMIT, readGoneStrikes, recordGoneStrike, resetGoneStrikes, tracePlanPickerDecision } from "../core/shared";
+import { GONE_STRIKE_LIMIT, readGoneStrikes, recordGoneStrike, resetGoneStrikes, setBoxPairedForTest, tracePlanPickerDecision } from "../core/shared";
 import {
   acceptLanAnswer, acceptLanCommand, commandWaitLoop, createWake, fileCursorStore, isCommandActiveSession, wantsCommands, enqueueDrainCommands, LAN_ANSWER_ECHO_DELAY_MS, LAN_COMMAND_ID_PREFIX,
   buildDoneEnvelope, buildEndEnvelope, buildHeartbeatEnvelope, buildNeedsAttentionEnvelope, buildProvisionalBlob,
@@ -5357,6 +5357,42 @@ describe("move to cloud from the phone (NOM-94)", () => {
     exits[0](0);
     expect(moveFailed(S, { state: "cloud", since: 0 }, null, () => "failed")).toBe(false);
     expect(moveRuns.has(S)).toBe(false);
+  });
+
+  test("NOM-112: a cloud.json change after a refused move (slot freed, box paired) forgets the failure", async () => {
+    const { exits, deps } = harness();
+    const c = await cmd();
+    await drainCommands(cfg(), { ...deps, take: () => [c] });
+    exits[0](4); // EXIT_BOX_FULL: the box already has 4 sessions
+    let fp = '["sb",null,["a","b","c","d"]]';
+    const idle = rec({ lastEvent: "done" });
+    expect(moveFailed(S, undefined, idle, () => undefined, () => fp)).toBe(true);
+    expect(moveFailed(S, undefined, idle, () => undefined, () => fp)).toBe(true); // nothing changed: still refused
+    fp = '["sb",null,["a","b","c"]]'; // one brought back
+    expect(moveFailed(S, undefined, idle, () => undefined, () => fp)).toBe(false);
+    expect(moveRuns.has(S)).toBe(false);
+  });
+
+  test("NOM-112: pairing/unpairing the box reseals an idle row's `box` with no cloud state and no event", async () => {
+    const id = "box-reseal-1";
+    const record = rec({ op: "done", lastEvent: "done", prio: 0, pairingId: "p", title: "t", blob: await encryptBlob(KEY, { status: "done", title: "t" }) });
+    const posts: any[] = [];
+    let written: SessionRecord | undefined;
+    const deps = (r: SessionRecord) => ({
+      post: async (b: object) => { posts.push(b); return "delivered" as PostOutcome; },
+      now: () => NOW, readRecord: async () => r, writeRecord: async (_p: string, w: SessionRecord) => { written = w; },
+    });
+    try {
+      expect(await correctCloudState(cfg(), "/x", id, record, undefined, deps(record))).toBe("uncorrected"); // no box yet
+      setBoxPairedForTest(true);
+      expect(await correctCloudState(cfg(), "/x", id, record, undefined, deps(record))).toBe("corrected");
+      expect(await decryptBlob(KEY, posts[0].blob)).toMatchObject({ status: "done", box: true });
+      expect(posts[0]).toMatchObject({ op: "done", prio: 0 });
+      expect(await correctCloudState(cfg(), "/x", id, written!, undefined, deps(written!))).toBe("uncorrected"); // settled
+      setBoxPairedForTest(false);
+      expect(await correctCloudState(cfg(), "/x", id, written!, undefined, deps(written!))).toBe("corrected");
+      expect(await decryptBlob(KEY, posts[1].blob)).not.toHaveProperty("box");
+    } finally { setBoxPairedForTest(false); }
   });
 
   test("move-failed rides the blob's `cloud` key like any other state", () => {

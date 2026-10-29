@@ -107,7 +107,7 @@ function buildPairURL(workerUrl, pairingId, qrSecret, pcEphPub) {
 }
 
 // src/core/shared.ts
-var PLUGIN_VERSION = "2.3.51";
+var PLUGIN_VERSION = "2.3.52";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -247,7 +247,7 @@ function appendFittedPlanAndDebug(base, plan, dbg) {
 }
 var recordCloudExtra = (r) => ({ ...r.cloudWhy ? { cloudWhy: r.cloudWhy } : {}, ...r.cloudAge ? { cloudAge: r.cloudAge } : {} });
 function withCloudKey(plain, cloud, extra = {}) {
-  const { cloud: _old, cloudWhy: _w, cloudAge: _a, plan, dbg, ...base } = plain;
+  const { cloud: _old, cloudWhy: _w, cloudAge: _a, box: _b, plan, dbg, ...base } = plain;
   const keys = cloud ? { cloud, ...extra.cloudWhy ? { cloudWhy: extra.cloudWhy } : {}, ...extra.cloudAge ? { cloudAge: extra.cloudAge } : {} } : {};
   const fitted = appendFittedPlanAndDebug({ ...base, ...keys }, typeof plan === "string" ? plan : undefined, typeof dbg === "string" ? dbg : undefined);
   if (!cloud)
