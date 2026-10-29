@@ -1810,7 +1810,7 @@ function computerUseAccessDetail(toolInput) {
   if (!Array.isArray(apps))
     return;
   const names = apps.filter((a) => typeof a === "string").map((a) => a.replace(/\s+/g, " ").trim()).filter((a) => a.length > 0);
-  return names.length > 0 ? clipDetail(`Computer Use: ${names.join(", ")}`) : undefined;
+  return names.length > 0 ? clipDetail(`Use ${names.join(", ")}`) : undefined;
 }
 function aiTitleFromLines(lines) {
   for (let i = lines.length - 1;i >= 0; i--) {

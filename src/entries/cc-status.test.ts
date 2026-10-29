@@ -2975,7 +2975,7 @@ describe("computer-use request_access heads-up", () => {
   const access = { apps: ["iPhone Mirroring", "Notes"], reason: "check the phone" };
 
   test("detail names the apps, encrypted in the blob; no apps → no detail", () => {
-    expect(detailForHook("PreToolUse", "mcp__computer-use__request_access", access)).toBe("Computer Use: iPhone Mirroring, Notes");
+    expect(detailForHook("PreToolUse", "mcp__computer-use__request_access", access)).toBe("Use iPhone Mirroring, Notes");
     expect(detailForHook("PreToolUse", "mcp__computer-use__request_access", { apps: [] })).toBeUndefined();
     expect(detailForHook("PreToolUse", "mcp__computer-use__request_access", undefined)).toBeUndefined();
     const long = detailForHook("PreToolUse", "mcp__computer-use__request_access", { apps: Array(100).fill("App") })!;
@@ -3005,9 +3005,9 @@ describe("computer-use request_access heads-up", () => {
       };
       const tool = { tool_name: "mcp__computer-use__request_access", tool_input: access };
       expect(await run({ hook_event_name: "PreToolUse", ...tool }))
-        .toMatchObject({ status: "needsAttention", detail: "Computer Use: iPhone Mirroring, Notes" });
+        .toMatchObject({ status: "needsAttention", detail: "Use iPhone Mirroring, Notes" });
       expect(await run({ hook_event_name: "Notification", notification_type: "permission_prompt", message: "Claude needs your permission" }))
-        .toMatchObject({ status: "needsAttention", detail: "Computer Use: iPhone Mirroring, Notes" });
+        .toMatchObject({ status: "needsAttention", detail: "Use iPhone Mirroring, Notes" });
       expect(await run({ hook_event_name: "PostToolUse", ...tool }))
         .toMatchObject({ status: "working", detail: "thinking" });
     } finally {

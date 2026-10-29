@@ -106,16 +106,18 @@ function clipDetail(text: string): string {
  *  no PermissionRequest ever fires and no hook can answer it. The phone can only say WHAT is asked. */
 export const COMPUTER_USE_ACCESS_TOOL = "mcp__computer-use__request_access";
 
-/** The phone's one-line heads-up for a computer-use access request, e.g. "Computer Use: iPhone
- *  Mirroring". App names are user content, so this rides the encrypted blob's `detail` exactly like
- *  the request_user_input preview above (the worker never sees it). The `reason` is left out: the app
+/** The phone's one-line heads-up for a computer-use access request, e.g. "Use iPhone Mirroring".
+ *  Short on purpose: the lock-screen Live Activity has ~188 pt left beside "NEED HELP" on a 393 pt
+ *  phone, and a "Computer Use: " prefix pushed the app name itself past the cut. App names are user
+ *  content, so this rides the encrypted blob's `detail` exactly like the request_user_input preview
+ *  above (the worker never sees it). The `reason` is left out: the app
  *  list is what the user approves, and the row has one line. Undefined when no app name is readable. */
 export function computerUseAccessDetail(toolInput: unknown): string | undefined {
   const apps = (toolInput as { apps?: unknown } | null)?.apps;
   if (!Array.isArray(apps)) return undefined;
   const names = apps.filter((a): a is string => typeof a === "string")
     .map((a) => a.replace(/\s+/g, " ").trim()).filter((a) => a.length > 0);
-  return names.length > 0 ? clipDetail(`Computer Use: ${names.join(", ")}`) : undefined;
+  return names.length > 0 ? clipDetail(`Use ${names.join(", ")}`) : undefined;
 }
 
 // --- Title resolution ------------------------------------------------------------------------
