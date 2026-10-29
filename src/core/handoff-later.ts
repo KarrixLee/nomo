@@ -361,7 +361,7 @@ export async function waitThenHandoff(p: Pending, d: WaitDeps): Promise<number> 
     d.notify("Your session is now running in the cloud.");
   } else {
     unpark();
-    d.result?.(false, code === EXIT_BOX_GONE ? "gone" : "other");
+    d.result?.(false, code === EXIT_BOX_GONE ? "gone" : code === EXIT_BOX_FULL ? "cap" : "other");
     d.log(`FAILED: ${why ?? `the handoff exited ${code}; see the lines above`}. Your Mac copy is untouched.`);
     d.notify("Handoff failed. Your Mac copy is untouched. Check /nomo-cc:handoff status.");
   }
@@ -393,8 +393,6 @@ export interface PhoneMoveFacts {
   parked: boolean;
   active: boolean;
   needsPairing: boolean;
-  /** cloud.json `active.length`: sessions already on the box. */
-  cloudCount: number;
   transcriptExists: (cwd: string) => boolean;
   /** Git-tracked files under cwd's repo whose name looks like a secret ([] outside git); undefined
    *  when git failed (readiness.ts trackedSecretFiles). */
@@ -419,7 +417,9 @@ export function phoneMoveCheck(f: PhoneMoveFacts): { claudePid: number; cwd: str
   if (f.parked) return { refuse: "it is already moving, in the cloud, or parked", why: "other" };
   if (f.active) return { refuse: "it is already running in the cloud", why: "other" };
   if (f.needsPairing) return { refuse: "the cloud box needs a one-time pairing; run /nomo-cc:handoff in that session first", why: "notPaired" };
-  if (f.cloudCount >= BOX_MAX_SESSIONS) return { refuse: `the cloud box already runs ${f.cloudCount} sessions (the cap is ${BOX_MAX_SESSIONS}); bring one back first`, why: "cap" };
+  // NOM-112: no cap check here. cloud.json `active` lists sessions not brought back yet (stopped, finished,
+  // failed), not running ones, and only the box sees its tmux; an asleep box runs none. The box's flock'd
+  // admit (handoff admitScript) counts live sessions and refuses with EXIT_BOX_FULL → why "cap".
   if (!r.cwd || !f.transcriptExists(r.cwd)) return { refuse: "its transcript was not found", why: "other" };
   const inTranscript = f.transcriptSecrets(r.cwd);
   if (inTranscript) return { refuse: `the conversation contains what look like ${inTranscript}, which would travel with the transcript; move it from the terminal (/nomo-cc:handoff anyway) if that is fine`, why: "transcriptSecret" };
@@ -431,6 +431,8 @@ export function phoneMoveCheck(f: PhoneMoveFacts): { claudePid: number; cwd: str
 
 /** The exit code of a handoff that found the user's box gone (NOM-99), so the helper can say why. */
 export const EXIT_BOX_GONE = 3;
+/** The exit code of a handoff the box refused at admission: BOX_MAX_SESSIONS already running (NOM-112). */
+export const EXIT_BOX_FULL = 4;
 
 /** How long the phone path waits after writing the "moving" marker before reading the session state. */
 export const PHONE_SETTLE_MS = 2000;

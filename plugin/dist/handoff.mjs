@@ -384,7 +384,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "2.3.47";
+var PLUGIN_VERSION = "2.3.48";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -4349,7 +4349,7 @@ async function waitThenHandoff(p, d) {
     d.notify("Your session is now running in the cloud.");
   } else {
     unpark();
-    d.result?.(false, code === EXIT_BOX_GONE ? "gone" : "other");
+    d.result?.(false, code === EXIT_BOX_GONE ? "gone" : code === EXIT_BOX_FULL ? "cap" : "other");
     d.log(`FAILED: ${why ?? `the handoff exited ${code}; see the lines above`}. Your Mac copy is untouched.`);
     d.notify("Handoff failed. Your Mac copy is untouched. Check /nomo-cc:handoff status.");
   }
@@ -4388,8 +4388,6 @@ function phoneMoveCheck(f) {
     return { refuse: "it is already running in the cloud", why: "other" };
   if (f.needsPairing)
     return { refuse: "the cloud box needs a one-time pairing; run /nomo-cc:handoff in that session first", why: "notPaired" };
-  if (f.cloudCount >= BOX_MAX_SESSIONS)
-    return { refuse: `the cloud box already runs ${f.cloudCount} sessions (the cap is ${BOX_MAX_SESSIONS}); bring one back first`, why: "cap" };
   if (!r.cwd || !f.transcriptExists(r.cwd))
     return { refuse: "its transcript was not found", why: "other" };
   const inTranscript = f.transcriptSecrets(r.cwd);
@@ -4403,6 +4401,7 @@ function phoneMoveCheck(f) {
   return { claudePid: pid, cwd: r.cwd };
 }
 var EXIT_BOX_GONE = 3;
+var EXIT_BOX_FULL = 4;
 var PHONE_SETTLE_MS = 2000;
 async function settleThenStamp(session, d) {
   for (let i = 0;i < 2; i++) {
@@ -6081,7 +6080,7 @@ function busyMessage(stdout, box, uuid, root) {
     return `another handoff to box ${box} is still in progress; rerun this one in a minute.`;
   const full = stdout.match(/^NOMO_FULL=(\d+)$/m);
   if (full) {
-    return `box ${box} already runs ${full[1]} sessions (the cap is ${BOX_MAX_SESSIONS}). Bring one back (--back --session <id>) or stop one (--stop --session <id>) first; --status lists them.`;
+    return `box ${box} has ${full[1]} sessions running or starting (the cap is ${BOX_MAX_SESSIONS}; stopped ones don't count). Stop one (--stop --session <id>) or bring one back (--back --session <id>) first; --status lists them.`;
   }
   return `session ${uuid} is already running on box ${box}. Check it with --status; rerun with --force to replace it (only that session is stopped).`;
 }
@@ -7069,7 +7068,6 @@ async function phoneLater(args, keys, worker) {
     parked: readPark(session) !== undefined,
     active: cloudActive(session),
     needsPairing: needsPairing(cloud, worker),
-    cloudCount: cloud.active?.length ?? 0,
     transcriptExists: (cwd) => existsSync6(join7(home, ".claude", "projects", projectDirName(cwd), `${session}.jsonl`)),
     trackedSecrets: trackedSecretFiles,
     transcriptSecrets: (cwd) => secretSummary(scanHandoff(join7(home, ".claude", "projects", projectDirName(cwd)), session), session)
@@ -7408,8 +7406,9 @@ Target worker: ${worker}`);
   if (r.exitCode === 4)
     throw new Error(`the OpenRouter relay did not start on box ${id}:
 ${pane.slice(-1000)}`);
-  if (r.exitCode === 3)
-    throw new Error(busyMessage(r.stdout ?? "", id, plan.uuid, plan.root));
+  if (r.exitCode === 3) {
+    throw Object.assign(new Error(busyMessage(r.stdout ?? "", id, plan.uuid, plan.root)), /^NOMO_FULL=/m.test(r.stdout ?? "") ? { exitCode: EXIT_BOX_FULL } : {});
+  }
   if (r.exitCode === 6) {
     updateCloud((c) => ({ ...c, pairedTo: undefined }));
     throw new Error(`box ${id} is not paired to ${worker}, so your phone couldn't see the session; nothing was started. Pair it from a terminal: ${q(process.execPath)} ${q(SELF)} --pair`);
@@ -7444,7 +7443,7 @@ Session ${plan.uuid} is running on cloud box ${id} (tmux session "${tmuxName(pla
 if (__require.main == __require.module) {
   main().catch((e) => {
     console.error(`handoff: ${e.message ?? e}`);
-    process.exit(e?.exitCode === EXIT_BOX_GONE ? EXIT_BOX_GONE : 1);
+    process.exit([EXIT_BOX_GONE, EXIT_BOX_FULL].includes(e?.exitCode) ? e.exitCode : 1);
   });
 }
 export {
