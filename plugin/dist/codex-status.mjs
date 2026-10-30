@@ -1502,8 +1502,19 @@ function requestUserInputDetail(toolInput) {
     return;
   const header = typeof q.header === "string" ? q.header.replace(/\s+/g, " ").trim() : "";
   const text = header && !question.toLowerCase().startsWith(`${header.toLowerCase()}:`) ? `${header}: ${question}` : question;
+  return clipDetail(text);
+}
+function clipDetail(text) {
   const characters = Array.from(text);
   return characters.length <= USER_INPUT_DETAIL_MAX ? text : `${characters.slice(0, USER_INPUT_DETAIL_MAX - 1).join("")}…`;
+}
+var COMPUTER_USE_ACCESS_TOOL = "mcp__computer-use__request_access";
+function computerUseAccessDetail(toolInput) {
+  const apps = toolInput?.apps;
+  if (!Array.isArray(apps))
+    return;
+  const names = apps.filter((a) => typeof a === "string").map((a) => a.replace(/\s+/g, " ").trim()).filter((a) => a.length > 0);
+  return names.length > 0 ? clipDetail(`Use ${names.join(", ")}`) : undefined;
 }
 function aiTitleFromLines(lines) {
   for (let i = lines.length - 1;i >= 0; i--) {
@@ -3724,6 +3735,9 @@ function detailForHook(hookName, toolName, toolInput) {
   if (hookName === "PreToolUse" && toolName === "request_user_input") {
     return requestUserInputDetail(toolInput);
   }
+  if (hookName === "PreToolUse" && toolName === COMPUTER_USE_ACCESS_TOOL) {
+    return computerUseAccessDetail(toolInput);
+  }
   if (hookName === "PreToolUse")
     return toolName ? TOOL_DETAIL[toolName] : undefined;
   if (hookName === "PostToolUse" || hookName === "PostToolUseFailure")
@@ -3765,7 +3779,7 @@ async function sessionHoldIsLive(sessionsDir, sessionId, now = Date.now(), alive
   const hold = await readDecisionHoldAt(sessionsDir, sessionId);
   return stateHoldLive(hold, hold !== null && typeof hold.pid === "number" ? alive(hold.pid) : false, now);
 }
-var USER_BLOCKING_TOOLS = new Set(["AskUserQuestion", "ExitPlanMode", "request_user_input"]);
+var USER_BLOCKING_TOOLS = new Set(["AskUserQuestion", "ExitPlanMode", "request_user_input", COMPUTER_USE_ACCESS_TOOL]);
 var INTERRUPT_STOP_REASON = "Interrupted from Nomo";
 function interruptHookOutput(hookName) {
   if (hookName === "PreToolUse") {
@@ -3901,6 +3915,16 @@ async function buildEnvelope(input, machine, now, title, e2eKey, sentDone, agent
   const blob = await encryptBlob(e2eKey, plaintext);
   const attentionKind = attentionKindOverride ?? (agent === "codex" && hookName === "PreToolUse" && i.tool_name === "request_user_input" ? "userInput" : undefined);
   return { ...base, ...attentionKind ? { attentionKind } : {}, blob };
+}
+async function attentionDetailOf(record, e2eKey) {
+  if (record?.lastEvent !== "needsAttention" || typeof record.blob !== "string")
+    return;
+  try {
+    const detail = (await decryptBlob(e2eKey, record.blob)).detail;
+    return typeof detail === "string" && detail.length > 0 ? detail : undefined;
+  } catch {
+    return;
+  }
 }
 function buildPendingStash(input, machine, title, now, pid = process.ppid, agent = "claude", model) {
   if (typeof input.session_id !== "string" || input.session_id.length === 0)
@@ -4335,9 +4359,10 @@ async function runHook(agent) {
       by: "h"
     }) : undefined;
     let planFull;
+    const keptDetail = hookName === "Notification" && plan.status === "needsAttention" ? await attentionDetailOf(existingRecord, config.e2eKey) : undefined;
     const envelope = await buildEnvelope(eventInput, machine, Date.now(), title, config.e2eKey, sentDone, agent, startedAt, turnStartedAt, folder, model, plan, attentionKind, proposedPlan, dbg, (plaintext) => {
       planFull = fullTextForRecord(proposedPlan, plaintext.plan);
-    });
+    }, keptDetail);
     if (!envelope)
       return;
     fullUpload = postFullText(config, sessionId, "plan", planFull);
