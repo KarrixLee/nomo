@@ -121,6 +121,10 @@ In plain English:
   At most every 6 hours, and only when they changed, they are sealed with the same AES-256-GCM key
   and uploaded to the relay's `/v1/cc/full` slot (`what: "activity"`). The relay cannot read them and
   deletes them after **35 days**.
+- **The Live Agents widget reads a snapshot that never leaves the iPhone.** On Nomo Pro, the iPhone
+  app writes a small snapshot of your sessions (decrypted titles, state, computer name) into its own
+  App Group container so the Live Agents widget can show them. It stays on the device and is never
+  sent anywhere.
 
 ## Install — one command
 
