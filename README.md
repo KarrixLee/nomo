@@ -111,6 +111,16 @@ In plain English:
   so a relay cannot relabel one session's real update as another's and steer what you tap (an
   approval, an interrupt) onto the wrong session. Updates from plugins older than this carry no `sid`
   and are still shown.
+- **The daily activity summary holds counts only, and it is sealed.** While paired, the watchdog
+  reads your agents' local history on this computer, read-only: Claude Code transcripts
+  (`~/.claude/projects`), Codex rollouts and its `state_5.sqlite` / `thread_history_1.sqlite`, and
+  OpenCode's `opencode.db`. From these it builds one row per day per agent: the number of sessions,
+  the number of prompts you sent, which 5-minute slots of the day had any activity, and token totals
+  per model. It **never** reads prompt or reply text into the summary, and it never includes project
+  names or paths. The rows are kept in `~/.config/cc-status/activity-days.json` (400 days at most).
+  At most every 6 hours, and only when they changed, they are sealed with the same AES-256-GCM key
+  and uploaded to the relay's `/v1/cc/full` slot (`what: "activity"`). The relay cannot read them and
+  deletes them after **35 days**.
 
 ## Install — one command
 
