@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   addEvent, buildPayload, Cursor, emptyState, freeze, localDate, maybeUpload, parseClaudeLine, parseCodexLine,
-  parseState, scanAll, serializeState, State,
+  parseState, runActivityCycle, scanAll, serializeState, State,
 } from "./activity";
 
 const asst = (id: string, req: string, ts: string, out = 10, sid = "s1") => JSON.stringify({
@@ -156,5 +156,62 @@ describe("upload", () => {
     addEvent(st, { ts: NOW, agent: "claude", sessionId: "s", kind: "turn", id: "b" });
     expect(await maybeUpload(st, config, NOW + 3_600_000, fetchFn)).toBe(false); // < 6 h
     expect(await maybeUpload(st, config, NOW + 7 * 3_600_000, fetchFn)).toBe(true);
+  });
+
+  const okFetch = (calls: any[]) => (async (_u: string, init: any) => { calls.push(init.headers["x-cc-pairing"]); return new Response("{}"); }) as any;
+  const cfg = (pairingId: string) => ({ url: "https://w", pairingId, pcSecret: "sec", e2eKey: new Uint8Array(32) }) as any;
+
+  test("a new pairing uploads right away despite a recent upload and the same rows", async () => {
+    const st = emptyState();
+    addEvent(st, { ts: NOW, agent: "claude", sessionId: "s", kind: "turn", id: "a" });
+    const calls: string[] = [];
+    expect(await maybeUpload(st, cfg("old"), NOW, okFetch(calls))).toBe(true);
+    expect(st.lastPairing).toBe("old");
+    expect(await maybeUpload(st, cfg("new"), NOW + 4 * 60_000, okFetch(calls))).toBe(true);
+    expect(calls).toEqual(["old", "new"]);
+    expect(st.lastPairing).toBe("new");
+    expect(await maybeUpload(st, cfg("new"), NOW + 5 * 60_000, okFetch(calls))).toBe(false); // now throttled again
+  });
+
+  test("the same pairing stays throttled; a failed upload keeps the old pairing", async () => {
+    const st = emptyState();
+    addEvent(st, { ts: NOW, agent: "claude", sessionId: "s", kind: "turn", id: "a" });
+    const calls: string[] = [];
+    expect(await maybeUpload(st, cfg("p"), NOW, okFetch(calls))).toBe(true);
+    addEvent(st, { ts: NOW, agent: "claude", sessionId: "s", kind: "turn", id: "b" });
+    expect(await maybeUpload(st, cfg("p"), NOW + 60_000, okFetch(calls))).toBe(false);
+    const fail = (async () => new Response("", { status: 500 })) as any;
+    expect(await maybeUpload(st, cfg("q"), NOW + 60_000, fail)).toBe(false);
+    expect(st.lastPairing).toBe("p");
+    expect(calls).toEqual(["p"]);
+  });
+
+  test("lastPairing round-trips; an old file without it loads and uploads to the current pairing", async () => {
+    const st = emptyState();
+    addEvent(st, { ts: NOW, agent: "claude", sessionId: "s", kind: "turn", id: "a" });
+    st.lastPairing = "p";
+    expect(parseState(serializeState(st)).lastPairing).toBe("p");
+    const old = JSON.parse(serializeState(st));
+    delete old.lastPairing;
+    old.lastUpload = NOW; old.lastHash = "x";
+    const st2 = parseState(JSON.stringify(old));
+    expect(st2.lastPairing).toBe("");
+    expect(st2.rows.size).toBe(1);
+    expect(st2.lastUpload).toBe(NOW);
+    const calls: string[] = [];
+    expect(await maybeUpload(st2, cfg("p"), NOW + 60_000, okFetch(calls))).toBe(true); // unknown → re-send once
+  });
+
+  test("scan:false re-sends the rows on disk to a new pairing without reading history", async () => {
+    const st = emptyState();
+    addEvent(st, { ts: NOW, agent: "claude", sessionId: "s", kind: "turn", id: "a" });
+    st.lastUpload = NOW; st.lastPairing = "old"; st.lastHash = "h";
+    const daysPath = join(dir, "days.json");
+    writeFileSync(daysPath, serializeState(st));
+    const calls: string[] = [];
+    const missing = { claude: join(dir, "nope"), codex: join(dir, "nope"), opencode: join(dir, "nope.db") };
+    await runActivityCycle({ config: cfg("new"), daysPath, cursorPath: join(dir, "cur.json"), roots: missing, now: () => NOW + 60_000, fetchFn: okFetch(calls), scan: false });
+    expect(calls).toEqual(["new"]);
+    expect(parseState(await Bun.file(daysPath).text()).lastPairing).toBe("new");
   });
 });

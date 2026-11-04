@@ -119,8 +119,9 @@ In plain English:
   per model. It **never** reads prompt or reply text into the summary, and it never includes project
   names or paths. The rows are kept in `~/.config/cc-status/activity-days.json` (400 days at most).
   At most every 6 hours, and only when they changed, they are sealed with the same AES-256-GCM key
-  and uploaded to the relay's `/v1/cc/full` slot (`what: "activity"`). The relay cannot read them and
-  deletes them after **35 days**.
+  and uploaded to the relay's `/v1/cc/full` slot (`what: "activity"`). The one exception: right after
+  you pair with a new phone, the existing rows are uploaded once within about a minute, because the
+  relay keeps them per pairing. The relay cannot read them and deletes them after **35 days**.
 - **The Live Agents widget reads a snapshot that never leaves the iPhone.** On Nomo Pro, the iPhone
   app writes a small snapshot of your sessions (decrypted titles, state, computer name) into its own
   App Group container so the Live Agents widget can show them. It stays on the device and is never

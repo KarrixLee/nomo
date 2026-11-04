@@ -8857,7 +8857,7 @@ var SAVE_EVERY_BYTES = 256 * 1024 * 1024;
 var MAX_PAYLOAD_CHARS = 900000;
 var ACTIVITY_DAYS_PATH = `${CC_DIR}/activity-days.json`;
 var ACTIVITY_CURSOR_PATH = `${CC_DIR}/activity-cursor.json`;
-var emptyState = () => ({ lastUpload: 0, lastHash: "", rows: new Map });
+var emptyState = () => ({ lastUpload: 0, lastHash: "", lastPairing: "", rows: new Map });
 var h12 = (s) => createHash3("sha1").update(s).digest("base64").slice(0, 12);
 var pad = (n) => String(n).padStart(2, "0");
 function localDate(ts) {
@@ -8922,7 +8922,7 @@ function serializeState(state) {
     u: r.u,
     ...r.k ? { k: [...r.k], ss: [...r.ss] } : {}
   }));
-  return JSON.stringify({ v: 1, lastUpload: state.lastUpload, lastHash: state.lastHash, days });
+  return JSON.stringify({ v: 1, lastUpload: state.lastUpload, lastHash: state.lastHash, lastPairing: state.lastPairing, days });
 }
 function parseState(text) {
   const st = emptyState();
@@ -8930,6 +8930,7 @@ function parseState(text) {
     const o = JSON.parse(text);
     st.lastUpload = Number(o.lastUpload) || 0;
     st.lastHash = typeof o.lastHash === "string" ? o.lastHash : "";
+    st.lastPairing = typeof o.lastPairing === "string" ? o.lastPairing : "";
     for (const r of o.days ?? []) {
       const bits = new Uint8Array(36);
       bits.set(Buffer.from(String(r.b ?? ""), "base64").subarray(0, 36));
@@ -9285,11 +9286,12 @@ function payloadHash(payload) {
   return createHash3("sha1").update(JSON.stringify(payload.days)).digest("hex");
 }
 async function maybeUpload(state, config, now, fetchFn = fetch) {
-  if (state.rows.size === 0 || now - state.lastUpload < UPLOAD_EVERY_MS)
+  const newPairing = config.pairingId !== state.lastPairing;
+  if (state.rows.size === 0 || !newPairing && now - state.lastUpload < UPLOAD_EVERY_MS)
     return false;
   const payload = buildPayload(state, now);
   const hash = payloadHash(payload);
-  if (hash === state.lastHash)
+  if (!newPairing && hash === state.lastHash)
     return false;
   try {
     const blob = await encryptBlob(config.e2eKey, payload);
@@ -9308,6 +9310,7 @@ async function maybeUpload(state, config, now, fetchFn = fetch) {
       return false;
     state.lastUpload = now;
     state.lastHash = hash;
+    state.lastPairing = config.pairingId;
     return true;
   } catch {
     return false;
@@ -9329,25 +9332,44 @@ async function runActivityCycle(deps = {}) {
     await atomicWrite(daysPath, serializeState(state), 384);
     await atomicWrite(cursorPath, JSON.stringify(cursor), 384);
   };
-  await scanAll(state, cursor, deps.roots ?? defaultRoots(), now(), save);
-  freeze(state, now());
-  await maybeUpload(state, config, now(), deps.fetchFn);
-  await save();
+  const scan = deps.scan !== false;
+  if (scan) {
+    await scanAll(state, cursor, deps.roots ?? defaultRoots(), now(), save);
+    freeze(state, now());
+  }
+  const sent = await maybeUpload(state, config, now(), deps.fetchFn);
+  if (scan || sent)
+    await save();
 }
 function startActivityLoop() {
   let busy = false;
-  const kick = () => {
+  let seen;
+  const run = (deps) => {
     if (busy)
       return;
     busy = true;
-    runActivityCycle().catch(() => {}).finally(() => {
+    runActivityCycle(deps).then(() => {
+      seen = deps.config?.pairingId ?? "";
+    }).catch(() => {}).finally(() => {
       busy = false;
     });
   };
-  const timer = setInterval(kick, HOUR_MS);
-  timer.unref?.();
+  const kick = async () => {
+    if (!busy)
+      run({ config: await loadConfig() });
+  };
+  const tick = async () => {
+    if (busy || seen === undefined)
+      return;
+    const config = await loadConfig();
+    if (config && config.pairingId !== seen)
+      run({ config, scan: seen !== "" });
+  };
+  const timers = [setInterval(() => void kick(), HOUR_MS), setInterval(() => void tick(), 60000)];
+  for (const t of timers)
+    t.unref?.();
   kick();
-  return () => clearInterval(timer);
+  return () => timers.forEach(clearInterval);
 }
 // src/entries/cc-watchdog.ts
 var POLL_MS = 5000;

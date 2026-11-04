@@ -2,7 +2,7 @@
 // Codex rollouts + its SQLite state, OpenCode's SQLite db), folds it into per-(local day, agent) rows
 // of COUNTS ONLY, and uploads the rows E2E-sealed through the blind /v1/cc/full slot. Driven by the
 // watchdog (startActivityLoop): once at start, then hourly; an upload needs changed rows AND ≥6 h since
-// the last one.
+// the last one — except the first upload to a NEW pairing (re-pair), which goes out within a minute.
 //
 // PRIVACY: an event carries a timestamp, a session id, a kind, a model id and token counts — never
 // prompt or reply text (a user line's text is looked at only to tell a real prompt from a tool echo).
@@ -53,9 +53,10 @@ interface Row {
   d: string; a: ActivityAgent; s: number; t: number; bits: Uint8Array; u: Record<string, Tokens>;
   k?: Set<string>; ss?: Set<string>; // present ⇔ hot
 }
-export interface State { lastUpload: number; lastHash: string; rows: Map<string, Row> }
+/** lastPairing = the pairingId the last upload went to; the relay keeps the blob PER PAIRING. */
+export interface State { lastUpload: number; lastHash: string; lastPairing: string; rows: Map<string, Row> }
 
-export const emptyState = (): State => ({ lastUpload: 0, lastHash: "", rows: new Map() });
+export const emptyState = (): State => ({ lastUpload: 0, lastHash: "", lastPairing: "", rows: new Map() });
 
 const h12 = (s: string) => createHash("sha1").update(s).digest("base64").slice(0, 12);
 const pad = (n: number) => String(n).padStart(2, "0");
@@ -108,7 +109,7 @@ export function serializeState(state: State): string {
     d: r.d, a: r.a, s: r.s, t: r.t, b: Buffer.from(r.bits).toString("base64"), u: r.u,
     ...(r.k ? { k: [...r.k], ss: [...r.ss!] } : {}),
   }));
-  return JSON.stringify({ v: 1, lastUpload: state.lastUpload, lastHash: state.lastHash, days });
+  return JSON.stringify({ v: 1, lastUpload: state.lastUpload, lastHash: state.lastHash, lastPairing: state.lastPairing, days });
 }
 
 export function parseState(text: string): State {
@@ -117,6 +118,7 @@ export function parseState(text: string): State {
     const o = JSON.parse(text);
     st.lastUpload = Number(o.lastUpload) || 0;
     st.lastHash = typeof o.lastHash === "string" ? o.lastHash : "";
+    st.lastPairing = typeof o.lastPairing === "string" ? o.lastPairing : ""; // absent in older files
     for (const r of o.days ?? []) {
       const bits = new Uint8Array(36);
       bits.set(Buffer.from(String(r.b ?? ""), "base64").subarray(0, 36));
@@ -413,12 +415,14 @@ export function payloadHash(payload: ReturnType<typeof buildPayload>): string {
   return createHash("sha1").update(JSON.stringify(payload.days)).digest("hex");
 }
 
-/** Seal + POST the payload when rows changed and the last upload is ≥6 h old. Never throws. */
+/** Seal + POST the payload when rows changed and the last upload is ≥6 h old — or right away when the
+ *  last upload went to a different pairing (a re-pair: the new pairing has no blob yet). Never throws. */
 export async function maybeUpload(state: State, config: Config, now: number, fetchFn: typeof fetch = fetch): Promise<boolean> {
-  if (state.rows.size === 0 || now - state.lastUpload < UPLOAD_EVERY_MS) return false;
+  const newPairing = config.pairingId !== state.lastPairing;
+  if (state.rows.size === 0 || (!newPairing && now - state.lastUpload < UPLOAD_EVERY_MS)) return false;
   const payload = buildPayload(state, now);
   const hash = payloadHash(payload);
-  if (hash === state.lastHash) return false;
+  if (!newPairing && hash === state.lastHash) return false;
   try {
     const blob = await encryptBlob(config.e2eKey, payload);
     const res = await fetchFn(`${config.url}/v1/cc/full`, {
@@ -433,12 +437,15 @@ export async function maybeUpload(state: State, config: Config, now: number, fet
     if (!res.ok) return false;
     state.lastUpload = now;
     state.lastHash = hash;
+    state.lastPairing = config.pairingId;
     return true;
   } catch { return false; }
 }
 
 export interface CycleDeps {
   config?: Config | null; roots?: Roots; daysPath?: string; cursorPath?: string; now?: () => number; fetchFn?: typeof fetch;
+  /** false = upload the rows already on disk, no history scan (the re-pair fast path). */
+  scan?: boolean;
 }
 
 export async function runActivityCycle(deps: CycleDeps = {}): Promise<void> {
@@ -455,22 +462,36 @@ export async function runActivityCycle(deps: CycleDeps = {}): Promise<void> {
     await atomicWrite(daysPath, serializeState(state), 0o600);
     await atomicWrite(cursorPath, JSON.stringify(cursor), 0o600);
   };
-  await scanAll(state, cursor, deps.roots ?? defaultRoots(), now(), save);
-  freeze(state, now());
-  await maybeUpload(state, config, now(), deps.fetchFn);
-  await save();
+  const scan = deps.scan !== false;
+  if (scan) {
+    await scanAll(state, cursor, deps.roots ?? defaultRoots(), now(), save);
+    freeze(state, now());
+  }
+  const sent = await maybeUpload(state, config, now(), deps.fetchFn);
+  if (scan || sent) await save();
 }
 
-/** Watchdog hook: run now, then hourly; overlapping runs are skipped. Returns the stopper. */
+/** Watchdog hook: run now, then hourly; overlapping runs are skipped. A once-a-minute tick reads only
+ *  config.json and, when the pairing changed since the last run (a re-pair under a live watchdog —
+ *  `pair` does not restart a same-build daemon), uploads the rows already on disk without rescanning.
+ *  Returns the stopper. */
 export function startActivityLoop(): () => void {
   let busy = false;
-  const kick = () => {
+  let seen: string | undefined; // pairingId the last run saw ("" = unpaired); undefined until the first run
+  const run = (deps: CycleDeps) => {
     if (busy) return;
     busy = true;
-    void runActivityCycle().catch(() => {}).finally(() => { busy = false; });
+    void runActivityCycle(deps).then(() => { seen = deps.config?.pairingId ?? ""; }).catch(() => {}).finally(() => { busy = false; });
   };
-  const timer = setInterval(kick, HOUR_MS);
-  (timer as unknown as { unref?: () => void }).unref?.();
-  kick();
-  return () => clearInterval(timer);
+  const kick = async () => { if (!busy) run({ config: await loadConfig() }); };
+  const tick = async () => {
+    if (busy || seen === undefined) return;
+    const config = await loadConfig();
+    // First pairing (seen "") needs the scan anyway; a re-pair just re-sends the rows on disk.
+    if (config && config.pairingId !== seen) run({ config, scan: seen !== "" });
+  };
+  const timers = [setInterval(() => void kick(), HOUR_MS), setInterval(() => void tick(), 60_000)];
+  for (const t of timers) (t as unknown as { unref?: () => void }).unref?.();
+  void kick();
+  return () => timers.forEach(clearInterval);
 }
