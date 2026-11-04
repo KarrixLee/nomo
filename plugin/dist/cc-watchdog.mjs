@@ -8844,9 +8844,10 @@ class CodexRemoteInputBridge {
 }
 
 // src/core/activity.ts
-import { createHash as createHash3 } from "node:crypto";
+import { createHash as createHash3, randomUUID } from "node:crypto";
 import { createReadStream, existsSync as existsSync4 } from "node:fs";
 import { readdir as readdir7, readFile as readFile9, stat as stat6 } from "node:fs/promises";
+import { dirname as dirname2 } from "node:path";
 import * as zlib from "node:zlib";
 var HOT_DAYS = 40;
 var MAX_DAYS = 400;
@@ -8857,6 +8858,15 @@ var SAVE_EVERY_BYTES = 256 * 1024 * 1024;
 var MAX_PAYLOAD_CHARS = 900000;
 var ACTIVITY_DAYS_PATH = `${CC_DIR}/activity-days.json`;
 var ACTIVITY_CURSOR_PATH = `${CC_DIR}/activity-cursor.json`;
+var UUID_SHAPE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+async function loadMachineId(path) {
+  const have = (await readFile9(path, "utf8").catch(() => "")).trim();
+  if (UUID_SHAPE.test(have))
+    return have;
+  const mid = randomUUID();
+  await atomicWrite(path, mid, 384);
+  return mid;
+}
 var emptyState = () => ({ lastUpload: 0, lastHash: "", lastPairing: "", rows: new Map });
 var h12 = (s) => createHash3("sha1").update(s).digest("base64").slice(0, 12);
 var pad = (n) => String(n).padStart(2, "0");
@@ -8949,7 +8959,7 @@ function parseState(text) {
   }
   return st;
 }
-function buildPayload(state, now) {
+function buildPayload(state, now, mid) {
   const days = [...state.rows.values()].sort((x, y) => x.d === y.d ? x.a.localeCompare(y.a) : x.d.localeCompare(y.d)).map((r) => ({
     d: r.d,
     a: r.a,
@@ -8960,7 +8970,7 @@ function buildPayload(state, now) {
   }));
   while (days.length > 1 && JSON.stringify(days).length > MAX_PAYLOAD_CHARS)
     days.shift();
-  return { v: 1, gen: now, tz: Intl.DateTimeFormat().resolvedOptions().timeZone, days };
+  return { v: 1, gen: now, tz: Intl.DateTimeFormat().resolvedOptions().timeZone, days, ...mid ? { mid } : {} };
 }
 var num = (x) => typeof x === "number" && Number.isFinite(x) && x > 0 ? x : 0;
 var NON_PROMPT = ["<task-notification>", "<bash-stdout>", "<bash-stderr>", "<local-command-stdout>", "<local-command-stderr>", "<local-command-caveat>"];
@@ -9285,11 +9295,11 @@ async function scanAll(state, cursor, roots, now, checkpoint = async () => {}) {
 function payloadHash(payload) {
   return createHash3("sha1").update(JSON.stringify(payload.days)).digest("hex");
 }
-async function maybeUpload(state, config, now, fetchFn = fetch) {
+async function maybeUpload(state, config, now, fetchFn = fetch, mid) {
   const newPairing = config.pairingId !== state.lastPairing;
   if (state.rows.size === 0 || !newPairing && now - state.lastUpload < UPLOAD_EVERY_MS)
     return false;
-  const payload = buildPayload(state, now);
+  const payload = buildPayload(state, now, mid);
   const hash = payloadHash(payload);
   if (!newPairing && hash === state.lastHash)
     return false;
@@ -9337,7 +9347,10 @@ async function runActivityCycle(deps = {}) {
     await scanAll(state, cursor, deps.roots ?? defaultRoots(), now(), save);
     freeze(state, now());
   }
-  const sent = await maybeUpload(state, config, now(), deps.fetchFn);
+  const mid = await loadMachineId(deps.midPath ?? `${dirname2(daysPath)}/machine-id`).catch(() => {
+    return;
+  });
+  const sent = await maybeUpload(state, config, now(), deps.fetchFn, mid);
   if (scan || sent)
     await save();
 }

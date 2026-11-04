@@ -22,9 +22,10 @@
 // FAILURE: every reader is wrapped — an unknown schema, a corrupt line or a missing runtime feature
 // skips that line/agent, never the watchdog. PORTABLE: runs under node or bun (no Bun.* globals).
 
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { createReadStream, existsSync } from "node:fs";
 import { readdir, readFile, stat } from "node:fs/promises";
+import { dirname } from "node:path";
 import * as zlib from "node:zlib";
 import { encryptBlob } from "./crypto";
 import { atomicWrite, CC_DIR, codexHome, Config, loadConfig, PLUGIN_VERSION } from "./shared";
@@ -46,6 +47,22 @@ const MAX_PAYLOAD_CHARS = 900_000; // the relay refuses blobs over 1.4 M base64 
 
 export const ACTIVITY_DAYS_PATH = `${CC_DIR}/activity-days.json`;
 export const ACTIVITY_CURSOR_PATH = `${CC_DIR}/activity-cursor.json`;
+
+// --- computer id -------------------------------------------------------------------------------
+
+const UUID_SHAPE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+
+/** `mid`: a RANDOM v4 UUID minted once per computer and kept (0600) in the state dir, so the phone can
+ *  tell two pairings of the same Mac apart from two Macs and not double-count it. Never derived from
+ *  hardware, hostname or user; survives re-pairing (unpair leaves it), regenerated if the file is
+ *  deleted or unreadable. Sealed inside the payload: the relay never sees it. */
+export async function loadMachineId(path: string): Promise<string> {
+  const have = (await readFile(path, "utf8").catch(() => "")).trim();
+  if (UUID_SHAPE.test(have)) return have;
+  const mid = randomUUID();
+  await atomicWrite(path, mid, 0o600);
+  return mid;
+}
 
 // --- day rows ----------------------------------------------------------------------------------
 
@@ -132,7 +149,7 @@ export function parseState(text: string): State {
 }
 
 /** The exact v1 wire payload (sorted, counts only). */
-export function buildPayload(state: State, now: number) {
+export function buildPayload(state: State, now: number, mid?: string) {
   const days = [...state.rows.values()]
     .sort((x, y) => (x.d === y.d ? x.a.localeCompare(y.a) : x.d.localeCompare(y.d)))
     .map((r) => ({
@@ -140,7 +157,8 @@ export function buildPayload(state: State, now: number) {
       u: Object.entries(r.u).map(([m, k]) => ({ m, i: k.i, o: k.o, cw: k.cw, cr: k.cr, ...(k.r ? { r: k.r } : {}) })),
     }));
   while (days.length > 1 && JSON.stringify(days).length > MAX_PAYLOAD_CHARS) days.shift();
-  return { v: 1 as const, gen: now, tz: Intl.DateTimeFormat().resolvedOptions().timeZone, days };
+  // mid appended last: optional, old apps ignore it (v stays 1).
+  return { v: 1 as const, gen: now, tz: Intl.DateTimeFormat().resolvedOptions().timeZone, days, ...(mid ? { mid } : {}) };
 }
 
 // --- line parsers (pure) -----------------------------------------------------------------------
@@ -417,10 +435,10 @@ export function payloadHash(payload: ReturnType<typeof buildPayload>): string {
 
 /** Seal + POST the payload when rows changed and the last upload is ≥6 h old — or right away when the
  *  last upload went to a different pairing (a re-pair: the new pairing has no blob yet). Never throws. */
-export async function maybeUpload(state: State, config: Config, now: number, fetchFn: typeof fetch = fetch): Promise<boolean> {
+export async function maybeUpload(state: State, config: Config, now: number, fetchFn: typeof fetch = fetch, mid?: string): Promise<boolean> {
   const newPairing = config.pairingId !== state.lastPairing;
   if (state.rows.size === 0 || (!newPairing && now - state.lastUpload < UPLOAD_EVERY_MS)) return false;
-  const payload = buildPayload(state, now);
+  const payload = buildPayload(state, now, mid);
   const hash = payloadHash(payload);
   if (!newPairing && hash === state.lastHash) return false;
   try {
@@ -446,6 +464,8 @@ export interface CycleDeps {
   config?: Config | null; roots?: Roots; daysPath?: string; cursorPath?: string; now?: () => number; fetchFn?: typeof fetch;
   /** false = upload the rows already on disk, no history scan (the re-pair fast path). */
   scan?: boolean;
+  /** Defaults to `machine-id` next to daysPath. */
+  midPath?: string;
 }
 
 export async function runActivityCycle(deps: CycleDeps = {}): Promise<void> {
@@ -467,7 +487,8 @@ export async function runActivityCycle(deps: CycleDeps = {}): Promise<void> {
     await scanAll(state, cursor, deps.roots ?? defaultRoots(), now(), save);
     freeze(state, now());
   }
-  const sent = await maybeUpload(state, config, now(), deps.fetchFn);
+  const mid = await loadMachineId(deps.midPath ?? `${dirname(daysPath)}/machine-id`).catch(() => undefined);
+  const sent = await maybeUpload(state, config, now(), deps.fetchFn, mid);
   if (scan || sent) await save();
 }
 

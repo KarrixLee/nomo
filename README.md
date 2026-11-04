@@ -122,6 +122,11 @@ In plain English:
   and uploaded to the relay's `/v1/cc/full` slot (`what: "activity"`). The one exception: right after
   you pair with a new phone, the existing rows are uploaded once within about a minute, because the
   relay keeps them per pairing. The relay cannot read them and deletes them after **35 days**.
+  The summary also carries a random per-computer id (`mid`), so the phone can avoid counting a
+  computer twice when it ends up paired twice. It is a random UUID made once on this computer and
+  kept in `~/.config/cc-status/machine-id` (readable only by you); it is **never** derived from your
+  hardware serial, MAC address, hostname or user name, and delete that file to get a new one. It is
+  sealed inside the end-to-end-encrypted summary, so the relay never sees it.
 - **The Live Agents widget reads a snapshot that never leaves the iPhone.** On Nomo Pro, the iPhone
   app writes a small snapshot of your sessions (decrypted titles, state, computer name) into its own
   App Group container so the Live Agents widget can show them. It stays on the device and is never

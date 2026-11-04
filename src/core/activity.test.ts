@@ -1,11 +1,11 @@
 process.env.TZ = "Asia/Tokyo"; // before any Date use: day bucketing is local-time
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { appendFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
-  addEvent, buildPayload, Cursor, emptyState, freeze, localDate, maybeUpload, parseClaudeLine, parseCodexLine,
+  addEvent, buildPayload, Cursor, emptyState, freeze, loadMachineId, localDate, maybeUpload, parseClaudeLine, parseCodexLine,
   parseState, runActivityCycle, scanAll, serializeState, State,
 } from "./activity";
 
@@ -143,13 +143,15 @@ describe("upload", () => {
     const calls: any[] = [];
     const fetchFn = (async (url: string, init: any) => { calls.push({ url, body: JSON.parse(init.body), h: init.headers }); return new Response("{}"); }) as any;
     const config = { url: "https://w", pairingId: "pid", pcSecret: "sec", e2eKey: new Uint8Array(32) } as any;
-    expect(await maybeUpload(st, config, NOW, fetchFn)).toBe(true);
+    expect(await maybeUpload(st, config, NOW, fetchFn, "11111111-1111-4111-8111-111111111111")).toBe(true);
     expect(calls[0].url).toBe("https://w/v1/cc/full");
     expect(calls[0].body).toMatchObject({ v: 2, sessionId: "activity", what: "activity" });
     expect(calls[0].h["x-cc-pairing"]).toBe("pid");
     const { decryptBlob } = await import("./crypto");
     const plain: any = await decryptBlob(config.e2eKey, calls[0].body.blob);
-    expect(Object.keys(plain)).toEqual(["v", "gen", "tz", "days"]);
+    expect(Object.keys(plain)).toEqual(["v", "gen", "tz", "days", "mid"]);
+    expect(plain.v).toBe(1);
+    expect(plain.mid).toBe("11111111-1111-4111-8111-111111111111");
     expect(plain.tz).toBe("Asia/Tokyo");
     expect(Object.keys(plain.days[0])).toEqual(["d", "a", "s", "t", "b", "u"]);
     expect(await maybeUpload(st, config, NOW + 7 * 3_600_000, fetchFn)).toBe(false); // unchanged
@@ -213,5 +215,44 @@ describe("upload", () => {
     await runActivityCycle({ config: cfg("new"), daysPath, cursorPath: join(dir, "cur.json"), roots: missing, now: () => NOW + 60_000, fetchFn: okFetch(calls), scan: false });
     expect(calls).toEqual(["new"]);
     expect(parseState(await Bun.file(daysPath).text()).lastPairing).toBe("new");
+  });
+});
+
+describe("machine id (mid)", () => {
+  const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+
+  test("random v4 UUID, 0600, stable across runs, regenerated when deleted or garbage", async () => {
+    const p = join(dir, "machine-id");
+    const a = await loadMachineId(p);
+    expect(a).toMatch(UUID);
+    expect(statSync(p).mode & 0o777).toBe(0o600);
+    expect(await loadMachineId(p)).toBe(a);
+    rmSync(p);
+    const b = await loadMachineId(p);
+    expect(b).toMatch(UUID);
+    expect(b).not.toBe(a);
+    writeFileSync(p, "not-a-uuid");
+    expect(await loadMachineId(p)).toMatch(UUID);
+  });
+
+  test("the cycle seals the same mid into every pairing's payload; no mid when not passed", async () => {
+    const st = emptyState();
+    addEvent(st, { ts: NOW, agent: "claude", sessionId: "s", kind: "turn", id: "a" });
+    expect("mid" in buildPayload(st, NOW)).toBe(false);
+    const daysPath = join(dir, "days.json");
+    writeFileSync(daysPath, serializeState(st));
+    const key = new Uint8Array(32);
+    const blobs: string[] = [];
+    const fetchFn = (async (_u: string, init: any) => { blobs.push(JSON.parse(init.body).blob); return new Response("{}"); }) as any;
+    const missing = { claude: join(dir, "nope"), codex: join(dir, "nope"), opencode: join(dir, "nope.db") };
+    for (const pid of ["one", "two"]) {
+      await runActivityCycle({ config: { url: "https://w", pairingId: pid, pcSecret: "s", e2eKey: key } as any, daysPath, cursorPath: join(dir, "cur.json"), roots: missing, now: () => NOW, fetchFn, scan: false });
+    }
+    const { decryptBlob } = await import("./crypto");
+    const mids = await Promise.all(blobs.map(async (b) => ((await decryptBlob(key, b)) as any).mid));
+    expect(mids).toHaveLength(2);
+    expect(mids[0]).toMatch(UUID);
+    expect(mids[1]).toBe(mids[0]);
+    expect(await Bun.file(join(dir, "machine-id")).text()).toBe(mids[0]);
   });
 });
