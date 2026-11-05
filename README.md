@@ -111,6 +111,26 @@ In plain English:
   so a relay cannot relabel one session's real update as another's and steer what you tap (an
   approval, an interrupt) onto the wrong session. Updates from plugins older than this carry no `sid`
   and are still shown.
+- **The daily activity summary holds counts only, and it is sealed.** While paired, the watchdog
+  reads your agents' local history on this computer, read-only: Claude Code transcripts
+  (`~/.claude/projects`), Codex rollouts and its `state_5.sqlite` / `thread_history_1.sqlite`, and
+  OpenCode's `opencode.db`. From these it builds one row per day per agent: the number of sessions,
+  the number of prompts you sent, which 5-minute slots of the day had any activity, and token totals
+  per model. It **never** reads prompt or reply text into the summary, and it never includes project
+  names or paths. The rows are kept in `~/.config/cc-status/activity-days.json` (400 days at most).
+  At most every 6 hours, and only when they changed, they are sealed with the same AES-256-GCM key
+  and uploaded to the relay's `/v1/cc/full` slot (`what: "activity"`). The one exception: right after
+  you pair with a new phone, the existing rows are uploaded once within about a minute, because the
+  relay keeps them per pairing. The relay cannot read them and deletes them after **35 days**.
+  The summary also carries a random per-computer id (`mid`), so the phone can avoid counting a
+  computer twice when it ends up paired twice. It is a random UUID made once on this computer and
+  kept in `~/.config/cc-status/machine-id` (readable only by you); it is **never** derived from your
+  hardware serial, MAC address, hostname or user name, and delete that file to get a new one. It is
+  sealed inside the end-to-end-encrypted summary, so the relay never sees it.
+- **The Live Agents widget reads a snapshot that never leaves the iPhone.** On Nomo Pro, the iPhone
+  app writes a small snapshot of your sessions (decrypted titles, state, computer name) into its own
+  App Group container so the Live Agents widget can show them. It stays on the device and is never
+  sent anywhere.
 
 ## Install — one command
 

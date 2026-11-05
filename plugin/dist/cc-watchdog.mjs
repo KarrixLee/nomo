@@ -2,7 +2,7 @@ import { createRequire } from "node:module";
 var __require = /* @__PURE__ */ createRequire(import.meta.url);
 
 // src/entries/cc-watchdog.ts
-import { readdir as readdir7, readFile as readFile9, unlink as unlink6 } from "node:fs/promises";
+import { readdir as readdir8, readFile as readFile10, unlink as unlink6 } from "node:fs/promises";
 import { readFileSync as readFileSync2, statSync as statSync4, unlinkSync } from "node:fs";
 import { hostname as hostname6 } from "node:os";
 import { basename as basename8 } from "node:path";
@@ -104,7 +104,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "2.3.5";
+var PLUGIN_VERSION = "2.4.0";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -8842,6 +8842,567 @@ class CodexRemoteInputBridge {
     }
   }
 }
+
+// src/core/activity.ts
+import { createHash as createHash3, randomUUID } from "node:crypto";
+import { createReadStream, existsSync as existsSync4 } from "node:fs";
+import { readdir as readdir7, readFile as readFile9, stat as stat6 } from "node:fs/promises";
+import { dirname as dirname2 } from "node:path";
+import * as zlib from "node:zlib";
+var HOT_DAYS = 40;
+var MAX_DAYS = 400;
+var HOUR_MS = 3600000;
+var UPLOAD_EVERY_MS = 6 * HOUR_MS;
+var REFRESH_EVERY_MS = 7 * 24 * HOUR_MS;
+var CHUNK = 2 * 1024 * 1024;
+var SAVE_EVERY_BYTES = 256 * 1024 * 1024;
+var MAX_PAYLOAD_CHARS = 900000;
+var ACTIVITY_DAYS_PATH = `${CC_DIR}/activity-days.json`;
+var ACTIVITY_CURSOR_PATH = `${CC_DIR}/activity-cursor.json`;
+var UUID_SHAPE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+async function loadMachineId(path) {
+  const have = (await readFile9(path, "utf8").catch(() => "")).trim();
+  if (UUID_SHAPE.test(have))
+    return have;
+  const mid = randomUUID();
+  await atomicWrite(path, mid, 384);
+  return mid;
+}
+var emptyState = () => ({ lastUpload: 0, lastHash: "", lastPairing: "", rows: new Map });
+var h12 = (s) => createHash3("sha1").update(s).digest("base64").slice(0, 12);
+var pad = (n) => String(n).padStart(2, "0");
+function localDate(ts) {
+  const d = new Date(ts);
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
+function addEvent(state, ev) {
+  if (!Number.isFinite(ev.ts))
+    return false;
+  const d = localDate(ev.ts);
+  const key = `${d}|${ev.agent}`;
+  let row = state.rows.get(key);
+  if (!row) {
+    row = { d, a: ev.agent, s: 0, t: 0, bits: new Uint8Array(36), u: {}, k: new Set, ss: new Set, ko: {} };
+    state.rows.set(key, row);
+  }
+  if (!row.k || !row.ss)
+    return false;
+  const id = h12(ev.id);
+  const model = ev.model || "unknown";
+  if (row.k.has(id)) {
+    const prev = row.ko?.[id];
+    if (prev === undefined || !ev.tokens || ev.tokens.o <= prev)
+      return false;
+    (row.u[model] ??= { i: 0, o: 0, cw: 0, cr: 0 }).o += ev.tokens.o - prev;
+    row.ko[id] = ev.tokens.o;
+    return true;
+  }
+  row.k.add(id);
+  if (ev.agent === "claude" && ev.tokens)
+    (row.ko ??= {})[id] = ev.tokens.o;
+  if (ev.sessionId) {
+    row.ss.add(h12(ev.sessionId));
+    row.s = row.ss.size;
+  }
+  if (ev.kind === "turn")
+    row.t++;
+  if (ev.tokens) {
+    const m = row.u[model] ??= { i: 0, o: 0, cw: 0, cr: 0 };
+    m.i += ev.tokens.i;
+    m.o += ev.tokens.o;
+    m.cw += ev.tokens.cw;
+    m.cr += ev.tokens.cr;
+    if (ev.tokens.r)
+      m.r = (m.r ?? 0) + ev.tokens.r;
+  }
+  const t = new Date(ev.ts);
+  const slot = t.getHours() * 12 + Math.floor(t.getMinutes() / 5);
+  row.bits[slot >> 3] |= 128 >> (slot & 7);
+  return true;
+}
+function freeze(state, now) {
+  const hot = localDate(now - HOT_DAYS * 86400000);
+  const keep = localDate(now - MAX_DAYS * 86400000);
+  for (const [key, row] of state.rows) {
+    if (row.d < keep)
+      state.rows.delete(key);
+    else if (row.d < hot) {
+      delete row.k;
+      delete row.ss;
+      delete row.ko;
+    }
+  }
+}
+function serializeState(state) {
+  const days = [...state.rows.values()].map((r) => ({
+    d: r.d,
+    a: r.a,
+    s: r.s,
+    t: r.t,
+    b: Buffer.from(r.bits).toString("base64"),
+    u: r.u,
+    ...r.k ? { k: [...r.k], ss: [...r.ss], ko: r.ko ?? {} } : {}
+  }));
+  return JSON.stringify({ v: 1, lastUpload: state.lastUpload, lastHash: state.lastHash, lastPairing: state.lastPairing, days });
+}
+function parseState(text) {
+  const st = emptyState();
+  try {
+    const o = JSON.parse(text);
+    st.lastUpload = Number(o.lastUpload) || 0;
+    st.lastHash = typeof o.lastHash === "string" ? o.lastHash : "";
+    st.lastPairing = typeof o.lastPairing === "string" ? o.lastPairing : "";
+    for (const r of o.days ?? []) {
+      const bits = new Uint8Array(36);
+      bits.set(Buffer.from(String(r.b ?? ""), "base64").subarray(0, 36));
+      st.rows.set(`${r.d}|${r.a}`, {
+        d: r.d,
+        a: r.a,
+        s: r.s | 0,
+        t: r.t | 0,
+        bits,
+        u: r.u ?? {},
+        ...Array.isArray(r.k) ? { k: new Set(r.k), ss: new Set(r.ss ?? []), ko: r.ko && typeof r.ko === "object" ? r.ko : {} } : {}
+      });
+    }
+  } catch {
+    return emptyState();
+  }
+  return st;
+}
+function buildPayload(state, now, mid) {
+  const days = [...state.rows.values()].sort((x, y) => x.d === y.d ? x.a.localeCompare(y.a) : x.d.localeCompare(y.d)).map((r) => ({
+    d: r.d,
+    a: r.a,
+    s: r.s,
+    t: r.t,
+    b: Buffer.from(r.bits).toString("base64"),
+    u: Object.entries(r.u).map(([m, k]) => ({ m, i: k.i, o: k.o, cw: k.cw, cr: k.cr, ...k.r ? { r: k.r } : {} }))
+  }));
+  while (days.length > 1 && JSON.stringify(days).length > MAX_PAYLOAD_CHARS)
+    days.shift();
+  return { v: 1, gen: now, tz: Intl.DateTimeFormat().resolvedOptions().timeZone, days, ...mid ? { mid } : {} };
+}
+var num = (x) => typeof x === "number" && Number.isFinite(x) && x > 0 ? x : 0;
+var NON_PROMPT = ["<task-notification>", "<bash-stdout>", "<bash-stderr>", "<local-command-stdout>", "<local-command-stderr>", "<local-command-caveat>"];
+function parseClaudeLine(line) {
+  const isA = line.includes('"type":"assistant"');
+  if (!isA && !(line.includes('"type":"user"') && line.includes('"userType":"external"')))
+    return null;
+  let o;
+  try {
+    o = JSON.parse(line);
+  } catch {
+    return null;
+  }
+  const ts = Date.parse(o?.timestamp);
+  const sid = typeof o?.sessionId === "string" ? o.sessionId : "";
+  if (!Number.isFinite(ts))
+    return null;
+  if (o.type === "assistant") {
+    const u = o.message?.usage;
+    const model = o.message?.model;
+    if (!u || typeof u !== "object" || model === "<synthetic>")
+      return null;
+    const r = num(u.output_tokens_details?.thinking_tokens);
+    return {
+      ts,
+      agent: "claude",
+      sessionId: sid,
+      kind: "assistant",
+      id: o.message?.id && o.requestId ? `cc:${o.message.id}:${o.requestId}` : `cc:${sid}:${o.timestamp}`,
+      model: typeof model === "string" ? model : undefined,
+      tokens: {
+        i: num(u.input_tokens),
+        o: Math.max(0, num(u.output_tokens) - r),
+        cw: num(u.cache_creation_input_tokens),
+        cr: num(u.cache_read_input_tokens),
+        ...r ? { r } : {}
+      }
+    };
+  }
+  if (o.type !== "user" || o.userType !== "external" || o.isMeta || o.isSidechain || o.isCompactSummary)
+    return null;
+  const c = o.message?.content;
+  let text;
+  if (typeof c === "string")
+    text = c;
+  else if (Array.isArray(c) && !c.some((x) => x?.type === "tool_result"))
+    text = c.find((x) => x?.type === "text")?.text;
+  if (typeof text !== "string" || NON_PROMPT.some((p) => text.startsWith(p)))
+    return null;
+  return { ts, agent: "claude", sessionId: sid, kind: "turn", id: `cc:u:${o.uuid ?? `${sid}:${o.timestamp}`}` };
+}
+function parseCodexLine(line, st) {
+  if (!line.includes('"session_meta"') && !line.includes('"turn_context"') && !line.includes('"task_started"') && !line.includes('"token_count"'))
+    return null;
+  let o;
+  try {
+    o = JSON.parse(line);
+  } catch {
+    return null;
+  }
+  const p = o?.payload;
+  if (!p || typeof p !== "object")
+    return null;
+  if (o.type === "session_meta") {
+    const src = p.source;
+    if (src && typeof src === "object" && src.subagent) {
+      st.sub = 1;
+      const parent = src.subagent?.thread_spawn?.parent_thread_id;
+      if (typeof parent === "string")
+        st.parent = parent;
+    }
+    return null;
+  }
+  if (o.type === "turn_context") {
+    if (typeof p.model === "string")
+      st.m = p.model;
+    return null;
+  }
+  if (o.type !== "event_msg")
+    return null;
+  const ts = Date.parse(o.timestamp);
+  if (!Number.isFinite(ts))
+    return null;
+  const sessionId = st.sub ? st.parent ?? "" : st.sid;
+  if (p.type === "task_started" && !st.sub) {
+    return { ts, agent: "codex", sessionId, kind: "turn", id: `cx:t:${p.turn_id ?? `${st.sid}:${o.timestamp}`}` };
+  }
+  if (p.type === "token_count") {
+    const last = p.info?.last_token_usage;
+    const total = p.info?.total_token_usage?.total_tokens;
+    if (!last || typeof total !== "number")
+      return null;
+    const cached = num(last.cached_input_tokens);
+    const r = num(last.reasoning_output_tokens);
+    return {
+      ts,
+      agent: "codex",
+      sessionId,
+      kind: "assistant",
+      id: `cx:u:${st.sid}:${total}`,
+      model: st.m,
+      tokens: {
+        i: Math.max(0, num(last.input_tokens) - cached),
+        o: Math.max(0, num(last.output_tokens) - r),
+        cw: num(last.cache_write_input_tokens),
+        cr: cached,
+        ...r ? { r } : {}
+      }
+    };
+  }
+  return null;
+}
+var breathe = () => new Promise((r) => setTimeout(r, 5));
+var hasZstd = typeof zlib.zstdDecompressSync === "function";
+async function scanFile(path, cursor, onLine) {
+  const st = await stat6(path);
+  const prev = cursor[path];
+  const same = prev && prev.ino === st.ino && st.size >= prev.offset;
+  const entry = same ? prev : { ino: st.ino, offset: 0, ...prev?.cx ? { cx: { sid: prev.cx.sid } } : {} };
+  if (path.endsWith(".zst")) {
+    if (same && prev.offset === st.size)
+      return 0;
+    const text = zlib.zstdDecompressSync(await readFile9(path)).toString("utf8");
+    entry.offset = 0;
+    for (const line of text.split(`
+`))
+      if (line)
+        onLine(line, entry);
+    entry.offset = st.size;
+    cursor[path] = entry;
+    return st.size;
+  }
+  if (entry.offset >= st.size) {
+    cursor[path] = entry;
+    return 0;
+  }
+  let carry = Buffer.alloc(0);
+  let consumed = entry.offset;
+  const stream = createReadStream(path, { start: entry.offset, end: st.size - 1, highWaterMark: CHUNK });
+  for await (const chunk of stream) {
+    const buf = carry.length ? Buffer.concat([carry, chunk]) : chunk;
+    const nl = buf.lastIndexOf(10);
+    if (nl < 0) {
+      carry = buf;
+      continue;
+    }
+    for (const line of buf.subarray(0, nl).toString("utf8").split(`
+`))
+      if (line)
+        onLine(line, entry);
+    consumed += nl + 1;
+    carry = buf.subarray(nl + 1);
+    await breathe();
+  }
+  entry.offset = consumed;
+  cursor[path] = entry;
+  return st.size - (prev && same ? prev.offset : 0);
+}
+async function listFiles(dir, match) {
+  try {
+    const names = await readdir7(dir, { recursive: true });
+    return names.filter(match).map((n) => `${dir}/${n}`);
+  } catch {
+    return [];
+  }
+}
+async function openReadOnly(path) {
+  if (!existsSync4(path))
+    return null;
+  const isBun = typeof globalThis.Bun !== "undefined";
+  const spec = isBun ? "bun:sqlite" : "node:sqlite";
+  let mod;
+  try {
+    mod = await import(spec);
+  } catch {
+    return null;
+  }
+  for (const opt of ["mode=ro", "immutable=1"]) {
+    try {
+      const db = isBun ? new mod.Database(`file:${path}?${opt}`, { readonly: true }) : new mod.DatabaseSync(new URL(`file://${path}?${opt}`), { readOnly: true });
+      db.prepare("select 1").all();
+      return { all: (sql, ...params) => db.prepare(sql).all(...params), close: () => db.close() };
+    } catch {}
+  }
+  return null;
+}
+var defaultRoots = () => ({
+  claude: `${process.env.HOME}/.claude/projects`,
+  codex: codexHome(),
+  opencode: `${process.env.XDG_DATA_HOME || `${process.env.HOME}/.local/share`}/opencode/opencode.db`
+});
+async function readClaude(root, cursor, sink, progress, seen) {
+  for (const f of await listFiles(root, (n) => n.endsWith(".jsonl"))) {
+    seen.add(f);
+    try {
+      await progress(await scanFile(f, cursor, (line) => {
+        const ev = parseClaudeLine(line);
+        if (ev)
+          sink(ev);
+      }));
+    } catch {}
+  }
+}
+var UUID_RE = /([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl(\.zst)?$/;
+async function readCodex(home, cursor, sink, progress, seen, sinceMs, days) {
+  const readable = (n) => /rollout-.*\.jsonl$/.test(n) || hasZstd && /rollout-.*\.jsonl\.zst$/.test(n);
+  const files = [...await listFiles(`${home}/sessions`, readable), ...await listFiles(`${home}/archived_sessions`, readable)];
+  for (const f of files) {
+    seen.add(f);
+    const sid = f.match(UUID_RE)?.[1] ?? f;
+    try {
+      await progress(await scanFile(f, cursor, (line, e) => {
+        e.cx ??= { sid };
+        const ev = parseCodexLine(line, e.cx);
+        if (ev)
+          sink(ev);
+      }));
+    } catch {}
+  }
+  const counted = (t) => {
+    const u = h12(`cx:u:${t.id}:${t.tokens_used}`);
+    for (const r of days.rows.values())
+      if (r.a === "codex" && r.k?.has(u))
+        return true;
+    return false;
+  };
+  const state = await openReadOnly(`${home}/state_5.sqlite`);
+  if (!state)
+    return;
+  try {
+    const orphans = new Map;
+    for (const t of state.all("select id, rollout_path, created_at, tokens_used, model, source from threads where created_at >= ?", Math.floor(sinceMs / 1000))) {
+      const p = String(t.rollout_path ?? "");
+      const base = p.replace(/\.zst$/, "");
+      if (existsSync4(base) || hasZstd && existsSync4(`${base}.zst`))
+        continue;
+      orphans.set(t.id, t);
+      if (counted(t))
+        continue;
+      const sub = String(t.source ?? "").includes("subagent");
+      sink({
+        ts: Number(t.created_at) * 1000,
+        agent: "codex",
+        sessionId: sub ? "" : t.id,
+        kind: "assistant",
+        id: `cx:th:${t.id}`,
+        model: t.model ?? undefined,
+        tokens: { i: num(t.tokens_used), o: 0, cw: 0, cr: 0 }
+      });
+    }
+    if (orphans.size === 0)
+      return;
+    const hist = await openReadOnly(`${home}/thread_history_1.sqlite`);
+    if (!hist)
+      return;
+    try {
+      for (const r of hist.all("select thread_id, turn_id, started_at from thread_turns where started_at >= ?", Math.floor(sinceMs / 1000))) {
+        const t = orphans.get(r.thread_id);
+        if (!t || String(t.source ?? "").includes("subagent"))
+          continue;
+        sink({ ts: Number(r.started_at) * 1000, agent: "codex", sessionId: t.id, kind: "turn", id: `cx:t:${r.turn_id}` });
+      }
+    } finally {
+      hist.close();
+    }
+  } finally {
+    state.close();
+  }
+}
+async function readOpenCode(dbPath, sink, sinceMs) {
+  const db = await openReadOnly(dbPath);
+  if (!db)
+    return;
+  try {
+    const rows = db.all("select m.id, m.session_id, m.time_created, m.data, s.parent_id from message m left join session s on s.id = m.session_id where m.time_created >= ?", sinceMs);
+    for (const r of rows) {
+      let o;
+      try {
+        o = JSON.parse(r.data);
+      } catch {
+        continue;
+      }
+      const sessionId = r.parent_id ?? r.session_id;
+      const ts = Number(r.time_created);
+      if (o?.role === "user" && !r.parent_id)
+        sink({ ts, agent: "opencode", sessionId, kind: "turn", id: `oc:${r.id}` });
+      else if (o?.role === "assistant" && o.time?.completed && o.tokens) {
+        const k = o.tokens;
+        sink({
+          ts,
+          agent: "opencode",
+          sessionId,
+          kind: "assistant",
+          id: `oc:${r.id}`,
+          model: typeof o.modelID === "string" ? o.modelID : undefined,
+          tokens: { i: num(k.input), o: num(k.output), cw: num(k.cache?.write), cr: num(k.cache?.read), ...num(k.reasoning) ? { r: num(k.reasoning) } : {} }
+        });
+      }
+    }
+  } finally {
+    db.close();
+  }
+}
+async function scanAll(state, cursor, roots, now, checkpoint = async () => {}) {
+  const sink = (ev) => {
+    addEvent(state, ev);
+  };
+  let sinceSave = 0;
+  const progress = async (n) => {
+    sinceSave += n;
+    if (sinceSave >= SAVE_EVERY_BYTES) {
+      sinceSave = 0;
+      await checkpoint();
+    }
+  };
+  const since = (a) => [...state.rows.values()].some((r) => r.a === a) ? now - HOT_DAYS * 86400000 : 0;
+  const seen = new Set;
+  try {
+    await readClaude(roots.claude, cursor, sink, progress, seen);
+  } catch {}
+  try {
+    await readCodex(roots.codex, cursor, sink, progress, seen, since("codex"), state);
+  } catch {}
+  try {
+    await readOpenCode(roots.opencode, sink, since("opencode"));
+  } catch {}
+  for (const p of Object.keys(cursor))
+    if (!seen.has(p))
+      delete cursor[p];
+}
+function payloadHash(payload) {
+  return createHash3("sha1").update(JSON.stringify(payload.days)).digest("hex");
+}
+async function maybeUpload(state, config, now, fetchFn = fetch, mid) {
+  const newPairing = config.pairingId !== state.lastPairing;
+  if (state.rows.size === 0 || !newPairing && now - state.lastUpload < UPLOAD_EVERY_MS)
+    return false;
+  const payload = buildPayload(state, now, mid);
+  const hash = payloadHash(payload);
+  if (!newPairing && hash === state.lastHash && now - state.lastUpload < REFRESH_EVERY_MS)
+    return false;
+  try {
+    const blob = await encryptBlob(config.e2eKey, payload);
+    const res = await fetchFn(`${config.url}/v1/cc/full`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-cc-pairing": config.pairingId,
+        "x-cc-auth": config.pcSecret,
+        "x-cc-version": PLUGIN_VERSION
+      },
+      body: JSON.stringify({ v: 2, sessionId: "activity", what: "activity", blob }),
+      signal: AbortSignal.timeout(15000)
+    });
+    if (!res.ok)
+      return false;
+    state.lastUpload = now;
+    state.lastHash = hash;
+    state.lastPairing = config.pairingId;
+    return true;
+  } catch {
+    return false;
+  }
+}
+async function runActivityCycle(deps = {}) {
+  const config = deps.config !== undefined ? deps.config : await loadConfig();
+  if (!config)
+    return;
+  const daysPath = deps.daysPath ?? ACTIVITY_DAYS_PATH;
+  const cursorPath = deps.cursorPath ?? ACTIVITY_CURSOR_PATH;
+  const now = deps.now ?? Date.now;
+  const state = parseState(await readFile9(daysPath, "utf8").catch(() => ""));
+  let cursor = {};
+  try {
+    cursor = JSON.parse(await readFile9(cursorPath, "utf8")) ?? {};
+  } catch {}
+  const save = async () => {
+    await atomicWrite(daysPath, serializeState(state), 384);
+    await atomicWrite(cursorPath, JSON.stringify(cursor), 384);
+  };
+  const scan = deps.scan !== false;
+  if (scan) {
+    await scanAll(state, cursor, deps.roots ?? defaultRoots(), now(), save);
+    freeze(state, now());
+  }
+  const mid = await loadMachineId(deps.midPath ?? `${dirname2(daysPath)}/machine-id`).catch(() => {
+    return;
+  });
+  const sent = await maybeUpload(state, config, now(), deps.fetchFn, mid);
+  if (scan || sent)
+    await save();
+}
+function startActivityLoop(load = loadConfig, cycle = runActivityCycle) {
+  let busy = false;
+  let seen;
+  const run = (deps) => {
+    if (busy)
+      return;
+    busy = true;
+    cycle(deps).catch(() => {}).finally(() => {
+      seen = deps.config?.pairingId ?? "";
+      busy = false;
+    });
+  };
+  const kick = async () => {
+    if (!busy)
+      run({ config: await load() });
+  };
+  const tick = async () => {
+    if (busy || seen === undefined)
+      return;
+    const config = await load();
+    if (config && config.pairingId !== seen)
+      run({ config, scan: seen === "" });
+  };
+  const timers = [setInterval(() => void kick(), HOUR_MS), setInterval(() => void tick(), 60000)];
+  for (const t of timers)
+    t.unref?.();
+  kick();
+  return () => timers.forEach(clearInterval);
+}
 // src/entries/cc-watchdog.ts
 var POLL_MS = 5000;
 var PAIRING_TTL_MS = 600000;
@@ -8865,7 +9426,7 @@ function resetDoneAttemptMemory() {
 }
 async function readRecordAt(path) {
   try {
-    return JSON.parse(await readFile9(path, "utf8"));
+    return JSON.parse(await readFile10(path, "utf8"));
   } catch {
     return null;
   }
@@ -9814,13 +10375,13 @@ function machineName(config) {
 }
 async function readAllRecordEntries() {
   try {
-    const files = await readdir7(SESSIONS_DIR);
+    const files = await readdir8(SESSIONS_DIR);
     const out = [];
     for (const f of files) {
       if (!f.endsWith(".json"))
         continue;
       try {
-        out.push({ sessionId: basename8(f, ".json"), rec: JSON.parse(await readFile9(`${SESSIONS_DIR}/${f}`, "utf8")) });
+        out.push({ sessionId: basename8(f, ".json"), rec: JSON.parse(await readFile10(`${SESSIONS_DIR}/${f}`, "utf8")) });
       } catch {}
     }
     return out;
@@ -10170,7 +10731,7 @@ async function antigravitySettleTick(config, deps = {}) {
   const dir = deps.dir ?? SESSIONS_DIR;
   let files = [];
   try {
-    files = await readdir7(dir);
+    files = await readdir8(dir);
   } catch {
     return 0;
   }
@@ -10759,7 +11320,7 @@ var waitingBeatAt;
 async function sweep(config, deps = {}) {
   let files;
   try {
-    files = await readdir7(SESSIONS_DIR);
+    files = await readdir8(SESSIONS_DIR);
   } catch {
     return { revoked: false, remaining: 0, delivered: false };
   }
@@ -10776,7 +11337,7 @@ async function sweep(config, deps = {}) {
     const sessionId = basename8(file, ".json");
     let record = null;
     try {
-      record = JSON.parse(await readFile9(path, "utf8"));
+      record = JSON.parse(await readFile10(path, "utf8"));
     } catch {
       record = null;
     }
@@ -11235,6 +11796,7 @@ async function run() {
     });
   }, ANTIGRAVITY_SETTLE_TICK_MS);
   settleTimer.unref?.();
+  const stopActivity = startActivityLoop();
   try {
     while (true) {
       if (!enforceWatchdogOwnership(shutdown))
@@ -11294,6 +11856,7 @@ async function run() {
     }
   } finally {
     clearInterval(settleTimer);
+    stopActivity();
     shutdown();
     activeBridgeShutdown = undefined;
     activeCodexInterrupt = undefined;
