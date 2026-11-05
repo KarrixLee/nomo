@@ -41,6 +41,8 @@ export const HOT_DAYS = 40; // > CC's 30-day transcript retention
 export const MAX_DAYS = 400;
 const HOUR_MS = 3_600_000;
 export const UPLOAD_EVERY_MS = 6 * HOUR_MS;
+/** Re-send unchanged rows this often: the relay drops the blob after 35 days (ACTIVITY_TTL_SECONDS). */
+export const REFRESH_EVERY_MS = 7 * 24 * HOUR_MS;
 const CHUNK = 2 * 1024 * 1024;
 const SAVE_EVERY_BYTES = 256 * 1024 * 1024;
 const MAX_PAYLOAD_CHARS = 900_000; // the relay refuses blobs over 1.4 M base64 chars
@@ -69,6 +71,7 @@ export async function loadMachineId(path: string): Promise<string> {
 interface Row {
   d: string; a: ActivityAgent; s: number; t: number; bits: Uint8Array; u: Record<string, Tokens>;
   k?: Set<string>; ss?: Set<string>; // present ⇔ hot
+  ko?: Record<string, number>; // hot only: output counted per CC assistant id hash (see addEvent)
 }
 /** lastPairing = the pairingId the last upload went to; the relay keeps the blob PER PAIRING. */
 export interface State { lastUpload: number; lastHash: string; lastPairing: string; rows: Map<string, Row> }
@@ -84,24 +87,35 @@ export function localDate(ts: number): string {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
 }
 
-/** Fold one event in. Returns whether it counted (false = duplicate, frozen day or bad ts). */
+/** Fold one event in. Returns whether it counted (false = duplicate, frozen day or bad ts).
+ *  CC writes one line per content block of a message, repeating message.id+requestId; output_tokens
+ *  only GROWS on the later lines (the rest is identical). So a repeated CC id with more output adds the
+ *  difference, tracked in `ko` — idempotent across re-reads and lines split across scans. */
 export function addEvent(state: State, ev: ActivityEvent): boolean {
   if (!Number.isFinite(ev.ts)) return false;
   const d = localDate(ev.ts);
   const key = `${d}|${ev.agent}`;
   let row = state.rows.get(key);
   if (!row) {
-    row = { d, a: ev.agent, s: 0, t: 0, bits: new Uint8Array(36), u: {}, k: new Set(), ss: new Set() };
+    row = { d, a: ev.agent, s: 0, t: 0, bits: new Uint8Array(36), u: {}, k: new Set(), ss: new Set(), ko: {} };
     state.rows.set(key, row);
   }
   if (!row.k || !row.ss) return false; // frozen
   const id = h12(ev.id);
-  if (row.k.has(id)) return false;
+  const model = ev.model || "unknown";
+  if (row.k.has(id)) {
+    const prev = row.ko?.[id];
+    if (prev === undefined || !ev.tokens || ev.tokens.o <= prev) return false;
+    (row.u[model] ??= { i: 0, o: 0, cw: 0, cr: 0 }).o += ev.tokens.o - prev;
+    row.ko![id] = ev.tokens.o;
+    return true;
+  }
   row.k.add(id);
+  if (ev.agent === "claude" && ev.tokens) (row.ko ??= {})[id] = ev.tokens.o;
   if (ev.sessionId) { row.ss.add(h12(ev.sessionId)); row.s = row.ss.size; }
   if (ev.kind === "turn") row.t++;
   if (ev.tokens) {
-    const m = (row.u[ev.model || "unknown"] ??= { i: 0, o: 0, cw: 0, cr: 0 });
+    const m = (row.u[model] ??= { i: 0, o: 0, cw: 0, cr: 0 });
     m.i += ev.tokens.i; m.o += ev.tokens.o; m.cw += ev.tokens.cw; m.cr += ev.tokens.cr;
     if (ev.tokens.r) m.r = (m.r ?? 0) + ev.tokens.r;
   }
@@ -117,14 +131,14 @@ export function freeze(state: State, now: number): void {
   const keep = localDate(now - MAX_DAYS * 86_400_000);
   for (const [key, row] of state.rows) {
     if (row.d < keep) state.rows.delete(key);
-    else if (row.d < hot) { delete row.k; delete row.ss; }
+    else if (row.d < hot) { delete row.k; delete row.ss; delete row.ko; }
   }
 }
 
 export function serializeState(state: State): string {
   const days = [...state.rows.values()].map((r) => ({
     d: r.d, a: r.a, s: r.s, t: r.t, b: Buffer.from(r.bits).toString("base64"), u: r.u,
-    ...(r.k ? { k: [...r.k], ss: [...r.ss!] } : {}),
+    ...(r.k ? { k: [...r.k], ss: [...r.ss!], ko: r.ko ?? {} } : {}),
   }));
   return JSON.stringify({ v: 1, lastUpload: state.lastUpload, lastHash: state.lastHash, lastPairing: state.lastPairing, days });
 }
@@ -141,7 +155,7 @@ export function parseState(text: string): State {
       bits.set(Buffer.from(String(r.b ?? ""), "base64").subarray(0, 36));
       st.rows.set(`${r.d}|${r.a}`, {
         d: r.d, a: r.a, s: r.s | 0, t: r.t | 0, bits, u: r.u ?? {},
-        ...(Array.isArray(r.k) ? { k: new Set<string>(r.k), ss: new Set<string>(r.ss ?? []) } : {}),
+        ...(Array.isArray(r.k) ? { k: new Set<string>(r.k), ss: new Set<string>(r.ss ?? []), ko: r.ko && typeof r.ko === "object" ? r.ko : {} } : {}),
       });
     }
   } catch { return emptyState(); }
@@ -337,7 +351,7 @@ async function readClaude(root: string, cursor: Cursor, sink: Sink, progress: Pr
 
 const UUID_RE = /([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl(\.zst)?$/;
 
-async function readCodex(home: string, cursor: Cursor, sink: Sink, progress: Progress, seen: Set<string>, sinceMs: number): Promise<void> {
+async function readCodex(home: string, cursor: Cursor, sink: Sink, progress: Progress, seen: Set<string>, sinceMs: number, days: State): Promise<void> {
   const readable = (n: string) => /rollout-.*\.jsonl$/.test(n) || (hasZstd && /rollout-.*\.jsonl\.zst$/.test(n));
   const files = [...await listFiles(`${home}/sessions`, readable), ...await listFiles(`${home}/archived_sessions`, readable)];
   for (const f of files) {
@@ -353,7 +367,18 @@ async function readCodex(home: string, cursor: Cursor, sink: Sink, progress: Pro
   }
   // BACKFILL for threads whose rollout we cannot read (deleted, or .zst on a runtime without zstd):
   // one token event per thread (tokens_used is a lifetime total, filed under input — the only split
-  // the table keeps) plus its turns. Rollout-backed threads never come through here, so no overlap.
+  // the table keeps) plus its turns (cx:t ids, shared with the rollout path, so dedupe covers them).
+  // A rollout read EARLIER and unreadable now (Codex compresses it to .zst when the thread closes — a
+  // runtime without zstd can't read that — or it was moved/deleted) already counted its tokens under
+  // cx:u ids. tokens_used equals the rollout's last total_token_usage.total_tokens, so a hot row holding
+  // `cx:u:<id>:<tokens_used>` means it is counted: skip the token event.
+  // ponytail: a rollout read only PART-way before it became unreadable still double-counts that part;
+  // fix by persisting the last cumulative total per thread if old-node users report inflated Codex tokens.
+  const counted = (t: any) => {
+    const u = h12(`cx:u:${t.id}:${t.tokens_used}`);
+    for (const r of days.rows.values()) if (r.a === "codex" && r.k?.has(u)) return true;
+    return false;
+  };
   const state = await openReadOnly(`${home}/state_5.sqlite`);
   if (!state) return;
   try {
@@ -363,6 +388,7 @@ async function readCodex(home: string, cursor: Cursor, sink: Sink, progress: Pro
       const base = p.replace(/\.zst$/, "");
       if ((existsSync(base)) || (hasZstd && existsSync(`${base}.zst`))) continue;
       orphans.set(t.id, t);
+      if (counted(t)) continue;
       const sub = String(t.source ?? "").includes("subagent");
       sink({
         ts: Number(t.created_at) * 1000, agent: "codex", sessionId: sub ? "" : t.id, kind: "assistant", id: `cx:th:${t.id}`,
@@ -422,7 +448,7 @@ export async function scanAll(state: State, cursor: Cursor, roots: Roots, now: n
   const since = (a: ActivityAgent) => ([...state.rows.values()].some((r) => r.a === a) ? now - HOT_DAYS * 86_400_000 : 0);
   const seen = new Set<string>();
   try { await readClaude(roots.claude, cursor, sink, progress, seen); } catch { /* skip agent */ }
-  try { await readCodex(roots.codex, cursor, sink, progress, seen, since("codex")); } catch { /* skip agent */ }
+  try { await readCodex(roots.codex, cursor, sink, progress, seen, since("codex"), state); } catch { /* skip agent */ }
   try { await readOpenCode(roots.opencode, sink, since("opencode")); } catch { /* skip agent */ }
   for (const p of Object.keys(cursor)) if (!seen.has(p)) delete cursor[p];
 }
@@ -434,13 +460,14 @@ export function payloadHash(payload: ReturnType<typeof buildPayload>): string {
 }
 
 /** Seal + POST the payload when rows changed and the last upload is ≥6 h old — or right away when the
- *  last upload went to a different pairing (a re-pair: the new pairing has no blob yet). Never throws. */
+ *  last upload went to a different pairing (a re-pair: the new pairing has no blob yet). Unchanged rows
+ *  are still re-sent every REFRESH_EVERY_MS so the relay copy never expires. Never throws. */
 export async function maybeUpload(state: State, config: Config, now: number, fetchFn: typeof fetch = fetch, mid?: string): Promise<boolean> {
   const newPairing = config.pairingId !== state.lastPairing;
   if (state.rows.size === 0 || (!newPairing && now - state.lastUpload < UPLOAD_EVERY_MS)) return false;
   const payload = buildPayload(state, now, mid);
   const hash = payloadHash(payload);
-  if (!newPairing && hash === state.lastHash) return false;
+  if (!newPairing && hash === state.lastHash && now - state.lastUpload < REFRESH_EVERY_MS) return false;
   try {
     const blob = await encryptBlob(config.e2eKey, payload);
     const res = await fetchFn(`${config.url}/v1/cc/full`, {
@@ -496,20 +523,21 @@ export async function runActivityCycle(deps: CycleDeps = {}): Promise<void> {
  *  config.json and, when the pairing changed since the last run (a re-pair under a live watchdog —
  *  `pair` does not restart a same-build daemon), uploads the rows already on disk without rescanning.
  *  Returns the stopper. */
-export function startActivityLoop(): () => void {
+export function startActivityLoop(load = loadConfig, cycle = runActivityCycle): () => void {
   let busy = false;
   let seen: string | undefined; // pairingId the last run saw ("" = unpaired); undefined until the first run
   const run = (deps: CycleDeps) => {
     if (busy) return;
     busy = true;
-    void runActivityCycle(deps).then(() => { seen = deps.config?.pairingId ?? ""; }).catch(() => {}).finally(() => { busy = false; });
+    // seen is set even when the run fails: the tick stays armed, and a failed pairing waits for the hourly kick.
+    void cycle(deps).catch(() => {}).finally(() => { seen = deps.config?.pairingId ?? ""; busy = false; });
   };
-  const kick = async () => { if (!busy) run({ config: await loadConfig() }); };
+  const kick = async () => { if (!busy) run({ config: await load() }); };
   const tick = async () => {
     if (busy || seen === undefined) return;
-    const config = await loadConfig();
+    const config = await load();
     // First pairing (seen "") needs the scan anyway; a re-pair just re-sends the rows on disk.
-    if (config && config.pairingId !== seen) run({ config, scan: seen !== "" });
+    if (config && config.pairingId !== seen) run({ config, scan: seen === "" });
   };
   const timers = [setInterval(() => void kick(), HOUR_MS), setInterval(() => void tick(), 60_000)];
   for (const t of timers) (t as unknown as { unref?: () => void }).unref?.();

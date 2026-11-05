@@ -1,12 +1,12 @@
 process.env.TZ = "Asia/Tokyo"; // before any Date use: day bucketing is local-time
 
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, jest, test } from "bun:test";
 import { appendFileSync, mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   addEvent, buildPayload, Cursor, emptyState, freeze, loadMachineId, localDate, maybeUpload, parseClaudeLine, parseCodexLine,
-  parseState, runActivityCycle, scanAll, serializeState, State,
+  parseState, runActivityCycle, scanAll, serializeState, startActivityLoop, State,
 } from "./activity";
 
 const asst = (id: string, req: string, ts: string, out = 10, sid = "s1") => JSON.stringify({
@@ -35,6 +35,23 @@ describe("claude dedupe + turns", () => {
     const st = emptyState();
     await scanAll(st, {}, roots, NOW);
     expect(row(st, "2026-11-03")!.u).toEqual([{ m: "claude-x", i: 2, o: 20, cw: 4, cr: 6 }]);
+  });
+
+  test("one line per content block: the message keeps its LARGEST output, across scans and re-reads", async () => {
+    const f = join(roots.claude, "p", "a.jsonl");
+    const ts = "2026-11-03T01:00:00Z";
+    writeFileSync(f, [asst("m1", "r1", ts, 5), asst("m1", "r1", ts, 5), ""].join("\n"));
+    const cur: Cursor = {};
+    let st = emptyState();
+    await scanAll(st, cur, roots, NOW);
+    expect(row(st, "2026-11-03")!.u).toEqual([{ m: "claude-x", i: 1, o: 5, cw: 2, cr: 3 }]);
+    appendFileSync(f, asst("m1", "r1", ts, 364) + "\n"); // the bigger line lands in the NEXT scan
+    st = parseState(serializeState(st)); // and survives a save/load
+    await scanAll(st, cur, roots, NOW);
+    expect(row(st, "2026-11-03")!.u).toEqual([{ m: "claude-x", i: 1, o: 364, cw: 2, cr: 3 }]);
+    writeFileSync(f, [asst("m1", "r1", ts, 5), asst("m1", "r1", ts, 364), asst("m1", "r1", ts, 300), ""].join("\n")); // full re-read
+    await scanAll(st, cur, roots, NOW);
+    expect(row(st, "2026-11-03")!.u).toEqual([{ m: "claude-x", i: 1, o: 364, cw: 2, cr: 3 }]);
   });
 
   test("turns: real prompts only", () => {
@@ -136,6 +153,35 @@ describe("incremental cursor", () => {
   });
 });
 
+describe("codex sqlite backfill", () => {
+  test("a rollout read earlier, now unreadable (zst/moved/deleted), is not re-added; a never-read thread is", async () => {
+    const { Database } = await import("bun:sqlite");
+    const day = join(roots.codex, "sessions", "2026", "11", "03");
+    mkdirSync(day, { recursive: true });
+    const READ = "01a1a296-89bc-7640-a7a1-2e55d66cf5ac", NEVER = "01a19138-a0e1-72a2-9bce-4cdeaf8d4444";
+    const f = join(day, `rollout-2026-11-03T01-00-00-${READ}.jsonl`);
+    writeFileSync(f, [
+      JSON.stringify({ timestamp: "2026-11-03T01:00:00Z", type: "turn_context", payload: { model: "gpt-x" } }),
+      JSON.stringify({ timestamp: "2026-11-03T01:00:05Z", type: "event_msg", payload: { type: "token_count", info: {
+        total_token_usage: { total_tokens: 120 }, last_token_usage: { input_tokens: 100, output_tokens: 20 } } } }), ""].join("\n"));
+    const db = new Database(join(roots.codex, "state_5.sqlite"));
+    db.run("create table threads (id text, rollout_path text, created_at integer, tokens_used integer, model text, source text)");
+    const created = Date.parse("2026-11-03T01:00:00Z") / 1000;
+    db.run("insert into threads values (?, ?, ?, 120, 'gpt-x', 'cli')", [READ, f, created]);
+    db.close();
+    const st = emptyState();
+    const cur: Cursor = {};
+    await scanAll(st, cur, roots, NOW);
+    expect(row(st, "2026-11-03", "codex")!.u).toEqual([{ m: "gpt-x", i: 100, o: 20, cw: 0, cr: 0 }]);
+    rmSync(f); // Codex compressed it (runtime without zstd), moved it, or it was deleted
+    const db2 = new Database(join(roots.codex, "state_5.sqlite"));
+    db2.run("insert into threads values (?, ?, ?, 50, 'gpt-x', 'cli')", [NEVER, join(day, `rollout-x-${NEVER}.jsonl`), created]);
+    db2.close();
+    await scanAll(st, cur, roots, NOW);
+    expect(row(st, "2026-11-03", "codex")!.u).toEqual([{ m: "gpt-x", i: 150, o: 20, cw: 0, cr: 0 }]); // +50 from NEVER only
+  });
+});
+
 describe("upload", () => {
   test("sends exact v1 envelope once, then waits 6 h and for a change", async () => {
     const st = emptyState();
@@ -186,6 +232,17 @@ describe("upload", () => {
     expect(await maybeUpload(st, cfg("q"), NOW + 60_000, fail)).toBe(false);
     expect(st.lastPairing).toBe("p");
     expect(calls).toEqual(["p"]);
+  });
+
+  test("unchanged rows are re-sent after 7 days so the relay's 35-day copy never expires", async () => {
+    const st = emptyState();
+    addEvent(st, { ts: NOW, agent: "claude", sessionId: "s", kind: "turn", id: "a" });
+    const calls: string[] = [];
+    expect(await maybeUpload(st, cfg("p"), NOW, okFetch(calls))).toBe(true);
+    expect(await maybeUpload(st, cfg("p"), NOW + 6 * 86_400_000, okFetch(calls))).toBe(false);
+    expect(await maybeUpload(st, cfg("p"), NOW + 7 * 86_400_000, okFetch(calls))).toBe(true);
+    expect(await maybeUpload(st, cfg("p"), NOW + 8 * 86_400_000, okFetch(calls))).toBe(false); // clock restarted
+    expect(calls).toEqual(["p", "p"]);
   });
 
   test("lastPairing round-trips; an old file without it loads and uploads to the current pairing", async () => {
@@ -254,5 +311,30 @@ describe("machine id (mid)", () => {
     expect(mids[0]).toMatch(UUID);
     expect(mids[1]).toBe(mids[0]);
     expect(await Bun.file(join(dir, "machine-id")).text()).toBe(mids[0]);
+  });
+});
+
+describe("activity loop", () => {
+  const cfg = (pairingId: string) => ({ url: "https://w", pairingId, pcSecret: "sec", e2eKey: new Uint8Array(32) }) as any;
+  const flush = async () => { for (let i = 0; i < 20; i++) await Promise.resolve(); };
+
+  test("first pairing scans, a re-pair re-sends without scanning, and a failed first run keeps the tick armed", async () => {
+    jest.useFakeTimers();
+    let config: any = null;
+    let fail = false;
+    const runs: any[] = [];
+    const stop = startActivityLoop(async () => config, async (d) => { runs.push({ pid: d?.config?.pairingId ?? null, scan: d?.scan }); if (fail) throw new Error("disk full"); });
+    try {
+      await flush(); // start-up kick while unpaired
+      expect(runs).toEqual([{ pid: null, scan: undefined }]);
+      config = cfg("A"); fail = true;
+      jest.advanceTimersByTime(60_000); await flush();
+      expect(runs[1]).toEqual({ pid: "A", scan: true }); // first pairing: full scan (it fails)
+      config = cfg("B");
+      jest.advanceTimersByTime(60_000); await flush();
+      expect(runs[2]).toEqual({ pid: "B", scan: false }); // re-pair after a FAILED run: still the cheap resend
+      jest.advanceTimersByTime(5 * 60_000); await flush();
+      expect(runs).toHaveLength(3); // the failed resend is not retried every minute
+    } finally { stop(); jest.useRealTimers(); }
   });
 });

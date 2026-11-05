@@ -8853,6 +8853,7 @@ var HOT_DAYS = 40;
 var MAX_DAYS = 400;
 var HOUR_MS = 3600000;
 var UPLOAD_EVERY_MS = 6 * HOUR_MS;
+var REFRESH_EVERY_MS = 7 * 24 * HOUR_MS;
 var CHUNK = 2 * 1024 * 1024;
 var SAVE_EVERY_BYTES = 256 * 1024 * 1024;
 var MAX_PAYLOAD_CHARS = 900000;
@@ -8881,15 +8882,24 @@ function addEvent(state, ev) {
   const key = `${d}|${ev.agent}`;
   let row = state.rows.get(key);
   if (!row) {
-    row = { d, a: ev.agent, s: 0, t: 0, bits: new Uint8Array(36), u: {}, k: new Set, ss: new Set };
+    row = { d, a: ev.agent, s: 0, t: 0, bits: new Uint8Array(36), u: {}, k: new Set, ss: new Set, ko: {} };
     state.rows.set(key, row);
   }
   if (!row.k || !row.ss)
     return false;
   const id = h12(ev.id);
-  if (row.k.has(id))
-    return false;
+  const model = ev.model || "unknown";
+  if (row.k.has(id)) {
+    const prev = row.ko?.[id];
+    if (prev === undefined || !ev.tokens || ev.tokens.o <= prev)
+      return false;
+    (row.u[model] ??= { i: 0, o: 0, cw: 0, cr: 0 }).o += ev.tokens.o - prev;
+    row.ko[id] = ev.tokens.o;
+    return true;
+  }
   row.k.add(id);
+  if (ev.agent === "claude" && ev.tokens)
+    (row.ko ??= {})[id] = ev.tokens.o;
   if (ev.sessionId) {
     row.ss.add(h12(ev.sessionId));
     row.s = row.ss.size;
@@ -8897,7 +8907,7 @@ function addEvent(state, ev) {
   if (ev.kind === "turn")
     row.t++;
   if (ev.tokens) {
-    const m = row.u[ev.model || "unknown"] ??= { i: 0, o: 0, cw: 0, cr: 0 };
+    const m = row.u[model] ??= { i: 0, o: 0, cw: 0, cr: 0 };
     m.i += ev.tokens.i;
     m.o += ev.tokens.o;
     m.cw += ev.tokens.cw;
@@ -8919,6 +8929,7 @@ function freeze(state, now) {
     else if (row.d < hot) {
       delete row.k;
       delete row.ss;
+      delete row.ko;
     }
   }
 }
@@ -8930,7 +8941,7 @@ function serializeState(state) {
     t: r.t,
     b: Buffer.from(r.bits).toString("base64"),
     u: r.u,
-    ...r.k ? { k: [...r.k], ss: [...r.ss] } : {}
+    ...r.k ? { k: [...r.k], ss: [...r.ss], ko: r.ko ?? {} } : {}
   }));
   return JSON.stringify({ v: 1, lastUpload: state.lastUpload, lastHash: state.lastHash, lastPairing: state.lastPairing, days });
 }
@@ -8951,7 +8962,7 @@ function parseState(text) {
         t: r.t | 0,
         bits,
         u: r.u ?? {},
-        ...Array.isArray(r.k) ? { k: new Set(r.k), ss: new Set(r.ss ?? []) } : {}
+        ...Array.isArray(r.k) ? { k: new Set(r.k), ss: new Set(r.ss ?? []), ko: r.ko && typeof r.ko === "object" ? r.ko : {} } : {}
       });
     }
   } catch {
@@ -9175,7 +9186,7 @@ async function readClaude(root, cursor, sink, progress, seen) {
   }
 }
 var UUID_RE = /([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl(\.zst)?$/;
-async function readCodex(home, cursor, sink, progress, seen, sinceMs) {
+async function readCodex(home, cursor, sink, progress, seen, sinceMs, days) {
   const readable = (n) => /rollout-.*\.jsonl$/.test(n) || hasZstd && /rollout-.*\.jsonl\.zst$/.test(n);
   const files = [...await listFiles(`${home}/sessions`, readable), ...await listFiles(`${home}/archived_sessions`, readable)];
   for (const f of files) {
@@ -9190,6 +9201,13 @@ async function readCodex(home, cursor, sink, progress, seen, sinceMs) {
       }));
     } catch {}
   }
+  const counted = (t) => {
+    const u = h12(`cx:u:${t.id}:${t.tokens_used}`);
+    for (const r of days.rows.values())
+      if (r.a === "codex" && r.k?.has(u))
+        return true;
+    return false;
+  };
   const state = await openReadOnly(`${home}/state_5.sqlite`);
   if (!state)
     return;
@@ -9201,6 +9219,8 @@ async function readCodex(home, cursor, sink, progress, seen, sinceMs) {
       if (existsSync4(base) || hasZstd && existsSync4(`${base}.zst`))
         continue;
       orphans.set(t.id, t);
+      if (counted(t))
+        continue;
       const sub = String(t.source ?? "").includes("subagent");
       sink({
         ts: Number(t.created_at) * 1000,
@@ -9283,7 +9303,7 @@ async function scanAll(state, cursor, roots, now, checkpoint = async () => {}) {
     await readClaude(roots.claude, cursor, sink, progress, seen);
   } catch {}
   try {
-    await readCodex(roots.codex, cursor, sink, progress, seen, since("codex"));
+    await readCodex(roots.codex, cursor, sink, progress, seen, since("codex"), state);
   } catch {}
   try {
     await readOpenCode(roots.opencode, sink, since("opencode"));
@@ -9301,7 +9321,7 @@ async function maybeUpload(state, config, now, fetchFn = fetch, mid) {
     return false;
   const payload = buildPayload(state, now, mid);
   const hash = payloadHash(payload);
-  if (!newPairing && hash === state.lastHash)
+  if (!newPairing && hash === state.lastHash && now - state.lastUpload < REFRESH_EVERY_MS)
     return false;
   try {
     const blob = await encryptBlob(config.e2eKey, payload);
@@ -9354,29 +9374,28 @@ async function runActivityCycle(deps = {}) {
   if (scan || sent)
     await save();
 }
-function startActivityLoop() {
+function startActivityLoop(load = loadConfig, cycle = runActivityCycle) {
   let busy = false;
   let seen;
   const run = (deps) => {
     if (busy)
       return;
     busy = true;
-    runActivityCycle(deps).then(() => {
+    cycle(deps).catch(() => {}).finally(() => {
       seen = deps.config?.pairingId ?? "";
-    }).catch(() => {}).finally(() => {
       busy = false;
     });
   };
   const kick = async () => {
     if (!busy)
-      run({ config: await loadConfig() });
+      run({ config: await load() });
   };
   const tick = async () => {
     if (busy || seen === undefined)
       return;
-    const config = await loadConfig();
+    const config = await load();
     if (config && config.pairingId !== seen)
-      run({ config, scan: seen !== "" });
+      run({ config, scan: seen === "" });
   };
   const timers = [setInterval(() => void kick(), HOUR_MS), setInterval(() => void tick(), 60000)];
   for (const t of timers)
