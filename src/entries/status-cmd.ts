@@ -24,6 +24,7 @@
 import { readdir, readFile, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { antigravityAdapter, claudeAdapter, codexAdapter, cursorAdapter, devinAdapter, opencodeAdapter } from "../core/adapter";
+import { devinInstallerActive, devinPluginInstalled, devinPluginLockPath } from "../core/devin";
 import {
   AgentKind, ANTIGRAVITY_HOOK_MARKER, antigravityConfigDir, CC_DIR, CODEX_HOOK_MARKER, codexAppServerSocketAvailable, codexHome, CURSOR_HOOK_MARKER, cursorHome, DEVIN_HOOK_MARKER, devinConfigDir, flagExists,
   LAST_SEND_PATH, localApprovalsState, NO_HOLD_PATH, parseConfig, parsePendingConfig, pidAlive,
@@ -103,8 +104,10 @@ export interface StatusDeps {
   /** Antigravity's global hooks.json and liveness stamp — injected so a test never reads ~/.gemini. */
   antigravityHooksPath?: string;
   lastHookAntigravityPath?: string;
-  /** Devin's user config.json and liveness stamp — injected so a test never reads ~/.config/devin. */
+  /** Devin's user config.json, plugin lock.json and liveness stamp — injected so a test never reads
+   *  ~/.config/devin or ~/.local/share/devin. */
   devinConfigPath?: string;
+  devinPluginLockPath?: string;
   lastHookDevinPath?: string;
   isAlive?: (pid: number) => boolean;
   now?: () => number;
@@ -139,13 +142,21 @@ const AGENT_UI: Record<AgentKind, { name: string; pair: string; approvalsOn: str
   cursor: { name: "Cursor", pair: "/nomo-pair", approvalsOn: "/nomo-cc:approvals on (in Claude Code — Cursor sessions are read-only)", status: "/nomo-status" },
   // Antigravity's own /nomo-* skills (the "nomo" plugin the installer puts in ~/.gemini/config/plugins).
   antigravity: { name: "Antigravity", pair: "/nomo-pair", approvalsOn: "/nomo-approvals on", status: "/nomo-status" },
-  // Devin has no /nomo-* skills (v1): every command is the bundle itself, typed in a terminal.
+  // Devin via `nomo-ai --devin` has no /nomo-* skills: every command is the bundle itself, typed in a
+  // terminal. The native plugin's skills are DEVIN_PLUGIN_UI below.
   devin: {
     name: "Devin",
     pair: "~/.nomo/plugin/scripts/run.sh ~/.nomo/plugin/dist/pair.mjs",
     approvalsOn: "~/.nomo/plugin/scripts/run.sh ~/.nomo/plugin/dist/cc-permission.mjs on",
     status: "~/.nomo/plugin/scripts/run.sh ~/.nomo/plugin/dist/status-cmd.mjs devin",
   },
+};
+
+/** Devin with the native plugin (and no nomo-ai checkout): its own skills, and the version-stable
+ *  shim for the one command it has no skill for. */
+const DEVIN_PLUGIN_UI = {
+  name: "Devin", pair: "/nomo:pair", status: "/nomo:status",
+  approvalsOn: "~/.config/cc-status/hook-shim.sh cc-permission on",
 };
 
 /** Fixed order, so two runs on the same machine never disagree about where to look. */
@@ -472,6 +483,10 @@ export async function statusCmd(deps: StatusDeps = {}): Promise<number> {
   const antigravityHooksPath = deps.antigravityHooksPath ?? `${antigravityConfigDir()}/hooks.json`;
   const lastHookAntigravityPath = deps.lastHookAntigravityPath ?? antigravityAdapter.hookStampPath();
   const devinConfigPath = deps.devinConfigPath ?? `${devinConfigDir()}/config.json`;
+  const devinConfigText = await readFile(devinConfigPath, "utf8").catch(() => "");
+  // The same two facts the bundle's stand-down reads (core/devin.ts), so this row cannot disagree with it.
+  const devinViaHooks = devinInstallerActive(devinConfigText);
+  const devinViaPlugin = devinPluginInstalled(await readFile(deps.devinPluginLockPath ?? devinPluginLockPath(), "utf8").catch(() => ""));
   const lastHookDevinPath = deps.lastHookDevinPath ?? devinAdapter.hookStampPath();
   const noHoldPath = deps.noHoldPath ?? NO_HOLD_PATH;
   const isAlive = deps.isAlive ?? pidAlive;
@@ -482,7 +497,7 @@ export async function statusCmd(deps: StatusDeps = {}): Promise<number> {
   const audience = deps.audience;
   /** The commands to name in a fix. With no calling agent there is no right prefix to suggest, so the
    *  no-argument render falls back to Claude's — the same thing it did before this change. */
-  const ui = AGENT_UI[audience ?? "claude"];
+  const ui = audience === "devin" && devinViaPlugin && !devinViaHooks ? DEVIN_PLUGIN_UI : AGENT_UI[audience ?? "claude"];
 
   // ── header ────────────────────────────────────────────────────────────────────────────────────
   // The build, because every bug report starts with "which version?" and nothing else on this screen
@@ -819,8 +834,11 @@ export async function statusCmd(deps: StatusDeps = {}): Promise<number> {
     problems: antigravityHooks.problem ? [antigravityHooks.problem] : [],
   };
 
-  // Devin — Cursor's twin. Installed = our status hook named in ~/.config/devin/config.json.
-  const devinInstalled = (await readFile(devinConfigPath, "utf8").catch(() => "")).includes(DEVIN_HOOK_MARKER);
+  // Devin — Cursor's twin. Installed = our status hook named in ~/.config/devin/config.json, or the
+  // native plugin in Devin's lock.json. Both → the plugin stands down (core/devin.ts).
+  const devinInstalled = devinConfigText.includes(DEVIN_HOOK_MARKER) || devinViaPlugin;
+  const devinInstall = devinViaPlugin && devinViaHooks ? "both installed — plugin idle (Nomo uses the nomo-ai hooks)"
+    : devinViaPlugin ? "plugin" : devinConfigText.includes(DEVIN_HOOK_MARKER) ? "hooks (nomo-ai --devin)" : undefined;
   const devinHooks = await hooksRow("devin", {
     installed: devinInstalled, sessionsDir: devinAdapter.sessionsDir(),
     match: devinAdapter.sessionMatch, stampPath: lastHookDevinPath,
@@ -830,7 +848,10 @@ export async function statusCmd(deps: StatusDeps = {}): Promise<number> {
     kind: "devin", present: devinInstalled || perAgent.devin! > 0 || devinHooks.stamp > 0,
     hooksLabel: "Hooks", hooks: devinHooks.value, sessions: sessionText(perAgent.devin!),
     sessionCount: perAgent.devin!,
-    detail: [["Mode", "sessions show on your phone; Allow/Deny for Devin's permission prompts"]],
+    detail: [
+      ...(devinInstall ? [["Install", devinInstall] as [string, string]] : []),
+      ["Mode", "sessions show on your phone; Allow/Deny for Devin's permission prompts"],
+    ],
     problems: devinHooks.problem ? [devinHooks.problem] : [],
   };
 

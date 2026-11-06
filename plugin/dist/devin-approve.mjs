@@ -2,6 +2,7 @@ import { createRequire } from "node:module";
 var __require = /* @__PURE__ */ createRequire(import.meta.url);
 
 // src/core/devin.ts
+import { existsSync as existsSync3, readFileSync as readFileSync2 } from "node:fs";
 import { hostname as hostname3 } from "node:os";
 
 // src/core/adapter.ts
@@ -105,7 +106,7 @@ async function sha256Hex(s) {
 }
 
 // src/core/shared.ts
-var PLUGIN_VERSION = "2.4.1";
+var PLUGIN_VERSION = "2.5.0";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -4482,6 +4483,40 @@ function planDevin(kind, input, record, now) {
       return null;
   }
 }
+var DEVIN_INSTALLER_COMMAND = /^'([^']+\/)scripts\/run\.sh' '\1dist\/devin-(status|approve)\.mjs'(; exit 0)?$/;
+var DEVIN_PLUGIN_FLAG = "--via=devin-plugin";
+function devinInstallerActive(configText, exists = existsSync3) {
+  for (const m of configText.matchAll(/"((?:[^"\\]|\\.)*)"/g)) {
+    let value;
+    try {
+      value = JSON.parse(`"${m[1]}"`);
+    } catch {
+      continue;
+    }
+    const owned = typeof value === "string" ? DEVIN_INSTALLER_COMMAND.exec(value) : null;
+    if (owned && exists(`${owned[1]}scripts/run.sh`))
+      return true;
+  }
+  return false;
+}
+var devinPluginLockPath = () => `${process.env.HOME ?? ""}/.local/share/devin/cli/plugins/lock.json`;
+function devinPluginInstalled(lockText) {
+  try {
+    const resolved = JSON.parse(lockText)?.resolved;
+    return Array.isArray(resolved) && resolved.some((r) => typeof r === "object" && r !== null && r.name === "nomo");
+  } catch {
+    return false;
+  }
+}
+function devinPluginStandsDown(argv = process.argv, configPath = process.env.NOMO_DEVIN_CONFIG ?? `${devinConfigDir()}/config.json`) {
+  if (!argv.includes(DEVIN_PLUGIN_FLAG))
+    return false;
+  try {
+    return devinInstallerActive(readFileSync2(configPath, "utf8"));
+  } catch {
+    return false;
+  }
+}
 var argv02 = (command) => command.trimStart().split(/\s/, 1)[0] ?? "";
 function devinOwnerPid(chain) {
   return chain.find((p) => p.command !== undefined && /(^|\/)devin$/.test(argv02(p.command)))?.pid;
@@ -5943,5 +5978,5 @@ if (__require.main == __require.module) {
     for await (const chunk of process.stdin)
       chunks.push(chunk);
   } catch {}
-  finish(await runDevinApproval(Buffer.concat(chunks).toString("utf8")));
+  finish(devinPluginStandsDown() ? "" : await runDevinApproval(Buffer.concat(chunks).toString("utf8")));
 }

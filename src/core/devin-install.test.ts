@@ -9,6 +9,8 @@ import { cp, link, mkdir, mkdtemp, readFile, realpath, rm, stat, symlink, writeF
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test } from "bun:test";
+import { existsSync } from "node:fs";
+import { DEVIN_INSTALLER_COMMAND, devinPluginInstalled as tsPluginInstalled } from "./devin";
 import { DEVIN_APPROVAL_TIMEOUT_S } from "./devin-approval";
 import { createProcessHygiene, isolatedTestEnv } from "../test/process-hygiene";
 
@@ -17,6 +19,9 @@ const SCRIPT = join(import.meta.dir, "../../plugin/scripts/devin-install.mjs");
 
 interface Installer {
   APPROVAL_TIMEOUT: number;
+  OWNED: RegExp;
+  devinPluginHooks(): Record<string, unknown[]>;
+  devinPluginInstalled(lockText: string): boolean;
   devinHooks(root: string): Record<string, unknown[]>;
   stripJsonc(text: string): { json: string; hadComments: boolean };
   mergeHooks(config: Record<string, unknown>, root: string): Record<string, unknown>;
@@ -216,5 +221,63 @@ describe("devin-install.mjs", () => {
     const r = await run(b);
     expect(r.code).toBe(1);
     expect(await stat(b.config).then(() => true, () => false)).toBe(false);
+  });
+
+  test("a Nomo Devin plugin in Devin's lock.json → one line, config.json never written", async () => {
+    const b = await box();
+    await mkdir(join(b.home, ".local", "share", "devin", "cli", "plugins"), { recursive: true });
+    await writeFile(join(b.home, ".local", "share", "devin", "cli", "plugins", "lock.json"),
+      JSON.stringify({ requirements: [], resolved: [{ name: "devin-playbooks" }, { name: "nomo" }] }));
+    const r = await run(b);
+    expect(r.code).toBe(0);
+    expect(r.out.trim()).toBe("devin-install: Nomo is already installed as a Devin plugin — nothing to do");
+    expect(await stat(b.config).then(() => true, () => false)).toBe(false);
+  });
+});
+
+// ── the native Devin plugin (repo root) ──────────────────────────────────────────────────────────
+
+const REPO = join(import.meta.dir, "..", "..");
+
+describe("native Devin plugin", () => {
+  test("root hooks.json is exactly devinPluginHooks() — same events, matchers and timeouts as the installer", async () => {
+    const m = await mod();
+    // On drift, regenerate: node -e 'import("./plugin/scripts/devin-install.mjs").then(m=>process.stdout.write(JSON.stringify(m.devinPluginHooks(),null,2)+"\n"))' > hooks.json
+    expect(await read(join(REPO, "hooks.json"))).toEqual(m.devinPluginHooks());
+    const shape = (h: Record<string, unknown[]>) => JSON.stringify(h, (k, v) => (k === "command" ? undefined : v));
+    expect(shape(m.devinPluginHooks())).toBe(shape(m.devinHooks("/r")));
+    for (const list of Object.values(m.devinPluginHooks()) as Array<Array<{ hooks: Array<{ command: string }> }>>) {
+      const cmd = list[0]!.hooks[0]!.command;
+      expect(cmd).toContain("--via=devin-plugin");
+      expect(cmd.endsWith("; exit 0")).toBe(true);
+      // the approval hold keeps the shell as its parent (Devin SIGKILLs the hook's direct child)
+      expect(cmd.includes("exec ")).toBe(!cmd.includes("devin-approve.mjs"));
+    }
+  });
+
+  test("manifest: name nomo, local only, skills from plugin/devin-skills (pair + status)", async () => {
+    const manifest = await read(join(REPO, ".devin-plugin", "plugin.json"));
+    expect(manifest).toMatchObject({ name: "nomo", platforms: ["local"], skills: "plugin/devin-skills" });
+    expect(manifest).not.toHaveProperty("hooks"); // hooks come from root hooks.json
+    for (const skill of ["pair", "status"]) {
+      const text = await readFile(join(REPO, "plugin", "devin-skills", skill, "SKILL.md"), "utf8");
+      expect(text).toContain(`name: ${skill}`);
+      expect(text).not.toContain("__NOMO_ROOT__");
+    }
+    expect(existsSync(join(REPO, String(manifest.logo)))).toBe(true);
+  });
+
+  test("the repo root carries nothing else Devin would load as part of the plugin", () => {
+    for (const p of ["hooks", "skills", "AGENTS.md", "rules", "agents", ".mcp.json", "mcp.json", "plugin.json", ".claude-plugin/plugin.json"]) {
+      expect({ p, exists: existsSync(join(REPO, p)) }).toEqual({ p, exists: false });
+    }
+  });
+
+  test("the bundle's TS twins match the installer", async () => {
+    const m = await mod();
+    expect(DEVIN_INSTALLER_COMMAND.source).toBe(m.OWNED.source);
+    for (const lock of ["", "{", "[]", '{"resolved":[{"name":"nomo"}]}', '{"resolved":[{"name":"nomo-cc"}]}', '{"resolved":"nomo"}']) {
+      expect({ lock, ts: tsPluginInstalled(lock) }).toEqual({ lock, ts: m.devinPluginInstalled(lock) });
+    }
   });
 });

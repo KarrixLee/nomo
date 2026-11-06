@@ -20,12 +20,13 @@
 // decision, block a prompt or rewrite a tool call), always exits 0 and swallows every error. Devin
 // waits for UserPromptSubmit, so that path does no sqlite read and at most one awaited 2 s POST.
 
+import { existsSync, readFileSync } from "node:fs";
 import { hostname } from "node:os";
 import { devinAdapter, devinSessionMeta } from "./adapter";
 import { CURSOR_KEEPALIVE_MS, CURSOR_UNKNOWN_OWNER_PID } from "./cursor";
 import { buildEnvelope, markDoneDeliveredAt, OpPlan, trackSessionAt } from "./hook";
 import {
-  atomicWrite, Config, ensureWatchdog, folderIdentity, lastHookPath, loadConfig, pidAlive, pidAncestors,
+  atomicWrite, Config, devinConfigDir, ensureWatchdog, folderIdentity, lastHookPath, loadConfig, pidAlive, pidAncestors,
   pidCommand, readRecord, SESSIONS_DIR, SessionRecord, traceSession,
 } from "./shared";
 import { postOcEvent } from "../opencode/state";
@@ -99,6 +100,56 @@ export function planDevin(
     default:
       return null;
   }
+}
+
+// ── one install wins: the `nomo-ai --devin` hooks, or the native Devin plugin ─────────────────────
+
+/** Nomo's two commands as `nomo-ai --devin` writes them into Devin's config.json. A TWIN of OWNED in
+ *  plugin/scripts/devin-install.mjs (pinned equal by devin-install.test.ts) — that script runs from a
+ *  clone with no build step, and importing it here would bundle its CLI `main()`. */
+export const DEVIN_INSTALLER_COMMAND = /^'([^']+\/)scripts\/run\.sh' '\1dist\/devin-(status|approve)\.mjs'(; exit 0)?$/;
+
+/** The plugin hooks' marker argv (root hooks.json, from devinPluginHooks in devin-install.mjs). */
+export const DEVIN_PLUGIN_FLAG = "--via=devin-plugin";
+
+/** Does this Devin config.json text carry a LIVE `nomo-ai --devin` install — one of our commands
+ *  whose checkout still has its run.sh? A dead checkout is not an install (the plugin must not go
+ *  quiet behind hooks that can no longer run). Every JSON string literal is checked, so a JSONC file
+ *  needs no parser. ponytail: a commented-out command line still counts; --uninstall is the off switch. */
+export function devinInstallerActive(configText: string, exists: (p: string) => boolean = existsSync): boolean {
+  for (const m of configText.matchAll(/"((?:[^"\\]|\\.)*)"/g)) {
+    let value: unknown;
+    try { value = JSON.parse(`"${m[1]}"`); } catch { continue; }
+    const owned = typeof value === "string" ? DEVIN_INSTALLER_COMMAND.exec(value) : null;
+    if (owned && exists(`${owned[1]}scripts/run.sh`)) return true;
+  }
+  return false;
+}
+
+/** Devin's plugin lock (read only). */
+export const devinPluginLockPath = (): string => `${process.env.HOME ?? ""}/.local/share/devin/cli/plugins/lock.json`;
+
+/** Is the Nomo Devin plugin (manifest name `nomo`) installed, per lock.json's text? A TWIN of
+ *  devinPluginInstalled in devin-install.mjs. */
+export function devinPluginInstalled(lockText: string): boolean {
+  try {
+    const resolved: unknown = JSON.parse(lockText)?.resolved;
+    return Array.isArray(resolved) && resolved.some((r) => typeof r === "object" && r !== null && (r as { name?: unknown }).name === "nomo");
+  } catch {
+    return false;
+  }
+}
+
+/** Should this invocation stay silent? Only a PLUGIN hook (argv carries DEVIN_PLUGIN_FLAG), and only
+ *  while the installer's hooks are live in Devin's config — they run on the same events, so the plugin
+ *  firing too would double every frame and every phone card. NOMO_DEVIN_CONFIG is a test seam (a
+ *  `devin --config <file>` run). */
+export function devinPluginStandsDown(
+  argv: readonly string[] = process.argv,
+  configPath: string = process.env.NOMO_DEVIN_CONFIG ?? `${devinConfigDir()}/config.json`,
+): boolean {
+  if (!argv.includes(DEVIN_PLUGIN_FLAG)) return false;
+  try { return devinInstallerActive(readFileSync(configPath, "utf8")); } catch { return false; }
 }
 
 const argv0 = (command: string): string => command.trimStart().split(/\s/, 1)[0] ?? "";

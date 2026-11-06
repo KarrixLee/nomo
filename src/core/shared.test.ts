@@ -74,6 +74,8 @@ const VERSION_MANIFESTS: [path: string, pick: (doc: any) => (string | undefined)
   ["plugin/.codex-plugin/plugin.json", (d) => [d.version]],
   [".claude-plugin/marketplace.json", (d) => (d.plugins ?? []).map((p: any) => p.version)],
   [".agents/plugins/marketplace.json", (d) => (d.plugins ?? []).map((p: any) => p.version)],
+  ["package.json", (d) => [d.version]],
+  [".devin-plugin/plugin.json", (d) => [d.version]],
 ];
 
 const manifestVersion = async (path: string): Promise<any> =>

@@ -1,8 +1,10 @@
 // devin-approve — the Devin PermissionRequest hook ENTRY (bundled to dist/devin-approve.mjs), registered
-// in ~/.config/devin/config.json by plugin/scripts/devin-install.mjs. Prints AT MOST ONE decision line
+// in ~/.config/devin/config.json by plugin/scripts/devin-install.mjs or by the native Devin plugin's
+// hooks.json (`--via=devin-plugin`). Prints AT MOST ONE decision line
 // and exits 0 — and prints NOTHING (= Devin's own prompt) on every path without a phone answer,
 // including its own hard cap. All logic: core/devin-approval.ts. PORTABILITY: bun AND node >= 18.
 
+import { devinPluginStandsDown } from "../core/devin";
 import { DEVIN_ENTRY_CAP_MS, markDevinApprovalTerminated, runDevinApproval } from "../core/devin-approval";
 
 /** Exit from the write's own callback: stdout is a pipe and process.exit does not wait for it (see
@@ -30,5 +32,6 @@ if (import.meta.main) {
   try {
     for await (const chunk of process.stdin) chunks.push(chunk as Buffer);
   } catch { /* unreadable stdin → no opinion */ }
-  finish(await runDevinApproval(Buffer.concat(chunks).toString("utf8")));
+  // The native plugin's copy goes quiet (no card, no opinion) while `nomo-ai --devin`'s is installed.
+  finish(devinPluginStandsDown() ? "" : await runDevinApproval(Buffer.concat(chunks).toString("utf8")));
 }

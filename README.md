@@ -561,19 +561,37 @@ which deletes only the `"nomo"` block and the `nomo` plugin folder Nomo installe
 
 ## Install — Devin
 
-One install covers the **Devin CLI** and Devin Desktop's **Devin Local** agent — both read the
-`"hooks"` key of `~/.config/devin/config.json`.
+Two ways to install, for the **Devin CLI** and Devin Desktop's **Devin Local** agent alike. **Install
+one.** If both are installed, Nomo uses the `nomo-ai` one and the plugin stays idle (`/nomo:status`
+says "both installed — plugin idle").
+
+**As a Devin plugin** (from a terminal, signed in to Devin):
+
+```sh
+devin plugins install KarrixLee/nomo
+```
+
+or in Devin Desktop: **Customize → Plugins → From repository** → `KarrixLee/nomo`. The plugin runs only
+in local Devin sessions (the CLI and Devin Desktop), never in Devin cloud sessions. Pair with
+`/nomo:pair` and check with `/nomo:status`. To remove it: `devin plugins remove nomo`.
+
+**Or with the installer:**
 
 ```sh
 bunx nomo-ai --devin     # or, from a checkout: node plugin/scripts/devin-install.mjs
 ```
 
-**Restart devin** (and Devin Desktop). Already paired from another agent? Nothing else to do. Otherwise
-pair from a terminal (Devin has no `/nomo-*` commands yet):
+It merges Nomo's hooks into the `"hooks"` key of `~/.config/devin/config.json` (read by both the CLI
+and Devin Desktop). If the Nomo plugin is already installed, it says so and changes nothing. **Restart
+devin** (and Devin Desktop). Already paired from another agent? Nothing else to do. Otherwise pair from
+a terminal (the installer adds no `/nomo:*` commands):
 
 ```sh
 ~/.nomo/plugin/scripts/run.sh ~/.nomo/plugin/dist/pair.mjs
 ```
+
+Either way, Devin Desktop's **Restricted Mode** turns hooks off, and Nomo with them: sessions stop
+reaching the phone until you leave it.
 
 **What the installer writes.** Nomo's entries go into the `"hooks"` key of `config.json`, next to your
 other Devin settings, which are left as they are: a status hook on `UserPromptSubmit`, `PostToolUse`,
@@ -645,7 +663,10 @@ description is dropped before the command is.
   notices its parent shell is gone, withdraws the phone's card and exits. Nomo's Claude Code hooks stand
   down inside Devin (Devin also runs `~/.claude` hooks), so a Devin session never shows up as a
   Claude Code row and never gets its prompts answered by them. The installer writes only its own
-  entries; remove them with `node ~/.nomo/plugin/scripts/devin-install.mjs --uninstall`.
+  entries; remove them with `node ~/.nomo/plugin/scripts/devin-install.mjs --uninstall` The Devin
+  plugin registers the same two bundles through its `hooks.json` (it adds no rules, MCP servers or
+  agents, and declares itself local-only); while the installer's entries are present, its copies exit
+  without sending anything. Remove it with `devin plugins remove nomo`.
 
 - **Antigravity: status hooks observe only, except to end a turn you interrupted or to hand over a
   message you sent; the approval hook
@@ -827,11 +848,12 @@ manifests said 2.1.7). The manifests are the source of truth; read them.
 - `plugin/.claude-plugin/plugin.json` (`nomo-cc`)
 - `plugin/.codex-plugin/plugin.json` (`nomo`)
 - `package.json` (the `nomo-ai` npm bootstrapper)
+- `.devin-plugin/plugin.json` (the native Devin plugin, `nomo`)
 
 OpenCode has no manifest — it installs from the checkout, so the checkout is its version. That is
 what makes `/nomo-update` a `git pull`, and what makes these manifests the number it reports.
 
-`bun build.ts` cross-checks all five and refuses to build on disagreement. `package.json` carries the
+`bun build.ts` cross-checks all six and refuses to build on disagreement. `package.json` carries the
 version only so `bunx nomo-ai --version` is quotable in a bug report; it ships no plugin code. The
 npm publish is a separate manual step — `npm pack --dry-run` first: the tarball is `bin/` plus the
 three files npm always adds (`package.json`, `README.md`, `LICENSE`), and nothing else.

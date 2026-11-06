@@ -1181,6 +1181,7 @@ describe("statusCmd", () => {
     cursorProjectsDir: join(dir, "cursor-projects"), lastHookCursorPath: join(dir, "lh-cursor"),
     antigravityHooksPath: join(dir, "agy-hooks.json"), lastHookAntigravityPath: join(dir, "lh-agy"),
     devinConfigPath: join(dir, "devin-config.json"), lastHookDevinPath: join(dir, "lh-devin"),
+    devinPluginLockPath: join(dir, "devin-lock.json"),
     ...deps,
   });
   // The machine-wide block: pairing, delivery, approvals. True regardless of which agent asked, which
@@ -1255,6 +1256,29 @@ describe("statusCmd", () => {
     expect(out).toContain("1 tracked");
     expect(out).toContain("Allow/Deny");
     expect(out).not.toContain("not set up here");
+  });
+
+  test("status devin: the Install row says plugin / hooks / both — plugin idle; plugin-only names /nomo:pair", async () => {
+    const root = join(dir, "checkout", "plugin");
+    await mkdir(join(root, "scripts"), { recursive: true });
+    await writeFile(join(root, "scripts", "run.sh"), "#!/bin/sh\n");
+    const hooks = JSON.stringify({ hooks: { Stop: [{ hooks: [{ type: "command", command: `'${root}/scripts/run.sh' '${root}/dist/devin-status.mjs'` }] }] } });
+    const lock = JSON.stringify({ resolved: [{ name: "nomo" }] });
+    const run = async (config: string | null, lockText: string | null): Promise<string> => {
+      lines.length = 0;
+      await rm(join(dir, "devin-config.json"), { force: true });
+      await rm(join(dir, "devin-lock.json"), { force: true });
+      if (config !== null) await writeFile(join(dir, "devin-config.json"), config);
+      if (lockText !== null) await writeFile(join(dir, "devin-lock.json"), lockText);
+      await statusCmd({ print, audience: "devin", configPath, lastSendPath: join(dir, "last-send"), sessionsDir: join(dir, "sessions"), watchdogPidPath: join(dir, "watchdog.pid"), isAlive: () => false });
+      return lines.join("\n");
+    };
+    const plugin = await run(null, lock);
+    expect(plugin).toMatch(/Install\s+plugin\n/);
+    expect(plugin).toContain("/nomo:pair"); // unpaired → the fix is the plugin's own skill
+    expect(await run(hooks, null)).toMatch(/Install\s+hooks \(nomo-ai --devin\)/);
+    expect(await run(hooks, lock)).toMatch(/Install\s+both installed — plugin idle/);
+    expect(await run(null, null)).not.toContain("Install");
   });
 
   test("a PENDING config → reports pairing-in-progress, not a flat 'not paired'", async () => {

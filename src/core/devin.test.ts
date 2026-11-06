@@ -2,13 +2,17 @@
 // end-to-end passes through runDevinHook against a temp sessions dir with the POST captured. Nothing
 // here touches the network, the real ~/.local/share/devin, or the real Nomo state dir.
 
-import { mkdtemp, readdir, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test } from "bun:test";
 import { decryptBlob } from "./crypto";
 import { CURSOR_KEEPALIVE_MS } from "./cursor";
-import { DevinHookDeps, devinEventKind, devinOwnerPid, planDevin, runDevinHook } from "./devin";
+import {
+  DevinHookDeps, devinEventKind, devinInstallerActive, devinOwnerPid, devinPluginInstalled, devinPluginStandsDown,
+  planDevin, runDevinHook,
+} from "./devin";
+import { createProcessHygiene, isolatedTestEnv } from "../test/process-hygiene";
 import { Config, readRecord, SessionRecord } from "./shared";
 
 const KEY = new Uint8Array(32).fill(7);
@@ -164,5 +168,99 @@ describe("runDevinHook", () => {
     await h.fire(ev("UserPromptSubmit", { prompt: "hi" }));
     await h.fire(ev("UserPromptSubmit", { prompt: "again", prompt_id: "p2" }));
     expect(reads).toBe(0);
+  });
+});
+
+// ── one install wins ────────────────────────────────────────────────────────────────────────────
+// `nomo-ai --devin` (config.json hooks) and the native plugin (repo-root hooks.json, `--via=devin-plugin`)
+// register the same events. Both installed → the PLUGIN copy stands down, so there is one set of frames.
+
+describe("devin plugin stand-down", () => {
+  const { spawnTestProcess } = createProcessHygiene();
+  const dirs: string[] = [];
+  afterEach(async () => { await Promise.all(dirs.splice(0).map((d) => rm(d, { recursive: true, force: true }))); });
+
+  /** A temp HOME, a fake `nomo-ai` checkout (scripts/run.sh exists) and a Devin config naming it. */
+  async function home(): Promise<{ home: string; root: string; config: string; installerConfig: string }> {
+    const home = await mkdtemp(join(tmpdir(), "nomo-devin-dedupe-"));
+    dirs.push(home);
+    const root = join(home, ".nomo", "plugin");
+    await mkdir(join(root, "scripts"), { recursive: true });
+    await writeFile(join(root, "scripts", "run.sh"), "#!/bin/sh\n");
+    const { devinHooks } = await import("../../plugin/scripts/devin-install.mjs" as string) as { devinHooks(r: string): object };
+    const installerConfig = JSON.stringify({ version: 1, hooks: devinHooks(root) }, null, 2);
+    return { home, root, config: join(home, "devin-config.json"), installerConfig };
+  }
+
+  test("devinInstallerActive: our command with a live checkout, also inside JSONC; never a dead checkout or a stranger", async () => {
+    const h = await home();
+    expect(devinInstallerActive(h.installerConfig)).toBe(true);
+    expect(devinInstallerActive(`// mine\n${h.installerConfig.replace(/\n}$/, ",\n}")}`)).toBe(true);
+    expect(devinInstallerActive(h.installerConfig, () => false)).toBe(false); // checkout deleted
+    expect(devinInstallerActive(JSON.stringify({ hooks: { Stop: [{ hooks: [{ command: "./audit.sh" }] }] } }))).toBe(false);
+    expect(devinInstallerActive("")).toBe(false);
+    expect(devinInstallerActive("{ not json")).toBe(false);
+  });
+
+  test("devinPluginInstalled reads lock.json's resolved names", () => {
+    expect(devinPluginInstalled(JSON.stringify({ resolved: [{ name: "devin-playbooks" }, { name: "nomo" }] }))).toBe(true);
+    expect(devinPluginInstalled(JSON.stringify({ resolved: [{ name: "devin-playbooks" }] }))).toBe(false);
+    expect(devinPluginInstalled(JSON.stringify({ requirements: [{ name: "nomo" }] }))).toBe(false);
+    expect(devinPluginInstalled("")).toBe(false);
+  });
+
+  test("devinPluginStandsDown: only a plugin invocation, only while the installer's hooks are live", async () => {
+    const h = await home();
+    await writeFile(h.config, h.installerConfig);
+    expect(devinPluginStandsDown(["bun", "x.mjs", "--via=devin-plugin"], h.config)).toBe(true);
+    expect(devinPluginStandsDown(["bun", "x.mjs"], h.config)).toBe(false); // the installer's own hook
+    expect(devinPluginStandsDown(["bun", "x.mjs", "--via=devin-plugin"], join(h.home, "missing.json"))).toBe(false);
+    await writeFile(h.config, JSON.stringify({ version: 1 }));
+    expect(devinPluginStandsDown(["bun", "x.mjs", "--via=devin-plugin"], h.config)).toBe(false);
+  });
+
+  /** Run an entry the way a hook does; returns its stdout. */
+  async function spawnEntry(entry: string, h: { home: string; config: string }, argv: string[], payload: object): Promise<string> {
+    const proc = spawnTestProcess({
+      cmd: ["bun", join(import.meta.dir, "..", "entries", entry), ...argv],
+      env: isolatedTestEnv(h.home, { DEVIN_PROJECT_DIR: h.home, NOMO_DEVIN_CONFIG: h.config, NOMO_CC_DIR: undefined }),
+      stdin: Buffer.from(JSON.stringify(payload)), stdout: "pipe", stderr: "ignore",
+    });
+    const [out] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
+    return out;
+  }
+  const stamped = async (homeDir: string) => stat(join(homeDir, ".config", "cc-status", "last-hook-devin")).then(() => true, () => false);
+
+  test("devin-status: the plugin copy is silent while nomo-ai's hooks are installed, and runs when they are not", async () => {
+    const both = await home();
+    await writeFile(both.config, both.installerConfig);
+    const prompt = ev("UserPromptSubmit", { prompt: "hi" });
+    expect(await spawnEntry("devin-status.ts", both, ["--via=devin-plugin"], prompt)).toBe("");
+    expect(await stamped(both.home)).toBe(false); // stood down before even the liveness stamp
+    await spawnEntry("devin-status.ts", both, [], prompt); // the installer's own hook still runs
+    expect(await stamped(both.home)).toBe(true);
+
+    const pluginOnly = await home();
+    await writeFile(pluginOnly.config, JSON.stringify({ version: 1 }));
+    expect(await spawnEntry("devin-status.ts", pluginOnly, ["--via=devin-plugin"], prompt)).toBe("");
+    expect(await stamped(pluginOnly.home)).toBe(true);
+  });
+
+  test("devin-approve: the plugin copy posts no phone card and prints no decision while nomo-ai's hooks are installed", async () => {
+    const requests: string[] = [];
+    const server = Bun.serve({ port: 0, fetch(req) { requests.push(new URL(req.url).pathname); return Response.json({ hold: false }); } });
+    try {
+      const h = await home();
+      await writeFile(h.config, h.installerConfig);
+      await mkdir(join(h.home, ".config", "cc-status"), { recursive: true });
+      await writeFile(join(h.home, ".config", "cc-status", "config.json"), JSON.stringify({
+        url: `http://127.0.0.1:${server.port}`, pairingId: "p", pcSecret: "s", e2eKeyB64: Buffer.from(KEY).toString("base64url"),
+      }));
+      const payload = ev("PermissionRequest", { tool_name: "exec", tool_use_id: "t1", tool_input: { command: "touch x" } });
+      expect(await spawnEntry("devin-approve.ts", h, ["--via=devin-plugin"], payload)).toBe("");
+      expect(requests).toEqual([]);
+    } finally {
+      server.stop(true);
+    }
   });
 });

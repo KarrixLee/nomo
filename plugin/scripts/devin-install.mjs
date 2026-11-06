@@ -44,8 +44,9 @@ export const APPROVAL_TIMEOUT = 86400;
 /** Seconds for the status hook: one awaited 2 s POST plus, on a session's first prompt, a few `ps`. */
 const STATUS_TIMEOUT = 10;
 
-/** Our two commands for ANY checkout root (the backreference keeps both paths under one root). */
-const OWNED = /^'([^']+\/)scripts\/run\.sh' '\1dist\/devin-(status|approve)\.mjs'(; exit 0)?$/;
+/** Our two commands for ANY checkout root (the backreference keeps both paths under one root).
+ *  core/devin.ts DEVIN_INSTALLER_COMMAND is its TS twin (pinned equal by devin-install.test.ts). */
+export const OWNED = /^'([^']+\/)scripts\/run\.sh' '\1dist\/devin-(status|approve)\.mjs'(; exit 0)?$/;
 
 const isObject = (v) => typeof v === "object" && v !== null && !Array.isArray(v);
 
@@ -62,6 +63,40 @@ export function devinHooks(root) {
     SessionEnd: [{ hooks: [S()] }],
     PermissionRequest: [{ hooks: [A] }],
   };
+}
+
+/** The same hooks for the native Devin PLUGIN (repo-root hooks.json, pinned equal by
+ *  devin-install.test.ts). The plugin root is the REPO root, known only at run time from Devin's env;
+ *  `--via=devin-plugin` makes the bundle stand down when this installer's entries are also present
+ *  (one install wins: this one). The approval command keeps the shell as the bundle's parent (no
+ *  `exec`) for the same SIGKILL reason as above. */
+export function devinPluginHooks() {
+  const at = `R="\${DEVIN_PLUGIN_ROOT:-\${PLUGIN_ROOT:-}}"; [ -n "$R" ] && [ -f "$R/plugin/scripts/run.sh" ] && `;
+  const cmd = (bundle, exec) =>
+    `${at}${exec ? "exec " : ""}/bin/sh "$R/plugin/scripts/run.sh" "$R/plugin/dist/${bundle}" --via=devin-plugin; exit 0`;
+  const out = devinHooks("");
+  for (const list of Object.values(out)) {
+    for (const entry of list) {
+      for (const h of entry.hooks) {
+        h.command = h.command.includes("devin-approve.mjs") ? cmd("devin-approve.mjs", false) : cmd("devin-status.mjs", true);
+      }
+    }
+  }
+  return out;
+}
+
+/** Where Devin records installed plugins (read only — never written by Nomo). */
+export const devinPluginLock = () => join(homedir(), ".local", "share", "devin", "cli", "plugins", "lock.json");
+
+/** Is the Nomo Devin plugin (manifest name `nomo`) installed, per the text of Devin's plugin lock.json?
+ *  core/devin.ts devinPluginInstalled is its TS twin. */
+export function devinPluginInstalled(lockText) {
+  try {
+    const resolved = JSON.parse(lockText)?.resolved;
+    return Array.isArray(resolved) && resolved.some((r) => isObject(r) && r.name === "nomo");
+  } catch {
+    return false;
+  }
 }
 
 /** Is this hooks entry one WE wrote? Every command in it must be OWNED. */
@@ -250,6 +285,14 @@ function main() {
       say(r.wrote ? "removed Nomo's hooks from Devin — restart devin" : "no Nomo hooks found in Devin's config");
       comments(r);
       if (VERBOSE) say(`config -> ${CONFIG}`);
+      return;
+    }
+    // One install wins. The plugin defers to this installer's entries, so writing them now would
+    // silently switch a working plugin install over to this checkout — say so and leave it.
+    let lock = "";
+    try { lock = readFileSync(devinPluginLock(), "utf8"); } catch { /* no plugins */ }
+    if (devinPluginInstalled(lock)) {
+      say("Nomo is already installed as a Devin plugin — nothing to do");
       return;
     }
     // ROOT is written inside single quotes in the hook commands.
