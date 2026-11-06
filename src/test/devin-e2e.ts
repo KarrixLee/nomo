@@ -5,6 +5,14 @@
 //   bun src/test/devin-e2e.ts deny                       # …the phone denies with a note
 //   bun src/test/devin-e2e.ts abandon                    # NO Devin: replays Devin's give-up (a SIGKILL
 //                                                        # of the hook's direct child) on the real bundle
+//   bun src/test/devin-e2e.ts interrupt                  # a real `devin -p` run: the phone answers Always
+//                                                        # allow on the first `touch`, the second runs with
+//                                                        # no card, then a phone Interrupt ends the turn
+//   bun src/test/devin-e2e.ts question                   # `devin acp` (Devin Desktop's transport) with a
+//                                                        # tiny stdio client: the phone answers Devin's
+//                                                        # ask_user_question and the model uses it
+//
+// Every Devin session a run creates is deleted afterwards (`devin rm --force <id>`).
 //
 // Everything lives in a throwaway dir: Nomo's state (NOMO_CC_DIR), the pairing (pointing at the fake
 // worker on 127.0.0.1), the project with its .devin/hooks.v1.json. Nothing reaches a real relay or
@@ -22,8 +30,8 @@ import { join, resolve } from "node:path";
 import { decryptBlob, encryptBlob } from "../core/crypto";
 
 const mode = process.argv[2];
-if (mode !== "allow" && mode !== "deny" && mode !== "abandon") {
-  console.error("usage: bun src/test/devin-e2e.ts allow|deny|abandon");
+if (mode !== "allow" && mode !== "deny" && mode !== "abandon" && mode !== "interrupt" && mode !== "question") {
+  console.error("usage: bun src/test/devin-e2e.ts allow|deny|abandon|interrupt|question");
   process.exit(2);
 }
 const PLUGIN = resolve(import.meta.dir, "../../plugin");
@@ -49,6 +57,8 @@ function approveAncestry(): string[] {
 
 let polls = 0;
 let requestId = "";
+let cardTool = "";
+const sessionIds = new Set<string>();
 const server = Bun.serve({
   port: 0,
   async fetch(req) {
@@ -56,12 +66,15 @@ const server = Bun.serve({
     const body = (req.method === "POST" ? await req.json().catch(() => ({})) : {}) as Record<string, unknown>;
     const open = async (blob: unknown) => (typeof blob === "string" ? await decryptBlob(key, blob) as Record<string, unknown> : {});
     if (path === "/v1/cc/event") {
+      if (typeof body.sessionId === "string") sessionIds.add(body.sessionId);
       const b = await open(body.blob);
       say(`event ${String(body.op)} ${b.status ?? "-"} ${b.agent ?? "claude"} ${JSON.stringify(b.title ?? "")} ${b.model ?? ""}`.trimEnd());
       if (DUMP) console.log(`  plaintext ${JSON.stringify(b)}`);
     } else if (path === "/v1/cc/decision") {
       const b = await open(body.blob);
       requestId = String(body.requestId ?? b.permissionRequestId ?? "");
+      cardTool = String(b.permissionToolName ?? "");
+      polls = 0;
       say(`decision ${b.status ?? "-"} ${b.agent ?? "claude"} ${b.permissionToolName ?? "-"} ${JSON.stringify(b.permissionDetail ?? "")}`);
       if (DUMP) console.log(`  plaintext ${JSON.stringify(b)}`);
       for (const line of approveAncestry()) say(`ancestry ${line}`);
@@ -70,7 +83,10 @@ const server = Bun.serve({
       say(`resolve ${String(body.requestId) === requestId ? "same-request" : "other"}`);
     } else if (path.startsWith("/v1/cc/decision/")) {
       if (mode === "abandon" || ++polls < 2) return Response.json({ status: "pending" });
-      const decision = mode === "allow" ? { decision: "allow" } : { decision: "deny", message: "nomo e2e deny" };
+      const decision = mode === "allow" ? { decision: "allow" }
+        : mode === "interrupt" ? { decision: "allow_always" }
+        : mode === "question" ? (cardTool === "AskUserQuestion" ? { decision: "answer", answers: ["Blue"] } : { decision: "allow" })
+        : { decision: "deny", message: "nomo e2e deny" };
       say(`answer ${decision.decision}`);
       return Response.json({ status: "answered", answerBlob: await encryptBlob(key, { requestId: path.slice("/v1/cc/decision/".length), ...decision, ts: Date.now() }) });
     }
@@ -117,16 +133,43 @@ if (mode === "abandon") {
   expectLog("resolve same-request");
   if (out.trim() !== "") failures.push(`printed to a dead pipe: ${out.trim()}`);
   if (approveAncestry().length > 0) failures.push("the bundle is still running after its card was withdrawn");
+} else if (mode === "interrupt") {
+  // The watchdog's half of a phone Interrupt, replayed: stamp the flag once the second `touch` has run
+  // (that one must have been approved by the stored grant, with no card).
+  let stamped = false;
+  const watch = setInterval(() => {
+    const sid = [...sessionIds][0];
+    if (stamped || !sid || !existsSync(join(proj, "a2.txt"))) return;
+    writeFileSync(join(cc, "sessions", `${sid}.interrupt`), JSON.stringify({ at: Date.now() }), { mode: 0o600 });
+    stamped = true;
+    say("flag stamped after a2.txt");
+  }, 10);
+  const prompt = "Run these three shell commands one at a time, each as its own separate tool call, waiting for each to finish before the next: `touch a1.txt`, then `touch a2.txt`, then `touch a3.txt`. Then reply done.";
+  const { code, out } = await runDevin(prompt);
+  clearInterval(watch);
+  await Bun.sleep(1500); // SessionEnd's POST
+  const decisions = log.filter((l) => l.startsWith("decision"));
+  if (decisions.length !== 1 || !decisions[0]!.includes('shell "touch a1.txt"')) failures.push(`expected ONE card (touch a1.txt), got: ${JSON.stringify(decisions)}`);
+  expectLog("answer allow_always");
+  if (!existsSync(join(proj, "a1.txt")) || !existsSync(join(proj, "a2.txt"))) failures.push("a1.txt / a2.txt not both created");
+  say(`a3.txt ${existsSync(join(proj, "a3.txt")) ? "EXISTS (the stop landed one tool later)" : "absent"}`);
+  if (!out.includes("Hook stop: Interrupted from Nomo")) failures.push("devin did not report the hook stop");
+  if (out.trim().endsWith("done")) failures.push("the turn finished instead of stopping");
+  let at = log.findIndex((l) => l.startsWith("flag stamped"));
+  for (const needle of ["event done done devin", "event end"]) {
+    const i = log.findIndex((l, k) => k > at && l.startsWith(needle));
+    if (i === -1) failures.push(`missing after the stamp (in order): ${needle}`); else at = i;
+  }
+  const sid = [...sessionIds][0] ?? "none";
+  for (const leftover of [`${sid}.interrupt`, `${sid}.devin-allow`]) {
+    if (existsSync(join(cc, "sessions", leftover))) failures.push(`left behind after SessionEnd: ${leftover}`);
+  }
+  say(`devin exit ${code} (a hook stop exits 1 in -p)`);
+} else if (mode === "question") {
+  await askOverAcp();
 } else {
   const prompt = "Create a file named nomo-e2e.txt containing hi, then reply done.";
-  const code = await new Promise<number>((done) => {
-    const p = spawn(process.env.DEVIN_BIN ?? "devin", ["--respect-workspace-trust=false", "-p", prompt], { cwd: proj, env, stdio: ["ignore", "pipe", "pipe"] });
-    let out = "";
-    p.stdout.on("data", (d) => { out += String(d); });
-    p.stderr.on("data", (d) => { out += String(d); });
-    const timer = setTimeout(() => p.kill("SIGINT"), 300_000);
-    p.on("exit", (c) => { clearTimeout(timer); say(`devin exit ${c} ${JSON.stringify(out.trim().slice(0, 300))}`); done(c ?? 1); });
-  });
+  const { code } = await runDevin(prompt);
   await Bun.sleep(1500); // SessionEnd's POST
   const order = ["event start working devin", "decision decisionPending devin Write", `answer ${mode}`];
   if (mode === "allow") order.push("event done done devin");
@@ -151,6 +194,16 @@ for (const name of readdirSync(join(cc, "sessions"))) {
 }
 if (existsSync(join(cc, "last-hook-claude"))) failures.push("a Claude entry did not stand down (last-hook-claude written)");
 
+// Leave no Devin session behind.
+for (const id of sessionIds) {
+  try {
+    execFileSync(process.env.DEVIN_BIN ?? "devin", ["rm", "--force", id], { cwd: proj, stdio: "ignore", timeout: 30_000 });
+    say(`devin rm ${id}`);
+  } catch {
+    failures.push(`could not delete Devin session ${id} — run: devin rm --force ${id}`);
+  }
+}
+
 server.stop(true);
 if (process.env.NOMO_E2E_KEEP !== "1") rmSync(T, { recursive: true, force: true });
 if (failures.length > 0) {
@@ -159,3 +212,83 @@ if (failures.length > 0) {
 }
 console.log(`PASS (${mode})`);
 process.exit(0);
+
+/** One `devin -p` run in the project; resolves with its exit code and combined output. */
+function runDevin(prompt: string): Promise<{ code: number; out: string }> {
+  return new Promise((done) => {
+    const p = spawn(process.env.DEVIN_BIN ?? "devin", ["--respect-workspace-trust=false", "-p", prompt], { cwd: proj, env, stdio: ["ignore", "pipe", "pipe"] });
+    let out = "";
+    p.stdout.on("data", (d) => { out += String(d); });
+    p.stderr.on("data", (d) => { out += String(d); });
+    const timer = setTimeout(() => p.kill("SIGINT"), 300_000);
+    p.on("exit", (c) => { clearTimeout(timer); say(`devin exit ${c} ${JSON.stringify(out.trim().slice(-300))}`); done({ code: c ?? 1, out }); });
+  });
+}
+
+/** Devin Desktop's transport: `devin acp` over stdio (JSON-RPC, one message per line), driven by a
+ *  minimal client that advertises form elicitation like Desktop. Devin's own question card would
+ *  arrive as `elicitation/create`; with the phone's answer it must never come. */
+async function askOverAcp(): Promise<void> {
+  const p = spawn(process.env.DEVIN_BIN ?? "devin", ["--respect-workspace-trust=false", "acp"], { cwd: proj, env, stdio: ["pipe", "pipe", "pipe"] });
+  const waiting = new Map<number, (msg: Record<string, unknown>) => void>();
+  let text = "";
+  let buf = "";
+  const send = (msg: object) => p.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", ...msg })}\n`);
+  let exited = false;
+  const call = (id: number, method: string, params: object) => new Promise<Record<string, unknown>>((resolve) => {
+    if (exited) return resolve({ error: "devin acp exited" });
+    waiting.set(id, resolve);
+    send({ id, method, params });
+  });
+  p.on("exit", (c) => {
+    exited = true;
+    say(`acp exit ${c}`);
+    for (const resolve of waiting.values()) resolve({ error: "devin acp exited" });
+    waiting.clear();
+  });
+  let stderr = "";
+  p.stderr.on("data", (d) => { stderr += String(d); });
+  p.stdout.on("data", (d) => {
+    buf += String(d);
+    for (let nl = buf.indexOf("\n"); nl !== -1; nl = buf.indexOf("\n")) {
+      const line = buf.slice(0, nl).trim();
+      buf = buf.slice(nl + 1);
+      if (!line) continue;
+      let msg: Record<string, unknown>;
+      try { msg = JSON.parse(line); } catch { continue; }
+      const params = (msg.params ?? {}) as Record<string, unknown>;
+      if (typeof msg.id === "number" && !msg.method) { waiting.get(msg.id)?.(msg); waiting.delete(msg.id); continue; }
+      if (msg.method === "session/update") {
+        const u = params.update as { sessionUpdate?: string; content?: { text?: string }; title?: string; status?: string } | undefined;
+        if (u?.sessionUpdate === "agent_message_chunk" && typeof u.content?.text === "string") text += u.content.text;
+        if (u?.sessionUpdate === "tool_call") say(`acp tool_call ${JSON.stringify(u.title ?? "")} ${u.status ?? ""}`.trimEnd());
+      } else if (msg.method === "elicitation/create") {
+        say("acp elicitation/create (Devin's own question card)");
+        send({ id: msg.id, result: { action: "cancel" } });
+      } else if (msg.method === "session/request_permission") {
+        say("acp session/request_permission");
+        send({ id: msg.id, result: { outcome: { outcome: "cancelled" } } });
+      } else if (msg.id !== undefined) {
+        send({ id: msg.id, error: { code: -32601, message: "not supported by the e2e client" } });
+      }
+    }
+  });
+  const timer = setTimeout(() => p.kill("SIGTERM"), 300_000);
+  const init = await call(1, "initialize", { protocolVersion: 1, clientCapabilities: { fs: { readTextFile: false, writeTextFile: false }, terminal: false, elicitation: { form: {} } } });
+  if (init.error) failures.push(`initialize: ${JSON.stringify(init.error)} ${stderr.slice(-300)}`);
+  const created = await call(2, "session/new", { cwd: proj, mcpServers: [] });
+  const sessionId = String((created.result as { sessionId?: unknown } | undefined)?.sessionId ?? "");
+  if (sessionId) sessionIds.add(sessionId);
+  say(`acp session ${sessionId || JSON.stringify(created.error)}`);
+  const prompt = "Use the ask_user_question tool to ask me which color I prefer, with exactly two options: Red and Blue. After I answer, reply with only the color I chose, as one word. Do not run any other tool.";
+  const done = await call(3, "session/prompt", { sessionId, prompt: [{ type: "text", text: prompt }] });
+  clearTimeout(timer);
+  say(`acp stop ${JSON.stringify((done.result as { stopReason?: unknown } | undefined)?.stopReason ?? done.error)} reply ${JSON.stringify(text.trim().slice(-200))}`);
+  p.stdin.end();
+  await new Promise((r) => { if (exited) r(null); p.on("exit", r); setTimeout(() => { p.kill("SIGTERM"); r(null); }, 5_000); });
+  await Bun.sleep(1500); // SessionEnd's POST, if any
+  expectLog("decision decisionPending devin AskUserQuestion");
+  expectLog("answer answer");
+  if (log.some((l) => l.startsWith("acp elicitation/create"))) failures.push("Devin still showed its own question card");
+  if (!/\bblue\b/i.test(text)) failures.push("the model did not use the phone's answer (Blue)");
+}
