@@ -90,6 +90,8 @@ const ENTRYPOINTS = [
   // The Devin hooks (CLI + Desktop's "Devin Local"), addressed by absolute path from
   // ~/.config/devin/config.json (see plugin/scripts/devin-install.mjs) — no shim. The status producer…
   "devin-status.ts",
+  // …and its PermissionRequest twin, the phone-approval hold.
+  "devin-approve.ts",
 ].map((f) => join(HERE, "src", "entries", f));
 
 /** The OpenCode plugin — a SECOND build pass, not another ENTRYPOINTS row, because it needs a

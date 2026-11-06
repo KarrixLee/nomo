@@ -1992,9 +1992,10 @@ export async function runPermissionHook(
       // A WORKING settle also claims a prio:0 record no hook has written since the hold began: an agent
       // whose hold never flipped the record to needsAttention (Antigravity) otherwise keeps a pre-hold
       // stamp the phone's held card outranks — the purple hand outlived an app Stop (NOM-96). Antigravity
-      // ONLY: Claude/Codex holds do flip the record, and their settle stays exactly as it was.
+      // and Devin ONLY (neither hold flips the record): Claude/Codex holds do, and their settle stays
+      // exactly as it was.
       await (deps.settleHoldRecordFn ?? defaultSettleHoldRecord())(
-        sessionId, patch, settleAsWorking && agent === "antigravity" ? holdAt : undefined);
+        sessionId, patch, settleAsWorking && (agent === "antigravity" || agent === "devin") ? holdAt : undefined);
     };
 
     // HOLD: poll until the phone answers, the request leaves "pending", sustained failure trips the

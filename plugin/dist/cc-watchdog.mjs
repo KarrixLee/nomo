@@ -8126,7 +8126,7 @@ async function runPermissionHook(deps = {}, agent = "claude") {
         attentionStalledAt: undefined,
         blob: await encryptBlob(config.e2eKey, { ...base, status: "working", at: Math.floor(settledAt / 1000) })
       } : attentionStalled ? await stalledPatch(settledAt) : { ts: settledAt, blob: fallbackBlob, attentionStalledAt: undefined };
-      await (deps.settleHoldRecordFn ?? defaultSettleHoldRecord())(sessionId, patch, settleAsWorking && agent === "antigravity" ? holdAt : undefined);
+      await (deps.settleHoldRecordFn ?? defaultSettleHoldRecord())(sessionId, patch, settleAsWorking && (agent === "antigravity" || agent === "devin") ? holdAt : undefined);
     };
     const jitter = deps.jitter ?? (() => Math.floor(Math.random() * POLL_JITTER_MAX_MS));
     const interval = deps.pollIntervalMs ?? POLL_INTERVAL_MS;
