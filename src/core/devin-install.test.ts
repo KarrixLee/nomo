@@ -94,9 +94,25 @@ describe("devin-install.mjs", () => {
     expect((await stat(b.config)).mode & 0o777).toBe(0o600);
     expect((await stat(join(b.home, ".config", "devin"))).mode & 0o777).toBe(0o700);
     // the approval command keeps a shell between Devin and the bundle (abandonment detection)
-    const pr = (await read(b.config)).hooks as Record<string, Array<{ hooks: Array<{ command: string; timeout: number }> }>>;
+    const pr = (await read(b.config)).hooks as Record<string, Array<{ matcher?: string; hooks: Array<{ command: string; timeout: number }> }>>;
     expect(pr.PermissionRequest![0]!.hooks[0]!.command).toBe(`'${b.root}/scripts/run.sh' '${b.root}/dist/devin-approve.mjs'; exit 0`);
     expect(pr.PermissionRequest![0]!.hooks[0]!.timeout).toBe(86400);
+    // Devin's question (PreToolUse ^ask_user_question$) is held by the same approval command
+    expect(pr.PreToolUse![0]).toEqual({ matcher: "^ask_user_question$", hooks: pr.PermissionRequest![0]!.hooks });
+  });
+
+  test("re-running over an older install swaps the question entry from the status to the approval command, in place", async () => {
+    const m = await mod();
+    const old = { hooks: { PreToolUse: [{ matcher: "^ask_user_question$", hooks: [{ type: "command", command: "'/r/scripts/run.sh' '/r/dist/devin-status.mjs'", timeout: 10 }] }] } };
+    expect((m.mergeHooks(old, "/r").hooks as Record<string, unknown>).PreToolUse).toEqual(m.devinHooks("/r").PreToolUse);
+  });
+
+  test("devinPluginHooks: the question entry is the approval command with the long timeout, shell kept as its parent", async () => {
+    const pre = ((await mod()).devinPluginHooks() as Record<string, Array<{ matcher?: string; hooks: Array<{ command: string; timeout: number }> }>>).PreToolUse![0]!;
+    expect(pre.matcher).toBe("^ask_user_question$");
+    expect(pre.hooks[0]!.command).toContain("devin-approve.mjs");
+    expect(pre.hooks[0]!.command).not.toContain("exec ");
+    expect(pre.hooks[0]!.timeout).toBe(86400);
   });
 
   test("foreign hooks, unknown top-level keys and their order survive install and uninstall", async () => {

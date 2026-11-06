@@ -2906,12 +2906,13 @@ export function devinSessionMeta(
 }
 
 /** Devin (CLI + Desktop's "Devin Local") — driven by Devin's Claude-shaped hooks, the Cursor recipe.
- *  The producer is core/devin.ts and the Allow/Deny hold core/devin-approval.ts; this adapter is
+ *  The producer is core/devin.ts and the phone hold (prompts + questions) core/devin-approval.ts; this adapter is
  *  reached through `adapterFor()` by the rebuild paths (watchdog correctives, LAN rollup).
  *
  *  TITLE = the first prompt (the prompt hook's seam), then Devin's own `sessions.title`, which the
  *  producer reads on later frames and `titleRepair` after the stop. INTERRUPT = the shared hook flag:
- *  the next PostToolUse prints continue:false (core/devin.ts). NO allowMode / answerExtras / discovery.
+ *  the next PostToolUse prints continue:false (core/devin.ts). ANSWER EXTRAS = both (they travel as
+ *  text in the question's block reason). NO allowMode / discovery.
  *  The not-firing detector is off (sessionMatch matches nothing): Devin keeps sessions in one sqlite
  *  file.
  *  NOT in `allAdapters` — nothing to discover. */
@@ -2933,6 +2934,8 @@ export const devinAdapter: AgentAdapter = {
   blobAgentFields: { agent: "devin" as const },
   // Phone Interrupt: the watchdog stamps `<id>.interrupt`; Devin stops after its current tool.
   interrupt: "hook-flag",
+  // Typed Other + notes ride in the question's block reason (core/devin-approval.ts).
+  answerExtras: true,
 };
 
 /** The adapter for an agent kind THIS BUILD DOES NOT KNOW — a record stamped by a newer peer install

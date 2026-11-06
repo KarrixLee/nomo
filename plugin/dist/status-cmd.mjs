@@ -3098,7 +3098,8 @@ var devinAdapter = {
   },
   toolDetail: {},
   blobAgentFields: { agent: "devin" },
-  interrupt: "hook-flag"
+  interrupt: "hook-flag",
+  answerExtras: true
 };
 function unknownAgentAdapter(kind) {
   return {
@@ -5154,7 +5155,7 @@ async function statusCmd(deps = {}) {
     sessionCount: perAgent.devin,
     detail: [
       ...devinInstall ? [["Install", devinInstall]] : [],
-      ["Mode", "sessions show on your phone; Allow/Deny for Devin's permission prompts"]
+      ["Mode", "sessions show on your phone; answer its prompts and questions, or interrupt it"]
     ],
     problems: devinHooks.problem ? [devinHooks.problem] : []
   };

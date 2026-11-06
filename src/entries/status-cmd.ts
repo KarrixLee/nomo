@@ -850,7 +850,7 @@ export async function statusCmd(deps: StatusDeps = {}): Promise<number> {
     sessionCount: perAgent.devin!,
     detail: [
       ...(devinInstall ? [["Install", devinInstall] as [string, string]] : []),
-      ["Mode", "sessions show on your phone; Allow/Deny for Devin's permission prompts"],
+      ["Mode", "sessions show on your phone; answer its prompts and questions, or interrupt it"],
     ],
     problems: devinHooks.problem ? [devinHooks.problem] : [],
   };

@@ -1254,7 +1254,7 @@ describe("statusCmd", () => {
     expect(out).toContain("Devin — you are here");
     expect(out).toContain("firing");
     expect(out).toContain("1 tracked");
-    expect(out).toContain("Allow/Deny");
+    expect(out).toContain("answer its prompts and questions, or interrupt it");
     expect(out).not.toContain("not set up here");
   });
 

@@ -9,8 +9,8 @@ import { join } from "node:path";
 import { afterAll, describe, expect, test } from "bun:test";
 import { decryptBlob, encryptBlob } from "./crypto";
 import {
-  DEVIN_APPROVAL_TIMEOUT_S, DEVIN_ENTRY_CAP_MS, DEVIN_HOLD_DEADLINE_MS, devinDecision, devinGrantFor, devinGrantMatches,
-  devinPermissionStdin, runDevinApproval,
+  DEVIN_ANSWER_REASON_MAX, DEVIN_APPROVAL_TIMEOUT_S, DEVIN_ENTRY_CAP_MS, DEVIN_HOLD_DEADLINE_MS, devinDecision, devinGrantFor,
+  devinGrantMatches, devinPermissionStdin, runDevinApproval,
 } from "./devin-approval";
 import { runDevinHook } from "./devin";
 import { devinGrantsPath, forgetDevinGrants, type Config } from "./shared";
@@ -54,8 +54,9 @@ describe("devinPermissionStdin", () => {
     expect(name("mcp__github__create_issue", {})).toBe("mcp__github__create_issue");
     expect(JSON.parse(devinPermissionStdin(payload("write", { file_path: "/w/a.ts", content: "hi" }))!).tool_input.file_path).toBe("/w/a.ts");
   });
-  test("ask_user_question and unsafe ids never hold", () => {
-    expect(devinPermissionStdin({ session_id: "s", tool_name: "ask_user_question", tool_input: {} })).toBeUndefined();
+  test("ask_user_question holds only from PreToolUse; no other PreToolUse holds; unsafe ids never hold", () => {
+    expect(devinPermissionStdin({ session_id: "s", hook_event_name: "PermissionRequest", tool_name: "ask_user_question", tool_input: {} })).toBeUndefined();
+    expect(devinPermissionStdin({ session_id: "s", hook_event_name: "PreToolUse", tool_name: "exec", tool_input: { command: "ls" } })).toBeUndefined();
     expect(devinPermissionStdin({ session_id: "../x", tool_name: "exec", tool_input: {} })).toBeUndefined();
     expect(devinPermissionStdin({ tool_name: "exec", tool_input: {} })).toBeUndefined();
     expect(devinPermissionStdin({ session_id: "s", tool_input: {} })).toBeUndefined();
@@ -286,5 +287,94 @@ describe("Always allow — session grants", () => {
     });
     expect(out).toBe('{"decision":"approve"}');
     expect(JSON.parse(await readFile(devinGrantsPath(dir, "brawny-shirt"), "utf8"))).toEqual([{ tool: "Write" }]);
+  });
+});
+
+// ── questions (ask_user_question → AskUserQuestion; the answer goes back as a block reason) ─────────
+
+const ASK = {
+  hook_event_name: "PreToolUse", session_id: "brawny-shirt", prompt_id: "p1", tool_name: "ask_user_question",
+  tool_input: { questions: [
+    { question: "Which color do you prefer?", header: "Color", options: [{ label: "Red", description: "warm" }, { label: "Blue" }] },
+    { question: "Which sizes?", options: [{ label: "S" }, { label: "M" }, { label: "L" }], multi_select: true },
+  ] },
+};
+
+describe("questions", () => {
+  test("stdin: AskUserQuestion, Claude's shape — multiSelect, missing descriptions omitted", () => {
+    const s = JSON.parse(devinPermissionStdin(ASK, "/w/api")!);
+    expect(s).toEqual({
+      session_id: "brawny-shirt", cwd: "/w/api", hook_event_name: "PermissionRequest", tool_name: "AskUserQuestion",
+      tool_input: { questions: [
+        { question: "Which color do you prefer?", header: "Color", options: [{ label: "Red", description: "warm" }, { label: "Blue" }], multiSelect: false },
+        { question: "Which sizes?", options: [{ label: "S" }, { label: "M" }, { label: "L" }], multiSelect: true },
+      ] },
+    });
+    expect(JSON.parse(devinPermissionStdin({ ...ASK, tool_input: { questions: "x" } })!).tool_input).toEqual({ questions: [] });
+  });
+
+  const hso = (decision: object) => JSON.stringify({ hookSpecificOutput: { hookEventName: "PermissionRequest", decision } });
+  const answered = (answers: Record<string, string>, annotations?: object) =>
+    hso({ behavior: "allow", updatedInput: { questions: [], answers, ...(annotations ? { annotations } : {}) } });
+  const reason = (out: string) => (JSON.parse(out) as { decision: string; reason: string });
+
+  test("an answer line → block with the answers as the reason (multi-select, typed Other, notes)", () => {
+    const out = devinDecision(answered({ "Which color do you prefer?": "Blue", "Which sizes?": "S, L" }), true);
+    expect(reason(out)).toEqual({
+      decision: "block",
+      reason: 'The user answered from their phone (Nomo): "Which color do you prefer?" → Blue; "Which sizes?" → S, L. Use these answers and continue; do not ask the same question again.',
+    });
+    expect(reason(devinDecision(answered({ "Which color do you prefer?": "teal, please" }, { "Which color do you prefer?": { notes: "for the logo" } }), true)).reason)
+      .toBe('The user answered from their phone (Nomo): "Which color do you prefer?" → teal, please (note: for the logo). Use these answers and continue; do not ask the same question again.');
+  });
+
+  test("deny → block (the note, or 'chose not to answer'); bare allow / no answers / over-long → no opinion", () => {
+    expect(reason(devinDecision(hso({ behavior: "deny", message: "skip colors" }), true)).reason).toBe("skip colors");
+    expect(reason(devinDecision(hso({ behavior: "deny", message: "Denied from phone" }), true)).reason).toContain("chose not to answer");
+    expect(devinDecision(hso({ behavior: "allow" }), true)).toBe("");
+    expect(devinDecision(answered({}), true)).toBe("");
+    expect(devinDecision(answered({ "Which color do you prefer?": "x".repeat(DEVIN_ANSWER_REASON_MAX) }), true)).toBe("");
+    expect(devinDecision(undefined, true)).toBe("");
+  });
+
+  test("through the relay: a sealed AskUserQuestion card; the phone's answer → block with the answer", async () => {
+    let clock = 1_000;
+    const hold = (fetchFn: typeof fetch) => ({
+      loadConfigFn: async () => CONFIG, readRecordFn: async () => null, sleep: async () => { clock += 3_000; },
+      now: () => clock, randomUUID: () => "req-devin", jitter: () => 0, noHoldPath: "/does/not/exist/no-hold",
+      trace: () => {}, fetchFn,
+    }) as never;
+    const ask = (fetchFn: typeof fetch) => runDevinApproval(JSON.stringify(ASK), { env: ENV, abandoned: () => false, sessionsDir: freshDir(), hold: hold(fetchFn) });
+    const answer = async (a: object) => ({ status: "answered", answerBlob: await encryptBlob(KEY, { requestId: "req-devin", ...a }) });
+
+    const w = worker(true, [{ status: "pending" }, await answer({ decision: "answer", answers: ["Blue", "S, L"] })]);
+    expect(reason(await ask(w.fn))).toEqual({
+      decision: "block",
+      reason: 'The user answered from their phone (Nomo): "Which color do you prefer?" → Blue; "Which sizes?" → S, L. Use these answers and continue; do not ask the same question again.',
+    });
+    const card = await decryptBlob(KEY, w.cards[0]!) as Record<string, unknown>;
+    expect(card).toMatchObject({ agent: "devin", status: "decisionPending", permissionToolName: "AskUserQuestion" });
+    expect(Array.isArray(card.permissionQuestions)).toBe(true);
+
+    // typed Other + a note (answerExtras: true)
+    const extras = await ask(worker(true, [await answer({ decision: "answer", answers: ["", "M"], other: ["Green", ""], notes: ["", "for kids"] })]).fn);
+    expect(reason(extras).reason).toBe('The user answered from their phone (Nomo): "Which color do you prefer?" → Green; "Which sizes?" → M (note: for kids). Use these answers and continue; do not ask the same question again.');
+
+    // a bare allow / always allow on a question is released → nothing (Devin shows its own question)
+    expect(await ask(worker(true, [await answer({ decision: "allow" })]).fn)).toBe("");
+    expect(await ask(worker(true, [await answer({ decision: "allow_always" })]).fn)).toBe("");
+    // an answer that matches no option → released
+    expect(await ask(worker(true, [await answer({ decision: "answer", answers: ["Purple", "S"] })]).fn)).toBe("");
+    // deny
+    expect(reason(await ask(worker(true, [await answer({ decision: "deny" })]).fn)).reason).toContain("chose not to answer");
+  });
+
+  test("paused approvals: the question is delegated to the producer (the yellow heads-up) and nothing printed", async () => {
+    let delegated = 0;
+    const out = await runDevinApproval(JSON.stringify(ASK), {
+      env: ENV, sessionsDir: freshDir(), delegate: async () => { delegated++; },
+      run: (async (deps: { delegate?: () => Promise<void> }) => { await deps.delegate!(); }) as never,
+    });
+    expect([delegated, out]).toEqual([1, ""]);
   });
 });

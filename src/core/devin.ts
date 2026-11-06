@@ -12,7 +12,8 @@
 //   PostToolUse                        update · working (detail thinking), keep-alive ≤ every 15 s;
 //                                      clears a needs-attention row at once;
 //                                      phone Interrupt pending → prints the stop line, done
-//   PreToolUse ^ask_user_question$     update prio 1 · needsAttention (display-only heads-up)
+//   PreToolUse ^ask_user_question$,    update prio 1 · needsAttention (devin-approve holds the question
+//     approvals paused                 for the phone and delegates here only while approvals are paused)
 //   PermissionRequest, approvals paused  update prio 1 · needsAttention (devin-approve delegates here)
 //   Stop                               done
 //   SessionEnd                         end (row retired; the session's Always-allow grants deleted)
@@ -50,7 +51,8 @@ const EVENT_KINDS: Record<string, DevinEventKind> = {
   SessionEnd: "end",
 };
 
-/** The one PreToolUse we listen to (the installer's matcher): Devin asking the user a question. */
+/** The one PreToolUse Nomo registers (the installer's matcher, on the APPROVAL hook): Devin asking the
+ *  user a question. */
 export const DEVIN_ASK_TOOL = "ask_user_question";
 
 const str = (v: unknown): string | undefined => (typeof v === "string" && v.length > 0 ? v : undefined);

@@ -2244,7 +2244,7 @@ describe("devinAdapter", () => {
     expect(devinAdapter.interrupt).toBe("hook-flag");
     expect(devinAdapter.interruptFlagSuffix).toBeUndefined(); // the shared `.interrupt`
     expect(devinAdapter.allowMode).toBeUndefined();
-    expect(devinAdapter.answerExtras).toBeUndefined();
+    expect(devinAdapter.answerExtras).toBe(true);
     expect(allAdapters).not.toContain(devinAdapter);
   });
   test("title is the prompt's display title", async () => {

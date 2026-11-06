@@ -3099,7 +3099,8 @@ var devinAdapter = {
   },
   toolDetail: {},
   blobAgentFields: { agent: "devin" },
-  interrupt: "hook-flag"
+  interrupt: "hook-flag",
+  answerExtras: true
 };
 function unknownAgentAdapter(kind) {
   return {
@@ -5913,7 +5914,6 @@ async function approvalsCommand(sub, deps = {}) {
 var DEVIN_APPROVAL_TIMEOUT_S = 86400;
 var DEVIN_HOLD_DEADLINE_MS = (DEVIN_APPROVAL_TIMEOUT_S - 600) * 1000;
 var DEVIN_ENTRY_CAP_MS = (DEVIN_APPROVAL_TIMEOUT_S - 300) * 1000;
-var DEVIN_NO_HOLD_TOOLS = new Set(["ask_user_question"]);
 var CARD_TOOL = {
   exec: "shell",
   write: "Write",
@@ -5924,18 +5924,33 @@ var CARD_TOOL = {
 var APPROVE = '{"decision":"approve"}';
 var SAFE_ID3 = /^[A-Za-z0-9_-][A-Za-z0-9._-]{0,127}$/;
 var str3 = (v) => typeof v === "string" && v.length > 0 ? v : undefined;
+var DEVIN_QUESTION_CARD_TOOL = "AskUserQuestion";
+function devinQuestionInput(toolInput) {
+  const qs = Array.isArray(toolInput.questions) ? toolInput.questions : [];
+  return {
+    questions: qs.filter((q) => typeof q === "object" && q !== null).map((q) => ({
+      question: q.question,
+      ...typeof q.header === "string" ? { header: q.header } : {},
+      options: (Array.isArray(q.options) ? q.options : []).filter((o) => typeof o === "object" && o !== null).map((o) => ({ label: o.label, ...typeof o.description === "string" ? { description: o.description } : {} })),
+      multiSelect: q.multi_select === true
+    }))
+  };
+}
 function devinPermissionStdin(input, cwd) {
   const sessionId = str3(input.session_id);
   const tool = str3(input.tool_name);
-  if (!sessionId || !SAFE_ID3.test(sessionId) || !tool || DEVIN_NO_HOLD_TOOLS.has(tool))
+  if (!sessionId || !SAFE_ID3.test(sessionId) || !tool)
+    return;
+  const isQuestion = tool === DEVIN_ASK_TOOL;
+  if (isQuestion !== (input.hook_event_name === "PreToolUse"))
     return;
   const toolInput = typeof input.tool_input === "object" && input.tool_input !== null && !Array.isArray(input.tool_input) ? input.tool_input : {};
   return JSON.stringify({
     session_id: sessionId,
     ...cwd ? { cwd } : {},
     hook_event_name: "PermissionRequest",
-    tool_name: CARD_TOOL[tool] ?? tool,
-    tool_input: toolInput
+    tool_name: isQuestion ? DEVIN_QUESTION_CARD_TOOL : CARD_TOOL[tool] ?? tool,
+    tool_input: isQuestion ? devinQuestionInput(toolInput) : toolInput
   });
 }
 var PLAIN_COMMAND = /^[A-Za-z0-9_./-]+( [^;&|`$<>(){}\n]*)?$/;
@@ -5978,11 +5993,37 @@ function grantsAlways(line) {
     return false;
   }
 }
-function devinDecision(line) {
+var DEVIN_ANSWER_REASON_MAX = 2000;
+var QUESTION_DENIED = "The user chose not to answer from their phone; continue without asking again or ask in chat.";
+function answerReason(updatedInput) {
+  const input = typeof updatedInput === "object" && updatedInput !== null ? updatedInput : {};
+  if (typeof input.answers !== "object" || input.answers === null)
+    return "";
+  const parts = Object.entries(input.answers).map(([q, a]) => {
+    const note = str3(input.annotations?.[q]?.notes);
+    return `"${q}" → ${String(a)}${note ? ` (note: ${note})` : ""}`;
+  });
+  if (parts.length === 0)
+    return "";
+  const reason = `The user answered from their phone (Nomo): ${parts.join("; ")}. Use these answers and continue; do not ask the same question again.`;
+  return reason.length <= DEVIN_ANSWER_REASON_MAX ? reason : "";
+}
+function devinDecision(line, isQuestion = false) {
   if (!line)
     return "";
   try {
     const d = JSON.parse(line).hookSpecificOutput?.decision;
+    if (isQuestion) {
+      if (d?.behavior === "allow") {
+        const reason = answerReason(d.updatedInput);
+        return reason ? JSON.stringify({ decision: "block", reason }) : "";
+      }
+      if (d?.behavior === "deny") {
+        const note = str3(d.message);
+        return JSON.stringify({ decision: "block", reason: note && note !== "Denied from phone" ? note : QUESTION_DENIED });
+      }
+      return "";
+    }
     if (d?.behavior === "allow")
       return APPROVE;
     if (d?.behavior === "deny")
@@ -6009,7 +6050,7 @@ async function runDevinApproval(raw, deps = {}) {
       return "";
     const { session_id: sessionId, tool_name: cardTool, tool_input: toolInput } = JSON.parse(stdin);
     const grantsPath = devinGrantsPath(deps.sessionsDir ?? SESSIONS_DIR, sessionId);
-    if ((await readGrants(grantsPath)).some((g) => devinGrantMatches(g, cardTool, toolInput)))
+    if (cardTool !== DEVIN_QUESTION_CARD_TOOL && (await readGrants(grantsPath)).some((g) => devinGrantMatches(g, cardTool, toolInput)))
       return APPROVE;
     let line;
     let gone = false;
@@ -6024,9 +6065,10 @@ async function runDevinApproval(raw, deps = {}) {
         line = l;
       }
     }, "devin");
-    if (grantsAlways(line))
+    const isQuestion = cardTool === DEVIN_QUESTION_CARD_TOOL;
+    if (!isQuestion && grantsAlways(line))
       await storeGrant(grantsPath, devinGrantFor(cardTool, toolInput)).catch(() => {});
-    return devinDecision(line);
+    return devinDecision(line, isQuestion);
   } catch {
     return "";
   }

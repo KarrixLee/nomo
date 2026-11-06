@@ -21,7 +21,8 @@
 //     through a live symlink; the file is re-read just before the rename and the merge re-applied if
 //     another tool wrote it in between. A file that already says what we want is not rewritten.
 //
-// The status hook observes (prints nothing). The PermissionRequest hook is the phone hold: Devin hooks
+// The status hook observes (it prints only a phone Interrupt). The PermissionRequest hook — and the
+// PreToolUse hook for Devin's `ask_user_question` — is the phone hold: Devin hooks
 // are FAIL-OPEN (no output, a crash or a timeout = Devin's own prompt). Its command ends in `; exit 0`
 // ON PURPOSE: Devin SIGKILLs the hook's direct child when it gives up, so a shell must stay between
 // Devin and the bundle for the bundle to notice (its parent pid changes) and withdraw the phone card.
@@ -54,14 +55,15 @@ const isObject = (v) => typeof v === "object" && v !== null && !Array.isArray(v)
 export function devinHooks(root) {
   const run = `'${root}/scripts/run.sh'`;
   const S = () => ({ type: "command", command: `${run} '${root}/dist/devin-status.mjs'`, timeout: STATUS_TIMEOUT });
-  const A = { type: "command", command: `${run} '${root}/dist/devin-approve.mjs'; exit 0`, timeout: APPROVAL_TIMEOUT };
+  const A = () => ({ type: "command", command: `${run} '${root}/dist/devin-approve.mjs'; exit 0`, timeout: APPROVAL_TIMEOUT });
   return {
     UserPromptSubmit: [{ hooks: [S()] }],
-    PreToolUse: [{ matcher: "^ask_user_question$", hooks: [S()] }],
+    // Devin's question: held for the phone's answer (it fires PreToolUse, never PermissionRequest).
+    PreToolUse: [{ matcher: "^ask_user_question$", hooks: [A()] }],
     PostToolUse: [{ hooks: [S()] }],
     Stop: [{ hooks: [S()] }],
     SessionEnd: [{ hooks: [S()] }],
-    PermissionRequest: [{ hooks: [A] }],
+    PermissionRequest: [{ hooks: [A()] }],
   };
 }
 
@@ -308,8 +310,8 @@ function main() {
     comments(r);
     if (VERBOSE) {
       say(`config -> ${CONFIG}`);
-      say(`status hook   -> ${join(ROOT, "dist", "devin-status.mjs")} (UserPromptSubmit, PreToolUse ask_user_question, PostToolUse, Stop, SessionEnd)`);
-      say(`approval hook -> ${join(ROOT, "dist", "devin-approve.mjs")} (PermissionRequest, timeout ${APPROVAL_TIMEOUT}s)`);
+      say(`status hook   -> ${join(ROOT, "dist", "devin-status.mjs")} (UserPromptSubmit, PostToolUse, Stop, SessionEnd)`);
+      say(`approval hook -> ${join(ROOT, "dist", "devin-approve.mjs")} (PermissionRequest, PreToolUse ask_user_question, timeout ${APPROVAL_TIMEOUT}s)`);
     }
   } catch (e) {
     fail(`could not finish — ${e?.message ?? e}`);

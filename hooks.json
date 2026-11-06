@@ -16,8 +16,8 @@
       "hooks": [
         {
           "type": "command",
-          "command": "R=\"${DEVIN_PLUGIN_ROOT:-${PLUGIN_ROOT:-}}\"; [ -n \"$R\" ] && [ -f \"$R/plugin/scripts/run.sh\" ] && exec /bin/sh \"$R/plugin/scripts/run.sh\" \"$R/plugin/dist/devin-status.mjs\" --via=devin-plugin; exit 0",
-          "timeout": 10
+          "command": "R=\"${DEVIN_PLUGIN_ROOT:-${PLUGIN_ROOT:-}}\"; [ -n \"$R\" ] && [ -f \"$R/plugin/scripts/run.sh\" ] && /bin/sh \"$R/plugin/scripts/run.sh\" \"$R/plugin/dist/devin-approve.mjs\" --via=devin-plugin; exit 0",
+          "timeout": 86400
         }
       ]
     }

@@ -20,7 +20,7 @@ needs-your-approval, done — shows up on your phone in real time, so you can st
 terminal and still know when an agent needs you or has finished. When a Claude Code, Codex,
 OpenCode, Antigravity or Devin session stops for a permission prompt or a question, you can **answer it from
 the phone** — tap Allow/Deny or pick an option and the session carries on without you at the keyboard
-(Cursor is status-only; Antigravity answers Allow/Deny for shell commands and file writes; Devin answers Allow/Deny for its permission prompts). Works with **Codex** in the terminal and the **Codex desktop app** alike.
+(Cursor is status-only; Antigravity answers Allow/Deny for shell commands and file writes; Devin answers its permission prompts and its questions). Works with **Codex** in the terminal and the **Codex desktop app** alike.
 
 Everything is **end-to-end encrypted**. Pairing is a single QR-code scan (or a short typed code);
 there is no server key to copy. All session content (titles, machine name, status, even *which* agent
@@ -595,8 +595,8 @@ reaching the phone until you leave it.
 
 **What the installer writes.** Nomo's entries go into the `"hooks"` key of `config.json`, next to your
 other Devin settings, which are left as they are: a status hook on `UserPromptSubmit`, `PostToolUse`,
-`Stop`, `SessionEnd` and `PreToolUse` (only for `ask_user_question`), and the phone-approval hook on
-`PermissionRequest`. Running it again changes nothing. If your `config.json` has comments, the
+`Stop` and `SessionEnd`, and the phone-approval hook on `PermissionRequest` and on `PreToolUse` (only
+for `ask_user_question`, Devin's question). Running it again changes nothing. If your `config.json` has comments, the
 installer first copies it to `config.json.nomo-backup`, then writes it back without the comments, and
 says so. `devin`'s `/hooks` command shows what it loaded. To remove it:
 
@@ -618,15 +618,28 @@ From the phone:
 - **Interrupt** a running turn (over your local network, like Claude Code). Devin stops after the
   step it is on; it cannot cut a command or a reply off halfway. The row reads done and the session
   takes a new prompt.
-- A question (`ask_user_question`) shows as a heads-up only, answered in Devin.
+- **Questions** (`ask_user_question`): pick an option, several, or type your own answer, with an
+  optional note. Devin has no way to take an answer from a hook, so Nomo hands it to Devin as the
+  reason for declining Devin's own question card: the model reads your answer and carries on, and the
+  Mac's transcript shows the question as **rejected**, with Nomo's text naming your answer. That is
+  expected. Deny tells Devin you chose not to answer.
+
+**Devin Desktop** (Devin Local) works like the CLI. While your phone holds a prompt or a question,
+Devin Desktop shows **no buttons of its own** for it (the same as Claude Code's terminal). To keep
+answering at the Mac, pause remote approvals on this computer before the next prompt — the
+machine-wide switch behind `/nomo-cc:approvals off`; with the installer,
+`~/.nomo/plugin/scripts/run.sh ~/.nomo/plugin/dist/cc-permission.mjs off` (`on` to resume). In
+Desktop's default **Code** mode Devin only asks for commands, web fetches and writes outside the
+project, so those are the prompts that reach the phone. **Restricted Mode** turns hooks off, and Nomo
+with them.
 
 ## Answering from your phone
 
 When a session stops for a **permission prompt** or a multiple-choice **question**, the card reaches
 the phone with its options; the answer rides back inside the same E2E-encrypted blob, so the relay
 never learns what you chose. Works for Claude Code, Codex, OpenCode, Antigravity and Devin (Antigravity:
-Allow/Deny on shell commands and file writes; Devin: Allow/Deny on its permission prompts; Cursor is
-read-only).
+Allow/Deny on shell commands and file writes; Devin: its permission prompts and its questions; Cursor
+is read-only).
 One exception: Claude Code's built-in **Computer Use** app-access dialog fires no hook that can answer
 it, so the phone shows a heads-up naming the apps (e.g. "Use iPhone Mirroring", sealed in the
 encrypted blob) with no Allow/Deny; approve it on the computer.
@@ -657,8 +670,8 @@ description is dropped before the command is.
 
 ## Hooks on your computer — security
 
-- **Devin: the status hook observes only; the approval hook can only defer, approve what you
-  approved, or deny what you denied.** Nomo's entries in `~/.config/devin/config.json` run two
+- **Devin: the status hook observes only, except to end a turn you interrupted; the approval hook can
+  only defer, approve what you approved, deny what you denied, or pass on your answer.** Nomo's entries in `~/.config/devin/config.json` run two
   bundles. The status hook prints nothing, so it can neither block a prompt nor change a tool call,
   with one exception: after you tap **Interrupt** on the phone, its next `PostToolUse` prints
   `{"continue":false,"stopReason":"Interrupted from Nomo"}`, which ends that turn (the watchdog writes
@@ -669,7 +682,10 @@ description is dropped before the command is.
   into the query). The `PermissionRequest` hook sends the tool name and its command or file path to
   the phone inside the end-to-end encrypted card, and prints `{"decision":"approve"}` only for an
   Allow sealed by your paired phone for that exact request id (`{"decision":"block"}` with your note,
-  or "Denied from phone", for a Deny). It is **fail-open**: unpaired, approvals paused, the session not
+  or "Denied from phone", for a Deny). The same hook on `PreToolUse` holds Devin's `ask_user_question`:
+  the questions and options go to the phone inside the encrypted card, and your sealed answer comes
+  back as `{"decision":"block","reason":"The user answered from their phone (Nomo): …"}`, which Devin's
+  model reads as your answer (a Deny is a block saying you chose not to answer). It is **fail-open**: unpaired, approvals paused, the session not
   on your phone, offline, the request expiring, a crash or a timeout all print nothing, which leaves
   the decision to Devin's own prompt. **An Always allow tap is remembered for that Devin session
   only, on this computer, and is forgotten when the session ends** (or when Nomo retires its row after

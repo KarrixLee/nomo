@@ -21,6 +21,6 @@ Present the block as-is; do not summarise or re-order it. Any line beginning wit
 problem and the `→` line under it is the fix — read those out. It always exits 0 — "NOT PAIRED" is
 information, not an error; if the user isn't paired, suggest `/nomo:pair`.
 
-Devin sessions show as working / needs you / done on the phone, and Devin's permission prompts can be
-answered there with Allow or Deny. A question Devin asks you (`ask_user_question`) is a heads-up only,
-answered in Devin.
+Devin sessions show as working / needs you / done on the phone. From the phone the user can answer
+Devin's permission prompts (Allow, Always allow for this session, Deny), answer the questions Devin
+asks (`ask_user_question`), and interrupt a running turn (Devin stops after its current step).

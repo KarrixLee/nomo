@@ -3392,7 +3392,8 @@ var devinAdapter = {
   },
   toolDetail: {},
   blobAgentFields: { agent: "devin" },
-  interrupt: "hook-flag"
+  interrupt: "hook-flag",
+  answerExtras: true
 };
 function unknownAgentAdapter(kind) {
   return {
