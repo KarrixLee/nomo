@@ -87,6 +87,9 @@ const ENTRYPOINTS = [
   "antigravity-status.ts",
   // Its PreToolUse twin: the phone-approval hold, run by plugin/scripts/antigravity-approve.sh.
   "antigravity-approve.ts",
+  // The Devin hooks (CLI + Desktop's "Devin Local"), addressed by absolute path from
+  // ~/.config/devin/config.json (see plugin/scripts/devin-install.mjs) — no shim. The status producer…
+  "devin-status.ts",
 ].map((f) => join(HERE, "src", "entries", f));
 
 /** The OpenCode plugin — a SECOND build pass, not another ENTRYPOINTS row, because it needs a
