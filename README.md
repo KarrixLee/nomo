@@ -565,6 +565,9 @@ When a session stops for a **permission prompt** or a multiple-choice **question
 the phone with its options; the answer rides back inside the same E2E-encrypted blob, so the relay
 never learns what you chose. Works for Claude Code, Codex, OpenCode and Antigravity (Antigravity:
 Allow/Deny on shell commands and file writes; Cursor is read-only).
+One exception: Claude Code's built-in **Computer Use** app-access dialog fires no hook that can answer
+it, so the phone shows a heads-up naming the apps (e.g. "Use iPhone Mirroring", sealed in the
+encrypted blob) with no Allow/Deny; approve it on the computer.
 `/nomo-cc:approvals` (or `$nomo-approvals`, `/nomo-approvals` in OpenCode and Antigravity) is the local off switch when your
 phone is away — one switch, machine-wide.
 
