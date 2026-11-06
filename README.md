@@ -14,19 +14,19 @@
 <a href="https://apps.apple.com/app/nomo-ai-status-usage/id6779366830"><img src="assets/app-store-badge.svg" height="48" alt="Download Nomo on the App Store"></a>
 </p>
 
-Mirror your **Claude Code**, **OpenAI Codex**, **OpenCode**, **Cursor** and **Antigravity** session milestones to
+Mirror your **Claude Code**, **OpenAI Codex**, **OpenCode**, **Cursor**, **Antigravity** and **Devin** session milestones to
 the **Nomo iPhone app** as a Live Activity (Dynamic Island). A session's status — working,
 needs-your-approval, done — shows up on your phone in real time, so you can step away from the
 terminal and still know when an agent needs you or has finished. When a Claude Code, Codex,
-OpenCode or Antigravity session stops for a permission prompt or a question, you can **answer it from
+OpenCode, Antigravity or Devin session stops for a permission prompt or a question, you can **answer it from
 the phone** — tap Allow/Deny or pick an option and the session carries on without you at the keyboard
-(Cursor is status-only; Antigravity answers Allow/Deny for shell commands and file writes). Works with **Codex** in the terminal and the **Codex desktop app** alike.
+(Cursor is status-only; Antigravity answers Allow/Deny for shell commands and file writes; Devin answers Allow/Deny for its permission prompts). Works with **Codex** in the terminal and the **Codex desktop app** alike.
 
 Everything is **end-to-end encrypted**. Pairing is a single QR-code scan (or a short typed code);
 there is no server key to copy. All session content (titles, machine name, status, even *which* agent
 produced an event) rides **inside** an encrypted blob, so the relay Worker that fans out the APNs
 push is a blind relay and never sees plaintext. **One pairing covers every agent** on a machine —
-Claude Code, Codex, OpenCode, Cursor and Antigravity share the same credentials, encryption key, watchdog, and
+Claude Code, Codex, OpenCode, Cursor, Antigravity and Devin share the same credentials, encryption key, watchdog, and
 Live Activity.
 
 > [!NOTE]
@@ -138,7 +138,7 @@ In plain English:
 bunx nomo-ai     # or: npx nomo-ai
 ```
 
-It detects which of Claude Code, Codex, OpenCode, Cursor and Antigravity are on this machine, shows exactly what
+It detects which of Claude Code, Codex, OpenCode, Cursor, Antigravity and Devin are on this machine, shows exactly what
 it will run for each, and lets you toggle the list before anything happens. Then it drives **each
 host's own install path** — the same four flows spelled out below — and prints the restart-and-pair
 step for each one it installed.
@@ -156,11 +156,11 @@ For scripting and CI:
 
 | Flag | |
 |---|---|
-| `--claude` `--codex` `--opencode` `--cursor` `--antigravity` | install exactly these — naming any one of them skips the prompt |
-| `--all` | all of them, detected or not — except Cursor and Antigravity, which are skipped with a note when they are not on this machine (name `--cursor` / `--antigravity` to try anyway) |
+| `--claude` `--codex` `--opencode` `--cursor` `--antigravity` `--devin` | install exactly these — naming any one of them skips the prompt |
+| `--all` | all of them, detected or not — except Cursor, Antigravity and Devin, which are skipped with a note when they are not on this machine (name `--cursor` / `--antigravity` / `--devin` to try anyway) |
 | `-y`, `--yes` | no prompt; install everything detected |
 | `-n`, `--dry-run` | print the commands, run nothing |
-| `--ref <branch\|tag>` | **OpenCode, Cursor and Antigravity only** — install from that ref instead of the default branch |
+| `--ref <branch\|tag>` | **OpenCode, Cursor, Antigravity and Devin only** — install from that ref instead of the default branch |
 | `-h`, `--help` / `-v`, `--version` | |
 
 With no flags and no terminal to ask, it refuses rather than guessing. Every failure names the step,
@@ -559,12 +559,46 @@ node ~/.nomo/plugin/scripts/antigravity-install.mjs --uninstall
 
 which deletes only the `"nomo"` block and the `nomo` plugin folder Nomo installed. Pairing is untouched.
 
+## Install — Devin
+
+One install covers the **Devin CLI** and Devin Desktop's **Devin Local** agent — both read the
+`"hooks"` key of `~/.config/devin/config.json`.
+
+```sh
+bunx nomo-ai --devin     # or, from a checkout: node plugin/scripts/devin-install.mjs
+```
+
+**Restart devin** (and Devin Desktop). Already paired from another agent? Nothing else to do. Otherwise
+pair from a terminal (Devin has no `/nomo-*` commands yet):
+
+```sh
+~/.nomo/plugin/scripts/run.sh ~/.nomo/plugin/dist/pair.mjs
+```
+
+**What the installer writes.** Nomo's entries go into the `"hooks"` key of `config.json`, next to your
+other Devin settings, which are left as they are: a status hook on `UserPromptSubmit`, `PostToolUse`,
+`Stop`, `SessionEnd` and `PreToolUse` (only for `ask_user_question`), and the phone-approval hook on
+`PermissionRequest`. Running it again changes nothing. If your `config.json` has comments, the
+installer first copies it to `config.json.nomo-backup`, then writes it back without the comments, and
+says so. `devin`'s `/hooks` command shows what it loaded. To remove it:
+
+```sh
+node ~/.nomo/plugin/scripts/devin-install.mjs --uninstall
+```
+
+which removes only Nomo's entries. Pairing is untouched.
+
+A Devin row shows working → needs you → done like the other agents, with Devin's own session title.
+A permission prompt reaches the phone as **Allow / Deny / Deny with note** (no Always allow); a
+question (`ask_user_question`) shows as a heads-up only, answered in Devin.
+
 ## Answering from your phone
 
 When a session stops for a **permission prompt** or a multiple-choice **question**, the card reaches
 the phone with its options; the answer rides back inside the same E2E-encrypted blob, so the relay
-never learns what you chose. Works for Claude Code, Codex, OpenCode and Antigravity (Antigravity:
-Allow/Deny on shell commands and file writes; Cursor is read-only).
+never learns what you chose. Works for Claude Code, Codex, OpenCode, Antigravity and Devin (Antigravity:
+Allow/Deny on shell commands and file writes; Devin: Allow/Deny on its permission prompts; Cursor is
+read-only).
 One exception: Claude Code's built-in **Computer Use** app-access dialog fires no hook that can answer
 it, so the phone shows a heads-up naming the apps (e.g. "Use iPhone Mirroring", sealed in the
 encrypted blob) with no Allow/Deny; approve it on the computer.
@@ -594,6 +628,24 @@ model, so Nomo treats it as a caption: it is kept short, and when the card runs 
 description is dropped before the command is.
 
 ## Hooks on your computer — security
+
+- **Devin: the status hook observes only; the approval hook can only defer, approve what you
+  approved, or deny what you denied.** Nomo's entries in `~/.config/devin/config.json` run two
+  bundles. The status hook prints nothing, so it can neither block a prompt nor change a tool call;
+  from each event it reads only `session_id`, `prompt_id`, the event and tool names, the first
+  prompt (for the title) and `DEVIN_PROJECT_DIR`, and from Devin's `sessions.db` only that session's
+  `title`, `model` and `working_directory`, read-only (the id must be a plain slug before it is put
+  into the query). The `PermissionRequest` hook sends the tool name and its command or file path to
+  the phone inside the end-to-end encrypted card, and prints `{"decision":"approve"}` only for an
+  Allow sealed by your paired phone for that exact request id (`{"decision":"block"}` with your note,
+  or "Denied from phone", for a Deny). It is **fail-open**: unpaired, approvals paused, the session not
+  on your phone, offline, the request expiring, a crash or a timeout all print nothing, which leaves
+  the decision to Devin's own prompt. Always allow is never offered (an older phone that sends it gets
+  a one-time approve). If Devin stops waiting (its timeout, Ctrl-C, the session ending), the hook
+  notices its parent shell is gone, withdraws the phone's card and exits. Nomo's Claude Code hooks stand
+  down inside Devin (Devin also runs `~/.claude` hooks), so a Devin session never shows up as a
+  Claude Code row and never gets its prompts answered by them. The installer writes only its own
+  entries; remove them with `node ~/.nomo/plugin/scripts/devin-install.mjs --uninstall`.
 
 - **Antigravity: status hooks observe only, except to end a turn you interrupted or to hand over a
   message you sent; the approval hook

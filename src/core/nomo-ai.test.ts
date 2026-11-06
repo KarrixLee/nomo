@@ -123,3 +123,65 @@ describe("runtime floor (CVE-2026-111497): a warning, never a block", () => {
     expect(await withBun("1.4.4")).not.toContain("CVE-2026-111497");
   });
 });
+
+describe("bunx nomo-ai --devin", () => {
+  async function nomoAi(flags: string[], setup: (home: string, bin: string) => Promise<void> = async () => {}): Promise<{ code: number; out: string }> {
+    const home = await mkdtemp(join(tmpdir(), "nomo-ai-devin-"));
+    homes.push(home);
+    const bin = join(home, "bin");
+    await mkdir(bin, { recursive: true });
+    for (const name of ["claude", "codex"]) await writeFile(join(bin, name), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    await setup(home, bin);
+    const proc = spawnTestProcess({
+      cmd: [Bun.which("node")!, NOMO_AI, ...flags],
+      cwd: home,
+      env: isolatedTestEnv(home, { NO_COLOR: "1", PATH: `${bin}:/usr/bin:/bin` }),
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [out, err] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
+    return { code: await proc.exited, out: `${out}${err}` };
+  }
+
+  test("--devin is a known flag and appears in --help with its uninstall line", async () => {
+    const help = await nomoAi(["--help"]);
+    expect(help.out).toContain("--devin");
+    expect(help.out).toContain("node ~/.nomo/plugin/scripts/devin-install.mjs --uninstall");
+    const r = await nomoAi(["--dry-run", "--devin"]);
+    expect(r.out).not.toContain("unknown");
+    expect(r.code).toBe(0);
+  });
+
+  test("--dry-run plan names the clone + devin-install.mjs, and the pair command for Devin-only users", async () => {
+    const r = await nomoAi(["--dry-run", "--devin"]);
+    expect(r.out).toContain("git clone --depth 1 https://github.com/KarrixLee/nomo.git");
+    expect(r.out).toContain(".nomo/plugin/scripts/devin-install.mjs");
+    expect(r.out).not.toContain("claude plugin");
+  });
+
+  test("detect: devin on PATH or ~/.config/devin exists; skipped under --all when undetected", async () => {
+    const none = await nomoAi(["--dry-run", "--all"]);
+    expect(none.out).toContain("Devin was not found on this machine — skipped");
+    expect(none.out).not.toContain("devin-install.mjs");
+    expect(none.code).toBe(0);
+    const onPath = await nomoAi(["--dry-run", "--all"], async (_h, bin) => { await writeFile(join(bin, "devin"), "#!/bin/sh\nexit 0\n", { mode: 0o755 }); });
+    expect(onPath.out).toContain("devin-install.mjs");
+    const dir = await nomoAi(["--dry-run", "--all"], async (home) => { await mkdir(join(home, ".config", "devin"), { recursive: true }); });
+    expect(dir.out).toContain("devin-install.mjs");
+  });
+
+  test("installed() reads the devin-status.mjs marker from ~/.config/devin/config.json", async () => {
+    const r = await nomoAi(["--dry-run", "--devin"], async (home) => {
+      await mkdir(join(home, ".config", "devin"), { recursive: true });
+      await writeFile(join(home, ".config", "devin", "config.json"), JSON.stringify({ hooks: { Stop: [{ hooks: [{ type: "command", command: "'/r/scripts/run.sh' '/r/dist/devin-status.mjs'" }] }] } }));
+    });
+    expect(r.out).toContain("already installed");
+    expect(r.out).toContain("config.json");
+  });
+
+  test("--ref note lists Devin among the pinned agents", async () => {
+    const r = await nomoAi(["--dry-run", "--devin", "--ref", "dev"]);
+    expect(r.out).toContain("(OpenCode, Cursor, Antigravity, Devin) only");
+    expect(r.out).not.toContain("None of them is selected");
+  });
+});
