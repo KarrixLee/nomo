@@ -9,11 +9,11 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { decryptBlob } from "./crypto";
 import { CURSOR_KEEPALIVE_MS } from "./cursor";
 import {
-  DevinHookDeps, devinEventKind, devinInstallerActive, devinOwnerPid, devinPluginInstalled, devinPluginStandsDown,
+  DEVIN_INTERRUPT_LINE, DevinHookDeps, devinEventKind, devinInstallerActive, devinOwnerPid, devinPluginInstalled, devinPluginStandsDown,
   planDevin, runDevinHook,
 } from "./devin";
 import { createProcessHygiene, isolatedTestEnv } from "../test/process-hygiene";
-import { Config, readRecord, SessionRecord } from "./shared";
+import { Config, interruptFlagSetAt, readRecord, SessionRecord, writeInterruptFlagAt } from "./shared";
 
 const KEY = new Uint8Array(32).fill(7);
 const CONFIG: Config = { url: "https://example.invalid", pairingId: "pairing-1", pcSecret: "secret", e2eKey: KEY };
@@ -168,6 +168,57 @@ describe("runDevinHook", () => {
     await h.fire(ev("UserPromptSubmit", { prompt: "hi" }));
     await h.fire(ev("UserPromptSubmit", { prompt: "again", prompt_id: "p2" }));
     expect(reads).toBe(0);
+  });
+});
+
+describe("runDevinHook — phone Interrupt", () => {
+  async function interruptHarness() {
+    const printed: string[] = [];
+    const traces: Record<string, unknown>[] = [];
+    const h = await harness({ print: async (l) => { printed.push(l); }, trace: (e) => traces.push(e as Record<string, unknown>) });
+    return { ...h, printed, traces, flag: () => writeInterruptFlagAt(h.sessionsDir, SID, h.clock.now), flagged: () => interruptFlagSetAt(h.sessionsDir, SID, h.clock.now) };
+  }
+
+  test("flag + PostToolUse → the stop line, the row planned DONE (no Stop follows), the flag kept for a sibling tool", async () => {
+    const h = await interruptHarness();
+    await h.fire(ev("UserPromptSubmit", { prompt: "touch three files" }));
+    await h.flag();
+    await h.fire(ev("PostToolUse", { tool_name: "exec" }));
+    expect(DEVIN_INTERRUPT_LINE).toBe('{"continue":false,"stopReason":"Interrupted from Nomo"}');
+    expect(h.printed).toEqual([DEVIN_INTERRUPT_LINE]);
+    expect(h.posts.at(-1)).toMatchObject({ op: "done" });
+    expect(await h.lastBlob()).toMatchObject({ status: "done", agent: "devin" });
+    expect(await h.record()).toMatchObject({ op: "done", lastEvent: "done" });
+    expect(h.traces).toContainEqual({ event: "interrupt", sessionId: SID, agent: "devin", result: "stopped" });
+    expect(await h.flagged()).toBe(true);
+    // a parallel tool from the same message stops too, without a second done frame
+    const posted = h.posts.length;
+    await h.fire(ev("PostToolUse", { tool_name: "exec" }));
+    expect(h.printed).toHaveLength(2);
+    expect(h.posts).toHaveLength(posted);
+  });
+
+  test("a prompt, Stop or SessionEnd clears the flag; no flag → nothing printed", async () => {
+    const h = await interruptHarness();
+    await h.fire(ev("UserPromptSubmit", { prompt: "go" }));
+    h.clock.now += 20_000;
+    await h.fire(ev("PostToolUse", { tool_name: "exec" }));
+    expect(h.printed).toEqual([]);
+    expect(await h.lastBlob()).toMatchObject({ status: "working" });
+    for (const name of ["UserPromptSubmit", "Stop", "SessionEnd"]) {
+      await h.flag();
+      await h.fire(ev(name, { prompt: "next" }));
+      expect({ name, flagged: await h.flagged() }).toEqual({ name, flagged: false });
+    }
+    expect(h.printed).toEqual([]);
+  });
+
+  test("the line is printed even unpaired (the flag only exists if the watchdog stamped it)", async () => {
+    const h = await interruptHarness();
+    await h.flag();
+    await h.fire(ev("PostToolUse", { tool_name: "exec" }), { config: null });
+    expect(h.printed).toEqual([DEVIN_INTERRUPT_LINE]);
+    expect(h.posts).toHaveLength(0);
   });
 });
 

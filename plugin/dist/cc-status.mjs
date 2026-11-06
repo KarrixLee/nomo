@@ -3088,7 +3088,8 @@ var devinAdapter = {
     resolve: (sessionId) => devinSessionMeta(sessionId).title
   },
   toolDetail: {},
-  blobAgentFields: { agent: "devin" }
+  blobAgentFields: { agent: "devin" },
+  interrupt: "hook-flag"
 };
 function unknownAgentAdapter(kind) {
   return {

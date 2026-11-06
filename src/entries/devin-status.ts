@@ -3,8 +3,10 @@
 // plugin/scripts/devin-install.mjs, or by the native Devin plugin (repo-root hooks.json, which adds
 // `--via=devin-plugin`). The whole implementation is core/devin.ts.
 //
-// Contract with Devin: read the event JSON on stdin, print NOTHING, exit 0 — always. No stdout means no
-// decision, no context injection, no input rewrite: this hook observes and can never steer or block.
+// Contract with Devin: read the event JSON on stdin, exit 0 — always. It prints NOTHING, with one
+// exception: a PostToolUse while the phone's Interrupt flag is set prints
+// `{"continue":false,"stopReason":"Interrupted from Nomo"}` (core/devin.ts), which ends the turn after
+// that tool. It never returns a decision, injects context or rewrites input.
 // PORTABILITY: bun AND node >= 18 — no `Bun.*` APIs.
 
 import { devinPluginStandsDown, runDevinHook } from "../core/devin";

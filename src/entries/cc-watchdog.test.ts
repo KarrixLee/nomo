@@ -4136,6 +4136,20 @@ describe("drainCommands (authenticate, validate, then execute)", () => {
       expect(traces[0]).toMatchObject({ agent: "antigravity", result: "interrupt-flagged" });
     });
 
+    test("a Devin session gets the shared hook flag (its PostToolUse hook prints continue:false)", async () => {
+      const { traces, deps } = harness();
+      const flagged: string[] = [];
+      const cmd = await sealed({ kind: "interrupt-session" });
+      await drainCommands(cfg(), {
+        ...deps,
+        take: () => [cmd],
+        readRecords: async () => [running({ agent: "devin" })],
+        writeInterruptFlagFn: async (sessionId) => { flagged.push(sessionId); },
+      });
+      expect(flagged).toEqual(["sess-a"]);
+      expect(traces[0]).toMatchObject({ agent: "devin", result: "interrupt-flagged" });
+    });
+
     test("a Codex session is interrupted through the bridge with the record's own turn id", async () => {
       const { traces, deps } = harness();
       const calls: Array<[string, string]> = [];

@@ -2910,9 +2910,10 @@ export function devinSessionMeta(
  *  reached through `adapterFor()` by the rebuild paths (watchdog correctives, LAN rollup).
  *
  *  TITLE = the first prompt (the prompt hook's seam), then Devin's own `sessions.title`, which the
- *  producer reads on later frames and `titleRepair` after the stop. NO interrupt / allowMode /
- *  answerExtras / discovery: the phone offers Allow / Deny / Deny with note only. The not-firing
- *  detector is off (sessionMatch matches nothing): Devin keeps sessions in one sqlite file.
+ *  producer reads on later frames and `titleRepair` after the stop. INTERRUPT = the shared hook flag:
+ *  the next PostToolUse prints continue:false (core/devin.ts). NO allowMode / answerExtras / discovery.
+ *  The not-firing detector is off (sessionMatch matches nothing): Devin keeps sessions in one sqlite
+ *  file.
  *  NOT in `allAdapters` — nothing to discover. */
 export const devinAdapter: AgentAdapter = {
   kind: "devin",
@@ -2930,6 +2931,8 @@ export const devinAdapter: AgentAdapter = {
   },
   toolDetail: {},
   blobAgentFields: { agent: "devin" as const },
+  // Phone Interrupt: the watchdog stamps `<id>.interrupt`; Devin stops after its current tool.
+  interrupt: "hook-flag",
 };
 
 /** The adapter for an agent kind THIS BUILD DOES NOT KNOW — a record stamped by a newer peer install

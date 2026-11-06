@@ -2238,10 +2238,11 @@ describe("devinHostInvocation", () => {
 });
 
 describe("devinAdapter", () => {
-  test("adapterFor('devin') is devinAdapter and stamps agent:devin; no interrupt/allowMode; not discovered", () => {
+  test("adapterFor('devin') is devinAdapter and stamps agent:devin; hook-flag interrupt, no allowMode; not discovered", () => {
     expect(adapterFor("devin")).toBe(devinAdapter);
     expect(devinAdapter.blobAgentFields).toEqual({ agent: "devin" });
-    expect(devinAdapter.interrupt).toBeUndefined();
+    expect(devinAdapter.interrupt).toBe("hook-flag");
+    expect(devinAdapter.interruptFlagSuffix).toBeUndefined(); // the shared `.interrupt`
     expect(devinAdapter.allowMode).toBeUndefined();
     expect(devinAdapter.answerExtras).toBeUndefined();
     expect(allAdapters).not.toContain(devinAdapter);

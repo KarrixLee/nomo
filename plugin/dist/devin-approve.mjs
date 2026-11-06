@@ -3089,7 +3089,8 @@ var devinAdapter = {
     resolve: (sessionId) => devinSessionMeta(sessionId).title
   },
   toolDetail: {},
-  blobAgentFields: { agent: "devin" }
+  blobAgentFields: { agent: "devin" },
+  interrupt: "hook-flag"
 };
 function unknownAgentAdapter(kind) {
   return {
@@ -4525,6 +4526,18 @@ function resolveOwnerPid2() {
   const pids = [process.ppid, ...pidAncestors(process.ppid)];
   return devinOwnerPid(pids.map((pid) => ({ pid, command: pidCommand(pid) })));
 }
+var DEVIN_INTERRUPT_LINE = JSON.stringify({ continue: false, stopReason: INTERRUPT_STOP_REASON });
+function printLine(line) {
+  return new Promise((resolve) => {
+    process.stdout.on("error", () => resolve());
+    try {
+      process.stdout.write(`${line}
+`, () => resolve());
+    } catch {
+      resolve();
+    }
+  });
+}
 async function runDevinHook(raw, deps = {}) {
   try {
     const parsed = JSON.parse(raw);
@@ -4541,14 +4554,22 @@ async function runDevinHook(raw, deps = {}) {
     const sessionId = str2(input.session_id);
     if (!kind || !sessionId || !SAFE_ID2.test(sessionId))
       return;
+    const sessionsDir = deps.sessionsDir ?? SESSIONS_DIR;
+    let interrupted = false;
+    if (kind === "prompt" || kind === "stop" || kind === "end") {
+      await clearInterruptFlagAt(sessionsDir, sessionId);
+    } else if (kind === "tool" && await interruptFlagSetAt(sessionsDir, sessionId, now)) {
+      interrupted = true;
+      await (deps.print ?? printLine)(DEVIN_INTERRUPT_LINE);
+      (deps.trace ?? traceSession)({ event: "interrupt", sessionId, agent: "devin", result: "stopped" });
+    }
     const config = deps.config !== undefined ? deps.config : await loadConfig();
     if (!config)
       return;
-    const sessionsDir = deps.sessionsDir ?? SESSIONS_DIR;
     const record = await readRecord(sessionId, sessionsDir);
     if (record && record.agent !== "devin")
       return;
-    const plan = planDevin(kind, input, record, now);
+    const plan = planDevin(interrupted ? "stop" : kind, input, record, now);
     if (!plan)
       return;
     const meta = kind === "prompt" || kind === "end" ? {} : (deps.sessionMeta ?? devinSessionMeta)(sessionId);
@@ -4564,7 +4585,7 @@ async function runDevinHook(raw, deps = {}) {
       if (pid !== CURSOR_UNKNOWN_OWNER_PID && !pidAlive(pid))
         pid = CURSOR_UNKNOWN_OWNER_PID;
     }
-    const hookEventName = str2(input.hook_event_name) ?? kind;
+    const hookEventName = interrupted ? "Stop" : str2(input.hook_event_name) ?? kind;
     const envelope = await buildEnvelope({ session_id: sessionId, ...cwd ? { cwd } : {}, hook_event_name: hookEventName }, machine, now, title, config.e2eKey, false, "devin", startedAt, plan.turnStartedAt, folder, model, { op: plan.op, prio: plan.prio, status: plan.status });
     if (!envelope)
       return;

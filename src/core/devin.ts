@@ -10,24 +10,32 @@
 //   SessionStart                       not registered (only a prompt creates a row)
 //   UserPromptSubmit                   start (no row yet) / update · working, new turn anchor
 //   PostToolUse                        update · working (detail thinking), keep-alive ≤ every 15 s;
-//                                      clears a needs-attention row at once
+//                                      clears a needs-attention row at once;
+//                                      phone Interrupt pending → prints the stop line, done
 //   PreToolUse ^ask_user_question$     update prio 1 · needsAttention (display-only heads-up)
 //   PermissionRequest, approvals paused  update prio 1 · needsAttention (devin-approve delegates here)
 //   Stop                               done
 //   SessionEnd                         end (row retired)
 //
-// THE CONTRACT WITH DEVIN: observe only. This process prints nothing (so it can never return a
-// decision, block a prompt or rewrite a tool call), always exits 0 and swallows every error. Devin
-// waits for UserPromptSubmit, so that path does no sqlite read and at most one awaited 2 s POST.
+// THE CONTRACT WITH DEVIN: observe, with ONE exception. This process prints nothing (so it can never
+// return a decision, block a prompt or rewrite a tool call), always exits 0 and swallows every error.
+// Devin waits for UserPromptSubmit, so that path does no sqlite read and at most one awaited 2 s POST.
+//
+// THE EXCEPTION — PHONE INTERRUPT (devinAdapter.interrupt = "hook-flag"; verified devin 3000.11.234,
+// docs/devin-spike-2026-11-07.md): the watchdog stamps `<sessions>/<id>.interrupt`, and the next
+// PostToolUse prints exactly `{"continue":false,"stopReason":"Interrupted from Nomo"}`. Devin ends the
+// turn right after that tool, fires NO Stop (so that PostToolUse is reported as the done), and the
+// session stays resumable. `{"stop":…}` is ignored by Devin. The flag is not consumed (a parallel tool
+// in the same message must stop too); a prompt, Stop or SessionEnd clears it.
 
 import { existsSync, readFileSync } from "node:fs";
 import { hostname } from "node:os";
 import { devinAdapter, devinSessionMeta } from "./adapter";
 import { CURSOR_KEEPALIVE_MS, CURSOR_UNKNOWN_OWNER_PID } from "./cursor";
-import { buildEnvelope, markDoneDeliveredAt, OpPlan, trackSessionAt } from "./hook";
+import { buildEnvelope, INTERRUPT_STOP_REASON, markDoneDeliveredAt, OpPlan, trackSessionAt } from "./hook";
 import {
-  atomicWrite, Config, devinConfigDir, ensureWatchdog, folderIdentity, lastHookPath, loadConfig, pidAlive, pidAncestors,
-  pidCommand, readRecord, SESSIONS_DIR, SessionRecord, traceSession,
+  atomicWrite, clearInterruptFlagAt, Config, devinConfigDir, ensureWatchdog, folderIdentity, lastHookPath, loadConfig, pidAlive, pidAncestors,
+  interruptFlagSetAt, pidCommand, readRecord, SESSIONS_DIR, SessionRecord, traceSession,
 } from "./shared";
 import { postOcEvent } from "../opencode/state";
 
@@ -179,9 +187,23 @@ export interface DevinHookDeps {
   post?: (config: Config, envelope: Record<string, unknown>) => Promise<boolean>;
   ensureWatchdog?: () => void;
   trace?: (event: object) => void;
+  /** Writes the interrupt line to stdout (resolves once flushed, or on a closed pipe). */
+  print?: (line: string) => Promise<void>;
 }
 
-/** One hook invocation, start to finish. Never throws, never prints. */
+/** The PostToolUse line that ends a Devin turn (spike D). */
+export const DEVIN_INTERRUPT_LINE = JSON.stringify({ continue: false, stopReason: INTERRUPT_STOP_REASON });
+
+/** Awaited so the line is flushed before the entry's process.exit. With the reader gone node raises
+ *  EPIPE as an unhandled stream 'error' (exit 1); the listener turns that into "done" instead. */
+function printLine(line: string): Promise<void> {
+  return new Promise<void>((resolve) => {
+    process.stdout.on("error", () => resolve());
+    try { process.stdout.write(`${line}\n`, () => resolve()); } catch { resolve(); }
+  });
+}
+
+/** One hook invocation, start to finish. Never throws; prints only the phone-interrupt line. */
 export async function runDevinHook(raw: string, deps: DevinHookDeps = {}): Promise<void> {
   try {
     const parsed: unknown = JSON.parse(raw);
@@ -198,15 +220,27 @@ export async function runDevinHook(raw: string, deps: DevinHookDeps = {}): Promi
     const kind = devinEventKind(input);
     const sessionId = str(input.session_id);
     if (!kind || !sessionId || !SAFE_ID.test(sessionId)) return;
+    const sessionsDir = deps.sessionsDir ?? SESSIONS_DIR;
+
+    // PHONE INTERRUPT, before every other gate and any network call. A turn boundary retires the flag
+    // so it can never reach the next turn.
+    let interrupted = false;
+    if (kind === "prompt" || kind === "stop" || kind === "end") {
+      await clearInterruptFlagAt(sessionsDir, sessionId);
+    } else if (kind === "tool" && await interruptFlagSetAt(sessionsDir, sessionId, now)) {
+      interrupted = true;
+      await (deps.print ?? printLine)(DEVIN_INTERRUPT_LINE);
+      (deps.trace ?? traceSession)({ event: "interrupt", sessionId, agent: "devin", result: "stopped" });
+    }
 
     const config = deps.config !== undefined ? deps.config : await loadConfig();
     if (!config) return; // not paired → inert
 
-    const sessionsDir = deps.sessionsDir ?? SESSIONS_DIR;
     const record = await readRecord(sessionId, sessionsDir);
     if (record && record.agent !== "devin") return; // another agent's row is not ours to rewrite
 
-    const plan = planDevin(kind, input, record, now);
+    // An interrupted turn gets no Stop hook, so the tool event that stopped it stands in for one.
+    const plan = planDevin(interrupted ? "stop" : kind, input, record, now);
     if (!plan) return;
 
     // Devin's own title/model, only on frames that are going out anyway after the prompt — never on
@@ -229,7 +263,7 @@ export async function runDevinHook(raw: string, deps: DevinHookDeps = {}): Promi
 
     // An allow-listed input, NOT the payload: the id, the folder, and the event name (so PostToolUse
     // seals detail "thinking"). tool_input / prompt never reach buildBlob.
-    const hookEventName = str(input.hook_event_name) ?? kind;
+    const hookEventName = interrupted ? "Stop" : str(input.hook_event_name) ?? kind;
     const envelope = await buildEnvelope(
       { session_id: sessionId, ...(cwd ? { cwd } : {}), hook_event_name: hookEventName }, machine, now, title,
       config.e2eKey, false, "devin", startedAt, plan.turnStartedAt, folder, model,
