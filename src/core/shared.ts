@@ -2205,6 +2205,21 @@ export async function clearInterruptFlagAt(
   await unlink(`${sessionsDir}/${interruptFlagFileName(sessionId, suffix)}`).catch(() => {});
 }
 
+/** A Devin session's "Always allow" grants (core/devin-approval.ts). A sibling file, and NOT `.json`, so
+ *  no SESSIONS_DIR reader mistakes it for a session row. */
+export const DEVIN_GRANTS_SUFFIX = ".devin-allow";
+
+export function devinGrantsPath(sessionsDir: string, sessionId: string): string {
+  return `${sessionsDir}/${sessionId}${DEVIN_GRANTS_SUFFIX}`;
+}
+
+/** Forget the Devin grants of the session whose RECORD is at `recordPath` (`<dir>/<id>.json`): the row
+ *  is being retired, and a grant must never outlive it into a later session that reuses the slug.
+ *  Best-effort; a no-op for every other agent (no such file). */
+export async function forgetDevinGrants(recordPath: string): Promise<void> {
+  if (recordPath.endsWith(".json")) await unlink(`${recordPath.slice(0, -5)}${DEVIN_GRANTS_SUFFIX}`).catch(() => {});
+}
+
 export async function settleDecisionHoldRecord(
   sessionId: string, patch: Partial<SessionRecord>, heldSince?: number,
 ): Promise<void> {

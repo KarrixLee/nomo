@@ -965,6 +965,14 @@ async function interruptFlagSetAt(sessionsDir, sessionId, now, maxAgeMs = INTERR
 async function clearInterruptFlagAt(sessionsDir, sessionId, suffix = INTERRUPT_FLAG_SUFFIX) {
   await unlink(`${sessionsDir}/${interruptFlagFileName(sessionId, suffix)}`).catch(() => {});
 }
+var DEVIN_GRANTS_SUFFIX = ".devin-allow";
+function devinGrantsPath(sessionsDir, sessionId) {
+  return `${sessionsDir}/${sessionId}${DEVIN_GRANTS_SUFFIX}`;
+}
+async function forgetDevinGrants(recordPath) {
+  if (recordPath.endsWith(".json"))
+    await unlink(`${recordPath.slice(0, -5)}${DEVIN_GRANTS_SUFFIX}`).catch(() => {});
+}
 async function settleDecisionHoldRecord(sessionId, patch, heldSince) {
   return settleDecisionHoldRecordAt(SESSIONS_DIR, sessionId, patch, heldSince);
 }
@@ -3129,6 +3137,7 @@ var allAdapters = [claudeAdapter, codexAdapter];
 
 // src/core/devin.ts
 import { existsSync as existsSync3, readFileSync as readFileSync2 } from "node:fs";
+import { unlink as unlink4 } from "node:fs/promises";
 import { hostname as hostname3 } from "node:os";
 
 // src/core/cursor.ts
@@ -4562,6 +4571,8 @@ async function runDevinHook(raw, deps = {}) {
     let interrupted = false;
     if (kind === "prompt" || kind === "stop" || kind === "end") {
       await clearInterruptFlagAt(sessionsDir, sessionId);
+      if (kind === "end")
+        await unlink4(devinGrantsPath(sessionsDir, sessionId)).catch(() => {});
     } else if (kind === "tool" && await interruptFlagSetAt(sessionsDir, sessionId, now)) {
       interrupted = true;
       await (deps.print ?? printLine)(DEVIN_INTERRUPT_LINE);

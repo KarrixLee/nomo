@@ -3,6 +3,7 @@ var __require = /* @__PURE__ */ createRequire(import.meta.url);
 
 // src/core/devin.ts
 import { existsSync as existsSync3, readFileSync as readFileSync2 } from "node:fs";
+import { unlink as unlink4 } from "node:fs/promises";
 import { hostname as hostname3 } from "node:os";
 
 // src/core/adapter.ts
@@ -964,6 +965,14 @@ async function interruptFlagSetAt(sessionsDir, sessionId, now, maxAgeMs = INTERR
 }
 async function clearInterruptFlagAt(sessionsDir, sessionId, suffix = INTERRUPT_FLAG_SUFFIX) {
   await unlink(`${sessionsDir}/${interruptFlagFileName(sessionId, suffix)}`).catch(() => {});
+}
+var DEVIN_GRANTS_SUFFIX = ".devin-allow";
+function devinGrantsPath(sessionsDir, sessionId) {
+  return `${sessionsDir}/${sessionId}${DEVIN_GRANTS_SUFFIX}`;
+}
+async function forgetDevinGrants(recordPath) {
+  if (recordPath.endsWith(".json"))
+    await unlink(`${recordPath.slice(0, -5)}${DEVIN_GRANTS_SUFFIX}`).catch(() => {});
 }
 async function settleDecisionHoldRecord(sessionId, patch, heldSince) {
   return settleDecisionHoldRecordAt(SESSIONS_DIR, sessionId, patch, heldSince);
@@ -4558,6 +4567,8 @@ async function runDevinHook(raw, deps = {}) {
     let interrupted = false;
     if (kind === "prompt" || kind === "stop" || kind === "end") {
       await clearInterruptFlagAt(sessionsDir, sessionId);
+      if (kind === "end")
+        await unlink4(devinGrantsPath(sessionsDir, sessionId)).catch(() => {});
     } else if (kind === "tool" && await interruptFlagSetAt(sessionsDir, sessionId, now)) {
       interrupted = true;
       await (deps.print ?? printLine)(DEVIN_INTERRUPT_LINE);
@@ -4603,8 +4614,11 @@ async function runDevinHook(raw, deps = {}) {
   } catch {}
 }
 
+// src/core/devin-approval.ts
+import { readFile as readFile6 } from "node:fs/promises";
+
 // src/core/permission.ts
-import { readFile as readFile5, realpath, unlink as unlink4 } from "node:fs/promises";
+import { readFile as readFile5, realpath, unlink as unlink5 } from "node:fs/promises";
 import { appendFileSync as appendFileSync2, statSync as statSync3, truncateSync as truncateSync2 } from "node:fs";
 import { hostname as hostname4 } from "node:os";
 import { basename as basename5, isAbsolute as isAbsolute3, relative, resolve as resolve3 } from "node:path";
@@ -5887,7 +5901,7 @@ async function approvalsCommand(sub, deps = {}) {
     return 0;
   }
   if (sub === "on") {
-    await unlink4(path).catch(() => {});
+    await unlink5(path).catch(() => {});
     print("Remote approvals are ON for this computer — when a session is on your phone's Live Activity, its permission prompts are sent to the phone to Allow or Deny.");
     return 0;
   }
@@ -5907,6 +5921,7 @@ var CARD_TOOL = {
   read: "Read",
   webfetch: "WebFetch"
 };
+var APPROVE = '{"decision":"approve"}';
 var SAFE_ID3 = /^[A-Za-z0-9_-][A-Za-z0-9._-]{0,127}$/;
 var str3 = (v) => typeof v === "string" && v.length > 0 ? v : undefined;
 function devinPermissionStdin(input, cwd) {
@@ -5923,13 +5938,53 @@ function devinPermissionStdin(input, cwd) {
     tool_input: toolInput
   });
 }
+var PLAIN_COMMAND = /^[A-Za-z0-9_./-]+( [^;&|`$<>(){}\n]*)?$/;
+var commandOf = (toolInput) => typeof toolInput.command === "string" ? toolInput.command : "";
+function devinGrantFor(cardTool, toolInput) {
+  if (cardTool !== "shell")
+    return { tool: cardTool };
+  const command = commandOf(toolInput);
+  return PLAIN_COMMAND.test(command) ? { tool: "shell", prefix: command.split(" ", 1)[0] } : { tool: "shell", exact: command };
+}
+function devinGrantMatches(grant, cardTool, toolInput) {
+  if (grant.tool !== cardTool)
+    return false;
+  if (cardTool !== "shell")
+    return true;
+  const command = commandOf(toolInput);
+  if (typeof grant.exact === "string")
+    return command === grant.exact;
+  return typeof grant.prefix === "string" && grant.prefix.length > 0 && PLAIN_COMMAND.test(command) && (command === grant.prefix || command.startsWith(`${grant.prefix} `));
+}
+async function readGrants(path) {
+  try {
+    const list = JSON.parse(await readFile6(path, "utf8"));
+    return Array.isArray(list) ? list.filter((g) => typeof g === "object" && g !== null && typeof g.tool === "string") : [];
+  } catch {
+    return [];
+  }
+}
+async function storeGrant(path, grant) {
+  const grants = await readGrants(path);
+  if (grants.some((g) => JSON.stringify(g) === JSON.stringify(grant)))
+    return;
+  await atomicWrite(path, JSON.stringify([...grants, grant]), 384);
+}
+function grantsAlways(line) {
+  try {
+    const d = JSON.parse(line ?? "").hookSpecificOutput?.decision;
+    return d?.behavior === "allow" && Array.isArray(d.updatedPermissions) && d.updatedPermissions.length > 0;
+  } catch {
+    return false;
+  }
+}
 function devinDecision(line) {
   if (!line)
     return "";
   try {
     const d = JSON.parse(line).hookSpecificOutput?.decision;
     if (d?.behavior === "allow")
-      return '{"decision":"approve"}';
+      return APPROVE;
     if (d?.behavior === "deny")
       return JSON.stringify({ decision: "block", reason: str3(d.message) ?? "Denied from phone" });
   } catch {}
@@ -5952,6 +6007,10 @@ async function runDevinApproval(raw, deps = {}) {
     const stdin = devinPermissionStdin(parsed, str3(env.DEVIN_PROJECT_DIR));
     if (!stdin)
       return "";
+    const { session_id: sessionId, tool_name: cardTool, tool_input: toolInput } = JSON.parse(stdin);
+    const grantsPath = devinGrantsPath(deps.sessionsDir ?? SESSIONS_DIR, sessionId);
+    if ((await readGrants(grantsPath)).some((g) => devinGrantMatches(g, cardTool, toolInput)))
+      return APPROVE;
     let line;
     let gone = false;
     const abandoned = () => gone ||= (deps.abandoned ?? defaultAbandoned)();
@@ -5965,6 +6024,8 @@ async function runDevinApproval(raw, deps = {}) {
         line = l;
       }
     }, "devin");
+    if (grantsAlways(line))
+      await storeGrant(grantsPath, devinGrantFor(cardTool, toolInput)).catch(() => {});
     return devinDecision(line);
   } catch {
     return "";

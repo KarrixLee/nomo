@@ -2,16 +2,27 @@
 // translation, and runs through the REAL shared relay (runPermissionHook) with a scripted worker.
 // Nothing here touches the network or the real Nomo state dir.
 
-import { describe, expect, test } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { readFile, stat } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterAll, describe, expect, test } from "bun:test";
 import { decryptBlob, encryptBlob } from "./crypto";
 import {
-  DEVIN_APPROVAL_TIMEOUT_S, DEVIN_ENTRY_CAP_MS, DEVIN_HOLD_DEADLINE_MS, devinDecision, devinPermissionStdin, runDevinApproval,
+  DEVIN_APPROVAL_TIMEOUT_S, DEVIN_ENTRY_CAP_MS, DEVIN_HOLD_DEADLINE_MS, devinDecision, devinGrantFor, devinGrantMatches,
+  devinPermissionStdin, runDevinApproval,
 } from "./devin-approval";
-import type { Config } from "./shared";
+import { runDevinHook } from "./devin";
+import { devinGrantsPath, forgetDevinGrants, type Config } from "./shared";
 
 const KEY = new Uint8Array(32).fill(7);
 const CONFIG: Config = { url: "https://relay.invalid", pairingId: "pairing-1", pcSecret: "secret", e2eKey: KEY };
 const ENV = { DEVIN_PROJECT_DIR: "/w/api" };
+/** Every run gets a private sessions dir: grants must never touch the real Nomo state dir. */
+const TMP = mkdtempSync(join(tmpdir(), "nomo-devin-approval-"));
+afterAll(() => rmSync(TMP, { recursive: true, force: true }));
+let dirN = 0;
+const freshDir = () => join(TMP, `s${dirN++}`);
 const payload = (tool_name: string, tool_input: Record<string, unknown>) =>
   ({ hook_event_name: "PermissionRequest", session_id: "brawny-shirt", prompt_id: "p1", tool_use_id: "t1", tool_name, tool_input });
 const EXEC = payload("exec", { command: "rm -rf build" });
@@ -55,7 +66,7 @@ describe("runDevinApproval — seams", () => {
   test("passes agent 'devin', a deadline, and returns the translated line", async () => {
     let seen: { agent?: string; deadlineAt?: number; stdin?: string } = {};
     const out = await runDevinApproval(JSON.stringify(EXEC), {
-      env: ENV, hold: { now: () => 5_000 },
+      env: ENV, sessionsDir: freshDir(), hold: { now: () => 5_000 },
       run: (async (deps: { deadlineAt?: number; readInput?: () => Promise<string>; emit?: (l: string) => void }, agent: string) => {
         seen = { agent, deadlineAt: deps.deadlineAt, stdin: await deps.readInput!() };
         deps.emit!(JSON.stringify({ hookSpecificOutput: { hookEventName: "PermissionRequest", decision: { behavior: "allow" } } }));
@@ -70,7 +81,7 @@ describe("runDevinApproval — seams", () => {
   test("paused approvals delegate to the producer and print nothing", async () => {
     let delegated = 0;
     const out = await runDevinApproval(JSON.stringify(EXEC), {
-      env: ENV, delegate: async () => { delegated++; },
+      env: ENV, sessionsDir: freshDir(), delegate: async () => { delegated++; },
       run: (async (deps: { delegate?: () => Promise<void> }) => { await deps.delegate!(); }) as never,
     });
     expect(delegated).toBe(1);
@@ -79,7 +90,7 @@ describe("runDevinApproval — seams", () => {
 
   test("abandoned hold prints nothing", async () => {
     const out = await runDevinApproval(JSON.stringify(EXEC), {
-      env: ENV, abandoned: () => true,
+      env: ENV, sessionsDir: freshDir(), abandoned: () => true,
       run: (async (deps: { abandoned?: () => boolean; emit?: (l: string) => void }) => {
         if (!deps.abandoned!()) deps.emit!("{}");
       }) as never,
@@ -90,11 +101,11 @@ describe("runDevinApproval — seams", () => {
   test("outside Devin (no DEVIN_PROJECT_DIR) → no hold at all; junk / a throwing relay → no opinion", async () => {
     let started = false;
     const run = (async () => { started = true; }) as never;
-    expect(await runDevinApproval(JSON.stringify(EXEC), { env: {}, run })).toBe("");
+    expect(await runDevinApproval(JSON.stringify(EXEC), { env: {}, run, sessionsDir: TMP })).toBe("");
     expect(started).toBe(false);
-    for (const raw of ["", "garbage", "[]", "null"]) expect(await runDevinApproval(raw, { env: ENV, run })).toBe("");
+    for (const raw of ["", "garbage", "[]", "null"]) expect(await runDevinApproval(raw, { env: ENV, run, sessionsDir: TMP })).toBe("");
     expect(started).toBe(false);
-    expect(await runDevinApproval(JSON.stringify(EXEC), { env: ENV, run: (async () => { throw new Error("boom"); }) as never })).toBe("");
+    expect(await runDevinApproval(JSON.stringify(EXEC), { env: ENV, sessionsDir: TMP, run: (async () => { throw new Error("boom"); }) as never })).toBe("");
   });
 
   test("timeouts nest strictly inside the hook timeout", () => {
@@ -130,7 +141,7 @@ describe("runDevinApproval — through the shared relay", () => {
   });
   const answered = async (answer: object) => ({ status: "answered", answerBlob: await encryptBlob(KEY, { requestId: "req-devin", ...answer }) });
   const run = (deps: Record<string, unknown>, input: object = EXEC, extra: Record<string, unknown> = {}) =>
-    runDevinApproval(JSON.stringify(input), { env: ENV, abandoned: () => false, hold: hold(deps) as never, ...extra });
+    runDevinApproval(JSON.stringify(input), { env: ENV, abandoned: () => false, hold: hold(deps) as never, sessionsDir: freshDir(), ...extra });
 
   test("phone Allow → approve; the card is a sealed agent:devin decisionPending shell card", async () => {
     const w = worker(true, [{ status: "pending" }, await answered({ decision: "allow" })]);
@@ -178,5 +189,102 @@ describe("runDevinApproval — through the shared relay", () => {
     expect(out).toBe("");
     expect(w.calls).toContain("POST /v1/cc/decision/resolve");
     expect(patches.at(-1)).toMatchObject({ lastEvent: "working", op: "update", prio: 0 });
+  });
+});
+
+describe("Always allow — session grants", () => {
+  const sh = (command: string) => ({ command });
+  test("grant derivation: a plain command grants its name; operators, substitutions, env prefixes → the exact text", () => {
+    expect(devinGrantFor("shell", sh("touch one.txt"))).toEqual({ tool: "shell", prefix: "touch" });
+    expect(devinGrantFor("shell", sh("bun"))).toEqual({ tool: "shell", prefix: "bun" });
+    expect(devinGrantFor("shell", sh("./build.sh --fast"))).toEqual({ tool: "shell", prefix: "./build.sh" });
+    for (const c of ["touch a && rm -rf ~", "echo $(id)", "ls > out", "cat a | sh", "echo `id`", "a; b", "FOO=1 make", "x\ny", "(ls)"]) {
+      expect(devinGrantFor("shell", sh(c))).toEqual({ tool: "shell", exact: c });
+    }
+    expect(devinGrantFor("Write", { file_path: "/w/a.ts" })).toEqual({ tool: "Write" });
+    expect(devinGrantFor("mcp__github__create_issue", {})).toEqual({ tool: "mcp__github__create_issue" });
+  });
+
+  test("matching: word-complete name prefix, plain commands only; exact grants; whole-tool grants", () => {
+    const touch = { tool: "shell", prefix: "touch" };
+    expect(devinGrantMatches(touch, "shell", sh("touch two.txt"))).toBe(true);
+    expect(devinGrantMatches(touch, "shell", sh("touch"))).toBe(true);
+    expect(devinGrantMatches(touch, "shell", sh("touchy x"))).toBe(false);
+    expect(devinGrantMatches(touch, "shell", sh("touch x && echo y"))).toBe(false);
+    expect(devinGrantMatches(touch, "shell", sh("touch $(rm -rf ~)"))).toBe(false);
+    expect(devinGrantMatches(touch, "Write", { file_path: "/x" })).toBe(false);
+    const exact = { tool: "shell", exact: "ls | wc -l" };
+    expect(devinGrantMatches(exact, "shell", sh("ls | wc -l"))).toBe(true);
+    expect(devinGrantMatches(exact, "shell", sh("ls | wc -c"))).toBe(false);
+    expect(devinGrantMatches({ tool: "Write" }, "Write", { file_path: "/anything" })).toBe(true);
+    expect(devinGrantMatches({ tool: "shell" }, "shell", sh("ls"))).toBe(false); // a malformed grant matches nothing
+  });
+
+  const hso = (decision: object) => JSON.stringify({ hookSpecificOutput: { hookEventName: "PermissionRequest", decision } });
+  const ALWAYS = hso({ behavior: "allow", updatedPermissions: [{ type: "addRules", rules: [{ toolName: "shell" }], behavior: "allow", destination: "session" }] });
+  const scripted = (line: string | undefined, calls: { n: number }) => (async (deps: { emit?: (l: string) => void }) => {
+    calls.n++;
+    if (line !== undefined) deps.emit!(line);
+  }) as never;
+  const req = (command: string) => JSON.stringify(payload("exec", { command }));
+
+  test("allow_always stores the grant (0600) and approves; the next matching request short-circuits without the relay", async () => {
+    const dir = freshDir();
+    const calls = { n: 0 };
+    expect(await runDevinApproval(req("touch one.txt"), { env: ENV, sessionsDir: dir, run: scripted(ALWAYS, calls) })).toBe('{"decision":"approve"}');
+    const path = devinGrantsPath(dir, "brawny-shirt");
+    expect(JSON.parse(await readFile(path, "utf8"))).toEqual([{ tool: "shell", prefix: "touch" }]);
+    expect((await stat(path)).mode & 0o777).toBe(0o600);
+    expect(await runDevinApproval(req("touch two.txt"), { env: ENV, sessionsDir: dir, run: scripted(undefined, calls) })).toBe('{"decision":"approve"}');
+    expect(calls.n).toBe(1); // no hold, no card, not even the pause gate
+    // a chained command still goes to the phone (and no answer → no opinion)
+    expect(await runDevinApproval(req("touch x && echo y"), { env: ENV, sessionsDir: dir, run: scripted(undefined, calls) })).toBe("");
+    expect(calls.n).toBe(2);
+    // another session never inherits it
+    const other = JSON.stringify({ ...payload("exec", { command: "touch z" }), session_id: "other-slug" });
+    expect(await runDevinApproval(other, { env: ENV, sessionsDir: dir, run: scripted(undefined, calls) })).toBe("");
+    expect(calls.n).toBe(3);
+  });
+
+  test("plain allow, allow_mode and deny store nothing", async () => {
+    const dir = freshDir();
+    const calls = { n: 0 };
+    for (const line of [hso({ behavior: "allow" }), hso({ behavior: "deny", message: "no" }), undefined]) {
+      await runDevinApproval(req("touch one.txt"), { env: ENV, sessionsDir: dir, run: scripted(line, calls) });
+    }
+    expect(await stat(devinGrantsPath(dir, "brawny-shirt")).then(() => true, () => false)).toBe(false);
+  });
+
+  test("SessionEnd and the watchdog's record retirement delete the grant file", async () => {
+    const dir = freshDir();
+    await runDevinApproval(req("touch one.txt"), { env: ENV, sessionsDir: dir, run: scripted(ALWAYS, { n: 0 }) });
+    const path = devinGrantsPath(dir, "brawny-shirt");
+    const exists = () => stat(path).then(() => true, () => false);
+    expect(await exists()).toBe(true);
+    await runDevinHook(JSON.stringify({ hook_event_name: "SessionEnd", session_id: "brawny-shirt" }), {
+      env: ENV, sessionsDir: dir, config: null, stampPath: join(dir, "stamp"),
+    });
+    expect(await exists()).toBe(false);
+    await runDevinApproval(req("touch one.txt"), { env: ENV, sessionsDir: dir, run: scripted(ALWAYS, { n: 0 }) });
+    await forgetDevinGrants(join(dir, "brawny-shirt.json"));
+    expect(await exists()).toBe(false);
+  });
+
+  test("through the relay: a phone Always allow on a Write grants Write for the session", async () => {
+    let clock = 1_000;
+    const dir = freshDir();
+    const answered = { status: "answered", answerBlob: await encryptBlob(KEY, { requestId: "req-devin", decision: "allow_always" }) };
+    const w = worker(true, [answered]);
+    const write = JSON.stringify(payload("write", { file_path: "/w/a.ts", content: "x" }));
+    const out = await runDevinApproval(write, {
+      env: ENV, abandoned: () => false, sessionsDir: dir,
+      hold: {
+        loadConfigFn: async () => CONFIG, readRecordFn: async () => null, sleep: async () => { clock += 3_000; },
+        now: () => clock, randomUUID: () => "req-devin", jitter: () => 0, noHoldPath: "/does/not/exist/no-hold",
+        trace: () => {}, fetchFn: w.fn,
+      } as never,
+    });
+    expect(out).toBe('{"decision":"approve"}');
+    expect(JSON.parse(await readFile(devinGrantsPath(dir, "brawny-shirt"), "utf8"))).toEqual([{ tool: "Write" }]);
   });
 });

@@ -25,11 +25,22 @@
 // `abandoned`). A SIGTERM/SIGHUP (a closed terminal) is honoured too.
 //
 // tool_input keys (verified): exec → command; write → file_path, content. edit/read use file_path
-// (Devin's EditInput/ReadInput), webfetch url. "ALWAYS ALLOW" IS NOT OFFERED (the phone's matrix);
-// an old phone that sends allow_always / allow_mode anyway gets a plain approve.
+// (Devin's EditInput/ReadInput), webfetch url. `allow_mode` is a plain approve (no allowMode).
+//
+// ALWAYS ALLOW IS NOMO-SIDE (spikes A/B): a hook can only approve/block ONE call (Devin has no
+// `updatedPermissions`), and a rule written into Devin's config only applies from the NEXT session. So an
+// Always-allow tap stores a grant in `<sessions>/<id>.devin-allow` (0600) and the next matching request
+// in that session is approved at once, without the phone — even while approvals are paused (an explicit
+// grant, like a Claude Code session rule). Scope mirrors Devin's own "(this session)" option: a plain
+// shell command grants its command NAME (word-complete, `touch` ≠ `touchy`); a command with any shell
+// operator, substitution or redirect grants only that exact text, and only a plain command can ever
+// match a name grant, so `touch a && rm -rf ~` always goes to the phone. Any other tool is granted whole.
+// The grant is deleted on SessionEnd and when the watchdog retires the row.
 
+import { readFile } from "node:fs/promises";
 import { runDevinHook } from "./devin";
 import { runPermissionHook, type PermissionHookDeps } from "./permission";
+import { atomicWrite, devinGrantsPath, SESSIONS_DIR } from "./shared";
 
 export const DEVIN_APPROVAL_TIMEOUT_S = 86_400;
 export const DEVIN_HOLD_DEADLINE_MS = (DEVIN_APPROVAL_TIMEOUT_S - 600) * 1000;
@@ -48,6 +59,7 @@ const CARD_TOOL: Record<string, string> = {
   webfetch: "WebFetch",
 };
 
+const APPROVE = '{"decision":"approve"}';
 const SAFE_ID = /^[A-Za-z0-9_-][A-Za-z0-9._-]{0,127}$/;
 const str = (v: unknown): string | undefined => (typeof v === "string" && v.length > 0 ? v : undefined);
 
@@ -68,14 +80,75 @@ export function devinPermissionStdin(input: Record<string, unknown>, cwd?: strin
   });
 }
 
+// ── Always allow (session grants) ───────────────────────────────────────────────────────────────
+
+export interface DevinGrant { tool: string; prefix?: string; exact?: string }
+
+/** A plain command: a name, then arguments with no shell operator, substitution, redirect or newline.
+ *  ponytail: a regex, not a shell parser — anything it is unsure of is not plain (asks the phone).
+ *  Upgrade path: Devin's own commandNames, if it ever reaches hooks. */
+const PLAIN_COMMAND = /^[A-Za-z0-9_./-]+( [^;&|`$<>(){}\n]*)?$/;
+
+const commandOf = (toolInput: Record<string, unknown>): string =>
+  typeof toolInput.command === "string" ? toolInput.command : "";
+
+/** The grant an Always-allow tap makes for this card tool + input. Pure. */
+export function devinGrantFor(cardTool: string, toolInput: Record<string, unknown>): DevinGrant {
+  if (cardTool !== "shell") return { tool: cardTool };
+  const command = commandOf(toolInput);
+  return PLAIN_COMMAND.test(command) ? { tool: "shell", prefix: command.split(" ", 1)[0] } : { tool: "shell", exact: command };
+}
+
+/** Does `grant` cover this request? Pure. */
+export function devinGrantMatches(grant: DevinGrant, cardTool: string, toolInput: Record<string, unknown>): boolean {
+  if (grant.tool !== cardTool) return false;
+  if (cardTool !== "shell") return true;
+  const command = commandOf(toolInput);
+  if (typeof grant.exact === "string") return command === grant.exact;
+  return typeof grant.prefix === "string" && grant.prefix.length > 0 && PLAIN_COMMAND.test(command)
+    && (command === grant.prefix || command.startsWith(`${grant.prefix} `));
+}
+
+async function readGrants(path: string): Promise<DevinGrant[]> {
+  try {
+    const list: unknown = JSON.parse(await readFile(path, "utf8"));
+    return Array.isArray(list)
+      ? list.filter((g): g is DevinGrant => typeof g === "object" && g !== null && typeof (g as DevinGrant).tool === "string")
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+/** Append one grant (deduped). ponytail: read-modify-write, so two Always-allow taps landing in the same
+ *  instant can drop one (that prompt just asks again); add a lock if that ever shows up. */
+async function storeGrant(path: string, grant: DevinGrant): Promise<void> {
+  const grants = await readGrants(path);
+  if (grants.some((g) => JSON.stringify(g) === JSON.stringify(grant))) return;
+  await atomicWrite(path, JSON.stringify([...grants, grant]), 0o600);
+}
+
+/** Did the phone answer Always allow? Only allowAlwaysLine carries `updatedPermissions` for Devin
+ *  (devinAdapter has no allowMode). */
+function grantsAlways(line: string | undefined): boolean {
+  try {
+    const d = (JSON.parse(line ?? "") as { hookSpecificOutput?: { decision?: { behavior?: unknown; updatedPermissions?: unknown } } })
+      .hookSpecificOutput?.decision;
+    return d?.behavior === "allow" && Array.isArray(d.updatedPermissions) && d.updatedPermissions.length > 0;
+  } catch {
+    return false;
+  }
+}
+
 /** runPermissionHook's emitted line → Devin's decision; "" = no opinion (print nothing). Every allow
- *  variant (allow / allow_always / allow_mode all emit behavior "allow") is a plain approve. */
+ *  variant (allow / allow_always / allow_mode all emit behavior "allow") is an approve; the
+ *  Always-allow grant is stored by the caller. */
 export function devinDecision(line: string | undefined): string {
   if (!line) return "";
   try {
     const d = (JSON.parse(line) as { hookSpecificOutput?: { decision?: { behavior?: unknown; message?: unknown } } })
       .hookSpecificOutput?.decision;
-    if (d?.behavior === "allow") return '{"decision":"approve"}';
+    if (d?.behavior === "allow") return APPROVE;
     if (d?.behavior === "deny") return JSON.stringify({ decision: "block", reason: str(d.message) ?? "Denied from phone" });
   } catch { /* fall through */ }
   return "";
@@ -90,6 +163,8 @@ export interface DevinApprovalDeps {
   /** Has Devin given up on this hook (tests)? Default: SIGTERM seen, or our parent pid changed. */
   abandoned?: () => boolean;
   env?: Record<string, string | undefined>;
+  /** Where the session grants live (tests). Default: SESSIONS_DIR. */
+  sessionsDir?: string;
 }
 
 /** Set by the entry's SIGTERM/SIGHUP handler. */
@@ -107,6 +182,11 @@ export async function runDevinApproval(raw: string, deps: DevinApprovalDeps = {}
     if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return "";
     const stdin = devinPermissionStdin(parsed as Record<string, unknown>, str(env.DEVIN_PROJECT_DIR));
     if (!stdin) return "";
+    const { session_id: sessionId, tool_name: cardTool, tool_input: toolInput } =
+      JSON.parse(stdin) as { session_id: string; tool_name: string; tool_input: Record<string, unknown> };
+    // An Always-allow grant answers at once — before the pause gate and before any phone card.
+    const grantsPath = devinGrantsPath(deps.sessionsDir ?? SESSIONS_DIR, sessionId);
+    if ((await readGrants(grantsPath)).some((g) => devinGrantMatches(g, cardTool, toolInput))) return APPROVE;
     let line: string | undefined;
     let gone = false;
     const abandoned = () => (gone ||= (deps.abandoned ?? defaultAbandoned)());
@@ -118,6 +198,7 @@ export async function runDevinApproval(raw: string, deps: DevinApprovalDeps = {}
       readInput: async () => stdin,
       emit: (l) => { line = l; },
     }, "devin");
+    if (grantsAlways(line)) await storeGrant(grantsPath, devinGrantFor(cardTool, toolInput)).catch(() => {});
     return devinDecision(line);
   } catch {
     return "";

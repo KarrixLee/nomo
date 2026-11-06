@@ -963,6 +963,14 @@ async function interruptFlagSetAt(sessionsDir, sessionId, now, maxAgeMs = INTERR
 async function clearInterruptFlagAt(sessionsDir, sessionId, suffix = INTERRUPT_FLAG_SUFFIX) {
   await unlink(`${sessionsDir}/${interruptFlagFileName(sessionId, suffix)}`).catch(() => {});
 }
+var DEVIN_GRANTS_SUFFIX = ".devin-allow";
+function devinGrantsPath(sessionsDir, sessionId) {
+  return `${sessionsDir}/${sessionId}${DEVIN_GRANTS_SUFFIX}`;
+}
+async function forgetDevinGrants(recordPath) {
+  if (recordPath.endsWith(".json"))
+    await unlink(`${recordPath.slice(0, -5)}${DEVIN_GRANTS_SUFFIX}`).catch(() => {});
+}
 async function settleDecisionHoldRecord(sessionId, patch, heldSince) {
   return settleDecisionHoldRecordAt(SESSIONS_DIR, sessionId, patch, heldSince);
 }
@@ -11194,6 +11202,7 @@ async function retireDoneStale(config, path, sessionId, record, now, deps = {}) 
       });
     } else {
       await deleteRecord(path);
+      await forgetDevinGrants(path);
     }
     const verdict = outcome === "delivered" ? "retired" : "retired-offline";
     breadcrumb(verdict, tuiPid);
@@ -11583,6 +11592,7 @@ async function sweep(config, deps = {}) {
     try {
       await unlink6(path);
     } catch {}
+    await forgetDevinGrants(path);
   }
   if (config !== null && greetDelivered)
     greetedPairingId = config.pairingId;

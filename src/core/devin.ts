@@ -15,7 +15,7 @@
 //   PreToolUse ^ask_user_question$     update prio 1 · needsAttention (display-only heads-up)
 //   PermissionRequest, approvals paused  update prio 1 · needsAttention (devin-approve delegates here)
 //   Stop                               done
-//   SessionEnd                         end (row retired)
+//   SessionEnd                         end (row retired; the session's Always-allow grants deleted)
 //
 // THE CONTRACT WITH DEVIN: observe, with ONE exception. This process prints nothing (so it can never
 // return a decision, block a prompt or rewrite a tool call), always exits 0 and swallows every error.
@@ -29,12 +29,13 @@
 // in the same message must stop too); a prompt, Stop or SessionEnd clears it.
 
 import { existsSync, readFileSync } from "node:fs";
+import { unlink } from "node:fs/promises";
 import { hostname } from "node:os";
 import { devinAdapter, devinSessionMeta } from "./adapter";
 import { CURSOR_KEEPALIVE_MS, CURSOR_UNKNOWN_OWNER_PID } from "./cursor";
 import { buildEnvelope, INTERRUPT_STOP_REASON, markDoneDeliveredAt, OpPlan, trackSessionAt } from "./hook";
 import {
-  atomicWrite, clearInterruptFlagAt, Config, devinConfigDir, ensureWatchdog, folderIdentity, lastHookPath, loadConfig, pidAlive, pidAncestors,
+  atomicWrite, clearInterruptFlagAt, Config, devinConfigDir, devinGrantsPath, ensureWatchdog, folderIdentity, lastHookPath, loadConfig, pidAlive, pidAncestors,
   interruptFlagSetAt, pidCommand, readRecord, SESSIONS_DIR, SessionRecord, traceSession,
 } from "./shared";
 import { postOcEvent } from "../opencode/state";
@@ -227,6 +228,8 @@ export async function runDevinHook(raw: string, deps: DevinHookDeps = {}): Promi
     let interrupted = false;
     if (kind === "prompt" || kind === "stop" || kind === "end") {
       await clearInterruptFlagAt(sessionsDir, sessionId);
+      // The session is over: its "Always allow" grants (core/devin-approval.ts) go with it.
+      if (kind === "end") await unlink(devinGrantsPath(sessionsDir, sessionId)).catch(() => {});
     } else if (kind === "tool" && await interruptFlagSetAt(sessionsDir, sessionId, now)) {
       interrupted = true;
       await (deps.print ?? printLine)(DEVIN_INTERRUPT_LINE);

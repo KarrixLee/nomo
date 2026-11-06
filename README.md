@@ -607,8 +607,18 @@ node ~/.nomo/plugin/scripts/devin-install.mjs --uninstall
 which removes only Nomo's entries. Pairing is untouched.
 
 A Devin row shows working → needs you → done like the other agents, with Devin's own session title.
-A permission prompt reaches the phone as **Allow / Deny / Deny with note** (no Always allow); a
-question (`ask_user_question`) shows as a heads-up only, answered in Devin.
+From the phone:
+
+- **Permission prompts:** Allow, **Always allow (this session)**, Deny, Deny with note. Always allow
+  is remembered by Nomo on this computer for that Devin session only and forgotten when the session
+  ends. For a shell command it covers the command's name (`touch` covers `touch b.txt`, not
+  `touchy`), and only plain commands: anything with `&&`, `;`, `|`, `$(…)`, backticks or a redirect
+  is covered only if it is the exact same text, so `touch x && rm -rf ~` still asks. For any other
+  tool it covers that tool for the rest of the session.
+- **Interrupt** a running turn (over your local network, like Claude Code). Devin stops after the
+  step it is on; it cannot cut a command or a reply off halfway. The row reads done and the session
+  takes a new prompt.
+- A question (`ask_user_question`) shows as a heads-up only, answered in Devin.
 
 ## Answering from your phone
 
@@ -649,8 +659,11 @@ description is dropped before the command is.
 
 - **Devin: the status hook observes only; the approval hook can only defer, approve what you
   approved, or deny what you denied.** Nomo's entries in `~/.config/devin/config.json` run two
-  bundles. The status hook prints nothing, so it can neither block a prompt nor change a tool call;
-  from each event it reads only `session_id`, `prompt_id`, the event and tool names, the first
+  bundles. The status hook prints nothing, so it can neither block a prompt nor change a tool call,
+  with one exception: after you tap **Interrupt** on the phone, its next `PostToolUse` prints
+  `{"continue":false,"stopReason":"Interrupted from Nomo"}`, which ends that turn (the watchdog writes
+  the flag only for an interrupt sealed by your paired phone, and the next prompt clears it). From
+  each event it reads only `session_id`, `prompt_id`, the event and tool names, the first
   prompt (for the title) and `DEVIN_PROJECT_DIR`, and from Devin's `sessions.db` only that session's
   `title`, `model` and `working_directory`, read-only (the id must be a plain slug before it is put
   into the query). The `PermissionRequest` hook sends the tool name and its command or file path to
@@ -658,8 +671,14 @@ description is dropped before the command is.
   Allow sealed by your paired phone for that exact request id (`{"decision":"block"}` with your note,
   or "Denied from phone", for a Deny). It is **fail-open**: unpaired, approvals paused, the session not
   on your phone, offline, the request expiring, a crash or a timeout all print nothing, which leaves
-  the decision to Devin's own prompt. Always allow is never offered (an older phone that sends it gets
-  a one-time approve). If Devin stops waiting (its timeout, Ctrl-C, the session ending), the hook
+  the decision to Devin's own prompt. **An Always allow tap is remembered for that Devin session
+  only, on this computer, and is forgotten when the session ends** (or when Nomo retires its row after
+  it goes quiet): it is stored in
+  `~/.config/cc-status/sessions/<session>.devin-allow` (readable only by you), and while it exists a
+  matching request in that session is approved at once without asking the phone, even with approvals
+  paused. A shell grant covers the command's name for plain commands only; a command with shell
+  operators, substitutions or redirects is covered only by a grant for that exact text. Devin's own
+  config files are never written. If Devin stops waiting (its timeout, Ctrl-C, the session ending), the hook
   notices its parent shell is gone, withdraws the phone's card and exits. Nomo's Claude Code hooks stand
   down inside Devin (Devin also runs `~/.claude` hooks), so a Devin session never shows up as a
   Claude Code row and never gets its prompts answered by them. The installer writes only its own
