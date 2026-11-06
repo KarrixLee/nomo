@@ -37,7 +37,7 @@ import {
 import { b64url, Bytes, decryptBlob, deriveLanKey, encryptBlob } from "./crypto";
 // The ONE transcript classifier for "is Claude still parked on a user-blocking tool" — the watchdog's
 // dropped-PreToolUse backstop (adapter.ts) and this hold's local-answer watch must never drift apart.
-import { adapterFor, claudeTailPendingApproval, cursorHostInvocation } from "./adapter";
+import { adapterFor, claudeTailPendingApproval, cursorHostInvocation, devinHostInvocation } from "./adapter";
 // The relay's timing/give-up rules, shared verbatim with the Codex relay (codex-remote-input.ts) that
 // polls the SAME route with the same credentials. See decision-poll.ts for what is deliberately NOT
 // shared — the first-contact POST ceiling, which each caller bounds by what IT blocks.
@@ -131,6 +131,7 @@ export const HOLD_BLOCKS_DIALOG: Record<AgentKind, boolean> = {
   opencode: false, // resident plugin, fired detached; OpenCode's own prompt is already on screen
   cursor: false,   // NEVER holds: v1 is read-only and registers no permission-class hook at all
   antigravity: true, // PreToolUse hook (core/antigravity-approval) — the tool waits until this process prints
+  devin: true,     // PermissionRequest hook (core/devin-approval) — Devin waits until this process exits
 };
 
 /** The Claude tools whose picker Claude Code renders ITSELF, concurrently with this hook — so the user
@@ -1533,6 +1534,7 @@ export async function runPermissionHook(
       return; // unreadable hook input → fail open, silent
     }
     if (agent === "claude" && cursorHostInvocation(input)) return; // Cursor payload → no decision, no network
+    if (agent === "claude" && devinHostInvocation(input)) return; // Devin payload → Devin's own prompt
     const sessionId = typeof input.session_id === "string" ? input.session_id : "";
     if (sessionId.length === 0) { trace({ event: "exit", reason: "no-session-id" }); return; }
 

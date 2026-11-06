@@ -290,6 +290,10 @@ function antigravityConfigDir() {
   return `${process.env.HOME}/.gemini/config`;
 }
 var ANTIGRAVITY_HOOK_MARKER = "antigravity-hook.sh";
+function devinConfigDir() {
+  return `${process.env.HOME}/.config/devin`;
+}
+var DEVIN_HOOK_MARKER = "devin-status.mjs";
 var CODEX_HOOK_MARKER = "codex-status.mjs";
 function codexAppServerSocketPath() {
   return `${codexHome()}/app-server-control/app-server-control.sock`;
@@ -2086,6 +2090,9 @@ var CLAUDE_DESKTOP_LAUNCHER = "Claude.app/Contents/Helpers/disclaimer";
 function cursorHostInvocation(input, env = process.env) {
   return env.CURSOR_VERSION !== undefined || typeof input === "object" && input !== null && "cursor_version" in input;
 }
+function devinHostInvocation(input, env = process.env) {
+  return env.DEVIN_PROJECT_DIR !== undefined && typeof input === "object" && input !== null && !Array.isArray(input) && !("transcript_path" in input);
+}
 function claudeDesktopInvocation(selfArgs, ancestorArgs, entrypoint) {
   if (entrypoint === CLAUDE_DESKTOP_ENTRYPOINT)
     return true;
@@ -3046,6 +3053,44 @@ var antigravityAdapter = {
   interrupt: "hook-flag",
   interruptFlagSuffix: ".agy-interrupt"
 };
+function devinSessionsDb() {
+  return `${process.env.HOME ?? ""}/.local/share/devin/cli/sessions.db`;
+}
+function devinSessionMeta(sessionId, db = devinSessionsDb(), env = process.env) {
+  if (!/^[A-Za-z0-9_-]{1,128}$/.test(sessionId))
+    return {};
+  const cell = sqliteOne(db, `select json_object('t',title,'m',model,'w',working_directory) from sessions where id='${sessionId}'`, env, true);
+  if (!cell)
+    return {};
+  try {
+    const row = JSON.parse(cell);
+    const s = (v) => typeof v === "string" && v.trim().length > 0 ? v.trim() : undefined;
+    const title = s(row.t)?.endsWith("...") ? undefined : s(row.t), model = s(row.m), cwd = s(row.w);
+    return {
+      ...title ? { title: truncateOnWord(title.replace(/\s+/g, " ")) } : {},
+      ...model ? { model: model.slice(0, 80) } : {},
+      ...cwd ? { cwd } : {}
+    };
+  } catch {
+    return {};
+  }
+}
+var devinAdapter = {
+  kind: "devin",
+  title: async ({ input }) => typeof input.prompt === "string" ? displayTitleFromUserText(input.prompt) : undefined,
+  model: async ({ sessionId }) => devinSessionMeta(sessionId).model,
+  detectInterrupt: () => false,
+  sessionsDir: () => `${process.env.HOME ?? ""}/.local/share/devin/cli`,
+  sessionMatch: () => false,
+  hookStampPath: () => lastHookPath("devin"),
+  hooksNotFiringHint: "  run `bunx nomo-ai --devin` again, then restart devin (`/hooks` shows what it loaded)",
+  titleRepair: {
+    due: (record, now) => record.lastEvent === "done" && typeof record.ts === "number" && now - record.ts < CURSOR_TITLE_REPAIR_MS,
+    resolve: (sessionId) => devinSessionMeta(sessionId).title
+  },
+  toolDetail: {},
+  blobAgentFields: { agent: "devin" }
+};
 function unknownAgentAdapter(kind) {
   return {
     kind,
@@ -3071,6 +3116,8 @@ function adapterFor(agent) {
       return cursorAdapter;
     case "antigravity":
       return antigravityAdapter;
+    case "devin":
+      return devinAdapter;
     case "claude":
       return claudeAdapter;
     default:
@@ -3086,9 +3133,15 @@ var AGENT_UI = {
   codex: { name: "Codex", pair: "$nomo-pair", approvalsOn: "$nomo-approvals on", status: "$nomo-status" },
   opencode: { name: "OpenCode", pair: "/nomo-pair", approvalsOn: "/nomo-approvals on", status: "/nomo-status" },
   cursor: { name: "Cursor", pair: "/nomo-pair", approvalsOn: "/nomo-cc:approvals on (in Claude Code — Cursor sessions are read-only)", status: "/nomo-status" },
-  antigravity: { name: "Antigravity", pair: "/nomo-pair", approvalsOn: "/nomo-approvals on", status: "/nomo-status" }
+  antigravity: { name: "Antigravity", pair: "/nomo-pair", approvalsOn: "/nomo-approvals on", status: "/nomo-status" },
+  devin: {
+    name: "Devin",
+    pair: "~/.nomo/plugin/scripts/run.sh ~/.nomo/plugin/dist/pair.mjs",
+    approvalsOn: "~/.nomo/plugin/scripts/run.sh ~/.nomo/plugin/dist/cc-permission.mjs on",
+    status: "~/.nomo/plugin/scripts/run.sh ~/.nomo/plugin/dist/status-cmd.mjs devin"
+  }
 };
-var AGENT_ORDER = ["claude", "codex", "opencode", "cursor", "antigravity"];
+var AGENT_ORDER = ["claude", "codex", "opencode", "cursor", "antigravity", "devin"];
 var VALUE_COL = 14;
 var row = (label, value) => `${label.padEnd(VALUE_COL)}${value}`;
 var subRow = (label, value) => `  ${label.padEnd(VALUE_COL - 2)}${value}`;
@@ -3322,6 +3375,8 @@ async function statusCmd(deps = {}) {
   const lastHookCursorPath = deps.lastHookCursorPath ?? cursorAdapter.hookStampPath();
   const antigravityHooksPath = deps.antigravityHooksPath ?? `${antigravityConfigDir()}/hooks.json`;
   const lastHookAntigravityPath = deps.lastHookAntigravityPath ?? antigravityAdapter.hookStampPath();
+  const devinConfigPath = deps.devinConfigPath ?? `${devinConfigDir()}/config.json`;
+  const lastHookDevinPath = deps.lastHookDevinPath ?? devinAdapter.hookStampPath();
   const noHoldPath = deps.noHoldPath ?? NO_HOLD_PATH;
   const isAlive = deps.isAlive ?? pidAlive;
   const now = deps.now ?? Date.now;
@@ -3382,7 +3437,7 @@ async function statusCmd(deps = {}) {
       print(cont(`→ run ${ui.approvalsOn}`));
     }
   }
-  const perAgent = { claude: 0, codex: 0, opencode: 0, cursor: 0, antigravity: 0 };
+  const perAgent = { claude: 0, codex: 0, opencode: 0, cursor: 0, antigravity: 0, devin: 0 };
   let totalSessions = 0;
   try {
     for (const name of await readdir2(sessionsDir)) {
@@ -3580,6 +3635,24 @@ async function statusCmd(deps = {}) {
     detail: [["Mode", "sessions show on your phone; Allow/Deny for shell commands and file writes, and Interrupt"]],
     problems: antigravityHooks.problem ? [antigravityHooks.problem] : []
   };
+  const devinInstalled = (await readFile3(devinConfigPath, "utf8").catch(() => "")).includes(DEVIN_HOOK_MARKER);
+  const devinHooks = await hooksRow("devin", {
+    installed: devinInstalled,
+    sessionsDir: devinAdapter.sessionsDir(),
+    match: devinAdapter.sessionMatch,
+    stampPath: lastHookDevinPath,
+    hint: devinAdapter.hooksNotFiringHint
+  });
+  const devinReport = {
+    kind: "devin",
+    present: devinInstalled || perAgent.devin > 0 || devinHooks.stamp > 0,
+    hooksLabel: "Hooks",
+    hooks: devinHooks.value,
+    sessions: sessionText(perAgent.devin),
+    sessionCount: perAgent.devin,
+    detail: [["Mode", "sessions show on your phone; Allow/Deny for Devin's permission prompts"]],
+    problems: devinHooks.problem ? [devinHooks.problem] : []
+  };
   if (deps.plain) {
     const approvalsOn = await localApprovalsState(noHoldPath) === "on";
     const lastSendTs = await readMsMarker(lastSendPath);
@@ -3595,7 +3668,7 @@ async function statusCmd(deps = {}) {
       out(line);
     return 0;
   }
-  const reports = { claude: claudeReport, codex: codexReport, opencode: opencodeReport, cursor: cursorReport, antigravity: antigravityReport };
+  const reports = { claude: claudeReport, codex: codexReport, opencode: opencodeReport, cursor: cursorReport, antigravity: antigravityReport, devin: devinReport };
   if (audience) {
     renderOwn(reports[audience], `${AGENT_UI[audience].name} — you are here`, print);
     const others = AGENT_ORDER.filter((k) => k !== audience && reports[k].present);
@@ -3643,14 +3716,14 @@ function plainStatusLines(s) {
 }
 function parseAudience(argv) {
   for (const arg of argv) {
-    if (arg === "claude" || arg === "codex" || arg === "opencode" || arg === "cursor" || arg === "antigravity")
+    if (arg === "claude" || arg === "codex" || arg === "opencode" || arg === "cursor" || arg === "antigravity" || arg === "devin")
       return arg;
   }
   return;
 }
 if (__require.main == __require.module) {
   if (process.argv.includes("--check")) {
-    console.log("usage: status [claude|codex|opencode|cursor|antigravity] [--plain] [--check]  — show pairing, delivery and per-agent health (--plain: a few lines in plain words)");
+    console.log("usage: status [claude|codex|opencode|cursor|antigravity|devin] [--plain] [--check]  — show pairing, delivery and per-agent health (--plain: a few lines in plain words)");
     process.exit(0);
   }
   process.exit(await statusCmd({ audience: parseAudience(process.argv.slice(2)), plain: process.argv.includes("--plain") }));

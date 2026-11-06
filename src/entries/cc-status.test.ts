@@ -1854,6 +1854,19 @@ await child.exited;
     });
   }, 20000);
 
+  test("runHook claude stands down under Devin (DEVIN_PROJECT_DIR + a Devin payload)", async () => {
+    await withEventServer(async ({ home, ccDir, sessionsDir, bodies }) => {
+      const payload = { session_id: "brawny-shirt", prompt_id: "p1", hook_event_name: "UserPromptSubmit", prompt: "hi" };
+      await spawnHook(claudeEntry, home, payload, { DEVIN_PROJECT_DIR: "/w" });
+      expect(bodies).toEqual([]);
+      expect(await readdir(sessionsDir)).toEqual([]);
+      expect(await exists(join(ccDir, "last-hook-claude"))).toBe(false);
+      // CONTROL: a real claude launched from a Devin exec inherits the env but sends transcript_path.
+      await spawnHook(claudeEntry, home, { ...payload, session_id: "real-claude", transcript_path: join(home, "t.jsonl") }, { DEVIN_PROJECT_DIR: "/w" });
+      expect(bodies.map((b) => b.sessionId)).toEqual(["real-claude"]);
+    });
+  }, 20000);
+
   const workingRecord = (over: Record<string, unknown> = {}) => JSON.stringify({
     pid: process.pid, machine: "m", label: "api-status", ts: Date.now(), lastEvent: "working",
     sentDone: false, op: "update", prio: 0, title: "Kept title", ...over,

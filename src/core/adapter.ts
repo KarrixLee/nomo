@@ -1015,6 +1015,20 @@ export function cursorHostInvocation(
     (typeof input === "object" && input !== null && "cursor_version" in input);
 }
 
+/** Is this hook running INSIDE DEVIN rather than the agent whose entry it is? Devin (CLI and Desktop's
+ *  "Devin Local") reads `~/.claude/settings.json` hooks and accepts `.claude-plugin` manifests, and runs
+ *  them with its own payloads — so Nomo's CLAUDE entries can fire inside a Devin session. Devin sets
+ *  `DEVIN_PROJECT_DIR` for every hook, but it is also INHERITED by anything a Devin `exec` launches —
+ *  including a real `claude`, whose hook payloads always carry `transcript_path` (Devin's never do,
+ *  verified 3000.11.234). So: the env var present AND an object payload without `transcript_path`.
+ *  Pure — env is injected. */
+export function devinHostInvocation(
+  input: unknown, env: Record<string, string | undefined> = process.env,
+): boolean {
+  return env.DEVIN_PROJECT_DIR !== undefined &&
+    typeof input === "object" && input !== null && !Array.isArray(input) && !("transcript_path" in input);
+}
+
 /** Pure: is this hook's invoking `claude` a conversation window of the Claude DESKTOP app?
  *
  *  PRIMARY signal: `entrypoint` — the process env's `CLAUDE_CODE_ENTRYPOINT`, read at the adapter
@@ -2859,6 +2873,65 @@ export const antigravityAdapter: AgentAdapter = {
   interruptFlagSuffix: ".agy-interrupt", // ANTIGRAVITY_INTERRUPT_SUFFIX in core/antigravity.ts
 };
 
+/** Devin's local session store: `sessions.id` IS the hooks' `session_id` (a word-word slug). */
+export function devinSessionsDb(): string {
+  return `${process.env.HOME ?? ""}/.local/share/devin/cli/sessions.db`;
+}
+
+/** Devin's own title / model / working directory for a session, from its sessions.db — each key only
+ *  when non-blank. One read-only, time-boxed `sqlite3` query (the id is spliced, so it must match the
+ *  safe shape first); the copy fallback because the DB lives in its WAL while Devin holds it open. Any
+ *  failure is `{}`. The title is Devin's AI title once generated (it is there by Stop, verified). */
+export function devinSessionMeta(
+  sessionId: string, db: string = devinSessionsDb(), env: NodeJS.ProcessEnv = process.env,
+): { title?: string; model?: string; cwd?: string } {
+  if (!/^[A-Za-z0-9_-]{1,128}$/.test(sessionId)) return {};
+  const cell = sqliteOne(db,
+    `select json_object('t',title,'m',model,'w',working_directory) from sessions where id='${sessionId}'`, env, true);
+  if (!cell) return {};
+  try {
+    const row = JSON.parse(cell) as { t?: unknown; m?: unknown; w?: unknown };
+    const s = (v: unknown) => (typeof v === "string" && v.trim().length > 0 ? v.trim() : undefined);
+    // Until its AI title lands, Devin stores the first prompt cut at 77 chars + "..." — worse than our
+    // own word-cut prompt title, so that placeholder is not a title.
+    const title = s(row.t)?.endsWith("...") ? undefined : s(row.t), model = s(row.m), cwd = s(row.w);
+    return {
+      ...(title ? { title: truncateOnWord(title.replace(/\s+/g, " ")) } : {}),
+      ...(model ? { model: model.slice(0, 80) } : {}),
+      ...(cwd ? { cwd } : {}),
+    };
+  } catch {
+    return {};
+  }
+}
+
+/** Devin (CLI + Desktop's "Devin Local") — driven by Devin's Claude-shaped hooks, the Cursor recipe.
+ *  The producer is core/devin.ts and the Allow/Deny hold core/devin-approval.ts; this adapter is
+ *  reached through `adapterFor()` by the rebuild paths (watchdog correctives, LAN rollup).
+ *
+ *  TITLE = the first prompt (the prompt hook's seam), then Devin's own `sessions.title`, which the
+ *  producer reads on later frames and `titleRepair` after the stop. NO interrupt / allowMode /
+ *  answerExtras / discovery: the phone offers Allow / Deny / Deny with note only. The not-firing
+ *  detector is off (sessionMatch matches nothing): Devin keeps sessions in one sqlite file.
+ *  NOT in `allAdapters` — nothing to discover. */
+export const devinAdapter: AgentAdapter = {
+  kind: "devin",
+  title: async ({ input }) =>
+    typeof input.prompt === "string" ? displayTitleFromUserText(input.prompt) : undefined,
+  model: async ({ sessionId }) => devinSessionMeta(sessionId).model,
+  detectInterrupt: () => false,
+  sessionsDir: () => `${process.env.HOME ?? ""}/.local/share/devin/cli`,
+  sessionMatch: () => false,
+  hookStampPath: () => lastHookPath("devin"),
+  hooksNotFiringHint: "  run `bunx nomo-ai --devin` again, then restart devin (`/hooks` shows what it loaded)",
+  titleRepair: {
+    due: (record, now) => record.lastEvent === "done" && typeof record.ts === "number" && now - record.ts < CURSOR_TITLE_REPAIR_MS,
+    resolve: (sessionId) => devinSessionMeta(sessionId).title,
+  },
+  toolDetail: {},
+  blobAgentFields: { agent: "devin" as const },
+};
+
 /** The adapter for an agent kind THIS BUILD DOES NOT KNOW — a record stamped by a newer peer install
  *  (see AgentKindWire). Its whole job is `blobAgentFields`: carry the raw literal back out, so a
  *  rebuild by an older build re-emits the agent it was handed instead of silently dropping the key and
@@ -2897,6 +2970,7 @@ export function adapterFor(agent: AgentKindWire): AgentAdapter {
     case "opencode": return opencodeAdapter;
     case "cursor": return cursorAdapter;
     case "antigravity": return antigravityAdapter;
+    case "devin": return devinAdapter;
     case "claude": return claudeAdapter;
     default: return typeof agent === "string" && agent.length > 0 ? unknownAgentAdapter(agent) : claudeAdapter;
   }

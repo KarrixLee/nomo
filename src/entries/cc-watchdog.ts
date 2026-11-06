@@ -2491,9 +2491,10 @@ export function isClaudeIdleReapEligible(
   // (CURSOR_UNKNOWN_OWNER_PID) — has nothing else to finish it. It never sets `awaitingPrompt`, so it
   // only ever gets the 30-min clock. Antigravity joins for the same reason, and because its turns can
   // end with NO event (PostInvocation/Stop are skipped on a user interrupt): this clock, with the
-  // transcript-mtime veto below, is what settles such a row.
+  // transcript-mtime veto below, is what settles such a row. Devin joins too: its hooks are its only
+  // signal, and a `devin -p` run that rejects a tool ends with SessionEnd and NO Stop.
   const agent = recordAgent(record);
-  if (agent !== "claude" && agent !== "cursor" && agent !== "antigravity") return false;
+  if (agent !== "claude" && agent !== "cursor" && agent !== "antigravity" && agent !== "devin") return false;
   if (record.provisional === true) return false;
   return idleReapAgeEligible(record, now, transcriptMtimeMs,
     record.awaitingPrompt === true ? CLAUDE_AWAITING_PROMPT_REAP_MS : CLAUDE_IDLE_REAP_MS);

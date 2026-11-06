@@ -12,7 +12,7 @@ import { parseNotifyFromToml } from "../core/notify-wire";
 import { completePendingPairing, PAIR_HTML_FILE, parsePendingConfig, PENDING_STASH_FILE, PLUGIN_VERSION } from "../core/shared";
 import { deriveCodeIkm } from "../core/pair-code";
 import { unpair } from "./unpair";
-import { humanAge, statusCmd as realStatusCmd } from "./status-cmd";
+import { humanAge, parseAudience, statusCmd as realStatusCmd } from "./status-cmd";
 
 // ---------- shared test plumbing -----------------------------------------------------------------
 
@@ -1180,6 +1180,7 @@ describe("statusCmd", () => {
     noHoldPath: join(dir, "no-hold"), cursorHooksPath: join(dir, "cursor-hooks.json"),
     cursorProjectsDir: join(dir, "cursor-projects"), lastHookCursorPath: join(dir, "lh-cursor"),
     antigravityHooksPath: join(dir, "agy-hooks.json"), lastHookAntigravityPath: join(dir, "lh-agy"),
+    devinConfigPath: join(dir, "devin-config.json"), lastHookDevinPath: join(dir, "lh-devin"),
     ...deps,
   });
   // The machine-wide block: pairing, delivery, approvals. True regardless of which agent asked, which
@@ -1231,6 +1232,29 @@ describe("statusCmd", () => {
     expect(out).toContain("2 tracked");
     // `ignore.tmp` is not a session record and must not be counted.
     expect(out).not.toContain("3 tracked");
+  });
+
+  test("status devin: a Devin block, Hooks installed when config.json names our hook, terminal commands", async () => {
+    await writeFile(configPath, JSON.stringify({
+      url: WORKER, pairingId: "abcdef0123456789".repeat(2), pcSecret: "s", e2eKeyB64: b64url(new Uint8Array(32)),
+    }));
+    const now = 1_800_000_000_000;
+    await writeFile(join(dir, "devin-config.json"), JSON.stringify({ version: 1, hooks: { Stop: [{ hooks: [{ type: "command", command: "'/r/scripts/run.sh' '/r/dist/devin-status.mjs'" }] }] } }));
+    await writeFile(join(dir, "lh-devin"), String(now - 60_000));
+    const { mkdir } = await import("node:fs/promises");
+    await mkdir(join(dir, "sessions"), { recursive: true });
+    await writeFile(join(dir, "sessions", "brawny-shirt.json"), JSON.stringify({ agent: "devin" }));
+    expect(parseAudience(["devin"])).toBe("devin");
+    expect(await statusCmd({
+      print, audience: "devin", configPath, lastSendPath: join(dir, "last-send"), sessionsDir: join(dir, "sessions"),
+      watchdogPidPath: join(dir, "watchdog.pid"), isAlive: () => false, now: () => now,
+    })).toBe(0);
+    const out = lines.join("\n");
+    expect(out).toContain("Devin — you are here");
+    expect(out).toContain("firing");
+    expect(out).toContain("1 tracked");
+    expect(out).toContain("Allow/Deny");
+    expect(out).not.toContain("not set up here");
   });
 
   test("a PENDING config → reports pairing-in-progress, not a flat 'not paired'", async () => {

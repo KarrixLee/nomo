@@ -545,6 +545,27 @@ describe("runPermissionHook — hold state machine", () => {
     expect(emitted).toEqual([]);
   });
 
+  // NOM-158. Devin runs ~/.claude hooks too (DEVIN_PROJECT_DIR set, no transcript_path): no decision,
+  // no network — Devin's own prompt (or Nomo's Devin hold) answers.
+  test("runPermissionHook claude stands down under Devin", async () => {
+    const emitted: string[] = [];
+    const { fn, calls } = scriptFetch(true, [{ decision: "allow" }]);
+    const { transcript_path: _t, ...devinShaped } = JSON.parse(INPUT) as Record<string, unknown>;
+    const previous = process.env.DEVIN_PROJECT_DIR;
+    process.env.DEVIN_PROJECT_DIR = "/w";
+    try {
+      await runPermissionHook(baseDeps({ readInput: async () => JSON.stringify(devinShaped), fetchFn: fn, emit: (l: string) => emitted.push(l) }) as never);
+      expect(calls).toEqual([]);
+      expect(emitted).toEqual([]);
+      // CONTROL: a real claude under an inherited Devin env (transcript_path present) still holds.
+      const control = scriptFetch(false, []);
+      await runPermissionHook(baseDeps({ readInput: async () => INPUT, fetchFn: control.fn, emit: (l: string) => emitted.push(l) }) as never);
+      expect(control.calls.filter((c) => c.method === "POST").length).toBeGreaterThan(0);
+    } finally {
+      if (previous === undefined) delete process.env.DEVIN_PROJECT_DIR; else process.env.DEVIN_PROJECT_DIR = previous;
+    }
+  });
+
   test("CURSOR_VERSION in the environment (even empty) → exits before stdin is read", async () => {
     const emitted: string[] = [];
     const { fn, calls } = scriptFetch(true, [{ decision: "allow" }]);

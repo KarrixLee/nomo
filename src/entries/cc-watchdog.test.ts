@@ -123,6 +123,11 @@ describe("isClaudeIdleReapEligible (a resumed Claude session gone silent past th
   const REAP_MS = 1_800_000; // must mirror CLAUDE_IDLE_REAP_MS in cc-watchdog.ts
   const now = 100_000_000;
 
+  test("a quiet working devin row is idle-reap eligible (its hooks are its only signal)", () => {
+    expect(isClaudeIdleReapEligible(rec({ agent: "devin", lastEvent: "working", ts: now - REAP_MS }), now)).toBe(true);
+    expect(isClaudeIdleReapEligible(rec({ agent: "devin", lastEvent: "working", ts: now - REAP_MS + 1 }), now)).toBe(false);
+  });
+
   test("a working Claude session idle ≥30 min → eligible; just under → not", () => {
     expect(isClaudeIdleReapEligible(rec({ lastEvent: "working", ts: now - REAP_MS }), now)).toBe(true);
     expect(isClaudeIdleReapEligible(rec({ lastEvent: "working", ts: now - REAP_MS + 1 }), now)).toBe(false);

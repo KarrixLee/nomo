@@ -1501,6 +1501,9 @@ var CLAUDE_DESKTOP_LAUNCHER = "Claude.app/Contents/Helpers/disclaimer";
 function cursorHostInvocation(input, env = process.env) {
   return env.CURSOR_VERSION !== undefined || typeof input === "object" && input !== null && "cursor_version" in input;
 }
+function devinHostInvocation(input, env = process.env) {
+  return env.DEVIN_PROJECT_DIR !== undefined && typeof input === "object" && input !== null && !Array.isArray(input) && !("transcript_path" in input);
+}
 function claudeDesktopInvocation(selfArgs, ancestorArgs, entrypoint) {
   if (entrypoint === CLAUDE_DESKTOP_ENTRYPOINT)
     return true;
@@ -2391,6 +2394,44 @@ var antigravityAdapter = {
   interrupt: "hook-flag",
   interruptFlagSuffix: ".agy-interrupt"
 };
+function devinSessionsDb() {
+  return `${process.env.HOME ?? ""}/.local/share/devin/cli/sessions.db`;
+}
+function devinSessionMeta(sessionId, db = devinSessionsDb(), env = process.env) {
+  if (!/^[A-Za-z0-9_-]{1,128}$/.test(sessionId))
+    return {};
+  const cell = sqliteOne(db, `select json_object('t',title,'m',model,'w',working_directory) from sessions where id='${sessionId}'`, env, true);
+  if (!cell)
+    return {};
+  try {
+    const row = JSON.parse(cell);
+    const s = (v) => typeof v === "string" && v.trim().length > 0 ? v.trim() : undefined;
+    const title = s(row.t)?.endsWith("...") ? undefined : s(row.t), model = s(row.m), cwd = s(row.w);
+    return {
+      ...title ? { title: truncateOnWord(title.replace(/\s+/g, " ")) } : {},
+      ...model ? { model: model.slice(0, 80) } : {},
+      ...cwd ? { cwd } : {}
+    };
+  } catch {
+    return {};
+  }
+}
+var devinAdapter = {
+  kind: "devin",
+  title: async ({ input }) => typeof input.prompt === "string" ? displayTitleFromUserText(input.prompt) : undefined,
+  model: async ({ sessionId }) => devinSessionMeta(sessionId).model,
+  detectInterrupt: () => false,
+  sessionsDir: () => `${process.env.HOME ?? ""}/.local/share/devin/cli`,
+  sessionMatch: () => false,
+  hookStampPath: () => lastHookPath("devin"),
+  hooksNotFiringHint: "  run `bunx nomo-ai --devin` again, then restart devin (`/hooks` shows what it loaded)",
+  titleRepair: {
+    due: (record, now) => record.lastEvent === "done" && typeof record.ts === "number" && now - record.ts < CURSOR_TITLE_REPAIR_MS,
+    resolve: (sessionId) => devinSessionMeta(sessionId).title
+  },
+  toolDetail: {},
+  blobAgentFields: { agent: "devin" }
+};
 function unknownAgentAdapter(kind) {
   return {
     kind,
@@ -2416,6 +2457,8 @@ function adapterFor(agent) {
       return cursorAdapter;
     case "antigravity":
       return antigravityAdapter;
+    case "devin":
+      return devinAdapter;
     case "claude":
       return claudeAdapter;
     default:
@@ -2985,6 +3028,8 @@ async function runHook(agent) {
     const input = JSON.parse(raw);
     if (agent === "claude" && cursorHostInvocation(input))
       return;
+    if (agent === "claude" && devinHostInvocation(input))
+      return;
     if (typeof input.session_id !== "string" || input.session_id.length === 0)
       return;
     if (agent === "claude" && (typeof input.turn_id === "string" && input.turn_id.length > 0 || typeof input.transcript_path === "string" && input.transcript_path.includes("/.codex/"))) {
@@ -3378,7 +3423,8 @@ var HOLD_BLOCKS_DIALOG = {
   codex: true,
   opencode: false,
   cursor: false,
-  antigravity: true
+  antigravity: true,
+  devin: true
 };
 var LOCAL_ANSWER_TOOLS = new Set(["AskUserQuestion", "ExitPlanMode"]);
 var LOCAL_ANSWER_TAIL_BYTES = 64000;
@@ -4172,6 +4218,8 @@ async function runPermissionHook(deps = {}, agent = "claude") {
       return;
     }
     if (agent === "claude" && cursorHostInvocation(input))
+      return;
+    if (agent === "claude" && devinHostInvocation(input))
       return;
     const sessionId = typeof input.session_id === "string" ? input.session_id : "";
     if (sessionId.length === 0) {

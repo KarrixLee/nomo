@@ -285,6 +285,10 @@ function antigravityConfigDir() {
   return `${process.env.HOME}/.gemini/config`;
 }
 var ANTIGRAVITY_HOOK_MARKER = "antigravity-hook.sh";
+function devinConfigDir() {
+  return `${process.env.HOME}/.config/devin`;
+}
+var DEVIN_HOOK_MARKER = "devin-status.mjs";
 var CODEX_HOOK_MARKER = "codex-status.mjs";
 function codexAppServerSocketPath() {
   return `${codexHome()}/app-server-control/app-server-control.sock`;

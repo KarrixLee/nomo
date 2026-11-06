@@ -458,8 +458,13 @@ export type CCStatus = "working" | "needsAttention" | "done";
  *  `"antigravity"` (the fifth) covers Google Antigravity — the desktop app/IDE and the `agy` CLI, which
  *  read the same ~/.gemini/config/hooks.json. One hook binary (entries/antigravity-status.ts →
  *  core/antigravity.ts), plus a PreToolUse phone-approval hold (entries/antigravity-approve.ts →
- *  core/antigravity-approval.ts). */
-export type AgentKind = "claude" | "codex" | "opencode" | "cursor" | "antigravity";
+ *  core/antigravity-approval.ts).
+ *
+ *  `"devin"` (the sixth) covers the Devin CLI and Devin Desktop's "Devin Local" agent, which run the same
+ *  harness and read the same ~/.config/devin/config.json hooks. One status hook (entries/devin-status.ts
+ *  → core/devin.ts) plus a PermissionRequest phone-approval hold (entries/devin-approve.ts →
+ *  core/devin-approval.ts). */
+export type AgentKind = "claude" | "codex" | "opencode" | "cursor" | "antigravity" | "devin";
 
 /** An agent literal AS IT ARRIVES — off a session record, out of a blob a peer install wrote. It is
  *  `AgentKind` plus "some string this build has never heard of", because that case is now REAL: two
@@ -502,6 +507,15 @@ export function antigravityConfigDir(): string {
 
 /** The substring that identifies OUR hook inside Antigravity's `hooks.json` (the wrapper's basename). */
 export const ANTIGRAVITY_HOOK_MARKER = "antigravity-hook.sh";
+
+/** Devin's user config dir — holds the `config.json` whose `"hooks"` key the installer merges Nomo's
+ *  entries into (plugin/scripts/devin-install.mjs). */
+export function devinConfigDir(): string {
+  return `${process.env.HOME}/.config/devin`;
+}
+
+/** The substring that identifies OUR status hook inside Devin's `config.json` (the bundle's basename). */
+export const DEVIN_HOOK_MARKER = "devin-status.mjs";
 
 /** The substring that identifies OUR hook command inside a codex `hooks.json` entry (the bundled
  *  hook's basename). status-cmd greps for it to flag leftover legacy (pre-native-plugin) installs. */
