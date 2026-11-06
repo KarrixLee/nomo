@@ -23,3 +23,24 @@ Note: `--respect-workspace-trust false` (space) is parsed as a PATH and the run 
 
 Not drivable from an agent: does the interactive TUI draw its own prompt while a PermissionRequest hook
 holds, and does Devin Desktop fire the same hooks. Both are on the device checklist.
+
+## Addendum — advanced controls spike (same day, same CLI)
+
+Ten more runs in throwaway projects (`.devin/hooks.v1.json` with every event, `read_config_from` all
+false, `NOMO_CC_DIR` throwaway), sessions deleted after. What shipped from it in plugin 2.5.0:
+
+| Finding | Result |
+|---|---|
+| Rule written mid-session (Always allow) | A hook that approved and wrote `.devin/config.local.json` = `{"permissions":{"allow":["Exec(touch)"]}}` did **not** stop the next `touch` in the same session from raising PermissionRequest; the next session honoured it (`touch` ran unasked, `mkdir` still asked). Config is read at session start. The binary has no `updatedPermissions`: its Claude-compatible output is `{continue, stopReason, suppressOutput, decision, reason, systemMessage, hookSpecificOutput}`. ⇒ Always allow is a Nomo-side per-session grant (`core/devin-approval.ts`). |
+| Interrupt | PostToolUse printing `{"stop":"…"}` is **ignored**. PostToolUse printing `{"continue":false,"stopReason":"Interrupted from Nomo"}` ends the turn right after that tool: `devin -p` prints `Hook stop: Interrupted from Nomo` / `Error: Operation canceled by user` (exit 1), **no Stop**, SessionEnd fires (because `-p` exits). `devin -r <id> -p …` resumes with full context; the model never sees the stop reason. Unverified: whether PostToolUse fires for a tool that failed (Devin has no PostToolUseFailure). |
+| ACP = the Desktop transport | `devin acp` over stdio with a hand-written client (`elicitation: {form: {}}`): the same hooks with the same payloads (SessionStart, UserPromptSubmit, PreToolUse, PermissionRequest, PostToolUse, Stop, SessionEnd); `exec`'s `tool_input` gains `workdir`. `session/new` starts in mode `accept-edits` ("Code"). |
+| Permission order under ACP | **Hook first, client second.** A hook that approved after 6 s: the client never got `session/request_permission`. A hook that printed nothing: the client then got it, with options `allow_once`, `allow_session` ("Yes, allow `touch` commands (this session)"), `allow_always`, `allow_always_global`, `switch_bypass`, `reject_once` and `_meta."cognition.ai/permissionRule": "Exec(touch)"`. ⇒ While Nomo holds, Desktop shows no buttons. |
+| `ask_user_question` | Fires **PreToolUse, never PermissionRequest**. `tool_input` = `{"questions":[{"question","header","options":[{"label","description"?}],"multi_select"?}]}`. Then the client gets `elicitation/create` (form, `q0` with `oneOf` labels, `_meta."cognition.ai/allowOther": true`); cancelling it ⇒ `Tool execution was rejected: User canceled the question`. |
+| `updatedInput.answers` | Schema text: "User's answers, keyed by question text. Populated by the UI … Do not set this yourself"; each value `UserQuestionAnswer {selected: [labels], custom_text}`. An array fails validation (`expected field 'answers' to be object, got array`). The correct object validated and was **ignored**: Devin still sent `elicitation/create`. |
+| Block-with-answer | PreToolUse printing `{"decision":"block","reason":"The user already answered this from their phone (Nomo): \"Which color do you prefer?\" -> Blue. …"}`: no elicitation, the model ran `echo Blue > color.txt` and replied `Blue`. The client sees a failed tool call `Tool rejected: <reason>` and an agent chunk `Hook block: <hook command>`. ⇒ the shipped question answer. |
+| Desktop's devin | Devin Desktop bundles its own `devin` (3000.11.238) at `/Applications/Devin.app/Contents/Resources/app/extensions/windsurf/devin/bin/devin`. The GUI itself was not driven: device checklist. |
+
+Wire Nomo ships on these (plugin 2.5.0): `{"continue":false,"stopReason":"Interrupted from Nomo"}` from
+PostToolUse while `<sessions>/<id>.interrupt` is fresh; `{"decision":"approve"}` for a stored
+`<sessions>/<id>.devin-allow` grant; `{"decision":"block","reason":"The user answered from their phone
+(Nomo): …"}` from PreToolUse `ask_user_question` for a phone answer.
