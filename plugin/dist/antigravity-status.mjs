@@ -2,20 +2,20 @@ import { createRequire } from "node:module";
 var __require = /* @__PURE__ */ createRequire(import.meta.url);
 
 // src/core/antigravity.ts
-import { readdir as readdir5 } from "node:fs/promises";
+import { readdir as readdir6 } from "node:fs/promises";
 import { hostname as hostname3 } from "node:os";
 import { basename as basename5 } from "node:path";
 
 // src/core/adapter.ts
 import { execFile as execFile2, execFileSync as execFileSync2 } from "node:child_process";
 import { copyFileSync, existsSync as existsSync2, mkdtempSync, rmSync, statSync as statSync2 } from "node:fs";
-import { readdir, readFile as readFile2, stat as stat2 } from "node:fs/promises";
+import { readdir as readdir2, readFile as readFile2, stat as stat2 } from "node:fs/promises";
 import { devNull, tmpdir } from "node:os";
 import { promisify as promisify2 } from "node:util";
 import { basename as basename2, isAbsolute as isAbsolute2, join as join2, resolve as resolve2 } from "node:path";
 
 // src/core/shared.ts
-import { access, chmod, open, readFile, rename, stat, mkdir, unlink, writeFile } from "node:fs/promises";
+import { access, chmod, open, readdir, readFile, rename, stat, mkdir, unlink, writeFile } from "node:fs/promises";
 import { appendFileSync, existsSync, readFileSync, statSync, truncateSync } from "node:fs";
 import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
@@ -973,6 +973,10 @@ function devinGrantsPath(sessionsDir, sessionId) {
 async function forgetDevinGrants(recordPath) {
   if (recordPath.endsWith(".json"))
     await unlink(`${recordPath.slice(0, -5)}${DEVIN_GRANTS_SUFFIX}`).catch(() => {});
+}
+async function forgetAllDevinGrants(sessionsDir = SESSIONS_DIR) {
+  const files = await readdir(sessionsDir).catch(() => []);
+  await Promise.all(files.filter((f) => f.endsWith(DEVIN_GRANTS_SUFFIX)).map((f) => unlink(`${sessionsDir}/${f}`).catch(() => {})));
 }
 async function settleDecisionHoldRecord(sessionId, patch, heldSince) {
   return settleDecisionHoldRecordAt(SESSIONS_DIR, sessionId, patch, heldSince);
@@ -2209,7 +2213,7 @@ var ROLLOUT_SCAN_MAX_HEADS = 40;
 var ROLLOUT_META_HEAD_BYTES = 64 * 1024;
 async function listNumericDirsDesc(path) {
   try {
-    return (await readdir(path)).filter((n) => /^\d+$/.test(n)).sort((a, b) => b.localeCompare(a));
+    return (await readdir2(path)).filter((n) => /^\d+$/.test(n)).sort((a, b) => b.localeCompare(a));
   } catch {
     return [];
   }
@@ -2225,7 +2229,7 @@ async function codexNewestRolloutForCwd(cwd, home = codexHome()) {
           const dir = join2(sessions, y, m, d);
           let names;
           try {
-            names = await readdir(dir);
+            names = await readdir2(dir);
           } catch {
             continue;
           }
@@ -2604,7 +2608,7 @@ async function codexRolloutExistsForSession(sessionId, home = codexHome()) {
       for (const d of await listNumericDirsDesc(join2(sessions, y, m))) {
         let names;
         try {
-          names = await readdir(join2(sessions, y, m, d));
+          names = await readdir2(join2(sessions, y, m, d));
         } catch {
           names = [];
         }
@@ -3140,7 +3144,7 @@ var allAdapters = [claudeAdapter, codexAdapter];
 // src/core/antigravity-inbox.ts
 import { spawn as spawn2 } from "node:child_process";
 import { existsSync as existsSync3 } from "node:fs";
-import { readdir as readdir2, readFile as readFile3, rename as rename2, stat as stat3, unlink as unlink2 } from "node:fs/promises";
+import { readdir as readdir3, readFile as readFile3, rename as rename2, stat as stat3, unlink as unlink2 } from "node:fs/promises";
 import { delimiter, isAbsolute as isAbsolute3, join as join3 } from "node:path";
 var ANTIGRAVITY_INBOX_SUFFIX = ".agy-inbox";
 var ANTIGRAVITY_RECEIPT_SUFFIX = ".agy-reply";
@@ -3164,7 +3168,7 @@ var fileFor = (dir, conv, mid, suffix) => join3(dir, `${conv}.${mid}${suffix}`);
 async function midsOf(dir, conv, suffix) {
   let names = [];
   try {
-    names = await readdir2(dir);
+    names = await readdir3(dir);
   } catch {
     return [];
   }
@@ -3260,7 +3264,7 @@ async function cancelReply(dir, conv, mid) {
 async function pruneStaleReplies(dir, now = Date.now()) {
   let names = [];
   try {
-    names = await readdir2(dir);
+    names = await readdir3(dir);
   } catch {
     return;
   }
@@ -3432,10 +3436,10 @@ async function handleReplyCommand(kind, conv, record, payload, deps) {
 // src/core/cursor.ts
 import { hostname as hostname2 } from "node:os";
 import { realpathSync } from "node:fs";
-import { readdir as readdir4, stat as stat5, unlink as unlink4 } from "node:fs/promises";
+import { readdir as readdir5, stat as stat5, unlink as unlink4 } from "node:fs/promises";
 
 // src/core/hook.ts
-import { readdir as readdir3, readFile as readFile5, unlink as unlink3 } from "node:fs/promises";
+import { readdir as readdir4, readFile as readFile5, unlink as unlink3 } from "node:fs/promises";
 import { hostname } from "node:os";
 import { basename as basename3 } from "node:path";
 
@@ -4077,7 +4081,7 @@ async function traceSendFailure(event, failPath = SEND_FAIL_PATH, lastSendPath =
 }
 async function reconcileProvisional(config, hookPid) {
   try {
-    const files = await readdir3(SESSIONS_DIR).catch(() => []);
+    const files = await readdir4(SESSIONS_DIR).catch(() => []);
     const provisionals = [];
     for (const f of files) {
       if (!f.endsWith(".json"))
@@ -4111,7 +4115,7 @@ async function reconcileProvisional(config, hookPid) {
   } catch {}
 }
 async function readTrackedSessions() {
-  const files = await readdir3(SESSIONS_DIR).catch(() => []);
+  const files = await readdir4(SESSIONS_DIR).catch(() => []);
   const out = [];
   for (const f of files) {
     if (!f.endsWith(".json"))
@@ -4631,7 +4635,7 @@ var IGNORED_TTL_MS = 86400000;
 async function markIgnored(dir, ids, now) {
   for (const id of ids)
     await atomicWrite(`${dir}/${id}`, "", 384);
-  for (const name of await readdir4(dir).catch(() => [])) {
+  for (const name of await readdir5(dir).catch(() => [])) {
     const path = `${dir}/${name}`;
     const s = await stat5(path).catch(() => null);
     if (s && now - s.mtimeMs > IGNORED_TTL_MS)
@@ -4808,7 +4812,7 @@ var clearStop = (sessionsDir, sessionId) => clearInterruptFlagAt(sessionsDir, se
 async function pruneStaleAntigravityStops(sessionsDir, now) {
   let names = [];
   try {
-    names = await readdir5(sessionsDir);
+    names = await readdir6(sessionsDir);
   } catch {
     return;
   }

@@ -2,7 +2,7 @@ import { createRequire } from "node:module";
 var __require = /* @__PURE__ */ createRequire(import.meta.url);
 
 // src/entries/cc-watchdog.ts
-import { readdir as readdir8, readFile as readFile10, unlink as unlink6 } from "node:fs/promises";
+import { readdir as readdir9, readFile as readFile10, unlink as unlink6 } from "node:fs/promises";
 import { readFileSync as readFileSync2, statSync as statSync4, unlinkSync } from "node:fs";
 import { hostname as hostname6 } from "node:os";
 import { basename as basename8 } from "node:path";
@@ -94,11 +94,11 @@ async function sha256Hex(s) {
 // src/core/antigravity-inbox.ts
 import { spawn as spawn2 } from "node:child_process";
 import { existsSync as existsSync2 } from "node:fs";
-import { readdir, readFile as readFile2, rename as rename2, stat as stat2, unlink as unlink2 } from "node:fs/promises";
+import { readdir as readdir2, readFile as readFile2, rename as rename2, stat as stat2, unlink as unlink2 } from "node:fs/promises";
 import { delimiter, isAbsolute as isAbsolute2, join as join2 } from "node:path";
 
 // src/core/shared.ts
-import { access, chmod, open, readFile, rename, stat, mkdir, unlink, writeFile } from "node:fs/promises";
+import { access, chmod, open, readdir, readFile, rename, stat, mkdir, unlink, writeFile } from "node:fs/promises";
 import { appendFileSync, existsSync, readFileSync, statSync, truncateSync } from "node:fs";
 import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
@@ -971,6 +971,10 @@ async function forgetDevinGrants(recordPath) {
   if (recordPath.endsWith(".json"))
     await unlink(`${recordPath.slice(0, -5)}${DEVIN_GRANTS_SUFFIX}`).catch(() => {});
 }
+async function forgetAllDevinGrants(sessionsDir = SESSIONS_DIR) {
+  const files = await readdir(sessionsDir).catch(() => []);
+  await Promise.all(files.filter((f) => f.endsWith(DEVIN_GRANTS_SUFFIX)).map((f) => unlink(`${sessionsDir}/${f}`).catch(() => {})));
+}
 async function settleDecisionHoldRecord(sessionId, patch, heldSince) {
   return settleDecisionHoldRecordAt(SESSIONS_DIR, sessionId, patch, heldSince);
 }
@@ -1122,7 +1126,7 @@ var fileFor = (dir, conv, mid, suffix) => join2(dir, `${conv}.${mid}${suffix}`);
 async function midsOf(dir, conv, suffix) {
   let names = [];
   try {
-    names = await readdir(dir);
+    names = await readdir2(dir);
   } catch {
     return [];
   }
@@ -1218,7 +1222,7 @@ async function cancelReply(dir, conv, mid) {
 async function pruneStaleReplies(dir, now = Date.now()) {
   let names = [];
   try {
-    names = await readdir(dir);
+    names = await readdir2(dir);
   } catch {
     return;
   }
@@ -1390,7 +1394,7 @@ async function handleReplyCommand(kind, conv, record, payload, deps) {
 // src/core/adapter.ts
 import { execFile as execFile2, execFileSync as execFileSync2 } from "node:child_process";
 import { copyFileSync, existsSync as existsSync3, mkdtempSync, rmSync, statSync as statSync2 } from "node:fs";
-import { readdir as readdir2, readFile as readFile3, stat as stat3 } from "node:fs/promises";
+import { readdir as readdir3, readFile as readFile3, stat as stat3 } from "node:fs/promises";
 import { devNull, tmpdir } from "node:os";
 import { promisify as promisify2 } from "node:util";
 import { basename as basename2, isAbsolute as isAbsolute3, join as join3, resolve as resolve2 } from "node:path";
@@ -2502,7 +2506,7 @@ var ROLLOUT_SCAN_MAX_HEADS = 40;
 var ROLLOUT_META_HEAD_BYTES = 64 * 1024;
 async function listNumericDirsDesc(path) {
   try {
-    return (await readdir2(path)).filter((n) => /^\d+$/.test(n)).sort((a, b) => b.localeCompare(a));
+    return (await readdir3(path)).filter((n) => /^\d+$/.test(n)).sort((a, b) => b.localeCompare(a));
   } catch {
     return [];
   }
@@ -2518,7 +2522,7 @@ async function codexNewestRolloutForCwd(cwd, home = codexHome()) {
           const dir = join3(sessions, y, m, d);
           let names;
           try {
-            names = await readdir2(dir);
+            names = await readdir3(dir);
           } catch {
             continue;
           }
@@ -2897,7 +2901,7 @@ async function codexRolloutExistsForSession(sessionId, home = codexHome()) {
       for (const d of await listNumericDirsDesc(join3(sessions, y, m))) {
         let names;
         try {
-          names = await readdir2(join3(sessions, y, m, d));
+          names = await readdir3(join3(sessions, y, m, d));
         } catch {
           names = [];
         }
@@ -3431,17 +3435,17 @@ function adapterFor(agent) {
 var allAdapters = [claudeAdapter, codexAdapter];
 
 // src/core/antigravity.ts
-import { readdir as readdir5 } from "node:fs/promises";
+import { readdir as readdir6 } from "node:fs/promises";
 import { hostname as hostname3 } from "node:os";
 import { basename as basename5 } from "node:path";
 
 // src/core/cursor.ts
 import { hostname as hostname2 } from "node:os";
 import { realpathSync } from "node:fs";
-import { readdir as readdir4, stat as stat5, unlink as unlink4 } from "node:fs/promises";
+import { readdir as readdir5, stat as stat5, unlink as unlink4 } from "node:fs/promises";
 
 // src/core/hook.ts
-import { readdir as readdir3, readFile as readFile5, unlink as unlink3 } from "node:fs/promises";
+import { readdir as readdir4, readFile as readFile5, unlink as unlink3 } from "node:fs/promises";
 import { hostname } from "node:os";
 import { basename as basename3 } from "node:path";
 
@@ -4083,7 +4087,7 @@ async function traceSendFailure(event, failPath = SEND_FAIL_PATH, lastSendPath =
 }
 async function reconcileProvisional(config, hookPid) {
   try {
-    const files = await readdir3(SESSIONS_DIR).catch(() => []);
+    const files = await readdir4(SESSIONS_DIR).catch(() => []);
     const provisionals = [];
     for (const f of files) {
       if (!f.endsWith(".json"))
@@ -4117,7 +4121,7 @@ async function reconcileProvisional(config, hookPid) {
   } catch {}
 }
 async function readTrackedSessions() {
-  const files = await readdir3(SESSIONS_DIR).catch(() => []);
+  const files = await readdir4(SESSIONS_DIR).catch(() => []);
   const out = [];
   for (const f of files) {
     if (!f.endsWith(".json"))
@@ -4637,7 +4641,7 @@ var IGNORED_TTL_MS = 86400000;
 async function markIgnored(dir, ids, now) {
   for (const id of ids)
     await atomicWrite(`${dir}/${id}`, "", 384);
-  for (const name of await readdir4(dir).catch(() => [])) {
+  for (const name of await readdir5(dir).catch(() => [])) {
     const path = `${dir}/${name}`;
     const s = await stat5(path).catch(() => null);
     if (s && now - s.mtimeMs > IGNORED_TTL_MS)
@@ -4814,7 +4818,7 @@ var clearStop = (sessionsDir, sessionId) => clearInterruptFlagAt(sessionsDir, se
 async function pruneStaleAntigravityStops(sessionsDir, now) {
   let names = [];
   try {
-    names = await readdir5(sessionsDir);
+    names = await readdir6(sessionsDir);
   } catch {
     return;
   }
@@ -5889,7 +5893,7 @@ import { networkInterfaces } from "node:os";
 // src/core/lan-frames.ts
 import { execFile as execFile3 } from "node:child_process";
 import { watch } from "node:fs";
-import { readdir as readdir6, readFile as readFile6 } from "node:fs/promises";
+import { readdir as readdir7, readFile as readFile6 } from "node:fs/promises";
 import { basename as basename6 } from "node:path";
 import { promisify as promisify3 } from "node:util";
 
@@ -6234,7 +6238,7 @@ function createLanFrameStore(deps = {}) {
     const at = now();
     let files = [];
     try {
-      files = await readdir6(sessionsDir);
+      files = await readdir7(sessionsDir);
     } catch {
       files = [];
     }
@@ -7308,8 +7312,11 @@ function ruleGrant(rule) {
   const content = typeof rule.ruleContent === "string" ? rule.ruleContent : "";
   if (!content)
     return tool === "ExitPlanMode" ? "plans" : grantEntry("tool", tool);
-  if (SHELL_TOOLS.has(tool))
-    return content.endsWith(":*") ? grantEntry("cmd", content.slice(0, -2)) : "exact";
+  if (SHELL_TOOLS.has(tool)) {
+    if (content.endsWith(":*"))
+      return grantEntry("cmd", content.slice(0, -2));
+    return content.includes("*") ? grantEntry("cmd", content) : "exact";
+  }
   if (tool === "WebFetch" && content.startsWith("domain:"))
     return grantEntry("domain", content.slice("domain:".length));
   if (EDIT_TOOLS.has(tool))
@@ -8991,7 +8998,7 @@ class CodexRemoteInputBridge {
 // src/core/activity.ts
 import { createHash as createHash3, randomUUID } from "node:crypto";
 import { createReadStream, existsSync as existsSync4 } from "node:fs";
-import { readdir as readdir7, readFile as readFile9, stat as stat6 } from "node:fs/promises";
+import { readdir as readdir8, readFile as readFile9, stat as stat6 } from "node:fs/promises";
 import { dirname as dirname2 } from "node:path";
 import * as zlib from "node:zlib";
 var HOT_DAYS = 40;
@@ -9287,7 +9294,7 @@ async function scanFile(path, cursor, onLine) {
 }
 async function listFiles(dir, match) {
   try {
-    const names = await readdir7(dir, { recursive: true });
+    const names = await readdir8(dir, { recursive: true });
     return names.filter(match).map((n) => `${dir}/${n}`);
   } catch {
     return [];
@@ -10520,7 +10527,7 @@ function machineName(config) {
 }
 async function readAllRecordEntries() {
   try {
-    const files = await readdir8(SESSIONS_DIR);
+    const files = await readdir9(SESSIONS_DIR);
     const out = [];
     for (const f of files) {
       if (!f.endsWith(".json"))
@@ -10876,7 +10883,7 @@ async function antigravitySettleTick(config, deps = {}) {
   const dir = deps.dir ?? SESSIONS_DIR;
   let files = [];
   try {
-    files = await readdir8(dir);
+    files = await readdir9(dir);
   } catch {
     return 0;
   }
@@ -11466,7 +11473,7 @@ var waitingBeatAt;
 async function sweep(config, deps = {}) {
   let files;
   try {
-    files = await readdir8(SESSIONS_DIR);
+    files = await readdir9(SESSIONS_DIR);
   } catch {
     return { revoked: false, remaining: 0, delivered: false };
   }

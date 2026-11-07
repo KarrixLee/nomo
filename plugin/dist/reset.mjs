@@ -3,11 +3,11 @@ var __require = /* @__PURE__ */ createRequire(import.meta.url);
 
 // src/entries/reset.ts
 import { execFileSync as execFileSync2 } from "node:child_process";
-import { readdir, readFile as readFile2, unlink as unlink2 } from "node:fs/promises";
+import { readdir as readdir2, readFile as readFile2, unlink as unlink2 } from "node:fs/promises";
 import { basename as basename2 } from "node:path";
 
 // src/core/shared.ts
-import { access, chmod, open, readFile, rename, stat, mkdir, unlink, writeFile } from "node:fs/promises";
+import { access, chmod, open, readdir, readFile, rename, stat, mkdir, unlink, writeFile } from "node:fs/promises";
 import { appendFileSync, existsSync, readFileSync, statSync, truncateSync } from "node:fs";
 import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
@@ -966,6 +966,10 @@ async function forgetDevinGrants(recordPath) {
   if (recordPath.endsWith(".json"))
     await unlink(`${recordPath.slice(0, -5)}${DEVIN_GRANTS_SUFFIX}`).catch(() => {});
 }
+async function forgetAllDevinGrants(sessionsDir = SESSIONS_DIR) {
+  const files = await readdir(sessionsDir).catch(() => []);
+  await Promise.all(files.filter((f) => f.endsWith(DEVIN_GRANTS_SUFFIX)).map((f) => unlink(`${sessionsDir}/${f}`).catch(() => {})));
+}
 async function settleDecisionHoldRecord(sessionId, patch, heldSince) {
   return settleDecisionHoldRecordAt(SESSIONS_DIR, sessionId, patch, heldSince);
 }
@@ -1163,7 +1167,7 @@ async function reset(deps = {}) {
   const config = await (deps.loadConfigFn ?? loadConfig)();
   let files = [];
   try {
-    files = (await readdir(sessionsDir)).filter((f) => f.endsWith(".json"));
+    files = (await readdir2(sessionsDir)).filter((f) => f.endsWith(".json"));
   } catch {
     files = [];
   }
@@ -1194,6 +1198,7 @@ async function reset(deps = {}) {
   }
   if (kept > 0)
     print(`Left ${kept} live session${kept === 1 ? "" : "s"} untouched.`);
+  await forgetAllDevinGrants(sessionsDir);
   print("Pairing and keys were not touched — use the unpair command if you want that.");
   return 0;
 }

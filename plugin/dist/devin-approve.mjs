@@ -9,13 +9,13 @@ import { hostname as hostname3 } from "node:os";
 // src/core/adapter.ts
 import { execFile as execFile2, execFileSync as execFileSync2 } from "node:child_process";
 import { copyFileSync, existsSync as existsSync2, mkdtempSync, rmSync, statSync as statSync2 } from "node:fs";
-import { readdir, readFile as readFile2, stat as stat2 } from "node:fs/promises";
+import { readdir as readdir2, readFile as readFile2, stat as stat2 } from "node:fs/promises";
 import { devNull, tmpdir } from "node:os";
 import { promisify as promisify2 } from "node:util";
 import { basename as basename2, isAbsolute as isAbsolute2, join as join2, resolve as resolve2 } from "node:path";
 
 // src/core/shared.ts
-import { access, chmod, open, readFile, rename, stat, mkdir, unlink, writeFile } from "node:fs/promises";
+import { access, chmod, open, readdir, readFile, rename, stat, mkdir, unlink, writeFile } from "node:fs/promises";
 import { appendFileSync, existsSync, readFileSync, statSync, truncateSync } from "node:fs";
 import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
@@ -973,6 +973,10 @@ function devinGrantsPath(sessionsDir, sessionId) {
 async function forgetDevinGrants(recordPath) {
   if (recordPath.endsWith(".json"))
     await unlink(`${recordPath.slice(0, -5)}${DEVIN_GRANTS_SUFFIX}`).catch(() => {});
+}
+async function forgetAllDevinGrants(sessionsDir = SESSIONS_DIR) {
+  const files = await readdir(sessionsDir).catch(() => []);
+  await Promise.all(files.filter((f) => f.endsWith(DEVIN_GRANTS_SUFFIX)).map((f) => unlink(`${sessionsDir}/${f}`).catch(() => {})));
 }
 async function settleDecisionHoldRecord(sessionId, patch, heldSince) {
   return settleDecisionHoldRecordAt(SESSIONS_DIR, sessionId, patch, heldSince);
@@ -2209,7 +2213,7 @@ var ROLLOUT_SCAN_MAX_HEADS = 40;
 var ROLLOUT_META_HEAD_BYTES = 64 * 1024;
 async function listNumericDirsDesc(path) {
   try {
-    return (await readdir(path)).filter((n) => /^\d+$/.test(n)).sort((a, b) => b.localeCompare(a));
+    return (await readdir2(path)).filter((n) => /^\d+$/.test(n)).sort((a, b) => b.localeCompare(a));
   } catch {
     return [];
   }
@@ -2225,7 +2229,7 @@ async function codexNewestRolloutForCwd(cwd, home = codexHome()) {
           const dir = join2(sessions, y, m, d);
           let names;
           try {
-            names = await readdir(dir);
+            names = await readdir2(dir);
           } catch {
             continue;
           }
@@ -2604,7 +2608,7 @@ async function codexRolloutExistsForSession(sessionId, home = codexHome()) {
       for (const d of await listNumericDirsDesc(join2(sessions, y, m))) {
         let names;
         try {
-          names = await readdir(join2(sessions, y, m, d));
+          names = await readdir2(join2(sessions, y, m, d));
         } catch {
           names = [];
         }
@@ -3140,10 +3144,10 @@ var allAdapters = [claudeAdapter, codexAdapter];
 // src/core/cursor.ts
 import { hostname as hostname2 } from "node:os";
 import { realpathSync } from "node:fs";
-import { readdir as readdir3, stat as stat4, unlink as unlink3 } from "node:fs/promises";
+import { readdir as readdir4, stat as stat4, unlink as unlink3 } from "node:fs/promises";
 
 // src/core/hook.ts
-import { readdir as readdir2, readFile as readFile4, unlink as unlink2 } from "node:fs/promises";
+import { readdir as readdir3, readFile as readFile4, unlink as unlink2 } from "node:fs/promises";
 import { hostname } from "node:os";
 import { basename as basename3 } from "node:path";
 
@@ -3785,7 +3789,7 @@ async function traceSendFailure(event, failPath = SEND_FAIL_PATH, lastSendPath =
 }
 async function reconcileProvisional(config, hookPid) {
   try {
-    const files = await readdir2(SESSIONS_DIR).catch(() => []);
+    const files = await readdir3(SESSIONS_DIR).catch(() => []);
     const provisionals = [];
     for (const f of files) {
       if (!f.endsWith(".json"))
@@ -3819,7 +3823,7 @@ async function reconcileProvisional(config, hookPid) {
   } catch {}
 }
 async function readTrackedSessions() {
-  const files = await readdir2(SESSIONS_DIR).catch(() => []);
+  const files = await readdir3(SESSIONS_DIR).catch(() => []);
   const out = [];
   for (const f of files) {
     if (!f.endsWith(".json"))
@@ -4339,7 +4343,7 @@ var IGNORED_TTL_MS = 86400000;
 async function markIgnored(dir, ids, now) {
   for (const id of ids)
     await atomicWrite(`${dir}/${id}`, "", 384);
-  for (const name of await readdir3(dir).catch(() => [])) {
+  for (const name of await readdir4(dir).catch(() => [])) {
     const path = `${dir}/${name}`;
     const s = await stat4(path).catch(() => null);
     if (s && now - s.mtimeMs > IGNORED_TTL_MS)
@@ -4942,8 +4946,11 @@ function ruleGrant(rule) {
   const content = typeof rule.ruleContent === "string" ? rule.ruleContent : "";
   if (!content)
     return tool === "ExitPlanMode" ? "plans" : grantEntry("tool", tool);
-  if (SHELL_TOOLS.has(tool))
-    return content.endsWith(":*") ? grantEntry("cmd", content.slice(0, -2)) : "exact";
+  if (SHELL_TOOLS.has(tool)) {
+    if (content.endsWith(":*"))
+      return grantEntry("cmd", content.slice(0, -2));
+    return content.includes("*") ? grantEntry("cmd", content) : "exact";
+  }
   if (tool === "WebFetch" && content.startsWith("domain:"))
     return grantEntry("domain", content.slice("domain:".length));
   if (EDIT_TOOLS.has(tool))
@@ -6039,11 +6046,62 @@ function isOwnExec(cardTool, toolInput, root) {
 }
 var PLAIN_COMMAND = /^[A-Za-z0-9_./-]+( [^;&|`$<>(){}\n]*)?$/;
 var commandOf = (toolInput) => typeof toolInput.command === "string" ? toolInput.command : "";
+var WRAPPERS = new Set([
+  "bash",
+  "sh",
+  "zsh",
+  "fish",
+  "dash",
+  "ksh",
+  "csh",
+  "tcsh",
+  "pwsh",
+  "env",
+  "sudo",
+  "doas",
+  "su",
+  "timeout",
+  "xargs",
+  "npx",
+  "bunx",
+  "pnpx",
+  "nohup",
+  "nice",
+  "exec",
+  "eval",
+  "command",
+  "builtin",
+  "time",
+  "watch",
+  ".",
+  "source",
+  "python",
+  "node",
+  "bun",
+  "deno",
+  "ruby",
+  "perl",
+  "php",
+  "lua",
+  "osascript",
+  "find",
+  "awk",
+  "gawk",
+  "stdbuf",
+  "setsid",
+  "caffeinate",
+  "arch",
+  "chroot",
+  "script",
+  "ssh"
+]);
+var isWrapper = (word) => WRAPPERS.has((word.split("/").pop() ?? "").toLowerCase().replace(/(?<=[a-z])[\d.]+$/, ""));
 function devinGrantFor(cardTool, toolInput) {
   if (cardTool !== "shell")
     return { tool: cardTool };
   const command = commandOf(toolInput);
-  return PLAIN_COMMAND.test(command) ? { tool: "shell", prefix: command.split(" ", 1)[0] } : { tool: "shell", exact: command };
+  const name = command.split(" ", 1)[0];
+  return PLAIN_COMMAND.test(command) && !isWrapper(name) ? { tool: "shell", prefix: name } : { tool: "shell", exact: command };
 }
 function devinGrantText(cardTool, toolInput) {
   const g = devinGrantFor(cardTool, toolInput);
@@ -6059,7 +6117,7 @@ function devinGrantMatches(grant, cardTool, toolInput) {
   const command = commandOf(toolInput);
   if (typeof grant.exact === "string")
     return command === grant.exact;
-  return typeof grant.prefix === "string" && grant.prefix.length > 0 && PLAIN_COMMAND.test(command) && (command === grant.prefix || command.startsWith(`${grant.prefix} `));
+  return typeof grant.prefix === "string" && grant.prefix.length > 0 && !isWrapper(grant.prefix) && PLAIN_COMMAND.test(command) && (command === grant.prefix || command.startsWith(`${grant.prefix} `));
 }
 async function readGrants(path) {
   try {
@@ -6139,10 +6197,11 @@ async function runDevinApproval(raw, deps = {}) {
     if (!stdin)
       return "";
     const { session_id: sessionId, tool_name: cardTool, tool_input: toolInput } = JSON.parse(stdin);
+    const paired = Boolean(await (deps.hold?.loadConfigFn ?? loadConfig)());
     const grantsPath = devinGrantsPath(deps.sessionsDir ?? SESSIONS_DIR, sessionId);
-    if (cardTool !== DEVIN_QUESTION_CARD_TOOL && (await readGrants(grantsPath)).some((g) => devinGrantMatches(g, cardTool, toolInput)))
+    if (paired && cardTool !== DEVIN_QUESTION_CARD_TOOL && (await readGrants(grantsPath)).some((g) => devinGrantMatches(g, cardTool, toolInput)))
       return APPROVE;
-    if (isOwnExec(cardTool, toolInput, deps.pluginRoot) && await (deps.hold?.loadConfigFn ?? loadConfig)())
+    if (paired && isOwnExec(cardTool, toolInput, deps.pluginRoot))
       return APPROVE;
     let line;
     let gone = false;

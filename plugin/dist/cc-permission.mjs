@@ -8,7 +8,7 @@ import { homedir, hostname as hostname2 } from "node:os";
 import { basename as basename4, isAbsolute as isAbsolute3, relative, resolve as resolve3 } from "node:path";
 
 // src/core/hook.ts
-import { readdir as readdir2, readFile as readFile4, unlink as unlink2 } from "node:fs/promises";
+import { readdir as readdir3, readFile as readFile4, unlink as unlink2 } from "node:fs/promises";
 import { hostname } from "node:os";
 import { basename as basename3 } from "node:path";
 
@@ -99,13 +99,13 @@ async function sha256Hex(s) {
 // src/core/adapter.ts
 import { execFile as execFile2, execFileSync as execFileSync2 } from "node:child_process";
 import { copyFileSync, existsSync as existsSync2, mkdtempSync, rmSync, statSync as statSync2 } from "node:fs";
-import { readdir, readFile as readFile2, stat as stat2 } from "node:fs/promises";
+import { readdir as readdir2, readFile as readFile2, stat as stat2 } from "node:fs/promises";
 import { devNull, tmpdir } from "node:os";
 import { promisify as promisify2 } from "node:util";
 import { basename as basename2, isAbsolute as isAbsolute2, join as join2, resolve as resolve2 } from "node:path";
 
 // src/core/shared.ts
-import { access, chmod, open, readFile, rename, stat, mkdir, unlink, writeFile } from "node:fs/promises";
+import { access, chmod, open, readdir, readFile, rename, stat, mkdir, unlink, writeFile } from "node:fs/promises";
 import { appendFileSync, existsSync, readFileSync, statSync, truncateSync } from "node:fs";
 import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
@@ -977,6 +977,10 @@ function devinGrantsPath(sessionsDir, sessionId) {
 async function forgetDevinGrants(recordPath) {
   if (recordPath.endsWith(".json"))
     await unlink(`${recordPath.slice(0, -5)}${DEVIN_GRANTS_SUFFIX}`).catch(() => {});
+}
+async function forgetAllDevinGrants(sessionsDir = SESSIONS_DIR) {
+  const files = await readdir(sessionsDir).catch(() => []);
+  await Promise.all(files.filter((f) => f.endsWith(DEVIN_GRANTS_SUFFIX)).map((f) => unlink(`${sessionsDir}/${f}`).catch(() => {})));
 }
 async function settleDecisionHoldRecord(sessionId, patch, heldSince) {
   return settleDecisionHoldRecordAt(SESSIONS_DIR, sessionId, patch, heldSince);
@@ -2213,7 +2217,7 @@ var ROLLOUT_SCAN_MAX_HEADS = 40;
 var ROLLOUT_META_HEAD_BYTES = 64 * 1024;
 async function listNumericDirsDesc(path) {
   try {
-    return (await readdir(path)).filter((n) => /^\d+$/.test(n)).sort((a, b) => b.localeCompare(a));
+    return (await readdir2(path)).filter((n) => /^\d+$/.test(n)).sort((a, b) => b.localeCompare(a));
   } catch {
     return [];
   }
@@ -2229,7 +2233,7 @@ async function codexNewestRolloutForCwd(cwd, home = codexHome()) {
           const dir = join2(sessions, y, m, d);
           let names;
           try {
-            names = await readdir(dir);
+            names = await readdir2(dir);
           } catch {
             continue;
           }
@@ -2608,7 +2612,7 @@ async function codexRolloutExistsForSession(sessionId, home = codexHome()) {
       for (const d of await listNumericDirsDesc(join2(sessions, y, m))) {
         let names;
         try {
-          names = await readdir(join2(sessions, y, m, d));
+          names = await readdir2(join2(sessions, y, m, d));
         } catch {
           names = [];
         }
@@ -3779,7 +3783,7 @@ async function traceSendFailure(event, failPath = SEND_FAIL_PATH, lastSendPath =
 }
 async function reconcileProvisional(config, hookPid) {
   try {
-    const files = await readdir2(SESSIONS_DIR).catch(() => []);
+    const files = await readdir3(SESSIONS_DIR).catch(() => []);
     const provisionals = [];
     for (const f of files) {
       if (!f.endsWith(".json"))
@@ -3813,7 +3817,7 @@ async function reconcileProvisional(config, hookPid) {
   } catch {}
 }
 async function readTrackedSessions() {
-  const files = await readdir2(SESSIONS_DIR).catch(() => []);
+  const files = await readdir3(SESSIONS_DIR).catch(() => []);
   const out = [];
   for (const f of files) {
     if (!f.endsWith(".json"))
@@ -4503,8 +4507,11 @@ function ruleGrant(rule) {
   const content = typeof rule.ruleContent === "string" ? rule.ruleContent : "";
   if (!content)
     return tool === "ExitPlanMode" ? "plans" : grantEntry("tool", tool);
-  if (SHELL_TOOLS.has(tool))
-    return content.endsWith(":*") ? grantEntry("cmd", content.slice(0, -2)) : "exact";
+  if (SHELL_TOOLS.has(tool)) {
+    if (content.endsWith(":*"))
+      return grantEntry("cmd", content.slice(0, -2));
+    return content.includes("*") ? grantEntry("cmd", content) : "exact";
+  }
   if (tool === "WebFetch" && content.startsWith("domain:"))
     return grantEntry("domain", content.slice("domain:".length));
   if (EDIT_TOOLS.has(tool))
