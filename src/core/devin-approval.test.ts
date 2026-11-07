@@ -260,37 +260,48 @@ describe("Always allow — session grants", () => {
     if (line !== undefined) deps.emit!(line);
   }) as never;
   const req = (command: string) => JSON.stringify(payload("exec", { command }));
+  const PAIRED = { loadConfigFn: async () => CONFIG } as never;
 
   test("allow_always stores the grant (0600) and approves; the next matching request short-circuits without the relay", async () => {
     const dir = freshDir();
     const calls = { n: 0 };
-    expect(await runDevinApproval(req("touch one.txt"), { env: ENV, sessionsDir: dir, run: scripted(ALWAYS, calls) })).toBe('{"decision":"approve"}');
+    expect(await runDevinApproval(req("touch one.txt"), { env: ENV, hold: PAIRED, sessionsDir: dir, run: scripted(ALWAYS, calls) })).toBe('{"decision":"approve"}');
     const path = devinGrantsPath(dir, "brawny-shirt");
     expect(JSON.parse(await readFile(path, "utf8"))).toEqual([{ tool: "shell", prefix: "touch" }]);
     expect((await stat(path)).mode & 0o777).toBe(0o600);
-    expect(await runDevinApproval(req("touch two.txt"), { env: ENV, sessionsDir: dir, run: scripted(undefined, calls) })).toBe('{"decision":"approve"}');
+    expect(await runDevinApproval(req("touch two.txt"), { env: ENV, hold: PAIRED, sessionsDir: dir, run: scripted(undefined, calls) })).toBe('{"decision":"approve"}');
     expect(calls.n).toBe(1); // no hold, no card, not even the pause gate
     // a chained command still goes to the phone (and no answer → no opinion)
-    expect(await runDevinApproval(req("touch x && echo y"), { env: ENV, sessionsDir: dir, run: scripted(undefined, calls) })).toBe("");
+    expect(await runDevinApproval(req("touch x && echo y"), { env: ENV, hold: PAIRED, sessionsDir: dir, run: scripted(undefined, calls) })).toBe("");
     expect(calls.n).toBe(2);
     // another session never inherits it
     const other = JSON.stringify({ ...payload("exec", { command: "touch z" }), session_id: "other-slug" });
-    expect(await runDevinApproval(other, { env: ENV, sessionsDir: dir, run: scripted(undefined, calls) })).toBe("");
+    expect(await runDevinApproval(other, { env: ENV, hold: PAIRED, sessionsDir: dir, run: scripted(undefined, calls) })).toBe("");
     expect(calls.n).toBe(3);
+  });
+
+  test("unpaired: a saved grant approves nothing (Devin's own prompt decides)", async () => {
+    const dir = freshDir();
+    const calls = { n: 0 };
+    await runDevinApproval(req("touch one.txt"), { env: ENV, hold: PAIRED, sessionsDir: dir, run: scripted(ALWAYS, calls) });
+    expect(await stat(devinGrantsPath(dir, "brawny-shirt")).then(() => true, () => false)).toBe(true);
+    const unpaired = { loadConfigFn: async () => null } as never;
+    expect(await runDevinApproval(req("touch two.txt"), { env: ENV, hold: unpaired, sessionsDir: dir, run: scripted(undefined, calls) })).toBe("");
+    expect(calls.n).toBe(2); // went to the hold (which, unpaired, prints nothing) — no short-circuit approve
   });
 
   test("plain allow, allow_mode and deny store nothing", async () => {
     const dir = freshDir();
     const calls = { n: 0 };
     for (const line of [hso({ behavior: "allow" }), hso({ behavior: "deny", message: "no" }), undefined]) {
-      await runDevinApproval(req("touch one.txt"), { env: ENV, sessionsDir: dir, run: scripted(line, calls) });
+      await runDevinApproval(req("touch one.txt"), { env: ENV, hold: PAIRED, sessionsDir: dir, run: scripted(line, calls) });
     }
     expect(await stat(devinGrantsPath(dir, "brawny-shirt")).then(() => true, () => false)).toBe(false);
   });
 
   test("SessionEnd and the watchdog's record retirement delete the grant file", async () => {
     const dir = freshDir();
-    await runDevinApproval(req("touch one.txt"), { env: ENV, sessionsDir: dir, run: scripted(ALWAYS, { n: 0 }) });
+    await runDevinApproval(req("touch one.txt"), { env: ENV, hold: PAIRED, sessionsDir: dir, run: scripted(ALWAYS, { n: 0 }) });
     const path = devinGrantsPath(dir, "brawny-shirt");
     const exists = () => stat(path).then(() => true, () => false);
     expect(await exists()).toBe(true);
@@ -298,7 +309,7 @@ describe("Always allow — session grants", () => {
       env: ENV, sessionsDir: dir, config: null, stampPath: join(dir, "stamp"),
     });
     expect(await exists()).toBe(false);
-    await runDevinApproval(req("touch one.txt"), { env: ENV, sessionsDir: dir, run: scripted(ALWAYS, { n: 0 }) });
+    await runDevinApproval(req("touch one.txt"), { env: ENV, hold: PAIRED, sessionsDir: dir, run: scripted(ALWAYS, { n: 0 }) });
     await forgetDevinGrants(join(dir, "brawny-shirt.json"));
     expect(await exists()).toBe(false);
   });

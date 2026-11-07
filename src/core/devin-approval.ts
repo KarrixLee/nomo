@@ -44,7 +44,7 @@
 // operator, substitution or redirect grants only that exact text, and only a plain command can ever
 // match a name grant, so `touch a && rm -rf ~` always goes to the phone. A WRAPPER (`bash`, `env`,
 // `sudo`, `python3`… — WRAPPERS) also grants only the exact text: `bash` would cover `bash -c "…"`.
-// Any other tool is granted whole.
+// Any other tool is granted whole. A grant only ever applies on a PAIRED computer.
 // The grant is deleted on SessionEnd and when the watchdog retires the row.
 //
 // NOMO'S OWN COMMANDS: on a paired computer, the `exec` of one of Nomo's own SAFE skill commands
@@ -332,12 +332,15 @@ export async function runDevinApproval(raw: string, deps: DevinApprovalDeps = {}
     if (!stdin) return "";
     const { session_id: sessionId, tool_name: cardTool, tool_input: toolInput } =
       JSON.parse(stdin) as { session_id: string; tool_name: string; tool_input: Record<string, unknown> };
+    // Nothing below auto-approves on an unpaired computer: Devin's own prompt decides. A grants file a
+    // crashed session left behind must not outlive the pairing (unpair/reset also delete them).
+    const paired = Boolean(await (deps.hold?.loadConfigFn ?? loadConfig)());
     // An Always-allow grant answers at once — before the pause gate and before any phone card.
     const grantsPath = devinGrantsPath(deps.sessionsDir ?? SESSIONS_DIR, sessionId);
-    if (cardTool !== DEVIN_QUESTION_CARD_TOOL && (await readGrants(grantsPath)).some((g) => devinGrantMatches(g, cardTool, toolInput))) return APPROVE;
-    // Nomo's OWN /nomo-* commands (status, approvals on, …) never become a phone card — but only when
-    // paired (unpaired, Devin's own prompt decides) and only byte-for-byte the skill's command.
-    if (isOwnExec(cardTool, toolInput, deps.pluginRoot) && await (deps.hold?.loadConfigFn ?? loadConfig)()) return APPROVE;
+    if (paired && cardTool !== DEVIN_QUESTION_CARD_TOOL && (await readGrants(grantsPath)).some((g) => devinGrantMatches(g, cardTool, toolInput))) return APPROVE;
+    // Nomo's OWN /nomo-* commands (status, approvals on, …) never become a phone card — only
+    // byte-for-byte the skill's command.
+    if (paired && isOwnExec(cardTool, toolInput, deps.pluginRoot)) return APPROVE;
     let line: string | undefined;
     let gone = false;
     const abandoned = () => (gone ||= (deps.abandoned ?? defaultAbandoned)());

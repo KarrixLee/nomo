@@ -10,7 +10,7 @@
 // and node >= 18 — no `Bun.*` APIs. File IO goes through node:fs/promises; base64 decode goes
 // through the portable crypto.ts helpers. Task 2.3 bundles these .ts files to a single .mjs.
 
-import { access, chmod, open, readFile, rename, stat, mkdir, unlink, writeFile } from "node:fs/promises";
+import { access, chmod, open, readdir, readFile, rename, stat, mkdir, unlink, writeFile } from "node:fs/promises";
 import { appendFileSync, existsSync, readFileSync, statSync, truncateSync } from "node:fs";
 import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
@@ -2218,6 +2218,13 @@ export function devinGrantsPath(sessionsDir: string, sessionId: string): string 
  *  Best-effort; a no-op for every other agent (no such file). */
 export async function forgetDevinGrants(recordPath: string): Promise<void> {
   if (recordPath.endsWith(".json")) await unlink(`${recordPath.slice(0, -5)}${DEVIN_GRANTS_SUFFIX}`).catch(() => {});
+}
+
+/** Delete EVERY Devin session's grants in `sessionsDir` (unpair, reset): no Always-allow outlives the
+ *  pairing or a reset, live session or not — the next matching request just asks again. Best-effort. */
+export async function forgetAllDevinGrants(sessionsDir: string = SESSIONS_DIR): Promise<void> {
+  const files = await readdir(sessionsDir).catch(() => [] as string[]);
+  await Promise.all(files.filter((f) => f.endsWith(DEVIN_GRANTS_SUFFIX)).map((f) => unlink(`${sessionsDir}/${f}`).catch(() => {})));
 }
 
 export async function settleDecisionHoldRecord(

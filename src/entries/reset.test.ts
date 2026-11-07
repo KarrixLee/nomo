@@ -131,6 +131,21 @@ describe("reset (end-to-end with injected seams)", () => {
     expect(all).toContain("not paired — cleared locally only");
   });
 
+  test("deletes every Devin Always-allow grant, live session or not; session rows untouched by it", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "nomo-reset-"));
+    const sessions = join(dir, "sessions");
+    const { mkdir } = await import("node:fs/promises");
+    await mkdir(sessions, { recursive: true });
+    await writeFile(join(sessions, "live.json"), JSON.stringify(rec({ pid: 222 })));
+    await writeFile(join(sessions, "live.devin-allow"), '[{"tool":"Write"}]');
+    await writeFile(join(sessions, "crashed.devin-allow"), '[{"tool":"Write"}]');
+    await reset({
+      print: () => {}, loadConfigFn: async () => null, sessionsDir: sessions,
+      watchdogPidPath: join(dir, "watchdog.pid"), isAlive: (pid) => pid === 222,
+    });
+    expect(await readdir(sessions)).toEqual(["live.json"]);
+  });
+
   test("nothing to do is a clean success", async () => {
     const dir = await mkdtemp(join(tmpdir(), "nomo-reset-"));
     const lines: string[] = [];
