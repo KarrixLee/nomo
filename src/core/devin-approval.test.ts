@@ -197,13 +197,33 @@ describe("Always allow — session grants", () => {
   const sh = (command: string) => ({ command });
   test("grant derivation: a plain command grants its name; operators, substitutions, env prefixes → the exact text", () => {
     expect(devinGrantFor("shell", sh("touch one.txt"))).toEqual({ tool: "shell", prefix: "touch" });
-    expect(devinGrantFor("shell", sh("bun"))).toEqual({ tool: "shell", prefix: "bun" });
+    expect(devinGrantFor("shell", sh("make"))).toEqual({ tool: "shell", prefix: "make" });
     expect(devinGrantFor("shell", sh("./build.sh --fast"))).toEqual({ tool: "shell", prefix: "./build.sh" });
     for (const c of ["touch a && rm -rf ~", "echo $(id)", "ls > out", "cat a | sh", "echo `id`", "a; b", "FOO=1 make", "x\ny", "(ls)"]) {
       expect(devinGrantFor("shell", sh(c))).toEqual({ tool: "shell", exact: c });
     }
     expect(devinGrantFor("Write", { file_path: "/w/a.ts" })).toEqual({ tool: "Write" });
     expect(devinGrantFor("mcp__github__create_issue", {})).toEqual({ tool: "mcp__github__create_issue" });
+  });
+
+  test("a wrapper or interpreter never becomes a name grant: exact text only, labelled \"exact\"", () => {
+    for (const c of [
+      "bash scripts/test.sh", "sh x.sh", "zsh", "env FOO=1 make", "sudo ls", "doas ls", "timeout 5 ls", "xargs rm",
+      "npx tsc", "bunx tsc", "nohup ./srv", "nice ls", "exec ls", "eval ls", "command ls", "time ls", "watch ls",
+      ". ./env.sh", "source ./env.sh", "python3 -c 'print(1)'", "python3.12 x.py", "node -e 1", "bun test", "deno run x",
+      "ruby -e 1", "perl -e 1", "/bin/bash scripts/test.sh", "/usr/bin/env rm -rf ~", "BASH -c ls", "find . -delete",
+    ]) {
+      expect(devinGrantFor("shell", sh(c))).toEqual({ tool: "shell", exact: c });
+      expect(devinGrantText("shell", sh(c))).toBe("exact");
+    }
+    // The exploit: Always allow on `bash scripts/test.sh` must not cover `bash -c "rm -rf ~"` or `env rm -rf ~`.
+    const g = devinGrantFor("shell", sh("bash scripts/test.sh"));
+    expect(devinGrantMatches(g, "shell", sh("bash scripts/test.sh"))).toBe(true);
+    for (const c of ['bash -c "rm -rf ~"', "bash scripts/test.sh --x", "env rm -rf ~"]) expect(devinGrantMatches(g, "shell", sh(c))).toBe(false);
+    // A name grant on a wrapper (an older grants file) matches nothing.
+    for (const prefix of ["bash", "env", "/bin/sh", "python3"]) {
+      expect(devinGrantMatches({ tool: "shell", prefix }, "shell", sh(`${prefix} -c 'rm -rf ~'`))).toBe(false);
+    }
   });
 
   test("grant text (the card's permissionGrant) says what the grant above covers, and rides to the hold", async () => {

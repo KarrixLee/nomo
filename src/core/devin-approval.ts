@@ -42,7 +42,9 @@
 // grant, like a Claude Code session rule). Scope mirrors Devin's own "(this session)" option: a plain
 // shell command grants its command NAME (word-complete, `touch` ≠ `touchy`); a command with any shell
 // operator, substitution or redirect grants only that exact text, and only a plain command can ever
-// match a name grant, so `touch a && rm -rf ~` always goes to the phone. Any other tool is granted whole.
+// match a name grant, so `touch a && rm -rf ~` always goes to the phone. A WRAPPER (`bash`, `env`,
+// `sudo`, `python3`… — WRAPPERS) also grants only the exact text: `bash` would cover `bash -c "…"`.
+// Any other tool is granted whole.
 // The grant is deleted on SessionEnd and when the watchdog retires the row.
 //
 // NOMO'S OWN COMMANDS: on a paired computer, the `exec` of one of Nomo's own SAFE skill commands
@@ -177,11 +179,26 @@ const PLAIN_COMMAND = /^[A-Za-z0-9_./-]+( [^;&|`$<>(){}\n]*)?$/;
 const commandOf = (toolInput: Record<string, unknown>): string =>
   typeof toolInput.command === "string" ? toolInput.command : "";
 
+/** Commands that run ANOTHER command or code given in their arguments (`bash -c …`, `env rm …`,
+ *  `python3 -e …`): a name grant on one would cover every command, so they only ever get an exact grant.
+ *  Looked up by basename, lowercased (macOS paths are case-insensitive), version digits dropped
+ *  (`python3.12` → `python`). ponytail: a list, not a parser — a wrapper missing here still grants its
+ *  name; add it here. */
+const WRAPPERS = new Set([
+  "bash", "sh", "zsh", "fish", "dash", "ksh", "csh", "tcsh", "pwsh", "env", "sudo", "doas", "su", "timeout",
+  "xargs", "npx", "bunx", "pnpx", "nohup", "nice", "exec", "eval", "command", "builtin", "time", "watch", ".",
+  "source", "python", "node", "bun", "deno", "ruby", "perl", "php", "lua", "osascript", "find", "awk", "gawk",
+  "stdbuf", "setsid", "caffeinate", "arch", "chroot", "script", "ssh",
+]);
+const isWrapper = (word: string): boolean =>
+  WRAPPERS.has((word.split("/").pop() ?? "").toLowerCase().replace(/(?<=[a-z])[\d.]+$/, ""));
+
 /** The grant an Always-allow tap makes for this card tool + input. Pure. */
 export function devinGrantFor(cardTool: string, toolInput: Record<string, unknown>): DevinGrant {
   if (cardTool !== "shell") return { tool: cardTool };
   const command = commandOf(toolInput);
-  return PLAIN_COMMAND.test(command) ? { tool: "shell", prefix: command.split(" ", 1)[0] } : { tool: "shell", exact: command };
+  const name = command.split(" ", 1)[0];
+  return PLAIN_COMMAND.test(command) && !isWrapper(name) ? { tool: "shell", prefix: name } : { tool: "shell", exact: command };
 }
 
 /** The grant above for the card's Always-allow label (`permissionGrant`, see grantEntry):
@@ -198,7 +215,7 @@ export function devinGrantMatches(grant: DevinGrant, cardTool: string, toolInput
   if (cardTool !== "shell") return true;
   const command = commandOf(toolInput);
   if (typeof grant.exact === "string") return command === grant.exact;
-  return typeof grant.prefix === "string" && grant.prefix.length > 0 && PLAIN_COMMAND.test(command)
+  return typeof grant.prefix === "string" && grant.prefix.length > 0 && !isWrapper(grant.prefix) && PLAIN_COMMAND.test(command)
     && (command === grant.prefix || command.startsWith(`${grant.prefix} `));
 }
 
