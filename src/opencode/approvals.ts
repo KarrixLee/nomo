@@ -35,7 +35,7 @@ import { appendFileSync, statSync, truncateSync } from "node:fs";
 import type { AgentKind, Config } from "../core/shared";
 import { PLUGIN_VERSION } from "../core/shared";
 import {
-  capGrant, commandsGrant, defaultWriteHold, foldersGrant, OPENCODE_QUESTION_TOOL, readableToolName, runPermissionHook, TRACE_PATH,
+  defaultWriteHold, foldersGrant, grantEntry, joinGrant, OPENCODE_QUESTION_TOOL, runPermissionHook, TRACE_PATH,
 } from "../core/permission";
 import type { PermissionHookDeps } from "../core/permission";
 
@@ -166,10 +166,10 @@ export function ocDecisionRequest(event: unknown): OcDecisionRequest | null {
 
 /** "*" alone → every request of that permission. */
 const OC_ALL: Record<string, string> = {
-  edit: "all edits", read: "all file reads", webfetch: "all web fetches", websearch: "all web searches", bash: "all commands",
+  edit: "edits", read: "reads", webfetch: "fetches", websearch: "searches", bash: "commands",
 };
 
-/** What OpenCode's `always` reply approves, in the phone's words. OpenCode (1.18.15,
+/** What OpenCode's `always` reply approves, as a `permissionGrant` (see grantEntry). OpenCode (1.18.15,
  *  packages/opencode/src/permission/index.ts `reply`) pushes one `{permission, pattern, action:"allow"}`
  *  rule per entry of the request's `always` array into the project instance's in-memory `approved`
  *  list — kept until OpenCode restarts, shared by every session of that project (its own TUI says
@@ -178,10 +178,10 @@ const OC_ALL: Record<string, string> = {
  *  Pure. */
 export function ocGrantText(permission: string, always: string[], home?: string): string {
   if (always.length === 0) return "";
-  if (always.includes("*")) return OC_ALL[permission] ?? readableToolName(permission);
-  if (permission === "bash") return capGrant(commandsGrant(always.map((p) => p.replace(/ \*$/, ""))));
-  if (permission === "external_directory") return capGrant(foldersGrant(always.map((p) => p.replace(/\/\*+$/, "")), home));
-  return capGrant(`${readableToolName(permission)} ${always.map((p) => `\`${p}\``).join(", ")}`);
+  if (always.includes("*")) return OC_ALL[permission] ?? grantEntry("tool", permission);
+  if (permission === "bash") return joinGrant(always.map((p) => grantEntry("cmd", p.replace(/ \*$/, ""))));
+  if (permission === "external_directory") return foldersGrant(always.map((p) => p.replace(/\/\*+$/, "")), home);
+  return "similar"; // any other pattern list (e.g. a skill name): honest but unnamed
 }
 
 /** The id a `permission.replied` / `question.replied` / `question.rejected` retires. FIELD-NAME TRAP:

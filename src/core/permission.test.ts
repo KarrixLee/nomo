@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, test } from "bun:test";
 import {
   buildPermissionSummary, buildPermissionDetail, buildPermissionQuestions, fitPermissionDetail,
-  sealedBlobChars, BLOB_FIT_CHARS, runPermissionHook, claudeGrantText, readableToolName, approvalsCommand, NO_HOLD_PATH, TRACE_PATH,
+  sealedBlobChars, BLOB_FIT_CHARS, runPermissionHook, claudeGrantText, grantEntry, joinGrant, approvalsCommand, NO_HOLD_PATH, TRACE_PATH,
   codexRolloutSessionId, codexTurnPolicyFromRollout, loadCodexTurnPolicy,
   POST_FIRST_CONTACT_TIMEOUT_MS, OPENCODE_QUESTION_TOOL, localAnswerProbe, answerExtrasAccepted,
 } from "./permission";
@@ -1098,7 +1098,7 @@ describe("runPermissionHook — hold state machine", () => {
     // then permissionGrant (no suggestions → the whole tool).
     expect(Object.keys(blob).slice(-5)).toEqual(
       ["permissionSummary", "permissionRequestId", "permissionToolName", "permissionDetail", "permissionGrant"]);
-    expect(blob.permissionGrant).toBe("Bash");
+    expect(blob.permissionGrant).toBe("tool:Bash");
     const fb = (await decryptBlob(KEY, body.fallbackBlob)) as Record<string, unknown>;
     expect(fb.status).toBe("needsAttention");
     expect("permissionSummary" in fb).toBe(false);
@@ -2232,7 +2232,7 @@ describe("runPermissionHook — decision blob detail fields", () => {
   test("permissionGrant: Claude's suggestions name the real rule; none surviving the filter seals \"\"", async () => {
     const sugg = [{ type: "addRules", rules: [{ toolName: "Bash", ruleContent: "bun test:*" }], behavior: "allow", destination: "localSettings" }];
     expect((await postedBlob({ readInput: async () => inputWith({ permission_suggestions: sugg }) })).blob.permissionGrant)
-      .toBe("`bun test` commands");
+      .toBe("cmd:bun test");
     const dropped = [{ type: "setMode", mode: "bypassPermissions", destination: "session" }];
     const { blob } = await postedBlob({ readInput: async () => inputWith({ permission_suggestions: dropped }) });
     expect(blob.permissionGrant).toBe(""); // the tap would be a plain one-time allow → the phone hides it
@@ -2247,7 +2247,7 @@ describe("runPermissionHook — decision blob detail fields", () => {
     expect("permissionGrant" in (await decryptBlob(KEY, codexBody.blob) as Record<string, unknown>)).toBe(false);
     const q = await postedBlob({ readInput: async () => inputWith({ tool_name: "AskUserQuestion", tool_input: { questions: [{ question: "Q?", options: [{ label: "A" }] }] } }) });
     expect("permissionGrant" in q.blob).toBe(false);
-    expect((await postedBlob({ grant: "`touch` commands" })).blob.permissionGrant).toBe("`touch` commands");
+    expect((await postedBlob({ grant: "cmd:touch" })).blob.permissionGrant).toBe("cmd:touch");
   });
 });
 
@@ -3728,37 +3728,44 @@ describe("NOM-63 answerExtrasAccepted + x wire key", () => {
   });
 });
 
-describe("claudeGrantText — mirrors allowAlwaysLine", () => {
+describe("claudeGrantText — mirrors allowAlwaysLine (structured permissionGrant)", () => {
   const HOME = "/Users/me";
   const g = (tool: string, s: unknown) => claudeGrantText(tool, s, HOME);
-  test("no suggestions → the whole tool (readable); ExitPlanMode → plans", () => {
-    expect(g("Write", undefined)).toBe("Write");
-    expect(g("Write", [])).toBe("Write");
+  test("no suggestions → the whole tool (raw id; the phone makes it readable); ExitPlanMode → plans", () => {
+    expect(g("Write", undefined)).toBe("tool:Write");
+    expect(g("Write", [])).toBe("tool:Write");
     expect(g("ExitPlanMode", undefined)).toBe("plans");
-    expect(g("mcp__github__create_issue", undefined)).toBe("create issue (github)");
+    expect(g("mcp__github__create_issue", undefined)).toBe("tool:mcp__github__create_issue");
   });
-  test("each kept suggestion shape", () => {
+  test("each kept suggestion shape → one kind", () => {
     const rule = (toolName: string, ruleContent?: string) => [{ type: "addRules", behavior: "allow", destination: "localSettings", rules: [{ toolName, ...(ruleContent ? { ruleContent } : {}) }] }];
-    expect(g("Bash", rule("Bash", "bun test:*"))).toBe("`bun test` commands");
-    expect(g("Bash", rule("Bash", "git status"))).toBe("this command");
-    expect(g("WebFetch", rule("WebFetch", "domain:example.com"))).toBe("example.com");
-    expect(g("Edit", rule("Edit", "src/**"))).toBe("Edit `src/**`");
-    expect(g("Read", [{ type: "addDirectories", directories: ["/Users/me/other"], destination: "session" }])).toBe("this folder (~/other)");
-    expect(g("Read", [{ type: "addDirectories", directories: ["/a", "/b"], destination: "session" }])).toBe("2 folders");
-    expect(g("Edit", [{ type: "setMode", mode: "acceptEdits", destination: "session" }])).toBe("all edits");
-    expect(g("Bash", [...rule("Bash", "bun test:*"), { type: "addDirectories", directories: ["/Users/me/x"] }]))
-      .toBe("`bun test` commands, this folder (~/x)");
+    expect(g("Bash", rule("Bash", "bun test:*"))).toBe("cmd:bun test");
+    expect(g("Bash", rule("Bash", "git status"))).toBe("exact");
+    expect(g("WebFetch", rule("WebFetch", "domain:example.com"))).toBe("domain:example.com");
+    expect(g("Edit", rule("Edit", "src/**"))).toBe("edit:src/**");
+    expect(g("Read", rule("Read", "src/**"))).toBe("similar");
+    expect(g("Read", [{ type: "addDirectories", directories: ["/Users/me/other"], destination: "session" }])).toBe("dir:~/other");
+    expect(g("Read", [{ type: "addDirectories", directories: ["/a", "/b"], destination: "session" }])).toBe("dirs:2");
+    expect(g("Edit", [{ type: "setMode", mode: "acceptEdits", destination: "session" }])).toBe("edits");
+    expect(g("Edit", [{ type: "setMode", mode: "plan" }])).toBe("planmode");
+    expect(g("Edit", [{ type: "setMode", mode: "auto" }])).toBe("automode");
+    expect(g("Edit", [{ type: "setMode", mode: "someNewMode" }])).toBe("similar");
+    expect(g("ExitPlanMode", rule("ExitPlanMode"))).toBe("plans");
+  });
+  test("several → \n-joined entries, deduped; any unnamed one collapses the whole grant to similar", () => {
+    const rules = [{ type: "addRules", behavior: "allow", rules: [{ toolName: "Bash", ruleContent: "git add:*" }, { toolName: "Bash", ruleContent: "git commit:*" }, { toolName: "Bash", ruleContent: "git add:*" }] }];
+    expect(g("Bash", [...rules, { type: "addDirectories", directories: ["/Users/me/x"] }])).toBe("cmd:git add\ncmd:git commit\ndir:~/x");
+    expect(g("Bash", [...rules, { type: "setMode", mode: "someNewMode" }])).toBe("similar");
   });
   test("nothing survives the filter → \"\" (a one-time allow)", () => {
     expect(g("Bash", [{ type: "setMode", mode: "bypassPermissions" }, { type: "addRules", behavior: "deny", rules: [{ toolName: "Bash" }] }])).toBe("");
   });
-  test("long grants are capped", () => {
+  test("literals: first \":\" splits, control chars cannot forge an entry, long ones are capped", () => {
+    expect(g("Bash", [{ type: "addRules", behavior: "allow", rules: [{ toolName: "Bash", ruleContent: "echo a:b *x* `y` [z]:*" }] }])).toBe("cmd:echo a:b *x* `y` [z]");
+    expect(grantEntry("cmd", "a\ntool:Bash")).toBe("cmd:a tool:Bash");
     const out = g("Bash", [{ type: "addRules", behavior: "allow", rules: [{ toolName: "Bash", ruleContent: `${"x".repeat(200)}:*` }] }]);
-    expect(out.length).toBe(80);
+    expect(out.length).toBe("cmd:".length + 80);
     expect(out.endsWith("…")).toBe(true);
-  });
-  test("readableToolName", () => {
-    expect(readableToolName("external_directory")).toBe("external directory");
-    expect(readableToolName("Bash")).toBe("Bash");
+    expect(joinGrant(Array.from({ length: 10 }, (_, i) => grantEntry("cmd", `${i}${"y".repeat(60)}`)))).toBe("similar");
   });
 });

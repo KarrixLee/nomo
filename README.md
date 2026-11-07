@@ -201,13 +201,20 @@ real installs never set it, and anything that can set your agent's environment c
   straight to the computer.
 - **Shell cards keep the command.** The model-written one-line description is a caption: shortened
   first, and dropped before the command when space runs out.
-- **The "Always allow" label is display-only.** At hold time the plugin seals a short description of
-  what an Always-allow tap would grant into the card as `permissionGrant` (e.g. `` `bun test` commands``,
-  `this folder (~/x)`, `all edits`, `plans`, `this command`, a tool name). It is built from the same
-  input as the answer: Claude Code's own suggestions (after the filter below), OpenCode's `always`
-  patterns, or Devin's Nomo-side grant rule. `""` means the tap would only be a one-time allow, and the
-  phone hides the option; absent (Codex, Antigravity, questions, older plugins) means unknown. The text
-  only labels the button: the rule itself is still decided and enforced by the agent.
+- **The "Always allow" label is display-only.** At hold time the plugin seals what an Always-allow tap
+  would grant into the card as `permissionGrant`: structured data, never prose, so the phone builds the
+  label in its own language. Format: `""`, or one or more entries joined by `\n`, each `kind` or
+  `kind:literal` (the literal is everything after the first `:`, has no control characters, is capped at
+  80 characters, and the phone shows it verbatim in monospace, never as Markdown). Kinds: `cmd:<prefix>`
+  (commands starting with it), `exact` (this exact command), `domain:<host>`, `edit:<glob>`,
+  `dir:<path>` (one folder), `dirs:<N>` (N folders), `edits`, `reads`, `fetches`, `searches`, `commands`
+  (every one of that kind), `planmode`, `automode`, `plans` (plan approvals), `tool:<tool id>` (the whole
+  tool) and `similar` (a rule the plugin can't name; also how the phone shows a kind it doesn't know).
+  Any unnamed part, or a value over 240 characters, collapses to `similar`, never a shorter list. It is
+  built from the same input as the answer: Claude Code's own suggestions (after the filter below),
+  OpenCode's `always` patterns, or Devin's Nomo-side grant rule. `""` means the tap would only be a
+  one-time allow, and the phone hides the option; absent (Codex, Antigravity, questions, older plugins)
+  means unknown. It only labels the button: the rule itself is still decided and enforced by the agent.
 - **Claude Code Computer Use** app-access dialogs fire no answerable hook, so the phone shows a sealed
   heads-up naming the apps with no Allow/Deny; approve it on the computer.
 

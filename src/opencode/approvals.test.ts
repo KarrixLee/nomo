@@ -69,7 +69,7 @@ describe("ocDecisionRequest", () => {
       toolName: "shell",
       toolInput: { command: "echo hello" },
       // The captured `always: ["echo *"]` — what an `always` reply really approves.
-      grant: "`echo` commands",
+      grant: "cmd:echo",
     });
   });
 
@@ -129,24 +129,26 @@ describe("ocDecisionRequest", () => {
 describe("ocGrantText — what an `always` reply approves (until OpenCode restarts)", () => {
   const HOME = "/Users/me";
   test("bash: one or more arity prefixes", () => {
-    expect(ocGrantText("bash", ["git status *"], HOME)).toBe("`git status` commands");
-    expect(ocGrantText("bash", ["git status *", "bun test *"], HOME)).toBe("`git status`, `bun test` commands");
+    expect(ocGrantText("bash", ["git status *"], HOME)).toBe("cmd:git status");
+    expect(ocGrantText("bash", ["git status *", "bun test *"], HOME)).toBe("cmd:git status\ncmd:bun test");
   });
   test("\"*\" approves every request of that permission", () => {
-    expect(ocGrantText("edit", ["*"], HOME)).toBe("all edits");
-    expect(ocGrantText("read", ["*"], HOME)).toBe("all file reads");
-    expect(ocGrantText("webfetch", ["*"], HOME)).toBe("all web fetches");
-    expect(ocGrantText("mcp__srv__do_it", ["*"], HOME)).toBe("do it (srv)");
+    expect(ocGrantText("edit", ["*"], HOME)).toBe("edits");
+    expect(ocGrantText("read", ["*"], HOME)).toBe("reads");
+    expect(ocGrantText("webfetch", ["*"], HOME)).toBe("fetches");
+    expect(ocGrantText("websearch", ["*"], HOME)).toBe("searches");
+    expect(ocGrantText("bash", ["*"], HOME)).toBe("commands");
+    expect(ocGrantText("mcp__srv__do_it", ["*"], HOME)).toBe("tool:mcp__srv__do_it");
   });
   test("external_directory: the folder glob", () => {
-    expect(ocGrantText("external_directory", ["/Users/me/other/*"], HOME)).toBe("this folder (~/other)");
-    expect(ocGrantText("external_directory", ["/a/*", "/b/*"], HOME)).toBe("2 folders");
+    expect(ocGrantText("external_directory", ["/Users/me/other/*"], HOME)).toBe("dir:~/other");
+    expect(ocGrantText("external_directory", ["/a/*", "/b/*"], HOME)).toBe("dirs:2");
   });
   test("no always patterns → \"\" (the reply approves this request only)", () => {
     expect(ocGrantText("bash", [], HOME)).toBe("");
   });
-  test("other patterns are named verbatim", () => {
-    expect(ocGrantText("skill", ["deploy"], HOME)).toBe("skill `deploy`");
+  test("any other pattern list is an honest, unnamed \"similar\"", () => {
+    expect(ocGrantText("skill", ["deploy"], HOME)).toBe("similar");
   });
 });
 
@@ -271,7 +273,7 @@ describe("no process handlers are ever installed", () => {
     expect(seen?.emit).toBeDefined();
     expect(seen?.delegate).toBeDefined();
     // The grant text rides to the hold, which seals it as the card's `permissionGrant`.
-    expect(seen?.grant).toBe("`echo` commands");
+    expect(seen?.grant).toBe("cmd:echo");
   });
 
   test("a hold that ends WITHOUT the phone's decision says so (paused, superseded, threw)", async () => {

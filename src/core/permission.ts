@@ -405,22 +405,39 @@ export function sessionScopedSuggestions(suggestions: unknown): Record<string, u
     .map((s) => ({ ...s, destination: "session" }));
 }
 
-// ── The grant text (`permissionGrant`) ────────────────────────────────────────────────────────────
+// ── The grant (`permissionGrant`) ─────────────────────────────────────────────────────────────────
 //
-// What an Always-allow tap REALLY grants, in a few words the phone puts in its label ("Always allow
-// <grant> (this session)"). Computed here, at hold time, from the SAME inputs the answer line is built
-// from (allowAlwaysLine), so the label and the rule cannot drift. "" = the tap would only be a one-time
-// allow (CC offered suggestions and none survived the filter, or OpenCode named no `always` pattern),
-// and the phone then hides Always allow. DISPLAY-ONLY: the agent still decides what the rule matches.
+// What an Always-allow tap REALLY grants, as STRUCTURED data the phone turns into a localized label
+// ("Always allow `bun test` commands (this session)"). Computed here, at hold time, from the SAME inputs
+// the answer line is built from (allowAlwaysLine), so the label and the rule cannot drift.
+// DISPLAY-ONLY: the agent still decides what the rule matches.
+//
+// Wire format (README "Approval holds"): "" | entry ("\n" entry)*, entry = kind | kind ":" literal.
+// The literal is everything after the FIRST ":" (it may hold ":"), has no control characters, and is
+// capped. The phone shows the literal verbatim (never Markdown) and an unknown kind as "similar".
+//   cmd:<prefix>  exact  domain:<host>  edit:<glob>  dir:<path>  dirs:<N>  edits  reads  fetches
+//   searches  commands  planmode  automode  plans  tool:<raw tool id>  similar
+// "" = the tap would only be a one-time allow (CC offered suggestions and none survived the filter, or
+// OpenCode named no `always` pattern), and the phone then hides Always allow.
 
-const GRANT_MAX = 80;
+const GRANT_LITERAL_MAX = 80;
+const GRANT_MAX = 240;
 
-/** A raw tool id in plain words: `mcp__github__create_issue` → `create issue (github)`,
- *  `external_directory` → `external directory`. Pure. */
-export function readableToolName(toolName: string): string {
-  const mcp = /^mcp__(.+?)__(.+)$/.exec(toolName);
-  if (mcp) return `${mcp[2].replace(/_/g, " ")} (${mcp[1].replace(/_/g, " ")})`;
-  return toolName.replace(/_/g, " ");
+/** One entry: `kind` or `kind:literal` (control chars → space, literal capped). Pure. */
+export function grantEntry(kind: string, literal?: string): string {
+  if (literal === undefined) return kind;
+  const clean = literal.replace(/[\u0000-\u001f\u007f]/g, " ");
+  if (clean.length === 0) return "similar";
+  return `${kind}:${clean.length <= GRANT_LITERAL_MAX ? clean : `${clean.slice(0, GRANT_LITERAL_MAX - 1)}…`}`;
+}
+
+/** Entries → the wire value: deduped, "\n"-joined. Any `similar`, or a value over the cap, collapses to
+ *  `similar` — never a partial list that would understate the grant. Pure. */
+export function joinGrant(entries: string[]): string {
+  const uniq = [...new Set(entries.filter((e) => e.length > 0))];
+  if (uniq.includes("similar")) return "similar";
+  const out = uniq.join("\n");
+  return out.length <= GRANT_MAX ? out : "similar";
 }
 
 /** `/Users/me/x` → `~/x` (display only). */
@@ -428,45 +445,37 @@ export function tildePath(path: string, home: string = homedir()): string {
   return home && (path === home || path.startsWith(`${home}/`)) ? `~${path.slice(home.length)}` : path;
 }
 
-/** "this folder (~/x)" for one folder, "N folders" for more. */
+/** `dir:<path>` for one folder, `dirs:<N>` for more. */
 export function foldersGrant(dirs: string[], home?: string): string {
   if (dirs.length === 0) return "";
-  return dirs.length === 1 ? `this folder (${tildePath(dirs[0], home)})` : `${dirs.length} folders`;
-}
-
-/** Commands by prefix: ["bun test"] → "`bun test` commands". */
-export function commandsGrant(prefixes: string[]): string {
-  return prefixes.length === 0 ? "" : `${prefixes.map((p) => `\`${p}\``).join(", ")} commands`;
-}
-
-export function capGrant(text: string): string {
-  return text.length <= GRANT_MAX ? text : `${text.slice(0, GRANT_MAX - 1)}…`;
+  return dirs.length === 1 ? grantEntry("dir", tildePath(dirs[0], home)) : grantEntry("dirs", String(dirs.length));
 }
 
 const SHELL_TOOLS = new Set(["Bash", "shell", "local_shell"]);
+const EDIT_TOOLS = new Set(["Edit", "Write", "MultiEdit", "NotebookEdit"]);
 
 function ruleGrant(rule: Record<string, unknown>): string {
   const tool = typeof rule.toolName === "string" ? rule.toolName : "";
   const content = typeof rule.ruleContent === "string" ? rule.ruleContent : "";
-  if (!content) return tool === "ExitPlanMode" ? "plans" : readableToolName(tool);
-  if (SHELL_TOOLS.has(tool)) return content.endsWith(":*") ? commandsGrant([content.slice(0, -2)]) : "this command";
-  if (tool === "WebFetch" && content.startsWith("domain:")) return content.slice("domain:".length);
-  return `${readableToolName(tool)} \`${content}\``;
+  if (!content) return tool === "ExitPlanMode" ? "plans" : grantEntry("tool", tool);
+  if (SHELL_TOOLS.has(tool)) return content.endsWith(":*") ? grantEntry("cmd", content.slice(0, -2)) : "exact";
+  if (tool === "WebFetch" && content.startsWith("domain:")) return grantEntry("domain", content.slice("domain:".length));
+  if (EDIT_TOOLS.has(tool)) return grantEntry("edit", content);
+  return "similar";
 }
 
-const MODE_GRANT: Record<string, string> = { acceptEdits: "all edits", plan: "plan mode", auto: "auto mode" };
+const MODE_GRANT: Record<string, string> = { acceptEdits: "edits", plan: "planmode", auto: "automode" };
 
-/** Claude Code's grant text for an Always-allow tap: mirrors allowAlwaysLine exactly. Pure. */
+/** Claude Code's grant for an Always-allow tap: mirrors allowAlwaysLine exactly. Pure. */
 export function claudeGrantText(toolName: string, suggestions: unknown, home?: string): string {
   if (!Array.isArray(suggestions) || suggestions.length === 0) {
-    return toolName === "ExitPlanMode" ? "plans" : readableToolName(toolName);
+    return toolName === "ExitPlanMode" ? "plans" : grantEntry("tool", toolName);
   }
-  const parts = sessionScopedSuggestions(suggestions).flatMap((s) => {
+  return joinGrant(sessionScopedSuggestions(suggestions).flatMap((s) => {
     if (s.type === "addRules") return (s.rules as unknown[]).filter((r): r is Record<string, unknown> => !!r && typeof r === "object").map(ruleGrant);
     if (s.type === "addDirectories") return [foldersGrant((s.directories as unknown[]).filter((d): d is string => typeof d === "string"), home)];
-    return [MODE_GRANT[s.mode as string] ?? `${s.mode as string} mode`];
-  }).filter((p) => p.length > 0);
-  return capGrant([...new Set(parts)].join(", "));
+    return [MODE_GRANT[s.mode as string] ?? "similar"];
+  }));
 }
 
 /** Allow carrying `updatedPermissions`. ExitPlanMode needs the same updatedInput echo as the plain
@@ -1490,7 +1499,7 @@ export interface PermissionHookDeps {
    *  Claude/Codex hooks and for OpenCode's mapped permissions, which all keep the built detail
    *  byte-for-byte. Uncapped, exactly like the built one: `fitPermissionDetail` owns the ceiling. */
   detail?: string;
-  /** OPTIONAL Always-allow grant text for the card's `permissionGrant` (see claudeGrantText), for a
+  /** OPTIONAL Always-allow grant for the card's `permissionGrant` (wire format: see grantEntry), for a
    *  caller whose grant is not Claude Code's suggestions: OpenCode (its `always` patterns) and Devin
    *  (Nomo's own session grant). "" = the tap would be a one-time allow. Absent → derived for Claude
    *  Code, omitted for every other agent. */
@@ -1692,7 +1701,7 @@ export async function runPermissionHook(
     // or, for Claude Code, derived from the same suggestions allowAlwaysLine will use. Absent for every
     // agent with no Always allow (Codex degrades it to a plain allow) and for question tools.
     const grant = isAnswerTool(toolName, agent) ? undefined
-      : deps.grant !== undefined ? capGrant(deps.grant)
+      : deps.grant !== undefined ? deps.grant
       : agent === "claude" ? claudeGrantText(toolName, suggestions)
       : undefined;
     const requestId = (deps.randomUUID ?? (() => crypto.randomUUID()))();

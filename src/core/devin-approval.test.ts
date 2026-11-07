@@ -207,15 +207,15 @@ describe("Always allow — session grants", () => {
   });
 
   test("grant text (the card's permissionGrant) says what the grant above covers, and rides to the hold", async () => {
-    expect(devinGrantText("shell", sh("touch one.txt"))).toBe("`touch` commands");
-    expect(devinGrantText("shell", sh("touch a && rm b"))).toBe("this command");
-    expect(devinGrantText("Write", { file_path: "/w/a.ts" })).toBe("Write");
-    expect(devinGrantText("mcp__github__create_issue", {})).toBe("create issue (github)");
+    expect(devinGrantText("shell", sh("touch one.txt"))).toBe("cmd:touch");
+    expect(devinGrantText("shell", sh("touch a && rm b"))).toBe("exact");
+    expect(devinGrantText("Write", { file_path: "/w/a.ts" })).toBe("tool:Write");
+    expect(devinGrantText("mcp__github__create_issue", {})).toBe("tool:mcp__github__create_issue");
     let grant: string | undefined;
     await runDevinApproval(JSON.stringify(payload("exec", { command: "touch one.txt" })), {
       env: ENV, sessionsDir: freshDir(), run: (async (deps: { grant?: string }) => { grant = deps.grant; }) as never,
     });
-    expect(grant).toBe("`touch` commands");
+    expect(grant).toBe("cmd:touch");
   });
 
   test("matching: word-complete name prefix, plain commands only; exact grants; whole-tool grants", () => {
