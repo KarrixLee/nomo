@@ -4623,7 +4623,7 @@ import { fileURLToPath as fileURLToPath2 } from "node:url";
 // src/core/permission.ts
 import { readFile as readFile5, realpath, unlink as unlink5 } from "node:fs/promises";
 import { appendFileSync as appendFileSync2, statSync as statSync3, truncateSync as truncateSync2 } from "node:fs";
-import { hostname as hostname4 } from "node:os";
+import { homedir, hostname as hostname4 } from "node:os";
 import { basename as basename5, isAbsolute as isAbsolute3, relative, resolve as resolve3 } from "node:path";
 
 // src/core/decision-poll.ts
@@ -4908,6 +4908,53 @@ function sessionScopedSuggestions(suggestions) {
       return typeof s.mode === "string" && s.mode !== "bypassPermissions" && s.mode !== "dontAsk";
     return false;
   }).map((s) => ({ ...s, destination: "session" }));
+}
+var GRANT_MAX = 80;
+function readableToolName(toolName) {
+  const mcp = /^mcp__(.+?)__(.+)$/.exec(toolName);
+  if (mcp)
+    return `${mcp[2].replace(/_/g, " ")} (${mcp[1].replace(/_/g, " ")})`;
+  return toolName.replace(/_/g, " ");
+}
+function tildePath(path, home = homedir()) {
+  return home && (path === home || path.startsWith(`${home}/`)) ? `~${path.slice(home.length)}` : path;
+}
+function foldersGrant(dirs, home) {
+  if (dirs.length === 0)
+    return "";
+  return dirs.length === 1 ? `this folder (${tildePath(dirs[0], home)})` : `${dirs.length} folders`;
+}
+function commandsGrant(prefixes) {
+  return prefixes.length === 0 ? "" : `${prefixes.map((p) => `\`${p}\``).join(", ")} commands`;
+}
+function capGrant(text) {
+  return text.length <= GRANT_MAX ? text : `${text.slice(0, GRANT_MAX - 1)}…`;
+}
+var SHELL_TOOLS = new Set(["Bash", "shell", "local_shell"]);
+function ruleGrant(rule) {
+  const tool = typeof rule.toolName === "string" ? rule.toolName : "";
+  const content = typeof rule.ruleContent === "string" ? rule.ruleContent : "";
+  if (!content)
+    return tool === "ExitPlanMode" ? "plans" : readableToolName(tool);
+  if (SHELL_TOOLS.has(tool))
+    return content.endsWith(":*") ? commandsGrant([content.slice(0, -2)]) : "this command";
+  if (tool === "WebFetch" && content.startsWith("domain:"))
+    return content.slice("domain:".length);
+  return `${readableToolName(tool)} \`${content}\``;
+}
+var MODE_GRANT = { acceptEdits: "all edits", plan: "plan mode", auto: "auto mode" };
+function claudeGrantText(toolName, suggestions, home) {
+  if (!Array.isArray(suggestions) || suggestions.length === 0) {
+    return toolName === "ExitPlanMode" ? "plans" : readableToolName(toolName);
+  }
+  const parts = sessionScopedSuggestions(suggestions).flatMap((s) => {
+    if (s.type === "addRules")
+      return s.rules.filter((r) => !!r && typeof r === "object").map(ruleGrant);
+    if (s.type === "addDirectories")
+      return [foldersGrant(s.directories.filter((d) => typeof d === "string"), home)];
+    return [MODE_GRANT[s.mode] ?? `${s.mode} mode`];
+  }).filter((p) => p.length > 0);
+  return capGrant([...new Set(parts)].join(", "));
 }
 function allowWithPermissionsLine(agent, toolName, toolInput, updatedPermissions) {
   const decision = toolName === "ExitPlanMode" ? { behavior: "allow", updatedInput: toolInput, updatedPermissions } : { behavior: "allow", updatedPermissions };
@@ -5275,11 +5322,13 @@ function fitPermissionDetail(base, detail, maxChars = BLOB_FIT_CHARS, questions 
   return { detail: shortest, omitted: all.length - lo, ...tail };
 }
 function permissionFrame(base, detail, omitted, questions = []) {
+  const { permissionGrant, ...rest } = base;
   return {
-    ...base,
+    ...rest,
     ...detail.length > 0 ? { permissionDetail: detail } : {},
     ...omitted > 0 ? { permissionDetailOmitted: omitted } : {},
-    ...questions.length > 0 ? { permissionQuestions: questions } : {}
+    ...questions.length > 0 ? { permissionQuestions: questions } : {},
+    ...typeof permissionGrant === "string" ? { permissionGrant } : {}
   };
 }
 function emitDecision(agent, answer, toolName, toolInput, suggestions, emit, trace) {
@@ -5584,6 +5633,7 @@ async function runPermissionHook(deps = {}, agent = "claude") {
     }
     const toolInput = typeof input.tool_input === "object" && input.tool_input !== null ? input.tool_input : {};
     const suggestions = input.permission_suggestions;
+    const grant = isAnswerTool(toolName, agent) ? undefined : deps.grant !== undefined ? capGrant(deps.grant) : agent === "claude" ? claudeGrantText(toolName, suggestions) : undefined;
     const requestId = (deps.randomUUID ?? (() => crypto.randomUUID()))();
     const summary = buildPermissionSummary(toolName, toolInput);
     const now = (deps.now ?? Date.now)();
@@ -5598,7 +5648,8 @@ async function runPermissionHook(deps = {}, agent = "claude") {
       status: "decisionPending",
       permissionSummary: summary,
       permissionRequestId: requestId,
-      permissionToolName: toolName
+      permissionToolName: toolName,
+      ...grant !== undefined ? { permissionGrant: grant } : {}
     };
     const rawDetail = deps.detail ?? buildPermissionDetail(toolName, toolInput);
     let fitted = fitPermissionDetail(permissionBase, rawDetail, BLOB_FIT_CHARS, buildPermissionQuestions(toolInput));
@@ -5987,6 +6038,12 @@ function devinGrantFor(cardTool, toolInput) {
   const command = commandOf(toolInput);
   return PLAIN_COMMAND.test(command) ? { tool: "shell", prefix: command.split(" ", 1)[0] } : { tool: "shell", exact: command };
 }
+function devinGrantText(cardTool, toolInput) {
+  const g = devinGrantFor(cardTool, toolInput);
+  if (g.prefix)
+    return commandsGrant([g.prefix]);
+  return g.exact !== undefined ? "this command" : readableToolName(g.tool);
+}
 function devinGrantMatches(grant, cardTool, toolInput) {
   if (grant.tool !== cardTool)
     return false;
@@ -6087,6 +6144,7 @@ async function runDevinApproval(raw, deps = {}) {
       delegate: deps.delegate ?? (() => runDevinHook(raw)),
       deadlineAt: (deps.hold?.now ?? Date.now)() + DEVIN_HOLD_DEADLINE_MS,
       abandoned,
+      grant: devinGrantText(cardTool, toolInput),
       ...deps.hold,
       readInput: async () => stdin,
       emit: (l) => {

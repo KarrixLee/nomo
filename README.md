@@ -201,6 +201,13 @@ real installs never set it, and anything that can set your agent's environment c
   straight to the computer.
 - **Shell cards keep the command.** The model-written one-line description is a caption: shortened
   first, and dropped before the command when space runs out.
+- **The "Always allow" label is display-only.** At hold time the plugin seals a short description of
+  what an Always-allow tap would grant into the card as `permissionGrant` (e.g. `` `bun test` commands``,
+  `this folder (~/x)`, `all edits`, `plans`, `this command`, a tool name). It is built from the same
+  input as the answer: Claude Code's own suggestions (after the filter below), OpenCode's `always`
+  patterns, or Devin's Nomo-side grant rule. `""` means the tap would only be a one-time allow, and the
+  phone hides the option; absent (Codex, Antigravity, questions, older plugins) means unknown. The text
+  only labels the button: the rule itself is still decided and enforced by the agent.
 - **Claude Code Computer Use** app-access dialogs fire no answerable hook, so the phone shows a sealed
   heads-up naming the apps with no Allow/Deny; approve it on the computer.
 
@@ -231,7 +238,9 @@ real installs never set it, and anything that can set your agent's environment c
 
 - One resident module inside OpenCode's server process; it must never throw, block, print or install
   process-wide signal handlers. It answers `permission.asked` (Allow / Always / Deny) and
-  `question.asked`.
+  `question.asked`. **Always** is OpenCode's own `always` reply: it allows the request's `always`
+  patterns (e.g. `git status *`, or `*` for every edit) for that project **until OpenCode restarts**,
+  across its sessions — OpenCode keeps the rule in memory, never on disk.
 - `/nomo-update` acts only on Nomo's own checkout: the stub's target must be an absolute
   `<checkout>/plugin/dist/opencode.js` and the checkout's `origin` must be this repo on github.com
   (`https://`, `ssh://` or `git@github.com:`), or it refuses before running anything there.

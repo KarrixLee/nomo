@@ -23,7 +23,7 @@
 
 import { readFile, realpath, unlink } from "node:fs/promises";
 import { appendFileSync, statSync, truncateSync } from "node:fs";
-import { hostname } from "node:os";
+import { homedir, hostname } from "node:os";
 import { basename, isAbsolute, relative, resolve } from "node:path";
 import { runHook, buildBlob, OpPlan } from "./hook";
 import {
@@ -403,6 +403,70 @@ export function sessionScopedSuggestions(suggestions: unknown): Record<string, u
       return false;
     })
     .map((s) => ({ ...s, destination: "session" }));
+}
+
+// ── The grant text (`permissionGrant`) ────────────────────────────────────────────────────────────
+//
+// What an Always-allow tap REALLY grants, in a few words the phone puts in its label ("Always allow
+// <grant> (this session)"). Computed here, at hold time, from the SAME inputs the answer line is built
+// from (allowAlwaysLine), so the label and the rule cannot drift. "" = the tap would only be a one-time
+// allow (CC offered suggestions and none survived the filter, or OpenCode named no `always` pattern),
+// and the phone then hides Always allow. DISPLAY-ONLY: the agent still decides what the rule matches.
+
+const GRANT_MAX = 80;
+
+/** A raw tool id in plain words: `mcp__github__create_issue` → `create issue (github)`,
+ *  `external_directory` → `external directory`. Pure. */
+export function readableToolName(toolName: string): string {
+  const mcp = /^mcp__(.+?)__(.+)$/.exec(toolName);
+  if (mcp) return `${mcp[2].replace(/_/g, " ")} (${mcp[1].replace(/_/g, " ")})`;
+  return toolName.replace(/_/g, " ");
+}
+
+/** `/Users/me/x` → `~/x` (display only). */
+export function tildePath(path: string, home: string = homedir()): string {
+  return home && (path === home || path.startsWith(`${home}/`)) ? `~${path.slice(home.length)}` : path;
+}
+
+/** "this folder (~/x)" for one folder, "N folders" for more. */
+export function foldersGrant(dirs: string[], home?: string): string {
+  if (dirs.length === 0) return "";
+  return dirs.length === 1 ? `this folder (${tildePath(dirs[0], home)})` : `${dirs.length} folders`;
+}
+
+/** Commands by prefix: ["bun test"] → "`bun test` commands". */
+export function commandsGrant(prefixes: string[]): string {
+  return prefixes.length === 0 ? "" : `${prefixes.map((p) => `\`${p}\``).join(", ")} commands`;
+}
+
+export function capGrant(text: string): string {
+  return text.length <= GRANT_MAX ? text : `${text.slice(0, GRANT_MAX - 1)}…`;
+}
+
+const SHELL_TOOLS = new Set(["Bash", "shell", "local_shell"]);
+
+function ruleGrant(rule: Record<string, unknown>): string {
+  const tool = typeof rule.toolName === "string" ? rule.toolName : "";
+  const content = typeof rule.ruleContent === "string" ? rule.ruleContent : "";
+  if (!content) return tool === "ExitPlanMode" ? "plans" : readableToolName(tool);
+  if (SHELL_TOOLS.has(tool)) return content.endsWith(":*") ? commandsGrant([content.slice(0, -2)]) : "this command";
+  if (tool === "WebFetch" && content.startsWith("domain:")) return content.slice("domain:".length);
+  return `${readableToolName(tool)} \`${content}\``;
+}
+
+const MODE_GRANT: Record<string, string> = { acceptEdits: "all edits", plan: "plan mode", auto: "auto mode" };
+
+/** Claude Code's grant text for an Always-allow tap: mirrors allowAlwaysLine exactly. Pure. */
+export function claudeGrantText(toolName: string, suggestions: unknown, home?: string): string {
+  if (!Array.isArray(suggestions) || suggestions.length === 0) {
+    return toolName === "ExitPlanMode" ? "plans" : readableToolName(toolName);
+  }
+  const parts = sessionScopedSuggestions(suggestions).flatMap((s) => {
+    if (s.type === "addRules") return (s.rules as unknown[]).filter((r): r is Record<string, unknown> => !!r && typeof r === "object").map(ruleGrant);
+    if (s.type === "addDirectories") return [foldersGrant((s.directories as unknown[]).filter((d): d is string => typeof d === "string"), home)];
+    return [MODE_GRANT[s.mode as string] ?? `${s.mode as string} mode`];
+  }).filter((p) => p.length > 0);
+  return capGrant([...new Set(parts)].join(", "));
 }
 
 /** Allow carrying `updatedPermissions`. ExitPlanMode needs the same updatedInput echo as the plain
@@ -1063,11 +1127,16 @@ function permissionFrame(
   omitted: number,
   questions: PermissionQuestion[] = [],
 ): Record<string, unknown> {
+  // `permissionGrant` rides on the base but is always emitted LAST (after permissionQuestions), so the
+  // fit's size prediction and the real seal both carry it in its append-last position. Present only
+  // when the hold computed one; "" is meaningful (the tap is a one-time allow), absent = unknown.
+  const { permissionGrant, ...rest } = base;
   return {
-    ...base,
+    ...rest,
     ...(detail.length > 0 ? { permissionDetail: detail } : {}),
     ...(omitted > 0 ? { permissionDetailOmitted: omitted } : {}),
     ...(questions.length > 0 ? { permissionQuestions: questions } : {}),
+    ...(typeof permissionGrant === "string" ? { permissionGrant } : {}),
   };
 }
 
@@ -1421,6 +1490,11 @@ export interface PermissionHookDeps {
    *  Claude/Codex hooks and for OpenCode's mapped permissions, which all keep the built detail
    *  byte-for-byte. Uncapped, exactly like the built one: `fitPermissionDetail` owns the ceiling. */
   detail?: string;
+  /** OPTIONAL Always-allow grant text for the card's `permissionGrant` (see claudeGrantText), for a
+   *  caller whose grant is not Claude Code's suggestions: OpenCode (its `always` patterns) and Devin
+   *  (Nomo's own session grant). "" = the tap would be a one-time allow. Absent → derived for Claude
+   *  Code, omitted for every other agent. */
+  grant?: string;
   /** Resolve Codex's effective per-turn approval policy from its rollout. Tests inject this so no
    *  local Codex state is touched; Claude never calls it. */
   loadCodexTurnPolicyFn?: (
@@ -1614,6 +1688,13 @@ export async function runPermissionHook(
     // CC's own narrowly-scoped rule suggestions (present on the PermissionRequest when it has them);
     // narrowed + forced to destination:session by allowAlwaysLine on an always-allow answer. Absent → whole-tool rule.
     const suggestions = input.permission_suggestions;
+    // The Always-allow grant text: the caller's (OpenCode's `always` patterns, Devin's Nomo-side grant)
+    // or, for Claude Code, derived from the same suggestions allowAlwaysLine will use. Absent for every
+    // agent with no Always allow (Codex degrades it to a plain allow) and for question tools.
+    const grant = isAnswerTool(toolName, agent) ? undefined
+      : deps.grant !== undefined ? capGrant(deps.grant)
+      : agent === "claude" ? claudeGrantText(toolName, suggestions)
+      : undefined;
     const requestId = (deps.randomUUID ?? (() => crypto.randomUUID()))();
     const summary = buildPermissionSummary(toolName, toolInput);
     const now = (deps.now ?? Date.now)();
@@ -1657,6 +1738,8 @@ export async function runPermissionHook(
     const permissionBase = {
       ...base, status: "decisionPending", permissionSummary: summary, permissionRequestId: requestId,
       permissionToolName: toolName,
+      // What Always allow really grants (see claudeGrantText) — moved to the tail by permissionFrame.
+      ...(grant !== undefined ? { permissionGrant: grant } : {}),
     };
     const rawDetail = deps.detail ?? buildPermissionDetail(toolName, toolInput);
     let fitted = fitPermissionDetail(

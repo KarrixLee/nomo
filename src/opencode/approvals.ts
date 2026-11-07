@@ -34,7 +34,9 @@
 import { appendFileSync, statSync, truncateSync } from "node:fs";
 import type { AgentKind, Config } from "../core/shared";
 import { PLUGIN_VERSION } from "../core/shared";
-import { defaultWriteHold, OPENCODE_QUESTION_TOOL, runPermissionHook, TRACE_PATH } from "../core/permission";
+import {
+  capGrant, commandsGrant, defaultWriteHold, foldersGrant, OPENCODE_QUESTION_TOOL, readableToolName, runPermissionHook, TRACE_PATH,
+} from "../core/permission";
 import type { PermissionHookDeps } from "../core/permission";
 
 /** One pending human decision, normalized across the two channels. */
@@ -55,6 +57,9 @@ export interface OcDecisionRequest {
    *  here: `permissionDetail` is uncapped by contract and `fitPermissionDetail` applies the frame's
    *  real ceiling at the seal site (see buildPermissionDetail's header). */
   detail?: string;
+  /** What an `always` reply really grants, for the card's Always-allow label (`permissionGrant`):
+   *  built from the request's `always` patterns (ocGrantText). Permissions only. */
+  grant?: string;
   /** OpenCode's own `questions` array, kept verbatim so the answers round-trip can re-find each
    *  question's original option labels. Questions only. */
   questions?: unknown[];
@@ -126,6 +131,9 @@ export function ocDecisionRequest(event: unknown): OcDecisionRequest | null {
     // The join matches the `bash` arm's own `patterns.join(" ")` — one line, and it is what an `always`
     // reply persists as the rule.
     const detail = mapped ? undefined : asString(patterns.join(" ").trim());
+    const always = Array.isArray(properties.always)
+      ? properties.always.filter((p): p is string => typeof p === "string" && p.length > 0)
+      : [];
     return {
       kind: "permission",
       id,
@@ -133,6 +141,7 @@ export function ocDecisionRequest(event: unknown): OcDecisionRequest | null {
       toolName: mapped?.name ?? permission,
       toolInput: mapped ? mapped.input({ metadata, patterns }) : {},
       ...(detail ? { detail } : {}),
+      grant: ocGrantText(permission, always),
     };
   }
 
@@ -153,6 +162,26 @@ export function ocDecisionRequest(event: unknown): OcDecisionRequest | null {
   }
 
   return null;
+}
+
+/** "*" alone → every request of that permission. */
+const OC_ALL: Record<string, string> = {
+  edit: "all edits", read: "all file reads", webfetch: "all web fetches", websearch: "all web searches", bash: "all commands",
+};
+
+/** What OpenCode's `always` reply approves, in the phone's words. OpenCode (1.18.15,
+ *  packages/opencode/src/permission/index.ts `reply`) pushes one `{permission, pattern, action:"allow"}`
+ *  rule per entry of the request's `always` array into the project instance's in-memory `approved`
+ *  list — kept until OpenCode restarts, shared by every session of that project (its own TUI says
+ *  "until OpenCode is restarted"). Shapes: bash → "<arity prefix> *" per command (tool/shell.ts);
+ *  edit/read/webfetch → ["*"]; external_directory → the folder glob. [] → "" (the tap approves once).
+ *  Pure. */
+export function ocGrantText(permission: string, always: string[], home?: string): string {
+  if (always.length === 0) return "";
+  if (always.includes("*")) return OC_ALL[permission] ?? readableToolName(permission);
+  if (permission === "bash") return capGrant(commandsGrant(always.map((p) => p.replace(/ \*$/, ""))));
+  if (permission === "external_directory") return capGrant(foldersGrant(always.map((p) => p.replace(/\/\*+$/, "")), home));
+  return capGrant(`${readableToolName(permission)} ${always.map((p) => `\`${p}\``).join(", ")}`);
 }
 
 /** The id a `permission.replied` / `question.replied` / `question.rejected` retires. FIELD-NAME TRAP:
@@ -399,6 +428,7 @@ export async function runOcApproval(request: OcDecisionRequest, o: OcApprovalOpt
       // The card's detail line for a permission the shared switch cannot render — see PERMISSION_TOOL's
       // header. Undefined for everything else, which is every Claude/Codex hold and every mapped one.
       detail: request.detail,
+      grant: request.grant,
       trace,
       fetchFn: o.fetchFn,
       delegate: o.delegate,

@@ -54,7 +54,7 @@ import { readFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { DEVIN_ASK_TOOL, runDevinHook } from "./devin";
-import { runPermissionHook, type PermissionHookDeps } from "./permission";
+import { commandsGrant, readableToolName, runPermissionHook, type PermissionHookDeps } from "./permission";
 import { atomicWrite, devinGrantsPath, loadConfig, SESSIONS_DIR } from "./shared";
 
 export const DEVIN_APPROVAL_TIMEOUT_S = 86_400;
@@ -182,6 +182,14 @@ export function devinGrantFor(cardTool: string, toolInput: Record<string, unknow
   if (cardTool !== "shell") return { tool: cardTool };
   const command = commandOf(toolInput);
   return PLAIN_COMMAND.test(command) ? { tool: "shell", prefix: command.split(" ", 1)[0] } : { tool: "shell", exact: command };
+}
+
+/** The grant above in the phone's words, for the card's Always-allow label (`permissionGrant`):
+ *  "`touch` commands" · "this command" · the tool. Pure. */
+export function devinGrantText(cardTool: string, toolInput: Record<string, unknown>): string {
+  const g = devinGrantFor(cardTool, toolInput);
+  if (g.prefix) return commandsGrant([g.prefix]);
+  return g.exact !== undefined ? "this command" : readableToolName(g.tool);
 }
 
 /** Does `grant` cover this request? Pure. */
@@ -320,6 +328,7 @@ export async function runDevinApproval(raw: string, deps: DevinApprovalDeps = {}
       delegate: deps.delegate ?? (() => runDevinHook(raw)),
       deadlineAt: (deps.hold?.now ?? Date.now)() + DEVIN_HOLD_DEADLINE_MS,
       abandoned,
+      grant: devinGrantText(cardTool, toolInput),
       ...deps.hold,
       readInput: async () => stdin,
       emit: (l) => { line = l; },

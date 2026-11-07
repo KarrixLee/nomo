@@ -9,7 +9,7 @@ import { join } from "node:path";
 import { afterAll, describe, expect, test } from "bun:test";
 import { decryptBlob, encryptBlob } from "./crypto";
 import {
-  DEVIN_ANSWER_REASON_MAX, DEVIN_APPROVAL_TIMEOUT_S, DEVIN_ENTRY_CAP_MS, DEVIN_HOLD_DEADLINE_MS, devinDecision, devinGrantFor,
+  DEVIN_ANSWER_REASON_MAX, DEVIN_APPROVAL_TIMEOUT_S, DEVIN_ENTRY_CAP_MS, DEVIN_HOLD_DEADLINE_MS, devinDecision, devinGrantFor, devinGrantText,
   devinGrantMatches, devinPermissionStdin, isDevinSkillCommand, runDevinApproval,
 } from "./devin-approval";
 import { runDevinHook } from "./devin";
@@ -204,6 +204,18 @@ describe("Always allow — session grants", () => {
     }
     expect(devinGrantFor("Write", { file_path: "/w/a.ts" })).toEqual({ tool: "Write" });
     expect(devinGrantFor("mcp__github__create_issue", {})).toEqual({ tool: "mcp__github__create_issue" });
+  });
+
+  test("grant text (the card's permissionGrant) says what the grant above covers, and rides to the hold", async () => {
+    expect(devinGrantText("shell", sh("touch one.txt"))).toBe("`touch` commands");
+    expect(devinGrantText("shell", sh("touch a && rm b"))).toBe("this command");
+    expect(devinGrantText("Write", { file_path: "/w/a.ts" })).toBe("Write");
+    expect(devinGrantText("mcp__github__create_issue", {})).toBe("create issue (github)");
+    let grant: string | undefined;
+    await runDevinApproval(JSON.stringify(payload("exec", { command: "touch one.txt" })), {
+      env: ENV, sessionsDir: freshDir(), run: (async (deps: { grant?: string }) => { grant = deps.grant; }) as never,
+    });
+    expect(grant).toBe("`touch` commands");
   });
 
   test("matching: word-complete name prefix, plain commands only; exact grants; whole-tool grants", () => {

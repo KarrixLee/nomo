@@ -9,7 +9,7 @@ import {
 } from "../core/permission";
 import type { PermissionHookDeps } from "../core/permission";
 import {
-  ocAnswers, ocDecisionRequest, ocPost, ocReplyFor, ocResolvedRequestId, ocResolveOnRelay,
+  ocAnswers, ocDecisionRequest, ocGrantText, ocPost, ocReplyFor, ocResolvedRequestId, ocResolveOnRelay,
   runOcApproval,
 } from "./approvals";
 import type { OcDecisionRequest } from "./approvals";
@@ -68,6 +68,8 @@ describe("ocDecisionRequest", () => {
       // `shell` is the tool name buildPermissionSummary/buildPermissionDetail read `command` from.
       toolName: "shell",
       toolInput: { command: "echo hello" },
+      // The captured `always: ["echo *"]` — what an `always` reply really approves.
+      grant: "`echo` commands",
     });
   });
 
@@ -88,7 +90,7 @@ describe("ocDecisionRequest", () => {
     // An UNMAPPED permission keeps its own name (the shared summary switch has no arm for it) but its
     // `patterns` still reach the card, as the detail line.
     expect(ask("grep", ["TODO"], { pattern: "TODO" }))
-      .toEqual({ kind: "permission", id: "per_x", sessionID: SESSION, toolName: "grep", toolInput: {}, detail: "TODO" });
+      .toEqual({ kind: "permission", id: "per_x", sessionID: SESSION, toolName: "grep", toolInput: {}, detail: "TODO", grant: "" });
     // The one that matters: an `external_directory` Allow grants THIS path, so the path must be on the
     // card. Multiple patterns join like the bash arm's own join.
     expect(ask("external_directory", ["/Users/x/secrets", "/etc"], {}))
@@ -121,6 +123,30 @@ describe("ocDecisionRequest", () => {
     expect(ocDecisionRequest({ type: "session.idle", properties: { sessionID: SESSION } })).toBeNull();
     expect(ocDecisionRequest({ type: "question.asked", properties: { id: "que_x", sessionID: SESSION, questions: [] } })).toBeNull();
     expect(ocDecisionRequest(null)).toBeNull();
+  });
+});
+
+describe("ocGrantText — what an `always` reply approves (until OpenCode restarts)", () => {
+  const HOME = "/Users/me";
+  test("bash: one or more arity prefixes", () => {
+    expect(ocGrantText("bash", ["git status *"], HOME)).toBe("`git status` commands");
+    expect(ocGrantText("bash", ["git status *", "bun test *"], HOME)).toBe("`git status`, `bun test` commands");
+  });
+  test("\"*\" approves every request of that permission", () => {
+    expect(ocGrantText("edit", ["*"], HOME)).toBe("all edits");
+    expect(ocGrantText("read", ["*"], HOME)).toBe("all file reads");
+    expect(ocGrantText("webfetch", ["*"], HOME)).toBe("all web fetches");
+    expect(ocGrantText("mcp__srv__do_it", ["*"], HOME)).toBe("do it (srv)");
+  });
+  test("external_directory: the folder glob", () => {
+    expect(ocGrantText("external_directory", ["/Users/me/other/*"], HOME)).toBe("this folder (~/other)");
+    expect(ocGrantText("external_directory", ["/a/*", "/b/*"], HOME)).toBe("2 folders");
+  });
+  test("no always patterns → \"\" (the reply approves this request only)", () => {
+    expect(ocGrantText("bash", [], HOME)).toBe("");
+  });
+  test("other patterns are named verbatim", () => {
+    expect(ocGrantText("skill", ["deploy"], HOME)).toBe("skill `deploy`");
   });
 });
 
@@ -244,6 +270,8 @@ describe("no process handlers are ever installed", () => {
     expect(seen?.readInput).toBeDefined();
     expect(seen?.emit).toBeDefined();
     expect(seen?.delegate).toBeDefined();
+    // The grant text rides to the hold, which seals it as the card's `permissionGrant`.
+    expect(seen?.grant).toBe("`echo` commands");
   });
 
   test("a hold that ends WITHOUT the phone's decision says so (paused, superseded, threw)", async () => {
