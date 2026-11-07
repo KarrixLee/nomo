@@ -228,6 +228,18 @@ const antigravityDir = () => join(homedir(), ".gemini", "config");
 /** Devin's installer, and its user config dir (holds config.json, whose "hooks" key it merges into). */
 const DEVIN_SCRIPT = join(CHECKOUT, "plugin", "scripts", "devin-install.mjs");
 const devinDir = () => join(homedir(), ".config", "devin");
+/** Already installed as the native Devin plugin (`devin plugins install KarrixLee/nomo`)? Read from
+ *  Devin's plugin lock.json — the twin of devin-install.mjs devinPluginInstalled (this file ships
+ *  alone, so it cannot import it). That install's skills are /nomo:*, not the installer's /nomo-*. */
+function devinPluginInstalled() {
+  try {
+    const resolved = JSON.parse(readFileSync(join(homedir(), ".local", "share", "devin", "cli", "plugins", "lock.json"), "utf8"))?.resolved;
+    return Array.isArray(resolved) && resolved.some((r) => r?.name === "nomo");
+  } catch {
+    return false;
+  }
+}
+const DEVIN_PLUGIN_ROW = ["already installed as a Devin plugin (devin plugins) — nothing to install here"];
 
 /** Is Nomo already installed for this host? Answered from the host's OWN plugin cache
  *  (`<cache>/<marketplace>/<plugin>/`): the MARKETPLACE directory name is whatever the user called it,
@@ -627,23 +639,29 @@ const AGENTS = [
     id: "devin",
     label: "Devin",
     plan: () =>
-      STATUS.get("devin")?.installed
-        ? [`already installed — updates ${CHECKOUT}, then refreshes config.json`]
-        : [
-            `git clone --depth 1 ${REF ? `--branch ${REF} ` : ""}${CLONE_URL} ${CHECKOUT}`,
-            `node ${DEVIN_SCRIPT}`,
-          ],
+      STATUS.get("devin")?.installed === "plugin"
+        ? DEVIN_PLUGIN_ROW
+        : STATUS.get("devin")?.installed
+          ? [`already installed — updates ${CHECKOUT}, then refreshes config.json`]
+          : [
+              `git clone --depth 1 ${REF ? `--branch ${REF} ` : ""}${CLONE_URL} ${CHECKOUT}`,
+              `node ${DEVIN_SCRIPT}`,
+            ],
     next: () =>
-      STATUS.get("devin")?.installed
-        ? ["restart devin (and Devin Desktop)"]
-        : [
-            "restart devin (and Devin Desktop)",
-            "already paired from another agent? nothing to do — otherwise type /nomo-pair in devin",
-          ],
+      STATUS.get("devin")?.installed === "plugin"
+        ? ["already paired from another agent? nothing to do — otherwise type /nomo:pair in devin"]
+        : STATUS.get("devin")?.installed
+          ? ["restart devin (and Devin Desktop)"]
+          : [
+              "restart devin (and Devin Desktop)",
+              "already paired from another agent? nothing to do — otherwise type /nomo-pair in devin",
+            ],
     uninstallScript: DEVIN_SCRIPT,
     detect: () => onPath("devin") || existsSync(devinDir()),
     skipUndetectedUnderAll: true,
+    // "plugin" = the native Devin plugin owns it (its own skills, /nomo:*); true = this installer's hooks.
     installed: () => {
+      if (devinPluginInstalled()) return "plugin";
       try {
         return readFileSync(join(devinDir(), "config.json"), "utf8").includes("devin-status.mjs");
       } catch {
@@ -651,6 +669,7 @@ const AGENTS = [
       }
     },
     install() {
+      if (STATUS.get("devin")?.installed === "plugin") return showUpdate(DEVIN_PLUGIN_ROW);
       const checkout = ensureCheckout("Devin", "devin-install.mjs");
       if (checkout) return checkout;
       if (!DRY && !existsSync(DEVIN_SCRIPT)) {

@@ -12,6 +12,7 @@
 // scripts rather than reimplementing them. `--dry-run` guarantees nothing is installed or written.
 
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test } from "bun:test";
@@ -177,6 +178,24 @@ describe("bunx nomo-ai --devin", () => {
     });
     expect(r.out).toContain("already installed");
     expect(r.out).toContain("config.json");
+  });
+
+  test("the native Devin plugin already installed: reported as installed, nothing cloned, /nomo:pair (not /nomo-pair)", async () => {
+    const pluginInstall = async (home: string) => {
+      const dir = join(home, ".local", "share", "devin", "cli", "plugins");
+      await mkdir(dir, { recursive: true });
+      await writeFile(join(dir, "lock.json"), JSON.stringify({ resolved: [{ name: "nomo", source: "KarrixLee/nomo" }] }));
+    };
+    const dry = await nomoAi(["--dry-run", "--devin"], pluginInstall);
+    expect(dry.out).toContain("already installed as a Devin plugin");
+    expect(dry.out).not.toContain("devin-install.mjs");
+    let home = "";
+    const real = await nomoAi(["--devin", "-y"], async (h) => { home = h; await pluginInstall(h); });
+    expect(real.code).toBe(0);
+    expect(real.out).toContain("already installed as a Devin plugin");
+    expect(real.out).toContain("/nomo:pair");
+    expect(real.out).not.toContain("/nomo-pair");
+    expect(existsSync(join(home, ".nomo"))).toBe(false);
   });
 
   test("--uninstall needs an agent flag: no picker, nothing run", async () => {
