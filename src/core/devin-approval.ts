@@ -44,11 +44,18 @@
 // operator, substitution or redirect grants only that exact text, and only a plain command can ever
 // match a name grant, so `touch a && rm -rf ~` always goes to the phone. Any other tool is granted whole.
 // The grant is deleted on SessionEnd and when the watchdog retires the row.
+//
+// NOMO'S OWN COMMANDS: on a paired computer, the `exec` of one of Nomo's own SAFE skill commands
+// (/nomo-status, /nomo-pair, /nomo-approvals on|status, /nomo-reset — the plugin's /nomo:* or the
+// installer's /nomo-*) is approved at once, byte for byte, so /nomo-status never puts a card on the
+// phone. Pausing approvals, unpairing and the typed pairing code still ask (Antigravity's rule).
 
 import { readFile } from "node:fs/promises";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { DEVIN_ASK_TOOL, runDevinHook } from "./devin";
 import { runPermissionHook, type PermissionHookDeps } from "./permission";
-import { atomicWrite, devinGrantsPath, SESSIONS_DIR } from "./shared";
+import { atomicWrite, devinGrantsPath, loadConfig, SESSIONS_DIR } from "./shared";
 
 export const DEVIN_APPROVAL_TIMEOUT_S = 86_400;
 export const DEVIN_HOLD_DEADLINE_MS = (DEVIN_APPROVAL_TIMEOUT_S - 600) * 1000;
@@ -106,6 +113,56 @@ export function devinPermissionStdin(input: Record<string, unknown>, cwd?: strin
     tool_name: isQuestion ? DEVIN_QUESTION_CARD_TOOL : CARD_TOOL[tool] ?? tool,
     tool_input: isQuestion ? devinQuestionInput(toolInput) : toolInput,
   });
+}
+
+// ── Nomo's own /nomo-* commands ─────────────────────────────────────────────────────────────────
+
+/** The plugin dir this bundle runs from (`<root>/dist/devin-approve.mjs` → `<root>`): the installer's
+ *  checkout (`~/.nomo/plugin`) or the Devin plugin cache's `…/plugin`. */
+export const DEVIN_PLUGIN_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+
+/** The plugin skills' search of Devin's plugin cache (plugin/devin-skills); the installer's skills put
+ *  the one quoted checkout path in its place (devin-install.mjs userSkill). */
+const PLUGIN_CACHE_GLOB = '"$HOME"/.local/share/devin/cli/plugins/cache/*nomo*/*/plugin';
+
+/** [dist script, args] of the SAFE skill commands: they only read state, restore the default, or
+ *  start/finish pairing — the same set as Antigravity's SAFE_SKILL_COMMANDS. NOT here (they still ask
+ *  the phone): pausing approvals, unpairing, printing the typed pairing code. */
+const SAFE_DEVIN_SKILL_COMMANDS: ReadonlyArray<readonly [string, string]> = [
+  ["status-cmd", "devin"],
+  ["cc-permission", "status"],
+  ["cc-permission", "on"],
+  ["reset", ""],
+  ["pair", ""],
+  ["pair", "wait --timeout 60"],
+];
+
+/** The exact line a Devin skill runs for `script args`, searching `loop` (the plugin-cache glob, or a
+ *  quoted checkout path), then the hook-shim fallback. Mirrors plugin/devin-skills byte for byte (a
+ *  test checks every skill's command against it). */
+function devinSkillCommand(loop: string, script: string, args: string, reinstall: string): string {
+  const a = args ? ` ${args}` : "";
+  return `/bin/sh -c 'NOMOS="$HOME/.config/cc-status/hook-shim.sh"; for NOMOR in ${loop}; do [ -x "$NOMOR/scripts/run.sh" ] && [ -f "$NOMOR/dist/${script}.mjs" ] && exec "$NOMOR/scripts/run.sh" "$NOMOR/dist/${script}.mjs"${a}; done; [ -x "$NOMOS" ] && exec "$NOMOS" ${script}${a}; echo "Nomo could not find its installed files - ${reinstall}"; exit 1'`;
+}
+
+/** Is `command` EXACTLY one of Nomo's own safe skill commands — the Devin plugin's (/nomo:*, plugin
+ *  cache search) or the installer's (/nomo-*, this checkout)? Only a single trailing newline is
+ *  forgiven; any other byte difference (`&& …`, `;`, `|`, a redirect, a CR/LF, other quoting, another
+ *  script) is not ours. Pure. */
+export function isDevinSkillCommand(command: string, root: string = DEVIN_PLUGIN_ROOT): boolean {
+  const c = command.endsWith("\n") ? command.slice(0, -1) : command;
+  if (/[\r\n]/.test(c)) return false;
+  return SAFE_DEVIN_SKILL_COMMANDS.some(([script, args]) =>
+    devinSkillCommand(PLUGIN_CACHE_GLOB, script, args, "reinstall: devin plugins install KarrixLee/nomo") === c
+    || devinSkillCommand(`"${root}"`, script, args, "re-run: bunx nomo-ai --devin") === c);
+}
+
+/** An `exec` call that is only Nomo's own skill command: `command` plus at most Devin Desktop's
+ *  `workdir` (the paths are absolute). Any other key (an env, …) could change what runs → not ours. */
+function isOwnExec(cardTool: string, toolInput: Record<string, unknown>, root?: string): boolean {
+  return cardTool === "shell" && typeof toolInput.command === "string"
+    && Object.keys(toolInput).every((k) => k === "command" || k === "workdir")
+    && isDevinSkillCommand(toolInput.command, root);
 }
 
 // ── Always allow (session grants) ───────────────────────────────────────────────────────────────
@@ -229,6 +286,8 @@ export interface DevinApprovalDeps {
   env?: Record<string, string | undefined>;
   /** Where the session grants live (tests). Default: SESSIONS_DIR. */
   sessionsDir?: string;
+  /** The plugin root Nomo's own skill commands are rebuilt under (tests). */
+  pluginRoot?: string;
 }
 
 /** Set by the entry's SIGTERM/SIGHUP handler. */
@@ -251,6 +310,9 @@ export async function runDevinApproval(raw: string, deps: DevinApprovalDeps = {}
     // An Always-allow grant answers at once — before the pause gate and before any phone card.
     const grantsPath = devinGrantsPath(deps.sessionsDir ?? SESSIONS_DIR, sessionId);
     if (cardTool !== DEVIN_QUESTION_CARD_TOOL && (await readGrants(grantsPath)).some((g) => devinGrantMatches(g, cardTool, toolInput))) return APPROVE;
+    // Nomo's OWN /nomo-* commands (status, approvals on, …) never become a phone card — but only when
+    // paired (unpaired, Devin's own prompt decides) and only byte-for-byte the skill's command.
+    if (isOwnExec(cardTool, toolInput, deps.pluginRoot) && await (deps.hold?.loadConfigFn ?? loadConfig)()) return APPROVE;
     let line: string | undefined;
     let gone = false;
     const abandoned = () => (gone ||= (deps.abandoned ?? defaultAbandoned)());

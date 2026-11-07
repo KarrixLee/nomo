@@ -4617,6 +4617,8 @@ async function runDevinHook(raw, deps = {}) {
 
 // src/core/devin-approval.ts
 import { readFile as readFile6 } from "node:fs/promises";
+import { dirname as dirname2, resolve as resolve4 } from "node:path";
+import { fileURLToPath as fileURLToPath2 } from "node:url";
 
 // src/core/permission.ts
 import { readFile as readFile5, realpath, unlink as unlink5 } from "node:fs/promises";
@@ -5953,6 +5955,30 @@ function devinPermissionStdin(input, cwd) {
     tool_input: isQuestion ? devinQuestionInput(toolInput) : toolInput
   });
 }
+var DEVIN_PLUGIN_ROOT = resolve4(dirname2(fileURLToPath2(import.meta.url)), "..");
+var PLUGIN_CACHE_GLOB = '"$HOME"/.local/share/devin/cli/plugins/cache/*nomo*/*/plugin';
+var SAFE_DEVIN_SKILL_COMMANDS = [
+  ["status-cmd", "devin"],
+  ["cc-permission", "status"],
+  ["cc-permission", "on"],
+  ["reset", ""],
+  ["pair", ""],
+  ["pair", "wait --timeout 60"]
+];
+function devinSkillCommand(loop, script, args, reinstall) {
+  const a = args ? ` ${args}` : "";
+  return `/bin/sh -c 'NOMOS="$HOME/.config/cc-status/hook-shim.sh"; for NOMOR in ${loop}; do [ -x "$NOMOR/scripts/run.sh" ] && [ -f "$NOMOR/dist/${script}.mjs" ] && exec "$NOMOR/scripts/run.sh" "$NOMOR/dist/${script}.mjs"${a}; done; [ -x "$NOMOS" ] && exec "$NOMOS" ${script}${a}; echo "Nomo could not find its installed files - ${reinstall}"; exit 1'`;
+}
+function isDevinSkillCommand(command, root = DEVIN_PLUGIN_ROOT) {
+  const c = command.endsWith(`
+`) ? command.slice(0, -1) : command;
+  if (/[\r\n]/.test(c))
+    return false;
+  return SAFE_DEVIN_SKILL_COMMANDS.some(([script, args]) => devinSkillCommand(PLUGIN_CACHE_GLOB, script, args, "reinstall: devin plugins install KarrixLee/nomo") === c || devinSkillCommand(`"${root}"`, script, args, "re-run: bunx nomo-ai --devin") === c);
+}
+function isOwnExec(cardTool, toolInput, root) {
+  return cardTool === "shell" && typeof toolInput.command === "string" && Object.keys(toolInput).every((k) => k === "command" || k === "workdir") && isDevinSkillCommand(toolInput.command, root);
+}
 var PLAIN_COMMAND = /^[A-Za-z0-9_./-]+( [^;&|`$<>(){}\n]*)?$/;
 var commandOf = (toolInput) => typeof toolInput.command === "string" ? toolInput.command : "";
 function devinGrantFor(cardTool, toolInput) {
@@ -6051,6 +6077,8 @@ async function runDevinApproval(raw, deps = {}) {
     const { session_id: sessionId, tool_name: cardTool, tool_input: toolInput } = JSON.parse(stdin);
     const grantsPath = devinGrantsPath(deps.sessionsDir ?? SESSIONS_DIR, sessionId);
     if (cardTool !== DEVIN_QUESTION_CARD_TOOL && (await readGrants(grantsPath)).some((g) => devinGrantMatches(g, cardTool, toolInput)))
+      return APPROVE;
+    if (isOwnExec(cardTool, toolInput, deps.pluginRoot) && await (deps.hold?.loadConfigFn ?? loadConfig)())
       return APPROVE;
     let line;
     let gone = false;

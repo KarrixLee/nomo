@@ -2,7 +2,7 @@
 // translation, and runs through the REAL shared relay (runPermissionHook) with a scripted worker.
 // Nothing here touches the network or the real Nomo state dir.
 
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { readFile, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -10,7 +10,7 @@ import { afterAll, describe, expect, test } from "bun:test";
 import { decryptBlob, encryptBlob } from "./crypto";
 import {
   DEVIN_ANSWER_REASON_MAX, DEVIN_APPROVAL_TIMEOUT_S, DEVIN_ENTRY_CAP_MS, DEVIN_HOLD_DEADLINE_MS, devinDecision, devinGrantFor,
-  devinGrantMatches, devinPermissionStdin, runDevinApproval,
+  devinGrantMatches, devinPermissionStdin, isDevinSkillCommand, runDevinApproval,
 } from "./devin-approval";
 import { runDevinHook } from "./devin";
 import { devinGrantsPath, forgetDevinGrants, type Config } from "./shared";
@@ -376,5 +376,67 @@ describe("questions", () => {
       run: (async (deps: { delegate?: () => Promise<void> }) => { await deps.delegate!(); }) as never,
     });
     expect([delegated, out]).toEqual([1, ""]);
+  });
+});
+
+const installerPath = join(import.meta.dir, "../../plugin/scripts/devin-install.mjs");
+const { userSkill } = await import(installerPath) as { userSkill: (text: string, root: string) => string };
+
+describe("Nomo's own /nomo-* commands never become phone cards", () => {
+  const ROOT = "/Users/me/.nomo/plugin";
+  const SKILLS = join(import.meta.dir, "../../plugin/devin-skills");
+  /** Every fenced command in every plugin skill, as written (plugin) and as the installer writes it. */
+  const commands = (installer: boolean): string[] => readdirSync(SKILLS).flatMap((name) => {
+    const text = readFileSync(join(SKILLS, name, "SKILL.md"), "utf8");
+    return [...(installer ? userSkill(text, ROOT) : text).matchAll(/```\n(.+)\n```/g)].map((m) => m[1]!);
+  });
+  const SAFE = /dist\/(status-cmd\.mjs" devin|cc-permission\.mjs" (on|status)|reset\.mjs";|pair\.mjs";|pair\.mjs" wait --timeout 60;)/;
+
+  test("exactly the safe skill commands match, in both the plugin and the installer form", () => {
+    for (const installer of [false, true]) {
+      const all = commands(installer);
+      expect(all.length).toBe(9); // status, approvals ×3, pair ×3, reset, unpair (a new command must be classified here)
+      for (const c of all) expect([c.slice(0, 80), isDevinSkillCommand(c, ROOT)]).toEqual([c.slice(0, 80), SAFE.test(c)]);
+      expect(all.filter((c) => isDevinSkillCommand(c, ROOT)).length).toBe(6);
+      // one trailing newline is forgiven
+      expect(isDevinSkillCommand(`${all.find((c) => SAFE.test(c))!}\n`, ROOT)).toBe(true);
+    }
+  });
+
+  test("lookalikes are not ours", () => {
+    const status = commands(false).find((c) => c.includes("status-cmd.mjs"))!;
+    const mine = commands(true).find((c) => c.includes("status-cmd.mjs"))!;
+    for (const c of [
+      `${status} && rm -rf ~`, `${status}; rm -rf ~`, `${status} | sh`, `${status} > /tmp/x`, `${status}\nrm -rf ~`,
+      `cd /tmp && ${status}`, ` ${status}`, `${status} `, `${status}\r`, status.replace("status-cmd", "evil"),
+      status.replace(" devin;", " devin --plain;"), status.replace("exit 1'", "exit 1'; rm -rf ~"),
+      mine.replace(ROOT, "/tmp/evil"), // the installer form under another checkout
+      "~/.nomo/plugin/scripts/run.sh ~/.nomo/plugin/dist/status-cmd.mjs devin",
+    ]) expect([c, isDevinSkillCommand(c, ROOT)]).toEqual([c, false]);
+  });
+
+  const run = (command: string, opts: { config?: Config | null; input?: Record<string, unknown> } = {}) => {
+    const calls = { n: 0 };
+    const out = runDevinApproval(JSON.stringify(payload("exec", { command, ...opts.input })), {
+      env: ENV, sessionsDir: freshDir(), pluginRoot: ROOT,
+      hold: { loadConfigFn: async () => (opts.config === undefined ? CONFIG : opts.config) },
+      run: (async () => { calls.n++; }) as never,
+    });
+    return out.then((o) => ({ out: o, held: calls.n }));
+  };
+
+  test("paired: a skill command is approved at once (Desktop's workdir too); lookalikes go to the hold", async () => {
+    const [plugin, installer] = [commands(false), commands(true)];
+    for (const c of [...plugin, ...installer].filter((x) => SAFE.test(x))) expect(await run(c)).toEqual({ out: '{"decision":"approve"}', held: 0 });
+    const status = plugin.find((c) => c.includes("status-cmd.mjs"))!;
+    expect(await run(status, { input: { workdir: "/w/api" } })).toEqual({ out: '{"decision":"approve"}', held: 0 });
+    // pausing approvals, unpairing and the typed code still ask the phone
+    for (const c of plugin.filter((x) => !SAFE.test(x))) expect(await run(c)).toEqual({ out: "", held: 1 });
+    expect(await run(`${status} && rm -rf ~`)).toEqual({ out: "", held: 1 });
+    expect(await run(status, { input: { env: { HOME: "/tmp/evil" } } })).toEqual({ out: "", held: 1 }); // an unknown key
+  });
+
+  test("unpaired: no auto-approve (Devin's own prompt decides)", async () => {
+    expect(await run(commands(false).find((c) => c.includes("status-cmd.mjs"))!, { config: null })).toEqual({ out: "", held: 1 });
   });
 });

@@ -701,7 +701,14 @@ description is dropped before the command is.
   config files are never written. If Devin stops waiting (its timeout, Ctrl-C, the session ending), the hook
   notices its parent shell is gone, withdraws the phone's card and exits. Nomo's Claude Code hooks stand
   down inside Devin (Devin also runs `~/.claude` hooks), so a Devin session never shows up as a
-  Claude Code row and never gets its prompts answered by them. The installer writes only its own
+  Claude Code row and never gets its prompts answered by them. So that `/nomo-status` doesn't put a
+  card on your phone, Nomo auto-approves **only its own commands** — on a paired computer, before any
+  card — for exactly six command lines, rebuilt in code and matched byte for byte against what the
+  skills run (the Devin plugin's `/nomo:*` form and the installer's `/nomo-*` form, with at most Devin
+  Desktop's `workdir` beside them): status, approvals status, approvals **on**, reset, pair, and the
+  pair wait. One trailing newline is forgiven; any other difference (`&& …`, `;`, `|`, a redirect, a
+  second line, another script or path, an extra tool argument) goes to the phone. Approvals **off**,
+  unpair and the typed pairing code still ask your phone. The installer writes only its own
   entries and the marked `/nomo-*` skills in `~/.config/devin/skills` (they run only Nomo's own local
   commands from the checkout and never print the pairing link or QR secret); remove them with
   `bunx nomo-ai --uninstall --devin`. The Devin
