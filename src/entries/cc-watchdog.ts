@@ -54,7 +54,7 @@ import type { CodexAppServerSocketState, DecisionHold, PlanPickerTraceDecision }
 import {
   AgentKind, AgentKindWire, appendCodexBridgeMarker, appendFittedPlanAndDebug, atomicWrite, CC_DIR, CCOp, CCStatus, codexAppServerSocketAvailable, codexAppServerSocketState, Config, completePendingPairing, DECISION_HOLD_SUFFIX, decisionHoldFileName, formatPlanPickerDebug, formatWatchdogPidfile,
   startCodexAppServerDaemon,
-  GONE_STRIKE_LIMIT, loadConfig, loadPendingConfig, localApprovalsState,
+  forgetDevinGrants, GONE_STRIKE_LIMIT, loadConfig, loadPendingConfig, localApprovalsState,
   PAIR_HTML_FILE, PairPollResult, parseWatchdogPidfile, PendingConfig, pidAlive, PLUGIN_VERSION, readDecisionHoldAt, readPrefix, readSuffix, recordGoneStrike, removeRevokedConfig,
   resetGoneStrikes, resolveGitDir, SessionRecord, sessionBranch, sidField, SESSIONS_DIR, traceSession, tracePlanPickerDecision, watchdogBuildDiffers,
   watchdogBuildStamp, watchdogHolderIsLive, WATCHDOG_PID_PATH, writeInterruptFlagAt,
@@ -2491,9 +2491,10 @@ export function isClaudeIdleReapEligible(
   // (CURSOR_UNKNOWN_OWNER_PID) — has nothing else to finish it. It never sets `awaitingPrompt`, so it
   // only ever gets the 30-min clock. Antigravity joins for the same reason, and because its turns can
   // end with NO event (PostInvocation/Stop are skipped on a user interrupt): this clock, with the
-  // transcript-mtime veto below, is what settles such a row.
+  // transcript-mtime veto below, is what settles such a row. Devin joins too: its hooks are its only
+  // signal, and a `devin -p` run that rejects a tool ends with SessionEnd and NO Stop.
   const agent = recordAgent(record);
-  if (agent !== "claude" && agent !== "cursor" && agent !== "antigravity") return false;
+  if (agent !== "claude" && agent !== "cursor" && agent !== "antigravity" && agent !== "devin") return false;
   if (record.provisional === true) return false;
   return idleReapAgeEligible(record, now, transcriptMtimeMs,
     record.awaitingPrompt === true ? CLAUDE_AWAITING_PROMPT_REAP_MS : CLAUDE_IDLE_REAP_MS);
@@ -3254,6 +3255,7 @@ export async function retireDoneStale(
       });
     } else {
       await deleteRecord(path);
+      await forgetDevinGrants(path);
     }
     const verdict = outcome === "delivered" ? "retired" : "retired-offline";
     breadcrumb(verdict, tuiPid);
@@ -3866,6 +3868,7 @@ async function sweep(config: Config | null, deps: SweepDeps = {}): Promise<Sweep
     } catch {
       // Already gone (raced with another sweep or a SessionEnd hook) — fine.
     }
+    await forgetDevinGrants(path);
   }
   // Claim the greet only once an envelope actually landed. With no sessions on disk there is nothing
   // to greet WITH, so the flag stays unclaimed and the very first session to appear gets the beat.

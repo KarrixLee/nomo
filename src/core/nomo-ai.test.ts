@@ -11,7 +11,8 @@
 // with no exports (it runs main() on import) — the same reason hook-shim.test.ts drives the real shell
 // scripts rather than reimplementing them. `--dry-run` guarantees nothing is installed or written.
 
-import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test } from "bun:test";
@@ -121,5 +122,119 @@ describe("runtime floor (CVE-2026-111497): a warning, never a block", () => {
 
   test("bun 1.4.4: no warning", async () => {
     expect(await withBun("1.4.4")).not.toContain("CVE-2026-111497");
+  });
+});
+
+describe("bunx nomo-ai --devin", () => {
+  async function nomoAi(flags: string[], setup: (home: string, bin: string) => Promise<void> = async () => {}): Promise<{ code: number; out: string }> {
+    const home = await mkdtemp(join(tmpdir(), "nomo-ai-devin-"));
+    homes.push(home);
+    const bin = join(home, "bin");
+    await mkdir(bin, { recursive: true });
+    for (const name of ["claude", "codex"]) await writeFile(join(bin, name), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    await setup(home, bin);
+    const proc = spawnTestProcess({
+      cmd: [Bun.which("node")!, NOMO_AI, ...flags],
+      cwd: home,
+      env: isolatedTestEnv(home, { NO_COLOR: "1", PATH: `${bin}:/usr/bin:/bin` }),
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [out, err] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
+    return { code: await proc.exited, out: `${out}${err}` };
+  }
+
+  test("--devin is a known flag and appears in --help with its uninstall line", async () => {
+    const help = await nomoAi(["--help"]);
+    expect(help.out).toContain("--devin");
+    expect(help.out).toContain("bunx nomo-ai --uninstall --devin");
+    const r = await nomoAi(["--dry-run", "--devin"]);
+    expect(r.out).not.toContain("unknown");
+    expect(r.code).toBe(0);
+  });
+
+  test("--dry-run plan names the clone + devin-install.mjs, and the pair command for Devin-only users", async () => {
+    const r = await nomoAi(["--dry-run", "--devin"]);
+    expect(r.out).toContain("git clone --depth 1 https://github.com/KarrixLee/nomo.git");
+    expect(r.out).toContain(".nomo/plugin/scripts/devin-install.mjs");
+    expect(r.out).not.toContain("claude plugin");
+  });
+
+  test("detect: devin on PATH or ~/.config/devin exists; skipped under --all when undetected", async () => {
+    const none = await nomoAi(["--dry-run", "--all"]);
+    expect(none.out).toContain("Devin was not found on this machine — skipped");
+    expect(none.out).not.toContain("devin-install.mjs");
+    expect(none.code).toBe(0);
+    const onPath = await nomoAi(["--dry-run", "--all"], async (_h, bin) => { await writeFile(join(bin, "devin"), "#!/bin/sh\nexit 0\n", { mode: 0o755 }); });
+    expect(onPath.out).toContain("devin-install.mjs");
+    const dir = await nomoAi(["--dry-run", "--all"], async (home) => { await mkdir(join(home, ".config", "devin"), { recursive: true }); });
+    expect(dir.out).toContain("devin-install.mjs");
+  });
+
+  test("installed() reads the devin-status.mjs marker from ~/.config/devin/config.json", async () => {
+    const r = await nomoAi(["--dry-run", "--devin"], async (home) => {
+      await mkdir(join(home, ".config", "devin"), { recursive: true });
+      await writeFile(join(home, ".config", "devin", "config.json"), JSON.stringify({ hooks: { Stop: [{ hooks: [{ type: "command", command: "'/r/scripts/run.sh' '/r/dist/devin-status.mjs'" }] }] } }));
+    });
+    expect(r.out).toContain("already installed");
+    expect(r.out).toContain("config.json");
+  });
+
+  test("the native Devin plugin already installed: reported as installed, nothing cloned, /nomo:pair (not /nomo-pair)", async () => {
+    const pluginInstall = async (home: string) => {
+      const dir = join(home, ".local", "share", "devin", "cli", "plugins");
+      await mkdir(dir, { recursive: true });
+      await writeFile(join(dir, "lock.json"), JSON.stringify({ resolved: [{ name: "nomo", source: "KarrixLee/nomo" }] }));
+    };
+    const dry = await nomoAi(["--dry-run", "--devin"], pluginInstall);
+    expect(dry.out).toContain("already installed as a Devin plugin");
+    expect(dry.out).not.toContain("devin-install.mjs");
+    let home = "";
+    const real = await nomoAi(["--devin", "-y"], async (h) => { home = h; await pluginInstall(h); });
+    expect(real.code).toBe(0);
+    expect(real.out).toContain("already installed as a Devin plugin");
+    expect(real.out).toContain("/nomo:pair");
+    expect(real.out).not.toContain("/nomo-pair");
+    expect(existsSync(join(home, ".nomo"))).toBe(false);
+  });
+
+  test("--uninstall needs an agent flag: no picker, nothing run", async () => {
+    const r = await nomoAi(["--uninstall"]);
+    expect(r.code).toBe(2);
+    expect(r.out).toContain("--uninstall needs to know which agent");
+    expect((await nomoAi(["--uninstall", "-y"])).code).toBe(2);
+  });
+
+  test("--uninstall --devin runs ~/.nomo's devin-install.mjs --uninstall; -y is accepted", async () => {
+    let log = "";
+    const r = await nomoAi(["--uninstall", "--devin", "-y"], async (home) => {
+      const scripts = join(home, ".nomo", "plugin", "scripts");
+      await mkdir(scripts, { recursive: true });
+      log = join(home, "argv.log");
+      await writeFile(join(scripts, "devin-install.mjs"), `import { writeFileSync } from "node:fs";\nwriteFileSync(${JSON.stringify(log)}, process.argv.slice(2).join(" "));\n`);
+    });
+    expect(r.code).toBe(0);
+    expect(await readFile(log, "utf8")).toBe("--uninstall");
+    expect(r.out).not.toContain("claude plugin");
+  });
+
+  test("--uninstall with no ~/.nomo checkout fails loudly and names the long form", async () => {
+    const r = await nomoAi(["--uninstall", "--cursor"]);
+    expect(r.code).toBe(1);
+    expect(r.out).toContain("cursor-install.mjs --uninstall");
+  });
+
+  test("--uninstall for a host-owned install prints the host's command and runs nothing", async () => {
+    const r = await nomoAi(["--uninstall", "--claude", "--codex"]);
+    expect(r.code).toBe(0);
+    expect(r.out).toContain("claude plugin uninstall nomo-cc@nomo");
+    expect(r.out).toContain("codex plugin remove nomo@nomo");
+    expect(r.out).not.toContain("$ claude");
+  });
+
+  test("--ref note lists Devin among the pinned agents", async () => {
+    const r = await nomoAi(["--dry-run", "--devin", "--ref", "dev"]);
+    expect(r.out).toContain("(OpenCode, Cursor, Antigravity, Devin) only");
+    expect(r.out).not.toContain("None of them is selected");
   });
 });

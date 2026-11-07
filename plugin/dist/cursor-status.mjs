@@ -4,18 +4,18 @@ var __require = /* @__PURE__ */ createRequire(import.meta.url);
 // src/core/cursor.ts
 import { hostname as hostname2 } from "node:os";
 import { realpathSync } from "node:fs";
-import { readdir as readdir3, stat as stat4, unlink as unlink3 } from "node:fs/promises";
+import { readdir as readdir4, stat as stat4, unlink as unlink3 } from "node:fs/promises";
 
 // src/core/adapter.ts
 import { execFile as execFile2, execFileSync as execFileSync2 } from "node:child_process";
 import { copyFileSync, existsSync as existsSync2, mkdtempSync, rmSync, statSync as statSync2 } from "node:fs";
-import { readdir, readFile as readFile2, stat as stat2 } from "node:fs/promises";
+import { readdir as readdir2, readFile as readFile2, stat as stat2 } from "node:fs/promises";
 import { devNull, tmpdir } from "node:os";
 import { promisify as promisify2 } from "node:util";
 import { basename as basename2, isAbsolute as isAbsolute2, join as join2, resolve as resolve2 } from "node:path";
 
 // src/core/shared.ts
-import { access, chmod, open, readFile, rename, stat, mkdir, unlink, writeFile } from "node:fs/promises";
+import { access, chmod, open, readdir, readFile, rename, stat, mkdir, unlink, writeFile } from "node:fs/promises";
 import { appendFileSync, existsSync, readFileSync, statSync, truncateSync } from "node:fs";
 import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
@@ -107,7 +107,7 @@ async function sha256Hex(s) {
 }
 
 // src/core/shared.ts
-var PLUGIN_VERSION = "2.4.0";
+var PLUGIN_VERSION = "2.5.0";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -291,6 +291,10 @@ function antigravityConfigDir() {
   return `${process.env.HOME}/.gemini/config`;
 }
 var ANTIGRAVITY_HOOK_MARKER = "antigravity-hook.sh";
+function devinConfigDir() {
+  return `${process.env.HOME}/.config/devin`;
+}
+var DEVIN_HOOK_MARKER = "devin-status.mjs";
 var CODEX_HOOK_MARKER = "codex-status.mjs";
 function codexAppServerSocketPath() {
   return `${codexHome()}/app-server-control/app-server-control.sock`;
@@ -734,6 +738,7 @@ async function completePendingPairing(pending, configPath, opts = {}) {
     e2eKeyB64: b64url(e2eKey),
     ...pending.machineName ? { machineName: pending.machineName } : {}
   }), CONFIG_MODE);
+  await forgetAllDevinGrants(opts.sessionsDir ?? join(dirname(configPath), "sessions"));
   for (let attempt = 0;attempt < ackAttempts; attempt++) {
     try {
       await fetchFn(`${pending.url}/v1/cc/pair/ack`, {
@@ -961,6 +966,18 @@ async function interruptFlagSetAt(sessionsDir, sessionId, now, maxAgeMs = INTERR
 }
 async function clearInterruptFlagAt(sessionsDir, sessionId, suffix = INTERRUPT_FLAG_SUFFIX) {
   await unlink(`${sessionsDir}/${interruptFlagFileName(sessionId, suffix)}`).catch(() => {});
+}
+var DEVIN_GRANTS_SUFFIX = ".devin-allow";
+function devinGrantsPath(sessionsDir, sessionId) {
+  return `${sessionsDir}/${sessionId}${DEVIN_GRANTS_SUFFIX}`;
+}
+async function forgetDevinGrants(recordPath) {
+  if (recordPath.endsWith(".json"))
+    await unlink(`${recordPath.slice(0, -5)}${DEVIN_GRANTS_SUFFIX}`).catch(() => {});
+}
+async function forgetAllDevinGrants(sessionsDir = SESSIONS_DIR) {
+  const files = await readdir(sessionsDir).catch(() => []);
+  await Promise.all(files.filter((f) => f.endsWith(DEVIN_GRANTS_SUFFIX)).map((f) => unlink(`${sessionsDir}/${f}`).catch(() => {})));
 }
 async function settleDecisionHoldRecord(sessionId, patch, heldSince) {
   return settleDecisionHoldRecordAt(SESSIONS_DIR, sessionId, patch, heldSince);
@@ -2087,6 +2104,9 @@ var CLAUDE_DESKTOP_LAUNCHER = "Claude.app/Contents/Helpers/disclaimer";
 function cursorHostInvocation(input, env = process.env) {
   return env.CURSOR_VERSION !== undefined || typeof input === "object" && input !== null && "cursor_version" in input;
 }
+function devinHostInvocation(input, env = process.env) {
+  return env.DEVIN_PROJECT_DIR !== undefined && typeof input === "object" && input !== null && !Array.isArray(input) && !("transcript_path" in input);
+}
 function claudeDesktopInvocation(selfArgs, ancestorArgs, entrypoint) {
   if (entrypoint === CLAUDE_DESKTOP_ENTRYPOINT)
     return true;
@@ -2194,7 +2214,7 @@ var ROLLOUT_SCAN_MAX_HEADS = 40;
 var ROLLOUT_META_HEAD_BYTES = 64 * 1024;
 async function listNumericDirsDesc(path) {
   try {
-    return (await readdir(path)).filter((n) => /^\d+$/.test(n)).sort((a, b) => b.localeCompare(a));
+    return (await readdir2(path)).filter((n) => /^\d+$/.test(n)).sort((a, b) => b.localeCompare(a));
   } catch {
     return [];
   }
@@ -2210,7 +2230,7 @@ async function codexNewestRolloutForCwd(cwd, home = codexHome()) {
           const dir = join2(sessions, y, m, d);
           let names;
           try {
-            names = await readdir(dir);
+            names = await readdir2(dir);
           } catch {
             continue;
           }
@@ -2589,7 +2609,7 @@ async function codexRolloutExistsForSession(sessionId, home = codexHome()) {
       for (const d of await listNumericDirsDesc(join2(sessions, y, m))) {
         let names;
         try {
-          names = await readdir(join2(sessions, y, m, d));
+          names = await readdir2(join2(sessions, y, m, d));
         } catch {
           names = [];
         }
@@ -3047,6 +3067,46 @@ var antigravityAdapter = {
   interrupt: "hook-flag",
   interruptFlagSuffix: ".agy-interrupt"
 };
+function devinSessionsDb() {
+  return `${process.env.HOME ?? ""}/.local/share/devin/cli/sessions.db`;
+}
+function devinSessionMeta(sessionId, db = devinSessionsDb(), env = process.env) {
+  if (!/^[A-Za-z0-9_-]{1,128}$/.test(sessionId))
+    return {};
+  const cell = sqliteOne(db, `select json_object('t',title,'m',model,'w',working_directory) from sessions where id='${sessionId}'`, env, true);
+  if (!cell)
+    return {};
+  try {
+    const row = JSON.parse(cell);
+    const s = (v) => typeof v === "string" && v.trim().length > 0 ? v.trim() : undefined;
+    const title = s(row.t)?.endsWith("...") ? undefined : s(row.t), model = s(row.m), cwd = s(row.w);
+    return {
+      ...title ? { title: truncateOnWord(title.replace(/\s+/g, " ")) } : {},
+      ...model ? { model: model.slice(0, 80) } : {},
+      ...cwd ? { cwd } : {}
+    };
+  } catch {
+    return {};
+  }
+}
+var devinAdapter = {
+  kind: "devin",
+  title: async ({ input }) => typeof input.prompt === "string" ? displayTitleFromUserText(input.prompt) : undefined,
+  model: async ({ sessionId }) => devinSessionMeta(sessionId).model,
+  detectInterrupt: () => false,
+  sessionsDir: () => `${process.env.HOME ?? ""}/.local/share/devin/cli`,
+  sessionMatch: () => false,
+  hookStampPath: () => lastHookPath("devin"),
+  hooksNotFiringHint: "  run `bunx nomo-ai --devin` again, then restart devin (`/hooks` shows what it loaded)",
+  titleRepair: {
+    due: (record, now) => record.lastEvent === "done" && typeof record.ts === "number" && now - record.ts < CURSOR_TITLE_REPAIR_MS,
+    resolve: (sessionId) => devinSessionMeta(sessionId).title
+  },
+  toolDetail: {},
+  blobAgentFields: { agent: "devin" },
+  interrupt: "hook-flag",
+  answerExtras: true
+};
 function unknownAgentAdapter(kind) {
   return {
     kind,
@@ -3072,6 +3132,8 @@ function adapterFor(agent) {
       return cursorAdapter;
     case "antigravity":
       return antigravityAdapter;
+    case "devin":
+      return devinAdapter;
     case "claude":
       return claudeAdapter;
     default:
@@ -3081,7 +3143,7 @@ function adapterFor(agent) {
 var allAdapters = [claudeAdapter, codexAdapter];
 
 // src/core/hook.ts
-import { readdir as readdir2, readFile as readFile4, unlink as unlink2 } from "node:fs/promises";
+import { readdir as readdir3, readFile as readFile4, unlink as unlink2 } from "node:fs/promises";
 import { hostname } from "node:os";
 import { basename as basename3 } from "node:path";
 
@@ -3723,7 +3785,7 @@ async function traceSendFailure(event, failPath = SEND_FAIL_PATH, lastSendPath =
 }
 async function reconcileProvisional(config, hookPid) {
   try {
-    const files = await readdir2(SESSIONS_DIR).catch(() => []);
+    const files = await readdir3(SESSIONS_DIR).catch(() => []);
     const provisionals = [];
     for (const f of files) {
       if (!f.endsWith(".json"))
@@ -3757,7 +3819,7 @@ async function reconcileProvisional(config, hookPid) {
   } catch {}
 }
 async function readTrackedSessions() {
-  const files = await readdir2(SESSIONS_DIR).catch(() => []);
+  const files = await readdir3(SESSIONS_DIR).catch(() => []);
   const out = [];
   for (const f of files) {
     if (!f.endsWith(".json"))
@@ -3809,6 +3871,8 @@ async function runHook(agent) {
     const [config, raw] = await Promise.all([loadConfig(), readStdin()]);
     const input = JSON.parse(raw);
     if (agent === "claude" && cursorHostInvocation(input))
+      return;
+    if (agent === "claude" && devinHostInvocation(input))
       return;
     if (typeof input.session_id !== "string" || input.session_id.length === 0)
       return;
@@ -4275,7 +4339,7 @@ var IGNORED_TTL_MS = 86400000;
 async function markIgnored(dir, ids, now) {
   for (const id of ids)
     await atomicWrite(`${dir}/${id}`, "", 384);
-  for (const name of await readdir3(dir).catch(() => [])) {
+  for (const name of await readdir4(dir).catch(() => [])) {
     const path = `${dir}/${name}`;
     const s = await stat4(path).catch(() => null);
     if (s && now - s.mtimeMs > IGNORED_TTL_MS)

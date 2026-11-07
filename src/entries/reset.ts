@@ -6,7 +6,8 @@
 //      PROVISIONAL (a discovery sentinel), or that is corrupt, gets an op:end POSTed under the
 //      CURRENT pairing (an end carries no blob, so it clears the phone row regardless of which key
 //      sealed the record's stale blob) and its file deleted. Records with LIVE pids are left alone.
-//   3. Pairing, keys, and config.json are NOT touched — that is `unpair`'s job.
+//   3. Deletes every Devin session's "Always allow" grants (<id>.devin-allow).
+//   4. Pairing, keys, and config.json are NOT touched — that is `unpair`'s job.
 //
 // Interactive command (same output contract as unpair): sequential stdout lines, ALWAYS exit 0 —
 // "nothing to reset" is a normal, successful outcome. The watchdog restarts automatically on the
@@ -17,7 +18,7 @@
 import { execFileSync } from "node:child_process";
 import { readdir, readFile, unlink } from "node:fs/promises";
 import { basename } from "node:path";
-import { Config, isWatchdogCommand, loadConfig, localApprovalsState, pidAlive, PLUGIN_VERSION, SessionRecord, SESSIONS_DIR, WATCHDOG_PID_PATH } from "../core/shared";
+import { Config, forgetAllDevinGrants, isWatchdogCommand, loadConfig, localApprovalsState, pidAlive, PLUGIN_VERSION, SessionRecord, SESSIONS_DIR, WATCHDOG_PID_PATH } from "../core/shared";
 
 export type ResetVerdict = "clear" | "keep";
 
@@ -145,6 +146,8 @@ export async function reset(deps: ResetDeps = {}): Promise<number> {
     print("No stale sessions to clear.");
   }
   if (kept > 0) print(`Left ${kept} live session${kept === 1 ? "" : "s"} untouched.`);
+  // Devin "Always allow" grants are forgotten too, live session or not (the next prompt just asks).
+  await forgetAllDevinGrants(sessionsDir);
   print("Pairing and keys were not touched — use the unpair command if you want that.");
   return 0;
 }

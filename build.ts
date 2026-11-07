@@ -27,13 +27,17 @@ const OUTDIR = join(HERE, "plugin", "dist");
  *  code — it only drives `claude plugin install` / `codex plugin add` / opencode-install.sh — so
  *  there was an argument for versioning it independently. It is here anyway: same product, same
  *  repo, and `bunx nomo-ai --version` is what a user will quote in a bug report. Locking it in means
- *  the build fails loudly on drift instead of leaving that trap for a future release to find. */
+ *  the build fails loudly on drift instead of leaving that trap for a future release to find.
+ *
+ *  .devin-plugin/plugin.json is the SIXTH: the native Devin plugin (`devin plugins install
+ *  KarrixLee/nomo`), whose plugin root is the repo root. */
 const VERSION_MANIFESTS: { path: string; versions: (doc: any) => (string | undefined)[] }[] = [
   { path: join("plugin", ".claude-plugin", "plugin.json"), versions: (d) => [d.version] },
   { path: join("plugin", ".codex-plugin", "plugin.json"), versions: (d) => [d.version] },
   { path: join(".claude-plugin", "marketplace.json"), versions: (d) => (d.plugins ?? []).map((p: any) => p.version) },
   { path: join(".agents", "plugins", "marketplace.json"), versions: (d) => (d.plugins ?? []).map((p: any) => p.version) },
   { path: "package.json", versions: (d) => [d.version] },
+  { path: join(".devin-plugin", "plugin.json"), versions: (d) => [d.version] },
 ];
 
 /** The Claude plugin manifest's version, after proving every other manifest agrees with it.
@@ -87,6 +91,11 @@ const ENTRYPOINTS = [
   "antigravity-status.ts",
   // Its PreToolUse twin: the phone-approval hold, run by plugin/scripts/antigravity-approve.sh.
   "antigravity-approve.ts",
+  // The Devin hooks (CLI + Desktop's "Devin Local"), addressed by absolute path from
+  // ~/.config/devin/config.json (see plugin/scripts/devin-install.mjs) — no shim. The status producer…
+  "devin-status.ts",
+  // …and its PermissionRequest twin, the phone-approval hold.
+  "devin-approve.ts",
 ].map((f) => join(HERE, "src", "entries", f));
 
 /** The OpenCode plugin — a SECOND build pass, not another ENTRYPOINTS row, because it needs a

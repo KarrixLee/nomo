@@ -23,7 +23,7 @@ import { hostname } from "node:os";
 import { basename } from "node:path";
 import { Bytes, decryptBlob, encryptBlob } from "./crypto";
 import {
-  adapterFor, claudeToolDetail, codexToolDetail, COMPUTER_USE_ACCESS_TOOL, computerUseAccessDetail, cursorHostInvocation, findProvisionalForPid, requestUserInputDetail,
+  adapterFor, claudeToolDetail, codexToolDetail, COMPUTER_USE_ACCESS_TOOL, computerUseAccessDetail, cursorHostInvocation, devinHostInvocation, findProvisionalForPid, requestUserInputDetail,
   SessionCreationSuppression, TrackedSessionLite,
 } from "./adapter";
 import {
@@ -875,6 +875,8 @@ export async function runHook(agent: AgentKind): Promise<void> {
     // Claude plugin's hooks itself, with Cursor-shaped payloads; mirroring those would report a Cursor
     // chat as a Claude Code session. Only the CLAUDE entry is imported that way. See cursorHostInvocation.
     if (agent === "claude" && cursorHostInvocation(input)) return;
+    // Devin import guard, same rule: Devin runs ~/.claude hooks too, with Devin-shaped payloads.
+    if (agent === "claude" && devinHostInvocation(input)) return;
     if (typeof input.session_id !== "string" || input.session_id.length === 0) return;
 
     // Codex compat-layer guard: Codex ≥0.142 auto-discovers installed Claude Code plugins as hook

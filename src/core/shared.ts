@@ -10,7 +10,7 @@
 // and node >= 18 — no `Bun.*` APIs. File IO goes through node:fs/promises; base64 decode goes
 // through the portable crypto.ts helpers. Task 2.3 bundles these .ts files to a single .mjs.
 
-import { access, chmod, open, readFile, rename, stat, mkdir, unlink, writeFile } from "node:fs/promises";
+import { access, chmod, open, readdir, readFile, rename, stat, mkdir, unlink, writeFile } from "node:fs/promises";
 import { appendFileSync, existsSync, readFileSync, statSync, truncateSync } from "node:fs";
 import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
@@ -458,8 +458,13 @@ export type CCStatus = "working" | "needsAttention" | "done";
  *  `"antigravity"` (the fifth) covers Google Antigravity — the desktop app/IDE and the `agy` CLI, which
  *  read the same ~/.gemini/config/hooks.json. One hook binary (entries/antigravity-status.ts →
  *  core/antigravity.ts), plus a PreToolUse phone-approval hold (entries/antigravity-approve.ts →
- *  core/antigravity-approval.ts). */
-export type AgentKind = "claude" | "codex" | "opencode" | "cursor" | "antigravity";
+ *  core/antigravity-approval.ts).
+ *
+ *  `"devin"` (the sixth) covers the Devin CLI and Devin Desktop's "Devin Local" agent, which run the same
+ *  harness and read the same ~/.config/devin/config.json hooks. One status hook (entries/devin-status.ts
+ *  → core/devin.ts) plus a PermissionRequest phone-approval hold (entries/devin-approve.ts →
+ *  core/devin-approval.ts). */
+export type AgentKind = "claude" | "codex" | "opencode" | "cursor" | "antigravity" | "devin";
 
 /** An agent literal AS IT ARRIVES — off a session record, out of a blob a peer install wrote. It is
  *  `AgentKind` plus "some string this build has never heard of", because that case is now REAL: two
@@ -502,6 +507,15 @@ export function antigravityConfigDir(): string {
 
 /** The substring that identifies OUR hook inside Antigravity's `hooks.json` (the wrapper's basename). */
 export const ANTIGRAVITY_HOOK_MARKER = "antigravity-hook.sh";
+
+/** Devin's user config dir — holds the `config.json` whose `"hooks"` key the installer merges Nomo's
+ *  entries into (plugin/scripts/devin-install.mjs). */
+export function devinConfigDir(): string {
+  return `${process.env.HOME}/.config/devin`;
+}
+
+/** The substring that identifies OUR status hook inside Devin's `config.json` (the bundle's basename). */
+export const DEVIN_HOOK_MARKER = "devin-status.mjs";
 
 /** The substring that identifies OUR hook command inside a codex `hooks.json` entry (the bundled
  *  hook's basename). status-cmd greps for it to flag leftover legacy (pre-native-plugin) installs. */
@@ -1639,6 +1653,13 @@ export async function completePendingPairing(
     ...(pending.machineName ? { machineName: pending.machineName } : {}),
   }), CONFIG_MODE);
 
+  // A new pairing starts with no Devin "Always allow" grants: they belong to the pairing that approved
+  // them, and re-pairing over an old config (no unpair first) would otherwise carry them over. Both
+  // completers (`pair wait` and the watchdog self-heal) funnel through here. Only after the new config
+  // is saved — a failed/cancelled pairing returns above and keeps them. Sessions dir sits next to
+  // config.json (as unpair resolves it) unless injected.
+  await forgetAllDevinGrants(opts.sessionsDir ?? join(dirname(configPath), "sessions"));
+
   // Ack so the worker drops the nonce + name blob. Best-effort (pairing is already complete either
   // way); the /cc/event route self-heals a lost ack on the PC's first post-pair hook.
   for (let attempt = 0; attempt < ackAttempts; attempt++) {
@@ -2189,6 +2210,28 @@ export async function clearInterruptFlagAt(
   sessionsDir: string, sessionId: string, suffix: string = INTERRUPT_FLAG_SUFFIX,
 ): Promise<void> {
   await unlink(`${sessionsDir}/${interruptFlagFileName(sessionId, suffix)}`).catch(() => {});
+}
+
+/** A Devin session's "Always allow" grants (core/devin-approval.ts). A sibling file, and NOT `.json`, so
+ *  no SESSIONS_DIR reader mistakes it for a session row. */
+export const DEVIN_GRANTS_SUFFIX = ".devin-allow";
+
+export function devinGrantsPath(sessionsDir: string, sessionId: string): string {
+  return `${sessionsDir}/${sessionId}${DEVIN_GRANTS_SUFFIX}`;
+}
+
+/** Forget the Devin grants of the session whose RECORD is at `recordPath` (`<dir>/<id>.json`): the row
+ *  is being retired, and a grant must never outlive it into a later session that reuses the slug.
+ *  Best-effort; a no-op for every other agent (no such file). */
+export async function forgetDevinGrants(recordPath: string): Promise<void> {
+  if (recordPath.endsWith(".json")) await unlink(`${recordPath.slice(0, -5)}${DEVIN_GRANTS_SUFFIX}`).catch(() => {});
+}
+
+/** Delete EVERY Devin session's grants in `sessionsDir` (unpair, reset): no Always-allow outlives the
+ *  pairing or a reset, live session or not — the next matching request just asks again. Best-effort. */
+export async function forgetAllDevinGrants(sessionsDir: string = SESSIONS_DIR): Promise<void> {
+  const files = await readdir(sessionsDir).catch(() => [] as string[]);
+  await Promise.all(files.filter((f) => f.endsWith(DEVIN_GRANTS_SUFFIX)).map((f) => unlink(`${sessionsDir}/${f}`).catch(() => {})));
 }
 
 export async function settleDecisionHoldRecord(

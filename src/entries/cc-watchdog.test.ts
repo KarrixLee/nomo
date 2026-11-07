@@ -123,6 +123,11 @@ describe("isClaudeIdleReapEligible (a resumed Claude session gone silent past th
   const REAP_MS = 1_800_000; // must mirror CLAUDE_IDLE_REAP_MS in cc-watchdog.ts
   const now = 100_000_000;
 
+  test("a quiet working devin row is idle-reap eligible (its hooks are its only signal)", () => {
+    expect(isClaudeIdleReapEligible(rec({ agent: "devin", lastEvent: "working", ts: now - REAP_MS }), now)).toBe(true);
+    expect(isClaudeIdleReapEligible(rec({ agent: "devin", lastEvent: "working", ts: now - REAP_MS + 1 }), now)).toBe(false);
+  });
+
   test("a working Claude session idle ≥30 min → eligible; just under → not", () => {
     expect(isClaudeIdleReapEligible(rec({ lastEvent: "working", ts: now - REAP_MS }), now)).toBe(true);
     expect(isClaudeIdleReapEligible(rec({ lastEvent: "working", ts: now - REAP_MS + 1 }), now)).toBe(false);
@@ -4129,6 +4134,20 @@ describe("drainCommands (authenticate, validate, then execute)", () => {
       });
       expect(flagged).toEqual(["sess-a"]);
       expect(traces[0]).toMatchObject({ agent: "antigravity", result: "interrupt-flagged" });
+    });
+
+    test("a Devin session gets the shared hook flag (its PostToolUse hook prints continue:false)", async () => {
+      const { traces, deps } = harness();
+      const flagged: string[] = [];
+      const cmd = await sealed({ kind: "interrupt-session" });
+      await drainCommands(cfg(), {
+        ...deps,
+        take: () => [cmd],
+        readRecords: async () => [running({ agent: "devin" })],
+        writeInterruptFlagFn: async (sessionId) => { flagged.push(sessionId); },
+      });
+      expect(flagged).toEqual(["sess-a"]);
+      expect(traces[0]).toMatchObject({ agent: "devin", result: "interrupt-flagged" });
     });
 
     test("a Codex session is interrupted through the bridge with the record's own turn id", async () => {

@@ -71,6 +71,7 @@ const USAGE = `nomo-ai ${VERSION} — install (or update) the Nomo plugin for yo
 
   bunx nomo-ai            detect agents, confirm, install
   npx nomo-ai             same, without bun
+  bunx nomo-ai --uninstall --devin   remove Nomo from an agent (name it; see below)
 
 An agent that already has Nomo shows an update instead of an install. OpenCode's is
 done for you — it has no marketplace, so its checkout is its version. Claude Code and
@@ -82,12 +83,14 @@ Agents (naming any one of these skips the prompt):
   --opencode              OpenCode
   --cursor                Cursor (desktop app + cursor-agent CLI)
   --antigravity           Google Antigravity (desktop app + agy CLI)
-  --all                   all of them (Cursor/Antigravity only if on this machine)
+  --devin                 Devin (CLI + Devin Desktop's Devin Local)
+  --all                   all of them (Cursor/Antigravity/Devin only if on this machine)
 
 Options:
   -y, --yes               no prompt; install every agent detected on this machine
+      --uninstall         remove Nomo from the agents you name (an agent flag is required)
   -n, --dry-run           print the commands that would run, run nothing
-      --ref <branch|tag>  OpenCode, Cursor and Antigravity only: install from this ref of the
+      --ref <branch|tag>  OpenCode, Cursor, Antigravity and Devin only: install from this ref of the
                           repo instead of its default branch. Claude Code and Codex
                           install through their own marketplaces, which read the
                           default branch and take no ref — --ref cannot pin them.
@@ -97,11 +100,16 @@ Options:
 Nothing here pairs your phone — that stays a deliberate step you run from inside the
 agent afterwards (/nomo-cc:pair, $nomo-pair, /nomo-pair).
 
-Cursor is the one agent whose config file this writes into directly (hooks.json, merged —
-other tools' entries are left alone). Undo it with:
-  node ~/.nomo/plugin/scripts/cursor-install.mjs --uninstall
-Antigravity likewise owns one "nomo" block in ~/.gemini/config/hooks.json. Undo it with:
-  node ~/.nomo/plugin/scripts/antigravity-install.mjs --uninstall`;
+Uninstall (removes only what Nomo wrote; your phone stays paired for your other agents):
+  bunx nomo-ai --uninstall --cursor        Nomo's entries in ~/.cursor/hooks.json + /nomo-* skills
+  bunx nomo-ai --uninstall --antigravity   the "nomo" block in ~/.gemini/config/hooks.json + plugin
+  bunx nomo-ai --uninstall --devin         Nomo's hooks in ~/.config/devin/config.json + /nomo-* skills
+  (the same as: node ~/.nomo/plugin/scripts/<agent>-install.mjs --uninstall)
+Not covered — each host removes its own install:
+  Claude Code   claude plugin uninstall nomo-cc@nomo
+  Codex         codex plugin remove nomo@nomo
+  Devin plugin  devin plugins remove nomo
+  OpenCode      delete ~/.config/opencode/plugins/nomo.js and ~/.config/opencode/commands/nomo-*.md`;
 
 // ── plumbing ─────────────────────────────────────────────────────────────────────────────────────
 
@@ -217,6 +225,21 @@ const cursorDir = () => process.env.CURSOR_CONFIG_DIR || join(homedir(), ".curso
 /** Antigravity's installer, and its global customization dir (holds hooks.json). */
 const ANTIGRAVITY_SCRIPT = join(CHECKOUT, "plugin", "scripts", "antigravity-install.mjs");
 const antigravityDir = () => join(homedir(), ".gemini", "config");
+/** Devin's installer, and its user config dir (holds config.json, whose "hooks" key it merges into). */
+const DEVIN_SCRIPT = join(CHECKOUT, "plugin", "scripts", "devin-install.mjs");
+const devinDir = () => join(homedir(), ".config", "devin");
+/** Already installed as the native Devin plugin (`devin plugins install KarrixLee/nomo`)? Read from
+ *  Devin's plugin lock.json — the twin of devin-install.mjs devinPluginInstalled (this file ships
+ *  alone, so it cannot import it). That install's skills are /nomo:*, not the installer's /nomo-*. */
+function devinPluginInstalled() {
+  try {
+    const resolved = JSON.parse(readFileSync(join(homedir(), ".local", "share", "devin", "cli", "plugins", "lock.json"), "utf8"))?.resolved;
+    return Array.isArray(resolved) && resolved.some((r) => r?.name === "nomo");
+  } catch {
+    return false;
+  }
+}
+const DEVIN_PLUGIN_ROW = ["already installed as a Devin plugin (devin plugins) — nothing to install here"];
 
 /** Is Nomo already installed for this host? Answered from the host's OWN plugin cache
  *  (`<cache>/<marketplace>/<plugin>/`): the MARKETPLACE directory name is whatever the user called it,
@@ -401,6 +424,7 @@ const AGENTS = [
       STATUS.get("claude")?.installed
         ? [`run \`${CLAUDE_UPDATE}\`, then restart Claude Code`]
         : ["restart Claude Code so the hooks load", "run /nomo-cc:pair"],
+    manualUninstall: "claude plugin uninstall nomo-cc@nomo",
     detect: () => onPath("claude") || existsSync(join(homedir(), ".claude")),
     installed: () => hostHasNomo(join(homedir(), ".claude", "plugins", "cache"), "nomo-cc"),
     install() {
@@ -439,6 +463,7 @@ const AGENTS = [
           ? ["run the command above, then restart Codex"]
           : ["nothing to run here — this row printed no command on purpose"]
         : ["run /hooks in Codex and trust the seven Nomo entries", "run $nomo-pair"],
+    manualUninstall: "codex plugin remove nomo@nomo",
     detect: () => onPath("codex") || existsSync(join(homedir(), ".codex")),
     installed: () => hostHasNomo(join(homedir(), ".codex", "plugins", "cache"), "nomo"),
     install() {
@@ -470,6 +495,7 @@ const AGENTS = [
       STATUS.get("opencode")?.installed
         ? ["restart OpenCode (plugins load once at server start; no hot reload)"]
         : ["restart OpenCode (plugins load once at server start; no hot reload)", "run /nomo-pair"],
+    manualUninstall: "delete ~/.config/opencode/plugins/nomo.js and ~/.config/opencode/commands/nomo-*.md",
     detect: () =>
       onPath("opencode") ||
       existsSync(join(process.env.XDG_CONFIG_HOME || join(homedir(), ".config"), "opencode")),
@@ -525,6 +551,7 @@ const AGENTS = [
       STATUS.get("cursor")?.installed
         ? ["restart Cursor (and any open cursor-agent) so it re-reads hooks.json"]
         : ["restart Cursor (and any open cursor-agent) so it re-reads hooks.json", "run /nomo-pair"],
+    uninstallScript: CURSOR_SCRIPT,
     detect: () => onPath("cursor-agent") || onPath("cursor") || existsSync(cursorDir()),
     // The one agent whose installer NEEDS the host's own directory to exist (it merges into a file
     // there). Claude and Codex go through their CLI and say so when it is missing; OpenCode's script
@@ -578,6 +605,7 @@ const AGENTS = [
       STATUS.get("antigravity")?.installed
         ? ["restart Antigravity (and any open agy)", "type /nomo-status to check"]
         : ["restart Antigravity (and any open agy)", "type /nomo-pair"],
+    uninstallScript: ANTIGRAVITY_SCRIPT,
     detect: () => onPath("agy") || existsSync(antigravityDir()),
     skipUndetectedUnderAll: true,
     installed: () => {
@@ -601,6 +629,60 @@ const AGENTS = [
       const fail = run(process.execPath, [ANTIGRAVITY_SCRIPT]);
       return fail
         ? { error: fail, hint: `The script's own line above says what it refused and why. Fix that and re-run;\n    ${process.execPath} ${ANTIGRAVITY_SCRIPT}` }
+        : null;
+    },
+  },
+  {
+    // Antigravity's twin: installs from the ~/.nomo checkout; devin-install.mjs merges Nomo's hooks
+    // into ~/.config/devin/config.json (read by the CLI and Devin Desktop's Devin Local) and writes
+    // the user-level /nomo-* skills into ~/.config/devin/skills.
+    id: "devin",
+    label: "Devin",
+    plan: () =>
+      STATUS.get("devin")?.installed === "plugin"
+        ? DEVIN_PLUGIN_ROW
+        : STATUS.get("devin")?.installed
+          ? [`already installed — updates ${CHECKOUT}, then refreshes config.json`]
+          : [
+              `git clone --depth 1 ${REF ? `--branch ${REF} ` : ""}${CLONE_URL} ${CHECKOUT}`,
+              `node ${DEVIN_SCRIPT}`,
+            ],
+    next: () =>
+      STATUS.get("devin")?.installed === "plugin"
+        ? ["already paired from another agent? nothing to do — otherwise type /nomo:pair in devin"]
+        : STATUS.get("devin")?.installed
+          ? ["restart devin (and Devin Desktop)"]
+          : [
+              "restart devin (and Devin Desktop)",
+              "already paired from another agent? nothing to do — otherwise type /nomo-pair in devin",
+            ],
+    uninstallScript: DEVIN_SCRIPT,
+    detect: () => onPath("devin") || existsSync(devinDir()),
+    skipUndetectedUnderAll: true,
+    // "plugin" = the native Devin plugin owns it (its own skills, /nomo:*); true = this installer's hooks.
+    installed: () => {
+      if (devinPluginInstalled()) return "plugin";
+      try {
+        return readFileSync(join(devinDir(), "config.json"), "utf8").includes("devin-status.mjs");
+      } catch {
+        return false;
+      }
+    },
+    install() {
+      if (STATUS.get("devin")?.installed === "plugin") return showUpdate(DEVIN_PLUGIN_ROW);
+      const checkout = ensureCheckout("Devin", "devin-install.mjs");
+      if (checkout) return checkout;
+      if (!DRY && !existsSync(DEVIN_SCRIPT)) {
+        return {
+          error: `${DEVIN_SCRIPT} is missing from the checkout`,
+          hint: REF
+            ? `Does \`${REF}\` have Devin support? Older refs do not ship that script.`
+            : `Delete ${CHECKOUT} and re-run.`,
+        };
+      }
+      const fail = run(process.execPath, [DEVIN_SCRIPT]);
+      return fail
+        ? { error: fail, hint: `The script's own line above says what it refused and why. Fix that and re-run;\n    ${process.execPath} ${DEVIN_SCRIPT}` }
         : null;
     },
   },
@@ -663,12 +745,14 @@ function parseArgs(argv) {
   const named = new Set();
   let all = false;
   let yes = false;
+  let uninstall = false;
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "-h" || a === "--help") return { help: true };
     else if (a === "-v" || a === "--version") return { showVersion: true };
     else if (a === "-y" || a === "--yes") yes = true;
     else if (a === "-n" || a === "--dry-run") DRY = true;
+    else if (a === "--uninstall") uninstall = true;
     else if (a === "--all") {
       all = true;
       for (const ag of AGENTS) picked.add(ag.id);
@@ -682,16 +766,16 @@ function parseArgs(argv) {
       named.add(a.slice(2));
     } else return { bad: a };
   }
-  return { picked, yes, all, named };
+  return { picked, yes, all, named, uninstall };
 }
 
 /** --ref reaches exactly one leg. Saying so out loud is the whole point: a flag that reads as
  *  "install this version" while two of three legs quietly ignore it is worse than no flag. */
 function refCaveat(selected) {
   /** The two that install from ~/.nomo. @param {{id: string}} a */
-  const pinned = (a) => a.id === "opencode" || a.id === "cursor" || a.id === "antigravity";
+  const pinned = (a) => a.id === "opencode" || a.id === "cursor" || a.id === "antigravity" || a.id === "devin";
   const ignoring = AGENTS.filter((a) => !pinned(a) && selected.has(a.id)).map((a) => a.label);
-  say(`${bold("Note:")} --ref ${REF} pins the ${CHECKOUT} checkout (OpenCode, Cursor, Antigravity) only.`);
+  say(`${bold("Note:")} --ref ${REF} pins the ${CHECKOUT} checkout (OpenCode, Cursor, Antigravity, Devin) only.`);
   if (ignoring.length > 0) {
     say(dim(`  ${ignoring.join(" and ")} install through their own marketplace, which takes an`));
     say(dim(`  owner/repo and reads ${REPO}'s default branch. There is no ref to pass it, so`));
@@ -1002,6 +1086,47 @@ function banner() {
 
 // ── main ─────────────────────────────────────────────────────────────────────────────────────────
 //
+// ── uninstall ────────────────────────────────────────────────────────────────────────────────────
+//
+// An agent flag is REQUIRED: no picker, no "everything detected". Removing is the one action here a
+// stray Enter should never be able to do. Each agent's own installer does the removal (it already
+// knows exactly what it wrote); an agent whose install belongs to its host gets that host's command
+// printed instead — nothing here drives a host's uninstall.
+
+/** @param {Set<string>} selected */
+function uninstall(selected) {
+  if (selected.size === 0) {
+    err("nomo-ai: --uninstall needs to know which agent — name it, e.g.:");
+    err("  bunx nomo-ai --uninstall --devin   (or --cursor, --antigravity)");
+    return 2;
+  }
+  if (DRY) say(dim("dry run — nothing will be removed\n"));
+  const failures = [];
+  for (const agent of AGENTS.filter((a) => selected.has(a.id))) {
+    say(bold(agent.label));
+    if (!agent.uninstallScript) {
+      say(`  ${dim("not covered by nomo-ai — remove it with:")}`);
+      say(`    ${bold(agent.manualUninstall)}`);
+      say();
+      continue;
+    }
+    if (!DRY && !existsSync(agent.uninstallScript)) {
+      failures.push(agent);
+      err(`  ${agent.uninstallScript} is missing — Nomo was not installed from ${CHECKOUT}.`);
+      err(`  Installed from another checkout? Run: node <checkout>/plugin/scripts/${agent.id}-install.mjs --uninstall`);
+      say();
+      continue;
+    }
+    const fail = run(process.execPath, [agent.uninstallScript, "--uninstall"]);
+    if (fail) {
+      failures.push(agent);
+      err(`  ${bold("FAILED")}: ${fail}`);
+    }
+    say();
+  }
+  return failures.length > 0 ? 1 : 0;
+}
+
 // Wrapped in a function purely so every exit is `process.exitCode` + `return`, never `process.exit()`.
 // console.log to a PIPE is asynchronous in node and process.exit() does not wait for it — the failure
 // report below is the longest thing this script prints and the last thing before a non-zero exit,
@@ -1030,6 +1155,8 @@ async function main() {
 
   banner();
 
+  if (args.uninstall) return uninstall(args.picked);
+
   const floor = hookRuntimeFloor();
   if (floor) {
     say(`${bold("Warning:")} ${floor.what}.`);
@@ -1046,9 +1173,9 @@ async function main() {
   const selected = explicit ? args.picked : new Set(args.yes ? found : []);
 
   if (!explicit && found.length === 0) {
-    err("\nnomo-ai: found no Claude Code, Codex, OpenCode, Cursor or Antigravity install on this machine.");
+    err("\nnomo-ai: found no Claude Code, Codex, OpenCode, Cursor, Antigravity or Devin install on this machine.");
     err("  Looked for `claude`, `codex`, `opencode`, `cursor-agent`, `agy` on PATH and ~/.claude, ~/.codex, ~/.config/opencode, ~/.cursor, ~/.gemini/config.");
-    err("  Name one anyway with --claude / --codex / --opencode / --cursor / --antigravity, or --all.");
+    err("  Name one anyway with --claude / --codex / --opencode / --cursor / --antigravity / --devin, or --all.");
     return 1;
   }
 
@@ -1068,7 +1195,7 @@ async function main() {
   if (!explicit && !args.yes) {
     if (!interactive()) {
       err("\nnomo-ai: not a terminal, so there is nobody to ask.");
-      err("  Pass --yes to install everything detected, or name agents: --claude --codex --opencode --cursor --antigravity / --all.");
+      err("  Pass --yes to install everything detected, or name agents: --claude --codex --opencode --cursor --antigravity --devin / --all.");
       return 2;
     }
     const answer = await choose(selected);
